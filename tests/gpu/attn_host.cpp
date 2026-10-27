@@ -72,9 +72,8 @@ int main(int argc, char** argv) {
 
     Args args{dq, dk, dv, dout, S, scale, H, S};
     void* params[] = {&args};
-    size_t params_size = sizeof(args);
     dim3 grid(S / 64, H, B);
-    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, params, &params_size));
+    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, params, nullptr));
     CK(hipDeviceSynchronize());
 
     std::vector<__half> got(elems);
