@@ -172,3 +172,26 @@ pub fn attention_fwd() -> Function {
 
     b.finish()
 }
+
+/// Minimal probe kernel: `o[tid] = q[tid]`, plus `n` stored at byte 128.
+/// Used to validate the kernarg/ABI plumbing independently of attention math.
+pub fn probe_store() -> Function {
+    let mut b = FnBuilder::new("probe_store", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("q", DType::Ptr, 8, 8);
+    b.arg("n", DType::I32, 16, 4);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let q = b.let_(Op::KernargPtr { offset: 8 });
+    let n = b.let_(Op::KernargI32 { offset: 16 });
+    let tid = b.let_(Op::WorkitemId);
+    let c2 = b.c_i32(2);
+    let off = b.mul_i32(tid, c2);
+    let src = b.ptr_add(q, off);
+    let dst = b.ptr_add(o, off);
+    let val = b.load_u16(src, 0);
+    b.store_u16(dst, 0, val);
+    let c128 = b.c_i32(128);
+    let dst2 = b.ptr_add(o, c128);
+    b.store_u16(dst2, 0, n);
+    b.finish()
+}

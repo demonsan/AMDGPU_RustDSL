@@ -25,12 +25,13 @@ pub fn compile(f: &amdgpu_dsl::Function) -> Result<Compiled, String> {
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
-    &["attention_fwd"]
+    &["attention_fwd", "probe_store"]
 }
 
 pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
     match name {
         "attention_fwd" => Some(amdgpu_dsl::kernels::attention_fwd()),
+        "probe_store" => Some(amdgpu_dsl::kernels::probe_store()),
         _ => None,
     }
 }
