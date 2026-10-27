@@ -156,6 +156,36 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 4; ++i) {
         std::printf("  [0] got=%.6f ref=%.6f\n", __half2float(got[i]), ref[i]);
     }
+    // Per-row bad counts: distinguishes broken lanes from broken math.
+    {
+        size_t rows_bad = 0;
+        size_t bad_in_lo = 0;
+        size_t bad_in_hi = 0;
+        for (int r = 0; r < B * H * S; ++r) {
+            size_t row_bad = 0;
+            for (int d = 0; d < D; ++d) {
+                size_t i = (size_t)r * D + d;
+                double a = __half2float(got[i]);
+                double e = ref[i];
+                if (std::fabs(a - e) > 2e-2 + 2e-2 * std::fabs(e)) {
+                    ++row_bad;
+                }
+            }
+            if (row_bad) {
+                ++rows_bad;
+                if ((r % S) < 32) {
+                    bad_in_lo += row_bad;
+                } else {
+                    bad_in_hi += row_bad;
+                }
+            }
+            if (r < 4) {
+                std::printf("  row %d bad=%zu\n", r, row_bad);
+            }
+        }
+        std::printf("rows_with_bad=%zu/%d bad_in_rows0_31=%zu bad_in_rows32_63=%zu\n",
+                    rows_bad, B * H * S, bad_in_lo, bad_in_hi);
+    }
     std::printf("max_abs_err=%.6g mean_abs_err=%.6g bad=%zu/%zu\n", max_abs,
                 sum_abs / (double)elems, bad, elems);
     if (bad != 0) {
