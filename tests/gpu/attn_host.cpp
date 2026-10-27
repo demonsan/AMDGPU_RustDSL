@@ -38,9 +38,13 @@ static_assert(sizeof(Args) == 48, "kernarg layout must match attention_fwd");
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const char* co = argc > 1 ? argv[1] : "build/attention.co";
-    const int B = 1;
-    const int H = 2;
-    const int S = 128;  // multiple of 64
+    auto envi = [](const char* name, int fallback) {
+        const char* v = std::getenv(name);
+        return v ? std::atoi(v) : fallback;
+    };
+    const int B = envi("ATTN_B", 1);
+    const int H = envi("ATTN_H", 2);
+    const int S = envi("ATTN_S", 128);  // multiple of 64
     const int D = 64;
     const float scale = 1.0f / std::sqrt((float)D);
 
