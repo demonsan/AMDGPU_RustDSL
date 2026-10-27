@@ -173,6 +173,9 @@ int main(int argc, char** argv) {
             }
             if (row_bad) {
                 ++rows_bad;
+                if (rows_bad <= 40) {
+                    std::printf("   bad_row=%d tid=%d block=%d\n", r, r % 64, r / 64);
+                }
                 if ((r % S) < 32) {
                     bad_in_lo += row_bad;
                 } else {
