@@ -53,16 +53,20 @@ pub fn attention_fwd() -> Function {
     let c_neg_inf = b.c_f32(f32::NEG_INFINITY);
 
     // --- addresses ------------------------------------------------------
-    let row = b.add_i32(b.mul_i32(bx, c_qrows), tid);
-    let head_index = b.add_i32(b.mul_i32(bz, nhead), by);
+    let block_row0 = b.mul_i32(bx, c_qrows);
+    let row = b.add_i32(block_row0, tid);
+    let head_base = b.mul_i32(bz, nhead);
+    let head_index = b.add_i32(head_base, by);
 
-    let q_row_index = b.add_i32(b.mul_i32(head_index, seqlen_q), row);
+    let head_row = b.mul_i32(head_index, seqlen_q);
+    let q_row_index = b.add_i32(head_row, row);
     let q_off = b.mul_i32(q_row_index, c_row_bytes);
     let q_row_ptr = b.ptr_add(q_ptr, q_off);
     let o_row_ptr = b.ptr_add(o_ptr, q_off);
 
     // Per-key rows share one invariant base offset.
-    let kv_base = b.mul_i32(b.mul_i32(head_index, seqlen_k), c_row_bytes);
+    let kv_head = b.mul_i32(head_index, seqlen_k);
+    let kv_base = b.mul_i32(kv_head, c_row_bytes);
 
     // --- load the query row, widening to f32 ----------------------------
     let mut q = Vec::with_capacity(HEAD_DIM);
@@ -82,11 +86,11 @@ pub fn attention_fwd() -> Function {
     // Loop-carried: key index, running max, running normaliser, output row.
     let mut inits: Vec<(DType, Opnd)> = Vec::with_capacity(3 + HEAD_DIM);
     let k_init = b.c_i32(0);
-    inits.push((DType::I32, k_init.into()));
-    inits.push((DType::F32, c_neg_inf.into()));
-    inits.push((DType::F32, c_zero_f.into()));
+    inits.push((DType::I32, Opnd::Val(k_init)));
+    inits.push((DType::F32, Opnd::Val(c_neg_inf)));
+    inits.push((DType::F32, Opnd::Val(c_zero_f)));
     for _ in 0..HEAD_DIM {
-        inits.push((DType::F32, c_zero_f.into()));
+        inits.push((DType::F32, Opnd::Val(c_zero_f)));
     }
     let vars = b.begin_loop(&inits);
     let k_var = vars[0];
@@ -94,11 +98,12 @@ pub fn attention_fwd() -> Function {
     let l_var = vars[2];
     let acc: Vec<VarId> = vars[3..].to_vec();
 
-    let row_off = b.add_i32(kv_base, b.shl_i32(k_var, c7));
+    let k_shifted = b.shl_i32(k_var, c7);
+    let row_off = b.add_i32(kv_base, k_shifted);
     let k_row_ptr = b.ptr_add(k_ptr, row_off);
     let v_row_ptr = b.ptr_add(v_ptr, row_off);
 
-    // qk = q . k  (f32 accumulate, grouped loads keep waitcnts cheap)
+    // qk = q . k  (f32 accumulate; grouped loads keep waitcnts cheap)
     let mut s = c_zero_f;
     let mut d = 0usize;
     while d < HEAD_DIM {
@@ -115,8 +120,10 @@ pub fn attention_fwd() -> Function {
 
     let scaled = b.mul_f32(s, scale);
     let m_new = b.max_f32(m_var, scaled);
-    let corr = b.exp_f32(b.sub_f32(m_var, m_new));
-    let p = b.exp_f32(b.sub_f32(scaled, m_new));
+    let m_delta = b.sub_f32(m_var, m_new);
+    let corr = b.exp_f32(m_delta);
+    let p_delta = b.sub_f32(scaled, m_new);
+    let p = b.exp_f32(p_delta);
     let l_new = b.fma_f32(l_var, corr, p);
 
     // out = out * corr + p * v
@@ -144,8 +151,8 @@ pub fn attention_fwd() -> Function {
     }
 
     let more = b.cmp_lt_i32(k_next, seqlen_k);
-    let stop = b.let_(Op::NotI1(more.into()));
-    b.break_if(stop);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
     b.end_loop();
 
     // --- normalise and store -------------------------------------------
@@ -158,7 +165,7 @@ pub fn attention_fwd() -> Function {
             *slot = b.cvt_f32_to_f16(normed);
         }
         for i in 0..4 {
-            b.store_u16(o_row_ptr, (2 * (d + i)) as u32, out[i]);
+            b.store_u16(o_row_ptr, (2 * (d + i)) as u32, Opnd::Val(out[i]));
         }
         d += 4;
     }
