@@ -60,6 +60,14 @@ int main(int argc, char** argv) {
         hk[i] = __float2half(dist(rng));
         hv[i] = __float2half(dist(rng));
     }
+    if (std::getenv("ATTN_CONST")) {
+        // q = k = 0, v = 0.5 => attention output is exactly 0.5 everywhere.
+        for (size_t i = 0; i < elems; ++i) {
+            hq[i] = __float2half(0.0f);
+            hk[i] = __float2half(0.0f);
+            hv[i] = __float2half(0.5f);
+        }
+    }
 
     __half* dq = nullptr;
     __half* dk = nullptr;
