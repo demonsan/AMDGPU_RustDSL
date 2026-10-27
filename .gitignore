@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+**/target/
+Cargo.lock
+
+# Generated code objects and assembly
+*.co
+*.hsaco
+*.o
+*.s
+*.mir
+!fixtures/**/*.md
+
+# Compiler caches and diagnostics
+/.cache/
+/dumps/
+*.log
+*.tmp
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
