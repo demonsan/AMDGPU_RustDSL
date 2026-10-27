@@ -46,7 +46,8 @@ int main(int argc, char** argv) {
     const int H = envi("ATTN_H", 2);
     const int S = envi("ATTN_S", 128);  // multiple of 64
     const int D = 64;
-    const float scale = 1.0f / std::sqrt((float)D);
+    const char* s_env = std::getenv("ATTN_SCALE");
+    const float scale = s_env ? (float)std::atof(s_env) : 1.0f / std::sqrt((float)D);
 
     std::printf("[harness] shape B=%d H=%d S=%d D=%d scale=%.4f\n", B, H, S, D, scale);
 
@@ -150,6 +151,9 @@ int main(int argc, char** argv) {
             }
             ++bad;
         }
+    }
+    for (int i = 0; i < 4; ++i) {
+        std::printf("  [0] got=%.6f ref=%.6f\n", __half2float(got[i]), ref[i]);
     }
     std::printf("max_abs_err=%.6g mean_abs_err=%.6g bad=%zu/%zu\n", max_abs,
                 sum_abs / (double)elems, bad, elems);
