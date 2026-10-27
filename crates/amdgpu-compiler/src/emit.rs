@@ -46,6 +46,10 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str("    .amdhsa_group_segment_fixed_size 0\n");
     out.push_str("    .amdhsa_private_segment_fixed_size 0\n");
     out.push_str(&format!("    .amdhsa_kernarg_size {}\n", m.kernarg_size));
+    // Two user SGPRs: the kernarg segment pointer in s[0:1]. Without this
+    // count the runtime passes no user SGPRs and every argument load reads
+    // garbage.
+    out.push_str("    .amdhsa_user_sgpr_count 2\n");
     out.push_str("    .amdhsa_user_sgpr_kernarg_segment_ptr 1\n");
     out.push_str("    .amdhsa_system_sgpr_workgroup_id_x 1\n");
     out.push_str("    .amdhsa_system_sgpr_workgroup_id_y 1\n");
