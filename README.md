@@ -49,3 +49,7 @@
 ## 许可
 
 本仓库尚未声明许可证；在明确决定前不复制第三方实现。
+
+## Status
+
+Implementation has started; see [docs/status.md](docs/status.md).
