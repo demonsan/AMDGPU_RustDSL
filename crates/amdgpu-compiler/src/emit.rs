@@ -45,7 +45,10 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str(&format!("\n.amdhsa_kernel {}\n", m.name));
     out.push_str("    .amdhsa_group_segment_fixed_size 0\n");
     out.push_str("    .amdhsa_private_segment_fixed_size 0\n");
-    out.push_str(&format!("    .amdhsa_kernarg_size {}\n", m.kernarg_size));
+    // The kernarg segment size must be 8-byte aligned or the assembler rejects
+    // the metadata outright.
+    let kernarg = round_up(m.kernarg_size, 8);
+    out.push_str(&format!("    .amdhsa_kernarg_size {}\n", kernarg));
     // Two user SGPRs: the kernarg segment pointer in s[0:1]. Without this
     // count the runtime passes no user SGPRs and every argument load reads
     // garbage.
@@ -66,7 +69,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str("\n.amdgpu_metadata\n---\namdhsa.kernels:\n");
     out.push_str(&format!("  - .name: {}\n", m.name));
     out.push_str(&format!("    .symbol: {}.kd\n", m.name));
-    out.push_str(&format!("    .kernarg_segment_size: {}\n", m.kernarg_size));
+    out.push_str(&format!("    .kernarg_segment_size: {}\n", round_up(m.kernarg_size, 8)));
     out.push_str("    .kernarg_segment_align: 8\n");
     out.push_str("    .group_segment_fixed_size: 0\n");
     out.push_str("    .private_segment_fixed_size: 0\n");
