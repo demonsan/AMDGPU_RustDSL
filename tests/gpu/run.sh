@@ -16,7 +16,7 @@ echo "== assemble =="
     -mcode-object-version=6 -o "build/${KERNEL}.co" "build/${KERNEL}.s"
 
 echo "== host =="
-g++ -O2 -std=c++17 tests/gpu/attn_host.cpp -o build/attn_host \
+g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/attn_host.cpp -o build/attn_host \
     -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib"
 
 echo "== run =="
