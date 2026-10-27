@@ -201,6 +201,7 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
             )
         })?;
         phys[r as usize] = slot as u32;
+        mark_used(&mut used_v, slot, c);
         active.push((e, r, c));
     }
 
@@ -230,6 +231,7 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
             )
         })?;
         phys[r as usize] = slot as u32;
+        mark_used(&mut used_s, slot, c);
         sactive.push((e, r, c));
     }
 
@@ -263,6 +265,13 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     }
 
     Ok(Alloc { phys: patched, max_v: max_v as u32, max_s: max_s as u32 })
+}
+
+fn mark_used(used: &mut [bool], slot: usize, c: RClass) {
+    used[slot] = true;
+    if matches!(c, RClass::V2 | RClass::S2) {
+        used[slot + 1] = true;
+    }
 }
 
 fn free_phys(used_v: &mut [bool], used_s: &mut [bool], phys: u32, c: RClass) {
