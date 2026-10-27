@@ -88,7 +88,8 @@ int main(int argc, char** argv) {
     void* a_k = dk;
     void* a_v = dv;
     void* a_o = dout;
-    int a_sk = S;
+    const int SK = envi("ATTN_SK", S);
+    int a_sk = SK;
     float a_scale = scale;
     int a_nhead = H;
     int a_sq = S;
@@ -108,9 +109,9 @@ int main(int argc, char** argv) {
         for (int h = 0; h < H; ++h) {
             const size_t base = ((size_t)b * H + h) * S * D;
             for (int qi = 0; qi < S; ++qi) {
-                std::vector<float> score(S);
+                std::vector<float> score(SK);
                 float mx = -INFINITY;
-                for (int s = 0; s < S; ++s) {
+                for (int s = 0; s < SK; ++s) {
                     float acc = 0.0f;
                     for (int d = 0; d < D; ++d) {
                         acc += __half2float(hq[base + (size_t)qi * D + d]) *
@@ -120,13 +121,13 @@ int main(int argc, char** argv) {
                     mx = std::max(mx, score[s]);
                 }
                 float sum = 0.0f;
-                for (int s = 0; s < S; ++s) {
+                for (int s = 0; s < SK; ++s) {
                     score[s] = std::exp(score[s] - mx);
                     sum += score[s];
                 }
                 for (int d = 0; d < D; ++d) {
                     float acc = 0.0f;
-                    for (int s = 0; s < S; ++s) {
+                    for (int s = 0; s < SK; ++s) {
                         acc += score[s] / sum * __half2float(hv[base + (size_t)s * D + d]);
                     }
                     ref[base + (size_t)qi * D + d] = acc;
