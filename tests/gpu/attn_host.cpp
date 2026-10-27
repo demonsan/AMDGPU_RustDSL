@@ -36,14 +36,15 @@ struct Args {
 static_assert(sizeof(Args) == 48, "kernarg layout must match attention_fwd");
 
 int main(int argc, char** argv) {
-    std::setvbuf(stdout, nullptr, _IONBF, 0);`n    const char* co = argc > 1 ? argv[1] : "build/attention.co";
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const char* co = argc > 1 ? argv[1] : "build/attention.co";
     const int B = 1;
     const int H = 2;
     const int S = 128;  // multiple of 64
     const int D = 64;
     const float scale = 1.0f / std::sqrt((float)D);
 
-    std::printf("shape B=%d H=%d S=%d D=%d scale=%.4f\n", B, H, S, D, scale);
+    std::printf("[harness] shape B=%d H=%d S=%d D=%d scale=%.4f\n", B, H, S, D, scale);
 
     const size_t elems = (size_t)B * H * S * D;
     std::vector<__half> hq(elems), hk(elems), hv(elems);
@@ -55,7 +56,10 @@ int main(int argc, char** argv) {
         hv[i] = __float2half(dist(rng));
     }
 
-    __half *dq = nullptr, *dk = nullptr, *dv = nullptr, *dout = nullptr;
+    __half* dq = nullptr;
+    __half* dk = nullptr;
+    __half* dv = nullptr;
+    __half* dout = nullptr;
     CK(hipMalloc((void**)&dq, elems * sizeof(__half)));
     CK(hipMalloc((void**)&dk, elems * sizeof(__half)));
     CK(hipMalloc((void**)&dv, elems * sizeof(__half)));
@@ -64,17 +68,22 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(dk, hk.data(), elems * sizeof(__half), hipMemcpyHostToDevice));
     CK(hipMemcpy(dv, hv.data(), elems * sizeof(__half), hipMemcpyHostToDevice));
     CK(hipMemset(dout, 0, elems * sizeof(__half)));
+    std::printf("[harness] buffers ready\n");
 
-    std::printf("[harness] buffers ready\n");`n    hipModule_t mod;
+    hipModule_t mod;
     hipFunction_t fn;
     CK(hipModuleLoad(&mod, co));
-    std::printf("[harness] module loaded\n");`n    CK(hipModuleGetFunction(&fn, mod, "attention_fwd"));`n    std::printf("[harness] function resolved\n");
+    std::printf("[harness] module loaded\n");
+    CK(hipModuleGetFunction(&fn, mod, "attention_fwd"));
+    std::printf("[harness] function resolved\n");
 
     Args args{dq, dk, dv, dout, S, scale, H, S};
     void* params[] = {&args};
     dim3 grid(S / 64, H, B);
-    std::printf("[harness] launching grid=(%u,%u,%u)\n", grid.x, grid.y, grid.z);`n    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, params, nullptr));
-    CK(hipDeviceSynchronize());`n    std::printf("[harness] kernel finished\n");
+    std::printf("[harness] launching grid=(%u,%u,%u)\n", grid.x, grid.y, grid.z);
+    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, params, nullptr));
+    CK(hipDeviceSynchronize());
+    std::printf("[harness] kernel finished\n");
 
     std::vector<__half> got(elems);
     CK(hipMemcpy(got.data(), dout, elems * sizeof(__half), hipMemcpyDeviceToHost));
