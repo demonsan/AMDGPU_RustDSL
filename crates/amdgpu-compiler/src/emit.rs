@@ -95,7 +95,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
         }
     }
     out.push_str("amdhsa.target: amdgcn-amd-amdhsa--gfx950\n");
-    out.push_str("amdhsa.version:\n  - 1\n  - 2\n...\n");
+    out.push_str("amdhsa.version:\n  - 1\n  - 0\n...\n");
     out.push_str(".end_amdgpu_metadata\n");
     out
 }
