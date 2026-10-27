@@ -83,7 +83,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str("    .vgpr_spill_count: 0\n");
     out.push_str("    .args:\n");
     for arg in &m.args {
-        out.push_str(&format!("      - .name: {}\n", arg.name));
+        out.push_str(&format!("      - .name: \"{}\"\n", arg.name));
         out.push_str(&format!("        .offset: {}\n", arg.offset));
         out.push_str(&format!("        .size: {}\n", arg.size));
         match arg.dsl_ty {
