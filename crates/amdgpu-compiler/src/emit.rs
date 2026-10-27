@@ -169,8 +169,13 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
     let d = |a: &Alloc| vr(a, inst.dst.expect("dst"));
     match inst.op {
         MOp::VMovB32 => {
-            let s0 = inst.srcs.first().copied().unwrap_or(Src::Imm(0));
-            vec![format!("v_mov_b32_e32 {}, {}", d(a), src1(a, s0))]
+            // A register-to-register move carries its source in `srcs`; a
+            // constant carries its 32-bit pattern in `imm`.
+            let text = match inst.srcs.first() {
+                Some(s) => src1(a, *s),
+                None => format!("{}", inst.imm as i32),
+            };
+            vec![format!("v_mov_b32_e32 {}, {}", d(a), text)]
         }
         MOp::VMovFromS => vec![format!("v_mov_b32_e32 {}, {}", d(a), sr(a, reg_of(&inst.srcs[0])))],
         MOp::VMovFromSPair => {
