@@ -177,7 +177,7 @@ impl Lowerer {
             }
             Opnd::Var(v) => self
                 .vars
-                .get(v as usize)
+                .get(v.0 as usize)
                 .copied()
                 .ok_or_else(|| format!("var{v} not lowered")),
             Opnd::I32(i) => Ok(self.const_vreg(i as i64)),
@@ -207,7 +207,7 @@ impl Lowerer {
             Opnd::Var(v) => {
                 let r = self
                     .vars
-                    .get(v as usize)
+                    .get(v.0 as usize)
                     .copied()
                     .ok_or_else(|| format!("var{v} not lowered"))?;
                 if self.mir.vreg_class(r) == RClass::V2 {
@@ -248,7 +248,7 @@ impl Lowerer {
                 }
                 Stmt::SetVar { var, value } => {
                     let src = self.as_v1(*value)?;
-                    let dst = self.vars[*var as usize];
+                    let dst = self.vars[var.0 as usize];
                     if self.mir.vreg_class(dst) != RClass::V1 {
                         return Err("pointer loop variables are not supported yet".to_string());
                     }
@@ -265,10 +265,10 @@ impl Lowerer {
                             _ => RClass::V1,
                         };
                         let r = self.new_vreg(class);
-                        if self.vars.len() <= *var as usize {
-                            self.vars.resize(*var as usize + 1, u32::MAX);
+                        if self.vars.len() <= var.0 as usize {
+                            self.vars.resize(var.0 as usize + 1, u32::MAX);
                         }
-                        self.vars[*var as usize] = r;
+                        self.vars[var.0 as usize] = r;
                         let src = self.as_v1(init[i])?;
                         self.touch(&[Src::Reg(src)]);
                         self.push(MInst::new(MOp::VMovB32).def(r).srcreg(src));

@@ -16,7 +16,11 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 
 pub type ValueId = u32;
-pub type VarId = u32;
+
+/// Loop-carried mutable variable. A distinct type so it cannot be confused
+/// with an SSA value id.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct VarId(pub u32);
 
 /// Element types understood by the IR.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -222,7 +226,7 @@ impl Function {
     }
 
     pub fn var_ty(&self, v: VarId) -> Option<DType> {
-        self.var_tys.get(v as usize).copied()
+        self.var_tys.get(v.0 as usize).copied()
     }
 
     /// Human readable dump used by tests and `amdc dump`.
@@ -250,7 +254,7 @@ impl Function {
                     let _ = writeln!(s, "{pad}store f32 [{base:?}+{byte_off}] <- {value:?}");
                 }
                 Stmt::SetVar { var, value } => {
-                    let _ = writeln!(s, "{pad}var{var} <- {value:?}");
+                    let _ = writeln!(s, "{pad}var{} <- {value:?}", var.0);
                 }
                 Stmt::BeginLoop { vars, init } => {
                     let _ = writeln!(s, "{pad}loop vars={vars:?} init={init:?}");
@@ -329,7 +333,7 @@ impl FnBuilder {
         let mut vars = Vec::with_capacity(inits.len());
         let mut init = Vec::with_capacity(inits.len());
         for (ty, val) in inits {
-            let id = self.f.var_tys.len() as VarId;
+            let id = VarId(self.f.var_tys.len() as u32);
             self.f.var_tys.push(*ty);
             vars.push(id);
             init.push(*val);
