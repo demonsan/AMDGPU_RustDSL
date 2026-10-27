@@ -22,6 +22,12 @@ pub type ValueId = u32;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct VarId(pub u32);
 
+impl std::fmt::Display for VarId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Element types understood by the IR.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum DType {
