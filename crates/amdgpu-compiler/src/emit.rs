@@ -42,7 +42,11 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     let vgpr = round_up(a.max_v, 4).max(4);
     let sgpr = round_up(a.max_s, 8).max(8);
 
-    out.push_str(&format!("\n.amdhsa_kernel {}\n", m.name));
+    // The kernel descriptor is a fixed 64-byte record and the runtime requires
+    // it to be 64-byte aligned; without this the fields are read shifted and
+    // the dispatch executes garbage.
+    out.push_str("\n.p2align 6\n");
+    out.push_str(&format!(".amdhsa_kernel {}\n", m.name));
     out.push_str("    .amdhsa_group_segment_fixed_size 0\n");
     out.push_str("    .amdhsa_private_segment_fixed_size 0\n");
     // The kernarg segment size must be 8-byte aligned or the assembler rejects
