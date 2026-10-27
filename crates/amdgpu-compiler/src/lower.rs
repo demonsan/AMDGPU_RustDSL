@@ -281,7 +281,7 @@ impl Lowerer {
                 }
                 Stmt::BreakIf { cond } => {
                     let (exit, _) = *self.break_stack.last().ok_or("break outside loop")?;
-                    let (on, srcs) = self.lower_condition(*cond, true)?;
+                    let (on, srcs) = self.lower_condition(*cond, false)?;
                     self.touch(&srcs);
                     let fall = self.fresh_label();
                     self.set_term(Term::CondGoto { on, target: exit, fall });
