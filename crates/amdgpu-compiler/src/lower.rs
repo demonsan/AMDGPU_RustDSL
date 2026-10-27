@@ -525,6 +525,7 @@ impl Lowerer {
 /// preceding instruction and has no other use is folded into the producer.
 /// This keeps loop-carried state from doubling register pressure.
 fn coalesce(m: &mut MFunction) {
+    let classes: Vec<RClass> = m.vregs.clone();
     let mut uses: HashMap<VReg, u32> = HashMap::new();
     for b in &m.blocks {
         for inst in &b.insts {
@@ -545,7 +546,7 @@ fn coalesce(m: &mut MFunction) {
                     let prev = &b.insts[i - 1];
                     let prev_defs_s = prev.dst == Some(s);
                     let single_use = uses.get(&s).copied().unwrap_or(0) == 1;
-                    let same_class = m.vreg_class(d) == m.vreg_class(s);
+                    let same_class = classes[d as usize] == classes[s as usize];
                     let prev_is_move_to_s = prev.op == MOp::VMovB32;
                     if prev_defs_s && single_use && same_class && !prev_is_move_to_s {
                         if let Some(pd) = b.insts[i - 1].dst.as_mut() {

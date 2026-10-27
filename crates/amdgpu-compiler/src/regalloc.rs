@@ -109,7 +109,7 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     }
 
     // --- live intervals ---------------------------------------------
-    let mut bump = |r: VReg, at: usize, start: &mut Vec<usize>, end: &mut Vec<usize>| {
+    let bump = |r: VReg, at: usize, start: &mut Vec<usize>, end: &mut Vec<usize>| {
         if at < start[r as usize] {
             start[r as usize] = at;
         }
