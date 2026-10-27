@@ -77,8 +77,17 @@ int main(int argc, char** argv) {
     CK(hipModuleGetFunction(&fn, mod, "attention_fwd"));
     std::printf("[harness] function resolved\n");
 
-    Args args{dq, dk, dv, dout, S, scale, H, S};
-    void* params[] = {&args};
+    // hipModuleLaunchKernel wants one pointer per kernel argument, matching the
+    // metadata argument order (q, k, v, o, seqlen_k, scale, nhead, seqlen_q).
+    void* a_q = dq;
+    void* a_k = dk;
+    void* a_v = dv;
+    void* a_o = dout;
+    int a_sk = S;
+    float a_scale = scale;
+    int a_nhead = H;
+    int a_sq = S;
+    void* params[] = {&a_q, &a_k, &a_v, &a_o, &a_sk, &a_scale, &a_nhead, &a_sq};
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u)\n", grid.x, grid.y, grid.z);
     CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, params, nullptr));
