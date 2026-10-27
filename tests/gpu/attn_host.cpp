@@ -36,7 +36,7 @@ struct Args {
 static_assert(sizeof(Args) == 48, "kernarg layout must match attention_fwd");
 
 int main(int argc, char** argv) {
-    const char* co = argc > 1 ? argv[1] : "build/attention.co";
+    std::setvbuf(stdout, nullptr, _IONBF, 0);`n    const char* co = argc > 1 ? argv[1] : "build/attention.co";
     const int B = 1;
     const int H = 2;
     const int S = 128;  // multiple of 64
@@ -65,16 +65,16 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(dv, hv.data(), elems * sizeof(__half), hipMemcpyHostToDevice));
     CK(hipMemset(dout, 0, elems * sizeof(__half)));
 
-    hipModule_t mod;
+    std::printf("[harness] buffers ready\n");`n    hipModule_t mod;
     hipFunction_t fn;
     CK(hipModuleLoad(&mod, co));
-    CK(hipModuleGetFunction(&fn, mod, "attention_fwd"));
+    std::printf("[harness] module loaded\n");`n    CK(hipModuleGetFunction(&fn, mod, "attention_fwd"));`n    std::printf("[harness] function resolved\n");
 
     Args args{dq, dk, dv, dout, S, scale, H, S};
     void* params[] = {&args};
     dim3 grid(S / 64, H, B);
-    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, params, nullptr));
-    CK(hipDeviceSynchronize());
+    std::printf("[harness] launching grid=(%u,%u,%u)\n", grid.x, grid.y, grid.z);`n    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, params, nullptr));
+    CK(hipDeviceSynchronize());`n    std::printf("[harness] kernel finished\n");
 
     std::vector<__half> got(elems);
     CK(hipMemcpy(got.data(), dout, elems * sizeof(__half), hipMemcpyDeviceToHost));
