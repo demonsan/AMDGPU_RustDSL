@@ -185,6 +185,9 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     }
     vregs.sort_by_key(|x| (x.0, x.1));
     let mut active: Vec<(usize, VReg, RClass)> = Vec::new();
+    // Highest slot ever handed out, not just the ones still live at the end:
+    // the descriptor must cover every register the code touches.
+    let mut max_v = 0usize;
     for (s, e, r, c) in vregs {
         active.retain(|(ae, ar, ac)| {
             if *ae < s {
@@ -202,6 +205,7 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
         })?;
         phys[r as usize] = slot as u32;
         mark_used(&mut used_v, slot, c);
+        max_v = max_v.max(slot + c.dwords() as usize);
         active.push((e, r, c));
     }
 
@@ -215,6 +219,7 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     }
     sregs.sort_by_key(|x| (x.0, x.1));
     let mut sactive: Vec<(usize, VReg, RClass)> = Vec::new();
+    let mut max_s = 0usize;
     for (s, e, r, c) in sregs {
         sactive.retain(|(ae, ar, ac)| {
             if *ae < s {
@@ -232,14 +237,18 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
         })?;
         phys[r as usize] = slot as u32;
         mark_used(&mut used_s, slot, c);
+        max_s = max_s.max(slot + c.dwords() as usize);
         sactive.push((e, r, c));
     }
 
-    let mut max_v = 0usize;
-    let mut max_s = 0usize;
     for (i, u) in used_v.iter().enumerate() {
         if *u {
-            max_v = i + 1;
+            max_v = max_v.max(i + 1);
+        }
+    }
+    for (i, u) in used_s.iter().enumerate() {
+        if *u {
+            max_s = max_s.max(i + 1);
         }
     }
     for (i, u) in used_s.iter().enumerate() {
