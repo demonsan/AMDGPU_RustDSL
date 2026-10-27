@@ -1,0 +1,297 @@
+//! Machine IR for the gfx950 backend.
+//!
+//! Registers are still virtual here: allocation happens in `regalloc`. Control
+//! flow is a flat list of blocks with explicit terminators so that layout never
+//! changes meaning. 64-bit pointers are a single `V2`/`S2` virtual register
+//! whose physical base must be even.
+
+pub type VReg = u32;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum RClass {
+    V1,
+    V2,
+    S1,
+    S2,
+}
+
+impl RClass {
+    pub fn dwords(self) -> u32 {
+        match self {
+            RClass::V2 | RClass::S2 => 2,
+            _ => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Src {
+    Reg(VReg),
+    Imm(i64),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MOp {
+    // vector ALU
+    VMovB32,
+    VMovFromS,
+    VMovFromSPair,
+    VPtrAdd,
+    VReadPhys,
+    VAddU32,
+    VAddCoU32,
+    VAddcCoU32,
+    VAddF32,
+    VSubF32,
+    VMulF32,
+    VMaxF32,
+    VFmaF32,
+    VExpF32,
+    VRcpF32,
+    VCvtF32F16,
+    VCvtF16F32,
+    VAndB32,
+    VXorB32,
+    VLshrB32,
+    VLshlB32,
+    VMulLoU32,
+    VCmpLtI32,
+    VCmpGeI32,
+    VCmpNeI32,
+    VCndmask,
+    // global memory
+    GlobalLoadU16,
+    GlobalLoadF32,
+    GlobalStoreU16,
+    GlobalStoreF32,
+    // scalar ALU / memory
+    SLoadDword,
+    SLoadDwordx2,
+    SReadPhys,
+    SMovB32,
+    SAddU32,
+    SAddcU32,
+    SMulI32,
+    SShlB32,
+    SCmpLtI32,
+    // misc
+    SNop,
+    SWaitVm,
+    SWaitLgkm,
+    SEndpgm,
+}
+
+impl MOp {
+    /// Does this instruction consume `vcc` from the immediately preceding
+    /// instruction? Used by the verifier to guarantee adjacency.
+    pub fn consumes_vcc(self) -> bool {
+        matches!(self, MOp::VAddcCoU32 | MOp::VCndmask)
+    }
+
+    /// Does this instruction define `vcc`?
+    pub fn defines_vcc(self) -> bool {
+        matches!(
+            self,
+            MOp::VAddCoU32
+                | MOp::VAddcCoU32
+                | MOp::VCmpLtI32
+                | MOp::VCmpGeI32
+                | MOp::VCmpNeI32
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MInst {
+    pub op: MOp,
+    pub dst: Option<VReg>,
+    pub srcs: Vec<Src>,
+    /// Offset, physical register index or label, depending on `op`.
+    pub imm: i64,
+}
+
+impl MInst {
+    pub fn new(op: MOp) -> Self {
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0 }
+    }
+
+    pub fn def(mut self, r: VReg) -> Self {
+        self.dst = Some(r);
+        self
+    }
+
+    pub fn src(mut self, s: Src) -> Self {
+        self.srcs.push(s);
+        self
+    }
+
+    pub fn srcreg(mut self, r: VReg) -> Self {
+        self.srcs.push(Src::Reg(r));
+        self
+    }
+
+    pub fn imm(mut self, v: i64) -> Self {
+        self.imm = v;
+        self
+    }
+
+    pub fn uses(&self) -> Vec<VReg> {
+        let mut v = Vec::new();
+        for s in &self.srcs {
+            if let Src::Reg(r) = s {
+                v.push(*r);
+            }
+        }
+        v
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pred {
+    Scc0,
+    Scc1,
+    Vccnz,
+    Vccz,
+}
+
+#[derive(Clone, Debug)]
+pub enum Term {
+    Goto(u32),
+    CondGoto { on: Pred, target: u32, fall: u32 },
+    Endpgm,
+}
+
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub label: u32,
+    pub insts: Vec<MInst>,
+    pub term: Term,
+    pub pred: Option<Pred>,
+}
+
+impl Block {
+    pub fn new(label: u32) -> Self {
+        Block { label, insts: Vec::new(), term: Term::Endpgm, pred: None }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MArg {
+    pub name: String,
+    pub dsl_ty: amdgpu_dsl::DType,
+    pub offset: u32,
+    pub size: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MFunction {
+    pub name: String,
+    pub args: Vec<MArg>,
+    pub kernarg_size: u32,
+    pub workgroup_size: u32,
+    pub blocks: Vec<Block>,
+    pub vregs: Vec<RClass>,
+    /// (header label, latch label) pairs, used to extend live ranges that cross
+    /// a loop backedge.
+    pub loops: Vec<(u32, u32)>,
+}
+
+impl MFunction {
+    pub fn vreg_class(&self, r: VReg) -> RClass {
+        self.vregs[r as usize]
+    }
+
+    pub fn linear_index(&self, block: usize, inst: usize) -> usize {
+        let mut n = 0usize;
+        for b in 0..block {
+            n += self.blocks[b].insts.len();
+        }
+        n + inst
+    }
+}
+
+/// Light static checks that do not need physical registers.
+pub fn verify(m: &MFunction) -> Vec<String> {
+    let mut errs = Vec::new();
+    let labels: Vec<u32> = m.blocks.iter().map(|b| b.label).collect();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            for s in &inst.srcs {
+                if let Src::Reg(r) = s {
+                    if (*r as usize) >= m.vregs.len() {
+                        errs.push(format!("block {bi} inst {ii}: use of unknown vreg r{r}"));
+                    }
+                }
+            }
+            if let Some(d) = inst.dst {
+                if (d as usize) >= m.vregs.len() {
+                    errs.push(format!("block {bi} inst {ii}: def of unknown vreg r{d}"));
+                }
+            }
+            // Class sanity for the operations with fixed register shapes.
+            match inst.op {
+                MOp::GlobalLoadU16 | MOp::GlobalLoadF32 => {
+                    if let Some(d) = inst.dst {
+                        if m.vreg_class(d) != RClass::V1 {
+                            errs.push(format!("block {bi} inst {ii}: load dst must be V1"));
+                        }
+                    }
+                    if let Some(Src::Reg(a)) = inst.srcs.first() {
+                        if m.vreg_class(*a) != RClass::V2 {
+                            errs.push(format!("block {bi} inst {ii}: load base must be V2"));
+                        }
+                    } else {
+                        errs.push(format!("block {bi} inst {ii}: load needs a base register"));
+                    }
+                }
+                MOp::GlobalStoreU16 | MOp::GlobalStoreF32 => {
+                    if let Some(Src::Reg(a)) = inst.srcs.first() {
+                        if m.vreg_class(*a) != RClass::V2 {
+                            errs.push(format!("block {bi} inst {ii}: store base must be V2"));
+                        }
+                    }
+                }
+                MOp::SLoadDwordx2 => {
+                    if let Some(d) = inst.dst {
+                        if m.vreg_class(d) != RClass::S2 {
+                            errs.push(format!("block {bi} inst {ii}: s_load_dwordx2 dst must be S2"));
+                        }
+                    }
+                }
+                MOp::SLoadDword => {
+                    if let Some(d) = inst.dst {
+                        if m.vreg_class(d) != RClass::S1 {
+                            errs.push(format!("block {bi} inst {ii}: s_load_dword dst must be S1"));
+                        }
+                    }
+                }
+                MOp::VPtrAdd => {
+                    if let Some(d) = inst.dst {
+                        if m.vreg_class(d) != RClass::V2 {
+                            errs.push(format!("block {bi} inst {ii}: ptradd dst must be V2"));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Branch targets must exist.
+        match &b.term {
+            Term::Goto(t) => {
+                if !labels.contains(t) {
+                    errs.push(format!("block {bi}: branch to unknown label {t}"));
+                }
+            }
+            Term::CondGoto { target, fall, .. } => {
+                if !labels.contains(target) {
+                    errs.push(format!("block {bi}: branch to unknown label {target}"));
+                }
+                if !labels.contains(fall) {
+                    errs.push(format!("block {bi}: branch to unknown label {fall}"));
+                }
+            }
+            Term::Endpgm => {}
+        }
+    }
+    errs
+}

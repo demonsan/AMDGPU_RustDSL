@@ -1,0 +1,10 @@
+[package]
+name = "amdc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Command line driver for the AMDGPU Rust DSL compiler"
+
+[dependencies]
+amdgpu-dsl = { path = "../amdgpu-dsl" }
+amdgpu-compiler = { path = "../amdgpu-compiler" }

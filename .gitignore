@@ -8,6 +8,7 @@ Cargo.lock
 *.hsaco
 *.o
 *.s
+!tools/probe.s
 *.mir
 !fixtures/**/*.md
 
@@ -22,3 +23,6 @@ Cargo.lock
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local toolchain scratch (Rust is installed inside the container)
+_tools/

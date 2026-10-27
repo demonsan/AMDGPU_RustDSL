@@ -1,0 +1,722 @@
+//! Typed, structured IR and builder for AMDGPU kernels.
+//!
+//! Design notes
+//! ------------
+//! * Pure values are SSA (`ValueId`); values defined inside a loop or an `if`
+//!   body are scoped to that region.
+//! * Loop-carried state uses explicit mutable variables (`VarId`) rather than
+//!   phi nodes. Lowering maps each variable to a virtual register, which keeps
+//!   the backend free of phi elimination and makes the ownership rules
+//!   ("a variable is written only through `SetVar`") checkable.
+//! * Every operation is typed and target independent: no physical register
+//!   numbers or machine encodings appear at this level.
+//! * Effects are explicit: only `Load*`/`Store*`/`Kernarg*` touch memory.
+
+use std::collections::HashSet;
+use std::fmt::Write as _;
+
+pub type ValueId = u32;
+pub type VarId = u32;
+
+/// Element types understood by the IR.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum DType {
+    /// 16-bit float bit pattern held in a 32-bit register's low half.
+    F16,
+    F32,
+    I32,
+    U32,
+    /// Predicate, materialised as 0/1 in a 32-bit register.
+    I1,
+    /// 64-bit global pointer.
+    Ptr,
+}
+
+impl DType {
+    pub fn is_int(self) -> bool {
+        matches!(self, DType::I32 | DType::U32 | DType::I1)
+    }
+
+    pub fn is_float(self) -> bool {
+        matches!(self, DType::F32)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            DType::F16 => "f16",
+            DType::F32 => "f32",
+            DType::I32 => "i32",
+            DType::U32 => "u32",
+            DType::I1 => "i1",
+            DType::Ptr => "ptr",
+        }
+    }
+
+    pub fn dwords(self) -> u32 {
+        match self {
+            DType::Ptr => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// Operand of an operation or statement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Opnd {
+    Val(ValueId),
+    Var(VarId),
+    I32(i32),
+    F32(f32),
+}
+
+impl From<ValueId> for Opnd {
+    fn from(v: ValueId) -> Self {
+        Opnd::Val(v)
+    }
+}
+
+impl From<VarId> for Opnd {
+    fn from(v: VarId) -> Self {
+        Opnd::Var(v)
+    }
+}
+
+impl From<i32> for Opnd {
+    fn from(v: i32) -> Self {
+        Opnd::I32(v)
+    }
+}
+
+impl From<f32> for Opnd {
+    fn from(v: f32) -> Self {
+        Opnd::F32(v)
+    }
+}
+
+/// Pure operations. All operands are consumed by value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Op {
+    ConstI32(i32),
+    ConstF32(f32),
+
+    KernargI32 { offset: u32 },
+    KernargF32 { offset: u32 },
+    KernargPtr { offset: u32 },
+
+    WorkitemId,
+    WorkgroupIdX,
+    WorkgroupIdY,
+    WorkgroupIdZ,
+
+    AddI32(Opnd, Opnd),
+    MulI32(Opnd, Opnd),
+    ShlI32(Opnd, Opnd),
+    LshrI32(Opnd, Opnd),
+    AndI32(Opnd, Opnd),
+
+    AddF32(Opnd, Opnd),
+    SubF32(Opnd, Opnd),
+    MulF32(Opnd, Opnd),
+    MaxF32(Opnd, Opnd),
+    FmaF32(Opnd, Opnd, Opnd),
+    ExpF32(Opnd),
+    RcpF32(Opnd),
+
+    CvtF16ToF32(Opnd),
+    CvtF32ToF16(Opnd),
+
+    CmpLtI32(Opnd, Opnd),
+    CmpGeI32(Opnd, Opnd),
+    NotI1(Opnd),
+    Select { ty: DType, cond: Opnd, a: Opnd, b: Opnd },
+
+    /// `base + byte_off` for a 64-bit pointer; offset is a 32-bit value.
+    PtrAdd { base: Opnd, byte_off: Opnd },
+
+    LoadU16 { base: Opnd, byte_off: u32 },
+    LoadF32 { base: Opnd, byte_off: u32 },
+}
+
+impl Op {
+    pub fn result_ty(&self) -> DType {
+        match self {
+            Op::ConstI32(_) | Op::KernargI32 { .. } | Op::AddI32(..) | Op::MulI32(..) => DType::I32,
+            Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::LoadU16 { .. } => DType::I32,
+            Op::ConstF32(_) | Op::KernargF32 { .. } => DType::F32,
+            Op::AddF32(..) | Op::SubF32(..) | Op::MulF32(..) | Op::MaxF32(..) | Op::FmaF32(..) => {
+                DType::F32
+            }
+            Op::ExpF32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } => DType::F32,
+            Op::CvtF32ToF16(..) => DType::I32,
+            Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
+            Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) => DType::I1,
+            Op::Select { ty, .. } => *ty,
+            Op::PtrAdd { .. } | Op::KernargPtr { .. } => DType::Ptr,
+        }
+    }
+
+    pub fn operands(&self) -> Vec<Opnd> {
+        match self {
+            Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. }
+            | Op::KernargPtr { .. } | Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY
+            | Op::WorkgroupIdZ => vec![],
+            Op::AddI32(a, b)
+            | Op::MulI32(a, b)
+            | Op::ShlI32(a, b)
+            | Op::LshrI32(a, b)
+            | Op::AndI32(a, b)
+            | Op::AddF32(a, b)
+            | Op::SubF32(a, b)
+            | Op::MulF32(a, b)
+            | Op::MaxF32(a, b)
+            | Op::CmpLtI32(a, b)
+            | Op::CmpGeI32(a, b)
+            | Op::PtrAdd { base: a, byte_off: b } => vec![*a, *b],
+            Op::FmaF32(a, b, c) => vec![*a, *b, *c],
+            Op::ExpF32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
+                vec![*a]
+            }
+            Op::Select { cond, a, b, .. } => vec![*cond, *a, *b],
+            Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } => vec![*base],
+        }
+    }
+}
+
+/// Statements: a flat sequence with explicit structured markers.
+#[derive(Clone, Debug)]
+pub enum Stmt {
+    Let { dst: ValueId, op: Op },
+    StoreU16 { base: Opnd, byte_off: u32, value: Opnd },
+    StoreF32 { base: Opnd, byte_off: u32, value: Opnd },
+    SetVar { var: VarId, value: Opnd },
+    BeginLoop { vars: Vec<VarId>, init: Vec<Opnd> },
+    BreakIf { cond: Opnd },
+    EndLoop,
+    BeginIf { cond: Opnd },
+    Else,
+    EndIf,
+}
+
+#[derive(Clone, Debug)]
+pub struct Arg {
+    pub name: String,
+    pub ty: DType,
+    pub kernarg_offset: u32,
+    pub size: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Function {
+    pub name: String,
+    pub args: Vec<Arg>,
+    pub kernarg_size: u32,
+    pub workgroup_size: u32,
+    pub stmts: Vec<Stmt>,
+    pub var_tys: Vec<DType>,
+    pub value_tys: Vec<DType>,
+}
+
+impl Function {
+    pub fn value_ty(&self, v: ValueId) -> Option<DType> {
+        self.value_tys.get(v as usize).copied()
+    }
+
+    pub fn var_ty(&self, v: VarId) -> Option<DType> {
+        self.var_tys.get(v as usize).copied()
+    }
+
+    /// Human readable dump used by tests and `amdc dump`.
+    pub fn dump(&self) -> String {
+        let mut s = String::new();
+        let _ = writeln!(s, "fn {} (wg={}, kernarg={})", self.name, self.workgroup_size, self.kernarg_size);
+        for a in &self.args {
+            let _ = writeln!(s, "  arg {} : {} @ {} (+{})", a.name, a.ty.name(), a.kernarg_offset, a.size);
+        }
+        let mut depth = 0usize;
+        for st in &self.stmts {
+            match st {
+                Stmt::EndLoop | Stmt::EndIf | Stmt::Else => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            let pad = "  ".repeat(depth + 1);
+            match st {
+                Stmt::Let { dst, op } => {
+                    let _ = writeln!(s, "{pad}v{dst}: {} = {op:?}", self.value_ty(*dst).map(|t| t.name()).unwrap_or("?"));
+                }
+                Stmt::StoreU16 { base, byte_off, value } => {
+                    let _ = writeln!(s, "{pad}store u16 [{base:?}+{byte_off}] <- {value:?}");
+                }
+                Stmt::StoreF32 { base, byte_off, value } => {
+                    let _ = writeln!(s, "{pad}store f32 [{base:?}+{byte_off}] <- {value:?}");
+                }
+                Stmt::SetVar { var, value } => {
+                    let _ = writeln!(s, "{pad}var{var} <- {value:?}");
+                }
+                Stmt::BeginLoop { vars, init } => {
+                    let _ = writeln!(s, "{pad}loop vars={vars:?} init={init:?}");
+                    depth += 1;
+                }
+                Stmt::BreakIf { cond } => {
+                    let _ = writeln!(s, "{pad}break if {cond:?}");
+                }
+                Stmt::EndLoop => {
+                    let _ = writeln!(s, "{pad}endloop");
+                }
+                Stmt::BeginIf { cond } => {
+                    let _ = writeln!(s, "{pad}if {cond:?}");
+                    depth += 1;
+                }
+                Stmt::Else => {
+                    let _ = writeln!(s, "{pad}else");
+                    depth += 1;
+                }
+                Stmt::EndIf => {
+                    let _ = writeln!(s, "{pad}endif");
+                }
+            }
+        }
+        s
+    }
+}
+
+/// Builder that allocates ids and keeps the statement stream balanced.
+pub struct FnBuilder {
+    pub f: Function,
+}
+
+impl FnBuilder {
+    pub fn new(name: &str, workgroup_size: u32) -> Self {
+        FnBuilder {
+            f: Function {
+                name: name.to_string(),
+                args: Vec::new(),
+                kernarg_size: 0,
+                workgroup_size,
+                stmts: Vec::new(),
+                var_tys: Vec::new(),
+                value_tys: Vec::new(),
+            },
+        }
+    }
+
+    pub fn arg(&mut self, name: &str, ty: DType, offset: u32, size: u32) {
+        self.f.args.push(Arg { name: name.to_string(), ty, kernarg_offset: offset, size });
+        self.f.kernarg_size = self.f.kernarg_size.max(offset + size);
+    }
+
+    pub fn let_(&mut self, op: Op) -> ValueId {
+        let ty = op.result_ty();
+        let dst = self.f.value_tys.len() as ValueId;
+        self.f.value_tys.push(ty);
+        self.f.stmts.push(Stmt::Let { dst, op });
+        dst
+    }
+
+    pub fn store_u16(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::StoreU16 { base: base.into(), byte_off, value: value.into() });
+    }
+
+    pub fn store_f32(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::StoreF32 { base: base.into(), byte_off, value: value.into() });
+    }
+
+    pub fn set_var(&mut self, var: VarId, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::SetVar { var, value: value.into() });
+    }
+
+    /// Declares `vars` initialised from `init`, then opens the loop body.
+    pub fn begin_loop(&mut self, inits: &[(DType, Opnd)]) -> Vec<VarId> {
+        let mut vars = Vec::with_capacity(inits.len());
+        let mut init = Vec::with_capacity(inits.len());
+        for (ty, val) in inits {
+            let id = self.f.var_tys.len() as VarId;
+            self.f.var_tys.push(*ty);
+            vars.push(id);
+            init.push(*val);
+        }
+        self.f.stmts.push(Stmt::BeginLoop { vars: vars.clone(), init });
+        vars
+    }
+
+    pub fn break_if(&mut self, cond: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::BreakIf { cond: cond.into() });
+    }
+
+    pub fn end_loop(&mut self) {
+        self.f.stmts.push(Stmt::EndLoop);
+    }
+
+    pub fn begin_if(&mut self, cond: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::BeginIf { cond: cond.into() });
+    }
+
+    pub fn else_(&mut self) {
+        self.f.stmts.push(Stmt::Else);
+    }
+
+    pub fn end_if(&mut self) {
+        self.f.stmts.push(Stmt::EndIf);
+    }
+
+    pub fn finish(self) -> Function {
+        self.f
+    }
+
+    // ---- convenience constructors -------------------------------------
+
+    pub fn c_i32(&mut self, v: i32) -> ValueId {
+        self.let_(Op::ConstI32(v))
+    }
+
+    pub fn c_f32(&mut self, v: f32) -> ValueId {
+        self.let_(Op::ConstF32(v))
+    }
+
+    pub fn add_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::AddI32(a.into(), b.into()))
+    }
+
+    pub fn mul_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::MulI32(a.into(), b.into()))
+    }
+
+    pub fn shl_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::ShlI32(a.into(), b.into()))
+    }
+
+    pub fn add_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::AddF32(a.into(), b.into()))
+    }
+
+    pub fn sub_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::SubF32(a.into(), b.into()))
+    }
+
+    pub fn mul_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::MulF32(a.into(), b.into()))
+    }
+
+    pub fn max_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::MaxF32(a.into(), b.into()))
+    }
+
+    pub fn fma_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::FmaF32(a.into(), b.into(), c.into()))
+    }
+
+    pub fn exp_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::ExpF32(a.into()))
+    }
+
+    pub fn rcp_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::RcpF32(a.into()))
+    }
+
+    pub fn cvt_f16_to_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CvtF16ToF32(a.into()))
+    }
+
+    pub fn cvt_f32_to_f16(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CvtF32ToF16(a.into()))
+    }
+
+    pub fn cmp_lt_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CmpLtI32(a.into(), b.into()))
+    }
+
+    pub fn load_u16(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
+        self.let_(Op::LoadU16 { base: base.into(), byte_off })
+    }
+
+    pub fn load_f32(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
+        self.let_(Op::LoadF32 { base: base.into(), byte_off })
+    }
+
+    pub fn ptr_add(&mut self, base: impl Into<Opnd>, byte_off: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::PtrAdd { base: base.into(), byte_off: byte_off.into() })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+fn opnd_ty(f: &Function, o: Opnd) -> Result<DType, String> {
+    match o {
+        Opnd::Val(v) => f.value_ty(v).ok_or_else(|| format!("use of undefined value v{v}")),
+        Opnd::Var(v) => f.var_ty(v).ok_or_else(|| format!("use of undefined var v{v}")),
+        Opnd::I32(_) => Ok(DType::I32),
+        Opnd::F32(_) => Ok(DType::F32),
+    }
+}
+
+fn expect_int(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
+    let t = opnd_ty(f, o)?;
+    if t.is_int() || t == DType::U32 {
+        Ok(())
+    } else {
+        Err(format!("{what}: expected integer operand, found {}", t.name()))
+    }
+}
+
+fn expect_float(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
+    let t = opnd_ty(f, o)?;
+    if t.is_float() {
+        Ok(())
+    } else {
+        Err(format!("{what}: expected float operand, found {}", t.name()))
+    }
+}
+
+fn expect_ptr(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
+    let t = opnd_ty(f, o)?;
+    if t == DType::Ptr {
+        Ok(())
+    } else {
+        Err(format!("{what}: expected pointer operand, found {}", t.name()))
+    }
+}
+
+/// Structural, scope and type validation. Returns every problem found.
+pub fn verify(f: &Function) -> Vec<String> {
+    let mut errs = Vec::new();
+
+    // Region stack: values visible in the current scope.
+    let mut scopes: Vec<HashSet<ValueId>> = vec![HashSet::new()];
+    let mut loop_depth = 0usize;
+    let mut if_depth = 0usize;
+    let mut loop_vars: Vec<Vec<VarId>> = Vec::new();
+    // Vars stay readable after their loop ends: the register holds the final
+    // value carried by the last iteration.
+    let mut vars_defined: HashSet<VarId> = HashSet::new();
+
+    let visible = |scopes: &Vec<HashSet<ValueId>>, v: ValueId| {
+        scopes.iter().any(|s| s.contains(&v))
+    };
+
+    for (idx, st) in f.stmts.iter().enumerate() {
+        let here = |e: String| format!("stmt {idx}: {e}");
+        match st {
+            Stmt::Let { dst, op } => {
+                for o in op.operands() {
+                    if let Opnd::Val(v) = o {
+                        if !visible(&scopes, v) {
+                            errs.push(here(format!("operand v{v} is not visible here")));
+                        }
+                    }
+                    if let Opnd::Var(v) = o {
+                        if !vars_defined.contains(&v) {
+                            errs.push(here(format!("var{v} used before its loop")));
+                        }
+                    }
+                }
+                match op {
+                    Op::AddI32(a, b)
+                    | Op::MulI32(a, b)
+                    | Op::ShlI32(a, b)
+                    | Op::LshrI32(a, b)
+                    | Op::AndI32(a, b)
+                    | Op::CmpLtI32(a, b)
+                    | Op::CmpGeI32(a, b) => {
+                        if let Err(e) = expect_int(f, *a, "int op") {
+                            errs.push(here(e));
+                        }
+                        if let Err(e) = expect_int(f, *b, "int op") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::AddF32(a, b) | Op::SubF32(a, b) | Op::MulF32(a, b) | Op::MaxF32(a, b) => {
+                        if let Err(e) = expect_float(f, *a, "float op") {
+                            errs.push(here(e));
+                        }
+                        if let Err(e) = expect_float(f, *b, "float op") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::FmaF32(a, b, c) => {
+                        for o in [a, b, c] {
+                            if let Err(e) = expect_float(f, *o, "fma") {
+                                errs.push(here(e));
+                            }
+                        }
+                    }
+                    Op::ExpF32(a) | Op::RcpF32(a) => {
+                        if let Err(e) = expect_float(f, *a, "unary float") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::CvtF32ToF16(a) => {
+                        if let Err(e) = expect_float(f, *a, "cvt") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::CvtF16ToF32(a) => {
+                        if let Err(e) = expect_int(f, *a, "cvt") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::NotI1(a) => {
+                        if let Ok(t) = opnd_ty(f, *a) {
+                            if t != DType::I1 {
+                                errs.push(here(format!("not: expected i1, found {}", t.name())));
+                            }
+                        }
+                    }
+                    Op::Select { cond, a, b, ty } => {
+                        match opnd_ty(f, *cond) {
+                            Ok(DType::I1) => {}
+                            Ok(t) => errs.push(here(format!("select: cond must be i1, found {}", t.name()))),
+                            Err(e) => errs.push(here(e)),
+                        }
+                        for o in [a, b] {
+                            if let Ok(t) = opnd_ty(f, *o) {
+                                if t != *ty {
+                                    errs.push(here(format!("select: branch type {} != {}", t.name(), ty.name())));
+                                }
+                            }
+                        }
+                    }
+                    Op::PtrAdd { base, byte_off } => {
+                        if let Err(e) = expect_ptr(f, *base, "ptradd") {
+                            errs.push(here(e));
+                        }
+                        if let Err(e) = expect_int(f, *byte_off, "ptradd") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } => {
+                        if let Err(e) = expect_ptr(f, *base, "load") {
+                            errs.push(here(e));
+                        }
+                    }
+                    _ => {}
+                }
+                // Scope: value becomes visible here.
+                scopes.last_mut().unwrap().insert(*dst);
+            }
+            Stmt::StoreU16 { base, value, .. } => {
+                if let Err(e) = expect_ptr(f, *base, "store") {
+                    errs.push(here(e));
+                }
+                if let Err(e) = expect_int(f, *value, "store u16") {
+                    errs.push(here(e));
+                }
+                if let Opnd::Var(v) = value {
+                    if !vars_defined.contains(v) {
+                        errs.push(here(format!("var{v} used before its loop")));
+                    }
+                }
+            }
+            Stmt::StoreF32 { base, value, .. } => {
+                if let Err(e) = expect_ptr(f, *base, "store") {
+                    errs.push(here(e));
+                }
+                if let Err(e) = expect_float(f, *value, "store f32") {
+                    errs.push(here(e));
+                }
+                if let Opnd::Var(v) = value {
+                    if !vars_defined.contains(v) {
+                        errs.push(here(format!("var{v} used before its loop")));
+                    }
+                }
+            }
+            Stmt::SetVar { var, value } => {
+                let ok = loop_vars.last().map(|vs| vs.contains(var)).unwrap_or(false);
+                if !ok {
+                    errs.push(here(format!("var{var} assigned outside its loop")));
+                }
+                if let (Some(vt), Ok(t)) = (f.var_ty(*var), opnd_ty(f, *value)) {
+                    if vt != t && !(vt.is_int() && t.is_int()) {
+                        errs.push(here(format!("var{var} type {} != {}", vt.name(), t.name())));
+                    }
+                }
+                if let Opnd::Val(v) = value {
+                    if !visible(&scopes, *v) {
+                        errs.push(here(format!("operand v{v} is not visible here")));
+                    }
+                }
+            }
+            Stmt::BeginLoop { vars, init } => {
+                if vars.len() != init.len() {
+                    errs.push(here("begin_loop: vars/init length mismatch".into()));
+                }
+                for (i, var) in vars.iter().enumerate() {
+                    if let Some(Opnd::Val(v)) = init.get(i) {
+                        if !visible(&scopes, *v) {
+                            errs.push(here(format!("loop init v{v} is not visible")));
+                        }
+                    }
+                    if let (Some(vt), Some(e)) = (f.var_ty(*var), init.get(i)) {
+                        if let Ok(t) = opnd_ty(f, *e) {
+                            if vt != t && !(vt.is_int() && t.is_int()) {
+                                errs.push(here(format!("loop var{var} type {} != init {}", vt.name(), t.name())));
+                            }
+                        }
+                    }
+                }
+                loop_vars.push(vars.clone());
+                vars_defined.extend(vars.iter().copied());
+                loop_depth += 1;
+                scopes.push(HashSet::new());
+            }
+            Stmt::BreakIf { cond } => {
+                if loop_depth == 0 {
+                    errs.push(here("break outside loop".into()));
+                }
+                if let Ok(t) = opnd_ty(f, *cond) {
+                    if t != DType::I1 {
+                        errs.push(here(format!("break: expected i1, found {}", t.name())));
+                    }
+                }
+                if let Opnd::Val(v) = cond {
+                    if !visible(&scopes, *v) {
+                        errs.push(here(format!("operand v{v} is not visible here")));
+                    }
+                }
+            }
+            Stmt::EndLoop => {
+                if loop_depth == 0 {
+                    errs.push(here("endloop without loop".into()));
+                } else {
+                    loop_depth -= 1;
+                    loop_vars.pop();
+                    scopes.pop();
+                }
+            }
+            Stmt::BeginIf { cond } => {
+                match opnd_ty(f, *cond) {
+                    Ok(DType::I1) => {}
+                    Ok(t) => errs.push(here(format!("if: expected i1, found {}", t.name()))),
+                    Err(e) => errs.push(here(e)),
+                }
+                if_depth += 1;
+                scopes.push(HashSet::new());
+            }
+            Stmt::Else => {
+                if if_depth == 0 {
+                    errs.push(here("else without if".into()));
+                }
+                scopes.pop();
+                scopes.push(HashSet::new());
+            }
+            Stmt::EndIf => {
+                if if_depth == 0 {
+                    errs.push(here("endif without if".into()));
+                } else {
+                    if_depth -= 1;
+                    scopes.pop();
+                }
+            }
+        }
+    }
+
+    if loop_depth != 0 {
+        errs.push("unterminated loop".to_string());
+    }
+    if if_depth != 0 {
+        errs.push("unterminated if".to_string());
+    }
+    errs
+}
+/// Kernel definitions built with this DSL.
+pub mod kernels;
