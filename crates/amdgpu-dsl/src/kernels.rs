@@ -1179,3 +1179,119 @@ pub fn probe_fp8_load() -> Function {
 
     b.finish()
 }
+/// Minimal block-scaled fp8 MFMA bisect, stage 1: constant `Frag8` operands
+/// (every fp8 byte is E4M3 1.0), scale 127, so every `D` element must be 64.0.
+///
+/// `o[tid * 16 + r]` = D register `r` of lane `tid`.
+pub fn probe_fp8_min() -> Function {
+    let mut b = FnBuilder::new("probe_fp8_min", 64);
+    b.lds(256);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let ones = b.c_i32(0x38383838_u32 as i32);
+    let sc = b.c_i32(127);
+    let a8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let b8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let zero = b.frag_zero(DType::Frag16);
+    let d = b.mfma_scale_fp8(a8, b8, zero, sc, sc);
+
+    let c64 = b.c_i32(64);
+    let base = b.mul_i32(tid, c64);
+    let p = b.ptr_add(o, base);
+    for r in 0..16u8 {
+        let lane = b.frag16_lane(d, r);
+        let v = b.bitcast_f32(lane);
+        b.store_f32(p, 4 * r as u32, v);
+    }
+    b.finish()
+}
+
+/// Minimal block-scaled fp8 MFMA bisect, stage 2: the same MFMA but with A / B^T
+/// and the scale bytes loaded from global memory, stored back through the same
+/// simple per-lane addressing as stage 1 (no layout math on the store side).
+pub fn probe_fp8_minload() -> Function {
+    let mut b = FnBuilder::new("probe_fp8_minload", 64);
+    b.lds(256);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let c4 = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c31 = b.c_i32(31);
+    let c64 = b.c_i32(64);
+    let c2048 = b.c_i32(2048);
+    let c4096 = b.c_i32(4096);
+    let c4352 = b.c_i32(4352);
+    let c4608 = b.c_i32(4608);
+
+    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let pblk = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
+    let row = b.mul_i32(j, c64);
+    let koff = b.shl_i32(pblk, c5);
+    let frag_off = b.add_i32(row, koff);
+    let a_base = b.ptr_add(o, frag_off);
+    let bt_off = b.add_i32(frag_off, c2048);
+    let bt_base = b.ptr_add(o, bt_off);
+
+    let a0 = b.load_f32(a_base, 0);
+    let a0 = b.bitcast_i32(a0);
+    let a1 = b.load_f32(a_base, 4);
+    let a1 = b.bitcast_i32(a1);
+    let a2 = b.load_f32(a_base, 8);
+    let a2 = b.bitcast_i32(a2);
+    let a3 = b.load_f32(a_base, 12);
+    let a3 = b.bitcast_i32(a3);
+    let a4 = b.load_f32(a_base, 16);
+    let a4 = b.bitcast_i32(a4);
+    let a5 = b.load_f32(a_base, 20);
+    let a5 = b.bitcast_i32(a5);
+    let a6 = b.load_f32(a_base, 24);
+    let a6 = b.bitcast_i32(a6);
+    let a7 = b.load_f32(a_base, 28);
+    let a7 = b.bitcast_i32(a7);
+    let a8 = b.frag8(a0, a1, a2, a3, a4, a5, a6, a7);
+
+    let b0 = b.load_f32(bt_base, 0);
+    let b0 = b.bitcast_i32(b0);
+    let b1 = b.load_f32(bt_base, 4);
+    let b1 = b.bitcast_i32(b1);
+    let b2 = b.load_f32(bt_base, 8);
+    let b2 = b.bitcast_i32(b2);
+    let b3 = b.load_f32(bt_base, 12);
+    let b3 = b.bitcast_i32(b3);
+    let b4 = b.load_f32(bt_base, 16);
+    let b4 = b.bitcast_i32(b4);
+    let b5 = b.load_f32(bt_base, 20);
+    let b5 = b.bitcast_i32(b5);
+    let b6 = b.load_f32(bt_base, 24);
+    let b6 = b.bitcast_i32(b6);
+    let b7 = b.load_f32(bt_base, 28);
+    let b7 = b.bitcast_i32(b7);
+    let b8 = b.frag8(b0, b1, b2, b3, b4, b5, b6, b7);
+
+    let tid4 = b.mul_i32(tid, c4);
+    let sa_off = b.add_i32(tid4, c4096);
+    let sa_ptr = b.ptr_add(o, sa_off);
+    let sa_f = b.load_f32(sa_ptr, 0);
+    let sa = b.bitcast_i32(sa_f);
+    let sb_off = b.add_i32(tid4, c4352);
+    let sb_ptr = b.ptr_add(o, sb_off);
+    let sb_f = b.load_f32(sb_ptr, 0);
+    let sb = b.bitcast_i32(sb_f);
+
+    let zero = b.frag_zero(DType::Frag16);
+    let d = b.mfma_scale_fp8(a8, b8, zero, sa, sb);
+
+    let out_base = b.mul_i32(tid, c64);
+    let out_off = b.add_i32(out_base, c4608);
+    let dp = b.ptr_add(o, out_off);
+    for r in 0..16u8 {
+        let lane = b.frag16_lane(d, r);
+        let v = b.bitcast_f32(lane);
+        b.store_f32(dp, 4 * r as u32, v);
+    }
+    b.finish()
+}

@@ -128,13 +128,15 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fmha_core") == 0 ||
                              std::strcmp(kern, "probe_pack") == 0 ||
                              std::strcmp(kern, "probe_fp8_matmul") == 0 ||
-                             std::strcmp(kern, "probe_fp8_load") == 0;
+                             std::strcmp(kern, "probe_fp8_load") == 0 ||
+                             std::strcmp(kern, "probe_fp8_min") == 0 ||
+                             std::strcmp(kern, "probe_fp8_minload") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
     // Real-data block-scaled fp8 matmul probe: fill the input region of `dout`
     // with A (32x64 fp8), B^T (32x64 fp8), and the per-lane scale bytes.
-    if (std::strcmp(kern, "probe_fp8_matmul") == 0 || std::strcmp(kern, "probe_fp8_load") == 0) {
+    if (std::strcmp(kern, "probe_fp8_matmul") == 0 || std::strcmp(kern, "probe_fp8_load") == 0 || std::strcmp(kern, "probe_fp8_minload") == 0) {
         const int fp8_test = envi("FP8_TEST", 1);
         std::vector<unsigned char> in(8960, 0);
         for (int i = 0; i < 32; ++i) {
@@ -325,6 +327,40 @@ int main(int argc, char** argv) {
                     partner_bad, bits[0], bits[128]);
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
+    }
+    if (std::strcmp(kern, "probe_fp8_min") == 0) {
+        const unsigned int* w = reinterpret_cast<const unsigned int*>(got.data());
+        int bad = 0;
+        for (int i = 0; i < 64 * 16; ++i) {
+            if (w[i] != 0x42800000u) {  // 64.0f
+                if (bad < 6) std::fprintf(stderr, "fp8_min i=%d got=0x%08x\n", i, w[i]);
+                ++bad;
+            }
+        }
+        std::printf("  fp8_min bad=%d first=0x%08x\n", bad, w[0]);
+        std::printf(bad ? "PROBE_FP8_MIN_FAIL\n" : "PROBE_FP8_MIN_OK\n");
+        return bad != 0;
+    }
+
+    if (std::strcmp(kern, "probe_fp8_minload") == 0) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        const float* dvals = reinterpret_cast<const float*>(raw + 4608);
+        int bad = 0;
+        for (int l = 0; l < 64; ++l) {
+            for (int r = 0; r < 16; ++r) {
+                const int i = 8 * (r / 4) + 4 * (l / 32) + (r % 4);
+                const int j = l % 32;
+                const float want = (i == j) ? 1.0f : 0.0f;
+                const float gotv = dvals[l * 16 + r];
+                if (std::fabs(gotv - want) > 1e-4f) {
+                    if (bad < 8) std::fprintf(stderr, "fp8_minload lane=%d r=%d D[%d][%d] want %g got %g\n", l, r, i, j, want, gotv);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("  fp8_minload bad=%d lane0_r0=%g\n", bad, dvals[0]);
+        std::printf(bad ? "PROBE_FP8_MINLOAD_FAIL\n" : "PROBE_FP8_MINLOAD_OK\n");
+        return bad != 0;
     }
     if (std::strcmp(kern, "probe_fp8_load") == 0) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
