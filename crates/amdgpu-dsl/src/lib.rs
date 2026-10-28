@@ -190,6 +190,8 @@ pub enum Op {
     Frag8(Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd),
     /// Concatenate two four-dword fragments into an eight-dword fragment.
     CatFrag8(Opnd, Opnd),
+    /// Build a sixteen-dword fragment from sixteen scalar dwords.
+    Frag16Build(Vec<Opnd>),
     /// Pack two f32 values into two unsigned-normalized 16-bit values (low = a).
     CvtPknormU16(Opnd, Opnd),
     /// Scale two bf16 values and pack them into two fp8 values, replacing one
@@ -234,6 +236,7 @@ impl Op {
             Op::MfmaFp8_32x32x16 { .. } => DType::Frag16,
             Op::Frag8(..) => DType::Frag8,
             Op::CatFrag8(..) => DType::Frag8,
+            Op::Frag16Build(..) => DType::Frag16,
             Op::CvtPknormU16(..) | Op::CvtScalef32PkFp8Bf16 { .. } | Op::CvtPkFp8F32(..) => DType::U32,
             Op::MfmaScaleFp8_32x32x64 { .. } => DType::Frag16,
             Op::FragZero { ty } => *ty,
@@ -281,6 +284,7 @@ impl Op {
             Op::MfmaFp8_32x32x16 { a, b, c } => vec![*a, *b, *c],
             Op::Frag8(a, b, c, d, e, f, g, h) => vec![*a, *b, *c, *d, *e, *f, *g, *h],
             Op::CatFrag8(a, b) => vec![*a, *b],
+            Op::Frag16Build(v) => v.clone(),
             Op::CvtPknormU16(a, b) | Op::CvtPkFp8F32(a, b) => vec![*a, *b],
             Op::CvtScalef32PkFp8Bf16 { old, src, scale, .. } => vec![*old, *src, *scale],
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
@@ -686,6 +690,12 @@ impl FnBuilder {
         self.let_(Op::CvtPkFp8F32(a.into(), b.into()))
     }
 
+    /// Build a Frag16 from sixteen scalar values (raw dwords).
+    pub fn frag16_build(&mut self, lanes: &[ValueId]) -> ValueId {
+        assert_eq!(lanes.len(), 16);
+        self.let_(Op::Frag16Build(lanes.iter().map(|v| Opnd::Val(*v)).collect()))
+    }
+
     pub fn cat_frag8(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CatFrag8(lo.into(), hi.into()))
     }
@@ -1038,6 +1048,11 @@ pub fn verify(f: &Function) -> Vec<String> {
                         }
                         if let Err(e) = expect_float(f, *scale, "pack fp8 scale") {
                             errs.push(here(e));
+                        }
+                    }
+                    Op::Frag16Build(v) => {
+                        if v.len() != 16 {
+                            errs.push(here("frag16 needs sixteen lanes".to_string()));
                         }
                     }
                     Op::CatFrag8(a, b) => {

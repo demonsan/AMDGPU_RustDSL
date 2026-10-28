@@ -862,6 +862,14 @@ impl Lowerer {
                 }
                 self.val.insert(dst, d);
             }
+            Op::Frag16Build(lanes) => {
+                let v = self.new_vreg(RClass::V16);
+                for (i, o) in lanes.iter().enumerate() {
+                    let r = self.as_v1(*o)?;
+                    self.push(MInst::new(MOp::VWriteSub).def(v).srcreg(r).imm(i as i64));
+                }
+                self.val.insert(dst, v);
+            }
             Op::CatFrag8(lo, hi) => {
                 let lo_r = self.as_v4(*lo)?;
                 let hi_r = self.as_v4(*hi)?;

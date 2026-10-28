@@ -147,7 +147,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fp8_softmax") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_tile") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_2tile") == 0 ||
-                             std::strcmp(kern, "probe_fp8_fmha_online") == 0;
+                             std::strcmp(kern, "probe_fp8_fmha_online") == 0 ||
+                             std::strcmp(kern, "probe_fp8_fmha_oreg") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -262,7 +263,7 @@ int main(int argc, char** argv) {
         }
         CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
         std::printf("[harness] 2tile inputs filled\n");
-    }    if (std::strcmp(kern, "probe_fp8_fmha_online") == 0) {
+    }    if (std::strcmp(kern, "probe_fp8_fmha_online") == 0 || std::strcmp(kern, "probe_fp8_fmha_oreg") == 0) {
         std::vector<unsigned char> in(20480, 0);
         unsigned int seed = 4242u;
         auto next_rand = [&seed]() {
@@ -512,7 +513,7 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
-    if (std::strcmp(kern, "probe_fp8_fmha_online") == 0) {
+    if (std::strcmp(kern, "probe_fp8_fmha_online") == 0 || std::strcmp(kern, "probe_fp8_fmha_oreg") == 0) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         static double S4[32][128];
         for (int t = 0; t < 4; ++t)
