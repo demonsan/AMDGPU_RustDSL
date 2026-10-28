@@ -825,7 +825,15 @@ impl Lowerer {
                             .srcreg(low_kept),
                     );
                 } else {
-                    self.push(MInst::new(MOp::VMovB32).def(d).srcreg(packed));
+                    // The low-half write preserves the upper 16 bits of the
+                    // destination, so seed it with the previous value.
+                    self.push(MInst::new(MOp::VMovB32).def(d).srcreg(ro));
+                    self.push(
+                        MInst::new(MOp::VCvtPkFp8Lo)
+                            .def(d)
+                            .srcreg(rs)
+                            .srcreg(rsc),
+                    );
                 }
                 self.val.insert(dst, d);
             }

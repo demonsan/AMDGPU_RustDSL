@@ -978,6 +978,13 @@ pub fn probe_pack() -> Function {
     let v1 = b.bitcast_f32(lo);
     b.store_f32(p1, 0, v1);
 
+    let c3072 = b.c_i32(3072);
+    let idx3 = b.add_i32(tid, c3072);
+    let off3 = b.mul_i32(idx3, c4);
+    let p3 = b.ptr_add(o, off3);
+    let v3 = b.bitcast_f32(old);
+    b.store_f32(p3, 0, v3);
+
     let idx2 = b.add_i32(tid, c2048);
     let off2 = b.mul_i32(idx2, c4);
     let p2 = b.ptr_add(o, off2);

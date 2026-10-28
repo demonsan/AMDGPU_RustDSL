@@ -299,9 +299,9 @@ int main(int argc, char** argv) {
         return (own_bad || partner_bad) ? 1 : 0;
     }
     if (std::strcmp(kern, "probe_pack") == 0) {
-        unsigned int bits[3072] = {0};
+        unsigned int bits[4096] = {0};
         std::memcpy(bits, got.data(), sizeof(bits));
-        std::printf("  pack pknorm=0x%08x lo=0x%08x hi=0x%08x\n", bits[0], bits[1024], bits[2048]);
+        std::printf("  pack pknorm=0x%08x lo=0x%08x hi=0x%08x old=0x%08x\n", bits[0], bits[1024], bits[2048], bits[3072]);
         int pack_bad = 0;
         if (bits[0] != 0x8000FFFFu) ++pack_bad;
         if ((bits[1024] & 0x0000FFFFu) != 0x3838u) ++pack_bad;
