@@ -6744,14 +6744,30 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let l_var = vars[2];
     let o_vars = [vars[3], vars[4], vars[5], vars[6]];
 
-    // ---- prefetch the next tile (or this one again after the last iteration) ----
+    // ---- K scale dwords of the four 32-key tiles: issued before the prefetch so that waiting for
+    // them (global loads complete in order) does not wait for the prefetch too ----
     let key0 = b.shl_i32(it, c7);
+    let hq4 = cx.kd_stride;
+    let mut kd_dw: Vec<ValueId> = Vec::with_capacity(4);
+    for s in 0..4usize {
+        let kkey0 = b.add_i32(key0, cx.j);
+        let kcs = b.c_i32(32 * s as i32);
+        let kkey_raw = b.add_i32(kkey0, kcs);
+        let kk_ok = b.cmp_lt_i32(kkey_raw, cx.kv_len);
+        let kkey = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kk_ok), a: Opnd::Val(kkey_raw), b: Opnd::Val(cx.kv_last) });
+        let kd_row = b.mul_i32(kkey, hq4);
+        let kd_off = b.add_i32(kd_row, cx.kd_base);
+        let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+        let kd_raw = b.load_f32(kd_ptr, 0);
+        kd_dw.push(b.bitcast_i32(kd_raw));
+    }
+
+    // ---- prefetch the next tile (or this one again after the last iteration) ----
     let it_p1 = b.add_i32(it, c1);
     let has_next = b.cmp_lt_i32(it_p1, cx.nkv);
     let nxt = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_next), a: Opnd::Val(it_p1), b: it.into() });
     let key_next = b.shl_i32(nxt, c7);
     let pre = if no_stage { first.clone() } else { stage_loads(b, key_next) };
-    let hq4 = cx.kd_stride;
     let compute = |b: &mut FnBuilder, masked: bool| {        for hh in 0..2usize {
             // ---- two 32-key score tiles (S^T = K Q^T) of this 64-key substep ----
             let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
@@ -6764,17 +6780,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let kaddr1 = b.add_i32(kaddr0, c64);
                 let kaddr1h = b.add_i32(kaddr1, c32v);
                 let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
-                // K scale dword of key (128 it + 32 s + j)
-                let kkey0 = b.add_i32(key0, cx.j);
-                let kcs = b.c_i32(32 * s as i32);
-                let kkey_raw = b.add_i32(kkey0, kcs);
-            let kk_ok = b.cmp_lt_i32(kkey_raw, cx.kv_len);
-            let kkey = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kk_ok), a: Opnd::Val(kkey_raw), b: Opnd::Val(cx.kv_last) });
-                let kd_row = b.mul_i32(kkey, hq4);
-                let kd_off = b.add_i32(kd_row, cx.kd_base);
-                let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
-                let kd_raw = b.load_f32(kd_ptr, 0);
-                let kd = b.bitcast_i32(kd_raw);
+                let kd = kd_dw[s];
                 let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
                 let sh16 = b.add_i32(cx.g8, c16i);
                 let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
