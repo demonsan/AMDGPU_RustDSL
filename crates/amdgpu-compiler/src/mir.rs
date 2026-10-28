@@ -56,6 +56,7 @@ pub enum MOp {
     VSubF32,
     VMulF32,
     VMaxF32,
+    VMax3F32,
     VFmaF32,
     VExpF32,
     VRcpF32,

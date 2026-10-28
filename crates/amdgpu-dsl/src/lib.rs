@@ -143,6 +143,8 @@ pub enum Op {
     SubF32(Opnd, Opnd),
     MulF32(Opnd, Opnd),
     MaxF32(Opnd, Opnd),
+    /// Three-way maximum (`v_max3_f32`).
+    Max3F32(Opnd, Opnd, Opnd),
     FmaF32(Opnd, Opnd, Opnd),
     ExpF32(Opnd),
     RcpF32(Opnd),
@@ -205,6 +207,7 @@ impl Op {
             Op::CvtF32ToF16(..) => DType::I32,
             Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
             Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) => DType::I1,
+            Op::Max3F32(..) => DType::F32,
             Op::Select { ty, .. } => *ty,
             Op::PtrAdd { .. } | Op::KernargPtr { .. } => DType::Ptr,
             Op::Frag2(..) => DType::Frag2,
@@ -240,6 +243,7 @@ impl Op {
             | Op::CmpGeI32(a, b)
             | Op::PtrAdd { base: a, byte_off: b } => vec![*a, *b],
             Op::FmaF32(a, b, c) => vec![*a, *b, *c],
+            Op::Max3F32(a, b, c) => vec![*a, *b, *c],
             Op::ExpF32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
                 vec![*a]
             }
@@ -504,6 +508,15 @@ impl FnBuilder {
 
     pub fn max_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::MaxF32(a.into(), b.into()))
+    }
+
+    pub fn max3_f32(
+        &mut self,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        c: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::Max3F32(a.into(), b.into(), c.into()))
     }
 
     pub fn fma_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
@@ -774,6 +787,13 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Op::FmaF32(a, b, c) => {
                         for o in [a, b, c] {
                             if let Err(e) = expect_float(f, *o, "fma") {
+                                errs.push(here(e));
+                            }
+                        }
+                    }
+                    Op::Max3F32(a, b, c) => {
+                        for o in [a, b, c] {
+                            if let Err(e) = expect_float(f, *o, "max3") {
                                 errs.push(here(e));
                             }
                         }

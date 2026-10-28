@@ -173,3 +173,27 @@ fn mfma_and_lds_are_emitted() {
         "LDS size not declared in the descriptor"
     );
 }
+#[test]
+fn scaled_mfma_and_max3_are_emitted() {
+    use amdgpu_dsl::{DType, FnBuilder, Op};
+
+    let scaled = compile(&kernel_by_name("probe_mfma_scale").unwrap()).unwrap();
+    assert!(
+        scaled
+            .asm
+            .contains("v_mfma_scale_f32_32x32x64_f8f6f4 v["),
+        "scaled MFMA missing"
+    );
+
+    let mut b = FnBuilder::new("m3", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let x = b.c_f32(1.0);
+    let y = b.c_f32(2.0);
+    let z = b.c_f32(3.0);
+    let m = b.max3_f32(x, y, z);
+    b.store_f32(o, 0, m);
+    let f = b.finish();
+    let compiled = compile(&f).unwrap();
+    assert!(compiled.asm.contains("v_max3_f32"), "v_max3_f32 missing");
+}

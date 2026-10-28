@@ -525,6 +525,21 @@ impl Lowerer {
                 self.push(MInst::new(MOp::VFmaF32).def(d).srcreg(ra).srcreg(rb).srcreg(rc));
                 self.val.insert(dst, d);
             }
+            Op::Max3F32(a, b, c) => {
+                let ra = self.as_v1(*a)?;
+                let rb = self.as_v1(*b)?;
+                let rc = self.as_v1(*c)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rb), Src::Reg(rc)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(
+                    MInst::new(MOp::VMax3F32)
+                        .def(d)
+                        .srcreg(ra)
+                        .srcreg(rb)
+                        .srcreg(rc),
+                );
+                self.val.insert(dst, d);
+            }
             Op::ExpF32(a) => {
                 // The hardware instruction is exp2, so natural exp is
                 // exp2(x * log2(e)).

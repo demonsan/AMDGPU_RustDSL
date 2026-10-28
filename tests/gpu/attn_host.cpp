@@ -218,7 +218,19 @@ int main(int argc, char** argv) {
         std::memcpy(vals, got.data(), sizeof(vals));
         std::printf("  scale variants (lane0): %.6f | %.6f | %.6f | %.6f\n", vals[0], vals[16],
                     vals[32], vals[48]);
-        return 0;
+        // E8M0 127 = 2^0, 128 = 2^1, and only the low byte is used, so the four
+        // variants must be 64, 128, 0, 0.
+        const float want[4] = {64.0f, 128.0f, 0.0f, 0.0f};
+        int scale_bad = 0;
+        for (int v = 0; v < 4; ++v) {
+            if (std::fabs(vals[v * 16] - want[v]) > 1e-3f) {
+                std::fprintf(stderr, "scale variant %d got %.6f want %.6f\n", v, vals[v * 16],
+                             want[v]);
+                ++scale_bad;
+            }
+        }
+        std::printf(scale_bad ? "PROBE_MFMA_SCALE_FAIL\n" : "PROBE_MFMA_SCALE_OK\n");
+        return scale_bad != 0;
     }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,
