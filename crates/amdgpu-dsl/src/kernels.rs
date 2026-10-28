@@ -363,8 +363,14 @@ pub fn probe_mfma_fp8() -> Function {
     }
     b.finish()
 }
-/// Block-scaled fp8 MFMA probe: all-ones E4M3 A/B with K = 64, so the result is
-/// `64 * 2^(scale_a - 127) * 2^(scale_b - 127)` per element.
+
+/// Block-scaled fp8 MFMA probe. All-ones E4M3 A/B with K = 64, so the result
+/// depends only on how the scale operands are interpreted:
+///   (127, 127)          -> 64   if scales are E8M0 exponents with 2^(x-127)
+///   (127, 0x807f)       -> 96   if the dword packs two 32-block scales
+///                       -> 128  if only the low byte is used
+///   (0x807f, 127)       -> 96 or 128
+///   (0x807f, 0x807f)    -> 160  or 256
 pub fn probe_mfma_scale() -> Function {
     let mut b = FnBuilder::new("probe_mfma_scale", 64);
     b.arg("o", DType::Ptr, 0, 8);
@@ -372,30 +378,24 @@ pub fn probe_mfma_scale() -> Function {
     let tid = b.let_(Op::WorkitemId);
     let ones = b.c_i32(0x38383838_u32 as i32);
 
-    let a1 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
-    let b1 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
-    let c1 = b.frag_zero(DType::Frag16);
-    // E8M0 127 == 2^0.
-    let d1 = b.mfma_scale_fp8(a1, b1, c1, 127, 127);
+    let a = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let bfrag = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let zero = b.frag_zero(DType::Frag16);
 
-    let a2 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
-    let b2 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
-    let c2 = b.frag_zero(DType::Frag16);
-    // E8M0 128 == 2^1.
-    let d2 = b.mfma_scale_fp8(a2, b2, c2, 127, 128);
+    let d1 = b.mfma_scale_fp8(a, bfrag, zero, 127, 127);
+    let d2 = b.mfma_scale_fp8(a, bfrag, zero, 127, 0x807f);
+    let d3 = b.mfma_scale_fp8(a, bfrag, zero, 0x807f, 127);
+    let d4 = b.mfma_scale_fp8(a, bfrag, zero, 0x807f, 0x807f);
 
-    let c128 = b.c_i32(128);
-    let lane_off = b.mul_i32(tid, c128);
+    let c256 = b.c_i32(256);
+    let lane_off = b.mul_i32(tid, c256);
     let row = b.ptr_add(o, lane_off);
-    for i in 0..16u8 {
-        let bits = b.frag16_lane(d1, i);
-        let value = b.bitcast_f32(bits);
-        b.store_f32(row, 4 * i as u32, value);
-    }
-    for i in 0..16u8 {
-        let bits = b.frag16_lane(d2, i);
-        let value = b.bitcast_f32(bits);
-        b.store_f32(row, 64 + 4 * i as u32, value);
+    for (v, frag) in [d1, d2, d3, d4].iter().enumerate() {
+        for i in 0..16u8 {
+            let bits = b.frag16_lane(*frag, i);
+            let value = b.bitcast_f32(bits);
+            b.store_f32(row, (v * 64 + 4 * i as usize) as u32, value);
+        }
     }
     b.finish()
 }

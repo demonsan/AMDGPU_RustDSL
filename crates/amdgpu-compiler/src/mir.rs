@@ -319,7 +319,7 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                 }
                 MOp::VMfmaScale32x32x64Fp8 => {
                     // D/A/B/C are 16/8/8/16 dwords, plus two scalar scales.
-                    let want = [RClass::V16, RClass::V8, RClass::V8, RClass::V16, RClass::S1, RClass::S1];
+                    let want = [RClass::V16, RClass::V8, RClass::V8, RClass::V16, RClass::V1, RClass::V1];
                     if let Some(d) = inst.dst {
                         if m.vreg_class(d) != RClass::V16 {
                             errs.push(format!("block {bi} inst {ii}: scaled mfma dst must be V16"));

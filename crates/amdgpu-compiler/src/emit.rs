@@ -311,8 +311,8 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
                 tuple(a, a_reg, 8),
                 tuple(a, b_reg, 8),
                 tuple(a, c_reg, 16),
-                sr(a, sa),
-                sr(a, sb)
+                vr(a, sa),
+                vr(a, sb)
             )]
         }
         MOp::VMfma16x16x32Fp8 => {

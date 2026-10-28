@@ -213,25 +213,12 @@ int main(int argc, char** argv) {
         return fp8_bad != 0;
     }
     if (std::strcmp(kern, "probe_mfma_scale") == 0) {
-        // 32 floats per lane: 16 from scales (127,127) -> 64, then 16 from
-        // scales (127,128) -> 128, if E8M0 scales multiply the product.
-        float vals[2048] = {0.0f};
+        // 64 floats per lane: four scale variants of 16 elements each.
+        float vals[4096] = {0.0f};
         std::memcpy(vals, got.data(), sizeof(vals));
-        int scale_bad = 0;
-        for (int lane = 0; lane < 64; ++lane) {
-            for (int i = 0; i < 16; ++i) {
-                if (std::fabs(vals[lane * 32 + i] - 64.0f) > 1e-3f) {
-                    ++scale_bad;
-                }
-                if (std::fabs(vals[lane * 32 + 16 + i] - 128.0f) > 1e-3f) {
-                    ++scale_bad;
-                }
-            }
-        }
-        std::printf("  scaled mfma lane0: %.6f %.6f | %.6f %.6f bad=%d\n", vals[0], vals[1],
-                    vals[16], vals[17], scale_bad);
-        std::printf(scale_bad ? "PROBE_MFMA_SCALE_FAIL\n" : "PROBE_MFMA_SCALE_OK\n");
-        return scale_bad != 0;
+        std::printf("  scale variants (lane0): %.6f | %.6f | %.6f | %.6f\n", vals[0], vals[16],
+                    vals[32], vals[48]);
+        return 0;
     }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,

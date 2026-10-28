@@ -695,8 +695,8 @@ impl Lowerer {
                 let ra = self.as_v8(*a)?;
                 let rb = self.as_v8(*b)?;
                 let rc = self.as_v16(*c)?;
-                let sa = self.as_s1(*scale_a)?;
-                let sb = self.as_s1(*scale_b)?;
+                let sa = self.as_v1(*scale_a)?;
+                let sb = self.as_v1(*scale_b)?;
                 let d = self.new_vreg(RClass::V16);
                 self.push(
                     MInst::new(MOp::VMfmaScale32x32x64Fp8)
