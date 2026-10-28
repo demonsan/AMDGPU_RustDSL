@@ -6788,8 +6788,12 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let kd_row = b.mul_i32(kkey, hq4);
                 let kd_off = b.add_i32(kd_row, cx.kd_base);
                 let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
-                let kd_raw = b.load_f32(kd_ptr, 0);
-                let kd = b.bitcast_i32(kd_raw);
+                let kd = if fmha_t_opt("kdconst") {
+                    b.c_i32(0x7f7f7f7f)
+                } else {
+                    let kd_raw = b.load_f32(kd_ptr, 0);
+                    b.bitcast_i32(kd_raw)
+                };
                 let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
                 let sh16 = b.add_i32(cx.g8, c16i);
                 let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
