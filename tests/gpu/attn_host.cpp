@@ -335,7 +335,20 @@ int main(int argc, char** argv) {
                 ++dp_bad;
             }
         }
-        std::printf("  datapath bad=%d sample=0x%08x 0x%08x\n", dp_bad, bits[0], bits[2047]);
+        int hi_bad = 0;
+        int lo_bad = 0;
+        for (int i = 0; i < 1024; ++i) {
+            if (bits[i] != want) {
+                ++hi_bad;
+            }
+        }
+        for (int i = 1024; i < 2048; ++i) {
+            if (bits[i] != want) {
+                ++lo_bad;
+            }
+        }
+        std::printf("  datapath bad=%d hi_bad=%d lo_bad=%d sample=0x%08x 0x%08x\n", dp_bad, hi_bad,
+                    lo_bad, bits[0], bits[1024]);
         std::printf(dp_bad ? "PROBE_FMHA_DATAPATH_FAIL\n" : "PROBE_FMHA_DATAPATH_OK\n");
         return dp_bad != 0;
     }
