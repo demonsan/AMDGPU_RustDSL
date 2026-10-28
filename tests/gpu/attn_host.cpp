@@ -115,7 +115,9 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_mfma_scale") == 0 ||
                              std::strcmp(kern, "probe_roles") == 0 ||
                              std::strcmp(kern, "probe_waves2") == 0 ||
-                             std::strcmp(kern, "hw_roles") == 0;
+                             std::strcmp(kern, "hw_roles") == 0 ||
+                             std::strcmp(kern, "hw_lds_neighbour") == 0 ||
+                             std::strcmp(kern, "hw_lds_own") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -302,6 +304,26 @@ int main(int argc, char** argv) {
                     vals[64], vals[65]);
         std::printf(hw_bad ? "HW_ROLES_FAIL\n" : "HW_ROLES_OK\n");
         return hw_bad != 0;
+    }
+    if (std::strcmp(kern, "hw_lds_neighbour") == 0 || std::strcmp(kern, "hw_lds_own") == 0) {
+        const bool neighbour = std::strcmp(kern, "hw_lds_neighbour") == 0;
+        float vals[64] = {0.0f};
+        std::memcpy(vals, got.data(), sizeof(vals));
+        int bad = 0;
+        for (int tid = 0; tid < 64; ++tid) {
+            int want = neighbour ? ((tid + 1) & 63) : tid;
+            if (std::fabs(vals[tid] - (float)want) > 0.5f) {
+                if (bad < 6) {
+                    std::fprintf(stderr, "%s mismatch tid=%d got=%.1f want=%d\n", kern, tid,
+                                 vals[tid], want);
+                }
+                ++bad;
+            }
+        }
+        std::printf("  %s bad=%d sample=%.1f %.1f %.1f %.1f\n", kern, bad, vals[0], vals[1],
+                    vals[2], vals[3]);
+        std::printf(bad ? "HW_LDS_FAIL\n" : "HW_LDS_OK\n");
+        return bad != 0;
     }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,
