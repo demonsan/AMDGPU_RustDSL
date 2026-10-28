@@ -164,6 +164,11 @@ int main(int argc, char** argv) {
                 const unsigned char v =
                     (fp8_test == 1) ? ((k == i) ? 0x38 : 0x00)
                                     : ((fp8_test == 3 || fp8_test == 4) ? palette[next_rand() % 9] : 0x38);
+                if (fp8_test == 5) {
+                    in[i * 64 + k] = 0x38;
+                    in[2048 + i * 64 + k] = (k < 32) ? 0x38 : 0x00;
+                    continue;
+                }
                 in[i * 64 + k] = v;
                 in[2048 + i * 64 + k] = v;
             }
@@ -177,6 +182,9 @@ int main(int argc, char** argv) {
             } else if (fp8_test == 3) {
                 sa = (unsigned char)(126 + next_rand() % 3);
                 sb = (unsigned char)(126 + next_rand() % 3);
+            } else if (fp8_test == 5) {
+                sa = (unsigned char)(127 + (l % 8));
+                sb = 127;
             }
             in[4096 + l * 4] = sa;
             in[4352 + l * 4] = sb;
@@ -423,6 +431,8 @@ int main(int argc, char** argv) {
                     want_d = (i == j) ? 1.0 : 0.0;
                 } else if (fp8_test == 2) {
                     want_d = 64.0 * (double)(1 << (((i & 1) + (j & 1))));
+                } else if (fp8_test == 5) {
+                    want_d = 32.0 * (double)(1 << (i % 8));
                 } else {
                     want_d = 0.0;
                     for (int kb = 0; kb < 2; ++kb) {
