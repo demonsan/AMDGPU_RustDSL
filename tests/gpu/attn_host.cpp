@@ -119,7 +119,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "hw_lds_neighbour") == 0 ||
                              std::strcmp(kern, "hw_lds_own") == 0 ||
                              std::strncmp(kern, "hw_bisect", 9) == 0 || std::strcmp(kern, "hw_store2") == 0 || std::strcmp(kern, "probe_lds_own") == 0 ||
-                             std::strcmp(kern, "probe_lds_self2") == 0;
+                             std::strcmp(kern, "probe_lds_self2") == 0 ||
+                             std::strcmp(kern, "probe_roles_loop") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -290,6 +291,33 @@ int main(int argc, char** argv) {
                     partner_bad, bits[0], bits[128]);
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
+    }
+    if (std::strcmp(kern, "probe_roles_loop") == 0) {
+        // Four iterations x 512 lanes. Lane tid of wave w reads the value the
+        // partner wave (w+4)%8 wrote, which carries the +100000 role-B marker.
+        unsigned int bits[2048] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
+        int loop_bad = 0;
+        for (int it = 0; it < 4; ++it) {
+            for (int tid = 0; tid < 512; ++tid) {
+                int w = tid / 64;
+                int l = tid % 64;
+                int pw = (w + 4) & 7;
+                unsigned int want = (unsigned int)(it * 1000 + pw * 64 + l + (pw >= 4 ? 100000 : 0));
+                unsigned int got_v = bits[it * 512 + tid];
+                if (got_v != want) {
+                    if (loop_bad < 6) {
+                        std::fprintf(stderr, "roles_loop mismatch it=%d tid=%d got=%u want=%u\n", it,
+                                     tid, got_v, want);
+                    }
+                    ++loop_bad;
+                }
+            }
+        }
+        std::printf("  roles_loop bad=%d sample=%u %u %u %u\n", loop_bad, bits[0], bits[64],
+                    bits[1024], bits[1088]);
+        std::printf(loop_bad ? "PROBE_ROLES_LOOP_FAIL\n" : "PROBE_ROLES_LOOP_OK\n");
+        return loop_bad != 0;
     }
     if (std::strcmp(kern, "hw_roles") == 0) {
         // Hand-written kernel: o[tid] must equal tid for every lane.

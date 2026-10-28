@@ -485,34 +485,6 @@ pub fn probe_waves2() -> Function {
 
     b.finish()
 }
-/// Same shape as `probe_lds`, but each lane reads back its own slot.
-/// `o[tid]` receives the float constant 42.0 (store-path check) and
-/// `o[64+tid]` the raw 32-bit value read from LDS (which must equal `tid`).
-pub fn probe_lds_own() -> Function {
-    let mut b = FnBuilder::new("probe_lds_own", 64);
-    b.lds(256);
-    b.arg("o", DType::Ptr, 0, 8);
-    let o = b.let_(Op::KernargPtr { offset: 0 });
-    let tid = b.let_(Op::WorkitemId);
-    let c4 = b.c_i32(4);
-    let c64 = b.c_i32(64);
-    let off = b.mul_i32(tid, c4);
-    b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
-    b.wait_lds(0);
-    b.barrier();
-    b.wait_lds(0);
-    let raw = b.load_lds_b32(Opnd::Val(off));
-    let value = b.bitcast_f32(Opnd::Val(raw));
-    let out_ptr = b.ptr_add(o, off);
-    let c42 = b.c_f32(42.0);
-    b.store_f32(out_ptr, 0, Opnd::Val(c42));
-    let out2_index = b.add_i32(tid, c64);
-    let out2_off = b.mul_i32(out2_index, c4);
-    let out2_ptr = b.ptr_add(o, out2_off);
-    b.store_f32(out2_ptr, 0, Opnd::Val(value));
-    b.finish()
-}
-
 /// Byte-for-byte clone of `probe_lds` with exactly one change: the lane reads
 /// its own slot instead of the neighbour's. Everything else (LDS size, barrier
 /// sequence, single read, single store, workgroup size) is identical.
@@ -532,5 +504,76 @@ pub fn probe_lds_self2() -> Function {
     let value = b.bitcast_f32(Opnd::Val(raw));
     let dst = b.ptr_add(o, self_off);
     b.store_f32(dst, 0, Opnd::Val(value));
+    b.finish()
+}
+/// FMHA-shaped structural skeleton: 8 waves per block, waves 0-3 take role A and
+/// waves 4-7 role B. Four iterations, each with a role-dependent LDS write, two
+/// paired workgroup barriers, and a cross-role LDS read. This is the control
+/// structure the FMHA reference core loop needs (roles + loop + paired
+/// barriers), with data values chosen so a wrong partner or a stale read shows
+/// up immediately.
+pub fn probe_roles_loop() -> Function {
+    let mut b = FnBuilder::new("probe_roles_loop", 512);
+    b.lds(2048);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let c1 = b.c_i32(1);
+    let c4 = b.c_i32(4);
+    let c6 = b.c_i32(6);
+    let c7 = b.c_i32(7);
+    let c63 = b.c_i32(63);
+    let c64 = b.c_i32(64);
+    let c512 = b.c_i32(512);
+    let c1000 = b.c_i32(1000);
+    let c100000 = b.c_i32(100000);
+
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let is_a = b.cmp_lt_i32(wave, c4);
+    let lds_off = b.mul_i32(tid, c4);
+    let wave_plus = b.add_i32(wave, c4);
+    let partner = b.let_(Op::AndI32(Opnd::Val(wave_plus), Opnd::Val(c7)));
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
+    let partner_row = b.mul_i32(partner, c64);
+    let partner_index = b.add_i32(partner_row, lane);
+    let partner_off = b.mul_i32(partner_index, c4);
+
+    let iter_init = b.c_i32(0);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(iter_init))]);
+    let iter = vars[0];
+
+    let scaled = b.mul_i32(iter, c1000);
+    let base = b.add_i32(scaled, tid);
+    b.begin_if(Opnd::Val(is_a));
+    b.store_lds_b32(Opnd::Val(lds_off), Opnd::Val(base));
+    b.else_();
+    let marked = b.add_i32(base, c100000);
+    b.store_lds_b32(Opnd::Val(lds_off), Opnd::Val(marked));
+    b.end_if();
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    let got = b.load_lds_b32(Opnd::Val(partner_off));
+    let out_index_base = b.mul_i32(iter, c512);
+    let out_index = b.add_i32(out_index_base, tid);
+    let out_off = b.mul_i32(out_index, c4);
+    let out_ptr = b.ptr_add(o, out_off);
+    let out_value = b.bitcast_f32(Opnd::Val(got));
+    b.store_f32(out_ptr, 0, Opnd::Val(out_value));
+
+    // Second barrier: no wave may overwrite LDS before everyone has read it.
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    let next = b.add_i32(iter, c1);
+    b.set_var(iter, next);
+    let more = b.cmp_lt_i32(next, c4);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+
     b.finish()
 }
