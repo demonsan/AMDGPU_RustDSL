@@ -5458,7 +5458,6 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
     let corr_row = b.add_i32(j4, lds_corr);
     let tid4 = b.mul_i32(tid, c4);
     let tid256 = b.shl_i32(tid, c8);
-    let zero = b.frag_zero(DType::Frag16);
 
     let j128 = b.mul_i32(j, c128);
     let p32 = b.shl_i32(pblk, c5);
@@ -5495,6 +5494,7 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
 
     b.begin_if(is_a);
     {
+    let zero = b.frag_zero(DType::Frag16);
     let m_init = b.bitcast_i32(neg_big);
     let vars = b.begin_loop(&[
         (DType::I32, Opnd::Val(c0)),
@@ -5554,7 +5554,8 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
             let sb_c0 = b.bitcast_i32(sbf0);
             let sbf1 = b.load_f32(sbp, 256);
             let sb_c1 = b.bitcast_i32(sbf1);
-            let s0 = b.mfma_scale_fp8(a8_0, k8_0, zero, sa0, sb_c0);
+            let zero_s = b.frag_zero(DType::Frag16);
+            let s0 = b.mfma_scale_fp8(a8_0, k8_0, zero_s, sa0, sb_c0);
             let s_frag = b.mfma_scale_fp8(a8_1, k8_1, s0, sa1, sb_c1);
             let reg = b.c_i32((4096 * sl) as i32);
             let lbase = b.add_i32(lds_dyn, reg);
@@ -5744,6 +5745,7 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
     }
     b.else_();
     {
+    let zero = b.frag_zero(DType::Frag16);
     let m_init = b.bitcast_i32(neg_big);
     let vars = b.begin_loop(&[
         (DType::I32, Opnd::Val(c0)),
@@ -5803,7 +5805,8 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
             let sb_c0 = b.bitcast_i32(sbf0);
             let sbf1 = b.load_f32(sbp, 256);
             let sb_c1 = b.bitcast_i32(sbf1);
-            let s0 = b.mfma_scale_fp8(a8_0, k8_0, zero, sa0, sb_c0);
+            let zero_s = b.frag_zero(DType::Frag16);
+            let s0 = b.mfma_scale_fp8(a8_0, k8_0, zero_s, sa0, sb_c0);
             let s_frag = b.mfma_scale_fp8(a8_1, k8_1, s0, sa1, sb_c1);
             let reg = b.c_i32((4096 * sl) as i32);
             let lbase = b.add_i32(lds_dyn, reg);
