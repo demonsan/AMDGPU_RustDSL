@@ -137,6 +137,11 @@ pub struct Exported {
 }
 
 pub fn export(m: &MFunction, a: &Alloc) -> Result<Exported, String> {
+    export_with(m, a, false)
+}
+
+/// markers: begin every block with a unique s_setprio <block> (oracle tooling only).
+pub fn export_with(m: &MFunction, a: &Alloc, markers: bool) -> Result<Exported, String> {
     let table = Table::load();
     let label_idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
     let nblocks = m.blocks.len();
@@ -147,6 +152,10 @@ pub fn export(m: &MFunction, a: &Alloc) -> Result<Exported, String> {
     for (bi, b) in m.blocks.iter().enumerate() {
         let cx = RenderCtx { m, a, target: None };
         let mut out = Vec::new();
+        if markers {
+            let mk = MInst::new(MOp::SNop).imm(bi as i64);
+            out.push(llvm20::render_text(&table.rows["X_Marker"].text[0], &mk, &cx)?);
+        }
         for inst in &b.insts {
             out.extend(llvm20::render_inst(&table, inst, &cx).map_err(|e| format!("block {bi}: {e}"))?);
         }

@@ -100,3 +100,5 @@ T_Scc1      | <- | S_CBRANCH_SCC1 {t}, implicit $scc
 T_Vccnz     | <- | S_CBRANCH_VCCNZ {t}, implicit $vcc
 T_Vccz      | <- | S_CBRANCH_VCCZ {t}, implicit $vcc
 T_Endpgm    | <- | S_ENDPGM 0
+# oracle tooling: unique block marker (not a hazard)
+X_Marker    | <- | S_SETPRIO {imm}

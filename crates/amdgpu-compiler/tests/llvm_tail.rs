@@ -58,7 +58,7 @@ fn opcode_probe_every_row_assembles() {
     let t = Table::load();
     let tail = LlvmTail::new();
     let mut failures = Vec::new();
-    let mut keys: Vec<&String> = t.rows.keys().filter(|k| !k.starts_with("T_")).collect();
+    let mut keys: Vec<&String> = t.rows.keys().filter(|k| !k.starts_with("T_") && !k.starts_with("X_")).collect();
     keys.sort();
     for key in keys {
         let row = &t.rows[key];
