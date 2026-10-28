@@ -61,9 +61,27 @@ for i, a, b in mism[:15]:
     print(f'        llvm : {b}')
 print(f'nop cycles : own={nop_cycles(of)} llvm={nop_cycles(lf)}')
 print(f'filler ops : own={dict(stats(of))} llvm={dict(stats(lf))}')
-if len(sys.argv) > 3:
+if len(sys.argv) > 3 and sys.argv[3] == 'nops':
     print('--- LLVM-inserted filler with neighbours (core index: prev | filler | next)')
     for idx, l in lf:
         prev = lc[idx - 1] if idx > 0 else '<start>'
         nxt = lc[idx] if idx < len(lc) else '<end>'
         print(f'{idx:6d}: {prev}  |  {l}  |  {nxt}')
+def waits_at(filler):
+    d = collections.defaultdict(list)
+    for idx, l in filler:
+        if l.startswith('s_waitcnt'):
+            d[idx].append(l[len('s_waitcnt '):])
+    return d
+
+if len(sys.argv) > 3 and sys.argv[3] == 'waits':
+    ow, lw = waits_at(of), waits_at(lf)
+    print('--- waitcnt differences at the same core position (own vs llvm)')
+    n = 0
+    for idx in sorted(set(ow) | set(lw)):
+        if ow.get(idx) != lw.get(idx):
+            n += 1
+            prev = lc[idx - 1] if idx > 0 else '<start>'
+            nxt = lc[idx] if idx < len(lc) else '<end>'
+            print(f'{idx:6d}: own={ow.get(idx)} llvm={lw.get(idx)}   [{prev}] -> [{nxt}]')
+    print(f'{n} positions differ')
