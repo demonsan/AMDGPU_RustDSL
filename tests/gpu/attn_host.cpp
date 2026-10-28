@@ -545,6 +545,7 @@ int main(int argc, char** argv) {
         int bad = 0;
         double worst = 0.0;
         static double S4[32][128];
+        int wbad[8] = {0};
         for (int w = 0; w < 8; ++w) {
             for (int t = 0; t < 4; ++t)
                 for (int i = 0; i < 32; ++i)
@@ -585,11 +586,12 @@ int main(int argc, char** argv) {
                     worst = std::max(worst, std::fabs(gotv - ref));
                     if (std::fabs(gotv - ref) > 2e-3 + 2e-3 * std::fabs(ref)) {
                         if (bad < 6) std::fprintf(stderr, "multiwave w=%d O[%d][%d] want %.6f got %.6f\n", w, i, d, ref, gotv);
-                        ++bad;
+                        ++bad; ++wbad[w];
                     }
                 }
             }
         }
+        std::printf("  per-wave bad:"); for (int w = 0; w < 8; ++w) std::printf(" %d", wbad[w]); std::printf("\n");
         std::printf("  fmha_multiwave bad=%d worst_vs_emulated=%.3e\n", bad, worst);
         std::printf(bad ? "PROBE_FMHA_MULTIWAVE_FAIL\n" : "PROBE_FMHA_MULTIWAVE_OK\n");
         return bad != 0;
