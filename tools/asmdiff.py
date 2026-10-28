@@ -16,7 +16,8 @@ def load(path):
     return out
 
 def is_filler(l):
-    # unconditional branches: we always emit them, LLVM drops fallthrough ones\n    return l.startswith(('s_nop', 's_waitcnt', 's_delay_alu', 's_set_vgpr_msb', 's_branch'))
+    # unconditional branches: we always emit them, LLVM drops fallthrough ones
+    return l.startswith(('s_nop', 's_waitcnt', 's_delay_alu', 's_set_vgpr_msb', 's_branch'))
 
 def norm(l):
     # LLVM may pick different (equivalent) mnemonics for the same op; normalise a few.
@@ -56,7 +57,8 @@ lc_n = [norm(x) for x in lc]
 mism = [(i, a, b) for i, (a, b) in enumerate(zip(oc_n, lc_n)) if a != b]
 print(f'core instructions: own={len(oc)} llvm={len(lc)} mismatches={len(mism)}')
 for i, a, b in mism[:15]:
-    print(f'  #{i}: own  : {a}\n        llvm : {b}')
+    print(f'  #{i}: own  : {a}
+        llvm : {b}')
 print(f'nop cycles : own={nop_cycles(of)} llvm={nop_cycles(lf)}')
 print(f'filler ops : own={dict(stats(of))} llvm={dict(stats(lf))}')
 if len(sys.argv) > 3:
