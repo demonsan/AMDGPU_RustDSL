@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
                 ++read_bad;
             }
         }
-        std::printf("  lds_own first_bad=%d second_bad=%d first[0]=%.1f second[0]=%.1f\n", const_bad,
+        std::printf("  lds_own first_bad=%d second_bad=%d first[0]=%.1f second[0]=%.1f\n", first_bad,
                     read_bad, vals[0], vals[64]);
         std::printf((first_bad || read_bad) ? "LDS_OWN_FAIL\n" : "LDS_OWN_OK\n");
         return (first_bad || read_bad) ? 1 : 0;
