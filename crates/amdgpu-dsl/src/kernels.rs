@@ -6729,15 +6729,11 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let s = 2 * hh + sl;
             let ko = b.c_i32((4096 * s) as i32);
             let kaddr0 = b.add_i32(cx.kf_base, ko);
-            let k_lo0 = b.load_lds_b128(Opnd::Val(kaddr0));
             let kaddr0h = b.add_i32(kaddr0, c32v);
-            let k_hi0 = b.load_lds_b128(Opnd::Val(kaddr0h));
-            let k8_0 = b.cat_frag8(k_lo0, k_hi0);
+            let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
             let kaddr1 = b.add_i32(kaddr0, c64);
-            let k_lo1 = b.load_lds_b128(Opnd::Val(kaddr1));
             let kaddr1h = b.add_i32(kaddr1, c32v);
-            let k_hi1 = b.load_lds_b128(Opnd::Val(kaddr1h));
-            let k8_1 = b.cat_frag8(k_lo1, k_hi1);
+            let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
             // K scale dword of key (128 it + 32 s + j)
             let kkey0 = b.add_i32(key0, cx.j);
             let kcs = b.c_i32(32 * s as i32);
@@ -6820,25 +6816,15 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 
         // ---- O^T += V^T P^T, four 32-wide dim tiles; the correction is lane-local ----
         for e in 0..4usize {
-            let mut scaled: Vec<ValueId> = Vec::with_capacity(16);
-            for r in 0..16u8 {
-                let lane = b.frag16_lane(o_vars[e], r);
-                let lanev = b.bitcast_f32(lane);
-                let sc = b.mul_f32(lanev, corr);
-                scaled.push(b.bitcast_i32(sc));
-            }
-            let acc = b.frag16_build(&scaled);
-            let mut vw: Vec<ValueId> = Vec::with_capacity(8);
+            // in place: O *= corr, then O += V^T P^T (no copies)
+            b.var_scale_f32(o_vars[e], corr);
+            let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
             for r in 0..4i32 {
                 let off = b.c_i32((hh as i32) * 8192 + 2048 * r + (e as i32) * 32);
-                let addr = b.add_i32(cx.tr_base, off);
-                let tr = b.load_lds_tr_b8(Opnd::Val(addr));
-                vw.push(b.frag16_lane(tr, 0));
-                vw.push(b.frag16_lane(tr, 1));
+                addrs.push(b.add_i32(cx.tr_base, off));
             }
-            let v8 = b.frag8(vw[0], vw[1], vw[2], vw[3], vw[4], vw[5], vw[6], vw[7]);
-            let o_new = b.mfma_scale_fp8(v8, p8, acc, c127, c123);
-            b.set_var(o_vars[e], o_new);
+            let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+            b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
         }
     }
     // all waves are done with this iteration's K/V before the next staging overwrites them
