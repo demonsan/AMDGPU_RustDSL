@@ -344,6 +344,8 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        const unsigned int* raw32 = reinterpret_cast<const unsigned int*>(raw);
+        std::printf("  diag a0=0x%08x b0=0x%08x sa=0x%08x d0=%g\\n", raw32[8704 / 4], raw32[8960 / 4], raw32[9216 / 4], dvals[0]);
         std::printf("  fp8_matmul test=%d bad=%d\n", fp8_test, bad);
         std::printf(bad ? "PROBE_FP8_MATMUL_FAIL\n" : "PROBE_FP8_MATMUL_OK\n");
         return bad != 0;
