@@ -225,6 +225,21 @@ for j, m in enumerate([0, 1, 2, 3, 4]):
     body += ["s_nop 15"] * 6
     body.append("v_mov_b32 v%d, v32" % (200 + j))
 add("mfma_haz_srcA_after_valu_scale32", mf_setup, body, 1, chk="v200", extra=5)
+# ---- global latency: L1 hit vs L2 hit (L1 thrashed by touching 1 MB first)
+thrash = ["s_mov_b64 s[44:45], s[6:7]"]
+for i in range(256):
+    thrash += ["global_load_dword v20, v243, s[6:7]", "s_add_u32 s6, s6, 4096", "s_addc_u32 s7, s7, 0"]
+thrash += ["s_waitcnt vmcnt(0)", "s_mov_b64 s[6:7], s[44:45]"]
+adv = ["s_add_u32 s6, s6, 4096", "s_addc_u32 s7, s7, 0"]
+same = ["s_add_u32 s6, s6, 0", "s_addc_u32 s7, s7, 0"]
+warm1 = ["global_load_dword v20, v243, s[6:7]", "s_waitcnt vmcnt(0)"]
+add("gl_dword_lat_L2", thrash, ["global_load_dword v16, v243, s[6:7]", "s_waitcnt vmcnt(0)"] + [] , 1)
+add("gl_dword_lat_L2x8", thrash, sum([["global_load_dword v16, v243, s[6:7]", "s_waitcnt vmcnt(0)"] + adv for i in range(8)], []), 8)
+add("gl_dword_lat_L1x8", warm1, sum([["global_load_dword v16, v243, s[6:7]", "s_waitcnt vmcnt(0)"] + same for i in range(8)], []), 8)
+add("gl_dwordx4_lat_L2x8", thrash, sum([["global_load_dwordx4 v[16:19], v244, s[6:7]", "s_waitcnt vmcnt(0)"] + adv for i in range(8)], []), 8)
+add("gl_dwordx4_lat_L1x8", warm1, sum([["global_load_dwordx4 v[16:19], v244, s[6:7]", "s_waitcnt vmcnt(0)"] + same for i in range(8)], []), 8)
+add("gl_dword_lat_sc0sc1x8", warm1, sum([["global_load_dword v16, v243, s[6:7] sc0 sc1", "s_waitcnt vmcnt(0)"] + same for i in range(8)], []), 8)
+add("gl_dword_lat_sc1x8", warm1, sum([["global_load_dword v16, v243, s[6:7] sc1", "s_waitcnt vmcnt(0)"] + same for i in range(8)], []), 8)
 out = [HDR]
 meta = []
 for name, text, n in KS:
@@ -264,6 +279,7 @@ out.append("amdhsa.target: amdgcn-amd-amdhsa--gfx950\namdhsa.version:\n  - 1\n  
 open("mb.s", "w").write("".join(out))
 json.dump({n: m for n, _, m in KS}, open("tests.json", "w"))
 print(len(KS), "kernels")
+
 
 
 
