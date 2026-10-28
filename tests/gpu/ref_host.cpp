@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     const char* co = argc > 1 ? argv[1] : "ref_mxfp8.co";
     auto envi = [](const char* n, int d) { const char* v = std::getenv(n); return v ? std::atoi(v) : d; };
     const int B = envi("REF_B", 1), H = envi("REF_H", 2), S = envi("REF_S", 512), SK = envi("REF_SK", 512);
+    const int HK = envi("REF_HK", H), GQA = H / HK;
     const int D = 128;
     const float softmax_scale = 1.0f / std::sqrt((float)D);
 
@@ -47,7 +48,7 @@ int main(int argc, char** argv) {
     auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 16) & 0xFFu; };
     static const unsigned char palette[11] = {0x00, 0x20, 0x28, 0x30, 0x38, 0x3C, 0x40, 0xA0, 0xA8, 0xB0, 0xB8};
 
-    const size_t nq = (size_t)B * S * H * D, nk = (size_t)B * SK * H * D;
+    const size_t nq = (size_t)B * S * H * D, nk = (size_t)B * SK * HK * D;
     std::vector<unsigned char> q(nq), k(nk), v(nk);
     for (auto& x : q) x = palette[rnd() % 11];
     for (auto& x : k) x = palette[rnd() % 11];
@@ -58,15 +59,15 @@ int main(int argc, char** argv) {
     // allocation carries zeroed slack for the kernel's unguarded tile gathers.
     const size_t qrows = (size_t)S, krows = (size_t)SK;
     const size_t q_slack = (size_t)(256 + 256) * H * 4, k_slack = (size_t)(512 + 128) * H * 4;
-    std::vector<unsigned char> qs((size_t)B * qrows * H * 4 + q_slack, 0), ks((size_t)B * krows * H * 4 + k_slack, 0);    auto qs_at = [&](int b, int s, int h, int blk) -> unsigned char& { return qs[(((size_t)b * qrows + s) * H + h) * 4 + blk]; };
-    auto ks_at = [&](int b, int s, int h, int blk) -> unsigned char& { return ks[(((size_t)b * krows + s) * H + h) * 4 + blk]; };
+    std::vector<unsigned char> qs((size_t)B * qrows * H * 4 + q_slack, 0), ks((size_t)B * krows * HK * 4 + k_slack, 0);    auto qs_at = [&](int b, int s, int h, int blk) -> unsigned char& { return qs[(((size_t)b * qrows + s) * H + h) * 4 + blk]; };
+    auto ks_at = [&](int b, int s, int h, int blk) -> unsigned char& { return ks[(((size_t)b * krows + s) * HK + h) * 4 + blk]; };
     for (int b = 0; b < B; ++b)
         for (int s = 0; s < S; ++s)
             for (int h = 0; h < H; ++h)
                 for (int blk = 0; blk < 4; ++blk) qs_at(b, s, h, blk) = (unsigned char)(126 + rnd() % 3);
     for (int b = 0; b < B; ++b)
         for (int s = 0; s < SK; ++s)
-            for (int h = 0; h < H; ++h)
+            for (int h = 0; h < HK; ++h)
                 for (int blk = 0; blk < 4; ++blk) ks_at(b, s, h, blk) = (unsigned char)(126 + rnd() % 3);
     if (std::getenv("REF_SC1")) {
         const int ev = std::atoi(std::getenv("REF_SC1"));
@@ -100,19 +101,19 @@ int main(int argc, char** argv) {
     put32(args, 0x080, 256 * H * D);           // Q tile stride
     put32(args, 0x090, D);                     // Q head stride
     put32(args, 0x0A0, (uint32_t)((size_t)S * H * D));  // Q batch stride
-    put32(args, 0x0B0, 1);                     // gqa
-    put32(args, 0x0C0, H * D);                 // K seq stride
+    put32(args, 0x0B0, GQA);                   // gqa
+    put32(args, 0x0C0, HK * D);                // K seq stride
     put32(args, 0x0D0, D);                     // K head stride
-    put32(args, 0x0E0, (uint32_t)((size_t)SK * H * D));
+    put32(args, 0x0E0, (uint32_t)((size_t)SK * HK * D));
     put32(args, 0x0F0, 5);                     // opt
     put32(args, 0x110, SK);
     put32(args, 0x120, D); put32(args, 0x130, D);
     put32(args, 0x140, H);
-    put32(args, 0x150, H * D); put32(args, 0x160, D); put32(args, 0x170, (uint32_t)((size_t)SK * H * D));
+    put32(args, 0x150, HK * D); put32(args, 0x160, D); put32(args, 0x170, (uint32_t)((size_t)SK * HK * D));
     put32(args, 0x180, H * D * 2); put32(args, 0x190, D * 2); put32(args, 0x1A0, (uint32_t)((size_t)S * H * D * 2));
     put64(args, 0x200, dqs); put64(args, 0x210, dks); put64(args, 0x220, dvs);
     put32(args, 0x230, (uint32_t)((size_t)qrows * H * 4)); put32(args, 0x240, 4);
-    put32(args, 0x250, (uint32_t)((size_t)krows * H * 4)); put32(args, 0x260, 4);
+    put32(args, 0x250, (uint32_t)((size_t)krows * HK * 4)); put32(args, 0x260, 4);
 
     hipModule_t mod; hipFunction_t fn;
     CK(hipModuleLoad(&mod, co));
@@ -158,8 +159,8 @@ int main(int argc, char** argv) {
                     for (int t = 0; t < SK; ++t) {
                         double acc = 0.0;
                         for (int kk = 0; kk < D; ++kk)
-                            acc += qd[kk] * fp8_e4m3(k[(((size_t)b * SK + t) * H + h) * D + kk]) *
-                                   std::ldexp(1.0, (int)ks_at(b, t, h, kk / 32) - 127);
+                            acc += qd[kk] * fp8_e4m3(k[(((size_t)b * SK + t) * HK + h / GQA) * D + kk]) *
+                                   std::ldexp(1.0, (int)ks_at(b, t, h / GQA, kk / 32) - 127);
                         sc[t] = acc * cpu_scale;
                         mx = std::max(mx, sc[t]);
                     }
@@ -167,7 +168,7 @@ int main(int argc, char** argv) {
                     for (int t = 0; t < SK; ++t) { sc[t] = std::exp(sc[t] - mx); den += sc[t]; }
                     for (int d = 0; d < D; ++d) {
                         double acc = 0.0;
-                        for (int t = 0; t < SK; ++t) acc += sc[t] / den * fp8_e4m3(v[(((size_t)b * SK + t) * H + h) * D + d]);
+                        for (int t = 0; t < SK; ++t) acc += sc[t] / den * fp8_e4m3(v[(((size_t)b * SK + t) * HK + h / GQA) * D + d]);
                         acc *= vdescale;
                         const double got = bf2f(o[(((size_t)b * S + i) * H + h) * D + d]);
                         const double err = std::fabs(got - acc);

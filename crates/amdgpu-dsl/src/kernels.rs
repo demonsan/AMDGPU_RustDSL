@@ -6630,7 +6630,7 @@ struct FmhaTCtx {
     ptr_kd: ValueId,
     k_seqs: ValueId,
     v_seqs: ValueId,
-    q_heads: ValueId,
+    kd_stride: ValueId,
     o_seqs: ValueId,
     o_hs: ValueId,
     o_bs: ValueId,
@@ -6744,7 +6744,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let nxt = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_next), a: Opnd::Val(it_p1), b: it.into() });
     let key_next = b.shl_i32(nxt, c7);
     let pre = if no_stage { first.clone() } else { stage_loads(b, key_next) };
-    let hq4 = b.mul_i32(cx.q_heads, c4);
+    let hq4 = cx.kd_stride;
     for hh in 0..2usize {
         // ---- two 32-key score tiles (S^T = K Q^T) of this 64-key substep ----
         let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
@@ -6928,9 +6928,11 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     b.arg("ptr_q", DType::Ptr, 0x010, 8);
     b.arg("ptr_k", DType::Ptr, 0x020, 8);
     b.arg("ptr_v", DType::Ptr, 0x030, 8);
+    b.arg("s_seq_len", DType::I32, 0x060, 4);
     b.arg("s_Seqs", DType::I32, 0x070, 4);
     b.arg("s_Hs", DType::I32, 0x090, 4);
     b.arg("s_Bs", DType::I32, 0x0A0, 4);
+    b.arg("s_gqa", DType::I32, 0x0B0, 4);
     b.arg("s_k_Seqs", DType::I32, 0x0C0, 4);
     b.arg("s_k_Hs", DType::I32, 0x0D0, 4);
     b.arg("s_k_Bs", DType::I32, 0x0E0, 4);
@@ -6955,6 +6957,8 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let ptr_q = b.let_(Op::KernargPtr { offset: 0x010 });
     let ptr_k = b.let_(Op::KernargPtr { offset: 0x020 });
     let ptr_v = b.let_(Op::KernargPtr { offset: 0x030 });
+    let s_len = b.let_(Op::KernargI32 { offset: 0x060 });
+    let gqa = b.let_(Op::KernargI32 { offset: 0x0B0 });
     let q_seqs = b.let_(Op::KernargI32 { offset: 0x070 });
     let q_hs = b.let_(Op::KernargI32 { offset: 0x090 });
     let q_bs = b.let_(Op::KernargI32 { offset: 0x0A0 });
@@ -6962,7 +6966,6 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let k_hs = b.let_(Op::KernargI32 { offset: 0x0D0 });
     let k_bs = b.let_(Op::KernargI32 { offset: 0x0E0 });
     let kv_len = b.let_(Op::KernargI32 { offset: 0x110 });
-    let q_heads = b.let_(Op::KernargI32 { offset: 0x140 });
     let v_seqs = b.let_(Op::KernargI32 { offset: 0x150 });
     let v_hs = b.let_(Op::KernargI32 { offset: 0x160 });
     let v_bs = b.let_(Op::KernargI32 { offset: 0x170 });
@@ -7022,7 +7025,13 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let wave32 = b.shl_i32(wave, c5);
     let qt256 = b.shl_i32(qtile, c8);
     let row0 = b.add_i32(qt256, wave32);
-    let row = b.add_i32(row0, j);
+    let row_raw = b.add_i32(row0, j);
+    // rows past the end of a partial query tile reuse the last valid row: they compute and store
+    // exactly its (identical) result instead of touching memory out of bounds
+    let cm1 = b.c_i32(-1);
+    let s_last = b.add_i32(s_len, cm1);
+    let row_ok = b.cmp_lt_i32(row_raw, s_len);
+    let row = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_ok), a: Opnd::Val(row_raw), b: Opnd::Val(s_last) });
     let q_row_off = b.mul_i32(row, q_seqs);
     let q_b_off = b.mul_i32(bidx, q_bs);
     let q_h_off = b.mul_i32(hidx, q_hs);
@@ -7042,8 +7051,10 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
         }
         bq.push(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]));
     }
-    let hq4 = b.mul_i32(q_heads, c4);
-    let qd_row = b.mul_i32(row, hq4);
+    let c5b = b.c_i32(5);
+    let qd_stride = b.let_(Op::LshrI32(Opnd::Val(q_seqs), Opnd::Val(c5b)));
+    let kd_stride = b.let_(Op::LshrI32(Opnd::Val(k_seqs), Opnd::Val(c5b)));
+    let qd_row = b.mul_i32(row, qd_stride);
     let qd_b = b.mul_i32(bidx, dq_bs);
     let qd_h = b.mul_i32(hidx, dq_hs);
     let qd0 = b.add_i32(qd_row, qd_b);
@@ -7056,14 +7067,25 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let sq1 = b.let_(Op::LshrI32(Opnd::Val(qd), Opnd::Val(sh16)));
     let vd_raw = b.load_f32(ptr_vd, 0);
 
+    // KV head of this query head (GQA ratio is a power of two <= 16)
+    let g2 = b.cmp_lt_i32(c1, gqa);
+    let g4 = b.cmp_lt_i32(c2, gqa);
+    let g8 = b.cmp_lt_i32(c4, gqa);
+    let g16 = b.cmp_lt_i32(c8, gqa);
+    let c0k = b.c_i32(0);
+    let s1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g2), a: Opnd::Val(c1), b: Opnd::Val(c0k) });
+    let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g4), a: Opnd::Val(c2), b: Opnd::Val(s1) });
+    let s3 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g8), a: Opnd::Val(c3), b: Opnd::Val(s2) });
+    let gshift = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g16), a: Opnd::Val(c4), b: Opnd::Val(s3) });
+    let kvh = b.let_(Op::LshrI32(Opnd::Val(hidx), Opnd::Val(gshift)));
     let kb0 = b.mul_i32(bidx, k_bs);
-    let kb1 = b.mul_i32(hidx, k_hs);
+    let kb1 = b.mul_i32(kvh, k_hs);
     let kbase_off = b.add_i32(kb0, kb1);
     let vb0 = b.mul_i32(bidx, v_bs);
-    let vb1 = b.mul_i32(hidx, v_hs);
+    let vb1 = b.mul_i32(kvh, v_hs);
     let vbase_off = b.add_i32(vb0, vb1);
     let kd_b = b.mul_i32(bidx, dk_bs);
-    let kd_h = b.mul_i32(hidx, dk_hs);
+    let kd_h = b.mul_i32(kvh, dk_hs);
     let kd_base = b.add_i32(kd_b, kd_h);
 
     let rt = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c255)));
@@ -7104,7 +7126,7 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
         ptr_kd,
         k_seqs,
         v_seqs,
-        q_heads,
+        kd_stride,
         o_seqs,
         o_hs,
         o_bs,
