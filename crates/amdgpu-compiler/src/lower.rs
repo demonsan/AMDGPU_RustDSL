@@ -811,7 +811,13 @@ impl Lowerer {
                             .srcreg(packed),
                     );
                     let low_kept = self.new_vreg(RClass::V1);
-                    self.push(MInst::new(MOp::VAndB32).def(low_kept).srcreg(ro).imm(0xFFFF));
+                    let mask = self.const_vreg(0xFFFF);
+                    self.push(
+                        MInst::new(MOp::VAndB32)
+                            .def(low_kept)
+                            .srcreg(ro)
+                            .srcreg(mask),
+                    );
                     self.push(
                         MInst::new(MOp::VOrB32)
                             .def(d)
