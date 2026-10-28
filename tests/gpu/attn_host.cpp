@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
     }
     if (std::strcmp(kern, "probe_mfma_scale") == 0) {
         // 64 floats per lane: four scale variants of 16 elements each.
-        float vals[4096] = {0.0f};
+        float vals[2048] = {0.0f};
         std::memcpy(vals, got.data(), sizeof(vals));
         std::printf("  scale variants (lane0): %.6f | %.6f | %.6f | %.6f\n", vals[0], vals[16],
                     vals[32], vals[48]);
