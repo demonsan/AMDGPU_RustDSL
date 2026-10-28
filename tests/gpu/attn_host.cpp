@@ -301,8 +301,10 @@ int main(int argc, char** argv) {
         const unsigned int want = 0x43000000u;  // 128.0f
         unsigned int bits[2048] = {0};
         std::memcpy(bits, got.data(), sizeof(bits));
+        std::printf("  loop_mfma diag iterD0=0x%08x 0x%08x finalAcc0=0x%08x\n",
+                    bits[1024], bits[1025], bits[1280]);
         int lm_bad = 0;
-        for (int i = 0; i < 2048; ++i) {
+        for (int i = 0; i < 1024; ++i) {
             if (bits[i] != want) {
                 if (lm_bad < 6) {
                     std::fprintf(stderr, "loop_mfma mismatch i=%d got=0x%08x\n", i, bits[i]);

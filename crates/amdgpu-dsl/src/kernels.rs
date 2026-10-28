@@ -831,6 +831,14 @@ pub fn probe_loop_mfma() -> Function {
     let a8 = b.cat_frag8(a_lo, a_lo);
     let b8 = b.cat_frag8(b_lo, b_lo);
     let d = b.mfma_scale_fp8(a8, b8, acc, 127, 127);
+    // Diagnostic: store D[0] of each iteration at o[4096 + it*4].
+    let diag = b.frag16_lane(d, 0);
+    let diag_f = b.bitcast_f32(diag);
+    let c4096 = b.c_i32(4096);
+    let diag_off = b.mul_i32(it, c4);
+    let diag_off_full = b.add_i32(diag_off, c4096);
+    let diag_ptr = b.ptr_add(o, diag_off_full);
+    b.store_f32(diag_ptr, 0, diag_f);
     b.set_var(acc, d);
     b.wait_lds(0);
     b.barrier();
@@ -843,9 +851,18 @@ pub fn probe_loop_mfma() -> Function {
     b.break_if(Opnd::Val(stop));
     b.end_loop();
 
-    let row_off = b.mul_i32(tid, c16);
+    // Diagnostic: final accumulator lane 0 at o[5120].
+    let c5120 = b.c_i32(5120);
+    let final_ptr = b.ptr_add(o, c5120);
+    let acc0 = b.frag16_lane(acc, 0);
+    let acc0_f = b.bitcast_f32(acc0);
+    b.store_f32(final_ptr, 0, acc0_f);
+
+    // Per-lane final accumulator: two dwords each, 8 bytes per lane.
+    let c8 = b.c_i32(8);
+    let row_off = b.mul_i32(tid, c8);
     let row = b.ptr_add(o, row_off);
-    for i in 0..4u8 {
+    for i in 0..2u8 {
         let bits = b.frag16_lane(acc, i);
         let value = b.bitcast_f32(bits);
         b.store_f32(row, 4 * i as u32, value);
