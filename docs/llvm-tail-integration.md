@@ -80,7 +80,7 @@ LLVM requires wait states our model lacks (class pair: LLVM nop cycles vs ours):
 | `v_cmp*`/`v_add_co` -> `v_cndmask` (vcc as mask) | 2 | 0 (verifier only forces adjacency) |
 | VALU-cvt (`v_cvt_pk_*`) -> next VALU/cmp/cndmask/trans | 0..1 (forwarding hazard) | 0 |
 | DS read/write, VMEM load/store, SALU -> `v_addc/v_add_co` (sgpr/vcc operand) | 0..2 | 0 |
-| VALU/VMEM -> VMEM store data (global_load -> global_store) | 1 | 0 |
+| global_load -> global_store data (observed in the probe blocks) | 1 | 0 |
 
 Where we are MORE conservative than LLVM (candidate savings, still Unknown for hardware):
 
