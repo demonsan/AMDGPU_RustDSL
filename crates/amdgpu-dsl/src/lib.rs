@@ -188,6 +188,8 @@ pub enum Op {
     MfmaFp8_32x32x16 { a: Opnd, b: Opnd, c: Opnd },
     /// Build an eight-dword fragment from eight 32-bit values.
     Frag8(Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd),
+    /// Concatenate two four-dword fragments into an eight-dword fragment.
+    CatFrag8(Opnd, Opnd),
     /// `v_mfma_scale_f32_32x32x64_f8f6f4`: block-scaled fp8 MFMA. The two scale
     /// operands are E8M0 exponents in scalar registers.
     MfmaScaleFp8_32x32x64 { a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
@@ -222,6 +224,7 @@ impl Op {
             Op::MfmaFp8_16x16x32 { .. } => DType::Frag4,
             Op::MfmaFp8_32x32x16 { .. } => DType::Frag16,
             Op::Frag8(..) => DType::Frag8,
+            Op::CatFrag8(..) => DType::Frag8,
             Op::MfmaScaleFp8_32x32x64 { .. } => DType::Frag16,
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
@@ -266,6 +269,7 @@ impl Op {
             Op::MfmaFp8_16x16x32 { a, b, c } => vec![*a, *b, *c],
             Op::MfmaFp8_32x32x16 { a, b, c } => vec![*a, *b, *c],
             Op::Frag8(a, b, c, d, e, f, g, h) => vec![*a, *b, *c, *d, *e, *f, *g, *h],
+            Op::CatFrag8(a, b) => vec![*a, *b],
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 vec![*a, *b, *c, *scale_a, *scale_b]
             }
@@ -637,6 +641,11 @@ impl FnBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Concatenate two Frag4 values into a Frag8 (low half first).
+    pub fn cat_frag8(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CatFrag8(lo.into(), hi.into()))
+    }
+
     pub fn frag8(
         &mut self,
         a: impl Into<Opnd>,
@@ -961,6 +970,18 @@ pub fn verify(f: &Function) -> Vec<String> {
                         }
                     }
                     Op::FragZero { .. } => {}
+                    Op::CatFrag8(a, b) => {
+                        for o in [a, b] {
+                            match opnd_ty(f, *o) {
+                                Ok(DType::Frag4) => {}
+                                Ok(t) => errs.push(here(format!(
+                                    "catfrag8: expected frag4, found {}",
+                                    t.name()
+                                ))),
+                                Err(e) => errs.push(here(e)),
+                            }
+                        }
+                    }
                     Op::Frag8(a, b, c, d, e, ff, g, h) => {
                         for o in [a, b, c, d, e, ff, g, h] {
                             if let Err(err) = expect_int(f, *o, "frag8") {

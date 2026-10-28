@@ -721,6 +721,22 @@ impl Lowerer {
                 );
                 self.val.insert(dst, d);
             }
+            Op::CatFrag8(lo, hi) => {
+                let lo_r = self.as_v4(*lo)?;
+                let hi_r = self.as_v4(*hi)?;
+                let d = self.new_vreg(RClass::V8);
+                for i in 0..4u8 {
+                    let sub = self.new_vreg(RClass::V1);
+                    self.push(MInst::new(MOp::VReadSub).def(sub).srcreg(lo_r).imm(i as i64));
+                    self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(sub).imm(i as i64));
+                }
+                for i in 0..4u8 {
+                    let sub = self.new_vreg(RClass::V1);
+                    self.push(MInst::new(MOp::VReadSub).def(sub).srcreg(hi_r).imm(i as i64));
+                    self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(sub).imm((i + 4) as i64));
+                }
+                self.val.insert(dst, d);
+            }
             Op::Frag8(a, b, c, d, e, f, g, h) => {
                 let v = self.new_vreg(RClass::V8);
                 for (i, o) in [*a, *b, *c, *d, *e, *f, *g, *h].into_iter().enumerate() {

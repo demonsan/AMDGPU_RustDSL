@@ -120,7 +120,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "hw_lds_own") == 0 ||
                              std::strncmp(kern, "hw_bisect", 9) == 0 || std::strcmp(kern, "hw_store2") == 0 || std::strcmp(kern, "probe_lds_own") == 0 ||
                              std::strcmp(kern, "probe_lds_self2") == 0 ||
-                             std::strcmp(kern, "probe_roles_loop") == 0;
+                             std::strcmp(kern, "probe_roles_loop") == 0 ||
+                             std::strcmp(kern, "probe_fmha_datapath") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -318,6 +319,25 @@ int main(int argc, char** argv) {
                     bits[1024], bits[1088]);
         std::printf(loop_bad ? "PROBE_ROLES_LOOP_FAIL\n" : "PROBE_ROLES_LOOP_OK\n");
         return loop_bad != 0;
+    }
+    if (std::strcmp(kern, "probe_fmha_datapath") == 0) {
+        // 2048 dwords, all of which must be the f32 bit pattern of 64.0.
+        const unsigned int want = 0x42800000u;  // 64.0f
+        unsigned int bits[2048] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
+        int dp_bad = 0;
+        for (int i = 0; i < 2048; ++i) {
+            if (bits[i] != want) {
+                if (dp_bad < 6) {
+                    std::fprintf(stderr, "datapath mismatch i=%d got=0x%08x want=0x%08x\n", i,
+                                 bits[i], want);
+                }
+                ++dp_bad;
+            }
+        }
+        std::printf("  datapath bad=%d sample=0x%08x 0x%08x\n", dp_bad, bits[0], bits[2047]);
+        std::printf(dp_bad ? "PROBE_FMHA_DATAPATH_FAIL\n" : "PROBE_FMHA_DATAPATH_OK\n");
+        return dp_bad != 0;
     }
     if (std::strcmp(kern, "hw_roles") == 0) {
         // Hand-written kernel: o[tid] must equal tid for every lane.
