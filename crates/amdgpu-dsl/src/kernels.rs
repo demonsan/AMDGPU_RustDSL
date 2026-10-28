@@ -1383,7 +1383,8 @@ pub fn probe_fp8_softmax() -> Function {
 
     // Store the score tile into LDS with the D fragment layout.
     let j4 = b.mul_i32(j, c4);
-    let p512 = b.shl_i32(pblk, b.c_i32(9));
+    let c9 = b.c_i32(9);
+    let p512 = b.shl_i32(pblk, c9);
     let lds_base = b.add_i32(j4, p512);
     for r in 0..16u8 {
         let i_const = ((r / 4) * 8 + (r % 4)) as i32;
