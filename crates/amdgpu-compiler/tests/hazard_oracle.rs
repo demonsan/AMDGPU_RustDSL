@@ -115,7 +115,11 @@ fn hazard_matrix() {
     for line in asm.lines() {
         let l = line.split(';').next().unwrap().trim();
         if let Some(n) = l.strip_prefix("s_setprio ") {
-            cur = n.trim().parse::<usize>().ok();
+            let n = n.trim();
+            cur = match n.strip_prefix("0x") {
+                Some(h) => usize::from_str_radix(h, 16).ok(),
+                None => n.parse::<usize>().ok(),
+            };
             continue;
         }
         if l.is_empty() || l.starts_with('.') || l.ends_with(':') {
