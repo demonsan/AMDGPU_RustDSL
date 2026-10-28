@@ -219,6 +219,7 @@ impl Lowerer {
                     .copied()
                     .ok_or_else(|| format!("var{v} not lowered"))?;
                 if self.mir.vreg_class(r) == RClass::V2 {
+                    self.touch(&[Src::Reg(r)]);
                     Ok(r)
                 } else {
                     Err(format!("var{v} is not a pointer"))
@@ -234,6 +235,7 @@ impl Lowerer {
             Opnd::Val(v) => {
                 let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
                 if self.mir.vreg_class(r) == RClass::V8 {
+                    self.touch(&[Src::Reg(r)]);
                     Ok(r)
                 } else {
                     Err(format!("value v{v} is not an eight-dword fragment"))
@@ -291,6 +293,7 @@ impl Lowerer {
             Opnd::Val(v) => {
                 let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
                 if self.mir.vreg_class(r) == RClass::V16 {
+                    self.touch(&[Src::Reg(r)]);
                     Ok(r)
                 } else {
                     Err(format!("value v{v} is not a sixteen-dword fragment"))
@@ -303,6 +306,7 @@ impl Lowerer {
                     .copied()
                     .ok_or_else(|| format!("var{v} not lowered"))?;
                 if self.mir.vreg_class(r) == RClass::V16 {
+                    self.touch(&[Src::Reg(r)]);
                     Ok(r)
                 } else {
                     Err(format!("var{v} is not a sixteen-dword fragment"))
@@ -318,6 +322,7 @@ impl Lowerer {
             Opnd::Val(v) => {
                 let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
                 if self.mir.vreg_class(r) == RClass::V4 {
+                    self.touch(&[Src::Reg(r)]);
                     Ok(r)
                 } else {
                     Err(format!("value v{v} is not a four-dword fragment"))
@@ -330,6 +335,7 @@ impl Lowerer {
                     .copied()
                     .ok_or_else(|| format!("var{v} not lowered"))?;
                 if self.mir.vreg_class(r) == RClass::V4 {
+                    self.touch(&[Src::Reg(r)]);
                     Ok(r)
                 } else {
                     Err(format!("var{v} is not a four-dword fragment"))
