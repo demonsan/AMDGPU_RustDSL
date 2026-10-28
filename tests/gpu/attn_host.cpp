@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
                     in[2048 + i * 64 + k] = (k >= 32) ? 0x38 : 0x00;
                     continue;
                 }
-                if (fp8_test == 9) {
+                if (fp8_test == 9 || fp8_test == 11) {
                     in[i * 64 + k] = 0x38;
                     in[2048 + i * 64 + k] = 0x38;
                     continue;
@@ -216,6 +216,9 @@ int main(int argc, char** argv) {
                 sb = 127;
             } else if (fp8_test == 9) {
                 sa = (unsigned char)((l < 32) ? 127 : 128);
+                sb = 127;
+            } else if (fp8_test == 11) {
+                sa = (unsigned char)((l < 4) ? (128 + l) : 127);
                 sb = 127;
             }
             in[4096 + l * 4] = sa;
@@ -451,6 +454,17 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
+    if (std::strcmp(kern, "probe_fp8_matmul") == 0 && envi("FP8_TEST", 1) == 11) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        const float* dvals = reinterpret_cast<const float*>(raw + 4608);
+        std::printf("  scale_map D[i][0]:");
+        for (int i = 0; i < 8; ++i) std::printf(" i%d=%g", i, dvals[i * 32]);
+        std::printf("\n  scale_map D[0][j]:");
+        for (int j = 0; j < 8; ++j) std::printf(" j%d=%g", j, dvals[j]);
+        std::printf("\n  scale_map D[4][0]=%g D[32%%8][0]=%g\n", dvals[4 * 32], dvals[(32 % 32) * 32]);
+        std::printf("PROBE_SCALE_MAP_DONE\n");
+        return 0;
+    }
     if (std::strcmp(kern, "probe_fp8_matmul") == 0) {
         const int fp8_test = envi("FP8_TEST", 1);
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
