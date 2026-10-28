@@ -212,6 +212,10 @@ pub enum Op {
     BitcastI32(Opnd),
     /// Pack two f32 into two E4M3 fp8 bytes (low 16 bits of the result).
     CvtPkFp8F32(Opnd, Opnd),
+    /// Two f32 -> two bf16 (round to nearest even) packed into one dword (_cvt_pk_bf16_f32).
+    CvtPkBf16F32(Opnd, Opnd),
+    /// Base-2 exponential: the hardware primitive (_exp_f32), no log2(e) scaling.
+    Exp2F32(Opnd),
 }
 
 impl Op {
@@ -223,7 +227,7 @@ impl Op {
             Op::AddF32(..) | Op::SubF32(..) | Op::MulF32(..) | Op::MaxF32(..) | Op::FmaF32(..) => {
                 DType::F32
             }
-            Op::ExpF32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } => DType::F32,
+            Op::ExpF32(..) | Op::Exp2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } => DType::F32,
             Op::CvtF32ToF16(..) => DType::I32,
             Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
             Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) => DType::I1,
@@ -239,7 +243,7 @@ impl Op {
             Op::Frag8(..) => DType::Frag8,
             Op::CatFrag8(..) => DType::Frag8,
             Op::Frag16Build(..) => DType::Frag16,
-            Op::CvtPknormU16(..) | Op::CvtScalef32PkFp8Bf16 { .. } | Op::CvtPkFp8F32(..) => DType::U32,
+            Op::CvtPknormU16(..) | Op::CvtScalef32PkFp8Bf16 { .. } | Op::CvtPkFp8F32(..) | Op::CvtPkBf16F32(..) => DType::U32,
             Op::MfmaScaleFp8_32x32x64 { .. } => DType::Frag16,
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
@@ -272,7 +276,7 @@ impl Op {
             | Op::PtrAdd { base: a, byte_off: b } => vec![*a, *b],
             Op::FmaF32(a, b, c) => vec![*a, *b, *c],
             Op::Max3F32(a, b, c) => vec![*a, *b, *c],
-            Op::ExpF32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
+            Op::ExpF32(a) | Op::Exp2F32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
                 vec![*a]
             }
             Op::Select { cond, a, b, .. } => vec![*cond, *a, *b],
@@ -288,7 +292,7 @@ impl Op {
             Op::Frag8(a, b, c, d, e, f, g, h) => vec![*a, *b, *c, *d, *e, *f, *g, *h],
             Op::CatFrag8(a, b) => vec![*a, *b],
             Op::Frag16Build(v) => v.clone(),
-            Op::CvtPknormU16(a, b) | Op::CvtPkFp8F32(a, b) => vec![*a, *b],
+            Op::CvtPknormU16(a, b) | Op::CvtPkFp8F32(a, b) | Op::CvtPkBf16F32(a, b) => vec![*a, *b],
             Op::CvtScalef32PkFp8Bf16 { old, src, scale, .. } => vec![*old, *src, *scale],
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 vec![*a, *b, *c, *scale_a, *scale_b]
@@ -690,6 +694,14 @@ impl FnBuilder {
     }
 
     /// Pack two f32 into two E4M3 fp8 bytes (upper 16 bits are zero).
+    pub fn exp2_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Exp2F32(a.into()))
+    }
+
+    pub fn cvt_pk_bf16_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CvtPkBf16F32(a.into(), b.into()))
+    }
+
     pub fn cvt_pk_fp8_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPkFp8F32(a.into(), b.into()))
     }
@@ -905,7 +917,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
-                    Op::ExpF32(a) | Op::RcpF32(a) => {
+                    Op::ExpF32(a) | Op::Exp2F32(a) | Op::RcpF32(a) => {
                         if let Err(e) = expect_float(f, *a, "unary float") {
                             errs.push(here(e));
                         }
@@ -1037,6 +1049,13 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Op::CvtPknormU16(a, b) => {
                         for o in [a, b] {
                             if let Err(e) = expect_float(f, *o, "pknorm") {
+                                errs.push(here(e));
+                            }
+                        }
+                    }
+                    Op::CvtPkBf16F32(a, b) => {
+                        for o in [a, b] {
+                            if let Err(e) = expect_float(f, *o, "cvt_pk_bf16") {
                                 errs.push(here(e));
                             }
                         }

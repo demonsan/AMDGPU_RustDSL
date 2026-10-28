@@ -6073,3 +6073,556 @@ pub fn probe_fp8_matmul_blk() -> Function {
     }
     b.finish()
 }
+/// Values shared by the two role loops of `fmha_fwd_hd128_mxfp8`.
+struct FmhaCtx {
+    ptr_o: ValueId,
+    ptr_k: ValueId,
+    ptr_v: ValueId,
+    ptr_kd: ValueId,
+    k_seqs: ValueId,
+    v_seqs: ValueId,
+    q_heads: ValueId,
+    o_seqs: ValueId,
+    o_hs: ValueId,
+    o_bs: ValueId,
+    bidx: ValueId,
+    hidx: ValueId,
+    row0: ValueId,
+    wave: ValueId,
+    j: ValueId,
+    pblk: ValueId,
+    pblk16: ValueId,
+    j4: ValueId,
+    g8: ValueId,
+    lds_dyn: ValueId,
+    lds_corr: ValueId,
+    corr_row: ValueId,
+    lds_k: ValueId,
+    lds_v: ValueId,
+    kbase_off: ValueId,
+    vbase_off: ValueId,
+    kd_base: ValueId,
+    rt_row: ValueId,
+    rt_half64: ValueId,
+    rt64: ValueId,
+    tr_base: ValueId,
+    kf_base: ValueId,
+    a8_0: ValueId,
+    a8_1: ValueId,
+    sa0: ValueId,
+    sa1: ValueId,
+    vd_raw: ValueId,
+    nkv: ValueId,
+}
+
+/// One role's steady loop plus the epilogue of `fmha_fwd_hd128_mxfp8`. Role A copies the K tile
+/// of each iteration into LDS, role B the V tile; everything else (and the barrier schedule) is
+/// identical.
+fn emit_fmha_role(b: &mut FnBuilder, cx: &FmhaCtx, role_a: bool) {
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c4 = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c7 = b.c_i32(7);
+    let c11 = b.c_i32(11);
+    let c16i = b.c_i32(16);
+    let c64 = b.c_i32(64);
+    let c123 = b.c_i32(123);
+    let c127 = b.c_i32(127);
+    let c128 = b.c_i32(128);
+    let c4096 = b.c_i32(4096);
+    let neg_big = b.c_f32(-1.0e30);
+    let c16f = b.c_f32(16.0);
+    let zero = b.frag_zero(DType::Frag16);
+    let m_init = b.bitcast_i32(neg_big);
+
+    let vars = b.begin_loop(&[
+        (DType::I32, Opnd::Val(c0)),
+        (DType::I32, Opnd::Val(m_init)),
+        (DType::I32, Opnd::Val(c0)),
+        (DType::Frag16, Opnd::Val(zero)),
+        (DType::Frag16, Opnd::Val(zero)),
+        (DType::Frag16, Opnd::Val(zero)),
+        (DType::Frag16, Opnd::Val(zero)),
+    ]);
+    let it = vars[0];
+    let m_var = vars[1];
+    let l_var = vars[2];
+    let o_vars = [vars[3], vars[4], vars[5], vars[6]];
+
+    // ---- stage this iteration's K (role A) or V (role B) tile into LDS ----
+    let key0 = b.shl_i32(it, c7);
+    let (seqs, base_off, ptr, lds_base) = if role_a {
+        (cx.k_seqs, cx.kbase_off, cx.ptr_k, cx.lds_k)
+    } else {
+        (cx.v_seqs, cx.vbase_off, cx.ptr_v, cx.lds_v)
+    };
+    let srow = b.add_i32(key0, cx.rt_row);
+    let soff0 = b.mul_i32(srow, seqs);
+    let soff1 = b.add_i32(soff0, base_off);
+    let soff = b.add_i32(soff1, cx.rt_half64);
+    let sp = b.ptr_add(ptr, soff);
+    let mut sla = b.add_i32(lds_base, cx.rt64);
+    for w in 0..16u32 {
+        let v = b.load_f32(sp, 4 * w);
+        let vi = b.bitcast_i32(v);
+        b.store_lds_b32(Opnd::Val(sla), Opnd::Val(vi));
+        sla = b.add_i32(sla, c4);
+    }
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    let hq4 = b.mul_i32(cx.q_heads, c4);
+    let rbase0 = b.mul_i32(cx.j, c128);
+    let rbase = b.add_i32(rbase0, b_wbase(b, cx));
+    for hh in 0..2usize {
+        // ---- two 32-key score tiles of this 64-key substep ----
+        for sl in 0..2usize {
+            let s = 2 * hh + sl;
+            let ko = b.c_i32((4096 * s) as i32);
+            let kaddr0 = b.add_i32(cx.kf_base, ko);
+            let k_lo0 = b.load_lds_b128(Opnd::Val(kaddr0));
+            let kaddr0h = b.add_i32(kaddr0, c16i_32(b));
+            let k_hi0 = b.load_lds_b128(Opnd::Val(kaddr0h));
+            let k8_0 = b.cat_frag8(k_lo0, k_hi0);
+            let kaddr1 = b.add_i32(kaddr0, c64);
+            let k_lo1 = b.load_lds_b128(Opnd::Val(kaddr1));
+            let kaddr1h = b.add_i32(kaddr1, c16i_32(b));
+            let k_hi1 = b.load_lds_b128(Opnd::Val(kaddr1h));
+            let k8_1 = b.cat_frag8(k_lo1, k_hi1);
+            // K scale dword of key (128 it + 32 s + j)
+            let kkey0 = b.add_i32(key0, cx.j);
+            let kcs = b.c_i32(32 * s as i32);
+            let kkey = b.add_i32(kkey0, kcs);
+            let kd_row = b.mul_i32(kkey, hq4);
+            let kd_off = b.add_i32(kd_row, cx.kd_base);
+            let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+            let kd_raw = b.load_f32(kd_ptr, 0);
+            let kd = b.bitcast_i32(kd_raw);
+            let sb0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
+            let sh16 = b.add_i32(cx.g8, c16i);
+            let sb1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
+            let zero_s = b.frag_zero(DType::Frag16);
+            let s0 = b.mfma_scale_fp8(cx.a8_0, k8_0, zero_s, cx.sa0, sb0);
+            let s_frag = b.mfma_scale_fp8(cx.a8_1, k8_1, s0, cx.sa1, sb1);
+            let reg = b.c_i32((4096 * sl) as i32);
+            let lbase = b.add_i32(cx.lds_dyn, reg);
+            for r in 0..16u8 {
+                let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+                let lane = b.frag16_lane(s_frag, r);
+                let coff = b.c_i32(i_const * 128);
+                let addr = b.add_i32(lbase, coff);
+                b.store_lds_b32(Opnd::Val(addr), Opnd::Val(lane));
+            }
+        }
+        b.wait_lds(0);
+        b.barrier();
+        b.wait_lds(0);
+
+        // ---- 64-wide online softmax (base 2): max pass, then exp2/sum/quantise per 32 keys ----
+        let mut tmax: Option<ValueId> = None;
+        for sl in 0..2u32 {
+            let sc = b.c_i32((sl * 4096) as i32);
+            let mut addr = b.add_i32(rbase, sc);
+            for _k in 0..32u32 {
+                let raw = b.load_lds_b32(Opnd::Val(addr));
+                addr = b.add_i32(addr, c4);
+                let v = b.bitcast_f32(raw);
+                tmax = Some(match tmax {
+                    None => v,
+                    Some(m) => b.max_f32(m, v),
+                });
+            }
+        }
+        let tmax = tmax.unwrap();
+        let m_old = b.bitcast_f32(m_var);
+        let m_new = b.max_f32(m_old, tmax);
+        let dm = b.sub_f32(m_old, m_new);
+        let corr = b.exp2_f32(dm);
+        let corr_bits = b.bitcast_i32(corr);
+        b.store_lds_b32(Opnd::Val(cx.corr_row), Opnd::Val(corr_bits));
+
+        let mut chunk_words: Vec<Vec<ValueId>> = Vec::with_capacity(2);
+        let mut rsum: Option<ValueId> = None;
+        for sl in 0..2u32 {
+            let sc2 = b.c_i32((sl * 4096) as i32);
+            let mut addr2 = b.add_i32(rbase, sc2);
+            let mut exps: Vec<ValueId> = Vec::with_capacity(32);
+            for _k in 0..32u32 {
+                let raw = b.load_lds_b32(Opnd::Val(addr2));
+                addr2 = b.add_i32(addr2, c4);
+                let v = b.bitcast_f32(raw);
+                let sh = b.sub_f32(v, m_new);
+                exps.push(b.exp2_f32(sh));
+            }
+            for e in &exps {
+                rsum = Some(match rsum {
+                    None => *e,
+                    Some(acc) => b.add_f32(acc, *e),
+                });
+            }
+            let mut words: Vec<ValueId> = Vec::with_capacity(8);
+            for m in 0..8usize {
+                let a = b.mul_f32(exps[4 * m], c16f);
+                let bb = b.mul_f32(exps[4 * m + 1], c16f);
+                let p0 = b.cvt_pk_fp8_f32(a, bb);
+                let c = b.mul_f32(exps[4 * m + 2], c16f);
+                let d = b.mul_f32(exps[4 * m + 3], c16f);
+                let p1 = b.cvt_pk_fp8_f32(c, d);
+                let sh = b.shl_i32(p1, c16i);
+                words.push(b.add_i32(p0, sh));
+            }
+            if sl == 0 {
+                chunk_words.push(words);
+            } else {
+                let mut selw: Vec<ValueId> = Vec::with_capacity(8);
+                for m in 0..8usize {
+                    let lo = chunk_words[0][m];
+                    let hi = words[m];
+                    let diff = b.xor_i32(lo, hi);
+                    let pick = b.mul_i32(diff, cx.pblk);
+                    selw.push(b.xor_i32(lo, pick));
+                }
+                chunk_words.clear();
+                chunk_words.push(selw);
+            }
+        }
+        let rsum = rsum.unwrap();
+        let l_old = b.bitcast_f32(l_var);
+        let l_scaled = b.mul_f32(l_old, corr);
+        let l_new = b.add_f32(l_scaled, rsum);
+        let m_bits = b.bitcast_i32(m_new);
+        let l_bits = b.bitcast_i32(l_new);
+        b.set_var(m_var, m_bits);
+        b.set_var(l_var, l_bits);
+        b.wait_lds(0);
+        b.barrier();
+        b.wait_lds(0);
+
+        // ---- PV: four 32-wide output tiles for this 64-key half ----
+        let sel = chunk_words[0].clone();
+        let p8 = b.frag8(sel[0], sel[1], sel[2], sel[3], sel[4], sel[5], sel[6], sel[7]);
+        for e in 0..4usize {
+            let mut scaled: Vec<ValueId> = Vec::with_capacity(16);
+            for r in 0..16u8 {
+                let lane = b.frag16_lane(o_vars[e], r);
+                let lanev = b.bitcast_f32(lane);
+                let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+                let ccoff = b.c_i32(i_const * 4);
+                let caddr0 = b.add_i32(cx.pblk16, cx.lds_corr);
+                let caddr = b.add_i32(caddr0, ccoff);
+                let craw = b.load_lds_b32(Opnd::Val(caddr));
+                let cf = b.bitcast_f32(craw);
+                let sc = b.mul_f32(lanev, cf);
+                scaled.push(b.bitcast_i32(sc));
+            }
+            let acc = b.frag16_build(&scaled);
+            let mut vw: Vec<ValueId> = Vec::with_capacity(8);
+            for r in 0..4i32 {
+                let off = b.c_i32((hh as i32) * 8192 + (e as i32) * 32 + 1024 * r);
+                let addr = b.add_i32(cx.tr_base, off);
+                let tr = b.load_lds_tr_b8(Opnd::Val(addr));
+                vw.push(b.frag16_lane(tr, 0));
+                vw.push(b.frag16_lane(tr, 1));
+            }
+            let v8 = b.frag8(vw[0], vw[1], vw[2], vw[3], vw[4], vw[5], vw[6], vw[7]);
+            let o_new = b.mfma_scale_fp8(p8, v8, acc, c127, c123);
+            b.set_var(o_vars[e], o_new);
+        }
+        b.wait_lds(0);
+        b.barrier();
+        b.wait_lds(0);
+    }
+
+    let it_next = b.add_i32(it, c1);
+    b.set_var(it, it_next);
+    let more = b.cmp_lt_i32(it_next, cx.nkv);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+
+    // ---- epilogue: O * (V descale / l) -> BF16 ----
+    let l_final = b.bitcast_f32(l_var);
+    let inv_l = b.rcp_f32(l_final);
+    let fin = b.mul_f32(inv_l, cx.vd_raw);
+    let fin_bits = b.bitcast_i32(fin);
+    b.store_lds_b32(Opnd::Val(cx.corr_row), Opnd::Val(fin_bits));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    // output byte offset of (batch, head, row 0 of this wave + 4p, column j)
+    let ob0 = b.mul_i32(cx.bidx, cx.o_bs);
+    let ob1 = b.mul_i32(cx.hidx, cx.o_hs);
+    let p4 = b.shl_i32(cx.pblk, c2_32(b));
+    let orow0 = b.shl_i32(cx.wave, c5);
+    let orow1 = b.add_i32(cx.row0, p4);
+    let _ = orow0;
+    let orow_off = b.mul_i32(orow1, cx.o_seqs);
+    let j2 = b.shl_i32(cx.j, c1);
+    let ob2 = b.add_i32(ob0, ob1);
+    let ob3 = b.add_i32(ob2, orow_off);
+    let ob4 = b.add_i32(ob3, j2);
+    let _ = (c4096, c11);
+    for e in 0..4usize {
+        let eo = b.c_i32(64 * e as i32);
+        let ob5 = b.add_i32(ob4, eo);
+        let o_ptr = b.ptr_add(cx.ptr_o, ob5);
+        for r in 0..16u8 {
+            let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+            let ccoff = b.c_i32(i_const * 4);
+            let caddr0 = b.add_i32(cx.pblk16, cx.lds_corr);
+            let caddr = b.add_i32(caddr0, ccoff);
+            let craw = b.load_lds_b32(Opnd::Val(caddr));
+            let cf = b.bitcast_f32(craw);
+            let lane = b.frag16_lane(o_vars[e], r);
+            let lanev = b.bitcast_f32(lane);
+            let res = b.mul_f32(lanev, cf);
+            let packed = b.cvt_pk_bf16_f32(res, res);
+            let ic = b.c_i32(i_const);
+            let roff = b.mul_i32(ic, cx.o_seqs);
+            let rptr = b.ptr_add(o_ptr, roff);
+            b.store_u16(rptr, 0, packed);
+        }
+    }
+}
+
+fn b_wbase(b: &mut FnBuilder, cx: &FmhaCtx) -> ValueId {
+    let c8320 = b.c_i32(8320);
+    b.mul_i32(cx.wave, c8320)
+}
+
+fn c16i_32(b: &mut FnBuilder) -> ValueId {
+    b.c_i32(16)
+}
+
+fn c2_32(b: &mut FnBuilder) -> ValueId {
+    b.c_i32(2)
+}
+
+/// ABI-compatible FMHA forward kernel for the vendor `fwd_hd128_mxfp8` interface.
+///
+/// Same 656-byte kernarg layout, BSHD fp8 (e4m3) Q/K/V with head dim 128, uint8 E8M0 1x32 Q/K
+/// descales `[B, S, H, 4]`, scalar f32 V descale, BF16 output `[B, S, H, 128]`, grid
+/// `(S / 256, H, B)`, block 512. Like the vendor kernel it computes `P = softmax_2(S)`, i.e.
+/// `exp2(S)` with `S = sum Qdeq * Kdeq`, and ignores the softmax-scale slot.
+///
+/// Requirements of this version: `S` a multiple of 256, `kv_seq_len` a multiple of 128,
+/// `gqa = 1`. Structure: eight query tiles of 32 rows per block, K (role A, waves 0-3) and V
+/// (role B, waves 4-7) staged through LDS, two 64-key online-softmax substeps per 128-key tile,
+/// four register-resident O accumulators, separate A/B steady loops with the same barrier
+/// schedule.
+pub fn fmha_fwd_hd128_mxfp8() -> Function {
+    let mut b = FnBuilder::new("fmha_fwd_hd128_mxfp8", 512);
+    b.lds(99456);
+    b.arg("ptr_o", DType::Ptr, 0x000, 8);
+    b.arg("ptr_q", DType::Ptr, 0x010, 8);
+    b.arg("ptr_k", DType::Ptr, 0x020, 8);
+    b.arg("ptr_v", DType::Ptr, 0x030, 8);
+    b.arg("s_Seqs", DType::I32, 0x070, 4);
+    b.arg("s_Hs", DType::I32, 0x090, 4);
+    b.arg("s_Bs", DType::I32, 0x0A0, 4);
+    b.arg("s_k_Seqs", DType::I32, 0x0C0, 4);
+    b.arg("s_k_Hs", DType::I32, 0x0D0, 4);
+    b.arg("s_k_Bs", DType::I32, 0x0E0, 4);
+    b.arg("s_kv_seq_len", DType::I32, 0x110, 4);
+    b.arg("s_q_head_num", DType::I32, 0x140, 4);
+    b.arg("s_v_Seqs", DType::I32, 0x150, 4);
+    b.arg("s_v_Hs", DType::I32, 0x160, 4);
+    b.arg("s_v_Bs", DType::I32, 0x170, 4);
+    b.arg("s_o_Seqs", DType::I32, 0x180, 4);
+    b.arg("s_o_Hs", DType::I32, 0x190, 4);
+    b.arg("s_o_Bs", DType::I32, 0x1A0, 4);
+    b.arg("ptr_q_descale", DType::Ptr, 0x200, 8);
+    b.arg("ptr_k_descale", DType::Ptr, 0x210, 8);
+    b.arg("ptr_v_descale", DType::Ptr, 0x220, 8);
+    b.arg("s_descale_q_Bs", DType::I32, 0x230, 4);
+    b.arg("s_descale_q_Hs", DType::I32, 0x240, 4);
+    b.arg("s_descale_k_Bs", DType::I32, 0x250, 4);
+    b.arg("s_descale_k_Hs", DType::I32, 0x260, 4);
+    b.arg("abi_tail", DType::I32, 0x280, 16);
+
+    let ptr_o = b.let_(Op::KernargPtr { offset: 0x000 });
+    let ptr_q = b.let_(Op::KernargPtr { offset: 0x010 });
+    let ptr_k = b.let_(Op::KernargPtr { offset: 0x020 });
+    let ptr_v = b.let_(Op::KernargPtr { offset: 0x030 });
+    let q_seqs = b.let_(Op::KernargI32 { offset: 0x070 });
+    let q_hs = b.let_(Op::KernargI32 { offset: 0x090 });
+    let q_bs = b.let_(Op::KernargI32 { offset: 0x0A0 });
+    let k_seqs = b.let_(Op::KernargI32 { offset: 0x0C0 });
+    let k_hs = b.let_(Op::KernargI32 { offset: 0x0D0 });
+    let k_bs = b.let_(Op::KernargI32 { offset: 0x0E0 });
+    let kv_len = b.let_(Op::KernargI32 { offset: 0x110 });
+    let q_heads = b.let_(Op::KernargI32 { offset: 0x140 });
+    let v_seqs = b.let_(Op::KernargI32 { offset: 0x150 });
+    let v_hs = b.let_(Op::KernargI32 { offset: 0x160 });
+    let v_bs = b.let_(Op::KernargI32 { offset: 0x170 });
+    let o_seqs = b.let_(Op::KernargI32 { offset: 0x180 });
+    let o_hs = b.let_(Op::KernargI32 { offset: 0x190 });
+    let o_bs = b.let_(Op::KernargI32 { offset: 0x1A0 });
+    let ptr_qd = b.let_(Op::KernargPtr { offset: 0x200 });
+    let ptr_kd = b.let_(Op::KernargPtr { offset: 0x210 });
+    let ptr_vd = b.let_(Op::KernargPtr { offset: 0x220 });
+    let dq_bs = b.let_(Op::KernargI32 { offset: 0x230 });
+    let dq_hs = b.let_(Op::KernargI32 { offset: 0x240 });
+    let dk_bs = b.let_(Op::KernargI32 { offset: 0x250 });
+    let dk_hs = b.let_(Op::KernargI32 { offset: 0x260 });
+
+    let tid_full = b.let_(Op::WorkitemId);
+    let qtile = b.let_(Op::WorkgroupIdX);
+    let hidx = b.let_(Op::WorkgroupIdY);
+    let bidx = b.let_(Op::WorkgroupIdZ);
+
+    let c1 = b.c_i32(1);
+    let c3 = b.c_i32(3);
+    let c4 = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c6 = b.c_i32(6);
+    let c7 = b.c_i32(7);
+    let c8 = b.c_i32(8);
+    let c9 = b.c_i32(9);
+    let c12 = b.c_i32(12);
+    let c16i = b.c_i32(16);
+    let c31 = b.c_i32(31);
+    let c63 = b.c_i32(63);
+    let c128 = b.c_i32(128);
+    let c255 = b.c_i32(255);
+    let c8320 = b.c_i32(8320);
+
+    let tid = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c63)));
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid_full), Opnd::Val(c6)));
+    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let pblk = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
+    let j4 = b.mul_i32(j, c4);
+    let p512 = b.shl_i32(pblk, c9);
+    let wbase = b.mul_i32(wave, c8320);
+    let lds_loc = b.add_i32(j4, p512);
+    let lds_dyn = b.add_i32(lds_loc, wbase);
+    let pblk16 = b.shl_i32(pblk, c4);
+    let lds_corr0 = b.c_i32(8192);
+    let lds_corr = b.add_i32(lds_corr0, wbase);
+    let corr_row = b.add_i32(j4, lds_corr);
+    let lds_k = b.c_i32(66560);
+    let lds_v = b.c_i32(82944);
+    let g8 = b.shl_i32(pblk, c3);
+    let g16 = b.shl_i32(pblk, c4);
+
+    let wave32 = b.shl_i32(wave, c5);
+    let qt256 = b.shl_i32(qtile, c8);
+    let row0 = b.add_i32(qt256, wave32);
+    let row = b.add_i32(row0, j);
+    let q_row_off = b.mul_i32(row, q_seqs);
+    let q_b_off = b.mul_i32(bidx, q_bs);
+    let q_h_off = b.mul_i32(hidx, q_hs);
+    let q_off0 = b.add_i32(q_row_off, q_b_off);
+    let q_off1 = b.add_i32(q_off0, q_h_off);
+    let q_off = b.add_i32(q_off1, g16);
+
+    // Q fragments: chunk c, bytes 0..15 = K 64c+16g.., bytes 16..31 = K 64c+32+16g..
+    let mut a8: Vec<ValueId> = Vec::with_capacity(2);
+    for c in 0..2u32 {
+        let qp = b.ptr_add(ptr_q, q_off);
+        let mut w: Vec<ValueId> = Vec::with_capacity(8);
+        for i in 0..8u32 {
+            let off = 64 * c + if i < 4 { 4 * i } else { 32 + 4 * (i - 4) };
+            let v = b.load_f32(qp, off);
+            w.push(b.bitcast_i32(v));
+        }
+        a8.push(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]));
+    }
+    let hq4 = b.mul_i32(q_heads, c4);
+    let qd_row = b.mul_i32(row, hq4);
+    let qd_b = b.mul_i32(bidx, dq_bs);
+    let qd_h = b.mul_i32(hidx, dq_hs);
+    let qd0 = b.add_i32(qd_row, qd_b);
+    let qd1 = b.add_i32(qd0, qd_h);
+    let qd_ptr = b.ptr_add(ptr_qd, qd1);
+    let qd_raw = b.load_f32(qd_ptr, 0);
+    let qd = b.bitcast_i32(qd_raw);
+    let sa0 = b.let_(Op::LshrI32(Opnd::Val(qd), Opnd::Val(g8)));
+    let sh16 = b.add_i32(g8, c16i);
+    let sa1 = b.let_(Op::LshrI32(Opnd::Val(qd), Opnd::Val(sh16)));
+    let vd_raw = b.load_f32(ptr_vd, 0);
+
+    let kb0 = b.mul_i32(bidx, k_bs);
+    let kb1 = b.mul_i32(hidx, k_hs);
+    let kbase_off = b.add_i32(kb0, kb1);
+    let vb0 = b.mul_i32(bidx, v_bs);
+    let vb1 = b.mul_i32(hidx, v_hs);
+    let vbase_off = b.add_i32(vb0, vb1);
+    let kd_b = b.mul_i32(bidx, dk_bs);
+    let kd_h = b.mul_i32(hidx, dk_hs);
+    let kd_base = b.add_i32(kd_b, kd_h);
+
+    let rt = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c255)));
+    let rt_row = b.let_(Op::LshrI32(Opnd::Val(rt), Opnd::Val(c1)));
+    let rt_half = b.let_(Op::AndI32(Opnd::Val(rt), Opnd::Val(c1)));
+    let rt_half64 = b.shl_i32(rt_half, c6);
+    let rt64 = b.shl_i32(rt, c6);
+    let is_a = b.cmp_lt_i32(wave, c4);
+
+    let tid_s1 = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c1)));
+    let i_idx = b.let_(Op::AndI32(Opnd::Val(tid_s1), Opnd::Val(c7)));
+    let tid_s4 = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c4)));
+    let g2 = b.let_(Op::AndI32(Opnd::Val(tid_s4), Opnd::Val(c1)));
+    let h_idx = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c1)));
+    let pP = b.shl_i32(pblk, c12);
+    let iP = b.mul_i32(i_idx, c128);
+    let g216 = b.mul_i32(g2, c16i);
+    let h8 = b.mul_i32(h_idx, c8);
+    let tr0 = b.add_i32(pP, iP);
+    let tr1 = b.add_i32(tr0, g216);
+    let tr2 = b.add_i32(tr1, h8);
+    let tr_base = b.add_i32(tr2, lds_v);
+    let j128 = b.mul_i32(j, c128);
+    let kf0 = b.add_i32(j128, g16);
+    let kf_base = b.add_i32(kf0, lds_k);
+    let nkv = b.let_(Op::LshrI32(Opnd::Val(kv_len), Opnd::Val(c7)));
+
+    let cx = FmhaCtx {
+        ptr_o,
+        ptr_k,
+        ptr_v,
+        ptr_kd,
+        k_seqs,
+        v_seqs,
+        q_heads,
+        o_seqs,
+        o_hs,
+        o_bs,
+        bidx,
+        hidx,
+        row0,
+        wave,
+        j,
+        pblk,
+        pblk16,
+        j4,
+        g8,
+        lds_dyn,
+        lds_corr,
+        corr_row,
+        lds_k,
+        lds_v,
+        kbase_off,
+        vbase_off,
+        kd_base,
+        rt_row,
+        rt_half64,
+        rt64,
+        tr_base,
+        kf_base,
+        a8_0: a8[0],
+        a8_1: a8[1],
+        sa0,
+        sa1,
+        vd_raw,
+        nkv,
+    };
+    b.begin_if(is_a);
+    emit_fmha_role(&mut b, &cx, true);
+    b.else_();
+    emit_fmha_role(&mut b, &cx, false);
+    b.end_if();
+    b.finish()
+}

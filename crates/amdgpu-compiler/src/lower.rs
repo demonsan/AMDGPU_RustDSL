@@ -708,6 +708,14 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::RcpF32(a) => self.un_v1(dst, MOp::VRcpF32, *a)?,
+            Op::Exp2F32(a) => self.un_v1(dst, MOp::VExpF32, *a)?,
+            Op::CvtPkBf16F32(a, b) => {
+                let ra = self.as_v1(*a)?;
+                let rb = self.as_v1(*b)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VCvtPkBf16F32).def(d).srcreg(ra).srcreg(rb));
+                self.val.insert(dst, d);
+            }
             Op::CvtF16ToF32(a) => self.un_v1(dst, MOp::VCvtF32F16, *a)?,
             Op::CvtF32ToF16(a) => self.un_v1(dst, MOp::VCvtF16F32, *a)?,
             Op::CmpLtI32(a, b) => self.cmp_i1(dst, MOp::VCmpLtI32, *a, *b)?,
