@@ -6678,11 +6678,42 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let c123 = b.c_i32(123);
     let c127 = b.c_i32(127);
     let neg_big = b.c_f32(-1.0e30);
-    let c16f = b.c_f32(16.0);
+    let c4f = b.c_f32(4.0);
+    let c_sixteenth = b.c_f32(0.0625);
     let zero = b.frag_zero(DType::Frag16);
     let m_init = b.bitcast_i32(neg_big);
     let zero_f = b.c_f32(0.0);
     let l_init = b.bitcast_i32(zero_f);
+
+    // Global -> LDS staging of one 128-key K (role A) or V (role B) tile: every thread of the
+    // role copies 64 bytes (four 16-byte loads), so all loads of a tile are in flight together.
+    let (seqs, base_off, ptr, lds_base) = if role_a {
+        (cx.k_seqs, cx.kbase_off, cx.ptr_k, cx.lds_k)
+    } else {
+        (cx.v_seqs, cx.vbase_off, cx.ptr_v, cx.lds_v)
+    };
+    let sdst = b.add_i32(lds_base, cx.rt64);
+    let stage_loads = |b: &mut FnBuilder, key0: ValueId| -> Vec<ValueId> {
+        let srow = b.add_i32(key0, cx.rt_row);
+        let soff0 = b.mul_i32(srow, seqs);
+        let soff1 = b.add_i32(soff0, base_off);
+        let soff = b.add_i32(soff1, cx.rt_half64);
+        let sp = b.ptr_add(ptr, soff);
+        (0..4u32).map(|w| b.load_b128(sp, 16 * w)).collect()
+    };
+    let stage_stores = |b: &mut FnBuilder, data: &[ValueId]| {
+        for (w, d) in data.iter().enumerate() {
+            let c = b.c_i32(16 * w as i32);
+            let a = b.add_i32(sdst, c);
+            b.store_lds_b128(Opnd::Val(a), Opnd::Val(*d));
+        }
+    };
+    let key_first = b.c_i32(0);
+    let first = stage_loads(b, key_first);
+    stage_stores(b, &first);
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
 
     let vars = b.begin_loop(&[
         (DType::I32, Opnd::Val(c0)),
@@ -6698,29 +6729,13 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let l_var = vars[2];
     let o_vars = [vars[3], vars[4], vars[5], vars[6]];
 
-    // ---- stage this iteration's K (role A) or V (role B) tile into LDS ----
+    // ---- prefetch the next tile (or this one again after the last iteration) ----
     let key0 = b.shl_i32(it, c7);
-    let (seqs, base_off, ptr, lds_base) = if role_a {
-        (cx.k_seqs, cx.kbase_off, cx.ptr_k, cx.lds_k)
-    } else {
-        (cx.v_seqs, cx.vbase_off, cx.ptr_v, cx.lds_v)
-    };
-    let srow = b.add_i32(key0, cx.rt_row);
-    let soff0 = b.mul_i32(srow, seqs);
-    let soff1 = b.add_i32(soff0, base_off);
-    let soff = b.add_i32(soff1, cx.rt_half64);
-    let sp = b.ptr_add(ptr, soff);
-    let mut sla = b.add_i32(lds_base, cx.rt64);
-    for w in 0..16u32 {
-        let v = b.load_f32(sp, 4 * w);
-        let vi = b.bitcast_i32(v);
-        b.store_lds_b32(Opnd::Val(sla), Opnd::Val(vi));
-        sla = b.add_i32(sla, c4);
-    }
-    b.wait_lds(0);
-    b.barrier();
-    b.wait_lds(0);
-
+    let it_p1 = b.add_i32(it, c1);
+    let has_next = b.cmp_lt_i32(it_p1, cx.nkv);
+    let nxt = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_next), a: Opnd::Val(it_p1), b: it.into() });
+    let key_next = b.shl_i32(nxt, c7);
+    let pre = stage_loads(b, key_next);
     let hq4 = b.mul_i32(cx.q_heads, c4);
     for hh in 0..2usize {
         // ---- two 32-key score tiles (S^T = K Q^T) of this 64-key substep ----
@@ -6758,14 +6773,21 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
 
         // ---- register softmax: lane-local max, exchange with the partner lane ----
-        let mut mloc = sv[0][0];
+        let mut flat: Vec<ValueId> = Vec::with_capacity(32);
         for sl in 0..2usize {
             for r in 0..16usize {
-                if sl == 0 && r == 0 {
-                    continue;
-                }
-                mloc = b.max_f32(mloc, sv[sl][r]);
+                flat.push(sv[sl][r]);
             }
+        }
+        // v_max3_f32 folds two new values per instruction
+        let mut mloc = b.max3_f32(flat[0], flat[1], flat[2]);
+        let mut k = 3usize;
+        while k + 1 < flat.len() {
+            mloc = b.max3_f32(mloc, flat[k], flat[k + 1]);
+            k += 2;
+        }
+        if k < flat.len() {
+            mloc = b.max_f32(mloc, flat[k]);
         }
         let mbits = b.bitcast_i32(mloc);
         b.store_lds_b32(Opnd::Val(cx.ex_own), Opnd::Val(mbits));
@@ -6779,12 +6801,14 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let dm = b.sub_f32(m_old, m_new);
         let corr = b.exp2_f32(dm);
 
+        // exp2(s - (m - 4)) = 16 exp2(s - m): the P x 16 quantisation scale comes for free
+        let m4 = b.sub_f32(m_new, c4f);
         let mut rsum: Option<ValueId> = None;
         let mut words: Vec<ValueId> = Vec::with_capacity(8);
         for sl in 0..2usize {
             let mut exps: Vec<ValueId> = Vec::with_capacity(16);
             for r in 0..16usize {
-                let sh = b.sub_f32(sv[sl][r], m_new);
+                let sh = b.sub_f32(sv[sl][r], m4);
                 exps.push(b.exp2_f32(sh));
             }
             for e in &exps {
@@ -6794,17 +6818,14 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 });
             }
             for m in 0..4usize {
-                let a = b.mul_f32(exps[4 * m], c16f);
-                let bb = b.mul_f32(exps[4 * m + 1], c16f);
-                let p0 = b.cvt_pk_fp8_f32(a, bb);
-                let c = b.mul_f32(exps[4 * m + 2], c16f);
-                let d = b.mul_f32(exps[4 * m + 3], c16f);
-                let p1 = b.cvt_pk_fp8_f32(c, d);
+                let p0 = b.cvt_pk_fp8_f32(exps[4 * m], exps[4 * m + 1]);
+                let p1 = b.cvt_pk_fp8_f32(exps[4 * m + 2], exps[4 * m + 3]);
                 let sh = b.shl_i32(p1, c16i);
                 words.push(b.add_i32(p0, sh));
             }
         }
-        let rsum = rsum.unwrap();
+        let rsum16 = rsum.unwrap();
+        let rsum = b.mul_f32(rsum16, c_sixteenth);
         let l_old = b.bitcast_f32(l_var);
         let l_scaled = b.mul_f32(l_old, corr);
         let l_new = b.add_f32(l_scaled, rsum);
@@ -6827,7 +6848,10 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
         }
     }
-    // all waves are done with this iteration's K/V before the next staging overwrites them
+    // all waves are done with this iteration's K/V; then publish the prefetched tile
+    b.wait_lds(0);
+    b.barrier();
+    stage_stores(b, &pre);
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
