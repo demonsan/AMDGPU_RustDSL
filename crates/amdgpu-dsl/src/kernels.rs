@@ -1092,16 +1092,19 @@ pub fn probe_fp8_matmul() -> Function {
 
     // Diagnostics: raw loaded words of lane `tid`.
     let c4b = b.c_i32(4);
+    let c8704 = b.c_i32(8704);
+    let c8960 = b.c_i32(8960);
+    let c9216 = b.c_i32(9216);
     let diag = b.mul_i32(tid, c4b);
-    let d8704 = b.add_i32(diag, b.c_i32(8704));
+    let d8704 = b.add_i32(diag, c8704);
     let pa = b.ptr_add(o, d8704);
     let va = b.bitcast_f32(a0);
     b.store_f32(pa, 0, va);
-    let d8960 = b.add_i32(diag, b.c_i32(8960));
+    let d8960 = b.add_i32(diag, c8960);
     let pb = b.ptr_add(o, d8960);
     let vb = b.bitcast_f32(b0);
     b.store_f32(pb, 0, vb);
-    let d9216 = b.add_i32(diag, b.c_i32(9216));
+    let d9216 = b.add_i32(diag, c9216);
     let ps = b.ptr_add(o, d9216);
     let vs = b.bitcast_f32(sa);
     b.store_f32(ps, 0, vs);
