@@ -89,18 +89,49 @@ fn ir_type(t: DType) -> &'static str {
     }
 }
 
-fn check_kernarg_layout(m: &MFunction) -> Result<u32, String> {
-    let mut end = 0u32;
-    for a in &m.args {
-        let align = a.size.max(1);
-        if a.offset % align != 0 || a.offset < end {
-            return Err(format!("kernarg '{}' at offset {} is not the natural LLVM layout", a.name, a.offset));
+/// IR parameter list reproducing the DSL's kernarg layout. LLVM lays kernel parameters out
+/// naturally aligned and packed, so gaps in the DSL layout (the vendor ABI has 16-byte
+/// spaced scalars and an opaque tail) are filled with dummy integer parameters. Returns the
+/// parameter list and the end offset.
+fn kernarg_ir(m: &MFunction) -> Result<(Vec<String>, u32), String> {
+    let mut params = Vec::new();
+    let mut cursor = 0u32;
+    let mut pad_id = 0;
+    let mut pad = |cursor: &mut u32, to: u32, params: &mut Vec<String>| {
+        while *cursor < to {
+            let gap = to - *cursor;
+            let ty = if *cursor % 8 == 0 && gap >= 8 {
+                ("i64", 8)
+            } else if *cursor % 4 == 0 && gap >= 4 {
+                ("i32", 4)
+            } else {
+                ("i8", 1)
+            };
+            params.push(format!("{} %pad{pad_id}", ty.0));
+            pad_id += 1;
+            *cursor += ty.1;
         }
-        end = a.offset + a.size;
+    };
+    for (i, a) in m.args.iter().enumerate() {
+        if a.offset < cursor {
+            return Err(format!("kernarg '{}' at offset {} overlaps the previous argument", a.name, a.offset));
+        }
+        pad(&mut cursor, a.offset, &mut params);
+        let natural = match a.dsl_ty {
+            DType::Ptr => a.size == 8 && a.offset % 8 == 0,
+            _ => a.size == 4 && a.offset % 4 == 0,
+        };
+        if natural {
+            params.push(format!("{} %a{i}", ir_type(a.dsl_ty)));
+            cursor += a.size;
+        } else {
+            let to = a.offset + a.size;
+            pad(&mut cursor, to, &mut params);
+        }
     }
-    Ok(end)
+    pad(&mut cursor, m.kernarg_size, &mut params);
+    Ok((params, cursor))
 }
-
 pub struct Exported {
     pub mir: String,
 }
@@ -192,11 +223,8 @@ pub fn export(m: &MFunction, a: &Alloc) -> Result<Exported, String> {
     }
 
     // 3. Header from the per-version template.
-    let explicit_end = check_kernarg_layout(m)?;
-    // The kernel may read kernarg bytes beyond its named args (the DSL declares the full segment),
-    // so the segment size comes from the function, as in the own emitter.
-    let kernarg = ((m.kernarg_size.max(explicit_end) + 7) / 8) * 8;
-    let irargs: Vec<String> = m.args.iter().enumerate().map(|(i, x)| format!("{} %a{i}", ir_type(x.dsl_ty))).collect();
+    let (irargs, kernarg) = kernarg_ir(m)?;
+    let kernarg = ((kernarg + 7) / 8) * 8;
     let mut mir = llvm20::HEADER_SRC
         .replace("@NAME@", &m.name)
         .replace("@IRARGS@", &irargs.join(", "))
