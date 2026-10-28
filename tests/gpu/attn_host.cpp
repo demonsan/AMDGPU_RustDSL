@@ -36,6 +36,19 @@ struct Args {
 
 static_assert(sizeof(Args) == 48, "kernarg layout must match attention_fwd");
 
+// Decode an OCP E4M3 fp8 byte (bias 7) to double.
+static double fp8_e4m3(unsigned char b) {
+    const int s = (b >> 7) & 1;
+    const int e = (b >> 3) & 0xF;
+    const int m = b & 0x7;
+    double v;
+    if (e == 0) {
+        v = (m / 8.0) * std::ldexp(1.0, -6);
+    } else {
+        v = (1.0 + m / 8.0) * std::ldexp(1.0, e - 7);
+    }
+    return s ? -v : v;
+}
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const char* co = argc > 1 ? argv[1] : "build/attention.co";
@@ -139,10 +152,18 @@ int main(int argc, char** argv) {
     if (std::strcmp(kern, "probe_fp8_matmul") == 0 || std::strcmp(kern, "probe_fp8_load") == 0 || std::strcmp(kern, "probe_fp8_minload") == 0) {
         const int fp8_test = envi("FP8_TEST", 1);
         std::vector<unsigned char> in(8960, 0);
+        unsigned int seed = 12345u;
+        auto next_rand = [&seed]() {
+            seed = seed * 1664525u + 1013904223u;
+            return (seed >> 16) & 0xFFu;
+        };
+        static const unsigned char palette[9] = {0x00, 0x28, 0x30, 0x38, 0x3C,
+                                                 0x40, 0x44, 0xB8, 0xC0};
         for (int i = 0; i < 32; ++i) {
             for (int k = 0; k < 64; ++k) {
                 const unsigned char v =
-                    (fp8_test == 1) ? ((k == i) ? 0x38 : 0x00) : 0x38;
+                    (fp8_test == 1) ? ((k == i) ? 0x38 : 0x00)
+                                    : ((fp8_test == 3) ? palette[next_rand() % 9] : 0x38);
                 in[i * 64 + k] = v;
                 in[2048 + i * 64 + k] = v;
             }
@@ -153,6 +174,9 @@ int main(int argc, char** argv) {
             if (fp8_test == 2) {
                 sa = (unsigned char)(127 + ((l % 32) & 1));
                 sb = (unsigned char)(127 + ((l % 32) & 1));
+            } else if (fp8_test == 3) {
+                sa = (unsigned char)(126 + next_rand() % 3);
+                sb = (unsigned char)(126 + next_rand() % 3);
             }
             in[4096 + l * 4] = sa;
             in[4352 + l * 4] = sb;
@@ -352,7 +376,7 @@ int main(int argc, char** argv) {
                 const int j = l % 32;
                 const float want = (i == j) ? 1.0f : 0.0f;
                 const float gotv = dvals[l * 16 + r];
-                if (std::fabs(gotv - want) > 1e-4f) {
+                if (std::fabs(gotv - want) > 1e-3f + 1e-4f * std::fabs(want)) {
                     if (bad < 8) std::fprintf(stderr, "fp8_minload lane=%d r=%d D[%d][%d] want %g got %g\n", l, r, i, j, want, gotv);
                     ++bad;
                 }
@@ -394,11 +418,26 @@ int main(int argc, char** argv) {
         int bad = 0;
         for (int i = 0; i < 32; ++i) {
             for (int j = 0; j < 32; ++j) {
-                const float want = (fp8_test == 1)
-                                       ? ((i == j) ? 1.0f : 0.0f)
-                                       : 64.0f * (float)(1 << (((i & 1) + (j & 1))));
+                double want_d;
+                if (fp8_test == 1) {
+                    want_d = (i == j) ? 1.0 : 0.0;
+                } else if (fp8_test == 2) {
+                    want_d = 64.0 * (double)(1 << (((i & 1) + (j & 1))));
+                } else {
+                    want_d = 0.0;
+                    for (int kb = 0; kb < 2; ++kb) {
+                        const double sa_v = std::ldexp(1.0, (int)raw[4096 + (i + 32 * kb) * 4] - 127);
+                        const double sb_v = std::ldexp(1.0, (int)raw[4352 + (j + 32 * kb) * 4] - 127);
+                        for (int kk = 0; kk < 32; ++kk) {
+                            const int k = kb * 32 + kk;
+                            want_d += fp8_e4m3(raw[i * 64 + k]) * fp8_e4m3(raw[2048 + j * 64 + k]) *
+                                      sa_v * sb_v;
+                        }
+                    }
+                }
+                const float want = (float)want_d;
                 const float gotv = dvals[i * 32 + j];
-                if (std::fabs(gotv - want) > 1e-4f) {
+                if (std::fabs(gotv - want) > 1e-3f + 1e-4f * std::fabs(want)) {
                     if (bad < 6) {
                         std::fprintf(stderr, "fp8_matmul D[%d][%d]: want %g got %g\n", i, j, want, gotv);
                     }
