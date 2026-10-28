@@ -6716,16 +6716,16 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let sp = b.ptr_add(ptr, soff);
         (0..4u32).map(|w| b.load_b128(sp, 16 * w)).collect()
     };
-    let stage_stores = |b: &mut FnBuilder, data: &[ValueId]| {
+    let stage_stores = |b: &mut FnBuilder, dstb: ValueId, data: &[ValueId]| {
         for (w, d) in data.iter().enumerate() {
             let c = b.c_i32(16 * w as i32);
-            let a = b.add_i32(sdst, c);
+            let a = b.add_i32(dstb, c);
             b.store_lds_b128(Opnd::Val(a), Opnd::Val(*d));
         }
     };
     let key_first = b.c_i32(0);
     let first = stage_loads(b, key_first);
-    stage_stores(b, &first);
+    stage_stores(b, sdst, &first);
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
@@ -6739,11 +6739,24 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (DType::Frag16, Opnd::Val(zero)),
         (DType::Frag16, Opnd::Val(zero)),
         (DType::Frag16, Opnd::Val(zero)),
+        (DType::I32, Opnd::Val(c0)),
     ]);
     let it = vars[0];
+    let par = vars[7];
     let m_var = vars[1];
     let l_var = vars[2];
     let o_vars = [vars[3], vars[4], vars[5], vars[6]];
+    let dbuf = fmha_t_opt("dbuf");
+    // double buffering: compute reads buffer `par`, the next tile is staged into the other one
+    let (kf_b, tr_b, sdst_n) = if dbuf {
+        let cbuf = b.c_i32(256 * fmha_t_pitch());
+        let co = b.mul_i32(par, cbuf);
+        let npar = b.xor_i32(par, c1);
+        let no = b.mul_i32(npar, cbuf);
+        (b.add_i32(cx.kf_base, co), b.add_i32(cx.tr_base, co), b.add_i32(sdst, no))
+    } else {
+        (cx.kf_base, cx.tr_base, sdst)
+    };
 
     // ---- prefetch the next tile (or this one again after the last iteration) ----
     let key0 = b.shl_i32(it, c7);
@@ -6760,7 +6773,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             for sl in 0..2usize {
                 let s = 2 * hh + sl;
                 let ko = b.c_i32(32 * pitch * (s as i32));
-                let kaddr0 = b.add_i32(cx.kf_base, ko);
+                let kaddr0 = b.add_i32(kf_b, ko);
                 let kaddr0h = b.add_i32(kaddr0, c32v);
                 let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
                 let kaddr1 = b.add_i32(kaddr0, c64);
@@ -6905,7 +6918,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
                 for r in 0..4i32 {
                     let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32);
-                    addrs.push(b.add_i32(cx.tr_base, off));
+                    addrs.push(b.add_i32(tr_b, off));
                 }
                 if !no_pv {
                     let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
@@ -6923,18 +6936,24 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     compute(b, false);
     b.end_if();
     // all waves are done with this iteration's K/V; then publish the prefetched tile
-    b.wait_lds(0);
-    if !no_bar {
-        b.barrier();
+    if !dbuf {
+        b.wait_lds(0);
+        if !no_bar {
+            b.barrier();
+        }
     }
     if !no_stage {
-        stage_stores(b, &pre);
+        stage_stores(b, sdst_n, &pre);
     }
     b.wait_lds(0);
     if !no_bar {
         b.barrier();
     }
     b.wait_lds(0);
+    if dbuf {
+        let npar2 = b.xor_i32(par, c1);
+        b.set_var(par, npar2);
+    }
 
     let it_next = b.add_i32(it, c1);
     b.set_var(it, it_next);
@@ -6997,7 +7016,8 @@ fn fmha_t_pitch() -> i32 {
 }
 pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let mut b = FnBuilder::new("fmha_fwd_hd128_mxfp8_t", 512);
-    b.lds((256 * fmha_t_pitch() + 2048) as u32);
+    let nbuf = if fmha_t_opt("dbuf") { 2 } else { 1 };
+    b.lds((nbuf * 256 * fmha_t_pitch() + 2048) as u32);
     b.arg("ptr_o", DType::Ptr, 0x000, 8);
     b.arg("ptr_q", DType::Ptr, 0x010, 8);
     b.arg("ptr_k", DType::Ptr, 0x020, 8);
@@ -7085,7 +7105,7 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let g_bytes8 = b.shl_i32(pblk, c3);
     let lds_k = b.c_i32(0);
     let lds_v = b.c_i32(128 * fmha_t_pitch());
-    let lds_ex = b.c_i32(256 * fmha_t_pitch());
+    let lds_ex = b.c_i32(nbuf * 256 * fmha_t_pitch());
 
     // per-wave exchange slots (own lane, partner lane l ^ 32)
     let wave256 = b.mul_i32(wave, c256);
