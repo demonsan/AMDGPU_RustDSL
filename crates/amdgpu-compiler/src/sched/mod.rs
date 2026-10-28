@@ -25,6 +25,8 @@ pub struct Options {
     pub reorder: bool,
     /// Let non-memory instructions cross `s_barrier` (memory ops never do).
     pub alu_across_barrier: bool,
+    /// Debug bisect: ALU may cross barriers only in this block index.
+    pub xbar_only: Option<usize>,
     /// Pressure limit in VGPR dwords (never below the original peak of the block).
     pub max_vgprs: u32,
     /// Run the verifiers (always on in tests).
@@ -34,7 +36,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, max_vgprs: 240, verify: true, stats: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, max_vgprs: 240, verify: true, stats: false }
     }
 }
 
@@ -54,6 +56,9 @@ impl Options {
                     "noverify" => o.verify = false,
                     "stats" => o.stats = true,
                     _ => {
+                        if let Some(v) = t.strip_prefix("xbar=") {
+                            o.xbar_only = v.parse().ok();
+                        }
                         if let Some(v) = t.strip_prefix("limit=") {
                             if let Ok(n) = v.parse() {
                                 o.max_vgprs = n;
@@ -102,10 +107,11 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
                 continue;
             }
             let term = m.blocks[bi].term.clone();
-            let g = depgraph::build(m, &insts, &term, o.alu_across_barrier);
+            let xb = o.alu_across_barrier || o.xbar_only == Some(bi);
+            let g = depgraph::build(m, &insts, &term, xb);
             let r = list::schedule_best(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], o.max_vgprs as i64);
             if o.verify {
-                verify::check_perm(m, &insts, &r.perm, &term, o.alu_across_barrier)
+                verify::check_perm(m, &insts, &r.perm, &term, xb)
                     .map_err(|e| format!("schedule verification failed in block {bi}: {e}"))?;
             }
             stats.scheduled += 1;

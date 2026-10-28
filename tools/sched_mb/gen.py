@@ -228,10 +228,10 @@ add("mfma_haz_srcA_after_valu_scale32", mf_setup, body, 1, chk="v200", extra=5)
 # ---- global latency: L1 hit vs L2 hit (L1 thrashed by touching 1 MB first)
 thrash = ["s_mov_b64 s[44:45], s[6:7]"]
 for i in range(256):
-    thrash += ["global_load_dword v20, v243, s[6:7]", "s_add_u32 s6, s6, 4096", "s_addc_u32 s7, s7, 0"]
-thrash += ["s_waitcnt vmcnt(0)", "s_mov_b64 s[6:7], s[44:45]"]
-adv = ["s_add_u32 s6, s6, 4096", "s_addc_u32 s7, s7, 0"]
-same = ["s_add_u32 s6, s6, 0", "s_addc_u32 s7, s7, 0"]
+    thrash += ["global_load_dword v20, v243, s[6:7]", "s_add_u32 s6, s6, 4096", "s_addc_u32 s7, s7, 0", "s_nop 4"]
+thrash += ["s_waitcnt vmcnt(0)", "s_mov_b64 s[6:7], s[44:45]", "s_nop 4"]
+adv = ["s_add_u32 s6, s6, 4096", "s_addc_u32 s7, s7, 0", "s_nop 4"]
+same = ["s_add_u32 s6, s6, 0", "s_addc_u32 s7, s7, 0", "s_nop 4"]
 warm1 = ["global_load_dword v20, v243, s[6:7]", "s_waitcnt vmcnt(0)"]
 add("gl_dword_lat_L2", thrash, ["global_load_dword v16, v243, s[6:7]", "s_waitcnt vmcnt(0)"] + [] , 1)
 add("gl_dword_lat_L2x8", thrash, sum([["global_load_dword v16, v243, s[6:7]", "s_waitcnt vmcnt(0)"] + adv for i in range(8)], []), 8)
@@ -240,14 +240,13 @@ add("gl_dwordx4_lat_L2x8", thrash, sum([["global_load_dwordx4 v[16:19], v244, s[
 add("gl_dwordx4_lat_L1x8", warm1, sum([["global_load_dwordx4 v[16:19], v244, s[6:7]", "s_waitcnt vmcnt(0)"] + same for i in range(8)], []), 8)
 add("gl_dword_lat_sc0sc1x8", warm1, sum([["global_load_dword v16, v243, s[6:7] sc0 sc1", "s_waitcnt vmcnt(0)"] + same for i in range(8)], []), 8)
 add("gl_dword_lat_sc1x8", warm1, sum([["global_load_dword v16, v243, s[6:7] sc1", "s_waitcnt vmcnt(0)"] + same for i in range(8)], []), 8)
-out = [HDR]
-meta = []
-for name, text, n in KS:
-    out.append(text)
-    meta.append(name)
-out.append("\n")
-for name, text, n in KS:
-    out.append("""
+def emit(path, kernels):
+    out = [HDR]
+    for name, text, n in kernels:
+        out.append(text)
+    out.append("\n")
+    for name, text, n in kernels:
+        out.append("""
 .amdhsa_kernel %s
   .amdhsa_group_segment_fixed_size 65536
   .amdhsa_private_segment_fixed_size 0
@@ -259,9 +258,9 @@ for name, text, n in KS:
   .amdhsa_accum_offset 256
 .end_amdhsa_kernel
 """ % name)
-out.append(".amdgpu_metadata\n---\namdhsa.kernels:\n")
-for name, text, n in KS:
-    out.append("""  - .name: "%s"
+    out.append(".amdgpu_metadata\n---\namdhsa.kernels:\n")
+    for name, text, n in kernels:
+        out.append("""  - .name: "%s"
     .symbol: %s.kd
     .kernarg_segment_size: 16
     .kernarg_segment_align: 8
@@ -275,14 +274,22 @@ for name, text, n in KS:
       - {.name: "o", .offset: 0, .size: 8, .value_kind: global_buffer, .address_space: global}
       - {.name: "i", .offset: 8, .size: 8, .value_kind: global_buffer, .address_space: global}
 """ % (name, name))
-out.append("amdhsa.target: amdgcn-amd-amdhsa--gfx950\namdhsa.version:\n  - 1\n  - 0\n...\n.end_amdgpu_metadata\n")
-open("mb.s", "w").write("".join(out))
+    out.append("amdhsa.target: amdgcn-amd-amdhsa--gfx950\namdhsa.version:\n  - 1\n  - 0\n...\n.end_amdgpu_metadata\n")
+    open(path, "w").write("".join(out))
+
+# NOTE: all kernels in one code object makes the loader/launch fail once it grows too big
+# (observed: >~140 kernels / large thrash kernel => every launch faults), so split in groups.
+late = [k for k in KS if "_L2" in k[0] or "_L1x8" in k[0] or "sc0sc1" in k[0] or "sc1x8" in k[0]]
+pad = KS[:2]
+rest = [k for k in KS if k not in late and k not in pad]
+half = len(rest) // 2
+emit("mb.s", pad + rest[:half])
+emit("mb_b.s", pad + rest[half:])
+emit("mb_c.s", pad + late)
+for i, k in enumerate(late):
+    emit('mb_c%d.s' % i, pad + [k])
 json.dump({n: m for n, _, m in KS}, open("tests.json", "w"))
+json.dump({"mb.co": [k[0] for k in rest[:half]], "mb_b.co": [k[0] for k in rest[half:]], "mb_c.co": [k[0] for k in late]}, open("groups.json", "w"), indent=1)
 print(len(KS), "kernels")
-
-
-
-
-
 
 
