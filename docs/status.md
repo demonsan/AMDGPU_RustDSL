@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **online-softmax MXFP8 attention (4 tiles, 128 keys)** | `probe_fp8_fmha_online`: flash-style loop with loop-carried running max/sum (float bits in I32 loop vars), per-row correction `exp(m_old-m_new)` broadcast through LDS, O accumulator rescaled in LDS, final 1/l epilogue; `worst_err = 1.8e-4` vs a host emulation of the same online algorithm over the kernel's quantised P bytes, `5.3e-2` vs exact softmax -> `PROBE_FMHA_ONLINE_OK` |
 | **two-tile MXFP8 attention with a tile loop** | `probe_fp8_fmha_2tile`: loop over two key tiles (loop-carried tile index, scores accumulated in LDS), 64-wide row softmax, lane-group split fp8 quantisation, one PV over 64 keys; `worst_err = 1.8e-4` vs the quantised-P reference, `8.3e-2` vs exact softmax (inherent fp8 P quantisation) -> `PROBE_FMHA_2TILE_OK` |
 | **single-tile MXFP8 attention** | `probe_fp8_fmha_tile`: QK^T -> row softmax -> in-kernel fp8 quantisation (scaled `v_cvt_pk_fp8_f32`) -> PV through the same scaled MFMA, `worst_err = 0.0` vs a CPU reference built from the quantised P bytes -> `PROBE_FMHA_TILE_OK` |
 | fp8 QK^T + softmax | `probe_fp8_softmax`: random fp8 Q/K with random E8M0 scales -> block-scaled MFMA -> LDS transpose -> per-row max/exp/sum/normalise, `worst_err=8.1e-08` vs a CPU double reference -> `PROBE_FP8_SOFTMAX_OK` |
@@ -320,6 +321,22 @@ of P itself.
 
 Not yet done: online softmax (running max/sum with rescaling of the O accumulator
 across tiles), which needs per-row correction factors broadcast through LDS.
+
+## Online-softmax attention (round 19)
+
+`probe_fp8_fmha_online` is the flash-attention core loop on gfx950 through our
+compiler, four 32-key tiles with fp8 data and block scales: loop-carried `m` and
+`l` (float bits in I32 loop variables), per-iteration `corr = exp(m_old - m_new)`
+published to LDS so every lane can rescale the O elements of the rows its
+fragment covers, quantised `P * 16` fed to the PV block-scaled MFMA, the O
+accumulator held in LDS, and a final `1/l` epilogue. Register use 160 VGPRs.
+Matches a double-precision host emulation of the same online algorithm (built from
+the kernel's own quantised P bytes) to 1.8e-4; the 5.3e-2 distance from exact
+softmax attention is the inherent fp8 rounding of P.
+
+Remaining distance to the reference kernel: multi-wave role split with paired
+barriers, ds_read_tr / larger tiles (256-row blocks), register-resident O
+accumulator instead of LDS, and the A/B pingpong loop structure.
 
 ## Next: FMHA reference core loop
 
