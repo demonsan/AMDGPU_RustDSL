@@ -6737,41 +6737,43 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let key_next = b.shl_i32(nxt, c7);
     let pre = stage_loads(b, key_next);
     let hq4 = b.mul_i32(cx.q_heads, c4);
-    for hh in 0..2usize {
-        // ---- two 32-key score tiles (S^T = K Q^T) of this 64-key substep ----
-        let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
-        for sl in 0..2usize {
-            let s = 2 * hh + sl;
-            let ko = b.c_i32((4096 * s) as i32);
-            let kaddr0 = b.add_i32(cx.kf_base, ko);
-            let kaddr0h = b.add_i32(kaddr0, c32v);
-            let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
-            let kaddr1 = b.add_i32(kaddr0, c64);
-            let kaddr1h = b.add_i32(kaddr1, c32v);
-            let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
-            // K scale dword of key (128 it + 32 s + j)
-            let kkey0 = b.add_i32(key0, cx.j);
-            let kcs = b.c_i32(32 * s as i32);
-            let kkey = b.add_i32(kkey0, kcs);
-            let kd_row = b.mul_i32(kkey, hq4);
-            let kd_off = b.add_i32(kd_row, cx.kd_base);
-            let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
-            let kd_raw = b.load_f32(kd_ptr, 0);
-            let kd = b.bitcast_i32(kd_raw);
-            let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
-            let sh16 = b.add_i32(cx.g8, c16i);
-            let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
-            let zero_s = b.frag_zero(DType::Frag16);
-            let s0 = b.mfma_scale_fp8(k8_0, cx.b0, zero_s, sk0, cx.sq0);
-            let s_frag = b.mfma_scale_fp8(k8_1, cx.b1, s0, sk1, cx.sq1);
-            let mut vals: Vec<ValueId> = Vec::with_capacity(16);
-            for r in 0..16u8 {
-                let lane = b.frag16_lane(s_frag, r);
-                vals.push(b.bitcast_f32(lane));
-            }
-            sv.push(vals);
+    // All four 32-key score tiles of the iteration are issued up front so that the MFMA latency of
+    // the later tiles hides behind the softmax of the earlier ones.
+    let mut sv_all: Vec<Vec<ValueId>> = Vec::with_capacity(4);
+    for s in 0..4usize {
+        let ko = b.c_i32((4096 * s) as i32);
+        let kaddr0 = b.add_i32(cx.kf_base, ko);
+        let kaddr0h = b.add_i32(kaddr0, c32v);
+        let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
+        let kaddr1 = b.add_i32(kaddr0, c64);
+        let kaddr1h = b.add_i32(kaddr1, c32v);
+        let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
+        // K scale dword of key (128 it + 32 s + j)
+        let kkey0 = b.add_i32(key0, cx.j);
+        let kcs = b.c_i32(32 * s as i32);
+        let kkey = b.add_i32(kkey0, kcs);
+        let kd_row = b.mul_i32(kkey, hq4);
+        let kd_off = b.add_i32(kd_row, cx.kd_base);
+        let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+        let kd_raw = b.load_f32(kd_ptr, 0);
+        let kd = b.bitcast_i32(kd_raw);
+        let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
+        let sh16 = b.add_i32(cx.g8, c16i);
+        let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
+        let zero_s = b.frag_zero(DType::Frag16);
+        let s0 = b.mfma_scale_fp8(k8_0, cx.b0, zero_s, sk0, cx.sq0);
+        let s_frag = b.mfma_scale_fp8(k8_1, cx.b1, s0, sk1, cx.sq1);
+        // keep the accumulator tuple; its lanes are read (as register aliases) after the softmax
+        // of the previous tiles has been issued
+        let mut vals: Vec<ValueId> = Vec::with_capacity(16);
+        for r in 0..16u8 {
+            let lane = b.frag16_lane(s_frag, r);
+            vals.push(b.bitcast_f32(lane));
         }
-
+        sv_all.push(vals);
+    }
+    for hh in 0..2usize {
+        let sv: Vec<Vec<ValueId>> = vec![sv_all[2 * hh].clone(), sv_all[2 * hh + 1].clone()];
         // ---- register softmax: lane-local max, exchange with the partner lane ----
         let mut flat: Vec<ValueId> = Vec::with_capacity(32);
         for sl in 0..2usize {
@@ -6796,32 +6798,13 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.wait_lds(0);
         let mpart = b.bitcast_f32(mp_raw);
         let mt = b.max_f32(mloc, mpart);
-        // Lazy rescaling (the reference kernel's "rollback" idea): the running max and the O
-        // accumulators are only updated when some lane's max grew by more than 4 (a factor 16 in
-        // P), otherwise the stale max is kept; P x 16 <= 256 still fits e4m3 (448).
         let m_old = b.bitcast_f32(m_var);
-        let m_cand = b.max_f32(m_old, mt);
-        let m_thr = b.add_f32(m_old, c4f);
-        let need = b.cmp_lt_f32(m_thr, m_cand);
-        b.begin_if(Opnd::Val(need));
-        {
-            let dm = b.sub_f32(m_old, m_cand);
-            let corr = b.exp2_f32(dm);
-            let l_o = b.bitcast_f32(l_var);
-            let l_s = b.mul_f32(l_o, corr);
-            let l_sb = b.bitcast_i32(l_s);
-            b.set_var(l_var, l_sb);
-            let m_cb = b.bitcast_i32(m_cand);
-            b.set_var(m_var, m_cb);
-            for e in 0..4usize {
-                b.var_scale_f32(o_vars[e], corr);
-            }
-        }
-        b.end_if();
-        let m_eff = b.bitcast_f32(m_var);
+        let m_new = b.max_f32(m_old, mt);
+        let dm = b.sub_f32(m_old, m_new);
+        let corr = b.exp2_f32(dm);
 
         // exp2(s - (m - 4)) = 16 exp2(s - m): the P x 16 quantisation scale comes for free
-        let m4 = b.sub_f32(m_eff, c4f);
+        let m4 = b.sub_f32(m_new, c4f);
         let mut rsum: Option<ValueId> = None;
         let mut words: Vec<ValueId> = Vec::with_capacity(8);
         for sl in 0..2usize {
@@ -6845,15 +6828,19 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         let rsum16 = rsum.unwrap();
         let rsum = b.mul_f32(rsum16, c_sixteenth);
-        let l_cur = b.bitcast_f32(l_var);
-        let l_new = b.add_f32(l_cur, rsum);
+        let l_old = b.bitcast_f32(l_var);
+        let l_scaled = b.mul_f32(l_old, corr);
+        let l_new = b.add_f32(l_scaled, rsum);
+        let m_bits = b.bitcast_i32(m_new);
         let l_bits = b.bitcast_i32(l_new);
+        b.set_var(m_var, m_bits);
         b.set_var(l_var, l_bits);
         let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
 
         // ---- O^T += V^T P^T, four 32-wide dim tiles; the correction is lane-local ----
         for e in 0..4usize {
-            // in place: O += V^T P^T (the lazy rescale above already applied the correction)
+            // in place: O *= corr, then O += V^T P^T (no copies)
+            b.var_scale_f32(o_vars[e], corr);
             let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
             for r in 0..4i32 {
                 let off = b.c_i32((hh as i32) * 8192 + 2048 * r + (e as i32) * 32);
