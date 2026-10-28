@@ -579,11 +579,11 @@ pub fn probe_roles_loop() -> Function {
 }
 /// FMHA compute shape: two distinct operands staged in LDS.
 ///
-/// Each lane stages an A tile (32 B at `tid*32`) and a B tile (32 B at
-/// `8192 + tid*32`), the workgroup synchronises, both tiles are read back with
-/// two `ds_read_b128` each, concatenated into Frag8 operands, and multiplied
-/// with the block-scaled fp8 MFMA. All-ones E4M3 with K = 64 means every output
-/// element must be exactly 64.0.
+/// Each lane stages an A tile (16 B at `tid*16`) and a B tile (16 B at
+/// `8192 + tid*16`), the workgroup synchronises, both tiles are read back with
+/// `ds_read_b128`, doubled into Frag8 operands, and multiplied with the
+/// block-scaled fp8 MFMA. All-ones E4M3 with K = 64 means every output element
+/// must be exactly 64.0.
 pub fn probe_fmha_datapath() -> Function {
     let mut b = FnBuilder::new("probe_fmha_datapath", 512);
     b.lds(16384);
@@ -594,28 +594,21 @@ pub fn probe_fmha_datapath() -> Function {
     let ones = b.c_i32(0x38383838_u32 as i32);
     let c8k = b.c_i32(8192);
     let c16 = b.c_i32(16);
-    let c32 = b.c_i32(32);
     let frag = b.frag4(ones, ones, ones, ones);
 
-    let off = b.mul_i32(tid, c32);
+    let off = b.mul_i32(tid, c16);
     b.store_lds_b128(Opnd::Val(off), Opnd::Val(frag));
-    let off_hi = b.add_i32(off, c16);
-    b.store_lds_b128(Opnd::Val(off_hi), Opnd::Val(frag));
     let boff = b.add_i32(c8k, off);
     b.store_lds_b128(Opnd::Val(boff), Opnd::Val(frag));
-    let boff_hi = b.add_i32(boff, c16);
-    b.store_lds_b128(Opnd::Val(boff_hi), Opnd::Val(frag));
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
 
     let a_lo = b.load_lds_b128(Opnd::Val(off));
-    let a_hi = b.load_lds_b128(Opnd::Val(off_hi));
     let b_lo = b.load_lds_b128(Opnd::Val(boff));
-    let b_hi = b.load_lds_b128(Opnd::Val(boff_hi));
 
-    let a8 = b.cat_frag8(a_lo, a_hi);
-    let b8 = b.cat_frag8(b_lo, b_hi);
+    let a8 = b.cat_frag8(a_lo, a_lo);
+    let b8 = b.cat_frag8(b_lo, b_lo);
     let zero = b.frag_zero(DType::Frag16);
     let d = b.mfma_scale_fp8(a8, b8, zero, 127, 127);
 
