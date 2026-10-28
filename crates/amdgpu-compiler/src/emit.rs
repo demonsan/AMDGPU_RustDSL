@@ -209,12 +209,10 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             let off = inst.srcs[1];
             let bb = a.phys[base as usize];
             let db = a.phys[inst.dst.unwrap() as usize];
-            let mut v = vec![format!("v_add_co_u32 v{db}, vcc, v{bb}, {}", src1(a, off))];
-            if std::env::var("AMDC_PTRADD_NOP").is_ok() {
-                v.push("s_nop 1".to_string());
-            }
-            v.push(format!("v_addc_co_u32 v{}, vcc, v{}, 0, vcc", db + 1, bb + 1));
-            v
+            vec![
+                format!("v_add_co_u32 v{db}, vcc, v{bb}, {}", src1(a, off)),
+                format!("v_addc_co_u32 v{}, vcc, v{}, 0, vcc", db + 1, bb + 1),
+            ]
         }
         MOp::VReadPhys => vec![format!("v_mov_b32_e32 {}, v{}", d(a), inst.imm)],
         MOp::VAddU32 => bin(a, inst, "v_add_u32_e32"),
