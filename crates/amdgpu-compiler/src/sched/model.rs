@@ -60,29 +60,37 @@ pub fn cost(op: MOp) -> OpCost {
     use Grade::*;
     use MOp::*;
     use Pipe::*;
-    let trans = if PARAMS.trans_separate_pipe { Trans } else { Valu };
+    // Numbers: tools/sched_mb/RESULTS.md (s_memtime microbenchmarks on MI355X, 2.39 GHz shader clock);
+    // grade V = 3 repetitions within 5%, E = experimental. See docs/scheduling.md.
     match op {
-        // VALU: wave64 on a SIMD16-class pipe -> 4 cycles per instruction.
+        // VALU: one wave issues one wave64 VALU every 4 cycles, dependent or not (V).
         VMovB32 | VMovFromS | VReadPhys | VAddU32 | VAddF32 | VSubF32 | VMulF32 | VMaxF32 | VMax3F32 | VFmaF32
-        | VAndB32 | VOrB32 | VXorB32 | VLshrB32 | VLshlB32 | VCvtPknormU16 | VCvtPkFp8F32 | VCvtPkBf16F32
-        | VCvtPkFp8Lo | VCvtPkFp8Hi | VCvtPkFp8F32Hi | VCvtF32F16 | VCvtF16F32 | VCndmask | VReadSub | VWriteSub
-        | VCmpLtI32 | VCmpGeI32 | VCmpNeI32 | VCmpLtF32 | VAddCoU32 | VAddcCoU32 => c(Valu, 4, 8, Experimental),
-        VMulLoU32 => c(Valu, 16, 20, Unknown),
-        VMovFromSPair | VPtrAdd => c(Valu, 8, 12, Experimental),
-        VPkAddF32 | VPkMulF32 => c(Valu, 8, 12, Unknown),
-        VPermlane32Swap => c(Valu, 8, 12, Unknown),
+        | VAndB32 | VOrB32 | VXorB32 | VLshrB32 | VLshlB32 | VCvtPknormU16 | VCvtPkBf16F32 | VCvtF32F16
+        | VCvtF16F32 | VCndmask | VReadSub | VWriteSub | VCmpLtI32 | VCmpGeI32 | VCmpNeI32 | VCmpLtF32
+        | VAddCoU32 | VAddcCoU32 | VPkAddF32 | VPkMulF32 => c(Valu, 4, 4, Verified),
+        // 8 cycles (V): fp8 conversion, permlane32_swap, exp/rcp (no separate trans pipe: 8 + 4k for k adds).
+        VCvtPkFp8F32 | VCvtPkFp8Lo | VCvtPkFp8Hi | VCvtPkFp8F32Hi | VPermlane32Swap | VExpF32 | VRcpF32 => {
+            c(Valu, 8, 8, Verified)
+        }
+        VMulLoU32 => c(Valu, 16, 16, Unknown),
+        VMovFromSPair | VPtrAdd => c(Valu, 8, 8, Experimental),
         VReadFirstLane => c(Valu, 4, 12, Unknown),
-        VExpF32 | VRcpF32 => c(trans, 16, 20, Unknown),
-        // MFMA: scaled fp8 32x32x64 (16 passes on the matrix pipe); latency until D readable.
-        VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z => c(Mfma, 32, 40, Unknown),
-        VMfma32x32x16Fp8 | VMfma32x32x8F16 => c(Mfma, 32, 40, Unknown),
-        VMfma16x16x32Fp8 | VMfma16x16x16F16 => c(Mfma, 16, 24, Unknown),
-        LdsReadB32 | LdsReadB128 | LdsReadB64TrB8 => c(Lds, 8, 64, Unknown),
-        LdsWriteB32 | LdsWriteB128 => c(Lds, 8, 4, Unknown),
-        GlobalLoadU16 | GlobalLoadF32 | GlobalLoadB128 => c(Vmem, 8, 500, Unknown),
+        // MFMA issue spacing 64/32/16 (V), same for dependent chains; latency = wait states until the
+        // last D register is readable (20/11/7 s_nop slots of 4 cycles; V) -> hazards pass pads the rest.
+        VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z => c(Mfma, 64, 84, Verified),
+        VMfma32x32x16Fp8 | VMfma32x32x8F16 => c(Mfma, 32, 48, Verified),
+        VMfma16x16x32Fp8 | VMfma16x16x16F16 => c(Mfma, 16, 32, Verified),
+        // LDS (E): b128 issue 8, b32 4, tr_b8 ~6, write b128 ~26; latency ~52 (reads) / ~75 (write).
+        LdsReadB128 => c(Lds, 8, 52, Experimental),
+        LdsReadB32 => c(Lds, 4, 52, Experimental),
+        LdsReadB64TrB8 => c(Lds, 6, 52, Experimental),
+        LdsWriteB128 => c(Lds, 26, 4, Experimental),
+        LdsWriteB32 => c(Lds, 8, 4, Unknown),
+        // Global: L1 hit ~100-108, L2 ~210-250 (E); streaming dwordx4 issue 14.
+        GlobalLoadU16 | GlobalLoadF32 => c(Vmem, 4, 220, Experimental),
+        GlobalLoadB128 => c(Vmem, 14, 240, Experimental),
         GlobalStoreU16 | GlobalStoreF32 => c(Vmem, 8, 4, Unknown),
-        SLoadDword | SLoadDwordx2 => c(Smem, 1, 200, Unknown),
-        SReadPhys | SMovB32 | SAddU32 | SAddcU32 | SMulI32 | SShlB32 | SCmpLtI32 => c(Salu, 1, 2, Experimental),
-        SBarrier | SSetPrio | SNop | SWaitVm | SWaitLgkm | SEndpgm => c(Ctrl, 1, 1, Unknown),
-    }
+        SLoadDword | SLoadDwordx2 => c(Smem, 4, 200, Unknown),
+        SReadPhys | SMovB32 | SAddU32 | SAddcU32 | SMulI32 | SShlB32 | SCmpLtI32 => c(Salu, 4, 4, Verified),
+        SBarrier | SSetPrio | SNop | SWaitVm | SWaitLgkm | SEndpgm => c(Ctrl, 4, 4, Verified),    }
 }

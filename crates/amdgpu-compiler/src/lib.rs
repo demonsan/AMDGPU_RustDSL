@@ -39,7 +39,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
             let mut m = base.clone();
             let attempt = (|| -> Result<regalloc::Alloc, String> {
                 sched::run(&mut m, &o)?;
-                hazards::fix_value_hazards(&mut m);
+                hazards::fix_value_hazards_opts(&mut m, true);
                 let errs = mir::verify(&m);
                 if !errs.is_empty() {
                     return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));

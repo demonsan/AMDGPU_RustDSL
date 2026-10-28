@@ -95,6 +95,13 @@ fn is_fence(op: MOp) -> bool {
 }
 
 pub fn fix_value_hazards(m: &mut MFunction) {
+    fix_value_hazards_opts(m, false)
+}
+
+/// pad_block_end: also pad before the terminator until every in-flight MFMA/transcendental result is
+/// readable (the per-block scan cannot see readers in successor blocks; a scheduler that sinks
+/// MFMAs to the end of a block needs this).
+pub fn fix_value_hazards_opts(m: &mut MFunction, pad_block_end: bool) {
     let alias = m.alias.clone();
     let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
     for b in &mut m.blocks {
@@ -233,6 +240,14 @@ pub fn fix_value_hazards(m: &mut MFunction) {
             out.push(inst);
             cycle += 1;
             i += 1;
+        }
+        if pad_block_end {
+            let mut missing = ready.values().map(|(rd, _)| rd.saturating_sub(cycle)).max().unwrap_or(0);
+            while missing > 0 {
+                let n = missing.min(7) as i64;
+                out.push(MInst::new(MOp::SNop).imm(n));
+                missing = missing.saturating_sub(n as usize + 1);
+            }
         }
         b.insts = out;
     }
