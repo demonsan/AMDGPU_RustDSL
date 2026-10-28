@@ -72,3 +72,15 @@ release 构建，整个进程（启动 + DSL 构建 + 编译 + 写文件），�
 6. DSL 变量遮蔽（`g8` / `g16`）：不是编译器 bug，但被真机对拍立即发现（第 34 轮）。
 
 每一项都有对应的回归（GPU-free 测试或真机 probe）。
+
+## 7. 从干净克隆复现（第 38 轮）
+
+在 GPU 节点上从 `Main` 的提交 `16df21b`（与 `origin/Main` 一致，工作区干净）全新克隆，只按 README 里的命令执行：
+
+| 步骤 | 结果 |
+|---|---|
+| `bash tools/container/cargo.sh test` | 10 passed, 0 failed |
+| `bash tests/gpu/run.sh`（`attention_fwd`，fp16，B=1 H=2 S=128） | `max_abs_err=5.99623e-05`，`bad=0/16384`，`ATTENTION_FWD OK`；`vgpr=205` |
+| `REF_CO=<厂商 .co> OUR_KERNEL=fmha_fwd_hd128_mxfp8_t bash tests/gpu/run_ref.sh` | 15 个形状全部 `REF_KERNEL_OK`；我们 vs CPU 平均误差 1.1–1.8e-3（SK=1 时为 0）；我们 vs 厂商全部输出逐个比较，平均差异 1.3–2.8e-3；1×8×2048×2048 上 185.9 TFLOP/s（厂商 517.5） |
+
+与 §2、§3 里的数字一致，没有需要更正的地方。
