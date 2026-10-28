@@ -12,6 +12,7 @@ pub enum RClass {
     V1,
     V2,
     V4,
+    V16,
     S1,
     S2,
 }
@@ -21,13 +22,14 @@ impl RClass {
         match self {
             RClass::V2 | RClass::S2 => 2,
             RClass::V4 => 4,
+            RClass::V16 => 16,
             _ => 1,
         }
     }
 
     /// Vector register classes share one physical file.
     pub fn is_vector(self) -> bool {
-        matches!(self, RClass::V1 | RClass::V2 | RClass::V4)
+        matches!(self, RClass::V1 | RClass::V2 | RClass::V4 | RClass::V16)
     }
 }
 
@@ -70,6 +72,7 @@ pub enum MOp {
     VWriteSub,
     VReadSub,
     VMfma16x16x16F16,
+    VMfma32x32x8F16,
     // workgroup LDS
     LdsWriteB32,
     LdsReadB32,
@@ -305,6 +308,26 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                             )),
                             _ => errs.push(format!(
                                 "block {bi} inst {ii}: mfma operand {k} is not a register"
+                            )),
+                        }
+                    }
+                }
+                MOp::VMfma32x32x8F16 => {
+                    if let Some(d) = inst.dst {
+                        if m.vreg_class(d) != RClass::V16 {
+                            errs.push(format!("block {bi} inst {ii}: wide mfma dst must be V16"));
+                        }
+                    }
+                    let want = [RClass::V2, RClass::V2, RClass::V16];
+                    for (k, w) in want.iter().enumerate() {
+                        match inst.srcs.get(k) {
+                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) => errs.push(format!(
+                                "block {bi} inst {ii}: wide mfma operand {k} is {:?}, expected {w:?}",
+                                m.vreg_class(*r)
+                            )),
+                            _ => errs.push(format!(
+                                "block {bi} inst {ii}: wide mfma operand {k} is not a register"
                             )),
                         }
                     }

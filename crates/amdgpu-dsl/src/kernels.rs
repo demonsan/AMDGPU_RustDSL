@@ -305,3 +305,26 @@ pub fn probe_lds() -> Function {
     b.store_f32(dst, 0, Opnd::Val(value));
     b.finish()
 }
+/// Wide MFMA probe: `v_mfma_f32_32x32x8_f16` with all-ones operands and a
+/// zeroed 16-dword accumulator, so every element must be exactly K = 8.0.
+pub fn probe_mfma_wide() -> Function {
+    let mut b = FnBuilder::new("probe_mfma_wide", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let ones = b.c_i32(0x3C003C00_u32 as i32);
+    let a = b.frag2(ones, ones);
+    let bfrag = b.frag2(ones, ones);
+    let c = b.frag_zero(DType::Frag16);
+    let d = b.mfma_f16_wide(a, bfrag, c);
+
+    let c64 = b.c_i32(64);
+    let lane_off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, lane_off);
+    for i in 0..16u8 {
+        let bits = b.frag16_lane(d, i);
+        let value = b.bitcast_f32(bits);
+        b.store_f32(row, 4 * i as u32, value);
+    }
+    b.finish()
+}

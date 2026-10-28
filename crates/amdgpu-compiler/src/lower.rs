@@ -221,6 +221,33 @@ impl Lowerer {
         }
     }
 
+    /// Sixteen-dword fragment operand.
+    fn as_v16(&mut self, o: Opnd) -> Result<VReg, String> {
+        match o {
+            Opnd::Val(v) => {
+                let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
+                if self.mir.vreg_class(r) == RClass::V16 {
+                    Ok(r)
+                } else {
+                    Err(format!("value v{v} is not a sixteen-dword fragment"))
+                }
+            }
+            Opnd::Var(v) => {
+                let r = self
+                    .vars
+                    .get(v.0 as usize)
+                    .copied()
+                    .ok_or_else(|| format!("var{v} not lowered"))?;
+                if self.mir.vreg_class(r) == RClass::V16 {
+                    Ok(r)
+                } else {
+                    Err(format!("var{v} is not a sixteen-dword fragment"))
+                }
+            }
+            _ => Err("fragment operand must be a value or variable".to_string()),
+        }
+    }
+
     /// Pointer or two-dword fragment operand, whichever the value holds.
     fn as_v4(&mut self, o: Opnd) -> Result<VReg, String> {
         match o {
@@ -576,6 +603,40 @@ impl Lowerer {
                 let a = self.as_v1(*addr)?;
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::LdsReadB32).def(d).srcreg(a));
+                self.val.insert(dst, d);
+            }
+            Op::MfmaF16Wide { a, b, c } => {
+                let ra = self.as_v2(*a)?;
+                let rb = self.as_v2(*b)?;
+                let rc = self.as_v16(*c)?;
+                let d = self.new_vreg(RClass::V16);
+                self.push(
+                    MInst::new(MOp::VMfma32x32x8F16)
+                        .def(d)
+                        .srcreg(ra)
+                        .srcreg(rb)
+                        .srcreg(rc),
+                );
+                self.val.insert(dst, d);
+            }
+            Op::Frag16Lane { frag, index } => {
+                let f = self.as_v16(*frag)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VReadSub).def(d).srcreg(f).imm(*index as i64));
+                self.val.insert(dst, d);
+            }
+            Op::FragZero { ty } => {
+                let class = match ty {
+                    DType::Frag2 => RClass::V2,
+                    DType::Frag4 => RClass::V4,
+                    DType::Frag16 => RClass::V16,
+                    other => return Err(format!("frag_zero: unsupported type {}", other.name())),
+                };
+                let d = self.new_vreg(class);
+                let zero = self.const_vreg(0);
+                for i in 0..class.dwords() {
+                    self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(zero).imm(i as i64));
+                }
                 self.val.insert(dst, d);
             }
             Op::BitcastF32(a) => {

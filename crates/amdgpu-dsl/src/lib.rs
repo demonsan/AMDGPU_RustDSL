@@ -44,6 +44,8 @@ pub enum DType {
     Frag2,
     /// Four-dword opaque fragment (an MFMA 16x16x16 accumulator).
     Frag4,
+    /// Sixteen-dword opaque fragment (an MFMA 32x32 accumulator).
+    Frag16,
 }
 
 impl DType {
@@ -65,6 +67,7 @@ impl DType {
             DType::Ptr => "ptr",
             DType::Frag2 => "frag2",
             DType::Frag4 => "frag4",
+            DType::Frag16 => "frag16",
         }
     }
 
@@ -72,6 +75,7 @@ impl DType {
         match self {
             DType::Ptr | DType::Frag2 => 2,
             DType::Frag4 => 4,
+            DType::Frag16 => 16,
             _ => 1,
         }
     }
@@ -165,6 +169,12 @@ pub enum Op {
     Frag4Lane { frag: Opnd, index: u8 },
     /// `v_mfma_f32_16x16x16_f16` with an existing accumulator.
     MfmaF16 { a: Opnd, b: Opnd, c: Opnd },
+    /// `v_mfma_f32_32x32x8_f16` with an existing accumulator.
+    MfmaF16Wide { a: Opnd, b: Opnd, c: Opnd },
+    /// Read dword `index` (0..15) of a sixteen-dword fragment.
+    Frag16Lane { frag: Opnd, index: u8 },
+    /// A fragment of `ty` zeroed out.
+    FragZero { ty: DType },
     /// Reinterpret the bits of an integer as `f32` (register renaming only).
     BitcastF32(Opnd),
 }
@@ -187,6 +197,9 @@ impl Op {
             Op::Frag2(..) => DType::Frag2,
             Op::Frag2Lane { .. } | Op::Frag4Lane { .. } => DType::U32,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
+            Op::MfmaF16Wide { .. } => DType::Frag16,
+            Op::FragZero { ty } => *ty,
+            Op::Frag16Lane { .. } => DType::U32,
             Op::BitcastF32(..) => DType::F32,
             Op::LoadLdsB32 { .. } => DType::U32,
         }
@@ -220,6 +233,9 @@ impl Op {
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
+            Op::MfmaF16Wide { a, b, c } => vec![*a, *b, *c],
+            Op::Frag16Lane { frag, .. } => vec![*frag],
+            Op::FragZero { .. } => vec![],
             Op::BitcastF32(a) => vec![*a],
             Op::LoadLdsB32 { addr } => vec![*addr],
         }
@@ -538,6 +554,24 @@ impl FnBuilder {
         self.let_(Op::BitcastF32(a.into()))
     }
 
+    pub fn mfma_f16_wide(
+        &mut self,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        c: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::MfmaF16Wide { a: a.into(), b: b.into(), c: c.into() })
+    }
+
+    pub fn frag16_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
+        self.let_(Op::Frag16Lane { frag: frag.into(), index })
+    }
+
+    /// A zero-initialised fragment of the given type.
+    pub fn frag_zero(&mut self, ty: DType) -> ValueId {
+        self.let_(Op::FragZero { ty })
+    }
+
     /// One dword read from workgroup LDS.
     pub fn load_lds_b32(&mut self, addr: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsB32 { addr: addr.into() })
@@ -759,6 +793,37 @@ pub fn verify(f: &Function) -> Vec<String> {
                             errs.push(here(e));
                         }
                     }
+                    Op::MfmaF16Wide { a, b, c } => {
+                        for (o, want, what) in [
+                            (*a, DType::Frag2, "a"),
+                            (*b, DType::Frag2, "b"),
+                            (*c, DType::Frag16, "c"),
+                        ] {
+                            if let Ok(t) = opnd_ty(f, o) {
+                                if t != want {
+                                    errs.push(here(format!(
+                                        "wide mfma: operand {what} is {}, expected {}",
+                                        t.name(),
+                                        want.name()
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Op::Frag16Lane { frag, index } => {
+                        match opnd_ty(f, *frag) {
+                            Ok(DType::Frag16) => {}
+                            Ok(t) => errs.push(here(format!(
+                                "frag16lane: expected frag16, found {}",
+                                t.name()
+                            ))),
+                            Err(e) => errs.push(here(e)),
+                        }
+                        if *index > 15 {
+                            errs.push(here("frag16lane: index out of range".to_string()));
+                        }
+                    }
+                    Op::FragZero { .. } => {}
                     _ => {}
                 }
                 // Scope: value becomes visible here.

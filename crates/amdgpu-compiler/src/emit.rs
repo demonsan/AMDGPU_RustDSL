@@ -286,6 +286,19 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             let base = v(a, src);
             vec![format!("v_mov_b32_e32 {}, v{}", d(a), base + inst.imm as u32)]
         }
+        MOp::VMfma32x32x8F16 => {
+            // 32x32x8 f16: D is sixteen dwords, A and B two each.
+            let a_reg = reg_of(&inst.srcs[0]);
+            let b_reg = reg_of(&inst.srcs[1]);
+            let c_reg = reg_of(&inst.srcs[2]);
+            vec![format!(
+                "v_mfma_f32_32x32x8_f16 {}, {}, {}, {}",
+                tuple(a, inst.dst.expect("dst"), 16),
+                tuple(a, a_reg, 2),
+                tuple(a, b_reg, 2),
+                tuple(a, c_reg, 16)
+            )]
+        }
         MOp::VMfma16x16x16F16 => {
             // 16x16x16 f16: D is four dwords, A and B two each, C four.
             let a_reg = reg_of(&inst.srcs[0]);
