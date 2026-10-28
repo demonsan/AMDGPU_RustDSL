@@ -447,7 +447,7 @@ pub fn probe_roles() -> Function {
 /// slot, the workgroup synchronises, then the lane reads back its own slot and
 /// the partner wave's slot. Ablations: constant data, no `v_readfirstlane`.
 pub fn probe_waves2() -> Function {
-    let mut b = FnBuilder::new("probe_waves2", 128);
+    let mut b = FnBuilder::new("probe_waves2", 64);
     b.lds(256);
     b.arg("o", DType::Ptr, 0, 8);
     let o = b.let_(Op::KernargPtr { offset: 0 });
