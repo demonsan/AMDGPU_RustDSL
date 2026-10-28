@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "hw_roles") == 0 ||
                              std::strcmp(kern, "hw_lds_neighbour") == 0 ||
                              std::strcmp(kern, "hw_lds_own") == 0 ||
-                             std::strncmp(kern, "hw_bisect", 9) == 0 || std::strcmp(kern, "hw_store2") == 0;
+                             std::strncmp(kern, "hw_bisect", 9) == 0 || std::strcmp(kern, "hw_store2") == 0 || std::strcmp(kern, "probe_lds_own") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -326,7 +326,8 @@ int main(int argc, char** argv) {
         std::printf(bad ? "HW_LDS_FAIL\n" : "HW_LDS_OK\n");
         return bad != 0;
     }
-    if (std::strncmp(kern, "hw_bisect", 9) == 0 || std::strcmp(kern, "hw_store2") == 0) {
+    if (std::strncmp(kern, "hw_bisect", 9) == 0 || std::strcmp(kern, "hw_store2") == 0 ||
+        std::strcmp(kern, "probe_lds_own") == 0) {
         float vals[64] = {0.0f};
         std::memcpy(vals, got.data(), sizeof(vals));
         int bad = 0;

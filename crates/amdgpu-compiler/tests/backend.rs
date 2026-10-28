@@ -68,7 +68,7 @@ fn descriptor_covers_all_registers() {
     // Regression: the allocator once reported only the slots still live at the
     // end, so the descriptor under-declared the VGPR count and the kernel
     // faulted on hardware.
-    for name in ["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2"] {
+    for name in ["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_own"] {
         let f = kernel_by_name(name).unwrap();
         let compiled = compile(&f).unwrap();
         let vgpr_declared = declared(&compiled.asm, ".amdhsa_next_free_vgpr");

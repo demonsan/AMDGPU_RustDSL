@@ -488,3 +488,23 @@ pub fn probe_waves2() -> Function {
 
     b.finish()
 }
+/// Same shape as `probe_lds`, but each lane reads back its own slot. The only
+/// difference from the passing probe is the read address.
+pub fn probe_lds_own() -> Function {
+    let mut b = FnBuilder::new("probe_lds_own", 64);
+    b.lds(256);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let off = b.mul_i32(tid, c4);
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let raw = b.load_lds_b32(Opnd::Val(off));
+    let value = b.bitcast_f32(raw);
+    let out_ptr = b.ptr_add(o, off);
+    b.store_f32(out_ptr, 0, value);
+    b.finish()
+}
