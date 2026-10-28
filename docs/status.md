@@ -657,7 +657,10 @@ dependency structure of the S path and by instruction issue rather than by memor
 real step would be restructuring the schedule across the two waves of a SIMD (the reference kernel's
 ping-pong), which is beyond what the unscheduled linear lowering can express.
 
-## Next: FMHA reference core loop
+## Final summary
+
+The consolidated summary, the reference-kernel comparison table, the measured compile latency and the list of what
+is not implemented are in [`final-report.md`](final-report.md).
 
 1. Resolve the 16 KB LDS question above (needed before scaling the core loop).
 2. Build the paired A/B loop skeleton: two loops with rollback exits, four

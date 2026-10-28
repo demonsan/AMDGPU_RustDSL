@@ -2,55 +2,63 @@
 
 面向 AMD GPU（首发 gfx950，架构上考虑 gfx1250）的 Rust kernel DSL 与自研 compiler。
 
-本项目目标是让 kernel 作者与自动化 agent 能在一个**类型安全、可验证、可快速迭代**的模型里表达 GPU 数据流、资源生命周期和通信协议，同时绕开现有 LLVM AMDGPU 后端中低效或不满足需求的寄存器分配与指令调度。
+kernel 作者和自动化 agent 在一个**类型化、可验证、可快速迭代**的 Rust DSL 里写 GPU 数据流；自研 compiler 把它降到内部 SSA / MIR，自己做寄存器分配、hazard / wait 插入和汇编发射，输出 `.s`，再由 ROCm 自带的 `clang` **只做汇编**得到 `.co`。LLVM 源码不修改，LLVM 的设备端 CodeGen（寄存器分配、调度）不参与。
 
-## 状态
+## 当前状态（已在 MI355X / gfx950 真机上验证）
 
-本仓库当前处于**设计基线阶段**。`docs/` 是可执行的规格，`crates/`、`llvm-bridge/`、`examples/`、`tests/` 将在后续提交中按 `docs/implementation-plan.md` 的里程碑落地。
-
-本仓库**尚无可运行 compiler**，也未在 GPU 上验证任何候选 kernel。文档中所有性能、硬件语义和 1:1 复刻结论都标注了证据等级。
-
-## 分支
-
-- 主开发分支：`Main`（大写 M）。
-- 所有 Rust DSL、内部 IR、compiler passes、LLVM bridge、测试和文档都在本仓库。
-
-## 核心约束
-
-1. **LLVM 源码不可修改。** 不应用 LLVM 补丁、不修改安装目录、不要求用户重建 LLVM。所有 LLVM 未提供或不满足合同的能力，由本项目的内部 compiler passes 实现。
-2. **不复用 LLVM 的设备端 CodeGen 决策。** 保留自己的语义 IR、effects、RA、调度和最终验证；LLVM 仅作为 MIR/target/ABI/编码与发射的基础设施。
-3. **安全不依赖 Drop。** Rust 的 `mem::forget` 可以跳过析构，因此 GPU completion、资源释放和协议义务由独立 ledger 与 IR verifier 检查。
-4. **Rust 类型系统只负责构图期约束。** GPU 异步 hazard、跨设备可见性、alias、epoch 与硬件 encoding 由内部 verifier 证明。
-5. **1:1 复刻是编译结果的验收约束。** 物理寄存器编号与指令顺序属于独立的 witness，不进入 kernel 源码。
-
-## 非目标（当前阶段）
-
-- 不实现完整的 Rust/MIR 前端或改写 rustc。
-- 不实现通用 AMDGPU 后端以替代 LLVM。
-- 不做完整框架移植（DeepInfer / SGLang 只提供薄适配）。
-- 不承诺未经测量的 10ms 编译延迟已达标。
-
-## 文档
-
-| 文档 | 内容 |
+| 内容 | 状态 |
 |---|---|
-| [`docs/design.md`](docs/design.md) | Rust 安全前端、Semantic/Resource/Async IR、MachineDAG、Witness、LLVM 边界 |
-| [`docs/fmha-reference.md`](docs/fmha-reference.md) | gfx950 MXFP8 FMHA 参考 kernel 的已核实事实与 1:1 验收方法 |
-| [`docs/implementation-plan.md`](docs/implementation-plan.md) | 阶段划分、测试矩阵、未验证项 |
+| Rust 类型化 DSL、IR 验证器、MIR、线性扫描 RA、hazard / wait 插入、asm 发射 | 已实现，`cargo test` 10 项 |
+| 端到端：DSL → `.s` → `.co` → HIP 启动 → 数值比对 | 已打通，见 `tests/gpu/` |
+| `attention_fwd`（fp16，示例） | 对 CPU 参考最大绝对误差 ≈ 6e-5 |
+| MXFP8 FMHA：`fmha_fwd_hd128_mxfp8_t` | 与厂商 `fwd_hd128_mxfp8.co` 使用**相同的 656 字节 kernarg ABI 和数据布局**，15 个形状逐元素对拍通过 |
 
-## 证据约定
+`fmha_fwd_hd128_mxfp8_t` 的功能：head dim 128，fp8(e4m3) Q/K/V，E8M0 1×32 Q/K 缩放，标量 V 缩放，BF16 输出，`exp2` softmax，在线 softmax，任意 query / key 长度（含不满一块的 tile），GQA（2 的幂 ≤ 16），任意 batch / head 数。不支持 LSE 输出。
 
-文档中的事实按来源区分：
+对拍结果（`tests/gpu/run_ref.sh`，同一输入同时运行我们的 kernel、厂商 kernel 和双精度 CPU 模型）：
 
-- **Verified**：由固定 commit 的源码、二进制解析或官方规范直接支持，并记录来源。
-- **Experimental**：有源码依据但未在目标硬件上验证。
-- **Unknown / 待确认**：无充分证据，禁止在实现中当作契约。
+- 我们 vs CPU：平均误差 1.1–1.8e-3（厂商 kernel vs CPU 为 1.8–2.8e-3）
+- 我们 vs 厂商：全部输出逐个比较，平均差异 1.3–2.8e-3；Q = 0 与 SK = 1 时逐位相同
+- 差异来源：P 量化到 fp8 的舍入方式不同（固有）
 
-## 许可
+**性能（如实）**：B=1, H=8, S=SK=2048 上约 186 TFLOP/s，厂商 kernel 约 518 TFLOP/s，**慢约 2.7 倍**。没有指令调度器，循环是线性 lowering，两个 wave 之间的 ping-pong 重叠没有实现。详见 `docs/status.md` 的消融实验。
 
-本仓库尚未声明许可证；在明确决定前不复制第三方实现。
+**不是 1:1 复刻**：ABI、网格 / block 形状、1×32 缩放用法、`v_mfma_scale_f32_32x32x64_f8f6f4`、`ds_read_b64_tr_b8`、A/B 两组 wave 的分工都和参考 kernel 一致，但指令级结构不同（P 量化用 `v_cvt_pk_fp8_f32`，参考用 pknorm + scalef32 pack；PV 用 32×32×64 MFMA，参考用 `v_smfmac_f32_16x16x128_fp8_fp8`；每轮 2 个 barrier，参考 4 个 phase；没有 rollback 出口）。对照表见 `docs/final-report.md`。
 
-## Status
+## 目录
 
-编译器链路已经端到端打通：Rust 类型化 DSL → 内部 MIR → 自研寄存器分配与汇编发射 → gfx950 code object，并在 MI355X 真机上运行验证。示例 `attention_fwd` kernel 与 CPU 参考实现对比的最大绝对误差约 `1e-4`。证据见 [docs/status.md](docs/status.md)，架构见 [docs/design.md](docs/design.md)；下一个里程碑是 FMHA 参考 core loop 的 1:1 复刻。
+| 路径 | 内容 |
+|---|---|
+| `crates/amdgpu-dsl` | DSL（`Op` / `Stmt` / `FnBuilder`）、类型检查与验证器、所有 kernel（`kernels.rs`） |
+| `crates/amdgpu-compiler` | lowering → MIR、coalescing、DCE、hazard / wait pass、线性扫描 RA、asm emit、`amdc` 命令行 |
+| `tests/gpu` | HIP 主机程序（`attn_host.cpp`、`ref_host.cpp`）与 `run.sh`、`run_ref.sh` |
+| `tools/container` | 在容器里运行 `cargo` 的脚本（`FMHA_ABLATE` 调试开关会被传入） |
+| `docs` | `final-report.md`（总结与对照）、`status.md`（按轮次的验证记录与硬件事实）、`design.md`、`fmha-reference.md`、`implementation-plan.md` |
 
+## 如何复现
+
+```bash
+# 编译器测试（容器内，不需要 GPU）
+bash tools/container/cargo.sh test
+
+# 示例 attention_fwd：DSL -> asm -> .co -> GPU -> CPU 对比（需要 gfx950 与 ROCm）
+bash tests/gpu/run.sh
+
+# 与厂商 fwd_hd128_mxfp8.co 逐元素对拍（厂商 .co 不在仓库里，需自行取得 aiter 提交 7061cbd 的该文件）
+REF_CO=/path/to/fwd_hd128_mxfp8.co OUR_KERNEL=fmha_fwd_hd128_mxfp8_t bash tests/gpu/run_ref.sh
+```
+
+`amdc emit <kernel> --out x.s` 可单独生成汇编；`amdc` 的 kernel 列表见 `crates/amdgpu-compiler/src/lib.rs` 的 `kernel_names()`。
+
+## 核心约束（保持不变）
+
+1. **LLVM 源码不可修改**：不打补丁、不改安装目录。LLVM 没有的能力由内部 pass 实现。
+2. **不复用 LLVM 的设备端 CodeGen 决策**：自己的 SSA / MIR、RA、wait / hazard 插入和 asm 发射；LLVM 只做汇编。
+3. **证据约定**：文档里的结论分 Verified（真机或固定 commit 的源码 / 二进制直接支持）、Experimental、Unknown。性能与数值结论都来自 `tests/gpu` 里的可复现命令。
+
+## 已知限制
+
+- 无指令调度器（只有 hazard / wait 插入）；性能落后厂商 kernel 约 2.7 倍。
+- 没有跨卡通信（MORI LSA / SDMA / GDA）、gfx1250 后端、JIT / 框架适配的实现；`docs/design.md` 里这些仍是设计。
+- 设计文档中的 Resource / Async IR 只落地了一部分（LDS 区域、待完成加载的 wait 跟踪）。
+- 没有测量 ≤10 ms 的编译延迟，不做这个声明。
