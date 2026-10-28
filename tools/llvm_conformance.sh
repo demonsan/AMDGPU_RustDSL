@@ -29,8 +29,8 @@ selected_tests() {  # basename list of MIR tests with a tail pass in a RUN line
     (cd "$LLVM_SRC/llvm/$TEST_SUB" && grep -lE "^# RUN:.*($TAIL_PASSES)" *.mir | sort)
 }
 
-make_mirror() {  # $1 = dir ; a copy of llvm/test plus symlinks to the rest of llvm/, with a lit site config pointing at it
-    local M="$1"
+make_mirror() {  # $1 = dir, $2 = tools dir ; a copy of llvm/test plus symlinks to the rest of llvm/, with a lit site config pointing at it
+    local M="$1" TD="$2"
     rm -rf "$M"; mkdir -p "$M/llvm" "$M/build/test"
     # llvm/test is 1.2 GB: copy only the config files and CodeGen/AMDGPU, symlink the rest.
     local T="$LLVM_SRC/llvm/test"
@@ -42,16 +42,24 @@ make_mirror() {  # $1 = dir ; a copy of llvm/test plus symlinks to the rest of l
     for e in "$LLVM_SRC"/*; do b=$(basename "$e"); [ "$b" = llvm ] || ln -s "$e" "$M/$b"; done
     sed -e "s#^config.llvm_src_root = .*#config.llvm_src_root = '$M/llvm'#" \
         -e "s#^config.llvm_obj_root = .*#config.llvm_obj_root = '$M/build'#" \
-        -e "s#^config.llvm_tools_dir = .*#config.llvm_tools_dir = '$LLVM_TOOLS'#" \
+        -e "s#^config.llvm_tools_dir = .*#config.llvm_tools_dir = '$TD'#" \
         -e "s#^config.llvm_shlib_dir = .*#config.llvm_shlib_dir = '$LLVM_ROCM/lib/llvm/lib'#" \
         "$LLVM_BUILD/test/lit.site.cfg.py" > "$M/build/test/lit.site.cfg.py"
     mkdir -p "$M/build/test/CodeGen/AMDGPU"
 }
 
+mk_fc_tools() {  # $1 = dir, $2 = record|compare : tools dir whose FileCheck is the differential wrapper
+    rm -rf "$1"; mkdir -p "$1"
+    for e in "$LLVM_TOOLS"/*; do b=$(basename "$e"); [ "$b" = FileCheck ] || ln -s "$e" "$1/$b"; done
+    printf '#!/bin/sh\nexport REAL_FILECHECK=%s GOLD_DIR=%s FC_MODE=%s\nexec python3 %s/tools/filecheck_diff.py "$@"\n' \
+        "$(readlink -f "$LLVM_TOOLS/FileCheck")" "$WORK/gold" "$2" "$REPO" > "$1/FileCheck"
+    chmod +x "$1/FileCheck"
+}
+
 run_lit() {  # $1 = mirror ; $2 = result json ; stdin = basenames
     local M="$1" J="$2" re
     re="CodeGen/AMDGPU/($(paste -sd'|' | sed 's/\./\\./g'))\$"
-    (cd "$M/build" && $LIT -j"$JOBS" -q --filter="$re" -o "$J" "$M/build/test/CodeGen/AMDGPU" > "${J%.json}.log" 2>&1)
+    (cd "$M/build" && $LIT -j"$JOBS" -q -a --filter="$re" -o "$J" "$M/build/test/CodeGen/AMDGPU" > "${J%.json}.log" 2>&1)
 }
 
 summ() { python3 - "$@" <<'EOF'
@@ -60,42 +68,57 @@ d=json.load(open(sys.argv[1])); c=collections.Counter(t["code"] for t in d["test
 EOF
 }
 
-if [ "$WHAT" = lit ] || [ "$WHAT" = all ]; then
-    echo "== lit: baseline vs round trip"
-    selected_tests > "$OUT/selected.txt"; echo "selected tail-pass MIR tests: $(wc -l < "$OUT/selected.txt")"
-    make_mirror "$WORK/base"
-    run_lit "$WORK/base" "$OUT/lit-baseline.json" < "$OUT/selected.txt"
-    echo -n "baseline: "; summ "$OUT/lit-baseline.json"
-    make_mirror "$WORK/rt"
-    : > "$OUT/roundtrip-stats.txt"
+roundtrip_all() {  # $1 = mirror ; $2 = level flag ; fills $OUT/roundtrip-stats-<level>.txt
+    local M="$1" LV="$2" ST="$OUT/roundtrip-stats$3.txt"
+    : > "$ST"
     while read -r f; do
-        p="$WORK/rt/llvm/$TEST_SUB/$f"
-        echo -n "$f " >> "$OUT/roundtrip-stats.txt"
-        "$AMDC" mir-roundtrip "$LLVM_SRC/llvm/$TEST_SUB/$f" "$p.new" >> "$OUT/roundtrip-stats.txt" 2>&1 && mv "$p.new" "$p"
+        p="$M/llvm/$TEST_SUB/$f"
+        echo -n "$f " >> "$ST"
+        "$AMDC" mir-roundtrip "$LLVM_SRC/llvm/$TEST_SUB/$f" "$p.new" $LV >> "$ST" 2>&1 && mv "$p.new" "$p"
     done < "$OUT/selected.txt"
-    run_lit "$WORK/rt" "$OUT/lit-roundtrip.json" < "$OUT/selected.txt"
-    echo -n "round trip: "; summ "$OUT/lit-roundtrip.json"
+}
+
+if [ "$WHAT" = lit ] || [ "$WHAT" = all ]; then
+    echo "== lit: baseline, then identity / flags / all round trips"
+    selected_tests > "$OUT/selected.txt"; echo "selected tail-pass MIR tests: $(wc -l < "$OUT/selected.txt")"
+    rm -rf "$WORK/gold"; mkdir -p "$WORK/gold"
+    mk_fc_tools "$WORK/tools-record" record
+    mk_fc_tools "$WORK/tools-compare" compare
+    make_mirror "$WORK/base" "$WORK/tools-record"
+    run_lit "$WORK/base" "$OUT/lit-baseline.json" < "$OUT/selected.txt"
+    echo -n "baseline (records the goldens): "; summ "$OUT/lit-baseline.json"
+    # identity round trip with the REAL FileCheck: do the original CHECK lines still hold?
+    make_mirror "$WORK/rt-id-real" "$LLVM_TOOLS"; roundtrip_all "$WORK/rt-id-real" "" "-identity"
+    run_lit "$WORK/rt-id-real" "$OUT/lit-identity-check.json" < "$OUT/selected.txt"
+    echo -n "identity round trip, original CHECK lines: "; summ "$OUT/lit-identity-check.json"
+    for LV in identity flags all; do
+        make_mirror "$WORK/rt-$LV" "$WORK/tools-compare"; roundtrip_all "$WORK/rt-$LV" "--level=$LV" "-$LV"
+        run_lit "$WORK/rt-$LV" "$OUT/lit-diff-$LV.json" < "$OUT/selected.txt"
+        echo -n "level=$LV, differential vs baseline output: "; summ "$OUT/lit-diff-$LV.json"
+    done
     python3 - "$OUT" <<'EOF'
-import json,sys,re,collections
+import json,sys,re
 o=sys.argv[1]
-b={t["name"]:t["code"] for t in json.load(open(o+"/lit-baseline.json"))["tests"]}
-r={t["name"]:t["code"] for t in json.load(open(o+"/lit-roundtrip.json"))["tests"]}
-st={}
-for l in open(o+"/roundtrip-stats.txt"):
-    m=re.match(r"(\S+) STATS files=1 bodies=(\d+) insts=(\d+) parsed=(\d+) opaque=(\d+) bundles=(\d+) changed=(\d+)",l)
-    if m: st["LLVM :: CodeGen/AMDGPU/"+m.group(1)]=tuple(map(int,m.groups()[1:]))
+def load(p): return {t["name"]:t["code"] for t in json.load(open(p))["tests"]}
+b=load(o+"/lit-baseline.json")
+def stats(p):
+    st={}
+    for l in open(p):
+        m=re.match(r"(\S+) STATS files=1 bodies=(\d+) insts=(\d+) parsed=(\d+) opaque=(\d+) bundles=(\d+) changed=(\d+)",l)
+        if m: st["LLVM :: CodeGen/AMDGPU/"+m.group(1)]=tuple(map(int,m.groups()[1:]))
+    return st
+st=stats(o+"/roundtrip-stats-identity.txt")
 imp=[n for n,s in st.items() if s[0]>0 and s[3]==0]
-print("tests: %d  baseline PASS: %d  roundtrip PASS: %d" % (len(b), sum(v=="PASS" for v in b.values()), sum(v=="PASS" for v in r.values())))
-print("fully importable (bodies>0, no opaque instruction): %d ; of those PASS after round trip: %d" % (len(imp), sum(r.get(n)=="PASS" for n in imp)))
-print("instructions: %d parsed: %d opaque: %d bundles: %d lines changed by printing: %d" % tuple(sum(s[i] for s in st.values()) for i in (1,2,3,4)) if False else "")
 tot=[sum(s[i] for s in st.values()) for i in range(6)]
-print("instructions=%d parsed=%d opaque=%d bundles=%d changed_lines=%d" % (tot[1],tot[2],tot[3],tot[4],tot[5]))
-reg=[n for n in b if b[n]=="PASS" and r.get(n)!="PASS"]
-print("REGRESSIONS (baseline PASS, round trip not PASS): %d" % len(reg))
-for n in sorted(reg): print("  ",n,r.get(n),st.get(n))
+print("tests=%d baseline PASS=%d; fully importable (bodies>0, no opaque instruction)=%d" % (len(b), sum(v=="PASS" for v in b.values()), len(imp)))
+print("instructions=%d parsed=%d opaque=%d bundles=%d lines-changed-by-printing=%d" % (tot[1],tot[2],tot[3],tot[4],tot[5]))
+for name,p in (("identity/original CHECK","lit-identity-check"),("identity/differential","lit-diff-identity"),("flags/differential","lit-diff-flags"),("all/differential","lit-diff-all")):
+    r=load(o+"/%s.json"%p)
+    reg=sorted(n for n in b if b[n]=="PASS" and r.get(n)!="PASS")
+    print("%-26s PASS %d/%d ; importable PASS %d/%d ; mismatching: %d" % (name, sum(v=="PASS" for v in r.values()), len(b), sum(r.get(n)=="PASS" for n in imp), len(imp), len(reg)))
+    open(o+"/failing-%s.txt"%p,"w").write("\n".join(n.split("::")[-1].strip() for n in reg)+"\n")
 EOF
 fi
-
 if [ "$WHAT" = table ] || [ "$WHAT" = all ]; then
     echo "== opcode table vs LLVM's own MIR"
     selected_tests > "$OUT/selected.txt"
