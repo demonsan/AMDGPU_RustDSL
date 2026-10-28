@@ -6,9 +6,10 @@ def load(p):
         l=l.split(';')[0].strip()
         if not l or l.startswith('.') and not l.startswith('.LBB'): continue
         if l.endswith(':'):
-            seq.append(('LABEL',0,[]));continue
+            continue
         m=l.split()[0]
         if not (m.startswith('v_') or m.startswith('s_') or m.startswith('ds_') or m.startswith('global_')): continue
+        if m in ('s_branch','s_cbranch_vccnz','s_cbranch_vccz','s_endpgm'): continue
         if m=='s_nop':
             gap[0]+=int(l.split()[1])+1;continue
         if m=='s_waitcnt':
