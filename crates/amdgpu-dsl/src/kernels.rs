@@ -6689,6 +6689,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let c127 = b.c_i32(127);
     let neg_big = b.c_f32(-1.0e30);
     let c128v = b.c_i32(128);
+    let pitch = fmha_t_pitch();
     let c4f = b.c_f32(4.0);
     let c_sixteenth = b.c_f32(0.0625);
     let zero = b.frag_zero(DType::Frag16);
@@ -6757,7 +6758,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
             for sl in 0..2usize {
                 let s = 2 * hh + sl;
-                let ko = b.c_i32((4096 * s) as i32);
+                let ko = b.c_i32((32 * pitch * s) as i32);
                 let kaddr0 = b.add_i32(cx.kf_base, ko);
                 let kaddr0h = b.add_i32(kaddr0, c32v);
                 let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
@@ -6870,7 +6871,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.var_scale_f32(o_vars[e], corr);
                 let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
                 for r in 0..4i32 {
-                    let off = b.c_i32((hh as i32) * 8192 + 2048 * r + (e as i32) * 32);
+                    let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32);
                     addrs.push(b.add_i32(cx.tr_base, off));
                 }
                 if !no_pv {
@@ -6951,9 +6952,14 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// Transposed (`S^T = K Q^T`) variant of `fmha_fwd_hd128_mxfp8`: same ABI, same requirements, but
 /// all score data lives in registers (lane = query), the online-softmax correction is lane-local
 /// and LDS holds only the K and V tiles.
+/// LDS row pitch (bytes) of the K/V tiles of the transposed FMHA kernel (env FMHA_PITCH, read at
+/// build time, for bank-conflict experiments; 128 = unpadded).
+fn fmha_t_pitch() -> i32 {
+    std::env::var("FMHA_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(128)
+}
 pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let mut b = FnBuilder::new("fmha_fwd_hd128_mxfp8_t", 512);
-    b.lds(34816);
+    b.lds((256 * fmha_t_pitch() + 2048) as u32);
     b.arg("ptr_o", DType::Ptr, 0x000, 8);
     b.arg("ptr_q", DType::Ptr, 0x010, 8);
     b.arg("ptr_k", DType::Ptr, 0x020, 8);
@@ -7040,8 +7046,8 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let g16 = b.shl_i32(pblk, c4);
     let g_bytes8 = b.shl_i32(pblk, c3);
     let lds_k = b.c_i32(0);
-    let lds_v = b.c_i32(16384);
-    let lds_ex = b.c_i32(32768);
+    let lds_v = b.c_i32(128 * fmha_t_pitch());
+    let lds_ex = b.c_i32(256 * fmha_t_pitch());
 
     // per-wave exchange slots (own lane, partner lane l ^ 32)
     let wave256 = b.mul_i32(wave, c256);
@@ -7127,7 +7133,9 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let rt_row = b.let_(Op::LshrI32(Opnd::Val(rt), Opnd::Val(c1)));
     let rt_half = b.let_(Op::AndI32(Opnd::Val(rt), Opnd::Val(c1)));
     let rt_half64 = b.shl_i32(rt_half, c6);
-    let rt64 = b.shl_i32(rt, c6);
+    let pitch_c = b.c_i32(fmha_t_pitch());
+    let rt_rowp = b.mul_i32(rt_row, pitch_c);
+    let rt64 = b.add_i32(rt_rowp, rt_half64);
     let is_a = b.cmp_lt_i32(wave, c4);
 
     // transposing-read lane address for A' = V^T (key of byte b: 16 r + 8 (i/4) + 4 g + i % 4):
@@ -7140,7 +7148,7 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let key_c = b.let_(Op::AndI32(Opnd::Val(m_s1), Opnd::Val(c3)));
     let key0p = b.add_i32(key_a, key_b);
     let key_part = b.add_i32(key0p, key_c);
-    let key_off = b.mul_i32(key_part, c128);
+    let key_off = b.mul_i32(key_part, pitch_c);
     let m_s4 = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c4)));
     let m_gl = b.let_(Op::AndI32(Opnd::Val(m_s4), Opnd::Val(c1)));
     let m_h = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c1)));
@@ -7149,7 +7157,7 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let col_part = b.add_i32(col_a, col_b);
     let tr0 = b.add_i32(key_off, col_part);
     let tr_base = b.add_i32(tr0, lds_v);
-    let j128 = b.mul_i32(j, c128);
+    let j128 = b.mul_i32(j, pitch_c);
     let kf0 = b.add_i32(j128, g16);
     let kf_base = b.add_i32(kf0, lds_k);
     let c127p = b.c_i32(127);
