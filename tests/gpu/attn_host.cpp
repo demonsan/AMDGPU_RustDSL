@@ -118,7 +118,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "hw_roles") == 0 ||
                              std::strcmp(kern, "hw_lds_neighbour") == 0 ||
                              std::strcmp(kern, "hw_lds_own") == 0 ||
-                             std::strncmp(kern, "hw_bisect", 9) == 0 || std::strcmp(kern, "hw_store2") == 0 || std::strcmp(kern, "probe_lds_own") == 0;
+                             std::strncmp(kern, "hw_bisect", 9) == 0 || std::strcmp(kern, "hw_store2") == 0 || std::strcmp(kern, "probe_lds_own") == 0 ||
+                             std::strcmp(kern, "probe_lds_self2") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -324,6 +325,23 @@ int main(int argc, char** argv) {
         std::printf("  %s bad=%d sample=%.1f %.1f %.1f %.1f\n", kern, bad, vals[0], vals[1],
                     vals[2], vals[3]);
         std::printf(bad ? "HW_LDS_FAIL\n" : "HW_LDS_OK\n");
+        return bad != 0;
+    }
+    if (std::strcmp(kern, "probe_lds_self2") == 0) {
+        float vals[64] = {0.0f};
+        std::memcpy(vals, got.data(), sizeof(vals));
+        int bad = 0;
+        for (int tid = 0; tid < 64; ++tid) {
+            if (std::fabs(vals[tid] - (float)tid) > 0.5f) {
+                if (bad < 4) {
+                    std::fprintf(stderr, "self2 mismatch tid=%d got=%.1f\n", tid, vals[tid]);
+                }
+                ++bad;
+            }
+        }
+        std::printf("  self2 bad=%d sample=%.1f %.1f %.1f %.1f\n", bad, vals[0], vals[1], vals[2],
+                    vals[3]);
+        std::printf(bad ? "SELF2_FAIL\n" : "SELF2_OK\n");
         return bad != 0;
     }
     if (std::strcmp(kern, "probe_lds_own") == 0) {
