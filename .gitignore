@@ -12,7 +12,7 @@ Cargo.lock
 !tools/mfma_probe.s
 !tools/lds_probe.s
 !tools/fmha_isa_probe.s
-!tools/hw_roles.s
+!tools/hw_*.s
 *.mir
 !fixtures/**/*.md
 
