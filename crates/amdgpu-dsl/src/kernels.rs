@@ -459,7 +459,8 @@ pub fn probe_roles() -> Function {
     let got = b.load_lds_b32(Opnd::Val(partner_off));
     let value = b.bitcast_f32(got);
 
-    let out2_index = b.add_i32(tid, c512);
+    let c1024 = b.c_i32(1024);
+    let out2_index = b.add_i32(tid, c1024);
     let out2_off = b.mul_i32(out2_index, c4);
     let out2_ptr = b.ptr_add(o, out2_off);
     b.store_f32(out2_ptr, 0, value);

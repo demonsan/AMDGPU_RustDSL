@@ -254,13 +254,18 @@ int main(int argc, char** argv) {
             if (std::fabs(vals[512 + tid] - (float)want_read) > 0.5f) {
                 if (lds_bad < 4) {
                     std::fprintf(stderr, "lds mismatch tid=%d got=%.1f want=%d\n", tid,
-                                 vals[512 + tid], want_read);
+                                 vals[1024 + tid], want_read);
                 }
                 ++lds_bad;
             }
         }
-        int self_bad = 0;`n        for (int tid = 0; tid < 512; ++tid) {`n            if (std::fabs(vals[512 + tid] - (float)tid) > 0.5f) {`n                ++self_bad;`n            }`n        }`n        std::printf("  roles self_bad=%d\\n", self_bad);`n        std::printf("  roles marker_bad=%d lds_bad=%d  o[0]=%.1f o[64]=%.1f o[512]=%.1f o[576]=%.1f\\n",
-                    marker_bad, lds_bad, vals[0], vals[64], vals[512], vals[576]);
+        int self_bad = 0;
+        for (int tid = 0; tid < 512; ++tid) {
+            if (std::fabs(vals[512 + tid] - (float)tid) > 0.5f) {
+                ++self_bad;
+            }
+        }
+        std::printf("  roles self_bad=%d marker_bad=%d lds_bad=%d\n", self_bad, marker_bad, lds_bad);
         for (int w = 0; w < 8; ++w) {
             std::printf("    wave %d marker=%.1f lds=%.1f\n", w, vals[w * 64], vals[512 + w * 64]);
         }
