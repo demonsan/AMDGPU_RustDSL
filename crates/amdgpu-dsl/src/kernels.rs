@@ -498,7 +498,14 @@ pub fn probe_lds_own() -> Function {
     let tid = b.let_(Op::WorkitemId);
     let c4 = b.c_i32(4);
     let off = b.mul_i32(tid, c4);
-    b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
+    // Rotate the write by one slot: the lane writes the slot of the previous
+    // lane and reads its own, so the value read must be `(tid - 1) & 63`.
+    // This separates "write and read work" from "write then read the same slot".
+    let c63r = b.c_i32(63);
+    let prev = b.add_i32(tid, c63r);
+    let prev_i = b.let_(Op::AndI32(Opnd::Val(prev), Opnd::Val(c63r)));
+    let wr_off = b.mul_i32(prev_i, c4);
+    b.store_lds_b32(Opnd::Val(wr_off), Opnd::Val(tid));
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
