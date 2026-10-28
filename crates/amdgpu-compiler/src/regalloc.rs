@@ -23,6 +23,16 @@ const V_RESERVED: usize = 1;
 const S_RESERVED: usize = 8;
 
 pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
+    // First try the compact policy. If the kernel runs out of registers only because wide
+    // tuples cannot find an aligned hole between scattered singles, retry with the singles
+    // packed from the top of the file so the low registers stay available for tuples.
+    match allocate_with(m, false) {
+        Err(e) if e.contains("out of VGPRs") => allocate_with(m, true),
+        other => other,
+    }
+}
+
+fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String> {
     let n = m.vregs.len();
     let mut start = vec![usize::MAX; n];
     let mut end = vec![0usize; n];
@@ -197,7 +207,7 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
                 true
             }
         });
-        let slot = find_slot(&used_v, c).ok_or_else(|| {
+        let slot = find_slot(&used_v, c, singles_from_top).ok_or_else(|| {
             let mut dwords = 0usize;
             let mut by_class = [0usize; 5];
             for (_, ar, ac) in &active {
@@ -252,7 +262,7 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
                 true
             }
         });
-        let slot = find_slot(&used_s, c).ok_or_else(|| {
+        let slot = find_slot(&used_s, c, false).ok_or_else(|| {
             format!(
                 "out of SGPRs allocating r{r} ({c:?}, live {}..{})",
                 s, e
@@ -316,7 +326,7 @@ fn free_phys(used_v: &mut [bool], used_s: &mut [bool], phys: u32, c: RClass) {
     }
 }
 
-fn find_slot(used: &[bool], c: RClass) -> Option<usize> {
+fn find_slot(used: &[bool], c: RClass, singles_from_top: bool) -> Option<usize> {
     // A register tuple must start at a multiple of its own width: the ISA
     // requires 64-bit pairs at even indices and 128-bit tuples at multiples of
     // four.
@@ -332,6 +342,16 @@ fn find_slot(used: &[bool], c: RClass) -> Option<usize> {
         S_RESERVED
     };
     let n = used.len();
+    if singles_from_top && c.is_vector() && width == 1 {
+        let mut i = n;
+        while i > lo {
+            i -= 1;
+            if !used[i] {
+                return Some(i);
+            }
+        }
+        return None;
+    }
     let mut i = lo;
     while i + width <= n {
         if i % align == 0 && (0..width).all(|k| !used[i + k]) {
