@@ -7,7 +7,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Step | Evidence |
 |---|---|
 | Rust toolchain only inside a container | `tools/container/Containerfile` (ubuntu 22.04 + rustup 1.83.0), built with rootless podman; host and shared home untouched |
-| Workspace builds and tests | `tools/container/cargo.sh build` clean, `cargo test` → 6 backend tests pass |
+| Workspace builds and tests | `tools/container/cargo.sh build` clean, `cargo test` → 7 backend tests pass |
 | Typed IR + verifier | `amdgpu-dsl`: SSA values, loop variables, scope and type checking |
 | Lowering + own register allocation | `amdgpu-compiler`: MIR, linear-scan RA, copy coalescing, wait-state insertion |
 | Assembly emission | `amdc emit attention_fwd` → gfx950 asm accepted by the ROCm assembler |
@@ -17,6 +17,8 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | **Attention kernel numerics** | `attention_fwd` on gfx950 vs CPU reference: `H=1 S=64` max_abs_err `9.4e-05`; `H=2 S=128` max_abs_err `6.0e-05`; `bad = 0` in both |
 | MFMA infrastructure | `probe_mfma`: emitted `v_mfma_f32_16x16x16_f16 v[12:15], v[4:5], v[6:7], v[8:11]` with 4/2/2/4-dword tuples; all 256 accumulator elements `16.0` → `PROBE_MFMA_OK` |
 | LDS, barriers, `lgkmcnt` | `probe_lds`: 64 lanes write their id to LDS, barrier, read the neighbour's value → `PROBE_LDS_OK`; descriptor declares 256 B of LDS |
+| Wide MFMA (16-dword accumulator) | `probe_mfma_wide`: `v_mfma_f32_32x32x8_f16` with a 16-dword zeroed accumulator; every element `8.0` → `PROBE_MFMA_WIDE_OK` |
+| FP8 MFMA | `probe_mfma_fp8`: all-ones E4M3 operands; `v_mfma_f32_16x16x32_fp8_fp8` → `32.0` (K=32), `v_mfma_f32_32x32x16_fp8_fp8` → `16.0` (K=16) → `PROBE_MFMA_FP8_OK` |
 
 `attention_fwd` is a real dense attention kernel (one lane per query row, online
 softmax over the key loop, f32 accumulation, f16 output) that is fully generated
@@ -73,22 +75,34 @@ Host harness:
 The 1:1 reproduction target is the core loop of
 `aiter/hsa/gfx950/fmha_v4_fwd/fwd_hd128_mxfp8.co` (facts in
 [docs/fmha-reference.md](fmha-reference.md)). Landed so far: MFMA
-(`v_mfma_f32_16x16x16_f16`) with 4/2/2/4-dword tuples, LDS read/write,
-`s_barrier` and explicit `lgkmcnt` waits, all verified on hardware.
+(`v_mfma_f32_16x16x16_f16`, `32x32x8_f16`, `16x16x32_fp8_fp8`,
+`32x32x16_fp8_fp8`), 4/16-dword accumulators, LDS read/write, `s_barrier` and
+explicit `lgkmcnt` waits — every one of those verified on hardware.
+
+Instruction forms confirmed to assemble on gfx950 (operand shapes measured, not
+yet wired into the DSL): `v_mfma_f32_16x16x128_f8f6f4` and
+`v_mfma_f32_32x32x64_f8f6f4` (A/B eight dwords), the 16-byte
+`v_mfma_scale_f32_32x32x64_f8f6f4` with its two extra scale operands,
+`v_max3_f32`, `v_cvt_pknorm_u16_f32`, `v_cvt_scalef32_pk_fp8_bf16`,
+`ds_read_b64`, `ds_read_b64_tr_b8`, `ds_read_b128`, `s_waitcnt lgkmcnt(4/2/0)`.
+`v_smfmac_f32_16x16x128_fp8_fp8` still needs its exact operand triple pinned
+down before it can be used.
 
 Still needed, in order:
 
-1. Wider fragments (`32x32x8` → 16-dword accumulator, `32x32x64`) and the
-   scaled fp8/fp4 MFMA forms, including the 16-byte scaled encoding.
+1. The scaled fp8/fp4 MFMA forms (`v_mfma_scale_f32_32x32x64_f8f6f4`) and the
+   wide `f8f6f4` shapes, including the 16-byte scaled encoding.
 2. Vector LDS widths (`ds_read_b64`/`b128`, `ds_read_b64_tr_b8`) and
    automatic `lgkmcnt` accounting for partial readiness.
-3. Multi-wave blocks: role split by wave id and the paired-phase barriers.
-4. Then the loop structure: A/B loop pairing, rollback exits, and the
+3. Softmax helpers as first-class ops: `v_max3_f32`, `v_cvt_pknorm_u16_f32`,
+   `v_cvt_scalef32_pk_fp8_bf16` (with the low/high write-mask semantics).
+4. Multi-wave blocks: role split by wave id and the paired-phase barriers.
+5. Then the loop structure: A/B loop pairing, rollback exits, and the
    witness-based comparison against the reference instruction stream.
 
 ## Not started
 
-* MFMA/PV tiling beyond the MFMA micro-kernel, LDS staging.
+* MFMA/PV tiling beyond the micro-kernels, LDS staging.
 * MORI-based cross-card fusion (LSA, SDMA, GDA).
 * gfx1250 Expert2 dependency scheduling.
 * JIT adapters for DeepInfer / SGLang.
