@@ -1627,3 +1627,254 @@ pub fn probe_fp8_fmha_tile() -> Function {
     }
     b.finish()
 }
+
+/// Two-tile MXFP8 attention: a loop over two key tiles, a 64-wide row softmax and
+/// one PV over all 64 keys.
+///
+/// Input image in `o`:
+/// * `0`: Q (32x64 fp8); `2048` / `4096`: K^T for tiles 0 and 1;
+/// * `6144`: combined V^T (`VT[j*64 + t*32 + key] = V_t[key][j]`);
+/// * `8192` / `8448`: Q scales per tile; `8704` / `8960`: K scales per tile;
+/// * `9216` / `10240`: quantised P bytes per tile; `11264`: output O (32x32 f32).
+pub fn probe_fp8_fmha_2tile() -> Function {
+    let mut b = FnBuilder::new("probe_fp8_fmha_2tile", 64);
+    b.lds(8448);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c2 = b.c_i32(2);
+    let c4 = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c9 = b.c_i32(9);
+    let c16i = b.c_i32(16);
+    let c31 = b.c_i32(31);
+    let c32 = b.c_i32(32);
+    let c64 = b.c_i32(64);
+    let c123 = b.c_i32(123);
+    let c127 = b.c_i32(127);
+    let c128 = b.c_i32(128);
+    let c256 = b.c_i32(256);
+    let c1024 = b.c_i32(1024);
+    let c2048 = b.c_i32(2048);
+    let c4096 = b.c_i32(4096);
+    let c6144 = b.c_i32(6144);
+    let c8192 = b.c_i32(8192);
+    let c8704 = b.c_i32(8704);
+    let c9216 = b.c_i32(9216);
+    let c11264 = b.c_i32(11264);
+
+    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let pblk = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
+    let j4 = b.mul_i32(j, c4);
+    let p512 = b.shl_i32(pblk, c9);
+    let lds_dyn = b.add_i32(j4, p512);
+
+    // Q fragment, loaded once.
+    let row = b.mul_i32(j, c64);
+    let koff = b.shl_i32(pblk, c5);
+    let frag_off = b.add_i32(row, koff);
+    let q_base = b.ptr_add(o, frag_off);
+    let q0 = b.load_f32(q_base, 0);
+    let q0 = b.bitcast_i32(q0);
+    let q1 = b.load_f32(q_base, 4);
+    let q1 = b.bitcast_i32(q1);
+    let q2 = b.load_f32(q_base, 8);
+    let q2 = b.bitcast_i32(q2);
+    let q3 = b.load_f32(q_base, 12);
+    let q3 = b.bitcast_i32(q3);
+    let q4 = b.load_f32(q_base, 16);
+    let q4 = b.bitcast_i32(q4);
+    let q5 = b.load_f32(q_base, 20);
+    let q5 = b.bitcast_i32(q5);
+    let q6 = b.load_f32(q_base, 24);
+    let q6 = b.bitcast_i32(q6);
+    let q7 = b.load_f32(q_base, 28);
+    let q7 = b.bitcast_i32(q7);
+    let a8 = b.frag8(q0, q1, q2, q3, q4, q5, q6, q7);
+
+    let tid4 = b.mul_i32(tid, c4);
+    let zero = b.frag_zero(DType::Frag16);
+
+    // Loop over the two key tiles, accumulating the score tiles in LDS.
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0))]);
+    let tile = vars[0];
+    let tile_off = b.mul_i32(tile, c2048);
+    let kt_dyn0 = b.add_i32(frag_off, tile_off);
+    let kt_dyn = b.add_i32(kt_dyn0, c2048);
+    let kt_base = b.ptr_add(o, kt_dyn);
+    let k0 = b.load_f32(kt_base, 0);
+    let k0 = b.bitcast_i32(k0);
+    let k1 = b.load_f32(kt_base, 4);
+    let k1 = b.bitcast_i32(k1);
+    let k2 = b.load_f32(kt_base, 8);
+    let k2 = b.bitcast_i32(k2);
+    let k3 = b.load_f32(kt_base, 12);
+    let k3 = b.bitcast_i32(k3);
+    let k4 = b.load_f32(kt_base, 16);
+    let k4 = b.bitcast_i32(k4);
+    let k5 = b.load_f32(kt_base, 20);
+    let k5 = b.bitcast_i32(k5);
+    let k6 = b.load_f32(kt_base, 24);
+    let k6 = b.bitcast_i32(k6);
+    let k7 = b.load_f32(kt_base, 28);
+    let k7 = b.bitcast_i32(k7);
+    let k8 = b.frag8(k0, k1, k2, k3, k4, k5, k6, k7);
+
+    let sat0 = b.mul_i32(tile, c256);
+    let sat1 = b.add_i32(sat0, tid4);
+    let sa_off = b.add_i32(sat1, c8192);
+    let sa_ptr = b.ptr_add(o, sa_off);
+    let sa_f = b.load_f32(sa_ptr, 0);
+    let sa = b.bitcast_i32(sa_f);
+    let sbt0 = b.mul_i32(tile, c256);
+    let sbt1 = b.add_i32(sbt0, tid4);
+    let sb_off = b.add_i32(sbt1, c8704);
+    let sb_ptr = b.ptr_add(o, sb_off);
+    let sb_f = b.load_f32(sb_ptr, 0);
+    let sb = b.bitcast_i32(sb_f);
+
+    let s_frag = b.mfma_scale_fp8(a8, k8, zero, sa, sb);
+
+    let tls = b.mul_i32(tile, c4096);
+    let lds_base = b.add_i32(lds_dyn, tls);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+        let lane = b.frag16_lane(s_frag, r);
+        let coff = b.c_i32(i_const * 128);
+        let addr = b.add_i32(lds_base, coff);
+        b.store_lds_b32(Opnd::Val(addr), Opnd::Val(lane));
+    }
+
+    let tile_next = b.add_i32(tile, c1);
+    b.set_var(tile, tile_next);
+    let more = b.cmp_lt_i32(tile_next, c2);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    // 64-wide row softmax.
+    let rbase = b.mul_i32(j, c128);
+    let mut vals: Vec<ValueId> = Vec::with_capacity(64);
+    for tile_c in 0..2u32 {
+        for k in 0..32u32 {
+            let coff = b.c_i32((tile_c * 4096 + 4 * k) as i32);
+            let addr = b.add_i32(rbase, coff);
+            let raw = b.load_lds_b32(Opnd::Val(addr));
+            vals.push(b.bitcast_f32(raw));
+        }
+    }
+    b.wait_lds(0);
+
+    let mut vmax = vals[0];
+    for k in 1..64usize {
+        vmax = b.max_f32(vmax, vals[k]);
+    }
+    let mut exps: Vec<ValueId> = Vec::with_capacity(64);
+    for k in 0..64usize {
+        let shifted = b.sub_f32(vals[k], vmax);
+        exps.push(b.exp_f32(shifted));
+    }
+    let mut total = exps[0];
+    for k in 1..64usize {
+        total = b.add_f32(total, exps[k]);
+    }
+    let inv_l = b.rcp_f32(total);
+
+    // Publish 1/l for the row so every lane can normalise its own elements.
+    let inv_j = b.mul_i32(j, c4);
+    let inv_addr = b.add_i32(inv_j, c8192);
+    let inv_bits = b.bitcast_i32(inv_l);
+    b.store_lds_b32(Opnd::Val(inv_addr), Opnd::Val(inv_bits));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    // Quantise the lane group's 32 probabilities to fp8, scaled by 16 and 1/l.
+    let c16f = b.c_f32(16.0);
+    let scale16 = b.mul_f32(inv_l, c16f);
+    let mut words: Vec<ValueId> = Vec::with_capacity(8);
+    for m in 0..8usize {
+        // low half: probs of tile 0, high half: tile 1
+        let lo_a = b.mul_f32(exps[4 * m], scale16);
+        let lo_b = b.mul_f32(exps[4 * m + 1], scale16);
+        let pair_lo0 = b.cvt_pk_fp8_f32(lo_a, lo_b);
+        let lo_c = b.mul_f32(exps[4 * m + 2], scale16);
+        let lo_d = b.mul_f32(exps[4 * m + 3], scale16);
+        let pair_lo1 = b.cvt_pk_fp8_f32(lo_c, lo_d);
+        let hi_a = b.mul_f32(exps[32 + 4 * m], scale16);
+        let hi_b = b.mul_f32(exps[32 + 4 * m + 1], scale16);
+        let pair_hi0 = b.cvt_pk_fp8_f32(hi_a, hi_b);
+        let hi_c = b.mul_f32(exps[32 + 4 * m + 2], scale16);
+        let hi_d = b.mul_f32(exps[32 + 4 * m + 3], scale16);
+        let pair_hi1 = b.cvt_pk_fp8_f32(hi_c, hi_d);
+        let s_lo = b.shl_i32(pair_lo1, c16i);
+        let w_lo = b.add_i32(pair_lo0, s_lo);
+        let s_hi = b.shl_i32(pair_hi1, c16i);
+        let w_hi = b.add_i32(pair_hi0, s_hi);
+        let diff = b.xor_i32(w_lo, w_hi);
+        let pick = b.mul_i32(diff, pblk);
+        words.push(b.xor_i32(w_lo, pick));
+    }
+
+    // Store the quantised bytes for the host reference.
+    let pb_off = b.mul_i32(pblk, c1024);
+    let j32 = b.mul_i32(j, c32);
+    let pb_off2 = b.add_i32(pb_off, j32);
+    let pb_off3 = b.add_i32(pb_off2, c9216);
+    let p_ptr = b.ptr_add(o, pb_off3);
+    for m in 0..8usize {
+        let v = b.bitcast_f32(words[m]);
+        b.store_f32(p_ptr, 4 * m as u32, v);
+    }
+
+    // PV over all 64 keys.
+    let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    let vt_dyn = b.add_i32(frag_off, c6144);
+    let vt_base = b.ptr_add(o, vt_dyn);
+    let v0 = b.load_f32(vt_base, 0);
+    let v0 = b.bitcast_i32(v0);
+    let v1 = b.load_f32(vt_base, 4);
+    let v1 = b.bitcast_i32(v1);
+    let v2 = b.load_f32(vt_base, 8);
+    let v2 = b.bitcast_i32(v2);
+    let v3 = b.load_f32(vt_base, 12);
+    let v3 = b.bitcast_i32(v3);
+    let v4 = b.load_f32(vt_base, 16);
+    let v4 = b.bitcast_i32(v4);
+    let v5 = b.load_f32(vt_base, 20);
+    let v5 = b.bitcast_i32(v5);
+    let v6 = b.load_f32(vt_base, 24);
+    let v6 = b.bitcast_i32(v6);
+    let v7 = b.load_f32(vt_base, 28);
+    let v7 = b.bitcast_i32(v7);
+    let v8 = b.frag8(v0, v1, v2, v3, v4, v5, v6, v7);
+
+    let zero2 = b.frag_zero(DType::Frag16);
+    let o_frag = b.mfma_scale_fp8(p8, v8, zero2, c127, c123);
+
+    // The probabilities already carry 1/l, so only the 1/16 quantisation factor
+    // remains; it is folded into the B scale above.
+    let o_lds_dyn = b.mul_i32(pblk, c16i);
+    let o_out_dyn = b.add_i32(j4, p512);
+    let o_out_off = b.add_i32(o_out_dyn, c11264);
+    let o_ptr = b.ptr_add(o, o_out_off);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+        let lane = b.frag16_lane(o_frag, r);
+        let laddrc = b.c_i32(8192 + i_const * 4);
+        let laddr = b.add_i32(o_lds_dyn, laddrc);
+        let invraw = b.load_lds_b32(Opnd::Val(laddr));
+        let invf = b.bitcast_f32(invraw);
+        let lanev = b.bitcast_f32(lane);
+        let val = b.mul_f32(lanev, invf);
+        b.store_f32(o_ptr, i_const * 128, val);
+    }
+    b.finish()
+}
