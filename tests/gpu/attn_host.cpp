@@ -143,13 +143,14 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fp8_matmul") == 0 ||
                              std::strcmp(kern, "probe_fp8_load") == 0 ||
                              std::strcmp(kern, "probe_fp8_min") == 0 ||
-                             std::strcmp(kern, "probe_fp8_minload") == 0;
+                             std::strcmp(kern, "probe_fp8_minload") == 0 ||
+                             std::strcmp(kern, "probe_fp8_softmax") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
     // Real-data block-scaled fp8 matmul probe: fill the input region of `dout`
     // with A (32x64 fp8), B^T (32x64 fp8), and the per-lane scale bytes.
-    if (std::strcmp(kern, "probe_fp8_matmul") == 0 || std::strcmp(kern, "probe_fp8_load") == 0 || std::strcmp(kern, "probe_fp8_minload") == 0) {
+    if (std::strcmp(kern, "probe_fp8_matmul") == 0 || std::strcmp(kern, "probe_fp8_load") == 0 || std::strcmp(kern, "probe_fp8_minload") == 0 || std::strcmp(kern, "probe_fp8_softmax") == 0) {
         const int fp8_test = envi("FP8_TEST", 1);
         std::vector<unsigned char> in(8960, 0);
         unsigned int seed = 12345u;
@@ -454,6 +455,45 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
+    if (std::strcmp(kern, "probe_fp8_softmax") == 0) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        const int fp8_test = envi("FP8_TEST", 3);
+        double s_mat[32][32];
+        for (int i = 0; i < 32; ++i) {
+            for (int jj = 0; jj < 32; ++jj) {
+                double acc = 0.0;
+                for (int k = 0; k < 64; ++k) {
+                    const int g = ((k % 32) / 16) % 2;
+                    const double sa_v = std::ldexp(1.0, (int)raw[4096 + (i + 32 * g) * 4] - 127);
+                    const double sb_v = std::ldexp(1.0, (int)raw[4352 + (jj + 32 * g) * 4] - 127);
+                    acc += fp8_e4m3(raw[i * 64 + k]) * fp8_e4m3(raw[2048 + jj * 64 + k]) * sa_v * sb_v;
+                }
+                s_mat[i][jj] = acc;
+            }
+        }
+        const float* outv = reinterpret_cast<const float*>(raw + 4608);
+        int bad = 0;
+        double worst = 0.0;
+        for (int i = 0; i < 32; ++i) {
+            double mx = -1e30;
+            for (int jj = 0; jj < 32; ++jj) mx = std::max(mx, s_mat[i][jj]);
+            double sum = 0.0;
+            for (int jj = 0; jj < 32; ++jj) sum += std::exp(s_mat[i][jj] - mx);
+            for (int jj = 0; jj < 32; ++jj) {
+                const double want = std::exp(s_mat[i][jj] - mx) / sum;
+                const double gotv = outv[i * 32 + jj];
+                const double err = std::fabs(gotv - want);
+                worst = std::max(worst, err);
+                if (err > 2e-4 + 2e-3 * want) {
+                    if (bad < 6) std::fprintf(stderr, "softmax S[%d][%d] want %.6f got %.6f\n", i, jj, want, gotv);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("  fp8_softmax test=%d bad=%d worst_err=%.3e row0_0=%.6f\n", fp8_test, bad, worst, outv[0]);
+        std::printf(bad ? "PROBE_FP8_SOFTMAX_FAIL\n" : "PROBE_FP8_SOFTMAX_OK\n");
+        return bad != 0;
+    }
     if (std::strcmp(kern, "probe_fp8_matmul") == 0 && envi("FP8_TEST", 1) == 6) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         const float* dvals = reinterpret_cast<const float*>(raw + 4608);

@@ -1295,3 +1295,137 @@ pub fn probe_fp8_minload() -> Function {
     }
     b.finish()
 }
+/// Real-data MXFP8 QK^T followed by a row-wise softmax.
+///
+/// The kernel runs the verified block-scaled fp8 MFMA, writes the 32x32 score
+/// tile into LDS through the D fragment layout, then every lane reloads one full
+/// row (lane `l` handles row `l & 31`), computes `exp(x - max) / sum(exp)` with
+/// plain VALU ops and stores the normalised row to global memory.
+///
+/// `o[0..2048]`  : Q (32x64 fp8), `o[2048..4096]`: K^T (32x64 fp8),
+/// `o[4096..4352]` / `o[4352..4608]`: per-lane E8M0 scales,
+/// `o[4608..8704]` : softmax output, row major 32x32 f32.
+pub fn probe_fp8_softmax() -> Function {
+    let mut b = FnBuilder::new("probe_fp8_softmax", 64);
+    b.lds(4096);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let c4 = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c31 = b.c_i32(31);
+    let c64 = b.c_i32(64);
+    let c128 = b.c_i32(128);
+    let c2048 = b.c_i32(2048);
+    let c4096 = b.c_i32(4096);
+    let c4352 = b.c_i32(4352);
+    let c4608 = b.c_i32(4608);
+
+    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let pblk = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
+
+    let row = b.mul_i32(j, c64);
+    let koff = b.shl_i32(pblk, c5);
+    let frag_off = b.add_i32(row, koff);
+    let a_base = b.ptr_add(o, frag_off);
+    let bt_off = b.add_i32(frag_off, c2048);
+    let bt_base = b.ptr_add(o, bt_off);
+
+    let a0 = b.load_f32(a_base, 0);
+    let a0 = b.bitcast_i32(a0);
+    let a1 = b.load_f32(a_base, 4);
+    let a1 = b.bitcast_i32(a1);
+    let a2 = b.load_f32(a_base, 8);
+    let a2 = b.bitcast_i32(a2);
+    let a3 = b.load_f32(a_base, 12);
+    let a3 = b.bitcast_i32(a3);
+    let a4 = b.load_f32(a_base, 16);
+    let a4 = b.bitcast_i32(a4);
+    let a5 = b.load_f32(a_base, 20);
+    let a5 = b.bitcast_i32(a5);
+    let a6 = b.load_f32(a_base, 24);
+    let a6 = b.bitcast_i32(a6);
+    let a7 = b.load_f32(a_base, 28);
+    let a7 = b.bitcast_i32(a7);
+    let a8 = b.frag8(a0, a1, a2, a3, a4, a5, a6, a7);
+
+    let b0 = b.load_f32(bt_base, 0);
+    let b0 = b.bitcast_i32(b0);
+    let b1 = b.load_f32(bt_base, 4);
+    let b1 = b.bitcast_i32(b1);
+    let b2 = b.load_f32(bt_base, 8);
+    let b2 = b.bitcast_i32(b2);
+    let b3 = b.load_f32(bt_base, 12);
+    let b3 = b.bitcast_i32(b3);
+    let b4 = b.load_f32(bt_base, 16);
+    let b4 = b.bitcast_i32(b4);
+    let b5 = b.load_f32(bt_base, 20);
+    let b5 = b.bitcast_i32(b5);
+    let b6 = b.load_f32(bt_base, 24);
+    let b6 = b.bitcast_i32(b6);
+    let b7 = b.load_f32(bt_base, 28);
+    let b7 = b.bitcast_i32(b7);
+    let b8v = b.frag8(b0, b1, b2, b3, b4, b5, b6, b7);
+
+    let tid4 = b.mul_i32(tid, c4);
+    let sa_off = b.add_i32(tid4, c4096);
+    let sa_ptr = b.ptr_add(o, sa_off);
+    let sa_f = b.load_f32(sa_ptr, 0);
+    let sa = b.bitcast_i32(sa_f);
+    let sb_off = b.add_i32(tid4, c4352);
+    let sb_ptr = b.ptr_add(o, sb_off);
+    let sb_f = b.load_f32(sb_ptr, 0);
+    let sb = b.bitcast_i32(sb_f);
+
+    let zero = b.frag_zero(DType::Frag16);
+    let d = b.mfma_scale_fp8(a8, b8v, zero, sa, sb);
+
+    // Store the score tile into LDS with the D fragment layout.
+    let j4 = b.mul_i32(j, c4);
+    let p512 = b.shl_i32(pblk, b.c_i32(9));
+    let lds_base = b.add_i32(j4, p512);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+        let lane = b.frag16_lane(d, r);
+        let v = b.bitcast_f32(lane);
+        let addr = b.add_i32(lds_base, b.c_i32(i_const * 128));
+        b.store_lds_b32(Opnd::Val(addr), Opnd::Val(v));
+    }
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    // Row softmax: lane l handles row (tid & 31); lanes 32..63 duplicate it.
+    let rbase = b.mul_i32(j, c128);
+    let mut vals: Vec<ValueId> = Vec::with_capacity(32);
+    for k in 0..32u32 {
+        let addr = b.add_i32(rbase, b.c_i32(4 * k as i32));
+        let raw = b.load_lds_b32(Opnd::Val(addr));
+        vals.push(b.bitcast_f32(raw));
+    }
+    b.wait_lds(0);
+
+    let mut vmax = vals[0];
+    for k in 1..32usize {
+        vmax = b.max_f32(vmax, vals[k]);
+    }
+    let mut exps: Vec<ValueId> = Vec::with_capacity(32);
+    for k in 0..32usize {
+        let shifted = b.sub_f32(vals[k], vmax);
+        exps.push(b.exp_f32(shifted));
+    }
+    let mut total = exps[0];
+    for k in 1..32usize {
+        total = b.add_f32(total, exps[k]);
+    }
+    let inv = b.rcp_f32(total);
+
+    let out_base = b.add_i32(rbase, c4608);
+    let out_ptr = b.ptr_add(o, out_base);
+    for k in 0..32u32 {
+        let scaled = b.mul_f32(exps[k as usize], inv);
+        b.store_f32(out_ptr, 4 * k, scaled);
+    }
+    b.finish()
+}
