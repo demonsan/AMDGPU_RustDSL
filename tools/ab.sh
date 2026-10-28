@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A/B timing of build-time kernel variants on the benchmark shape.
-# Usage: AB_VARIANTS="FMHA_PITCH=128 FMHA_PITCH=144,FMHA_OPT=x" [AB_SHAPE="1 8 2048 2048"] bash tools/ab.sh
-# Each space-separated variant is a comma-separated list of VAR=value build-time environment settings.
+# Usage: AB_VARIANTS="FMHA_PITCH=128 FMHA_PITCH=144;FMHA_OPT=a,b" [AB_SHAPE="1 8 2048 2048"] bash tools/ab.sh
+# Each space-separated variant is a semicolon-separated list of VAR=value build-time environment settings.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
@@ -13,7 +13,7 @@ set -- ${AB_SHAPE:-1 8 2048 2048}
 i=0
 for V in ${AB_VARIANTS:-FMHA_PITCH=128}; do
     i=$((i+1))
-    ( export $(echo "$V" | tr ',' ' ')
+    ( export $(echo "$V" | tr ';' ' ')
       bash tools/container/cargo.sh run -q --bin amdc -- emit "$K" --out "/work/build/ab$i.s" 2>&1 | grep -E "^error|out of VGPR" -A5
       "$ROC/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/ab$i.co build/ab$i.s )
     echo "### variant $i: $V  ($(grep -m1 -E 'vgpr_count' build/ab$i.s))"
