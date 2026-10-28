@@ -79,6 +79,57 @@ fn backend_cmd(args: &[String]) -> ExitCode {
     }
 }
 
+/// `amdc mir-roundtrip <in.mir> <out.mir>`: parse all `body: |` sections and print them back.
+fn mir_roundtrip_cmd(args: &[String]) -> ExitCode {
+    let (Some(i), Some(o)) = (args.get(1), args.get(2)) else {
+        usage();
+        return ExitCode::from(2);
+    };
+    let text = match fs::read_to_string(i) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{i}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let (out, st) = amdgpu_compiler::backend::mir_roundtrip::roundtrip_text(&text);
+    if let Err(e) = fs::write(o, out) {
+        eprintln!("{o}: {e}");
+        return ExitCode::from(1);
+    }
+    println!(
+        "STATS files=1 bodies={} insts={} parsed={} opaque={} bundles={} changed={}",
+        st.bodies, st.insts, st.parsed, st.opaque, st.bundles, st.changed_lines
+    );
+    ExitCode::SUCCESS
+}
+
+/// `amdc mir-table-report <files...>`: how well does our opcode table match LLVM's own MIR?
+fn mir_table_report_cmd(args: &[String]) -> ExitCode {
+    let mut files = Vec::new();
+    for f in &args[1..] {
+        match fs::read_to_string(f) {
+            Ok(t) => files.push((f.clone(), t)),
+            Err(e) => eprintln!("{f}: {e}"),
+        }
+    }
+    let t = amdgpu_compiler::backend::llvm20::Table::load();
+    let r = amdgpu_compiler::backend::mir_roundtrip::table_report(&files, &t);
+    println!("instructions={} matched={} shape_mismatch={} unknown_opcode={}", r.total, r.matched, r.shape_mismatch, r.unknown_opcode);
+    println!("matched opcodes: {}", r.matched_by_opcode.len());
+    println!("-- table opcodes with an instruction that did not match the row (opcode: example)");
+    for (o, ex) in &r.mismatch_examples {
+        println!("  {o}: {ex}");
+    }
+    let mut unk: Vec<_> = r.unknown_by_opcode.iter().collect();
+    unk.sort_by(|a, b| b.1.cmp(a.1));
+    println!("-- top unknown opcodes (not in the table)");
+    for (o, n) in unk.iter().take(40) {
+        println!("  {n:>6} {o}");
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
@@ -93,6 +144,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "backend" => backend_cmd(&args),
+        "mir-roundtrip" => mir_roundtrip_cmd(&args),
+        "mir-table-report" => mir_table_report_cmd(&args),
         "simmodel" => {
             // amdc simmodel <kernel> [--sched] : model cycles/iteration of every loop for 1,2 waves per SIMD
             let Some(name) = args.get(1) else {

@@ -12,6 +12,7 @@ use crate::regalloc::Alloc;
 
 pub mod llvm20;
 pub mod llvm_mir;
+pub mod mir_roundtrip;
 pub mod probe;
 
 pub trait TailBackend {
