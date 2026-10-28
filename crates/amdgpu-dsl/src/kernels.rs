@@ -910,6 +910,7 @@ pub fn probe_fmha_core() -> Function {
     b.barrier();
     b.wait_lds(0);
     // Compute.
+    b.wait_lds(0);
     let a_lo = b.load_lds_b128(Opnd::Val(off));
     let b_lo = b.load_lds_b128(Opnd::Val(boff));
     let a8 = b.cat_frag8(a_lo, a_lo);
