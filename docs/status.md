@@ -700,3 +700,13 @@ Reading: removing 160 VALU instructions (~25%) gave only ~3-5%, so the kernel is
 - V fragments via ds_read_b64_tr_b8 with `s_waitcnt lgkmcnt(4)` pipelining between MFMAs; K via ds_read_b128; LDS ring offsets wrap with s_cselect (multi-buffer ring, LDS 84 KB).
 - Global loads via buffer_load_dwordx4 (8 per 2 steps).
 Next candidates: unscaled PV MFMA + MFMA row sum, lazy rescale with threshold, permlane32_swap, setprio ping-pong, LDS ring double buffering.
+
+### Negative / neutral experiments (all measured on top of cvt4+pksub = 213 TFLOP/s, run-to-run noise ~0.5)
+| Experiment (FMHA_OPT flag) | Result |
+|---|---|
+| permlane: lane^32 max exchange with `v_permlane32_swap_b32` (2 movs + swap + max, new op PartnerMaxF32) instead of LDS store/wait/load/wait | correct, 212.3-213.4: no gain |
+| dbuf: double-buffered K/V tiles in LDS (66 KB + exchange), one barrier per iteration | correct, 212.4-213.0: no gain |
+| kdconst (ablation, wrong scales but data scales are all 127): K scale loads replaced by a constant | 212.5-213.0: the per-tile K-scale global loads are not on the critical path |
+| prioA / prioB: `s_setprio 1` for role A or B waves for the whole loop (new Stmt::SetPrio) | 212.7-213.7: no gain |
+
+Interpretation: five independent changes (barriers, exchange, scale loads, priorities, 25% fewer VALU) each move the time by at most 3%, while the 11 us launch/timing floor is included in every measurement (S=77,SK=1 takes 11.4 us; S=SK=256 20 us). Per iteration (128 keys, 8 waves) the kernel needs ~4.5 us (~11k cycles at 2.4 GHz) against ~1.5 us for the vendor kernel, although both execute the same 16 MFMAs per wave and iteration. The vendor loop (see above) differs structurally: unscaled PV MFMAs, MFMA row sums (smfmac), pknorm-based P conversion, lazy-rescale branch, 2x unrolled ping-pong with setprio/barrier phases. Untested hypotheses for the remaining gap: (1) the in-order MFMA->VALU dependency chain inside one wave (QK -> max -> exp -> PV never overlaps within a wave; the vendor issues the next tile's QK MFMAs before the current softmax), which needs software pipelining across iterations with 2 x 16 S registers; (2) the hazard pass pads MFMA/trans latencies with s_nop (grep s_nop in the emitted .s). Next step: count s_nop cycles in the loop and prototype the cross-iteration QK software pipeline.
