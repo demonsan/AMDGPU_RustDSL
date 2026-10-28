@@ -125,6 +125,7 @@ pub fn attention_impl(debug: bool) -> Function {
     let corr = b.exp_f32(m_delta);
     let p_delta = b.sub_f32(scaled, m_new);
     let p = b.exp_f32(p_delta);
+    let l_new = b.fma_f32(l_var, corr, p);
 
     // out = out * corr + p * v
     let mut next_acc = Vec::with_capacity(HEAD_DIM);
@@ -141,8 +142,6 @@ pub fn attention_impl(debug: bool) -> Function {
         }
         d += 4;
     }
-
-    let l_new = b.fma_f32(l_var, corr, p);
 
     if debug {
         // Last-iteration values of the softmax intermediates, stored after the
