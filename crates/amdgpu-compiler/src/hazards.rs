@@ -387,9 +387,11 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 20 => 21,
                 _ => 12,
             }) {
+                // Only the accumulator (SrcC) is a WAR hazard: the LLVM tail inserts nothing for a VALU
+                // write to SrcA/SrcB/scale registers right after the MFMA (docs/scheduling.md).
                 let mut srcs = Vec::new();
-                for s in inst.srcs.iter() {
-                    if let Src::Reg(r) = s {
+                if inst.op != MOp::VMfmaScale32x32x64Fp8Z {
+                    if let Some(Src::Reg(r)) = inst.srcs.get(2) {
                         if m.vreg_class(*r).is_vector() {
                             srcs.push(rng(m, *r));
                         }
