@@ -621,3 +621,119 @@ pub fn probe_fmha_datapath() -> Function {
     }
     b.finish()
 }
+/// A/B paired-loop skeleton with paired barriers.
+///
+/// 8 waves per block: waves 0-3 are role A, waves 4-7 role B. The outer loop
+/// runs two iterations; inside it there are two sequential inner loops (an A
+/// phase and a B phase), each of which writes a phase-dependent value into LDS,
+/// synchronises, reads the partner lane's slot, accumulates it, and synchronises
+/// again. Nested loops, loop-carried accumulators, role-dependent values and
+/// paired barriers are all exercised, with a closed-form expected result.
+pub fn probe_ab_loops() -> Function {
+    let mut b = FnBuilder::new("probe_ab_loops", 512);
+    b.lds(2048);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let c1 = b.c_i32(1);
+    let c2 = b.c_i32(2);
+    let c4 = b.c_i32(4);
+    let c6 = b.c_i32(6);
+    let c10 = b.c_i32(10);
+    let c20 = b.c_i32(20);
+    let c1000 = b.c_i32(1000);
+    let c2000 = b.c_i32(2000);
+    let c256 = b.c_i32(256);
+    let c512 = b.c_i32(512);
+    let c1024 = b.c_i32(1024);
+
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let is_a = b.cmp_lt_i32(wave, c4);
+    let off = b.mul_i32(tid, c4);
+    let partner = b.let_(Op::XorI32(Opnd::Val(tid), Opnd::Val(c256)));
+    let partner_off = b.mul_i32(partner, c4);
+
+    // Outer loop carries the accumulator and the outer index.
+    let zero = b.c_i32(0);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(zero)), (DType::I32, Opnd::Val(zero))]);
+    let acc = vars[0];
+    let outer = vars[1];
+
+    // ---- A phase -----------------------------------------------------------
+    let ia_init = b.c_i32(0);
+    let inner = b.begin_loop(&[(DType::I32, Opnd::Val(ia_init))]);
+    let ia = inner[0];
+
+    let t10 = b.mul_i32(outer, c10);
+    let base_a = b.add_i32(t10, ia);
+    let base_a_tid = b.add_i32(base_a, tid);
+    b.begin_if(Opnd::Val(is_a));
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(base_a_tid));
+    b.else_();
+    let marked_a = b.add_i32(base_a_tid, c1000);
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(marked_a));
+    b.end_if();
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let got_a = b.load_lds_b32(Opnd::Val(partner_off));
+    let acc_a = b.add_i32(acc, got_a);
+    b.set_var(acc, acc_a);
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    let ia_next = b.add_i32(ia, c1);
+    b.set_var(ia, ia_next);
+    let more_a = b.cmp_lt_i32(ia_next, c2);
+    let stop_a = b.let_(Op::NotI1(Opnd::Val(more_a)));
+    b.break_if(Opnd::Val(stop_a));
+    b.end_loop();
+
+    // ---- B phase -----------------------------------------------------------
+    let ib_init = b.c_i32(0);
+    let inner_b = b.begin_loop(&[(DType::I32, Opnd::Val(ib_init))]);
+    let ib = inner_b[0];
+
+    let t20 = b.mul_i32(outer, c20);
+    let base_b = b.add_i32(t20, ib);
+    let base_b_tid = b.add_i32(base_b, tid);
+    b.begin_if(Opnd::Val(is_a));
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(base_b_tid));
+    b.else_();
+    let marked_b = b.add_i32(base_b_tid, c2000);
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(marked_b));
+    b.end_if();
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let got_b = b.load_lds_b32(Opnd::Val(partner_off));
+    let acc_b = b.add_i32(acc, got_b);
+    b.set_var(acc, acc_b);
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    let ib_next = b.add_i32(ib, c1);
+    b.set_var(ib, ib_next);
+    let more_b = b.cmp_lt_i32(ib_next, c2);
+    let stop_b = b.let_(Op::NotI1(Opnd::Val(more_b)));
+    b.break_if(Opnd::Val(stop_b));
+    b.end_loop();
+
+    let outer_next = b.add_i32(outer, c1);
+    b.set_var(outer, outer_next);
+    let more_outer = b.cmp_lt_i32(outer_next, c2);
+    let stop_outer = b.let_(Op::NotI1(Opnd::Val(more_outer)));
+    b.break_if(Opnd::Val(stop_outer));
+    b.end_loop();
+
+    // Store the final accumulator: o[tid*4] (raw bits).
+    let out_off = b.mul_i32(tid, c4);
+    let out_ptr = b.ptr_add(o, out_off);
+    let value = b.bitcast_f32(Opnd::Val(acc));
+    b.store_f32(out_ptr, 0, Opnd::Val(value));
+    let _ = (c512, c1024);
+    b.finish()
+}

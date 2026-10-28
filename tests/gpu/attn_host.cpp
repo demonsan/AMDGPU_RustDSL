@@ -121,7 +121,8 @@ int main(int argc, char** argv) {
                              std::strncmp(kern, "hw_bisect", 9) == 0 || std::strcmp(kern, "hw_store2") == 0 || std::strcmp(kern, "probe_lds_own") == 0 ||
                              std::strcmp(kern, "probe_lds_self2") == 0 ||
                              std::strcmp(kern, "probe_roles_loop") == 0 ||
-                             std::strcmp(kern, "probe_fmha_datapath") == 0;
+                             std::strcmp(kern, "probe_fmha_datapath") == 0 ||
+                             std::strcmp(kern, "probe_ab_loops") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -292,6 +293,28 @@ int main(int argc, char** argv) {
                     partner_bad, bits[0], bits[128]);
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
+    }
+    if (std::strcmp(kern, "probe_ab_loops") == 0) {
+        // Accumulator closed form: role A lanes read the B partner's writes
+        // (14112 + 8*tid); role B lanes read the A partner's writes
+        // (8*tid - 1984). Stored as raw integer bit patterns.
+        unsigned int bits[512] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
+        int ab_bad = 0;
+        for (int tid = 0; tid < 512; ++tid) {
+            long want = (tid < 256) ? (14112 + 8L * tid) : (8L * tid - 1984);
+            if (bits[tid] != (unsigned int)want) {
+                if (ab_bad < 6) {
+                    std::fprintf(stderr, "ab_loops mismatch tid=%d got=%u want=%ld\n", tid, bits[tid],
+                                 want);
+                }
+                ++ab_bad;
+            }
+        }
+        std::printf("  ab_loops bad=%d sample=%u %u %u %u\n", ab_bad, bits[0], bits[256], bits[511],
+                    bits[1]);
+        std::printf(ab_bad ? "PROBE_AB_LOOPS_FAIL\n" : "PROBE_AB_LOOPS_OK\n");
+        return ab_bad != 0;
     }
     if (std::strcmp(kern, "probe_roles_loop") == 0) {
         // Four iterations x 512 lanes. Lane tid of wave w reads the value the
