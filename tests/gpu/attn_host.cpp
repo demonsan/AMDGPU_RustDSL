@@ -124,7 +124,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fmha_datapath") == 0 ||
                              std::strcmp(kern, "probe_ab_loops") == 0 ||
                              std::strcmp(kern, "probe_nested_acc") == 0 ||
-                             std::strcmp(kern, "probe_loop_mfma") == 0;
+                             std::strcmp(kern, "probe_loop_mfma") == 0 ||
+                             std::strcmp(kern, "probe_fmha_core") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -295,6 +296,24 @@ int main(int argc, char** argv) {
                     partner_bad, bits[0], bits[128]);
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
+    }
+    if (std::strcmp(kern, "probe_fmha_core") == 0) {
+        // Two A/B phases per iteration x 2 iterations, K = 64 each: 128.0.
+        const unsigned int want = 0x43000000u;
+        unsigned int bits[1024] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
+        int fc_bad = 0;
+        for (int i = 0; i < 1024; ++i) {
+            if (bits[i] != want) {
+                if (fc_bad < 6) {
+                    std::fprintf(stderr, "fmha_core mismatch i=%d got=0x%08x\n", i, bits[i]);
+                }
+                ++fc_bad;
+            }
+        }
+        std::printf("  fmha_core bad=%d sample=0x%08x\n", fc_bad, bits[0]);
+        std::printf(fc_bad ? "PROBE_FMHA_CORE_FAIL\n" : "PROBE_FMHA_CORE_OK\n");
+        return fc_bad != 0;
     }
     if (std::strcmp(kern, "probe_loop_mfma") == 0) {
         // Two accumulated K=64 MFMAs over ones data: every element must be 128.0.

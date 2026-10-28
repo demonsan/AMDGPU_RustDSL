@@ -263,6 +263,8 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
             let _ = r;
         }
     }
+    check_mfma_operand_aliasing(m, &phys)?;
+
     let mut patched = Vec::with_capacity(n);
     for (r, p) in phys.into_iter().enumerate() {
         if p == u32::MAX {
@@ -315,4 +317,67 @@ fn find_slot(used: &[bool], c: RClass) -> Option<usize> {
         i += 1;
     }
     None
+}
+/// The MFMA instructions require the accumulator (D, C) and the multiplicands
+/// (A, B) to live in disjoint register ranges; D and C may either be the same
+/// range (in-place accumulation) or disjoint. Violating this silently produces
+/// wrong results, so it is checked after allocation.
+fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String> {
+    fn range(phys: &[u32], m: &MFunction, r: VReg) -> (u32, u32) {
+        let base = phys[r as usize];
+        (base, base + m.vreg_class(r).dwords() as u32)
+    }
+    fn overlaps(a: (u32, u32), b: (u32, u32)) -> bool {
+        a.0 < b.1 && b.0 < a.1
+    }
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            let is_mfma = matches!(
+                inst.op,
+                MOp::VMfma16x16x16F16
+                    | MOp::VMfma32x32x8F16
+                    | MOp::VMfma16x16x32Fp8
+                    | MOp::VMfma32x32x16Fp8
+                    | MOp::VMfmaScale32x32x64Fp8
+            );
+            if !is_mfma || inst.srcs.len() < 3 {
+                continue;
+            }
+            let d = inst
+                .dst
+                .ok_or_else(|| format!("block {bi} inst {ii}: MFMA without destination"))?;
+            let (a, b_src, c) = match (&inst.srcs[0], &inst.srcs[1], &inst.srcs[2]) {
+                (Src::Reg(a), Src::Reg(b), Src::Reg(c)) => (*a, *b, *c),
+                _ => return Err(format!("block {bi} inst {ii}: MFMA operands must be registers")),
+            };
+            let rd = range(phys, m, d);
+            let ra = range(phys, m, a);
+            let rb = range(phys, m, b_src);
+            let rc = range(phys, m, c);
+            let pairs = [
+                ("A/B", ra, rb),
+                ("A/C", ra, rc),
+                ("A/D", ra, rd),
+                ("B/C", rb, rc),
+                ("B/D", rb, rd),
+            ];
+            for (name, x, y) in pairs {
+                if overlaps(x, y) {
+                    return Err(format!(
+                        "block {bi} inst {ii}: MFMA operands {name} overlap (v{}..v{}, v{}..v{})",
+                        x.0,
+                        x.1 - 1,
+                        y.0,
+                        y.1 - 1
+                    ));
+                }
+            }
+            if overlaps(rc, rd) && rc != rd {
+                return Err(format!(
+                    "block {bi} inst {ii}: MFMA accumulator C and D partially overlap"
+                ));
+            }
+        }
+    }
+    Ok(())
 }

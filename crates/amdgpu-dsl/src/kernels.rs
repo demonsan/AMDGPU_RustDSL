@@ -870,3 +870,69 @@ pub fn probe_loop_mfma() -> Function {
     }
     b.finish()
 }
+/// FMHA core loop shape: A and B tiles are staged in separate phases with
+/// paired barriers, read back with `ds_read_b128`, concatenated into `Frag8`
+/// operands and accumulated into a `Frag16` register accumulator by the
+/// block-scaled fp8 MFMA. Two iterations of K = 64 with all-ones data must give
+/// 128.0 in every element.
+pub fn probe_fmha_core() -> Function {
+    let mut b = FnBuilder::new("probe_fmha_core", 512);
+    b.lds(16384);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let ones = b.c_i32(0x38383838_u32 as i32);
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c2 = b.c_i32(2);
+    let c8 = b.c_i32(8);
+    let c16 = b.c_i32(16);
+    let c8k = b.c_i32(8192);
+    let frag = b.frag4(ones, ones, ones, ones);
+    let zero = b.frag_zero(DType::Frag16);
+
+    let off = b.mul_i32(tid, c16);
+    let boff = b.add_i32(c8k, off);
+
+    let vars = b.begin_loop(&[(DType::Frag16, Opnd::Val(zero)), (DType::I32, Opnd::Val(c0))]);
+    let acc = vars[0];
+    let it = vars[1];
+
+    // A phase.
+    b.store_lds_b128(Opnd::Val(off), Opnd::Val(frag));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    // B phase.
+    b.store_lds_b128(Opnd::Val(boff), Opnd::Val(frag));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    // Compute.
+    let a_lo = b.load_lds_b128(Opnd::Val(off));
+    let b_lo = b.load_lds_b128(Opnd::Val(boff));
+    let a8 = b.cat_frag8(a_lo, a_lo);
+    let b8 = b.cat_frag8(b_lo, b_lo);
+    let d = b.mfma_scale_fp8(a8, b8, acc, 127, 127);
+    b.set_var(acc, d);
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    let it_next = b.add_i32(it, c1);
+    b.set_var(it, it_next);
+    let more = b.cmp_lt_i32(it_next, c2);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+
+    let row_off = b.mul_i32(tid, c8);
+    let row = b.ptr_add(o, row_off);
+    for i in 0..2u8 {
+        let bits = b.frag16_lane(acc, i);
+        let value = b.bitcast_f32(bits);
+        b.store_f32(row, 4 * i as u32, value);
+    }
+    b.finish()
+}
