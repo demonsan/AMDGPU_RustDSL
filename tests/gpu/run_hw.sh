@@ -5,12 +5,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 KERNEL="${KERNEL:-hw_roles}"
+SRC="${SRC:-tools/${KERNEL}.s}"
 cd "$REPO"
 mkdir -p build
 
 echo "== assemble $KERNEL =="
 "$ROC/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 \
-    -mcode-object-version=6 -o "build/${KERNEL}.co" "tools/${KERNEL}.s"
+    -mcode-object-version=6 -o "build/${KERNEL}.co" "$SRC"
 
 echo "== host =="
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/attn_host.cpp -o build/attn_host \
