@@ -422,6 +422,7 @@ impl Lowerer {
                         self.touch(&[Src::Reg(src)]);
                         self.copy_reg(r, src)?;
                     }
+                    self.flush_pending();
                     let header = self.fresh_label();
                     let exit = self.fresh_label();
                     self.set_term(Term::Goto(header));
@@ -430,6 +431,7 @@ impl Lowerer {
                 }
                 Stmt::BreakIf { cond } => {
                     let (exit, _) = *self.break_stack.last().ok_or("break outside loop")?;
+                    self.flush_pending();
                     let (on, srcs) = self.lower_condition(*cond, false)?;
                     self.touch(&srcs);
                     let fall = self.fresh_label();
@@ -438,12 +440,14 @@ impl Lowerer {
                 }
                 Stmt::EndLoop => {
                     let (exit, header) = self.break_stack.pop().ok_or("endloop without loop")?;
+                    self.flush_pending();
                     let latch = self.mir.blocks[self.cur].label;
                     self.mir.loops.push((header, latch));
                     self.set_term(Term::Goto(header));
                     self.start_block(exit);
                 }
                 Stmt::BeginIf { cond } => {
+                    self.flush_pending();
                     let (on, srcs) = self.lower_condition(*cond, false)?;
                     self.touch(&srcs);
                     let then_l = self.fresh_label();
@@ -454,6 +458,7 @@ impl Lowerer {
                     self.if_stack.push((else_l, end_l));
                 }
                 Stmt::Else => {
+                    self.flush_pending();
                     let (else_l, end_l) = *self.if_stack.last().ok_or("else without if")?;
                     self.set_term(Term::Goto(end_l));
                     self.start_block(else_l);
@@ -476,6 +481,7 @@ impl Lowerer {
                     self.push(MInst::new(MOp::SBarrier));
                 }
                 Stmt::EndIf => {
+                    self.flush_pending();
                     let (_, end_l) = self.if_stack.pop().ok_or("endif without if")?;
                     self.set_term(Term::Goto(end_l));
                     self.start_block(end_l);
