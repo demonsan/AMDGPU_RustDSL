@@ -502,13 +502,17 @@ pub fn probe_lds_own() -> Function {
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
-    // Read through a freshly computed address register (equal value) to see
-    // whether reading the exact register that fed the write matters.
-    let c0 = b.c_i32(0);
-    let raddr = b.add_i32(off, c0);
-    let raw = b.load_lds_b32(Opnd::Val(raddr));
+    let raw = b.load_lds_b32(Opnd::Val(off));
     let value = b.bitcast_f32(raw);
+    // Diagnostic split: o[tid] gets a constant (does the store path work?),
+    // o[64+tid] gets the value read back from this lane's own LDS slot.
     let out_ptr = b.ptr_add(o, off);
-    b.store_f32(out_ptr, 0, value);
+    let c42 = b.c_f32(42.0);
+    b.store_f32(out_ptr, 0, c42);
+    let c64 = b.c_i32(64);
+    let out2_index = b.add_i32(tid, c64);
+    let out2_off = b.mul_i32(out2_index, c4);
+    let out2_ptr = b.ptr_add(o, out2_off);
+    b.store_f32(out2_ptr, 0, value);
     b.finish()
 }
