@@ -46,6 +46,8 @@ struct Lowerer {
     cur: usize,
     next_label: u32,
     defs: HashMap<ValueId, Op>,
+    /// How many times each value is used as an operand anywhere in the function.
+    use_counts: HashMap<ValueId, usize>,
 }
 
 impl Lowerer {
@@ -72,9 +74,36 @@ impl Lowerer {
         mir.blocks.push(Block::new(0));
 
         let mut defs = HashMap::new();
+        let mut use_counts: HashMap<ValueId, usize> = HashMap::new();
+        let mut count = |o: &Opnd| {
+            if let Opnd::Val(v) = o {
+                *use_counts.entry(*v).or_insert(0) += 1;
+            }
+        };
         for st in &f.stmts {
-            if let Stmt::Let { dst, op } = st {
-                defs.insert(*dst, op.clone());
+            match st {
+                Stmt::Let { dst, op } => {
+                    defs.insert(*dst, op.clone());
+                    for o in op.operands() {
+                        count(&o);
+                    }
+                }
+                Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } => {
+                    count(base);
+                    count(value);
+                }
+                Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } => {
+                    count(addr);
+                    count(value);
+                }
+                Stmt::SetVar { value, .. } => count(value),
+                Stmt::BeginLoop { init, .. } => {
+                    for o in init {
+                        count(o);
+                    }
+                }
+                Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => count(cond),
+                _ => {}
             }
         }
 
@@ -93,6 +122,7 @@ impl Lowerer {
             cur: 0,
             next_label: 1,
             defs,
+            use_counts,
         }
     }
 
@@ -976,9 +1006,24 @@ impl Lowerer {
                     self.fresh_zero16()
                 } else {
                     let rc = self.as_v16(*c)?;
-                    let d = self.new_vreg(RClass::V16);
-                    self.copy_reg(d, rc)?;
-                    d
+                    // A single-use accumulator produced by an MFMA or a fragment build can be
+                    // updated in place: no copy and no second sixteen-dword live range.
+                    let reusable = matches!(
+                        c,
+                        Opnd::Val(cv)
+                            if self.use_counts.get(cv).copied() == Some(1)
+                                && matches!(
+                                    self.defs.get(cv),
+                                    Some(Op::MfmaScaleFp8_32x32x64 { .. }) | Some(Op::Frag16Build(_))
+                                )
+                    );
+                    if reusable {
+                        rc
+                    } else {
+                        let d = self.new_vreg(RClass::V16);
+                        self.copy_reg(d, rc)?;
+                        d
+                    }
                 };
                 self.push(
                     MInst::new(MOp::VMfmaScale32x32x64Fp8)
