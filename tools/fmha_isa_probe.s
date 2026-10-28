@@ -1,30 +1,34 @@
-// Second assembler probe for the FMHA instruction family: corrected names and
-// operand counts, plus the encodings we will compare against the reference.
+// Third assembler probe: pin down fp8 MFMA operand sizes and SMFMAC's shape.
+// Multiple candidate lines are intentional; clang reports the wrong ones.
 .text
 .globl fmha_isa_probe
 .p2align 8
 .type fmha_isa_probe,@function
 fmha_isa_probe:
-    // f16 MFMA, wider shape (D = 16 dwords).
+    // f16 wider shape (D = 16).
     v_mfma_f32_32x32x8_f16 v[16:31], v[32:33], v[34:35], v[36:51]
-    // gfx950 fp8/fp6/fp4 MFMA shapes.
+    // fp8 MFMA with per-lane byte counts derived from the matrix shapes:
+    // 16x16x32: A=16x32 fp8=512B -> 2 dwords, B=32x16 -> 2, D=4.
+    v_mfma_f32_16x16x32_fp8_fp8 v[4:7], v[8:9], v[10:11], v[12:15]
+    // 32x32x16: A=32x16 fp8=512B -> 2, B=16x32 -> 2, D=16.
+    v_mfma_f32_32x32x16_fp8_fp8 v[16:31], v[32:33], v[34:35], v[36:51]
+    // gfx950 wide fp8/fp6/fp4 shapes (K=64/128).
     v_mfma_f32_16x16x128_f8f6f4 v[4:7], v[8:15], v[16:23], v[24:27]
     v_mfma_f32_32x32x64_f8f6f4 v[16:31], v[32:39], v[40:47], v[48:63]
     v_mfma_scale_f32_32x32x64_f8f6f4 v[16:31], v[32:39], v[40:47], v[48:63], s0, s1
-    v_mfma_f32_16x16x32_fp8_fp8 v[4:7], v[8:11], v[12:15], v[16:19]
-    v_mfma_f32_32x32x16_fp8_fp8 v[16:31], v[32:39], v[40:47], v[48:63]
-    // Sparse MFMA (5 operands: D, A, B, C, index).
-    v_smfmac_f32_16x16x128_fp8_fp8 v[4:7], v[8:11], v[12:15], v[16:19], v20
-    // Softmax helpers.
+    // SMFMAC candidates: D=4, then combinations of A/B sizes and index.
+    v_smfmac_f32_16x16x128_fp8_fp8 v[4:7], v[8:11], v[12:19], v[20:23], v24
+    v_smfmac_f32_16x16x128_fp8_fp8 v[4:7], v[8:15], v[16:23], v[24:27], v28
+    v_smfmac_f32_16x16x128_fp8_fp8 v[4:7], v[8:11], v[12:15], v[16:23], v24
+    // Softmax / packing helpers.
     v_max3_f32 v1, v2, v3, v4
     v_cvt_pknorm_u16_f32 v5, v6, v7
     v_cvt_scalef32_pk_fp8_bf16 v8, v9, v10
-    // LDS variants used by the reference (transposed byte read included).
+    // LDS variants.
     ds_read_b64 v[4:5], v6
     ds_read_b64_tr_b8 v[8:9], v10
     ds_read_b128 v[12:15], v16
     s_waitcnt lgkmcnt(4)
-    s_waitcnt lgkmcnt(2)
     s_barrier
     s_endpgm
 .size fmha_isa_probe, .-fmha_isa_probe
