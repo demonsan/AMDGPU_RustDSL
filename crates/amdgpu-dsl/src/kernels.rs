@@ -1042,23 +1042,39 @@ pub fn probe_fp8_matmul() -> Function {
     let bt_base = b.ptr_add(o, bt_off);
 
     let a0 = b.load_f32(a_base, 0);
+    let a0 = b.bitcast_i32(a0);
     let a1 = b.load_f32(a_base, 4);
+    let a1 = b.bitcast_i32(a1);
     let a2 = b.load_f32(a_base, 8);
+    let a2 = b.bitcast_i32(a2);
     let a3 = b.load_f32(a_base, 12);
+    let a3 = b.bitcast_i32(a3);
     let a4 = b.load_f32(a_base, 16);
+    let a4 = b.bitcast_i32(a4);
     let a5 = b.load_f32(a_base, 20);
+    let a5 = b.bitcast_i32(a5);
     let a6 = b.load_f32(a_base, 24);
+    let a6 = b.bitcast_i32(a6);
     let a7 = b.load_f32(a_base, 28);
+    let a7 = b.bitcast_i32(a7);
     let a8 = b.frag8(a0, a1, a2, a3, a4, a5, a6, a7);
 
     let b0 = b.load_f32(bt_base, 0);
+    let b0 = b.bitcast_i32(b0);
     let b1 = b.load_f32(bt_base, 4);
+    let b1 = b.bitcast_i32(b1);
     let b2 = b.load_f32(bt_base, 8);
+    let b2 = b.bitcast_i32(b2);
     let b3 = b.load_f32(bt_base, 12);
+    let b3 = b.bitcast_i32(b3);
     let b4 = b.load_f32(bt_base, 16);
+    let b4 = b.bitcast_i32(b4);
     let b5 = b.load_f32(bt_base, 20);
+    let b5 = b.bitcast_i32(b5);
     let b6 = b.load_f32(bt_base, 24);
+    let b6 = b.bitcast_i32(b6);
     let b7 = b.load_f32(bt_base, 28);
+    let b7 = b.bitcast_i32(b7);
     let b8v = b.frag8(b0, b1, b2, b3, b4, b5, b6, b7);
 
     let tid4 = b.mul_i32(tid, c4);
