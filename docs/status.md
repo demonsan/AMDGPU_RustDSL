@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **512-thread tr + A/B role-split attention** | `probe_fp8_fmha_trab`: eight query tiles in one block of 512, V double-buffered in shared LDS and copied half by role A (waves 0-3) and half by role B (waves 4-7) with their own steady loops and identical barrier schedule, V consumed with `ds_read_b64_tr_b8`, 64 keys per iteration, register-resident O; all 8 waves match the host emulation (`1.8e-4`) -> `PROBE_FMHA_TRAB_OK` |
 | **64-key online softmax, V through `ds_read_b64_tr_b8`** | `probe_fp8_fmha_tr`: two score tiles and a 64-wide online softmax per iteration, quantised P as the full K=64 A fragment (lane group g keeps keys 32g..32g+31), row-major V staged in LDS and turned into the B fragment by four transposing reads, register-resident O accumulator; `worst_err = 3.4e-7` vs the host emulation, `3.8e-2` vs exact softmax -> `PROBE_FMHA_TR_OK` |
 | **ds_read_b64_tr_b8 B fragment** | `probe_fp8_matmul_tr`: row-major B staged in LDS, the 32x32x64 B fragment built with four `ds_read_b64_tr_b8` reads (no host-side transpose), random fp8 data and random scales, `worst_err = 0` vs the CPU reference -> `PROBE_MATMUL_TR_OK` |
 | **separate A/B steady loops (block 512)** | `probe_fp8_fmha_abloops`: waves 0-3 and 4-7 each run their own steady loop with its own backedge (A copies K, B copies V, both compute their own query tile) and the same four collective barriers per iteration plus one in the epilogue (12 static `s_barrier`, 4 branches, 208 VGPRs); all 8 waves match the host emulation -> `PROBE_FMHA_MULTIWAVE_OK` |
@@ -357,9 +358,12 @@ distinct instruction that lands on the same collective phase.
 64 keys per iteration, so V no longer needs a host-side transpose and the K=64 B fragment is
 fully populated (176 VGPRs).
 
+`probe_fp8_fmha_trab` (round 26) combines the tr-based 64-key loop with the A/B role-split
+loops in a 512-thread block (192 VGPRs, 70,656 B LDS vs the reference 246 VGPRs / 84,224 B).
+
 Remaining distance to the reference kernel: the `+0x80` KV progress updates, rollback exits,
-combining the tr-based loop with the A/B role-split loops in a 512-thread block, and the
-reference tile shapes (hd128, tile Q 256, tile KV 128).
+and the reference tile shapes (hd128 instead of our 64-wide head, KV tile 128 instead of 64
+keys per iteration, a K tile staged through LDS as well).
 
 ## Separate A/B loops and two lowering bugs (round 23)
 
