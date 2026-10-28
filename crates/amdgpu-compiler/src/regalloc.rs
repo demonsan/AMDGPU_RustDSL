@@ -354,13 +354,18 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
             let ra = range(phys, m, a);
             let rb = range(phys, m, b_src);
             let rc = range(phys, m, c);
-            let pairs = [
-                ("A/B", ra, rb),
-                ("A/C", ra, rc),
-                ("A/D", ra, rd),
-                ("B/C", rb, rc),
-                ("B/D", rb, rd),
-            ];
+            // The accumulator is in-place (C == D on gfx9), so only A and B have
+            // to stay clear of the destination.
+            if rc != rd {
+                return Err(format!(
+                    "block {bi} inst {ii}: MFMA accumulator C must be in place with D (v{}..v{} vs v{}..v{})",
+                    rc.0,
+                    rc.1 - 1,
+                    rd.0,
+                    rd.1 - 1
+                ));
+            }
+            let pairs = [("A/B", ra, rb), ("A/D", ra, rd), ("B/D", rb, rd)];
             for (name, x, y) in pairs {
                 if overlaps(x, y) {
                     return Err(format!(
@@ -372,11 +377,7 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
                     ));
                 }
             }
-            if overlaps(rc, rd) && rc != rd {
-                return Err(format!(
-                    "block {bi} inst {ii}: MFMA accumulator C and D partially overlap"
-                ));
-            }
+
         }
     }
     Ok(())

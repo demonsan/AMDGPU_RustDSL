@@ -695,12 +695,15 @@ impl Lowerer {
                 let rb = self.as_v2(*b)?;
                 let rc = self.as_v4(*c)?;
                 let d = self.new_vreg(RClass::V4);
+                // gfx9 MFMA accumulates in place: D and C are the same registers,
+                // so materialise the incoming accumulator into D first.
+                self.copy_reg(d, rc)?;
                 self.push(
                     MInst::new(MOp::VMfma16x16x16F16)
                         .def(d)
                         .srcreg(ra)
                         .srcreg(rb)
-                        .srcreg(rc),
+                        .srcreg(d),
                 );
                 self.val.insert(dst, d);
             }
@@ -730,12 +733,13 @@ impl Lowerer {
                 let rb = self.as_v2(*b)?;
                 let rc = self.as_v16(*c)?;
                 let d = self.new_vreg(RClass::V16);
+                self.copy_reg(d, rc)?;
                 self.push(
                     MInst::new(MOp::VMfma32x32x8F16)
                         .def(d)
                         .srcreg(ra)
                         .srcreg(rb)
-                        .srcreg(rc),
+                        .srcreg(d),
                 );
                 self.val.insert(dst, d);
             }
@@ -744,12 +748,13 @@ impl Lowerer {
                 let rb = self.as_v2(*b)?;
                 let rc = self.as_v4(*c)?;
                 let d = self.new_vreg(RClass::V4);
+                self.copy_reg(d, rc)?;
                 self.push(
                     MInst::new(MOp::VMfma16x16x32Fp8)
                         .def(d)
                         .srcreg(ra)
                         .srcreg(rb)
-                        .srcreg(rc),
+                        .srcreg(d),
                 );
                 self.val.insert(dst, d);
             }
@@ -758,12 +763,13 @@ impl Lowerer {
                 let rb = self.as_v2(*b)?;
                 let rc = self.as_v16(*c)?;
                 let d = self.new_vreg(RClass::V16);
+                self.copy_reg(d, rc)?;
                 self.push(
                     MInst::new(MOp::VMfma32x32x16Fp8)
                         .def(d)
                         .srcreg(ra)
                         .srcreg(rb)
-                        .srcreg(rc),
+                        .srcreg(d),
                 );
                 self.val.insert(dst, d);
             }
@@ -799,12 +805,13 @@ impl Lowerer {
                 let sa = self.as_v1(*scale_a)?;
                 let sb = self.as_v1(*scale_b)?;
                 let d = self.new_vreg(RClass::V16);
+                self.copy_reg(d, rc)?;
                 self.push(
                     MInst::new(MOp::VMfmaScale32x32x64Fp8)
                         .def(d)
                         .srcreg(ra)
                         .srcreg(rb)
-                        .srcreg(rc)
+                        .srcreg(d)
                         .srcreg(sa)
                         .srcreg(sb),
                 );
