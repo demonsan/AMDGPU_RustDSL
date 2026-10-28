@@ -26,6 +26,11 @@ pub fn compile_with(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend) -
     Ok(Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }
 
+/// The final (allocated, scheduled, hazard-padded) MIR of a kernel, for model reports.
+pub fn compile_mir(f: &amdgpu_dsl::Function) -> Result<mir::MFunction, String> {
+    lower_and_allocate(f).map(|(m, _)| m)
+}
+
 /// lower -> [schedule] -> hazards -> verify -> register allocation. With the scheduler enabled
 /// (`sched::Options::from_env`) a result that does not fit the register file is retried with a
 /// lower pressure limit and finally with the unscheduled code.

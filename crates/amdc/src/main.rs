@@ -93,6 +93,33 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "backend" => backend_cmd(&args),
+        "simmodel" => {
+            // amdc simmodel <kernel> [--sched] : model cycles/iteration of every loop for 1,2 waves per SIMD
+            let Some(name) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let Some(f) = amdgpu_compiler::kernel_by_name(name) else {
+                eprintln!("unknown kernel: {name}");
+                return ExitCode::from(2);
+            };
+            if args.iter().any(|a| a == "--sched") {
+                env::set_var("AMDC_SCHED", "1");
+            }
+            match amdgpu_compiler::compile_mir(&f) {
+                Ok(m) => {
+                    for r in amdgpu_compiler::sched::sim::report(&m, &[1, 2]) {
+                        println!("SIM {} loop@{} blocks={} insts={} {}", name, r.header_label, r.blocks, r.insts,
+                            r.cycles_per_iter.iter().map(|(w, c)| format!("waves{}={:.1}", w, c)).collect::<Vec<_>>().join(" "));
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("compile error:\n{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         "dump" => {
             let Some(name) = args.get(1) else {
                 usage();

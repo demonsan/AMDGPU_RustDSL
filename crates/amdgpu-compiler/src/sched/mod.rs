@@ -8,12 +8,14 @@
 //! 3. re-inserts waits from a whole-function scoreboard over the final order.
 //! Default OFF (`--sched` / `AMDC_SCHED=1`).
 
+pub mod cfg;
 pub mod depgraph;
 pub mod effects;
 pub mod list;
 pub mod liveness;
 pub mod model;
 pub mod order;
+pub mod sim;
 pub mod verify;
 pub mod waits;
 
@@ -29,6 +31,8 @@ pub struct Options {
     pub xbar_only: Option<usize>,
     /// Debug: full-drain waits only.
     pub drain_only: bool,
+    /// Remove empty latch blocks / elide fall-through branches (default on with the scheduler).
+    pub cfg_cleanup: bool,
     /// Debug bisect: schedule only this block index.
     pub only_block: Option<Vec<usize>>,
     /// Pressure limit in VGPR dwords (never below the original peak of the block).
@@ -40,7 +44,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, only_block: None, max_vgprs: 240, verify: true, stats: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false }
     }
 }
 
@@ -60,6 +64,7 @@ impl Options {
                     "noverify" => o.verify = false,
                     "stats" => o.stats = true,
                     "drain" => o.drain_only = true,
+                    "nocfg" => o.cfg_cleanup = false,
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
@@ -100,6 +105,9 @@ fn apply_perm(insts: &[MInst], perm: &[usize]) -> Vec<MInst> {
 /// Run the scheduling pass over the whole function.
 pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
     let mut stats = Stats::default();
+    if o.cfg_cleanup {
+        cfg::cleanup(m);
+    }
     waits::DRAIN_ONLY.store(o.drain_only, std::sync::atomic::Ordering::Relaxed);
     waits::strip_auto_waits(m);
     if o.reorder {

@@ -257,6 +257,8 @@ pub struct MFunction {
     /// after allocation it is the tuple's physical register plus the offset, so extracting or
     /// inserting a lane of a fragment needs no move.
     pub alias: HashMap<VReg, (VReg, u8)>,
+    /// Emit no s_branch to the immediately following block (set by the scheduler pipeline only).
+    pub elide_fallthrough: bool,
 }
 
 impl MFunction {

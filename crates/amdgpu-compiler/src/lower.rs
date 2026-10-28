@@ -75,6 +75,7 @@ impl Lowerer {
             vregs: Vec::new(),
             loops: Vec::new(),
             alias: HashMap::new(),
+            elide_fallthrough: false,
         };
         mir.blocks.push(Block::new(0));
 

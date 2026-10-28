@@ -14,6 +14,7 @@ fn func(vregs: &[RClass], insts: Vec<MInst>) -> MFunction {
         vregs: vregs.to_vec(),
         loops: vec![],
         alias: HashMap::new(),
+        elide_fallthrough: false,
     }
 }
 
