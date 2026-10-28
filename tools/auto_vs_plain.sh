@@ -15,10 +15,10 @@ micro)
   for K in sched_valu_mul sched_valu_max3 sched_valu_exp sched_mfma_chain sched_mfma_valu16 sched_mfma_valu4 sched_diamond; do
     for V in plain auto; do
       FL=""; [ $V = auto ] && FL="--sched=auto"
-      bash tools/container/cargo.sh run -q --bin amdc -- emit $K $FL --out /work/build/hw/$K.$V.s >/dev/null 2>&1
+      timeout 600 bash tools/container/cargo.sh run -q --bin amdc -- emit $K $FL --out /work/build/hw/$K.$V.s >/dev/null 2>&1
       asm build/hw/$K.$V.s build/hw/$K.$V.co || continue
-      H1=$(HIP_VISIBLE_DEVICES=$GPU ./build/sched_host build/hw/$K.$V.co $K 64 1 4000 10 | sed -n 's/.*cycles_per_iter=\([0-9.]*\).*/\1/p')
-      H2=$(HIP_VISIBLE_DEVICES=$GPU ./build/sched_host build/hw/$K.$V.co $K 512 1 4000 10 | sed -n 's/.*cycles_per_iter=\([0-9.]*\).*/\1/p')
+      H1=$(HIP_VISIBLE_DEVICES=$GPU timeout 60 ./build/sched_host build/hw/$K.$V.co $K 64 1 4000 10 | sed -n 's/.*cycles_per_iter=\([0-9.]*\).*/\1/p')
+      H2=$(HIP_VISIBLE_DEVICES=$GPU timeout 60 ./build/sched_host build/hw/$K.$V.co $K 512 1 4000 10 | sed -n 's/.*cycles_per_iter=\([0-9.]*\).*/\1/p')
       if [ $V = plain ]; then P1=$H1; P2=$H2; printf "%-18s %-6s | %9s %9s |\n" $K $V $H1 $H2
       else awk -v k=$K -v a=$H1 -v b=$H2 -v p1=$P1 -v p2=$P2 'BEGIN{printf "%-18s %-6s | %9s %9s | %+8.1f%% %+8.1f%%\n", k, "auto", a, b, (a/p1-1)*100, (b/p2-1)*100}'; fi
     done
