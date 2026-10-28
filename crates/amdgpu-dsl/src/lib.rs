@@ -354,6 +354,8 @@ pub enum Stmt {
     WaitLds { count: u8 },
     /// `s_barrier`: synchronise every wave in the workgroup.
     Barrier,
+    /// `s_setprio`: wave issue priority 0..3.
+    SetPrio { prio: u8 },
     SetVar { var: VarId, value: Opnd },
     /// Multiply all sixteen dwords of a `Frag16` loop variable by an f32 scalar, in place.
     VarScaleF32 { var: VarId, scalar: Opnd },
@@ -436,6 +438,9 @@ impl Function {
                 }
                 Stmt::Barrier => {
                     let _ = writeln!(s, "{pad}barrier");
+                }
+                Stmt::SetPrio { prio } => {
+                    let _ = writeln!(s, "{pad}setprio {prio}");
                 }
                 Stmt::SetVar { var, value } => {
                     let _ = writeln!(s, "{pad}var{} <- {value:?}", var.0);
@@ -928,6 +933,9 @@ impl FnBuilder {
     }
 
     /// `s_barrier`.
+    pub fn set_prio(&mut self, prio: u8) {
+        self.f.stmts.push(Stmt::SetPrio { prio });
+    }
     pub fn barrier(&mut self) {
         self.f.stmts.push(Stmt::Barrier);
     }
@@ -1361,7 +1369,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } => {}
             Stmt::SetVar { var, value } => {
                 // Any enclosing loop's variable may be updated; an inner loop can
                 // therefore update an outer loop's accumulator.

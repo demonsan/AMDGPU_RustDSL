@@ -6731,6 +6731,9 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.wait_lds(0);
     let _ = (no_pv, no_exp, no_stage, no_bar, no_s);
 
+    if (role_a && fmha_t_opt("prioA")) || (!role_a && fmha_t_opt("prioB")) {
+        b.set_prio(1);
+    }
     let vars = b.begin_loop(&[
         (DType::I32, Opnd::Val(c0)),
         (DType::I32, Opnd::Val(m_init)),

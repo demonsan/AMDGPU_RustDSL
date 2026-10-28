@@ -528,6 +528,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             vec![format!("v_readfirstlane_b32 {}, {}", sr(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]))]
         }
         MOp::SBarrier => vec!["s_barrier".to_string()],
+        MOp::SSetPrio => vec![format!("s_setprio {}", inst.imm)],
         MOp::SEndpgm => vec!["s_endpgm".to_string()],
     }
 }

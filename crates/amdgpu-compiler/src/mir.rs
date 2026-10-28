@@ -104,6 +104,8 @@ pub enum MOp {
     LdsReadB128,
     LdsReadB64TrB8,
     SBarrier,
+    /// `s_setprio` imm.
+    SSetPrio,
     // global memory
     GlobalLoadU16,
     GlobalLoadF32,

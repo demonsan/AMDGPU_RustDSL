@@ -722,6 +722,9 @@ impl Lowerer {
                 Stmt::Barrier => {
                     self.push(MInst::new(MOp::SBarrier));
                 }
+                Stmt::SetPrio { prio } => {
+                    self.push(MInst::new(MOp::SSetPrio).imm(*prio as i64));
+                }
                 Stmt::EndIf => {
                     self.flush_pending();
                     if let Some((c, v)) = self.scope_snaps.pop() {
