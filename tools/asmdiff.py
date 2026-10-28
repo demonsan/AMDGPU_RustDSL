@@ -85,3 +85,37 @@ if len(sys.argv) > 3 and sys.argv[3] == 'waits':
             nxt = lc[idx] if idx < len(lc) else '<end>'
             print(f'{idx:6d}: own={ow.get(idx)} llvm={lw.get(idx)}   [{prev}] -> [{nxt}]')
     print(f'{n} positions differ')
+def cls(l):
+    m = l.split()[0]
+    if m.startswith('v_mfma'): return 'MFMA'
+    if m.startswith(('v_exp', 'v_rcp', 'v_log', 'v_rsq', 'v_sqrt', 'v_sin', 'v_cos')): return 'VALU-trans'
+    if m.startswith('v_cmp') or m.startswith('v_cndmask'): return 'VALU-vcc'
+    if m.startswith('v_readfirstlane') or m.startswith('v_readlane'): return 'VALU-readlane'
+    if m.startswith('v_'): return 'VALU'
+    if m.startswith('ds_'): return 'DS'
+    if m.startswith(('global_', 'buffer_', 'flat_')): return 'VMEM'
+    if m.startswith(('s_load', 's_buffer')): return 'SMEM'
+    if m.startswith('s_cbranch'): return 'S-branch'
+    if m.startswith('s_barrier'): return 'S-barrier'
+    if m.startswith('s_'): return 'SALU'
+    return m
+
+def nop_amount(l):
+    m = re.match(r's_nop (\d+)', l)
+    return int(m.group(1)) + 1 if m else 0
+
+if len(sys.argv) > 3 and sys.argv[3] == 'classes':
+    # group consecutive filler at one core position; attribute the nops to (prev class -> next class)
+    for name, fl, core in (('own', of, oc), ('llvm', lf, lc)):
+        hist = collections.Counter(); cyc = collections.Counter(); ex = {}
+        for idx, l in fl:
+            n = nop_amount(l)
+            if not n: continue
+            prev = core[idx - 1] if idx > 0 else '<start>'
+            nxt = core[idx] if idx < len(core) else '<end>'
+            k = (cls(prev) if idx > 0 else 'start', cls(nxt) if idx < len(core) else 'end')
+            hist[k] += 1; cyc[k] += n; ex.setdefault(k, (prev, l, nxt))
+        print(f'--- {name}: s_nop cycles by (instruction before -> instruction after)')
+        for k, c in cyc.most_common(14):
+            p, nn, x = ex[k]
+            print(f'  {k[0]:>14} -> {k[1]:<14} x{hist[k]:<4} cycles={c:<5} e.g. [{p}] {nn} [{x}]')
