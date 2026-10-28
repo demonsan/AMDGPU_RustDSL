@@ -5594,6 +5594,14 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
         let corr_bits = b.bitcast_i32(corr);
         b.store_lds_b32(Opnd::Val(corr_row), Opnd::Val(corr_bits));
 
+        let pbh = b.c_i32((2048 * hh) as i32);
+        let pb0 = b.mul_i32(it, c4096);
+        let pb1 = b.add_i32(pb0, pbh);
+        let pb2 = b.mul_i32(j, c64);
+        let pb3 = b.add_i32(pb1, pb2);
+        let pb3b = b.add_i32(pb3, wpb);
+        let pb4 = b.add_i32(pb3b, c90624);
+        let p_ptr_pub = b.ptr_add(o, pb4);
         let mut chunk_words: Vec<Vec<ValueId>> = Vec::with_capacity(2);
         let mut rsum: Option<ValueId> = None;
         for sl in 0..2u32 {
@@ -5624,7 +5632,25 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
                 let sh = b.shl_i32(p1, c16i);
                 words.push(b.add_i32(p0, sh));
             }
-            chunk_words.push(words);
+            // publish this chunk's quantised bytes right away and keep only what PV needs
+            for m in 0..8usize {
+                let v = b.bitcast_f32(words[m]);
+                b.store_f32(p_ptr_pub, (32 * sl as usize + 4 * m) as u32, v);
+            }
+            if sl == 0 {
+                chunk_words.push(words);
+            } else {
+                let mut selw: Vec<ValueId> = Vec::with_capacity(8);
+                for m in 0..8usize {
+                    let lo = chunk_words[0][m];
+                    let hi = words[m];
+                    let diff = b.xor_i32(lo, hi);
+                    let pick = b.mul_i32(diff, pblk);
+                    selw.push(b.xor_i32(lo, pick));
+                }
+                chunk_words.clear();
+                chunk_words.push(selw);
+            }
         }
         let rsum = rsum.unwrap();
         let l_old = b.bitcast_f32(l_var);
@@ -5638,48 +5664,21 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
         b.barrier();
         b.wait_lds(0);
 
-        // publish the quantised bytes of substep (2 it + hh) for the host reference
-        let pbh = b.c_i32((2048 * hh) as i32);
-        let pb0 = b.mul_i32(it, c4096);
-        let pb1 = b.add_i32(pb0, pbh);
-        let pb2 = b.mul_i32(j, c64);
-        let pb3 = b.add_i32(pb1, pb2);
-        let pb3b = b.add_i32(pb3, wpb);
-        let pb4 = b.add_i32(pb3b, c90624);
-        let p_ptr = b.ptr_add(o, pb4);
-        for q in 0..2usize {
-            for m in 0..8usize {
-                let v = b.bitcast_f32(chunk_words[q][m]);
-                b.store_f32(p_ptr, (32 * q + 4 * m) as u32, v);
-            }
-        }
-        let _ = it4096;
-
         // ---- row corrections and the PV step ----
-        let mut corrs: Vec<ValueId> = Vec::with_capacity(16);
-        for r in 0..16u8 {
-            let i_const = ((r / 4) * 8 + (r % 4)) as i32;
-            let ccoff = b.c_i32(i_const * 4);
-            let caddr0 = b.add_i32(pblk16, lds_corr);
-            let caddr = b.add_i32(caddr0, ccoff);
-            let craw = b.load_lds_b32(Opnd::Val(caddr));
-            corrs.push(b.bitcast_f32(craw));
-        }
-        let mut sel: Vec<ValueId> = Vec::with_capacity(8);
-        for m in 0..8usize {
-            let lo = chunk_words[0][m];
-            let hi = chunk_words[1][m];
-            let diff = b.xor_i32(lo, hi);
-            let pick = b.mul_i32(diff, pblk);
-            sel.push(b.xor_i32(lo, pick));
-        }
+        let sel = chunk_words[0].clone();
         let p8 = b.frag8(sel[0], sel[1], sel[2], sel[3], sel[4], sel[5], sel[6], sel[7]);
         for e in 0..4usize {
             let mut scaled: Vec<ValueId> = Vec::with_capacity(16);
             for r in 0..16u8 {
                 let lane = b.frag16_lane(o_vars[e], r);
                 let lanev = b.bitcast_f32(lane);
-                let sc = b.mul_f32(lanev, corrs[r as usize]);
+                let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+                let ccoff = b.c_i32(i_const * 4);
+                let caddr0 = b.add_i32(pblk16, lds_corr);
+                let caddr = b.add_i32(caddr0, ccoff);
+                let craw = b.load_lds_b32(Opnd::Val(caddr));
+                let cf = b.bitcast_f32(craw);
+                let sc = b.mul_f32(lanev, cf);
                 scaled.push(b.bitcast_i32(sc));
             }
             let acc = b.frag16_build(&scaled);
@@ -5845,6 +5844,14 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
         let corr_bits = b.bitcast_i32(corr);
         b.store_lds_b32(Opnd::Val(corr_row), Opnd::Val(corr_bits));
 
+        let pbh = b.c_i32((2048 * hh) as i32);
+        let pb0 = b.mul_i32(it, c4096);
+        let pb1 = b.add_i32(pb0, pbh);
+        let pb2 = b.mul_i32(j, c64);
+        let pb3 = b.add_i32(pb1, pb2);
+        let pb3b = b.add_i32(pb3, wpb);
+        let pb4 = b.add_i32(pb3b, c90624);
+        let p_ptr_pub = b.ptr_add(o, pb4);
         let mut chunk_words: Vec<Vec<ValueId>> = Vec::with_capacity(2);
         let mut rsum: Option<ValueId> = None;
         for sl in 0..2u32 {
@@ -5875,7 +5882,25 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
                 let sh = b.shl_i32(p1, c16i);
                 words.push(b.add_i32(p0, sh));
             }
-            chunk_words.push(words);
+            // publish this chunk's quantised bytes right away and keep only what PV needs
+            for m in 0..8usize {
+                let v = b.bitcast_f32(words[m]);
+                b.store_f32(p_ptr_pub, (32 * sl as usize + 4 * m) as u32, v);
+            }
+            if sl == 0 {
+                chunk_words.push(words);
+            } else {
+                let mut selw: Vec<ValueId> = Vec::with_capacity(8);
+                for m in 0..8usize {
+                    let lo = chunk_words[0][m];
+                    let hi = words[m];
+                    let diff = b.xor_i32(lo, hi);
+                    let pick = b.mul_i32(diff, pblk);
+                    selw.push(b.xor_i32(lo, pick));
+                }
+                chunk_words.clear();
+                chunk_words.push(selw);
+            }
         }
         let rsum = rsum.unwrap();
         let l_old = b.bitcast_f32(l_var);
@@ -5889,48 +5914,21 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
         b.barrier();
         b.wait_lds(0);
 
-        // publish the quantised bytes of substep (2 it + hh) for the host reference
-        let pbh = b.c_i32((2048 * hh) as i32);
-        let pb0 = b.mul_i32(it, c4096);
-        let pb1 = b.add_i32(pb0, pbh);
-        let pb2 = b.mul_i32(j, c64);
-        let pb3 = b.add_i32(pb1, pb2);
-        let pb3b = b.add_i32(pb3, wpb);
-        let pb4 = b.add_i32(pb3b, c90624);
-        let p_ptr = b.ptr_add(o, pb4);
-        for q in 0..2usize {
-            for m in 0..8usize {
-                let v = b.bitcast_f32(chunk_words[q][m]);
-                b.store_f32(p_ptr, (32 * q + 4 * m) as u32, v);
-            }
-        }
-        let _ = it4096;
-
         // ---- row corrections and the PV step ----
-        let mut corrs: Vec<ValueId> = Vec::with_capacity(16);
-        for r in 0..16u8 {
-            let i_const = ((r / 4) * 8 + (r % 4)) as i32;
-            let ccoff = b.c_i32(i_const * 4);
-            let caddr0 = b.add_i32(pblk16, lds_corr);
-            let caddr = b.add_i32(caddr0, ccoff);
-            let craw = b.load_lds_b32(Opnd::Val(caddr));
-            corrs.push(b.bitcast_f32(craw));
-        }
-        let mut sel: Vec<ValueId> = Vec::with_capacity(8);
-        for m in 0..8usize {
-            let lo = chunk_words[0][m];
-            let hi = chunk_words[1][m];
-            let diff = b.xor_i32(lo, hi);
-            let pick = b.mul_i32(diff, pblk);
-            sel.push(b.xor_i32(lo, pick));
-        }
+        let sel = chunk_words[0].clone();
         let p8 = b.frag8(sel[0], sel[1], sel[2], sel[3], sel[4], sel[5], sel[6], sel[7]);
         for e in 0..4usize {
             let mut scaled: Vec<ValueId> = Vec::with_capacity(16);
             for r in 0..16u8 {
                 let lane = b.frag16_lane(o_vars[e], r);
                 let lanev = b.bitcast_f32(lane);
-                let sc = b.mul_f32(lanev, corrs[r as usize]);
+                let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+                let ccoff = b.c_i32(i_const * 4);
+                let caddr0 = b.add_i32(pblk16, lds_corr);
+                let caddr = b.add_i32(caddr0, ccoff);
+                let craw = b.load_lds_b32(Opnd::Val(caddr));
+                let cf = b.bitcast_f32(craw);
+                let sc = b.mul_f32(lanev, cf);
                 scaled.push(b.bitcast_i32(sc));
             }
             let acc = b.frag16_build(&scaled);
