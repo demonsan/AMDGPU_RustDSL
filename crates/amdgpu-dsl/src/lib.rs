@@ -152,6 +152,8 @@ pub enum Op {
 
     LoadU16 { base: Opnd, byte_off: u32 },
     LoadF32 { base: Opnd, byte_off: u32 },
+    /// Read one dword from workgroup LDS; `addr` is a byte offset.
+    LoadLdsB32 { addr: Opnd },
 
     /// Build a two-dword fragment from two 32-bit values.
     Frag2(Opnd, Opnd),
@@ -186,6 +188,7 @@ impl Op {
             Op::Frag2Lane { .. } | Op::Frag4Lane { .. } => DType::U32,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::BitcastF32(..) => DType::F32,
+            Op::LoadLdsB32 { .. } => DType::U32,
         }
     }
 
@@ -218,6 +221,7 @@ impl Op {
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
             Op::BitcastF32(a) => vec![*a],
+            Op::LoadLdsB32 { addr } => vec![*addr],
         }
     }
 }
@@ -228,6 +232,12 @@ pub enum Stmt {
     Let { dst: ValueId, op: Op },
     StoreU16 { base: Opnd, byte_off: u32, value: Opnd },
     StoreF32 { base: Opnd, byte_off: u32, value: Opnd },
+    /// Write one dword into workgroup LDS; `addr` is a byte offset.
+    StoreLdsB32 { addr: Opnd, value: Opnd },
+    /// `s_waitcnt lgkmcnt(count)`.
+    WaitLds { count: u8 },
+    /// `s_barrier`: synchronise every wave in the workgroup.
+    Barrier,
     SetVar { var: VarId, value: Opnd },
     BeginLoop { vars: Vec<VarId>, init: Vec<Opnd> },
     BreakIf { cond: Opnd },
@@ -251,6 +261,8 @@ pub struct Function {
     pub args: Vec<Arg>,
     pub kernarg_size: u32,
     pub workgroup_size: u32,
+    /// Bytes of workgroup LDS this kernel declares.
+    pub lds_bytes: u32,
     pub stmts: Vec<Stmt>,
     pub var_tys: Vec<DType>,
     pub value_tys: Vec<DType>,
@@ -288,6 +300,15 @@ impl Function {
                 }
                 Stmt::StoreF32 { base, byte_off, value } => {
                     let _ = writeln!(s, "{pad}store f32 [{base:?}+{byte_off}] <- {value:?}");
+                }
+                Stmt::StoreLdsB32 { addr, value } => {
+                    let _ = writeln!(s, "{pad}lds[{addr:?}] <- {value:?}");
+                }
+                Stmt::WaitLds { count } => {
+                    let _ = writeln!(s, "{pad}waitlds({count})");
+                }
+                Stmt::Barrier => {
+                    let _ = writeln!(s, "{pad}barrier");
                 }
                 Stmt::SetVar { var, value } => {
                     let _ = writeln!(s, "{pad}var{} <- {value:?}", var.0);
@@ -332,11 +353,17 @@ impl FnBuilder {
                 args: Vec::new(),
                 kernarg_size: 0,
                 workgroup_size,
+                lds_bytes: 0,
                 stmts: Vec::new(),
                 var_tys: Vec::new(),
                 value_tys: Vec::new(),
             },
         }
+    }
+
+    /// Declares how many bytes of workgroup LDS the kernel uses.
+    pub fn lds(&mut self, bytes: u32) {
+        self.f.lds_bytes = bytes;
     }
 
     pub fn arg(&mut self, name: &str, ty: DType, offset: u32, size: u32) {
@@ -509,6 +536,26 @@ impl FnBuilder {
 
     pub fn bitcast_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::BitcastF32(a.into()))
+    }
+
+    /// One dword read from workgroup LDS.
+    pub fn load_lds_b32(&mut self, addr: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::LoadLdsB32 { addr: addr.into() })
+    }
+
+    /// One dword write into workgroup LDS.
+    pub fn store_lds_b32(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::StoreLdsB32 { addr: addr.into(), value: value.into() });
+    }
+
+    /// `s_waitcnt lgkmcnt(count)`.
+    pub fn wait_lds(&mut self, count: u8) {
+        self.f.stmts.push(Stmt::WaitLds { count });
+    }
+
+    /// `s_barrier`.
+    pub fn barrier(&mut self) {
+        self.f.stmts.push(Stmt::Barrier);
     }
 }
 
@@ -743,6 +790,22 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
+            Stmt::StoreLdsB32 { addr, value } => {
+                if let Err(e) = expect_int(f, *addr, "lds store address") {
+                    errs.push(here(e));
+                }
+                if let Err(e) = expect_int(f, *value, "lds store value") {
+                    errs.push(here(e));
+                }
+                for o in [addr, value] {
+                    if let Opnd::Val(v) = o {
+                        if !visible(&scopes, *v) {
+                            errs.push(here(format!("operand v{v} is not visible here")));
+                        }
+                    }
+                }
+            }
+            Stmt::WaitLds { .. } | Stmt::Barrier => {}
             Stmt::SetVar { var, value } => {
                 let ok = loop_vars.last().map(|vs| vs.contains(var)).unwrap_or(false);
                 if !ok {

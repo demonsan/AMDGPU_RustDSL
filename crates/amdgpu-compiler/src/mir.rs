@@ -70,6 +70,10 @@ pub enum MOp {
     VWriteSub,
     VReadSub,
     VMfma16x16x16F16,
+    // workgroup LDS
+    LdsWriteB32,
+    LdsReadB32,
+    SBarrier,
     // global memory
     GlobalLoadU16,
     GlobalLoadF32,
@@ -200,6 +204,8 @@ pub struct MFunction {
     pub args: Vec<MArg>,
     pub kernarg_size: u32,
     pub workgroup_size: u32,
+    /// Workgroup LDS bytes declared by the kernel.
+    pub lds_bytes: u32,
     pub blocks: Vec<Block>,
     pub vregs: Vec<RClass>,
     /// (header label, latch label) pairs, used to extend live ranges that cross

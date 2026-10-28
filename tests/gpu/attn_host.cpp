@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
     // Probe kernels take the output pointer as their only argument.
     void* probe_params[] = {&a_o};
     const bool probe_kernel = std::strcmp(kern, "probe_math") == 0 ||
-                             std::strcmp(kern, "probe_mfma") == 0;
+                             std::strcmp(kern, "probe_mfma") == 0 || std::strcmp(kern, "probe_lds") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u)\n", grid.x, grid.y, grid.z);
@@ -148,6 +148,25 @@ int main(int argc, char** argv) {
         return mfma_bad != 0;
     }
 
+    if (std::strcmp(kern, "probe_lds") == 0) {
+        // Lane i must read the value lane (i+1)%64 wrote into LDS.
+        unsigned int bits[64] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
+        int lds_bad = 0;
+        for (int i = 0; i < 64; ++i) {
+            unsigned int want = (unsigned int)((i + 1) & 63);
+            if (bits[i] != want) {
+                if (lds_bad < 6) {
+                    std::fprintf(stderr, "lds mismatch lane=%d got=%u want=%u\n", i, bits[i], want);
+                }
+                ++lds_bad;
+            }
+        }
+        std::printf("  lds[0..3]=%u %u %u %u bad=%d\n", bits[0], bits[1], bits[2], bits[3],
+                    lds_bad);
+        std::printf(lds_bad ? "PROBE_LDS_FAIL\n" : "PROBE_LDS_OK\n");
+        return lds_bad != 0;
+    }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,
         // 4 corr, 5 p, 6 l_new, 7 scaled (last iteration).

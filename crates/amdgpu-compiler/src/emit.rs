@@ -47,7 +47,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     // the dispatch executes garbage.
     out.push_str("\n.p2align 6\n");
     out.push_str(&format!(".amdhsa_kernel {}\n", m.name));
-    out.push_str("    .amdhsa_group_segment_fixed_size 0\n");
+    out.push_str(&format!("    .amdhsa_group_segment_fixed_size {}\n", m.lds_bytes));
     out.push_str("    .amdhsa_private_segment_fixed_size 0\n");
     // The kernarg segment size must be 8-byte aligned or the assembler rejects
     // the metadata outright.
@@ -75,7 +75,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str(&format!("    .symbol: {}.kd\n", m.name));
     out.push_str(&format!("    .kernarg_segment_size: {}\n", round_up(m.kernarg_size, 8)));
     out.push_str("    .kernarg_segment_align: 8\n");
-    out.push_str("    .group_segment_fixed_size: 0\n");
+    out.push_str(&format!("    .group_segment_fixed_size: {}\n", m.lds_bytes));
     out.push_str("    .private_segment_fixed_size: 0\n");
     out.push_str("    .wavefront_size: 64\n");
     out.push_str("    .max_flat_workgroup_size: ");
@@ -358,7 +358,14 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         )],
         MOp::SNop => vec![format!("s_nop {}", inst.imm)],
         MOp::SWaitVm => vec!["s_waitcnt vmcnt(0)".to_string()],
-        MOp::SWaitLgkm => vec!["s_waitcnt lgkmcnt(0)".to_string()],
+        MOp::SWaitLgkm => vec![format!("s_waitcnt lgkmcnt({})", inst.imm)],
+        MOp::LdsWriteB32 => vec![format!(
+            "ds_write_b32 {}, {}",
+            src1(a, inst.srcs[0]),
+            src1(a, inst.srcs[1])
+        )],
+        MOp::LdsReadB32 => vec![format!("ds_read_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
+        MOp::SBarrier => vec!["s_barrier".to_string()],
         MOp::SEndpgm => vec!["s_endpgm".to_string()],
     }
 }

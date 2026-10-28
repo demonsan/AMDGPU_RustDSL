@@ -280,3 +280,28 @@ pub fn probe_mfma() -> Function {
     }
     b.finish()
 }
+/// LDS probe: every lane writes its id to LDS, then reads the value written by
+/// the next lane after a workgroup barrier.
+pub fn probe_lds() -> Function {
+    let mut b = FnBuilder::new("probe_lds", 64);
+    b.lds(256);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c1 = b.c_i32(1);
+    let c4 = b.c_i32(4);
+    let c63 = b.c_i32(63);
+    let next = b.add_i32(tid, c1);
+    let wrapped = b.let_(Op::AndI32(Opnd::Val(next), Opnd::Val(c63)));
+    let self_off = b.mul_i32(tid, c4);
+    let next_off = b.mul_i32(wrapped, c4);
+    b.store_lds_b32(Opnd::Val(self_off), Opnd::Val(tid));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let raw = b.load_lds_b32(Opnd::Val(next_off));
+    let value = b.bitcast_f32(Opnd::Val(raw));
+    let dst = b.ptr_add(o, self_off);
+    b.store_f32(dst, 0, Opnd::Val(value));
+    b.finish()
+}

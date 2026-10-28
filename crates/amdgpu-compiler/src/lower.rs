@@ -56,6 +56,7 @@ impl Lowerer {
                 .collect(),
             kernarg_size: f.kernarg_size,
             workgroup_size: f.workgroup_size,
+            lds_bytes: f.lds_bytes,
             blocks: Vec::new(),
             vregs: Vec::new(),
             loops: Vec::new(),
@@ -336,6 +337,18 @@ impl Lowerer {
                     self.set_term(Term::Goto(end_l));
                     self.start_block(else_l);
                 }
+                Stmt::StoreLdsB32 { addr, value } => {
+                    let a = self.as_v1(*addr)?;
+                    let v = self.as_v1(*value)?;
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(MInst::new(MOp::LdsWriteB32).srcreg(a).srcreg(v));
+                }
+                Stmt::WaitLds { count } => {
+                    self.push(MInst::new(MOp::SWaitLgkm).imm(*count as i64));
+                }
+                Stmt::Barrier => {
+                    self.push(MInst::new(MOp::SBarrier));
+                }
                 Stmt::EndIf => {
                     let (_, end_l) = self.if_stack.pop().ok_or("endif without if")?;
                     self.set_term(Term::Goto(end_l));
@@ -557,6 +570,12 @@ impl Lowerer {
                         .srcreg(rb)
                         .srcreg(rc),
                 );
+                self.val.insert(dst, d);
+            }
+            Op::LoadLdsB32 { addr } => {
+                let a = self.as_v1(*addr)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::LdsReadB32).def(d).srcreg(a));
                 self.val.insert(dst, d);
             }
             Op::BitcastF32(a) => {
