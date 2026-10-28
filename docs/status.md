@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **prefetching staging + folded addresses (190 TFLOP/s)** | 16-byte global loads with the next K/V tile prefetched behind the MFMA work, LDS offsets folded into DS immediates with DCE, zero-C MFMA, folded x16 scale and `v_max3_f32`: **190 TFLOP/s on 1x8x2048x2048** (vendor 518), all 6 shapes `REF_KERNEL_OK` |
 | **sub-register aliases + in-place accumulators (118 TFLOP/s)** | compiler removes ~75% of the `v_mov_b32` in `fmha_fwd_hd128_mxfp8_t`: 2859 asm lines instead of 4935, 176 VGPRs; **118 TFLOP/s on 1x8x2048x2048** (vendor 518); all 6 shapes `REF_KERNEL_OK` |
 | **transposed register-softmax `fmha_fwd_hd128_mxfp8_t`** | same ABI and numerics (all 6 shapes `REF_KERNEL_OK`, mean error vs CPU 1.1-1.7e-3, vs vendor 2.5-2.8e-3) with `S^T = K Q^T`: scores stay in registers (lane = query), softmax max/sum are register reductions plus one LDS exchange with lane `l ^ 32`, the online-softmax correction is lane-local, no score tile goes through LDS; 192 VGPRs, 34.8 KB LDS; **88 TFLOP/s vs 15 for the first version (5.9x faster), vendor kernel 518 TFLOP/s** |
 | **ABI-compatible `fmha_fwd_hd128_mxfp8`** | our kernel launched with the vendor kernel's 656-byte kernarg on BSHD fp8 Q/K/V, E8M0 1x32 descales and a BF16 output; `exp2` softmax; **every output element agrees with a double-precision CPU model (mean error 1.2-1.7e-3, better than the vendor kernel's own 1.8-2.8e-3) and with the vendor kernel (mean difference 2.5-2.8e-3, worst 0.10) on 6 shapes up to B=3 H=3 S=768 SK=1280 and 2M outputs**; bit-identical to the vendor kernel when Q = 0 (`REF_KERNEL_OK`) |
@@ -564,6 +565,31 @@ Result for `fmha_fwd_hd128_mxfp8_t` (all 6 shapes still `REF_KERNEL_OK`, numeric
 2859 lines, `v_mov_b32` 2585 -> 633, VGPRs 192 -> 176, **88 -> 118 TFLOP/s** on 1x8x2048x2048 (vendor kernel:
 518 TFLOP/s, a 4.4x gap). The other kernels also benefit (`probe_fp8_fmha_hd128c` 224 -> 208 VGPRs) and all
 earlier probes still pass.
+
+## Staging, address folding and instruction trimming (round 33)
+
+The loop body of `fmha_fwd_hd128_mxfp8_t` was 945 instructions per 128-key iteration. Its histogram showed the
+real culprit: the K/V staging issued sixteen 4-byte `global_load_dword`s per thread, each followed by an
+`s_waitcnt vmcnt(0)` and a `ds_write_b32` -- sixteen serialised memory round trips per iteration. Changes:
+
+* **16-byte global loads** (`load_b128`, `global_load_dwordx4`): four loads cover a thread's 64 bytes and all of
+  them are in flight together.
+* **Software-pipelined staging.** The next tile's four loads are issued at the top of the iteration (the last
+  iteration re-reads its own tile so nothing is read out of range), the MFMA / softmax work of the current tile
+  hides their latency, and after the end-of-iteration barrier the prefetched registers are written to LDS before
+  the second barrier. Still two barriers per iteration.
+* **LDS offset folding + DCE.** `x + const` chains in LDS addresses become the DS instruction's `offset:`
+  immediate; a small dead-code pass removes the address adds that are no longer read (about 100 `v_add_u32` per
+  iteration).
+* **Zero-accumulator MFMA** (`D = A x B` with the inline constant 0 as C): the 64 `v_mov_b32` that zero-filled the
+  S accumulators are gone.
+* **Math trimming.** The `P * 16` quantisation scale is folded into the exp2 argument
+  (`exp2(s - (m - 4)) = 16 exp2(s - m)`, so the row sum is corrected by 1/16 once per substep), the 32-value row
+  max uses `v_max3_f32`.
+
+Result (`REF_ITERS=20`, 1x8x2048x2048; all 6 shapes still `REF_KERNEL_OK`, numerics unchanged): **190 TFLOP/s**
+(0.091 ms) against 118 before and 518 for the vendor kernel -- a 2.7x gap; assembly 2859 -> 2329 lines,
+`v_mov_b32` 633 -> 447.
 
 ## Next: FMHA reference core loop
 
