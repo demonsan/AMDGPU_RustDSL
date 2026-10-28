@@ -168,23 +168,39 @@ pub fn schedule(
             let t = ready_time[c].max(pipe_free[costs[c].pipe.index()]).max(cycle);
             tmin = tmin.min(t);
         }
-        // candidates that can start at tmin: pick by (fits pressure, height, original order)
-        let mut best: Option<(bool, u32, std::cmp::Reverse<usize>, usize)> = None;
+        // candidate pool: (index in ready, start time, delta, fits)
+        let mut pool: Vec<(usize, u32, i64, bool)> = Vec::with_capacity(ready.len());
         for (k, &c) in ready.iter().enumerate() {
             let t = ready_time[c].max(pipe_free[costs[c].pipe.index()]).max(cycle);
-            if t != tmin {
-                continue;
-            }
             let d = pr.delta(&rd[c], &wr[c]);
             let fits = pr.cur + d <= limit_eff || d <= 0;
-            let key = (fits, height[c], std::cmp::Reverse(c), k);
-            if best.map_or(true, |b| (key.0, key.1, key.2) > (b.0, b.1, b.2)) {
-                best = Some(key);
-            }
+            pool.push((k, t, d, fits));
         }
-        let (_, _, _, k) = best.expect("ready list is never empty while instructions remain");
-        let c = ready.swap_remove(k);
-        let t = tmin;
+        let pick_best = |sel: &dyn Fn(&(usize, u32, i64, bool)) -> bool| -> Option<usize> {
+            let mut best: Option<(u32, std::cmp::Reverse<usize>, usize)> = None;
+            for p in pool.iter().filter(|p| sel(p)) {
+                let c = ready[p.0];
+                let key = (height[c], std::cmp::Reverse(c), p.0);
+                if best.map_or(true, |b| (key.0, key.1) > (b.0, b.1)) {
+                    best = Some(key);
+                }
+            }
+            best.map(|b| b.2)
+        };
+        let k = if let Some(k) = pick_best(&|p| p.1 == tmin && p.3) {
+            k
+        } else if let Some(k) = {
+            // nothing fits at the earliest start: take the earliest fitting one
+            let tf = pool.iter().filter(|p| p.3).map(|p| p.1).min();
+            tf.and_then(|tf| pick_best(&|p| p.3 && p.1 == tf))
+        } {
+            k
+        } else {
+            // nothing fits: least pressure growth
+            let dmin = pool.iter().map(|p| p.2).min().unwrap();
+            pick_best(&|p| p.2 == dmin).unwrap()
+        };        let c = ready.swap_remove(k);
+        let t = ready_time[c].max(pipe_free[costs[c].pipe.index()]).max(cycle);
         start[c] = t;
         pipe_free[costs[c].pipe.index()] = t + costs[c].issue;
         cycle = t + 1;
