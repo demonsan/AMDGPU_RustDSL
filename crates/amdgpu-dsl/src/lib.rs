@@ -906,8 +906,8 @@ pub fn verify(f: &Function) -> Vec<String> {
                         }
                     }
                     Op::FragZero { .. } => {}
-                    Op::Frag8(a, b, c, d, e, f, g, h) => {
-                        for o in [a, b, c, d, e, f, g, h] {
+                    Op::Frag8(a, b, c, d, e, ff, g, h) => {
+                        for o in [a, b, c, d, e, ff, g, h] {
                             if let Err(err) = expect_int(f, *o, "frag8") {
                                 errs.push(here(err));
                             }
