@@ -500,6 +500,8 @@ pub fn probe_lds_own() -> Function {
     let off = b.mul_i32(tid, c4);
     b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
     b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
     let c1 = b.c_i32(1);
     let c63 = b.c_i32(63);
     let next = b.add_i32(tid, c1);
