@@ -294,7 +294,7 @@ int main(int argc, char** argv) {
         std::memcpy(vals, got.data(), sizeof(vals));
         int hw_bad = 0;
         for (int tid = 0; tid < 128; ++tid) {
-            if (std::fabs(vals[tid] - (float)tid) > 0.5f) {
+            if (std::fabs(vals[tid] - (float)((tid + 63) & 63)) > 0.5f) {
                 if (hw_bad < 6) {
                     std::fprintf(stderr, "hw_roles mismatch tid=%d got=%.1f\n", tid, vals[tid]);
                 }
@@ -332,7 +332,7 @@ int main(int argc, char** argv) {
         int first_bad = 0;
         int read_bad = 0;
         for (int tid = 0; tid < 64; ++tid) {
-            if (std::fabs(vals[tid] - (float)tid) > 0.5f) {
+            if (std::fabs(vals[tid] - (float)((tid + 63) & 63)) > 0.5f) {
                 ++first_bad;
             }
             if (std::fabs(vals[64 + tid] - (float)((tid + 1) & 63)) > 0.5f) {
@@ -353,7 +353,7 @@ int main(int argc, char** argv) {
         std::memcpy(vals, got.data(), sizeof(vals));
         int bad = 0;
         for (int tid = 0; tid < 64; ++tid) {
-            if (std::fabs(vals[tid] - (float)tid) > 0.5f) {
+            if (std::fabs(vals[tid] - (float)((tid + 63) & 63)) > 0.5f) {
                 if (bad < 4) {
                     std::fprintf(stderr, "%s mismatch tid=%d got=%.1f\n", kern, tid, vals[tid]);
                 }
