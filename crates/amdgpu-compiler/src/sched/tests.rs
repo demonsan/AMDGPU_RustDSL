@@ -153,7 +153,7 @@ impl Rng {
 #[test]
 fn random_blocks_schedule_legally() {
     for seed in 1..200u64 {
-        let mut rng = Rng(seed * 0x9E3779B97F4A7C15 + 1);
+        let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1));
         let nv = 12u32;
         let mut vregs = vec![RClass::V1; nv as usize];
         vregs.push(RClass::V4); // 12 tuple

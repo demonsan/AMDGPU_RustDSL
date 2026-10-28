@@ -224,7 +224,7 @@ for j, m in enumerate([0, 1, 2, 3, 4]):
     body.append(zf["scale32"])
     body += ["s_nop 15"] * 6
     body.append("v_mov_b32 v%d, v32" % (200 + j))
-add("mfma_srcA_after_valu_scale32", mf_setup, body, 1, chk="v200", extra=5)
+add("mfma_haz_srcA_after_valu_scale32", mf_setup, body, 1, chk="v200", extra=5)
 out = [HDR]
 meta = []
 for name, text, n in KS:
@@ -264,6 +264,7 @@ out.append("amdhsa.target: amdgcn-amd-amdhsa--gfx950\namdhsa.version:\n  - 1\n  
 open("mb.s", "w").write("".join(out))
 json.dump({n: m for n, _, m in KS}, open("tests.json", "w"))
 print(len(KS), "kernels")
+
 
 
 

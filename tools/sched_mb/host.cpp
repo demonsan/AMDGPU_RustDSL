@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
                 printf("\n");
                 if (nm.find("haz") != std::string::npos) {
                     printf("X %s %d %d |", nm.c_str(), w, r);
-                    for (int k = 0; k < 24; ++k) printf(" %08x", h[8 + k]);
+                    for (int k = 0; k < 28; ++k) printf(" %08x", h[8 + k]);
                     printf("\n");
                 }
             }
@@ -51,4 +51,5 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+
 
