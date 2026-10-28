@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **single-tile MXFP8 attention** | `probe_fp8_fmha_tile`: QK^T -> row softmax -> in-kernel fp8 quantisation (scaled `v_cvt_pk_fp8_f32`) -> PV through the same scaled MFMA, `worst_err = 0.0` vs a CPU reference built from the quantised P bytes -> `PROBE_FMHA_TILE_OK` |
 | fp8 QK^T + softmax | `probe_fp8_softmax`: random fp8 Q/K with random E8M0 scales -> block-scaled MFMA -> LDS transpose -> per-row max/exp/sum/normalise, `worst_err=8.1e-08` vs a CPU double reference -> `PROBE_FP8_SOFTMAX_OK` |
 | fp8 matmul (real data, general) | `probe_fp8_matmul`: random E4M3 data with random per-lane E8M0 scales through the real fragment/scale layout, matched element by element against a CPU double reference (`FP8_TEST=1,2,3,4,6,7`) -> `PROBE_FP8_MATMUL_OK` |
 | fp8 load path | `probe_fp8_load`: address arithmetic and the ISA fragment mapping for the real-data fp8 matmul probe -> `PROBE_FP8_LOAD_OK` |
@@ -286,6 +287,23 @@ calls, an add chain and one `v_rcp_f32`) and stores the normalised row.
 Matched against a CPU double-precision reference over random fp8 data with random
 per-lane scales: `worst_err = 8.1e-08`, so both the fragment/scale layout and the
 transcendental/reciprocal path are numerically sound.
+
+## Single-tile MXFP8 attention (round 17)
+
+`probe_fp8_fmha_tile` is the first complete attention tile produced by the
+compiler: QK^T with the block-scaled fp8 MFMA, a row-wise softmax through LDS,
+**in-kernel fp8 quantisation** of the probabilities (`v_cvt_pk_fp8_f32`, two
+values per instruction, combined into dwords with a shift and add), and a second
+block-scaled MFMA for PV. The `p * 16` quantisation factor is folded into the PV
+B-scale (`123 = 2^-4`), so no extra epilogue is needed.
+
+Verified on random fp8 Q/K/V with random per-lane E8M0 scales: the kernel also
+writes the quantised P bytes, the host rebuilds `O = (P_q @ V) / 16` from exactly
+those bytes and compares element by element -> `worst_err = 0.0`,
+`PROBE_FMHA_TILE_OK`.
+
+New compiler pieces: the `CvtPkFp8F32` op (DSL/MIR/lowering/emit) with its
+verified low-half write semantics.
 
 ## Next: FMHA reference core loop
 
