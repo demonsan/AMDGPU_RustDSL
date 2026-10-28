@@ -213,7 +213,8 @@ pub fn attn_debug() -> Function {
     attention_impl(true)
 }
 
-/// Minimal probe kernel: `o[tid] = q[tid]`, plus `n` stored at byte 128.
+/// Minimal probe kernel: `o[tid] = q[tid]`, plus 
+` stored at byte 128.
 /// Used to validate the kernarg/ABI plumbing independently of attention math.
 pub fn probe_store() -> Function {
     let mut b = FnBuilder::new("probe_store", 64);
@@ -2463,7 +2464,15 @@ pub fn probe_fp8_fmha_multiwave() -> Function {
     let c19456 = b.c_i32(33792); // K scales
     let c20480 = b.c_i32(34816); // O out (per wave +4096)
     let c24576 = b.c_i32(67584); // P bytes (per wave +4096)
-    let c8448w = b.c_i32(8448);`n    let c2048w = b.c_i32(2048);`n    let c4096w = b.c_i32(4096);`n    let c16384 = b.c_i32(16384);`n    let wbase = b.mul_i32(wave, c8448w);`n    let wq = b.mul_i32(wave, c2048w);`n    let wout = b.mul_i32(wave, c4096w);`n    let lds_corr0 = b.c_i32(4096);`n    let lds_corr = b.add_i32(lds_corr0, wbase);
+    let c8448w = b.c_i32(8448);
+    let c2048w = b.c_i32(2048);
+    let c4096w = b.c_i32(4096);
+    let c16384 = b.c_i32(16384);
+    let wbase = b.mul_i32(wave, c8448w);
+    let wq = b.mul_i32(wave, c2048w);
+    let wout = b.mul_i32(wave, c4096w);
+    let lds_corr0 = b.c_i32(4096);
+    let lds_corr = b.add_i32(lds_corr0, wbase);
     let lds_o = b.c_i32(4224);
     let neg_big = b.c_f32(-1.0e30);
     let c16f = b.c_f32(16.0);
@@ -2472,7 +2481,8 @@ pub fn probe_fp8_fmha_multiwave() -> Function {
     let pblk = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
     let j4 = b.mul_i32(j, c4);
     let p512 = b.shl_i32(pblk, c9);
-    let lds_loc = b.add_i32(j4, p512);`n    let lds_dyn = b.add_i32(lds_loc, wbase);
+    let lds_loc = b.add_i32(j4, p512);
+    let lds_dyn = b.add_i32(lds_loc, wbase);
     let pblk16 = b.shl_i32(pblk, c4t);
     let corr_row = b.add_i32(j4, lds_corr);
     let o_lds_dyn = b.add_i32(lds_dyn, lds_o);
@@ -2484,7 +2494,8 @@ pub fn probe_fp8_fmha_multiwave() -> Function {
     let zero = b.frag_zero(DType::Frag16);
 
     // Q fragment, loaded once.
-    let q_off = b.add_i32(frag_off, wq);`n    let q_base = b.ptr_add(o, q_off);
+    let q_off = b.add_i32(frag_off, wq);
+    let q_base = b.ptr_add(o, q_off);
     let q0 = b.load_f32(q_base, 0);
     let q0 = b.bitcast_i32(q0);
     let q1 = b.load_f32(q_base, 4);
@@ -2562,7 +2573,8 @@ pub fn probe_fp8_fmha_multiwave() -> Function {
     b.wait_lds(0);
 
     // ---- online softmax update for this lane's row ----
-    let rbase0 = b.mul_i32(j, c128);`n    let rbase = b.add_i32(rbase0, wbase);
+    let rbase0 = b.mul_i32(j, c128);
+    let rbase = b.add_i32(rbase0, wbase);
     let mut vals: Vec<ValueId> = Vec::with_capacity(32);
     for k in 0..32u32 {
         let coff = b.c_i32(4 * k as i32);
@@ -2614,7 +2626,8 @@ pub fn probe_fp8_fmha_multiwave() -> Function {
     let pt0 = b.mul_i32(tile, c1024);
     let pt1 = b.mul_i32(j, c32);
     let pt2 = b.add_i32(pt0, pt1);
-    let pt2b = b.add_i32(pt2, wout);`n    let pt3 = b.add_i32(pt2b, c24576);
+    let pt2b = b.add_i32(pt2, wout);
+    let pt3 = b.add_i32(pt2b, c24576);
     let p_ptr = b.ptr_add(o, pt3);
     for m in 0..8usize {
         let v = b.bitcast_f32(words[m]);
@@ -2681,7 +2694,8 @@ pub fn probe_fp8_fmha_multiwave() -> Function {
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
-    let o_out00 = b.add_i32(lds_loc, wout);`n    let o_out0 = b.add_i32(o_out00, c20480);
+    let o_out00 = b.add_i32(lds_loc, wout);
+    let o_out0 = b.add_i32(o_out00, c20480);
     let o_ptr = b.ptr_add(o, o_out0);
     for r in 0..16u8 {
         let i_const = ((r / 4) * 8 + (r % 4)) as i32;
