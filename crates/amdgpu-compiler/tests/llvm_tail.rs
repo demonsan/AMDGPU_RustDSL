@@ -119,6 +119,7 @@ fn opcode_probe_every_row_assembles() {
             vregs,
             loops: vec![],
             alias: HashMap::new(),
+            elide_fallthrough: false,
         };
         let a = Alloc { phys, max_v: vnext, max_s: snext };
         let mir = match tail.export_mir(&m, &a) {
