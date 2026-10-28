@@ -198,9 +198,32 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
             }
         });
         let slot = find_slot(&used_v, c).ok_or_else(|| {
+            let mut dwords = 0usize;
+            let mut by_class = [0usize; 5];
+            for (_, ar, ac) in &active {
+                dwords += ac.dwords() as usize;
+                match ac {
+                    RClass::V1 => by_class[0] += 1,
+                    RClass::V2 => by_class[1] += 1,
+                    RClass::V4 => by_class[2] += 1,
+                    RClass::V8 => by_class[3] += 1,
+                    RClass::V16 => by_class[4] += 1,
+                    _ => {}
+                }
+                let _ = ar;
+            }
             format!(
-                "out of VGPRs allocating r{r} ({c:?}, live {}..{})",
-                s, e
+                "out of VGPRs allocating r{r} ({c:?}, live {}..{}); {} live vregs holding {} dwords \
+                 (V1 {} V2 {} V4 {} V8 {} V16 {})",
+                s,
+                e,
+                active.len(),
+                dwords,
+                by_class[0],
+                by_class[1],
+                by_class[2],
+                by_class[3],
+                by_class[4]
             )
         })?;
         phys[r as usize] = slot as u32;
