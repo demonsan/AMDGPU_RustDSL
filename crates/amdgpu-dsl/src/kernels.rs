@@ -2857,7 +2857,7 @@ pub fn probe_fp8_fmha_pingpong() -> Function {
     let o_var = vars[3];
 
     // ---- S_t = Q K_t^T ----
-    let slot = b.let_(Op::AndI32(Opnd::Val(tile), Opnd::Val(c1k)));
+    let slot = b.let_(Op::AndI32(tile.into(), Opnd::Val(c1k)));
     let slot_off = b.mul_i32(slot, c4096k);
     let kslot0 = b.add_i32(slot_off, kvb);
     let kaddr = b.add_i32(kslot0, frag_off);
