@@ -73,6 +73,8 @@ pub enum MOp {
     VReadSub,
     VMfma16x16x16F16,
     VMfma32x32x8F16,
+    VMfma16x16x32Fp8,
+    VMfma32x32x16Fp8,
     // workgroup LDS
     LdsWriteB32,
     LdsReadB32,
@@ -308,6 +310,28 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                             )),
                             _ => errs.push(format!(
                                 "block {bi} inst {ii}: mfma operand {k} is not a register"
+                            )),
+                        }
+                    }
+                }
+                MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8 => {
+                    let wide = inst.op == MOp::VMfma32x32x16Fp8;
+                    let acc = if wide { RClass::V16 } else { RClass::V4 };
+                    if let Some(d) = inst.dst {
+                        if m.vreg_class(d) != acc {
+                            errs.push(format!("block {bi} inst {ii}: fp8 mfma dst class mismatch"));
+                        }
+                    }
+                    let want = [RClass::V2, RClass::V2, acc];
+                    for (k, w) in want.iter().enumerate() {
+                        match inst.srcs.get(k) {
+                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) => errs.push(format!(
+                                "block {bi} inst {ii}: fp8 mfma operand {k} is {:?}, expected {w:?}",
+                                m.vreg_class(*r)
+                            )),
+                            _ => errs.push(format!(
+                                "block {bi} inst {ii}: fp8 mfma operand {k} is not a register"
                             )),
                         }
                     }

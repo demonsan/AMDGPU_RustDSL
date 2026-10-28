@@ -171,6 +171,10 @@ pub enum Op {
     MfmaF16 { a: Opnd, b: Opnd, c: Opnd },
     /// `v_mfma_f32_32x32x8_f16` with an existing accumulator.
     MfmaF16Wide { a: Opnd, b: Opnd, c: Opnd },
+    /// `v_mfma_f32_16x16x32_fp8_fp8`: fp8 A/B, f32 accumulator.
+    MfmaFp8_16x16x32 { a: Opnd, b: Opnd, c: Opnd },
+    /// `v_mfma_f32_32x32x16_fp8_fp8`: fp8 A/B, 16-dword accumulator.
+    MfmaFp8_32x32x16 { a: Opnd, b: Opnd, c: Opnd },
     /// Read dword `index` (0..15) of a sixteen-dword fragment.
     Frag16Lane { frag: Opnd, index: u8 },
     /// A fragment of `ty` zeroed out.
@@ -198,6 +202,8 @@ impl Op {
             Op::Frag2Lane { .. } | Op::Frag4Lane { .. } => DType::U32,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::MfmaF16Wide { .. } => DType::Frag16,
+            Op::MfmaFp8_16x16x32 { .. } => DType::Frag4,
+            Op::MfmaFp8_32x32x16 { .. } => DType::Frag16,
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
             Op::BitcastF32(..) => DType::F32,
@@ -234,6 +240,8 @@ impl Op {
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
             Op::MfmaF16Wide { a, b, c } => vec![*a, *b, *c],
+            Op::MfmaFp8_16x16x32 { a, b, c } => vec![*a, *b, *c],
+            Op::MfmaFp8_32x32x16 { a, b, c } => vec![*a, *b, *c],
             Op::Frag16Lane { frag, .. } => vec![*frag],
             Op::FragZero { .. } => vec![],
             Op::BitcastF32(a) => vec![*a],
@@ -563,6 +571,24 @@ impl FnBuilder {
         self.let_(Op::MfmaF16Wide { a: a.into(), b: b.into(), c: c.into() })
     }
 
+    pub fn mfma_fp8_16x16x32(
+        &mut self,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        c: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::MfmaFp8_16x16x32 { a: a.into(), b: b.into(), c: c.into() })
+    }
+
+    pub fn mfma_fp8_32x32x16(
+        &mut self,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        c: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::MfmaFp8_32x32x16 { a: a.into(), b: b.into(), c: c.into() })
+    }
+
     pub fn frag16_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
         self.let_(Op::Frag16Lane { frag: frag.into(), index })
     }
@@ -824,6 +850,40 @@ pub fn verify(f: &Function) -> Vec<String> {
                         }
                     }
                     Op::FragZero { .. } => {}
+                    Op::MfmaFp8_16x16x32 { a, b, c } => {
+                        for (o, want, what) in [
+                            (*a, DType::Frag2, "a"),
+                            (*b, DType::Frag2, "b"),
+                            (*c, DType::Frag4, "c"),
+                        ] {
+                            if let Ok(t) = opnd_ty(f, o) {
+                                if t != want {
+                                    errs.push(here(format!(
+                                        "fp8 mfma: operand {what} is {}, expected {}",
+                                        t.name(),
+                                        want.name()
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Op::MfmaFp8_32x32x16 { a, b, c } => {
+                        for (o, want, what) in [
+                            (*a, DType::Frag2, "a"),
+                            (*b, DType::Frag2, "b"),
+                            (*c, DType::Frag16, "c"),
+                        ] {
+                            if let Ok(t) = opnd_ty(f, o) {
+                                if t != want {
+                                    errs.push(here(format!(
+                                        "wide fp8 mfma: operand {what} is {}, expected {}",
+                                        t.name(),
+                                        want.name()
+                                    )));
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 // Scope: value becomes visible here.

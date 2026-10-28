@@ -109,7 +109,8 @@ int main(int argc, char** argv) {
     void* probe_params[] = {&a_o};
     const bool probe_kernel = std::strcmp(kern, "probe_math") == 0 ||
                              std::strcmp(kern, "probe_mfma") == 0 || std::strcmp(kern, "probe_lds") == 0 ||
-                             std::strcmp(kern, "probe_mfma_wide") == 0;
+                             std::strcmp(kern, "probe_mfma_wide") == 0 ||
+                             std::strcmp(kern, "probe_mfma_fp8") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u)\n", grid.x, grid.y, grid.z);
@@ -186,6 +187,29 @@ int main(int argc, char** argv) {
                     vals[3], wide_bad);
         std::printf(wide_bad ? "PROBE_MFMA_WIDE_FAIL\n" : "PROBE_MFMA_WIDE_OK\n");
         return wide_bad != 0;
+    }
+    if (std::strcmp(kern, "probe_mfma_fp8") == 0) {
+        // Lane layout: 4 floats from the 16x16x32 result (K = 32), then 16 from
+        // the 32x32x16 result (K = 16).
+        float vals[1280] = {0.0f};
+        std::memcpy(vals, got.data(), sizeof(vals));
+        int fp8_bad = 0;
+        for (int lane = 0; lane < 64; ++lane) {
+            for (int i = 0; i < 4; ++i) {
+                if (std::fabs(vals[lane * 20 + i] - 32.0f) > 1e-3f) {
+                    ++fp8_bad;
+                }
+            }
+            for (int i = 0; i < 16; ++i) {
+                if (std::fabs(vals[lane * 20 + 4 + i] - 16.0f) > 1e-3f) {
+                    ++fp8_bad;
+                }
+            }
+        }
+        std::printf("  fp8 mfma lane0: %.6f %.6f %.6f %.6f | %.6f %.6f bad=%d\n", vals[0],
+                    vals[1], vals[2], vals[3], vals[4], vals[5], fp8_bad);
+        std::printf(fp8_bad ? "PROBE_MFMA_FP8_FAIL\n" : "PROBE_MFMA_FP8_OK\n");
+        return fp8_bad != 0;
     }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,

@@ -328,3 +328,38 @@ pub fn probe_mfma_wide() -> Function {
     }
     b.finish()
 }
+/// FP8 MFMA probe: all-ones E4M3 operands, so `16x16x32` yields K = 32.0 and
+/// `32x32x16` yields K = 16.0 in every accumulator element.
+pub fn probe_mfma_fp8() -> Function {
+    let mut b = FnBuilder::new("probe_mfma_fp8", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    // E4M3 1.0 is 0x38; four fp8 values per dword.
+    let ones4 = b.c_i32(0x38383838_u32 as i32);
+
+    let a_small = b.frag2(ones4, ones4);
+    let b_small = b.frag2(ones4, ones4);
+    let c_small = b.frag_zero(DType::Frag4);
+    let d_small = b.mfma_fp8_16x16x32(a_small, b_small, c_small);
+
+    let a_wide = b.frag2(ones4, ones4);
+    let b_wide = b.frag2(ones4, ones4);
+    let c_wide = b.frag_zero(DType::Frag16);
+    let d_wide = b.mfma_fp8_32x32x16(a_wide, b_wide, c_wide);
+
+    let c80 = b.c_i32(80);
+    let lane_off = b.mul_i32(tid, c80);
+    let row = b.ptr_add(o, lane_off);
+    for i in 0..4u8 {
+        let bits = b.frag4_lane(d_small, i);
+        let value = b.bitcast_f32(bits);
+        b.store_f32(row, 4 * i as u32, value);
+    }
+    for i in 0..16u8 {
+        let bits = b.frag16_lane(d_wide, i);
+        let value = b.bitcast_f32(bits);
+        b.store_f32(row, 16 + 4 * i as u32, value);
+    }
+    b.finish()
+}

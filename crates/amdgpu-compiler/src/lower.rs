@@ -619,6 +619,34 @@ impl Lowerer {
                 );
                 self.val.insert(dst, d);
             }
+            Op::MfmaFp8_16x16x32 { a, b, c } => {
+                let ra = self.as_v2(*a)?;
+                let rb = self.as_v2(*b)?;
+                let rc = self.as_v4(*c)?;
+                let d = self.new_vreg(RClass::V4);
+                self.push(
+                    MInst::new(MOp::VMfma16x16x32Fp8)
+                        .def(d)
+                        .srcreg(ra)
+                        .srcreg(rb)
+                        .srcreg(rc),
+                );
+                self.val.insert(dst, d);
+            }
+            Op::MfmaFp8_32x32x16 { a, b, c } => {
+                let ra = self.as_v2(*a)?;
+                let rb = self.as_v2(*b)?;
+                let rc = self.as_v16(*c)?;
+                let d = self.new_vreg(RClass::V16);
+                self.push(
+                    MInst::new(MOp::VMfma32x32x16Fp8)
+                        .def(d)
+                        .srcreg(ra)
+                        .srcreg(rb)
+                        .srcreg(rc),
+                );
+                self.val.insert(dst, d);
+            }
             Op::Frag16Lane { frag, index } => {
                 let f = self.as_v16(*frag)?;
                 let d = self.new_vreg(RClass::V1);
