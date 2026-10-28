@@ -6640,6 +6640,8 @@ struct FmhaTCtx {
     bidx: ValueId,
     hidx: ValueId,
     row: ValueId,
+    row0: ValueId,
+    s_len: ValueId,
     g8: ValueId,
     g_bytes8: ValueId,
     j: ValueId,
@@ -7067,6 +7069,12 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let ob3 = b.add_i32(ob2, orow);
     let ob4 = b.add_i32(ob3, cx.g_bytes8);
     let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
+    // Waves whose rows all lie past the end of a partial query tile only duplicate the last row:
+    // they must not store (their lazy-rescale decisions differ from the wave holding the real row,
+    // so their rounding would differ and the same-address stores would race). The condition is
+    // wave-uniform; the loop above still ran for the barriers.
+    let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
+    b.begin_if(Opnd::Val(wave_live));
     for e in 0..4usize {
         for q in 0..4usize {
             let mut v4: Vec<ValueId> = Vec::with_capacity(4);
@@ -7085,6 +7093,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.store_f32(o_ptr0, off + 4, f1);
         }
     }
+    b.end_if();
 }
 
 /// Transposed (`S^T = K Q^T`) variant of `fmha_fwd_hd128_mxfp8`: same ABI, same requirements, but
@@ -7328,6 +7337,8 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
         bidx,
         hidx,
         row,
+        row0,
+        s_len,
         g8,
         g_bytes8,
         j,
