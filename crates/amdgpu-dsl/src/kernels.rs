@@ -6668,6 +6668,13 @@ struct FmhaTCtx {
 /// into the B operand of `O^T = V^T P^T` (the V fragment, a column read of the row-major V tile,
 /// comes from `ds_read_b64_tr_b8`). No score tile ever goes through LDS.
 fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
+    // Debug ablations for performance attribution (never set in normal builds).
+    let ablate = std::env::var("FMHA_ABLATE").unwrap_or_default();
+    let no_pv = ablate.contains("nopv");
+    let no_exp = ablate.contains("noexp");
+    let no_stage = ablate.contains("nostage");
+    let no_bar = ablate.contains("nobar");
+    let no_s = ablate.contains("nos");
     let c0 = b.c_i32(0);
     let c1 = b.c_i32(1);
     let c4 = b.c_i32(4);
@@ -6714,6 +6721,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
+    let _ = (no_pv, no_exp, no_stage, no_bar, no_s);
 
     let vars = b.begin_loop(&[
         (DType::I32, Opnd::Val(c0)),
@@ -6735,45 +6743,43 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let has_next = b.cmp_lt_i32(it_p1, cx.nkv);
     let nxt = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_next), a: Opnd::Val(it_p1), b: it.into() });
     let key_next = b.shl_i32(nxt, c7);
-    let pre = stage_loads(b, key_next);
+    let pre = if no_stage { first.clone() } else { stage_loads(b, key_next) };
     let hq4 = b.mul_i32(cx.q_heads, c4);
-    // All four 32-key score tiles of the iteration are issued up front so that the MFMA latency of
-    // the later tiles hides behind the softmax of the earlier ones.
-    let mut sv_all: Vec<Vec<ValueId>> = Vec::with_capacity(4);
-    for s in 0..4usize {
-        let ko = b.c_i32((4096 * s) as i32);
-        let kaddr0 = b.add_i32(cx.kf_base, ko);
-        let kaddr0h = b.add_i32(kaddr0, c32v);
-        let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
-        let kaddr1 = b.add_i32(kaddr0, c64);
-        let kaddr1h = b.add_i32(kaddr1, c32v);
-        let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
-        // K scale dword of key (128 it + 32 s + j)
-        let kkey0 = b.add_i32(key0, cx.j);
-        let kcs = b.c_i32(32 * s as i32);
-        let kkey = b.add_i32(kkey0, kcs);
-        let kd_row = b.mul_i32(kkey, hq4);
-        let kd_off = b.add_i32(kd_row, cx.kd_base);
-        let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
-        let kd_raw = b.load_f32(kd_ptr, 0);
-        let kd = b.bitcast_i32(kd_raw);
-        let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
-        let sh16 = b.add_i32(cx.g8, c16i);
-        let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
-        let zero_s = b.frag_zero(DType::Frag16);
-        let s0 = b.mfma_scale_fp8(k8_0, cx.b0, zero_s, sk0, cx.sq0);
-        let s_frag = b.mfma_scale_fp8(k8_1, cx.b1, s0, sk1, cx.sq1);
-        // keep the accumulator tuple; its lanes are read (as register aliases) after the softmax
-        // of the previous tiles has been issued
-        let mut vals: Vec<ValueId> = Vec::with_capacity(16);
-        for r in 0..16u8 {
-            let lane = b.frag16_lane(s_frag, r);
-            vals.push(b.bitcast_f32(lane));
-        }
-        sv_all.push(vals);
-    }
     for hh in 0..2usize {
-        let sv: Vec<Vec<ValueId>> = vec![sv_all[2 * hh].clone(), sv_all[2 * hh + 1].clone()];
+        // ---- two 32-key score tiles (S^T = K Q^T) of this 64-key substep ----
+        let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
+        for sl in 0..2usize {
+            let s = 2 * hh + sl;
+            let ko = b.c_i32((4096 * s) as i32);
+            let kaddr0 = b.add_i32(cx.kf_base, ko);
+            let kaddr0h = b.add_i32(kaddr0, c32v);
+            let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
+            let kaddr1 = b.add_i32(kaddr0, c64);
+            let kaddr1h = b.add_i32(kaddr1, c32v);
+            let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
+            // K scale dword of key (128 it + 32 s + j)
+            let kkey0 = b.add_i32(key0, cx.j);
+            let kcs = b.c_i32(32 * s as i32);
+            let kkey = b.add_i32(kkey0, kcs);
+            let kd_row = b.mul_i32(kkey, hq4);
+            let kd_off = b.add_i32(kd_row, cx.kd_base);
+            let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+            let kd_raw = b.load_f32(kd_ptr, 0);
+            let kd = b.bitcast_i32(kd_raw);
+            let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
+            let sh16 = b.add_i32(cx.g8, c16i);
+            let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
+            let zero_s = b.frag_zero(DType::Frag16);
+            let s0 = b.mfma_scale_fp8(k8_0, cx.b0, zero_s, sk0, cx.sq0);
+            let s_frag = b.mfma_scale_fp8(k8_1, cx.b1, s0, sk1, cx.sq1);
+            let mut vals: Vec<ValueId> = Vec::with_capacity(16);
+            for r in 0..16u8 {
+                let lane = b.frag16_lane(s_frag, r);
+                vals.push(b.bitcast_f32(lane));
+            }
+            sv.push(vals);
+        }
+
         // ---- register softmax: lane-local max, exchange with the partner lane ----
         let mut flat: Vec<ValueId> = Vec::with_capacity(32);
         for sl in 0..2usize {
@@ -6811,7 +6817,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let mut exps: Vec<ValueId> = Vec::with_capacity(16);
             for r in 0..16usize {
                 let sh = b.sub_f32(sv[sl][r], m4);
-                exps.push(b.exp2_f32(sh));
+                exps.push(if no_exp { sh } else { b.exp2_f32(sh) });
             }
             for e in &exps {
                 rsum = Some(match rsum {
@@ -6846,16 +6852,24 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let off = b.c_i32((hh as i32) * 8192 + 2048 * r + (e as i32) * 32);
                 addrs.push(b.add_i32(cx.tr_base, off));
             }
-            let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
-            b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
+            if !no_pv {
+                let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+                b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
+            }
         }
     }
     // all waves are done with this iteration's K/V; then publish the prefetched tile
     b.wait_lds(0);
-    b.barrier();
-    stage_stores(b, &pre);
+    if !no_bar {
+        b.barrier();
+    }
+    if !no_stage {
+        stage_stores(b, &pre);
+    }
     b.wait_lds(0);
-    b.barrier();
+    if !no_bar {
+        b.barrier();
+    }
     b.wait_lds(0);
 
     let it_next = b.add_i32(it, c1);
