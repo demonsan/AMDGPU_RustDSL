@@ -20,7 +20,8 @@ a=load(sys.argv[1]);b=load(sys.argv[2])
 print(len(a),len(b))
 n=0
 for i,(x,y) in enumerate(zip(a,b)):
-    if x[0].split()[0]!=y[0].split()[0]:
+    nm=lambda s: re.sub(r'_e(32|64)$','',s.split()[0])
+    if nm(x[0])!=nm(y[0]):
         print("MISMATCH at",i,x[0],y[0]);break
     if y[1]<x[1] or (set(x[2])-set(y[2])):
         n+=1
