@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **separate A/B steady loops (block 512)** | `probe_fp8_fmha_abloops`: waves 0-3 and 4-7 each run their own steady loop with its own backedge (A copies K, B copies V, both compute their own query tile) and the same four collective barriers per iteration plus one in the epilogue (12 static `s_barrier`, 4 branches, 208 VGPRs); all 8 waves match the host emulation -> `PROBE_FMHA_MULTIWAVE_OK` |
 | **role-split producer/consumer attention (block 512)** | `probe_fp8_fmha_pingpong`: waves 0-3 (role A) copy the next K tile and waves 4-7 (role B) copy the next V tile into a double-buffered LDS region; the two role branches (begin_if/else on wave id) each end in the same workgroup barrier (8 static `s_barrier`, 3 branches); every wave reads its fragments with `ds_read_b128` + `cat_frag8`; all 8 waves match the host emulation (`2.1e-4`) -> `PROBE_FMHA_MULTIWAVE_OK` |
 | **eight-wave online-softmax attention (block 512)** | `probe_fp8_fmha_multiwave`: 512 threads, each wave owns one 32-row query tile and a private 8448 B LDS region, all waves share K/V tiles and run the same workgroup-barrier sequence; all 8 waves match the host emulation (`worst_err 2.1e-4`) -> `PROBE_FMHA_MULTIWAVE_OK` |
 | **online-softmax attention, O accumulator in registers** | `probe_fp8_fmha_oreg`: same algorithm with O as a loop-carried `Frag16`; each iteration rebuilds the fragment from lane values times the LDS-published row correction (new `Frag16Build` op) and feeds it back as the MFMA C input; bit-identical results to the LDS-accumulator version (`worst_err 1.8e-4` vs emulation) -> `PROBE_FMHA_ONLINE_OK` |
@@ -350,10 +351,28 @@ double-buffered LDS region by a producer/consumer split (role A = waves 0-3 copy
 = waves 4-7 copy V) and consumed with `ds_read_b128`; the barrier in each role branch is a
 distinct instruction that lands on the same collective phase.
 
-Remaining distance to the reference kernel: separate A/B *steady loops* (each role running
-its own backedge loop rather than one shared loop with a role branch), the four-phase
-barrier schedule with the `+0x80` KV progress updates, rollback exits, `ds_read_b64_tr_b8`
-and the reference tile shapes (hd128, tile Q 256, tile KV 128).
+Remaining distance to the reference kernel (after round 23 added separate A/B loops): the
+`+0x80` KV progress updates, rollback exits, `ds_read_b64_tr_b8` and the reference tile
+shapes (hd128, tile Q 256, tile KV 128).
+
+## Separate A/B loops and two lowering bugs (round 23)
+
+Giving each role its own loop (`probe_fp8_fmha_abloops`) failed at first with ~200 wrong
+elements per wave and run-to-run variation, which exposed two real compiler bugs in how
+lowering treats control flow:
+
+1. **Pending-wait state leaked across paths.** `pending_vmem/smem/lds` is a linear-lowering
+   set; a wait emitted in the then-branch cleared it, so the else-branch consumed the same
+   outstanding loads (the Q fragment) without any `s_waitcnt`. Lowering now drains all
+   pending loads at every control-flow edge (loop entry, break, backedge, `if`, `else`,
+   `endif`).
+2. **Constant and conversion caches were not region scoped.** A constant first materialised
+   inside role A's loop body was reused by role B's loop as if its `v_mov` had executed there.
+   `consts` and `converted` are now snapshotted at loop/if entry and restored at `else`,
+   `endif` and loop exit.
+
+After both fixes all 8 waves match (`per-wave bad: 0 0 0 0 0 0 0 0`), and the shared-loop
+variants still pass.
 
 ## Next: FMHA reference core loop
 
