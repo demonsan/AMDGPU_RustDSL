@@ -354,6 +354,17 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
             let ra = range(phys, m, a);
             let rb = range(phys, m, b_src);
             let rc = range(phys, m, c);
+            // ISA: operands are contiguous and the base register is aligned to
+            // the operand width (and at least even aligned).
+            for (name, r) in [("A", ra), ("B", rb), ("C/D", rd)] {
+                let width = r.1 - r.0;
+                if r.0 % width != 0 || r.0 % 2 != 0 {
+                    return Err(format!(
+                        "block {bi} inst {ii}: MFMA operand {name} at v{} is not aligned to its width {}",
+                        r.0, width
+                    ));
+                }
+            }
             // The accumulator is in-place (C == D on gfx9), so only A and B have
             // to stay clear of the destination.
             if rc != rd {

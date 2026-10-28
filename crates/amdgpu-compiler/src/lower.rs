@@ -773,6 +773,30 @@ impl Lowerer {
                 );
                 self.val.insert(dst, d);
             }
+            Op::CvtPknormU16(a, b) => {
+                let ra = self.as_v1(*a)?;
+                let rb = self.as_v1(*b)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(
+                    MInst::new(MOp::VCvtPknormU16)
+                        .def(d)
+                        .srcreg(ra)
+                        .srcreg(rb),
+                );
+                self.val.insert(dst, d);
+            }
+            Op::CvtScalef32PkFp8Bf16 { old, src, scale, high } => {
+                let ro = self.as_v1(*old)?;
+                let rs = self.as_v1(*src)?;
+                let rsc = self.as_v1(*scale)?;
+                let d = self.new_vreg(RClass::V1);
+                // The instruction only overwrites one 16-bit half of the
+                // destination, so seed it with the previous value first.
+                self.push(MInst::new(MOp::VMovB32).def(d).srcreg(ro));
+                let op = if *high { MOp::VCvtPkFp8Hi } else { MOp::VCvtPkFp8Lo };
+                self.push(MInst::new(op).def(d).srcreg(rs).srcreg(rsc));
+                self.val.insert(dst, d);
+            }
             Op::CatFrag8(lo, hi) => {
                 let lo_r = self.as_v4(*lo)?;
                 let hi_r = self.as_v4(*hi)?;

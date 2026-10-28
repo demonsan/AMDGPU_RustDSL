@@ -190,6 +190,11 @@ pub enum Op {
     Frag8(Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd),
     /// Concatenate two four-dword fragments into an eight-dword fragment.
     CatFrag8(Opnd, Opnd),
+    /// Pack two f32 values into two unsigned-normalized 16-bit values (low = a).
+    CvtPknormU16(Opnd, Opnd),
+    /// Scale two bf16 values and pack them into two fp8 values, replacing one
+    /// 16-bit half of old (high selects the upper half).
+    CvtScalef32PkFp8Bf16 { old: Opnd, src: Opnd, scale: Opnd, high: bool },
     /// `v_mfma_scale_f32_32x32x64_f8f6f4`: block-scaled fp8 MFMA. The two scale
     /// operands are E8M0 exponents in scalar registers.
     MfmaScaleFp8_32x32x64 { a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
@@ -225,6 +230,7 @@ impl Op {
             Op::MfmaFp8_32x32x16 { .. } => DType::Frag16,
             Op::Frag8(..) => DType::Frag8,
             Op::CatFrag8(..) => DType::Frag8,
+            Op::CvtPknormU16(..) | Op::CvtScalef32PkFp8Bf16 { .. } => DType::U32,
             Op::MfmaScaleFp8_32x32x64 { .. } => DType::Frag16,
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
@@ -270,6 +276,8 @@ impl Op {
             Op::MfmaFp8_32x32x16 { a, b, c } => vec![*a, *b, *c],
             Op::Frag8(a, b, c, d, e, f, g, h) => vec![*a, *b, *c, *d, *e, *f, *g, *h],
             Op::CatFrag8(a, b) => vec![*a, *b],
+            Op::CvtPknormU16(a, b) => vec![*a, *b],
+            Op::CvtScalef32PkFp8Bf16 { old, src, scale, .. } => vec![*old, *src, *scale],
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 vec![*a, *b, *c, *scale_a, *scale_b]
             }
@@ -642,6 +650,28 @@ impl FnBuilder {
 
     #[allow(clippy::too_many_arguments)]
     /// Concatenate two Frag4 values into a Frag8 (low half first).
+    /// Pack two f32 into two unsigned-normalized 16-bit values.
+    pub fn cvt_pknorm_u16_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CvtPknormU16(a.into(), b.into()))
+    }
+
+    /// Scale two bf16 and pack into fp8, writing one 16-bit half of old.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cvt_scalef32_pk_fp8_bf16(
+        &mut self,
+        old: impl Into<Opnd>,
+        src: impl Into<Opnd>,
+        scale: impl Into<Opnd>,
+        high: bool,
+    ) -> ValueId {
+        self.let_(Op::CvtScalef32PkFp8Bf16 {
+            old: old.into(),
+            src: src.into(),
+            scale: scale.into(),
+            high,
+        })
+    }
+
     pub fn cat_frag8(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CatFrag8(lo.into(), hi.into()))
     }
@@ -970,6 +1000,24 @@ pub fn verify(f: &Function) -> Vec<String> {
                         }
                     }
                     Op::FragZero { .. } => {}
+                    Op::CvtPknormU16(a, b) => {
+                        for o in [a, b] {
+                            if let Err(e) = expect_float(f, *o, "pknorm") {
+                                errs.push(here(e));
+                            }
+                        }
+                    }
+                    Op::CvtScalef32PkFp8Bf16 { old, src, scale, .. } => {
+                        if let Err(e) = expect_int(f, *old, "pack fp8 destination") {
+                            errs.push(here(e));
+                        }
+                        if let Err(e) = expect_int(f, *src, "pack fp8 source") {
+                            errs.push(here(e));
+                        }
+                        if let Err(e) = expect_float(f, *scale, "pack fp8 scale") {
+                            errs.push(here(e));
+                        }
+                    }
                     Op::CatFrag8(a, b) => {
                         for o in [a, b] {
                             match opnd_ty(f, *o) {

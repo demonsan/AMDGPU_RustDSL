@@ -125,7 +125,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_ab_loops") == 0 ||
                              std::strcmp(kern, "probe_nested_acc") == 0 ||
                              std::strcmp(kern, "probe_loop_mfma") == 0 ||
-                             std::strcmp(kern, "probe_fmha_core") == 0;
+                             std::strcmp(kern, "probe_fmha_core") == 0 ||
+                             std::strcmp(kern, "probe_pack") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -296,6 +297,19 @@ int main(int argc, char** argv) {
                     partner_bad, bits[0], bits[128]);
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
+    }
+    if (std::strcmp(kern, "probe_pack") == 0) {
+        unsigned int bits[3072] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
+        std::printf("  pack pknorm=0x%08x lo=0x%08x hi=0x%08x\n", bits[0], bits[1024], bits[2048]);
+        int pack_bad = 0;
+        if (bits[0] != 0x8000FFFFu) ++pack_bad;
+        if ((bits[1024] & 0x0000FFFFu) != 0x3838u) ++pack_bad;
+        if ((bits[1024] & 0xFFFF0000u) != 0xAAAA0000u) ++pack_bad;
+        if ((bits[2048] & 0xFFFF0000u) != 0x38380000u) ++pack_bad;
+        if ((bits[2048] & 0x0000FFFFu) != 0x0000AAAAu) ++pack_bad;
+        std::printf(pack_bad ? "PROBE_PACK_FAIL\n" : "PROBE_PACK_OK\n");
+        return pack_bad != 0;
     }
     if (std::strcmp(kern, "probe_fmha_core") == 0) {
         // Two A/B phases per iteration x 2 iterations, K = 64 each: 128.0.
