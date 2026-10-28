@@ -500,17 +500,16 @@ pub fn probe_lds_own() -> Function {
     let off = b.mul_i32(tid, c4);
     b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
     b.wait_lds(0);
-    let raw = b.load_lds_b32(Opnd::Val(off));
-    let value = b.bitcast_f32(raw);
-    // Diagnostic split: o[tid] gets a constant (does the store path work?),
-    // o[64+tid] gets the value read back from this lane's own LDS slot.
+    let raw1 = b.load_lds_b32(Opnd::Val(off));
+    let raw2 = b.load_lds_b32(Opnd::Val(off));
+    let value1 = b.bitcast_f32(raw1);
+    let value2 = b.bitcast_f32(raw2);
     let out_ptr = b.ptr_add(o, off);
-    let c42 = b.c_f32(42.0);
-    b.store_f32(out_ptr, 0, c42);
+    b.store_f32(out_ptr, 0, value1);
     let c64 = b.c_i32(64);
     let out2_index = b.add_i32(tid, c64);
     let out2_off = b.mul_i32(out2_index, c4);
     let out2_ptr = b.ptr_add(o, out2_off);
-    b.store_f32(out2_ptr, 0, value);
+    b.store_f32(out2_ptr, 0, value2);
     b.finish()
 }
