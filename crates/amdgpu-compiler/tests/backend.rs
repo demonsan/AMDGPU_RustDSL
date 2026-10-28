@@ -247,3 +247,28 @@ fn constants_are_materialised_on_every_path() {
         "the constant must be materialised in both branches:\n{asm}"
     );
 }
+
+/// Round 39: a stalled consumer of a transcendental result is no longer padded with `s_nop` when
+/// independent ALU instructions follow it; they are moved into the gap.
+#[test]
+fn hazard_gaps_are_filled_with_independent_work() {
+    use amdgpu_dsl::{DType, FnBuilder, Op};
+    let mut b = FnBuilder::new("gap_fill", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let a = b.load_f32(o, 0);
+    let c = b.load_f32(o, 4);
+    let e = b.exp_f32(a);
+    let y = b.mul_f32(e, a); // consumer right behind the transcendental
+    let z1 = b.add_f32(c, c);
+    let z2 = b.add_f32(z1, c);
+    let z3 = b.add_f32(z2, c);
+    b.store_f32(o, 8, y);
+    b.store_f32(o, 12, z3);
+    let asm = compile(&b.finish()).expect("compiles").asm;
+    let exp_pos = asm.find("v_exp_f32").expect("exp emitted");
+    let tail = &asm[exp_pos..];
+    let first_mul = tail.find("v_mul_f32").expect("consumer emitted");
+    let first_add = tail.find("v_add_f32").expect("independent work emitted");
+    assert!(first_add < first_mul, "independent adds must fill the gap before the consumer:\n{asm}");
+}
