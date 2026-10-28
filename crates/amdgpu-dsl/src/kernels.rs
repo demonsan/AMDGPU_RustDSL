@@ -7361,9 +7361,12 @@ pub fn sched_mfma_chain() -> Function {
     let ones = b.c_i32(0x38383838_u32 as i32);
     let f4 = b.frag4(ones, ones, ones, ones);
     let a8 = b.cat_frag8(f4, f4);
+    let twos = b.c_i32(0x40404040_u32 as i32);
+    let f4b = b.frag4(twos, twos, twos, twos);
+    let b8 = b.cat_frag8(f4b, f4b);
     let zero = b.frag_zero(DType::Frag16);
     let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::Frag16, Opnd::Val(zero))]);
-    b.var_mfma_scale(vars[1], a8, a8, 127, 127);
+    b.var_mfma_scale(vars[1], a8, b8, 127, 127);
     sched_end_loop(&mut b, vars[0], n);
     let off = b.mul_i32(tid, c64);
     let row = b.ptr_add(o, off);
@@ -7385,12 +7388,15 @@ fn sched_mfma_valu_kernel(name: &str, lanes: u8) -> Function {
     let ones = b.c_i32(0x38383838_u32 as i32);
     let f4 = b.frag4(ones, ones, ones, ones);
     let a8 = b.cat_frag8(f4, f4);
+    let twos = b.c_i32(0x40404040_u32 as i32);
+    let f4b = b.frag4(twos, twos, twos, twos);
+    let b8 = b.cat_frag8(f4b, f4b);
     let zf = b.c_f32(0.0);
     let zi = b.bitcast_i32(zf);
     let m = b.c_f32(1.5);
     let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(zi))]);
     let zero = b.frag_zero(DType::Frag16);
-    let s = b.mfma_scale_fp8(a8, a8, zero, 127, 127);
+    let s = b.mfma_scale_fp8(a8, b8, zero, 127, 127);
     let mut sum = b.bitcast_f32(vars[1]);
     for r in 0..lanes {
         let l = b.frag16_lane(s, r);
