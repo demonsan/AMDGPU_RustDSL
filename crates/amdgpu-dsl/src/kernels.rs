@@ -7093,7 +7093,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// LDS row pitch (bytes) of the K/V tiles of the transposed FMHA kernel (env FMHA_PITCH, read at
 /// build time, for bank-conflict experiments; default 144: 16-byte aligned and conflict-free enough, 128 = unpadded).
 fn fmha_t_opt(name: &str) -> bool {
-    let v = std::env::var("FMHA_OPT").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "cvt4,pksub".to_string());
+    let v = std::env::var("FMHA_OPT").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "cvt4,pksub,lazy,msum,permlane".to_string());
     v.split(',').any(|x| x == name)
 }
 
