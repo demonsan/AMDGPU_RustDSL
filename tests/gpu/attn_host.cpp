@@ -259,7 +259,7 @@ int main(int argc, char** argv) {
                 ++lds_bad;
             }
         }
-        std::printf("  roles marker_bad=%d lds_bad=%d  o[0]=%.1f o[64]=%.1f o[512]=%.1f o[576]=%.1f\n",
+        int self_bad = 0;`n        for (int tid = 0; tid < 512; ++tid) {`n            if (std::fabs(vals[512 + tid] - (float)tid) > 0.5f) {`n                ++self_bad;`n            }`n        }`n        std::printf("  roles self_bad=%d\\n", self_bad);`n        std::printf("  roles marker_bad=%d lds_bad=%d  o[0]=%.1f o[64]=%.1f o[512]=%.1f o[576]=%.1f\\n",
                     marker_bad, lds_bad, vals[0], vals[64], vals[512], vals[576]);
         for (int w = 0; w < 8; ++w) {
             std::printf("    wave %d marker=%.1f lds=%.1f\n", w, vals[w * 64], vals[512 + w * 64]);

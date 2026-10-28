@@ -437,8 +437,15 @@ pub fn probe_roles() -> Function {
     b.store_f32(ptr, 0, Opnd::Val(marker_b));
     b.end_if();
 
-    // Phase 2: LDS exchange across roles.
+    // Phase 2: write, read back the own slot (no barrier yet), then exchange.
     b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
+    b.wait_lds(0);
+    let own = b.load_lds_b32(Opnd::Val(off));
+    let own_value = b.bitcast_f32(own);
+    let own_index = b.add_i32(tid, c512);
+    let own_out_off = b.mul_i32(own_index, c4);
+    let own_ptr = b.ptr_add(o, own_out_off);
+    b.store_f32(own_ptr, 0, own_value);
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
