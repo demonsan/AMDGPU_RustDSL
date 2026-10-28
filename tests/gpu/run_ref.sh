@@ -5,10 +5,11 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 REF_CO="${REF_CO:?set REF_CO to the vendor fwd_hd128_mxfp8.co}"
+OUR_KERNEL="${OUR_KERNEL:-fmha_fwd_hd128_mxfp8}"
 cd "$REPO"; mkdir -p build
-bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8 --out /work/build/fmha_fwd_hd128_mxfp8.s
+bash tools/container/cargo.sh run -q --bin amdc -- emit "$OUR_KERNEL" --out "/work/build/$OUR_KERNEL.s"
 "$ROC/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
-    -o build/fmha_ours.co build/fmha_fwd_hd128_mxfp8.s
+    -o build/fmha_ours.co "build/$OUR_KERNEL.s"
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/ref_host.cpp -o build/ref_host \
     -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib"
 rc=0
@@ -16,7 +17,7 @@ for CFG in "1 1 256 256" "1 2 512 512" "2 4 1024 1024" "1 8 2048 2048" "1 2 512 
     set -- $CFG
     echo "=== B=$1 H=$2 S=$3 SK=$4"
     REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_ROWS="${REF_ROWS:-16}" REF_ITERS="${REF_ITERS:-20}" \
-        REF_CO2=build/fmha_ours.co HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
+        REF_CO2=build/fmha_ours.co REF_KNAME2="$OUR_KERNEL" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
         ./build/ref_host "$REF_CO" 2>&1 | grep -E "vs|timing|REF_" || rc=1
 done
 exit $rc
