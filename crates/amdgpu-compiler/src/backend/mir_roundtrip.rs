@@ -248,8 +248,40 @@ fn parse_at(lines: &[&str], i: usize, st: &mut Stats) -> (Inst, usize) {
     }
 }
 
+/// How much information the printed MIR keeps.
+/// * `Identity`: everything (structure round trip only).
+/// * `Flags`: drop register flags our exporter never writes (`killed dead undef renamable internal`).
+/// * `All`: additionally drop instruction flags, memory operands and debug locations, i.e. the
+///   information level of MIR as our exporter writes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Level {
+    Identity,
+    Flags,
+    All,
+}
+
+fn degrade(i: &mut Inst, lv: Level) {
+    if lv == Level::Identity || i.raw.is_some() {
+        return;
+    }
+    let strip = |o: &mut Operand| o.flags.retain(|f| !matches!(f.as_str(), "killed" | "dead" | "undef" | "renamable" | "internal"));
+    i.defs.iter_mut().for_each(strip);
+    i.ops.iter_mut().for_each(strip);
+    if lv == Level::All {
+        i.iflags.clear();
+        i.suffix.clear();
+    }
+    for c in i.children.iter_mut() {
+        degrade(c, lv);
+    }
+}
+
 /// Rewrite the bodies of a whole test file.
 pub fn roundtrip_text(text: &str) -> (String, Stats) {
+    roundtrip_text_level(text, Level::Identity)
+}
+
+pub fn roundtrip_text_level(text: &str, lv: Level) -> (String, Stats) {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut out: Vec<String> = Vec::new();
     let mut st = Stats { files: 1, ..Default::default() };
@@ -268,8 +300,9 @@ pub fn roundtrip_text(text: &str) -> (String, Stats) {
             let body = &lines[start..i];
             let mut j = 0;
             while j < body.len() {
-                let (inst, nj) = parse_at(body, j, &mut st);
+                let (mut inst, nj) = parse_at(body, j, &mut st);
                 let orig = body[j..nj].join("\n");
+                degrade(&mut inst, lv);
                 let printed = inst.print().join("\n");
                 if printed != orig {
                     st.changed_lines += 1;

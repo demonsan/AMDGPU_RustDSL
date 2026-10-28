@@ -92,7 +92,13 @@ fn mir_roundtrip_cmd(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let (out, st) = amdgpu_compiler::backend::mir_roundtrip::roundtrip_text(&text);
+    use amdgpu_compiler::backend::mir_roundtrip::Level;
+    let lv = match args.get(3).map(|s| s.as_str()) {
+        Some("--level=flags") => Level::Flags,
+        Some("--level=all") => Level::All,
+        _ => Level::Identity,
+    };
+    let (out, st) = amdgpu_compiler::backend::mir_roundtrip::roundtrip_text_level(&text, lv);
     if let Err(e) = fs::write(o, out) {
         eprintln!("{o}: {e}");
         return ExitCode::from(1);
