@@ -89,7 +89,8 @@ int main(int argc, char** argv) {
     unsigned char args[656];
     std::memset(args, 0, sizeof(args));
     put64(args, 0x000, dout); put64(args, 0x010, dq); put64(args, 0x020, dk); put64(args, 0x030, dv);
-    uint32_t sbits; std::memcpy(&sbits, &softmax_scale, 4);
+    float passed_scale = softmax_scale * (std::getenv("REF_SCALE_MUL") ? (float)std::atof(std::getenv("REF_SCALE_MUL")) : 1.0f);
+    uint32_t sbits; std::memcpy(&sbits, &passed_scale, 4);
     put32(args, 0x050, sbits);
     put32(args, 0x060, S);
     put32(args, 0x070, H * D);                 // Q seq stride (bytes)
