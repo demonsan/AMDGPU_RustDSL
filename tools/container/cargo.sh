@@ -13,5 +13,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host \
     -v "$TARGET:/target:Z" \
     -e CARGO_TARGET_DIR=/target \
     -e FMHA_ABLATE="${FMHA_ABLATE:-}" \
+    -e FMHA_PITCH="${FMHA_PITCH:-}" \
+    -e FMHA_OPT="${FMHA_OPT:-}" \
     -w /work \
     amd-rust-dsl:1 cargo "$@"
