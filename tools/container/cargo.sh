@@ -23,5 +23,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e AMDC_TEST_KERNELS="${AMDC_TEST_KERNELS:-}" \
     -e AMDC_KEEP_MIR="${AMDC_KEEP_MIR:-}" \
     -e AMDC_LLC_ARGS="${AMDC_LLC_ARGS:-}" \
+    -e AMDC_SCHED="${AMDC_SCHED:-}" \
+    -e AMDC_SCHED_OPTS="${AMDC_SCHED_OPTS:-}" \
     -w /work \
     amd-rust-dsl:1 cargo "$@"
