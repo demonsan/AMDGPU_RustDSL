@@ -169,6 +169,16 @@ int main(int argc, char** argv) {
                     in[2048 + i * 64 + k] = (k < 32) ? 0x38 : 0x00;
                     continue;
                 }
+                if (fp8_test == 6) {
+                    in[i * 64 + k] = 0x38;
+                    in[2048 + i * 64 + k] = (k >= 32) ? 0x38 : 0x00;
+                    continue;
+                }
+                if (fp8_test == 7) {
+                    in[i * 64 + k] = 0x38;
+                    in[2048 + i * 64 + k] = 0x38;
+                    continue;
+                }
                 in[i * 64 + k] = v;
                 in[2048 + i * 64 + k] = v;
             }
@@ -185,6 +195,12 @@ int main(int argc, char** argv) {
             } else if (fp8_test == 5) {
                 sa = (unsigned char)(127 + (l % 8));
                 sb = 127;
+            } else if (fp8_test == 6) {
+                sa = (unsigned char)((l < 32) ? 127 : (128 + (l % 4)));
+                sb = 127;
+            } else if (fp8_test == 7) {
+                sa = 127;
+                sb = (unsigned char)((l < 32) ? 127 : 128);
             }
             in[4096 + l * 4] = sa;
             in[4352 + l * 4] = sb;
@@ -433,6 +449,10 @@ int main(int argc, char** argv) {
                     want_d = 64.0 * (double)(1 << (((i & 1) + (j & 1))));
                 } else if (fp8_test == 5) {
                     want_d = 32.0 * (double)(1 << (i % 8));
+                } else if (fp8_test == 6) {
+                    want_d = 32.0 * (double)(1 << (1 + (i % 4)));
+                } else if (fp8_test == 7) {
+                    want_d = 96.0;
                 } else {
                     want_d = 0.0;
                     for (int kb = 0; kb < 2; ++kb) {
