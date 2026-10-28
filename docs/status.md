@@ -641,6 +641,22 @@ kernel on every output (mean difference 1.3-2.8e-3; SK = 1 is bit-identical to t
 
 Remaining differences from the vendor kernel's feature set: no LSE output.
 
+## Partial `vmcnt` waits and a negative result (round 36)
+
+Global loads complete in issue order, so the lowering now waits for the newest load that feeds an operand
+with `s_waitcnt vmcnt(n)`, where `n` is the number of loads issued after it (instead of always `vmcnt(0)`),
+and keeps the later loads pending. It also gained `var_load_b128`, a 16-byte global load written directly
+into a `Frag4` loop variable (the loop back edge still drains everything). Neither changes the existing
+kernels' output.
+
+Hypothesis tested and rejected: that the K scale dword loads issued *after* the prefetch force a full wait for
+the prefetch. Hoisting the four K scale loads in front of the prefetch (so their `vmcnt(4)` leaves the prefetch
+in flight) made the kernel slower (224 VGPRs, 190 -> 167 TFLOP/s) and was reverted; the 15-shape comparison
+stayed green throughout. Together with the ablation study of round 34 this says the loop is bound by the
+dependency structure of the S path and by instruction issue rather than by memory latency, so the next
+real step would be restructuring the schedule across the two waves of a SIMD (the reference kernel's
+ping-pong), which is beyond what the unscheduled linear lowering can express.
+
 ## Next: FMHA reference core loop
 
 1. Resolve the 16 KB LDS question above (needed before scaling the core loop).
