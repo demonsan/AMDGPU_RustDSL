@@ -38,8 +38,13 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
     let mut end = vec![0usize; n];
 
     let mut idx_of: Vec<Vec<usize>> = Vec::with_capacity(m.blocks.len());
+    // Linear position of each block's first slot. An empty block still sits at a definite
+    // position; using 0 for it would stretch every value live across it back to the start of
+    // the function.
+    let mut block_start: Vec<usize> = Vec::with_capacity(m.blocks.len());
     let mut next = 0usize;
     for b in &m.blocks {
+        block_start.push(next);
         let mut v = Vec::with_capacity(b.insts.len());
         for _ in 0..b.insts.len() {
             v.push(next);
@@ -147,7 +152,7 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
             }
         }
         // Values live across the block boundary are live at block entry.
-        let entry = idx_of[bi].first().copied().unwrap_or(0);
+        let entry = idx_of[bi].first().copied().unwrap_or(block_start[bi]);
         let snapshot: Vec<VReg> = live.iter().copied().collect();
         for r in snapshot {
             bump(r, entry, &mut start, &mut end);
@@ -162,7 +167,7 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
             (Some(h), Some(l)) => (*h, *l),
             _ => continue,
         };
-        let latch_end = idx_of[lb].last().copied().unwrap_or(0);
+        let latch_end = idx_of[lb].last().copied().unwrap_or(block_start[lb]);
         let vals: Vec<VReg> = live_in[hb].iter().copied().collect();
         for r in vals {
             if latch_end > end[r as usize] {
