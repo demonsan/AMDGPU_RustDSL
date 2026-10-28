@@ -226,7 +226,10 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
             let wide: Vec<String> = active
                 .iter()
                 .filter(|(_, _, ac)| ac.dwords() >= 8)
-                .map(|(ae, ar, ac)| format!("r{ar}:{ac:?}@{}..{ae}", start[*ar as usize]))
+                .map(|(ae, ar, ac)| {
+                    let first_block = (0..m.blocks.len()).find(|bi| live_in[*bi].contains(ar));
+                    format!("r{ar}:{ac:?}@{}..{ae} livein_first_block={first_block:?}", start[*ar as usize])
+                })
                 .collect();
             format!(
                 "out of VGPRs allocating r{r} ({c:?}, live {}..{}); wide {wide:?}; map {map}; {} live vregs holding {} dwords \
