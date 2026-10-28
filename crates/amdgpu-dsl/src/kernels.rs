@@ -1389,10 +1389,9 @@ pub fn probe_fp8_softmax() -> Function {
     for r in 0..16u8 {
         let i_const = ((r / 4) * 8 + (r % 4)) as i32;
         let lane = b.frag16_lane(d, r);
-        let v = b.bitcast_f32(lane);
         let coff = b.c_i32(i_const * 128);
         let addr = b.add_i32(lds_base, coff);
-        b.store_lds_b32(Opnd::Val(addr), Opnd::Val(v));
+        b.store_lds_b32(Opnd::Val(addr), Opnd::Val(lane));
     }
     b.wait_lds(0);
     b.barrier();
