@@ -88,6 +88,11 @@ SAddcU32    | S1 <- S1 S1 | {d} = S_ADDC_U32 {s0}, {s1}, implicit-def $scc, impl
 SMulI32     | S1 <- S1 S1 | {d} = S_MUL_I32 {s0}, {s1}
 SShlB32     | S1 <- S1 I  | {d} = S_LSHL_B32 {s0}, {s1}, implicit-def $scc
 SCmpLtI32   | <- S1 S1 | S_CMP_LT_I32 {s0}, {s1}, implicit-def $scc
+VCvtPkFp8F32Hi | V1 <- V1 V1 | {d} = nofpexcept V_CVT_PK_FP8_F32_e64 8, {s0}, 0, {s1}, {d}(tied-def 0), 4, implicit $mode, implicit $exec
+VPkAddF32   | V2 <- V2 V2 | {d} = nofpexcept V_PK_ADD_F32 8, {s0}, 8, {s1}, 0, 0, -1, 0, 0, implicit $mode, implicit $exec
+VPkMulF32   | V2 <- V2 V2 | {d} = nofpexcept V_PK_MUL_F32 8, {s0}, 8, {s1}, 0, 0, -1, 0, 0, implicit $mode, implicit $exec
+VPermlane32Swap | V1 <- V1 V1 | {s0}, {s1} = V_PERMLANE32_SWAP_B32_e32 {s0}(tied-def 0), {s1}(tied-def 1), implicit $exec
+SSetPrio    | <- | S_SETPRIO {imm}
 SNop        | <- | DROP
 SWaitVm     | <- | S_WAITCNT {vmcnt}
 SWaitLgkm   | <- | S_WAITCNT {lgkmcnt}
