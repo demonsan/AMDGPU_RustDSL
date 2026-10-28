@@ -114,7 +114,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_mfma_fp8") == 0 ||
                              std::strcmp(kern, "probe_mfma_scale") == 0 ||
                              std::strcmp(kern, "probe_roles") == 0 ||
-                             std::strcmp(kern, "probe_waves2") == 0;
+                             std::strcmp(kern, "probe_waves2") == 0 ||
+                             std::strcmp(kern, "hw_roles") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -283,6 +284,24 @@ int main(int argc, char** argv) {
                     partner_bad, vals[0], vals[128]);
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
+    }
+    if (std::strcmp(kern, "hw_roles") == 0) {
+        // Hand-written kernel: o[tid] must equal tid for every lane.
+        float vals[128] = {0.0f};
+        std::memcpy(vals, got.data(), sizeof(vals));
+        int hw_bad = 0;
+        for (int tid = 0; tid < 128; ++tid) {
+            if (std::fabs(vals[tid] - (float)tid) > 0.5f) {
+                if (hw_bad < 6) {
+                    std::fprintf(stderr, "hw_roles mismatch tid=%d got=%.1f\n", tid, vals[tid]);
+                }
+                ++hw_bad;
+            }
+        }
+        std::printf("  hw_roles bad=%d sample=%.1f %.1f %.1f %.1f\n", hw_bad, vals[0], vals[1],
+                    vals[64], vals[65]);
+        std::printf(hw_bad ? "HW_ROLES_FAIL\n" : "HW_ROLES_OK\n");
+        return hw_bad != 0;
     }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,
