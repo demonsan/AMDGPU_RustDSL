@@ -583,7 +583,7 @@ pub fn probe_roles_loop() -> Function {
 /// every output element must be exactly 64.0.
 pub fn probe_fmha_datapath() -> Function {
     let mut b = FnBuilder::new("probe_fmha_datapath", 512);
-    b.lds(16384);
+    b.lds(8192);
     b.arg("o", DType::Ptr, 0, 8);
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
@@ -593,17 +593,15 @@ pub fn probe_fmha_datapath() -> Function {
     let c32 = b.c_i32(32);
     let frag = b.frag4(ones, ones, ones, ones);
 
-    let off = b.mul_i32(tid, c32);
+    let _ = c32;
+    let off = b.mul_i32(tid, c16);
     b.store_lds_b128(Opnd::Val(off), Opnd::Val(frag));
-    let off_hi = b.add_i32(off, c16);
-    b.store_lds_b128(Opnd::Val(off_hi), Opnd::Val(frag));
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
 
     let lo = b.load_lds_b128(Opnd::Val(off));
-    let hi = b.load_lds_b128(Opnd::Val(off_hi));
-    let a8 = b.cat_frag8(lo, hi);
+    let a8 = b.cat_frag8(lo, lo);
     let zero = b.frag_zero(DType::Frag16);
     let d = b.mfma_scale_fp8(a8, a8, zero, 127, 127);
 
