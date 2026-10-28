@@ -119,6 +119,11 @@ for name,p in (("identity/original CHECK","lit-identity-check"),("identity/diffe
     open(o+"/failing-%s.txt"%p,"w").write("\n".join(n.split("::")[-1].strip() for n in reg)+"\n")
 EOF
 fi
+if [ "$WHAT" = census ] || [ "$WHAT" = all ]; then
+    echo "== census of test/CodeGen/AMDGPU/*.mir"
+    python3 "$REPO/tools/mir_census.py" "$LLVM_SRC/llvm/$TEST_SUB" | tee "$OUT/census.txt"
+fi
+
 if [ "$WHAT" = table ] || [ "$WHAT" = all ]; then
     echo "== opcode table vs LLVM's own MIR"
     selected_tests > "$OUT/selected.txt"
