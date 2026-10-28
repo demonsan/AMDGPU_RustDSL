@@ -23,7 +23,7 @@ VPtrAdd:rr  | V2 <- V2 V1 | {d.0} = V_ADD_CO_U32_e32 {s1}, {s0.0}, implicit-def 
 VPtrAdd:ri  | V2 <- V2 I | {d.0}, $vcc = V_ADD_CO_U32_e64 {s0.0}, {s1}, 0, implicit $exec ;; {d.1}, $vcc = V_ADDC_U32_e64 {s0.1}, 0, $vcc, 0, implicit $exec
 VReadPhys   | V1 <-    | {d} = V_MOV_B32_e32 {pv}, implicit $exec
 VReadFirstLane | S1 <- V1 | {d} = V_READFIRSTLANE_B32 {s0}, implicit $exec
-VCvtPknormU16 | V1 <- V1 V1 | {d} = nofpexcept V_CVT_PKNORM_U16_F32_e64 0, {s0}, 0, {s1}, 0, 0, implicit $mode, implicit $exec
+VCvtPknormU16 | V1 <- V1 V1 | {d} = nofpexcept V_CVT_PKNORM_U16_F32_e64 0, {s0}, 0, {s1}, 0, implicit $mode, implicit $exec
 VCvtPkFp8F32 | V1 <- V1 V1 | {d} = nofpexcept V_CVT_PK_FP8_F32_e64 0, {s0}, 0, {s1}, {d}(tied-def 0), 0, implicit $mode, implicit $exec
 VCvtPkBf16F32 | V1 <- V1 V1 | {d} = nofpexcept V_CVT_PK_BF16_F32_e64 0, {s0}, 0, {s1}, 0, 0, implicit $mode, implicit $exec
 VCvtPkFp8Lo | V1 <- V1 V1 | {d} = nofpexcept V_CVT_SCALEF32_PK_FP8_BF16_e64 0, {s0}, 0, {s1}, {d}(tied-def 0), 0, implicit $mode, implicit $exec
