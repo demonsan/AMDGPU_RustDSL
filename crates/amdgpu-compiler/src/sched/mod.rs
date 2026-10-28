@@ -29,6 +29,8 @@ pub struct Options {
     pub xbar_only: Option<usize>,
     /// Debug: full-drain waits only.
     pub drain_only: bool,
+    /// Debug bisect: schedule only this block index.
+    pub only_block: Option<usize>,
     /// Pressure limit in VGPR dwords (never below the original peak of the block).
     pub max_vgprs: u32,
     /// Run the verifiers (always on in tests).
@@ -38,7 +40,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, max_vgprs: 240, verify: true, stats: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, only_block: None, max_vgprs: 240, verify: true, stats: false }
     }
 }
 
@@ -59,6 +61,9 @@ impl Options {
                     "stats" => o.stats = true,
                     "drain" => o.drain_only = true,
                     _ => {
+                        if let Some(v) = t.strip_prefix("only=") {
+                            o.only_block = v.parse().ok();
+                        }
                         if let Some(v) = t.strip_prefix("xbar=") {
                             o.xbar_only = v.parse().ok();
                         }
@@ -102,7 +107,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         for bi in 0..m.blocks.len() {
             stats.blocks += 1;
             let insts = m.blocks[bi].insts.clone();
-            if insts.len() < 2 {
+            if insts.len() < 2 || o.only_block.map_or(false, |x| x != bi) {
                 continue;
             }
             // Explicit partial waits count outstanding operations by program order: do not touch.

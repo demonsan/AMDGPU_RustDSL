@@ -18,6 +18,7 @@ for V in $VARIANTS; do
   [ -z "$FIRST" ] && FIRST="$name"
   i=0
   for CFG in "${SHAPES[@]}"; do
+    if [ -n "${ONLY:-}" ] && ! echo " $ONLY " | grep -q " $i "; then i=$((i+1)); continue; fi
     set -- $CFG
     REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_HK=$(( $2 / $5 )) REF_ROWS=16 REF_ITERS=30 REF_CO2="build/ab/$name.co" REF_KNAME2="$K" \
       REF_DUMP2="build/ab/${name}_$i.bin" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/ref_host "$REF_CO" > "build/ab/${name}_$i.log" 2>&1
