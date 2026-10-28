@@ -487,7 +487,3 @@ pub fn probe_waves2() -> Function {
 
     b.finish()
 }
-
-fn c512_unused() -> i32 {
-    512
-}
