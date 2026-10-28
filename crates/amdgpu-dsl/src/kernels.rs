@@ -4963,7 +4963,6 @@ pub fn probe_fp8_fmha_hd128() -> Function {
         }
         p8.push(b.frag8(sel[0], sel[1], sel[2], sel[3], sel[4], sel[5], sel[6], sel[7]));
     }
-    let mut new_o: Vec<ValueId> = Vec::with_capacity(4);
     for e in 0..4usize {
         let mut scaled: Vec<ValueId> = Vec::with_capacity(16);
         for r in 0..16u8 {
@@ -4985,7 +4984,7 @@ pub fn probe_fp8_fmha_hd128() -> Function {
             let v8 = b.frag8(vw[0], vw[1], vw[2], vw[3], vw[4], vw[5], vw[6], vw[7]);
             acc = b.mfma_scale_fp8(p8[hh], v8, acc, c127, c123);
         }
-        new_o.push(acc);
+        b.set_var(o_vars[e], acc);
     }
     b.wait_lds(0);
     b.barrier();
@@ -4997,9 +4996,6 @@ pub fn probe_fp8_fmha_hd128() -> Function {
     let l_bits = b.bitcast_i32(l_new);
     b.set_var(m_var, m_bits);
     b.set_var(l_var, l_bits);
-    for e in 0..4usize {
-        b.set_var(o_vars[e], new_o[e]);
-    }
     let more = b.cmp_lt_i32(it_next, c2);
     let stop = b.let_(Op::NotI1(Opnd::Val(more)));
     b.break_if(Opnd::Val(stop));
