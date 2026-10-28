@@ -6834,7 +6834,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             // v_max3_f32 folds two new values per instruction
             let mut mloc = b.max3_f32(flat[0], flat[1], flat[2]);
             let mut k = 3usize;
-            while k + 1 < flat.len() {
+            while k + 1 < flat.len() && !fmha_t_opt("abl_max") {
                 mloc = b.max3_f32(mloc, flat[k], flat[k + 1]);
                 k += 2;
             }
@@ -6882,17 +6882,21 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     }
                 } else {
                     for r in 0..16usize {
-                        let sh = b.sub_f32(sv[sl][r], m4);
+                        let sh = if fmha_t_opt("abl_sub") { sv[sl][r] } else { b.sub_f32(sv[sl][r], m4) };
                         exps.push(if no_exp { sh } else { b.exp2_f32(sh) });
                     }
                 }
-                for e in &exps {
+                for e in exps.iter().take(if fmha_t_opt("abl_sum") { 1 } else { 16 }) {
                     rsum = Some(match rsum {
                         None => *e,
                         Some(acc) => b.add_f32(acc, *e),
                     });
                 }
                 for m in 0..4usize {
+                    if fmha_t_opt("abl_cvt") {
+                        words.push(b.bitcast_i32(exps[4 * m]));
+                        continue;
+                    }
                     if fmha_t_opt("cvt4") {
                         words.push(b.cvt_pk_fp8x4_f32(exps[4 * m], exps[4 * m + 1], exps[4 * m + 2], exps[4 * m + 3]));
                         continue;
@@ -6919,6 +6923,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             for e in 0..4usize {
                 // in place: O *= corr, then O += V^T P^T (no copies)
                 match corr_dup {
+                    _ if fmha_t_opt("abl_rescale") => {}
                     Some(cd) => b.var_scale_pk(o_vars[e], cd),
                     None => b.var_scale_f32(o_vars[e], corr),
                 }
