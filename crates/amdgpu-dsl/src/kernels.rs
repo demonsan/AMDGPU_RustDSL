@@ -732,7 +732,7 @@ pub fn probe_ab_loops() -> Function {
     // Store the final accumulator: o[tid*4] (raw bits).
     let out_off = b.mul_i32(tid, c4);
     let out_ptr = b.ptr_add(o, out_off);
-    let value = b.bitcast_f32(Opnd::Val(acc));
+    let value = b.bitcast_f32(acc);
     b.store_f32(out_ptr, 0, Opnd::Val(value));
     let _ = (c512, c1024);
     b.finish()
