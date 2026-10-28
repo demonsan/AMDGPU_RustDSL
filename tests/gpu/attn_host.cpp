@@ -454,6 +454,15 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
+    if (std::strcmp(kern, "probe_fp8_matmul") == 0 && envi("FP8_TEST", 1) == 6) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        const float* dvals = reinterpret_cast<const float*>(raw + 4608);
+        std::printf("  t6 D[i][0]:");
+        for (int i = 0; i < 6; ++i) std::printf(" i%d=%g", i, dvals[i * 32]);
+        std::printf("\n  t6 D[0][j]:");
+        for (int j = 0; j < 6; ++j) std::printf(" j%d=%g", j, dvals[j]);
+        std::printf("\n");
+    }
     if (std::strcmp(kern, "probe_fp8_matmul") == 0 && envi("FP8_TEST", 1) == 11) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         const float* dvals = reinterpret_cast<const float*>(raw + 4608);
