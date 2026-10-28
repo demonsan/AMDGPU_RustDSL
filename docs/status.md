@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **sub-register aliases + in-place accumulators (118 TFLOP/s)** | compiler removes ~75% of the `v_mov_b32` in `fmha_fwd_hd128_mxfp8_t`: 2859 asm lines instead of 4935, 176 VGPRs; **118 TFLOP/s on 1x8x2048x2048** (vendor 518); all 6 shapes `REF_KERNEL_OK` |
 | **transposed register-softmax `fmha_fwd_hd128_mxfp8_t`** | same ABI and numerics (all 6 shapes `REF_KERNEL_OK`, mean error vs CPU 1.1-1.7e-3, vs vendor 2.5-2.8e-3) with `S^T = K Q^T`: scores stay in registers (lane = query), softmax max/sum are register reductions plus one LDS exchange with lane `l ^ 32`, the online-softmax correction is lane-local, no score tile goes through LDS; 192 VGPRs, 34.8 KB LDS; **88 TFLOP/s vs 15 for the first version (5.9x faster), vendor kernel 518 TFLOP/s** |
 | **ABI-compatible `fmha_fwd_hd128_mxfp8`** | our kernel launched with the vendor kernel's 656-byte kernarg on BSHD fp8 Q/K/V, E8M0 1x32 descales and a BF16 output; `exp2` softmax; **every output element agrees with a double-precision CPU model (mean error 1.2-1.7e-3, better than the vendor kernel's own 1.8-2.8e-3) and with the vendor kernel (mean difference 2.5-2.8e-3, worst 0.10) on 6 shapes up to B=3 H=3 S=768 SK=1280 and 2M outputs**; bit-identical to the vendor kernel when Q = 0 (`REF_KERNEL_OK`) |
 | **512-thread hd128 attention, LDS-staged K/V, A/B role loops** | `probe_fp8_fmha_hd128c`: reference tile shapes at reference scale — eight 32-row query tiles (256 rows) per block of 512, head dim 128, KV tile 128 processed as two 64-key online-softmax substeps, K (role A, waves 0-3) and V (role B, waves 4-7) copied through shared LDS (99,456 B), K fragments by `ds_read_b128`, V fragments by `ds_read_b64_tr_b8`, separate A/B steady loops with the same barrier schedule, four register-resident O accumulators; **224 VGPRs** (reference 246); all 8 waves match the host emulation (`1.8e-4`) -> `PROBE_FMHA_HD128C_OK` |
@@ -538,6 +539,31 @@ each 32-key tile. That removes almost all of the LDS traffic of the first versio
 Measured (`REF_ITERS=20`, 1x8x2048x2048): 0.194 ms = 88 TFLOP/s against 1.14 ms (15 TFLOP/s) for the first
 version and 0.033 ms (518 TFLOP/s) for the vendor kernel, i.e. the gap closed from 34x to 5.9x. LDS now holds
 only the K and V tiles (34.8 KB), so a second tile buffer (software pipelining) fits.
+
+## Sub-register aliases: removing the register-to-register moves (round 32)
+
+Profiling the transposed kernel's assembly showed that 2585 of its 4935 lines were `v_mov_b32`: every
+`Frag16Lane` read, `Frag16Build` / `Frag8` write, fragment concatenation and loop-variable `set_var` of a
+sixteen-dword accumulator was lowered to one or two moves per dword, which swamped the 16 MFMAs and ~130
+`v_exp_f32` of a 128-key iteration. Fixes in the compiler:
+
+* **Sub-register aliases** (`MFunction::alias`): an alias vreg owns no register; after allocation it is
+  its tuple's physical register plus a dword offset. `frag16_lane` is now free, `copy_reg` is one move per
+  dword instead of two, and liveness / hazards / allocation treat a use or definition of an alias as one of
+  the tuple (hazards: an MFMA result tuple is waited on when any of its lanes is read).
+* **Producer retargeting.** When a fragment is built from single-use ALU results (`Frag16Build`, `Frag8`),
+  the producing instruction now writes the fragment's sub-register directly instead of a fresh register
+  that is moved in afterwards.
+* **Direct loads and in-place accumulators in the DSL**: `load_lds_b128x2` (two `ds_read_b128` into the halves
+  of one `Frag8`), `load_lds_tr_b8x4` (four transposing reads into the quarters of one `Frag8`),
+  `var_scale_f32` (16 in-place `v_mul_f32` on a loop-carried accumulator) and `var_mfma_scale` (in-place
+  accumulation into a loop variable). The register allocator no longer reserves registers for vregs that are
+  never referenced.
+
+Result for `fmha_fwd_hd128_mxfp8_t` (all 6 shapes still `REF_KERNEL_OK`, numerics unchanged): assembly 4935 ->
+2859 lines, `v_mov_b32` 2585 -> 633, VGPRs 192 -> 176, **88 -> 118 TFLOP/s** on 1x8x2048x2048 (vendor kernel:
+518 TFLOP/s, a 4.4x gap). The other kernels also benefit (`probe_fp8_fmha_hd128c` 224 -> 208 VGPRs) and all
+earlier probes still pass.
 
 ## Next: FMHA reference core loop
 
