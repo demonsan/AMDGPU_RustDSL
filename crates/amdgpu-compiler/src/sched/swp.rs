@@ -350,7 +350,13 @@ pub fn apply(m: &MFunction, li: &LoopInfo, k: usize, live_after: &HashSet<VReg>)
 pub(super) fn eval_cost(m: &MFunction, label: u32, per_trip: f64, o: &super::Options) -> Option<f64> {
     let mut c = m.clone();
     let mut stats = super::Stats::default();
-    super::schedule_blocks(&mut c, o, &mut stats).ok()?;
+    // schedule only the blocks of the loop's hot path, cheaply
+    let mut o2 = o.clone();
+    o2.fast = true;
+    if let (Some(hi), Some(li)) = (c.blocks.iter().position(|b| b.label == label), c.loops.iter().find(|l| l.0 == label).and_then(|l| c.blocks.iter().position(|b| b.label == l.1))) {
+        o2.only_block = Some(super::sim::hot_path(&c, hi, li));
+    }
+    super::schedule_blocks(&mut c, &o2, &mut stats).ok()?;
     super::waits::insert_waits(&mut c);
     crate::hazards::fix_value_hazards_opts(&mut c, true);
     let rep = super::sim::report(&c, &[1, 2]);

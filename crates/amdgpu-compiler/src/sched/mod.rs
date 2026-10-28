@@ -35,6 +35,8 @@ pub struct Options {
     pub drain_only: bool,
     /// Software-pipeline eligible counted loops (stage 3).
     pub swp: bool,
+    /// Cheaper scheduling (fewer windows): used while evaluating transformation candidates.
+    pub fast: bool,
     /// Tail-duplicate join prefixes into the arms of if/else diamonds inside loops (stage 2).
     pub taildup: bool,
     /// Remove empty latch blocks / elide fall-through branches (default on with the scheduler).
@@ -50,7 +52,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false }
     }
 }
 
@@ -132,7 +134,7 @@ pub(crate) fn schedule_blocks(m: &mut MFunction, o: &Options, stats: &mut Stats)
             let term = m.blocks[bi].term.clone();
             let xb = o.alu_across_barrier || o.xbar_only == Some(bi);
             let g = depgraph::build(m, &insts, &term, xb);
-            let r = list::schedule_best(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], o.max_vgprs as i64);
+            let r = list::schedule_best(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], o.max_vgprs as i64, o.fast);
             if o.verify {
                 verify::check_perm(m, &insts, &r.perm, &term, xb)
                     .map_err(|e| format!("schedule verification failed in block {bi}: {e}"))?;

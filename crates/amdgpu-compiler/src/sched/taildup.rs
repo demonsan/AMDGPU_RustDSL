@@ -72,12 +72,7 @@ pub fn run(m: &mut MFunction, o: &super::Options) -> TdStats {
         let Some(base) = eval_cost(m, hl, 1.0, o) else { continue };
         let _ = ll;
         let mut best: Option<(f64, usize)> = None;
-        let mut cands: Vec<usize> = (1..=len.min(16)).collect();
-        let mut k = 20;
-        while k < len {
-            cands.push(k);
-            k += 8;
-        }
+        let mut cands: Vec<usize> = vec![2, 4, 8, 12, 16, 24, 32, 48, 64].into_iter().filter(|&k| k < len).collect();
         cands.push(len);
         cands.sort();
         cands.dedup();
