@@ -6758,7 +6758,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
             for sl in 0..2usize {
                 let s = 2 * hh + sl;
-                let ko = b.c_i32((32 * pitch * s) as i32);
+                let ko = b.c_i32(32 * pitch * (s as i32));
                 let kaddr0 = b.add_i32(cx.kf_base, ko);
                 let kaddr0h = b.add_i32(kaddr0, c32v);
                 let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
