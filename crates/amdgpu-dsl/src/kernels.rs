@@ -382,10 +382,13 @@ pub fn probe_mfma_scale() -> Function {
     let bfrag = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
     let zero = b.frag_zero(DType::Frag16);
 
+    // 127 -> 2^0 = 1x, 128 -> 2^1 = 2x.
     let d1 = b.mfma_scale_fp8(a, bfrag, zero, 127, 127);
-    let d2 = b.mfma_scale_fp8(a, bfrag, zero, 127, 0x807f);
-    let d3 = b.mfma_scale_fp8(a, bfrag, zero, 0x807f, 127);
-    let d4 = b.mfma_scale_fp8(a, bfrag, zero, 0x807f, 0x807f);
+    let d2 = b.mfma_scale_fp8(a, bfrag, zero, 127, 128);
+    // A zero low byte makes the scale ~0 if only the low byte is used; if the
+    // dword packs two 32-block scales these two differ (64 vs 32).
+    let d3 = b.mfma_scale_fp8(a, bfrag, zero, 127, 0x8000);
+    let d4 = b.mfma_scale_fp8(a, bfrag, zero, 127, 0x7f00);
 
     let c256 = b.c_i32(256);
     let lane_off = b.mul_i32(tid, c256);
