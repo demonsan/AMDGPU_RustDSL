@@ -60,7 +60,9 @@ pub fn build(m: &MFunction, insts: &[MInst], term: &Term, alu_across: bool) -> G
         g.ver[i] = e.mem.as_ref().and_then(|a| a.base).and_then(|b| last_def.get(&b).copied());
         for &s in &e.reads {
             if let Some(&d) = last_def.get(&s) {
-                add_edge(&mut g, d, i, cost[d].latency);
+                // vcc producer -> consumer needs 2 wait states (hazards strict mode)
+                let lat = if s == VCC { cost[d].latency.max(12) } else { cost[d].latency };
+                add_edge(&mut g, d, i, lat);
             }
             readers.entry(s).or_default().push(i);
         }

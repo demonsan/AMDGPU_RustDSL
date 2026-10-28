@@ -116,11 +116,16 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         let mut vw: HashMap<VReg, usize> = HashMap::new();
         // strict: v_pk_add/mul_f32 result -> v_exp/v_rcp needs one wait state (LLVM oracle).
         let mut pkw: HashMap<VReg, usize> = HashMap::new();
+        // strict: VALU write of vcc -> VALU read of vcc needs 2 wait states (LLVM oracle: _cmp -> v_cndmask, _add_co -> v_addc).
+        let vccw = std::cell::Cell::new(0usize);
         let mut cycle = 0usize;
 
         // The earliest cycle at which `inst` may issue given the in-flight results.
         let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, usize>, pkw: &HashMap<VReg, usize>, cycle: usize| -> usize {
             let mut earliest = cycle;
+            if strict && inst.op.consumes_vcc() {
+                earliest = earliest.max(vccw.get());
+            }
             if strict && is_transcendental(inst.op) {
                 for s in &inst.srcs {
                     if let Src::Reg(r) = s {
@@ -262,6 +267,12 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     let lat = if strict { latency + 1 } else { latency };
                     ready.insert(canon(d), (cycle + lat, is_scaled_mfma(inst.op)));
                 }
+            }
+            if strict && inst.op.defines_vcc() {
+                vccw.set(cycle + 3);
+            }
+            if strict && matches!(inst.op, MOp::VPtrAdd) {
+                vccw.set(cycle + 3);
             }
             out.push(inst);
             cycle += 1;
