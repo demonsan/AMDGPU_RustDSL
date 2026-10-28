@@ -6,7 +6,6 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 cd "$REPO"; mkdir -p build/oracle
-export AMD_ROCM_MOUNT="$ROC"
 KERNELS=("$@")
 if [ ${#KERNELS[@]} -eq 0 ]; then
   mapfile -t KERNELS < <(bash tools/container/cargo.sh run -q --bin amdc -- list 2>/dev/null)

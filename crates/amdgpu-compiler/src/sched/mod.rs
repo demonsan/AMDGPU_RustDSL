@@ -48,21 +48,28 @@ pub struct Options {
     /// Run the verifiers (always on in tests).
     pub verify: bool,
     pub stats: bool,
+    /// AMDC_SCHED=auto: decide per loop with the multi-wave simulator (see uto_plan).
+    pub auto: bool,
+    /// Restrict block scheduling to blocks whose label is in the set or above the floor (blocks created
+    /// by swp / taildup). Used by uto_plan.
+    pub sched_labels: Option<(std::collections::HashSet<u32>, u32)>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, auto: false, sched_labels: None }
     }
 }
 
 impl Options {
     /// `AMDC_SCHED=1` enables; `AMDC_SCHED_OPTS=rewait,xbar,noverify,stats,limit=N` tunes.
     pub fn from_env() -> Option<Options> {
-        if std::env::var("AMDC_SCHED").ok().as_deref() != Some("1") {
+        let mode = std::env::var("AMDC_SCHED").ok();
+        if mode.as_deref() != Some("1") && mode.as_deref() != Some("auto") {
             return None;
         }
         let mut o = Options::default();
+        o.auto = mode.as_deref() == Some("auto");
         if let Ok(s) = std::env::var("AMDC_SCHED_OPTS") {
             for t in s.split(',') {
                 let t = t.trim();
@@ -123,6 +130,12 @@ pub(crate) fn schedule_blocks(m: &mut MFunction, o: &Options, stats: &mut Stats)
         for bi in 0..m.blocks.len() {
             stats.blocks += 1;
             let insts = m.blocks[bi].insts.clone();
+            if let Some((set, floor)) = &o.sched_labels {
+                let lb = m.blocks[bi].label;
+                if !(set.contains(&lb) || lb > *floor) {
+                    continue;
+                }
+            }
             if insts.len() < 2 || o.only_block.as_ref().map_or(false, |x| !x.contains(&bi)) {
                 continue;
             }
@@ -185,6 +198,103 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         eprintln!("sched: {stats:?}");
     }
     Ok(stats)
+}
+
+/// Simulated cycles per iteration (average of 1 and 2 waves per SIMD) of every loop, by header label.
+fn loop_costs(m: &MFunction) -> std::collections::HashMap<u32, f64> {
+    let mut c = m.clone();
+    crate::hazards::fix_value_hazards_opts(&mut c, true);
+    sim::report(&c, &[1, 2])
+        .into_iter()
+        .filter_map(|r| {
+            let w1 = r.cycles_per_iter.iter().find(|x| x.0 == 1)?.1;
+            let w2 = r.cycles_per_iter.iter().find(|x| x.0 == 2)?.1;
+            Some((r.header_label, (w1 + w2) / 2.0))
+        })
+        .collect()
+}
+
+/// Gain threshold shared with swp: a transformation is applied only if the model predicts >= 3%.
+pub const AUTO_GAIN: f64 = 0.97;
+
+/// `AMDC_SCHED=auto`. Returns the options to schedule `base` with, or `None` when the model predicts no gain
+/// anywhere (the kernel is then compiled completely unscheduled).
+/// * in-block scheduling is enabled per loop: only the hot-path blocks of loops whose simulated
+///   cycles/iteration drop by >= 3% are scheduled; straight-line code is never touched;
+/// * software pipelining is enabled (it applies its own >= 3% model gate per loop);
+/// * taildup is enabled only if, compared with the plan without it, the loops that exist in both
+///   results improve by >= 3% in total.
+pub fn auto_plan(base: &MFunction, o: &Options) -> Option<Options> {
+    let mut m = base.clone();
+    if o.cfg_cleanup {
+        cfg::cleanup(&mut m);
+    }
+    let log = |s: String| {
+        if o.stats {
+            eprintln!("auto: {s}");
+        }
+    };
+    let base_cost = loop_costs(&m);
+    let floor = m.blocks.iter().map(|b| b.label).max().unwrap_or(0);
+    let idx = |l: u32| m.blocks.iter().position(|b| b.label == l);
+    let mut selected = std::collections::HashSet::new();
+    for &(hl, ll) in &m.loops {
+        let (Some(hi), Some(li)) = (idx(hl), idx(ll)) else { continue };
+        let path = sim::hot_path(&m, hi, li);
+        let mut c = m.clone();
+        waits::strip_auto_waits(&mut c);
+        let mut o2 = o.clone();
+        o2.fast = true;
+        o2.auto = false;
+        o2.sched_labels = None;
+        o2.only_block = Some(path.clone());
+        let mut st = Stats::default();
+        if schedule_blocks(&mut c, &o2, &mut st).is_err() {
+            continue;
+        }
+        waits::insert_waits(&mut c);
+        let (Some(b), Some(s)) = (base_cost.get(&hl), loop_costs(&c).get(&hl).copied()) else { continue };
+        let take = s < b * AUTO_GAIN;
+        log(format!("loop {hl}: model {b:.1} -> {s:.1} cycles/iteration ({:+.1}%) {}", (s / b - 1.0) * 100.0, if take { "SCHEDULE" } else { "keep unscheduled" }));
+        if take {
+            for &p in &path {
+                selected.insert(m.blocks[p].label);
+            }
+        }
+    }
+    let mut plan = o.clone();
+    plan.auto = false;
+    plan.swp = true;
+    plan.reorder = true;
+    plan.taildup = false;
+    plan.sched_labels = Some((selected.clone(), floor));
+    // Trial run: what do the plan (and the plan + taildup) actually produce?
+    let trial = |opts: &Options| -> Option<(Stats, std::collections::HashMap<u32, f64>)> {
+        let mut c = base.clone();
+        let mut q = opts.clone();
+        q.stats = false;
+        let st = run(&mut c, &q).ok()?;
+        Some((st, loop_costs(&c)))
+    };
+    let a = trial(&plan);
+    let applied = a.as_ref().map_or(false, |(st, _)| st.scheduled > 0 || st.swp_loops > 0);
+    let mut chosen = if applied { Some(plan.clone()) } else { None };
+    let mut td = plan.clone();
+    td.taildup = true;
+    if let Some((stb, cb)) = trial(&td) {
+        let reference = a.as_ref().map(|x| x.1.clone()).unwrap_or_else(|| base_cost.clone());
+        let common: Vec<u32> = cb.keys().filter(|k| reference.contains_key(k)).copied().collect();
+        let (sa, sb): (f64, f64) = common.iter().fold((0.0, 0.0), |acc, k| (acc.0 + reference[k], acc.1 + cb[k]));
+        let gain = !common.is_empty() && sb < sa * AUTO_GAIN;
+        log(format!("taildup trial: loops {common:?} model {sa:.1} -> {sb:.1} ({} scheduled blocks) {}", stb.scheduled, if gain { "ENABLE" } else { "off" }));
+        if gain {
+            chosen = Some(td);
+        }
+    }
+    if chosen.is_none() {
+        log("no modelled gain: kernel stays unscheduled".to_string());
+    }
+    chosen
 }
 
 #[cfg(test)]

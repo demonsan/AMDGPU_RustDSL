@@ -9,7 +9,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  amdc list");
     eprintln!("  amdc dump <kernel>");
-    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend own|llvm-tail] [--mir-out <file.mir>] [--llvm-tail-drop-auto-waits] [--sched]");
+    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--llvm-tail-drop-auto-waits] [--sched | --sched=auto]");
     eprintln!("      --backend llvm-tail runs the pinned llc tail (ROCM_LLVM_BIN overrides the tool dir);");
     eprintln!("      --mir-out writes the exported post-RA MIR only (no llc needed) and exits.");
     eprintln!("  amdc backend probe|check|write-lock   version probe / verify / rewrite backend.lock");
@@ -166,7 +166,9 @@ fn main() -> ExitCode {
                 eprintln!("unknown kernel: {name}");
                 return ExitCode::from(2);
             };
-            if args.iter().any(|a| a == "--sched") {
+            if args.iter().any(|a| a == "--sched=auto") {
+                env::set_var("AMDC_SCHED", "auto");
+            } else if args.iter().any(|a| a == "--sched") {
                 env::set_var("AMDC_SCHED", "1");
             }
             match amdgpu_compiler::compile_mir(&f) {
@@ -210,7 +212,7 @@ fn main() -> ExitCode {
             };
             let mut out_path: Option<String> = None;
             let mut mir_out: Option<String> = None;
-            let mut backend_name = env::var("AMDC_BACKEND").unwrap_or_else(|_| "own".to_string());
+            let mut backend_name = env::var("AMDC_BACKEND").unwrap_or_else(|_| "llvm-tail".to_string());
             let mut i = 2;
             while i < args.len() {
                 if args[i] == "--out" {
@@ -222,6 +224,8 @@ fn main() -> ExitCode {
                 } else if let Some(b) = args[i].strip_prefix("--backend=") {
                     backend_name = b.to_string();
                     i += 1;
+                } else if args[i] == "--sched=auto" {
+                    env::set_var("AMDC_SCHED", "auto");
                 } else if args[i] == "--sched" {
                     env::set_var("AMDC_SCHED", "1");
                     i += 1;

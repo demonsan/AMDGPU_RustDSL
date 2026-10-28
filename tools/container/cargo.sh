@@ -8,6 +8,11 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/xdg-$USER}"
 mkdir -p "$XDG_RUNTIME_DIR" "$TARGET"
 chmod 700 "$XDG_RUNTIME_DIR"
 
+# Default: mount the pinned LLVM (ROCm 10.1.0 + the llc tool dir) so the LLVM tail (the default backend) runs in the container.
+DEF_ROCM=/shared/apps/ubuntu/opt/rocm-10.1.0; DEF_TOOLS=/shared/amdgpu/home/blyu_qle/llvm-tools/rocm-10.1.0
+if [ -z "${AMD_ROCM_MOUNT:-}" ] && [ -d "$DEF_ROCM" ] && [ -d "$DEF_TOOLS" ]; then
+    AMD_ROCM_MOUNT="$DEF_ROCM $DEF_TOOLS"; AMD_LLVM_BIN="${AMD_LLVM_BIN:-$DEF_TOOLS/bin}"
+fi
 # Optional read-only mount of the ROCm tree so the LLVM-tail tests can run llc in the container.
 EXTRA=()
 # AMD_ROCM_MOUNT may list several directories; AMD_LLVM_BIN overrides the tool directory.

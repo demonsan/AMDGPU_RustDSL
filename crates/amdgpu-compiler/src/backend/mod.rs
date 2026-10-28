@@ -47,11 +47,11 @@ impl LlvmTools {
         }
         // Primary pin: llc built against the ROCm 10.1.0 libLLVM (ROCm 10 ships no llc binary).
         let pin = Path::new("/shared/amdgpu/home/blyu_qle/llvm-tools/rocm-10.1.0/bin");
-        if pin.join("llc").exists() {
-            return LlvmTools { bin: pin.to_path_buf() };
+        // An explicit ROCM_PATH is honoured; there is deliberately NO silent fallback to another LLVM.
+        if let Ok(roc) = std::env::var("ROCM_PATH") {
+            return LlvmTools { bin: Path::new(&roc).join("llvm").join("bin") };
         }
-        let roc = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/shared/apps/ubuntu/opt/rocm-7.0.2".to_string());
-        LlvmTools { bin: Path::new(&roc).join("llvm").join("bin") }
+        LlvmTools { bin: pin.to_path_buf() }
     }
 
     pub fn tool(&self, name: &str) -> PathBuf {
@@ -62,7 +62,7 @@ impl LlvmTools {
         let out = Command::new(self.tool(tool))
             .args(args)
             .output()
-            .map_err(|e| format!("cannot run {}: {e} (set ROCM_LLVM_BIN)", self.tool(tool).display()))?;
+            .map_err(|e| format!("the LLVM tail needs {} but it cannot be run: {e}. Set ROCM_LLVM_BIN to a tool directory (see backend.lock / docs/llvm-tail-conformance.md) or use --backend=own for our complete own tail.", self.tool(tool).display()))?;
         let so = String::from_utf8_lossy(&out.stdout).into_owned();
         let se = String::from_utf8_lossy(&out.stderr).into_owned();
         if !out.status.success() {

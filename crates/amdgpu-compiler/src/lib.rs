@@ -36,7 +36,11 @@ pub fn compile_mir(f: &amdgpu_dsl::Function) -> Result<mir::MFunction, String> {
 /// lower pressure limit and finally with the unscheduled code.
 fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regalloc::Alloc), String> {
     let base = lower::lower(f)?;
-    if let Some(opts) = sched::Options::from_env() {
+    let sched_opts = match sched::Options::from_env() {
+        Some(o) if o.auto => sched::auto_plan(&base, &o),
+        other => other,
+    };
+    if let Some(opts) = sched_opts {
         let mut last_err = String::new();
         for cut in [0u32, 16, 32, 48] {
             let mut o = opts.clone();
