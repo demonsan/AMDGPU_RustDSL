@@ -226,6 +226,7 @@ fn main() -> ExitCode {
                     i += 1;
                 } else if args[i] == "--sched=auto" {
                     env::set_var("AMDC_SCHED", "auto");
+                    i += 1;
                 } else if args[i] == "--sched" {
                     env::set_var("AMDC_SCHED", "1");
                     i += 1;
