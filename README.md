@@ -52,4 +52,4 @@
 
 ## Status
 
-Implementation has started; see [docs/status.md](docs/status.md).
+The compiler pipeline works end to end: a typed Rust DSL lowers to internal MIR, goes through this project's own register allocator and assembly emitter, and produces gfx950 code objects that run on hardware. The sample ttention_fwd kernel is numerically verified against a CPU reference on an MI355X (max abs error ~1e-4). See [docs/status.md](docs/status.md) for evidence and [docs/design.md](docs/design.md) for the architecture; the next milestone is the 1:1 FMHA reference core loop.
