@@ -185,6 +185,13 @@ impl Lowerer {
     fn as_v1(&mut self, o: Opnd) -> Result<VReg, String> {
         match o {
             Opnd::Val(v) => {
+                // Constants are rematerialised per region: a constant defined before a loop
+                // must not stay live across the whole loop just because the body uses it.
+                match self.defs.get(&v).cloned() {
+                    Some(Op::ConstI32(i)) => return Ok(self.const_vreg(i as i64)),
+                    Some(Op::ConstF32(f)) => return Ok(self.const_vreg((f.to_bits() as i32) as i64)),
+                    _ => {}
+                }
                 if let Some(r) = self.converted.get(&v) {
                     let r = *r;
                     self.touch(&[Src::Reg(r)]);
@@ -442,6 +449,8 @@ impl Lowerer {
                     }
                     self.flush_pending();
                     self.scope_snaps.push((self.consts.clone(), self.converted.clone()));
+                    self.consts.clear();
+                    self.converted.clear();
                     let header = self.fresh_label();
                     let exit = self.fresh_label();
                     self.set_term(Term::Goto(header));
