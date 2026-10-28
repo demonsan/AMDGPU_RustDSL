@@ -413,9 +413,10 @@ pub fn probe_roles() -> Function {
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
 
-    let tid_scalar = b.read_first_lane(tid);
     let c6 = b.c_i32(6);
-    let wave = b.let_(Op::LshrI32(Opnd::Val(tid_scalar), Opnd::Val(c6)));
+    // Wave id from the vector workitem id: uniform inside a wave, so it is safe
+    // to use it in the per-lane address computation.
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
     let c4 = b.c_i32(4);
     let c7 = b.c_i32(7);
     let c63 = b.c_i32(63);
