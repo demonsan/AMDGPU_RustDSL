@@ -1303,6 +1303,19 @@ impl Lowerer {
                 self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
                 self.val.insert(dst, d);
             }
+            Op::PartnerMaxF32(a) => {
+                let ra = self.as_v1(*a)?;
+                self.touch(&[Src::Reg(ra)]);
+                let d1 = self.new_vreg(RClass::V1);
+                let d2 = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
+                self.push(MInst::new(MOp::VMovB32).def(d2).srcreg(ra));
+                // afterwards d1 = [lo, lo], d2 = [hi, hi]
+                self.push(MInst::new(MOp::VPermlane32Swap).def(d1).srcreg(d1).srcreg(d2));
+                let r = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VMaxF32).def(r).srcreg(d1).srcreg(d2));
+                self.val.insert(dst, r);
+            }
             Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => {
                 let ra = self.as_v2(*a)?;
                 let rb = self.as_v2(*b)?;

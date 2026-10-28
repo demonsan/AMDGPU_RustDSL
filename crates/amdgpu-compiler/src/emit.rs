@@ -268,6 +268,11 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[0]),
             src1(a, inst.srcs[1])
         )],
+        MOp::VPermlane32Swap => vec![format!(
+            "v_permlane32_swap_b32_e32 {}, {}",
+            vr(a, reg_of(&inst.srcs[0])),
+            vr(a, reg_of(&inst.srcs[1]))
+        )],
         MOp::VPkAddF32 => vec![format!(
             "v_pk_add_f32 {}, {}, {}",
             pair(a, inst.dst.unwrap()),

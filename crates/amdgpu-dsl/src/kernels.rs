@@ -6821,13 +6821,17 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             if k < flat.len() {
                 mloc = b.max_f32(mloc, flat[k]);
             }
-            let mbits = b.bitcast_i32(mloc);
-            b.store_lds_b32(Opnd::Val(cx.ex_own), Opnd::Val(mbits));
-            b.wait_lds(0);
-            let mp_raw = b.load_lds_b32(Opnd::Val(cx.ex_partner));
-            b.wait_lds(0);
-            let mpart = b.bitcast_f32(mp_raw);
-            let mt = b.max_f32(mloc, mpart);
+            let mt = if fmha_t_opt("permlane") {
+                b.partner_max_f32(mloc)
+            } else {
+                let mbits = b.bitcast_i32(mloc);
+                b.store_lds_b32(Opnd::Val(cx.ex_own), Opnd::Val(mbits));
+                b.wait_lds(0);
+                let mp_raw = b.load_lds_b32(Opnd::Val(cx.ex_partner));
+                b.wait_lds(0);
+                let mpart = b.bitcast_f32(mp_raw);
+                b.max_f32(mloc, mpart)
+            };
             let m_old = b.bitcast_f32(m_var);
             let m_new = b.max_f32(m_old, mt);
             let dm = b.sub_f32(m_old, m_new);

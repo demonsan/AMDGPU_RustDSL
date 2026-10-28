@@ -234,6 +234,8 @@ pub enum Op {
     PkMulF32(Opnd, Opnd),
     /// Four f32 -> four E4M3 bytes of one dword (a, b low half; c, d high half): two `v_cvt_pk_fp8_f32`.
     CvtPkFp8x4F32(Opnd, Opnd, Opnd, Opnd),
+    /// max(x, x of lane l ^ 32) via `v_permlane32_swap_b32` (every lane gets the max of the two halves).
+    PartnerMaxF32(Opnd),
 }
 
 impl Op {
@@ -267,6 +269,7 @@ impl Op {
             Op::Frag16Lane { .. } => DType::U32,
             Op::Frag16Pair { .. } | Op::Frag2Dup(..) | Op::PkAddF32(..) | Op::PkMulF32(..) => DType::Frag2,
             Op::CvtPkFp8x4F32(..) => DType::U32,
+            Op::PartnerMaxF32(..) => DType::F32,
             Op::BitcastF32(..) => DType::F32,
             Op::BitcastI32(..) => DType::I32,
             Op::LoadLdsB32 { .. } => DType::U32,
@@ -321,7 +324,7 @@ impl Op {
                 vec![*a, *b, *c, *scale_a, *scale_b]
             }
             Op::Frag16Lane { frag, .. } | Op::Frag16Pair { frag, .. } => vec![*frag],
-            Op::Frag2Dup(a) => vec![*a],
+            Op::Frag2Dup(a) | Op::PartnerMaxF32(a) => vec![*a],
             Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => vec![*a, *b],
             Op::CvtPkFp8x4F32(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::FragZero { .. } => vec![],
@@ -354,7 +357,7 @@ pub enum Stmt {
     SetVar { var: VarId, value: Opnd },
     /// Multiply all sixteen dwords of a `Frag16` loop variable by an f32 scalar, in place.
     VarScaleF32 { var: VarId, scalar: Opnd },
-    /// Multiply all sixteen dwords of a Frag16 loop variable by the (duplicated) scalar held in a Frag2, in place, with _pk_mul_f32.
+    /// Multiply all sixteen dwords of a Frag16 loop variable by the (duplicated) scalar held in a Frag2, in place, with _pk_mul_f32.
     VarScalePk { var: VarId, pair: Opnd },
     /// 16-byte global load written straight into a `Frag4` loop variable.
     VarLoadB128 { var: VarId, base: Opnd, byte_off: u32 },
@@ -865,6 +868,9 @@ impl FnBuilder {
     /// `var *= scalar` on every dword of a `Frag16` loop variable.
     pub fn frag16_pair(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
         self.let_(Op::Frag16Pair { frag: frag.into(), index })
+    }
+    pub fn partner_max_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::PartnerMaxF32(a.into()))
     }
     pub fn frag2_dup(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Frag2Dup(a.into()))

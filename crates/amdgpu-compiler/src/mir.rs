@@ -60,6 +60,8 @@ pub enum MOp {
     /// `v_cvt_pk_fp8_f32` into the high 16 bits of its destination (low half preserved); srcs: a, b, old.
     VCvtPkFp8F32Hi,
     VPkAddF32,
+    /// `v_permlane32_swap_b32` dst, src: swaps dst lanes 32..63 with src lanes 0..31 (both registers change); srcs: dst, src.
+    VPermlane32Swap,
     VPkMulF32,
     VAddU32,
     VAddCoU32,
