@@ -30,6 +30,7 @@ struct Wave {
     pc: usize,
     iter: usize,
     last_issue: i64,
+    last_grant: i64,
     pipe_free: [i64; NPIPES],
     ready: HashMap<Slot, i64>,
     vm: Vec<i64>,
@@ -145,6 +146,7 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
             pc: 0,
             iter: 0,
             last_issue: -1,
+            last_grant: -1,
             pipe_free: [0; NPIPES],
             ready: HashMap::new(),
             vm: Vec::new(),
@@ -156,7 +158,7 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
     let mut unit_free = [0i64; NPIPES];
     loop {
         // earliest feasible issue time per wave
-        let mut best: Option<(i64, usize)> = None;
+        let mut best: Option<(i64, i64, usize)> = None;
         for (wi, w) in ws.iter().enumerate() {
             if w.iter >= iters || w.at_barrier.is_some() {
                 continue;
@@ -187,11 +189,12 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
                 }
                 _ => {}
             }
-            if best.map_or(true, |b| t < b.0) {
-                best = Some((t, wi));
+            // earliest start wins; ties go to the wave that issued least recently (fair arbitration)
+            if best.map_or(true, |b| (t, w.last_grant) < (b.0, b.1)) {
+                best = Some((t, w.last_grant, wi));
             }
         }
-        let Some((t, wi)) = best else {
+        let Some((t, _, wi)) = best else {
             // everyone finished or at a barrier
             let waiting = ws.iter().filter(|w| w.at_barrier.is_some()).count();
             if waiting == 0 {
@@ -219,6 +222,7 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
         }
         let w = &mut ws[wi];
         w.last_issue = t + ins.extra;
+        w.last_grant = t;
         w.pipe_free[ins.cost.pipe.index()] = t + ins.cost.issue as i64;
         if ins.cost.occ > 0 {
             unit_free[ins.cost.pipe.index()] = t + ins.cost.occ as i64;
