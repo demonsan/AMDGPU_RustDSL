@@ -50,6 +50,8 @@ pub struct Options {
     pub stats: bool,
     /// AMDC_SCHED=auto: decide per loop with the multi-wave simulator (see uto_plan).
     pub auto: bool,
+    /// `trustmodel`: let `auto` also consider loops with barriers.
+    pub trust_model: bool,
     /// Restrict block scheduling to blocks whose label is in the set or above the floor (blocks created
     /// by swp / taildup). Used by uto_plan.
     pub sched_labels: Option<(std::collections::HashSet<u32>, u32)>,
@@ -57,7 +59,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, auto: false, sched_labels: None }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, auto: false, trust_model: false, sched_labels: None }
     }
 }
 
@@ -82,6 +84,7 @@ impl Options {
                     "nocfg" => o.cfg_cleanup = false,
                     "swp" => o.swp = true,
                     "taildup" => o.taildup = true,
+                    "trustmodel" => o.trust_model = true,
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
@@ -238,9 +241,18 @@ pub fn auto_plan(base: &MFunction, o: &Options) -> Option<Options> {
     let floor = m.blocks.iter().map(|b| b.label).max().unwrap_or(0);
     let idx = |l: u32| m.blocks.iter().position(|b| b.label == l);
     let mut selected = std::collections::HashSet::new();
+    let mut eligible: Vec<u32> = Vec::new();
     for &(hl, ll) in &m.loops {
         let (Some(hi), Some(li)) = (idx(hl), idx(ll)) else { continue };
         let path = sim::hot_path(&m, hi, li);
+        // The model has no cross-wave barrier term: on the FMHA kernels it predicts -23% for in-block scheduling
+        // while hardware measured 221.7 vs 225.0 TFLOP/s unscheduled. Loops with `s_barrier` are therefore not
+        // eligible unless AMDC_SCHED_OPTS contains `trustmodel`.
+        if !o.trust_model && path.iter().any(|&b| m.blocks[b].insts.iter().any(|i| i.op == MOp::SBarrier)) {
+            log(format!("loop {hl}: contains s_barrier (model blind to cross-wave sync): keep unscheduled"));
+            continue;
+        }
+        eligible.push(hl);
         let mut c = m.clone();
         waits::strip_auto_waits(&mut c);
         let mut o2 = o.clone();
@@ -261,6 +273,10 @@ pub fn auto_plan(base: &MFunction, o: &Options) -> Option<Options> {
                 selected.insert(m.blocks[p].label);
             }
         }
+    }
+    if eligible.is_empty() {
+        log("no eligible loop: kernel stays unscheduled".to_string());
+        return None;
     }
     let mut plan = o.clone();
     plan.auto = false;
@@ -283,7 +299,7 @@ pub fn auto_plan(base: &MFunction, o: &Options) -> Option<Options> {
     td.taildup = true;
     if let Some((stb, cb)) = trial(&td) {
         let reference = a.as_ref().map(|x| x.1.clone()).unwrap_or_else(|| base_cost.clone());
-        let common: Vec<u32> = cb.keys().filter(|k| reference.contains_key(k)).copied().collect();
+        let common: Vec<u32> = cb.keys().filter(|k| reference.contains_key(k) && eligible.contains(k)).copied().collect();
         let (sa, sb): (f64, f64) = common.iter().fold((0.0, 0.0), |acc, k| (acc.0 + reference[k], acc.1 + cb[k]));
         let gain = !common.is_empty() && sb < sa * AUTO_GAIN;
         log(format!("taildup trial: loops {common:?} model {sa:.1} -> {sb:.1} ({} scheduled blocks) {}", stb.scheduled, if gain { "ENABLE" } else { "off" }));
