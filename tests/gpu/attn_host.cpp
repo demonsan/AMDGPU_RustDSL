@@ -152,7 +152,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fp8_fmha_multiwave") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_pingpong") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_abloops") == 0 ||
-                             std::strcmp(kern, "probe_lds_tr_b8") == 0;
+                             std::strcmp(kern, "probe_lds_tr_b8") == 0 ||
+                             std::strcmp(kern, "probe_fp8_matmul_tr") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -314,6 +315,24 @@ int main(int argc, char** argv) {
             }
         CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
         std::printf("[harness] multiwave inputs filled\n");
+    }    if (std::strcmp(kern, "probe_fp8_matmul_tr") == 0) {
+        std::vector<unsigned char> in(4608, 0);
+        unsigned int seed = 31337u;
+        auto next_rand = [&seed]() {
+            seed = seed * 1664525u + 1013904223u;
+            return (seed >> 16) & 0xFFu;
+        };
+        static const unsigned char palette[9] = {0x00, 0x28, 0x30, 0x38, 0x3C, 0x40, 0x44, 0xB8, 0xC0};
+        for (int i = 0; i < 32; ++i)
+            for (int k = 0; k < 64; ++k) in[i * 64 + k] = palette[next_rand() % 9];
+        for (int k = 0; k < 64; ++k)
+            for (int jj = 0; jj < 32; ++jj) in[2048 + k * 32 + jj] = palette[next_rand() % 9];
+        for (int l = 0; l < 64; ++l) {
+            in[4096 + l * 4] = (unsigned char)(126 + next_rand() % 3);
+            in[4352 + l * 4] = (unsigned char)(126 + next_rand() % 3);
+        }
+        CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
+        std::printf("[harness] tr matmul inputs filled\n");
     }    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, (unsigned)BLOCK, 1, 1, 0, nullptr, launch_params,
                              nullptr));
     CK(hipDeviceSynchronize());
@@ -541,7 +560,31 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
-    if (std::strcmp(kern, "probe_lds_tr_b8") == 0) {
+    if (std::strcmp(kern, "probe_fp8_matmul_tr") == 0) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        const float* dvals = reinterpret_cast<const float*>(raw + 4608);
+        int bad = 0;
+        double worst = 0.0;
+        for (int i = 0; i < 32; ++i)
+            for (int jj = 0; jj < 32; ++jj) {
+                double want = 0.0;
+                for (int k = 0; k < 64; ++k) {
+                    const int g = ((k % 32) / 16) % 2;
+                    const double sa_v = std::ldexp(1.0, (int)raw[4096 + (i + 32 * g) * 4] - 127);
+                    const double sb_v = std::ldexp(1.0, (int)raw[4352 + (jj + 32 * g) * 4] - 127);
+                    want += fp8_e4m3(raw[i * 64 + k]) * fp8_e4m3(raw[2048 + k * 32 + jj]) * sa_v * sb_v;
+                }
+                const double err = std::fabs(dvals[i * 32 + jj] - want);
+                worst = std::max(worst, err);
+                if (err > 1e-3 + 1e-4 * std::fabs(want)) {
+                    if (bad < 6) std::fprintf(stderr, "tr matmul D[%d][%d] want %g got %g\n", i, jj, want, dvals[i * 32 + jj]);
+                    ++bad;
+                }
+            }
+        std::printf("  matmul_tr bad=%d worst=%.3e\n", bad, worst);
+        std::printf(bad ? "PROBE_MATMUL_TR_FAIL\n" : "PROBE_MATMUL_TR_OK\n");
+        return bad != 0;
+    }    if (std::strcmp(kern, "probe_lds_tr_b8") == 0) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         std::printf("  tr_b8 instr1 (lane: 8 bytes) / instr2:\n");
         for (int l = 0; l < 64; ++l) {
