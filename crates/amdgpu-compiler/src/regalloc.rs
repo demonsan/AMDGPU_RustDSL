@@ -223,8 +223,13 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
                 let _ = ar;
             }
             let map: String = used_v.iter().map(|u| if *u { '#' } else { '.' }).collect();
+            let wide: Vec<String> = active
+                .iter()
+                .filter(|(_, _, ac)| ac.dwords() >= 8)
+                .map(|(ae, ar, ac)| format!("r{ar}:{ac:?}@{}..{ae}", start[*ar as usize]))
+                .collect();
             format!(
-                "out of VGPRs allocating r{r} ({c:?}, live {}..{}); map {map}; {} live vregs holding {} dwords \
+                "out of VGPRs allocating r{r} ({c:?}, live {}..{}); wide {wide:?}; map {map}; {} live vregs holding {} dwords \
                  (V1 {} V2 {} V4 {} V8 {} V16 {})",
                 s,
                 e,
