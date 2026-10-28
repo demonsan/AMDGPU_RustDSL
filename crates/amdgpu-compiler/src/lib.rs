@@ -1,6 +1,7 @@
 //! Backend for the AMDGPU Rust DSL: lowering, register allocation, emission.
 
 pub mod emit;
+pub mod hazards;
 pub mod lower;
 pub mod mir;
 pub mod regalloc;
@@ -13,7 +14,8 @@ pub struct Compiled {
 
 /// Lowers, verifies, allocates and emits a kernel as gfx950 assembly text.
 pub fn compile(f: &amdgpu_dsl::Function) -> Result<Compiled, String> {
-    let m = lower::lower(f)?;
+    let mut m = lower::lower(f)?;
+    hazards::fix_value_hazards(&mut m);
     let errs = mir::verify(&m);
     if !errs.is_empty() {
         return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));

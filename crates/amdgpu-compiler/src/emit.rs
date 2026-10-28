@@ -323,7 +323,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1_s(a, inst.srcs[0]),
             src1_s(a, inst.srcs[1])
         )],
-        MOp::SNop => vec!["s_nop 0".to_string()],
+        MOp::SNop => vec![format!("s_nop {}", inst.imm)],
         MOp::SWaitVm => vec!["s_waitcnt vmcnt(0)".to_string()],
         MOp::SWaitLgkm => vec!["s_waitcnt lgkmcnt(0)".to_string()],
         MOp::SEndpgm => vec!["s_endpgm".to_string()],
