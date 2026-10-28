@@ -19,8 +19,9 @@ pub const KERNARG_SIZE: u32 = 48;
 /// Layout assumption (checked by the host harness): `[B, H, S, D]` contiguous,
 /// `D = HEAD_DIM`, and `S` a multiple of `Q_ROWS`. Grid is
 /// `(S / Q_ROWS, H, B)`, block is `(Q_ROWS, 1, 1)`.
-pub fn attention_fwd() -> Function {
-    let mut b = FnBuilder::new("attention_fwd", Q_ROWS as u32);
+pub fn attention_impl(debug: bool) -> Function {
+    let name = if debug { "attn_debug" } else { "attention_fwd" };
+    let mut b = FnBuilder::new(name, Q_ROWS as u32);
     b.arg("q", DType::Ptr, 0, 8);
     b.arg("k", DType::Ptr, 8, 8);
     b.arg("v", DType::Ptr, 16, 8);
@@ -156,21 +157,46 @@ pub fn attention_fwd() -> Function {
     b.end_loop();
 
     // --- normalise and store -------------------------------------------
-    let inv_l = b.rcp_f32(l_var);
-    let mut d = 0usize;
-    while d < HEAD_DIM {
-        let mut out = [0u32; 4];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let normed = b.mul_f32(acc[d + i], inv_l);
-            *slot = b.cvt_f32_to_f16(normed);
+    if debug {
+        // Diagnostic kernel: write the loop-carried state so the harness can
+        // compare it against the expected values directly.
+        let l_f16 = b.cvt_f32_to_f16(l_var);
+        let m_f16 = b.cvt_f32_to_f16(m_var);
+        let acc0_f16 = b.cvt_f32_to_f16(acc[0]);
+        let q0_f16 = b.cvt_f32_to_f16(q[0]);
+        b.store_u16(o_row_ptr, 0, Opnd::Val(l_f16));
+        b.store_u16(o_row_ptr, 2, Opnd::Val(m_f16));
+        b.store_u16(o_row_ptr, 4, Opnd::Val(acc0_f16));
+        b.store_u16(o_row_ptr, 6, Opnd::Val(q0_f16));
+    } else {
+        let inv_l = b.rcp_f32(l_var);
+        let mut d = 0usize;
+        while d < HEAD_DIM {
+            let mut out = [0u32; 4];
+            for (i, slot) in out.iter_mut().enumerate() {
+                let normed = b.mul_f32(acc[d + i], inv_l);
+                *slot = b.cvt_f32_to_f16(normed);
+            }
+            for i in 0..4 {
+                b.store_u16(o_row_ptr, (2 * (d + i)) as u32, Opnd::Val(out[i]));
+            }
+            d += 4;
         }
-        for i in 0..4 {
-            b.store_u16(o_row_ptr, (2 * (d + i)) as u32, Opnd::Val(out[i]));
-        }
-        d += 4;
     }
 
     b.finish()
+}
+
+/// Dense attention kernel.
+pub fn attention_fwd() -> Function {
+    attention_impl(false)
+}
+
+/// Same attention kernel, but stores `l`, `m`, `acc[0]` and `q[0]` at the start
+/// of each output row instead of the normalised result. Used to debug the
+/// loop-carried softmax state on hardware.
+pub fn attn_debug() -> Function {
+    attention_impl(true)
 }
 
 /// Minimal probe kernel: `o[tid] = q[tid]`, plus `n` stored at byte 128.

@@ -19,5 +19,6 @@ echo "== host =="
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/attn_host.cpp -o build/attn_host \
     -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib"
 
+export ATTN_KERNEL="$KERNEL"
 echo "== run =="
 HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" ./build/attn_host "build/${KERNEL}.co"
