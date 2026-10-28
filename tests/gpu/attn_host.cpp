@@ -260,7 +260,7 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("  roles marker_bad=%d lds_bad=%d  o[0]=%.1f o[64]=%.1f o[512]=%.1f o[576]=%.1f\n",
-                    marker_bad, lds_bad, vals[0], vals[64], vals[512], vals[576]);
+                    marker_bad, lds_bad, vals[0], vals[64], vals[512], vals[576]);`n        for (int w = 0; w < 8; ++w) {`n            std::printf("    wave %d marker[%d]=%.1f lds[%d]=%.1f\n", w, w * 64, vals[w * 64], w * 64,`n                        vals[512 + w * 64]);`n        }
         std::printf(marker_bad || lds_bad ? "PROBE_ROLES_FAIL\n" : "PROBE_ROLES_OK\n");
         return (marker_bad || lds_bad) ? 1 : 0;
     }
