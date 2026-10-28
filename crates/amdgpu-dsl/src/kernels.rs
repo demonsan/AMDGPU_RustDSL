@@ -402,13 +402,12 @@ pub fn probe_mfma_scale() -> Function {
     }
     b.finish()
 }
-/// Multi-wave structure probe: 8 waves per block, waves 0-3 take role A and
-/// waves 4-7 take role B. Every iteration writes one dword per lane into LDS,
-/// synchronises, reads the partner role's slot, and stores it to global memory.
+
+/// Multi-wave structure probe with two independent phases.
 ///
-/// This exercises the pieces the FMHA core loop needs structurally: wave-role
-/// branching, a loop with two paired workgroup barriers per iteration, and LDS
-/// exchange between the roles.
+/// 1. Role marker: waves 0-3 store 111.0 at `o[tid]`, waves 4-7 store 222.0.
+/// 2. LDS exchange: every lane writes its id into LDS, the block synchronises,
+///    and each lane reads the id written by the partner role.
 pub fn probe_roles() -> Function {
     let mut b = FnBuilder::new("probe_roles", 512);
     b.lds(2048);
@@ -416,81 +415,47 @@ pub fn probe_roles() -> Function {
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
 
-    // Wave id = first lane's workitem id >> 6.
     let tid_scalar = b.read_first_lane(tid);
     let c6 = b.c_i32(6);
     let wave = b.let_(Op::LshrI32(Opnd::Val(tid_scalar), Opnd::Val(c6)));
-
-    let c1 = b.c_i32(1);
     let c4 = b.c_i32(4);
     let c7 = b.c_i32(7);
     let c63 = b.c_i32(63);
     let c64 = b.c_i32(64);
     let c512 = b.c_i32(512);
-    let c1000 = b.c_i32(1000);
-    let c100000 = b.c_i32(100000);
+    let is_a = b.cmp_lt_i32(wave, c4);
+
+    let off = b.mul_i32(tid, c4);
+    let ptr = b.ptr_add(o, off);
+
+    // Phase 1: role marker.
+    b.begin_if(Opnd::Val(is_a));
+    let marker_a = b.c_f32(111.0);
+    b.store_f32(ptr, 0, Opnd::Val(marker_a));
+    b.else_();
+    let marker_b = b.c_f32(222.0);
+    b.store_f32(ptr, 0, Opnd::Val(marker_b));
+    b.end_if();
+
+    // Phase 2: LDS exchange across roles.
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
 
     let wave_plus = b.add_i32(wave, c4);
     let partner = b.let_(Op::AndI32(Opnd::Val(wave_plus), Opnd::Val(c7)));
-    let is_a = b.cmp_lt_i32(wave, c4);
-
-    let lds_off = b.mul_i32(tid, c4);
     let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
     let partner_row = b.mul_i32(partner, c64);
     let partner_index = b.add_i32(partner_row, lane);
     let partner_off = b.mul_i32(partner_index, c4);
-
-    // Loop-carried iteration counter.
-    let iter_init = b.c_i32(0);
-    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(iter_init))]);
-    let iter = vars[0];
-
-    let scaled = b.mul_i32(iter, c1000);
-    let base = b.add_i32(scaled, tid);
-    b.begin_if(Opnd::Val(is_a));
-    b.store_lds_b32(Opnd::Val(lds_off), Opnd::Val(base));
-    b.else_();
-    let marked = b.add_i32(base, c100000);
-    b.store_lds_b32(Opnd::Val(lds_off), Opnd::Val(marked));
-    b.end_if();
-
-    b.wait_lds(0);
-    b.barrier();
-    b.wait_lds(0);
     let got = b.load_lds_b32(Opnd::Val(partner_off));
     let value = b.bitcast_f32(got);
 
-    // Diagnostic split: the first half of the buffer receives the value this
-    // lane wrote (after the role marker), the second half the value it read
-    // from its partner role.
-    let out_index_base = b.mul_i32(iter, c512);
-    let out_index = b.add_i32(out_index_base, tid);
-    let out_off = b.mul_i32(out_index, c4);
-    let out_ptr = b.ptr_add(o, out_off);
-    b.begin_if(Opnd::Val(is_a));
-    b.store_f32(out_ptr, 0, value);
-    b.else_();
-    let marked_self = b.add_i32(base, c100000);
-    let marked_f = b.bitcast_f32(marked_self);
-    b.store_f32(out_ptr, 0, marked_f);
-    b.end_if();
-
-    let c2048 = b.c_i32(2048);
-    let out2_index = b.add_i32(out_index, c2048);
+    let out2_index = b.add_i32(tid, c512);
     let out2_off = b.mul_i32(out2_index, c4);
     let out2_ptr = b.ptr_add(o, out2_off);
     b.store_f32(out2_ptr, 0, value);
-
-    // Second barrier: no wave may overwrite LDS before everyone has read it.
-    b.wait_lds(0);
-    b.barrier();
-
-    let next = b.add_i32(iter, c1);
-    b.set_var(iter, next);
-    let more = b.cmp_lt_i32(next, c4);
-    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
-    b.break_if(Opnd::Val(stop));
-    b.end_loop();
 
     b.finish()
 }

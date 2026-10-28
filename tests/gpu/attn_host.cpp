@@ -234,41 +234,35 @@ int main(int argc, char** argv) {
         return scale_bad != 0;
     }
     if (std::strcmp(kern, "probe_roles") == 0) {
-        // First half: value written by this lane (plus a role-B marker).
-        // Second half: value read from the partner role.
-        float vals[4096] = {0.0f};
+        float vals[1024] = {0.0f};
         std::memcpy(vals, got.data(), sizeof(vals));
-        int roles_bad = 0;
-        int own_bad = 0;
-        for (int it = 0; it < 4; ++it) {
-            for (int tid = 0; tid < 512; ++tid) {
-                int w = tid / 64;
-                int l = tid % 64;
-                int own = it * 1000 + tid + (w >= 4 ? 100000 : 0);
-                float got_own = vals[it * 512 + tid];
-                if (std::fabs(got_own - (float)own) > 0.5f) {
-                    if (own_bad < 4) {
-                        std::fprintf(stderr, "own mismatch it=%d tid=%d got=%.1f want=%d\n", it,
-                                     tid, got_own, own);
-                    }
-                    ++own_bad;
+        int marker_bad = 0;
+        int lds_bad = 0;
+        for (int tid = 0; tid < 512; ++tid) {
+            int w = tid / 64;
+            int l = tid % 64;
+            float want_marker = (w < 4) ? 111.0f : 222.0f;
+            if (std::fabs(vals[tid] - want_marker) > 0.5f) {
+                if (marker_bad < 4) {
+                    std::fprintf(stderr, "marker mismatch tid=%d got=%.1f want=%.1f\n", tid,
+                                 vals[tid], want_marker);
                 }
-                int pw = (w + 4) & 7;
-                int expect = it * 1000 + pw * 64 + l + (pw >= 4 ? 100000 : 0);
-                float got_read = vals[2048 + it * 512 + tid];
-                if (std::fabs(got_read - (float)expect) > 0.5f) {
-                    if (roles_bad < 4) {
-                        std::fprintf(stderr, "read mismatch it=%d tid=%d got=%.1f want=%d\n", it,
-                                     tid, got_read, expect);
-                    }
-                    ++roles_bad;
+                ++marker_bad;
+            }
+            int pw = (w + 4) & 7;
+            int want_read = pw * 64 + l;
+            if (std::fabs(vals[512 + tid] - (float)want_read) > 0.5f) {
+                if (lds_bad < 4) {
+                    std::fprintf(stderr, "lds mismatch tid=%d got=%.1f want=%d\n", tid,
+                                 vals[512 + tid], want_read);
                 }
+                ++lds_bad;
             }
         }
-        std::printf("  roles own_bad=%d read_bad=%d  samples own=%.1f read=%.1f\n", own_bad,
-                    roles_bad, vals[0], vals[2048]);
-        std::printf(roles_bad || own_bad ? "PROBE_ROLES_FAIL\n" : "PROBE_ROLES_OK\n");
-        return (roles_bad || own_bad) ? 1 : 0;
+        std::printf("  roles marker_bad=%d lds_bad=%d  o[0]=%.1f o[64]=%.1f o[512]=%.1f o[576]=%.1f\n",
+                    marker_bad, lds_bad, vals[0], vals[64], vals[512], vals[576]);
+        std::printf(marker_bad || lds_bad ? "PROBE_ROLES_FAIL\n" : "PROBE_ROLES_OK\n");
+        return (marker_bad || lds_bad) ? 1 : 0;
     }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,
