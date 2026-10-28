@@ -3058,3 +3058,542 @@ pub fn probe_fp8_fmha_pingpong() -> Function {
     }
     b.finish()
 }
+
+/// Separate steady loops per role: waves 0-3 run an A loop that copies K, waves 4-7 run a
+/// B loop that copies V; each loop has its own backedge and the same barrier schedule.
+pub fn probe_fp8_fmha_abloops() -> Function {
+    let mut b = FnBuilder::new("probe_fp8_fmha_abloops", 512);
+    b.lds(75776);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid_full = b.let_(Op::WorkitemId);
+    let c63w = b.c_i32(63);
+    let c6w = b.c_i32(6);
+    let tid = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c63w)));
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid_full), Opnd::Val(c6w)));
+
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c4 = b.c_i32(4);
+    let c4t = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c9 = b.c_i32(9);
+    let c16i = b.c_i32(16);
+    let c31 = b.c_i32(31);
+    let c32 = b.c_i32(32);
+    let c64 = b.c_i32(64);
+    let c123 = b.c_i32(123);
+    let c127 = b.c_i32(127);
+    let c128 = b.c_i32(128);
+    let c256 = b.c_i32(256);
+    let c1024 = b.c_i32(1024);
+    let c2048 = b.c_i32(2048);
+    let c10240 = b.c_i32(24576); // V^T tiles
+    let c18432 = b.c_i32(32768); // Q scales
+    let c19456 = b.c_i32(33792); // K scales
+    let c20480 = b.c_i32(34816); // O out (per wave +4096)
+    let c24576 = b.c_i32(67584); // P bytes (per wave +4096)
+    let c8448w = b.c_i32(8448);
+    let c2048w = b.c_i32(2048);
+    let c4096w = b.c_i32(4096);
+    let c16384 = b.c_i32(16384);
+    let wbase = b.mul_i32(wave, c8448w);
+    let wq = b.mul_i32(wave, c2048w);
+    let wout = b.mul_i32(wave, c4096w);
+    let kvb = b.c_i32(67584);
+    let c255 = b.c_i32(255);
+    let c3k = b.c_i32(3);
+    let c1k = b.c_i32(1);
+    let c2048k = b.c_i32(2048);
+    let c4096k = b.c_i32(4096);
+    let c16384k = b.c_i32(16384);
+    let c24576k = b.c_i32(24576);
+    let is_a = b.cmp_lt_i32(wave, c4);
+    let rt = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c255)));
+    let rt8 = b.shl_i32(rt, c3k);
+    let lds_corr0 = b.c_i32(4096);
+    let lds_corr = b.add_i32(lds_corr0, wbase);
+    let lds_o = b.c_i32(4224);
+    let neg_big = b.c_f32(-1.0e30);
+    let c16f = b.c_f32(16.0);
+
+    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let pblk = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
+    let j4 = b.mul_i32(j, c4);
+    let p512 = b.shl_i32(pblk, c9);
+    let lds_loc = b.add_i32(j4, p512);
+    let lds_dyn = b.add_i32(lds_loc, wbase);
+    let pblk16 = b.shl_i32(pblk, c4t);
+    let corr_row = b.add_i32(j4, lds_corr);
+    let o_lds_dyn = b.add_i32(lds_dyn, lds_o);
+
+    let row = b.mul_i32(j, c64);
+    let koff = b.shl_i32(pblk, c5);
+    let frag_off = b.add_i32(row, koff);
+    let tid4 = b.mul_i32(tid, c4);
+    let zero = b.frag_zero(DType::Frag16);
+
+    // Q fragment, loaded once.
+    let q_off = b.add_i32(frag_off, wq);
+    let q_base = b.ptr_add(o, q_off);
+    let q0 = b.load_f32(q_base, 0);
+    let q0 = b.bitcast_i32(q0);
+    let q1 = b.load_f32(q_base, 4);
+    let q1 = b.bitcast_i32(q1);
+    let q2 = b.load_f32(q_base, 8);
+    let q2 = b.bitcast_i32(q2);
+    let q3 = b.load_f32(q_base, 12);
+    let q3 = b.bitcast_i32(q3);
+    let q4 = b.load_f32(q_base, 16);
+    let q4 = b.bitcast_i32(q4);
+    let q5 = b.load_f32(q_base, 20);
+    let q5 = b.bitcast_i32(q5);
+    let q6 = b.load_f32(q_base, 24);
+    let q6 = b.bitcast_i32(q6);
+    let q7 = b.load_f32(q_base, 28);
+    let q7 = b.bitcast_i32(q7);
+    let a8 = b.frag8(q0, q1, q2, q3, q4, q5, q6, q7);
+
+    // Prologue: stage tile 0 into LDS slot 0 with the same role split.
+    {
+        let gk0 = b.add_i32(c16384k, rt8);
+        let gv0 = b.add_i32(c24576k, rt8);
+        let lk = b.add_i32(kvb, rt8);
+        let lv0 = b.add_i32(kvb, c2048k);
+        let lv = b.add_i32(lv0, rt8);
+        b.begin_if(is_a);
+        {
+            let gp = b.ptr_add(o, gk0);
+            let w0 = b.load_f32(gp, 0);
+            let w1 = b.load_f32(gp, 4);
+            let w0 = b.bitcast_i32(w0);
+            let w1 = b.bitcast_i32(w1);
+            let lk4 = b.add_i32(lk, c4);
+            b.store_lds_b32(Opnd::Val(lk), Opnd::Val(w0));
+            b.store_lds_b32(Opnd::Val(lk4), Opnd::Val(w1));
+            b.wait_lds(0);
+            b.barrier();
+            b.wait_lds(0);
+        }
+        b.else_();
+        {
+            let gp = b.ptr_add(o, gv0);
+            let w0 = b.load_f32(gp, 0);
+            let w1 = b.load_f32(gp, 4);
+            let w0 = b.bitcast_i32(w0);
+            let w1 = b.bitcast_i32(w1);
+            let lv4 = b.add_i32(lv, c4);
+            b.store_lds_b32(Opnd::Val(lv), Opnd::Val(w0));
+            b.store_lds_b32(Opnd::Val(lv4), Opnd::Val(w1));
+            b.wait_lds(0);
+            b.barrier();
+            b.wait_lds(0);
+        }
+        b.end_if();
+    }    // Role A and role B each run their own steady loop with its own backedge; both
+    // execute the same four collective barriers per iteration plus one in the epilogue.
+    b.begin_if(is_a);
+    {
+    let m_init = b.bitcast_i32(neg_big);
+    let vars = b.begin_loop(&[
+        (DType::I32, Opnd::Val(c0)),
+        (DType::I32, Opnd::Val(m_init)),
+        (DType::I32, Opnd::Val(c0)),
+        (DType::Frag16, Opnd::Val(zero)),
+    ]);
+    let tile = vars[0];
+    let m_var = vars[1];
+    let l_var = vars[2];
+    let o_var = vars[3];
+
+    // ---- S_t = Q K_t^T ----
+    let slot = b.let_(Op::AndI32(tile.into(), Opnd::Val(c1k)));
+    let slot_off = b.mul_i32(slot, c4096k);
+    let kslot0 = b.add_i32(slot_off, kvb);
+    let kaddr = b.add_i32(kslot0, frag_off);
+    let kaddr_hi = b.add_i32(kaddr, c16i);
+    let k_lo = b.load_lds_b128(Opnd::Val(kaddr));
+    let k_hi = b.load_lds_b128(Opnd::Val(kaddr_hi));
+    let k8 = b.cat_frag8(k_lo, k_hi);
+
+    let sc0 = b.mul_i32(tile, c256);
+    let sc1 = b.add_i32(sc0, tid4);
+    let sa_off = b.add_i32(sc1, c18432);
+    let sa_ptr = b.ptr_add(o, sa_off);
+    let sa_f = b.load_f32(sa_ptr, 0);
+    let sa = b.bitcast_i32(sa_f);
+    let sb_off = b.add_i32(sc1, c19456);
+    let sb_ptr = b.ptr_add(o, sb_off);
+    let sb_f = b.load_f32(sb_ptr, 0);
+    let sb = b.bitcast_i32(sb_f);
+    let s_frag = b.mfma_scale_fp8(a8, k8, zero, sa, sb);
+
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+        let lane = b.frag16_lane(s_frag, r);
+        let coff = b.c_i32(i_const * 128);
+        let addr = b.add_i32(lds_dyn, coff);
+        b.store_lds_b32(Opnd::Val(addr), Opnd::Val(lane));
+    }
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    // ---- online softmax update for this lane's row ----
+    let rbase0 = b.mul_i32(j, c128);
+    let rbase = b.add_i32(rbase0, wbase);
+    let mut vals: Vec<ValueId> = Vec::with_capacity(32);
+    for k in 0..32u32 {
+        let coff = b.c_i32(4 * k as i32);
+        let addr = b.add_i32(rbase, coff);
+        let raw = b.load_lds_b32(Opnd::Val(addr));
+        vals.push(b.bitcast_f32(raw));
+    }
+    b.wait_lds(0);
+    let mut tmax = vals[0];
+    for k in 1..32usize {
+        tmax = b.max_f32(tmax, vals[k]);
+    }
+    let m_old = b.bitcast_f32(m_var);
+    let m_new = b.max_f32(m_old, tmax);
+    let dm = b.sub_f32(m_old, m_new);
+    let corr = b.exp_f32(dm);
+    let mut exps: Vec<ValueId> = Vec::with_capacity(32);
+    for k in 0..32usize {
+        let sh = b.sub_f32(vals[k], m_new);
+        exps.push(b.exp_f32(sh));
+    }
+    let mut rsum = exps[0];
+    for k in 1..32usize {
+        rsum = b.add_f32(rsum, exps[k]);
+    }
+    let l_old = b.bitcast_f32(l_var);
+    let l_scaled = b.mul_f32(l_old, corr);
+    let l_new = b.add_f32(l_scaled, rsum);
+
+    // Publish the row correction for the lanes that own this row's O elements.
+    let corr_bits = b.bitcast_i32(corr);
+    b.store_lds_b32(Opnd::Val(corr_row), Opnd::Val(corr_bits));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    // ---- quantise P (x16) and PV for tile t ----
+    let mut words: Vec<ValueId> = Vec::with_capacity(8);
+    for m in 0..8usize {
+        let a = b.mul_f32(exps[4 * m], c16f);
+        let bb = b.mul_f32(exps[4 * m + 1], c16f);
+        let p0 = b.cvt_pk_fp8_f32(a, bb);
+        let c = b.mul_f32(exps[4 * m + 2], c16f);
+        let d = b.mul_f32(exps[4 * m + 3], c16f);
+        let p1 = b.cvt_pk_fp8_f32(c, d);
+        let sh = b.shl_i32(p1, c16i);
+        words.push(b.add_i32(p0, sh));
+    }
+    let pt0 = b.mul_i32(tile, c1024);
+    let pt1 = b.mul_i32(j, c32);
+    let pt2 = b.add_i32(pt0, pt1);
+    let pt2b = b.add_i32(pt2, wout);
+    let pt3 = b.add_i32(pt2b, c24576);
+    let p_ptr = b.ptr_add(o, pt3);
+    for m in 0..8usize {
+        let v = b.bitcast_f32(words[m]);
+        b.store_f32(p_ptr, 4 * m as u32, v);
+    }
+    let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    let vslot0 = b.add_i32(kslot0, c2048k);
+    let vaddr = b.add_i32(vslot0, frag_off);
+    let vaddr_hi = b.add_i32(vaddr, c16i);
+    let v_lo = b.load_lds_b128(Opnd::Val(vaddr));
+    let v_hi = b.load_lds_b128(Opnd::Val(vaddr_hi));
+    let v8 = b.cat_frag8(v_lo, v_hi);
+    // ---- O = MFMA(P, V, C = O * corr[row]); O stays in registers ----
+    let mut scaled_lanes: Vec<ValueId> = Vec::with_capacity(16);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+        let lane = b.frag16_lane(o_var, r);
+        let lanev = b.bitcast_f32(lane);
+        let ccoff = b.c_i32(i_const * 4);
+        let caddr0 = b.add_i32(pblk16, lds_corr);
+        let caddr = b.add_i32(caddr0, ccoff);
+        let craw = b.load_lds_b32(Opnd::Val(caddr));
+        let cf = b.bitcast_f32(craw);
+        let sc = b.mul_f32(lanev, cf);
+        scaled_lanes.push(b.bitcast_i32(sc));
+    }
+    let c_scaled = b.frag16_build(&scaled_lanes);
+    let o_frag = b.mfma_scale_fp8(p8, v8, c_scaled, c127, c123);
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    // Producer/consumer stage of the next tile: role A (waves 0-3) copies K, role B
+    // (waves 4-7) copies V into the other LDS slot; both branches end in the same
+    // workgroup barrier.
+    let tn = b.add_i32(tile, c1k);
+    let tn_off = b.mul_i32(tn, c2048k);
+    let ns = b.let_(Op::AndI32(Opnd::Val(tn), Opnd::Val(c1k)));
+    let ns_off = b.mul_i32(ns, c4096k);
+    let nslot = b.add_i32(ns_off, kvb);
+    let gk0 = b.add_i32(tn_off, c16384k);
+    let gk = b.add_i32(gk0, rt8);
+    let lk = b.add_i32(nslot, rt8);
+    let gv0 = b.add_i32(tn_off, c24576k);
+    let gv = b.add_i32(gv0, rt8);
+    let lv0 = b.add_i32(nslot, c2048k);
+    let lv = b.add_i32(lv0, rt8);
+
+    {
+        let gp = b.ptr_add(o, gk);
+        let w0 = b.load_f32(gp, 0);
+        let w1 = b.load_f32(gp, 4);
+        let w0 = b.bitcast_i32(w0);
+        let w1 = b.bitcast_i32(w1);
+        let lk4 = b.add_i32(lk, c4);
+        b.store_lds_b32(Opnd::Val(lk), Opnd::Val(w0));
+        b.store_lds_b32(Opnd::Val(lk4), Opnd::Val(w1));
+        b.wait_lds(0);
+        b.barrier();
+        b.wait_lds(0);
+    }
+
+    let tile_next = b.add_i32(tile, c1);
+    b.set_var(tile, tile_next);
+    b.set_var(o_var, o_frag);
+    let m_bits = b.bitcast_i32(m_new);
+    let l_bits = b.bitcast_i32(l_new);
+    b.set_var(m_var, m_bits);
+    b.set_var(l_var, l_bits);
+    let c4n = b.c_i32(4);
+    let more = b.cmp_lt_i32(tile_next, c4n);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+
+    // ---- epilogue: divide by l and write O ----
+    let l_final = b.bitcast_f32(l_var);
+    let inv_l = b.rcp_f32(l_final);
+    let inv_bits = b.bitcast_i32(inv_l);
+    b.store_lds_b32(Opnd::Val(corr_row), Opnd::Val(inv_bits));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let o_out00 = b.add_i32(lds_loc, wout);
+    let o_out0 = b.add_i32(o_out00, c20480);
+    let o_ptr = b.ptr_add(o, o_out0);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+        let ccoff = b.c_i32(i_const * 4);
+        let caddr0 = b.add_i32(pblk16, lds_corr);
+        let caddr = b.add_i32(caddr0, ccoff);
+        let craw = b.load_lds_b32(Opnd::Val(caddr));
+        let cf = b.bitcast_f32(craw);
+        let lane = b.frag16_lane(o_var, r);
+        let lanev = b.bitcast_f32(lane);
+        let res = b.mul_f32(lanev, cf);
+        b.store_f32(o_ptr, (i_const * 128) as u32, res);
+    }
+    }
+    b.else_();
+    {
+    let m_init = b.bitcast_i32(neg_big);
+    let vars = b.begin_loop(&[
+        (DType::I32, Opnd::Val(c0)),
+        (DType::I32, Opnd::Val(m_init)),
+        (DType::I32, Opnd::Val(c0)),
+        (DType::Frag16, Opnd::Val(zero)),
+    ]);
+    let tile = vars[0];
+    let m_var = vars[1];
+    let l_var = vars[2];
+    let o_var = vars[3];
+
+    // ---- S_t = Q K_t^T ----
+    let slot = b.let_(Op::AndI32(tile.into(), Opnd::Val(c1k)));
+    let slot_off = b.mul_i32(slot, c4096k);
+    let kslot0 = b.add_i32(slot_off, kvb);
+    let kaddr = b.add_i32(kslot0, frag_off);
+    let kaddr_hi = b.add_i32(kaddr, c16i);
+    let k_lo = b.load_lds_b128(Opnd::Val(kaddr));
+    let k_hi = b.load_lds_b128(Opnd::Val(kaddr_hi));
+    let k8 = b.cat_frag8(k_lo, k_hi);
+
+    let sc0 = b.mul_i32(tile, c256);
+    let sc1 = b.add_i32(sc0, tid4);
+    let sa_off = b.add_i32(sc1, c18432);
+    let sa_ptr = b.ptr_add(o, sa_off);
+    let sa_f = b.load_f32(sa_ptr, 0);
+    let sa = b.bitcast_i32(sa_f);
+    let sb_off = b.add_i32(sc1, c19456);
+    let sb_ptr = b.ptr_add(o, sb_off);
+    let sb_f = b.load_f32(sb_ptr, 0);
+    let sb = b.bitcast_i32(sb_f);
+    let s_frag = b.mfma_scale_fp8(a8, k8, zero, sa, sb);
+
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+        let lane = b.frag16_lane(s_frag, r);
+        let coff = b.c_i32(i_const * 128);
+        let addr = b.add_i32(lds_dyn, coff);
+        b.store_lds_b32(Opnd::Val(addr), Opnd::Val(lane));
+    }
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    // ---- online softmax update for this lane's row ----
+    let rbase0 = b.mul_i32(j, c128);
+    let rbase = b.add_i32(rbase0, wbase);
+    let mut vals: Vec<ValueId> = Vec::with_capacity(32);
+    for k in 0..32u32 {
+        let coff = b.c_i32(4 * k as i32);
+        let addr = b.add_i32(rbase, coff);
+        let raw = b.load_lds_b32(Opnd::Val(addr));
+        vals.push(b.bitcast_f32(raw));
+    }
+    b.wait_lds(0);
+    let mut tmax = vals[0];
+    for k in 1..32usize {
+        tmax = b.max_f32(tmax, vals[k]);
+    }
+    let m_old = b.bitcast_f32(m_var);
+    let m_new = b.max_f32(m_old, tmax);
+    let dm = b.sub_f32(m_old, m_new);
+    let corr = b.exp_f32(dm);
+    let mut exps: Vec<ValueId> = Vec::with_capacity(32);
+    for k in 0..32usize {
+        let sh = b.sub_f32(vals[k], m_new);
+        exps.push(b.exp_f32(sh));
+    }
+    let mut rsum = exps[0];
+    for k in 1..32usize {
+        rsum = b.add_f32(rsum, exps[k]);
+    }
+    let l_old = b.bitcast_f32(l_var);
+    let l_scaled = b.mul_f32(l_old, corr);
+    let l_new = b.add_f32(l_scaled, rsum);
+
+    // Publish the row correction for the lanes that own this row's O elements.
+    let corr_bits = b.bitcast_i32(corr);
+    b.store_lds_b32(Opnd::Val(corr_row), Opnd::Val(corr_bits));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    // ---- quantise P (x16) and PV for tile t ----
+    let mut words: Vec<ValueId> = Vec::with_capacity(8);
+    for m in 0..8usize {
+        let a = b.mul_f32(exps[4 * m], c16f);
+        let bb = b.mul_f32(exps[4 * m + 1], c16f);
+        let p0 = b.cvt_pk_fp8_f32(a, bb);
+        let c = b.mul_f32(exps[4 * m + 2], c16f);
+        let d = b.mul_f32(exps[4 * m + 3], c16f);
+        let p1 = b.cvt_pk_fp8_f32(c, d);
+        let sh = b.shl_i32(p1, c16i);
+        words.push(b.add_i32(p0, sh));
+    }
+    let pt0 = b.mul_i32(tile, c1024);
+    let pt1 = b.mul_i32(j, c32);
+    let pt2 = b.add_i32(pt0, pt1);
+    let pt2b = b.add_i32(pt2, wout);
+    let pt3 = b.add_i32(pt2b, c24576);
+    let p_ptr = b.ptr_add(o, pt3);
+    for m in 0..8usize {
+        let v = b.bitcast_f32(words[m]);
+        b.store_f32(p_ptr, 4 * m as u32, v);
+    }
+    let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    let vslot0 = b.add_i32(kslot0, c2048k);
+    let vaddr = b.add_i32(vslot0, frag_off);
+    let vaddr_hi = b.add_i32(vaddr, c16i);
+    let v_lo = b.load_lds_b128(Opnd::Val(vaddr));
+    let v_hi = b.load_lds_b128(Opnd::Val(vaddr_hi));
+    let v8 = b.cat_frag8(v_lo, v_hi);
+    // ---- O = MFMA(P, V, C = O * corr[row]); O stays in registers ----
+    let mut scaled_lanes: Vec<ValueId> = Vec::with_capacity(16);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+        let lane = b.frag16_lane(o_var, r);
+        let lanev = b.bitcast_f32(lane);
+        let ccoff = b.c_i32(i_const * 4);
+        let caddr0 = b.add_i32(pblk16, lds_corr);
+        let caddr = b.add_i32(caddr0, ccoff);
+        let craw = b.load_lds_b32(Opnd::Val(caddr));
+        let cf = b.bitcast_f32(craw);
+        let sc = b.mul_f32(lanev, cf);
+        scaled_lanes.push(b.bitcast_i32(sc));
+    }
+    let c_scaled = b.frag16_build(&scaled_lanes);
+    let o_frag = b.mfma_scale_fp8(p8, v8, c_scaled, c127, c123);
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    // Producer/consumer stage of the next tile: role A (waves 0-3) copies K, role B
+    // (waves 4-7) copies V into the other LDS slot; both branches end in the same
+    // workgroup barrier.
+    let tn = b.add_i32(tile, c1k);
+    let tn_off = b.mul_i32(tn, c2048k);
+    let ns = b.let_(Op::AndI32(Opnd::Val(tn), Opnd::Val(c1k)));
+    let ns_off = b.mul_i32(ns, c4096k);
+    let nslot = b.add_i32(ns_off, kvb);
+    let gk0 = b.add_i32(tn_off, c16384k);
+    let gk = b.add_i32(gk0, rt8);
+    let lk = b.add_i32(nslot, rt8);
+    let gv0 = b.add_i32(tn_off, c24576k);
+    let gv = b.add_i32(gv0, rt8);
+    let lv0 = b.add_i32(nslot, c2048k);
+    let lv = b.add_i32(lv0, rt8);
+
+    {
+        let gp = b.ptr_add(o, gv);
+        let w0 = b.load_f32(gp, 0);
+        let w1 = b.load_f32(gp, 4);
+        let w0 = b.bitcast_i32(w0);
+        let w1 = b.bitcast_i32(w1);
+        let lv4 = b.add_i32(lv, c4);
+        b.store_lds_b32(Opnd::Val(lv), Opnd::Val(w0));
+        b.store_lds_b32(Opnd::Val(lv4), Opnd::Val(w1));
+        b.wait_lds(0);
+        b.barrier();
+        b.wait_lds(0);
+    }
+
+    let tile_next = b.add_i32(tile, c1);
+    b.set_var(tile, tile_next);
+    b.set_var(o_var, o_frag);
+    let m_bits = b.bitcast_i32(m_new);
+    let l_bits = b.bitcast_i32(l_new);
+    b.set_var(m_var, m_bits);
+    b.set_var(l_var, l_bits);
+    let c4n = b.c_i32(4);
+    let more = b.cmp_lt_i32(tile_next, c4n);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+
+    // ---- epilogue: divide by l and write O ----
+    let l_final = b.bitcast_f32(l_var);
+    let inv_l = b.rcp_f32(l_final);
+    let inv_bits = b.bitcast_i32(inv_l);
+    b.store_lds_b32(Opnd::Val(corr_row), Opnd::Val(inv_bits));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let o_out00 = b.add_i32(lds_loc, wout);
+    let o_out0 = b.add_i32(o_out00, c20480);
+    let o_ptr = b.ptr_add(o, o_out0);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+        let ccoff = b.c_i32(i_const * 4);
+        let caddr0 = b.add_i32(pblk16, lds_corr);
+        let caddr = b.add_i32(caddr0, ccoff);
+        let craw = b.load_lds_b32(Opnd::Val(caddr));
+        let cf = b.bitcast_f32(craw);
+        let lane = b.frag16_lane(o_var, r);
+        let lanev = b.bitcast_f32(lane);
+        let res = b.mul_f32(lanev, cf);
+        b.store_f32(o_ptr, (i_const * 128) as u32, res);
+    }
+    }
+    b.end_if();
+    b.finish()
+}
