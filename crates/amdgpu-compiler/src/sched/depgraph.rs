@@ -19,6 +19,8 @@ pub struct Graph {
     pub eff: Vec<Effects>,
     /// Value version (defining instruction index) of each memory access's base register.
     pub ver: Vec<Option<usize>>,
+    /// Index of the last vcc writer when the terminator reads vcc (its result feeds the branch).
+    pub term_vcc_writer: Option<usize>,
 }
 
 fn add_edge(g: &mut Graph, from: usize, to: usize, lat: u32) {
@@ -52,6 +54,7 @@ pub fn build(m: &MFunction, insts: &[MInst], term: &Term, alu_across: bool) -> G
         preds: vec![Vec::new(); n],
         eff: Vec::new(),
         ver: vec![None; n],
+        term_vcc_writer: None,
     };
     let mut last_def: HashMap<Slot, usize> = HashMap::new();
     let mut readers: HashMap<Slot, Vec<usize>> = HashMap::new();
@@ -81,7 +84,9 @@ pub fn build(m: &MFunction, insts: &[MInst], term: &Term, alu_across: bool) -> G
             last_def.insert(s, i);
         }
     }
-    let _ = term;
+    if term_reads(term).contains(&VCC) {
+        g.term_vcc_writer = (0..n).rev().find(|&i| eff[i].writes.contains(&VCC));
+    }
     let is_fence = |i: usize| eff[i].fence != Fence::None;
     let fences: Vec<usize> = (0..n).filter(|&i| is_fence(i)).collect();
     let mems: Vec<usize> = (0..n).filter(|&i| !is_fence(i) && eff[i].mem.is_some()).collect();

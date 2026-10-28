@@ -149,6 +149,9 @@ pub fn schedule(
     let mut height = vec![0u32; n];
     for i in (0..n).rev() {
         let mut h = costs[i].latency;
+        if g.term_vcc_writer == Some(i) {
+            h = h.max(model::VCC_TO_BRANCH + 8);
+        }
         for &(s, lat) in &g.succs[i] {
             h = h.max(lat + height[s]);
         }

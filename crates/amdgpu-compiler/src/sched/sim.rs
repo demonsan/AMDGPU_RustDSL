@@ -24,6 +24,7 @@ struct SInst {
     is_vmem: bool,
     is_lds: bool,
     extra: i64, // cycles added after issue (branch cost)
+    vcc_extra: i64, // extra latency of a vcc read (terminator)
 }
 
 struct Wave {
@@ -94,6 +95,7 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
                 is_vmem: matches!(&e.mem, Some(a) if a.space == Space::Global),
                 is_lds: matches!(&e.mem, Some(a) if a.space == Space::Lds),
                 extra: 0,
+                vcc_extra: 0,
             });
         }
         // terminator cost
@@ -104,7 +106,7 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
             Term::Goto(t) => {
                 let ti = label_to_block.get(t).copied().unwrap_or(usize::MAX);
                 if !(m.elide_fallthrough && ti == next_layout) {
-                    cost_t += BRANCH_TAKEN as i64;
+                    cost_t += BRANCH_UNCOND as i64;
                 }
             }
             Term::CondGoto { target, fall, .. } => {
@@ -115,7 +117,7 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
                 } else {
                     cost_t += BRANCH_NOT_TAKEN as i64;
                     if !(m.elide_fallthrough && fi == next_layout) {
-                        cost_t += BRANCH_TAKEN as i64;
+                        cost_t += BRANCH_UNCOND as i64;
                     }
                 }
             }
@@ -130,6 +132,7 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
                 is_vmem: false,
                 is_lds: false,
                 extra: cost_t,
+                vcc_extra: if term_reads(&b.term).contains(&VCC) { VCC_TO_BRANCH as i64 } else { 0 },
             });
         }
     }
@@ -171,7 +174,7 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
             }
             for s in &ins.reads {
                 if let Some(r) = w.ready.get(s) {
-                    t = t.max(*r);
+                    t = t.max(*r + if *s == VCC { ins.vcc_extra } else { 0 });
                 }
             }
             match ins.fence {

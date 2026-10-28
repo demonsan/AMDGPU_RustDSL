@@ -16,6 +16,7 @@ pub mod liveness;
 pub mod model;
 pub mod order;
 pub mod sim;
+pub mod swp;
 pub mod verify;
 pub mod waits;
 
@@ -31,6 +32,8 @@ pub struct Options {
     pub xbar_only: Option<usize>,
     /// Debug: full-drain waits only.
     pub drain_only: bool,
+    /// Software-pipeline eligible counted loops (stage 3).
+    pub swp: bool,
     /// Remove empty latch blocks / elide fall-through branches (default on with the scheduler).
     pub cfg_cleanup: bool,
     /// Debug bisect: schedule only this block index.
@@ -44,7 +47,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false }
     }
 }
 
@@ -65,6 +68,7 @@ impl Options {
                     "stats" => o.stats = true,
                     "drain" => o.drain_only = true,
                     "nocfg" => o.cfg_cleanup = false,
+                    "swp" => o.swp = true,
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
@@ -91,6 +95,7 @@ pub struct Stats {
     pub scheduled: usize,
     pub skipped: usize,
     pub moved: usize,
+    pub swp_loops: usize,
     pub waits_inserted: usize,
     pub est_before: u64,
     pub est_after: u64,
@@ -102,15 +107,12 @@ fn apply_perm(insts: &[MInst], perm: &[usize]) -> Vec<MInst> {
     perm.iter().map(|&k| insts[k].clone()).collect()
 }
 
-/// Run the scheduling pass over the whole function.
-pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
-    let mut stats = Stats::default();
-    if o.cfg_cleanup {
-        cfg::cleanup(m);
+
+/// Reorder every basic block with the list scheduler (verified).
+pub(crate) fn schedule_blocks(m: &mut MFunction, o: &Options, stats: &mut Stats) -> Result<(), String> {
+    if !o.reorder {
+        return Ok(());
     }
-    waits::DRAIN_ONLY.store(o.drain_only, std::sync::atomic::Ordering::Relaxed);
-    waits::strip_auto_waits(m);
-    if o.reorder {
         let lv = liveness::compute(m);
         for bi in 0..m.blocks.len() {
             stats.blocks += 1;
@@ -139,7 +141,28 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
             stats.peak_after = stats.peak_after.max(r.peak_after);
             m.blocks[bi].insts = apply_perm(&insts, &r.perm);
         }
+    Ok(())
+}
+
+/// Run the scheduling pass over the whole function.
+pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
+    let mut stats = Stats::default();
+    if o.cfg_cleanup {
+        cfg::cleanup(m);
     }
+    waits::DRAIN_ONLY.store(o.drain_only, std::sync::atomic::Ordering::Relaxed);
+    waits::strip_auto_waits(m);
+    cfg::dce_dead_selects(m);
+    if o.swp {
+        let st = swp::run(m, o);
+        stats.swp_loops = st.loops_pipelined;
+        if o.stats {
+            for l in &st.log {
+                eprintln!("swp: {l}");
+            }
+        }
+    }
+    schedule_blocks(m, o, &mut stats)?;
     stats.waits_inserted = waits::insert_waits(m);
     if o.verify {
         waits::verify_waits(m).map_err(|e| format!("wait verification failed: {e}"))?;
