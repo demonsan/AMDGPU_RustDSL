@@ -17,6 +17,7 @@ pub mod model;
 pub mod order;
 pub mod sim;
 pub mod swp;
+pub mod taildup;
 pub mod verify;
 pub mod waits;
 
@@ -34,6 +35,8 @@ pub struct Options {
     pub drain_only: bool,
     /// Software-pipeline eligible counted loops (stage 3).
     pub swp: bool,
+    /// Tail-duplicate join prefixes into the arms of if/else diamonds inside loops (stage 2).
+    pub taildup: bool,
     /// Remove empty latch blocks / elide fall-through branches (default on with the scheduler).
     pub cfg_cleanup: bool,
     /// Debug bisect: schedule only this block index.
@@ -47,7 +50,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false }
     }
 }
 
@@ -69,6 +72,7 @@ impl Options {
                     "drain" => o.drain_only = true,
                     "nocfg" => o.cfg_cleanup = false,
                     "swp" => o.swp = true,
+                    "taildup" => o.taildup = true,
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
@@ -153,6 +157,14 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
     waits::DRAIN_ONLY.store(o.drain_only, std::sync::atomic::Ordering::Relaxed);
     waits::strip_auto_waits(m);
     cfg::dce_dead_selects(m);
+    if o.taildup {
+        let st = taildup::run(m, o);
+        if o.stats {
+            for l in &st.log {
+                eprintln!("taildup: {l}");
+            }
+        }
+    }
     if o.swp {
         let st = swp::run(m, o);
         stats.swp_loops = st.loops_pipelined;

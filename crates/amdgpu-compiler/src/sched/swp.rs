@@ -347,7 +347,7 @@ pub fn apply(m: &MFunction, li: &LoopInfo, k: usize, live_after: &HashSet<VReg>)
 }
 /// Cost used to choose between the plain loop and a candidate: simulated cycles per original
 /// iteration, averaged over 1 and 2 waves per SIMD, for the loop headed by `label`.
-fn eval_cost(m: &MFunction, label: u32, per_trip: f64, o: &super::Options) -> Option<f64> {
+pub(super) fn eval_cost(m: &MFunction, label: u32, per_trip: f64, o: &super::Options) -> Option<f64> {
     let mut c = m.clone();
     let mut stats = super::Stats::default();
     super::schedule_blocks(&mut c, o, &mut stats).ok()?;
