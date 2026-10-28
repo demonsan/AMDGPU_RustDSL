@@ -442,9 +442,10 @@ pub fn probe_roles() -> Function {
 
     b.finish()
 }
-/// Two-wave LDS probe (block 128). Each lane writes its id, the workgroup
-/// synchronises, then the lane reads its own slot and the partner wave's slot.
-/// Distinguishes "LDS data lost" from "barrier does not order waves".
+
+/// Two-wave LDS probe (block 128). Every lane writes a constant into its LDS
+/// slot, the workgroup synchronises, then the lane reads back its own slot and
+/// the partner wave's slot. Ablations: constant data, no `v_readfirstlane`.
 pub fn probe_waves2() -> Function {
     let mut b = FnBuilder::new("probe_waves2", 128);
     b.lds(512);
@@ -452,17 +453,18 @@ pub fn probe_waves2() -> Function {
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
 
-    let tid_scalar = b.read_first_lane(tid);
     let c6 = b.c_i32(6);
-    let wave = b.let_(Op::LshrI32(Opnd::Val(tid_scalar), Opnd::Val(c6)));
     let c1 = b.c_i32(1);
+    let c2 = b.c_i32(2);
     let c4 = b.c_i32(4);
     let c63 = b.c_i32(63);
     let c64 = b.c_i32(64);
     let c128 = b.c_i32(128);
+    let c7 = b.c_i32(7);
     let off = b.mul_i32(tid, c4);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
 
-    b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(c7));
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
@@ -485,5 +487,10 @@ pub fn probe_waves2() -> Function {
     let out2_ptr = b.ptr_add(o, out2_off);
     b.store_f32(out2_ptr, 0, value);
 
+    let _ = (c2, c512_unused());
     b.finish()
+}
+
+fn c512_unused() -> i32 {
+    512
 }

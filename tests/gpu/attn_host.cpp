@@ -265,10 +265,10 @@ int main(int argc, char** argv) {
         for (int tid = 0; tid < 128; ++tid) {
             int w = tid / 64;
             int l = tid % 64;
-            if (std::fabs(vals[tid] - (float)tid) > 0.5f) {
+            if (std::fabs(vals[tid] - 7.0f) > 0.5f) {
                 ++own_bad;
             }
-            int want = (w ^ 1) * 64 + l;
+            int want = 7;
             if (std::fabs(vals[128 + tid] - (float)want) > 0.5f) {
                 if (partner_bad < 6) {
                     std::fprintf(stderr, "waves2 mismatch tid=%d got=%.1f want=%d\n", tid,
