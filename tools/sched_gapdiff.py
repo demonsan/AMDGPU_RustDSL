@@ -25,5 +25,5 @@ for i,(x,y) in enumerate(zip(a,b)):
         print("MISMATCH at",i,x[0],y[0]);break
     if y[1]<x[1] or (set(x[2])-set(y[2])):
         n+=1
-        if y[1]<x[1] and not re.match(r'v_(cndmask|addc)',x[0]): print(i,x[0][:60],'| llvm nop',x[1],'waits',x[2],'| own nop',y[1],'waits',y[2],'| prev:',a[i-1][0][:50])
+        if (y[1]<x[1] or set(x[2])-set(y[2])) and i<int(sys.argv[3] if len(sys.argv)>3 else 99999): print(i,x[0][:60],'| llvm nop',x[1],'waits',x[2],'| own nop',y[1],'waits',y[2],'| prev:',a[i-1][0][:50])
 print('total diffs',n)
