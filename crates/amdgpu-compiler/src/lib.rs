@@ -6,6 +6,7 @@ pub mod hazards;
 pub mod lower;
 pub mod mir;
 pub mod regalloc;
+pub mod sched;
 
 pub struct Compiled {
     pub asm: String,
@@ -20,26 +21,55 @@ pub fn compile(f: &amdgpu_dsl::Function) -> Result<Compiled, String> {
 
 /// Same pipeline, with a selectable tail backend (OwnTail or LlvmTail).
 pub fn compile_with(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend) -> Result<Compiled, String> {
-    let mut m = lower::lower(f)?;
-    hazards::fix_value_hazards(&mut m);
-    let errs = mir::verify(&m);
-    if !errs.is_empty() {
-        return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
-    }
-    let alloc = regalloc::allocate(&m)?;
+    let (m, alloc) = lower_and_allocate(f)?;
     let asm = tail.finish(&m, &alloc)?;
     Ok(Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }
 
-/// Lower, schedule and allocate, then export post-RA MIR (no llc involved).
-pub fn export_mir(f: &amdgpu_dsl::Function, tail: &backend::LlvmTail) -> Result<String, String> {
-    let mut m = lower::lower(f)?;
+/// lower -> [schedule] -> hazards -> verify -> register allocation. With the scheduler enabled
+/// (`sched::Options::from_env`) a result that does not fit the register file is retried with a
+/// lower pressure limit and finally with the unscheduled code.
+fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regalloc::Alloc), String> {
+    let base = lower::lower(f)?;
+    if let Some(opts) = sched::Options::from_env() {
+        let mut last_err = String::new();
+        for cut in [0u32, 16, 32, 48] {
+            let mut o = opts.clone();
+            o.max_vgprs = opts.max_vgprs.saturating_sub(cut);
+            let mut m = base.clone();
+            let attempt = (|| -> Result<regalloc::Alloc, String> {
+                sched::run(&mut m, &o)?;
+                hazards::fix_value_hazards(&mut m);
+                let errs = mir::verify(&m);
+                if !errs.is_empty() {
+                    return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
+                }
+                regalloc::allocate(&m)
+            })();
+            match attempt {
+                Ok(a) => return Ok((m, a)),
+                Err(e) if e.contains("out of VGPRs") => last_err = e,
+                Err(e) => return Err(e),
+            }
+            if !opts.reorder {
+                break;
+            }
+        }
+        eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(120).collect::<String>());
+    }
+    let mut m = base;
     hazards::fix_value_hazards(&mut m);
     let errs = mir::verify(&m);
     if !errs.is_empty() {
         return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
     }
     let alloc = regalloc::allocate(&m)?;
+    Ok((m, alloc))
+}
+
+/// Lower, schedule and allocate, then export post-RA MIR (no llc involved).
+pub fn export_mir(f: &amdgpu_dsl::Function, tail: &backend::LlvmTail) -> Result<String, String> {
+    let (m, alloc) = lower_and_allocate(f)?;
     tail.export_mir(&m, &alloc)
 }
 
