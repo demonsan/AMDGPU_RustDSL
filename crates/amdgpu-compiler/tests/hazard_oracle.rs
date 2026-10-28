@@ -143,7 +143,7 @@ fn hazard_matrix() {
             }
             if let Some(n) = l.strip_prefix("s_nop ") {
                 nops += n.trim().parse::<u32>().unwrap_or(0) + 1;
-            } else if l.starts_with("s_waitcnt") || l.starts_with("s_delay_alu") {
+            } else if (l.starts_with("s_waitcnt") && l != "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)") || l.starts_with("s_delay_alu") {
                 waits.push(l.clone());
             }
         }
