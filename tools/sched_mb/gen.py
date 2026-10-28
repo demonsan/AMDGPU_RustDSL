@@ -185,6 +185,46 @@ add("s_nop0_x256", [], ["s_nop 0"] * 256, 256)
 add("s_mov_x256", [], ["s_mov_b32 s40, s41"] * 256, 256)
 add("v_add_ind_x256_long", [], ["v_add_f32 v%d, v2, v3" % D(i) for i in range(1024)], 1024)
 
+# ================= round 2 additions =================
+# clock calibration: long s_nop loop, compare s_memtime delta vs s_memrealtime (100 MHz) delta
+add("clk_cal_loop", [], ["s_mov_b32 s40, 3000", "cal_loop:"] + ["s_nop 15"] * 16 + ["s_sub_u32 s40, s40, 1", "s_cmp_lg_u32 s40, 0", "s_cbranch_scc1 cal_loop"], 1)
+# cndmask variants
+add("v_cndmask_e64_sgpr_ind", [], ["v_cndmask_b32_e64 v%d, v2, v3, s[30:31]" % D(i) for i in range(N)], N)
+add("v_cndmask_e64_sgpr_dep", [], ["v_cndmask_b32_e64 v1, v1, v2, s[30:31]" for i in range(N)], N)
+# larger-N LDS/global for slope (N=128 vs N=64)
+L2 = 128
+add("lds_rd128_ind128", [], ["ds_read_b128 v[%d:%d], v241 offset:%d" % (16+4*(i%16), 19+4*(i%16), (i%16)*1024) for i in range(L2)], L2)
+add("lds_rd_b32_ind128", [], ["ds_read_b32 v%d, v243 offset:%d" % (16+i%32, (i%16)*256) for i in range(L2)], L2)
+add("lds_rd_b64_tr_b8_ind128", [], ["ds_read_b64_tr_b8 v[%d:%d], v242 offset:%d" % (16+2*(i%16), 17+2*(i%16), (i%16)*512) for i in range(L2)], L2)
+add("lds_wr128_ind128", [], ["ds_write_b128 v241, v[16:19] offset:%d" % ((i%16)*1024) for i in range(L2)], L2)
+add("gl_dwordx4_ind64", g_setup, ["global_load_dwordx4 v[%d:%d], v244, s[6:7] offset:%d" % (16+4*(i%16), 19+4*(i%16), (i%4)*1024) for i in range(64)] + ["@MARK"], 64)
+# MFMA hazard sweep, reading D[0] (first) and D[last]; fine sweep of s_nop count
+ms2 = list(range(0, 21)) + [22, 24, 26, 28, 32]
+last = {"scale32": 47, "f32x32x16": 47, "f16x16x32": 35}
+for t, z in zf.items():
+    for which, reg in (("first", 32), ("last", last[t])):
+        body = []
+        for j, m in enumerate(ms2):
+            body += ["s_nop 15"] * 6
+            body += ["v_mov_b32 v32, 0xbf800000", "v_mov_b32 v%d, 0xbf800000" % last[t], "s_nop 7", z]
+            left = m
+            while left > 0:
+                c = min(left, 16); body.append("s_nop %d" % (c - 1)); left -= c
+            body.append("v_mov_b32 v%d, v%d" % (200 + j, reg))
+        add("mfma_haz2_%s_%s" % (t, which), mf_setup, body, 1, chk="v200", extra=len(ms2))
+# VALU write of A operand then MFMA reads it after m wait states
+body = []
+for j, m in enumerate([0, 1, 2, 3, 4]):
+    body += ["s_nop 15"] * 6
+    body += ["v_mov_b32 v%d, 0" % r for r in range(16, 24)] + ["s_nop 7"]
+    body += ["v_mov_b32 v%d, 0x38383838" % r for r in range(16, 24)]
+    left = m
+    while left > 0:
+        c = min(left, 16); body.append("s_nop %d" % (c - 1)); left -= c
+    body.append(zf["scale32"])
+    body += ["s_nop 15"] * 6
+    body.append("v_mov_b32 v%d, v32" % (200 + j))
+add("mfma_srcA_after_valu_scale32", mf_setup, body, 1, chk="v200", extra=5)
 out = [HDR]
 meta = []
 for name, text, n in KS:
@@ -213,7 +253,7 @@ for name, text, n in KS:
     .group_segment_fixed_size: 65536
     .private_segment_fixed_size: 0
     .wavefront_size: 64
-    .max_flat_workgroup_size: 512
+    .max_flat_workgroup_size: 1024
     .sgpr_count: 64
     .vgpr_count: 256
     .args:
@@ -224,6 +264,8 @@ out.append("amdhsa.target: amdgcn-amd-amdhsa--gfx950\namdhsa.version:\n  - 1\n  
 open("mb.s", "w").write("".join(out))
 json.dump({n: m for n, _, m in KS}, open("tests.json", "w"))
 print(len(KS), "kernels")
+
+
 
 
 

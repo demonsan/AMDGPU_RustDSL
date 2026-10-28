@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
     auto waves = split(argc > 3 ? argv[3] : "1,4,8");
     int reps = argc > 4 ? atoi(argv[4]) : 3;
     hipModule_t mod; CK(hipModuleLoad(&mod, argv[1]));
-    const size_t OUT = 8 * 512, IN = 1 << 20;
+    const size_t OUT = 16 * 512, IN = 1 << 20;
     void *dout, *din; CK(hipMalloc(&dout, OUT)); CK(hipMalloc(&din, IN)); CK(hipMemset(din, 0, IN));
     for (auto& nm : names) {
         hipFunction_t fn;
@@ -51,3 +51,4 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+
