@@ -299,6 +299,22 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
                 tuple(a, c_reg, 16)
             )]
         }
+        MOp::VMfmaScale32x32x64Fp8 => {
+            let a_reg = reg_of(&inst.srcs[0]);
+            let b_reg = reg_of(&inst.srcs[1]);
+            let c_reg = reg_of(&inst.srcs[2]);
+            let sa = reg_of(&inst.srcs[3]);
+            let sb = reg_of(&inst.srcs[4]);
+            vec![format!(
+                "v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}",
+                tuple(a, inst.dst.expect("dst"), 16),
+                tuple(a, a_reg, 8),
+                tuple(a, b_reg, 8),
+                tuple(a, c_reg, 16),
+                sr(a, sa),
+                sr(a, sb)
+            )]
+        }
         MOp::VMfma16x16x32Fp8 => {
             let a_reg = reg_of(&inst.srcs[0]);
             let b_reg = reg_of(&inst.srcs[1]);
@@ -363,7 +379,13 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             vec![format!("s_load_dwordx2 {}, s[0:1], {}", spair(a, inst.dst.unwrap()), inst.imm)]
         }
         MOp::SReadPhys => vec![format!("s_mov_b32 {}, s{}", d_s(a, inst), inst.imm)],
-        MOp::SMovB32 => vec![format!("s_mov_b32 {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]))],
+        MOp::SMovB32 => {
+            let text = match inst.srcs.first() {
+                Some(s) => src1_s(a, *s),
+                None => format!("{}", inst.imm as i32),
+            };
+            vec![format!("s_mov_b32 {}, {}", d_s(a, inst), text)]
+        }
         MOp::SAddU32 => vec![format!(
             "s_add_u32 {}, {}, {}",
             d_s(a, inst),

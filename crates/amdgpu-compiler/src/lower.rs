@@ -221,6 +221,41 @@ impl Lowerer {
         }
     }
 
+    /// Eight-dword fragment operand.
+    fn as_v8(&mut self, o: Opnd) -> Result<VReg, String> {
+        match o {
+            Opnd::Val(v) => {
+                let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
+                if self.mir.vreg_class(r) == RClass::V8 {
+                    Ok(r)
+                } else {
+                    Err(format!("value v{v} is not an eight-dword fragment"))
+                }
+            }
+            _ => Err("eight-dword fragment operand must be an SSA value".to_string()),
+        }
+    }
+
+    /// Scalar operand for instructions that take SGPRs (e.g. MFMA scales).
+    fn as_s1(&mut self, o: Opnd) -> Result<VReg, String> {
+        match o {
+            Opnd::Val(v) => {
+                let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
+                if self.mir.vreg_class(r) == RClass::S1 {
+                    Ok(r)
+                } else {
+                    Err(format!("value v{v} is not a scalar register"))
+                }
+            }
+            Opnd::I32(i) => {
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SMovB32).def(d).imm(i as i64));
+                Ok(d)
+            }
+            _ => Err("scalar operand must be a value or immediate".to_string()),
+        }
+    }
+
     /// Sixteen-dword fragment operand.
     fn as_v16(&mut self, o: Opnd) -> Result<VReg, String> {
         match o {
@@ -644,6 +679,33 @@ impl Lowerer {
                         .srcreg(ra)
                         .srcreg(rb)
                         .srcreg(rc),
+                );
+                self.val.insert(dst, d);
+            }
+            Op::Frag8(a, b, c, d, e, f, g, h) => {
+                let v = self.new_vreg(RClass::V8);
+                for (i, o) in [*a, *b, *c, *d, *e, *f, *g, *h].into_iter().enumerate() {
+                    let r = self.as_v1(o)?;
+                    self.touch(&[Src::Reg(r)]);
+                    self.push(MInst::new(MOp::VWriteSub).def(v).srcreg(r).imm(i as i64));
+                }
+                self.val.insert(dst, v);
+            }
+            Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
+                let ra = self.as_v8(*a)?;
+                let rb = self.as_v8(*b)?;
+                let rc = self.as_v16(*c)?;
+                let sa = self.as_s1(*scale_a)?;
+                let sb = self.as_s1(*scale_b)?;
+                let d = self.new_vreg(RClass::V16);
+                self.push(
+                    MInst::new(MOp::VMfmaScale32x32x64Fp8)
+                        .def(d)
+                        .srcreg(ra)
+                        .srcreg(rb)
+                        .srcreg(rc)
+                        .srcreg(sa)
+                        .srcreg(sb),
                 );
                 self.val.insert(dst, d);
             }

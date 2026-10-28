@@ -363,3 +363,39 @@ pub fn probe_mfma_fp8() -> Function {
     }
     b.finish()
 }
+/// Block-scaled fp8 MFMA probe: all-ones E4M3 A/B with K = 64, so the result is
+/// `64 * 2^(scale_a - 127) * 2^(scale_b - 127)` per element.
+pub fn probe_mfma_scale() -> Function {
+    let mut b = FnBuilder::new("probe_mfma_scale", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let ones = b.c_i32(0x38383838_u32 as i32);
+
+    let a1 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let b1 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let c1 = b.frag_zero(DType::Frag16);
+    // E8M0 127 == 2^0.
+    let d1 = b.mfma_scale_fp8(a1, b1, c1, 127, 127);
+
+    let a2 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let b2 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let c2 = b.frag_zero(DType::Frag16);
+    // E8M0 128 == 2^1.
+    let d2 = b.mfma_scale_fp8(a2, b2, c2, 127, 128);
+
+    let c128 = b.c_i32(128);
+    let lane_off = b.mul_i32(tid, c128);
+    let row = b.ptr_add(o, lane_off);
+    for i in 0..16u8 {
+        let bits = b.frag16_lane(d1, i);
+        let value = b.bitcast_f32(bits);
+        b.store_f32(row, 4 * i as u32, value);
+    }
+    for i in 0..16u8 {
+        let bits = b.frag16_lane(d2, i);
+        let value = b.bitcast_f32(bits);
+        b.store_f32(row, 64 + 4 * i as u32, value);
+    }
+    b.finish()
+}

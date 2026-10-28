@@ -44,6 +44,8 @@ pub enum DType {
     Frag2,
     /// Four-dword opaque fragment (an MFMA 16x16x16 accumulator).
     Frag4,
+    /// Eight-dword opaque fragment (an MFMA 32x32x64 A/B operand).
+    Frag8,
     /// Sixteen-dword opaque fragment (an MFMA 32x32 accumulator).
     Frag16,
 }
@@ -67,6 +69,7 @@ impl DType {
             DType::Ptr => "ptr",
             DType::Frag2 => "frag2",
             DType::Frag4 => "frag4",
+            DType::Frag8 => "frag8",
             DType::Frag16 => "frag16",
         }
     }
@@ -75,6 +78,7 @@ impl DType {
         match self {
             DType::Ptr | DType::Frag2 => 2,
             DType::Frag4 => 4,
+            DType::Frag8 => 8,
             DType::Frag16 => 16,
             _ => 1,
         }
@@ -175,6 +179,11 @@ pub enum Op {
     MfmaFp8_16x16x32 { a: Opnd, b: Opnd, c: Opnd },
     /// `v_mfma_f32_32x32x16_fp8_fp8`: fp8 A/B, 16-dword accumulator.
     MfmaFp8_32x32x16 { a: Opnd, b: Opnd, c: Opnd },
+    /// Build an eight-dword fragment from eight 32-bit values.
+    Frag8(Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd),
+    /// `v_mfma_scale_f32_32x32x64_f8f6f4`: block-scaled fp8 MFMA. The two scale
+    /// operands are E8M0 exponents in scalar registers.
+    MfmaScaleFp8_32x32x64 { a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
     /// Read dword `index` (0..15) of a sixteen-dword fragment.
     Frag16Lane { frag: Opnd, index: u8 },
     /// A fragment of `ty` zeroed out.
@@ -204,6 +213,8 @@ impl Op {
             Op::MfmaF16Wide { .. } => DType::Frag16,
             Op::MfmaFp8_16x16x32 { .. } => DType::Frag4,
             Op::MfmaFp8_32x32x16 { .. } => DType::Frag16,
+            Op::Frag8(..) => DType::Frag8,
+            Op::MfmaScaleFp8_32x32x64 { .. } => DType::Frag16,
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
             Op::BitcastF32(..) => DType::F32,
@@ -242,6 +253,10 @@ impl Op {
             Op::MfmaF16Wide { a, b, c } => vec![*a, *b, *c],
             Op::MfmaFp8_16x16x32 { a, b, c } => vec![*a, *b, *c],
             Op::MfmaFp8_32x32x16 { a, b, c } => vec![*a, *b, *c],
+            Op::Frag8(a, b, c, d, e, f, g, h) => vec![*a, *b, *c, *d, *e, *f, *g, *h],
+            Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
+                vec![*a, *b, *c, *scale_a, *scale_b]
+            }
             Op::Frag16Lane { frag, .. } => vec![*frag],
             Op::FragZero { .. } => vec![],
             Op::BitcastF32(a) => vec![*a],
@@ -589,6 +604,47 @@ impl FnBuilder {
         self.let_(Op::MfmaFp8_32x32x16 { a: a.into(), b: b.into(), c: c.into() })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn frag8(
+        &mut self,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        c: impl Into<Opnd>,
+        d: impl Into<Opnd>,
+        e: impl Into<Opnd>,
+        f: impl Into<Opnd>,
+        g: impl Into<Opnd>,
+        h: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::Frag8(
+            a.into(),
+            b.into(),
+            c.into(),
+            d.into(),
+            e.into(),
+            f.into(),
+            g.into(),
+            h.into(),
+        ))
+    }
+
+    pub fn mfma_scale_fp8(
+        &mut self,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        c: impl Into<Opnd>,
+        scale_a: impl Into<Opnd>,
+        scale_b: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::MfmaScaleFp8_32x32x64 {
+            a: a.into(),
+            b: b.into(),
+            c: c.into(),
+            scale_a: scale_a.into(),
+            scale_b: scale_b.into(),
+        })
+    }
+
     pub fn frag16_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
         self.let_(Op::Frag16Lane { frag: frag.into(), index })
     }
@@ -850,6 +906,35 @@ pub fn verify(f: &Function) -> Vec<String> {
                         }
                     }
                     Op::FragZero { .. } => {}
+                    Op::Frag8(a, b, c, d, e, f, g, h) => {
+                        for o in [a, b, c, d, e, f, g, h] {
+                            if let Err(err) = expect_int(f, *o, "frag8") {
+                                errs.push(here(err));
+                            }
+                        }
+                    }
+                    Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
+                        for (o, want, what) in [
+                            (*a, DType::Frag8, "a"),
+                            (*b, DType::Frag8, "b"),
+                            (*c, DType::Frag16, "c"),
+                        ] {
+                            if let Ok(t) = opnd_ty(f, o) {
+                                if t != want {
+                                    errs.push(here(format!(
+                                        "scaled mfma: operand {what} is {}, expected {}",
+                                        t.name(),
+                                        want.name()
+                                    )));
+                                }
+                            }
+                        }
+                        for (o, what) in [(*scale_a, "scale_a"), (*scale_b, "scale_b")] {
+                            if let Err(err) = expect_int(f, o, what) {
+                                errs.push(here(err));
+                            }
+                        }
+                    }
                     Op::MfmaFp8_16x16x32 { a, b, c } => {
                         for (o, want, what) in [
                             (*a, DType::Frag2, "a"),
