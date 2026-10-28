@@ -134,9 +134,9 @@ int main(int argc, char** argv) {
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
     // Real-data block-scaled fp8 matmul probe: fill the input region of `dout`
     // with A (32x64 fp8), B^T (32x64 fp8), and the per-lane scale bytes.
-    if (std::strcmp(kern, "probe_fp8_matmul") == 0) {
+    if (std::strcmp(kern, "probe_fp8_matmul") == 0 || std::strcmp(kern, "probe_fp8_load") == 0) {
         const int fp8_test = envi("FP8_TEST", 1);
-        std::vector<unsigned char> in(8704, 0);
+        std::vector<unsigned char> in(8960, 0);
         for (int i = 0; i < 32; ++i) {
             for (int k = 0; k < 64; ++k) {
                 const unsigned char v =
