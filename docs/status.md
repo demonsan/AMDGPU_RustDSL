@@ -20,7 +20,10 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Wide MFMA (16-dword accumulator) | `probe_mfma_wide`: `v_mfma_f32_32x32x8_f16` with a 16-dword zeroed accumulator; every element `8.0` → `PROBE_MFMA_WIDE_OK` |
 | FP8 MFMA | `probe_mfma_fp8`: all-ones E4M3 operands; `v_mfma_f32_16x16x32_fp8_fp8` → `32.0` (K=32), `v_mfma_f32_32x32x16_fp8_fp8` → `16.0` (K=16) → `PROBE_MFMA_FP8_OK` |
 | Block-scaled fp8 MFMA | `probe_mfma_scale`: `v_mfma_scale_f32_32x32x64_f8f6f4` with E8M0 scales; `(127,127)` → `64.0`, `(127,128)` → `128.0`, `(127,0x8000)` → `0.0`, `(127,0x7f00)` → `0.0` → `PROBE_MFMA_SCALE_OK` |
-| Wave-role branching (8 waves) | `probe_roles` marker phase: waves 0-3 store `111.0`, waves 4-7 store `222.0`, `marker_bad = 0` — DSL `if` + wave-id from `v_readfirstlane` verified on hardware |
+| Wave-role branching (8 waves) | `probe_roles`: waves 0-3 store `111.0`, waves 4-7 store `222.0` (`marker_bad = 0`) and exchange LDS data across waves (`bad = 0`) |
+| FMHA control skeleton | `probe_roles_loop`: 8 waves, role A/B, 4 iterations, two paired barriers per iteration, cross-role LDS exchange → `PROBE_ROLES_LOOP_OK` |
+| LDS self-read | `probe_lds_self2`: own-slot read after a barrier → `SELF2_OK` |
+| Two-wave LDS | `probe_waves2`: own + partner-wave slot → `PROBE_WAVES2_OK` |
 | `v_max3_f32`, fp8 fragments | `v_max3_f32` in the ISA of the compiler, `Frag8`/`V8` register class for the `32x32x64` operands |
 
 `attention_fwd` is a real dense attention kernel (one lane per query row, online
@@ -81,57 +84,30 @@ Host harness:
 * the IR verifier rejects ill-typed programs;
 * the attention IR verifies and really contains a loop.
 
-## Open issue: LDS self-read / multi-wave exchange
+## Resolved: the "LDS self-read / multi-wave exchange" anomaly
 
-`probe_lds` (one wave, 64 threads, reads the *neighbour* slot) passes on hardware.
-The related probes below fail, and the failure is not yet explained:
+Earlier rounds reported that reading a lane's own LDS slot, or exchanging LDS
+data across waves, "read back zero". That was **not** a hardware or compiler
+problem: the kernels store raw 32-bit values (`bitcast_f32` is an alias, so the
+stored word is the integer bit pattern), while those probe checks reinterpreted
+the buffer as `float` and compared against `(float)tid`. Small integers as float
+bits are denormal values that print as `0.0`, so the checks failed while the
+hardware behaved correctly. Checks now compare raw bit patterns.
 
-| variant | write | read | result |
-| --- | --- | --- | --- |
-| `probe_lds` | `tid` at `tid*4` | neighbour slot `((tid+1)&63)*4` | **OK** (`bad=0`) |
-| `probe_lds_own` | `tid` at `tid*4` | own slot `tid*4` | reads `0.0` |
-| `probe_lds_own` | `tid` at `tid*4` | own **and** neighbour | both read `0.0` |
-| `probe_lds_own` | `tid` at `tid*4` | own slot, no `s_barrier` | reads `0.0` |
-| `probe_waves2` (2 waves) | constant `7` | own slot | reads garbage |
-| `probe_roles` (8 waves) | `tid` | partner role slot | reads `0.0` |
+Verified after the fix (all on gfx950):
 
-Evidence collected so far:
+| probe | meaning |
+| --- | --- |
+| `probe_lds` | neighbour-slot read after a barrier (`bad=0`) |
+| `probe_lds_self2` | own-slot read after a barrier (`bad=0`) |
+| `probe_waves2` | two waves: own slot + partner-wave slot (`own_bad=0 partner_bad=0`) |
+| `probe_roles` | eight waves: role A/B ids exchanged across waves (`bad=0`) |
+| `probe_roles_loop` | 8 waves, roles, 4 iterations, two paired barriers per iteration, cross-role LDS exchange (`bad=0`, 2048 values) |
 
-* The global-store path in the failing kernels is correct: a constant store
-  from the same kernel lands (`const_bad = 0`), so the kernarg pointer, the
-  output address maths and `s_endpgm` are fine.
-* The generated assembly for `probe_lds_own` is semantically identical to the
-  passing `probe_lds` apart from the read address
-  (`v_mul_lo_u32 v3, v1, v2` / `ds_write_b32 v3, v1` / `ds_read_b32 v4, v3`).
-* Host-side causes were eliminated: probe kernels receive a single output
-  pointer, buffers are sized and indexed correctly, and an earlier host buffer
-  overrun (a `float vals[4096]` copy over an 8 KB buffer) was fixed.
-* Hand-written assembly controls are **not** valid evidence yet: the first
-  attempt omitted the `s_waitcnt` after `s_load_dwordx2` and faulted; those
-  files need a pass before they can be used.
+`probe_roles_loop` is the control skeleton of the FMHA reference core loop, so
+the structural pieces needed for the 1:1 reproduction are in place.
 
-Additional facts gathered:
-
-* `llvm-objdump -d --mcpu=gfx950` on both code objects shows the encoded
-  instructions match the emitted assembly (`ds_write_b32 v5, v1`,
-  `ds_read_b32 v5, v3`, `s_waitcnt lgkmcnt(0)`, `s_barrier`), so the assembler
-  is not reordering or mis-encoding the LDS pair.
-* Rotating the write by one slot (lane writes `(tid-1)&63`, reads its own slot,
-  so the value must come from the next lane) still reads `0.0`. That rules out
-  "write then read the same address" as the trigger.
-* Reading two slots in one kernel returns `0.0` for both, while the
-  single-neighbour-read kernel returns correct data.
-
-The contradiction (a slot written by another lane reads back correctly in
-`probe_lds`, yet the same slot reads `0` when a lane reads its own index) means
-the remaining hypothesis space is small: either the read address of the failing
-kernels is not what the assembly shows at run time, or the LDS content is being
-invalidated between the write and the read. Next step: dump LDS through a
-different path (write a sentinel from lane 0 only and read it from all lanes, then
-vary the sentinel address) and, if that also fails, compare against the aiter
-reference kernel's LDS write/read sequence disassembly.
-
-## Next: FMHA reference core loop## Next: FMHA reference core loop
+## Next: FMHA reference core loop## Next: FMHA reference core loop## Next: FMHA reference core loop
 
 The 1:1 reproduction target is the core loop of
 `aiter/hsa/gfx950/fmha_v4_fwd/fwd_hd128_mxfp8.co` (facts in
