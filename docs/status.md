@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| fp8 load path | `probe_fp8_load`: address arithmetic and the ISA fragment mapping for the real-data fp8 matmul probe -> `PROBE_FP8_LOAD_OK` |
 | Pack instructions | `probe_pack`: `v_cvt_pknorm_u16_f32(1.0, 0.5)` = `0x8000FFFF`; `v_cvt_scalef32_pk_fp8_bf16` low half = `0xAAAA3838`, high half = `0x3838AAAA` → `PROBE_PACK_OK` |
 | LDS self-read | `probe_lds_self2`: own-slot read after a barrier → `SELF2_OK` |
 | Two-wave LDS | `probe_waves2`: own + partner-wave slot → `PROBE_WAVES2_OK` |
@@ -214,6 +215,34 @@ once the FMHA core loop is wired to real data.
   ops.
 * MFMA operand alignment is now enforced after allocation: each operand base must
   be aligned to its width (and even), as the CDNA4 ISA requires.
+
+## Real-data fp8 matmul probe (round 13, in progress)
+
+`probe_fp8_matmul` feeds a genuine 32x64 fp8 A and 64x32 fp8 B (stored
+transposed) from global memory through the block-scaled MFMA and compares against
+an analytic CPU reference:
+
+* test 1 (identity): `A[i][k] = (k == i)`, `B[k][j] = (j == k)` -> `D` must be the
+  32x32 identity,
+* test 2 (scales): all-ones A and B with per-lane E8M0 scales
+  `127 + (row & 1)` -> `D[i][j] = 64 * 2^((i & 1) + (j & 1))`.
+
+Fragment mapping taken from CDNA4 ISA 7.1.3 and used by both sides:
+`A[i][k]` is in lane `i + 32 * (k / 32)` at byte `k % 32`, `B[k][j]` in lane
+`j + 32 * (k / 32)`, lane `l`'s scale byte covers row `l % 32` and K block
+`l / 32`, and `D[i][j]` is in lane `j + 32 * ((i / 4) % 2)` at register
+`4 * (i / 8) + (i % 4)`.
+
+**Verified so far:** `probe_fp8_load` (`PROBE_FP8_LOAD_OK`) checks the address
+arithmetic and the fragment mapping without the MFMA; every word of every lane
+matches the expected image (`lane0 A0 = 0x00000038`, `lane1 A0 = 0x00003800`,
+scale `0x7f`).
+
+**Still failing:** `probe_fp8_matmul` stores zeros (test 1) and takes an illegal
+memory access once extra stores are added (test 2), so the failure is downstream
+of the loads. Next step is a minimal MFMA kernel (constant Frag8 operands, single
+exported D word) and then to grow it back to the global-load version, which will
+separate a register-allocation problem from an MFMA operand problem.
 
 ## Next: FMHA reference core loop
 
