@@ -213,8 +213,7 @@ pub fn attn_debug() -> Function {
     attention_impl(true)
 }
 
-/// Minimal probe kernel: `o[tid] = q[tid]`, plus 
-` stored at byte 128.
+/// Minimal probe kernel: `o[tid] = q[tid]`, plus the constant 7 stored at byte 128.
 /// Used to validate the kernarg/ABI plumbing independently of attention math.
 pub fn probe_store() -> Function {
     let mut b = FnBuilder::new("probe_store", 64);
