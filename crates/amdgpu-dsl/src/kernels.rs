@@ -6953,9 +6953,9 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// all score data lives in registers (lane = query), the online-softmax correction is lane-local
 /// and LDS holds only the K and V tiles.
 /// LDS row pitch (bytes) of the K/V tiles of the transposed FMHA kernel (env FMHA_PITCH, read at
-/// build time, for bank-conflict experiments; 128 = unpadded).
+/// build time, for bank-conflict experiments; default 144: 16-byte aligned and conflict-free enough, 128 = unpadded).
 fn fmha_t_pitch() -> i32 {
-    std::env::var("FMHA_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(128)
+    std::env::var("FMHA_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(144)
 }
 pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let mut b = FnBuilder::new("fmha_fwd_hd128_mxfp8_t", 512);
