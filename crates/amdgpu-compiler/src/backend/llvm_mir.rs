@@ -192,7 +192,10 @@ pub fn export(m: &MFunction, a: &Alloc) -> Result<Exported, String> {
     }
 
     // 3. Header from the per-version template.
-    let kernarg = check_kernarg_layout(m)?;
+    let explicit_end = check_kernarg_layout(m)?;
+    // The kernel may read kernarg bytes beyond its named args (the DSL declares the full segment),
+    // so the segment size comes from the function, as in the own emitter.
+    let kernarg = ((m.kernarg_size.max(explicit_end) + 7) / 8) * 8;
     let irargs: Vec<String> = m.args.iter().enumerate().map(|(i, x)| format!("{} %a{i}", ir_type(x.dsl_ty))).collect();
     let mut mir = llvm20::HEADER_SRC
         .replace("@NAME@", &m.name)
