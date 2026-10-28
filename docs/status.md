@@ -247,6 +247,32 @@ produced by a memory load was consumed without waiting (the scale registers read
 garbage addresses). Both helpers now touch their operand, which also covers the
 V2 A/B operands of the F16 MFMA shapes.
 
+## Scale semantics of the block-scaled fp8 MFMA (round 15 findings)
+
+The unscaled data path is fully verified: `FP8_TEST=4` runs a real random fp8
+matmul (mixed E4M3 values incl. negatives, all scales 127) through the
+block-scaled MFMA and matches a CPU double-precision reference element by
+element, so the E4M3 decode, the A/B fragment mapping and the K pairing are
+correct.
+
+The E8M0 scale *lane* mapping is partially pinned down:
+
+* `FP8_TEST=11` (raise the scale of A lanes 0..3 to 2,4,8,16, everything else 1)
+  gives `D[i][0] = 96, 160, 288, 544` for rows 0..3 and 64 for rows 4..7, i.e.
+  lane `i`'s A scale multiplies **32 of row `i`'s 64 K values** by 2^(l-127).
+* `FP8_TEST=9` (A scale 2 on lanes 32..63 only, all-ones data) gives 96 =
+  32*1 + 32*2, so lanes 32..63 scale the other 32 K values of their row.
+* `FP8_TEST=2`, `5`, `7`, `8` pass, but `FP8_TEST=6` (B restricted to the upper
+  32 bytes of each B^T row, A scale varying as 2^(1 + (l % 4)) on lanes 32..63)
+  gives 48 = 16*2 + 16*1 instead of 64, and the pattern repeats with period 4 in
+  the row index. That means the 32 K indices held in B's lane group 1 are split
+  16/16 across A's two scale groups: **A and B do not share the same byte-to-K
+  ordering**, they differ by a 16-value interleave.
+
+Next step: measure the exact byte-to-K map with a targeted probe (single 1.0 at
+one A byte vs. distinct fp8 values in the B bytes) and encode the two layouts in
+the host reference and in the FMHA kernel.
+
 ## Next: FMHA reference core loop
 
 1. Resolve the 16 KB LDS question above (needed before scaling the core loop).
