@@ -1,5 +1,7 @@
 # LLVM tail integration ("our middle end + LLVM tail")
 
+NOTE (round 3): the primary pin is now ROCm 10.1.0 (AMD LLVM 24.0.0git, dialect `llvm24`), ROCm 7.0.2 (`llvm20`) stays supported; see docs/llvm-tail-conformance.md. Numbers below were measured with 7.0.2 unless stated.
+
 Status: prototype on branch `backend-tail`. Evidence grades: **Verified** = measured/observed in this
 repo on the node (ROCm 7.0.2, `AMD LLVM version 20.0.0git`, 8x MI355X); **Experimental** = works in our
 tests but not understood/measured beyond that; **Unknown** = not investigated.
