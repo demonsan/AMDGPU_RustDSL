@@ -299,15 +299,16 @@ int main(int argc, char** argv) {
         return (own_bad || partner_bad) ? 1 : 0;
     }
     if (std::strcmp(kern, "probe_pack") == 0) {
-        unsigned int bits[4096] = {0};
+        unsigned int bits[2048] = {0};
         std::memcpy(bits, got.data(), sizeof(bits));
-        std::printf("  pack pknorm=0x%08x lo=0x%08x hi=0x%08x old=0x%08x\n", bits[0], bits[1024], bits[2048], bits[3072]);
+        std::printf("  pack pknorm=0x%08x lo=0x%08x hi=0x%08x old=0x%08x\n", bits[0], bits[512], bits[1024], bits[1536]);
         int pack_bad = 0;
         if (bits[0] != 0x8000FFFFu) ++pack_bad;
-        if ((bits[1024] & 0x0000FFFFu) != 0x3838u) ++pack_bad;
-        if ((bits[1024] & 0xFFFF0000u) != 0xAAAA0000u) ++pack_bad;
-        if ((bits[2048] & 0xFFFF0000u) != 0x38380000u) ++pack_bad;
-        if ((bits[2048] & 0x0000FFFFu) != 0x0000AAAAu) ++pack_bad;
+        if ((bits[512] & 0x0000FFFFu) != 0x3838u) ++pack_bad;
+        if ((bits[512] & 0xFFFF0000u) != 0xAAAA0000u) ++pack_bad;
+        if ((bits[1024] & 0xFFFF0000u) != 0x38380000u) ++pack_bad;
+        if ((bits[1024] & 0x0000FFFFu) != 0x0000AAAAu) ++pack_bad;
+        if (bits[1536] != 0xAAAAAAAAu) ++pack_bad;
         std::printf(pack_bad ? "PROBE_PACK_FAIL\n" : "PROBE_PACK_OK\n");
         return pack_bad != 0;
     }

@@ -938,14 +938,15 @@ pub fn probe_fmha_core() -> Function {
     b.finish()
 }
 /// Pack instruction probe: checks the semantics of `v_cvt_pknorm_u16_f32` and
-/// of both destination halves of `v_cvt_scalef32_pk_fp8_bf16`.
+/// of the fp8 packing path.
 ///
-/// * `o[tid]`       = pknorm(1.0, 0.5)  -> low half 1.0 -> 0xFFFF, high 0x8000
-/// * `o[1024+tid]`  = pack fp8, low half of 0xAAAAAAAA replaced
-/// * `o[2048+tid]`  = pack fp8, high half of 0xAAAAAAAA replaced
+/// * `o[tid]`      = pknorm(1.0, 0.5)  -> low 0xFFFF, high 0x8000
+/// * `o[512+tid]`  = fp8 pack, low half of 0xAAAAAAAA replaced
+/// * `o[1024+tid]` = fp8 pack, high half of 0xAAAAAAAA replaced
+/// * `o[1536+tid]` = the 0xAAAAAAAA constant itself (control)
 ///
 /// The bf16 inputs are two 1.0 values (0x3F80) and the scale is 1.0, so the
-/// packed fp8 bytes must both be E4M3 1.0 (0x38).
+/// packed fp8 bytes are both E4M3 1.0 (0x38).
 pub fn probe_pack() -> Function {
     let mut b = FnBuilder::new("probe_pack", 64);
     b.lds(256);
@@ -954,8 +955,9 @@ pub fn probe_pack() -> Function {
     let tid = b.let_(Op::WorkitemId);
 
     let c4 = b.c_i32(4);
+    let c512 = b.c_i32(512);
     let c1024 = b.c_i32(1024);
-    let c2048 = b.c_i32(2048);
+    let c1536 = b.c_i32(1536);
 
     let old = b.c_i32(0xAAAA_AAAA_u32 as i32);
     let src = b.c_i32(0x3F80_3F80_u32 as i32);
@@ -972,24 +974,23 @@ pub fn probe_pack() -> Function {
     let v0 = b.bitcast_f32(pn);
     b.store_f32(p0, 0, v0);
 
-    let idx1 = b.add_i32(tid, c1024);
+    let idx1 = b.add_i32(tid, c512);
     let off1 = b.mul_i32(idx1, c4);
     let p1 = b.ptr_add(o, off1);
     let v1 = b.bitcast_f32(lo);
     b.store_f32(p1, 0, v1);
 
-    let c3072 = b.c_i32(3072);
-    let idx3 = b.add_i32(tid, c3072);
-    let off3 = b.mul_i32(idx3, c4);
-    let p3 = b.ptr_add(o, off3);
-    let v3 = b.bitcast_f32(old);
-    b.store_f32(p3, 0, v3);
-
-    let idx2 = b.add_i32(tid, c2048);
+    let idx2 = b.add_i32(tid, c1024);
     let off2 = b.mul_i32(idx2, c4);
     let p2 = b.ptr_add(o, off2);
     let v2 = b.bitcast_f32(hi);
     b.store_f32(p2, 0, v2);
+
+    let idx3 = b.add_i32(tid, c1536);
+    let off3 = b.mul_i32(idx3, c4);
+    let p3 = b.ptr_add(o, off3);
+    let v3 = b.bitcast_f32(old);
+    b.store_f32(p3, 0, v3);
 
     b.finish()
 }
