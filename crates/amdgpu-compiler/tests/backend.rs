@@ -156,3 +156,20 @@ fn loop_variables_survive_verification() {
     assert!(has_loop);
     let _ = Op::ConstI32(0);
 }
+#[test]
+fn mfma_and_lds_are_emitted() {
+    let mfma = compile(&kernel_by_name("probe_mfma").unwrap()).unwrap();
+    assert!(
+        mfma.asm.contains("v_mfma_f32_16x16x16_f16 v["),
+        "MFMA instruction missing"
+    );
+    let lds = compile(&kernel_by_name("probe_lds").unwrap()).unwrap();
+    assert!(lds.asm.contains("ds_write_b32"), "LDS write missing");
+    assert!(lds.asm.contains("ds_read_b32"), "LDS read missing");
+    assert!(lds.asm.contains("s_barrier"), "barrier missing");
+    assert!(lds.asm.contains("s_waitcnt lgkmcnt(0)"), "lgkmcnt wait missing");
+    assert!(
+        lds.asm.contains(".amdhsa_group_segment_fixed_size 256"),
+        "LDS size not declared in the descriptor"
+    );
+}

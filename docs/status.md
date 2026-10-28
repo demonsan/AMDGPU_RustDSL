@@ -15,6 +15,8 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | ABI + memory path | `probe_store` kernel: `o[tid] = q[tid]` plus a kernarg scalar, `PROBE_OK` |
 | Hardware transcendental behaviour | `probe_math`: `exp(1) = 2.0`, `exp(2) = 4.0`, `rcp(3) = 0.333333313` |
 | **Attention kernel numerics** | `attention_fwd` on gfx950 vs CPU reference: `H=1 S=64` max_abs_err `9.4e-05`; `H=2 S=128` max_abs_err `6.0e-05`; `bad = 0` in both |
+| MFMA infrastructure | `probe_mfma`: emitted `v_mfma_f32_16x16x16_f16 v[12:15], v[4:5], v[6:7], v[8:11]` with 4/2/2/4-dword tuples; all 256 accumulator elements `16.0` → `PROBE_MFMA_OK` |
+| LDS, barriers, `lgkmcnt` | `probe_lds`: 64 lanes write their id to LDS, barrier, read the neighbour's value → `PROBE_LDS_OK`; descriptor declares 256 B of LDS |
 
 `attention_fwd` is a real dense attention kernel (one lane per query row, online
 softmax over the key loop, f32 accumulation, f16 output) that is fully generated
@@ -70,16 +72,19 @@ Host harness:
 
 The 1:1 reproduction target is the core loop of
 `aiter/hsa/gfx950/fmha_v4_fwd/fwd_hd128_mxfp8.co` (facts in
-[docs/fmha-reference.md](fmha-reference.md)). It needs features this backend does
-not have yet, in this order:
+[docs/fmha-reference.md](fmha-reference.md)). Landed so far: MFMA
+(`v_mfma_f32_16x16x16_f16`) with 4/2/2/4-dword tuples, LDS read/write,
+`s_barrier` and explicit `lgkmcnt` waits, all verified on hardware.
 
-1. MFMA ops in the DSL and MIR (including the scaled fp8/fp4 forms), with a
-   micro-kernel validated against a CPU reference on gfx950.
-2. LDS staging: `ds_write`/`ds_read` with vector widths, `s_barrier`, and
-   `lgkmcnt` accounting (the current lowerer only waits with `vmcnt(0)`).
-3. Multi-wave blocks: workgroup-level barriers and role split (producer/consumer).
-4. Then the loop structure: A/B loop pairing, `grpmask`-style rollback exits,
-   and the witness-based comparison against the reference instruction stream.
+Still needed, in order:
+
+1. Wider fragments (`32x32x8` → 16-dword accumulator, `32x32x64`) and the
+   scaled fp8/fp4 MFMA forms, including the 16-byte scaled encoding.
+2. Vector LDS widths (`ds_read_b64`/`b128`, `ds_read_b64_tr_b8`) and
+   automatic `lgkmcnt` accounting for partial readiness.
+3. Multi-wave blocks: role split by wave id and the paired-phase barriers.
+4. Then the loop structure: A/B loop pairing, rollback exits, and the
+   witness-based comparison against the reference instruction stream.
 
 ## Not started
 
