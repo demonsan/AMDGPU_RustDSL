@@ -81,25 +81,41 @@ Host harness:
 * the IR verifier rejects ill-typed programs;
 * the attention IR verifies and really contains a loop.
 
-## Open issue: multi-wave LDS exchange
+## Open issue: LDS self-read / multi-wave exchange
 
-`probe_lds` (one wave, 64 threads) passes on hardware, but the cross-wave exchange
-probes (`probe_roles`, `probe_waves2`) read garbage back from LDS even for a
-lane's own slot. What has been ruled out so far:
+`probe_lds` (one wave, 64 threads, reads the *neighbour* slot) passes on hardware.
+The related probes below fail, and the failure is not yet explained:
 
-* probe arguments (the harness always passes one output pointer to probes),
-* host buffer sizes and output indices,
-* constant vs. per-lane data, presence of `v_readfirstlane`,
-* one wave (block 64) vs. two (block 128) vs. eight waves (block 512),
-* LDS declaration of 256 vs. 512 bytes, declared workgroup size 64 vs. 128,
-* the `lgkmcnt` wait before consuming a `ds_read_b32` result (fixed, but not sufficient).
+| variant | write | read | result |
+| --- | --- | --- | --- |
+| `probe_lds` | `tid` at `tid*4` | neighbour slot `((tid+1)&63)*4` | **OK** (`bad=0`) |
+| `probe_lds_own` | `tid` at `tid*4` | own slot `tid*4` | reads `0.0` |
+| `probe_lds_own` | `tid` at `tid*4` | own **and** neighbour | both read `0.0` |
+| `probe_lds_own` | `tid` at `tid*4` | own slot, no `s_barrier` | reads `0.0` |
+| `probe_waves2` (2 waves) | constant `7` | own slot | reads garbage |
+| `probe_roles` (8 waves) | `tid` | partner role slot | reads `0.0` |
 
-Next experiment: run the hand-written `tools/lds_probe.s` (assembled directly, no
-DSL) as a multi-wave kernel. If that also fails, the problem is in how the code
-object/descriptor is consumed; if it works, the difference to the generated
-kernel is the bug.
+Evidence collected so far:
 
-## Next: FMHA reference core loop
+* The global-store path in the failing kernels is correct: a constant store
+  from the same kernel lands (`const_bad = 0`), so the kernarg pointer, the
+  output address maths and `s_endpgm` are fine.
+* The generated assembly for `probe_lds_own` is semantically identical to the
+  passing `probe_lds` apart from the read address
+  (`v_mul_lo_u32 v3, v1, v2` / `ds_write_b32 v3, v1` / `ds_read_b32 v4, v3`).
+* Host-side causes were eliminated: probe kernels receive a single output
+  pointer, buffers are sized and indexed correctly, and an earlier host buffer
+  overrun (a `float vals[4096]` copy over an 8 KB buffer) was fixed.
+* Hand-written assembly controls are **not** valid evidence yet: the first
+  attempt omitted the `s_waitcnt` after `s_load_dwordx2` and faulted; those
+  files need a pass before they can be used.
+
+Next experiment to close this out: disassemble the failing `.co`
+(`llvm-objdump -d --mcpu=gfx950`) and compare the encoded `ds_write_b32` /
+`ds_read_b32` pairs with the passing kernel; if the encodings match, add an
+`s_nop` pad between write and read (write-then-read hazard) and re-test.
+
+## Next: FMHA reference core loop## Next: FMHA reference core loop
 
 The 1:1 reproduction target is the core loop of
 `aiter/hsa/gfx950/fmha_v4_fwd/fwd_hd128_mxfp8.co` (facts in
