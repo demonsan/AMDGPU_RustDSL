@@ -245,7 +245,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[1])
         )],
         MOp::VCvtPkFp8Hi => vec![format!(
-            "v_cvt_scalef32_pk_fp8_bf16 {}, {}, {} op_sel:[0,0,0,1]",
+            "v_cvt_scalef32_pk_fp8_bf16 {}, {}, {} op_sel:[0,0,1]",
             d(a),
             src1(a, inst.srcs[0]),
             src1(a, inst.srcs[1])
