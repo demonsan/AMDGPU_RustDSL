@@ -30,7 +30,7 @@ pub struct Options {
     /// Debug: full-drain waits only.
     pub drain_only: bool,
     /// Debug bisect: schedule only this block index.
-    pub only_block: Option<usize>,
+    pub only_block: Option<Vec<usize>>,
     /// Pressure limit in VGPR dwords (never below the original peak of the block).
     pub max_vgprs: u32,
     /// Run the verifiers (always on in tests).
@@ -62,7 +62,7 @@ impl Options {
                     "drain" => o.drain_only = true,
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
-                            o.only_block = v.parse().ok();
+                            o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
                         }
                         if let Some(v) = t.strip_prefix("xbar=") {
                             o.xbar_only = v.parse().ok();
@@ -107,7 +107,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         for bi in 0..m.blocks.len() {
             stats.blocks += 1;
             let insts = m.blocks[bi].insts.clone();
-            if insts.len() < 2 || o.only_block.map_or(false, |x| x != bi) {
+            if insts.len() < 2 || o.only_block.as_ref().map_or(false, |x| !x.contains(&bi)) {
                 continue;
             }
             // Explicit partial waits count outstanding operations by program order: do not touch.
