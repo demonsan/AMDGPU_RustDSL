@@ -1,21 +1,20 @@
-// Assembler probe for the instruction family used by the FMHA reference core
-// loop. Every line is intentional; clang reports the exact operand shape when
-// a form is wrong.
+// Second assembler probe for the FMHA instruction family: corrected names and
+// operand counts, plus the encodings we will compare against the reference.
 .text
 .globl fmha_isa_probe
 .p2align 8
 .type fmha_isa_probe,@function
 fmha_isa_probe:
-    // Wider f16 MFMA: D = 16 dwords.
+    // f16 MFMA, wider shape (D = 16 dwords).
     v_mfma_f32_32x32x8_f16 v[16:31], v[32:33], v[34:35], v[36:51]
-    // FP8 / FP6 / FP4 MFMA (gfx950 shapes).
-    v_mfma_f32_16x16x32_f8f6f4 v[4:7], v[8:11], v[12:15], v[16:19]
-    v_mfma_f32_32x32x16_f8f6f4 v[16:31], v[32:39], v[40:47], v[48:63]
+    // gfx950 fp8/fp6/fp4 MFMA shapes.
+    v_mfma_f32_16x16x128_f8f6f4 v[4:7], v[8:15], v[16:23], v[24:27]
     v_mfma_f32_32x32x64_f8f6f4 v[16:31], v[32:39], v[40:47], v[48:63]
-    // Scaled variant: the 16-byte encoding used by the reference kernel.
     v_mfma_scale_f32_32x32x64_f8f6f4 v[16:31], v[32:39], v[40:47], v[48:63], s0, s1
-    // Scaled fused multiply-add-accumulate for the PV product.
-    v_smfmac_f32_16x16x128_fp8_fp8 v[4:7], v[8:11], v[12:15], v16
+    v_mfma_f32_16x16x32_fp8_fp8 v[4:7], v[8:11], v[12:15], v[16:19]
+    v_mfma_f32_32x32x16_fp8_fp8 v[16:31], v[32:39], v[40:47], v[48:63]
+    // Sparse MFMA (5 operands: D, A, B, C, index).
+    v_smfmac_f32_16x16x128_fp8_fp8 v[4:7], v[8:11], v[12:15], v[16:19], v20
     // Softmax helpers.
     v_max3_f32 v1, v2, v3, v4
     v_cvt_pknorm_u16_f32 v5, v6, v7
