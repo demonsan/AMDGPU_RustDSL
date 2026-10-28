@@ -163,7 +163,7 @@ int main(int argc, char** argv) {
             for (int k = 0; k < 64; ++k) {
                 const unsigned char v =
                     (fp8_test == 1) ? ((k == i) ? 0x38 : 0x00)
-                                    : ((fp8_test == 3) ? palette[next_rand() % 9] : 0x38);
+                                    : ((fp8_test == 3 || fp8_test == 4) ? palette[next_rand() % 9] : 0x38);
                 in[i * 64 + k] = v;
                 in[2048 + i * 64 + k] = v;
             }
