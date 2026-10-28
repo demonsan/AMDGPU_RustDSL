@@ -125,6 +125,7 @@ int main(int argc, char** argv) {
     double worst = 0.0, sum_abs = 0.0, max_ref = 0.0;
     size_t bad = 0, cnt = 0;
     const int check_rows = envi("REF_ROWS", 64);
+    const double cpu_scale = std::getenv("REF_CPU_SCALE") ? std::atof(std::getenv("REF_CPU_SCALE")) : (double)softmax_scale;
     std::vector<double> sc(SK), qd(D), kd(D);
     for (int b = 0; b < B; ++b)
         for (int h = 0; h < H; ++h)
@@ -138,7 +139,7 @@ int main(int argc, char** argv) {
                     for (int kk = 0; kk < D; ++kk)
                         acc += qd[kk] * fp8_e4m3(k[(((size_t)b * SK + t) * H + h) * D + kk]) *
                                std::ldexp(1.0, (int)ks_at(b, t, h, kk / 32) - 127);
-                    sc[t] = acc * softmax_scale;
+                    sc[t] = acc * cpu_scale;
                     mx = std::max(mx, sc[t]);
                 }
                 double den = 0.0;
