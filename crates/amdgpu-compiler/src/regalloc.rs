@@ -178,7 +178,7 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     // VGPRs: V1 and V2 share one file.
     let mut vregs: Vec<(usize, usize, VReg, RClass)> = Vec::new();
     for (r, c) in m.vregs.iter().enumerate() {
-        if matches!(c, RClass::V1 | RClass::V2) {
+        if c.is_vector() {
             let s = if start[r] == usize::MAX { 0 } else { start[r] };
             vregs.push((s, end[r], r as VReg, *c));
         }
@@ -212,7 +212,7 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     // SGPRs.
     let mut sregs: Vec<(usize, usize, VReg, RClass)> = Vec::new();
     for (r, c) in m.vregs.iter().enumerate() {
-        if matches!(c, RClass::S1 | RClass::S2) {
+        if !c.is_vector() {
             let s = if start[r] == usize::MAX { 0 } else { start[r] };
             sregs.push((s, end[r], r as VReg, *c));
         }
@@ -278,33 +278,33 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
 
 fn mark_used(used: &mut [bool], slot: usize, c: RClass) {
     used[slot] = true;
-    if matches!(c, RClass::V2 | RClass::S2) {
-        used[slot + 1] = true;
+    for k in 1..c.dwords() as usize {
+        used[slot + k] = true;
     }
 }
 
 fn free_phys(used_v: &mut [bool], used_s: &mut [bool], phys: u32, c: RClass) {
     let p = phys as usize;
-    match c {
-        RClass::V1 => used_v[p] = false,
-        RClass::V2 => {
-            used_v[p] = false;
-            used_v[p + 1] = false;
-        }
-        RClass::S1 => used_s[p] = false,
-        RClass::S2 => {
-            used_s[p] = false;
-            used_s[p + 1] = false;
-        }
+    let table = if c.is_vector() { used_v } else { used_s };
+    for k in 0..c.dwords() as usize {
+        table[p + k] = false;
     }
 }
 
 fn find_slot(used: &[bool], c: RClass) -> Option<usize> {
-    let (lo, width, align) = match c {
-        RClass::V1 => (V_RESERVED, 1usize, 1usize),
-        RClass::V2 => (2usize, 2usize, 2usize),
-        RClass::S1 => (S_RESERVED, 1, 1),
-        RClass::S2 => (S_RESERVED, 2, 2),
+    // A register tuple must start at a multiple of its own width: the ISA
+    // requires 64-bit pairs at even indices and 128-bit tuples at multiples of
+    // four.
+    let width = c.dwords() as usize;
+    let align = width;
+    let lo = if c.is_vector() {
+        if width == 1 {
+            V_RESERVED
+        } else {
+            width
+        }
+    } else {
+        S_RESERVED
     };
     let n = used.len();
     let mut i = lo;

@@ -40,6 +40,10 @@ pub enum DType {
     I1,
     /// 64-bit global pointer.
     Ptr,
+    /// Two-dword opaque fragment (an MFMA A/B operand).
+    Frag2,
+    /// Four-dword opaque fragment (an MFMA 16x16x16 accumulator).
+    Frag4,
 }
 
 impl DType {
@@ -59,12 +63,15 @@ impl DType {
             DType::U32 => "u32",
             DType::I1 => "i1",
             DType::Ptr => "ptr",
+            DType::Frag2 => "frag2",
+            DType::Frag4 => "frag4",
         }
     }
 
     pub fn dwords(self) -> u32 {
         match self {
-            DType::Ptr => 2,
+            DType::Ptr | DType::Frag2 => 2,
+            DType::Frag4 => 4,
             _ => 1,
         }
     }
@@ -145,6 +152,19 @@ pub enum Op {
 
     LoadU16 { base: Opnd, byte_off: u32 },
     LoadF32 { base: Opnd, byte_off: u32 },
+
+    /// Build a two-dword fragment from two 32-bit values.
+    Frag2(Opnd, Opnd),
+    /// Read dword `index` (0 or 1) of a two-dword fragment.
+    Frag2Lane { frag: Opnd, index: u8 },
+    /// Build a four-dword fragment from four 32-bit values.
+    Frag4(Opnd, Opnd, Opnd, Opnd),
+    /// Read dword `index` (0..3) of a four-dword fragment.
+    Frag4Lane { frag: Opnd, index: u8 },
+    /// `v_mfma_f32_16x16x16_f16` with an existing accumulator.
+    MfmaF16 { a: Opnd, b: Opnd, c: Opnd },
+    /// Reinterpret the bits of an integer as `f32` (register renaming only).
+    BitcastF32(Opnd),
 }
 
 impl Op {
@@ -162,6 +182,10 @@ impl Op {
             Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) => DType::I1,
             Op::Select { ty, .. } => *ty,
             Op::PtrAdd { .. } | Op::KernargPtr { .. } => DType::Ptr,
+            Op::Frag2(..) => DType::Frag2,
+            Op::Frag2Lane { .. } | Op::Frag4Lane { .. } => DType::U32,
+            Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
+            Op::BitcastF32(..) => DType::F32,
         }
     }
 
@@ -188,6 +212,12 @@ impl Op {
             }
             Op::Select { cond, a, b, .. } => vec![*cond, *a, *b],
             Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } => vec![*base],
+            Op::Frag2(a, b) => vec![*a, *b],
+            Op::Frag2Lane { frag, .. } => vec![*frag],
+            Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
+            Op::Frag4Lane { frag, .. } => vec![*frag],
+            Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
+            Op::BitcastF32(a) => vec![*a],
         }
     }
 }
@@ -445,6 +475,41 @@ impl FnBuilder {
     pub fn ptr_add(&mut self, base: impl Into<Opnd>, byte_off: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PtrAdd { base: base.into(), byte_off: byte_off.into() })
     }
+
+    pub fn frag2(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Frag2(a.into(), b.into()))
+    }
+
+    pub fn frag2_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
+        self.let_(Op::Frag2Lane { frag: frag.into(), index })
+    }
+
+    pub fn frag4(
+        &mut self,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        c: impl Into<Opnd>,
+        d: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::Frag4(a.into(), b.into(), c.into(), d.into()))
+    }
+
+    pub fn frag4_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
+        self.let_(Op::Frag4Lane { frag: frag.into(), index })
+    }
+
+    pub fn mfma_f16(
+        &mut self,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        c: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::MfmaF16 { a: a.into(), b: b.into(), c: c.into() })
+    }
+
+    pub fn bitcast_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::BitcastF32(a.into()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +661,54 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                     Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } => {
                         if let Err(e) = expect_ptr(f, *base, "load") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::Frag2(a, b) => {
+                        for o in [a, b] {
+                            if let Err(e) = expect_int(f, *o, "frag2") {
+                                errs.push(here(e));
+                            }
+                        }
+                    }
+                    Op::Frag4(a, b, c, d) => {
+                        for o in [a, b, c, d] {
+                            if let Err(e) = expect_int(f, *o, "frag4") {
+                                errs.push(here(e));
+                            }
+                        }
+                    }
+                    Op::Frag2Lane { frag, index } => {
+                        match opnd_ty(f, *frag) {
+                            Ok(DType::Frag2) => {}
+                            Ok(t) => errs.push(here(format!("frag2lane: expected frag2, found {}", t.name()))),
+                            Err(e) => errs.push(here(e)),
+                        }
+                        if *index > 1 {
+                            errs.push(here("frag2lane: index out of range".to_string()));
+                        }
+                    }
+                    Op::Frag4Lane { frag, index } => {
+                        match opnd_ty(f, *frag) {
+                            Ok(DType::Frag4) => {}
+                            Ok(t) => errs.push(here(format!("frag4lane: expected frag4, found {}", t.name()))),
+                            Err(e) => errs.push(here(e)),
+                        }
+                        if *index > 3 {
+                            errs.push(here("frag4lane: index out of range".to_string()));
+                        }
+                    }
+                    Op::MfmaF16 { a, b, c } => {
+                        for (o, want, what) in [(*a, DType::Frag2, "a"), (*b, DType::Frag2, "b"), (*c, DType::Frag4, "c")] {
+                            if let Ok(t) = opnd_ty(f, o) {
+                                if t != want {
+                                    errs.push(here(format!("mfma: operand {what} is {}, expected {}", t.name(), want.name())));
+                                }
+                            }
+                        }
+                    }
+                    Op::BitcastF32(a) => {
+                        if let Err(e) = expect_int(f, *a, "bitcast") {
                             errs.push(here(e));
                         }
                     }

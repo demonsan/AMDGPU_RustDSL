@@ -11,6 +11,7 @@ pub type VReg = u32;
 pub enum RClass {
     V1,
     V2,
+    V4,
     S1,
     S2,
 }
@@ -19,8 +20,14 @@ impl RClass {
     pub fn dwords(self) -> u32 {
         match self {
             RClass::V2 | RClass::S2 => 2,
+            RClass::V4 => 4,
             _ => 1,
         }
+    }
+
+    /// Vector register classes share one physical file.
+    pub fn is_vector(self) -> bool {
+        matches!(self, RClass::V1 | RClass::V2 | RClass::V4)
     }
 }
 
@@ -59,6 +66,10 @@ pub enum MOp {
     VCmpGeI32,
     VCmpNeI32,
     VCndmask,
+    // fragments / matrix cores
+    VWriteSub,
+    VReadSub,
+    VMfma16x16x16F16,
     // global memory
     GlobalLoadU16,
     GlobalLoadF32,
@@ -269,6 +280,45 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                     if let Some(d) = inst.dst {
                         if m.vreg_class(d) != RClass::V2 {
                             errs.push(format!("block {bi} inst {ii}: ptradd dst must be V2"));
+                        }
+                    }
+                }
+                MOp::VMfma16x16x16F16 => {
+                    if let Some(d) = inst.dst {
+                        if m.vreg_class(d) != RClass::V4 {
+                            errs.push(format!("block {bi} inst {ii}: mfma dst must be V4"));
+                        }
+                    }
+                    let want = [RClass::V2, RClass::V2, RClass::V4];
+                    for (k, w) in want.iter().enumerate() {
+                        match inst.srcs.get(k) {
+                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) => errs.push(format!(
+                                "block {bi} inst {ii}: mfma operand {k} is {:?}, expected {w:?}",
+                                m.vreg_class(*r)
+                            )),
+                            _ => errs.push(format!(
+                                "block {bi} inst {ii}: mfma operand {k} is not a register"
+                            )),
+                        }
+                    }
+                }
+                MOp::VWriteSub | MOp::VReadSub => {
+                    if inst.op == MOp::VWriteSub {
+                        if let Some(d) = inst.dst {
+                            if !matches!(m.vreg_class(d), RClass::V2 | RClass::V4) {
+                                errs.push(format!(
+                                    "block {bi} inst {ii}: tuple write dst must be V2 or V4"
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(Src::Reg(r)) = inst.srcs.first() {
+                        let class = m.vreg_class(*r);
+                        if inst.op == MOp::VReadSub && !matches!(class, RClass::V2 | RClass::V4) {
+                            errs.push(format!(
+                                "block {bi} inst {ii}: tuple read base must be V2 or V4"
+                            ));
                         }
                     }
                 }

@@ -107,7 +107,9 @@ int main(int argc, char** argv) {
     void* params[] = {&a_q, &a_k, &a_v, &a_o, &a_sk, &a_scale, &a_nhead, &a_sq};
     // Probe kernels take the output pointer as their only argument.
     void* probe_params[] = {&a_o};
-    void** launch_params = std::strcmp(kern, "probe_math") == 0 ? probe_params : params;
+    const bool probe_kernel = std::strcmp(kern, "probe_math") == 0 ||
+                             std::strcmp(kern, "probe_mfma") == 0;
+    void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u)\n", grid.x, grid.y, grid.z);
     CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, launch_params,
@@ -123,6 +125,27 @@ int main(int argc, char** argv) {
         std::memcpy(vals, got.data(), sizeof(vals));
         std::printf("  exp(1)=%.9f exp(2)=%.9f rcp(3)=%.9f\n", vals[0], vals[1], vals[2]);
         return 0;
+    }
+
+    if (std::strcmp(kern, "probe_mfma") == 0) {
+        // All-ones A and B with a zero accumulator: every element of the 16x16
+        // result must be exactly K = 16.0, independent of the fragment layout.
+        float vals[256] = {0.0f};
+        std::memcpy(vals, got.data(), sizeof(vals));
+        int mfma_bad = 0;
+        for (int i = 0; i < 256; ++i) {
+            if (std::fabs(vals[i] - 16.0f) > 1e-3f) {
+                if (mfma_bad < 6) {
+                    std::fprintf(stderr, "mfma mismatch lane=%d reg=%d got=%.6f\n", i / 4, i % 4,
+                                 vals[i]);
+                }
+                ++mfma_bad;
+            }
+        }
+        std::printf("  mfma[0..3]=%.6f %.6f %.6f %.6f bad=%d\n", vals[0], vals[1], vals[2], vals[3],
+                    mfma_bad);
+        std::printf(mfma_bad ? "PROBE_MFMA_FAIL\n" : "PROBE_MFMA_OK\n");
+        return mfma_bad != 0;
     }
 
     if (std::strcmp(kern, "attention_fwd") != 0) {

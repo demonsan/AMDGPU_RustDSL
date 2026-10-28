@@ -253,3 +253,30 @@ pub fn probe_math() -> Function {
     b.store_f32(o, 8, r3);
     b.finish()
 }
+
+/// MFMA micro-kernel: one `v_mfma_f32_16x16x16_f16` per lane with all-ones
+/// operands, so every accumulator element must be exactly 16.0 regardless of
+/// the fragment layout.
+pub fn probe_mfma() -> Function {
+    let mut b = FnBuilder::new("probe_mfma", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    // Two f16 1.0 values in one dword.
+    let ones = b.c_i32(0x3C003C00_u32 as i32);
+    let zero = b.c_i32(0);
+    let a = b.frag2(ones, ones);
+    let bfrag = b.frag2(ones, ones);
+    let c = b.frag4(zero, zero, zero, zero);
+    let d = b.mfma_f16(a, bfrag, c);
+
+    let c16 = b.c_i32(16);
+    let lane_off = b.mul_i32(tid, c16);
+    let row = b.ptr_add(o, lane_off);
+    for i in 0..4u8 {
+        let bits = b.frag4_lane(d, i);
+        let value = b.bitcast_f32(bits);
+        b.store_f32(row, 4 * i as u32, value);
+    }
+    b.finish()
+}

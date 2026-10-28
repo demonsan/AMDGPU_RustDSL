@@ -141,6 +141,12 @@ fn pair(a: &Alloc, r: VReg) -> String {
     format!("v[{b}:{}]", b + 1)
 }
 
+/// A register tuple of `n` consecutive dwords, e.g. `v[8:9]` or `v[4:7]`.
+fn tuple(a: &Alloc, r: VReg, n: u32) -> String {
+    let b = v(a, r);
+    format!("v[{b}:{}]", b + n - 1)
+}
+
 fn sr(a: &Alloc, r: VReg) -> String {
     format!("s{}", a.phys[r as usize])
 }
@@ -266,6 +272,33 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[0]),
             src1(a, inst.srcs[1])
         )],
+        MOp::VWriteSub => {
+            // Write one dword of a register tuple.
+            let base = v(a, inst.dst.expect("dst"));
+            vec![format!(
+                "v_mov_b32_e32 v{}, {}",
+                base + inst.imm as u32,
+                src1(a, inst.srcs[0])
+            )]
+        }
+        MOp::VReadSub => {
+            let src = reg_of(&inst.srcs[0]);
+            let base = v(a, src);
+            vec![format!("v_mov_b32_e32 {}, v{}", d(a), base + inst.imm as u32)]
+        }
+        MOp::VMfma16x16x16F16 => {
+            // 16x16x16 f16: D is four dwords, A and B two each, C four.
+            let a_reg = reg_of(&inst.srcs[0]);
+            let b_reg = reg_of(&inst.srcs[1]);
+            let c_reg = reg_of(&inst.srcs[2]);
+            vec![format!(
+                "v_mfma_f32_16x16x16_f16 {}, {}, {}, {}",
+                tuple(a, inst.dst.expect("dst"), 4),
+                tuple(a, a_reg, 2),
+                tuple(a, b_reg, 2),
+                tuple(a, c_reg, 4)
+            )]
+        }
         MOp::GlobalLoadU16 => vec![format!(
             "global_load_ushort {}, {}",
             d(a),

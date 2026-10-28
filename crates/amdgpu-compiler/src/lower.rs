@@ -220,6 +220,33 @@ impl Lowerer {
         }
     }
 
+    /// Pointer or two-dword fragment operand, whichever the value holds.
+    fn as_v4(&mut self, o: Opnd) -> Result<VReg, String> {
+        match o {
+            Opnd::Val(v) => {
+                let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
+                if self.mir.vreg_class(r) == RClass::V4 {
+                    Ok(r)
+                } else {
+                    Err(format!("value v{v} is not a four-dword fragment"))
+                }
+            }
+            Opnd::Var(v) => {
+                let r = self
+                    .vars
+                    .get(v.0 as usize)
+                    .copied()
+                    .ok_or_else(|| format!("var{v} not lowered"))?;
+                if self.mir.vreg_class(r) == RClass::V4 {
+                    Ok(r)
+                } else {
+                    Err(format!("var{v} is not a four-dword fragment"))
+                }
+            }
+            _ => Err("fragment operand must be a value or variable".to_string()),
+        }
+    }
+
     fn run(&mut self, f: &Function) -> Result<(), String> {
         for st in &f.stmts {
             match st {
@@ -487,6 +514,55 @@ impl Lowerer {
                 );
                 self.pending_vmem.push(d);
                 self.val.insert(dst, d);
+            }
+            Op::Frag2(a, b) => {
+                let d = self.new_vreg(RClass::V2);
+                for (i, o) in [*a, *b].into_iter().enumerate() {
+                    let r = self.as_v1(o)?;
+                    self.touch(&[Src::Reg(r)]);
+                    self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(r).imm(i as i64));
+                }
+                self.val.insert(dst, d);
+            }
+            Op::Frag2Lane { frag, index } => {
+                let f = self.as_v2(*frag)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VReadSub).def(d).srcreg(f).imm(*index as i64));
+                self.val.insert(dst, d);
+            }
+            Op::Frag4(a, b, c, e) => {
+                let d = self.new_vreg(RClass::V4);
+                for (i, o) in [*a, *b, *c, *e].into_iter().enumerate() {
+                    let r = self.as_v1(o)?;
+                    self.touch(&[Src::Reg(r)]);
+                    self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(r).imm(i as i64));
+                }
+                self.val.insert(dst, d);
+            }
+            Op::Frag4Lane { frag, index } => {
+                let f = self.as_v4(*frag)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VReadSub).def(d).srcreg(f).imm(*index as i64));
+                self.val.insert(dst, d);
+            }
+            Op::MfmaF16 { a, b, c } => {
+                let ra = self.as_v2(*a)?;
+                let rb = self.as_v2(*b)?;
+                let rc = self.as_v4(*c)?;
+                let d = self.new_vreg(RClass::V4);
+                self.push(
+                    MInst::new(MOp::VMfma16x16x16F16)
+                        .def(d)
+                        .srcreg(ra)
+                        .srcreg(rb)
+                        .srcreg(rc),
+                );
+                self.val.insert(dst, d);
+            }
+            Op::BitcastF32(a) => {
+                // Pure register reinterpretation: no instruction.
+                let r = self.as_v1(*a)?;
+                self.val.insert(dst, r);
             }
         }
         Ok(())
