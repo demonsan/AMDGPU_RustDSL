@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| Pack instructions | `probe_pack`: `v_cvt_pknorm_u16_f32(1.0, 0.5)` = `0x8000FFFF`; `v_cvt_scalef32_pk_fp8_bf16` low half = `0xAAAA3838`, high half = `0x3838AAAA` → `PROBE_PACK_OK` |
 | LDS self-read | `probe_lds_self2`: own-slot read after a barrier → `SELF2_OK` |
 | Two-wave LDS | `probe_waves2`: own + partner-wave slot → `PROBE_WAVES2_OK` |
 | `v_max3_f32`, fp8 fragments | `v_max3_f32` in the ISA of the compiler, `Frag8`/`V8` register class for the `32x32x64` operands |
@@ -198,6 +199,21 @@ Follow-ups: the wait counts are the conservative end of the ISA table (12 for th
 16x16/32x32 F16/FP8 shapes, 20 for F8F6F4) and the pass is per basic block, so
 cross-block producers are not covered yet. Both should be tightened/validated
 once the FMHA core loop is wired to real data.
+
+## Pack instructions and MFMA alignment checks (round 12)
+
+* `v_cvt_pknorm_u16_f32` is wired through DSL/MIR/emit and verified on hardware:
+  `(1.0, 0.5)` produces `0x8000FFFF` (low half = S0 as unorm16, high = S1).
+* `v_cvt_scalef32_pk_fp8_bf16` is wired with the low-half form
+  (`v_cvt_scalef32_pk_fp8_bf16 vD, vS0, vS1`), verified to replace only bits
+  `[15:0]` of the destination and keep the rest (`0xAAAA3838`). Its OPSEL[3]
+  high-half encoding could not be pinned down (`op_sel:[0,0,0,1]` and
+  `op_sel:[0,0,1]` both produce wrong values), so the DSL builds the high half
+  explicitly with `v_lshlrev_b32` + `v_and_b32` + `v_or_b32`; verified to give
+  `0x3838AAAA`. The native high-half form should be found later to save the VALU
+  ops.
+* MFMA operand alignment is now enforced after allocation: each operand base must
+  be aligned to its width (and even), as the CDNA4 ISA requires.
 
 ## Next: FMHA reference core loop
 
