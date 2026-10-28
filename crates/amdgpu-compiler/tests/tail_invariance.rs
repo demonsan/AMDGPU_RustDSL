@@ -96,7 +96,7 @@ fn instruction_stream(asm: &str) -> Vec<String> {
         if !cur.trim().is_empty() {
             ops.push(cur);
         }
-        let mut ops: Vec<String> = ops.iter().map(|o| norm_operand(o)).collect();
+        let mut ops: Vec<String> = if mn.starts_with("s_cbranch") { vec!["<label>".to_string()] } else { ops.iter().map(|o| norm_operand(o)).collect() };
         if COMMUTATIVE.contains(&mn) && ops.len() >= 3 {
             let n = ops.len();
             if ops[n - 2] > ops[n - 1] {

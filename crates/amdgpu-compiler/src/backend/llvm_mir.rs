@@ -129,7 +129,8 @@ fn kernarg_ir(m: &MFunction) -> Result<(Vec<String>, u32), String> {
             pad(&mut cursor, to, &mut params);
         }
     }
-    pad(&mut cursor, m.kernarg_size, &mut params);
+    // The own emitter declares the segment rounded up to 8 bytes; keep the LLVM descriptor identical.
+    pad(&mut cursor, ((m.kernarg_size + 7) / 8) * 8, &mut params);
     Ok((params, cursor))
 }
 pub struct Exported {
