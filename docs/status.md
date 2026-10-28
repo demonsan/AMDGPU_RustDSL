@@ -138,6 +138,57 @@ diagnostic store (same IR semantics). That points at a register-aliasing hazard
 for MFMA D/C versus A/B that the allocator does not model; the condition needs
 to be found and enforced in MIR verification.
 
+## Hardware facts confirmed from the CDNA4 ISA (kernel wiki)
+
+Source: `MI_Kernel_Agent/skills/kernel-wiki/references/mi300-sources/cdna4-isa`
+(chapter 7, MFMA).
+
+* The matrix core has its own register file, the **AccVGPRs**. The `ACC` field of
+  an MFMA instruction selects VGPRs (0) or AccVGPRs (1) for A (low bit) and B
+  (high bit), and `ACC_CD` does the same for C and D. In the code object the
+  boundary between the two files is `.amdhsa_accum_offset`.
+* Operands must be **contiguous and the base register aligned to the operand
+  width** (a 4-register A needs a base that is a multiple of 4). Our raw/linear
+  allocator aligns tuples to their width, but this is not verified yet.
+* For the F16/BF16/I8 MFMA group the sources and destination must additionally be
+  **even aligned**.
+* MFMA ignores the execution mask (forced to 1).
+* `V_MFMA_SCALE_F32_32X32X64_F8F6F4` is a **4-dword instruction**: two back to
+  back VOP3Ps, the first carrying `0xD3AC` plus the two scale sources (SRC0 = A
+  scale, SRC1 = B scale). `OP_SEL[0]`/`OP_SEL[1]` pick **which byte** of the
+  scale VGPR is used (00 -> `[7:0]`, 01 -> `[15:8]`, 10 -> `[23:16]`, 11 ->
+  `[31:24]`). There is one scale byte per lane per 32 K-values and the scale
+  applies to that instruction only.
+* The F8F6F4 MFMA takes 32 cycles when either A or B is F8 and 16 otherwise
+  (64/32 for the 32x32x64 form).
+
+## MFMA accumulator is in place
+
+`lower.rs` now materialises the incoming accumulator into the destination
+registers and emits `C == D` (the form the aiter reference kernel uses), and
+`regalloc` rejects any MFMA where C and D are not the same range or where A/B
+overlap D. All MFMA probes still pass with this form: `PROBE_MFMA_SCALE_OK`,
+`PROBE_MFMA_FP8_OK`, `PROBE_MFMA_WIDE_OK`, `PROBE_LOOP_MFMA_OK` (128.0),
+`PROBE_FMHA_DATAPATH_OK`.
+
+## Open issue: probe_fmha_core reads zero
+
+`probe_fmha_core` (A phase / B phase staging, three paired barriers per
+iteration, in-place MFMA accumulation) currently stores `0.0` in every element,
+while `probe_fmha_datapath` (same staging, no loop) and `probe_loop_mfma` (loop +
+accumulation, one staging phase) both pass. The emitted sequence is
+
+```
+BB1: ds_write_b128 v3, v[4:7] ; bar ; ds_write_b128 v8, v[4:7] ; bar
+     ds_read_b128 v[12:15], v3 ; ds_read_b128 v[32:35], v8
+     ... Frag8 build ...
+     v_mfma_scale_f32_32x32x64_f8f6f4 v[64:79], v[40:47], v[48:55], v[64:79], v12, v12
+```
+
+so the operands are built from the LDS reads, but the result is zero. Next step is
+to store the built Frag8 lane values to global memory inside the loop to see
+whether the operands or the MFMA are zero.
+
 ## Next: FMHA reference core loop
 
 1. Resolve the 16 KB LDS question above (needed before scaling the core loop).
