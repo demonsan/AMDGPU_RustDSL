@@ -128,7 +128,7 @@ pub fn fix_value_hazards(m: &mut MFunction) {
             if earliest > cycle && !insts[i].op.consumes_vcc() {
                 let mut j = i + 1;
                 let limit = (i + 1 + FILL_WINDOW).min(insts.len());
-                while earliest > cycle && j < limit {
+                while earliest > cycle && j < limit.min(insts.len()) {
                     if is_fence(insts[j].op) {
                         break;
                     }
