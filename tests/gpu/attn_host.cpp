@@ -250,7 +250,7 @@ int main(int argc, char** argv) {
                 ++marker_bad;
             }
             int pw = (w + 4) & 7;
-            int want_read = pw * 64 + l;
+            int want_read = tid;
             if (std::fabs(vals[512 + tid] - (float)want_read) > 0.5f) {
                 if (lds_bad < 4) {
                     std::fprintf(stderr, "lds mismatch tid=%d got=%.1f want=%d\n", tid,
