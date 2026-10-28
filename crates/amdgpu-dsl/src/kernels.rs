@@ -5995,3 +5995,81 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
     b.end_if();
     b.finish()
 }
+/// Block-scaled fp8 matmul with real 1x32 E8M0 scales (the reference kernel's scale recipe).
+///
+/// The scaled MFMA takes one scale byte per lane and uses lane `row + 32 * (byte / 16)` for the
+/// data byte `byte` of any lane group, so one scale block of 32 logical K values occupies bytes
+/// 0..15 of *both* lane groups (block 0) or bytes 16..31 of both (block 1). The fragment for lane
+/// group `g` is therefore: bytes 0..15 = K `16 g .. 16 g + 15`, bytes 16..31 = K `32 + 16 g ..`;
+/// lane group `g` supplies the scale of block `g` (`dword >> 8 g`, low byte, op_sel 0).
+///
+/// Image in `o`: A (32 x 64, pitch 64) at 0, B^T (32 x 64, pitch 64) at 2048, one E8M0 dword per
+/// A row at 4096 (bytes = scales of K blocks 0, 1, ...) and per B row at 4352; D (32 x 32 f32) at
+/// 4608 in the usual MFMA output layout.
+pub fn probe_fp8_matmul_blk() -> Function {
+    let mut b = FnBuilder::new("probe_fp8_matmul_blk", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let c3 = b.c_i32(3);
+    let c4 = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c6 = b.c_i32(6);
+    let c9 = b.c_i32(9);
+    let c31 = b.c_i32(31);
+    let c2048 = b.c_i32(2048);
+    let c4096 = b.c_i32(4096);
+    let c4352 = b.c_i32(4352);
+    let c4608 = b.c_i32(4608);
+
+    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let g = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
+    let row64 = b.shl_i32(j, c6);
+    let g16 = b.shl_i32(g, c4);
+    let frag_off = b.add_i32(row64, g16);
+    let a_base = b.ptr_add(o, frag_off);
+    let bt_off = b.add_i32(frag_off, c2048);
+    let bt_base = b.ptr_add(o, bt_off);
+
+    let mut aw: Vec<ValueId> = Vec::with_capacity(8);
+    let mut bw: Vec<ValueId> = Vec::with_capacity(8);
+    for w in 0..8u32 {
+        let off = if w < 4 { 4 * w } else { 32 + 4 * (w - 4) };
+        let av = b.load_f32(a_base, off);
+        aw.push(b.bitcast_i32(av));
+        let bv = b.load_f32(bt_base, off);
+        bw.push(b.bitcast_i32(bv));
+    }
+    let a8 = b.frag8(aw[0], aw[1], aw[2], aw[3], aw[4], aw[5], aw[6], aw[7]);
+    let b8 = b.frag8(bw[0], bw[1], bw[2], bw[3], bw[4], bw[5], bw[6], bw[7]);
+
+    // scale dwords of the lane's row, shifted so that byte 0 is block g
+    let j4 = b.mul_i32(j, c4);
+    let sa_off = b.add_i32(j4, c4096);
+    let sa_ptr = b.ptr_add(o, sa_off);
+    let sa_raw = b.load_f32(sa_ptr, 0);
+    let sa_i = b.bitcast_i32(sa_raw);
+    let sb_off = b.add_i32(j4, c4352);
+    let sb_ptr = b.ptr_add(o, sb_off);
+    let sb_raw = b.load_f32(sb_ptr, 0);
+    let sb_i = b.bitcast_i32(sb_raw);
+    let g8 = b.shl_i32(g, c3);
+    let sa = b.let_(Op::LshrI32(Opnd::Val(sa_i), Opnd::Val(g8)));
+    let sb = b.let_(Op::LshrI32(Opnd::Val(sb_i), Opnd::Val(g8)));
+
+    let zero = b.frag_zero(DType::Frag16);
+    let d = b.mfma_scale_fp8(a8, b8, zero, sa, sb);
+
+    let p512 = b.shl_i32(g, c9);
+    let lane_off = b.add_i32(j4, p512);
+    let dyn_off = b.add_i32(lane_off, c4608);
+    let dptr = b.ptr_add(o, dyn_off);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as u32;
+        let lane = b.frag16_lane(d, r);
+        let v = b.bitcast_f32(lane);
+        b.store_f32(dptr, i_const * 128, v);
+    }
+    b.finish()
+}
