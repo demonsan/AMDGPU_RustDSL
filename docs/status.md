@@ -265,9 +265,11 @@ The E8M0 scale *lane* mapping is partially pinned down:
 * `FP8_TEST=2`, `5`, `7`, `8` pass, but `FP8_TEST=6` (B restricted to the upper
   32 bytes of each B^T row, A scale varying as 2^(1 + (l % 4)) on lanes 32..63)
   gives 48 = 16*2 + 16*1 instead of 64, and the pattern repeats with period 4 in
-  the row index. That means the 32 K indices held in B's lane group 1 are split
-  16/16 across A's two scale groups: **A and B do not share the same byte-to-K
-  ordering**, they differ by a 16-value interleave.
+  the row index. That was the clue for the real rule: **the scale lane is
+  `row + 32 * ((k % 32) / 16)`**, i.e. the 32 bytes of a lane's fragment are
+  split into two halves of 16 and each half is scaled by a different lane group
+  (the upper half of the bytes uses the +32 scale lane). Encoding that in the
+  host reference makes the general random-data test pass.
 
 Next step: measure the exact byte-to-K map with a targeted probe (single 1.0 at
 one A byte vs. distinct fp8 values in the B bytes) and encode the two layouts in

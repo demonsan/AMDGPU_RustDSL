@@ -489,7 +489,7 @@ int main(int argc, char** argv) {
                 } else if (fp8_test == 5) {
                     want_d = 32.0 * (double)(1 << (i % 8));
                 } else if (fp8_test == 6) {
-                    want_d = 32.0 * (double)(1 << (1 + (i % 4)));
+                    want_d = 16.0 + 16.0 * (double)(1 << (1 + (i % 4)));
                 } else if (fp8_test == 7) {
                     want_d = 96.0;
                 } else if (fp8_test == 8) {
@@ -497,15 +497,16 @@ int main(int argc, char** argv) {
                 } else if (fp8_test == 9) {
                     want_d = 96.0;
                 } else {
+                    // Scale lane: row + 32 * ((k % 32) / 16); the upper and
+                    // lower 16 bytes of each lane's fragment use different
+                    // scale groups.
                     want_d = 0.0;
-                    for (int kb = 0; kb < 2; ++kb) {
-                        const double sa_v = std::ldexp(1.0, (int)raw[4096 + (i + 32 * kb) * 4] - 127);
-                        const double sb_v = std::ldexp(1.0, (int)raw[4352 + (j + 32 * kb) * 4] - 127);
-                        for (int kk = 0; kk < 32; ++kk) {
-                            const int k = kb * 32 + kk;
-                            want_d += fp8_e4m3(raw[i * 64 + k]) * fp8_e4m3(raw[2048 + j * 64 + k]) *
-                                      sa_v * sb_v;
-                        }
+                    for (int k = 0; k < 64; ++k) {
+                        const int g = ((k % 32) / 16) % 2;
+                        const double sa_v = std::ldexp(1.0, (int)raw[4096 + (i + 32 * g) * 4] - 127);
+                        const double sb_v = std::ldexp(1.0, (int)raw[4352 + (j + 32 * g) * 4] - 127);
+                        want_d += fp8_e4m3(raw[i * 64 + k]) * fp8_e4m3(raw[2048 + j * 64 + k]) *
+                                  sa_v * sb_v;
                     }
                 }
                 const float want = (float)want_d;
