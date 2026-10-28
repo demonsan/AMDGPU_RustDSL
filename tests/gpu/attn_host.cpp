@@ -234,31 +234,41 @@ int main(int argc, char** argv) {
         return scale_bad != 0;
     }
     if (std::strcmp(kern, "probe_roles") == 0) {
-        // 4 iterations x 512 lanes; lane tid of wave w must read the value
-        // written by wave (w+4)%8, plus 100000 for the role-B writers.
-        float vals[2048] = {0.0f};
+        // First half: value written by this lane (plus a role-B marker).
+        // Second half: value read from the partner role.
+        float vals[4096] = {0.0f};
         std::memcpy(vals, got.data(), sizeof(vals));
         int roles_bad = 0;
+        int own_bad = 0;
         for (int it = 0; it < 4; ++it) {
             for (int tid = 0; tid < 512; ++tid) {
                 int w = tid / 64;
                 int l = tid % 64;
+                int own = it * 1000 + tid + (w >= 4 ? 100000 : 0);
+                float got_own = vals[it * 512 + tid];
+                if (std::fabs(got_own - (float)own) > 0.5f) {
+                    if (own_bad < 4) {
+                        std::fprintf(stderr, "own mismatch it=%d tid=%d got=%.1f want=%d\n", it,
+                                     tid, got_own, own);
+                    }
+                    ++own_bad;
+                }
                 int pw = (w + 4) & 7;
                 int expect = it * 1000 + pw * 64 + l + (pw >= 4 ? 100000 : 0);
-                float got_v = vals[it * 512 + tid];
-                if (std::fabs(got_v - (float)expect) > 0.5f) {
-                    if (roles_bad < 6) {
-                        std::fprintf(stderr, "roles mismatch it=%d tid=%d got=%.1f want=%d\n", it,
-                                     tid, got_v, expect);
+                float got_read = vals[2048 + it * 512 + tid];
+                if (std::fabs(got_read - (float)expect) > 0.5f) {
+                    if (roles_bad < 4) {
+                        std::fprintf(stderr, "read mismatch it=%d tid=%d got=%.1f want=%d\n", it,
+                                     tid, got_read, expect);
                     }
                     ++roles_bad;
                 }
             }
         }
-        std::printf("  roles sample: %.1f %.1f %.1f %.1f bad=%d\n", vals[0], vals[64], vals[256],
-                    vals[320], roles_bad);
-        std::printf(roles_bad ? "PROBE_ROLES_FAIL\n" : "PROBE_ROLES_OK\n");
-        return roles_bad != 0;
+        std::printf("  roles own_bad=%d read_bad=%d  samples own=%.1f read=%.1f\n", own_bad,
+                    roles_bad, vals[0], vals[2048]);
+        std::printf(roles_bad || own_bad ? "PROBE_ROLES_FAIL\n" : "PROBE_ROLES_OK\n");
+        return (roles_bad || own_bad) ? 1 : 0;
     }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,

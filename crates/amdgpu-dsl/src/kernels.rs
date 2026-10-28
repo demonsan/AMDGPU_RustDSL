@@ -460,11 +460,26 @@ pub fn probe_roles() -> Function {
     let got = b.load_lds_b32(Opnd::Val(partner_off));
     let value = b.bitcast_f32(got);
 
+    // Diagnostic split: the first half of the buffer receives the value this
+    // lane wrote (after the role marker), the second half the value it read
+    // from its partner role.
     let out_index_base = b.mul_i32(iter, c512);
     let out_index = b.add_i32(out_index_base, tid);
     let out_off = b.mul_i32(out_index, c4);
     let out_ptr = b.ptr_add(o, out_off);
+    b.begin_if(Opnd::Val(is_a));
     b.store_f32(out_ptr, 0, value);
+    b.else_();
+    let marked_self = b.add_i32(base, c100000);
+    let marked_f = b.bitcast_f32(marked_self);
+    b.store_f32(out_ptr, 0, marked_f);
+    b.end_if();
+
+    let c2048 = b.c_i32(2048);
+    let out2_index = b.add_i32(out_index, c2048);
+    let out2_off = b.mul_i32(out2_index, c4);
+    let out2_ptr = b.ptr_add(o, out2_off);
+    b.store_f32(out2_ptr, 0, value);
 
     // Second barrier: no wave may overwrite LDS before everyone has read it.
     b.wait_lds(0);
