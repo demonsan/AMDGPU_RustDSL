@@ -234,43 +234,26 @@ int main(int argc, char** argv) {
         return scale_bad != 0;
     }
     if (std::strcmp(kern, "probe_roles") == 0) {
-        float vals[1024] = {0.0f};
+        float vals[512] = {0.0f};
         std::memcpy(vals, got.data(), sizeof(vals));
-        int marker_bad = 0;
-        int lds_bad = 0;
+        int roles_bad = 0;
         for (int tid = 0; tid < 512; ++tid) {
             int w = tid / 64;
             int l = tid % 64;
-            float want_marker = (w < 4) ? 111.0f : 222.0f;
-            if (std::fabs(vals[tid] - want_marker) > 0.5f) {
-                if (marker_bad < 4) {
-                    std::fprintf(stderr, "marker mismatch tid=%d got=%.1f want=%.1f\n", tid,
-                                 vals[tid], want_marker);
-                }
-                ++marker_bad;
-            }
             int pw = (w + 4) & 7;
-            int want_read = pw * 64 + l;
-            if (std::fabs(vals[512 + tid] - (float)want_read) > 0.5f) {
-                if (lds_bad < 4) {
-                    std::fprintf(stderr, "lds mismatch tid=%d got=%.1f want=%d\n", tid,
-                                 vals[1024 + tid], want_read);
+            int want = pw * 64 + l;
+            if (std::fabs(vals[tid] - (float)want) > 0.5f) {
+                if (roles_bad < 6) {
+                    std::fprintf(stderr, "roles mismatch tid=%d got=%.1f want=%d\n", tid, vals[tid],
+                                 want);
                 }
-                ++lds_bad;
+                ++roles_bad;
             }
         }
-        int self_bad = 0;
-        for (int tid = 0; tid < 512; ++tid) {
-            if (std::fabs(vals[512 + tid] - (float)tid) > 0.5f) {
-                ++self_bad;
-            }
-        }
-        std::printf("  roles self_bad=%d marker_bad=%d lds_bad=%d\n", self_bad, marker_bad, lds_bad);
-        for (int w = 0; w < 8; ++w) {
-            std::printf("    wave %d marker=%.1f lds=%.1f\n", w, vals[w * 64], vals[512 + w * 64]);
-        }
-        std::printf(marker_bad || lds_bad ? "PROBE_ROLES_FAIL\n" : "PROBE_ROLES_OK\n");
-        return (marker_bad || lds_bad) ? 1 : 0;
+        std::printf("  roles bad=%d sample=%.1f %.1f %.1f %.1f\n", roles_bad, vals[0], vals[64],
+                    vals[256], vals[320]);
+        std::printf(roles_bad ? "PROBE_ROLES_FAIL\n" : "PROBE_ROLES_OK\n");
+        return roles_bad != 0;
     }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,

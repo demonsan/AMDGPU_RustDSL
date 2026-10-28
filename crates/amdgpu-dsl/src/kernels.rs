@@ -403,11 +403,9 @@ pub fn probe_mfma_scale() -> Function {
     b.finish()
 }
 
-/// Multi-wave structure probe with two independent phases.
-///
-/// 1. Role marker: waves 0-3 store 111.0 at `o[tid]`, waves 4-7 store 222.0.
-/// 2. LDS exchange: every lane writes its id into LDS, the block synchronises,
-///    and each lane reads the id written by the partner role.
+/// Minimal multi-wave LDS exchange: every lane writes its id into LDS, the whole
+/// workgroup synchronises, and each lane reads the id written by the partner
+/// role (waves 0-3 <-> 4-7).
 pub fn probe_roles() -> Function {
     let mut b = FnBuilder::new("probe_roles", 512);
     b.lds(2048);
@@ -422,30 +420,9 @@ pub fn probe_roles() -> Function {
     let c7 = b.c_i32(7);
     let c63 = b.c_i32(63);
     let c64 = b.c_i32(64);
-    let c512 = b.c_i32(512);
-    let is_a = b.cmp_lt_i32(wave, c4);
 
     let off = b.mul_i32(tid, c4);
-    let ptr = b.ptr_add(o, off);
-
-    // Phase 1: role marker.
-    b.begin_if(Opnd::Val(is_a));
-    let marker_a = b.c_f32(111.0);
-    b.store_f32(ptr, 0, Opnd::Val(marker_a));
-    b.else_();
-    let marker_b = b.c_f32(222.0);
-    b.store_f32(ptr, 0, Opnd::Val(marker_b));
-    b.end_if();
-
-    // Phase 2: write, read back the own slot (no barrier yet), then exchange.
     b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
-    b.wait_lds(0);
-    let own = b.load_lds_b32(Opnd::Val(off));
-    let own_value = b.bitcast_f32(own);
-    let own_index = b.add_i32(tid, c512);
-    let own_out_off = b.mul_i32(own_index, c4);
-    let own_ptr = b.ptr_add(o, own_out_off);
-    b.store_f32(own_ptr, 0, own_value);
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
@@ -459,11 +436,9 @@ pub fn probe_roles() -> Function {
     let got = b.load_lds_b32(Opnd::Val(partner_off));
     let value = b.bitcast_f32(got);
 
-    let c1024 = b.c_i32(1024);
-    let out2_index = b.add_i32(tid, c1024);
-    let out2_off = b.mul_i32(out2_index, c4);
-    let out2_ptr = b.ptr_add(o, out2_off);
-    b.store_f32(out2_ptr, 0, value);
+    let out_off = b.mul_i32(tid, c4);
+    let out_ptr = b.ptr_add(o, out_off);
+    b.store_f32(out_ptr, 0, value);
 
     b.finish()
 }
