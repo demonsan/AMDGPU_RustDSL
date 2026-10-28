@@ -257,12 +257,12 @@ fn hazard_gaps_are_filled_with_independent_work() {
     b.arg("o", DType::Ptr, 0, 8);
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let a = b.load_f32(o, 0);
-    let c = b.load_f32(o, 4);
     let e = b.exp_f32(a);
     let y = b.mul_f32(e, a); // consumer right behind the transcendental
-    let z1 = b.add_f32(c, c);
-    let z2 = b.add_f32(z1, c);
-    let z3 = b.add_f32(z2, c);
+    // independent work that only needs `a` (already waited for), so no wait fence separates it
+    let z1 = b.add_f32(a, a);
+    let z2 = b.add_f32(z1, a);
+    let z3 = b.add_f32(z2, a);
     b.store_f32(o, 8, y);
     b.store_f32(o, 12, z3);
     let asm = compile(&b.finish()).expect("compiles").asm;
