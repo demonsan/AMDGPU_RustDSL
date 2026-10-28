@@ -1,0 +1,102 @@
+# MOp -> post-RA LLVM MIR table for AMD LLVM 20.0.0git (ROCm 7.0.2), gfx950.
+#
+# Row format:   Key | signature | MIR text
+#   Key        MOp variant name, optionally ':kinds' where kinds has one char per source,
+#              r = register, i = immediate ('-' = no sources). The most specific row wins.
+#   signature  'DST <- SRC SRC ...' with classes V1 V2 V4 V8 V16 S1 S2 and I (immediate).
+#              Used by the probe test to build one tiny MIR per row.
+#   MIR text   one MachineInstr; ' ;; ' separates several. Tokens:
+#     {d} {d.K}    destination register (K-th dword)       {sN} {sN.K}  source N (register or immediate)
+#     {i0}         source 0 if immediate else inst.imm      {imm} {imm32}  inst.imm
+#     {dsub}       $vgpr (dst base + imm)                   {s0sub}  $vgpr (src0 base + imm)
+#     {pv} {ps}    physical $vgpr<imm> / $sgpr<imm>          {vmcnt} {lgkmcnt}  S_WAITCNT immediates
+#     {t}          branch target block
+#
+# Dropped on purpose: SNop (LLVM recomputes hazards).
+
+VMovB32:r   | V1 <- V1 | {d} = V_MOV_B32_e32 {s0}, implicit $exec
+VMovB32:i   | V1 <- I  | {d} = V_MOV_B32_e32 {s0}, implicit $exec
+VMovB32:-   | V1 <-    | {d} = V_MOV_B32_e32 {imm32}, implicit $exec
+VMovFromS   | V1 <- S1 | {d} = V_MOV_B32_e32 {s0}, implicit $exec
+VMovFromSPair | V2 <- S2 | {d.0} = V_MOV_B32_e32 {s0.0}, implicit $exec ;; {d.1} = V_MOV_B32_e32 {s0.1}, implicit $exec
+VPtrAdd:rr  | V2 <- V2 V1 | {d.0} = V_ADD_CO_U32_e32 {s1}, {s0.0}, implicit-def $vcc, implicit $exec ;; {d.1}, $vcc = V_ADDC_U32_e64 {s0.1}, 0, $vcc, 0, implicit $exec
+VPtrAdd:ri  | V2 <- V2 I | {d.0}, $vcc = V_ADD_CO_U32_e64 {s0.0}, {s1}, 0, implicit $exec ;; {d.1}, $vcc = V_ADDC_U32_e64 {s0.1}, 0, $vcc, 0, implicit $exec
+VReadPhys   | V1 <-    | {d} = V_MOV_B32_e32 {pv}, implicit $exec
+VReadFirstLane | S1 <- V1 | {d} = V_READFIRSTLANE_B32 {s0}, implicit $exec
+VCvtPknormU16 | V1 <- V1 V1 | {d} = nofpexcept V_CVT_PKNORM_U16_F32_e64 0, {s0}, 0, {s1}, 0, 0, implicit $mode, implicit $exec
+VCvtPkFp8F32 | V1 <- V1 V1 | {d} = nofpexcept V_CVT_PK_FP8_F32_e64 0, {s0}, 0, {s1}, {d}(tied-def 0), 0, implicit $mode, implicit $exec
+VCvtPkBf16F32 | V1 <- V1 V1 | {d} = nofpexcept V_CVT_PK_BF16_F32_e64 0, {s0}, 0, {s1}, 0, 0, implicit $mode, implicit $exec
+VCvtPkFp8Lo | V1 <- V1 V1 | {d} = nofpexcept V_CVT_SCALEF32_PK_FP8_BF16_e64 0, {s0}, 0, {s1}, {d}(tied-def 0), 0, implicit $mode, implicit $exec
+VCvtPkFp8Hi | V1 <- V1 V1 | {d} = nofpexcept V_CVT_SCALEF32_PK_FP8_BF16_e64 8, {s0}, 0, {s1}, {d}(tied-def 0), 4, implicit $mode, implicit $exec
+VAddU32     | V1 <- V1 V1 | {d} = V_ADD_U32_e32 {s0}, {s1}, implicit $exec
+VAddCoU32:rr | V1 <- V1 V1 | {d} = V_ADD_CO_U32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VAddCoU32:ir | V1 <- I V1  | {d} = V_ADD_CO_U32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VAddCoU32:ri | V1 <- V1 I  | {d}, $vcc = V_ADD_CO_U32_e64 {s0}, {s1}, 0, implicit $exec
+VAddCoU32:ii | V1 <- I I   | {d}, $vcc = V_ADD_CO_U32_e64 {s0}, {s1}, 0, implicit $exec
+VAddcCoU32:rr | V1 <- V1 V1 | {d} = V_ADDC_U32_e32 {s0}, {s1}, implicit-def $vcc, implicit $vcc, implicit $exec
+VAddcCoU32:ir | V1 <- I V1  | {d} = V_ADDC_U32_e32 {s0}, {s1}, implicit-def $vcc, implicit $vcc, implicit $exec
+VAddcCoU32:ri | V1 <- V1 I  | {d}, $vcc = V_ADDC_U32_e64 {s0}, {s1}, $vcc, 0, implicit $exec
+VAddcCoU32:ii | V1 <- I I   | {d}, $vcc = V_ADDC_U32_e64 {s0}, {s1}, $vcc, 0, implicit $exec
+VAddF32     | V1 <- V1 V1 | {d} = nofpexcept V_ADD_F32_e32 {s0}, {s1}, implicit $mode, implicit $exec
+VSubF32     | V1 <- V1 V1 | {d} = nofpexcept V_SUB_F32_e32 {s0}, {s1}, implicit $mode, implicit $exec
+VMulF32     | V1 <- V1 V1 | {d} = nofpexcept V_MUL_F32_e32 {s0}, {s1}, implicit $mode, implicit $exec
+VMaxF32     | V1 <- V1 V1 | {d} = nofpexcept V_MAX_F32_e32 {s0}, {s1}, implicit $mode, implicit $exec
+VMax3F32    | V1 <- V1 V1 V1 | {d} = nofpexcept V_MAX3_F32_e64 0, {s0}, 0, {s1}, 0, {s2}, 0, 0, implicit $mode, implicit $exec
+VFmaF32     | V1 <- V1 V1 V1 | {d} = nofpexcept V_FMA_F32_e64 0, {s0}, 0, {s1}, 0, {s2}, 0, 0, implicit $mode, implicit $exec
+VExpF32     | V1 <- V1 | {d} = nofpexcept V_EXP_F32_e32 {s0}, implicit $mode, implicit $exec
+VRcpF32     | V1 <- V1 | {d} = nofpexcept V_RCP_F32_e32 {s0}, implicit $mode, implicit $exec
+VCvtF32F16  | V1 <- V1 | {d} = nofpexcept V_CVT_F32_F16_e32 {s0}, implicit $mode, implicit $exec
+VCvtF16F32  | V1 <- V1 | {d} = nofpexcept V_CVT_F16_F32_e32 {s0}, implicit $mode, implicit $exec
+VAndB32     | V1 <- V1 V1 | {d} = V_AND_B32_e32 {s0}, {s1}, implicit $exec
+VOrB32      | V1 <- V1 V1 | {d} = V_OR_B32_e32 {s0}, {s1}, implicit $exec
+VXorB32     | V1 <- V1 V1 | {d} = V_XOR_B32_e32 {s0}, {s1}, implicit $exec
+VLshrB32    | V1 <- I V1  | {d} = V_LSHRREV_B32_e32 {s0}, {s1}, implicit $exec
+VLshlB32    | V1 <- I V1  | {d} = V_LSHLREV_B32_e32 {s0}, {s1}, implicit $exec
+VMulLoU32   | V1 <- V1 V1 | {d} = V_MUL_LO_U32_e64 {s0}, {s1}, implicit $exec
+VCmpLtI32   | <- V1 V1 | V_CMP_LT_I32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VCmpGeI32   | <- V1 V1 | V_CMP_GE_I32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VCmpNeI32   | <- V1 V1 | V_CMP_NE_I32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VCmpLtF32   | <- V1 V1 | nofpexcept V_CMP_LT_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
+VCndmask    | V1 <- V1 V1 | {d} = V_CNDMASK_B32_e32 {s0}, {s1}, implicit $exec, implicit $vcc
+VWriteSub   | V2 <- V1 | {dsub} = V_MOV_B32_e32 {s0}, implicit $exec
+VReadSub    | V1 <- V2 | {d} = V_MOV_B32_e32 {s0sub}, implicit $exec
+VMfma16x16x16F16 | V4 <- V2 V2 V4 | {d} = V_MFMA_F32_16X16X16F16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x8F16 | V16 <- V2 V2 V16 | {d} = V_MFMA_F32_32X32X8F16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x32Fp8 | V4 <- V2 V2 V4 | {d} = V_MFMA_F32_16X16X32_FP8_FP8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x16Fp8 | V16 <- V2 V2 V16 | {d} = V_MFMA_F32_32X32X16_FP8_FP8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfmaScale32x32x64Fp8 | V16 <- V8 V8 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, {s3}, {s4}, 0, 0, implicit $mode, implicit $exec
+VMfmaScale32x32x64Fp8Z | V16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_vgprcd_e64 {s0}, {s1}, 0, 0, 0, {s2}, {s3}, 0, 0, implicit $mode, implicit $exec
+LdsWriteB32 | <- V1 V1 | DS_WRITE_B32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s32), addrspace 3)
+LdsReadB32  | V1 <- V1 | {d} = DS_READ_B32_gfx9 {s0}, {imm}, 0, implicit $exec :: (load (s32), addrspace 3)
+LdsWriteB128 | <- V1 V4 | DS_WRITE_B128_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s128), addrspace 3)
+LdsReadB128 | V4 <- V1 | {d} = DS_READ_B128_gfx9 {s0}, {imm}, 0, implicit $exec :: (load (s128), addrspace 3)
+LdsReadB64TrB8 | V2 <- V1 | {d} = DS_READ_B64_TR_B8_vi {s0}, {imm}, 0, implicit $exec :: (load (s64), addrspace 3)
+SBarrier    | <- | S_BARRIER
+GlobalLoadU16 | V1 <- V2 | {d} = GLOBAL_LOAD_USHORT {s0}, {imm}, 0, implicit $exec :: (load (s16), addrspace 1)
+GlobalLoadF32 | V1 <- V2 | {d} = GLOBAL_LOAD_DWORD {s0}, {imm}, 0, implicit $exec :: (load (s32), addrspace 1)
+GlobalLoadB128 | V4 <- V2 | {d} = GLOBAL_LOAD_DWORDX4 {s0}, {imm}, 0, implicit $exec :: (load (s128), addrspace 1)
+GlobalStoreU16 | <- V2 V1 | GLOBAL_STORE_SHORT {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s16), addrspace 1)
+GlobalStoreF32 | <- V2 V1 | GLOBAL_STORE_DWORD {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s32), addrspace 1)
+SLoadDword  | S1 <-    | {d} = S_LOAD_DWORD_IMM $sgpr0_sgpr1, {imm}, 0 :: (dereferenceable invariant load (s32), addrspace 4)
+SLoadDwordx2 | S2 <-   | {d} = S_LOAD_DWORDX2_IMM $sgpr0_sgpr1, {imm}, 0 :: (dereferenceable invariant load (s64), addrspace 4)
+SReadPhys   | S1 <-    | {d} = S_MOV_B32 {ps}
+SMovB32:r   | S1 <- S1 | {d} = S_MOV_B32 {s0}
+SMovB32:i   | S1 <- I  | {d} = S_MOV_B32 {s0}
+SMovB32:-   | S1 <-    | {d} = S_MOV_B32 {imm32}
+SAddU32     | S1 <- S1 S1 | {d} = S_ADD_U32 {s0}, {s1}, implicit-def $scc
+SAddcU32    | S1 <- S1 S1 | {d} = S_ADDC_U32 {s0}, {s1}, implicit-def $scc, implicit $scc
+SMulI32     | S1 <- S1 S1 | {d} = S_MUL_I32 {s0}, {s1}
+SShlB32     | S1 <- S1 I  | {d} = S_LSHL_B32 {s0}, {s1}, implicit-def $scc
+SCmpLtI32   | <- S1 S1 | S_CMP_LT_I32 {s0}, {s1}, implicit-def $scc
+SNop        | <- | DROP
+SWaitVm     | <- | S_WAITCNT {vmcnt}
+SWaitLgkm   | <- | S_WAITCNT {lgkmcnt}
+SEndpgm     | <- | S_ENDPGM 0
+
+# terminators
+T_Goto      | <- | S_BRANCH {t}
+T_Scc0      | <- | S_CBRANCH_SCC0 {t}, implicit $scc
+T_Scc1      | <- | S_CBRANCH_SCC1 {t}, implicit $scc
+T_Vccnz     | <- | S_CBRANCH_VCCNZ {t}, implicit $vcc
+T_Vccz      | <- | S_CBRANCH_VCCZ {t}, implicit $vcc
+T_Endpgm    | <- | S_ENDPGM 0
