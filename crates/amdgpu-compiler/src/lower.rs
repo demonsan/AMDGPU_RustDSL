@@ -129,6 +129,20 @@ impl Lowerer {
         self.cur = self.mir.blocks.len() - 1;
     }
 
+    /// Drain every outstanding load before control flow diverges or joins: the pending
+    /// set is a linear-lowering notion, so a wait emitted on one path must not be assumed
+    /// by the code on another.
+    fn flush_pending(&mut self) {
+        if !self.pending_vmem.is_empty() {
+            self.push(MInst::new(MOp::SWaitVm));
+            self.pending_vmem.clear();
+        }
+        if !self.pending_smem.is_empty() || !self.pending_lds.is_empty() {
+            self.push(MInst::new(MOp::SWaitLgkm).imm(0));
+            self.pending_smem.clear();
+            self.pending_lds.clear();
+        }
+    }
     /// Wait for any pending load feeding `srcs`, then clear the pending set.
     fn touch(&mut self, srcs: &[Src]) {
         let mut need_vm = false;
