@@ -44,7 +44,9 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
                 if !errs.is_empty() {
                     return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
                 }
-                regalloc::allocate(&m)
+                let a = regalloc::allocate(&m)?;
+                hazards::pad_physical_war(&mut m, &a);
+                Ok(a)
             })();
             match attempt {
                 Ok(a) => return Ok((m, a)),

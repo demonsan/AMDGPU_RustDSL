@@ -252,3 +252,96 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, pad_block_end: bool) {
         b.insts = out;
     }
 }
+/// Post-register-allocation hazard: a VALU (or other) write to a physical VGPR range that a still
+/// running MFMA reads (SrcA/B/C) can corrupt the MFMA. Allocation reuses registers freely and the
+/// value-level pass above cannot see it; a scheduler that moves definitions closer to MFMAs makes
+/// it real (found by hardware: scheduled kernels that are bit-exact through the LLVM tail but wrong
+/// through the own tail). Pads `s_nop` until the MFMA's wait-state count elapsed, and before the
+/// end of a block for successors. Only run for scheduled code (default output unchanged).
+pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
+    let rng = |m: &MFunction, r: VReg| -> (u32, u32) {
+        let b = a.phys[r as usize];
+        (b, b + m.vreg_class(r).dwords())
+    };
+    let overlaps = |x: (u32, u32), y: (u32, u32)| x.0 < y.1 && y.0 < x.1;
+    let blocks = std::mem::take(&mut m.blocks);
+    let mut out_blocks = Vec::with_capacity(blocks.len());
+    for mut b in blocks {
+        let mut out: Vec<MInst> = Vec::with_capacity(b.insts.len() + 8);
+        // (issue cycle, wait states needed, op, source ranges)
+        let mut inflight: Vec<(usize, usize, MOp, Vec<(u32, u32)>)> = Vec::new();
+        let mut cycle = 0usize;
+        for inst in b.insts.drain(..) {
+            // destination ranges written by this instruction
+            let mut wr: Vec<(u32, u32)> = Vec::new();
+            match inst.op {
+                MOp::VWriteSub => {
+                    if let Some(d) = inst.dst {
+                        let base = a.phys[d as usize] + inst.imm as u32;
+                        wr.push((base, base + 1));
+                    }
+                }
+                MOp::VPermlane32Swap => {
+                    for s in inst.srcs.iter().take(2) {
+                        if let Src::Reg(r) = s {
+                            wr.push(rng(m, *r));
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(d) = inst.dst {
+                        if m.vreg_class(d).is_vector() {
+                            wr.push(rng(m, d));
+                        }
+                    }
+                }
+            }
+            if inst.op == MOp::VMovFromSPair || inst.op == MOp::VPtrAdd {
+                // two-instruction expansions write the whole pair (already covered by dst range)
+            }
+            let mut earliest = cycle;
+            for (issue, need, op, srcs) in &inflight {
+                if inst.op == *op && matches!(inst.op, MOp::VMfmaScale32x32x64Fp8) {
+                    continue; // in-place accumulation chain of the same opcode
+                }
+                if wr.iter().any(|w| srcs.iter().any(|s| overlaps(*w, *s))) {
+                    earliest = earliest.max(issue + need);
+                }
+            }
+            while earliest > cycle {
+                let n = (earliest - cycle).min(8);
+                out.push(MInst::new(MOp::SNop).imm(n as i64 - 1));
+                cycle += n;
+            }
+            if let Some(need) = mfma_latency(inst.op).map(|l| match l {
+                20 => 21,
+                _ => 12,
+            }) {
+                let mut srcs = Vec::new();
+                for s in inst.srcs.iter() {
+                    if let Src::Reg(r) = s {
+                        if m.vreg_class(*r).is_vector() {
+                            srcs.push(rng(m, *r));
+                        }
+                    }
+                }
+                inflight.push((cycle, need, inst.op, srcs));
+            }
+            if matches!(inst.op, MOp::SNop) {
+                cycle += inst.imm as usize;
+            }
+            out.push(inst);
+            cycle += 1;
+            inflight.retain(|(issue, need, _, _)| issue + need > cycle);
+        }
+        let mut missing = inflight.iter().map(|(i, n, _, _)| (i + n).saturating_sub(cycle)).max().unwrap_or(0);
+        while missing > 0 {
+            let n = missing.min(8);
+            out.push(MInst::new(MOp::SNop).imm(n as i64 - 1));
+            missing -= n;
+        }
+        b.insts = out;
+        out_blocks.push(b);
+    }
+    m.blocks = out_blocks;
+}
