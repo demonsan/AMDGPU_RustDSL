@@ -4772,7 +4772,8 @@ pub fn probe_fp8_fmha_hd128() -> Function {
     let tid_s4 = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c4)));
     let g2 = b.let_(Op::AndI32(Opnd::Val(tid_s4), Opnd::Val(c1)));
     let h_idx = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c1)));
-    let pP = b.shl_i32(pblk, c11);
+    let c12 = b.c_i32(12);
+    let pP = b.shl_i32(pblk, c12);
     let iP = b.mul_i32(i_idx, c128);
     let g216 = b.mul_i32(g2, c16i);
     let h8 = b.mul_i32(h_idx, c8);
