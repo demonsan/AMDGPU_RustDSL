@@ -16,11 +16,12 @@ def load(path):
     return out
 
 def is_filler(l):
-    return l.startswith(('s_nop', 's_waitcnt', 's_delay_alu', 's_set_vgpr_msb'))
+    # unconditional branches: we always emit them, LLVM drops fallthrough ones\n    return l.startswith(('s_nop', 's_waitcnt', 's_delay_alu', 's_set_vgpr_msb', 's_branch'))
 
 def norm(l):
     # LLVM may pick different (equivalent) mnemonics for the same op; normalise a few.
     l = l.replace('_e32', '').replace('_e64', '')
+    l = re.sub(r'\b0x([0-9a-fA-F]+)\b', lambda m: str(int(m.group(1), 16)), l)
     l = re.sub(r'\bs_branch BB(\d+)', 's_branch L', l)
     l = re.sub(r'(s_cbranch_\w+) \S+', r'\1 L', l)
     return l
