@@ -7073,15 +7073,15 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let vd_raw = b.load_f32(ptr_vd, 0);
 
     // KV head of this query head (GQA ratio is a power of two <= 16)
-    let g2 = b.cmp_lt_i32(c1, gqa);
-    let g4 = b.cmp_lt_i32(c2, gqa);
-    let g8 = b.cmp_lt_i32(c4, gqa);
-    let g16 = b.cmp_lt_i32(c8, gqa);
+    let gq2 = b.cmp_lt_i32(c1, gqa);
+    let gq4 = b.cmp_lt_i32(c2, gqa);
+    let gq8 = b.cmp_lt_i32(c4, gqa);
+    let gq16 = b.cmp_lt_i32(c8, gqa);
     let c0k = b.c_i32(0);
-    let s1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g2), a: Opnd::Val(c1), b: Opnd::Val(c0k) });
-    let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g4), a: Opnd::Val(c2), b: Opnd::Val(s1) });
-    let s3 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g8), a: Opnd::Val(c3), b: Opnd::Val(s2) });
-    let gshift = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g16), a: Opnd::Val(c4), b: Opnd::Val(s3) });
+    let s1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gq2), a: Opnd::Val(c1), b: Opnd::Val(c0k) });
+    let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gq4), a: Opnd::Val(c2), b: Opnd::Val(s1) });
+    let s3 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gq8), a: Opnd::Val(c3), b: Opnd::Val(s2) });
+    let gshift = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gq16), a: Opnd::Val(c4), b: Opnd::Val(s3) });
     let kvh = if ablate_pre.contains("nogqa") { hidx } else { b.let_(Op::LshrI32(Opnd::Val(hidx), Opnd::Val(gshift))) };
     let kb0 = b.mul_i32(bidx, k_bs);
     let kb1 = b.mul_i32(kvh, k_hs);
