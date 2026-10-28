@@ -7,8 +7,8 @@ ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 REF_CO="${REF_CO:?set REF_CO to the vendor fwd_hd128_mxfp8.co}"
 OUR_KERNEL="${OUR_KERNEL:-fmha_fwd_hd128_mxfp8_t}"
 cd "$REPO"; mkdir -p build
-bash tools/container/cargo.sh run -q --bin amdc -- emit "$OUR_KERNEL" --out "/work/build/$OUR_KERNEL.s" >/dev/null 2>&1
-"$ROC/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
+AMD_ROCM_MOUNT="${AMD_ROCM_MOUNT:-$ROC}" bash tools/container/cargo.sh run -q --bin amdc -- emit "$OUR_KERNEL" --backend "${BACKEND:-own}" ${AMDC_EXTRA_FLAGS:-} --out "/work/build/$OUR_KERNEL.s" >/dev/null 2>&1
+"${ASM_ROC:-$ROC}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
     -o build/fmha_ours.co "build/$OUR_KERNEL.s"
 [ -x build/ref_host ] || g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/ref_host.cpp -o build/ref_host \
     -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib"

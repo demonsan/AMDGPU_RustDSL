@@ -1,0 +1,11 @@
+# backend.lock - LLVM the MIR tail was validated against (see docs/llvm-tail-integration.md).
+# Regenerate deliberately with: amdc backend write-lock  (after re-running the opcode probe and the oracle).
+# Pin: ROCm 10.1.0 LLVM (ROCm/llvm-project d6f6cb691863e9258034ab48c1dfce21689d5606); llc built from llvm/tools/llc against its libLLVM.so
+# (ROCm 10 ships no llc binary): /shared/amdgpu/home/blyu_qle/llvm-tools/rocm-10.1.0/bin (see tools/llvm_build_llc.sh).
+# The previous pin (ROCm 7.0.2, dialect llvm20) is in backend.llvm20.lock.
+dialect = llvm24
+llvm_version = AMD LLVM version 24.0.0git
+start_before = gcn-create-vopd
+forbidden_after_start = postmisched,machine-scheduler,post-RA-sched,block-placement,tailduplication,branch-folder,machine-cp,greedy,virtregrewriter,prologepilog,machine-sink,postra-machine-sink
+required_in_tail = si-insert-waitcnts,post-RA-hazard-rec
+tail_passes = gcn-create-vopd,si-memory-legalizer,machinedomtree,machine-loops,machinepostdomtree,si-insert-waitcnts,si-mode-register,si-insert-hard-clauses,si-late-branch-lowering,si-pre-emit-peephole,post-RA-hazard-rec,amdgpu-wait-sgpr-hazards,amdgpu-lower-vgpr-encoding,amdgpu-insert-delay-alu,branch-relaxation,RegUsageInfoCollector,remove-loads-into-fake-uses,livedebugvalues,machine-sanmd,amdgpu-preload-kern-arg-prolog,lazy-machine-block-freq,machine-opt-remark-emitter,stack-frame-layout,amdgpu-resource-usage
