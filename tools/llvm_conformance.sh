@@ -32,7 +32,12 @@ selected_tests() {  # basename list of MIR tests with a tail pass in a RUN line
 make_mirror() {  # $1 = dir ; a copy of llvm/test plus symlinks to the rest of llvm/, with a lit site config pointing at it
     local M="$1"
     rm -rf "$M"; mkdir -p "$M/llvm" "$M/build/test"
-    cp -r "$LLVM_SRC/llvm/test" "$M/llvm/test"
+    # llvm/test is 1.2 GB: copy only the config files and CodeGen/AMDGPU, symlink the rest.
+    local T="$LLVM_SRC/llvm/test"
+    mkdir -p "$M/llvm/test/CodeGen"
+    for e in "$T"/*; do b=$(basename "$e"); if [ -d "$e" ]; then [ "$b" = CodeGen ] || ln -s "$e" "$M/llvm/test/$b"; else cp "$e" "$M/llvm/test/$b"; fi; done
+    for e in "$T"/CodeGen/*; do b=$(basename "$e"); if [ -d "$e" ]; then [ "$b" = AMDGPU ] || ln -s "$e" "$M/llvm/test/CodeGen/$b"; else cp "$e" "$M/llvm/test/CodeGen/$b"; fi; done
+    cp -r "$T/CodeGen/AMDGPU" "$M/llvm/test/CodeGen/AMDGPU"
     for e in "$LLVM_SRC"/llvm/*; do b=$(basename "$e"); [ "$b" = test ] || ln -s "$e" "$M/llvm/$b"; done
     for e in "$LLVM_SRC"/*; do b=$(basename "$e"); [ "$b" = llvm ] || ln -s "$e" "$M/$b"; done
     sed -e "s#^config.llvm_src_root = .*#config.llvm_src_root = '$M/llvm'#" \
