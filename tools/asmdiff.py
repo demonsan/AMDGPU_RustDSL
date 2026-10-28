@@ -57,8 +57,8 @@ lc_n = [norm(x) for x in lc]
 mism = [(i, a, b) for i, (a, b) in enumerate(zip(oc_n, lc_n)) if a != b]
 print(f'core instructions: own={len(oc)} llvm={len(lc)} mismatches={len(mism)}')
 for i, a, b in mism[:15]:
-    print(f'  #{i}: own  : {a}
-        llvm : {b}')
+    print(f'  #{i}: own  : {a}')
+    print(f'        llvm : {b}')
 print(f'nop cycles : own={nop_cycles(of)} llvm={nop_cycles(lf)}')
 print(f'filler ops : own={dict(stats(of))} llvm={dict(stats(lf))}')
 if len(sys.argv) > 3:
