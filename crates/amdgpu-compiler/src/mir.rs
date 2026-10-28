@@ -79,6 +79,7 @@ pub enum MOp {
     VCmpLtI32,
     VCmpGeI32,
     VCmpNeI32,
+    VCmpLtF32,
     VCndmask,
     // fragments / matrix cores
     VWriteSub,
@@ -136,6 +137,7 @@ impl MOp {
                 | MOp::VCmpLtI32
                 | MOp::VCmpGeI32
                 | MOp::VCmpNeI32
+                | MOp::VCmpLtF32
         )
     }
 }

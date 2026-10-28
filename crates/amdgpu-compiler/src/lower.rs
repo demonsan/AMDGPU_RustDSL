@@ -9,7 +9,7 @@
 //! * loop-carried variables become plain virtual registers, so no phi
 //!   elimination is needed downstream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use amdgpu_dsl::{DType, Function, Op, Opnd, Stmt, ValueId};
 use crate::mir::*;
@@ -50,6 +50,8 @@ struct Lowerer {
     use_counts: HashMap<ValueId, usize>,
     /// Cache of sub-register views: (tuple, dword offset, class) -> alias vreg.
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
+    /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
+    else_started: HashSet<u32>,
 }
 
 impl Lowerer {
@@ -127,6 +129,7 @@ impl Lowerer {
             defs,
             use_counts,
             alias_cache: HashMap::new(),
+            else_started: HashSet::new(),
         }
     }
 
@@ -660,6 +663,9 @@ impl Lowerer {
                 }
                 Stmt::Else => {
                     self.flush_pending();
+                    if let Some((else_l, _)) = self.if_stack.last() {
+                        self.else_started.insert(*else_l);
+                    }
                     if let Some((c, v)) = self.scope_snaps.last() {
                         self.consts = c.clone();
                         self.converted = v.clone();
@@ -691,8 +697,13 @@ impl Lowerer {
                         self.consts = c;
                         self.converted = v;
                     }
-                    let (_, end_l) = self.if_stack.pop().ok_or("endif without if")?;
+                    let (else_l, end_l) = self.if_stack.pop().ok_or("endif without if")?;
                     self.set_term(Term::Goto(end_l));
+                    if !self.else_started.remove(&else_l) {
+                        // An `if` without `else`: the not-taken edge still needs its target block.
+                        self.start_block(else_l);
+                        self.set_term(Term::Goto(end_l));
+                    }
                     self.start_block(end_l);
                 }
             }
@@ -719,6 +730,13 @@ impl Lowerer {
                         let ra = self.as_v1(a)?;
                         let rb = self.as_v1(b)?;
                         self.push(MInst::new(MOp::VCmpGeI32).srcreg(ra).srcreg(rb));
+                        let on = if negate { Pred::Vccz } else { Pred::Vccnz };
+                        return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
+                    }
+                    Op::CmpLtF32(a, b) => {
+                        let ra = self.as_v1(a)?;
+                        let rb = self.as_v1(b)?;
+                        self.push(MInst::new(MOp::VCmpLtF32).srcreg(ra).srcreg(rb));
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
                     }
@@ -844,6 +862,7 @@ impl Lowerer {
             Op::CvtF16ToF32(a) => self.un_v1(dst, MOp::VCvtF32F16, *a)?,
             Op::CvtF32ToF16(a) => self.un_v1(dst, MOp::VCvtF16F32, *a)?,
             Op::CmpLtI32(a, b) => self.cmp_i1(dst, MOp::VCmpLtI32, *a, *b)?,
+            Op::CmpLtF32(a, b) => self.cmp_i1(dst, MOp::VCmpLtF32, *a, *b)?,
             Op::CmpGeI32(a, b) => self.cmp_i1(dst, MOp::VCmpGeI32, *a, *b)?,
             Op::NotI1(a) => {
                 let r = self.as_v1(*a)?;

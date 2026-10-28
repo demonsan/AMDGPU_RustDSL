@@ -155,6 +155,8 @@ pub enum Op {
 
     CmpLtI32(Opnd, Opnd),
     CmpGeI32(Opnd, Opnd),
+    /// `a < b` on f32 (`v_cmp_lt_f32`).
+    CmpLtF32(Opnd, Opnd),
     NotI1(Opnd),
     Select { ty: DType, cond: Opnd, a: Opnd, b: Opnd },
 
@@ -236,7 +238,7 @@ impl Op {
             Op::ExpF32(..) | Op::Exp2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } => DType::F32,
             Op::CvtF32ToF16(..) => DType::I32,
             Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
-            Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) => DType::I1,
+            Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::CmpLtF32(..) | Op::NotI1(..) => DType::I1,
             Op::Max3F32(..) => DType::F32,
             Op::Select { ty, .. } => *ty,
             Op::PtrAdd { .. } | Op::KernargPtr { .. } => DType::Ptr,
@@ -281,6 +283,7 @@ impl Op {
             | Op::MaxF32(a, b)
             | Op::CmpLtI32(a, b)
             | Op::CmpGeI32(a, b)
+            | Op::CmpLtF32(a, b)
             | Op::PtrAdd { base: a, byte_off: b } => vec![*a, *b],
             Op::FmaF32(a, b, c) => vec![*a, *b, *c],
             Op::Max3F32(a, b, c) => vec![*a, *b, *c],
@@ -606,6 +609,10 @@ impl FnBuilder {
 
     pub fn cvt_f32_to_f16(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtF32ToF16(a.into()))
+    }
+
+    pub fn cmp_lt_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CmpLtF32(a.into(), b.into()))
     }
 
     pub fn cmp_lt_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
@@ -960,7 +967,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                             errs.push(here(e));
                         }
                     }
-                    Op::AddF32(a, b) | Op::SubF32(a, b) | Op::MulF32(a, b) | Op::MaxF32(a, b) => {
+                    Op::AddF32(a, b) | Op::SubF32(a, b) | Op::MulF32(a, b) | Op::MaxF32(a, b) | Op::CmpLtF32(a, b) => {
                         if let Err(e) = expect_float(f, *a, "float op") {
                             errs.push(here(e));
                         }
