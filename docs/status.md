@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **head dim 128, KV tile 128** | `probe_fp8_fmha_hd128`: reference tile shapes — Q 32x128, four 32-key score tiles per iteration each the sum of two chained K=64 scaled MFMAs, two-pass 128-wide softmax, eight PV MFMAs (two 64-key halves x four 32-wide output tiles) with V through `ds_read_b64_tr_b8` at pitch 128, four register-resident O accumulators; 240 VGPRs (reference 246); `worst_err = 4.3e-7` vs the host emulation -> `PROBE_FMHA_HD128_OK` |
 | **512-thread tr + A/B role-split attention** | `probe_fp8_fmha_trab`: eight query tiles in one block of 512, V double-buffered in shared LDS and copied half by role A (waves 0-3) and half by role B (waves 4-7) with their own steady loops and identical barrier schedule, V consumed with `ds_read_b64_tr_b8`, 64 keys per iteration, register-resident O; all 8 waves match the host emulation (`1.8e-4`) -> `PROBE_FMHA_TRAB_OK` |
 | **64-key online softmax, V through `ds_read_b64_tr_b8`** | `probe_fp8_fmha_tr`: two score tiles and a 64-wide online softmax per iteration, quantised P as the full K=64 A fragment (lane group g keeps keys 32g..32g+31), row-major V staged in LDS and turned into the B fragment by four transposing reads, register-resident O accumulator; `worst_err = 3.4e-7` vs the host emulation, `3.8e-2` vs exact softmax -> `PROBE_FMHA_TR_OK` |
 | **ds_read_b64_tr_b8 B fragment** | `probe_fp8_matmul_tr`: row-major B staged in LDS, the 32x32x64 B fragment built with four `ds_read_b64_tr_b8` reads (no host-side transpose), random fp8 data and random scales, `worst_err = 0` vs the CPU reference -> `PROBE_MATMUL_TR_OK` |
@@ -361,9 +362,7 @@ fully populated (176 VGPRs).
 `probe_fp8_fmha_trab` (round 26) combines the tr-based 64-key loop with the A/B role-split
 loops in a 512-thread block (192 VGPRs, 70,656 B LDS vs the reference 246 VGPRs / 84,224 B).
 
-Remaining distance to the reference kernel: the `+0x80` KV progress updates, rollback exits,
-and the reference tile shapes (hd128 instead of our 64-wide head, KV tile 128 instead of 64
-keys per iteration, a K tile staged through LDS as well).
+Remaining distance to the reference kernel: see the round 27 section.
 
 ## Separate A/B loops and two lowering bugs (round 23)
 
@@ -405,6 +404,26 @@ at the per-lane address
 GPU-free regression tests for the round 23 lowering fixes were added
 (`loads_are_drained_before_a_branch`, `constants_are_materialised_on_every_path`); the backend
 suite is now 10 tests.
+
+## Reference tile shapes (round 27)
+
+`probe_fp8_fmha_hd128` runs the reference kernel's tile shapes (head dim 128, KV tile 128) for one
+32-row query tile at 240 VGPRs (the reference uses 246). Bringing it up exposed three compiler /
+codegen limits that are now documented:
+
+1. **Register pressure from the constant cache.** Hundreds of distinct address constants
+   (`4 * k` for every LDS word) were all live at once and exhausted the 256 VGPRs even though the
+   real working set is small. Kernels now use running addresses (`addr += 4`); the allocator's
+   out-of-registers error also reports how many vregs of each class were live at that point.
+2. **13-bit global offsets.** `global_load/store` immediates are signed 13-bit (+-4 KiB); larger
+   static offsets must be folded into the pointer.
+3. **Transposing-read address for other pitches.** The K-block stride of the `ds_read_b64_tr_b8`
+   address is `32 * pitch` (4096 for pitch 128), not a constant 1024: with the wrong stride the
+   first query rows were right and the `p = 1` rows were wrong, which pinned it down.
+
+Remaining distance to the reference kernel: combining the hd128 loop with the 512-thread A/B role
+split (eight query tiles, K also staged through LDS), the `+0x80` KV progress updates and the
+rollback exits.
 
 ## Next: FMHA reference core loop
 
