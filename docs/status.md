@@ -119,3 +119,14 @@ in the two-fragment concatenation. Worth isolating before the FMHA core loop,
 which needs >= 8 KB and the reference kernel uses ~84 KB.
 
 ## Next: FMHA reference core loop
+
+1. Resolve the 16 KB LDS question above (needed before scaling the core loop).
+2. Build the paired A/B loop skeleton: two loops with rollback exits, four
+   paired barriers per outer iteration, exactly as in the reference kernel.
+3. Wire the data path into the loop: LDS staging -> `ds_read_b64/b128` -> MFMA
+   accumulation (accumulator lives in the fragment registers).
+4. Add the softmax pack instructions
+   (`v_cvt_pknorm_u16_f32`, `v_cvt_scalef32_pk_fp8_bf16`) with their
+   low/high write-mask semantics.
+5. Compare the emitted instruction stream against the reference witness
+   section by section.
