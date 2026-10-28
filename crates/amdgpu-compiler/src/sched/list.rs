@@ -95,6 +95,8 @@ pub struct ListResult {
     pub est_after: u32,
     pub peak_before: i64,
     pub peak_after: i64,
+    pub limit_eff: i64,
+    pub window: usize,
 }
 
 /// Cycle estimate of issuing `order` in order on the machine model.
@@ -125,6 +127,7 @@ pub fn schedule(
     live_in: &HashSet<VReg>,
     live_out: &HashSet<VReg>,
     limit: i64,
+    window: usize,
 ) -> ListResult {
     let n = g.n;
     let costs: Vec<OpCost> = insts.iter().map(|i| model::cost(i.op)).collect();
@@ -160,17 +163,22 @@ pub fn schedule(
     let mut pipe_free = [0u32; NPIPES];
     let mut cycle = 0u32;
     let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut done = vec![false; n];
+    let mut lowest = 0usize;
     let mut start = vec![0u32; n];
     while order.len() < n {
-        // earliest start among the ready instructions
+        // earliest start among the ready instructions inside the window
         let mut tmin = u32::MAX;
-        for &c in &ready {
+        for &c in ready.iter().filter(|&&c| c < lowest.saturating_add(window)) {
             let t = ready_time[c].max(pipe_free[costs[c].pipe.index()]).max(cycle);
             tmin = tmin.min(t);
         }
         // candidate pool: (index in ready, start time, delta, fits)
         let mut pool: Vec<(usize, u32, i64, bool)> = Vec::with_capacity(ready.len());
         for (k, &c) in ready.iter().enumerate() {
+            if c >= lowest.saturating_add(window) {
+                continue;
+            }
             let t = ready_time[c].max(pipe_free[costs[c].pipe.index()]).max(cycle);
             let d = pr.delta(&rd[c], &wr[c]);
             let fits = pr.cur + d <= limit_eff || d <= 0;
@@ -207,6 +215,10 @@ pub fn schedule(
         pr.commit(&rd[c], &wr[c]);
         peak_after = peak_after.max(pr.cur);
         order.push(c);
+        done[c] = true;
+        while lowest < n && done[lowest] {
+            lowest += 1;
+        }
         for &(s, lat) in &g.succs[c] {
             ready_time[s] = ready_time[s].max(t + lat);
             indeg[s] -= 1;
@@ -216,5 +228,33 @@ pub fn schedule(
         }
     }
     let est_after = estimate(g, &costs, &order);
-    ListResult { perm: order, est_before, est_after, peak_before, peak_after }
+    ListResult { perm: order, est_before, est_after, peak_before, peak_after, limit_eff, window }
+}
+/// Try several scheduling windows (how far past the oldest unscheduled instruction candidates may
+/// come from); keep the best estimate that stays within the pressure limit, else the original order.
+pub fn schedule_best(
+    m: &MFunction,
+    insts: &[MInst],
+    g: &Graph,
+    live_in: &HashSet<VReg>,
+    live_out: &HashSet<VReg>,
+    limit: i64,
+) -> ListResult {
+    let mut best: Option<ListResult> = None;
+    let mut first: Option<ListResult> = None;
+    for w in [usize::MAX, 400, 200, 100, 50, 25] {
+        let r = schedule(m, insts, g, live_in, live_out, limit, w);
+        if r.peak_after <= r.limit_eff && best.as_ref().map_or(true, |b| r.est_after < b.est_after) {
+            best = Some(ListResult { perm: r.perm.clone(), ..r });
+        } else if first.is_none() {
+            first = Some(r);
+        }
+    }
+    match best {
+        Some(b) => b,
+        None => {
+            let f = first.unwrap();
+            ListResult { perm: (0..g.n).collect(), est_after: f.est_before, peak_after: f.peak_before, ..f }
+        }
+    }
 }

@@ -103,7 +103,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
             }
             let term = m.blocks[bi].term.clone();
             let g = depgraph::build(m, &insts, &term, o.alu_across_barrier);
-            let r = list::schedule(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], o.max_vgprs as i64);
+            let r = list::schedule_best(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], o.max_vgprs as i64);
             if o.verify {
                 verify::check_perm(m, &insts, &r.perm, &term, o.alu_across_barrier)
                     .map_err(|e| format!("schedule verification failed in block {bi}: {e}"))?;
