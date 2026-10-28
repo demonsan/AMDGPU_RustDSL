@@ -6872,7 +6872,15 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let thr = b.add_f32(m_old, tau);
                 let grow = b.cmp_lt_f32(thr, mt);
                 b.begin_if(Opnd::Val(grow));
-                let m_new = b.max_f32(m_old, mt);
+                // overshoot: move the running max "over" above the tile max so the next triggers are rarer
+                let over = [("over8", 8.0f32), ("over6", 6.0), ("over4", 4.0), ("over3", 3.0), ("over2", 2.0)].iter().find(|(n, _)| fmha_t_opt(n)).map(|x| x.1).unwrap_or(0.0);
+                let mt_o = if over > 0.0 {
+                    let co = b.c_f32(over);
+                    b.add_f32(mt, co)
+                } else {
+                    mt
+                };
+                let m_new = b.max_f32(m_old, mt_o);
                 let dm = b.sub_f32(m_old, m_new);
                 let corr = b.exp2_f32(dm);
                 let m_bits = b.bitcast_i32(m_new);
