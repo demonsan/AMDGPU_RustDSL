@@ -127,14 +127,14 @@ if [ "$WHAT" = table ] || [ "$WHAT" = all ]; then
 fi
 
 if [ "$WHAT" = idem ] || [ "$WHAT" = all ]; then
-    echo "== tail idempotence + verifier on exported kernels"
+    echo "== tail idempotence + verifier on exported kernels (AMDC_SCHED=${AMDC_SCHED:-0} AMDC_SCHED_OPTS=${AMDC_SCHED_OPTS:-})"
     mkdir -p "$OUT/idem"; ok=0; bad=0
     LLC="$LLVM_TOOLS/llc"; ARGS="-mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -O2"
     for K in $("$AMDC" list); do
         "$AMDC" emit "$K" --mir-out "$OUT/idem/$K.mir" 2>/dev/null || { echo "EXPORT FAIL $K"; bad=$((bad+1)); continue; }
         if ! $LLC $ARGS -verify-machineinstrs -start-before=gcn-create-vopd -stop-after=amdgpu-insert-delay-alu "$OUT/idem/$K.mir" -o "$OUT/idem/$K.a.mir" 2> "$OUT/idem/$K.err"; then echo "VERIFY/LLC FAIL $K"; bad=$((bad+1)); continue; fi
         $LLC $ARGS -verify-machineinstrs -start-before=si-insert-waitcnts -stop-after=amdgpu-insert-delay-alu "$OUT/idem/$K.a.mir" -o "$OUT/idem/$K.b.mir" 2> "$OUT/idem/$K.err2" || { echo "SECOND RUN FAIL $K"; bad=$((bad+1)); continue; }
-        if diff -q "$OUT/idem/$K.a.mir" "$OUT/idem/$K.b.mir" >/dev/null; then ok=$((ok+1)); else echo "NOT IDEMPOTENT $K ($(diff "$OUT/idem/$K.a.mir" "$OUT/idem/$K.b.mir" | grep -c '^[<>]') lines)"; bad=$((bad+1)); fi
+        if diff -q <(grep -v "ModuleID" "$OUT/idem/$K.a.mir") <(grep -v "ModuleID" "$OUT/idem/$K.b.mir") >/dev/null; then ok=$((ok+1)); else echo "NOT IDEMPOTENT $K ($(diff <(grep -v ModuleID "$OUT/idem/$K.a.mir") <(grep -v ModuleID "$OUT/idem/$K.b.mir") | grep -c '^[<>]') lines)"; bad=$((bad+1)); fi
     done
     echo "idempotent+verified kernels: $ok  failing: $bad"
 fi

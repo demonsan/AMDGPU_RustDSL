@@ -121,14 +121,18 @@ fn mir_table_report_cmd(args: &[String]) -> ExitCode {
     }
     let t = amdgpu_compiler::backend::llvm20::Table::load();
     let r = amdgpu_compiler::backend::mir_roundtrip::table_report(&files, &t);
-    println!("instructions={} matched={} shape_mismatch={} unknown_opcode={}", r.total, r.matched, r.shape_mismatch, r.unknown_opcode);
+    println!("instructions={} matched_exact={} implicit_operands_differ={} explicit_shape_mismatch={} unknown_opcode={}", r.total, r.matched, r.implicit_differs, r.shape_mismatch, r.unknown_opcode);
     println!("matched opcodes: {}", r.matched_by_opcode.len());
-    println!("-- table opcodes with an instruction that did not match the row (opcode: example)");
+    println!("-- explicit operand shape differs from the table row (opcode: example)");
     for (o, ex) in &r.mismatch_examples {
         println!("  {o}: {ex}");
     }
     let mut unk: Vec<_> = r.unknown_by_opcode.iter().collect();
     unk.sort_by(|a, b| b.1.cmp(a.1));
+    println!("-- explicit operands match but the implicit operand set differs (opcode: instruction | implicit set)");
+    for (o, ex) in &r.implicit_examples {
+        println!("  {o}: {ex}");
+    }
     println!("-- top unknown opcodes (not in the table)");
     for (o, n) in unk.iter().take(40) {
         println!("  {n:>6} {o}");

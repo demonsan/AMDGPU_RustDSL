@@ -323,6 +323,8 @@ pub struct TableReport {
     pub total: usize,
     pub matched: usize,
     pub shape_mismatch: usize,
+    pub implicit_differs: usize,
+    pub implicit_examples: BTreeMap<String, String>,
     pub unknown_opcode: usize,
     pub unknown_by_opcode: BTreeMap<String, usize>,
     pub mismatch_examples: BTreeMap<String, String>,
@@ -398,7 +400,7 @@ fn opcode_of_row(line: &str) -> Option<String> {
 }
 
 pub fn table_report(files: &[(String, String)], t: &Table) -> TableReport {
-    // opcode -> single-line templates (tokens present)
+    // opcode -> single-line templates
     let mut by_op: HashMap<String, Vec<String>> = HashMap::new();
     for row in t.rows.values() {
         if row.text.len() != 1 {
@@ -410,10 +412,8 @@ pub fn table_report(files: &[(String, String)], t: &Table) -> TableReport {
     }
     let mut rep = TableReport::default();
     for (_name, text) in files {
-        let (_, _) = (0, 0);
-        let lines: Vec<&str> = text.split('\n').collect();
         let mut in_body = false;
-        for l in &lines {
+        for l in text.split('\n') {
             if l.trim_end().starts_with("body:") && l.trim_start_matches("body:").trim() == "|" {
                 in_body = true;
                 continue;
@@ -424,53 +424,81 @@ pub fn table_report(files: &[(String, String)], t: &Table) -> TableReport {
             if !in_body {
                 continue;
             }
-            let mut st = Stats::default();
-            let _ = &mut st;
-            if let Some(inst) = parse_inst_line(l) {
-                rep.total += 1;
-                match by_op.get(&inst.opcode) {
-                    None => {
-                        rep.unknown_opcode += 1;
-                        *rep.unknown_by_opcode.entry(inst.opcode.clone()).or_default() += 1;
+            let Some(inst) = parse_inst_line(l) else { continue };
+            rep.total += 1;
+            let Some(tpls) = by_op.get(&inst.opcode) else {
+                rep.unknown_opcode += 1;
+                *rep.unknown_by_opcode.entry(inst.opcode.clone()).or_default() += 1;
+                continue;
+            };
+            // explicit part (defs + non-implicit operands) and the sorted implicit set
+            let split = |ops: &[Operand]| -> (Vec<String>, Vec<String>) {
+                let (mut ex, mut im) = (Vec::new(), Vec::new());
+                for o in ops {
+                    let p = strip_reg_flags(&o.print());
+                    if o.flags.iter().any(|f| f.starts_with("implicit")) {
+                        im.push(p);
+                    } else {
+                        ex.push(p);
                     }
-                    Some(tpls) => {
-                        // normalised text of the instruction: "defs = opcode ops" with flags dropped
-                        let mut s = String::new();
-                        if !inst.defs.is_empty() {
-                            s.push_str(&inst.defs.iter().map(|o| strip_reg_flags(&o.print())).collect::<Vec<_>>().join(", "));
-                            s.push_str(" = ");
-                        }
-                        s.push_str(&inst.opcode);
-                        if !inst.ops.is_empty() {
-                            s.push(' ');
-                            s.push_str(&inst.ops.iter().map(|o| strip_reg_flags(&o.print())).collect::<Vec<_>>().join(", "));
-                        }
-                        s.push_str(&inst.suffix.split(" :: ").next().unwrap_or("").to_string());
-                        let ok = tpls.iter().any(|tp| {
-                            let tp_norm: String = {
-                                let mut x = tp.clone();
-                                for f in INST_FLAGS {
-                                    x = x.replace(&format!("{f} "), "");
-                                }
-                                x
-                            };
-                            matches_template(&tp_norm, &s)
-                        });
-                        if ok {
-                            rep.matched += 1;
-                            *rep.matched_by_opcode.entry(inst.opcode.clone()).or_default() += 1;
-                        } else {
-                            rep.shape_mismatch += 1;
-                            rep.mismatch_examples.entry(inst.opcode.clone()).or_insert_with(|| s.clone());
-                        }
-                    }
+                }
+                im.sort();
+                (ex, im)
+            };
+            let defs_ex: Vec<String> = inst.defs.iter().filter(|o| !o.flags.iter().any(|f| f.starts_with("implicit"))).map(|o| strip_reg_flags(&o.print())).collect();
+            let defs_im: Vec<String> = inst.defs.iter().filter(|o| o.flags.iter().any(|f| f.starts_with("implicit"))).map(|o| strip_reg_flags(&o.print())).collect();
+            let (ex, mut im) = split(&inst.ops);
+            im.extend(defs_im);
+            im.sort();
+            let mut s = String::new();
+            if !defs_ex.is_empty() {
+                s.push_str(&defs_ex.join(", "));
+                s.push_str(" = ");
+            }
+            s.push_str(&inst.opcode);
+            if !ex.is_empty() {
+                s.push(' ');
+                s.push_str(&ex.join(", "));
+            }
+            let mut best = 0; // 0 = no match, 1 = explicit operands match but implicit set differs, 2 = exact
+            for tp in tpls {
+                // template: strip instruction flags, split implicit operands off
+                let mut x = tp.clone();
+                for f in INST_FLAGS {
+                    x = x.replace(&format!("{f} "), "");
+                }
+                let (head, tail) = match x.find(", implicit") {
+                    Some(p) => (x[..p].to_string(), x[p + 2..].to_string()),
+                    None => (x.clone(), String::new()),
+                };
+                // "implicit-def $vcc" inside the explicit part of the template (V_ADD_CO ... implicit-def $vcc): handled by the tail
+                if matches_template(&head, &s) {
+                    let mut tim: Vec<String> = tail.split(", ").filter(|z| !z.is_empty()).map(|z| z.to_string()).collect();
+                    tim.sort();
+                    let mut iim: Vec<String> = im.clone();
+                    // instruction implicit operands print as "implicit $exec"; compare as strings
+                    iim.iter_mut().for_each(|z| *z = z.trim().to_string());
+                    best = best.max(if tim == iim { 2 } else { 1 });
+                }
+            }
+            match best {
+                2 => {
+                    rep.matched += 1;
+                    *rep.matched_by_opcode.entry(inst.opcode.clone()).or_default() += 1;
+                }
+                1 => {
+                    rep.implicit_differs += 1;
+                    rep.implicit_examples.entry(inst.opcode.clone()).or_insert_with(|| format!("{} | implicit: {}", s, im.join(", ")));
+                }
+                _ => {
+                    rep.shape_mismatch += 1;
+                    rep.mismatch_examples.entry(inst.opcode.clone()).or_insert_with(|| s.clone());
                 }
             }
         }
     }
     rep
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
