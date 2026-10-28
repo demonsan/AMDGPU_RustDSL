@@ -72,6 +72,10 @@ fn instruction_stream(asm: &str) -> Vec<String> {
         if matches!(mn, "s_nop" | "s_waitcnt" | "s_delay_alu" | "s_branch" | "s_set_vgpr_msb") {
             continue;
         }
+        // LLVM's vccz-corruption workaround (`s_mov_b64 vcc, vcc` before `s_cbranch_vccz`): a hazard instruction the tail may add.
+        if mn == "s_mov_b64" && rest == "vcc, vcc" {
+            continue;
+        }
         let mn = mn.trim_end_matches("_e32").trim_end_matches("_e64");
         // operands split at top-level commas; modifiers (op_sel_hi:[..], offset:N) stay attached to the last operand
         let rest = rest.replace(" op_sel_hi:[0,0,0]", "");
