@@ -222,8 +222,9 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
                 }
                 let _ = ar;
             }
+            let map: String = used_v.iter().map(|u| if *u { '#' } else { '.' }).collect();
             format!(
-                "out of VGPRs allocating r{r} ({c:?}, live {}..{}); {} live vregs holding {} dwords \
+                "out of VGPRs allocating r{r} ({c:?}, live {}..{}); map {map}; {} live vregs holding {} dwords \
                  (V1 {} V2 {} V4 {} V8 {} V16 {})",
                 s,
                 e,
