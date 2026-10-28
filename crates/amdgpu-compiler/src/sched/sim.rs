@@ -244,7 +244,8 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
             w.iter_end.push(w.last_issue + 1);
         }
     }
-    // time at which the slowest wave finishes iteration k\n    let end_at = |k: usize| ws.iter().map(|w| w.iter_end[k]).max().unwrap_or(0);
+    // time at which the slowest wave finishes iteration k
+    let end_at = |k: usize| ws.iter().map(|w| w.iter_end[k]).max().unwrap_or(0);
     let k0 = (iters / 2).max(1).min(iters - 1);
     if iters < 4 {
         return end_at(iters - 1) as f64 / iters as f64;
