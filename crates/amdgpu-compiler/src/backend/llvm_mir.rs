@@ -201,6 +201,9 @@ pub fn export(m: &MFunction, a: &Alloc) -> Result<Exported, String> {
         .replace("@KERNARG@", &kernarg.to_string())
         .replace("@LDS@", &m.lds_bytes.to_string());
     // 4. Body.
+    if !mir.ends_with('\n') {
+        mir.push('\n');
+    }
     for bi in 0..nblocks {
         mir.push_str(&format!("  bb.{bi}:\n"));
         if !succs[bi].is_empty() {
