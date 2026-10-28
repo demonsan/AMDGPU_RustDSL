@@ -10,6 +10,7 @@ Cargo.lock
 *.s
 !tools/probe.s
 !tools/mfma_probe.s
+!tools/lds_probe.s
 *.mir
 !fixtures/**/*.md
 
