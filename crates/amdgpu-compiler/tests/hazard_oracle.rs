@@ -52,6 +52,8 @@ fn hazard_matrix() {
             // slots to link: every register source whose class equals the producer's dst class;
             // if the producer has no dst (vcc/scc setters) one implicit-dependency case.
             let slots: Vec<Option<usize>> = match prow.dst {
+                // v_mov from a tuple dword: any tuple class feeds it (covers MFMA results).
+                Some(dc) if cop == MOp::VReadSub && dc.dwords() >= 2 && dc.is_vector() => vec![Some(0)],
                 Some(dc) => crow
                     .srcs
                     .iter()
