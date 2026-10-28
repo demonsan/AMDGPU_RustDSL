@@ -168,11 +168,16 @@ impl Lowerer {
         match o {
             Opnd::Val(v) => {
                 if let Some(r) = self.converted.get(&v) {
-                    return Ok(*r);
+                    let r = *r;
+                    self.touch(&[Src::Reg(r)]);
+                    return Ok(r);
                 }
                 let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
                 match self.mir.vreg_class(r) {
-                    RClass::V1 => Ok(r),
+                    RClass::V1 => {
+                        self.touch(&[Src::Reg(r)]);
+                        Ok(r)
+                    }
                     RClass::S1 => {
                         let d = self.new_vreg(RClass::V1);
                         self.touch(&[Src::Reg(r)]);
@@ -197,11 +202,16 @@ impl Lowerer {
         match o {
             Opnd::Val(v) => {
                 if let Some(r) = self.converted.get(&v) {
-                    return Ok(*r);
+                    let r = *r;
+                    self.touch(&[Src::Reg(r)]);
+                    return Ok(r);
                 }
                 let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
                 match self.mir.vreg_class(r) {
-                    RClass::V2 => Ok(r),
+                    RClass::V2 => {
+                        self.touch(&[Src::Reg(r)]);
+                        Ok(r)
+                    }
                     RClass::S2 => {
                         let d = self.new_vreg(RClass::V2);
                         self.touch(&[Src::Reg(r)]);
