@@ -9,7 +9,7 @@ cd "$REPO"
 mkdir -p build
 
 echo "== emit =="
-bash tools/container/cargo.sh run -q --bin amdc -- emit "$KERNEL" --out "/work/build/${KERNEL}.s"
+AMD_ROCM_MOUNT="$ROC" bash tools/container/cargo.sh run -q --bin amdc -- emit "$KERNEL" --backend "${BACKEND:-own}" --out "/work/build/${KERNEL}.s"
 
 echo "== assemble =="
 "$ROC/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 \
