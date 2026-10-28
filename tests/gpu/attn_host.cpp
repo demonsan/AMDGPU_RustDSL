@@ -146,7 +146,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fp8_minload") == 0 ||
                              std::strcmp(kern, "probe_fp8_softmax") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_tile") == 0 ||
-                             std::strcmp(kern, "probe_fp8_fmha_2tile") == 0;
+                             std::strcmp(kern, "probe_fp8_fmha_2tile") == 0 ||
+                             std::strcmp(kern, "probe_fp8_fmha_online") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -261,6 +262,29 @@ int main(int argc, char** argv) {
         }
         CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
         std::printf("[harness] 2tile inputs filled\n");
+    }    if (std::strcmp(kern, "probe_fp8_fmha_online") == 0) {
+        std::vector<unsigned char> in(20480, 0);
+        unsigned int seed = 4242u;
+        auto next_rand = [&seed]() {
+            seed = seed * 1664525u + 1013904223u;
+            return (seed >> 16) & 0xFFu;
+        };
+        static const unsigned char palette[9] = {0x00, 0x28, 0x30, 0x38, 0x3C, 0x40, 0x44, 0xB8, 0xC0};
+        for (int i = 0; i < 32; ++i)
+            for (int k = 0; k < 64; ++k) in[i * 64 + k] = palette[next_rand() % 9];
+        for (int t = 0; t < 4; ++t)
+            for (int i = 0; i < 32; ++i)
+                for (int k = 0; k < 64; ++k) {
+                    in[2048 + 2048 * t + i * 64 + k] = palette[next_rand() % 9];
+                    in[10240 + 2048 * t + i * 64 + k] = (k < 32) ? palette[next_rand() % 9] : 0x00;
+                }
+        for (int t = 0; t < 4; ++t)
+            for (int l = 0; l < 64; ++l) {
+                in[18432 + 256 * t + l * 4] = (unsigned char)(126 + next_rand() % 3);
+                in[19456 + 256 * t + l * 4] = (unsigned char)(126 + next_rand() % 3);
+            }
+        CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
+        std::printf("[harness] online inputs filled\n");
     }    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, (unsigned)BLOCK, 1, 1, 0, nullptr, launch_params,
                              nullptr));
     CK(hipDeviceSynchronize());
@@ -488,7 +512,65 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
-    if (std::strcmp(kern, "probe_fp8_fmha_2tile") == 0) {
+    if (std::strcmp(kern, "probe_fp8_fmha_online") == 0) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        static double S4[32][128];
+        for (int t = 0; t < 4; ++t)
+            for (int i = 0; i < 32; ++i)
+                for (int jj = 0; jj < 32; ++jj) {
+                    double acc = 0.0;
+                    for (int k = 0; k < 64; ++k) {
+                        const int g = ((k % 32) / 16) % 2;
+                        const double sa_v = std::ldexp(1.0, (int)raw[18432 + 256 * t + (i + 32 * g) * 4] - 127);
+                        const double sb_v = std::ldexp(1.0, (int)raw[19456 + 256 * t + (jj + 32 * g) * 4] - 127);
+                        acc += fp8_e4m3(raw[i * 64 + k]) * fp8_e4m3(raw[2048 + 2048 * t + jj * 64 + k]) * sa_v * sb_v;
+                    }
+                    S4[i][t * 32 + jj] = acc;
+                }
+        const float* outv = reinterpret_cast<const float*>(raw + 20480);
+        int bad = 0;
+        double worst = 0.0, worst_exact = 0.0;
+        for (int i = 0; i < 32; ++i) {
+            double m = -1e30, l = 0.0;
+            double oacc[32];
+            for (int d = 0; d < 32; ++d) oacc[d] = 0.0;
+            for (int t = 0; t < 4; ++t) {
+                double tmax = -1e30;
+                for (int k = 0; k < 32; ++k) tmax = std::max(tmax, S4[i][t * 32 + k]);
+                const double mn = std::max(m, tmax);
+                const double corr = std::exp(m - mn);
+                double rs = 0.0;
+                for (int k = 0; k < 32; ++k) rs += std::exp(S4[i][t * 32 + k] - mn);
+                l = l * corr + rs;
+                for (int d = 0; d < 32; ++d) {
+                    double pv = 0.0;
+                    for (int k = 0; k < 32; ++k)
+                        pv += fp8_e4m3(raw[24576 + 1024 * t + 32 * i + k]) / 16.0 *
+                              fp8_e4m3(raw[10240 + 2048 * t + d * 64 + k]);
+                    oacc[d] = oacc[d] * corr + pv;
+                }
+                m = mn;
+            }
+            double sum = 0.0;
+            for (int c = 0; c < 128; ++c) sum += std::exp(S4[i][c] - m);
+            for (int d = 0; d < 32; ++d) {
+                const double ref = oacc[d] / l;
+                double exact = 0.0;
+                for (int c = 0; c < 128; ++c)
+                    exact += std::exp(S4[i][c] - m) / sum * fp8_e4m3(raw[10240 + 2048 * (c / 32) + d * 64 + (c % 32)]);
+                const double gotv = outv[i * 32 + d];
+                worst = std::max(worst, std::fabs(gotv - ref));
+                worst_exact = std::max(worst_exact, std::fabs(gotv - exact));
+                if (std::fabs(gotv - ref) > 2e-3 + 2e-3 * std::fabs(ref)) {
+                    if (bad < 6) std::fprintf(stderr, "online O[%d][%d] want %.6f got %.6f (exact %.6f)\n", i, d, ref, gotv, exact);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("  fmha_online bad=%d worst_vs_emulated=%.3e worst_vs_exact=%.3e O[0][0]=%.6f\n", bad, worst, worst_exact, outv[0]);
+        std::printf(bad ? "PROBE_FMHA_ONLINE_FAIL\n" : "PROBE_FMHA_ONLINE_OK\n");
+        return bad != 0;
+    }    if (std::strcmp(kern, "probe_fp8_fmha_2tile") == 0) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         // scores over 64 keys: tile t uses KT at 2048+2048t, scales SA at 8192+256t, SB at 8704+256t
         static double S2[32][64];
