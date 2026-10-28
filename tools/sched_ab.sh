@@ -13,7 +13,7 @@ FIRST=""
 for V in $VARIANTS; do
   name="${V%%:*}"; envs="${V#*:}"
   if [ -n "$envs" ]; then EV=(${envs//,/ }); else EV=(); fi
-  env "${EV[@]}" AMD_ROCM_MOUNT="$ROC" bash tools/container/cargo.sh run -q --bin amdc -- emit "$K" --out "/work/build/ab/$name.s" 2>&1 | grep -E "wrote|^error|sched:" | cut -c1-200
+  env "${EV[@]}" AMD_ROCM_MOUNT="$ROC" bash tools/container/cargo.sh run -q --bin amdc -- emit "$K" ${EMIT_FLAGS:-} --out "/work/build/ab/$name.s" 2>&1 | grep -E "wrote|^error|sched:" | cut -c1-200
   "$ROC/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "build/ab/$name.co" "build/ab/$name.s" || exit 1
   [ -z "$FIRST" ] && FIRST="$name"
   i=0
