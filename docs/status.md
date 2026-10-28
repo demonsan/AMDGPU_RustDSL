@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **eight-wave online-softmax attention (block 512)** | `probe_fp8_fmha_multiwave`: 512 threads, each wave owns one 32-row query tile and a private 8448 B LDS region, all waves share K/V tiles and run the same workgroup-barrier sequence; all 8 waves match the host emulation (`worst_err 2.1e-4`) -> `PROBE_FMHA_MULTIWAVE_OK` |
 | **online-softmax attention, O accumulator in registers** | `probe_fp8_fmha_oreg`: same algorithm with O as a loop-carried `Frag16`; each iteration rebuilds the fragment from lane values times the LDS-published row correction (new `Frag16Build` op) and feeds it back as the MFMA C input; bit-identical results to the LDS-accumulator version (`worst_err 1.8e-4` vs emulation) -> `PROBE_FMHA_ONLINE_OK` |
 | **online-softmax MXFP8 attention (4 tiles, 128 keys)** | `probe_fp8_fmha_online`: flash-style loop with loop-carried running max/sum (float bits in I32 loop vars), per-row correction `exp(m_old-m_new)` broadcast through LDS, O accumulator rescaled in LDS, final 1/l epilogue; `worst_err = 1.8e-4` vs a host emulation of the same online algorithm over the kernel's quantised P bytes, `5.3e-2` vs exact softmax -> `PROBE_FMHA_ONLINE_OK` |
 | **two-tile MXFP8 attention with a tile loop** | `probe_fp8_fmha_2tile`: loop over two key tiles (loop-carried tile index, scores accumulated in LDS), 64-wide row softmax, lane-group split fp8 quantisation, one PV over 64 keys; `worst_err = 1.8e-4` vs the quantised-P reference, `8.3e-2` vs exact softmax (inherent fp8 P quantisation) -> `PROBE_FMHA_2TILE_OK` |
@@ -339,9 +340,13 @@ softmax attention is the inherent fp8 rounding of P.
 DSL op assembles a fragment from sixteen scalars, so the rescale-then-accumulate
 step becomes `O = MFMA(P, V, C = O * corr)` with O living in registers (176 VGPRs).
 
-Remaining distance to the reference kernel: multi-wave role split with paired
-barriers, ds_read_tr / larger tiles (256-row blocks) and the A/B pingpong loop
-structure.
+`probe_fp8_fmha_multiwave` (round 21) runs the same loop in a 512-thread block, 8 waves
+with 8 query tiles (256 query rows, like the reference grid), per-wave LDS regions
+(67,584 B) and shared K/V; 176 VGPRs.
+
+Remaining distance to the reference kernel: the A/B role split (`s62 < 4`) with the
+two paired-barrier loops and rollback exits, K/V staging through LDS with
+`ds_read_b64_tr_b8`, and the reference tile shapes.
 
 ## Next: FMHA reference core loop
 
