@@ -26,6 +26,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | A/B paired loops | `probe_ab_loops`: 8 waves, role A/B, outer loop with two sequential inner phase loops, paired barriers, LDS read-modify-write accumulator → `PROBE_AB_LOOPS_OK` (closed form over 512 lanes) |
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
+| FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
 | LDS self-read | `probe_lds_self2`: own-slot read after a barrier → `SELF2_OK` |
 | Two-wave LDS | `probe_waves2`: own + partner-wave slot → `PROBE_WAVES2_OK` |
 | `v_max3_f32`, fp8 fragments | `v_max3_f32` in the ISA of the compiler, `Frag8`/`V8` register class for the `32x32x64` operands |
@@ -171,23 +172,32 @@ overlap D. All MFMA probes still pass with this form: `PROBE_MFMA_SCALE_OK`,
 `PROBE_MFMA_FP8_OK`, `PROBE_MFMA_WIDE_OK`, `PROBE_LOOP_MFMA_OK` (128.0),
 `PROBE_FMHA_DATAPATH_OK`.
 
-## Open issue: probe_fmha_core reads zero
+## Resolved: MFMA result reads need independent instructions
 
-`probe_fmha_core` (A phase / B phase staging, three paired barriers per
-iteration, in-place MFMA accumulation) currently stores `0.0` in every element,
-while `probe_fmha_datapath` (same staging, no loop) and `probe_loop_mfma` (loop +
-accumulation, one staging phase) both pass. The emitted sequence is
+CDNA4 ISA section 7.6 ("Dependency Resolution: Required Independent
+Instructions") states that an MFMA result written to a VGPR must not be read by a
+VALU/VM/LDS instruction until 5/8/12/20 independent instructions have been
+issued, depending on the opcode (there is no forwarding path). Chained in-place
+MFMA accumulation of the same opcode needs 0. `hazards.rs` now models this: every
+MFMA result gets a ready cycle and consumers are padded with `s_nop`.
 
-```
-BB1: ds_write_b128 v3, v[4:7] ; bar ; ds_write_b128 v8, v[4:7] ; bar
-     ds_read_b128 v[12:15], v3 ; ds_read_b128 v[32:35], v8
-     ... Frag8 build ...
-     v_mfma_scale_f32_32x32x64_f8f6f4 v[64:79], v[40:47], v[48:55], v[64:79], v12, v12
-```
+That was the cause of the zeros from `probe_fmha_core` (the accumulator copy
+right after the MFMA read a partially written VGPR). The same padding also makes
+the other MFMA probes deterministic instead of timing-dependent.
 
-so the operands are built from the LDS reads, but the result is zero. Next step is
-to store the built Frag8 lane values to global memory inside the loop to see
-whether the operands or the MFMA are zero.
+Verified after the fix:
+
+| probe | result |
+| --- | --- |
+| `probe_fmha_core` | A/B phase staging, three paired barriers per iteration, in-place MFMA accumulation over two K=64 iterations -> every value `128.0` -> `PROBE_FMHA_CORE_OK` |
+| `probe_loop_mfma` | `PROBE_LOOP_MFMA_OK` (`128.0`) |
+| `probe_mfma_scale` / `probe_mfma_fp8` / `probe_mfma_wide` | all still OK |
+| `attention_fwd` | `bad=0/16384`, `max_abs_err=5.996e-05` |
+
+Follow-ups: the wait counts are the conservative end of the ISA table (12 for the
+16x16/32x32 F16/FP8 shapes, 20 for F8F6F4) and the pass is per basic block, so
+cross-block producers are not covered yet. Both should be tightened/validated
+once the FMHA core loop is wired to real data.
 
 ## Next: FMHA reference core loop
 
