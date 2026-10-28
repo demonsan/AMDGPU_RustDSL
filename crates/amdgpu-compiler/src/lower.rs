@@ -755,6 +755,13 @@ impl Lowerer {
                 );
                 self.val.insert(dst, d);
             }
+            Op::LoadLdsTrB8 { addr } => {
+                let a = self.as_v1(*addr)?;
+                let d = self.new_vreg(RClass::V2);
+                self.push(MInst::new(MOp::LdsReadB64TrB8).def(d).srcreg(a));
+                self.pending_lds.push(d);
+                self.val.insert(dst, d);
+            }
             Op::LoadLdsB128 { addr } => {
                 let a = self.as_v1(*addr)?;
                 let d = self.new_vreg(RClass::V4);
@@ -953,7 +960,15 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::Frag16Lane { frag, index } => {
-                let f = self.as_v16(*frag)?;
+                // Any multi-dword fragment: read the requested dword.
+                let f = match frag {
+                    Opnd::Val(v) => {
+                        let r = *self.val.get(v).ok_or_else(|| format!("value v{v} not lowered"))?;
+                        self.touch(&[Src::Reg(r)]);
+                        r
+                    }
+                    other => self.as_v16(*other)?,
+                };
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VReadSub).def(d).srcreg(f).imm(*index as i64));
                 self.val.insert(dst, d);

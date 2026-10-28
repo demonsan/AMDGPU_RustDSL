@@ -3597,3 +3597,56 @@ pub fn probe_fp8_fmha_abloops() -> Function {
     b.end_if();
     b.finish()
 }
+/// Measurement probe for `ds_read_b64_tr_b8`. LDS byte `a` holds `a & 0xFF`; lane `l` of the
+/// first instruction supplies byte address `8 * l`, the second one `8 * l + 512`. The two
+/// result dwords of both instructions are stored to `o[tid*4 .. tid*4+3]` so the host can
+/// decode the transpose pattern.
+pub fn probe_lds_tr_b8() -> Function {
+    let mut b = FnBuilder::new("probe_lds_tr_b8", 64);
+    b.lds(2048);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c2 = b.c_i32(2);
+    let c3 = b.c_i32(3);
+    let c4 = b.c_i32(4);
+    let c16 = b.c_i32(16);
+    let c256 = b.c_i32(256);
+    let c512 = b.c_i32(512);
+    let rep = b.c_i32(0x0101_0101);
+    let base_pat = b.c_i32(0x0302_0100);
+
+    // word value for byte address 4*tid: bytes (4tid .. 4tid+3)
+    let off4 = b.shl_i32(tid, c2);
+    let scaled = b.mul_i32(off4, rep);
+    let value = b.add_i32(scaled, base_pat);
+    for k in 0..4i32 {
+        let ck = b.c_i32(256 * k);
+        let addr = b.add_i32(off4, ck);
+        b.store_lds_b32(Opnd::Val(addr), Opnd::Val(value));
+    }
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    let addr1 = b.shl_i32(tid, c3);
+    let addr2 = b.add_i32(addr1, c512);
+    let r1 = b.load_lds_tr_b8(Opnd::Val(addr1));
+    let r2 = b.load_lds_tr_b8(Opnd::Val(addr2));
+    b.wait_lds(0);
+
+    let out_off = b.shl_i32(tid, c4);
+    let out_ptr = b.ptr_add(o, out_off);
+    for i in 0..2u8 {
+        let lane = b.frag16_lane(r1, i);
+        let v = b.bitcast_f32(lane);
+        b.store_f32(out_ptr, 4 * i as u32, v);
+    }
+    for i in 0..2u8 {
+        let lane = b.frag16_lane(r2, i);
+        let v = b.bitcast_f32(lane);
+        b.store_f32(out_ptr, 8 + 4 * i as u32, v);
+    }
+    let _ = (c16, c256);
+    b.finish()
+}

@@ -466,6 +466,11 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             tuple(a, inst.dst.expect("dst"), 4),
             src1(a, inst.srcs[0])
         )],
+        MOp::LdsReadB64TrB8 => vec![format!(
+            "ds_read_b64_tr_b8 {}, {}",
+            tuple(a, inst.dst.expect("dst"), 2),
+            src1(a, inst.srcs[0])
+        )],
         MOp::VReadFirstLane => {
             vec![format!("v_readfirstlane_b32 {}, {}", sr(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]))]
         }

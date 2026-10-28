@@ -167,6 +167,8 @@ pub enum Op {
     LoadLdsB32 { addr: Opnd },
     /// Read four dwords (16 B) from workgroup LDS.
     LoadLdsB128 { addr: Opnd },
+    /// 8-bit transposing LDS read (ds_read_b64_tr_b8), two dwords per lane.
+    LoadLdsTrB8 { addr: Opnd },
     /// Broadcast lane 0 of a vector value into a scalar register.
     ReadFirstLane(Opnd),
 
@@ -245,6 +247,7 @@ impl Op {
             Op::BitcastI32(..) => DType::I32,
             Op::LoadLdsB32 { .. } => DType::U32,
             Op::LoadLdsB128 { .. } => DType::Frag4,
+            Op::LoadLdsTrB8 { .. } => DType::Frag2,
             Op::ReadFirstLane(..) => DType::U32,
         }
     }
@@ -295,6 +298,7 @@ impl Op {
             Op::BitcastF32(a) | Op::BitcastI32(a) => vec![*a],
             Op::LoadLdsB32 { addr } => vec![*addr],
             Op::LoadLdsB128 { addr } => vec![*addr],
+            Op::LoadLdsTrB8 { addr } => vec![*addr],
             Op::ReadFirstLane(a) => vec![*a],
         }
     }
@@ -765,6 +769,11 @@ impl FnBuilder {
     }
 
     /// Four dwords (16 B) write into workgroup LDS.
+    /// Transposing 8-bit LDS read into two dwords per lane.
+    pub fn load_lds_tr_b8(&mut self, addr: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::LoadLdsTrB8 { addr: addr.into() })
+    }
+
     pub fn store_lds_b128(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::StoreLdsB128 { addr: addr.into(), value: value.into() });
     }
@@ -1013,9 +1022,9 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                     Op::Frag16Lane { frag, index } => {
                         match opnd_ty(f, *frag) {
-                            Ok(DType::Frag16) => {}
+                            Ok(DType::Frag16) | Ok(DType::Frag8) | Ok(DType::Frag4) | Ok(DType::Frag2) => {}
                             Ok(t) => errs.push(here(format!(
-                                "frag16lane: expected frag16, found {}",
+                                "frag16lane: expected a fragment, found {}",
                                 t.name()
                             ))),
                             Err(e) => errs.push(here(e)),
@@ -1128,6 +1137,11 @@ pub fn verify(f: &Function) -> Vec<String> {
                                     )));
                                 }
                             }
+                        }
+                    }
+                    Op::LoadLdsTrB8 { addr } => {
+                        if let Err(e) = expect_int(f, *addr, "lds tr_b8 load address") {
+                            errs.push(here(e));
                         }
                     }
                     Op::LoadLdsB128 { addr } => {

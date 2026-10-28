@@ -90,6 +90,7 @@ pub enum MOp {
     LdsReadB32,
     LdsWriteB128,
     LdsReadB128,
+    LdsReadB64TrB8,
     SBarrier,
     // global memory
     GlobalLoadU16,

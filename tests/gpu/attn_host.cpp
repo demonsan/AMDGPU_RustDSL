@@ -151,7 +151,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fp8_fmha_oreg") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_multiwave") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_pingpong") == 0 ||
-                             std::strcmp(kern, "probe_fp8_fmha_abloops") == 0;
+                             std::strcmp(kern, "probe_fp8_fmha_abloops") == 0 ||
+                             std::strcmp(kern, "probe_lds_tr_b8") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -540,7 +541,18 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
-    if (std::strcmp(kern, "probe_fp8_fmha_multiwave") == 0 || std::strcmp(kern, "probe_fp8_fmha_pingpong") == 0 || std::strcmp(kern, "probe_fp8_fmha_abloops") == 0) {
+    if (std::strcmp(kern, "probe_lds_tr_b8") == 0) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        std::printf("  tr_b8 instr1 (lane: 8 bytes) / instr2:\n");
+        for (int l = 0; l < 64; ++l) {
+            std::printf("   lane %2d: ", l);
+            for (int i = 0; i < 8; ++i) std::printf("%3d ", raw[l * 16 + i]);
+            std::printf(" | ");
+            for (int i = 0; i < 8; ++i) std::printf("%3d ", raw[l * 16 + 8 + i]);
+            std::printf("\n");
+        }
+        return 0;
+    }    if (std::strcmp(kern, "probe_fp8_fmha_multiwave") == 0 || std::strcmp(kern, "probe_fp8_fmha_pingpong") == 0 || std::strcmp(kern, "probe_fp8_fmha_abloops") == 0) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         int bad = 0;
         double worst = 0.0;
