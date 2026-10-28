@@ -1389,7 +1389,8 @@ pub fn probe_fp8_softmax() -> Function {
         let i_const = ((r / 4) * 8 + (r % 4)) as i32;
         let lane = b.frag16_lane(d, r);
         let v = b.bitcast_f32(lane);
-        let addr = b.add_i32(lds_base, b.c_i32(i_const * 128));
+        let coff = b.c_i32(i_const * 128);
+        let addr = b.add_i32(lds_base, coff);
         b.store_lds_b32(Opnd::Val(addr), Opnd::Val(v));
     }
     b.wait_lds(0);
@@ -1400,7 +1401,8 @@ pub fn probe_fp8_softmax() -> Function {
     let rbase = b.mul_i32(j, c128);
     let mut vals: Vec<ValueId> = Vec::with_capacity(32);
     for k in 0..32u32 {
-        let addr = b.add_i32(rbase, b.c_i32(4 * k as i32));
+        let coff = b.c_i32(4 * k as i32);
+        let addr = b.add_i32(rbase, coff);
         let raw = b.load_lds_b32(Opnd::Val(addr));
         vals.push(b.bitcast_f32(raw));
     }
