@@ -1122,3 +1122,60 @@ pub fn probe_fp8_matmul() -> Function {
     }
     b.finish()
 }
+/// Load-path bisect for the fp8 matmul probe: reads the same A / B^T / scale
+/// words but stores them raw, so the host can check the address arithmetic and
+/// the fragment mapping independently of the MFMA.
+///
+/// `o[1152 + tid*8 + d]`  = A word `d` of lane `tid`
+/// `o[1664 + tid*8 + d]`  = B^T word `d` of lane `tid`
+/// `o[2176 + tid]`        = the A scale word of lane `tid`
+pub fn probe_fp8_load() -> Function {
+    let mut b = FnBuilder::new("probe_fp8_load", 64);
+    b.lds(256);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let c4 = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c31 = b.c_i32(31);
+    let c64 = b.c_i32(64);
+    let c2048 = b.c_i32(2048);
+    let c4096 = b.c_i32(4096);
+    let c4608 = b.c_i32(4608);
+    let c6656 = b.c_i32(6656);
+    let c8704 = b.c_i32(8704);
+
+    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let p = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
+    let row = b.mul_i32(j, c64);
+    let koff = b.shl_i32(p, c5);
+    let frag_off = b.add_i32(row, koff);
+    let a_base = b.ptr_add(o, frag_off);
+    let bt_off = b.add_i32(frag_off, c2048);
+    let bt_base = b.ptr_add(o, bt_off);
+
+    let tid32 = b.shl_i32(tid, c5);
+    let a_out = b.add_i32(tid32, c4608);
+    let a_ptr = b.ptr_add(o, a_out);
+    for d in 0..8u32 {
+        let v = b.load_f32(a_base, 4 * d);
+        b.store_f32(a_ptr, 4 * d, v);
+    }
+    let b_out = b.add_i32(tid32, c6656);
+    let b_ptr = b.ptr_add(o, b_out);
+    for d in 0..8u32 {
+        let v = b.load_f32(bt_base, 4 * d);
+        b.store_f32(b_ptr, 4 * d, v);
+    }
+
+    let tid4 = b.mul_i32(tid, c4);
+    let sa_off = b.add_i32(tid4, c4096);
+    let sa_ptr = b.ptr_add(o, sa_off);
+    let sa = b.load_f32(sa_ptr, 0);
+    let sa_out = b.add_i32(tid4, c8704);
+    let sa_o = b.ptr_add(o, sa_out);
+    b.store_f32(sa_o, 0, sa);
+
+    b.finish()
+}

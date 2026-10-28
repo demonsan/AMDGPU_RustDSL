@@ -127,7 +127,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_loop_mfma") == 0 ||
                              std::strcmp(kern, "probe_fmha_core") == 0 ||
                              std::strcmp(kern, "probe_pack") == 0 ||
-                             std::strcmp(kern, "probe_fp8_matmul") == 0;
+                             std::strcmp(kern, "probe_fp8_matmul") == 0 ||
+                             std::strcmp(kern, "probe_fp8_load") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -325,6 +326,31 @@ int main(int argc, char** argv) {
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
     }
+    if (std::strcmp(kern, "probe_fp8_load") == 0) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        const unsigned int* w = reinterpret_cast<const unsigned int*>(raw);
+        int bad = 0;
+        for (int l = 0; l < 64; ++l) {
+            for (int d = 0; d < 8; ++d) {
+                const int row = l % 32;
+                unsigned int want = 0;
+                for (int byte = 0; byte < 4; ++byte) {
+                    const int k = 32 * (l / 32) + 4 * d + byte;
+                    const unsigned char v = (k == row) ? 0x38 : 0x00;
+                    want |= (unsigned int)v << (8 * byte);
+                }
+                const unsigned int gotw = w[1152 + l * 8 + d];
+                if (gotw != want) {
+                    if (bad < 8) std::fprintf(stderr, "fp8_load A lane=%d d=%d want=0x%08x got=0x%08x\n", l, d, want, gotw);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("  fp8_load bad=%d lane0_a0=0x%08x lane1_a0=0x%08x sa=0x%08x\n", bad, w[1152], w[1160], w[2176]);
+        std::printf(bad ? "PROBE_FP8_LOAD_FAIL\n" : "PROBE_FP8_LOAD_OK\n");
+        return bad != 0;
+    }
+
     if (std::strcmp(kern, "probe_fp8_matmul") == 0) {
         const int fp8_test = envi("FP8_TEST", 1);
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
