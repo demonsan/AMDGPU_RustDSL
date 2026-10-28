@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **online-softmax attention, O accumulator in registers** | `probe_fp8_fmha_oreg`: same algorithm with O as a loop-carried `Frag16`; each iteration rebuilds the fragment from lane values times the LDS-published row correction (new `Frag16Build` op) and feeds it back as the MFMA C input; bit-identical results to the LDS-accumulator version (`worst_err 1.8e-4` vs emulation) -> `PROBE_FMHA_ONLINE_OK` |
 | **online-softmax MXFP8 attention (4 tiles, 128 keys)** | `probe_fp8_fmha_online`: flash-style loop with loop-carried running max/sum (float bits in I32 loop vars), per-row correction `exp(m_old-m_new)` broadcast through LDS, O accumulator rescaled in LDS, final 1/l epilogue; `worst_err = 1.8e-4` vs a host emulation of the same online algorithm over the kernel's quantised P bytes, `5.3e-2` vs exact softmax -> `PROBE_FMHA_ONLINE_OK` |
 | **two-tile MXFP8 attention with a tile loop** | `probe_fp8_fmha_2tile`: loop over two key tiles (loop-carried tile index, scores accumulated in LDS), 64-wide row softmax, lane-group split fp8 quantisation, one PV over 64 keys; `worst_err = 1.8e-4` vs the quantised-P reference, `8.3e-2` vs exact softmax (inherent fp8 P quantisation) -> `PROBE_FMHA_2TILE_OK` |
 | **single-tile MXFP8 attention** | `probe_fp8_fmha_tile`: QK^T -> row softmax -> in-kernel fp8 quantisation (scaled `v_cvt_pk_fp8_f32`) -> PV through the same scaled MFMA, `worst_err = 0.0` vs a CPU reference built from the quantised P bytes -> `PROBE_FMHA_TILE_OK` |
@@ -334,9 +335,13 @@ Matches a double-precision host emulation of the same online algorithm (built fr
 the kernel's own quantised P bytes) to 1.8e-4; the 5.3e-2 distance from exact
 softmax attention is the inherent fp8 rounding of P.
 
+`probe_fp8_fmha_oreg` (round 20) removes the LDS O accumulator: a new `Frag16Build`
+DSL op assembles a fragment from sixteen scalars, so the rescale-then-accumulate
+step becomes `O = MFMA(P, V, C = O * corr)` with O living in registers (176 VGPRs).
+
 Remaining distance to the reference kernel: multi-wave role split with paired
-barriers, ds_read_tr / larger tiles (256-row blocks), register-resident O
-accumulator instead of LDS, and the A/B pingpong loop structure.
+barriers, ds_read_tr / larger tiles (256-row blocks) and the A/B pingpong loop
+structure.
 
 ## Next: FMHA reference core loop
 
