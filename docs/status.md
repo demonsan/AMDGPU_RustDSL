@@ -110,10 +110,26 @@ Evidence collected so far:
   attempt omitted the `s_waitcnt` after `s_load_dwordx2` and faulted; those
   files need a pass before they can be used.
 
-Next experiment to close this out: disassemble the failing `.co`
-(`llvm-objdump -d --mcpu=gfx950`) and compare the encoded `ds_write_b32` /
-`ds_read_b32` pairs with the passing kernel; if the encodings match, add an
-`s_nop` pad between write and read (write-then-read hazard) and re-test.
+Additional facts gathered:
+
+* `llvm-objdump -d --mcpu=gfx950` on both code objects shows the encoded
+  instructions match the emitted assembly (`ds_write_b32 v5, v1`,
+  `ds_read_b32 v5, v3`, `s_waitcnt lgkmcnt(0)`, `s_barrier`), so the assembler
+  is not reordering or mis-encoding the LDS pair.
+* Rotating the write by one slot (lane writes `(tid-1)&63`, reads its own slot,
+  so the value must come from the next lane) still reads `0.0`. That rules out
+  "write then read the same address" as the trigger.
+* Reading two slots in one kernel returns `0.0` for both, while the
+  single-neighbour-read kernel returns correct data.
+
+The contradiction (a slot written by another lane reads back correctly in
+`probe_lds`, yet the same slot reads `0` when a lane reads its own index) means
+the remaining hypothesis space is small: either the read address of the failing
+kernels is not what the assembly shows at run time, or the LDS content is being
+invalidated between the write and the read. Next step: dump LDS through a
+different path (write a sentinel from lane 0 only and read it from all lanes, then
+vary the sentinel address) and, if that also fails, compare against the aiter
+reference kernel's LDS write/read sequence disassembly.
 
 ## Next: FMHA reference core loop## Next: FMHA reference core loop
 
