@@ -423,7 +423,18 @@ impl Lowerer {
                 self.push(MInst::new(MOp::VFmaF32).def(d).srcreg(ra).srcreg(rb).srcreg(rc));
                 self.val.insert(dst, d);
             }
-            Op::ExpF32(a) => self.un_v1(dst, MOp::VExpF32, *a)?,
+            Op::ExpF32(a) => {
+                // The hardware instruction is exp2, so natural exp is
+                // exp2(x * log2(e)).
+                let ra = self.as_v1(*a)?;
+                self.touch(&[Src::Reg(ra)]);
+                let log2e = self.const_vreg(0x3FB8AA3B_u32 as i32 as i64);
+                let scaled = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VMulF32).def(scaled).srcreg(ra).srcreg(log2e));
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VExpF32).def(d).srcreg(scaled));
+                self.val.insert(dst, d);
+            }
             Op::RcpF32(a) => self.un_v1(dst, MOp::VRcpF32, *a)?,
             Op::CvtF16ToF32(a) => self.un_v1(dst, MOp::VCvtF32F16, *a)?,
             Op::CvtF32ToF16(a) => self.un_v1(dst, MOp::VCvtF16F32, *a)?,
