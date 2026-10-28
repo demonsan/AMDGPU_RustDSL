@@ -35,6 +35,9 @@ struct Lowerer {
     converted: HashMap<ValueId, VReg>,
     vars: Vec<VReg>,
     consts: HashMap<i64, VReg>,
+    /// Constant / conversion caches saved at control-flow entry; anything materialised
+    /// inside a branch or loop body must not be assumed by code after it or on the sibling path.
+    scope_snaps: Vec<(HashMap<i64, VReg>, HashMap<ValueId, VReg>)>,
     pending_vmem: Vec<VReg>,
     pending_smem: Vec<VReg>,
     pending_lds: Vec<VReg>,
@@ -81,6 +84,7 @@ impl Lowerer {
             converted: HashMap::new(),
             vars: Vec::new(),
             consts: HashMap::new(),
+            scope_snaps: Vec::new(),
             pending_vmem: Vec::new(),
             pending_smem: Vec::new(),
             pending_lds: Vec::new(),
@@ -437,6 +441,7 @@ impl Lowerer {
                         self.copy_reg(r, src)?;
                     }
                     self.flush_pending();
+                    self.scope_snaps.push((self.consts.clone(), self.converted.clone()));
                     let header = self.fresh_label();
                     let exit = self.fresh_label();
                     self.set_term(Term::Goto(header));
@@ -455,6 +460,10 @@ impl Lowerer {
                 Stmt::EndLoop => {
                     let (exit, header) = self.break_stack.pop().ok_or("endloop without loop")?;
                     self.flush_pending();
+                    if let Some((c, v)) = self.scope_snaps.pop() {
+                        self.consts = c;
+                        self.converted = v;
+                    }
                     let latch = self.mir.blocks[self.cur].label;
                     self.mir.loops.push((header, latch));
                     self.set_term(Term::Goto(header));
@@ -462,6 +471,7 @@ impl Lowerer {
                 }
                 Stmt::BeginIf { cond } => {
                     self.flush_pending();
+                    self.scope_snaps.push((self.consts.clone(), self.converted.clone()));
                     let (on, srcs) = self.lower_condition(*cond, false)?;
                     self.touch(&srcs);
                     let then_l = self.fresh_label();
@@ -473,6 +483,10 @@ impl Lowerer {
                 }
                 Stmt::Else => {
                     self.flush_pending();
+                    if let Some((c, v)) = self.scope_snaps.last() {
+                        self.consts = c.clone();
+                        self.converted = v.clone();
+                    }
                     let (else_l, end_l) = *self.if_stack.last().ok_or("else without if")?;
                     self.set_term(Term::Goto(end_l));
                     self.start_block(else_l);
@@ -496,6 +510,10 @@ impl Lowerer {
                 }
                 Stmt::EndIf => {
                     self.flush_pending();
+                    if let Some((c, v)) = self.scope_snaps.pop() {
+                        self.consts = c;
+                        self.converted = v;
+                    }
                     let (_, end_l) = self.if_stack.pop().ok_or("endif without if")?;
                     self.set_term(Term::Goto(end_l));
                     self.start_block(end_l);
