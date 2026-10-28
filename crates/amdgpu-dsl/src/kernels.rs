@@ -4852,12 +4852,12 @@ pub fn probe_fp8_fmha_hd128() -> Function {
     let vg1 = b.add_i32(vg0, c36864);
     let vg = b.ptr_add(o, vg1);
     let vl = b.add_i32(tid256, lds_v);
+    let mut la = vl;
     for w in 0..64u32 {
         let v = b.load_f32(vg, 4 * w);
         let vi = b.bitcast_i32(v);
-        let wc = b.c_i32(4 * w as i32);
-        let la = b.add_i32(vl, wc);
         b.store_lds_b32(Opnd::Val(la), Opnd::Val(vi));
+        la = b.add_i32(la, c4);
     }
     b.wait_lds(0);
     b.barrier();
@@ -4867,10 +4867,11 @@ pub fn probe_fp8_fmha_hd128() -> Function {
     let rbase = b.mul_i32(j, c128);
     let mut tmax: Option<ValueId> = None;
     for s in 0..4u32 {
-        for k in 0..32u32 {
-            let coff = b.c_i32((s * 4096 + 4 * k) as i32);
-            let addr = b.add_i32(rbase, coff);
+        let sc = b.c_i32((s * 4096) as i32);
+        let mut addr = b.add_i32(rbase, sc);
+        for _k in 0..32u32 {
             let raw = b.load_lds_b32(Opnd::Val(addr));
+            addr = b.add_i32(addr, c4);
             let v = b.bitcast_f32(raw);
             tmax = Some(match tmax {
                 None => v,
@@ -4891,10 +4892,11 @@ pub fn probe_fp8_fmha_hd128() -> Function {
     let mut rsum: Option<ValueId> = None;
     for s in 0..4u32 {
         let mut exps: Vec<ValueId> = Vec::with_capacity(32);
-        for k in 0..32u32 {
-            let coff = b.c_i32((s * 4096 + 4 * k) as i32);
-            let addr = b.add_i32(rbase, coff);
-            let raw = b.load_lds_b32(Opnd::Val(addr));
+        let sc2 = b.c_i32((s * 4096) as i32);
+        let mut addr2 = b.add_i32(rbase, sc2);
+        for _k in 0..32u32 {
+            let raw = b.load_lds_b32(Opnd::Val(addr2));
+            addr2 = b.add_i32(addr2, c4);
             let v = b.bitcast_f32(raw);
             let sh = b.sub_f32(v, m_new);
             exps.push(b.exp_f32(sh));
