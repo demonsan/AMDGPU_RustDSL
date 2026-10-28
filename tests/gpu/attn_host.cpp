@@ -155,7 +155,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_lds_tr_b8") == 0 ||
                              std::strcmp(kern, "probe_fp8_matmul_tr") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_tr") == 0 ||
-                             std::strcmp(kern, "probe_fp8_fmha_trab") == 0;
+                             std::strcmp(kern, "probe_fp8_fmha_trab") == 0 ||
+                             std::strcmp(kern, "probe_fp8_fmha_hd128") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -382,6 +383,28 @@ int main(int argc, char** argv) {
             }
         CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
         std::printf("[harness] fmha_trab inputs filled\n");
+    }    if (std::strcmp(kern, "probe_fp8_fmha_hd128") == 0) {
+        std::vector<unsigned char> in(74240, 0);
+        unsigned int seed = 1234567u;
+        auto next_rand = [&seed]() {
+            seed = seed * 1664525u + 1013904223u;
+            return (seed >> 16) & 0xFFu;
+        };
+        static const unsigned char palette[9] = {0x00, 0x28, 0x30, 0x38, 0x3C, 0x40, 0x44, 0xB8, 0xC0};
+        for (int i = 0; i < 32; ++i)
+            for (int k = 0; k < 128; ++k) in[i * 128 + k] = palette[next_rand() % 9];
+        for (int t = 0; t < 8; ++t)
+            for (int i = 0; i < 32; ++i)
+                for (int k = 0; k < 128; ++k) in[4096 + 4096 * t + i * 128 + k] = palette[next_rand() % 9];
+        for (int it = 0; it < 2; ++it)
+            for (int c = 0; c < 128; ++c)
+                for (int d = 0; d < 128; ++d) in[36864 + 16384 * it + c * 128 + d] = palette[next_rand() % 9];
+        for (int c = 0; c < 2; ++c)
+            for (int l = 0; l < 64; ++l) in[69632 + 256 * c + l * 4] = (unsigned char)(126 + next_rand() % 3);
+        for (int q = 0; q < 16; ++q)
+            for (int l = 0; l < 64; ++l) in[70144 + 256 * q + l * 4] = (unsigned char)(126 + next_rand() % 3);
+        CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
+        std::printf("[harness] hd128 inputs filled\n");
     }    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, (unsigned)BLOCK, 1, 1, 0, nullptr, launch_params,
                              nullptr));
     CK(hipDeviceSynchronize());
@@ -609,7 +632,60 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
-    if (std::strcmp(kern, "probe_fp8_fmha_trab") == 0) {
+    if (std::strcmp(kern, "probe_fp8_fmha_hd128") == 0) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        static double S5[32][256];
+        for (int t = 0; t < 8; ++t)
+            for (int i = 0; i < 32; ++i)
+                for (int jj = 0; jj < 32; ++jj) {
+                    double acc = 0.0;
+                    for (int c = 0; c < 2; ++c)
+                        for (int k = 0; k < 64; ++k) {
+                            const int g = ((k % 32) / 16) % 2;
+                            const double sa_v = std::ldexp(1.0, (int)raw[69632 + 256 * c + (i + 32 * g) * 4] - 127);
+                            const double sb_v = std::ldexp(1.0, (int)raw[70144 + 256 * (2 * t + c) + (jj + 32 * g) * 4] - 127);
+                            acc += fp8_e4m3(raw[i * 128 + 64 * c + k]) *
+                                   fp8_e4m3(raw[4096 + 4096 * t + jj * 128 + 64 * c + k]) * sa_v * sb_v;
+                        }
+                    S5[i][t * 32 + jj] = acc;
+                }
+        const float* outv = reinterpret_cast<const float*>(raw + 74240);
+        int bad = 0;
+        double worst = 0.0;
+        for (int i = 0; i < 32; ++i) {
+            double m = -1e30, l = 0.0, oacc[128];
+            for (int d = 0; d < 128; ++d) oacc[d] = 0.0;
+            for (int it = 0; it < 2; ++it) {
+                double tmax = -1e30;
+                for (int c = 0; c < 128; ++c) tmax = std::max(tmax, S5[i][128 * it + c]);
+                const double mn = std::max(m, tmax);
+                const double corr = std::exp(m - mn);
+                double rs = 0.0;
+                for (int c = 0; c < 128; ++c) rs += std::exp(S5[i][128 * it + c] - mn);
+                l = l * corr + rs;
+                for (int d = 0; d < 128; ++d) {
+                    double pv = 0.0;
+                    for (int c = 0; c < 128; ++c)
+                        pv += fp8_e4m3(raw[90624 + 4096 * it + 128 * i + c]) / 16.0 *
+                              fp8_e4m3(raw[36864 + 16384 * it + c * 128 + d]);
+                    oacc[d] = oacc[d] * corr + pv;
+                }
+                m = mn;
+            }
+            for (int d = 0; d < 128; ++d) {
+                const double ref = oacc[d] / l;
+                const double gotv = outv[i * 128 + d];
+                worst = std::max(worst, std::fabs(gotv - ref));
+                if (std::fabs(gotv - ref) > 2e-3 + 2e-3 * std::fabs(ref)) {
+                    if (bad < 6) std::fprintf(stderr, "hd128 O[%d][%d] want %.6f got %.6f\n", i, d, ref, gotv);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("  fmha_hd128 bad=%d worst_vs_emulated=%.3e O[0][0]=%.6f\n", bad, worst, outv[0]);
+        std::printf(bad ? "PROBE_FMHA_HD128_FAIL\n" : "PROBE_FMHA_HD128_OK\n");
+        return bad != 0;
+    }    if (std::strcmp(kern, "probe_fp8_fmha_trab") == 0) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         int bad = 0;
         int wbad[8] = {0};
