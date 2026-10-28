@@ -22,7 +22,8 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Block-scaled fp8 MFMA | `probe_mfma_scale`: `v_mfma_scale_f32_32x32x64_f8f6f4` with E8M0 scales; `(127,127)` → `64.0`, `(127,128)` → `128.0`, `(127,0x8000)` → `0.0`, `(127,0x7f00)` → `0.0` → `PROBE_MFMA_SCALE_OK` |
 | Wave-role branching (8 waves) | `probe_roles`: waves 0-3 store `111.0`, waves 4-7 store `222.0` (`marker_bad = 0`) and exchange LDS data across waves (`bad = 0`) |
 | FMHA control skeleton | `probe_roles_loop`: 8 waves, role A/B, 4 iterations, two paired barriers per iteration, cross-role LDS exchange → `PROBE_ROLES_LOOP_OK` |
-| FMHA data path | `probe_fmha_datapath`: `ds_write_b128` → `ds_read_b128` → `Frag8` (`frag4` concatenation) → `v_mfma_scale_f32_32x32x64_f8f6f4` → every one of 2048 values is `64.0` → `PROBE_FMHA_DATAPATH_OK` |
+| FMHA data path | `probe_fmha_datapath`: distinct A and B tiles staged in LDS (`ds_write_b128`), read back (`ds_read_b128`), concatenated into `Frag8` operands and multiplied with `v_mfma_scale_f32_32x32x64_f8f6f4` → every value is `64.0` → `PROBE_FMHA_DATAPATH_OK` |
+| A/B paired loops | `probe_ab_loops`: 8 waves, role A/B, outer loop with two sequential inner phase loops, paired barriers, LDS read-modify-write accumulator → `PROBE_AB_LOOPS_OK` (closed form over 512 lanes) |
 | LDS self-read | `probe_lds_self2`: own-slot read after a barrier → `SELF2_OK` |
 | Two-wave LDS | `probe_waves2`: own + partner-wave slot → `PROBE_WAVES2_OK` |
 | `v_max3_f32`, fp8 fragments | `v_max3_f32` in the ISA of the compiler, `Frag8`/`V8` register class for the `32x32x64` operands |
@@ -108,15 +109,23 @@ Verified after the fix (all on gfx950):
 `probe_roles_loop` is the control skeleton of the FMHA reference core loop, so
 the structural pieces needed for the 1:1 reproduction are in place.
 
-## Open question: 32 bytes per lane (16 KB LDS) probe
+## Resolved: the 16 KB LDS probe failure
 
-A variant of `probe_fmha_datapath` that stages 32 B per lane (16 KB of LDS with
-512 threads, two `ds_read_b128` feeds) produced wrong MFMA results for lanes
-with `tid >= 388` (`57.5` and `955.0` instead of `64.0`), while the 16 B/lane
-(8 KB) version is exact. The MFMA and the read path are identical, so this is
-either an LDS-capacity limit for this launch shape or a register/aliasing issue
-in the two-fragment concatenation. Worth isolating before the FMHA core loop,
-which needs >= 8 KB and the reference kernel uses ~84 KB.
+The 32 B/lane variant was writing its B tile at `8192 + tid*32`, which reaches
+`24560` B — past the declared 16 KB and over the A tile. It was a probe bug, not
+an LDS capacity or compiler problem. With both tiles inside the declaration the
+A/B data path is exact.
+
+## Known IR limitations (found while building the A/B loops)
+
+1. `SetVar` is only accepted for the **innermost** loop's variables, so an outer
+   loop accumulator cannot be updated from an inner loop.
+2. Loop variables are not visible after `EndLoop`, so an inner loop's final value
+   cannot be merged into an outer accumulator after the loop.
+
+`probe_ab_loops` works around both by keeping its accumulator in LDS. Removing
+the restrictions is worthwhile for the FMHA core loop (it needs the accumulator
+in registers) and is the first item of the next round.
 
 ## Next: FMHA reference core loop
 
