@@ -5032,7 +5032,10 @@ pub fn probe_fp8_fmha_hd128() -> Function {
             let lane = b.frag16_lane(o_vars[e], r);
             let lanev = b.bitcast_f32(lane);
             let res = b.mul_f32(lanev, invs[r as usize]);
-            b.store_f32(o_ptr, i_const * 512, res);
+            // the global offset field is only 13 bits wide: fold the row offset into the pointer
+            let row_off = b.c_i32((i_const * 512) as i32);
+            let row_ptr = b.ptr_add(o_ptr, row_off);
+            b.store_f32(row_ptr, 0, res);
         }
     }
     let _ = (c32, c256, c1024, c2048);
