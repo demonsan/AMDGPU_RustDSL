@@ -583,8 +583,7 @@ pub fn probe_roles_loop() -> Function {
 /// every output element must be exactly 64.0.
 pub fn probe_fmha_datapath() -> Function {
     let mut b = FnBuilder::new("probe_fmha_datapath", 512);
-    b.lds(8192);
-    b.arg("o", DType::Ptr, 0, 8);
+    b.lds(16384);    b.arg("o", DType::Ptr, 0, 8);
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
 
