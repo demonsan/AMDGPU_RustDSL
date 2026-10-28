@@ -500,8 +500,6 @@ pub fn probe_lds_own() -> Function {
     let off = b.mul_i32(tid, c4);
     b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
     b.wait_lds(0);
-    b.barrier();
-    b.wait_lds(0);
     let raw = b.load_lds_b32(Opnd::Val(off));
     let value = b.bitcast_f32(raw);
     // Diagnostic split: o[tid] gets a constant (does the store path work?),
