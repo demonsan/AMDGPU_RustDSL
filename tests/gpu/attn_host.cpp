@@ -105,9 +105,13 @@ int main(int argc, char** argv) {
     int a_nhead = H;
     int a_sq = S;
     void* params[] = {&a_q, &a_k, &a_v, &a_o, &a_sk, &a_scale, &a_nhead, &a_sq};
+    // Probe kernels take the output pointer as their only argument.
+    void* probe_params[] = {&a_o};
+    void** launch_params = std::strcmp(kern, "probe_math") == 0 ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u)\n", grid.x, grid.y, grid.z);
-    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, params, nullptr));
+    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, launch_params,
+                             nullptr));
     CK(hipDeviceSynchronize());
     std::printf("[harness] kernel finished\n");
 
