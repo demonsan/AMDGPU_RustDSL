@@ -8,7 +8,7 @@ kernel 作者和自动化 agent 在一个**类型化、可验证、可快速迭�
 
 | 内容 | 状态 |
 |---|---|
-| Rust 类型化 DSL、IR 验证器、MIR、线性扫描 RA、hazard / wait 插入、asm 发射 | 已实现，`cargo test` 10 项 |
+| Rust 类型化 DSL、IR 验证器、MIR、线性扫描 RA、hazard / wait 插入、asm 发射 | 已实现，`cargo test` 11 项 |
 | 端到端：DSL → `.s` → `.co` → HIP 启动 → 数值比对 | 已打通，见 `tests/gpu/` |
 | `attention_fwd`（fp16，示例） | 对 CPU 参考最大绝对误差 ≈ 6e-5 |
 | MXFP8 FMHA：`fmha_fwd_hd128_mxfp8_t` | 与厂商 `fwd_hd128_mxfp8.co` 使用**相同的 656 字节 kernarg ABI 和数据布局**，15 个形状逐元素对拍通过 |
@@ -58,7 +58,7 @@ REF_CO=/path/to/fwd_hd128_mxfp8.co OUR_KERNEL=fmha_fwd_hd128_mxfp8_t bash tests/
 
 ## 已知限制
 
-- 无指令调度器（只有 hazard / wait 插入）；性能落后厂商 kernel 约 2.7 倍。
+- 只有块内局部调度（hazard 空档填充），没有全局 / 跨块调度；性能落后厂商 kernel 约 2.7 倍。
 - 没有跨卡通信（MORI LSA / SDMA / GDA）、gfx1250 后端、JIT / 框架适配的实现；`docs/design.md` 里这些仍是设计。
 - 设计文档中的 Resource / Async IR 只落地了一部分（LDS 区域、待完成加载的 wait 跟踪）。
 - 没有测量 ≤10 ms 的编译延迟，不做这个声明。
