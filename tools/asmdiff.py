@@ -10,7 +10,7 @@ def load(path):
     out = []
     for line in open(path):
         line = line.split(';')[0].split('//')[0].strip()
-        if not line or line.startswith('.') or line.endswith(':'):
+        if not line or line.startswith(('.', '-')) or line.endswith(':') or ': ' in line:
             continue
         out.append(re.sub(r'\s+', ' ', line))
     return out
