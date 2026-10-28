@@ -672,3 +672,31 @@ is not implemented are in [`final-report.md`](final-report.md).
    low/high write-mask semantics.
 5. Compare the emitted instruction stream against the reference witness
    section by section.
+
+## Kernel optimisation (round 41+)
+
+All numbers: B=1 H=8 S=SK=2048, GPU 0, 30 iterations, `tools/ab.sh` (build-time variants through env vars FMHA_PITCH / FMHA_OPT, forwarded by `tools/container/cargo.sh`). Vendor kernel in the same runs: 518 TFLOP/s.
+
+| Experiment | Result |
+|---|---|
+| Baseline (pitch 128) | 186.4 TFLOP/s |
+| LDS row pitch 144 (K/V tiles padded; bank conflicts) | **207.7-208.1** (+11%), kept |
+| Pitch 160 / 176 / 208 / 272 | 206-208 (same plateau); 192: 197 |
+| Pitch 132 / 136 / 152 (not 16-byte aligned) | wrong results (132) or 142 TFLOP/s: ds_read_b128 needs 16 B alignment |
+| cvt4: P word = two `v_cvt_pk_fp8_f32` (second with op_sel:[0,0,1] keeping the low half) instead of mov+cvt+mov+cvt+shl+add (-64 instr/iter) | 207.5 -> 212.5-213.3 (+2.7%), numerics identical, kept |
+| pksub: S - m via `v_pk_add_f32` on register pairs of the MFMA tuple, broadcast of -(m-4) in a duplicated pair (-32 instr/iter) | 207.5 -> 210-211 (+1.5%), kept |
+| pkscale: O rescale with `v_pk_mul_f32` (-64 instr/iter) | 206.6 (no gain, -0.4%); NOT default (FMHA_OPT=pkscale) |
+| cvt4+pksub (new default) | 213.1-213.3; all 15 run_ref shapes REF_KERNEL_OK, mean err unchanged (1.07e-3 vs CPU) |
+
+New DSL ops: Frag16Pair, Frag2Dup, PkAddF32, PkMulF32, CvtPkFp8x4F32, Stmt::VarScalePk (lowering in lower.rs; MOps VPkAddF32, VPkMulF32, VCvtPkFp8F32Hi; hazards.rs only got the three MOps in the `movable` list; emit.rs three additive match arms).
+Note: hazards track readiness per parent tuple, so two v_exp writing two halves of one pair would see a false WAW stall; exp results therefore stay in separate V1 registers.
+
+Reading: removing 160 VALU instructions (~25%) gave only ~3-5%, so the kernel is not simply VALU-issue bound; barrier/dependency structure matters more.
+
+### Vendor kernel schedule (llvm-objdump of ref_mxfp8.co)
+- Two code paths per role (label_block_A_loop / label_block_B_loop), each loop covers two 128-key sub-steps with `s_setprio 1 ... s_barrier ... s_setprio 0 ... s_barrier` around the MFMA phases: wave ping-pong with priorities (idea 3).
+- Softmax: v_max3 chains (34 per 32-key pair), `v_cvt_pknorm_u16_f32` + `v_cvt_scalef32_pk_fp8_bf16` (lo, then op_sel:[0,0,1] hi) to produce P, 256 v_pk_fma_f32 + 472 v_pk_mul_f32 + 526 v_exp (whole file), 46 v_permlane32_swap_b32 for the lane^32 exchange (idea 4), a rare overflow rollback branch (`v_cmp_nge_f32 vcc, s92, max` -> rescale only when the max grows by more than a threshold = lazy rescaling).
+- PV MFMAs are unscaled `v_mfma_f32_32x32x64_f8f6f4` (no scale operands), and row sums come from `v_smfmac_f32_16x16x128_fp8_fp8` instead of VALU adds.
+- V fragments via ds_read_b64_tr_b8 with `s_waitcnt lgkmcnt(4)` pipelining between MFMAs; K via ds_read_b128; LDS ring offsets wrap with s_cselect (multi-buffer ring, LDS 84 KB).
+- Global loads via buffer_load_dwordx4 (8 per 2 steps).
+Next candidates: unscaled PV MFMA + MFMA row sum, lazy rescale with threshold, permlane32_swap, setprio ping-pong, LDS ring double buffering.

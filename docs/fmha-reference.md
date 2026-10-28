@@ -141,3 +141,6 @@ witness 不能修正语义缺失。以下情况直接报错，不自动插 copy/
 - 缺少参考使用的 SMFMAC / pknorm / 16 B scaled form
 - 自动新增 loop header 或 end guard
 - 把 partial completion 当作 whole-tile ready
+
+## Vendor kernel schedule (disassembly findings)
+See docs/status.md, section Kernel optimisation (round 41+), subsection Vendor kernel schedule.
