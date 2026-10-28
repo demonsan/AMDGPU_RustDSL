@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
     double worst = 0.0, sum_abs = 0.0, max_ref = 0.0;
     size_t bad = 0, cnt = 0;
     const int check_rows = envi("REF_ROWS", 64);
-    const double cpu_scale = std::getenv("REF_CPU_SCALE") ? std::atof(std::getenv("REF_CPU_SCALE")) : (double)softmax_scale;
+    const double cpu_scale = std::getenv("REF_CPU_SCALE") ? std::atof(std::getenv("REF_CPU_SCALE")) : 0.6931471805599453;  // ln 2: the kernel computes exp2(S)
     std::vector<double> sc(SK), qd(D), kd(D);
     for (int b = 0; b < B; ++b)
         for (int h = 0; h < H; ++h)

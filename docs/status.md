@@ -451,6 +451,35 @@ Remaining distance to the reference kernel: the `+0x80` KV progress updates and 
 plus replacing our row-per-lane LDS softmax with the reference's in-register `v_max3_f32` /
 `v_cmp_nge_f32` rollback structure.
 
+## The vendor reference kernel as ground truth (round 29)
+
+`tests/gpu/ref_host.cpp` launches the vendor `fwd_hd128_mxfp8.co` (aiter commit 7061cbd, SHA256
+83331484...4243438) on random data through its 656-byte kernarg ABI (layout taken from
+`asm_mha_v4_fwd.cu`) and compares it with a double-precision CPU model. The binary is **not** stored
+in the repository; copy it to the node (`scp`) and pass its path.
+
+What the experiments established (all on hardware, `REF_KERNEL_OK`, 32768 outputs, 0 bad):
+
+* ABI and layouts are as in the launcher: Q/K/V are BSHD e4m3 with a contiguous head dim of 128,
+  Q/K descales are uint8 E8M0 `[B, S, H, 4]` (one byte per 1x32 block of the head dim, with zeroed slack
+  rows behind them), V descale is a scalar float, output is BF16 `[B, S, H, 128]`; grid
+  `(ceil(S/256), H, B)`, block 512.
+* A zero Q gives exactly the mean of V, so the V path, output strides and key length are right.
+* **The kernel computes `P = softmax_2(S)`, i.e. `exp2(S)` with `S = sum Qdeq * Kdeq`, and ignores the
+  scalar passed at 0x50** (varying it, even to 0, changes nothing). A CPU model with an effective scale of
+  `ln 2` matches the kernel best (error minimum at 0.693 in a sweep from 0.30 to 0.80); the caller is
+  expected to fold `softmax_scale * log2(e)` into the Q/K data or descales.
+
+Scale recipe check (`probe_fp8_matmul_blk`, exact): the scaled MFMA's per-lane scale byte applies to
+the data byte `b` of either lane group through lane `row + 32 * (b / 16)`, so a 1x32 block of K
+occupies bytes 0..15 (block 0) or 16..31 (block 1) of both lane groups. The fragment for lane group `g`
+is therefore `K 16g..16g+15` followed by `K 32+16g..32+16g+15`, and lane group `g` supplies the scale
+of block `g` as `descale_dword >> (8 g)` (op_sel 0). With that arrangement real 1x32 E8M0 scales are
+reproduced exactly (`PROBE_MATMUL_BLK_OK`).
+
+Next: an ABI-compatible kernel built on these layouts, compared element by element with the vendor
+output on identical inputs.
+
 ## Next: FMHA reference core loop
 
 1. Resolve the 16 KB LDS question above (needed before scaling the core loop).
