@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::mir::MFunction;
+use crate::mir::{MFunction, MOp};
 use crate::regalloc::Alloc;
 
 pub mod llvm20;
