@@ -342,13 +342,18 @@ fn find_slot(used: &[bool], c: RClass, singles_from_top: bool) -> Option<usize> 
         S_RESERVED
     };
     let n = used.len();
-    if singles_from_top && c.is_vector() && width == 1 {
-        let mut i = n;
-        while i > lo {
-            i -= 1;
-            if !used[i] {
+    if singles_from_top && c.is_vector() && width < 16 {
+        // Narrow operands pack from the top (aligned), leaving the low registers as dense
+        // sixteen-dword blocks for the accumulators.
+        let mut i = (n - width) / align * align;
+        loop {
+            if i >= lo && (0..width).all(|k| !used[i + k]) {
                 return Some(i);
             }
+            if i < align || i - align < lo {
+                break;
+            }
+            i -= align;
         }
         return None;
     }
