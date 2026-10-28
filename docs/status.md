@@ -710,3 +710,33 @@ Next candidates: unscaled PV MFMA + MFMA row sum, lazy rescale with threshold, p
 | prioA / prioB: `s_setprio 1` for role A or B waves for the whole loop (new Stmt::SetPrio) | 212.7-213.7: no gain |
 
 Interpretation: five independent changes (barriers, exchange, scale loads, priorities, 25% fewer VALU) each move the time by at most 3%, while the 11 us launch/timing floor is included in every measurement (S=77,SK=1 takes 11.4 us; S=SK=256 20 us). Per iteration (128 keys, 8 waves) the kernel needs ~4.5 us (~11k cycles at 2.4 GHz) against ~1.5 us for the vendor kernel, although both execute the same 16 MFMAs per wave and iteration. The vendor loop (see above) differs structurally: unscaled PV MFMAs, MFMA row sums (smfmac), pknorm-based P conversion, lazy-rescale branch, 2x unrolled ping-pong with setprio/barrier phases. Untested hypotheses for the remaining gap: (1) the in-order MFMA->VALU dependency chain inside one wave (QK -> max -> exp -> PV never overlaps within a wave; the vendor issues the next tile's QK MFMAs before the current softmax), which needs software pipelining across iterations with 2 x 16 S registers; (2) the hazard pass pads MFMA/trans latencies with s_nop (grep s_nop in the emitted .s). Next step: count s_nop cycles in the loop and prototype the cross-iteration QK software pipeline.
+
+### Round 42: VALU-count ablation and VALU reductions
+Base cvt4+pksub, 215.5 TFLOP/s (0.0797 ms, incl. ~11 us launch floor). Saved cycles per iteration (1 us = 2400 cyc), measured vs predicted (2 waves/SIMD x ops x 4 cyc, exp/cvt 8 cyc):
+
+| Removed (timing-only ablation) | measured | predicted | TFLOP/s |
+|---|---|---|---|
+| O rescale (128 v_mul) | 720 | 1024 | 229.6 |
+| S-m (64 v_sub) | 480 | 512 | 221.8 (vs cvt4 base 212.5) |
+| row-sum adds (62) | 390 | 496 | 222.7 |
+| fp8 cvt (32) | 465 | 512 | 224.2 |
+| max3 chain (~16) | 315 | 128 | 221.3 |
+| v_exp (66) | 885 | 1056 | 232.9 |
+| sub+sum+rescale+max (~270 instr) | 1700 | 2160 | 251 |
+| all of the above + exp + cvt | 3030 | 3730 | 289 |
+
+Savings are 80-100% of the VALU-slot prediction, so VALU issue slots are a major limiter. But the floor with all those removed is still ~7.3k cycles/iteration (MFMA 16 x 64 cyc x 2 waves = 2k, LDS, address/mov work, barriers, latency chains), and after the numerically valid reductions below the executed path has ~410 instructions (~3.6k VALU cycles per SIMD, the vendor's total) yet still takes ~9.8k cycles: the VALU count alone does not explain the vendor gap.
+
+Numerically valid reductions (FMHA_OPT flags, now default together with cvt4,pksub):
+| flag | change | TFLOP/s | mean err vs CPU |
+|---|---|---|---|
+| (base cvt4,pksub) | | 215.5 | 1.07e-3 |
+| msum | row sums via MFMA with an all-ones E4M3 A operand and P^T as B (every lane gets its query's sum of the quantised P; 16 extra accumulator regs, VGPR 240), no v_add row sum, no l exchange | 218.5-219.3 | 1.08e-3 |
+| lazy | rescale branch (any lane's tile max > running max + 4 -> new max, rescale O and l; P x 16 stays < 256 < 448) | 221.5 | 1.41e-3 |
+| lazy+msum | | 222.8 | 1.25e-3 |
+| lazy+msum+permlane | | 224.3-225 (default) | 1.25e-3 |
+| lazyinf (ablation, tau=1e9, wrong numerics) | the branch never taken after tile 0 | 240 | - |
+| over2/4/6/8 (new max = tile max + k on trigger) | fewer triggers in theory | 225 / 226 / 227 / 229 | 1.25e-3 / 1.41e-3 / 2.1e-3 / 4.7e-3: rejected (accuracy loss, gain <= 1%) |
+
+On the benchmark's random data the lazy branch fires in most iterations (some lane of the wave exceeds the threshold), so lazy gets about half of the ablation upper bound (240). Final default: cvt4,pksub,lazy,msum,permlane = 224-225 TFLOP/s; 15/15 run_ref shapes REF_KERNEL_OK (mean diff vs vendor 2.3-2.6e-3, within the earlier 1.3-2.8e-3 pattern), cargo test and run.sh OK.
+Not done: unscaled PV MFMA (no VALU effect), cross-iteration QK/softmax software pipelining (needs VGPRs beyond 240 with msum), wave ping-pong skew.

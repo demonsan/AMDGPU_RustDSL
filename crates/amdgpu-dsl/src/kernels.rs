@@ -6734,7 +6734,12 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     if (role_a && fmha_t_opt("prioA")) || (!role_a && fmha_t_opt("prioB")) {
         b.set_prio(1);
     }
-    let vars = b.begin_loop(&[
+    let lazy = fmha_t_opt("lazy");
+    let msum = fmha_t_opt("msum");
+    // row sums by MFMA: A = all-ones (E4M3 1.0), B = P^T, so every lane accumulates its query's sum
+    let ones_w = b.c_i32(0x38383838);
+    let ones8 = b.frag8(ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w);
+    let mut init_vars = vec![
         (DType::I32, Opnd::Val(c0)),
         (DType::I32, Opnd::Val(m_init)),
         (DType::I32, Opnd::Val(l_init)),
@@ -6743,9 +6748,14 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (DType::Frag16, Opnd::Val(zero)),
         (DType::Frag16, Opnd::Val(zero)),
         (DType::I32, Opnd::Val(c0)),
-    ]);
+    ];
+    if msum {
+        init_vars.push((DType::Frag16, Opnd::Val(zero)));
+    }
+    let vars = b.begin_loop(&init_vars);
     let it = vars[0];
     let par = vars[7];
+    let lacc = if msum { Some(vars[8]) } else { None };
     let m_var = vars[1];
     let l_var = vars[2];
     let o_vars = [vars[3], vars[4], vars[5], vars[6]];
@@ -6834,7 +6844,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             // v_max3_f32 folds two new values per instruction
             let mut mloc = b.max3_f32(flat[0], flat[1], flat[2]);
             let mut k = 3usize;
-            while k + 1 < flat.len() {
+            while k + 1 < flat.len() && !fmha_t_opt("abl_max") {
                 mloc = b.max3_f32(mloc, flat[k], flat[k + 1]);
                 k += 2;
             }
@@ -6853,15 +6863,60 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.max_f32(mloc, mpart)
             };
             let m_old = b.bitcast_f32(m_var);
-            let m_new = b.max_f32(m_old, mt);
-            let dm = b.sub_f32(m_old, m_new);
-            let corr = b.exp2_f32(dm);
+            let corr_eager: Option<ValueId>;
+            let m_use: ValueId;
+            if lazy {
+                // lazy rescaling: the running max only moves when some lane of the wave grows by
+                // more than 4 (P x 16 then stays below 16 * 2^4 = 256 < 448, the E4M3 maximum)
+                let tau = if fmha_t_opt("lazyinf") { b.c_f32(1.0e9) } else { c4f };
+                let thr = b.add_f32(m_old, tau);
+                let grow = b.cmp_lt_f32(thr, mt);
+                b.begin_if(Opnd::Val(grow));
+                // overshoot: move the running max "over" above the tile max so the next triggers are rarer
+                let over = [("over8", 8.0f32), ("over6", 6.0), ("over4", 4.0), ("over3", 3.0), ("over2", 2.0)].iter().find(|(n, _)| fmha_t_opt(n)).map(|x| x.1).unwrap_or(0.0);
+                let mt_o = if over > 0.0 {
+                    let co = b.c_f32(over);
+                    b.add_f32(mt, co)
+                } else {
+                    mt
+                };
+                let m_new = b.max_f32(m_old, mt_o);
+                let dm = b.sub_f32(m_old, m_new);
+                let corr = b.exp2_f32(dm);
+                let m_bits = b.bitcast_i32(m_new);
+                b.set_var(m_var, m_bits);
+                for e in 0..4usize {
+                    if !fmha_t_opt("abl_rescale") {
+                        b.var_scale_f32(o_vars[e], corr);
+                    }
+                }
+                match lacc {
+                    Some(la) => b.var_scale_f32(la, corr),
+                    None => {
+                        let l_old = b.bitcast_f32(l_var);
+                        let l_scaled = b.mul_f32(l_old, corr);
+                        let l_bits = b.bitcast_i32(l_scaled);
+                        b.set_var(l_var, l_bits);
+                    }
+                }
+                b.end_if();
+                corr_eager = None;
+                m_use = b.bitcast_f32(m_var);
+            } else {
+                let m_new = b.max_f32(m_old, mt);
+                let dm = b.sub_f32(m_old, m_new);
+                let corr = b.exp2_f32(dm);
+                let m_bits = b.bitcast_i32(m_new);
+                b.set_var(m_var, m_bits);
+                corr_eager = Some(corr);
+                m_use = m_new;
+            }
 
             // exp2(s - (m - 4)) = 16 exp2(s - m): the P x 16 quantisation scale comes for free
-            let m4 = b.sub_f32(m_new, c4f);
+            let m4 = b.sub_f32(m_use, c4f);
             let pk_sub = !masked && fmha_t_opt("pksub");
             let negm4_dup = if pk_sub {
-                let negm4 = b.sub_f32(c4f, m_new);
+                let negm4 = b.sub_f32(c4f, m_use);
                 Some(b.frag2_dup(negm4))
             } else {
                 None
@@ -6882,17 +6937,21 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     }
                 } else {
                     for r in 0..16usize {
-                        let sh = b.sub_f32(sv[sl][r], m4);
+                        let sh = if fmha_t_opt("abl_sub") { sv[sl][r] } else { b.sub_f32(sv[sl][r], m4) };
                         exps.push(if no_exp { sh } else { b.exp2_f32(sh) });
                     }
                 }
-                for e in &exps {
+                for e in exps.iter().take(if fmha_t_opt("abl_sum") { 1 } else { 16 }) {
                     rsum = Some(match rsum {
                         None => *e,
                         Some(acc) => b.add_f32(acc, *e),
                     });
                 }
                 for m in 0..4usize {
+                    if fmha_t_opt("abl_cvt") {
+                        words.push(b.bitcast_i32(exps[4 * m]));
+                        continue;
+                    }
                     if fmha_t_opt("cvt4") {
                         words.push(b.cvt_pk_fp8x4_f32(exps[4 * m], exps[4 * m + 1], exps[4 * m + 2], exps[4 * m + 3]));
                         continue;
@@ -6903,24 +6962,38 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     words.push(b.add_i32(p0, sh));
                 }
             }
-            let rsum16 = rsum.unwrap();
-            let rsum = b.mul_f32(rsum16, c_sixteenth);
-            let l_old = b.bitcast_f32(l_var);
-            let l_scaled = b.mul_f32(l_old, corr);
-            let l_new = b.add_f32(l_scaled, rsum);
-            let m_bits = b.bitcast_i32(m_new);
-            let l_bits = b.bitcast_i32(l_new);
-            b.set_var(m_var, m_bits);
-            b.set_var(l_var, l_bits);
+            if !msum {
+                let rsum16 = rsum.unwrap();
+                let rsum = b.mul_f32(rsum16, c_sixteenth);
+                let l_old = b.bitcast_f32(l_var);
+                let l_base = match corr_eager {
+                    Some(corr) => b.mul_f32(l_old, corr),
+                    None => l_old,
+                };
+                let l_new = b.add_f32(l_base, rsum);
+                let l_bits = b.bitcast_i32(l_new);
+                b.set_var(l_var, l_bits);
+            }
             let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
 
             // ---- O^T += V^T P^T, four 32-wide dim tiles; the correction is lane-local ----
-            let corr_dup = if fmha_t_opt("pkscale") { Some(b.frag2_dup(corr)) } else { None };
+            let corr_dup = match corr_eager {
+                Some(corr) if fmha_t_opt("pkscale") => Some(b.frag2_dup(corr)),
+                _ => None,
+            };
+            if let (Some(la), Some(corr)) = (lacc, corr_eager) {
+                b.var_scale_f32(la, corr);
+            }
+            if let Some(la) = lacc {
+                b.var_mfma_scale(la, ones8, p8, c127, c123);
+            }
             for e in 0..4usize {
                 // in place: O *= corr, then O += V^T P^T (no copies)
-                match corr_dup {
-                    Some(cd) => b.var_scale_pk(o_vars[e], cd),
-                    None => b.var_scale_f32(o_vars[e], corr),
+                match (corr_dup, corr_eager) {
+                    _ if fmha_t_opt("abl_rescale") => {}
+                    (_, None) => {}
+                    (Some(cd), _) => b.var_scale_pk(o_vars[e], cd),
+                    (None, Some(corr)) => b.var_scale_f32(o_vars[e], corr),
                 }
                 let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
                 for r in 0..4i32 {
@@ -6970,14 +7043,20 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.end_loop();
 
     // ---- epilogue: O * (V descale / l_total) -> BF16, four dims per 8-byte store ----
-    let l_final = b.bitcast_f32(l_var);
-    let lbits = b.bitcast_i32(l_final);
-    b.store_lds_b32(Opnd::Val(cx.ex_own), Opnd::Val(lbits));
-    b.wait_lds(0);
-    let lp_raw = b.load_lds_b32(Opnd::Val(cx.ex_partner));
-    b.wait_lds(0);
-    let lpart = b.bitcast_f32(lp_raw);
-    let l_tot = b.add_f32(l_final, lpart);
+    let l_tot = if let Some(la) = lacc {
+        // the MFMA sum already covers the keys of both lane halves
+        let l0 = b.frag16_lane(la, 0);
+        b.bitcast_f32(l0)
+    } else {
+        let l_final = b.bitcast_f32(l_var);
+        let lbits = b.bitcast_i32(l_final);
+        b.store_lds_b32(Opnd::Val(cx.ex_own), Opnd::Val(lbits));
+        b.wait_lds(0);
+        let lp_raw = b.load_lds_b32(Opnd::Val(cx.ex_partner));
+        b.wait_lds(0);
+        let lpart = b.bitcast_f32(lp_raw);
+        b.add_f32(l_final, lpart)
+    };
     let inv_l = b.rcp_f32(l_tot);
     let fin = b.mul_f32(inv_l, cx.vd_raw);
 
@@ -7014,7 +7093,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// LDS row pitch (bytes) of the K/V tiles of the transposed FMHA kernel (env FMHA_PITCH, read at
 /// build time, for bank-conflict experiments; default 144: 16-byte aligned and conflict-free enough, 128 = unpadded).
 fn fmha_t_opt(name: &str) -> bool {
-    let v = std::env::var("FMHA_OPT").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "cvt4,pksub".to_string());
+    let v = std::env::var("FMHA_OPT").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "cvt4,pksub,lazy,msum,permlane".to_string());
     v.split(',').any(|x| x == name)
 }
 
