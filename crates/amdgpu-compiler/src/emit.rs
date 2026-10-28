@@ -474,7 +474,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1_s(a, inst.srcs[1])
         )],
         MOp::SNop => vec![format!("s_nop {}", inst.imm)],
-        MOp::SWaitVm => vec!["s_waitcnt vmcnt(0)".to_string()],
+        MOp::SWaitVm => vec![format!("s_waitcnt vmcnt({})", inst.imm)],
         MOp::SWaitLgkm => vec![format!("s_waitcnt lgkmcnt({})", inst.imm)],
         MOp::LdsWriteB32 => vec![format!(
             "ds_write_b32 {}, {}{}",

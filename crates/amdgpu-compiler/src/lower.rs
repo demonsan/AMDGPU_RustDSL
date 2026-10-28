@@ -187,22 +187,32 @@ impl Lowerer {
     }
     /// Wait for any pending load feeding `srcs`, then clear the pending set.
     fn touch(&mut self, srcs: &[Src]) {
-        let mut need_vm = false;
+        // Global loads complete in issue order, so waiting for the newest load that feeds `srcs`
+        // only needs `vmcnt(n)` where n is the number of loads issued after it: loads issued later
+        // (a prefetch, for instance) stay in flight.
+        let mut vm_newest: Option<usize> = None;
         let mut need_lgkm = false;
         for s in srcs {
             if let Src::Reg(r) = s {
                 let r = &self.mir.canon(*r);
-                if self.pending_vmem.contains(r) {
-                    need_vm = true;
+                if let Some(pos) = self.pending_vmem.iter().rposition(|x| x == r) {
+                    vm_newest = Some(vm_newest.map_or(pos, |p| p.max(pos)));
                 }
                 if self.pending_smem.contains(r) || self.pending_lds.contains(r) {
                     need_lgkm = true;
                 }
             }
         }
-        if need_vm {
-            self.push(MInst::new(MOp::SWaitVm));
-            self.pending_vmem.clear();
+        if let Some(pos) = vm_newest {
+            let after = self.pending_vmem.len() - 1 - pos;
+            self.push(MInst::new(MOp::SWaitVm).imm(after.min(63) as i64));
+            if after > 63 {
+                // beyond the counter range: fall back to draining everything
+                self.mir.blocks[self.cur].insts.last_mut().unwrap().imm = 0;
+                self.pending_vmem.clear();
+            } else {
+                self.pending_vmem.drain(..=pos);
+            }
         }
         if need_lgkm {
             self.push(MInst::new(MOp::SWaitLgkm).imm(0));
@@ -210,111 +220,6 @@ impl Lowerer {
             self.pending_lds.clear();
         }
     }
-
-    /// A sub-register view of `tuple` at dword `off` (no instruction, no register of its own).
-    fn alias_vreg(&mut self, tuple: VReg, off: u8, class: RClass) -> VReg {
-        let tuple = self.mir.canon(tuple);
-        if let Some(a) = self.alias_cache.get(&(tuple, off, class)) {
-            return *a;
-        }
-        let a = self.new_vreg(class);
-        self.mir.alias.insert(a, (tuple, off));
-        self.alias_cache.insert((tuple, off, class), a);
-        a
-    }
-
-    /// Make the instruction that produced value `v` write `new_dst` directly (instead of a fresh
-    /// register that would then be moved into a fragment). Only for single-use results of plain
-    /// ALU ops defined earlier in the current block.
-    fn retarget_producer(&mut self, v: ValueId, new_dst: VReg) -> bool {
-        let mut cur = v;
-        loop {
-            if self.use_counts.get(&cur).copied() != Some(1) {
-                return false;
-            }
-            match self.defs.get(&cur) {
-                Some(Op::BitcastF32(Opnd::Val(i))) | Some(Op::BitcastI32(Opnd::Val(i))) => cur = *i,
-                Some(Op::MulF32(..))
-                | Some(Op::AddF32(..))
-                | Some(Op::SubF32(..))
-                | Some(Op::AddI32(..))
-                | Some(Op::ShlI32(..))
-                | Some(Op::XorI32(..))
-                | Some(Op::MulI32(..)) => break,
-                _ => return false,
-            }
-        }
-        let r = match self.val.get(&cur) {
-            Some(r) => *r,
-            None => return false,
-        };
-        if self.mir.vreg_class(r) != RClass::V1 || self.mir.alias.contains_key(&r) {
-            return false;
-        }
-        let insts = &mut self.mir.blocks[self.cur].insts;
-        for inst in insts.iter_mut().rev() {
-            if inst.dst == Some(r) {
-                inst.dst = Some(new_dst);
-                self.val.insert(cur, new_dst);
-                return true;
-            }
-            if inst.uses().contains(&r) {
-                return false;
-            }
-        }
-        false
-    }
-
-    fn const_of(&self, o: Opnd) -> Option<i64> {
-        match o {
-            Opnd::I32(i) => Some(i as i64),
-            Opnd::Val(v) => match self.defs.get(&v) {
-                Some(Op::ConstI32(i)) => Some(*i as i64),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// An LDS address operand split into a base register and the constant byte offset that the DS
-    /// instruction can take in its immediate field (chains of `x + const` are flattened).
-    fn lds_addr(&mut self, o: Opnd) -> Result<(VReg, i64), String> {
-        let mut cur = o;
-        let mut off: i64 = 0;
-        loop {
-            if let Opnd::Val(v) = cur {
-                if let Some(Op::AddI32(x, y)) = self.defs.get(&v).cloned() {
-                    if let Some(k) = self.const_of(y) {
-                        if k >= 0 && off + k < 65536 {
-                            off += k;
-                            cur = x;
-                            continue;
-                        }
-                    }
-                    if let Some(k) = self.const_of(x) {
-                        if k >= 0 && off + k < 65536 {
-                            off += k;
-                            cur = y;
-                            continue;
-                        }
-                    }
-                }
-            }
-            break;
-        }
-        Ok((self.as_v1(cur)?, off))
-    }
-
-    /// A freshly zeroed sixteen-dword fragment.
-    fn fresh_zero16(&mut self) -> VReg {
-        let d = self.new_vreg(RClass::V16);
-        let zero = self.const_vreg(0);
-        for i in 0..16 {
-            self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(zero).imm(i as i64));
-        }
-        d
-    }
-
     fn const_vreg(&mut self, bits: i64) -> VReg {
         if let Some(r) = self.consts.get(&bits) {
             return *r;
@@ -565,6 +470,12 @@ impl Lowerer {
                     };
                     self.touch(&[Src::Reg(src)]);
                     self.copy_reg(dst, src)?;
+                }
+                Stmt::VarLoadB128 { var, base, byte_off } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let rb = self.as_v2(*base)?;
+                    self.push(MInst::new(MOp::GlobalLoadB128).def(v).srcreg(rb).imm(*byte_off as i64));
+                    self.pending_vmem.push(self.mir.canon(v));
                 }
                 Stmt::VarScaleF32 { var, scalar } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;

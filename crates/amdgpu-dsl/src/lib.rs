@@ -339,6 +339,8 @@ pub enum Stmt {
     SetVar { var: VarId, value: Opnd },
     /// Multiply all sixteen dwords of a `Frag16` loop variable by an f32 scalar, in place.
     VarScaleF32 { var: VarId, scalar: Opnd },
+    /// 16-byte global load written straight into a `Frag4` loop variable.
+    VarLoadB128 { var: VarId, base: Opnd, byte_off: u32 },
     /// `var = scaled_mfma_32x32x64_fp8(a, b, var)`: accumulate into a loop variable in place.
     VarMfmaScale { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
     BeginLoop { vars: Vec<VarId>, init: Vec<Opnd> },
@@ -420,6 +422,9 @@ impl Function {
                 }
                 Stmt::VarScaleF32 { var, scalar } => {
                     let _ = writeln!(s, "{pad}var{} *= {scalar:?}", var.0);
+                }
+                Stmt::VarLoadB128 { var, base, byte_off } => {
+                    let _ = writeln!(s, "{pad}var{} <- load128 [{base:?}+{byte_off}]", var.0);
                 }
                 Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
                     let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
@@ -829,6 +834,12 @@ impl FnBuilder {
     /// Two 16-byte LDS reads into the low and high half of one `Frag8`.
     pub fn load_lds_b128x2(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsB128x2 { lo: lo.into(), hi: hi.into() })
+    }
+
+    /// Load 16 bytes from global memory directly into a `Frag4` loop variable (the load stays in
+    /// flight across the code that follows; the loop back edge waits for it).
+    pub fn var_load_b128(&mut self, var: VarId, base: impl Into<Opnd>, byte_off: u32) {
+        self.f.stmts.push(Stmt::VarLoadB128 { var, base: base.into(), byte_off });
     }
 
     /// `var *= scalar` on every dword of a `Frag16` loop variable.
@@ -1320,6 +1331,20 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
                 if let Opnd::Val(v) = value {
+                    if !visible(&scopes, *v) {
+                        errs.push(here(format!("operand v{v} is not visible here")));
+                    }
+                }
+            }
+            Stmt::VarLoadB128 { var, base, .. } => {
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var));
+                if !ok {
+                    errs.push(here(format!("var{var} loaded outside its loop")));
+                }
+                if f.var_ty(*var) != Some(DType::Frag4) {
+                    errs.push(here(format!("var{var} must be a frag4 to take a 16-byte load")));
+                }
+                if let Opnd::Val(v) = base {
                     if !visible(&scopes, *v) {
                         errs.push(here(format!("operand v{v} is not visible here")));
                     }
