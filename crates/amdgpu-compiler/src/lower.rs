@@ -172,6 +172,16 @@ impl Lowerer {
         }
     }
 
+    /// A freshly zeroed sixteen-dword fragment.
+    fn fresh_zero16(&mut self) -> VReg {
+        let d = self.new_vreg(RClass::V16);
+        let zero = self.const_vreg(0);
+        for i in 0..16 {
+            self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(zero).imm(i as i64));
+        }
+        d
+    }
+
     fn const_vreg(&mut self, bits: i64) -> VReg {
         if let Some(r) = self.consts.get(&bits) {
             return *r;
@@ -325,6 +335,9 @@ impl Lowerer {
     /// Sixteen-dword fragment operand.
     fn as_v16(&mut self, o: Opnd) -> Result<VReg, String> {
         match o {
+            Opnd::Val(v) if matches!(self.defs.get(&v), Some(Op::FragZero { ty: DType::Frag16 })) => {
+                Ok(self.fresh_zero16())
+            }
             Opnd::Val(v) => {
                 let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
                 if self.mir.vreg_class(r) == RClass::V16 {
@@ -952,11 +965,21 @@ impl Lowerer {
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 let ra = self.as_v8(*a)?;
                 let rb = self.as_v8(*b)?;
-                let rc = self.as_v16(*c)?;
+                let c_is_zero = matches!(
+                    c,
+                    Opnd::Val(cv) if matches!(self.defs.get(cv), Some(Op::FragZero { ty: DType::Frag16 }))
+                );
                 let sa = self.as_v1(*scale_a)?;
                 let sb = self.as_v1(*scale_b)?;
-                let d = self.new_vreg(RClass::V16);
-                self.copy_reg(d, rc)?;
+                let d = if c_is_zero {
+                    // accumulate onto zero: zero-fill D directly instead of copying a zero fragment
+                    self.fresh_zero16()
+                } else {
+                    let rc = self.as_v16(*c)?;
+                    let d = self.new_vreg(RClass::V16);
+                    self.copy_reg(d, rc)?;
+                    d
+                };
                 self.push(
                     MInst::new(MOp::VMfmaScale32x32x64Fp8)
                         .def(d)
@@ -983,6 +1006,11 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::FragZero { ty } => {
+                // A zero Frag16 is rematerialised at each use (see as_v16) so that it never
+                // stays live across a loop just because every iteration starts from it.
+                if matches!(ty, DType::Frag16) {
+                    return Ok(());
+                }
                 let class = match ty {
                     DType::Frag2 => RClass::V2,
                     DType::Frag4 => RClass::V4,
