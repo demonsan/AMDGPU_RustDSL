@@ -51,6 +51,7 @@ pub enum MOp {
     VReadPhys,
     VReadFirstLane,
     VCvtPknormU16,
+    VCvtPkFp8F32,
     VCvtPkFp8Lo,
     VCvtPkFp8Hi,
     VAddU32,

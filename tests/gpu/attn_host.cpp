@@ -144,13 +144,14 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fp8_load") == 0 ||
                              std::strcmp(kern, "probe_fp8_min") == 0 ||
                              std::strcmp(kern, "probe_fp8_minload") == 0 ||
-                             std::strcmp(kern, "probe_fp8_softmax") == 0;
+                             std::strcmp(kern, "probe_fp8_softmax") == 0 ||
+                             std::strcmp(kern, "probe_fp8_fmha_tile") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
     // Real-data block-scaled fp8 matmul probe: fill the input region of `dout`
     // with A (32x64 fp8), B^T (32x64 fp8), and the per-lane scale bytes.
-    if (std::strcmp(kern, "probe_fp8_matmul") == 0 || std::strcmp(kern, "probe_fp8_load") == 0 || std::strcmp(kern, "probe_fp8_minload") == 0 || std::strcmp(kern, "probe_fp8_softmax") == 0) {
+    if (std::strcmp(kern, "probe_fp8_matmul") == 0 || std::strcmp(kern, "probe_fp8_load") == 0 || std::strcmp(kern, "probe_fp8_minload") == 0 || std::strcmp(kern, "probe_fp8_softmax") == 0 || std::strcmp(kern, "probe_fp8_fmha_tile") == 0) {
         const int fp8_test = envi("FP8_TEST", 1);
         std::vector<unsigned char> in(8960, 0);
         unsigned int seed = 12345u;
@@ -192,6 +193,14 @@ int main(int argc, char** argv) {
                 }
                 in[i * 64 + k] = v;
                 in[2048 + i * 64 + k] = v;
+            }
+        }
+        if (std::strcmp(kern, "probe_fp8_fmha_tile") == 0) {
+            // V^T padded to 32x64: V[k][j] in the lower 32 bytes, zeros above.
+            for (int jj = 0; jj < 32; ++jj) {
+                for (int k = 0; k < 64; ++k) {
+                    in[4608 + jj * 64 + k] = (k < 32) ? palette[next_rand() % 9] : 0x00;
+                }
             }
         }
         for (int l = 0; l < 64; ++l) {
@@ -455,6 +464,43 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
+    if (std::strcmp(kern, "probe_fp8_fmha_tile") == 0) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        double s_mat[32][32];
+        for (int i = 0; i < 32; ++i) {
+            for (int jj = 0; jj < 32; ++jj) {
+                double acc = 0.0;
+                for (int k = 0; k < 64; ++k) {
+                    const int g = ((k % 32) / 16) % 2;
+                    const double sa_v = std::ldexp(1.0, (int)raw[4096 + (i + 32 * g) * 4] - 127);
+                    const double sb_v = std::ldexp(1.0, (int)raw[4352 + (jj + 32 * g) * 4] - 127);
+                    acc += fp8_e4m3(raw[i * 64 + k]) * fp8_e4m3(raw[2048 + jj * 64 + k]) * sa_v * sb_v;
+                }
+                s_mat[i][jj] = acc;
+            }
+        }
+        const float* outv = reinterpret_cast<const float*>(raw + 6656);
+        int bad = 0;
+        double worst = 0.0;
+        for (int i = 0; i < 32; ++i) {
+            for (int jj = 0; jj < 32; ++jj) {
+                double ref = 0.0;
+                for (int k = 0; k < 32; ++k) {
+                    ref += fp8_e4m3(raw[10752 + i * 32 + k]) * fp8_e4m3(raw[4608 + jj * 64 + k]);
+                }
+                ref /= 16.0;
+                const double err = std::fabs((double)outv[i * 32 + jj] - ref);
+                worst = std::max(worst, err);
+                if (err > 1e-3 + 1e-3 * std::fabs(ref)) {
+                    if (bad < 6) std::fprintf(stderr, "fmha_tile O[%d][%d] want %.6f got %.6f\n", i, jj, ref, outv[i * 32 + jj]);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("  fmha_tile bad=%d worst_err=%.3e O[0][0]=%.6f q0=0x%02x\n", bad, worst, outv[0], raw[10752]);
+        std::printf(bad ? "PROBE_FMHA_TILE_FAIL\n" : "PROBE_FMHA_TILE_OK\n");
+        return bad != 0;
+    }
     if (std::strcmp(kern, "probe_fp8_softmax") == 0) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         const int fp8_test = envi("FP8_TEST", 3);

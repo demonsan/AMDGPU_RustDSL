@@ -795,6 +795,21 @@ impl Lowerer {
                 );
                 self.val.insert(dst, d);
             }
+            Op::CvtPkFp8F32(a, b) => {
+                let ra = self.as_v1(*a)?;
+                let rb = self.as_v1(*b)?;
+                let d = self.new_vreg(RClass::V1);
+                // The instruction only writes the low 16 bits, so start from 0.
+                let z = self.const_vreg(0);
+                self.push(MInst::new(MOp::VMovB32).def(d).srcreg(z));
+                self.push(
+                    MInst::new(MOp::VCvtPkFp8F32)
+                        .def(d)
+                        .srcreg(ra)
+                        .srcreg(rb),
+                );
+                self.val.insert(dst, d);
+            }
             Op::CvtScalef32PkFp8Bf16 { old, src, scale, high } => {
                 let ro = self.as_v1(*old)?;
                 let rs = self.as_v1(*src)?;

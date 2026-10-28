@@ -1431,3 +1431,196 @@ pub fn probe_fp8_softmax() -> Function {
     }
     b.finish()
 }
+/// Single-tile MXFP8 attention: QK^T -> row softmax -> fp8 quantisation -> PV.
+///
+/// Input image in `o`:
+/// * `0`    : Q (32x64 fp8), `2048`: K^T (32x64 fp8)
+/// * `4096` / `4352`: per-lane E8M0 scales for Q and K
+/// * `4608` : V^T padded to 32x64 (upper 32 bytes zero)
+/// * `6656` : output O (32x32 f32, row major)
+/// * `10752`: the quantised P bytes, one row per lane (32 bytes)
+pub fn probe_fp8_fmha_tile() -> Function {
+    let mut b = FnBuilder::new("probe_fp8_fmha_tile", 64);
+    b.lds(4096);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let c4 = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c9 = b.c_i32(9);
+    let c16i = b.c_i32(16);
+    let c31 = b.c_i32(31);
+    let c32 = b.c_i32(32);
+    let c64 = b.c_i32(64);
+    let c128 = b.c_i32(128);
+    let c2048 = b.c_i32(2048);
+    let c4096 = b.c_i32(4096);
+    let c4352 = b.c_i32(4352);
+    let c4608 = b.c_i32(4608);
+    let c6656 = b.c_i32(6656);
+    let c10752 = b.c_i32(10752);
+
+    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let pblk = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
+
+    // ---- phase 1: QK^T ----
+    let row = b.mul_i32(j, c64);
+    let koff = b.shl_i32(pblk, c5);
+    let frag_off = b.add_i32(row, koff);
+    let a_base = b.ptr_add(o, frag_off);
+    let kt_off = b.add_i32(frag_off, c2048);
+    let kt_base = b.ptr_add(o, kt_off);
+    let v_off = b.add_i32(frag_off, c4608);
+    let v_base = b.ptr_add(o, v_off);
+
+    let a0 = b.load_f32(a_base, 0);
+    let a0 = b.bitcast_i32(a0);
+    let a1 = b.load_f32(a_base, 4);
+    let a1 = b.bitcast_i32(a1);
+    let a2 = b.load_f32(a_base, 8);
+    let a2 = b.bitcast_i32(a2);
+    let a3 = b.load_f32(a_base, 12);
+    let a3 = b.bitcast_i32(a3);
+    let a4 = b.load_f32(a_base, 16);
+    let a4 = b.bitcast_i32(a4);
+    let a5 = b.load_f32(a_base, 20);
+    let a5 = b.bitcast_i32(a5);
+    let a6 = b.load_f32(a_base, 24);
+    let a6 = b.bitcast_i32(a6);
+    let a7 = b.load_f32(a_base, 28);
+    let a7 = b.bitcast_i32(a7);
+    let a8 = b.frag8(a0, a1, a2, a3, a4, a5, a6, a7);
+
+    let k0 = b.load_f32(kt_base, 0);
+    let k0 = b.bitcast_i32(k0);
+    let k1 = b.load_f32(kt_base, 4);
+    let k1 = b.bitcast_i32(k1);
+    let k2 = b.load_f32(kt_base, 8);
+    let k2 = b.bitcast_i32(k2);
+    let k3 = b.load_f32(kt_base, 12);
+    let k3 = b.bitcast_i32(k3);
+    let k4 = b.load_f32(kt_base, 16);
+    let k4 = b.bitcast_i32(k4);
+    let k5 = b.load_f32(kt_base, 20);
+    let k5 = b.bitcast_i32(k5);
+    let k6 = b.load_f32(kt_base, 24);
+    let k6 = b.bitcast_i32(k6);
+    let k7 = b.load_f32(kt_base, 28);
+    let k7 = b.bitcast_i32(k7);
+    let k8 = b.frag8(k0, k1, k2, k3, k4, k5, k6, k7);
+
+    let tid4 = b.mul_i32(tid, c4);
+    let sa_off = b.add_i32(tid4, c4096);
+    let sa_ptr = b.ptr_add(o, sa_off);
+    let sa_f = b.load_f32(sa_ptr, 0);
+    let sa = b.bitcast_i32(sa_f);
+    let sb_off = b.add_i32(tid4, c4352);
+    let sb_ptr = b.ptr_add(o, sb_off);
+    let sb_f = b.load_f32(sb_ptr, 0);
+    let sb = b.bitcast_i32(sb_f);
+
+    let zero = b.frag_zero(DType::Frag16);
+    let s_frag = b.mfma_scale_fp8(a8, k8, zero, sa, sb);
+
+    // ---- phase 2: store S to LDS, row softmax ----
+    let j4 = b.mul_i32(j, c4);
+    let p512 = b.shl_i32(pblk, c9);
+    let lds_base = b.add_i32(j4, p512);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as i32;
+        let lane = b.frag16_lane(s_frag, r);
+        let coff = b.c_i32(i_const * 128);
+        let addr = b.add_i32(lds_base, coff);
+        b.store_lds_b32(Opnd::Val(addr), Opnd::Val(lane));
+    }
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    let rbase = b.mul_i32(j, c128);
+    let mut vals: Vec<ValueId> = Vec::with_capacity(32);
+    for k in 0..32u32 {
+        let coff = b.c_i32(4 * k as i32);
+        let addr = b.add_i32(rbase, coff);
+        let raw = b.load_lds_b32(Opnd::Val(addr));
+        vals.push(b.bitcast_f32(raw));
+    }
+    b.wait_lds(0);
+
+    let mut vmax = vals[0];
+    for k in 1..32usize {
+        vmax = b.max_f32(vmax, vals[k]);
+    }
+    let mut exps: Vec<ValueId> = Vec::with_capacity(32);
+    for k in 0..32usize {
+        let shifted = b.sub_f32(vals[k], vmax);
+        exps.push(b.exp_f32(shifted));
+    }
+    let mut total = exps[0];
+    for k in 1..32usize {
+        total = b.add_f32(total, exps[k]);
+    }
+    let inv = b.rcp_f32(total);
+
+    // ---- phase 3: quantise the probabilities to fp8 (values scaled by 16) ----
+    let c16f = b.c_f32(16.0);
+    let mut quant: Vec<ValueId> = Vec::with_capacity(32);
+    for k in 0..32usize {
+        let p = b.mul_f32(exps[k], inv);
+        quant.push(b.mul_f32(p, c16f));
+    }
+    let mut pairs: Vec<ValueId> = Vec::with_capacity(16);
+    for m in 0..16usize {
+        pairs.push(b.cvt_pk_fp8_f32(quant[2 * m], quant[2 * m + 1]));
+    }
+    let mut words: Vec<ValueId> = Vec::with_capacity(8);
+    for m in 0..8usize {
+        let hi = b.shl_i32(pairs[2 * m + 1], c16i);
+        words.push(b.add_i32(pairs[2 * m], hi));
+    }
+
+    // Store the quantised bytes for the host reference.
+    let prow = b.mul_i32(j, c32);
+    let p_off = b.add_i32(prow, c10752);
+    let p_ptr = b.ptr_add(o, p_off);
+    for m in 0..8usize {
+        let v = b.bitcast_f32(words[m]);
+        b.store_f32(p_ptr, 4 * m as u32, v);
+    }
+
+    // ---- phase 4: PV via the same block-scaled MFMA ----
+    let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    let v0 = b.load_f32(v_base, 0);
+    let v0 = b.bitcast_i32(v0);
+    let v1 = b.load_f32(v_base, 4);
+    let v1 = b.bitcast_i32(v1);
+    let v2 = b.load_f32(v_base, 8);
+    let v2 = b.bitcast_i32(v2);
+    let v3 = b.load_f32(v_base, 12);
+    let v3 = b.bitcast_i32(v3);
+    let v4 = b.load_f32(v_base, 16);
+    let v4 = b.bitcast_i32(v4);
+    let v5 = b.load_f32(v_base, 20);
+    let v5 = b.bitcast_i32(v5);
+    let v6 = b.load_f32(v_base, 24);
+    let v6 = b.bitcast_i32(v6);
+    let v7 = b.load_f32(v_base, 28);
+    let v7 = b.bitcast_i32(v7);
+    let v8 = b.frag8(v0, v1, v2, v3, v4, v5, v6, v7);
+
+    let sc = b.c_i32(127);
+    let zero2 = b.frag_zero(DType::Frag16);
+    let o_frag = b.mfma_scale_fp8(p8, v8, zero2, sc, sc);
+
+    let lane_off = b.add_i32(j4, p512);
+    let out_dyn = b.add_i32(lane_off, c6656);
+    let out_ptr = b.ptr_add(o, out_dyn);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as u32;
+        let lane = b.frag16_lane(o_frag, r);
+        let v = b.bitcast_f32(lane);
+        b.store_f32(out_ptr, i_const * 128, v);
+    }
+    b.finish()
+}
