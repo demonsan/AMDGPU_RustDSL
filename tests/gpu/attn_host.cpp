@@ -157,7 +157,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fp8_fmha_tr") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_trab") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_hd128") == 0 ||
-                             std::strcmp(kern, "probe_fp8_fmha_hd128b") == 0;
+                             std::strcmp(kern, "probe_fp8_fmha_hd128b") == 0 ||
+                             std::strcmp(kern, "probe_fp8_fmha_hd128c") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -406,6 +407,29 @@ int main(int argc, char** argv) {
             for (int l = 0; l < 64; ++l) in[70144 + 256 * q + l * 4] = (unsigned char)(126 + next_rand() % 3);
         CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
         std::printf("[harness] hd128 inputs filled\n");
+    }    if (std::strcmp(kern, "probe_fp8_fmha_hd128c") == 0) {
+        std::vector<unsigned char> in(102912, 0);
+        unsigned int seed = 424242u;
+        auto next_rand = [&seed]() {
+            seed = seed * 1664525u + 1013904223u;
+            return (seed >> 16) & 0xFFu;
+        };
+        static const unsigned char palette[9] = {0x00, 0x28, 0x30, 0x38, 0x3C, 0x40, 0x44, 0xB8, 0xC0};
+        for (int w = 0; w < 8; ++w)
+            for (int i = 0; i < 32; ++i)
+                for (int k = 0; k < 128; ++k) in[4096 * w + i * 128 + k] = palette[next_rand() % 9];
+        for (int t = 0; t < 8; ++t)
+            for (int i = 0; i < 32; ++i)
+                for (int k = 0; k < 128; ++k) in[32768 + 4096 * t + i * 128 + k] = palette[next_rand() % 9];
+        for (int it = 0; it < 2; ++it)
+            for (int c = 0; c < 128; ++c)
+                for (int d = 0; d < 128; ++d) in[65536 + 16384 * it + c * 128 + d] = palette[next_rand() % 9];
+        for (int c = 0; c < 2; ++c)
+            for (int l = 0; l < 64; ++l) in[98304 + 256 * c + l * 4] = (unsigned char)(126 + next_rand() % 3);
+        for (int q = 0; q < 16; ++q)
+            for (int l = 0; l < 64; ++l) in[98816 + 256 * q + l * 4] = (unsigned char)(126 + next_rand() % 3);
+        CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
+        std::printf("[harness] hd128c inputs filled\n");
     }    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, (unsigned)BLOCK, 1, 1, 0, nullptr, launch_params,
                              nullptr));
     CK(hipDeviceSynchronize());
@@ -633,7 +657,65 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
-    if (std::strcmp(kern, "probe_fp8_fmha_hd128b") == 0) {
+    if (std::strcmp(kern, "probe_fp8_fmha_hd128c") == 0) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        int bad = 0;
+        int wbad[8] = {0};
+        double worst = 0.0;
+        static double S5[32][256];
+        for (int w = 0; w < 8; ++w) {
+            for (int t = 0; t < 8; ++t)
+                for (int i = 0; i < 32; ++i)
+                    for (int jj = 0; jj < 32; ++jj) {
+                        double acc = 0.0;
+                        for (int c = 0; c < 2; ++c)
+                            for (int k = 0; k < 64; ++k) {
+                                const int g = ((k % 32) / 16) % 2;
+                                const double sa_v = std::ldexp(1.0, (int)raw[98304 + 256 * c + (i + 32 * g) * 4] - 127);
+                                const double sb_v = std::ldexp(1.0, (int)raw[98816 + 256 * (2 * t + c) + (jj + 32 * g) * 4] - 127);
+                                acc += fp8_e4m3(raw[4096 * w + i * 128 + 64 * c + k]) *
+                                       fp8_e4m3(raw[32768 + 4096 * t + jj * 128 + 64 * c + k]) * sa_v * sb_v;
+                            }
+                        S5[i][t * 32 + jj] = acc;
+                    }
+            const float* outv = reinterpret_cast<const float*>(raw + 102912 + 16384 * w);
+            for (int i = 0; i < 32; ++i) {
+                double m = -1e30, l = 0.0, oacc[128];
+                for (int d = 0; d < 128; ++d) oacc[d] = 0.0;
+                for (int sub = 0; sub < 4; ++sub) {
+                    const int it = sub / 2, hh = sub % 2;
+                    double tmax = -1e30;
+                    for (int c = 0; c < 64; ++c) tmax = std::max(tmax, S5[i][64 * sub + c]);
+                    const double mn = std::max(m, tmax);
+                    const double corr = std::exp(m - mn);
+                    double rs = 0.0;
+                    for (int c = 0; c < 64; ++c) rs += std::exp(S5[i][64 * sub + c] - mn);
+                    l = l * corr + rs;
+                    for (int d = 0; d < 128; ++d) {
+                        double pv = 0.0;
+                        for (int c = 0; c < 64; ++c)
+                            pv += fp8_e4m3(raw[233984 + 8192 * w + 2048 * sub + 64 * i + c]) / 16.0 *
+                                  fp8_e4m3(raw[65536 + 16384 * it + (64 * hh + c) * 128 + d]);
+                        oacc[d] = oacc[d] * corr + pv;
+                    }
+                    m = mn;
+                }
+                for (int d = 0; d < 128; ++d) {
+                    const double ref = oacc[d] / l;
+                    const double gotv = outv[i * 128 + d];
+                    worst = std::max(worst, std::fabs(gotv - ref));
+                    if (std::fabs(gotv - ref) > 2e-3 + 2e-3 * std::fabs(ref)) {
+                        if (bad < 6) std::fprintf(stderr, "hd128c w=%d O[%d][%d] want %.6f got %.6f\n", w, i, d, ref, gotv);
+                        ++bad; ++wbad[w];
+                    }
+                }
+            }
+        }
+        std::printf("  per-wave bad:"); for (int w = 0; w < 8; ++w) std::printf(" %d", wbad[w]); std::printf("\n");
+        std::printf("  fmha_hd128c bad=%d worst_vs_emulated=%.3e\n", bad, worst);
+        std::printf(bad ? "PROBE_FMHA_HD128C_FAIL\n" : "PROBE_FMHA_HD128C_OK\n");
+        return bad != 0;
+    }    if (std::strcmp(kern, "probe_fp8_fmha_hd128b") == 0) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         static double S5[32][256];
         for (int t = 0; t < 8; ++t)
