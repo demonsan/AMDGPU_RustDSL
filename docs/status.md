@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **ABI-compatible `fmha_fwd_hd128_mxfp8`** | our kernel launched with the vendor kernel's 656-byte kernarg on BSHD fp8 Q/K/V, E8M0 1x32 descales and a BF16 output; `exp2` softmax; **every output element agrees with a double-precision CPU model (mean error 1.2-1.7e-3, better than the vendor kernel's own 1.8-2.8e-3) and with the vendor kernel (mean difference 2.5-2.8e-3, worst 0.10) on 6 shapes up to B=3 H=3 S=768 SK=1280 and 2M outputs**; bit-identical to the vendor kernel when Q = 0 (`REF_KERNEL_OK`) |
 | **512-thread hd128 attention, LDS-staged K/V, A/B role loops** | `probe_fp8_fmha_hd128c`: reference tile shapes at reference scale — eight 32-row query tiles (256 rows) per block of 512, head dim 128, KV tile 128 processed as two 64-key online-softmax substeps, K (role A, waves 0-3) and V (role B, waves 4-7) copied through shared LDS (99,456 B), K fragments by `ds_read_b128`, V fragments by `ds_read_b64_tr_b8`, separate A/B steady loops with the same barrier schedule, four register-resident O accumulators; **224 VGPRs** (reference 246); all 8 waves match the host emulation (`1.8e-4`) -> `PROBE_FMHA_HD128C_OK` |
 | **head dim 128, KV tile 128** | `probe_fp8_fmha_hd128`: reference tile shapes — Q 32x128, four 32-key score tiles per iteration each the sum of two chained K=64 scaled MFMAs, two-pass 128-wide softmax, eight PV MFMAs (two 64-key halves x four 32-wide output tiles) with V through `ds_read_b64_tr_b8` at pitch 128, four register-resident O accumulators; 240 VGPRs (reference 246); `worst_err = 4.3e-7` vs the host emulation -> `PROBE_FMHA_HD128_OK` |
 | **512-thread tr + A/B role-split attention** | `probe_fp8_fmha_trab`: eight query tiles in one block of 512, V double-buffered in shared LDS and copied half by role A (waves 0-3) and half by role B (waves 4-7) with their own steady loops and identical barrier schedule, V consumed with `ds_read_b64_tr_b8`, 64 keys per iteration, register-resident O; all 8 waves match the host emulation (`1.8e-4`) -> `PROBE_FMHA_TRAB_OK` |
@@ -479,6 +480,39 @@ reproduced exactly (`PROBE_MATMUL_BLK_OK`).
 
 Next: an ABI-compatible kernel built on these layouts, compared element by element with the vendor
 output on identical inputs.
+
+## ABI-compatible kernel validated against the vendor kernel (round 30)
+
+`fmha_fwd_hd128_mxfp8` (in `kernels.rs`) takes exactly the vendor kernel's 656-byte kernarg and
+layouts and is run next to the vendor `fwd_hd128_mxfp8.co` on identical random inputs by
+`tests/gpu/run_ref.sh` (`REF_CO=<vendor .co> bash tests/gpu/run_ref.sh`). New DSL pieces: `exp2_f32`
+(the hardware `v_exp_f32`, no log2e scaling), `cvt_pk_bf16_f32` (`v_cvt_pk_bf16_f32`), and the
+kernarg / workgroup-id plumbing for runtime strides. The scale recipe from round 29 is used as is:
+Q/K fragments in the permuted K order and `descale_dword >> (16 c + 8 g)` as the per-lane scale.
+
+Results on gfx950 (random fp8 data, random 126..128 E8M0 descales, per-tensor V descale 1.0; `REF_ROWS`
+rows per head checked against the CPU model, all outputs compared against the vendor kernel):
+
+| shape B,H,S,SK | ours vs CPU (mean / worst) | vendor vs CPU (mean / worst) | ours vs vendor (mean / worst, all outputs) |
+|---|---|---|---|
+| 1,1,256,256 | 1.3e-3 / 1.8e-2 | 2.2e-3 / 2.4e-2 | 2.5e-3 / 6.6e-2 |
+| 1,2,512,512 | 1.1e-3 / 2.6e-2 | 1.8e-3 / 5.4e-2 | 2.8e-3 / 7.5e-2 |
+| 2,4,1024,1024 | 1.7e-3 / 3.9e-2 | 2.4e-3 / 3.7e-2 | 2.7e-3 / 8.1e-2 |
+| 1,8,2048,2048 | 1.7e-3 / 3.9e-2 | 2.8e-3 / 4.3e-2 | 2.8e-3 / 9.8e-2 |
+| 1,2,512,2048 | 1.3e-3 / 3.7e-2 | 2.4e-3 / 3.7e-2 | 2.8e-3 / 7.5e-2 |
+| 3,3,768,1280 | 1.2e-3 / 4.0e-2 | 2.3e-3 / 4.1e-2 | 2.7e-3 / 8.2e-2 |
+
+With Q = 0 the two kernels' outputs are bit-identical on all 131072 outputs. The remaining
+differences are the fp8 rounding of P (we quantise `P * 16`, the vendor kernel its own way), which is
+why both kernels sit about 1-3e-3 from the exact model and ~3e-3 from each other.
+
+Performance, honestly (`REF_ITERS=20`): the vendor kernel runs the 2048x2048, 8-head problem in 0.033 ms
+(about 518 TFLOP/s); ours takes 1.14 ms (15 TFLOP/s), i.e. **~34x slower**. Our loop is not software
+pipelined (K/V staging, S stores, softmax and PV are serialised by barriers), the softmax goes through
+LDS one row per lane, and there is no overlap between the roles. Closing that gap is the remaining
+work on the way to a 1:1 core loop.
+
+Limits of this version: `S` a multiple of 256, `kv_seq_len` a multiple of 128, GQA ratio 1, no LSE.
 
 ## Next: FMHA reference core loop
 
