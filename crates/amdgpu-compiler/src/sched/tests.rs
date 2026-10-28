@@ -14,6 +14,7 @@ fn func(vregs: &[RClass], insts: Vec<MInst>) -> MFunction {
         vregs: vregs.to_vec(),
         loops: vec![],
         alias: HashMap::new(),
+        elide_fallthrough: false,
     }
 }
 
@@ -204,5 +205,171 @@ fn every_kernel_schedules_and_verifies() {
         o.reorder = false;
         run(&mut mm, &o).unwrap_or_else(|e| panic!("{name} rewait: {e}"));
         let _ = &mut m;
+    }
+}
+
+// ---- software pipelining: GPU-free semantic check with a tiny MIR interpreter (V1 integer subset) ----
+
+fn interp(m: &MFunction, n_val: u32) -> (u32, u32) {
+    let mut val: HashMap<VReg, u32> = HashMap::new();
+    let mut vcc = false;
+    let get = |val: &HashMap<VReg, u32>, s: &Src| -> u32 {
+        match s {
+            Src::Imm(i) => *i as u32,
+            Src::Reg(r) => *val.get(r).unwrap_or(&0),
+        }
+    };
+    let mut bi = 0usize;
+    for _ in 0..100_000 {
+        let b = &m.blocks[bi];
+        for i in &b.insts {
+            let s = |k: usize| get(&val, &i.srcs[k]);
+            let r = match i.op {
+                MOp::VMovB32 => Some(if i.srcs.is_empty() { i.imm as u32 } else { s(0) }),
+                MOp::VMovFromS => Some(n_val),
+                MOp::VAddU32 => Some(s(0).wrapping_add(s(1))),
+                MOp::VMulLoU32 => Some(s(0).wrapping_mul(s(1))),
+                MOp::VXorB32 => Some(s(0) ^ s(1)),
+                MOp::VAndB32 => Some(s(0) & s(1)),
+                MOp::VLshrB32 => Some(s(1) >> (s(0) & 31)),
+                MOp::VCmpLtI32 => {
+                    vcc = (s(0) as i32) < (s(1) as i32);
+                    None
+                }
+                MOp::VCmpGeI32 => {
+                    vcc = (s(0) as i32) >= (s(1) as i32);
+                    None
+                }
+                MOp::VCmpNeI32 => {
+                    vcc = s(0) != s(1);
+                    None
+                }
+                MOp::VCndmask => Some(if vcc { s(1) } else { s(0) }),
+                other => panic!("interp: unsupported {other:?}"),
+            };
+            if let (Some(d), Some(x)) = (i.dst, r) {
+                val.insert(d, x);
+            }
+        }
+        let next = |l: u32| m.blocks.iter().position(|x| x.label == l).unwrap();
+        match &b.term {
+            Term::Goto(t) => bi = next(*t),
+            Term::CondGoto { on, target, fall } => {
+                let taken = match on {
+                    Pred::Vccnz => vcc,
+                    Pred::Vccz => !vcc,
+                    _ => panic!("pred"),
+                };
+                bi = next(if taken { *target } else { *fall });
+            }
+            Term::Endpgm => return (val[&1], val[&0]),
+        }
+    }
+    panic!("interp: no termination");
+}
+
+fn counted_loop() -> MFunction {
+    let vregs = vec![
+        RClass::V1, // 0 it
+        RClass::V1, // 1 acc
+        RClass::S1, // 2 n
+        RClass::V1, // 3 one
+        RClass::V1, // 4 it_next
+        RClass::V1, // 5 nreg
+        RClass::V1, // 6 t1
+        RClass::V1, // 7 t2
+        RClass::V1, // 8 t3
+        RClass::V1, // 9 c3
+    ];
+    let mut pre = Block::new(0);
+    pre.insts = vec![MInst::new(MOp::VMovB32).def(0).imm(0), MInst::new(MOp::VMovB32).def(1).imm(0)];
+    pre.term = Term::Goto(1);
+    let mut h = Block::new(1);
+    h.insts = vec![
+        MInst::new(MOp::VMovB32).def(9).imm(3),
+        MInst::new(MOp::VMulLoU32).def(6).srcreg(0).srcreg(9),
+        MInst::new(MOp::VAddU32).def(7).srcreg(6).src(Src::Imm(7)),
+        MInst::new(MOp::VMulLoU32).def(8).srcreg(7).srcreg(7),
+        MInst::new(MOp::VAddU32).def(1).srcreg(1).srcreg(8),
+        MInst::new(MOp::VMovB32).def(3).imm(1),
+        MInst::new(MOp::VAddU32).def(4).srcreg(0).srcreg(3),
+        MInst::new(MOp::VMovB32).def(0).srcreg(4),
+        MInst::new(MOp::VMovFromS).def(5).srcreg(2),
+        MInst::new(MOp::VCmpLtI32).srcreg(4).srcreg(5),
+    ];
+    h.term = Term::CondGoto { on: Pred::Vccnz, target: 1, fall: 2 };
+    let mut x = Block::new(2);
+    x.term = Term::Endpgm;
+    MFunction {
+        name: "t".into(),
+        args: vec![],
+        kernarg_size: 0,
+        workgroup_size: 64,
+        lds_bytes: 0,
+        blocks: vec![pre, h, x],
+        vregs,
+        loops: vec![(1, 1)],
+        alias: HashMap::new(),
+        elide_fallthrough: false,
+    }
+}
+
+#[test]
+fn swp_matches_plain_loop_for_all_trip_counts_and_cuts() {
+    let m = counted_loop();
+    let li = swp::analyze(&m, 1).expect("canonical loop");
+    let nb = li.body.len();
+    let live_after: std::collections::HashSet<VReg> = [0u32, 1].into_iter().collect();
+    for k in 1..nb {
+        let p = swp::apply(&m, &li, k, &live_after).expect("apply");
+        for n in 0..14u32 {
+            assert_eq!(interp(&m, n), interp(&p, n), "cut {k} n {n}");
+        }
+    }
+}
+
+#[test]
+fn taildup_preserves_semantics_in_interpreter() {
+    // diamond inside a counted loop: odd iterations add t, even iterations xor; join accumulates
+    let mut m = counted_loop();
+    // split H: [.. it update + cmp] stays; insert arms: simplest check is the pure transformation on a hand-built diamond
+    m.vregs.push(RClass::V1); // 10
+    let mut a = Block::new(10);
+    a.insts = vec![MInst::new(MOp::VAddU32).def(1).srcreg(1).srcreg(0)];
+    a.term = Term::Goto(12);
+    let mut b = Block::new(11);
+    b.insts = vec![MInst::new(MOp::VXorB32).def(1).srcreg(1).srcreg(0)];
+    b.term = Term::Goto(12);
+    let mut j = Block::new(12);
+    j.insts = vec![
+        MInst::new(MOp::VAddU32).def(1).srcreg(1).src(Src::Imm(5)),
+        MInst::new(MOp::VMovB32).def(3).imm(1),
+        MInst::new(MOp::VAddU32).def(4).srcreg(0).srcreg(3),
+        MInst::new(MOp::VMovB32).def(0).srcreg(4),
+        MInst::new(MOp::VMovFromS).def(5).srcreg(2),
+        MInst::new(MOp::VCmpLtI32).srcreg(4).srcreg(5),
+    ];
+    j.term = Term::CondGoto { on: Pred::Vccnz, target: 1, fall: 2 };
+    let mut h = Block::new(1);
+    h.insts = vec![MInst::new(MOp::VAndB32).def(6).srcreg(0).src(Src::Imm(1)), MInst::new(MOp::VCmpNeI32).src(Src::Imm(0)).srcreg(6)];
+    h.term = Term::CondGoto { on: Pred::Vccnz, target: 10, fall: 11 };
+    let mut pre = Block::new(0);
+    pre.insts = vec![MInst::new(MOp::VMovB32).def(0).imm(0), MInst::new(MOp::VMovB32).def(1).imm(0)];
+    pre.term = Term::Goto(1);
+    let mut x = Block::new(2);
+    x.term = Term::Endpgm;
+    m.blocks = vec![pre, h, a, b, j, x];
+    m.loops = vec![(1, 12)];
+    let base: Vec<(u32, u32)> = (0..10).map(|n| interp(&m, n)).collect();
+    // tail-duplicate k instructions of the join into both arms (blocks index 2,3 <- 4)
+    for k in 1..=6 {
+        let mut c = m.clone();
+        let pre: Vec<MInst> = c.blocks[4].insts[..k].to_vec();
+        c.blocks[2].insts.extend(pre.iter().cloned());
+        c.blocks[3].insts.extend(pre);
+        c.blocks[4].insts.drain(..k);
+        for n in 0..10 {
+            assert_eq!(interp(&c, n), base[n as usize], "k {k} n {n}");
+        }
     }
 }

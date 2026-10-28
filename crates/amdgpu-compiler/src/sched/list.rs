@@ -149,6 +149,9 @@ pub fn schedule(
     let mut height = vec![0u32; n];
     for i in (0..n).rev() {
         let mut h = costs[i].latency;
+        if g.term_vcc_writer == Some(i) {
+            h = h.max(model::VCC_TO_BRANCH + 8);
+        }
         for &(s, lat) in &g.succs[i] {
             h = h.max(lat + height[s]);
         }
@@ -239,10 +242,12 @@ pub fn schedule_best(
     live_in: &HashSet<VReg>,
     live_out: &HashSet<VReg>,
     limit: i64,
+    fast: bool,
 ) -> ListResult {
     let mut best: Option<ListResult> = None;
     let mut first: Option<ListResult> = None;
-    for w in [usize::MAX, 400, 200, 100, 50, 25] {
+    let windows: &[usize] = if fast { &[usize::MAX, 100] } else { &[usize::MAX, 400, 200, 100, 50, 25] };
+    for &w in windows {
         let r = schedule(m, insts, g, live_in, live_out, limit, w);
         if r.peak_after <= r.limit_eff && best.as_ref().map_or(true, |b| r.est_after < b.est_after) {
             best = Some(ListResult { perm: r.perm.clone(), ..r });

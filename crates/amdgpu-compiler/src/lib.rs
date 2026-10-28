@@ -26,6 +26,11 @@ pub fn compile_with(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend) -
     Ok(Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }
 
+/// The final (allocated, scheduled, hazard-padded) MIR of a kernel, for model reports.
+pub fn compile_mir(f: &amdgpu_dsl::Function) -> Result<mir::MFunction, String> {
+    lower_and_allocate(f).map(|(m, _)| m)
+}
+
 /// lower -> [schedule] -> hazards -> verify -> register allocation. With the scheduler enabled
 /// (`sched::Options::from_env`) a result that does not fit the register file is retried with a
 /// lower pressure limit and finally with the unscheduled code.
@@ -77,7 +82,7 @@ pub fn export_mir(f: &amdgpu_dsl::Function, tail: &backend::LlvmTail) -> Result<
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
-    &["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t"]
+    &["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t", "sched_valu_mul", "sched_valu_max3", "sched_valu_exp", "sched_mfma_chain", "sched_mfma_valu16", "sched_mfma_valu4", "sched_diamond"]
 }
 
 pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
@@ -123,6 +128,13 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_fp8_matmul_blk" => Some(amdgpu_dsl::kernels::probe_fp8_matmul_blk()),
         "fmha_fwd_hd128_mxfp8" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8()),
         "fmha_fwd_hd128_mxfp8_t" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_t()),
+        "sched_valu_mul" => Some(amdgpu_dsl::kernels::sched_valu_mul()),
+        "sched_valu_max3" => Some(amdgpu_dsl::kernels::sched_valu_max3()),
+        "sched_valu_exp" => Some(amdgpu_dsl::kernels::sched_valu_exp()),
+        "sched_mfma_chain" => Some(amdgpu_dsl::kernels::sched_mfma_chain()),
+        "sched_mfma_valu16" => Some(amdgpu_dsl::kernels::sched_mfma_valu16()),
+        "sched_mfma_valu4" => Some(amdgpu_dsl::kernels::sched_mfma_valu4()),
+        "sched_diamond" => Some(amdgpu_dsl::kernels::sched_diamond()),
         _ => None,
     }
 }

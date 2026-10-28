@@ -8,12 +8,16 @@
 //! 3. re-inserts waits from a whole-function scoreboard over the final order.
 //! Default OFF (`--sched` / `AMDC_SCHED=1`).
 
+pub mod cfg;
 pub mod depgraph;
 pub mod effects;
 pub mod list;
 pub mod liveness;
 pub mod model;
 pub mod order;
+pub mod sim;
+pub mod swp;
+pub mod taildup;
 pub mod verify;
 pub mod waits;
 
@@ -29,6 +33,14 @@ pub struct Options {
     pub xbar_only: Option<usize>,
     /// Debug: full-drain waits only.
     pub drain_only: bool,
+    /// Software-pipeline eligible counted loops (stage 3).
+    pub swp: bool,
+    /// Cheaper scheduling (fewer windows): used while evaluating transformation candidates.
+    pub fast: bool,
+    /// Tail-duplicate join prefixes into the arms of if/else diamonds inside loops (stage 2).
+    pub taildup: bool,
+    /// Remove empty latch blocks / elide fall-through branches (default on with the scheduler).
+    pub cfg_cleanup: bool,
     /// Debug bisect: schedule only this block index.
     pub only_block: Option<Vec<usize>>,
     /// Pressure limit in VGPR dwords (never below the original peak of the block).
@@ -40,7 +52,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, only_block: None, max_vgprs: 240, verify: true, stats: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false }
     }
 }
 
@@ -60,6 +72,9 @@ impl Options {
                     "noverify" => o.verify = false,
                     "stats" => o.stats = true,
                     "drain" => o.drain_only = true,
+                    "nocfg" => o.cfg_cleanup = false,
+                    "swp" => o.swp = true,
+                    "taildup" => o.taildup = true,
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
@@ -86,6 +101,7 @@ pub struct Stats {
     pub scheduled: usize,
     pub skipped: usize,
     pub moved: usize,
+    pub swp_loops: usize,
     pub waits_inserted: usize,
     pub est_before: u64,
     pub est_after: u64,
@@ -97,12 +113,12 @@ fn apply_perm(insts: &[MInst], perm: &[usize]) -> Vec<MInst> {
     perm.iter().map(|&k| insts[k].clone()).collect()
 }
 
-/// Run the scheduling pass over the whole function.
-pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
-    let mut stats = Stats::default();
-    waits::DRAIN_ONLY.store(o.drain_only, std::sync::atomic::Ordering::Relaxed);
-    waits::strip_auto_waits(m);
-    if o.reorder {
+
+/// Reorder every basic block with the list scheduler (verified).
+pub(crate) fn schedule_blocks(m: &mut MFunction, o: &Options, stats: &mut Stats) -> Result<(), String> {
+    if !o.reorder {
+        return Ok(());
+    }
         let lv = liveness::compute(m);
         for bi in 0..m.blocks.len() {
             stats.blocks += 1;
@@ -118,7 +134,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
             let term = m.blocks[bi].term.clone();
             let xb = o.alu_across_barrier || o.xbar_only == Some(bi);
             let g = depgraph::build(m, &insts, &term, xb);
-            let r = list::schedule_best(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], o.max_vgprs as i64);
+            let r = list::schedule_best(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], o.max_vgprs as i64, o.fast);
             if o.verify {
                 verify::check_perm(m, &insts, &r.perm, &term, xb)
                     .map_err(|e| format!("schedule verification failed in block {bi}: {e}"))?;
@@ -131,7 +147,36 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
             stats.peak_after = stats.peak_after.max(r.peak_after);
             m.blocks[bi].insts = apply_perm(&insts, &r.perm);
         }
+    Ok(())
+}
+
+/// Run the scheduling pass over the whole function.
+pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
+    let mut stats = Stats::default();
+    if o.cfg_cleanup {
+        cfg::cleanup(m);
     }
+    waits::DRAIN_ONLY.store(o.drain_only, std::sync::atomic::Ordering::Relaxed);
+    waits::strip_auto_waits(m);
+    cfg::dce_dead_selects(m);
+    if o.taildup {
+        let st = taildup::run(m, o);
+        if o.stats {
+            for l in &st.log {
+                eprintln!("taildup: {l}");
+            }
+        }
+    }
+    if o.swp {
+        let st = swp::run(m, o);
+        stats.swp_loops = st.loops_pipelined;
+        if o.stats {
+            for l in &st.log {
+                eprintln!("swp: {l}");
+            }
+        }
+    }
+    schedule_blocks(m, o, &mut stats)?;
     stats.waits_inserted = waits::insert_waits(m);
     if o.verify {
         waits::verify_waits(m).map_err(|e| format!("wait verification failed: {e}"))?;

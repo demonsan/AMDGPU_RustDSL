@@ -39,14 +39,31 @@ pub enum Grade {
 #[derive(Clone, Copy, Debug)]
 pub struct OpCost {
     pub pipe: Pipe,
+    /// Cycles the *wave* cannot issue another instruction of this pipe.
     pub issue: u32,
+    /// Cycles the SIMD-shared unit is busy (what a second wave on the SIMD competes for).
+    pub occ: u32,
     pub latency: u32,
     pub grade: Grade,
 }
 
 const fn c(pipe: Pipe, issue: u32, latency: u32, grade: Grade) -> OpCost {
-    OpCost { pipe, issue, latency, grade }
+    OpCost { pipe, issue, occ: issue, latency, grade }
 }
+
+const fn co(pipe: Pipe, issue: u32, occ: u32, latency: u32, grade: Grade) -> OpCost {
+    OpCost { pipe, issue, occ, latency, grade }
+}
+
+/// Taken branch (s_branch / taken s_cbranch) and not-taken s_cbranch cost in cycles (calibrated in docs/scheduling.md).
+/// Measured (tools/sched_mb/RESULTS2.md, 1 wave, V): taken backward s_cbranch ~24, uncond s_branch (even to the next label) ~18, not taken ~6,
+/// extra ~20 cycles from a VALU v_cmp issue to the s_cbranch_vccnz that reads it (about 5 independent VALU hide it).
+/// With >=4 waves per CU some launches show +96 per taken branch (cause unknown, not modelled).
+pub const BRANCH_TAKEN: u32 = 24;
+pub const BRANCH_UNCOND: u32 = 18;
+pub const BRANCH_NOT_TAKEN: u32 = 6;
+pub const VCC_TO_BRANCH: u32 = 16;
+pub const BARRIER_COST: u32 = 12;
 
 /// Global model knobs (also data): whether `v_exp`/`v_rcp` run on their own pipe next to the VALU.
 pub struct ModelParams {
@@ -64,7 +81,8 @@ pub fn cost(op: MOp) -> OpCost {
     // grade V = 3 repetitions within 5%, E = experimental. See docs/scheduling.md.
     match op {
         // VALU: one wave issues one wave64 VALU every 4 cycles, dependent or not (V).
-        VMovB32 | VMovFromS | VReadPhys | VAddU32 | VAddF32 | VSubF32 | VMulF32 | VMaxF32 | VMax3F32 | VFmaF32
+        VMovB32 | VAddF32 | VSubF32 | VMulF32 | VFmaF32 => co(Valu, 4, 2, 4, Verified),
+        VMovFromS | VReadPhys | VAddU32 | VMaxF32 | VMax3F32
         | VAndB32 | VOrB32 | VXorB32 | VLshrB32 | VLshlB32 | VCvtPknormU16 | VCvtPkBf16F32 | VCvtF32F16
         | VCvtF16F32 | VCndmask | VReadSub | VWriteSub | VCmpLtI32 | VCmpGeI32 | VCmpNeI32 | VCmpLtF32
         | VAddCoU32 | VAddcCoU32 | VPkAddF32 | VPkMulF32 => c(Valu, 4, 4, Verified),

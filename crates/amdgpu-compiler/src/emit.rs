@@ -18,7 +18,8 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str(&format!(".type {},@function\n", m.name));
     out.push_str(&format!("{}:\n", m.name));
 
-    for b in &m.blocks {
+    for (bi, b) in m.blocks.iter().enumerate() {
+        let next_label = m.blocks.get(bi + 1).map(|n| n.label);
         out.push_str(&format!("BB{}:\n", b.label));
         for inst in &b.insts {
             for line in inst_lines(a, inst) {
@@ -28,10 +29,16 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
             }
         }
         match &b.term {
-            Term::Goto(t) => out.push_str(&format!("    s_branch BB{t}\n")),
+            Term::Goto(t) => {
+                if !(m.elide_fallthrough && next_label == Some(*t)) {
+                    out.push_str(&format!("    s_branch BB{t}\n"))
+                }
+            }
             Term::CondGoto { on, target, fall } => {
                 out.push_str(&format!("    {} BB{}\n", pred_mnemonic(*on), target));
-                out.push_str(&format!("    s_branch BB{fall}\n"));
+                if !(m.elide_fallthrough && next_label == Some(*fall)) {
+                    out.push_str(&format!("    s_branch BB{fall}\n"));
+                }
             }
             Term::Endpgm => out.push_str("    s_endpgm\n"),
         }

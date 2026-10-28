@@ -7368,3 +7368,226 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     b.end_if();
     b.finish()
 }
+
+// ---------------------------------------------------------------------------------------------
+// sched_* microkernels: small loops with a runtime trip count `n` (kernarg offset 8) used to compare
+// the scheduler's machine model with hardware and to exercise cross-block / cross-iteration
+// scheduling (docs/scheduling.md). Output: per-thread results at o[tid * 64 ..].
+// ---------------------------------------------------------------------------------------------
+
+fn sched_begin(name: &str) -> (FnBuilder, ValueId, ValueId, ValueId) {
+    let mut b = FnBuilder::new(name, 512);
+    b.lds(16384);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("count", DType::I32, 8, 4);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let n = b.let_(Op::KernargI32 { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    (b, o, n, tid)
+}
+
+/// Close a counted loop: it += 1; break unless it < n.
+fn sched_end_loop(b: &mut FnBuilder, it: VarId, n: ValueId) {
+    let c1 = b.c_i32(1);
+    let it_next = b.add_i32(it, c1);
+    b.set_var(it, it_next);
+    let more = b.cmp_lt_i32(it_next, n);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+}
+
+/// 16 independent chains of one VALU op per iteration. kind: 0 = v_mul_f32, 1 = v_max3_f32, 2 = v_exp_f32.
+fn sched_valu_kernel(name: &str, kind: u32) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c64 = b.c_i32(64);
+    let step = b.c_f32(1.0001);
+    let step_i = b.bitcast_i32(step);
+    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0))];
+    for k in 0..16 {
+        let f = b.c_f32(0.5 + k as f32);
+        let fi = b.bitcast_i32(f);
+        inits.push((DType::I32, Opnd::Val(fi)));
+    }
+    let vars = b.begin_loop(&inits);
+    let it = vars[0];
+    let stepf = b.bitcast_f32(step_i);
+    for k in 0..16 {
+        let x = b.bitcast_f32(vars[1 + k]);
+        let y = match kind {
+            0 => b.mul_f32(x, stepf),
+            1 => b.max3_f32(x, stepf, stepf),
+            _ => b.exp2_f32(x),
+        };
+        let yi = b.bitcast_i32(y);
+        b.set_var(vars[1 + k], yi);
+    }
+    sched_end_loop(&mut b, it, n);
+    let off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, off);
+    for k in 0..16 {
+        let x = b.bitcast_f32(vars[1 + k]);
+        b.store_f32(row, 4 * k as u32, x);
+    }
+    b.finish()
+}
+
+pub fn sched_valu_mul() -> Function {
+    sched_valu_kernel("sched_valu_mul", 0)
+}
+pub fn sched_valu_max3() -> Function {
+    sched_valu_kernel("sched_valu_max3", 1)
+}
+pub fn sched_valu_exp() -> Function {
+    sched_valu_kernel("sched_valu_exp", 2)
+}
+
+/// In-place scaled MFMA chain, no VALU.
+pub fn sched_mfma_chain() -> Function {
+    let (mut b, o, n, tid) = sched_begin("sched_mfma_chain");
+    let c0 = b.c_i32(0);
+    let c64 = b.c_i32(64);
+    let ones = b.c_i32(0x38383838_u32 as i32);
+    let f4 = b.frag4(ones, ones, ones, ones);
+    let a8 = b.cat_frag8(f4, f4);
+    let twos = b.c_i32(0x40404040_u32 as i32);
+    let f4b = b.frag4(twos, twos, twos, twos);
+    let b8 = b.cat_frag8(f4b, f4b);
+    let zero = b.frag_zero(DType::Frag16);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::Frag16, Opnd::Val(zero))]);
+    b.var_mfma_scale(vars[1], a8, b8, 127, 127);
+    sched_end_loop(&mut b, vars[0], n);
+    let off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, off);
+    for i in 0..16u8 {
+        let l = b.frag16_lane(vars[1], i);
+        let x = b.bitcast_f32(l);
+        b.store_f32(row, 4 * i as u32, x);
+    }
+    b.finish()
+}
+
+/// Each iteration: S = A x B (zero accumulator), then a VALU post-processing chain over `lanes` of S
+/// (sub, exp2, add into a loop-carried sum). Iterations are independent apart from the sum: the
+/// MFMA of iteration i+1 can overlap the VALU work of iteration i (software pipelining target).
+fn sched_mfma_valu_kernel(name: &str, lanes: u8) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c64 = b.c_i32(64);
+    let ones = b.c_i32(0x38383838_u32 as i32);
+    let f4 = b.frag4(ones, ones, ones, ones);
+    let a8 = b.cat_frag8(f4, f4);
+    let twos = b.c_i32(0x40404040_u32 as i32);
+    let f4b = b.frag4(twos, twos, twos, twos);
+    let b8 = b.cat_frag8(f4b, f4b);
+    let zf = b.c_f32(0.0);
+    let zi = b.bitcast_i32(zf);
+    let m = b.c_f32(1.5);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(zi))]);
+    let zero = b.frag_zero(DType::Frag16);
+    let s = b.mfma_scale_fp8(a8, b8, zero, 127, 127);
+    let mut sum = b.bitcast_f32(vars[1]);
+    for r in 0..lanes {
+        let l = b.frag16_lane(s, r);
+        let v = b.bitcast_f32(l);
+        let d = b.sub_f32(v, m);
+        let e = b.exp2_f32(d);
+        sum = b.add_f32(sum, e);
+    }
+    let si = b.bitcast_i32(sum);
+    b.set_var(vars[1], si);
+    sched_end_loop(&mut b, vars[0], n);
+    let off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, off);
+    let fin = b.bitcast_f32(vars[1]);
+    b.store_f32(row, 0, fin);
+    b.finish()
+}
+
+pub fn sched_mfma_valu16() -> Function {
+    sched_mfma_valu_kernel("sched_mfma_valu16", 16)
+}
+pub fn sched_mfma_valu4() -> Function {
+    sched_mfma_valu_kernel("sched_mfma_valu4", 4)
+}
+
+/// Loop with an if/else diamond: each arm computes an MFMA and its own consumer chain; the join then does
+/// independent VALU work (a second chain on loop-carried state) that can fill the arm's MFMA latency
+/// when the join prefix is duplicated into the arms (stage 2).
+pub fn sched_diamond() -> Function {
+    let (mut b, o, n, tid) = sched_begin("sched_diamond");
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c64 = b.c_i32(64);
+    let ones = b.c_i32(0x38383838_u32 as i32);
+    let f4 = b.frag4(ones, ones, ones, ones);
+    let a8 = b.cat_frag8(f4, f4);
+    let twos = b.c_i32(0x40404040_u32 as i32);
+    let f4b = b.frag4(twos, twos, twos, twos);
+    let b8 = b.cat_frag8(f4b, f4b);
+    let zf = b.c_f32(0.0);
+    let zi = b.bitcast_i32(zf);
+    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(zi))];
+    for k in 0..8 {
+        let f = b.c_f32(1.0 + k as f32);
+        let fi = b.bitcast_i32(f);
+        inits.push((DType::I32, Opnd::Val(fi)));
+    }
+    let vars = b.begin_loop(&inits);
+    let it = vars[0];
+    let m = b.c_f32(1.5);
+    // arm result goes into loop var 1 (sum)
+    let odd = b.let_(Op::AndI32(Opnd::Var(it), Opnd::Val(c1)));
+    let zero_i = b.c_i32(0);
+    let cond = b.cmp_lt_i32(zero_i, odd);
+    b.begin_if(Opnd::Val(cond));
+    {
+        let z = b.frag_zero(DType::Frag16);
+        let s = b.mfma_scale_fp8(a8, b8, z, 127, 127);
+        let mut sum = b.bitcast_f32(vars[1]);
+        for r in 0..4u8 {
+            let l = b.frag16_lane(s, r);
+            let v = b.bitcast_f32(l);
+            let d = b.sub_f32(v, m);
+            let e = b.exp2_f32(d);
+            sum = b.add_f32(sum, e);
+        }
+        let si = b.bitcast_i32(sum);
+        b.set_var(vars[1], si);
+    }
+    b.else_();
+    {
+        let z = b.frag_zero(DType::Frag16);
+        let s = b.mfma_scale_fp8(b8, a8, z, 127, 127);
+        let mut sum = b.bitcast_f32(vars[1]);
+        for r in 0..4u8 {
+            let l = b.frag16_lane(s, r);
+            let v = b.bitcast_f32(l);
+            let d = b.add_f32(v, m);
+            let e = b.exp2_f32(d);
+            sum = b.add_f32(sum, e);
+        }
+        let si = b.bitcast_i32(sum);
+        b.set_var(vars[1], si);
+    }
+    b.end_if();
+    // join: independent chains on loop-carried state
+    for k in 0..8 {
+        let x = b.bitcast_f32(vars[2 + k]);
+        let y = b.mul_f32(x, m);
+        let y2 = b.add_f32(y, m);
+        let yi = b.bitcast_i32(y2);
+        b.set_var(vars[2 + k], yi);
+    }
+    sched_end_loop(&mut b, it, n);
+    let off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, off);
+    let fin = b.bitcast_f32(vars[1]);
+    b.store_f32(row, 0, fin);
+    for k in 0..8 {
+        let x = b.bitcast_f32(vars[2 + k]);
+        b.store_f32(row, 4 + 4 * k as u32, x);
+    }
+    b.finish()
+}
