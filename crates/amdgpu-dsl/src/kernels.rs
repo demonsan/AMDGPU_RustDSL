@@ -448,7 +448,7 @@ pub fn probe_roles() -> Function {
 /// the partner wave's slot. Ablations: constant data, no `v_readfirstlane`.
 pub fn probe_waves2() -> Function {
     let mut b = FnBuilder::new("probe_waves2", 128);
-    b.lds(512);
+    b.lds(256);
     b.arg("o", DType::Ptr, 0, 8);
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
