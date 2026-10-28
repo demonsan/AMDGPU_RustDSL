@@ -47,6 +47,7 @@ int main(int argc, char** argv) {
     const int H = envi("ATTN_H", 2);
     const int S = envi("ATTN_S", 128);  // multiple of 64
     const int D = 64;
+    const int BLOCK = envi("ATTN_BLOCK", 64);
     const char* s_env = std::getenv("ATTN_SCALE");
     const float scale = s_env ? (float)std::atof(s_env) : 1.0f / std::sqrt((float)D);
 
@@ -111,11 +112,11 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_mfma") == 0 || std::strcmp(kern, "probe_lds") == 0 ||
                              std::strcmp(kern, "probe_mfma_wide") == 0 ||
                              std::strcmp(kern, "probe_mfma_fp8") == 0 ||
-                             std::strcmp(kern, "probe_mfma_scale") == 0;
+                             std::strcmp(kern, "probe_mfma_scale") == 0 || std::strcmp(kern, "probe_roles") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u)\n", grid.x, grid.y, grid.z);
-    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, 64, 1, 1, 0, nullptr, launch_params,
+    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, (unsigned)BLOCK, 1, 1, 0, nullptr, launch_params,
                              nullptr));
     CK(hipDeviceSynchronize());
     std::printf("[harness] kernel finished\n");
@@ -231,6 +232,33 @@ int main(int argc, char** argv) {
         }
         std::printf(scale_bad ? "PROBE_MFMA_SCALE_FAIL\n" : "PROBE_MFMA_SCALE_OK\n");
         return scale_bad != 0;
+    }
+    if (std::strcmp(kern, "probe_roles") == 0) {
+        // 4 iterations x 512 lanes; lane tid of wave w must read the value
+        // written by wave (w+4)%8, plus 100000 for the role-B writers.
+        float vals[2048] = {0.0f};
+        std::memcpy(vals, got.data(), sizeof(vals));
+        int roles_bad = 0;
+        for (int it = 0; it < 4; ++it) {
+            for (int tid = 0; tid < 512; ++tid) {
+                int w = tid / 64;
+                int l = tid % 64;
+                int pw = (w + 4) & 7;
+                int expect = it * 1000 + pw * 64 + l + (pw >= 4 ? 100000 : 0);
+                float got_v = vals[it * 512 + tid];
+                if (std::fabs(got_v - (float)expect) > 0.5f) {
+                    if (roles_bad < 6) {
+                        std::fprintf(stderr, "roles mismatch it=%d tid=%d got=%.1f want=%d\n", it,
+                                     tid, got_v, expect);
+                    }
+                    ++roles_bad;
+                }
+            }
+        }
+        std::printf("  roles sample: %.1f %.1f %.1f %.1f bad=%d\n", vals[0], vals[64], vals[256],
+                    vals[320], roles_bad);
+        std::printf(roles_bad ? "PROBE_ROLES_FAIL\n" : "PROBE_ROLES_OK\n");
+        return roles_bad != 0;
     }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,

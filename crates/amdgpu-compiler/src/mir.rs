@@ -49,6 +49,7 @@ pub enum MOp {
     VMovFromSPair,
     VPtrAdd,
     VReadPhys,
+    VReadFirstLane,
     VAddU32,
     VAddCoU32,
     VAddcCoU32,
@@ -82,6 +83,8 @@ pub enum MOp {
     // workgroup LDS
     LdsWriteB32,
     LdsReadB32,
+    LdsWriteB128,
+    LdsReadB128,
     SBarrier,
     // global memory
     GlobalLoadU16,

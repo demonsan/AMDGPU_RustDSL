@@ -164,6 +164,10 @@ pub enum Op {
     LoadF32 { base: Opnd, byte_off: u32 },
     /// Read one dword from workgroup LDS; `addr` is a byte offset.
     LoadLdsB32 { addr: Opnd },
+    /// Read four dwords (16 B) from workgroup LDS.
+    LoadLdsB128 { addr: Opnd },
+    /// Broadcast lane 0 of a vector value into a scalar register.
+    ReadFirstLane(Opnd),
 
     /// Build a two-dword fragment from two 32-bit values.
     Frag2(Opnd, Opnd),
@@ -222,6 +226,8 @@ impl Op {
             Op::Frag16Lane { .. } => DType::U32,
             Op::BitcastF32(..) => DType::F32,
             Op::LoadLdsB32 { .. } => DType::U32,
+            Op::LoadLdsB128 { .. } => DType::Frag4,
+            Op::ReadFirstLane(..) => DType::U32,
         }
     }
 
@@ -265,6 +271,8 @@ impl Op {
             Op::FragZero { .. } => vec![],
             Op::BitcastF32(a) => vec![*a],
             Op::LoadLdsB32 { addr } => vec![*addr],
+            Op::LoadLdsB128 { addr } => vec![*addr],
+            Op::ReadFirstLane(a) => vec![*a],
         }
     }
 }
@@ -277,6 +285,8 @@ pub enum Stmt {
     StoreF32 { base: Opnd, byte_off: u32, value: Opnd },
     /// Write one dword into workgroup LDS; `addr` is a byte offset.
     StoreLdsB32 { addr: Opnd, value: Opnd },
+    /// Write four dwords (16 B) into workgroup LDS.
+    StoreLdsB128 { addr: Opnd, value: Opnd },
     /// `s_waitcnt lgkmcnt(count)`.
     WaitLds { count: u8 },
     /// `s_barrier`: synchronise every wave in the workgroup.
@@ -346,6 +356,9 @@ impl Function {
                 }
                 Stmt::StoreLdsB32 { addr, value } => {
                     let _ = writeln!(s, "{pad}lds[{addr:?}] <- {value:?}");
+                }
+                Stmt::StoreLdsB128 { addr, value } => {
+                    let _ = writeln!(s, "{pad}lds128[{addr:?}] <- {value:?}");
                 }
                 Stmt::WaitLds { count } => {
                     let _ = writeln!(s, "{pad}waitlds({count})");
@@ -677,6 +690,21 @@ impl FnBuilder {
         self.f.stmts.push(Stmt::StoreLdsB32 { addr: addr.into(), value: value.into() });
     }
 
+    /// Four dwords (16 B) read from workgroup LDS.
+    pub fn load_lds_b128(&mut self, addr: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::LoadLdsB128 { addr: addr.into() })
+    }
+
+    /// Four dwords (16 B) write into workgroup LDS.
+    pub fn store_lds_b128(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::StoreLdsB128 { addr: addr.into(), value: value.into() });
+    }
+
+    /// Broadcast lane 0 of a vector value into a scalar register.
+    pub fn read_first_lane(&mut self, v: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::ReadFirstLane(v.into()))
+    }
+
     /// `s_waitcnt lgkmcnt(count)`.
     pub fn wait_lds(&mut self, count: u8) {
         self.f.stmts.push(Stmt::WaitLds { count });
@@ -989,6 +1017,21 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
+                    Op::LoadLdsB128 { addr } => {
+                        if let Err(e) = expect_int(f, *addr, "lds128 load address") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::LoadLdsB32 { addr } => {
+                        if let Err(e) = expect_int(f, *addr, "lds load address") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::ReadFirstLane(a) => {
+                        if let Err(e) = expect_int(f, *a, "readfirstlane") {
+                            errs.push(here(e));
+                        }
+                    }
                     _ => {}
                 }
                 // Scope: value becomes visible here.
@@ -1033,6 +1076,16 @@ pub fn verify(f: &Function) -> Vec<String> {
                             errs.push(here(format!("operand v{v} is not visible here")));
                         }
                     }
+                }
+            }
+            Stmt::StoreLdsB128 { addr, value } => {
+                if let Err(e) = expect_int(f, *addr, "lds128 store address") {
+                    errs.push(here(e));
+                }
+                match opnd_ty(f, *value) {
+                    Ok(DType::Frag4) => {}
+                    Ok(t) => errs.push(here(format!("lds128 store: expected frag4, found {}", t.name()))),
+                    Err(e) => errs.push(here(e)),
                 }
             }
             Stmt::WaitLds { .. } | Stmt::Barrier => {}

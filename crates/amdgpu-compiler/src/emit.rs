@@ -431,6 +431,19 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[1])
         )],
         MOp::LdsReadB32 => vec![format!("ds_read_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
+        MOp::LdsWriteB128 => vec![format!(
+            "ds_write_b128 {}, {}",
+            src1(a, inst.srcs[0]),
+            tuple(a, reg_of(&inst.srcs[1]), 4)
+        )],
+        MOp::LdsReadB128 => vec![format!(
+            "ds_read_b128 {}, {}",
+            tuple(a, inst.dst.expect("dst"), 4),
+            src1(a, inst.srcs[0])
+        )],
+        MOp::VReadFirstLane => {
+            vec![format!("v_readfirstlane_b32 {}, {}", sr(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]))]
+        }
         MOp::SBarrier => vec!["s_barrier".to_string()],
         MOp::SEndpgm => vec!["s_endpgm".to_string()],
     }

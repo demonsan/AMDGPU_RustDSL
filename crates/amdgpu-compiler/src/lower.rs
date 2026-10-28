@@ -399,6 +399,11 @@ impl Lowerer {
                     self.set_term(Term::Goto(end_l));
                     self.start_block(else_l);
                 }
+                Stmt::StoreLdsB128 { addr, value } => {
+                    let a = self.as_v1(*addr)?;
+                    let v = self.as_v4(*value)?;
+                    self.push(MInst::new(MOp::LdsWriteB128).srcreg(a).srcreg(v));
+                }
                 Stmt::StoreLdsB32 { addr, value } => {
                     let a = self.as_v1(*addr)?;
                     let v = self.as_v1(*value)?;
@@ -647,6 +652,19 @@ impl Lowerer {
                         .srcreg(rb)
                         .srcreg(rc),
                 );
+                self.val.insert(dst, d);
+            }
+            Op::LoadLdsB128 { addr } => {
+                let a = self.as_v1(*addr)?;
+                let d = self.new_vreg(RClass::V4);
+                self.push(MInst::new(MOp::LdsReadB128).def(d).srcreg(a));
+                self.val.insert(dst, d);
+            }
+            Op::ReadFirstLane(a) => {
+                let r = self.as_v1(*a)?;
+                self.touch(&[Src::Reg(r)]);
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::VReadFirstLane).def(d).srcreg(r));
                 self.val.insert(dst, d);
             }
             Op::LoadLdsB32 { addr } => {
