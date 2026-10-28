@@ -114,6 +114,13 @@ int main(int argc, char** argv) {
     std::vector<__half> got(elems);
     CK(hipMemcpy(got.data(), dout, elems * sizeof(__half), hipMemcpyDeviceToHost));
 
+    if (std::strcmp(kern, "probe_math") == 0) {
+        float vals[3] = {0.0f, 0.0f, 0.0f};
+        std::memcpy(vals, got.data(), sizeof(vals));
+        std::printf("  exp(1)=%.9f exp(2)=%.9f rcp(3)=%.9f\n", vals[0], vals[1], vals[2]);
+        return 0;
+    }
+
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,
         // 4 corr, 5 p, 6 l_new, 7 scaled (last iteration).

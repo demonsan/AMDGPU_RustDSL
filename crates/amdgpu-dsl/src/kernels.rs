@@ -235,3 +235,21 @@ pub fn probe_store() -> Function {
     b.store_u16(dst2, 0, count);
     b.finish()
 }
+
+/// Probe kernel: writes `exp(1)`, `exp(2)` and `rcp(3)` so the harness can
+/// confirm the base and accuracy of the hardware transcendental functions.
+pub fn probe_math() -> Function {
+    let mut b = FnBuilder::new("probe_math", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let one = b.c_f32(1.0);
+    let two = b.c_f32(2.0);
+    let three = b.c_f32(3.0);
+    let e1 = b.exp_f32(one);
+    let e2 = b.exp_f32(two);
+    let r3 = b.rcp_f32(three);
+    b.store_f32(o, 0, e1);
+    b.store_f32(o, 4, e2);
+    b.store_f32(o, 8, r3);
+    b.finish()
+}
