@@ -101,7 +101,8 @@ pub fn fix_value_hazards(m: &mut MFunction) {
 /// pad_block_end: also pad before the terminator until every in-flight MFMA/transcendental result is
 /// readable (the per-block scan cannot see readers in successor blocks; a scheduler that sinks
 /// MFMAs to the end of a block needs this).
-pub fn fix_value_hazards_opts(m: &mut MFunction, pad_block_end: bool) {
+pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
+    let pad_block_end = strict;
     let alias = m.alias.clone();
     let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
     for b in &mut m.blocks {
@@ -113,11 +114,22 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, pad_block_end: bool) {
         // Virtual register -> earliest cycle at which a plain VALU result may feed an MFMA operand
         // or a permlane (a different, shorter hazard than the in-flight latencies above).
         let mut vw: HashMap<VReg, usize> = HashMap::new();
+        // strict: v_pk_add/mul_f32 result -> v_exp/v_rcp needs one wait state (LLVM oracle).
+        let mut pkw: HashMap<VReg, usize> = HashMap::new();
         let mut cycle = 0usize;
 
         // The earliest cycle at which `inst` may issue given the in-flight results.
-        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, usize>, cycle: usize| -> usize {
+        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, usize>, pkw: &HashMap<VReg, usize>, cycle: usize| -> usize {
             let mut earliest = cycle;
+            if strict && is_transcendental(inst.op) {
+                for s in &inst.srcs {
+                    if let Src::Reg(r) = s {
+                        if let Some(rd) = pkw.get(&canon(*r)) {
+                            earliest = earliest.max(*rd);
+                        }
+                    }
+                }
+            }
             if reads_valu_hazard_operands(inst.op) {
                 for s in &inst.srcs {
                     if let Src::Reg(r) = s {
@@ -161,7 +173,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, pad_block_end: bool) {
 
         let mut i = 0usize;
         while i < insts.len() {
-            let mut earliest = earliest_of(&insts[i], &ready, &vw, cycle);
+            let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, cycle);
 
             // Fill the stall with independent ALU work from further down the block.
             if earliest > cycle && !insts[i].op.consumes_vcc() {
@@ -174,7 +186,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, pad_block_end: bool) {
                     let cand = &insts[j];
                     let mut ok = movable(cand.op)
                         && cand.dst.is_some()
-                        && earliest_of(cand, &ready, &vw, cycle) <= cycle;
+                        && earliest_of(cand, &ready, &vw, &pkw, cycle) <= cycle;
                     if ok {
                         let cd = canon(cand.dst.unwrap());
                         let cs: Vec<VReg> = cand.uses().into_iter().map(canon).collect();
@@ -192,6 +204,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, pad_block_end: bool) {
                     if ok {
                         let x = insts.remove(j);
                         if let Some(d) = x.dst {
+                            pkw.remove(&canon(d));
+                            if strict && matches!(x.op, MOp::VPkAddF32 | MOp::VPkMulF32) {
+                                pkw.insert(canon(d), cycle + 2);
+                            }
                             ready.remove(&canon(d));
                             vw.remove(&canon(d));
                             if let Some(dly) = valu_writer_delay(x.op) {
@@ -205,12 +221,12 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, pad_block_end: bool) {
                         j += 1;
                     }
                     // The consumer may have become ready.
-                    earliest = earliest_of(&insts[i], &ready, &vw, cycle);
+                    earliest = earliest_of(&insts[i], &ready, &vw, &pkw, cycle);
                 }
             }
 
             let inst = insts[i].clone();
-            let earliest = earliest_of(&inst, &ready, &vw, cycle);
+            let earliest = earliest_of(&inst, &ready, &vw, &pkw, cycle);
             if earliest > cycle {
                 let mut missing = earliest - cycle;
                 while missing > 0 {
@@ -227,6 +243,14 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, pad_block_end: bool) {
                     vw.insert(canon(d), cycle + 1 + dly);
                 }
             }
+            if strict {
+                if let Some(d) = inst.dst {
+                    pkw.remove(&canon(d));
+                    if matches!(inst.op, MOp::VPkAddF32 | MOp::VPkMulF32) {
+                        pkw.insert(canon(d), cycle + 2);
+                    }
+                }
+            }
             if is_transcendental(inst.op) {
                 if let Some(d) = inst.dst {
                     ready.insert(canon(d), (cycle + TRANS_LATENCY, false));
@@ -234,7 +258,9 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, pad_block_end: bool) {
             }
             if let Some(latency) = mfma_latency(inst.op) {
                 if let Some(d) = inst.dst {
-                    ready.insert(canon(d), (cycle + latency, is_scaled_mfma(inst.op)));
+                    // strict: latency wait states must lie *between* the MFMA and the reader (hardware: 19 is still stale)
+                    let lat = if strict { latency + 1 } else { latency };
+                    ready.insert(canon(d), (cycle + lat, is_scaled_mfma(inst.op)));
                 }
             }
             out.push(inst);
