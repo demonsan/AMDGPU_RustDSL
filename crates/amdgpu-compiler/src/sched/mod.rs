@@ -27,6 +27,8 @@ pub struct Options {
     pub alu_across_barrier: bool,
     /// Debug bisect: ALU may cross barriers only in this block index.
     pub xbar_only: Option<usize>,
+    /// Debug: full-drain waits only.
+    pub drain_only: bool,
     /// Pressure limit in VGPR dwords (never below the original peak of the block).
     pub max_vgprs: u32,
     /// Run the verifiers (always on in tests).
@@ -36,7 +38,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, max_vgprs: 240, verify: true, stats: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, max_vgprs: 240, verify: true, stats: false }
     }
 }
 
@@ -55,6 +57,7 @@ impl Options {
                     "xbar" => o.alu_across_barrier = true,
                     "noverify" => o.verify = false,
                     "stats" => o.stats = true,
+                    "drain" => o.drain_only = true,
                     _ => {
                         if let Some(v) = t.strip_prefix("xbar=") {
                             o.xbar_only = v.parse().ok();
@@ -92,6 +95,7 @@ fn apply_perm(insts: &[MInst], perm: &[usize]) -> Vec<MInst> {
 /// Run the scheduling pass over the whole function.
 pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
     let mut stats = Stats::default();
+    waits::DRAIN_ONLY.store(o.drain_only, std::sync::atomic::Ordering::Relaxed);
     waits::strip_auto_waits(m);
     if o.reorder {
         let lv = liveness::compute(m);
