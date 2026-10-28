@@ -105,7 +105,9 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
     let pad_block_end = strict;
     let alias = m.alias.clone();
     let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
-    for b in &mut m.blocks {
+    let succs = crate::sched::liveness::successors(m);
+    let snap: Vec<Vec<MInst>> = m.blocks.iter().map(|b| b.insts.clone()).collect();
+    for (bi, b) in m.blocks.iter_mut().enumerate() {
         let mut insts: Vec<MInst> = std::mem::take(&mut b.insts);
         let mut out: Vec<MInst> = Vec::with_capacity(insts.len() + 8);
         // Virtual register -> (earliest cycle at which its in-flight result may be read, whether
@@ -282,7 +284,35 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             i += 1;
         }
         if pad_block_end {
-            let mut missing = ready.values().map(|(rd, _)| rd.saturating_sub(cycle)).max().unwrap_or(0);
+            // Only results that a successor reads soon need the padding; the in-place accumulation chain
+            // of one MFMA opcode never does.
+            let mut missing = 0usize;
+            for (reg, (rd, from_mfma)) in ready.iter() {
+                let remaining = rd.saturating_sub(cycle);
+                if remaining == 0 {
+                    continue;
+                }
+                let mut dist = usize::MAX;
+                for &s in &succs[bi] {
+                    let mut d = 0usize;
+                    let mut found = None;
+                    for x in &snap[s] {
+                        let touches = x.uses().iter().any(|u| canon(*u) == *reg) || x.dst.map(|y| canon(y) == *reg).unwrap_or(false);
+                        if touches {
+                            let chain = *from_mfma
+                                && x.op == MOp::VMfmaScale32x32x64Fp8
+                                && matches!(x.srcs.get(2), Some(Src::Reg(c)) if canon(*c) == *reg);
+                            found = Some(if chain { usize::MAX } else { d });
+                            break;
+                        }
+                        d += if x.op == MOp::SNop { x.imm as usize + 1 } else { 1 };
+                    }
+                    dist = dist.min(found.unwrap_or(d));
+                }
+                if dist != usize::MAX {
+                    missing = missing.max(remaining.saturating_sub(dist));
+                }
+            }
             while missing > 0 {
                 let n = missing.min(7) as i64;
                 out.push(MInst::new(MOp::SNop).imm(n));
