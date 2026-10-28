@@ -502,7 +502,11 @@ pub fn probe_lds_own() -> Function {
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
-    let raw = b.load_lds_b32(Opnd::Val(off));
+    // Read through a freshly computed address register (equal value) to see
+    // whether reading the exact register that fed the write matters.
+    let c0 = b.c_i32(0);
+    let raddr = b.add_i32(off, c0);
+    let raw = b.load_lds_b32(Opnd::Val(raddr));
     let value = b.bitcast_f32(raw);
     let out_ptr = b.ptr_add(o, off);
     b.store_f32(out_ptr, 0, value);
