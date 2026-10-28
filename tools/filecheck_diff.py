@@ -24,7 +24,7 @@ def norm(b):
         if not t or t.startswith(";") or t.startswith("#") or t.startswith("liveins:"):
             continue
         t = re.sub(r"\S*/llvm/test/", "<T>/", t)
-        t = re.sub(r"\b(killed|dead|undef|renamable|internal|early-clobber) ", "", t)
+        t = re.sub(r"\b(killed|dead|renamable|internal|early-clobber) ", "", t)
         t = re.sub(r" :: \(.*$", "", t)
         t = re.sub(r",? ?debug-location !\d+.*$", "", t)
         t = re.sub(r"= (?:" + IFLAGS + ")+", "= ", t)
