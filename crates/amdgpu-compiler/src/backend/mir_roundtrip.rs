@@ -388,6 +388,35 @@ fn matches_template(tpl: &str, text: &str) -> bool {
     pos == text.len()
 }
 
+/// Template normalisation for the report: drop memory operands and `(tied-def N)` annotations
+/// (tests omit them) and turn literal numeric operands (modifier/cpol/cbsz values) into wildcards.
+fn normalise_template(x: &str) -> String {
+    let mut s = x.split(" :: ").next().unwrap_or(x).to_string();
+    while let Some(i) = s.find("(tied-def ") {
+        let j = s[i..].find(')').map(|k| k + i).unwrap_or(s.len() - 1);
+        s.replace_range(i..=j, "");
+    }
+    let (pre, rest) = match s.find(" = ") {
+        Some(p) => (s[..p + 3].to_string(), s[p + 3..].to_string()),
+        None => (String::new(), s.clone()),
+    };
+    // rest = "OPCODE op, op, ..."
+    let (op, ops) = match rest.find(' ') {
+        Some(p) => (rest[..p].to_string(), rest[p + 1..].to_string()),
+        None => (rest.clone(), String::new()),
+    };
+    let ops: Vec<String> = ops
+        .split(", ")
+        .filter(|z| !z.is_empty())
+        .map(|z| if z.parse::<i64>().is_ok() { "{n}".to_string() } else { z.to_string() })
+        .collect();
+    if ops.is_empty() {
+        format!("{pre}{op}")
+    } else {
+        format!("{pre}{op} {}", ops.join(", "))
+    }
+}
+
 fn opcode_of_row(line: &str) -> Option<String> {
     let rhs = line.split(" = ").last()?;
     let mut w = rhs.split(' ').filter(|x| !INST_FLAGS.contains(x));
@@ -467,6 +496,7 @@ pub fn table_report(files: &[(String, String)], t: &Table) -> TableReport {
                 for f in INST_FLAGS {
                     x = x.replace(&format!("{f} "), "");
                 }
+                x = normalise_template(&x);
                 let (head, tail) = match x.find(", implicit") {
                     Some(p) => (x[..p].to_string(), x[p + 2..].to_string()),
                     None => (x.clone(), String::new()),
