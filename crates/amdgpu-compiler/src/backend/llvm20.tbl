@@ -102,3 +102,5 @@ T_Vccz      | <- | S_CBRANCH_VCCZ {t}, implicit $vcc
 T_Endpgm    | <- | S_ENDPGM 0
 # oracle tooling: unique block marker (not a hazard)
 X_Marker    | <- | S_SETPRIO {imm}
+X_Sep       | <- | S_NOP 15
+X_Drain     | <- | S_WAITCNT 0

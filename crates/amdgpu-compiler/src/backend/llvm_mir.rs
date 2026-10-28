@@ -155,9 +155,15 @@ pub fn export_with(m: &MFunction, a: &Alloc, markers: bool) -> Result<Exported, 
         if markers {
             let mk = MInst::new(MOp::SNop).imm(bi as i64);
             out.push(llvm20::render_text(&table.rows["X_Marker"].text[0], &mk, &cx)?);
+            for _ in 0..2 {
+                out.push(llvm20::render_text(&table.rows["X_Sep"].text[0], &mk, &cx)?);
+            }
         }
         for inst in &b.insts {
             out.extend(llvm20::render_inst(&table, inst, &cx).map_err(|e| format!("block {bi}: {e}"))?);
+        }
+        if markers {
+            out.push(llvm20::render_text(&table.rows["X_Drain"].text[0], &MInst::new(MOp::SNop), &cx)?);
         }
         let next = bi + 1;
         let mut s = Vec::new();

@@ -88,6 +88,11 @@ fn hazard_matrix() {
         }
     }
     eprintln!("hazard oracle: {} pairs", cases.len());
+    let nb = blocks.len();
+    for (i, b) in blocks.iter_mut().enumerate() {
+        b.label = i as u32;
+        b.term = if i + 1 < nb { Term::Goto(i as u32 + 1) } else { Term::Endpgm };
+    }
     let m = func("oracle", blocks, sm.vregs.clone());
     let a = sm.alloc();
     // Per-block physical numbering is not kept in `sm.phys` (reset_phys): rebuild per block instead.
@@ -129,6 +134,9 @@ fn hazard_matrix() {
         let mut nops = 0u32;
         let mut waits = Vec::new();
         for l in body {
+            if l == "s_nop 15" {
+                continue; // block separator
+            }
             if let Some(n) = l.strip_prefix("s_nop ") {
                 nops += n.trim().parse::<u32>().unwrap_or(0) + 1;
             } else if l.starts_with("s_waitcnt") || l.starts_with("s_delay_alu") {
