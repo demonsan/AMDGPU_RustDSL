@@ -1861,20 +1861,14 @@ pub fn probe_fp8_fmha_2tile() -> Function {
 
     // The probabilities already carry 1/l, so only the 1/16 quantisation factor
     // remains; it is folded into the B scale above.
-    let o_lds_dyn = b.mul_i32(pblk, c16i);
     let o_out_dyn = b.add_i32(j4, p512);
     let o_out_off = b.add_i32(o_out_dyn, c11264);
     let o_ptr = b.ptr_add(o, o_out_off);
     for r in 0..16u8 {
         let i_const = ((r / 4) * 8 + (r % 4)) as i32;
         let lane = b.frag16_lane(o_frag, r);
-        let laddrc = b.c_i32(8192 + i_const * 4);
-        let laddr = b.add_i32(o_lds_dyn, laddrc);
-        let invraw = b.load_lds_b32(Opnd::Val(laddr));
-        let invf = b.bitcast_f32(invraw);
         let lanev = b.bitcast_f32(lane);
-        let val = b.mul_f32(lanev, invf);
-        b.store_f32(o_ptr, (i_const * 128) as u32, val);
+        b.store_f32(o_ptr, (i_const * 128) as u32, lanev);
     }
     b.finish()
 }
