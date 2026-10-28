@@ -789,12 +789,38 @@ impl Lowerer {
                 let ro = self.as_v1(*old)?;
                 let rs = self.as_v1(*src)?;
                 let rsc = self.as_v1(*scale)?;
+                // The instruction writes the 16 bits selected by OPSEL[3]. The
+                // low-half form is verified; the high-half encoding is still
+                // being pinned down, so build it explicitly: pack into the low
+                // half, shift it up, then OR in the preserved low half of old.
+                let packed = self.new_vreg(RClass::V1);
+                self.push(
+                    MInst::new(MOp::VCvtPkFp8Lo)
+                        .def(packed)
+                        .srcreg(rs)
+                        .srcreg(rsc),
+                );
                 let d = self.new_vreg(RClass::V1);
-                // The instruction only overwrites one 16-bit half of the
-                // destination, so seed it with the previous value first.
-                self.push(MInst::new(MOp::VMovB32).def(d).srcreg(ro));
-                let op = if *high { MOp::VCvtPkFp8Hi } else { MOp::VCvtPkFp8Lo };
-                self.push(MInst::new(op).def(d).srcreg(rs).srcreg(rsc));
+                if *high {
+                    let c16 = self.const_vreg(16);
+                    let shifted = self.new_vreg(RClass::V1);
+                    self.push(
+                        MInst::new(MOp::VLshlB32)
+                            .def(shifted)
+                            .srcreg(c16)
+                            .srcreg(packed),
+                    );
+                    let low_kept = self.new_vreg(RClass::V1);
+                    self.push(MInst::new(MOp::VAndB32).def(low_kept).srcreg(ro).imm(0xFFFF));
+                    self.push(
+                        MInst::new(MOp::VOrB32)
+                            .def(d)
+                            .srcreg(shifted)
+                            .srcreg(low_kept),
+                    );
+                } else {
+                    self.push(MInst::new(MOp::VMovB32).def(d).srcreg(packed));
+                }
                 self.val.insert(dst, d);
             }
             Op::CatFrag8(lo, hi) => {
