@@ -65,6 +65,9 @@ fn movable(op: MOp) -> bool {
             | MOp::VMax3F32
             | MOp::VFmaF32
             | MOp::VCvtPkFp8F32
+            | MOp::VCvtPkFp8F32Hi
+            | MOp::VPkAddF32
+            | MOp::VPkMulF32
             | MOp::VCvtPkBf16F32
     )
 }

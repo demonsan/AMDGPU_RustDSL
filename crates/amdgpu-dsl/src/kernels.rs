@@ -6756,6 +6756,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let compute = |b: &mut FnBuilder, masked: bool| {        for hh in 0..2usize {
             // ---- two 32-key score tiles (S^T = K Q^T) of this 64-key substep ----
             let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
+            let mut sfr: Vec<ValueId> = Vec::with_capacity(2);
             for sl in 0..2usize {
                 let s = 2 * hh + sl;
                 let ko = b.c_i32(32 * pitch * (s as i32));
@@ -6800,6 +6801,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     }
                 }
                 sv.push(vals);
+                sfr.push(s_frag);
             }
 
             // ---- register softmax: lane-local max, exchange with the partner lane ----
@@ -6833,13 +6835,32 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 
             // exp2(s - (m - 4)) = 16 exp2(s - m): the P x 16 quantisation scale comes for free
             let m4 = b.sub_f32(m_new, c4f);
+            let pk_sub = !masked && fmha_t_opt("pksub");
+            let negm4_dup = if pk_sub {
+                let negm4 = b.sub_f32(c4f, m_new);
+                Some(b.frag2_dup(negm4))
+            } else {
+                None
+            };
             let mut rsum: Option<ValueId> = None;
             let mut words: Vec<ValueId> = Vec::with_capacity(8);
             for sl in 0..2usize {
                 let mut exps: Vec<ValueId> = Vec::with_capacity(16);
-                for r in 0..16usize {
-                    let sh = b.sub_f32(sv[sl][r], m4);
-                    exps.push(if no_exp { sh } else { b.exp2_f32(sh) });
+                if let Some(nd) = negm4_dup {
+                    for pr in 0..8usize {
+                        let sp = b.frag16_pair(sfr[sl], (2 * pr) as u8);
+                        let t = b.pk_add_f32(sp, nd);
+                        for h2 in 0..2u8 {
+                            let l = b.frag16_lane(t, h2);
+                            let sh = b.bitcast_f32(l);
+                            exps.push(if no_exp { sh } else { b.exp2_f32(sh) });
+                        }
+                    }
+                } else {
+                    for r in 0..16usize {
+                        let sh = b.sub_f32(sv[sl][r], m4);
+                        exps.push(if no_exp { sh } else { b.exp2_f32(sh) });
+                    }
                 }
                 for e in &exps {
                     rsum = Some(match rsum {
@@ -6848,6 +6869,10 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     });
                 }
                 for m in 0..4usize {
+                    if fmha_t_opt("cvt4") {
+                        words.push(b.cvt_pk_fp8x4_f32(exps[4 * m], exps[4 * m + 1], exps[4 * m + 2], exps[4 * m + 3]));
+                        continue;
+                    }
                     let p0 = b.cvt_pk_fp8_f32(exps[4 * m], exps[4 * m + 1]);
                     let p1 = b.cvt_pk_fp8_f32(exps[4 * m + 2], exps[4 * m + 3]);
                     let sh = b.shl_i32(p1, c16i);
@@ -6866,9 +6891,13 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
 
             // ---- O^T += V^T P^T, four 32-wide dim tiles; the correction is lane-local ----
+            let corr_dup = if fmha_t_opt("pkscale") { Some(b.frag2_dup(corr)) } else { None };
             for e in 0..4usize {
                 // in place: O *= corr, then O += V^T P^T (no copies)
-                b.var_scale_f32(o_vars[e], corr);
+                match corr_dup {
+                    Some(cd) => b.var_scale_pk(o_vars[e], cd),
+                    None => b.var_scale_f32(o_vars[e], corr),
+                }
                 let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
                 for r in 0..4i32 {
                     let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32);
@@ -6954,6 +6983,10 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// and LDS holds only the K and V tiles.
 /// LDS row pitch (bytes) of the K/V tiles of the transposed FMHA kernel (env FMHA_PITCH, read at
 /// build time, for bank-conflict experiments; default 144: 16-byte aligned and conflict-free enough, 128 = unpadded).
+fn fmha_t_opt(name: &str) -> bool {
+    std::env::var("FMHA_OPT").map(|v| v.split(',').any(|x| x == name)).unwrap_or(false)
+}
+
 fn fmha_t_pitch() -> i32 {
     std::env::var("FMHA_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(144)
 }

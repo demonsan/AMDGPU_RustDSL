@@ -233,6 +233,12 @@ impl Lowerer {
         a
     }
 
+    /// Alias of dwords `off..` of `r` (which may itself be an alias) with class `class`.
+    fn sub_alias(&mut self, r: VReg, off: u8, class: RClass) -> VReg {
+        let (base, o) = self.mir.alias.get(&r).copied().unwrap_or((r, 0));
+        self.alias_vreg(base, o + off, class)
+    }
+
     /// Make the instruction that produced value `v` write `new_dst` directly (instead of a fresh
     /// register that would then be moved into a fragment). Only for single-use results of plain
     /// ALU ops defined earlier in the current block.
@@ -589,6 +595,15 @@ impl Lowerer {
                     for i in 0..16u8 {
                         let a = self.alias_vreg(v, i, RClass::V1);
                         self.push(MInst::new(MOp::VMulF32).def(a).srcreg(a).srcreg(s));
+                    }
+                }
+                Stmt::VarScalePk { var, pair } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let p = self.as_v2(*pair)?;
+                    self.touch(&[Src::Reg(v), Src::Reg(p)]);
+                    for i in 0..8u8 {
+                        let a = self.sub_alias(v, 2 * i, RClass::V2);
+                        self.push(MInst::new(MOp::VPkMulF32).def(a).srcreg(a).srcreg(p));
                     }
                 }
                 Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
@@ -1267,6 +1282,46 @@ impl Lowerer {
                     other => self.as_v16(*other)?,
                 };
                 let d = self.alias_vreg(f, *index, RClass::V1);
+                self.val.insert(dst, d);
+            }
+            Op::Frag16Pair { frag, index } => {
+                let f = match frag {
+                    Opnd::Val(v) => *self.val.get(v).ok_or_else(|| format!("value v{v} not lowered"))?,
+                    other => self.as_v16(*other)?,
+                };
+                self.touch(&[Src::Reg(f)]);
+                let d = self.sub_alias(f, *index, RClass::V2);
+                self.val.insert(dst, d);
+            }
+            Op::Frag2Dup(a) => {
+                let ra = self.as_v1(*a)?;
+                self.touch(&[Src::Reg(ra)]);
+                let d = self.new_vreg(RClass::V2);
+                let d0 = self.sub_alias(d, 0, RClass::V1);
+                let d1 = self.sub_alias(d, 1, RClass::V1);
+                self.push(MInst::new(MOp::VMovB32).def(d0).srcreg(ra));
+                self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
+                self.val.insert(dst, d);
+            }
+            Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => {
+                let ra = self.as_v2(*a)?;
+                let rb = self.as_v2(*b)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let d = self.new_vreg(RClass::V2);
+                let mop = if matches!(op, Op::PkAddF32(..)) { MOp::VPkAddF32 } else { MOp::VPkMulF32 };
+                self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb));
+                self.val.insert(dst, d);
+            }
+            Op::CvtPkFp8x4F32(a, b, c, e) => {
+                let ra = self.as_v1(*a)?;
+                let rb = self.as_v1(*b)?;
+                let rc = self.as_v1(*c)?;
+                let re = self.as_v1(*e)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rb), Src::Reg(rc), Src::Reg(re)]);
+                let d = self.new_vreg(RClass::V1);
+                // the low-half form writes only 16 bits; the high-half form keeps them
+                self.push(MInst::new(MOp::VCvtPkFp8F32).def(d).srcreg(ra).srcreg(rb));
+                self.push(MInst::new(MOp::VCvtPkFp8F32Hi).def(d).srcreg(rc).srcreg(re).srcreg(d));
                 self.val.insert(dst, d);
             }
             Op::FragZero { ty } => {

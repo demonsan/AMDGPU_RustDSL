@@ -57,6 +57,10 @@ pub enum MOp {
     VCvtPkBf16F32,
     VCvtPkFp8Lo,
     VCvtPkFp8Hi,
+    /// `v_cvt_pk_fp8_f32` into the high 16 bits of its destination (low half preserved); srcs: a, b, old.
+    VCvtPkFp8F32Hi,
+    VPkAddF32,
+    VPkMulF32,
     VAddU32,
     VAddCoU32,
     VAddcCoU32,

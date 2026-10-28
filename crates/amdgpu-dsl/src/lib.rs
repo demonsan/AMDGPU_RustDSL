@@ -220,10 +220,20 @@ pub enum Op {
     BitcastI32(Opnd),
     /// Pack two f32 into two E4M3 fp8 bytes (low 16 bits of the result).
     CvtPkFp8F32(Opnd, Opnd),
-    /// Two f32 -> two bf16 (round to nearest even) packed into one dword (_cvt_pk_bf16_f32).
+    /// Two f32 -> two bf16 (round to nearest even) packed into one dword (_cvt_pk_bf16_f32).
     CvtPkBf16F32(Opnd, Opnd),
-    /// Base-2 exponential: the hardware primitive (_exp_f32), no log2(e) scaling.
+    /// Base-2 exponential: the hardware primitive (_exp_f32), no log2(e) scaling.
     Exp2F32(Opnd),
+    /// Dwords `index` and `index + 1` (`index` even) of a fragment as a `Frag2` (register alias, no instruction).
+    Frag16Pair { frag: Opnd, index: u8 },
+    /// A `Frag2` with both dwords set to one 32-bit value.
+    Frag2Dup(Opnd),
+    /// `v_pk_add_f32` on two `Frag2` operands.
+    PkAddF32(Opnd, Opnd),
+    /// `v_pk_mul_f32` on two `Frag2` operands.
+    PkMulF32(Opnd, Opnd),
+    /// Four f32 -> four E4M3 bytes of one dword (a, b low half; c, d high half): two `v_cvt_pk_fp8_f32`.
+    CvtPkFp8x4F32(Opnd, Opnd, Opnd, Opnd),
 }
 
 impl Op {
@@ -255,6 +265,8 @@ impl Op {
             Op::MfmaScaleFp8_32x32x64 { .. } => DType::Frag16,
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
+            Op::Frag16Pair { .. } | Op::Frag2Dup(..) | Op::PkAddF32(..) | Op::PkMulF32(..) => DType::Frag2,
+            Op::CvtPkFp8x4F32(..) => DType::U32,
             Op::BitcastF32(..) => DType::F32,
             Op::BitcastI32(..) => DType::I32,
             Op::LoadLdsB32 { .. } => DType::U32,
@@ -308,7 +320,10 @@ impl Op {
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 vec![*a, *b, *c, *scale_a, *scale_b]
             }
-            Op::Frag16Lane { frag, .. } => vec![*frag],
+            Op::Frag16Lane { frag, .. } | Op::Frag16Pair { frag, .. } => vec![*frag],
+            Op::Frag2Dup(a) => vec![*a],
+            Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => vec![*a, *b],
+            Op::CvtPkFp8x4F32(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::FragZero { .. } => vec![],
             Op::BitcastF32(a) | Op::BitcastI32(a) => vec![*a],
             Op::LoadLdsB32 { addr } => vec![*addr],
@@ -339,6 +354,8 @@ pub enum Stmt {
     SetVar { var: VarId, value: Opnd },
     /// Multiply all sixteen dwords of a `Frag16` loop variable by an f32 scalar, in place.
     VarScaleF32 { var: VarId, scalar: Opnd },
+    /// Multiply all sixteen dwords of a Frag16 loop variable by the (duplicated) scalar held in a Frag2, in place, with _pk_mul_f32.
+    VarScalePk { var: VarId, pair: Opnd },
     /// 16-byte global load written straight into a `Frag4` loop variable.
     VarLoadB128 { var: VarId, base: Opnd, byte_off: u32 },
     /// `var = scaled_mfma_32x32x64_fp8(a, b, var)`: accumulate into a loop variable in place.
@@ -422,6 +439,9 @@ impl Function {
                 }
                 Stmt::VarScaleF32 { var, scalar } => {
                     let _ = writeln!(s, "{pad}var{} *= {scalar:?}", var.0);
+                }
+                Stmt::VarScalePk { var, pair } => {
+                    let _ = writeln!(s, "{pad}var{} *=pk {pair:?}", var.0);
                 }
                 Stmt::VarLoadB128 { var, base, byte_off } => {
                     let _ = writeln!(s, "{pad}var{} <- load128 [{base:?}+{byte_off}]", var.0);
@@ -843,6 +863,24 @@ impl FnBuilder {
     }
 
     /// `var *= scalar` on every dword of a `Frag16` loop variable.
+    pub fn frag16_pair(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
+        self.let_(Op::Frag16Pair { frag: frag.into(), index })
+    }
+    pub fn frag2_dup(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Frag2Dup(a.into()))
+    }
+    pub fn pk_add_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::PkAddF32(a.into(), b.into()))
+    }
+    pub fn pk_mul_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::PkMulF32(a.into(), b.into()))
+    }
+    pub fn cvt_pk_fp8x4_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CvtPkFp8x4F32(a.into(), b.into(), c.into(), d.into()))
+    }
+    pub fn var_scale_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::VarScalePk { var, pair: pair.into() });
+    }
     pub fn var_scale_f32(&mut self, var: VarId, scalar: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::VarScaleF32 { var, scalar: scalar.into() });
     }
@@ -1360,6 +1398,20 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
                 if let Err(e) = expect_float(f, *scalar, "var scale") {
                     errs.push(here(e));
+                }
+            }
+            Stmt::VarScalePk { var, pair } => {
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var));
+                if !ok {
+                    errs.push(here(format!("var{var} scaled outside its loop")));
+                }
+                if f.var_ty(*var) != Some(DType::Frag16) {
+                    errs.push(here(format!("var{var} must be a frag16 to be scaled in place")));
+                }
+                if let Ok(t) = opnd_ty(f, *pair) {
+                    if t != DType::Frag2 {
+                        errs.push(here(format!("var scale pair: expected frag2, found {}", t.name())));
+                    }
                 }
             }
             Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {

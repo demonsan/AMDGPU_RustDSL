@@ -262,6 +262,24 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[0]),
             src1(a, inst.srcs[1])
         )],
+        MOp::VCvtPkFp8F32Hi => vec![format!(
+            "v_cvt_pk_fp8_f32 {}, {}, {} op_sel:[0,0,1]",
+            d(a),
+            src1(a, inst.srcs[0]),
+            src1(a, inst.srcs[1])
+        )],
+        MOp::VPkAddF32 => vec![format!(
+            "v_pk_add_f32 {}, {}, {}",
+            pair(a, inst.dst.unwrap()),
+            pair(a, reg_of(&inst.srcs[0])),
+            pair(a, reg_of(&inst.srcs[1]))
+        )],
+        MOp::VPkMulF32 => vec![format!(
+            "v_pk_mul_f32 {}, {}, {}",
+            pair(a, inst.dst.unwrap()),
+            pair(a, reg_of(&inst.srcs[0])),
+            pair(a, reg_of(&inst.srcs[1]))
+        )],
         MOp::VMax3F32 => vec![format!(
             "v_max3_f32 {}, {}, {}, {}",
             d(a),
