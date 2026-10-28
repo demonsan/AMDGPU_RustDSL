@@ -443,11 +443,13 @@ pub fn probe_roles() -> Function {
     b.barrier();
     b.wait_lds(0);
 
-    // Diagnostic: read back the lane's own slot first; the harness expects tid.
-    let _ = c7;
-    let _ = c63;
-    let _ = c64;
-    let got = b.load_lds_b32(Opnd::Val(off));
+    let wave_plus = b.add_i32(wave, c4);
+    let partner = b.let_(Op::AndI32(Opnd::Val(wave_plus), Opnd::Val(c7)));
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
+    let partner_row = b.mul_i32(partner, c64);
+    let partner_index = b.add_i32(partner_row, lane);
+    let partner_off = b.mul_i32(partner_index, c4);
+    let got = b.load_lds_b32(Opnd::Val(partner_off));
     let value = b.bitcast_f32(got);
 
     let out2_index = b.add_i32(tid, c512);

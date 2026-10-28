@@ -33,6 +33,7 @@ struct Lowerer {
     consts: HashMap<i64, VReg>,
     pending_vmem: Vec<VReg>,
     pending_smem: Vec<VReg>,
+    pending_lds: Vec<VReg>,
     break_stack: Vec<(u32, u32)>,
     if_stack: Vec<(u32, u32)>,
     cur: usize,
@@ -78,6 +79,7 @@ impl Lowerer {
             consts: HashMap::new(),
             pending_vmem: Vec::new(),
             pending_smem: Vec::new(),
+            pending_lds: Vec::new(),
             break_stack: Vec::new(),
             if_stack: Vec::new(),
             cur: 0,
@@ -90,8 +92,8 @@ impl Lowerer {
         if !self.pending_vmem.is_empty() {
             self.push(MInst::new(MOp::SWaitVm));
         }
-        if !self.pending_smem.is_empty() {
-            self.push(MInst::new(MOp::SWaitLgkm));
+        if !self.pending_smem.is_empty() || !self.pending_lds.is_empty() {
+            self.push(MInst::new(MOp::SWaitLgkm).imm(0));
         }
         self.set_term(Term::Endpgm);
         coalesce(&mut self.mir);
@@ -126,14 +128,14 @@ impl Lowerer {
     /// Wait for any pending load feeding `srcs`, then clear the pending set.
     fn touch(&mut self, srcs: &[Src]) {
         let mut need_vm = false;
-        let mut need_sm = false;
+        let mut need_lgkm = false;
         for s in srcs {
             if let Src::Reg(r) = s {
                 if self.pending_vmem.contains(r) {
                     need_vm = true;
                 }
-                if self.pending_smem.contains(r) {
-                    need_sm = true;
+                if self.pending_smem.contains(r) || self.pending_lds.contains(r) {
+                    need_lgkm = true;
                 }
             }
         }
@@ -141,9 +143,10 @@ impl Lowerer {
             self.push(MInst::new(MOp::SWaitVm));
             self.pending_vmem.clear();
         }
-        if need_sm {
-            self.push(MInst::new(MOp::SWaitLgkm));
+        if need_lgkm {
+            self.push(MInst::new(MOp::SWaitLgkm).imm(0));
             self.pending_smem.clear();
+            self.pending_lds.clear();
         }
     }
 
@@ -658,6 +661,7 @@ impl Lowerer {
                 let a = self.as_v1(*addr)?;
                 let d = self.new_vreg(RClass::V4);
                 self.push(MInst::new(MOp::LdsReadB128).def(d).srcreg(a));
+                self.pending_lds.push(d);
                 self.val.insert(dst, d);
             }
             Op::ReadFirstLane(a) => {
@@ -671,6 +675,7 @@ impl Lowerer {
                 let a = self.as_v1(*addr)?;
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::LdsReadB32).def(d).srcreg(a));
+                self.pending_lds.push(d);
                 self.val.insert(dst, d);
             }
             Op::MfmaF16Wide { a, b, c } => {
