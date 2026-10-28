@@ -149,7 +149,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fp8_fmha_2tile") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_online") == 0 ||
                              std::strcmp(kern, "probe_fp8_fmha_oreg") == 0 ||
-                             std::strcmp(kern, "probe_fp8_fmha_multiwave") == 0;
+                             std::strcmp(kern, "probe_fp8_fmha_multiwave") == 0 ||
+                             std::strcmp(kern, "probe_fp8_fmha_pingpong") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -287,7 +288,7 @@ int main(int argc, char** argv) {
             }
         CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
         std::printf("[harness] online inputs filled\n");
-    }    if (std::strcmp(kern, "probe_fp8_fmha_multiwave") == 0) {
+    }    if (std::strcmp(kern, "probe_fp8_fmha_multiwave") == 0 || std::strcmp(kern, "probe_fp8_fmha_pingpong") == 0) {
         std::vector<unsigned char> in(34816, 0);
         unsigned int seed = 9001u;
         auto next_rand = [&seed]() {
@@ -538,7 +539,7 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
-    if (std::strcmp(kern, "probe_fp8_fmha_multiwave") == 0) {
+    if (std::strcmp(kern, "probe_fp8_fmha_multiwave") == 0 || std::strcmp(kern, "probe_fp8_fmha_pingpong") == 0) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         int bad = 0;
         double worst = 0.0;
