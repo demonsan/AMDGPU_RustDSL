@@ -745,3 +745,52 @@ pub fn probe_ab_loops() -> Function {
     b.store_f32(out_ptr, 0, Opnd::Val(value));
     b.finish()
 }
+/// Nested loops with a register accumulator: the inner loop updates the outer
+/// loop's accumulator directly (previously rejected by the verifier), and the
+/// accumulator is read after both loops (previously out of scope).
+///
+/// Expected value per lane: `3 + 2*tid` (inner indices 0+1 per outer iteration,
+/// plus the outer index, plus tid).
+pub fn probe_nested_acc() -> Function {
+    let mut b = FnBuilder::new("probe_nested_acc", 64);
+    b.lds(256);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let c1 = b.c_i32(1);
+    let c2 = b.c_i32(2);
+    let c4 = b.c_i32(4);
+    let zero = b.c_i32(0);
+
+    let outer_vars = b.begin_loop(&[(DType::I32, Opnd::Val(zero)), (DType::I32, Opnd::Val(zero))]);
+    let acc = outer_vars[0];
+    let outer = outer_vars[1];
+
+    let inner_vars = b.begin_loop(&[(DType::I32, Opnd::Val(zero))]);
+    let k = inner_vars[0];
+    let acc_k = b.add_i32(acc, k);
+    b.set_var(acc, acc_k);
+    let k_next = b.add_i32(k, c1);
+    b.set_var(k, k_next);
+    let more_k = b.cmp_lt_i32(k_next, c2);
+    let stop_k = b.let_(Op::NotI1(Opnd::Val(more_k)));
+    b.break_if(Opnd::Val(stop_k));
+    b.end_loop();
+
+    let acc_o = b.add_i32(acc, outer);
+    let acc_t = b.add_i32(acc_o, tid);
+    b.set_var(acc, acc_t);
+    let outer_next = b.add_i32(outer, c1);
+    b.set_var(outer, outer_next);
+    let more_outer = b.cmp_lt_i32(outer_next, c2);
+    let stop_outer = b.let_(Op::NotI1(Opnd::Val(more_outer)));
+    b.break_if(Opnd::Val(stop_outer));
+    b.end_loop();
+
+    let out_off = b.mul_i32(tid, c4);
+    let out_ptr = b.ptr_add(o, out_off);
+    let value = b.bitcast_f32(acc);
+    b.store_f32(out_ptr, 0, Opnd::Val(value));
+    b.finish()
+}

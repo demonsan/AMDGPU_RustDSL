@@ -1118,7 +1118,9 @@ pub fn verify(f: &Function) -> Vec<String> {
             }
             Stmt::WaitLds { .. } | Stmt::Barrier => {}
             Stmt::SetVar { var, value } => {
-                let ok = loop_vars.last().map(|vs| vs.contains(var)).unwrap_or(false);
+                // Any enclosing loop's variable may be updated; an inner loop can
+                // therefore update an outer loop's accumulator.
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var));
                 if !ok {
                     errs.push(here(format!("var{var} assigned outside its loop")));
                 }
@@ -1177,7 +1179,15 @@ pub fn verify(f: &Function) -> Vec<String> {
                 } else {
                     loop_depth -= 1;
                     loop_vars.pop();
-                    scopes.pop();
+                    // Values (including loop variables) stay visible after the
+                    // loop: a loop variable then holds its last value, which is
+                    // what the lowering leaves in its register.
+                    let inner = scopes.pop().unwrap_or_default();
+                    if let Some(parent) = scopes.last_mut() {
+                        parent.extend(inner);
+                    } else {
+                        errs.push(here("endloop without enclosing scope".into()));
+                    }
                 }
             }
             Stmt::BeginIf { cond } => {

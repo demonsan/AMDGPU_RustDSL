@@ -122,7 +122,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_lds_self2") == 0 ||
                              std::strcmp(kern, "probe_roles_loop") == 0 ||
                              std::strcmp(kern, "probe_fmha_datapath") == 0 ||
-                             std::strcmp(kern, "probe_ab_loops") == 0;
+                             std::strcmp(kern, "probe_ab_loops") == 0 ||
+                             std::strcmp(kern, "probe_nested_acc") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -293,6 +294,25 @@ int main(int argc, char** argv) {
                     partner_bad, bits[0], bits[128]);
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
+    }
+    if (std::strcmp(kern, "probe_nested_acc") == 0) {
+        // Expected raw integer per lane: 3 + 2*tid.
+        unsigned int bits[64] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
+        int na_bad = 0;
+        for (int tid = 0; tid < 64; ++tid) {
+            unsigned int want = (unsigned int)(3 + 2 * tid);
+            if (bits[tid] != want) {
+                if (na_bad < 6) {
+                    std::fprintf(stderr, "nested_acc mismatch tid=%d got=%u want=%u\n", tid, bits[tid],
+                                 want);
+                }
+                ++na_bad;
+            }
+        }
+        std::printf("  nested_acc bad=%d sample=%u %u %u\n", na_bad, bits[0], bits[1], bits[63]);
+        std::printf(na_bad ? "PROBE_NESTED_ACC_FAIL\n" : "PROBE_NESTED_ACC_OK\n");
+        return na_bad != 0;
     }
     if (std::strcmp(kern, "probe_ab_loops") == 0) {
         // Accumulator closed form: role A lanes read the B partner's writes
