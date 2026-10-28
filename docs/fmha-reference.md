@@ -90,6 +90,12 @@ hot loop 使用：
 
 **scaled MFMA 在此 binary 中为 16 字节编码**（例：`0x30BC` → `D3AC0000 0003D9EE D3AE0834 05920914`）。不能用一个高层 GEMM API 隐藏该形态差异。
 
+反汇编原文（已验证）：
+`v_mfma_scale_f32_32x32x64_f8f6f4 v[52:67], v[20:27], v[4:11], v[52:67], v238, v236 op_sel_hi:[0,0,0]`
+即 dst 16 dword、A 8 dword、B 8 dword、C 16 dword（in-place），**两个 scale 操作数是 VGPR**
+（不是 SGPR），并带 `op_sel_hi` 修饰。gfx950 实测：scale 取 VGPR 低 8 位的 E8M0 指数，
+结果为 `2^(a-127) * 2^(b-127) * (A @ B) + C`，A/B 字节按 E4M3 解码。
+
 FP8 pack 的低/高部分写入必须保留 write mask 与旧值依赖，不能简化为「覆盖写」。
 
 ## 7. 1:1 验收方法

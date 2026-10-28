@@ -7,7 +7,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Step | Evidence |
 |---|---|
 | Rust toolchain only inside a container | `tools/container/Containerfile` (ubuntu 22.04 + rustup 1.83.0), built with rootless podman; host and shared home untouched |
-| Workspace builds and tests | `tools/container/cargo.sh build` clean, `cargo test` → 7 backend tests pass |
+| Workspace builds and tests | `tools/container/cargo.sh build` clean, `cargo test` → 8 backend tests pass |
 | Typed IR + verifier | `amdgpu-dsl`: SSA values, loop variables, scope and type checking |
 | Lowering + own register allocation | `amdgpu-compiler`: MIR, linear-scan RA, copy coalescing, wait-state insertion |
 | Assembly emission | `amdc emit attention_fwd` → gfx950 asm accepted by the ROCm assembler |
@@ -19,6 +19,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | LDS, barriers, `lgkmcnt` | `probe_lds`: 64 lanes write their id to LDS, barrier, read the neighbour's value → `PROBE_LDS_OK`; descriptor declares 256 B of LDS |
 | Wide MFMA (16-dword accumulator) | `probe_mfma_wide`: `v_mfma_f32_32x32x8_f16` with a 16-dword zeroed accumulator; every element `8.0` → `PROBE_MFMA_WIDE_OK` |
 | FP8 MFMA | `probe_mfma_fp8`: all-ones E4M3 operands; `v_mfma_f32_16x16x32_fp8_fp8` → `32.0` (K=32), `v_mfma_f32_32x32x16_fp8_fp8` → `16.0` (K=16) → `PROBE_MFMA_FP8_OK` |
+| Block-scaled fp8 MFMA | `probe_mfma_scale`: `v_mfma_scale_f32_32x32x64_f8f6f4` with E8M0 scales; `(127,127)` → `64.0`, `(127,128)` → `128.0`, `(127,0x8000)` → `0.0`, `(127,0x7f00)` → `0.0` → `PROBE_MFMA_SCALE_OK` |
 
 `attention_fwd` is a real dense attention kernel (one lane per query row, online
 softmax over the key loop, f32 accumulation, f16 output) that is fully generated
@@ -48,7 +49,12 @@ Hardware behaviour that the compiler now models:
 11. **`v_exp_f32` computes `2^x`, not `e^x`.** Natural exp is lowered to
     `exp2(x * log2(e))`. This was invisible to the constant-input test (`exp(0) = 1`
     either way) and only showed up with random data.
-12. **Transcendental results are not interlocked.** A consumer issued in the
+12. **`v_mfma_scale_*_f8f6f4` scales are E8M0 exponents in the low byte of a
+    VGPR**, one scalar per matrix: the result is
+    `2^(a-127) * 2^(b-127) * (A @ B) + C`, and A/B bytes are decoded as E4M3.
+    Passing the scales in SGPRs (as the syntax also accepts) silently produced
+    zero, so the DSL/lowering now always materialises them as VGPRs.
+13. **Transcendental results are not interlocked.** A consumer issued in the
     instruction slot right after `v_exp_f32`/`v_rcp_f32` reads the stale register
     value. `hazards::fix_value_hazards` models the latency and pads with `s_nop`;
     `attention_fwd` relies on it (it computes `l_new` immediately after `p` on
