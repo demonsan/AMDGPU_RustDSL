@@ -123,45 +123,75 @@ int main(int argc, char** argv) {
 
     // CPU reference.
     auto bf2f = [](uint16_t x) { uint32_t u = (uint32_t)x << 16; float f; std::memcpy(&f, &u, 4); return f; };
-    double worst = 0.0, sum_abs = 0.0, max_ref = 0.0;
-    size_t bad = 0, cnt = 0;
     const int check_rows = envi("REF_ROWS", 64);
     const double cpu_scale = std::getenv("REF_CPU_SCALE") ? std::atof(std::getenv("REF_CPU_SCALE")) : 0.6931471805599453;  // ln 2: the kernel computes exp2(S)
-    std::vector<double> sc(SK), qd(D), kd(D);
-    for (int b = 0; b < B; ++b)
-        for (int h = 0; h < H; ++h)
-            for (int i = 0; i < S && i < check_rows; ++i) {
-                for (int kk = 0; kk < D; ++kk)
-                    qd[kk] = fp8_e4m3(q[(((size_t)b * S + i) * H + h) * D + kk]) *
-                             std::ldexp(1.0, (int)qs_at(b, i, h, kk / 32) - 127);
-                double mx = -1e300;
-                for (int t = 0; t < SK; ++t) {
-                    double acc = 0.0;
+    auto check = [&](const std::vector<uint16_t>& o, const char* label) -> size_t {
+        double worst = 0.0, sum_abs = 0.0, max_ref = 0.0;
+        size_t bad = 0, cnt = 0;
+        std::vector<double> sc(SK), qd(D);
+        for (int b = 0; b < B; ++b)
+            for (int h = 0; h < H; ++h)
+                for (int i = 0; i < S && i < check_rows; ++i) {
                     for (int kk = 0; kk < D; ++kk)
-                        acc += qd[kk] * fp8_e4m3(k[(((size_t)b * SK + t) * H + h) * D + kk]) *
-                               std::ldexp(1.0, (int)ks_at(b, t, h, kk / 32) - 127);
-                    sc[t] = acc * cpu_scale;
-                    mx = std::max(mx, sc[t]);
+                        qd[kk] = fp8_e4m3(q[(((size_t)b * S + i) * H + h) * D + kk]) *
+                                 std::ldexp(1.0, (int)qs_at(b, i, h, kk / 32) - 127);
+                    double mx = -1e300;
+                    for (int t = 0; t < SK; ++t) {
+                        double acc = 0.0;
+                        for (int kk = 0; kk < D; ++kk)
+                            acc += qd[kk] * fp8_e4m3(k[(((size_t)b * SK + t) * H + h) * D + kk]) *
+                                   std::ldexp(1.0, (int)ks_at(b, t, h, kk / 32) - 127);
+                        sc[t] = acc * cpu_scale;
+                        mx = std::max(mx, sc[t]);
+                    }
+                    double den = 0.0;
+                    for (int t = 0; t < SK; ++t) { sc[t] = std::exp(sc[t] - mx); den += sc[t]; }
+                    for (int d = 0; d < D; ++d) {
+                        double acc = 0.0;
+                        for (int t = 0; t < SK; ++t) acc += sc[t] / den * fp8_e4m3(v[(((size_t)b * SK + t) * H + h) * D + d]);
+                        acc *= vdescale;
+                        const double got = bf2f(o[(((size_t)b * S + i) * H + h) * D + d]);
+                        const double err = std::fabs(got - acc);
+                        worst = std::max(worst, err); sum_abs += err; max_ref = std::max(max_ref, std::fabs(acc)); ++cnt;
+                        if (err > 0.05 + 0.05 * std::fabs(acc)) { if (bad < 5) std::fprintf(stderr, "%s O[%d][%d][%d][%d] want %.5f got %.5f\n", label, b, h, i, d, acc, got); ++bad; }
+                    }
                 }
-                double den = 0.0;
-                for (int t = 0; t < SK; ++t) { sc[t] = std::exp(sc[t] - mx); den += sc[t]; }
-                for (int d = 0; d < D; ++d) {
-                    double acc = 0.0;
-                    for (int t = 0; t < SK; ++t) acc += sc[t] / den * fp8_e4m3(v[(((size_t)b * SK + t) * H + h) * D + d]);
-                    acc *= vdescale;
-                    const double got = bf2f(out[(((size_t)b * S + i) * H + h) * D + d]);
-                    const double err = std::fabs(got - acc);
-                    worst = std::max(worst, err); sum_abs += err; max_ref = std::max(max_ref, std::fabs(acc)); ++cnt;
-                    if (err > 0.05 + 0.05 * std::fabs(acc)) { if (bad < 5) std::fprintf(stderr, "ref O[%d][%d][%d][%d] want %.5f got %.5f\n", b, h, i, d, acc, got); ++bad; }
-                }
-            }
-    std::printf("ref kernel: checked=%zu bad=%zu worst_err=%.4e mean_err=%.4e max|ref|=%.4f\n", cnt, bad, worst, sum_abs / cnt, max_ref);
-    if (const char* dump = std::getenv("REF_DUMP")) {
+        std::printf("%s: checked=%zu bad=%zu worst_err=%.4e mean_err=%.4e max|ref|=%.4f\n", label, cnt, bad, worst, sum_abs / cnt, max_ref);
+        return bad;
+    };
+    size_t bad = check(out, "vendor kernel vs CPU");
+
+    // Optional second kernel (ours) on the same inputs.
+    size_t bad2 = 0;
+    if (const char* co2 = std::getenv("REF_CO2")) {
+        const char* kname2 = std::getenv("REF_KNAME2") ? std::getenv("REF_KNAME2") : "fmha_fwd_hd128_mxfp8";
+        void* dout2;
+        CK(hipMalloc(&dout2, no * 2));
+        CK(hipMemset(dout2, 0, no * 2));
+        put64(args, 0x000, dout2);
+        hipModule_t mod2; hipFunction_t fn2;
+        CK(hipModuleLoad(&mod2, co2));
+        CK(hipModuleGetFunction(&fn2, mod2, kname2));
+        CK(hipModuleLaunchKernel(fn2, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
+        CK(hipDeviceSynchronize());
+        std::vector<uint16_t> out2(no, 0);
+        CK(hipMemcpy(out2.data(), dout2, no * 2, hipMemcpyDeviceToHost));
+        bad2 = check(out2, "our kernel   vs CPU");
+        double wd = 0.0, md = 0.0;
+        for (size_t i = 0; i < no; ++i) {
+            const double dd = std::fabs((double)bf2f(out[i]) - (double)bf2f(out2[i]));
+            wd = std::max(wd, dd); md += dd;
+        }
+        std::printf("our kernel vs vendor kernel (all %zu outputs): worst_diff=%.4e mean_diff=%.4e\n", no, wd, md / no);
+        if (const char* dump2 = std::getenv("REF_DUMP2")) {
+            FILE* fo = std::fopen(dump2, "wb"); std::fwrite(out2.data(), 2, no, fo); std::fclose(fo);
+        }
+    }    if (const char* dump = std::getenv("REF_DUMP")) {
         FILE* fo = std::fopen(dump, "wb");
         std::fwrite(out.data(), 2, no, fo);
         std::fclose(fo);
         std::printf("dumped %zu bf16 values to %s\n", no, dump);
     }
-    std::printf(bad ? "REF_KERNEL_FAIL\n" : "REF_KERNEL_OK\n");
-    return bad != 0;
+    std::printf((bad || bad2) ? "REF_KERNEL_FAIL\n" : "REF_KERNEL_OK\n");
+    return (bad || bad2) != 0;
 }
