@@ -1,4 +1,4 @@
-﻿// Runs the vendor reference kernel (aiter fwd_hd128_mxfp8.co) on random fp8 data with E8M0 1x32
+// Runs the vendor reference kernel (aiter fwd_hd128_mxfp8.co) on random fp8 data with E8M0 1x32
 // Q/K descales and compares it with a CPU reference. Also dumps the bf16 output so our own kernel
 // can be compared against the vendor kernel on identical inputs.
 #include <hip/hip_runtime.h>
@@ -52,6 +52,7 @@ int main(int argc, char** argv) {
     for (auto& x : q) x = palette[rnd() % 11];
     for (auto& x : k) x = palette[rnd() % 11];
     for (auto& x : v) x = palette[rnd() % 11];
+    if (std::getenv("REF_QZ")) std::fill(q.begin(), q.end(), 0);
     // E8M0 descales: [B, S, H, 4], padded with zeroed slack rows for the unguarded tile gathers.
     const size_t qrows = (size_t)((S + 255) / 256) * 256 + 256, krows = (size_t)((SK + 127) / 128) * 128 + 512;
     std::vector<unsigned char> qs((size_t)B * qrows * H * 4, 0), ks((size_t)B * krows * H * 4, 0);
@@ -65,6 +66,10 @@ int main(int argc, char** argv) {
         for (int s = 0; s < SK; ++s)
             for (int h = 0; h < H; ++h)
                 for (int blk = 0; blk < 4; ++blk) ks_at(b, s, h, blk) = (unsigned char)(126 + rnd() % 3);
+    if (std::getenv("REF_SC1")) {
+        std::fill(qs.begin(), qs.end(), 127);
+        std::fill(ks.begin(), ks.end(), 127);
+    }
     float vdescale = 1.0f;
     const size_t no = (size_t)B * S * H * D;
     std::vector<uint16_t> out(no, 0);
