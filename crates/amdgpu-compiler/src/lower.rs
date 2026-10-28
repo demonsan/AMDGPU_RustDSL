@@ -901,7 +901,7 @@ impl Lowerer {
                 }
                 self.val.insert(dst, d);
             }
-            Op::BitcastF32(a) => {
+            Op::BitcastF32(a) | Op::BitcastI32(a) => {
                 // Pure register reinterpretation: no instruction.
                 let r = self.as_v1(*a)?;
                 self.val.insert(dst, r);

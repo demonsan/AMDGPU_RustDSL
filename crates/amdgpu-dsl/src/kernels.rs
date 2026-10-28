@@ -994,3 +994,95 @@ pub fn probe_pack() -> Function {
 
     b.finish()
 }
+/// Real-data block-scaled fp8 matmul probe.
+///
+/// The input buffer `o` holds, at fixed byte offsets:
+///
+/// * `0`    : matrix A, 32 x 64 fp8, row major (2048 bytes)
+/// * `2048` : matrix B transposed, 32 x 64 fp8 (B^T[j][k] = B[k][j])
+/// * `4096` : A scale bytes, one dword per lane (only the low byte is read)
+/// * `4352` : B scale bytes, one dword per lane
+/// * `4608` : output, 32 x 32 f32, row major (4096 bytes)
+///
+/// The MFMA fragment layout comes from the CDNA4 ISA (7.1.3):
+///
+/// * `A[i][k]`  lives in lane `i + 32 * (k / 32)` at byte `k % 32` of the lane's
+///   8-dword fragment,
+/// * `B[k][j]`  lives in lane `j + 32 * (k / 32)` at byte `k % 32`,
+/// * the scale byte of lane `l` for matrix A applies to row `l % 32` and K block
+///   `l / 32` (same for B with row replaced by the B row index),
+/// * `D[i][j]`  lives in lane `j + 32 * ((i / 4) % 2)` at register
+///   `4 * (i / 8) + (i % 4)`.
+pub fn probe_fp8_matmul() -> Function {
+    let mut b = FnBuilder::new("probe_fp8_matmul", 64);
+    b.lds(256);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let c4 = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c9 = b.c_i32(9);
+    let c31 = b.c_i32(31);
+    let c64 = b.c_i32(64);
+    let c2048 = b.c_i32(2048);
+    let c4096 = b.c_i32(4096);
+    let c4352 = b.c_i32(4352);
+    let c4608 = b.c_i32(4608);
+
+    // lane decomposition: row index j (lane % 32) and K block (lane / 32)
+    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let p = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
+
+    let row = b.mul_i32(j, c64);
+    let koff = b.shl_i32(p, c5);
+    let frag_off = b.add_i32(row, koff);
+    let a_base = b.ptr_add(o, frag_off);
+    let bt_off = b.add_i32(frag_off, c2048);
+    let bt_base = b.ptr_add(o, bt_off);
+
+    let a0 = b.load_f32(a_base, 0);
+    let a1 = b.load_f32(a_base, 4);
+    let a2 = b.load_f32(a_base, 8);
+    let a3 = b.load_f32(a_base, 12);
+    let a4 = b.load_f32(a_base, 16);
+    let a5 = b.load_f32(a_base, 20);
+    let a6 = b.load_f32(a_base, 24);
+    let a7 = b.load_f32(a_base, 28);
+    let a8 = b.frag8(a0, a1, a2, a3, a4, a5, a6, a7);
+
+    let b0 = b.load_f32(bt_base, 0);
+    let b1 = b.load_f32(bt_base, 4);
+    let b2 = b.load_f32(bt_base, 8);
+    let b3 = b.load_f32(bt_base, 12);
+    let b4 = b.load_f32(bt_base, 16);
+    let b5 = b.load_f32(bt_base, 20);
+    let b6 = b.load_f32(bt_base, 24);
+    let b7 = b.load_f32(bt_base, 28);
+    let b8v = b.frag8(b0, b1, b2, b3, b4, b5, b6, b7);
+
+    let tid4 = b.mul_i32(tid, c4);
+    let sa_off = b.add_i32(tid4, c4096);
+    let sa_ptr = b.ptr_add(o, sa_off);
+    let sa_f = b.load_f32(sa_ptr, 0);
+    let sa = b.bitcast_i32(sa_f);
+    let sb_off = b.add_i32(tid4, c4352);
+    let sb_ptr = b.ptr_add(o, sb_off);
+    let sb_f = b.load_f32(sb_ptr, 0);
+    let sb = b.bitcast_i32(sb_f);
+
+    let zero = b.frag_zero(DType::Frag16);
+    let d = b.mfma_scale_fp8(a8, b8v, zero, sa, sb);
+
+    let j4 = b.mul_i32(j, c4);
+    let p512 = b.shl_i32(p, c9);
+    let dyn_off = b.add_i32(b.add_i32(j4, p512), c4608);
+    let dptr = b.ptr_add(o, dyn_off);
+    for r in 0..16u8 {
+        let i_const = ((r / 4) * 8 + (r % 4)) as u32;
+        let lane = b.frag16_lane(d, r);
+        let v = b.bitcast_f32(lane);
+        b.store_f32(dptr, i_const * 128, v);
+    }
+    b.finish()
+}

@@ -126,10 +126,37 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_nested_acc") == 0 ||
                              std::strcmp(kern, "probe_loop_mfma") == 0 ||
                              std::strcmp(kern, "probe_fmha_core") == 0 ||
-                             std::strcmp(kern, "probe_pack") == 0;
+                             std::strcmp(kern, "probe_pack") == 0 ||
+                             std::strcmp(kern, "probe_fp8_matmul") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
+    // Real-data block-scaled fp8 matmul probe: fill the input region of `dout`
+    // with A (32x64 fp8), B^T (32x64 fp8), and the per-lane scale bytes.
+    if (std::strcmp(kern, "probe_fp8_matmul") == 0) {
+        const int fp8_test = envi("FP8_TEST", 1);
+        std::vector<unsigned char> in(8704, 0);
+        for (int i = 0; i < 32; ++i) {
+            for (int k = 0; k < 64; ++k) {
+                const unsigned char v =
+                    (fp8_test == 1) ? ((k == i) ? 0x38 : 0x00) : 0x38;
+                in[i * 64 + k] = v;
+                in[2048 + i * 64 + k] = v;
+            }
+        }
+        for (int l = 0; l < 64; ++l) {
+            unsigned char sa = 127;
+            unsigned char sb = 127;
+            if (fp8_test == 2) {
+                sa = (unsigned char)(127 + ((l % 32) & 1));
+                sb = (unsigned char)(127 + ((l % 32) & 1));
+            }
+            in[4096 + l * 4] = sa;
+            in[4352 + l * 4] = sb;
+        }
+        CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
+        std::printf("[harness] fp8 matmul inputs filled (test %d)\n", fp8_test);
+    }
     CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, (unsigned)BLOCK, 1, 1, 0, nullptr, launch_params,
                              nullptr));
     CK(hipDeviceSynchronize());
@@ -297,6 +324,29 @@ int main(int argc, char** argv) {
                     partner_bad, bits[0], bits[128]);
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
+    }
+    if (std::strcmp(kern, "probe_fp8_matmul") == 0) {
+        const int fp8_test = envi("FP8_TEST", 1);
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        const float* dvals = reinterpret_cast<const float*>(raw + 4608);
+        int bad = 0;
+        for (int i = 0; i < 32; ++i) {
+            for (int j = 0; j < 32; ++j) {
+                const float want = (fp8_test == 1)
+                                       ? ((i == j) ? 1.0f : 0.0f)
+                                       : 64.0f * (float)(1 << (((i & 1) + (j & 1))));
+                const float gotv = dvals[i * 32 + j];
+                if (std::fabs(gotv - want) > 1e-4f) {
+                    if (bad < 6) {
+                        std::fprintf(stderr, "fp8_matmul D[%d][%d]: want %g got %g\n", i, j, want, gotv);
+                    }
+                    ++bad;
+                }
+            }
+        }
+        std::printf("  fp8_matmul test=%d bad=%d\n", fp8_test, bad);
+        std::printf(bad ? "PROBE_FP8_MATMUL_FAIL\n" : "PROBE_FP8_MATMUL_OK\n");
+        return bad != 0;
     }
     if (std::strcmp(kern, "probe_pack") == 0) {
         unsigned int bits[2048] = {0};

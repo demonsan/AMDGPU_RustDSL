@@ -204,6 +204,8 @@ pub enum Op {
     FragZero { ty: DType },
     /// Reinterpret the bits of an integer as `f32` (register renaming only).
     BitcastF32(Opnd),
+    /// Register reinterpretation to i32 (no instruction).
+    BitcastI32(Opnd),
 }
 
 impl Op {
@@ -235,6 +237,7 @@ impl Op {
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
             Op::BitcastF32(..) => DType::F32,
+            Op::BitcastI32(..) => DType::I32,
             Op::LoadLdsB32 { .. } => DType::U32,
             Op::LoadLdsB128 { .. } => DType::Frag4,
             Op::ReadFirstLane(..) => DType::U32,
@@ -283,7 +286,7 @@ impl Op {
             }
             Op::Frag16Lane { frag, .. } => vec![*frag],
             Op::FragZero { .. } => vec![],
-            Op::BitcastF32(a) => vec![*a],
+            Op::BitcastF32(a) | Op::BitcastI32(a) => vec![*a],
             Op::LoadLdsB32 { addr } => vec![*addr],
             Op::LoadLdsB128 { addr } => vec![*addr],
             Op::ReadFirstLane(a) => vec![*a],
@@ -619,6 +622,10 @@ impl FnBuilder {
 
     pub fn bitcast_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::BitcastF32(a.into()))
+    }
+
+    pub fn bitcast_i32(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::BitcastI32(a.into()))
     }
 
     pub fn mfma_f16_wide(
@@ -964,6 +971,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
+                    Op::BitcastI32(_) => {}
                     Op::BitcastF32(a) => {
                         if let Err(e) = expect_int(f, *a, "bitcast") {
                             errs.push(here(e));
