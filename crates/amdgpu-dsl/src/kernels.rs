@@ -808,6 +808,8 @@ pub fn probe_loop_mfma() -> Function {
     let ones = b.c_i32(0x38383838_u32 as i32);
     let c1 = b.c_i32(1);
     let c2 = b.c_i32(2);
+    let c4 = b.c_i32(4);
+    let c8 = b.c_i32(8);
     let c8k = b.c_i32(8192);
     let c16 = b.c_i32(16);
     let c0 = b.c_i32(0);
@@ -859,7 +861,6 @@ pub fn probe_loop_mfma() -> Function {
     b.store_f32(final_ptr, 0, acc0_f);
 
     // Per-lane final accumulator: two dwords each, 8 bytes per lane.
-    let c8 = b.c_i32(8);
     let row_off = b.mul_i32(tid, c8);
     let row = b.ptr_add(o, row_off);
     for i in 0..2u8 {
