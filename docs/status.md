@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **ds_read_b64_tr_b8 B fragment** | `probe_fp8_matmul_tr`: row-major B staged in LDS, the 32x32x64 B fragment built with four `ds_read_b64_tr_b8` reads (no host-side transpose), random fp8 data and random scales, `worst_err = 0` vs the CPU reference -> `PROBE_MATMUL_TR_OK` |
 | **separate A/B steady loops (block 512)** | `probe_fp8_fmha_abloops`: waves 0-3 and 4-7 each run their own steady loop with its own backedge (A copies K, B copies V, both compute their own query tile) and the same four collective barriers per iteration plus one in the epilogue (12 static `s_barrier`, 4 branches, 208 VGPRs); all 8 waves match the host emulation -> `PROBE_FMHA_MULTIWAVE_OK` |
 | **role-split producer/consumer attention (block 512)** | `probe_fp8_fmha_pingpong`: waves 0-3 (role A) copy the next K tile and waves 4-7 (role B) copy the next V tile into a double-buffered LDS region; the two role branches (begin_if/else on wave id) each end in the same workgroup barrier (8 static `s_barrier`, 3 branches); every wave reads its fragments with `ds_read_b128` + `cat_frag8`; all 8 waves match the host emulation (`2.1e-4`) -> `PROBE_FMHA_MULTIWAVE_OK` |
 | **eight-wave online-softmax attention (block 512)** | `probe_fp8_fmha_multiwave`: 512 threads, each wave owns one 32-row query tile and a private 8448 B LDS region, all waves share K/V tiles and run the same workgroup-barrier sequence; all 8 waves match the host emulation (`worst_err 2.1e-4`) -> `PROBE_FMHA_MULTIWAVE_OK` |
@@ -351,9 +352,10 @@ double-buffered LDS region by a producer/consumer split (role A = waves 0-3 copy
 = waves 4-7 copy V) and consumed with `ds_read_b128`; the barrier in each role branch is a
 distinct instruction that lands on the same collective phase.
 
-Remaining distance to the reference kernel (after round 23 added separate A/B loops): the
-`+0x80` KV progress updates, rollback exits, `ds_read_b64_tr_b8` and the reference tile
-shapes (hd128, tile Q 256, tile KV 128).
+Remaining distance to the reference kernel: the `+0x80` KV progress updates, rollback exits,
+using `ds_read_b64_tr_b8` for V inside the attention loop (64 keys per iteration so the
+K=64 B fragment is fully populated) and the reference tile shapes (hd128, tile Q 256, tile KV
+128).
 
 ## Separate A/B loops and two lowering bugs (round 23)
 
@@ -373,6 +375,28 @@ lowering treats control flow:
 
 After both fixes all 8 waves match (`per-wave bad: 0 0 0 0 0 0 0 0`), and the shared-loop
 variants still pass.
+
+## ds_read_b64_tr_b8 (round 24)
+
+The CDNA4 ISA only says the instruction transposes an 8-bit matrix on the way from LDS to
+VGPRs, so the lane mapping was measured (`probe_lds_tr_b8`, LDS byte a = a & 0xFF, lane l
+supplying address 8*l). For a group of 16 lanes g = l / 16 the result is
+
+    result[lane j][byte i] = byte (j % 8) of the 8-byte chunk addressed by lane 16g + 2i + (j % 16) / 8
+
+i.e. each lane contributes a row chunk and every lane receives one column of eight rows.
+From that, the B fragment of the 32x32x64 block-scaled MFMA (lane L = j + 32 * gk, byte
+b -> k = 32 * gk + b) is built from a row-major B (pitch P bytes) with four reads r = 0..3
+at the per-lane address
+
+    gk * 32P + (8r + i) * P + 8 * (2 * (g % 2) + h)     with i = (lane % 16) / 2, h = lane % 2
+
+(`probe_fp8_matmul_tr`, P = 32). The DSL gained `load_lds_tr_b8` (`Frag2` result) and
+`frag16_lane` now extracts a dword from any multi-dword fragment.
+
+GPU-free regression tests for the round 23 lowering fixes were added
+(`loads_are_drained_before_a_branch`, `constants_are_materialised_on_every_path`); the backend
+suite is now 10 tests.
 
 ## Next: FMHA reference core loop
 
