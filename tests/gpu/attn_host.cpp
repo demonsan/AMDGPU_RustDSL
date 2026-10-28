@@ -241,51 +241,53 @@ int main(int argc, char** argv) {
         return scale_bad != 0;
     }
     if (std::strcmp(kern, "probe_roles") == 0) {
-        float vals[512] = {0.0f};
-        std::memcpy(vals, got.data(), sizeof(vals));
+        // The kernel stores the raw 32-bit integer it read from LDS, so compare
+        // bit patterns rather than floats.
+        unsigned int bits[512] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
         int roles_bad = 0;
         for (int tid = 0; tid < 512; ++tid) {
             int w = tid / 64;
             int l = tid % 64;
             int pw = (w + 4) & 7;
-            int want = pw * 64 + l;
-            if (std::fabs(vals[tid] - (float)want) > 0.5f) {
+            unsigned int want = (unsigned int)(pw * 64 + l);
+            if (bits[tid] != want) {
                 if (roles_bad < 6) {
-                    std::fprintf(stderr, "roles mismatch tid=%d got=%.1f want=%d\n", tid, vals[tid],
+                    std::fprintf(stderr, "roles mismatch tid=%d got=%u want=%u\n", tid, bits[tid],
                                  want);
                 }
                 ++roles_bad;
             }
         }
-        std::printf("  roles bad=%d sample=%.1f %.1f %.1f %.1f\n", roles_bad, vals[0], vals[64],
-                    vals[256], vals[320]);
+        std::printf("  roles bad=%d sample=%u %u %u %u\n", roles_bad, bits[0], bits[64], bits[256],
+                    bits[320]);
         std::printf(roles_bad ? "PROBE_ROLES_FAIL\n" : "PROBE_ROLES_OK\n");
         return roles_bad != 0;
     }
     if (std::strcmp(kern, "probe_waves2") == 0) {
-        // Block 128 (two waves): o[tid] must be the lane's own id after the
-        // barrier, o[128+tid] the partner wave's id.
-        float vals[256] = {0.0f};
-        std::memcpy(vals, got.data(), sizeof(vals));
+        // Two waves: o[tid] holds the lane's own id, o[128+tid] the id of the
+        // partner wave's lane. Raw integer bit patterns, not floats.
+        unsigned int bits[256] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
         int own_bad = 0;
         int partner_bad = 0;
         for (int tid = 0; tid < 128; ++tid) {
             int w = tid / 64;
             int l = tid % 64;
-            if (std::fabs(vals[tid] - 7.0f) > 0.5f) {
+            if (bits[tid] != (unsigned int)tid) {
                 ++own_bad;
             }
-            int want = 7;
-            if (std::fabs(vals[128 + tid] - (float)want) > 0.5f) {
+            unsigned int want = (unsigned int)((w ^ 1) * 64 + l);
+            if (bits[128 + tid] != want) {
                 if (partner_bad < 6) {
-                    std::fprintf(stderr, "waves2 mismatch tid=%d got=%.1f want=%d\n", tid,
-                                 vals[128 + tid], want);
+                    std::fprintf(stderr, "waves2 mismatch tid=%d got=%u want=%u\n", tid,
+                                 bits[128 + tid], want);
                 }
                 ++partner_bad;
             }
         }
-        std::printf("  waves2 own_bad=%d partner_bad=%d own[0]=%.1f partner[0]=%.1f\n", own_bad,
-                    partner_bad, vals[0], vals[128]);
+        std::printf("  waves2 own_bad=%d partner_bad=%d own[0]=%u partner[0]=%u\n", own_bad,
+                    partner_bad, bits[0], bits[128]);
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
     }
@@ -328,41 +330,42 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
     if (std::strcmp(kern, "probe_lds_self2") == 0) {
-        float vals[64] = {0.0f};
-        std::memcpy(vals, got.data(), sizeof(vals));
+        unsigned int bits[64] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
         int bad = 0;
         for (int tid = 0; tid < 64; ++tid) {
-            if (std::fabs(vals[tid] - (float)tid) > 0.5f) {
+            if (bits[tid] != (unsigned int)tid) {
                 if (bad < 4) {
-                    std::fprintf(stderr, "self2 mismatch tid=%d got=%.1f\n", tid, vals[tid]);
+                    std::fprintf(stderr, "self2 mismatch tid=%d got=%u\n", tid, bits[tid]);
                 }
                 ++bad;
             }
         }
-        std::printf("  self2 bad=%d sample=%.1f %.1f %.1f %.1f\n", bad, vals[0], vals[1], vals[2],
-                    vals[3]);
+        std::printf("  self2 bad=%d sample=%u %u %u %u\n", bad, bits[0], bits[1], bits[2], bits[3]);
         std::printf(bad ? "SELF2_FAIL\n" : "SELF2_OK\n");
         return bad != 0;
     }
     if (std::strcmp(kern, "probe_lds_own") == 0) {
-        float vals[128] = {0.0f};
+        // o[tid] is a float constant 42.0; o[64+tid] holds the raw LDS bit pattern.
+        float vals[64] = {0.0f};
         std::memcpy(vals, got.data(), sizeof(vals));
+        unsigned int bits[64] = {0};
+        std::memcpy(bits, got.data() + 64 * sizeof(float), sizeof(bits));
         int first_bad = 0;
         int read_bad = 0;
         for (int tid = 0; tid < 64; ++tid) {
-            if (std::fabs(vals[tid] - (float)((tid + 63) & 63)) > 0.5f) {
+            if (std::fabs(vals[tid] - 42.0f) > 0.5f) {
                 ++first_bad;
             }
-            if (std::fabs(vals[64 + tid] - (float)((tid + 1) & 63)) > 0.5f) {
+            if (bits[tid] != (unsigned int)tid) {
                 if (read_bad < 4) {
-                    std::fprintf(stderr, "own read mismatch tid=%d got=%.1f\n", tid,
-                                 vals[64 + tid]);
+                    std::fprintf(stderr, "own read mismatch tid=%d got=%u\n", tid, bits[tid]);
                 }
                 ++read_bad;
             }
         }
-        std::printf("  lds_own first_bad=%d second_bad=%d first[0]=%.1f second[0]=%.1f\n", first_bad,
-                    read_bad, vals[0], vals[64]);
+        std::printf("  lds_own first_bad=%d second_bad=%d first[0]=%.1f second[0]=%u\n", first_bad,
+                    read_bad, vals[0], bits[0]);
         std::printf((first_bad || read_bad) ? "LDS_OWN_FAIL\n" : "LDS_OWN_OK\n");
         return (first_bad || read_bad) ? 1 : 0;
     }

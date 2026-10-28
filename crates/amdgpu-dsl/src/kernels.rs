@@ -443,35 +443,32 @@ pub fn probe_roles() -> Function {
     b.finish()
 }
 
-/// Two-wave LDS probe (block 128). Every lane writes a constant into its LDS
-/// slot, the workgroup synchronises, then the lane reads back its own slot and
-/// the partner wave's slot. Ablations: constant data, no `v_readfirstlane`.
+/// Two-wave LDS probe (block 128): every lane writes its id, the workgroup
+/// synchronises, then the lane reads its own slot and the partner wave's slot.
 pub fn probe_waves2() -> Function {
-    let mut b = FnBuilder::new("probe_waves2", 64);
-    b.lds(256);
+    let mut b = FnBuilder::new("probe_waves2", 128);
+    b.lds(512);
     b.arg("o", DType::Ptr, 0, 8);
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
-
-    let c6 = b.c_i32(6);
     let c1 = b.c_i32(1);
     let c4 = b.c_i32(4);
+    let c6 = b.c_i32(6);
     let c63 = b.c_i32(63);
     let c64 = b.c_i32(64);
     let c128 = b.c_i32(128);
-    let c7 = b.c_i32(7);
-    let off = b.mul_i32(tid, c4);
     let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let off = b.mul_i32(tid, c4);
 
-    b.store_lds_b32(Opnd::Val(off), Opnd::Val(c7));
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
 
     let own = b.load_lds_b32(Opnd::Val(off));
-    let own_value = b.bitcast_f32(own);
+    let own_value = b.bitcast_f32(Opnd::Val(own));
     let own_ptr = b.ptr_add(o, off);
-    b.store_f32(own_ptr, 0, own_value);
+    b.store_f32(own_ptr, 0, Opnd::Val(own_value));
 
     let partner = b.xor_i32(wave, c1);
     let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
@@ -479,17 +476,17 @@ pub fn probe_waves2() -> Function {
     let partner_index = b.add_i32(partner_row, lane);
     let partner_off = b.mul_i32(partner_index, c4);
     let got = b.load_lds_b32(Opnd::Val(partner_off));
-    let value = b.bitcast_f32(got);
-
+    let value = b.bitcast_f32(Opnd::Val(got));
     let out2_index = b.add_i32(tid, c128);
     let out2_off = b.mul_i32(out2_index, c4);
     let out2_ptr = b.ptr_add(o, out2_off);
-    b.store_f32(out2_ptr, 0, value);
+    b.store_f32(out2_ptr, 0, Opnd::Val(value));
 
     b.finish()
 }
-/// Same shape as `probe_lds`, but each lane reads back its own slot. The only
-/// difference from the passing probe is the read address.
+/// Same shape as `probe_lds`, but each lane reads back its own slot.
+/// `o[tid]` receives the float constant 42.0 (store-path check) and
+/// `o[64+tid]` the raw 32-bit value read from LDS (which must equal `tid`).
 pub fn probe_lds_own() -> Function {
     let mut b = FnBuilder::new("probe_lds_own", 64);
     b.lds(256);
@@ -497,36 +494,24 @@ pub fn probe_lds_own() -> Function {
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
     let c4 = b.c_i32(4);
+    let c64 = b.c_i32(64);
     let off = b.mul_i32(tid, c4);
-    // Rotate the write by one slot: the lane writes the slot of the previous
-    // lane and reads its own, so the value read must be `(tid - 1) & 63`.
-    // This separates "write and read work" from "write then read the same slot".
-    let c63r = b.c_i32(63);
-    let prev = b.add_i32(tid, c63r);
-    let prev_i = b.let_(Op::AndI32(Opnd::Val(prev), Opnd::Val(c63r)));
-    let wr_off = b.mul_i32(prev_i, c4);
-    b.store_lds_b32(Opnd::Val(wr_off), Opnd::Val(tid));
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
-    let c1 = b.c_i32(1);
-    let c63 = b.c_i32(63);
-    let next = b.add_i32(tid, c1);
-    let idx = b.let_(Op::AndI32(Opnd::Val(next), Opnd::Val(c63)));
-    let nb_off = b.mul_i32(idx, c4);
-    let raw1 = b.load_lds_b32(Opnd::Val(off));
-    let raw2 = b.load_lds_b32(Opnd::Val(nb_off));
-    let value1 = b.bitcast_f32(raw1);
-    let value2 = b.bitcast_f32(raw2);
+    let raw = b.load_lds_b32(Opnd::Val(off));
+    let value = b.bitcast_f32(Opnd::Val(raw));
     let out_ptr = b.ptr_add(o, off);
-    b.store_f32(out_ptr, 0, value1);
-    let c64 = b.c_i32(64);
+    let c42 = b.c_f32(42.0);
+    b.store_f32(out_ptr, 0, Opnd::Val(c42));
     let out2_index = b.add_i32(tid, c64);
     let out2_off = b.mul_i32(out2_index, c4);
     let out2_ptr = b.ptr_add(o, out2_off);
-    b.store_f32(out2_ptr, 0, value2);
+    b.store_f32(out2_ptr, 0, Opnd::Val(value));
     b.finish()
 }
+
 /// Byte-for-byte clone of `probe_lds` with exactly one change: the lane reads
 /// its own slot instead of the neighbour's. Everything else (LDS size, barrier
 /// sequence, single read, single store, workgroup size) is identical.
@@ -536,20 +521,13 @@ pub fn probe_lds_self2() -> Function {
     b.arg("o", DType::Ptr, 0, 8);
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
-    let c1 = b.c_i32(1);
     let c4 = b.c_i32(4);
-    let c63 = b.c_i32(63);
-    let next = b.add_i32(tid, c1);
-    let wrapped = b.let_(Op::AndI32(Opnd::Val(next), Opnd::Val(c63)));
     let self_off = b.mul_i32(tid, c4);
-    let _ = wrapped;
     b.store_lds_b32(Opnd::Val(self_off), Opnd::Val(tid));
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
-    // Recompute the address after the barrier in a fresh value.
-    let raddr = b.mul_i32(tid, c4);
-    let raw = b.load_lds_b32(Opnd::Val(raddr));
+    let raw = b.load_lds_b32(Opnd::Val(self_off));
     let value = b.bitcast_f32(Opnd::Val(raw));
     let dst = b.ptr_add(o, self_off);
     b.store_f32(dst, 0, Opnd::Val(value));
