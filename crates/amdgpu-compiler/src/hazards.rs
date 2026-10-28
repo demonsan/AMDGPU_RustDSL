@@ -72,6 +72,23 @@ fn movable(op: MOp) -> bool {
     )
 }
 
+/// VALU instructions whose VGPR result feeding an MFMA operand or a `v_permlane*_swap` needs wait
+/// states first (LLVM GCNHazardRecognizer: 2 states; 4 after carry-out adds). Found by the LLVM-tail
+/// oracle (docs/llvm-tail-integration.md); the exact count is taken from LLVM, not measured.
+fn valu_writer_delay(op: MOp) -> Option<usize> {
+    match op {
+        MOp::VAddCoU32 | MOp::VAddcCoU32 | MOp::VPtrAdd => Some(4),
+        MOp::VExpF32 | MOp::VRcpF32 => None,
+        o if movable(o) => Some(2),
+        MOp::VMovFromS | MOp::VMovFromSPair | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VCvtPknormU16 => Some(2),
+        _ => None,
+    }
+}
+
+fn reads_valu_hazard_operands(op: MOp) -> bool {
+    is_scaled_mfma(op) || matches!(op, MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
+}
+
 /// Instructions the scanner must never look past (waits, barriers, nops).
 fn is_fence(op: MOp) -> bool {
     matches!(op, MOp::SWaitVm | MOp::SWaitLgkm | MOp::SBarrier | MOp::SNop | MOp::SEndpgm)
@@ -125,7 +142,7 @@ pub fn fix_value_hazards(m: &mut MFunction) {
 
         let mut i = 0usize;
         while i < insts.len() {
-            let mut earliest = earliest_of(&insts[i], &ready, cycle);
+            let mut earliest = earliest_of(&insts[i], &ready, &vw, cycle);
 
             // Fill the stall with independent ALU work from further down the block.
             if earliest > cycle && !insts[i].op.consumes_vcc() {
@@ -138,7 +155,7 @@ pub fn fix_value_hazards(m: &mut MFunction) {
                     let cand = &insts[j];
                     let mut ok = movable(cand.op)
                         && cand.dst.is_some()
-                        && earliest_of(cand, &ready, cycle) <= cycle;
+                        && earliest_of(cand, &ready, &vw, cycle) <= cycle;
                     if ok {
                         let cd = canon(cand.dst.unwrap());
                         let cs: Vec<VReg> = cand.uses().into_iter().map(canon).collect();
@@ -165,12 +182,12 @@ pub fn fix_value_hazards(m: &mut MFunction) {
                         j += 1;
                     }
                     // The consumer may have become ready.
-                    earliest = earliest_of(&insts[i], &ready, cycle);
+                    earliest = earliest_of(&insts[i], &ready, &vw, cycle);
                 }
             }
 
             let inst = insts[i].clone();
-            let earliest = earliest_of(&inst, &ready, cycle);
+            let earliest = earliest_of(&inst, &ready, &vw, cycle);
             if earliest > cycle {
                 let mut missing = earliest - cycle;
                 while missing > 0 {
