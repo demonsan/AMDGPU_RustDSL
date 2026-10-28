@@ -27,7 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
-| fp8 matmul (real data) | `probe_fp8_matmul`: identity and per-lane-scale tests through the real fragment layout -> `PROBE_FP8_MATMUL_OK` |
+| fp8 matmul (real data, general) | `probe_fp8_matmul`: random E4M3 data with random per-lane E8M0 scales through the real fragment/scale layout, matched element by element against a CPU double reference (`FP8_TEST=1,2,3,4,6,7`) -> `PROBE_FP8_MATMUL_OK` |
 | fp8 load path | `probe_fp8_load`: address arithmetic and the ISA fragment mapping for the real-data fp8 matmul probe -> `PROBE_FP8_LOAD_OK` |
 | Pack instructions | `probe_pack`: `v_cvt_pknorm_u16_f32(1.0, 0.5)` = `0x8000FFFF`; `v_cvt_scalef32_pk_fp8_bf16` low half = `0xAAAA3838`, high half = `0x3838AAAA` → `PROBE_PACK_OK` |
 | LDS self-read | `probe_lds_self2`: own-slot read after a barrier → `SELF2_OK` |
@@ -271,9 +271,7 @@ The E8M0 scale *lane* mapping is partially pinned down:
   (the upper half of the bytes uses the +32 scale lane). Encoding that in the
   host reference makes the general random-data test pass.
 
-Next step: measure the exact byte-to-K map with a targeted probe (single 1.0 at
-one A byte vs. distinct fp8 values in the B bytes) and encode the two layouts in
-the host reference and in the FMHA kernel.
+
 
 ## Next: FMHA reference core loop
 
