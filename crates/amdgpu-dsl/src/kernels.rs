@@ -577,12 +577,13 @@ pub fn probe_roles_loop() -> Function {
 
     b.finish()
 }
-/// FMHA data path, two variants in one launch. Each lane stages 32 B into LDS
-/// (two `ds_write_b128`), reads them back with two `ds_read_b128`, and runs two
-/// block-scaled fp8 MFMAs:
-///   `o[tid*16 ..]`        <- cat(lo, hi) as the operand
-///   `o[8192 + tid*16 ..]` <- cat(lo, lo) as the operand
-/// All-ones E4M3 data with K = 64 means every element must be exactly 64.0.
+/// FMHA compute shape: two distinct operands staged in LDS.
+///
+/// Each lane stages an A tile (32 B at `tid*32`) and a B tile (32 B at
+/// `8192 + tid*32`), the workgroup synchronises, both tiles are read back with
+/// two `ds_read_b128` each, concatenated into Frag8 operands, and multiplied
+/// with the block-scaled fp8 MFMA. All-ones E4M3 with K = 64 means every output
+/// element must be exactly 64.0.
 pub fn probe_fmha_datapath() -> Function {
     let mut b = FnBuilder::new("probe_fmha_datapath", 512);
     b.lds(16384);
@@ -600,32 +601,30 @@ pub fn probe_fmha_datapath() -> Function {
     b.store_lds_b128(Opnd::Val(off), Opnd::Val(frag));
     let off_hi = b.add_i32(off, c16);
     b.store_lds_b128(Opnd::Val(off_hi), Opnd::Val(frag));
+    let boff = b.add_i32(c8k, off);
+    b.store_lds_b128(Opnd::Val(boff), Opnd::Val(frag));
+    let boff_hi = b.add_i32(boff, c16);
+    b.store_lds_b128(Opnd::Val(boff_hi), Opnd::Val(frag));
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
 
-    let lo = b.load_lds_b128(Opnd::Val(off));
-    let hi = b.load_lds_b128(Opnd::Val(off_hi));
-    let zero = b.frag_zero(DType::Frag16);
+    let a_lo = b.load_lds_b128(Opnd::Val(off));
+    let a_hi = b.load_lds_b128(Opnd::Val(off_hi));
+    let b_lo = b.load_lds_b128(Opnd::Val(boff));
+    let b_hi = b.load_lds_b128(Opnd::Val(boff_hi));
 
-    let a_hi = b.cat_frag8(lo, hi);
-    let d_hi = b.mfma_scale_fp8(a_hi, a_hi, zero, 127, 127);
-    let a_lo = b.cat_frag8(lo, lo);
-    let d_lo = b.mfma_scale_fp8(a_lo, a_lo, zero, 127, 127);
+    let a8 = b.cat_frag8(a_lo, a_hi);
+    let b8 = b.cat_frag8(b_lo, b_hi);
+    let zero = b.frag_zero(DType::Frag16);
+    let d = b.mfma_scale_fp8(a8, b8, zero, 127, 127);
 
     let row_off = b.mul_i32(tid, c16);
     let row = b.ptr_add(o, row_off);
     for i in 0..4u8 {
-        let bits = b.frag16_lane(d_hi, i);
+        let bits = b.frag16_lane(d, i);
         let value = b.bitcast_f32(bits);
         b.store_f32(row, 4 * i as u32, value);
-    }
-    let row2_off = b.add_i32(row_off, c8k);
-    let row2 = b.ptr_add(o, row2_off);
-    for i in 0..4u8 {
-        let bits = b.frag16_lane(d_lo, i);
-        let value = b.bitcast_f32(bits);
-        b.store_f32(row2, 4 * i as u32, value);
     }
     b.finish()
 }
