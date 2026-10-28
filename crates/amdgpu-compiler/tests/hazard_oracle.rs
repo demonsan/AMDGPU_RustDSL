@@ -166,7 +166,7 @@ fn hazard_matrix() {
         ));
     }
     eprintln!("pairs with LLVM-inserted filler: {total_llvm}; LLVM needs more nops than own for {missing}");
-    if let Ok(p) = std::env::var("AMDC_ORACLE_OUT") {
+    if let Some(p) = std::env::var("AMDC_ORACLE_OUT").ok().filter(|p| !p.is_empty()) {
         let mut out = String::from("| producer | consumer | LLVM nop cycles | own nop cycles | verdict | other LLVM filler |\n|---|---|---|---|---|---|\n");
         for r in rows {
             out.push_str(&r);
