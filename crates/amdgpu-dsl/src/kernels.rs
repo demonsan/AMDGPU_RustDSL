@@ -625,10 +625,13 @@ pub fn probe_fmha_datapath() -> Function {
 ///
 /// 8 waves per block: waves 0-3 are role A, waves 4-7 role B. The outer loop
 /// runs two iterations; inside it there are two sequential inner loops (an A
-/// phase and a B phase), each of which writes a phase-dependent value into LDS,
-/// synchronises, reads the partner lane's slot, accumulates it, and synchronises
-/// again. Nested loops, loop-carried accumulators, role-dependent values and
-/// paired barriers are all exercised, with a closed-form expected result.
+/// phase and a B phase). Each inner iteration writes a phase-dependent value
+/// into LDS, synchronises, reads the partner lane's slot, accumulates it, and
+/// synchronises again. The inner loops carry their own sum, which is merged into
+/// the outer accumulator after the loop (the IR forbids mutating an outer loop
+/// variable from an inner loop). Nested loops, loop-carried accumulators,
+/// role-dependent values and paired barriers are all exercised, with a
+/// closed-form expected result.
 pub fn probe_ab_loops() -> Function {
     let mut b = FnBuilder::new("probe_ab_loops", 512);
     b.lds(2048);
@@ -642,11 +645,9 @@ pub fn probe_ab_loops() -> Function {
     let c6 = b.c_i32(6);
     let c10 = b.c_i32(10);
     let c20 = b.c_i32(20);
+    let c256 = b.c_i32(256);
     let c1000 = b.c_i32(1000);
     let c2000 = b.c_i32(2000);
-    let c256 = b.c_i32(256);
-    let c512 = b.c_i32(512);
-    let c1024 = b.c_i32(1024);
 
     let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
     let is_a = b.cmp_lt_i32(wave, c4);
@@ -654,7 +655,6 @@ pub fn probe_ab_loops() -> Function {
     let partner = b.let_(Op::XorI32(Opnd::Val(tid), Opnd::Val(c256)));
     let partner_off = b.mul_i32(partner, c4);
 
-    // Outer loop carries the accumulator and the outer index.
     let zero = b.c_i32(0);
     let vars = b.begin_loop(&[(DType::I32, Opnd::Val(zero)), (DType::I32, Opnd::Val(zero))]);
     let acc = vars[0];
@@ -662,8 +662,9 @@ pub fn probe_ab_loops() -> Function {
 
     // ---- A phase -----------------------------------------------------------
     let ia_init = b.c_i32(0);
-    let inner = b.begin_loop(&[(DType::I32, Opnd::Val(ia_init))]);
-    let ia = inner[0];
+    let inner_a = b.begin_loop(&[(DType::I32, Opnd::Val(ia_init)), (DType::I32, Opnd::Val(zero))]);
+    let ia = inner_a[0];
+    let sum_a = inner_a[1];
 
     let t10 = b.mul_i32(outer, c10);
     let base_a = b.add_i32(t10, ia);
@@ -678,8 +679,8 @@ pub fn probe_ab_loops() -> Function {
     b.barrier();
     b.wait_lds(0);
     let got_a = b.load_lds_b32(Opnd::Val(partner_off));
-    let acc_a = b.add_i32(acc, got_a);
-    b.set_var(acc, acc_a);
+    let sum_a_next = b.add_i32(sum_a, got_a);
+    b.set_var(sum_a, sum_a_next);
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
@@ -690,11 +691,14 @@ pub fn probe_ab_loops() -> Function {
     let stop_a = b.let_(Op::NotI1(Opnd::Val(more_a)));
     b.break_if(Opnd::Val(stop_a));
     b.end_loop();
+    let acc_after_a = b.add_i32(acc, sum_a);
+    b.set_var(acc, acc_after_a);
 
     // ---- B phase -----------------------------------------------------------
     let ib_init = b.c_i32(0);
-    let inner_b = b.begin_loop(&[(DType::I32, Opnd::Val(ib_init))]);
+    let inner_b = b.begin_loop(&[(DType::I32, Opnd::Val(ib_init)), (DType::I32, Opnd::Val(zero))]);
     let ib = inner_b[0];
+    let sum_b = inner_b[1];
 
     let t20 = b.mul_i32(outer, c20);
     let base_b = b.add_i32(t20, ib);
@@ -709,8 +713,8 @@ pub fn probe_ab_loops() -> Function {
     b.barrier();
     b.wait_lds(0);
     let got_b = b.load_lds_b32(Opnd::Val(partner_off));
-    let acc_b = b.add_i32(acc, got_b);
-    b.set_var(acc, acc_b);
+    let sum_b_next = b.add_i32(sum_b, got_b);
+    b.set_var(sum_b, sum_b_next);
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
@@ -721,6 +725,8 @@ pub fn probe_ab_loops() -> Function {
     let stop_b = b.let_(Op::NotI1(Opnd::Val(more_b)));
     b.break_if(Opnd::Val(stop_b));
     b.end_loop();
+    let acc_after_b = b.add_i32(acc_after_a, sum_b);
+    b.set_var(acc, acc_after_b);
 
     let outer_next = b.add_i32(outer, c1);
     b.set_var(outer, outer_next);
@@ -729,11 +735,9 @@ pub fn probe_ab_loops() -> Function {
     b.break_if(Opnd::Val(stop_outer));
     b.end_loop();
 
-    // Store the final accumulator: o[tid*4] (raw bits).
     let out_off = b.mul_i32(tid, c4);
     let out_ptr = b.ptr_add(o, out_off);
-    let value = b.bitcast_f32(acc);
+    let value = b.bitcast_f32(acc_after_b);
     b.store_f32(out_ptr, 0, Opnd::Val(value));
-    let _ = (c512, c1024);
     b.finish()
 }
