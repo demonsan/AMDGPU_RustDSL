@@ -43,7 +43,8 @@ impl Queue {
         for v in self.e.values_mut() {
             v.after += 1;
         }
-        self.e.retain(|_, v| v.after < max);
+        // scalar loads return out of order: never assume they completed because of the count
+        self.e.retain(|_, v| v.after < max || v.smem);
         self.e.insert(id, Ent { after: 0, slots, smem });
     }
 
