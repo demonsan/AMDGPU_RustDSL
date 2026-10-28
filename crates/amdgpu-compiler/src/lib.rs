@@ -1,5 +1,6 @@
 //! Backend for the AMDGPU Rust DSL: lowering, register allocation, emission.
 
+pub mod backend;
 pub mod emit;
 pub mod hazards;
 pub mod lower;
@@ -12,8 +13,13 @@ pub struct Compiled {
     pub sgpr: u32,
 }
 
-/// Lowers, verifies, allocates and emits a kernel as gfx950 assembly text.
+/// Lowers, verifies, allocates and emits a kernel as gfx950 assembly text with our own tail.
 pub fn compile(f: &amdgpu_dsl::Function) -> Result<Compiled, String> {
+    compile_with(f, &backend::OwnTail)
+}
+
+/// Same pipeline, with a selectable tail backend (OwnTail or LlvmTail).
+pub fn compile_with(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend) -> Result<Compiled, String> {
     let mut m = lower::lower(f)?;
     hazards::fix_value_hazards(&mut m);
     let errs = mir::verify(&m);
@@ -21,8 +27,20 @@ pub fn compile(f: &amdgpu_dsl::Function) -> Result<Compiled, String> {
         return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
     }
     let alloc = regalloc::allocate(&m)?;
-    let asm = emit::emit(&m, &alloc);
+    let asm = tail.finish(&m, &alloc)?;
     Ok(Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
+}
+
+/// Lower, schedule and allocate, then export post-RA MIR (no llc involved).
+pub fn export_mir(f: &amdgpu_dsl::Function, tail: &backend::LlvmTail) -> Result<String, String> {
+    let mut m = lower::lower(f)?;
+    hazards::fix_value_hazards(&mut m);
+    let errs = mir::verify(&m);
+    if !errs.is_empty() {
+        return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
+    }
+    let alloc = regalloc::allocate(&m)?;
+    tail.export_mir(&m, &alloc)
 }
 
 /// All kernel definitions currently shipped with the DSL.

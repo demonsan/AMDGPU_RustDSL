@@ -1,0 +1,8 @@
+# backend.lock - LLVM the MIR tail was validated against (see docs/llvm-tail-integration.md).
+# Regenerate deliberately with: amdc backend write-lock  (after re-running the opcode probe and the oracle).
+dialect = llvm20
+llvm_version = AMD LLVM version 20.0.0git
+start_before = gcn-create-vopd
+forbidden_after_start = postmisched,machine-scheduler,post-RA-sched,block-placement,tailduplication,branch-folder,machine-cp,greedy,virtregrewriter,prologepilog,machine-sink,postra-machine-sink
+required_in_tail = si-insert-waitcnts,post-RA-hazard-rec
+tail_passes = gcn-create-vopd,si-memory-legalizer,machinedomtree,machine-loops,machinepostdomtree,si-insert-waitcnts,si-mode-register,si-insert-hard-clauses,si-late-branch-lowering,si-pre-emit-peephole,post-RA-hazard-rec,amdgpu-wait-sgpr-hazards,amdgpu-insert-delay-alu,branch-relaxation,RegUsageInfoCollector,remove-loads-into-fake-uses,livedebugvalues,machine-sanmd,amdgpu-preload-kern-arg-prolog,lazy-machine-block-freq,machine-opt-remark-emitter,stack-frame-layout,amdgpu-resource-usage
