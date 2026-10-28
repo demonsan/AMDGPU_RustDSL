@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **512-thread hd128 attention, LDS-staged K/V, A/B role loops** | `probe_fp8_fmha_hd128c`: reference tile shapes at reference scale — eight 32-row query tiles (256 rows) per block of 512, head dim 128, KV tile 128 processed as two 64-key online-softmax substeps, K (role A, waves 0-3) and V (role B, waves 4-7) copied through shared LDS (99,456 B), K fragments by `ds_read_b128`, V fragments by `ds_read_b64_tr_b8`, separate A/B steady loops with the same barrier schedule, four register-resident O accumulators; **224 VGPRs** (reference 246); all 8 waves match the host emulation (`1.8e-4`) -> `PROBE_FMHA_HD128C_OK` |
 | **head dim 128, KV tile 128** | `probe_fp8_fmha_hd128`: reference tile shapes — Q 32x128, four 32-key score tiles per iteration each the sum of two chained K=64 scaled MFMAs, two-pass 128-wide softmax, eight PV MFMAs (two 64-key halves x four 32-wide output tiles) with V through `ds_read_b64_tr_b8` at pitch 128, four register-resident O accumulators; 240 VGPRs (reference 246); `worst_err = 4.3e-7` vs the host emulation -> `PROBE_FMHA_HD128_OK` |
 | **512-thread tr + A/B role-split attention** | `probe_fp8_fmha_trab`: eight query tiles in one block of 512, V double-buffered in shared LDS and copied half by role A (waves 0-3) and half by role B (waves 4-7) with their own steady loops and identical barrier schedule, V consumed with `ds_read_b64_tr_b8`, 64 keys per iteration, register-resident O; all 8 waves match the host emulation (`1.8e-4`) -> `PROBE_FMHA_TRAB_OK` |
 | **64-key online softmax, V through `ds_read_b64_tr_b8`** | `probe_fp8_fmha_tr`: two score tiles and a 64-wide online softmax per iteration, quantised P as the full K=64 A fragment (lane group g keeps keys 32g..32g+31), row-major V staged in LDS and turned into the B fragment by four transposing reads, register-resident O accumulator; `worst_err = 3.4e-7` vs the host emulation, `3.8e-2` vs exact softmax -> `PROBE_FMHA_TR_OK` |
@@ -362,7 +363,7 @@ fully populated (176 VGPRs).
 `probe_fp8_fmha_trab` (round 26) combines the tr-based 64-key loop with the A/B role-split
 loops in a 512-thread block (192 VGPRs, 70,656 B LDS vs the reference 246 VGPRs / 84,224 B).
 
-Remaining distance to the reference kernel: see the round 27 section.
+Remaining distance to the reference kernel: see the round 28 section.
 
 ## Separate A/B loops and two lowering bugs (round 23)
 
@@ -424,6 +425,31 @@ codegen limits that are now documented:
 Remaining distance to the reference kernel: combining the hd128 loop with the 512-thread A/B role
 split (eight query tiles, K also staged through LDS), the `+0x80` KV progress updates and the
 rollback exits.
+
+## hd128 at reference scale and the register-allocator fixes (round 28)
+
+`probe_fp8_fmha_hd128b` (single wave, K and V staged in LDS, two 64-key substeps per 128-key tile)
+and `probe_fp8_fmha_hd128c` (the 512-thread, A/B role-split version) are verified on hardware. Getting
+the 512-thread kernel to fit needed several allocator / lowering improvements, found by listing the
+live wide vregs when allocation failed:
+
+1. **Live ranges stretched to position 0 (real bug).** Blocks with no instructions bumped every value
+   live across them at index 0, so any loop-carried accumulator that crossed an empty block (the
+   structured `if`/loop skeleton creates many) was treated as live from the start of the function.
+   Both role loops' four O accumulators (128 dwords) were therefore live simultaneously for the whole
+   kernel. Empty blocks now use their true linear position; `hd128c` dropped from "out of VGPRs" to
+   224.
+2. **Constants are rematerialised per loop** instead of staying live across the whole loop body.
+3. **Zero fragments are rematerialised** at use and MFMA destinations on a zero accumulator are
+   zero-filled directly; single-use MFMA/`Frag16Build` accumulators are updated in place (no copy and
+   no second sixteen-dword live range).
+4. **Fallback allocation policy.** If compact allocation runs out of registers, retry with narrow
+   operands packed from the top of the file so the low registers stay as dense sixteen-dword blocks.
+5. The allocator failure message now lists live wide vregs and prints the register map.
+
+Remaining distance to the reference kernel: the `+0x80` KV progress updates and the rollback exits,
+plus replacing our row-per-lane LDS softmax with the reference's in-register `v_max3_f32` /
+`v_cmp_nge_f32` rollback structure.
 
 ## Next: FMHA reference core loop
 
