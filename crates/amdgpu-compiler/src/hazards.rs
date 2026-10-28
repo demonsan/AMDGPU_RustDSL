@@ -103,11 +103,23 @@ pub fn fix_value_hazards(m: &mut MFunction) {
         // Virtual register -> (earliest cycle at which its in-flight result may be read, whether
         // the producer is a scaled MFMA).
         let mut ready: HashMap<VReg, (usize, bool)> = HashMap::new();
+        // Virtual register -> earliest cycle at which a plain VALU result may feed an MFMA operand
+        // or a permlane (a different, shorter hazard than the in-flight latencies above).
+        let mut vw: HashMap<VReg, usize> = HashMap::new();
         let mut cycle = 0usize;
 
         // The earliest cycle at which `inst` may issue given the in-flight results.
-        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, cycle: usize| -> usize {
+        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, usize>, cycle: usize| -> usize {
             let mut earliest = cycle;
+            if reads_valu_hazard_operands(inst.op) {
+                for s in &inst.srcs {
+                    if let Src::Reg(r) = s {
+                        if let Some(rd) = vw.get(&canon(*r)) {
+                            earliest = earliest.max(*rd);
+                        }
+                    }
+                }
+            }
             let chained = is_scaled_mfma(inst.op);
             let c_reg = if chained && inst.srcs.len() > 2 && inst.op == MOp::VMfmaScale32x32x64Fp8 {
                 match inst.srcs[2] {
@@ -174,6 +186,10 @@ pub fn fix_value_hazards(m: &mut MFunction) {
                         let x = insts.remove(j);
                         if let Some(d) = x.dst {
                             ready.remove(&canon(d));
+                            vw.remove(&canon(d));
+                            if let Some(dly) = valu_writer_delay(x.op) {
+                                vw.insert(canon(d), cycle + 1 + dly);
+                            }
                         }
                         out.push(x);
                         cycle += 1;
@@ -199,6 +215,10 @@ pub fn fix_value_hazards(m: &mut MFunction) {
             }
             if let Some(d) = inst.dst {
                 ready.remove(&canon(d));
+                vw.remove(&canon(d));
+                if let Some(dly) = valu_writer_delay(inst.op) {
+                    vw.insert(canon(d), cycle + 1 + dly);
+                }
             }
             if is_transcendental(inst.op) {
                 if let Some(d) = inst.dst {
