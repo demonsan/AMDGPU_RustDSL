@@ -138,6 +138,7 @@ pub enum Op {
     ShlI32(Opnd, Opnd),
     LshrI32(Opnd, Opnd),
     AndI32(Opnd, Opnd),
+    XorI32(Opnd, Opnd),
 
     AddF32(Opnd, Opnd),
     SubF32(Opnd, Opnd),
@@ -202,7 +203,7 @@ impl Op {
     pub fn result_ty(&self) -> DType {
         match self {
             Op::ConstI32(_) | Op::KernargI32 { .. } | Op::AddI32(..) | Op::MulI32(..) => DType::I32,
-            Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::LoadU16 { .. } => DType::I32,
+            Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::XorI32(..) | Op::LoadU16 { .. } => DType::I32,
             Op::ConstF32(_) | Op::KernargF32 { .. } => DType::F32,
             Op::AddF32(..) | Op::SubF32(..) | Op::MulF32(..) | Op::MaxF32(..) | Op::FmaF32(..) => {
                 DType::F32
@@ -241,6 +242,7 @@ impl Op {
             | Op::ShlI32(a, b)
             | Op::LshrI32(a, b)
             | Op::AndI32(a, b)
+            | Op::XorI32(a, b)
             | Op::AddF32(a, b)
             | Op::SubF32(a, b)
             | Op::MulF32(a, b)
@@ -523,6 +525,10 @@ impl FnBuilder {
         self.let_(Op::MaxF32(a.into(), b.into()))
     }
 
+    pub fn xor_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::XorI32(a.into(), b.into()))
+    }
+
     pub fn max3_f32(
         &mut self,
         a: impl Into<Opnd>,
@@ -795,6 +801,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     | Op::ShlI32(a, b)
                     | Op::LshrI32(a, b)
                     | Op::AndI32(a, b)
+                    | Op::XorI32(a, b)
                     | Op::CmpLtI32(a, b)
                     | Op::CmpGeI32(a, b) => {
                         if let Err(e) = expect_int(f, *a, "int op") {

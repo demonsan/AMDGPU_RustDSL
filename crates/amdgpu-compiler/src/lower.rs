@@ -506,6 +506,7 @@ impl Lowerer {
             Op::MulF32(a, b) => self.bin_v1(dst, MOp::VMulF32, *a, *b)?,
             Op::MaxF32(a, b) => self.bin_v1(dst, MOp::VMaxF32, *a, *b)?,
             Op::AndI32(a, b) => self.bin_v1(dst, MOp::VAndB32, *a, *b)?,
+            Op::XorI32(a, b) => self.bin_v1(dst, MOp::VXorB32, *a, *b)?,
             Op::MulI32(a, b) => self.bin_v1(dst, MOp::VMulLoU32, *a, *b)?,
             Op::ShlI32(a, b) => {
                 // lshlrev encodes the shift in src0, where a literal is legal.

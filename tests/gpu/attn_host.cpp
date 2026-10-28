@@ -255,6 +255,33 @@ int main(int argc, char** argv) {
         std::printf(roles_bad ? "PROBE_ROLES_FAIL\n" : "PROBE_ROLES_OK\n");
         return roles_bad != 0;
     }
+    if (std::strcmp(kern, "probe_waves2") == 0) {
+        // Block 128 (two waves): o[tid] must be the lane's own id after the
+        // barrier, o[128+tid] the partner wave's id.
+        float vals[256] = {0.0f};
+        std::memcpy(vals, got.data(), sizeof(vals));
+        int own_bad = 0;
+        int partner_bad = 0;
+        for (int tid = 0; tid < 128; ++tid) {
+            int w = tid / 64;
+            int l = tid % 64;
+            if (std::fabs(vals[tid] - (float)tid) > 0.5f) {
+                ++own_bad;
+            }
+            int want = (w ^ 1) * 64 + l;
+            if (std::fabs(vals[128 + tid] - (float)want) > 0.5f) {
+                if (partner_bad < 6) {
+                    std::fprintf(stderr, "waves2 mismatch tid=%d got=%.1f want=%d\n", tid,
+                                 vals[128 + tid], want);
+                }
+                ++partner_bad;
+            }
+        }
+        std::printf("  waves2 own_bad=%d partner_bad=%d own[0]=%.1f partner[0]=%.1f\n", own_bad,
+                    partner_bad, vals[0], vals[128]);
+        std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
+        return (own_bad || partner_bad) ? 1 : 0;
+    }
     if (std::strcmp(kern, "attention_fwd") != 0) {
         // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,
         // 4 corr, 5 p, 6 l_new, 7 scaled (last iteration).
