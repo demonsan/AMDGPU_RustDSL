@@ -17,7 +17,11 @@ use crate::mir::*;
 pub fn lower(f: &Function) -> Result<MFunction, String> {
     let errs = amdgpu_dsl::verify(f);
     if !errs.is_empty() {
-        return Err(format!("IR verification failed:\n  {}", errs.join("\n  ")));
+        return Err(format!(
+            "IR verification failed:\n  {}\nIR:\n{}",
+            errs.join("\n  "),
+            f.dump()
+        ));
     }
     let mut lw = Lowerer::new(f);
     lw.run(f)?;
