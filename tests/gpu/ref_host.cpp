@@ -54,9 +54,11 @@ int main(int argc, char** argv) {
     for (auto& x : v) x = palette[rnd() % 11];
     if (std::getenv("REF_QZ")) std::fill(q.begin(), q.end(), 0);
     // E8M0 descales: [B, S, H, 4], padded with zeroed slack rows for the unguarded tile gathers.
-    const size_t qrows = (size_t)((S + 255) / 256) * 256 + 256, krows = (size_t)((SK + 127) / 128) * 128 + 512;
-    std::vector<unsigned char> qs((size_t)B * qrows * H * 4, 0), ks((size_t)B * krows * H * 4, 0);
-    auto qs_at = [&](int b, int s, int h, int blk) -> unsigned char& { return qs[(((size_t)b * qrows + s) * H + h) * 4 + blk]; };
+    // Descale tensors are contiguous [B, S, H, 4] (batch stride S * H * 4); only the end of the
+    // allocation carries zeroed slack for the kernel's unguarded tile gathers.
+    const size_t qrows = (size_t)S, krows = (size_t)SK;
+    const size_t q_slack = (size_t)(256 + 256) * H * 4, k_slack = (size_t)(512 + 128) * H * 4;
+    std::vector<unsigned char> qs((size_t)B * qrows * H * 4 + q_slack, 0), ks((size_t)B * krows * H * 4 + k_slack, 0);    auto qs_at = [&](int b, int s, int h, int blk) -> unsigned char& { return qs[(((size_t)b * qrows + s) * H + h) * 4 + blk]; };
     auto ks_at = [&](int b, int s, int h, int blk) -> unsigned char& { return ks[(((size_t)b * krows + s) * H + h) * 4 + blk]; };
     for (int b = 0; b < B; ++b)
         for (int s = 0; s < S; ++s)
