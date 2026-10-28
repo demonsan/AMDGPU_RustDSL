@@ -44,6 +44,11 @@ impl LlvmTools {
         if let Ok(p) = std::env::var("ROCM_LLVM_BIN") {
             return LlvmTools { bin: PathBuf::from(p) };
         }
+        // Primary pin: llc built against the ROCm 10.1.0 libLLVM (ROCm 10 ships no llc binary).
+        let pin = Path::new("/shared/amdgpu/home/blyu_qle/llvm-tools/rocm-10.1.0/bin");
+        if pin.join("llc").exists() {
+            return LlvmTools { bin: pin.to_path_buf() };
+        }
         let roc = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/shared/apps/ubuntu/opt/rocm-7.0.2".to_string());
         LlvmTools { bin: Path::new(&roc).join("llvm").join("bin") }
     }

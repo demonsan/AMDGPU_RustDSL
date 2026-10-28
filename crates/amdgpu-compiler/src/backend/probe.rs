@@ -108,7 +108,7 @@ impl Report {
              forbidden_after_start = {}\n\
              required_in_tail = {}\n\
              tail_passes = {}\n",
-            llvm20::NAME,
+            llvm20::current().name,
             self.version,
             self.start_before,
             FORBIDDEN_AFTER_START.join(","),
@@ -164,15 +164,25 @@ impl Lock {
         c.exists().then_some(c)
     }
 
+    /// The lock for the current dialect: ackend.lock if it pins this dialect, else ackend.<dialect>.lock.
     pub fn find_and_load() -> Result<Lock, String> {
         let p = Lock::find().ok_or("backend.lock not found (run from the repo or set AMDC_BACKEND_LOCK)")?;
         let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-        Lock::parse(&text)
+        let l = Lock::parse(&text)?;
+        if l.dialect == llvm20::current().name {
+            return Ok(l);
+        }
+        let alt = p.with_file_name(format!("backend.{}.lock", llvm20::current().name));
+        if alt.exists() {
+            let text = std::fs::read_to_string(&alt).map_err(|e| format!("{}: {e}", alt.display()))?;
+            return Lock::parse(&text);
+        }
+        Ok(l)
     }
 
     pub fn check_version(&self, version: &str) -> Result<(), String> {
-        if self.dialect != llvm20::NAME {
-            return Err(format!("backend.lock dialect '{}' but this build only has '{}'", self.dialect, llvm20::NAME));
+        if self.dialect != llvm20::current().name {
+            return Err(format!("backend.lock dialect '{}' but this build only has '{}'", self.dialect, llvm20::current().name));
         }
         if self.llvm_version != version {
             return Err(format!(

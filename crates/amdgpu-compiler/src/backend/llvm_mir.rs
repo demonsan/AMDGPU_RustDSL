@@ -249,7 +249,7 @@ pub fn export_opts(m: &MFunction, a: &Alloc, markers: bool, drop_auto_waits: boo
     // 3. Header from the per-version template.
     let (irargs, kernarg) = kernarg_ir(m)?;
     let kernarg = ((kernarg + 7) / 8) * 8;
-    let mut mir = llvm20::HEADER_SRC
+    let mut mir = llvm20::current().header_src
         .replace("@NAME@", &m.name)
         .replace("@IRARGS@", &irargs.join(", "))
         .replace("@FLATWG@", &m.workgroup_size.to_string())

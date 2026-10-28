@@ -1,0 +1,110 @@
+--- |
+  target triple = "amdgcn-amd-amdhsa"
+
+  define amdgpu_kernel void @@NAME@(@IRARGS@) #0 {
+    ret void
+  }
+
+  attributes #0 = { "amdgpu-flat-work-group-size"="@FLATWG@,@FLATWG@" "amdgpu-ieee"="false" "amdgpu-no-completion-action" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "target-cpu"="gfx950" "uniform-work-group-size"="false" }
+
+...
+---
+name:            @NAME@
+alignment:       4
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+failedISel:      false
+tracksRegLiveness: true
+hasWinCFI:       false
+noPhis:          true
+isSSA:           false
+noVRegs:         true
+hasFakeUses:     false
+callsEHReturn:   false
+callsUnwindInit: false
+hasEHContTarget: false
+hasEHScopes:     false
+hasEHFunclets:   false
+isOutlined:      false
+debugInstrRef:   true
+failsVerification: false
+tracksDebugUserValues: true
+registers:       []
+liveins:         []
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    1
+  adjustsStack:    false
+  hasCalls:        false
+  framePointerPolicy: none
+  stackProtector:  ''
+  functionContext: ''
+  maxCallFrameSize: 0
+  cvBytesOfCalleeSavedRegisters: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+  hasTailCall:     false
+  isCalleeSavedInfoValid: true
+  localFrameSize:  0
+fixedStack:      []
+stack:           []
+entry_values:    []
+callSites:       []
+debugValueSubstitutions: []
+constants:       []
+machineFunctionInfo:
+  explicitKernArgSize: @KERNARG@
+  maxKernArgAlign: 8
+  ldsSize:         @LDS@
+  gdsSize:         0
+  dynLDSAlign:     1
+  isEntryFunction: true
+  isChainFunction: false
+  memoryBound:     false
+  waveLimiter:     false
+  hasSpilledSGPRs: false
+  hasSpilledVGPRs: false
+  hasNoWWMPoolSGPRSpillFallback: false
+  numWaveDispatchSGPRs: 0
+  numWaveDispatchVGPRs: 0
+  scratchRSrcReg:  '$private_rsrc_reg'
+  frameOffsetReg:  '$fp_reg'
+  stackPtrOffsetReg: '$sgpr32'
+  bytesInStackArgArea: 0
+  returnsVoid:     true
+  argumentInfo:
+    kernargSegmentPtr: { reg: '$sgpr0_sgpr1' }
+    workGroupIDX:    { reg: '$sgpr2' }
+    workGroupIDY:    { reg: '$sgpr3' }
+    workGroupIDZ:    { reg: '$sgpr4' }
+    workItemIDX:     { reg: '$vgpr0' }
+  psInputAddr:     0
+  psInputEnable:   0
+  maxMemoryClusterDWords: 8
+  mode:
+    ieee:            false
+    dx10-clamp:      true
+    fp32-input-denormals: true
+    fp32-output-denormals: true
+    fp64-fp16-input-denormals: true
+    fp64-fp16-output-denormals: true
+  highBitsOf32BitAddress: 0
+  occupancy:       8
+  vgprForAGPRCopy: ''
+  sgprForEXECCopy: '$sgpr100_sgpr101'
+  longBranchReservedReg: ''
+  hasInitWholeWave: false
+  dynamicVGPRBlockSize: 0
+  scratchReservedForDynamicVGPRs: 0
+  numKernargPreloadSGPRs: 0
+  isWholeWaveFunction: false
+  minNumAGPRs:     4294967295
+body:             |

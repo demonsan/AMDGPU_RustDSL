@@ -10,7 +10,11 @@ chmod 700 "$XDG_RUNTIME_DIR"
 
 # Optional read-only mount of the ROCm tree so the LLVM-tail tests can run llc in the container.
 EXTRA=()
-if [ -n "${AMD_ROCM_MOUNT:-}" ]; then EXTRA=(-v "$AMD_ROCM_MOUNT:$AMD_ROCM_MOUNT:ro" -e ROCM_LLVM_BIN="$AMD_ROCM_MOUNT/llvm/bin"); fi
+# AMD_ROCM_MOUNT may list several directories; AMD_LLVM_BIN overrides the tool directory.
+if [ -n "${AMD_ROCM_MOUNT:-}" ]; then
+    for m in $AMD_ROCM_MOUNT; do EXTRA+=(-v "$m:$m:ro"); done
+    EXTRA+=(-e ROCM_LLVM_BIN="${AMD_LLVM_BIN:-${AMD_ROCM_MOUNT%% *}/llvm/bin}")
+fi
 
 podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}" \
     -v "$REPO:/work:Z" \
@@ -23,6 +27,8 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e AMDC_TEST_KERNELS="${AMDC_TEST_KERNELS:-}" \
     -e AMDC_KEEP_MIR="${AMDC_KEEP_MIR:-}" \
     -e AMDC_LLC_ARGS="${AMDC_LLC_ARGS:-}" \
+    -e AMDC_DIALECT="${AMDC_DIALECT:-}" \
+    -e AMDC_DROP_AUTO_WAITS="${AMDC_DROP_AUTO_WAITS:-}" \
     -e AMDC_SCHED="${AMDC_SCHED:-}" \
     -e AMDC_SCHED_OPTS="${AMDC_SCHED_OPTS:-}" \
     -w /work \

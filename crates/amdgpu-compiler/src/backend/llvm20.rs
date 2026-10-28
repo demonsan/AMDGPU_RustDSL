@@ -11,6 +11,38 @@ pub const NAME: &str = "llvm20";
 /// `llc --version` first line this dialect was written and validated against.
 pub const LLC_VERSION_PREFIX: &str = "AMD LLVM version 20.";
 pub const TABLE_SRC: &str = include_str!("llvm20.tbl");
+
+/// One LLVM version's data: selected by the probed llc --version (or AMDC_DIALECT).
+#[derive(Debug)]
+pub struct Dialect {
+    pub name: &'static str,
+    pub version_prefix: &'static str,
+    pub table_src: &'static str,
+    pub header_src: &'static str,
+}
+
+pub const DIALECTS: &[Dialect] = &[
+    Dialect { name: "llvm20", version_prefix: "AMD LLVM version 20.", table_src: include_str!("llvm20.tbl"), header_src: include_str!("llvm20_header.txt") },
+    Dialect { name: "llvm24", version_prefix: "AMD LLVM version 24.", table_src: include_str!("llvm24.tbl"), header_src: include_str!("llvm24_header.txt") },
+];
+
+/// The dialect for the pinned LLVM: $AMDC_DIALECT, else matched against llc --version, else the primary pin (llvm24).
+pub fn current() -> &'static Dialect {
+    static CUR: std::sync::OnceLock<&'static Dialect> = std::sync::OnceLock::new();
+    CUR.get_or_init(|| {
+        if let Ok(n) = std::env::var("AMDC_DIALECT") {
+            if let Some(d) = DIALECTS.iter().find(|d| d.name == n) {
+                return d;
+            }
+        }
+        if let Ok(v) = super::probe::llc_version(&super::LlvmTools::locate()) {
+            if let Some(d) = DIALECTS.iter().find(|d| v.starts_with(d.version_prefix)) {
+                return d;
+            }
+        }
+        &DIALECTS[DIALECTS.len() - 1]
+    })
+}
 pub const HEADER_SRC: &str = include_str!("llvm20_header.txt");
 /// Pass the tail starts at; first one that exists in the pipeline is used.
 pub const START_PASS_PREFERENCE: &[&str] = &["gcn-create-vopd", "si-memory-legalizer"];
@@ -86,7 +118,7 @@ impl Table {
     }
 
     pub fn load() -> Table {
-        Table::parse(TABLE_SRC).expect("llvm20.tbl is malformed")
+        Table::parse(current().table_src).expect("llvm20.tbl is malformed")
     }
 
     /// Most specific row for an instruction: `Op:kinds` then `Op`.
