@@ -123,7 +123,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_roles_loop") == 0 ||
                              std::strcmp(kern, "probe_fmha_datapath") == 0 ||
                              std::strcmp(kern, "probe_ab_loops") == 0 ||
-                             std::strcmp(kern, "probe_nested_acc") == 0;
+                             std::strcmp(kern, "probe_nested_acc") == 0 ||
+                             std::strcmp(kern, "probe_loop_mfma") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -294,6 +295,24 @@ int main(int argc, char** argv) {
                     partner_bad, bits[0], bits[128]);
         std::printf((own_bad || partner_bad) ? "PROBE_WAVES2_FAIL\n" : "PROBE_WAVES2_OK\n");
         return (own_bad || partner_bad) ? 1 : 0;
+    }
+    if (std::strcmp(kern, "probe_loop_mfma") == 0) {
+        // Two accumulated K=64 MFMAs over ones data: every element must be 128.0.
+        const unsigned int want = 0x43000000u;  // 128.0f
+        unsigned int bits[2048] = {0};
+        std::memcpy(bits, got.data(), sizeof(bits));
+        int lm_bad = 0;
+        for (int i = 0; i < 2048; ++i) {
+            if (bits[i] != want) {
+                if (lm_bad < 6) {
+                    std::fprintf(stderr, "loop_mfma mismatch i=%d got=0x%08x\n", i, bits[i]);
+                }
+                ++lm_bad;
+            }
+        }
+        std::printf("  loop_mfma bad=%d sample=0x%08x\n", lm_bad, bits[0]);
+        std::printf(lm_bad ? "PROBE_LOOP_MFMA_FAIL\n" : "PROBE_LOOP_MFMA_OK\n");
+        return lm_bad != 0;
     }
     if (std::strcmp(kern, "probe_nested_acc") == 0) {
         // Expected raw integer per lane: 3 + 2*tid.

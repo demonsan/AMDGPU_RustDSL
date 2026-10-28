@@ -263,6 +263,28 @@ impl Lowerer {
         }
     }
 
+    /// Copy a whole register (all dwords of its class) into `dst`.
+    fn copy_reg(&mut self, dst: VReg, src: VReg) -> Result<(), String> {
+        if dst == src {
+            return Ok(());
+        }
+        let class = self.mir.vreg_class(src);
+        let width = class.dwords() as usize;
+        if width == 1 {
+            self.push(MInst::new(MOp::VMovB32).def(dst).srcreg(src));
+            return Ok(());
+        }
+        if self.mir.vreg_class(dst) != class {
+            return Err(format!("copy_reg: class mismatch {:?} -> {:?}", class, self.mir.vreg_class(dst)));
+        }
+        for i in 0..width {
+            let t = self.new_vreg(RClass::V1);
+            self.push(MInst::new(MOp::VReadSub).def(t).srcreg(src).imm(i as i64));
+            self.push(MInst::new(MOp::VWriteSub).def(dst).srcreg(t).imm(i as i64));
+        }
+        Ok(())
+    }
+
     /// Sixteen-dword fragment operand.
     fn as_v16(&mut self, o: Opnd) -> Result<VReg, String> {
         match o {
@@ -344,21 +366,28 @@ impl Lowerer {
                     );
                 }
                 Stmt::SetVar { var, value } => {
-                    let src = self.as_v1(*value)?;
                     let dst = self.vars[var.0 as usize];
-                    if self.mir.vreg_class(dst) != RClass::V1 {
-                        return Err("pointer loop variables are not supported yet".to_string());
-                    }
+                    let class = self.mir.vreg_class(dst);
+                    let src = match class {
+                        RClass::V1 => self.as_v1(*value)?,
+                        RClass::V2 => self.as_v2(*value)?,
+                        RClass::V4 => self.as_v4(*value)?,
+                        RClass::V8 => self.as_v8(*value)?,
+                        RClass::V16 => self.as_v16(*value)?,
+                        other => return Err(format!("loop variable class {other:?} is not supported")),
+                    };
                     self.touch(&[Src::Reg(src)]);
-                    if src != dst {
-                        self.push(MInst::new(MOp::VMovB32).def(dst).srcreg(src));
-                    }
+                    self.copy_reg(dst, src)?;
                 }
                 Stmt::BeginLoop { vars, init } => {
                     for (i, var) in vars.iter().enumerate() {
                         let ty = f.var_ty(*var).ok_or("loop var has no type")?;
                         let class = match ty {
                             DType::Ptr => return Err("pointer loop variables are not supported".to_string()),
+                            DType::Frag2 => RClass::V2,
+                            DType::Frag4 => RClass::V4,
+                            DType::Frag8 => RClass::V8,
+                            DType::Frag16 => RClass::V16,
                             _ => RClass::V1,
                         };
                         let r = self.new_vreg(class);
@@ -366,9 +395,16 @@ impl Lowerer {
                             self.vars.resize(var.0 as usize + 1, u32::MAX);
                         }
                         self.vars[var.0 as usize] = r;
-                        let src = self.as_v1(init[i])?;
+                        let src = match class {
+                            RClass::V1 => self.as_v1(init[i])?,
+                            RClass::V2 => self.as_v2(init[i])?,
+                            RClass::V4 => self.as_v4(init[i])?,
+                            RClass::V8 => self.as_v8(init[i])?,
+                            RClass::V16 => self.as_v16(init[i])?,
+                            _ => return Err("unsupported loop variable class".to_string()),
+                        };
                         self.touch(&[Src::Reg(src)]);
-                        self.push(MInst::new(MOp::VMovB32).def(r).srcreg(src));
+                        self.copy_reg(r, src)?;
                     }
                     let header = self.fresh_label();
                     let exit = self.fresh_label();

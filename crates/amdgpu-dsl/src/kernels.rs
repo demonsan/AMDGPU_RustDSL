@@ -794,3 +794,61 @@ pub fn probe_nested_acc() -> Function {
     b.store_f32(out_ptr, 0, Opnd::Val(value));
     b.finish()
 }
+/// FMHA accumulation loop: a Frag16 register accumulator is carried across loop
+/// iterations and updated by `v_mfma_scale_f32_32x32x64_f8f6f4` each iteration
+/// (the accumulator is a loop variable of fragment type). Two iterations with
+/// all-ones E4M3 data at K = 64 must produce 128.0 in every element.
+pub fn probe_loop_mfma() -> Function {
+    let mut b = FnBuilder::new("probe_loop_mfma", 512);
+    b.lds(16384);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+
+    let ones = b.c_i32(0x38383838_u32 as i32);
+    let c1 = b.c_i32(1);
+    let c2 = b.c_i32(2);
+    let c8k = b.c_i32(8192);
+    let c16 = b.c_i32(16);
+    let c0 = b.c_i32(0);
+    let frag = b.frag4(ones, ones, ones, ones);
+    let zero = b.frag_zero(DType::Frag16);
+
+    let off = b.mul_i32(tid, c16);
+    let boff = b.add_i32(c8k, off);
+
+    let vars = b.begin_loop(&[(DType::Frag16, Opnd::Val(zero)), (DType::I32, Opnd::Val(c0))]);
+    let acc = vars[0];
+    let it = vars[1];
+
+    b.store_lds_b128(Opnd::Val(off), Opnd::Val(frag));
+    b.store_lds_b128(Opnd::Val(boff), Opnd::Val(frag));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let a_lo = b.load_lds_b128(Opnd::Val(off));
+    let b_lo = b.load_lds_b128(Opnd::Val(boff));
+    let a8 = b.cat_frag8(a_lo, a_lo);
+    let b8 = b.cat_frag8(b_lo, b_lo);
+    let d = b.mfma_scale_fp8(a8, b8, acc, 127, 127);
+    b.set_var(acc, d);
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    let it_next = b.add_i32(it, c1);
+    b.set_var(it, it_next);
+    let more = b.cmp_lt_i32(it_next, c2);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+
+    let row_off = b.mul_i32(tid, c16);
+    let row = b.ptr_add(o, row_off);
+    for i in 0..4u8 {
+        let bits = b.frag16_lane(acc, i);
+        let value = b.bitcast_f32(bits);
+        b.store_f32(row, 4 * i as u32, value);
+    }
+    b.finish()
+}
