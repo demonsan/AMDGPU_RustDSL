@@ -48,6 +48,8 @@ struct Lowerer {
     defs: HashMap<ValueId, Op>,
     /// How many times each value is used as an operand anywhere in the function.
     use_counts: HashMap<ValueId, usize>,
+    /// Cache of sub-register views: (tuple, dword offset, class) -> alias vreg.
+    alias_cache: HashMap<(VReg, u8, RClass), VReg>,
 }
 
 impl Lowerer {
@@ -70,6 +72,7 @@ impl Lowerer {
             blocks: Vec::new(),
             vregs: Vec::new(),
             loops: Vec::new(),
+            alias: HashMap::new(),
         };
         mir.blocks.push(Block::new(0));
 
@@ -123,6 +126,7 @@ impl Lowerer {
             next_label: 1,
             defs,
             use_counts,
+            alias_cache: HashMap::new(),
         }
     }
 
@@ -183,6 +187,7 @@ impl Lowerer {
         let mut need_lgkm = false;
         for s in srcs {
             if let Src::Reg(r) = s {
+                let r = &self.mir.canon(*r);
                 if self.pending_vmem.contains(r) {
                     need_vm = true;
                 }
@@ -200,6 +205,60 @@ impl Lowerer {
             self.pending_smem.clear();
             self.pending_lds.clear();
         }
+    }
+
+    /// A sub-register view of `tuple` at dword `off` (no instruction, no register of its own).
+    fn alias_vreg(&mut self, tuple: VReg, off: u8, class: RClass) -> VReg {
+        let tuple = self.mir.canon(tuple);
+        if let Some(a) = self.alias_cache.get(&(tuple, off, class)) {
+            return *a;
+        }
+        let a = self.new_vreg(class);
+        self.mir.alias.insert(a, (tuple, off));
+        self.alias_cache.insert((tuple, off, class), a);
+        a
+    }
+
+    /// Make the instruction that produced value `v` write `new_dst` directly (instead of a fresh
+    /// register that would then be moved into a fragment). Only for single-use results of plain
+    /// ALU ops defined earlier in the current block.
+    fn retarget_producer(&mut self, v: ValueId, new_dst: VReg) -> bool {
+        let mut cur = v;
+        loop {
+            if self.use_counts.get(&cur).copied() != Some(1) {
+                return false;
+            }
+            match self.defs.get(&cur) {
+                Some(Op::BitcastF32(Opnd::Val(i))) | Some(Op::BitcastI32(Opnd::Val(i))) => cur = *i,
+                Some(Op::MulF32(..))
+                | Some(Op::AddF32(..))
+                | Some(Op::SubF32(..))
+                | Some(Op::AddI32(..))
+                | Some(Op::ShlI32(..))
+                | Some(Op::XorI32(..))
+                | Some(Op::MulI32(..)) => break,
+                _ => return false,
+            }
+        }
+        let r = match self.val.get(&cur) {
+            Some(r) => *r,
+            None => return false,
+        };
+        if self.mir.vreg_class(r) != RClass::V1 || self.mir.alias.contains_key(&r) {
+            return false;
+        }
+        let insts = &mut self.mir.blocks[self.cur].insts;
+        for inst in insts.iter_mut().rev() {
+            if inst.dst == Some(r) {
+                inst.dst = Some(new_dst);
+                self.val.insert(cur, new_dst);
+                return true;
+            }
+            if inst.uses().contains(&r) {
+                return false;
+            }
+        }
+        false
     }
 
     /// A freshly zeroed sixteen-dword fragment.
@@ -355,9 +414,9 @@ impl Lowerer {
             return Err(format!("copy_reg: class mismatch {:?} -> {:?}", class, self.mir.vreg_class(dst)));
         }
         for i in 0..width {
-            let t = self.new_vreg(RClass::V1);
-            self.push(MInst::new(MOp::VReadSub).def(t).srcreg(src).imm(i as i64));
-            self.push(MInst::new(MOp::VWriteSub).def(dst).srcreg(t).imm(i as i64));
+            let s = self.alias_vreg(src, i as u8, RClass::V1);
+            let d = self.alias_vreg(dst, i as u8, RClass::V1);
+            self.push(MInst::new(MOp::VMovB32).def(d).srcreg(s));
         }
         Ok(())
     }
@@ -462,6 +521,31 @@ impl Lowerer {
                     };
                     self.touch(&[Src::Reg(src)]);
                     self.copy_reg(dst, src)?;
+                }
+                Stmt::VarScaleF32 { var, scalar } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let s = self.as_v1(*scalar)?;
+                    self.touch(&[Src::Reg(v), Src::Reg(s)]);
+                    for i in 0..16u8 {
+                        let a = self.alias_vreg(v, i, RClass::V1);
+                        self.push(MInst::new(MOp::VMulF32).def(a).srcreg(a).srcreg(s));
+                    }
+                }
+                Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let ra = self.as_v8(*a)?;
+                    let rb = self.as_v8(*b)?;
+                    let sa = self.as_v1(*scale_a)?;
+                    let sb = self.as_v1(*scale_b)?;
+                    self.push(
+                        MInst::new(MOp::VMfmaScale32x32x64Fp8)
+                            .def(v)
+                            .srcreg(ra)
+                            .srcreg(rb)
+                            .srcreg(v)
+                            .srcreg(sa)
+                            .srcreg(sb),
+                    );
                 }
                 Stmt::BeginLoop { vars, init } => {
                     for (i, var) in vars.iter().enumerate() {
@@ -622,13 +706,13 @@ impl Lowerer {
             Op::KernargI32 { offset } | Op::KernargF32 { offset } => {
                 let d = self.new_vreg(RClass::S1);
                 self.push(MInst::new(MOp::SLoadDword).def(d).imm(*offset as i64));
-                self.pending_smem.push(d);
+                self.pending_smem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::KernargPtr { offset } => {
                 let d = self.new_vreg(RClass::S2);
                 self.push(MInst::new(MOp::SLoadDwordx2).def(d).imm(*offset as i64));
-                self.pending_smem.push(d);
+                self.pending_smem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::WorkitemId => {
@@ -756,7 +840,7 @@ impl Lowerer {
                 self.push(
                     MInst::new(MOp::GlobalLoadU16).def(d).srcreg(rb).imm(*byte_off as i64),
                 );
-                self.pending_vmem.push(d);
+                self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::LoadF32 { base, byte_off } => {
@@ -765,7 +849,7 @@ impl Lowerer {
                 self.push(
                     MInst::new(MOp::GlobalLoadF32).def(d).srcreg(rb).imm(*byte_off as i64),
                 );
-                self.pending_vmem.push(d);
+                self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::Frag2(a, b) => {
@@ -779,8 +863,7 @@ impl Lowerer {
             }
             Op::Frag2Lane { frag, index } => {
                 let f = self.as_v2(*frag)?;
-                let d = self.new_vreg(RClass::V1);
-                self.push(MInst::new(MOp::VReadSub).def(d).srcreg(f).imm(*index as i64));
+                let d = self.alias_vreg(f, *index, RClass::V1);
                 self.val.insert(dst, d);
             }
             Op::Frag4(a, b, c, e) => {
@@ -794,8 +877,7 @@ impl Lowerer {
             }
             Op::Frag4Lane { frag, index } => {
                 let f = self.as_v4(*frag)?;
-                let d = self.new_vreg(RClass::V1);
-                self.push(MInst::new(MOp::VReadSub).def(d).srcreg(f).imm(*index as i64));
+                let d = self.alias_vreg(f, *index, RClass::V1);
                 self.val.insert(dst, d);
             }
             Op::MfmaF16 { a, b, c } => {
@@ -819,14 +901,14 @@ impl Lowerer {
                 let a = self.as_v1(*addr)?;
                 let d = self.new_vreg(RClass::V2);
                 self.push(MInst::new(MOp::LdsReadB64TrB8).def(d).srcreg(a));
-                self.pending_lds.push(d);
+                self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::LoadLdsB128 { addr } => {
                 let a = self.as_v1(*addr)?;
                 let d = self.new_vreg(RClass::V4);
                 self.push(MInst::new(MOp::LdsReadB128).def(d).srcreg(a));
-                self.pending_lds.push(d);
+                self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::ReadFirstLane(a) => {
@@ -840,7 +922,7 @@ impl Lowerer {
                 let a = self.as_v1(*addr)?;
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::LdsReadB32).def(d).srcreg(a));
-                self.pending_lds.push(d);
+                self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::MfmaF16Wide { a, b, c } => {
@@ -970,8 +1052,15 @@ impl Lowerer {
             Op::Frag16Build(lanes) => {
                 let v = self.new_vreg(RClass::V16);
                 for (i, o) in lanes.iter().enumerate() {
-                    let r = self.as_v1(*o)?;
-                    self.push(MInst::new(MOp::VWriteSub).def(v).srcreg(r).imm(i as i64));
+                    let a = self.alias_vreg(v, i as u8, RClass::V1);
+                    let retargeted = match o {
+                        Opnd::Val(ov) => self.retarget_producer(*ov, a),
+                        _ => false,
+                    };
+                    if !retargeted {
+                        let r = self.as_v1(*o)?;
+                        self.push(MInst::new(MOp::VMovB32).def(a).srcreg(r));
+                    }
                 }
                 self.val.insert(dst, v);
             }
@@ -980,23 +1069,50 @@ impl Lowerer {
                 let hi_r = self.as_v4(*hi)?;
                 let d = self.new_vreg(RClass::V8);
                 for i in 0..4u8 {
-                    let sub = self.new_vreg(RClass::V1);
-                    self.push(MInst::new(MOp::VReadSub).def(sub).srcreg(lo_r).imm(i as i64));
-                    self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(sub).imm(i as i64));
+                    let s = self.alias_vreg(lo_r, i, RClass::V1);
+                    let a = self.alias_vreg(d, i, RClass::V1);
+                    self.push(MInst::new(MOp::VMovB32).def(a).srcreg(s));
                 }
                 for i in 0..4u8 {
-                    let sub = self.new_vreg(RClass::V1);
-                    self.push(MInst::new(MOp::VReadSub).def(sub).srcreg(hi_r).imm(i as i64));
-                    self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(sub).imm((i + 4) as i64));
+                    let s = self.alias_vreg(hi_r, i, RClass::V1);
+                    let a = self.alias_vreg(d, i + 4, RClass::V1);
+                    self.push(MInst::new(MOp::VMovB32).def(a).srcreg(s));
                 }
                 self.val.insert(dst, d);
             }
-            Op::Frag8(a, b, c, d, e, f, g, h) => {
+            Op::LoadLdsTr4B8 { addrs } => {
+                let d = self.new_vreg(RClass::V8);
+                for (r, ad) in addrs.iter().enumerate() {
+                    let a = self.as_v1(*ad)?;
+                    let part = self.alias_vreg(d, (2 * r) as u8, RClass::V2);
+                    self.push(MInst::new(MOp::LdsReadB64TrB8).def(part).srcreg(a));
+                }
+                self.pending_lds.push(d);
+                self.val.insert(dst, d);
+            }
+            Op::LoadLdsB128x2 { lo, hi } => {
+                let d = self.new_vreg(RClass::V8);
+                let a_lo = self.as_v1(*lo)?;
+                let part_lo = self.alias_vreg(d, 0, RClass::V4);
+                self.push(MInst::new(MOp::LdsReadB128).def(part_lo).srcreg(a_lo));
+                let a_hi = self.as_v1(*hi)?;
+                let part_hi = self.alias_vreg(d, 4, RClass::V4);
+                self.push(MInst::new(MOp::LdsReadB128).def(part_hi).srcreg(a_hi));
+                self.pending_lds.push(d);
+                self.val.insert(dst, d);
+            }            Op::Frag8(a, b, c, d, e, f, g, h) => {
                 let v = self.new_vreg(RClass::V8);
                 for (i, o) in [*a, *b, *c, *d, *e, *f, *g, *h].into_iter().enumerate() {
-                    let r = self.as_v1(o)?;
-                    self.touch(&[Src::Reg(r)]);
-                    self.push(MInst::new(MOp::VWriteSub).def(v).srcreg(r).imm(i as i64));
+                    let al = self.alias_vreg(v, i as u8, RClass::V1);
+                    let retargeted = match o {
+                        Opnd::Val(ov) => self.retarget_producer(ov, al),
+                        _ => false,
+                    };
+                    if !retargeted {
+                        let r = self.as_v1(o)?;
+                        self.touch(&[Src::Reg(r)]);
+                        self.push(MInst::new(MOp::VMovB32).def(al).srcreg(r));
+                    }
                 }
                 self.val.insert(dst, v);
             }
@@ -1054,8 +1170,7 @@ impl Lowerer {
                     }
                     other => self.as_v16(*other)?,
                 };
-                let d = self.new_vreg(RClass::V1);
-                self.push(MInst::new(MOp::VReadSub).def(d).srcreg(f).imm(*index as i64));
+                let d = self.alias_vreg(f, *index, RClass::V1);
                 self.val.insert(dst, d);
             }
             Op::FragZero { ty } => {
@@ -1131,6 +1246,7 @@ impl Lowerer {
 /// This keeps loop-carried state from doubling register pressure.
 fn coalesce(m: &mut MFunction) {
     let classes: Vec<RClass> = m.vregs.clone();
+    let aliased = m.alias.clone();
     let mut uses: HashMap<VReg, u32> = HashMap::new();
     for b in &m.blocks {
         for inst in &b.insts {
@@ -1153,7 +1269,9 @@ fn coalesce(m: &mut MFunction) {
                     let single_use = uses.get(&s).copied().unwrap_or(0) == 1;
                     let same_class = classes[d as usize] == classes[s as usize];
                     let prev_is_move_to_s = prev.op == MOp::VMovB32;
-                    if prev_defs_s && single_use && same_class && !prev_is_move_to_s {
+                    // A lane of a fragment is not a standalone value: the whole tuple may still be read.
+                    let s_is_alias = aliased.contains_key(&s);
+                    if prev_defs_s && single_use && same_class && !prev_is_move_to_s && !s_is_alias {
                         if let Some(pd) = b.insts[i - 1].dst.as_mut() {
                             *pd = d;
                         }

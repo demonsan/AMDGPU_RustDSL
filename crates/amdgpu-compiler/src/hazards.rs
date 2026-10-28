@@ -37,6 +37,8 @@ fn mfma_latency(op: MOp) -> Option<usize> {
 }
 
 pub fn fix_value_hazards(m: &mut MFunction) {
+    let alias = m.alias.clone();
+    let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
     for b in &mut m.blocks {
         let mut out: Vec<MInst> = Vec::with_capacity(b.insts.len() + 8);
         // Virtual register -> earliest cycle at which its transcendental result
@@ -48,13 +50,13 @@ pub fn fix_value_hazards(m: &mut MFunction) {
             let mut earliest = cycle;
             for s in &inst.srcs {
                 if let Src::Reg(r) = s {
-                    if let Some(rd) = ready.get(r) {
+                    if let Some(rd) = ready.get(&canon(*r)) {
                         earliest = earliest.max(*rd);
                     }
                 }
             }
             if let Some(d) = inst.dst {
-                if let Some(rd) = ready.get(&d) {
+                if let Some(rd) = ready.get(&canon(d)) {
                     earliest = earliest.max(*rd);
                 }
             }
@@ -68,16 +70,16 @@ pub fn fix_value_hazards(m: &mut MFunction) {
                 }
             }
             if let Some(d) = inst.dst {
-                ready.remove(&d);
+                ready.remove(&canon(d));
             }
             if is_transcendental(inst.op) {
                 if let Some(d) = inst.dst {
-                    ready.insert(d, cycle + TRANS_LATENCY);
+                    ready.insert(canon(d), cycle + TRANS_LATENCY);
                 }
             }
             if let Some(latency) = mfma_latency(inst.op) {
                 if let Some(d) = inst.dst {
-                    ready.insert(d, cycle + latency);
+                    ready.insert(canon(d), cycle + latency);
                 }
             }
             out.push(inst.clone());

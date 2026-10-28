@@ -82,12 +82,13 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
     for (i, b) in m.blocks.iter().enumerate() {
         for inst in &b.insts {
             for r in inst.uses() {
+                let r = m.canon(r);
                 if !def_set[i].contains(&r) {
                     use_set[i].insert(r);
                 }
             }
             if let Some(d) = inst.dst {
-                def_set[i].insert(d);
+                def_set[i].insert(m.canon(d));
             }
         }
     }
@@ -143,10 +144,12 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
             }
             let inst = &b.insts[i];
             if let Some(d) = inst.dst {
+                let d = m.canon(d);
                 bump(d, at, &mut start, &mut end);
                 live.remove(&d);
             }
             for r in inst.uses() {
+                let r = m.canon(r);
                 bump(r, at, &mut start, &mut end);
                 live.insert(r);
             }
@@ -193,7 +196,7 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
     // VGPRs: V1 and V2 share one file.
     let mut vregs: Vec<(usize, usize, VReg, RClass)> = Vec::new();
     for (r, c) in m.vregs.iter().enumerate() {
-        if c.is_vector() {
+        if c.is_vector() && !m.alias.contains_key(&(r as VReg)) {
             let s = if start[r] == usize::MAX { 0 } else { start[r] };
             vregs.push((s, end[r], r as VReg, *c));
         }
@@ -286,6 +289,11 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
         mark_used(&mut used_s, slot, c);
         max_s = max_s.max(slot + c.dwords() as usize);
         sactive.push((e, r, c));
+    }
+
+    // Sub-register views live inside their tuple.
+    for (a, (t, off)) in &m.alias {
+        phys[*a as usize] = phys[*t as usize] + *off as u32;
     }
 
     for (i, u) in used_v.iter().enumerate() {

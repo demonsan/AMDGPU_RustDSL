@@ -169,6 +169,10 @@ pub enum Op {
     LoadLdsB128 { addr: Opnd },
     /// 8-bit transposing LDS read (ds_read_b64_tr_b8), two dwords per lane.
     LoadLdsTrB8 { addr: Opnd },
+    /// Four `ds_read_b64_tr_b8` reads written straight into the four quarters of one `Frag8`.
+    LoadLdsTr4B8 { addrs: [Opnd; 4] },
+    /// Two `ds_read_b128` reads written straight into the two halves of one `Frag8`.
+    LoadLdsB128x2 { lo: Opnd, hi: Opnd },
     /// Broadcast lane 0 of a vector value into a scalar register.
     ReadFirstLane(Opnd),
 
@@ -252,6 +256,7 @@ impl Op {
             Op::LoadLdsB32 { .. } => DType::U32,
             Op::LoadLdsB128 { .. } => DType::Frag4,
             Op::LoadLdsTrB8 { .. } => DType::Frag2,
+            Op::LoadLdsTr4B8 { .. } | Op::LoadLdsB128x2 { .. } => DType::Frag8,
             Op::ReadFirstLane(..) => DType::U32,
         }
     }
@@ -303,6 +308,8 @@ impl Op {
             Op::LoadLdsB32 { addr } => vec![*addr],
             Op::LoadLdsB128 { addr } => vec![*addr],
             Op::LoadLdsTrB8 { addr } => vec![*addr],
+            Op::LoadLdsTr4B8 { addrs } => addrs.to_vec(),
+            Op::LoadLdsB128x2 { lo, hi } => vec![*lo, *hi],
             Op::ReadFirstLane(a) => vec![*a],
         }
     }
@@ -323,6 +330,10 @@ pub enum Stmt {
     /// `s_barrier`: synchronise every wave in the workgroup.
     Barrier,
     SetVar { var: VarId, value: Opnd },
+    /// Multiply all sixteen dwords of a `Frag16` loop variable by an f32 scalar, in place.
+    VarScaleF32 { var: VarId, scalar: Opnd },
+    /// `var = scaled_mfma_32x32x64_fp8(a, b, var)`: accumulate into a loop variable in place.
+    VarMfmaScale { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
     BeginLoop { vars: Vec<VarId>, init: Vec<Opnd> },
     BreakIf { cond: Opnd },
     EndLoop,
@@ -782,6 +793,45 @@ impl FnBuilder {
 
     /// Four dwords (16 B) write into workgroup LDS.
     /// Transposing 8-bit LDS read into two dwords per lane.
+    /// Four transposing reads into one `Frag8` (bytes 8r..8r+7 from the r-th address).
+    pub fn load_lds_tr_b8x4(
+        &mut self,
+        a0: impl Into<Opnd>,
+        a1: impl Into<Opnd>,
+        a2: impl Into<Opnd>,
+        a3: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::LoadLdsTr4B8 { addrs: [a0.into(), a1.into(), a2.into(), a3.into()] })
+    }
+
+    /// Two 16-byte LDS reads into the low and high half of one `Frag8`.
+    pub fn load_lds_b128x2(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::LoadLdsB128x2 { lo: lo.into(), hi: hi.into() })
+    }
+
+    /// `var *= scalar` on every dword of a `Frag16` loop variable.
+    pub fn var_scale_f32(&mut self, var: VarId, scalar: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::VarScaleF32 { var, scalar: scalar.into() });
+    }
+
+    /// `var = scaled_mfma(a, b, var)` in place.
+    pub fn var_mfma_scale(
+        &mut self,
+        var: VarId,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        scale_a: impl Into<Opnd>,
+        scale_b: impl Into<Opnd>,
+    ) {
+        self.f.stmts.push(Stmt::VarMfmaScale {
+            var,
+            a: a.into(),
+            b: b.into(),
+            scale_a: scale_a.into(),
+            scale_b: scale_b.into(),
+        });
+    }
+
     pub fn load_lds_tr_b8(&mut self, addr: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsTrB8 { addr: addr.into() })
     }

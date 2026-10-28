@@ -5,6 +5,8 @@
 //! changes meaning. 64-bit pointers are a single `V2`/`S2` virtual register
 //! whose physical base must be even.
 
+use std::collections::HashMap;
+
 pub type VReg = u32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -230,9 +232,18 @@ pub struct MFunction {
     /// (header label, latch label) pairs, used to extend live ranges that cross
     /// a loop backedge.
     pub loops: Vec<(u32, u32)>,
+    /// Sub-register views: alias vreg -> (tuple vreg, dword offset). An alias owns no register;
+    /// after allocation it is the tuple's physical register plus the offset, so extracting or
+    /// inserting a lane of a fragment needs no move.
+    pub alias: HashMap<VReg, (VReg, u8)>,
 }
 
 impl MFunction {
+    /// The vreg that owns the register behind `r` (itself unless `r` is an alias).
+    pub fn canon(&self, r: VReg) -> VReg {
+        self.alias.get(&r).map(|a| a.0).unwrap_or(r)
+    }
+
     pub fn vreg_class(&self, r: VReg) -> RClass {
         self.vregs[r as usize]
     }
