@@ -24,6 +24,8 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | FMHA control skeleton | `probe_roles_loop`: 8 waves, role A/B, 4 iterations, two paired barriers per iteration, cross-role LDS exchange → `PROBE_ROLES_LOOP_OK` |
 | FMHA data path | `probe_fmha_datapath`: distinct A and B tiles staged in LDS (`ds_write_b128`), read back (`ds_read_b128`), concatenated into `Frag8` operands and multiplied with `v_mfma_scale_f32_32x32x64_f8f6f4` → every value is `64.0` → `PROBE_FMHA_DATAPATH_OK` |
 | A/B paired loops | `probe_ab_loops`: 8 waves, role A/B, outer loop with two sequential inner phase loops, paired barriers, LDS read-modify-write accumulator → `PROBE_AB_LOOPS_OK` (closed form over 512 lanes) |
+| Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
+| MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | LDS self-read | `probe_lds_self2`: own-slot read after a barrier → `SELF2_OK` |
 | Two-wave LDS | `probe_waves2`: own + partner-wave slot → `PROBE_WAVES2_OK` |
 | `v_max3_f32`, fp8 fragments | `v_max3_f32` in the ISA of the compiler, `Frag8`/`V8` register class for the `32x32x64` operands |
@@ -116,16 +118,25 @@ The 32 B/lane variant was writing its B tile at `8192 + tid*32`, which reaches
 an LDS capacity or compiler problem. With both tiles inside the declaration the
 A/B data path is exact.
 
-## Known IR limitations (found while building the A/B loops)
+## IR capabilities added for the loop (round 9)
 
-1. `SetVar` is only accepted for the **innermost** loop's variables, so an outer
-   loop accumulator cannot be updated from an inner loop.
-2. Loop variables are not visible after `EndLoop`, so an inner loop's final value
-   cannot be merged into an outer accumulator after the loop.
+1. `SetVar` now accepts **any enclosing loop's** variable, so an inner loop can
+   update an outer loop accumulator.
+2. Values and loop variables stay visible **after `EndLoop`**; a loop variable
+   then holds its last value (undefined if the body never ran).
+3. Loop variables can have fragment types (`Frag2/4/8/16`), so a `Frag16` MFMA
+   accumulator can live in registers across iterations. Copies are emitted as
+   `VReadSub`/`VWriteSub` pairs.
+4. Every fragment operand materialisation now calls `touch()`, so `ds_read_*`
+   results feeding `cat_frag8`/MFMA get their `lgkmcnt` wait.
 
-`probe_ab_loops` works around both by keeping its accumulator in LDS. Removing
-the restrictions is worthwhile for the FMHA core loop (it needs the accumulator
-in registers) and is the first item of the next round.
+Still unsupported: pointer-typed loop variables.
+
+Risk to watch: the MFMA accumulation loop produced `64.0` instead of `128.0`
+in an earlier register allocation and `128.0` after the probe gained a
+diagnostic store (same IR semantics). That points at a register-aliasing hazard
+for MFMA D/C versus A/B that the allocator does not model; the condition needs
+to be found and enforced in MIR verification.
 
 ## Next: FMHA reference core loop
 
