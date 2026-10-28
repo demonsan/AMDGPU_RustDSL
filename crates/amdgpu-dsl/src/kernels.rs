@@ -224,7 +224,6 @@ pub fn probe_store() -> Function {
     let q = b.let_(Op::KernargPtr { offset: 8 });
     let count = b.let_(Op::KernargI32 { offset: 16 });
     let tid = b.let_(Op::WorkitemId);
-    let c2 = b.c_i32(2);
     let off = b.mul_i32(tid, c2);
     let src = b.ptr_add(q, off);
     let dst = b.ptr_add(o, off);
@@ -455,7 +454,6 @@ pub fn probe_waves2() -> Function {
 
     let c6 = b.c_i32(6);
     let c1 = b.c_i32(1);
-    let c2 = b.c_i32(2);
     let c4 = b.c_i32(4);
     let c63 = b.c_i32(63);
     let c64 = b.c_i32(64);
@@ -487,7 +485,6 @@ pub fn probe_waves2() -> Function {
     let out2_ptr = b.ptr_add(o, out2_off);
     b.store_f32(out2_ptr, 0, value);
 
-    let _ = (c2, c512_unused());
     b.finish()
 }
 
