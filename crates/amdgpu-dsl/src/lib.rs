@@ -163,6 +163,8 @@ pub enum Op {
 
     LoadU16 { base: Opnd, byte_off: u32 },
     LoadF32 { base: Opnd, byte_off: u32 },
+    /// 16-byte global load (`global_load_dwordx4`) into a `Frag4`.
+    LoadGlobalB128 { base: Opnd, byte_off: u32 },
     /// Read one dword from workgroup LDS; `addr` is a byte offset.
     LoadLdsB32 { addr: Opnd },
     /// Read four dwords (16 B) from workgroup LDS.
@@ -257,6 +259,7 @@ impl Op {
             Op::LoadLdsB128 { .. } => DType::Frag4,
             Op::LoadLdsTrB8 { .. } => DType::Frag2,
             Op::LoadLdsTr4B8 { .. } | Op::LoadLdsB128x2 { .. } => DType::Frag8,
+            Op::LoadGlobalB128 { .. } => DType::Frag4,
             Op::ReadFirstLane(..) => DType::U32,
         }
     }
@@ -309,6 +312,7 @@ impl Op {
             Op::LoadLdsB128 { addr } => vec![*addr],
             Op::LoadLdsTrB8 { addr } => vec![*addr],
             Op::LoadLdsTr4B8 { addrs } => addrs.to_vec(),
+            Op::LoadGlobalB128 { base, .. } => vec![*base],
             Op::LoadLdsB128x2 { lo, hi } => vec![*lo, *hi],
             Op::ReadFirstLane(a) => vec![*a],
         }
@@ -799,6 +803,11 @@ impl FnBuilder {
 
     /// Four dwords (16 B) write into workgroup LDS.
     /// Transposing 8-bit LDS read into two dwords per lane.
+    /// 16-byte global load into a `Frag4`.
+    pub fn load_b128(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
+        self.let_(Op::LoadGlobalB128 { base: base.into(), byte_off })
+    }
+
     /// Four transposing reads into one `Frag8` (bytes 8r..8r+7 from the r-th address).
     pub fn load_lds_tr_b8x4(
         &mut self,

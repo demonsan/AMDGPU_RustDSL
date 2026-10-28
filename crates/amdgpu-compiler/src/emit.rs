@@ -337,6 +337,20 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
                 tuple(a, c_reg, 16)
             )]
         }
+        MOp::VMfmaScale32x32x64Fp8Z => {
+            let a_reg = reg_of(&inst.srcs[0]);
+            let b_reg = reg_of(&inst.srcs[1]);
+            let sa = reg_of(&inst.srcs[2]);
+            let sb = reg_of(&inst.srcs[3]);
+            vec![format!(
+                "v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, 0, {}, {}",
+                tuple(a, inst.dst.expect("dst"), 16),
+                tuple(a, a_reg, 8),
+                tuple(a, b_reg, 8),
+                vr(a, sa),
+                vr(a, sb)
+            )]
+        }
         MOp::VMfmaScale32x32x64Fp8 => {
             let a_reg = reg_of(&inst.srcs[0]);
             let b_reg = reg_of(&inst.srcs[1]);
@@ -400,6 +414,11 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             d(a),
             mem_op(a, inst.srcs[0], inst.imm)
         )],
+        MOp::GlobalLoadB128 => vec![format!(
+            "global_load_dwordx4 {}, {}",
+            tuple(a, inst.dst.expect("dst"), 4),
+            mem_op(a, inst.srcs[0], inst.imm)
+        )],
         MOp::GlobalStoreU16 => vec![format!(
             "global_store_short {}, {}, off{}",
             pair(a, reg_of(&inst.srcs[0])),
@@ -457,25 +476,29 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SWaitVm => vec!["s_waitcnt vmcnt(0)".to_string()],
         MOp::SWaitLgkm => vec![format!("s_waitcnt lgkmcnt({})", inst.imm)],
         MOp::LdsWriteB32 => vec![format!(
-            "ds_write_b32 {}, {}",
+            "ds_write_b32 {}, {}{}",
             src1(a, inst.srcs[0]),
-            src1(a, inst.srcs[1])
+            src1(a, inst.srcs[1]),
+            lds_off(inst.imm)
         )],
-        MOp::LdsReadB32 => vec![format!("ds_read_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
+        MOp::LdsReadB32 => vec![format!("ds_read_b32 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
         MOp::LdsWriteB128 => vec![format!(
-            "ds_write_b128 {}, {}",
+            "ds_write_b128 {}, {}{}",
             src1(a, inst.srcs[0]),
-            tuple(a, reg_of(&inst.srcs[1]), 4)
+            tuple(a, reg_of(&inst.srcs[1]), 4),
+            lds_off(inst.imm)
         )],
         MOp::LdsReadB128 => vec![format!(
-            "ds_read_b128 {}, {}",
+            "ds_read_b128 {}, {}{}",
             tuple(a, inst.dst.expect("dst"), 4),
-            src1(a, inst.srcs[0])
+            src1(a, inst.srcs[0]),
+            lds_off(inst.imm)
         )],
         MOp::LdsReadB64TrB8 => vec![format!(
-            "ds_read_b64_tr_b8 {}, {}",
+            "ds_read_b64_tr_b8 {}, {}{}",
             tuple(a, inst.dst.expect("dst"), 2),
-            src1(a, inst.srcs[0])
+            src1(a, inst.srcs[0]),
+            lds_off(inst.imm)
         )],
         MOp::VReadFirstLane => {
             vec![format!("v_readfirstlane_b32 {}, {}", sr(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]))]
@@ -512,4 +535,13 @@ fn un(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
 
 fn cmp(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
     vec![format!("{} vcc, {}, {}", mnemonic, src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))]
+}
+
+/// ` offset:N` suffix of a DS instruction (empty for offset 0).
+fn lds_off(imm: i64) -> String {
+    if imm == 0 {
+        String::new()
+    } else {
+        format!(" offset:{imm}")
+    }
 }

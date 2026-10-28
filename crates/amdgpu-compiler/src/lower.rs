@@ -139,6 +139,7 @@ impl Lowerer {
         }
         self.set_term(Term::Endpgm);
         coalesce(&mut self.mir);
+        dce(&mut self.mir);
         self.mir
     }
 
@@ -259,6 +260,46 @@ impl Lowerer {
             }
         }
         false
+    }
+
+    fn const_of(&self, o: Opnd) -> Option<i64> {
+        match o {
+            Opnd::I32(i) => Some(i as i64),
+            Opnd::Val(v) => match self.defs.get(&v) {
+                Some(Op::ConstI32(i)) => Some(*i as i64),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// An LDS address operand split into a base register and the constant byte offset that the DS
+    /// instruction can take in its immediate field (chains of `x + const` are flattened).
+    fn lds_addr(&mut self, o: Opnd) -> Result<(VReg, i64), String> {
+        let mut cur = o;
+        let mut off: i64 = 0;
+        loop {
+            if let Opnd::Val(v) = cur {
+                if let Some(Op::AddI32(x, y)) = self.defs.get(&v).cloned() {
+                    if let Some(k) = self.const_of(y) {
+                        if k >= 0 && off + k < 65536 {
+                            off += k;
+                            cur = x;
+                            continue;
+                        }
+                    }
+                    if let Some(k) = self.const_of(x) {
+                        if k >= 0 && off + k < 65536 {
+                            off += k;
+                            cur = y;
+                            continue;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        Ok((self.as_v1(cur)?, off))
     }
 
     /// A freshly zeroed sixteen-dword fragment.
@@ -628,15 +669,15 @@ impl Lowerer {
                     self.start_block(else_l);
                 }
                 Stmt::StoreLdsB128 { addr, value } => {
-                    let a = self.as_v1(*addr)?;
+                    let (a, off) = self.lds_addr(*addr)?;
                     let v = self.as_v4(*value)?;
-                    self.push(MInst::new(MOp::LdsWriteB128).srcreg(a).srcreg(v));
+                    self.push(MInst::new(MOp::LdsWriteB128).srcreg(a).srcreg(v).imm(off));
                 }
                 Stmt::StoreLdsB32 { addr, value } => {
-                    let a = self.as_v1(*addr)?;
+                    let (a, off) = self.lds_addr(*addr)?;
                     let v = self.as_v1(*value)?;
                     self.touch(&[Src::Reg(v)]);
-                    self.push(MInst::new(MOp::LdsWriteB32).srcreg(a).srcreg(v));
+                    self.push(MInst::new(MOp::LdsWriteB32).srcreg(a).srcreg(v).imm(off));
                 }
                 Stmt::WaitLds { count } => {
                     self.push(MInst::new(MOp::SWaitLgkm).imm(*count as i64));
@@ -852,6 +893,13 @@ impl Lowerer {
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
+            Op::LoadGlobalB128 { base, byte_off } => {
+                let rb = self.as_v2(*base)?;
+                let d = self.new_vreg(RClass::V4);
+                self.push(MInst::new(MOp::GlobalLoadB128).def(d).srcreg(rb).imm(*byte_off as i64));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
             Op::Frag2(a, b) => {
                 let d = self.new_vreg(RClass::V2);
                 for (i, o) in [*a, *b].into_iter().enumerate() {
@@ -898,16 +946,16 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::LoadLdsTrB8 { addr } => {
-                let a = self.as_v1(*addr)?;
+                let (a, off) = self.lds_addr(*addr)?;
                 let d = self.new_vreg(RClass::V2);
-                self.push(MInst::new(MOp::LdsReadB64TrB8).def(d).srcreg(a));
+                self.push(MInst::new(MOp::LdsReadB64TrB8).def(d).srcreg(a).imm(off));
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::LoadLdsB128 { addr } => {
-                let a = self.as_v1(*addr)?;
+                let (a, off) = self.lds_addr(*addr)?;
                 let d = self.new_vreg(RClass::V4);
-                self.push(MInst::new(MOp::LdsReadB128).def(d).srcreg(a));
+                self.push(MInst::new(MOp::LdsReadB128).def(d).srcreg(a).imm(off));
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
@@ -919,9 +967,9 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::LoadLdsB32 { addr } => {
-                let a = self.as_v1(*addr)?;
+                let (a, off) = self.lds_addr(*addr)?;
                 let d = self.new_vreg(RClass::V1);
-                self.push(MInst::new(MOp::LdsReadB32).def(d).srcreg(a));
+                self.push(MInst::new(MOp::LdsReadB32).def(d).srcreg(a).imm(off));
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
@@ -1083,21 +1131,21 @@ impl Lowerer {
             Op::LoadLdsTr4B8 { addrs } => {
                 let d = self.new_vreg(RClass::V8);
                 for (r, ad) in addrs.iter().enumerate() {
-                    let a = self.as_v1(*ad)?;
+                    let (a, off) = self.lds_addr(*ad)?;
                     let part = self.alias_vreg(d, (2 * r) as u8, RClass::V2);
-                    self.push(MInst::new(MOp::LdsReadB64TrB8).def(part).srcreg(a));
+                    self.push(MInst::new(MOp::LdsReadB64TrB8).def(part).srcreg(a).imm(off));
                 }
                 self.pending_lds.push(d);
                 self.val.insert(dst, d);
             }
             Op::LoadLdsB128x2 { lo, hi } => {
                 let d = self.new_vreg(RClass::V8);
-                let a_lo = self.as_v1(*lo)?;
+                let (a_lo, off_lo) = self.lds_addr(*lo)?;
                 let part_lo = self.alias_vreg(d, 0, RClass::V4);
-                self.push(MInst::new(MOp::LdsReadB128).def(part_lo).srcreg(a_lo));
-                let a_hi = self.as_v1(*hi)?;
+                self.push(MInst::new(MOp::LdsReadB128).def(part_lo).srcreg(a_lo).imm(off_lo));
+                let (a_hi, off_hi) = self.lds_addr(*hi)?;
                 let part_hi = self.alias_vreg(d, 4, RClass::V4);
-                self.push(MInst::new(MOp::LdsReadB128).def(part_hi).srcreg(a_hi));
+                self.push(MInst::new(MOp::LdsReadB128).def(part_hi).srcreg(a_hi).imm(off_hi));
                 self.pending_lds.push(d);
                 self.val.insert(dst, d);
             }            Op::Frag8(a, b, c, d, e, f, g, h) => {
@@ -1125,8 +1173,21 @@ impl Lowerer {
                 );
                 let sa = self.as_v1(*scale_a)?;
                 let sb = self.as_v1(*scale_b)?;
+                if c_is_zero {
+                    // D = A x B: the accumulator is the inline constant 0, nothing to initialise
+                    let d = self.new_vreg(RClass::V16);
+                    self.push(
+                        MInst::new(MOp::VMfmaScale32x32x64Fp8Z)
+                            .def(d)
+                            .srcreg(ra)
+                            .srcreg(rb)
+                            .srcreg(sa)
+                            .srcreg(sb),
+                    );
+                    self.val.insert(dst, d);
+                    return Ok(());
+                }
                 let d = if c_is_zero {
-                    // accumulate onto zero: zero-fill D directly instead of copying a zero fragment
                     self.fresh_zero16()
                 } else {
                     let rc = self.as_v16(*c)?;
@@ -1281,6 +1342,56 @@ fn coalesce(m: &mut MFunction) {
                 }
             }
             i += 1;
+        }
+    }
+}
+
+/// Dead-code elimination of pure single-result ALU instructions whose result is never read
+/// (the folded `x + const` chains of LDS addresses, for instance).
+fn dce(m: &mut MFunction) {
+    fn pure_alu(op: MOp) -> bool {
+        matches!(
+            op,
+            MOp::VMovB32
+                | MOp::VAddU32
+                | MOp::VMulLoU32
+                | MOp::VAndB32
+                | MOp::VOrB32
+                | MOp::VXorB32
+                | MOp::VLshrB32
+                | MOp::VLshlB32
+                | MOp::VAddF32
+                | MOp::VSubF32
+                | MOp::VMulF32
+        )
+    }
+    loop {
+        let mut used: HashMap<VReg, u32> = HashMap::new();
+        for b in &m.blocks {
+            for inst in &b.insts {
+                for r in inst.uses() {
+                    *used.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut removed = false;
+        let alias = m.alias.clone();
+        for b in &mut m.blocks {
+            let before = b.insts.len();
+            b.insts.retain(|inst| {
+                if let (true, Some(d)) = (pure_alu(inst.op), inst.dst) {
+                    if !alias.contains_key(&d) && used.get(&d).copied().unwrap_or(0) == 0 {
+                        return false;
+                    }
+                }
+                true
+            });
+            if b.insts.len() != before {
+                removed = true;
+            }
+        }
+        if !removed {
+            break;
         }
     }
 }

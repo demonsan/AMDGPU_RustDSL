@@ -88,6 +88,8 @@ pub enum MOp {
     VMfma16x16x32Fp8,
     VMfma32x32x16Fp8,
     VMfmaScale32x32x64Fp8,
+    /// Scaled MFMA with an inline-zero accumulator (no C operand): D = A x B.
+    VMfmaScale32x32x64Fp8Z,
     // workgroup LDS
     LdsWriteB32,
     LdsReadB32,
@@ -98,6 +100,7 @@ pub enum MOp {
     // global memory
     GlobalLoadU16,
     GlobalLoadF32,
+    GlobalLoadB128,
     GlobalStoreU16,
     GlobalStoreF32,
     // scalar ALU / memory
