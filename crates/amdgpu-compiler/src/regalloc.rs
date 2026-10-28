@@ -196,8 +196,10 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
     // VGPRs: V1 and V2 share one file.
     let mut vregs: Vec<(usize, usize, VReg, RClass)> = Vec::new();
     for (r, c) in m.vregs.iter().enumerate() {
-        if c.is_vector() && !m.alias.contains_key(&(r as VReg)) {
-            let s = if start[r] == usize::MAX { 0 } else { start[r] };
+        // A vreg that is never defined or used (for example the original destination of a
+        // producer that was retargeted into a fragment) needs no register.
+        if c.is_vector() && !m.alias.contains_key(&(r as VReg)) && start[r] != usize::MAX {
+            let s = start[r];
             vregs.push((s, end[r], r as VReg, *c));
         }
     }
