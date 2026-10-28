@@ -115,15 +115,15 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(got.data(), dout, elems * sizeof(__half), hipMemcpyDeviceToHost));
 
     if (std::strcmp(kern, "attention_fwd") != 0) {
-        // Diagnostic kernel: row 0 holds l, m, acc[0], q[0] at bytes 0,2,4,6.
-        std::printf("  l=%.6f m=%.6f acc0=%.6f q0=%.6f\n", __half2float(got[0]),
-                    __half2float(got[1]), __half2float(got[2]), __half2float(got[3]));
+        // Diagnostic kernel layout per row: 0 l, 1 m, 2 acc0, 3 q0,
+        // 4 corr, 5 p, 6 l_new, 7 scaled (last iteration).
         for (int r = 0; r < 4; ++r) {
-            std::printf("  row %d: l=%.6f m=%.6f acc0=%.6f q0=%.6f\n", r,
-                        __half2float(got[(size_t)r * D + 0]),
-                        __half2float(got[(size_t)r * D + 1]),
-                        __half2float(got[(size_t)r * D + 2]),
-                        __half2float(got[(size_t)r * D + 3]));
+            std::printf(
+                "  row %d: l=%.6f m=%.6f acc0=%.6f q0=%.6f corr=%.6f p=%.6f l_new=%.6f s=%.6f\n",
+                r, __half2float(got[(size_t)r * D + 0]), __half2float(got[(size_t)r * D + 1]),
+                __half2float(got[(size_t)r * D + 2]), __half2float(got[(size_t)r * D + 3]),
+                __half2float(got[(size_t)r * D + 4]), __half2float(got[(size_t)r * D + 5]),
+                __half2float(got[(size_t)r * D + 6]), __half2float(got[(size_t)r * D + 7]));
         }
         return 0;
     }

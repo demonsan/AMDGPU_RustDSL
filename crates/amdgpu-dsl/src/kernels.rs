@@ -127,6 +127,20 @@ pub fn attention_impl(debug: bool) -> Function {
     let p = b.exp_f32(p_delta);
     let l_new = b.fma_f32(l_var, corr, p);
 
+    if debug {
+        // Last-iteration values of the softmax intermediates, stored after the
+        // real outputs so the harness can tell "math wrong" from "loop-carried
+        // variable lost".
+        let corr16 = b.cvt_f32_to_f16(corr);
+        let p16 = b.cvt_f32_to_f16(p);
+        let lnew16 = b.cvt_f32_to_f16(l_new);
+        let s16 = b.cvt_f32_to_f16(scaled);
+        b.store_u16(o_row_ptr, 8, Opnd::Val(corr16));
+        b.store_u16(o_row_ptr, 10, Opnd::Val(p16));
+        b.store_u16(o_row_ptr, 12, Opnd::Val(lnew16));
+        b.store_u16(o_row_ptr, 14, Opnd::Val(s16));
+    }
+
     // out = out * corr + p * v
     let mut next_acc = Vec::with_capacity(HEAD_DIM);
     let mut d = 0usize;
