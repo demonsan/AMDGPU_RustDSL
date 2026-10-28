@@ -120,6 +120,23 @@ int main(int argc, char** argv) {
     CK(hipModuleLaunchKernel(fn, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(out.data(), dout, no * 2, hipMemcpyDeviceToHost));
+    const int iters = envi("REF_ITERS", 0);
+    const double flops = 4.0 * B * H * (double)S * SK * D;
+    auto time_kernel = [&](hipFunction_t f, const char* label) {
+        if (iters <= 0) return;
+        hipEvent_t e0, e1;
+        CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
+        for (int w = 0; w < 3; ++w) CK(hipModuleLaunchKernel(f, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
+        CK(hipDeviceSynchronize());
+        CK(hipEventRecord(e0));
+        for (int w = 0; w < iters; ++w) CK(hipModuleLaunchKernel(f, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
+        CK(hipEventRecord(e1));
+        CK(hipEventSynchronize(e1));
+        float ms = 0; CK(hipEventElapsedTime(&ms, e0, e1));
+        const double per = ms / iters;
+        std::printf("timing %-8s: %.4f ms/iter, %.2f TFLOP/s (%d iters)\n", label, per, flops / (per * 1e-3) / 1e12, iters);
+    };
+    time_kernel(fn, "vendor");
 
     // CPU reference.
     auto bf2f = [](uint16_t x) { uint32_t u = (uint32_t)x << 16; float f; std::memcpy(&f, &u, 4); return f; };
@@ -177,6 +194,7 @@ int main(int argc, char** argv) {
         std::vector<uint16_t> out2(no, 0);
         CK(hipMemcpy(out2.data(), dout2, no * 2, hipMemcpyDeviceToHost));
         bad2 = check(out2, "our kernel   vs CPU");
+        time_kernel(fn2, "ours");
         double wd = 0.0, md = 0.0;
         for (size_t i = 0; i < no; ++i) {
             const double dd = std::fabs((double)bf2f(out[i]) - (double)bf2f(out2[i]));
