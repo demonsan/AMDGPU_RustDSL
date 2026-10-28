@@ -98,6 +98,12 @@ fn hazard_matrix() {
     let mut tail = LlvmTail::new();
     tail.skip_lock = true;
     let asm = tail.run_llc("oracle", &mir, "gcn-create-vopd").expect("llc");
+    if let Ok(p) = std::env::var("AMDC_ORACLE_OUT") {
+        if !p.is_empty() {
+            let _ = std::fs::write(format!("{p}.s"), &asm);
+            let _ = std::fs::write(format!("{p}.mir"), &mir);
+        }
+    }
     // Split by s_setprio markers.
     let mut per: Vec<Vec<String>> = vec![Vec::new(); cases.len()];
     let mut cur: Option<usize> = None;

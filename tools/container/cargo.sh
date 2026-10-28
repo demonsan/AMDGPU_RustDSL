@@ -17,5 +17,9 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -v "$TARGET:/target:Z" \
     -e CARGO_TARGET_DIR=/target \
     -e FMHA_ABLATE="${FMHA_ABLATE:-}" \
+    -e AMDC_ORACLE_OUT="${AMDC_ORACLE_OUT:-}" \
+    -e AMDC_TEST_KERNELS="${AMDC_TEST_KERNELS:-}" \
+    -e AMDC_KEEP_MIR="${AMDC_KEEP_MIR:-}" \
+    -e AMDC_LLC_ARGS="${AMDC_LLC_ARGS:-}" \
     -w /work \
     amd-rust-dsl:1 cargo "$@"
