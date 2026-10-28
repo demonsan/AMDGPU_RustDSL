@@ -5184,12 +5184,12 @@ pub fn probe_fp8_fmha_hd128b() -> Function {
             let ko = b.c_i32((4096 * s) as i32);
             let kaddr0 = b.add_i32(kf_base, ko);
             let k_lo0 = b.load_lds_b128(Opnd::Val(kaddr0));
-            let kaddr0h = b.add_i32(kaddr0, c16i);
+            let kaddr0h = b.add_i32(kaddr0, c32v);
             let k_hi0 = b.load_lds_b128(Opnd::Val(kaddr0h));
             let k8_0 = b.cat_frag8(k_lo0, k_hi0);
             let kaddr1 = b.add_i32(kaddr0, c64);
             let k_lo1 = b.load_lds_b128(Opnd::Val(kaddr1));
-            let kaddr1h = b.add_i32(kaddr1, c16i);
+            let kaddr1h = b.add_i32(kaddr1, c32v);
             let k_hi1 = b.load_lds_b128(Opnd::Val(kaddr1h));
             let k8_1 = b.cat_frag8(k_lo1, k_hi1);
             let sb_s = b.c_i32((512 * s) as i32);
@@ -5537,12 +5537,12 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
             let ko = b.c_i32((4096 * s) as i32);
             let kaddr0 = b.add_i32(kf_base, ko);
             let k_lo0 = b.load_lds_b128(Opnd::Val(kaddr0));
-            let kaddr0h = b.add_i32(kaddr0, c16i);
+            let kaddr0h = b.add_i32(kaddr0, c32v);
             let k_hi0 = b.load_lds_b128(Opnd::Val(kaddr0h));
             let k8_0 = b.cat_frag8(k_lo0, k_hi0);
             let kaddr1 = b.add_i32(kaddr0, c64);
             let k_lo1 = b.load_lds_b128(Opnd::Val(kaddr1));
-            let kaddr1h = b.add_i32(kaddr1, c16i);
+            let kaddr1h = b.add_i32(kaddr1, c32v);
             let k_hi1 = b.load_lds_b128(Opnd::Val(kaddr1h));
             let k8_1 = b.cat_frag8(k_lo1, k_hi1);
             let sb_s = b.c_i32((512 * s) as i32);
@@ -5787,12 +5787,12 @@ pub fn probe_fp8_fmha_hd128c() -> Function {
             let ko = b.c_i32((4096 * s) as i32);
             let kaddr0 = b.add_i32(kf_base, ko);
             let k_lo0 = b.load_lds_b128(Opnd::Val(kaddr0));
-            let kaddr0h = b.add_i32(kaddr0, c16i);
+            let kaddr0h = b.add_i32(kaddr0, c32v);
             let k_hi0 = b.load_lds_b128(Opnd::Val(kaddr0h));
             let k8_0 = b.cat_frag8(k_lo0, k_hi0);
             let kaddr1 = b.add_i32(kaddr0, c64);
             let k_lo1 = b.load_lds_b128(Opnd::Val(kaddr1));
-            let kaddr1h = b.add_i32(kaddr1, c16i);
+            let kaddr1h = b.add_i32(kaddr1, c32v);
             let k_hi1 = b.load_lds_b128(Opnd::Val(kaddr1h));
             let k8_1 = b.cat_frag8(k_lo1, k_hi1);
             let sb_s = b.c_i32((512 * s) as i32);
@@ -6131,6 +6131,7 @@ fn emit_fmha_role(b: &mut FnBuilder, cx: &FmhaCtx, role_a: bool) {
     let c127 = b.c_i32(127);
     let c128 = b.c_i32(128);
     let c4096 = b.c_i32(4096);
+    let c32v = b.c_i32(32);
     let neg_big = b.c_f32(-1.0e30);
     let c16f = b.c_f32(16.0);
     let zero = b.frag_zero(DType::Frag16);
@@ -6184,12 +6185,12 @@ fn emit_fmha_role(b: &mut FnBuilder, cx: &FmhaCtx, role_a: bool) {
             let ko = b.c_i32((4096 * s) as i32);
             let kaddr0 = b.add_i32(cx.kf_base, ko);
             let k_lo0 = b.load_lds_b128(Opnd::Val(kaddr0));
-            let kaddr0h = b.add_i32(kaddr0, c16i);
+            let kaddr0h = b.add_i32(kaddr0, c32v);
             let k_hi0 = b.load_lds_b128(Opnd::Val(kaddr0h));
             let k8_0 = b.cat_frag8(k_lo0, k_hi0);
             let kaddr1 = b.add_i32(kaddr0, c64);
             let k_lo1 = b.load_lds_b128(Opnd::Val(kaddr1));
-            let kaddr1h = b.add_i32(kaddr1, c16i);
+            let kaddr1h = b.add_i32(kaddr1, c32v);
             let k_hi1 = b.load_lds_b128(Opnd::Val(kaddr1h));
             let k8_1 = b.cat_frag8(k_lo1, k_hi1);
             // K scale dword of key (128 it + 32 s + j)
