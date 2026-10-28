@@ -411,6 +411,12 @@ impl Function {
                 Stmt::SetVar { var, value } => {
                     let _ = writeln!(s, "{pad}var{} <- {value:?}", var.0);
                 }
+                Stmt::VarScaleF32 { var, scalar } => {
+                    let _ = writeln!(s, "{pad}var{} *= {scalar:?}", var.0);
+                }
+                Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
+                    let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
+                }
                 Stmt::BeginLoop { vars, init } => {
                     let _ = writeln!(s, "{pad}loop vars={vars:?} init={init:?}");
                     depth += 1;
@@ -1300,6 +1306,39 @@ pub fn verify(f: &Function) -> Vec<String> {
                 if let Opnd::Val(v) = value {
                     if !visible(&scopes, *v) {
                         errs.push(here(format!("operand v{v} is not visible here")));
+                    }
+                }
+            }
+            Stmt::VarScaleF32 { var, scalar } => {
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var));
+                if !ok {
+                    errs.push(here(format!("var{var} scaled outside its loop")));
+                }
+                if f.var_ty(*var) != Some(DType::Frag16) {
+                    errs.push(here(format!("var{var} must be a frag16 to be scaled in place")));
+                }
+                if let Err(e) = expect_float(f, *scalar, "var scale") {
+                    errs.push(here(e));
+                }
+            }
+            Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var));
+                if !ok {
+                    errs.push(here(format!("var{var} accumulated outside its loop")));
+                }
+                if f.var_ty(*var) != Some(DType::Frag16) {
+                    errs.push(here(format!("var{var} must be a frag16 accumulator")));
+                }
+                for (o, ty) in [(a, DType::Frag8), (b, DType::Frag8)] {
+                    match opnd_ty(f, *o) {
+                        Ok(t) if t == ty => {}
+                        Ok(t) => errs.push(here(format!("mfma operand is {}, expected {}", t.name(), ty.name()))),
+                        Err(e) => errs.push(here(e)),
+                    }
+                }
+                for o in [scale_a, scale_b] {
+                    if let Err(e) = expect_int(f, *o, "mfma scale") {
+                        errs.push(here(e));
                     }
                 }
             }
