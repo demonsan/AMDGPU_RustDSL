@@ -112,7 +112,9 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_mfma") == 0 || std::strcmp(kern, "probe_lds") == 0 ||
                              std::strcmp(kern, "probe_mfma_wide") == 0 ||
                              std::strcmp(kern, "probe_mfma_fp8") == 0 ||
-                             std::strcmp(kern, "probe_mfma_scale") == 0 || std::strcmp(kern, "probe_roles") == 0;
+                             std::strcmp(kern, "probe_mfma_scale") == 0 ||
+                             std::strcmp(kern, "probe_roles") == 0 ||
+                             std::strcmp(kern, "probe_waves2") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
