@@ -335,7 +335,7 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                 MOp::VWriteSub | MOp::VReadSub => {
                     if inst.op == MOp::VWriteSub {
                         if let Some(d) = inst.dst {
-                            if !matches!(m.vreg_class(d), RClass::V2 | RClass::V4) {
+                            if !matches!(m.vreg_class(d), RClass::V2 | RClass::V4 | RClass::V16) {
                                 errs.push(format!(
                                     "block {bi} inst {ii}: tuple write dst must be V2 or V4"
                                 ));
@@ -344,7 +344,7 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                     }
                     if let Some(Src::Reg(r)) = inst.srcs.first() {
                         let class = m.vreg_class(*r);
-                        if inst.op == MOp::VReadSub && !matches!(class, RClass::V2 | RClass::V4) {
+                        if inst.op == MOp::VReadSub && !matches!(class, RClass::V2 | RClass::V4 | RClass::V16) {
                             errs.push(format!(
                                 "block {bi} inst {ii}: tuple read base must be V2 or V4"
                             ));
