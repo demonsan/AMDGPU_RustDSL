@@ -7289,7 +7289,7 @@ fn sched_begin(name: &str) -> (FnBuilder, ValueId, ValueId, ValueId) {
     let mut b = FnBuilder::new(name, 512);
     b.lds(16384);
     b.arg("o", DType::Ptr, 0, 8);
-    b.arg("n", DType::I32, 8, 4);
+    b.arg("count", DType::I32, 8, 4);
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let n = b.let_(Op::KernargI32 { offset: 8 });
     let tid = b.let_(Op::WorkitemId);
