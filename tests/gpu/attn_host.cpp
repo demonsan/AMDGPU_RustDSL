@@ -145,7 +145,8 @@ int main(int argc, char** argv) {
                              std::strcmp(kern, "probe_fp8_min") == 0 ||
                              std::strcmp(kern, "probe_fp8_minload") == 0 ||
                              std::strcmp(kern, "probe_fp8_softmax") == 0 ||
-                             std::strcmp(kern, "probe_fp8_fmha_tile") == 0;
+                             std::strcmp(kern, "probe_fp8_fmha_tile") == 0 ||
+                             std::strcmp(kern, "probe_fp8_fmha_2tile") == 0;
     void** launch_params = probe_kernel ? probe_params : params;
     dim3 grid(S / 64, H, B);
     std::printf("[harness] launching grid=(%u,%u,%u) block=%d\n", grid.x, grid.y, grid.z, BLOCK);
@@ -237,7 +238,30 @@ int main(int argc, char** argv) {
         CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
         std::printf("[harness] fp8 matmul inputs filled (test %d)\n", fp8_test);
     }
-    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, (unsigned)BLOCK, 1, 1, 0, nullptr, launch_params,
+    if (std::strcmp(kern, "probe_fp8_fmha_2tile") == 0) {
+        std::vector<unsigned char> in(9216, 0);
+        unsigned int seed = 777u;
+        auto next_rand = [&seed]() {
+            seed = seed * 1664525u + 1013904223u;
+            return (seed >> 16) & 0xFFu;
+        };
+        static const unsigned char palette[9] = {0x00, 0x28, 0x30, 0x38, 0x3C, 0x40, 0x44, 0xB8, 0xC0};
+        for (int i = 0; i < 32; ++i)
+            for (int k = 0; k < 64; ++k) {
+                in[i * 64 + k] = palette[next_rand() % 9];
+                in[2048 + i * 64 + k] = palette[next_rand() % 9];
+                in[4096 + i * 64 + k] = palette[next_rand() % 9];
+                in[6144 + i * 64 + k] = palette[next_rand() % 9];
+            }
+        for (int l = 0; l < 64; ++l) {
+            in[8192 + l * 4] = (unsigned char)(126 + next_rand() % 3);
+            in[8448 + l * 4] = (unsigned char)(126 + next_rand() % 3);
+            in[8704 + l * 4] = (unsigned char)(126 + next_rand() % 3);
+            in[8960 + l * 4] = (unsigned char)(126 + next_rand() % 3);
+        }
+        CK(hipMemcpy(dout, in.data(), in.size(), hipMemcpyHostToDevice));
+        std::printf("[harness] 2tile inputs filled\n");
+    }    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, (unsigned)BLOCK, 1, 1, 0, nullptr, launch_params,
                              nullptr));
     CK(hipDeviceSynchronize());
     std::printf("[harness] kernel finished\n");
@@ -464,7 +488,63 @@ int main(int argc, char** argv) {
         return bad != 0;
     }
 
-    if (std::strcmp(kern, "probe_fp8_fmha_tile") == 0) {
+    if (std::strcmp(kern, "probe_fp8_fmha_2tile") == 0) {
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
+        // scores over 64 keys: tile t uses KT at 2048+2048t, scales SA at 8192+256t, SB at 8704+256t
+        static double S2[32][64];
+        for (int t = 0; t < 2; ++t)
+            for (int i = 0; i < 32; ++i)
+                for (int jj = 0; jj < 32; ++jj) {
+                    double acc = 0.0;
+                    for (int k = 0; k < 64; ++k) {
+                        const int g = ((k % 32) / 16) % 2;
+                        const double sa_v = std::ldexp(1.0, (int)raw[8192 + 256 * t + (i + 32 * g) * 4] - 127);
+                        const double sb_v = std::ldexp(1.0, (int)raw[8704 + 256 * t + (jj + 32 * g) * 4] - 127);
+                        acc += fp8_e4m3(raw[i * 64 + k]) * fp8_e4m3(raw[2048 + 2048 * t + jj * 64 + k]) * sa_v * sb_v;
+                    }
+                    S2[i][t * 32 + jj] = acc;
+                }
+        const float* outv = reinterpret_cast<const float*>(raw + 11264);
+        int bad = 0;
+        double worst = 0.0;
+        for (int i = 0; i < 32; ++i) {
+            double mx = -1e30;
+            for (int c = 0; c < 64; ++c) mx = std::max(mx, S2[i][c]);
+            double sum = 0.0;
+            for (int c = 0; c < 64; ++c) sum += std::exp(S2[i][c] - mx);
+            for (int d = 0; d < 32; ++d) {
+                // use the kernel's quantised P bytes (tile t, row i, key k) at 9216 + 1024t + 32i + k
+                double ref = 0.0;
+                for (int t = 0; t < 2; ++t)
+                    for (int k = 0; k < 32; ++k)
+                        ref += fp8_e4m3(raw[9216 + 1024 * t + 32 * i + k]) / 16.0 *
+                               fp8_e4m3(raw[6144 + d * 64 + t * 32 + k]);
+                double exact = 0.0;
+                for (int t = 0; t < 2; ++t)
+                    for (int k = 0; k < 32; ++k)
+                        exact += std::exp(S2[i][t * 32 + k] - mx) / sum * fp8_e4m3(raw[6144 + d * 64 + t * 32 + k]);
+                const double gotv = outv[i * 32 + d];
+                const double err = std::fabs(gotv - ref);
+                worst = std::max(worst, err);
+                if (err > 1e-3 + 1e-3 * std::fabs(ref)) {
+                    if (bad < 6) std::fprintf(stderr, "2tile O[%d][%d] want %.6f got %.6f (exact %.6f)\n", i, d, ref, gotv, exact);
+                    ++bad;
+                }
+            }
+        }
+        double fp8_err = 0.0;
+        for (int i = 0; i < 32; ++i) for (int d = 0; d < 32; ++d) {
+            double mx = -1e30; for (int c = 0; c < 64; ++c) mx = std::max(mx, S2[i][c]);
+            double sum = 0.0; for (int c = 0; c < 64; ++c) sum += std::exp(S2[i][c] - mx);
+            double exact = 0.0;
+            for (int t = 0; t < 2; ++t) for (int k = 0; k < 32; ++k)
+                exact += std::exp(S2[i][t * 32 + k] - mx) / sum * fp8_e4m3(raw[6144 + d * 64 + t * 32 + k]);
+            fp8_err = std::max(fp8_err, std::fabs(outv[i * 32 + d] - exact));
+        }
+        std::printf("  fmha_2tile bad=%d worst_vs_quantised=%.3e worst_vs_exact=%.3e O[0][0]=%.6f\n", bad, worst, fp8_err, outv[0]);
+        std::printf(bad ? "PROBE_FMHA_2TILE_FAIL\n" : "PROBE_FMHA_2TILE_OK\n");
+        return bad != 0;
+    }    if (std::strcmp(kern, "probe_fp8_fmha_tile") == 0) {
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(got.data());
         double s_mat[32][32];
         for (int i = 0; i < 32; ++i) {

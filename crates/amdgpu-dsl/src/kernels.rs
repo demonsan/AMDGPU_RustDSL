@@ -1874,7 +1874,7 @@ pub fn probe_fp8_fmha_2tile() -> Function {
         let invf = b.bitcast_f32(invraw);
         let lanev = b.bitcast_f32(lane);
         let val = b.mul_f32(lanev, invf);
-        b.store_f32(o_ptr, i_const * 128, val);
+        b.store_f32(o_ptr, (i_const * 128) as u32, val);
     }
     b.finish()
 }
