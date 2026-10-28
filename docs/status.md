@@ -622,7 +622,24 @@ touching memory out of bounds. `tests/gpu/run_ref.sh` now covers 9 shapes includ
 with `gqa = 2` and `gqa = 4`; all `REF_KERNEL_OK` against both the CPU model (mean error 1.1-1.8e-3) and the
 vendor kernel (mean difference 2.4-2.8e-3, all outputs compared).
 
-Still required: `kv_seq_len` a multiple of 128, no LSE output.
+Still required at this point: `kv_seq_len` a multiple of 128 (lifted in round 35), no LSE output.
+
+## Arbitrary key length (round 35)
+
+`fmha_fwd_hd128_mxfp8_t` no longer requires `kv_seq_len` to be a multiple of 128 (the vendor kernel does not
+either: it passed SK = 1, 100, 129, 1000, 1088, 1337 against the CPU model). The loop runs
+`ceil(kv_len / 128)` iterations; K/V staging rows and K descale rows past the end are clamped to the last
+valid key, and the last iteration (detected as `kv_len < 128 (it + 1)`, uniform across the block) takes a
+second copy of the compute body in which every score value whose key index (`128 it + 32 s + 8 (r / 4) +
+4 g + r % 4`) is `>= kv_len` is replaced by `-1e30` before the softmax, so those keys get probability 0.
+Only the last iteration pays for the 64 compare/selects. Cost: 208 VGPRs and ~2x assembly size; throughput on the
+main benchmark shape is 186 TFLOP/s (was 190).
+
+`tests/gpu/run_ref.sh` now has 15 shapes (partial query tiles, GQA 2/4, key lengths 1..1337, batch 1..3); all
+`REF_KERNEL_OK` for `fmha_fwd_hd128_mxfp8_t` against both the CPU model (mean error 1.1-1.8e-3) and the vendor
+kernel on every output (mean difference 1.3-2.8e-3; SK = 1 is bit-identical to the vendor kernel).
+
+Remaining differences from the vendor kernel's feature set: no LSE output.
 
 ## Next: FMHA reference core loop
 
