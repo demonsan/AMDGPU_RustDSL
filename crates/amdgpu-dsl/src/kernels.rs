@@ -500,8 +500,13 @@ pub fn probe_lds_own() -> Function {
     let off = b.mul_i32(tid, c4);
     b.store_lds_b32(Opnd::Val(off), Opnd::Val(tid));
     b.wait_lds(0);
+    let c1 = b.c_i32(1);
+    let c63 = b.c_i32(63);
+    let next = b.add_i32(tid, c1);
+    let idx = b.let_(Op::AndI32(Opnd::Val(next), Opnd::Val(c63)));
+    let nb_off = b.mul_i32(idx, c4);
     let raw1 = b.load_lds_b32(Opnd::Val(off));
-    let raw2 = b.load_lds_b32(Opnd::Val(off));
+    let raw2 = b.load_lds_b32(Opnd::Val(nb_off));
     let value1 = b.bitcast_f32(raw1);
     let value2 = b.bitcast_f32(raw2);
     let out_ptr = b.ptr_add(o, off);

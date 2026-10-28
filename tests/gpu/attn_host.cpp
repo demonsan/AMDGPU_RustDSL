@@ -335,7 +335,7 @@ int main(int argc, char** argv) {
             if (std::fabs(vals[tid] - (float)tid) > 0.5f) {
                 ++first_bad;
             }
-            if (std::fabs(vals[64 + tid] - (float)tid) > 0.5f) {
+            if (std::fabs(vals[64 + tid] - (float)((tid + 1) & 63)) > 0.5f) {
                 if (read_bad < 4) {
                     std::fprintf(stderr, "own read mismatch tid=%d got=%.1f\n", tid,
                                  vals[64 + tid]);
