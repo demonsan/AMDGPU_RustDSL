@@ -547,7 +547,9 @@ pub fn probe_lds_self2() -> Function {
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
-    let raw = b.load_lds_b32(Opnd::Val(self_off));
+    // Recompute the address after the barrier in a fresh value.
+    let raddr = b.mul_i32(tid, c4);
+    let raw = b.load_lds_b32(Opnd::Val(raddr));
     let value = b.bitcast_f32(Opnd::Val(raw));
     let dst = b.ptr_add(o, self_off);
     b.store_f32(dst, 0, Opnd::Val(value));
