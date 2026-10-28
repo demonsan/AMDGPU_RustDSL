@@ -67,8 +67,9 @@ int main(int argc, char** argv) {
             for (int h = 0; h < H; ++h)
                 for (int blk = 0; blk < 4; ++blk) ks_at(b, s, h, blk) = (unsigned char)(126 + rnd() % 3);
     if (std::getenv("REF_SC1")) {
-        std::fill(qs.begin(), qs.end(), 127);
-        std::fill(ks.begin(), ks.end(), 127);
+        const int ev = std::atoi(std::getenv("REF_SC1"));
+        std::fill(qs.begin(), qs.end(), (unsigned char)(ev > 1 ? ev : 127));
+        std::fill(ks.begin(), ks.end(), (unsigned char)(ev > 1 ? ev : 127));
     }
     float vdescale = 1.0f;
     const size_t no = (size_t)B * S * H * D;
