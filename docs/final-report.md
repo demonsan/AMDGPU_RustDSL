@@ -90,3 +90,11 @@ release 构建，整个进程（启动 + DSL 构建 + 编译 + 写文件），�
 `hazards.rs` 现在不只是补 `s_nop`：消费者因为 MFMA / 超越函数结果还没就绪而要停顿时，在同一基本块、后面 48 条指令的窗口内寻找可以提前的 ALU 指令（`v_mov` / 加减乘 / 位运算 / `v_max3` / `v_cvt_pk_*` 等纯寄存器指令；不碰内存、标量状态、`vcc`、墙 / barrier），并检查它与被它跨过的所有指令没有 RAW / WAR / WAW 依赖（按子寄存器别名所属的 tuple 保守判断），自己的源操作数也已就绪；这样的指令被搬到消费者前面填空档。同一 pass 还放宽了"同一缩放 MFMA 在原地链式累加 C 操作数"的保守补 nop（ISA §7.6：同操作码原地累加不需要额外等待）。
 
 效果（诚实）：`fmha_fwd_hd128_mxfp8_t` 汇编 4413 → 4365 行，`s_nop` 条数下降；吞吐不变（185.5 TFLOP/s），符合第 34 轮消融的预期（nop 只占循环的很小一部分）。价值在于编译器现在有了一个经过真机回归验证的调度步骤，回归测试 `hazard_gaps_are_filled_with_independent_work` 锁定了它的行为。
+
+## 9. 默认后端改为 LLVM tail（第 3 轮，gfx950）
+
+* 默认：`llvm-tail`（寄存器分配、调度、lowering 仍是自研；LLVM 只负责 wait / hazard / memory legalizer / descriptor）。`--backend=own` / `BACKEND=own` 保留完整自研 tail。
+* 不变量（`tests/tail_invariance.rs`）：两个后端的指令流逐条一致（忽略 nop / waitcnt / 分支标签写法），MIR 为纯物理寄存器；在 `AMDC_SCHED=1`、`swp`、`taildup,swp`、`auto` 下同样成立（唯一允许的额外指令是 LLVM 的 vccz 错误规避 `s_mov_b64 vcc, vcc`，在 `sched_diamond` 的 taildup 构建里出现）。
+* 真机（GPU 4，ROCm 10.1 tail + 10.1 汇编器）：`cargo test` 34 通过；`attention_fwd` OK；fmha_t 15/15 REF_KERNEL_OK、determinism 5/5，在无调度、`swp`、`taildup,swp`、`auto` 下均成立。B1H8S2048：own 224.7 / llvm-tail 224.0–226.3 / llvm-tail+auto 224.7–225.6 TFLOP/s（无回归）。
+* `--sched=auto`：只对模拟器预测收益 ≥3% 的循环做块内调度；swp 自带 3% 门限；taildup 只在其“与无 taildup 方案相比，两者共有的循环总模型周期下降 ≥3%”时启用。含 `s_barrier` 的循环不参与（模型没有跨 wave 同步项：在 FMHA 上模型预测 −23%，而真机是 221.7 vs 225.0 TFLOP/s），所以 FMHA 在 auto 下保持未调度；sched_* 微内核真机 1 wave/2 waves 每次迭代周期：valu_mul −37%/−36%，valu_max3 −35%/−22%，valu_exp −23%/−14%，mfma_chain −40%/−1%，mfma_valu16 −37%/−15%，mfma_valu4 −56%/−24%，diamond −32%/−14%。
+* 未完成项：导出 kill/dead 标志（目前 3 个 LLVM peephole 测试因此不能折叠，保守且正确）、DSL 引入原子/LDS-DMA 时需导出 MMO（ordering/syncscope）、2 个 verifier 个案（`waitcnt.mir`, `waitcnt-agpr.mir`）尚未查明。

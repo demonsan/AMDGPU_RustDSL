@@ -25,6 +25,18 @@ kernel 作者和自动化 agent 在一个**类型化、可验证、可快速迭�
 
 **不是 1:1 复刻**：ABI、网格 / block 形状、1×32 缩放用法、`v_mfma_scale_f32_32x32x64_f8f6f4`、`ds_read_b64_tr_b8`、A/B 两组 wave 的分工都和参考 kernel 一致，但指令级结构不同（P 量化用 `v_cvt_pk_fp8_f32`，参考用 pknorm + scalef32 pack；PV 用 32×32×64 MFMA，参考用 `v_smfmac_f32_16x16x128_fp8_fp8`；每轮 2 个 barrier，参考 4 个 phase；没有 rollback 出口）。对照表见 `docs/final-report.md`。
 
+## 后端分工：默认 LLVM tail（第 3 轮）
+
+`amdc emit` 的**默认后端是 `llvm-tail`**（`--backend=own` 或环境变量 `BACKEND=own` 回到完整的自研 tail；`AMDC_BACKEND` 也可设置）。分工如下：
+
+| 阶段 | 谁负责 |
+|---|---|
+| DSL、lowering、MIR、**寄存器分配**、**指令调度**（块内 list scheduler、swp、taildup、`--sched` / `--sched=auto`） | **始终是我们自己的**（两个后端完全一致） |
+| 硬件 wait（`s_waitcnt`）、hazard nop / `s_delay_alu`、memory legalizer、kernel descriptor / metadata | `llvm-tail`：我们导出 post-RA MIR（物理寄存器、已排好序），`llc -start-before=gcn-create-vopd` 只跑 tail 的 pass；`own`：我们自己的实现 |
+
+LLVM 不改源码；pin 的版本记录在 `backend.lock`（ROCm 10.1.0，AMD LLVM 24.0.0git；ROCm 10 不带 `llc`，用 `tools/llvm_build_llc.sh` 从同一 commit 的 `llc.cpp` 链接其 `libLLVM.so` 得到）。找不到 pin 的工具目录时 `llvm-tail` **直接报错**并建议 `--backend=own`，不会静默换成别的 LLVM。ROCm 7.0.2（dialect `llvm20`）仍可通过 `ROCM_LLVM_BIN` / `AMDC_DIALECT` 选用。
+
+**“RA 和调度仍然是我们的”有自动化回归保护**：`crates/amdgpu-compiler/tests/tail_invariance.rs`（`cargo test`）对每个 kernel 同时用 own 与 llvm-tail 编译，要求指令流（opcode、物理寄存器、顺序）在忽略 `s_nop` / `s_waitcnt` / `s_delay_alu` / fallthrough `s_branch` 与等价的操作数写法后**完全一致**，导出的 MIR 仅含物理寄存器（`noVRegs: true`），descriptor 与我们的一致；可在 `AMDC_SCHED=1`、`swp`、`taildup,swp`、`auto` 下重复。详见 `docs/llvm-tail-integration.md` §9 与 `docs/llvm-tail-conformance.md`。
 ## 目录
 
 | 路径 | 内容 |

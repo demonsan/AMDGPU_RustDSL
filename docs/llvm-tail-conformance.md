@@ -107,3 +107,8 @@ python3 tools/conformance_classify.py $WORK/results/lit-diff-all.log     # failu
 3. `tools/llvm_conformance.sh all`: baseline of the new LLVM first (its own failures are not ours), then compare the identity / flags / all tables with section 3; any new failure is an exporter/table regression.
 4. Hazard diff: rerun `hazard_matrix` (`AMDC_ORACLE_OUT`) and diff against the previous matrix to get the new erratum changelog; rerun `tools/hazard_oracle.sh` for static nop/wait counts.
 5. Hardware: attention_fwd, 15 shapes, determinism, scheduler variants (section 5).
+
+## 8. Default backend and the retained-capability guarantee (round 3)
+
+The LLVM tail is now the default backend (`docs/llvm-tail-integration.md` section 9). What is **proven** about "RA and scheduling remain ours" (Verified, `cargo test --test tail_invariance`, 48 kernels, scheduler off / `1` / `swp` / `taildup,swp` / `auto`): the instruction stream after LLVM's tail equals ours modulo nops, waits, fallthrough branches and operand spelling, the exported MIR is physical-register only, and the descriptor sizes agree. What is **not** claimed: that LLVM never adds instructions (it may add hazard workarounds such as `s_mov_b64 vcc, vcc`).
+Open conformance items (unchanged from section 3): kill/dead flags, MMO atomic / LDS-DMA information, the 2 verifier cases (`waitcnt.mir`, `waitcnt-agpr.mir`).
