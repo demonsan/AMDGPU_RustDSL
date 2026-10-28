@@ -197,3 +197,53 @@ fn scaled_mfma_and_max3_are_emitted() {
     let compiled = compile(&f).unwrap();
     assert!(compiled.asm.contains("v_max3_f32"), "v_max3_f32 missing");
 }
+
+/// Regression (round 23): the pending-load set used to be a purely linear notion, so a wait
+/// emitted inside the then-branch hid the outstanding load from the else-branch. Every
+/// outstanding load must now be drained before the branch is taken.
+#[test]
+fn loads_are_drained_before_a_branch() {
+    use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
+    let mut b = FnBuilder::new("branch_wait", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c32 = b.c_i32(32);
+    let loaded = b.load_f32(o, 64);
+    let cond = b.cmp_lt_i32(tid, c32);
+    b.begin_if(Opnd::Val(cond));
+    b.store_f32(o, 0, loaded);
+    b.else_();
+    b.store_f32(o, 4, loaded);
+    b.end_if();
+    let asm = compile(&b.finish()).expect("compiles").asm;
+    let wait = asm.find("s_waitcnt vmcnt").expect("a vmcnt wait is emitted");
+    let branch = asm.find("s_cbranch").expect("a branch is emitted");
+    assert!(wait < branch, "the load must be drained before the branch:\n{asm}");
+}
+
+/// Regression (round 23): a constant first materialised inside one branch used to be reused
+/// by the sibling branch as if its `v_mov` had executed there.
+#[test]
+fn constants_are_materialised_on_every_path() {
+    use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
+    let mut b = FnBuilder::new("branch_const", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c32 = b.c_i32(32);
+    let cond = b.cmp_lt_i32(tid, c32);
+    b.begin_if(Opnd::Val(cond));
+    let x = b.c_f32(3.0);
+    b.store_f32(o, 0, x);
+    b.else_();
+    let y = b.c_f32(3.0);
+    b.store_f32(o, 4, y);
+    b.end_if();
+    let asm = compile(&b.finish()).expect("compiles").asm;
+    // 3.0f = 1077936128; it has to be loaded once per branch.
+    assert!(
+        asm.matches("1077936128").count() >= 2,
+        "the constant must be materialised in both branches:\n{asm}"
+    );
+}
