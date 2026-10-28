@@ -7031,7 +7031,12 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let cm1 = b.c_i32(-1);
     let s_last = b.add_i32(s_len, cm1);
     let row_ok = b.cmp_lt_i32(row_raw, s_len);
-    let row = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_ok), a: Opnd::Val(row_raw), b: Opnd::Val(s_last) });
+    let ablate_pre = std::env::var("FMHA_ABLATE").unwrap_or_default();
+    let row = if ablate_pre.contains("noclamp") {
+        row_raw
+    } else {
+        b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_ok), a: Opnd::Val(row_raw), b: Opnd::Val(s_last) })
+    };
     let q_row_off = b.mul_i32(row, q_seqs);
     let q_b_off = b.mul_i32(bidx, q_bs);
     let q_h_off = b.mul_i32(hidx, q_hs);
@@ -7077,7 +7082,7 @@ pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
     let s2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g4), a: Opnd::Val(c2), b: Opnd::Val(s1) });
     let s3 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g8), a: Opnd::Val(c3), b: Opnd::Val(s2) });
     let gshift = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g16), a: Opnd::Val(c4), b: Opnd::Val(s3) });
-    let kvh = b.let_(Op::LshrI32(Opnd::Val(hidx), Opnd::Val(gshift)));
+    let kvh = if ablate_pre.contains("nogqa") { hidx } else { b.let_(Op::LshrI32(Opnd::Val(hidx), Opnd::Val(gshift))) };
     let kb0 = b.mul_i32(bidx, k_bs);
     let kb1 = b.mul_i32(kvh, k_hs);
     let kbase_off = b.add_i32(kb0, kb1);
