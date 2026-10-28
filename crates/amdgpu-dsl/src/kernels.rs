@@ -6175,7 +6175,8 @@ fn emit_fmha_role(b: &mut FnBuilder, cx: &FmhaCtx, role_a: bool) {
 
     let hq4 = b.mul_i32(cx.q_heads, c4);
     let rbase0 = b.mul_i32(cx.j, c128);
-    let rbase = b.add_i32(rbase0, b_wbase(b, cx));
+    let wbase_v = b_wbase(b, cx);
+    let rbase = b.add_i32(rbase0, wbase_v);
     for hh in 0..2usize {
         // ---- two 32-key score tiles of this 64-key substep ----
         for sl in 0..2usize {
@@ -6183,12 +6184,12 @@ fn emit_fmha_role(b: &mut FnBuilder, cx: &FmhaCtx, role_a: bool) {
             let ko = b.c_i32((4096 * s) as i32);
             let kaddr0 = b.add_i32(cx.kf_base, ko);
             let k_lo0 = b.load_lds_b128(Opnd::Val(kaddr0));
-            let kaddr0h = b.add_i32(kaddr0, c16i_32(b));
+            let kaddr0h = b.add_i32(kaddr0, c16i);
             let k_hi0 = b.load_lds_b128(Opnd::Val(kaddr0h));
             let k8_0 = b.cat_frag8(k_lo0, k_hi0);
             let kaddr1 = b.add_i32(kaddr0, c64);
             let k_lo1 = b.load_lds_b128(Opnd::Val(kaddr1));
-            let kaddr1h = b.add_i32(kaddr1, c16i_32(b));
+            let kaddr1h = b.add_i32(kaddr1, c16i);
             let k_hi1 = b.load_lds_b128(Opnd::Val(kaddr1h));
             let k8_1 = b.cat_frag8(k_lo1, k_hi1);
             // K scale dword of key (128 it + 32 s + j)
@@ -6354,7 +6355,8 @@ fn emit_fmha_role(b: &mut FnBuilder, cx: &FmhaCtx, role_a: bool) {
     // output byte offset of (batch, head, row 0 of this wave + 4p, column j)
     let ob0 = b.mul_i32(cx.bidx, cx.o_bs);
     let ob1 = b.mul_i32(cx.hidx, cx.o_hs);
-    let p4 = b.shl_i32(cx.pblk, c2_32(b));
+    let c2v = b.c_i32(2);
+    let p4 = b.shl_i32(cx.pblk, c2v);
     let orow0 = b.shl_i32(cx.wave, c5);
     let orow1 = b.add_i32(cx.row0, p4);
     let _ = orow0;
@@ -6390,14 +6392,6 @@ fn emit_fmha_role(b: &mut FnBuilder, cx: &FmhaCtx, role_a: bool) {
 fn b_wbase(b: &mut FnBuilder, cx: &FmhaCtx) -> ValueId {
     let c8320 = b.c_i32(8320);
     b.mul_i32(cx.wave, c8320)
-}
-
-fn c16i_32(b: &mut FnBuilder) -> ValueId {
-    b.c_i32(16)
-}
-
-fn c2_32(b: &mut FnBuilder) -> ValueId {
-    b.c_i32(2)
 }
 
 /// ABI-compatible FMHA forward kernel for the vendor `fwd_hd128_mxfp8` interface.
