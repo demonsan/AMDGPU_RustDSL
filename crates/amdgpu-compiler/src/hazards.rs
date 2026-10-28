@@ -264,7 +264,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             if let Some(latency) = mfma_latency(inst.op) {
                 if let Some(d) = inst.dst {
                     // strict: latency wait states must lie *between* the MFMA and the reader (hardware: 19 is still stale)
-                    let lat = if strict { latency + 1 } else { latency };
+                    // The scaled MFMA fix is hardware-confirmed (microbenchmark: 19 states between MFMA and reader is still
+                // stale, 20 are needed), so it also applies to the default path; the other opcodes keep the table value
+                // outside strict mode.
+                let lat = if strict || is_scaled_mfma(inst.op) { latency + 1 } else { latency };
                     ready.insert(canon(d), (cycle + lat, is_scaled_mfma(inst.op)));
                 }
             }
