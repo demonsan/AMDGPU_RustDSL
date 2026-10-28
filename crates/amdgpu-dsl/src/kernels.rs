@@ -1076,7 +1076,8 @@ pub fn probe_fp8_matmul() -> Function {
 
     let j4 = b.mul_i32(j, c4);
     let p512 = b.shl_i32(p, c9);
-    let dyn_off = b.add_i32(b.add_i32(j4, p512), c4608);
+    let lane_off = b.add_i32(j4, p512);
+    let dyn_off = b.add_i32(lane_off, c4608);
     let dptr = b.ptr_add(o, dyn_off);
     for r in 0..16u8 {
         let i_const = ((r / 4) * 8 + (r % 4)) as u32;
