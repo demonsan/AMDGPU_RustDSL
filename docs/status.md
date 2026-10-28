@@ -591,6 +591,39 @@ Result (`REF_ITERS=20`, 1x8x2048x2048; all 6 shapes still `REF_KERNEL_OK`, numer
 (0.091 ms) against 118 before and 518 for the vendor kernel -- a 2.7x gap; assembly 2859 -> 2329 lines,
 `v_mov_b32` 633 -> 447.
 
+## Where the time goes, GQA and partial query tiles (round 34)
+
+**Performance attribution (ablation).** `FMHA_ABLATE` (a debug switch read when the kernel is built; passed
+into the build container by `tools/container/cargo.sh`) removes one component of `fmha_fwd_hd128_mxfp8_t` at a
+time. Timing the 1x8x2048x2048 problem (0.090 ms = 190 TFLOP/s as is):
+
+| ablated | time | change |
+|---|---|---|
+| `nostage` (no K/V prefetch + LDS writes) | 0.0769 ms | -15% |
+| `nobar` (no in-loop barriers) | 0.0808 ms | -10% |
+| `nopv` (no PV MFMAs) | 0.0815 ms | -10% |
+| `noexp` (no `v_exp_f32`) | 0.0851 ms | -6% |
+| `nostage,nobar` | 0.0692 ms | -23% |
+| all four | 0.0533 ms | -41% |
+
+No single component dominates: staging + barriers cost about a quarter, PV a tenth, the exponentials a
+twentieth, and more than half of the time is the rest of the S path (the QK^T MFMAs with their hazard
+padding, the max exchange, the `sub`/`cvt` work). Two experiments that did *not* help and were reverted:
+issuing all four score tiles before the softmax (192 -> 224 VGPRs, 190 -> 179 TFLOP/s) and lazy rescaling of
+the running max / O accumulators behind a wave-level branch (the reference's "rollback" idea; only 3% faster
+even on data whose max never grows, and slightly noisier numerics), so the 128 `v_mul_f32` of the O
+rescale are not the bottleneck.
+
+**GQA and partial query tiles.** `fmha_fwd_hd128_mxfp8_t` now reads `s_seq_len` and `s_gqa`: the KV head of
+query head `h` is `h >> log2(gqa)` (gqa a power of two up to 16), K/V/descale offsets use it, the descale
+row strides are taken from the Q/K row strides (`stride >> 5`), and query rows past the end of a partial
+tile are clamped to the last valid row, so they compute and store that row's identical result instead of
+touching memory out of bounds. `tests/gpu/run_ref.sh` now covers 9 shapes including `S = 300`, `S = 700`
+with `gqa = 2` and `gqa = 4`; all `REF_KERNEL_OK` against both the CPU model (mean error 1.1-1.8e-3) and the
+vendor kernel (mean difference 2.4-2.8e-3, all outputs compared).
+
+Still required: `kv_seq_len` a multiple of 128, no LSE output.
+
 ## Next: FMHA reference core loop
 
 1. Resolve the 16 KB LDS question above (needed before scaling the core loop).
