@@ -1609,9 +1609,12 @@ pub fn probe_fp8_fmha_tile() -> Function {
     let v7 = b.bitcast_i32(v7);
     let v8 = b.frag8(v0, v1, v2, v3, v4, v5, v6, v7);
 
+    // P was scaled by 16 while quantising, so the B scale of 2^-4 folds the
+    // normalisation into the MFMA itself.
     let sc = b.c_i32(127);
+    let sc_quarter = b.c_i32(123);
     let zero2 = b.frag_zero(DType::Frag16);
-    let o_frag = b.mfma_scale_fp8(p8, v8, zero2, sc, sc);
+    let o_frag = b.mfma_scale_fp8(p8, v8, zero2, sc, sc_quarter);
 
     let lane_off = b.add_i32(j4, p512);
     let out_dyn = b.add_i32(lane_off, c6656);
