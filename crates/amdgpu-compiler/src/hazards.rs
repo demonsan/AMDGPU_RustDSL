@@ -20,6 +20,22 @@ fn is_transcendental(op: MOp) -> bool {
     matches!(op, MOp::VExpF32 | MOp::VRcpF32)
 }
 
+/// Independent instructions that must follow an MFMA before its result may be
+/// read (CDNA4 ISA section 7.6, "Table: XDL write VGPR" -> "VALU read/write of
+/// the destination VGPR"). The table lists 5/8/12/20 depending on the opcode
+/// size; the largest value is used for the F8F6F4 shapes, which take 32 to 64
+/// cycles.
+fn mfma_latency(op: MOp) -> Option<usize> {
+    match op {
+        MOp::VMfma16x16x16F16 => Some(12),
+        MOp::VMfma32x32x8F16 => Some(12),
+        MOp::VMfma16x16x32Fp8 => Some(12),
+        MOp::VMfma32x32x16Fp8 => Some(12),
+        MOp::VMfmaScale32x32x64Fp8 => Some(20),
+        _ => None,
+    }
+}
+
 pub fn fix_value_hazards(m: &mut MFunction) {
     for b in &mut m.blocks {
         let mut out: Vec<MInst> = Vec::with_capacity(b.insts.len() + 8);
@@ -37,11 +53,19 @@ pub fn fix_value_hazards(m: &mut MFunction) {
                     }
                 }
             }
+            if let Some(d) = inst.dst {
+                if let Some(rd) = ready.get(&d) {
+                    earliest = earliest.max(*rd);
+                }
+            }
             if earliest > cycle {
-                let missing = earliest - cycle;
-                let n = missing.saturating_sub(1).min(7) as i64;
-                out.push(MInst::new(MOp::SNop).imm(n));
-                cycle += (n as usize) + 1;
+                let mut missing = earliest - cycle;
+                while missing > 0 {
+                    let n = missing.min(7) as i64;
+                    out.push(MInst::new(MOp::SNop).imm(n));
+                    cycle += (n as usize) + 1;
+                    missing = missing.saturating_sub(n as usize + 1);
+                }
             }
             if let Some(d) = inst.dst {
                 ready.remove(&d);
@@ -49,6 +73,11 @@ pub fn fix_value_hazards(m: &mut MFunction) {
             if is_transcendental(inst.op) {
                 if let Some(d) = inst.dst {
                     ready.insert(d, cycle + TRANS_LATENCY);
+                }
+            }
+            if let Some(latency) = mfma_latency(inst.op) {
+                if let Some(d) = inst.dst {
+                    ready.insert(d, cycle + latency);
                 }
             }
             out.push(inst.clone());
