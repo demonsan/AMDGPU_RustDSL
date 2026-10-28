@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| fp8 QK^T + softmax | `probe_fp8_softmax`: random fp8 Q/K with random E8M0 scales -> block-scaled MFMA -> LDS transpose -> per-row max/exp/sum/normalise, `worst_err=8.1e-08` vs a CPU double reference -> `PROBE_FP8_SOFTMAX_OK` |
 | fp8 matmul (real data, general) | `probe_fp8_matmul`: random E4M3 data with random per-lane E8M0 scales through the real fragment/scale layout, matched element by element against a CPU double reference (`FP8_TEST=1,2,3,4,6,7`) -> `PROBE_FP8_MATMUL_OK` |
 | fp8 load path | `probe_fp8_load`: address arithmetic and the ISA fragment mapping for the real-data fp8 matmul probe -> `PROBE_FP8_LOAD_OK` |
 | Pack instructions | `probe_pack`: `v_cvt_pknorm_u16_f32(1.0, 0.5)` = `0x8000FFFF`; `v_cvt_scalef32_pk_fp8_bf16` low half = `0xAAAA3838`, high half = `0x3838AAAA` → `PROBE_PACK_OK` |
@@ -272,6 +273,19 @@ The E8M0 scale *lane* mapping is partially pinned down:
   host reference makes the general random-data test pass.
 
 
+
+## MXFP8 score tile plus row softmax (round 16)
+
+`probe_fp8_softmax` runs the whole score stage end to end: it loads a real fp8 Q
+tile and a transposed K tile plus their per-lane E8M0 scales from global memory,
+runs `v_mfma_scale_f32_32x32x64_f8f6f4`, writes the 32x32 score tile into LDS
+using the D fragment layout, then every lane reloads one full row, computes
+`exp(x - max) / sum(exp)` with plain VALU ops (a 32-step max chain, 32 `v_exp_f32`
+calls, an add chain and one `v_rcp_f32`) and stores the normalised row.
+
+Matched against a CPU double-precision reference over random fp8 data with random
+per-lane scales: `worst_err = 8.1e-08`, so both the fragment/scale layout and the
+transcendental/reciprocal path are numerically sound.
 
 ## Next: FMHA reference core loop
 
