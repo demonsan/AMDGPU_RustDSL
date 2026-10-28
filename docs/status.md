@@ -27,6 +27,7 @@ Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
 | Nested loops, register accumulator | `probe_nested_acc`: inner loop updates the outer loop variable, accumulator read after the loops → `PROBE_NESTED_ACC_OK` |
 | MFMA accumulation loop | `probe_loop_mfma`: `Frag16` loop variable accumulated by `v_mfma_scale_f32_32x32x64_f8f6f4` over two K=64 iterations → every element `128.0` → `PROBE_LOOP_MFMA_OK` |
 | FMHA core loop | `probe_fmha_core`: A/B phase staging with paired barriers, `ds_read_b128` → `Frag8` → in-place MFMA accumulation in a loop → every value `128.0` → `PROBE_FMHA_CORE_OK` |
+| **transposed register-softmax `fmha_fwd_hd128_mxfp8_t`** | same ABI and numerics (all 6 shapes `REF_KERNEL_OK`, mean error vs CPU 1.1-1.7e-3, vs vendor 2.5-2.8e-3) with `S^T = K Q^T`: scores stay in registers (lane = query), softmax max/sum are register reductions plus one LDS exchange with lane `l ^ 32`, the online-softmax correction is lane-local, no score tile goes through LDS; 192 VGPRs, 34.8 KB LDS; **88 TFLOP/s vs 15 for the first version (5.9x faster), vendor kernel 518 TFLOP/s** |
 | **ABI-compatible `fmha_fwd_hd128_mxfp8`** | our kernel launched with the vendor kernel's 656-byte kernarg on BSHD fp8 Q/K/V, E8M0 1x32 descales and a BF16 output; `exp2` softmax; **every output element agrees with a double-precision CPU model (mean error 1.2-1.7e-3, better than the vendor kernel's own 1.8-2.8e-3) and with the vendor kernel (mean difference 2.5-2.8e-3, worst 0.10) on 6 shapes up to B=3 H=3 S=768 SK=1280 and 2M outputs**; bit-identical to the vendor kernel when Q = 0 (`REF_KERNEL_OK`) |
 | **512-thread hd128 attention, LDS-staged K/V, A/B role loops** | `probe_fp8_fmha_hd128c`: reference tile shapes at reference scale — eight 32-row query tiles (256 rows) per block of 512, head dim 128, KV tile 128 processed as two 64-key online-softmax substeps, K (role A, waves 0-3) and V (role B, waves 4-7) copied through shared LDS (99,456 B), K fragments by `ds_read_b128`, V fragments by `ds_read_b64_tr_b8`, separate A/B steady loops with the same barrier schedule, four register-resident O accumulators; **224 VGPRs** (reference 246); all 8 waves match the host emulation (`1.8e-4`) -> `PROBE_FMHA_HD128C_OK` |
 | **head dim 128, KV tile 128** | `probe_fp8_fmha_hd128`: reference tile shapes — Q 32x128, four 32-key score tiles per iteration each the sum of two chained K=64 scaled MFMAs, two-pass 128-wide softmax, eight PV MFMAs (two 64-key halves x four 32-wide output tiles) with V through `ds_read_b64_tr_b8` at pitch 128, four register-resident O accumulators; 240 VGPRs (reference 246); `worst_err = 4.3e-7` vs the host emulation -> `PROBE_FMHA_HD128_OK` |
@@ -506,13 +507,37 @@ With Q = 0 the two kernels' outputs are bit-identical on all 131072 outputs. The
 differences are the fp8 rounding of P (we quantise `P * 16`, the vendor kernel its own way), which is
 why both kernels sit about 1-3e-3 from the exact model and ~3e-3 from each other.
 
-Performance, honestly (`REF_ITERS=20`): the vendor kernel runs the 2048x2048, 8-head problem in 0.033 ms
+Performance of the first version, honestly (`REF_ITERS=20`; see the round 31 section for the transposed kernel): the vendor kernel runs the 2048x2048, 8-head problem in 0.033 ms
 (about 518 TFLOP/s); ours takes 1.14 ms (15 TFLOP/s), i.e. **~34x slower**. Our loop is not software
 pipelined (K/V staging, S stores, softmax and PV are serialised by barriers), the softmax goes through
 LDS one row per lane, and there is no overlap between the roles. Closing that gap is the remaining
 work on the way to a 1:1 core loop.
 
 Limits of this version: `S` a multiple of 256, `kv_seq_len` a multiple of 128, GQA ratio 1, no LSE.
+
+## Register-resident softmax (round 31)
+
+`fmha_fwd_hd128_mxfp8_t` computes the transposed product `S^T = K Q^T` (K fragment as the MFMA A
+operand, Q as B), whose output layout gives every lane one query (`j = lane % 32`) and sixteen keys of
+each 32-key tile. That removes almost all of the LDS traffic of the first version:
+
+* **Softmax in registers.** The row max is a lane-local `max` chain over 32 values plus one exchange with
+  the partner lane `l ^ 32` (a single LDS store and load of one dword, no barrier), the row sum stays a
+  lane-local partial (the two partners are added once in the epilogue), and the online-softmax correction
+  `exp2(m_old - m_new)` is a lane-local scalar. No score tile, no correction slot and no per-wave LDS
+  region is needed any more.
+* **`P^T` is the B operand of the next product.** `O^T = V^T P^T` takes the quantised `P^T` straight from
+  the score registers (byte `b` of lane group `g` is key `16 r + 8 (i / 4) + 4 g + i % 4`) and the O
+  accumulators come out with one query per lane, so the correction multiplies the accumulator registers
+  directly and the epilogue stores four consecutive dims per 8 bytes.
+* **The V fragment** is the same `ds_read_b64_tr_b8` read as before with a new lane address: for lane `M`,
+  `key = 8 ((M & 15) >> 3) + 4 (M >> 5) + ((M >> 1) & 3)`, column `16 ((M >> 4) & 1) + 8 (M & 1)`, plus
+  `2048 r + 32 e + 8192 hh` per instruction. (Derived from the measured transposing-read mapping and
+  checked on hardware.)
+
+Measured (`REF_ITERS=20`, 1x8x2048x2048): 0.194 ms = 88 TFLOP/s against 1.14 ms (15 TFLOP/s) for the first
+version and 0.033 ms (518 TFLOP/s) for the vendor kernel, i.e. the gap closed from 34x to 5.9x. LDS now holds
+only the K and V tiles (34.8 KB), so a second tile buffer (software pipelining) fits.
 
 ## Next: FMHA reference core loop
 
