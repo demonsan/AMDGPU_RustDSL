@@ -157,11 +157,14 @@ pub struct MInst {
     pub srcs: Vec<Src>,
     /// Offset, physical register index or label, depending on `op`.
     pub imm: i64,
+    /// True for s_waitcnt inserted automatically by lowering (touch/flush_pending), false for
+    /// explicit DSL waits. Only the LLVM-tail exporter looks at it (--llvm-tail-drop-auto-waits).
+    pub auto: bool,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0 }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false }
     }
 
     pub fn def(mut self, r: VReg) -> Self {
@@ -176,6 +179,11 @@ impl MInst {
 
     pub fn srcreg(mut self, r: VReg) -> Self {
         self.srcs.push(Src::Reg(r));
+        self
+    }
+
+    pub fn auto(mut self) -> Self {
+        self.auto = true;
         self
     }
 

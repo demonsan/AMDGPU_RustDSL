@@ -179,3 +179,28 @@ fn llvm_tail_assembles_kernels() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
     let _: &dyn TailBackend = &tail;
 }
+#[test]
+fn drop_auto_waits_removes_only_auto_waits() {
+    let tail = LlvmTail::new();
+    let mut total_dropped = 0usize;
+    for k in ["attention_fwd", "fmha_fwd_hd128_mxfp8_t", "probe_lds_self2"] {
+        let f = kernel_by_name(k).unwrap();
+        let mut m = amdgpu_compiler::lower::lower(&f).unwrap();
+        amdgpu_compiler::hazards::fix_value_hazards(&mut m);
+        let a = amdgpu_compiler::regalloc::allocate(&m).unwrap();
+        let keep = amdgpu_compiler::backend::llvm_mir::export_opts(&m, &a, false, false).unwrap().mir;
+        let drop = amdgpu_compiler::backend::llvm_mir::export_opts(&m, &a, false, true).unwrap().mir;
+        let n = |s: &str| s.lines().filter(|l| l.trim_start().starts_with("S_WAITCNT")).count();
+        let explicit = m
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(i.op, MOp::SWaitVm | MOp::SWaitLgkm) && !i.auto)
+            .count();
+        assert_eq!(n(&drop), explicit, "{k}: only explicit waits may remain");
+        assert!(n(&keep) >= n(&drop));
+        total_dropped += n(&keep) - n(&drop);
+    }
+    assert!(total_dropped > 0);
+    let _ = tail;
+}

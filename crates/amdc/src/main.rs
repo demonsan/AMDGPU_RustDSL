@@ -9,7 +9,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  amdc list");
     eprintln!("  amdc dump <kernel>");
-    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend own|llvm-tail] [--mir-out <file.mir>]");
+    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend own|llvm-tail] [--mir-out <file.mir>] [--llvm-tail-drop-auto-waits]");
     eprintln!("      --backend llvm-tail runs the pinned llc tail (ROCM_LLVM_BIN overrides the tool dir);");
     eprintln!("      --mir-out writes the exported post-RA MIR only (no llc needed) and exits.");
     eprintln!("  amdc backend probe|check|write-lock   version probe / verify / rewrite backend.lock");
@@ -131,6 +131,9 @@ fn main() -> ExitCode {
                     i += 2;
                 } else if let Some(b) = args[i].strip_prefix("--backend=") {
                     backend_name = b.to_string();
+                    i += 1;
+                } else if args[i] == "--llvm-tail-drop-auto-waits" {
+                    env::set_var("AMDC_DROP_AUTO_WAITS", "1");
                     i += 1;
                 } else if args[i] == "--backend" {
                     backend_name = args.get(i + 1).cloned().unwrap_or_default();

@@ -142,6 +142,12 @@ pub fn export(m: &MFunction, a: &Alloc) -> Result<Exported, String> {
 
 /// markers: begin every block with a unique s_setprio <block> (oracle tooling only).
 pub fn export_with(m: &MFunction, a: &Alloc, markers: bool) -> Result<Exported, String> {
+    export_opts(m, a, markers, false)
+}
+
+/// drop_auto_waits: omit the s_waitcnt lowering inserted by itself (explicit DSL waits are kept)
+/// and leave wait computation to SIInsertWaitcnts.
+pub fn export_opts(m: &MFunction, a: &Alloc, markers: bool, drop_auto_waits: bool) -> Result<Exported, String> {
     let table = Table::load();
     let label_idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
     let nblocks = m.blocks.len();
@@ -160,6 +166,9 @@ pub fn export_with(m: &MFunction, a: &Alloc, markers: bool) -> Result<Exported, 
             }
         }
         for inst in &b.insts {
+            if drop_auto_waits && inst.auto && matches!(inst.op, MOp::SWaitVm | MOp::SWaitLgkm) {
+                continue;
+            }
             out.extend(llvm20::render_inst(&table, inst, &cx).map_err(|e| format!("block {bi}: {e}"))?);
         }
         if markers {

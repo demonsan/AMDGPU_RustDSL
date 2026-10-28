@@ -72,16 +72,19 @@ pub struct LlvmTail {
     pub keep_mir: Option<PathBuf>,
     /// Skip the backend.lock check (tests only).
     pub skip_lock: bool,
+    /// Do not export lowering's auto-inserted waits (experimental, see docs).
+    pub drop_auto_waits: bool,
 }
 
 impl LlvmTail {
     pub fn new() -> LlvmTail {
         let keep = std::env::var("AMDC_KEEP_MIR").ok().map(PathBuf::from);
-        LlvmTail { tools: LlvmTools::locate(), keep_mir: keep, skip_lock: false }
+        let drop = std::env::var("AMDC_DROP_AUTO_WAITS").map(|v| v == "1").unwrap_or(false);
+        LlvmTail { tools: LlvmTools::locate(), keep_mir: keep, skip_lock: false, drop_auto_waits: drop }
     }
 
     pub fn export_mir(&self, m: &MFunction, a: &Alloc) -> Result<String, String> {
-        Ok(llvm_mir::export(m, a)?.mir)
+        Ok(llvm_mir::export_opts(m, a, false, self.drop_auto_waits)?.mir)
     }
 
     /// Run the pinned llc tail over a MIR text.

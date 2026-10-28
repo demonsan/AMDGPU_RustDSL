@@ -135,10 +135,10 @@ impl Lowerer {
 
     fn finish(mut self) -> MFunction {
         if !self.pending_vmem.is_empty() {
-            self.push(MInst::new(MOp::SWaitVm));
+            self.push(MInst::new(MOp::SWaitVm).auto());
         }
         if !self.pending_smem.is_empty() || !self.pending_lds.is_empty() {
-            self.push(MInst::new(MOp::SWaitLgkm).imm(0));
+            self.push(MInst::new(MOp::SWaitLgkm).imm(0).auto());
         }
         self.set_term(Term::Endpgm);
         coalesce(&mut self.mir);
@@ -176,11 +176,11 @@ impl Lowerer {
     /// by the code on another.
     fn flush_pending(&mut self) {
         if !self.pending_vmem.is_empty() {
-            self.push(MInst::new(MOp::SWaitVm));
+            self.push(MInst::new(MOp::SWaitVm).auto());
             self.pending_vmem.clear();
         }
         if !self.pending_smem.is_empty() || !self.pending_lds.is_empty() {
-            self.push(MInst::new(MOp::SWaitLgkm).imm(0));
+            self.push(MInst::new(MOp::SWaitLgkm).imm(0).auto());
             self.pending_smem.clear();
             self.pending_lds.clear();
         }
@@ -205,7 +205,7 @@ impl Lowerer {
         }
         if let Some(pos) = vm_newest {
             let after = self.pending_vmem.len() - 1 - pos;
-            self.push(MInst::new(MOp::SWaitVm).imm(after.min(63) as i64));
+            self.push(MInst::new(MOp::SWaitVm).imm(after.min(63) as i64).auto());
             if after > 63 {
                 // beyond the counter range: fall back to draining everything
                 self.mir.blocks[self.cur].insts.last_mut().unwrap().imm = 0;
@@ -215,7 +215,7 @@ impl Lowerer {
             }
         }
         if need_lgkm {
-            self.push(MInst::new(MOp::SWaitLgkm).imm(0));
+            self.push(MInst::new(MOp::SWaitLgkm).imm(0).auto());
             self.pending_smem.clear();
             self.pending_lds.clear();
         }
