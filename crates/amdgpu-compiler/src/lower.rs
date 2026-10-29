@@ -533,6 +533,9 @@ impl Lowerer {
                 if self.var_backed(t) {
                     return Ok(false);
                 }
+                if std::env::var("AMDC_ADDRFOLD_TRACE").map(|v| !v.is_empty()).unwrap_or(false) {
+                    eprintln!("LAZY#{} v{dst} = {:?} + {:?}: core r{t} class {:?} k={}", self.lazy.len(), a, b, self.mir.vreg_class(t), k0 + k);
+                }
                 self.lazy.insert(dst, (t, k0 + k));
                 Ok(true)
             }
