@@ -1019,6 +1019,9 @@ pub fn probe_dma_tile() -> Function {
         let cl = b.c_i32(4096 * q);
         let l = b.add_i32(w1024, cl);
         b.load_global_lds(sp, l, 0, 4);
+        if let Some(w) = std::env::var("PD_WAIT").ok().and_then(|v| v.parse::<u8>().ok()) {
+            b.wait_vm(w);
+        }
     }
     b.wait_vm(0);
     b.wait_lds(0);
