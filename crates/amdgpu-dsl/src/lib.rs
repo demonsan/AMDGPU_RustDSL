@@ -239,6 +239,14 @@ pub enum Op {
     /// Schraudolph exp2 pack: `v_cvt_pknorm_u16_f32` of (a,b) and (c,d), each u16 pair reinterpreted as bf16 and packed to E4M3
     /// (a,b low half, c,d high half) with `v_cvt_scalef32_pk_fp8_bf16` (scale operand last).
     CvtPknormP8x4(Opnd, Opnd, Opnd, Opnd, Opnd),
+    /// `v_perm_b32 d, a, b, sel` (byte select).
+    PermB32(Opnd, Opnd, Opnd),
+    /// `v_pk_sub_u16`: per-half 16-bit subtraction (no borrow across the halves).
+    PkSubU16(Opnd, Opnd),
+    /// `v_cvt_pknorm_u16_f32`: two values in [0, 1] -> one dword of two u16 (65535 x).
+    CvtPknormPair(Opnd, Opnd),
+    /// Second half of `CvtPknormP8x4`: two u16-pair dwords (bf16 reinterpretation) -> four fp8 with a scale.
+    CvtP8x4FromU16(Opnd, Opnd, Opnd),
 }
 
 impl Op {
@@ -274,6 +282,8 @@ impl Op {
             Op::CvtPkFp8x4F32(..) => DType::U32,
             Op::PartnerMaxF32(..) => DType::F32,
             Op::CvtPknormP8x4(..) => DType::U32,
+        Op::PermB32(..) | Op::CvtPknormPair(..) | Op::PkSubU16(..) => DType::I32,
+        Op::CvtP8x4FromU16(..) => DType::U32,
             Op::BitcastF32(..) => DType::F32,
             Op::BitcastI32(..) => DType::I32,
             Op::LoadLdsB32 { .. } => DType::U32,
@@ -332,6 +342,8 @@ impl Op {
             Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => vec![*a, *b],
             Op::CvtPkFp8x4F32(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::CvtPknormP8x4(a, b, c, d, e) => vec![*a, *b, *c, *d, *e],
+            Op::PermB32(a, b, c) | Op::CvtP8x4FromU16(a, b, c) => vec![*a, *b, *c],
+            Op::CvtPknormPair(a, b) | Op::PkSubU16(a, b) => vec![*a, *b],
             Op::FragZero { .. } => vec![],
             Op::BitcastF32(a) | Op::BitcastI32(a) => vec![*a],
             Op::LoadLdsB32 { addr } => vec![*addr],
@@ -930,6 +942,18 @@ impl FnBuilder {
     }
     pub fn var_scale_lane(&mut self, var: VarId, index: u8, scalar: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::VarScaleLane { var, index, scalar: scalar.into() });
+    }
+    pub fn perm_b32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, sel: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::PermB32(a.into(), b.into(), sel.into()))
+    }
+    pub fn pk_sub_u16(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::PkSubU16(a.into(), b.into()))
+    }
+    pub fn cvt_pknorm_pair(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CvtPknormPair(a.into(), b.into()))
+    }
+    pub fn cvt_p8x4_from_u16(&mut self, u0: impl Into<Opnd>, u1: impl Into<Opnd>, scale: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CvtP8x4FromU16(u0.into(), u1.into(), scale.into()))
     }
     pub fn cvt_pknorm_p8x4(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>, scale: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPknormP8x4(a.into(), b.into(), c.into(), d.into(), scale.into()))

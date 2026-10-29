@@ -8499,8 +8499,28 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                         words.push(b.cvt_pk_fp8x4_f32(ps[4 * m], ps[4 * m + 1], ps[4 * m + 2], ps[4 * m + 3]));
                     }
                 } else {
+                if fmha_t_opt("svcorr") {
+                    // Schraudolph correction: 2^f ~ 1 + f is up to 6% high. The mantissa of each bf16 half is reduced by
+                    // 128 (f - (2^f - 1)) looked up (v_perm byte LUT) on its top three mantissa bits.
+                    let c4s = b.c_i32(4);
+                    let cmk = b.c_i32(0x0007_0007);
+                    let lut_lo = b.c_i32(i32::from_le_bytes([0, 6, 9, 11]));
+                    let lut_hi = b.c_i32(i32::from_le_bytes([11, 10, 7, 3]));
+                    for m in 0..4usize {
+                        let mut us: Vec<ValueId> = Vec::with_capacity(2);
+                        for h in 0..2usize {
+                            let u = b.cvt_pknorm_pair(xs[4 * m + 2 * h], xs[4 * m + 2 * h + 1]);
+                            let s1 = b.let_(Op::LshrI32(Opnd::Val(u), Opnd::Val(c4s)));
+                            let s2 = b.let_(Op::AndI32(Opnd::Val(s1), Opnd::Val(cmk)));
+                            let pm = b.perm_b32(lut_hi, lut_lo, s2);
+                            us.push(b.pk_sub_u16(u, pm));
+                        }
+                        words.push(b.cvt_p8x4_from_u16(us[0], us[1], one_f));
+                    }
+                } else {
                 for m in 0..4usize {
                     words.push(b.cvt_pknorm_p8x4(xs[4 * m], xs[4 * m + 1], xs[4 * m + 2], xs[4 * m + 3], one_f));
+                }
                 }
                 }
             }

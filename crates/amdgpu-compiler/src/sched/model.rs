@@ -82,7 +82,7 @@ pub fn cost(op: MOp) -> OpCost {
     match op {
         // VALU: one wave issues one wave64 VALU every 4 cycles, dependent or not (V).
         VMovB32 | VAddF32 | VSubF32 | VMulF32 | VFmaF32 => co(Valu, 4, 2, 4, Verified),
-        VMovFromS | VReadPhys | VAddU32 | VMaxF32 | VMax3F32
+        VMovFromS | VReadPhys | VAddU32 | VMaxF32 | VMax3F32 | VPermB32 | VPkSubU16
         | VAndB32 | VOrB32 | VXorB32 | VLshrB32 | VLshlB32 | VCvtPknormU16 | VCvtPkBf16F32 | VCvtF32F16
         | VCvtF16F32 | VCndmask | VReadSub | VWriteSub | VCmpLtI32 | VCmpGeI32 | VCmpNeI32 | VCmpLtF32
         | VAddCoU32 | VAddcCoU32 | VPkAddF32 | VPkMulF32 => c(Valu, 4, 4, Verified),
