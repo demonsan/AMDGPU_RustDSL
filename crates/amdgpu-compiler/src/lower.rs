@@ -45,6 +45,8 @@ struct Lowerer {
     if_stack: Vec<(u32, u32)>,
     /// Pending-load sets at if entry (vmem, smem, lds) and whether the then-branch changed them.
     if_snaps: Vec<((Vec<VReg>, Vec<VReg>, Vec<VReg>), bool)>,
+    /// `v_readfirstlane` results of the current block (LDS-DMA bases), keyed by the vector source register.
+    rfl_cache: HashMap<VReg, VReg>,
     cur: usize,
     next_label: u32,
     defs: HashMap<ValueId, Op>,
@@ -128,6 +130,7 @@ impl Lowerer {
             break_stack: Vec::new(),
             if_stack: Vec::new(),
             if_snaps: Vec::new(),
+            rfl_cache: HashMap::new(),
             cur: 0,
             next_label: 1,
             defs,
@@ -171,6 +174,7 @@ impl Lowerer {
     }
 
     fn start_block(&mut self, label: u32) {
+        self.rfl_cache.clear();
         self.mir.blocks.push(Block::new(label));
         self.cur = self.mir.blocks.len() - 1;
     }
@@ -782,9 +786,17 @@ impl Lowerer {
                     let rb = self.as_v2(*base)?;
                     let lv = self.as_v1(*lds_addr)?;
                     self.touch(&[Src::Reg(rb), Src::Reg(lv)]);
-                    let sreg = self.new_vreg(RClass::S1);
-                    self.push(MInst::new(MOp::VReadFirstLane).def(sreg).srcreg(lv));
+                    let sreg = match self.rfl_cache.get(&lv) {
+                        Some(s) => *s,
+                        None => {
+                            let s = self.new_vreg(RClass::S1);
+                            self.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(lv));
+                            self.rfl_cache.insert(lv, s);
+                            s
+                        }
+                    };
                     let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128 } else { MOp::GlobalLoadLdsB32 };
+                    // imm = LDS byte offset added to the base in M0 (the global offset is always 0)
                     self.push(MInst::new(mop).srcreg(rb).srcreg(sreg).imm(*byte_off as i64));
                 }
                 Stmt::SetPrio { prio } => {

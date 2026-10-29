@@ -1159,9 +1159,7 @@ pub fn probe_dma_kread() -> Function {
             let r128 = b.mul_i32(row, c128);
             let off = b.add_i32(r128, cb4);
             let sp = b.ptr_add(inp, off);
-            let cl = b.c_i32(4160 * q);
-            let l = b.add_i32(w1040, cl);
-            b.load_global_lds(sp, l, 0, 4);
+            b.load_global_lds(sp, w1040, (4160 * q) as u32, 4);
         }
     } else {
     for q in 0..4i32 {
@@ -1170,9 +1168,7 @@ pub fn probe_dma_kread() -> Function {
         let r128 = b.mul_i32(row, c128);
         let off = b.add_i32(r128, cbytes);
         let sp = b.ptr_add(inp, off);
-        let cl = b.c_i32(4096 * q);
-        let l = b.add_i32(w1024, cl);
-        b.load_global_lds(sp, l, 0, 4);
+        b.load_global_lds(sp, w1024, (4096 * q) as u32, 4);
     }
     }
     // trailing DMA (see emit_fmha_sv_role)
@@ -8036,6 +8032,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let dummy_lds = b.c_i32(nbuf_l * cbuf_i + 2048 + 1024);
     let dma_issue = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId, kd_off: ValueId| {
         let rb = b.add_i32(key0, rowb);
+        let lbase = b.add_i32(lds_tile, buf_off);
         let mut last_sp = None;
         for q in 0..4i32 {
             // run rho = wave4 + 4 q: rows (wave4 + 4 (q & 1)) + 64 (q >> 1) + 8 s
@@ -8048,10 +8045,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let o2 = b.add_i32(o1, cbytes);
             let sp = b.ptr_add(ptr, o2);
             last_sp = Some(sp);
-            let cl = b.c_i32(4 * 1040 * q);
-            let l0 = b.add_i32(lds_tile, buf_off);
-            let lq = b.add_i32(l0, cl);
-            b.load_global_lds(sp, lq, 0, 4);
+            b.load_global_lds(sp, lbase, (4 * 1040 * q) as u32, 4);
         }
         if role_a && kdlds {
             // K scale dwords of the tile's 128 keys: waves 0/1 (and 2/3 again, same data) fetch 64 keys each
