@@ -9958,23 +9958,45 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             return;
         }
         let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot)).collect();
+        let load_v = |b: &mut FnBuilder, hh: usize, e: usize| -> ValueId {
+            let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+            for r in 0..4i32 {
+                let off = b.c_i32((hh as i32) * 8192 + 2048 * r);
+                addrs.push(b.add_i32(trb[e], off));
+            }
+            b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3])
+        };
+        if fmha_t_opt("pvpipe") {
+            // software pipeline: the tr reads of step i+1 are issued before the MFMA of step i (partial lgkmcnt waits, reads in flight
+            // during the MFMA); +8 VGPR for the second fragment
+            let mut nxt = load_v(b, 0, 0);
+            for hh in 0..2usize {
+                let o = 8 * hh;
+                let p8 = b.frag8(w[o], w[o + 1], w[o + 2], w[o + 3], w[o + 4], w[o + 5], w[o + 6], w[o + 7]);
+                let ones8 = load_ones(b);
+                b.var_mfma_scale(la, ones8, p8, c127, c123);
+                for e in 0..4usize {
+                    let cur = nxt;
+                    let step = hh * 4 + e;
+                    if step + 1 < 8 {
+                        nxt = load_v(b, (step + 1) / 4, (step + 1) % 4);
+                    }
+                    b.var_mfma_scale(o_vars[e], cur, p8, c127, c123);
+                }
+            }
+            return;
+        }
         for hh in 0..2usize {
             let o = 8 * hh;
             let p8 = b.frag8(w[o], w[o + 1], w[o + 2], w[o + 3], w[o + 4], w[o + 5], w[o + 6], w[o + 7]);
             let ones8 = load_ones(b);
             b.var_mfma_scale(la, ones8, p8, c127, c123);
             for e in 0..4usize {
-                let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
-                for r in 0..4i32 {
-                    let off = b.c_i32((hh as i32) * 8192 + 2048 * r);
-                    addrs.push(b.add_i32(trb[e], off));
-                }
-                let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+                let v8 = load_v(b, hh, e);
                 b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
             }
         }
-    };
-    let iter = |b: &mut FnBuilder, masked: bool, stage: bool, last_barrier: bool| {
+    };    let iter = |b: &mut FnBuilder, masked: bool, stage: bool, last_barrier: bool| {
         let (_i1, slot_cur, slot_nxt, slot_n2, kds_nxt, key_n2, _kds_cur) = ring(b);
         // V phase (the DMA of tile t+2 runs under it, waited for at its end); M phase: PV(this tile) + QK(next tile)
         let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
