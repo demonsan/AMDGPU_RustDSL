@@ -403,7 +403,10 @@ reference. A faster kernel that changes numerics fails the correctness gate rega
 | setprio windows | 1 set/clear pair per step over the MFMA phase | not used | required |
 | next-tile QK inside current compute group | yes (8 scaled MFMA) | separate | required |
 | staging | LDS-DMA, 1040-B runs, ring | register round trip | required |
+| row-sum structure | 2x `v_smfmac_f32_16x16x128_fp8_fp8` with complementary index patterns (0x44444444 then 0xeeeeeeee), chained from a zero C (recipe in 4.5.1) | 2 scaled MFMAs (no smfmac) | required |
 | row-sum cycle cost per 128 keys | 32 (2 smfmac) | 128 (2 scaled MFMA) | <= 32 |
+| smfmac operand hazard | no VALU-written A/B/C within 8 clocks (2 waits) of an smfmac; no non-zero VALU-initialised accumulator feeding an smfmac | n/a (no smfmac yet) | required (see 4.5.2) |
+| iteration unit | 128 keys per barrier pair | checked per push | required |
 | correctness | 15/15 REF shapes + determinism | same | unchanged (docs/verification.md) |
 
 Failure of the wall/throughput lines with all counter lines green means the scheduler/prefetch structure
@@ -441,6 +444,10 @@ bash tools/vendor_disasm.sh survey
 bash tools/vendor_disasm.sh phases label_block_A_loop --seq
 bash tools/vendor_disasm.sh mfma; bash tools/vendor_disasm.sh lds; bash tools/vendor_disasm.sh staging
 OURS_CO=build/ours_t.co bash tools/vendor_counters.sh vendor-spec
+# §7.5 acceptance checklist for one of our kernels (structural VAL lines + same-run wall + 15 shapes +
+# determinism + counters):
+bash tools/vendor_validate.sh fmha_fwd_hd128_mxfp8_vs
+bash tools/vendor_validate.sh fmha_fwd_hd128_mxfp8_vs --no-counters    # skip the slow profile passes
 ```
 
 Wall time (unprofiled, the number to quote for performance) comes from `ref_host` itself:
