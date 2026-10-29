@@ -103,7 +103,8 @@ pub enum MOp {
     VMfmaScale32x32x64Fp8Z,
     /// Sparse fp8 MFMA `v_smfmac_f32_16x16x128_fp8_fp8`: the accumulator D (4 dwords) is also
     /// the input C, A (4 dwords) is the 2:4-compressed sparse operand, B (8 dwords) is dense,
-    /// and srcs[2] is the SRC2 sparse-index register (one dword). Semantics:
+    /// srcs[2] is the SRC2 sparse-index register (one dword) and srcs[3] is the accumulator C, which is the same register as D (implicit in the
+    /// ISA, explicit here so every pass sees the read). Semantics:
     /// D += A_sparse(16x128, 64 nonzeros/row) x B(128x16).
     VSmfmac16x16x128Fp8,
     // workgroup LDS
@@ -407,6 +408,9 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                         if m.vreg_class(d) != RClass::V4 {
                             errs.push(format!("block {bi} inst {ii}: smfmac dst must be V4"));
                         }
+                    }
+                    if inst.srcs.len() != 4 || !matches!(inst.srcs.get(3), Some(Src::Reg(c)) if Some(*c) == inst.dst) {
+                        errs.push(format!("block {bi} inst {ii}: smfmac needs the accumulator C (== dst) as srcs[3]"));
                     }
                     let want = [RClass::V4, RClass::V8, RClass::V1];
                     for (k, w) in want.iter().enumerate() {

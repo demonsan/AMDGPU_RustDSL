@@ -42,6 +42,11 @@ fn mfma_latency(op: MOp) -> Option<usize> {
     }
 }
 
+/// In-place accumulating matrix ops whose dependent same-opcode chain is interlocked by the hardware.
+fn chains_in_place(op: MOp) -> bool {
+    matches!(op, MOp::VMfmaScale32x32x64Fp8 | MOp::VSmfmac16x16x128Fp8)
+}
+
 fn is_scaled_mfma(op: MOp) -> bool {
     matches!(op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfmaScale32x32x64Fp8Z)
 }
@@ -83,7 +88,8 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
         MOp::VAddCoU32 | MOp::VAddcCoU32 | MOp::VPtrAdd => Some(4),
         MOp::VExpF32 | MOp::VRcpF32 => None,
         o if movable(o) => Some(2),
-        MOp::VMovFromS | MOp::VMovFromSPair | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VCvtPknormU16 => Some(2),
+        // lane write of a fragment (expands to v_mov): the tuple may feed a matrix op next
+        MOp::VWriteSub | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VCvtPknormU16 => Some(2),
         _ => None,
     }
 }
@@ -91,7 +97,9 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
 fn reads_valu_hazard_operands(op: MOp) -> bool {
     // v_readfirstlane reading a VGPR the previous VALU instruction wrote needs the same 2 wait states (found on hardware:
     // v_add d; v_readfirstlane s, d; s_mov m0, s; global_load_lds read a stale lane value)
-    is_scaled_mfma(op) || matches!(op, MOp::VReadFirstLane | MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
+    // SMFMAC: a VALU write of A, B, SRC2 or the accumulator C needs 2 wait states (8 clocks) before the matrix op (CDNA4 ISA 7.6,
+    // docs/vendor-spec.md 4.5.2); C is srcs[3] of the MIR op so it is covered like any other source.
+    is_scaled_mfma(op) || matches!(op, MOp::VSmfmac16x16x128Fp8 | MOp::VReadFirstLane | MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
 }
 
 /// Instructions the scanner must never look past (waits, barriers, nops).
@@ -151,14 +159,16 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     }
                 }
             }
-            let chained = is_scaled_mfma(inst.op);
-            let c_reg = if chained && inst.srcs.len() > 2 && inst.op == MOp::VMfmaScale32x32x64Fp8 {
-                match inst.srcs[2] {
+            let c_reg = match inst.op {
+                MOp::VMfmaScale32x32x64Fp8 if inst.srcs.len() > 2 => match inst.srcs[2] {
                     Src::Reg(r) => Some(canon(r)),
                     _ => None,
-                }
-            } else {
-                None
+                },
+                MOp::VSmfmac16x16x128Fp8 if inst.srcs.len() > 3 => match inst.srcs[3] {
+                    Src::Reg(r) => Some(canon(r)),
+                    _ => None,
+                },
+                _ => None,
             };
             for s in &inst.srcs {
                 if let Src::Reg(r) = s {
@@ -275,7 +285,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 // stale, 20 are needed), so it also applies to the default path; the other opcodes keep the table value
                 // outside strict mode.
                 let lat = if strict || is_scaled_mfma(inst.op) { latency + 1 } else { latency };
-                    ready.insert(canon(d), (cycle + lat, is_scaled_mfma(inst.op)));
+                    ready.insert(canon(d), (cycle + lat, chains_in_place(inst.op)));
                 }
             }
             if strict && inst.op.defines_vcc() {
@@ -376,7 +386,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
             }
             let mut earliest = cycle;
             for (issue, need, op, srcs) in &inflight {
-                if inst.op == *op && matches!(inst.op, MOp::VMfmaScale32x32x64Fp8) {
+                if inst.op == *op && matches!(inst.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VSmfmac16x16x128Fp8) {
                     continue; // in-place accumulation chain of the same opcode
                 }
                 if wr.iter().any(|w| srcs.iter().any(|s| overlaps(*w, *s))) {
@@ -395,7 +405,16 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 // Only the accumulator (SrcC) is a WAR hazard: the LLVM tail inserts nothing for a VALU
                 // write to SrcA/SrcB/scale registers right after the MFMA (docs/scheduling.md).
                 let mut srcs = Vec::new();
-                if !matches!(inst.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x8F16Z) {
+                if inst.op == MOp::VSmfmac16x16x128Fp8 {
+                    // SMFMAC reads A, B and SRC2 over several passes; the accumulator C is D itself (value-level pass)
+                    for s in inst.srcs.iter().take(3) {
+                        if let Src::Reg(r) = s {
+                            if m.vreg_class(*r).is_vector() {
+                                srcs.push(rng(m, *r));
+                            }
+                        }
+                    }
+                } else if !matches!(inst.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x8F16Z) {
                     if let Some(Src::Reg(r)) = inst.srcs.get(2) {
                         if m.vreg_class(*r).is_vector() {
                             srcs.push(rng(m, *r));
