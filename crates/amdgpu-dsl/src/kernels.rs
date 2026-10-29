@@ -8486,8 +8486,22 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                         xs.push(v);
                     }
                 }
+                if fmha_t_opt("svexact") {
+                    // diagnostic: exact exp2 instead of the bf16-exponent (Schraudolph) trick
+                    let c127f = b.c_f32(127.0);
+                    let mut ps: Vec<ValueId> = Vec::with_capacity(16);
+                    for x in xs.iter() {
+                        let y = b.mul_f32(*x, c512f);
+                        let y2 = b.sub_f32(y, c127f);
+                        ps.push(b.exp2_f32(y2));
+                    }
+                    for m in 0..4usize {
+                        words.push(b.cvt_pk_fp8x4_f32(ps[4 * m], ps[4 * m + 1], ps[4 * m + 2], ps[4 * m + 3]));
+                    }
+                } else {
                 for m in 0..4usize {
                     words.push(b.cvt_pknorm_p8x4(xs[4 * m], xs[4 * m + 1], xs[4 * m + 2], xs[4 * m + 3], one_f));
+                }
                 }
             }
             let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
