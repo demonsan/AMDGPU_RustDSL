@@ -9535,7 +9535,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     // svscale: the reference only moves ("rebase") when the row max is far above it (S' > 0.45, i.e. 2^100 above); smaller growth is
     // absorbed by a per-lane power-of-two scale of this unit's P (cvt scale operand) that the PV/row-sum MFMA scale operand undoes
     let svscale = fmha_t_opt("svscale");
-    let c_thr = b.c_f32(if fmha_t_opt("svinf") { 1.0e9 } else if svscale { fmha_t_num("svr").map(|v| v as f32 / 1000.0).unwrap_or(0.45) } else { fmha_t_num("thr").map(|v| v as f32).unwrap_or(135.0) / 512.0 }); // svinf: never roll back (timing diagnostic, wrong numerics)
+    let c_thr = b.c_f32(if fmha_t_opt("svinf") { 1.0e9 } else if svscale { fmha_t_num("svr").map(|v| v as f32 / 1000.0).unwrap_or(0.45) } else { fmha_t_num("thr").map(|v| v as f32).unwrap_or(if fmha_t_opt("vsx") { 120.0 } else { 135.0 }) / 512.0 }); // svinf: never roll back (timing diagnostic, wrong numerics)
     let c135f = b.c_f32(fmha_t_num("svt").map(|v| v as f32).unwrap_or(135.0)); // fp8 target exponent: P max = 2^(svt - 127)
     let c0p5 = b.c_f32(0.5);
     let c2p23 = b.c_f32(8388608.0);
@@ -9991,7 +9991,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         {
             let w_old_u = b.frag2_lane(bias2, 0);
             let w_old = b.bitcast_i32(w_old_u);
-            let (delta, w_new) = if fmha_t_opt("bias2w") {
+            let (delta, w_new) = if fmha_t_opt("bias2w") || fmha_t_opt("vsx") {
                 // bias2w: the bias is the sum of TWO f16 words (hi + residual, 4 (hi + lo) over the 8 K slots) instead of one rounded f16: the
                 // reference shift delta = b_q - b_old that is added to the scores and used for the O/l rescale is then exact to ~2^-22 (the
                 // single f16 word quantised it to ~1.2e-4 in x, i.e. 4-6% of P per rollback)
@@ -10072,7 +10072,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
             }
             for m in 0..4usize {
-                let word = if fmha_t_opt("svcorr") {
+                let word = if vs_corr() {
                     let mut us: Vec<ValueId> = Vec::with_capacity(2);
                     for h in 0..2usize {
                         let u = b.cvt_pknorm_pair(xs[4 * m + 2 * h], xs[4 * m + 2 * h + 1]);
@@ -10838,6 +10838,15 @@ fn vs_active() -> bool {
 }
 /// LDS layout of the vendor-structure kernels (bytes). `_vs`: 3-slot ring (3 x 32768) + the K-scale ring (3 x 512). `_vs128`: 2-slot
 /// ring (2 x 32768), K-scale ring (2 x 512, in a 2048-byte block), ones block (2048), per-wave Q fragments b1/b0 (2 x 16384).
+/// 0 = follow FMHA_OPT svcorr, 1 = force the LUT correction on, 2 = force it off (emission-time switch for the short/long sequence code copies)
+static VS_CORR_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+fn vs_corr() -> bool {
+    match VS_CORR_FORCE.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => true,
+        2 => false,
+        _ => fmha_t_opt("svcorr"),
+    }
+}
 pub const VS_LDS_BYTES: u32 = 3 * 32768 + 3 * 512;
 pub const VS128_LDS_BYTES: u32 = 2 * 32768 + 2048 + 2048 + 16384 + 16384;
 /// First LDS byte available to the compiler for spilling wave-uniform/lane-invariant values of `fmha_fwd_hd128_mxfp8_vs128`
@@ -11299,6 +11308,30 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         bq1_words,
         bq0_words,
     };
+    // vsx: short sequences (<= 2 tiles of 128 keys) keep the LUT correction (their error does not average out), long ones skip it (-128 VALU per
+    // tile): two complete code copies selected once at kernel start
+    let vsx_split = sv && name.ends_with("_vs128") && (fmha_t_opt("vsx") || fmha_t_opt("corrshort"));
+    if vsx_split {
+        let c3k = b.c_i32(3);
+        let short = b.cmp_lt_i32(cx.nkv, c3k);
+        for pass in 0..2u8 {
+            if pass == 0 {
+                b.begin_if(Opnd::Val(short));
+                VS_CORR_FORCE.store(1, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                b.else_();
+                VS_CORR_FORCE.store(2, std::sync::atomic::Ordering::SeqCst);
+            }
+            b.begin_if(is_a);
+            emit_fmha_vs128_role(&mut b, &cx, true);
+            b.else_();
+            emit_fmha_vs128_role(&mut b, &cx, false);
+            b.end_if();
+        }
+        b.end_if();
+        VS_CORR_FORCE.store(0, std::sync::atomic::Ordering::SeqCst);
+        return b.finish();
+    }
     b.begin_if(is_a);
     if pp {
         emit_fmha_pp_role(&mut b, &cx, true);
