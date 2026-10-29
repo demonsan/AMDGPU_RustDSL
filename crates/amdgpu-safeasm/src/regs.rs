@@ -6,7 +6,10 @@
 //! * `Imm<K>` (inline constant, range checked at compile time) and `Lit` (32-bit literal): operand-only kinds.
 //! * `Ready<'a, N>`: proof that a register may be read by a hazard-sensitive instruction (see `seq`).
 
-use amdgpu_compiler::mir::{RClass, VReg};
+use crate::block::{AClass, ASrc};
+
+/// Register slot id inside a sequence.
+pub type VReg = u32;
 use std::marker::PhantomData;
 
 mod sealed {
@@ -19,20 +22,20 @@ pub struct Wd<const N: usize>;
 impl<const N: usize> Sealed for Wd<N> {}
 
 pub trait VectorWidth: Sealed {
-    const CLASS: RClass;
+    const CLASS: AClass;
 }
 pub trait ScalarWidth: Sealed {
-    const CLASS: RClass;
+    const CLASS: AClass;
 }
 macro_rules! vwidth {
-    ($($n:literal => $c:ident),*) => { $(impl VectorWidth for Wd<$n> { const CLASS: RClass = RClass::$c; })* };
+    ($($n:literal => $c:ident),*) => { $(impl VectorWidth for Wd<$n> { const CLASS: AClass = AClass::$c; })* };
 }
 vwidth!(1 => V1, 2 => V2, 4 => V4, 8 => V8, 16 => V16);
 impl ScalarWidth for Wd<1> {
-    const CLASS: RClass = RClass::S1;
+    const CLASS: AClass = AClass::S1;
 }
 impl ScalarWidth for Wd<2> {
-    const CLASS: RClass = RClass::S2;
+    const CLASS: AClass = AClass::S2;
 }
 
 /// A vector register tuple of `N` dwords owned by the sequence.
@@ -127,45 +130,45 @@ pub trait Operand: Sealed {
     /// Allowed in src1/src2 of an e32 form and in VOP3 slots (everything but a literal).
     const VOP3_OK: bool;
     #[doc(hidden)]
-    fn to_src(&self) -> amdgpu_compiler::mir::Src;
+    fn to_src(&self) -> ASrc;
 }
 impl Operand for &Vgpr<1> {
     const BUS: u8 = 0;
     const VOP3_OK: bool = true;
-    fn to_src(&self) -> amdgpu_compiler::mir::Src {
-        amdgpu_compiler::mir::Src::Reg(self.id)
+    fn to_src(&self) -> ASrc {
+        AASrc::Reg(self.id)
     }
 }
 impl Operand for Sub<'_, 1> {
     const BUS: u8 = 0;
     const VOP3_OK: bool = true;
-    fn to_src(&self) -> amdgpu_compiler::mir::Src {
-        amdgpu_compiler::mir::Src::Reg(self.id)
+    fn to_src(&self) -> ASrc {
+        AASrc::Reg(self.id)
     }
 }
 impl Sealed for &Sgpr<1> {}
 impl Operand for &Sgpr<1> {
     const BUS: u8 = 1;
     const VOP3_OK: bool = true;
-    fn to_src(&self) -> amdgpu_compiler::mir::Src {
-        amdgpu_compiler::mir::Src::Reg(self.id)
+    fn to_src(&self) -> ASrc {
+        AASrc::Reg(self.id)
     }
 }
 impl<const K: i32> Sealed for Imm<K> {}
 impl<const K: i32> Operand for Imm<K> {
     const BUS: u8 = 0;
     const VOP3_OK: bool = true;
-    fn to_src(&self) -> amdgpu_compiler::mir::Src {
+    fn to_src(&self) -> ASrc {
         let () = Imm::<K>::OK;
-        amdgpu_compiler::mir::Src::Imm(K as i64)
+        AASrc::Imm(K as i64)
     }
 }
 impl Sealed for Lit {}
 impl Operand for Lit {
     const BUS: u8 = 1;
     const VOP3_OK: bool = false;
-    fn to_src(&self) -> amdgpu_compiler::mir::Src {
-        amdgpu_compiler::mir::Src::Imm(self.0 as i64)
+    fn to_src(&self) -> ASrc {
+        AASrc::Imm(self.0 as i64)
     }
 }
 
@@ -173,3 +176,10 @@ impl Operand for Lit {
 pub trait VgprOnly: Operand {}
 impl VgprOnly for &Vgpr<1> {}
 impl VgprOnly for Sub<'_, 1> {}
+/// A register whose matrix result is still in flight at the end of the sequence. It can only be exported (`Seq::output_exit`): the
+/// consumer after the sequence is padded by the compiler's hazard pass, which sees the whole instruction stream.
+#[derive(Debug)]
+pub struct Exit<const N: usize> {
+    pub(crate) id: VReg,
+    pub(crate) issued: u32,
+}
