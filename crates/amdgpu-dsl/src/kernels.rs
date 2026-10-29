@@ -7263,6 +7263,13 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.break_if(Opnd::Val(tail_h));
     }
     let body = |b: &mut FnBuilder, masked_iter: bool| -> ValueId {
+    // experiment: independent dummy VALU work in one role only (which role is critical?)
+    if (role_a && fmha_t_opt("dummyA")) || (!role_a && fmha_t_opt("dummyB")) {
+        let mut x = b.add_i32(it, c1);
+        for _ in 0..192 {
+            x = b.add_i32(x, c1);
+        }
+    }
     let dbuf = fmha_t_opt("dbuf");
     // double buffering: compute reads buffer `par`, the next tile is staged into the other one
     let j4 = b.shl_i32(cx.j, c2);
