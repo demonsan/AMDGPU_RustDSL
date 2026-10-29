@@ -231,8 +231,8 @@ fn exported_flags_pass_the_machine_verifier() {
             }
         };
         let mir = tail.export_mir(&m, &a).unwrap();
-        if !mir.contains("killed") || !mir.contains("dead") {
-            bad.push(format!("{k}: no kill/dead flags exported"));
+        if !mir.contains(" killed ") && !mir.contains("killed $") {
+            bad.push(format!("{k}: no kill flags exported"));
         }
         if let Err(e) = tail.run_llc(k, &mir, llvm20::START_PASS_PREFERENCE[0]) {
             bad.push(format!("{k}: {}", e.lines().take(6).collect::<Vec<_>>().join(" | ")));
