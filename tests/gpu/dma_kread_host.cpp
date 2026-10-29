@@ -8,11 +8,12 @@
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s failed: %s\n", #x, hipGetErrorString(e_)); std::exit(1); } } while (0)
 int main(int argc, char** argv) {
     const char* co = argc > 1 ? argv[1] : "build/probe_dma_kread.co";
-    std::vector<unsigned char> hi(16384), ho(16384, 0xee);
-    for (int i = 0; i < 16384; ++i) hi[i] = (unsigned char)(i * 7 + (i >> 7) + (unsigned char)(time(nullptr) * 37));
+    int rs = getenv("PD_ROWSTRIDE") && *getenv("PD_ROWSTRIDE") ? atoi(getenv("PD_ROWSTRIDE")) : 128; int hoff = getenv("PD_HEADOFF") && *getenv("PD_HEADOFF") ? atoi(getenv("PD_HEADOFF")) : 0; const int N = 128 * rs + 4096;
+    std::vector<unsigned char> hi(N), ho(16384, 0xee);
+    for (int i = 0; i < N; ++i) hi[i] = (unsigned char)(i * 7 + (i >> 7) + (unsigned char)(time(nullptr) * 37));
     void *di, *dout;
-    CK(hipMalloc(&di, 16384)); CK(hipMalloc(&dout, 16384));
-    CK(hipMemcpy(di, hi.data(), 16384, hipMemcpyHostToDevice));
+    CK(hipMalloc(&di, N)); CK(hipMalloc(&dout, 16384));
+    CK(hipMemcpy(di, hi.data(), N, hipMemcpyHostToDevice));
     CK(hipMemcpy(dout, ho.data(), 16384, hipMemcpyHostToDevice));
     hipModule_t mod; hipFunction_t fn;
     CK(hipModuleLoad(&mod, co)); CK(hipModuleGetFunction(&fn, mod, "probe_dma_kread"));
@@ -24,9 +25,9 @@ int main(int argc, char** argv) {
     for (int t = 0; t < 256; ++t) {
         int row = (t & 31) + 32 * (t >> 6), g = (t >> 5) & 1;
         for (int k = 0; k < 4; ++k) {
-            const unsigned char* want = &hi[row * 128 + (g ^ (2 * k)) * 16];
+            const unsigned char* want = &hi[row * rs + hoff + (g ^ (2 * k)) * 16];
             const unsigned char* got = &ho[t * 64 + k * 16];
-            if (std::memcmp(want, got, 16)) { ++bad; ++badrow[row]; if (bad <= 12) { int fr = -1, fc = -1; for (int r2 = 0; r2 < 128 && fr < 0; ++r2) for (int c2 = 0; c2 < 8; ++c2) if (!std::memcmp(got, &hi[r2 * 128 + c2 * 16], 16)) { fr = r2; fc = c2; break; } std::printf("t %3d row %3d g %d k %d: expected (row %d chunk %d) got source (row %d chunk %d)\n", t, row, g, k, row, g ^ (2 * k), fr, fc); } }
+            if (std::memcmp(want, got, 16)) { ++bad; ++badrow[row]; if (bad <= 12) { int fr = -1, fc = -1; for (int r2 = 0; r2 < 128 && fr < 0; ++r2) for (int c2 = 0; c2 < 8; ++c2) if (!std::memcmp(got, &hi[r2 * rs + hoff + c2 * 16], 16)) { fr = r2; fc = c2; break; } std::printf("t %3d row %3d g %d k %d: expected (row %d chunk %d) got source (row %d chunk %d)\n", t, row, g, k, row, g ^ (2 * k), fr, fc); } }
         }
     }
     for (int r = 0; r < 128; r += 8) { int s = 0; for (int i = 0; i < 8; ++i) s += badrow[r + i]; if (s) std::printf("rows %3d..%3d (LDS run %2d): %d bad fragments\n", r, r + 7, r / 8, s); }

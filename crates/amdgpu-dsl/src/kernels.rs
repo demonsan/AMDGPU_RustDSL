@@ -1160,7 +1160,9 @@ pub fn probe_dma_seq() -> Function {
 pub fn probe_dma_kread() -> Function {
     // PD_SWZ: 0/empty = row-major, 1 = 3-bit XOR swizzle, 2 = 2-bit XOR swizzle
     let swz_mode: u32 = std::env::var("PD_SWZ").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let swz = swz_mode != 0 && swz_mode != 4;
+    let swz = swz_mode != 0 && swz_mode != 4 && swz_mode != 5;
+    let row_stride: i32 = std::env::var("PD_ROWSTRIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+    let head_off: i32 = std::env::var("PD_HEADOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let fmask: i32 = if swz_mode == 2 { 3 } else { 7 };
     let mut b = FnBuilder::new("probe_dma_kread", 256);
     b.lds(20000);
@@ -1209,7 +1211,34 @@ pub fn probe_dma_kread() -> Function {
             b.store_lds_b128(Opnd::Val(la), Opnd::Val(d));
         }
     } else {
-    if swz_mode == 4 {
+    if swz_mode == 5 {
+        // kernel scheme: wave w owns runs rho = 4 w + q (rows (4 (w & 1) + q) + 8 s + 64 (w >> 1)); one M0 per wave, run offsets via
+        // the signed instruction offset with a compensated source address
+        let cb4 = b.shl_i32(lane_lo, c4);
+        let s8 = b.shl_i32(lane_hi, c3);
+        let w_hi = b.let_(Op::LshrI32(Opnd::Val(wave), Opnd::Val(c1)));
+        let w_hi64 = b.shl_i32(w_hi, c6);
+        let w_lo4 = w4;
+        let rb0 = b.add_i32(s8, w_hi64);
+        let rb4 = b.add_i32(rb0, w_lo4);
+        let c4160 = b.c_i32(4160);
+        let w4160 = b.mul_i32(wave, c4160);
+        let c3120 = b.c_i32(3120);
+        let top = b.add_i32(w4160, c3120);
+        let crs = b.c_i32(row_stride);
+        let cho = b.c_i32(head_off);
+        for q in 0..4i32 {
+            let cq = b.c_i32(q);
+            let row = b.add_i32(rb4, cq);
+            let r0 = b.mul_i32(row, crs);
+            let r1 = b.add_i32(r0, cho);
+            let off = b.add_i32(r1, cb4);
+            let comp = b.c_i32(1040 * (3 - q));
+            let off2 = b.add_i32(off, comp);
+            let sp = b.ptr_add(inp, off2);
+            b.load_global_lds(sp, top, -(1040 * (3 - q)), 4);
+        }
+    } else if swz_mode == 4 {
         // vendor-style runs: run rho = wave + 4 q holds rows (rho & 7) + 8 s + 64 (rho >> 3) at LDS 1040 rho
         let cb4 = b.shl_i32(lane_lo, c4);
         let s8 = b.shl_i32(lane_hi, c3);
@@ -1284,7 +1313,7 @@ pub fn probe_dma_kread() -> Function {
         let c2k = b.c_i32(2 * k);
         let xk = b.xor_i32(x, c2k);
         let xs = b.shl_i32(xk, c4);
-        let a = if swz_mode == 4 { b.add_i32(base4, xs) } else { b.add_i32(jrow, xs) };
+        let a = if swz_mode == 4 || swz_mode == 5 { b.add_i32(base4, xs) } else { b.add_i32(jrow, xs) };
         let v = b.load_lds_b128(Opnd::Val(a));
         let ob = b.c_i32(16 * k);
         let o1 = b.add_i32(t64, ob);
