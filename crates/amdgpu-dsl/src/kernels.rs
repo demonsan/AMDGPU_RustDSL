@@ -12092,7 +12092,7 @@ pub fn probe_smfmac_ones() -> Function {
     };
     for (pat, p0, p1) in [(0usize, p1_0, p1_1), (1usize, p2_0, p2_1)] {
         let base_slot = 64 + 10 * pat;
-        let cands: [(ValueId, ValueId, ValueId, ValueId); 10] = [
+        let cands: [(ValueId, ValueId, ValueId, ValueId, ValueId); 10] = [
             (a_vendor, idx_vendor, idx_vendor, p0, p1),
             (a_vendor, i01, i01, p0, p1),
             (a_vendor, i23, i23, p0, p1),
