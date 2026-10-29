@@ -197,7 +197,7 @@ fn input_type_mismatch_is_rejected_by_verify() {
     // port 1 wants a Frag8, a Frag4 is bound
     let r = b.asm(rowsum_chain_block(), &[Opnd::Val(a_rs), Opnd::Val(a_rs), Opnd::Val(a_rs), Opnd::Val(c0), Opnd::Val(c0)]);
     let _ = r;
-    let f = b.finish_unchecked();
+    let f = b.finish();
     let errs = amdgpu_dsl::verify(&f);
     assert!(errs.iter().any(|e| e.contains("asm")), "{errs:?}");
 }
@@ -208,9 +208,10 @@ fn input_type_mismatch_is_rejected_by_verify() {
 fn pending_loads_emit_partial_waits_from_the_scoreboard() {
     let mut s = Seq::new();
     let addr = s.splat(0);
-    let r0 = s.ds_read_b128(s.vgpr::<4>(), &addr, 0);
-    let r1 = s.ds_read_b128(s.vgpr::<4>(), &addr, 16);
-    let r2 = s.ds_read_b128(s.vgpr::<4>(), &addr, 32);
+    let (d0, d1, d2) = (s.vgpr::<4>(), s.vgpr::<4>(), s.vgpr::<4>());
+    let r0 = s.ds_read_b128(d0, &addr, 0);
+    let r1 = s.ds_read_b128(d1, &addr, 16);
+    let r2 = s.ds_read_b128(d2, &addr, 32);
     let v0 = r0.wait(&mut s); // two later loads may stay in flight: lgkmcnt(2)
     let v2 = r2.wait(&mut s); // drains everything up to r2: lgkmcnt(0)
     let v1 = r1.wait(&mut s); // already covered: no instruction
@@ -227,8 +228,9 @@ fn vm_and_lgkm_queues_are_independent() {
     let mut s = Seq::new();
     let a2 = s.vgpr::<2>();
     let addr = s.splat(0);
-    let g = s.global_load_dwordx4(s.vgpr::<4>(), &a2, 0);
-    let l = s.ds_read_b128(s.vgpr::<4>(), &addr, 0);
+    let (dg, dl) = (s.vgpr::<4>(), s.vgpr::<4>());
+    let g = s.global_load_dwordx4(dg, &a2, 0);
+    let l = s.ds_read_b128(dl, &addr, 0);
     let vl = l.wait(&mut s); // lgkm queue holds only this load: lgkmcnt(0), the global load stays in flight
     let vg = g.wait(&mut s); // vmcnt(0)
     s.output(vl);

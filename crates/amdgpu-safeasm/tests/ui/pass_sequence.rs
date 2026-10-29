@@ -22,8 +22,9 @@ fn main() {
     s.v_readfirstlane_b32(&mut sg, r);
     // loads: issue, then wait (partial count derived from the scoreboard)
     let addr = s.splat(0);
-    let r0 = s.ds_read_b128(s.vgpr::<4>(), &addr, 0);
-    let r1 = s.ds_read_b128(s.vgpr::<4>(), &addr, 16);
+    let (d0, d1) = (s.vgpr::<4>(), s.vgpr::<4>());
+    let r0 = s.ds_read_b128(d0, &addr, 0);
+    let r1 = s.ds_read_b128(d1, &addr, 16);
     let v0 = r0.wait(&mut s);
     let v1 = r1.wait(&mut s);
     s.output(v0);
