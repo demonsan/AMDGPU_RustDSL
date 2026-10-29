@@ -7908,7 +7908,9 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     let kaddr1h = b.add_i32(kaddr1, c32v);
                     (k8_0, b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h)))
                 };
-                let kd = if kdlds {
+                let kd = if fmha_t_opt("kdconst") {
+                    Opnd::Val(b.c_i32(0x7f7f7f7f))
+                } else if kdlds {
                     let koff = b.c_i32(128 * s as i32);
                     let ka = b.add_i32(kd_rd, koff);
                     Opnd::Val(b.load_lds_b32(Opnd::Val(ka)))
