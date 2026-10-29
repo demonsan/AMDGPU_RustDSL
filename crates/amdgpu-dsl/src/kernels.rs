@@ -7373,7 +7373,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             if lazy {
                 // lazy rescaling: the running max only moves when some lane of the wave grows by
                 // more than 4 (P x 16 then stays below 16 * 2^4 = 256 < 448, the E4M3 maximum)
-                let tau = if fmha_t_opt("lazyinf") { b.c_f32(1.0e9) } else { c4f };
+                let tau = if fmha_t_opt("lazyinf") { b.c_f32(1.0e9) } else if fmha_t_opt("tau8") { b.c_f32(8.0) } else if fmha_t_opt("tau6") { b.c_f32(6.0) } else { c4f };
                 let thr = b.add_f32(m_old, tau);
                 let grow = b.cmp_lt_f32(thr, mt);
                 b.begin_if(Opnd::Val(grow));
