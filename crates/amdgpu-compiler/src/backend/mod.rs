@@ -97,7 +97,10 @@ impl LlvmTail {
 
     /// Run the pinned llc tail over a MIR text.
     pub fn run_llc(&self, name: &str, mir: &str, start: &str) -> Result<String, String> {
-        let dir = std::env::temp_dir().join(format!("amdc-llvm-tail-{}-{}", std::process::id(), name));
+        // unique per invocation: tests (and callers) compile the same kernel name concurrently
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("amdc-llvm-tail-{}-{}-{}", std::process::id(), seq, name));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mir_path = dir.join(format!("{name}.mir"));
         let asm_path = dir.join(format!("{name}.s"));
