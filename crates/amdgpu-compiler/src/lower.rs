@@ -2184,7 +2184,8 @@ impl Lowerer {
         }
         let rx = self.as_v1(core)?;
         self.touch(&[Src::Reg(sb), Src::Reg(rx)]);
-        let bound = if k == 0 {
+        // a loop variable is a mutable register and `cmpfold` may re-issue this compare later: take a copy in that case
+        let bound = if k == 0 && matches!(b, Opnd::Val(_)) {
             sb
         } else {
             let d = self.new_vreg(RClass::S1);
