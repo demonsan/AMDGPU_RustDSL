@@ -8320,7 +8320,8 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     if pp {
         b.lds((512 * fmha_t_pitch() + 2048) as u32);
     } else {
-        b.lds((nbuf * 256 * fmha_t_pitch() + 2048 + 1024 + 1024) as u32);
+        let pad: i32 = std::env::var("FMHA_LDSPAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        b.lds((nbuf * 256 * fmha_t_pitch() + 2048 + 1024 + 1024 + pad) as u32);
     }
     b.arg("ptr_o", DType::Ptr, 0x000, 8);
     b.arg("ptr_q", DType::Ptr, 0x010, 8);
