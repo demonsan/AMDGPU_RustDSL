@@ -92,6 +92,9 @@ SAddU32     | S1 <- S1 S1 | {d} = S_ADD_U32 {s0}, {s1}, implicit-def $scc
 SAddcU32    | S1 <- S1 S1 | {d} = S_ADDC_U32 {s0}, {s1}, implicit-def $scc, implicit $scc
 SMulI32     | S1 <- S1 S1 | {d} = S_MUL_I32 {s0}, {s1}
 SShlB32     | S1 <- S1 I  | {d} = S_LSHL_B32 {s0}, {s1}, implicit-def $scc
+SLshrB32    | S1 <- S1 I  | {d} = S_LSHR_B32 {s0}, {s1}, implicit-def $scc
+SAndB32     | S1 <- S1 S1 | {d} = S_AND_B32 {s0}, {s1}, implicit-def $scc
+SXorB32     | S1 <- S1 S1 | {d} = S_XOR_B32 {s0}, {s1}, implicit-def $scc
 SCmpLtI32   | <- S1 S1 | S_CMP_LT_I32 {s0}, {s1}, implicit-def $scc
 VCvtPkFp8F32Hi | V1 <- V1 V1 | {d} = nofpexcept V_CVT_PK_FP8_F32_e64 8, {s0}, 0, {s1}, {d}(tied-def 0), 4, implicit $mode, implicit $exec
 VPkAddF32   | V2 <- V2 V2 | {d} = nofpexcept V_PK_ADD_F32 8, {s0}, 8, {s1}, 0, 0, -1, 0, 0, implicit $mode, implicit $exec

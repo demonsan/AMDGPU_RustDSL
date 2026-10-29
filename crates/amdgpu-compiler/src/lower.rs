@@ -20,6 +20,9 @@ use crate::mir::*;
 ///                instead of `v_mov` into a register;
 ///  * `sgpr`    - scalar (SGPR) values are used directly as VALU source operands instead of a `v_mov` copy;
 ///  * `shl`     - multiplication by a power-of-two constant becomes a shift;
+///  * `scalarize` - wave-uniform integer arithmetic (workgroup ids, kernarg values, constants and loop counters /
+///                 toggles derived from them with add/mul/shl/lshr/and/xor) is computed with SALU instructions in SGPRs;
+///                 a value needed by a VALU instruction is copied with one `v_mov` (cached per region);
 ///  * `saddr`   - global loads whose address is `kernarg_ptr + vector offset` use the scalar-base form (no 64-bit add);
 ///  * `dce`     - dead address / clamp chains (`v_add_co`/`v_addc`, `v_cmp`+`v_cndmask`, pointer adds) are removed;
 ///  * `cmpfold` - `select(cmp(x,y), ..)` re-issues the compare instead of the 0/1 materialisation +
@@ -76,6 +79,11 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         ));
     }
     let mut lw = Lowerer::new(f);
+    if opt_on("scalarize") {
+        let (u, v) = uniform_analysis(f);
+        lw.uniform = u;
+        lw.uvars = v;
+    }
     lw.run(f)?;
     Ok(lw.finish())
 }
@@ -108,6 +116,9 @@ struct Lowerer {
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
+    /// `scalarize`: DSL values / loop variables that are wave-uniform integers (computed in SGPRs).
+    uniform: HashSet<ValueId>,
+    uvars: HashSet<amdgpu_dsl::VarId>,
 }
 
 impl Lowerer {
@@ -189,6 +200,8 @@ impl Lowerer {
             use_counts,
             alias_cache: HashMap::new(),
             else_started: HashSet::new(),
+            uniform: HashSet::new(),
+            uvars: HashSet::new(),
         }
     }
 
@@ -369,6 +382,42 @@ impl Lowerer {
         Ok(Some((sreg, off)))
     }
 
+    /// A scalar source operand: an immediate (SALU takes 32-bit literals) or an SGPR value / scalar loop variable.
+    fn s_operand(&mut self, o: Opnd) -> Result<Src, String> {
+        if let Some(k) = self.const_bits(o) {
+            return Ok(Src::Imm(k));
+        }
+        let r = match o {
+            Opnd::Val(v) => *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?,
+            Opnd::Var(v) => *self.vars.get(v.0 as usize).ok_or("var not lowered")?,
+            _ => return Err("scalar operand must be a value, variable or immediate".to_string()),
+        };
+        if self.mir.vreg_class(r) != RClass::S1 {
+            return Err(format!("operand {o:?} is not in an SGPR (uniform analysis disagrees with lowering)"));
+        }
+        Ok(Src::Reg(r))
+    }
+
+    /// `dst = a <op> b` in SALU (both operands uniform).
+    fn scalar_bin(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
+        let (mut sa, mut sb) = (self.s_operand(a)?, self.s_operand(b)?);
+        let commutative = matches!(op, MOp::SAddU32 | MOp::SMulI32 | MOp::SAndB32 | MOp::SXorB32);
+        if matches!(sa, Src::Imm(_)) && matches!(sb, Src::Reg(_)) && commutative {
+            std::mem::swap(&mut sa, &mut sb);
+        }
+        if let Src::Imm(k) = sa {
+            let t = self.new_vreg(RClass::S1);
+            self.push(MInst::new(MOp::SMovB32).def(t).imm(k));
+            sa = Src::Reg(t);
+        }
+        let regs: Vec<Src> = [sa, sb].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+        self.touch(&regs);
+        let d = self.new_vreg(RClass::S1);
+        self.push(MInst::new(op).def(d).src(sa).src(sb));
+        self.val.insert(dst, d);
+        Ok(())
+    }
+
     fn const_bits(&self, o: Opnd) -> Option<i64> {
         match o {
             Opnd::I32(i) => Some(i as i64),
@@ -473,11 +522,17 @@ impl Lowerer {
                     other => Err(format!("value v{v} has class {other:?}, expected scalar/vector")),
                 }
             }
-            Opnd::Var(v) => self
-                .vars
-                .get(v.0 as usize)
-                .copied()
-                .ok_or_else(|| format!("var{v} not lowered")),
+            Opnd::Var(v) => {
+                let r = self.vars.get(v.0 as usize).copied().ok_or_else(|| format!("var{v} not lowered"))?;
+                if self.mir.vreg_class(r) == RClass::S1 {
+                    // uniform (SGPR) loop variable read by a VALU consumer
+                    let d = self.new_vreg(RClass::V1);
+                    self.touch(&[Src::Reg(r)]);
+                    self.push(MInst::new(MOp::VMovFromS).def(d).srcreg(r));
+                    return Ok(d);
+                }
+                Ok(r)
+            }
             Opnd::I32(i) => Ok(self.const_vreg(i as i64)),
             Opnd::F32(f) => Ok(self.const_vreg((f.to_bits() as i32) as i64)),
         }
@@ -672,6 +727,14 @@ impl Lowerer {
                 Stmt::SetVar { var, value } => {
                     let dst = self.vars[var.0 as usize];
                     let class = self.mir.vreg_class(dst);
+                    if class == RClass::S1 {
+                        let s = self.s_operand(*value)?;
+                        if let Src::Reg(x) = s {
+                            self.touch(&[Src::Reg(x)]);
+                        }
+                        self.push(MInst::new(MOp::SMovB32).def(dst).src(s));
+                        continue;
+                    }
                     let src = match class {
                         RClass::V1 => self.as_v1(*value)?,
                         RClass::V2 => self.as_v2(*value)?,
@@ -766,6 +829,7 @@ impl Lowerer {
                             DType::Frag4 => RClass::V4,
                             DType::Frag8 => RClass::V8,
                             DType::Frag16 => RClass::V16,
+                            _ if self.uvars.contains(var) => RClass::S1,
                             _ => RClass::V1,
                         };
                         let r = self.new_vreg(class);
@@ -773,6 +837,14 @@ impl Lowerer {
                             self.vars.resize(var.0 as usize + 1, u32::MAX);
                         }
                         self.vars[var.0 as usize] = r;
+                        if class == RClass::S1 {
+                            let s = self.s_operand(init[i])?;
+                            if let Src::Reg(x) = s {
+                                self.touch(&[Src::Reg(x)]);
+                            }
+                            self.push(MInst::new(MOp::SMovB32).def(r).src(s));
+                            continue;
+                        }
                         let src = match class {
                             RClass::V1 => self.as_v1(init[i])?,
                             RClass::V2 => self.as_v2(init[i])?,
@@ -1024,6 +1096,12 @@ impl Lowerer {
                 self.push(MInst::new(MOp::SReadPhys).def(d).imm(phys));
                 self.val.insert(dst, d);
             }
+            Op::AddI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAddU32, *a, *b)?,
+            Op::MulI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SMulI32, *a, *b)?,
+            Op::ShlI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SShlB32, *a, *b)?,
+            Op::LshrI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SLshrB32, *a, *b)?,
+            Op::AndI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAndB32, *a, *b)?,
+            Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
             Op::AddI32(a, b) => self.bin_v1(dst, MOp::VAddU32, *a, *b)?,
             Op::AddF32(a, b) => self.bin_v1(dst, MOp::VAddF32, *a, *b)?,
             Op::SubF32(a, b) => self.bin_v1(dst, MOp::VSubF32, *a, *b)?,
@@ -2018,6 +2096,68 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
         }
         if !changed {
             break;
+        }
+    }
+}
+/// Wave-uniform integer values and loop variables (see the `scalarize` option). Control flow is wave-uniform by
+/// construction (branches are taken on `vcc != 0`), so a loop variable is uniform when its initial value and every
+/// value assigned to it are uniform.
+fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarId>) {
+    let mut uvars: HashSet<amdgpu_dsl::VarId> = HashSet::new();
+    for (i, t) in f.var_tys.iter().enumerate() {
+        if *t == DType::I32 {
+            uvars.insert(amdgpu_dsl::VarId(i as u32));
+        }
+    }
+    loop {
+        let mut u: HashSet<ValueId> = HashSet::new();
+        let is_u = |o: &Opnd, u: &HashSet<ValueId>, uvars: &HashSet<amdgpu_dsl::VarId>| match o {
+            Opnd::I32(_) => true,
+            Opnd::Val(v) => u.contains(v),
+            Opnd::Var(v) => uvars.contains(v),
+            _ => false,
+        };
+        let mut changed = false;
+        for st in &f.stmts {
+            match st {
+                Stmt::Let { dst, op } => {
+                    let uni = match op {
+                        Op::ConstI32(_) | Op::KernargI32 { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
+                        Op::AddI32(a, b) | Op::MulI32(a, b) | Op::ShlI32(a, b) | Op::LshrI32(a, b) | Op::AndI32(a, b) | Op::XorI32(a, b) => {
+                            is_u(a, &u, &uvars) && is_u(b, &u, &uvars)
+                        }
+                        _ => false,
+                    };
+                    if uni {
+                        u.insert(*dst);
+                    }
+                }
+                Stmt::SetVar { var, value } => {
+                    if uvars.contains(var) && !is_u(value, &u, &uvars) {
+                        uvars.remove(var);
+                        changed = true;
+                    }
+                }
+                Stmt::BeginLoop { vars, init } => {
+                    for (v, i) in vars.iter().zip(init.iter()) {
+                        if uvars.contains(v) && !is_u(i, &u, &uvars) {
+                            uvars.remove(v);
+                            changed = true;
+                        }
+                    }
+                }
+                // any other statement that writes a variable in place makes it non-scalar
+                Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
+                | Stmt::VarScaleLane { var, .. } | Stmt::VarLoadB128 { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScaleZ { var, .. } => {
+                    if uvars.remove(var) {
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            return (u, uvars);
         }
     }
 }

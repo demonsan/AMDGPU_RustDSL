@@ -131,6 +131,9 @@ pub enum MOp {
     SAddcU32,
     SMulI32,
     SShlB32,
+    SLshrB32,
+    SAndB32,
+    SXorB32,
     SCmpLtI32,
     // misc
     SNop,

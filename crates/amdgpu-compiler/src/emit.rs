@@ -550,6 +550,9 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1_s(a, inst.srcs[0]),
             src1_s(a, inst.srcs[1])
         )],
+        MOp::SLshrB32 => vec![format!("s_lshr_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
+        MOp::SAndB32 => vec![format!("s_and_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
+        MOp::SXorB32 => vec![format!("s_xor_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SCmpLtI32 => vec![format!(
             "s_cmp_lt_i32 {}, {}",
             src1_s(a, inst.srcs[0]),
