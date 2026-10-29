@@ -12134,5 +12134,56 @@ pub fn probe_smfmac_ones() -> Function {
     let d_rev = b.smfmac_fp8_16x16x128(a_vendor, p1_0, idx_vendor, d_rev1);
     probe_smfmac_dump(&mut b, base, 87, d_rev);
     let _ = (a_lo4, a_hi4);
+    // ---- decisive K-coverage + final-recipe test (slots 160..170) -----------------------------------
+    // P pattern K: every lane byte value = 1 + dword_index/8 for hh0 (values 1.0..1.875) and
+    // 2 + (dword_index-8)/8 for hh1 (2.0..2.875): a full 128-key row sum is then
+    // 2 lanes * 4 bytes * sum(1..2.875 step 0.125) = 248 (msum reference = 248/16 = 15.5).
+    let mut w3: Vec<ValueId> = Vec::with_capacity(16);
+    for d in 0..16i32 {
+        let bits = if d < 8 { b.c_i32(0x3F80_0000u32 as i32 + (d << 20)) } else { b.c_i32(0x4000_0000u32 as i32 + ((d - 8) << 20)) };
+        let v = b.bitcast_f32(bits);
+        w3.push(b.cvt_pk_fp8x4_f32(v, v, v, v));
+    }
+    let p3_0 = mk8(&mut b, &w3, 0);
+    let p3_1 = mk8(&mut b, &w3, 1);
+    let l3a = b.mfma_scale_fp8(b_ones, p3_0, zero16r, c127r, c123r);
+    let l3r = b.mfma_scale_fp8(b_ones, p3_1, l3a, c127r, c123r);
+    probe_smfmac_dump16(&mut b, base, 160, l3r);
+    let run4 = |b: &mut FnBuilder, a: ValueId, p0: ValueId, p1: ValueId| -> ValueId {
+        let r = b.smfmac_fp8_16x16x128(a, p0, i01, c0);
+        let r = b.smfmac_fp8_16x16x128(a, p1, i01, r);
+        let r = b.smfmac_fp8_16x16x128(a, p0, i23, r);
+        b.smfmac_fp8_16x16x128(a, p1, i23, r)
+    };
+    let d161 = run4(&mut b, a_vendor_sw, p3_0, p3_1);
+    probe_smfmac_dump(&mut b, base, 161, d161);
+    let d162 = run4(&mut b, a3, p3_0, p3_1);
+    probe_smfmac_dump(&mut b, base, 162, d162);
+    let half2 = |b: &mut FnBuilder, a: ValueId, idx: ValueId, p0: ValueId, p1: ValueId| -> ValueId {
+        let r = b.smfmac_fp8_16x16x128(a, p0, idx, c0);
+        b.smfmac_fp8_16x16x128(a, p1, idx, r)
+    };
+    let d163 = half2(&mut b, a_vendor_sw, i01, p3_0, p3_1);
+    probe_smfmac_dump(&mut b, base, 163, d163);
+    let d164 = half2(&mut b, a3, i01, p3_0, p3_1);
+    probe_smfmac_dump(&mut b, base, 164, d164);
+    let d165 = half2(&mut b, a_vendor_sw, i23, p3_0, p3_1);
+    probe_smfmac_dump(&mut b, base, 165, d165);
+    let run4b = |b: &mut FnBuilder, a: ValueId, p0: ValueId, p1: ValueId| -> ValueId {
+        let r = b.smfmac_fp8_16x16x128(a, p0, i23, c0);
+        let r = b.smfmac_fp8_16x16x128(a, p1, i23, r);
+        let r = b.smfmac_fp8_16x16x128(a, p0, i01, r);
+        b.smfmac_fp8_16x16x128(a, p1, i01, r)
+    };
+    let d166 = run4b(&mut b, a_vendor_sw, p3_0, p3_1);
+    probe_smfmac_dump(&mut b, base, 166, d166);
+    let d167 = run4(&mut b, a_vendor_sw, p1_0, p1_1);
+    probe_smfmac_dump(&mut b, base, 167, d167);
+    let d168 = run4(&mut b, a_vendor_sw, p2_0, p2_1);
+    probe_smfmac_dump(&mut b, base, 168, d168);
+    let d169 = run4(&mut b, a3, p1_0, p1_1);
+    probe_smfmac_dump(&mut b, base, 169, d169);
+    let d170 = run4(&mut b, a3, p2_0, p2_1);
+    probe_smfmac_dump(&mut b, base, 170, d170);
     b.finish()
 }
