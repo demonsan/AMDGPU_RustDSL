@@ -6779,8 +6779,28 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let has_next = b.cmp_lt_i32(it_p1, cx.nkv);
     let nxt = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_next), a: Opnd::Val(it_p1), b: it.into() });
     let key_next = b.shl_i32(nxt, c7);
-    let pre = if no_stage { first.clone() } else { stage_loads(b, key_next) };
     let hq4 = cx.kd_stride;
+    // K scale dwords of the four 32-key tiles, loaded before the prefetch so that waiting for
+    // them (global loads complete in order) does not also wait for the prefetched tile
+    let kd_hoisted: Vec<ValueId> = if fmha_t_opt("kdhoist") {
+        (0..4i32)
+            .map(|s| {
+                let kkey0 = b.add_i32(key0, cx.j);
+                let kcs = b.c_i32(32 * s);
+                let kkey_raw = b.add_i32(kkey0, kcs);
+                let kk_ok = b.cmp_lt_i32(kkey_raw, cx.kv_len);
+                let kkey = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kk_ok), a: Opnd::Val(kkey_raw), b: Opnd::Val(cx.kv_last) });
+                let kd_row = b.mul_i32(kkey, hq4);
+                let kd_off = b.add_i32(kd_row, cx.kd_base);
+                let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+                let kd_raw = b.load_f32(kd_ptr, 0);
+                b.bitcast_i32(kd_raw)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let pre = if no_stage { first.clone() } else { stage_loads(b, key_next) };
     let compute = |b: &mut FnBuilder, masked: bool| {        for hh in 0..2usize {
             // ---- two 32-key score tiles (S^T = K Q^T) of this 64-key substep ----
             let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
@@ -6805,6 +6825,8 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
                 let kd = if fmha_t_opt("kdconst") {
                     b.c_i32(0x7f7f7f7f)
+                } else if !kd_hoisted.is_empty() {
+                    kd_hoisted[s]
                 } else {
                     let kd_raw = b.load_f32(kd_ptr, 0);
                     b.bitcast_i32(kd_raw)
