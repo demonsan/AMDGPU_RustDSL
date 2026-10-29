@@ -9254,7 +9254,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let stop = b.let_(Op::NotI1(Opnd::Val(more)));
     b.break_if(Opnd::Val(stop));
     b.end_loop();
-    if !a_body && !fmha_t_opt("vsflat") {
+    if !role_a {
         // group B: PV of the last unit (hh1 of the last tile; its V sits in the slot of the parity before the final flip)
         let lp = b.xor_i32(par, c1);
         let last_off = b.mul_i32(lp, cbuf);
