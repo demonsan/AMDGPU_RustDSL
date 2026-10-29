@@ -12100,9 +12100,11 @@ pub fn probe_smfmac_ones() -> Function {
     let a5 = b.frag4(zero, zero, ones, ones);
     let a6 = b.frag4(ones, ones, ones, ones);
     let l1x = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::Val(c1r)));
-    let idx_l1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(l1x), a: Opnd::Val(i23), b: Opnd::Val(i01) });
+    let l1c = b.cmp_lt_i32(zero, l1x);
+    let idx_l1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(l1c), a: Opnd::Val(i23), b: Opnd::Val(i01) });
     let l2x = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::Val(c2r)));
-    let idx_l2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(l2x), a: Opnd::Val(i23), b: Opnd::Val(i01) });
+    let l2c = b.cmp_lt_i32(zero, l2x);
+    let idx_l2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(l2c), a: Opnd::Val(i23), b: Opnd::Val(i01) });
     let cands: [(ValueId, ValueId, ValueId); 25] = [
         (a_vendor_sw, i01, i01), (a_vendor_sw, i23, i23), (a_vendor_sw, i01, i23), (a_vendor_sw, i23, i01),
         (a_vendor_sw, idx_vendor, idx_vendor), (a_vendor_sw, idx_vswap, idx_vswap),
