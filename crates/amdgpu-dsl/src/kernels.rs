@@ -7719,6 +7719,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
     }
     let dbuf = fmha_t_opt("dbuf");
+    let stmid = fmha_t_opt("stmid");
     let par_idx = init_vars.len();
     init_vars.push((DType::I32, Opnd::Val(c0)));
     let vars = b.begin_loop(&init_vars);
@@ -7882,6 +7883,10 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             }
             let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
             // ---- O^T += V^T P^T and the row sums (ones x P^T) ----
+            if hh == 0 && stmid && !no_stage && dbuf {
+                // publish the next tile early: its global loads had a whole substep to land
+                stage_stores(b, sdst_n, kdb_n, &pre);
+            }
             b.var_mfma_scale(la, ones8, p8, c127, c123);
             for e in 0..4usize {
                 let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
@@ -7910,7 +7915,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.barrier();
         }
     }
-    if !no_stage {
+    if !no_stage && !(stmid && dbuf) {
         stage_stores(b, sdst_n, kdb_n, &pre);
     }
     b.wait_lds(0);
