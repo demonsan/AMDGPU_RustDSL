@@ -9,7 +9,7 @@ cd "$REPO"
 mkdir -p build
 
 echo "== emit =="
-bash tools/container/cargo.sh run -q --bin amdc -- emit "$KERNEL" --backend "${BACKEND:-llvm-tail}" ${AMDC_EXTRA_FLAGS:-} --out "/work/build/${KERNEL}.s"
+bash tools/container/cargo.sh run -q --bin amdc -- emit "$KERNEL" --backend "${BACKEND:-auto}" ${AMDC_EXTRA_FLAGS:-} --out "/work/build/${KERNEL}.s"
 
 echo "== assemble =="
 "${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 \

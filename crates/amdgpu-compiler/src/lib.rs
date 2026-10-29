@@ -63,6 +63,9 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/status.md round 47).
     let base = if f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
         let mut v: Vec<&str> = vec!["dce", "cmpfold", "scalarize"];
+        if f.name.ends_with("_vs128") {
+            v.push("imm"); // constants as inline/literal operands: slack in the register file (docs/status.md round 49)
+        }
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
     } else {
@@ -81,9 +84,12 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
             // "ld" preset: scoreboard (partial) waits + ds_read hoisting, no instruction reordering. Measured best on the
             // merged tree (docs/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
             let mut o = sched::Options::default();
-            o.reorder = false;
-            o.alu_across_barrier = true;
-            o.ldshoist = true; // hoist ds_read above independent work (docs/scheduling.md); AMDC_SCHED=0 / 1 / auto / OPTS override
+            // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/status.md round 49)
+            if !f.name.ends_with("_vs128") {
+                o.reorder = false;
+                o.alu_across_barrier = true;
+                o.ldshoist = true; // hoist ds_read above independent work (docs/scheduling.md); AMDC_SCHED=0 / 1 / auto / OPTS override
+            }
             Some(o)
         }
         other => other,

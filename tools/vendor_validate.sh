@@ -108,7 +108,7 @@ print("VAL static_barriers=%d static_setprio=%d static_dual_mfma=%d" % (
     sum(1 for _, m, _ in ins if m == "s_barrier"),
     sum(1 for _, m, _ in ins if m == "s_setprio"),
     sum(1 for _, m, _ in ins if m.startswith("v_mfma_f32_32x32x64_f8f6f4"))))
-print("VAL static_lds_dma=%d" % sum(1 for _, m, ops in ins if " lds" in ops and m.startswith("buffer_load")))
+print("VAL static_lds_dma=%d" % sum(1 for _, m, ops in ins if "load_lds" in m or (" lds" in ops and m.startswith("buffer_load"))))
 print("VAL static_next_tile_qk=%d" % sum(1 for _, m, _ in ins if m.startswith("v_mfma_scale")))
 print("VAL static_smfmac=%d" % sum(1 for _, m, _ in ins if m.startswith("v_smfmac")))
 
