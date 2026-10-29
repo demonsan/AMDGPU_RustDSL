@@ -14,7 +14,8 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(di, hi.data(), n * 4, hipMemcpyHostToDevice));
     CK(hipMemcpy(dout, ho.data(), n * 4, hipMemcpyHostToDevice));
     hipModule_t mod; hipFunction_t fn;
-    CK(hipModuleLoad(&mod, co)); const char* kn = argc > 2 ? argv[2] : "probe_dma_tile"; int nthr = argc > 3 ? atoi(argv[3]) : 256;`n    CK(hipModuleGetFunction(&fn, mod, kn));
+    CK(hipModuleLoad(&mod, co)); const char* kn = argc > 2 ? argv[2] : "probe_dma_tile"; int nthr = argc > 3 ? atoi(argv[3]) : 256;
+    CK(hipModuleGetFunction(&fn, mod, kn));
     void* a_o = dout; void* a_i = di; void* params[] = {&a_o, &a_i};
     CK(hipModuleLaunchKernel(fn, 1, 1, 1, nthr, 1, 1, 0, nullptr, params, nullptr));
     CK(hipDeviceSynchronize());
