@@ -13,7 +13,8 @@ set -- ${AB_SHAPE:-1 8 2048 2048}
 i=0
 for V in ${AB_VARIANTS:-FMHA_PITCH=128}; do
     i=$((i+1))
-    rm -f build/ab$i.s build/ab$i.co`n    ( export $(echo "$V" | tr ';' ' ')
+    rm -f build/ab$i.s build/ab$i.co
+    ( export $(echo "$V" | tr ';' ' ')
       bash tools/container/cargo.sh run -q --bin amdc -- emit "$K" --backend "${BACKEND:-llvm-tail}" ${AMDC_EXTRA_FLAGS:-} --out "/work/build/ab$i.s" 2>&1 | grep -E "^error|out of VGPR" -A5
       "${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/ab$i.co build/ab$i.s )
     echo "### variant $i: $V  ($(grep -m1 -E 'vgpr_count' build/ab$i.s))"
