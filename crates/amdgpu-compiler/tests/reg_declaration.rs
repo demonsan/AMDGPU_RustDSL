@@ -68,6 +68,13 @@ fn declared(asm: &str, key: &str) -> Option<i64> {
 #[test]
 fn declared_register_counts_cover_the_instruction_stream() {
     let mut bad = Vec::new();
+    // second pass: the DMA staging variant of the FMHA kernels (opt-in; only it triggered the old bug)
+    let passes: [Option<&str>; 2] = [None, Some("cvt4,pksub,lazy,msum,permlane,kdlds,dbuf,lacc1,psh2,svpk,dma")];
+    for opt in passes {
+    match opt {
+        Some(o) => std::env::set_var("FMHA_OPT", o),
+        None => std::env::remove_var("FMHA_OPT"),
+    }
     for name in kernel_names() {
         let f = kernel_by_name(name).unwrap();
         let Ok(c) = compile(&f) else { continue };
@@ -81,5 +88,7 @@ fn declared_register_counts_cover_the_instruction_stream() {
             bad.push(format!("{name}: VGPR v{mv} used but .amdhsa_next_free_vgpr = {dv}"));
         }
     }
+    }
+    std::env::remove_var("FMHA_OPT");
     assert!(bad.is_empty(), "under-declared registers:\n{}", bad.join("\n"));
 }
