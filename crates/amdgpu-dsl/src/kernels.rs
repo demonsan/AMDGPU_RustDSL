@@ -9319,7 +9319,10 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let p8 = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
         let scb = if w.len() > 8 { w[8] } else { c123 };
         if smf {
-            b.var_smfmac_fp8(la, a_ones, p8, if hh == 0 { idx01 } else { idx23 });
+            // one smfmac contracts 64 of the 128 K positions of a B operand: the complementary patterns on the same P half cover all of it
+            let _ = hh;
+            b.var_smfmac_fp8(la, a_ones, p8, idx01);
+            b.var_smfmac_fp8(la, a_ones, p8, idx23);
         } else {
             b.var_mfma_scale(la, ones8, p8, c127, scb);
         }
