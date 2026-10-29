@@ -143,6 +143,7 @@ impl Operand for Sub<'_, 1> {
         amdgpu_compiler::mir::Src::Reg(self.id)
     }
 }
+impl Sealed for &Sgpr<1> {}
 impl Operand for &Sgpr<1> {
     const BUS: u8 = 1;
     const VOP3_OK: bool = true;
