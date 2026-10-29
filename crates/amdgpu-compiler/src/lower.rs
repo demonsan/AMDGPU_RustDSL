@@ -389,6 +389,28 @@ impl Lowerer {
                 | Some(Op::ShlI32(..))
                 | Some(Op::XorI32(..))
                 | Some(Op::MulI32(..)) => break,
+                // wider producer set (`retarget2`): single-use results of any plain ALU / conversion op
+                Some(Op::MaxF32(..))
+                | Some(Op::Max3F32(..))
+                | Some(Op::FmaF32(..))
+                | Some(Op::ExpF32(..))
+                | Some(Op::Exp2F32(..))
+                | Some(Op::RcpF32(..))
+                | Some(Op::CvtF16ToF32(..))
+                | Some(Op::CvtF32ToF16(..))
+                | Some(Op::CvtPkFp8F32(..))
+                | Some(Op::CvtPkFp8x4F32(..))
+                | Some(Op::CvtPkBf16F32(..))
+                | Some(Op::CvtPknormU16(..))
+                | Some(Op::PermB32(..))
+                | Some(Op::LshrI32(..))
+                | Some(Op::AndI32(..))
+                | Some(Op::PkSubU16(..))
+                | Some(Op::Select { .. })
+                    if opt_on("retarget2") =>
+                {
+                    break
+                }
                 _ => return false,
             }
         }
@@ -400,17 +422,41 @@ impl Lowerer {
             return false;
         }
         let insts = &mut self.mir.blocks[self.cur].insts;
-        for inst in insts.iter_mut().rev() {
-            if inst.dst == Some(r) {
-                inst.dst = Some(new_dst);
-                self.val.insert(cur, new_dst);
-                return true;
+        // every instruction of the producing chain (a partial-write form such as the cvt_pk high half reads and writes the
+        // same register): collect first, then rewrite, so a failed attempt changes nothing
+        let mut chain: Vec<usize> = Vec::new();
+        let mut complete = false;
+        for (k, inst) in insts.iter().enumerate().rev() {
+            let writes = inst.dst == Some(r);
+            let reads = inst.uses().contains(&r);
+            if writes {
+                chain.push(k);
+                if reads {
+                    continue;
+                }
+                complete = true;
+                break;
             }
-            if inst.uses().contains(&r) {
+            if reads {
                 return false;
             }
         }
-        false
+        if !complete {
+            return false;
+        }
+        for k in chain {
+            let inst = &mut insts[k];
+            inst.dst = Some(new_dst);
+            for s in inst.srcs.iter_mut() {
+                if let Src::Reg(x) = s {
+                    if *x == r {
+                        *x = new_dst;
+                    }
+                }
+            }
+        }
+        self.val.insert(cur, new_dst);
+        true
     }
 
     /// Bit pattern of a constant operand (integer or f32), for in-line operands.
