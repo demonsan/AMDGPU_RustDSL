@@ -9166,7 +9166,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
 
     let first_pass = b.cmp_lt_i32(it, c1);
-    if role_a {
+    let a_body = role_a || fmha_t_opt("vsseq");
+    if a_body {
         // first pass: QK of unit 0 (A's peeled prologue), then the barrier that group B's first pass waits at
         b.begin_if(Opnd::Val(first_pass));
         qk(b, 0, c0, c0);
@@ -9235,7 +9236,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let stop = b.let_(Op::NotI1(Opnd::Val(more)));
     b.break_if(Opnd::Val(stop));
     b.end_loop();
-    if !role_a {
+    if !a_body {
         // group B: PV of the last unit (hh1 of the last tile; its V sits in the slot of the parity before the final flip)
         let lp = b.xor_i32(par, c1);
         let last_off = b.mul_i32(lp, cbuf);
