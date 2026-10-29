@@ -21,7 +21,7 @@ kernel 作者和自动化 agent 在一个**类型化、可验证、可快速迭�
 - 我们 vs 厂商：全部输出逐个比较，平均差异 1.3–2.8e-3；Q = 0 与 SK = 1 时逐位相同
 - 差异来源：P 量化到 fp8 的舍入方式不同（固有）
 
-**性能（如实）**：B=1, H=8, S=SK=2048 上约 186 TFLOP/s，厂商 kernel 约 518 TFLOP/s，**慢约 2.7 倍**。没有指令调度器，循环是线性 lowering，两个 wave 之间的 ping-pong 重叠没有实现。详见 `docs/status.md` 的消融实验。
+**性能（如实）**：B=1, H=8, S=SK=2048 上默认的精确 recipe kernel `fmha_fwd_hd128_mxfp8_t` 约 **266 TFLOP/s**（与 CPU 的 mean err 1.25e-3，优于厂商 2.42e-3；15 个形状在两个后端均通过，确定性 5/5），厂商 kernel 约 518 TFLOP/s，**慢约 1.95 倍**。opt-in 实验：`_sv`（厂商式 softmax，加 svcorr 后 15/15，254 TFLOP/s，mean err 1.75e-3；不加 svcorr 285 TFLOP/s 但 13/15 形状有离群点）、`_pp`（ping-pong，205）、`FMHA_OPT=dma`（global->LDS DMA，仅 own 后端，H>=2 仍错误，未启用）。详见 `docs/status.md` 第 44 轮。
 
 **不是 1:1 复刻**：ABI、网格 / block 形状、1×32 缩放用法、`v_mfma_scale_f32_32x32x64_f8f6f4`、`ds_read_b64_tr_b8`、A/B 两组 wave 的分工都和参考 kernel 一致，但指令级结构不同（P 量化用 `v_cvt_pk_fp8_f32`，参考用 pknorm + scalef32 pack；PV 用 32×32×64 MFMA，参考用 `v_smfmac_f32_16x16x128_fp8_fp8`；每轮 2 个 barrier，参考 4 个 phase；没有 rollback 出口）。对照表见 `docs/final-report.md`。
 
