@@ -40,7 +40,13 @@ pub fn compile_mir(f: &amdgpu_dsl::Function) -> Result<mir::MFunction, String> {
 /// (`sched::Options::from_env`) a result that does not fit the register file is retried with a
 /// lower pressure limit and finally with the unscheduled code.
 fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regalloc::Alloc), String> {
-    let base = lower::lower(f)?;
+    // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
+    // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/status.md round 47).
+    let base = if f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
+        lower::with_opts(&["dce", "cmpfold", "scalarize"], || lower::lower(f))?
+    } else {
+        lower::lower(f)?
+    };
     let sched_opts = match sched::Options::from_env() {
         Some(o) if o.auto => sched::auto_plan(&base, &o),
         other => other,
