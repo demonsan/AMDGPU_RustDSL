@@ -1087,9 +1087,30 @@ impl Lowerer {
                 }
                 Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
                     let rb = self.as_v2(*base)?;
-                    let lv = self.as_v1(*lds_addr)?;
+                    // scalarize: a wave-uniform LDS base already lives in an SGPR (or is a constant): no v_mov + v_readfirstlane
+                    let direct: Option<VReg> = if opt_on("scalarize") {
+                        let r = match *lds_addr {
+                            Opnd::Var(v) => self.vars.get(v.0 as usize).copied().filter(|r| self.mir.vreg_class(*r) == RClass::S1),
+                            o => self.scalar_reg(o),
+                        };
+                        match (r, self.const_bits(*lds_addr)) {
+                            (Some(r), _) => Some(r),
+                            (None, Some(k)) => {
+                                let t = self.new_vreg(RClass::S1);
+                                self.push(MInst::new(MOp::SMovB32).def(t).imm(k));
+                                Some(t)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let lv = if direct.is_some() { rb } else { self.as_v1(*lds_addr)? };
                     self.touch(&[Src::Reg(rb), Src::Reg(lv)]);
-                    let sreg = match self.rfl_cache.get(&lv) {
+                    let sreg = if let Some(s) = direct {
+                        self.touch(&[Src::Reg(s)]);
+                        s
+                    } else { match self.rfl_cache.get(&lv) {
                         Some(s) => *s,
                         None => {
                             let s = self.new_vreg(RClass::S1);
@@ -1097,7 +1118,7 @@ impl Lowerer {
                             self.rfl_cache.insert(lv, s);
                             s
                         }
-                    };
+                    } };
                     let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128 } else { MOp::GlobalLoadLdsB32 };
                     // imm = instruction offset: added to the global address AND to the LDS destination (M0 + imm + 16 lane)
                     self.push(MInst::new(mop).srcreg(rb).srcreg(sreg).imm(*byte_off as i64));
