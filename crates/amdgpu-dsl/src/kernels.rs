@@ -9346,7 +9346,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 qk(b, 0, slot_cur, kds_cur);
                 pv(b, 1, slot_pv);
             } else {
-                pv(b, 1, slot_pv);
+                if !ablate.contains("bnoprev") {
+                    pv(b, 1, slot_pv);
+                }
                 qk(b, 0, slot_cur, kds_cur);
             }
             b.set_prio(0);
@@ -9377,7 +9379,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
             }
             // M(unit 1): PV(hh0) + QK(hh1)
-            pv_w(b, 0, slot_cur, &w0);
+            if !ablate.contains("bnopv0") {
+                pv_w(b, 0, slot_cur, &w0);
+            }
             qk(b, 1, slot_cur, kds_cur);
             b.set_prio(0);
             b.wait_lds(0);
@@ -9427,7 +9431,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     if !role_a && !seq_mode {
         // group B: PV of the last unit (hh1 of the last tile; its V sits in the slot of the final ring index)
         let last_off = b.mul_i32(Opnd::Var(idx), cbuf);
-        pv(b, 1, last_off);
+        if !ablate.contains("bnoprev") {
+            pv(b, 1, last_off);
+        }
     }    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
     let l0 = b.frag16_lane(la, 0);
     let l_tot = b.bitcast_f32(l0);
