@@ -9566,7 +9566,11 @@ pub fn sched_occ_chain() -> Function {
     b.barrier();
     b.wait_lds(0);
     sched_end_loop(&mut b, vars[0], n);
-    let off = b.mul_i32(tid, c64);
+    // One result row per thread with a 128-byte stride: the 16 accumulator lanes plus the scalar sum
+    // are 68 bytes, so a 64-byte stride would overlap the next thread's row and the harness hash
+    // would depend on which wave wrote last (a race, not a compiler difference).
+    let stride = b.c_i32(128);
+    let off = b.mul_i32(tid, stride);
     let row = b.ptr_add(o, off);
     let fin = b.bitcast_f32(vars[2]);
     b.store_f32(row, 0, fin);
