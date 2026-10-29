@@ -455,7 +455,7 @@ impl Lowerer {
         loop {
             if let Opnd::Val(v) = cur {
                 if let Some(&(t, k)) = self.lazy.get(&v) {
-                    if std::env::var("AMDC_ADDRFOLD_NODS").map(|v| v.is_empty()).unwrap_or(true) && (0..65536).contains(&(off + k)) {
+                    if  (0..65536).contains(&(off + k)) {
                         self.touch(&[Src::Reg(t)]);
                         return Ok((t, off + k));
                     }
@@ -518,23 +518,12 @@ impl Lowerer {
             }
         }
         let (kb, ka) = (self.const_bits(b), self.const_bits(a));
-        let mode = std::env::var("AMDC_ADDRFOLD_MODE").unwrap_or_default();
-        if let Some(lim) = std::env::var("AMDC_ADDRFOLD_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {
-            if self.lazy.len() >= lim {
-                return Ok(false);
-            }
-        }
         match (ka, kb) {
-            (None, None) if mode == "c" => Ok(false),
-            (None, Some(_)) | (Some(_), None) if mode == "n" => Ok(false),
             (None, Some(k)) | (Some(k), None) => {
                 let other = if kb.is_some() { a } else { b };
                 let (t, k0) = self.lazy_core(other)?;
                 if self.var_backed(t) {
                     return Ok(false);
-                }
-                if std::env::var("AMDC_ADDRFOLD_TRACE").map(|v| !v.is_empty()).unwrap_or(false) {
-                    eprintln!("LAZY#{} v{dst} = {:?} + {:?}: core r{t} class {:?} k={}", self.lazy.len(), a, b, self.mir.vreg_class(t), k0 + k);
                 }
                 self.lazy.insert(dst, (t, k0 + k));
                 Ok(true)
@@ -1239,11 +1228,7 @@ impl Lowerer {
             Op::LshrI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SLshrB32, *a, *b)?,
             Op::AndI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAndB32, *a, *b)?,
             Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
-            Op::AddI32(a, b) if opt_on("addrfold") && self.lazy_add(dst, *a, *b)? => {
-                if std::env::var("AMDC_ADDRFOLD_EAGER").map(|v| !v.is_empty()).unwrap_or(false) {
-                    let _ = self.as_v1(Opnd::Val(dst))?;
-                }
-            }
+            Op::AddI32(a, b) if opt_on("addrfold") && self.lazy_add(dst, *a, *b)? => {}
             Op::AddI32(a, b) => self.bin_v1(dst, MOp::VAddU32, *a, *b)?,
             Op::AddF32(a, b) => self.bin_v1(dst, MOp::VAddF32, *a, *b)?,
             Op::SubF32(a, b) => self.bin_v1(dst, MOp::VSubF32, *a, *b)?,

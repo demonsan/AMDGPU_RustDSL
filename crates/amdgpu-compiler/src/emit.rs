@@ -587,13 +587,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             lds_off(inst.imm)
         )],
         MOp::VReadFirstLane => {
-            let nops = std::env::var("AMDC_RFL_NOP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
-            let mut v = Vec::new();
-            if nops > 0 {
-                v.push(format!("s_nop {}", nops - 1));
-            }
-            v.push(format!("v_readfirstlane_b32 {}, {}", sr(a, inst.dst.expect("dst")), src1(a, inst.srcs[0])));
-            v
+            vec![format!("v_readfirstlane_b32 {}, {}", sr(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]))]
         }
         MOp::SBarrier => vec!["s_barrier".to_string()],
         MOp::SSetPrio => vec![format!("s_setprio {}", inst.imm)],

@@ -88,7 +88,7 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
 }
 
 fn reads_valu_hazard_operands(op: MOp) -> bool {
-    is_scaled_mfma(op) || matches!(op, MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
+    // v_readfirstlane reading a VGPR the previous VALU instruction wrote needs the same 2 wait states (found on hardware:\n    // `v_add d; v_readfirstlane s, d; s_mov m0, s; global_load_lds` read a stale lane value)\n    is_scaled_mfma(op) || matches!(op, MOp::VReadFirstLane | MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
 }
 
 /// Instructions the scanner must never look past (waits, barriers, nops).
