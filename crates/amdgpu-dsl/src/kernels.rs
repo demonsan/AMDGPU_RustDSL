@@ -9555,8 +9555,21 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (cx.v_seqs, cx.vbase_off, cx.ptr_v, cx.lds_v)
     };
     let lds_kd = b.c_i32(2 * cbuf_i);
-    let rt_row4 = b.shl_i32(cx.rt_row, c2);
-    let kdb0 = b.add_i32(lds_kd, rt_row4);
+    // kdv4: the four K-scale dwords of a lane (tiles 0..3) are contiguous (lane*16 + 4 s): ONE ds_read_b128 per tile instead of four ds_read_b32
+    let kdv4 = fmha_t_opt("kdv4");
+    let kdb0 = if kdv4 {
+        let c31k = b.c_i32(31);
+        let c5k = b.c_i32(5);
+        let rlo = b.let_(Op::AndI32(Opnd::Val(cx.rt_row), Opnd::Val(c31k)));
+        let rlo16 = b.shl_i32(rlo, c4);
+        let rhi = b.let_(Op::LshrI32(Opnd::Val(cx.rt_row), Opnd::Val(c5k)));
+        let rhi4 = b.shl_i32(rhi, c2);
+        let o0 = b.add_i32(rlo16, rhi4);
+        b.add_i32(lds_kd, o0)
+    } else {
+        let rt_row4 = b.shl_i32(cx.rt_row, c2);
+        b.add_i32(lds_kd, rt_row4)
+    };
     // ---- DMA staging (see the sv/t roles): 1040-byte run layout, one M0 per wave ----
     // dense swizzled layout (rows of 128 bytes, 16-byte chunk c of tile row r at chunk c ^ s(r), s as in the `swz` option): wave w
     // stages rows 32 w .. 32 w + 31; DMA instruction q covers rows 32 w + 8 q .. +7 = 1 KB contiguous, lane i lands in slot i, so
@@ -9612,7 +9625,45 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let kd_raw = b.load_f32(kd_ptr, 0);
         b.bitcast_i32(kd_raw)
     };
+    // kdglob: every wave loads the K scales of its own lanes (rows j + 32 s of the tile) straight from global memory one tile ahead (4 VGPR,
+    // issued in the V phase together with the DMA, covered by its vmcnt wait) instead of A staging them through LDS (4 ds_read_b32 per tile)
+    let kdglob = fmha_t_opt("kdglob");
+    let kd_rows = |b: &mut FnBuilder, key0: ValueId| -> Vec<ValueId> {
+        let r0 = b.add_i32(key0, cx.j);
+        let off0 = b.mul_i32(r0, hq4_d);
+        let c32s = b.c_i32(32);
+        let step = b.mul_i32(c32s, hq4_d);
+        let lastoff = b.mul_i32(cx.kv_last, hq4_d);
+        let mut out: Vec<ValueId> = Vec::with_capacity(4);
+        let mut offs = off0;
+        for s in 0..4usize {
+            if s > 0 {
+                offs = b.add_i32(offs, step);
+            }
+            let past = b.cmp_lt_i32(lastoff, offs);
+            let oc = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(past), a: Opnd::Val(lastoff), b: Opnd::Val(offs) });
+            let o2 = b.add_i32(oc, cx.kd_base);
+            let kp = b.ptr_add(cx.ptr_kd, o2);
+            let kr = b.load_f32(kp, 0);
+            out.push(b.bitcast_i32(kr));
+        }
+        out
+    };
     let no_dma = ablate.contains("nodma");
+    // dmah: base_off + column bytes + instruction compensation per q are tile-invariant: computed once (4 VGPR)
+    let dmah = fmha_t_opt("dmah");
+    let oq: Vec<ValueId> = if dmah {
+        (0..4i32)
+            .map(|q| {
+                let cbytes = if q & 1 == 0 { cbytes_even } else { cbytes_odd };
+                let o1 = b.add_i32(base_off, cbytes);
+                let comp = b.c_i32(1024 * (3 - q));
+                b.add_i32(o1, comp)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let dma_issue = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId| {
         if no_dma {
             return;
@@ -9625,11 +9676,15 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let ok = b.cmp_lt_i32(row_raw, cx.kv_len);
             let row = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(row_raw), b: Opnd::Val(cx.kv_last) });
             let o0 = b.mul_i32(row, seqs);
-            let o1 = b.add_i32(o0, base_off);
-            let cbytes = if q & 1 == 0 { cbytes_even } else { cbytes_odd };
-            let o2 = b.add_i32(o1, cbytes);
-            let comp = b.c_i32(1024 * (3 - q));
-            let o3 = b.add_i32(o2, comp);
+            let o3 = if dmah {
+                b.add_i32(o0, oq[q as usize])
+            } else {
+                let o1 = b.add_i32(o0, base_off);
+                let cbytes = if q & 1 == 0 { cbytes_even } else { cbytes_odd };
+                let o2 = b.add_i32(o1, cbytes);
+                let comp = b.c_i32(1024 * (3 - q));
+                b.add_i32(o2, comp)
+            };
             let sp = b.ptr_add(ptr, o3);
             b.load_global_lds(sp, lbase, -(1024 * (3 - q)), 4);
         }
@@ -9639,7 +9694,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if no_stage {
             return None;
         }
-        let kd = if role_a { Some(kd_row_load(b, key0)) } else { None };
+        let kd = if role_a && !kdglob { Some(kd_row_load(b, key0)) } else { None };
         dma_issue(b, key0, slot_off);
         kd
     };
@@ -9737,13 +9792,22 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let cm1 = b.c_i32(-1);
     let cbuf = b.c_i32(cbuf_i);
     let c512 = b.c_i32(512);
-    let j4 = b.shl_i32(cx.j, c2);
+    let j4 = if kdv4 { b.shl_i32(cx.j, c4) } else { b.shl_i32(cx.j, c2) };
     let kd_cur = b.add_i32(lds_kd, j4);
     if !role_a && !no_bar {
         b.barrier(); // P1 (group A computed QK(0) before its P1)
     }
     let s_init: Vec<ValueId> = {
         let mut out: Vec<ValueId> = Vec::with_capacity(4);
+        let kdf0 = if kdv4 { Some(b.load_lds_b128(Opnd::Val(kd_cur))) } else { None };
+        let kd0g: Option<Vec<ValueId>> = if kdglob {
+            let z = b.c_i32(0);
+            let v = kd_rows(b, z);
+            b.wait_vm(0);
+            Some(v)
+        } else {
+            None
+        };
         for s in 0..4usize {
             let biasf = b.mfma_f16_wide(ones_f16, bias_init, zero);
             let ko = b.c_i32(4096 * (s as i32));
@@ -9753,9 +9817,16 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a3 = b.add_i32(cx.kfx[3], ko);
             let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
             let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
-            let koff = b.c_i32(128 * s as i32);
-            let ka = b.add_i32(kd_cur, koff);
-            let kd = b.load_lds_b32(Opnd::Val(ka));
+            let kd = if let Some(v) = &kd0g {
+                v[s]
+            } else if let Some(f) = kdf0 {
+                let l = b.frag4_lane(f, s as u8);
+                b.bitcast_i32(l)
+            } else {
+                let koff = b.c_i32(128 * s as i32);
+                let ka = b.add_i32(kd_cur, koff);
+                b.load_lds_b32(Opnd::Val(ka))
+            };
             let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
@@ -9809,12 +9880,32 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let key_n = b.shl_i32(nn, c7d);
         (i1, slot_cur, slot_nxt, slot_nxt, kds_nxt, key_n, kds_cur)
     };    // QK of the whole tile (4 x 32 keys) in ring slot `slot`: S' = bias + scaled K.Q^T, in place
-    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId| {
+    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId, kdv: Option<&[ValueId]>| {
         if no_qk {
             return;
         }
         let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot)).collect();
         let kd_rd = b.add_i32(kd_cur, kdslot);
+        // kdpre: the four K-scale dwords are read up front (4 VGPR) so that their lgkmcnt waits do not sit in front of every tile's MFMAs
+        let kd_pre: Vec<ValueId> = if kdv4 {
+            let f = b.load_lds_b128(Opnd::Val(kd_rd));
+            (0..4u8)
+                .map(|s| {
+                    let l = b.frag4_lane(f, s);
+                    b.bitcast_i32(l)
+                })
+                .collect()
+        } else if fmha_t_opt("kdpre") {
+            (0..4usize)
+                .map(|s| {
+                    let koff = b.c_i32(128 * s as i32);
+                    let ka = b.add_i32(kd_rd, koff);
+                    b.load_lds_b32(Opnd::Val(ka))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         for s in 0..4usize {
             b.var_mfma_f16_z(s_vars[s], ones_f16, bias2);
             let ko = b.c_i32(4096 * (s as i32));
@@ -9824,12 +9915,25 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a3 = b.add_i32(kfb[3], ko);
             let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
             let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
-            let koff = b.c_i32(128 * s as i32);
-            let ka = b.add_i32(kd_rd, koff);
-            let kd = b.load_lds_b32(Opnd::Val(ka));
-            let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
-            let sh16 = b.add_i32(cx.g8, c16i);
-            let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
+            let kd = if let Some(v) = kdv {
+                v[s]
+            } else if ablate.contains("kdc") {
+                b.c_i32(0x7f7f7f7f)
+            } else if kd_pre.is_empty() {
+                let koff = b.c_i32(128 * s as i32);
+                let ka = b.add_i32(kd_rd, koff);
+                b.load_lds_b32(Opnd::Val(ka))
+            } else {
+                kd_pre[s]
+            };
+            let (sk0, sk1) = if ablate.contains("kdnoshift") {
+                (kd, kd)
+            } else {
+                let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
+                let sh16 = b.add_i32(cx.g8, c16i);
+                let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
+                (sk0, sk1)
+            };
             let qb0 = if q0_reg { cx.b0 } else { load_q0(b) };
             b.var_mfma_scale(s_vars[s], k8_0, qb0, sk0, sq0m);
             let qb1 = load_q1(b);
@@ -9887,14 +9991,15 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         {
             let w_old_u = b.frag2_lane(bias2, 0);
             let w_old = b.bitcast_i32(w_old_u);
-            let lo16 = b.let_(Op::AndI32(Opnd::Val(w_old), Opnd::Val(cffff)));
+            // rbtrim: v_cvt_f32_f16 reads only the low 16 bits and v_cvt_f16_f32 zero-extends: the masks are redundant
+            let lo16 = if !fmha_t_opt("norbtrim") { w_old } else { b.let_(Op::AndI32(Opnd::Val(w_old), Opnd::Val(cffff))) };
             let b8 = b.let_(Op::CvtF16ToF32(Opnd::Val(lo16)));
             let b_old = b.mul_f32(b8, c8f);
             let tt = b.sub_f32(c_b131, mt);
             let b_new = b.add_f32(b_old, tt);
             let q8 = b.mul_f32(b_new, c0125);
             let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q8)));
-            let h = b.let_(Op::AndI32(Opnd::Val(h_raw), Opnd::Val(cffff)));
+            let h = if !fmha_t_opt("norbtrim") { h_raw } else { b.let_(Op::AndI32(Opnd::Val(h_raw), Opnd::Val(cffff))) };
             let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h)));
             let b_q = b.mul_f32(hq, c8f);
             let d_full = b.sub_f32(b_q, b_old);
@@ -9903,14 +10008,18 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let w_q = b.let_(Op::AddI32(Opnd::Val(h), Opnd::Val(h_sh)));
             let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
             let dupd = b.frag2_dup(delta);
-            for s in 0..4usize {
-                b.var_add_pk(s_vars[s], dupd);
+            if !ablate.contains("rbnos") {
+                for s in 0..4usize {
+                    b.var_add_pk(s_vars[s], dupd);
+                }
             }
             let ex = b.mul_f32(delta, c512f);
             let corr = b.exp2_f32(ex);
             let cd = b.frag2_dup(corr);
-            for e in 0..4usize {
-                b.var_scale_pk(o_vars[e], cd);
+            if !ablate.contains("rbnoo") {
+                for e in 0..4usize {
+                    b.var_scale_pk(o_vars[e], cd);
+                }
             }
             b.var_scale_lane(la, 0, corr);
             let nb = b.frag2(w_new, w_new);
@@ -10000,6 +10109,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let (_i1, slot_cur, slot_nxt, slot_n2, kds_nxt, key_n2, _kds_cur) = ring(b);
         // V phase (the DMA of tile t+2 runs under it, waited for at its end); M phase: PV(this tile) + QK(next tile)
         let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
+        let kdg: Option<Vec<ValueId>> = if kdglob && stage { Some(kd_rows(b, key_n2)) } else { None };
+        let _ = &kdg;
         let w = valu(b, masked);
         if stage {
             stage_end(b, skd, kds_nxt);
@@ -10011,9 +10122,33 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if !no_bar && !nobar1 {
             b.barrier();
         }
-        pv_w(b, slot_cur, &w);
-        if stage {
-            qk(b, slot_nxt, kds_nxt);
+        // kdearly: the four K-scale dwords of the next tile are read at the START of the M phase (right after the barrier), so their lgkmcnt
+        // wait retires behind the PV MFMAs instead of sitting in front of the first QK MFMA (4 VGPR live during PV)
+        let kdg: Option<Vec<ValueId>> = if fmha_t_opt("kdearly") && stage {
+            let kd_rd0 = b.add_i32(kd_cur, kds_nxt);
+            Some(
+                (0..4usize)
+                    .map(|s| {
+                        let koff = b.c_i32(128 * s as i32);
+                        let ka = b.add_i32(kd_rd0, koff);
+                        b.load_lds_b32(Opnd::Val(ka))
+                    })
+                    .collect(),
+            )
+        } else {
+            kdg
+        };
+        if fmha_t_opt("qkfirst") {
+            // QK(i+1) first: S(i) was consumed by the V phase; the PV tr reads then queue behind the QK fragment reads
+            if stage {
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref());
+            }
+            pv_w(b, slot_cur, &w);
+        } else {
+            pv_w(b, slot_cur, &w);
+            if stage {
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref());
+            }
         }
         if !noprio {
             b.set_prio(0);
@@ -10907,14 +11042,50 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let kd_h = b.mul_i32(kvh, dk_hs);
     let kd_base = b.add_i32(kd_b, kd_h);
 
-    let rt = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c255)));
+    // wave-group split (which 4 of the 8 waves form role A): FMHA_OPT split0 = waves 0-3 (default), split1 = even waves, split2 = bit-1 of the wave id.
+    // The group-local thread id (rt) must stay a permutation of 0..255 inside a group: rt = 64 * (index of the wave in its group) + lane.
+    let split_mode = fmha_t_num("split").unwrap_or(0);
+    let c3s = b.c_i32(3);
+    let wave4_s = match split_mode {
+        0 => b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c3s))),
+        1 => b.let_(Op::LshrI32(Opnd::Val(wave), Opnd::Val(c1))),
+        2 => {
+            let lo = b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c1)));
+            let c2s = b.c_i32(2);
+            let hi0 = b.let_(Op::LshrI32(Opnd::Val(wave), Opnd::Val(c2s)));
+            let hi = b.shl_i32(hi0, c1);
+            b.add_i32(lo, hi)
+        }
+        _ => b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c3s))),
+    };
+    let rt = if split_mode == 0 {
+        b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c255)))
+    } else {
+        let c63s = b.c_i32(63);
+        let lane_s = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c63s)));
+        let c6s = b.c_i32(6);
+        let w64 = b.shl_i32(wave4_s, c6s);
+        b.add_i32(w64, lane_s)
+    };
     let rt_row = b.let_(Op::LshrI32(Opnd::Val(rt), Opnd::Val(c1)));
     let rt_half = b.let_(Op::AndI32(Opnd::Val(rt), Opnd::Val(c1)));
     let rt_half64 = b.shl_i32(rt_half, c6);
     let pitch_c = b.c_i32(fmha_t_pitch());
     let rt_rowp = b.mul_i32(rt_row, pitch_c);
     let rt64 = b.add_i32(rt_rowp, rt_half64);
-    let is_a = b.cmp_lt_i32(wave, c4);
+    let is_a = match split_mode {
+        1 => {
+            let lo = b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c1)));
+            b.cmp_lt_i32(lo, c1)
+        }
+        2 => {
+            let c1b = b.c_i32(1);
+            let sh = b.let_(Op::LshrI32(Opnd::Val(wave), Opnd::Val(c1b)));
+            let lo = b.let_(Op::AndI32(Opnd::Val(sh), Opnd::Val(c1b)));
+            b.cmp_lt_i32(lo, c1b)
+        }
+        _ => b.cmp_lt_i32(wave, c4),
+    };
 
     // transposing-read lane address for A' = V^T (key of byte b: 16 r + 8 (i/4) + 4 g + i % 4):
     //   key_part = 8 * ((M & 15) >> 3) + 4 g + ((M >> 1) & 3); col_part = 16 * ((M >> 4) & 1) + 8 * (M & 1)
@@ -10963,7 +11134,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let cm1k = b.c_i32(-1);
     let kv_last = b.add_i32(kv_len, cm1k);
     let g4 = b.shl_i32(pblk, c2);
-    let wave4 = b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c3)));
+    let wave4 = wave4_s;
     let mut kfx: Vec<ValueId> = Vec::new();
     let mut trx: Vec<ValueId> = Vec::new();
     let mut swzw: Vec<ValueId> = Vec::new();
@@ -11271,6 +11442,105 @@ fn sched_mfma_valu_kernel(name: &str, lanes: u8) -> Function {
     b.finish()
 }
 
+/// Cross-wave co-issue probe: waves 0-3 run an independent-accumulator scaled-MFMA loop, waves 4-7 a VALU (fma) loop, so each SIMD
+/// has one wave of each kind. mode 0 = both, 1 = MFMA waves only, 2 = VALU waves only (the other role skips its loop).
+fn sched_coissue_kernel(name: &str, mode: u8, kind: u8) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c64 = b.c_i32(64);
+    let c6 = b.c_i32(6);
+    let c4 = b.c_i32(4);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let is_mfma = b.cmp_lt_i32(wave, c4);
+    let off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, off);
+    b.begin_if(Opnd::Val(is_mfma));
+    if mode != 2 {
+        let ones = b.c_i32(0x38383838_u32 as i32);
+        let f4 = b.frag4(ones, ones, ones, ones);
+        let a8 = b.cat_frag8(f4, f4);
+        let twos = b.c_i32(0x40404040_u32 as i32);
+        let f4b = b.frag4(twos, twos, twos, twos);
+        let b8 = b.cat_frag8(f4b, f4b);
+        let zero = b.frag_zero(DType::Frag16);
+        let vars = b.begin_loop(&[
+            (DType::I32, Opnd::Val(c0)),
+            (DType::Frag16, Opnd::Val(zero)),
+            (DType::Frag16, Opnd::Val(zero)),
+            (DType::Frag16, Opnd::Val(zero)),
+            (DType::Frag16, Opnd::Val(zero)),
+        ]);
+        for k in 1..5 {
+            b.var_mfma_scale(vars[k], a8, b8, 127, 127);
+        }
+        sched_end_loop(&mut b, vars[0], n);
+        for k in 1..5usize {
+            let l = b.frag16_lane(vars[k], 0);
+            let x = b.bitcast_f32(l);
+            b.store_f32(row, 4 * k as u32, x);
+        }
+    }
+    b.else_();
+    if mode != 1 {
+        let one = b.c_f32(1.0001);
+        let two = b.c_f32(0.5);
+        let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0))];
+        for k in 0..16 {
+            let f = b.c_f32(1.0 + k as f32);
+            let fi = b.bitcast_i32(f);
+            inits.push((DType::I32, Opnd::Val(fi)));
+        }
+        let vars = b.begin_loop(&inits);
+        let c4s = b.c_i32(4);
+        let cmk = b.c_i32(0x0007_0007);
+        let lut_lo = b.c_i32(i32::from_le_bytes([0, 6, 9, 11]));
+        let lut_hi = b.c_i32(i32::from_le_bytes([11, 10, 7, 3]));
+        let one_f = b.c_f32(1.0);
+        for k in 0..16usize {
+            let mut x = b.bitcast_f32(vars[1 + k]);
+            if kind == 0 {
+                for _ in 0..4 {
+                    let m = b.mul_f32(x, one);
+                    x = b.add_f32(m, two);
+                }
+            } else {
+                // the softmax conversion recipe of the FMHA kernels: pknorm pair, LUT correction (shift/mask/perm/pk_sub), fp8 pack
+                let y = b.add_f32(x, two);
+                let u = b.cvt_pknorm_pair(x, y);
+                let s1 = b.let_(Op::LshrI32(Opnd::Val(u), Opnd::Val(c4s)));
+                let s2 = b.let_(Op::AndI32(Opnd::Val(s1), Opnd::Val(cmk)));
+                let pm = b.perm_b32(lut_hi, lut_lo, s2);
+                let w = b.pk_sub_u16(u, pm);
+                let wd = b.cvt_p8x4_from_u16(w, w, one_f);
+                x = b.bitcast_f32(wd);
+            }
+            let xi = b.bitcast_i32(x);
+            b.set_var(vars[1 + k], xi);
+        }
+        sched_end_loop(&mut b, vars[0], n);
+        for k in 0..16usize {
+            let x = b.bitcast_f32(vars[1 + k]);
+            b.store_f32(row, 4 * k as u32, x);
+        }
+    }
+    b.end_if();
+    b.finish()
+}
+pub fn sched_coissue_both() -> Function {
+    sched_coissue_kernel("sched_coissue_both", 0, 0)
+}
+pub fn sched_coissue_mfma() -> Function {
+    sched_coissue_kernel("sched_coissue_mfma", 1, 0)
+}
+pub fn sched_coissue_valu() -> Function {
+    sched_coissue_kernel("sched_coissue_valu", 2, 0)
+}
+pub fn sched_coissue_cboth() -> Function {
+    sched_coissue_kernel("sched_coissue_cboth", 0, 1)
+}
+pub fn sched_coissue_cvalu() -> Function {
+    sched_coissue_kernel("sched_coissue_cvalu", 2, 1)
+}
 pub fn sched_mfma_valu16() -> Function {
     sched_mfma_valu_kernel("sched_mfma_valu16", 16)
 }
