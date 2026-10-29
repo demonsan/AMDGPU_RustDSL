@@ -2169,7 +2169,7 @@ impl Lowerer {
     /// `x + k < bound` with a wave-uniform bound: `bound - k > x` with the (uniform) adjusted bound in an SGPR (src0 of
     /// `v_cmp_gt_i32`): no per-lane add of the constant, no v_mov of the bound. Returns the compare's sources.
     fn cmp_lt_scalar_bound(&mut self, a: Opnd, b: Opnd) -> Result<Option<Vec<Src>>, String> {
-        if !opt_on("sgpr") || self.const_bits(a).is_some() {
+        if !opt_on("sbound") || self.const_bits(a).is_some() {
             return Ok(None);
         }
         let Some(sb) = self.sgpr_src(b) else { return Ok(None) };
