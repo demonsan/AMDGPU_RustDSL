@@ -9872,9 +9872,14 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             } else {
                 kd_pre[s]
             };
-            let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
-            let sh16 = b.add_i32(cx.g8, c16i);
-            let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
+            let (sk0, sk1) = if ablate.contains("kdnoshift") {
+                (kd, kd)
+            } else {
+                let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
+                let sh16 = b.add_i32(cx.g8, c16i);
+                let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
+                (sk0, sk1)
+            };
             let qb0 = if q0_reg { cx.b0 } else { load_q0(b) };
             b.var_mfma_scale(s_vars[s], k8_0, qb0, sk0, sq0m);
             let qb1 = load_q1(b);
