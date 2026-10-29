@@ -55,6 +55,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e AMDC_LLC_ARGS="${AMDC_LLC_ARGS:-}" \
     -e AMDC_ADDRFOLD_NODS="${AMDC_ADDRFOLD_NODS:-}" \
     -e AMDC_ADDRFOLD_MODE="${AMDC_ADDRFOLD_MODE:-}" \
+    -e AMDC_ADDRFOLD_LIMIT="${AMDC_ADDRFOLD_LIMIT:-}" \
     -e AMDC_LOOP_ALIGN="${AMDC_LOOP_ALIGN:-}" \
     -e AMDC_LOWER_OPTS="${AMDC_LOWER_OPTS:-}" \
     -e AMDC_DIALECT="${AMDC_DIALECT:-}" \

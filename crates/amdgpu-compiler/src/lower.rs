@@ -519,6 +519,11 @@ impl Lowerer {
         }
         let (kb, ka) = (self.const_bits(b), self.const_bits(a));
         let mode = std::env::var("AMDC_ADDRFOLD_MODE").unwrap_or_default();
+        if let Some(lim) = std::env::var("AMDC_ADDRFOLD_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+            if self.lazy.len() >= lim {
+                return Ok(false);
+            }
+        }
         match (ka, kb) {
             (None, None) if mode == "c" => Ok(false),
             (None, Some(_)) | (Some(_), None) if mode == "n" => Ok(false),
