@@ -101,6 +101,11 @@ pub enum MOp {
     VMfmaScale32x32x64Fp8,
     /// Scaled MFMA with an inline-zero accumulator (no C operand): D = A x B.
     VMfmaScale32x32x64Fp8Z,
+    /// Sparse fp8 MFMA `v_smfmac_f32_16x16x128_fp8_fp8`: the accumulator D (4 dwords) is also
+    /// the input C, A (4 dwords) is the 2:4-compressed sparse operand, B (8 dwords) is dense,
+    /// and srcs[2] is the SRC2 sparse-index register (one dword). Semantics:
+    /// D += A_sparse(16x128, 64 nonzeros/row) x B(128x16).
+    VSmfmac16x16x128Fp8,
     // workgroup LDS
     LdsWriteB32,
     LdsReadB32,
@@ -389,6 +394,27 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                             )),
                             _ => errs.push(format!(
                                 "block {bi} inst {ii}: scaled mfma operand {k} is not a register"
+                            )),
+                        }
+                    }
+                }
+                MOp::VSmfmac16x16x128Fp8 => {
+                    // D/A/B are 4/4/8 dwords; SRC2 is a single dword sparse-index register.
+                    if let Some(d) = inst.dst {
+                        if m.vreg_class(d) != RClass::V4 {
+                            errs.push(format!("block {bi} inst {ii}: smfmac dst must be V4"));
+                        }
+                    }
+                    let want = [RClass::V4, RClass::V8, RClass::V1];
+                    for (k, w) in want.iter().enumerate() {
+                        match inst.srcs.get(k) {
+                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) => errs.push(format!(
+                                "block {bi} inst {ii}: smfmac operand {k} is {:?}, expected {w:?}",
+                                m.vreg_class(*r)
+                            )),
+                            _ => errs.push(format!(
+                                "block {bi} inst {ii}: smfmac operand {k} is not a register"
                             )),
                         }
                     }

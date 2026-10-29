@@ -1523,6 +1523,52 @@ impl Lowerer {
                 );
                 self.val.insert(dst, d);
             }
+            Op::SmfmacFp8_16x16x128 { a, b, idx, c } => {
+                // Sparse MFMA: the accumulator D is also the input C. A (4 dwords) is the
+                // 2:4-compressed operand, B (8 dwords) the dense matrix, idx a single dword.
+                let ra = self.as_v4(*a)?;
+                let rb = self.as_v8(*b)?;
+                let ri = self.as_v1(*idx)?;
+                let c_is_zero = matches!(
+                    c,
+                    Opnd::Val(cv) if matches!(self.defs.get(cv), Some(Op::FragZero { ty: DType::Frag4 }))
+                );
+                let d = if c_is_zero {
+                    let d = self.new_vreg(RClass::V4);
+                    let zero = self.const_vreg(0);
+                    for i in 0..4i64 {
+                        self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(zero).imm(i));
+                    }
+                    d
+                } else {
+                    let rc = self.as_v4(*c)?;
+                    // In-place accumulation when the accumulator has no other use.
+                    let reusable = matches!(
+                        c,
+                        Opnd::Val(cv)
+                            if self.use_counts.get(cv).copied() == Some(1)
+                                && matches!(
+                                    self.defs.get(cv),
+                                    Some(Op::SmfmacFp8_16x16x128 { .. }) | Some(Op::Frag4(..))
+                                )
+                    );
+                    if reusable {
+                        rc
+                    } else {
+                        let d = self.new_vreg(RClass::V4);
+                        self.copy_reg(d, rc)?;
+                        d
+                    }
+                };
+                self.push(
+                    MInst::new(MOp::VSmfmac16x16x128Fp8)
+                        .def(d)
+                        .srcreg(ra)
+                        .srcreg(rb)
+                        .srcreg(ri),
+                );
+                self.val.insert(dst, d);
+            }
             Op::Frag16Lane { frag, index } => {
                 // Any multi-dword fragment: read the requested dword.
                 let f = match frag {

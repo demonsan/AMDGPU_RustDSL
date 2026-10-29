@@ -37,6 +37,7 @@ fn mfma_latency(op: MOp) -> Option<usize> {
         MOp::VMfma16x16x32Fp8 => Some(12),
         MOp::VMfma32x32x16Fp8 => Some(12),
         MOp::VMfmaScale32x32x64Fp8 | MOp::VMfmaScale32x32x64Fp8Z => Some(20),
+        MOp::VSmfmac16x16x128Fp8 => Some(20),
         _ => None,
     }
 }
