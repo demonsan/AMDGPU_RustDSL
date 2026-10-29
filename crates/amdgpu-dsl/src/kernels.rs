@@ -12212,5 +12212,18 @@ pub fn probe_smfmac_ones() -> Function {
     probe_smfmac_dump(&mut b, base, 175, d175);
     let d176 = run4b(&mut b, a_vendor_sw, p4_0, p4_1);
     probe_smfmac_dump(&mut b, base, 176, d176);
+    // ---- can TWO smfmac (hh0 with one idx, hh1 with the other) cover all 128 K? --------------------
+    let chain2 = |b: &mut FnBuilder, a: ValueId, x0: ValueId, x1: ValueId, p0: ValueId, p1: ValueId| -> ValueId {
+        let r = b.smfmac_fp8_16x16x128(a, p0, x0, c0);
+        b.smfmac_fp8_16x16x128(a, p1, x1, r)
+    };
+    let d177 = chain2(&mut b, a_vendor_sw, i01, i23, p4_0, p4_1);
+    probe_smfmac_dump(&mut b, base, 177, d177);
+    let d178 = chain2(&mut b, a_vendor_sw, i23, i01, p4_0, p4_1);
+    probe_smfmac_dump(&mut b, base, 178, d178);
+    let d179 = chain2(&mut b, a_vendor_sw, i01, i23, p1_0, p1_1);
+    probe_smfmac_dump(&mut b, base, 179, d179);
+    let d180 = chain2(&mut b, a_vendor_sw, i23, i01, p1_0, p1_1);
+    probe_smfmac_dump(&mut b, base, 180, d180);
     b.finish()
 }
