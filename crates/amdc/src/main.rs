@@ -95,6 +95,7 @@ fn mir_roundtrip_cmd(args: &[String]) -> ExitCode {
     use amdgpu_compiler::backend::mir_roundtrip::Level;
     let lv = match args.get(3).map(|s| s.as_str()) {
         Some("--level=flags") => Level::Flags,
+        Some("--level=reflag") => Level::Reflag,
         Some("--level=all") => Level::All,
         _ => Level::Identity,
     };

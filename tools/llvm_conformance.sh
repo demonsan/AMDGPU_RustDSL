@@ -91,7 +91,7 @@ if [ "$WHAT" = lit ] || [ "$WHAT" = all ]; then
     make_mirror "$WORK/rt-id-real" "$LLVM_TOOLS"; roundtrip_all "$WORK/rt-id-real" "" "-identity"
     run_lit "$WORK/rt-id-real" "$OUT/lit-identity-check.json" < "$OUT/selected.txt"
     echo -n "identity round trip, original CHECK lines: "; summ "$OUT/lit-identity-check.json"
-    for LV in identity flags all; do
+    for LV in identity flags reflag all; do
         make_mirror "$WORK/rt-$LV" "$WORK/tools-compare"; roundtrip_all "$WORK/rt-$LV" "--level=$LV" "-$LV"
         run_lit "$WORK/rt-$LV" "$OUT/lit-diff-$LV.json" < "$OUT/selected.txt"
         echo -n "level=$LV, differential vs baseline output: "; summ "$OUT/lit-diff-$LV.json"
@@ -112,7 +112,7 @@ imp=[n for n,s in st.items() if s[0]>0 and s[3]==0]
 tot=[sum(s[i] for s in st.values()) for i in range(6)]
 print("tests=%d baseline PASS=%d; fully importable (bodies>0, no opaque instruction)=%d" % (len(b), sum(v=="PASS" for v in b.values()), len(imp)))
 print("instructions=%d parsed=%d opaque=%d bundles=%d lines-changed-by-printing=%d" % (tot[1],tot[2],tot[3],tot[4],tot[5]))
-for name,p in (("identity/original CHECK","lit-identity-check"),("identity/differential","lit-diff-identity"),("flags/differential","lit-diff-flags"),("all/differential","lit-diff-all")):
+for name,p in (("identity/original CHECK","lit-identity-check"),("identity/differential","lit-diff-identity"),("flags/differential","lit-diff-flags"),("reflag/differential","lit-diff-reflag"),("all/differential","lit-diff-all")):
     r=load(o+"/%s.json"%p)
     reg=sorted(n for n in b if b[n]=="PASS" and r.get(n)!="PASS")
     print("%-26s PASS %d/%d ; importable PASS %d/%d ; mismatching: %d" % (name, sum(v=="PASS" for v in r.values()), len(b), sum(r.get(n)=="PASS" for n in imp), len(imp), len(reg)))

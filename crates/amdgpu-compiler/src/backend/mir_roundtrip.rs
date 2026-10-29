@@ -257,10 +257,13 @@ fn parse_at(lines: &[&str], i: usize, st: &mut Stats) -> (Inst, usize) {
 pub enum Level {
     Identity,
     Flags,
+    /// `Flags` followed by our own kill/dead annotation (`llvm_mir::reflag_body`).
+    Reflag,
     All,
 }
 
 fn degrade(i: &mut Inst, lv: Level) {
+    let lv = if lv == Level::Reflag { Level::Flags } else { lv };
     if lv == Level::Identity || i.raw.is_some() {
         return;
     }
@@ -298,6 +301,7 @@ pub fn roundtrip_text_level(text: &str, lv: Level) -> (String, Stats) {
                 i += 1;
             }
             let body = &lines[start..i];
+            let body_start = out.len();
             let mut j = 0;
             while j < body.len() {
                 let (mut inst, nj) = parse_at(body, j, &mut st);
@@ -309,6 +313,11 @@ pub fn roundtrip_text_level(text: &str, lv: Level) -> (String, Stats) {
                 }
                 out.push(printed);
                 j = nj;
+            }
+            if lv == Level::Reflag {
+                let blk: Vec<String> = out[body_start..].iter().flat_map(|s| s.split('\n').map(|x| x.to_string()).collect::<Vec<_>>()).collect();
+                out.truncate(body_start);
+                out.extend(super::llvm_mir::reflag_body(&blk));
             }
         }
     }
