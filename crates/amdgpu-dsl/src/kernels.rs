@@ -9736,10 +9736,14 @@ pub fn probe_smfmac_ones() -> Function {
     //        sum (28) and as a rebuilt fragment (29).
     let acc28 = b.frag4(k1000, k1000, k1000, k1000);
     let s28 = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc28);
-    let v28_0 = b.bitcast_f32(b.frag4_lane(s28, 0));
-    let v28_1 = b.bitcast_f32(b.frag4_lane(s28, 1));
-    let v28_2 = b.bitcast_f32(b.frag4_lane(s28, 2));
-    let v28_3 = b.bitcast_f32(b.frag4_lane(s28, 3));
+    let b28_0 = b.frag4_lane(s28, 0);
+    let b28_1 = b.frag4_lane(s28, 1);
+    let b28_2 = b.frag4_lane(s28, 2);
+    let b28_3 = b.frag4_lane(s28, 3);
+    let v28_0 = b.bitcast_f32(b28_0);
+    let v28_1 = b.bitcast_f32(b28_1);
+    let v28_2 = b.bitcast_f32(b28_2);
+    let v28_3 = b.bitcast_f32(b28_3);
     let sum28a = b.add_f32(v28_0, v28_1);
     let sum28b = b.add_f32(v28_2, v28_3);
     let sum28 = b.add_f32(sum28a, sum28b);
