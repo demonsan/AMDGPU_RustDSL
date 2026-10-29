@@ -8268,7 +8268,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let bias_init = b.frag2(w_init, w_init);
     let sq0m = b.add_i32(cx.sq0, cm9); // Q scales 2^-9: S' = S / 512
     let sq1m = b.add_i32(cx.sq1, cm9);
-    if fmha_t_opt("dbgk") {
+    if fmha_t_opt("dbgk_old") {
         // debug: dump the K and V fragments of tile 0 as read from LDS into the output rows, then stop
         let (k8_0, k8_1) = {
             let kaddr0h = b.add_i32(cx.kf_base, c32v);
@@ -8597,7 +8597,27 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.break_if(Opnd::Val(stop));
     b.end_loop();
 
-    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
+    if fmha_t_opt("dbgk") {
+        // debug: dump the first 64 bytes of this lane's K row (as read from LDS buffer 0 with the kernel's fragment addressing)
+        // into the output instead of the result (use with a single KV tile, SK <= 128)
+        let kaddr0h = b.add_i32(cx.kf_base, c32v);
+        let kd0 = b.load_lds_b128x2(Opnd::Val(cx.kf_base), Opnd::Val(kaddr0h));
+        let ob0 = b.mul_i32(cx.bidx, cx.o_bs);
+        let ob1 = b.mul_i32(cx.hidx, cx.o_hs);
+        let orow = b.mul_i32(cx.row, cx.o_seqs);
+        let ob2 = b.add_i32(ob0, ob1);
+        let ob3 = b.add_i32(ob2, orow);
+        let c4d = b.c_i32(4);
+        let gsel = b.mul_i32(cx.g_bytes8, c4d);
+        let ob4 = b.add_i32(ob3, gsel);
+        let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
+        for q in 0..8u8 {
+            let w = b.frag16_lane(kd0, q);
+            let f = b.bitcast_f32(w);
+            b.store_f32(o_ptr0, 4 * q as u32, f);
+        }
+        return;
+    }    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
     let l0 = b.frag16_lane(la, 0);
     let l_tot = b.bitcast_f32(l0);
     let inv_l = b.rcp_f32(l_tot);
