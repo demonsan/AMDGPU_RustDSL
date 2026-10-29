@@ -107,6 +107,8 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
         MOp::VExpF32 | MOp::VRcpF32 => None,
         o if movable(o) => Some(2),
         // lane write of a fragment (expands to v_mov): the tuple may feed a matrix op next
+        // mask compares write an SGPR pair that the cndmask reads: same 2 wait states as the vcc form (conservative)
+        MOp::VCmpMaskLtI32 | MOp::VCmpMaskGeI32 | MOp::VCmpMaskGtI32 | MOp::VCmpMaskLtF32 => Some(2),
         MOp::VWriteSub | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VCvtPknormU16 => Some(2),
         _ => None,
     }
@@ -117,7 +119,7 @@ fn reads_valu_hazard_operands(op: MOp) -> bool {
     // v_add d; v_readfirstlane s, d; s_mov m0, s; global_load_lds read a stale lane value)
     // SMFMAC: a VALU write of A, B, SRC2 or the accumulator C needs 2 wait states (8 clocks) before the matrix op (CDNA4 ISA 7.6,
     // docs/vendor-spec.md 4.5.2); C is srcs[3] of the MIR op so it is covered like any other source.
-    is_scaled_mfma(op) || matches!(op, MOp::VSmfmac16x16x128Fp8 | MOp::VReadFirstLane | MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
+    is_scaled_mfma(op) || matches!(op, MOp::VCndmaskM | MOp::VSmfmac16x16x128Fp8 | MOp::VReadFirstLane | MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
 }
 
 /// Instructions the scanner must never look past (waits, barriers, nops).
