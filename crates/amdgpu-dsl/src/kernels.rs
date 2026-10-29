@@ -9994,11 +9994,16 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let key0p = b.shl_i32(it, c7d);
         let key_endp = b.add_i32(key0p, c128v);
         let is_tail = b.cmp_lt_i32(cx.kv_len, key_endp);
-        b.begin_if(Opnd::Val(is_tail));
-        iter(b, true, false, role_a);
-        b.else_();
-        iter(b, false, false, role_a);
-        b.end_if();
+        if fmha_t_opt("peelone") {
+            // one shared (always masked) copy of the last tile: smaller code, the mask is a no-op for a full tile
+            iter(b, true, false, role_a);
+        } else {
+            b.begin_if(Opnd::Val(is_tail));
+            iter(b, true, false, role_a);
+            b.else_();
+            iter(b, false, false, role_a);
+            b.end_if();
+        }
     }    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
     let l0 = b.frag16_lane(la, 0);
     let l_tot = b.bitcast_f32(l0);
