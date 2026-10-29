@@ -12185,5 +12185,32 @@ pub fn probe_smfmac_ones() -> Function {
     probe_smfmac_dump(&mut b, base, 169, d169);
     let d170 = run4(&mut b, a3, p2_0, p2_1);
     probe_smfmac_dump(&mut b, base, 170, d170);
+    // ---- byte-coded K pattern: proves the two idx passes cover complementary K positions ------------
+    // one word = [1.0, 1.125, 2.0, 2.5] -> full 128-key sum = 2 lanes * 16 dwords * 6.625 = 212,
+    // the {0,1} byte subset sums 68, the {2,3} subset 144 (distinguishable, half+half would be 136).
+    let v1f = b.c_f32(1.0);
+    let v2f = b.c_f32(1.125);
+    let v3f = b.c_f32(2.0);
+    let v4f = b.c_f32(2.5);
+    let kbw = b.cvt_pk_fp8x4_f32(v1f, v2f, v3f, v4f);
+    let mut w4: Vec<ValueId> = Vec::with_capacity(16);
+    for _ in 0..16usize {
+        w4.push(kbw);
+    }
+    let p4_0 = mk8(&mut b, &w4, 0);
+    let p4_1 = mk8(&mut b, &w4, 1);
+    let l4a = b.mfma_scale_fp8(b_ones, p4_0, zero16r, c127r, c123r);
+    let l4r = b.mfma_scale_fp8(b_ones, p4_1, l4a, c127r, c123r);
+    probe_smfmac_dump16(&mut b, base, 171, l4r);
+    let d172 = run4(&mut b, a_vendor_sw, p4_0, p4_1);
+    probe_smfmac_dump(&mut b, base, 172, d172);
+    let d173 = run4(&mut b, a3, p4_0, p4_1);
+    probe_smfmac_dump(&mut b, base, 173, d173);
+    let d174 = half2(&mut b, a_vendor_sw, i01, p4_0, p4_1);
+    probe_smfmac_dump(&mut b, base, 174, d174);
+    let d175 = half2(&mut b, a_vendor_sw, i23, p4_0, p4_1);
+    probe_smfmac_dump(&mut b, base, 175, d175);
+    let d176 = run4b(&mut b, a_vendor_sw, p4_0, p4_1);
+    probe_smfmac_dump(&mut b, base, 176, d176);
     b.finish()
 }
