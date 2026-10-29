@@ -26,7 +26,12 @@ int main(int argc, char** argv) {
     for (int r = 0; r < 16; ++r) {
         int nb = 0; unsigned first = 0;
         for (int i = 0; i < 256; ++i) if (ho[r * 256 + i] != hi[r * 256 + i]) { if (!nb) first = ho[r * 256 + i]; ++nb; }
-        if (nb) std::printf("run %2d (LDS byte %5d): %3d bad dwords; first got 0x%x => source run %d\n", r, r * 1024, nb, first, (int)((first - 0x10000) / 256));
+        if (nb) {
+            std::printf("run %2d (LDS byte %5d): %3d bad dwords; src dword of LDS dwords 0,1,2,3,4,16,64,255:", r, r * 1024, nb);
+            const int pick[8] = {0, 1, 2, 3, 4, 16, 64, 255};
+            for (int p : pick) { unsigned v = ho[r * 256 + p]; if (v >= 0x10000 && v < 0x10000 + 4096) std::printf(" %d", (int)(v - 0x10000)); else std::printf(" ?"); }
+            std::printf("\n");
+        }
     }
     std::printf("DMA_TILE_PROBE %s (bad=%d of %d)\n", bad ? "FAIL" : "OK", bad, n);
     return bad ? 1 : 0;
