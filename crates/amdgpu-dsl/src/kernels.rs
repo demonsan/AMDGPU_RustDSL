@@ -955,10 +955,11 @@ pub fn probe_dma() -> Function {
     let c1024 = b.c_i32(1024);
     let c2048 = b.c_i32(68096); // above 64 KB
     let c0 = b.c_i32(0);
+    let c36864 = b.c_i32(36864);
 
     let off16 = b.mul_i32(tid, c16);
     let p16 = b.ptr_add(inp, off16);
-    b.load_global_lds(p16, c0, 0, 4);
+    b.load_global_lds(p16, c36864, 0, 4);
     let off4 = b.mul_i32(tid, c4);
     let src4 = b.add_i32(off4, c1024);
     let p4 = b.ptr_add(inp, src4);
@@ -967,7 +968,8 @@ pub fn probe_dma() -> Function {
     b.wait_lds(0);
     b.barrier();
 
-    let v = b.load_lds_b128(Opnd::Val(off16));
+    let ra = b.add_i32(off16, c36864);
+    let v = b.load_lds_b128(Opnd::Val(ra));
     for k in 0..4u8 {
         let w = b.frag4_lane(v, k);
         let f = b.bitcast_f32(w);
