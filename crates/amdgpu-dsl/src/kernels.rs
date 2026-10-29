@@ -1010,7 +1010,7 @@ pub fn probe_dma_tile() -> Function {
     let rowb = b.add_i32(lane_hi, w8);
     let cbytes = b.mul_i32(lane_lo, c16);
     let w1024 = b.shl_i32(wave, c10);
-    let order: Vec<i32> = if std::env::var("PD_REV").is_ok() { vec![3, 2, 1, 0] } else { vec![0, 1, 2, 3] };
+    let order: Vec<i32> = if std::env::var("PD_REV").map(|v| !v.is_empty()).unwrap_or(false) { vec![3, 2, 1, 0] } else { vec![0, 1, 2, 3] };
     for q in order {
         let cq = b.c_i32(32 * q);
         let row = b.add_i32(rowb, cq);
@@ -1026,7 +1026,7 @@ pub fn probe_dma_tile() -> Function {
             b.wait_vm(w);
         }
     }
-    if std::env::var("PD_DUMMY").is_ok() {
+    if std::env::var("PD_DUMMY").map(|v| !v.is_empty()).unwrap_or(false) {
         // a harmless trailing DMA into spare LDS (needs PD_LDS >= 18432)
         let spare = b.c_i32(17408);
         let r0 = b.mul_i32(lane, c16);
@@ -1134,7 +1134,7 @@ pub fn probe_dma_kread() -> Function {
     let w8 = b.shl_i32(wave, c3);
     let rowb = b.add_i32(lane_hi, w8);
     let w1024 = b.shl_i32(wave, c10);
-    if std::env::var("PD_NODMA").is_ok() {
+    if std::env::var("PD_NODMA").map(|v| !v.is_empty()).unwrap_or(false) {
         // reference staging: plain loads + ds_write, row-major (no swizzle)
         let c64s = b.c_i32(64);
         let t64s = b.mul_i32(tid, c64s);
@@ -1192,7 +1192,7 @@ pub fn probe_dma_kread() -> Function {
         }
     }
     b.barrier();
-    if std::env::var("PD_B2").is_ok() {
+    if std::env::var("PD_B2").map(|v| !v.is_empty()).unwrap_or(false) {
         b.wait_vm(0);
         b.barrier();
     }
