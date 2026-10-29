@@ -27,7 +27,11 @@ fn check(asm: &str, kernel: &str, bad: &mut Vec<String>) {
         let ops: Vec<&str> = rest.split(',').collect();
         // sources: everything after the destination (VOPC e32 has the implicit/explicit vcc destination first)
         let srcs: Vec<&str> = ops.iter().skip(1).copied().collect();
-        let sg = sgpr_operands(&srcs);
+        let mut sg = sgpr_operands(&srcs);
+        // vcc read through the constant bus: v_cndmask / v_addc / v_subb (e32) read vcc implicitly or explicitly
+        if (mn.starts_with("v_cndmask") || mn.starts_with("v_addc") || mn.starts_with("v_subb")) && (srcs.iter().any(|s| s.trim() == "vcc") || mn.ends_with("_e32")) {
+            sg.push("vcc".to_string());
+        }
         if sg.len() > 1 {
             bad.push(format!("{kernel}: {l}: {} distinct SGPR sources", sg.len()));
         }

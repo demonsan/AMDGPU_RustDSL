@@ -1504,12 +1504,8 @@ impl Lowerer {
                     DType::Ptr => return Err("select of pointers is not supported".to_string()),
                     _ => self.as_v1(*a)?,
                 };
-                let b_sgpr = if opt_on("sgpr") && self.const_bits(*b).is_none() { self.sgpr_src(*b) } else { None };
+                // (no SGPR operand here: v_cndmask_b32_e32 reads vcc through the constant bus, so an SGPR source would be a second read)
                 let b_src = match (opt_on("imm"), self.const_bits(*b)) {
-                    _ if b_sgpr.is_some() => {
-                        self.touch(&[Src::Reg(b_sgpr.unwrap())]);
-                        Src::Reg(b_sgpr.unwrap())
-                    }
                     (true, Some(k)) if is_inline_const(k) => Src::Imm(k),
                     _ => Src::Reg(self.as_v1(*b)?),
                 };
