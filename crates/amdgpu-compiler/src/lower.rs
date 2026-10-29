@@ -2761,10 +2761,11 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
     }
     let mut spilled = 0usize;
     for _ in 0..count {
-        let (peak, _pos, pblk) = crate::regalloc::pressure_profile(m);
+        let (peak, ppos, pblk) = crate::regalloc::pressure_profile(m);
         if peak <= TARGET {
             break;
         }
+        let pidx = ppos - m.blocks[..pblk].iter().map(|b| b.insts.len()).sum::<usize>();
         let idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
         let mut in_loop = vec![false; m.blocks.len()];
         for (h, l) in &m.loops {
@@ -2804,8 +2805,16 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
                 continue;
             }
             let Some(&(db, di)) = def.get(&r) else { continue };
-            if in_loop[db] || blocks.contains(&pblk) {
-                continue; // a reload at the peak block would not help
+            if in_loop[db] {
+                continue;
+            }
+            if blocks.contains(&pblk) {
+                // the reload temporary lives from the first to the last use in the peak block: it only helps if that range
+                // does not contain the peak position
+                let us: Vec<usize> = m.blocks[pblk].insts.iter().enumerate().filter(|(_, i)| i.uses().contains(&r)).map(|(k, _)| k).collect();
+                if us.first().map_or(false, |f| *f <= pidx) && us.last().map_or(false, |l| *l >= pidx) {
+                    continue;
+                }
             }
             if matches!(m.blocks[db].insts[di].op, MOp::VReadPhys) {
                 continue;
