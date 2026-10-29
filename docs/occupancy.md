@@ -13,6 +13,10 @@ The remaining hypothesis tested here is the mechanism, not the count: our wave i
 (`SQ_WAVE_CYCLES` 16.9M vs 9.5M, `SQ_BUSY_CYCLES` 4.8M vs 2.4M, i.e. the same ~26% issue-busy fraction), so a design
 with <= 128 VGPR per wave would put **4 waves per SIMD** instead of 2 and let the extra waves hide the stalls.
 
+Same-session baseline used for every statement in this document (B=1, H=8, S=SK=2048, 30 iters, GPU 5, LLVM tail):
+ours **292.86 TFLOP/s**, vendor **517.11 TFLOP/s** (matches the README's 292); the kernel is 64 workgroups x 8 waves
+on 64 of 256 CUs = 2 waves/SIMD.
+
 ## 2. Proxy measurement (Verified)
 
 The real kernel cannot run at 4 waves/SIMD at 256 VGPR, so measure the *mechanism* on small-VGPR kernels with the same
