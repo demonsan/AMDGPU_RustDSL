@@ -8,44 +8,9 @@
 
 use amdgpu_compiler::{compile, kernel_by_name, kernel_names};
 
-/// Highest physical register index used by the instruction stream.
-fn max_reg(asm: &str, prefix: char) -> u32 {
-    let bytes = asm.as_bytes();
-    let mut max = 0u32;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] as char == prefix {
-            let prev_ok = i == 0
-                || (!(bytes[i - 1] as char).is_ascii_alphanumeric() && bytes[i - 1] != b'_');
-            if prev_ok {
-                let mut j = i + 1;
-                let mut value = 0u32;
-                let mut has_digit = false;
-                while j < bytes.len() && (bytes[j] as char).is_ascii_digit() {
-                    value = value * 10 + (bytes[j] - b'0') as u32;
-                    j += 1;
-                    has_digit = true;
-                }
-                if has_digit {
-                    max = max.max(value);
-                }
-            }
-        }
-        i += 1;
-    }
-    max
-}
-
-fn declared(asm: &str, directive: &str) -> u32 {
-    for line in asm.lines() {
-        if let Some(rest) = line.trim().strip_prefix(directive) {
-            if let Ok(v) = rest.trim().parse::<u32>() {
-                return v;
-            }
-        }
-    }
-    panic!("directive {directive} missing from assembly");
-}
+// The descriptor/register-accounting invariants live in `register_accounting.rs`, which parses the
+// emitted assembly properly (tuple operands such as `v[4:19]` included) instead of the previous
+// single-register scan that could not see registers used only inside tuples.
 
 #[test]
 fn every_kernel_compiles() {
@@ -60,31 +25,6 @@ fn every_kernel_compiles() {
             compiled.asm.contains(&format!(".symbol: {name}.kd")),
             "kernel {name} metadata missing"
         );
-    }
-}
-
-#[test]
-fn descriptor_covers_all_registers() {
-    // Regression: the allocator once reported only the slots still live at the
-    // end, so the descriptor under-declared the VGPR count and the kernel
-    // faulted on hardware.
-    for name in ["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_pp", "fmha_fwd_hd128_mxfp8_sv"] {
-        let f = kernel_by_name(name).unwrap();
-        let compiled = compile(&f).unwrap();
-        let vgpr_declared = declared(&compiled.asm, ".amdhsa_next_free_vgpr");
-        let sgpr_declared = declared(&compiled.asm, ".amdhsa_next_free_sgpr");
-        let vgpr_used = max_reg(&compiled.asm, 'v');
-        let sgpr_used = max_reg(&compiled.asm, 's');
-        assert!(
-            vgpr_used < vgpr_declared,
-            "{name}: code uses v{vgpr_used} but only {vgpr_declared} VGPRs are declared"
-        );
-        assert!(
-            sgpr_used < sgpr_declared,
-            "{name}: code uses s{sgpr_used} but only {sgpr_declared} SGPRs are declared"
-        );
-        // The kernel descriptor must start 64 bytes after the code it describes.
-        assert!(compiled.asm.contains(".p2align 6\n.amdhsa_kernel"), "{name}: descriptor alignment missing");
     }
 }
 
