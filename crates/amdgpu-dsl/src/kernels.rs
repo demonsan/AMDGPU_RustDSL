@@ -7138,12 +7138,14 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let c16i = b.c_i32(16);
     let c32v = b.c_i32(32);
     let c64 = b.c_i32(64);
-    let c123 = b.c_i32(123);
+    // P scale 2^psh (psh 4: P x 16, rescale when the max grows by more than 8 - psh; psh 2/0 trade small-P precision for rarer rescales)
+    let psh: i32 = if fmha_t_opt("psh0") { 0 } else if fmha_t_opt("psh2") { 2 } else { 4 };
+    let c123 = b.c_i32(127 - psh);
     let c127 = b.c_i32(127);
     let neg_big = b.c_f32(-1.0e30);
     let c128v = b.c_i32(128);
     let pitch = fmha_t_pitch();
-    let c4f = b.c_f32(4.0);
+    let c4f = b.c_f32(psh as f32);
     let c_sixteenth = b.c_f32(0.0625);
     let zero = b.frag_zero(DType::Frag16);
     let m_init = b.bitcast_i32(neg_big);
@@ -7373,7 +7375,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             if lazy {
                 // lazy rescaling: the running max only moves when some lane of the wave grows by
                 // more than 4 (P x 16 then stays below 16 * 2^4 = 256 < 448, the E4M3 maximum)
-                let tau = if fmha_t_opt("lazyinf") { b.c_f32(1.0e9) } else if fmha_t_opt("tau8") { b.c_f32(8.0) } else if fmha_t_opt("tau6") { b.c_f32(6.0) } else { c4f };
+                let tau = if fmha_t_opt("lazyinf") { b.c_f32(1.0e9) } else { b.c_f32((8 - psh) as f32) };
                 let thr = b.add_f32(m_old, tau);
                 let grow = b.cmp_lt_f32(thr, mt);
                 b.begin_if(Opnd::Val(grow));
