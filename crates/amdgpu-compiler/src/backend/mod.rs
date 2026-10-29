@@ -150,7 +150,8 @@ impl TailBackend for LlvmTail {
             lock.start_before.clone()
         };
         let mir = self.export_mir(m, a)?;
-        self.run_llc(&m.name, &mir, &start)
+        let asm = self.run_llc(&m.name, &mir, &start)?;
+        Ok(strip_pad_args(&asm))
     }
 }
 
@@ -241,3 +242,51 @@ pub const ALL_MOPS: &[crate::mir::MOp] = &[
     MOp::SWaitLgkm,
     MOp::SEndpgm,
 ];
+
+/// Remove the dummy padding parameters (`%padN`, added by `llvm_mir::kernarg_ir` to give the IR shell the DSL's
+/// kernarg layout) from the `.amdgpu_metadata` `.args` list. They only exist so that LLVM computes the right
+/// `kernarg_segment_size`; listing them makes `hipModuleLaunchKernel` with `kernelParams` read parameters that the
+/// caller does not have (host crash). `.kernarg_segment_size` and every real argument entry are untouched.
+pub fn strip_pad_args(asm: &str) -> String {
+    let lines: Vec<&str> = asm.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        out.push(l);
+        i += 1;
+        if l.trim() == ".args:" {
+            let base = indent(l);
+            // items: lines starting with "- " at indent > base; the list ends at the first line with indent <= base
+            let mut items: Vec<Vec<&str>> = Vec::new();
+            while i < lines.len() && (lines[i].trim().is_empty() || indent(lines[i]) > base) {
+                if lines[i].trim_start().starts_with("- ") {
+                    items.push(vec![lines[i]]);
+                } else if let Some(last) = items.last_mut() {
+                    last.push(lines[i]);
+                } else {
+                    out.push(lines[i]);
+                }
+                i += 1;
+            }
+            for it in items {
+                let is_pad = it.iter().any(|x| {
+                    let t = x.trim().trim_start_matches("- ");
+                    t.strip_prefix(".name:").map(|v| {
+                        let v = v.trim();
+                        v.strip_prefix("pad").map(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit())).unwrap_or(false)
+                    }).unwrap_or(false)
+                });
+                if !is_pad {
+                    out.extend(it);
+                }
+            }
+        }
+    }
+    let mut s = out.join("\n");
+    if asm.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}

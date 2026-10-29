@@ -240,3 +240,86 @@ fn exported_flags_pass_the_machine_verifier() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+/// The kernel metadata must list exactly the DSL's arguments (no `padN` entries from the IR shell), with their real
+/// offsets and sizes: `hipModuleLaunchKernel(kernelParams)` indexes the caller's parameter array by this list.
+#[test]
+fn metadata_args_match_the_dsl_args_without_padding() {
+    if !llc_available() {
+        return;
+    }
+    let tail = LlvmTail::new();
+    let mut bad = Vec::new();
+    for k in kernel_names() {
+        let f = kernel_by_name(k).unwrap();
+        let (m, _) = compile_mir_alloc(&f).unwrap();
+        let asm = match amdgpu_compiler::compile_with(&f, &tail) {
+            Ok(c) => c.asm,
+            Err(e) => {
+                bad.push(format!("{k}: {e}"));
+                continue;
+            }
+        };
+        // parse the .args list of .amdgpu_metadata
+        let mut args: Vec<(String, i64, i64)> = Vec::new(); // name, offset, size
+        let mut in_args = false;
+        let mut cur: Option<(String, i64, i64)> = None;
+        for l in asm.lines() {
+            let t = l.trim();
+            if t == ".args:" {
+                in_args = true;
+                continue;
+            }
+            if in_args {
+                if t.starts_with("- ") || t.starts_with('.') {
+                    if t.starts_with("- ") {
+                        if let Some(c) = cur.take() {
+                            args.push(c);
+                        }
+                        cur = Some((String::new(), -1, -1));
+                    }
+                    let kv = t.trim_start_matches("- ");
+                    if let Some(c) = cur.as_mut() {
+                        if let Some(v) = kv.strip_prefix(".name:") {
+                            c.0 = v.trim().to_string();
+                        } else if let Some(v) = kv.strip_prefix(".offset:") {
+                            c.1 = v.trim().parse().unwrap_or(-1);
+                        } else if let Some(v) = kv.strip_prefix(".size:") {
+                            c.2 = v.trim().parse().unwrap_or(-1);
+                        }
+                    }
+                    if !t.starts_with("- ") && !t.starts_with(".") {
+                        in_args = false;
+                    }
+                } else if !t.is_empty() {
+                    if let Some(c) = cur.take() {
+                        args.push(c);
+                    }
+                    in_args = false;
+                }
+            }
+        }
+        if let Some(c) = cur.take() {
+            args.push(c);
+        }
+        if args.iter().any(|a| a.0.starts_with("pad")) {
+            bad.push(format!("{k}: metadata lists padding arguments: {:?}", args.iter().filter(|a| a.0.starts_with("pad")).collect::<Vec<_>>()));
+        }
+        let natural: Vec<(i64, i64)> = m
+            .args
+            .iter()
+            .filter(|a| match a.dsl_ty {
+                amdgpu_dsl::DType::Ptr => a.size == 8 && a.offset % 8 == 0,
+                _ => a.size == 4 && a.offset % 4 == 0,
+            })
+            .map(|a| (a.offset as i64, a.size as i64))
+            .collect();
+        let got: Vec<(i64, i64)> = args.iter().map(|a| (a.1, a.2)).collect();
+        if got != natural {
+            bad.push(format!("{k}: metadata args (offset,size) {got:?} != DSL args {natural:?}"));
+        }
+        if got.windows(2).any(|w| w[1].0 < w[0].0 + w[0].1) {
+            bad.push(format!("{k}: metadata arg offsets overlap or go backwards: {got:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
