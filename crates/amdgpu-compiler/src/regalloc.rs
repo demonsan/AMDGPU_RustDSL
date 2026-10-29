@@ -25,16 +25,41 @@ const V_RESERVED: usize = 1;
 const S_RESERVED: usize = 8;
 
 pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
+    // AMDC_RA_FORCE_TWOPHASE=1: use the precise-liveness packing first (testing; it is normally the last resort)
+    if std::env::var("AMDC_RA_FORCE_TWOPHASE").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
+        if let Ok(a) = allocate_two_phase(m) {
+            return Ok(a);
+        }
+    }
     // First try the compact policy. If the kernel runs out of registers only because wide
     // tuples cannot find an aligned hole between scattered singles, retry with the singles
     // packed from the top of the file so the low registers stay available for tuples.
     match allocate_with(m, false) {
-        Err(e) if e.contains("out of VGPRs") => allocate_with(m, true),
+        Err(e) if e.contains("out of VGPRs") => match allocate_with(m, true) {
+            // last resort: offline two-phase packing (wide tuples first, singles into the remaining holes in time)
+            Err(e2) if e2.contains("out of VGPRs") => allocate_two_phase(m).map_err(|e3| if e3.contains("out of VGPRs") { format!("{e2}  ||  {e3}") } else { e3 }),
+            other => other,
+        },
         other => other,
     }
 }
 
 fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String> {
+    allocate_policy(m, Policy::Scan { singles_from_top })
+}
+
+fn allocate_two_phase(m: &MFunction) -> Result<Alloc, String> {
+    allocate_policy(m, Policy::TwoPhase)
+}
+
+#[derive(Clone, Copy)]
+enum Policy {
+    Scan { singles_from_top: bool },
+    TwoPhase,
+}
+
+fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
+    let singles_from_top = matches!(policy, Policy::Scan { singles_from_top: true });
     let n = m.vregs.len();
     let mut start = vec![usize::MAX; n];
     let mut end = vec![0usize; n];
@@ -184,6 +209,11 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
         }
     }
 
+    // --- precise live segments (dword-level liveness, holes included) ------------------------------------------
+    // Used by the two-phase policy: a register may be reused inside a hole of another value's live range. Liveness is
+    // tracked per register DWORD (the scheduler's effects model: lane writes, partial writers, in-place operands), so a
+    // fragment built lane by lane stays live between its lane writes.
+    let segs: Vec<Vec<(usize, usize)>> = if matches!(policy, Policy::TwoPhase) { precise_segments(m, &idx_of, &succs) } else { vec![Vec::new(); n] };
     // --- linear scan -------------------------------------------------
     let mut phys = vec![u32::MAX; n];
     let mut used_v = vec![false; VGPR_COUNT];
@@ -210,6 +240,67 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
     // Highest slot ever handed out, not just the ones still live at the end:
     // the descriptor must cover every register the code touches.
     let mut max_v = 0usize;
+    if matches!(policy, Policy::TwoPhase) {
+        // Per physical register: the (start, end) intervals already placed on it. Wide tuples first (widest, then longest),
+        // every placement checked for overlap in time, so a single may sit in a register between two phases of a tuple.
+        let mut occ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); VGPR_COUNT];
+        for i in 0..V_RESERVED {
+            occ[i].push((0, usize::MAX));
+        }
+        let seg_len = |r: VReg| -> usize { segs[r as usize].iter().map(|(a, b)| b - a + 1).sum() };
+        let mut order: Vec<(usize, usize, VReg, RClass)> = vregs.clone();
+        order.sort_by_key(|x| (std::cmp::Reverse(x.3.dwords()), std::cmp::Reverse(seg_len(x.2)), x.0));
+        for (s, e, r, c) in order {
+            let my: Vec<(usize, usize)> = if segs[r as usize].is_empty() { vec![(s, e)] } else { segs[r as usize].clone() };
+            let width = c.dwords() as usize;
+            let lo = if width == 1 { V_RESERVED } else { width };
+            let mut found = None;
+            let mut i = lo;
+            while i + width <= VGPR_COUNT {
+                if i % width == 0 && (0..width).all(|k| occ[i + k].iter().all(|(os, oe)| my.iter().all(|(ms, me)| *oe < *ms || *me < *os))) {
+                    found = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            let slot = found.ok_or_else(|| {
+                // numeric lower bound: the largest number of dwords live at one position
+                let mut ev: Vec<(usize, i64)> = Vec::new();
+                for (_, _, r2, c2) in &vregs {
+                    // dword-level live segments of the value (not the [first, last] hull)
+                    let sg = &segs[*r2 as usize];
+                    if sg.is_empty() {
+                        continue;
+                    }
+                    for (a, b) in sg {
+                        ev.push((*a, c2.dwords() as i64));
+                        ev.push((b.saturating_add(1), -(c2.dwords() as i64)));
+                    }
+                }
+                ev.sort();
+                let (mut cur, mut peak, mut at) = (V_RESERVED as i64, 0i64, 0usize);
+                for (p, d) in ev {
+                    cur += d;
+                    if cur > peak {
+                        peak = cur;
+                        at = p;
+                    }
+                }
+                format!("out of VGPRs allocating r{r} ({c:?}, live {s}..{e}) in the two-phase packing; peak live dwords {peak} at position {at} (limit {VGPR_COUNT})")
+            })?;
+            for k in 0..width {
+                occ[slot + k].extend(my.iter().copied());
+            }
+            phys[r as usize] = slot as u32;
+            max_v = max_v.max(slot + width);
+        }
+        for (i, o) in occ.iter().enumerate() {
+            if !o.is_empty() {
+                used_v[i] = true;
+            }
+        }
+        vregs = Vec::new();
+    }
     for (s, e, r, c) in vregs {
         active.retain(|(ae, ar, ac)| {
             if *ae < s {
@@ -505,4 +596,235 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
         }
     }
     Ok(())
+}
+/// Per virtual register (canonical tuple): the instruction-position segments in which any of its dwords is live.
+fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) -> Vec<Vec<(usize, usize)>> {
+    use crate::sched::effects::{effects, Slot, SCC, VCC};
+    let n = m.vregs.len();
+    let nb = m.blocks.len();
+    let keep = |s: &Slot| *s != VCC && *s != SCC;
+    // reads / writes per instruction (slots), computed once
+    let mut rw: Vec<Vec<(Vec<Slot>, Vec<Slot>)>> = Vec::with_capacity(nb);
+    for b in &m.blocks {
+        rw.push(
+            b.insts
+                .iter()
+                .map(|i| {
+                    let e = effects(m, i);
+                    (e.reads.into_iter().filter(keep).collect(), e.writes.into_iter().filter(keep).collect())
+                })
+                .collect(),
+        );
+    }
+    let mut gen: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    let mut kill: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    for bi in 0..nb {
+        for (r, w) in &rw[bi] {
+            for s in r {
+                if !kill[bi].contains(s) {
+                    gen[bi].insert(*s);
+                }
+            }
+            for s in w {
+                kill[bi].insert(*s);
+            }
+        }
+    }
+    let mut live_in: Vec<HashSet<Slot>> = gen.clone();
+    let mut live_out: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    loop {
+        let mut changed = false;
+        for bi in (0..nb).rev() {
+            let mut out: HashSet<Slot> = HashSet::new();
+            for s in &succs[bi] {
+                out.extend(live_in[*s].iter().copied());
+            }
+            let mut inn = gen[bi].clone();
+            for s in &out {
+                if !kill[bi].contains(s) {
+                    inn.insert(*s);
+                }
+            }
+            if inn != live_in[bi] || out != live_out[bi] {
+                live_in[bi] = inn;
+                live_out[bi] = out;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Pruned liveness: a slot is only live where some definition of it can reach (forward may-defined sets). A slot that is
+    // live without any reaching definition is a read of an uninitialised value on an infeasible path (for example two
+    // correlated `if`s); keeping it live would only inflate the pressure.
+    let mut def_in: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    let mut def_out: Vec<HashSet<Slot>> = kill.clone();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    for (b, ss) in succs.iter().enumerate() {
+        for &s in ss {
+            preds[s].push(b);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for bi in 0..nb {
+            let mut inn: HashSet<Slot> = HashSet::new();
+            for &p in &preds[bi] {
+                inn.extend(def_out[p].iter().copied());
+            }
+            let mut out = inn.clone();
+            out.extend(kill[bi].iter().copied());
+            if inn != def_in[bi] || out != def_out[bi] {
+                def_in[bi] = inn;
+                def_out[bi] = out;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for bi in 0..nb {
+        live_in[bi].retain(|s| def_in[bi].contains(s));
+        live_out[bi].retain(|s| def_out[bi].contains(s));
+    }
+    let mut raw: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    for (bi, b) in m.blocks.iter().enumerate() {
+        if b.insts.is_empty() {
+            continue;
+        }
+        let first = idx_of[bi][0];
+        let last = *idx_of[bi].last().unwrap();
+        let mut open: std::collections::HashMap<Slot, usize> = std::collections::HashMap::new();
+        for s in &live_out[bi] {
+            open.insert(*s, last);
+        }
+        for i in (0..b.insts.len()).rev() {
+            let at = idx_of[bi][i];
+            let (r, w) = &rw[bi][i];
+            for s in w {
+                let v = (*s / 16) as usize;
+                match open.remove(s) {
+                    Some(e) => raw[v].push((at, e)),
+                    None => raw[v].push((at, at)),
+                }
+            }
+            for s in r {
+                open.entry(*s).or_insert(at);
+                // a use keeps the position itself occupied even when the slot is also written here
+                raw[(*s / 16) as usize].push((at, at));
+            }
+        }
+        for (s, e) in open {
+            if def_in[bi].contains(&s) {
+                raw[(s / 16) as usize].push((first, e));
+            } else {
+                // a use with no reaching definition: keep just the use position
+                raw[(s / 16) as usize].push((e, e));
+            }
+        }
+    }
+    // merge overlapping / touching segments per vreg
+    for segs in raw.iter_mut() {
+        segs.sort();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(segs.len());
+        for &(a, b) in segs.iter() {
+            match merged.last_mut() {
+                Some(l) if a <= l.1 + 1 => l.1 = l.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        *segs = merged;
+    }
+    raw
+}
+/// Peak vector-register pressure (dwords, v0 included) from dword-level liveness: (peak, linear position, block index).
+pub fn pressure_profile(m: &MFunction) -> (u32, usize, usize) {
+    let mut idx_of: Vec<Vec<usize>> = Vec::with_capacity(m.blocks.len());
+    let mut next = 0usize;
+    for b in &m.blocks {
+        let mut v = Vec::with_capacity(b.insts.len());
+        for _ in 0..b.insts.len() {
+            v.push(next);
+            next += 1;
+        }
+        idx_of.push(v);
+    }
+    let label_to_block: std::collections::HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); m.blocks.len()];
+    for (i, b) in m.blocks.iter().enumerate() {
+        match &b.term {
+            Term::Goto(t) => {
+                if let Some(j) = label_to_block.get(t) {
+                    succs[i].push(*j);
+                }
+            }
+            Term::CondGoto { target, fall, .. } => {
+                for t in [target, fall] {
+                    if let Some(j) = label_to_block.get(t) {
+                        succs[i].push(*j);
+                    }
+                }
+            }
+            Term::Endpgm => {}
+        }
+    }
+    let segs = precise_segments(m, &idx_of, &succs);
+    let mut ev: Vec<(usize, i64)> = Vec::new();
+    for (r, sg) in segs.iter().enumerate() {
+        let c = m.vreg_class(r as VReg);
+        if !c.is_vector() || m.alias.contains_key(&(r as VReg)) {
+            continue;
+        }
+        for (a, b) in sg {
+            ev.push((*a, c.dwords() as i64));
+            ev.push((b.saturating_add(1), -(c.dwords() as i64)));
+        }
+    }
+    ev.sort();
+    let (mut cur, mut peak, mut at) = (V_RESERVED as i64, 0i64, 0usize);
+    for (p, d) in ev {
+        cur += d;
+        if cur > peak {
+            peak = cur;
+            at = p;
+        }
+    }
+    let blk = idx_of.iter().position(|v| v.last().map_or(false, |l| *l >= at) && v.first().map_or(false, |f| *f <= at)).unwrap_or(0);
+    (peak as u32, at, blk)
+}
+/// The vregs live at linear position `pos` (dword-level liveness), for diagnostics.
+pub fn live_at(m: &MFunction, pos: usize) -> Vec<VReg> {
+    let mut idx_of: Vec<Vec<usize>> = Vec::new();
+    let mut next = 0usize;
+    for b in &m.blocks {
+        let mut v = Vec::new();
+        for _ in 0..b.insts.len() {
+            v.push(next);
+            next += 1;
+        }
+        idx_of.push(v);
+    }
+    let label_to_block: std::collections::HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); m.blocks.len()];
+    for (i, b) in m.blocks.iter().enumerate() {
+        match &b.term {
+            Term::Goto(t) => {
+                if let Some(j) = label_to_block.get(t) {
+                    succs[i].push(*j);
+                }
+            }
+            Term::CondGoto { target, fall, .. } => {
+                for t in [target, fall] {
+                    if let Some(j) = label_to_block.get(t) {
+                        succs[i].push(*j);
+                    }
+                }
+            }
+            Term::Endpgm => {}
+        }
+    }
+    let segs = precise_segments(m, &idx_of, &succs);
+    segs.iter().enumerate().filter(|(r, sg)| m.vreg_class(*r as VReg).is_vector() && !m.alias.contains_key(&(*r as VReg)) && sg.iter().any(|(a, b)| *a <= pos && pos <= *b)).map(|(r, _)| r as VReg).collect()
 }

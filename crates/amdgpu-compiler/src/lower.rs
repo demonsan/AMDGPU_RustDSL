@@ -252,6 +252,9 @@ impl Lowerer {
         }
         // rematerialise loop-invariant constants next to their loop uses (register pressure; `remat1/2/3` = at most 1/2/any
         // number of loop blocks using the constant)
+        let spill_n: usize = std::env::var("AMDC_RA_LDS_SPILL").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0).unwrap_or_else(|| {
+            ["ldsspill8", "ldsspill16", "ldsspill24", "ldsspill32", "ldsspill48", "ldsspill64"].iter().find(|n| opt_on(n)).map(|n| n.trim_start_matches("ldsspill").parse().unwrap()).unwrap_or(0)
+        });
         if opt_on("remat4") {
             remat_exprs(&mut self.mir);
         } else {
@@ -260,6 +263,13 @@ impl Lowerer {
                     remat_consts(&mut self.mir, k);
                     break;
                 }
+            }
+        }
+        if spill_n > 0 {
+            let (n, bytes) = lds_spill(&mut self.mir, spill_n);
+            if n > 0 {
+                eprintln!("lds-spill: {n} loop-invariant values moved to LDS, {} bytes per value per workgroup, {bytes} bytes total", bytes / (n.max(1) as u32));
+                crate::sched::waits::insert_waits(&mut self.mir);
             }
         }
         coalesce(&mut self.mir);
@@ -2718,4 +2728,149 @@ fn remat_exprs(m: &mut MFunction) {
             }
         }
     }
+}
+/// LDS spilling of loop-invariant V1 values (last-resort register relief, `ldsspillN` / `AMDC_RA_LDS_SPILL=N`).
+/// The N invariants that are used in the fewest loop blocks are stored once, right after their definition, into a per-wave
+/// LDS area (`ds_write_b32 [lane*4 + wave_base] offset:k*256`, one 256-byte row per value so consecutive lanes hit consecutive
+/// banks) and reloaded with `ds_read_b32` into a short-lived temporary before the first use in every loop block. The value
+/// then only lives from its definition to its last use outside loops. Costs one DS read per (value, loop block) per
+/// iteration and `256 * values * waves` bytes of LDS (appended after the kernel's own LDS). Returns (#values, total bytes).
+fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
+    const TARGET: u32 = 236; // stop when the true peak is this low (alignment / reserved registers need slack)
+    let nwaves = (m.workgroup_size / 64).max(1);
+    let base = (m.lds_bytes + 15) / 16 * 16;
+    let newv = |m: &mut MFunction| -> VReg {
+        let r = m.vregs.len() as VReg;
+        m.vregs.push(RClass::V1);
+        r
+    };
+    let (tid, wave, creg, wbase, lane, lane4, a1, addr) = (newv(m), newv(m), newv(m), newv(m), newv(m), newv(m), newv(m), newv(m));
+    let pre = vec![
+        MInst::new(MOp::VReadPhys).def(tid).imm(0),
+        MInst::new(MOp::VLshrB32).def(wave).src(Src::Imm(6)).srcreg(tid),
+        MInst::new(MOp::VMovB32).def(creg).imm(0), // patched below: bytes per wave
+        MInst::new(MOp::VMulLoU32).def(wbase).srcreg(wave).srcreg(creg),
+        MInst::new(MOp::VAndB32).def(lane).src(Src::Imm(63)).srcreg(tid),
+        MInst::new(MOp::VLshlB32).def(lane4).src(Src::Imm(2)).srcreg(lane),
+        MInst::new(MOp::VAddU32).def(a1).srcreg(wbase).srcreg(lane4),
+        MInst::new(MOp::VAddU32).def(addr).src(Src::Imm(base as i64)).srcreg(a1),
+    ];
+    let npre = pre.len();
+    for (k, p) in pre.into_iter().enumerate() {
+        m.blocks[0].insts.insert(k, p);
+    }
+    let mut spilled = 0usize;
+    for _ in 0..count {
+        let (peak, ppos, pblk) = crate::regalloc::pressure_profile(m);
+        if peak <= TARGET {
+            break;
+        }
+        let pidx = ppos - m.blocks[..pblk].iter().map(|b| b.insts.len()).sum::<usize>();
+        let idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+        let mut in_loop = vec![false; m.blocks.len()];
+        for (h, l) in &m.loops {
+            if let (Some(&hi), Some(&li)) = (idx.get(h), idx.get(l)) {
+                for b in hi.min(li)..=hi.max(li) {
+                    in_loop[b] = true;
+                }
+            }
+        }
+        let mut ndefs: HashMap<VReg, u32> = HashMap::new();
+        let mut def: HashMap<VReg, (usize, usize)> = HashMap::new();
+        for (bi, b) in m.blocks.iter().enumerate() {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                if let Some(d) = inst.dst {
+                    *ndefs.entry(d).or_insert(0) += 1;
+                    def.insert(d, (bi, ii));
+                }
+            }
+        }
+        let mut loop_blocks: HashMap<VReg, std::collections::BTreeSet<usize>> = HashMap::new();
+        let mut loop_uses: HashMap<VReg, usize> = HashMap::new();
+        for (bi, b) in m.blocks.iter().enumerate() {
+            if !in_loop[bi] {
+                continue;
+            }
+            for inst in &b.insts {
+                for r in inst.uses() {
+                    loop_blocks.entry(r).or_default().insert(bi);
+                    *loop_uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut cands: Vec<(usize, usize, VReg)> = Vec::new();
+        for (r, blocks) in &loop_blocks {
+            let r = *r;
+            if r == addr || m.vreg_class(r) != RClass::V1 || m.alias.contains_key(&r) || ndefs.get(&r) != Some(&1) {
+                continue;
+            }
+            let Some(&(db, di)) = def.get(&r) else { continue };
+            if in_loop[db] {
+                continue;
+            }
+            if blocks.contains(&pblk) {
+                // the reload temporary lives from the first to the last use in the peak block: it only helps if that range
+                // does not contain the peak position
+                let us: Vec<usize> = m.blocks[pblk].insts.iter().enumerate().filter(|(_, i)| i.uses().contains(&r)).map(|(k, _)| k).collect();
+                // (straddling values are reloaded before each use instead: per_use below; costs one DS read per use)
+            }
+            if matches!(m.blocks[db].insts[di].op, MOp::VReadPhys) {
+                continue;
+            }
+            cands.push((blocks.len(), loop_uses[&r], r));
+        }
+        cands.sort();
+        let Some(&(_, _, v)) = cands.first() else { break };
+        let off = (spilled as i64) * 256;
+        let (db, di) = def[&v];
+        m.blocks[db].insts.insert(di + 1, MInst::new(MOp::LdsWriteB32).srcreg(addr).srcreg(v).imm(off));
+        let blocks: Vec<usize> = loop_blocks[&v].iter().copied().collect();
+        for bi in blocks {
+            if bi == pblk {
+                let us: Vec<usize> = m.blocks[bi].insts.iter().enumerate().filter(|(_, i)| i.uses().contains(&v)).map(|(k, _)| k).collect();
+                if us.first().map_or(false, |f| *f <= pidx) && us.last().map_or(false, |l| *l >= pidx) {
+                    // per-use reloads: each temporary lives for one instruction
+                    for k in us.into_iter().rev() {
+                        let t = newv(m);
+                        for s in m.blocks[bi].insts[k].srcs.iter_mut() {
+                            if let Src::Reg(r) = s {
+                                if *r == v {
+                                    *r = t;
+                                }
+                            }
+                        }
+                        m.blocks[bi].insts.insert(k, MInst::new(MOp::LdsReadB32).def(t).srcreg(addr).imm(off));
+                    }
+                    continue;
+                }
+            }
+            let t = newv(m);
+            let b = &mut m.blocks[bi];
+            let first = b.insts.iter().position(|i| i.srcs.iter().any(|s| matches!(s, Src::Reg(r) if *r == v))).unwrap();
+            for inst in b.insts.iter_mut().skip(first) {
+                for s in inst.srcs.iter_mut() {
+                    if let Src::Reg(r) = s {
+                        if *r == v {
+                            *r = t;
+                        }
+                    }
+                }
+            }
+            b.insts.insert(first, MInst::new(MOp::LdsReadB32).def(t).srcreg(addr).imm(off));
+        }
+        spilled += 1;
+    }
+    let _ = npre;
+    if spilled == 0 {
+        // nothing spilled: remove the address prologue again
+        for _ in 0..npre {
+            m.blocks[0].insts.remove(0);
+        }
+        return (0, 0);
+    }
+    let area = (spilled as u32) * 256;
+    m.blocks[0].insts[2].imm = area as i64;
+    let total = area * nwaves;
+    m.lds_bytes = base + total;
+    (spilled, total)
 }
