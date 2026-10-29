@@ -148,3 +148,12 @@ fn matrix_sequence_equals_the_existing_kernel_path() {
     assert_eq!(k.len(), 7, "expected 2 MFMA + 4 SMFMAC + 1 add (operand moves filtered out):\n{}", show(&k));
     assert_eq!(safe, k, "safe-DSL sequence differs from the kernel path:\n--- safe\n{}\n--- kernel\n{}", show(&safe), show(&k));
 }
+/// Prints the allocated assembly of the phase (for docs/safe-asm-design.md): `cargo test -p amdgpu-safeasm --test pv_phase show -- --nocapture`.
+#[test]
+fn show_phase_asm() {
+    let mut s = Seq::new();
+    pv_rowsum_phase(&mut s);
+    let asm = s.to_asm().unwrap();
+    let body: Vec<&str> = asm.lines().skip_while(|l| !l.starts_with("safeasm_seq:")).skip(1).take_while(|l| !l.contains("s_endpgm")).collect();
+    eprintln!("SHOW\n{}", body.join("\n"));
+}
