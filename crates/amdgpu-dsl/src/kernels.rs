@@ -1183,7 +1183,8 @@ pub fn probe_dma_kread() -> Function {
     let jrow = b.mul_i32(rowk, c128);
     let js1 = b.let_(Op::LshrI32(Opnd::Val(rowk), Opnd::Val(c1)));
     let f0 = b.let_(Op::AndI32(Opnd::Val(js1), Opnd::Val(cfm)));
-    let fk = if swz { f0 } else { zero };
+    // PD_SWZ=3: DMA with the 3-bit swizzle but reads WITHOUT it (tests whether the hardware ignores the lane permutation)
+    let fk = if swz && swz_mode != 3 { f0 } else { zero };
     let x = b.xor_i32(g, fk);
     let t64 = b.shl_i32(tid, c6);
     for k in 0..4i32 {
