@@ -7424,7 +7424,6 @@ fn emit_fmha_pp_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     // ---- MFMA phase: O += V^T P^T for the 64 keys `hh` of the V buffer at `tr_cur`, and the
     // scores of the next substep (K from `kbuf`, 32-key tiles s0, s0 + 1) into `s_vars` ----
     let mfma_phase = |b: &mut FnBuilder, p8: ValueId, hh: usize, kbuf: ValueId, s0: usize, kds: [ValueId; 2]| {
-        let kfr = [k_frags(b, kbuf, s0), k_frags(b, kbuf, s0 + 1)];
         if let Some(la) = lacc {
             b.var_mfma_scale(la, ones8, p8, c127, c123);
         }
@@ -7437,18 +7436,13 @@ fn emit_fmha_pp_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
             b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
         }
-        let mut scs: Vec<(ValueId, ValueId)> = Vec::new();
         for sl in 0..2usize {
+            let (k8_0, k8_1) = k_frags(b, kbuf, s0 + sl);
             let sk0 = b.let_(Op::LshrI32(Opnd::Val(kds[sl]), Opnd::Val(cx.g8)));
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kds[sl]), Opnd::Val(sh16)));
-            scs.push((sk0, sk1));
-        }
-        for sl in 0..2usize {
-            b.var_mfma_scale_z(s_vars[sl], kfr[sl].0, cx.b0, scs[sl].0, cx.sq0);
-        }
-        for sl in 0..2usize {
-            b.var_mfma_scale(s_vars[sl], kfr[sl].1, cx.b1, scs[sl].1, cx.sq1);
+            b.var_mfma_scale_z(s_vars[sl], k8_0, cx.b0, sk0, cx.sq0);
+            b.var_mfma_scale(s_vars[sl], k8_1, cx.b1, sk1, cx.sq1);
         }
     };
 
