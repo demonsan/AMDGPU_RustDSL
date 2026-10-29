@@ -9037,11 +9037,10 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (DType::Frag16, Opnd::Val(zero)),     // 8 row sums
         (DType::I32, Opnd::Val(c0)),          // 9 ring index (tile mod 3)
     ];
-    for _ in 0..8 {
-        init_vars.push((DType::I32, Opnd::Val(c0))); // 10..17: B's hh1 P words (4 x fp8 each), carried to the next iteration
-    }
+    let zero8 = b.frag_zero(DType::Frag8);
+    init_vars.push((DType::Frag8, Opnd::Val(zero8))); // 10: B's hh1 P fragment (8 words of 4 x fp8), carried to the next iteration
     if let Some(k0) = kdp0 {
-        init_vars.push((DType::I32, Opnd::Val(k0))); // 18 (group A): K scales of tile it + 1, loaded one iteration ago
+        init_vars.push((DType::I32, Opnd::Val(k0))); // 11 (group A): K scales of tile it + 1, loaded one iteration ago
     }
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
@@ -9055,7 +9054,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let s_vars = [vars[6], vars[7]];
     let la = vars[8];
     let idx = vars[9];
-    let kdp = if role_a { Some(vars[18]) } else { None };
+    let kdp = if role_a { Some(vars[11]) } else { None };
     // deferred completion: the DMA of tile t+1 (issued one iteration ago) must have landed; this iteration's loads may stay in flight
     let n_vm: u8 = if role_a { 5 } else { 4 };
     let no_vmwait = ablate.contains("novmwait");
@@ -9070,7 +9069,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.store_lds_b32(Opnd::Val(a), Opnd::Var(kv));
         }
     };
-    let pw: Vec<_> = (0..8usize).map(|k| vars[10 + k]).collect();
+    let p8v = vars[10];
     // ring: tile t is in slot t mod 3; tile t+1 in i1, tile t+2 (and tile t-1) in i2
     let ring = |b: &mut FnBuilder| -> (ValueId, ValueId, ValueId, ValueId, ValueId, ValueId, ValueId, ValueId, ValueId) {
         let lt2 = b.cmp_lt_i32(idx, c2);
@@ -9124,9 +9123,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             return;
         }
         let tr_b = b.add_i32(cx.tr_base, slot);
-        // read the P words out of their loop variables first (a frag8 built directly from variables was suspect)
-        let pwv: Vec<ValueId> = (0..8usize).map(|k| b.add_i32(Opnd::Var(pw[k]), c0)).collect();
-        let p8 = b.frag8(pwv[0], pwv[1], pwv[2], pwv[3], pwv[4], pwv[5], pwv[6], pwv[7]);
+        let p8 = Opnd::Var(p8v);
         b.var_mfma_scale(la, ones8, p8, c127, c123);
         for e in 0..4usize {
             let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
@@ -9249,11 +9246,12 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 } else {
                     b.cvt_pknorm_p8x4(xs[4 * m], xs[4 * m + 1], xs[4 * m + 2], xs[4 * m + 3], one_f)
                 };
-                if store {
-                    b.set_var(pw[4 * sl + m], word);
-                }
                 words_out.push(word);
             }
+        }
+        if store {
+            let pf = b.frag8(words_out[0], words_out[1], words_out[2], words_out[3], words_out[4], words_out[5], words_out[6], words_out[7]);
+            b.set_var(p8v, pf);
         }
         words_out
     };
