@@ -145,6 +145,6 @@ fn matrix_sequence_equals_the_existing_kernel_path() {
     let safe = normalise(&m, s.insts());
 
     let show = |n: &Norm| n.iter().map(|(o, d, s)| format!("{o:?} d={d:?} s={s:?}")).collect::<Vec<_>>().join("\n");
-    assert_eq!(k.len(), 8, "expected 2 MFMA + 4 SMFMAC + 1 add (+ the operand moves filtered):\n{}", show(&k));
+    assert_eq!(k.len(), 7, "expected 2 MFMA + 4 SMFMAC + 1 add (operand moves filtered out):\n{}", show(&k));
     assert_eq!(safe, k, "safe-DSL sequence differs from the kernel path:\n--- safe\n{}\n--- kernel\n{}", show(&safe), show(&k));
 }
