@@ -7623,7 +7623,21 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.store_lds_b128(Opnd::Val(a), Opnd::Val(*d));
         }
     };
+    let kdpf = fmha_t_opt("kdpf");
+    let kd_load = |b: &mut FnBuilder, key0: ValueId, s: i32| -> ValueId {
+        let kkey0 = b.add_i32(key0, cx.j);
+        let kcs = b.c_i32(32 * s);
+        let kkey_raw = b.add_i32(kkey0, kcs);
+        let kk_ok = b.cmp_lt_i32(kkey_raw, cx.kv_len);
+        let kkey = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kk_ok), a: Opnd::Val(kkey_raw), b: Opnd::Val(cx.kv_last) });
+        let kd_row = b.mul_i32(kkey, hq4);
+        let kd_off = b.add_i32(kd_row, cx.kd_base);
+        let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+        let kd_raw = b.load_f32(kd_ptr, 0);
+        b.bitcast_i32(kd_raw)
+    };
     let key_first = b.c_i32(0);
+    let kd_first: Vec<ValueId> = if kdpf { (0..4i32).map(|s| kd_load(b, key_first, s)).collect() } else { Vec::new() };
     let first = stage_loads(b, key_first);
     stage_stores(b, sdst, &first);
     b.wait_lds(0);
@@ -7639,7 +7653,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let bias_init = b.frag2(w_init, w_init);
     let sq0m = b.add_i32(cx.sq0, cm9); // Q scales 2^-9: S' = S / 512
     let sq1m = b.add_i32(cx.sq1, cm9);
-    let vars = b.begin_loop(&[
+    let mut init_vars = vec![
         (DType::I32, Opnd::Val(c0)),
         (DType::Frag2, Opnd::Val(bias_init)),
         (DType::Frag16, Opnd::Val(zero)),
@@ -7649,7 +7663,13 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (DType::Frag16, Opnd::Val(zero)),
         (DType::Frag16, Opnd::Val(zero)),
         (DType::Frag16, Opnd::Val(zero)),
-    ]);
+    ];
+    if kdpf {
+        for s in 0..4usize {
+            init_vars.push((DType::I32, Opnd::Val(kd_first[s])));
+        }
+    }
+    let vars = b.begin_loop(&init_vars);
     let it = vars[0];
     let bias2 = vars[1];
     let o_vars = [vars[2], vars[3], vars[4], vars[5]];
@@ -7662,6 +7682,8 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let nxt = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_next), a: Opnd::Val(it_p1), b: it.into() });
     let key_next = b.shl_i32(nxt, c7);
     let pre = stage_loads(b, key_next);
+    // K scales of the next tile, requested now and consumed one iteration later
+    let kd_next: Vec<ValueId> = if kdpf { (0..4i32).map(|s| kd_load(b, key_next, s)).collect() } else { Vec::new() };
 
     let compute = |b: &mut FnBuilder, masked: bool| {
         for hh in 0..2usize {
@@ -7676,19 +7698,10 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let kaddr1 = b.add_i32(kaddr0, c64);
                 let kaddr1h = b.add_i32(kaddr1, c32v);
                 let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
-                let kkey0 = b.add_i32(key0, cx.j);
-                let kcs = b.c_i32(32 * s as i32);
-                let kkey_raw = b.add_i32(kkey0, kcs);
-                let kk_ok = b.cmp_lt_i32(kkey_raw, cx.kv_len);
-                let kkey = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kk_ok), a: Opnd::Val(kkey_raw), b: Opnd::Val(cx.kv_last) });
-                let kd_row = b.mul_i32(kkey, hq4);
-                let kd_off = b.add_i32(kd_row, cx.kd_base);
-                let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
-                let kd_raw = b.load_f32(kd_ptr, 0);
-                let kd = b.bitcast_i32(kd_raw);
-                let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
+                let kd = if kdpf { Opnd::Var(vars[9 + s]) } else { Opnd::Val(kd_load(b, key0, s as i32)) };
+                let sk0 = b.let_(Op::LshrI32(kd, Opnd::Val(cx.g8)));
                 let sh16 = b.add_i32(cx.g8, c16i);
-                let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
+                let sk1 = b.let_(Op::LshrI32(kd, Opnd::Val(sh16)));
                 b.var_mfma_scale(s_vars[sl], k8_0, cx.b0, sk0, sq0m);
                 b.var_mfma_scale(s_vars[sl], k8_1, cx.b1, sk1, sq1m);
             }
@@ -7758,8 +7771,15 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.var_add_pk(s_vars[1], dupd);
                 let ex = b.mul_f32(delta, c512f);
                 let corr = b.exp2_f32(ex);
-                for e in 0..4usize {
-                    b.var_scale_f32(o_vars[e], corr);
+                if fmha_t_opt("svpk") {
+                    let cd = b.frag2_dup(corr);
+                    for e in 0..4usize {
+                        b.var_scale_pk(o_vars[e], cd);
+                    }
+                } else {
+                    for e in 0..4usize {
+                        b.var_scale_f32(o_vars[e], corr);
+                    }
                 }
                 b.var_scale_lane(la, 0, corr);
                 let nb = b.frag2(w_new, w_new);
@@ -7811,6 +7831,11 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
+    if kdpf {
+        for s in 0..4usize {
+            b.set_var(vars[9 + s], kd_next[s]);
+        }
+    }
     let it_next = b.add_i32(it, c1);
     b.set_var(it, it_next);
     let more = b.cmp_lt_i32(it_next, cx.nkv);
