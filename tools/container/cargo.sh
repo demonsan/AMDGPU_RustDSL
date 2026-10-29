@@ -38,6 +38,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e PD_NOPS="${PD_NOPS:-}" \
     -e PD_B2="${PD_B2:-}" \
     -e PD_NODMA="${PD_NODMA:-}" \
+    -e PD_STRIDE="${PD_STRIDE:-}" \
     -e FMHA_LDSPAD="${FMHA_LDSPAD:-}" \
     -e AMDC_ORACLE_OUT="${AMDC_ORACLE_OUT:-}" \
     -e AMDC_TEST_KERNELS="${AMDC_TEST_KERNELS:-}" \

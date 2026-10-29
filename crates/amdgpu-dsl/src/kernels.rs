@@ -1055,8 +1055,9 @@ pub fn probe_dma_tile() -> Function {
 /// Single-wave DMA sequence probe (64 threads): sixteen `global_load_lds_dwordx4`, DMA q landing at LDS byte 1024 q,
 /// then read back linearly. `o` must equal `i` (16 KB).
 pub fn probe_dma_seq() -> Function {
+    let stride: i32 = std::env::var("PD_STRIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
     let mut b = FnBuilder::new("probe_dma_seq", 64);
-    b.lds(16384);
+    b.lds(20000 + 16 * 64);
     b.arg("o", DType::Ptr, 0, 8);
     b.arg("i", DType::Ptr, 8, 8);
     let o = b.let_(Op::KernargPtr { offset: 0 });
@@ -1066,18 +1067,21 @@ pub fn probe_dma_seq() -> Function {
     let off16 = b.mul_i32(tid, c16);
     for q in 0..16i32 {
         let cq = b.c_i32(1024 * q);
+        let cl = b.c_i32(stride * q);
         let src = b.add_i32(off16, cq);
         let sp = b.ptr_add(inp, src);
-        b.load_global_lds(sp, cq, 0, 4);
+        b.load_global_lds(sp, cl, 0, 4);
     }
     b.wait_vm(0);
     b.wait_lds(0);
     b.barrier();
     for q in 0..16i32 {
+        let cl = b.c_i32(stride * q);
         let cq = b.c_i32(1024 * q);
-        let a = b.add_i32(off16, cq);
+        let a = b.add_i32(off16, cl);
         let v = b.load_lds_b128(Opnd::Val(a));
-        let op = b.ptr_add(o, a);
+        let od = b.add_i32(off16, cq);
+        let op = b.ptr_add(o, od);
         for w in 0..4u8 {
             let x = b.frag4_lane(v, w);
             let f = b.bitcast_f32(x);
