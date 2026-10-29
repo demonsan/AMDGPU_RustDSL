@@ -1026,6 +1026,13 @@ pub fn probe_dma_tile() -> Function {
             b.wait_vm(w);
         }
     }
+    if std::env::var("PD_DUMMY").is_ok() {
+        // a harmless trailing DMA into spare LDS (needs PD_LDS >= 18432)
+        let spare = b.c_i32(17408);
+        let r0 = b.mul_i32(lane, c16);
+        let sp = b.ptr_add(inp, r0);
+        b.load_global_lds(sp, spare, 0, 4);
+    }
     b.wait_vm(0);
     b.wait_lds(0);
     b.barrier();
