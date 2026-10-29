@@ -62,10 +62,10 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
     // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/status.md round 47).
     let base = if f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
-        let mut v: Vec<&str> = vec!["dce", "cmpfold", "scalarize"];
-        if f.name.ends_with("_vs128") || f.name.ends_with("_vsm") {
-            v.push("imm"); // constants as inline/literal operands: slack in the register file (docs/status.md round 49)
-        }
+        // measured on vs128 (15/15, 301.9-304.0 vs 280.6 TFLOP/s): retarget2 (cvt results written straight into the MFMA fragment
+        // lanes), imm and sgpr cut ~230 copies/VALU and free 12 VGPRs; addrfold and shl are slower and stay off. `imm` also gives
+        // the vs128/vsm builds the register slack they need (docs/status.md rounds 49-50).
+        let mut v: Vec<&str> = vec!["dce", "cmpfold", "scalarize", "retarget2", "imm", "sgpr", "imm"];
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
     } else {
