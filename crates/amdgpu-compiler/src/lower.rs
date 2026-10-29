@@ -121,6 +121,8 @@ struct Lowerer {
     /// `scalarize`: DSL values / loop variables that are wave-uniform integers (computed in SGPRs).
     uniform: HashSet<ValueId>,
     uvars: HashSet<amdgpu_dsl::VarId>,
+    /// `addrfold`: integer values held as `reg + constant` without an instruction for the constant (value -> (reg, k)).
+    lazy: HashMap<ValueId, (VReg, i64)>,
 }
 
 impl Lowerer {
@@ -204,6 +206,7 @@ impl Lowerer {
             else_started: HashSet::new(),
             uniform: HashSet::new(),
             uvars: HashSet::new(),
+            lazy: HashMap::new(),
         }
     }
 
@@ -451,6 +454,12 @@ impl Lowerer {
         let mut off: i64 = 0;
         loop {
             if let Opnd::Val(v) = cur {
+                if let Some(&(t, k)) = self.lazy.get(&v) {
+                    if (0..65536).contains(&(off + k)) {
+                        self.touch(&[Src::Reg(t)]);
+                        return Ok((t, off + k));
+                    }
+                }
                 if let Some(Op::AddI32(x, y)) = self.defs.get(&v).cloned() {
                     if let Some(k) = self.const_of(y) {
                         if k >= 0 && off + k < 65536 {
@@ -470,31 +479,59 @@ impl Lowerer {
             }
             break;
         }
-        // addrfold: `(base + k1) + (y + k2)` used once as an address -> add the bases, move k1+k2 into the DS offset field
-        // (keeps one base live instead of one VGPR per constant variant)
-        if opt_on("addrfold") {
-            if let Opnd::Val(v) = cur {
-                if let Some(Op::AddI32(x, y)) = self.defs.get(&v).cloned() {
-                    if self.use_counts.get(&v).copied().unwrap_or(0) <= 1 {
-                        let (xc, kx) = self.split_const(x);
-                        let (yc, ky) = self.split_const(y);
-                        let tot = off + kx + ky;
-                        if (kx != 0 || ky != 0) && (0..65536).contains(&tot) && self.const_of(xc).is_none() && self.const_of(yc).is_none() {
-                            let rx = self.as_v1(xc)?;
-                            let ry = self.as_v1(yc)?;
-                            self.touch(&[Src::Reg(rx), Src::Reg(ry)]);
-                            let d = self.new_vreg(RClass::V1);
-                            self.push(MInst::new(MOp::VAddU32).def(d).srcreg(rx).srcreg(ry));
-                            return Ok((d, tot));
-                        }
-                    }
-                }
-            }
-        }
         Ok((self.as_v1(cur)?, off))
     }
 
-    /// `o = core + k` through chains of `x + const`: (core, k).
+    /// (register, constant) view of an integer operand for `addrfold`.
+    fn lazy_core(&mut self, o: Opnd) -> Result<(VReg, i64), String> {
+        if let Opnd::Val(v) = o {
+            if let Some(&(t, k)) = self.lazy.get(&v) {
+                return Ok((t, k));
+            }
+        }
+        let (c, k) = self.split_const(o);
+        if let Opnd::Val(v) = c {
+            if let Some(&(t, k2)) = self.lazy.get(&v) {
+                return Ok((t, k + k2));
+            }
+        }
+        Ok((self.as_v1(c)?, k))
+    }
+
+    /// `dst = a + b` kept as `reg + k` when a constant is involved; emits at most the register add. Returns false
+    /// when nothing is gained (the caller emits the ordinary add).
+    fn lazy_add(&mut self, dst: ValueId, a: Opnd, b: Opnd) -> Result<bool, String> {
+        if self.uniform.contains(&dst) {
+            return Ok(false);
+        }
+        let (kb, ka) = (self.const_bits(b), self.const_bits(a));
+        match (ka, kb) {
+            (None, Some(k)) | (Some(k), None) => {
+                let other = if kb.is_some() { a } else { b };
+                let (t, k0) = self.lazy_core(other)?;
+                self.lazy.insert(dst, (t, k0 + k));
+                Ok(true)
+            }
+            (None, None) => {
+                // only worth it when a side already carries a constant
+                let sa = self.split_const(a).1 != 0 || matches!(a, Opnd::Val(v) if self.lazy.contains_key(&v));
+                let sb = self.split_const(b).1 != 0 || matches!(b, Opnd::Val(v) if self.lazy.contains_key(&v));
+                if !(sa || sb) {
+                    return Ok(false);
+                }
+                let (ta, k1) = self.lazy_core(a)?;
+                let (tb, k2) = self.lazy_core(b)?;
+                self.touch(&[Src::Reg(ta), Src::Reg(tb)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VAddU32).def(d).srcreg(ta).srcreg(tb));
+                self.lazy.insert(dst, (d, k1 + k2));
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// ``o = core + k`` through chains of ``x + const``: (core, k).
     fn split_const(&self, o: Opnd) -> (Opnd, i64) {
         let mut cur = o;
         let mut k = 0i64;
@@ -552,6 +589,18 @@ impl Lowerer {
                     self.touch(&[Src::Reg(r)]);
                     return Ok(r);
                 }
+                if let Some(&(t, k)) = self.lazy.get(&v) {
+                    // materialise `t + k` (cached for the region)
+                    if k == 0 {
+                        self.touch(&[Src::Reg(t)]);
+                        return Ok(t);
+                    }
+                    let d = self.new_vreg(RClass::V1);
+                    self.touch(&[Src::Reg(t)]);
+                    self.push(MInst::new(MOp::VAddU32).def(d).src(Src::Imm(k)).srcreg(t));
+                    self.converted.insert(v, d);
+                    return Ok(d);
+                }
                 let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
                 match self.mir.vreg_class(r) {
                     RClass::V1 => {
@@ -591,6 +640,18 @@ impl Lowerer {
                     let r = *r;
                     self.touch(&[Src::Reg(r)]);
                     return Ok(r);
+                }
+                if let Some(&(t, k)) = self.lazy.get(&v) {
+                    // materialise `t + k` (cached for the region)
+                    if k == 0 {
+                        self.touch(&[Src::Reg(t)]);
+                        return Ok(t);
+                    }
+                    let d = self.new_vreg(RClass::V1);
+                    self.touch(&[Src::Reg(t)]);
+                    self.push(MInst::new(MOp::VAddU32).def(d).src(Src::Imm(k)).srcreg(t));
+                    self.converted.insert(v, d);
+                    return Ok(d);
                 }
                 let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
                 match self.mir.vreg_class(r) {
@@ -1148,6 +1209,7 @@ impl Lowerer {
             Op::LshrI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SLshrB32, *a, *b)?,
             Op::AndI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAndB32, *a, *b)?,
             Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
+            Op::AddI32(a, b) if opt_on("addrfold") && self.lazy_add(dst, *a, *b)? => {}
             Op::AddI32(a, b) => self.bin_v1(dst, MOp::VAddU32, *a, *b)?,
             Op::AddF32(a, b) => self.bin_v1(dst, MOp::VAddF32, *a, *b)?,
             Op::SubF32(a, b) => self.bin_v1(dst, MOp::VSubF32, *a, *b)?,
