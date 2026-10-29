@@ -18,6 +18,7 @@ use crate::mir::*;
 /// arithmetic). Selected with `AMDC_LOWER_OPTS=imm,cmpfold` (`all`, `none`).
 ///  * `imm`     - constants become in-line / literal operands (VOP2 src0, shift amounts, cndmask false arm)
 ///                instead of `v_mov` into a register;
+///  * `saddr`   - global loads whose address is `kernarg_ptr + vector offset` use the scalar-base form (no 64-bit add);
 ///  * `dce`     - dead address / clamp chains (`v_add_co`/`v_addc`, `v_cmp`+`v_cndmask`, pointer adds) are removed;
 ///  * `cmpfold` - `select(cmp(x,y), ..)` re-issues the compare instead of the 0/1 materialisation +
 ///                `v_cmp_ne`, and the dead materialisation is removed.
@@ -329,6 +330,23 @@ impl Lowerer {
     }
 
     /// Bit pattern of a constant operand (integer or f32), for in-line operands.
+    /// `base` = `PtrAdd{ scalar kernarg pointer, vector byte offset }`: (scalar pair, 32-bit vector offset) for the SADDR form.
+    fn saddr_parts(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
+        if !opt_on("saddr") {
+            return Ok(None);
+        }
+        let Opnd::Val(v) = base else { return Ok(None) };
+        let Some(Op::PtrAdd { base: pb, byte_off }) = self.defs.get(&v).cloned() else { return Ok(None) };
+        let Opnd::Val(pv) = pb else { return Ok(None) };
+        let Some(&sreg) = self.val.get(&pv) else { return Ok(None) };
+        if self.mir.vreg_class(sreg) != RClass::S2 {
+            return Ok(None);
+        }
+        let off = self.as_v1(byte_off)?;
+        self.touch(&[Src::Reg(sreg), Src::Reg(off)]);
+        Ok(Some((sreg, off)))
+    }
+
     fn const_bits(&self, o: Opnd) -> Option<i64> {
         match o {
             Opnd::I32(i) => Some(i as i64),
@@ -645,8 +663,12 @@ impl Lowerer {
                 }
                 Stmt::VarLoadB128 { var, base, byte_off } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
-                    let rb = self.as_v2(*base)?;
-                    self.push(MInst::new(MOp::GlobalLoadB128).def(v).srcreg(rb).imm(*byte_off as i64));
+                    if let Some((sr, off)) = self.saddr_parts(*base)? {
+                        self.push(MInst::new(MOp::GlobalLoadB128S).def(v).srcreg(sr).srcreg(off).imm(*byte_off as i64));
+                    } else {
+                        let rb = self.as_v2(*base)?;
+                        self.push(MInst::new(MOp::GlobalLoadB128).def(v).srcreg(rb).imm(*byte_off as i64));
+                    }
                     self.pending_vmem.push(self.mir.canon(v));
                 }
                 Stmt::VarScaleF32 { var, scalar } => {
@@ -1102,18 +1124,24 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::LoadF32 { base, byte_off } => {
-                let rb = self.as_v2(*base)?;
                 let d = self.new_vreg(RClass::V1);
-                self.push(
-                    MInst::new(MOp::GlobalLoadF32).def(d).srcreg(rb).imm(*byte_off as i64),
-                );
+                if let Some((sr, off)) = self.saddr_parts(*base)? {
+                    self.push(MInst::new(MOp::GlobalLoadF32S).def(d).srcreg(sr).srcreg(off).imm(*byte_off as i64));
+                } else {
+                    let rb = self.as_v2(*base)?;
+                    self.push(MInst::new(MOp::GlobalLoadF32).def(d).srcreg(rb).imm(*byte_off as i64));
+                }
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::LoadGlobalB128 { base, byte_off } => {
-                let rb = self.as_v2(*base)?;
                 let d = self.new_vreg(RClass::V4);
-                self.push(MInst::new(MOp::GlobalLoadB128).def(d).srcreg(rb).imm(*byte_off as i64));
+                if let Some((sr, off)) = self.saddr_parts(*base)? {
+                    self.push(MInst::new(MOp::GlobalLoadB128S).def(d).srcreg(sr).srcreg(off).imm(*byte_off as i64));
+                } else {
+                    let rb = self.as_v2(*base)?;
+                    self.push(MInst::new(MOp::GlobalLoadB128).def(d).srcreg(rb).imm(*byte_off as i64));
+                }
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
