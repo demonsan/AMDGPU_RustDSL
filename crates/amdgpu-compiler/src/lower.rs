@@ -27,7 +27,8 @@ use crate::mir::*;
 pub fn opt_on(name: &str) -> bool {
     static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let v = OPTS.get_or_init(|| match std::env::var("AMDC_LOWER_OPTS") {
-        Ok(s) => s.split(',').map(|x| x.trim().to_string()).collect(),
+        Ok(s) if !s.is_empty() => s.split(',').map(|x| x.trim().to_string()).collect(),
+        Ok(_) => vec!["dce".to_string(), "cmpfold".to_string()], // cargo.sh forwards an empty value when unset
         // default: the optimisations measured to help (value-preserving, bit-exact on all shapes); `none` disables all
         Err(_) => vec!["dce".to_string(), "cmpfold".to_string()],
     });
