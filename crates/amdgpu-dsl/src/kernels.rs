@@ -8938,14 +8938,21 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
     };
     // stage a tile into ring slot `slot_off` (K scales of role A at `kd_slot`) and wait for it
-    let stage = |b: &mut FnBuilder, key0: ValueId, slot_off: ValueId, kd_slot: ValueId| {
+    let stage_start = |b: &mut FnBuilder, key0: ValueId, slot_off: ValueId| -> Option<ValueId> {
         let kd = if role_a { Some(kd_row_load(b, key0)) } else { None };
         dma_issue(b, key0, slot_off);
+        kd
+    };
+    let stage_end = |b: &mut FnBuilder, kd: Option<ValueId>, kd_slot: ValueId| {
         b.wait_vm(0);
         if let Some(kd) = kd {
             let a = b.add_i32(kdb0, kd_slot);
             b.store_lds_b32(Opnd::Val(a), Opnd::Val(kd));
         }
+    };
+    let stage = |b: &mut FnBuilder, key0: ValueId, slot_off: ValueId, kd_slot: ValueId| {
+        let kd = stage_start(b, key0, slot_off);
+        stage_end(b, kd, kd_slot);
     };
     let key_first = b.c_i32(0);
     stage(b, key_first, c0, c0);
@@ -9185,8 +9192,10 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             }
             let masked = pass == 0;
             // unit 0: V, stage K(next tile); M: PV(hh0) + QK(hh1)
+            // the DMA of the next tile runs under the VALU work of this phase and is waited for at its end
+            let skd = stage_start(b, key_next, slot_nxt);
             let w0 = valu(b, 0, masked, false);
-            stage(b, key_next, slot_nxt, kds_nxt);
+            stage_end(b, skd, kds_nxt);
             b.set_prio(1);
             b.wait_lds(0);
             b.barrier();
@@ -9228,8 +9237,10 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             }
             let masked = pass == 0;
             // V(unit 0), stage V(next tile)
+            // the DMA of the next tile runs under the VALU work of this phase and is waited for at its end
+            let skd = stage_start(b, key_next, slot_nxt);
             let w0 = valu(b, 0, masked, false);
-            stage(b, key_next, slot_nxt, kds_nxt);
+            stage_end(b, skd, kds_nxt);
             b.set_prio(1);
             b.wait_lds(0);
             b.barrier();
