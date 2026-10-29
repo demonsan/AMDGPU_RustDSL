@@ -9238,14 +9238,15 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         {
             let w_old_u = b.frag2_lane(bias2, 0);
             let w_old = b.bitcast_i32(w_old_u);
-            let lo16 = b.let_(Op::AndI32(Opnd::Val(w_old), Opnd::Val(cffff)));
+            // v_cvt_f32_f16 reads only the low 16 bits and v_cvt_f16_f32 zero-extends: the masks are redundant (rbtrim)
+            let lo16 = if fmha_t_opt("rbtrim") { w_old } else { b.let_(Op::AndI32(Opnd::Val(w_old), Opnd::Val(cffff))) };
             let b8 = b.let_(Op::CvtF16ToF32(Opnd::Val(lo16)));
             let b_old = b.mul_f32(b8, c8f);
             let tt = b.sub_f32(c_b131, mt);
             let b_new = b.add_f32(b_old, tt);
             let q8 = b.mul_f32(b_new, c0125);
             let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q8)));
-            let h = b.let_(Op::AndI32(Opnd::Val(h_raw), Opnd::Val(cffff)));
+            let h = if fmha_t_opt("rbtrim") { h_raw } else { b.let_(Op::AndI32(Opnd::Val(h_raw), Opnd::Val(cffff))) };
             let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h)));
             let b_q = b.mul_f32(hq, c8f);
             let d_full = b.sub_f32(b_q, b_old);
