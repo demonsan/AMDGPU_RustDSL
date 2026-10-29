@@ -9505,6 +9505,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let ablate = std::env::var("FMHA_ABLATE").unwrap_or_default();
     let no_bar = ablate.contains("nobar");
+    let nobar1 = ablate.contains("nobar1"); // drop the V->M barrier only
+    let nobar2 = ablate.contains("nobar2"); // drop the M->V barrier only
+    let noprio = ablate.contains("noprio");
     let no_valu = ablate.contains("novalu");
     let no_qk = ablate.contains("noqk");
     let no_pv = ablate.contains("nopv");
@@ -9806,6 +9809,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (i1, slot_cur, slot_nxt, slot_nxt, kds_nxt, key_n, kds_cur)
     };    // QK of the whole tile (4 x 32 keys) in ring slot `slot`: S' = bias + scaled K.Q^T, in place
     let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId| {
+        if no_qk {
+            return;
+        }
         let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot)).collect();
         let kd_rd = b.add_i32(kd_cur, kdslot);
         for s in 0..4usize {
@@ -9832,6 +9838,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     // VALU phase of the whole tile: ONE max / rollback decision over its 64 scores, then P (16 words)
     let valu = |b: &mut FnBuilder, masked: bool| -> Vec<ValueId> {
         let mut words_out: Vec<ValueId> = Vec::with_capacity(16);
+        if no_valu {
+            for _ in 0..16 {
+                words_out.push(c0);
+            }
+            return words_out;
+        }
         let mut kb: Vec<ValueId> = Vec::new();
         if masked {
             for s in 0..4usize {
@@ -9941,6 +9953,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // PV of the whole tile (V in ring slot `slot`, P words `w`) and its row sums
     let pv_w = |b: &mut FnBuilder, slot: ValueId, w: &[ValueId]| {
+        if no_pv {
+            return;
+        }
         let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot)).collect();
         for hh in 0..2usize {
             let o = 8 * hh;
@@ -9966,18 +9981,22 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if stage {
             stage_end(b, skd, kds_nxt);
         }
-        b.set_prio(1);
+        if !noprio {
+            b.set_prio(1);
+        }
         b.wait_lds(0);
-        if !no_bar {
+        if !no_bar && !nobar1 {
             b.barrier();
         }
         pv_w(b, slot_cur, &w);
         if stage {
             qk(b, slot_nxt, kds_nxt);
         }
-        b.set_prio(0);
+        if !noprio {
+            b.set_prio(0);
+        }
         b.wait_lds(0);
-        if !no_bar && last_barrier {
+        if !no_bar && !nobar2 && last_barrier {
             b.barrier();
         }
     };
