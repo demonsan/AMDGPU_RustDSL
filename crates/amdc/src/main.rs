@@ -9,7 +9,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  amdc list");
     eprintln!("  amdc dump <kernel>");
-    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--llvm-tail-drop-auto-waits] [--sched | --sched=auto]");
+    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--llvm-tail-drop-auto-waits] [--sched | --sched=auto | --sched=ld]");
     eprintln!("      --backend llvm-tail runs the pinned llc tail (ROCM_LLVM_BIN overrides the tool dir);");
     eprintln!("      --mir-out writes the exported post-RA MIR only (no llc needed) and exits.");
     eprintln!("  amdc backend probe|check|write-lock   version probe / verify / rewrite backend.lock");
@@ -223,6 +223,9 @@ fn main() -> ExitCode {
                     i += 2;
                 } else if let Some(b) = args[i].strip_prefix("--backend=") {
                     backend_name = b.to_string();
+                    i += 1;
+                } else if args[i] == "--sched=ld" {
+                    env::set_var("AMDC_SCHED", "ld");
                     i += 1;
                 } else if args[i] == "--sched=auto" {
                     env::set_var("AMDC_SCHED", "auto");

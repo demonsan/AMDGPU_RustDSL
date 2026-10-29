@@ -71,11 +71,16 @@ impl Options {
     /// `AMDC_SCHED=1` enables; `AMDC_SCHED_OPTS=rewait,xbar,noverify,stats,limit=N` tunes.
     pub fn from_env() -> Option<Options> {
         let mode = std::env::var("AMDC_SCHED").ok();
-        if mode.as_deref() != Some("1") && mode.as_deref() != Some("auto") {
+        if !matches!(mode.as_deref(), Some("1") | Some("auto") | Some("ld")) {
             return None;
         }
         let mut o = Options::default();
         o.auto = mode.as_deref() == Some("auto");
+        if mode.as_deref() == Some("ld") {
+            // preset: scoreboard waits + LDS-read hoisting, no instruction reordering
+            o.reorder = false;
+            o.ldshoist = true;
+        }
         if let Ok(s) = std::env::var("AMDC_SCHED_OPTS") {
             for t in s.split(',') {
                 let t = t.trim();

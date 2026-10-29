@@ -15,7 +15,7 @@ use amdgpu_dsl::{DType, Function, Op, Opnd, Stmt, ValueId};
 use crate::mir::*;
 
 /// Compiler optimisations that reduce dynamic VALU count (accuracy-preserving: same values, same
-/// arithmetic). Selected with `AMDC_LOWER_OPTS=imm,cmpfold` (`all`, `none`).
+/// arithmetic). Selected with `AMDC_LOWER_OPTS=imm,cmpfold` (`all`, `none`); DEFAULT `dce,cmpfold`.
 ///  * `imm`     - constants become in-line / literal operands (VOP2 src0, shift amounts, cndmask false arm)
 ///                instead of `v_mov` into a register;
 ///  * `saddr`   - global loads whose address is `kernarg_ptr + vector offset` use the scalar-base form (no 64-bit add);
@@ -26,7 +26,8 @@ pub fn opt_on(name: &str) -> bool {
     static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let v = OPTS.get_or_init(|| match std::env::var("AMDC_LOWER_OPTS") {
         Ok(s) => s.split(',').map(|x| x.trim().to_string()).collect(),
-        Err(_) => Vec::new(),
+        // default: the optimisations measured to help (value-preserving, bit-exact on all shapes); `none` disables all
+        Err(_) => vec!["dce".to_string(), "cmpfold".to_string()],
     });
     v.iter().any(|x| x == name || x == "all")
 }
