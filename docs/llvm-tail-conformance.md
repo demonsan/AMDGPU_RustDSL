@@ -112,3 +112,29 @@ python3 tools/conformance_classify.py $WORK/results/lit-diff-all.log     # failu
 
 The LLVM tail is now the default backend (`docs/llvm-tail-integration.md` section 9). What is **proven** about "RA and scheduling remain ours" (Verified, `cargo test --test tail_invariance`, 48 kernels, scheduler off / `1` / `swp` / `taildup,swp` / `auto`): the instruction stream after LLVM's tail equals ours modulo nops, waits, fallthrough branches and operand spelling, the exported MIR is physical-register only, and the descriptor sizes agree. What is **not** claimed: that LLVM never adds instructions (it may add hazard workarounds such as `s_mov_b64 vcc, vcc`).
 Open conformance items (unchanged from section 3): kill/dead flags, MMO atomic / LDS-DMA information, the 2 verifier cases (`waitcnt.mir`, `waitcnt-agpr.mir`).
+
+## 9. Round 5: kill/dead flags exported, the 2 verifier cases explained (pinned ROCm 10.1.0, `tools/llvm_conformance.sh all`)
+
+**Exporter change (Verified).** `llvm_mir::annotate_flags` writes `killed` / `dead` on the exported MIR from the per-instruction backward liveness we already compute (whole-operand granularity; only the last use of a register in an instruction carries the kill; flags are on by default, `AMDC_MIR_FLAGS=0` disables). All 50 kernels pass `-verify-machineinstrs` with them (`exported_flags_pass_the_machine_verifier`, 36 `cargo test` tests green), `tail_invariance` is green (default and `AMDC_SCHED=ld`), FMHA is unchanged: `fmha_fwd_hd128_mxfp8_t` B1H8S2048 292.1-292.8 TFLOP/s, 15/15 shapes bit-identical to the unscheduled plain build, LLVM `s_nop` count unchanged (171).
+
+**The 2 "undefined physical register" cases (`waitcnt.mir`, `waitcnt-agpr.mir`) - root cause (Verified).** Not an exporter bug. The tests contain a `BUNDLE` whose second instruction reads a register defined inside the bundle and marked `internal` (`FLAT_STORE_DWORD $vgpr1_vgpr2, internal $vgpr0, ...`). The round-trip `flags` level dropped `internal` together with `killed/dead/renamable`; without it the verifier sees a read of `$vgpr0` that is not live-in. Our exporter never produces bundles, so there is nothing to emit; the `flags` level now keeps `undef` and `internal` (they state intent / bundle membership, not liveness).
+
+**Final coverage table (178 post-RA tail-pass MIR tests, 169 fully importable; all numbers from one run):**
+
+| level | criterion | PASS / 178 | importable PASS / 169 |
+|---|---|---|---|
+| identity | original RUN + FileCheck | 178 | 169 |
+| identity | differential | 178 | 169 |
+| flags (drop `killed dead renamable`) | differential | **175** (was 173) | 166 |
+| reflag (flags, then recompute `killed/dead` with our annotation) | differential | 173 | 164 |
+| all (also drop instruction flags, MMOs, debug locations) | differential | 140 | 131 |
+
+Remaining failures:
+* `flags` (3): `hazard-pass-ordering`, `insert-skip-from-vcc`, `si-pre-emit-peephole-preserve-loop-info` - the SIPreEmitPeephole folds need the kill/dead flags that this level removes from LLVM's own input.
+* `reflag` (5): recomputing the flags with our annotation recovers `hazard-pass-ordering`. `insert-skip-from-vcc` and `si-pre-emit-peephole-preserve-loop-info` still differ *because the pass now optimises MORE than LLVM's recorded output* (e.g. the dead `$vcc = S_MOV_B64 0` / `S_AND_B64 $exec, -1` are removed: LLVM's input has no kill flags, so its expected output keeps them); a differential comparator cannot count an improvement as a pass. `hazard-shift64` (verifier) and `vopd-combine`, `vopd-combine-gfx1250` differ because tiny test functions never consume their results: our exact liveness marks those defs `dead`, which LLVM's own tests never do, and the hazard / VOPD passes then act differently. These are test-function artefacts of the foreign-MIR level, not exporter defects (the same annotation is verifier-clean on all kernels).
+* `all` (38): unchanged: 19 MIMG needs MMO (DSL emits no image ops), 12 wait differences from missing MMO atomic / LDS-DMA information (`waitcnt.mir` and `waitcnt-agpr.mir` moved here: without MMOs LLVM waits conservatively), 7 other (importer artefact, error-expectation test, `machine-scheduler` start, cpol from MMO).
+Opcode table vs LLVM MIR: 4405 exact, 453 implicit-operand differences, 154 explicit-shape differences, 5742 opcodes not in the table (48 table opcodes seen). Tail idempotence + verifier: 50 kernels, 0 failing.
+
+**What stays unsatisfiable by definition:** pre-RA MIR tests (490 files, 6 with tail-pass RUN lines; CHECK lines encode LLVM's register allocation) and a scheduler level on LLVM-MIR (our scheduler works on our MOps). **Open items:** MMO atomic / LDS-DMA information when the DSL needs it; sub-register-granular kill flags (only whole-operand flags are written); tracking of `exec/m0/agpr/ttmp` liveness for foreign MIR in the `reflag` level.
+
+**Reproduce:** `bash tools/llvm_build_llc.sh /shared/apps/ubuntu/opt/rocm-10.1.0 <llvm-project checkout> <tools dir>` (llc for ROCm 10); sparse checkout + `cmake -G Ninja llvm -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" -DLLVM_INCLUDE_TESTS=ON` + patch of `test/lit.site.cfg.py` as in section 1; `bash tools/container/cargo.sh build --bin amdc`; `bash tools/llvm_conformance.sh all` (levels `lit|census|table|idem`; env `LLVM_SRC LLVM_BUILD LLVM_TOOLS LLVM_ROCM AMDC WORK`); failures by cause: `python3 tools/conformance_classify.py $WORK/results/lit-diff-<level>.log`; FMHA sanity: `AB_VARIANTS=default bash tools/opt_ab.sh`.
