@@ -266,9 +266,16 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
             let slot = found.ok_or_else(|| {
                 // numeric lower bound: the largest number of dwords live at one position
                 let mut ev: Vec<(usize, i64)> = Vec::new();
-                for (s2, e2, _, c2) in &vregs {
-                    ev.push((*s2, c2.dwords() as i64));
-                    ev.push((e2.saturating_add(1), -(c2.dwords() as i64)));
+                for (_, _, r2, c2) in &vregs {
+                    // dword-level live segments of the value (not the [first, last] hull)
+                    let sg = &segs[*r2 as usize];
+                    if sg.is_empty() {
+                        continue;
+                    }
+                    for (a, b) in sg {
+                        ev.push((*a, c2.dwords() as i64));
+                        ev.push((b.saturating_add(1), -(c2.dwords() as i64)));
+                    }
                 }
                 ev.sort();
                 let (mut cur, mut peak, mut at) = (V_RESERVED as i64, 0i64, 0usize);
