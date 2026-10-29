@@ -7113,6 +7113,8 @@ struct FmhaTCtx {
     /// DMA layout only: per-lane K / V read addresses for the four 32-byte column groups (XOR swizzle)
     kfx: Vec<ValueId>,
     trx: Vec<ValueId>,
+    /// swz layout: per-thread staging write offsets (row-relative, without the tile base) for the four 16-byte chunks
+    swzw: Vec<ValueId>,
 }
 
 /// One role's steady loop and epilogue of the transposed FMHA kernel.
@@ -7185,19 +7187,29 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         v
     };
+    let swz = fmha_t_opt("swz") && !fmha_t_opt("dma");
+    assert!(!swz || fmha_t_opt("dbuf"), "swz needs dbuf");
+    let swzb: Vec<ValueId> = if swz { (0..4usize).map(|w| b.add_i32(cx.swzw[w], lds_base)).collect() } else { Vec::new() };
     let stage_stores = |b: &mut FnBuilder, dstb: ValueId, kdb: ValueId, data: &[ValueId]| {
         if data.len() == 5 {
             b.store_lds_b32(Opnd::Val(kdb), Opnd::Val(data[4]));
         }
         for (w, d) in data.iter().take(4).enumerate() {
-            let c = b.c_i32(16 * w as i32);
-            let a = b.add_i32(dstb, c);
-            b.store_lds_b128(Opnd::Val(a), Opnd::Val(*d));
+            if swz {
+                // dstb is the buffer offset; the chunk position (swizzled) is per thread
+                let a = b.add_i32(swzb[w], dstb);
+                b.store_lds_b128(Opnd::Val(a), Opnd::Val(*d));
+            } else {
+                let c = b.c_i32(16 * w as i32);
+                let a = b.add_i32(dstb, c);
+                b.store_lds_b128(Opnd::Val(a), Opnd::Val(*d));
+            }
         }
     };
     let key_first = b.c_i32(0);
     let first = stage_loads(b, key_first);
-    stage_stores(b, sdst, kdb0, &first);
+    let sd0 = if swz { b.c_i32(0) } else { sdst };
+    stage_stores(b, sd0, kdb0, &first);
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
@@ -7234,7 +7246,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let dbuf = fmha_t_opt("dbuf");
     // double buffering: compute reads buffer `par`, the next tile is staged into the other one
     let j4 = b.shl_i32(cx.j, c2);
-    let (kf_b, tr_b, sdst_n, kdb_n, kd_rd) = if dbuf {
+    let (kf_b, tr_b, sdst_n, kdb_n, kd_rd, cur_buf) = if dbuf {
         let cbuf = b.c_i32(256 * fmha_t_pitch());
         let co = b.mul_i32(par, cbuf);
         let npar = b.xor_i32(par, c1);
@@ -7243,10 +7255,14 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let kco = b.mul_i32(par, c512);
         let kno = b.mul_i32(npar, c512);
         let kd0 = b.add_i32(lds_kd, j4);
-        (b.add_i32(cx.kf_base, co), b.add_i32(cx.tr_base, co), b.add_i32(sdst, no), b.add_i32(kdb0, kno), b.add_i32(kd0, kco))
+        let sdn = if swz { no } else { b.add_i32(sdst, no) };
+        (b.add_i32(cx.kf_base, co), b.add_i32(cx.tr_base, co), sdn, b.add_i32(kdb0, kno), b.add_i32(kd0, kco), co)
     } else {
-        (cx.kf_base, cx.tr_base, sdst, kdb0, b.add_i32(lds_kd, j4))
+        let z = b.c_i32(0);
+        (cx.kf_base, cx.tr_base, sdst, kdb0, b.add_i32(lds_kd, j4), z)
     };
+    let kfb: Vec<ValueId> = if swz { (0..4usize).map(|k| b.add_i32(cx.kfx[k], cur_buf)).collect() } else { Vec::new() };
+    let trb: Vec<ValueId> = if swz { (0..4usize).map(|e| b.add_i32(cx.trx[e], cur_buf)).collect() } else { Vec::new() };
 
     // ---- prefetch the next tile (or this one again after the last iteration) ----
     let key0 = b.shl_i32(it, c7);
@@ -7283,12 +7299,20 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             for sl in 0..2usize {
                 let s = 2 * hh + sl;
                 let ko = b.c_i32(32 * pitch * (s as i32));
-                let kaddr0 = b.add_i32(kf_b, ko);
-                let kaddr0h = b.add_i32(kaddr0, c32v);
-                let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
-                let kaddr1 = b.add_i32(kaddr0, c64);
-                let kaddr1h = b.add_i32(kaddr1, c32v);
-                let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
+                let (k8_0, k8_1) = if swz {
+                    let a0 = b.add_i32(kfb[0], ko);
+                    let a1 = b.add_i32(kfb[1], ko);
+                    let a2 = b.add_i32(kfb[2], ko);
+                    let a3 = b.add_i32(kfb[3], ko);
+                    (b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)), b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)))
+                } else {
+                    let kaddr0 = b.add_i32(kf_b, ko);
+                    let kaddr0h = b.add_i32(kaddr0, c32v);
+                    let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
+                    let kaddr1 = b.add_i32(kaddr0, c64);
+                    let kaddr1h = b.add_i32(kaddr1, c32v);
+                    (k8_0, b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h)))
+                };
                 // K scale dword of key (128 it + 32 s + j); the global address is only built when it is used (it was dead code with kdlds: ~10 VALU per tile)
                 let kd_ptr = if !kdlds && !fmha_t_opt("kdconst") && kd_hoisted.is_empty() {
                     let kkey0 = b.add_i32(key0, cx.j);
@@ -7516,8 +7540,13 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
                 let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
                 for r in 0..4i32 {
-                    let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32);
-                    addrs.push(b.add_i32(tr_b, off));
+                    if swz {
+                        let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r);
+                        addrs.push(b.add_i32(trb[e], off));
+                    } else {
+                        let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32);
+                        addrs.push(b.add_i32(tr_b, off));
+                    }
                 }
                 if !no_pv {
                     let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
@@ -8677,7 +8706,7 @@ fn fmha_t_opt(name: &str) -> bool {
 
 fn fmha_t_pitch() -> i32 {
     // the DMA layout is a dense 128-byte row (conflicts are avoided by an XOR swizzle instead of padding)
-    let dflt = if fmha_t_opt("dma") { 128 } else { 144 };
+    let dflt = if fmha_t_opt("dma") || fmha_t_opt("swz") { 128 } else { 144 };
     std::env::var("FMHA_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(dflt)
 }
 pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
@@ -8933,6 +8962,60 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let wave4 = b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c3)));
     let mut kfx: Vec<ValueId> = Vec::new();
     let mut trx: Vec<ValueId> = Vec::new();
+    let mut swzw: Vec<ValueId> = Vec::new();
+    if fmha_t_opt("swz") && !fmha_t_opt("dma") {
+        // Bank-conflict-free dense layout: rows of 128 bytes, 16-byte chunk c of row r stored at chunk c ^ s(r), s = (u0 << 2) |
+        // ((u0 ^ u2) << 1) | u1 with u = (r >> 1) & 7. Conflict-free for the K b128 fragment reads (16 lanes: distinct
+        // (r & 1, chunk)), the ds_read_b64_tr_b8 V reads (32B segments e ^ (s >> 1): the 8 rows of a half wave tile the 64 banks)
+        // and the b128 staging writes.
+        fn swz_s(b: &mut FnBuilder, row: ValueId, c1: ValueId, c2: ValueId, c3: ValueId) -> ValueId {
+            let t1 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(c1)));
+            let u0 = b.let_(Op::AndI32(Opnd::Val(t1), Opnd::Val(c1)));
+            let t2 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(c2)));
+            let u1 = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(c1)));
+            let t3 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(c3)));
+            let u2 = b.let_(Op::AndI32(Opnd::Val(t3), Opnd::Val(c1)));
+            let x = b.xor_i32(u0, u2);
+            let s2 = b.shl_i32(u0, c2);
+            let s1 = b.shl_i32(x, c1);
+            let a = b.add_i32(s2, s1);
+            b.add_i32(a, u1)
+        }
+        let s_k = swz_s(b, j, c1, c2, c3);
+        let xk0 = b.xor_i32(pblk, s_k);
+        let jrow = b.mul_i32(j, c128);
+        for k in 0..4i32 {
+            let c2k = b.c_i32(2 * k);
+            let xk = b.xor_i32(xk0, c2k);
+            let xs = b.shl_i32(xk, c4);
+            let a0 = b.add_i32(jrow, xs);
+            kfx.push(b.add_i32(a0, lds_k));
+        }
+        let s_v = swz_s(b, key_part, c1, c2, c3);
+        let f_s = b.let_(Op::LshrI32(Opnd::Val(s_v), Opnd::Val(c1)));
+        let trow = b.mul_i32(key_part, c128);
+        let mg16 = b.shl_i32(m_gl, c4);
+        let mh8 = b.shl_i32(m_h, c3);
+        let colp = b.add_i32(mg16, mh8);
+        let trow_c = b.add_i32(trow, colp);
+        let trow_cl = b.add_i32(trow_c, lds_v);
+        for e in 0..4i32 {
+            let ce = b.c_i32(e);
+            let seg = b.xor_i32(f_s, ce);
+            let segb = b.shl_i32(seg, c5);
+            trx.push(b.add_i32(trow_cl, segb));
+        }
+        let s_r = swz_s(b, rt_row, c1, c2, c3);
+        let h4 = b.let_(Op::LshrI32(Opnd::Val(rt_half64), Opnd::Val(c4)));
+        let rrow = b.mul_i32(rt_row, c128);
+        for w in 0..4i32 {
+            let cwv = b.c_i32(w);
+            let cw = b.add_i32(h4, cwv);
+            let cs = b.xor_i32(cw, s_r);
+            let off = b.shl_i32(cs, c4);
+            swzw.push(b.add_i32(rrow, off));
+        }
+    }
     if false {
         let j_s1 = b.let_(Op::LshrI32(Opnd::Val(j), Opnd::Val(c1)));
         let f_k0 = b.let_(Op::AndI32(Opnd::Val(j_s1), Opnd::Val(c7)));
@@ -9007,6 +9090,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         wave4,
         kfx,
         trx,
+        swzw,
     };
     b.begin_if(is_a);
     if pp {
