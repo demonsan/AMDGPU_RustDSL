@@ -9037,7 +9037,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (DType::Frag16, Opnd::Val(zero)),     // 8 row sums
         (DType::I32, Opnd::Val(c0)),          // 9 ring index (tile mod 3)
     ];
-    let zero8 = b.frag_zero(DType::Frag8);
+    let zero8 = b.frag8(c0, c0, c0, c0, c0, c0, c0, c0);
     init_vars.push((DType::Frag8, Opnd::Val(zero8))); // 10: B's hh1 P fragment (8 words of 4 x fp8), carried to the next iteration
     if let Some(k0) = kdp0 {
         init_vars.push((DType::I32, Opnd::Val(k0))); // 11 (group A): K scales of tile it + 1, loaded one iteration ago
