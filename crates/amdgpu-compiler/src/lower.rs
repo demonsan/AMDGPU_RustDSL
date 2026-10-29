@@ -250,6 +250,13 @@ impl Lowerer {
         if opt_on("sink") {
             sink_defs(&mut self.mir);
         }
+        if opt_on("tcoalesce") {
+            for _ in 0..64 {
+                if !tuple_coalesce(&mut self.mir) {
+                    break;
+                }
+            }
+        }
         // rematerialise loop-invariant constants next to their loop uses (register pressure; `remat1/2/3` = at most 1/2/any
         // number of loop blocks using the constant)
         let spill_n: usize = std::env::var("AMDC_RA_LDS_SPILL").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0).unwrap_or_else(|| {
@@ -3043,4 +3050,127 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
     let total = area * nwaves;
     m.lds_bytes = base + total;
     (spilled, total)
+}
+/// Tuple-level copy coalescing (`tcoalesce`): a run of W `v_mov` that copies every dword of tuple S into tuple D (same class)
+/// is removed when S is used by nothing else and all instructions that write S sit in the same block before the run, with
+/// no access to D in between: those writers are renamed to write D directly. Returns whether anything changed.
+fn tuple_coalesce(m: &mut MFunction) -> bool {
+    // function-wide use counts and def sites of canonical vregs
+    let mut uses: HashMap<VReg, u32> = HashMap::new();
+    let mut defs: HashMap<VReg, Vec<(usize, usize)>> = HashMap::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            for u in inst.uses() {
+                *uses.entry(m.canon(u)).or_insert(0) += 1;
+            }
+            if let Some(d) = inst.dst {
+                defs.entry(m.canon(d)).or_default().push((bi, ii));
+            }
+        }
+    }
+    for bi in 0..m.blocks.len() {
+        let n = m.blocks[bi].insts.len();
+        let mut ii = 0;
+        while ii < n {
+            let inst = &m.blocks[bi].insts[ii];
+            let lane = |m: &MFunction, x: VReg| m.alias.get(&x).copied();
+            let (Some(d), Some(Src::Reg(s))) = (inst.dst, inst.srcs.first()) else {
+                ii += 1;
+                continue;
+            };
+            if inst.op != MOp::VMovB32 {
+                ii += 1;
+                continue;
+            }
+            let (Some((dt, d0)), Some((st, s0))) = (lane(m, d), lane(m, *s)) else {
+                ii += 1;
+                continue;
+            };
+            let class = m.vreg_class(st);
+            let w = class.dwords() as usize;
+            if w < 2 || m.vreg_class(dt) != class || d0 != 0 || s0 != 0 || m.alias.contains_key(&dt) || m.alias.contains_key(&st) || dt == st || ii + w > n {
+                ii += 1;
+                continue;
+            }
+            // the full in-order run of W lane copies
+            let mut ok = true;
+            for k in 0..w {
+                let j = &m.blocks[bi].insts[ii + k];
+                let (Some(dd), Some(Src::Reg(ss))) = (j.dst, j.srcs.first()) else {
+                    ok = false;
+                    break;
+                };
+                if j.op != MOp::VMovB32 || j.srcs.len() != 1 || lane(m, dd) != Some((dt, k as u8)) || lane(m, *ss) != Some((st, k as u8)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok || uses.get(&st).copied() != Some(w as u32) {
+                ii += 1;
+                continue;
+            }
+            // writers of S: same block, before the run
+            let Some(sd) = defs.get(&st) else {
+                ii += 1;
+                continue;
+            };
+            if sd.iter().any(|(b, i)| *b != bi || *i >= ii) {
+                ii += 1;
+                continue;
+            }
+            let first = sd.iter().map(|(_, i)| *i).min().unwrap();
+            // D untouched between the first writer of S and the end of the run (except by the run itself)
+            let mut clean = true;
+            for k in first..ii {
+                let j = &m.blocks[bi].insts[k];
+                if j.dst.map_or(false, |x| m.canon(x) == dt) || j.uses().iter().any(|x| m.canon(*x) == dt) {
+                    clean = false;
+                    break;
+                }
+            }
+            if !clean {
+                ii += 1;
+                continue;
+            }
+            // rename: every reference to S (in the writers) becomes the same lane/sub-tuple of D
+            let sites: Vec<usize> = sd.iter().map(|(_, i)| *i).collect();
+            let mut rename: HashMap<VReg, VReg> = HashMap::new();
+            let mut remap = |m: &mut MFunction, x: VReg| -> VReg {
+                if x == st {
+                    return dt;
+                }
+                if let Some(r) = rename.get(&x) {
+                    return *r;
+                }
+                let (t, off) = m.alias[&x];
+                debug_assert_eq!(t, st);
+                let nr = m.vregs.len() as VReg;
+                let c = m.vregs[x as usize];
+                m.vregs.push(c);
+                m.alias.insert(nr, (dt, off));
+                rename.insert(x, nr);
+                nr
+            };
+            for i in sites {
+                let mut inst = m.blocks[bi].insts[i].clone();
+                if let Some(x) = inst.dst {
+                    if m.canon(x) == st {
+                        inst.dst = Some(remap(m, x));
+                    }
+                }
+                for s in inst.srcs.iter_mut() {
+                    if let Src::Reg(x) = s {
+                        if m.canon(*x) == st {
+                            *x = remap(m, *x);
+                        }
+                    }
+                }
+                m.blocks[bi].insts[i] = inst;
+            }
+            // drop the copy run
+            m.blocks[bi].insts.drain(ii..ii + w);
+            return true;
+        }
+    }
+    false
 }
