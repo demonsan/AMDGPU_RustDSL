@@ -937,6 +937,51 @@ pub fn probe_fmha_core() -> Function {
     }
     b.finish()
 }
+/// Global -> LDS DMA probe (64 threads): `global_load_lds_dwordx4` of 1 KB and `global_load_lds_dword` of 256 B,
+/// read back through ordinary LDS reads. Lane i must land at byte 16 i (4 i) of its wave's M0 base.
+///
+/// * `o[0..256]`    (dwords): the 1 KB copied with the 16-byte form, read back with `ds_read_b128`
+/// * `o[256..320]`  (dwords): the 256 B copied with the 4-byte form, read back with `ds_read_b32`
+pub fn probe_dma() -> Function {
+    let mut b = FnBuilder::new("probe_dma", 64);
+    b.lds(4096);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("i", DType::Ptr, 8, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let inp = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let c16 = b.c_i32(16);
+    let c1024 = b.c_i32(1024);
+    let c2048 = b.c_i32(2048);
+    let c0 = b.c_i32(0);
+
+    let off16 = b.mul_i32(tid, c16);
+    let p16 = b.ptr_add(inp, off16);
+    b.load_global_lds(p16, c0, 0, 4);
+    let off4 = b.mul_i32(tid, c4);
+    let src4 = b.add_i32(off4, c1024);
+    let p4 = b.ptr_add(inp, src4);
+    b.load_global_lds(p4, c2048, 0, 1);
+    b.wait_vm(0);
+    b.wait_lds(0);
+    b.barrier();
+
+    let v = b.load_lds_b128(Opnd::Val(off16));
+    for k in 0..4u8 {
+        let w = b.frag4_lane(v, k);
+        let f = b.bitcast_f32(w);
+        let op = b.ptr_add(o, off16);
+        b.store_f32(op, 4 * k as u32, f);
+    }
+    let a4 = b.add_i32(off4, c2048);
+    let w4 = b.load_lds_b32(Opnd::Val(a4));
+    let f4 = b.bitcast_f32(w4);
+    let ob = b.add_i32(off4, c1024);
+    let op4 = b.ptr_add(o, ob);
+    b.store_f32(op4, 0, f4);
+    b.finish()
+}
 /// Pack instruction probe: checks the semantics of `v_cvt_pknorm_u16_f32` and
 /// of the fp8 packing path.
 ///
