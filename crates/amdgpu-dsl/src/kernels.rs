@@ -7802,6 +7802,10 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     if dma {
         dma_issue(b, key_first, c0, c0);
         b.wait_vm(0);
+        if fmha_t_opt("dmasync") {
+            b.barrier();
+            b.wait_vm(0);
+        }
     } else {
         stage_stores(b, sdst, kdb0, &first);
     }
@@ -8096,6 +8100,10 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.end_if();
     if dma {
         b.wait_vm(0);
+        if fmha_t_opt("dmasync") {
+            b.barrier();
+            b.wait_vm(0);
+        }
     } else {
         if !dbuf {
             b.wait_lds(0);
