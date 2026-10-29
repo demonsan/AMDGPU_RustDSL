@@ -352,6 +352,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         )],
         MOp::VCmpLtI32 => cmp(a, inst, "v_cmp_lt_i32_e32"),
         MOp::VCmpGeI32 => cmp(a, inst, "v_cmp_ge_i32_e32"),
+        MOp::VCmpGtI32 => cmp(a, inst, "v_cmp_gt_i32_e32"),
         MOp::VCmpNeI32 => cmp(a, inst, "v_cmp_ne_i32_e32"),
         MOp::VCmpLtF32 => cmp(a, inst, "v_cmp_lt_f32_e32"),
         MOp::VCndmask => vec![format!(

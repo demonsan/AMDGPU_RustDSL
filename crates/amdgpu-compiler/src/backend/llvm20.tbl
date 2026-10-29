@@ -57,6 +57,7 @@ VLshlB32    | V1 <- I V1  | {d} = V_LSHLREV_B32_e32 {s0}, {s1}, implicit $exec
 VMulLoU32   | V1 <- V1 V1 | {d} = V_MUL_LO_U32_e64 {s0}, {s1}, implicit $exec
 VCmpLtI32   | <- V1 V1 | V_CMP_LT_I32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
 VCmpGeI32   | <- V1 V1 | V_CMP_GE_I32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VCmpGtI32   | <- V1 V1 | V_CMP_GT_I32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
 VCmpNeI32   | <- V1 V1 | V_CMP_NE_I32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
 VCmpLtF32   | <- V1 V1 | nofpexcept V_CMP_LT_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
 VCndmask    | V1 <- V1 V1 | {d} = V_CNDMASK_B32_e32 {s0}, {s1}, implicit $exec, implicit $vcc

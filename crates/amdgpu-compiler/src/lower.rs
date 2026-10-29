@@ -1347,6 +1347,10 @@ impl Lowerer {
             if let Some(op) = self.defs.get(&v).cloned() {
                 match op {
                     Op::CmpLtI32(a, b) => {
+                        if let Some(srcs) = self.cmp_lt_scalar_bound(a, b)? {
+                            let on = if negate { Pred::Vccz } else { Pred::Vccnz };
+                            return Ok((on, srcs));
+                        }
                         // src0 of the e32 compare may be an SGPR (sgpr option); src1 must be a VGPR
                         let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
                         let ra = match sa {
@@ -2162,6 +2166,30 @@ impl Lowerer {
         (self.mir.vreg_class(r) == RClass::S1).then_some(r)
     }
 
+    /// `x + k < bound` with a wave-uniform bound: `bound - k > x` with the (uniform) adjusted bound in an SGPR (src0 of
+    /// `v_cmp_gt_i32`): no per-lane add of the constant, no v_mov of the bound. Returns the compare's sources.
+    fn cmp_lt_scalar_bound(&mut self, a: Opnd, b: Opnd) -> Result<Option<Vec<Src>>, String> {
+        if !opt_on("sgpr") || self.const_bits(a).is_some() {
+            return Ok(None);
+        }
+        let Some(sb) = self.sgpr_src(b) else { return Ok(None) };
+        let (core, k) = self.split_const(a);
+        if k.abs() >= (1 << 20) {
+            return Ok(None);
+        }
+        let rx = self.as_v1(core)?;
+        self.touch(&[Src::Reg(sb), Src::Reg(rx)]);
+        let bound = if k == 0 {
+            sb
+        } else {
+            let d = self.new_vreg(RClass::S1);
+            self.push(MInst::new(MOp::SAddU32).def(d).srcreg(sb).src(Src::Imm(-k)));
+            d
+        };
+        self.push(MInst::new(MOp::VCmpGtI32).srcreg(bound).srcreg(rx));
+        Ok(Some(vec![Src::Reg(bound), Src::Reg(rx)]))
+    }
+
     fn bin_v1(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
         if opt_on("shl") && op == MOp::VMulLoU32 {
             for (c, other) in [(b, a), (a, b)] {
@@ -2249,6 +2277,8 @@ impl Lowerer {
                 return Ok(());
             }
         }
+        let scalar_bound = if op == MOp::VCmpLtI32 { self.cmp_lt_scalar_bound(a, b)? } else { None };
+        if scalar_bound.is_none() {
         let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
         let ra = match sa {
             Some(s) => s,
@@ -2257,6 +2287,7 @@ impl Lowerer {
         let rb = self.as_v1(b)?;
         self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
         self.push(MInst::new(op).srcreg(ra).srcreg(rb));
+        }
         let one = self.const_vreg(1);
         let d = self.new_vreg(RClass::V1);
         self.push(MInst::new(MOp::VCndmask).def(d).src(Src::Imm(0)).srcreg(one));
@@ -2385,7 +2416,7 @@ fn fold_select_cmp(m: &mut MFunction) {
                     break;
                 }
                 let c = &b.insts[j];
-                if matches!(c.op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32) && c.dst.is_none() {
+                if matches!(c.op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32 | MOp::VCmpGtI32) && c.dst.is_none() {
                     mat.insert(inst.dst.unwrap(), (c.op, c.srcs.clone(), j));
                 }
                 continue;
@@ -2433,7 +2464,7 @@ fn dce_cmp_pairs(m: &mut MFunction) {
                             }
                             break;
                         }
-                        if matches!(b.insts[j].op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32) && b.insts[j].dst.is_none() {
+                        if matches!(b.insts[j].op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32 | MOp::VCmpGtI32) && b.insts[j].dst.is_none() {
                             dead[i] = true;
                             dead[j] = true;
                         }
@@ -2473,7 +2504,7 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
             MOp::VMovB32 | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VPtrAdd | MOp::VAddU32 | MOp::VAddCoU32 | MOp::VAddcCoU32
                 | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VMax3F32 | MOp::VFmaF32 | MOp::VExpF32
                 | MOp::VRcpF32 | MOp::VAndB32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32 | MOp::VMulLoU32
-                | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VReadPhys | MOp::VCmpLtI32 | MOp::VCmpGeI32
+                | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VReadPhys | MOp::VCmpLtI32 | MOp::VCmpGtI32 | MOp::VCmpGeI32
                 | MOp::VCmpNeI32 | MOp::VCmpLtF32
         )
     };
