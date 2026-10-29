@@ -9815,6 +9815,18 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot)).collect();
         let kd_rd = b.add_i32(kd_cur, kdslot);
+        // kdpre: the four K-scale dwords are read up front (4 VGPR) so that their lgkmcnt waits do not sit in front of every tile's MFMAs
+        let kd_pre: Vec<ValueId> = if fmha_t_opt("kdpre") {
+            (0..4usize)
+                .map(|s| {
+                    let koff = b.c_i32(128 * s as i32);
+                    let ka = b.add_i32(kd_rd, koff);
+                    b.load_lds_b32(Opnd::Val(ka))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         for s in 0..4usize {
             b.var_mfma_f16_z(s_vars[s], ones_f16, bias2);
             let ko = b.c_i32(4096 * (s as i32));
@@ -9824,9 +9836,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a3 = b.add_i32(kfb[3], ko);
             let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
             let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
-            let koff = b.c_i32(128 * s as i32);
-            let ka = b.add_i32(kd_rd, koff);
-            let kd = b.load_lds_b32(Opnd::Val(ka));
+            let kd = if kd_pre.is_empty() {
+                let koff = b.c_i32(128 * s as i32);
+                let ka = b.add_i32(kd_rd, koff);
+                b.load_lds_b32(Opnd::Val(ka))
+            } else {
+                kd_pre[s]
+            };
             let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
@@ -10011,9 +10027,17 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if !no_bar && !nobar1 {
             b.barrier();
         }
-        pv_w(b, slot_cur, &w);
-        if stage {
-            qk(b, slot_nxt, kds_nxt);
+        if fmha_t_opt("qkfirst") {
+            // QK(i+1) first: S(i) was consumed by the V phase; the PV tr reads then queue behind the QK fragment reads
+            if stage {
+                qk(b, slot_nxt, kds_nxt);
+            }
+            pv_w(b, slot_cur, &w);
+        } else {
+            pv_w(b, slot_cur, &w);
+            if stage {
+                qk(b, slot_nxt, kds_nxt);
+            }
         }
         if !noprio {
             b.set_prio(0);
