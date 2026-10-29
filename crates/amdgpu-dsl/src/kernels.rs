@@ -10934,10 +10934,9 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     // wave-group split (which 4 of the 8 waves form role A): FMHA_OPT split0 = waves 0-3 (default), split1 = even waves, split2 = bit-1 of the wave id.
     // The group-local thread id (rt) must stay a permutation of 0..255 inside a group: rt = 64 * (index of the wave in its group) + lane.
     let split_mode = fmha_t_num("split").unwrap_or(0);
-    let c63s = b.c_i32(63);
-    let lane_s = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c63s)));
     let c3s = b.c_i32(3);
     let wave4_s = match split_mode {
+        0 => b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c3s))),
         1 => b.let_(Op::LshrI32(Opnd::Val(wave), Opnd::Val(c1))),
         2 => {
             let lo = b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c1)));
@@ -10948,8 +10947,12 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         }
         _ => b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c3s))),
     };
-    let c6s = b.c_i32(6);
-    let rt = {
+    let rt = if split_mode == 0 {
+        b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c255)))
+    } else {
+        let c63s = b.c_i32(63);
+        let lane_s = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c63s)));
+        let c6s = b.c_i32(6);
         let w64 = b.shl_i32(wave4_s, c6s);
         b.add_i32(w64, lane_s)
     };
