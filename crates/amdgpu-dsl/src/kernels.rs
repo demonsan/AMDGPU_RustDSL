@@ -9934,6 +9934,15 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         } else {
             None
         };
+        // qonce: the two Q fragments are the same for all four S tiles: read them ONCE per tile (16 VGPR live during the QK group) instead of per tile
+        let qonce = fmha_t_opt("qonce");
+        let q_pre: Option<(ValueId, ValueId)> = if qonce {
+            let q0 = if q0_reg { cx.b0 } else { load_q0(b) };
+            let q1 = load_q1(b);
+            Some((q0, q1))
+        } else {
+            None
+        };
         for s in 0..4usize {
             if biasf_once.is_none() {
                 b.var_mfma_f16_z(s_vars[s], ones_f16, bias2);
@@ -9964,13 +9973,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
                 (sk0, sk1)
             };
-            let qb0 = if q0_reg { cx.b0 } else { load_q0(b) };
+            let qb0 = if let Some((q0, _)) = q_pre { q0 } else if q0_reg { cx.b0 } else { load_q0(b) };
             if let Some(bf) = biasf_once {
                 b.var_mfma_scale_c(s_vars[s], k8_0, qb0, bf, sk0, sq0m);
             } else {
                 b.var_mfma_scale(s_vars[s], k8_0, qb0, sk0, sq0m);
             }
-            let qb1 = load_q1(b);
+            let qb1 = if let Some((_, q1)) = q_pre { q1 } else { load_q1(b) };
             b.var_mfma_scale(s_vars[s], k8_1, qb1, sk1, sq1m);
         }
     };
