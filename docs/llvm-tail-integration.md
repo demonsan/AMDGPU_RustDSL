@@ -139,3 +139,20 @@ Cosmetic differences between the two outputs (all semantically identical, Verifi
 * **`--sched=auto`** (`AMDC_SCHED=auto`, default scheduler stays OFF): `sched::auto_plan` simulates each loop (`sched/sim.rs`, average of 1 and 2 waves/SIMD) and schedules only loops whose model improves by >= 3% (`AUTO_GAIN`); swp keeps its own >= 3% gate; taildup is enabled only if the loops common to both trial results improve >= 3% in total. Loops with `s_barrier` are excluded (the model has no cross-wave barrier term; it predicted -23% for the FMHA loops where hardware measured 221.7 vs 225.0 TFLOP/s) unless `AMDC_SCHED_OPTS=trustmodel`. `AMDC_SCHED_OPTS=stats` prints the per-loop decisions. Compile time: instant when no loop is eligible (FMHA), seconds for the microkernels, ~2 min for `attention_fwd` (large single loop evaluated several times).
   Measured on hardware (GPU 4, `tools/auto_vs_plain.sh`, cycles/iteration, 1 wave / 2 waves per SIMD, auto vs plain): sched_valu_mul -37%/-36%, valu_max3 -35%/-22%, valu_exp -23%/-14%, mfma_chain -40%/-1%, mfma_valu16 -37%/-15%, mfma_valu4 -56%/-24%, diamond -32%/-14%. FMHA B1H8S2048 (TFLOP/s, 3 reps): own 224.6-224.7, llvm-tail 224.0-226.3, llvm-tail+auto 224.7-225.6 (identical code to llvm-tail: auto leaves FMHA unscheduled).
 * Open conformance items: kill/dead flags not exported (3 LLVM peephole tests skipped, conservative), MMO atomic/LDS-DMA information when the DSL needs it, 2 verifier cases (`waitcnt.mir`, `waitcnt-agpr.mir`, not root-caused).
+
+## Compiler-side FMHA gains: waits, LDS-read hoisting, dead code (round 4)
+
+Evidence (rocprofv3, fmha_t B1H8S2048, vs vendor): the gap was not VALU count alone: SQ_WAIT_INST_ANY 5.3M vs 2.76M, SQ_BUSY 4.8M vs 2.39M, SQ_LDS_BANK_CONFLICT 524288 vs 0, SQ_IFETCH 928k vs 667k. Findings and measured effect (TFLOP/s, 3 reps, GPU 4, every variant bit-identical to the plain build on the 15 run_ref shapes; `tools/opt_ab.sh`):
+
+| configuration | TFLOP/s |
+|---|---|
+| plain (lowering waits) | 258.2 |
+| `AMDC_DROP_AUTO_WAITS=1` (LLVM computes waits) | 259.4 |
+| `AMDC_SCHED=1 AMDC_SCHED_OPTS=rewait` (scoreboard waits; removes the loop-head `vmcnt(0)` drain that lowering inserts at the masked-tail `if`) | 264.7 |
+| full reorder scheduler (`AMDC_SCHED=1`) | 261.5 (`xbar`: 258.9) |
+| `rewait,ldshoist` = **`AMDC_SCHED=ld`** (new `sched/hoist.rs`: hoist `ds_read` above independent work, pressure- and dependence-limited, verified by `verify::check_perm`; waits become partial `lgkmcnt(n)`) | 273.5 |
+| + `AMDC_LOOP_ALIGN=64` (loop headers aligned; both backends) | 273.7-274.2 |
+| + default lowering opts `dce,cmpfold` | **285.0-286.5** (+10.4% vs plain) |
+| + `imm`, `saddr`, `sgpr`, `shl` (all, flagged off) | 285.3-285.5 (neutral) |
+
+Lowering options (`AMDC_LOWER_OPTS`, default `dce,cmpfold`, `none` disables): `dce` vcc-aware full DCE (removes the dead per-iteration K-scale address chain), `cmpfold` (`select(cmp)` re-issues the compare), `imm` (in-line/literal operands; cndmask only with in-line constants because of the constant bus), `saddr` (scalar-base global loads, new MOps `GlobalLoadB128S/F32S` with rows in both dialect tables), `sgpr` (SGPR VALU operands), `shl` (mul by power of two). Alone, VALU reductions did not speed the kernel up (-14% VALU, 0% time) until the LDS-latency stall was removed; then `dce,cmpfold` gave +4%. Scheduler stays opt-in (`AMDC_SCHED=ld` / `--sched=ld`). Counters plain -> `ld`: WAVE_CYCLES 18.5M -> 17.6M, WAIT_ANY 7.5M -> 6.4M, BUSY 4.80M -> 4.56M, IFETCH 928k -> 894k (886k with alignment). Still open: LDS bank conflicts (kernel layout), cold-arm layout (taken `s_branch` around the masked variant and each lazy-rescale `if`, ~70 cycles/iteration by the model).
