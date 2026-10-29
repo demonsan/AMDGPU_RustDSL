@@ -11333,7 +11333,7 @@ fn sched_mfma_valu_kernel(name: &str, lanes: u8) -> Function {
 
 /// Cross-wave co-issue probe: waves 0-3 run an independent-accumulator scaled-MFMA loop, waves 4-7 a VALU (fma) loop, so each SIMD
 /// has one wave of each kind. mode 0 = both, 1 = MFMA waves only, 2 = VALU waves only (the other role skips its loop).
-fn sched_coissue_kernel(name: &str, mode: u8) -> Function {
+fn sched_coissue_kernel(name: &str, mode: u8, kind: u8) -> Function {
     let (mut b, o, n, tid) = sched_begin(name);
     let c0 = b.c_i32(0);
     let c64 = b.c_i32(64);
@@ -11380,11 +11380,28 @@ fn sched_coissue_kernel(name: &str, mode: u8) -> Function {
             inits.push((DType::I32, Opnd::Val(fi)));
         }
         let vars = b.begin_loop(&inits);
+        let c4s = b.c_i32(4);
+        let cmk = b.c_i32(0x0007_0007);
+        let lut_lo = b.c_i32(i32::from_le_bytes([0, 6, 9, 11]));
+        let lut_hi = b.c_i32(i32::from_le_bytes([11, 10, 7, 3]));
+        let one_f = b.c_f32(1.0);
         for k in 0..16usize {
             let mut x = b.bitcast_f32(vars[1 + k]);
-            for _ in 0..4 {
-                let m = b.mul_f32(x, one);
-                x = b.add_f32(m, two);
+            if kind == 0 {
+                for _ in 0..4 {
+                    let m = b.mul_f32(x, one);
+                    x = b.add_f32(m, two);
+                }
+            } else {
+                // the softmax conversion recipe of the FMHA kernels: pknorm pair, LUT correction (shift/mask/perm/pk_sub), fp8 pack
+                let y = b.add_f32(x, two);
+                let u = b.cvt_pknorm_pair(x, y);
+                let s1 = b.let_(Op::LshrI32(Opnd::Val(u), Opnd::Val(c4s)));
+                let s2 = b.let_(Op::AndI32(Opnd::Val(s1), Opnd::Val(cmk)));
+                let pm = b.perm_b32(lut_hi, lut_lo, s2);
+                let w = b.pk_sub_u16(u, pm);
+                let wd = b.cvt_p8x4_from_u16(w, w, one_f);
+                x = b.bitcast_f32(wd);
             }
             let xi = b.bitcast_i32(x);
             b.set_var(vars[1 + k], xi);
@@ -11399,13 +11416,19 @@ fn sched_coissue_kernel(name: &str, mode: u8) -> Function {
     b.finish()
 }
 pub fn sched_coissue_both() -> Function {
-    sched_coissue_kernel("sched_coissue_both", 0)
+    sched_coissue_kernel("sched_coissue_both", 0, 0)
 }
 pub fn sched_coissue_mfma() -> Function {
-    sched_coissue_kernel("sched_coissue_mfma", 1)
+    sched_coissue_kernel("sched_coissue_mfma", 1, 0)
 }
 pub fn sched_coissue_valu() -> Function {
-    sched_coissue_kernel("sched_coissue_valu", 2)
+    sched_coissue_kernel("sched_coissue_valu", 2, 0)
+}
+pub fn sched_coissue_cboth() -> Function {
+    sched_coissue_kernel("sched_coissue_cboth", 0, 1)
+}
+pub fn sched_coissue_cvalu() -> Function {
+    sched_coissue_kernel("sched_coissue_cvalu", 2, 1)
 }
 pub fn sched_mfma_valu16() -> Function {
     sched_mfma_valu_kernel("sched_mfma_valu16", 16)
