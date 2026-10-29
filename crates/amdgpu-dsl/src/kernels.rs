@@ -7574,6 +7574,10 @@ fn emit_fmha_pp_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// shifts the S registers by the (per-lane) change, rescales O and the MFMA row sum and stores the new
 /// bias. Row sums come from the same quantised P (ones-MFMA), so the normalisation is consistent.
 fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
+    let ablate = std::env::var("FMHA_ABLATE").unwrap_or_default();
+    let no_stage = ablate.contains("nostage");
+    let no_bar = ablate.contains("nobar");
+    let no_pv = ablate.contains("nopv");
     let c0 = b.c_i32(0);
     let c1 = b.c_i32(1);
     let c7 = b.c_i32(7);
@@ -7695,7 +7699,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let has_next = b.cmp_lt_i32(it_p1, cx.nkv);
     let nxt = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_next), a: Opnd::Val(it_p1), b: it.into() });
     let key_next = b.shl_i32(nxt, c7);
-    let pre = stage_loads(b, key_next);
+    let pre = if no_stage { first.clone() } else { stage_loads(b, key_next) };
     // K scales of the next tile, requested now and consumed one iteration later
     let kd_next: Vec<ValueId> = if kdpf { (0..4i32).map(|s| kd_load(b, key_next, s)).collect() } else { Vec::new() };
 
@@ -7827,6 +7831,9 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32);
                     addrs.push(b.add_i32(tr_b, off));
                 }
+                if no_pv {
+                    continue;
+                }
                 let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
                 b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
             }
@@ -7841,11 +7848,17 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.end_if();
     if !dbuf {
         b.wait_lds(0);
+        if !no_bar {
+            b.barrier();
+        }
+    }
+    if !no_stage {
+        stage_stores(b, sdst_n, &pre);
+    }
+    b.wait_lds(0);
+    if !no_bar {
         b.barrier();
     }
-    stage_stores(b, sdst_n, &pre);
-    b.wait_lds(0);
-    b.barrier();
     b.wait_lds(0);
     if dbuf {
         let npar2 = b.xor_i32(par, c1);
