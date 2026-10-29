@@ -21,6 +21,19 @@ const TRANS_LATENCY: usize = 5;
 /// How many instructions after the stalled consumer are examined as fill candidates.
 const FILL_WINDOW: usize = 48;
 
+thread_local! {
+    static VCC_FILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with stall filling for `vcc` consumers enabled: the movable candidates never read or write `vcc`, so an independent
+/// instruction may be placed between a `v_cmp` and its `v_cndmask` to cover the 2 wait states instead of an `s_nop`.
+pub fn with_vcc_fill<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let old = VCC_FILL.with(|c| c.replace(on));
+    let r = f();
+    VCC_FILL.with(|c| c.set(old));
+    r
+}
+
 fn is_transcendental(op: MOp) -> bool {
     matches!(op, MOp::VExpF32 | MOp::VRcpF32)
 }
@@ -198,7 +211,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, cycle);
 
             // Fill the stall with independent ALU work from further down the block.
-            if earliest > cycle && !insts[i].op.consumes_vcc() {
+            if earliest > cycle && (!insts[i].op.consumes_vcc() || VCC_FILL.with(|c| c.get())) {
                 let mut j = i + 1;
                 let limit = (i + 1 + FILL_WINDOW).min(insts.len());
                 while earliest > cycle && j < limit.min(insts.len()) {
