@@ -99,8 +99,10 @@ release 构建，整个进程（启动 + DSL 构建 + 编译 + 写文件），�
 * `--sched=auto`：只对模拟器预测收益 ≥3% 的循环做块内调度；swp 自带 3% 门限；taildup 只在其“与无 taildup 方案相比，两者共有的循环总模型周期下降 ≥3%”时启用。含 `s_barrier` 的循环不参与（模型没有跨 wave 同步项：在 FMHA 上模型预测 −23%，而真机是 221.7 vs 225.0 TFLOP/s），所以 FMHA 在 auto 下保持未调度；sched_* 微内核真机 1 wave/2 waves 每次迭代周期：valu_mul −37%/−36%，valu_max3 −35%/−22%，valu_exp −23%/−14%，mfma_chain −40%/−1%，mfma_valu16 −37%/−15%，mfma_valu4 −56%/−24%，diamond −32%/−14%。
 * 未完成项：导出 kill/dead 标志（目前 3 个 LLVM peephole 测试因此不能折叠，保守且正确）、DSL 引入原子/LDS-DMA 时需导出 MMO（ordering/syncscope）、2 个 verifier 个案（`waitcnt.mir`, `waitcnt-agpr.mir`）尚未查明。
 
-## 10. 编译器侧 FMHA 收益（第 4 轮）
+## 10. 编译器侧 FMHA 收益（第 4 轮，合并后的 Main）
 
-* 默认开启 `AMDC_LOWER_OPTS=dce,cmpfold`（保值）；新增调度预设 `AMDC_SCHED=ld` / `--sched=ld`（scoreboard 等待 + `ds_read` 上提，新文件 `sched/hoist.rs`，每个基本块都由 `verify::check_perm` 证明合法）；`AMDC_LOOP_ALIGN=N` 循环头对齐。
-* fmha_t B1H8S2048（GPU 4，30 iters）：plain 258.2 -> rewait 264.7 -> ld 273.5 -> ld + dce,cmpfold **285.0-286.5 TFLOP/s**（+10.4%）；15 个 shape 与 plain 逐位一致，determinism 5/5，tail_invariance 通过。
-* 负面结果：单独减少 14% VALU（imm/dce/cmpfold/saddr/sgpr/shl）在 LDS 延迟未解决前没有提速；imm/saddr/sgpr/shl 在最终配置上也是中性，保持关闭。详见 docs/llvm-tail-integration.md 末节。
+* 构建与口径：fmha_fwd_hd128_mxfp8_t，B1H8S2048，30 iters，GPU 4，LLVM tail；全部与 plain（`AMDC_SCHED=0 AMDC_LOWER_OPTS=none`）在 15 个 shape 上逐位一致。
+* 默认路径（`dce,cmpfold` + fmha 调度默认 `rewait,xbar,ldshoist`）：**288.2-289.2 TFLOP/s**（plain 260.5-262.3，`AMDC_SCHED=0` 264.5-265.0）；打开 XOR swizzle（`FMHA_OPT=...,swz`）：**292.6-293.1**，LDS bank conflict 524288 -> 8704（vendor 0）。own 后端默认 282.9-284.2。
+* 计数器（plain / 默认 / 默认+swz）：VALU 3.302M / 3.196M / 3.314M（vendor 2.055M），WAIT_ANY 7.29M / 6.22M / 6.07M，BUSY 4.58M / 4.33M / 4.26M（vendor 2.39M），WAVE_CYCLES 17.5M / 16.7M / 16.4M（vendor 9.4M），IFETCH 834k / 782k / 797k（vendor 667k）。
+* 负面/中性结果：只减少 VALU（imm/saddr/sgpr/shl/dce/cmpfold，-14% VALU）在 LDS 延迟未解决前为 0%；imm/saddr/sgpr/shl 在最终配置上中性（关闭）；全量重排调度器比 rewait 差；`AMDC_LOOP_ALIGN` 仅 +0.1%（噪声级，默认关闭）。
+* 本轮发现并修复的问题：空的 `AMDC_LOWER_OPTS`（cargo.sh 在未设置时转发空值）曾让默认优化静默失效；调度器在寄存器不足时重试逻辑只尝试一次，导致 swz 构建退回未调度代码（260 -> 292.6）。详见 docs/llvm-tail-integration.md 末节。

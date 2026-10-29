@@ -40,7 +40,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
         Some(o) if o.auto => sched::auto_plan(&base, &o),
         other => other,
     };
-    // The FMHA kernels default to the wait-recomputing pass (partial vmcnt/lgkmcnt waits, ALU across barriers): +9% on the
+    // The FMHA kernels default to the wait-recomputing pass (partial vmcnt/lgkmcnt waits, ALU across barriers, ds_read hoisting): +9% on the
     // transposed kernel, bit-identical results (measured, docs/status.md round 44). AMDC_SCHED=0 turns it off.
     let sched_opts = match sched_opts {
         None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0")
@@ -50,16 +50,30 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
             // merged tree (docs/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
             let mut o = sched::Options::default();
             o.reorder = false;
-            o.ldshoist = true;
+            o.alu_across_barrier = true;
+            o.ldshoist = true; // hoist ds_read above independent work (docs/scheduling.md); AMDC_SCHED=0 / 1 / auto / OPTS override
             Some(o)
         }
         other => other,
     };
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
-        for cut in [0u32, 16, 32, 48] {
+        // (pressure cut, hoist distance cap): first shrink the LDS-read hoisting (it lengthens live ranges and fragments
+        // the register file), then the pressure limit, and only then give up the scheduler.
+        let mut attempts: Vec<(u32, Option<usize>)> = vec![(0, None)];
+        if opts.ldshoist {
+            attempts.extend([(0, Some(24)), (0, Some(8)), (0, Some(0))]);
+        }
+        if opts.reorder {
+            attempts.extend([(16, Some(0)), (32, Some(0)), (48, Some(0))]); // the pressure limit only matters for the reordering scheduler
+        }
+        for (cut, hoist) in attempts {
             let mut o = opts.clone();
             o.max_vgprs = opts.max_vgprs.saturating_sub(cut);
+            if let Some(h) = hoist {
+                o.hoist_dist = h;
+                o.ldshoist = h > 0 && opts.ldshoist;
+            }
             let mut m = base.clone();
             let attempt = (|| -> Result<regalloc::Alloc, String> {
                 sched::run(&mut m, &o)?;
@@ -76,9 +90,6 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
                 Ok(a) => return Ok((m, a)),
                 Err(e) if e.contains("out of VGPRs") => last_err = e,
                 Err(e) => return Err(e),
-            }
-            if !opts.reorder {
-                break;
             }
         }
         eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(120).collect::<String>());
