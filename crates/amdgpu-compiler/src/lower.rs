@@ -1859,6 +1859,10 @@ impl Lowerer {
                 // `foldq`: four consecutive lanes that are exactly the four lanes of one just-loaded V4 are not copied; the load
                 // writes the half of the fragment directly
                 let mut folded = [false; 8];
+                if std::env::var("AMDC_FOLDQ_DEBUG").map(|x| !x.is_empty()).unwrap_or(false) {
+                    let d: Vec<String> = ops8.iter().map(|o| match o { Opnd::Val(ov) => format!("{}:uses{:?}", self.defs.get(ov).map(|d| format!("{d:?}").chars().take(40).collect::<String>()).unwrap_or_default(), self.use_counts.get(ov)), other => format!("{other:?}") }).collect();
+                    eprintln!("FRAG8 {}", d.join(" | "));
+                }
                 if opt_on("foldq") {
                     for half in 0..2usize {
                         if self.fold_lane_group(v, (half * 4) as u8, &ops8[half * 4..half * 4 + 4]) {
