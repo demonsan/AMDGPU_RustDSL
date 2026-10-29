@@ -214,6 +214,9 @@ pub enum Op {
     /// `a` is a Frag4 (the 2:4-compressed A operand), `b` a Frag8 (dense B, 128 K x 16 N),
     /// `idx` the SRC2 dword of sixteen 2-bit sparse indices, `c` the Frag4 accumulator.
     SmfmacFp8_16x16x128 { a: Opnd, b: Opnd, idx: Opnd, c: Opnd },
+    /// A safe-asm instruction sequence (`amdgpu-safeasm`): its input ports are bound to `inputs` (in port order), its single output port is
+    /// the result. Lowered into the same MIR as every other op, so register allocation, scheduling and the hazard passes apply to it.
+    Asm { block: std::sync::Arc<amdgpu_safeasm::AsmBlock>, inputs: Vec<Opnd> },
     /// Read dword `index` (0..15) of a sixteen-dword fragment.
     Frag16Lane { frag: Opnd, index: u8 },
     /// A fragment of `ty` zeroed out.
@@ -281,6 +284,7 @@ impl Op {
             Op::CvtPknormU16(..) | Op::CvtScalef32PkFp8Bf16 { .. } | Op::CvtPkFp8F32(..) | Op::CvtPkBf16F32(..) => DType::U32,
             Op::MfmaScaleFp8_32x32x64 { .. } => DType::Frag16,
             Op::SmfmacFp8_16x16x128 { .. } => DType::Frag4,
+            Op::Asm { block, .. } => asm_out_ty(block),
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
             Op::Frag16Pair { .. } | Op::Frag2Dup(..) | Op::PkAddF32(..) | Op::PkMulF32(..) => DType::Frag2,
@@ -343,6 +347,7 @@ impl Op {
                 vec![*a, *b, *c, *scale_a, *scale_b]
             }
             Op::SmfmacFp8_16x16x128 { a, b, idx, c } => vec![*a, *b, *idx, *c],
+            Op::Asm { inputs, .. } => inputs.clone(),
             Op::Frag16Lane { frag, .. } | Op::Frag16Pair { frag, .. } => vec![*frag],
             Op::Frag2Dup(a) | Op::PartnerMaxF32(a) => vec![*a],
             Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => vec![*a, *b],
@@ -585,6 +590,11 @@ impl FnBuilder {
     pub fn arg(&mut self, name: &str, ty: DType, offset: u32, size: u32) {
         self.f.args.push(Arg { name: name.to_string(), ty, kernarg_offset: offset, size });
         self.f.kernarg_size = self.f.kernarg_size.max(offset + size);
+    }
+
+    /// Embed a safe-asm sequence. `inputs` bind to the block's input ports in order (types are checked against the port classes by `verify`).
+    pub fn asm(&mut self, block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) -> ValueId {
+        self.let_(Op::Asm { block: std::sync::Arc::new(block), inputs: inputs.to_vec() })
     }
 
     pub fn let_(&mut self, op: Op) -> ValueId {
@@ -1789,4 +1799,28 @@ pub fn lint(f: &Function) -> Vec<String> {
         }
     }
     out
+}
+/// Value type of a safe-asm block's single output port (`I32` for one dword: callers bitcast as needed).
+pub fn asm_out_ty(b: &amdgpu_safeasm::AsmBlock) -> DType {
+    use amdgpu_safeasm::AClass;
+    match b.outputs.first().map(|p| p.class) {
+        Some(AClass::V2) => DType::Frag2,
+        Some(AClass::V4) => DType::Frag4,
+        Some(AClass::V8) => DType::Frag8,
+        Some(AClass::V16) => DType::Frag16,
+        _ => DType::I32,
+    }
+}
+
+/// The DSL type a safe-asm input port of class `c` accepts (one dword: any 32-bit value).
+pub fn asm_port_accepts(c: amdgpu_safeasm::AClass, ty: DType) -> bool {
+    use amdgpu_safeasm::AClass;
+    match c {
+        AClass::V1 => matches!(ty, DType::I32 | DType::U32 | DType::F32 | DType::F16),
+        AClass::V2 => ty == DType::Frag2,
+        AClass::V4 => ty == DType::Frag4,
+        AClass::V8 => ty == DType::Frag8,
+        AClass::V16 => ty == DType::Frag16,
+        AClass::S1 | AClass::S2 => false,
+    }
 }
