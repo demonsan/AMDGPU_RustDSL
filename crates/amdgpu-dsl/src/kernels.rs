@@ -7289,15 +7289,19 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let kaddr1 = b.add_i32(kaddr0, c64);
                 let kaddr1h = b.add_i32(kaddr1, c32v);
                 let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
-                // K scale dword of key (128 it + 32 s + j)
-                let kkey0 = b.add_i32(key0, cx.j);
-                let kcs = b.c_i32(32 * s as i32);
-                let kkey_raw = b.add_i32(kkey0, kcs);
-            let kk_ok = b.cmp_lt_i32(kkey_raw, cx.kv_len);
-            let kkey = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kk_ok), a: Opnd::Val(kkey_raw), b: Opnd::Val(cx.kv_last) });
-                let kd_row = b.mul_i32(kkey, hq4);
-                let kd_off = b.add_i32(kd_row, cx.kd_base);
-                let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+                // K scale dword of key (128 it + 32 s + j); the global address is only built when it is used (it was dead code with kdlds: ~10 VALU per tile)
+                let kd_ptr = if !kdlds && !fmha_t_opt("kdconst") && kd_hoisted.is_empty() {
+                    let kkey0 = b.add_i32(key0, cx.j);
+                    let kcs = b.c_i32(32 * s as i32);
+                    let kkey_raw = b.add_i32(kkey0, kcs);
+                    let kk_ok = b.cmp_lt_i32(kkey_raw, cx.kv_len);
+                    let kkey = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kk_ok), a: Opnd::Val(kkey_raw), b: Opnd::Val(cx.kv_last) });
+                    let kd_row = b.mul_i32(kkey, hq4);
+                    let kd_off = b.add_i32(kd_row, cx.kd_base);
+                    Some(b.ptr_add(cx.ptr_kd, kd_off))
+                } else {
+                    None
+                };
                 let kd = if kdlds {
                     let koff = b.c_i32(128 * s as i32);
                     let ka = b.add_i32(kd_rd, koff);
@@ -7307,7 +7311,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 } else if !kd_hoisted.is_empty() {
                     kd_hoisted[s]
                 } else {
-                    let kd_raw = b.load_f32(kd_ptr, 0);
+                    let kd_raw = b.load_f32(kd_ptr.expect("kd address"), 0);
                     b.bitcast_i32(kd_raw)
                 };
                 let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
