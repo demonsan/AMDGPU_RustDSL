@@ -46,9 +46,11 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
         None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0")
             && (f.name.starts_with("fmha_fwd_hd128_mxfp8_t") || f.name.starts_with("fmha_fwd_hd128_mxfp8_sv")) =>
         {
+            // "ld" preset: scoreboard (partial) waits + ds_read hoisting, no instruction reordering. Measured best on the
+            // merged tree (docs/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
             let mut o = sched::Options::default();
             o.reorder = false;
-            o.alu_across_barrier = true;
+            o.ldshoist = true;
             Some(o)
         }
         other => other,
