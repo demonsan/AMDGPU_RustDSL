@@ -120,7 +120,8 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
             let mut m = base.clone();
             let attempt = (|| -> Result<regalloc::Alloc, String> {
                 sched::run(&mut m, &o)?;
-                hazards::fix_value_hazards_opts(&mut m, true);
+                let vcc_fill = f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") && std::env::var("AMDC_VCC_FILL").map_or(false, |v| !v.is_empty() && v != "0");
+                hazards::with_vcc_fill(vcc_fill, || hazards::fix_value_hazards_opts(&mut m, true));
                 let errs = mir::verify(&m);
                 if !errs.is_empty() {
                     return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));

@@ -353,6 +353,11 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VCmpLtI32 => cmp(a, inst, "v_cmp_lt_i32_e32"),
         MOp::VCmpGeI32 => cmp(a, inst, "v_cmp_ge_i32_e32"),
         MOp::VCmpGtI32 => cmp(a, inst, "v_cmp_gt_i32_e32"),
+        MOp::VCmpMaskLtI32 => cmp_mask(a, inst, "v_cmp_lt_i32_e64"),
+        MOp::VCmpMaskGeI32 => cmp_mask(a, inst, "v_cmp_ge_i32_e64"),
+        MOp::VCmpMaskGtI32 => cmp_mask(a, inst, "v_cmp_gt_i32_e64"),
+        MOp::VCmpMaskLtF32 => cmp_mask(a, inst, "v_cmp_lt_f32_e64"),
+        MOp::VCndmaskM => vec![format!("v_cndmask_b32_e64 {}, {}, {}, {}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), spair(a, reg_of(&inst.srcs[2])))],
         MOp::VCmpNeI32 => cmp(a, inst, "v_cmp_ne_i32_e32"),
         MOp::VCmpLtF32 => cmp(a, inst, "v_cmp_lt_f32_e32"),
         MOp::VCndmask => vec![format!(
@@ -632,6 +637,10 @@ fn bin(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
 
 fn un(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
     vec![format!("{} {}, {}", mnemonic, vr(a, inst.dst.unwrap()), src1(a, inst.srcs[0]))]
+}
+
+fn cmp_mask(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
+    vec![format!("{} {}, {}, {}", mnemonic, spair(a, inst.dst.expect("mask dst")), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]))]
 }
 
 fn cmp(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {

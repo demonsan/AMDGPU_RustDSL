@@ -21,6 +21,19 @@ const TRANS_LATENCY: usize = 5;
 /// How many instructions after the stalled consumer are examined as fill candidates.
 const FILL_WINDOW: usize = 48;
 
+thread_local! {
+    static VCC_FILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with stall filling for `vcc` consumers enabled: the movable candidates never read or write `vcc`, so an independent
+/// instruction may be placed between a `v_cmp` and its `v_cndmask` to cover the 2 wait states instead of an `s_nop`.
+pub fn with_vcc_fill<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let old = VCC_FILL.with(|c| c.replace(on));
+    let r = f();
+    VCC_FILL.with(|c| c.set(old));
+    r
+}
+
 fn is_transcendental(op: MOp) -> bool {
     matches!(op, MOp::VExpF32 | MOp::VRcpF32)
 }
@@ -80,6 +93,11 @@ fn movable(op: MOp) -> bool {
     )
 }
 
+/// Extra fill candidates when `vcc` filling is on (none touches vcc; partial writers are guarded by the RAW/WAR/WAW check).
+fn movable_wide(op: MOp) -> bool {
+    matches!(op, MOp::VCvtPknormU16 | MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VMovFromS)
+}
+
 /// VALU instructions whose VGPR result feeding an MFMA operand or a `v_permlane*_swap` needs wait
 /// states first (LLVM GCNHazardRecognizer: 2 states; 4 after carry-out adds). Found by the LLVM-tail
 /// oracle (docs/llvm-tail-integration.md); the exact count is taken from LLVM, not measured.
@@ -89,6 +107,8 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
         MOp::VExpF32 | MOp::VRcpF32 => None,
         o if movable(o) => Some(2),
         // lane write of a fragment (expands to v_mov): the tuple may feed a matrix op next
+        // mask compares write an SGPR pair that the cndmask reads: same 2 wait states as the vcc form (conservative)
+        MOp::VCmpMaskLtI32 | MOp::VCmpMaskGeI32 | MOp::VCmpMaskGtI32 | MOp::VCmpMaskLtF32 => Some(2),
         MOp::VWriteSub | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VCvtPknormU16 => Some(2),
         _ => None,
     }
@@ -99,7 +119,7 @@ fn reads_valu_hazard_operands(op: MOp) -> bool {
     // v_add d; v_readfirstlane s, d; s_mov m0, s; global_load_lds read a stale lane value)
     // SMFMAC: a VALU write of A, B, SRC2 or the accumulator C needs 2 wait states (8 clocks) before the matrix op (CDNA4 ISA 7.6,
     // docs/vendor-spec.md 4.5.2); C is srcs[3] of the MIR op so it is covered like any other source.
-    is_scaled_mfma(op) || matches!(op, MOp::VSmfmac16x16x128Fp8 | MOp::VReadFirstLane | MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
+    is_scaled_mfma(op) || matches!(op, MOp::VCndmaskM | MOp::VSmfmac16x16x128Fp8 | MOp::VReadFirstLane | MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
 }
 
 /// Instructions the scanner must never look past (waits, barriers, nops).
@@ -198,7 +218,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, cycle);
 
             // Fill the stall with independent ALU work from further down the block.
-            if earliest > cycle && !insts[i].op.consumes_vcc() {
+            if earliest > cycle && (!insts[i].op.consumes_vcc() || VCC_FILL.with(|c| c.get())) {
                 let mut j = i + 1;
                 let limit = (i + 1 + FILL_WINDOW).min(insts.len());
                 while earliest > cycle && j < limit.min(insts.len()) {
@@ -206,7 +226,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         break;
                     }
                     let cand = &insts[j];
-                    let mut ok = movable(cand.op)
+                    let mut ok = (movable(cand.op) || (VCC_FILL.with(|c| c.get()) && movable_wide(cand.op)))
                         && cand.dst.is_some()
                         && earliest_of(cand, &ready, &vw, &pkw, cycle) <= cycle;
                     if ok {

@@ -250,6 +250,12 @@ impl Lowerer {
         if opt_on("sink") {
             sink_defs(&mut self.mir);
         }
+        for (name, stride) in [("maskreg", 1usize), ("maskreg2", 2), ("maskreg3", 3), ("maskreg4", 4)] {
+            if opt_on(name) {
+                mask_regs(&mut self.mir, stride);
+                break;
+            }
+        }
         // rematerialise loop-invariant constants next to their loop uses (register pressure; `remat1/2/3` = at most 1/2/any
         // number of loop blocks using the constant)
         let spill_n: usize = std::env::var("AMDC_RA_LDS_SPILL").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0).unwrap_or_else(|| {
@@ -3121,4 +3127,89 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
     let total = area * nwaves;
     m.lds_bytes = base + total;
     (spilled, total)
+}
+/// ``maskreg``: turn ``v_cmp (vcc) ; ... ; v_cndmask`` pairs into compares that write an SGPR pair and a ``v_cndmask_b32_e64`` reading
+/// it, so the scheduler (and the hazard filler) can have several masks in flight instead of one serialised ``vcc``. Only pairs
+/// where nothing between the two touches ``vcc`` and ``vcc`` is not read again afterwards (a branch terminator counts as a read when
+/// the compare is the block's last ``vcc`` writer).
+fn mask_regs(m: &mut MFunction, stride: usize) {
+    let mut seen = 0usize;
+    for bi in 0..m.blocks.len() {
+        let n = m.blocks[bi].insts.len();
+        let mut conv: Vec<(usize, usize, MOp)> = Vec::new();
+        let mut j = 0;
+        while j < n {
+            let cmp_op = match m.blocks[bi].insts[j].op {
+                MOp::VCmpLtI32 => Some(MOp::VCmpMaskLtI32),
+                MOp::VCmpGeI32 => Some(MOp::VCmpMaskGeI32),
+                MOp::VCmpGtI32 => Some(MOp::VCmpMaskGtI32),
+                MOp::VCmpLtF32 => Some(MOp::VCmpMaskLtF32),
+                _ => None,
+            };
+            let Some(mop) = cmp_op else {
+                j += 1;
+                continue;
+            };
+            if m.blocks[bi].insts[j].dst.is_some() {
+                j += 1;
+                continue;
+            }
+            // VOP3 has no literal operand on gfx9: only inline integer constants (and none at all for the f32 compare)
+            let bad_imm = m.blocks[bi].insts[j].srcs.iter().any(|s| match s {
+                Src::Imm(k) => mop == MOp::VCmpMaskLtF32 || !(-16..=64).contains(k),
+                _ => false,
+            });
+            if bad_imm {
+                j += 1;
+                continue;
+            }
+            // next vcc touching instruction
+            let mut k = j + 1;
+            let mut found = None;
+            while k < n {
+                let x = &m.blocks[bi].insts[k];
+                if x.op == MOp::VCndmask && x.dst.is_some() && x.srcs.len() == 2 {
+                    found = Some(k);
+                    break;
+                }
+                if x.op.consumes_vcc() || x.op.defines_vcc() || matches!(x.op, MOp::VPtrAdd | MOp::VCmpNeI32 | MOp::SWaitVm | MOp::SWaitLgkm | MOp::SBarrier) || x.dst.is_none() && !matches!(x.op, MOp::SNop) {
+                    break;
+                }
+                k += 1;
+            }
+            let Some(ci) = found else {
+                j += 1;
+                continue;
+            };
+            // vcc must be dead after the cndmask: the next vcc touching instruction must be a writer, and the block must not end first
+            let mut dead = false;
+            for x in &m.blocks[bi].insts[ci + 1..] {
+                if x.op.consumes_vcc() {
+                    break;
+                }
+                if x.op.defines_vcc() || matches!(x.op, MOp::VPtrAdd | MOp::VCmpNeI32) {
+                    dead = true;
+                    break;
+                }
+            }
+            if dead {
+                // stride > 1: only every `stride`-th pair uses a mask register (bounds the SGPRs in flight)
+                if seen % stride == 0 {
+                    conv.push((j, ci, mop));
+                }
+                seen += 1;
+            }
+            j = ci + 1;
+        }
+        for (cj, ci, mop) in conv {
+            let mask = m.vregs.len() as VReg;
+            m.vregs.push(RClass::S2);
+            let c = &mut m.blocks[bi].insts[cj];
+            c.op = mop;
+            c.dst = Some(mask);
+            let x = &mut m.blocks[bi].insts[ci];
+            x.op = MOp::VCndmaskM;
+            x.srcs.push(Src::Reg(mask));
+        }
+    }
 }

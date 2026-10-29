@@ -84,7 +84,7 @@ pub fn cost(op: MOp) -> OpCost {
         VMovB32 | VAddF32 | VSubF32 | VMulF32 | VFmaF32 => co(Valu, 4, 2, 4, Verified),
         VMovFromS | VReadPhys | VAddU32 | VMaxF32 | VMax3F32 | VPermB32 | VPkSubU16
         | VAndB32 | VOrB32 | VXorB32 | VLshrB32 | VLshlB32 | VCvtPknormU16 | VCvtPkBf16F32 | VCvtF32F16
-        | VCvtF16F32 | VCndmask | VReadSub | VWriteSub | VCmpLtI32 | VCmpGeI32 | VCmpGtI32 | VCmpNeI32 | VCmpLtF32
+        | VCvtF16F32 | VCndmask | VReadSub | VWriteSub | VCmpLtI32 | VCmpGeI32 | VCmpGtI32 | VCmpNeI32 | VCmpLtF32 | VCmpMaskLtI32 | VCmpMaskGeI32 | VCmpMaskGtI32 | VCmpMaskLtF32 | VCndmaskM
         | VAddCoU32 | VAddcCoU32 | VPkAddF32 | VPkMulF32 => c(Valu, 4, 4, Verified),
         // 8 cycles (V): fp8 conversion, permlane32_swap, exp/rcp (no separate trans pipe: 8 + 4k for k adds).
         VCvtPkFp8F32 | VCvtPkFp8Lo | VCvtPkFp8Hi | VCvtPkFp8F32Hi | VPermlane32Swap | VExpF32 | VRcpF32 => {
