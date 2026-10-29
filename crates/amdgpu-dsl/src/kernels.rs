@@ -988,6 +988,64 @@ pub fn probe_dma() -> Function {
 /// r = wave + 4 q at LDS byte 1024 r, rows of 128 bytes), then every thread reads its 4 x 16 bytes back.
 /// `o` must equal `i` (16 KB).
 pub fn probe_dma_tile() -> Function {
+    // PD_NEW=1: one M0 per wave (run 1040 (4 wave + q) via signed instruction offsets, compensated source address),
+    // readback at LDS 1040 rho into o[1024 rho ..]
+    let new_mode = std::env::var("PD_NEW").map(|v| !v.is_empty()).unwrap_or(false);
+    let mut b = FnBuilder::new("probe_dma_tile", 256);
+    b.lds(std::env::var("PD_LDS").ok().and_then(|v| v.parse().ok()).unwrap_or(20000));
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("i", DType::Ptr, 8, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let inp = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let c6 = b.c_i32(6);
+    let c63 = b.c_i32(63);
+    let c16 = b.c_i32(16);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
+    let l16 = b.mul_i32(lane, c16);
+    if new_mode {
+        let c1024 = b.c_i32(1024);
+        let c4160 = b.c_i32(4160);
+        let c3120 = b.c_i32(3120);
+        let w4 = b.mul_i32(wave, c4);
+        let w4k = b.mul_i32(w4, c1024);
+        let wsrc = b.add_i32(w4k, l16);
+        let w4160 = b.mul_i32(wave, c4160);
+        let top = b.add_i32(w4160, c3120);
+        for q in 0..4i32 {
+            let cq = b.c_i32(1024 * q + 1040 * (3 - q));
+            let off = b.add_i32(wsrc, cq);
+            let sp = b.ptr_add(inp, off);
+            b.load_global_lds(sp, top, -(1040 * (3 - q)), 4);
+        }
+        b.wait_vm(0);
+        b.wait_lds(0);
+        b.barrier();
+        // thread t reads 4 x 16 B of run rho = 4 wave + q at LDS 1040 rho + 16 lane
+        let c1040 = b.c_i32(1040);
+        for q in 0..4i32 {
+            let cq = b.c_i32(q);
+            let rho = b.add_i32(w4, cq);
+            let la = b.mul_i32(rho, c1040);
+            let a = b.add_i32(la, l16);
+            let v = b.load_lds_b128(Opnd::Val(a));
+            let r1024 = b.mul_i32(rho, c1024);
+            let od = b.add_i32(r1024, l16);
+            let op = b.ptr_add(o, od);
+            for w in 0..4u8 {
+                let x = b.frag4_lane(v, w);
+                let f = b.bitcast_f32(x);
+                b.store_f32(op, 4 * w as u32, f);
+            }
+        }
+        return b.finish();
+    }
+    b.finish()
+}
+/// (previous version, kept)
+pub fn probe_dma_tile_old() -> Function {
     let mut b = FnBuilder::new("probe_dma_tile", 256);
     b.lds(std::env::var("PD_LDS").ok().and_then(|v| v.parse().ok()).unwrap_or(16384));
     b.arg("o", DType::Ptr, 0, 8);

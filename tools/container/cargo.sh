@@ -42,6 +42,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e PD_MAP="${PD_MAP:-}" \
     -e PD_Q="${PD_Q:-}" \
     -e PD_BAR="${PD_BAR:-}" \
+    -e PD_NEW="${PD_NEW:-}" \
     -e AMDC_M0_NOP="${AMDC_M0_NOP:-}" \
     -e AMDC_DMA_NOP="${AMDC_DMA_NOP:-}" \
     -e FMHA_LDSPAD="${FMHA_LDSPAD:-}" \
