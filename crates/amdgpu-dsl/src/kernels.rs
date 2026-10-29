@@ -1331,7 +1331,8 @@ pub fn probe_dma_map() -> Function {
         _ => {
             let hi = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c3)));
             let lo = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c7)));
-            let c1024 = b.c_i32(1024);
+            let rs: i32 = std::env::var("PD_MAPSTRIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+            let c1024 = b.c_i32(rs);
             let a = b.mul_i32(hi, c1024);
             let bb = b.mul_i32(lo, c16);
             b.add_i32(a, bb)
