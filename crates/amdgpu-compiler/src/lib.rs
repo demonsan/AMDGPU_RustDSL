@@ -139,6 +139,11 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
     }
     let alloc = regalloc::allocate(&m)?;
+    // Register reuse (especially the hole-filling packing) can place a new value in a register an in-flight MFMA still reads:
+    // pad the physical write-after-read hazard on every path, not only for scheduled code (AMDC_NO_PHYS_WAR=1 disables, testing).
+    if std::env::var("AMDC_NO_PHYS_WAR").map(|v| v.is_empty() || v == "0").unwrap_or(true) {
+        hazards::pad_physical_war(&mut m, &alloc);
+    }
     Ok((m, alloc))
 }
 
@@ -146,6 +151,27 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
 pub fn export_mir(f: &amdgpu_dsl::Function, tail: &backend::LlvmTail) -> Result<String, String> {
     let (m, alloc) = lower_and_allocate(f)?;
     tail.export_mir(&m, &alloc)
+}
+
+/// Does the kernel contain own-backend-only MOps (the LDS-DMA loads)? The LLVM tail cannot express them.
+pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
+    match lower::lower_with_extra(f, &[]) {
+        Ok(m) => m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, mir::MOp::GlobalLoadLdsB128 | mir::MOp::GlobalLoadLdsB32))),
+        Err(_) => false,
+    }
+}
+
+/// Backend policy: uto (the CLI default) is llvm-tail unless the kernel uses own-backend-only ops, then own;
+/// explicit own / llvm-tail are returned unchanged. The second value is a note to print when auto switched.
+pub fn resolve_backend(name: &str, f: &amdgpu_dsl::Function) -> (String, Option<String>) {
+    if name != "auto" {
+        return (name.to_string(), None);
+    }
+    if uses_own_only_ops(f) {
+        ("own".to_string(), Some(format!("kernel {} uses own-backend-only ops (DMA); emitting with --backend=own", f.name)))
+    } else {
+        ("llvm-tail".to_string(), None)
+    }
 }
 
 /// All kernel definitions currently shipped with the DSL.
