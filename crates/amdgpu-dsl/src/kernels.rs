@@ -1139,9 +1139,8 @@ pub fn probe_dma_kread() -> Function {
     // trailing DMA (see emit_fmha_sv_role)
     {
         let spare = b.c_i32(17408);
-        let sp = b.ptr_add(inp, b.c_i32(0));
-        let _ = sp;
-        let r0 = b.mul_i32(lane, b.c_i32(16));
+        let c16 = b.c_i32(16);
+        let r0 = b.mul_i32(lane, c16);
         let sp2 = b.ptr_add(inp, r0);
         b.load_global_lds(sp2, spare, 0, 4);
     }
@@ -1149,10 +1148,9 @@ pub fn probe_dma_kread() -> Function {
     b.wait_lds(0);
     b.barrier();
     // K-fragment style reads
-    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
-    let g = b.let_(Op::AndI32(Opnd::Val(b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5))), Opnd::Val(c1)));
+    let t5 = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
+    let g = b.let_(Op::AndI32(Opnd::Val(t5), Opnd::Val(c1)));
     let jj = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
-    let _ = j;
     let wsel = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
     let w32 = b.shl_i32(wsel, c5);
     let rowk = b.add_i32(jj, w32);
