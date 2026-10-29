@@ -140,19 +140,28 @@ Cosmetic differences between the two outputs (all semantically identical, Verifi
   Measured on hardware (GPU 4, `tools/auto_vs_plain.sh`, cycles/iteration, 1 wave / 2 waves per SIMD, auto vs plain): sched_valu_mul -37%/-36%, valu_max3 -35%/-22%, valu_exp -23%/-14%, mfma_chain -40%/-1%, mfma_valu16 -37%/-15%, mfma_valu4 -56%/-24%, diamond -32%/-14%. FMHA B1H8S2048 (TFLOP/s, 3 reps): own 224.6-224.7, llvm-tail 224.0-226.3, llvm-tail+auto 224.7-225.6 (identical code to llvm-tail: auto leaves FMHA unscheduled).
 * Open conformance items: kill/dead flags not exported (3 LLVM peephole tests skipped, conservative), MMO atomic/LDS-DMA information when the DSL needs it, 2 verifier cases (`waitcnt.mir`, `waitcnt-agpr.mir`, not root-caused).
 
-## Compiler-side FMHA gains: waits, LDS-read hoisting, dead code (round 4)
+## Compiler-side FMHA gains: waits, LDS-read hoisting, dead code (round 4, merged-Main numbers)
 
-Evidence (rocprofv3, fmha_t B1H8S2048, vs vendor): the gap was not VALU count alone: SQ_WAIT_INST_ANY 5.3M vs 2.76M, SQ_BUSY 4.8M vs 2.39M, SQ_LDS_BANK_CONFLICT 524288 vs 0, SQ_IFETCH 928k vs 667k. Findings and measured effect (TFLOP/s, 3 reps, GPU 4, every variant bit-identical to the plain build on the 15 run_ref shapes; `tools/opt_ab.sh`):
+Builds: all numbers below are `fmha_fwd_hd128_mxfp8_t`, B1H8S2048, 30 iters, GPU 4, 3 reps, default LLVM-tail backend, on the MERGED Main (kernel-opt defaults `cvt4,pksub,lazy,msum,permlane,kdlds,dbuf,lacc1,psh2,svpk,svcorr`, commit a9f5f081 of backend-tail = Main 060e16f + the fixes listed here). "plain" = `AMDC_SCHED=0 AMDC_LOWER_OPTS=none` (no scheduler, no lowering opts) = bit-exactness reference. Every row is bit-identical to plain on the 15 run_ref shapes (`tools/opt_ab.sh`).
 
-| configuration | TFLOP/s |
-|---|---|
-| plain (lowering waits) | 258.2 |
-| `AMDC_DROP_AUTO_WAITS=1` (LLVM computes waits) | 259.4 |
-| `AMDC_SCHED=1 AMDC_SCHED_OPTS=rewait` (scoreboard waits; removes the loop-head `vmcnt(0)` drain that lowering inserts at the masked-tail `if`) | 264.7 |
-| full reorder scheduler (`AMDC_SCHED=1`) | 261.5 (`xbar`: 258.9) |
-| `rewait,ldshoist` = **`AMDC_SCHED=ld`** (new `sched/hoist.rs`: hoist `ds_read` above independent work, pressure- and dependence-limited, verified by `verify::check_perm`; waits become partial `lgkmcnt(n)`) | 273.5 |
-| + `AMDC_LOOP_ALIGN=64` (loop headers aligned; both backends) | 273.7-274.2 |
-| + default lowering opts `dce,cmpfold` | **285.0-286.5** (+10.4% vs plain) |
-| + `imm`, `saddr`, `sgpr`, `shl` (all, flagged off) | 285.3-285.5 (neutral) |
+| configuration (env) | TFLOP/s | notes |
+|---|---|---|
+| plain: `AMDC_SCHED=0 AMDC_LOWER_OPTS=none` | 260.5-262.3 | reference |
+| `AMDC_SCHED=0` (lowering opts `dce,cmpfold` only) | 264.5-265.0 | VALU -3.2%, INT32 -12% |
+| **default** (`dce,cmpfold` + fmha scheduler default `rewait,xbar,ldshoist`) | **288.2-289.2** | VALU 3.196M, WAIT_ANY 6.22M |
+| `AMDC_SCHED=ld` (rewait + ldshoist, no xbar) | 288.1-288.7 | same as default within noise |
+| default + `AMDC_LOOP_ALIGN=64` | 288.4-288.8 | +0.1%: noise level, stays off |
+| default + `FMHA_OPT=...,swz` (XOR swizzle) | **292.6-293.1** | LDS bank conflicts 524288 -> 8704 |
+| swz + `AMDC_LOOP_ALIGN=64` | 291.8-292.0 | alignment does not help here |
+| own backend, default | 282.9-284.2 | LLVM tail is ~+1.7% faster (fewer/shorter nops) |
 
-Lowering options (`AMDC_LOWER_OPTS`, default `dce,cmpfold`, `none` disables): `dce` vcc-aware full DCE (removes the dead per-iteration K-scale address chain), `cmpfold` (`select(cmp)` re-issues the compare), `imm` (in-line/literal operands; cndmask only with in-line constants because of the constant bus), `saddr` (scalar-base global loads, new MOps `GlobalLoadB128S/F32S` with rows in both dialect tables), `sgpr` (SGPR VALU operands), `shl` (mul by power of two). Alone, VALU reductions did not speed the kernel up (-14% VALU, 0% time) until the LDS-latency stall was removed; then `dce,cmpfold` gave +4%. Scheduler stays opt-in (`AMDC_SCHED=ld` / `--sched=ld`). Counters plain -> `ld`: WAVE_CYCLES 18.5M -> 17.6M, WAIT_ANY 7.5M -> 6.4M, BUSY 4.80M -> 4.56M, IFETCH 928k -> 894k (886k with alignment). Still open: LDS bank conflicts (kernel layout), cold-arm layout (taken `s_branch` around the masked variant and each lazy-rescale `if`, ~70 cycles/iteration by the model).
+Counters (rocprofv3, same process; plain / default / default+swz): SQ_INSTS_VALU 3.302M / 3.196M / 3.314M (vendor 2.055M); VALU_INT32 301k / 264k / 351k (vendor 89k); SQ_WAIT_ANY 7.29M / 6.22M / 6.07M; SQ_BUSY_CYCLES 4.58M / 4.33M / 4.26M (vendor 2.39M); SQ_WAVE_CYCLES 17.52M / 16.66M / 16.36M (vendor 9.4M); SQ_IFETCH 834k / 782k / 797k (vendor 667k); SQ_LDS_BANK_CONFLICT 524288 / 524288 / **8704** (vendor 0; confirms the swizzle closes that item).
+
+What contributed, in order (earlier OLD-Main measurements, before kernel-opt made `rewait,xbar` the fmha default, were: plain 258.2, rewait 264.7, rewait+ldshoist 273.5, + dce,cmpfold 285.0; on the merged Main the baseline is already `rewait,xbar`, so only the increments that are still real are in the table above):
+* `AMDC_SCHED=0` -> default: +9% (waits: lowering drained `vmcnt(0)` at the masked-tail `if` every iteration; ds_read batches waited with `lgkmcnt(0)` into reused registers).
+* `ldshoist` on top of `rewait,xbar` (merged Main, measured by the lead on GPU 2): 285.05 -> 286.12-286.56, i.e. +0.4%; on OLD Main it was +3.2% over `rewait` alone. It is now part of the fmha default; it is bounded by the register budget (see the retry fix below).
+* Lowering `dce,cmpfold`: +1.4% without the scheduler (264.9 vs 261.5), larger on top of the latency fix.
+Negative / neutral results: VALU-only reductions (`imm`, `saddr`, `sgpr`, `shl`, `dce`, `cmpfold` alone, -14% VALU) gave 0% (even -0.3..-0.9%) until the LDS-latency stall was removed; `imm/saddr/sgpr/shl` stay neutral on top of the final configuration (284.7-285.5 vs 285.0-286.5 on OLD Main) and are OFF; the full reordering scheduler (`AMDC_SCHED=1`) is worse than `rewait` (261.5 vs 264.7, OLD Main); `AMDC_DROP_AUTO_WAITS=1` +0.5%; loop alignment +0.1..0.3%.
+
+Fixes made while closing this out (all found by the matrix): (1) `AMDC_LOWER_OPTS` set to the empty string (what `tools/container/cargo.sh` forwards when unset) disabled all lowering opts, so the "default" was silently off in the container; empty now means default. (2) The scheduler retry loop broke out after the first failed allocation in rewait mode, so with the swizzle (`swz`, 256 VGPRs) the default fell back to the completely unscheduled code (260 TFLOP/s); it now walks hoist caps (24, 8, 0) before giving up (swz default: 260.8 -> 292.6).
+Reproduce: `AB_VARIANTS=default bash tools/opt_ab.sh` (add `AB_EXTRA_ENV="FMHA_OPT=...,swz"`, `AB_REF`/`AB_TAG` for bit-exact comparison), counters `bash tools/counters.sh build/ab/<tag>_v_default.co`.

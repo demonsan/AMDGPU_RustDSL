@@ -103,4 +103,4 @@ Pipelining of multi-block loop bodies (diamonds, barriers), common-prefix hoisti
 
 ## ldshoist / preset ld (round 4)
 
-`AMDC_SCHED=ld` = `rewait` + `ldshoist`: no instruction reordering except hoisting `ds_read*` upward inside a block (distance `hoist=N`, default 64; budget: live VGPR dwords <= max_vgprs). On fmha_t B1H8S2048: 258.2 -> 273.5 TFLOP/s (285 with the default `dce,cmpfold`), bit-identical output. Table and counters: docs/llvm-tail-integration.md, section 'Compiler-side FMHA gains'.
+`AMDC_SCHED=ld` = `rewait` + `ldshoist`. The fmha_fwd_hd128_mxfp8_t/_sv default is now `rewait,xbar,ldshoist` (lib.rs::lower_and_allocate); `AMDC_SCHED=0/1/auto/ld` and `AMDC_SCHED_OPTS` override. `ldshoist` hoists `ds_read*` upward inside a block (`hoist=N`, default 64) within a live-VGPR budget, each block verified by `verify::check_perm`; on out-of-VGPR the retry caps the hoist distance (24, 8, 0) before dropping the scheduler. Merged-Main numbers (B1H8S2048, GPU 4): plain 260.5-262.3, default 288.2-289.2, with the XOR swizzle 292.6-293.1 TFLOP/s; full tables, counters and negative results in docs/llvm-tail-integration.md (last section).
