@@ -9596,11 +9596,15 @@ pub fn sched_occ_chain() -> Function {
 //     identifies which dense-B dword lands in which (key, row) slot;
 //   * lane masks (tid < 32) on the index register and on A answer whether the sparse index and the
 //     compressed-A values are consumed per lane or per wave.
-fn probe_smfmac_dump(b: &mut FnBuilder, row: ValueId, slot: usize, d: ValueId) {
+fn probe_smfmac_dump(b: &mut FnBuilder, base: ValueId, slot: usize, d: ValueId) {
+    // global_store_dword only carries a 13-bit signed immediate offset, so each 1 KB slot gets its
+    // own base pointer (base = o + tid*16).
+    let off = b.c_i32((slot * 1024) as i32);
+    let row = b.ptr_add(base, off);
     for i in 0..4u8 {
         let bits = b.frag4_lane(d, i);
         let v = b.bitcast_f32(bits);
-        b.store_f32(row, (slot * 1024 + 4 * i as usize) as u32, v);
+        b.store_f32(row, 4 * i as u32, v);
     }
 }
 
@@ -9611,7 +9615,7 @@ pub fn probe_smfmac_ones() -> Function {
     let tid = b.let_(Op::WorkitemId);
     let c16 = b.c_i32(16);
     let lane_off = b.mul_i32(tid, c16);
-    let row = b.ptr_add(o, lane_off);
+    let base = b.ptr_add(o, lane_off);
 
     let ones = b.c_i32(0x38383838u32 as i32); // E4M3 1.0 in all four bytes
     let zero = b.c_i32(0);
@@ -9644,38 +9648,38 @@ pub fn probe_smfmac_ones() -> Function {
 
     // 0/1: one smfmac with each index pattern, all-ones A and B -> number of contracted K positions.
     let d = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, c0);
-    probe_smfmac_dump(&mut b, row, 0, d);
+    probe_smfmac_dump(&mut b, base, 0, d);
     let d = b.smfmac_fp8_16x16x128(a_ones, b_ones, i23, c0);
-    probe_smfmac_dump(&mut b, row, 1, d);
+    probe_smfmac_dump(&mut b, base, 1, d);
     // 2: the two patterns accumulated into one D -> the full 128-key row sum if complementary.
     let d = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, c0);
     let d = b.smfmac_fp8_16x16x128(a_ones, b_ones, i23, d);
-    probe_smfmac_dump(&mut b, row, 2, d);
+    probe_smfmac_dump(&mut b, base, 2, d);
     // 3/4: degenerate index patterns (pairs equal / all zero) - often accepted or UB.
     let d = b.smfmac_fp8_16x16x128(a_ones, b_ones, i11, c0);
-    probe_smfmac_dump(&mut b, row, 3, d);
+    probe_smfmac_dump(&mut b, base, 3, d);
     let d = b.smfmac_fp8_16x16x128(a_ones, b_ones, i00, c0);
-    probe_smfmac_dump(&mut b, row, 4, d);
+    probe_smfmac_dump(&mut b, base, 4, d);
     // 5: zero A -> D must be zero (sanity).
     let d = b.smfmac_fp8_16x16x128(a_zero, b_ones, i01, c0);
-    probe_smfmac_dump(&mut b, row, 5, d);
+    probe_smfmac_dump(&mut b, base, 5, d);
     // 6: index chosen by a lane mask (lanes 0..31 vs 32..63) -> is SRC2 per lane or per wave?
     let d = b.smfmac_fp8_16x16x128(a_ones, b_ones, sel_idx, c0);
-    probe_smfmac_dump(&mut b, row, 6, d);
+    probe_smfmac_dump(&mut b, base, 6, d);
     // 7: A zeroed on lanes 32..63 -> which D rows/lanes depend on which lane's A data?
     let d = b.smfmac_fp8_16x16x128(a_lane, b_ones, i01, c0);
-    probe_smfmac_dump(&mut b, row, 7, d);
+    probe_smfmac_dump(&mut b, base, 7, d);
     // 8/9: B has a single marker byte in dword 0 (value 1.0) -> identifies its (K,N) slot and
     //      whether that K position is selected by each index pattern.
     let d = b.smfmac_fp8_16x16x128(a_ones, b_d0, i01, c0);
-    probe_smfmac_dump(&mut b, row, 8, d);
+    probe_smfmac_dump(&mut b, base, 8, d);
     let d = b.smfmac_fp8_16x16x128(a_ones, b_d0, i23, c0);
-    probe_smfmac_dump(&mut b, row, 9, d);
+    probe_smfmac_dump(&mut b, base, 9, d);
     // 10: one power-of-two marker per B dword -> weighted counts per (row, dword).
     let d = b.smfmac_fp8_16x16x128(a_ones, b_mark, i01, c0);
-    probe_smfmac_dump(&mut b, row, 10, d);
+    probe_smfmac_dump(&mut b, base, 10, d);
     // 11: marker A dwords (1,2,4,8) with all-ones B -> which compressed-A dword feeds which row.
     let d = b.smfmac_fp8_16x16x128(a_mark, b_ones, i01, c0);
-    probe_smfmac_dump(&mut b, row, 11, d);
+    probe_smfmac_dump(&mut b, base, 11, d);
     b.finish()
 }
