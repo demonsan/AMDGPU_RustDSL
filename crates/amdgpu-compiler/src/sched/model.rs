@@ -98,6 +98,8 @@ pub fn cost(op: MOp) -> OpCost {
         VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z => c(Mfma, 64, 84, Verified),
         VMfma32x32x16Fp8 | VMfma32x32x8F16 | VMfma32x32x8F16Z => c(Mfma, 32, 48, Verified),
         VMfma16x16x32Fp8 | VMfma16x16x16F16 => c(Mfma, 16, 32, Verified),
+        // Sparse fp8 16x16x128: arch table says 32 cycles (MI350X, F8 involved); latency not measured.
+        VSmfmac16x16x128Fp8 => c(Mfma, 32, 32, Experimental),
         // LDS (E): b128 issue 8, b32 4, tr_b8 ~6, write b128 ~26; latency ~52 (reads) / ~75 (write).
         LdsReadB128 => c(Lds, 8, 52, Experimental),
         LdsReadB32 => c(Lds, 4, 52, Experimental),
