@@ -1016,7 +1016,9 @@ pub fn probe_dma_tile() -> Function {
         let r128 = b.mul_i32(row, c128);
         let off = b.add_i32(r128, cbytes);
         let sp = b.ptr_add(inp, off);
-        let cl = b.c_i32(4096 * q);
+        let pd_base: i32 = std::env::var("PD_BASE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let pd_qs: i32 = std::env::var("PD_QS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096);
+        let cl = b.c_i32(pd_base + pd_qs * q);
         let l = b.add_i32(w1024, cl);
         b.load_global_lds(sp, l, 0, 4);
         if let Some(w) = std::env::var("PD_WAIT").ok().and_then(|v| v.parse::<u8>().ok()) {
@@ -1028,7 +1030,9 @@ pub fn probe_dma_tile() -> Function {
     b.barrier();
     let off16 = b.mul_i32(tid, c16);
     for k in 0..4i32 {
-        let ck = b.c_i32(4096 * k);
+        let pd_base: i32 = std::env::var("PD_BASE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let pd_qs: i32 = std::env::var("PD_QS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096);
+        let ck = b.c_i32(pd_base + pd_qs * k);
         let a = b.add_i32(off16, ck);
         let v = b.load_lds_b128(Opnd::Val(a));
         let op = b.ptr_add(o, a);
