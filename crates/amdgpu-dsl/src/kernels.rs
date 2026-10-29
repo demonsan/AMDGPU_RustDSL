@@ -9017,7 +9017,15 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 
     // ---- loop state ----
     let ones_w = b.c_i32(0x38383838);
+    // smf: row sums with two v_smfmac_f32_16x16x128_fp8_fp8 per 128 keys (A = constant E4M3 ones, complementary 2:4 index patterns for the
+    // two P halves, docs/vendor-spec.md 4.5.1; accumulate from the zero-initialised loop variable only) instead of the ones-MFMA
+    let smf = fmha_t_opt("smf");
+    assert!(!(smf && svscale), "smf (smfmac row sums) has no scale operand: it cannot carry svscale");
     let ones8 = b.frag8(ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w);
+    let a_ones = b.frag4(ones_w, ones_w, ones_w, ones_w);
+    let idx01 = b.c_i32(0x4444_4444_u32 as i32);
+    let idx23 = b.c_i32(0xeeee_eeee_u32 as i32);
+    let zero4 = b.frag_zero(DType::Frag4);
     let ones_h = b.c_i32(0x3C003C00);
     let ones_f16 = b.frag2(ones_h, ones_h);
     let w_init = b.c_i32(0x48004800u32 as i32); // B = 64: the first V phase always rolls back
@@ -9071,7 +9079,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (DType::Frag16, Opnd::Val(zero)),
         (DType::Frag16, Opnd::Val(s_init[0])), // 6..7 S tiles of the current 64-key unit
         (DType::Frag16, Opnd::Val(s_init[1])),
-        (DType::Frag16, Opnd::Val(zero)),     // 8 row sums
+        if smf { (DType::Frag4, Opnd::Val(zero4)) } else { (DType::Frag16, Opnd::Val(zero)) }, // 8 row sums
         (DType::I32, Opnd::Val(c0)),          // 9 ring index (tile mod 3)
     ];
     if let Some(k0) = kdp0 {
@@ -9310,7 +9318,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot)).collect();
         let p8 = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
         let scb = if w.len() > 8 { w[8] } else { c123 };
-        b.var_mfma_scale(la, ones8, p8, c127, scb);
+        if smf {
+            b.var_smfmac_fp8(la, a_ones, p8, if hh == 0 { idx01 } else { idx23 });
+        } else {
+            b.var_mfma_scale(la, ones8, p8, c127, scb);
+        }
         for e in 0..4usize {
             let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
             for r in 0..4i32 {
@@ -9407,7 +9419,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.end_if();
     }
     // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
-    let l0 = b.frag16_lane(la, 0);
+    let l0 = if smf { b.frag4_lane(la, 0) } else { b.frag16_lane(la, 0) };
     let l_tot = b.bitcast_f32(l0);
     let inv_l = b.rcp_f32(l_tot);
     let fin = b.mul_f32(inv_l, cx.vd_raw);
