@@ -239,6 +239,7 @@ pub const ALL_MOPS: &[crate::mir::MOp] = &[
     MOp::SAddcU32,
     MOp::SMulI32,
     MOp::SShlB32,
+    MOp::VSmfmac16x16x128Fp8,
     MOp::SLshrB32,
     MOp::SAndB32,
     MOp::SXorB32,

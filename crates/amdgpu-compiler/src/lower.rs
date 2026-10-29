@@ -1766,11 +1766,14 @@ impl Lowerer {
                     }
                 };
                 self.push(
+                    // srcs: A, B, SRC2 (sparse index) and the implicit in-place accumulator C (== D), so that liveness,
+                    // the scheduler and the hazard passes see that the instruction reads D.
                     MInst::new(MOp::VSmfmac16x16x128Fp8)
                         .def(d)
                         .srcreg(ra)
                         .srcreg(rb)
-                        .srcreg(ri),
+                        .srcreg(ri)
+                        .srcreg(d),
                 );
                 self.val.insert(dst, d);
             }
