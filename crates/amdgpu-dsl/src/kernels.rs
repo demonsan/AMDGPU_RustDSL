@@ -8677,6 +8677,10 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.end_loop();
 
     if fmha_t_opt("dbgret") {
+        if fmha_t_opt("dbgwait") {
+            b.wait_vm(0);
+            b.wait_lds(0);
+        }
         return;
     }
     if fmha_t_opt("dbgload") {
