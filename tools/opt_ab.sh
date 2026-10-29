@@ -13,7 +13,7 @@ SHAPES=("1 1 256 256 1" "1 2 512 512 1" "2 4 1024 1024 1" "1 8 2048 2048 1" "1 2
 first=""
 for V in ${AB_VARIANTS:-none}; do
   T="v_$(echo $V | tr ',' '_')"
-  ( export AMDC_LOWER_OPTS=$V $AB_EXTRA_ENV
+  ( export AMDC_LOWER_OPTS=$V ${AB_EXTRA_ENV:-}
     bash tools/container/cargo.sh run -q --bin amdc -- emit $K --out /work/build/ab/$T.s 2>&1 | grep -E "compile error|error:" -A3
     "$ASM/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/ab/$T.co build/ab/$T.s ) || continue
   echo "### variant $V: static valu=$(grep -cE '^\s+v_' build/ab/$T.s) mov=$(grep -cE '^\s+v_mov_b32' build/ab/$T.s) nop=$(grep -cE 's_nop' build/ab/$T.s) $(grep -m1 vgpr_count build/ab/$T.s | tr -s ' ')"
