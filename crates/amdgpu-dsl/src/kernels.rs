@@ -8879,7 +8879,14 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let c128v = b.c_i32(128);
     let zero = b.frag_zero(DType::Frag16);
     let hq4_d = cx.kd_stride;
-    let c_thr = b.c_f32(if fmha_t_opt("svinf") { 1.0e9 } else { 135.0 / 512.0 }); // svinf: never roll back (timing diagnostic, wrong numerics)
+    // svscale: the reference only moves ("rebase") when the row max is far above it (S' > 0.45, i.e. 2^100 above); smaller growth is
+    // absorbed by a per-lane power-of-two scale of this unit's P (cvt scale operand) that the PV/row-sum MFMA scale operand undoes
+    let svscale = fmha_t_opt("svscale");
+    let c_thr = b.c_f32(if fmha_t_opt("svinf") { 1.0e9 } else if svscale { 0.45 } else { 135.0 / 512.0 }); // svinf: never roll back (timing diagnostic, wrong numerics)
+    let c135f = b.c_f32(135.0);
+    let c0p5 = b.c_f32(0.5);
+    let c2p23 = b.c_f32(8388608.0);
+    let cmagic = b.c_i32(-0x4B00_0000);
     let c_b131 = b.c_f32((131 - shd) as f32 / 512.0);
     let c8f = b.c_f32(8.0);
     let c0125 = b.c_f32(0.125);
@@ -9199,6 +9206,24 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.set_var(bias2, nb);
         }
         b.end_if();
+        // per-lane scale: Delta = ceil(512 S'max - 135) (0 for lanes that rebased); P_fp8 = P_bf16 2^-Delta, MFMA scale 123 + Delta
+        let (p_scale, scb) = if svscale {
+            let t0 = b.mul_f32(mt, c512f);
+            let t1 = b.sub_f32(t0, c135f);
+            let t2 = b.max_f32(t1, zero_f);
+            let t3 = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(zero_f), b: Opnd::Val(t2) });
+            let y = b.add_f32(t3, c0p5);
+            let z = b.add_f32(y, c2p23);
+            let zi = b.bitcast_i32(z);
+            let di = b.add_i32(zi, cmagic);
+            let dfl = b.sub_f32(z, c2p23);
+            let ndf = b.sub_f32(zero_f, dfl);
+            let sc = b.exp2_f32(ndf);
+            let scb = b.add_i32(di, c123);
+            (sc, scb)
+        } else {
+            (one_f, c123)
+        };
         let c4s = b.c_i32(4);
         let cmk = b.c_i32(0x0007_0007);
         let lut_lo = b.c_i32(i32::from_le_bytes([0, 6, 9, 11]));
@@ -9225,15 +9250,15 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                         let pm = b.perm_b32(lut_hi, lut_lo, s2);
                         us.push(b.pk_sub_u16(u, pm));
                     }
-                    b.cvt_p8x4_from_u16(us[0], us[1], one_f)
+                    b.cvt_p8x4_from_u16(us[0], us[1], p_scale)
                 } else {
-                    b.cvt_pknorm_p8x4(xs[4 * m], xs[4 * m + 1], xs[4 * m + 2], xs[4 * m + 3], one_f)
+                    b.cvt_pknorm_p8x4(xs[4 * m], xs[4 * m + 1], xs[4 * m + 2], xs[4 * m + 3], p_scale)
                 };
                 words_out.push(word);
             }
         }
         let _ = store;
-
+        words_out.push(scb);
         words_out
     };
     let pv_w = |b: &mut FnBuilder, hh: usize, slot: ValueId, w: &[ValueId]| {
@@ -9242,7 +9267,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         let tr_b = b.add_i32(cx.tr_base, slot);
         let p8 = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-        b.var_mfma_scale(la, ones8, p8, c127, c123);
+        let scb = if w.len() > 8 { w[8] } else { c123 };
+        b.var_mfma_scale(la, ones8, p8, c127, scb);
         for e in 0..4usize {
             let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
             for r in 0..4i32 {
@@ -9250,7 +9276,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 addrs.push(b.add_i32(tr_b, off));
             }
             let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
-            b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
+            b.var_mfma_scale(o_vars[e], v8, p8, c127, scb);
         }
     };    // The P words of a unit are plain values inside one iteration (a loop variable read in the same iteration would give the
     // value of the iteration start); only B's hh1 words cross the iteration boundary, in the `pw` variables.
