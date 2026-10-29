@@ -20,6 +20,11 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
 
     for (bi, b) in m.blocks.iter().enumerate() {
         let next_label = m.blocks.get(bi + 1).map(|n| n.label);
+        if let Some(a) = crate::backend::llvm_mir::loop_align() {
+            if m.loops.iter().any(|l| l.0 == b.label) {
+                out.push_str(&format!("    .p2align {}\n", a.trailing_zeros()));
+            }
+        }
         out.push_str(&format!("BB{}:\n", b.label));
         for inst in &b.insts {
             for line in inst_lines(a, inst) {
@@ -467,6 +472,20 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             "global_load_dword {}, {}",
             d(a),
             mem_op(a, inst.srcs[0], inst.imm)
+        )],
+        MOp::GlobalLoadB128S => vec![format!(
+            "global_load_dwordx4 {}, {}, {}{}",
+            tuple(a, inst.dst.expect("dst"), 4),
+            vr(a, reg_of(&inst.srcs[1])),
+            spair(a, reg_of(&inst.srcs[0])),
+            if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
+        )],
+        MOp::GlobalLoadF32S => vec![format!(
+            "global_load_dword {}, {}, {}{}",
+            d(a),
+            vr(a, reg_of(&inst.srcs[1])),
+            spair(a, reg_of(&inst.srcs[0])),
+            if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
         )],
         MOp::GlobalLoadB128 => vec![format!(
             "global_load_dwordx4 {}, {}",

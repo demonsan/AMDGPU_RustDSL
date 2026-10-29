@@ -170,6 +170,12 @@ pub fn effects(m: &MFunction, inst: &MInst) -> Effects {
         MOp::GlobalLoadF32 => {
             e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 4 })
         }
+        MOp::GlobalLoadB128S => {
+            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(1), off: inst.imm, size: 16 })
+        }
+        MOp::GlobalLoadF32S => {
+            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(1), off: inst.imm, size: 4 })
+        }
         MOp::GlobalLoadB128 => {
             e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 16 })
         }

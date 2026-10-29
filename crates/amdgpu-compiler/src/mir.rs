@@ -114,6 +114,9 @@ pub enum MOp {
     GlobalLoadU16,
     GlobalLoadF32,
     GlobalLoadB128,
+    /// `global_load_dwordx4 v[d], v_off, s[base]`: scalar base + 32-bit vector offset (no 64-bit address arithmetic).
+    GlobalLoadB128S,
+    GlobalLoadF32S,
     /// Global -> LDS DMA (M0 = LDS base from srcs[1], an S1 register): srcs: ptr (V2), lds base (S1); imm = byte offset.
     GlobalLoadLdsB128,
     GlobalLoadLdsB32,

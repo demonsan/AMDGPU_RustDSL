@@ -14,6 +14,40 @@ use std::collections::{HashMap, HashSet};
 use amdgpu_dsl::{DType, Function, Op, Opnd, Stmt, ValueId};
 use crate::mir::*;
 
+/// Compiler optimisations that reduce dynamic VALU count (accuracy-preserving: same values, same
+/// arithmetic). Selected with `AMDC_LOWER_OPTS=imm,cmpfold` (`all`, `none`); DEFAULT `dce,cmpfold`.
+///  * `imm`     - constants become in-line / literal operands (VOP2 src0, shift amounts, cndmask false arm)
+///                instead of `v_mov` into a register;
+///  * `saddr`   - global loads whose address is `kernarg_ptr + vector offset` use the scalar-base form (no 64-bit add);
+///  * `dce`     - dead address / clamp chains (`v_add_co`/`v_addc`, `v_cmp`+`v_cndmask`, pointer adds) are removed;
+///  * `cmpfold` - `select(cmp(x,y), ..)` re-issues the compare instead of the 0/1 materialisation +
+///                `v_cmp_ne`, and the dead materialisation is removed.
+pub fn opt_on(name: &str) -> bool {
+    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let v = OPTS.get_or_init(|| match std::env::var("AMDC_LOWER_OPTS") {
+        Ok(s) => s.split(',').map(|x| x.trim().to_string()).collect(),
+        // default: the optimisations measured to help (value-preserving, bit-exact on all shapes); `none` disables all
+        Err(_) => vec!["dce".to_string(), "cmpfold".to_string()],
+    });
+    v.iter().any(|x| x == name || x == "all")
+}
+
+/// Is `bits` an in-line constant of the ISA (integers -16..64 and the f32 constants 0, +-0.5, +-1, +-2, +-4, 1/(2pi))?
+/// Literals are not allowed where the instruction also reads the constant bus (e.g. `v_cndmask` reads vcc).
+fn is_inline_const(bits: i64) -> bool {
+    let u = bits as i32 as u32;
+    (-16..=64).contains(&bits) || matches!(u, 0x3f00_0000 | 0xbf00_0000 | 0x3f80_0000 | 0xbf80_0000 | 0x4000_0000 | 0xc000_0000 | 0x4080_0000 | 0xc080_0000 | 0x3e22_f983)
+}
+
+/// May `bits` be the constant source operand of `op` (placed in src0)?
+fn imm_ok(op: MOp, bits: i64) -> bool {
+    match op {
+        MOp::VMulLoU32 => (-16..=64).contains(&bits), // VOP3 on gfx9: in-line constants only
+        MOp::VAddU32 | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VAndB32 | MOp::VXorB32 | MOp::VOrB32 => true,
+        _ => false,
+    }
+}
+
 pub fn lower(f: &Function) -> Result<MFunction, String> {
     let errs = amdgpu_dsl::verify(f);
     if !errs.is_empty() {
@@ -148,6 +182,13 @@ impl Lowerer {
             self.push(MInst::new(MOp::SWaitLgkm).imm(0).auto());
         }
         self.set_term(Term::Endpgm);
+        if opt_on("cmpfold") {
+            fold_select_cmp(&mut self.mir);
+            dce_cmp_pairs(&mut self.mir);
+        }
+        if opt_on("dce") {
+            dce_full(&mut self.mir);
+        }
         coalesce(&mut self.mir);
         dce(&mut self.mir);
         self.mir
@@ -287,6 +328,37 @@ impl Lowerer {
             }
         }
         false
+    }
+
+    /// Bit pattern of a constant operand (integer or f32), for in-line operands.
+    /// `base` = `PtrAdd{ scalar kernarg pointer, vector byte offset }`: (scalar pair, 32-bit vector offset) for the SADDR form.
+    fn saddr_parts(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
+        if !opt_on("saddr") {
+            return Ok(None);
+        }
+        let Opnd::Val(v) = base else { return Ok(None) };
+        let Some(Op::PtrAdd { base: pb, byte_off }) = self.defs.get(&v).cloned() else { return Ok(None) };
+        let Opnd::Val(pv) = pb else { return Ok(None) };
+        let Some(&sreg) = self.val.get(&pv) else { return Ok(None) };
+        if self.mir.vreg_class(sreg) != RClass::S2 {
+            return Ok(None);
+        }
+        let off = self.as_v1(byte_off)?;
+        self.touch(&[Src::Reg(sreg), Src::Reg(off)]);
+        Ok(Some((sreg, off)))
+    }
+
+    fn const_bits(&self, o: Opnd) -> Option<i64> {
+        match o {
+            Opnd::I32(i) => Some(i as i64),
+            Opnd::F32(f) => Some((f.to_bits() as i32) as i64),
+            Opnd::Val(v) => match self.defs.get(&v) {
+                Some(Op::ConstI32(i)) => Some(*i as i64),
+                Some(Op::ConstF32(f)) => Some((f.to_bits() as i32) as i64),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn const_of(&self, o: Opnd) -> Option<i64> {
@@ -592,8 +664,12 @@ impl Lowerer {
                 }
                 Stmt::VarLoadB128 { var, base, byte_off } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
-                    let rb = self.as_v2(*base)?;
-                    self.push(MInst::new(MOp::GlobalLoadB128).def(v).srcreg(rb).imm(*byte_off as i64));
+                    if let Some((sr, off)) = self.saddr_parts(*base)? {
+                        self.push(MInst::new(MOp::GlobalLoadB128S).def(v).srcreg(sr).srcreg(off).imm(*byte_off as i64));
+                    } else {
+                        let rb = self.as_v2(*base)?;
+                        self.push(MInst::new(MOp::GlobalLoadB128).def(v).srcreg(rb).imm(*byte_off as i64));
+                    }
                     self.pending_vmem.push(self.mir.canon(v));
                 }
                 Stmt::VarScaleF32 { var, scalar } => {
@@ -1016,9 +1092,13 @@ impl Lowerer {
                 // exp2(x * log2(e)).
                 let ra = self.as_v1(*a)?;
                 self.touch(&[Src::Reg(ra)]);
-                let log2e = self.const_vreg(0x3FB8AA3B_u32 as i32 as i64);
                 let scaled = self.new_vreg(RClass::V1);
-                self.push(MInst::new(MOp::VMulF32).def(scaled).srcreg(ra).srcreg(log2e));
+                if opt_on("imm") {
+                    self.push(MInst::new(MOp::VMulF32).def(scaled).src(Src::Imm(0x3FB8AA3B_u32 as i32 as i64)).srcreg(ra));
+                } else {
+                    let log2e = self.const_vreg(0x3FB8AA3B_u32 as i32 as i64);
+                    self.push(MInst::new(MOp::VMulF32).def(scaled).srcreg(ra).srcreg(log2e));
+                }
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VExpF32).def(d).srcreg(scaled));
                 self.val.insert(dst, d);
@@ -1054,9 +1134,12 @@ impl Lowerer {
                     DType::Ptr => return Err("select of pointers is not supported".to_string()),
                     _ => self.as_v1(*a)?,
                 };
-                let rb = self.as_v1(*b)?;
+                let b_src = match (opt_on("imm"), self.const_bits(*b)) {
+                    (true, Some(k)) if is_inline_const(k) => Src::Imm(k),
+                    _ => Src::Reg(self.as_v1(*b)?),
+                };
                 let d = self.new_vreg(RClass::V1);
-                self.push(MInst::new(MOp::VCndmask).def(d).srcreg(rb).srcreg(ra));
+                self.push(MInst::new(MOp::VCndmask).def(d).src(b_src).srcreg(ra));
                 self.val.insert(dst, d);
             }
             Op::PtrAdd { base, byte_off } => {
@@ -1077,18 +1160,24 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::LoadF32 { base, byte_off } => {
-                let rb = self.as_v2(*base)?;
                 let d = self.new_vreg(RClass::V1);
-                self.push(
-                    MInst::new(MOp::GlobalLoadF32).def(d).srcreg(rb).imm(*byte_off as i64),
-                );
+                if let Some((sr, off)) = self.saddr_parts(*base)? {
+                    self.push(MInst::new(MOp::GlobalLoadF32S).def(d).srcreg(sr).srcreg(off).imm(*byte_off as i64));
+                } else {
+                    let rb = self.as_v2(*base)?;
+                    self.push(MInst::new(MOp::GlobalLoadF32).def(d).srcreg(rb).imm(*byte_off as i64));
+                }
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::LoadGlobalB128 { base, byte_off } => {
-                let rb = self.as_v2(*base)?;
                 let d = self.new_vreg(RClass::V4);
-                self.push(MInst::new(MOp::GlobalLoadB128).def(d).srcreg(rb).imm(*byte_off as i64));
+                if let Some((sr, off)) = self.saddr_parts(*base)? {
+                    self.push(MInst::new(MOp::GlobalLoadB128S).def(d).srcreg(sr).srcreg(off).imm(*byte_off as i64));
+                } else {
+                    let rb = self.as_v2(*base)?;
+                    self.push(MInst::new(MOp::GlobalLoadB128).def(d).srcreg(rb).imm(*byte_off as i64));
+                }
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
@@ -1528,11 +1617,35 @@ impl Lowerer {
     fn shift_operand(&mut self, o: Opnd) -> Result<Src, String> {
         match o {
             Opnd::I32(i) => Ok(Src::Imm(i as i64)),
-            other => Ok(Src::Reg(self.as_v1(other)?)),
+            other => {
+                if opt_on("imm") {
+                    if let Some(k) = self.const_of(other) {
+                        return Ok(Src::Imm(k));
+                    }
+                }
+                Ok(Src::Reg(self.as_v1(other)?))
+            }
         }
     }
 
     fn bin_v1(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
+        if opt_on("imm") {
+            let (ca, cb) = (self.const_bits(a), self.const_bits(b));
+            let commutative = op != MOp::VSubF32;
+            let pick = match (ca, cb) {
+                (None, Some(k)) if commutative && imm_ok(op, k) => Some((k, a)),
+                (Some(k), None) if imm_ok(op, k) => Some((k, b)),
+                _ => None,
+            };
+            if let Some((k, other)) = pick {
+                let r = self.as_v1(other)?;
+                self.touch(&[Src::Reg(r)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(op).def(d).src(Src::Imm(k)).srcreg(r));
+                self.val.insert(dst, d);
+                return Ok(());
+            }
+        }
         let ra = self.as_v1(a)?;
         let rb = self.as_v1(b)?;
         self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
@@ -1552,6 +1665,18 @@ impl Lowerer {
     }
 
     fn cmp_i1(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
+        if opt_on("imm") {
+            if let (Some(k), None) = (self.const_bits(a), self.const_bits(b)) {
+                let rb = self.as_v1(b)?;
+                self.touch(&[Src::Reg(rb)]);
+                self.push(MInst::new(op).src(Src::Imm(k)).srcreg(rb));
+                let one = self.const_vreg(1);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VCndmask).def(d).src(Src::Imm(0)).srcreg(one));
+                self.val.insert(dst, d);
+                return Ok(());
+            }
+        }
         let ra = self.as_v1(a)?;
         let rb = self.as_v1(b)?;
         self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
@@ -1653,6 +1778,159 @@ fn dce(m: &mut MFunction) {
             }
         }
         if !removed {
+            break;
+        }
+    }
+}
+/// `select(cmp(x, y), ..)`: lowering materialises `cmp` as a 0/1 value (`v_cmp` + `v_cndmask t, 0, 1`) and
+/// the select compares it against zero again. Re-issue the original compare in place of the second one
+/// when its operands are unchanged in between; the materialisation then usually becomes dead.
+fn fold_select_cmp(m: &mut MFunction) {
+    let alias = m.alias.clone();
+    let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
+    for b in &mut m.blocks {
+        // t -> (compare op, srcs, instruction index of the compare)
+        let mut mat: HashMap<VReg, (MOp, Vec<Src>, usize)> = HashMap::new();
+        for i in 0..b.insts.len() {
+            let inst = b.insts[i].clone();
+            // materialisation: v_cndmask t, 0, one  right after a compare (a const mov may sit in between)
+            if inst.op == MOp::VCndmask && matches!(inst.srcs.first(), Some(Src::Imm(0))) && inst.dst.is_some() {
+                let mut j = i;
+                while j > 0 {
+                    j -= 1;
+                    if b.insts[j].op == MOp::VMovB32 {
+                        continue;
+                    }
+                    break;
+                }
+                let c = &b.insts[j];
+                if matches!(c.op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32) && c.dst.is_none() {
+                    mat.insert(inst.dst.unwrap(), (c.op, c.srcs.clone(), j));
+                }
+                continue;
+            }
+            // consumer: v_cmp_ne t, zero
+            if inst.op == MOp::VCmpNeI32 && inst.srcs.len() == 2 {
+                if let Src::Reg(t) = inst.srcs[0] {
+                    if let Some((op, srcs, cidx)) = mat.get(&t).cloned() {
+                        let regs: Vec<VReg> = srcs.iter().filter_map(|s| if let Src::Reg(r) = s { Some(canon(*r)) } else { None }).collect();
+                        let redefined = b.insts[cidx + 1..i].iter().any(|x| x.dst.map_or(false, |d| regs.contains(&canon(d))));
+                        if !redefined {
+                            b.insts[i].op = op;
+                            b.insts[i].srcs = srcs;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Remove `v_cmp ; v_cndmask t, 0, one` pairs whose result `t` is never read.
+fn dce_cmp_pairs(m: &mut MFunction) {
+    let mut used: HashMap<VReg, u32> = HashMap::new();
+    for b in &m.blocks {
+        for inst in &b.insts {
+            for r in inst.uses() {
+                *used.entry(r).or_insert(0) += 1;
+            }
+        }
+    }
+    let alias = m.alias.clone();
+    for b in &mut m.blocks {
+        let mut dead = vec![false; b.insts.len()];
+        for i in 0..b.insts.len() {
+            let inst = &b.insts[i];
+            if inst.op == MOp::VCndmask && matches!(inst.srcs.first(), Some(Src::Imm(0))) {
+                if let Some(d) = inst.dst {
+                    if used.get(&d).copied().unwrap_or(0) == 0 && !alias.contains_key(&d) {
+                        let mut j = i;
+                        while j > 0 {
+                            j -= 1;
+                            if b.insts[j].op == MOp::VMovB32 {
+                                continue;
+                            }
+                            break;
+                        }
+                        if matches!(b.insts[j].op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32) && b.insts[j].dst.is_none() {
+                            dead[i] = true;
+                            dead[j] = true;
+                        }
+                    }
+                }
+            }
+        }
+        let mut k = 0;
+        b.insts.retain(|_| {
+            k += 1;
+            !dead[k - 1]
+        });
+    }
+}
+/// Dead-code elimination that understands `vcc`: a pure instruction whose result is never read is removed, and a
+/// compare / carry producer is removed when no later instruction of the block reads the `vcc` it writes
+/// (the terminator may read it). The lowering emits address / clamp chains whose consumers were dropped by other
+/// options (e.g. the global scale loads replaced by LDS scale reads); this removes them. Same values, same
+/// arithmetic for everything that remains.
+fn dce_full(m: &mut MFunction) {
+    fn removable(op: MOp) -> bool {
+        matches!(
+            op,
+            MOp::VMovB32 | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VPtrAdd | MOp::VAddU32 | MOp::VAddCoU32 | MOp::VAddcCoU32
+                | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VMax3F32 | MOp::VFmaF32 | MOp::VExpF32
+                | MOp::VRcpF32 | MOp::VAndB32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32 | MOp::VMulLoU32
+                | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VReadPhys | MOp::VCmpLtI32 | MOp::VCmpGeI32
+                | MOp::VCmpNeI32 | MOp::VCmpLtF32
+        )
+    }
+    let defines_vcc = |op: MOp| op.defines_vcc() || op == MOp::VPtrAdd;
+    loop {
+        let mut used: HashMap<VReg, u32> = HashMap::new();
+        for b in &m.blocks {
+            for inst in &b.insts {
+                for r in inst.uses() {
+                    *used.entry(m.canon(r)).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut changed = false;
+        for bi in 0..m.blocks.len() {
+            let mut vcc_live = matches!(m.blocks[bi].term, Term::CondGoto { on: Pred::Vccnz | Pred::Vccz, .. });
+            let n = m.blocks[bi].insts.len();
+            let mut dead = vec![false; n];
+            for i in (0..n).rev() {
+                let inst = &m.blocks[bi].insts[i];
+                let dst_unused = match inst.dst {
+                    Some(d) => !m.alias.contains_key(&d) && used.get(&m.canon(d)).copied().unwrap_or(0) == 0,
+                    None => true,
+                };
+                let rm = removable(inst.op)
+                    && dst_unused
+                    && (!defines_vcc(inst.op) || !vcc_live)
+                    // a v_cndmask/v_addc consumes vcc: removing it is fine only if nothing else depends on its dst (checked above)
+                    && !(inst.dst.is_none() && !defines_vcc(inst.op));
+                if rm {
+                    dead[i] = true;
+                    // its own uses no longer count; handled by the outer fixed point
+                    continue;
+                }
+                if defines_vcc(inst.op) {
+                    vcc_live = false;
+                }
+                if inst.op.consumes_vcc() {
+                    vcc_live = true;
+                }
+            }
+            if dead.iter().any(|d| *d) {
+                changed = true;
+                let mut k = 0;
+                m.blocks[bi].insts.retain(|_| {
+                    k += 1;
+                    !dead[k - 1]
+                });
+            }
+        }
+        if !changed {
             break;
         }
     }
