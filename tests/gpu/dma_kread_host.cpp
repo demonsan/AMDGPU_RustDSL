@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
         for (int k = 0; k < 4; ++k) {
             const unsigned char* want = &hi[row * 128 + (g ^ (2 * k)) * 16];
             const unsigned char* got = &ho[t * 64 + k * 16];
-            if (std::memcmp(want, got, 16)) { ++bad; ++badrow[row]; }
+            if (std::memcmp(want, got, 16)) { ++bad; ++badrow[row]; if (bad <= 12) { int fr = -1, fc = -1; for (int r2 = 0; r2 < 128 && fr < 0; ++r2) for (int c2 = 0; c2 < 8; ++c2) if (!std::memcmp(got, &hi[r2 * 128 + c2 * 16], 16)) { fr = r2; fc = c2; break; } std::printf("t %3d row %3d g %d k %d: expected (row %d chunk %d) got source (row %d chunk %d)\n", t, row, g, k, row, g ^ (2 * k), fr, fc); } }
         }
     }
     for (int r = 0; r < 128; r += 8) { int s = 0; for (int i = 0; i < 8; ++i) s += badrow[r + i]; if (s) std::printf("rows %3d..%3d (LDS run %2d): %d bad fragments\n", r, r + 7, r / 8, s); }
