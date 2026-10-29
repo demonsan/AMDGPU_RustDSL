@@ -7166,7 +7166,17 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let nbuf_l = if fmha_t_opt("dbuf") { 2 } else { 1 };
     let lds_kd = b.c_i32(nbuf_l * 256 * pitch + 2048);
     let rt_row4 = b.shl_i32(cx.rt_row, c2);
-    let kdb0 = b.add_i32(lds_kd, rt_row4);
+    let kdb0 = if fmha_t_opt("swz") && !fmha_t_opt("dma") {
+        // the two threads of a row write the same K-scale dword: send the odd one to a scratch dword (unique addresses, banks 32..63 of the next 256 B)
+        let c6k = b.c_i32(6);
+        let odd = b.let_(Op::LshrI32(Opnd::Val(cx.rt_half64), Opnd::Val(c6k)));
+        let c1152 = b.c_i32(1152);
+        let oo = b.mul_i32(odd, c1152);
+        let base = b.add_i32(lds_kd, rt_row4);
+        b.add_i32(base, oo)
+    } else {
+        b.add_i32(lds_kd, rt_row4)
+    };
     let stage_loads = |b: &mut FnBuilder, key0: ValueId| -> Vec<ValueId> {
         let srow_raw = b.add_i32(key0, cx.rt_row);
         let srow_ok = b.cmp_lt_i32(srow_raw, cx.kv_len);
