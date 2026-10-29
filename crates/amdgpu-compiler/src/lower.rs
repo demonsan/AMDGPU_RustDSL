@@ -375,11 +375,7 @@ impl Lowerer {
     /// register that would then be moved into a fragment). Only for single-use results of plain
     /// ALU ops defined earlier in the current block.
     fn retarget_producer(&mut self, v: ValueId, new_dst: VReg) -> bool {
-        let r = self.retarget_producer_inner(v, new_dst);
-        if std::env::var("AMDC_RETARGET_DEBUG").map(|x| !x.is_empty()).unwrap_or(false) {
-            eprintln!("RETARGET v{v} {:?} uses={:?} -> {r}", self.defs.get(&v).map(|o| format!("{o:?}").chars().take(24).collect::<String>()), self.use_counts.get(&v));
-        }
-        r
+        self.retarget_producer_inner(v, new_dst)
     }
 
     fn retarget_producer_inner(&mut self, v: ValueId, new_dst: VReg) -> bool {
