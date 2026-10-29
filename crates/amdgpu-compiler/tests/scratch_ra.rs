@@ -8,7 +8,7 @@ fn ra_peak() {
         let m = with_opts(opts, || lower::lower(&f)).unwrap();
         match regalloc::allocate(&m) {
             Ok(a) => println!("RAP {opts:?}: ALLOCATED max_v {}", a.max_v),
-            Err(e) => println!("RAP {opts:?}: FAIL {}", e.chars().take(160).collect::<String>()),
+            Err(e) => println!("RAP {opts:?}: FAIL {}", e.split("||").last().unwrap_or("").trim().to_string()),
         }
     }
 }

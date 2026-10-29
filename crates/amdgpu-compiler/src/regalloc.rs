@@ -31,7 +31,7 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     match allocate_with(m, false) {
         Err(e) if e.contains("out of VGPRs") => match allocate_with(m, true) {
             // last resort: offline two-phase packing (wide tuples first, singles into the remaining holes in time)
-            Err(e2) if e2.contains("out of VGPRs") => allocate_two_phase(m).map_err(|e3| if e3.contains("out of VGPRs") { e2 } else { e3 }),
+            Err(e2) if e2.contains("out of VGPRs") => allocate_two_phase(m).map_err(|e3| if e3.contains("out of VGPRs") { format!("{e2}  ||  {e3}") } else { e3 }),
             other => other,
         },
         other => other,
