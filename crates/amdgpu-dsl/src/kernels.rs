@@ -7187,7 +7187,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let soff = b.add_i32(soff1, cx.rt_half64);
         let sp = b.ptr_add(ptr, soff);
         let mut v: Vec<ValueId> = (0..4u32).map(|w| b.load_b128(sp, 16 * w)).collect();
-        if role_a && kdlds {
+        if (role_a != fmha_t_opt("kdB")) && kdlds {
             // K scale dword of this thread's key row, staged with the K tile
             let kd_row = b.mul_i32(srow, cx.kd_stride);
             let kd_off = b.add_i32(kd_row, cx.kd_base);
