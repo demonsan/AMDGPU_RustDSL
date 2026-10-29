@@ -466,6 +466,59 @@ impl Lowerer {
         true
     }
 
+    /// If `ops` are lanes 0..3 (in order) of one V4 value that is only used through these four lane reads and whose last
+    /// writer in the current block is a 128-bit load, retarget that load into dwords `base..base+4` of the fragment `v`.
+    fn fold_lane_group(&mut self, v: VReg, base: u8, ops: &[Opnd]) -> bool {
+        let mut x: Option<ValueId> = None;
+        for (k, o) in ops.iter().enumerate() {
+            let Opnd::Val(ov) = o else { return false };
+            if self.use_counts.get(ov).copied() != Some(1) {
+                return false;
+            }
+            match self.defs.get(ov) {
+                Some(Op::Frag16Lane { frag: Opnd::Val(fx), index }) if *index as usize == k => {
+                    if x.map_or(false, |p| p != *fx) {
+                        return false;
+                    }
+                    x = Some(*fx);
+                }
+                _ => return false,
+            }
+        }
+        let Some(x) = x else { return false };
+        if self.use_counts.get(&x).copied() != Some(4) {
+            return false;
+        }
+        let Some(&t) = self.val.get(&x) else { return false };
+        if self.mir.vreg_class(t) != RClass::V4 || self.mir.alias.contains_key(&t) {
+            return false;
+        }
+        let insts = &self.mir.blocks[self.cur].insts;
+        let mut at = None;
+        for (k, inst) in insts.iter().enumerate().rev() {
+            if inst.dst == Some(t) {
+                if !matches!(inst.op, MOp::LdsReadB128) {
+                    return false;
+                }
+                at = Some(k);
+                break;
+            }
+            if inst.uses().contains(&t) {
+                return false;
+            }
+        }
+        let Some(at) = at else { return false };
+        let part = self.alias_vreg(v, base, RClass::V4);
+        self.mir.blocks[self.cur].insts[at].dst = Some(part);
+        let (old, new) = (self.mir.canon(t), self.mir.canon(v));
+        for p in self.pending_lds.iter_mut().chain(self.pending_vmem.iter_mut()) {
+            if *p == old {
+                *p = new;
+            }
+        }
+        true
+    }
+
     /// Bit pattern of a constant operand (integer or f32), for in-line operands.
     /// `base` = `PtrAdd{ scalar kernarg pointer, vector byte offset }`: (scalar pair, 32-bit vector offset) for the SADDR form.
     fn saddr_parts(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
@@ -958,6 +1011,14 @@ impl Lowerer {
                         self.push(MInst::new(MOp::SMovB32).def(dst).src(s));
                         continue;
                     }
+                    if class == RClass::V16 && opt_on("zeroinit") && matches!(value, Opnd::Val(v) if matches!(self.defs.get(v), Some(Op::FragZero { ty: DType::Frag16 }))) {
+                        // zero accumulator: zero the variable's own register instead of building a zero tuple and copying it
+                        let zero = self.const_vreg(0);
+                        for i in 0..16 {
+                            self.push(MInst::new(MOp::VWriteSub).def(dst).srcreg(zero).imm(i as i64));
+                        }
+                        continue;
+                    }
                     let src = match class {
                         RClass::V1 => self.as_v1(*value)?,
                         RClass::V2 => self.as_v2(*value)?,
@@ -1074,6 +1135,13 @@ impl Lowerer {
                                 self.touch(&[Src::Reg(x)]);
                             }
                             self.push(MInst::new(MOp::SMovB32).def(r).src(s));
+                            continue;
+                        }
+                        if class == RClass::V16 && opt_on("zeroinit") && matches!(init[i], Opnd::Val(v) if matches!(self.defs.get(&v), Some(Op::FragZero { ty: DType::Frag16 }))) {
+                            let zero = self.const_vreg(0);
+                            for k in 0..16 {
+                                self.push(MInst::new(MOp::VWriteSub).def(r).srcreg(zero).imm(k as i64));
+                            }
                             continue;
                         }
                         let src = match class {
@@ -1279,22 +1347,40 @@ impl Lowerer {
             if let Some(op) = self.defs.get(&v).cloned() {
                 match op {
                     Op::CmpLtI32(a, b) => {
-                        let ra = self.as_v1(a)?;
+                        // src0 of the e32 compare may be an SGPR (sgpr option); src1 must be a VGPR
+                        let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
+                        let ra = match sa {
+                            Some(s) => s,
+                            None => self.as_v1(a)?,
+                        };
                         let rb = self.as_v1(b)?;
+                        self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
                         self.push(MInst::new(MOp::VCmpLtI32).srcreg(ra).srcreg(rb));
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
                     }
                     Op::CmpGeI32(a, b) => {
-                        let ra = self.as_v1(a)?;
+                        // src0 of the e32 compare may be an SGPR (sgpr option); src1 must be a VGPR
+                        let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
+                        let ra = match sa {
+                            Some(s) => s,
+                            None => self.as_v1(a)?,
+                        };
                         let rb = self.as_v1(b)?;
+                        self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
                         self.push(MInst::new(MOp::VCmpGeI32).srcreg(ra).srcreg(rb));
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
                     }
                     Op::CmpLtF32(a, b) => {
-                        let ra = self.as_v1(a)?;
+                        // src0 of the e32 compare may be an SGPR (sgpr option); src1 must be a VGPR
+                        let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
+                        let ra = match sa {
+                            Some(s) => s,
+                            None => self.as_v1(a)?,
+                        };
                         let rb = self.as_v1(b)?;
+                        self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
                         self.push(MInst::new(MOp::VCmpLtF32).srcreg(ra).srcreg(rb));
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
@@ -1486,6 +1572,7 @@ impl Lowerer {
                     DType::Ptr => return Err("select of pointers is not supported".to_string()),
                     _ => self.as_v1(*a)?,
                 };
+                // (no SGPR operand here: v_cndmask_b32_e32 reads vcc through the constant bus, so an SGPR source would be a second read)
                 let b_src = match (opt_on("imm"), self.const_bits(*b)) {
                     (true, Some(k)) if is_inline_const(k) => Src::Imm(k),
                     _ => Src::Reg(self.as_v1(*b)?),
@@ -1783,7 +1870,23 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }            Op::Frag8(a, b, c, d, e, f, g, h) => {
                 let v = self.new_vreg(RClass::V8);
-                for (i, o) in [*a, *b, *c, *d, *e, *f, *g, *h].into_iter().enumerate() {
+                let ops8 = [*a, *b, *c, *d, *e, *f, *g, *h];
+                // `foldq`: four consecutive lanes that are exactly the four lanes of one just-loaded V4 are not copied; the load
+                // writes the half of the fragment directly
+                let mut folded = [false; 8];
+                if opt_on("foldq") {
+                    for half in 0..2usize {
+                        if self.fold_lane_group(v, (half * 4) as u8, &ops8[half * 4..half * 4 + 4]) {
+                            for k in 0..4 {
+                                folded[half * 4 + k] = true;
+                            }
+                        }
+                    }
+                }
+                for (i, o) in ops8.into_iter().enumerate() {
+                    if folded[i] {
+                        continue;
+                    }
                     let al = self.alias_vreg(v, i as u8, RClass::V1);
                     let retargeted = match o {
                         Opnd::Val(ov) => self.retarget_producer(ov, al),
@@ -2029,6 +2132,15 @@ impl Lowerer {
         }
     }
 
+    /// The SGPR an operand already lives in: an S1 value or a scalar (uniform) loop variable. gfx9 VALU instructions read at most
+    /// ONE distinct SGPR (constant bus limit 1) and only in src0 of the e32 forms; every user of this helper keeps to that.
+    fn sgpr_src(&self, o: Opnd) -> Option<VReg> {
+        match o {
+            Opnd::Var(v) => self.vars.get(v.0 as usize).copied().filter(|r| self.mir.vreg_class(*r) == RClass::S1),
+            o => self.scalar_reg(o),
+        }
+    }
+
     /// The SGPR a value already lives in (S1 class), if any.
     fn scalar_reg(&self, o: Opnd) -> Option<VReg> {
         let Opnd::Val(v) = o else { return None };
@@ -2057,9 +2169,10 @@ impl Lowerer {
         if opt_on("sgpr") {
             let vop3 = op == MOp::VMulLoU32;
             let commutative = op != MOp::VSubF32;
-            let (sa, sb) = (self.scalar_reg(a), self.scalar_reg(b));
+            let (sa, sb) = (self.sgpr_src(a), self.sgpr_src(b));
             let plan = match (sa, sb) {
-                (Some(s), None) if self.const_bits(b).is_none() => Some((s, b, true)),
+                // both scalar: one operand stays in its SGPR, the other is moved (one v_mov instead of two)
+                (Some(s), _) if self.const_bits(b).is_none() => Some((s, b, true)),
                 (None, Some(s)) if self.const_bits(a).is_none() && (commutative || vop3) => Some((s, a, false)),
                 _ => None,
             };
@@ -2125,7 +2238,11 @@ impl Lowerer {
                 return Ok(());
             }
         }
-        let ra = self.as_v1(a)?;
+        let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
+        let ra = match sa {
+            Some(s) => s,
+            None => self.as_v1(a)?,
+        };
         let rb = self.as_v1(b)?;
         self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
         self.push(MInst::new(op).srcreg(ra).srcreg(rb));
