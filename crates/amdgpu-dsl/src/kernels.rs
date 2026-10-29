@@ -9233,6 +9233,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         b.end_if();
         // per-lane scale: Delta = ceil(512 S'max - 135) (0 for lanes that rebased); P_fp8 = P_bf16 2^-Delta, MFMA scale 123 + Delta
+        let svsub = fmha_t_opt("svsub");
+        let mut dpair_opt: Option<ValueId> = None;
         let (p_scale, scb) = if svscale {
             let t0 = b.mul_f32(mt, c512f);
             let t1 = b.sub_f32(t0, c135f);
@@ -9248,9 +9250,18 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let c23 = b.c_i32(23);
             let e127 = b.add_i32(di, c127i);
             let sbits = b.shl_i32(e127, c23);
-            let sc = b.bitcast_f32(sbits);
+            let sc0 = b.bitcast_f32(sbits);
             let scb = b.add_i32(di, c123);
-            (sc, scb)
+            if svsub {
+                // diagnostic: divide by 2^Delta in the bf16 exponent field (u16 bits 7..14, two halves) instead of the cvt scale operand
+                let c7s = b.c_i32(7);
+                let dsh = b.shl_i32(di, c7s);
+                let c10001 = b.c_i32(0x10001);
+                dpair_opt = Some(b.mul_i32(dsh, c10001));
+                (one_f, scb)
+            } else {
+                (sc0, scb)
+            }
         } else {
             (one_f, c123)
         };
@@ -9277,7 +9288,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                         let u = b.cvt_pknorm_pair(xs[4 * m + 2 * h], xs[4 * m + 2 * h + 1]);
                         let s1 = b.let_(Op::LshrI32(Opnd::Val(u), Opnd::Val(c4s)));
                         let s2 = b.let_(Op::AndI32(Opnd::Val(s1), Opnd::Val(cmk)));
-                        let pm = b.perm_b32(lut_hi, lut_lo, s2);
+                        let pm0 = b.perm_b32(lut_hi, lut_lo, s2);
+                        let pm = if let Some(dp) = dpair_opt { b.add_i32(pm0, dp) } else { pm0 };
                         us.push(b.pk_sub_u16(u, pm));
                     }
                     b.cvt_p8x4_from_u16(us[0], us[1], p_scale)
