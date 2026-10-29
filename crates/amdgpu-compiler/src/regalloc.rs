@@ -755,3 +755,37 @@ pub fn pressure_profile(m: &MFunction) -> (u32, usize, usize) {
     let blk = idx_of.iter().position(|v| v.last().map_or(false, |l| *l >= at) && v.first().map_or(false, |f| *f <= at)).unwrap_or(0);
     (peak as u32, at, blk)
 }
+/// The vregs live at linear position `pos` (dword-level liveness), for diagnostics.
+pub fn live_at(m: &MFunction, pos: usize) -> Vec<VReg> {
+    let mut idx_of: Vec<Vec<usize>> = Vec::new();
+    let mut next = 0usize;
+    for b in &m.blocks {
+        let mut v = Vec::new();
+        for _ in 0..b.insts.len() {
+            v.push(next);
+            next += 1;
+        }
+        idx_of.push(v);
+    }
+    let label_to_block: std::collections::HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); m.blocks.len()];
+    for (i, b) in m.blocks.iter().enumerate() {
+        match &b.term {
+            Term::Goto(t) => {
+                if let Some(j) = label_to_block.get(t) {
+                    succs[i].push(*j);
+                }
+            }
+            Term::CondGoto { target, fall, .. } => {
+                for t in [target, fall] {
+                    if let Some(j) = label_to_block.get(t) {
+                        succs[i].push(*j);
+                    }
+                }
+            }
+            Term::Endpgm => {}
+        }
+    }
+    let segs = precise_segments(m, &idx_of, &succs);
+    segs.iter().enumerate().filter(|(r, sg)| m.vreg_class(*r as VReg).is_vector() && !m.alias.contains_key(&(*r as VReg)) && sg.iter().any(|(a, b)| *a <= pos && pos <= *b)).map(|(r, _)| r as VReg).collect()
+}
