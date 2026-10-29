@@ -69,7 +69,7 @@ impl Samples {
     }
 
     pub fn alloc(&self) -> amdgpu_compiler::regalloc::Alloc {
-        amdgpu_compiler::regalloc::Alloc { phys: self.phys.clone(), max_v: 256, max_s: 100 }
+        amdgpu_compiler::regalloc::Alloc { phys: self.phys.clone(), max_v: 256, max_s: 100, scalar: self.vregs.iter().map(|c| !c.is_vector()).collect() }
     }
 }
 

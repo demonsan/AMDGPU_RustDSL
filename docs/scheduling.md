@@ -100,3 +100,7 @@ Pipelining of multi-block loop bodies (diamonds, barriers), common-prefix hoisti
 
 ## `--sched=auto` (round 3)
 `AMDC_SCHED=auto` / `--sched=auto`: model-gated scheduling, default scheduler still OFF. Per loop the multi-wave simulator decides (>= 3%); loops with `s_barrier` are not eligible (no cross-wave term in the model; FMHA stays unscheduled, as measured 221.7 scheduled vs 225.0 unscheduled). Hardware results and details: docs/llvm-tail-integration.md section 9, `tools/auto_vs_plain.sh`.
+
+## ldshoist / preset ld (round 4)
+
+`AMDC_SCHED=ld` = `rewait` + `ldshoist`: no instruction reordering except hoisting `ds_read*` upward inside a block (distance `hoist=N`, default 64; budget: live VGPR dwords <= max_vgprs). On fmha_t B1H8S2048: 258.2 -> 273.5 TFLOP/s (285 with the default `dce,cmpfold`), bit-identical output. Table and counters: docs/llvm-tail-integration.md, section 'Compiler-side FMHA gains'.

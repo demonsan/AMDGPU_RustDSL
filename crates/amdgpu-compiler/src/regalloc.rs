@@ -13,6 +13,8 @@ pub struct Alloc {
     pub phys: Vec<u32>,
     pub max_v: u32,
     pub max_s: u32,
+    /// Per vreg: lives in an SGPR (so a VALU source operand prints `sN`).
+    pub scalar: Vec<bool>,
 }
 
 const VGPR_COUNT: usize = 256;
@@ -332,7 +334,7 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
         }
     }
 
-    Ok(Alloc { phys: patched, max_v: max_v as u32, max_s: max_s as u32 })
+    Ok(Alloc { phys: patched, max_v: max_v as u32, max_s: max_s as u32, scalar: m.vregs.iter().map(|c| !c.is_vector()).collect() })
 }
 
 fn mark_used(used: &mut [bool], slot: usize, c: RClass) {

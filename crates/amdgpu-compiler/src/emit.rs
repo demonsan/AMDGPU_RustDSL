@@ -170,6 +170,7 @@ fn spair(a: &Alloc, r: VReg) -> String {
 
 fn src1(a: &Alloc, s: Src) -> String {
     match s {
+        Src::Reg(r) if a.scalar.get(r as usize).copied().unwrap_or(false) => sr(a, r),
         Src::Reg(r) => vr(a, r),
         Src::Imm(i) => format!("{}", i as i32),
     }

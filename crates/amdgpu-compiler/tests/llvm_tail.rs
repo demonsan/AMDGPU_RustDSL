@@ -121,7 +121,7 @@ fn opcode_probe_every_row_assembles() {
             alias: HashMap::new(),
             elide_fallthrough: false,
         };
-        let a = Alloc { phys, max_v: vnext, max_s: snext };
+        let a = Alloc { scalar: vregs.iter().map(|c| !c.is_vector()).collect(), phys, max_v: vnext, max_s: snext };
         let mir = match tail.export_mir(&m, &a) {
             Ok(x) => x,
             Err(e) => {

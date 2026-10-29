@@ -98,3 +98,9 @@ release 构建，整个进程（启动 + DSL 构建 + 编译 + 写文件），�
 * 真机（GPU 4，ROCm 10.1 tail + 10.1 汇编器）：`cargo test` 34 通过；`attention_fwd` OK；fmha_t 15/15 REF_KERNEL_OK、determinism 5/5，在无调度、`swp`、`taildup,swp`、`auto` 下均成立。B1H8S2048：own 224.7 / llvm-tail 224.0–226.3 / llvm-tail+auto 224.7–225.6 TFLOP/s（无回归）。
 * `--sched=auto`：只对模拟器预测收益 ≥3% 的循环做块内调度；swp 自带 3% 门限；taildup 只在其“与无 taildup 方案相比，两者共有的循环总模型周期下降 ≥3%”时启用。含 `s_barrier` 的循环不参与（模型没有跨 wave 同步项：在 FMHA 上模型预测 −23%，而真机是 221.7 vs 225.0 TFLOP/s），所以 FMHA 在 auto 下保持未调度；sched_* 微内核真机 1 wave/2 waves 每次迭代周期：valu_mul −37%/−36%，valu_max3 −35%/−22%，valu_exp −23%/−14%，mfma_chain −40%/−1%，mfma_valu16 −37%/−15%，mfma_valu4 −56%/−24%，diamond −32%/−14%。
 * 未完成项：导出 kill/dead 标志（目前 3 个 LLVM peephole 测试因此不能折叠，保守且正确）、DSL 引入原子/LDS-DMA 时需导出 MMO（ordering/syncscope）、2 个 verifier 个案（`waitcnt.mir`, `waitcnt-agpr.mir`）尚未查明。
+
+## 10. 编译器侧 FMHA 收益（第 4 轮）
+
+* 默认开启 `AMDC_LOWER_OPTS=dce,cmpfold`（保值）；新增调度预设 `AMDC_SCHED=ld` / `--sched=ld`（scoreboard 等待 + `ds_read` 上提，新文件 `sched/hoist.rs`，每个基本块都由 `verify::check_perm` 证明合法）；`AMDC_LOOP_ALIGN=N` 循环头对齐。
+* fmha_t B1H8S2048（GPU 4，30 iters）：plain 258.2 -> rewait 264.7 -> ld 273.5 -> ld + dce,cmpfold **285.0-286.5 TFLOP/s**（+10.4%）；15 个 shape 与 plain 逐位一致，determinism 5/5，tail_invariance 通过。
+* 负面结果：单独减少 14% VALU（imm/dce/cmpfold/saddr/sgpr/shl）在 LDS 延迟未解决前没有提速；imm/saddr/sgpr/shl 在最终配置上也是中性，保持关闭。详见 docs/llvm-tail-integration.md 末节。
