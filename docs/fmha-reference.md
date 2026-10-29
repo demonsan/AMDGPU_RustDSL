@@ -144,3 +144,8 @@ witness 不能修正语义缺失。以下情况直接报错，不自动插 copy/
 
 ## Vendor kernel schedule (disassembly findings)
 See docs/status.md, section Kernel optimisation (round 41+), subsection Vendor kernel schedule.
+
+
+### Update (round 44): current state of our kernel
+
+Default `fmha_fwd_hd128_mxfp8_t` now includes `kdlds,dbuf` (K scales staged through LDS with the K tile, two LDS buffers, one barrier per iteration): 257.8 TFLOP/s vs vendor 517.5 on B1 H8 S=SK=2048, numerics unchanged (mean err 1.248e-3 vs CPU, vendor 2.418e-3). Opt-in `fmha_fwd_hd128_mxfp8_sv` (vendor-style softmax: bias MFMA, max3 + rollback branch, pknorm + scalef32 Schraudolph exp2, row sums from the quantised P) reaches 285.5 TFLOP/s with mean err 2.186e-3 (better than the vendor's 2.418e-3 on this data) but exceeds the per-element tolerance on a few elements of 4 of the 15 `run_ref.sh` shapes (worst_err ~7e-2), so it is NOT the default; the accurate recipe stays the default. Remaining gap to the vendor (about 1.8-2x): global->LDS DMA staging (staging ~2.0-2.5k cycles/iter, see docs/status.md round 44 for the hardware rules found), the barrier imbalance (~1.2-1.4k cycles/iter from the data-dependent rollback), the rollback itself, and the VALU of the softmax (hot path ~296 vs ~160 VALU per 128 keys).

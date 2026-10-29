@@ -743,3 +743,35 @@ Not done: unscaled PV MFMA (no VALU effect), cross-iteration QK/softmax software
 
 ### Round 43: nondeterminism with lazy rescale on partial query tiles (fixed)
 Reproduced with tests/gpu/determinism.sh: B=2 H=8 S=700 SK=640 gqa=2 gave three different output md5 in three runs (7b73481b / 9e558145 / acbaf99b); the other shapes (S=200, S=300 x2, 2048x2048) were bit-identical. Cause as diagnosed by sched: rows >= S are clamped to row S-1 and store to the same address; the lazy-rescale branch is a wave-level decision, so a wave holding only duplicate rows rounds differently from the wave holding the real row (last writer wins). Fix: the epilogue stores are guarded by the wave-uniform condition (first row of the wave < S); such waves still run the loop (barriers) but do not store. Duplicates inside the partially valid wave compute identically to row S-1 (same decisions), so their same-address stores agree. After the fix all five determinism shapes give identical md5 in 3 runs (S=700: cbc75e0a x3), 15/15 run_ref shapes REF_KERNEL_OK, cargo test and run.sh OK, no performance change (224.7 TFLOP/s).
+
+
+## Round 44 (kernel-opt): vendor-gap work on `fmha_fwd_hd128_mxfp8_t` (B1 H8 S=SK=2048, vendor 517.5 TFLOP/s)
+
+**Result: plain accurate kernel 227.5 -> 257.8 TFLOP/s (+13%, numerics bit-identical, mean err 1.248e-3); opt-in `fmha_fwd_hd128_mxfp8_sv` 285.5 TFLOP/s (mean err 2.186e-3 vs vendor 2.418e-3).** Gap to vendor: 2.0x (plain) / 1.81x (sv).
+
+| variant (same run, 30 iters) | TFLOP/s | notes |
+|---|---|---|
+| vendor | 517.5 | |
+| `_t` before this round (cvt4,pksub,lazy,msum,permlane) | 227.5 | |
+| `_t` + `lacc1` | 229.3 -> 260.8 with kdlds,dbuf | opt-in, +1.2% only |
+| `_t` default now (+kdlds,dbuf) | 257.8 | 15 shapes OK on both backends, determinism 5/5, cargo test green |
+| `_sv` default (cvt4,svpk,kdlds,dbuf) | 285.5 | 11/15 shapes REF_KERNEL_OK (a few outlier elements, `bad` 1-7 per shape, exceed the tolerance; worst_err 7e-2 vs vendor 5.9e-2): stays opt-in |
+| `_pp` phase-shifted ping-pong | 205 | negative (VGPR 256, 4 barriers/tile); kept only as an experiment |
+
+**Root cause of the old "staging + barrier = 3.2k cycles/iter": the per-tile K-scale dword was loaded with `global_load_dword` right before its use, and the lowering/LLVM emitted `s_waitcnt vmcnt(0)` right after it (4x per 128-key iteration).** Loads complete in order, so every wait also waited for the 4 tile-prefetch loads: a full L2 round trip, four times per iteration. Fix (`FMHA_OPT=kdlds`, now default): role A stages the K-scale dword of each key row into LDS together with its K tile; all waves read it with `ds_read_b32`. +11.6% on the plain kernel, numerics unchanged. `dbuf` (two LDS buffers, one barrier per iteration, now default) +2%.
+
+Other measured experiments (all on the benchmark shape):
+* `kdhoist` (hoist kd loads) 211 (worse), `lazypk` 222 (worse), `kdpf` (kd software-prefetch through a loop var) 203 (VGPR 256), `stmid` (stage stores mid-iteration) +1.3% on sv, `permlane` neutral, `pp` 205.
+* sv: per-64-key max3 + rollback branch + pknorm/scalef32 Schraudolph exp2 + row sums from the same quantised P. Rollback fires in ~70% of the substeps on this data (vendor ~86% of its 128-key checks, but its rollback block is cheaper). `svpk` (packed O rescale in the rollback) +2.7%. `svinf` (never roll back; wrong numerics, timing only) shows the rollback is worth ~13%.
+* counters (rocprofv3, before kdlds): SQ_INSTS_VALU vendor 2.06M / sv 3.60M / plain 3.75M; CVT 569k vs 577k (sv equal to vendor), TRANS 536k plain -> 12k sv (vendor 8k), MUL_F32 959k plain / 859k sv / 265k vendor.
+* ablations on sv+dbuf+kdlds (286): no staging 393, no barrier 335, both 443, nopv+svinf 401.
+
+**Lowering change** (`lower.rs`): outstanding loads stay pending across `if/else` (snapshot per branch; drained at the join only when a branch changed the set). Neutral on speed, needed so the masked/unmasked diamonds do not drain the prefetch. GPU-free regression tests in `tests/backend.rs`: `loads_are_drained_on_every_path_of_a_branch` (replaces the old "drain before the branch" assertion: the invariant is that no path reads a load before its wait) and `untouched_loads_are_not_over_drained_across_a_branch`.
+
+### Global -> LDS DMA staging (`FMHA_OPT=dma`, own backend only, NOT usable yet: multi-head shapes fail)
+Implemented: DSL `load_global_lds` / `wait_vm`, MOps `GlobalLoadLdsB128/B32` (+emit, effects, model), LDS layout of 1040-byte runs like the vendor kernel (0x410), probes `probe_dma`, `probe_dma_tile`, `probe_dma_seq`, `probe_dma_kread`, `probe_dma_map` with `tests/gpu/dma_*_probe.sh`. Hardware findings (gfx950):
+1. `global_load_lds_dwordx4`: lane i lands at `M0 + inst_offset + 16 i`, in lane order for ANY lane address pattern (reversed, strided, rows 8 KB apart): an XOR swizzle of the source chunks is possible but my first swizzle attempt was invalidated by a probe bug (empty `PD_*` env counted as set); the 1040-byte-run layout (rows {u + 8 s} per run) is conflict-free for the K fragment reads and was verified with `probe_dma_kread` (mode 5) for row strides 128..1024 and head offsets.
+2. **Changing M0 between consecutive DMAs of one wave is unreliable** (the q-th DMA of 4 waves landed at the wrong LDS address, deterministic; even with `vmcnt(0)`+barrier between DMAs). Working scheme: ONE M0 per wave per group and the run offset through the signed instruction offset (`offset:-1040 k`, which applies to the global address AND the LDS address; the source address is compensated). `probe_dma_tile` with `PD_NEW=1` passes repeatedly.
+3. The dword form (`global_load_lds_dword`) for the K scales needs its own M0 (same problem): the K scales are staged with a normal load + `ds_write` (`dmakd` = experimental dword DMA, flaky).
+4. LLVM tail: `llc` aborts (SIGABRT) on the DMA MIR, so the DMA MOps have no LLVM table rows and the DMA probes are only reachable by name (not in the enumerated lists / tail-invariance); `BACKEND=own` only.
+5. Status: with DMA the 1-head shapes (S up to 2048, 16 iterations) are REF_KERNEL_OK and the apparent speed is ~297-376 TFLOP/s; shapes with H >= 2 give a wrong second head (every dim of head 1; head 0 right; the old `ds_write` staging into the same layout is right). Not root-caused: the probe with the same scheme, row strides and head offsets passes. Next step would be a dump of the LDS K tile of a head-1 block. Do not enable by default.
