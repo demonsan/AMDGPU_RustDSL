@@ -465,8 +465,9 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             let mn = if inst.op == MOp::GlobalLoadLdsB128 { "global_load_lds_dwordx4" } else { "global_load_lds_dword" };
             vec![
                 format!("s_add_u32 m0, {m0}, {}", inst.imm),
-                "s_nop 0".to_string(),
+                format!("s_nop {}", std::env::var("AMDC_M0_NOP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0)),
                 format!("{mn} {}", mem_op(a, inst.srcs[0], 0)),
+                format!("s_nop {}", std::env::var("AMDC_DMA_NOP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0)),
             ]
         }
         MOp::GlobalStoreU16 => vec![format!(
