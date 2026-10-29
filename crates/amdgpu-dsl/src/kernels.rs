@@ -8974,21 +8974,28 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let mut trx: Vec<ValueId> = Vec::new();
     let mut swzw: Vec<ValueId> = Vec::new();
     if fmha_t_opt("swz") && !fmha_t_opt("dma") {
-        // Bank-conflict-free dense layout (LDS = 32 banks x 4 B per cycle, b128 per 8 lanes, b64 per 16 lanes; measured with
-        // SQ_LDS_BANK_CONFLICT): rows of 128 bytes, 16-byte chunk c of row r stored at chunk c ^ s(r) with
-        // s(r) = (r & 7) ^ (((r >> 3) & 1) << 2). K fragment reads: 8 consecutive rows -> 8 distinct chunks; V tr reads: the 8 rows
-        // {0..3, 8..11} of a 16-lane group -> 8 distinct chunks; staging writes: 4 rows x 2 halves -> 8 distinct chunks.
-        fn swz_s(b: &mut FnBuilder, row: ValueId, c3: ValueId, c7: ValueId, c4: ValueId) -> ValueId {
-            let lo = b.let_(Op::AndI32(Opnd::Val(row), Opnd::Val(c7)));
-            let t3 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(c3)));
+        // Bank-conflict-free dense layout: rows of 128 bytes, 16-byte chunk c of row r stored at chunk c ^ s(r). s was found by a
+        // brute-force search over s(r) = pi(u) ^ (5 (r & 1)), u = (r >> 1) & 7, against two LDS bank models (64 banks / 16 lanes per
+        // b128 and 32 lanes per b64; 32 banks / 8 and 16 lanes) for the K fragment reads, the ds_read_b64_tr_b8 V reads and the
+        // b128 staging writes (zero conflicts in both): pi swaps bits 0 and 1 of u, i.e. s2 = u2 ^ p, s1 = u0, s0 = u1 ^ p.
+        fn swz_s(b: &mut FnBuilder, row: ValueId, _c3: ValueId, _c7: ValueId, _c4: ValueId) -> ValueId {
             let one = b.c_i32(1);
-            let b3 = b.let_(Op::AndI32(Opnd::Val(t3), Opnd::Val(one)));
             let two = b.c_i32(2);
-            let b3s = b.shl_i32(b3, two);
-            let _ = c4;
-            b.xor_i32(lo, b3s)
-        }
-        let s_k = swz_s(&mut b, j, c3, c7, c4);
+            let three = b.c_i32(3);
+            let p = b.let_(Op::AndI32(Opnd::Val(row), Opnd::Val(one)));
+            let t1 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(one)));
+            let u0 = b.let_(Op::AndI32(Opnd::Val(t1), Opnd::Val(one)));
+            let t2 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(two)));
+            let u1 = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(one)));
+            let t3 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(three)));
+            let u2 = b.let_(Op::AndI32(Opnd::Val(t3), Opnd::Val(one)));
+            let s2 = b.xor_i32(u2, p);
+            let s0 = b.xor_i32(u1, p);
+            let s2s = b.shl_i32(s2, two);
+            let s1s = b.shl_i32(u0, one);
+            let a = b.add_i32(s2s, s1s);
+            b.add_i32(a, s0)
+        }        let s_k = swz_s(&mut b, j, c3, c7, c4);
         let xk0 = b.xor_i32(pblk, s_k);
         let jrow = b.mul_i32(j, c128);
         for k in 0..4i32 {
