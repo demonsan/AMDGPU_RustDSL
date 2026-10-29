@@ -198,6 +198,11 @@ fn clobbers(m: &MFunction, a: &amdgpu_compiler::regalloc::Alloc) -> Vec<String> 
                 if *r == VCC || *r == u32::MAX - 1 {
                     continue;
                 }
+                // partial writers (v_cvt_pk_fp8: 16-bit halves) read the old value of their own destination: the first
+                // half of the idiom reads garbage by design, the second half is covered by the writer check
+                if e.writes.contains(r) && matches!(inst.op, MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi) {
+                    continue;
+                }
                 let p = phys_of(m, a, *r);
                 match st.get(&p) {
                     // never written on any path: an undefined read (reported by the other test), not a clobber
