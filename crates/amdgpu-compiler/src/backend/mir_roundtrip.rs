@@ -123,7 +123,7 @@ fn parse_operand(t: &str) -> Operand {
     Operand { flags: words[..k].iter().map(|s| s.to_string()).collect(), text: rest }
 }
 
-fn parse_inst_line(line: &str) -> Option<Inst> {
+pub fn parse_inst_line(line: &str) -> Option<Inst> {
     let indent: String = line.chars().take_while(|c| *c == ' ').collect();
     let body = line[indent.len()..].trim_end();
     if body.is_empty() || body.starts_with(';') || body.starts_with("bb.") || body.starts_with("liveins:")
@@ -250,21 +250,24 @@ fn parse_at(lines: &[&str], i: usize, st: &mut Stats) -> (Inst, usize) {
 
 /// How much information the printed MIR keeps.
 /// * `Identity`: everything (structure round trip only).
-/// * `Flags`: drop register flags our exporter never writes (`killed dead renamable internal`; `undef` is kept: it states intent, not liveness).
+/// * `Flags`: drop register flags our exporter never writes (`killed dead renamable`; `undef` and `internal` are kept: they state intent / bundle membership, which our exporter never produces and which the verifier needs).
 /// * `All`: additionally drop instruction flags, memory operands and debug locations, i.e. the
 ///   information level of MIR as our exporter writes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
     Identity,
     Flags,
+    /// `Flags` followed by our own kill/dead annotation (`llvm_mir::reflag_body`).
+    Reflag,
     All,
 }
 
 fn degrade(i: &mut Inst, lv: Level) {
+    let lv = if lv == Level::Reflag { Level::Flags } else { lv };
     if lv == Level::Identity || i.raw.is_some() {
         return;
     }
-    let strip = |o: &mut Operand| o.flags.retain(|f| !matches!(f.as_str(), "killed" | "dead" | "renamable" | "internal"));
+    let strip = |o: &mut Operand| o.flags.retain(|f| !matches!(f.as_str(), "killed" | "dead" | "renamable"));
     i.defs.iter_mut().for_each(strip);
     i.ops.iter_mut().for_each(strip);
     if lv == Level::All {
@@ -298,6 +301,7 @@ pub fn roundtrip_text_level(text: &str, lv: Level) -> (String, Stats) {
                 i += 1;
             }
             let body = &lines[start..i];
+            let body_start = out.len();
             let mut j = 0;
             while j < body.len() {
                 let (mut inst, nj) = parse_at(body, j, &mut st);
@@ -309,6 +313,11 @@ pub fn roundtrip_text_level(text: &str, lv: Level) -> (String, Stats) {
                 }
                 out.push(printed);
                 j = nj;
+            }
+            if lv == Level::Reflag {
+                let blk: Vec<String> = out[body_start..].iter().flat_map(|s| s.split('\n').map(|x| x.to_string()).collect::<Vec<_>>()).collect();
+                out.truncate(body_start);
+                out.extend(super::llvm_mir::reflag_body(&blk));
             }
         }
     }

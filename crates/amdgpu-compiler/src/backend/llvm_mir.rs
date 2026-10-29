@@ -31,8 +31,9 @@ fn slot_name(s: Slot) -> String {
 /// Physical dword slots named by a MIR register token (`$vgpr4_vgpr5`, `$vcc`, ...).
 fn slots_of(name: &str) -> Vec<Slot> {
     let name = name.trim_start_matches('$');
+    let name = name.split('.').next().unwrap_or(name);
     match name {
-        "vcc" => return vec![VCC],
+        "vcc" | "vcc_lo" | "vcc_hi" => return vec![VCC],
         "scc" => return vec![SCC],
         _ => {}
     }
@@ -247,6 +248,17 @@ pub fn export_opts(m: &MFunction, a: &Alloc, markers: bool, drop_auto_waits: boo
         }
     }
 
+    // 2b. kill / dead flags from the same liveness (lets LLVM's peepholes and the verifier see exact liveness).
+    if std::env::var("AMDC_MIR_FLAGS").map(|v| v != "0").unwrap_or(true) {
+        for bi in 0..nblocks {
+            let mut live: BTreeSet<Slot> = BTreeSet::new();
+            for &s in &succs[bi] {
+                live.extend(live_in[s].iter().copied());
+            }
+            annotate_flags(&mut lines[bi], live);
+        }
+    }
+
     // 3. Header from the per-version template.
     let (irargs, kernarg) = kernarg_ir(m)?;
     let kernarg = ((kernarg + 7) / 8) * 8;
@@ -288,6 +300,193 @@ pub fn export_opts(m: &MFunction, a: &Alloc, markers: bool, drop_auto_waits: boo
 /// `AMDC_LOOP_ALIGN=32`: align loop headers to this many bytes (power of two).
 pub fn loop_align() -> Option<u32> {
     std::env::var("AMDC_LOOP_ALIGN").ok().and_then(|v| v.parse().ok()).filter(|v: &u32| v.is_power_of_two())
+}
+
+/// Register slots named by an operand text (`$vgpr4_vgpr5`, `$vgpr1(tied-def 0)`, `$vcc`).
+fn operand_slots(text: &str) -> Vec<Slot> {
+    let t = text.split('(').next().unwrap_or(text);
+    if !t.starts_with('$') {
+        return Vec::new();
+    }
+    slots_of(t)
+}
+
+/// Add `killed` to the last use of a register and `dead` to defs nobody reads, walking the block backwards
+/// from its live-out set. Whole-operand granularity only: a tuple is `killed`/`dead` when every dword is.
+fn annotate_flags(lines: &mut [String], mut live: BTreeSet<Slot>) {
+    use super::mir_roundtrip::parse_inst_line;
+    for line in lines.iter_mut().rev() {
+        let Some(mut inst) = parse_inst_line(line) else { continue };
+        if inst.opcode == "BUNDLE" || inst.raw.is_some() {
+            continue;
+        }
+        // operands: (is_def, index into defs or ops)
+        let mut defs: Vec<(bool, usize, Vec<Slot>)> = Vec::new();
+        let mut uses: Vec<(usize, Vec<Slot>)> = Vec::new();
+        for (i, o) in inst.defs.iter().enumerate() {
+            defs.push((true, i, operand_slots(&o.text)));
+        }
+        for (i, o) in inst.ops.iter().enumerate() {
+            let sl = operand_slots(&o.text);
+            if o.flags.iter().any(|f| f == "implicit-def" || f == "def") {
+                defs.push((false, i, sl));
+            } else {
+                uses.push((i, sl));
+            }
+        }
+        let defined: BTreeSet<Slot> = defs.iter().flat_map(|d| d.2.iter().copied()).collect();
+        for (is_def_list, i, sl) in &defs {
+            if sl.is_empty() || sl.iter().any(|s| live.contains(s)) {
+                continue;
+            }
+            let o = if *is_def_list { &mut inst.defs[*i] } else { &mut inst.ops[*i] };
+            if !o.flags.iter().any(|f| f == "dead") {
+                o.flags.push("dead".to_string());
+            }
+        }
+        // uses: only the last operand touching a slot may carry the kill
+        let mut seen: BTreeSet<Slot> = BTreeSet::new();
+        for (i, sl) in uses.iter().rev() {
+            if sl.is_empty() {
+                continue;
+            }
+            let free = sl.iter().all(|s| !seen.contains(s));
+            let dies = sl.iter().all(|s| !live.contains(s) || defined.contains(s));
+            seen.extend(sl.iter().copied());
+            if free && dies && !inst.ops[*i].flags.iter().any(|f| f == "killed") {
+                inst.ops[*i].flags.push("killed".to_string());
+            }
+        }
+        // liveness before this instruction
+        for s in &defined {
+            live.remove(s);
+        }
+        for (_, sl) in &uses {
+            live.extend(sl.iter().copied());
+        }
+        *line = inst.print().join("\n");
+    }
+}
+
+/// Conformance helper (`--level=reflag`): recompute kill/dead flags for the register slots we track over the body
+/// lines of one function of a hand-written MIR test, exactly as the exporter does for our kernels. Blocks containing
+/// bundles are left alone. Returns the rewritten lines.
+pub fn reflag_body(body: &[String]) -> Vec<String> {
+    use super::mir_roundtrip::parse_inst_line;
+    let mut out: Vec<String> = body.to_vec();
+    // block boundaries
+    let mut starts: Vec<usize> = Vec::new();
+    for (i, l) in body.iter().enumerate() {
+        if l.trim_start().starts_with("bb.") && l.trim_end().ends_with(':') {
+            starts.push(i);
+        }
+    }
+    if starts.is_empty() {
+        return out;
+    }
+    let nb = starts.len();
+    let end_of = |b: usize| if b + 1 < nb { starts[b + 1] } else { body.len() };
+    let is_inst = |l: &str| parse_inst_line(l).is_some();
+    let mut inst_idx: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    let mut has_bundle = false;
+    let id_of = |l: &str| -> Option<usize> {
+        let t = l.trim_start().strip_prefix("bb.")?;
+        t.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    };
+    let ids: Vec<usize> = starts.iter().map(|&s| id_of(&body[s]).unwrap_or(0)).collect();
+    let pos_of = |id: usize| ids.iter().position(|&x| x == id);
+    for b in 0..nb {
+        let mut explicit: Option<Vec<usize>> = None;
+        let mut last_op = String::new();
+        for i in starts[b] + 1..end_of(b) {
+            let l = &body[i];
+            if l.trim_start().starts_with("successors:") {
+                let v: Vec<usize> = l.split("%bb.").skip(1).filter_map(|x| x.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()).collect();
+                explicit = Some(v);
+                continue;
+            }
+            if l.trim_start().starts_with("BUNDLE") {
+                has_bundle = true;
+            }
+            if is_inst(l) {
+                inst_idx[b].push(i);
+                last_op = parse_inst_line(l).map(|x| x.opcode).unwrap_or_default();
+            }
+        }
+        let mut s: Vec<usize> = match explicit {
+            Some(v) => v.into_iter().filter_map(pos_of).collect(),
+            None => {
+                let mut v: Vec<usize> = Vec::new();
+                for &i in &inst_idx[b] {
+                    for t in body[i].split("%bb.").skip(1) {
+                        if let Some(n) = t.split(|c: char| !c.is_ascii_digit()).next().and_then(|x| x.parse::<usize>().ok()) {
+                            if let Some(p) = pos_of(n) {
+                                v.push(p);
+                            }
+                        }
+                    }
+                }
+                if b + 1 < nb && !matches!(last_op.as_str(), "S_BRANCH" | "S_ENDPGM" | "SI_RETURN_TO_EPILOG" | "S_SETPC_B64_return") {
+                    v.push(b + 1);
+                }
+                v
+            }
+        };
+        s.sort();
+        s.dedup();
+        succs[b] = s;
+    }
+    if has_bundle {
+        return out;
+    }
+    // per-block gen/kill over our slots
+    let mut gen_: Vec<BTreeSet<Slot>> = vec![BTreeSet::new(); nb];
+    let mut kill: Vec<BTreeSet<Slot>> = vec![BTreeSet::new(); nb];
+    for b in 0..nb {
+        for &i in &inst_idx[b] {
+            let (d, u) = defs_uses(&body[i]);
+            for x in u {
+                if !kill[b].contains(&x) {
+                    gen_[b].insert(x);
+                }
+            }
+            kill[b].extend(d);
+        }
+    }
+    let mut live_in = gen_.clone();
+    loop {
+        let mut changed = false;
+        for b in (0..nb).rev() {
+            let mut new_in = gen_[b].clone();
+            for &s in &succs[b] {
+                for x in &live_in[s] {
+                    if !kill[b].contains(x) {
+                        new_in.insert(*x);
+                    }
+                }
+            }
+            if new_in != live_in[b] {
+                live_in[b] = new_in;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for b in 0..nb {
+        let mut live: BTreeSet<Slot> = BTreeSet::new();
+        for &s in &succs[b] {
+            live.extend(live_in[s].iter().copied());
+        }
+        let mut lines: Vec<String> = inst_idx[b].iter().map(|&i| body[i].clone()).collect();
+        annotate_flags(&mut lines, live);
+        for (k, &i) in inst_idx[b].iter().enumerate() {
+            out[i] = lines[k].clone();
+        }
+    }
+    out
 }
 
 fn livein_text(set: &BTreeSet<Slot>) -> String {
