@@ -9043,7 +9043,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // VALU phase of half `hh`: max over its 32 scores, rollback (reference change) when some lane's S' leaves the fp8 range,
     // then P = fp8(2^(s - r) x 16) into `pw`
-    let valu = |b: &mut FnBuilder, hh: usize, masked: bool| {
+    let valu = |b: &mut FnBuilder, hh: usize, masked: bool| -> Vec<ValueId> {
+        let mut words_out: Vec<ValueId> = Vec::with_capacity(8);
         let mut kb: Vec<ValueId> = Vec::new();
         if masked {
             for sl in 0..2usize {
@@ -9145,20 +9146,35 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     b.cvt_pknorm_p8x4(xs[4 * m], xs[4 * m + 1], xs[4 * m + 2], xs[4 * m + 3], one_f)
                 };
                 b.set_var(pw[4 * sl + m], word);
+                words_out.push(word);
             }
         }
+        words_out
     };
-    let valu_tail = |b: &mut FnBuilder, hh: usize| {
+    let pv_w = |b: &mut FnBuilder, hh: usize, slot: ValueId, w: &[ValueId]| {
+        let tr_b = b.add_i32(cx.tr_base, slot);
+        let p8 = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        b.var_mfma_scale(la, ones8, p8, c127, c123);
+        for e in 0..4usize {
+            let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+            for r in 0..4i32 {
+                let off = b.c_i32((hh as i32) * 8320 + 256 * r + (e as i32) * 32);
+                addrs.push(b.add_i32(tr_b, off));
+            }
+            let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+            b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
+        }
+    };    let valu_tail = |b: &mut FnBuilder, hh: usize| {
         if fmha_t_opt("vsnotail") {
-            valu(b, hh, false);
+            let _ = valu(b, hh, false);
             return;
         }
         let key_end = b.add_i32(key0, c128v);
         let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
         b.begin_if(Opnd::Val(is_tail));
-        valu(b, hh, true);
+        let _ = valu(b, hh, true);
         b.else_();
-        valu(b, hh, false);
+        let _ = valu(b, hh, false);
         b.end_if();
     };
 
@@ -9167,11 +9183,19 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     if fmha_t_opt("vsflat") {
         // sequential order of the sv role with the same phase closures (no pipelining): QK, softmax, PV per 64-key unit
         qk(b, 0, slot_cur, kds_cur);
-        valu_tail(b, 0);
-        pv(b, 0, slot_cur);
-        qk(b, 1, slot_cur, kds_cur);
-        valu_tail(b, 1);
-        pv(b, 1, slot_cur);
+        if fmha_t_opt("vsvals") {
+            let w0 = valu(b, 0, false);
+            pv_w(b, 0, slot_cur, &w0);
+            qk(b, 1, slot_cur, kds_cur);
+            let w1 = valu(b, 1, false);
+            pv_w(b, 1, slot_cur, &w1);
+        } else {
+            valu_tail(b, 0);
+            pv(b, 0, slot_cur);
+            qk(b, 1, slot_cur, kds_cur);
+            valu_tail(b, 1);
+            pv(b, 1, slot_cur);
+        }
         stage(b, key_next, slot_nxt, kds_nxt);
         b.wait_lds(0);
         b.barrier();
