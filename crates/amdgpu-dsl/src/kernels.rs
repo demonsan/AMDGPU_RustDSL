@@ -9740,15 +9740,20 @@ pub fn probe_smfmac_ones() -> Function {
     let v28_1 = b.bitcast_f32(b.frag4_lane(s28, 1));
     let v28_2 = b.bitcast_f32(b.frag4_lane(s28, 2));
     let v28_3 = b.bitcast_f32(b.frag4_lane(s28, 3));
-    let sum28 = b.add_f32(b.add_f32(v28_0, v28_1), b.add_f32(v28_2, v28_3));
+    let sum28a = b.add_f32(v28_0, v28_1);
+    let sum28b = b.add_f32(v28_2, v28_3);
+    let sum28 = b.add_f32(sum28a, sum28b);
     let acc29 = b.frag4(k1000, k1000, k1000, k1000);
     let s29 = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc29);
-    let r29 = b.frag4(
-        b.bitcast_i32(b.frag4_lane(s29, 0)),
-        b.bitcast_i32(b.frag4_lane(s29, 1)),
-        b.bitcast_i32(b.frag4_lane(s29, 2)),
-        b.bitcast_i32(b.frag4_lane(s29, 3)),
-    );
+    let l29_0 = b.frag4_lane(s29, 0);
+    let l29_1 = b.frag4_lane(s29, 1);
+    let l29_2 = b.frag4_lane(s29, 2);
+    let l29_3 = b.frag4_lane(s29, 3);
+    let i29_0 = b.bitcast_i32(l29_0);
+    let i29_1 = b.bitcast_i32(l29_1);
+    let i29_2 = b.bitcast_i32(l29_2);
+    let i29_3 = b.bitcast_i32(l29_3);
+    let r29 = b.frag4(i29_0, i29_1, i29_2, i29_3);
 
     for (e, d) in results.iter().enumerate() {
         probe_smfmac_dump(&mut b, base, e, *d);
