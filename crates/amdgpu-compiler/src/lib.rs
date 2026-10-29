@@ -40,7 +40,13 @@ pub fn compile_mir(f: &amdgpu_dsl::Function) -> Result<mir::MFunction, String> {
 /// (`sched::Options::from_env`) a result that does not fit the register file is retried with a
 /// lower pressure limit and finally with the unscheduled code.
 fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regalloc::Alloc), String> {
-    let base = lower::lower(f)?;
+    // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
+    // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/status.md round 47).
+    let base = if f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
+        lower::with_opts(&["dce", "cmpfold", "scalarize"], || lower::lower(f))?
+    } else {
+        lower::lower(f)?
+    };
     let sched_opts = match sched::Options::from_env() {
         Some(o) if o.auto => sched::auto_plan(&base, &o),
         other => other,
@@ -117,7 +123,7 @@ pub fn export_mir(f: &amdgpu_dsl::Function, tail: &backend::LlvmTail) -> Result<
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
-    &["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_pp", "fmha_fwd_hd128_mxfp8_sv", "fmha_fwd_hd128_mxfp8_vs", "sched_valu_mul", "sched_valu_max3", "sched_valu_exp", "sched_mfma_chain", "sched_mfma_valu16", "sched_mfma_valu4", "sched_diamond", "sched_occ_chain"]
+    &["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_pp", "fmha_fwd_hd128_mxfp8_sv", "sched_valu_mul", "sched_valu_max3", "sched_valu_exp", "sched_mfma_chain", "sched_mfma_valu16", "sched_mfma_valu4", "sched_diamond", "sched_occ_chain"]
 }
 
 pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
@@ -166,11 +172,13 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_pp" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_pp()),
         "fmha_fwd_hd128_mxfp8_sv" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_sv()),
         "fmha_fwd_hd128_mxfp8_vs" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vs()),
+        "fmha_fwd_hd128_mxfp8_vs128" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vs128()),
         "probe_dma" => Some(amdgpu_dsl::kernels::probe_dma()),
         "probe_dma_tile" => Some(amdgpu_dsl::kernels::probe_dma_tile()),
         "probe_dma_seq" => Some(amdgpu_dsl::kernels::probe_dma_seq()),
         "probe_dma_kread" => Some(amdgpu_dsl::kernels::probe_dma_kread()),
         "probe_dma_map" => Some(amdgpu_dsl::kernels::probe_dma_map()),
+        "probe_smfmac_ones" => Some(amdgpu_dsl::kernels::probe_smfmac_ones()),
         "sched_valu_mul" => Some(amdgpu_dsl::kernels::sched_valu_mul()),
         "sched_valu_max3" => Some(amdgpu_dsl::kernels::sched_valu_max3()),
         "sched_valu_exp" => Some(amdgpu_dsl::kernels::sched_valu_exp()),
