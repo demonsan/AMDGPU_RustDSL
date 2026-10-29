@@ -15,6 +15,7 @@
 //! See `docs/safe-asm-design.md` for the rules the types enforce and what they cannot.
 #![forbid(unsafe_code)]
 
+pub mod examples;
 pub mod ops;
 pub mod regs;
 pub mod seq;

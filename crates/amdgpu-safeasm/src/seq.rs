@@ -279,6 +279,7 @@ impl<const I: usize, const N: usize> LaneCheck<I, N> {
 #[must_use = "an in-flight MFMA must be retired (or chained) before its result is used"]
 pub struct Mfma<'a> {
     pub(crate) issued: u32,
+    pub(crate) acc: VReg,
     pub(crate) _p: PhantomData<&'a mut ()>,
 }
 
@@ -286,6 +287,7 @@ pub struct Mfma<'a> {
 #[must_use = "an in-flight SMFMAC must be retired (or chained) before its result is used"]
 pub struct Smfmac<'a> {
     pub(crate) issued: u32,
+    pub(crate) acc: VReg,
     pub(crate) _p: PhantomData<&'a mut ()>,
 }
 

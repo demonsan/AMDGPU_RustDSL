@@ -54,6 +54,12 @@ impl Seq {
         self.note_valu_write(dst.dst_id());
     }
 
+    /// `v_add_f32_e32 acc, src0, acc` (accumulate in place).
+    pub fn v_add_f32_acc<A: Operand>(&mut self, acc: &mut Vgpr<1>, a: A) {
+        self.push(MInst::new(MOp::VAddF32).def(acc.id).src(a.to_src()).srcreg(acc.id));
+        self.note_valu_write(acc.id);
+    }
+
     // ---- VALU, VOP3 -------------------------------------------------------------------------------------------------------------
     /// `v_mul_lo_u32 dst, a, b` (VOP3: one scalar source at most, no literal).
     pub fn v_mul_lo_u32<D: Dst<1>, A: Operand, B: Operand>(&mut self, dst: D, a: A, b: B) {
@@ -118,7 +124,7 @@ impl Seq {
         let issued = self.clock;
         self.push(MInst::new(MOp::VMfmaScale32x32x64Fp8).def(acc.id).srcreg(a.id).srcreg(b.id).srcreg(acc.id).srcreg(sa.id).srcreg(sb.id));
         self.note_write(acc.id, MATRIX_RESULT);
-        Mfma { issued, _p: PhantomData }
+        Mfma { issued, acc: acc.id, _p: PhantomData }
     }
 
     /// The same with an implicit zero accumulator (`D = A x B`): `acc` is only written.
@@ -126,7 +132,7 @@ impl Seq {
         let issued = self.clock;
         self.push(MInst::new(MOp::VMfmaScale32x32x64Fp8Z).def(acc.id).srcreg(a.id).srcreg(b.id).srcreg(sa.id).srcreg(sb.id));
         self.note_write(acc.id, MATRIX_RESULT);
-        Mfma { issued, _p: PhantomData }
+        Mfma { issued, acc: acc.id, _p: PhantomData }
     }
 
     /// `v_smfmac_f32_16x16x128_fp8_fp8 acc, a_sparse, b, idx`: the accumulator C is `acc` itself (implicit in the ISA, explicit here).
@@ -135,25 +141,27 @@ impl Seq {
         let issued = self.clock;
         self.push(MInst::new(MOp::VSmfmac16x16x128Fp8).def(acc.id).srcreg(a.id).srcreg(b.id).srcreg(idx.id).srcreg(acc.id));
         self.note_write(acc.id, MATRIX_RESULT);
-        Smfmac { issued, _p: PhantomData }
+        Smfmac { issued, acc: acc.id, _p: PhantomData }
     }
 }
 
 impl<'a> Mfma<'a> {
     /// Dependent MFMA of the same opcode accumulating in place into the same register: hardware-interlocked, no wait needed.
-    pub fn chain(self, s: &mut Seq, acc: &'a mut Vgpr<16>, a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>) -> Mfma<'a> {
+    pub fn chain(self, s: &mut Seq, a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>) -> Mfma<'a> {
         let issued = s.clock;
-        s.push(MInst::new(MOp::VMfmaScale32x32x64Fp8).def(acc.id).srcreg(a.id).srcreg(b.id).srcreg(acc.id).srcreg(sa.id).srcreg(sb.id));
-        s.note_write(acc.id, MATRIX_RESULT);
-        Mfma { issued, _p: PhantomData }
+        let acc = self.acc;
+        s.push(MInst::new(MOp::VMfmaScale32x32x64Fp8).def(acc).srcreg(a.id).srcreg(b.id).srcreg(acc).srcreg(sa.id).srcreg(sb.id));
+        s.note_write(acc, MATRIX_RESULT);
+        Mfma { issued, acc, _p: PhantomData }
     }
 }
 
 impl<'a> Smfmac<'a> {
-    pub fn chain(self, s: &mut Seq, acc: &'a mut Vgpr<4>, a: Ready<'a, 4>, b: Ready<'a, 8>, idx: Ready<'a, 1>) -> Smfmac<'a> {
+    pub fn chain(self, s: &mut Seq, a: Ready<'a, 4>, b: Ready<'a, 8>, idx: Ready<'a, 1>) -> Smfmac<'a> {
         let issued = s.clock;
-        s.push(MInst::new(MOp::VSmfmac16x16x128Fp8).def(acc.id).srcreg(a.id).srcreg(b.id).srcreg(idx.id).srcreg(acc.id));
-        s.note_write(acc.id, MATRIX_RESULT);
-        Smfmac { issued, _p: PhantomData }
+        let acc = self.acc;
+        s.push(MInst::new(MOp::VSmfmac16x16x128Fp8).def(acc).srcreg(a.id).srcreg(b.id).srcreg(idx.id).srcreg(acc));
+        s.note_write(acc, MATRIX_RESULT);
+        Smfmac { issued, acc, _p: PhantomData }
     }
 }
