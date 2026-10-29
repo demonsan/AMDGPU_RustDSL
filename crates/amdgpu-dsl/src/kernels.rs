@@ -989,7 +989,7 @@ pub fn probe_dma() -> Function {
 /// `o` must equal `i` (16 KB).
 pub fn probe_dma_tile() -> Function {
     let mut b = FnBuilder::new("probe_dma_tile", 256);
-    b.lds(16384);
+    b.lds(std::env::var("PD_LDS").ok().and_then(|v| v.parse().ok()).unwrap_or(16384));
     b.arg("o", DType::Ptr, 0, 8);
     b.arg("i", DType::Ptr, 8, 8);
     let o = b.let_(Op::KernargPtr { offset: 0 });

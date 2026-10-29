@@ -28,6 +28,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e FMHA_ABLATE="${FMHA_ABLATE:-}" \
     -e FMHA_PITCH="${FMHA_PITCH:-}" \
     -e FMHA_OPT="${FMHA_OPT:-}" \
+    -e PD_LDS="${PD_LDS:-}" \
     -e AMDC_ORACLE_OUT="${AMDC_ORACLE_OUT:-}" \
     -e AMDC_TEST_KERNELS="${AMDC_TEST_KERNELS:-}" \
     -e AMDC_KEEP_MIR="${AMDC_KEEP_MIR:-}" \
