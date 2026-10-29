@@ -9991,22 +9991,51 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         {
             let w_old_u = b.frag2_lane(bias2, 0);
             let w_old = b.bitcast_i32(w_old_u);
-            // rbtrim: v_cvt_f32_f16 reads only the low 16 bits and v_cvt_f16_f32 zero-extends: the masks are redundant
-            let lo16 = if !fmha_t_opt("norbtrim") { w_old } else { b.let_(Op::AndI32(Opnd::Val(w_old), Opnd::Val(cffff))) };
-            let b8 = b.let_(Op::CvtF16ToF32(Opnd::Val(lo16)));
-            let b_old = b.mul_f32(b8, c8f);
-            let tt = b.sub_f32(c_b131, mt);
-            let b_new = b.add_f32(b_old, tt);
-            let q8 = b.mul_f32(b_new, c0125);
-            let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q8)));
-            let h = if !fmha_t_opt("norbtrim") { h_raw } else { b.let_(Op::AndI32(Opnd::Val(h_raw), Opnd::Val(cffff))) };
-            let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h)));
-            let b_q = b.mul_f32(hq, c8f);
-            let d_full = b.sub_f32(b_q, b_old);
-            let delta = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(d_full), b: Opnd::Val(zero_f) });
-            let h_sh = b.shl_i32(h, c16i);
-            let w_q = b.let_(Op::AddI32(Opnd::Val(h), Opnd::Val(h_sh)));
-            let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
+            let (delta, w_new) = if fmha_t_opt("bias2w") {
+                // bias2w: the bias is the sum of TWO f16 words (hi + residual, 4 (hi + lo) over the 8 K slots) instead of one rounded f16: the
+                // reference shift delta = b_q - b_old that is added to the scores and used for the O/l rescale is then exact to ~2^-22 (the
+                // single f16 word quantised it to ~1.2e-4 in x, i.e. 4-6% of P per rollback)
+                let hi_o = b.let_(Op::CvtF16ToF32(Opnd::Val(w_old)));
+                let lo_s = b.let_(Op::LshrI32(Opnd::Val(w_old), Opnd::Val(c16i)));
+                let lo_o = b.let_(Op::CvtF16ToF32(Opnd::Val(lo_s)));
+                let c4f = b.c_f32(4.0);
+                let c025 = b.c_f32(0.25);
+                let sum_o = b.add_f32(hi_o, lo_o);
+                let b_old = b.mul_f32(sum_o, c4f);
+                let tt = b.sub_f32(c_b131, mt);
+                let b_new = b.add_f32(b_old, tt);
+                let q = b.mul_f32(b_new, c025);
+                let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q)));
+                let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h_raw)));
+                let r = b.sub_f32(q, hq);
+                let l_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(r)));
+                let lq = b.let_(Op::CvtF16ToF32(Opnd::Val(l_raw)));
+                let sum_q = b.add_f32(hq, lq);
+                let b_q = b.mul_f32(sum_q, c4f);
+                let d_full = b.sub_f32(b_q, b_old);
+                let delta = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(d_full), b: Opnd::Val(zero_f) });
+                let l_sh = b.shl_i32(l_raw, c16i);
+                let w_q = b.let_(Op::AddI32(Opnd::Val(h_raw), Opnd::Val(l_sh)));
+                let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
+                (delta, w_new)
+            } else {                // rbtrim: v_cvt_f32_f16 reads only the low 16 bits and v_cvt_f16_f32 zero-extends: the masks are redundant
+                let lo16 = if !fmha_t_opt("norbtrim") { w_old } else { b.let_(Op::AndI32(Opnd::Val(w_old), Opnd::Val(cffff))) };
+                let b8 = b.let_(Op::CvtF16ToF32(Opnd::Val(lo16)));
+                let b_old = b.mul_f32(b8, c8f);
+                let tt = b.sub_f32(c_b131, mt);
+                let b_new = b.add_f32(b_old, tt);
+                let q8 = b.mul_f32(b_new, c0125);
+                let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q8)));
+                let h = if !fmha_t_opt("norbtrim") { h_raw } else { b.let_(Op::AndI32(Opnd::Val(h_raw), Opnd::Val(cffff))) };
+                let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h)));
+                let b_q = b.mul_f32(hq, c8f);
+                let d_full = b.sub_f32(b_q, b_old);
+                let delta = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(d_full), b: Opnd::Val(zero_f) });
+                let h_sh = b.shl_i32(h, c16i);
+                let w_q = b.let_(Op::AddI32(Opnd::Val(h), Opnd::Val(h_sh)));
+                let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
+                    (delta, w_new)
+            };
             let dupd = b.frag2_dup(delta);
             if !ablate.contains("rbnos") {
                 for s in 0..4usize {
