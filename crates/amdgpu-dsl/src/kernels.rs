@@ -8994,7 +8994,9 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         let s_v = swz_s(&mut b, key_part, c1, c2, c3);
         let f_s = b.let_(Op::LshrI32(Opnd::Val(s_v), Opnd::Val(c1)));
         let trow = b.mul_i32(key_part, c128);
-        let mg16 = b.shl_i32(m_gl, c4);
+        let s_v0 = b.let_(Op::AndI32(Opnd::Val(s_v), Opnd::Val(c1)));
+        let mgx = b.xor_i32(m_gl, s_v0);
+        let mg16 = b.shl_i32(mgx, c4);
         let mh8 = b.shl_i32(m_h, c3);
         let colp = b.add_i32(mg16, mh8);
         let trow_c = b.add_i32(trow, colp);
