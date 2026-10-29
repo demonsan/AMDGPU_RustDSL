@@ -306,6 +306,54 @@ parity gate. Cheapest first experiment: keep the current recipe but store the bi
 words (hi + residual of B/8), so the delta no longer loses its low bits; expected to remove the
 52 bad elements. If it still fails, port the f32-reference path above.
 
+### 4.5.3 Row sums for OUR P layout: the 4-smfmac recipe (Verified on hardware)
+
+The vendor's 2-smfmac row sum cannot be reused verbatim for our P layout: the smfmac 16x16x128 B
+operand is a 128K x 16-query view of the same bytes that the PV MFMA sees as 64K x 32-query, so a
+naive A/SRC2 copy mixes query q with q+16 (this is what kernel-opt's two attempts hit). The probe
+(slots 100-180 of `probe_smfmac_ones`, query-coded and byte-coded P patterns) found the exact
+construction that works for our layout:
+
+```
+// once per kernel, outside the loops (lane = workitem_id & 63):
+let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(b.c_i32(63))));
+let b0 = lane & 3;                      // Op::AndI32
+let b1 = lane & 4;
+let ones_w = 0x38383838;                // E4M3 1.0 x4
+let v = (b0 >= 2) ? ones_w : 0;         // Op::CmpLtI32(b0,2) + Select (select 0 when b0<2)
+let a01 = (b1 == 0) ? 0 : v;            // Select on CmpLtI32(b1,1)
+let a23 = (b1 == 0) ? v : 0;
+let a_rs = b.frag4(a23, a23, a01, a01); // the row-sum A operand (4 VGPR, per-lane)
+let idx01 = b.c_i32(0x44444444);        // {0,1} of each group of 4 B rows
+let idx23 = b.c_i32(0xeeeeeeee);        // {2,3}
+// per 128-key unit, with p8_hh0/p8_hh1 = the two P Frag8 the PV MFMA already consumes:
+let z = b.frag_zero(DType::Frag4);
+let r = b.smfmac_fp8_16x16x128(a_rs, p8_hh0, idx01, z);
+let r = b.smfmac_fp8_16x16x128(a_rs, p8_hh1, idx01, r);
+let r = b.smfmac_fp8_16x16x128(a_rs, p8_hh0, idx23, r);
+let r = b.smfmac_fp8_16x16x128(a_rs, p8_hh1, idx23, r);
+let l_unit = b.bitcast_f32(b.frag4_lane(r, 2));   // dword 2 (dword 3 is identical)
+```
+
+`l_unit` is EXACTLY 16 x the current msum result (`2x var_mfma_scale(la, ones8, p8, c127, c123)` read
+as `frag16_lane(la, 0)`): the smfmac pair sums the raw fp8 P (no /16 B scale), the msum applies
+2^(123-127) = 1/16. So keep a scalar f32 loop accumulator `l_var += l_unit` (and `l_var *= corr` in the
+rollback block, replacing `var_scale_lane(la, 0, corr)`) and at the epilogue use
+`l_tot = l_var * 0.0625` before `rcp`. Cost: **4 smfmac x 16 = 64 XDL cycles vs the 2 x 64 = 128 of the
+two scaled ones-MFMAs -> -64 cycles/wave-iteration (-128/SIMD-iteration)**; the 16-VGPR `la` accumulator
+becomes a scalar f32 (frees 16 VGPR); per iteration cost is +1 `v_add_f32` (and ~6 VALU once for A).
+
+Evidence (probe slots, all 64 lanes, GPU 5):
+* query-coded P (v = 1+(lane%8)/8 and v = 1+((lane>>3)&3)/8 to separate q from q+16): the 4-smfmac D
+  dword 2 equals `16 * ref[lane]` for all 64 lanes -> per-QUERY sums, query = lane%32 (slots 167/168).
+* byte-coded K pattern (`word = [1.0,1.125,2.0,2.5]`, full 128-K sum = 203): 4-smfmac = **203** exactly;
+  idx01-only = 68, idx23-only = 135, 68+135 = 203 -> the two index passes cover **complementary** K
+  positions (slots 171-176). Order of the four smfmacs does not matter.
+* 2 smfmac are NOT enough: every 2-smfmac variant (including hh0 with idx01 + hh1 with idx23) gives only
+  half (106/97 of 203); a single A/idx pair cannot cover both index halves (slots 177-180).
+* The same construction with the inverse lane condition (`v = (b0 < 2) ? ones : 0`, A = frag4(a23,a23,
+  a01,a01)) works identically and puts the result in dwords 0/1 instead (slots 169/170/173) - use either.
+
 ## 5. LDS layout, staging and VGPR budget (Verified static)
 
 * **Global -> LDS is DMA, not a register round trip.** 63 static `buffer_load_dwordx4 ... lds`
