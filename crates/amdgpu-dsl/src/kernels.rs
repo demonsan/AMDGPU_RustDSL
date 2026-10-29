@@ -6813,8 +6813,12 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let sh16 = b.add_i32(cx.g8, c16i);
                 let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
                 let zero_s = b.frag_zero(DType::Frag16);
-                let s0 = b.mfma_scale_fp8(k8_0, cx.b0, zero_s, sk0, cx.sq0);
-                let s_frag = b.mfma_scale_fp8(k8_1, cx.b1, s0, sk1, cx.sq1);
+                let s_frag = if fmha_t_opt("abl_qk") {
+                    zero_s
+                } else {
+                    let s0 = b.mfma_scale_fp8(k8_0, cx.b0, zero_s, sk0, cx.sq0);
+                    b.mfma_scale_fp8(k8_1, cx.b1, s0, sk1, cx.sq1)
+                };
                 let mut vals: Vec<ValueId> = Vec::with_capacity(16);
                 let kb_s0 = b.add_i32(key0, cx.g4);
                 let kb_cs = b.c_i32(32 * s as i32);
