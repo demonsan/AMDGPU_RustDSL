@@ -8135,13 +8135,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let sq1m = b.add_i32(cx.sq1, cm9);
     if fmha_t_opt("dbgk") {
         // debug: dump the K and V fragments of tile 0 as read from LDS into the output rows, then stop
-        let (k8_0, k8_1) = if dma {
-            let a0 = cx.kfx[0];
-            let a1 = cx.kfx[1];
-            let a2 = cx.kfx[2];
-            let a3 = cx.kfx[3];
-            (b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)), b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)))
-        } else {
+        let (k8_0, k8_1) = {
             let kaddr0h = b.add_i32(cx.kf_base, c32v);
             let kaddr1 = b.add_i32(cx.kf_base, c64);
             let kaddr1h = b.add_i32(kaddr1, c32v);
@@ -8149,9 +8143,8 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         };
         let mut addrs: Vec<ValueId> = Vec::new();
         for r in 0..4i32 {
-            let off = b.c_i32(16 * pitch * r);
-            let base = if dma { cx.trx[0] } else { cx.tr_base };
-            addrs.push(b.add_i32(base, off));
+            let off = b.c_i32(if dma_l { 256 * r } else { 16 * pitch * r });
+            addrs.push(b.add_i32(cx.tr_base, off));
         }
         let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
         let ob0 = b.mul_i32(cx.bidx, cx.o_bs);
