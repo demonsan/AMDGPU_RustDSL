@@ -482,6 +482,12 @@ impl Lowerer {
         Ok((self.as_v1(cur)?, off))
     }
 
+    /// Is `r` a loop variable's register or a view (lane / sub-register) of one? Such registers are overwritten in place.
+    fn var_backed(&self, r: VReg) -> bool {
+        let c = self.mir.canon(r);
+        self.vars.iter().any(|v| *v != u32::MAX && self.mir.canon(*v) == c)
+    }
+
     /// (register, constant) view of an integer operand for `addrfold`.
     fn lazy_core(&mut self, o: Opnd) -> Result<(VReg, i64), String> {
         if let Opnd::Val(v) = o {
@@ -519,6 +525,9 @@ impl Lowerer {
             (None, Some(k)) | (Some(k), None) => {
                 let other = if kb.is_some() { a } else { b };
                 let (t, k0) = self.lazy_core(other)?;
+                if self.var_backed(t) {
+                    return Ok(false);
+                }
                 self.lazy.insert(dst, (t, k0 + k));
                 Ok(true)
             }
@@ -531,6 +540,9 @@ impl Lowerer {
                 }
                 let (ta, k1) = self.lazy_core(a)?;
                 let (tb, k2) = self.lazy_core(b)?;
+                if self.var_backed(ta) || self.var_backed(tb) {
+                    return Ok(false);
+                }
                 self.touch(&[Src::Reg(ta), Src::Reg(tb)]);
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VAddU32).def(d).srcreg(ta).srcreg(tb));
