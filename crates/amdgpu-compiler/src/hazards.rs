@@ -93,6 +93,11 @@ fn movable(op: MOp) -> bool {
     )
 }
 
+/// Extra fill candidates when `vcc` filling is on (none touches vcc; partial writers are guarded by the RAW/WAR/WAW check).
+fn movable_wide(op: MOp) -> bool {
+    matches!(op, MOp::VCvtPknormU16 | MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VMovFromS)
+}
+
 /// VALU instructions whose VGPR result feeding an MFMA operand or a `v_permlane*_swap` needs wait
 /// states first (LLVM GCNHazardRecognizer: 2 states; 4 after carry-out adds). Found by the LLVM-tail
 /// oracle (docs/llvm-tail-integration.md); the exact count is taken from LLVM, not measured.
@@ -219,7 +224,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         break;
                     }
                     let cand = &insts[j];
-                    let mut ok = movable(cand.op)
+                    let mut ok = (movable(cand.op) || (VCC_FILL.with(|c| c.get()) && movable_wide(cand.op)))
                         && cand.dst.is_some()
                         && earliest_of(cand, &ready, &vw, &pkw, cycle) <= cycle;
                     if ok {
