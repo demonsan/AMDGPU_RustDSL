@@ -29,12 +29,31 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     // tuples cannot find an aligned hole between scattered singles, retry with the singles
     // packed from the top of the file so the low registers stay available for tuples.
     match allocate_with(m, false) {
-        Err(e) if e.contains("out of VGPRs") => allocate_with(m, true),
+        Err(e) if e.contains("out of VGPRs") => match allocate_with(m, true) {
+            // last resort: offline two-phase packing (wide tuples first, singles into the remaining holes in time)
+            Err(e2) if e2.contains("out of VGPRs") => allocate_two_phase(m).map_err(|e3| if e3.contains("out of VGPRs") { e2 } else { e3 }),
+            other => other,
+        },
         other => other,
     }
 }
 
 fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String> {
+    allocate_policy(m, Policy::Scan { singles_from_top })
+}
+
+fn allocate_two_phase(m: &MFunction) -> Result<Alloc, String> {
+    allocate_policy(m, Policy::TwoPhase)
+}
+
+#[derive(Clone, Copy)]
+enum Policy {
+    Scan { singles_from_top: bool },
+    TwoPhase,
+}
+
+fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
+    let singles_from_top = matches!(policy, Policy::Scan { singles_from_top: true });
     let n = m.vregs.len();
     let mut start = vec![usize::MAX; n];
     let mut end = vec![0usize; n];
@@ -210,6 +229,41 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
     // Highest slot ever handed out, not just the ones still live at the end:
     // the descriptor must cover every register the code touches.
     let mut max_v = 0usize;
+    if matches!(policy, Policy::TwoPhase) {
+        // Per physical register: the (start, end) intervals already placed on it. Wide tuples first (widest, then longest),
+        // every placement checked for overlap in time, so a single may sit in a register between two phases of a tuple.
+        let mut occ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); VGPR_COUNT];
+        for i in 0..V_RESERVED {
+            occ[i].push((0, usize::MAX));
+        }
+        let mut order: Vec<(usize, usize, VReg, RClass)> = vregs.clone();
+        order.sort_by_key(|x| (std::cmp::Reverse(x.3.dwords()), std::cmp::Reverse(x.1 - x.0), x.0));
+        for (s, e, r, c) in order {
+            let width = c.dwords() as usize;
+            let lo = if width == 1 { V_RESERVED } else { width };
+            let mut found = None;
+            let mut i = lo;
+            while i + width <= VGPR_COUNT {
+                if i % width == 0 && (0..width).all(|k| occ[i + k].iter().all(|(os, oe)| *oe < s || e < *os)) {
+                    found = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            let slot = found.ok_or_else(|| format!("out of VGPRs allocating r{r} ({c:?}, live {s}..{e}) in the two-phase packing"))?;
+            for k in 0..width {
+                occ[slot + k].push((s, e));
+            }
+            phys[r as usize] = slot as u32;
+            max_v = max_v.max(slot + width);
+        }
+        for (i, o) in occ.iter().enumerate() {
+            if o.iter().any(|x| x.1 != usize::MAX || i < V_RESERVED) {
+                used_v[i] = true;
+            }
+        }
+        vregs = Vec::new();
+    }
     for (s, e, r, c) in vregs {
         active.retain(|(ae, ar, ac)| {
             if *ae < s {
