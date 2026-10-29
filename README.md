@@ -11,7 +11,7 @@ kernel 作者和自动化 agent 在一个**类型化、可验证、可快速迭�
 | Rust 类型化 DSL、IR 验证器、MIR、线性扫描 RA、hazard / wait 插入、asm 发射 | 已实现，`cargo test` 11 项 |
 | 端到端：DSL → `.s` → `.co` → HIP 启动 → 数值比对 | 已打通，见 `tests/gpu/` |
 | `attention_fwd`（fp16，示例） | 对 CPU 参考最大绝对误差 ≈ 6e-5 |
-| MXFP8 FMHA：`fmha_fwd_hd128_mxfp8_t` | 与厂商 `fwd_hd128_mxfp8.co` 使用**相同的 656 字节 kernarg ABI 和数据布局**，15 个形状逐元素对拍通过；B1H8S2048 上 286–287 TFLOP/s（厂商 518），对 CPU 的平均误差 1.25e-3（优于厂商 2.42e-3） |
+| MXFP8 FMHA：`fmha_fwd_hd128_mxfp8_t` | 与厂商 `fwd_hd128_mxfp8.co` 使用**相同的 656 字节 kernarg ABI 和数据布局**，15 个形状逐元素对拍通过；B1H8S2048 上 292 TFLOP/s（厂商 514，差 1.76 倍），对 CPU 的平均误差 1.25e-3（优于厂商 2.42e-3） |
 
 `fmha_fwd_hd128_mxfp8_t` 的功能：head dim 128，fp8(e4m3) Q/K/V，E8M0 1×32 Q/K 缩放，标量 V 缩放，BF16 输出，`exp2` softmax，在线 softmax，任意 query / key 长度（含不满一块的 tile），GQA（2 的幂 ≤ 16），任意 batch / head 数。不支持 LSE 输出。
 
@@ -21,7 +21,7 @@ kernel 作者和自动化 agent 在一个**类型化、可验证、可快速迭�
 - 我们 vs 厂商：全部输出逐个比较，平均差异 1.3–2.8e-3；Q = 0 与 SK = 1 时逐位相同
 - 差异来源：P 量化到 fp8 的舍入方式不同（固有）
 
-**性能（如实）**：B=1, H=8, S=SK=2048 上默认的精确 recipe kernel `fmha_fwd_hd128_mxfp8_t` 约 **286–287 TFLOP/s**（默认对该 kernel 启用 scheduler 的 `ld` 预设：scoreboard 部分 wait + `ds_read` 提升，`AMDC_SCHED=0` 可关）（与 CPU 的 mean err 1.25e-3，优于厂商 2.42e-3；15 个形状在两个后端均通过，确定性 5/5），厂商 kernel 约 518 TFLOP/s，**慢约 1.81 倍**。opt-in 实验：`_sv`（厂商式 softmax，加 svcorr 后 15/15，254 TFLOP/s，mean err 1.75e-3；不加 svcorr 285 TFLOP/s 但 13/15 形状有离群点）、`_pp`（ping-pong，205）、`FMHA_OPT=dma`（global->LDS DMA，仅 own 后端，H>=2 仍错误，未启用）。详见 `docs/status.md` 第 44/45 轮（占用率、barrier、swizzle 等负结果）。
+**性能（如实）**：B=1, H=8, S=SK=2048 上默认的精确 recipe kernel `fmha_fwd_hd128_mxfp8_t` 约 **292 TFLOP/s**（llvm-tail）/ **286**（own）（默认对该 kernel 启用 scheduler 的 `ld` 预设：scoreboard 部分 wait + `ds_read` 提升，`AMDC_SCHED=0` 可关）（与 CPU 的 mean err 1.25e-3，优于厂商 2.42e-3；15 个形状在两个后端均通过，确定性 5/5），厂商 kernel 约 518 TFLOP/s，**慢约 1.76 倍**。opt-in 实验：`_sv`（厂商式 softmax，加 svcorr 后 15/15，254 TFLOP/s，mean err 1.75e-3；不加 svcorr 285 TFLOP/s 但 13/15 形状有离群点）、`_pp`（ping-pong，205）、`FMHA_OPT=dma`（global->LDS DMA，仅 own 后端，H>=2 仍错误，未启用）。详见 `docs/status.md` 第 44/45 轮（占用率、barrier、swizzle 等负结果）。
 
 **不是 1:1 复刻**：ABI、网格 / block 形状、1×32 缩放用法、`v_mfma_scale_f32_32x32x64_f8f6f4`、`ds_read_b64_tr_b8`、A/B 两组 wave 的分工都和参考 kernel 一致，但指令级结构不同（P 量化用 `v_cvt_pk_fp8_f32`，参考用 pknorm + scalef32 pack；PV 用 32×32×64 MFMA，参考用 `v_smfmac_f32_16x16x128_fp8_fp8`；每轮 1 个 barrier（双缓冲），参考 4 个 phase；没有 rollback 出口）。对照表见 `docs/final-report.md`。
 
@@ -70,7 +70,7 @@ REF_CO=/path/to/fwd_hd128_mxfp8.co OUR_KERNEL=fmha_fwd_hd128_mxfp8_t bash tests/
 
 ## 已知限制
 
-- 调度能力：块内 list scheduling、超块尾部复制（`taildup`）、单块循环软件流水（`swp`）、`ds_read` 提升（`ldshoist`）；默认对 FMHA kernel 开 `ld` 预设，其余默认关闭。仍没有全局（跨函数/跨 region）调度。\n- 性能：FMHA 约 286–287 TFLOP/s，厂商手写 kernel 约 518，差约 1.8 倍；剩余差距主要是 staging+barrier、exp 与惰性重缩放（详见 `docs/status.md` 第 44/45 轮）。
+- 调度能力：块内 list scheduling、超块尾部复制（`taildup`）、单块循环软件流水（`swp`）、`ds_read` 提升（`ldshoist`）；默认对 FMHA kernel 开 `ld` 预设，其余默认关闭。仍没有全局（跨函数/跨 region）调度。\n- 性能：FMHA 约 292（llvm-tail）/ 286（own）TFLOP/s，厂商手写 kernel 约 514–518，差约 1.76 倍；剩余差距主要是 staging+barrier、exp 与惰性重缩放（详见 `docs/status.md` 第 44/45 轮）。
 - 没有跨卡通信（MORI LSA / SDMA / GDA）、gfx1250 后端、JIT / 框架适配的实现；`docs/design.md` 里这些仍是设计。
 - 设计文档中的 Resource / Async IR 只落地了一部分（LDS 区域、待完成加载的 wait 跟踪）。
 - 没有测量 ≤10 ms 的编译延迟，不做这个声明。
