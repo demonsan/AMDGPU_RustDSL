@@ -2812,9 +2812,7 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
                 // the reload temporary lives from the first to the last use in the peak block: it only helps if that range
                 // does not contain the peak position
                 let us: Vec<usize> = m.blocks[pblk].insts.iter().enumerate().filter(|(_, i)| i.uses().contains(&r)).map(|(k, _)| k).collect();
-                if us.first().map_or(false, |f| *f <= pidx) && us.last().map_or(false, |l| *l >= pidx) {
-                    continue;
-                }
+                // (straddling values are reloaded before each use instead: per_use below; costs one DS read per use)
             }
             if matches!(m.blocks[db].insts[di].op, MOp::VReadPhys) {
                 continue;
@@ -2828,6 +2826,24 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
         m.blocks[db].insts.insert(di + 1, MInst::new(MOp::LdsWriteB32).srcreg(addr).srcreg(v).imm(off));
         let blocks: Vec<usize> = loop_blocks[&v].iter().copied().collect();
         for bi in blocks {
+            if bi == pblk {
+                let us: Vec<usize> = m.blocks[bi].insts.iter().enumerate().filter(|(_, i)| i.uses().contains(&v)).map(|(k, _)| k).collect();
+                if us.first().map_or(false, |f| *f <= pidx) && us.last().map_or(false, |l| *l >= pidx) {
+                    // per-use reloads: each temporary lives for one instruction
+                    for k in us.into_iter().rev() {
+                        let t = newv(m);
+                        for s in m.blocks[bi].insts[k].srcs.iter_mut() {
+                            if let Src::Reg(r) = s {
+                                if *r == v {
+                                    *r = t;
+                                }
+                            }
+                        }
+                        m.blocks[bi].insts.insert(k, MInst::new(MOp::LdsReadB32).def(t).srcreg(addr).imm(off));
+                    }
+                    continue;
+                }
+            }
             let t = newv(m);
             let b = &mut m.blocks[bi];
             let first = b.insts.iter().position(|i| i.srcs.iter().any(|s| matches!(s, Src::Reg(r) if *r == v))).unwrap();
