@@ -246,6 +246,66 @@ Open point (Experimental): our used-filler experiment shows that 8 clocks of VAL
 enough to make a non-zero VALU-initialised C dword 3 visible in the single-smfmac case; treat the exact
 minimum for that path as unconfirmed and avoid it (start chains from zero C or from a previous SMFMAC).
 
+## 4.7 The vendor's softmax conversion: exact constants, formula, and why it needs no correction
+
+Reverse-engineered from `ref_mxfp8.co` (`tools/vendor_disasm.sh`); all values are the live scalars of
+`label_block_A_loop` at 0x2b68 and the four rollback copies at 0x9d4c/0xa1f4/0xa69c/0xab44.
+
+**Constants (Verified, exact bit patterns):**
+
+| constant | value | where / role |
+|---|---|---|
+| `s26`/`s27` | `0x43ffff00` = **511.9921875** = 65535/128 | exponent-field scale: `E_bf16 = floor(65535*x/128) = floor(s26*x)` |
+| `s93` | `0x3b000080` = 1/512 (1+2^-16) | reference update, `r += s93*s26*delta` (product = 0.9999997) |
+| `s90` | **1.0** (the 1/512 computed at 0x1a68 is dead; overwritten at 0x1ab4) | `v_mul_f32_e64 v184, -s90, v192` = minus the carried max reference |
+| `s91` | `0x3e7df17e` = **0.24799132** | exp bias added to every score before `v_cvt_pknorm_u16_f32` |
+| `s92` | `0x3e85d086` = **0.26135647** | lazy-rollback threshold, `v_cmp_nge_f32 vcc, s92, v193` |
+| `s89` | `0x3e800000` = **0.25** (f32) | scale operand of every `v_cvt_scalef32_pk_fp8_bf16` |
+| Q scale | `v236 = max(qscale,9) - 9` (0x1d50/0x1d54) | Q operand is lowered 2^-9, so the QK output S = decoded K·Q^T / 512 |
+| `s94` | 0/1 | seed-phase flag (no numerics) |
+
+**Formula (fast path):**
+```
+x   = (S - r) + s91                      // S = K·Q^T with the Q scale lowered 2^-9, r = carried f32 row-max ref
+u16 = v_cvt_pknorm_u16_f32(x)            // = round(65535 * clamp(x,0,1))
+bf16 = reinterpret_u16_as_bf16(u16)      // = 2^(E-127)*(1+m/128), E = floor(65535*x/128), m = low 7 bits
+P   = s89 * bf16  = 0.25 * bf16
+    ~= 0.24513 * 2^(s - s_max)           // s = decoded score in exp2-exponent units
+```
+i.e. the **Schraudolph piecewise-linear exp2** (`2^f ~ 1+f`, error 0 .. +6.2 %, mean +4.0 %) — exactly
+the approximation our uncorrected path uses (our bias 131/512 and cvt scale 1.0 give P = 16*2^(s-s_max);
+the two differ only by the constant factor 2^-6.0284, whose 2^-0.0284 part changes no error statistic).
+
+**Negative result (Verified): the vendor does not correct the approximation.** The whole binary contains
+**zero** `v_pk_sub_u16`, zero `v_perm_b32` and no u16 masking/correction; the fast path and all four
+rollback copies use the identical 32x pknorm + 32x scalef32 (scale s89) pair. There is no "better
+scaling" behind s89/s91/s92 — they are the same approximation, not a correction.
+
+**What the vendor does differently is the reference path, not the conversion (Verified static):**
+1. The row-max reference is carried **in f32** (`v192`) and updated exactly: rollback subtracts
+   `delta = max - s91` from all 64 scores in f32, updates `r += s93*s26*delta` (~= delta) and rescales
+   O by `v_exp_f32(-s26*delta)` = 2^(-512*delta).
+2. The bias is expanded into **multiple bf16 words** (`v244`, `v245`: hi word + residual, 0x1a1c0-0x1e8)
+   so the carried bias keeps ~16+ bits, not one f16 word.
+3. The rollback recomputes the row max **cross-lane** (`v_permlane32_swap_b32` + `v_max_f32`) before the
+   `s92` compare; the bias/threshold margin is 0.0134 (=6.84/512), ours is 4/512.
+4. P is rescaled per lane with an **integer Delta** (`123 + Delta` MFMA scale), no fractional loss.
+
+**Our sv/vs recipe instead round-trips the bias through a single f16 word:**
+`bias2 = CvtF32ToF16((B_old + (c_b131 - mt))/8)` and the rollback delta used for the score add, the O/l
+rescale (`exp2(512*delta)`) and the new bias is `b_q - b_old`, i.e. **quantised to the f16 bias grid**
+(~1.2e-4 in x units = ~0.06 in exponent units = up to ~4-6 % P error per rollback, at ~70 % rollback
+frequency). This is the only place where our implemented recipe loses precision relative to the vendor.
+
+**Recommendation for kernel-opt (to drop svcorr and recover the +9.7 % path):** keep the pknorm+scalef32
+Schraudolph conversion uncorrected, and make the reference path exact like the vendor: carry the max
+reference in an f32 register, compute delta = max - s91 in f32, add it to the scores in f32, rescale O/l
+with 2^(-512*delta) exactly, and keep the bias word as a two-word (hi+residual) expansion instead of a
+single f16 round-trip. Then our uncorrected error should fall to the vendor's ~2.4e-3 mean and pass the
+parity gate. Cheapest first experiment: keep the current recipe but store the bias word as two f16
+words (hi + residual of B/8), so the delta no longer loses its low bits; expected to remove the
+52 bad elements. If it still fails, port the f32-reference path above.
+
 ## 5. LDS layout, staging and VGPR budget (Verified static)
 
 * **Global -> LDS is DMA, not a register round trip.** 63 static `buffer_load_dwordx4 ... lds`
