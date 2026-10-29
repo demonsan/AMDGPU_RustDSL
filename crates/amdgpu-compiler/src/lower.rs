@@ -24,7 +24,22 @@ use crate::mir::*;
 ///  * `dce`     - dead address / clamp chains (`v_add_co`/`v_addc`, `v_cmp`+`v_cndmask`, pointer adds) are removed;
 ///  * `cmpfold` - `select(cmp(x,y), ..)` re-issues the compare instead of the 0/1 materialisation +
 ///                `v_cmp_ne`, and the dead materialisation is removed.
+thread_local! {
+    static OVERRIDE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the lowering options forced to `opts` on this thread (tests; the environment is not consulted).
+pub fn with_opts<R>(opts: &[&str], f: impl FnOnce() -> R) -> R {
+    OVERRIDE.with(|o| *o.borrow_mut() = Some(opts.iter().map(|s| s.to_string()).collect()));
+    let r = f();
+    OVERRIDE.with(|o| *o.borrow_mut() = None);
+    r
+}
+
 pub fn opt_on(name: &str) -> bool {
+    if let Some(v) = OVERRIDE.with(|o| o.borrow().clone()) {
+        return v.iter().any(|x| x == name || x == "all");
+    }
     static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let v = OPTS.get_or_init(|| match std::env::var("AMDC_LOWER_OPTS") {
         Ok(s) if !s.is_empty() => s.split(',').map(|x| x.trim().to_string()).collect(),
@@ -1843,6 +1858,11 @@ fn fold_select_cmp(m: &mut MFunction) {
         let mut mat: HashMap<VReg, (MOp, Vec<Src>, usize)> = HashMap::new();
         for i in 0..b.insts.len() {
             let inst = b.insts[i].clone();
+            // any redefinition of a recorded 0/1 value invalidates its record (loop variables are not SSA)
+            if let Some(d) = inst.dst {
+                mat.remove(&d);
+                mat.remove(&canon(d));
+            }
             // materialisation: v_cndmask t, 0, one  right after a compare (a const mov may sit in between)
             if inst.op == MOp::VCndmask && matches!(inst.srcs.first(), Some(Src::Imm(0))) && inst.dst.is_some() {
                 let mut j = i;
