@@ -8981,7 +8981,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
             let a = b.add_i32(s2, s1);
             b.add_i32(a, u1)
         }
-        let s_k = swz_s(b, j, c1, c2, c3);
+        let s_k = swz_s(&mut b, j, c1, c2, c3);
         let xk0 = b.xor_i32(pblk, s_k);
         let jrow = b.mul_i32(j, c128);
         for k in 0..4i32 {
@@ -8991,7 +8991,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
             let a0 = b.add_i32(jrow, xs);
             kfx.push(b.add_i32(a0, lds_k));
         }
-        let s_v = swz_s(b, key_part, c1, c2, c3);
+        let s_v = swz_s(&mut b, key_part, c1, c2, c3);
         let f_s = b.let_(Op::LshrI32(Opnd::Val(s_v), Opnd::Val(c1)));
         let trow = b.mul_i32(key_part, c128);
         let mg16 = b.shl_i32(m_gl, c4);
@@ -9005,7 +9005,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
             let segb = b.shl_i32(seg, c5);
             trx.push(b.add_i32(trow_cl, segb));
         }
-        let s_r = swz_s(b, rt_row, c1, c2, c3);
+        let s_r = swz_s(&mut b, rt_row, c1, c2, c3);
         let h4 = b.let_(Op::LshrI32(Opnd::Val(rt_half64), Opnd::Val(c4)));
         let rrow = b.mul_i32(rt_row, c128);
         for w in 0..4i32 {
