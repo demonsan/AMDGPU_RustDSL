@@ -422,6 +422,8 @@ pub struct Function {
     pub stmts: Vec<Stmt>,
     pub var_tys: Vec<DType>,
     pub value_tys: Vec<DType>,
+    /// Opt-out of the loop-variable re-read lint (see [`lint`]).
+    pub allow_var_rereads: bool,
 }
 
 impl Function {
@@ -549,8 +551,14 @@ impl FnBuilder {
                 stmts: Vec::new(),
                 var_tys: Vec::new(),
                 value_tys: Vec::new(),
+                allow_var_rereads: false,
             },
         }
+    }
+
+    /// Declares that this kernel intentionally re-reads loop variables after `set_var` in the same iteration.
+    pub fn allow_var_rereads(&mut self) {
+        self.f.allow_var_rereads = true;
     }
 
     /// Declares how many bytes of workgroup LDS the kernel uses.
@@ -1653,3 +1661,70 @@ pub fn verify(f: &Function) -> Vec<String> {
 }
 /// Kernel definitions built with this DSL.
 pub mod kernels;
+
+/// Every `Opnd` a statement reads (loop variables read implicitly by in-place `Var*` statements are not listed).
+fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
+    match st {
+        Stmt::Let { op, .. } => op.operands(),
+        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } => vec![*base, *value],
+        Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } => vec![*addr, *value],
+        Stmt::LoadGlobalLds { base, lds_addr, .. } => vec![*base, *lds_addr],
+        Stmt::SetVar { value, .. } => vec![*value],
+        Stmt::VarScaleF32 { scalar, .. } | Stmt::VarScaleLane { scalar, .. } => vec![*scalar],
+        Stmt::VarScalePk { pair, .. } | Stmt::VarAddPk { pair, .. } => vec![*pair],
+        Stmt::VarMfmaF16Z { a, b, .. } => vec![*a, *b],
+        Stmt::VarLoadB128 { base, .. } => vec![*base],
+        Stmt::VarMfmaScale { a, b, scale_a, scale_b, .. } | Stmt::VarMfmaScaleZ { a, b, scale_a, scale_b, .. } => {
+            vec![*a, *b, *scale_a, *scale_b]
+        }
+        Stmt::BeginLoop { init, .. } => init.clone(),
+        Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => vec![*cond],
+        _ => Vec::new(),
+    }
+}
+
+/// Semantics of loop variables: a read of a loop variable (`Opnd::Var`) **after a `set_var` of the same variable in
+/// the same iteration** is easy to get wrong - the author usually expects the value just written, but the variable is
+/// a loop-carried (phi-like) value that is defined to hold the value from the *start* of the iteration; use a plain SSA
+/// value (the operand you passed to `set_var`) for intra-iteration producer/consumer pairs.
+/// This lint reports such reads conservatively (a `set_var` inside an `if` counts). Cross-iteration reads (read before
+/// the `set_var`, the common case), reads of the loop condition value held in an SSA value, and reads after the loop are
+/// not reported. Kernels that really intend this can call `FnBuilder::allow_var_rereads()`.
+pub fn lint(f: &Function) -> Vec<String> {
+    if f.allow_var_rereads {
+        return Vec::new();
+    }
+    struct L {
+        vars: HashSet<VarId>,
+        set_so_far: HashSet<VarId>,
+    }
+    let mut stack: Vec<L> = Vec::new();
+    let mut out = Vec::new();
+    for (idx, st) in f.stmts.iter().enumerate() {
+        for o in stmt_operands(st) {
+            if let Opnd::Var(v) = o {
+                if let Some(l) = stack.iter().rev().find(|l| l.vars.contains(&v)) {
+                    if l.set_so_far.contains(&v) {
+                        out.push(format!(
+                            "stmt {idx}: loop variable var{} is read after set_var(var{}) in the same iteration; the read does not see the value just written (loop variables hold the iteration-start value) - use the SSA value passed to set_var",
+                            v.0, v.0
+                        ));
+                    }
+                }
+            }
+        }
+        match st {
+            Stmt::BeginLoop { vars, .. } => stack.push(L { vars: vars.iter().copied().collect(), set_so_far: HashSet::new() }),
+            Stmt::EndLoop => {
+                stack.pop();
+            }
+            Stmt::SetVar { var, .. } => {
+                if let Some(l) = stack.iter_mut().rev().find(|l| l.vars.contains(var)) {
+                    l.set_so_far.insert(*var);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}

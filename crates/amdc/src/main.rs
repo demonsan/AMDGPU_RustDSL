@@ -211,6 +211,9 @@ fn main() -> ExitCode {
                 eprintln!("unknown kernel: {name}");
                 return ExitCode::from(2);
             };
+            for w in amdgpu_dsl::lint(&f) {
+                eprintln!("warning: {name}: {w}");
+            }
             let mut out_path: Option<String> = None;
             let mut mir_out: Option<String> = None;
             let mut backend_name = env::var("AMDC_BACKEND").unwrap_or_else(|_| "llvm-tail".to_string());
