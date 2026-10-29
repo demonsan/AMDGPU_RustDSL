@@ -9410,7 +9410,8 @@ pub fn sched_occ_chain() -> Function {
     let f4b = b.frag4(twos, twos, twos, twos);
     let b8 = b.cat_frag8(f4b, f4b);
     let m = b.c_f32(1.5);
-    let zi = b.bitcast_i32(b.c_f32(0.0));
+    let zf = b.c_f32(0.0);
+    let zi = b.bitcast_i32(zf);
     let zero = b.frag_zero(DType::Frag16);
     let vars = b.begin_loop(&[
         (DType::I32, Opnd::Val(c0)),
