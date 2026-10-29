@@ -12090,22 +12090,41 @@ pub fn probe_smfmac_ones() -> Function {
         let d1 = b.smfmac_fp8_16x16x128(a, p0, idx0, c0);
         b.smfmac_fp8_16x16x128(a, p1, idx1, d1)
     };
+    // A/idx variant sweep: candidate = (A, idx0, idx1) with B = hh0 then hh1 (accumulating)
+    let a3v186 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(b0r), a: Opnd::Val(zero), b: Opnd::Val(ones) }); // placeholder
+    let _ = a3v186;
+    // a3: lane condition (lane&3)<2 (inverse set), same dword split as vendor
+    let a01i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lt2), a: Opnd::Val(v186r), b: Opnd::Val(zero) });
+    let lt2b = b.cmp_lt_i32(b0r, c2r);
+    // v186i = (lane&3)<2 ? ones : 0  == lt2 ? ones : 0
+    let v186i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lt2b), a: Opnd::Val(ones), b: Opnd::Val(zero) });
+    let a01x = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(b1z), a: Opnd::Val(zero), b: Opnd::Val(v186i) });
+    let a23x = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(b1z), a: Opnd::Val(v186i), b: Opnd::Val(zero) });
+    let a3 = b.frag4(a23x, a23x, a01x, a01x);
+    let _ = a01i;
+    let a4 = b.frag4(ones, ones, zero, zero);
+    let a5 = b.frag4(zero, zero, ones, ones);
+    let a6 = b.frag4(ones, ones, ones, ones);
+    let l1x = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::Val(c1r)));
+    let idx_l1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(l1x), a: Opnd::Val(i23), b: Opnd::Val(i01) });
+    let l2x = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::Val(c2r)));
+    let idx_l2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(l2x), a: Opnd::Val(i23), b: Opnd::Val(i01) });
+    let cands: [(ValueId, ValueId, ValueId); 25] = [
+        (a_vendor_sw, i01, i01), (a_vendor_sw, i23, i23), (a_vendor_sw, i01, i23), (a_vendor_sw, i23, i01),
+        (a_vendor_sw, idx_vendor, idx_vendor), (a_vendor_sw, idx_vswap, idx_vswap),
+        (a_vendor, i01, i01), (a_vendor, i23, i23), (a_vendor, i01, i23), (a_vendor, i23, i01),
+        (a3, i01, i01), (a3, i23, i23),
+        (a4, i01, i01), (a4, i23, i23), (a4, i01, i23),
+        (a5, i01, i01), (a5, i23, i23), (a5, i01, i23),
+        (a6, i01, i01), (a6, i01, i23),
+        (a6, idx_vendor, idx_vendor),
+        (a_vendor_sw, idx_l1, idx_l1), (a_vendor_sw, idx_l2, idx_l2),
+        (a_vendor, idx_l1, idx_l1), (a_vendor, idx_l2, idx_l2),
+    ];
     for (pat, p0, p1) in [(0usize, p1_0, p1_1), (1usize, p2_0, p2_1)] {
-        let base_slot = 64 + 10 * pat;
-        let cands: [(ValueId, ValueId, ValueId, ValueId, ValueId); 10] = [
-            (a_vendor, idx_vendor, idx_vendor, p0, p1),
-            (a_vendor, i01, i01, p0, p1),
-            (a_vendor, i23, i23, p0, p1),
-            (a_vendor_sw, idx_vendor, idx_vendor, p0, p1),
-            (a_ones4, i01, i01, p0, p1),
-            (a_ones4, i23, i23, p0, p1),
-            (a_ones4, idx_vendor, idx_vendor, p0, p1),
-            (a_vendor, idx_vendor, idx_vendor, p1, p0),
-            (a_vendor, idx_vswap, idx_vswap, p0, p1),
-            (a_vendor, i01, i23, p0, p1),
-        ];
-        for (k, (a, i0, i1, b0, b1)) in cands.iter().enumerate() {
-            let d = run2(&mut b, *a, *i0, *i1, *b0, *b1);
+        let base_slot = 100 + 25 * pat;
+        for (k, (a, i0, i1)) in cands.iter().enumerate() {
+            let d = run2(&mut b, *a, *i0, *i1, p0, p1);
             probe_smfmac_dump(&mut b, base, base_slot + k, d);
         }
     }
