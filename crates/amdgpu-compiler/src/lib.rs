@@ -68,6 +68,11 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         let mut v: Vec<&str> = vec!["dce", "cmpfold", "scalarize", "retarget2", "imm", "sgpr", "zeroinit"];
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
+    } else if f.name.starts_with("fmha_fwd_hd128_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
+        // the FMHA kernels zero their accumulators in place (bit-exact on all 15 shapes, -160 v_mov on _t, docs/status.md)
+        let mut v: Vec<&str> = vec!["zeroinit"];
+        v.extend_from_slice(extra);
+        lower::lower_with_extra(f, &v)?
     } else {
         lower::lower_with_extra(f, extra)?
     };
