@@ -578,6 +578,12 @@ fn llvm_tail_register_accounting() {
     let mut bad = Vec::new();
     for name in kernel_names() {
         let f = kernel_by_name(name).unwrap();
+        // own-backend-only DMA kernels (e.g. fmha_fwd_hd128_mxfp8_vs) cannot go through the LLVM tail
+        if let Ok(m) = amdgpu_compiler::compile_mir(&f) {
+            if m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, amdgpu_compiler::mir::MOp::GlobalLoadLdsB128 | amdgpu_compiler::mir::MOp::GlobalLoadLdsB32))) {
+                continue;
+            }
+        }
         let c = compile_with(&f, &tail).unwrap_or_else(|e| panic!("{name}: llvm tail: {e}"));
         // checks (1)+(2) only: the def-use dataflow is written for our own emitter's operand forms.
         bad.extend(audit_asm(name, &c.asm).into_iter().filter(|m| {
