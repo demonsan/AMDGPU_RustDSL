@@ -92,8 +92,8 @@ fn kernel_path() -> MFunction {
     let v0 = b.frag8(c0, c0, c0, c0, c0, c0, c0, c0);
     let v1 = b.frag8(c0, c0, c0, c0, c0, c0, c0, c0);
     let z16 = b.frag_zero(DType::Frag16);
-    let o1 = b.mfma_scale_fp8_32x32x64(pa, v0, z16, c1, c2);
-    let o2 = b.mfma_scale_fp8_32x32x64(pb, v1, o1, c1, c2);
+    let o1 = b.mfma_scale_fp8(pa, v0, z16, c1, c2);
+    let o2 = b.mfma_scale_fp8(pb, v1, o1, c1, c2);
     let a_rs = b.frag4(c0, c0, c0, c0);
     let z4 = b.frag_zero(DType::Frag4);
     let r1 = b.smfmac_fp8_16x16x128(a_rs, pa, c3, z4);
