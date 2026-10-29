@@ -4,11 +4,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <ctime>
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s failed: %s\n", #x, hipGetErrorString(e_)); std::exit(1); } } while (0)
 int main(int argc, char** argv) {
     const char* co = argc > 1 ? argv[1] : "build/probe_dma_kread.co";
     std::vector<unsigned char> hi(16384), ho(16384, 0xee);
-    for (int i = 0; i < 16384; ++i) hi[i] = (unsigned char)(i * 7 + (i >> 7));
+    for (int i = 0; i < 16384; ++i) hi[i] = (unsigned char)(i * 7 + (i >> 7) + (unsigned char)(time(nullptr) * 37));
     void *di, *dout;
     CK(hipMalloc(&di, 16384)); CK(hipMalloc(&dout, 16384));
     CK(hipMemcpy(di, hi.data(), 16384, hipMemcpyHostToDevice));

@@ -3,12 +3,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <ctime>
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s failed: %s\n", #x, hipGetErrorString(e_)); std::exit(1); } } while (0)
 int main(int argc, char** argv) {
     const char* co = argc > 1 ? argv[1] : "build/probe_dma_tile.co";
     const int n = 4096;  // dwords
     std::vector<unsigned> hi(n), ho(n, 0xdeadbeef);
-    for (int i = 0; i < n; ++i) hi[i] = 0x10000 + i;
+    unsigned seed = (unsigned)time(nullptr) * 2654435761u; for (int i = 0; i < n; ++i) hi[i] = 0x10000 + i + ((seed >> 8) & 0xff0000u);
     void *di, *dout;
     CK(hipMalloc(&di, n * 4)); CK(hipMalloc(&dout, n * 4));
     CK(hipMemcpy(di, hi.data(), n * 4, hipMemcpyHostToDevice));
@@ -29,7 +30,7 @@ int main(int argc, char** argv) {
         if (nb) {
             std::printf("run %2d (LDS byte %5d): %3d bad dwords; src dword of LDS dwords 0,1,2,3,4,16,64,255:", r, r * 1024, nb);
             const int pick[8] = {0, 1, 2, 3, 4, 16, 64, 255};
-            for (int p : pick) { unsigned v = ho[r * 256 + p]; if (v >= 0x10000 && v < 0x10000 + 4096) std::printf(" %d", (int)(v - 0x10000)); else std::printf(" ?"); }
+            for (int p : pick) { unsigned v = ho[r * 256 + p]; if ((v & 0xffff) < 4096 && (v & 0xff00ffffu) >= 0x10000) std::printf(" %d", (int)((v & 0xffff) - 0x10000 + 0x10000)); else std::printf(" ?"); }
             std::printf("\n");
         }
     }
