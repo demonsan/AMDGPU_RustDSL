@@ -8945,7 +8945,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let rowb = b.add_i32(w32, lane_hi);
     let c4096 = b.c_i32(4096);
     let w4096 = b.mul_i32(cx.wave4, c4096);
-    let lds_tile = b.add_i32(lds_base, w4096);    let kd_row_load = |b: &mut FnBuilder, key0: ValueId| -> ValueId {
+    // M0 at the top of the wave's 4 KB: the instruction offsets are negative and the global address is compensated by a POSITIVE amount
+    // (a 32-bit pointer offset is zero-extended: a negative one would wrap to +4 GB)
+    let c3072 = b.c_i32(3072);
+    let w_top = b.add_i32(w4096, c3072);
+    let lds_tile = b.add_i32(lds_base, w_top);    let kd_row_load = |b: &mut FnBuilder, key0: ValueId| -> ValueId {
         let srow_raw = b.add_i32(key0, cx.rt_row);
         let srow_ok = b.cmp_lt_i32(srow_raw, cx.kv_len);
         let srow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(srow_ok), a: Opnd::Val(srow_raw), b: Opnd::Val(cx.kv_last) });
@@ -8971,10 +8975,10 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let o1 = b.add_i32(o0, base_off);
             let cbytes = if q & 1 == 0 { cbytes_even } else { cbytes_odd };
             let o2 = b.add_i32(o1, cbytes);
-            let comp = b.c_i32(-1024 * q);
+            let comp = b.c_i32(1024 * (3 - q));
             let o3 = b.add_i32(o2, comp);
             let sp = b.ptr_add(ptr, o3);
-            b.load_global_lds(sp, lbase, 1024 * q, 4);
+            b.load_global_lds(sp, lbase, -(1024 * (3 - q)), 4);
         }
     };
     // stage a tile into ring slot `slot_off` (K scales of role A at `kd_slot`) and wait for it
