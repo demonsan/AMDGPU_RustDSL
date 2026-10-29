@@ -8611,10 +8611,14 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let gsel = b.mul_i32(cx.g_bytes8, c4d);
         let ob4 = b.add_i32(ob3, gsel);
         let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
-        for q in 0..8u8 {
-            let w = b.frag16_lane(kd0, q);
-            let f = b.bitcast_f32(w);
-            b.store_f32(o_ptr0, 4 * q as u32, f);
+        if !fmha_t_opt("dbgnost") {
+            for q in 0..8u8 {
+                let w = b.frag16_lane(kd0, q);
+                let f = b.bitcast_f32(w);
+                b.store_f32(o_ptr0, 4 * q as u32, f);
+            }
+        } else {
+            let _ = (o_ptr0, kd0);
         }
         return;
     }    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
