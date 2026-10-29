@@ -1026,6 +1026,10 @@ pub fn probe_dma_tile() -> Function {
         if let Some(w) = std::env::var("PD_WAIT").ok().and_then(|v| v.parse::<u8>().ok()) {
             b.wait_vm(w);
         }
+        if std::env::var("PD_BAR").map(|v| !v.is_empty()).unwrap_or(false) {
+            b.wait_vm(0);
+            b.barrier();
+        }
     }
     if std::env::var("PD_DUMMY").map(|v| !v.is_empty()).unwrap_or(false) {
         // a harmless trailing DMA into spare LDS (needs PD_LDS >= 18432)
