@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # Raw-asm hardware probes for the ISA rules encoded by amdgpu-safeasm (see the review section of docs/safe-asm-design.md).
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -114,67 +114,53 @@ mk() {
     echo "ASSEMBLE FAIL $1"; head -6 "out/$1.err"; return 1
   fi
 }
+# 32x32x64 f8f6f4 scaled MFMA (A = 8 dwords v[8:15], B = 8 dwords v[16:23], D = 16 dwords v[32:47], scales v24/v25)
+# 1) VALU -> MFMA operand wait: A overwritten with ones immediately before the MFMA (stale read -> 0)
 for PAD in 1 7; do
-  mk "valu2mfma_pad$PAD" "$F16_ON
-$F16_ZERO_A
+  mk "valu2mfma_pad$PAD" "$FP8
 $ZERO_D
 $WAIT20
-    v_mov_b32_e32 v8, 0x3C003C00
-    v_mov_b32_e32 v9, 0x3C003C00
+    v_mov_b32_e32 v8, 0x38383838
+    v_mov_b32_e32 v9, 0x38383838
+    v_mov_b32_e32 v10, 0x38383838
+    v_mov_b32_e32 v11, 0x38383838
+    v_mov_b32_e32 v12, 0x38383838
+    v_mov_b32_e32 v13, 0x38383838
+    v_mov_b32_e32 v14, 0x38383838
+    v_mov_b32_e32 v15, 0x38383838
     s_nop $PAD
-    v_mfma_f32_32x32x8_f16 v[32:47], v[8:9], v[10:17], v[32:47]
+    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], 0, v24, v25
 $WAIT20
     global_store_dword v[4:5], v32, off"
 done
-mk "zerochain_nopad" "$FP8
+# 2) WAR: overwrite an A dword immediately after the MFMA issue vs after 20 states
+mk "war_nopad" "$FP8
 $ZERO_D
 $WAIT20
     v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], 0, v24, v25
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], v[32:47], v24, v25
+    v_mov_b32_e32 v8, 0
 $WAIT20
     global_store_dword v[4:5], v32, off"
-mk "zerochain_pad20" "$FP8
+mk "war_pad20" "$FP8
 $ZERO_D
 $WAIT20
     v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], 0, v24, v25
 $WAIT20
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], v[32:47], v24, v25
+    v_mov_b32_e32 v8, 0
 $WAIT20
     global_store_dword v[4:5], v32, off"
-mk "samechain_nopad" "$FP8
+# 4) RAW: read MFMA D via VALU immediately vs after 20 states
+mk "rawread_nopad" "$FP8
 $ZERO_D
 $WAIT20
     v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], 0, v24, v25
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], v[32:47], v24, v25
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], v[32:47], v24, v25
-$WAIT20
-    global_store_dword v[4:5], v32, off"
-mk "war_nopad" "$F16_ON
-$ZERO_D
-$WAIT20
-    v_mfma_f32_32x32x8_f16 v[32:47], v[8:9], v[10:17], v[32:47]
-$F16_ZERO_A
-$WAIT20
-    global_store_dword v[4:5], v32, off"
-mk "war_pad20" "$F16_ON
-$ZERO_D
-$WAIT20
-    v_mfma_f32_32x32x8_f16 v[32:47], v[8:9], v[10:17], v[32:47]
-$WAIT20
-$F16_ZERO_A
-$WAIT20
-    global_store_dword v[4:5], v32, off"
-mk "rawread_nopad" "$F16_ON
-$ZERO_D
-$WAIT20
-    v_mfma_f32_32x32x8_f16 v[32:47], v[8:9], v[10:17], v[32:47]
     v_add_f32_e32 v50, v32, v49
 $WAIT20
     global_store_dword v[4:5], v50, off"
-mk "rawread_pad20" "$F16_ON
+mk "rawread_pad20" "$FP8
 $ZERO_D
 $WAIT20
-    v_mfma_f32_32x32x8_f16 v[32:47], v[8:9], v[10:17], v[32:47]
+    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], 0, v24, v25
 $WAIT20
     v_add_f32_e32 v50, v32, v49
 $WAIT20

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # Adversarial review driver for crates/amdgpu-safeasm. Compiles each case with rustc inside the pinned rust
 # container (links against the just-built crate rlibs), classifies pass_/fail_, runs the pass binaries if they
 # print something, then emits both the safe-DSL phase asm and the kernel-path asm for the POC identity check.
