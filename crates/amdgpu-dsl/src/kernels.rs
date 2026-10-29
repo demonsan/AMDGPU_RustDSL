@@ -8882,7 +8882,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     // svscale: the reference only moves ("rebase") when the row max is far above it (S' > 0.45, i.e. 2^100 above); smaller growth is
     // absorbed by a per-lane power-of-two scale of this unit's P (cvt scale operand) that the PV/row-sum MFMA scale operand undoes
     let svscale = fmha_t_opt("svscale");
-    let c_thr = b.c_f32(if fmha_t_opt("svinf") { 1.0e9 } else if svscale { 0.45 } else { 135.0 / 512.0 }); // svinf: never roll back (timing diagnostic, wrong numerics)
+    let c_thr = b.c_f32(if fmha_t_opt("svinf") { 1.0e9 } else if svscale { fmha_t_num("svr").map(|v| v as f32 / 1000.0).unwrap_or(0.45) } else { 135.0 / 512.0 }); // svinf: never roll back (timing diagnostic, wrong numerics)
     let c135f = b.c_f32(fmha_t_num("svt").map(|v| v as f32).unwrap_or(135.0)); // fp8 target exponent: P max = 2^(svt - 127)
     let c0p5 = b.c_f32(0.5);
     let c2p23 = b.c_f32(8388608.0);
