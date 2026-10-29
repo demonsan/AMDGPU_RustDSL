@@ -261,7 +261,11 @@ pub fn export_opts(m: &MFunction, a: &Alloc, markers: bool, drop_auto_waits: boo
         mir.push('\n');
     }
     for bi in 0..nblocks {
-        mir.push_str(&format!("  bb.{bi}:\n"));
+        let align = loop_align().filter(|_| m.loops.iter().any(|l| l.0 == m.blocks[bi].label));
+        match align {
+            Some(a) => mir.push_str(&format!("  bb.{bi} (align {a}):\n")),
+            None => mir.push_str(&format!("  bb.{bi}:\n")),
+        }
         if !succs[bi].is_empty() {
             let s: Vec<String> = succs[bi].iter().map(|x| format!("%bb.{x}")).collect();
             mir.push_str(&format!("    successors: {}\n", s.join(", ")));
@@ -279,6 +283,11 @@ pub fn export_opts(m: &MFunction, a: &Alloc, markers: bool, drop_auto_waits: boo
     }
     mir.push_str("...\n");
     Ok(Exported { mir })
+}
+
+/// `AMDC_LOOP_ALIGN=32`: align loop headers to this many bytes (power of two).
+pub fn loop_align() -> Option<u32> {
+    std::env::var("AMDC_LOOP_ALIGN").ok().and_then(|v| v.parse().ok()).filter(|v: &u32| v.is_power_of_two())
 }
 
 fn livein_text(set: &BTreeSet<Slot>) -> String {
