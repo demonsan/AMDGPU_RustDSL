@@ -12020,16 +12020,13 @@ pub fn probe_smfmac_ones() -> Function {
     probe_smfmac_dump(&mut b, base, 18, s18);
 
     // ---- row-sum-for-our-P probe (slots 62..85) -----------------------------------------------------
-    // Question: can TWO smfmac reproduce, per lane, the row sum that our two 32x32x64 ones-MFMAs give
-    // for our real P byte layout (P = B operand of the PV MFMA: query = lane%32, lane half = K half,
-    // Frag8 half = K block)? The P bytes are query-coded so both the ones-MFMA reference and every
-    // smfmac candidate can be compared per lane:
-    //   E1: every byte = fp8(1 + (lane%8)/8)   -> identifies query mod 8
-    //   E2: every byte = fp8(1 + ((lane>>3)&3)/8) -> identifies query/8 (distinguishes q from q+16)
-    // The reference is the exact msum path the kernel uses (2x mfma_scale_fp8 with A = fp8 ones).
+    // Can TWO smfmac reproduce, per lane, the row sum our two 32x32x64 ones-MFMAs give for our real P
+    // byte layout? P bytes are query-coded so both references and candidates are comparable per lane:
+    //   E1 v = 1 + (lane%8)/8 (query mod 8), E2 v = 1 + ((lane>>3)&3)/8 (query/8, separates q from q+16).
     let c1r = b.c_i32(1);
     let c2r = b.c_i32(2);
     let c3r = b.c_i32(3);
+    let c4r = b.c_i32(4);
     let c7r = b.c_i32(7);
     let c63r = b.c_i32(63);
     let c20r = b.c_i32(20);
@@ -12060,7 +12057,7 @@ pub fn probe_smfmac_ones() -> Function {
     let p1_1 = mk8(&mut b, &w1, 1);
     let p2_0 = mk8(&mut b, &w2, 0);
     let p2_1 = mk8(&mut b, &w2, 1);
-    // reference: exactly the kernel's row-sum accumulation
+    // reference: exactly the kernel's row-sum accumulation (2x ones-MFMA, B scale c123 -> /16)
     let zero16r = b.frag_zero(DType::Frag16);
     let l1a = b.mfma_scale_fp8(b_ones, p1_0, zero16r, c127r, c123r);
     let l1r = b.mfma_scale_fp8(b_ones, p1_1, l1a, c127r, c123r);
@@ -12068,55 +12065,59 @@ pub fn probe_smfmac_ones() -> Function {
     let l2r = b.mfma_scale_fp8(b_ones, p2_1, l2a, c127r, c123r);
     probe_smfmac_dump16(&mut b, base, 62, l1r);
     probe_smfmac_dump16(&mut b, base, 63, l2r);
-    // vendor A/SRC2 construction (verbatim from ref_mxfp8.co: lane = tid&63; b0 = lane&3, b1 = lane&4)
+    // vendor A/SRC2 construction, corrected operand-order reading:
+    //   v186 = ((lane&3) >= 2) ? 0x38383838 : 0
+    //   A0=A1 = ((lane&4)==0) ? 0 : v186 ;  A2=A3 = ((lane&4)==0) ? v186 : 0
+    //   SRC2  = ((lane&3)==1) ? 0x44444444 : 0xeeeeeeee
     let b0r = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::Val(c3r)));
-    let c4r = b.c_i32(4);
     let b1r = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::Val(c4r)));
-    let lor = b.cmp_lt_i32(b0r, c2r);
+    let lt2 = b.cmp_lt_i32(b0r, c2r);
     let b1z = b.cmp_lt_i32(b1r, c1r);
-    let v186r = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lor), a: Opnd::Val(ones), b: Opnd::Val(zero) });
+    // v186 = ((lane&3) >= 2) ? ones : 0  ==  (lt2 ? 0 : ones)
+    let v186r = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lt2), a: Opnd::Val(zero), b: Opnd::Val(ones) });
     let a01 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(b1z), a: Opnd::Val(zero), b: Opnd::Val(v186r) });
     let a23 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(b1z), a: Opnd::Val(v186r), b: Opnd::Val(zero) });
     let a_vendor = b.frag4(a01, a01, a23, a23);
+    let a_vendor_sw = b.frag4(a23, a23, a01, a01);
     let b0x = b.let_(Op::XorI32(Opnd::Val(b0r), Opnd::Val(c1r)));
     let is1 = b.cmp_lt_i32(b0x, c1r);
-    let idx_lane = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is1), a: Opnd::Val(i23), b: Opnd::Val(i01) });
+    let idx_vendor = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is1), a: Opnd::Val(i01), b: Opnd::Val(i23) });
+    let idx_vswap = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is1), a: Opnd::Val(i23), b: Opnd::Val(i01) });
     let a_ones4 = b.frag4(ones, ones, ones, ones);
     let a_lo4 = b.frag4(ones, ones, zero, zero);
     let a_hi4 = b.frag4(zero, zero, ones, ones);
-    let run2 = |b: &mut FnBuilder, a: ValueId, idx: ValueId, p0: ValueId, p1: ValueId| -> ValueId {
-        let d1 = b.smfmac_fp8_16x16x128(a, p0, idx, c0);
-        b.smfmac_fp8_16x16x128(a, p1, idx, d1)
+    let run2 = |b: &mut FnBuilder, a: ValueId, idx0: ValueId, idx1: ValueId, p0: ValueId, p1: ValueId| -> ValueId {
+        let d1 = b.smfmac_fp8_16x16x128(a, p0, idx0, c0);
+        b.smfmac_fp8_16x16x128(a, p1, idx1, d1)
     };
-    let mut slot = 64usize;
     for (pat, p0, p1) in [(0usize, p1_0, p1_1), (1usize, p2_0, p2_1)] {
-        let base_slot = 64 + 9 * pat;
-        let cands: [(ValueId, ValueId); 9] = [
-            (a_vendor, idx_lane),
-            (a_vendor, i01),
-            (a_vendor, i23),
-            (a_ones4, i01),
-            (a_ones4, i23),
-            (a_ones4, idx_lane),
-            (a_lo4, i01),
-            (a_hi4, i23),
-            (a_lo4, i23),
+        let base_slot = 64 + 10 * pat;
+        let cands: [(ValueId, ValueId, ValueId, ValueId); 10] = [
+            (a_vendor, idx_vendor, idx_vendor, p0, p1),
+            (a_vendor, i01, i01, p0, p1),
+            (a_vendor, i23, i23, p0, p1),
+            (a_vendor_sw, idx_vendor, idx_vendor, p0, p1),
+            (a_ones4, i01, i01, p0, p1),
+            (a_ones4, i23, i23, p0, p1),
+            (a_ones4, idx_vendor, idx_vendor, p0, p1),
+            (a_vendor, idx_vendor, idx_vendor, p1, p0),
+            (a_vendor, idx_vswap, idx_vswap, p0, p1),
+            (a_vendor, i01, i23, p0, p1),
         ];
-        for (k, (a, idx)) in cands.iter().enumerate() {
-            let d = run2(&mut b, *a, *idx, p0, p1);
+        for (k, (a, i0, i1, b0, b1)) in cands.iter().enumerate() {
+            let d = run2(&mut b, *a, *i0, *i1, *b0, *b1);
             probe_smfmac_dump(&mut b, base, base_slot + k, d);
         }
-        slot = base_slot + 9;
     }
-    // diagnostics: the constructed A/idx values, one smfmac only, reversed order
-    probe_smfmac_dump(&mut b, base, 82, a_vendor);
-    let idxf = b.frag4(idx_lane, zero, zero, zero);
-    probe_smfmac_dump(&mut b, base, 83, idxf);
-    let d_single = b.smfmac_fp8_16x16x128(a_vendor, p1_0, idx_lane, c0);
-    probe_smfmac_dump(&mut b, base, 84, d_single);
-    let d_rev1 = b.smfmac_fp8_16x16x128(a_vendor, p1_1, idx_lane, c0);
-    let d_rev = b.smfmac_fp8_16x16x128(a_vendor, p1_0, idx_lane, d_rev1);
-    probe_smfmac_dump(&mut b, base, 85, d_rev);
-    let _ = slot;
+    // diagnostics: constructed A/idx values, single smfmac, reversed order
+    probe_smfmac_dump(&mut b, base, 84, a_vendor);
+    let idxf = b.frag4(idx_vendor, idx_vswap, zero, zero);
+    probe_smfmac_dump(&mut b, base, 85, idxf);
+    let d_single = b.smfmac_fp8_16x16x128(a_vendor, p1_0, idx_vendor, c0);
+    probe_smfmac_dump(&mut b, base, 86, d_single);
+    let d_rev1 = b.smfmac_fp8_16x16x128(a_vendor, p1_1, idx_vendor, c0);
+    let d_rev = b.smfmac_fp8_16x16x128(a_vendor, p1_0, idx_vendor, d_rev1);
+    probe_smfmac_dump(&mut b, base, 87, d_rev);
+    let _ = (a_lo4, a_hi4);
     b.finish()
 }
