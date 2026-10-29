@@ -3150,6 +3150,15 @@ fn mask_regs(m: &mut MFunction) {
                 j += 1;
                 continue;
             }
+            // VOP3 has no literal operand on gfx9: only inline integer constants (and none at all for the f32 compare)
+            let bad_imm = m.blocks[bi].insts[j].srcs.iter().any(|s| match s {
+                Src::Imm(k) => mop == MOp::VCmpMaskLtF32 || !(-16..=64).contains(k),
+                _ => false,
+            });
+            if bad_imm {
+                j += 1;
+                continue;
+            }
             // next vcc touching instruction
             let mut k = j + 1;
             let mut found = None;
