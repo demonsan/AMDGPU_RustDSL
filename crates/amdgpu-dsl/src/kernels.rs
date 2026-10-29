@@ -7818,7 +7818,44 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let bias_init = b.frag2(w_init, w_init);
     let sq0m = b.add_i32(cx.sq0, cm9); // Q scales 2^-9: S' = S / 512
     let sq1m = b.add_i32(cx.sq1, cm9);
-    let mut init_vars = vec![
+    if fmha_t_opt("dbgk") {
+        // debug: dump the K and V fragments of tile 0 as read from LDS into the output rows, then stop
+        let (k8_0, k8_1) = if dma {
+            let a0 = cx.kfx[0];
+            let a1 = cx.kfx[1];
+            let a2 = cx.kfx[2];
+            let a3 = cx.kfx[3];
+            (b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)), b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)))
+        } else {
+            let kaddr0h = b.add_i32(cx.kf_base, c32v);
+            let kaddr1 = b.add_i32(cx.kf_base, c64);
+            let kaddr1h = b.add_i32(kaddr1, c32v);
+            (b.load_lds_b128x2(Opnd::Val(cx.kf_base), Opnd::Val(kaddr0h)), b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h)))
+        };
+        let mut addrs: Vec<ValueId> = Vec::new();
+        for r in 0..4i32 {
+            let off = b.c_i32(16 * pitch * r);
+            let base = if dma { cx.trx[0] } else { cx.tr_base };
+            addrs.push(b.add_i32(base, off));
+        }
+        let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+        let ob0 = b.mul_i32(cx.bidx, cx.o_bs);
+        let ob1 = b.mul_i32(cx.hidx, cx.o_hs);
+        let orow = b.mul_i32(cx.row, cx.o_seqs);
+        let ob2 = b.add_i32(ob0, ob1);
+        let ob3 = b.add_i32(ob2, orow);
+        let ob4 = b.add_i32(ob3, cx.g_bytes8);
+        let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
+        for (n, fr) in [k8_0, k8_1, v8].iter().enumerate() {
+            let cnt = 8u8;
+            for q in 0..cnt {
+                let w = b.frag16_lane(*fr, q);
+                let f = b.bitcast_f32(w);
+                b.store_f32(o_ptr0, (n as u32 * 32 + q as u32 * 4) as u32, f);
+            }
+        }
+        return;
+    }    let mut init_vars = vec![
         (DType::I32, Opnd::Val(c0)),
         (DType::Frag2, Opnd::Val(bias_init)),
         (DType::Frag16, Opnd::Val(zero)),
