@@ -60,5 +60,6 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e AMDC_SCHED="${AMDC_SCHED:-}" \
     -e AMDC_SCHED_OPTS="${AMDC_SCHED_OPTS:-}" \
     -e SCHED_WG="${SCHED_WG:-}" \
+    -e AMDC_TEST_LLVM="${AMDC_TEST_LLVM:-}" \
     -w /work \
     amd-rust-dsl:1 cargo "$@"
