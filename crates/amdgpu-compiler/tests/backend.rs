@@ -198,11 +198,18 @@ fn scaled_mfma_and_max3_are_emitted() {
     assert!(compiled.asm.contains("v_max3_f32"), "v_max3_f32 missing");
 }
 
-/// Regression (round 23): the pending-load set used to be a purely linear notion, so a wait
-/// emitted inside the then-branch hid the outstanding load from the else-branch. Every
-/// outstanding load must now be drained before the branch is taken.
+/// Index of the first `s_waitcnt vmcnt` strictly between `from` and `to` of the asm text.
+fn vm_wait_between(asm: &str, from: usize, to: usize) -> bool {
+    asm[from..to].contains("s_waitcnt vmcnt")
+}
+
+/// Regression (round 23, updated by the "outstanding loads stay pending across if/else" lowering):
+/// the pending-load set used to be a purely linear notion, so a wait emitted inside the then-branch
+/// hid the outstanding load from the else-branch. A load used in BOTH branches must be waited for
+/// inside each of them (the lowering no longer drains everything before the branch, but no path may
+/// read the register before its wait).
 #[test]
-fn loads_are_drained_before_a_branch() {
+fn loads_are_drained_on_every_path_of_a_branch() {
     use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
     let mut b = FnBuilder::new("branch_wait", 64);
     b.arg("o", DType::Ptr, 0, 8);
@@ -217,11 +224,58 @@ fn loads_are_drained_before_a_branch() {
     b.store_f32(o, 4, loaded);
     b.end_if();
     let asm = compile(&b.finish()).expect("compiles").asm;
-    let wait = asm.find("s_waitcnt vmcnt").expect("a vmcnt wait is emitted");
-    let branch = asm.find("s_cbranch").expect("a branch is emitted");
-    assert!(wait < branch, "the load must be drained before the branch:\n{asm}");
+    let load_pos = asm.find("global_load_dword").expect("load emitted");
+    // each store of the loaded value is preceded (after the load) by a vmcnt wait on its own path
+    for store_off in ["off\n", "offset:4"] {
+        let _ = store_off;
+    }
+    let stores: Vec<usize> = asm.match_indices("global_store_dword").map(|(i, _)| i).collect();
+    assert_eq!(stores.len(), 2, "two stores expected:\n{asm}");
+    for &s in &stores {
+        // nearest label before the store (the start of its path)
+        let label = asm[..s].rfind("\nBB").map(|i| i + 1).unwrap_or(load_pos);
+        assert!(
+            vm_wait_between(&asm, label.max(load_pos), s) || vm_wait_between(&asm, load_pos, label),
+            "a store of the loaded value is not preceded by a vmcnt wait on its path:\n{asm}"
+        );
+    }
 }
 
+/// Regression (outstanding loads stay pending across if/else): a load that no branch touches must NOT
+/// be drained before the branch (over-draining throws the latency hiding away), but it must be drained
+/// before its first use after the join.
+#[test]
+fn untouched_loads_are_not_over_drained_across_a_branch() {
+    use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
+    let mut b = FnBuilder::new("branch_nowait", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c32 = b.c_i32(32);
+    let c1 = b.c_f32(1.0);
+    let c2 = b.c_f32(2.0);
+    let loaded = b.load_f32(o, 64);
+    let cond = b.cmp_lt_i32(tid, c32);
+    b.begin_if(Opnd::Val(cond));
+    b.store_f32(o, 0, c1);
+    b.else_();
+    b.store_f32(o, 4, c2);
+    b.end_if();
+    b.store_f32(o, 8, loaded);
+    let asm = compile(&b.finish()).expect("compiles").asm;
+    let load_pos = asm.find("global_load_dword").expect("load emitted");
+    let branch = asm.find("s_cbranch").expect("a branch is emitted");
+    assert!(load_pos < branch);
+    assert!(
+        !vm_wait_between(&asm, load_pos, branch),
+        "the untouched load was drained before the branch:\n{asm}"
+    );
+    let last_store = asm.rfind("global_store_dword").expect("final store");
+    assert!(
+        vm_wait_between(&asm, branch, last_store),
+        "the load is used after the join without a vmcnt wait:\n{asm}"
+    );
+}
 /// Regression (round 23): a constant first materialised inside one branch used to be reused
 /// by the sibling branch as if its `v_mov` had executed there.
 #[test]
