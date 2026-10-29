@@ -9699,7 +9699,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         kd
     };
     let stage_end = |b: &mut FnBuilder, kd: Option<ValueId>, kd_slot: ValueId| {
-        b.wait_vm(0);
+        if !ablate.contains("novmwait") {
+            b.wait_vm(0);
+        }
         if let Some(kd) = kd {
             let a = b.add_i32(kdb0, kd_slot);
             b.store_lds_b32(Opnd::Val(a), Opnd::Val(kd));
