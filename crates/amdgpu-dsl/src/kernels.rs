@@ -9289,6 +9289,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.wait_lds(0);
             if !no_bar {
                 b.barrier();
+                if ablate.contains("dblbar") {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
+                }
             }
             pv_w(b, 0, slot_cur, &w0);
             qk(b, 1, slot_cur, kds_cur);
@@ -9296,6 +9301,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.wait_lds(0);
             if !no_bar {
                 b.barrier();
+                if ablate.contains("dblbar") {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
+                }
             }
             // unit 1: V; M: PV(hh1) + QK(hh0 of the next tile)
             let w1 = valu(b, 1, masked, false);
@@ -9303,6 +9313,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.wait_lds(0);
             if !no_bar {
                 b.barrier();
+                if ablate.contains("dblbar") {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
+                }
             }
             pv_w(b, 1, slot_cur, &w1);
             if stage {
@@ -9312,6 +9327,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.wait_lds(0);
             if !no_bar {
                 b.barrier();
+                if ablate.contains("dblbar") {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
+                }
             }
             if let (Some(kv), Some(kn)) = (kdp, skd) {
                 b.set_var(kv, kn);
@@ -9333,6 +9353,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.wait_lds(0);
             if !no_bar {
                 b.barrier();
+                if ablate.contains("dblbar") {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
+                }
             }
             // V(unit 0) (+ the DMA of tile t+2)
             let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
@@ -9345,6 +9370,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.wait_lds(0);
             if !no_bar {
                 b.barrier();
+                if ablate.contains("dblbar") {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
+                }
             }
             // M(unit 1): PV(hh0) + QK(hh1)
             pv_w(b, 0, slot_cur, &w0);
@@ -9353,6 +9383,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.wait_lds(0);
             if !no_bar {
                 b.barrier();
+                if ablate.contains("dblbar") {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
+                }
             }
             // V(unit 1): its P words wait for the next iteration's M(unit 0) in the variables
             let _ = valu(b, 1, masked, true);
@@ -9360,6 +9395,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.wait_lds(0);
             if !no_bar {
                 b.barrier();
+                if ablate.contains("dblbar") {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
+                }
             }
         }
     };
