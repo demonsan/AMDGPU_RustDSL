@@ -984,6 +984,59 @@ pub fn probe_dma() -> Function {
     b.store_f32(op4, 0, f4);
     b.finish()
 }
+/// Multi-wave DMA tile probe (256 threads): four waves each issue four 1 KB `global_load_lds_dwordx4` (run
+/// r = wave + 4 q at LDS byte 1024 r, rows of 128 bytes), then every thread reads its 4 x 16 bytes back.
+/// `o` must equal `i` (16 KB).
+pub fn probe_dma_tile() -> Function {
+    let mut b = FnBuilder::new("probe_dma_tile", 256);
+    b.lds(16384);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("i", DType::Ptr, 8, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let inp = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c3 = b.c_i32(3);
+    let c6 = b.c_i32(6);
+    let c7 = b.c_i32(7);
+    let c10 = b.c_i32(10);
+    let c63 = b.c_i32(63);
+    let c16 = b.c_i32(16);
+    let c128 = b.c_i32(128);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
+    let lane_hi = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::Val(c3)));
+    let lane_lo = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::Val(c7)));
+    let w8 = b.shl_i32(wave, c3);
+    let rowb = b.add_i32(lane_hi, w8);
+    let cbytes = b.mul_i32(lane_lo, c16);
+    let w1024 = b.shl_i32(wave, c10);
+    for q in 0..4i32 {
+        let cq = b.c_i32(32 * q);
+        let row = b.add_i32(rowb, cq);
+        let r128 = b.mul_i32(row, c128);
+        let off = b.add_i32(r128, cbytes);
+        let sp = b.ptr_add(inp, off);
+        let cl = b.c_i32(4096 * q);
+        let l = b.add_i32(w1024, cl);
+        b.load_global_lds(sp, l, 0, 4);
+    }
+    b.wait_vm(0);
+    b.wait_lds(0);
+    b.barrier();
+    let off16 = b.mul_i32(tid, c16);
+    for k in 0..4i32 {
+        let ck = b.c_i32(4096 * k);
+        let a = b.add_i32(off16, ck);
+        let v = b.load_lds_b128(Opnd::Val(a));
+        let op = b.ptr_add(o, a);
+        for w in 0..4u8 {
+            let x = b.frag4_lane(v, w);
+            let f = b.bitcast_f32(x);
+            b.store_f32(op, 4 * w as u32, f);
+        }
+    }
+    b.finish()
+}
 /// Pack instruction probe: checks the semantics of `v_cvt_pknorm_u16_f32` and
 /// of the fp8 packing path.
 ///
