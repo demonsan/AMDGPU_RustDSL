@@ -48,9 +48,8 @@ fn undefined_reads(m: &MFunction) -> Vec<String> {
             preds[s].push(b);
         }
     }
-    let mut out_set: Vec<Option<HashSet<Slot>>> = vec![None; nb]; // None = "everything defined" (top)
-    let mut report: Vec<String> = Vec::new();
-    for round in 0..200 {
+    let mut out_set: Vec<Option<HashSet<Slot>>> = vec![None; nb]; // None = not reached yet (top)
+    for _ in 0..500 {
         let mut changed = false;
         for b in 0..nb {
             let mut cur: HashSet<Slot> = if b == 0 {
@@ -67,37 +66,23 @@ fn undefined_reads(m: &MFunction) -> Vec<String> {
                 }
                 match acc {
                     Some(a) => a,
-                    None => continue, // unreachable so far
+                    None => continue,
                 }
             };
-            let final_round = round > 0 && !changed;
-            let _ = final_round;
-            for (ii, inst) in m.blocks[b].insts.iter().enumerate() {
-                let e = effects(m, inst);
-                if round == 199 {
-                    for r in &e.reads {
-                        if *r != VCC && *r != u32::MAX - 1 && !cur.contains(r) {
-                            report.push(format!("block {b} inst {ii} {:?}: reads undefined slot {r}", inst.op));
-                        }
-                    }
-                }
-                cur.extend(e.writes.iter().copied());
+            for inst in &m.blocks[b].insts {
+                cur.extend(effects(m, inst).writes.iter().copied());
             }
             if out_set[b].as_ref() != Some(&cur) {
                 out_set[b] = Some(cur);
                 changed = true;
             }
         }
-        if !changed && round < 199 {
-            // converged: one more reporting round
-            let mut dummy = 199;
-            std::mem::swap(&mut dummy, &mut dummy);
-            return undefined_reads_report(m, &preds, &out_set);
+        if !changed {
+            break;
         }
     }
-    report
+    undefined_reads_report(m, &preds, &out_set)
 }
-
 fn undefined_reads_report(m: &MFunction, preds: &[Vec<usize>], out_set: &[Option<HashSet<Slot>>]) -> Vec<String> {
     let mut report = Vec::new();
     for b in 0..m.blocks.len() {
