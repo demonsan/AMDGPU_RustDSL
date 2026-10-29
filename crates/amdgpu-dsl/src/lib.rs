@@ -401,6 +401,8 @@ pub enum Stmt {
     VarMfmaScale { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
     /// `var = scaled_mfma_32x32x64_fp8(a, b)` with a zero accumulator (overwrites the variable).
     VarMfmaScaleZ { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
+    /// `var += smfmac_16x16x128_fp8(a, b, idx)`: sparse-A MFMA accumulating into a `Frag4` loop variable in place.
+    VarSmfmac { var: VarId, a: Opnd, b: Opnd, idx: Opnd },
     BeginLoop { vars: Vec<VarId>, init: Vec<Opnd> },
     BreakIf { cond: Opnd },
     EndLoop,
@@ -512,6 +514,9 @@ impl Function {
                 }
                 Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
                     let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
+                }
+                Stmt::VarSmfmac { var, a, b, idx } => {
+                    let _ = writeln!(s, "{pad}var{} += smfmac({a:?}, {b:?}; {idx:?})", var.0);
                 }
                 Stmt::BeginLoop { vars, init } => {
                     let _ = writeln!(s, "{pad}loop vars={vars:?} init={init:?}");
@@ -1017,6 +1022,11 @@ impl FnBuilder {
             scale_a: scale_a.into(),
             scale_b: scale_b.into(),
         });
+    }
+
+    /// `var += smfmac_16x16x128_fp8_fp8(a, b, idx)`: accumulate into a `Frag4` loop variable in place.
+    pub fn var_smfmac_fp8(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, idx: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::VarSmfmac { var, a: a.into(), b: b.into(), idx: idx.into() });
     }
 
     pub fn load_lds_tr_b8(&mut self, addr: impl Into<Opnd>) -> ValueId {
@@ -1540,8 +1550,8 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
             }
             Stmt::VarScaleLane { var, .. } => {
-                if f.var_ty(*var) != Some(DType::Frag16) {
-                    errs.push(here(format!("var{var} must be a frag16")));
+                if !matches!(f.var_ty(*var), Some(DType::Frag16) | Some(DType::Frag4)) {
+                    errs.push(here(format!("var{var} must be a frag16 or frag4")));
                 }
             }
             Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. } => {
@@ -1587,6 +1597,25 @@ pub fn verify(f: &Function) -> Vec<String> {
                     if let Err(e) = expect_int(f, *o, "mfma scale") {
                         errs.push(here(e));
                     }
+                }
+            }
+            Stmt::VarSmfmac { var, a, b, idx } => {
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
+                if !ok {
+                    errs.push(here(format!("var{var} accumulated outside its loop")));
+                }
+                if f.var_ty(*var) != Some(DType::Frag4) {
+                    errs.push(here(format!("var{var} must be a frag4 accumulator")));
+                }
+                for (o, ty) in [(a, DType::Frag4), (b, DType::Frag8)] {
+                    match opnd_ty(f, *o) {
+                        Ok(t) if t == ty => {}
+                        Ok(t) => errs.push(here(format!("smfmac operand is {}, expected {}", t.name(), ty.name()))),
+                        Err(e) => errs.push(here(e)),
+                    }
+                }
+                if let Err(e) = expect_int(f, *idx, "smfmac index") {
+                    errs.push(here(e));
                 }
             }
             Stmt::BeginLoop { vars, init } => {
@@ -1699,6 +1728,7 @@ fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::VarMfmaScale { a, b, scale_a, scale_b, .. } | Stmt::VarMfmaScaleZ { a, b, scale_a, scale_b, .. } => {
             vec![*a, *b, *scale_a, *scale_b]
         }
+        Stmt::VarSmfmac { a, b, idx, .. } => vec![*a, *b, *idx],
         Stmt::BeginLoop { init, .. } => init.clone(),
         Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => vec![*cond],
         _ => Vec::new(),
