@@ -250,8 +250,11 @@ impl Lowerer {
         if opt_on("sink") {
             sink_defs(&mut self.mir);
         }
-        if opt_on("maskreg") {
-            mask_regs(&mut self.mir);
+        for (name, stride) in [("maskreg", 1usize), ("maskreg2", 2), ("maskreg3", 3), ("maskreg4", 4)] {
+            if opt_on(name) {
+                mask_regs(&mut self.mir, stride);
+                break;
+            }
         }
         // rematerialise loop-invariant constants next to their loop uses (register pressure; `remat1/2/3` = at most 1/2/any
         // number of loop blocks using the constant)
@@ -3129,7 +3132,8 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
 /// it, so the scheduler (and the hazard filler) can have several masks in flight instead of one serialised ``vcc``. Only pairs
 /// where nothing between the two touches ``vcc`` and ``vcc`` is not read again afterwards (a branch terminator counts as a read when
 /// the compare is the block's last ``vcc`` writer).
-fn mask_regs(m: &mut MFunction) {
+fn mask_regs(m: &mut MFunction, stride: usize) {
+    let mut seen = 0usize;
     for bi in 0..m.blocks.len() {
         let n = m.blocks[bi].insts.len();
         let mut conv: Vec<(usize, usize, MOp)> = Vec::new();
@@ -3189,7 +3193,11 @@ fn mask_regs(m: &mut MFunction) {
                 }
             }
             if dead {
-                conv.push((j, ci, mop));
+                // stride > 1: only every `stride`-th pair uses a mask register (bounds the SGPRs in flight)
+                if seen % stride == 0 {
+                    conv.push((j, ci, mop));
+                }
+                seen += 1;
             }
             j = ci + 1;
         }

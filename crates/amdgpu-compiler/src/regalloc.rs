@@ -18,7 +18,8 @@ pub struct Alloc {
 }
 
 const VGPR_COUNT: usize = 256;
-const SGPR_COUNT: usize = 104;
+// 102 usable SGPRs (the descriptor's next_free_sgpr must stay <= 102; vcc is separate)
+const SGPR_COUNT: usize = 102;
 
 /// Reserved: v0 holds workitem id; s0:s1 kernarg pointer; s2..s4 workgroup ids.
 const V_RESERVED: usize = 1;
