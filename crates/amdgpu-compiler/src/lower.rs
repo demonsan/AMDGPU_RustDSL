@@ -18,6 +18,7 @@ use crate::mir::*;
 /// arithmetic). Selected with `AMDC_LOWER_OPTS=imm,cmpfold` (`all`, `none`).
 ///  * `imm`     - constants become in-line / literal operands (VOP2 src0, shift amounts, cndmask false arm)
 ///                instead of `v_mov` into a register;
+///  * `dce`     - dead address / clamp chains (`v_add_co`/`v_addc`, `v_cmp`+`v_cndmask`, pointer adds) are removed;
 ///  * `cmpfold` - `select(cmp(x,y), ..)` re-issues the compare instead of the 0/1 materialisation +
 ///                `v_cmp_ne`, and the dead materialisation is removed.
 pub fn opt_on(name: &str) -> bool {
@@ -182,6 +183,9 @@ impl Lowerer {
         if opt_on("cmpfold") {
             fold_select_cmp(&mut self.mir);
             dce_cmp_pairs(&mut self.mir);
+        }
+        if opt_on("dce") {
+            dce_full(&mut self.mir);
         }
         coalesce(&mut self.mir);
         dce(&mut self.mir);
@@ -1797,5 +1801,73 @@ fn dce_cmp_pairs(m: &mut MFunction) {
             k += 1;
             !dead[k - 1]
         });
+    }
+}
+/// Dead-code elimination that understands `vcc`: a pure instruction whose result is never read is removed, and a
+/// compare / carry producer is removed when no later instruction of the block reads the `vcc` it writes
+/// (the terminator may read it). The lowering emits address / clamp chains whose consumers were dropped by other
+/// options (e.g. the global scale loads replaced by LDS scale reads); this removes them. Same values, same
+/// arithmetic for everything that remains.
+fn dce_full(m: &mut MFunction) {
+    fn removable(op: MOp) -> bool {
+        matches!(
+            op,
+            MOp::VMovB32 | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VPtrAdd | MOp::VAddU32 | MOp::VAddCoU32 | MOp::VAddcCoU32
+                | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VMax3F32 | MOp::VFmaF32 | MOp::VExpF32
+                | MOp::VRcpF32 | MOp::VAndB32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32 | MOp::VMulLoU32
+                | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VReadPhys | MOp::VCmpLtI32 | MOp::VCmpGeI32
+                | MOp::VCmpNeI32 | MOp::VCmpLtF32
+        )
+    }
+    let defines_vcc = |op: MOp| op.defines_vcc() || op == MOp::VPtrAdd;
+    loop {
+        let mut used: HashMap<VReg, u32> = HashMap::new();
+        for b in &m.blocks {
+            for inst in &b.insts {
+                for r in inst.uses() {
+                    *used.entry(m.canon(r)).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut changed = false;
+        for bi in 0..m.blocks.len() {
+            let mut vcc_live = matches!(m.blocks[bi].term, Term::CondGoto { on: Pred::Vccnz | Pred::Vccz, .. });
+            let n = m.blocks[bi].insts.len();
+            let mut dead = vec![false; n];
+            for i in (0..n).rev() {
+                let inst = &m.blocks[bi].insts[i];
+                let dst_unused = match inst.dst {
+                    Some(d) => !m.alias.contains_key(&d) && used.get(&m.canon(d)).copied().unwrap_or(0) == 0,
+                    None => true,
+                };
+                let rm = removable(inst.op)
+                    && dst_unused
+                    && (!defines_vcc(inst.op) || !vcc_live)
+                    // a v_cndmask/v_addc consumes vcc: removing it is fine only if nothing else depends on its dst (checked above)
+                    && !(inst.dst.is_none() && !defines_vcc(inst.op));
+                if rm {
+                    dead[i] = true;
+                    // its own uses no longer count; handled by the outer fixed point
+                    continue;
+                }
+                if defines_vcc(inst.op) {
+                    vcc_live = false;
+                }
+                if inst.op.consumes_vcc() {
+                    vcc_live = true;
+                }
+            }
+            if dead.iter().any(|d| *d) {
+                changed = true;
+                let mut k = 0;
+                m.blocks[bi].insts.retain(|_| {
+                    k += 1;
+                    !dead[k - 1]
+                });
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 }
