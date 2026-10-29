@@ -10688,6 +10688,17 @@ fn probe_smfmac_dump(b: &mut FnBuilder, base: ValueId, slot: usize, d: ValueId) 
     }
 }
 
+/// Same for the first four dwords of a sixteen-dword fragment (the msum reference path).
+fn probe_smfmac_dump16(b: &mut FnBuilder, base: ValueId, slot: usize, d: ValueId) {
+    let off = b.c_i32((slot * 1024) as i32);
+    let row = b.ptr_add(base, off);
+    for i in 0..4u8 {
+        let bits = b.frag16_lane(d, i);
+        let v = b.bitcast_f32(bits);
+        b.store_f32(row, 4 * i as u32, v);
+    }
+}
+
 pub fn probe_smfmac_ones() -> Function {
     let mut b = FnBuilder::new("probe_smfmac_ones", 64);
     b.arg("o", DType::Ptr, 0, 8);
@@ -10753,8 +10764,148 @@ pub fn probe_smfmac_ones() -> Function {
     results.push(b.smfmac_fp8_16x16x128(a_ones, b_mark, i01, c0));
     results.push(b.smfmac_fp8_16x16x128(a_ones, b_mark, i23, c0));
 
+    // 14: current row-sum reference: two accumulated scaled MFMAs (msum), A = all-ones 8-dword
+    //     fragment, B = the two P halves; the first four D dwords are dumped.
+    let ones8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let z16 = b.frag_zero(DType::Frag16);
+    let c127 = b.c_i32(127);
+    let p1 = b.frag8(m1, m2, m4, m8, m1, m2, m4, m8);
+    let p2 = b.frag8(m8, m4, m2, m1, m8, m4, m2, m1);
+    let m0 = b.mfma_scale_fp8(ones8, p1, z16, c127, c127);
+    let msum = b.mfma_scale_fp8(ones8, p2, m0, c127, c127);
+    // 15-18: smfmac variants on the same P halves (accumulating chains; see the dword-3 hazard note).
+    let s15a = b.smfmac_fp8_16x16x128(a_ones, p1, i01, c0);
+    let s15 = b.smfmac_fp8_16x16x128(a_ones, p2, i23, s15a);
+    let s16a = b.smfmac_fp8_16x16x128(a_ones, p1, i01, c0);
+    let s16 = b.smfmac_fp8_16x16x128(a_ones, p2, i01, s16a);
+    let s17a = b.smfmac_fp8_16x16x128(a_ones, p1, i01, c0);
+    let s17 = b.smfmac_fp8_16x16x128(a_ones, p1, i23, s17a);
+    let s18a = b.smfmac_fp8_16x16x128(a_ones, p1, i01, c0);
+    let s18b = b.smfmac_fp8_16x16x128(a_ones, p1, i23, s18a);
+    let s18c = b.smfmac_fp8_16x16x128(a_ones, p2, i01, s18b);
+    let s18 = b.smfmac_fp8_16x16x128(a_ones, p2, i23, s18c);
+
+    // 19/20: is the 4th D dword written at all? Pre-initialise the accumulator to a known value
+    //        (1000.0f) and check that a single smfmac adds exactly 64 (ones A/B) to every dword.
+    let k1000 = b.c_i32(0x447A0000u32 as i32);
+    let acc19 = b.frag4(k1000, k1000, k1000, k1000);
+    let s19 = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc19);
+    let acc20 = b.frag4(k1000, k1000, k1000, k1000);
+    let s20a = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc20);
+    let s20 = b.smfmac_fp8_16x16x128(a_ones, b_ones, i23, s20a);
+    // 23-26: row-sum mapping with a *lane-dependent* P (even lanes 1.0, odd lanes 2.0), so the row
+    //        sums differ and a wrong P-half/index pairing shows up. 23 = msum reference.
+    let c1i = b.c_i32(1);
+    let oddbit = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c1i)));
+    let lane_is_even = b.cmp_lt_i32(oddbit, c1i);
+    let lane_val = b.let_(Op::Select { ty: DType::I32, cond: lane_is_even.into(), a: m1.into(), b: m2.into() });
+    let pv = b.frag8(lane_val, lane_val, lane_val, lane_val, lane_val, lane_val, lane_val, lane_val);
+    let m23 = b.mfma_scale_fp8(ones8, pv, z16, c127, c127);
+    let m23b = b.mfma_scale_fp8(ones8, pv, m23, c127, c127);
+    let s24a = b.smfmac_fp8_16x16x128(a_ones, pv, i01, c0);
+    let s24 = b.smfmac_fp8_16x16x128(a_ones, pv, i23, s24a);
+    let s25a = b.smfmac_fp8_16x16x128(a_ones, pv, i01, c0);
+    let s25 = b.smfmac_fp8_16x16x128(a_ones, pv, i01, s25a);
+    let s26a = b.smfmac_fp8_16x16x128(a_ones, pv, i01, c0);
+    let s26 = b.smfmac_fp8_16x16x128(a_ones, pv, i01, s26a);
+
+    // 27: preset accumulator dumped WITHOUT any smfmac - control for the dump/read path itself.
+    let acc27 = b.frag4(k1000, k1000, k1000, k1000);
+    // 28/29: preset + single smfmac, read back through VALU (forcing a VALU consumer) and dumped as a
+    //        sum (28) and as a rebuilt fragment (29).
+    let acc28 = b.frag4(k1000, k1000, k1000, k1000);
+    let s28 = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc28);
+    let b28_0 = b.frag4_lane(s28, 0);
+    let b28_1 = b.frag4_lane(s28, 1);
+    let b28_2 = b.frag4_lane(s28, 2);
+    let b28_3 = b.frag4_lane(s28, 3);
+    let v28_0 = b.bitcast_f32(b28_0);
+    let v28_1 = b.bitcast_f32(b28_1);
+    let v28_2 = b.bitcast_f32(b28_2);
+    let v28_3 = b.bitcast_f32(b28_3);
+    let sum28a = b.add_f32(v28_0, v28_1);
+    let sum28b = b.add_f32(v28_2, v28_3);
+    let sum28 = b.add_f32(sum28a, sum28b);
+    let acc29 = b.frag4(k1000, k1000, k1000, k1000);
+    let s29 = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc29);
+    let l29_0 = b.frag4_lane(s29, 0);
+    let l29_1 = b.frag4_lane(s29, 1);
+    let l29_2 = b.frag4_lane(s29, 2);
+    let l29_3 = b.frag4_lane(s29, 3);
+    let i29_0 = b.bitcast_i32(l29_0);
+    let i29_1 = b.bitcast_i32(l29_1);
+    let i29_2 = b.bitcast_i32(l29_2);
+    let i29_3 = b.bitcast_i32(l29_3);
+    let r29 = b.frag4(i29_0, i29_1, i29_2, i29_3);
+
+    // 30-33: how much VALU work between the accumulator pre-set and the smfmac makes the C read
+    //        visible? The filler chain is *stored* (slots 60+) so it cannot be dead-code-eliminated.
+    let c1f = b.c_f32(1.0);
+    let mut prev = b.c_f32(0.0);
+    let mut s35: Vec<ValueId> = Vec::new();
+    for &(slot, extra) in &[(30usize, 0usize), (31, 1), (32, 2), (33, 4)] {
+        let acc = b.frag4(k1000, k1000, k1000, k1000);
+        let mut filler = prev;
+        for _ in 0..extra {
+            filler = b.add_f32(filler, c1f);
+        }
+        prev = filler;
+        let s = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc);
+        let l0 = b.frag4_lane(s, 0);
+        let l1 = b.frag4_lane(s, 1);
+        let l2 = b.frag4_lane(s, 2);
+        let l3 = b.frag4_lane(s, 3);
+        let i0 = b.bitcast_i32(l0);
+        let i1 = b.bitcast_i32(l1);
+        let i2 = b.bitcast_i32(l2);
+        let i3 = b.bitcast_i32(l3);
+        s35.push(b.frag4(i0, i1, i2, i3));
+        // keep the filler chain alive: one store per filler variant into its own slot
+        let off_f = b.c_i32(((60 + extra) * 1024) as i32);
+        let row_f = b.ptr_add(base, off_f);
+        b.store_f32(row_f, 0, filler);
+    }
+    // 40-44: which P Frag8 goes into which smfmac / index pattern? P_a depends on the lane, P_b is a
+    //        constant 4.0, so the three pairings give different results. 44 = msum reference.
+    let p_a = b.frag8(lane_val, lane_val, lane_val, lane_val, lane_val, lane_val, lane_val, lane_val);
+    let p_b = b.frag8(m4, m4, m4, m4, m4, m4, m4, m4);
+    let m44 = b.mfma_scale_fp8(ones8, p_a, z16, c127, c127);
+    let m44b = b.mfma_scale_fp8(ones8, p_b, m44, c127, c127);
+    let s40a = b.smfmac_fp8_16x16x128(a_ones, p_a, i01, c0);
+    let s40 = b.smfmac_fp8_16x16x128(a_ones, p_b, i23, s40a);
+    let s41a = b.smfmac_fp8_16x16x128(a_ones, p_a, i01, c0);
+    let s41 = b.smfmac_fp8_16x16x128(a_ones, p_b, i01, s41a);
+    let s42a = b.smfmac_fp8_16x16x128(a_ones, p_a, i01, c0);
+    let s42 = b.smfmac_fp8_16x16x128(a_ones, p_a, i23, s42a);
+    let s43a = b.smfmac_fp8_16x16x128(a_ones, p_b, i01, c0);
+    let s43 = b.smfmac_fp8_16x16x128(a_ones, p_a, i23, s43a);
+
     for (e, d) in results.iter().enumerate() {
         probe_smfmac_dump(&mut b, base, e, *d);
     }
+    for (k, d) in s35.iter().enumerate() {
+        probe_smfmac_dump(&mut b, base, 30 + k, *d);
+    }
+    probe_smfmac_dump16(&mut b, base, 44, m44b);
+    probe_smfmac_dump(&mut b, base, 40, s40);
+    probe_smfmac_dump(&mut b, base, 41, s41);
+    probe_smfmac_dump(&mut b, base, 42, s42);
+    probe_smfmac_dump(&mut b, base, 43, s43);
+    probe_smfmac_dump(&mut b, base, 27, acc27);
+    let off28 = b.c_i32(28 * 1024);
+    let row28 = b.ptr_add(base, off28);
+    b.store_f32(row28, 0, sum28);
+    probe_smfmac_dump(&mut b, base, 29, r29);
+    probe_smfmac_dump(&mut b, base, 19, s19);
+    probe_smfmac_dump(&mut b, base, 20, s20);
+    probe_smfmac_dump16(&mut b, base, 23, m23b);
+    probe_smfmac_dump(&mut b, base, 24, s24);
+    probe_smfmac_dump(&mut b, base, 25, s25);
+    probe_smfmac_dump(&mut b, base, 26, s26);
+    probe_smfmac_dump16(&mut b, base, 14, msum);
+    probe_smfmac_dump(&mut b, base, 15, s15);
+    probe_smfmac_dump(&mut b, base, 16, s16);
+    probe_smfmac_dump(&mut b, base, 17, s17);
+    probe_smfmac_dump(&mut b, base, 18, s18);
     b.finish()
 }

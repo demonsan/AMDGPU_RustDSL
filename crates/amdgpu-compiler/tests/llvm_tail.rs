@@ -41,6 +41,9 @@ fn own_tail_is_the_default_and_unchanged() {
 fn every_kernel_exports_mir() {
     let tail = LlvmTail::new();
     for k in kernel_names() {
+        if !llvm_tail_supported(k) {
+            continue;
+        }
         let f = kernel_by_name(k).unwrap();
         let mir = amdgpu_compiler::export_mir(&f, &tail).unwrap_or_else(|e| panic!("{k}: {e}"));
         assert!(mir.contains("body:"), "{k}");
@@ -163,6 +166,9 @@ fn llvm_tail_assembles_kernels() {
     tail.skip_lock = false;
     let mut bad = Vec::new();
     for k in kernel_names() {
+        if !llvm_tail_supported(k) {
+            continue;
+        }
         if let Some(o) = &only {
             if !o.split(',').any(|x| x == *k) {
                 continue;
@@ -217,6 +223,9 @@ fn exported_flags_pass_the_machine_verifier() {
     let only = std::env::var("AMDC_TEST_KERNELS").ok().filter(|s| !s.is_empty());
     let mut bad = Vec::new();
     for k in kernel_names() {
+        if !llvm_tail_supported(k) {
+            continue;
+        }
         if let Some(o) = &only {
             if !o.split(',').any(|x| x == *k) {
                 continue;
@@ -250,6 +259,9 @@ fn metadata_args_match_the_dsl_args_without_padding() {
     let tail = LlvmTail::new();
     let mut bad = Vec::new();
     for k in kernel_names() {
+        if !llvm_tail_supported(k) {
+            continue;
+        }
         let f = kernel_by_name(k).unwrap();
         let (m, _) = compile_mir_alloc(&f).unwrap();
         let asm = match amdgpu_compiler::compile_with(&f, &tail) {
@@ -322,4 +334,13 @@ fn metadata_args_match_the_dsl_args_without_padding() {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Kernels that use own-backend-only MOps (the LDS-DMA loads) cannot go through the LLVM tail (llc aborts on them).
+fn llvm_tail_supported(name: &str) -> bool {
+    let Some(f) = amdgpu_compiler::kernel_by_name(name) else { return true };
+    match amdgpu_compiler::compile_mir(&f) {
+        Ok(m) => !m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32))),
+        Err(_) => true,
+    }
 }

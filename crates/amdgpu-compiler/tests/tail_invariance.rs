@@ -11,6 +11,7 @@
 //! Needs the pinned llc (skips loudly without).
 
 use amdgpu_compiler::backend::{LlvmTail, LlvmTools, OwnTail};
+use amdgpu_compiler::mir::MOp;
 use amdgpu_compiler::{compile_with, export_mir, kernel_by_name, kernel_names};
 
 fn llc_available() -> bool {
@@ -129,6 +130,9 @@ fn llvm_tail_changes_only_waits_nops_and_descriptor() {
     let mut bad = Vec::new();
     let mut checked = 0;
     for k in kernel_names() {
+        if !llvm_tail_supported(k) {
+            continue;
+        }
         if let Some(o) = &only {
             if !o.split(',').any(|x| x == *k) {
                 continue;
@@ -179,4 +183,13 @@ fn llvm_tail_changes_only_waits_nops_and_descriptor() {
     }
     assert!(checked > 0);
     assert!(bad.is_empty(), "{} invariance violations:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// Kernels that use own-backend-only MOps (the LDS-DMA loads) cannot go through the LLVM tail (llc aborts on them).
+fn llvm_tail_supported(name: &str) -> bool {
+    let Some(f) = amdgpu_compiler::kernel_by_name(name) else { return true };
+    match amdgpu_compiler::compile_mir(&f) {
+        Ok(m) => !m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32))),
+        Err(_) => true,
+    }
 }

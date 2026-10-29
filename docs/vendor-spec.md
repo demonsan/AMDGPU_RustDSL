@@ -171,11 +171,80 @@ pass does not currently pad for `VSmfmac16x16x128Fp8`. Mitigation until fixed: u
 chains (which the row-sum recipe does anyway) or distinct D registers per result. Recorded here so
 the rewrite does not trust a single-smfmac 4th dword.
 
-**Remaining work before this becomes the rewrite's row-sum recipe:** map our softmax P (two Frag8
-halves, 128 keys x 32 rows) onto the smfmac dense-B grid (8 dwords = 128 K x 16 N) and verify that
-the D row sums equal the current ones-MFMA (msum) result; the vendor reads two D dwords of the
-accumulated D for its l, so the expected recipe is 2 smfmacs (one per P half) plus a reduction of the
-right D dword pair.
+### 4.5.1 Row-sum recipe for the rewrite (Verified on hardware)
+
+Replacing the two accumulated scaled MFMAs (msum) with two sparse MFMAs works **exactly**, on all four
+D dwords, lane for lane. Copy-pasteable recipe (own backend; P1/P2 are the two Frag8 halves of the P
+fragments the PV path already builds, i.e. P^T in the vendor's orientation):
+
+```rust
+// A = constant 2:4-compressed ones (E4M3 1.0 = 0x38383838 in all four bytes of each A dword).
+let a_ones = b.frag4(ones, ones, ones, ones);
+// 2-bit sparse index patterns: 0x44444444 selects K positions {0,1} of every group of 4,
+// 0xeeeeeeee is the complementary {2,3} pattern. Together they contract all 128 K positions.
+let idx01 = b.c_i32(0x44444444_u32 as i32);
+let idx23 = b.c_i32(0xeeeeeeee_u32 as i32);
+let zero = b.frag_zero(DType::Frag4);
+// D accumulates: first P half with {0,1}, second P half with {2,3}. 2 x 16 cycles = 32 per 128 keys
+// (vs 2 x 64 = 128 for the two scaled MFMAs we use today).
+let l = b.smfmac_fp8_16x16x128(a_ones, p1, idx01, zero);
+let l = b.smfmac_fp8_16x16x128(a_ones, p2, idx23, l);
+// Consume: D dword j of `l` == dword j of the msum Frag16 accumulator (j = 0..3), so use exactly the
+// dword pair the kernel already reduces for l (the vendor reads v224+v225 = D dwords 0 and 1).
+```
+
+Evidence (probe slots 40/44, 3 repeated runs): with a lane-dependent P (even lanes 1.0, odd lanes 2.0
+in one half; constant 4.0 in the other) the 2-smfmac chain and the msum reference produced **identical**
+values: lane0 = 320, lane1 = 384 on every one of the four D dwords. A flat-marker P gave 480 = 480
+(slots 14/15). Dropping one P half gives half the value (128/256 instead of 320/384), and swapping which
+half pairs with which index pattern also sums correctly on dwords 0-2 (dword 3 only differs because of
+the C-accumulation quirk below; with the zero-initialised C used in the recipe all four dwords are
+correct).
+
+**Constraint:** the first smfmac of the chain must start from an all-zero C (zero fragment is fine -
+a dropped zero contribution is harmless). Do **not** start the chain from a non-zero,
+VALU-initialised accumulator: see 4.5.2.
+
+### 4.5.2 The 4th-D-dword anomaly: root cause and required padding rule (Verified + ISA)
+
+Controlled probe experiments:
+
+| experiment | d0 | d1 | d2 | d3 |
+|---|---|---|---|---|
+| preset C = 1000.0f, no smfmac, dump | 1000 | 1000 | 1000 | 1000 |
+| preset C, one smfmac, read back through VALU | 1064 | 1064 | 1064 | **~64 (C dropped)** |
+| preset C + 1/2/4 used filler VALU ops, one smfmac | 1064 | 1064 | 1064 | **still A x B only** |
+| chain of 2 smfmacs from a zero C (row-sum recipe) | 128 | 128 | 128 | 128 (correct) |
+| single smfmac read directly by a global_store | 64 | 64 | 64 | run-to-run garbage |
+
+So the preset writes and the read path are fine (first row), and the smfmac writes dwords 0..3; the
+anomaly is specific to the **implicit accumulator C**: when C is written by a *non-XDL* (VALU) producer
+shortly before the SMFMAC, the 4th C dword is not seen by the instruction (the result is A x B only for
+that dword), and a *direct* consumer reading D too early sees stale/garbage in that dword because matrix
+results are written back in stages. A second SMFMAC reading the same D (same-opcode exact-C path)
+accumulates correctly on all four dwords, and a zero C makes the missing contribution harmless - which
+is why the row-sum recipe above is safe.
+
+ISA basis (CDNA4 §7.6; kernel-wiki `mi350-isa-waitcnt-hazards` p74/p77, PASS = 4 clocks):
+`VALU write VGPR -> MFMA/SMFMA read` is a **Required Wait of 2 waits (8 clocks)**, and p77 lists the
+**WAR** direction (`XDL/SMFMA reads SrcC -> VALU overwrite of the source`) as a separate hazard that a
+RAW-only check misses. Matrix results are explicitly documented as written back in multiple stages and
+possibly partially visible (p49), matching the dword-3-only behaviour.
+
+**Required padding rule for our backend and for backend-llvm-tail:**
+1. Model the SMFMAC in-place accumulator `C` as a *real source operand* in MIR. Today the MIR op has
+   sources A, B, SRC2 only, so no hazard pass can see that the instruction reads D. (Our own backend
+   currently pads chained SMFMACs only by accident, through the WAW branch.)
+2. After a non-DL VALU write to any A/B/C register, insert the ISA's **2 waits = 8 clocks** before the
+   SMFMAC (e.g. `s_nop 7` = 8 cycles).
+3. Add the p77 **WAR** direction as well: a VALU write to A/B/C shortly after an SMFMAC reads them must
+   wait for the operand read to complete (same class of spacing).
+4. Keep the existing 20-wait rule before reading D, but apply it before the **last** dword read too
+   (partial writeback) and prefer the accumulator chain pattern over a single smfmac + immediate read.
+
+Open point (Experimental): our used-filler experiment shows that 8 clocks of VALU distance were *not*
+enough to make a non-zero VALU-initialised C dword 3 visible in the single-smfmac case; treat the exact
+minimum for that path as unconfirmed and avoid it (start chains from zero C or from a previous SMFMAC).
 
 ## 5. LDS layout, staging and VGPR budget (Verified static)
 
@@ -334,11 +403,60 @@ reference. A faster kernel that changes numerics fails the correctness gate rega
 | setprio windows | 1 set/clear pair per step over the MFMA phase | not used | required |
 | next-tile QK inside current compute group | yes (8 scaled MFMA) | separate | required |
 | staging | LDS-DMA, 1040-B runs, ring | register round trip | required |
+| row-sum structure | 2x `v_smfmac_f32_16x16x128_fp8_fp8` with complementary index patterns (0x44444444 then 0xeeeeeeee), chained from a zero C (recipe in 4.5.1) | 2 scaled MFMAs (no smfmac) | required |
 | row-sum cycle cost per 128 keys | 32 (2 smfmac) | 128 (2 scaled MFMA) | <= 32 |
+| smfmac operand hazard | no VALU-written A/B/C within 8 clocks (2 waits) of an smfmac; no non-zero VALU-initialised accumulator feeding an smfmac | n/a (no smfmac yet) | required (see 4.5.2) |
+| iteration unit | 128 keys per barrier pair | checked per push | required |
 | correctness | 15/15 REF shapes + determinism | same | unchanged (docs/verification.md) |
 
 Failure of the wall/throughput lines with all counter lines green means the scheduler/prefetch structure
 (item 5) is still wrong; failure of the VALU lines points at the emitter/codegen (items 1, 4).
+
+## 7.6 Baseline run of the checklist: kernel-opt `_vs` @ be6c1f1 (GPU 5)
+
+Commit under test: kernel-opt `be6c1f1` (merged Main `e0e9a77`; validation branch `vs-validate`,
+head `a84fe4a`). Command: `bash tools/vendor_validate.sh fmha_fwd_hd128_mxfp8_vs`; same-run wall,
+B1 H8 S=SK=2048, 20 unprofiled launches. The generated asm has two role loops of 687/673 instructions;
+one loop iteration = 128 keys.
+
+| §7.5 line | vendor | `_vs` @ be6c1f1 | target | delta closed? |
+|---|---|---|---|---|
+| wall per launch | 0.0333 ms (516.0 TFLOP/s) | 0.0658 ms (**261.0 TFLOP/s**) | <= 0.040 ms / >= 420 TFLOP/s | **no** (also below current `_t`: 292.6) |
+| `SQ_INSTS` /wave-iter | 381.6 | 678.4 | <= 400 | no |
+| `SQ_INSTS_VALU` | 250.9 | 543.7 | <= 265 | no |
+| `_MUL_F32` | 32.3 | 58.1 | <= 40 | no |
+| `_INT32` | 10.8 | 75.6 | <= 15 | no |
+| other VALU (MOV/TRANS/CMP) | 79.6 | 311.8 | <= 95 | no |
+| `_CVT` | 69.4 | 70.4 | >= 60 | **yes** (pknorm+scalef32 path ported) |
+| `SQ_INSTS_SALU` | 40.0 | 4.4 | >= 35 | no (ring/address math still VALU) |
+| `SQ_INSTS_LDS` | 52.5 | 52.5 | <= 55 | **yes** (exact match) |
+| `SQ_INSTS_VMEM` | 5.7 | 7.9 | <= 6 | no (marginal, same as `_t`) |
+| `SQ_IFETCH` | 81.4 | 136.4 | <= 85 | no (worse than `_t` 97.3) |
+| `SQ_VALU_MFMA_BUSY_CYCLES` | 1086 | 1280 | <= 1100 | no (20 MFMA/wave-iter) |
+| `SQ_ACTIVE_INST_VALU` | 293.8 | 597.2 | <= 310 | no |
+| `SQ_WAIT_ANY` | 415.6 | 1113.2 | <= 450 | no (worse than `_t` 739.0) |
+| `SQ_INST_LEVEL_VMEM` | 52.7 | 119.5 | <= 60 | no (improved from `_t` 147.3) |
+| `SQ_INST_LEVEL_LDS` | 32.1 | 39.5 | <= 35 | no |
+| LDS bank conflicts | 0 | **64.0** | <= 0.1 | **no - new regression** (the `_t` kernel has 1.06) |
+| barriers per 128 keys | 2 | **4** | 2 | no (asm: 4 `s_barrier` per role loop iteration) |
+| setprio windows | 1 set/clear pair per 128 keys | **4 `s_setprio` per iteration** | 1 pair | no |
+| next-tile QK in compute group | 8 scaled QK MFMA | 18 `v_mfma_scale` per iteration (QK+PV, next tile prefetched in-loop) | present | **yes (structure present)** |
+| staging | LDS-DMA, 1040-B runs | 4 `global_load_lds_dwordx4` per iteration | required | **yes** |
+| iteration unit | 128 keys | 128 keys but built from 2x64-key tiles | 128 keys | no (barrier/setprio rate doubled) |
+| row-sum structure | 2x smfmac, complementary patterns, chained from zero C | 0 smfmac; 4x `v_mfma_f32_32x32x8_f16` msum (128 cyc/128 keys) | required | **no** |
+| smfmac operand hazard | n/a | n/a (no smfmac) | required when smfmac lands | n/a |
+
+Correctness gate at that commit: **15/15 reference shapes, 5/5 determinism** (own backend) - passes.
+So be6c1f1 is numerically correct and has the DMA/CVT/next-tile-QK structure in place, but the
+64-key-tile barrier/setprio rate (4 per 128 keys instead of 2), the VALU address math (INT32 75.6,
+other 311.8), the remaining msum MFMAs and a **new LDS bank-conflict regression (64/wave-iteration)**
+keep it at 261 TFLOP/s - below the existing `_t` (292.6) and far from the 420 target.
+
+Note: `fmha_fwd_hd128_mxfp8_vs128` (the 128-key-unit variant) is *not buildable* at be6c1f1:
+`amdc emit fmha_fwd_hd128_mxfp8_vs128 --backend own` fails with
+`out of VGPRs allocating r827 (V16, live 832..2626); 73 live vregs holding 231 dwords`
+(after 8 DSL lint warnings "loop variable read after set_var in the same iteration"). It must be
+made to allocate before the next validation round.
 
 ## 8. Unknowns / limitations
 
@@ -372,6 +490,10 @@ bash tools/vendor_disasm.sh survey
 bash tools/vendor_disasm.sh phases label_block_A_loop --seq
 bash tools/vendor_disasm.sh mfma; bash tools/vendor_disasm.sh lds; bash tools/vendor_disasm.sh staging
 OURS_CO=build/ours_t.co bash tools/vendor_counters.sh vendor-spec
+# §7.5 acceptance checklist for one of our kernels (structural VAL lines + same-run wall + 15 shapes +
+# determinism + counters):
+bash tools/vendor_validate.sh fmha_fwd_hd128_mxfp8_vs
+bash tools/vendor_validate.sh fmha_fwd_hd128_mxfp8_vs --no-counters    # skip the slow profile passes
 ```
 
 Wall time (unprofiled, the number to quote for performance) comes from `ref_host` itself:
