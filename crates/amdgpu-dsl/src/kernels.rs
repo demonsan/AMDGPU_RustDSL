@@ -8681,6 +8681,18 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.wait_vm(0);
             b.wait_lds(0);
         }
+        if fmha_t_opt("dbgst") {
+            // minimal global store (zero) into this lane's output row, like the epilogue does
+            let ob0 = b.mul_i32(cx.bidx, cx.o_bs);
+            let ob1 = b.mul_i32(cx.hidx, cx.o_hs);
+            let orow = b.mul_i32(cx.row, cx.o_seqs);
+            let ob2 = b.add_i32(ob0, ob1);
+            let ob3 = b.add_i32(ob2, orow);
+            let ob4 = b.add_i32(ob3, cx.g_bytes8);
+            let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
+            let zf = b.c_f32(0.0);
+            b.store_f32(o_ptr0, 0, zf);
+        }
         return;
     }
     if fmha_t_opt("dbgload") {
