@@ -10931,14 +10931,47 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let kd_h = b.mul_i32(kvh, dk_hs);
     let kd_base = b.add_i32(kd_b, kd_h);
 
-    let rt = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c255)));
+    // wave-group split (which 4 of the 8 waves form role A): FMHA_OPT split0 = waves 0-3 (default), split1 = even waves, split2 = bit-1 of the wave id.
+    // The group-local thread id (rt) must stay a permutation of 0..255 inside a group: rt = 64 * (index of the wave in its group) + lane.
+    let split_mode = fmha_t_num("split").unwrap_or(0);
+    let c63s = b.c_i32(63);
+    let lane_s = b.let_(Op::AndI32(Opnd::Val(tid_full), Opnd::Val(c63s)));
+    let c3s = b.c_i32(3);
+    let wave4_s = match split_mode {
+        1 => b.let_(Op::LshrI32(Opnd::Val(wave), Opnd::Val(c1))),
+        2 => {
+            let lo = b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c1)));
+            let c2s = b.c_i32(2);
+            let hi0 = b.let_(Op::LshrI32(Opnd::Val(wave), Opnd::Val(c2s)));
+            let hi = b.shl_i32(hi0, c1);
+            b.add_i32(lo, hi)
+        }
+        _ => b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c3s))),
+    };
+    let c6s = b.c_i32(6);
+    let rt = {
+        let w64 = b.shl_i32(wave4_s, c6s);
+        b.add_i32(w64, lane_s)
+    };
     let rt_row = b.let_(Op::LshrI32(Opnd::Val(rt), Opnd::Val(c1)));
     let rt_half = b.let_(Op::AndI32(Opnd::Val(rt), Opnd::Val(c1)));
     let rt_half64 = b.shl_i32(rt_half, c6);
     let pitch_c = b.c_i32(fmha_t_pitch());
     let rt_rowp = b.mul_i32(rt_row, pitch_c);
     let rt64 = b.add_i32(rt_rowp, rt_half64);
-    let is_a = b.cmp_lt_i32(wave, c4);
+    let is_a = match split_mode {
+        1 => {
+            let lo = b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c1)));
+            b.cmp_lt_i32(lo, c1)
+        }
+        2 => {
+            let c1b = b.c_i32(1);
+            let sh = b.let_(Op::LshrI32(Opnd::Val(wave), Opnd::Val(c1b)));
+            let lo = b.let_(Op::AndI32(Opnd::Val(sh), Opnd::Val(c1b)));
+            b.cmp_lt_i32(lo, c1b)
+        }
+        _ => b.cmp_lt_i32(wave, c4),
+    };
 
     // transposing-read lane address for A' = V^T (key of byte b: 16 r + 8 (i/4) + 4 g + i % 4):
     //   key_part = 8 * ((M & 15) >> 3) + 4 g + ((M >> 1) & 3); col_part = 16 * ((M >> 4) & 1) + 8 * (M & 1)
@@ -10987,7 +11020,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let cm1k = b.c_i32(-1);
     let kv_last = b.add_i32(kv_len, cm1k);
     let g4 = b.shl_i32(pblk, c2);
-    let wave4 = b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c3)));
+    let wave4 = wave4_s;
     let mut kfx: Vec<ValueId> = Vec::new();
     let mut trx: Vec<ValueId> = Vec::new();
     let mut swzw: Vec<ValueId> = Vec::new();
