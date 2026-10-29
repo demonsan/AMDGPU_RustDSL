@@ -1279,22 +1279,40 @@ impl Lowerer {
             if let Some(op) = self.defs.get(&v).cloned() {
                 match op {
                     Op::CmpLtI32(a, b) => {
-                        let ra = self.as_v1(a)?;
+                        // src0 of the e32 compare may be an SGPR (sgpr option); src1 must be a VGPR
+                        let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
+                        let ra = match sa {
+                            Some(s) => s,
+                            None => self.as_v1(a)?,
+                        };
                         let rb = self.as_v1(b)?;
+                        self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
                         self.push(MInst::new(MOp::VCmpLtI32).srcreg(ra).srcreg(rb));
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
                     }
                     Op::CmpGeI32(a, b) => {
-                        let ra = self.as_v1(a)?;
+                        // src0 of the e32 compare may be an SGPR (sgpr option); src1 must be a VGPR
+                        let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
+                        let ra = match sa {
+                            Some(s) => s,
+                            None => self.as_v1(a)?,
+                        };
                         let rb = self.as_v1(b)?;
+                        self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
                         self.push(MInst::new(MOp::VCmpGeI32).srcreg(ra).srcreg(rb));
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
                     }
                     Op::CmpLtF32(a, b) => {
-                        let ra = self.as_v1(a)?;
+                        // src0 of the e32 compare may be an SGPR (sgpr option); src1 must be a VGPR
+                        let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
+                        let ra = match sa {
+                            Some(s) => s,
+                            None => self.as_v1(a)?,
+                        };
                         let rb = self.as_v1(b)?;
+                        self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
                         self.push(MInst::new(MOp::VCmpLtF32).srcreg(ra).srcreg(rb));
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
@@ -1486,7 +1504,12 @@ impl Lowerer {
                     DType::Ptr => return Err("select of pointers is not supported".to_string()),
                     _ => self.as_v1(*a)?,
                 };
+                let b_sgpr = if opt_on("sgpr") && self.const_bits(*b).is_none() { self.sgpr_src(*b) } else { None };
                 let b_src = match (opt_on("imm"), self.const_bits(*b)) {
+                    _ if b_sgpr.is_some() => {
+                        self.touch(&[Src::Reg(b_sgpr.unwrap())]);
+                        Src::Reg(b_sgpr.unwrap())
+                    }
                     (true, Some(k)) if is_inline_const(k) => Src::Imm(k),
                     _ => Src::Reg(self.as_v1(*b)?),
                 };
@@ -2029,6 +2052,15 @@ impl Lowerer {
         }
     }
 
+    /// The SGPR an operand already lives in: an S1 value or a scalar (uniform) loop variable. gfx9 VALU instructions read at most
+    /// ONE distinct SGPR (constant bus limit 1) and only in src0 of the e32 forms; every user of this helper keeps to that.
+    fn sgpr_src(&self, o: Opnd) -> Option<VReg> {
+        match o {
+            Opnd::Var(v) => self.vars.get(v.0 as usize).copied().filter(|r| self.mir.vreg_class(*r) == RClass::S1),
+            o => self.scalar_reg(o),
+        }
+    }
+
     /// The SGPR a value already lives in (S1 class), if any.
     fn scalar_reg(&self, o: Opnd) -> Option<VReg> {
         let Opnd::Val(v) = o else { return None };
@@ -2057,9 +2089,10 @@ impl Lowerer {
         if opt_on("sgpr") {
             let vop3 = op == MOp::VMulLoU32;
             let commutative = op != MOp::VSubF32;
-            let (sa, sb) = (self.scalar_reg(a), self.scalar_reg(b));
+            let (sa, sb) = (self.sgpr_src(a), self.sgpr_src(b));
             let plan = match (sa, sb) {
-                (Some(s), None) if self.const_bits(b).is_none() => Some((s, b, true)),
+                // both scalar: one operand stays in its SGPR, the other is moved (one v_mov instead of two)
+                (Some(s), _) if self.const_bits(b).is_none() => Some((s, b, true)),
                 (None, Some(s)) if self.const_bits(a).is_none() && (commutative || vop3) => Some((s, a, false)),
                 _ => None,
             };
@@ -2125,7 +2158,11 @@ impl Lowerer {
                 return Ok(());
             }
         }
-        let ra = self.as_v1(a)?;
+        let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
+        let ra = match sa {
+            Some(s) => s,
+            None => self.as_v1(a)?,
+        };
         let rb = self.as_v1(b)?;
         self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
         self.push(MInst::new(op).srcreg(ra).srcreg(rb));
