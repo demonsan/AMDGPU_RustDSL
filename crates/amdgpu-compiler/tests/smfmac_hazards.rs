@@ -35,12 +35,11 @@ fn valu_inputs_kernel() -> amdgpu_dsl::Function {
     let a = b.frag4(x, y, x, y);
     let bb = b.frag8(x, y, x, y, x, y, x, y);
     let idx = b.add_i32(y, y);
-    let f0 = b.bitcast_f32(x);
-    let f1 = b.bitcast_f32(y);
-    let c = b.frag4(f0, f1, f0, f1);
+    let c = b.frag4(x, y, x, y);
     let d = b.smfmac_fp8_16x16x128(a, bb, idx, c);
     let d0 = b.frag4_lane(d, 0);
-    b.store_f32(base, 0, d0);
+    let f0 = b.bitcast_f32(d0);
+    b.store_f32(base, 0, f0);
     b.finish()
 }
 
@@ -110,7 +109,8 @@ fn dependent_smfmac_chain_is_not_padded() {
     let d1 = b.smfmac_fp8_16x16x128(a, bb, i01, c0);
     let d2 = b.smfmac_fp8_16x16x128(a, bb, i23, d1);
     let l = b.frag4_lane(d2, 0);
-    b.store_f32(base, 0, l);
+    let lf = b.bitcast_f32(l);
+    b.store_f32(base, 0, lf);
     let _ = Opnd::I32(0);
     let asm = compile(&b.finish()).unwrap().asm;
     let lines: Vec<&str> = asm.lines().map(|l| l.split(';').next().unwrap().trim()).filter(|l| !l.is_empty() && !l.starts_with('.')).collect();
