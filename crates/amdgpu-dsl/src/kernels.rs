@@ -944,7 +944,7 @@ pub fn probe_fmha_core() -> Function {
 /// * `o[256..320]`  (dwords): the 256 B copied with the 4-byte form, read back with `ds_read_b32`
 pub fn probe_dma() -> Function {
     let mut b = FnBuilder::new("probe_dma", 64);
-    b.lds(4096);
+    b.lds(70000);
     b.arg("o", DType::Ptr, 0, 8);
     b.arg("i", DType::Ptr, 8, 8);
     let o = b.let_(Op::KernargPtr { offset: 0 });
@@ -953,7 +953,7 @@ pub fn probe_dma() -> Function {
     let c4 = b.c_i32(4);
     let c16 = b.c_i32(16);
     let c1024 = b.c_i32(1024);
-    let c2048 = b.c_i32(2048);
+    let c2048 = b.c_i32(68096); // above 64 KB
     let c0 = b.c_i32(0);
 
     let off16 = b.mul_i32(tid, c16);
