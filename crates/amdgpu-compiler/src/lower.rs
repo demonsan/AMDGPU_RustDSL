@@ -29,6 +29,13 @@ pub fn opt_on(name: &str) -> bool {
     v.iter().any(|x| x == name || x == "all")
 }
 
+/// Is `bits` an in-line constant of the ISA (integers -16..64 and the f32 constants 0, +-0.5, +-1, +-2, +-4, 1/(2pi))?
+/// Literals are not allowed where the instruction also reads the constant bus (e.g. `v_cndmask` reads vcc).
+fn is_inline_const(bits: i64) -> bool {
+    let u = bits as i32 as u32;
+    (-16..=64).contains(&bits) || matches!(u, 0x3f00_0000 | 0xbf00_0000 | 0x3f80_0000 | 0xbf80_0000 | 0x4000_0000 | 0xc000_0000 | 0x4080_0000 | 0xc080_0000 | 0x3e22_f983)
+}
+
 /// May `bits` be the constant source operand of `op` (placed in src0)?
 fn imm_ok(op: MOp, bits: i64) -> bool {
     match op {
@@ -1066,7 +1073,7 @@ impl Lowerer {
                     _ => self.as_v1(*a)?,
                 };
                 let b_src = match (opt_on("imm"), self.const_bits(*b)) {
-                    (true, Some(k)) => Src::Imm(k),
+                    (true, Some(k)) if is_inline_const(k) => Src::Imm(k),
                     _ => Src::Reg(self.as_v1(*b)?),
                 };
                 let d = self.new_vreg(RClass::V1);
