@@ -9510,6 +9510,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let no_pv = ablate.contains("nopv");
     let no_stage = ablate.contains("nostage");
     let seq_mode = ablate.contains("seq"); // diagnostic: both groups run group A's schedule (no phase offset)
+    let q0_reg = fmha_t_opt("q0reg"); // keep Q b0 in registers (8 VGPR) instead of 8 ds_read_b128 per tile
     let c0 = b.c_i32(0);
     let c1 = b.c_i32(1);
     let c2 = b.c_i32(2);
@@ -9674,32 +9675,33 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.store_lds_b32(Opnd::Val(ones_wa), Opnd::Val(ones_w0));
     let wq2048 = b.c_i32(2048);
     let wq_off = b.mul_i32(wid, wq2048);
-    let lq32 = b.mul_i32(lane_q, c32_);
+    // conflict-free layout: the first 16 B of every lane contiguous (lane*16), the second 16 B in the next KB (1024 + lane*16)
+    let c16l = b.c_i32(16);
+    let lq32 = b.mul_i32(lane_q, c16l);
     let q_addr0 = {
         let a0 = b.add_i32(q_base, wq_off);
         b.add_i32(a0, lq32)
     };
+    let c1024q = b.c_i32(1024);
     let q0_addr0 = {
         let a0 = b.add_i32(q0_base, wq_off);
         b.add_i32(a0, lq32)
     };
     {
-        let c16_ = b.c_i32(16);
-        let q0_addr1 = b.add_i32(q0_addr0, c16_);
+        let q0_addr1 = b.add_i32(q0_addr0, c1024q);
         let g0 = b.frag4(cx.bq0_words[0], cx.bq0_words[1], cx.bq0_words[2], cx.bq0_words[3]);
         let g1 = b.frag4(cx.bq0_words[4], cx.bq0_words[5], cx.bq0_words[6], cx.bq0_words[7]);
         b.store_lds_b128(Opnd::Val(q0_addr0), Opnd::Val(g0));
         b.store_lds_b128(Opnd::Val(q0_addr1), Opnd::Val(g1));
     }
     {
-        let c16_ = b.c_i32(16);
-        let q_addr1 = b.add_i32(q_addr0, c16_);
+        let q_addr1 = b.add_i32(q_addr0, c1024q);
         let f0 = b.frag4(cx.bq1_words[0], cx.bq1_words[1], cx.bq1_words[2], cx.bq1_words[3]);
         let f1 = b.frag4(cx.bq1_words[4], cx.bq1_words[5], cx.bq1_words[6], cx.bq1_words[7]);
         b.store_lds_b128(Opnd::Val(q_addr0), Opnd::Val(f0));
         b.store_lds_b128(Opnd::Val(q_addr1), Opnd::Val(f1));
     }
-    let ones_addr0 = b.mul_i32(lane_q, c32_);
+    let ones_addr0 = b.mul_i32(lane_q, c16l);
     let ones_addr = b.add_i32(ones_base, ones_addr0);
     b.wait_vm(0);
     b.wait_lds(0);
@@ -9708,18 +9710,18 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     // ---- loop state (128-key units: S is 4 tiles, one rollback decision and two barriers per tile) ----
     let ones_w = b.c_i32(0x38383838);
     let load_ones = |b: &mut FnBuilder| -> ValueId {
-        let c16_ = b.c_i32(16);
-        let a1 = b.add_i32(ones_addr, c16_);
+        let c1024_ = b.c_i32(1024);
+        let a1 = b.add_i32(ones_addr, c1024_);
         b.load_lds_b128x2(Opnd::Val(ones_addr), Opnd::Val(a1))
     };
     let load_q0 = |b: &mut FnBuilder| -> ValueId {
-        let c16_ = b.c_i32(16);
-        let a1 = b.add_i32(q0_addr0, c16_);
+        let c1024_ = b.c_i32(1024);
+        let a1 = b.add_i32(q0_addr0, c1024_);
         b.load_lds_b128x2(Opnd::Val(q0_addr0), Opnd::Val(a1))
     };
     let load_q1 = |b: &mut FnBuilder| -> ValueId {
-        let c16_ = b.c_i32(16);
-        let a1 = b.add_i32(q_addr0, c16_);
+        let c1024_ = b.c_i32(1024);
+        let a1 = b.add_i32(q_addr0, c1024_);
         b.load_lds_b128x2(Opnd::Val(q_addr0), Opnd::Val(a1))
     };
     let ones_h = b.c_i32(0x3C003C00);
@@ -9753,7 +9755,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
-            let qb0 = load_q0(b);
+            let qb0 = if q0_reg { cx.b0 } else { load_q0(b) };
             let s0 = b.mfma_scale_fp8(k8_0, qb0, biasf, sk0, sq0m);
             let qb1 = load_q1(b);
             out.push(b.mfma_scale_fp8(k8_1, qb1, s0, sk1, sq1m));
@@ -9821,7 +9823,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
-            let qb0 = load_q0(b);
+            let qb0 = if q0_reg { cx.b0 } else { load_q0(b) };
             b.var_mfma_scale(s_vars[s], k8_0, qb0, sk0, sq0m);
             let qb1 = load_q1(b);
             b.var_mfma_scale(s_vars[s], k8_1, qb1, sk1, sq1m);
@@ -9992,11 +9994,16 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let key0p = b.shl_i32(it, c7d);
         let key_endp = b.add_i32(key0p, c128v);
         let is_tail = b.cmp_lt_i32(cx.kv_len, key_endp);
-        b.begin_if(Opnd::Val(is_tail));
-        iter(b, true, false, role_a);
-        b.else_();
-        iter(b, false, false, role_a);
-        b.end_if();
+        if fmha_t_opt("peelone") {
+            // one shared (always masked) copy of the last tile: smaller code, the mask is a no-op for a full tile
+            iter(b, true, false, role_a);
+        } else {
+            b.begin_if(Opnd::Val(is_tail));
+            iter(b, true, false, role_a);
+            b.else_();
+            iter(b, false, false, role_a);
+            b.end_if();
+        }
     }    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
     let l0 = b.frag16_lane(la, 0);
     let l_tot = b.bitcast_f32(l0);
