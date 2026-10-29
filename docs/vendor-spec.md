@@ -29,6 +29,9 @@ runs `tools/vendor_analyze.py` on the dump; the vendor kernel is unusually frien
 built from hand-written aiter assembly with named labels (`label_block_A_loop`,
 `label_rollback_overflow_block_s_0`, ...). 9189 static instructions, 37 labels.
 
+Both tools were validated end-to-end on GPU 5 / node 53 (branch `kernel-occ` head `fddc0e9`): the
+disassembly survey/phases output above and the counter table in section 6 are their output.
+
 ## 1. Budget (Verified)
 
 From the code-object metadata (`.vgpr_count` / `.sgpr_count` / `.group_segment_fixed_size`; Verified,
