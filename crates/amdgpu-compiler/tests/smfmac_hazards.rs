@@ -54,7 +54,7 @@ fn smfmac_mir_op_has_the_accumulator_as_a_source() {
             if i.op == MOp::VSmfmac16x16x128Fp8 {
                 seen += 1;
                 assert_eq!(i.srcs.len(), 4, "A, B, SRC2 and C");
-                assert_eq!(i.srcs[3], Src::Reg(i.dst.unwrap()), "C must be D (in place)");
+                assert!(matches!(i.srcs[3], Src::Reg(c) if Some(c) == i.dst), "C must be D (in place)");
             }
         }
     }

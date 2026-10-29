@@ -409,7 +409,7 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                             errs.push(format!("block {bi} inst {ii}: smfmac dst must be V4"));
                         }
                     }
-                    if inst.srcs.len() != 4 || inst.srcs.get(3) != inst.dst.map(Src::Reg).as_ref() {
+                    if inst.srcs.len() != 4 || !matches!(inst.srcs.get(3), Some(Src::Reg(c)) if Some(*c) == inst.dst) {
                         errs.push(format!("block {bi} inst {ii}: smfmac needs the accumulator C (== dst) as srcs[3]"));
                     }
                     let want = [RClass::V4, RClass::V8, RClass::V1];
