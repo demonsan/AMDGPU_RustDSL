@@ -10136,20 +10136,42 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot)).collect();
         let mut p_pre: Option<[ValueId; 2]> = None;
+        // smford: issue the row-sum chain after the PV MFMAs; smf2: two independent 2-smfmac chains (idx01 / idx23) instead of one dependent chain of 4
+        let smford = fmha_t_opt("smford");
+        let smf2 = fmha_t_opt("smf2");
+        let chain = |b: &mut FnBuilder, pa: ValueId, pb: ValueId| {
+            let lu = if smf2 {
+                let z4 = b.frag_zero(DType::Frag4);
+                let z4b = b.frag_zero(DType::Frag4);
+                let r1 = b.smfmac_fp8_16x16x128(a_rs, pa, idx01, z4);
+                let r1b = b.smfmac_fp8_16x16x128(a_rs, pa, idx23, z4b);
+                let r2 = b.smfmac_fp8_16x16x128(a_rs, pb, idx01, r1);
+                let r2b = b.smfmac_fp8_16x16x128(a_rs, pb, idx23, r1b);
+                let d0 = b.frag4_lane(r2, 2);
+                let d1 = b.frag4_lane(r2b, 2);
+                let f0 = b.bitcast_f32(d0);
+                let f1 = b.bitcast_f32(d1);
+                b.add_f32(f0, f1)
+            } else {
+                let z4 = b.frag_zero(DType::Frag4);
+                let r1 = b.smfmac_fp8_16x16x128(a_rs, pa, idx01, z4);
+                let r2 = b.smfmac_fp8_16x16x128(a_rs, pb, idx01, r1);
+                let r3 = b.smfmac_fp8_16x16x128(a_rs, pa, idx23, r2);
+                let r4 = b.smfmac_fp8_16x16x128(a_rs, pb, idx23, r3);
+                let lu = b.frag4_lane(r4, 2);
+                b.bitcast_f32(lu)
+            };
+            let l_old = b.bitcast_f32(Opnd::Var(la));
+            let l_new = b.add_f32(l_old, lu);
+            let l_new_i = b.bitcast_i32(l_new);
+            b.set_var(la, l_new_i);
+        };
         if smfrs {
             let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             let pb = b.frag8(w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
-            let z4 = b.frag_zero(DType::Frag4);
-            let r1 = b.smfmac_fp8_16x16x128(a_rs, pa, idx01, z4);
-            let r2 = b.smfmac_fp8_16x16x128(a_rs, pb, idx01, r1);
-            let r3 = b.smfmac_fp8_16x16x128(a_rs, pa, idx23, r2);
-            let r4 = b.smfmac_fp8_16x16x128(a_rs, pb, idx23, r3);
-            let lu = b.frag4_lane(r4, 2);
-            let l_unit = b.bitcast_f32(lu);
-            let l_old = b.bitcast_f32(Opnd::Var(la));
-            let l_new = b.add_f32(l_old, l_unit);
-            let l_new_i = b.bitcast_i32(l_new);
-            b.set_var(la, l_new_i);
+            if !smford {
+                chain(b, pa, pb);
+            }
             p_pre = Some([pa, pb]);
         }
         let load_v = |b: &mut FnBuilder, hh: usize, e: usize| -> ValueId {
@@ -10194,6 +10216,11 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             for e in 0..4usize {
                 let v8 = load_v(b, hh, e);
                 b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
+            }
+        }
+        if smfrs && smford {
+            if let Some(ps) = p_pre {
+                chain(b, ps[0], ps[1]);
             }
         }
     };    let iter = |b: &mut FnBuilder, masked: bool, stage: bool, last_barrier: bool| {
