@@ -7117,6 +7117,8 @@ struct FmhaTCtx {
     swzw: Vec<ValueId>,
     /// the eight words of the second Q fragment (b1), for kernels that keep it in LDS instead of registers
     bq1_words: Vec<ValueId>,
+    /// likewise for the first Q fragment (b0)
+    bq0_words: Vec<ValueId>,
 }
 
 /// One role's steady loop and epilogue of the transposed FMHA kernel.
@@ -9665,6 +9667,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     let ones_base = b.c_i32(3 * cbuf_i + 2048 + 2048);
     let q_base = b.c_i32(3 * cbuf_i + 2048 + 2048 + 2048);
+    let q0_base = b.c_i32(3 * cbuf_i + 2048 + 2048 + 2048 + 16384);
     let c64_ = b.c_i32(64);
     let c32_ = b.c_i32(32);
     let tid_q = {
@@ -9682,6 +9685,18 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let a0 = b.add_i32(q_base, wq_off);
         b.add_i32(a0, lq32)
     };
+    let q0_addr0 = {
+        let a0 = b.add_i32(q0_base, wq_off);
+        b.add_i32(a0, lq32)
+    };
+    {
+        let c16_ = b.c_i32(16);
+        let q0_addr1 = b.add_i32(q0_addr0, c16_);
+        let g0 = b.frag4(cx.bq0_words[0], cx.bq0_words[1], cx.bq0_words[2], cx.bq0_words[3]);
+        let g1 = b.frag4(cx.bq0_words[4], cx.bq0_words[5], cx.bq0_words[6], cx.bq0_words[7]);
+        b.store_lds_b128(Opnd::Val(q0_addr0), Opnd::Val(g0));
+        b.store_lds_b128(Opnd::Val(q0_addr1), Opnd::Val(g1));
+    }
     {
         let c16_ = b.c_i32(16);
         let q_addr1 = b.add_i32(q_addr0, c16_);
@@ -9702,6 +9717,11 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let c16_ = b.c_i32(16);
         let a1 = b.add_i32(ones_addr, c16_);
         b.load_lds_b128x2(Opnd::Val(ones_addr), Opnd::Val(a1))
+    };
+    let load_q0 = |b: &mut FnBuilder| -> ValueId {
+        let c16_ = b.c_i32(16);
+        let a1 = b.add_i32(q0_addr0, c16_);
+        b.load_lds_b128x2(Opnd::Val(q0_addr0), Opnd::Val(a1))
     };
     let load_q1 = |b: &mut FnBuilder| -> ValueId {
         let c16_ = b.c_i32(16);
@@ -9739,7 +9759,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
-            let s0 = b.mfma_scale_fp8(k8_0, cx.b0, biasf, sk0, sq0m);
+            let qb0 = load_q0(b);
+            let s0 = b.mfma_scale_fp8(k8_0, qb0, biasf, sk0, sq0m);
             let qb1 = load_q1(b);
             out.push(b.mfma_scale_fp8(k8_1, qb1, s0, sk1, sq1m));
         }
@@ -9824,7 +9845,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
-            b.var_mfma_scale(s_vars[s], k8_0, cx.b0, sk0, sq0m);
+            let qb0 = load_q0(b);
+            b.var_mfma_scale(s_vars[s], k8_0, qb0, sk0, sq0m);
             let qb1 = load_q1(b);
             b.var_mfma_scale(s_vars[s], k8_1, qb1, sk1, sq1m);
         }
@@ -10107,7 +10129,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         let pad: i32 = std::env::var("FMHA_LDSPAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let cb = if fmha_t_opt("dma") && !vs_active() { 33280 } else { 256 * fmha_t_pitch() };
         // vendor-structure kernels: + a 2 KB block of E4M3 ones and 16 KB for the per-wave second Q fragment (vs128)
-        let vs_extra = if vs_active() { 2048 + 16384 } else { 0 };
+        let vs_extra = if vs_active() && name.ends_with("_vs128") { 2048 + 16384 + 16384 } else { 0 };
         b.lds((nbuf * cb + 2048 + 1024 + 1024 + pad + vs_extra) as u32);
     }
     b.arg("ptr_o", DType::Ptr, 0x000, 8);
@@ -10234,6 +10256,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     // Q fragments (B operand of S^T = K Q^T): same permuted K order as the K fragments
     let mut bq: Vec<ValueId> = Vec::with_capacity(2);
     let mut bq1_words: Vec<ValueId> = Vec::new();
+    let mut bq0_words: Vec<ValueId> = Vec::new();
     for c in 0..2u32 {
         let qp = b.ptr_add(ptr_q, q_off);
         let mut w: Vec<ValueId> = Vec::with_capacity(8);
@@ -10244,6 +10267,8 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         }
         if c == 1 {
             bq1_words = w.clone();
+        } else {
+            bq0_words = w.clone();
         }
         bq.push(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]));
     }
@@ -10474,6 +10499,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         trx,
         swzw,
         bq1_words,
+        bq0_words,
     };
     b.begin_if(is_a);
     if pp {
