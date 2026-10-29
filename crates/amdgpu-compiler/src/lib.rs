@@ -166,6 +166,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_pp" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_pp()),
         "fmha_fwd_hd128_mxfp8_sv" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_sv()),
         "fmha_fwd_hd128_mxfp8_vs" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vs()),
+        "fmha_fwd_hd128_mxfp8_vs128" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vs128()),
         "probe_dma" => Some(amdgpu_dsl::kernels::probe_dma()),
         "probe_dma_tile" => Some(amdgpu_dsl::kernels::probe_dma_tile()),
         "probe_dma_seq" => Some(amdgpu_dsl::kernels::probe_dma_seq()),
