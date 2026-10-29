@@ -8926,7 +8926,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let kd_raw = b.load_f32(kd_ptr, 0);
         b.bitcast_i32(kd_raw)
     };
+    let no_dma = ablate.contains("nodma");
     let dma_issue = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId| {
+        if no_dma {
+            return;
+        }
         let rb = b.add_i32(key0, rowb);
         let lbase = b.add_i32(lds_tile, buf_off);
         for q in 0..4i32 {
@@ -9053,8 +9057,11 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let kdp = if role_a { Some(vars[18]) } else { None };
     // deferred completion: the DMA of tile t+1 (issued one iteration ago) must have landed; this iteration's loads may stay in flight
     let n_vm: u8 = if role_a { 5 } else { 4 };
+    let no_vmwait = ablate.contains("novmwait");
     let stage_wait = |b: &mut FnBuilder, kdslot_n1: ValueId| {
-        b.wait_vm(n_vm);
+        if !no_vmwait {
+            b.wait_vm(n_vm);
+        }
         if let Some(kv) = kdp {
             let a = b.add_i32(kdb0, kdslot_n1);
             b.store_lds_b32(Opnd::Val(a), Opnd::Var(kv));
