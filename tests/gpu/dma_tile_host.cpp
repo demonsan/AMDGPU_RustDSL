@@ -21,6 +21,11 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(ho.data(), dout, n * 4, hipMemcpyDeviceToHost));
     int bad = 0;
     for (int i = 0; i < n; ++i) if (ho[i] != hi[i]) { if (bad++ < 12) std::printf("mismatch dword %d (byte %d): got 0x%x want 0x%x\n", i, 4 * i, ho[i], hi[i]); }
+    for (int r = 0; r < 16; ++r) {
+        int nb = 0; unsigned first = 0;
+        for (int i = 0; i < 256; ++i) if (ho[r * 256 + i] != hi[r * 256 + i]) { if (!nb) first = ho[r * 256 + i]; ++nb; }
+        if (nb) std::printf("run %2d (LDS byte %5d): %3d bad dwords; first got 0x%x => source run %d\n", r, r * 1024, nb, first, (int)((first - 0x10000) / 256));
+    }
     std::printf("DMA_TILE_PROBE %s (bad=%d of %d)\n", bad ? "FAIL" : "OK", bad, n);
     return bad ? 1 : 0;
 }
