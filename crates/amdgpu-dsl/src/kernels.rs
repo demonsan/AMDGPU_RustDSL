@@ -8034,6 +8034,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let rt_row4 = b.shl_i32(cx.rt_row, c2);
     let kdb0 = b.add_i32(lds_kd, rt_row4);
     let dma_l = fmha_t_opt("dma");
+    let dmakd = fmha_t_opt("dmakd");
     let dma = dma_l && !(role_a && fmha_t_opt("nodmak")) && !(!role_a && fmha_t_opt("nodmav"));
     // DMA staging (global -> LDS, no VGPRs, no ds_write). One wave instruction writes 1 KB to M0 + 16 lane in the order of the
     // lane addresses (the hardware lands the data in ADDRESS order, it ignores a lane permutation: an XOR swizzle is impossible),
@@ -8062,6 +8063,17 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let kd_w = b.shl_i32(w4_odd, c6);
     let kdl_w = b.shl_i32(w4_odd, c8);
     let dummy_lds = b.c_i32(nbuf_l * cbuf_i + 2048 + 1024);
+    // K scale dword of this thread's key row (staged with a plain load + ds_write when the dword DMA is not used)
+    let kd_row_load = |b: &mut FnBuilder, key0: ValueId| -> ValueId {
+        let srow_raw = b.add_i32(key0, cx.rt_row);
+        let srow_ok = b.cmp_lt_i32(srow_raw, cx.kv_len);
+        let srow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(srow_ok), a: Opnd::Val(srow_raw), b: Opnd::Val(cx.kv_last) });
+        let kd_row = b.mul_i32(srow, hq4);
+        let kd_off = b.add_i32(kd_row, cx.kd_base);
+        let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+        let kd_raw = b.load_f32(kd_ptr, 0);
+        b.bitcast_i32(kd_raw)
+    };
     let dma_issue = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId, kd_off: ValueId| {
         let rb = b.add_i32(key0, rowb);
         let lbase = b.add_i32(lds_tile, buf_off);
@@ -8082,7 +8094,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             last_sp = Some(sp);
             b.load_global_lds(sp, lbase, -(1040 * (3 - q)), 4);
         }
-        if role_a && kdlds {
+        if role_a && kdlds && dmakd {
             // K scale dwords of the tile's 128 keys: waves 0/1 (and 2/3 again, same data) fetch 64 keys each
             let k0 = b.add_i32(key0, kd_w);
             let kk = b.add_i32(k0, lane_v);
@@ -8142,8 +8154,12 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let kd_first: Vec<ValueId> = if kdpf { (0..4i32).map(|s| kd_load(b, key_first, s)).collect() } else { Vec::new() };
     let first = if dma { Vec::new() } else { stage_loads(b, key_first) };
     if dma {
+        let kd0 = if role_a && kdlds && !dmakd { Some(kd_row_load(b, key_first)) } else { None };
         dma_issue(b, key_first, c0, c0);
         b.wait_vm(0);
+        if let Some(kd) = kd0 {
+            b.store_lds_b32(Opnd::Val(kdb0), Opnd::Val(kd));
+        }
         if fmha_t_opt("dmasync") {
             b.barrier();
             b.wait_vm(0);
@@ -8250,6 +8266,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     } else {
         stage_loads(b, key_next)
     };
+    let kd_pending = if dma && role_a && kdlds && !dmakd { Some(kd_row_load(b, key_next)) } else { None };
     if dma {
         dma_issue(b, key_next, buf_nxt, kd_nxt);
     }
@@ -8419,6 +8436,9 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.end_if();
     if dma {
         b.wait_vm(0);
+        if let Some(kd) = kd_pending {
+            b.store_lds_b32(Opnd::Val(kdb_n), Opnd::Val(kd));
+        }
         if fmha_t_opt("dmasync") {
             b.barrier();
             b.wait_vm(0);
