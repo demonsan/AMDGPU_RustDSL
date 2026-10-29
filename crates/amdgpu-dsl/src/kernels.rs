@@ -9217,8 +9217,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let zi = b.bitcast_i32(z);
             let di = b.add_i32(zi, cmagic);
             let dfl = b.sub_f32(z, c2p23);
-            let ndf = b.sub_f32(zero_f, dfl);
-            let sc = b.exp2_f32(ndf);
+            // the to-fp8 scaled convert DIVIDES by the scale (OCP MX quantisation): scale = 2^+Delta
+            let sc = b.exp2_f32(dfl);
             let scb = b.add_i32(di, c123);
             (sc, scb)
         } else {
