@@ -1164,7 +1164,7 @@ pub fn probe_dma_kread() -> Function {
             let r128 = b.mul_i32(row, c128);
             let off = b.add_i32(r128, cb4);
             let sp = b.ptr_add(inp, off);
-            b.load_global_lds(sp, w1040, (4160 * q) as u32, 4);
+            b.load_global_lds(sp, w1040, 0, 4);
         }
     } else {
     for q in 0..4i32 {
@@ -1173,7 +1173,7 @@ pub fn probe_dma_kread() -> Function {
         let r128 = b.mul_i32(row, c128);
         let off = b.add_i32(r128, cbytes);
         let sp = b.ptr_add(inp, off);
-        b.load_global_lds(sp, w1024, (4096 * q) as u32, 4);
+        b.load_global_lds(sp, w1024, 0, 4);
     }
     }
     // trailing DMA (see emit_fmha_sv_role)
@@ -8048,10 +8048,17 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let w4_odd = b.let_(Op::AndI32(Opnd::Val(cx.wave4), Opnd::Val(c1)));
     let cbytes = b.shl_i32(lane_lo, c4);
     let w8s = b.shl_i32(lane_hi, c3);
-    let rowb = b.add_i32(w8s, cx.wave4);
-    let c1040 = b.c_i32(1040);
-    let w1040 = b.mul_i32(cx.wave4, c1040);
-    let lds_tile = b.add_i32(lds_base, w1040);
+    // wave w owns runs rho = 4 w + q (q = 0..3): rows (4 (w & 1) + q) + 8 s + 64 (w >> 1); one M0 per wave, the run offset 1040 q goes through the instruction offset
+    let w_hi = b.let_(Op::LshrI32(Opnd::Val(cx.wave4), Opnd::Val(c1)));
+    let w_hi64 = b.shl_i32(w_hi, c6);
+    let w_lo4 = b.shl_i32(w4_odd, c2);
+    let rw0 = b.add_i32(w8s, w_hi64);
+    let rowb = b.add_i32(rw0, w_lo4);
+    let c4160 = b.c_i32(4160);
+    let w4160 = b.mul_i32(cx.wave4, c4160);
+    let c3120 = b.c_i32(3120);
+    let w_top = b.add_i32(w4160, c3120);
+    let lds_tile = b.add_i32(lds_base, w_top);
     let kd_w = b.shl_i32(w4_odd, c6);
     let kdl_w = b.shl_i32(w4_odd, c8);
     let dummy_lds = b.c_i32(nbuf_l * cbuf_i + 2048 + 1024);
@@ -8060,17 +8067,20 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let lbase = b.add_i32(lds_tile, buf_off);
         let mut last_sp = None;
         for q in 0..4i32 {
-            // run rho = wave4 + 4 q: rows (wave4 + 4 (q & 1)) + 64 (q >> 1) + 8 s
-            let cq = b.c_i32(4 * (q & 1) + 64 * (q >> 1));
+            // run rho = 4 wave4 + q: row offset q within the wave's rows
+            let cq = b.c_i32(q);
             let row_raw = b.add_i32(rb, cq);
             let ok = b.cmp_lt_i32(row_raw, cx.kv_len);
             let row = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(row_raw), b: Opnd::Val(cx.kv_last) });
             let o0 = b.mul_i32(row, seqs);
             let o1 = b.add_i32(o0, base_off);
             let o2 = b.add_i32(o1, cbytes);
-            let sp = b.ptr_add(ptr, o2);
+            // the instruction offset (negative, -1040 (3 - q)) is added to the global address too: compensate
+            let comp = b.c_i32(1040 * (3 - q));
+            let o3 = b.add_i32(o2, comp);
+            let sp = b.ptr_add(ptr, o3);
             last_sp = Some(sp);
-            b.load_global_lds(sp, lbase, (4 * 1040 * q) as u32, 4);
+            b.load_global_lds(sp, lbase, -(1040 * (3 - q)), 4);
         }
         if role_a && kdlds {
             // K scale dwords of the tile's 128 keys: waves 0/1 (and 2/3 again, same data) fetch 64 keys each
@@ -8085,10 +8095,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let lq = b.add_i32(l0, kd_off);
             b.load_global_lds(kd_ptr, lq, 0, 1);
         }
-        // trailing DMA into a spare 1 KB region (a precaution: early experiments lost the last DMA of a wave's group)
-        if let Some(sp) = last_sp {
-            b.load_global_lds(sp, dummy_lds, 0, 4);
-        }
+        let _ = (last_sp, dummy_lds);
     };    let stage_loads = |b: &mut FnBuilder, key0: ValueId| -> Vec<ValueId> {
         let srow_raw = b.add_i32(key0, cx.rt_row);
         let srow_ok = b.cmp_lt_i32(srow_raw, cx.kv_len);

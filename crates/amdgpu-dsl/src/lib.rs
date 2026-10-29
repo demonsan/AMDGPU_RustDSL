@@ -365,7 +365,7 @@ pub enum Stmt {
     WaitVm { count: u8 },
     /// Global -> LDS DMA load (`global_load_lds_dwordx4` or `_dword`): lane i of the wave writes its 16 (4) bytes at
     /// `lds_addr + 16 i` (`+ 4 i`), `lds_addr` being wave-uniform; completion is tracked by `vmcnt` only.
-    LoadGlobalLds { base: Opnd, lds_addr: Opnd, byte_off: u32, dwords: u8 },
+    LoadGlobalLds { base: Opnd, lds_addr: Opnd, byte_off: i32, dwords: u8 },
     SetVar { var: VarId, value: Opnd },
     /// Multiply all sixteen dwords of a `Frag16` loop variable by an f32 scalar, in place.
     VarScaleF32 { var: VarId, scalar: Opnd },
@@ -988,7 +988,7 @@ impl FnBuilder {
         self.f.stmts.push(Stmt::WaitVm { count });
     }
     /// 16-byte (dwords = 4) or 4-byte (dwords = 1) global -> LDS DMA load; see `Stmt::LoadGlobalLds`.
-    pub fn load_global_lds(&mut self, base: impl Into<Opnd>, lds_addr: impl Into<Opnd>, byte_off: u32, dwords: u8) {
+    pub fn load_global_lds(&mut self, base: impl Into<Opnd>, lds_addr: impl Into<Opnd>, byte_off: i32, dwords: u8) {
         self.f.stmts.push(Stmt::LoadGlobalLds { base: base.into(), lds_addr: lds_addr.into(), byte_off, dwords });
     }
     pub fn set_prio(&mut self, prio: u8) {

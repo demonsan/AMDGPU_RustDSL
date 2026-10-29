@@ -796,7 +796,7 @@ impl Lowerer {
                         }
                     };
                     let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128 } else { MOp::GlobalLoadLdsB32 };
-                    // imm = LDS byte offset added to the base in M0 (the global offset is always 0)
+                    // imm = instruction offset: added to the global address AND to the LDS destination (M0 + imm + 16 lane)
                     self.push(MInst::new(mop).srcreg(rb).srcreg(sreg).imm(*byte_off as i64));
                 }
                 Stmt::SetPrio { prio } => {
