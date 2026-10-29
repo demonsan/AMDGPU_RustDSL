@@ -49,7 +49,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     // transposed kernel, bit-identical results (measured, docs/status.md round 44). AMDC_SCHED=0 turns it off.
     let sched_opts = match sched_opts {
         None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0")
-            && (f.name.starts_with("fmha_fwd_hd128_mxfp8_t") || f.name.starts_with("fmha_fwd_hd128_mxfp8_sv")) =>
+            && (f.name.starts_with("fmha_fwd_hd128_mxfp8_t") || f.name.starts_with("fmha_fwd_hd128_mxfp8_sv") || f.name.starts_with("fmha_fwd_hd128_mxfp8_vs")) =>
         {
             // "ld" preset: scoreboard (partial) waits + ds_read hoisting, no instruction reordering. Measured best on the
             // merged tree (docs/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
