@@ -7737,7 +7737,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let lq = b.add_i32(l0, cl);
             b.load_global_lds(sp, lq, 0, 4);
         }
-        if role_a {
+        if role_a && kdlds {
             // K scale dwords of the tile's 128 keys: waves 0/1 (and 2/3 again, same data) fetch 64 keys each
             let k0 = b.add_i32(key0, kd_w);
             let kk = b.add_i32(k0, lane_v);
@@ -8128,6 +8128,9 @@ fn fmha_t_opt(name: &str) -> bool {
     let v = std::env::var("FMHA_OPT").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "cvt4,pksub,lazy,msum,permlane".to_string());
     let has = |n: &str| v.split(',').any(|x| x == n);
     // DMA staging needs the K scales in LDS and the two-buffer ring
+    if name == "kdlds" && has("nokd") {
+        return false;
+    }
     has(name) || (has("dma") && (name == "dbuf" || name == "kdlds"))
 }
 
