@@ -1093,7 +1093,7 @@ pub fn probe_dma_seq() -> Function {
 pub fn probe_dma_kread() -> Function {
     // PD_SWZ: 0/empty = row-major, 1 = 3-bit XOR swizzle, 2 = 2-bit XOR swizzle
     let swz_mode: u32 = std::env::var("PD_SWZ").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let swz = swz_mode != 0;
+    let swz = swz_mode != 0 && swz_mode != 4;
     let fmask: i32 = if swz_mode == 2 { 3 } else { 7 };
     let mut b = FnBuilder::new("probe_dma_kread", 256);
     b.lds(20000);
@@ -1142,6 +1142,24 @@ pub fn probe_dma_kread() -> Function {
             b.store_lds_b128(Opnd::Val(la), Opnd::Val(d));
         }
     } else {
+    if swz_mode == 4 {
+        // vendor-style runs: run rho = wave + 4 q holds rows (rho & 7) + 8 s + 64 (rho >> 3) at LDS 1040 rho
+        let cb4 = b.shl_i32(lane_lo, c4);
+        let s8 = b.shl_i32(lane_hi, c3);
+        let rb4 = b.add_i32(s8, wave);
+        let c1040 = b.c_i32(1040);
+        let w1040 = b.mul_i32(wave, c1040);
+        for q in 0..4i32 {
+            let cq = b.c_i32(4 * (q & 1) + 64 * (q >> 1));
+            let row = b.add_i32(rb4, cq);
+            let r128 = b.mul_i32(row, c128);
+            let off = b.add_i32(r128, cb4);
+            let sp = b.ptr_add(inp, off);
+            let cl = b.c_i32(4160 * q);
+            let l = b.add_i32(w1040, cl);
+            b.load_global_lds(sp, l, 0, 4);
+        }
+    } else {
     for q in 0..4i32 {
         let cq = b.c_i32(32 * q);
         let row = b.add_i32(rowb, cq);
@@ -1151,6 +1169,7 @@ pub fn probe_dma_kread() -> Function {
         let cl = b.c_i32(4096 * q);
         let l = b.add_i32(w1024, cl);
         b.load_global_lds(sp, l, 0, 4);
+    }
     }
     // trailing DMA (see emit_fmha_sv_role)
     {
@@ -1187,11 +1206,22 @@ pub fn probe_dma_kread() -> Function {
     let fk = if swz && swz_mode != 3 { f0 } else { zero };
     let x = b.xor_i32(g, fk);
     let t64 = b.shl_i32(tid, c6);
+    // mode 4 base: ((R & 7) + 8 (R >> 6)) 1040 + ((R >> 3) & 7) 128 with R = j + 32 wave
+    let r_u = b.let_(Op::AndI32(Opnd::Val(rowk), Opnd::Val(c7)));
+    let r_h = b.let_(Op::LshrI32(Opnd::Val(rowk), Opnd::Val(c6)));
+    let r_h8 = b.shl_i32(r_h, c3);
+    let r_uh = b.add_i32(r_u, r_h8);
+    let c1040r = b.c_i32(1040);
+    let r_a = b.mul_i32(r_uh, c1040r);
+    let r_s0 = b.let_(Op::LshrI32(Opnd::Val(rowk), Opnd::Val(c3)));
+    let r_s = b.let_(Op::AndI32(Opnd::Val(r_s0), Opnd::Val(c7)));
+    let r_s128 = b.mul_i32(r_s, c128);
+    let base4 = b.add_i32(r_a, r_s128);
     for k in 0..4i32 {
         let c2k = b.c_i32(2 * k);
         let xk = b.xor_i32(x, c2k);
         let xs = b.shl_i32(xk, c4);
-        let a = b.add_i32(jrow, xs);
+        let a = if swz_mode == 4 { b.add_i32(base4, xs) } else { b.add_i32(jrow, xs) };
         let v = b.load_lds_b128(Opnd::Val(a));
         let ob = b.c_i32(16 * k);
         let o1 = b.add_i32(t64, ob);
