@@ -112,6 +112,9 @@ pub enum MOp {
     GlobalLoadU16,
     GlobalLoadF32,
     GlobalLoadB128,
+    /// Global -> LDS DMA (M0 = LDS base from srcs[1], an S1 register): srcs: ptr (V2), lds base (S1); imm = byte offset.
+    GlobalLoadLdsB128,
+    GlobalLoadLdsB32,
     GlobalStoreU16,
     GlobalStoreF32,
     // scalar ALU / memory

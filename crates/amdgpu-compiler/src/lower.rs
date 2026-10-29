@@ -775,6 +775,18 @@ impl Lowerer {
                 Stmt::Barrier => {
                     self.push(MInst::new(MOp::SBarrier));
                 }
+                Stmt::WaitVm { count } => {
+                    self.push(MInst::new(MOp::SWaitVm).imm(*count as i64));
+                }
+                Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
+                    let rb = self.as_v2(*base)?;
+                    let lv = self.as_v1(*lds_addr)?;
+                    self.touch(&[Src::Reg(rb), Src::Reg(lv)]);
+                    let sreg = self.new_vreg(RClass::S1);
+                    self.push(MInst::new(MOp::VReadFirstLane).def(sreg).srcreg(lv));
+                    let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128 } else { MOp::GlobalLoadLdsB32 };
+                    self.push(MInst::new(mop).srcreg(rb).srcreg(sreg).imm(*byte_off as i64));
+                }
                 Stmt::SetPrio { prio } => {
                     self.push(MInst::new(MOp::SSetPrio).imm(*prio as i64));
                 }

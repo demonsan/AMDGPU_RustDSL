@@ -361,6 +361,11 @@ pub enum Stmt {
     Barrier,
     /// `s_setprio`: wave issue priority 0..3.
     SetPrio { prio: u8 },
+    /// `s_waitcnt vmcnt(count)`: wait until at most `count` global/LDS-DMA loads are outstanding.
+    WaitVm { count: u8 },
+    /// Global -> LDS DMA load (`global_load_lds_dwordx4` or `_dword`): lane i of the wave writes its 16 (4) bytes at
+    /// `lds_addr + 16 i` (`+ 4 i`), `lds_addr` being wave-uniform; completion is tracked by `vmcnt` only.
+    LoadGlobalLds { base: Opnd, lds_addr: Opnd, byte_off: u32, dwords: u8 },
     SetVar { var: VarId, value: Opnd },
     /// Multiply all sixteen dwords of a `Frag16` loop variable by an f32 scalar, in place.
     VarScaleF32 { var: VarId, scalar: Opnd },
@@ -454,6 +459,12 @@ impl Function {
                 }
                 Stmt::SetPrio { prio } => {
                     let _ = writeln!(s, "{pad}setprio {prio}");
+                }
+                Stmt::WaitVm { count } => {
+                    let _ = writeln!(s, "{pad}waitvm({count})");
+                }
+                Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
+                    let _ = writeln!(s, "{pad}dma{} lds[{lds_addr:?}] <- [{base:?}+{byte_off}]", dwords * 4);
                 }
                 Stmt::SetVar { var, value } => {
                     let _ = writeln!(s, "{pad}var{} <- {value:?}", var.0);
@@ -973,6 +984,13 @@ impl FnBuilder {
     }
 
     /// `s_barrier`.
+    pub fn wait_vm(&mut self, count: u8) {
+        self.f.stmts.push(Stmt::WaitVm { count });
+    }
+    /// 16-byte (dwords = 4) or 4-byte (dwords = 1) global -> LDS DMA load; see `Stmt::LoadGlobalLds`.
+    pub fn load_global_lds(&mut self, base: impl Into<Opnd>, lds_addr: impl Into<Opnd>, byte_off: u32, dwords: u8) {
+        self.f.stmts.push(Stmt::LoadGlobalLds { base: base.into(), lds_addr: lds_addr.into(), byte_off, dwords });
+    }
     pub fn set_prio(&mut self, prio: u8) {
         self.f.stmts.push(Stmt::SetPrio { prio });
     }
@@ -1409,7 +1427,18 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::WaitVm { .. } => {}
+            Stmt::LoadGlobalLds { base, lds_addr, dwords, .. } => {
+                if let Err(e) = expect_ptr(f, *base, "dma base") {
+                    errs.push(here(e));
+                }
+                if let Err(e) = expect_int(f, *lds_addr, "dma lds address") {
+                    errs.push(here(e));
+                }
+                if *dwords != 1 && *dwords != 4 {
+                    errs.push(here("dma: dwords must be 1 or 4".to_string()));
+                }
+            }
             Stmt::SetVar { var, value } => {
                 // Any enclosing loop's variable may be updated; an inner loop can
                 // therefore update an outer loop's accumulator.
