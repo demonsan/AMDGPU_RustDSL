@@ -466,6 +466,59 @@ impl Lowerer {
         true
     }
 
+    /// If `ops` are lanes 0..3 (in order) of one V4 value that is only used through these four lane reads and whose last
+    /// writer in the current block is a 128-bit load, retarget that load into dwords `base..base+4` of the fragment `v`.
+    fn fold_lane_group(&mut self, v: VReg, base: u8, ops: &[Opnd]) -> bool {
+        let mut x: Option<ValueId> = None;
+        for (k, o) in ops.iter().enumerate() {
+            let Opnd::Val(ov) = o else { return false };
+            if self.use_counts.get(ov).copied() != Some(1) {
+                return false;
+            }
+            match self.defs.get(ov) {
+                Some(Op::Frag16Lane { frag: Opnd::Val(fx), index }) if *index as usize == k => {
+                    if x.map_or(false, |p| p != *fx) {
+                        return false;
+                    }
+                    x = Some(*fx);
+                }
+                _ => return false,
+            }
+        }
+        let Some(x) = x else { return false };
+        if self.use_counts.get(&x).copied() != Some(4) {
+            return false;
+        }
+        let Some(&t) = self.val.get(&x) else { return false };
+        if self.mir.vreg_class(t) != RClass::V4 || self.mir.alias.contains_key(&t) {
+            return false;
+        }
+        let insts = &self.mir.blocks[self.cur].insts;
+        let mut at = None;
+        for (k, inst) in insts.iter().enumerate().rev() {
+            if inst.dst == Some(t) {
+                if !matches!(inst.op, MOp::LdsReadB128) {
+                    return false;
+                }
+                at = Some(k);
+                break;
+            }
+            if inst.uses().contains(&t) {
+                return false;
+            }
+        }
+        let Some(at) = at else { return false };
+        let part = self.alias_vreg(v, base, RClass::V4);
+        self.mir.blocks[self.cur].insts[at].dst = Some(part);
+        let (old, new) = (self.mir.canon(t), self.mir.canon(v));
+        for p in self.pending_lds.iter_mut().chain(self.pending_vmem.iter_mut()) {
+            if *p == old {
+                *p = new;
+            }
+        }
+        true
+    }
+
     /// Bit pattern of a constant operand (integer or f32), for in-line operands.
     /// `base` = `PtrAdd{ scalar kernarg pointer, vector byte offset }`: (scalar pair, 32-bit vector offset) for the SADDR form.
     fn saddr_parts(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
@@ -1802,7 +1855,23 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }            Op::Frag8(a, b, c, d, e, f, g, h) => {
                 let v = self.new_vreg(RClass::V8);
-                for (i, o) in [*a, *b, *c, *d, *e, *f, *g, *h].into_iter().enumerate() {
+                let ops8 = [*a, *b, *c, *d, *e, *f, *g, *h];
+                // `foldq`: four consecutive lanes that are exactly the four lanes of one just-loaded V4 are not copied; the load
+                // writes the half of the fragment directly
+                let mut folded = [false; 8];
+                if opt_on("foldq") {
+                    for half in 0..2usize {
+                        if self.fold_lane_group(v, (half * 4) as u8, &ops8[half * 4..half * 4 + 4]) {
+                            for k in 0..4 {
+                                folded[half * 4 + k] = true;
+                            }
+                        }
+                    }
+                }
+                for (i, o) in ops8.into_iter().enumerate() {
+                    if folded[i] {
+                        continue;
+                    }
                     let al = self.alias_vreg(v, i as u8, RClass::V1);
                     let retargeted = match o {
                         Opnd::Val(ov) => self.retarget_producer(ov, al),
