@@ -1685,8 +1685,8 @@ fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
 
 /// Semantics of loop variables: a read of a loop variable (`Opnd::Var`) **after a `set_var` of the same variable in
 /// the same iteration** is easy to get wrong - the author usually expects the value just written, but the variable is
-/// a loop-carried (phi-like) value that is defined to hold the value from the *start* of the iteration; use a plain SSA
-/// value (the operand you passed to `set_var`) for intra-iteration producer/consumer pairs.
+/// loop-carried state whose value after a `set_var` is not guaranteed by the contract (docs/verification.md); use a
+/// plain SSA value (the operand you passed to `set_var`) for intra-iteration producer/consumer pairs.
 /// This lint reports such reads conservatively (a `set_var` inside an `if` counts). Cross-iteration reads (read before
 /// the `set_var`, the common case), reads of the loop condition value held in an SSA value, and reads after the loop are
 /// not reported. Kernels that really intend this can call `FnBuilder::allow_var_rereads()`.
@@ -1706,7 +1706,7 @@ pub fn lint(f: &Function) -> Vec<String> {
                 if let Some(l) = stack.iter().rev().find(|l| l.vars.contains(&v)) {
                     if l.set_so_far.contains(&v) {
                         out.push(format!(
-                            "stmt {idx}: loop variable var{} is read after set_var(var{}) in the same iteration; the read does not see the value just written (loop variables hold the iteration-start value) - use the SSA value passed to set_var",
+                            "stmt {idx}: loop variable var{} is read after set_var(var{}) in the same iteration; the value of such a read is not defined by the DSL contract (the lowering usually returns the value just written, other paths can return the iteration-start value) - use the SSA value passed to set_var",
                             v.0, v.0
                         ));
                     }
