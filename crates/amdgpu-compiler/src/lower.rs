@@ -1437,6 +1437,17 @@ impl Lowerer {
             Op::AddI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAddU32, *a, *b)?,
             Op::MulI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SMulI32, *a, *b)?,
             Op::ShlI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SShlB32, *a, *b)?,
+            Op::LshrI32(Opnd::Val(a), b) if self.uniform.contains(&dst) && matches!(self.defs.get(a), Some(Op::WorkitemId)) => {
+                // wave id: v_lshr then one v_readfirstlane into an SGPR (the value is the same in every lane of the wave)
+                let k = self.const_bits(*b).ok_or("wave id shift must be constant")?;
+                let tid = self.as_v1(Opnd::Val(*a))?;
+                self.touch(&[Src::Reg(tid)]);
+                let t = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VLshrB32).def(t).src(Src::Imm(k)).srcreg(tid));
+                let s = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(t));
+                self.val.insert(dst, s);
+            }
             Op::LshrI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SLshrB32, *a, *b)?,
             Op::AndI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAndB32, *a, *b)?,
             Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
@@ -2530,6 +2541,8 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
     }
     loop {
         let mut u: HashSet<ValueId> = HashSet::new();
+        let mut wi: HashSet<ValueId> = HashSet::new(); // workitem id values (waveuni)
+        let mut cst: HashMap<ValueId, i64> = HashMap::new();
         let is_u = |o: &Opnd, u: &HashSet<ValueId>, uvars: &HashSet<amdgpu_dsl::VarId>| match o {
             Opnd::I32(_) => true,
             Opnd::Val(v) => u.contains(v),
@@ -2540,8 +2553,20 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
         for st in &f.stmts {
             match st {
                 Stmt::Let { dst, op } => {
+                    if matches!(op, Op::WorkitemId) {
+                        wi.insert(*dst);
+                    }
+                    if let Op::ConstI32(k) = op {
+                        cst.insert(*dst, *k as i64);
+                    }
                     let uni = match op {
                         Op::ConstI32(_) | Op::KernargI32 { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
+                        // waveuni: `workitem_id >> k` (k >= 6) is constant within a 64-lane wave (1-D workgroups)
+                        Op::LshrI32(Opnd::Val(a), b) if wi.contains(a) && opt_on("waveuni") => match b {
+                            Opnd::I32(k) => *k >= 6,
+                            Opnd::Val(v) => cst.get(v).map_or(false, |k| *k >= 6),
+                            _ => false,
+                        },
                         Op::AddI32(a, b) | Op::MulI32(a, b) | Op::ShlI32(a, b) | Op::LshrI32(a, b) | Op::AndI32(a, b) | Op::XorI32(a, b) => {
                             is_u(a, &u, &uvars) && is_u(b, &u, &uvars)
                         }
