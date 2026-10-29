@@ -203,6 +203,41 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
         }
     }
 
+    // --- precise live segments (instruction-level liveness, holes included) -----------------------------------
+    // Used by the two-phase policy: a register may be reused inside a hole of another value's live range.
+    let mut segs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    if matches!(policy, Policy::TwoPhase) {
+        for (bi, b) in m.blocks.iter().enumerate() {
+            if b.insts.is_empty() {
+                continue;
+            }
+            let first = idx_of[bi][0];
+            let last = *idx_of[bi].last().unwrap();
+            let mut open: std::collections::HashMap<VReg, usize> = std::collections::HashMap::new();
+            for r in &live_out[bi] {
+                open.insert(*r, last);
+            }
+            for i in (0..b.insts.len()).rev() {
+                let at = idx_of[bi][i];
+                let inst = &b.insts[i];
+                if let Some(d) = inst.dst {
+                    let d = m.canon(d);
+                    match open.remove(&d) {
+                        Some(e) => segs[d as usize].push((at, e)),
+                        None => segs[d as usize].push((at, at)),
+                    }
+                }
+                for r in inst.uses() {
+                    let r = m.canon(r);
+                    open.entry(r).or_insert(at);
+                }
+            }
+            for (r, e) in open {
+                segs[r as usize].push((first, e));
+            }
+        }
+    }
+
     // --- linear scan -------------------------------------------------
     let mut phys = vec![u32::MAX; n];
     let mut used_v = vec![false; VGPR_COUNT];
@@ -236,15 +271,17 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
         for i in 0..V_RESERVED {
             occ[i].push((0, usize::MAX));
         }
+        let seg_len = |r: VReg| -> usize { segs[r as usize].iter().map(|(a, b)| b - a + 1).sum() };
         let mut order: Vec<(usize, usize, VReg, RClass)> = vregs.clone();
-        order.sort_by_key(|x| (std::cmp::Reverse(x.3.dwords()), std::cmp::Reverse(x.1 - x.0), x.0));
+        order.sort_by_key(|x| (std::cmp::Reverse(x.3.dwords()), std::cmp::Reverse(seg_len(x.2)), x.0));
         for (s, e, r, c) in order {
+            let my: Vec<(usize, usize)> = if segs[r as usize].is_empty() { vec![(s, e)] } else { segs[r as usize].clone() };
             let width = c.dwords() as usize;
             let lo = if width == 1 { V_RESERVED } else { width };
             let mut found = None;
             let mut i = lo;
             while i + width <= VGPR_COUNT {
-                if i % width == 0 && (0..width).all(|k| occ[i + k].iter().all(|(os, oe)| *oe < s || e < *os)) {
+                if i % width == 0 && (0..width).all(|k| occ[i + k].iter().all(|(os, oe)| my.iter().all(|(ms, me)| *oe < *ms || *me < *os))) {
                     found = Some(i);
                     break;
                 }
@@ -269,13 +306,13 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
                 format!("out of VGPRs allocating r{r} ({c:?}, live {s}..{e}) in the two-phase packing; peak live dwords {peak} at position {at} (limit {VGPR_COUNT})")
             })?;
             for k in 0..width {
-                occ[slot + k].push((s, e));
+                occ[slot + k].extend(my.iter().copied());
             }
             phys[r as usize] = slot as u32;
             max_v = max_v.max(slot + width);
         }
         for (i, o) in occ.iter().enumerate() {
-            if o.iter().any(|x| x.1 != usize::MAX || i < V_RESERVED) {
+            if !o.is_empty() {
                 used_v[i] = true;
             }
         }
