@@ -33,4 +33,5 @@ g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/smfmac_host.cpp -o build/smf
     -I"$HIPROOT/include" -L"$HIPROOT/lib" -lamdhip64 -Wl,-rpath,"$HIPROOT/lib" || exit 1
 
 echo "[smfmac] run"
-SLOTS="${SLOTS:-16}" ./build/smfmac_host "$OUT/probe_smfmac_ones.co" "$SLOTS"
+SLOTS="${SLOTS:-16}"
+./build/smfmac_host "$OUT/probe_smfmac_ones.co" "$SLOTS"
