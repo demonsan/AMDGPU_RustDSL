@@ -9787,7 +9787,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // smfrs: row sums with 4 v_smfmac_f32_16x16x128_fp8_fp8 per 128 keys (2 P halves x 2 complementary index patterns), per-lane A (vendor-spec 4.5.3,
     // hardware verified by kernel-occ): D dword 2 = 16 x the msum result of the lane's own query; the sum is a scalar F32 loop variable
-    let smfrs = fmha_t_opt("smfrs") || !fmha_t_opt("nosmfrs");
+    let smfv = fmha_t_opt("smfv"); // smfv: the four smfmacs accumulate in place into a Frag4 LOOP VARIABLE (dword 2 = 16 x row sum), no per-unit zero/extract/add
+    let smfrs = smfv || fmha_t_opt("smfrs");
     let c4k = b.c_i32(4);
     let a_rs = {
         let b0k = b.let_(Op::AndI32(Opnd::Val(lane_q), Opnd::Val(c3d)));
@@ -9859,6 +9860,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     if !no_bar {
         b.barrier(); // A: P1, B: P2
     }
+    let zero4v = b.frag_zero(DType::Frag4);
     let mut init_vars = vec![
         (DType::I32, Opnd::Val(c0)),          // 0 it
         (DType::Frag2, Opnd::Val(bias_init)), // 1 bias word
@@ -9870,7 +9872,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (DType::Frag16, Opnd::Val(s_init[1])),
         (DType::Frag16, Opnd::Val(s_init[2])),
         (DType::Frag16, Opnd::Val(s_init[3])),
-        if smfrs { (DType::I32, Opnd::Val(c0)) } else { (DType::Frag16, Opnd::Val(zero)) }, // 10 row sums (smfrs: scalar f32 bits)
+        if smfv { (DType::Frag4, Opnd::Val(zero4v)) } else if smfrs { (DType::I32, Opnd::Val(c0)) } else { (DType::Frag16, Opnd::Val(zero)) }, // 10 row sums
         (DType::I32, Opnd::Val(c0)),          // 11 ring index (tile mod 3)
     ];
     let vars = b.begin_loop(&init_vars);
@@ -10082,7 +10084,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     b.var_scale_pk(o_vars[e], cd);
                 }
             }
-            if smfrs {
+            if smfv {
+                b.var_scale_lane(la, 2, corr);
+            } else if smfrs {
                 let lf = b.bitcast_f32(Opnd::Var(la));
                 let ls = b.mul_f32(lf, corr);
                 let lsi = b.bitcast_i32(ls);
@@ -10140,6 +10144,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let smford = fmha_t_opt("smford");
         let smf2 = fmha_t_opt("smf2");
         let chain = |b: &mut FnBuilder, pa: ValueId, pb: ValueId| {
+            if smfv {
+                b.var_smfmac_fp8(la, a_rs, pa, idx01);
+                b.var_smfmac_fp8(la, a_rs, pb, idx01);
+                b.var_smfmac_fp8(la, a_rs, pa, idx23);
+                b.var_smfmac_fp8(la, a_rs, pb, idx23);
+                return;
+            }
             let lu = if smf2 {
                 let z4 = b.frag_zero(DType::Frag4);
                 let z4b = b.frag_zero(DType::Frag4);
@@ -10300,7 +10311,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.end_if();
         }
     }    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
-    let l_tot = if smfrs {
+    let l_tot = if smfv {
+        let d2 = b.frag4_lane(la, 2);
+        let lf = b.bitcast_f32(d2);
+        let c0625 = b.c_f32(0.0625);
+        b.mul_f32(lf, c0625)
+    } else if smfrs {
         let lf = b.bitcast_f32(Opnd::Var(la));
         let c0625 = b.c_f32(0.0625);
         b.mul_f32(lf, c0625)
