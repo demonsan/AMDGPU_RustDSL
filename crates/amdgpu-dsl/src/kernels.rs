@@ -9706,9 +9706,39 @@ pub fn probe_smfmac_ones() -> Function {
     let s18c = b.smfmac_fp8_16x16x128(a_ones, p2, i01, s18b);
     let s18 = b.smfmac_fp8_16x16x128(a_ones, p2, i23, s18c);
 
+    // 19/20: is the 4th D dword written at all? Pre-initialise the accumulator to a known value
+    //        (1000.0f) and check that a single smfmac adds exactly 64 (ones A/B) to every dword.
+    let k1000 = b.c_i32(0x447A0000u32 as i32);
+    let acc19 = b.frag4(k1000, k1000, k1000, k1000);
+    let s19 = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc19);
+    let acc20 = b.frag4(k1000, k1000, k1000, k1000);
+    let s20a = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc20);
+    let s20 = b.smfmac_fp8_16x16x128(a_ones, b_ones, i23, s20a);
+    // 23-26: row-sum mapping with a *lane-dependent* P (even lanes 1.0, odd lanes 2.0), so the row
+    //        sums differ and a wrong P-half/index pairing shows up. 23 = msum reference.
+    let c1i = b.c_i32(1);
+    let oddbit = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c1i)));
+    let lane_is_even = b.cmp_lt_i32(oddbit, c1i);
+    let lane_val = b.let_(Op::Select { ty: DType::I32, cond: lane_is_even.into(), a: m1.into(), b: m2.into() });
+    let pv = b.frag8(lane_val, lane_val, lane_val, lane_val, lane_val, lane_val, lane_val, lane_val);
+    let m23 = b.mfma_scale_fp8(ones8, pv, z16, c127, c127);
+    let m23b = b.mfma_scale_fp8(ones8, pv, m23, c127, c127);
+    let s24a = b.smfmac_fp8_16x16x128(a_ones, pv, i01, c0);
+    let s24 = b.smfmac_fp8_16x16x128(a_ones, pv, i23, s24a);
+    let s25a = b.smfmac_fp8_16x16x128(a_ones, pv, i01, c0);
+    let s25 = b.smfmac_fp8_16x16x128(a_ones, pv, i01, s25a);
+    let s26a = b.smfmac_fp8_16x16x128(a_ones, pv, i01, c0);
+    let s26 = b.smfmac_fp8_16x16x128(a_ones, pv, i01, s26a);
+
     for (e, d) in results.iter().enumerate() {
         probe_smfmac_dump(&mut b, base, e, *d);
     }
+    probe_smfmac_dump(&mut b, base, 19, s19);
+    probe_smfmac_dump(&mut b, base, 20, s20);
+    probe_smfmac_dump16(&mut b, base, 23, m23b);
+    probe_smfmac_dump(&mut b, base, 24, s24);
+    probe_smfmac_dump(&mut b, base, 25, s25);
+    probe_smfmac_dump(&mut b, base, 26, s26);
     probe_smfmac_dump16(&mut b, base, 14, msum);
     probe_smfmac_dump(&mut b, base, 15, s15);
     probe_smfmac_dump(&mut b, base, 16, s16);
