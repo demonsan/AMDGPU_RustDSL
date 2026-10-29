@@ -9023,7 +9023,27 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let smf = fmha_t_opt("smf");
     assert!(!(smf && svscale), "smf (smfmac row sums) has no scale operand: it cannot carry svscale");
     let ones8 = b.frag8(ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w);
-    let a_ones = b.frag4(ones_w, ones_w, ones_w, ones_w);
+    // smfmac D[m][n] = sum over the K blocks (lane groups n, n+16, n+32, n+48 of B) selected by row m of A. Our P has query = lane % 32 and the two
+    // K halves in lanes 0..31 / 32..63, so D lane L must sum only the lane groups of its own query: rows 4 (L/16) .. +3 take blocks {0,2} when
+    // (L/16 + (m/4)) is even... i.e. A is per lane: lane L (row m = L % 16, block kb = L / 16) holds ones iff (m / 4 + kb) is even.
+    let a_ones = {
+        let c15 = b.c_i32(15);
+        let c4i = b.c_i32(4);
+        let c2i = b.c_i32(2);
+        let cm1_ = b.c_i32(-1);
+        let lane_a = {
+            let t8 = b.shl_i32(cx.g4, c3d);
+            b.add_i32(cx.j, t8)
+        };
+        let mrow = b.let_(Op::AndI32(Opnd::Val(lane_a), Opnd::Val(c15)));
+        let kb = b.let_(Op::LshrI32(Opnd::Val(lane_a), Opnd::Val(c4i)));
+        let g = b.let_(Op::LshrI32(Opnd::Val(mrow), Opnd::Val(c2i)));
+        let gk = b.add_i32(g, kb);
+        let par1 = b.let_(Op::AndI32(Opnd::Val(gk), Opnd::Val(c1)));
+        let msk = b.add_i32(par1, cm1_); // parity 0 -> 0xffffffff, parity 1 -> 0
+        let w = b.let_(Op::AndI32(Opnd::Val(msk), Opnd::Val(ones_w)));
+        b.frag4(w, w, w, w)
+    };
     let idx01 = b.c_i32(0x4444_4444_u32 as i32);
     let idx23 = b.c_i32(0xeeee_eeee_u32 as i32);
     let zero4 = b.frag_zero(DType::Frag4);
