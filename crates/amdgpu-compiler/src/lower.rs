@@ -1011,6 +1011,14 @@ impl Lowerer {
                         self.push(MInst::new(MOp::SMovB32).def(dst).src(s));
                         continue;
                     }
+                    if class == RClass::V16 && opt_on("zeroinit") && matches!(value, Opnd::Val(v) if matches!(self.defs.get(v), Some(Op::FragZero { ty: DType::Frag16 }))) {
+                        // zero accumulator: zero the variable's own register instead of building a zero tuple and copying it
+                        let zero = self.const_vreg(0);
+                        for i in 0..16 {
+                            self.push(MInst::new(MOp::VWriteSub).def(dst).srcreg(zero).imm(i as i64));
+                        }
+                        continue;
+                    }
                     let src = match class {
                         RClass::V1 => self.as_v1(*value)?,
                         RClass::V2 => self.as_v2(*value)?,
@@ -1127,6 +1135,13 @@ impl Lowerer {
                                 self.touch(&[Src::Reg(x)]);
                             }
                             self.push(MInst::new(MOp::SMovB32).def(r).src(s));
+                            continue;
+                        }
+                        if class == RClass::V16 && opt_on("zeroinit") && matches!(init[i], Opnd::Val(v) if matches!(self.defs.get(&v), Some(Op::FragZero { ty: DType::Frag16 }))) {
+                            let zero = self.const_vreg(0);
+                            for k in 0..16 {
+                                self.push(MInst::new(MOp::VWriteSub).def(r).srcreg(zero).imm(k as i64));
+                            }
                             continue;
                         }
                         let src = match class {
@@ -1859,10 +1874,6 @@ impl Lowerer {
                 // `foldq`: four consecutive lanes that are exactly the four lanes of one just-loaded V4 are not copied; the load
                 // writes the half of the fragment directly
                 let mut folded = [false; 8];
-                if std::env::var("AMDC_FOLDQ_DEBUG").map(|x| !x.is_empty()).unwrap_or(false) {
-                    let d: Vec<String> = ops8.iter().map(|o| match o { Opnd::Val(ov) => format!("{}:uses{:?}", self.defs.get(ov).map(|d| format!("{d:?}").chars().take(40).collect::<String>()).unwrap_or_default(), self.use_counts.get(ov)), other => format!("{other:?}") }).collect();
-                    eprintln!("FRAG8 {}", d.join(" | "));
-                }
                 if opt_on("foldq") {
                     for half in 0..2usize {
                         if self.fold_lane_group(v, (half * 4) as u8, &ops8[half * 4..half * 4 + 4]) {
