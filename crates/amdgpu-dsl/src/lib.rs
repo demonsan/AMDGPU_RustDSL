@@ -365,6 +365,8 @@ pub enum Stmt {
     VarLoadB128 { var: VarId, base: Opnd, byte_off: u32 },
     /// `var = scaled_mfma_32x32x64_fp8(a, b, var)`: accumulate into a loop variable in place.
     VarMfmaScale { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
+    /// `var = scaled_mfma_32x32x64_fp8(a, b)` with a zero accumulator (overwrites the variable).
+    VarMfmaScaleZ { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
     BeginLoop { vars: Vec<VarId>, init: Vec<Opnd> },
     BreakIf { cond: Opnd },
     EndLoop,
@@ -453,6 +455,9 @@ impl Function {
                 }
                 Stmt::VarLoadB128 { var, base, byte_off } => {
                     let _ = writeln!(s, "{pad}var{} <- load128 [{base:?}+{byte_off}]", var.0);
+                }
+                Stmt::VarMfmaScaleZ { var, a, b, scale_a, scale_b } => {
+                    let _ = writeln!(s, "{pad}var{} = mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
                 }
                 Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
                     let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
@@ -888,6 +893,9 @@ impl FnBuilder {
     }
     pub fn cvt_pk_fp8x4_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPkFp8x4F32(a.into(), b.into(), c.into(), d.into()))
+    }
+    pub fn var_mfma_scale_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::VarMfmaScaleZ { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
     }
     pub fn var_scale_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::VarScalePk { var, pair: pair.into() });
@@ -1426,6 +1434,11 @@ pub fn verify(f: &Function) -> Vec<String> {
                     if t != DType::Frag2 {
                         errs.push(here(format!("var scale pair: expected frag2, found {}", t.name())));
                     }
+                }
+            }
+            Stmt::VarMfmaScaleZ { var, .. } => {
+                if f.var_ty(*var) != Some(DType::Frag16) {
+                    errs.push(here(format!("var{var} must be a frag16 accumulator")));
                 }
             }
             Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {

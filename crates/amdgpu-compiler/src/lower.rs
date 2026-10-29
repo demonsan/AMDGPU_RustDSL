@@ -610,6 +610,14 @@ impl Lowerer {
                         self.push(MInst::new(MOp::VPkMulF32).def(a).srcreg(a).srcreg(p));
                     }
                 }
+                Stmt::VarMfmaScaleZ { var, a, b, scale_a, scale_b } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let ra = self.as_v8(*a)?;
+                    let rb = self.as_v8(*b)?;
+                    let sa = self.as_v1(*scale_a)?;
+                    let sb = self.as_v1(*scale_b)?;
+                    self.push(MInst::new(MOp::VMfmaScale32x32x64Fp8Z).def(v).srcreg(ra).srcreg(rb).srcreg(sa).srcreg(sb));
+                }
                 Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let ra = self.as_v8(*a)?;
