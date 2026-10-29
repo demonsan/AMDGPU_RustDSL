@@ -10135,6 +10135,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             return;
         }
         let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot)).collect();
+        let mut p_pre: Option<[ValueId; 2]> = None;
         if smfrs {
             let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             let pb = b.frag8(w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
@@ -10149,6 +10150,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let l_new = b.add_f32(l_old, l_unit);
             let l_new_i = b.bitcast_i32(l_new);
             b.set_var(la, l_new_i);
+            p_pre = Some([pa, pb]);
         }
         let load_v = |b: &mut FnBuilder, hh: usize, e: usize| -> ValueId {
             let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
@@ -10164,7 +10166,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let mut nxt = load_v(b, 0, 0);
             for hh in 0..2usize {
                 let o = 8 * hh;
-                let p8 = b.frag8(w[o], w[o + 1], w[o + 2], w[o + 3], w[o + 4], w[o + 5], w[o + 6], w[o + 7]);
+                let p8 = match &p_pre { Some(ps) => ps[hh], None => b.frag8(w[o], w[o + 1], w[o + 2], w[o + 3], w[o + 4], w[o + 5], w[o + 6], w[o + 7]) };
                 if !smfrs {
                     let ones8 = load_ones(b);
                     b.var_mfma_scale(la, ones8, p8, c127, c123);
@@ -10182,7 +10184,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         for hh in 0..2usize {
             let o = 8 * hh;
-            let p8 = b.frag8(w[o], w[o + 1], w[o + 2], w[o + 3], w[o + 4], w[o + 5], w[o + 6], w[o + 7]);
+            let p8 = match &p_pre { Some(ps) => ps[hh], None => b.frag8(w[o], w[o + 1], w[o + 2], w[o + 3], w[o + 4], w[o + 5], w[o + 6], w[o + 7]) };
             if !smfrs {
                 if !smfrs {
                     let ones8 = load_ones(b);
