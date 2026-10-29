@@ -98,6 +98,8 @@ pub fn cost(op: MOp) -> OpCost {
         VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z => c(Mfma, 64, 84, Verified),
         VMfma32x32x16Fp8 | VMfma32x32x8F16 | VMfma32x32x8F16Z => c(Mfma, 32, 48, Verified),
         VMfma16x16x32Fp8 | VMfma16x16x16F16 => c(Mfma, 16, 32, Verified),
+        // Sparse fp8 16x16x128: arch table says 32 cycles (MI350X, F8 involved); latency not measured.
+        VSmfmac16x16x128Fp8 => c(Mfma, 32, 32, Experimental),
         // LDS (E): b128 issue 8, b32 4, tr_b8 ~6, write b128 ~26; latency ~52 (reads) / ~75 (write).
         LdsReadB128 => c(Lds, 8, 52, Experimental),
         LdsReadB32 => c(Lds, 4, 52, Experimental),
@@ -110,6 +112,6 @@ pub fn cost(op: MOp) -> OpCost {
         GlobalLoadLdsB128 | GlobalLoadLdsB32 => c(Vmem, 14, 240, Unknown),
         GlobalStoreU16 | GlobalStoreF32 => c(Vmem, 8, 4, Unknown),
         SLoadDword | SLoadDwordx2 => c(Smem, 4, 200, Unknown),
-        SReadPhys | SMovB32 | SAddU32 | SAddcU32 | SMulI32 | SShlB32 | SCmpLtI32 => c(Salu, 4, 4, Verified),
+        SReadPhys | SMovB32 | SAddU32 | SAddcU32 | SMulI32 | SShlB32 | SLshrB32 | SAndB32 | SXorB32 | SCmpLtI32 => c(Salu, 4, 4, Verified),
         SBarrier | SSetPrio | SNop | SWaitVm | SWaitLgkm | SEndpgm => c(Ctrl, 4, 4, Verified),    }
 }

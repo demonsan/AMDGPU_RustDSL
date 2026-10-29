@@ -427,6 +427,19 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
                 vr(a, sb)
             )]
         }
+        MOp::VSmfmac16x16x128Fp8 => {
+            // D (4) += sparse A (4) x dense B (8); SRC2 is the sparse-index dword.
+            let a_reg = reg_of(&inst.srcs[0]);
+            let b_reg = reg_of(&inst.srcs[1]);
+            let idx = reg_of(&inst.srcs[2]);
+            vec![format!(
+                "v_smfmac_f32_16x16x128_fp8_fp8 {}, {}, {}, {}",
+                tuple(a, inst.dst.expect("dst"), 4),
+                tuple(a, a_reg, 4),
+                tuple(a, b_reg, 8),
+                vr(a, idx)
+            )]
+        }
         MOp::VMfma16x16x32Fp8 => {
             let a_reg = reg_of(&inst.srcs[0]);
             let b_reg = reg_of(&inst.srcs[1]);
@@ -550,6 +563,9 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1_s(a, inst.srcs[0]),
             src1_s(a, inst.srcs[1])
         )],
+        MOp::SLshrB32 => vec![format!("s_lshr_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
+        MOp::SAndB32 => vec![format!("s_and_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
+        MOp::SXorB32 => vec![format!("s_xor_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SCmpLtI32 => vec![format!(
             "s_cmp_lt_i32 {}, {}",
             src1_s(a, inst.srcs[0]),

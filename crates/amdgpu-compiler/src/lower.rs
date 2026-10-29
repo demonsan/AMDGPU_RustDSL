@@ -20,6 +20,11 @@ use crate::mir::*;
 ///                instead of `v_mov` into a register;
 ///  * `sgpr`    - scalar (SGPR) values are used directly as VALU source operands instead of a `v_mov` copy;
 ///  * `shl`     - multiplication by a power-of-two constant becomes a shift;
+///  * `scalarize` - wave-uniform integer arithmetic (workgroup ids, kernarg values, constants and loop counters /
+///                 toggles derived from them with add/mul/shl/lshr/and/xor) is computed with SALU instructions in SGPRs;
+///                 a value needed by a VALU instruction is copied with one `v_mov` (cached per region);
+///  * `addrfold` - an address `(base + k1) + (y + k2)` used once is formed as `base + y` with `k1+k2` in the DS
+///                 offset field, so the `base + k` variants no longer stay live in VGPRs;
 ///  * `saddr`   - global loads whose address is `kernarg_ptr + vector offset` use the scalar-base form (no 64-bit add);
 ///  * `dce`     - dead address / clamp chains (`v_add_co`/`v_addc`, `v_cmp`+`v_cndmask`, pointer adds) are removed;
 ///  * `cmpfold` - `select(cmp(x,y), ..)` re-issues the compare instead of the 0/1 materialisation +
@@ -76,6 +81,11 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         ));
     }
     let mut lw = Lowerer::new(f);
+    if opt_on("scalarize") {
+        let (u, v) = uniform_analysis(f);
+        lw.uniform = u;
+        lw.uvars = v;
+    }
     lw.run(f)?;
     Ok(lw.finish())
 }
@@ -108,6 +118,11 @@ struct Lowerer {
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
+    /// `scalarize`: DSL values / loop variables that are wave-uniform integers (computed in SGPRs).
+    uniform: HashSet<ValueId>,
+    uvars: HashSet<amdgpu_dsl::VarId>,
+    /// `addrfold`: integer values held as `reg + constant` without an instruction for the constant (value -> (reg, k)).
+    lazy: HashMap<ValueId, (VReg, i64)>,
 }
 
 impl Lowerer {
@@ -189,6 +204,9 @@ impl Lowerer {
             use_counts,
             alias_cache: HashMap::new(),
             else_started: HashSet::new(),
+            uniform: HashSet::new(),
+            uvars: HashSet::new(),
+            lazy: HashMap::new(),
         }
     }
 
@@ -369,6 +387,42 @@ impl Lowerer {
         Ok(Some((sreg, off)))
     }
 
+    /// A scalar source operand: an immediate (SALU takes 32-bit literals) or an SGPR value / scalar loop variable.
+    fn s_operand(&mut self, o: Opnd) -> Result<Src, String> {
+        if let Some(k) = self.const_bits(o) {
+            return Ok(Src::Imm(k));
+        }
+        let r = match o {
+            Opnd::Val(v) => *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?,
+            Opnd::Var(v) => *self.vars.get(v.0 as usize).ok_or("var not lowered")?,
+            _ => return Err("scalar operand must be a value, variable or immediate".to_string()),
+        };
+        if self.mir.vreg_class(r) != RClass::S1 {
+            return Err(format!("operand {o:?} is not in an SGPR (uniform analysis disagrees with lowering)"));
+        }
+        Ok(Src::Reg(r))
+    }
+
+    /// `dst = a <op> b` in SALU (both operands uniform).
+    fn scalar_bin(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
+        let (mut sa, mut sb) = (self.s_operand(a)?, self.s_operand(b)?);
+        let commutative = matches!(op, MOp::SAddU32 | MOp::SMulI32 | MOp::SAndB32 | MOp::SXorB32);
+        if matches!(sa, Src::Imm(_)) && matches!(sb, Src::Reg(_)) && commutative {
+            std::mem::swap(&mut sa, &mut sb);
+        }
+        if let Src::Imm(k) = sa {
+            let t = self.new_vreg(RClass::S1);
+            self.push(MInst::new(MOp::SMovB32).def(t).imm(k));
+            sa = Src::Reg(t);
+        }
+        let regs: Vec<Src> = [sa, sb].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+        self.touch(&regs);
+        let d = self.new_vreg(RClass::S1);
+        self.push(MInst::new(op).def(d).src(sa).src(sb));
+        self.val.insert(dst, d);
+        Ok(())
+    }
+
     fn const_bits(&self, o: Opnd) -> Option<i64> {
         match o {
             Opnd::I32(i) => Some(i as i64),
@@ -400,6 +454,12 @@ impl Lowerer {
         let mut off: i64 = 0;
         loop {
             if let Opnd::Val(v) = cur {
+                if let Some(&(t, k)) = self.lazy.get(&v) {
+                    if (0..65536).contains(&(off + k)) {
+                        self.touch(&[Src::Reg(t)]);
+                        return Ok((t, off + k));
+                    }
+                }
                 if let Some(Op::AddI32(x, y)) = self.defs.get(&v).cloned() {
                     if let Some(k) = self.const_of(y) {
                         if k >= 0 && off + k < 65536 {
@@ -420,6 +480,78 @@ impl Lowerer {
             break;
         }
         Ok((self.as_v1(cur)?, off))
+    }
+
+    /// (register, constant) view of an integer operand for `addrfold`.
+    fn lazy_core(&mut self, o: Opnd) -> Result<(VReg, i64), String> {
+        if let Opnd::Val(v) = o {
+            if let Some(&(t, k)) = self.lazy.get(&v) {
+                return Ok((t, k));
+            }
+        }
+        let (c, k) = self.split_const(o);
+        if let Opnd::Val(v) = c {
+            if let Some(&(t, k2)) = self.lazy.get(&v) {
+                return Ok((t, k + k2));
+            }
+        }
+        Ok((self.as_v1(c)?, k))
+    }
+
+    /// `dst = a + b` kept as `reg + k` when a constant is involved; emits at most the register add. Returns false
+    /// when nothing is gained (the caller emits the ordinary add).
+    fn lazy_add(&mut self, dst: ValueId, a: Opnd, b: Opnd) -> Result<bool, String> {
+        if self.uniform.contains(&dst) {
+            return Ok(false);
+        }
+        let (kb, ka) = (self.const_bits(b), self.const_bits(a));
+        match (ka, kb) {
+            (None, Some(k)) | (Some(k), None) => {
+                let other = if kb.is_some() { a } else { b };
+                let (t, k0) = self.lazy_core(other)?;
+                self.lazy.insert(dst, (t, k0 + k));
+                Ok(true)
+            }
+            (None, None) => {
+                // only worth it when a side already carries a constant
+                let sa = self.split_const(a).1 != 0 || matches!(a, Opnd::Val(v) if self.lazy.contains_key(&v));
+                let sb = self.split_const(b).1 != 0 || matches!(b, Opnd::Val(v) if self.lazy.contains_key(&v));
+                if !(sa || sb) {
+                    return Ok(false);
+                }
+                let (ta, k1) = self.lazy_core(a)?;
+                let (tb, k2) = self.lazy_core(b)?;
+                self.touch(&[Src::Reg(ta), Src::Reg(tb)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VAddU32).def(d).srcreg(ta).srcreg(tb));
+                self.lazy.insert(dst, (d, k1 + k2));
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// ``o = core + k`` through chains of ``x + const``: (core, k).
+    fn split_const(&self, o: Opnd) -> (Opnd, i64) {
+        let mut cur = o;
+        let mut k = 0i64;
+        loop {
+            if let Opnd::Val(v) = cur {
+                if let Some(Op::AddI32(x, y)) = self.defs.get(&v) {
+                    if let Some(c) = self.const_of(*y) {
+                        k += c;
+                        cur = *x;
+                        continue;
+                    }
+                    if let Some(c) = self.const_of(*x) {
+                        k += c;
+                        cur = *y;
+                        continue;
+                    }
+                }
+            }
+            return (cur, k);
+        }
     }
 
     /// A freshly zeroed sixteen-dword fragment.
@@ -457,6 +589,18 @@ impl Lowerer {
                     self.touch(&[Src::Reg(r)]);
                     return Ok(r);
                 }
+                if let Some(&(t, k)) = self.lazy.get(&v) {
+                    // materialise `t + k` (cached for the region)
+                    if k == 0 {
+                        self.touch(&[Src::Reg(t)]);
+                        return Ok(t);
+                    }
+                    let d = self.new_vreg(RClass::V1);
+                    self.touch(&[Src::Reg(t)]);
+                    self.push(MInst::new(MOp::VAddU32).def(d).src(Src::Imm(k)).srcreg(t));
+                    self.converted.insert(v, d);
+                    return Ok(d);
+                }
                 let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
                 match self.mir.vreg_class(r) {
                     RClass::V1 => {
@@ -473,11 +617,17 @@ impl Lowerer {
                     other => Err(format!("value v{v} has class {other:?}, expected scalar/vector")),
                 }
             }
-            Opnd::Var(v) => self
-                .vars
-                .get(v.0 as usize)
-                .copied()
-                .ok_or_else(|| format!("var{v} not lowered")),
+            Opnd::Var(v) => {
+                let r = self.vars.get(v.0 as usize).copied().ok_or_else(|| format!("var{v} not lowered"))?;
+                if self.mir.vreg_class(r) == RClass::S1 {
+                    // uniform (SGPR) loop variable read by a VALU consumer
+                    let d = self.new_vreg(RClass::V1);
+                    self.touch(&[Src::Reg(r)]);
+                    self.push(MInst::new(MOp::VMovFromS).def(d).srcreg(r));
+                    return Ok(d);
+                }
+                Ok(r)
+            }
             Opnd::I32(i) => Ok(self.const_vreg(i as i64)),
             Opnd::F32(f) => Ok(self.const_vreg((f.to_bits() as i32) as i64)),
         }
@@ -490,6 +640,18 @@ impl Lowerer {
                     let r = *r;
                     self.touch(&[Src::Reg(r)]);
                     return Ok(r);
+                }
+                if let Some(&(t, k)) = self.lazy.get(&v) {
+                    // materialise `t + k` (cached for the region)
+                    if k == 0 {
+                        self.touch(&[Src::Reg(t)]);
+                        return Ok(t);
+                    }
+                    let d = self.new_vreg(RClass::V1);
+                    self.touch(&[Src::Reg(t)]);
+                    self.push(MInst::new(MOp::VAddU32).def(d).src(Src::Imm(k)).srcreg(t));
+                    self.converted.insert(v, d);
+                    return Ok(d);
                 }
                 let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
                 match self.mir.vreg_class(r) {
@@ -672,6 +834,14 @@ impl Lowerer {
                 Stmt::SetVar { var, value } => {
                     let dst = self.vars[var.0 as usize];
                     let class = self.mir.vreg_class(dst);
+                    if class == RClass::S1 {
+                        let s = self.s_operand(*value)?;
+                        if let Src::Reg(x) = s {
+                            self.touch(&[Src::Reg(x)]);
+                        }
+                        self.push(MInst::new(MOp::SMovB32).def(dst).src(s));
+                        continue;
+                    }
                     let src = match class {
                         RClass::V1 => self.as_v1(*value)?,
                         RClass::V2 => self.as_v2(*value)?,
@@ -766,6 +936,7 @@ impl Lowerer {
                             DType::Frag4 => RClass::V4,
                             DType::Frag8 => RClass::V8,
                             DType::Frag16 => RClass::V16,
+                            _ if self.uvars.contains(var) => RClass::S1,
                             _ => RClass::V1,
                         };
                         let r = self.new_vreg(class);
@@ -773,6 +944,14 @@ impl Lowerer {
                             self.vars.resize(var.0 as usize + 1, u32::MAX);
                         }
                         self.vars[var.0 as usize] = r;
+                        if class == RClass::S1 {
+                            let s = self.s_operand(init[i])?;
+                            if let Src::Reg(x) = s {
+                                self.touch(&[Src::Reg(x)]);
+                            }
+                            self.push(MInst::new(MOp::SMovB32).def(r).src(s));
+                            continue;
+                        }
                         let src = match class {
                             RClass::V1 => self.as_v1(init[i])?,
                             RClass::V2 => self.as_v2(init[i])?,
@@ -1024,6 +1203,13 @@ impl Lowerer {
                 self.push(MInst::new(MOp::SReadPhys).def(d).imm(phys));
                 self.val.insert(dst, d);
             }
+            Op::AddI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAddU32, *a, *b)?,
+            Op::MulI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SMulI32, *a, *b)?,
+            Op::ShlI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SShlB32, *a, *b)?,
+            Op::LshrI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SLshrB32, *a, *b)?,
+            Op::AndI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAndB32, *a, *b)?,
+            Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
+            Op::AddI32(a, b) if opt_on("addrfold") && self.lazy_add(dst, *a, *b)? => {}
             Op::AddI32(a, b) => self.bin_v1(dst, MOp::VAddU32, *a, *b)?,
             Op::AddF32(a, b) => self.bin_v1(dst, MOp::VAddF32, *a, *b)?,
             Op::SubF32(a, b) => self.bin_v1(dst, MOp::VSubF32, *a, *b)?,
@@ -1523,6 +1709,52 @@ impl Lowerer {
                 );
                 self.val.insert(dst, d);
             }
+            Op::SmfmacFp8_16x16x128 { a, b, idx, c } => {
+                // Sparse MFMA: the accumulator D is also the input C. A (4 dwords) is the
+                // 2:4-compressed operand, B (8 dwords) the dense matrix, idx a single dword.
+                let ra = self.as_v4(*a)?;
+                let rb = self.as_v8(*b)?;
+                let ri = self.as_v1(*idx)?;
+                let c_is_zero = matches!(
+                    c,
+                    Opnd::Val(cv) if matches!(self.defs.get(cv), Some(Op::FragZero { ty: DType::Frag4 }))
+                );
+                let d = if c_is_zero {
+                    let d = self.new_vreg(RClass::V4);
+                    let zero = self.const_vreg(0);
+                    for i in 0..4i64 {
+                        self.push(MInst::new(MOp::VWriteSub).def(d).srcreg(zero).imm(i));
+                    }
+                    d
+                } else {
+                    let rc = self.as_v4(*c)?;
+                    // In-place accumulation when the accumulator has no other use.
+                    let reusable = matches!(
+                        c,
+                        Opnd::Val(cv)
+                            if self.use_counts.get(cv).copied() == Some(1)
+                                && matches!(
+                                    self.defs.get(cv),
+                                    Some(Op::SmfmacFp8_16x16x128 { .. }) | Some(Op::Frag4(..))
+                                )
+                    );
+                    if reusable {
+                        rc
+                    } else {
+                        let d = self.new_vreg(RClass::V4);
+                        self.copy_reg(d, rc)?;
+                        d
+                    }
+                };
+                self.push(
+                    MInst::new(MOp::VSmfmac16x16x128Fp8)
+                        .def(d)
+                        .srcreg(ra)
+                        .srcreg(rb)
+                        .srcreg(ri),
+                );
+                self.val.insert(dst, d);
+            }
             Op::Frag16Lane { frag, index } => {
                 // Any multi-dword fragment: read the requested dword.
                 let f = match frag {
@@ -2018,6 +2250,68 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
         }
         if !changed {
             break;
+        }
+    }
+}
+/// Wave-uniform integer values and loop variables (see the `scalarize` option). Control flow is wave-uniform by
+/// construction (branches are taken on `vcc != 0`), so a loop variable is uniform when its initial value and every
+/// value assigned to it are uniform.
+fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarId>) {
+    let mut uvars: HashSet<amdgpu_dsl::VarId> = HashSet::new();
+    for (i, t) in f.var_tys.iter().enumerate() {
+        if *t == DType::I32 {
+            uvars.insert(amdgpu_dsl::VarId(i as u32));
+        }
+    }
+    loop {
+        let mut u: HashSet<ValueId> = HashSet::new();
+        let is_u = |o: &Opnd, u: &HashSet<ValueId>, uvars: &HashSet<amdgpu_dsl::VarId>| match o {
+            Opnd::I32(_) => true,
+            Opnd::Val(v) => u.contains(v),
+            Opnd::Var(v) => uvars.contains(v),
+            _ => false,
+        };
+        let mut changed = false;
+        for st in &f.stmts {
+            match st {
+                Stmt::Let { dst, op } => {
+                    let uni = match op {
+                        Op::ConstI32(_) | Op::KernargI32 { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
+                        Op::AddI32(a, b) | Op::MulI32(a, b) | Op::ShlI32(a, b) | Op::LshrI32(a, b) | Op::AndI32(a, b) | Op::XorI32(a, b) => {
+                            is_u(a, &u, &uvars) && is_u(b, &u, &uvars)
+                        }
+                        _ => false,
+                    };
+                    if uni {
+                        u.insert(*dst);
+                    }
+                }
+                Stmt::SetVar { var, value } => {
+                    if uvars.contains(var) && !is_u(value, &u, &uvars) {
+                        uvars.remove(var);
+                        changed = true;
+                    }
+                }
+                Stmt::BeginLoop { vars, init } => {
+                    for (v, i) in vars.iter().zip(init.iter()) {
+                        if uvars.contains(v) && !is_u(i, &u, &uvars) {
+                            uvars.remove(v);
+                            changed = true;
+                        }
+                    }
+                }
+                // any other statement that writes a variable in place makes it non-scalar
+                Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
+                | Stmt::VarScaleLane { var, .. } | Stmt::VarLoadB128 { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScaleZ { var, .. } => {
+                    if uvars.remove(var) {
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            return (u, uvars);
         }
     }
 }

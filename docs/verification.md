@@ -2,9 +2,11 @@
 
 Author: `kernel-occ`, the independent party. Everything below was produced in this session on MI355X / gfx950
 (GPU 5, `aac16` node 53) from the compiler source and the emitted assembly/hardware; the register bug was located
-from `regalloc.rs` and the assembly before reading any teammate report. Base commit: `origin/Main` = `ae003a9`
+from `regalloc.rs` and the assembly before reading any teammate report. Measurement base: `origin/Main` = `ae003a9`
 (merges `kernel-opt` incl. the regalloc fix `794c978`, the new DMA staging `68d03aa`, the dead-load DCE fix
-`7934e4e`; round-46 docs `d6f2d9d`).
+`7934e4e`; round-46 docs `d6f2d9d`). The section-4 re-verification below (and the cargo-test/audit re-run) was done
+on `origin/Main` = `72ec5d1`, which adds the backend-tail merge (`afef952` padN metadata fix, `e468937` unique llc
+temp dir); the hardware conclusions are unchanged, and the one open red flag from the first round is now closed.
 
 ## 1. Scope
 
@@ -77,7 +79,7 @@ for the `sched_*` microkernels, printed results for the probe kernels.
 | `fmha_fwd_hd128_mxfp8_t` / `_sv` / `_pp` | **15/15 shapes bit-identical each (60/60)**; e.g. `_t` B1H8S2048 md5 `38e3200f304d`; `_pp` B2H8S700 gqa=2 md5 `cbc75e0a0708` matches the determinism md5 in `status.md` round 43 |
 | `fmha_fwd_hd128_mxfp8` (old kernel) | bit-identical on its 13 in-spec shapes; see the nondeterminism note below for the other 2 |
 | `sched_*` microkernels (8) | output hashes identical at block 256 / 512 / grid 256 |
-| probe kernels | 20 pass on both tails and print identical results; see below for the FAIL cases and the `probe_store` red flag |
+| probe kernels | 20 pass on both tails and print identical results; `probe_store` was the one red flag (LLVM-tail launch crash, section 4) and is now fixed and verified; the remaining 4 `BX_PROBE_DIFF` are the known nondeterministic probes below |
 
 **Deterministic vs nondeterministic kernels (documented limitation).** Several A/B "diffs" in this experiment were
 run-to-run nondeterminism in the *kernel*, not a tail difference; future comparisons must not treat them as tail
@@ -94,17 +96,20 @@ evidence:
 * Everything else measured is deterministic and identical: the three FMHA default kernels (all 15 shapes), the 8
   `sched_*` kernels, and the 20 passing probes.
 
-**RED FLAG (found, fix handed to backend-llvm-tail): the LLVM-tail `probe_store` code object crashes the host at
-`hipModuleLaunchKernel` (SIGSEGV); the own-backend object prints `PROBE_OK`.** Root cause: the LLVM tail lists
-kernarg *layout padding* as kernel arguments. `probe_store` has a 20-byte argument area rounded to 24 bytes; the
-exported IR adds a dummy `%pad0` parameter (`crates/amdgpu-compiler/src/backend/llvm_mir.rs::kernarg_ir`), which
-llc turns into a fourth HSA argument (`pad0`, offset 20, by_value). HIP's kernel-parameter launch API then reads a
-fourth parameter from a three-entry array (out of bounds). The own metadata has only the three real arguments and
-works; patching the descriptor fields does not change the crash. Scope: any LLVM-tail kernel whose DSL kernarg
-layout has internal gaps or trailing padding when launched via the `kernelParams` API (`ref_host`/`sched_host` use
-the flat-buffer API and are unaffected; `attention_fwd`'s 8 contiguous args are unaffected). Fix: do not emit pad
-parameters as HSA args (strip `padN` from the generated `.amdgpu_metadata` `.args` list; `kernarg_segment_size`
-already includes the padding).
+**RED FLAG (found here, fixed by backend-llvm-tail in Main `afef952`, re-verified on hardware): the LLVM-tail
+`probe_store` code object crashed the host at `hipModuleLaunchKernel` (SIGSEGV); the own-backend object printed
+`PROBE_OK`.** Root cause: the LLVM tail listed kernarg *layout padding* as kernel arguments. `probe_store` has a
+20-byte argument area rounded to 24 bytes; the exported IR added a dummy `%pad0` parameter
+(`crates/amdgpu-compiler/src/backend/llvm_mir.rs::kernarg_ir`), which llc turned into a fourth HSA argument
+(`pad0`, offset 20, by_value). HIP's kernel-parameter launch API then read a fourth parameter from a three-entry
+array (out of bounds). The own metadata had only the three real arguments and worked; patching the descriptor
+fields did not change the crash. Scope: any LLVM-tail kernel whose DSL kernarg layout has internal gaps or
+trailing padding when launched via the `kernelParams` API (`ref_host`/`sched_host` use the flat-buffer API and
+were unaffected; `attention_fwd`'s 8 contiguous args were unaffected).
+**Status: closed.** On Main `72ec5d1` (which carries `afef952`, "strip padN dummy parameters from
+`.amdgpu_metadata` `.args`"), `tools/bit_exactness.sh probes` on GPU 5 prints `BX_PROBE_SAME probe_store
+PROBE_OK` - the LLVM-tail object now launches and matches the own backend. This closes the only red flag of
+the round-47 verification.
 
 ## 5. DMA staging on the new implementation (Verified)
 
@@ -133,7 +138,7 @@ regalloc bug; the regalloc fix alone (verified in section 3) predates the new DM
   checks (plus `tail_invariance.rs`).
 * Results measured with an under-declared SGPR window (before `794c978`) are suspect for kernels whose high SGPRs
   were only live mid-function; the DMA numbers in rounds 44/45 predate both fixes and are superseded.
-* `probe_store` remains broken on the LLVM tail until the pad-argument metadata fix lands (section 4).
+* `probe_store` on the LLVM tail: fixed in Main `afef952` and re-verified (section 4) - no longer a risk.
 * The old `fmha_fwd_hd128_mxfp8` kernel is nondeterministic on out-of-spec inputs (section 4); do not use it for
   tail comparisons outside its documented requirements.
 * `attn_debug` and the hand-written `hw_*` asm kernels are outside the bit-exactness sweep (`probe_store` is
@@ -157,3 +162,8 @@ FMHA_OPT="cvt4,pksub,lazy,msum,permlane,kdlds,dbuf,lacc1,psh2,dma" REF_CO=<vendo
   OUR_KERNEL=fmha_fwd_hd128_mxfp8_t REF_ROWS=16 bash tests/gpu/run_ref.sh
 FMHA_OPT="..." REF_CO=<vendor.co> BACKEND=own OUR_KERNEL=fmha_fwd_hd128_mxfp8_t bash tests/gpu/determinism.sh
 ```
+
+## Loop-variable semantics and the re-read lint
+
+A *loop variable* (`begin_loop` / `set_var`, `Opnd::Var`) is loop-carried state. Contract: a read of a variable **before** the first `set_var` of that variable in an iteration sees the value the previous iteration left (the initial value in the first iteration). A read **after** a `set_var` of the same variable in the same iteration is **not part of the contract**: our lowering keeps the variable in one mutable register and often retargets the producer of the `set_var` operand straight into it, so such a read usually sees the newly written value, but that depends on the producer, on in-place `Var*` statements, on nested `if`s and on instruction movement, and kernel-opt measured stale data (39% wrong rows, varying from run to run) in one such pattern. For an intra-iteration producer/consumer pair use the plain SSA value that was passed to `set_var`.
+`amdgpu_dsl::lint(&Function)` reports every such read conservatively (a `set_var` inside an `if` counts); `amdc emit` prints the reports as warnings; `FnBuilder::allow_var_rereads()` opts a kernel out. Cross-iteration reads (read before the set) and loop conditions expressed on SSA values are not reported. `tests/var_lint.rs`: the lint precision test, and a guard that only the kernels listed in `KNOWN_REREADERS` (fmha_*, sched_diamond; plus the `probe_*` research kernels) re-read after set - any other kernel must be clean.

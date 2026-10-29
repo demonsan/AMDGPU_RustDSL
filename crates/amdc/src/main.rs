@@ -211,6 +211,9 @@ fn main() -> ExitCode {
                 eprintln!("unknown kernel: {name}");
                 return ExitCode::from(2);
             };
+            for w in amdgpu_dsl::lint(&f) {
+                eprintln!("warning: {name}: {w}");
+            }
             let mut out_path: Option<String> = None;
             let mut mir_out: Option<String> = None;
             let mut backend_name = env::var("AMDC_BACKEND").unwrap_or_else(|_| "llvm-tail".to_string());
@@ -224,6 +227,10 @@ fn main() -> ExitCode {
                     i += 2;
                 } else if let Some(b) = args[i].strip_prefix("--backend=") {
                     backend_name = b.to_string();
+                    i += 1;
+                } else if args[i] == "--scalarize" {
+                    let cur = env::var("AMDC_LOWER_OPTS").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "dce,cmpfold".to_string());
+                    env::set_var("AMDC_LOWER_OPTS", format!("{cur},scalarize"));
                     i += 1;
                 } else if args[i] == "--sched=ld" {
                     env::set_var("AMDC_SCHED", "ld");

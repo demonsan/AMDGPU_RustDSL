@@ -27,6 +27,27 @@ fn side_effect_op(op: MOp) -> bool {
     )
 }
 
+/// Like [`side_effect_signature`] but ignoring immediates of memory ops (`addrfold` moves constant address parts into the
+/// DS offset field on purpose).
+fn side_effect_signature_noimm(m: &MFunction) -> Vec<Vec<String>> {
+    m.blocks
+        .iter()
+        .map(|b| {
+            let mut v: Vec<String> = b
+                .insts
+                .iter()
+                .filter(|i| side_effect_op(i.op))
+                .map(|i| {
+                    let mem = matches!(i.op, MOp::LdsWriteB32 | MOp::LdsWriteB128 | MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64TrB8);
+                    format!("{:?}/{}/{}", i.op, if mem { 0 } else { i.imm }, i.srcs.len())
+                })
+                .collect();
+            v.push(format!("{:?}", b.term));
+            v
+        })
+        .collect()
+}
+
 fn side_effect_signature(m: &MFunction) -> Vec<Vec<String>> {
     m.blocks
         .iter()
@@ -123,6 +144,22 @@ fn lowering_opts_keep_side_effects_and_definedness() {
         let f = kernel_by_name(k).unwrap();
         let none = with_opts(&["none"], || lower::lower(&f)).unwrap();
         let dflt = with_opts(&["dce", "cmpfold"], || lower::lower(&f)).unwrap();
+        let scal = with_opts(&["dce", "cmpfold", "scalarize"], || lower::lower(&f)).unwrap();
+        if side_effect_signature(&none) != side_effect_signature(&scal) {
+            bad.push(format!("{k}: side-effect/terminator sequence differs between none and dce,cmpfold,scalarize"));
+        }
+        let all = with_opts(&["dce", "cmpfold", "scalarize", "sgpr", "addrfold"], || lower::lower(&f)).unwrap();
+        if side_effect_signature_noimm(&none) != side_effect_signature_noimm(&all) {
+            bad.push(format!("{k}: side-effect/terminator sequence differs with scalarize,sgpr,addrfold"));
+        }
+        let ua = undefined_reads(&all);
+        if ua.len() > undefined_reads(&none).len() {
+            bad.push(format!("{k}: all opts introduced undefined reads: {:?}", &ua[..ua.len().min(3)]));
+        }
+        let us = undefined_reads(&scal);
+        if us.len() > undefined_reads(&none).len() {
+            bad.push(format!("{k}: scalarize introduced undefined reads: {:?}", &us[..us.len().min(3)]));
+        }
         if side_effect_signature(&none) != side_effect_signature(&dflt) {
             bad.push(format!("{k}: side-effect/terminator sequence differs between none and dce,cmpfold"));
         }
@@ -236,7 +273,7 @@ fn register_assignment_never_clobbers_a_live_value() {
     let mut bad = Vec::new();
     for k in kernel_names() {
         let f = kernel_by_name(k).unwrap();
-        for opts in [&["none"][..], &["dce", "cmpfold"][..]] {
+        for opts in [&["none"][..], &["dce", "cmpfold"][..], &["dce", "cmpfold", "scalarize"][..], &["dce", "cmpfold", "scalarize", "sgpr", "addrfold"][..]] {
             let r = with_opts(opts, || compile_mir_alloc(&f));
             let (m, a) = match r {
                 Ok(x) => x,

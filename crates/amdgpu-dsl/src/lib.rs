@@ -210,6 +210,10 @@ pub enum Op {
     /// `v_mfma_scale_f32_32x32x64_f8f6f4`: block-scaled fp8 MFMA. The two scale
     /// operands are E8M0 exponents in scalar registers.
     MfmaScaleFp8_32x32x64 { a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
+    /// `v_smfmac_f32_16x16x128_fp8_fp8`: sparse (2:4) fp8 A times dense fp8 B, f32 accumulate.
+    /// `a` is a Frag4 (the 2:4-compressed A operand), `b` a Frag8 (dense B, 128 K x 16 N),
+    /// `idx` the SRC2 dword of sixteen 2-bit sparse indices, `c` the Frag4 accumulator.
+    SmfmacFp8_16x16x128 { a: Opnd, b: Opnd, idx: Opnd, c: Opnd },
     /// Read dword `index` (0..15) of a sixteen-dword fragment.
     Frag16Lane { frag: Opnd, index: u8 },
     /// A fragment of `ty` zeroed out.
@@ -276,6 +280,7 @@ impl Op {
             Op::Frag16Build(..) => DType::Frag16,
             Op::CvtPknormU16(..) | Op::CvtScalef32PkFp8Bf16 { .. } | Op::CvtPkFp8F32(..) | Op::CvtPkBf16F32(..) => DType::U32,
             Op::MfmaScaleFp8_32x32x64 { .. } => DType::Frag16,
+            Op::SmfmacFp8_16x16x128 { .. } => DType::Frag4,
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
             Op::Frag16Pair { .. } | Op::Frag2Dup(..) | Op::PkAddF32(..) | Op::PkMulF32(..) => DType::Frag2,
@@ -337,6 +342,7 @@ impl Op {
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 vec![*a, *b, *c, *scale_a, *scale_b]
             }
+            Op::SmfmacFp8_16x16x128 { a, b, idx, c } => vec![*a, *b, *idx, *c],
             Op::Frag16Lane { frag, .. } | Op::Frag16Pair { frag, .. } => vec![*frag],
             Op::Frag2Dup(a) | Op::PartnerMaxF32(a) => vec![*a],
             Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => vec![*a, *b],
@@ -422,6 +428,8 @@ pub struct Function {
     pub stmts: Vec<Stmt>,
     pub var_tys: Vec<DType>,
     pub value_tys: Vec<DType>,
+    /// Opt-out of the loop-variable re-read lint (see [`lint`]).
+    pub allow_var_rereads: bool,
 }
 
 impl Function {
@@ -549,8 +557,14 @@ impl FnBuilder {
                 stmts: Vec::new(),
                 var_tys: Vec::new(),
                 value_tys: Vec::new(),
+                allow_var_rereads: false,
             },
         }
+    }
+
+    /// Declares that this kernel intentionally re-reads loop variables after `set_var` in the same iteration.
+    pub fn allow_var_rereads(&mut self) {
+        self.f.allow_var_rereads = true;
     }
 
     /// Declares how many bytes of workgroup LDS the kernel uses.
@@ -867,6 +881,22 @@ impl FnBuilder {
 
     pub fn frag16_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
         self.let_(Op::Frag16Lane { frag: frag.into(), index })
+    }
+
+    /// Sparse fp8 MFMA (`v_smfmac_f32_16x16x128_fp8_fp8`): D = compressed A x dense B + C.
+    pub fn smfmac_fp8_16x16x128(
+        &mut self,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        idx: impl Into<Opnd>,
+        c: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::SmfmacFp8_16x16x128 {
+            a: a.into(),
+            b: b.into(),
+            idx: idx.into(),
+            c: c.into(),
+        })
     }
 
     /// A zero-initialised fragment of the given type.
@@ -1653,3 +1683,70 @@ pub fn verify(f: &Function) -> Vec<String> {
 }
 /// Kernel definitions built with this DSL.
 pub mod kernels;
+
+/// Every `Opnd` a statement reads (loop variables read implicitly by in-place `Var*` statements are not listed).
+fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
+    match st {
+        Stmt::Let { op, .. } => op.operands(),
+        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } => vec![*base, *value],
+        Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } => vec![*addr, *value],
+        Stmt::LoadGlobalLds { base, lds_addr, .. } => vec![*base, *lds_addr],
+        Stmt::SetVar { value, .. } => vec![*value],
+        Stmt::VarScaleF32 { scalar, .. } | Stmt::VarScaleLane { scalar, .. } => vec![*scalar],
+        Stmt::VarScalePk { pair, .. } | Stmt::VarAddPk { pair, .. } => vec![*pair],
+        Stmt::VarMfmaF16Z { a, b, .. } => vec![*a, *b],
+        Stmt::VarLoadB128 { base, .. } => vec![*base],
+        Stmt::VarMfmaScale { a, b, scale_a, scale_b, .. } | Stmt::VarMfmaScaleZ { a, b, scale_a, scale_b, .. } => {
+            vec![*a, *b, *scale_a, *scale_b]
+        }
+        Stmt::BeginLoop { init, .. } => init.clone(),
+        Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => vec![*cond],
+        _ => Vec::new(),
+    }
+}
+
+/// Semantics of loop variables: a read of a loop variable (`Opnd::Var`) **after a `set_var` of the same variable in
+/// the same iteration** is easy to get wrong - the author usually expects the value just written, but the variable is
+/// loop-carried state whose value after a `set_var` is not guaranteed by the contract (docs/verification.md); use a
+/// plain SSA value (the operand you passed to `set_var`) for intra-iteration producer/consumer pairs.
+/// This lint reports such reads conservatively (a `set_var` inside an `if` counts). Cross-iteration reads (read before
+/// the `set_var`, the common case), reads of the loop condition value held in an SSA value, and reads after the loop are
+/// not reported. Kernels that really intend this can call `FnBuilder::allow_var_rereads()`.
+pub fn lint(f: &Function) -> Vec<String> {
+    if f.allow_var_rereads {
+        return Vec::new();
+    }
+    struct L {
+        vars: HashSet<VarId>,
+        set_so_far: HashSet<VarId>,
+    }
+    let mut stack: Vec<L> = Vec::new();
+    let mut out = Vec::new();
+    for (idx, st) in f.stmts.iter().enumerate() {
+        for o in stmt_operands(st) {
+            if let Opnd::Var(v) = o {
+                if let Some(l) = stack.iter().rev().find(|l| l.vars.contains(&v)) {
+                    if l.set_so_far.contains(&v) {
+                        out.push(format!(
+                            "stmt {idx}: loop variable var{} is read after set_var(var{}) in the same iteration; the value of such a read is not defined by the DSL contract (the lowering usually returns the value just written, other paths can return the iteration-start value) - use the SSA value passed to set_var",
+                            v.0, v.0
+                        ));
+                    }
+                }
+            }
+        }
+        match st {
+            Stmt::BeginLoop { vars, .. } => stack.push(L { vars: vars.iter().copied().collect(), set_so_far: HashSet::new() }),
+            Stmt::EndLoop => {
+                stack.pop();
+            }
+            Stmt::SetVar { var, .. } => {
+                if let Some(l) = stack.iter_mut().rev().find(|l| l.vars.contains(var)) {
+                    l.set_so_far.insert(*var);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
