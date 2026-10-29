@@ -7253,6 +7253,16 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let m_var = vars[1];
     let l_var = vars[2];
     let o_vars = [vars[3], vars[4], vars[5], vars[6]];
+    let peel = fmha_t_opt("peel");
+    if peel {
+        // the tail iteration (fewer than 128 keys) leaves the loop here and runs once, peeled, after it: the loop body only
+        // contains the unmasked code (smaller instruction footprint)
+        let key0h = b.shl_i32(it, c7);
+        let key_endh = b.add_i32(key0h, c128v);
+        let tail_h = b.cmp_lt_i32(cx.kv_len, key_endh);
+        b.break_if(Opnd::Val(tail_h));
+    }
+    let body = |b: &mut FnBuilder, masked_iter: bool| -> ValueId {
     let dbuf = fmha_t_opt("dbuf");
     // double buffering: compute reads buffer `par`, the next tile is staged into the other one
     let j4 = b.shl_i32(cx.j, c2);
@@ -7566,13 +7576,17 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
     };
     // the last iteration may hold fewer than 128 keys: only that one pays for the key mask
-    let key_end = b.add_i32(key0, c128v);
-    let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
-    b.begin_if(Opnd::Val(is_tail));
-    compute(b, true);
-    b.else_();
-    compute(b, false);
-    b.end_if();
+    if peel {
+        compute(b, masked_iter);
+    } else {
+        let key_end = b.add_i32(key0, c128v);
+        let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
+        b.begin_if(Opnd::Val(is_tail));
+        compute(b, true);
+        b.else_();
+        compute(b, false);
+        b.end_if();
+    }
     // all waves are done with this iteration's K/V; then publish the prefetched tile
     if !dbuf {
         b.wait_lds(0);
@@ -7595,10 +7609,20 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 
     let it_next = b.add_i32(it, c1);
     b.set_var(it, it_next);
+    it_next
+    };
+    let it_next = body(b, false);
     let more = b.cmp_lt_i32(it_next, cx.nkv);
     let stop = b.let_(Op::NotI1(Opnd::Val(more)));
     b.break_if(Opnd::Val(stop));
     b.end_loop();
+    if peel {
+        // peeled tail iteration (only when the loop left through the head test)
+        let has_tail_iter = b.cmp_lt_i32(it, cx.nkv);
+        b.begin_if(Opnd::Val(has_tail_iter));
+        body(b, true);
+        b.end_if();
+    }
 
     // ---- epilogue: O * (V descale / l_total) -> BF16, four dims per 8-byte store ----
     let l_tot = if let Some(la) = lacc {
