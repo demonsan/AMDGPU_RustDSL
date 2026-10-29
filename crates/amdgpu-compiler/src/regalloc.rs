@@ -655,6 +655,40 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
             break;
         }
     }
+    // Pruned liveness: a slot is only live where some definition of it can reach (forward may-defined sets). A slot that is
+    // live without any reaching definition is a read of an uninitialised value on an infeasible path (for example two
+    // correlated `if`s); keeping it live would only inflate the pressure.
+    let mut def_in: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    let mut def_out: Vec<HashSet<Slot>> = kill.clone();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    for (b, ss) in succs.iter().enumerate() {
+        for &s in ss {
+            preds[s].push(b);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for bi in 0..nb {
+            let mut inn: HashSet<Slot> = HashSet::new();
+            for &p in &preds[bi] {
+                inn.extend(def_out[p].iter().copied());
+            }
+            let mut out = inn.clone();
+            out.extend(kill[bi].iter().copied());
+            if inn != def_in[bi] || out != def_out[bi] {
+                def_in[bi] = inn;
+                def_out[bi] = out;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for bi in 0..nb {
+        live_in[bi].retain(|s| def_in[bi].contains(s));
+        live_out[bi].retain(|s| def_out[bi].contains(s));
+    }
     let mut raw: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
     for (bi, b) in m.blocks.iter().enumerate() {
         if b.insts.is_empty() {
@@ -683,7 +717,12 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
             }
         }
         for (s, e) in open {
-            raw[(s / 16) as usize].push((first, e));
+            if def_in[bi].contains(&s) {
+                raw[(s / 16) as usize].push((first, e));
+            } else {
+                // a use with no reaching definition: keep just the use position
+                raw[(s / 16) as usize].push((e, e));
+            }
         }
     }
     // merge overlapping / touching segments per vreg
