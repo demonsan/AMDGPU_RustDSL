@@ -1,5 +1,6 @@
 //! Backend for the AMDGPU Rust DSL: lowering, register allocation, emission.
 
+pub mod asm;
 pub mod backend;
 pub mod emit;
 pub mod hazards;

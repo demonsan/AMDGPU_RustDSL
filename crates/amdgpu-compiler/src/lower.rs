@@ -3295,15 +3295,4 @@ fn mask_regs(m: &mut MFunction, stride: usize) {
         }
     }
 }
-/// `MOp` by variant name (the safe-asm export uses the names; the table is `backend::ALL_MOPS` plus the ops that are own-backend only).
-fn mop_by_name(n: &str) -> Option<MOp> {
-    match n {
-        "SNop" => Some(MOp::SNop),
-        "SWaitLgkm" => Some(MOp::SWaitLgkm),
-        "SWaitVm" => Some(MOp::SWaitVm),
-        "VWriteSub" => Some(MOp::VWriteSub),
-        "VCmpMaskLtI32" => Some(MOp::VCmpMaskLtI32),
-        "VCndmaskM" => Some(MOp::VCndmaskM),
-        _ => crate::backend::ALL_MOPS.iter().copied().find(|m| format!("{m:?}") == n),
-    }
-}
+use crate::asm::mop_by_name;
