@@ -9,6 +9,7 @@
 # Env:
 #   REF_CO    vendor .co          (default /shared/amdgpu/home/blyu_qle/sessions/ref_mxfp8.co)
 #   OURS_CO   our .co             (default build/ours_t.co; built here with amdc + clang if missing)
+#   OURS_KERNEL  kernel name inside OURS_CO (default fmha_fwd_hd128_mxfp8_t)
 #   ROCM_PATH ROCm used for clang/llvm-objdump (default 10.1.0); the profiler comes from ROCM_PROF
 #             (default /shared/apps/ubuntu/opt/rocm-7.2.4 - rocprofv3 1.1.0; the 10.1.0 one aborts)
 #   HIP_VISIBLE_DEVICES  default 5
@@ -40,10 +41,11 @@ export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-5}"
 
 # ---- our code object: emit with the default (llvm-tail) build and assemble -----------------------
 if [ ! -s "$OURS_CO" ]; then
-    echo "[vendor_counters] emitting our kernel (default llvm-tail)"
+    K="${OURS_KERNEL:-fmha_fwd_hd128_mxfp8_t}"
+    echo "[vendor_counters] emitting $K (default llvm-tail)"
     ASM_ROC="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}"
     mkdir -p "$(dirname "$OURS_CO")"
-    bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_t \
+    bash tools/container/cargo.sh run -q --bin amdc -- emit "$K" \
         --out /work/build/ours_t.s 2>&1 | grep -E "^error|compile error" && exit 1
     "$ASM_ROC/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 \
         -mcode-object-version=6 -o "$OURS_CO" build/ours_t.s || exit 1
@@ -57,7 +59,7 @@ fi
 set -- ${PROFILE_SHAPE:-1 8 2048 2048}
 B="$1"; H="$2"; S="$3"; SK="$4"; ITERS="${REF_ITERS:-5}"
 COMMON="REF_B=$B REF_H=$H REF_S=$S REF_SK=$SK REF_HK=$H REF_ROWS=2 REF_ITERS=$ITERS \
-REF_CO2=$OURS_CO REF_KNAME2=fmha_fwd_hd128_mxfp8_t"
+REF_CO2=$OURS_CO REF_KNAME2=${OURS_KERNEL:-fmha_fwd_hd128_mxfp8_t}"
 
 run_pass() { # $1 tag, rest = counters
     P="$1"; shift
