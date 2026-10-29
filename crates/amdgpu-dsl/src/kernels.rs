@@ -9254,13 +9254,17 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let w_q = b.let_(Op::AddI32(Opnd::Val(h), Opnd::Val(h_sh)));
             let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
             let dupd = b.frag2_dup(delta);
-            b.var_add_pk(s_vars[0], dupd);
-            b.var_add_pk(s_vars[1], dupd);
+            if !ablate.contains("rbnos") {
+                b.var_add_pk(s_vars[0], dupd);
+                b.var_add_pk(s_vars[1], dupd);
+            }
             let ex = b.mul_f32(delta, c512f);
             let corr = b.exp2_f32(ex);
             let cd = b.frag2_dup(corr);
-            for e in 0..4usize {
-                b.var_scale_pk(o_vars[e], cd);
+            if !ablate.contains("rbnoo") {
+                for e in 0..4usize {
+                    b.var_scale_pk(o_vars[e], cd);
+                }
             }
             b.var_scale_lane(la, 0, corr);
             let nb = b.frag2(w_new, w_new);
