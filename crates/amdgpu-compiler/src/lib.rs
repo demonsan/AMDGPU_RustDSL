@@ -63,7 +63,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/status.md round 47).
     let base = if f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
         let mut v: Vec<&str> = vec!["dce", "cmpfold", "scalarize"];
-        if f.name.ends_with("_vs128") {
+        if f.name.ends_with("_vs128") || f.name.ends_with("_vsm") {
             v.push("imm"); // constants as inline/literal operands: slack in the register file (docs/status.md round 49)
         }
         v.extend_from_slice(extra);
@@ -85,7 +85,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
             // merged tree (docs/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
             let mut o = sched::Options::default();
             // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/status.md round 49)
-            if !f.name.ends_with("_vs128") {
+            if !f.name.ends_with("_vs128") && !f.name.ends_with("_vsm") {
                 o.reorder = false;
                 o.alu_across_barrier = true;
                 o.ldshoist = true; // hoist ds_read above independent work (docs/scheduling.md); AMDC_SCHED=0 / 1 / auto / OPTS override
@@ -200,6 +200,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_sv" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_sv()),
         "fmha_fwd_hd128_mxfp8_vs" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vs()),
         "fmha_fwd_hd128_mxfp8_vs128" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vs128()),
+        "fmha_fwd_hd128_mxfp8_vsm" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vsm()),
         "probe_dma" => Some(amdgpu_dsl::kernels::probe_dma()),
         "probe_dma_tile" => Some(amdgpu_dsl::kernels::probe_dma_tile()),
         "probe_dma_seq" => Some(amdgpu_dsl::kernels::probe_dma_seq()),
