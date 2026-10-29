@@ -2172,7 +2172,12 @@ impl Lowerer {
         if !opt_on("sbound") || self.const_bits(a).is_some() {
             return Ok(None);
         }
-        let Some(sb) = self.sgpr_src(b) else { return Ok(None) };
+        // the bound may already have a VGPR copy (`converted`): the scalar original is still the value to use
+        let sb = match b {
+            Opnd::Val(v) => self.val.get(&v).copied().filter(|r| self.mir.vreg_class(*r) == RClass::S1),
+            o => self.sgpr_src(o),
+        };
+        let Some(sb) = sb else { return Ok(None) };
         let (core, k) = self.split_const(a);
         if k.abs() >= (1 << 20) {
             return Ok(None);
