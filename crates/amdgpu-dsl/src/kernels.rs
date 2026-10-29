@@ -9019,6 +9019,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let ones_w = b.c_i32(0x38383838);
     // smf: row sums with two v_smfmac_f32_16x16x128_fp8_fp8 per 128 keys (A = constant E4M3 ones, complementary 2:4 index patterns for the
     // two P halves, docs/vendor-spec.md 4.5.1; accumulate from the zero-initialised loop variable only) instead of the ones-MFMA
+    let smfdbg = fmha_t_opt("smfdbg"); // diagnostic: msum row sums stay in use; the smfmac sums are accumulated beside them and dumped
     let smf = fmha_t_opt("smf");
     assert!(!(smf && svscale), "smf (smfmac row sums) has no scale operand: it cannot carry svscale");
     let ones8 = b.frag8(ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w);
@@ -9085,6 +9086,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     if let Some(k0) = kdp0 {
         init_vars.push((DType::I32, Opnd::Val(k0))); // 10 (group A): K scales of tile it + 1, loaded one iteration ago
     }
+    if smfdbg {
+        init_vars.push((DType::Frag4, Opnd::Val(zero4))); // smfmac row sums beside msum (diagnostic)
+    }
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
     // the loop runs the full tiles 0 .. nkv-2; the last tile (possibly partial) is peeled after it
@@ -9098,6 +9102,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let la = vars[8];
     let idx = vars[9];
     let kdp = if role_a { Some(vars[10]) } else { None };
+    let ls_var = if smfdbg { Some(*vars.last().unwrap()) } else { None };
     // deferred completion: the DMA of tile t+1 (issued one iteration ago) must have landed; this iteration's loads may stay in flight
     let n_vm: u8 = if role_a { 5 } else { 4 };
     let no_vmwait = ablate.contains("novmwait");
@@ -9318,6 +9323,10 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot)).collect();
         let p8 = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
         let scb = if w.len() > 8 { w[8] } else { c123 };
+        if let Some(lsv) = ls_var {
+            b.var_smfmac_fp8(lsv, a_ones, p8, idx01);
+            b.var_smfmac_fp8(lsv, a_ones, p8, idx23);
+        }
         if smf {
             // one smfmac contracts 64 of the 128 K positions of a B operand: the complementary patterns on the same P half cover all of it
             let _ = hh;
@@ -9452,7 +9461,15 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.store_f32(o_ptr0, off + 4, f1);
         }
     }
-    b.end_if();
+    if let Some(lsv) = ls_var {
+        // dump: dwords 0..3 of the smfmac sums and dword 0 of the msum row sums into the first five f32 slots of this lane's output row
+        for j in 0..4u8 {
+            let d = b.frag4_lane(lsv, j);
+            let f = b.bitcast_f32(d);
+            b.store_f32(o_ptr0, 4 * j as u32, f);
+        }
+        b.store_f32(o_ptr0, 16, l_tot);
+    }    b.end_if();
 }
 
 /// 128-key-unit variant of the vendor-structure kernel (mha_fwd_hd128_mxfp8_vs128): one rollback decision and two barriers per 128 keys.
