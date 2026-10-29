@@ -34,6 +34,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e PD_QS="${PD_QS:-}" \
     -e PD_REV="${PD_REV:-}" \
     -e PD_DUMMY="${PD_DUMMY:-}" \
+    -e PD_SWZ="${PD_SWZ:-}" \
     -e FMHA_LDSPAD="${FMHA_LDSPAD:-}" \
     -e AMDC_ORACLE_OUT="${AMDC_ORACLE_OUT:-}" \
     -e AMDC_TEST_KERNELS="${AMDC_TEST_KERNELS:-}" \

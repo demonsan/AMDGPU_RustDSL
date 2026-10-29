@@ -1086,6 +1086,99 @@ pub fn probe_dma_seq() -> Function {
     }
     b.finish()
 }
+/// DMA + K-fragment read probe (256 threads): the tile of `probe_dma_tile` is staged with the (optionally
+/// XOR-swizzled, PD_SWZ=1) DMA layout of `fmha_fwd_hd128_mxfp8_sv`, then thread t (j = t & 31, g = (t >> 5) & 1)
+/// reads the four 16-byte K fragment chunks `g ^ 2 k` of row `j` (+ 32 rows per wave group w = t >> 6) the way the
+/// kernel does and stores them. `o[(t * 4 + k) * 16 ..]` must equal `i[(j + 32 (t >> 6)) * 128 + 16 (g ^ 2 k) ..]`.
+pub fn probe_dma_kread() -> Function {
+    let swz = std::env::var("PD_SWZ").is_ok();
+    let mut b = FnBuilder::new("probe_dma_kread", 256);
+    b.lds(20000);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("i", DType::Ptr, 8, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let inp = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c1 = b.c_i32(1);
+    let c3 = b.c_i32(3);
+    let c4 = b.c_i32(4);
+    let c5 = b.c_i32(5);
+    let c6 = b.c_i32(6);
+    let c7 = b.c_i32(7);
+    let c10 = b.c_i32(10);
+    let c31 = b.c_i32(31);
+    let c63 = b.c_i32(63);
+    let c128 = b.c_i32(128);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
+    let lane_hi = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::Val(c3)));
+    let lane_lo = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::Val(c7)));
+    let w_odd = b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c1)));
+    let c2 = b.c_i32(2);
+    let w4 = b.shl_i32(w_odd, c2);
+    let lane_h4 = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::Val(c4)));
+    let fs0 = b.add_i32(w4, lane_h4);
+    let fsw_raw = b.let_(Op::AndI32(Opnd::Val(fs0), Opnd::Val(c7)));
+    let zero = b.c_i32(0);
+    let fsw = if swz { fsw_raw } else { zero };
+    let cch = b.xor_i32(lane_lo, fsw);
+    let cbytes = b.shl_i32(cch, c4);
+    let w8 = b.shl_i32(wave, c3);
+    let rowb = b.add_i32(lane_hi, w8);
+    let w1024 = b.shl_i32(wave, c10);
+    for q in 0..4i32 {
+        let cq = b.c_i32(32 * q);
+        let row = b.add_i32(rowb, cq);
+        let r128 = b.mul_i32(row, c128);
+        let off = b.add_i32(r128, cbytes);
+        let sp = b.ptr_add(inp, off);
+        let cl = b.c_i32(4096 * q);
+        let l = b.add_i32(w1024, cl);
+        b.load_global_lds(sp, l, 0, 4);
+    }
+    // trailing DMA (see emit_fmha_sv_role)
+    {
+        let spare = b.c_i32(17408);
+        let sp = b.ptr_add(inp, b.c_i32(0));
+        let _ = sp;
+        let r0 = b.mul_i32(lane, b.c_i32(16));
+        let sp2 = b.ptr_add(inp, r0);
+        b.load_global_lds(sp2, spare, 0, 4);
+    }
+    b.wait_vm(0);
+    b.wait_lds(0);
+    b.barrier();
+    // K-fragment style reads
+    let j = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let g = b.let_(Op::AndI32(Opnd::Val(b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5))), Opnd::Val(c1)));
+    let jj = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c31)));
+    let _ = j;
+    let wsel = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let w32 = b.shl_i32(wsel, c5);
+    let rowk = b.add_i32(jj, w32);
+    let jrow = b.mul_i32(rowk, c128);
+    let js1 = b.let_(Op::LshrI32(Opnd::Val(rowk), Opnd::Val(c1)));
+    let f0 = b.let_(Op::AndI32(Opnd::Val(js1), Opnd::Val(c7)));
+    let fk = if swz { f0 } else { zero };
+    let x = b.xor_i32(g, fk);
+    let t64 = b.shl_i32(tid, c6);
+    for k in 0..4i32 {
+        let c2k = b.c_i32(2 * k);
+        let xk = b.xor_i32(x, c2k);
+        let xs = b.shl_i32(xk, c4);
+        let a = b.add_i32(jrow, xs);
+        let v = b.load_lds_b128(Opnd::Val(a));
+        let ob = b.c_i32(16 * k);
+        let o1 = b.add_i32(t64, ob);
+        let op = b.ptr_add(o, o1);
+        for w in 0..4u8 {
+            let xw = b.frag4_lane(v, w);
+            let f = b.bitcast_f32(xw);
+            b.store_f32(op, 4 * w as u32, f);
+        }
+    }
+    b.finish()
+}
 /// Pack instruction probe: checks the semantics of `v_cvt_pknorm_u16_f32` and
 /// of the fp8 packing path.
 ///
