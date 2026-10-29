@@ -9675,13 +9675,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let mut out: Vec<ValueId> = Vec::with_capacity(4);
         for s in 0..4usize {
             let biasf = b.mfma_f16_wide(ones_f16, bias_init, zero);
-            let ko = b.c_i32(512 * ((s as i32) & 1) + 8320 * ((s as i32) >> 1));
-            let kaddr0 = b.add_i32(cx.kf_base, ko);
-            let kaddr0h = b.add_i32(kaddr0, c32v);
-            let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
-            let kaddr1 = b.add_i32(kaddr0, c64);
-            let kaddr1h = b.add_i32(kaddr1, c32v);
-            let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
+            let ko = b.c_i32(4096 * (s as i32));
+            let a0 = b.add_i32(cx.kfx[0], ko);
+            let a1 = b.add_i32(cx.kfx[1], ko);
+            let a2 = b.add_i32(cx.kfx[2], ko);
+            let a3 = b.add_i32(cx.kfx[3], ko);
+            let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
+            let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
             let koff = b.c_i32(128 * s as i32);
             let ka = b.add_i32(kd_cur, koff);
             let kd = b.load_lds_b32(Opnd::Val(ka));
@@ -9755,17 +9755,17 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // QK of the whole tile (4 x 32 keys) in ring slot `slot`: S' = bias + scaled K.Q^T, in place
     let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId| {
-        let kf_b = b.add_i32(cx.kf_base, slot);
+        let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot)).collect();
         let kd_rd = b.add_i32(kd_cur, kdslot);
         for s in 0..4usize {
             b.var_mfma_f16_z(s_vars[s], ones_f16, bias2);
-            let ko = b.c_i32(512 * ((s as i32) & 1) + 8320 * ((s as i32) >> 1));
-            let kaddr0 = b.add_i32(kf_b, ko);
-            let kaddr0h = b.add_i32(kaddr0, c32v);
-            let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
-            let kaddr1 = b.add_i32(kaddr0, c64);
-            let kaddr1h = b.add_i32(kaddr1, c32v);
-            let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
+            let ko = b.c_i32(4096 * (s as i32));
+            let a0 = b.add_i32(kfb[0], ko);
+            let a1 = b.add_i32(kfb[1], ko);
+            let a2 = b.add_i32(kfb[2], ko);
+            let a3 = b.add_i32(kfb[3], ko);
+            let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
+            let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
             let koff = b.c_i32(128 * s as i32);
             let ka = b.add_i32(kd_rd, koff);
             let kd = b.load_lds_b32(Opnd::Val(ka));
@@ -9888,7 +9888,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // PV of the whole tile (V in ring slot `slot`, P words `w`) and its row sums
     let pv_w = |b: &mut FnBuilder, slot: ValueId, w: &[ValueId]| {
-        let tr_b = b.add_i32(cx.tr_base, slot);
+        let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot)).collect();
         for hh in 0..2usize {
             let o = 8 * hh;
             let p8 = b.frag8(w[o], w[o + 1], w[o + 2], w[o + 3], w[o + 4], w[o + 5], w[o + 6], w[o + 7]);
@@ -9896,8 +9896,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             for e in 0..4usize {
                 let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
                 for r in 0..4i32 {
-                    let off = b.c_i32((hh as i32) * 8320 + 256 * r + (e as i32) * 32);
-                    addrs.push(b.add_i32(tr_b, off));
+                    let off = b.c_i32((hh as i32) * 8192 + 2048 * r);
+                    addrs.push(b.add_i32(trb[e], off));
                 }
                 let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
                 b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
