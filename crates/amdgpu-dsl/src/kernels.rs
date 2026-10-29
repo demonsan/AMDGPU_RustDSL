@@ -7587,7 +7587,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let pitch = fmha_t_pitch();
     let zero = b.frag_zero(DType::Frag16);
     let hq4 = cx.kd_stride;
-    let c_thr = b.c_f32(135.0 / 512.0);
+    let c_thr = b.c_f32(if fmha_t_opt("svinf") { 1.0e9 } else { 135.0 / 512.0 });
     let c_b131 = b.c_f32(131.0 / 512.0);
     let c8f = b.c_f32(8.0);
     let c0125 = b.c_f32(0.125);
