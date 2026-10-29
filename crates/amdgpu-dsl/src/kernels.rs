@@ -8995,7 +8995,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let s_init: Vec<ValueId> = if role_a {
         let mut out: Vec<ValueId> = Vec::with_capacity(2);
         for sl in 0..2usize {
-            let biasf = b.mfma_f16(ones_f16, bias_init, zero);
+            let biasf = b.mfma_f16_wide(ones_f16, bias_init, zero);
             let ko = b.c_i32(512 * ((sl as i32) & 1));
             let kaddr0 = b.add_i32(cx.kf_base, ko);
             let kaddr0h = b.add_i32(kaddr0, c32v);
