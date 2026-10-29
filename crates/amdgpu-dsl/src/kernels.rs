@@ -9166,6 +9166,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
 
     let a_body = role_a || fmha_t_opt("vsseq");
+    let first_pass = b.cmp_lt_i32(it, c1);
     if fmha_t_opt("vsflat") {
         // sequential order of the sv role with the same phase closures (no pipelining): QK, softmax, PV per 64-key unit
         qk(b, 0, slot_cur, kds_cur);
