@@ -7164,7 +7164,9 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let sdst = b.add_i32(lds_base, cx.rt64);
     let kdlds = fmha_t_opt("kdlds");
     let nbuf_l = if fmha_t_opt("dbuf") { 2 } else { 1 };
-    let lds_kd = b.c_i32(nbuf_l * 256 * pitch + 2048);
+    let dma_l = fmha_t_opt("dma");
+    let cbuf_i: i32 = if dma_l { 33280 } else { 256 * pitch };
+    let lds_kd = b.c_i32(nbuf_l * cbuf_i + 2048);
     let rt_row4 = b.shl_i32(cx.rt_row, c2);
     let kdb0 = if fmha_t_opt("swz") && !fmha_t_opt("dma") {
         // the two threads of a row write the same K-scale dword: send the odd one to a scratch dword (unique addresses, banks 32..63 of the next 256 B)
@@ -7177,7 +7179,59 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     } else {
         b.add_i32(lds_kd, rt_row4)
     };
-    let stage_loads = |b: &mut FnBuilder, key0: ValueId| -> Vec<ValueId> {
+    // ---- global -> LDS DMA staging (opt-in `dma`, own backend): see the sv role for the layout derivation ----
+    let dma = dma_l && !(role_a && fmha_t_opt("nodmak")) && !(!role_a && fmha_t_opt("nodmav"));
+    let hq4_d = cx.kd_stride;
+    let c3d = b.c_i32(3);
+    let c6d = b.c_i32(6);
+    let c7d = b.c_i32(7);
+    let lane_v = {
+        let t8 = b.shl_i32(cx.g4, c3d);
+        b.add_i32(cx.j, t8)
+    };
+    let lane_hi = b.let_(Op::LshrI32(Opnd::Val(lane_v), Opnd::Val(c3d)));
+    let lane_lo = b.let_(Op::AndI32(Opnd::Val(lane_v), Opnd::Val(c7d)));
+    let w4_odd = b.let_(Op::AndI32(Opnd::Val(cx.wave4), Opnd::Val(c1)));
+    let cbytes = b.shl_i32(lane_lo, c4);
+    let w8s = b.shl_i32(lane_hi, c3d);
+    let w_hi = b.let_(Op::LshrI32(Opnd::Val(cx.wave4), Opnd::Val(c1)));
+    let w_hi64 = b.shl_i32(w_hi, c6d);
+    let w_lo4 = b.shl_i32(w4_odd, c2);
+    let rw0 = b.add_i32(w8s, w_hi64);
+    let rowb = b.add_i32(rw0, w_lo4);
+    let c4160 = b.c_i32(4160);
+    let w4160 = b.mul_i32(cx.wave4, c4160);
+    let c3120 = b.c_i32(3120);
+    let w_top = b.add_i32(w4160, c3120);
+    let lds_tile = b.add_i32(lds_base, w_top);
+    let kd_row_load = |b: &mut FnBuilder, key0: ValueId| -> ValueId {
+        let srow_raw = b.add_i32(key0, cx.rt_row);
+        let srow_ok = b.cmp_lt_i32(srow_raw, cx.kv_len);
+        let srow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(srow_ok), a: Opnd::Val(srow_raw), b: Opnd::Val(cx.kv_last) });
+        let kd_row = b.mul_i32(srow, hq4_d);
+        let kd_off = b.add_i32(kd_row, cx.kd_base);
+        let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+        let kd_raw = b.load_f32(kd_ptr, 0);
+        b.bitcast_i32(kd_raw)
+    };
+    let dma_issue = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId| {
+        let rb = b.add_i32(key0, rowb);
+        let lbase = b.add_i32(lds_tile, buf_off);
+        for q in 0..4i32 {
+            let cq = b.c_i32(q);
+            let row_raw = b.add_i32(rb, cq);
+            let ok = b.cmp_lt_i32(row_raw, cx.kv_len);
+            let row = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(row_raw), b: Opnd::Val(cx.kv_last) });
+            let o0 = b.mul_i32(row, seqs);
+            let o1 = b.add_i32(o0, base_off);
+            let o2 = b.add_i32(o1, cbytes);
+            // the instruction offset (negative, -1040 (3 - q)) is added to the global address too: compensate
+            let comp = b.c_i32(1040 * (3 - q));
+            let o3 = b.add_i32(o2, comp);
+            let sp = b.ptr_add(ptr, o3);
+            b.load_global_lds(sp, lbase, -(1040 * (3 - q)), 4);
+        }
+    };    let stage_loads = |b: &mut FnBuilder, key0: ValueId| -> Vec<ValueId> {
         let srow_raw = b.add_i32(key0, cx.rt_row);
         let srow_ok = b.cmp_lt_i32(srow_raw, cx.kv_len);
         // rows past the end of the keys (partial last tile) are clamped to the last valid row
@@ -7217,9 +7271,18 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
     };
     let key_first = b.c_i32(0);
-    let first = stage_loads(b, key_first);
-    let sd0 = if swz { b.c_i32(0) } else { sdst };
-    stage_stores(b, sd0, kdb0, &first);
+    let first = if dma { Vec::new() } else { stage_loads(b, key_first) };
+    if dma {
+        let kd0 = if role_a && kdlds { Some(kd_row_load(b, key_first)) } else { None };
+        dma_issue(b, key_first, c0);
+        b.wait_vm(0);
+        if let Some(kd) = kd0 {
+            b.store_lds_b32(Opnd::Val(kdb0), Opnd::Val(kd));
+        }
+    } else {
+        let sd0 = if swz { b.c_i32(0) } else { sdst };
+        stage_stores(b, sd0, kdb0, &first);
+    }
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
@@ -7276,8 +7339,8 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let dbuf = fmha_t_opt("dbuf");
     // double buffering: compute reads buffer `par`, the next tile is staged into the other one
     let j4 = b.shl_i32(cx.j, c2);
-    let (kf_b, tr_b, sdst_n, kdb_n, kd_rd, cur_buf) = if dbuf {
-        let cbuf = b.c_i32(256 * fmha_t_pitch());
+    let (kf_b, tr_b, sdst_n, kdb_n, kd_rd, cur_buf, buf_nxt, _kd_nxt) = if dbuf {
+        let cbuf = b.c_i32(cbuf_i);
         let co = b.mul_i32(par, cbuf);
         let npar = b.xor_i32(par, c1);
         let no = b.mul_i32(npar, cbuf);
@@ -7286,10 +7349,10 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let kno = b.mul_i32(npar, c512);
         let kd0 = b.add_i32(lds_kd, j4);
         let sdn = if swz { no } else { b.add_i32(sdst, no) };
-        (b.add_i32(cx.kf_base, co), b.add_i32(cx.tr_base, co), sdn, b.add_i32(kdb0, kno), b.add_i32(kd0, kco), co)
+        (b.add_i32(cx.kf_base, co), b.add_i32(cx.tr_base, co), sdn, b.add_i32(kdb0, kno), b.add_i32(kd0, kco), co, no, kno)
     } else {
         let z = b.c_i32(0);
-        (cx.kf_base, cx.tr_base, sdst, kdb0, b.add_i32(lds_kd, j4), z)
+        (cx.kf_base, cx.tr_base, sdst, kdb0, b.add_i32(lds_kd, j4), z, z, z)
     };
     let kfb: Vec<ValueId> = if swz { (0..4usize).map(|k| b.add_i32(cx.kfx[k], cur_buf)).collect() } else { Vec::new() };
     let trb: Vec<ValueId> = if swz { (0..4usize).map(|e| b.add_i32(cx.trx[e], cur_buf)).collect() } else { Vec::new() };
@@ -7321,14 +7384,24 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     } else {
         Vec::new()
     };
-    let pre = if no_stage { first.clone() } else { stage_loads(b, key_next) };
+    let pre = if dma {
+        Vec::new()
+    } else if no_stage {
+        first.clone()
+    } else {
+        stage_loads(b, key_next)
+    };
+    let kd_pending = if dma && role_a && kdlds { Some(kd_row_load(b, key_next)) } else { None };
+    if dma {
+        dma_issue(b, key_next, buf_nxt);
+    }
     let compute = |b: &mut FnBuilder, masked: bool| {        for hh in 0..2usize {
             // ---- two 32-key score tiles (S^T = K Q^T) of this 64-key substep ----
             let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
             let mut sfr: Vec<ValueId> = Vec::with_capacity(2);
             for sl in 0..2usize {
                 let s = 2 * hh + sl;
-                let ko = b.c_i32(32 * pitch * (s as i32));
+                let ko = if dma_l { b.c_i32(512 * ((s as i32) & 1) + 8320 * ((s as i32) >> 1)) } else { b.c_i32(32 * pitch * (s as i32)) };
                 let (k8_0, k8_1) = if swz {
                     let a0 = b.add_i32(kfb[0], ko);
                     let a1 = b.add_i32(kfb[1], ko);
@@ -7574,7 +7647,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                         let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r);
                         addrs.push(b.add_i32(trb[e], off));
                     } else {
-                        let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32);
+                        let off = if dma_l { b.c_i32((hh as i32) * 8320 + 256 * r + (e as i32) * 32) } else { b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32) };
                         addrs.push(b.add_i32(tr_b, off));
                     }
                 }
@@ -7598,14 +7671,21 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.end_if();
     }
     // all waves are done with this iteration's K/V; then publish the prefetched tile
-    if !dbuf {
-        b.wait_lds(0);
-        if !no_bar {
-            b.barrier();
+    if dma {
+        b.wait_vm(0);
+        if let Some(kd) = kd_pending {
+            b.store_lds_b32(Opnd::Val(kdb_n), Opnd::Val(kd));
         }
-    }
-    if !no_stage {
-        stage_stores(b, sdst_n, kdb_n, &pre);
+    } else {
+        if !dbuf {
+            b.wait_lds(0);
+            if !no_bar {
+                b.barrier();
+            }
+        }
+        if !no_stage {
+            stage_stores(b, sdst_n, kdb_n, &pre);
+        }
     }
     b.wait_lds(0);
     if !no_bar {
