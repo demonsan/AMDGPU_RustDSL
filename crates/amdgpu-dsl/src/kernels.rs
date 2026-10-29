@@ -9836,7 +9836,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a3 = b.add_i32(kfb[3], ko);
             let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
             let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
-            let kd = if kd_pre.is_empty() {
+            let kd = if ablate.contains("kdc") {
+                b.c_i32(0x7f7f7f7f)
+            } else if kd_pre.is_empty() {
                 let koff = b.c_i32(128 * s as i32);
                 let ka = b.add_i32(kd_rd, koff);
                 b.load_lds_b32(Opnd::Val(ka))
@@ -9919,14 +9921,18 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let w_q = b.let_(Op::AddI32(Opnd::Val(h), Opnd::Val(h_sh)));
             let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
             let dupd = b.frag2_dup(delta);
-            for s in 0..4usize {
-                b.var_add_pk(s_vars[s], dupd);
+            if !ablate.contains("rbnos") {
+                for s in 0..4usize {
+                    b.var_add_pk(s_vars[s], dupd);
+                }
             }
             let ex = b.mul_f32(delta, c512f);
             let corr = b.exp2_f32(ex);
             let cd = b.frag2_dup(corr);
-            for e in 0..4usize {
-                b.var_scale_pk(o_vars[e], cd);
+            if !ablate.contains("rbnoo") {
+                for e in 0..4usize {
+                    b.var_scale_pk(o_vars[e], cd);
+                }
             }
             b.var_scale_lane(la, 0, corr);
             let nb = b.frag2(w_new, w_new);
