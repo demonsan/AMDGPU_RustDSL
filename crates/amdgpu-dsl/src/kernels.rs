@@ -8676,6 +8676,16 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.break_if(Opnd::Val(stop));
     b.end_loop();
 
+    if fmha_t_opt("dbgret") {
+        return;
+    }
+    if fmha_t_opt("dbgload") {
+        let kaddr0h = b.add_i32(cx.kf_base, c32v);
+        let kd0 = b.load_lds_b128x2(Opnd::Val(cx.kf_base), Opnd::Val(kaddr0h));
+        let w = b.frag16_lane(kd0, 0);
+        let f = b.bitcast_f32(w);
+        b.store_lds_b32(Opnd::Val(cx.ex_own), Opnd::Val(b.bitcast_i32(f)));
+    }
     if fmha_t_opt("dbgk") {
         // debug: dump the first 64 bytes of this lane's K row (as read from LDS buffer 0 with the kernel's fragment addressing)
         // into the output instead of the result (use with a single KV tile, SK <= 128)
