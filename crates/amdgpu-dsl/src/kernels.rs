@@ -11312,7 +11312,8 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     // tile): two complete code copies selected once at kernel start
     let vsx_split = sv && name.ends_with("_vs128") && (fmha_t_opt("vsx") || fmha_t_opt("corrshort"));
     if vsx_split {
-        let c3k = b.c_i32(3);
+        // short = fewer than `cs` tiles of 128 keys (default 3)
+        let c3k = b.c_i32(fmha_t_num("cs").unwrap_or(3) as i32);
         let short = b.cmp_lt_i32(cx.nkv, c3k);
         for pass in 0..2u8 {
             if pass == 0 {
