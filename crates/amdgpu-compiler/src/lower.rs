@@ -268,7 +268,7 @@ impl Lowerer {
         if spill_n > 0 {
             let (n, bytes) = lds_spill(&mut self.mir, spill_n);
             if n > 0 {
-                eprintln!("lds-spill: {n} loop-invariant values moved to LDS, {} bytes per value per workgroup, {bytes} bytes total", bytes / n.max(1));
+                eprintln!("lds-spill: {n} loop-invariant values moved to LDS, {} bytes per value per workgroup, {bytes} bytes total", bytes / (n.max(1) as u32));
                 crate::sched::waits::insert_waits(&mut self.mir);
             }
         }
