@@ -492,11 +492,51 @@ fn audit_kernel(name: &str) -> Vec<String> {
     audit_asm(name, &c.asm)
 }
 
+/// Build-time variants of the FMHA kernels read their options from the environment while the DSL
+/// function is *constructed*, so the audit has to rebuild the kernels under each option set. The
+/// known SGPR under-declaration only appeared with the DMA staging variant, so the environment is
+/// process-global: both tests that build kernels take this lock.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The `probe_dma*` kernels are registered but deliberately not in `kernel_names()` (the LLVM tail
+/// cannot emit their MIR), so a `kernel_names()` sweep alone would miss them.
+const DMA_PROBES: &[&str] = &["probe_dma", "probe_dma_tile", "probe_dma_seq", "probe_dma_kread", "probe_dma_map"];
+
+const DMA_OPTS: &str = "cvt4,pksub,lazy,msum,permlane,kdlds,dbuf,lacc1,psh2,svpk,svcorr,swz,dma";
+
 #[test]
 fn every_kernel_register_accounting_own_backend() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut bad = Vec::new();
     for name in kernel_names() {
         bad.extend(audit_kernel(name));
+    }
+    // Variants that change the lowering (and therefore the SGPR live ranges): the DMA path is the
+    // one where the under-declared `next_free_sgpr` corrupted hardware before it was found.
+    let variants: &[(&str, &str)] = &[("FMHA_OPT", DMA_OPTS), ("FMHA_OPT", "dma"), ("FMHA_LDSPAD", "8192")];
+    let saved: Vec<(&str, Option<String>)> =
+        ["FMHA_OPT", "FMHA_LDSPAD", "FMHA_ABLATE", "FMHA_PITCH"].iter().map(|v| (*v, std::env::var(v).ok())).collect();
+    for (var, val) in variants {
+        std::env::set_var(var, val);
+        for name in kernel_names() {
+            bad.extend(audit_kernel(name));
+        }
+        for name in DMA_PROBES {
+            bad.extend(audit_kernel(name));
+        }
+        std::env::remove_var(var);
+    }
+    for (var, val) in saved {
+        match val {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+    }
+    // The DMA probes are compiled (own backend only) but not enumerated by kernel_names().
+    for name in DMA_PROBES {
+        if kernel_by_name(name).is_some() {
+            bad.extend(audit_kernel(name));
+        }
     }
     if !bad.is_empty() {
         panic!(
@@ -528,6 +568,7 @@ fn llvm_tail_register_accounting() {
         eprintln!("SKIPPED: set AMDC_TEST_LLVM=1 to audit the LLVM tail assembly too");
         return;
     }
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !llc_available() {
         return;
     }
@@ -567,16 +608,16 @@ fn checker_detects_the_bug_class() {
     // (1) descriptor under-declares a VGPR that only appears as a tuple operand
     let asm = synthetic(&["ds_write_b128 v[2:3], v[60:67], off", "s_endpgm"], 64, 8);
     assert!(
-        audit_asm("bug", &asm).iter().any(|m| m.contains("next_free_vgpr") && m.contains("60:67")),
+        audit_asm("k", &asm).iter().any(|m| m.contains("next_free_vgpr") && m.contains("60:67")),
         "tuple-only VGPR use not detected: {:?}",
-        audit_asm("bug", &asm)
+        audit_asm("k", &asm)
     );
     // (2) descriptor under-declares SGPRs by one
     let asm = synthetic(&["s_mov_b32 s64, 0", "s_endpgm"], 4, 64);
     assert!(
-        audit_asm("bug", &asm).iter().any(|m| m.contains("next_free_sgpr")),
+        audit_asm("k", &asm).iter().any(|m| m.contains("next_free_sgpr")),
         "SGPR overrun not detected: {:?}",
-        audit_asm("bug", &asm)
+        audit_asm("k", &asm)
     );
     // (3) misaligned MFMA B operand (must be even)
     let asm = synthetic(
@@ -588,21 +629,21 @@ fn checker_detects_the_bug_class() {
         8,
     );
     assert!(
-        audit_asm("bug", &asm).iter().any(|m| m.contains("not aligned")),
+        audit_asm("k", &asm).iter().any(|m| m.contains("not aligned")),
         "misaligned MFMA tuple not detected: {:?}",
-        audit_asm("bug", &asm)
+        audit_asm("k", &asm)
     );
     // (4) read of a register that is not written on every path (stale read)
     let asm = String::from(
         "// synthetic\n.text\n.globl k\n.type k,@function\nk:\nBB0:\n    s_cbranch_scc1 BB2\n    s_branch BB1\nBB1:\n    v_mov_b32_e32 v2, 1\n    s_branch BB3\nBB2:\n    v_add_f32_e32 v3, v2, 1\n    s_endpgm\nBB3:\n    s_endpgm\n.size k, .-k\n.amdhsa_kernel k\n    .amdhsa_next_free_vgpr 8\n    .amdhsa_next_free_sgpr 8\n.end_amdhsa_kernel\n",
     );
     assert!(
-        audit_asm("bug", &asm).iter().any(|m| m.contains("before it is written")),
+        audit_asm("k", &asm).iter().any(|m| m.contains("before it is written")),
         "stale read not detected: {:?}",
-        audit_asm("bug", &asm)
+        audit_asm("k", &asm)
     );
     // (5) a clean snippet must produce no violation (no false positives from the checker itself)
     let asm = synthetic(&["v_mov_b32_e32 v1, 1", "v_add_f32_e32 v2, v1, v1", "s_endpgm"], 8, 8);
-    let clean = audit_asm("ok", &asm);
+    let clean = audit_asm("k", &asm);
     assert!(clean.is_empty(), "clean snippet flagged: {clean:?}");
 }
