@@ -12091,17 +12091,11 @@ pub fn probe_smfmac_ones() -> Function {
         b.smfmac_fp8_16x16x128(a, p1, idx1, d1)
     };
     // A/idx variant sweep: candidate = (A, idx0, idx1) with B = hh0 then hh1 (accumulating)
-    let a3v186 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(b0r), a: Opnd::Val(zero), b: Opnd::Val(ones) }); // placeholder
-    let _ = a3v186;
     // a3: lane condition (lane&3)<2 (inverse set), same dword split as vendor
-    let a01i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lt2), a: Opnd::Val(v186r), b: Opnd::Val(zero) });
-    let lt2b = b.cmp_lt_i32(b0r, c2r);
-    // v186i = (lane&3)<2 ? ones : 0  == lt2 ? ones : 0
-    let v186i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lt2b), a: Opnd::Val(ones), b: Opnd::Val(zero) });
+    let v186i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lt2), a: Opnd::Val(ones), b: Opnd::Val(zero) });
     let a01x = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(b1z), a: Opnd::Val(zero), b: Opnd::Val(v186i) });
     let a23x = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(b1z), a: Opnd::Val(v186i), b: Opnd::Val(zero) });
     let a3 = b.frag4(a23x, a23x, a01x, a01x);
-    let _ = a01i;
     let a4 = b.frag4(ones, ones, zero, zero);
     let a5 = b.frag4(zero, zero, ones, ones);
     let a6 = b.frag4(ones, ones, ones, ones);
