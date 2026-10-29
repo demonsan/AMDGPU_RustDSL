@@ -9507,7 +9507,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let no_bar = ablate.contains("nobar");
     let nobar1 = ablate.contains("nobar1"); // drop the V->M barrier only
     let nobar2 = ablate.contains("nobar2"); // drop the M->V barrier only
-    let noprio = ablate.contains("noprio");
+    // s_setprio 1/0 per phase measured -3% (299.8 -> 308.5 TFLOP/s without): off unless FMHA_OPT has `prio`
+    let noprio = ablate.contains("noprio") || !fmha_t_opt("prio");
     let no_valu = ablate.contains("novalu");
     let no_qk = ablate.contains("noqk");
     let no_pv = ablate.contains("nopv");
