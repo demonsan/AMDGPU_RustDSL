@@ -214,6 +214,18 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     // tracked per register DWORD (the scheduler's effects model: lane writes, partial writers, in-place operands), so a
     // fragment built lane by lane stays live between its lane writes.
     let segs: Vec<Vec<(usize, usize)>> = if matches!(policy, Policy::TwoPhase) { precise_segments(m, &idx_of, &succs) } else { vec![Vec::new(); n] };
+    // AMDC_RA_PRUNED_HULL=1 (experiment): the scan policies use the hull of the pruned dword-level segments instead of the
+    // block-level liveness hull (no ghost live-in values, lane-built fragments handled exactly).
+    if matches!(policy, Policy::Scan { .. }) && std::env::var("AMDC_RA_PRUNED_HULL").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
+        let sg = precise_segments(m, &idx_of, &succs);
+        for r in 0..n {
+            if m.vregs[r].is_vector() && !m.alias.contains_key(&(r as VReg)) && !sg[r].is_empty() {
+                start[r] = sg[r].first().unwrap().0;
+                end[r] = sg[r].last().unwrap().1;
+            }
+        }
+    }
+
     // --- linear scan -------------------------------------------------
     let mut phys = vec![u32::MAX; n];
     let mut used_v = vec![false; VGPR_COUNT];
