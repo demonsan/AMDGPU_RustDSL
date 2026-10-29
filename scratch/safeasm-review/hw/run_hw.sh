@@ -1,9 +1,5 @@
 ﻿#!/usr/bin/env bash
-# Raw-asm hardware probes for the ISA rules the safe-asm types encode:
-#   1) VALU write -> MFMA operand read: how many wait states are really needed (crate pads 2 states)
-#   2) zero-variant MFMA followed by accumulate-variant MFMA back to back (different opcode) vs same-opcode control
-#   3) WAR: overwrite an MFMA operand immediately after issue
-#   4) RAW: read the MFMA D through a VALU op immediately after issue
+# Raw-asm hardware probes for the ISA rules encoded by amdgpu-safeasm (see the review section of docs/safe-asm-design.md).
 set -uo pipefail
 cd "$(dirname "$0")"
 ASM_ROC="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}"
@@ -26,8 +22,7 @@ __NAME__:
     v_add_co_u32 v4, vcc, v4, v0
     v_addc_co_u32 v5, vcc, v5, 0, vcc
     v_mov_b32_e32 v48, 0
-    v_mov_b32_e32 v49, 0
-    s_mov_b32 s8, 0'
+    v_mov_b32_e32 v49, 0'
 FTR='    s_endpgm
 .size __NAME__, .-__NAME__
 .p2align 6
@@ -78,15 +73,19 @@ amdhsa.version:
 ZERO_D=''
 for i in $(seq 32 47); do ZERO_D="$ZERO_D    v_mov_b32_e32 v$i, 0
 "; done
-ONES16='    v_mov_b32_e32 v8, 0x3C003C00
+F16_ON='    v_mov_b32_e32 v8, 0x3C003C00
     v_mov_b32_e32 v9, 0x3C003C00
     v_mov_b32_e32 v10, 0x3C003C00
     v_mov_b32_e32 v11, 0x3C003C00
     v_mov_b32_e32 v12, 0x3C003C00
     v_mov_b32_e32 v13, 0x3C003C00
     v_mov_b32_e32 v14, 0x3C003C00
-    v_mov_b32_e32 v15, 0x3C003C00'
-FP8ONES='    v_mov_b32_e32 v8, 0x38383838
+    v_mov_b32_e32 v15, 0x3C003C00
+    v_mov_b32_e32 v16, 0x3C003C00
+    v_mov_b32_e32 v17, 0x3C003C00'
+F16_ZERO_A='    v_mov_b32_e32 v8, 0
+    v_mov_b32_e32 v9, 0'
+FP8='    v_mov_b32_e32 v8, 0x38383838
     v_mov_b32_e32 v9, 0x38383838
     v_mov_b32_e32 v10, 0x38383838
     v_mov_b32_e32 v11, 0x38383838
@@ -98,90 +97,88 @@ FP8ONES='    v_mov_b32_e32 v8, 0x38383838
     v_mov_b32_e32 v17, 0x38383838
     v_mov_b32_e32 v18, 0x38383838
     v_mov_b32_e32 v19, 0x38383838
-    v_mov_b32_e32 v20, 127
-    v_mov_b32_e32 v21, 127
-    s_nop 7'
+    v_mov_b32_e32 v20, 0x38383838
+    v_mov_b32_e32 v21, 0x38383838
+    v_mov_b32_e32 v22, 0x38383838
+    v_mov_b32_e32 v23, 0x38383838
+    v_mov_b32_e32 v24, 127
+    v_mov_b32_e32 v25, 127
+    s_nop 7
+    s_nop 3'
 WAIT20='    s_nop 7
     s_nop 7
     s_nop 3'
-mk() { # name body
+mk() {
   { sed "s/__NAME__/$1/g" <<<"$HDR"; printf '%s\n' "$2"; sed "s/__NAME__/$1/g" <<<"$FTR"; } > "out/$1.s"
-  if ! "$ASM_ROC/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
-        -o "out/$1.co" "out/$1.s" 2> "out/$1.err"; then echo "ASSEMBLE FAIL $1"; head -5 "out/$1.err"; fi
+  if ! "$ASM_ROC/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "out/$1.co" "out/$1.s" 2> "out/$1.err"; then
+    echo "ASSEMBLE FAIL $1"; head -6 "out/$1.err"; return 1
+  fi
 }
-# ---- 1) VALU -> MFMA operand wait states: A is overwritten with ones just before the MFMA (stale read -> 0) ----
 for PAD in 1 7; do
-  mk "valu2mfma_pad$PAD" "$ONES16
-    v_mov_b32_e32 v8, 0
-    v_mov_b32_e32 v9, 0
-    v_mov_b32_e32 v10, 0
-    v_mov_b32_e32 v11, 0
+  mk "valu2mfma_pad$PAD" "$F16_ON
+$F16_ZERO_A
 $ZERO_D
 $WAIT20
     v_mov_b32_e32 v8, 0x3C003C00
     v_mov_b32_e32 v9, 0x3C003C00
-    v_mov_b32_e32 v10, 0x3C003C00
-    v_mov_b32_e32 v11, 0x3C003C00
     s_nop $PAD
-    v_mfma_f32_32x32x8_f16 v[32:47], v[8:11], v[12:15], v[32:47]
+    v_mfma_f32_32x32x8_f16 v[32:47], v[8:9], v[10:17], v[32:47]
 $WAIT20
     global_store_dword v[4:5], v32, off"
 done
-# ---- 2) zero-variant then accumulate-variant, back-to-back (different opcode) vs 20-state gap; plus same-opcode control ----
-mk "zerochain_nopad" "$FP8ONES
+mk "zerochain_nopad" "$FP8
 $ZERO_D
 $WAIT20
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:11], v[12:19], 0, v20, v21
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:11], v[12:19], v[32:47], v20, v21
+    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], 0, v24, v25
+    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], v[32:47], v24, v25
 $WAIT20
     global_store_dword v[4:5], v32, off"
-mk "zerochain_pad20" "$FP8ONES
+mk "zerochain_pad20" "$FP8
 $ZERO_D
 $WAIT20
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:11], v[12:19], 0, v20, v21
+    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], 0, v24, v25
 $WAIT20
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:11], v[12:19], v[32:47], v20, v21
+    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], v[32:47], v24, v25
 $WAIT20
     global_store_dword v[4:5], v32, off"
-mk "samechain_nopad" "$FP8ONES
+mk "samechain_nopad" "$FP8
 $ZERO_D
 $WAIT20
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:11], v[12:19], 0, v20, v21
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:11], v[12:19], v[32:47], v20, v21
-    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:11], v[12:19], v[32:47], v20, v21
+    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], 0, v24, v25
+    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], v[32:47], v24, v25
+    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], v[32:47], v24, v25
 $WAIT20
     global_store_dword v[4:5], v32, off"
-# ---- 3) WAR: overwrite A dword0 immediately after the MFMA issue vs after 20 states ----
-for PAD in 0 1; do
-  if [ "$PAD" = 0 ]; then MID=""; else MID="$WAIT20"; fi
-  mk "war_$([ "$PAD" = 0 ] && echo nopad || echo pad20)" "$ONES16
+mk "war_nopad" "$F16_ON
 $ZERO_D
 $WAIT20
-    v_mfma_f32_32x32x8_f16 v[32:47], v[8:11], v[12:15], v[32:47]
-$MID
-    v_mov_b32_e32 v8, 0
+    v_mfma_f32_32x32x8_f16 v[32:47], v[8:9], v[10:17], v[32:47]
+$F16_ZERO_A
 $WAIT20
     global_store_dword v[4:5], v32, off"
-done
-# ---- 4) RAW: read MFMA D via VALU immediately vs after 20 states ----
-mk "rawread_nopad" "$ONES16
+mk "war_pad20" "$F16_ON
 $ZERO_D
 $WAIT20
-    v_mfma_f32_32x32x8_f16 v[32:47], v[8:11], v[12:15], v[32:47]
+    v_mfma_f32_32x32x8_f16 v[32:47], v[8:9], v[10:17], v[32:47]
+$WAIT20
+$F16_ZERO_A
+$WAIT20
+    global_store_dword v[4:5], v32, off"
+mk "rawread_nopad" "$F16_ON
+$ZERO_D
+$WAIT20
+    v_mfma_f32_32x32x8_f16 v[32:47], v[8:9], v[10:17], v[32:47]
     v_add_f32_e32 v50, v32, v49
 $WAIT20
     global_store_dword v[4:5], v50, off"
-mk "rawread_pad20" "$ONES16
+mk "rawread_pad20" "$F16_ON
 $ZERO_D
 $WAIT20
-    v_mfma_f32_32x32x8_f16 v[32:47], v[8:11], v[12:15], v[32:47]
+    v_mfma_f32_32x32x8_f16 v[32:47], v[8:9], v[10:17], v[32:47]
 $WAIT20
     v_add_f32_e32 v50, v32, v49
 $WAIT20
     global_store_dword v[4:5], v50, off"
 echo "[hw] assembling done; building host"
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ hw_host.cpp -o out/hw_host -I"$HIPROOT/include" -L"$HIPROOT/lib" -lamdhip64 -Wl,-rpath,"$HIPROOT/lib" || exit 1
-for co in out/*.co; do
-  n="$(basename "$co" .co)"
-  ./out/hw_host "$co" "$n"
-done
+for co in out/*.co; do n="$(basename "$co" .co)"; ./out/hw_host "$co" "$n"; done
