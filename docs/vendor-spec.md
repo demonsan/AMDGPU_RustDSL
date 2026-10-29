@@ -29,6 +29,9 @@ runs `tools/vendor_analyze.py` on the dump; the vendor kernel is unusually frien
 built from hand-written aiter assembly with named labels (`label_block_A_loop`,
 `label_rollback_overflow_block_s_0`, ...). 9189 static instructions, 37 labels.
 
+Both tools were validated end-to-end on GPU 5 / node 53 (branch `kernel-occ` head `fddc0e9`): the
+disassembly survey/phases output above and the counter table in section 6 are their output.
+
 ## 1. Budget (Verified)
 
 From the code-object metadata (`.vgpr_count` / `.sgpr_count` / `.group_segment_fixed_size`; Verified,
@@ -136,6 +139,43 @@ cover the full 128-key row sum (their output matches CPU, so it does). Kernel-op
 that layout equivalence against aiter's P packing or use two complementary index patterns
 (`0x44444444` selects {0,1}, `0xeeeeeeee` selects {2,3}) and rely on D accumulation; cost is 2 smfmac
 per 128 keys either way (32 cycles).
+
+
+## 4.5 SMFMAC sparse layout - hardware probe (Verified / in progress)
+
+The rewrite wants to replace the two row-sum scaled MFMAs with `v_smfmac_f32_16x16x128_fp8_fp8`.
+`tests/gpu/smfmac_host.cpp` + `tools/vendor_smfmac_probe.sh` run a 14-experiment probe
+(`probe_smfmac_ones` in `crates/amdgpu-dsl/src/kernels.rs`, own backend) that dumps the 4-dword D of
+every lane for each experiment. The probe is built on the new additive DSL/MIR support
+`b.smfmac_fp8_16x16x128(a_frag4, b_frag8, idx_v1, c_frag4)` (MOp `VSmfmac16x16x128Fp8`), so the
+rewrite can use it directly.
+
+Verified on MI355X / gfx950 (node 53, GPU 5), 5 repeated runs:
+
+| question | answer | evidence |
+|---|---|---|
+| operand register shape | A = **4 VGPR** (2:4-compressed A), B = **8 VGPR** (dense), SRC2 = **1 VGPR**, D = **4 VGPR** (f32) | emitted asm + hardware results |
+| SRC2 encoding | 32 bits = 16 x 2-bit fields, LSB-first; each pair of fields selects two of the four K positions of that group and must be strictly increasing. `0x44444444` = pairs (0,1), `0xeeeeeeee` = pairs (2,3) | `0x44444444` and `0xeeeeeeee` both accepted; `0x55555555` (pair (1,1)) is also accepted but is not a valid strictly-increasing pattern |
+| K coverage of one smfmac | **64 of the 128 K positions**: A/B all ones with either pattern gives D = 64 for **all four D dwords** | slots 0/1/5/6 of the probe |
+| K coverage of two smfmacs | **128 (all K)**: accumulating `0x44444444` then `0xeeeeeeee` into the same D (both B halves) gives D = 128 on all four D dwords; order-independent; a third instruction gives 192 | slots 2/3/4, stable across 5 runs |
+| is A per-lane data? | **yes**: zeroing A on lanes 32..63 halves every D element (64 -> 32), i.e. the two lane halves supply complementary halves of the compressed A nonzeros | slot 9 |
+| is SRC2 per-lane? | accepted and runs with a lane-masked index (`tid<32 ? 0x44444444 : 0xeeeeeeee`); with all-ones A/B the value is still 64, so this does not yet prove whether the hardware reads SRC2 per lane or per wave. Follow-up experiment uses per-lane dense B to settle it (Experimental) | slot 8 |
+| marker A dwords (1,2,4,8) | all-ones B gives D = 240 on all four dwords = 64 contributions x mean 3.75, consistent with "64 selected nonzeros per row, each carrying one of the four dword marker values" | slots 10/11 |
+
+**Open issue (probe/backend hazard, not resolved yet):** a *single* smfmac experiment sometimes
+returns nondeterministic garbage in the **4th D dword** (run-to-run varying values such as 64.0002 or
+69.5 where 64 is expected; some runs are fully clean). Two-instruction accumulation chains are always
+clean on all four dwords. Working hypothesis: a write-after-write hazard between the zero-initialisation
+of the next experiment's in-place accumulator D and the previous smfmac's writeback, which our hazard
+pass does not currently pad for `VSmfmac16x16x128Fp8`. Mitigation until fixed: use accumulating
+chains (which the row-sum recipe does anyway) or distinct D registers per result. Recorded here so
+the rewrite does not trust a single-smfmac 4th dword.
+
+**Remaining work before this becomes the rewrite's row-sum recipe:** map our softmax P (two Frag8
+halves, 128 keys x 32 rows) onto the smfmac dense-B grid (8 dwords = 128 K x 16 N) and verify that
+the D row sums equal the current ones-MFMA (msum) result; the vendor reads two D dwords of the
+accumulated D for its l, so the expected recipe is 2 smfmacs (one per P half) plus a reduction of the
+right D dword pair.
 
 ## 5. LDS layout, staging and VGPR budget (Verified static)
 

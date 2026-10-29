@@ -210,6 +210,10 @@ pub enum Op {
     /// `v_mfma_scale_f32_32x32x64_f8f6f4`: block-scaled fp8 MFMA. The two scale
     /// operands are E8M0 exponents in scalar registers.
     MfmaScaleFp8_32x32x64 { a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
+    /// `v_smfmac_f32_16x16x128_fp8_fp8`: sparse (2:4) fp8 A times dense fp8 B, f32 accumulate.
+    /// `a` is a Frag4 (the 2:4-compressed A operand), `b` a Frag8 (dense B, 128 K x 16 N),
+    /// `idx` the SRC2 dword of sixteen 2-bit sparse indices, `c` the Frag4 accumulator.
+    SmfmacFp8_16x16x128 { a: Opnd, b: Opnd, idx: Opnd, c: Opnd },
     /// Read dword `index` (0..15) of a sixteen-dword fragment.
     Frag16Lane { frag: Opnd, index: u8 },
     /// A fragment of `ty` zeroed out.
@@ -276,6 +280,7 @@ impl Op {
             Op::Frag16Build(..) => DType::Frag16,
             Op::CvtPknormU16(..) | Op::CvtScalef32PkFp8Bf16 { .. } | Op::CvtPkFp8F32(..) | Op::CvtPkBf16F32(..) => DType::U32,
             Op::MfmaScaleFp8_32x32x64 { .. } => DType::Frag16,
+            Op::SmfmacFp8_16x16x128 { .. } => DType::Frag4,
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
             Op::Frag16Pair { .. } | Op::Frag2Dup(..) | Op::PkAddF32(..) | Op::PkMulF32(..) => DType::Frag2,
@@ -337,6 +342,7 @@ impl Op {
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 vec![*a, *b, *c, *scale_a, *scale_b]
             }
+            Op::SmfmacFp8_16x16x128 { a, b, idx, c } => vec![*a, *b, *idx, *c],
             Op::Frag16Lane { frag, .. } | Op::Frag16Pair { frag, .. } => vec![*frag],
             Op::Frag2Dup(a) | Op::PartnerMaxF32(a) => vec![*a],
             Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => vec![*a, *b],
@@ -875,6 +881,22 @@ impl FnBuilder {
 
     pub fn frag16_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
         self.let_(Op::Frag16Lane { frag: frag.into(), index })
+    }
+
+    /// Sparse fp8 MFMA (`v_smfmac_f32_16x16x128_fp8_fp8`): D = compressed A x dense B + C.
+    pub fn smfmac_fp8_16x16x128(
+        &mut self,
+        a: impl Into<Opnd>,
+        b: impl Into<Opnd>,
+        idx: impl Into<Opnd>,
+        c: impl Into<Opnd>,
+    ) -> ValueId {
+        self.let_(Op::SmfmacFp8_16x16x128 {
+            a: a.into(),
+            b: b.into(),
+            idx: idx.into(),
+            c: c.into(),
+        })
     }
 
     /// A zero-initialised fragment of the given type.

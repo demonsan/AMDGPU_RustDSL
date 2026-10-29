@@ -403,6 +403,48 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
     }
     for (bi, b) in m.blocks.iter().enumerate() {
         for (ii, inst) in b.insts.iter().enumerate() {
+            if inst.op == MOp::VSmfmac16x16x128Fp8 {
+                // D (4) is the in-place accumulator; A (4) and B (8) must be aligned to their
+                // width and disjoint from D; SRC2 is a single dword.
+                let d = inst
+                    .dst
+                    .ok_or_else(|| format!("block {bi} inst {ii}: SMFMAC without destination"))?;
+                let regs: Vec<VReg> = inst
+                    .srcs
+                    .iter()
+                    .map(|s| match s {
+                        Src::Reg(r) => Ok(*r),
+                        _ => Err(format!("block {bi} inst {ii}: SMFMAC operands must be registers")),
+                    })
+                    .collect::<Result<_, String>>()?;
+                if regs.len() < 3 {
+                    return Err(format!("block {bi} inst {ii}: SMFMAC needs 3 source operands"));
+                }
+                let rd = range(phys, m, d);
+                let ra = range(phys, m, regs[0]);
+                let rb = range(phys, m, regs[1]);
+                for (name, r) in [("A", ra), ("B", rb), ("D", rd)] {
+                    let width = r.1 - r.0;
+                    if r.0 % width != 0 || r.0 % 2 != 0 {
+                        return Err(format!(
+                            "block {bi} inst {ii}: SMFMAC operand {name} at v{} is not aligned to its width {}",
+                            r.0, width
+                        ));
+                    }
+                }
+                for (name, x, y) in [("A/B", ra, rb), ("A/D", ra, rd), ("B/D", rb, rd)] {
+                    if overlaps(x, y) {
+                        return Err(format!(
+                            "block {bi} inst {ii}: SMFMAC operands {name} overlap (v{}..v{}, v{}..v{})",
+                            x.0,
+                            x.1 - 1,
+                            y.0,
+                            y.1 - 1
+                        ));
+                    }
+                }
+                continue;
+            }
             let is_mfma = matches!(
                 inst.op,
                 MOp::VMfma16x16x16F16
