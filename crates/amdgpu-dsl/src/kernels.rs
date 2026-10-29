@@ -7691,22 +7691,21 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.var_mfma_scale(s_vars[sl], k8_1, cx.b1, sk1, sq1m);
             }
             // key validity masks (tail tile only): invalid keys never raise the max and give P = 0
-            let mut valid: Vec<Vec<ValueId>> = Vec::new();
+            // (recomputed at every use: keeping 32 masks live would not fit the register file)
+            let mut kb: Vec<ValueId> = Vec::new();
             if masked {
                 for sl in 0..2usize {
                     let s = 2 * hh + sl;
                     let kb_s0 = b.add_i32(key0, cx.g4);
                     let kb_cs = b.c_i32(32 * s as i32);
-                    let kb_s = b.add_i32(kb_s0, kb_cs);
-                    let mut vs = Vec::new();
-                    for r in 0..16u8 {
-                        let kc = b.c_i32((8 * (r / 4) + (r % 4)) as i32);
-                        let kidx = b.add_i32(kb_s, kc);
-                        vs.push(b.cmp_lt_i32(kidx, cx.kv_len));
-                    }
-                    valid.push(vs);
+                    kb.push(b.add_i32(kb_s0, kb_cs));
                 }
             }
+            let valid = |b: &mut FnBuilder, sl: usize, r: u8| -> ValueId {
+                let kc = b.c_i32((8 * (r / 4) + (r % 4)) as i32);
+                let kidx = b.add_i32(kb[sl], kc);
+                b.cmp_lt_i32(kidx, cx.kv_len)
+            };
             // ---- max over the 32 scores, partner lane, overflow test ----
             let mut flat: Vec<ValueId> = Vec::with_capacity(32);
             for sl in 0..2usize {
@@ -7714,7 +7713,8 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     let lane = b.frag16_lane(s_vars[sl], r);
                     let v = b.bitcast_f32(lane);
                     if masked {
-                        flat.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(valid[sl][r as usize]), a: Opnd::Val(v), b: Opnd::Val(neg_big) }));
+                        let ok = valid(b, sl, r);
+                        flat.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg_big) }));
                     } else {
                         flat.push(v);
                     }
@@ -7772,7 +7772,8 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     let lane = b.frag16_lane(s_vars[sl], r);
                     let v = b.bitcast_f32(lane);
                     if masked {
-                        xs.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(valid[sl][r as usize]), a: Opnd::Val(v), b: Opnd::Val(zero_f) }));
+                        let ok = valid(b, sl, r);
+                        xs.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(zero_f) }));
                     } else {
                         xs.push(v);
                     }
