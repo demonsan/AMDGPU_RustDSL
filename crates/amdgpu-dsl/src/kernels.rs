@@ -1146,7 +1146,16 @@ pub fn probe_dma_kread() -> Function {
     }
     b.wait_vm(0);
     b.wait_lds(0);
+    if let Some(n) = std::env::var("PD_NOPS").ok().and_then(|v| v.parse::<u32>().ok()) {
+        for _ in 0..n {
+            b.set_prio(0);
+        }
+    }
     b.barrier();
+    if std::env::var("PD_B2").is_ok() {
+        b.wait_vm(0);
+        b.barrier();
+    }
     // K-fragment style reads
     let t5 = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c5)));
     let g = b.let_(Op::AndI32(Opnd::Val(t5), Opnd::Val(c1)));
