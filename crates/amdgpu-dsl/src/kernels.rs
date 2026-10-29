@@ -6682,6 +6682,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let no_s = ablate.contains("nos");
     let c0 = b.c_i32(0);
     let c1 = b.c_i32(1);
+    let c2 = b.c_i32(2);
     let c4 = b.c_i32(4);
     let c7 = b.c_i32(7);
     let c16i = b.c_i32(16);
@@ -6707,6 +6708,11 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (cx.v_seqs, cx.vbase_off, cx.ptr_v, cx.lds_v)
     };
     let sdst = b.add_i32(lds_base, cx.rt64);
+    let kdlds = fmha_t_opt("kdlds");
+    let nbuf_l = if fmha_t_opt("dbuf") { 2 } else { 1 };
+    let lds_kd = b.c_i32(nbuf_l * 256 * pitch + 2048);
+    let rt_row4 = b.shl_i32(cx.rt_row, c2);
+    let kdb0 = b.add_i32(lds_kd, rt_row4);
     let stage_loads = |b: &mut FnBuilder, key0: ValueId| -> Vec<ValueId> {
         let srow_raw = b.add_i32(key0, cx.rt_row);
         let srow_ok = b.cmp_lt_i32(srow_raw, cx.kv_len);
@@ -6716,10 +6722,22 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let soff1 = b.add_i32(soff0, base_off);
         let soff = b.add_i32(soff1, cx.rt_half64);
         let sp = b.ptr_add(ptr, soff);
-        (0..4u32).map(|w| b.load_b128(sp, 16 * w)).collect()
+        let mut v: Vec<ValueId> = (0..4u32).map(|w| b.load_b128(sp, 16 * w)).collect();
+        if role_a && kdlds {
+            // K scale dword of this thread's key row, staged with the K tile
+            let kd_row = b.mul_i32(srow, cx.kd_stride);
+            let kd_off = b.add_i32(kd_row, cx.kd_base);
+            let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+            let kd_raw = b.load_f32(kd_ptr, 0);
+            v.push(b.bitcast_i32(kd_raw));
+        }
+        v
     };
-    let stage_stores = |b: &mut FnBuilder, dstb: ValueId, data: &[ValueId]| {
-        for (w, d) in data.iter().enumerate() {
+    let stage_stores = |b: &mut FnBuilder, dstb: ValueId, kdb: ValueId, data: &[ValueId]| {
+        if data.len() == 5 {
+            b.store_lds_b32(Opnd::Val(kdb), Opnd::Val(data[4]));
+        }
+        for (w, d) in data.iter().take(4).enumerate() {
             let c = b.c_i32(16 * w as i32);
             let a = b.add_i32(dstb, c);
             b.store_lds_b128(Opnd::Val(a), Opnd::Val(*d));
@@ -6727,7 +6745,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     let key_first = b.c_i32(0);
     let first = stage_loads(b, key_first);
-    stage_stores(b, sdst, &first);
+    stage_stores(b, sdst, kdb0, &first);
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
@@ -6763,14 +6781,19 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let o_vars = [vars[3], vars[4], vars[5], vars[6]];
     let dbuf = fmha_t_opt("dbuf");
     // double buffering: compute reads buffer `par`, the next tile is staged into the other one
-    let (kf_b, tr_b, sdst_n) = if dbuf {
+    let j4 = b.shl_i32(cx.j, c2);
+    let (kf_b, tr_b, sdst_n, kdb_n, kd_rd) = if dbuf {
         let cbuf = b.c_i32(256 * fmha_t_pitch());
         let co = b.mul_i32(par, cbuf);
         let npar = b.xor_i32(par, c1);
         let no = b.mul_i32(npar, cbuf);
-        (b.add_i32(cx.kf_base, co), b.add_i32(cx.tr_base, co), b.add_i32(sdst, no))
+        let c512 = b.c_i32(512);
+        let kco = b.mul_i32(par, c512);
+        let kno = b.mul_i32(npar, c512);
+        let kd0 = b.add_i32(lds_kd, j4);
+        (b.add_i32(cx.kf_base, co), b.add_i32(cx.tr_base, co), b.add_i32(sdst, no), b.add_i32(kdb0, kno), b.add_i32(kd0, kco))
     } else {
-        (cx.kf_base, cx.tr_base, sdst)
+        (cx.kf_base, cx.tr_base, sdst, kdb0, b.add_i32(lds_kd, j4))
     };
 
     // ---- prefetch the next tile (or this one again after the last iteration) ----
@@ -6823,7 +6846,11 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let kd_row = b.mul_i32(kkey, hq4);
                 let kd_off = b.add_i32(kd_row, cx.kd_base);
                 let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
-                let kd = if fmha_t_opt("kdconst") {
+                let kd = if kdlds {
+                    let koff = b.c_i32(128 * s as i32);
+                    let ka = b.add_i32(kd_rd, koff);
+                    b.load_lds_b32(Opnd::Val(ka))
+                } else if fmha_t_opt("kdconst") {
                     b.c_i32(0x7f7f7f7f)
                 } else if !kd_hoisted.is_empty() {
                     kd_hoisted[s]
@@ -7059,7 +7086,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
     }
     if !no_stage {
-        stage_stores(b, sdst_n, &pre);
+        stage_stores(b, sdst_n, kdb_n, &pre);
     }
     b.wait_lds(0);
     if !no_bar {
