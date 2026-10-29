@@ -133,6 +133,11 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
     }
     let alloc = regalloc::allocate(&m)?;
+    // Register reuse (especially the hole-filling packing) can place a new value in a register an in-flight MFMA still reads:
+    // pad the physical write-after-read hazard on every path, not only for scheduled code (AMDC_NO_PHYS_WAR=1 disables, testing).
+    if std::env::var("AMDC_NO_PHYS_WAR").map(|v| v.is_empty() || v == "0").unwrap_or(true) {
+        hazards::pad_physical_war(&mut m, &alloc);
+    }
     Ok((m, alloc))
 }
 
