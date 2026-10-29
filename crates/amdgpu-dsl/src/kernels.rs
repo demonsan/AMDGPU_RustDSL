@@ -9176,23 +9176,25 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.end_if();
         // unit 0: V, stage K(next tile); M: PV(hh0) + QK(hh1)
         valu_tail(b, 0);
-        stage(b, key_next, slot_nxt, kds_nxt);
-        b.set_prio(1);
+        if !fmha_t_opt("vsnostage") {
+            stage(b, key_next, slot_nxt, kds_nxt);
+        }
+        if !fmha_t_opt("vsnoprio") { b.set_prio(1); }
         b.wait_lds(0);
         b.barrier();
         pv(b, 0, slot_cur);
         qk(b, 1, slot_cur, kds_cur);
-        b.set_prio(0);
+        if !fmha_t_opt("vsnoprio") { b.set_prio(0); }
         b.wait_lds(0);
         b.barrier();
         // unit 1: V; M: PV(hh1) + QK(hh0 of the next tile)
         valu_tail(b, 1);
-        b.set_prio(1);
+        if !fmha_t_opt("vsnoprio") { b.set_prio(1); }
         b.wait_lds(0);
         b.barrier();
         pv(b, 1, slot_cur);
         qk(b, 0, slot_nxt, kds_nxt);
-        b.set_prio(0);
+        if !fmha_t_opt("vsnoprio") { b.set_prio(0); }
         b.wait_lds(0);
         b.barrier();
     } else {
@@ -9200,31 +9202,33 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.barrier();
         b.end_if();
         // M(unit 0): PV(hh1 of the previous tile; P = 0 on the first pass) + QK(hh0)
-        b.set_prio(1);
+        if !fmha_t_opt("vsnoprio") { b.set_prio(1); }
         // (on the first pass V of tile -1 does not exist: its LDS slot holds garbage that 0 x NaN would spread)
         let not_first = b.let_(Op::NotI1(Opnd::Val(first_pass)));
         b.begin_if(Opnd::Val(not_first));
         pv(b, 1, slot_nxt);
         b.end_if();
         qk(b, 0, slot_cur, kds_cur);
-        b.set_prio(0);
+        if !fmha_t_opt("vsnoprio") { b.set_prio(0); }
         b.wait_lds(0);
         b.barrier();
         // V(unit 0), stage V(next tile)
         valu_tail(b, 0);
-        stage(b, key_next, slot_nxt, kds_nxt);
-        b.set_prio(1);
+        if !fmha_t_opt("vsnostage") {
+            stage(b, key_next, slot_nxt, kds_nxt);
+        }
+        if !fmha_t_opt("vsnoprio") { b.set_prio(1); }
         b.wait_lds(0);
         b.barrier();
         // M(unit 1): PV(hh0) + QK(hh1)
         pv(b, 0, slot_cur);
         qk(b, 1, slot_cur, kds_cur);
-        b.set_prio(0);
+        if !fmha_t_opt("vsnoprio") { b.set_prio(0); }
         b.wait_lds(0);
         b.barrier();
         // V(unit 1)
         valu_tail(b, 1);
-        b.set_prio(1);
+        if !fmha_t_opt("vsnoprio") { b.set_prio(1); }
         b.wait_lds(0);
         b.barrier();
     }
