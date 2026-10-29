@@ -2182,7 +2182,14 @@ impl Lowerer {
         if k.abs() >= (1 << 20) {
             return Ok(None);
         }
+        // the compare may be re-issued later by `cmpfold`: its sources must be immutable registers (not loop variables)
+        if matches!(core, Opnd::Var(_)) {
+            return Ok(None);
+        }
         let rx = self.as_v1(core)?;
+        if self.var_backed(rx) {
+            return Ok(None);
+        }
         self.touch(&[Src::Reg(sb), Src::Reg(rx)]);
         // a loop variable is a mutable register and `cmpfold` may re-issue this compare later: take a copy in that case
         let bound = if k == 0 && matches!(b, Opnd::Val(_)) {
