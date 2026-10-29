@@ -9322,8 +9322,13 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.set_prio(1);
             let first = b.cmp_lt_i32(it, c1);
             let slot_pv = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(first), a: Opnd::Val(slot_cur), b: Opnd::Val(slot_n2) });
-            pv(b, 1, slot_pv);
-            qk(b, 0, slot_cur, kds_cur);
+            if ablate.contains("bswap") {
+                qk(b, 0, slot_cur, kds_cur);
+                pv(b, 1, slot_pv);
+            } else {
+                pv(b, 1, slot_pv);
+                qk(b, 0, slot_cur, kds_cur);
+            }
             b.set_prio(0);
             b.wait_lds(0);
             if !no_bar {
