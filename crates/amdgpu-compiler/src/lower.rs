@@ -2308,8 +2308,6 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
     }
     loop {
         let mut u: HashSet<ValueId> = HashSet::new();
-        let mut wi: HashSet<ValueId> = HashSet::new(); // workitem id values
-        let mut cst: HashMap<ValueId, i64> = HashMap::new();
         let is_u = |o: &Opnd, u: &HashSet<ValueId>, uvars: &HashSet<amdgpu_dsl::VarId>| match o {
             Opnd::I32(_) => true,
             Opnd::Val(v) => u.contains(v),
@@ -2320,20 +2318,8 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
         for st in &f.stmts {
             match st {
                 Stmt::Let { dst, op } => {
-                    if matches!(op, Op::WorkitemId) {
-                        wi.insert(*dst);
-                    }
-                    if let Op::ConstI32(k) = op {
-                        cst.insert(*dst, *k as i64);
-                    }
                     let uni = match op {
                         Op::ConstI32(_) | Op::KernargI32 { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
-                        // wave id: `workitem_id >> k` with k >= 6 is constant within a 64-lane wave
-                        Op::LshrI32(Opnd::Val(a), b) if wi.contains(a) => match b {
-                            Opnd::I32(k) => *k >= 6,
-                            Opnd::Val(v) => cst.get(v).map_or(false, |k| *k >= 6),
-                            _ => false,
-                        },
                         Op::AddI32(a, b) | Op::MulI32(a, b) | Op::ShlI32(a, b) | Op::LshrI32(a, b) | Op::AndI32(a, b) | Op::XorI32(a, b) => {
                             is_u(a, &u, &uvars) && is_u(b, &u, &uvars)
                         }
