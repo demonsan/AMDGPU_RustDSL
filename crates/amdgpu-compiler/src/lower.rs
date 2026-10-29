@@ -41,6 +41,25 @@ pub fn with_opts<R>(opts: &[&str], f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// The lowering options in effect on this thread (override, environment or default).
+pub fn current_opts() -> Vec<String> {
+    if let Some(v) = OVERRIDE.with(|o| o.borrow().clone()) {
+        return v;
+    }
+    match std::env::var("AMDC_LOWER_OPTS") {
+        Ok(s) if !s.is_empty() => s.split(',').map(|x| x.trim().to_string()).collect(),
+        _ => vec!["dce".to_string(), "cmpfold".to_string()],
+    }
+}
+
+/// `lower` with extra options on top of the current ones (used by the register-pressure retries).
+pub fn lower_with_extra(f: &Function, extra: &[&str]) -> Result<MFunction, String> {
+    let mut v = current_opts();
+    v.extend(extra.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+    with_opts(&refs, || lower(f))
+}
+
 pub fn opt_on(name: &str) -> bool {
     if let Some(v) = OVERRIDE.with(|o| o.borrow().clone()) {
         return v.iter().any(|x| x == name || x == "all");
@@ -227,6 +246,21 @@ impl Lowerer {
         dce_full(&mut self.mir, true);
         if opt_on("dce") {
             dce_full(&mut self.mir, false);
+        }
+        if opt_on("sink") {
+            sink_defs(&mut self.mir);
+        }
+        // rematerialise loop-invariant constants next to their loop uses (register pressure; `remat1/2/3` = at most 1/2/any
+        // number of loop blocks using the constant)
+        if opt_on("remat4") {
+            remat_exprs(&mut self.mir);
+        } else {
+            for (name, k) in [("remat1", 1usize), ("remat2", 2), ("remat3", usize::MAX)] {
+                if opt_on(name) {
+                    remat_consts(&mut self.mir, k);
+                    break;
+                }
+            }
         }
         coalesce(&mut self.mir);
         dce(&mut self.mir);
@@ -2363,6 +2397,325 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
         }
         if !changed {
             return (u, uvars);
+        }
+    }
+}
+/// Rematerialise constants (`v_mov_b32 d, imm`, single definition) that are defined outside a loop and used inside it:
+/// every loop block that uses the constant gets its own `v_mov` right before the first use, so the constant no longer
+/// occupies a VGPR across the whole loop. Costs one VALU per (block, constant) per iteration; `max_blocks` limits the
+/// constants to those used by at most that many loop blocks.
+fn remat_consts(m: &mut MFunction, max_blocks: usize) {
+    let idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut in_loop = vec![false; m.blocks.len()];
+    for (h, l) in &m.loops {
+        if let (Some(&hi), Some(&li)) = (idx.get(h), idx.get(l)) {
+            for b in hi.min(li)..=hi.max(li) {
+                in_loop[b] = true;
+            }
+        }
+    }
+    // single-definition constants
+    let mut defs: HashMap<VReg, (usize, i64, u32)> = HashMap::new(); // vreg -> (def block, imm, #defs)
+    let mut ndefs: HashMap<VReg, u32> = HashMap::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for inst in &b.insts {
+            if let Some(d) = inst.dst {
+                *ndefs.entry(d).or_insert(0) += 1;
+                if inst.op == MOp::VMovB32 && inst.srcs.is_empty() {
+                    defs.insert(d, (bi, inst.imm, 0));
+                }
+            }
+        }
+    }
+    let consts: HashMap<VReg, (usize, i64)> = defs
+        .into_iter()
+        .filter(|(r, (b, _, _))| ndefs.get(r) == Some(&1) && !in_loop[*b] && !m.alias.contains_key(r) && m.vreg_class(*r) == RClass::V1)
+        .map(|(r, (b, k, _))| (r, (b, k)))
+        .collect();
+    // loop blocks using each constant
+    let mut users: HashMap<VReg, Vec<usize>> = HashMap::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        if !in_loop[bi] {
+            continue;
+        }
+        for inst in &b.insts {
+            for s in &inst.srcs {
+                if let Src::Reg(r) = s {
+                    if consts.contains_key(r) {
+                        let e = users.entry(*r).or_default();
+                        if e.last() != Some(&bi) {
+                            e.push(bi);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (c, blocks) in users {
+        if blocks.len() > max_blocks {
+            continue;
+        }
+        let k = consts[&c].1;
+        for bi in blocks {
+            let nr = m.vregs.len() as VReg;
+            m.vregs.push(RClass::V1);
+            let b = &mut m.blocks[bi];
+            let first = b.insts.iter().position(|i| i.srcs.iter().any(|s| matches!(s, Src::Reg(r) if *r == c))).unwrap();
+            for inst in b.insts.iter_mut().skip(first) {
+                for s in inst.srcs.iter_mut() {
+                    if let Src::Reg(r) = s {
+                        if *r == c {
+                            *r = nr;
+                        }
+                    }
+                }
+            }
+            b.insts.insert(first, MInst::new(MOp::VMovB32).def(nr).imm(k));
+        }
+    }
+}
+/// Sink definitions of pure single-definition V1 values down to their first use (same block) or, along a chain of
+/// unconditional single-predecessor edges, into the last block of the chain that still dominates every use (never into a
+/// loop). Shortens live ranges across the prologue peak: values computed early but only needed after it stop occupying a
+/// VGPR in between. Sources are single-definition registers, so moving the definition later cannot change its value.
+fn sink_defs(m: &mut MFunction) {
+    fn pure(op: MOp) -> bool {
+        matches!(
+            op,
+            MOp::VMovB32 | MOp::VMovFromS | MOp::VAddU32 | MOp::VMulLoU32 | MOp::VAndB32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32
+        )
+    }
+    let nb = m.blocks.len();
+    let succs = crate::sched::liveness::successors(m);
+    let mut preds = vec![0usize; nb];
+    for s in &succs {
+        for &x in s {
+            preds[x] += 1;
+        }
+    }
+    let idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    // definitions and uses
+    let mut ndefs: HashMap<VReg, u32> = HashMap::new();
+    let mut use_blocks: HashMap<VReg, Vec<usize>> = HashMap::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for inst in &b.insts {
+            if let Some(d) = inst.dst {
+                *ndefs.entry(d).or_insert(0) += 1;
+            }
+            for r in inst.uses() {
+                let e = use_blocks.entry(r).or_default();
+                if e.last() != Some(&bi) {
+                    e.push(bi);
+                }
+            }
+        }
+    }
+    let alias = m.alias.clone();
+    let single = |r: &VReg| ndefs.get(r).copied().unwrap_or(0) == 1 && !alias.contains_key(r);
+    for bi in 0..nb {
+        // the unconditional chain starting at bi
+        let mut chain = vec![bi];
+        loop {
+            let last = *chain.last().unwrap();
+            match &m.blocks[last].term {
+                Term::Goto(t) => match idx.get(t) {
+                    Some(&n) if preds[n] == 1 && !chain.contains(&n) => chain.push(n),
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        let mut i = m.blocks[bi].insts.len();
+        while i > 0 {
+            i -= 1;
+            let inst = m.blocks[bi].insts[i].clone();
+            let Some(d) = inst.dst else { continue };
+            if !pure(inst.op) || m.vreg_class(d) != RClass::V1 || !single(&d) {
+                continue;
+            }
+            if !inst.srcs.iter().all(|s| match s {
+                Src::Imm(_) => true,
+                Src::Reg(r) => single(r),
+            }) {
+                continue;
+            }
+            let ubs = match use_blocks.get(&d) {
+                Some(u) if !u.is_empty() => u.clone(),
+                _ => continue,
+            };
+            // all uses in this block: sink to just before the first use
+            if ubs.iter().all(|&u| u == bi) {
+                let first = (i + 1..m.blocks[bi].insts.len()).find(|&k| m.blocks[bi].insts[k].uses().contains(&d));
+                if let Some(k) = first {
+                    if k > i + 1 {
+                        let x = m.blocks[bi].insts.remove(i);
+                        m.blocks[bi].insts.insert(k - 1, x);
+                    }
+                }
+                continue;
+            }
+            if ubs.contains(&bi) {
+                continue;
+            }
+            // furthest chain block such that every use is in it or beyond the chain
+            let mut target = 0usize;
+            for (ci, &cb) in chain.iter().enumerate().skip(1) {
+                // uses inside chain blocks before cb would not be dominated by the new position
+                if ubs.iter().any(|u| chain[..ci].contains(u)) {
+                    break;
+                }
+                target = ci;
+                let _ = cb;
+            }
+            if target == 0 {
+                continue;
+            }
+            let tb = chain[target];
+            // never into a loop block
+            if m.loops.iter().any(|(h, l)| {
+                let (hi, li) = (idx.get(h).copied().unwrap_or(usize::MAX), idx.get(l).copied().unwrap_or(0));
+                tb >= hi.min(li) && tb <= hi.max(li)
+            }) {
+                continue;
+            }
+            let x = m.blocks[bi].insts.remove(i);
+            // before the first use if the use is in tb, else at the end of tb (before nothing: terminators are not instructions)
+            let pos = m.blocks[tb].insts.iter().position(|y| y.uses().contains(&d)).unwrap_or(m.blocks[tb].insts.len());
+            m.blocks[tb].insts.insert(pos, x);
+        }
+    }
+}
+/// Rematerialise whole expressions: a pure single-definition V1 value defined outside a loop whose expression tree
+/// (add/mul/shift/and/or/xor/mov, depth <= 6) has only constants, single-definition SGPRs and the workitem id as leaves is
+/// recomputed in every loop block that uses it, right before the first use, instead of staying in a VGPR across the loop.
+/// Last-resort register relief (`remat4`): costs the expression's VALU instructions per block per iteration.
+fn remat_exprs(m: &mut MFunction) {
+    let idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut in_loop = vec![false; m.blocks.len()];
+    for (h, l) in &m.loops {
+        if let (Some(&hi), Some(&li)) = (idx.get(h), idx.get(l)) {
+            for b in hi.min(li)..=hi.max(li) {
+                in_loop[b] = true;
+            }
+        }
+    }
+    let mut ndefs: HashMap<VReg, u32> = HashMap::new();
+    let mut def: HashMap<VReg, (usize, usize)> = HashMap::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if let Some(d) = inst.dst {
+                *ndefs.entry(d).or_insert(0) += 1;
+                def.insert(d, (bi, ii));
+            }
+        }
+    }
+    fn pure(op: MOp) -> bool {
+        matches!(
+            op,
+            MOp::VMovB32 | MOp::VAddU32 | MOp::VMulLoU32 | MOp::VAndB32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32
+        )
+    }
+    // expression tree of `r` as a list of (vreg, instruction), children first; None if a leaf is not allowed
+    fn expr(
+        m: &MFunction,
+        ndefs: &HashMap<VReg, u32>,
+        def: &HashMap<VReg, (usize, usize)>,
+        in_loop: &[bool],
+        r: VReg,
+        depth: u32,
+        out: &mut Vec<(VReg, MInst)>,
+    ) -> Option<()> {
+        if depth > 6 || m.alias.contains_key(&r) || m.vreg_class(r) != RClass::V1 || ndefs.get(&r) != Some(&1) {
+            return None;
+        }
+        let (b, i) = *def.get(&r)?;
+        if in_loop[b] {
+            return None;
+        }
+        let inst = m.blocks[b].insts[i].clone();
+        if !pure(inst.op) {
+            return None;
+        }
+        for s in &inst.srcs {
+            if let Src::Reg(x) = s {
+                let xc = m.vreg_class(*x);
+                if xc == RClass::S1 {
+                    if ndefs.get(x) != Some(&1) {
+                        return None; // a loop variable: its value changes
+                    }
+                    continue;
+                }
+                // the workitem id: a VReadPhys, kept live by everything else anyway
+                if let Some(&(xb, xi)) = def.get(x) {
+                    if ndefs.get(x) == Some(&1) && m.blocks[xb].insts[xi].op == MOp::VReadPhys {
+                        continue;
+                    }
+                }
+                expr(m, ndefs, def, in_loop, *x, depth + 1, out)?;
+            }
+        }
+        if !out.iter().any(|(v, _)| *v == r) {
+            out.push((r, inst));
+        }
+        Some(())
+    }
+    let mut cands: Vec<(VReg, Vec<(VReg, MInst)>)> = Vec::new();
+    let mut used_in_loop: std::collections::HashSet<VReg> = std::collections::HashSet::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        if in_loop[bi] {
+            for inst in &b.insts {
+                for r in inst.uses() {
+                    used_in_loop.insert(r);
+                }
+            }
+        }
+    }
+    let mut regs: Vec<VReg> = used_in_loop.into_iter().collect();
+    regs.sort();
+    for r in regs {
+        let mut e = Vec::new();
+        if expr(m, &ndefs, &def, &in_loop, r, 0, &mut e).is_some() {
+            cands.push((r, e));
+        }
+    }
+    for (c, e) in cands {
+        let blocks: Vec<usize> = (0..m.blocks.len())
+            .filter(|&bi| in_loop[bi] && m.blocks[bi].insts.iter().any(|i| i.srcs.iter().any(|s| matches!(s, Src::Reg(r) if *r == c))))
+            .collect();
+        for bi in blocks {
+            // fresh copies of the expression, renamed
+            let mut map: HashMap<VReg, VReg> = HashMap::new();
+            let mut clones: Vec<MInst> = Vec::new();
+            for (v, inst) in &e {
+                let nr = m.vregs.len() as VReg;
+                m.vregs.push(RClass::V1);
+                map.insert(*v, nr);
+                let mut ni = inst.clone();
+                ni.dst = Some(nr);
+                for s in ni.srcs.iter_mut() {
+                    if let Src::Reg(x) = s {
+                        if let Some(n) = map.get(x) {
+                            *x = *n;
+                        }
+                    }
+                }
+                clones.push(ni);
+            }
+            let nc = map[&c];
+            let b = &mut m.blocks[bi];
+            let first = b.insts.iter().position(|i| i.srcs.iter().any(|s| matches!(s, Src::Reg(r) if *r == c))).unwrap();
+            for inst in b.insts.iter_mut().skip(first) {
+                for s in inst.srcs.iter_mut() {
+                    if let Src::Reg(r) = s {
+                        if *r == c {
+                            *r = nc;
+                        }
+                    }
+                }
+            }
+            for (k, ci) in clones.into_iter().enumerate() {
+                b.insts.insert(first + k, ci);
+            }
         }
     }
 }
