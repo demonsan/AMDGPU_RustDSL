@@ -88,7 +88,8 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
         MOp::VAddCoU32 | MOp::VAddcCoU32 | MOp::VPtrAdd => Some(4),
         MOp::VExpF32 | MOp::VRcpF32 => None,
         o if movable(o) => Some(2),
-        MOp::VMovFromS | MOp::VMovFromSPair | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VCvtPknormU16 => Some(2),
+        // lane write of a fragment (expands to v_mov): the tuple may feed a matrix op next
+        MOp::VWriteSub | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VCvtPknormU16 => Some(2),
         _ => None,
     }
 }
