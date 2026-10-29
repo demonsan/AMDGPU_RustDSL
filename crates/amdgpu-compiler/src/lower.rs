@@ -504,6 +504,13 @@ impl Lowerer {
         if self.uniform.contains(&dst) {
             return Ok(false);
         }
+        // A loop variable is a mutable register: `var + k` must be evaluated now, never kept as a reference to the
+        // register (set_var may overwrite it before the value is used).
+        for o in [a, b] {
+            if self.const_bits(o).is_none() && matches!(self.split_const(o).0, Opnd::Var(_)) {
+                return Ok(false);
+            }
+        }
         let (kb, ka) = (self.const_bits(b), self.const_bits(a));
         match (ka, kb) {
             (None, Some(k)) | (Some(k), None) => {
