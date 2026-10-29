@@ -700,3 +700,58 @@ fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) 
     }
     raw
 }
+/// Peak vector-register pressure (dwords, v0 included) from dword-level liveness: (peak, linear position, block index).
+pub fn pressure_profile(m: &MFunction) -> (u32, usize, usize) {
+    let mut idx_of: Vec<Vec<usize>> = Vec::with_capacity(m.blocks.len());
+    let mut next = 0usize;
+    for b in &m.blocks {
+        let mut v = Vec::with_capacity(b.insts.len());
+        for _ in 0..b.insts.len() {
+            v.push(next);
+            next += 1;
+        }
+        idx_of.push(v);
+    }
+    let label_to_block: std::collections::HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); m.blocks.len()];
+    for (i, b) in m.blocks.iter().enumerate() {
+        match &b.term {
+            Term::Goto(t) => {
+                if let Some(j) = label_to_block.get(t) {
+                    succs[i].push(*j);
+                }
+            }
+            Term::CondGoto { target, fall, .. } => {
+                for t in [target, fall] {
+                    if let Some(j) = label_to_block.get(t) {
+                        succs[i].push(*j);
+                    }
+                }
+            }
+            Term::Endpgm => {}
+        }
+    }
+    let segs = precise_segments(m, &idx_of, &succs);
+    let mut ev: Vec<(usize, i64)> = Vec::new();
+    for (r, sg) in segs.iter().enumerate() {
+        let c = m.vreg_class(r as VReg);
+        if !c.is_vector() || m.alias.contains_key(&(r as VReg)) {
+            continue;
+        }
+        for (a, b) in sg {
+            ev.push((*a, c.dwords() as i64));
+            ev.push((b.saturating_add(1), -(c.dwords() as i64)));
+        }
+    }
+    ev.sort();
+    let (mut cur, mut peak, mut at) = (V_RESERVED as i64, 0i64, 0usize);
+    for (p, d) in ev {
+        cur += d;
+        if cur > peak {
+            peak = cur;
+            at = p;
+        }
+    }
+    let blk = idx_of.iter().position(|v| v.last().map_or(false, |l| *l >= at) && v.first().map_or(false, |f| *f <= at)).unwrap_or(0);
+    (peak as u32, at, blk)
+}
