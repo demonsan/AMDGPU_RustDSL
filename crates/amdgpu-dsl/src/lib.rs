@@ -1550,8 +1550,8 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
             }
             Stmt::VarScaleLane { var, .. } => {
-                if f.var_ty(*var) != Some(DType::Frag16) {
-                    errs.push(here(format!("var{var} must be a frag16")));
+                if !matches!(f.var_ty(*var), Some(DType::Frag16) | Some(DType::Frag4)) {
+                    errs.push(here(format!("var{var} must be a frag16 or frag4")));
                 }
             }
             Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. } => {
