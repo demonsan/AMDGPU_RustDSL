@@ -7712,7 +7712,8 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let w4_4 = b.shl_i32(w4_odd, c2);
     let lane_h4 = b.let_(Op::LshrI32(Opnd::Val(lane_v), Opnd::Val(c4)));
     let fsw0 = b.add_i32(w4_4, lane_h4);
-    let fsw = b.let_(Op::AndI32(Opnd::Val(fsw0), Opnd::Val(c7m)));
+    let fsw1 = b.let_(Op::AndI32(Opnd::Val(fsw0), Opnd::Val(c7m)));
+    let fsw = if fmha_t_opt("noswz") { c0 } else { fsw1 };
     let cch = b.xor_i32(lane_lo, fsw);
     let cbytes = b.shl_i32(cch, c4);
     let w8 = b.shl_i32(cx.wave4, c3);
@@ -8374,7 +8375,9 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let mut trx: Vec<ValueId> = Vec::new();
     if fmha_t_opt("dma") {
         let j_s1 = b.let_(Op::LshrI32(Opnd::Val(j), Opnd::Val(c1)));
-        let f_k = b.let_(Op::AndI32(Opnd::Val(j_s1), Opnd::Val(c7)));
+        let f_k0 = b.let_(Op::AndI32(Opnd::Val(j_s1), Opnd::Val(c7)));
+        let zero_sw = b.c_i32(0);
+        let f_k = if fmha_t_opt("noswz") { zero_sw } else { f_k0 };
         let gbit = pblk;
         let x = b.xor_i32(gbit, f_k);
         let jrow = b.mul_i32(j, c128);
@@ -8386,7 +8389,8 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
             kfx.push(b.add_i32(a0, lds_k));
         }
         let kp_s1 = b.let_(Op::LshrI32(Opnd::Val(key_part), Opnd::Val(c1)));
-        let f_t = b.let_(Op::AndI32(Opnd::Val(kp_s1), Opnd::Val(c7)));
+        let f_t0 = b.let_(Op::AndI32(Opnd::Val(kp_s1), Opnd::Val(c7)));
+        let f_t = if fmha_t_opt("noswz") { zero_sw } else { f_t0 };
         let y = b.xor_i32(m_gl, f_t);
         let trow = b.mul_i32(key_part, c128);
         let mh8 = b.shl_i32(m_h, c3);
