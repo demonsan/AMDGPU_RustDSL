@@ -9555,8 +9555,21 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (cx.v_seqs, cx.vbase_off, cx.ptr_v, cx.lds_v)
     };
     let lds_kd = b.c_i32(2 * cbuf_i);
-    let rt_row4 = b.shl_i32(cx.rt_row, c2);
-    let kdb0 = b.add_i32(lds_kd, rt_row4);
+    // kdv4: the four K-scale dwords of a lane (tiles 0..3) are contiguous (lane*16 + 4 s): ONE ds_read_b128 per tile instead of four ds_read_b32
+    let kdv4 = fmha_t_opt("kdv4");
+    let kdb0 = if kdv4 {
+        let c31k = b.c_i32(31);
+        let c5k = b.c_i32(5);
+        let rlo = b.let_(Op::AndI32(Opnd::Val(cx.rt_row), Opnd::Val(c31k)));
+        let rlo16 = b.shl_i32(rlo, c4);
+        let rhi = b.let_(Op::LshrI32(Opnd::Val(cx.rt_row), Opnd::Val(c5k)));
+        let rhi4 = b.shl_i32(rhi, c2);
+        let o0 = b.add_i32(rlo16, rhi4);
+        b.add_i32(lds_kd, o0)
+    } else {
+        let rt_row4 = b.shl_i32(cx.rt_row, c2);
+        b.add_i32(lds_kd, rt_row4)
+    };
     // ---- DMA staging (see the sv/t roles): 1040-byte run layout, one M0 per wave ----
     // dense swizzled layout (rows of 128 bytes, 16-byte chunk c of tile row r at chunk c ^ s(r), s as in the `swz` option): wave w
     // stages rows 32 w .. 32 w + 31; DMA instruction q covers rows 32 w + 8 q .. +7 = 1 KB contiguous, lane i lands in slot i, so
@@ -9737,13 +9750,14 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let cm1 = b.c_i32(-1);
     let cbuf = b.c_i32(cbuf_i);
     let c512 = b.c_i32(512);
-    let j4 = b.shl_i32(cx.j, c2);
+    let j4 = if kdv4 { b.shl_i32(cx.j, c4) } else { b.shl_i32(cx.j, c2) };
     let kd_cur = b.add_i32(lds_kd, j4);
     if !role_a && !no_bar {
         b.barrier(); // P1 (group A computed QK(0) before its P1)
     }
     let s_init: Vec<ValueId> = {
         let mut out: Vec<ValueId> = Vec::with_capacity(4);
+        let kdf0 = if kdv4 { Some(b.load_lds_b128(Opnd::Val(kd_cur))) } else { None };
         for s in 0..4usize {
             let biasf = b.mfma_f16_wide(ones_f16, bias_init, zero);
             let ko = b.c_i32(4096 * (s as i32));
@@ -9753,9 +9767,14 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a3 = b.add_i32(cx.kfx[3], ko);
             let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
             let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
-            let koff = b.c_i32(128 * s as i32);
-            let ka = b.add_i32(kd_cur, koff);
-            let kd = b.load_lds_b32(Opnd::Val(ka));
+            let kd = if let Some(f) = kdf0 {
+                let l = b.frag4_lane(f, s as u8);
+                b.bitcast_i32(l)
+            } else {
+                let koff = b.c_i32(128 * s as i32);
+                let ka = b.add_i32(kd_cur, koff);
+                b.load_lds_b32(Opnd::Val(ka))
+            };
             let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
@@ -9816,7 +9835,15 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot)).collect();
         let kd_rd = b.add_i32(kd_cur, kdslot);
         // kdpre: the four K-scale dwords are read up front (4 VGPR) so that their lgkmcnt waits do not sit in front of every tile's MFMAs
-        let kd_pre: Vec<ValueId> = if fmha_t_opt("kdpre") {
+        let kd_pre: Vec<ValueId> = if kdv4 {
+            let f = b.load_lds_b128(Opnd::Val(kd_rd));
+            (0..4u8)
+                .map(|s| {
+                    let l = b.frag4_lane(f, s);
+                    b.bitcast_i32(l)
+                })
+                .collect()
+        } else if fmha_t_opt("kdpre") {
             (0..4usize)
                 .map(|s| {
                     let koff = b.c_i32(128 * s as i32);
