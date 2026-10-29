@@ -9518,7 +9518,14 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let c128v = b.c_i32(128);
     let zero = b.frag_zero(DType::Frag16);
     let hq4_d = cx.kd_stride;
-    let c_thr = b.c_f32(135.0 / 512.0);
+    // svscale: the reference only moves ("rebase") when the row max is far above it (S' > 0.45, i.e. 2^100 above); smaller growth is
+    // absorbed by a per-lane power-of-two scale of this unit's P (cvt scale operand) that the PV/row-sum MFMA scale operand undoes
+    let svscale = fmha_t_opt("svscale");
+    let c_thr = b.c_f32(if fmha_t_opt("svinf") { 1.0e9 } else if svscale { fmha_t_num("svr").map(|v| v as f32 / 1000.0).unwrap_or(0.45) } else { 135.0 / 512.0 }); // svinf: never roll back (timing diagnostic, wrong numerics)
+    let c135f = b.c_f32(fmha_t_num("svt").map(|v| v as f32).unwrap_or(135.0)); // fp8 target exponent: P max = 2^(svt - 127)
+    let c0p5 = b.c_f32(0.5);
+    let c2p23 = b.c_f32(8388608.0);
+    let cmagic = b.c_i32(-0x4B00_0000);
     let c_b131 = b.c_f32((131 - shd) as f32 / 512.0);
     let c8f = b.c_f32(8.0);
     let c0125 = b.c_f32(0.125);
@@ -9527,7 +9534,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let zero_f = b.c_f32(0.0);
     let cffff = b.c_i32(0xffff);
     let cm9 = b.c_i32(-9);
-    let cbuf_i: i32 = 33280;
+    let cbuf_i: i32 = 32768;
     let (seqs, base_off, ptr, lds_base) = if role_a {
         (cx.k_seqs, cx.kbase_off, cx.ptr_k, cx.lds_k)
     } else {
@@ -9537,26 +9544,51 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let rt_row4 = b.shl_i32(cx.rt_row, c2);
     let kdb0 = b.add_i32(lds_kd, rt_row4);
     // ---- DMA staging (see the sv/t roles): 1040-byte run layout, one M0 per wave ----
+    // dense swizzled layout (rows of 128 bytes, 16-byte chunk c of tile row r at chunk c ^ s(r), s as in the `swz` option): wave w
+    // stages rows 32 w .. 32 w + 31; DMA instruction q covers rows 32 w + 8 q .. +7 = 1 KB contiguous, lane i lands in slot i, so
+    // lane i fetches chunk (i & 7) ^ s(row) of row 8 q + (i >> 3)
+    fn swz_s(b: &mut FnBuilder, row: ValueId) -> ValueId {
+        let one = b.c_i32(1);
+        let two = b.c_i32(2);
+        let three = b.c_i32(3);
+        let p = b.let_(Op::AndI32(Opnd::Val(row), Opnd::Val(one)));
+        let t1 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(one)));
+        let u0 = b.let_(Op::AndI32(Opnd::Val(t1), Opnd::Val(one)));
+        let t2 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(two)));
+        let u1 = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(one)));
+        let t3 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(three)));
+        let u2 = b.let_(Op::AndI32(Opnd::Val(t3), Opnd::Val(one)));
+        let s2 = b.xor_i32(u2, p);
+        let s0 = b.xor_i32(u1, p);
+        let s2s = b.shl_i32(s2, two);
+        let s1s = b.shl_i32(u0, one);
+        let a = b.add_i32(s2s, s1s);
+        b.add_i32(a, s0)
+    }
     let lane_v = {
         let t8 = b.shl_i32(cx.g4, c3d);
         b.add_i32(cx.j, t8)
     };
     let lane_hi = b.let_(Op::LshrI32(Opnd::Val(lane_v), Opnd::Val(c3d)));
     let lane_lo = b.let_(Op::AndI32(Opnd::Val(lane_v), Opnd::Val(c7d)));
-    let w4_odd = b.let_(Op::AndI32(Opnd::Val(cx.wave4), Opnd::Val(c1)));
-    let cbytes = b.shl_i32(lane_lo, c4);
-    let w8s = b.shl_i32(lane_hi, c3d);
-    let w_hi = b.let_(Op::LshrI32(Opnd::Val(cx.wave4), Opnd::Val(c1)));
-    let w_hi64 = b.shl_i32(w_hi, c6d);
-    let w_lo4 = b.shl_i32(w4_odd, c2);
-    let rw0 = b.add_i32(w8s, w_hi64);
-    let rowb = b.add_i32(rw0, w_lo4);
-    let c4160 = b.c_i32(4160);
-    let w4160 = b.mul_i32(cx.wave4, c4160);
-    let c3120 = b.c_i32(3120);
-    let w_top = b.add_i32(w4160, c3120);
-    let lds_tile = b.add_i32(lds_base, w_top);
-    let kd_row_load = |b: &mut FnBuilder, key0: ValueId| -> ValueId {
+    let c8_ = b.c_i32(8);
+    let lane_hi8 = b.add_i32(lane_hi, c8_);
+    let s_even = swz_s(b, lane_hi);
+    let s_odd = swz_s(b, lane_hi8);
+    let ch_even = b.xor_i32(lane_lo, s_even);
+    let ch_odd = b.xor_i32(lane_lo, s_odd);
+    let cbytes_even = b.shl_i32(ch_even, c4);
+    let cbytes_odd = b.shl_i32(ch_odd, c4);
+    let c5_ = b.c_i32(5);
+    let w32 = b.shl_i32(cx.wave4, c5_);
+    let rowb = b.add_i32(w32, lane_hi);
+    let c4096 = b.c_i32(4096);
+    let w4096 = b.mul_i32(cx.wave4, c4096);
+    // M0 at the top of the wave's 4 KB: the instruction offsets are negative and the global address is compensated by a POSITIVE amount
+    // (a 32-bit pointer offset is zero-extended: a negative one would wrap to +4 GB)
+    let c3072 = b.c_i32(3072);
+    let w_top = b.add_i32(w4096, c3072);
+    let lds_tile = b.add_i32(lds_base, w_top);    let kd_row_load = |b: &mut FnBuilder, key0: ValueId| -> ValueId {
         let srow_raw = b.add_i32(key0, cx.rt_row);
         let srow_ok = b.cmp_lt_i32(srow_raw, cx.kv_len);
         let srow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(srow_ok), a: Opnd::Val(srow_raw), b: Opnd::Val(cx.kv_last) });
@@ -9574,17 +9606,18 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let rb = b.add_i32(key0, rowb);
         let lbase = b.add_i32(lds_tile, buf_off);
         for q in 0..4i32 {
-            let cq = b.c_i32(q);
+            let cq = b.c_i32(8 * q);
             let row_raw = b.add_i32(rb, cq);
             let ok = b.cmp_lt_i32(row_raw, cx.kv_len);
             let row = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(row_raw), b: Opnd::Val(cx.kv_last) });
             let o0 = b.mul_i32(row, seqs);
             let o1 = b.add_i32(o0, base_off);
+            let cbytes = if q & 1 == 0 { cbytes_even } else { cbytes_odd };
             let o2 = b.add_i32(o1, cbytes);
-            let comp = b.c_i32(1040 * (3 - q));
+            let comp = b.c_i32(1024 * (3 - q));
             let o3 = b.add_i32(o2, comp);
             let sp = b.ptr_add(ptr, o3);
-            b.load_global_lds(sp, lbase, -(1040 * (3 - q)), 4);
+            b.load_global_lds(sp, lbase, -(1024 * (3 - q)), 4);
         }
     };
     // stage a tile into ring slot `slot_off` (K scales of role A at `kd_slot`) and wait for it
