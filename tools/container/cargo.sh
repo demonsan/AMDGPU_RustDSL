@@ -53,6 +53,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e AMDC_TEST_KERNELS="${AMDC_TEST_KERNELS:-}" \
     -e AMDC_KEEP_MIR="${AMDC_KEEP_MIR:-}" \
     -e AMDC_LLC_ARGS="${AMDC_LLC_ARGS:-}" \
+    -e AMDC_ADDRFOLD_NODS="${AMDC_ADDRFOLD_NODS:-}" \
     -e AMDC_LOOP_ALIGN="${AMDC_LOOP_ALIGN:-}" \
     -e AMDC_LOWER_OPTS="${AMDC_LOWER_OPTS:-}" \
     -e AMDC_DIALECT="${AMDC_DIALECT:-}" \
