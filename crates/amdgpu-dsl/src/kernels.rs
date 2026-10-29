@@ -9650,6 +9650,20 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         out
     };
     let no_dma = ablate.contains("nodma");
+    // dmah: base_off + column bytes + instruction compensation per q are tile-invariant: computed once (4 VGPR)
+    let dmah = fmha_t_opt("dmah");
+    let oq: Vec<ValueId> = if dmah {
+        (0..4i32)
+            .map(|q| {
+                let cbytes = if q & 1 == 0 { cbytes_even } else { cbytes_odd };
+                let o1 = b.add_i32(base_off, cbytes);
+                let comp = b.c_i32(1024 * (3 - q));
+                b.add_i32(o1, comp)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let dma_issue = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId| {
         if no_dma {
             return;
@@ -9662,11 +9676,15 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let ok = b.cmp_lt_i32(row_raw, cx.kv_len);
             let row = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(row_raw), b: Opnd::Val(cx.kv_last) });
             let o0 = b.mul_i32(row, seqs);
-            let o1 = b.add_i32(o0, base_off);
-            let cbytes = if q & 1 == 0 { cbytes_even } else { cbytes_odd };
-            let o2 = b.add_i32(o1, cbytes);
-            let comp = b.c_i32(1024 * (3 - q));
-            let o3 = b.add_i32(o2, comp);
+            let o3 = if dmah {
+                b.add_i32(o0, oq[q as usize])
+            } else {
+                let o1 = b.add_i32(o0, base_off);
+                let cbytes = if q & 1 == 0 { cbytes_even } else { cbytes_odd };
+                let o2 = b.add_i32(o1, cbytes);
+                let comp = b.c_i32(1024 * (3 - q));
+                b.add_i32(o2, comp)
+            };
             let sp = b.ptr_add(ptr, o3);
             b.load_global_lds(sp, lbase, -(1024 * (3 - q)), 4);
         }
@@ -9973,14 +9991,15 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         {
             let w_old_u = b.frag2_lane(bias2, 0);
             let w_old = b.bitcast_i32(w_old_u);
-            let lo16 = b.let_(Op::AndI32(Opnd::Val(w_old), Opnd::Val(cffff)));
+            // rbtrim: v_cvt_f32_f16 reads only the low 16 bits and v_cvt_f16_f32 zero-extends: the masks are redundant
+            let lo16 = if fmha_t_opt("rbtrim") { w_old } else { b.let_(Op::AndI32(Opnd::Val(w_old), Opnd::Val(cffff))) };
             let b8 = b.let_(Op::CvtF16ToF32(Opnd::Val(lo16)));
             let b_old = b.mul_f32(b8, c8f);
             let tt = b.sub_f32(c_b131, mt);
             let b_new = b.add_f32(b_old, tt);
             let q8 = b.mul_f32(b_new, c0125);
             let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q8)));
-            let h = b.let_(Op::AndI32(Opnd::Val(h_raw), Opnd::Val(cffff)));
+            let h = if fmha_t_opt("rbtrim") { h_raw } else { b.let_(Op::AndI32(Opnd::Val(h_raw), Opnd::Val(cffff))) };
             let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h)));
             let b_q = b.mul_f32(hq, c8f);
             let d_full = b.sub_f32(b_q, b_old);
@@ -10091,6 +10110,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         // V phase (the DMA of tile t+2 runs under it, waited for at its end); M phase: PV(this tile) + QK(next tile)
         let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
         let kdg: Option<Vec<ValueId>> = if kdglob && stage { Some(kd_rows(b, key_n2)) } else { None };
+        let _ = &kdg;
         let w = valu(b, masked);
         if stage {
             stage_end(b, skd, kds_nxt);
@@ -10102,6 +10122,22 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if !no_bar && !nobar1 {
             b.barrier();
         }
+        // kdearly: the four K-scale dwords of the next tile are read at the START of the M phase (right after the barrier), so their lgkmcnt
+        // wait retires behind the PV MFMAs instead of sitting in front of the first QK MFMA (4 VGPR live during PV)
+        let kdg: Option<Vec<ValueId>> = if fmha_t_opt("kdearly") && stage {
+            let kd_rd0 = b.add_i32(kd_cur, kds_nxt);
+            Some(
+                (0..4usize)
+                    .map(|s| {
+                        let koff = b.c_i32(128 * s as i32);
+                        let ka = b.add_i32(kd_rd0, koff);
+                        b.load_lds_b32(Opnd::Val(ka))
+                    })
+                    .collect(),
+            )
+        } else {
+            kdg
+        };
         if fmha_t_opt("qkfirst") {
             // QK(i+1) first: S(i) was consumed by the V phase; the PV tr reads then queue behind the QK fragment reads
             if stage {
