@@ -54,6 +54,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e AMDC_KEEP_MIR="${AMDC_KEEP_MIR:-}" \
     -e AMDC_LLC_ARGS="${AMDC_LLC_ARGS:-}" \
     -e AMDC_RA_FORCE_TWOPHASE="${AMDC_RA_FORCE_TWOPHASE:-}" \
+    -e AMDC_RA_LDS_SPILL="${AMDC_RA_LDS_SPILL:-}" \
     -e AMDC_LOOP_ALIGN="${AMDC_LOOP_ALIGN:-}" \
     -e AMDC_LOWER_OPTS="${AMDC_LOWER_OPTS:-}" \
     -e AMDC_DIALECT="${AMDC_DIALECT:-}" \
