@@ -1091,7 +1091,10 @@ pub fn probe_dma_seq() -> Function {
 /// reads the four 16-byte K fragment chunks `g ^ 2 k` of row `j` (+ 32 rows per wave group w = t >> 6) the way the
 /// kernel does and stores them. `o[(t * 4 + k) * 16 ..]` must equal `i[(j + 32 (t >> 6)) * 128 + 16 (g ^ 2 k) ..]`.
 pub fn probe_dma_kread() -> Function {
-    let swz = std::env::var("PD_SWZ").is_ok();
+    // PD_SWZ: 0/empty = row-major, 1 = 3-bit XOR swizzle, 2 = 2-bit XOR swizzle
+    let swz_mode: u32 = std::env::var("PD_SWZ").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let swz = swz_mode != 0;
+    let fmask: i32 = if swz_mode == 2 { 3 } else { 7 };
     let mut b = FnBuilder::new("probe_dma_kread", 256);
     b.lds(20000);
     b.arg("o", DType::Ptr, 0, 8);
@@ -1105,6 +1108,7 @@ pub fn probe_dma_kread() -> Function {
     let c5 = b.c_i32(5);
     let c6 = b.c_i32(6);
     let c7 = b.c_i32(7);
+    let cfm = b.c_i32(fmask);
     let c10 = b.c_i32(10);
     let c31 = b.c_i32(31);
     let c63 = b.c_i32(63);
@@ -1118,7 +1122,7 @@ pub fn probe_dma_kread() -> Function {
     let w4 = b.shl_i32(w_odd, c2);
     let lane_h4 = b.let_(Op::LshrI32(Opnd::Val(lane), Opnd::Val(c4)));
     let fs0 = b.add_i32(w4, lane_h4);
-    let fsw_raw = b.let_(Op::AndI32(Opnd::Val(fs0), Opnd::Val(c7)));
+    let fsw_raw = b.let_(Op::AndI32(Opnd::Val(fs0), Opnd::Val(cfm)));
     let zero = b.c_i32(0);
     let fsw = if swz { fsw_raw } else { zero };
     let cch = b.xor_i32(lane_lo, fsw);
@@ -1178,7 +1182,7 @@ pub fn probe_dma_kread() -> Function {
     let rowk = b.add_i32(jj, w32);
     let jrow = b.mul_i32(rowk, c128);
     let js1 = b.let_(Op::LshrI32(Opnd::Val(rowk), Opnd::Val(c1)));
-    let f0 = b.let_(Op::AndI32(Opnd::Val(js1), Opnd::Val(c7)));
+    let f0 = b.let_(Op::AndI32(Opnd::Val(js1), Opnd::Val(cfm)));
     let fk = if swz { f0 } else { zero };
     let x = b.xor_i32(g, fk);
     let t64 = b.shl_i32(tid, c6);
