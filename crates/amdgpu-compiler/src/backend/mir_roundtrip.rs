@@ -250,7 +250,7 @@ fn parse_at(lines: &[&str], i: usize, st: &mut Stats) -> (Inst, usize) {
 
 /// How much information the printed MIR keeps.
 /// * `Identity`: everything (structure round trip only).
-/// * `Flags`: drop register flags our exporter never writes (`killed dead renamable internal`; `undef` is kept: it states intent, not liveness).
+/// * `Flags`: drop register flags our exporter never writes (`killed dead renamable`; `undef` and `internal` are kept: they state intent / bundle membership, which our exporter never produces and which the verifier needs).
 /// * `All`: additionally drop instruction flags, memory operands and debug locations, i.e. the
 ///   information level of MIR as our exporter writes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -264,7 +264,7 @@ fn degrade(i: &mut Inst, lv: Level) {
     if lv == Level::Identity || i.raw.is_some() {
         return;
     }
-    let strip = |o: &mut Operand| o.flags.retain(|f| !matches!(f.as_str(), "killed" | "dead" | "renamable" | "internal"));
+    let strip = |o: &mut Operand| o.flags.retain(|f| !matches!(f.as_str(), "killed" | "dead" | "renamable"));
     i.defs.iter_mut().for_each(strip);
     i.ops.iter_mut().for_each(strip);
     if lv == Level::All {
