@@ -9149,6 +9149,10 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
     };
     let valu_tail = |b: &mut FnBuilder, hh: usize| {
+        if fmha_t_opt("vsnotail") {
+            valu(b, hh, false);
+            return;
+        }
         let key_end = b.add_i32(key0, c128v);
         let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
         b.begin_if(Opnd::Val(is_tail));
