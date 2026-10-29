@@ -1110,8 +1110,7 @@ impl Lowerer {
                             self.rfl_cache.insert(lv, s);
                             s
                         }
-                    };
-                    };
+                    } };
                     let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128 } else { MOp::GlobalLoadLdsB32 };
                     // imm = instruction offset: added to the global address AND to the LDS destination (M0 + imm + 16 lane)
                     self.push(MInst::new(mop).srcreg(rb).srcreg(sreg).imm(*byte_off as i64));
