@@ -9759,8 +9759,35 @@ pub fn probe_smfmac_ones() -> Function {
     let i29_3 = b.bitcast_i32(l29_3);
     let r29 = b.frag4(i29_0, i29_1, i29_2, i29_3);
 
+    // 30-35: how much VALU work between the accumulator pre-set and the smfmac makes the C read
+    //        visible? K independent-ish VALU adds in between; dump the rebuilt fragment.
+    let c1f = b.c_f32(1.0);
+    let mut prev = b.c_f32(0.0);
+    let mut s35: Vec<ValueId> = Vec::new();
+    for &(slot, extra) in &[(30usize, 0usize), (31, 2), (32, 4), (33, 8), (34, 16), (35, 32)] {
+        let acc = b.frag4(k1000, k1000, k1000, k1000);
+        let mut filler = prev;
+        for _ in 0..extra {
+            filler = b.add_f32(filler, c1f);
+        }
+        prev = filler;
+        let s = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc);
+        let l0 = b.frag4_lane(s, 0);
+        let l1 = b.frag4_lane(s, 1);
+        let l2 = b.frag4_lane(s, 2);
+        let l3 = b.frag4_lane(s, 3);
+        let i0 = b.bitcast_i32(l0);
+        let i1 = b.bitcast_i32(l1);
+        let i2 = b.bitcast_i32(l2);
+        let i3 = b.bitcast_i32(l3);
+        s35.push(b.frag4(i0, i1, i2, i3));
+    }
+
     for (e, d) in results.iter().enumerate() {
         probe_smfmac_dump(&mut b, base, e, *d);
+    }
+    for (k, d) in s35.iter().enumerate() {
+        probe_smfmac_dump(&mut b, base, 30 + k, *d);
     }
     probe_smfmac_dump(&mut b, base, 27, acc27);
     let off28 = b.c_i32(28 * 1024);
