@@ -9043,7 +9043,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // VALU phase of half `hh`: max over its 32 scores, rollback (reference change) when some lane's S' leaves the fp8 range,
     // then P = fp8(2^(s - r) x 16) into `pw`
-    let valu = |b: &mut FnBuilder, hh: usize, masked: bool| -> Vec<ValueId> {
+    let valu = |b: &mut FnBuilder, hh: usize, masked: bool, store: bool| -> Vec<ValueId> {
         let mut words_out: Vec<ValueId> = Vec::with_capacity(8);
         let mut kb: Vec<ValueId> = Vec::new();
         if masked {
@@ -9145,7 +9145,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 } else {
                     b.cvt_pknorm_p8x4(xs[4 * m], xs[4 * m + 1], xs[4 * m + 2], xs[4 * m + 3], one_f)
                 };
-                b.set_var(pw[4 * sl + m], word);
+                if store {
+                    b.set_var(pw[4 * sl + m], word);
+                }
                 words_out.push(word);
             }
         }
@@ -9164,108 +9166,87 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
             b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
         }
-    };    let valu_tail = |b: &mut FnBuilder, hh: usize| {
-        if fmha_t_opt("vsnotail") {
-            let _ = valu(b, hh, false);
-            return;
-        }
-        let key_end = b.add_i32(key0, c128v);
-        let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
-        b.begin_if(Opnd::Val(is_tail));
-        let _ = valu(b, hh, true);
-        b.else_();
-        let _ = valu(b, hh, false);
-        b.end_if();
-    };
-
-    let a_body = role_a || fmha_t_opt("vsseq");
+    };    // The P words of a unit are plain values inside one branch of the tail test (a loop variable read in the same iteration
+    // would give the value of the iteration start); only B's hh1 words cross the iteration boundary, in the `pw` variables.
+    let key_end = b.add_i32(key0, c128v);
+    let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
     let first_pass = b.cmp_lt_i32(it, c1);
-    if fmha_t_opt("vsflat") {
-        // sequential order of the sv role with the same phase closures (no pipelining): QK, softmax, PV per 64-key unit
-        qk(b, 0, slot_cur, kds_cur);
-        if fmha_t_opt("vsvals") {
-            let w0 = valu(b, 0, false);
-            pv_w(b, 0, slot_cur, &w0);
-            qk(b, 1, slot_cur, kds_cur);
-            let w1 = valu(b, 1, false);
-            pv_w(b, 1, slot_cur, &w1);
-        } else {
-            valu_tail(b, 0);
-            pv(b, 0, slot_cur);
-            qk(b, 1, slot_cur, kds_cur);
-            valu_tail(b, 1);
-            pv(b, 1, slot_cur);
-        }
-        stage(b, key_next, slot_nxt, kds_nxt);
-        b.wait_lds(0);
-        b.barrier();
-        b.wait_lds(0);
-    } else    if a_body {
+    if role_a {
         // first pass: QK of unit 0 (A's peeled prologue), then the barrier that group B's first pass waits at
         b.begin_if(Opnd::Val(first_pass));
         qk(b, 0, c0, c0);
         b.wait_lds(0);
         b.barrier();
         b.end_if();
-        // unit 0: V, stage K(next tile); M: PV(hh0) + QK(hh1)
-        valu_tail(b, 0);
-        if !fmha_t_opt("vsnostage") {
+        b.begin_if(Opnd::Val(is_tail));
+        for pass in 0..2 {
+            if pass == 1 {
+                b.else_();
+            }
+            let masked = pass == 0;
+            // unit 0: V, stage K(next tile); M: PV(hh0) + QK(hh1)
+            let w0 = valu(b, 0, masked, false);
             stage(b, key_next, slot_nxt, kds_nxt);
+            b.set_prio(1);
+            b.wait_lds(0);
+            b.barrier();
+            pv_w(b, 0, slot_cur, &w0);
+            qk(b, 1, slot_cur, kds_cur);
+            b.set_prio(0);
+            b.wait_lds(0);
+            b.barrier();
+            // unit 1: V; M: PV(hh1) + QK(hh0 of the next tile)
+            let w1 = valu(b, 1, masked, false);
+            b.set_prio(1);
+            b.wait_lds(0);
+            b.barrier();
+            pv_w(b, 1, slot_cur, &w1);
+            qk(b, 0, slot_nxt, kds_nxt);
+            b.set_prio(0);
+            b.wait_lds(0);
+            b.barrier();
         }
-        if !fmha_t_opt("vsnoprio") { b.set_prio(1); }
-        b.wait_lds(0);
-        b.barrier();
-        pv(b, 0, slot_cur);
-        qk(b, 1, slot_cur, kds_cur);
-        if !fmha_t_opt("vsnoprio") { b.set_prio(0); }
-        b.wait_lds(0);
-        b.barrier();
-        // unit 1: V; M: PV(hh1) + QK(hh0 of the next tile)
-        valu_tail(b, 1);
-        if !fmha_t_opt("vsnoprio") { b.set_prio(1); }
-        b.wait_lds(0);
-        b.barrier();
-        pv(b, 1, slot_cur);
-        qk(b, 0, slot_nxt, kds_nxt);
-        if !fmha_t_opt("vsnoprio") { b.set_prio(0); }
-        b.wait_lds(0);
-        b.barrier();
+        b.end_if();
     } else {
         b.begin_if(Opnd::Val(first_pass));
         b.barrier();
         b.end_if();
-        // M(unit 0): PV(hh1 of the previous tile; P = 0 on the first pass) + QK(hh0)
-        if !fmha_t_opt("vsnoprio") { b.set_prio(1); }
-        // (on the first pass V of tile -1 does not exist: its LDS slot holds garbage that 0 x NaN would spread)
+        // M(unit 0): PV(hh1 of the previous tile, P from the variables = the previous iteration's value; skipped on the first pass)
+        b.set_prio(1);
         let not_first = b.let_(Op::NotI1(Opnd::Val(first_pass)));
         b.begin_if(Opnd::Val(not_first));
         pv(b, 1, slot_nxt);
         b.end_if();
         qk(b, 0, slot_cur, kds_cur);
-        if !fmha_t_opt("vsnoprio") { b.set_prio(0); }
+        b.set_prio(0);
         b.wait_lds(0);
         b.barrier();
-        // V(unit 0), stage V(next tile)
-        valu_tail(b, 0);
-        if !fmha_t_opt("vsnostage") {
+        b.begin_if(Opnd::Val(is_tail));
+        for pass in 0..2 {
+            if pass == 1 {
+                b.else_();
+            }
+            let masked = pass == 0;
+            // V(unit 0), stage V(next tile)
+            let w0 = valu(b, 0, masked, false);
             stage(b, key_next, slot_nxt, kds_nxt);
+            b.set_prio(1);
+            b.wait_lds(0);
+            b.barrier();
+            // M(unit 1): PV(hh0) + QK(hh1)
+            pv_w(b, 0, slot_cur, &w0);
+            qk(b, 1, slot_cur, kds_cur);
+            b.set_prio(0);
+            b.wait_lds(0);
+            b.barrier();
+            // V(unit 1): its P words wait for the next iteration's M(unit 0) in the variables
+            let _ = valu(b, 1, masked, true);
+            b.set_prio(1);
+            b.wait_lds(0);
+            b.barrier();
         }
-        if !fmha_t_opt("vsnoprio") { b.set_prio(1); }
-        b.wait_lds(0);
-        b.barrier();
-        // M(unit 1): PV(hh0) + QK(hh1)
-        pv(b, 0, slot_cur);
-        qk(b, 1, slot_cur, kds_cur);
-        if !fmha_t_opt("vsnoprio") { b.set_prio(0); }
-        b.wait_lds(0);
-        b.barrier();
-        // V(unit 1)
-        valu_tail(b, 1);
-        if !fmha_t_opt("vsnoprio") { b.set_prio(1); }
-        b.wait_lds(0);
-        b.barrier();
-    }
-    let npar2 = b.xor_i32(par, c1);
+        b.end_if();
+    }    let npar2 = b.xor_i32(par, c1);
     b.set_var(par, npar2);
     let it_next = b.add_i32(it, c1);
     b.set_var(it, it_next);
