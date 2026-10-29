@@ -8172,6 +8172,8 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     } else {
         (cx.v_seqs, cx.vbase_off, cx.ptr_v, cx.lds_v)
     };
+    // experiment (kh0): every head reads head 0's K/V (separates the DMA machinery from the head-1 address computation)
+    let base_off = if fmha_t_opt("kh0") { b.c_i32(0) } else { base_off };
     // staging address of this thread's 64-byte half row: the plain row-major layout, or (DMA layout read through the old ds_write path, a debugging aid) the 1040-byte run layout
     let sdst = if fmha_t_opt("dma") {
         let c7s = b.c_i32(7);
