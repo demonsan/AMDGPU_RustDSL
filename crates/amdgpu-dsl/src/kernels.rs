@@ -8848,7 +8848,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     }
     b.end_if();
 }
-/// Vendor-structure variant (kernel `fmha_fwd_hd128_mxfp8_vs`): the `sv` recipe (bias in the accumulator, pknorm/scalef32 P,
+/// Vendor-structure variant (kernel `fmha_fwd_hd128_mxfp8_vs`, 64-key units to fit the register file): the `sv` recipe (bias in the accumulator, pknorm/scalef32 P,
 /// rollback) with the vendor's two-group ping-pong schedule: the 8 waves are two groups of 4 (A = waves 0-3, B = waves 4-7)
 /// that alternate a VALU phase (max, rollback test, P conversion) and an MFMA phase (PV of the converted tile and QK of the next
 /// one), shifted by one phase, so that of the two waves sharing a SIMD one runs MFMAs while the other runs VALU. Phases are
@@ -8968,24 +8968,22 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (DType::Frag16, Opnd::Val(zero)),
         (DType::Frag16, Opnd::Val(zero)),
         (DType::Frag16, Opnd::Val(zero)),
-        (DType::Frag16, Opnd::Val(zero)),     // 6..9 S tiles
+        (DType::Frag16, Opnd::Val(zero)),     // 6..7 S tiles of the current 64-key unit
         (DType::Frag16, Opnd::Val(zero)),
-        (DType::Frag16, Opnd::Val(zero)),
-        (DType::Frag16, Opnd::Val(zero)),
-        (DType::Frag16, Opnd::Val(zero)),     // 10 row sums
-        (DType::I32, Opnd::Val(c0)),          // 11 ring parity
+        (DType::Frag16, Opnd::Val(zero)),     // 8 row sums
+        (DType::I32, Opnd::Val(c0)),          // 9 ring parity
     ];
-    for _ in 0..16 {
-        init_vars.push((DType::I32, Opnd::Val(c0))); // 12..27: P words (4 x fp8 each); zero = P 0
+    for _ in 0..8 {
+        init_vars.push((DType::I32, Opnd::Val(c0))); // 10..17: P words of the unit (4 x fp8 each); zero = P 0
     }
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
     let bias2 = vars[1];
     let o_vars = [vars[2], vars[3], vars[4], vars[5]];
-    let s_vars = [vars[6], vars[7], vars[8], vars[9]];
-    let la = vars[10];
-    let par = vars[11];
-    let pw: Vec<_> = (0..16usize).map(|k| vars[12 + k]).collect();
+    let s_vars = [vars[6], vars[7]];
+    let la = vars[8];
+    let par = vars[9];
+    let pw: Vec<_> = (0..8usize).map(|k| vars[10 + k]).collect();
 
     let cbuf = b.c_i32(cbuf_i);
     let c512 = b.c_i32(512);
@@ -9002,12 +9000,13 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let nxt = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_next), a: Opnd::Val(it_p1), b: it.into() });
     let key_next = b.shl_i32(nxt, c7d);
 
-    // QK of the tile whose K sits in ring slot `slot` (its K scales at `kdslot`): S' = bias + scaled K.Q^T, in place
-    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId| {
+    // QK of half `hh` (two 32-key tiles) of the tile whose K sits in ring slot `slot` (K scales at `kdslot`): S' = bias + scaled K.Q^T
+    let qk = |b: &mut FnBuilder, hh: usize, slot: ValueId, kdslot: ValueId| {
         let kf_b = b.add_i32(cx.kf_base, slot);
         let kd_rd = b.add_i32(kd_cur, kdslot);
-        for s in 0..4usize {
-            b.var_mfma_f16_z(s_vars[s], ones_f16, bias2);
+        for sl in 0..2usize {
+            let s = 2 * hh + sl;
+            b.var_mfma_f16_z(s_vars[sl], ones_f16, bias2);
             let ko = b.c_i32(512 * ((s as i32) & 1) + 8320 * ((s as i32) >> 1));
             let kaddr0 = b.add_i32(kf_b, ko);
             let kaddr0h = b.add_i32(kaddr0, c32v);
@@ -9021,59 +9020,57 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
-            b.var_mfma_scale(s_vars[s], k8_0, cx.b0, sk0, sq0m);
-            b.var_mfma_scale(s_vars[s], k8_1, cx.b1, sk1, sq1m);
+            b.var_mfma_scale(s_vars[sl], k8_0, cx.b0, sk0, sq0m);
+            b.var_mfma_scale(s_vars[sl], k8_1, cx.b1, sk1, sq1m);
         }
     };
-    // PV of the converted tile (P words in `pw`, V in ring slot `slot`) and its row sums
-    let pv = |b: &mut FnBuilder, slot: ValueId| {
+    // PV of half `hh` (P words in `pw`, V in ring slot `slot`) and its row sums
+    let pv = |b: &mut FnBuilder, hh: usize, slot: ValueId| {
         let tr_b = b.add_i32(cx.tr_base, slot);
-        for hh in 0..2usize {
-            let p8 = b.frag8(
-                Opnd::Var(pw[8 * hh]),
-                Opnd::Var(pw[8 * hh + 1]),
-                Opnd::Var(pw[8 * hh + 2]),
-                Opnd::Var(pw[8 * hh + 3]),
-                Opnd::Var(pw[8 * hh + 4]),
-                Opnd::Var(pw[8 * hh + 5]),
-                Opnd::Var(pw[8 * hh + 6]),
-                Opnd::Var(pw[8 * hh + 7]),
-            );
-            b.var_mfma_scale(la, ones8, p8, c127, c123);
-            for e in 0..4usize {
-                let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
-                for r in 0..4i32 {
-                    let off = b.c_i32((hh as i32) * 8320 + 256 * r + (e as i32) * 32);
-                    addrs.push(b.add_i32(tr_b, off));
-                }
-                let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
-                b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
+        let p8 = b.frag8(
+            Opnd::Var(pw[0]),
+            Opnd::Var(pw[1]),
+            Opnd::Var(pw[2]),
+            Opnd::Var(pw[3]),
+            Opnd::Var(pw[4]),
+            Opnd::Var(pw[5]),
+            Opnd::Var(pw[6]),
+            Opnd::Var(pw[7]),
+        );
+        b.var_mfma_scale(la, ones8, p8, c127, c123);
+        for e in 0..4usize {
+            let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+            for r in 0..4i32 {
+                let off = b.c_i32((hh as i32) * 8320 + 256 * r + (e as i32) * 32);
+                addrs.push(b.add_i32(tr_b, off));
             }
+            let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+            b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
         }
     };
-    // VALU phase of tile `key0`: max over the 64 scores, rollback (reference change) when some lane's S' leaves the fp8 range,
+    // VALU phase of half `hh`: max over its 32 scores, rollback (reference change) when some lane's S' leaves the fp8 range,
     // then P = fp8(2^(s - r) x 16) into `pw`
-    let valu = |b: &mut FnBuilder, masked: bool| {
+    let valu = |b: &mut FnBuilder, hh: usize, masked: bool| {
         let mut kb: Vec<ValueId> = Vec::new();
         if masked {
-            for s in 0..4usize {
+            for sl in 0..2usize {
                 let kb_s0 = b.add_i32(key0, cx.g4);
-                let kb_cs = b.c_i32(32 * s as i32);
+                let kb_cs = b.c_i32(32 * (2 * hh + sl) as i32);
                 kb.push(b.add_i32(kb_s0, kb_cs));
             }
         }
-        let valid = |b: &mut FnBuilder, s: usize, r: u8| -> ValueId {
+        let valid = |b: &mut FnBuilder, sl: usize, r: u8| -> ValueId {
             let kc = b.c_i32((8 * (r / 4) + (r % 4)) as i32);
-            let kidx = b.add_i32(kb[s], kc);
+            let kidx = b.add_i32(kb[sl], kc);
             b.cmp_lt_i32(kidx, cx.kv_len)
         };
-        let mut flat: Vec<ValueId> = Vec::with_capacity(64);
-        for s in 0..4usize {
+        let mut flat: Vec<ValueId> = Vec::with_capacity(32);
+        for sl in 0..2usize {
             for r in 0..16u8 {
-                let lane = b.frag16_lane(s_vars[s], r);
+                let lane = b.frag16_lane(s_vars[sl], r);
                 let v = b.bitcast_f32(lane);
                 if masked {
-                    let ok = valid(b, s, r);
+                    let ok = valid(b, sl, r);
                     flat.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(neg_big) }));
                 } else {
                     flat.push(v);
@@ -9111,9 +9108,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let w_q = b.let_(Op::AddI32(Opnd::Val(h), Opnd::Val(h_sh)));
             let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
             let dupd = b.frag2_dup(delta);
-            for s in 0..4usize {
-                b.var_add_pk(s_vars[s], dupd);
-            }
+            b.var_add_pk(s_vars[0], dupd);
+            b.var_add_pk(s_vars[1], dupd);
             let ex = b.mul_f32(delta, c512f);
             let corr = b.exp2_f32(ex);
             let cd = b.frag2_dup(corr);
@@ -9125,18 +9121,17 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.set_var(bias2, nb);
         }
         b.end_if();
-        // P words (same conversion as the sv role)
         let c4s = b.c_i32(4);
         let cmk = b.c_i32(0x0007_0007);
         let lut_lo = b.c_i32(i32::from_le_bytes([0, 6, 9, 11]));
         let lut_hi = b.c_i32(i32::from_le_bytes([11, 10, 7, 3]));
-        for s in 0..4usize {
+        for sl in 0..2usize {
             let mut xs: Vec<ValueId> = Vec::with_capacity(16);
             for r in 0..16u8 {
-                let lane = b.frag16_lane(s_vars[s], r);
+                let lane = b.frag16_lane(s_vars[sl], r);
                 let v = b.bitcast_f32(lane);
                 if masked {
-                    let ok = valid(b, s, r);
+                    let ok = valid(b, sl, r);
                     xs.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(zero_f) }));
                 } else {
                     xs.push(v);
@@ -9156,37 +9151,46 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 } else {
                     b.cvt_pknorm_p8x4(xs[4 * m], xs[4 * m + 1], xs[4 * m + 2], xs[4 * m + 3], one_f)
                 };
-                b.set_var(pw[4 * s + m], word);
+                b.set_var(pw[4 * sl + m], word);
             }
         }
     };
-    let valu_tail = |b: &mut FnBuilder| {
+    let valu_tail = |b: &mut FnBuilder, hh: usize| {
         let key_end = b.add_i32(key0, c128v);
         let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
         b.begin_if(Opnd::Val(is_tail));
-        valu(b, true);
+        valu(b, hh, true);
         b.else_();
-        valu(b, false);
+        valu(b, hh, false);
         b.end_if();
     };
 
     let first_pass = b.cmp_lt_i32(it, c1);
     if role_a {
-        // first pass: QK(0) (A's peeled prologue), then the barrier that group B's first pass waits at
+        // first pass: QK of unit 0 (A's peeled prologue), then the barrier that group B's first pass waits at
         b.begin_if(Opnd::Val(first_pass));
-        qk(b, c0, c0);
+        qk(b, 0, c0, c0);
         b.wait_lds(0);
         b.barrier();
         b.end_if();
-        // V(i), stage K(i+1)
-        valu_tail(b);
+        // unit 0: V, stage K(next tile); M: PV(hh0) + QK(hh1)
+        valu_tail(b, 0);
         stage(b, key_next, slot_nxt, kds_nxt);
         b.set_prio(1);
         b.wait_lds(0);
         b.barrier();
-        // M(i): PV(i) + QK(i+1)
-        pv(b, slot_cur);
-        qk(b, slot_nxt, kds_nxt);
+        pv(b, 0, slot_cur);
+        qk(b, 1, slot_cur, kds_cur);
+        b.set_prio(0);
+        b.wait_lds(0);
+        b.barrier();
+        // unit 1: V; M: PV(hh1) + QK(hh0 of the next tile)
+        valu_tail(b, 1);
+        b.set_prio(1);
+        b.wait_lds(0);
+        b.barrier();
+        pv(b, 1, slot_cur);
+        qk(b, 0, slot_nxt, kds_nxt);
         b.set_prio(0);
         b.wait_lds(0);
         b.barrier();
@@ -9194,16 +9198,27 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.begin_if(Opnd::Val(first_pass));
         b.barrier();
         b.end_if();
+        // M(unit 0): PV(hh1 of the previous tile; P = 0 on the first pass) + QK(hh0)
         b.set_prio(1);
-        // M(i): PV(i-1) (P = 0 on the first pass) + QK(i)
-        pv(b, slot_nxt);
-        qk(b, slot_cur, kds_cur);
+        pv(b, 1, slot_nxt);
+        qk(b, 0, slot_cur, kds_cur);
         b.set_prio(0);
         b.wait_lds(0);
         b.barrier();
-        // V(i), stage V(i+1)
-        valu_tail(b);
+        // V(unit 0), stage V(next tile)
+        valu_tail(b, 0);
         stage(b, key_next, slot_nxt, kds_nxt);
+        b.set_prio(1);
+        b.wait_lds(0);
+        b.barrier();
+        // M(unit 1): PV(hh0) + QK(hh1)
+        pv(b, 0, slot_cur);
+        qk(b, 1, slot_cur, kds_cur);
+        b.set_prio(0);
+        b.wait_lds(0);
+        b.barrier();
+        // V(unit 1)
+        valu_tail(b, 1);
         b.set_prio(1);
         b.wait_lds(0);
         b.barrier();
@@ -9217,10 +9232,10 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.break_if(Opnd::Val(stop));
     b.end_loop();
     if !role_a {
-        // group B: PV of the last tile (its V sits in the slot of the parity before the final flip)
+        // group B: PV of the last unit (hh1 of the last tile; its V sits in the slot of the parity before the final flip)
         let lp = b.xor_i32(par, c1);
         let last_off = b.mul_i32(lp, cbuf);
-        pv(b, last_off);
+        pv(b, 1, last_off);
     }    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
     let l0 = b.frag16_lane(la, 0);
     let l_tot = b.bitcast_f32(l0);
