@@ -68,6 +68,23 @@ int main(int argc, char** argv) {
                         vals[4 * l + 1], vals[4 * l + 2], vals[4 * l + 3]);
         }
     }
+    if (const char* det = std::getenv("DETAIL")) {
+        // DETAIL="slot[,slot...]" prints all 64 lanes x 4 dwords for those slots.
+        std::vector<int> want;
+        for (const char* q = det; *q;) {
+            want.push_back(std::atoi(q));
+            const char* comma = std::strchr(q, ',');
+            if (!comma) break;
+            q = comma + 1;
+        }
+        for (int e : want) {
+            for (int l = 0; l < kLanes; ++l) {
+                const float* v = (const float*)(hout.data() + (size_t)e * 1024) + 4 * l;
+                std::printf("DETAIL slot %d lane %2d: %.9g %.9g %.9g %.9g\n", e, l, v[0], v[1], v[2],
+                            v[3]);
+            }
+        }
+    }
     std::printf("SMFMAC_PROBE_OK\n");
     return 0;
 }
