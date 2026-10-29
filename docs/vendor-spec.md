@@ -412,6 +412,52 @@ reference. A faster kernel that changes numerics fails the correctness gate rega
 Failure of the wall/throughput lines with all counter lines green means the scheduler/prefetch structure
 (item 5) is still wrong; failure of the VALU lines points at the emitter/codegen (items 1, 4).
 
+## 7.6 Baseline run of the checklist: kernel-opt `_vs` @ be6c1f1 (GPU 5)
+
+Commit under test: kernel-opt `be6c1f1` (merged Main `e0e9a77`; validation branch `vs-validate`,
+head `a84fe4a`). Command: `bash tools/vendor_validate.sh fmha_fwd_hd128_mxfp8_vs`; same-run wall,
+B1 H8 S=SK=2048, 20 unprofiled launches. The generated asm has two role loops of 687/673 instructions;
+one loop iteration = 128 keys.
+
+| §7.5 line | vendor | `_vs` @ be6c1f1 | target | delta closed? |
+|---|---|---|---|---|
+| wall per launch | 0.0333 ms (516.0 TFLOP/s) | 0.0658 ms (**261.0 TFLOP/s**) | <= 0.040 ms / >= 420 TFLOP/s | **no** (also below current `_t`: 292.6) |
+| `SQ_INSTS` /wave-iter | 381.6 | 678.4 | <= 400 | no |
+| `SQ_INSTS_VALU` | 250.9 | 543.7 | <= 265 | no |
+| `_MUL_F32` | 32.3 | 58.1 | <= 40 | no |
+| `_INT32` | 10.8 | 75.6 | <= 15 | no |
+| other VALU (MOV/TRANS/CMP) | 79.6 | 311.8 | <= 95 | no |
+| `_CVT` | 69.4 | 70.4 | >= 60 | **yes** (pknorm+scalef32 path ported) |
+| `SQ_INSTS_SALU` | 40.0 | 4.4 | >= 35 | no (ring/address math still VALU) |
+| `SQ_INSTS_LDS` | 52.5 | 52.5 | <= 55 | **yes** (exact match) |
+| `SQ_INSTS_VMEM` | 5.7 | 7.9 | <= 6 | no (marginal, same as `_t`) |
+| `SQ_IFETCH` | 81.4 | 136.4 | <= 85 | no (worse than `_t` 97.3) |
+| `SQ_VALU_MFMA_BUSY_CYCLES` | 1086 | 1280 | <= 1100 | no (20 MFMA/wave-iter) |
+| `SQ_ACTIVE_INST_VALU` | 293.8 | 597.2 | <= 310 | no |
+| `SQ_WAIT_ANY` | 415.6 | 1113.2 | <= 450 | no (worse than `_t` 739.0) |
+| `SQ_INST_LEVEL_VMEM` | 52.7 | 119.5 | <= 60 | no (improved from `_t` 147.3) |
+| `SQ_INST_LEVEL_LDS` | 32.1 | 39.5 | <= 35 | no |
+| LDS bank conflicts | 0 | **64.0** | <= 0.1 | **no - new regression** (the `_t` kernel has 1.06) |
+| barriers per 128 keys | 2 | **4** | 2 | no (asm: 4 `s_barrier` per role loop iteration) |
+| setprio windows | 1 set/clear pair per 128 keys | **4 `s_setprio` per iteration** | 1 pair | no |
+| next-tile QK in compute group | 8 scaled QK MFMA | 18 `v_mfma_scale` per iteration (QK+PV, next tile prefetched in-loop) | present | **yes (structure present)** |
+| staging | LDS-DMA, 1040-B runs | 4 `global_load_lds_dwordx4` per iteration | required | **yes** |
+| iteration unit | 128 keys | 128 keys but built from 2x64-key tiles | 128 keys | no (barrier/setprio rate doubled) |
+| row-sum structure | 2x smfmac, complementary patterns, chained from zero C | 0 smfmac; 4x `v_mfma_f32_32x32x8_f16` msum (128 cyc/128 keys) | required | **no** |
+| smfmac operand hazard | n/a | n/a (no smfmac) | required when smfmac lands | n/a |
+
+Correctness gate at that commit: **15/15 reference shapes, 5/5 determinism** (own backend) - passes.
+So be6c1f1 is numerically correct and has the DMA/CVT/next-tile-QK structure in place, but the
+64-key-tile barrier/setprio rate (4 per 128 keys instead of 2), the VALU address math (INT32 75.6,
+other 311.8), the remaining msum MFMAs and a **new LDS bank-conflict regression (64/wave-iteration)**
+keep it at 261 TFLOP/s - below the existing `_t` (292.6) and far from the 420 target.
+
+Note: `fmha_fwd_hd128_mxfp8_vs128` (the 128-key-unit variant) is *not buildable* at be6c1f1:
+`amdc emit fmha_fwd_hd128_mxfp8_vs128 --backend own` fails with
+`out of VGPRs allocating r827 (V16, live 832..2626); 73 live vregs holding 231 dwords`
+(after 8 DSL lint warnings "loop variable read after set_var in the same iteration"). It must be
+made to allocate before the next validation round.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as
