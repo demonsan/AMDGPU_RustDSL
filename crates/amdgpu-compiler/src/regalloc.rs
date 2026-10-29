@@ -250,7 +250,24 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
                 }
                 i += 1;
             }
-            let slot = found.ok_or_else(|| format!("out of VGPRs allocating r{r} ({c:?}, live {s}..{e}) in the two-phase packing"))?;
+            let slot = found.ok_or_else(|| {
+                // numeric lower bound: the largest number of dwords live at one position
+                let mut ev: Vec<(usize, i64)> = Vec::new();
+                for (s2, e2, _, c2) in &vregs {
+                    ev.push((*s2, c2.dwords() as i64));
+                    ev.push((e2.saturating_add(1), -(c2.dwords() as i64)));
+                }
+                ev.sort();
+                let (mut cur, mut peak, mut at) = (V_RESERVED as i64, 0i64, 0usize);
+                for (p, d) in ev {
+                    cur += d;
+                    if cur > peak {
+                        peak = cur;
+                        at = p;
+                    }
+                }
+                format!("out of VGPRs allocating r{r} ({c:?}, live {s}..{e}) in the two-phase packing; peak live dwords {peak} at position {at} (limit {VGPR_COUNT})")
+            })?;
             for k in 0..width {
                 occ[slot + k].push((s, e));
             }
