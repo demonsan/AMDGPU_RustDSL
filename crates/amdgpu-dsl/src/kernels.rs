@@ -8001,7 +8001,27 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     } else {
         (cx.v_seqs, cx.vbase_off, cx.ptr_v, cx.lds_v)
     };
-    let sdst = b.add_i32(lds_base, cx.rt64);
+    // staging address of this thread's 64-byte half row: the plain row-major layout, or (DMA layout read through the old ds_write path, a debugging aid) the 1040-byte run layout
+    let sdst = if fmha_t_opt("dma") {
+        let c7s = b.c_i32(7);
+        let c3s = b.c_i32(3);
+        let c6s = b.c_i32(6);
+        let c1040s = b.c_i32(1040);
+        let c128s = b.c_i32(128);
+        let ru = b.let_(Op::AndI32(Opnd::Val(cx.rt_row), Opnd::Val(c7s)));
+        let rh = b.let_(Op::LshrI32(Opnd::Val(cx.rt_row), Opnd::Val(c6s)));
+        let rh8 = b.shl_i32(rh, c3s);
+        let ruh = b.add_i32(ru, rh8);
+        let ra = b.mul_i32(ruh, c1040s);
+        let rs0 = b.let_(Op::LshrI32(Opnd::Val(cx.rt_row), Opnd::Val(c3s)));
+        let rs = b.let_(Op::AndI32(Opnd::Val(rs0), Opnd::Val(c7s)));
+        let rs128 = b.mul_i32(rs, c128s);
+        let rb0 = b.add_i32(ra, rs128);
+        let rb1 = b.add_i32(rb0, cx.rt_half64);
+        b.add_i32(lds_base, rb1)
+    } else {
+        b.add_i32(lds_base, cx.rt64)
+    };
     let kdlds = fmha_t_opt("kdlds");
     let dma_l_pre = fmha_t_opt("dma");
     let nbuf_l = if fmha_t_opt("dbuf") { 2 } else { 1 };
