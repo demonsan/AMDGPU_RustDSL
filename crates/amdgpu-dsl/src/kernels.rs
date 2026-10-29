@@ -11426,6 +11426,17 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     // vsx: short sequences (<= 2 tiles of 128 keys) keep the LUT correction (their error does not average out), long ones skip it (-128 VALU per
     // tile): two complete code copies selected once at kernel start
     let vsx_split = sv && name.ends_with("_vs128") && (vs128_vsx() || fmha_t_opt("corrshort"));
+    if vsx_split && fmha_t_opt("onecopy") {
+        // timing diagnostic: only the long-sequence (no LUT) copy is emitted (short sequences lose their correction)
+        VS_CORR_FORCE.store(2, std::sync::atomic::Ordering::SeqCst);
+        b.begin_if(is_a);
+        emit_fmha_vs128_role(&mut b, &cx, true);
+        b.else_();
+        emit_fmha_vs128_role(&mut b, &cx, false);
+        b.end_if();
+        VS_CORR_FORCE.store(0, std::sync::atomic::Ordering::SeqCst);
+        return b.finish();
+    }
     if vsx_split {
         // short = fewer than `cs` tiles of 128 keys (default 3)
         let c3k = b.c_i32(fmha_t_num("cs").unwrap_or(9) as i32);
