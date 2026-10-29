@@ -7701,7 +7701,8 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let lds_kd = b.c_i32(nbuf_l * 256 * pitch + 2048);
     let rt_row4 = b.shl_i32(cx.rt_row, c2);
     let kdb0 = b.add_i32(lds_kd, rt_row4);
-    let dma = fmha_t_opt("dma");
+    let dma_l = fmha_t_opt("dma");
+    let dma = dma_l && !(role_a && fmha_t_opt("nodmak")) && !(!role_a && fmha_t_opt("nodmav"));
     // DMA staging (global -> LDS, no VGPRs, no ds_write): one wave instruction fills 1 KB = 8 rows of 128 bytes
     // (lane i -> byte 16 i), so lane i fetches chunk (i & 7) ^ ((row >> 1) & 7) of its row: the XOR swizzle
     let lane_v = {
@@ -7902,8 +7903,8 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     } else {
         c0
     };
-    let kfb: Vec<ValueId> = if dma { (0..4).map(|k| b.add_i32(cx.kfx[k], cur_buf)).collect() } else { Vec::new() };
-    let trb: Vec<ValueId> = if dma { (0..4).map(|e| b.add_i32(cx.trx[e], cur_buf)).collect() } else { Vec::new() };
+    let kfb: Vec<ValueId> = if dma_l { (0..4).map(|k| b.add_i32(cx.kfx[k], cur_buf)).collect() } else { Vec::new() };
+    let trb: Vec<ValueId> = if dma_l { (0..4).map(|e| b.add_i32(cx.trx[e], cur_buf)).collect() } else { Vec::new() };
     let it = vars[0];
     let bias2 = vars[1];
     let o_vars = [vars[2], vars[3], vars[4], vars[5]];
@@ -7935,7 +7936,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let s = 2 * hh + sl;
                 b.var_mfma_f16_z(s_vars[sl], ones_f16, bias2);
                 let ko = b.c_i32(32 * pitch * (s as i32));
-                let (k8_0, k8_1) = if dma {
+                let (k8_0, k8_1) = if dma_l {
                     let a0 = b.add_i32(kfb[0], ko);
                     let a1 = b.add_i32(kfb[1], ko);
                     let a2 = b.add_i32(kfb[2], ko);
@@ -8075,7 +8076,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             for e in 0..4usize {
                 let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
                 for r in 0..4i32 {
-                    if dma {
+                    if dma_l {
                         let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r);
                         addrs.push(b.add_i32(trb[e], off));
                     } else {
