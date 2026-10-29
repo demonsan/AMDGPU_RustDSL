@@ -204,8 +204,11 @@ impl Lowerer {
             fold_select_cmp(&mut self.mir);
             dce_cmp_pairs(&mut self.mir);
         }
+        // Always: an unused load must not stay (its destination would get a zero-length live range while the load is
+        // still in flight and could be reused by a live value: found with sv+dma+kh0 under `dce`).
+        dce_full(&mut self.mir, true);
         if opt_on("dce") {
-            dce_full(&mut self.mir);
+            dce_full(&mut self.mir, false);
         }
         coalesce(&mut self.mir);
         dce(&mut self.mir);
@@ -1942,8 +1945,21 @@ fn dce_cmp_pairs(m: &mut MFunction) {
 /// (the terminator may read it). The lowering emits address / clamp chains whose consumers were dropped by other
 /// options (e.g. the global scale loads replaced by LDS scale reads); this removes them. Same values, same
 /// arithmetic for everything that remains.
-fn dce_full(m: &mut MFunction) {
-    fn removable(op: MOp) -> bool {
+fn dce_full(m: &mut MFunction, loads_only: bool) {
+    fn load_op(op: MOp) -> bool {
+        matches!(
+            op,
+            MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64TrB8 | MOp::GlobalLoadU16
+                | MOp::GlobalLoadF32 | MOp::GlobalLoadB128 | MOp::GlobalLoadB128S | MOp::GlobalLoadF32S
+        )
+    }
+    let removable = |op: MOp| -> bool {
+        if load_op(op) {
+            return true;
+        }
+        if loads_only {
+            return false;
+        }
         matches!(
             op,
             MOp::VMovB32 | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VPtrAdd | MOp::VAddU32 | MOp::VAddCoU32 | MOp::VAddcCoU32
@@ -1952,7 +1968,7 @@ fn dce_full(m: &mut MFunction) {
                 | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VReadPhys | MOp::VCmpLtI32 | MOp::VCmpGeI32
                 | MOp::VCmpNeI32 | MOp::VCmpLtF32
         )
-    }
+    };
     let defines_vcc = |op: MOp| op.defines_vcc() || op == MOp::VPtrAdd;
     loop {
         let mut used: HashMap<VReg, u32> = HashMap::new();
