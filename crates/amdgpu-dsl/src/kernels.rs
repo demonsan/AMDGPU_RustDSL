@@ -8602,7 +8602,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// LDS row pitch (bytes) of the K/V tiles of the transposed FMHA kernel (env FMHA_PITCH, read at
 /// build time, for bank-conflict experiments; default 144: 16-byte aligned and conflict-free enough, 128 = unpadded).
 fn fmha_t_opt(name: &str) -> bool {
-    let v = std::env::var("FMHA_OPT").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "cvt4,pksub,lazy,msum,permlane".to_string());
+    let v = std::env::var("FMHA_OPT").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "cvt4,pksub,lazy,msum,permlane,kdlds,dbuf,svpk".to_string());
     let has = |n: &str| v.split(',').any(|x| x == n);
     // DMA staging needs the K scales in LDS and the two-buffer ring
     if name == "kdlds" && has("nokd") {
