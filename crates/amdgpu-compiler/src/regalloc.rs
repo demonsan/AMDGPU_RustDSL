@@ -581,9 +581,10 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
             }
             // The accumulator is in-place (C == D on gfx9), so only A and B have
             // to stay clear of the destination.
-            if rc != rd {
+            // C may be a different register than D (gfx950 `v_mfma* vdst, a, b, srcC`), but a partial overlap is illegal
+            if rc != rd && overlaps(rc, rd) {
                 return Err(format!(
-                    "block {bi} inst {ii}: MFMA accumulator C must be in place with D (v{}..v{} vs v{}..v{})",
+                    "block {bi} inst {ii}: MFMA accumulator C must be identical to or disjoint from D (v{}..v{} vs v{}..v{})",
                     rc.0,
                     rc.1 - 1,
                     rd.0,
