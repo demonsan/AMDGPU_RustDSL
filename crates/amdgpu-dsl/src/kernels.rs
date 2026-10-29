@@ -7580,7 +7580,9 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let c16i = b.c_i32(16);
     let c32v = b.c_i32(32);
     let c64 = b.c_i32(64);
-    let c123 = b.c_i32(123);
+    // P scale exponent: P = 2^(4 - shd) 2^(s - r) in the fp8 (default shd = 0: x16); a larger shd leaves more headroom (fewer rollbacks)
+    let shd: i32 = if fmha_t_opt("sh4") { 4 } else if fmha_t_opt("sh2") { 2 } else { 0 };
+    let c123 = b.c_i32(123 + shd);
     let c127 = b.c_i32(127);
     let neg_big = b.c_f32(-1.0e30);
     let c128v = b.c_i32(128);
@@ -7588,7 +7590,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let zero = b.frag_zero(DType::Frag16);
     let hq4 = cx.kd_stride;
     let c_thr = b.c_f32(if fmha_t_opt("svinf") { 1.0e9 } else { 135.0 / 512.0 });
-    let c_b131 = b.c_f32(131.0 / 512.0);
+    let c_b131 = b.c_f32((131 - shd) as f32 / 512.0);
     let c8f = b.c_f32(8.0);
     let c0125 = b.c_f32(0.125);
     let c512f = b.c_f32(512.0);
