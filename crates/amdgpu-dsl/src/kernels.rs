@@ -6913,12 +6913,20 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let corr = b.exp2_f32(dm);
                 let m_bits = b.bitcast_i32(m_new);
                 b.set_var(m_var, m_bits);
-                for e in 0..4usize {
-                    if !fmha_t_opt("abl_rescale") {
-                        b.var_scale_f32(o_vars[e], corr);
+                if fmha_t_opt("lazypk") {
+                    let cd = b.frag2_dup(corr);
+                    for e in 0..4usize {
+                        b.var_scale_pk(o_vars[e], cd);
+                    }
+                } else {
+                    for e in 0..4usize {
+                        if !fmha_t_opt("abl_rescale") {
+                            b.var_scale_f32(o_vars[e], corr);
+                        }
                     }
                 }
                 match lacc {
+                    Some(la) if fmha_t_opt("lacc1") => b.var_scale_lane(la, 0, corr),
                     Some(la) => b.var_scale_f32(la, corr),
                     None => {
                         let l_old = b.bitcast_f32(l_var);

@@ -601,6 +601,13 @@ impl Lowerer {
                         self.push(MInst::new(MOp::VMulF32).def(a).srcreg(a).srcreg(s));
                     }
                 }
+                Stmt::VarScaleLane { var, index, scalar } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let s = self.as_v1(*scalar)?;
+                    self.touch(&[Src::Reg(v), Src::Reg(s)]);
+                    let a = self.sub_alias(v, *index, RClass::V1);
+                    self.push(MInst::new(MOp::VMulF32).def(a).srcreg(a).srcreg(s));
+                }
                 Stmt::VarScalePk { var, pair } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let p = self.as_v2(*pair)?;

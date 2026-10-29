@@ -361,6 +361,8 @@ pub enum Stmt {
     VarScaleF32 { var: VarId, scalar: Opnd },
     /// Multiply all sixteen dwords of a Frag16 loop variable by the (duplicated) scalar held in a Frag2, in place, with _pk_mul_f32.
     VarScalePk { var: VarId, pair: Opnd },
+    /// Multiply one dword of a `Frag16` loop variable by an f32 scalar, in place.
+    VarScaleLane { var: VarId, index: u8, scalar: Opnd },
     /// 16-byte global load written straight into a `Frag4` loop variable.
     VarLoadB128 { var: VarId, base: Opnd, byte_off: u32 },
     /// `var = scaled_mfma_32x32x64_fp8(a, b, var)`: accumulate into a loop variable in place.
@@ -449,6 +451,9 @@ impl Function {
                 }
                 Stmt::VarScaleF32 { var, scalar } => {
                     let _ = writeln!(s, "{pad}var{} *= {scalar:?}", var.0);
+                }
+                Stmt::VarScaleLane { var, index, scalar } => {
+                    let _ = writeln!(s, "{pad}var{}[{index}] *= {scalar:?}", var.0);
                 }
                 Stmt::VarScalePk { var, pair } => {
                     let _ = writeln!(s, "{pad}var{} *=pk {pair:?}", var.0);
@@ -896,6 +901,9 @@ impl FnBuilder {
     }
     pub fn var_mfma_scale_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::VarMfmaScaleZ { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
+    }
+    pub fn var_scale_lane(&mut self, var: VarId, index: u8, scalar: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::VarScaleLane { var, index, scalar: scalar.into() });
     }
     pub fn var_scale_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::VarScalePk { var, pair: pair.into() });
@@ -1420,6 +1428,11 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
                 if let Err(e) = expect_float(f, *scalar, "var scale") {
                     errs.push(here(e));
+                }
+            }
+            Stmt::VarScaleLane { var, .. } => {
+                if f.var_ty(*var) != Some(DType::Frag16) {
+                    errs.push(here(format!("var{var} must be a frag16")));
                 }
             }
             Stmt::VarScalePk { var, pair } => {
