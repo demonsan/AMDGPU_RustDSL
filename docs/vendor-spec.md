@@ -458,6 +458,87 @@ Note: `fmha_fwd_hd128_mxfp8_vs128` (the 128-key-unit variant) is *not buildable*
 (after 8 DSL lint warnings "loop variable read after set_var in the same iteration"). It must be
 made to allocate before the next validation round.
 
+## 7.7 Full checklist: kernel-opt `fmha_fwd_hd128_mxfp8_vs128` @ Main 3cc73c0 (GPU 5)
+
+Measured 2026-10-29 on GPU 5 with `bash tools/vendor_validate.sh fmha_fwd_hd128_mxfp8_vs128` plus
+`tools/vendor_counters.sh` for the counter rows (same-run wall, B1 H8 S=SK=2048, 20 unprofiled
+launches; vendor measured in the same process). Commit: Main `3cc73c0` (kernel-opt `34efdeb`
+"vs128: default lowering opts scalarize+imm and the full scheduler" + backend-tail pressure fix).
+
+**Headline: 298.1 TFLOP/s (0.0576 ms) vs vendor 515.8 TFLOP/s (0.0333 ms) - the first kernel of ours
+above the tuned default in the same run** (`_t` llvm-tail 290.4, `_t` own 281.4; `_vs` @be6c1f1 261.0).
+Remaining gap to the vendor: **1.73x**. Correctness gate passes: 15/15 reference shapes (own backend),
+5/5 determinism. Numeric recipe: svcorr rollback; bit-parity with `_sv`/`_vs` is *not* given (vs128 md5
+`6891688c…` vs sv/vs `9aced7bc…`; mean_err 1.7738e-3 vs sv 1.7517e-3, `_t` 1.2540e-3, vendor ~2.4e-3;
+vendor-parity gate PARITY_OK is the round-49 claim). LDS footprint 102400 B (vendor 84480); vgpr 244,
+sgpr 45.
+
+| §7.5 line | vendor | `_vs128` @3cc73c0 | target | delta closed? |
+|---|---|---|---|---|
+| wall per launch | 0.0333 ms (515.8 TFLOP/s) | 0.0576 ms (**298.1 TFLOP/s**) | <= 0.040 ms / >= 420 TFLOP/s | **no** (best of ours; 1.73x from vendor) |
+| `SQ_INSTS` /wave-iter | 381.6 | 642.5 | <= 400 | no |
+| `SQ_INSTS_VALU` | 250.9 | 491.3 | <= 265 | no |
+| `_MUL_F32` | 32.3 | 37.2 | <= 40 | **yes (new)** |
+| `_INT32` | 10.8 | 60.8 | <= 15 | no |
+| other VALU (MOV/TRANS/CMP) | 79.6 | 293.3 | <= 95 | no |
+| `_CVT` | 69.4 | 68.7 | >= 60 | **yes** |
+| `SQ_INSTS_SALU` | 40.0 | 22.8 | >= 35 | no (improved from `_vs` 4.4) |
+| `SQ_INSTS_LDS` | 52.5 | 72.8 | <= 55 | no (regressed from `_vs` 52.5) |
+| `SQ_INSTS_VMEM` | 5.7 | 7.6 | <= 6 | no |
+| `SQ_IFETCH` | 81.4 | 136.0 | <= 85 | no |
+| `SQ_VALU_MFMA_BUSY_CYCLES` | 1086 | 1280 | <= 1100 | no (22 MFMA/wave-iter: 18 scaled + 4 f16) |
+| `SQ_ACTIVE_INST_VALU` | 293.8 | 543.3 | <= 310 | no |
+| `SQ_WAIT_ANY` | 412.9 | 803.6 | <= 450 | no (improved from `_vs` 1113) |
+| `SQ_INST_LEVEL_VMEM` | 52.1 | 117.1 | <= 60 | no |
+| `SQ_INST_LEVEL_LDS` | 32.1 | 49.4 | <= 35 | no |
+| LDS bank conflicts | 0 | **82.0** | <= 0.1 | no (worse than `_vs` 64.0) |
+| barriers per 128 keys | 2 | **2** | 2 | **yes** |
+| rollbacks per 128 keys | 1 | **1** (`v_cmp_lt_f32` + `s_cbranch_vccnz` per loop iteration) | 1 | **yes** |
+| setprio pair | 1 set/clear pair | **1 pair** (`s_setprio 1` … `s_setprio 0` per iteration) | 1 pair | **yes** |
+| DMA staging | ~5 LDS-DMA writes /128 keys | **4 `global_load_lds_dwordx4` per iteration per role** | 4 | **yes** |
+| next-tile QK in compute group | 8 scaled QK MFMA | 18 `v_mfma_scale` per iteration (QK+PV, next tile prefetched in-loop) | present | **yes** |
+| row-sum path | 2x smfmac, complementary patterns, chained from zero C | ones-MFMA: 4x `v_mfma_f32_32x32x8_f16` (128 cyc) | 2 smfmac (32 cyc) | **no** |
+| iteration unit | 128 keys | **128 keys** (loop body = one 128-key tile) | 128 keys | **yes** |
+| smfmac operand hazard | n/a | n/a (no smfmac yet) | required when smfmac lands | n/a |
+| correctness | 15/15 + det | **15/15, 5/5 determinism** | pass | **yes** |
+
+Movement versus the stored baselines (`_vs` @be6c1f1 261.0 TFLOP/s; `_t` 292.6):
+
+* NO -> YES: barriers per 128 keys (4 -> 2), rollback rate (2 -> 1), setprio pair (4 -> 2), iteration
+  unit (2x64-key tiles -> one 128-key tile), `_MUL_F32` (58.1 -> 37.2 <= 40). DMA staging, CVT path and
+  next-tile QK were already YES for `_vs` and stay YES.
+* Still NO: smfmac row sums (unmoved), all VALU classes except MUL, INT32, other-VALU, IFETCH,
+  MFMA busy (1280), ACTIVE_INST_VALU, WAIT_ANY, VMEM/LDS level cycles; LDS instructions regressed
+  (52.5 -> 72.8) and bank conflicts regressed (64 -> 82 per wave-iteration); SALU improved but below
+  target.
+* Wall: 261.0 -> 298.1 (+14.2%, now above `_t` llvm-tail 290.4) - the structural fixes (barrier/
+  setprio/iteration unit) bought the improvement, while the remaining gap is work + stalls.
+
+**Honest decomposition of the remaining 1.73x gap** (per SIMD-iteration at 2.4 GHz: vendor 4995 cycles,
+ours 8625, +3630):
+
+| component | cycles/SIMD-iter | evidence |
+|---|---|---|
+| XDL (22 vs 19 MFMA/wave-iter: 18 scaled + 4 f16 msum) | +388 | MFMA busy 1280 vs 1086 per wave-iter |
+| VALU work | +499 | ACTIVE_INST_VALU 543.3 vs 293.8 per wave-iter (other-VALU 293.3 vs 79.6, INT32 60.8 vs 10.8) |
+| VMEM latency exposure | +130 | INST_LEVEL_VMEM 117.1 vs 52.1 |
+| LDS latency exposure | +35 | INST_LEVEL_LDS 49.4 vs 32.1 |
+| instruction fetch | +109 | IFETCH 136.0 vs 81.4 |
+| **accounted work delta** | **+1161** | |
+| stalls / lost overlap (incl. 82 bank-conflict cycles/wave = +164 and 1607 vs 826 WAIT_ANY) | **+2470** | WAIT_ANY, bank conflicts, barrier/priority windows, LDS count |
+
+Ranked remaining actions (with expected savings):
+1. **Row sums via the 2-smfmac recipe (4.5.1)** and remove the 2 extra scaled MFMAs (18 vs vendor 16):
+   up to **-448 XDL cycles/SIMD** plus ~-66 VALU/wave; brings MFMA busy to the vendor's 1086.
+2. **VALU work (-~500/SIMD)**: cut "other VALU" (register copies) 293.3 -> <=95 and INT32 60.8 -> <=15
+   by moving ring/address arithmetic to SALU (we use 22.8 vs vendor 40) and by removing the copies the
+   scalarize/imm lowering still leaves.
+3. **LDS (-164 conflict cycles + issue slots)**: fix the 82/wave bank conflicts and the 72.8 vs 52.5
+   LDS instruction excess (pitch/swizzle for the 128-key ring, avoid redundant reads).
+4. **Latency hiding**: VMEM level 117 -> ~52, LDS level 49 -> ~32 and IFETCH 136 -> ~81 (loop 605 vs
+   vendor 473 instructions) - deeper DMA prefetch and less prologue/epilogue code.
+5. Remaining barrier/priority/issue stalls (~+1500 cycles not explained by the work counters).
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as
