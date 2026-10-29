@@ -62,7 +62,9 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
         if opts.ldshoist {
             attempts.extend([(0, Some(24)), (0, Some(8)), (0, Some(0))]);
         }
-        attempts.extend([(16, Some(0)), (32, Some(0)), (48, Some(0))]);
+        if opts.reorder {
+            attempts.extend([(16, Some(0)), (32, Some(0)), (48, Some(0))]); // the pressure limit only matters for the reordering scheduler
+        }
         for (cut, hoist) in attempts {
             let mut o = opts.clone();
             o.max_vgprs = opts.max_vgprs.saturating_sub(cut);
@@ -86,9 +88,6 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
                 Ok(a) => return Ok((m, a)),
                 Err(e) if e.contains("out of VGPRs") => last_err = e,
                 Err(e) => return Err(e),
-            }
-            if !opts.reorder {
-                break;
             }
         }
         eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(120).collect::<String>());
