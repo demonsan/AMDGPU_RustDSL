@@ -8861,6 +8861,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let no_qk = ablate.contains("noqk");
     let no_pv = ablate.contains("nopv");
     let no_stage = ablate.contains("nostage");
+    let seq_mode = ablate.contains("seq"); // diagnostic: both groups run group A's schedule (no phase offset)
     let c0 = b.c_i32(0);
     let c1 = b.c_i32(1);
     let c2 = b.c_i32(2);
@@ -8996,7 +8997,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let j4 = b.shl_i32(cx.j, c2);
     let kd_cur = b.add_i32(lds_kd, j4);
     // group A's pipeline prologue: QK of 64-key unit 0 as plain values (loop-variable initial values); group B only waits
-    let s_init: Vec<ValueId> = if role_a {
+    let s_init: Vec<ValueId> = if role_a || seq_mode {
         let mut out: Vec<ValueId> = Vec::with_capacity(2);
         for sl in 0..2usize {
             let biasf = b.mfma_f16_wide(ones_f16, bias_init, zero);
@@ -9277,7 +9278,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let iter = |b: &mut FnBuilder, masked: bool, stage: bool| {
         let (_i1, slot_cur, slot_nxt, slot_n2, kds_cur, kds_nxt, key0, key_n2, _i2) = ring(b);
         let _ = key0;
-        if role_a {
+        if role_a || seq_mode {
             // unit 0: V (the DMA of tile t+2 runs under it, waited for at its end); M: PV(hh0) + QK(hh1)
             let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
             let w0 = valu(b, 0, masked, false);
@@ -9378,7 +9379,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         iter(b, false, false);
         b.end_if();
     }
-    if !role_a {
+    if !role_a && !seq_mode {
         // group B: PV of the last unit (hh1 of the last tile; its V sits in the slot of the final ring index)
         let last_off = b.mul_i32(Opnd::Var(idx), cbuf);
         pv(b, 1, last_off);
