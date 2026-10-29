@@ -7115,6 +7115,8 @@ struct FmhaTCtx {
     trx: Vec<ValueId>,
     /// swz layout: per-thread staging write offsets (row-relative, without the tile base) for the four 16-byte chunks
     swzw: Vec<ValueId>,
+    /// the eight words of the second Q fragment (b1), for kernels that keep it in LDS instead of registers
+    bq1_words: Vec<ValueId>,
 }
 
 /// One role's steady loop and epilogue of the transposed FMHA kernel.
@@ -9650,13 +9652,57 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let key_one = b.shl_i32(t1, c7d);
     let slot_one = b.c_i32(cbuf_i);
     let kdp0 = stage_start(b, key_one, slot_one);
+    // constants in LDS instead of registers: a 2 KB block of E4M3 ones (A of the row-sum MFMA) and this wave's second Q fragment (32 B per lane)
+    let wid = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
+    let lane_q = {
+        let t8 = b.shl_i32(cx.g4, c3d);
+        b.add_i32(cx.j, t8)
+    };
+    let ones_base = b.c_i32(3 * cbuf_i + 2048 + 2048);
+    let q_base = b.c_i32(3 * cbuf_i + 2048 + 2048 + 2048);
+    let c64_ = b.c_i32(64);
+    let c32_ = b.c_i32(32);
+    let tid_q = {
+        let w64 = b.mul_i32(wid, c64_);
+        b.add_i32(w64, lane_q)
+    };
+    let ones_w0 = b.c_i32(0x38383838);
+    let ones_wr = b.shl_i32(tid_q, c2);
+    let ones_wa = b.add_i32(ones_base, ones_wr);
+    b.store_lds_b32(Opnd::Val(ones_wa), Opnd::Val(ones_w0));
+    let wq2048 = b.c_i32(2048);
+    let wq_off = b.mul_i32(wid, wq2048);
+    let lq32 = b.mul_i32(lane_q, c32_);
+    let q_addr0 = {
+        let a0 = b.add_i32(q_base, wq_off);
+        b.add_i32(a0, lq32)
+    };
+    {
+        let c16_ = b.c_i32(16);
+        let q_addr1 = b.add_i32(q_addr0, c16_);
+        let f0 = b.frag4(cx.bq1_words[0], cx.bq1_words[1], cx.bq1_words[2], cx.bq1_words[3]);
+        let f1 = b.frag4(cx.bq1_words[4], cx.bq1_words[5], cx.bq1_words[6], cx.bq1_words[7]);
+        b.store_lds_b128(Opnd::Val(q_addr0), Opnd::Val(f0));
+        b.store_lds_b128(Opnd::Val(q_addr1), Opnd::Val(f1));
+    }
+    let ones_addr0 = b.mul_i32(lane_q, c32_);
+    let ones_addr = b.add_i32(ones_base, ones_addr0);
     b.wait_vm(0);
     b.wait_lds(0);
-    b.barrier(); // P0: tiles 0 and 1 are in LDS
+    b.barrier(); // P0: tiles 0 and 1 (and the constants) are in LDS
 
     // ---- loop state (128-key units: S is 4 tiles, one rollback decision and two barriers per tile) ----
     let ones_w = b.c_i32(0x38383838);
-    let ones8 = b.frag8(ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w);
+    let load_ones = |b: &mut FnBuilder| -> ValueId {
+        let c16_ = b.c_i32(16);
+        let a1 = b.add_i32(ones_addr, c16_);
+        b.load_lds_b128x2(Opnd::Val(ones_addr), Opnd::Val(a1))
+    };
+    let load_q1 = |b: &mut FnBuilder| -> ValueId {
+        let c16_ = b.c_i32(16);
+        let a1 = b.add_i32(q_addr0, c16_);
+        b.load_lds_b128x2(Opnd::Val(q_addr0), Opnd::Val(a1))
+    };
     let ones_h = b.c_i32(0x3C003C00);
     let ones_f16 = b.frag2(ones_h, ones_h);
     let w_init = b.c_i32(0x48004800u32 as i32);
@@ -9689,7 +9735,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
             let s0 = b.mfma_scale_fp8(k8_0, cx.b0, biasf, sk0, sq0m);
-            out.push(b.mfma_scale_fp8(k8_1, cx.b1, s0, sk1, sq1m));
+            let qb1 = load_q1(b);
+            out.push(b.mfma_scale_fp8(k8_1, qb1, s0, sk1, sq1m));
         }
         b.wait_lds(0);
         out
@@ -9773,7 +9820,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let sh16 = b.add_i32(cx.g8, c16i);
             let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
             b.var_mfma_scale(s_vars[s], k8_0, cx.b0, sk0, sq0m);
-            b.var_mfma_scale(s_vars[s], k8_1, cx.b1, sk1, sq1m);
+            let qb1 = load_q1(b);
+            b.var_mfma_scale(s_vars[s], k8_1, qb1, sk1, sq1m);
         }
     };
     // VALU phase of the whole tile: ONE max / rollback decision over its 64 scores, then P (16 words)
@@ -9892,6 +9940,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         for hh in 0..2usize {
             let o = 8 * hh;
             let p8 = b.frag8(w[o], w[o + 1], w[o + 2], w[o + 3], w[o + 4], w[o + 5], w[o + 6], w[o + 7]);
+            let ones8 = load_ones(b);
             b.var_mfma_scale(la, ones8, p8, c127, c123);
             for e in 0..4usize {
                 let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
@@ -10052,7 +10101,9 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     } else {
         let pad: i32 = std::env::var("FMHA_LDSPAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let cb = if fmha_t_opt("dma") && !vs_active() { 33280 } else { 256 * fmha_t_pitch() };
-        b.lds((nbuf * cb + 2048 + 1024 + 1024 + pad) as u32);
+        // vendor-structure kernels: + a 2 KB block of E4M3 ones and 16 KB for the per-wave second Q fragment (vs128)
+        let vs_extra = if vs_active() { 2048 + 16384 } else { 0 };
+        b.lds((nbuf * cb + 2048 + 1024 + 1024 + pad + vs_extra) as u32);
     }
     b.arg("ptr_o", DType::Ptr, 0x000, 8);
     b.arg("ptr_q", DType::Ptr, 0x010, 8);
@@ -10177,6 +10228,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
 
     // Q fragments (B operand of S^T = K Q^T): same permuted K order as the K fragments
     let mut bq: Vec<ValueId> = Vec::with_capacity(2);
+    let mut bq1_words: Vec<ValueId> = Vec::new();
     for c in 0..2u32 {
         let qp = b.ptr_add(ptr_q, q_off);
         let mut w: Vec<ValueId> = Vec::with_capacity(8);
@@ -10184,6 +10236,9 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
             let off = 64 * c + if i < 4 { 4 * i } else { 32 + 4 * (i - 4) };
             let v = b.load_f32(qp, off);
             w.push(b.bitcast_i32(v));
+        }
+        if c == 1 {
+            bq1_words = w.clone();
         }
         bq.push(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]));
     }
@@ -10413,6 +10468,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         kfx,
         trx,
         swzw,
+        bq1_words,
     };
     b.begin_if(is_a);
     if pp {
