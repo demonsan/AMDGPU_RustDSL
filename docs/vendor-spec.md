@@ -520,6 +520,8 @@ made to allocate before the next validation round.
 
 ## 7.7 Full checklist: kernel-opt `fmha_fwd_hd128_mxfp8_vs128` @ Main 3cc73c0 (GPU 5)
 
+**Superseded by 7.8 (the vsx recipe); kept as the 298.1 TFLOP/s baseline for the delta columns.**
+
 Measured 2026-10-29 on GPU 5 with `bash tools/vendor_validate.sh fmha_fwd_hd128_mxfp8_vs128` plus
 `tools/vendor_counters.sh` for the counter rows (same-run wall, B1 H8 S=SK=2048, 20 unprofiled
 launches; vendor measured in the same process). Commit: Main `3cc73c0` (kernel-opt `34efdeb`
@@ -598,6 +600,93 @@ Ranked remaining actions (with expected savings):
 4. **Latency hiding**: VMEM level 117 -> ~52, LDS level 49 -> ~32 and IFETCH 136 -> ~81 (loop 605 vs
    vendor 473 instructions) - deeper DMA prefetch and less prologue/epilogue code.
 5. Remaining barrier/priority/issue stalls (~+1500 cycles not explained by the work counters).
+
+## 7.8 Full checklist: `_vs128` with the vsx exact-reference recipe @ Main 466c5cb (GPU 5)
+
+Measured 2026-10-29 on GPU 5, Main `466c5cb` ("vs128 350 TFLOP/s after the exact-reference recipe"),
+same command `bash tools/vendor_validate.sh fmha_fwd_hd128_mxfp8_vs128` plus `tools/vendor_counters.sh`
+(same-run B1 H8 S=SK=2048, 20 unprofiled launches). Recipe: two-word f16 bias (exact reference shift),
+realign threshold **120/512** (re-align every unit so the max key sits at f = 0 where the Schraudolph
+conversion is exact), no LUT correction on the long-sequence path; short sequences (< 9 tiles = SK <=
+1024) use a second code copy with the correction (two complete copies selected once at kernel start,
+no branch in the loop). vgpr 229 / sgpr 45, LDS 102400 B.
+
+**Wall: 0.0490 ms = 350.6 TFLOP/s vs vendor 0.0333 ms = 515.7 TFLOP/s -> gap 1.47x** (was 1.73x at
+298.1; `_t` llvm-tail same run 291.3). Benchmark mean error **6.95e-4** vs vendor 2.42e-3, `_t` 1.25e-3.
+Correctness: 15/15 at 16 rows (REF_KERNEL_OK), **ours bad = 0 on all 15 shapes at 64 rows** (3 shapes
+report REF_KERNEL_FAIL only because the *vendor* has bad elements there), determinism 5/5.
+
+| §7.5 line | vendor | vsx @466c5cb | prev @3cc73c0 (298.1) | target | delta closed? |
+|---|---|---|---|---|---|
+| wall | 515.7 TFLOP/s | **350.6** | 298.1 | >= 420 | no (1.47x, best of ours) |
+| `SQ_INSTS` | 381.6 | 496.9 | 642.5 | <= 400 | no (improved -145.6) |
+| `SQ_INSTS_VALU` | 250.9 | 347.9 | 491.3 | <= 265 | no (improved -143.4) |
+| `_MUL_F32` | 32.3 | 41.1 | 37.2 | <= 40 | no (marginally over) |
+| `_INT32` | 10.8 | 61.2 | 60.8 | <= 15 | no (unchanged) |
+| other VALU (MOV/TRANS/CMP) | 79.6 | **135.6** | 293.3 | <= 95 | no (**-157.7: svcorr LUT removed**) |
+| `_CVT` | 69.4 | 72.0 | 68.7 | >= 60 | yes |
+| `SQ_INSTS_SALU` | 40.0 | 22.8 | 22.8 | >= 35 | no (unchanged) |
+| `SQ_INSTS_LDS` | 52.5 | 72.8 | 72.8 | <= 55 | no (unchanged) |
+| `SQ_INSTS_VMEM` | 5.7 | 7.6 | 7.6 | <= 6 | no |
+| `SQ_IFETCH` | 81.4 | **106.0** | 136.0 | <= 85 | no (**-30.0** from the smaller long-path loop) |
+| `SQ_VALU_MFMA_BUSY_CYCLES` | 1086 | 1280 | 1280 | <= 1100 | no (unchanged: 22 MFMA/wave-iter) |
+| `SQ_ACTIVE_INST_VALU` | 293.8 | 399.9 | 543.3 | <= 310 | no (-143.4) |
+| `SQ_WAIT_ANY` | 412.9 | 655.0 | 803.6 | <= 450 | no (-148.6) |
+| `SQ_INST_LEVEL_VMEM` | 52.6 | 119.7 | 117.1 | <= 60 | no (unchanged; now the largest latency term) |
+| `SQ_INST_LEVEL_LDS` | 32.1 | 47.6 | 49.4 | <= 35 | no |
+| LDS bank conflicts | 0 | **0.0** | 82.0 | <= 0.1 | **yes (fixed in the vsx/vs128 layout)** |
+| `SQ_WAVE_CYCLES` (info) | 1156 | 1664.8 | 1988.2 | - | improved -323 |
+
+Structural (emitted asm; **4 role loops = two complete code copies x 2 roles**):
+| line | vendor | vsx | target | closed? |
+|---|---|---|---|---|
+| barriers per 128 keys | 2 | **2** (long copy BB48/BB67 loops: 2 `s_barrier`/iteration) | 2 | **yes** |
+| realign/rollback decisions per 128 keys | 1 | **1** (`v_cmp_lt_f32` + `s_cbranch_vccnz` after the max3 chain; the other `s_cbranch_vccnz` is the loop backedge, plus one guard `s_cbranch_vccz` for the tail) | 1 | **yes (structurally unchanged; cost unchanged: same branch + realign block, now taken ~every unit because threshold = 120/512)** |
+| threshold literal | - | **120/512 = 0x3e700000** present (8x), i.e. the vsx default | - | yes |
+| setprio pair | 1 pair per 128 keys | **0** (all `s_setprio` removed in vsx) | 1 pair | n/a - mechanism dropped (was 1 pair at 298.1); potential experiment, see below |
+| DMA staging | ~5 LDS-DMA writes /128 keys | **4 `global_load_lds_dwordx4` per iteration per role** | 4 | **yes** |
+| next-tile QK in compute group | 8 scaled QK MFMA | 18 `v_mfma_scale` per iteration (QK+PV, in-loop) | present | **yes** |
+| iteration unit | 128 keys | **128 keys** | 128 keys | **yes** |
+| row-sum path | 2x smfmac complementary chain | ones-MFMA: 4x `v_mfma_f32_32x32x8_f16` (128 cyc) | 2 smfmac (32 cyc) | **no (unchanged)** |
+| short-sequence LUT correction | - | **present only in the short-code-copy loops** (32 `v_perm_b32` + 32 `v_pk_sub_u16` per role loop); long-copy loops 0 | design | **yes (two copies selected once at start, no in-loop branch)** |
+| smfmac operand hazard | n/a | n/a (no smfmac yet) | required when smfmac lands | n/a |
+
+**Movement vs the stored baselines** (`_vs` @be6c1f1 261.0; `_vs128` @3cc73c0 298.1; `_t` 292.6):
+NO -> YES: LDS bank conflicts (82 -> 0); wall now 350.6 (> `_t`'s 291 by 20 %, 1.47x from vendor).
+Big improvements without crossing the target: other-VALU 293.3 -> 135.6, IFETCH 136 -> 106, WAIT_ANY
+803.6 -> 655, ACTIVE_INST_VALU 543.3 -> 399.9. Still NO / unchanged: MFMA busy 1280 (row-sum msum +
+2 extra scaled MFMAs), INT32 61.2, other-VALU 135.6, SALU 22.8, LDS instr 72.8, VMEM 7.6, VMEM level
+119.7, LDS level 47.6, row sums still ones-MFMA. setprio removed.
+
+**Honest decomposition of the remaining 1.47x gap** (per SIMD-iteration @2.4 GHz: vendor 4995 cycles,
+ours 7350, +2355; previous vs128 was 8625):
+| component | cycles/SIMD-iter | evidence |
+|---|---|---|
+| XDL: 22 vs 19 MFMA/wave-iter (18 scaled + 4 f16 ones-MFMA msum) | **+388** | MFMA busy 1280 vs 1086 |
+| VALU work | +212 | ACTIVE_INST_VALU 399.9 vs 293.8 (INT32 61.2 vs 10.8, other-VALU 135.6 vs 79.6) |
+| VMEM latency exposure | +134 | INST_LEVEL_VMEM 119.7 vs 52.6 |
+| LDS latency exposure | +31 | INST_LEVEL_LDS 47.6 vs 32.1 |
+| instruction fetch | +49 | IFETCH 106.0 vs 81.4 |
+| **accounted work delta** | **+814** | |
+| stalls / lost overlap (WAIT_ANY +478/SIMD visible, LDS-instr excess +41, barrier/priority windows, residual) | **+1541** | |
+
+Ranked remaining actions:
+1. **XDL (-388/SIMD, now the #1 lever)**: replace the 4x `v_mfma_f32_32x32x8_f16` ones-MFMA row sums
+   (128 cyc/wave) with the 2-smfmac complementary chain from 4.5.1 (32 cyc -> -96/wave) and remove the
+   2 extra scaled MFMAs (18 vs vendor 16 -> -128/wave): up to **-448 cycles/SIMD**, bringing MFMA busy
+   to the vendor's 1086.
+2. **VMEM latency (-134/SIMD)**: VMEM level 119.7 vs 52.6 - deeper/earlier DMA prefetch, tighter
+   waitcnt placement; now the largest latency exposure.
+3. **VALU (-212/SIMD)**: `_INT32` 61.2 (5.6x vendor) is the worst class - move ring/address arithmetic
+   to SALU (we use 22.8 vs the vendor's 40) or precompute per iteration; then the remaining other-VALU
+   135.6 -> 79.6 (register copies).
+4. **WAIT/barrier/scheduling (residual ~1500)**: WAIT_ANY 655 vs 416; the vsx recipe dropped the
+   setprio window that the 298.1 version had and the vendor still uses - re-adding one `s_setprio 1`
+   window over the MFMA phase is a cheap experiment worth ~a few % if it re-enables priority steering.
+5. **LDS (instr 72.8 vs 52.5, level 47.6 vs 32.1)**: fewer/rearranged LDS reads (the bank conflicts are
+   already 0).
+6. **IFETCH 106 vs 81**: the two-code-copy split doubles the static footprint (9568 vs ~5000 insns);
+   consider making the short-sequence copy a separate kernel if I-cache pressure shows up.
 
 ## 8. Unknowns / limitations
 
