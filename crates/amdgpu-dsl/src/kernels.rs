@@ -8974,24 +8974,21 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let mut trx: Vec<ValueId> = Vec::new();
     let mut swzw: Vec<ValueId> = Vec::new();
     if fmha_t_opt("swz") && !fmha_t_opt("dma") {
-        // Bank-conflict-free dense layout: rows of 128 bytes, 16-byte chunk c of row r stored at chunk c ^ s(r), s = (u0 << 2) |
-        // ((u0 ^ u2) << 1) | u1 with u = (r >> 1) & 7. Conflict-free for the K b128 fragment reads (16 lanes: distinct
-        // (r & 1, chunk)), the ds_read_b64_tr_b8 V reads (32B segments e ^ (s >> 1): the 8 rows of a half wave tile the 64 banks)
-        // and the b128 staging writes.
-        fn swz_s(b: &mut FnBuilder, row: ValueId, c1: ValueId, c2: ValueId, c3: ValueId) -> ValueId {
-            let t1 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(c1)));
-            let u0 = b.let_(Op::AndI32(Opnd::Val(t1), Opnd::Val(c1)));
-            let t2 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(c2)));
-            let u1 = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(c1)));
+        // Bank-conflict-free dense layout (LDS = 32 banks x 4 B per cycle, b128 per 8 lanes, b64 per 16 lanes; measured with
+        // SQ_LDS_BANK_CONFLICT): rows of 128 bytes, 16-byte chunk c of row r stored at chunk c ^ s(r) with
+        // s(r) = (r & 7) ^ (((r >> 3) & 1) << 2). K fragment reads: 8 consecutive rows -> 8 distinct chunks; V tr reads: the 8 rows
+        // {0..3, 8..11} of a 16-lane group -> 8 distinct chunks; staging writes: 4 rows x 2 halves -> 8 distinct chunks.
+        fn swz_s(b: &mut FnBuilder, row: ValueId, c3: ValueId, c7: ValueId, c4: ValueId) -> ValueId {
+            let lo = b.let_(Op::AndI32(Opnd::Val(row), Opnd::Val(c7)));
             let t3 = b.let_(Op::LshrI32(Opnd::Val(row), Opnd::Val(c3)));
-            let u2 = b.let_(Op::AndI32(Opnd::Val(t3), Opnd::Val(c1)));
-            let x = b.xor_i32(u0, u2);
-            let s2 = b.shl_i32(u0, c2);
-            let s1 = b.shl_i32(x, c1);
-            let a = b.add_i32(s2, s1);
-            b.add_i32(a, u1)
+            let one = b.c_i32(1);
+            let b3 = b.let_(Op::AndI32(Opnd::Val(t3), Opnd::Val(one)));
+            let two = b.c_i32(2);
+            let b3s = b.shl_i32(b3, two);
+            let _ = c4;
+            b.xor_i32(lo, b3s)
         }
-        let s_k = swz_s(&mut b, j, c1, c2, c3);
+        let s_k = swz_s(&mut b, j, c3, c7, c4);
         let xk0 = b.xor_i32(pblk, s_k);
         let jrow = b.mul_i32(j, c128);
         for k in 0..4i32 {
@@ -9001,23 +8998,18 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
             let a0 = b.add_i32(jrow, xs);
             kfx.push(b.add_i32(a0, lds_k));
         }
-        let s_v = swz_s(&mut b, key_part, c1, c2, c3);
-        let f_s = b.let_(Op::LshrI32(Opnd::Val(s_v), Opnd::Val(c1)));
+        let s_v = swz_s(&mut b, key_part, c3, c7, c4);
         let trow = b.mul_i32(key_part, c128);
-        let s_v0 = b.let_(Op::AndI32(Opnd::Val(s_v), Opnd::Val(c1)));
-        let mgx = b.xor_i32(m_gl, s_v0);
-        let mg16 = b.shl_i32(mgx, c4);
         let mh8 = b.shl_i32(m_h, c3);
-        let colp = b.add_i32(mg16, mh8);
-        let trow_c = b.add_i32(trow, colp);
+        let trow_c = b.add_i32(trow, mh8);
         let trow_cl = b.add_i32(trow_c, lds_v);
+        let z = b.xor_i32(m_gl, s_v);
         for e in 0..4i32 {
-            let ce = b.c_i32(e);
-            let seg = b.xor_i32(f_s, ce);
-            let segb = b.shl_i32(seg, c5);
-            trx.push(b.add_i32(trow_cl, segb));
-        }
-        let s_r = swz_s(&mut b, rt_row, c1, c2, c3);
+            let ce = b.c_i32(2 * e);
+            let ch = b.xor_i32(z, ce);
+            let chb = b.shl_i32(ch, c4);
+            trx.push(b.add_i32(trow_cl, chb));
+        }        let s_r = swz_s(&mut b, rt_row, c3, c7, c4);
         let h4 = b.let_(Op::LshrI32(Opnd::Val(rt_half64), Opnd::Val(c4)));
         let rrow = b.mul_i32(rt_row, c128);
         for w in 0..4i32 {
