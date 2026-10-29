@@ -136,14 +136,14 @@ impl Operand for &Vgpr<1> {
     const BUS: u8 = 0;
     const VOP3_OK: bool = true;
     fn to_src(&self) -> ASrc {
-        AASrc::Reg(self.id)
+        ASrc::Reg(self.id)
     }
 }
 impl Operand for Sub<'_, 1> {
     const BUS: u8 = 0;
     const VOP3_OK: bool = true;
     fn to_src(&self) -> ASrc {
-        AASrc::Reg(self.id)
+        ASrc::Reg(self.id)
     }
 }
 impl Sealed for &Sgpr<1> {}
@@ -151,7 +151,7 @@ impl Operand for &Sgpr<1> {
     const BUS: u8 = 1;
     const VOP3_OK: bool = true;
     fn to_src(&self) -> ASrc {
-        AASrc::Reg(self.id)
+        ASrc::Reg(self.id)
     }
 }
 impl<const K: i32> Sealed for Imm<K> {}
@@ -160,7 +160,7 @@ impl<const K: i32> Operand for Imm<K> {
     const VOP3_OK: bool = true;
     fn to_src(&self) -> ASrc {
         let () = Imm::<K>::OK;
-        AASrc::Imm(K as i64)
+        ASrc::Imm(K as i64)
     }
 }
 impl Sealed for Lit {}
@@ -168,7 +168,7 @@ impl Operand for Lit {
     const BUS: u8 = 1;
     const VOP3_OK: bool = false;
     fn to_src(&self) -> ASrc {
-        AASrc::Imm(self.0 as i64)
+        ASrc::Imm(self.0 as i64)
     }
 }
 
