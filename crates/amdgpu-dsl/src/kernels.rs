@@ -9059,7 +9059,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let n_vm: u8 = if role_a { 5 } else { 4 };
     let no_vmwait = ablate.contains("novmwait");
     let stage_wait = |b: &mut FnBuilder, kdslot_n1: ValueId| {
-        if !no_vmwait {
+        if ablate.contains("vmall") {
+            b.wait_vm(0);
+        } else if !no_vmwait {
             b.wait_vm(n_vm);
         }
         if let Some(kv) = kdp {
