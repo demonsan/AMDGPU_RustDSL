@@ -43,7 +43,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     // Register pressure: when allocation fails, rematerialise loop-invariant constants next to their loop uses (remat1 -> remat3)
     // and try again. A kernel that allocates at the first attempt is unaffected.
     let mut last = String::new();
-    for extra in [&[][..], &["remat1"][..], &["remat2"][..], &["remat3"][..]] {
+    for extra in [&[][..], &["remat1"][..], &["remat2"][..], &["remat3"][..], &["remat4"][..]] {
         match lower_and_allocate_with(f, extra) {
             Ok(r) => return Ok(r),
             Err(e) if e.contains("out of VGPRs") => last = e,
