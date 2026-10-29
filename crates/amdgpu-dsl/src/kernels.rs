@@ -7269,6 +7269,8 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         for _ in 0..192 {
             x = b.add_i32(x, c1);
         }
+        // keep the chain alive (dead values are removed): a scratch store into the unused exchange slot
+        b.store_lds_b32(Opnd::Val(cx.ex_own), Opnd::Val(x));
     }
     let dbuf = fmha_t_opt("dbuf");
     // double buffering: compute reads buffer `par`, the next tile is staged into the other one
