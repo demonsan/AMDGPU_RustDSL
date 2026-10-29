@@ -23,6 +23,8 @@ use crate::mir::*;
 ///  * `scalarize` - wave-uniform integer arithmetic (workgroup ids, kernarg values, constants and loop counters /
 ///                 toggles derived from them with add/mul/shl/lshr/and/xor) is computed with SALU instructions in SGPRs;
 ///                 a value needed by a VALU instruction is copied with one `v_mov` (cached per region);
+///  * `addrfold` - an address `(base + k1) + (y + k2)` used once is formed as `base + y` with `k1+k2` in the DS
+///                 offset field, so the `base + k` variants no longer stay live in VGPRs;
 ///  * `saddr`   - global loads whose address is `kernarg_ptr + vector offset` use the scalar-base form (no 64-bit add);
 ///  * `dce`     - dead address / clamp chains (`v_add_co`/`v_addc`, `v_cmp`+`v_cndmask`, pointer adds) are removed;
 ///  * `cmpfold` - `select(cmp(x,y), ..)` re-issues the compare instead of the 0/1 materialisation +
@@ -468,7 +470,51 @@ impl Lowerer {
             }
             break;
         }
+        // addrfold: `(base + k1) + (y + k2)` used once as an address -> add the bases, move k1+k2 into the DS offset field
+        // (keeps one base live instead of one VGPR per constant variant)
+        if opt_on("addrfold") {
+            if let Opnd::Val(v) = cur {
+                if let Some(Op::AddI32(x, y)) = self.defs.get(&v).cloned() {
+                    if self.use_counts.get(&v).copied().unwrap_or(0) <= 1 {
+                        let (xc, kx) = self.split_const(x);
+                        let (yc, ky) = self.split_const(y);
+                        let tot = off + kx + ky;
+                        if (kx != 0 || ky != 0) && (0..65536).contains(&tot) && self.const_of(xc).is_none() && self.const_of(yc).is_none() {
+                            let rx = self.as_v1(xc)?;
+                            let ry = self.as_v1(yc)?;
+                            self.touch(&[Src::Reg(rx), Src::Reg(ry)]);
+                            let d = self.new_vreg(RClass::V1);
+                            self.push(MInst::new(MOp::VAddU32).def(d).srcreg(rx).srcreg(ry));
+                            return Ok((d, tot));
+                        }
+                    }
+                }
+            }
+        }
         Ok((self.as_v1(cur)?, off))
+    }
+
+    /// `o = core + k` through chains of `x + const`: (core, k).
+    fn split_const(&self, o: Opnd) -> (Opnd, i64) {
+        let mut cur = o;
+        let mut k = 0i64;
+        loop {
+            if let Opnd::Val(v) = cur {
+                if let Some(Op::AddI32(x, y)) = self.defs.get(&v) {
+                    if let Some(c) = self.const_of(*y) {
+                        k += c;
+                        cur = *x;
+                        continue;
+                    }
+                    if let Some(c) = self.const_of(*x) {
+                        k += c;
+                        cur = *y;
+                        continue;
+                    }
+                }
+            }
+            return (cur, k);
+        }
     }
 
     /// A freshly zeroed sixteen-dword fragment.
