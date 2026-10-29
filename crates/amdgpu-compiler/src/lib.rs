@@ -56,9 +56,20 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     };
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
-        for cut in [0u32, 16, 32, 48] {
+        // (pressure cut, hoist distance cap): first shrink the LDS-read hoisting (it lengthens live ranges and fragments
+        // the register file), then the pressure limit, and only then give up the scheduler.
+        let mut attempts: Vec<(u32, Option<usize>)> = vec![(0, None)];
+        if opts.ldshoist {
+            attempts.extend([(0, Some(24)), (0, Some(8)), (0, Some(0))]);
+        }
+        attempts.extend([(16, Some(0)), (32, Some(0)), (48, Some(0))]);
+        for (cut, hoist) in attempts {
             let mut o = opts.clone();
             o.max_vgprs = opts.max_vgprs.saturating_sub(cut);
+            if let Some(h) = hoist {
+                o.hoist_dist = h;
+                o.ldshoist = h > 0 && opts.ldshoist;
+            }
             let mut m = base.clone();
             let attempt = (|| -> Result<regalloc::Alloc, String> {
                 sched::run(&mut m, &o)?;
