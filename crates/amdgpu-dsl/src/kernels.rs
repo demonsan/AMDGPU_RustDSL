@@ -9699,7 +9699,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         kd
     };
     let stage_end = |b: &mut FnBuilder, kd: Option<ValueId>, kd_slot: ValueId| {
-        b.wait_vm(0);
+        if !ablate.contains("novmwait") {
+            b.wait_vm(0);
+        }
         if let Some(kd) = kd {
             let a = b.add_i32(kdb0, kd_slot);
             b.store_lds_b32(Opnd::Val(a), Opnd::Val(kd));
@@ -9906,8 +9908,18 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         } else {
             Vec::new()
         };
+        // biasonce: the bias accumulator (one f16 MFMA) is computed ONCE per tile and used as the C input of the first scaled MFMA of all four S tiles
+        // (the vendor issues one bf16 bias MFMA per 128 keys; we issued four)
+        let biasf_once: Option<ValueId> = if fmha_t_opt("biasonce") {
+            let zero16 = b.frag_zero(DType::Frag16);
+            Some(b.mfma_f16_wide(ones_f16, Opnd::Var(bias2), zero16))
+        } else {
+            None
+        };
         for s in 0..4usize {
-            b.var_mfma_f16_z(s_vars[s], ones_f16, bias2);
+            if biasf_once.is_none() {
+                b.var_mfma_f16_z(s_vars[s], ones_f16, bias2);
+            }
             let ko = b.c_i32(4096 * (s as i32));
             let a0 = b.add_i32(kfb[0], ko);
             let a1 = b.add_i32(kfb[1], ko);
@@ -9935,7 +9947,11 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 (sk0, sk1)
             };
             let qb0 = if q0_reg { cx.b0 } else { load_q0(b) };
-            b.var_mfma_scale(s_vars[s], k8_0, qb0, sk0, sq0m);
+            if let Some(bf) = biasf_once {
+                b.var_mfma_scale_c(s_vars[s], k8_0, qb0, bf, sk0, sq0m);
+            } else {
+                b.var_mfma_scale(s_vars[s], k8_0, qb0, sk0, sq0m);
+            }
             let qb1 = load_q1(b);
             b.var_mfma_scale(s_vars[s], k8_1, qb1, sk1, sq1m);
         }
