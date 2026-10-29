@@ -1238,6 +1238,61 @@ pub fn probe_dma_kread() -> Function {
     }
     b.finish()
 }
+/// DMA address-pattern probe (64 threads, one `global_load_lds_dwordx4` to M0 = 0): lane i fetches the 16 bytes at a
+/// pattern-dependent source offset (PD_MAP: 0 identity, 1 reversed, 2 stride 1024, 3 stride 128, 4 rows 1024 apart x
+/// 8 chunks) and the 1 KB of LDS is read back linearly: `o` slot u holds the data some lane fetched.
+pub fn probe_dma_map() -> Function {
+    let mode: u32 = std::env::var("PD_MAP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut b = FnBuilder::new("probe_dma_map", 64);
+    b.lds(4096);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("i", DType::Ptr, 8, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let inp = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c16 = b.c_i32(16);
+    let c3 = b.c_i32(3);
+    let c7 = b.c_i32(7);
+    let c0 = b.c_i32(0);
+    let off = match mode {
+        0 => b.mul_i32(tid, c16),
+        1 => {
+            let c63 = b.c_i32(63);
+            let r = b.xor_i32(tid, c63);
+            b.mul_i32(r, c16)
+        }
+        2 => {
+            let c1024 = b.c_i32(1024);
+            b.mul_i32(tid, c1024)
+        }
+        3 => {
+            let c128 = b.c_i32(128);
+            b.mul_i32(tid, c128)
+        }
+        _ => {
+            let hi = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c3)));
+            let lo = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c7)));
+            let c1024 = b.c_i32(1024);
+            let a = b.mul_i32(hi, c1024);
+            let bb = b.mul_i32(lo, c16);
+            b.add_i32(a, bb)
+        }
+    };
+    let sp = b.ptr_add(inp, off);
+    b.load_global_lds(sp, c0, 0, 4);
+    b.wait_vm(0);
+    b.wait_lds(0);
+    b.barrier();
+    let o16 = b.mul_i32(tid, c16);
+    let v = b.load_lds_b128(Opnd::Val(o16));
+    let op = b.ptr_add(o, o16);
+    for w in 0..4u8 {
+        let x = b.frag4_lane(v, w);
+        let f = b.bitcast_f32(x);
+        b.store_f32(op, 4 * w as u32, f);
+    }
+    b.finish()
+}
 /// Pack instruction probe: checks the semantics of `v_cvt_pknorm_u16_f32` and
 /// of the fp8 packing path.
 ///
