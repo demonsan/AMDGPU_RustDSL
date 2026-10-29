@@ -7187,7 +7187,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let soff = b.add_i32(soff1, cx.rt_half64);
         let sp = b.ptr_add(ptr, soff);
         let mut v: Vec<ValueId> = (0..4u32).map(|w| b.load_b128(sp, 16 * w)).collect();
-        if role_a && kdlds {
+        if (role_a != fmha_t_opt("kdB")) && kdlds {
             // K scale dword of this thread's key row, staged with the K tile
             let kd_row = b.mul_i32(srow, cx.kd_stride);
             let kd_off = b.add_i32(kd_row, cx.kd_base);
@@ -7253,6 +7253,26 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let m_var = vars[1];
     let l_var = vars[2];
     let o_vars = [vars[3], vars[4], vars[5], vars[6]];
+    let peel = fmha_t_opt("peel");
+    if peel {
+        // the tail iteration (fewer than 128 keys) leaves the loop here and runs once, peeled, after it: the loop body only
+        // contains the unmasked code (smaller instruction footprint)
+        let key0h = b.shl_i32(it, c7);
+        let key_endh = b.add_i32(key0h, c128v);
+        let tail_h = b.cmp_lt_i32(cx.kv_len, key_endh);
+        b.break_if(Opnd::Val(tail_h));
+    }
+    let body = |b: &mut FnBuilder, masked_iter: bool| -> ValueId {
+    // experiment: independent dummy VALU work in one role only (which role is critical?)
+    let dn = if role_a { fmha_t_num("dAn") } else { fmha_t_num("dBn") };
+    if (role_a && fmha_t_opt("dummyA")) || (!role_a && fmha_t_opt("dummyB")) || dn.is_some() {
+        let mut x = b.add_i32(it, c1);
+        for _ in 0..dn.unwrap_or(192) {
+            x = b.add_i32(x, c1);
+        }
+        // keep the chain alive (dead values are removed): a scratch store into the unused exchange slot
+        b.store_lds_b32(Opnd::Val(cx.ex_own), Opnd::Val(x));
+    }
     let dbuf = fmha_t_opt("dbuf");
     // double buffering: compute reads buffer `par`, the next tile is staged into the other one
     let j4 = b.shl_i32(cx.j, c2);
@@ -7566,13 +7586,17 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
     };
     // the last iteration may hold fewer than 128 keys: only that one pays for the key mask
-    let key_end = b.add_i32(key0, c128v);
-    let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
-    b.begin_if(Opnd::Val(is_tail));
-    compute(b, true);
-    b.else_();
-    compute(b, false);
-    b.end_if();
+    if peel {
+        compute(b, masked_iter);
+    } else {
+        let key_end = b.add_i32(key0, c128v);
+        let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
+        b.begin_if(Opnd::Val(is_tail));
+        compute(b, true);
+        b.else_();
+        compute(b, false);
+        b.end_if();
+    }
     // all waves are done with this iteration's K/V; then publish the prefetched tile
     if !dbuf {
         b.wait_lds(0);
@@ -7595,10 +7619,20 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 
     let it_next = b.add_i32(it, c1);
     b.set_var(it, it_next);
+    it_next
+    };
+    let it_next = body(b, false);
     let more = b.cmp_lt_i32(it_next, cx.nkv);
     let stop = b.let_(Op::NotI1(Opnd::Val(more)));
     b.break_if(Opnd::Val(stop));
     b.end_loop();
+    if peel {
+        // peeled tail iteration (only when the loop left through the head test)
+        let has_tail_iter = b.cmp_lt_i32(it, cx.nkv);
+        b.begin_if(Opnd::Val(has_tail_iter));
+        body(b, true);
+        b.end_if();
+    }
 
     // ---- epilogue: O * (V descale / l_total) -> BF16, four dims per 8-byte store ----
     let l_tot = if let Some(la) = lacc {
@@ -8712,6 +8746,12 @@ fn fmha_t_opt(name: &str) -> bool {
         return false;
     }
     has(name) || (has("dma") && (name == "dbuf" || name == "kdlds"))
+}
+
+/// Numeric FMHA_OPT token `<prefix><N>` (e.g. dBn32), if present.
+fn fmha_t_num(prefix: &str) -> Option<usize> {
+    let v = std::env::var("FMHA_OPT").ok()?;
+    v.split(',').find_map(|x| x.strip_prefix(prefix).and_then(|n| n.parse().ok()))
 }
 
 fn fmha_t_pitch() -> i32 {

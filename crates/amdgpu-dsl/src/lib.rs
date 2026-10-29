@@ -1072,6 +1072,8 @@ pub fn verify(f: &Function) -> Vec<String> {
     let mut loop_depth = 0usize;
     let mut if_depth = 0usize;
     let mut loop_vars: Vec<Vec<VarId>> = Vec::new();
+    // variables of loops that already ended: their final values may be updated by straight-line code after the loop (peeled iterations)
+    let mut done_vars: Vec<VarId> = Vec::new();
     // Vars stay readable after their loop ends: the register holds the final
     // value carried by the last iteration.
     let mut vars_defined: HashSet<VarId> = HashSet::new();
@@ -1466,7 +1468,7 @@ pub fn verify(f: &Function) -> Vec<String> {
             Stmt::SetVar { var, value } => {
                 // Any enclosing loop's variable may be updated; an inner loop can
                 // therefore update an outer loop's accumulator.
-                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var));
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
                     errs.push(here(format!("var{var} assigned outside its loop")));
                 }
@@ -1482,7 +1484,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
             }
             Stmt::VarLoadB128 { var, base, .. } => {
-                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var));
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
                     errs.push(here(format!("var{var} loaded outside its loop")));
                 }
@@ -1496,7 +1498,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
             }
             Stmt::VarScaleF32 { var, scalar } => {
-                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var));
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
                     errs.push(here(format!("var{var} scaled outside its loop")));
                 }
@@ -1518,7 +1520,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
             }
             Stmt::VarScalePk { var, pair } => {
-                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var));
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
                     errs.push(here(format!("var{var} scaled outside its loop")));
                 }
@@ -1537,7 +1539,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
             }
             Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
-                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var));
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
                     errs.push(here(format!("var{var} accumulated outside its loop")));
                 }
@@ -1600,7 +1602,9 @@ pub fn verify(f: &Function) -> Vec<String> {
                     errs.push(here("endloop without loop".into()));
                 } else {
                     loop_depth -= 1;
-                    loop_vars.pop();
+                    if let Some(vs) = loop_vars.pop() {
+                    done_vars.extend(vs);
+                }
                     // Values (including loop variables) stay visible after the
                     // loop: a loop variable then holds its last value, which is
                     // what the lowering leaves in its register.
