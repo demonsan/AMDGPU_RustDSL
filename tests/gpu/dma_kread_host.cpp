@@ -19,15 +19,16 @@ int main(int argc, char** argv) {
     CK(hipModuleLaunchKernel(fn, 1, 1, 1, 256, 1, 1, 0, nullptr, params, nullptr));
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(ho.data(), dout, 16384, hipMemcpyDeviceToHost));
-    int bad = 0;
+    int bad = 0; int badrow[128] = {0};
     for (int t = 0; t < 256; ++t) {
         int row = (t & 31) + 32 * (t >> 6), g = (t >> 5) & 1;
         for (int k = 0; k < 4; ++k) {
             const unsigned char* want = &hi[row * 128 + (g ^ (2 * k)) * 16];
             const unsigned char* got = &ho[t * 64 + k * 16];
-            if (std::memcmp(want, got, 16)) { if (bad++ < 8) std::printf("thread %d (row %d g %d) k %d: mismatch\n", t, row, g, k); }
+            if (std::memcmp(want, got, 16)) { ++bad; ++badrow[row]; }
         }
     }
+    for (int r = 0; r < 128; r += 8) { int s = 0; for (int i = 0; i < 8; ++i) s += badrow[r + i]; if (s) std::printf("rows %3d..%3d (LDS run %2d): %d bad fragments\n", r, r + 7, r / 8, s); }
     std::printf("DMA_KREAD_PROBE %s (bad=%d of 1024 fragments)\n", bad ? "FAIL" : "OK", bad);
     return bad ? 1 : 0;
 }
