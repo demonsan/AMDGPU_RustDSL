@@ -1,0 +1,10 @@
+[package]
+name = "amdgpu-safeasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Safe-Rust authoring of gfx950 instruction sequences: the type system enforces the ISA rules (operand legality, hazards)"
+
+[dependencies]
+amdgpu-compiler = { path = "../amdgpu-compiler" }
+amdgpu-dsl = { path = "../amdgpu-dsl" }
