@@ -455,7 +455,7 @@ impl Lowerer {
         loop {
             if let Opnd::Val(v) = cur {
                 if let Some(&(t, k)) = self.lazy.get(&v) {
-                    if std::env::var("AMDC_ADDRFOLD_NODS").is_err() && (0..65536).contains(&(off + k)) {
+                    if std::env::var("AMDC_ADDRFOLD_NODS").map(|v| v.is_empty()).unwrap_or(true) && (0..65536).contains(&(off + k)) {
                         self.touch(&[Src::Reg(t)]);
                         return Ok((t, off + k));
                     }
