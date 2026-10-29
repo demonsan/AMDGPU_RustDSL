@@ -7827,8 +7827,10 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let lds_tile = b.add_i32(lds_base, w1024);
     let kd_w = b.shl_i32(w4_odd, c6);
     let kdl_w = b.shl_i32(w4_odd, c8);
+    let dummy_lds = b.c_i32(nbuf_l * 256 * pitch + 2048 + 1024);
     let dma_issue = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId, kd_off: ValueId| {
         let rb = b.add_i32(key0, rowb);
+        let mut last_sp = None;
         for q in 0..4i32 {
             let cq = b.c_i32(32 * q);
             let row_raw = b.add_i32(rb, cq);
@@ -7838,6 +7840,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let o1 = b.add_i32(o0, base_off);
             let o2 = b.add_i32(o1, cbytes);
             let sp = b.ptr_add(ptr, o2);
+            last_sp = Some(sp);
             let cl = b.c_i32(4096 * q);
             let l0 = b.add_i32(lds_tile, buf_off);
             let lq = b.add_i32(l0, cl);
@@ -7855,6 +7858,11 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let l0 = b.add_i32(lds_kd, kdl_w);
             let lq = b.add_i32(l0, kd_off);
             b.load_global_lds(kd_ptr, lq, 0, 1);
+        }
+        // The LAST DMA of a wave's group lands at LDS 0 instead of its M0 base on gfx950 (hardware observation, see
+        // tests/gpu/dma_tile_probe.sh / docs): a harmless trailing DMA into a spare 1 KB region absorbs it.
+        if let Some(sp) = last_sp {
+            b.load_global_lds(sp, dummy_lds, 0, 4);
         }
     };
     let stage_loads = |b: &mut FnBuilder, key0: ValueId| -> Vec<ValueId> {
@@ -8312,7 +8320,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     if pp {
         b.lds((512 * fmha_t_pitch() + 2048) as u32);
     } else {
-        b.lds((nbuf * 256 * fmha_t_pitch() + 2048 + 1024) as u32);
+        b.lds((nbuf * 256 * fmha_t_pitch() + 2048 + 1024 + 1024) as u32);
     }
     b.arg("ptr_o", DType::Ptr, 0x000, 8);
     b.arg("ptr_q", DType::Ptr, 0x010, 8);
