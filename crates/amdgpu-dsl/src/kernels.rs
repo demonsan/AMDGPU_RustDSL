@@ -1037,6 +1037,40 @@ pub fn probe_dma_tile() -> Function {
     }
     b.finish()
 }
+/// Single-wave DMA sequence probe (64 threads): sixteen `global_load_lds_dwordx4`, DMA q landing at LDS byte 1024 q,
+/// then read back linearly. `o` must equal `i` (16 KB).
+pub fn probe_dma_seq() -> Function {
+    let mut b = FnBuilder::new("probe_dma_seq", 64);
+    b.lds(16384);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("i", DType::Ptr, 8, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let inp = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c16 = b.c_i32(16);
+    let off16 = b.mul_i32(tid, c16);
+    for q in 0..16i32 {
+        let cq = b.c_i32(1024 * q);
+        let src = b.add_i32(off16, cq);
+        let sp = b.ptr_add(inp, src);
+        b.load_global_lds(sp, cq, 0, 4);
+    }
+    b.wait_vm(0);
+    b.wait_lds(0);
+    b.barrier();
+    for q in 0..16i32 {
+        let cq = b.c_i32(1024 * q);
+        let a = b.add_i32(off16, cq);
+        let v = b.load_lds_b128(Opnd::Val(a));
+        let op = b.ptr_add(o, a);
+        for w in 0..4u8 {
+            let x = b.frag4_lane(v, w);
+            let f = b.bitcast_f32(x);
+            b.store_f32(op, 4 * w as u32, f);
+        }
+    }
+    b.finish()
+}
 /// Pack instruction probe: checks the semantics of `v_cvt_pknorm_u16_f32` and
 /// of the fp8 packing path.
 ///
