@@ -96,7 +96,7 @@ pub fn cost(op: MOp) -> OpCost {
         // MFMA issue spacing 64/32/16 (V), same for dependent chains; latency = wait states until the
         // last D register is readable (20/11/7 s_nop slots of 4 cycles; V) -> hazards pass pads the rest.
         VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z => c(Mfma, 64, 84, Verified),
-        VMfma32x32x16Fp8 | VMfma32x32x8F16 => c(Mfma, 32, 48, Verified),
+        VMfma32x32x16Fp8 | VMfma32x32x8F16 | VMfma32x32x8F16Z => c(Mfma, 32, 48, Verified),
         VMfma16x16x32Fp8 | VMfma16x16x16F16 => c(Mfma, 16, 32, Verified),
         // LDS (E): b128 issue 8, b32 4, tr_b8 ~6, write b128 ~26; latency ~52 (reads) / ~75 (write).
         LdsReadB128 => c(Lds, 8, 52, Experimental),

@@ -7562,6 +7562,292 @@ fn emit_fmha_pp_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.end_if();
 }
 
+/// Vendor-style softmax variant of `emit_fmha_t_role` (kernel `fmha_fwd_hd128_mxfp8_sv`).
+///
+/// No `v_exp`/`v_sub` on the hot path: the scores come out of the MFMA already biased,
+/// `S' = (s - r + 131) / 512`, because the accumulator input of the QK MFMA is a broadcast bias
+/// produced by a tiny f16 MFMA (A = ones, B = bias/8 in all eight k slots), and the Q scale is lowered by 2^-9.
+/// `v_cvt_pknorm_u16_f32` turns S' into a u16 = 65535 S' whose bit pattern, read as bf16, is
+/// 2^(512 S' - 127) (Schraudolph exp2: piecewise linear mantissa, <= 6% error), and
+/// `v_cvt_scalef32_pk_fp8_bf16` packs two of them into E4M3. P is thus 16 2^(s - r). The reference `r`
+/// only moves ("rollback") when some lane's S' exceeds the E4M3 range (s - r > 4); the rollback
+/// shifts the S registers by the (per-lane) change, rescales O and the MFMA row sum and stores the new
+/// bias. Row sums come from the same quantised P (ones-MFMA), so the normalisation is consistent.
+fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c7 = b.c_i32(7);
+    let c16i = b.c_i32(16);
+    let c32v = b.c_i32(32);
+    let c64 = b.c_i32(64);
+    let c123 = b.c_i32(123);
+    let c127 = b.c_i32(127);
+    let neg_big = b.c_f32(-1.0e30);
+    let c128v = b.c_i32(128);
+    let pitch = fmha_t_pitch();
+    let zero = b.frag_zero(DType::Frag16);
+    let hq4 = cx.kd_stride;
+    let c_thr = b.c_f32(135.0 / 512.0);
+    let c_b131 = b.c_f32(131.0 / 512.0);
+    let c8f = b.c_f32(8.0);
+    let c0125 = b.c_f32(0.125);
+    let c512f = b.c_f32(512.0);
+    let one_f = b.c_f32(1.0);
+    let zero_f = b.c_f32(0.0);
+    let cffff = b.c_i32(0xffff);
+    let cm9 = b.c_i32(-9);
+
+    // ---- staging as in the plain kernel ----
+    let (seqs, base_off, ptr, lds_base) = if role_a {
+        (cx.k_seqs, cx.kbase_off, cx.ptr_k, cx.lds_k)
+    } else {
+        (cx.v_seqs, cx.vbase_off, cx.ptr_v, cx.lds_v)
+    };
+    let sdst = b.add_i32(lds_base, cx.rt64);
+    let stage_loads = |b: &mut FnBuilder, key0: ValueId| -> Vec<ValueId> {
+        let srow_raw = b.add_i32(key0, cx.rt_row);
+        let srow_ok = b.cmp_lt_i32(srow_raw, cx.kv_len);
+        let srow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(srow_ok), a: Opnd::Val(srow_raw), b: Opnd::Val(cx.kv_last) });
+        let soff0 = b.mul_i32(srow, seqs);
+        let soff1 = b.add_i32(soff0, base_off);
+        let soff = b.add_i32(soff1, cx.rt_half64);
+        let sp = b.ptr_add(ptr, soff);
+        (0..4u32).map(|w| b.load_b128(sp, 16 * w)).collect()
+    };
+    let stage_stores = |b: &mut FnBuilder, dstb: ValueId, data: &[ValueId]| {
+        for (w, d) in data.iter().enumerate() {
+            let c = b.c_i32(16 * w as i32);
+            let a = b.add_i32(dstb, c);
+            b.store_lds_b128(Opnd::Val(a), Opnd::Val(*d));
+        }
+    };
+    let key_first = b.c_i32(0);
+    let first = stage_loads(b, key_first);
+    stage_stores(b, sdst, &first);
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+
+    // ---- loop state: bias word (f16 of B/8 in both halves, B = (131 - r)/512), O, scores, row-sum accumulator ----
+    let ones_w = b.c_i32(0x38383838);
+    let ones8 = b.frag8(ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w, ones_w);
+    let ones_h = b.c_i32(0x3C003C00);
+    let ones_f16 = b.frag2(ones_h, ones_h);
+    let w_init = b.c_i32(0x48004800u32 as i32); // B = 64: the first substep always rolls back
+    let bias_init = b.frag2(w_init, w_init);
+    let sq0m = b.add_i32(cx.sq0, cm9); // Q scales 2^-9: S' = S / 512
+    let sq1m = b.add_i32(cx.sq1, cm9);
+    let vars = b.begin_loop(&[
+        (DType::I32, Opnd::Val(c0)),
+        (DType::Frag2, Opnd::Val(bias_init)),
+        (DType::Frag16, Opnd::Val(zero)),
+        (DType::Frag16, Opnd::Val(zero)),
+        (DType::Frag16, Opnd::Val(zero)),
+        (DType::Frag16, Opnd::Val(zero)),
+        (DType::Frag16, Opnd::Val(zero)),
+        (DType::Frag16, Opnd::Val(zero)),
+        (DType::Frag16, Opnd::Val(zero)),
+    ]);
+    let it = vars[0];
+    let bias2 = vars[1];
+    let o_vars = [vars[2], vars[3], vars[4], vars[5]];
+    let s_vars = [vars[6], vars[7]];
+    let la = vars[8];
+
+    let key0 = b.shl_i32(it, c7);
+    let it_p1 = b.add_i32(it, c1);
+    let has_next = b.cmp_lt_i32(it_p1, cx.nkv);
+    let nxt = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_next), a: Opnd::Val(it_p1), b: it.into() });
+    let key_next = b.shl_i32(nxt, c7);
+    let pre = stage_loads(b, key_next);
+
+    let compute = |b: &mut FnBuilder, masked: bool| {
+        for hh in 0..2usize {
+            // ---- scores S' of this 64-key substep: bias MFMA, then the two scaled K Q^T products ----
+            for sl in 0..2usize {
+                let s = 2 * hh + sl;
+                b.var_mfma_f16_z(s_vars[sl], ones_f16, bias2);
+                let ko = b.c_i32(32 * pitch * (s as i32));
+                let kaddr0 = b.add_i32(cx.kf_base, ko);
+                let kaddr0h = b.add_i32(kaddr0, c32v);
+                let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
+                let kaddr1 = b.add_i32(kaddr0, c64);
+                let kaddr1h = b.add_i32(kaddr1, c32v);
+                let k8_1 = b.load_lds_b128x2(Opnd::Val(kaddr1), Opnd::Val(kaddr1h));
+                let kkey0 = b.add_i32(key0, cx.j);
+                let kcs = b.c_i32(32 * s as i32);
+                let kkey_raw = b.add_i32(kkey0, kcs);
+                let kk_ok = b.cmp_lt_i32(kkey_raw, cx.kv_len);
+                let kkey = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kk_ok), a: Opnd::Val(kkey_raw), b: Opnd::Val(cx.kv_last) });
+                let kd_row = b.mul_i32(kkey, hq4);
+                let kd_off = b.add_i32(kd_row, cx.kd_base);
+                let kd_ptr = b.ptr_add(cx.ptr_kd, kd_off);
+                let kd_raw = b.load_f32(kd_ptr, 0);
+                let kd = b.bitcast_i32(kd_raw);
+                let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
+                let sh16 = b.add_i32(cx.g8, c16i);
+                let sk1 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(sh16)));
+                b.var_mfma_scale(s_vars[sl], k8_0, cx.b0, sk0, sq0m);
+                b.var_mfma_scale(s_vars[sl], k8_1, cx.b1, sk1, sq1m);
+            }
+            // key validity masks (tail tile only): invalid keys never raise the max and give P = 0
+            let mut valid: Vec<Vec<ValueId>> = Vec::new();
+            if masked {
+                for sl in 0..2usize {
+                    let s = 2 * hh + sl;
+                    let kb_s0 = b.add_i32(key0, cx.g4);
+                    let kb_cs = b.c_i32(32 * s as i32);
+                    let kb_s = b.add_i32(kb_s0, kb_cs);
+                    let mut vs = Vec::new();
+                    for r in 0..16u8 {
+                        let kc = b.c_i32((8 * (r / 4) + (r % 4)) as i32);
+                        let kidx = b.add_i32(kb_s, kc);
+                        vs.push(b.cmp_lt_i32(kidx, cx.kv_len));
+                    }
+                    valid.push(vs);
+                }
+            }
+            // ---- max over the 32 scores, partner lane, overflow test ----
+            let mut flat: Vec<ValueId> = Vec::with_capacity(32);
+            for sl in 0..2usize {
+                for r in 0..16u8 {
+                    let lane = b.frag16_lane(s_vars[sl], r);
+                    let v = b.bitcast_f32(lane);
+                    if masked {
+                        flat.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(valid[sl][r as usize]), a: Opnd::Val(v), b: Opnd::Val(neg_big) }));
+                    } else {
+                        flat.push(v);
+                    }
+                }
+            }
+            let mut mloc = b.max3_f32(flat[0], flat[1], flat[2]);
+            let mut k = 3usize;
+            while k + 1 < flat.len() {
+                mloc = b.max3_f32(mloc, flat[k], flat[k + 1]);
+                k += 2;
+            }
+            if k < flat.len() {
+                mloc = b.max_f32(mloc, flat[k]);
+            }
+            let mt = b.partner_max_f32(mloc);
+            let grow = b.cmp_lt_f32(c_thr, mt);
+            b.begin_if(Opnd::Val(grow));
+            {
+                // rollback: new reference = this lane's max (only for lanes that overflowed)
+                let w_old_u = b.frag2_lane(bias2, 0);
+                let w_old = b.bitcast_i32(w_old_u);
+                let lo16 = b.let_(Op::AndI32(Opnd::Val(w_old), Opnd::Val(cffff)));
+                let b8 = b.let_(Op::CvtF16ToF32(Opnd::Val(lo16)));
+                let b_old = b.mul_f32(b8, c8f);
+                let tt = b.sub_f32(c_b131, mt);
+                let b_new = b.add_f32(b_old, tt);
+                let q8 = b.mul_f32(b_new, c0125);
+                let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q8)));
+                let h = b.let_(Op::AndI32(Opnd::Val(h_raw), Opnd::Val(cffff)));
+                let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h)));
+                let b_q = b.mul_f32(hq, c8f);
+                let d_full = b.sub_f32(b_q, b_old);
+                let delta = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(d_full), b: Opnd::Val(zero_f) });
+                let h_sh = b.shl_i32(h, c16i);
+                let w_q = b.let_(Op::AddI32(Opnd::Val(h), Opnd::Val(h_sh)));
+                let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
+                let dupd = b.frag2_dup(delta);
+                b.var_add_pk(s_vars[0], dupd);
+                b.var_add_pk(s_vars[1], dupd);
+                let ex = b.mul_f32(delta, c512f);
+                let corr = b.exp2_f32(ex);
+                for e in 0..4usize {
+                    b.var_scale_f32(o_vars[e], corr);
+                }
+                b.var_scale_lane(la, 0, corr);
+                let nb = b.frag2(w_new, w_new);
+                b.set_var(bias2, nb);
+            }
+            b.end_if();
+            // ---- P = fp8(2^(s - r) x 16) via pknorm + bf16 reinterpretation ----
+            let mut words: Vec<ValueId> = Vec::with_capacity(8);
+            for sl in 0..2usize {
+                let mut xs: Vec<ValueId> = Vec::with_capacity(16);
+                for r in 0..16u8 {
+                    let lane = b.frag16_lane(s_vars[sl], r);
+                    let v = b.bitcast_f32(lane);
+                    if masked {
+                        xs.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(valid[sl][r as usize]), a: Opnd::Val(v), b: Opnd::Val(zero_f) }));
+                    } else {
+                        xs.push(v);
+                    }
+                }
+                for m in 0..4usize {
+                    words.push(b.cvt_pknorm_p8x4(xs[4 * m], xs[4 * m + 1], xs[4 * m + 2], xs[4 * m + 3], one_f));
+                }
+            }
+            let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+            // ---- O^T += V^T P^T and the row sums (ones x P^T) ----
+            b.var_mfma_scale(la, ones8, p8, c127, c123);
+            for e in 0..4usize {
+                let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+                for r in 0..4i32 {
+                    let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32);
+                    addrs.push(b.add_i32(cx.tr_base, off));
+                }
+                let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+                b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
+            }
+        }
+    };
+    let key_end = b.add_i32(key0, c128v);
+    let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
+    b.begin_if(Opnd::Val(is_tail));
+    compute(b, true);
+    b.else_();
+    compute(b, false);
+    b.end_if();
+    b.wait_lds(0);
+    b.barrier();
+    stage_stores(b, sdst, &pre);
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let it_next = b.add_i32(it, c1);
+    b.set_var(it, it_next);
+    let more = b.cmp_lt_i32(it_next, cx.nkv);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+
+    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
+    let l0 = b.frag16_lane(la, 0);
+    let l_tot = b.bitcast_f32(l0);
+    let inv_l = b.rcp_f32(l_tot);
+    let fin = b.mul_f32(inv_l, cx.vd_raw);
+    let ob0 = b.mul_i32(cx.bidx, cx.o_bs);
+    let ob1 = b.mul_i32(cx.hidx, cx.o_hs);
+    let orow = b.mul_i32(cx.row, cx.o_seqs);
+    let ob2 = b.add_i32(ob0, ob1);
+    let ob3 = b.add_i32(ob2, orow);
+    let ob4 = b.add_i32(ob3, cx.g_bytes8);
+    let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
+    let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
+    b.begin_if(Opnd::Val(wave_live));
+    for e in 0..4usize {
+        for q in 0..4usize {
+            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
+            for k in 0..4usize {
+                let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                let lanev = b.bitcast_f32(lane);
+                v4.push(b.mul_f32(lanev, fin));
+            }
+            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
+            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+            let off = (64 * e + 16 * q) as u32;
+            let f0 = b.bitcast_f32(w0);
+            let f1 = b.bitcast_f32(w1);
+            b.store_f32(o_ptr0, off, f0);
+            b.store_f32(o_ptr0, off + 4, f1);
+        }
+    }
+    b.end_if();
+}
 /// Transposed (`S^T = K Q^T`) variant of `fmha_fwd_hd128_mxfp8`: same ABI, same requirements, but
 /// all score data lives in registers (lane = query), the online-softmax correction is lane-local
 /// and LDS holds only the K and V tiles.
@@ -7576,15 +7862,20 @@ fn fmha_t_pitch() -> i32 {
     std::env::var("FMHA_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(144)
 }
 pub fn fmha_fwd_hd128_mxfp8_t() -> Function {
-    fmha_t_build("fmha_fwd_hd128_mxfp8_t", false)
+    fmha_t_build("fmha_fwd_hd128_mxfp8_t", false, false)
 }
 
 /// Phase-shifted ping-pong variant (see `emit_fmha_pp_role`): same ABI and numerics.
 pub fn fmha_fwd_hd128_mxfp8_pp() -> Function {
-    fmha_t_build("fmha_fwd_hd128_mxfp8_pp", true)
+    fmha_t_build("fmha_fwd_hd128_mxfp8_pp", true, false)
 }
 
-fn fmha_t_build(name: &str, pp: bool) -> Function {
+/// Vendor-style softmax variant (Schraudolph exp2 through `v_cvt_pknorm_u16_f32`, see `emit_fmha_sv_role`).
+pub fn fmha_fwd_hd128_mxfp8_sv() -> Function {
+    fmha_t_build("fmha_fwd_hd128_mxfp8_sv", false, true)
+}
+
+fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let mut b = FnBuilder::new(name, 512);
     let nbuf = if fmha_t_opt("dbuf") { 2 } else { 1 };
     if pp {
@@ -7843,12 +8134,16 @@ fn fmha_t_build(name: &str, pp: bool) -> Function {
     b.begin_if(is_a);
     if pp {
         emit_fmha_pp_role(&mut b, &cx, true);
+    } else if sv {
+        emit_fmha_sv_role(&mut b, &cx, true);
     } else {
         emit_fmha_t_role(&mut b, &cx, true);
     }
     b.else_();
     if pp {
         emit_fmha_pp_role(&mut b, &cx, false);
+    } else if sv {
+        emit_fmha_sv_role(&mut b, &cx, false);
     } else {
         emit_fmha_t_role(&mut b, &cx, false);
     }

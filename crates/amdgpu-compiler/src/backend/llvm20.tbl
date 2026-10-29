@@ -62,6 +62,7 @@ VWriteSub   | V2 <- V1 | {dsub} = V_MOV_B32_e32 {s0}, implicit $exec
 VReadSub    | V1 <- V2 | {d} = V_MOV_B32_e32 {s0sub}, implicit $exec
 VMfma16x16x16F16 | V4 <- V2 V2 V4 | {d} = V_MFMA_F32_16X16X16F16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x8F16 | V16 <- V2 V2 V16 | {d} = V_MFMA_F32_32X32X8F16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x8F16Z | V16 <- V2 V2 | {d} = V_MFMA_F32_32X32X8F16_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
 VMfma16x16x32Fp8 | V4 <- V2 V2 V4 | {d} = V_MFMA_F32_16X16X32_FP8_FP8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x16Fp8 | V16 <- V2 V2 V16 | {d} = V_MFMA_F32_32X32X16_FP8_FP8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfmaScale32x32x64Fp8 | V16 <- V8 V8 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, {s3}, {s4}, 0, 0, implicit $mode, implicit $exec

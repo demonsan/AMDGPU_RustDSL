@@ -92,6 +92,8 @@ pub enum MOp {
     VReadSub,
     VMfma16x16x16F16,
     VMfma32x32x8F16,
+    /// 32x32x8 f16 MFMA with an inline-zero accumulator: D = A x B (srcs: a, b).
+    VMfma32x32x8F16Z,
     VMfma16x16x32Fp8,
     VMfma32x32x16Fp8,
     VMfmaScale32x32x64Fp8,
@@ -402,6 +404,13 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                             _ => errs.push(format!(
                                 "block {bi} inst {ii}: fp8 mfma operand {k} is not a register"
                             )),
+                        }
+                    }
+                }
+                MOp::VMfma32x32x8F16Z => {
+                    if let Some(d) = inst.dst {
+                        if m.vreg_class(d) != RClass::V16 {
+                            errs.push(format!("block {bi} inst {ii}: f16 mfma dst must be V16"));
                         }
                     }
                 }

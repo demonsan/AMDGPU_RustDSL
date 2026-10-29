@@ -33,7 +33,7 @@ fn is_transcendental(op: MOp) -> bool {
 fn mfma_latency(op: MOp) -> Option<usize> {
     match op {
         MOp::VMfma16x16x16F16 => Some(12),
-        MOp::VMfma32x32x8F16 => Some(12),
+        MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z => Some(12),
         MOp::VMfma16x16x32Fp8 => Some(12),
         MOp::VMfma32x32x16Fp8 => Some(12),
         MOp::VMfmaScale32x32x64Fp8 | MOp::VMfmaScale32x32x64Fp8Z => Some(20),
@@ -86,7 +86,7 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
 }
 
 fn reads_valu_hazard_operands(op: MOp) -> bool {
-    is_scaled_mfma(op) || matches!(op, MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
+    is_scaled_mfma(op) || matches!(op, MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
 }
 
 /// Instructions the scanner must never look past (waits, barriers, nops).
@@ -118,7 +118,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         let mut vw: HashMap<VReg, usize> = HashMap::new();
         // strict: v_pk_add/mul_f32 result -> v_exp/v_rcp needs one wait state (LLVM oracle).
         let mut pkw: HashMap<VReg, usize> = HashMap::new();
-        // strict: VALU write of vcc -> VALU read of vcc needs 2 wait states (LLVM oracle: _cmp -> v_cndmask, _add_co -> v_addc).
+        // strict: VALU write of vcc -> VALU read of vcc needs 2 wait states (LLVM oracle: _cmp -> v_cndmask, _add_co -> v_addc).
         let vccw = std::cell::Cell::new(0usize);
         let mut cycle = 0usize;
 
@@ -390,7 +390,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 // Only the accumulator (SrcC) is a WAR hazard: the LLVM tail inserts nothing for a VALU
                 // write to SrcA/SrcB/scale registers right after the MFMA (docs/scheduling.md).
                 let mut srcs = Vec::new();
-                if inst.op != MOp::VMfmaScale32x32x64Fp8Z {
+                if !matches!(inst.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x8F16Z) {
                     if let Some(Src::Reg(r)) = inst.srcs.get(2) {
                         if m.vreg_class(*r).is_vector() {
                             srcs.push(rng(m, *r));

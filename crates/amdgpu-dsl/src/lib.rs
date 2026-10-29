@@ -236,6 +236,9 @@ pub enum Op {
     CvtPkFp8x4F32(Opnd, Opnd, Opnd, Opnd),
     /// max(x, x of lane l ^ 32) via `v_permlane32_swap_b32` (every lane gets the max of the two halves).
     PartnerMaxF32(Opnd),
+    /// Schraudolph exp2 pack: `v_cvt_pknorm_u16_f32` of (a,b) and (c,d), each u16 pair reinterpreted as bf16 and packed to E4M3
+    /// (a,b low half, c,d high half) with `v_cvt_scalef32_pk_fp8_bf16` (scale operand last).
+    CvtPknormP8x4(Opnd, Opnd, Opnd, Opnd, Opnd),
 }
 
 impl Op {
@@ -270,6 +273,7 @@ impl Op {
             Op::Frag16Pair { .. } | Op::Frag2Dup(..) | Op::PkAddF32(..) | Op::PkMulF32(..) => DType::Frag2,
             Op::CvtPkFp8x4F32(..) => DType::U32,
             Op::PartnerMaxF32(..) => DType::F32,
+            Op::CvtPknormP8x4(..) => DType::U32,
             Op::BitcastF32(..) => DType::F32,
             Op::BitcastI32(..) => DType::I32,
             Op::LoadLdsB32 { .. } => DType::U32,
@@ -327,6 +331,7 @@ impl Op {
             Op::Frag2Dup(a) | Op::PartnerMaxF32(a) => vec![*a],
             Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => vec![*a, *b],
             Op::CvtPkFp8x4F32(a, b, c, d) => vec![*a, *b, *c, *d],
+            Op::CvtPknormP8x4(a, b, c, d, e) => vec![*a, *b, *c, *d, *e],
             Op::FragZero { .. } => vec![],
             Op::BitcastF32(a) | Op::BitcastI32(a) => vec![*a],
             Op::LoadLdsB32 { addr } => vec![*addr],
@@ -361,6 +366,10 @@ pub enum Stmt {
     VarScaleF32 { var: VarId, scalar: Opnd },
     /// Multiply all sixteen dwords of a Frag16 loop variable by the (duplicated) scalar held in a Frag2, in place, with _pk_mul_f32.
     VarScalePk { var: VarId, pair: Opnd },
+    /// Add the (duplicated) scalar held in a `Frag2` to all sixteen dwords of a `Frag16` loop variable, in place (`v_pk_add_f32`).
+    VarAddPk { var: VarId, pair: Opnd },
+    /// `var = mfma_f32_32x32x8_f16(a, b)` with a zero accumulator (a, b are `Frag2`).
+    VarMfmaF16Z { var: VarId, a: Opnd, b: Opnd },
     /// Multiply one dword of a `Frag16` loop variable by an f32 scalar, in place.
     VarScaleLane { var: VarId, index: u8, scalar: Opnd },
     /// 16-byte global load written straight into a `Frag4` loop variable.
@@ -454,6 +463,12 @@ impl Function {
                 }
                 Stmt::VarScaleLane { var, index, scalar } => {
                     let _ = writeln!(s, "{pad}var{}[{index}] *= {scalar:?}", var.0);
+                }
+                Stmt::VarAddPk { var, pair } => {
+                    let _ = writeln!(s, "{pad}var{} +=pk {pair:?}", var.0);
+                }
+                Stmt::VarMfmaF16Z { var, a, b } => {
+                    let _ = writeln!(s, "{pad}var{} = mfma_f16({a:?}, {b:?})", var.0);
                 }
                 Stmt::VarScalePk { var, pair } => {
                     let _ = writeln!(s, "{pad}var{} *=pk {pair:?}", var.0);
@@ -904,6 +919,15 @@ impl FnBuilder {
     }
     pub fn var_scale_lane(&mut self, var: VarId, index: u8, scalar: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::VarScaleLane { var, index, scalar: scalar.into() });
+    }
+    pub fn cvt_pknorm_p8x4(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>, scale: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::CvtPknormP8x4(a.into(), b.into(), c.into(), d.into(), scale.into()))
+    }
+    pub fn var_add_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::VarAddPk { var, pair: pair.into() });
+    }
+    pub fn var_mfma_f16_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::VarMfmaF16Z { var, a: a.into(), b: b.into() });
     }
     pub fn var_scale_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::VarScalePk { var, pair: pair.into() });
@@ -1431,6 +1455,11 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
             }
             Stmt::VarScaleLane { var, .. } => {
+                if f.var_ty(*var) != Some(DType::Frag16) {
+                    errs.push(here(format!("var{var} must be a frag16")));
+                }
+            }
+            Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. } => {
                 if f.var_ty(*var) != Some(DType::Frag16) {
                     errs.push(here(format!("var{var} must be a frag16")));
                 }

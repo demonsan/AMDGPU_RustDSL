@@ -608,6 +608,21 @@ impl Lowerer {
                     let a = self.sub_alias(v, *index, RClass::V1);
                     self.push(MInst::new(MOp::VMulF32).def(a).srcreg(a).srcreg(s));
                 }
+                Stmt::VarAddPk { var, pair } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let p = self.as_v2(*pair)?;
+                    self.touch(&[Src::Reg(v), Src::Reg(p)]);
+                    for i in 0..8u8 {
+                        let a = self.sub_alias(v, 2 * i, RClass::V2);
+                        self.push(MInst::new(MOp::VPkAddF32).def(a).srcreg(a).srcreg(p));
+                    }
+                }
+                Stmt::VarMfmaF16Z { var, a, b } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let ra = self.as_v2(*a)?;
+                    let rb = self.as_v2(*b)?;
+                    self.push(MInst::new(MOp::VMfma32x32x8F16Z).def(v).srcreg(ra).srcreg(rb));
+                }
                 Stmt::VarScalePk { var, pair } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let p = self.as_v2(*pair)?;
@@ -1369,6 +1384,23 @@ impl Lowerer {
                 let d1 = self.sub_alias(d, 1, RClass::V1);
                 self.push(MInst::new(MOp::VMovB32).def(d0).srcreg(ra));
                 self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
+                self.val.insert(dst, d);
+            }
+            Op::CvtPknormP8x4(a, b, c, e, sc) => {
+                let ra = self.as_v1(*a)?;
+                let rb = self.as_v1(*b)?;
+                let rc = self.as_v1(*c)?;
+                let re = self.as_v1(*e)?;
+                let rs = self.as_v1(*sc)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rb), Src::Reg(rc), Src::Reg(re), Src::Reg(rs)]);
+                let u0 = self.new_vreg(RClass::V1);
+                let u1 = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VCvtPknormU16).def(u0).srcreg(ra).srcreg(rb));
+                self.push(MInst::new(MOp::VCvtPknormU16).def(u1).srcreg(rc).srcreg(re));
+                let d = self.new_vreg(RClass::V1);
+                // low-half form writes bits 0..15; the high-half form keeps them
+                self.push(MInst::new(MOp::VCvtPkFp8Lo).def(d).srcreg(u0).srcreg(rs));
+                self.push(MInst::new(MOp::VCvtPkFp8Hi).def(d).srcreg(u1).srcreg(rs).srcreg(d));
                 self.val.insert(dst, d);
             }
             Op::PartnerMaxF32(a) => {
