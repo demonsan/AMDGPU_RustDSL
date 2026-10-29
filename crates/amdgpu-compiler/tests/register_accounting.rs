@@ -28,7 +28,9 @@
 //!
 //! A negative result here is not hypothetical: the SGPR under-declaration found on this branch
 //! (a loop after allocation overwrote `max_s` with "last still-live slot + 1") is exactly what check
-//! (1) reports. See `docs/verification.md`.
+//! (1) reports. See `docs/verification.md`. This test supersedes the duplicate
+//! `tests/reg_declaration.rs` (same descriptor coverage plus MFMA tuple shape, defined-before-use, the
+//! `probe_dma*` kernels and a mutation self-test).
 
 use std::collections::HashSet;
 
