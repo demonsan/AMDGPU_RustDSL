@@ -8651,8 +8651,8 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let kv_last = b.add_i32(kv_len, cm1k);
     let g4 = b.shl_i32(pblk, c2);
     let wave4 = b.let_(Op::AndI32(Opnd::Val(wave), Opnd::Val(c3)));
-    let kfx: Vec<ValueId> = Vec::new();
-    let trx: Vec<ValueId> = Vec::new();
+    let mut kfx: Vec<ValueId> = Vec::new();
+    let mut trx: Vec<ValueId> = Vec::new();
     if false {
         let j_s1 = b.let_(Op::LshrI32(Opnd::Val(j), Opnd::Val(c1)));
         let f_k0 = b.let_(Op::AndI32(Opnd::Val(j_s1), Opnd::Val(c7)));
