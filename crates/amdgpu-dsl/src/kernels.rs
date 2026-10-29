@@ -8172,6 +8172,14 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     } else {
         (cx.v_seqs, cx.vbase_off, cx.ptr_v, cx.lds_v)
     };
+    // experiment (kh0): every head reads head 0's K/V (separates the DMA machinery from the head-1 address computation)
+    let base_off = if fmha_t_opt("kh0") {
+        b.c_i32(0)
+    } else if let Some(n) = fmha_t_num("kho") {
+        b.c_i32(n as i32)
+    } else {
+        base_off
+    };
     // staging address of this thread's 64-byte half row: the plain row-major layout, or (DMA layout read through the old ds_write path, a debugging aid) the 1040-byte run layout
     let sdst = if fmha_t_opt("dma") {
         let c7s = b.c_i32(7);
@@ -8676,6 +8684,33 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.break_if(Opnd::Val(stop));
     b.end_loop();
 
+    if fmha_t_opt("dbgret") {
+        if fmha_t_opt("dbgwait") {
+            b.wait_vm(0);
+            b.wait_lds(0);
+        }
+        if fmha_t_opt("dbgst") {
+            // minimal global store (zero) into this lane's output row, like the epilogue does
+            let ob0 = b.mul_i32(cx.bidx, cx.o_bs);
+            let ob1 = b.mul_i32(cx.hidx, cx.o_hs);
+            let orow = b.mul_i32(cx.row, cx.o_seqs);
+            let ob2 = b.add_i32(ob0, ob1);
+            let ob3 = b.add_i32(ob2, orow);
+            let ob4 = b.add_i32(ob3, cx.g_bytes8);
+            let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
+            let zf = b.c_f32(0.0);
+            b.store_f32(o_ptr0, 0, zf);
+        }
+        return;
+    }
+    if fmha_t_opt("dbgload") {
+        let kaddr0h = b.add_i32(cx.kf_base, c32v);
+        let kd0 = b.load_lds_b128x2(Opnd::Val(cx.kf_base), Opnd::Val(kaddr0h));
+        let w = b.frag16_lane(kd0, 0);
+        let f = b.bitcast_f32(w);
+        let fi = b.bitcast_i32(f);
+        b.store_lds_b32(Opnd::Val(cx.ex_own), Opnd::Val(fi));
+    }
     if fmha_t_opt("dbgk") {
         // debug: dump the first 64 bytes of this lane's K row (as read from LDS buffer 0 with the kernel's fragment addressing)
         // into the output instead of the result (use with a single KV tile, SK <= 128)
@@ -9170,7 +9205,11 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
 // ---------------------------------------------------------------------------------------------
 
 fn sched_begin(name: &str) -> (FnBuilder, ValueId, ValueId, ValueId) {
-    let mut b = FnBuilder::new(name, 512);
+    // Build-time workgroup-size override for occupancy experiments (SCHED_WG=1024 launches a
+    // 16-wave block = 4 waves/SIMD on one CU). The descriptor's `.max_flat_workgroup_size` must
+    // cover the launched block size or the dispatch fails, so it has to be set at build time.
+    let wg = std::env::var("SCHED_WG").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(512);
+    let mut b = FnBuilder::new(name, wg);
     b.lds(16384);
     b.arg("o", DType::Ptr, 0, 8);
     b.arg("count", DType::I32, 8, 4);
@@ -9382,6 +9421,79 @@ pub fn sched_diamond() -> Function {
     for k in 0..8 {
         let x = b.bitcast_f32(vars[2 + k]);
         b.store_f32(row, 4 + 4 * k as u32, x);
+    }
+    b.finish()
+}
+/// Occupancy proxy: one loop iteration is shape-wise like one FMHA substep -- a dependent QK
+/// MFMA chain, a softmax-like exp/serial-add VALU chain over the score lanes, an fp8
+/// quantisation, then a PV MFMA into a loop-carried O accumulator -- followed by one block-wide
+/// barrier like the FMHA loop's tile hand-off. The block size (and therefore the number of waves
+/// per SIMD on one CU) is a build-time choice (SCHED_WG=256/512/1024 -> 1/2/4 waves/SIMD), so the
+/// same instruction stream can be timed at 2 vs 4 waves/SIMD. Used to decide whether a
+/// <=128-VGPR split of the FMHA kernel could hide the dependency stalls measured in
+/// docs/status.md (round 45 columns); see docs/scheduling.md.
+pub fn sched_occ_chain() -> Function {
+    let (mut b, o, n, tid) = sched_begin("sched_occ_chain");
+    let c0 = b.c_i32(0);
+    let c64 = b.c_i32(64);
+    let c127 = b.c_i32(127);
+    let c123 = b.c_i32(123);
+    let ones = b.c_i32(0x38383838_u32 as i32);
+    let f4 = b.frag4(ones, ones, ones, ones);
+    let a8 = b.cat_frag8(f4, f4);
+    let twos = b.c_i32(0x40404040_u32 as i32);
+    let f4b = b.frag4(twos, twos, twos, twos);
+    let b8 = b.cat_frag8(f4b, f4b);
+    let m = b.c_f32(1.5);
+    let zf = b.c_f32(0.0);
+    let zi = b.bitcast_i32(zf);
+    let zero = b.frag_zero(DType::Frag16);
+    let vars = b.begin_loop(&[
+        (DType::I32, Opnd::Val(c0)),
+        (DType::Frag16, Opnd::Val(zero)),
+        (DType::I32, Opnd::Val(zi)),
+    ]);
+    // two 32x32 score tiles, each accumulated over two chained MFMAs (like the QK chain)
+    let zero_s = b.frag_zero(DType::Frag16);
+    let s0 = b.mfma_scale_fp8(a8, b8, zero_s, c127, c127);
+    let s0 = b.mfma_scale_fp8(a8, b8, s0, c127, c127);
+    let s1 = b.mfma_scale_fp8(b8, a8, zero_s, c127, c127);
+    let s1 = b.mfma_scale_fp8(b8, a8, s1, c127, c127);
+    // softmax-like chain: exp2 of every score lane, serial row-sum adds, fp8 quantisation
+    let mut sum = b.bitcast_f32(vars[2]);
+    let mut words: Vec<ValueId> = Vec::with_capacity(8);
+    for s in [s0, s1] {
+        let mut exps: Vec<ValueId> = Vec::with_capacity(16);
+        for r in 0..16u8 {
+            let l = b.frag16_lane(s, r);
+            let v = b.bitcast_f32(l);
+            let d = b.sub_f32(v, m);
+            let e = b.exp2_f32(d);
+            sum = b.add_f32(sum, e);
+            exps.push(e);
+        }
+        for q in 0..4usize {
+            words.push(b.cvt_pk_fp8x4_f32(exps[4 * q], exps[4 * q + 1], exps[4 * q + 2], exps[4 * q + 3]));
+        }
+    }
+    let p8 = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    // PV-like: the loop-carried O accumulator gets one MFMA on the quantised P
+    b.var_mfma_scale(vars[1], a8, p8, c127, c123);
+    let si = b.bitcast_i32(sum);
+    b.set_var(vars[2], si);
+    // tile hand-off between the wave groups of one block
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    sched_end_loop(&mut b, vars[0], n);
+    let off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, off);
+    let fin = b.bitcast_f32(vars[2]);
+    b.store_f32(row, 0, fin);
+    for i in 0..16u8 {
+        let l = b.frag16_lane(vars[1], i);
+        let x = b.bitcast_f32(l);
+        b.store_f32(row, 4 + 4 * i as u32, x);
     }
     b.finish()
 }
