@@ -1010,7 +1010,8 @@ pub fn probe_dma_tile() -> Function {
     let rowb = b.add_i32(lane_hi, w8);
     let cbytes = b.mul_i32(lane_lo, c16);
     let w1024 = b.shl_i32(wave, c10);
-    for q in 0..4i32 {
+    let order: Vec<i32> = if std::env::var("PD_REV").is_ok() { vec![3, 2, 1, 0] } else { vec![0, 1, 2, 3] };
+    for q in order {
         let cq = b.c_i32(32 * q);
         let row = b.add_i32(rowb, cq);
         let r128 = b.mul_i32(row, c128);
