@@ -228,6 +228,10 @@ fn main() -> ExitCode {
                 } else if let Some(b) = args[i].strip_prefix("--backend=") {
                     backend_name = b.to_string();
                     i += 1;
+                } else if args[i] == "--scalarize" {
+                    let cur = env::var("AMDC_LOWER_OPTS").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "dce,cmpfold".to_string());
+                    env::set_var("AMDC_LOWER_OPTS", format!("{cur},scalarize"));
+                    i += 1;
                 } else if args[i] == "--sched=ld" {
                     env::set_var("AMDC_SCHED", "ld");
                     i += 1;

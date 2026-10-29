@@ -123,6 +123,14 @@ fn lowering_opts_keep_side_effects_and_definedness() {
         let f = kernel_by_name(k).unwrap();
         let none = with_opts(&["none"], || lower::lower(&f)).unwrap();
         let dflt = with_opts(&["dce", "cmpfold"], || lower::lower(&f)).unwrap();
+        let scal = with_opts(&["dce", "cmpfold", "scalarize"], || lower::lower(&f)).unwrap();
+        if side_effect_signature(&none) != side_effect_signature(&scal) {
+            bad.push(format!("{k}: side-effect/terminator sequence differs between none and dce,cmpfold,scalarize"));
+        }
+        let us = undefined_reads(&scal);
+        if us.len() > undefined_reads(&none).len() {
+            bad.push(format!("{k}: scalarize introduced undefined reads: {:?}", &us[..us.len().min(3)]));
+        }
         if side_effect_signature(&none) != side_effect_signature(&dflt) {
             bad.push(format!("{k}: side-effect/terminator sequence differs between none and dce,cmpfold"));
         }
@@ -236,7 +244,7 @@ fn register_assignment_never_clobbers_a_live_value() {
     let mut bad = Vec::new();
     for k in kernel_names() {
         let f = kernel_by_name(k).unwrap();
-        for opts in [&["none"][..], &["dce", "cmpfold"][..]] {
+        for opts in [&["none"][..], &["dce", "cmpfold"][..], &["dce", "cmpfold", "scalarize"][..]] {
             let r = with_opts(opts, || compile_mir_alloc(&f));
             let (m, a) = match r {
                 Ok(x) => x,
