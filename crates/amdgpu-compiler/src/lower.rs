@@ -247,6 +247,9 @@ impl Lowerer {
         if opt_on("dce") {
             dce_full(&mut self.mir, false);
         }
+        if opt_on("sink") {
+            sink_defs(&mut self.mir);
+        }
         // rematerialise loop-invariant constants next to their loop uses (register pressure; `remat1/2/3` = at most 1/2/any
         // number of loop blocks using the constant)
         for (name, k) in [("remat1", 1usize), ("remat2", 2), ("remat3", usize::MAX)] {
@@ -2456,6 +2459,117 @@ fn remat_consts(m: &mut MFunction, max_blocks: usize) {
                 }
             }
             b.insts.insert(first, MInst::new(MOp::VMovB32).def(nr).imm(k));
+        }
+    }
+}
+/// Sink definitions of pure single-definition V1 values down to their first use (same block) or, along a chain of
+/// unconditional single-predecessor edges, into the last block of the chain that still dominates every use (never into a
+/// loop). Shortens live ranges across the prologue peak: values computed early but only needed after it stop occupying a
+/// VGPR in between. Sources are single-definition registers, so moving the definition later cannot change its value.
+fn sink_defs(m: &mut MFunction) {
+    fn pure(op: MOp) -> bool {
+        matches!(
+            op,
+            MOp::VMovB32 | MOp::VMovFromS | MOp::VAddU32 | MOp::VMulLoU32 | MOp::VAndB32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32
+        )
+    }
+    let nb = m.blocks.len();
+    let succs = crate::sched::liveness::successors(m);
+    let mut preds = vec![0usize; nb];
+    for s in &succs {
+        for &x in s {
+            preds[x] += 1;
+        }
+    }
+    let idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    // definitions and uses
+    let mut ndefs: HashMap<VReg, u32> = HashMap::new();
+    let mut use_blocks: HashMap<VReg, Vec<usize>> = HashMap::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for inst in &b.insts {
+            if let Some(d) = inst.dst {
+                *ndefs.entry(d).or_insert(0) += 1;
+            }
+            for r in inst.uses() {
+                let e = use_blocks.entry(r).or_default();
+                if e.last() != Some(&bi) {
+                    e.push(bi);
+                }
+            }
+        }
+    }
+    let alias = m.alias.clone();
+    let single = |r: &VReg| ndefs.get(r).copied().unwrap_or(0) == 1 && !alias.contains_key(r);
+    for bi in 0..nb {
+        // the unconditional chain starting at bi
+        let mut chain = vec![bi];
+        loop {
+            let last = *chain.last().unwrap();
+            match &m.blocks[last].term {
+                Term::Goto(t) => match idx.get(t) {
+                    Some(&n) if preds[n] == 1 && !chain.contains(&n) => chain.push(n),
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        let mut i = m.blocks[bi].insts.len();
+        while i > 0 {
+            i -= 1;
+            let inst = m.blocks[bi].insts[i].clone();
+            let Some(d) = inst.dst else { continue };
+            if !pure(inst.op) || m.vreg_class(d) != RClass::V1 || !single(&d) {
+                continue;
+            }
+            if !inst.srcs.iter().all(|s| match s {
+                Src::Imm(_) => true,
+                Src::Reg(r) => single(r),
+            }) {
+                continue;
+            }
+            let ubs = match use_blocks.get(&d) {
+                Some(u) if !u.is_empty() => u.clone(),
+                _ => continue,
+            };
+            // all uses in this block: sink to just before the first use
+            if ubs.iter().all(|&u| u == bi) {
+                let first = (i + 1..m.blocks[bi].insts.len()).find(|&k| m.blocks[bi].insts[k].uses().contains(&d));
+                if let Some(k) = first {
+                    if k > i + 1 {
+                        let x = m.blocks[bi].insts.remove(i);
+                        m.blocks[bi].insts.insert(k - 1, x);
+                    }
+                }
+                continue;
+            }
+            if ubs.contains(&bi) {
+                continue;
+            }
+            // furthest chain block such that every use is in it or beyond the chain
+            let mut target = 0usize;
+            for (ci, &cb) in chain.iter().enumerate().skip(1) {
+                // uses inside chain blocks before cb would not be dominated by the new position
+                if ubs.iter().any(|u| chain[..ci].contains(u)) {
+                    break;
+                }
+                target = ci;
+                let _ = cb;
+            }
+            if target == 0 {
+                continue;
+            }
+            let tb = chain[target];
+            // never into a loop block
+            if m.loops.iter().any(|(h, l)| {
+                let (hi, li) = (idx.get(h).copied().unwrap_or(usize::MAX), idx.get(l).copied().unwrap_or(0));
+                tb >= hi.min(li) && tb <= hi.max(li)
+            }) {
+                continue;
+            }
+            let x = m.blocks[bi].insts.remove(i);
+            // before the first use if the use is in tb, else at the end of tb (before nothing: terminators are not instructions)
+            let pos = m.blocks[tb].insts.iter().position(|y| y.uses().contains(&d)).unwrap_or(m.blocks[tb].insts.len());
+            m.blocks[tb].insts.insert(pos, x);
         }
     }
 }
