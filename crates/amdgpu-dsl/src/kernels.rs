@@ -7132,7 +7132,11 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// in a two-deep LDS ring (K(t+1) is written by role A in the third phase of iteration t, V(t+1)
 /// by role B in the fourth), so the loop needs four barriers per 128-key tile and no others.
 fn emit_fmha_pp_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
-    let no_exp = std::env::var("FMHA_ABLATE").unwrap_or_default().contains("noexp");
+    let ablate = std::env::var("FMHA_ABLATE").unwrap_or_default();
+    let no_exp = ablate.contains("noexp");
+    let no_pv = ablate.contains("nopv");
+    let no_bar = ablate.contains("nobar");
+    let no_stage = ablate.contains("nostage");
     let c0 = b.c_i32(0);
     let c1 = b.c_i32(1);
     let c7 = b.c_i32(7);
@@ -7275,7 +7279,7 @@ fn emit_fmha_pp_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let kd_a3 = kd_load(b, key0, 3);
     let kd_b0 = kd_load(b, key_t1, 0);
     let kd_b1 = kd_load(b, key_t1, 1);
-    let pre = stage_loads(b, key_next);
+    let pre = if no_stage { first.clone() } else { stage_loads(b, key_next) };
 
     // ---- VALU phase: softmax of the scores in `s_vars` (64 keys, hh selects the key offset) ----
     let softmax = |b: &mut FnBuilder, masked: bool, hh: usize| -> ValueId {
@@ -7433,6 +7437,9 @@ fn emit_fmha_pp_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32);
                 addrs.push(b.add_i32(tr_cur, off));
             }
+            if no_pv {
+                continue;
+            }
             let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
             b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
         }
@@ -7455,7 +7462,9 @@ fn emit_fmha_pp_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.set_prio(if hi { 1 } else { 0 });
         }
         b.wait_lds(0);
-        b.barrier();
+        if !no_bar {
+            b.barrier();
+        }
     };
     let four_phases = |b: &mut FnBuilder, masked: bool| {
         // P1: V(2t)
@@ -7466,13 +7475,13 @@ fn emit_fmha_pp_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         phase_end(b, false);
         // P3: V(2t+1), then role A publishes K(t+1)
         let pb = softmax(b, masked, 1);
-        if role_a {
+        if role_a && !no_stage {
             stage_stores(b, sdst_n, &pre);
         }
         phase_end(b, true);
         // P4: M(2t+2): PV(P_b, V(t) rows 64..127) + QK(2t+2) (tile t+1, tiles 0,1); role B publishes V(t+1)
         mfma_phase(b, pb, 1, kf_nxt, 0, [kd_b0, kd_b1]);
-        if !role_a {
+        if !role_a && !no_stage {
             stage_stores(b, sdst_n, &pre);
         }
         phase_end(b, false);
