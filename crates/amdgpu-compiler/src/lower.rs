@@ -43,6 +43,8 @@ struct Lowerer {
     pending_lds: Vec<VReg>,
     break_stack: Vec<(u32, u32)>,
     if_stack: Vec<(u32, u32)>,
+    /// Pending-load sets at if entry (vmem, smem, lds) and whether the then-branch changed them.
+    if_snaps: Vec<((Vec<VReg>, Vec<VReg>, Vec<VReg>), bool)>,
     cur: usize,
     next_label: u32,
     defs: HashMap<ValueId, Op>,
@@ -125,6 +127,7 @@ impl Lowerer {
             pending_lds: Vec::new(),
             break_stack: Vec::new(),
             if_stack: Vec::new(),
+            if_snaps: Vec::new(),
             cur: 0,
             next_label: 1,
             defs,
@@ -682,10 +685,13 @@ impl Lowerer {
                     self.start_block(exit);
                 }
                 Stmt::BeginIf { cond } => {
-                    self.flush_pending();
+                    // Outstanding loads stay pending across the if (a prefetch must not be drained at
+                    // every branch): the sets are restored/compared at else/endif, which drain
+                    // conservatively whenever a branch changed them.
                     self.scope_snaps.push((self.consts.clone(), self.converted.clone()));
                     let (on, srcs) = self.lower_condition(*cond, false)?;
                     self.touch(&srcs);
+                    self.if_snaps.push(((self.pending_vmem.clone(), self.pending_smem.clone(), self.pending_lds.clone()), false));
                     let then_l = self.fresh_label();
                     let else_l = self.fresh_label();
                     let end_l = self.fresh_label();
@@ -694,7 +700,23 @@ impl Lowerer {
                     self.if_stack.push((else_l, end_l));
                 }
                 Stmt::Else => {
-                    self.flush_pending();
+                    {
+                        let cur = (self.pending_vmem.clone(), self.pending_smem.clone(), self.pending_lds.clone());
+                        let (snap, dirty) = {
+                            let e = self.if_snaps.last_mut().ok_or("else without if")?;
+                            if cur != e.0 {
+                                e.1 = true;
+                            }
+                            (e.0.clone(), e.1)
+                        };
+                        if dirty {
+                            // the then-path drains everything; the else path starts from the entry state
+                            self.flush_pending();
+                        }
+                        self.pending_vmem = snap.0;
+                        self.pending_smem = snap.1;
+                        self.pending_lds = snap.2;
+                    }
                     if let Some((else_l, _)) = self.if_stack.last() {
                         self.else_started.insert(*else_l);
                     }
@@ -727,17 +749,44 @@ impl Lowerer {
                     self.push(MInst::new(MOp::SSetPrio).imm(*prio as i64));
                 }
                 Stmt::EndIf => {
-                    self.flush_pending();
+                    let (snap, dirty_then) = self.if_snaps.pop().ok_or("endif without if")?;
+                    let cur = (self.pending_vmem.clone(), self.pending_smem.clone(), self.pending_lds.clone());
+                    let differs = cur != snap;
                     if let Some((c, v)) = self.scope_snaps.pop() {
                         self.consts = c;
                         self.converted = v;
                     }
                     let (else_l, end_l) = self.if_stack.pop().ok_or("endif without if")?;
-                    self.set_term(Term::Goto(end_l));
-                    if !self.else_started.remove(&else_l) {
-                        // An `if` without `else`: the not-taken edge still needs its target block.
-                        self.start_block(else_l);
+                    if self.else_started.remove(&else_l) {
+                        // current block ends the else branch
+                        if dirty_then || differs {
+                            self.flush_pending();
+                        }
                         self.set_term(Term::Goto(end_l));
+                    } else {
+                        // `if` without `else`: current block ends the then branch; the not-taken edge
+                        // still needs its target block (and the same drain if the then path drained)
+                        if differs {
+                            self.flush_pending();
+                        }
+                        self.set_term(Term::Goto(end_l));
+                        self.start_block(else_l);
+                        if differs {
+                            self.pending_vmem = snap.0.clone();
+                            self.pending_smem = snap.1.clone();
+                            self.pending_lds = snap.2.clone();
+                            self.flush_pending();
+                        }
+                        self.set_term(Term::Goto(end_l));
+                    }
+                    if dirty_then || differs {
+                        self.pending_vmem.clear();
+                        self.pending_smem.clear();
+                        self.pending_lds.clear();
+                    } else {
+                        self.pending_vmem = snap.0;
+                        self.pending_smem = snap.1;
+                        self.pending_lds = snap.2;
                     }
                     self.start_block(end_l);
                 }
