@@ -7807,7 +7807,12 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     } else {
         (cx.kf_base, cx.tr_base, sdst, kdb0, b.add_i32(lds_kd, j4), c0, c0)
     };
-    let cur_buf = if dbuf { b.mul_i32(par, b.c_i32(256 * fmha_t_pitch())) } else { c0 };
+    let cur_buf = if dbuf {
+        let cb = b.c_i32(256 * fmha_t_pitch());
+        b.mul_i32(par, cb)
+    } else {
+        c0
+    };
     let kfb: Vec<ValueId> = if dma { (0..4).map(|k| b.add_i32(cx.kfx[k], cur_buf)).collect() } else { Vec::new() };
     let trb: Vec<ValueId> = if dma { (0..4).map(|e| b.add_i32(cx.trx[e], cur_buf)).collect() } else { Vec::new() };
     let it = vars[0];
