@@ -10838,7 +10838,11 @@ fn vs_active() -> bool {
 }
 /// LDS layout of the vendor-structure kernels (bytes). `_vs`: 3-slot ring (3 x 32768) + the K-scale ring (3 x 512). `_vs128`: 2-slot
 /// ring (2 x 32768), K-scale ring (2 x 512, in a 2048-byte block), ones block (2048), per-wave Q fragments b1/b0 (2 x 16384).
-/// `_vs128` default recipe ("vsx"): two-word f16 bias (exact reference shift), rollback threshold 120/512 (re-align every unit), LUT correction only for sequences\n/// shorter than 9 tiles of 128 keys; `novsx` restores the previous recipe (svcorr everywhere, one-word bias, threshold 135/512).\nfn vs128_vsx() -> bool {\n    !fmha_t_opt("novsx")\n}\n/// 0 = follow FMHA_OPT svcorr, 1 = force the LUT correction on, 2 = force it off (emission-time switch for the short/long sequence code copies)
+/// `_vs128` default recipe ("vsx"): two-word f16 bias (exact reference shift), rollback threshold 120/512 (re-align every unit), LUT correction only
+/// for sequences shorter than 9 tiles of 128 keys; `novsx` restores the previous recipe (svcorr everywhere, one-word bias, threshold 135/512).
+fn vs128_vsx() -> bool {
+    !fmha_t_opt("novsx")
+}/// `_vs128` default recipe ("vsx"): two-word f16 bias (exact reference shift), rollback threshold 120/512 (re-align every unit), LUT correction only for sequences\n/// shorter than 9 tiles of 128 keys; `novsx` restores the previous recipe (svcorr everywhere, one-word bias, threshold 135/512).\nfn vs128_vsx() -> bool {\n    !fmha_t_opt("novsx")\n}\n/// 0 = follow FMHA_OPT svcorr, 1 = force the LUT correction on, 2 = force it off (emission-time switch for the short/long sequence code copies)
 static VS_CORR_FORCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 fn vs_corr() -> bool {
     match VS_CORR_FORCE.load(std::sync::atomic::Ordering::SeqCst) {
