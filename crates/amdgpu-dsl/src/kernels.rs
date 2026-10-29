@@ -9787,7 +9787,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // smfrs: row sums with 4 v_smfmac_f32_16x16x128_fp8_fp8 per 128 keys (2 P halves x 2 complementary index patterns), per-lane A (vendor-spec 4.5.3,
     // hardware verified by kernel-occ): D dword 2 = 16 x the msum result of the lane's own query; the sum is a scalar F32 loop variable
-    let smfv = fmha_t_opt("smfv"); // smfv: the four smfmacs accumulate in place into a Frag4 LOOP VARIABLE (dword 2 = 16 x row sum), no per-unit zero/extract/add
+    let smfv = fmha_t_opt("smfv") || !fmha_t_opt("nosmfv"); // default ON (`nosmfv` restores the ones-MFMA row sums) // smfv: the four smfmacs accumulate in place into a Frag4 LOOP VARIABLE (dword 2 = 16 x row sum), no per-unit zero/extract/add
     let smfrs = smfv || fmha_t_opt("smfrs");
     let c4k = b.c_i32(4);
     let a_rs = {
