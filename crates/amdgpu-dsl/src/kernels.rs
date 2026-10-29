@@ -9216,9 +9216,13 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let z = b.add_f32(y, c2p23);
             let zi = b.bitcast_i32(z);
             let di = b.add_i32(zi, cmagic);
-            let dfl = b.sub_f32(z, c2p23);
-            // the to-fp8 scaled convert DIVIDES by the scale (OCP MX quantisation): scale = 2^+Delta
-            let sc = b.exp2_f32(dfl);
+            // the to-fp8 scaled convert DIVIDES by the scale (OCP MX quantisation): scale = 2^+Delta, built exactly from the exponent
+            // bits (v_exp_f32 of an integer is not guaranteed exact and only the exponent field is used)
+            let c127i = b.c_i32(127);
+            let c23 = b.c_i32(23);
+            let e127 = b.add_i32(di, c127i);
+            let sbits = b.shl_i32(e127, c23);
+            let sc = b.bitcast_f32(sbits);
             let scb = b.add_i32(di, c123);
             (sc, scb)
         } else {
