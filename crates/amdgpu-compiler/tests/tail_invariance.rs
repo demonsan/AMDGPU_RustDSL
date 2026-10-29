@@ -11,6 +11,7 @@
 //! Needs the pinned llc (skips loudly without).
 
 use amdgpu_compiler::backend::{LlvmTail, LlvmTools, OwnTail};
+use amdgpu_compiler::mir::MOp;
 use amdgpu_compiler::{compile_with, export_mir, kernel_by_name, kernel_names};
 
 fn llc_available() -> bool {
