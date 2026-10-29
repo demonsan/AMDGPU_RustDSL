@@ -8855,6 +8855,12 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// separated by `s_barrier`; `s_setprio` is 1 in MFMA phases and 0 in VALU phases. Staging is DMA (global -> LDS): group A
 /// fetches K (and the K scales), group B fetches V, in the VALU phase before the tile is needed.
 fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
+    let ablate = std::env::var("FMHA_ABLATE").unwrap_or_default();
+    let no_bar = ablate.contains("nobar");
+    let no_valu = ablate.contains("novalu");
+    let no_qk = ablate.contains("noqk");
+    let no_pv = ablate.contains("nopv");
+    let no_stage = ablate.contains("nostage");
     let c0 = b.c_i32(0);
     let c1 = b.c_i32(1);
     let c2 = b.c_i32(2);
@@ -8939,6 +8945,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // stage a tile into ring slot `slot_off` (K scales of role A at `kd_slot`) and wait for it
     let stage_start = |b: &mut FnBuilder, key0: ValueId, slot_off: ValueId| -> Option<ValueId> {
+        if no_stage {
+            return None;
+        }
         let kd = if role_a { Some(kd_row_load(b, key0)) } else { None };
         dma_issue(b, key0, slot_off);
         kd
@@ -9009,6 +9018,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 
     // QK of half `hh` (two 32-key tiles) of the tile whose K sits in ring slot `slot` (K scales at `kdslot`): S' = bias + scaled K.Q^T
     let qk = |b: &mut FnBuilder, hh: usize, slot: ValueId, kdslot: ValueId| {
+        if no_qk {
+            return;
+        }
         let kf_b = b.add_i32(cx.kf_base, slot);
         let kd_rd = b.add_i32(kd_cur, kdslot);
         for sl in 0..2usize {
@@ -9033,6 +9045,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // PV of half `hh` (P words in `pw`, V in ring slot `slot`) and its row sums
     let pv = |b: &mut FnBuilder, hh: usize, slot: ValueId| {
+        if no_pv {
+            return;
+        }
         let tr_b = b.add_i32(cx.tr_base, slot);
         // read the P words out of their loop variables first (a frag8 built directly from variables was suspect)
         let pwv: Vec<ValueId> = (0..8usize).map(|k| b.add_i32(Opnd::Var(pw[k]), c0)).collect();
@@ -9052,6 +9067,12 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     // then P = fp8(2^(s - r) x 16) into `pw`
     let valu = |b: &mut FnBuilder, hh: usize, masked: bool, store: bool| -> Vec<ValueId> {
         let mut words_out: Vec<ValueId> = Vec::with_capacity(8);
+        if no_valu {
+            for _ in 0..8 {
+                words_out.push(c0);
+            }
+            return words_out;
+        }
         let mut kb: Vec<ValueId> = Vec::new();
         if masked {
             for sl in 0..2usize {
@@ -9161,6 +9182,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         words_out
     };
     let pv_w = |b: &mut FnBuilder, hh: usize, slot: ValueId, w: &[ValueId]| {
+        if no_pv {
+            return;
+        }
         let tr_b = b.add_i32(cx.tr_base, slot);
         let p8 = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
         b.var_mfma_scale(la, ones8, p8, c127, c123);
@@ -9183,7 +9207,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.begin_if(Opnd::Val(first_pass));
         qk(b, 0, c0, c0);
         b.wait_lds(0);
-        b.barrier();
+        if !no_bar {
+                b.barrier();
+            }
         b.end_if();
         b.begin_if(Opnd::Val(is_tail));
         for pass in 0..2 {
@@ -9198,27 +9224,37 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             stage_end(b, skd, kds_nxt);
             b.set_prio(1);
             b.wait_lds(0);
-            b.barrier();
+            if !no_bar {
+                b.barrier();
+            }
             pv_w(b, 0, slot_cur, &w0);
             qk(b, 1, slot_cur, kds_cur);
             b.set_prio(0);
             b.wait_lds(0);
-            b.barrier();
+            if !no_bar {
+                b.barrier();
+            }
             // unit 1: V; M: PV(hh1) + QK(hh0 of the next tile)
             let w1 = valu(b, 1, masked, false);
             b.set_prio(1);
             b.wait_lds(0);
-            b.barrier();
+            if !no_bar {
+                b.barrier();
+            }
             pv_w(b, 1, slot_cur, &w1);
             qk(b, 0, slot_nxt, kds_nxt);
             b.set_prio(0);
             b.wait_lds(0);
-            b.barrier();
+            if !no_bar {
+                b.barrier();
+            }
         }
         b.end_if();
     } else {
         b.begin_if(Opnd::Val(first_pass));
-        b.barrier();
+        if !no_bar {
+                b.barrier();
+            }
         b.end_if();
         // M(unit 0): PV(hh1 of the previous tile, P from the variables = the previous iteration's value; skipped on the first pass)
         b.set_prio(1);
@@ -9229,7 +9265,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         qk(b, 0, slot_cur, kds_cur);
         b.set_prio(0);
         b.wait_lds(0);
-        b.barrier();
+        if !no_bar {
+                b.barrier();
+            }
         b.begin_if(Opnd::Val(is_tail));
         for pass in 0..2 {
             if pass == 1 {
@@ -9243,18 +9281,24 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             stage_end(b, skd, kds_nxt);
             b.set_prio(1);
             b.wait_lds(0);
-            b.barrier();
+            if !no_bar {
+                b.barrier();
+            }
             // M(unit 1): PV(hh0) + QK(hh1)
             pv_w(b, 0, slot_cur, &w0);
             qk(b, 1, slot_cur, kds_cur);
             b.set_prio(0);
             b.wait_lds(0);
-            b.barrier();
+            if !no_bar {
+                b.barrier();
+            }
             // V(unit 1): its P words wait for the next iteration's M(unit 0) in the variables
             let _ = valu(b, 1, masked, true);
             b.set_prio(1);
             b.wait_lds(0);
-            b.barrier();
+            if !no_bar {
+                b.barrier();
+            }
         }
         b.end_if();
     }    let npar2 = b.xor_i32(par, c1);
