@@ -7264,9 +7264,10 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     }
     let body = |b: &mut FnBuilder, masked_iter: bool| -> ValueId {
     // experiment: independent dummy VALU work in one role only (which role is critical?)
-    if (role_a && fmha_t_opt("dummyA")) || (!role_a && fmha_t_opt("dummyB")) {
+    let dn = if role_a { fmha_t_num("dAn") } else { fmha_t_num("dBn") };
+    if (role_a && fmha_t_opt("dummyA")) || (!role_a && fmha_t_opt("dummyB")) || dn.is_some() {
         let mut x = b.add_i32(it, c1);
-        for _ in 0..192 {
+        for _ in 0..dn.unwrap_or(192) {
             x = b.add_i32(x, c1);
         }
         // keep the chain alive (dead values are removed): a scratch store into the unused exchange slot
@@ -8745,6 +8746,12 @@ fn fmha_t_opt(name: &str) -> bool {
         return false;
     }
     has(name) || (has("dma") && (name == "dbuf" || name == "kdlds"))
+}
+
+/// Numeric FMHA_OPT token `<prefix><N>` (e.g. dBn32), if present.
+fn fmha_t_num(prefix: &str) -> Option<usize> {
+    let v = std::env::var("FMHA_OPT").ok()?;
+    v.split(',').find_map(|x| x.strip_prefix(prefix).and_then(|n| n.parse().ok()))
 }
 
 fn fmha_t_pitch() -> i32 {
