@@ -5,7 +5,7 @@ use amdgpu_compiler::backend::llvm20::{self, SigClass, Table};
 use amdgpu_compiler::backend::{probe, LlvmTail, LlvmTools, TailBackend, ALL_MOPS};
 use amdgpu_compiler::mir::*;
 use amdgpu_compiler::regalloc::Alloc;
-use amdgpu_compiler::{compile, compile_with, kernel_by_name, kernel_names};
+use amdgpu_compiler::{compile, compile_mir_alloc, compile_with, kernel_by_name, kernel_names};
 use std::collections::HashMap;
 
 fn llc_available() -> bool {
