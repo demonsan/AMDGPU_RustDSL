@@ -86,6 +86,8 @@ pub enum MOp {
     VMulLoU32,
     VCmpLtI32,
     VCmpGeI32,
+    /// `v_cmp_gt_i32 vcc, a, b` (a > b): lets a scalar bound sit in src0 for `x < bound` (`sgpr`).
+    VCmpGtI32,
     VCmpNeI32,
     VCmpLtF32,
     VCndmask,
@@ -163,6 +165,7 @@ impl MOp {
                 | MOp::VAddcCoU32
                 | MOp::VCmpLtI32
                 | MOp::VCmpGeI32
+                | MOp::VCmpGtI32
                 | MOp::VCmpNeI32
                 | MOp::VCmpLtF32
         )

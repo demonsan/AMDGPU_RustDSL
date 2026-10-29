@@ -142,7 +142,7 @@ pub fn effects(m: &MFunction, inst: &MInst) -> Effects {
             push_unique(&mut e.reads, VCC);
             push_unique(&mut e.writes, VCC);
         }
-        MOp::VCmpLtI32 | MOp::VCmpGeI32 | MOp::VCmpNeI32 | MOp::VCmpLtF32 => push_unique(&mut e.writes, VCC),
+        MOp::VCmpLtI32 | MOp::VCmpGeI32 | MOp::VCmpGtI32 | MOp::VCmpNeI32 | MOp::VCmpLtF32 => push_unique(&mut e.writes, VCC),
         MOp::VCndmask => push_unique(&mut e.reads, VCC),
         MOp::SAddU32 | MOp::SShlB32 | MOp::SLshrB32 | MOp::SAndB32 | MOp::SXorB32 | MOp::SCmpLtI32 => push_unique(&mut e.writes, SCC),
         MOp::SAddcU32 => {

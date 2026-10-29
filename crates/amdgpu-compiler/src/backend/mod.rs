@@ -205,6 +205,7 @@ pub const ALL_MOPS: &[crate::mir::MOp] = &[
     MOp::VMulLoU32,
     MOp::VCmpLtI32,
     MOp::VCmpGeI32,
+    MOp::VCmpGtI32,
     MOp::VCmpNeI32,
     MOp::VCmpLtF32,
     MOp::VCndmask,

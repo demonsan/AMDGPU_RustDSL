@@ -1356,6 +1356,10 @@ impl Lowerer {
             if let Some(op) = self.defs.get(&v).cloned() {
                 match op {
                     Op::CmpLtI32(a, b) => {
+                        if let Some(srcs) = self.cmp_lt_scalar_bound(a, b)? {
+                            let on = if negate { Pred::Vccz } else { Pred::Vccnz };
+                            return Ok((on, srcs));
+                        }
                         // src0 of the e32 compare may be an SGPR (sgpr option); src1 must be a VGPR
                         let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
                         let ra = match sa {
@@ -1446,6 +1450,17 @@ impl Lowerer {
             Op::AddI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAddU32, *a, *b)?,
             Op::MulI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SMulI32, *a, *b)?,
             Op::ShlI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SShlB32, *a, *b)?,
+            Op::LshrI32(Opnd::Val(a), b) if self.uniform.contains(&dst) && matches!(self.defs.get(a), Some(Op::WorkitemId)) => {
+                // wave id: v_lshr then one v_readfirstlane into an SGPR (the value is the same in every lane of the wave)
+                let k = self.const_bits(*b).ok_or("wave id shift must be constant")?;
+                let tid = self.as_v1(Opnd::Val(*a))?;
+                self.touch(&[Src::Reg(tid)]);
+                let t = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VLshrB32).def(t).src(Src::Imm(k)).srcreg(tid));
+                let s = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(t));
+                self.val.insert(dst, s);
+            }
             Op::LshrI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SLshrB32, *a, *b)?,
             Op::AndI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAndB32, *a, *b)?,
             Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
@@ -2160,6 +2175,43 @@ impl Lowerer {
         (self.mir.vreg_class(r) == RClass::S1).then_some(r)
     }
 
+    /// `x + k < bound` with a wave-uniform bound: `bound - k > x` with the (uniform) adjusted bound in an SGPR (src0 of
+    /// `v_cmp_gt_i32`): no per-lane add of the constant, no v_mov of the bound. Returns the compare's sources.
+    fn cmp_lt_scalar_bound(&mut self, a: Opnd, b: Opnd) -> Result<Option<Vec<Src>>, String> {
+        if !opt_on("sbound") || self.const_bits(a).is_some() {
+            return Ok(None);
+        }
+        // the bound may already have a VGPR copy (`converted`): the scalar original is still the value to use
+        let sb = match b {
+            Opnd::Val(v) => self.val.get(&v).copied().filter(|r| self.mir.vreg_class(*r) == RClass::S1),
+            o => self.sgpr_src(o),
+        };
+        let Some(sb) = sb else { return Ok(None) };
+        let (core, k) = self.split_const(a);
+        if k.abs() >= (1 << 20) {
+            return Ok(None);
+        }
+        // the compare may be re-issued later by `cmpfold`: its sources must be immutable registers (not loop variables)
+        if matches!(core, Opnd::Var(_)) {
+            return Ok(None);
+        }
+        let rx = self.as_v1(core)?;
+        if self.var_backed(rx) {
+            return Ok(None);
+        }
+        self.touch(&[Src::Reg(sb), Src::Reg(rx)]);
+        // a loop variable is a mutable register and `cmpfold` may re-issue this compare later: take a copy in that case
+        let bound = if k == 0 && matches!(b, Opnd::Val(_)) {
+            sb
+        } else {
+            let d = self.new_vreg(RClass::S1);
+            self.push(MInst::new(MOp::SAddU32).def(d).srcreg(sb).src(Src::Imm(-k)));
+            d
+        };
+        self.push(MInst::new(MOp::VCmpGtI32).srcreg(bound).srcreg(rx));
+        Ok(Some(vec![Src::Reg(bound), Src::Reg(rx)]))
+    }
+
     fn bin_v1(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
         if opt_on("shl") && op == MOp::VMulLoU32 {
             for (c, other) in [(b, a), (a, b)] {
@@ -2247,6 +2299,8 @@ impl Lowerer {
                 return Ok(());
             }
         }
+        let scalar_bound = if op == MOp::VCmpLtI32 { self.cmp_lt_scalar_bound(a, b)? } else { None };
+        if scalar_bound.is_none() {
         let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
         let ra = match sa {
             Some(s) => s,
@@ -2255,6 +2309,7 @@ impl Lowerer {
         let rb = self.as_v1(b)?;
         self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
         self.push(MInst::new(op).srcreg(ra).srcreg(rb));
+        }
         let one = self.const_vreg(1);
         let d = self.new_vreg(RClass::V1);
         self.push(MInst::new(MOp::VCndmask).def(d).src(Src::Imm(0)).srcreg(one));
@@ -2383,7 +2438,7 @@ fn fold_select_cmp(m: &mut MFunction) {
                     break;
                 }
                 let c = &b.insts[j];
-                if matches!(c.op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32) && c.dst.is_none() {
+                if matches!(c.op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32 | MOp::VCmpGtI32) && c.dst.is_none() {
                     mat.insert(inst.dst.unwrap(), (c.op, c.srcs.clone(), j));
                 }
                 continue;
@@ -2431,7 +2486,7 @@ fn dce_cmp_pairs(m: &mut MFunction) {
                             }
                             break;
                         }
-                        if matches!(b.insts[j].op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32) && b.insts[j].dst.is_none() {
+                        if matches!(b.insts[j].op, MOp::VCmpLtI32 | MOp::VCmpLtF32 | MOp::VCmpGeI32 | MOp::VCmpGtI32) && b.insts[j].dst.is_none() {
                             dead[i] = true;
                             dead[j] = true;
                         }
@@ -2471,7 +2526,7 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
             MOp::VMovB32 | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VPtrAdd | MOp::VAddU32 | MOp::VAddCoU32 | MOp::VAddcCoU32
                 | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VMax3F32 | MOp::VFmaF32 | MOp::VExpF32
                 | MOp::VRcpF32 | MOp::VAndB32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32 | MOp::VMulLoU32
-                | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VReadPhys | MOp::VCmpLtI32 | MOp::VCmpGeI32
+                | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VReadPhys | MOp::VCmpLtI32 | MOp::VCmpGtI32 | MOp::VCmpGeI32
                 | MOp::VCmpNeI32 | MOp::VCmpLtF32
         )
     };
@@ -2539,6 +2594,8 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
     }
     loop {
         let mut u: HashSet<ValueId> = HashSet::new();
+        let mut wi: HashSet<ValueId> = HashSet::new(); // workitem id values (waveuni)
+        let mut cst: HashMap<ValueId, i64> = HashMap::new();
         let is_u = |o: &Opnd, u: &HashSet<ValueId>, uvars: &HashSet<amdgpu_dsl::VarId>| match o {
             Opnd::I32(_) => true,
             Opnd::Val(v) => u.contains(v),
@@ -2549,8 +2606,20 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
         for st in &f.stmts {
             match st {
                 Stmt::Let { dst, op } => {
+                    if matches!(op, Op::WorkitemId) {
+                        wi.insert(*dst);
+                    }
+                    if let Op::ConstI32(k) = op {
+                        cst.insert(*dst, *k as i64);
+                    }
                     let uni = match op {
                         Op::ConstI32(_) | Op::KernargI32 { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
+                        // waveuni: `workitem_id >> k` (k >= 6) is constant within a 64-lane wave (1-D workgroups)
+                        Op::LshrI32(Opnd::Val(a), b) if wi.contains(a) && opt_on("waveuni") => match b {
+                            Opnd::I32(k) => *k >= 6,
+                            Opnd::Val(v) => cst.get(v).map_or(false, |k| *k >= 6),
+                            _ => false,
+                        },
                         Op::AddI32(a, b) | Op::MulI32(a, b) | Op::ShlI32(a, b) | Op::LshrI32(a, b) | Op::AndI32(a, b) | Op::XorI32(a, b) => {
                             is_u(a, &u, &uvars) && is_u(b, &u, &uvars)
                         }
