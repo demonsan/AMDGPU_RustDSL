@@ -53,6 +53,10 @@ fn ui_cases() {
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         let src = std::fs::read_to_string(f).unwrap();
         let (ok, err) = compile(f);
+        if std::env::var("SAFEASM_SHOW").is_ok() && !ok {
+            let first: Vec<&str> = err.lines().filter(|l| l.starts_with("error") || l.contains("-->") || l.trim_start().starts_with("= note") || l.contains("the evaluated program panicked")).take(4).collect();
+            eprintln!("DIAG {name}: {}", first.join(" | "));
+        }
         if name.starts_with("pass_") {
             if !ok {
                 bad.push(format!("{name}: expected to compile:\n{err}"));
