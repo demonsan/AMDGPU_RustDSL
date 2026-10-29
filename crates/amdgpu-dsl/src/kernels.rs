@@ -8959,15 +8959,6 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.store_lds_b32(Opnd::Val(a), Opnd::Val(kd));
         }
     };
-    // deferred completion: the DMA of tile t+1 (issued one iteration ago) must have landed; this iteration's loads may stay in flight
-    let n_vm: u32 = if role_a { 5 } else { 4 };
-    let stage_wait = |b: &mut FnBuilder, kdslot_n1: ValueId| {
-        b.wait_vm(n_vm);
-        if let Some(kv) = kdp {
-            let a = b.add_i32(kdb0, kdslot_n1);
-            b.store_lds_b32(Opnd::Val(a), Opnd::Var(kv));
-        }
-    };
     let stage = |b: &mut FnBuilder, key0: ValueId, slot_off: ValueId, kd_slot: ValueId| {
         let kd = stage_start(b, key0, slot_off);
         stage_end(b, kd, kd_slot);
@@ -9021,6 +9012,15 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let la = vars[8];
     let idx = vars[9];
     let kdp = if role_a { Some(vars[18]) } else { None };
+    // deferred completion: the DMA of tile t+1 (issued one iteration ago) must have landed; this iteration's loads may stay in flight
+    let n_vm: u8 = if role_a { 5 } else { 4 };
+    let stage_wait = |b: &mut FnBuilder, kdslot_n1: ValueId| {
+        b.wait_vm(n_vm);
+        if let Some(kv) = kdp {
+            let a = b.add_i32(kdb0, kdslot_n1);
+            b.store_lds_b32(Opnd::Val(a), Opnd::Var(kv));
+        }
+    };
     let pw: Vec<_> = (0..8usize).map(|k| vars[10 + k]).collect();
 
     let cbuf = b.c_i32(cbuf_i);
