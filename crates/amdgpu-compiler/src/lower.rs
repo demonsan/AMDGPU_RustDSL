@@ -18,6 +18,8 @@ use crate::mir::*;
 /// arithmetic). Selected with `AMDC_LOWER_OPTS=imm,cmpfold` (`all`, `none`); DEFAULT `dce,cmpfold`.
 ///  * `imm`     - constants become in-line / literal operands (VOP2 src0, shift amounts, cndmask false arm)
 ///                instead of `v_mov` into a register;
+///  * `sgpr`    - scalar (SGPR) values are used directly as VALU source operands instead of a `v_mov` copy;
+///  * `shl`     - multiplication by a power-of-two constant becomes a shift;
 ///  * `saddr`   - global loads whose address is `kernarg_ptr + vector offset` use the scalar-base form (no 64-bit add);
 ///  * `dce`     - dead address / clamp chains (`v_add_co`/`v_addc`, `v_cmp`+`v_cndmask`, pointer adds) are removed;
 ///  * `cmpfold` - `select(cmp(x,y), ..)` re-issues the compare instead of the 0/1 materialisation +
@@ -1593,7 +1595,54 @@ impl Lowerer {
         }
     }
 
+    /// The SGPR a value already lives in (S1 class), if any.
+    fn scalar_reg(&self, o: Opnd) -> Option<VReg> {
+        let Opnd::Val(v) = o else { return None };
+        if self.converted.contains_key(&v) {
+            return None;
+        }
+        let r = *self.val.get(&v)?;
+        (self.mir.vreg_class(r) == RClass::S1).then_some(r)
+    }
+
     fn bin_v1(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
+        if opt_on("shl") && op == MOp::VMulLoU32 {
+            for (c, other) in [(b, a), (a, b)] {
+                if let Some(k) = self.const_bits(c) {
+                    if k > 0 && (k & (k - 1)) == 0 && k < (1 << 31) && self.const_bits(other).is_none() {
+                        let r = self.as_v1(other)?;
+                        self.touch(&[Src::Reg(r)]);
+                        let d = self.new_vreg(RClass::V1);
+                        self.push(MInst::new(MOp::VLshlB32).def(d).src(Src::Imm(k.trailing_zeros() as i64)).srcreg(r));
+                        self.val.insert(dst, d);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if opt_on("sgpr") {
+            let vop3 = op == MOp::VMulLoU32;
+            let commutative = op != MOp::VSubF32;
+            let (sa, sb) = (self.scalar_reg(a), self.scalar_reg(b));
+            let plan = match (sa, sb) {
+                (Some(s), None) if self.const_bits(b).is_none() => Some((s, b, true)),
+                (None, Some(s)) if self.const_bits(a).is_none() && (commutative || vop3) => Some((s, a, false)),
+                _ => None,
+            };
+            if let Some((s, other, scalar_first)) = plan {
+                let r = self.as_v1(other)?;
+                self.touch(&[Src::Reg(r), Src::Reg(s)]);
+                let d = self.new_vreg(RClass::V1);
+                let inst = if scalar_first || !commutative {
+                    MInst::new(op).def(d).srcreg(s).srcreg(r)
+                } else {
+                    MInst::new(op).def(d).srcreg(s).srcreg(r)
+                };
+                self.push(inst);
+                self.val.insert(dst, d);
+                return Ok(());
+            }
+        }
         if opt_on("imm") {
             let (ca, cb) = (self.const_bits(a), self.const_bits(b));
             let commutative = op != MOp::VSubF32;
