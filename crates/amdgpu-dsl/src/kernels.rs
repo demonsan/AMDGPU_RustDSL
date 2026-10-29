@@ -9165,9 +9165,20 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.end_if();
     };
 
-    let first_pass = b.cmp_lt_i32(it, c1);
     let a_body = role_a || fmha_t_opt("vsseq");
-    if a_body {
+    if fmha_t_opt("vsflat") {
+        // sequential order of the sv role with the same phase closures (no pipelining): QK, softmax, PV per 64-key unit
+        qk(b, 0, slot_cur, kds_cur);
+        valu_tail(b, 0);
+        pv(b, 0, slot_cur);
+        qk(b, 1, slot_cur, kds_cur);
+        valu_tail(b, 1);
+        pv(b, 1, slot_cur);
+        stage(b, key_next, slot_nxt, kds_nxt);
+        b.wait_lds(0);
+        b.barrier();
+        b.wait_lds(0);
+    } else    if a_body {
         // first pass: QK of unit 0 (A's peeled prologue), then the barrier that group B's first pass waits at
         b.begin_if(Opnd::Val(first_pass));
         qk(b, 0, c0, c0);
@@ -9240,7 +9251,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let stop = b.let_(Op::NotI1(Opnd::Val(more)));
     b.break_if(Opnd::Val(stop));
     b.end_loop();
-    if !a_body {
+    if !a_body && !fmha_t_opt("vsflat") {
         // group B: PV of the last unit (hh1 of the last tile; its V sits in the slot of the parity before the final flip)
         let lp = b.xor_i32(par, c1);
         let last_off = b.mul_i32(lp, cbuf);
