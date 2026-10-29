@@ -41,6 +41,25 @@ pub fn with_opts<R>(opts: &[&str], f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// The lowering options in effect on this thread (override, environment or default).
+pub fn current_opts() -> Vec<String> {
+    if let Some(v) = OVERRIDE.with(|o| o.borrow().clone()) {
+        return v;
+    }
+    match std::env::var("AMDC_LOWER_OPTS") {
+        Ok(s) if !s.is_empty() => s.split(',').map(|x| x.trim().to_string()).collect(),
+        _ => vec!["dce".to_string(), "cmpfold".to_string()],
+    }
+}
+
+/// `lower` with extra options on top of the current ones (used by the register-pressure retries).
+pub fn lower_with_extra(f: &Function, extra: &[&str]) -> Result<MFunction, String> {
+    let mut v = current_opts();
+    v.extend(extra.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+    with_opts(&refs, || lower(f))
+}
+
 pub fn opt_on(name: &str) -> bool {
     if let Some(v) = OVERRIDE.with(|o| o.borrow().clone()) {
         return v.iter().any(|x| x == name || x == "all");
@@ -227,6 +246,14 @@ impl Lowerer {
         dce_full(&mut self.mir, true);
         if opt_on("dce") {
             dce_full(&mut self.mir, false);
+        }
+        // rematerialise loop-invariant constants next to their loop uses (register pressure; `remat1/2/3` = at most 1/2/any
+        // number of loop blocks using the constant)
+        for (name, k) in [("remat1", 1usize), ("remat2", 2), ("remat3", usize::MAX)] {
+            if opt_on(name) {
+                remat_consts(&mut self.mir, k);
+                break;
+            }
         }
         coalesce(&mut self.mir);
         dce(&mut self.mir);
@@ -2355,6 +2382,80 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
         }
         if !changed {
             return (u, uvars);
+        }
+    }
+}
+/// Rematerialise constants (`v_mov_b32 d, imm`, single definition) that are defined outside a loop and used inside it:
+/// every loop block that uses the constant gets its own `v_mov` right before the first use, so the constant no longer
+/// occupies a VGPR across the whole loop. Costs one VALU per (block, constant) per iteration; `max_blocks` limits the
+/// constants to those used by at most that many loop blocks.
+fn remat_consts(m: &mut MFunction, max_blocks: usize) {
+    let idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut in_loop = vec![false; m.blocks.len()];
+    for (h, l) in &m.loops {
+        if let (Some(&hi), Some(&li)) = (idx.get(h), idx.get(l)) {
+            for b in hi.min(li)..=hi.max(li) {
+                in_loop[b] = true;
+            }
+        }
+    }
+    // single-definition constants
+    let mut defs: HashMap<VReg, (usize, i64, u32)> = HashMap::new(); // vreg -> (def block, imm, #defs)
+    let mut ndefs: HashMap<VReg, u32> = HashMap::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for inst in &b.insts {
+            if let Some(d) = inst.dst {
+                *ndefs.entry(d).or_insert(0) += 1;
+                if inst.op == MOp::VMovB32 && inst.srcs.is_empty() {
+                    defs.insert(d, (bi, inst.imm, 0));
+                }
+            }
+        }
+    }
+    let consts: HashMap<VReg, (usize, i64)> = defs
+        .into_iter()
+        .filter(|(r, (b, _, _))| ndefs.get(r) == Some(&1) && !in_loop[*b] && !m.alias.contains_key(r) && m.vreg_class(*r) == RClass::V1)
+        .map(|(r, (b, k, _))| (r, (b, k)))
+        .collect();
+    // loop blocks using each constant
+    let mut users: HashMap<VReg, Vec<usize>> = HashMap::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        if !in_loop[bi] {
+            continue;
+        }
+        for inst in &b.insts {
+            for s in &inst.srcs {
+                if let Src::Reg(r) = s {
+                    if consts.contains_key(r) {
+                        let e = users.entry(*r).or_default();
+                        if e.last() != Some(&bi) {
+                            e.push(bi);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (c, blocks) in users {
+        if blocks.len() > max_blocks {
+            continue;
+        }
+        let k = consts[&c].1;
+        for bi in blocks {
+            let nr = m.vregs.len() as VReg;
+            m.vregs.push(RClass::V1);
+            let b = &mut m.blocks[bi];
+            let first = b.insts.iter().position(|i| i.srcs.iter().any(|s| matches!(s, Src::Reg(r) if *r == c))).unwrap();
+            for inst in b.insts.iter_mut().skip(first) {
+                for s in inst.srcs.iter_mut() {
+                    if let Src::Reg(r) = s {
+                        if *r == c {
+                            *r = nr;
+                        }
+                    }
+                }
+            }
+            b.insts.insert(first, MInst::new(MOp::VMovB32).def(nr).imm(k));
         }
     }
 }

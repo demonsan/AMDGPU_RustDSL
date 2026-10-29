@@ -40,12 +40,28 @@ pub fn compile_mir(f: &amdgpu_dsl::Function) -> Result<mir::MFunction, String> {
 /// (`sched::Options::from_env`) a result that does not fit the register file is retried with a
 /// lower pressure limit and finally with the unscheduled code.
 fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regalloc::Alloc), String> {
+    // Register pressure: when allocation fails, rematerialise loop-invariant constants next to their loop uses (remat1 -> remat3)
+    // and try again. A kernel that allocates at the first attempt is unaffected.
+    let mut last = String::new();
+    for extra in [&[][..], &["remat1"][..], &["remat2"][..], &["remat3"][..]] {
+        match lower_and_allocate_with(f, extra) {
+            Ok(r) => return Ok(r),
+            Err(e) if e.contains("out of VGPRs") => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
     // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
     // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/status.md round 47).
     let base = if f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
-        lower::with_opts(&["dce", "cmpfold", "scalarize"], || lower::lower(f))?
+        let mut v: Vec<&str> = vec!["dce", "cmpfold", "scalarize"];
+        v.extend_from_slice(extra);
+        lower::with_opts(&v, || lower::lower(f))?
     } else {
-        lower::lower(f)?
+        lower::lower_with_extra(f, extra)?
     };
     let sched_opts = match sched::Options::from_env() {
         Some(o) if o.auto => sched::auto_plan(&base, &o),
