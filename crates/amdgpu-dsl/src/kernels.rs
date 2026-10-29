@@ -1126,6 +1126,18 @@ pub fn probe_dma_kread() -> Function {
     let w8 = b.shl_i32(wave, c3);
     let rowb = b.add_i32(lane_hi, w8);
     let w1024 = b.shl_i32(wave, c10);
+    if std::env::var("PD_NODMA").is_ok() {
+        // reference staging: plain loads + ds_write, row-major (no swizzle)
+        let c64s = b.c_i32(64);
+        let t64s = b.mul_i32(tid, c64s);
+        let sp = b.ptr_add(inp, t64s);
+        for w in 0..4u32 {
+            let d = b.load_b128(sp, 16 * w);
+            let cw = b.c_i32(16 * w as i32);
+            let la = b.add_i32(t64s, cw);
+            b.store_lds_b128(Opnd::Val(la), Opnd::Val(d));
+        }
+    } else {
     for q in 0..4i32 {
         let cq = b.c_i32(32 * q);
         let row = b.add_i32(rowb, cq);
@@ -1143,6 +1155,7 @@ pub fn probe_dma_kread() -> Function {
         let r0 = b.mul_i32(lane, c16);
         let sp2 = b.ptr_add(inp, r0);
         b.load_global_lds(sp2, spare, 0, 4);
+    }
     }
     b.wait_vm(0);
     b.wait_lds(0);
