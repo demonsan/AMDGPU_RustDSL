@@ -9759,12 +9759,12 @@ pub fn probe_smfmac_ones() -> Function {
     let i29_3 = b.bitcast_i32(l29_3);
     let r29 = b.frag4(i29_0, i29_1, i29_2, i29_3);
 
-    // 30-35: how much VALU work between the accumulator pre-set and the smfmac makes the C read
-    //        visible? K independent-ish VALU adds in between; dump the rebuilt fragment.
+    // 30-33: how much VALU work between the accumulator pre-set and the smfmac makes the C read
+    //        visible? The filler chain is *stored* (slots 60+) so it cannot be dead-code-eliminated.
     let c1f = b.c_f32(1.0);
     let mut prev = b.c_f32(0.0);
     let mut s35: Vec<ValueId> = Vec::new();
-    for &(slot, extra) in &[(30usize, 0usize), (31, 2), (32, 4), (33, 8), (34, 16), (35, 32)] {
+    for &(slot, extra) in &[(30usize, 0usize), (31, 1), (32, 2), (33, 4)] {
         let acc = b.frag4(k1000, k1000, k1000, k1000);
         let mut filler = prev;
         for _ in 0..extra {
@@ -9781,7 +9781,25 @@ pub fn probe_smfmac_ones() -> Function {
         let i2 = b.bitcast_i32(l2);
         let i3 = b.bitcast_i32(l3);
         s35.push(b.frag4(i0, i1, i2, i3));
+        // keep the filler chain alive: one store per filler variant into its own slot
+        let off_f = b.c_i32(((60 + extra) * 1024) as i32);
+        let row_f = b.ptr_add(base, off_f);
+        b.store_f32(row_f, 0, filler);
     }
+    // 40-44: which P Frag8 goes into which smfmac / index pattern? P_a depends on the lane, P_b is a
+    //        constant 4.0, so the three pairings give different results. 44 = msum reference.
+    let p_a = b.frag8(lane_val, lane_val, lane_val, lane_val, lane_val, lane_val, lane_val, lane_val);
+    let p_b = b.frag8(m4, m4, m4, m4, m4, m4, m4, m4);
+    let m44 = b.mfma_scale_fp8(ones8, p_a, z16, c127, c127);
+    let m44b = b.mfma_scale_fp8(ones8, p_b, m44, c127, c127);
+    let s40a = b.smfmac_fp8_16x16x128(a_ones, p_a, i01, c0);
+    let s40 = b.smfmac_fp8_16x16x128(a_ones, p_b, i23, s40a);
+    let s41a = b.smfmac_fp8_16x16x128(a_ones, p_a, i01, c0);
+    let s41 = b.smfmac_fp8_16x16x128(a_ones, p_b, i01, s41a);
+    let s42a = b.smfmac_fp8_16x16x128(a_ones, p_a, i01, c0);
+    let s42 = b.smfmac_fp8_16x16x128(a_ones, p_a, i23, s42a);
+    let s43a = b.smfmac_fp8_16x16x128(a_ones, p_b, i01, c0);
+    let s43 = b.smfmac_fp8_16x16x128(a_ones, p_a, i23, s43a);
 
     for (e, d) in results.iter().enumerate() {
         probe_smfmac_dump(&mut b, base, e, *d);
@@ -9789,6 +9807,11 @@ pub fn probe_smfmac_ones() -> Function {
     for (k, d) in s35.iter().enumerate() {
         probe_smfmac_dump(&mut b, base, 30 + k, *d);
     }
+    probe_smfmac_dump16(&mut b, base, 44, m44b);
+    probe_smfmac_dump(&mut b, base, 40, s40);
+    probe_smfmac_dump(&mut b, base, 41, s41);
+    probe_smfmac_dump(&mut b, base, 42, s42);
+    probe_smfmac_dump(&mut b, base, 43, s43);
     probe_smfmac_dump(&mut b, base, 27, acc27);
     let off28 = b.c_i32(28 * 1024);
     let row28 = b.ptr_add(base, off28);
