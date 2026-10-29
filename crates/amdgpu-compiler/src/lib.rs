@@ -26,6 +26,11 @@ pub fn compile_with(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend) -
     Ok(Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }
 
+/// The final MIR and register assignment of a kernel (what the tail backends receive).
+pub fn compile_mir_alloc(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regalloc::Alloc), String> {
+    lower_and_allocate(f)
+}
+
 /// The final (allocated, scheduled, hazard-padded) MIR of a kernel, for model reports.
 pub fn compile_mir(f: &amdgpu_dsl::Function) -> Result<mir::MFunction, String> {
     lower_and_allocate(f).map(|(m, _)| m)

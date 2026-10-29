@@ -123,7 +123,7 @@ fn parse_operand(t: &str) -> Operand {
     Operand { flags: words[..k].iter().map(|s| s.to_string()).collect(), text: rest }
 }
 
-fn parse_inst_line(line: &str) -> Option<Inst> {
+pub fn parse_inst_line(line: &str) -> Option<Inst> {
     let indent: String = line.chars().take_while(|c| *c == ' ').collect();
     let body = line[indent.len()..].trim_end();
     if body.is_empty() || body.starts_with(';') || body.starts_with("bb.") || body.starts_with("liveins:")

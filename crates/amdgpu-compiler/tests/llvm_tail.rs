@@ -206,3 +206,37 @@ fn drop_auto_waits_removes_only_auto_waits() {
     assert!(total_dropped > 0);
     let _ = tail;
 }
+/// Kill/dead flags are exported from our liveness: the verifier must accept them on every kernel.
+#[test]
+fn exported_flags_pass_the_machine_verifier() {
+    if !llc_available() {
+        return;
+    }
+    let mut tail = LlvmTail::new();
+    tail.extra_args = vec!["-verify-machineinstrs".to_string()];
+    let only = std::env::var("AMDC_TEST_KERNELS").ok().filter(|s| !s.is_empty());
+    let mut bad = Vec::new();
+    for k in kernel_names() {
+        if let Some(o) = &only {
+            if !o.split(',').any(|x| x == *k) {
+                continue;
+            }
+        }
+        let f = kernel_by_name(k).unwrap();
+        let (m, a) = match amdgpu_compiler::compile_mir_alloc(&f) {
+            Ok(x) => x,
+            Err(e) => {
+                bad.push(format!("{k}: {e}"));
+                continue;
+            }
+        };
+        let mir = tail.export_mir(&m, &a).unwrap();
+        if !mir.contains("killed") || !mir.contains("dead") {
+            bad.push(format!("{k}: no kill/dead flags exported"));
+        }
+        if let Err(e) = tail.run_llc(k, &mir, llvm20::START_PASS_PREFERENCE[0]) {
+            bad.push(format!("{k}: {}", e.lines().take(6).collect::<Vec<_>>().join(" | ")));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

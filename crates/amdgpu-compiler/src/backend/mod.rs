@@ -80,13 +80,15 @@ pub struct LlvmTail {
     pub skip_lock: bool,
     /// Do not export lowering's auto-inserted waits (experimental, see docs).
     pub drop_auto_waits: bool,
+    /// Extra llc arguments (e.g. `-verify-machineinstrs`), in addition to `AMDC_LLC_ARGS`.
+    pub extra_args: Vec<String>,
 }
 
 impl LlvmTail {
     pub fn new() -> LlvmTail {
         let keep = std::env::var("AMDC_KEEP_MIR").ok().map(PathBuf::from);
         let drop = std::env::var("AMDC_DROP_AUTO_WAITS").map(|v| v == "1").unwrap_or(false);
-        LlvmTail { tools: LlvmTools::locate(), keep_mir: keep, skip_lock: false, drop_auto_waits: drop }
+        LlvmTail { tools: LlvmTools::locate(), keep_mir: keep, skip_lock: false, drop_auto_waits: drop, extra_args: Vec::new() }
     }
 
     pub fn export_mir(&self, m: &MFunction, a: &Alloc) -> Result<String, String> {
@@ -110,6 +112,9 @@ impl LlvmTail {
         args.push("-filetype=asm");
         let extra = std::env::var("AMDC_LLC_ARGS").unwrap_or_default();
         for e in extra.split_whitespace() {
+            args.push(e);
+        }
+        for e in &self.extra_args {
             args.push(e);
         }
         let mp = mir_path.to_string_lossy().into_owned();
