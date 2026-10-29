@@ -7669,7 +7669,21 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             init_vars.push((DType::I32, Opnd::Val(kd_first[s])));
         }
     }
+    let dbuf = fmha_t_opt("dbuf");
+    let par_idx = init_vars.len();
+    init_vars.push((DType::I32, Opnd::Val(c0)));
     let vars = b.begin_loop(&init_vars);
+    let par = vars[par_idx];
+    // double buffering: compute reads buffer par, the next tile is staged into the other one
+    let (kf_b, tr_b, sdst_n) = if dbuf {
+        let cbuf = b.c_i32(256 * fmha_t_pitch());
+        let co = b.mul_i32(par, cbuf);
+        let npar = b.xor_i32(par, c1);
+        let no = b.mul_i32(npar, cbuf);
+        (b.add_i32(cx.kf_base, co), b.add_i32(cx.tr_base, co), b.add_i32(sdst, no))
+    } else {
+        (cx.kf_base, cx.tr_base, sdst)
+    };
     let it = vars[0];
     let bias2 = vars[1];
     let o_vars = [vars[2], vars[3], vars[4], vars[5]];
@@ -7692,7 +7706,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let s = 2 * hh + sl;
                 b.var_mfma_f16_z(s_vars[sl], ones_f16, bias2);
                 let ko = b.c_i32(32 * pitch * (s as i32));
-                let kaddr0 = b.add_i32(cx.kf_base, ko);
+                let kaddr0 = b.add_i32(kf_b, ko);
                 let kaddr0h = b.add_i32(kaddr0, c32v);
                 let k8_0 = b.load_lds_b128x2(Opnd::Val(kaddr0), Opnd::Val(kaddr0h));
                 let kaddr1 = b.add_i32(kaddr0, c64);
@@ -7811,7 +7825,7 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
                 for r in 0..4i32 {
                     let off = b.c_i32((hh as i32) * 64 * pitch + 16 * pitch * r + (e as i32) * 32);
-                    addrs.push(b.add_i32(cx.tr_base, off));
+                    addrs.push(b.add_i32(tr_b, off));
                 }
                 let v8 = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
                 b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
@@ -7825,12 +7839,18 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.else_();
     compute(b, false);
     b.end_if();
+    if !dbuf {
+        b.wait_lds(0);
+        b.barrier();
+    }
+    stage_stores(b, sdst_n, &pre);
     b.wait_lds(0);
     b.barrier();
-    stage_stores(b, sdst, &pre);
     b.wait_lds(0);
-    b.barrier();
-    b.wait_lds(0);
+    if dbuf {
+        let npar2 = b.xor_i32(par, c1);
+        b.set_var(par, npar2);
+    }
     if kdpf {
         for s in 0..4usize {
             b.set_var(vars[9 + s], kd_next[s]);
