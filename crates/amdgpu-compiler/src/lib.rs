@@ -40,6 +40,19 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
         Some(o) if o.auto => sched::auto_plan(&base, &o),
         other => other,
     };
+    // The FMHA kernels default to the wait-recomputing pass (partial vmcnt/lgkmcnt waits, ALU across barriers): +9% on the
+    // transposed kernel, bit-identical results (measured, docs/status.md round 44). AMDC_SCHED=0 turns it off.
+    let sched_opts = match sched_opts {
+        None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0")
+            && (f.name.starts_with("fmha_fwd_hd128_mxfp8_t") || f.name.starts_with("fmha_fwd_hd128_mxfp8_sv")) =>
+        {
+            let mut o = sched::Options::default();
+            o.reorder = false;
+            o.alu_across_barrier = true;
+            Some(o)
+        }
+        other => other,
+    };
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
         for cut in [0u32, 16, 32, 48] {

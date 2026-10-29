@@ -1039,6 +1039,41 @@ impl Lowerer {
                 self.push(MInst::new(MOp::VFmaF32).def(d).srcreg(ra).srcreg(rb).srcreg(rc));
                 self.val.insert(dst, d);
             }
+            Op::PkSubU16(a, b) => {
+                let ra = self.as_v1(*a)?;
+                let rb = self.as_v1(*b)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VPkSubU16).def(d).srcreg(ra).srcreg(rb));
+                self.val.insert(dst, d);
+            }
+            Op::PermB32(a, b, c) => {
+                let ra = self.as_v1(*a)?;
+                let rb = self.as_v1(*b)?;
+                let rc = self.as_v1(*c)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rb), Src::Reg(rc)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VPermB32).def(d).srcreg(ra).srcreg(rb).srcreg(rc));
+                self.val.insert(dst, d);
+            }
+            Op::CvtPknormPair(a, b) => {
+                let ra = self.as_v1(*a)?;
+                let rb = self.as_v1(*b)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VCvtPknormU16).def(d).srcreg(ra).srcreg(rb));
+                self.val.insert(dst, d);
+            }
+            Op::CvtP8x4FromU16(u0, u1, sc) => {
+                let r0 = self.as_v1(*u0)?;
+                let r1 = self.as_v1(*u1)?;
+                let rs = self.as_v1(*sc)?;
+                self.touch(&[Src::Reg(r0), Src::Reg(r1), Src::Reg(rs)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VCvtPkFp8Lo).def(d).srcreg(r0).srcreg(rs));
+                self.push(MInst::new(MOp::VCvtPkFp8Hi).def(d).srcreg(r1).srcreg(rs).srcreg(d));
+                self.val.insert(dst, d);
+            }
             Op::Max3F32(a, b, c) => {
                 let ra = self.as_v1(*a)?;
                 let rb = self.as_v1(*b)?;

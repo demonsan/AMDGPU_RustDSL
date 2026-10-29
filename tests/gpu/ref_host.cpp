@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <limits>
 
 #define CK(x)                                                                  \
     do {                                                                       \
@@ -172,8 +173,8 @@ int main(int argc, char** argv) {
                         acc *= vdescale;
                         const double got = bf2f(o[(((size_t)b * S + i) * H + h) * D + d]);
                         const double err = std::fabs(got - acc);
-                        worst = std::max(worst, err); sum_abs += err; max_ref = std::max(max_ref, std::fabs(acc)); ++cnt;
-                        if (err > 0.05 + 0.05 * std::fabs(acc)) { if (bad < 5) std::fprintf(stderr, "%s O[%d][%d][%d][%d] want %.5f got %.5f\n", label, b, h, i, d, acc, got); ++bad; }
+                        if (err != err) worst = std::numeric_limits<double>::infinity(); else worst = std::max(worst, err); sum_abs += err; max_ref = std::max(max_ref, std::fabs(acc)); ++cnt;
+                        if (!(err <= 0.05 + 0.05 * std::fabs(acc))) { /* NaN counts as bad */ if (bad < 5) std::fprintf(stderr, "%s O[%d][%d][%d][%d] want %.5f got %.5f\n", label, b, h, i, d, acc, got); ++bad; }
                     }
                 }
         std::printf("%s: checked=%zu bad=%zu worst_err=%.4e mean_err=%.4e max|ref|=%.4f\n", label, cnt, bad, worst, sum_abs / cnt, max_ref);
