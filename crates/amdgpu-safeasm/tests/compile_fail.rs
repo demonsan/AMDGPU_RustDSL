@@ -53,9 +53,12 @@ fn ui_cases() {
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         let src = std::fs::read_to_string(f).unwrap();
         let (ok, err) = compile(f);
-        if std::env::var("SAFEASM_SHOW").is_ok() && !ok {
-            let first: Vec<&str> = err.lines().filter(|l| l.starts_with("error") || l.contains("-->") || l.trim_start().starts_with("= note") || l.contains("the evaluated program panicked")).take(4).collect();
-            eprintln!("DIAG {name}: {}", first.join(" | "));
+        if !ok {
+            // first lines of each diagnostic, kept next to the test binary for the design doc (`target/debug/deps/safeasm-diagnostics.txt`)
+            let first: Vec<&str> = err.lines().filter(|l| l.starts_with("error") || l.contains("-->") || l.contains("the evaluated program panicked") || l.contains("expected ") || l.contains("help:")).take(5).collect();
+            let mut log = std::fs::OpenOptions::new().create(true).append(true).open(deps_dir().join("safeasm-diagnostics.txt")).unwrap();
+            use std::io::Write;
+            writeln!(log, "DIAG {name}: {}", first.join(" | ")).unwrap();
         }
         if name.starts_with("pass_") {
             if !ok {
