@@ -1239,7 +1239,11 @@ impl Lowerer {
             Op::LshrI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SLshrB32, *a, *b)?,
             Op::AndI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAndB32, *a, *b)?,
             Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
-            Op::AddI32(a, b) if opt_on("addrfold") && self.lazy_add(dst, *a, *b)? => {}
+            Op::AddI32(a, b) if opt_on("addrfold") && self.lazy_add(dst, *a, *b)? => {
+                if std::env::var("AMDC_ADDRFOLD_EAGER").map(|v| !v.is_empty()).unwrap_or(false) {
+                    let _ = self.as_v1(Opnd::Val(dst))?;
+                }
+            }
             Op::AddI32(a, b) => self.bin_v1(dst, MOp::VAddU32, *a, *b)?,
             Op::AddF32(a, b) => self.bin_v1(dst, MOp::VAddF32, *a, *b)?,
             Op::SubF32(a, b) => self.bin_v1(dst, MOp::VSubF32, *a, *b)?,
