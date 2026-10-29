@@ -209,41 +209,11 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
         }
     }
 
-    // --- precise live segments (instruction-level liveness, holes included) -----------------------------------
-    // Used by the two-phase policy: a register may be reused inside a hole of another value's live range.
-    let mut segs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
-    if matches!(policy, Policy::TwoPhase) {
-        for (bi, b) in m.blocks.iter().enumerate() {
-            if b.insts.is_empty() {
-                continue;
-            }
-            let first = idx_of[bi][0];
-            let last = *idx_of[bi].last().unwrap();
-            let mut open: std::collections::HashMap<VReg, usize> = std::collections::HashMap::new();
-            for r in &live_out[bi] {
-                open.insert(*r, last);
-            }
-            for i in (0..b.insts.len()).rev() {
-                let at = idx_of[bi][i];
-                let inst = &b.insts[i];
-                if let Some(d) = inst.dst {
-                    let d = m.canon(d);
-                    match open.remove(&d) {
-                        Some(e) => segs[d as usize].push((at, e)),
-                        None => segs[d as usize].push((at, at)),
-                    }
-                }
-                for r in inst.uses() {
-                    let r = m.canon(r);
-                    open.entry(r).or_insert(at);
-                }
-            }
-            for (r, e) in open {
-                segs[r as usize].push((first, e));
-            }
-        }
-    }
-
+    // --- precise live segments (dword-level liveness, holes included) ------------------------------------------
+    // Used by the two-phase policy: a register may be reused inside a hole of another value's live range. Liveness is
+    // tracked per register DWORD (the scheduler's effects model: lane writes, partial writers, in-place operands), so a
+    // fragment built lane by lane stays live between its lane writes.
+    let segs: Vec<Vec<(usize, usize)>> = if matches!(policy, Policy::TwoPhase) { precise_segments(m, &idx_of, &succs) } else { vec![Vec::new(); n] };
     // --- linear scan -------------------------------------------------
     let mut phys = vec![u32::MAX; n];
     let mut used_v = vec![false; VGPR_COUNT];
@@ -619,4 +589,107 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
         }
     }
     Ok(())
+}
+/// Per virtual register (canonical tuple): the instruction-position segments in which any of its dwords is live.
+fn precise_segments(m: &MFunction, idx_of: &[Vec<usize>], succs: &[Vec<usize>]) -> Vec<Vec<(usize, usize)>> {
+    use crate::sched::effects::{effects, Slot, SCC, VCC};
+    let n = m.vregs.len();
+    let nb = m.blocks.len();
+    let keep = |s: &Slot| *s != VCC && *s != SCC;
+    // reads / writes per instruction (slots), computed once
+    let mut rw: Vec<Vec<(Vec<Slot>, Vec<Slot>)>> = Vec::with_capacity(nb);
+    for b in &m.blocks {
+        rw.push(
+            b.insts
+                .iter()
+                .map(|i| {
+                    let e = effects(m, i);
+                    (e.reads.into_iter().filter(keep).collect(), e.writes.into_iter().filter(keep).collect())
+                })
+                .collect(),
+        );
+    }
+    let mut gen: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    let mut kill: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    for bi in 0..nb {
+        for (r, w) in &rw[bi] {
+            for s in r {
+                if !kill[bi].contains(s) {
+                    gen[bi].insert(*s);
+                }
+            }
+            for s in w {
+                kill[bi].insert(*s);
+            }
+        }
+    }
+    let mut live_in: Vec<HashSet<Slot>> = gen.clone();
+    let mut live_out: Vec<HashSet<Slot>> = vec![HashSet::new(); nb];
+    loop {
+        let mut changed = false;
+        for bi in (0..nb).rev() {
+            let mut out: HashSet<Slot> = HashSet::new();
+            for s in &succs[bi] {
+                out.extend(live_in[*s].iter().copied());
+            }
+            let mut inn = gen[bi].clone();
+            for s in &out {
+                if !kill[bi].contains(s) {
+                    inn.insert(*s);
+                }
+            }
+            if inn != live_in[bi] || out != live_out[bi] {
+                live_in[bi] = inn;
+                live_out[bi] = out;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut raw: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    for (bi, b) in m.blocks.iter().enumerate() {
+        if b.insts.is_empty() {
+            continue;
+        }
+        let first = idx_of[bi][0];
+        let last = *idx_of[bi].last().unwrap();
+        let mut open: std::collections::HashMap<Slot, usize> = std::collections::HashMap::new();
+        for s in &live_out[bi] {
+            open.insert(*s, last);
+        }
+        for i in (0..b.insts.len()).rev() {
+            let at = idx_of[bi][i];
+            let (r, w) = &rw[bi][i];
+            for s in w {
+                let v = (*s / 16) as usize;
+                match open.remove(s) {
+                    Some(e) => raw[v].push((at, e)),
+                    None => raw[v].push((at, at)),
+                }
+            }
+            for s in r {
+                open.entry(*s).or_insert(at);
+                // a use keeps the position itself occupied even when the slot is also written here
+                raw[(*s / 16) as usize].push((at, at));
+            }
+        }
+        for (s, e) in open {
+            raw[(s / 16) as usize].push((first, e));
+        }
+    }
+    // merge overlapping / touching segments per vreg
+    for segs in raw.iter_mut() {
+        segs.sort();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(segs.len());
+        for &(a, b) in segs.iter() {
+            match merged.last_mut() {
+                Some(l) if a <= l.1 + 1 => l.1 = l.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        *segs = merged;
+    }
+    raw
 }
