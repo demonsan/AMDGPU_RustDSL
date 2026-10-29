@@ -171,7 +171,7 @@ fn chain_kernel(use_asm: bool) -> amdgpu_dsl::Function {
 #[test]
 fn embedded_block_lowers_to_the_same_mir_as_the_dsl_chain() {
     // the DSL path also builds an unused zero tuple (4 dead VWriteSub) before the SMFMAC chain: compare everything except zero-initialisation moves
-    let all = |op: MOp| !matches!(op, MOp::VWriteSub | MOp::VMovB32);
+    let all = |op: MOp| !matches!(op, MOp::VWriteSub | MOp::VMovB32 | MOp::SNop); // the safe path's own padding is explicit s_nop; the DSL path is padded later by the hazard pass
     let fa = lower::lower(&chain_kernel(true)).unwrap();
     let fd = lower::lower(&chain_kernel(false)).unwrap();
     let na = normalise(&fa, &fa.blocks.iter().flat_map(|b| b.insts.clone()).collect::<Vec<_>>(), all);
