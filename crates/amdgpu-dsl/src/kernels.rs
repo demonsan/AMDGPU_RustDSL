@@ -8153,11 +8153,6 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let dummy_lds = b.c_i32(nbuf_l * cbuf_i + 2048 + 1024);
     // K scale dword of this thread's key row (staged with a plain load + ds_write when the dword DMA is not used)
     let kd_row_load = |b: &mut FnBuilder, key0: ValueId| -> ValueId {
-        if fmha_t_opt("kdold") {
-            // debug: take the K scale from the old staging loader (its K data loads are dead)
-            let v = stage_loads(b, key0);
-            return v[4];
-        }
         let srow_raw = b.add_i32(key0, cx.rt_row);
         let srow_ok = b.cmp_lt_i32(srow_raw, cx.kv_len);
         let srow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(srow_ok), a: Opnd::Val(srow_raw), b: Opnd::Val(cx.kv_last) });
