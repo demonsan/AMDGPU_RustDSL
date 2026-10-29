@@ -216,7 +216,7 @@ fn main() -> ExitCode {
             }
             let mut out_path: Option<String> = None;
             let mut mir_out: Option<String> = None;
-            let mut backend_name = env::var("AMDC_BACKEND").unwrap_or_else(|_| "llvm-tail".to_string());
+            let mut backend_name = env::var("AMDC_BACKEND").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "auto".to_string());
             let mut i = 2;
             while i < args.len() {
                 if args[i] == "--out" {
@@ -269,8 +269,13 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            let (resolved, note) = amdgpu_compiler::resolve_backend(&backend_name, &f);
+            if let Some(n) = note {
+                eprintln!("note: {n}");
+            }
+            let backend_name = resolved;
             let Some(tail) = backend::backend_by_name(&backend_name) else {
-                eprintln!("unknown backend: {backend_name} (own | llvm-tail)");
+                eprintln!("unknown backend: {backend_name} (own | llvm-tail | auto)");
                 return ExitCode::from(2);
             };
             let tail: &dyn TailBackend = tail.as_ref();
