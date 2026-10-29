@@ -9638,8 +9638,8 @@ pub fn probe_smfmac_ones() -> Function {
     let i00 = b.c_i32(0);
     let c32 = b.c_i32(32);
     let lt32 = b.cmp_lt_i32(tid, c32);
-    let sel_idx = b.let_(Op::Select { ty: DType::I32, cond: lt32, a: i01, b: i23 });
-    let sel_a = b.let_(Op::Select { ty: DType::I32, cond: lt32, a: ones, b: zero });
+    let sel_idx = b.let_(Op::Select { ty: DType::I32, cond: lt32.into(), a: i01.into(), b: i23.into() });
+    let sel_a = b.let_(Op::Select { ty: DType::I32, cond: lt32.into(), a: ones.into(), b: zero.into() });
     let a_lane = b.frag4(sel_a, sel_a, sel_a, sel_a);
 
     // 0/1: one smfmac with each index pattern, all-ones A and B -> number of contracted K positions.
