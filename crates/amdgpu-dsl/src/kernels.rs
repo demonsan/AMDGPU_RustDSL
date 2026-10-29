@@ -11331,6 +11331,82 @@ fn sched_mfma_valu_kernel(name: &str, lanes: u8) -> Function {
     b.finish()
 }
 
+/// Cross-wave co-issue probe: waves 0-3 run an independent-accumulator scaled-MFMA loop, waves 4-7 a VALU (fma) loop, so each SIMD
+/// has one wave of each kind. mode 0 = both, 1 = MFMA waves only, 2 = VALU waves only (the other role skips its loop).
+fn sched_coissue_kernel(name: &str, mode: u8) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c64 = b.c_i32(64);
+    let c6 = b.c_i32(6);
+    let c4 = b.c_i32(4);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let is_mfma = b.cmp_lt_i32(wave, c4);
+    let off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, off);
+    b.begin_if(Opnd::Val(is_mfma));
+    if mode != 2 {
+        let ones = b.c_i32(0x38383838_u32 as i32);
+        let f4 = b.frag4(ones, ones, ones, ones);
+        let a8 = b.cat_frag8(f4, f4);
+        let twos = b.c_i32(0x40404040_u32 as i32);
+        let f4b = b.frag4(twos, twos, twos, twos);
+        let b8 = b.cat_frag8(f4b, f4b);
+        let zero = b.frag_zero(DType::Frag16);
+        let vars = b.begin_loop(&[
+            (DType::I32, Opnd::Val(c0)),
+            (DType::Frag16, Opnd::Val(zero)),
+            (DType::Frag16, Opnd::Val(zero)),
+            (DType::Frag16, Opnd::Val(zero)),
+            (DType::Frag16, Opnd::Val(zero)),
+        ]);
+        for k in 1..5 {
+            b.var_mfma_scale(vars[k], a8, b8, 127, 127);
+        }
+        sched_end_loop(&mut b, vars[0], n);
+        for k in 1..5usize {
+            let l = b.frag16_lane(vars[k], 0);
+            let x = b.bitcast_f32(l);
+            b.store_f32(row, 4 * k as u32, x);
+        }
+    }
+    b.else_();
+    if mode != 1 {
+        let one = b.c_f32(1.0001);
+        let two = b.c_f32(0.5);
+        let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0))];
+        for k in 0..16 {
+            let f = b.c_f32(1.0 + k as f32);
+            let fi = b.bitcast_i32(f);
+            inits.push((DType::I32, Opnd::Val(fi)));
+        }
+        let vars = b.begin_loop(&inits);
+        for k in 0..16usize {
+            let mut x = b.bitcast_f32(vars[1 + k]);
+            for _ in 0..4 {
+                let m = b.mul_f32(x, one);
+                x = b.add_f32(m, two);
+            }
+            let xi = b.bitcast_i32(x);
+            b.set_var(vars[1 + k], xi);
+        }
+        sched_end_loop(&mut b, vars[0], n);
+        for k in 0..16usize {
+            let x = b.bitcast_f32(vars[1 + k]);
+            b.store_f32(row, 4 * k as u32, x);
+        }
+    }
+    b.end_if();
+    b.finish()
+}
+pub fn sched_coissue_both() -> Function {
+    sched_coissue_kernel("sched_coissue_both", 0)
+}
+pub fn sched_coissue_mfma() -> Function {
+    sched_coissue_kernel("sched_coissue_mfma", 1)
+}
+pub fn sched_coissue_valu() -> Function {
+    sched_coissue_kernel("sched_coissue_valu", 2)
+}
 pub fn sched_mfma_valu16() -> Function {
     sched_mfma_valu_kernel("sched_mfma_valu16", 16)
 }
