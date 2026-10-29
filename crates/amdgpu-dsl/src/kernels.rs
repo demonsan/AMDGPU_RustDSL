@@ -9730,9 +9730,34 @@ pub fn probe_smfmac_ones() -> Function {
     let s26a = b.smfmac_fp8_16x16x128(a_ones, pv, i01, c0);
     let s26 = b.smfmac_fp8_16x16x128(a_ones, pv, i01, s26a);
 
+    // 27: preset accumulator dumped WITHOUT any smfmac - control for the dump/read path itself.
+    let acc27 = b.frag4(k1000, k1000, k1000, k1000);
+    // 28/29: preset + single smfmac, read back through VALU (forcing a VALU consumer) and dumped as a
+    //        sum (28) and as a rebuilt fragment (29).
+    let acc28 = b.frag4(k1000, k1000, k1000, k1000);
+    let s28 = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc28);
+    let v28_0 = b.bitcast_f32(b.frag4_lane(s28, 0));
+    let v28_1 = b.bitcast_f32(b.frag4_lane(s28, 1));
+    let v28_2 = b.bitcast_f32(b.frag4_lane(s28, 2));
+    let v28_3 = b.bitcast_f32(b.frag4_lane(s28, 3));
+    let sum28 = b.add_f32(b.add_f32(v28_0, v28_1), b.add_f32(v28_2, v28_3));
+    let acc29 = b.frag4(k1000, k1000, k1000, k1000);
+    let s29 = b.smfmac_fp8_16x16x128(a_ones, b_ones, i01, acc29);
+    let r29 = b.frag4(
+        b.bitcast_i32(b.frag4_lane(s29, 0)),
+        b.bitcast_i32(b.frag4_lane(s29, 1)),
+        b.bitcast_i32(b.frag4_lane(s29, 2)),
+        b.bitcast_i32(b.frag4_lane(s29, 3)),
+    );
+
     for (e, d) in results.iter().enumerate() {
         probe_smfmac_dump(&mut b, base, e, *d);
     }
+    probe_smfmac_dump(&mut b, base, 27, acc27);
+    let off28 = b.c_i32(28 * 1024);
+    let row28 = b.ptr_add(base, off28);
+    b.store_f32(row28, 0, sum28);
+    probe_smfmac_dump(&mut b, base, 29, r29);
     probe_smfmac_dump(&mut b, base, 19, s19);
     probe_smfmac_dump(&mut b, base, 20, s20);
     probe_smfmac_dump16(&mut b, base, 23, m23b);
