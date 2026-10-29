@@ -9027,16 +9027,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     // PV of half `hh` (P words in `pw`, V in ring slot `slot`) and its row sums
     let pv = |b: &mut FnBuilder, hh: usize, slot: ValueId| {
         let tr_b = b.add_i32(cx.tr_base, slot);
-        let p8 = b.frag8(
-            Opnd::Var(pw[0]),
-            Opnd::Var(pw[1]),
-            Opnd::Var(pw[2]),
-            Opnd::Var(pw[3]),
-            Opnd::Var(pw[4]),
-            Opnd::Var(pw[5]),
-            Opnd::Var(pw[6]),
-            Opnd::Var(pw[7]),
-        );
+        // read the P words out of their loop variables first (a frag8 built directly from variables was suspect)
+        let pwv: Vec<ValueId> = (0..8usize).map(|k| b.add_i32(Opnd::Var(pw[k]), c0)).collect();
+        let p8 = b.frag8(pwv[0], pwv[1], pwv[2], pwv[3], pwv[4], pwv[5], pwv[6], pwv[7]);
         b.var_mfma_scale(la, ones8, p8, c127, c123);
         for e in 0..4usize {
             let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
