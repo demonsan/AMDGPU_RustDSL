@@ -310,11 +310,8 @@ fn allocate_with(m: &MFunction, singles_from_top: bool) -> Result<Alloc, String>
             max_s = max_s.max(i + 1);
         }
     }
-    for (i, u) in used_s.iter().enumerate() {
-        if *u {
-            max_s = i + 1;
-        }
-    }
+    // (a second loop here used to ASSIGN max_s = highest still-live slot + 1, discarding the running maximum: kernels whose last live
+    // scalar registers were low under-declared .amdhsa_next_free_sgpr and the hardware aliased the registers above it)
 
     for (r, p) in phys.iter().enumerate() {
         if *p == u32::MAX {
