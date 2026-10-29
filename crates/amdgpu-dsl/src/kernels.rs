@@ -7451,7 +7451,8 @@ fn emit_fmha_pp_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
     let phase_end = |b: &mut FnBuilder, next_is_mfma: bool| {
         if use_prio {
-            b.set_prio(if next_is_mfma { 1 } else { 0 });
+            let hi = if fmha_t_opt("pp_prioinv") { !next_is_mfma } else { next_is_mfma };
+            b.set_prio(if hi { 1 } else { 0 });
         }
         b.wait_lds(0);
         b.barrier();
