@@ -28,19 +28,35 @@ pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
     // AMDC_RA_FORCE_TWOPHASE=1: use the precise-liveness packing first (testing; it is normally the last resort)
     if std::env::var("AMDC_RA_FORCE_TWOPHASE").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
         if let Ok(a) = allocate_two_phase(m) {
-            return Ok(a);
+            return checked(m, a, "two-phase");
         }
     }
     // First try the compact policy. If the kernel runs out of registers only because wide
     // tuples cannot find an aligned hole between scattered singles, retry with the singles
     // packed from the top of the file so the low registers stay available for tuples.
+    if std::env::var("AMDC_RA_PRUNED_HULL").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
+        // experiment: report (do not hide) what the reaching-writer check says about the scan policies on pruned hulls
+        if let Ok(a) = allocate_with(m, false) {
+            return checked(m, a, "pruned-hull scan");
+        }
+    }
     match allocate_with(m, false) {
         Err(e) if e.contains("out of VGPRs") => match allocate_with(m, true) {
             // last resort: offline two-phase packing (wide tuples first, singles into the remaining holes in time)
-            Err(e2) if e2.contains("out of VGPRs") => allocate_two_phase(m).map_err(|e3| if e3.contains("out of VGPRs") { format!("{e2}  ||  {e3}") } else { e3 }),
+            Err(e2) if e2.contains("out of VGPRs") => allocate_two_phase(m).and_then(|a| checked(m, a, "two-phase")).map_err(|e3| if e3.contains("out of VGPRs") { format!("{e2}  ||  {e3}") } else { e3 }),
             other => other,
         },
         other => other,
+    }
+}
+
+/// Reject an allocation whose reaching-writer check fails (the hole-filling packing must never ship a clobbered value).
+fn checked(m: &MFunction, a: Alloc, what: &str) -> Result<Alloc, String> {
+    let v = check_reaching(m, &a);
+    if v.is_empty() {
+        Ok(a)
+    } else {
+        Err(format!("{what} allocation failed the reaching-writer check ({} violations), e.g. {}", v.len(), v[0]))
     }
 }
 
@@ -839,4 +855,79 @@ pub fn live_at(m: &MFunction, pos: usize) -> Vec<VReg> {
     }
     let segs = precise_segments(m, &idx_of, &succs);
     segs.iter().enumerate().filter(|(r, sg)| m.vreg_class(*r as VReg).is_vector() && !m.alias.contains_key(&(*r as VReg)) && sg.iter().any(|(a, b)| *a <= pos && pos <= *b)).map(|(r, _)| r as VReg).collect()
+}
+/// Physical reaching-writer check (the same analysis as tests/mir_invariants.rs): every register dword read must be
+/// reached by the write of the virtual register dword it names, and by no other value, on every path. Returns the
+/// violations; used to guard the hole-filling packing and for allocator experiments.
+pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
+    use crate::sched::effects::{effects, Slot, SCC, VCC};
+    use std::collections::{BTreeSet, HashMap};
+    type Writers = HashMap<(bool, u32), BTreeSet<Slot>>;
+    let phys = |slot: Slot| -> (bool, u32) {
+        let t = slot / 16;
+        (m.vreg_class(t).is_vector(), a.phys[t as usize] + (slot - t * 16))
+    };
+    let succs = crate::sched::liveness::successors(m);
+    let nb = m.blocks.len();
+    let mut in_st: Vec<Option<Writers>> = vec![None; nb];
+    in_st[0] = Some(Writers::new());
+    for _ in 0..500 {
+        let mut changed = false;
+        for b in 0..nb {
+            let Some(mut st) = in_st[b].clone() else { continue };
+            for inst in &m.blocks[b].insts {
+                for w in &effects(m, inst).writes {
+                    if *w != VCC && *w != SCC {
+                        st.insert(phys(*w), BTreeSet::from([*w]));
+                    }
+                }
+            }
+            for &s in &succs[b] {
+                match &mut in_st[s] {
+                    None => {
+                        in_st[s] = Some(st.clone());
+                        changed = true;
+                    }
+                    Some(x) => {
+                        for (k, v) in &st {
+                            let e = x.entry(*k).or_default();
+                            for s2 in v {
+                                changed |= e.insert(*s2);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut report = Vec::new();
+    for b in 0..nb {
+        let Some(mut st) = in_st[b].clone() else { continue };
+        for (ii, inst) in m.blocks[b].insts.iter().enumerate() {
+            let e = effects(m, inst);
+            for r in &e.reads {
+                if *r == VCC || *r == SCC {
+                    continue;
+                }
+                if e.writes.contains(r) && matches!(inst.op, MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi) {
+                    continue;
+                }
+                let p = phys(*r);
+                if let Some(ws) = st.get(&p) {
+                    if !ws.contains(r) || ws.len() > 1 {
+                        report.push(format!("block {b} inst {ii} {:?}: reads slot {r} ({}{}) but the reaching writers are {:?}", inst.op, if p.0 { "v" } else { "s" }, p.1, ws));
+                    }
+                }
+            }
+            for w in &e.writes {
+                if *w != VCC && *w != SCC {
+                    st.insert(phys(*w), BTreeSet::from([*w]));
+                }
+            }
+        }
+    }
+    report
 }
