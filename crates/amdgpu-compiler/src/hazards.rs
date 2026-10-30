@@ -111,6 +111,9 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
         // mask compares write an SGPR pair that the cndmask reads: same 2 wait states as the vcc form (conservative)
         MOp::VCmpMaskLtI32 | MOp::VCmpMaskGeI32 | MOp::VCmpMaskGtI32 | MOp::VCmpMaskLtF32 => Some(2),
         MOp::VWriteSub | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VCvtPknormU16 => Some(2),
+        // audit (safe-asm review): VALU writers that were missing from the class - the scalef32 half-write converts (P words feeding the PV MFMA),
+        // the permlane swap, and the register reads that expand to v_mov
+        MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VPermlane32Swap | MOp::VReadPhys | MOp::VReadSub => Some(2),
         _ => None,
     }
 }
@@ -284,6 +287,12 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 vw.remove(&canon(d));
                 if let Some(dly) = valu_writer_delay(inst.op) {
                     vw.insert(canon(d), cycle + 1 + dly);
+                }
+                if inst.op == MOp::VPermlane32Swap {
+                    // the swap rewrites its second operand too
+                    if let Some(Src::Reg(r2)) = inst.srcs.get(1) {
+                        vw.insert(canon(*r2), cycle + 1 + 2);
+                    }
                 }
             }
             if strict {
