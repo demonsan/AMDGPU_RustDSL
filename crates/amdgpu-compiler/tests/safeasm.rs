@@ -343,3 +343,71 @@ fn second_vcc_is_none() {
     assert!(s.vcc().is_some());
     assert!(s.vcc().is_none());
 }
+// ---- round 2: F8 inputs read-only, F9 outputs defined, F10 ds_write, F12 verifier robustness ------------------------------------------------
+
+/// F9: an output port that nothing writes is refused.
+#[test]
+fn output_must_be_written() {
+    let mut s = Seq::new();
+    let x = s.vgpr::<1>();
+    s.output(x);
+    let e = s.finish().unwrap_err();
+    assert!(e.contains("never written"), "{e}");
+}
+
+/// F10: a store followed by a wait finishes clean (no abandoned token), and without the wait the sequence is refused.
+#[test]
+fn ds_write_then_wait_all_is_clean() {
+    let mut s = Seq::new();
+    let a = s.splat(0);
+    let d = s.splat(1);
+    s.ds_write_b32(&a, &d, 0);
+    s.wait_lgkm_all();
+    let mut x = s.vgpr::<1>();
+    s.v_mov_b32(&mut x, Imm::<1>::new());
+    s.output(x);
+    s.finish().unwrap();
+    let mut s = Seq::new();
+    let a = s.splat(0);
+    let d = s.splat(1);
+    s.ds_write_b32(&a, &d, 0);
+    assert!(s.finish().unwrap_err().contains("outstanding"));
+}
+
+/// F12: a forged stream with a malformed immediate is an Err, never a panic or a wrapped counter.
+#[test]
+fn verifier_survives_malformed_input() {
+    let mut s = Seq::new();
+    let mut x = s.vgpr::<1>();
+    s.v_mov_b32(&mut x, Imm::<1>::new());
+    s.output(x);
+    let ok = s.finish().unwrap();
+    for imm in [-5i64, 99, i64::MIN, i64::MAX] {
+        let mut v = ok.insts().to_vec();
+        v.insert(0, AInst { op: "SNop", dst: None, srcs: vec![], imm });
+        v.push(AInst { op: "SWaitLgkm", dst: None, srcs: vec![], imm });
+        let r = amdgpu_safeasm::forge_for_tests(&ok, v).verify();
+        assert!(r.is_err(), "imm {imm} accepted");
+    }
+}
+
+/// F8: a stream that defines an input register is refused by the verifier, and a DSL kernel embedding it fails to lower.
+#[test]
+fn writing_an_input_port_is_refused() {
+    let ok = rowsum_chain_block();
+    let input = ok.inputs()[3].reg; // idx01
+    let mut v = ok.insts().to_vec();
+    v.insert(0, AInst { op: "VMovB32", dst: Some(input), srcs: vec![], imm: 2 });
+    let forged = amdgpu_safeasm::forge_for_tests(&ok, v);
+    let e = forged.verify().unwrap_err().join("; ");
+    assert!(e.contains("INPUT port"), "{e}");
+    let mut b = FnBuilder::new("clobber", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let c0 = b.c_i32(0);
+    let a_rs = b.frag4(c0, c0, c0, c0);
+    let pa = b.frag8(c0, c0, c0, c0, c0, c0, c0, c0);
+    let r = b.asm(forged, &[Opnd::Val(a_rs), Opnd::Val(pa), Opnd::Val(pa), Opnd::Val(c0), Opnd::Val(c0)]);
+    let _ = r;
+    let err = lower::lower(&b.finish()).unwrap_err();
+    assert!(err.contains("INPUT port") || err.contains("hazard verifier"), "{err}");
+}
