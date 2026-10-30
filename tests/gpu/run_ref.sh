@@ -31,7 +31,7 @@ for CFG in "1 1 256 256 1" "1 2 512 512 1" "2 4 1024 1024 1" "1 8 2048 2048 1" "
     echo "=== B=$1 H=$2 S=$3 SK=$4 gqa=$5"
     out=$(REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_HK=$(( $2 / $5 )) REF_ROWS="${REF_ROWS:-16}" REF_ITERS="${REF_ITERS:-20}" \
         REF_CO2=build/fmha_ours.co REF_KNAME2="$KNAME" REF_CO2_SMALL="$SMALL_ENV" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
-        ./build/ref_host "$REF_CO" 2>&1 | grep -E "vs|timing|REF_") || rc=1
+        ./build/ref_host "$REF_CO" 2>&1 | grep -E "vs|timing|REF_|^\[grid\]") || rc=1
     echo "$out"
     # Second gate, VENDOR PARITY: our MEAN error against the CPU model must be within PARITY_MARGIN (default 1.10) of the vendor's on the same
     # elements. The worst element is printed but does not gate: on a small row sample (REF_ROWS=16) it is noise-dominated (even the accurate
