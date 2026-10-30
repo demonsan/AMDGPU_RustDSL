@@ -9514,7 +9514,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let no_pv = ablate.contains("nopv");
     let no_stage = ablate.contains("nostage");
     let seq_mode = ablate.contains("seq"); // diagnostic: both groups run group A's schedule (no phase offset)
-    let q0_reg = fmha_t_opt("q0reg"); // keep Q b0 in registers (8 VGPR) instead of 8 ds_read_b128 per tile
+    let q0_reg = fmha_t_opt("q0reg") || !fmha_t_opt("noqreg"); // Q fragments resident in registers by default (`noqreg` reads them from LDS) // keep Q b0 in registers (8 VGPR) instead of 8 ds_read_b128 per tile
     let c0 = b.c_i32(0);
     let c1 = b.c_i32(1);
     let c2 = b.c_i32(2);
@@ -9780,7 +9780,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let a1 = b.add_i32(q0_addr0, c1024_);
         b.load_lds_b128x2(Opnd::Val(q0_addr0), Opnd::Val(a1))
     };
-    let q1_reg = fmha_t_opt("q1reg"); // keep Q b1 in registers too
+    let q1_reg = fmha_t_opt("q1reg") || !fmha_t_opt("noqreg");
     let load_q1 = |b: &mut FnBuilder| -> ValueId {
         if q1_reg {
             return cx.b1;
