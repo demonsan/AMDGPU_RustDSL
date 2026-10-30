@@ -9529,6 +9529,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 
 /// 128-key-unit variant of the vendor-structure kernel (mha_fwd_hd128_mxfp8_vs128): one rollback decision and two barriers per 128 keys.
 fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
+    let _winasm = vs5_winasm_requested(); // false unless FMHA_OPT=winasm on _vs5 (then it stops: the asm window is not wired yet)
     let ablate = std::env::var("FMHA_ABLATE").unwrap_or_default();
     let no_bar = ablate.contains("nobar");
     let nobar1 = ablate.contains("nobar1"); // drop the V->M barrier only
@@ -15815,11 +15816,27 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4h() -> Function {
 }
 /// `_vs5` (gen5 scaffolding, docs/gen5-window-spec.md): identical to `_vs128` in everything except that its inner tile window is meant to be replaced by a
 /// hand-authored safe-asm window (`Op::Asm`). While the window is still the DSL one it must be bit-identical to `_vs128` (control point).
+/// Set while `_vs5` is being built: only then does `FMHA_OPT=winasm` swap the DSL window of `emit_fmha_vs128_role` for the safe-asm window.
+static VS5_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn fmha_fwd_hd128_mxfp8_vs5() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
+    VS5_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
     let f = fmha_t_build("fmha_fwd_hd128_mxfp8_vs5", false, true);
+    VS5_BUILD.store(false, std::sync::atomic::Ordering::SeqCst);
     VS_MODE.store(false, std::sync::atomic::Ordering::SeqCst);
     f
+}
+
+/// `FMHA_OPT=winasm` on `_vs5`: the hand-authored window (docs/gen5-window-spec.md sections 3-4) is swapped in here, block by block (C = PV + SMFMAC, A = max chain,
+/// B = convert + QK interleave). The DSL window stays the default and the control point until the safe-asm ops (DS reads, conversion chain, drain-closed loop
+/// contract) are available; with the flag set and the ops missing the build stops with a clear message instead of silently emitting the DSL window.
+fn vs5_winasm_requested() -> bool {
+    let want = fmha_t_opt("winasm") && VS5_BUILD.load(std::sync::atomic::Ordering::SeqCst);
+    if want {
+        panic!("FMHA_OPT=winasm: the safe-asm window is not wired yet (waiting for the typed DS / conversion-chain ops and the drain-closed loop contract; see docs/gen5-window-spec.md section 7)");
+    }
+    want
 }
 pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
