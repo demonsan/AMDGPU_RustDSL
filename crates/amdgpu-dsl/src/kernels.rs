@@ -9981,6 +9981,14 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (DType::I32, Opnd::Val(c0)),          // 11 ring index (tile mod 3)
         (DType::I32, Opnd::Val(match kd1_init { Some(v) => v, None => c0 })), // 12 kdp: the K-scale dword of tile t+1 (dsplit, group A)
     ];
+    // biasacc: the bias accumulator (ones x bias, f16 MFMA) is a persistent loop variable, recomputed only in the rollback branch; every tile's first scaled QK MFMA
+    // takes it as its C operand (removes the 4 f16 bias MFMAs per tile from the common path)
+    let biasacc = fmha_t_opt("biasacc");
+    if biasacc {
+        let zero16b = b.frag_zero(DType::Frag16);
+        let bacc0 = b.mfma_f16_wide(ones_f16, Opnd::Val(bias_init), zero16b);
+        init_vars.push((DType::Frag16, Opnd::Val(bacc0))); // 13 bias accumulator
+    }
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
     let nkv_m1h = b.add_i32(cx.nkv, cm1);
@@ -9993,6 +10001,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let la = vars[10];
     let idx = vars[11];
     let kdp = vars[12];
+    let bacc: Option<VarId> = if biasacc { Some(vars[13]) } else { None };
     // 2-slot ring: tile t in slot t & 1, tile t+1 in the other one
     let ring = |b: &mut FnBuilder| -> (ValueId, ValueId, ValueId, ValueId, ValueId, ValueId, ValueId) {
         let i1 = b.xor_i32(idx, c1);
@@ -10051,7 +10060,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             None
         };
         for s in 0..4usize {
-            if biasf_once.is_none() && !fmha_t_opt("biasv") {
+            if biasf_once.is_none() && !fmha_t_opt("biasv") && bacc.is_none() {
                 b.var_mfma_f16_z(s_vars[s], ones_f16, Opnd::Val(bias_v));
             }
             let ko = b.c_i32(4096 * (s as i32));
@@ -10081,7 +10090,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 (sk0, sk1)
             };
             let qb0 = if let Some((q0, _)) = q_pre { q0 } else if q0_reg { cx.b0 } else { load_q0(b) };
-            if let Some(bf) = biasf_once {
+            if let Some(ba) = bacc {
+                b.var_mfma_scale_c(s_vars[s], k8_0, qb0, Opnd::Var(ba), sk0, sq0m);
+            } else if let Some(bf) = biasf_once {
                 b.var_mfma_scale_c(s_vars[s], k8_0, qb0, bf, sk0, sq0m);
             } else if fmha_t_opt("biasv") {
                 b.var_mfma_scale_z(s_vars[s], k8_0, qb0, sk0, sq0m);
@@ -10211,6 +10222,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.set_var(bias2, nb);
         b.begin_if(Opnd::Val(grow));
         {
+            if let Some(ba) = bacc {
+                b.var_mfma_f16_z(ba, ones_f16, nb);
+            }
             let dupd = b.frag2_dup(delta);
             if !ablate.contains("rbnos") {
                 for s in 0..4usize {
