@@ -36,3 +36,36 @@ Same-run numbers, B1H8S2048, REF_ITERS=200, REF_ROWS=64, one event pair around b
 The main kernel without any partial write is 18.8 us (diagnostic): the remaining write cost is ~4 us, the rest is the fixed per-launch/prologue/epilogue cost.
 **Numerics**: fp16 partials: mean_abs vs `_vs128` 5.5e-5 (s=4) / 6.9e-5 (s=2) (fp32: 6.6e-6 / 3.3e-6; informational gate was 1e-4), max_abs = 1 bf16 ULP (7.8e-3 at |x| = 2), vs CPU mean error 8.41e-4 (fp32 8.39e-4).
 **Gates through the auto_split path** (`OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto_split REF_SPLIT=4`, guard decides per shape: 9 of the 15 gate shapes choose a split, 6 fall back to t128): 15/15 vs the CPU reference at 16 rows, parity 15/15 at REF_ROWS=64, bad = 0 at 16 and 64 rows, determinism 5/5 x3, max combined mean error 1.88e-3 (<= 2.0e-3; vendor 1.5-2.9e-3) - the two shapes above 1.5e-3 are fall-back shapes. Harness changes: `ref_host` default combine kernel `..._kvsplit_combine4h` and launch grid divided by 4 for `*combine4*` kernels; `run_ref.sh`/`determinism.sh` build `..._kvsplit_combine4h`.
+
+## Default auto dispatch (final)
+`OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto` (run_ref.sh / determinism.sh build `_vs128`, `_t128`, `_kvsplit`, `_kvsplit_combine4h`; `ref_host` picks per shape at launch time, no `REF_SPLIT` needed). Overrides: `REF_SPLIT=s` (+ `REF_SPLIT_FORCE=1`) forces a split candidate, `REF_NO_AUTO_SPLIT=1` disables the split, `REF_ROWS_PER_BLOCK`/`REF_OURS_BLOCK_THREADS` as before, `REF_PARTIAL_BYTES=4` for `nop16` (fp32 partial) builds. The `[split]`/`[grid]` lines print every candidate with its model times and the reason.
+**Guard** (candidates s in {2, 4}, best modelled T_kv that passes): `N256 <= 128 && N256 * s <= 256 && (s-1) * tps < ntiles && T_kv(s) < 0.95 * T_current`, with the model fitted to the measurements (docs above):
+- `T_t128 = F / (5.9e12 * min(256, 2 N256)) + 9.4 us` (9.4 us = the floor measured at SK = 1); `T_vs128 = F / (5.9e12 * min(256, N256))` for filling grids;
+- `T_kvsplit(s) = F / (5.9e12 * min(256, N256 s)) + 7 us` (phase 1 fixed prologue/epilogue cost) `+ partial_bytes / 4.0 TB/s` (epilogue write, not hidden) `+ max(3 us, (partial + out bytes) / 4.2 TB/s) + 1.5 us` (combine with its kernel floor + launch gap); partial bytes = `s * rows * 128 * 2 (fp16) + s * rows * 4`.
+The first version of the guard (kernel-occ's constants with fp16 bytes, no combine floor, t128 fixed 10.9 us) chose splits on tiny shapes where they lose 15% (B1H1S256 SK256: 13.7 vs 11.5 us; B2H4S300 SK129: 15.5 vs 13.2); with the two floors above no shape loses.
+**Per-shape results, default auto vs the same build with the split disabled** (300 iters, same run, both launches inside the event window of the split path):
+| shape | auto path | auto us | no-split us | speed-up |
+|---|---|---|---|---|
+| B1 H1 S256 SK256 | t128 | 11.5 | 11.5 | 1.00 |
+| B1 H2 S512 SK512 | t128 | 15.1 | 15.1 | 1.00 |
+| B2 H4 S1024 SK1024 | kvsplit | 22.1 | 22.0 | 1.00 |
+| **B1 H8 S2048 SK2048 (benchmark)** | kvsplit s=4 | **27.3** | 32.7 | **1.20** |
+| **B1 H2 S512 SK2048** | kvsplit | 21.4 | 31.0 | **1.45** |
+| B3 H3 S768 SK1280 | kvsplit | 22.8 | 23.2 | 1.02 |
+| B1 H4 S300 SK512 | t128 | 15.2 | 15.2 | 1.00 |
+| B2 H8 S700 SK640 | t128 | 18.0 | 18.0 | 1.00 |
+| B1 H16 S256 SK1024 | kvsplit | 19.0 | 21.6 | 1.14 |
+| B1 H2 S256 SK1000 | kvsplit | 18.4 | 22.2 | 1.21 |
+| B2 H4 S300 SK129 | t128 | 13.2 | 13.2 | 1.00 |
+| B1 H8 S512 SK100 | t128 | 11.1 | 11.1 | 1.00 |
+| B1 H2 S1024 SK1088 | t128 | 22.1 | 22.1 | 1.00 |
+| B1 H4 S77 SK1 | t128 | 9.4 | 9.4 | 1.00 |
+| **B1 H2 S200 SK1337** | kvsplit | 18.1 | 24.6 | **1.36** |
+| B1 H8 S1024 SK1024 (mid) | kvsplit | 22.0 | 21.9 | 1.00 |
+| B2 H8 S2048 SK2048 (mid, N256 = 128) | t128 | 37.2 | 37.3 | 1.00 |
+| B1 H8 S4096 SK4096 (mid, N256 = 128) | t128 | 60.2 | 60.4 | 1.00 |
+| B4 H8 S2048 SK2048 (filling) | `_vs128` | 56.0 | 55.7 | 0.99 |
+| B1 H8 S8192 SK8192 (filling) | `_vs128` | 154.7 | 154.1 | 1.00 |
+Filling and mid shapes are unchanged (the guard keeps them on `_vs128` / t128); the 15-shape gate takes the split on 7 shapes (B2H4S1024, B1H8S2048, B1H2S512 SK2048, B3H3S768, B1H16S256 SK1024, B1H2S256 SK1000, B1H2S200 SK1337) and the certified t128 on the other 8.
+**Gates through the default auto path** (no REF_SPLIT env): 15/15 vs the CPU reference at 16 rows, 0 bad at 16 and 64 rows, parity 15/15 (REF_ROWS=64), determinism 5/5 x3, max combined mean error 1.84e-3 (16 rows) / 1.88e-3 (64 rows), vendor 1.5-2.9e-3. The three REF_KERNEL_FAIL verdicts at 64 rows are the vendor's own bad elements.
+**Why the partial write cannot be hidden (keep):** the normalised `Ohat = O / l` and `lse` exist only after the LAST tile of the split, every block finishes at the same moment, and the combine kernel cannot start before the main kernel's stores have drained; per-tile stores would have to write unnormalised running state (a different algorithm). The ~4 us of write that remains (fp16, coalesced) is the floor for this algorithm; the other ~19 us of the main kernel is compute (11.4 us) plus fixed per-launch/prologue/epilogue cost.

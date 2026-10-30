@@ -978,3 +978,7 @@ See docs/gen4-tiling-design.md section 9. B1H8S2048 (64 blocks of 256 rows = 25%
 ## Round 60 (kernel-opt): KV-split (sequence-parallel attention + exact merge)
 See docs/kvsplit-results.md. B1H8S2048 s=4: 28.0 us total (main 23.0 + combine 5.2) = 613 TFLOP/s = 1.21x t128 (505) = 1.18x vendor (520) with fp16 partials, LDS-transposed coalesced 16-byte stores and a 4-elements-per-thread combine; fp32 partials 556. Numerics vs _vs128: mean_abs 5.5e-5 (fp16) / 6.6e-6 (fp32), max 1 bf16 ULP; vs CPU mean err 8.4e-4. Gates via auto_split (guard): 15/15, parity 15/15, 0 bad at 16/64 rows, determinism 5/5 x3. New compiler ops: Op::Log2F32, Stmt::StoreF32x4.
 
+
+### Round 60 addendum (kernel-opt): KV-split in the DEFAULT auto dispatch
+OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto now applies the calibrated guard (N256 <= 128 && N256*s <= 256 && tiles && T_kv < 0.95 T_current, s in {2,4}) at launch time and runs _kvsplit + _kvsplit_combine4h inside one event window when it wins, else the certified t128 / _vs128 rule. Benchmark B1H8S2048: 27.3 us vs 32.7 us without split (1.20x; vs the vendor 1.18x in the earlier same-run measurement); B1H2S512 SK2048 1.45x; B1H2S200 SK1337 1.36x; filling and mid shapes unchanged (1.00x). 15-shape gate through the default path: 7 shapes split / 8 t128, 15/15, parity 15/15, 0 bad at 16/64 rows, determinism 5/5 x3, max mean err 1.88e-3. Details and the guard table: docs/kvsplit-results.md.
+
