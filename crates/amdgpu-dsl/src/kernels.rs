@@ -14763,7 +14763,8 @@ fn emit_fmha_vsm_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// `amdgpu_safeasm::examples::global_probe_block`). out[tid] = in[4*tid..4*tid+4].sum() + 64.0.
 /// Memory-order probe for the fused-combine (last-arriver) pattern. `mode`: 0 = full fences (`fence_release` + `fence_acquire`: wait, `buffer_wbl2 sc1`,
 /// wait / wait, `buffer_inv sc1`), 1 = lite (waits only, no L2 write-back / invalidate), 2 = none (no fence at all: expected to be able to fail; it proves
-/// the probe can detect a violation). Every lane of every 64-thread block writes `(bid+1)*1000+tid` to `part[bid*64+tid]` with a write-through store,
+/// the probe can detect a violation). Modes 3 and 4 use PLAIN stores/loads (no sc1): 3 = no fence (must be able to fail across XCDs), 4 = full fences
+/// (`buffer_wbl2 sc1` / `buffer_inv sc1`) only, the LLVM agent-scope release/acquire sequence. Every lane of every 64-thread block writes `(bid+1)*1000+tid` to `part[bid*64+tid]` with a write-through store,
 /// releases, does `old = atomic_add(counter, 1)` (per lane: the lane that gets `old == nblocks*64-1` is the last arriver in the whole grid), and that
 /// wave acquires and sums all partials with coherent loads into `result[0]`.
 fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
@@ -14791,9 +14792,13 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     let valf = b.bitcast_f32(Opnd::Val(val));
     let off = b.mul_i32(idx, c4);
     let pp = b.ptr_add(part, off);
-    b.store_f32_wt(pp, 0, Opnd::Val(valf));
+    if mode >= 3 {
+        b.store_f32(pp, 0, Opnd::Val(valf));
+    } else {
+        b.store_f32_wt(pp, 0, Opnd::Val(valf));
+    }
     match mode {
-        0 => b.fence_release(),
+        0 | 4 => b.fence_release(),
         1 => b.fence_release_lite(),
         _ => {}
     }
@@ -14803,7 +14808,7 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     let is_last = b.let_(Op::CmpGeI32(Opnd::Val(old), Opnd::Val(last_ticket)));
     b.begin_if(Opnd::Val(is_last));
     match mode {
-        0 => b.fence_acquire(),
+        0 | 4 => b.fence_acquire(),
         1 => b.fence_acquire_lite(),
         _ => {}
     }
@@ -14812,7 +14817,7 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     let (i, s) = (vars[0], vars[1]);
     let io = b.mul_i32(i, c4);
     let q = b.ptr_add(part, io);
-    let x = b.load_f32_coherent(q, 0);
+    let x = if mode >= 3 { b.load_f32(q, 0) } else { b.load_f32_coherent(q, 0) };
     let xi = b.bitcast_i32(Opnd::Val(x));
     let s2 = b.add_i32(s, xi);
     b.set_var(s, Opnd::Val(s2));
@@ -14838,6 +14843,14 @@ pub fn probe_last_arriver_lite() -> Function {
 
 pub fn probe_last_arriver_nofence() -> Function {
     probe_last_arriver_mode("probe_last_arriver_nofence", 2)
+}
+
+pub fn probe_last_arriver_plain() -> Function {
+    probe_last_arriver_mode("probe_last_arriver_plain", 3)
+}
+
+pub fn probe_last_arriver_plain_fenced() -> Function {
+    probe_last_arriver_mode("probe_last_arriver_plain_fenced", 4)
 }
 
 pub fn probe_log_store4() -> Function {

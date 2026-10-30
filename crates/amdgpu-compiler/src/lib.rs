@@ -252,6 +252,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_log_store4" => Some(amdgpu_dsl::kernels::probe_log_store4()),
         "probe_last_arriver" => Some(amdgpu_dsl::kernels::probe_last_arriver()),
         "probe_last_arriver_lite" => Some(amdgpu_dsl::kernels::probe_last_arriver_lite()),
+        "probe_last_arriver_plain" => Some(amdgpu_dsl::kernels::probe_last_arriver_plain()),
+        "probe_last_arriver_plain_fenced" => Some(amdgpu_dsl::kernels::probe_last_arriver_plain_fenced()),
         "probe_last_arriver_nofence" => Some(amdgpu_dsl::kernels::probe_last_arriver_nofence()),
         "probe_dma_tile" => Some(amdgpu_dsl::kernels::probe_dma_tile()),
         "probe_dma_seq" => Some(amdgpu_dsl::kernels::probe_dma_seq()),
