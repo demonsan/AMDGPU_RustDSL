@@ -51,6 +51,7 @@ VRcpF32     | V1 <- V1 | {d} = nofpexcept V_RCP_F32_e32 {s0}, implicit $mode, im
 VCvtF32F16  | V1 <- V1 | {d} = nofpexcept V_CVT_F32_F16_e32 {s0}, implicit $mode, implicit $exec
 VCvtF16F32  | V1 <- V1 | {d} = nofpexcept V_CVT_F16_F32_e32 {s0}, implicit $mode, implicit $exec
 VAndB32     | V1 <- V1 V1 | {d} = V_AND_B32_e32 {s0}, {s1}, implicit $exec
+VMinI32     | V1 <- V1 V1 | {d} = V_MIN_I32_e32 {s0}, {s1}, implicit $exec
 VOrB32      | V1 <- V1 V1 | {d} = V_OR_B32_e32 {s0}, {s1}, implicit $exec
 VXorB32     | V1 <- V1 V1 | {d} = V_XOR_B32_e32 {s0}, {s1}, implicit $exec
 VLshrB32    | V1 <- I V1  | {d} = V_LSHRREV_B32_e32 {s0}, {s1}, implicit $exec

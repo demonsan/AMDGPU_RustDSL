@@ -9700,8 +9700,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         for q in 0..4i32 {
             let cq = b.c_i32(8 * q);
             let row_raw = b.add_i32(rb, cq);
-            let ok = b.cmp_lt_i32(row_raw, cx.kv_len);
-            let row = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(row_raw), b: Opnd::Val(cx.kv_last) });
+            // dmin: one v_min_i32 instead of v_cmp + v_cndmask for the clamp to the last key row
+            let row = if fmha_t_opt("dmin") {
+                b.min_i32(row_raw, cx.kv_last)
+            } else {
+                let ok = b.cmp_lt_i32(row_raw, cx.kv_len);
+                b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(row_raw), b: Opnd::Val(cx.kv_last) })
+            };
             let o0 = b.mul_i32(row, seqs);
             let o3 = if dmah {
                 b.add_i32(o0, oq[q as usize])
@@ -9724,8 +9729,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let w64r = b.shl_i32(wlo, c6d);
         let kr0 = b.add_i32(key0, w64r);
         let kr1 = b.add_i32(kr0, lane_v);
-        let kok = b.cmp_lt_i32(kr1, cx.kv_len);
-        let krow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kok), a: Opnd::Val(kr1), b: Opnd::Val(cx.kv_last) });
+        let krow = if fmha_t_opt("dmin") {
+            b.min_i32(kr1, cx.kv_last)
+        } else {
+            let kok = b.cmp_lt_i32(kr1, cx.kv_len);
+            b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kok), a: Opnd::Val(kr1), b: Opnd::Val(cx.kv_last) })
+        };
         let kdr = b.mul_i32(krow, hq4_d);
         let kdo = b.add_i32(kdr, cx.kd_base);
         let kdp_ptr = b.ptr_add(cx.ptr_kd, kdo);

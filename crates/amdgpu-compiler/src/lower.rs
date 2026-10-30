@@ -85,7 +85,7 @@ fn is_inline_const(bits: i64) -> bool {
 fn imm_ok(op: MOp, bits: i64) -> bool {
     match op {
         MOp::VMulLoU32 => (-16..=64).contains(&bits), // VOP3 on gfx9: in-line constants only
-        MOp::VAddU32 | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VAndB32 | MOp::VXorB32 | MOp::VOrB32 => true,
+        MOp::VAddU32 | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VAndB32 | MOp::VXorB32 | MOp::VOrB32 | MOp::VMinI32 => true,
         _ => false,
     }
 }
@@ -419,6 +419,7 @@ impl Lowerer {
                 | Some(Op::PermB32(..))
                 | Some(Op::LshrI32(..))
                 | Some(Op::AndI32(..))
+                | Some(Op::MinI32(..))
                 | Some(Op::PkSubU16(..))
                 | Some(Op::Select { .. })
                     if opt_on("retarget2") =>
@@ -1610,6 +1611,7 @@ impl Lowerer {
             Op::MulF32(a, b) => self.bin_v1(dst, MOp::VMulF32, *a, *b)?,
             Op::MaxF32(a, b) => self.bin_v1(dst, MOp::VMaxF32, *a, *b)?,
             Op::AndI32(a, b) => self.bin_v1(dst, MOp::VAndB32, *a, *b)?,
+            Op::MinI32(a, b) => self.bin_v1(dst, MOp::VMinI32, *a, *b)?,
             Op::XorI32(a, b) => self.bin_v1(dst, MOp::VXorB32, *a, *b)?,
             Op::MulI32(a, b) => self.bin_v1(dst, MOp::VMulLoU32, *a, *b)?,
             Op::ShlI32(a, b) => {
@@ -2515,6 +2517,7 @@ fn dce(m: &mut MFunction) {
                 | MOp::VAddU32
                 | MOp::VMulLoU32
                 | MOp::VAndB32
+                | MOp::VMinI32
                 | MOp::VOrB32
                 | MOp::VXorB32
                 | MOp::VLshrB32
@@ -2668,7 +2671,7 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
             op,
             MOp::VMovB32 | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VPtrAdd | MOp::VAddU32 | MOp::VAddCoU32 | MOp::VAddcCoU32
                 | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VMax3F32 | MOp::VFmaF32 | MOp::VExpF32 | MOp::VLogF32
-                | MOp::VRcpF32 | MOp::VAndB32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32 | MOp::VMulLoU32
+                | MOp::VRcpF32 | MOp::VAndB32 | MOp::VMinI32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32 | MOp::VMulLoU32
                 | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VReadPhys | MOp::VCmpLtI32 | MOp::VCmpGtI32 | MOp::VCmpGeI32
                 | MOp::VCmpNeI32 | MOp::VCmpLtF32
         )

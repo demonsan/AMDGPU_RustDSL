@@ -80,6 +80,7 @@ pub enum MOp {
     VCvtF32F16,
     VCvtF16F32,
     VAndB32,
+    VMinI32,
     VOrB32,
     VXorB32,
     VLshrB32,

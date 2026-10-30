@@ -73,6 +73,7 @@ fn movable(op: MOp) -> bool {
             | MOp::VAddU32
             | MOp::VMulLoU32
             | MOp::VAndB32
+            | MOp::VMinI32
             | MOp::VOrB32
             | MOp::VXorB32
             | MOp::VLshrB32

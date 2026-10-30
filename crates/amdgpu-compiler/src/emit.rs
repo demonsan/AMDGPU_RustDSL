@@ -331,6 +331,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VCvtF32F16 => un(a, inst, "v_cvt_f32_f16_e32"),
         MOp::VCvtF16F32 => un(a, inst, "v_cvt_f16_f32_e32"),
         MOp::VAndB32 => bin(a, inst, "v_and_b32_e32"),
+        MOp::VMinI32 => bin(a, inst, "v_min_i32_e32"),
         MOp::VOrB32 => bin(a, inst, "v_or_b32_e32"),
         MOp::VXorB32 => bin(a, inst, "v_xor_b32_e32"),
         MOp::VLshlB32 => vec![format!(
