@@ -9718,7 +9718,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // kddma: the K-scale dwords go straight from global memory into the LDS K-scale ring with `global_load_lds_dword` (no VGPR round trip, no ds_write, the
     // same vmcnt wait as the K tile): wave w (waves 2, 3 duplicate waves 0, 1) covers rows 64 (w & 1) + lane, written to lds_kd + slot*512 + 4 row
-    let kddma = fmha_t_opt("kddma");
+    let kddma = fmha_t_opt("kddma") || !fmha_t_opt("nokddma"); // default ON (`nokddma`: K scales through VGPR + ds_write)
     let kd_dma = |b: &mut FnBuilder, key0: ValueId, slot_off: ValueId| {
         let wlo = b.let_(Op::AndI32(Opnd::Val(cx.wave4), Opnd::Val(c1)));
         let w64r = b.shl_i32(wlo, c6d);
