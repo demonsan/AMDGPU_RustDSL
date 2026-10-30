@@ -372,6 +372,16 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         b.insts = out;
     }
 }
+/// Wait states until an MFMA has finished WRITING its destination (not the value-level RAW latency): 16-pass ops need 18 + 1 (CDNA4 ISA 7.6 "XDL write
+/// VGPR -> VALU write of the same VGPR"), the 32x32x64 scaled and sparse forms 21.
+fn mfma_dst_wait(lat: usize) -> usize {
+    if lat == 20 {
+        21
+    } else {
+        19
+    }
+}
+
 /// Post-register-allocation hazard: a VALU (or other) write to a physical VGPR range that a still
 /// running MFMA reads (SrcA/B/C) can corrupt the MFMA. Allocation reuses registers freely and the
 /// value-level pass above cannot see it; a scheduler that moves definitions closer to MFMAs makes
@@ -384,10 +394,45 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
         (b, b + m.vreg_class(r).dwords())
     };
     let overlaps = |x: (u32, u32), y: (u32, u32)| x.0 < y.1 && y.0 < x.1;
+    // MFMA DESTINATIONS still being written when the block is left (per block: canonical vreg, physical range, remaining wait states). A register reuse
+    // by a different value in the successor must wait too. Computed from the unpadded block (padding only shortens what remains).
+    let succs = crate::sched::liveness::successors(m);
+    let exit_dst: Vec<Vec<(VReg, (u32, u32), usize)>> = m
+        .blocks
+        .iter()
+        .map(|b| {
+            let mut cycle = 0usize;
+            let mut live: Vec<(usize, usize, VReg, (u32, u32))> = Vec::new();
+            for inst in &b.insts {
+                if let (Some(l), Some(d)) = (mfma_latency(inst.op), inst.dst) {
+                    live.push((cycle, mfma_dst_wait(l), m.canon(d), rng(m, d)));
+                }
+                if matches!(inst.op, MOp::SNop) {
+                    cycle += inst.imm as usize;
+                }
+                cycle += 1;
+                live.retain(|(i, n, _, _)| i + n > cycle);
+            }
+            live.iter().map(|(i, n, d, r)| (*d, *r, i + n - cycle)).collect()
+        })
+        .collect();
+    let mut entry_dst: Vec<Vec<(VReg, (u32, u32), usize)>> = vec![Vec::new(); m.blocks.len()];
+    for (bi, ss) in succs.iter().enumerate() {
+        for &s in ss {
+            if s < entry_dst.len() {
+                for e in &exit_dst[bi] {
+                    entry_dst[s].push(*e);
+                }
+            }
+        }
+    }
     let blocks = std::mem::take(&mut m.blocks);
     let mut out_blocks = Vec::with_capacity(blocks.len());
-    for mut b in blocks {
+    for (bi, mut b) in blocks.into_iter().enumerate() {
         let mut out: Vec<MInst> = Vec::with_capacity(b.insts.len() + 8);
+        // in-flight MFMA destinations: (issue cycle, wait states, canonical dst vreg, physical range). Entries inherited from predecessors are issued
+        // at cycle 0 with only their remaining wait states left.
+        let mut dst_inflight: Vec<(usize, usize, VReg, (u32, u32))> = entry_dst[bi].iter().map(|(d, r, rem)| (0usize, *rem, *d, *r)).collect();
         // (issue cycle, wait states needed, op, source ranges)
         let mut inflight: Vec<(usize, usize, MOp, Vec<(u32, u32)>)> = Vec::new();
         let mut cycle = 0usize;
@@ -420,6 +465,34 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 // two-instruction expansions write the whole pair (already covered by dst range)
             }
             let mut earliest = cycle;
+            // physical WAW/RAW through a DIFFERENT value: another vreg whose register range overlaps the destination of an MFMA that is still writing
+            // it (typically the MFMA result was dead - e.g. the last tile of an unrolled loop copy - so allocation handed its registers to a new value).
+            // The late MFMA write would overwrite that value. The MFMA's own vreg is the value-level pass's business.
+            if !dst_inflight.is_empty() {
+                let mut touched: Vec<VReg> = inst.uses();
+                if mfma_latency(inst.op).is_none() {
+                    if let Some(d) = inst.dst {
+                        touched.push(d);
+                    }
+                    if inst.op == MOp::VPermlane32Swap {
+                        for s in inst.srcs.iter().take(2) {
+                            if let Src::Reg(r) = s {
+                                touched.push(*r);
+                            }
+                        }
+                    }
+                }
+                for (issue, need, dv, drange) in &dst_inflight {
+                    for r in &touched {
+                        if !m.vreg_class(*r).is_vector() || m.canon(*r) == *dv {
+                            continue;
+                        }
+                        if overlaps(rng(m, *r), *drange) {
+                            earliest = earliest.max(issue + need);
+                        }
+                    }
+                }
+            }
             for (issue, need, op, srcs) in &inflight {
                 if inst.op == *op && matches!(inst.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VSmfmac16x16x128Fp8) {
                     continue; // in-place accumulation chain of the same opcode
@@ -458,12 +531,16 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
                 inflight.push((cycle, need, inst.op, srcs));
             }
+            if let (Some(l), Some(d)) = (mfma_latency(inst.op), inst.dst) {
+                dst_inflight.push((cycle, mfma_dst_wait(l), m.canon(d), rng(m, d)));
+            }
             if matches!(inst.op, MOp::SNop) {
                 cycle += inst.imm as usize;
             }
             out.push(inst);
             cycle += 1;
             inflight.retain(|(issue, need, _, _)| issue + need > cycle);
+            dst_inflight.retain(|(issue, need, _, _)| issue + need > cycle);
         }
         let mut missing = inflight.iter().map(|(i, n, _, _)| (i + n).saturating_sub(cycle)).max().unwrap_or(0);
         while missing > 0 {
