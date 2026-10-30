@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -126,14 +127,14 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(out.data(), dout, no * 2, hipMemcpyDeviceToHost));
     const int iters = envi("REF_ITERS", 0);
     const double flops = 4.0 * B * H * (double)S * SK * D;
-    auto time_kernel = [&](hipFunction_t f, const char* label) {
+    auto time_kernel = [&](hipFunction_t f, const char* label, int gdiv = 256, int bdim = 512) {
         if (iters <= 0) return;
         hipEvent_t e0, e1;
         CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
-        for (int w = 0; w < 3; ++w) CK(hipModuleLaunchKernel(f, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
+        for (int w = 0; w < 3; ++w) CK(hipModuleLaunchKernel(f, (S + gdiv - 1) / gdiv, H, B, bdim, 1, 1, 0, nullptr, nullptr, extra));
         CK(hipDeviceSynchronize());
         CK(hipEventRecord(e0));
-        for (int w = 0; w < iters; ++w) CK(hipModuleLaunchKernel(f, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
+        for (int w = 0; w < iters; ++w) CK(hipModuleLaunchKernel(f, (S + gdiv - 1) / gdiv, H, B, bdim, 1, 1, 0, nullptr, nullptr, extra));
         CK(hipEventRecord(e1));
         CK(hipEventSynchronize(e1));
         float ms = 0; CK(hipEventElapsedTime(&ms, e0, e1));
@@ -193,12 +194,17 @@ int main(int argc, char** argv) {
         hipModule_t mod2; hipFunction_t fn2;
         CK(hipModuleLoad(&mod2, co2));
         CK(hipModuleGetFunction(&fn2, mod2, kname2));
-        CK(hipModuleLaunchKernel(fn2, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
+        // `_t128` kernels (and REF_GRID128=1): 128-row blocks of 256 threads (4 waves), grid x = ceil(S / 128)
+        const std::string kn2(kname2);
+        const bool g128 = envi("REF_GRID128", 0) != 0 || (kn2.size() >= 4 && kn2.compare(kn2.size() - 4, 4, "t128") == 0);
+        const int gdiv2 = g128 ? 128 : 256, bdim2 = g128 ? 256 : 512;
+        std::printf("our kernel launch: grid (%d, %d, %d) x %d threads\n", (S + gdiv2 - 1) / gdiv2, H, B, bdim2);
+        CK(hipModuleLaunchKernel(fn2, (S + gdiv2 - 1) / gdiv2, H, B, bdim2, 1, 1, 0, nullptr, nullptr, extra));
         CK(hipDeviceSynchronize());
         std::vector<uint16_t> out2(no, 0);
         CK(hipMemcpy(out2.data(), dout2, no * 2, hipMemcpyDeviceToHost));
         bad2 = check(out2, "our kernel   vs CPU");
-        time_kernel(fn2, "ours");
+        time_kernel(fn2, "ours", gdiv2, bdim2);
         double wd = 0.0, md = 0.0;
         for (size_t i = 0; i < no; ++i) {
             const double dd = std::fabs((double)bf2f(out[i]) - (double)bf2f(out2[i]));
