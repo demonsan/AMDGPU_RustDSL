@@ -179,3 +179,72 @@ tests, 18 compile-fail cases, `pv_phase`).
 ### First real use: the `_vs128` row-sum chain
 
 `FMHA_OPT=<default recipe>,safeasm` routes the four in-place SMFMACs of the per-tile row sum (`smfv`) through `examples::rowsum_var_block()` and `Stmt::VarAsm` (12 statements replace 48 `VarSmfmac`). Result: the emitted assembly is BYTE-IDENTICAL to the DSL path (md5 equal), 15 shapes pass 3 times (REF_OK 15/15; at 64 rows the same 12/3 as the normal path), 358.2 TFLOP/s. Default behaviour is unchanged (the flag is opt-in).
+
+## Round-3 final verification (independent, GPU 5, Main `f374320`)
+
+### Byte-identical integration, reproduced
+
+`_vs128` emitted with `--backend own` in three configurations - `FMHA_OPT` unset (base), the explicit default recipe
+(`cvt4,pksub,lazy,msum,permlane,kdlds,dbuf,lacc1,psh2,svpk,svcorr,swz`) and that recipe plus `safeasm`:
+
+* `.s` md5 is **bc0590617995ebb13c79afd31efcca33** in all three cases (9825 lines each), `.co` md5
+  **57f6bc1a4ee650e29faf27cf30e36ff7** in all three, vgpr=248 sgpr=45;
+* `diff base.s safeasm.s` = **0 lines**, `diff default.s safeasm.s` = **0 lines**;
+* the DSL dump shows the route is actually taken: default has 48 `varN += smfmac(...)` statements and 0 asm blocks,
+  `safeasm` has **12 `varN <- asm `safeasm` (...)`** blocks and 0 `VarSmfmac` (48 SMFMACs -> 12 `Stmt::VarAsm`, 36
+  fewer dump lines). The flag is opt-in; the default build is unchanged.
+
+### Gates, determinism and timing on the safeasm build (GPU 5)
+
+* 15 reference shapes at **16 rows**: **15/15 REF_KERNEL_OK, 0 FAIL** (identical per-shape result lines to the default build).
+* 15 reference shapes at **64 rows**: **12 OK / 3 FAIL - exactly the same 12/3 as the default build** (this is the known
+  worst-element noise at the 64-row sample, not a safe-asm regression; the asm is byte-identical).
+* determinism 3 runs x 5 shapes: **5/5 DET_OK**, identical md5 per shape.
+* timing, same vendor reference and same run: default **358.88 / 358.99 / 359.33 TFLOP/s**, safeasm
+  **359.39 / 359.21 / 359.17 TFLOP/s** (vendor 516.2 - 517.0 in the same runs) - identical within noise, matching the
+  reported ~358 TFLOP/s.
+
+### Final closed/open table
+
+| issue | status | evidence |
+|---|---|---|
+| F1 dropped matrix token / early read of D | **closed** | `In`... see round 2; `E0382`, poison, verifier; unchanged |
+| F2 WAR/WAW on in-flight operands | **closed** | poison + verifier WAR diagnostics |
+| F3 verifier in `finish()` / `Op::Asm` lowering | **closed** | runs in all three places; forged/rewritten streams rejected |
+| F4 chain across opcodes | **closed** | `chain` only on `Mfma<OP_MFMA_SCALE>`, `E0599` for the `_zero` form |
+| F5 2-state wait rule | **closed/validated** | hardware: fresh value already at 1 state for all four 2-state classes; 2 is safe |
+| F6 `vcc()` | **closed** | returns `Option`, second call is `None` (no panic) |
+| F8 writable input ports (round-2 hole, hardware-confirmed) | **closed** | `Seq::input` returns `In<N>`: writing is `E0277 &mut In<1>: Dst<1>`, `lane_mut` `E0308`, matrix accumulator `E0308`; verifier rejects any instruction defining an input register and `lower_asm` re-checks the lowered MIR. An in/out block fully bound through `Op::Asm` passes DSL verify but is rejected at lowering ("6 inputs bound for 5 read-only ports (in/out port bound: false)"). Positive hardware check: a block that *reads* an input, embedded in a kernel that stores the same DSL value before and after, leaves it at 7.0 (lane0 = [7, 7]) |
+| F9 undefined output | **closed** | `finish()` -> "output port r0 is never written by the sequence (an undefined value would flow into the kernel)" |
+| F10 `ds_write` unusable | **closed** | `ds_write_b32` takes a scoreboard slot without a token; `finish()` Ok, listing `[... LdsWriteB32, SWaitLgkm ...]` |
+| F11 const-folded stream vs wait states | **closed** | the folded stream is re-verified; the round-2 "19 dropped splats" block now emits **20 wait states** between the MFMA and its reader (needs 20) |
+| F12 forge/malformed input | **closed** | `forge_for_tests` is **unreachable in a normal build** (`E0425 cannot find value`), `AsmBlock` fields are private (`E0451`), `verify_insts` only returns a diagnostic (cannot manufacture a block), malformed `s_nop` immediates and saturating arithmetic are verifier errors |
+| input-through-loop / `inout` misuse | **closed** | `var_asm` with a wrong loop-variable type -> "in/out port V4 does not match var0"; wrong input count -> "4 inputs bound for 5 remaining ports"; correct loop use verifies clean |
+
+### Hardware-measured minimum wait states (gfx950, GPU 5) - carried forward, unchanged
+
+| rule | states tried | first correct | crate requires | verdict |
+|---|---|---|---|---|
+| VALU -> MFMA A/B | 1,2,3,4 | **1** | 2 | 2 safe |
+| VALU -> `v_readfirstlane` | 1,2,3,4 | **1** | 2 | 2 safe |
+| VALU -> SMFMAC operand | 1,2,3,4 | **1** | 2 | 2 safe |
+| compare -> `v_cndmask` mask | 1,2,3,4 | **1** | 2 | 2 safe |
+| MFMA result -> reader | 1,8,12,16,20 | **8** (1 stale: 0 vs 64) | 20 | 20 conservative/safe |
+
+### Final guarantee verdict
+
+**Yes - with a precisely scoped sentence.** For a sequence obtained from `Seq::finish()` and embedded through
+`Op::Asm` / `Stmt::VarAsm` into a kernel built by `amdgpu-compiler`, the crate's guarantee can now be quoted as:
+
+> A safe-authored sequence cannot corrupt the kernel's data and cannot emit an illegal or under-padded instruction
+> hazard: it can only write registers it owns or the in/out port it was given (inputs are read-only at the type,
+> verifier and lowering levels), every output is defined, and the emitted instruction stream satisfies the 2-wait
+> VALU->matrix, 20-wait matrix-result and DS/VMEM scoreboard rules with no WAR/WAW against in-flight matrix ops,
+> independently of the type-level discipline (poison flag + verifier + the MIR hazard pass).
+
+What this does **not** claim: arithmetic/value correctness (scale semantics, index patterns, wrong fragment contents);
+hazards across arbitrary control flow other than the `VarAsm` in/out contract (block-boundary contracts for
+software-pipelined loops are still not modelled); and anything outside a safe block (`amdgpu-compiler`'s MIR remains
+an unchecked IR for hand-written code). The independent round-3 evidence above (byte-identical `_vs128` assembly,
+15/15 + 12/3 gates matching the default, 5/5 determinism, equal timing) is what upgrades the claim from "inside its
+own API" to "usable in the real kernel".
