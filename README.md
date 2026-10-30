@@ -11,7 +11,7 @@ kernel 作者和自动化 agent 在一个**类型化、可验证、可快速迭�
 | Rust 类型化 DSL、IR 验证器、MIR、线性扫描 RA、hazard / wait 插入、asm 发射 | 已实现，`cargo test` 11 项 |
 | 端到端：DSL → `.s` → `.co` → HIP 启动 → 数值比对 | 已打通，见 `tests/gpu/` |
 | `attention_fwd`（fp16，示例） | 对 CPU 参考最大绝对误差 ≈ 6e-5 |
-| MXFP8 FMHA：`fmha_fwd_hd128_mxfp8_t` | 与厂商 `fwd_hd128_mxfp8.co` 使用**相同的 656 字节 kernarg ABI 和数据布局**，15 个形状逐元素对拍通过；B1H8S2048 上 360 TFLOP/s（厂商 514，差 1.43 倍），对 CPU 的平均误差 1.25e-3（优于厂商 2.42e-3） |
+| MXFP8 FMHA：`fmha_fwd_hd128_mxfp8_t` | 与厂商 `fwd_hd128_mxfp8.co` 使用**相同的 656 字节 kernarg ABI 和数据布局**，15 个形状逐元素对拍通过；B1H8S2048 上 291 TFLOP/s（llvm-tail；厂商 514，差 1.76 倍；快速路径 `fmha_fwd_hd128_mxfp8_vs128` 见下），对 CPU 的平均误差 1.25e-3（优于厂商 2.42e-3） |
 
 `fmha_fwd_hd128_mxfp8_t` 的功能：head dim 128，fp8(e4m3) Q/K/V，E8M0 1×32 Q/K 缩放，标量 V 缩放，BF16 输出，`exp2` softmax，在线 softmax，任意 query / key 长度（含不满一块的 tile），GQA（2 的幂 ≤ 16），任意 batch / head 数。不支持 LSE 输出。
 
@@ -74,3 +74,8 @@ REF_CO=/path/to/fwd_hd128_mxfp8.co OUR_KERNEL=fmha_fwd_hd128_mxfp8_t bash tests/
 - 没有跨卡通信（MORI LSA / SDMA / GDA）、gfx1250 后端、JIT / 框架适配的实现；`docs/design.md` 里这些仍是设计。
 - 设计文档中的 Resource / Async IR 只落地了一部分（LDS 区域、待完成加载的 wait 跟踪）。
 - 没有测量 ≤10 ms 的编译延迟，不做这个声明。
+
+## 最终 FMHA 架构（第 57 轮）
+- **快速路径** `fmha_fwd_hd128_mxfp8_vs128`（仅 own 后端：global->LDS DMA 暂存）：厂商结构（128 键单位、每 128 键 2 个 barrier、DMA 暂存、双 wave 组互补相位）+ 精确参考 recipe（每单位重对齐的 rollback 阈值 120/512、两字 f16 bias、长序列不用 LUT 修正、短序列 <9 tile 用 LUT 修正的第二份代码）+ smfmac 行和 + Q 常驻寄存器。B1H8S2048 **367 TFLOP/s**（厂商 ~514，差 1.40 倍），对 CPU 平均误差 6.9e-4（厂商 2.42e-3），15/15 形状、64 行下 bad=0、确定性 5/5。
+- **精确默认** `fmha_fwd_hd128_mxfp8_t`（llvm-tail 可用）：292 TFLOP/s，mean err 1.25e-3。
+- **实验** `fmha_fwd_hd128_mxfp8_g2`（仅按名字注册，own 后端）：QK(t+1) 放进 V 相位（3-slot ring），输出与 `_vs128` 逐位一致，333/344 TFLOP/s（低于 `_vs128`）；结论与第二代前置条件见 `docs/kernel-gen2-design.md` §6-7 与 `docs/status.md` 第 57 轮。
