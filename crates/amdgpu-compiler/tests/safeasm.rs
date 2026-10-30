@@ -665,7 +665,7 @@ fn var_asm_n_binds_inout_ports_in_declaration_order() {
             b.var_smfmac_fp8(vars[0], a_rs, pa, c3);
             b.var_smfmac_fp8(vars[1], a_rs, pa, c3);
         }
-        let stop = b.c_i32(1);
+        let stop = b.cmp_lt_i32(c0, c3); // always true: one iteration
         b.break_if(Opnd::Val(stop));
         b.end_loop();
         let x = b.frag4_lane(Opnd::Var(vars[1]), 2);
