@@ -23,8 +23,8 @@ fn main() {
     // loads: issue, then wait (partial count derived from the scoreboard)
     let addr = s.splat(0);
     let (d0, d1) = (s.vgpr::<4>(), s.vgpr::<4>());
-    let r0 = s.ds_read_b128(d0, &addr, 0);
-    let r1 = s.ds_read_b128(d1, &addr, 16);
+    let r0 = s.ds_read_b128::<0>(d0, &addr);
+    let r1 = s.ds_read_b128::<16>(d1, &addr);
     let v0 = r0.wait(&mut s);
     let v1 = r1.wait(&mut s);
     s.output(v0);
