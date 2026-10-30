@@ -11803,6 +11803,95 @@ pub fn sched_coissue_cboth() -> Function {
 pub fn sched_coissue_cvalu() -> Function {
     sched_coissue_kernel("sched_coissue_cvalu", 2, 1)
 }
+/// Intra-wave overlap probe: every wave issues MFMAs (4 independent accumulators x 2 dependent steps) and an independent VALU conversion
+/// workload (16 chains of the softmax recipe) per iteration. mode 0 = both (MFMAs first, then the VALU), 1 = MFMA only, 2 = VALU only,
+/// 3 = both with the VALU first.
+fn sched_ovl_kernel(name: &str, mode: u8) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c64 = b.c_i32(64);
+    let off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, off);
+    let ones = b.c_i32(0x38383838_u32 as i32);
+    let f4 = b.frag4(ones, ones, ones, ones);
+    let a8 = b.cat_frag8(f4, f4);
+    let twos = b.c_i32(0x40404040_u32 as i32);
+    let f4b = b.frag4(twos, twos, twos, twos);
+    let b8 = b.cat_frag8(f4b, f4b);
+    let zero = b.frag_zero(DType::Frag16);
+    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0))];
+    for _ in 0..4 {
+        inits.push((DType::Frag16, Opnd::Val(zero)));
+    }
+    for k in 0..16 {
+        let f = b.c_f32(0.1 + 0.01 * k as f32);
+        let fi = b.bitcast_i32(f);
+        inits.push((DType::I32, Opnd::Val(fi)));
+    }
+    let vars = b.begin_loop(&inits);
+    let c4s = b.c_i32(4);
+    let cmk = b.c_i32(0x0007_0007);
+    let lut_lo = b.c_i32(i32::from_le_bytes([0, 6, 9, 11]));
+    let lut_hi = b.c_i32(i32::from_le_bytes([11, 10, 7, 3]));
+    let one_f = b.c_f32(1.0);
+    let two_f = b.c_f32(0.5);
+    let do_m = |b: &mut FnBuilder| {
+        for k in 1..5usize {
+            b.var_mfma_scale(vars[k], a8, b8, 127, 127);
+            b.var_mfma_scale(vars[k], a8, b8, 127, 127);
+        }
+    };
+    let do_v = |b: &mut FnBuilder| {
+        for k in 0..16usize {
+            let x = b.bitcast_f32(vars[5 + k]);
+            let y = b.add_f32(x, two_f);
+            let u = b.cvt_pknorm_pair(x, y);
+            let s1 = b.let_(Op::LshrI32(Opnd::Val(u), Opnd::Val(c4s)));
+            let s2 = b.let_(Op::AndI32(Opnd::Val(s1), Opnd::Val(cmk)));
+            let pm = b.perm_b32(lut_hi, lut_lo, s2);
+            let w = b.pk_sub_u16(u, pm);
+            let wd = b.cvt_p8x4_from_u16(w, w, one_f);
+            let xn = b.bitcast_f32(wd);
+            let xi = b.bitcast_i32(xn);
+            b.set_var(vars[5 + k], xi);
+        }
+    };
+    match mode {
+        0 => {
+            do_m(&mut b);
+            do_v(&mut b);
+        }
+        1 => do_m(&mut b),
+        2 => do_v(&mut b),
+        _ => {
+            do_v(&mut b);
+            do_m(&mut b);
+        }
+    }
+    sched_end_loop(&mut b, vars[0], n);
+    for k in 1..5usize {
+        let l = b.frag16_lane(vars[k], 0);
+        let x = b.bitcast_f32(l);
+        b.store_f32(row, 4 * k as u32, x);
+    }
+    for k in 0..16usize {
+        let x = b.bitcast_f32(vars[5 + k]);
+        b.store_f32(row, 4 * (5 + k) as u32, x);
+    }
+    b.finish()
+}
+pub fn sched_ovl_both() -> Function {
+    sched_ovl_kernel("sched_ovl_both", 0)
+}
+pub fn sched_ovl_mfma() -> Function {
+    sched_ovl_kernel("sched_ovl_mfma", 1)
+}
+pub fn sched_ovl_valu() -> Function {
+    sched_ovl_kernel("sched_ovl_valu", 2)
+}
+pub fn sched_ovl_vfirst() -> Function {
+    sched_ovl_kernel("sched_ovl_vfirst", 3)
+}
 pub fn sched_mfma_valu16() -> Function {
     sched_mfma_valu_kernel("sched_mfma_valu16", 16)
 }
