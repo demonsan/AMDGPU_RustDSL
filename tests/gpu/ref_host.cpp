@@ -94,7 +94,17 @@ int main(int argc, char** argv) {
             : F / (5.9e12 * std::min<double>(256.0, (double)blocks256));
         const double part_b = (double)s * rows_total * D * part_elem_bytes + (double)s * rows_total * 4;
         const double comb_b = part_b + (double)rows_total * D * 2;
-        r.t_kv = F / (5.9e12 * std::min<double>(256.0, (double)blocks256 * s)) + 7.0e-6 + part_b / 4.0e12 + std::max(3.0e-6, comb_b / 4.2e12) + 1.5e-6;
+        // Phase-1 cost: a physics floor (compute at 5.9 TFLOP/s/CU + fixed 7 us + serial fp16 write + combine floor)
+        // and an empirical linear fit to the measured totals of the final build (kernel-occ clean GPU-5 run,
+        // 6 shapes: bench/B1H8S1024/B2H4S1024/B3H3S768/B1H16S256/N128 s=2; residuals <= 5%):
+        //   T_kv_fit[us] = 17.1965 + 0.0937013*F[GFLOP] - 0.00103388*(N256*s) + 0.620991*rows[k]
+        // max() keeps the fit from extrapolating below the fixed-cost floor on tiny shapes; T_cur keeps the
+        // physical form (fits the measured t128 totals within 7%). Guard threshold 0.95 = 5% safety margin.
+        const double t_kv_phys = F / (5.9e12 * std::min<double>(256.0, (double)blocks256 * s)) + 7.0e-6
+                               + part_b / 4.0e12 + std::max(3.0e-6, comb_b / 4.2e12) + 1.5e-6;
+        const double t_kv_fit = (17.1965 + 0.0937013 * (F / 1e9) - 0.00103388 * (double)(blocks256 * s)
+                                 + 0.620991 * ((double)rows_total / 1000.0)) * 1e-6;
+        r.t_kv = std::max(t_kv_phys, t_kv_fit);
         const int ntiles = (SK + 127) / 128;
         r.tps = (ntiles + s - 1) / s;
         r.tiles_ok = (s >= 1) && (r.tps >= 1) && ((s - 1) * r.tps < ntiles);
