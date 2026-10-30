@@ -12935,7 +12935,6 @@ fn emit_fmha_t128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     (delta, w_new)
             };
         let nb = b.frag2(w_new, w_new);
-        b.set_var(bias2, nb);
         b.begin_if(Opnd::Val(grow));
         {
             let dupd = b.frag2_dup(delta);
@@ -13166,7 +13165,9 @@ fn emit_fmha_t128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     qk(b, slot_nxt, kds_nxt, None, s, s + 1, pre_w, bias_now);
                 }
             }
-            pv_w(b, slot_cur, &words);
+            // the loop variable is written once, at the end of the window (the SSA bias word is live until here; the variable register is free meanwhile)
+        b.set_var(bias2, bias_now);
+        pv_w(b, slot_cur, &words);
         }
         if stage {
             stage_end(b, skd, kds_n2);
