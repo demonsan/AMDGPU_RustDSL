@@ -9533,9 +9533,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let nobar2 = ablate.contains("nobar2"); // drop the M->V barrier only
     // s_setprio 1/0 per phase measured -3% (299.8 -> 308.5 TFLOP/s without): off unless FMHA_OPT has `prio`
     let noprio = ablate.contains("noprio") || !fmha_t_opt("prio");
-    let no_valu = ablate.contains("novalu");
-    let no_qk = ablate.contains("noqk");
-    let no_pv = ablate.contains("nopv");
+    // bidle / aidle: ONE role group does no VALU / QK / PV work (it still stages its DMA and meets the barriers): the partner-free time per tile of the other
+    // group measures how much of the two-wave wall is real overlap (diagnostic only, wrong numerics)
+    let idle_me = (!role_a && ablate.contains("bidle")) || (role_a && ablate.contains("aidle"));
+    let no_valu = ablate.contains("novalu") || idle_me;
+    let no_qk = ablate.contains("noqk") || idle_me;
+    let no_pv = ablate.contains("nopv") || idle_me;
     let no_stage = ablate.contains("nostage");
     let seq_mode = ablate.contains("seq"); // diagnostic: both groups run group A's schedule (no phase offset)
     let q0_reg = fmha_t_opt("q0reg") || !fmha_t_opt("noqreg"); // Q fragments resident in registers by default (`noqreg` reads them from LDS) // keep Q b0 in registers (8 VGPR) instead of 8 ds_read_b128 per tile
