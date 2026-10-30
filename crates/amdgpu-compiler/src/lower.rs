@@ -184,7 +184,7 @@ impl Lowerer {
                         count(&o);
                     }
                 }
-                Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } => {
+                Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } => {
                     count(base);
                     count(value);
                 }
@@ -405,6 +405,7 @@ impl Lowerer {
                 | Some(Op::FmaF32(..))
                 | Some(Op::ExpF32(..))
                 | Some(Op::Exp2F32(..))
+                | Some(Op::Log2F32(..))
                 | Some(Op::RcpF32(..))
                 | Some(Op::CvtF16ToF32(..))
                 | Some(Op::CvtF32ToF16(..))
@@ -1123,6 +1124,17 @@ impl Lowerer {
                             .imm(*byte_off as i64),
                     );
                 }
+                Stmt::StoreF32x4 { base, byte_off, value } => {
+                    let b = self.as_v2(*base)?;
+                    let v = self.as_v4(*value)?;
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(
+                        MInst::new(MOp::GlobalStoreF32x4)
+                            .srcreg(b)
+                            .srcreg(v)
+                            .imm(*byte_off as i64),
+                    );
+                }
                 Stmt::SetVar { var, value } => {
                     let dst = self.vars[var.0 as usize];
                     let class = self.mir.vreg_class(dst);
@@ -1694,6 +1706,7 @@ impl Lowerer {
             }
             Op::RcpF32(a) => self.un_v1(dst, MOp::VRcpF32, *a)?,
             Op::Exp2F32(a) => self.un_v1(dst, MOp::VExpF32, *a)?,
+            Op::Log2F32(a) => self.un_v1(dst, MOp::VLogF32, *a)?,
             Op::CvtPkBf16F32(a, b) => {
                 let ra = self.as_v1(*a)?;
                 let rb = self.as_v1(*b)?;
@@ -2654,7 +2667,7 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
         matches!(
             op,
             MOp::VMovB32 | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VPtrAdd | MOp::VAddU32 | MOp::VAddCoU32 | MOp::VAddcCoU32
-                | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VMax3F32 | MOp::VFmaF32 | MOp::VExpF32
+                | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VMax3F32 | MOp::VFmaF32 | MOp::VExpF32 | MOp::VLogF32
                 | MOp::VRcpF32 | MOp::VAndB32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32 | MOp::VMulLoU32
                 | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VReadPhys | MOp::VCmpLtI32 | MOp::VCmpGtI32 | MOp::VCmpGeI32
                 | MOp::VCmpNeI32 | MOp::VCmpLtF32

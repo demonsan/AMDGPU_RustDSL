@@ -35,7 +35,7 @@ pub fn with_vcc_fill<R>(on: bool, f: impl FnOnce() -> R) -> R {
 }
 
 fn is_transcendental(op: MOp) -> bool {
-    matches!(op, MOp::VExpF32 | MOp::VRcpF32)
+    matches!(op, MOp::VExpF32 | MOp::VLogF32 | MOp::VRcpF32)
 }
 
 /// Independent instructions that must follow an MFMA before its result may be
@@ -104,7 +104,7 @@ fn movable_wide(op: MOp) -> bool {
 fn valu_writer_delay(op: MOp) -> Option<usize> {
     match op {
         MOp::VAddCoU32 | MOp::VAddcCoU32 | MOp::VPtrAdd => Some(4),
-        MOp::VExpF32 | MOp::VRcpF32 => None,
+        MOp::VExpF32 | MOp::VLogF32 | MOp::VRcpF32 => None,
         o if movable(o) => Some(2),
         // lane write of a fragment (expands to v_mov): the tuple may feed a matrix op next
         // mask compares write an SGPR pair that the cndmask reads: same 2 wait states as the vcc form (conservative)
