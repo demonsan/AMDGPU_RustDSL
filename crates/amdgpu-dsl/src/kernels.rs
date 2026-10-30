@@ -10473,7 +10473,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
         b.begin_if(Opnd::Val(wave_live));
         b.store_f32(l_ptr, 0, lse_v);
-        for e in 0..4usize {
+        for e in 0..(if ablate.contains("nopartial") { 0usize } else { 4usize }) {
             for q in 0..4usize {
                 for k in 0..4usize {
                     let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
