@@ -136,7 +136,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 Err(e) => return Err(e),
             }
         }
-        eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(120).collect::<String>());
+        eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(if std::env::var("AMDC_SCHED_VERBOSE").is_ok() { 6000 } else { 120 }).collect::<String>());
     }
     let mut m = base;
     hazards::fix_value_hazards(&mut m);
