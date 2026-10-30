@@ -161,9 +161,9 @@ int main(int argc, char** argv) {
                 why, blocks256, use_split ? ", split phase-1" : "");
     if (use_split) {
         const long cgrid = (long)std::ceil((double)rows_total * D / comb_threads_d);
-        std::printf("[split] s=%d: phase1 Ohat=%.1f MB (fp32) + lse=%.2f MB, grid=(%d,%d,%d) blocks=%ld block=512; "
+        std::printf("[split] s=%d: phase1 Ohat=%.1f MB (model %.0f B/elem) + lse=%.2f MB, grid=(%d,%d,%d) blocks=%ld block=512; "
                     "combine grid=%ld block=%u; guard=%s\n",
-                    splits, ohat_bytes / 1e6, lse_bytes / 1e6, gox, gy, goz, s_blocks,
+                    splits, ohat_bytes / 1e6, part_elem_bytes, lse_bytes / 1e6, gox, gy, goz, s_blocks,
                     cgrid, (unsigned)comb_threads_d, split_why);
         if (!co_comb) std::printf("[split] WARNING: REF_CO2_SPLIT is set but REF_CO2_COMBINE is not - combine cannot launch\n");
     }
@@ -343,9 +343,9 @@ int main(int argc, char** argv) {
             if (!co_comb) { std::printf("[split] missing REF_CO2_COMBINE\n"); return 1; }
             // Partials: allocated ONCE, outside every timed window (docs/kvsplit-design.md section 3).
             void *ohat, *lse;
-            CK(hipMalloc(&ohat, (size_t)ohat_bytes));
+            CK(hipMalloc(&ohat, (size_t)ohat_alloc_bytes));
             CK(hipMalloc(&lse, (size_t)lse_bytes));
-            CK(hipMemset(ohat, 0, (size_t)ohat_bytes));
+            CK(hipMemset(ohat, 0, (size_t)ohat_alloc_bytes));
             CK(hipMemset(lse, 0, (size_t)lse_bytes));
             const bool fused = envi("REF_FUSED", 0) != 0 && std::getenv("REF_CO2_FUSED") && splits == 4;
             if (fused) {
