@@ -16112,28 +16112,27 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     let pkd2 = s.ds_read_b32::<256, _>(&mut kd2, &kdrd);
     let pkd3 = s.ds_read_b32::<384, _>(&mut kd3, &kdrd);
     let pk0 = rd_v(&mut s, &mut v0, trb[0], 0);
-    let pk1 = rd_v(&mut s, &mut v1, trb[1], 0);
     let tb0 = s.v_mfma_f32_32x32x8_f16_zero(sv0, rones, rbias);
     let tb1 = s.v_mfma_f32_32x32x8_f16_zero(sv1, rones, rbias);
     let tb2 = s.v_mfma_f32_32x32x8_f16_zero(sv2, rones, rbias);
     let tb3 = s.v_mfma_f32_32x32x8_f16_zero(sv3, rones, rbias);
-    let pk2 = rd_v(&mut s, &mut v2, trb[2], 0);
+    let pk1 = rd_v(&mut s, &mut v1, trb[1], 0);
     wait4(&mut s, pk0);
     let rv0 = s.ready(&v0);
     let t0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o0, rv0, rpa, rs127, rs123);
-    let pk3 = rd_v(&mut s, &mut v3, trb[3], 0);
+    let pk2 = rd_v(&mut s, &mut v2, trb[2], 0);
     wait4(&mut s, pk1);
     let rv1 = s.ready(&v1);
     let t1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o1, rv1, rpa, rs127, rs123);
-    let pk4 = rd_k::<0>(&mut s, &mut v4, &kfb0, &kfb1);
+    let pk3 = rd_v(&mut s, &mut v3, trb[3], 0);
     wait4(&mut s, pk2);
     let rv2 = s.ready(&v2);
     let t2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o2, rv2, rpa, rs127, rs123);
-    let pk5 = rd_k::<4096>(&mut s, &mut v5, &kfb0, &kfb1);
+    let pk4 = rd_k::<0>(&mut s, &mut v4, &kfb0, &kfb1);
     wait4(&mut s, pk3);
     let rv3 = s.ready(&v3);
     let t3 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o3, rv3, rpa, rs127, rs123);
-    let pk6 = rd_k::<8192>(&mut s, &mut v6, &kfb0, &kfb1);
+    let pk5 = rd_k::<4096>(&mut s, &mut v5, &kfb0, &kfb1);
     wait2(&mut s, pk4);
     let rv4 = s.ready(&v4);
     let _ = pkd3.wait(&mut s);
@@ -16147,7 +16146,7 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     let (rk0_0, rk1_0) = (s.ready(&sk0_0), s.ready(&sk1_0));
     let acc0 = tb0.retire(&mut s);
     let tq0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc0, rv4, rq0, rk0_0, rsq0);
-    let pk7 = rd_k::<12288>(&mut s, &mut v7, &kfb0, &kfb1);
+    let pk6 = rd_k::<8192>(&mut s, &mut v6, &kfb0, &kfb1);
     wait2(&mut s, pk5);
     let rv5 = s.ready(&v5);
     let mut sk0_1 = s.vgpr::<1>();
@@ -16157,7 +16156,7 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     let (rk0_1, rk1_1) = (s.ready(&sk0_1), s.ready(&sk1_1));
     let acc1 = tb1.retire(&mut s);
     let tq1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc1, rv5, rq0, rk0_1, rsq0);
-    let pk8 = rd_v(&mut s, &mut v8, trb[0], 1);
+    let pk7 = rd_k::<12288>(&mut s, &mut v7, &kfb0, &kfb1);
     wait2(&mut s, pk6);
     let rv6 = s.ready(&v6);
     let mut sk0_2 = s.vgpr::<1>();
@@ -16167,7 +16166,7 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     let (rk0_2, rk1_2) = (s.ready(&sk0_2), s.ready(&sk1_2));
     let acc2 = tb2.retire(&mut s);
     let tq2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc2, rv6, rq0, rk0_2, rsq0);
-    let pk9 = rd_v(&mut s, &mut v9, trb[1], 1);
+    let pk8 = rd_v(&mut s, &mut v8, trb[0], 1);
     wait2(&mut s, pk7);
     let rv7 = s.ready(&v7);
     let mut sk0_3 = s.vgpr::<1>();
@@ -16179,30 +16178,31 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     let tq3 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc3, rv7, rq0, rk0_3, rsq0);
     let ts = s.v_smfmac_f32_16x16x128_fp8_fp8(la, rra, rpa, ri01);
     let ts = ts.chain(&mut s, rra, rpb, ri01);
-    let pk10 = rd_v(&mut s, &mut v10, trb[2], 1);
+    let pk9 = rd_v(&mut s, &mut v9, trb[1], 1);
     wait4(&mut s, pk8);
     let rv8 = s.ready(&v8);
     let t0 = t0.chain(&mut s, rv8, rpb, rs127, rs123);
-    let pk11 = rd_v(&mut s, &mut v11, trb[3], 1);
+    let pk10 = rd_v(&mut s, &mut v10, trb[2], 1);
     wait4(&mut s, pk9);
     let rv9 = s.ready(&v9);
     let t1 = t1.chain(&mut s, rv9, rpb, rs127, rs123);
-    let pk12 = rd_k::<0>(&mut s, &mut v12, &kfb2, &kfb3);
+    let pk11 = rd_v(&mut s, &mut v11, trb[3], 1);
     wait4(&mut s, pk10);
     let rv10 = s.ready(&v10);
     let t2 = t2.chain(&mut s, rv10, rpb, rs127, rs123);
-    let pk13 = rd_k::<4096>(&mut s, &mut v13, &kfb2, &kfb3);
+    let pk12 = rd_k::<0>(&mut s, &mut v12, &kfb2, &kfb3);
     wait4(&mut s, pk11);
     let rv11 = s.ready(&v11);
     let t3 = t3.chain(&mut s, rv11, rpb, rs127, rs123);
-    let pk14 = rd_k::<8192>(&mut s, &mut v14, &kfb2, &kfb3);
+    let pk13 = rd_k::<4096>(&mut s, &mut v13, &kfb2, &kfb3);
     wait2(&mut s, pk12);
     let rv12 = s.ready(&v12);
     let tq0 = tq0.chain(&mut s, rv12, rq1, rk1_0, rsq1);
-    let pk15 = rd_k::<12288>(&mut s, &mut v15, &kfb2, &kfb3);
+    let pk14 = rd_k::<8192>(&mut s, &mut v14, &kfb2, &kfb3);
     wait2(&mut s, pk13);
     let rv13 = s.ready(&v13);
     let tq1 = tq1.chain(&mut s, rv13, rq1, rk1_1, rsq1);
+    let pk15 = rd_k::<12288>(&mut s, &mut v15, &kfb2, &kfb3);
     wait2(&mut s, pk14);
     let rv14 = s.ready(&v14);
     let tq2 = tq2.chain(&mut s, rv14, rq1, rk1_2, rsq1);
@@ -16231,7 +16231,6 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     s.output_exit(exl);
     s.finish().expect("pv_qk_window_block is a verified sequence")
 }
-
 pub fn fmha_fwd_hd128_mxfp8_vs5() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     VS5_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
