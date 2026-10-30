@@ -10294,6 +10294,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         words_out
     };
     // PV of the whole tile (V in ring slot `slot`, P words `w`) and its row sums
+    // vpre: the first V fragment (half 0, column group 0) of the PV window is read in the V window (its tile is already in LDS), carried in this cell to pv_w
+    let vpre_cell: std::cell::Cell<Option<ValueId>> = std::cell::Cell::new(None);
     let pv_w = |b: &mut FnBuilder, slot: ValueId, w: &[ValueId]| {
         if no_pv {
             return;
@@ -10405,7 +10407,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
             }
             for e in 0..4usize {
-                let v8 = load_v(b, hh, e);
+                let v8 = if hh == 0 && e == 0 { match vpre_cell.take() { Some(v) => v, None => load_v(b, hh, e) } } else { load_v(b, hh, e) };
                 b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
             }
         }
@@ -10418,6 +10420,16 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let (_i1, slot_cur, slot_nxt, slot_n2, kds_nxt, key_n2, _kds_cur) = ring(b);
         // V phase (the DMA of tile t+2 runs under it, waited for at its end); M phase: PV(this tile) + QK(next tile)
         let skd = if stage && !(dsplit && role_a) { stage_start(b, key_n2, slot_n2) } else { None };
+        if fmha_t_opt("vpre") && smfrs && !fmha_t_opt("pvpipe") && !fmha_t_opt("convlate") {
+            let trb0 = b.add_i32(cx.trx[0], slot_cur);
+            let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+            for r in 0..4i32 {
+                let off = b.c_i32(2048 * r);
+                addrs.push(b.add_i32(trb0, off));
+            }
+            let v = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+            vpre_cell.set(Some(v));
+        }
         let kdg: Option<Vec<ValueId>> = if kdglob && stage { Some(kd_rows(b, key_n2)) } else { None };
         let _ = &kdg;
         // convlate: the P conversion of S tiles 2 and 3 moves from the V phase into the M phase (after PV half 0) to balance the two phases
