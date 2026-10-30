@@ -9905,7 +9905,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let key_n = b.shl_i32(nn, c7d);
         (i1, slot_cur, slot_nxt, slot_nxt, kds_nxt, key_n, kds_cur)
     };    // QK of the whole tile (4 x 32 keys) in ring slot `slot`: S' = bias + scaled K.Q^T, in place
-    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId, kdv: Option<&[ValueId]>| {
+    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId, kdv: Option<&[ValueId]>, bias_v: ValueId| {
         if no_qk {
             return;
         }
@@ -9935,7 +9935,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         // (the vendor issues one bf16 bias MFMA per 128 keys; we issued four)
         let biasf_once: Option<ValueId> = if fmha_t_opt("biasonce") {
             let zero16 = b.frag_zero(DType::Frag16);
-            Some(b.mfma_f16_wide(ones_f16, Opnd::Var(bias2), zero16))
+            Some(b.mfma_f16_wide(ones_f16, Opnd::Val(bias_v), zero16))
         } else {
             None
         };
@@ -9950,7 +9950,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         };
         for s in 0..4usize {
             if biasf_once.is_none() && !fmha_t_opt("biasv") {
-                b.var_mfma_f16_z(s_vars[s], ones_f16, bias2);
+                b.var_mfma_f16_z(s_vars[s], ones_f16, Opnd::Val(bias_v));
             }
             let ko = b.c_i32(4096 * (s as i32));
             let a0 = b.add_i32(kfb[0], ko);
@@ -9997,6 +9997,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             for _ in 0..16 {
                 words_out.push(c0);
             }
+            if do_decide {
+                let nb0 = b.frag2(c0, c0);
+                words_out.push(nb0);
+            }
             return words_out;
         }
         let mut kb: Vec<ValueId> = Vec::new();
@@ -10027,7 +10031,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.var_add_pk(s_vars[s], bpair);
             }
         }
-        if do_decide {
+        let bias_now_opt: Option<ValueId> = if do_decide {
         let mut flat: Vec<ValueId> = Vec::with_capacity(64);
         for s in 0..4usize {
             for r in 0..16u8 {
@@ -10052,8 +10056,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         let mt = b.partner_max_f32(mloc);
         let grow = b.cmp_lt_f32(c_thr, mt);
-        b.begin_if(Opnd::Val(grow));
-        {
+        // the bias chain (reference shift) is computed OUTSIDE the rollback branch and the new bias word is an SSA value (`bias_now`): the loop variable is
+        // read once at the start of the iteration and written once here, never read after the write (DSL contract)
             let w_old_u = b.frag2_lane(bias2, 0);
             let w_old = b.bitcast_i32(w_old_u);
             let (delta, w_new) = if fmha_t_opt("bias2w") || vs128_vsx() {
@@ -10101,6 +10105,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
                     (delta, w_new)
             };
+        let nb = b.frag2(w_new, w_new);
+        b.set_var(bias2, nb);
+        b.begin_if(Opnd::Val(grow));
+        {
             let dupd = b.frag2_dup(delta);
             if !ablate.contains("rbnos") {
                 for s in 0..4usize {
@@ -10125,11 +10133,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             } else {
                 b.var_scale_lane(la, 0, corr);
             }
-            let nb = b.frag2(w_new, w_new);
-            b.set_var(bias2, nb);
         }
         b.end_if();
-        }
+        Some(nb)
+        } else {
+            None
+        };
         let c4s = b.c_i32(4);
         let cmk = b.c_i32(0x0007_0007);
         let lut_lo = b.c_i32(i32::from_le_bytes([0, 6, 9, 11]));
@@ -10162,6 +10171,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 };
                 words_out.push(word);
             }
+        }
+        if let Some(nb) = bias_now_opt {
+            words_out.push(nb);
         }
         words_out
     };
@@ -10280,7 +10292,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let _ = &kdg;
         // convlate: the P conversion of S tiles 2 and 3 moves from the V phase into the M phase (after PV half 0) to balance the two phases
         let convlate = fmha_t_opt("convlate") && smfv;
-        let w = if convlate { valu(b, masked, true, 0, 2) } else { valu(b, masked, true, 0, 4) };
+        let mut w = if convlate { valu(b, masked, true, 0, 2) } else { valu(b, masked, true, 0, 4) };
+        let bias_now = w.pop().expect("bias word");
         if stage {
             stage_end(b, skd, kds_nxt);
         }
@@ -10333,12 +10346,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.var_smfmac_fp8(la, a_rs, pa, idx23);
             b.var_smfmac_fp8(la, a_rs, pb, idx23);
             if stage {
-                qk(b, slot_nxt, kds_nxt, kdg.as_deref());
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
             }
         } else if fmha_t_opt("qkfirst") {
             // QK(i+1) first: S(i) was consumed by the V phase; the PV tr reads then queue behind the QK fragment reads
             if stage {
-                qk(b, slot_nxt, kds_nxt, kdg.as_deref());
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
             }
             pv_w(b, slot_cur, &w);
         } else {
@@ -10349,7 +10362,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.barrier();
             }
             if stage {
-                qk(b, slot_nxt, kds_nxt, kdg.as_deref());
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
             }
         }
         if !noprio {
