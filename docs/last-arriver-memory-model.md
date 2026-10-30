@@ -31,3 +31,14 @@ The last row shows the probe can detect a violation (a stale partial read on ano
 
 ## Backends
 All five new ops (plus `BufferWbl2` / `BufferInv`) have rows in BOTH `llvm20.tbl` and `llvm24.tbl` (cpol 16 = sc1; the returning atomic uses cpol 1 = sc0 and `syncscope("agent")` so LLVM does not add the system-scope `sc1`), so the LLVM tail emits the same instructions (tail_invariance covers `probe_last_arriver*`); `tools/last_arriver_probe.sh` runs with `BACKEND=llvm-tail` too.
+
+## 8-wave (512-thread) probe: the real fused-combine shape (review round 2)
+
+`s_barrier` does NOT drain VM_CNT, so the contract is: every wave that wrote a partial drains its OWN stores (`s_waitcnt vmcnt(0)`, `fence_release_lite`) BEFORE the block barrier; only after the barrier does thread 0 take the ticket (value 1, the other threads add 0), the ticket is broadcast through LDS, and in the last block EVERY wave does the acquire drain before its coherent loads. `fence_acquire` (full) is `s_waitcnt vmcnt(0); buffer_inv sc1; s_waitcnt vmcnt(0)` (the inv returns an ACK through VM_CNT). Static check for the lite contract: `asm_check::check_lite_contract` (every shared global access `sc1`, ticket `sc0` without `sc1`, no `buffer_wbl2/inv`, a store must be drained before the next `s_barrier` and before the atomic) - covered by tests/lite_contract.rs.
+Probe: kernels `probe_la8*` (512 threads, per-element hash(i+seed) partials, new seed every run, block-dependent stagger loop, odd block counts 3..2432, counter on its own page, concurrent 256 MB device-to-device copy on a second stream, exact per-element verification by `probe_la_verify` on the device). Results (MI355X, GPU 4):
+| variant | accesses | fences | result |
+|---|---|---|---|
+| `probe_la8_lite` | sc1/sc1 | per-wave drain before the barrier, acquire drain | **0 bad runs of 400000** |
+| `probe_la8` (full) | sc1/sc1 | drain + `buffer_wbl2` / drain + `buffer_inv` + drain | 0 of 20000 (smoke; the long run was killed by an external process on the shared node, see below) |
+| `probe_la8_plain` | plain/plain | none | **10966 bad runs of 20000 (55%)** |
+The 8-wave probe is ~3 orders of magnitude more sensitive than the 1-wave one (plain/no-fence failed 1/12000 there). Honest limitation: the longer full / plain_fenced / nodrain runs (>= 1e5 each) were terminated repeatedly by an external SIGTERM on the shared node (other sessions' guard scripts run on the same account/GPU), so only the lite 4e5 and the 20000-run smoke numbers above are final; `tools/last_arriver8_probe.sh` reproduces any of them (`RUNS=... THRASH=1 STAGGER=4`).
