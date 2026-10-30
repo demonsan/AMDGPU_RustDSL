@@ -1471,8 +1471,30 @@ The counters are diagnostic attribution; in this round they were consistent with
 provenance was checked - the earlier apparent counter/wall contradiction was our own label crossing, not a
 counter limitation.
 
-The full control table (per-CU, filled, mid, shipped auto, gates, determinism, parity, counters) is
-measured on `8c5bb14` and recorded in the validation report attached to this section.
+**Control measurements on Main `8c5bb14` (GPU 5, own backend; vendor same-run; best/median):**
+
+| metric | value | previous control (`82ff0bf`/`d412d50` dwordx2) |
+|---|---|---|
+| `_vs128` B1H8S2048 64-block | **best 454.5 / median 453.4 TFLOP/s** (0.0378/0.0379 ms) | 390.6 / 389.5 |
+| per-CU | **7.10 / 7.08 TF/CU** | 6.10 / 6.09 |
+| vendor same run | 538.0-539.2 TFLOP/s = 8.42 TF/CU | 540 = 8.44 |
+| **per-CU gap** | **1.19-1.20x** | 1.38x |
+| filled B4H8S2048 | **best 1412.2 / median 1408.2** (vendor 1661/1648) | 1239.7/1236.2 |
+| filled B1H8S8192 | **best 1967.3 / median 1949.7** (vendor 2361/2360) | 1853.4/1851.9 |
+| shipped auto B1H8S2048 (split s=4, combine8h) | **best 706.8 / median 698.5 TFLOP/s** (24.3/24.6 us; main 19.7, combine 4.0) | 596.7-605.5 (old auto) -> 707-711 (kernel-opt dwordx2) |
+| auto path vs vendor | 698.5-706.8 vs 538.5 = **1.30-1.31x** | 1.11-1.13x |
+| output md5 | **faadf00c95f4eaffff94ece7d1429b3d**, bad=0, mean 2.4184e-3 (REF_ROWS=4 sampling) | same md5 |
+| auto gate @16 rows | **15/15 OK, parity 15/15, ours bad=0** | 15/15 |
+| auto gate @64 rows | **12/15 OK / 3 vendor-fail, ours bad=0, parity 15/15** | same |
+| determinism | **5/5 x3** | 5/5 x2 |
+| counters (per wave-iter) | level **66.4** (was 121.6), VMEM inst **5.88** (was 7.62), wave cycles **1347.4** (was 1538.4), ACTIVE_VALU 403.1, XDL 1216, WAIT_ANY 485.4 (was 516.8), WAIT_INST_ANY 367.1 (was 523.8) | - |
+
+**Headline:** shipped auto path 596.7-605.5 -> **~700 TFLOP/s (+13-17%)**; per-CU 6.10 -> **7.08-7.10
+(+16%)**; per-CU gap 1.38x -> **1.19-1.20x**; VMEM level 121.6 -> 66.4 and VMEM inst 7.62 -> 5.88 (now
+vendor-like); wave cycles -12%.
+Mid-shape table (auto path, t128 fallback) is measured in the same run and recorded in the validation
+report; representative: B2H4S1024 ~234.9 TFLOP/s, B3H3S768 ~235.4 TFLOP/s (both comfortably above the
+same-run vendor 225.2/208.2), i.e. the t128 fallback also inherits the Q/epilogue/prologue wins.
 
 ## 8. Unknowns / limitations
 
