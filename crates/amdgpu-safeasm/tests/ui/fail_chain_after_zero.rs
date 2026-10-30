@@ -1,4 +1,4 @@
-// error-contains: no method named `chain`
+// error-contains: is not an iterator
 use amdgpu_safeasm::*;
 fn main() {
     let mut s = Seq::new();
