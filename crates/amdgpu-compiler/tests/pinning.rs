@@ -1,5 +1,5 @@
 //! Pinned (hand-authored) instruction runs survive the list scheduler verbatim; the unpinned control is reordered.
-use amdgpu_compiler::mir::{Block, MFunction, MInst, MOp, RClass, Src, VReg};
+use amdgpu_compiler::mir::{Block, MFunction, MInst, MOp, RClass, VReg};
 use amdgpu_compiler::sched;
 use amdgpu_safeasm::{Imm, Seq};
 
@@ -65,9 +65,9 @@ fn unpinned_control_is_reordered() {
 #[test]
 fn pinned_run_is_preserved_verbatim_and_acts_as_a_barrier() {
     let m = block(true);
-    let before: Vec<(MOp, Option<u32>, Vec<Src>, i64)> = m.blocks[0].insts.iter().map(|i| (i.op, i.dst, i.srcs.clone(), i.imm)).collect();
+    let before: Vec<String> = m.blocks[0].insts.iter().map(|i| format!("{:?} {:?} {:?} {}", i.op, i.dst, i.srcs, i.imm)).collect();
     let after_m = run(block(true));
-    let pinned: Vec<(MOp, Option<u32>, Vec<Src>, i64)> = after_m.blocks[0].insts.iter().filter(|i| i.pin).map(|i| (i.op, i.dst, i.srcs.clone(), i.imm)).collect();
+    let pinned: Vec<String> = after_m.blocks[0].insts.iter().filter(|i| i.pin).map(|i| format!("{:?} {:?} {:?} {}", i.op, i.dst, i.srcs, i.imm)).collect();
     let want: Vec<_> = before.iter().take(9).cloned().collect();
     assert_eq!(pinned, want, "the pinned instructions must keep their exact order and operands");
     // nothing moved into the middle of the pinned run: the nine pinned instructions are contiguous
