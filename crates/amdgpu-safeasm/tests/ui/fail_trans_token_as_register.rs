@@ -1,4 +1,4 @@
-// error-contains: mismatched types
+// error-contains: VgprOnly
 use amdgpu_safeasm::*;
 fn main() {
     let mut s = Seq::new();
