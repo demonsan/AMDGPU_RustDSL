@@ -14926,7 +14926,8 @@ fn probe_la8_mode(name: &str, mode: u8) -> Function {
     b.wait_lds(0);
     b.barrier();
     let ticket = b.load_lds_b32(Opnd::Val(c0)); // thread 0's old value: broadcast
-    let nbm1 = b.add_i32(nb, b.c_i32(-1));
+    let cm1 = b.c_i32(-1);
+    let nbm1 = b.add_i32(nb, cm1);
     let is_last = b.let_(Op::CmpGeI32(Opnd::Val(ticket), Opnd::Val(nbm1)));
     b.begin_if(Opnd::Val(is_last));
     match mode {
