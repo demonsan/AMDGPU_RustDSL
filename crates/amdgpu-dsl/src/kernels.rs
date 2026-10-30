@@ -7399,7 +7399,10 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     if dma {
         dma_issue(b, key_next, buf_nxt);
     }
-    let compute = |b: &mut FnBuilder, masked: bool| {        for hh in 0..2usize {
+    let compute = |b: &mut FnBuilder, masked: bool| {        // the running max is threaded through the two 64-key halves as an SSA value (the second half must see the first half's update; the loop
+        // variable is read once, at the start of the iteration, and only written afterwards)
+        let mut m_carry: Option<ValueId> = None;
+        for hh in 0..2usize {
             // ---- two 32-key score tiles (S^T = K Q^T) of this 64-key substep ----
             let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
             let mut sfr: Vec<ValueId> = Vec::with_capacity(2);
@@ -7504,7 +7507,10 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let mpart = b.bitcast_f32(mp_raw);
                 b.max_f32(mloc, mpart)
             };
-            let m_old = b.bitcast_f32(m_var);
+            let m_old = match m_carry {
+                Some(v) => v,
+                None => b.bitcast_f32(m_var),
+            };
             let corr_eager: Option<ValueId>;
             let m_use: ValueId;
             if lazy {
@@ -7564,6 +7570,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 m_use = m_new;
             }
 
+            m_carry = Some(m_use);
             // exp2(s - (m - 4)) = 16 exp2(s - m): the P x 16 quantisation scale comes for free
             let m4 = b.sub_f32(m_use, c4f);
             let pk_sub = !masked && fmha_t_opt("pksub");
