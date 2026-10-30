@@ -7513,7 +7513,6 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let tau = if fmha_t_opt("lazyinf") { b.c_f32(1.0e9) } else { b.c_f32((8 - psh) as f32) };
                 let thr = b.add_f32(m_old, tau);
                 let grow = b.cmp_lt_f32(thr, mt);
-                b.begin_if(Opnd::Val(grow));
                 // overshoot: move the running max "over" above the tile max so the next triggers are rarer
                 let over = [("over8", 8.0f32), ("over6", 6.0), ("over4", 4.0), ("over3", 3.0), ("over2", 2.0)].iter().find(|(n, _)| fmha_t_opt(n)).map(|x| x.1).unwrap_or(0.0);
                 let mt_o = if over > 0.0 {
@@ -7522,7 +7521,10 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 } else {
                     mt
                 };
+                // the candidate new max is an SSA value computed outside the branch; the value used afterwards is a per-lane select of it
+                // (never a read of the loop variable after its set_var in the same iteration)
                 let m_new = b.max_f32(m_old, mt_o);
+                b.begin_if(Opnd::Val(grow));
                 let dm = b.sub_f32(m_old, m_new);
                 let corr = b.exp2_f32(dm);
                 let m_bits = b.bitcast_i32(m_new);
@@ -7551,7 +7553,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
                 b.end_if();
                 corr_eager = None;
-                m_use = b.bitcast_f32(m_var);
+                m_use = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(m_new), b: Opnd::Val(m_old) });
             } else {
                 let m_new = b.max_f32(m_old, mt);
                 let dm = b.sub_f32(m_old, m_new);
@@ -9162,7 +9164,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let key_n2 = b.shl_i32(n2, c7d);
         (i1, slot_cur, slot_nxt, slot_n2, kds_cur, kds_nxt, key0, key_n2, i2)
     };    // QK of half `hh` (two 32-key tiles) of the tile whose K sits in ring slot `slot` (K scales at `kdslot`): S' = bias + scaled K.Q^T
-    let qk = |b: &mut FnBuilder, hh: usize, slot: ValueId, kdslot: ValueId| {
+    let qk = |b: &mut FnBuilder, hh: usize, slot: ValueId, kdslot: ValueId, bias_v: ValueId| {
         if no_qk {
             return;
         }
@@ -9170,7 +9172,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let kd_rd = b.add_i32(kd_cur, kdslot);
         for sl in 0..2usize {
             let s = 2 * hh + sl;
-            b.var_mfma_f16_z(s_vars[sl], ones_f16, bias2);
+            b.var_mfma_f16_z(s_vars[sl], ones_f16, Opnd::Val(bias_v));
             let ko = b.c_i32(4096 * (s as i32));
             let a0 = b.add_i32(kfb[0], ko);
             let a1 = b.add_i32(kfb[1], ko);
@@ -9190,14 +9192,19 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // VALU phase of half `hh`: max over its 32 scores, rollback (reference change) when some lane's S' leaves the fp8 range,
     // then P = fp8(2^(s - r) x 16) into `pw`
-    let valu = |b: &mut FnBuilder, hh: usize, masked: bool, store: bool| -> Vec<ValueId> {
-        let mut words_out: Vec<ValueId> = Vec::with_capacity(8);
+    // `bias_in`: the bias word frag2 at the start of this unit (the loop variable at the iteration start for unit 0, the previous unit's SSA result for
+    // unit 1); the updated bias frag2 is returned as the LAST element of the result (never written to / read back from the loop variable inside the iteration)
+    let valu = |b: &mut FnBuilder, hh: usize, masked: bool, store: bool, bias_in: Opnd| -> Vec<ValueId> {
+        let mut words_out: Vec<ValueId> = Vec::with_capacity(9);
         if no_valu {
             for _ in 0..8 {
                 words_out.push(c0);
             }
+            let nb0 = b.frag2(c0, c0);
+            words_out.push(nb0);
             return words_out;
         }
+        let bias_out: Option<ValueId>;
         let mut kb: Vec<ValueId> = Vec::new();
         if masked {
             for sl in 0..2usize {
@@ -9236,9 +9243,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         let mt = b.partner_max_f32(mloc);
         let grow = b.cmp_lt_f32(c_thr, mt);
-        b.begin_if(Opnd::Val(grow));
-        {
-            let w_old_u = b.frag2_lane(bias2, 0);
+        // the bias chain runs outside the rollback branch; the new bias word is returned as an SSA value (no loop-variable read after set_var)
+            let w_old_u = b.frag2_lane(bias_in, 0);
             let w_old = b.bitcast_i32(w_old_u);
             // v_cvt_f32_f16 reads only the low 16 bits and v_cvt_f16_f32 zero-extends: the masks are redundant (rbtrim)
             let lo16 = if fmha_t_opt("rbtrim") { w_old } else { b.let_(Op::AndI32(Opnd::Val(w_old), Opnd::Val(cffff))) };
@@ -9256,6 +9262,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let h_sh = b.shl_i32(h, c16i);
             let w_q = b.let_(Op::AddI32(Opnd::Val(h), Opnd::Val(h_sh)));
             let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
+        let nb = b.frag2(w_new, w_new);
+        b.begin_if(Opnd::Val(grow));
+        {
             let dupd = b.frag2_dup(delta);
             if !ablate.contains("rbnos") {
                 b.var_add_pk(s_vars[0], dupd);
@@ -9270,10 +9279,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
             }
             b.var_scale_lane(la, 0, corr);
-            let nb = b.frag2(w_new, w_new);
-            b.set_var(bias2, nb);
         }
         b.end_if();
+        bias_out = Some(nb);
         // per-lane scale: Delta = ceil(512 S'max - 135) (0 for lanes that rebased); P_fp8 = P_bf16 2^-Delta, MFMA scale 123 + Delta
         let svsub = fmha_t_opt("svsub");
         let mut dpair_opt: Option<ValueId> = None;
@@ -9343,6 +9351,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         let _ = store;
         words_out.push(scb);
+        words_out.push(bias_out.expect("bias"));
         words_out
     };
     let pv_w = |b: &mut FnBuilder, hh: usize, slot: ValueId, w: &[ValueId]| {
@@ -9381,7 +9390,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         // both groups run this sequence; group B one phase later (its prologue QK(0) phase came first)
             // unit 0: V (the DMA of tile t+2 runs under it, waited for at its end); M: PV(hh0) + QK(hh1)
             let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
-            let w0 = valu(b, 0, masked, false);
+            let mut w0 = valu(b, 0, masked, false, Opnd::Var(bias2));
+            let nb0 = w0.pop().expect("bias word");
             if stage {
                 stage_wait(b, kds_nxt);
             }
@@ -9396,7 +9406,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
             }
             pv_w(b, 0, slot_cur, &w0);
-            qk(b, 1, slot_cur, kds_cur);
+            qk(b, 1, slot_cur, kds_cur, nb0);
             b.set_prio(0);
             b.wait_lds(0);
             if !no_bar {
@@ -9408,7 +9418,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
             }
             // unit 1: V; M: PV(hh1) + QK(hh0 of the next tile)
-            let w1 = valu(b, 1, masked, false);
+            let mut w1 = valu(b, 1, masked, false, Opnd::Val(nb0));
+            let nb1 = w1.pop().expect("bias word");
             b.set_prio(1);
             b.wait_lds(0);
             if !no_bar {
@@ -9421,7 +9432,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             }
             pv_w(b, 1, slot_cur, &w1);
             if stage {
-                qk(b, 0, slot_nxt, kds_nxt);
+                qk(b, 0, slot_nxt, kds_nxt, nb1);
             }
             b.set_prio(0);
             b.wait_lds(0);
@@ -9437,6 +9448,7 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             if let (Some(kv), Some(kn)) = (kdp, skd) {
                 b.set_var(kv, kn);
             }
+            b.set_var(bias2, nb1);
     };
     // loop body: a full tile, no branches (a branch would force the in-flight DMA to be waited for)
     iter(b, false, true, true);
