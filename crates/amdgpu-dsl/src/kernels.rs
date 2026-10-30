@@ -14942,7 +14942,11 @@ fn probe_la8_mode(name: &str, mode: u8) -> Function {
     let q = b.ptr_add(part, io);
     let x = if mode == 2 || mode == 3 { b.load_f32(q, 0) } else { b.load_f32_coherent(q, 0) };
     let qo = b.ptr_add(out, io);
-    b.store_f32(qo, 0, Opnd::Val(x));
+    if mode == 2 || mode == 3 {
+        b.store_f32(qo, 0, Opnd::Val(x));
+    } else {
+        b.store_f32_wt(qo, 0, Opnd::Val(x));
+    }
     let i2 = b.add_i32(i, c512);
     b.set_var(i, Opnd::Val(i2));
     let more = b.cmp_lt_i32(i2, total);

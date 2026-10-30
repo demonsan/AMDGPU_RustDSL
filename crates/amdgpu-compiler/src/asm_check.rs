@@ -10,6 +10,12 @@
 //! exact for the straight-line release sequence these kernels use.
 
 pub fn check_lite_contract(asm: &str) -> Result<(), Vec<String>> {
+    check_lite_contract_ex(asm, false)
+}
+
+/// Same, with an escape for kernels whose FINAL output stores (read only after the kernel ends, never by another workgroup during it) are plain:
+/// `allow_plain_stores = true` accepts global stores without `sc1` (loads and atomics stay strict). A plain store still counts for the drain rule.
+pub fn check_lite_contract_ex(asm: &str, allow_plain_stores: bool) -> Result<(), Vec<String>> {
     let mut errs = Vec::new();
     let mut undrained: Option<usize> = None;
     for (n, raw) in asm.lines().enumerate() {
@@ -21,7 +27,7 @@ pub fn check_lite_contract(asm: &str) -> Result<(), Vec<String>> {
         }
         let is_lds_dma = mnemonic.contains("_lds");
         if (mnemonic.starts_with("global_load") || mnemonic.starts_with("global_store")) && !is_lds_dma {
-            if !l.split_whitespace().any(|t| t == "sc1") {
+            if !l.split_whitespace().any(|t| t == "sc1") && !(allow_plain_stores && mnemonic.starts_with("global_store")) {
                 errs.push(format!("line {ln}: `{l}`: shared-memory access without sc1"));
             }
             if mnemonic.starts_with("global_store") {
