@@ -93,22 +93,19 @@ int main(int argc, char** argv) {
     auto eval_split = [&](int s) {
         SplitEval r{};
         const double F = 4.0 * B * H * (double)S * SK * D;
+        // Refit on the post-Q/epilogue-vectorisation control (Main 8c5bb14, GPU 5; 20 shapes: the 15 gate
+        // shapes + the 9 sweep shapes + mid/filled extras; measured split-vs-fallback totals in
+        // docs/vendor-spec.md 7.10.5). T_cur = F/(5.96e12*min(256,2N)) + 7.48us; T_kv =
+        // F/(7.38e12*min(256,N*s)) + 6.80us + part_b/4.0TB/s + max(3us, comb_b/4.2TB/s) + 1.0us.
+        // The old 9.4us/7.0us floors and 5.9 TF/CU rates were pre-prologue-cut; the old empirical fit is
+        // dropped (it over-rejected the small/full-fill shapes). Guard threshold 0.95 (5% margin) kept.
         r.t_cur = (blocks256 <= 128)
-            ? F / (5.9e12 * std::min<double>(256.0, 2.0 * (double)blocks256)) + 9.4e-6
-            : F / (5.9e12 * std::min<double>(256.0, (double)blocks256));
+            ? F / (5.96e12 * std::min<double>(256.0, 2.0 * (double)blocks256)) + 7.48e-6
+            : F / (5.96e12 * std::min<double>(256.0, (double)blocks256)) + 7.48e-6;
         const double part_b = (double)s * rows_total * D * part_elem_bytes + (double)s * rows_total * 4;
         const double comb_b = part_b + (double)rows_total * D * 2;
-        // Phase-1 cost: a physics floor (compute at 5.9 TFLOP/s/CU + fixed 7 us + serial fp16 write + combine floor)
-        // and an empirical linear fit to the measured totals of the final build (kernel-occ clean GPU-5 run,
-        // 6 shapes: bench/B1H8S1024/B2H4S1024/B3H3S768/B1H16S256/N128 s=2; residuals <= 5%):
-        //   T_kv_fit[us] = 17.1965 + 0.0937013*F[GFLOP] - 0.00103388*(N256*s) + 0.620991*rows[k]
-        // max() keeps the fit from extrapolating below the fixed-cost floor on tiny shapes; T_cur keeps the
-        // physical form (fits the measured t128 totals within 7%). Guard threshold 0.95 = 5% safety margin.
-        const double t_kv_phys = F / (5.9e12 * std::min<double>(256.0, (double)blocks256 * s)) + 7.0e-6
-                               + part_b / 4.0e12 + std::max(3.0e-6, comb_b / 4.2e12) + 1.5e-6;
-        const double t_kv_fit = (17.1965 + 0.0937013 * (F / 1e9) - 0.00103388 * (double)(blocks256 * s)
-                                 + 0.620991 * ((double)rows_total / 1000.0)) * 1e-6;
-        r.t_kv = std::max(t_kv_phys, t_kv_fit);
+        r.t_kv = F / (7.38e12 * std::min<double>(256.0, (double)blocks256 * s)) + 6.80e-6
+               + part_b / 4.0e12 + std::max(3.0e-6, comb_b / 4.2e12) + 1.0e-6;
         const int ntiles = (SK + 127) / 128;
         r.tps = (ntiles + s - 1) / s;
         r.tiles_ok = (s >= 1) && (r.tps >= 1) && ((s - 1) * r.tps < ntiles);
