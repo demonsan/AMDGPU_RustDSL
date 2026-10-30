@@ -13,7 +13,7 @@ fn main() {
     let lane = s.lane::<16, 3>(&o);
     let mut x = s.vgpr::<1>();
     s.v_add_f32(&mut x, lane, &sa);
-    let vcc = s.vcc();
+    let vcc = s.vcc().unwrap();
     let live = s.v_cmp_lt_i32(vcc, Imm::<5>::new(), &x);
     let mut d = s.vgpr::<1>();
     let _free = s.v_cndmask_b32(live, &mut d, &sa, &sb);

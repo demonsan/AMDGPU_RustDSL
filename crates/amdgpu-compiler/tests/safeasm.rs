@@ -54,7 +54,7 @@ fn assembles(asm: &str) {
 fn pv_phase_assembles() {
     let mut s = Seq::new();
     pv_rowsum_phase(&mut s);
-    let asm = block_to_asm(&s.finish()).unwrap();
+    let asm = block_to_asm(&s.finish().unwrap()).unwrap();
     assert!(asm.contains("v_mfma_scale_f32_32x32x64_f8f6f4") && asm.contains("v_smfmac_f32_16x16x128_fp8_fp8"), "{asm}");
     assembles(&asm);
 }
@@ -63,8 +63,8 @@ fn pv_phase_assembles() {
 fn waits_are_inserted_by_construction() {
     let mut s = Seq::new();
     pv_rowsum_phase(&mut s);
-    let b = s.finish();
-    let ops: Vec<&AInst> = b.insts.iter().collect();
+    let b = s.finish().unwrap();
+    let ops: Vec<&AInst> = b.insts().iter().collect();
     let smf: Vec<usize> = ops.iter().enumerate().filter(|(_, i)| i.op == "VSmfmac16x16x128Fp8").map(|(k, _)| k).collect();
     assert_eq!(smf.len(), 4);
     for w in smf.windows(2) {
@@ -136,7 +136,7 @@ fn matrix_sequence_equals_the_existing_kernel_path() {
     let k = normalise(&kernel, &kinsts, keep);
     let mut s = Seq::new();
     pv_rowsum_phase(&mut s);
-    let m = block_to_mfunction(&s.finish(), "pv_safe").unwrap();
+    let m = block_to_mfunction(&s.finish().unwrap(), "pv_safe").unwrap();
     let safe = normalise(&m, &m.blocks[0].insts, keep);
     assert_eq!(k.len(), 7);
     assert_eq!(safe, k, "safe-DSL sequence differs from the kernel path");
@@ -222,9 +222,9 @@ fn pending_loads_emit_partial_waits_from_the_scoreboard() {
     s.output(v0);
     s.output(v1);
     s.output(v2);
-    let b = s.finish();
-    let waits: Vec<i64> = b.insts.iter().filter(|i| i.op == "SWaitLgkm").map(|i| i.imm).collect();
-    assert_eq!(waits, vec![2, 0], "{:?}", b.insts.iter().map(|i| (i.op, i.imm)).collect::<Vec<_>>());
+    let b = s.finish().unwrap();
+    let waits: Vec<i64> = b.insts().iter().filter(|i| i.op == "SWaitLgkm").map(|i| i.imm).collect();
+    assert_eq!(waits, vec![2, 0], "{:?}", b.insts().iter().map(|i| (i.op, i.imm)).collect::<Vec<_>>());
 }
 
 #[test]
@@ -239,8 +239,8 @@ fn vm_and_lgkm_queues_are_independent() {
     let vg = g.wait(&mut s); // vmcnt(0)
     s.output(vl);
     s.output(vg);
-    let b = s.finish();
-    let w: Vec<(&str, i64)> = b.insts.iter().filter(|i| i.op.starts_with("SWait")).map(|i| (i.op, i.imm)).collect();
+    let b = s.finish().unwrap();
+    let w: Vec<(&str, i64)> = b.insts().iter().filter(|i| i.op.starts_with("SWait")).map(|i| (i.op, i.imm)).collect();
     assert_eq!(w, vec![("SWaitLgkm", 0), ("SWaitVm", 0)]);
 }
 
@@ -248,4 +248,98 @@ fn vm_and_lgkm_queues_are_independent() {
 fn block_insts_round_trip_names() {
     let b = rowsum_chain_block();
     assert!(block_insts(&b).unwrap().iter().any(|i| i.op == MOp::VSmfmac16x16x128Fp8));
+}
+// ---- attacks: every bypass of the type discipline must be refused by the poison flag / the hazard verifier -----------------------------------
+
+use amdgpu_safeasm::OP_MFMA_SCALE_ZERO;
+
+fn mfma_setup(s: &mut Seq) -> (Vgpr<8>, Vgpr<8>, Vgpr<1>, Vgpr<1>, Vgpr<16>) {
+    (s.zeroed::<8>(), s.zeroed::<8>(), s.splat(127), s.splat(127), s.vgpr::<16>())
+}
+
+/// (a) F1: drop the in-flight token (`let _ = t`) and go on. The accumulator moved into the token, so it cannot even be read (compile error,
+/// `fail_read_inflight_mfma_d.rs`); what remains is the abandoned token, which `finish` reports.
+#[test]
+fn attack_dropped_token_is_refused() {
+    let mut s = Seq::new();
+    let (a, b, sa, sb, o) = mfma_setup(&mut s);
+    let (ra, rb, rsa, rsb) = (s.ready(&a), s.ready(&b), s.ready(&sa), s.ready(&sb));
+    let t = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(o, ra, rb, rsa, rsb);
+    let _ = t; // dropped immediately
+    let e = s.finish().unwrap_err();
+    assert!(e.contains("unretired matrix result"), "{e}");
+}
+
+/// (b) F2 (WAR): drop the token to release the operand borrows, then overwrite an operand the MFMA is still reading.
+#[test]
+fn attack_war_after_dropped_token_is_refused() {
+    let mut s = Seq::new();
+    let (a, mut b, sa, sb, o) = mfma_setup(&mut s);
+    let (ra, rb, rsa, rsb) = (s.ready(&a), s.ready(&b), s.ready(&sa), s.ready(&sb));
+    let t = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(o, ra, rb, rsa, rsb);
+    drop(t);
+    let z = s.splat(0);
+    let b0 = s.lane_mut::<8, 0>(&mut b);
+    s.v_mov_b32(b0, &z);
+    let e = s.finish().unwrap_err();
+    assert!(e.contains("unretired matrix result") && e.contains("WAR"), "{e}");
+}
+
+/// The verifier is independent of the token discipline: a hand-written (forged) instruction list with the same holes is rejected too.
+#[test]
+fn verifier_rejects_forged_sequences() {
+    // MFMA then an immediate reader of its result, 2 wait states VALU->matrix operand, WAW, WAR
+    let mut s = Seq::new();
+    let (a, b, sa, sb, o) = mfma_setup(&mut s);
+    let (ra, rb, rsa, rsb) = (s.ready(&a), s.ready(&b), s.ready(&sa), s.ready(&sb));
+    let o = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(o, ra, rb, rsa, rsb).retire(&mut s);
+    let ok = s.finish().unwrap();
+    // forge: remove the retire padding
+    let ops_no_pad: Vec<AInst> = ok.insts().iter().filter(|i| i.op != "SNop").cloned().collect();
+    let _ = o;
+    let forged = amdgpu_safeasm::forge_for_tests(&ok, ops_no_pad.clone());
+    // the reader is missing in `ok`; append a VALU reader of the accumulator and a writer of an operand
+    let acc = ok.insts().iter().find(|i| i.op == "VMfmaScale32x32x64Fp8Z").unwrap().dst.unwrap();
+    let mut with_reader = ops_no_pad.clone();
+    with_reader.push(AInst { op: "VAddF32", dst: Some(0), srcs: vec![ASrc::Reg(acc), ASrc::Reg(acc)], imm: 0 });
+    let e1 = amdgpu_safeasm::forge_for_tests(&ok, with_reader).verify().unwrap_err().join("; ");
+    assert!(e1.contains("unretired matrix result"), "{e1}");
+    let mut waw = ops_no_pad.clone();
+    waw.push(AInst { op: "VMovB32", dst: Some(acc), srcs: vec![], imm: 0 });
+    let e2 = amdgpu_safeasm::forge_for_tests(&ok, waw).verify().unwrap_err().join("; ");
+    assert!(e2.contains("WAW"), "{e2}");
+    let mfma = ok.insts().iter().find(|i| i.op == "VMfmaScale32x32x64Fp8Z").unwrap();
+    let operand = if let ASrc::Reg(r) = mfma.srcs[0] { r } else { unreachable!() };
+    let mut war = ops_no_pad.clone();
+    war.push(AInst { op: "VMovB32", dst: Some(operand), srcs: vec![], imm: 0 });
+    let e3 = amdgpu_safeasm::forge_for_tests(&ok, war).verify().unwrap_err().join("; ");
+    assert!(e3.contains("WAR"), "{e3}");
+    // VALU write -> matrix operand with 0 wait states
+    let mut valu = vec![AInst { op: "VMovB32", dst: Some(operand), srcs: vec![], imm: 7 }];
+    valu.extend(ops_no_pad.iter().filter(|i| i.op == "VMfmaScale32x32x64Fp8Z").cloned());
+    let e4 = amdgpu_safeasm::forge_for_tests(&ok, valu).verify().unwrap_err().join("; ");
+    assert!(e4.contains("needs 2"), "{e4}");
+    let _ = forged;
+}
+
+/// F4: `chain` exists only for the accumulate opcode; the `_zero` token needs `retire` (checked at compile time in `fail_chain_after_zero.rs`).
+#[test]
+fn zero_form_then_accumulate_form_gets_the_full_latency() {
+    let mut s = Seq::new();
+    pv_rowsum_phase(&mut s);
+    let b = s.finish().unwrap();
+    let ops = b.insts();
+    let z = ops.iter().position(|i| i.op == "VMfmaScale32x32x64Fp8Z").unwrap();
+    let acc = ops.iter().position(|i| i.op == "VMfmaScale32x32x64Fp8").unwrap();
+    let states: i64 = ops[z + 1..acc].iter().map(|i| if i.op == "SNop" { i.imm + 1 } else { 1 }).sum();
+    assert!(states >= 20, "{states}");
+    let _ = OP_MFMA_SCALE_ZERO;
+}
+
+/// F6: a second `vcc()` is a value, not a panic.
+#[test]
+fn second_vcc_is_none() {
+    let mut s = Seq::new();
+    assert!(s.vcc().is_some());
+    assert!(s.vcc().is_none());
 }

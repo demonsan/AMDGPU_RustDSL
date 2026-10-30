@@ -558,7 +558,7 @@ impl Lowerer {
         }
         // constants: a one-dword register written once by `v_mov_b32 imm` is the region's cached constant register
         let mut ndefs = vec![0u32; block.regs().len()];
-        for i in &block.insts() {
+        for i in block.insts() {
             if let Some(d) = i.dst {
                 ndefs[d as usize] += 1;
             }
