@@ -38,10 +38,4 @@ fn main() {
     let f2 = forge_for_tests(&b, illegal_encoding);
     println!("  forged (encoding-illegal ops, hazard-clean): verify = {:?}", f2.verify().err().map(|e| e.join("; ")));
     let _ = v16;
-    // 3) forged clock manipulation: a negative SNop between a VALU write and a matrix read (state accounting)
-    let mut clock_trick = vec![AInst { op: "VMovB32", dst: Some(v1), srcs: vec![], imm: 7 }];
-    clock_trick.push(AInst { op: "SNop", dst: None, srcs: vec![], imm: -1 });
-    clock_trick.push(AInst { op: "VMfmaScale32x32x64Fp8Z", dst: Some(v1), srcs: vec![ASrc::Reg(v1), ASrc::Reg(v1), ASrc::Reg(v1), ASrc::Reg(v1)], imm: 0 });
-    let f3 = forge_for_tests(&b, clock_trick);
-    println!("  forged (negative s_nop clock trick): verify = {:?}", f3.verify().err().map(|e| e.join("; ")));
 }

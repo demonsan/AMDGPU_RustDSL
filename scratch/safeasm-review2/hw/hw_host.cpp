@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(h.data(), d, h.size() * 4, hipMemcpyDeviceToHost));
     std::printf("KERNEL %s:", argv[2]);
-    for (int l = 0; l < 64; ++l) if (l < 4 || l == 63) std::printf(" lane%d=%u", l, h[l * 4]);
+    for (int l = 0; l < 64; ++l) if (l < 4 || l == 63) std::printf(" lane%d=[%u %u]", l, h[l * 4], h[l * 4 + 1]);
     std::printf("\n");
     return 0;
 }

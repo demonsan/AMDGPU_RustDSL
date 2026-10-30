@@ -176,6 +176,109 @@ $(PAD $S)
 $WAIT20
     global_store_dword v[4:5], v10, off"
 done
+PADN() { case "$1" in 20) echo "    s_nop 7
+    s_nop 7
+    s_nop 3";; 16) echo "    s_nop 7
+    s_nop 7
+    s_nop 0";; 12) echo "    s_nop 7
+    s_nop 3";; 8) echo "    s_nop 7";; 1) echo "    s_nop 0";; *) echo "    s_nop $(( $1 - 1 ))";; esac; }
+# ---- class 5: MFMA result read by a VALU op after `states` wait states (how stale is the D really?) ----
+for S in 1 8 12 16 20; do
+  mk "rawread_s$S" "    v_mov_b32_e32 v8, 0x38383838
+    v_mov_b32_e32 v9, 0x38383838
+    v_mov_b32_e32 v10, 0x38383838
+    v_mov_b32_e32 v11, 0x38383838
+    v_mov_b32_e32 v12, 0x38383838
+    v_mov_b32_e32 v13, 0x38383838
+    v_mov_b32_e32 v14, 0x38383838
+    v_mov_b32_e32 v15, 0x38383838
+    v_mov_b32_e32 v16, 0x38383838
+    v_mov_b32_e32 v17, 0x38383838
+    v_mov_b32_e32 v18, 0x38383838
+    v_mov_b32_e32 v19, 0x38383838
+    v_mov_b32_e32 v20, 0x38383838
+    v_mov_b32_e32 v21, 0x38383838
+    v_mov_b32_e32 v22, 0x38383838
+    v_mov_b32_e32 v23, 0x38383838
+    v_mov_b32_e32 v24, 127
+    v_mov_b32_e32 v25, 127
+$(zero_d)
+$WAIT20
+    v_mfma_scale_f32_32x32x64_f8f6f4 v[32:47], v[8:15], v[16:23], 0, v24, v25
+$(PADN $S)
+    v_add_f32_e32 v50, v32, v49
+$WAIT20
+    global_store_dword v[4:5], v50, off"
+done
+# ---- class 6: SMFMAC idx operand written by VALU right before the SMFMAC (stale idx = old sparse pattern) ----
+for S in 1 2 3 4; do
+  mk "smfmac_idx_s$S" "    v_mov_b32_e32 v8, 0x38383838
+    v_mov_b32_e32 v9, 0x38383838
+    v_mov_b32_e32 v10, 0x38383838
+    v_mov_b32_e32 v11, 0x38383838
+    v_mov_b32_e32 v12, 0x38383838
+    v_mov_b32_e32 v13, 0x38383838
+    v_mov_b32_e32 v14, 0x38383838
+    v_mov_b32_e32 v15, 0x38383838
+    v_mov_b32_e32 v16, 0x38383838
+    v_mov_b32_e32 v17, 0x38383838
+    v_mov_b32_e32 v18, 0x38383838
+    v_mov_b32_e32 v19, 0x38383838
+    v_mov_b32_e32 v20, 0x44444444
+    v_mov_b32_e32 v32, 0
+    v_mov_b32_e32 v33, 0
+    v_mov_b32_e32 v34, 0
+    v_mov_b32_e32 v35, 0
+$WAIT20
+    v_mov_b32_e32 v20, 0xeeeeeeee
+$(PADN $S)
+    v_smfmac_f32_16x16x128_fp8_fp8 v[32:35], v[8:11], v[12:19], v20
+$WAIT20
+    global_store_dword v[4:5], v32, off"
+done
+# control: idx written long before (no rewrite)
+mk "smfmac_idx_ref01" "    v_mov_b32_e32 v8, 0x38383838
+    v_mov_b32_e32 v9, 0x38383838
+    v_mov_b32_e32 v10, 0x38383838
+    v_mov_b32_e32 v11, 0x38383838
+    v_mov_b32_e32 v12, 0x38383838
+    v_mov_b32_e32 v13, 0x38383838
+    v_mov_b32_e32 v14, 0x38383838
+    v_mov_b32_e32 v15, 0x38383838
+    v_mov_b32_e32 v16, 0x38383838
+    v_mov_b32_e32 v17, 0x38383838
+    v_mov_b32_e32 v18, 0x38383838
+    v_mov_b32_e32 v19, 0x38383838
+    v_mov_b32_e32 v20, 0x44444444
+    v_mov_b32_e32 v32, 0
+    v_mov_b32_e32 v33, 0
+    v_mov_b32_e32 v34, 0
+    v_mov_b32_e32 v35, 0
+$WAIT20
+    v_smfmac_f32_16x16x128_fp8_fp8 v[32:35], v[8:11], v[12:19], v20
+$WAIT20
+    global_store_dword v[4:5], v32, off"
+mk "smfmac_idx_ref23" "    v_mov_b32_e32 v8, 0x38383838
+    v_mov_b32_e32 v9, 0x38383838
+    v_mov_b32_e32 v10, 0x38383838
+    v_mov_b32_e32 v11, 0x38383838
+    v_mov_b32_e32 v12, 0x38383838
+    v_mov_b32_e32 v13, 0x38383838
+    v_mov_b32_e32 v14, 0x38383838
+    v_mov_b32_e32 v15, 0x38383838
+    v_mov_b32_e32 v16, 0x38383838
+    v_mov_b32_e32 v17, 0x38383838
+    v_mov_b32_e32 v18, 0x38383838
+    v_mov_b32_e32 v19, 0x38383838
+    v_mov_b32_e32 v20, 0xeeeeeeee
+    v_mov_b32_e32 v32, 0
+    v_mov_b32_e32 v33, 0
+    v_mov_b32_e32 v34, 0
+    v_mov_b32_e32 v35, 0
+$WAIT20
+    v_smfmac_f32_16x16x128_fp8_fp8 v[32:35], v[8:11], v[12:19], v20
+$WAIT20
+    global_store_dword v[4:5], v32, off"
 echo "[hw2] assembling done; building host"
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ hw_host.cpp -o out/hw_host -I"$HIPROOT/include" -L"$HIPROOT/lib" -lamdhip64 -Wl,-rpath,"$HIPROOT/lib" || exit 1
 run_all() { for co in out/*.co; do n="$(basename "$co" .co)"; ./out/hw_host "$co" "$n"; done; }

@@ -9,7 +9,7 @@ fn input_clobber_block() -> AsmBlock {
     let mut x = s.input::<1>();          // read-only contract... but it is an owned Vgpr
     let one = s.splat(1);
     s.v_add_u32(&mut x, &one, &one);     // writes the input port register (x = 2)
-    let out = s.vgpr::<1>();
+    let mut out = s.vgpr::<1>();
     s.v_add_u32(&mut out, &one, &one);   // out = 2
     s.output(out);
     s.finish().expect("verifier does not notice that an input port was written")
@@ -34,9 +34,11 @@ fn main() {
     match amdgpu_compiler::compile(&func) {
         Ok(r) => {
             println!("  compiled OK; lines touching the input register (look for a write to the register that later stores v):");
-            for l in r.asm.lines().filter(|l| l.contains("v_add_f32") || l.contains("v_add_u32") || l.contains("global_store")) {
+            for l in r.asm.lines().filter(|l| l.contains("v_add_f32") || l.contains("v_add_u32") || l.contains("global_store") || l.contains("v_mov")) {
                 println!("    {}", l.trim());
             }
+            println!("=== KERNEL_ASM ===");
+            println!("{}", r.asm);
         }
         Err(e) => println!("  compile Err: {e}"),
     }

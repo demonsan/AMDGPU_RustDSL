@@ -1,5 +1,5 @@
-﻿// (4b) Forged encoding-illegal instructions that pass (or fail) the hazard verifier, then handed to the compiler's public
-// `block_to_asm` / `block_to_mfunction` / `compile` path: does an illegal sequence escape as valid-looking asm?
+﻿// (4b, fixed) Encoding-illegal but HAZARD-CLEAN forged instructions: the verifier only models hazards, so this should pass
+// verify(); what do the compiler's public block_to_asm / block_to_mfunction do with it?
 use amdgpu_compiler::asm::{block_to_asm, block_to_mfunction};
 use amdgpu_safeasm::*;
 fn base() -> AsmBlock {
@@ -19,29 +19,30 @@ fn base() -> AsmBlock {
 }
 fn main() {
     let b = base();
-    let v16 = b.regs().iter().position(|c| *c == AClass::V16).unwrap() as u32;
     let v1 = b.regs().iter().position(|c| *c == AClass::V1).unwrap() as u32;
     let mut insts = b.insts().to_vec();
-    // 3 sources on a 2-source VALU op; readfirstlane with a VGPR destination; matrix op with a V1 destination
-    insts.push(AInst { op: "VAddF32", dst: Some(v1), srcs: vec![ASrc::Reg(v1), ASrc::Reg(v1), ASrc::Reg(v1)], imm: 0 });
-    insts.push(AInst { op: "VReadFirstLane", dst: Some(v1), srcs: vec![ASrc::Reg(v1)], imm: 0 });
-    insts.push(AInst { op: "VMfmaScale32x32x64Fp8Z", dst: Some(v1), srcs: vec![ASrc::Reg(v1), ASrc::Reg(v1), ASrc::Reg(v1), ASrc::Reg(v1)], imm: 0 });
-    insts.push(AInst { op: "VMovB32", dst: Some(v16), srcs: vec![ASrc::Reg(v1)], imm: 0 });
-    let f = forge_for_tests(&b, insts);
-    println!("CASE pass_forge_emit: verify = {:?}", f.verify().err().map(|e| e.join("; ")));
-    match block_to_asm(&f) {
-        Ok(asm) => {
-            let bad: Vec<&str> = asm.lines().filter(|l| l.contains("v_add_f32") || l.contains("v_readfirstlane") || l.contains("v_mfma") || l.contains("v_mov_b32")).collect();
-            println!("  block_to_asm OK; suspect lines:");
-            for l in bad { println!("    {}", l.trim()); }
-        }
-        Err(e) => println!("  block_to_asm Err: {e}"),
-    }
-    match block_to_mfunction(&f, "forged") {
-        Ok(m) => {
-            let n: usize = m.blocks.iter().map(|b| b.insts.len()).sum();
-            println!("  block_to_mfunction OK ({n} MIR insts) - the compiler accepted a forged, encoding-illegal block");
-        }
-        Err(e) => println!("  block_to_mfunction Err: {e}"),
+    insts.push(AInst { op: "SNop", dst: None, srcs: vec![], imm: 19 }); // 20 states
+    // 1) a 3-source e32 VALU op (the template has 2 operands)
+    let mut i1 = insts.clone();
+    i1.push(AInst { op: "VAddF32", dst: Some(v1), srcs: vec![ASrc::Reg(v1), ASrc::Reg(v1), ASrc::Reg(v1)], imm: 0 });
+    let f1 = forge_for_tests(&b, i1);
+    println!("CASE pass_forge_emit: 3-source VAddF32: verify = {:?}", f1.verify().err().map(|e| e.join("; ")));
+    println!("  block_to_asm = {:?}", block_to_asm(&f1).map(|a| a.lines().filter(|l| l.contains("v_add")).map(|l| l.trim().to_string()).collect::<Vec<_>>()).map_err(|e| e.chars().take(160).collect::<String>()));
+    println!("  block_to_mfunction = {:?}", block_to_mfunction(&f1, "forged").map(|m| m.blocks.iter().map(|b| b.insts.len()).sum::<usize>()).map_err(|e| e.chars().take(160).collect::<String>()));
+    // 2) v_readfirstlane with a VGPR destination
+    let mut i2 = insts.clone();
+    i2.push(AInst { op: "VReadFirstLane", dst: Some(v1), srcs: vec![ASrc::Reg(v1)], imm: 0 });
+    let f2 = forge_for_tests(&b, i2);
+    println!("CASE pass_forge_emit: rfl with VGPR dst: verify = {:?}", f2.verify().err().map(|e| e.join("; ")));
+    println!("  block_to_asm = {:?}", block_to_asm(&f2).map(|a| a.lines().filter(|l| l.contains("v_readfirstlane")).map(|l| l.trim().to_string()).collect::<Vec<_>>()).map_err(|e| e.chars().take(160).collect::<String>()));
+    println!("  block_to_mfunction = {:?}", block_to_mfunction(&f2, "forged").map(|m| m.blocks.iter().map(|b| b.insts.len()).sum::<usize>()).map_err(|e| e.chars().take(160).collect::<String>()));
+    // 3) negative SNop: does the verifier panic (debug overflow) / wrap (release)?
+    let mut i3 = insts.clone();
+    i3.push(AInst { op: "SNop", dst: None, srcs: vec![], imm: -1 });
+    let f3 = forge_for_tests(&b, i3);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f3.verify()));
+    match r {
+        Ok(v) => println!("CASE pass_forge_emit: negative SNop: verify returned {:?}", v.err()),
+        Err(_) => println!("CASE pass_forge_emit: ** verifier PANICKED on a forged negative SNop (debug overflow at the slot add) **"),
     }
 }
