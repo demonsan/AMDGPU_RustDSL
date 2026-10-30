@@ -7,9 +7,21 @@ ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 REF_CO="${REF_CO:?set REF_CO to the vendor fwd_hd128_mxfp8.co}"
 OUR_KERNEL="${OUR_KERNEL:-fmha_fwd_hd128_mxfp8_t}"
 cd "$REPO"; mkdir -p build
-bash tools/container/cargo.sh run -q --bin amdc -- emit "$OUR_KERNEL" --backend "${BACKEND:-auto}" ${AMDC_EXTRA_FLAGS:-} --out "/work/build/$OUR_KERNEL.s" >/dev/null 2>&1
-"${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
-    -o build/fmha_ours.co "build/$OUR_KERNEL.s"
+build_one() { # kernel, out.co
+    bash tools/container/cargo.sh run -q --bin amdc -- emit "$1" --backend "${BACKEND:-auto}" ${AMDC_EXTRA_FLAGS:-} --out "/work/build/$1.s" >/dev/null 2>&1
+    "${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
+        -o "$2" "build/$1.s"
+}
+# OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto: _vs128 + _t128, ref_host picks the tiling per shape (see run_ref.sh)
+KNAME="$OUR_KERNEL"; SMALL_ENV=""
+if [[ "$OUR_KERNEL" == *_auto ]]; then
+    KNAME="${OUR_KERNEL%_auto}_vs128"
+    build_one "$KNAME" build/fmha_ours.co
+    build_one "${OUR_KERNEL%_auto}_t128" build/fmha_ours_small.co
+    SMALL_ENV="build/fmha_ours_small.co"
+else
+    build_one "$OUR_KERNEL" build/fmha_ours.co
+fi
 [ -x build/ref_host ] || g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/ref_host.cpp -o build/ref_host \
     -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib"
 rc=0
@@ -18,7 +30,7 @@ for CFG in "2 8 700 640 2" "1 2 200 1337 2" "1 4 300 512 1" "2 4 300 129 1" "1 8
     sums=""
     for run in 1 2 3; do
         REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_HK=$(( $2 / $5 )) REF_ROWS=4 REF_ITERS=5 REF_DUMP2=build/det_$run.bin \
-            REF_CO2=build/fmha_ours.co REF_KNAME2="$OUR_KERNEL" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
+            REF_CO2=build/fmha_ours.co REF_KNAME2="$KNAME" REF_CO2_SMALL="$SMALL_ENV" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
             ./build/ref_host "$REF_CO" >/dev/null 2>&1
         sums="$sums $(md5sum build/det_$run.bin | cut -c1-12)"
     done

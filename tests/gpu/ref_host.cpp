@@ -229,16 +229,39 @@ int main(int argc, char** argv) {
         void* dout2;
         CK(hipMalloc(&dout2, no * 2));
         CK(hipMemset(dout2, 0, no * 2));
-        set_launch(dout2, ours_stride_rows);
+        // Tiling dispatch (our kernel only; the vendor line stays at 256 rows x 512 threads). Two tilings share the ABI:
+        //   256 rows / 512 threads per block (e.g. fmha_fwd_hd128_mxfp8_vs128) and 128 rows / 256 threads (fmha_fwd_hd128_mxfp8_t128).
+        // The measured rule (docs/gen4-tiling-design.md, kernel-occ validation): use the 128-row kernel iff 2 * ceil(S/256) * H * B <= 256, i.e. its
+        // own grid (2N blocks) fits the 256 CUs (N <= 128: t128 wins 1.33-1.5x); above that (N = 129..255 the 128-row grid oversubscribes the CUs and
+        // t128 collapses to 0.4-0.8x; N >= 256: 0.64-0.75x) use the 256-row kernel.
+        // REF_CO2/REF_KNAME2 = the 256-row kernel (or a single kernel); REF_CO2_SMALL/REF_KNAME2_SMALL = the 128-row kernel (enables the automatic
+        // choice). Overrides: REF_ROWS_PER_BLOCK=128|256 forces the tiling, REF_OURS_BLOCK_THREADS forces the block size.
+        const std::string kn2(kname2);
+        const char* co_small = std::getenv("REF_CO2_SMALL");
+        const char* kname_small = std::getenv("REF_KNAME2_SMALL") ? std::getenv("REF_KNAME2_SMALL") : "fmha_fwd_hd128_mxfp8_t128";
+        const long blocks256 = (long)((S + 255) / 256) * H * B;
+        const int forced_rows = envi("REF_ROWS_PER_BLOCK", 0);
+        const bool name128 = (kn2.size() >= 4 && kn2.compare(kn2.size() - 4, 4, "t128") == 0);
+        int rows_pb; const char* why;
+        if (forced_rows == 128 || forced_rows == 256) { rows_pb = forced_rows; why = "REF_ROWS_PER_BLOCK override"; }
+        else if (envi("REF_GRID128", 0) != 0) { rows_pb = 128; why = "REF_GRID128=1"; }
+        else if (co_small) { rows_pb = blocks256 <= 128 ? 128 : 256; why = blocks256 <= 128 ? "auto: 2*ceil(S/256)*H*B <= 256 CUs" : "auto: 2*ceil(S/256)*H*B > 256 CUs"; }
+        else { rows_pb = name128 ? 128 : 256; why = "kernel name"; }
+        const int gdiv2 = rows_pb;
+        const int bdim2 = envi("REF_OURS_BLOCK_THREADS", rows_pb == 128 ? 256 : 512);
+        const char* use_co = (rows_pb == 128 && co_small) ? co_small : co2;
+        const char* use_kn = (rows_pb == 128 && co_small) ? kname_small : kname2;
+        set_launch(dout2, rows_pb);   // output pointer + Q tile stride at 0x080 for the chosen tiling (rows_pb * H * D)
+        std::printf("[grid] vendor: rows/block=256 threads=512 blocks=%ld | ours (%s): rows/block=%d threads=%d blocks=%d (%s; blocks256=%ld)\n",
+                    blocks256, use_kn, rows_pb, bdim2, (int)(((S + gdiv2 - 1) / gdiv2) * H * B), why, blocks256);
         hipModule_t mod2; hipFunction_t fn2;
-        CK(hipModuleLoad(&mod2, co2));
-        CK(hipModuleGetFunction(&fn2, mod2, kname2));
-        CK(hipModuleLaunchKernel(fn2, gox, gy, gz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
+        CK(hipModuleLoad(&mod2, use_co));
+        CK(hipModuleGetFunction(&fn2, mod2, use_kn));        CK(hipModuleLaunchKernel(fn2, (S + gdiv2 - 1) / gdiv2, H, B, bdim2, 1, 1, 0, nullptr, nullptr, extra));
         CK(hipDeviceSynchronize());
         std::vector<uint16_t> out2(no, 0);
         CK(hipMemcpy(out2.data(), dout2, no * 2, hipMemcpyDeviceToHost));
         bad2 = check(out2, "our kernel   vs CPU");
-        time_kernel(fn2, "ours", dout2, ours_rows, gox, ours_block);
+        time_kernel(fn2, "ours", dout2, rows_pb, (S + rows_pb - 1) / rows_pb, bdim2);
         double wd = 0.0, md = 0.0;
         for (size_t i = 0; i < no; ++i) {
             const double dd = std::fabs((double)bf2f(out[i]) - (double)bf2f(out2[i]));
