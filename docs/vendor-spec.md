@@ -1144,6 +1144,153 @@ epilogue write cost is measured by ablation instead: main 23.0 us with partials 
 for 17.04 MB fp16 partials, ~4.0 TB/s serial**, matching the model; combine 5.2 us for 21.3 MB = 4.1 TB/s);
 tiny shapes where s=4 would have an empty split (guard rejects), and the pending kernel-opt optimisations.
 
+## 7.10.1 Per-CU gap decomposition (kddma build) and what is left
+
+Measured GPU 5 on kernel-opt `07cae94` (kddma default: K scales by LDS DMA). `_vs128`, B1H8S2048=SK2048,
+64 blocks / 256 CUs, 2 waves/SIMD; vendor `ref_mxfp8.co` in the same process/run; rocprofv3 1.1.0
+(ROCm 7.2.4) counters, per wave-iteration (waves=512, iterations=16); wall from unprofiled hipEvent runs,
+best of 3, node shared. Per-CU: ours **390-391 TFLOP/s / 64 CU = 6.10-6.11 TFLOP/s/CU**; vendor
+**537.5 / 64 = 8.40** => **1.38x per-CU gap** (the shipped auto path is 1.16x faster than the vendor in
+absolute terms because it fills 256 CUs; that win is CU fill, not per-CU).
+
+**Counter table (per wave-iteration; vendor -> ours; deltas are ours-vendor):**
+
+| counter | vendor | ours | delta | note |
+|---|---|---|---|---|
+| SQ_WAVE_CYCLES | 1159.5 | 1549.1 | **+389.6** | wave time; +34% |
+| SQ_VALU_MFMA_BUSY_CYCLES (XDL) | 1086.0 | 1216.0 | **+130.0** | 22 vs 19 MFMA/wave-iter (18 scaled + 4 f16 msum vs 16+2+1) |
+| SQ_ACTIVE_INST_VALU | 293.8 | 401.1 | **+107.3** | VALU busy cycles |
+| SQ_INSTS_VALU | 250.9 | 351.1 | **+100.2** | |
+| - _INT32 | 10.9 | 60.3 | **+49.4** | ring/address math; ours moved SALU -> VALU |
+| - other VALU (MOV/TRANS/CMP/...) | 79.6 | 139.7 | **+60.0** | register copies / transpose / mask ops |
+| - _MUL_F32 | 32.3 | 41.1 | +8.8 | |
+| - _ADD_F32 | 54.7 | 38.0 | -16.7 | vendor softmax path uses more additions |
+| - _CVT | 69.4 | 72.0 | +2.6 | equal-ish |
+| - _FMA_F32 | 4.1 | 0.0 | -4.1 | |
+| SQ_INSTS_SALU | 40.0 | 24.4 | -15.6 | ours puts address math in VALU INT32 instead |
+| SQ_INSTS_LDS | 52.5 | 52.3 | -0.2 | **staging is now equal after kddma** |
+| SQ_INSTS_VMEM | 5.7 | 7.6 | +2.0 | +2 Q/O staging vs vendor |
+| SQ_IFETCH | 81.4 | 101.0 | +19.5 | loop 605 vs 473 instructions |
+| SQ_INST_LEVEL_LDS | 32.1 | 31.5 | -0.7 | LDS latency exposure closed |
+| SQ_INST_LEVEL_VMEM | 50.5 | 121.5 | **+71.0** | VMEM latency exposed (DMA prefetch depth) |
+| SQ_WAIT_ANY (dependency wait) | 419.9 | 516.4 | **+96.5** | |
+| SQ_WAIT_INST_ANY (issue wait) | 337.7 | 527.3 | **+189.6** | **largest single stall class** |
+| SQ_WAIT_INST_LDS | 33.5 | 17.8 | -15.7 | better than vendor |
+| LDS bank conflicts | 0 | 0 | 0 | no conflicts in either |
+| barriers / 128 keys (static) | 2 | 2 | 0 | equal (from 7.7) |
+| setprio pair (static) | 1 | 1 | 0 | equal (from 7.7) |
+| staging instructions / 128 keys | ~5 LDS-DMA | 4 global_load_lds/role (kddma) | equal-ish | kddma removed the VGPR+ds_write K-scale path |
+
+**Cycle budget per wave-iteration (vendor 1159.5 cycles = 100%):**
+* vendor: XDL busy 93.7%, VALU active 25.3%, dependency wait 36.2/100, issue wait 29.1/100, VMEM level
+  4.4, LDS level 2.8, IFETCH 7.0 (these overlap; they do not sum to 100).
+* ours: XDL busy 78.5%, VALU active 25.9%, dependency wait 33.3/100, **issue wait 34.0/100**, VMEM level
+  7.8, LDS level 2.0, IFETCH 6.5.
+* The extra **+389.6 cycles/wave** decompose as: **+130 XDL work** (more MFMA per tile), **+107 VALU
+  work** (INT32 + the other-VALU class), **+19.5 IFETCH**, and the rest (~+133) is **lost overlap: issue
+  wait WAIT_INST_ANY +190 and dependency wait WAIT_ANY +97 minus LDS wait -16 and the work that hides
+  inside those windows**. Vendor hides nearly all of its own VALU/wait time inside the 93.7% XDL-busy
+  window; we lose 14-15 points of XDL occupancy (78.5%) because our extra VALU/INT32 work competes with
+  MFMA issue on the same SIMD and stretches the loop.
+* **Which wait dominates:** `SQ_WAIT_INST_ANY` (issue wait) is the single largest class (+189.6/wave,
+  +50% of its vendor value), then `SQ_WAIT_ANY` (dependency wait, +96.5). Per-100-vendor-cycles mapping:
+  for every 100 vendor wave cycles we spend 105 XDL-busy, 34.6 VALU-active, 45.5 issue wait, 44.5
+  dependency wait, 10.5 VMEM level, 8.7 IFETCH - i.e. we spend ~1.6x the vendor's issue-wait budget on
+  the same tile. LDS waits are *better* than the vendor's (17.8 vs 33.5), and bank conflicts are zero, so
+  the gap is **not** a hidden LDS/VMEM latency class: it is VALU/MFMA issue pressure plus work.
+
+**Vendor-mechanism check (what their per-CU advantage actually is):**
+* Their VALU advantage is **100 fewer VALU instructions per wave**: ~49 INT32 (they keep address/ring
+  math in SALU: 40 SALU vs our 24) + ~60 other-VALU (MOV/TRANS/CMP/copies) - ours spends these on the
+  rollback/reference and on LDS-transpose/mask ops; their `_ADD_F32` is 17 higher (softmax path). Their
+  CVT count is the same. This is a *work* difference, not scheduling magic.
+* **Interleaving/co-issue:** both run the same ISA; we already emit 1 setprio pair and 2 barriers per
+  128 keys, the same static schedule structure as the vendor (7.7). There is no gfx950
+  VALU-plus-MFMA "extra" co-issue mode the vendor could be using that we are not: their XDL busy is
+  93.7% of wave time because they issue fewer VALU ops, leaving issue slots free for MFMA. Our
+  WAIT_INST_ANY of 527 vs their 338 is the signature of VALU/MFMA issue-slot competition, not of absent
+  interleaving. (The `SQ_VALU_MFMA_COEXEC_CYCLES` counter is not exposed by this rocprofv3 build on
+  node 53, so the co-issue share itself is not directly measurable here.)
+* **Staging after kddma (answer to the staging question):** LDS instruction count is **52.3 ours vs 52.5
+  vendor** per wave-iteration (equal), VMEM instructions +2 (Q/O staging), barrier count **2 per 128 keys
+  = vendor's 2**, setprio **1 pair = vendor's 1 pair**. The vendor K/V staging is not the differentiator
+  any more; their remaining advantage is the compute/stall side (VALU work + XDL work + lost overlap).
+  The earlier `buffer_load`/LDS-transpose staging spec still holds for the vendor, but kddma made our
+  K-scale path direct-to-LDS as well.
+
+**Ranked per-CU targets (with cycle estimates per wave-iteration; 1% of ~2.75 us wave time = ~27.5 cycles):**
+1. **Cut the issue-wait/lost overlap (~+190 issue wait, +97 dependency wait, net +260-390 cycles/wave).**
+   This is the explicit-window target: authoring the inner loop so MFMA and VALU issue are separated into
+   alternating windows (or pinning VALU waits) to recover even half of the +260 net stall cycles =>
+   **-130..-200 cycles/wave = -8..-13% wall**. Highest value, but this is exactly where gen2/gen3
+   structural attempts (nobar/dblbar/g2/g3/g3o) went negative, so a hand-authored window with proven
+   cycle accounting is required, not another scheduler flag.
+2. **Remove VALU work (~100 instructions/wave -> up to ~215 active-VALU cycles/SIMD):** move the +49
+   INT32 ring/address math to SALU (as the vendor does), and delete the +60 other-VALU copies by
+   restructuring the reference/rollback path and the LDS transpose masks. Target `_INT32 <= 15` and
+   other-VALU <= 95 as in 7.5; expected **-100..-180 cycles/wave = -6..-11%** if the freed issue slots are
+   used by MFMA.
+3. **Reclaim XDL work (+130 cycles/wave):** the 2-smfmac row-sum recipe (4.5.1) plus removing the 2
+   extra scaled MFMAs (18 vs vendor 16) and the 4 f16 bias MFMAs (vendor 2+2) => **-64..-128
+   cycles/wave = -4..-8%**, and it also frees issue slots for (1).
+4. **Hide VMEM latency (+71 INST_LEVEL_VMEM):** deepen the K/V/Q DMA prefetch (kddma already improved the
+   path); expected **-30..-70 cycles/wave = -2..-4%**.
+
+**Negative list (tried, do not retry as-is):** `dmah` (DMA scheduling/hoist variant): no gain / worse;
+`dsplit` (deferred DMA waits): negative; `min_i32` (min-i32 shortcut): negative; barrier variants
+`nobar`, `nobar1` (drop V->M only), `nobar2` (drop M->V only), `dblbar`: all worse or unsafe
+(applies to vs128; the two barriers per 128 keys are already the vendor count); `g2`/`g3`/`g3o`
+(single-window/one-barrier structural rewrites): 334.6/367.2 TFLOP/s vs 365.7 baseline; explicit
+safe-asm window: **not applicable** to the current tile-level schedule as a drop-in - the safe-asm bridge
+can only help inside a hand-authored inner window (that is Target 1), not by replacing the scheduler
+globally.
+
+**Split-main fixed cost (the shipped path; kddma, forced s=4, B1H8S2048 rows, main kernel only):**
+SK sweep (one 128-key tile per split at SK=512, 2 at 1024, 4 at 2048, 8 at 4096) gives a linear fit
+`T_main[us] = 12.0 + 2.66 * tiles_per_split` (main 14.7/18.0/22.5/33.3 us at 1/2/4/8 tiles; launch gap
+<=0.1 us). The 12.0 us fixed part per split block decomposes with ablations (all full-benchmark, main
+only):
+
+| category | us | evidence |
+|---|---|---|
+| phase-1 tile loop (4 x 128 keys: QK/PV MFMA, softmax, K/V DMA) | 10.6 | SK-sweep slope 2.66 us/tile x4 |
+| LDS-transposed coalesced partial epilogue (Ohat fp16 + lse write) | **3.7** | full 22.5 -> `nopartial` 18.8 |
+| prologue staging (Q staging + DMA descriptor/ring init) | **~2.5** | `nostage` 20.0 / `nodma` 20.2 -> full 22.5 |
+| other fixed (launch, block setup, epilogue normalise/lse math, loop prologue/epilogue) | **~5.8** | 12.0 - 3.7 - 2.5 |
+| combine (see below) | **5.2** | combine-only hipEvent window |
+| launch gap main->combine | ~0.0-0.3 | total - main - combine |
+| **shipped total** | **27.7-28.4** | 621-624 TFLOP/s (vendor 536.5 same run; 1.16x) |
+
+Ablation cross-checks: `nokddma` main 23.2 (+0.7 us, kddma gain confirmed); `noexp` 22.5 (exp fused/hidden);
+`nopv` 20.5 (PV MFMA chain ~2.0 us of the tile loop).
+
+**Combine floor-vs-bandwidth verdict (settles the contradictory claims):** rows sweep at fixed SK=2048,
+s=4, combine-only hipEvent window (S=8/32/64/128/256/512/1024/2048 -> rows=64..16384 -> 0.02..21.3 MB):
+combine time is **~3.0 us floor + ~0.10 us/MB** (3.0-3.1 us for 0.02-2 MB/64-2048 rows; 5.2 us for
+21.3 MB at 16384 rows; a couple of points are outliers from node contention: 5.2 us at S=64 and 20.1 us
+at S=1024). So the combine is **both**: a **~3 us launch/completion floor (58%) plus ~2.2 us of bytes**
+(~9-10 TB/s effective for the 21.3 MB read+write). kernel-opt's "launch floor" claim is closer to right
+than my earlier "pure bandwidth-bound" one; conversely fusing does **not** save the whole 5.2 us - a fused
+last-arriver still reads the 17 MB of partials (~1.7-2 us) and pays its own epilogue. Expected fused
+saving **~2.5-3.5 us = +9-13% on the shipped path**, not the full 5 us. At 28.4 us shipped, -3 us gives
+~24.5 us => ~700 TFLOP/s, which is exactly the 700+ target.
+
+**What is left (shipped path, ranked):**
+1. **Fused combine (last lever): ~3 us** (combine floor + launch gap), +9-13%; must use the lite sc1
+   contract and the per-wave drain (7.8); acceptance = >=1e6-run stress + real-kernel md5 determinism.
+2. **Prologue/epilogue fixed floor: ~7.8 us/block non-write (2.5 staging + ~5.3 launch/setup/math)**:
+   the only way below it is a persistent/one-block-per-row-block kernel that amortises the split
+   prologue across all 4 splits (or a cooperative grid); expected 1-3 us if staging/init is 2.5 of it.
+3. **Partial epilogue write: 3.7 us** (17 MB fp16 at ~4.6 TB/s, serialised after the last tile). fp8
+   partials are a dead end (accuracy failed); bf16 has the same bytes; the only lever is overlapping the
+   LDS transpose + write with the last tile's PV/softmax (needs a separate store window) or fusing the
+   combine so the partials stay in L2/registers. Until then this cost is not reducible.
+4. **Per-CU (the other axis):** the 1.38x gap is Target 1-3 above; absolute shipped path already beats
+   the vendor by 1.16x, so per-CU work matters for the 700+ path only through the main-kernel 22.5 us.
+5. Not levers: launch gap (~0), combine kernel grid/threads (floor flat with grid), LDS bank conflicts
+   (zero), barrier count (already 2 = vendor), setprio (already 1 pair), safe-asm global replacement
+   (not applicable), dsplit/dmah/min_i32/barrier variants (negative list).
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as
