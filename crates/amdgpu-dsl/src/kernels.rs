@@ -7077,7 +7077,8 @@ struct KvsCtx {
     part_row0: ValueId,
     /// number of query heads (row_lin = (b * S + row) * H + h)
     heads: ValueId,
-    _unused: ValueId,
+    /// ceil(SK / 128): the TOTAL tile count of the sequence (the LUT-correction copy is chosen by it, like `_vs128`, not by the tiles of one split)
+    ntiles_total: ValueId,
 }
 
 struct FmhaTCtx {
@@ -15519,7 +15520,12 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         let rows_total = b.let_(Op::KernargI32 { offset: 0x284 });
         let heads = b.let_(Op::KernargI32 { offset: 0x140 });
         let part_row0 = b.mul_i32(kvs_split.expect("split"), rows_total);
-        Some(KvsCtx { ptr_ohat, ptr_lse, part_row0, heads, _unused: rows_total })
+        let kvl0 = b.let_(Op::KernargI32 { offset: 0x110 });
+        let c127t = b.c_i32(127);
+        let c7t = b.c_i32(7);
+        let kvl_r = b.add_i32(kvl0, c127t);
+        let ntiles_total = b.let_(Op::LshrI32(Opnd::Val(kvl_r), Opnd::Val(c7t)));
+        Some(KvsCtx { ptr_ohat, ptr_lse, part_row0, heads, ntiles_total })
     } else {
         None
     };
@@ -15605,9 +15611,11 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     }
     if vsx_split {
         // short = fewer than `cs` tiles of 128 keys (default 3)
-        // KV-split blocks own few tiles (SK/splits): `cs` defaults to 1 there (no LUT copy: the split-vs-single mean difference is 3e-6 with it, 4e-4 without)
-        let c3k = b.c_i32(fmha_t_num("cs").unwrap_or(if is_kvs { 1 } else { 9 }) as i32);
-        let short = b.cmp_lt_i32(cx.nkv, c3k);
+        // the recipe copy is chosen by the TOTAL tile count of the sequence (LUT correction below `cs` = 9 tiles, as in `_vs128`), not by the tiles of one split:
+        // identical numerics to `_vs128` per split, and the accuracy of the short-sequence recipe does not depend on how the keys are split
+        let c3k = b.c_i32(fmha_t_num("cs").unwrap_or(9) as i32);
+        let nk_sel = match cx.kvs { Some(kv) => kv.ntiles_total, None => cx.nkv };
+        let short = b.cmp_lt_i32(nk_sel, c3k);
         for pass in 0..2u8 {
             if pass == 0 {
                 b.begin_if(Opnd::Val(short));
