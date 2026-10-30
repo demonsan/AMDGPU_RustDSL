@@ -202,11 +202,14 @@ pub struct MInst {
     /// True for s_waitcnt inserted automatically by lowering (touch/flush_pending), false for
     /// explicit DSL waits. Only the LLVM-tail exporter looks at it (--llvm-tail-drop-auto-waits).
     pub auto: bool,
+    /// Pinned instruction (safe-asm blocks built with `Seq::pin`): the scheduler keeps it in program order and treats a run of pinned
+    /// instructions as a barrier (nothing moves into, out of or across it).
+    pub pin: bool,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false }
     }
 
     pub fn def(mut self, r: VReg) -> Self {

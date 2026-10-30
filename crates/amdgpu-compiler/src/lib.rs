@@ -2,6 +2,7 @@
 
 pub mod asm;
 pub mod asm_check;
+pub mod pin_check;
 pub mod backend;
 pub mod emit;
 pub mod hazards;
@@ -132,6 +133,10 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
             let mut m = base.clone();
             let attempt = (|| -> Result<regalloc::Alloc, String> {
                 sched::run(&mut m, &o)?;
+                let pe = pin_check::check(&m);
+                if !pe.is_empty() {
+                    return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
+                }
                 let vcc_fill = f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") && std::env::var("AMDC_VCC_FILL").map_or(false, |v| !v.is_empty() && v != "0");
                 hazards::with_vcc_fill(vcc_fill, || hazards::fix_value_hazards_opts(&mut m, true));
                 let errs = mir::verify(&m);
@@ -151,6 +156,10 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(if std::env::var("AMDC_SCHED_VERBOSE").is_ok() { 6000 } else { 120 }).collect::<String>());
     }
     let mut m = base;
+    let pe = pin_check::check(&m);
+    if !pe.is_empty() {
+        return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
+    }
     hazards::fix_value_hazards(&mut m);
     let errs = mir::verify(&m);
     if !errs.is_empty() {

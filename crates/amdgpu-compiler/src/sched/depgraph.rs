@@ -118,6 +118,26 @@ pub fn build(m: &MFunction, insts: &[MInst], term: &Term, alu_across: bool) -> G
             }
         }
     }
+    // pinned runs are barriers: every earlier instruction precedes the first pinned one, consecutive pinned ones keep their order, the last one
+    // precedes every later instruction. All edges point forward, so the graph stays acyclic.
+    let pin: Vec<bool> = eff.iter().map(|e| e.pinned).collect();
+    for i in 0..n {
+        if !pin[i] {
+            continue;
+        }
+        if i > 0 && pin[i - 1] {
+            add_edge(&mut g, i - 1, i, 1);
+        } else {
+            for j in 0..i {
+                add_edge(&mut g, j, i, 1);
+            }
+        }
+        if i + 1 < n && !pin[i + 1] {
+            for k in i + 1..n {
+                add_edge(&mut g, i, k, 1);
+            }
+        }
+    }
     g.eff = eff;
     g
 }

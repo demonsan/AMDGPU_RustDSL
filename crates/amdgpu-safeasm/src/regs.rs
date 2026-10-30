@@ -116,6 +116,11 @@ impl<const N: usize> Dst<N> for &mut Vgpr<N> {
         self.id
     }
 }
+impl<const N: usize> Dst<N> for Vgpr<N> {
+    fn dst_id(&self) -> VReg {
+        self.id
+    }
+}
 impl<const M: usize> Sealed for SubMut<'_, M> {}
 impl<const M: usize> Dst<M> for SubMut<'_, M> {
     fn dst_id(&self) -> VReg {

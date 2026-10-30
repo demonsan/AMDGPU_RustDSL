@@ -82,6 +82,7 @@ pub struct Seq {
     exit_in_flight: Vec<(u32, u32)>,
     next_token: u32,
     loop_body: bool,
+    pinned: bool,
     lgkm: Vec<u32>,
     vm: Vec<u32>,
 }
@@ -111,6 +112,7 @@ impl Seq {
             exit_in_flight: Vec::new(),
             next_token: 0,
             loop_body: false,
+            pinned: false,
             lgkm: Vec::new(),
             vm: Vec::new(),
         }
@@ -240,6 +242,42 @@ impl Seq {
     /// Low (`HI` = false) or high half of an 8-dword tuple as a 4-dword view; the parent stays borrowed.
     pub fn half8<'a, const HI: bool>(&mut self, r: &'a impl Readable<8>) -> Sub<'a, 4> {
         Sub { id: self.alias_of(r.reg_id(), if HI { 4 } else { 0 }, AClass::V4), _p: PhantomData }
+    }
+
+    /// Dwords `2*I .. 2*I+2` of an 8-dword tuple as a writable pair (I in 0..4); the parent stays mutably borrowed while the view lives.
+    pub fn pair_mut<'a, const I: usize>(&mut self, r: &'a mut Vgpr<8>) -> SubMut<'a, 2> {
+        let () = ViewCheck::<I, 4>::OK;
+        SubMut { id: self.alias_of(r.id, (2 * I) as u8, AClass::V2), _p: PhantomData }
+    }
+
+    /// All four dword pairs of an 8-dword tuple at once: DISJOINT writable views under ONE mutable borrow of the parent, so four DS reads can be in
+    /// flight together; the parent is usable again (e.g. `ready`) only after every pending token has been waited and dropped.
+    pub fn split_pairs_mut<'a>(&mut self, r: &'a mut Vgpr<8>) -> [SubMut<'a, 2>; 4] {
+        let id = r.id;
+        [0u8, 2, 4, 6].map(|o| SubMut { id: self.alias_of(id, o, AClass::V2), _p: PhantomData })
+    }
+
+    /// Both halves of an 8-dword tuple (disjoint writable 4-dword views).
+    pub fn split_halves8_mut<'a>(&mut self, r: &'a mut Vgpr<8>) -> [SubMut<'a, 4>; 2] {
+        let id = r.id;
+        [0u8, 4].map(|o| SubMut { id: self.alias_of(id, o, AClass::V4), _p: PhantomData })
+    }
+
+    /// All four quarters of a 16-dword tuple (disjoint writable 4-dword views).
+    pub fn split_quarters16_mut<'a>(&mut self, r: &'a mut Vgpr<16>) -> [SubMut<'a, 4>; 4] {
+        let id = r.id;
+        [0u8, 4, 8, 12].map(|o| SubMut { id: self.alias_of(id, o, AClass::V4), _p: PhantomData })
+    }
+
+    /// Low (`HI` = false) or high half of an 8-dword tuple as a writable 4-dword view.
+    pub fn half8_mut<'a, const HI: bool>(&mut self, r: &'a mut Vgpr<8>) -> SubMut<'a, 4> {
+        SubMut { id: self.alias_of(r.id, if HI { 4 } else { 0 }, AClass::V4), _p: PhantomData }
+    }
+
+    /// Dwords `4*I .. 4*I+4` of a 16-dword tuple as a writable quad (I in 0..4).
+    pub fn quarter16_mut<'a, const I: usize>(&mut self, r: &'a mut Vgpr<16>) -> SubMut<'a, 4> {
+        let () = ViewCheck::<I, 4>::OK;
+        SubMut { id: self.alias_of(r.id, (4 * I) as u8, AClass::V4), _p: PhantomData }
     }
 
     fn alias_of(&mut self, parent: VReg, off: u8, class: AClass) -> VReg {
@@ -443,6 +481,11 @@ impl Seq {
         self.insts.iter().map(|i| i.op.to_string()).collect::<Vec<_>>().join("\n")
     }
 
+    /// Pin the block: the hand-authored instruction order is preserved by the scheduler (no instruction moves into, out of or across it).
+    pub fn pin(&mut self) {
+        self.pinned = true;
+    }
+
     /// Finish a LOOP BODY: the block runs once per iteration, so it must be DRAIN-CLOSED. It enters with nothing in flight (the previous iteration
     /// ended clean) and must exit the same way: every matrix result retired (20 wait states), no outstanding DS/VMEM loads, no matrix `output_exit`.
     /// The straight-line verifier is then sound for every iteration because the entry and exit wait clocks are defined (all waits satisfied).
@@ -467,6 +510,7 @@ impl Seq {
             outputs: self.outputs,
             exit_in_flight: self.exit_in_flight,
             loop_body: self.loop_body,
+            pinned: self.pinned,
         };
         if let Err(v) = block.verify() {
             errs.extend(v);
@@ -478,6 +522,11 @@ impl Seq {
         }
     }
 }
+struct ViewCheck<const I: usize, const N: usize>;
+impl<const I: usize, const N: usize> ViewCheck<I, N> {
+    const OK: () = assert!(I < N, "view index out of range for this register tuple");
+}
+
 struct LaneCheck<const I: usize, const N: usize>;
 impl<const I: usize, const N: usize> LaneCheck<I, N> {
     const OK: () = assert!(I < N, "lane index out of range for this register tuple");
