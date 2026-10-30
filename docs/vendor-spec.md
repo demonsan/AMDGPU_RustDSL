@@ -612,6 +612,61 @@ runs**; the uncontended same-run pair is what the 1.41x ratio is based on. A fir
 during a busy period gave vendor 0.0522 ms / 328.9 TFLOP/s and ours 0.0664 ms / 258.9 TFLOP/s - both
 deflated, not used.
 
+### 0) Fair-comparison protocol for a tiling difference (prepared for the 128-row `t128` kernel)
+
+The vendor binary is fixed: its kernarg/ABI hard-codes a 256-query-row tiling (`ts_qo = 256`, Q tile stride
+`256*H*D`) and 512 threads (8 waves = 2 waves/SIMD). Our kernels choose their own tiling; the candidate
+`fmha_fwd_hd128_mxfp8_t128` uses 128-row blocks (256 threads = 4 waves = 1 wave/SIMD) and deliberately
+enforces one block per CU (3-slot ring = 99840 B LDS; two blocks need 199680 B > 163840 B). A single
+TFLOP/s number is therefore ambiguous, and from now on **every tiling comparison is reported as two
+explicitly labelled lines**:
+
+* **(a) Per-CU efficiency, same grid.** Both kernels at the vendor's 256-row tiling (grid
+  `(ceil(S/256), H, B)`), or equivalently the clock-free counters normalised per wave-iteration (they
+  divide `blocks x 8 x (SK/128)` away). This number answers "which kernel is more efficient per CU" and
+  is the only line where the two kernels are on identical launch geometry. For `_vs128` vs vendor on
+  B1H8S2048 this is **1.41x slower (365.7 vs 515.5 TFLOP/s)** and is unchanged by tiling work.
+* **(b) Absolute throughput at each kernel's own best legal tiling on this shape.** Vendor at 256 rows
+  (it cannot do 128); ours at its best (`_vs128`: 256 rows; `_t128`: 128 rows). This number answers
+  "what does this shape deliver" and **must always be quoted with both grids and block counts**, e.g.
+  B1H8S2048: vendor `(8,8,1)=64 blocks = 25 % of 256 CUs`, `_t128` `(16,8,1)=128 blocks = 50 %`.
+  It is not a per-CU efficiency claim: if `_t128` beats the vendor's absolute number by filling more
+  CUs, the conclusion is "our tiling uses this shape's grid better", not "our kernel is faster per CU".
+
+Grid-fill reference (256 active CUs/package, MI350 `mi350-arch-topology`; 1 block/CU for both the
+vendor kernel and `_t128`): benchmark B1H8S2048 = 64 blocks (25 %) at 256 rows / 128 blocks (50 %) at
+128 rows; the filling shape B4H8S2048 = 256 blocks (100 %) at 256 rows / 512 blocks (two sequential
+block waves, all 256 CUs busy) at 128 rows. Absolute package-level claims are only meaningful for
+shapes/grids that reach 256 blocks; the 15-shape gate mostly does not (see the table below).
+
+Harness support (kept backward-compatible; defaults reproduce the historical 256-row/512-thread run):
+`tests/gpu/ref_host.cpp` reads `REF_ROWS_PER_BLOCK` (candidate rows/block, default 256),
+`REF_VENDOR_ROWS_PER_BLOCK` (vendor, default/only 256), `REF_OURS_BLOCK_THREADS` (default 512),
+`REF_CUS` (default 256) and `REF_GRID_ONLY=1` (print the grid line and exit). It patches the
+tiling-dependent ABI fields per kernel (output pointer, Q tile stride), launches the vendor on its
+256-row grid and our kernel on `ceil(S/REF_ROWS_PER_BLOCK)` blocks, and prints one `[grid] ...` line;
+the `timing vendor/ours` lines now carry `rows/block` and `blocks`. The 15-shape and determinism scripts
+inherit the environment variable. The two t128 result lines are filled in here once the kernel lands.
+
+**Harness validated (2026-10-30, commit `e8be2ba`)** with `REF_GRID_ONLY=1` and the real kernels, without
+touching any default behaviour:
+* B1H8S2048 default: `[grid] vendor 256 rows/blk grid=(8,8,1)=64 blocks (25.0% of 256 CUs); ours 256
+  rows/blk grid=(8,8,1)=64 blocks (25.0%)` - exactly the historical launch.
+* B1H8S2048 `REF_ROWS_PER_BLOCK=128 REF_OURS_BLOCK_THREADS=256`: ours `(16,8,1)=128 blocks (50.0%)`,
+  vendor still `(8,8,1)=64 blocks (25.0%)`.
+* Filling shape B4H8S2048: default both `(8,8,4)=256 blocks (100%)`; ours at 128 rows
+  `(16,8,4)=512 blocks (two sequential block waves, all 256 CUs busy = 200% block-slots)`.
+* Odd S (B1 H3 S=300): vendor `(2,3,1)`, ours-128 `(3,3,1)` - grid rounding correct.
+* Default path regression with the modified host: 16-row gate **15/15 OK, parity 15/15**, ours `bad=0`,
+  determinism **5/5**, and the best-case same-run timing reproduces §7.9 exactly:
+  vendor 0.0333 ms / **515.8 TFLOP/s**, ours 0.0470 ms / **365.6 TFLOP/s** = **1.411x**.
+  (Single samples on GPU 5 are only trustworthy at the top clock state: the same kernel ranges
+  0.033-0.085 ms depending on the shared node's clock/contention; use a long warm-up and best-of-N,
+  as in §7.9. This is why the numbers are quoted as best-case + median, never as a single sample.)
+* For the t128 run the invocation is `REF_ROWS_PER_BLOCK=128 REF_OURS_BLOCK_THREADS=256
+  OUR_KERNEL=fmha_fwd_hd128_mxfp8_t128 REF_CO2=build/<t128>.co REF_KNAME2=fmha_fwd_hd128_mxfp8_t128`;
+  the 15-shape and determinism scripts inherit the environment variables unchanged.
+
 ### 1) Same-run wall vs vendor (final)
 
 | | vendor | `_vs128` final @f4cccb6 | previous `_vs128` @3cc73c0 (§7.7) |
