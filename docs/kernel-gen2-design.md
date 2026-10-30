@@ -67,3 +67,7 @@ Interpretation: the intra-wave overlap works (QK hidden, dependency stalls down 
 2. **It did not pay because of window balance and phase rendezvous**: V' (VALU + MFMA issue + K reads) vs M' (PV only) are unbalanced, the complementary partner waits at the barrier (WAIT_ANY 560 -> 813, wave cycles 1599 -> 1760); `g2split` (+3.3%) shows balance matters but is not sufficient.
 3. **Minimum viable gen2 design**: (a) balanced V'/M' windows; (b) finer-than-block synchronisation - per-group named barriers (if gfx950 has them for this use), double-buffered tile state so one group can run a phase ahead without rendezvous, or a single merged window per tile with only the ring-recycle barrier (the earlier `_vsm` merged form, 287 TFLOP/s, predates the exact-reference recipe, smfmac row sums and resident Q and is untried with today's ingredients); (c) an explicitly authored inner loop (`Stmt::Asm`) if the list scheduler reorders the window.
 4. `fmha_fwd_hd128_mxfp8_g2` stays registered by name only (own backend, not in `kernel_names()`) as the starting point; `_vs128` (367 TFLOP/s, 1.40x from the vendor) is the fast path and `_t` (292, llvm-tail) the accurate default.
+
+### 7.1 Merged single window (g3) result
+See docs/status.md round 57 addendum: g3 343.3 TFLOP/s (-6.5%), bit-identical, WAIT_ANY 558 (rendezvous tax gone) but WAIT_INST_ANY 627 (dependency stalls back), wave cycles 1702 vs 1599. The single window trades the barrier rendezvous for dependency stalls; the complementary offset is what hides them. Final negative of the line.
+
