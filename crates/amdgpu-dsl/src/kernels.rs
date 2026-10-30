@@ -14916,7 +14916,8 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine() -> Function {
     let rd = b.rcp_f32(denf);
     let res = b.mul_f32(accf, rd);
     let packed = b.cvt_pk_bf16_f32(res, res);
-    let o_byte = b.shl_i32(idx, c1_const(&mut b));
+    let c1x = b.c_i32(1);
+    let o_byte = b.shl_i32(idx, c1x);
     let optr = b.ptr_add(out, o_byte);
     b.store_u16(optr, 0, packed);
     b.finish()
