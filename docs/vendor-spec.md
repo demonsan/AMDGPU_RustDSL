@@ -1394,16 +1394,46 @@ a ready patch; the counter evidence for the *source* is independent of that bug.
    fragment, 16-byte-group aligned) -> **4 `global_load_dwordx4`** (bytes 0,32,64,96) + dword unpack.
    Expected: level 121.6 -> 86.6, VMEM inst 7.62 -> 6.88, wave cycles -6.7%, **+3-6% per-CU**; md5 gate
    `faadf00c...` mandatory. One-function change in `fmha_t_build`'s Q-fragment loop.
-2. **Vectorise the epilogue output stores**: the two contiguous dwords at `off, off+4` -> add
-   `GlobalStoreF32x2` (`global_store_dwordx2`, 8 B) + `store_f32x2`; 32 -> 16 stores/wave (or 8 if the
-   lane map allows 16 B groups). Diagnostic removal is -38 level / -10.4% wave cycles; dwordx2 should
-   recover ~half -> **+2-4% per-CU**; bit-identity gate mandatory. (The 8 B chunks are 16 B apart, so
-   dwordx2 is the safe first step; 16 B needs a packing/lane-map check.)
+2. **Epilogue output stores - the level metric misleads here.** The two contiguous dwords at
+   `off, off+4` can be merged into `global_store_dwordx2` (+ `store_f32x2`), 32 -> 16 stores/wave. That
+   lowers `INST_LEVEL_VMEM` (86.3 -> 66.5) and wave cycles (1436 -> 1351) but **makes the wall slower**:
+   a 12-round interleaved A/B on `d412d50e` gives `_vs128` 64 blocks **454.6 scalar-4B vs 417.1
+   dwordx2 TFLOP/s** (+9.1% for scalar) and filled B4H8S2048 1399.8 vs 1320.7 (+6%); only B1H8S8192
+   showed dwordx2 better in 3 rounds (1888 vs 1816, needs more data - possible shape-dependent store
+   choice). **Do not treat INST_LEVEL_VMEM / wave-cycle counters as acceptance gates for store-path
+   changes**; acceptance is the interleaved multi-round A/B (>=12 rounds, >=200 iters, same commit,
+   same-run vendor, median) plus md5 bit-identity. The vectorisation itself is not a win; the Q prologue
+   vectorisation (#1) remains the only confirmed prologue/epilogue win so far.
 3. **Do not change kddma or the K/V staging**: kddma is 4.3 level; staging is 38.9 at 9.7 cycles/inst
    (vendor 9.0) - already vendor-like. `nodma`'s -3.7% is the unavoidable staging cost.
 
 If both are implemented correctly the level should land near the vendor's 50.8 and the per-CU rate should
 gain 5-8% (391 -> 411-422 at 64 blocks), with the prologue part also shrinking the 3.1 us fixed cost.
+
+## 7.10.5 Post-vectorisation state and acceptance methodology (in progress)
+
+**Q prologue vectorisation is confirmed:** kernel-opt's `load_b128` Q loads (2 per fragment, replacing 16
+serialised scalar dword loads) are bit-identical (`faadf00c...` etc.) and give **+6.6% per-CU in isolation**
+(`qdw` restores scalar Q: 64-block median 416.2 -> 424.6 with dwordx2 O; on the scalar-O build the effect
+is similar). The epilogue store change is **negative** per the 12-round A/B in section 7.10.4: scalar 4-byte
+stores are +9.1% at 64 blocks and +6% on B4H8S2048 over `global_store_dwordx2`, despite the counters
+favouring dwordx2. The only dwordx2-positive point so far is B1H8S8192 (1888 vs 1816 in 3 rounds, n=2 for
+scalar - needs >=6 rounds).
+
+**Acceptance methodology (recorded after the counter/wall contradiction):** for any change with expected
+effect below ~5% the only acceptance is an **interleaved multi-round A/B** - >=12 rounds, >=200 iterations,
+same commit, same-run vendor, report best+median, plus the md5 bit-identity and the 15-shape gate. Counter
+rows (`INST_LEVEL_VMEM`, `SQ_WAVE_CYCLES`, `WAIT_INST_ANY`, ...) are diagnostic attribution, not wall-time
+predictors; in particular a store-path change can lower the level/wave counters while making the kernel
+slower.
+
+**Pending freeze:** when kernel-opt's decisive A/B settles the epilogue default (and any shape-dependent
+choice), this section becomes the new control with: `_vs128` per-CU (expect ~450-455 TFLOP/s = ~7.0
+TF/CU, gap to vendor 8.44 = **1.20x**), filled B4H8S2048 (~1400) and B1H8S8192 (~1890 if dwordx2 wins
+there), mid shapes, shipped auto path (expect >691 TFLOP/s), 15 gate shapes @16/64 rows, determinism 3x5,
+parity, md5 faadf00c, and counters (VMEM level ~66/86 depending on store choice, VMEM inst 5.88/6.88, wave
+cycles ~1351/1436). The guard refit is on hold until this control is frozen; its constants will be
+re-measured on the winning build.
 
 ## 8. Unknowns / limitations
 
