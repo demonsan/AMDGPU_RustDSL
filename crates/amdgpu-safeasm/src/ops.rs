@@ -114,19 +114,43 @@ impl Seq {
         Smfmac { issued, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
     }
 
-    // ---- loads (Pending tokens) -----------------------------------------------------------------------------------------------------
-    /// `ds_read_b128 dst, vaddr offset:N`: LDS read (lgkmcnt queue). The destination moves into the token.
-    pub fn ds_read_b128(&mut self, dst: Vgpr<4>, addr: &impl Readable<1>, offset: u16) -> Pending<Vgpr<4>> {
-        self.push(AInst { op: "LdsReadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: offset as i64 });
+    // ---- loads / DS (Pending tokens; offsets are compile-time constants with alignment checks) ---------------------------------------
+    /// `ds_read_b128 dst, vaddr offset:OFF`: LDS read (lgkmcnt queue). OFF is 16-byte aligned (compile-time). The destination moves into the token.
+    pub fn ds_read_b128<const OFF: u32>(&mut self, dst: Vgpr<4>, addr: &impl Readable<1>) -> Pending<Vgpr<4>> {
+        let () = DsOff::<OFF, 16>::OK;
+        self.push(AInst { op: "LdsReadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: OFF as i64 });
         self.clear_write(dst.id);
         self.issue_load(Queue::Lgkm, dst)
     }
 
-    /// `ds_read_b32 dst, vaddr offset:N`.
-    pub fn ds_read_b32(&mut self, dst: Vgpr<1>, addr: &impl Readable<1>, offset: u16) -> Pending<Vgpr<1>> {
-        self.push(AInst { op: "LdsReadB32", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: offset as i64 });
+    /// `ds_read_b64_tr_b8 dst, vaddr offset:OFF`: transposed 8-bit read (2 dwords). OFF is 8-byte aligned.
+    pub fn ds_read_b64_tr_b8<const OFF: u32>(&mut self, dst: Vgpr<2>, addr: &impl Readable<1>) -> Pending<Vgpr<2>> {
+        let () = DsOff::<OFF, 8>::OK;
+        self.push(AInst { op: "LdsReadB64TrB8", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: OFF as i64 });
         self.clear_write(dst.id);
         self.issue_load(Queue::Lgkm, dst)
+    }
+
+    /// `ds_read_b32 dst, vaddr offset:OFF` (OFF 4-byte aligned).
+    pub fn ds_read_b32<const OFF: u32>(&mut self, dst: Vgpr<1>, addr: &impl Readable<1>) -> Pending<Vgpr<1>> {
+        let () = DsOff::<OFF, 4>::OK;
+        self.push(AInst { op: "LdsReadB32", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: OFF as i64 });
+        self.clear_write(dst.id);
+        self.issue_load(Queue::Lgkm, dst)
+    }
+
+    /// `ds_write_b32 vaddr, vdata offset:OFF`: occupies a lgkmcnt slot (no value comes back).
+    pub fn ds_write_b32<const OFF: u32>(&mut self, addr: &impl Readable<1>, data: &impl Readable<1>) {
+        let () = DsOff::<OFF, 4>::OK;
+        self.push(AInst { op: "LdsWriteB32", dst: None, srcs: vec![ASrc::Reg(addr.reg_id()), ASrc::Reg(data.reg_id())], imm: OFF as i64 });
+        self.issue_store(Queue::Lgkm);
+    }
+
+    /// `ds_write_b128 vaddr, vdata[4] offset:OFF` (OFF 16-byte aligned).
+    pub fn ds_write_b128<const OFF: u32>(&mut self, addr: &impl Readable<1>, data: &impl Readable<4>) {
+        let () = DsOff::<OFF, 16>::OK;
+        self.push(AInst { op: "LdsWriteB128", dst: None, srcs: vec![ASrc::Reg(addr.reg_id()), ASrc::Reg(data.reg_id())], imm: OFF as i64 });
+        self.issue_store(Queue::Lgkm);
     }
 
     /// `global_load_dwordx4 dst, vaddr[2], off offset:N` (vmcnt queue).
@@ -136,13 +160,81 @@ impl Seq {
         self.issue_load(Queue::Vm, dst)
     }
 
-    /// `ds_write_b32 vaddr, vdata offset:N`: occupies a lgkmcnt slot (no value comes back).
-    pub fn ds_write_b32(&mut self, addr: &impl Readable<1>, data: &impl Readable<1>, offset: u16) {
-        self.push(AInst { op: "LdsWriteB32", dst: None, srcs: vec![ASrc::Reg(addr.reg_id()), ASrc::Reg(data.reg_id())], imm: offset as i64 });
-        self.issue_store(Queue::Lgkm);
+    // ---- transcendental ops: the result needs 4 wait states (TRANS_LATENCY 5 slots) before any reader ------------------------------------
+    /// `v_exp_f32 dst, src`: returns a token; `settle` pads the missing wait states and gives the register back.
+    pub fn v_exp_f32<A: Operand>(&mut self, dst: Vgpr<1>, a: A) -> Trans {
+        self.trans("VExpF32", dst, a)
+    }
+    pub fn v_rcp_f32<A: Operand>(&mut self, dst: Vgpr<1>, a: A) -> Trans {
+        self.trans("VRcpF32", dst, a)
+    }
+    pub fn v_log_f32<A: Operand>(&mut self, dst: Vgpr<1>, a: A) -> Trans {
+        self.trans("VLogF32", dst, a)
+    }
+
+    fn trans<A: Operand>(&mut self, op: &'static str, dst: Vgpr<1>, a: A) -> Trans {
+        // a packed-fp32 result feeding a transcendental op needs 2 slots first (hazards.rs `pkw`)
+        if let ASrc::Reg(r) = a.to_src() {
+            self.pad_for_pk(r);
+        }
+        let issued = self.clock;
+        self.push(inst(op, Some(dst.id), vec![a.to_src()]));
+        Trans { issued, reg: Some(dst), poison: self.poison.clone() }
+    }
+
+    // ---- packed (VOP3P) fp32 ops on register pairs ------------------------------------------------------------------------------------
+    /// `v_pk_add_f32 dst[2], a[2], b[2]`.
+    pub fn v_pk_add_f32<D: Dst<2>, A: Src<2>, B: Src<2>>(&mut self, dst: D, a: A, b: B) {
+        self.push(inst("VPkAddF32", Some(dst.dst_id()), vec![ASrc::Reg(a.src_id()), ASrc::Reg(b.src_id())]));
+        self.note_valu_write(dst.dst_id());
+        self.note_pk_write(dst.dst_id());
+    }
+    /// `v_pk_mul_f32 dst[2], a[2], b[2]`.
+    pub fn v_pk_mul_f32<D: Dst<2>, A: Src<2>, B: Src<2>>(&mut self, dst: D, a: A, b: B) {
+        self.push(inst("VPkMulF32", Some(dst.dst_id()), vec![ASrc::Reg(a.src_id()), ASrc::Reg(b.src_id())]));
+        self.note_valu_write(dst.dst_id());
+        self.note_pk_write(dst.dst_id());
+    }
+
+    // ---- permlane32 swap: swaps the upper half of `a` with the lower half of `b` across the wave; both registers are rewritten ------------
+    pub fn v_permlane32_swap_b32(&mut self, a: &mut Vgpr<1>, b: &mut Vgpr<1>) {
+        // both operands are VALU-written inputs of a hazard-sensitive reader: 2 wait states first
+        self.make_ready_pub(a.id);
+        self.make_ready_pub(b.id);
+        self.push(inst("VPermlane32Swap", Some(a.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id)]));
+        self.note_valu_write(a.id);
+        self.note_valu_write(b.id);
     }
 }
 
+/// A transcendental result in flight (5-slot latency). Owns the destination register; `settle` pads exactly the missing wait states.
+#[must_use = "a transcendental result must be settled before it is used"]
+pub struct Trans {
+    issued: u32,
+    reg: Option<Vgpr<1>>,
+    poison: Poison,
+}
+
+impl Trans {
+    pub fn settle(mut self, s: &mut Seq) -> Vgpr<1> {
+        let r = self.reg.take().expect("register");
+        s.pad_after(self.issued, TRANS_RESULT);
+        r
+    }
+}
+
+impl Drop for Trans {
+    fn drop(&mut self) {
+        if self.reg.is_some() {
+            self.poison.borrow_mut().push("a transcendental result was abandoned without settle()".to_string());
+        }
+    }
+}
+
+struct DsOff<const OFF: u32, const A: u32>;
+impl<const OFF: u32, const A: u32> DsOff<OFF, A> {
+    const OK: () = assert!(OFF % A == 0 && OFF <= 65535, "ds offset must be aligned to the access size and fit the 16-bit offset field");
+}
 impl<'a> Mfma<'a, OP_MFMA_SCALE> {
     /// Dependent MFMA of the SAME accumulate opcode accumulating in place into the same register: hardware-interlocked, no wait needed.
     /// (Not defined for the `_zero` form: a different opcode needs the full result latency, i.e. `retire`.)
@@ -183,4 +275,16 @@ pub const HAND_WRITTEN_OPS: &[(&str, &str, &str)] = &[
     ("global_load_dwordx4", "GlobalLoadB128", "Pending (vmcnt)"),
     ("v_add_f32_acc", "VAddF32", "in-place accumulate"),
     ("v_writesub (zeroed)", "VWriteSub", "register init"),
+    ("ds_read_b64_tr_b8", "LdsReadB64TrB8", "Pending (lgkmcnt), 8-byte aligned offset"),
+    ("ds_write_b128", "LdsWriteB128", "lgkm slot, 16-byte aligned offset"),
+    ("v_exp_f32 / v_rcp_f32 / v_log_f32", "VExpF32", "Trans token (4 wait states)"),
+    ("v_rcp_f32", "VRcpF32", "Trans token"),
+    ("v_log_f32", "VLogF32", "Trans token"),
+    ("v_pk_add_f32", "VPkAddF32", "VOP3P pair, pk->trans rule"),
+    ("v_pk_mul_f32", "VPkMulF32", "VOP3P pair, pk->trans rule"),
+    ("v_permlane32_swap_b32", "VPermlane32Swap", "in-place pair, 2-state reader rule"),
+    ("v_cvt_scalef32_pk_fp8_bf16 lo", "VCvtPkFp8Lo", "partial-write type-state Pw"),
+    ("v_cvt_scalef32_pk_fp8_bf16 hi", "VCvtPkFp8Hi", "partial-write type-state Pw"),
+    ("v_cvt_pk_fp8_f32 lo", "VCvtPkFp8F32", "partial-write type-state Pw"),
+    ("v_cvt_pk_fp8_f32 hi", "VCvtPkFp8F32Hi", "partial-write type-state Pw"),
 ];

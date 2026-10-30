@@ -14,6 +14,10 @@ use std::rc::Rc;
 pub const VALU_TO_MATRIX_READ: u32 = 2;
 /// Wait states between a (scaled) MFMA / SMFMAC and the first reader of its result (hardware-confirmed: 19 is still stale).
 pub const MATRIX_RESULT: u32 = 20;
+/// Wait states between a transcendental op (`v_exp/rcp/log_f32`) and any reader of its result (hazards.rs TRANS_LATENCY = 5 slots).
+pub const TRANS_RESULT: u32 = 4;
+/// Wait states between a packed-fp32 op and a transcendental op that reads its result (hazards.rs `pkw`).
+pub const PK_TO_TRANS: u32 = 1;
 /// Wait states between a compare that writes `vcc` and the `v_cndmask` that reads it.
 pub const VCC_TO_CNDMASK: u32 = 2;
 
@@ -70,12 +74,14 @@ pub struct Seq {
     pub(crate) clock: u32,
     writes: HashMap<VReg, Write>,
     vcc_taken: bool,
+    pk_writes: HashMap<VReg, u32>,
     vcc_written_at: u32,
     zero: Option<VReg>,
     inputs: Vec<AsmPort>,
     outputs: Vec<AsmPort>,
     exit_in_flight: Vec<(u32, u32)>,
     next_token: u32,
+    loop_body: bool,
     lgkm: Vec<u32>,
     vm: Vec<u32>,
 }
@@ -97,12 +103,14 @@ impl Seq {
             clock: 0,
             writes: HashMap::new(),
             vcc_taken: false,
+            pk_writes: HashMap::new(),
             vcc_written_at: 0,
             zero: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             exit_in_flight: Vec::new(),
             next_token: 0,
+            loop_body: false,
             lgkm: Vec::new(),
             vm: Vec::new(),
         }
@@ -264,6 +272,19 @@ impl Seq {
         self.writes.insert(c, Write { at, need });
     }
 
+    pub(crate) fn note_pk_write(&mut self, r: VReg) {
+        let c = self.canon(r);
+        let at = self.clock - 1;
+        self.pk_writes.insert(c, at);
+    }
+
+    pub(crate) fn pad_for_pk(&mut self, r: VReg) {
+        let c = self.canon(r);
+        if let Some(at) = self.pk_writes.get(&c).copied() {
+            self.pad_after(at, PK_TO_TRANS);
+        }
+    }
+
     pub(crate) fn clear_write(&mut self, r: VReg) {
         let c = self.canon(r);
         self.writes.remove(&c);
@@ -422,6 +443,14 @@ impl Seq {
         self.insts.iter().map(|i| i.op.to_string()).collect::<Vec<_>>().join("\n")
     }
 
+    /// Finish a LOOP BODY: the block runs once per iteration, so it must be DRAIN-CLOSED. It enters with nothing in flight (the previous iteration
+    /// ended clean) and must exit the same way: every matrix result retired (20 wait states), no outstanding DS/VMEM loads, no matrix `output_exit`.
+    /// The straight-line verifier is then sound for every iteration because the entry and exit wait clocks are defined (all waits satisfied).
+    pub fn finish_loop_body(mut self) -> Result<AsmBlock, String> {
+        self.loop_body = true;
+        self.finish()
+    }
+
     /// Finish the sequence into a verified plain-data block. Fails (with every reason) if a token was abandoned without being retired /
     /// waited for, loads are still outstanding, or the hazard verifier finds a violation of the wait-state model.
     pub fn finish(self) -> Result<AsmBlock, String> {
@@ -437,6 +466,7 @@ impl Seq {
             inputs: self.inputs,
             outputs: self.outputs,
             exit_in_flight: self.exit_in_flight,
+            loop_body: self.loop_body,
         };
         if let Err(v) = block.verify() {
             errs.extend(v);

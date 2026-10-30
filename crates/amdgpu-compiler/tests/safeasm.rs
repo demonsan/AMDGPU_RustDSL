@@ -213,9 +213,9 @@ fn pending_loads_emit_partial_waits_from_the_scoreboard() {
     let mut s = Seq::new();
     let addr = s.splat(0);
     let (d0, d1, d2) = (s.vgpr::<4>(), s.vgpr::<4>(), s.vgpr::<4>());
-    let r0 = s.ds_read_b128(d0, &addr, 0);
-    let r1 = s.ds_read_b128(d1, &addr, 16);
-    let r2 = s.ds_read_b128(d2, &addr, 32);
+    let r0 = s.ds_read_b128::<0>(d0, &addr);
+    let r1 = s.ds_read_b128::<16>(d1, &addr);
+    let r2 = s.ds_read_b128::<32>(d2, &addr);
     let v0 = r0.wait(&mut s); // two later loads may stay in flight: lgkmcnt(2)
     let v2 = r2.wait(&mut s); // drains everything up to r2: lgkmcnt(0)
     let v1 = r1.wait(&mut s); // already covered: no instruction
@@ -234,7 +234,7 @@ fn vm_and_lgkm_queues_are_independent() {
     let addr = s.splat(0);
     let (dg, dl) = (s.vgpr::<4>(), s.vgpr::<4>());
     let g = s.global_load_dwordx4(dg, &a2, 0);
-    let l = s.ds_read_b128(dl, &addr, 0);
+    let l = s.ds_read_b128::<0>(dl, &addr);
     let vl = l.wait(&mut s); // lgkm queue holds only this load: lgkmcnt(0), the global load stays in flight
     let vg = g.wait(&mut s); // vmcnt(0)
     s.output(vl);
@@ -361,7 +361,7 @@ fn ds_write_then_wait_all_is_clean() {
     let mut s = Seq::new();
     let a = s.splat(0);
     let d = s.splat(1);
-    s.ds_write_b32(&a, &d, 0);
+    s.ds_write_b32::<0>(&a, &d);
     s.wait_lgkm_all();
     let mut x = s.vgpr::<1>();
     s.v_mov_b32(&mut x, Imm::<1>::new());
@@ -370,7 +370,7 @@ fn ds_write_then_wait_all_is_clean() {
     let mut s = Seq::new();
     let a = s.splat(0);
     let d = s.splat(1);
-    s.ds_write_b32(&a, &d, 0);
+    s.ds_write_b32::<0>(&a, &d);
     assert!(s.finish().unwrap_err().contains("outstanding"));
 }
 
@@ -442,9 +442,9 @@ fn explicit_wait_counts_are_checked() {
     let mut s = Seq::new();
     let addr = s.splat(0);
     let (d0, d1, d2) = (s.vgpr::<4>(), s.vgpr::<4>(), s.vgpr::<4>());
-    let r0 = s.ds_read_b128(d0, &addr, 0);
-    let r1 = s.ds_read_b128(d1, &addr, 16);
-    let r2 = s.ds_read_b128(d2, &addr, 32);
+    let r0 = s.ds_read_b128::<0>(d0, &addr);
+    let r1 = s.ds_read_b128::<16>(d1, &addr);
+    let r2 = s.ds_read_b128::<32>(d2, &addr);
     assert!(s.wait_lgkm_cnt(3).is_err(), "3 outstanding: lgkmcnt(3) waits for nothing");
     s.wait_lgkm_cnt(1).unwrap(); // r0 and r1 complete, r2 may stay in flight
     let v0 = r0.wait(&mut s); // covered: no instruction
@@ -465,4 +465,133 @@ fn generated_templates_cover_the_documented_set() {
     for n in ["v_add_u32", "v_add_f32", "v_mul_lo_u32", "v_cmp_lt_i32", "v_perm_b32", "v_fma_f32", "global_store_dword", "v_lshrrev_b32"] {
         assert!(names.contains(&n), "{n} missing from the generated set");
     }
+}
+
+// ---- round 4: typed DS / conversion / pack ops and the loop-body contract ----------------------------------------------------------------
+
+#[test]
+fn ds_ops_with_partial_counts_and_transposed_read() {
+    let mut s = Seq::new();
+    let addr = s.splat(0);
+    let (d0, d1, d2, d3) = (s.vgpr::<4>(), s.vgpr::<4>(), s.vgpr::<2>(), s.vgpr::<1>());
+    let r0 = s.ds_read_b128::<0>(d0, &addr);
+    let r1 = s.ds_read_b128::<16>(d1, &addr);
+    let r2 = s.ds_read_b64_tr_b8::<8>(d2, &addr);
+    let r3 = s.ds_read_b32::<4>(d3, &addr);
+    let w = s.zeroed::<4>();
+    s.ds_write_b128::<32>(&addr, &w);
+    let v0 = r0.wait(&mut s); // 4 younger DS ops outstanding (r1, r2, r3, the write): lgkmcnt(4)
+    let v1 = r1.wait(&mut s); // lgkmcnt(3)
+    let v2 = r2.wait(&mut s);
+    let v3 = r3.wait(&mut s);
+    s.wait_lgkm_all(); // the write
+    for r in [v0, v1] {
+        s.output(r);
+    }
+    s.output(v2);
+    s.output(v3);
+    let b = s.finish().unwrap();
+    let w: Vec<i64> = b.insts().iter().filter(|i| i.op == "SWaitLgkm").map(|i| i.imm).collect();
+    assert_eq!(w, vec![4, 3, 2, 1, 0], "{:?}", b.insts().iter().map(|i| (i.op, i.imm)).collect::<Vec<_>>());
+}
+
+#[test]
+fn transcendental_results_are_padded_and_pk_feeds_exp_with_a_gap() {
+    let mut s = Seq::new();
+    let a = s.zeroed::<2>();
+    let b = s.zeroed::<2>();
+    let mut p = s.vgpr::<2>();
+    s.v_pk_add_f32(&mut p, &a, &b);
+    let l = s.lane::<2, 0>(&p);
+    let d = s.vgpr::<1>();
+    let e = s.v_exp_f32(d, l); // reads a packed-fp32 result: the builder pads the 1 wait state
+    let e = e.settle(&mut s); // 4 wait states
+    let mut y = s.vgpr::<1>();
+    s.v_add_f32(&mut y, &e, &e);
+    s.output(y);
+    let blk = s.finish().unwrap();
+    let ops = blk.insts();
+    let pk = ops.iter().position(|i| i.op == "VPkAddF32").unwrap();
+    let ex = ops.iter().position(|i| i.op == "VExpF32").unwrap();
+    let add = ops.iter().position(|i| i.op == "VAddF32").unwrap();
+    let gap = |a: usize, b: usize| -> i64 { ops[a + 1..b].iter().map(|i| if i.op == "SNop" { i.imm + 1 } else { 1 }).sum() };
+    assert!(gap(pk, ex) >= 1, "pk -> exp");
+    assert!(gap(ex, add) >= 4, "exp -> reader");
+}
+
+#[test]
+fn partial_write_converts_build_a_word_and_the_verifier_rejects_a_half_read() {
+    let mut s = Seq::new();
+    let (a, b, c, e) = (s.splat(1), s.splat(2), s.splat(3), s.splat(4));
+    let scale = s.splat(127);
+    let d = s.vgpr::<1>();
+    let pw = s.partial(d);
+    let pw = s.v_cvt_scalef32_pk_fp8_bf16_lo(pw, &a, &scale);
+    let pw = s.v_cvt_scalef32_pk_fp8_bf16_hi(pw, &b, &scale);
+    let word = pw.done();
+    let d2 = s.vgpr::<1>();
+    let pw2 = s.partial(d2);
+    let pw2 = s.v_cvt_pk_fp8_f32_lo(pw2, &c, &e);
+    let pw2 = s.v_cvt_pk_fp8_f32_hi(pw2, &c, &e);
+    let word2 = pw2.done();
+    let mut y = s.vgpr::<1>();
+    s.v_add_u32(&mut y, &word, &word2);
+    s.output(y);
+    let ok = s.finish().unwrap();
+    // forge: drop the high-half convert of the first word, then read the dword
+    let hi = ok.insts().iter().position(|i| i.op == "VCvtPkFp8Hi").unwrap();
+    let mut v = ok.insts().to_vec();
+    v.remove(hi);
+    let e = amdgpu_safeasm::forge_for_tests(&ok, v).verify().unwrap_err().join("; ");
+    assert!(e.contains("only the low half was written"), "{e}");
+}
+
+#[test]
+fn loop_body_contract_is_drain_closed() {
+    // legitimate: matrix retired, loads waited, nothing exported in flight
+    let mut s = Seq::new();
+    let a = s.input::<8>();
+    let b = s.input::<8>();
+    let sa = s.splat(127);
+    let sb = s.splat(127);
+    let o = s.vgpr::<16>();
+    let (ra, rb, rsa, rsb) = (s.ready(&a), s.ready(&b), s.ready(&sa), s.ready(&sb));
+    let o = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(o, ra, rb, rsa, rsb).retire(&mut s);
+    s.output(o);
+    assert!(s.finish_loop_body().is_ok());
+
+    // an in-flight matrix result at the boundary is refused
+    let mut s = Seq::new();
+    let a = s.input::<8>();
+    let b = s.input::<8>();
+    let sa = s.splat(127);
+    let sb = s.splat(127);
+    let o = s.vgpr::<16>();
+    let (ra, rb, rsa, rsb) = (s.ready(&a), s.ready(&b), s.ready(&sa), s.ready(&sb));
+    let ex = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(o, ra, rb, rsa, rsb).exit();
+    s.output_exit(ex);
+    let e = s.finish_loop_body().unwrap_err();
+    assert!(e.contains("drain-closed"), "{e}");
+
+    // an outstanding DS load at the boundary is refused
+    let mut s = Seq::new();
+    let addr = s.input::<1>();
+    let d = s.vgpr::<4>();
+    let p = s.ds_read_b128::<0>(d, &addr);
+    drop(p);
+    let e = s.finish_loop_body().unwrap_err();
+    assert!(e.contains("outstanding") || e.contains("abandoned"), "{e}");
+}
+
+#[test]
+fn raw_only_ops_are_not_allowed_in_a_sequence() {
+    let mut s = Seq::new();
+    let mut x = s.vgpr::<1>();
+    s.v_mov_b32(&mut x, Imm::<1>::new());
+    s.output(x);
+    let ok = s.finish().unwrap();
+    let mut v = ok.insts().to_vec();
+    v.push(AInst { op: "VAddCoU32", dst: Some(ok.outputs()[0].reg), srcs: vec![ASrc::Imm(1), ASrc::Reg(ok.outputs()[0].reg)], imm: 0 });
+    let e = amdgpu_safeasm::forge_for_tests(&ok, v).verify().unwrap_err().join("; ");
+    assert!(e.contains("raw-only"), "{e}");
 }
