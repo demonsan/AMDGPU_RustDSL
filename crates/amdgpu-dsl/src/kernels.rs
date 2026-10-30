@@ -10463,10 +10463,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let rb3 = b.mul_i32(rb2, kv.heads);
         let rb4 = b.add_i32(rb3, cx.hidx);
         let prow = b.add_i32(kv.part_row0, rb4);
-        let c512i = b.c_i32(512);
-        let ooff = b.mul_i32(prow, c512i); // 128 fp32 per row
+        // p16: fp16 partials (128 x 2 bytes per row, halves the write and the combine read); default fp32
+        let p16 = fmha_t_opt("p16");
+        let c512i = b.c_i32(if p16 { 256 } else { 512 });
+        let ooff = b.mul_i32(prow, c512i); // 128 fp32 (or fp16) per row
         let half = b.let_(Op::LshrI32(Opnd::Val(cx.g4), Opnd::Val(c2)));
-        let hb = b.shl_i32(half, c4); // 16 bytes per lane half
+        let hb = b.shl_i32(half, if p16 { c3d } else { c4 }); // 16 (fp32) or 8 (fp16) bytes per lane half
         let ooff2 = b.add_i32(ooff, hb);
         let o_ptr0 = b.ptr_add(kv.ptr_ohat, ooff2);
         let lse_off = b.shl_i32(prow, c2);
@@ -10474,7 +10476,30 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
         b.begin_if(Opnd::Val(wave_live));
         b.store_f32(l_ptr, 0, lse_v);
-        for e in 0..(if ablate.contains("nopartial") { 0usize } else { 4usize }) {
+        if p16 {
+            for e in 0..(if ablate.contains("nopartial") { 0usize } else { 4usize }) {
+                for q in 0..4usize {
+                    let mut hv: Vec<ValueId> = Vec::with_capacity(4);
+                    for k in 0..4usize {
+                        let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                        let lanev = b.bitcast_f32(lane);
+                        let v = b.mul_f32(lanev, fin);
+                        hv.push(b.let_(Op::CvtF32ToF16(Opnd::Val(v))));
+                    }
+                    let s0 = b.shl_i32(hv[1], c16i);
+                    let s1 = b.shl_i32(hv[3], c16i);
+                    let w0 = b.let_(Op::AddI32(Opnd::Val(hv[0]), Opnd::Val(s0)));
+                    let w1 = b.let_(Op::AddI32(Opnd::Val(hv[2]), Opnd::Val(s1)));
+                    // dims 32 e + 8 q + 4 half + 0..3 -> bytes 64 e + 16 q + 8 half
+                    let off = (64 * e + 16 * q) as u32;
+                    let f0 = b.bitcast_f32(w0);
+                    let f1 = b.bitcast_f32(w1);
+                    b.store_f32(o_ptr0, off, f0);
+                    b.store_f32(o_ptr0, off + 4, f1);
+                }
+            }
+        }
+        for e in 0..(if ablate.contains("nopartial") || p16 { 0usize } else { 4usize }) {
             for q in 0..4usize {
                 let mut wv: Vec<ValueId> = Vec::with_capacity(4);
                 for k in 0..4usize {
@@ -15048,6 +15073,113 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4() -> Function {
     let w0 = b.cvt_pk_bf16_f32(res[0], res[1]);
     let w1 = b.cvt_pk_bf16_f32(res[2], res[3]);
     let o_byte = b.shl_i32(t4, c3); // 8 bytes per thread
+    let optr = b.ptr_add(out, o_byte);
+    let f0 = b.bitcast_f32(w0);
+    let f1 = b.bitcast_f32(w1);
+    b.store_f32(optr, 0, f0);
+    b.store_f32(optr, 4, f1);
+    b.finish()
+}
+/// fp16-partial variant of the vectorised combine (`..._kvsplit_combine4h`): Ohat is `[splits][rows_total][128]` fp16 (split kernel built with `p16`);
+/// same launch as `..._combine4` (4 elements per thread, grid ceil(rows_total * 128 / 4 / 256)).
+pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4h() -> Function {
+    let mut b = FnBuilder::new("fmha_fwd_hd128_mxfp8_kvsplit_combine4h", 256);
+    b.arg("ptr_ohat", DType::Ptr, 0x00, 8);
+    b.arg("ptr_lse", DType::Ptr, 0x08, 8);
+    b.arg("ptr_out", DType::Ptr, 0x10, 8);
+    b.arg("rows_total", DType::I32, 0x18, 4);
+    b.arg("d", DType::I32, 0x1C, 4);
+    b.arg("splits", DType::I32, 0x20, 4);
+    let ohat = b.let_(Op::KernargPtr { offset: 0x00 });
+    let lse = b.let_(Op::KernargPtr { offset: 0x08 });
+    let out = b.let_(Op::KernargPtr { offset: 0x10 });
+    let rows = b.let_(Op::KernargI32 { offset: 0x18 });
+    let splits = b.let_(Op::KernargI32 { offset: 0x20 });
+    let tid = b.let_(Op::WorkitemId);
+    let bx = b.let_(Op::WorkgroupIdX);
+    let c0 = b.c_i32(0);
+    let c2 = b.c_i32(2);
+    let c3 = b.c_i32(3);
+    let c5 = b.c_i32(5);
+    let c8 = b.c_i32(8);
+    let c16 = b.c_i32(16);
+    let cm1 = b.c_i32(-1);
+    let bx256 = b.shl_i32(bx, c8);
+    let t_raw = b.add_i32(bx256, tid);
+    let total4 = b.shl_i32(rows, c5);
+    let last = b.add_i32(total4, cm1);
+    let ok = b.cmp_lt_i32(t_raw, total4);
+    let t4 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(t_raw), b: Opnd::Val(last) });
+    let row = b.let_(Op::LshrI32(Opnd::Val(t4), Opnd::Val(c5)));
+    let neg_big = b.c_f32(-1.0e30);
+    let neg_big_i = b.bitcast_i32(neg_big);
+    let zero_f = b.c_f32(0.0);
+    let zero_i = b.bitcast_i32(zero_f);
+    let inits: Vec<(DType, Opnd)> = vec![
+        (DType::I32, Opnd::Val(c0)),
+        (DType::I32, Opnd::Val(neg_big_i)),
+        (DType::I32, Opnd::Val(zero_i)),
+        (DType::I32, Opnd::Val(zero_i)),
+        (DType::I32, Opnd::Val(zero_i)),
+        (DType::I32, Opnd::Val(zero_i)),
+        (DType::I32, Opnd::Val(zero_i)),
+    ];
+    let vars = b.begin_loop(&inits);
+    let rs = b.mul_i32(vars[0], rows);
+    let lrow = b.add_i32(rs, row);
+    let lse_off = b.shl_i32(lrow, c2);
+    let lp = b.ptr_add(lse, lse_off);
+    let l = b.load_f32(lp, 0);
+    let rs32 = b.shl_i32(rs, c5);
+    let oidx = b.add_i32(rs32, t4);
+    let o_off = b.shl_i32(oidx, c3); // 8 bytes per thread (4 fp16)
+    let op = b.ptr_add(ohat, o_off);
+    let x0f = b.load_f32(op, 0);
+    let x1f = b.load_f32(op, 4);
+    let x0 = b.bitcast_i32(x0f);
+    let x1 = b.bitcast_i32(x1f);
+    let x0h = b.let_(Op::LshrI32(Opnd::Val(x0), Opnd::Val(c16)));
+    let x1h = b.let_(Op::LshrI32(Opnd::Val(x1), Opnd::Val(c16)));
+    let ovs = [
+        b.let_(Op::CvtF16ToF32(Opnd::Val(x0))),
+        b.let_(Op::CvtF16ToF32(Opnd::Val(x0h))),
+        b.let_(Op::CvtF16ToF32(Opnd::Val(x1))),
+        b.let_(Op::CvtF16ToF32(Opnd::Val(x1h))),
+    ];
+    let m_old = b.bitcast_f32(vars[1]);
+    let den = b.bitcast_f32(vars[2]);
+    let m_new = b.max_f32(m_old, l);
+    let neg1 = b.c_f32(-1.0);
+    let dm = b.mul_f32(m_new, neg1);
+    let d_old = b.add_f32(m_old, dm);
+    let d_new = b.add_f32(l, dm);
+    let a = b.exp2_f32(d_old);
+    let w = b.exp2_f32(d_new);
+    let den_s = b.mul_f32(den, a);
+    let den_n = b.add_f32(den_s, w);
+    let m_i = b.bitcast_i32(m_new);
+    let den_i = b.bitcast_i32(den_n);
+    b.set_var(vars[1], m_i);
+    b.set_var(vars[2], den_i);
+    for k in 0..4usize {
+        let acc = b.bitcast_f32(vars[3 + k]);
+        let acc_s = b.mul_f32(acc, a);
+        let wv = b.mul_f32(w, ovs[k]);
+        let acc_n = b.add_f32(acc_s, wv);
+        let acc_i = b.bitcast_i32(acc_n);
+        b.set_var(vars[3 + k], acc_i);
+    }
+    sched_end_loop(&mut b, vars[0], splits);
+    let denf = b.bitcast_f32(Opnd::Var(vars[2]));
+    let rd = b.rcp_f32(denf);
+    let mut res: Vec<ValueId> = Vec::with_capacity(4);
+    for k in 0..4usize {
+        let accf = b.bitcast_f32(Opnd::Var(vars[3 + k]));
+        res.push(b.mul_f32(accf, rd));
+    }
+    let w0 = b.cvt_pk_bf16_f32(res[0], res[1]);
+    let w1 = b.cvt_pk_bf16_f32(res[2], res[3]);
+    let o_byte = b.shl_i32(t4, c3);
     let optr = b.ptr_add(out, o_byte);
     let f0 = b.bitcast_f32(w0);
     let f1 = b.bitcast_f32(w1);
