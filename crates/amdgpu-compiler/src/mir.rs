@@ -139,6 +139,7 @@ pub enum MOp {
     GlobalLoadLdsB32,
     GlobalStoreU16,
     GlobalStoreF32,
+    GlobalStoreF32x4,
     // scalar ALU / memory
     SLoadDword,
     SLoadDwordx2,
@@ -345,7 +346,7 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                         errs.push(format!("block {bi} inst {ii}: load needs a base register"));
                     }
                 }
-                MOp::GlobalStoreU16 | MOp::GlobalStoreF32 => {
+                MOp::GlobalStoreU16 | MOp::GlobalStoreF32 | MOp::GlobalStoreF32x4 => {
                     if let Some(Src::Reg(a)) = inst.srcs.first() {
                         if m.vreg_class(*a) != RClass::V2 {
                             errs.push(format!("block {bi} inst {ii}: store base must be V2"));

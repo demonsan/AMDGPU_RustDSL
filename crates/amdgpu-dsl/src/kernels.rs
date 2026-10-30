@@ -10475,14 +10475,17 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.store_f32(l_ptr, 0, lse_v);
         for e in 0..(if ablate.contains("nopartial") { 0usize } else { 4usize }) {
             for q in 0..4usize {
+                let mut wv: Vec<ValueId> = Vec::with_capacity(4);
                 for k in 0..4usize {
                     let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
                     let lanev = b.bitcast_f32(lane);
                     let v = b.mul_f32(lanev, fin);
-                    // dims 32 e + 8 q + 4 half + k  ->  bytes 128 e + 32 q + 16 half + 4 k
-                    let off = (128 * e + 32 * q + 4 * k) as u32;
-                    b.store_f32(o_ptr0, off, v);
+                    wv.push(b.bitcast_i32(v));
                 }
+                // dims 32 e + 8 q + 4 half + 0..3  ->  one 16-byte store at bytes 128 e + 32 q + 16 half
+                let f4 = b.frag4(wv[0], wv[1], wv[2], wv[3]);
+                let off = (128 * e + 32 * q) as u32;
+                b.store_f32x4(o_ptr0, off, f4);
             }
         }
         b.end_if();

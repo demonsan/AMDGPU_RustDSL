@@ -184,7 +184,7 @@ impl Lowerer {
                         count(&o);
                     }
                 }
-                Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } => {
+                Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } => {
                     count(base);
                     count(value);
                 }
@@ -1119,6 +1119,17 @@ impl Lowerer {
                     self.touch(&[Src::Reg(v)]);
                     self.push(
                         MInst::new(MOp::GlobalStoreF32)
+                            .srcreg(b)
+                            .srcreg(v)
+                            .imm(*byte_off as i64),
+                    );
+                }
+                Stmt::StoreF32x4 { base, byte_off, value } => {
+                    let b = self.as_v2(*base)?;
+                    let v = self.as_v4(*value)?;
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(
+                        MInst::new(MOp::GlobalStoreF32x4)
                             .srcreg(b)
                             .srcreg(v)
                             .imm(*byte_off as i64),

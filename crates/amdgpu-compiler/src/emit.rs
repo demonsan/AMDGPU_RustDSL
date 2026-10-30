@@ -534,6 +534,12 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             vr(a, reg_of(&inst.srcs[1])),
             if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
         )],
+        MOp::GlobalStoreF32x4 => vec![format!(
+            "global_store_dwordx4 {}, {}, off{}",
+            pair(a, reg_of(&inst.srcs[0])),
+            tuple(a, reg_of(&inst.srcs[1]), 4),
+            if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
+        )],
         MOp::SLoadDword => vec![format!("s_load_dword {}, s[0:1], {}", d_s(a, inst), inst.imm)],
         MOp::SLoadDwordx2 => {
             vec![format!("s_load_dwordx2 {}, s[0:1], {}", spair(a, inst.dst.unwrap()), inst.imm)]

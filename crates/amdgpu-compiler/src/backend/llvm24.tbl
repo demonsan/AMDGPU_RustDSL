@@ -84,6 +84,7 @@ GlobalLoadB128S | V4 <- S2 V1 | {d} = GLOBAL_LOAD_DWORDX4_SADDR {s0}, {s1}, {imm
 GlobalLoadF32S | V1 <- S2 V1 | {d} = GLOBAL_LOAD_DWORD_SADDR {s0}, {s1}, {imm}, 0, implicit $exec :: (load (s32), addrspace 1)
 GlobalStoreU16 | <- V2 V1 | GLOBAL_STORE_SHORT {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s16), addrspace 1)
 GlobalStoreF32 | <- V2 V1 | GLOBAL_STORE_DWORD {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s32), addrspace 1)
+GlobalStoreF32x4 | <- V2 V4 | GLOBAL_STORE_DWORDX4 {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s128), addrspace 1)
 SLoadDword  | S1 <-    | {d} = S_LOAD_DWORD_IMM $sgpr0_sgpr1, {imm}, 0 :: (dereferenceable invariant load (s32), addrspace 4)
 SLoadDwordx2 | S2 <-   | {d} = S_LOAD_DWORDX2_IMM $sgpr0_sgpr1, {imm}, 0 :: (dereferenceable invariant load (s64), addrspace 4)
 SReadPhys   | S1 <-    | {d} = S_MOV_B32 {ps}
