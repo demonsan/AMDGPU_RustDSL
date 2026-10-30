@@ -116,29 +116,29 @@ impl Seq {
 
     // ---- loads (Pending tokens) -----------------------------------------------------------------------------------------------------
     /// `ds_read_b128 dst, vaddr offset:N`: LDS read (lgkmcnt queue). The destination moves into the token.
-    pub fn ds_read_b128(&mut self, dst: Vgpr<4>, addr: &Vgpr<1>, offset: u16) -> Pending<Vgpr<4>> {
-        self.push(AInst { op: "LdsReadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.id)], imm: offset as i64 });
+    pub fn ds_read_b128(&mut self, dst: Vgpr<4>, addr: &impl Readable<1>, offset: u16) -> Pending<Vgpr<4>> {
+        self.push(AInst { op: "LdsReadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: offset as i64 });
         self.clear_write(dst.id);
         self.issue_load(Queue::Lgkm, dst)
     }
 
     /// `ds_read_b32 dst, vaddr offset:N`.
-    pub fn ds_read_b32(&mut self, dst: Vgpr<1>, addr: &Vgpr<1>, offset: u16) -> Pending<Vgpr<1>> {
-        self.push(AInst { op: "LdsReadB32", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.id)], imm: offset as i64 });
+    pub fn ds_read_b32(&mut self, dst: Vgpr<1>, addr: &impl Readable<1>, offset: u16) -> Pending<Vgpr<1>> {
+        self.push(AInst { op: "LdsReadB32", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: offset as i64 });
         self.clear_write(dst.id);
         self.issue_load(Queue::Lgkm, dst)
     }
 
     /// `global_load_dwordx4 dst, vaddr[2], off offset:N` (vmcnt queue).
-    pub fn global_load_dwordx4(&mut self, dst: Vgpr<4>, addr: &Vgpr<2>, offset: i32) -> Pending<Vgpr<4>> {
-        self.push(AInst { op: "GlobalLoadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.id)], imm: offset as i64 });
+    pub fn global_load_dwordx4(&mut self, dst: Vgpr<4>, addr: &impl Readable<2>, offset: i32) -> Pending<Vgpr<4>> {
+        self.push(AInst { op: "GlobalLoadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: offset as i64 });
         self.clear_write(dst.id);
         self.issue_load(Queue::Vm, dst)
     }
 
     /// `ds_write_b32 vaddr, vdata offset:N`: occupies a lgkmcnt slot (no value comes back).
-    pub fn ds_write_b32(&mut self, addr: &Vgpr<1>, data: &Vgpr<1>, offset: u16) {
-        self.push(AInst { op: "LdsWriteB32", dst: None, srcs: vec![ASrc::Reg(addr.id), ASrc::Reg(data.id)], imm: offset as i64 });
+    pub fn ds_write_b32(&mut self, addr: &impl Readable<1>, data: &impl Readable<1>, offset: u16) {
+        self.push(AInst { op: "LdsWriteB32", dst: None, srcs: vec![ASrc::Reg(addr.reg_id()), ASrc::Reg(data.reg_id())], imm: offset as i64 });
         self.issue_store(Queue::Lgkm);
     }
 }
