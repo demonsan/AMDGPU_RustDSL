@@ -10035,7 +10035,24 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         };
         // biasonce: the bias accumulator (one f16 MFMA) is computed ONCE per tile and used as the C input of the first scaled MFMA of all four S tiles
         // (the vendor issues one bf16 bias MFMA per 128 keys; we issued four)
-        let biasf_once: Option<ValueId> = if fmha_t_opt("biasonce") {
+        let biasf_once: Option<ValueId> = if fmha_t_opt("biasc") {
+            // biasc: build the bias C fragment with VALU (one f32 broadcast into all 16 C lanes) instead of the f16 ones*bias
+            // MFMA; mathematically identical (bias is per-row constant), removes the last bias MFMA entirely.
+            let w_u = b.frag2_lane(Opnd::Val(bias_v), 0);
+            let w_i = b.bitcast_i32(w_u);
+            let hi = b.let_(Op::CvtF16ToF32(Opnd::Val(w_i)));
+            let lo_s = b.lshr_i32(Opnd::Val(w_i), Opnd::Val(c16i));
+            let lo = b.let_(Op::CvtF16ToF32(Opnd::Val(lo_s)));
+            let sum = b.add_f32(hi, lo);
+            let c4fb = b.c_f32(4.0);
+            let b_cur = b.mul_f32(sum, c4fb);
+            let bi = b.bitcast_i32(b_cur);
+            let mut lanes: Vec<ValueId> = Vec::with_capacity(16);
+            for _ in 0..16 {
+                lanes.push(bi);
+            }
+            Some(b.frag16_build(&lanes))
+        } else if fmha_t_opt("biasonce") {
             let zero16 = b.frag_zero(DType::Frag16);
             Some(b.mfma_f16_wide(ones_f16, Opnd::Val(bias_v), zero16))
         } else {
