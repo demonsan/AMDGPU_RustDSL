@@ -169,3 +169,13 @@ tests, 18 compile-fail cases, `pv_phase`).
 * The wait-state constants are only hardware-evidenced for the matrix-result rule (20, confirmed earlier);
   VALU->matrix (2) and vcc->cndmask (2) still rest on the ISA table, not on a regression probe.
 * `Sealed`/`#[forbid(unsafe_code)]` hold: no `unsafe` in the crate and no way to invent operand kinds.
+
+## Round-2 fixes (F8-F12) and what the safe-path guarantee is now
+
+* **F8 (inputs are read-only):** `Seq::input` returns `In<N>`, which has no `Dst` implementation and no writable view; the verifier rejects any instruction that defines an input register and `lower_asm` re-checks the lowered MIR. In/out registers exist only as `Seq::inout` (bound to a loop variable by `Stmt::VarAsm`).
+* **F9:** every output port must be written (or exported in flight). **F10:** `ds_write_b32` takes a scoreboard slot without a token (`wait_lgkm_all` covers it). **F11:** the constant cache in `lower_asm` is only applied if the verifier still accepts the stream with the folded moves removed, otherwise the moves are kept. **F12:** the verifier uses saturating arithmetic and reports malformed immediates as errors; `forge_for_tests` exists only under `cfg(test)` / the `test-support` feature.
+* **Guarantee:** a block that `Seq::finish` returns, and that the compiler lowers through `Op::Asm` / `Stmt::VarAsm`, (1) uses only encodable operand forms, (2) satisfies the 2-wait VALU->matrix, 20-wait matrix-result and DS/VMEM scoreboard rules and has no WAR/WAW against in-flight matrix ops, (3) writes only registers it owns or its declared in/out port, (4) produces only defined outputs. It does not prove value correctness, and `amdgpu-compiler`'s MIR remains an unchecked IR for everything that is not a safe block.
+
+### First real use: the `_vs128` row-sum chain
+
+`FMHA_OPT=<default recipe>,safeasm` routes the four in-place SMFMACs of the per-tile row sum (`smfv`) through `examples::rowsum_var_block()` and `Stmt::VarAsm` (12 statements replace 48 `VarSmfmac`). Result: the emitted assembly is BYTE-IDENTICAL to the DSL path (md5 equal), 15 shapes pass 3 times (REF_OK 15/15; at 64 rows the same 12/3 as the normal path), 358.2 TFLOP/s. Default behaviour is unchanged (the flag is opt-in).
