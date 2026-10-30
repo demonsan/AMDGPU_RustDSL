@@ -648,6 +648,25 @@ tiling-dependent ABI fields per kernel (output pointer, Q tile stride), launches
 the `timing vendor/ours` lines now carry `rows/block` and `blocks`. The 15-shape and determinism scripts
 inherit the environment variable. The two t128 result lines are filled in here once the kernel lands.
 
+**Harness validated (2026-10-30, commit `e8be2ba`)** with `REF_GRID_ONLY=1` and the real kernels, without
+touching any default behaviour:
+* B1H8S2048 default: `[grid] vendor 256 rows/blk grid=(8,8,1)=64 blocks (25.0% of 256 CUs); ours 256
+  rows/blk grid=(8,8,1)=64 blocks (25.0%)` - exactly the historical launch.
+* B1H8S2048 `REF_ROWS_PER_BLOCK=128 REF_OURS_BLOCK_THREADS=256`: ours `(16,8,1)=128 blocks (50.0%)`,
+  vendor still `(8,8,1)=64 blocks (25.0%)`.
+* Filling shape B4H8S2048: default both `(8,8,4)=256 blocks (100%)`; ours at 128 rows
+  `(16,8,4)=512 blocks (two sequential block waves, all 256 CUs busy = 200% block-slots)`.
+* Odd S (B1 H3 S=300): vendor `(2,3,1)`, ours-128 `(3,3,1)` - grid rounding correct.
+* Default path regression with the modified host: 16-row gate **15/15 OK, parity 15/15**, ours `bad=0`,
+  determinism **5/5**, and the best-case same-run timing reproduces §7.9 exactly:
+  vendor 0.0333 ms / **515.8 TFLOP/s**, ours 0.0470 ms / **365.6 TFLOP/s** = **1.411x**.
+  (Single samples on GPU 5 are only trustworthy at the top clock state: the same kernel ranges
+  0.033-0.085 ms depending on the shared node's clock/contention; use a long warm-up and best-of-N,
+  as in §7.9. This is why the numbers are quoted as best-case + median, never as a single sample.)
+* For the t128 run the invocation is `REF_ROWS_PER_BLOCK=128 REF_OURS_BLOCK_THREADS=256
+  OUR_KERNEL=fmha_fwd_hd128_mxfp8_t128 REF_CO2=build/<t128>.co REF_KNAME2=fmha_fwd_hd128_mxfp8_t128`;
+  the 15-shape and determinism scripts inherit the environment variables unchanged.
+
 ### 1) Same-run wall vs vendor (final)
 
 | | vendor | `_vs128` final @f4cccb6 | previous `_vs128` @3cc73c0 (§7.7) |
