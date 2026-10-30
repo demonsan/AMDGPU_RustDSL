@@ -15658,6 +15658,14 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4h() -> Function {
     b.store_f32(optr, 4, f1);
     b.finish()
 }
+/// `_vs5` (gen5 scaffolding, docs/gen5-window-spec.md): identical to `_vs128` in everything except that its inner tile window is meant to be replaced by a
+/// hand-authored safe-asm window (`Op::Asm`). While the window is still the DSL one it must be bit-identical to `_vs128` (control point).
+pub fn fmha_fwd_hd128_mxfp8_vs5() -> Function {
+    VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let f = fmha_t_build("fmha_fwd_hd128_mxfp8_vs5", false, true);
+    VS_MODE.store(false, std::sync::atomic::Ordering::SeqCst);
+    f
+}
 pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     let f = fmha_t_build("fmha_fwd_hd128_mxfp8_vs128", false, true);
@@ -15687,7 +15695,7 @@ pub fn fmha_fwd_hd128_mxfp8_sv() -> Function {
 
 fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let mut b = FnBuilder::new(name, if name.ends_with("_t128") { 256 } else { 512 });
-    let nbuf = if VS_MODE.load(std::sync::atomic::Ordering::SeqCst) { if name.ends_with("_vs128") || name.ends_with("_kvsplit") { 2 } else { 3 } } else if fmha_t_opt("dbuf") { 2 } else { 1 };
+    let nbuf = if VS_MODE.load(std::sync::atomic::Ordering::SeqCst) { if (name.ends_with("_vs128") || name.ends_with("_vs5")) || name.ends_with("_kvsplit") { 2 } else { 3 } } else if fmha_t_opt("dbuf") { 2 } else { 1 };
     if pp {
         b.lds((512 * fmha_t_pitch() + 2048) as u32);
     } else {
@@ -15695,7 +15703,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         let cb = if fmha_t_opt("dma") && !vs_active() { 33280 } else { 256 * fmha_t_pitch() };
         // vendor-structure kernels: + a 2 KB block of E4M3 ones and 16 KB for the per-wave second Q fragment (vs128)
         if vs_active() {
-            b.lds(if name.ends_with("_vs128") || name.ends_with("_kvsplit") { VS128_LDS_BYTES } else if name.ends_with("_g3o") { 4 * 32768 + 2048 } else if name.ends_with("_vsm") || name.ends_with("_g2") || name.ends_with("_g3") || name.ends_with("_t128") { 3 * 32768 + 2048 + 2048 + 16384 + 16384 } else { VS_LDS_BYTES } + pad as u32);
+            b.lds(if (name.ends_with("_vs128") || name.ends_with("_vs5")) || name.ends_with("_kvsplit") { VS128_LDS_BYTES } else if name.ends_with("_g3o") { 4 * 32768 + 2048 } else if name.ends_with("_vsm") || name.ends_with("_g2") || name.ends_with("_g3") || name.ends_with("_t128") { 3 * 32768 + 2048 + 2048 + 16384 + 16384 } else { VS_LDS_BYTES } + pad as u32);
         } else {
             b.lds((nbuf * cb + 2048 + 1024 + 1024 + pad) as u32);
         }
@@ -16190,7 +16198,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     if std::env::var("FMHA_ABLATE").unwrap_or_default().split(|c| c == ',').any(|x| x == "quit") {
         return b.finish(); // diagnostic: the kernel exits immediately (launch + dispatch cost only)
     }
-    let vsx_split = sv && (name.ends_with("_vs128") || is_kvs) && (vs128_vsx() || fmha_t_opt("corrshort"));
+    let vsx_split = sv && ((name.ends_with("_vs128") || name.ends_with("_vs5")) || is_kvs) && (vs128_vsx() || fmha_t_opt("corrshort"));
     if sv && name.ends_with("_t128") {
         if vs128_vsx() || fmha_t_opt("corrshort") {
             // same two code copies as `_vs128`: sequences with fewer than `cs` (9) tiles of 128 keys keep the LUT correction
@@ -16256,7 +16264,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         emit_fmha_g2_role(&mut b, &cx, true);
     } else if sv && name.ends_with("_vsm") {
         emit_fmha_vsm_role(&mut b, &cx, true);
-    } else if sv && name.ends_with("_vs128") {
+    } else if sv && (name.ends_with("_vs128") || name.ends_with("_vs5")) {
         emit_fmha_vs128_role(&mut b, &cx, true);
     } else if sv && name.ends_with("_vs") {
         emit_fmha_vs_role(&mut b, &cx, true);
@@ -16276,7 +16284,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         emit_fmha_g2_role(&mut b, &cx, false);
     } else if sv && name.ends_with("_vsm") {
         emit_fmha_vsm_role(&mut b, &cx, false);
-    } else if sv && name.ends_with("_vs128") {
+    } else if sv && (name.ends_with("_vs128") || name.ends_with("_vs5")) {
         emit_fmha_vs128_role(&mut b, &cx, false);
     } else if sv && name.ends_with("_vs") {
         emit_fmha_vs_role(&mut b, &cx, false);

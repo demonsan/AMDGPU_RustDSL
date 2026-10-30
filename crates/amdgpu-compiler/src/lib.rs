@@ -101,7 +101,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 o.max_vgprs = 248;
             }
             // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/status.md round 49)
-            if !f.name.ends_with("_vs128") && !f.name.ends_with("_kvsplit") && !f.name.ends_with("_vsm") && !f.name.ends_with("_t128") && !(f.name.ends_with("_g2") || f.name.ends_with("_g3") || f.name.ends_with("_g3o")) {
+            if !f.name.ends_with("_vs128") && !f.name.ends_with("_vs5") && !f.name.ends_with("_kvsplit") && !f.name.ends_with("_vsm") && !f.name.ends_with("_t128") && !(f.name.ends_with("_g2") || f.name.ends_with("_g3") || f.name.ends_with("_g3o")) {
                 o.reorder = false;
                 o.alu_across_barrier = true;
                 o.ldshoist = true; // hoist ds_read above independent work (docs/scheduling.md); AMDC_SCHED=0 / 1 / auto / OPTS override
@@ -246,6 +246,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_kvsplit_combine4h" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine4h()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine4" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine4()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine()),
+        "fmha_fwd_hd128_mxfp8_vs5" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vs5()),
         "fmha_fwd_hd128_mxfp8_vs128" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vs128()),
         "fmha_fwd_hd128_mxfp8_vsm" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vsm()),
         "probe_dma" => Some(amdgpu_dsl::kernels::probe_dma()),
