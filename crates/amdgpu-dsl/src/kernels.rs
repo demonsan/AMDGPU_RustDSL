@@ -7399,10 +7399,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     if dma {
         dma_issue(b, key_next, buf_nxt);
     }
-    let compute = |b: &mut FnBuilder, masked: bool, m_in: ValueId| {        // the running max is threaded through the two 64-key halves as an SSA value (the second half must see the first half's update; the loop
-        // variable is read once, at the start of the iteration, and only written afterwards)
-        let mut m_carry: Option<ValueId> = None;
-        for hh in 0..2usize {
+    let compute = |b: &mut FnBuilder, masked: bool| {        for hh in 0..2usize {
             // ---- two 32-key score tiles (S^T = K Q^T) of this 64-key substep ----
             let mut sv: Vec<Vec<ValueId>> = Vec::with_capacity(2);
             let mut sfr: Vec<ValueId> = Vec::with_capacity(2);
@@ -7507,10 +7504,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let mpart = b.bitcast_f32(mp_raw);
                 b.max_f32(mloc, mpart)
             };
-            let m_old = match m_carry {
-                Some(v) => v,
-                None => m_in,
-            };
+            let m_old = b.bitcast_f32(m_var);
             let corr_eager: Option<ValueId>;
             let m_use: ValueId;
             if lazy {
@@ -7519,6 +7513,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let tau = if fmha_t_opt("lazyinf") { b.c_f32(1.0e9) } else { b.c_f32((8 - psh) as f32) };
                 let thr = b.add_f32(m_old, tau);
                 let grow = b.cmp_lt_f32(thr, mt);
+                b.begin_if(Opnd::Val(grow));
                 // overshoot: move the running max "over" above the tile max so the next triggers are rarer
                 let over = [("over8", 8.0f32), ("over6", 6.0), ("over4", 4.0), ("over3", 3.0), ("over2", 2.0)].iter().find(|(n, _)| fmha_t_opt(n)).map(|x| x.1).unwrap_or(0.0);
                 let mt_o = if over > 0.0 {
@@ -7527,10 +7522,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 } else {
                     mt
                 };
-                // the candidate new max is an SSA value computed outside the branch; the value used afterwards is a per-lane select of it
-                // (never a read of the loop variable after its set_var in the same iteration)
                 let m_new = b.max_f32(m_old, mt_o);
-                b.begin_if(Opnd::Val(grow));
                 let dm = b.sub_f32(m_old, m_new);
                 let corr = b.exp2_f32(dm);
                 let m_bits = b.bitcast_i32(m_new);
@@ -7559,7 +7551,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
                 b.end_if();
                 corr_eager = None;
-                m_use = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(m_new), b: Opnd::Val(m_old) });
+                m_use = b.bitcast_f32(m_var);
             } else {
                 let m_new = b.max_f32(m_old, mt);
                 let dm = b.sub_f32(m_old, m_new);
@@ -7570,7 +7562,6 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 m_use = m_new;
             }
 
-            m_carry = Some(m_use);
             // exp2(s - (m - 4)) = 16 exp2(s - m): the P x 16 quantisation scale comes for free
             let m4 = b.sub_f32(m_use, c4f);
             let pk_sub = !masked && fmha_t_opt("pksub");
@@ -7671,18 +7662,16 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             }
         }
     };
-    // the running max (loop variable) is read ONCE per iteration, before any branch / set_var of the iteration
-    let m_in = b.bitcast_f32(m_var);
     // the last iteration may hold fewer than 128 keys: only that one pays for the key mask
     if peel {
-        compute(b, masked_iter, m_in);
+        compute(b, masked_iter);
     } else {
         let key_end = b.add_i32(key0, c128v);
         let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
         b.begin_if(Opnd::Val(is_tail));
-        compute(b, true, m_in);
+        compute(b, true);
         b.else_();
-        compute(b, false, m_in);
+        compute(b, false);
         b.end_if();
     }
     // all waves are done with this iteration's K/V; then publish the prefetched tile
