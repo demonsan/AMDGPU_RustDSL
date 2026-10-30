@@ -10678,9 +10678,20 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let tile0 = b.mul_i32(hq2, s32);
                 let rt = b.let_(Op::LshrI32(Opnd::Val(cx.row0), Opnd::Val(c5f)));
                 let tile = b.add_i32(tile0, rt);
-                let tile4 = b.shl_i32(tile, c2);
-                let cptr = b.ptr_add(counters, tile4);
-                let old = b.atomic_add_u32(cptr, 0, Opnd::Val(one_v));
+                // 128-byte-padded ticket per 32-row tile; the other 63 lanes of the wave add 0 to PRIVATE dummy lines (the atomic is per lane and begin_if has no exec
+                // mask: 64 lane atomics on one line would serialise at the memory side)
+                let c7f = b.c_i32(7);
+                let c6f = b.c_i32(6);
+                let tile_b = b.shl_i32(tile, c7f);
+                let cptr = b.ptr_add(counters, tile_b);
+                let dummy_off = b.let_(Op::KernargI32 { offset: 0x290 });
+                let t64 = b.shl_i32(tile, c6f);
+                let tl = b.add_i32(t64, lane_q);
+                let tl128 = b.shl_i32(tl, c7f);
+                let dof = b.add_i32(dummy_off, tl128);
+                let aoff = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lane0), a: Opnd::Val(tile_b), b: Opnd::Val(dof) });
+                let aptr = b.ptr_add(counters, aoff);
+                let old = b.atomic_add_u32(aptr, 0, Opnd::Val(one_v));
                 let old0 = b.read_first_lane(Opnd::Val(old));
                 let c_last = b.c_i32(nsp as i32 - 1);
                 let is_last = b.let_(Op::CmpGeI32(Opnd::Val(old0), Opnd::Val(c_last)));
@@ -15719,6 +15730,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         b.arg("kvs_rows_total", DType::I32, 0x284, 4);
         if fmha_t_opt("fused") {
             b.arg("kvs_counters", DType::Ptr, 0x288, 8);
+            b.arg("kvs_dummy_off", DType::I32, 0x290, 4);
         }
     } else {
         b.arg("abi_tail", DType::I32, 0x280, 16);

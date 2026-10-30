@@ -251,9 +251,10 @@ int main(int argc, char** argv) {
     };
     // KV-split kernarg extension (docs/kvsplit-design.md section 3, agreed with kernel-opt): 0x270 ptr Ohat,
     // 0x278 ptr lse, 0x280 u32 splits, 0x284 u32 rows_total (= B*S*H, the per-split stride); segment 720 bytes.
+    size_t fused_dummy_off = 0;
     void* fused_counters = nullptr;   // REF_FUSED=1: per-32-row-tile ticket counters at 0x288 (zeroed once, reset by the last arriver)
     auto set_split_args = [&](void* ohat, void* lse) {
-        if (fused_counters) put64(args, 0x288, fused_counters);
+        if (fused_counters) { put64(args, 0x288, fused_counters); put32(args, 0x290, (uint32_t)fused_dummy_off); }
         put64(args, 0x270, ohat);
         put64(args, 0x278, lse);
         put32(args, 0x280, (uint32_t)splits);
@@ -345,10 +346,12 @@ int main(int argc, char** argv) {
             CK(hipMemset(lse, 0, (size_t)lse_bytes));
             const bool fused = envi("REF_FUSED", 0) != 0 && std::getenv("REF_CO2_FUSED") && splits == 4;
             if (fused) {
-                const size_t nctr = (size_t)B * H * ((S + 31) / 32) + 64;
-                CK(hipMalloc(&fused_counters, nctr * 4));
-                CK(hipMemset(fused_counters, 0, nctr * 4));
-                std::printf("[split] FUSED combine (last arriver): counters=%zu\n", nctr);
+                const size_t ntl = (size_t)B * H * ((S + 31) / 32);
+                fused_dummy_off = ntl * 128;                              // 128-byte padded tickets, then 64 private dummy lines per tile
+                const size_t nbytes = ntl * 128 + ntl * 64 * 128 + 4096;
+                CK(hipMalloc(&fused_counters, nbytes));
+                CK(hipMemset(fused_counters, 0, nbytes));
+                std::printf("[split] FUSED combine (last arriver): %zu tiles, counter buffer %.1f MB\n", ntl, nbytes / 1e6);
             }
             hipModule_t mod2; hipFunction_t fn2;
             CK(hipModuleLoad(&mod2, fused ? std::getenv("REF_CO2_FUSED") : use_co));
