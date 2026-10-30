@@ -66,6 +66,10 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         // lanes), imm and sgpr cut ~230 copies/VALU and free 12 VGPRs; addrfold and shl are slower and stay off. `imm` also gives
         // the vs128/vsm builds the register slack they need (docs/status.md rounds 49-50).
         let mut v: Vec<&str> = vec!["dce", "cmpfold", "scalarize", "retarget2", "imm", "sgpr", "zeroinit"];
+        // `_t128` (4-wave blocks, one wave per SIMD): addrfold frees the DMA address temporaries so the full scheduler fits (416 -> 494 TFLOP/s)
+        if f.name.ends_with("_t128") {
+            v.push("addrfold");
+        }
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
     } else if f.name.starts_with("fmha_fwd_hd128_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
@@ -90,7 +94,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
             // merged tree (docs/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
             let mut o = sched::Options::default();
             // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/status.md round 49)
-            if !f.name.ends_with("_vs128") && !f.name.ends_with("_vsm") && !(f.name.ends_with("_g2") || f.name.ends_with("_g3") || f.name.ends_with("_g3o")) {
+            if !f.name.ends_with("_vs128") && !f.name.ends_with("_vsm") && !f.name.ends_with("_t128") && !(f.name.ends_with("_g2") || f.name.ends_with("_g3") || f.name.ends_with("_g3o")) {
                 o.reorder = false;
                 o.alu_across_barrier = true;
                 o.ldshoist = true; // hoist ds_read above independent work (docs/scheduling.md); AMDC_SCHED=0 / 1 / auto / OPTS override
