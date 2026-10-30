@@ -397,24 +397,27 @@ int main(int argc, char** argv) {
                     CK(hipDeviceSynchronize());
                     std::vector<uint16_t> ref(no, 0);
                     CK(hipMemcpy(ref.data(), dout_ref, no * 2, hipMemcpyDeviceToHost));
-                    double mean_abs = 0.0, max_abs = 0.0;
-                    int max_ulp = 0; long gt1 = 0, nz = 0;
-                    std::vector<int> all_ulps; all_ulps.reserve((size_t)no);
+                    // Gate in kernel-opt's suggested form: max_abs <= 1 bf16 ULP of max|reference| plus
+                    // mean_abs <= 1e-4. Word-ULP counts are informational only (near-zero outputs explode them).
+                    double mean_abs = 0.0, max_abs = 0.0, max_ref = 0.0;
+                    long gt1 = 0, nz = 0;
                     for (size_t i = 0; i < no; ++i) {
+                        const double rr = std::fabs((double)bf2f(ref[i]));
+                        max_ref = std::max(max_ref, rr);
                         const double dd = std::fabs((double)bf2f(out2[i]) - (double)bf2f(ref[i]));
                         mean_abs += dd; max_abs = std::max(max_abs, dd);
                         const int u = std::abs((int)out2[i] - (int)ref[i]);
-                        all_ulps.push_back(u); max_ulp = std::max(max_ulp, u);
                         if (u > 1) ++gt1; if (u) ++nz;
                     }
                     mean_abs /= (double)no;
-                    std::sort(all_ulps.begin(), all_ulps.end());
-                    const long p99 = all_ulps.empty() ? 0 : (long)all_ulps[(size_t)(0.99 * (double)(all_ulps.size() - 1))];
-                    const int ulp_max = envi("SPLIT_ULP_MAX", 2);
+                    int rexp = 0; std::frexp(max_ref, &rexp);
+                    const double ulp_ref = std::ldexp(1.0, rexp - 8);   // bf16: 7-bit mantissa
                     const double mean_max = std::getenv("SPLIT_MEAN_ABS_MAX") ? std::atof(std::getenv("SPLIT_MEAN_ABS_MAX")) : 1e-4;
-                    std::printf("SPLIT_ULP split=%d: max_ulp=%d p99_ulp=%ld mean_abs=%.3e max_abs=%.3e frac_gt1ulp=%.5f frac_nonzero=%.5f\n",
-                                splits, max_ulp, p99, mean_abs, max_abs, (double)gt1 / (double)no, (double)nz / (double)no);
-                    std::printf("%s\n", (max_ulp <= ulp_max && mean_abs <= mean_max) ? "SPLIT_ULP_OK" : "SPLIT_ULP_FAIL");
+                    const double abs_tol = (std::getenv("SPLIT_ABS_TOL") ? std::atof(std::getenv("SPLIT_ABS_TOL")) : 1.0) * ulp_ref;
+                    std::printf("SPLIT_ULP split=%d: max_abs=%.3e ulp_ref=%.3e (%.2f ULP) mean_abs=%.3e frac_diff_words=%.5f frac_gt1_word_ulp=%.5f max|ref|=%.3f\n",
+                                splits, max_abs, ulp_ref, max_abs / ulp_ref, mean_abs, (double)nz / (double)no,
+                                (double)gt1 / (double)no, max_ref);
+                    std::printf("%s\n", (max_abs <= abs_tol && mean_abs <= mean_max) ? "SPLIT_ULP_OK" : "SPLIT_ULP_FAIL");
                     CK(hipFree(dout_ref));
                 }
             }
