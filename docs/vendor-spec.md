@@ -1534,6 +1534,43 @@ the table above (7 gate splits incl B1H16S256; fills unchanged). The change is h
 (`tests/gpu/ref_host.cpp` eval_split constants/threshold) - **zero kernel risk**, one shipped-path win of
 +13-15% on B1H16S256, neutral on two N=32 shapes.
 
+### Final control on Main `c812e9e` (round close, GPU 5, own backend, vendor same-run)
+
+Main `c812e9e` = the track1 control (Q `load_b128` + 8-byte epilogue + combine8h) + backend x2 typed
+stores + kernel-opt `2da9f6b` (Q `load_b128` inheritance for `_t`/`_t128`: `_t` 296.8 -> 311.5 +4.9%,
+`_t128` 537.7 -> 566.8 +5.4%, bit-identical; no prologue follow-up) + the guard refit above. Verified on
+the shipped auto path:
+
+| metric | final control |
+|---|---|
+| `_vs128` B1H8S2048 64-block (6 interleaved rounds) | **best 453.5 / median 452.7 TFLOP/s** (0.0379-0.0380 ms) -> **7.09 / 7.07 TF/CU** |
+| vendor same run | 537.5-538.8 TFLOP/s = 8.40-8.42 TF/CU -> **gap 1.19x** |
+| filled B4H8S2048 | **1427.9 / 1416.1** (vendor ~1648-1661 = 0.85-0.86x) |
+| filled B1H8S8192 | **1975.7 / 1963.9** (vendor ~2360 = 0.83-0.84x) |
+| shipped auto B1H8S2048 (split s=4, combine8h) | **best 705.3 / median 700.3 TFLOP/s** (main 19.7-20.6 us, combine 4.1-4.2 us; vendor 537.4-538.9 -> **1.30-1.31x**) |
+| mid `B2H8S2048` t128 | **1057.5 / ~1043.5** (vendor 1039-1058 = 1.00-1.01x) |
+| mid `B1H8S4096` t128 | **1300.6 / ~1286.6** (vendor 1201-1205 = 1.07-1.08x) |
+| mid `B1H8S1024` split | **227.2 / 226.5** (vendor 223.8 = 1.01x) |
+| mid `B2H4S1024` split | **228.6 / 227.4** (vendor 225.0-225.5 = 1.01x) |
+| mid `B3H3S768` split | **234.6 / 232.3** (vendor 207.4-207.7 = 1.11-1.13x) |
+| mid `B1H16S256` split | **131.3 / 130.8** (vendor 112.4-112.7 = 1.16x) |
+| output md5 | **faadf00c95f4eaffff94ece7d1429b3d**, bad=0; vs128 `.s` `00d34086...` (0 scalar / 64 x2 stores) |
+| auto gate @16 rows | **15/15 OK, parity 15/15, ours bad=0** |
+| auto gate @64 rows | **12/15 OK / 3 vendor-fail, ours bad=0, parity 15/15** |
+| determinism | **14 runs x 5 shapes x 3 = all 5/5 DET_OK, zero DET_FAIL** (see flake verdict below) |
+| counters (per wave-iter) | level **66.3**, VMEM inst **5.9**, wave cycles **1349.2**, ACTIVE_VALU 403.1, XDL 1216, WAIT_ANY 485.6, WAIT_INST_ANY 368.6 (baseline 121.6 / 7.62 / 1538.4 / 403.1 / 1216 / 516.8 / 523.8) |
+| 20-shape GRID_ONLY decisions | exactly the 7-split refit table above (incl B1H16S256, B2H4S1024, B1H8S1024); fills unchanged |
+
+**Determinism flake verdict (certification):** kernel-opt saw one 4/5 run that it could not reproduce. On
+Main `c812e9e` we ran the determinism gate **14 independent times** (5 shapes x 3 runs each, harness
+`tests/gpu/determinism.sh`): **14/14 runs returned 5/5 `DET_OK`, zero `DET_FAIL`, zero non-zero exits**.
+No shape, timeout, or abort failure was observed; the pass criterion recorded is **output md5 identical
+across the 3 runs per shape** (the harness compares `REF_DUMP2` md5s; it does not use the process exit
+code as the criterion). The single 4/5 sighting is therefore classified as a harness/node transient, not
+a kernel determinism defect; the shipped path is deterministic by construction (no atomics, fused off)
+and the flake did not reproduce in 14 x 15 shape-runs (210 dumps). If it ever recurs, capture the failing
+shape's three `REF_DUMP2` md5s and compare against `faadf00c...` before treating it as a kernel issue.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as
