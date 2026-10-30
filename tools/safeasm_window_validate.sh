@@ -49,13 +49,13 @@ for i in 1 2 3 4 5; do run_one build/vs_base.co fmha_fwd_hd128_mxfp8_vs128 "$B64
 for i in 1 2 3 4 5; do run_one build/vs_$TAG.co fmha_fwd_hd128_mxfp8_vs128 "$B64" 'timing (vendor|ours)'; echo ---; done > out/wv/win64.log 2>&1
 for i in 1 2 3; do run_one build/vs_base.co fmha_fwd_hd128_mxfp8_vs128 "$FILL" 'timing (vendor|ours)'; echo ---; done > out/wv/basefill.log 2>&1
 for i in 1 2 3; do run_one build/vs_$TAG.co fmha_fwd_hd128_mxfp8_vs128 "$FILL" 'timing (vendor|ours)'; echo ---; done > out/wv/winfill.log 2>&1
-echo "== md5 (B1H8S2048, bf16 dump) =="
-env REF_B=1 REF_H=8 REF_S=2048 REF_SK=2048 REF_HK=8 REF_ROWS=2 REF_ITERS=1 REF_CO2=build/vs_base.co REF_KNAME2=fmha_fwd_hd128_mxfp8_vs128 REF_DUMP=/tmp/wv_base.bin HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" ./build/ref_host "$REF" > out/wv/md5_base.log 2>&1
-env REF_B=1 REF_H=8 REF_S=2048 REF_SK=2048 REF_HK=8 REF_ROWS=2 REF_ITERS=1 REF_CO2=build/vs_$TAG.co REF_KNAME2=fmha_fwd_hd128_mxfp8_vs128 REF_DUMP=/tmp/wv_win.bin HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" ./build/ref_host "$REF" > out/wv/md5_win.log 2>&1
-echo "base_md5=$(md5sum /tmp/wv_base.bin | cut -c1-32) win_md5=$(md5sum /tmp/wv_win.bin | cut -c1-32)"
+echo "== md5 (B1H8S2048, bf16 REF_DUMP2 = _vs128 output; authoritative baseline faadf00c95f4eaffff94ece7d1429b3d) =="
+env REF_B=1 REF_H=8 REF_S=2048 REF_SK=2048 REF_HK=8 REF_ROWS=4 REF_ITERS=1 REF_CO2=build/vs_base.co REF_KNAME2=fmha_fwd_hd128_mxfp8_vs128 REF_DUMP2=/tmp/wv_base.bin HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" ./build/ref_host "$REF" > out/wv/md5_base.log 2>&1
+env REF_B=1 REF_H=8 REF_S=2048 REF_SK=2048 REF_HK=8 REF_ROWS=4 REF_ITERS=1 REF_CO2=build/vs_$TAG.co REF_KNAME2=fmha_fwd_hd128_mxfp8_vs128 REF_DUMP2=/tmp/wv_win.bin HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" ./build/ref_host "$REF" > out/wv/md5_win.log 2>&1
+echo "base_md5=$(md5sum /tmp/wv_base.bin | cut -c1-32) win_md5=$(md5sum /tmp/wv_win.bin | cut -c1-32) (target faadf00c95f4eaffff94ece7d1429b3d)"
 grep -E 'our kernel.*vs CPU' out/wv/md5_win.log | head -1
 echo "== counters (window; compare with frozen §7.10.2 baseline) =="
-VC="REF_B=1 REF_H=8 REF_S=2048 REF_SK=2048 REF_HK=8 REF_ROWS=2 REF_ITERS=10 REF_CO2=build/vs_$TAG.co REF_KNAME2=fmha_fwd_hd128_mxfp8_vs128 HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES"
+VC="REF_B=1 REF_H=8 REF_S=2048 REF_SK=2048 REF_HK=8 REF_ROWS=4 REF_ITERS=10 REF_CO2=build/vs_$TAG.co REF_KNAME2=fmha_fwd_hd128_mxfp8_vs128 HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES"
 wcp() { P=$1; shift; rm -rf out/wv/c_$P; mkdir -p out/wv/c_$P; env $VC timeout 150 "$RP" --pmc "$@" --output-format csv -d out/wv/c_$P -o r -- ./build/ref_host "$REF" > out/wv/c_$P.log 2>&1; echo "pass $P rc=$?"; }
 wcp X1 SQ_WAVE_CYCLES
 wcp X2 SQ_VALU_MFMA_BUSY_CYCLES
