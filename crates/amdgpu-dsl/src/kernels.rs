@@ -11903,12 +11903,12 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.var_smfmac_fp8(la, a_rs, pa, idx23);
             b.var_smfmac_fp8(la, a_rs, pb, idx23);
             if stage {
-                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now, 0, 4);
             }
         } else if fmha_t_opt("qkfirst") {
             // QK(i+1) first: S(i) was consumed by the V phase; the PV tr reads then queue behind the QK fragment reads
             if stage {
-                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now, 0, 4);
             }
             pv_w(b, slot_cur, &w);
         } else if win_m && stage && smfrs && smfv && q0_reg && !fmha_t_opt("qonce") && !fmha_t_opt("biasonce") && !fmha_t_opt("biasv") {
