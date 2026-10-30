@@ -78,23 +78,23 @@ int main(int argc, char** argv) {
     // Dispatch guard for the KV-split candidate (docs/kvsplit-results.md, docs/gen4-tiling-design.md section 11): use it only when
     // N256 <= 128 and N256*s <= 256 (one full block wave), every split owns a tile, and the modelled T_kvsplit(s) < 0.95 * T_current;
     // otherwise fall back to the certified _t128/_vs128 rule. The model is the one fitted to the measurements (kernel-opt, B1H8S2048 and 1 8 1024):
-    //   T_t128    = F / (5.9e12 * min(256, 2 N256)) + 10.9 us            (4-wave blocks: 5.9 TFLOP/s per CU-pair + the fixed per-launch cost)
+    //   T_t128    = F / (5.9e12 * min(256, 2 N256)) + 9.4 us             (4-wave blocks: compute + the fixed per-launch cost; 9.4 us is the floor measured at SK = 1)
     //   T_vs128   = F / (5.9e12 * min(256, N256))                        (filling grids)
     //   T_kvsplit = F / (5.9e12 * min(256, N256 s)) + 7 us               (phase 1: compute + fixed prologue/epilogue)
     //             + partial bytes / 4.0 TB/s                              (epilogue write, not hidden: the normalised partial exists only after
     //                                                                     the last tile and all blocks finish together)
-    //             + (partial + out bytes) / 4.2 TB/s + 1.5 us             (combine + launch gap)
+    //             + max(3 us, (partial + out bytes) / 4.2 TB/s) + 1.5 us  (combine (kernel floor 3 us) + launch gap)
     // The split launch counts BOTH kernels in the timing window.
     struct SplitEval { bool guard; double t_cur; double t_kv; int tps; bool tiles_ok; };
     auto eval_split = [&](int s) {
         SplitEval r{};
         const double F = 4.0 * B * H * (double)S * SK * D;
         r.t_cur = (blocks256 <= 128)
-            ? F / (5.9e12 * std::min<double>(256.0, 2.0 * (double)blocks256)) + 10.9e-6
+            ? F / (5.9e12 * std::min<double>(256.0, 2.0 * (double)blocks256)) + 9.4e-6
             : F / (5.9e12 * std::min<double>(256.0, (double)blocks256));
         const double part_b = (double)s * rows_total * D * part_elem_bytes + (double)s * rows_total * 4;
         const double comb_b = part_b + (double)rows_total * D * 2;
-        r.t_kv = F / (5.9e12 * std::min<double>(256.0, (double)blocks256 * s)) + 7.0e-6 + part_b / 4.0e12 + comb_b / 4.2e12 + 1.5e-6;
+        r.t_kv = F / (5.9e12 * std::min<double>(256.0, (double)blocks256 * s)) + 7.0e-6 + part_b / 4.0e12 + std::max(3.0e-6, comb_b / 4.2e12) + 1.5e-6;
         const int ntiles = (SK + 127) / 128;
         r.tps = (ntiles + s - 1) / s;
         r.tiles_ok = (s >= 1) && (r.tps >= 1) && ((s - 1) * r.tps < ntiles);
