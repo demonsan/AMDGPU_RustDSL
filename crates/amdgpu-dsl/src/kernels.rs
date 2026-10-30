@@ -12142,14 +12142,53 @@ fn emit_fmha_g3_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
         let _ = valu(b, masked, true, 0, 0);
         let mut words: Vec<ValueId> = Vec::with_capacity(16);
-        for s in 0..4usize {
-            let ws = valu(b, masked, false, s, s + 1);
-            words.extend(ws);
-            if stage {
-                qk(b, slot_nxt, kds_nxt, None, s, s + 1);
+        if fmha_t_opt("g3pv") {
+            // g3pv: PV half 0 (P of S tiles 0,1) is issued between the conversions of tiles 1 and 2, PV half 1 + the row sums at the end
+            let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot_cur)).collect();
+            let load_v = |b: &mut FnBuilder, hh: usize, e: usize| -> ValueId {
+                let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+                for r in 0..4i32 {
+                    let off = b.c_i32((hh as i32) * 8192 + 2048 * r);
+                    addrs.push(b.add_i32(trb[e], off));
+                }
+                b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3])
+            };
+            let mut pa_opt: Option<ValueId> = None;
+            for s in 0..4usize {
+                let ws = valu(b, masked, false, s, s + 1);
+                words.extend(ws);
+                if stage {
+                    qk(b, slot_nxt, kds_nxt, None, s, s + 1);
+                }
+                if s == 1 {
+                    let pa = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+                    for e in 0..4usize {
+                        let v8 = load_v(b, 0, e);
+                        b.var_mfma_scale(o_vars[e], v8, pa, c127, c123);
+                    }
+                    pa_opt = Some(pa);
+                }
             }
+            let pa = pa_opt.unwrap();
+            let pb = b.frag8(words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
+            for e in 0..4usize {
+                let v8 = load_v(b, 1, e);
+                b.var_mfma_scale(o_vars[e], v8, pb, c127, c123);
+            }
+            b.var_smfmac_fp8(la, a_rs, pa, idx01);
+            b.var_smfmac_fp8(la, a_rs, pb, idx01);
+            b.var_smfmac_fp8(la, a_rs, pa, idx23);
+            b.var_smfmac_fp8(la, a_rs, pb, idx23);
+        } else {
+            for s in 0..4usize {
+                let ws = valu(b, masked, false, s, s + 1);
+                words.extend(ws);
+                if stage {
+                    qk(b, slot_nxt, kds_nxt, None, s, s + 1);
+                }
+            }
+            pv_w(b, slot_cur, &words);
         }
-        pv_w(b, slot_cur, &words);
         if stage {
             stage_end(b, skd, kds_n2);
             b.wait_lds(0);
