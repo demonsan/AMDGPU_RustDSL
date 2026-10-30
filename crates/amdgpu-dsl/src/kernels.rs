@@ -15605,7 +15605,8 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     }
     if vsx_split {
         // short = fewer than `cs` tiles of 128 keys (default 3)
-        let c3k = b.c_i32(fmha_t_num("cs").unwrap_or(9) as i32);
+        // KV-split blocks own few tiles (SK/splits): `cs` defaults to 1 there (no LUT copy: the split-vs-single mean difference is 3e-6 with it, 4e-4 without)
+        let c3k = b.c_i32(fmha_t_num("cs").unwrap_or(if is_kvs { 1 } else { 9 }) as i32);
         let short = b.cmp_lt_i32(cx.nkv, c3k);
         for pass in 0..2u8 {
             if pass == 0 {
