@@ -93,6 +93,12 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
             // "ld" preset: scoreboard (partial) waits + ds_read hoisting, no instruction reordering. Measured best on the
             // merged tree (docs/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
             let mut o = sched::Options::default();
+            // `_t128`: ALU may cross the single barrier per tile and the pressure limit 248 lets the list scheduler take a schedule at vgpr 256
+            // (measured 489 -> 505 TFLOP/s on B1H8S2048; limit 246/248 only, 244/250 give the old schedule: a heuristic knob, re-measure on changes)
+            if f.name.ends_with("_t128") {
+                o.alu_across_barrier = true;
+                o.max_vgprs = 248;
+            }
             // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/status.md round 49)
             if !f.name.ends_with("_vs128") && !f.name.ends_with("_vsm") && !f.name.ends_with("_t128") && !(f.name.ends_with("_g2") || f.name.ends_with("_g3") || f.name.ends_with("_g3o")) {
                 o.reorder = false;
