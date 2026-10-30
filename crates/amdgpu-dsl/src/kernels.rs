@@ -9529,7 +9529,9 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 
 /// 128-key-unit variant of the vendor-structure kernel (mha_fwd_hd128_mxfp8_vs128): one rollback decision and two barriers per 128 keys.
 fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
-    let _winasm = vs5_winasm_requested(); // false unless FMHA_OPT=winasm on _vs5 (then it stops: the asm window is not wired yet)
+    let win_c = vs5_win("winc");
+    let _win_a = vs5_win("wina");
+    let _win_b = vs5_win("winb");
     let ablate = std::env::var("FMHA_ABLATE").unwrap_or_default();
     let no_bar = ablate.contains("nobar");
     let nobar1 = ablate.contains("nobar1"); // drop the V->M barrier only
@@ -10315,6 +10317,14 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let l_new_i = b.bitcast_i32(l_new);
             b.set_var(la, l_new_i);
         };
+        if win_c && smfrs && smfv {
+            // Block C: the whole PV window (16 V-fragment reads, 8 PV MFMAs, 4 row-sum SMFMACs) as one pinned safe-asm block
+            let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            let pb = b.frag8(w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+            let ins = [Opnd::Val(trb[0]), Opnd::Val(trb[1]), Opnd::Val(trb[2]), Opnd::Val(trb[3]), Opnd::Val(pa), Opnd::Val(pb), Opnd::Val(a_rs), Opnd::Val(idx01), Opnd::Val(idx23), Opnd::Val(c127), Opnd::Val(c123)];
+            b.var_asm_n(&[o_vars[0], o_vars[1], o_vars[2], o_vars[3], la], pv_window_block(), &ins);
+            return;
+        }
         if smfrs {
             let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             let pb = b.frag8(w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
@@ -15819,6 +15829,103 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4h() -> Function {
 /// Set while `_vs5` is being built: only then does `FMHA_OPT=winasm` swap the DSL window of `emit_fmha_vs128_role` for the safe-asm window.
 static VS5_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Block C of docs/gen5-window-spec.md (`FMHA_OPT=winc` on `_vs5`): the PV window of one tile (8 scaled MFMAs on the four O accumulators with the V fragments read by
+/// `ds_read_b64_tr_b8` in a one-step software pipeline, plus the four in-place row-sum SMFMACs), authored in safe Rust and PINNED (order preserved verbatim).
+/// Ports: inout o0..o3 (Frag16), inout la (Frag4); in trb0..trb3 (tile slot + e column address), pa, pb (P words), a_rs, idx01, idx23, c127, c123.
+pub fn pv_window_block() -> amdgpu_safeasm::AsmBlock {
+    use amdgpu_safeasm::{In, Pending, Seq, SubMut, Vgpr};
+    fn rd<'a>(s: &mut Seq, v8: &'a mut Vgpr<8>, addr: &In<1>, hh: usize) -> [Pending<SubMut<'a, 2>>; 4] {
+        let [d0, d1, d2, d3] = s.split_pairs_mut(v8);
+        if hh == 0 {
+            [s.ds_read_b64_tr_b8::<0, _>(d0, addr), s.ds_read_b64_tr_b8::<2048, _>(d1, addr), s.ds_read_b64_tr_b8::<4096, _>(d2, addr), s.ds_read_b64_tr_b8::<6144, _>(d3, addr)]
+        } else {
+            [s.ds_read_b64_tr_b8::<8192, _>(d0, addr), s.ds_read_b64_tr_b8::<10240, _>(d1, addr), s.ds_read_b64_tr_b8::<12288, _>(d2, addr), s.ds_read_b64_tr_b8::<14336, _>(d3, addr)]
+        }
+    }
+    let mut s = Seq::new();
+    s.pin();
+    let o0 = s.inout::<16>();
+    let o1 = s.inout::<16>();
+    let o2 = s.inout::<16>();
+    let o3 = s.inout::<16>();
+    let la = s.inout::<4>();
+    let trb0 = s.input::<1>();
+    let trb1 = s.input::<1>();
+    let trb2 = s.input::<1>();
+    let trb3 = s.input::<1>();
+    let pa = s.input::<8>();
+    let pb = s.input::<8>();
+    let a_rs = s.input::<4>();
+    let idx01 = s.input::<1>();
+    let idx23 = s.input::<1>();
+    let c127 = s.input::<1>();
+    let c123 = s.input::<1>();
+    let (rpa, rpb, rra, ri01, ri23, rs127, rs123) = (s.ready(&pa), s.ready(&pb), s.ready(&a_rs), s.ready(&idx01), s.ready(&idx23), s.ready(&c127), s.ready(&c123));
+    let mut v0 = s.vgpr::<8>();
+    let mut v1 = s.vgpr::<8>();
+    let mut v2 = s.vgpr::<8>();
+    let mut v3 = s.vgpr::<8>();
+    let mut v4 = s.vgpr::<8>();
+    let mut v5 = s.vgpr::<8>();
+    let mut v6 = s.vgpr::<8>();
+    let mut v7 = s.vgpr::<8>();
+    let trb = [&trb0, &trb1, &trb2, &trb3];
+    let mut p0 = Some(rd(&mut s, &mut v0, trb[0], 0));
+    let mut p1 = None;
+    let mut p2 = None;
+    let mut p3 = None;
+    let mut p4 = None;
+    let mut p5 = None;
+    let mut p6 = None;
+    let mut p7 = None;
+    p1 = Some(rd(&mut s, &mut v1, trb[1], 0));
+    for pk in p0.take().expect("reads issued") { let _ = pk.wait(&mut s); }
+    let rv0 = s.ready(&v0);
+    let t0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o0, rv0, rpa, rs127, rs123);
+    p2 = Some(rd(&mut s, &mut v2, trb[2], 0));
+    for pk in p1.take().expect("reads issued") { let _ = pk.wait(&mut s); }
+    let rv1 = s.ready(&v1);
+    let t1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o1, rv1, rpa, rs127, rs123);
+    p3 = Some(rd(&mut s, &mut v3, trb[3], 1));
+    for pk in p2.take().expect("reads issued") { let _ = pk.wait(&mut s); }
+    let rv2 = s.ready(&v2);
+    let t2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o2, rv2, rpa, rs127, rs123);
+    let ts = s.v_smfmac_f32_16x16x128_fp8_fp8(la, rra, rpa, ri01);
+    let ts = ts.chain(&mut s, rra, rpb, ri01);
+    p4 = Some(rd(&mut s, &mut v4, trb[0], 1));
+    for pk in p3.take().expect("reads issued") { let _ = pk.wait(&mut s); }
+    let rv3 = s.ready(&v3);
+    let t3 = t3.chain(&mut s, rv3, rpb, rs127, rs123);
+    p5 = Some(rd(&mut s, &mut v5, trb[1], 1));
+    for pk in p4.take().expect("reads issued") { let _ = pk.wait(&mut s); }
+    let rv4 = s.ready(&v4);
+    let t0 = t0.chain(&mut s, rv4, rpb, rs127, rs123);
+    p6 = Some(rd(&mut s, &mut v6, trb[2], 2));
+    for pk in p5.take().expect("reads issued") { let _ = pk.wait(&mut s); }
+    let rv5 = s.ready(&v5);
+    let t1 = t1.chain(&mut s, rv5, rpb, rs127, rs123);
+    let ts = ts.chain(&mut s, rra, rpa, ri23);
+    let ts = ts.chain(&mut s, rra, rpb, ri23);
+    p7 = Some(rd(&mut s, &mut v7, trb[3], 2));
+    for pk in p6.take().expect("reads issued") { let _ = pk.wait(&mut s); }
+    let rv6 = s.ready(&v6);
+    let t2 = t2.chain(&mut s, rv6, rpb, rs127, rs123);
+    for pk in p7.take().expect("reads issued") { let _ = pk.wait(&mut s); }
+    let rv7 = s.ready(&v7);
+    let t3 = t3.chain(&mut s, rv7, rpb, rs127, rs123);
+    let ex0 = t0.exit();
+    s.output_exit(ex0);
+    let ex1 = t1.exit();
+    s.output_exit(ex1);
+    let ex2 = t2.exit();
+    s.output_exit(ex2);
+    let ex3 = t3.exit();
+    s.output_exit(ex3);
+    let exl = ts.exit();
+    s.output_exit(exl);
+    s.finish().expect("pv_window_block is a verified sequence")
+}
+
 pub fn fmha_fwd_hd128_mxfp8_vs5() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     VS5_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -15828,17 +15935,15 @@ pub fn fmha_fwd_hd128_mxfp8_vs5() -> Function {
     f
 }
 
-/// `FMHA_OPT=winasm` on `_vs5`: the hand-authored window (docs/gen5-window-spec.md sections 3-4) is swapped in here, block by block (C = PV + SMFMAC, A = max chain,
-/// B = convert + QK interleave). The DSL window stays the default and the control point until the safe-asm ops (DS reads, conversion chain, drain-closed loop
-/// contract) are available; with the flag set and the ops missing the build stops with a clear message instead of silently emitting the DSL window.
-fn vs5_winasm_requested() -> bool {
-    let want = fmha_t_opt("winasm") && VS5_BUILD.load(std::sync::atomic::Ordering::SeqCst);
-    if want {
-        panic!("FMHA_OPT=winasm: the safe-asm window is not wired yet (waiting for the typed DS / conversion-chain ops and the drain-closed loop contract; see docs/gen5-window-spec.md section 7)");
+/// `_vs5` only: `FMHA_OPT=winc` (Block C: PV + row sums as a pinned safe-asm block), `wina` (Block A), `winb` (Block B, the QK-under-VALU overlap); see docs/gen5-window-spec.md.
+/// Each block is gated separately (md5 + 15 shapes + determinism + timing). `wina` / `winb` are not wired yet and stop the build with a message.
+fn vs5_win(name: &str) -> bool {
+    let want = fmha_t_opt(name) && VS5_BUILD.load(std::sync::atomic::Ordering::SeqCst);
+    if want && name != "winc" {
+        panic!("FMHA_OPT={name}: this safe-asm window block is not wired yet (docs/gen5-window-spec.md section 7)");
     }
     want
-}
-pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
+}pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     let f = fmha_t_build("fmha_fwd_hd128_mxfp8_vs128", false, true);
     VS_MODE.store(false, std::sync::atomic::Ordering::SeqCst);
