@@ -10735,6 +10735,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     let ro2 = b.add_i32(ro, hh128);
                     pptr.push(b.ptr_add(kv.ptr_ohat, ro2));
                 }
+                // all 8 x nsp partial chunks are requested before the first one is used (one memory latency for the whole reduction)
+                let mut all_ld: Vec<Vec<ValueId>> = Vec::new();
+                for c in 0..8usize {
+                    let mut ld: Vec<ValueId> = Vec::new();
+                    for s in 0..nsp { ld.push(b.load_b128_coherent(pptr[s], (16 * c) as u32)); }
+                    all_ld.push(ld);
+                }
                 let mut m = lses[0];
                 for s in 1..nsp { m = b.max_f32(m, lses[s]); }
                 let neg1 = b.c_f32(-1.0);
@@ -10751,13 +10758,6 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let lin128 = b.mul_i32(lin, c256);
                 let ob = b.add_i32(lin128, hh128);
                 let optr = b.ptr_add(cx.ptr_o, ob);
-                // all 8 x nsp partial chunks are requested before the first one is used (one memory latency for the whole reduction)
-                let mut all_ld: Vec<Vec<ValueId>> = Vec::new();
-                for c in 0..8usize {
-                    let mut ld: Vec<ValueId> = Vec::new();
-                    for s in 0..nsp { ld.push(b.load_b128_coherent(pptr[s], (16 * c) as u32)); }
-                    all_ld.push(ld);
-                }
                 for c in 0..8usize {
                     let ld = all_ld[c].clone();
                     let mut acc: Vec<Option<ValueId>> = vec![None; 8];
