@@ -139,7 +139,9 @@ int main(int argc, char** argv) {
     }
     const long s_blocks = (long)s_gx * H * B * (splits > 1 ? splits : 1);
     const double ohat_bytes = (double)splits * rows_total * D * part_elem_bytes;
-    const double lse_bytes = (double)splits * rows_total * 4;    int rows_pb; const char* why;
+    const double lse_bytes = (double)splits * rows_total * 4;
+    const double ohat_alloc_bytes = (double)splits * rows_total * D * 4;   // fp32-sized so both fp16 and fp32-partial builds fit
+    int rows_pb; const char* why;
     if (use_split) { rows_pb = s_rows_pb; why = "KV-split (main+combine)"; }
     else if (forced_rows == 128 || forced_rows == 256) { rows_pb = forced_rows; why = "REF_ROWS_PER_BLOCK override"; }
     else if (envi("REF_GRID128", 0) != 0) { rows_pb = 128; why = "REF_GRID128=1"; }
