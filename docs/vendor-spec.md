@@ -1496,6 +1496,37 @@ Mid-shape table (auto path, t128 fallback) is measured in the same run and recor
 report; representative: B2H4S1024 ~234.9 TFLOP/s, B3H3S768 ~235.4 TFLOP/s (both comfortably above the
 same-run vendor 225.2/208.2), i.e. the t128 fallback also inherits the Q/epilogue/prologue wins.
 
+## 7.10.6 Guard refit on the post-vectorisation control (dispatch win, zero kernel risk)
+
+The Q/epilogue vectorisation cut both split and fallback times asymmetrically (the split kernel's per-block
+Q prologue and the t128 fallback both improved), so the guard model constants in 7.10.2/7.10.3 are stale and
+the current guard is over-conservative on N<=16 shapes (it rejects `B1H16S256 SK1024`, measured **+13-15%**
+for the split path). Refit on the new control (Main `8c5bb14`, 20 shapes = 15 gate + 9 sweep + mid/filled
+extras; measured split-vs-fallback totals):
+
+* `T_cur = F / (5.96e12 * min(256, 2*N256)) + 7.48 us` (t128; was 5.9e12 / 9.4 us)
+* `T_kv = F / (7.38e12 * min(256, N256*s)) + 6.80 us + part_b / 4.0 TB/s + max(3 us, comb_b / 4.2 TB/s) + 1.0 us`
+  (was 5.9e12 / 7.0 us / +1.5 us, plus the empirical linear-fit term; the fit is dropped - it was what
+  over-rejected the small/full-fill shapes), threshold 0.95 kept.
+* Fit residuals: T_cur <= 2.6 us on N<=128 shapes; T_kv <= 2.3 us (rmse 1.29 us) across the 16 measured
+  split-valid shapes at their chosen s.
+
+**Simulated + re-verified decisions (GRID_ONLY on the patched branch, branch `guard-refit` @ 3c2c17e):**
+7 gate shapes choose split - `B2H4S1024` (measured -0.5% = neutral, was t128), `B1H8S2048` (-16.0%),
+`B1H2S512 SK2048` (-36.1%), `B3H3S768` (-3.0%), **`B1H16S256 SK1024` (-13.2%, was t128 - the big add)**,
+`B1H2S256 SK1000` (-18.1%), `B1H2S200 SK1337` (-28.7%); plus `B1H8S1024` (0.0% neutral, extras). **No
+chosen shape loses** (worst chosen -0.5% neutral, within noise). Everything else stays t128/vs128:
+tiny/short-tile shapes (`B1H1S256` +28.7% if split, `B1H2S512` +1.7%, `B1H4S300` +3.3%, `B2H4S300SK129`
++33.3%), short-SK (`B2H8S700` +36.9%), N=128/short split (`B2H8S2048` +19%, `B1H8S4096` +3.4%) and the
+filling shapes (B4H8S2048/B1H8S8192) all stay on the single-launch path. Missed marginal win:
+`B1H2S1024 SK1088` split +1.0% (not worth a rule).
+**Re-measured on the patched auto path:** B1H16S256 split **16.4-16.5 us = 129.8-130.7 TFLOP/s** vs
+fallback ~18.9 us (t128) and vendor 112.6 (1.15-1.16x vendor); B2H4S1024 18.8-18.9 us = 227.7 TFLOP/s
+(neutral, above vendor 224); B1H8S1024 18.9 us = 226.7 (neutral, above vendor 223). Auto gate @16 rows
+**15/15 OK, parity 15/15, ours bad=0** with the refit; the 15-shape determinism and 64-row gate are run at
+landing. The change is harness-only (`tests/gpu/ref_host.cpp` eval_split constants/threshold) - **zero
+kernel risk**, one shipped-path win of +13-15% on B1H16S256, neutral on two N=32 shapes.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as
