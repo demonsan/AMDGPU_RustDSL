@@ -10919,21 +10919,23 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
     let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
     b.begin_if(Opnd::Val(wave_live));
-    for e in 0..4usize {
-        for q in 0..4usize {
-            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
-            for k in 0..4usize {
-                let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
-                let lanev = b.bitcast_f32(lane);
-                v4.push(b.mul_f32(lanev, fin));
+    if !fmha_t_opt("noout") {
+        for e in 0..4usize {
+            for q in 0..4usize {
+                let mut v4: Vec<ValueId> = Vec::with_capacity(4);
+                for k in 0..4usize {
+                    let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                    let lanev = b.bitcast_f32(lane);
+                    v4.push(b.mul_f32(lanev, fin));
+                }
+                let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
+                let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+                let off = (64 * e + 16 * q) as u32;
+                let f0 = b.bitcast_f32(w0);
+                let f1 = b.bitcast_f32(w1);
+                b.store_f32(o_ptr0, off, f0);
+                b.store_f32(o_ptr0, off + 4, f1);
             }
-            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
-            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
-            let off = (64 * e + 16 * q) as u32;
-            let f0 = b.bitcast_f32(w0);
-            let f1 = b.bitcast_f32(w1);
-            b.store_f32(o_ptr0, off, f0);
-            b.store_f32(o_ptr0, off + 4, f1);
         }
     }
     b.end_if();
@@ -11843,21 +11845,23 @@ fn emit_fmha_g2_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
     let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
     b.begin_if(Opnd::Val(wave_live));
-    for e in 0..4usize {
-        for q in 0..4usize {
-            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
-            for k in 0..4usize {
-                let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
-                let lanev = b.bitcast_f32(lane);
-                v4.push(b.mul_f32(lanev, fin));
+    if !fmha_t_opt("noout") {
+        for e in 0..4usize {
+            for q in 0..4usize {
+                let mut v4: Vec<ValueId> = Vec::with_capacity(4);
+                for k in 0..4usize {
+                    let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                    let lanev = b.bitcast_f32(lane);
+                    v4.push(b.mul_f32(lanev, fin));
+                }
+                let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
+                let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+                let off = (64 * e + 16 * q) as u32;
+                let f0 = b.bitcast_f32(w0);
+                let f1 = b.bitcast_f32(w1);
+                b.store_f32(o_ptr0, off, f0);
+                b.store_f32(o_ptr0, off + 4, f1);
             }
-            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
-            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
-            let off = (64 * e + 16 * q) as u32;
-            let f0 = b.bitcast_f32(w0);
-            let f1 = b.bitcast_f32(w1);
-            b.store_f32(o_ptr0, off, f0);
-            b.store_f32(o_ptr0, off + 4, f1);
         }
     }
     b.end_if();
@@ -12762,21 +12766,23 @@ fn emit_fmha_g3_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
     let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
     b.begin_if(Opnd::Val(wave_live));
-    for e in 0..4usize {
-        for q in 0..4usize {
-            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
-            for k in 0..4usize {
-                let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
-                let lanev = b.bitcast_f32(lane);
-                v4.push(b.mul_f32(lanev, fin));
+    if !fmha_t_opt("noout") {
+        for e in 0..4usize {
+            for q in 0..4usize {
+                let mut v4: Vec<ValueId> = Vec::with_capacity(4);
+                for k in 0..4usize {
+                    let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                    let lanev = b.bitcast_f32(lane);
+                    v4.push(b.mul_f32(lanev, fin));
+                }
+                let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
+                let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+                let off = (64 * e + 16 * q) as u32;
+                let f0 = b.bitcast_f32(w0);
+                let f1 = b.bitcast_f32(w1);
+                b.store_f32(o_ptr0, off, f0);
+                b.store_f32(o_ptr0, off + 4, f1);
             }
-            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
-            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
-            let off = (64 * e + 16 * q) as u32;
-            let f0 = b.bitcast_f32(w0);
-            let f1 = b.bitcast_f32(w1);
-            b.store_f32(o_ptr0, off, f0);
-            b.store_f32(o_ptr0, off + 4, f1);
         }
     }
     b.end_if();
@@ -13701,21 +13707,23 @@ fn emit_fmha_t128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
     let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
     b.begin_if(Opnd::Val(wave_live));
-    for e in 0..4usize {
-        for q in 0..4usize {
-            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
-            for k in 0..4usize {
-                let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
-                let lanev = b.bitcast_f32(lane);
-                v4.push(b.mul_f32(lanev, fin));
+    if !fmha_t_opt("noout") {
+        for e in 0..4usize {
+            for q in 0..4usize {
+                let mut v4: Vec<ValueId> = Vec::with_capacity(4);
+                for k in 0..4usize {
+                    let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                    let lanev = b.bitcast_f32(lane);
+                    v4.push(b.mul_f32(lanev, fin));
+                }
+                let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
+                let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+                let off = (64 * e + 16 * q) as u32;
+                let f0 = b.bitcast_f32(w0);
+                let f1 = b.bitcast_f32(w1);
+                b.store_f32(o_ptr0, off, f0);
+                b.store_f32(o_ptr0, off + 4, f1);
             }
-            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
-            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
-            let off = (64 * e + 16 * q) as u32;
-            let f0 = b.bitcast_f32(w0);
-            let f1 = b.bitcast_f32(w1);
-            b.store_f32(o_ptr0, off, f0);
-            b.store_f32(o_ptr0, off + 4, f1);
         }
     }
     b.end_if();
@@ -14589,21 +14597,23 @@ fn emit_fmha_g3o_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
     let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
     b.begin_if(Opnd::Val(wave_live));
-    for e in 0..4usize {
-        for q in 0..4usize {
-            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
-            for k in 0..4usize {
-                let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
-                let lanev = b.bitcast_f32(lane);
-                v4.push(b.mul_f32(lanev, fin));
+    if !fmha_t_opt("noout") {
+        for e in 0..4usize {
+            for q in 0..4usize {
+                let mut v4: Vec<ValueId> = Vec::with_capacity(4);
+                for k in 0..4usize {
+                    let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                    let lanev = b.bitcast_f32(lane);
+                    v4.push(b.mul_f32(lanev, fin));
+                }
+                let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
+                let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+                let off = (64 * e + 16 * q) as u32;
+                let f0 = b.bitcast_f32(w0);
+                let f1 = b.bitcast_f32(w1);
+                b.store_f32(o_ptr0, off, f0);
+                b.store_f32(o_ptr0, off + 4, f1);
             }
-            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
-            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
-            let off = (64 * e + 16 * q) as u32;
-            let f0 = b.bitcast_f32(w0);
-            let f1 = b.bitcast_f32(w1);
-            b.store_f32(o_ptr0, off, f0);
-            b.store_f32(o_ptr0, off + 4, f1);
         }
     }
     b.end_if();
@@ -15150,21 +15160,23 @@ fn emit_fmha_vsm_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
     let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
     b.begin_if(Opnd::Val(wave_live));
-    for e in 0..4usize {
-        for q in 0..4usize {
-            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
-            for k in 0..4usize {
-                let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
-                let lanev = b.bitcast_f32(lane);
-                v4.push(b.mul_f32(lanev, fin));
+    if !fmha_t_opt("noout") {
+        for e in 0..4usize {
+            for q in 0..4usize {
+                let mut v4: Vec<ValueId> = Vec::with_capacity(4);
+                for k in 0..4usize {
+                    let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                    let lanev = b.bitcast_f32(lane);
+                    v4.push(b.mul_f32(lanev, fin));
+                }
+                let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
+                let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+                let off = (64 * e + 16 * q) as u32;
+                let f0 = b.bitcast_f32(w0);
+                let f1 = b.bitcast_f32(w1);
+                b.store_f32(o_ptr0, off, f0);
+                b.store_f32(o_ptr0, off + 4, f1);
             }
-            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
-            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
-            let off = (64 * e + 16 * q) as u32;
-            let f0 = b.bitcast_f32(w0);
-            let f1 = b.bitcast_f32(w1);
-            b.store_f32(o_ptr0, off, f0);
-            b.store_f32(o_ptr0, off + 4, f1);
         }
     }
     b.end_if();
