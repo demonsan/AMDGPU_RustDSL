@@ -250,6 +250,25 @@ impl Seq {
         SubMut { id: self.alias_of(r.id, (2 * I) as u8, AClass::V2), _p: PhantomData }
     }
 
+    /// All four dword pairs of an 8-dword tuple at once: DISJOINT writable views under ONE mutable borrow of the parent, so four DS reads can be in
+    /// flight together; the parent is usable again (e.g. `ready`) only after every pending token has been waited and dropped.
+    pub fn split_pairs_mut<'a>(&mut self, r: &'a mut Vgpr<8>) -> [SubMut<'a, 2>; 4] {
+        let id = r.id;
+        [0u8, 2, 4, 6].map(|o| SubMut { id: self.alias_of(id, o, AClass::V2), _p: PhantomData })
+    }
+
+    /// Both halves of an 8-dword tuple (disjoint writable 4-dword views).
+    pub fn split_halves8_mut<'a>(&mut self, r: &'a mut Vgpr<8>) -> [SubMut<'a, 4>; 2] {
+        let id = r.id;
+        [0u8, 4].map(|o| SubMut { id: self.alias_of(id, o, AClass::V4), _p: PhantomData })
+    }
+
+    /// All four quarters of a 16-dword tuple (disjoint writable 4-dword views).
+    pub fn split_quarters16_mut<'a>(&mut self, r: &'a mut Vgpr<16>) -> [SubMut<'a, 4>; 4] {
+        let id = r.id;
+        [0u8, 4, 8, 12].map(|o| SubMut { id: self.alias_of(id, o, AClass::V4), _p: PhantomData })
+    }
+
     /// Low (`HI` = false) or high half of an 8-dword tuple as a writable 4-dword view.
     pub fn half8_mut<'a, const HI: bool>(&mut self, r: &'a mut Vgpr<8>) -> SubMut<'a, 4> {
         SubMut { id: self.alias_of(r.id, if HI { 4 } else { 0 }, AClass::V4), _p: PhantomData }

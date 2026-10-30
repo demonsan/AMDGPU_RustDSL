@@ -213,9 +213,9 @@ fn pending_loads_emit_partial_waits_from_the_scoreboard() {
     let mut s = Seq::new();
     let addr = s.splat(0);
     let (d0, d1, d2) = (s.vgpr::<4>(), s.vgpr::<4>(), s.vgpr::<4>());
-    let r0 = s.ds_read_b128::<0>(d0, &addr);
-    let r1 = s.ds_read_b128::<16>(d1, &addr);
-    let r2 = s.ds_read_b128::<32>(d2, &addr);
+    let r0 = s.ds_read_b128::<0, _>(d0, &addr);
+    let r1 = s.ds_read_b128::<16, _>(d1, &addr);
+    let r2 = s.ds_read_b128::<32, _>(d2, &addr);
     let v0 = r0.wait(&mut s); // two later loads may stay in flight: lgkmcnt(2)
     let v2 = r2.wait(&mut s); // drains everything up to r2: lgkmcnt(0)
     let v1 = r1.wait(&mut s); // already covered: no instruction
@@ -234,7 +234,7 @@ fn vm_and_lgkm_queues_are_independent() {
     let addr = s.splat(0);
     let (dg, dl) = (s.vgpr::<4>(), s.vgpr::<4>());
     let g = s.global_load_dwordx4(dg, &a2, 0);
-    let l = s.ds_read_b128::<0>(dl, &addr);
+    let l = s.ds_read_b128::<0, _>(dl, &addr);
     let vl = l.wait(&mut s); // lgkm queue holds only this load: lgkmcnt(0), the global load stays in flight
     let vg = g.wait(&mut s); // vmcnt(0)
     s.output(vl);
@@ -442,9 +442,9 @@ fn explicit_wait_counts_are_checked() {
     let mut s = Seq::new();
     let addr = s.splat(0);
     let (d0, d1, d2) = (s.vgpr::<4>(), s.vgpr::<4>(), s.vgpr::<4>());
-    let r0 = s.ds_read_b128::<0>(d0, &addr);
-    let r1 = s.ds_read_b128::<16>(d1, &addr);
-    let r2 = s.ds_read_b128::<32>(d2, &addr);
+    let r0 = s.ds_read_b128::<0, _>(d0, &addr);
+    let r1 = s.ds_read_b128::<16, _>(d1, &addr);
+    let r2 = s.ds_read_b128::<32, _>(d2, &addr);
     assert!(s.wait_lgkm_cnt(3).is_err(), "3 outstanding: lgkmcnt(3) waits for nothing");
     s.wait_lgkm_cnt(1).unwrap(); // r0 and r1 complete, r2 may stay in flight
     let v0 = r0.wait(&mut s); // covered: no instruction
@@ -474,10 +474,10 @@ fn ds_ops_with_partial_counts_and_transposed_read() {
     let mut s = Seq::new();
     let addr = s.splat(0);
     let (d0, d1, d2, d3) = (s.vgpr::<4>(), s.vgpr::<4>(), s.vgpr::<2>(), s.vgpr::<1>());
-    let r0 = s.ds_read_b128::<0>(d0, &addr);
-    let r1 = s.ds_read_b128::<16>(d1, &addr);
-    let r2 = s.ds_read_b64_tr_b8::<8>(d2, &addr);
-    let r3 = s.ds_read_b32::<4>(d3, &addr);
+    let r0 = s.ds_read_b128::<0, _>(d0, &addr);
+    let r1 = s.ds_read_b128::<16, _>(d1, &addr);
+    let r2 = s.ds_read_b64_tr_b8::<8, _>(d2, &addr);
+    let r3 = s.ds_read_b32::<4, _>(d3, &addr);
     let w = s.zeroed::<4>();
     s.ds_write_b128::<32>(&addr, &w);
     let v0 = r0.wait(&mut s); // 4 younger DS ops outstanding (r1, r2, r3, the write): lgkmcnt(4)
@@ -577,7 +577,7 @@ fn loop_body_contract_is_drain_closed() {
     let mut s = Seq::new();
     let addr = s.input::<1>();
     let d = s.vgpr::<4>();
-    let p = s.ds_read_b128::<0>(d, &addr);
+    let p = s.ds_read_b128::<0, _>(d, &addr);
     drop(p);
     let e = s.finish_loop_body().unwrap_err();
     assert!(e.contains("outstanding") || e.contains("abandoned"), "{e}");
@@ -594,4 +594,88 @@ fn raw_only_ops_are_not_allowed_in_a_sequence() {
     v.push(AInst { op: "VAddCoU32", dst: Some(ok.outputs()[0].reg), srcs: vec![ASrc::Imm(1), ASrc::Reg(ok.outputs()[0].reg)], imm: 0 });
     let e = amdgpu_safeasm::forge_for_tests(&ok, v).verify().unwrap_err().join("; ");
     assert!(e.contains("raw-only"), "{e}");
+}
+// ---- Block C enablers: writable views as DS destinations, multi-inout variables -----------------------------------------------------------
+
+/// Four `ds_read_b64_tr_b8` fill one 8-dword MFMA operand through disjoint pair views (all four in flight together); `ready` needs the borrows (and
+/// therefore the waits) to be over, and the MFMA is padded only by the DS waits (a DS-written register has no VALU write to wait for).
+#[test]
+fn four_transposed_reads_assemble_one_mfma_operand() {
+    let mut s = Seq::new();
+    let addr = s.input::<1>();
+    let b = s.input::<8>();
+    let sa = s.splat(127);
+    let sb = s.splat(127);
+    let mut v8 = s.vgpr::<8>();
+    {
+        let [d0, d1, d2, d3] = s.split_pairs_mut(&mut v8);
+        let p0 = s.ds_read_b64_tr_b8::<0, _>(d0, &addr);
+        let p1 = s.ds_read_b64_tr_b8::<2048, _>(d1, &addr);
+        let p2 = s.ds_read_b64_tr_b8::<4096, _>(d2, &addr);
+        let p3 = s.ds_read_b64_tr_b8::<6144, _>(d3, &addr);
+        let _ = p0.wait(&mut s); // lgkmcnt(3)
+        let _ = p1.wait(&mut s); // lgkmcnt(2)
+        let _ = p2.wait(&mut s); // lgkmcnt(1)
+        let _ = p3.wait(&mut s); // lgkmcnt(0)
+    }
+    let o = s.vgpr::<16>();
+    let (ra, rb, rsa, rsb) = (s.ready(&v8), s.ready(&b), s.ready(&sa), s.ready(&sb));
+    let o = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(o, ra, rb, rsa, rsb).retire(&mut s);
+    s.output(o);
+    let blk = s.finish().unwrap();
+    let waits: Vec<i64> = blk.insts().iter().filter(|i| i.op == "SWaitLgkm").map(|i| i.imm).collect();
+    assert_eq!(waits, vec![3, 2, 1, 0]);
+    let mf = blk.insts().iter().position(|i| i.op == "VMfmaScale32x32x64Fp8Z").unwrap();
+    let last_wait = blk.insts().iter().rposition(|i| i.op == "SWaitLgkm").unwrap();
+    assert!(last_wait < mf);
+}
+
+/// Multi-inout: a block updating two loop variables in place through two in/out ports (`Stmt::VarAsmN`), lowered into the same MIR as two separate
+/// DSL in-place accumulations.
+#[test]
+fn var_asm_n_binds_inout_ports_in_declaration_order() {
+    use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
+    let mut s = Seq::new();
+    let acc0 = s.inout::<4>();
+    let acc1 = s.inout::<4>();
+    let a_rs = s.input::<4>();
+    let pa = s.input::<8>();
+    let idx = s.input::<1>();
+    let (ra, rpa, ri) = (s.ready(&a_rs), s.ready(&pa), s.ready(&idx));
+    let e0 = s.v_smfmac_f32_16x16x128_fp8_fp8(acc0, ra, rpa, ri).exit();
+    let e1 = s.v_smfmac_f32_16x16x128_fp8_fp8(acc1, ra, rpa, ri).exit();
+    s.output_exit(e0);
+    s.output_exit(e1);
+    let blk = s.finish().unwrap();
+
+    let build = |use_asm: bool| {
+        let mut b = FnBuilder::new(if use_asm { "n_asm" } else { "n_dsl" }, 64);
+        b.arg("o", DType::Ptr, 0, 8);
+        let o = b.let_(Op::KernargPtr { offset: 0 });
+        let c0 = b.c_i32(0);
+        let c3 = b.c_i32(3);
+        let a_rs = b.frag4(c0, c0, c0, c0);
+        let pa = b.frag8(c0, c0, c0, c0, c0, c0, c0, c0);
+        let z0 = b.frag4(c0, c0, c0, c0);
+        let z1 = b.frag4(c0, c0, c0, c0);
+        let vars = b.begin_loop(&[(DType::Frag4, Opnd::Val(z0)), (DType::Frag4, Opnd::Val(z1))]);
+        if use_asm {
+            b.var_asm_n(&[vars[0], vars[1]], blk.clone(), &[Opnd::Val(a_rs), Opnd::Val(pa), Opnd::Val(c3)]);
+        } else {
+            b.var_smfmac_fp8(vars[0], a_rs, pa, c3);
+            b.var_smfmac_fp8(vars[1], a_rs, pa, c3);
+        }
+        let stop = b.c_i32(1);
+        b.break_if(Opnd::Val(stop));
+        b.end_loop();
+        let x = b.frag4_lane(Opnd::Var(vars[1]), 2);
+        let xf = b.bitcast_f32(x);
+        b.store_f32(o, 0, xf);
+        b.finish()
+    };
+    let fa = amdgpu_compiler::lower::lower(&build(true)).unwrap();
+    let fd = amdgpu_compiler::lower::lower(&build(false)).unwrap();
+    let smf = |m: &MFunction| m.blocks.iter().flat_map(|b| b.insts.iter()).filter(|i| i.op == MOp::VSmfmac16x16x128Fp8).count();
+    assert_eq!(smf(&fa), 2);
+    assert_eq!(smf(&fa), smf(&fd));
 }
