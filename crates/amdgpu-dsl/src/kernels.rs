@@ -9740,6 +9740,21 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     let key_first = b.c_i32(0);
     stage(b, key_first, c0, c0);
+    // dsplit (deferred DMA waits): group A stages the K tile (and the K scales) of tile t+2 at the START of the M phase of tile t and waits for it at the
+    // end of the V phase of tile t+1 (one phase + one phase of cover instead of the whole V phase); group B stages V(t+1) at the start of V(t) and waits
+    // at the END of M(t). Prologue: A also issues K(1); its scale dword is carried into the loop in the variable `kdp` and stored at the end of V(0).
+    let dsplit = fmha_t_opt("dsplit");
+    let kd1_init: Option<ValueId> = if dsplit && role_a && !no_stage {
+        let cm1x = b.c_i32(-1);
+        let nkv_m1x = b.add_i32(cx.nkv, cm1x);
+        let has1x = b.cmp_lt_i32(c1, cx.nkv);
+        let t1x = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has1x), a: Opnd::Val(c1), b: Opnd::Val(nkv_m1x) });
+        let key_one = b.shl_i32(t1x, c7d);
+        let slot_one = b.c_i32(cbuf_i);
+        stage_start(b, key_one, slot_one)
+    } else {
+        None
+    };
     // 2-slot ring: only tile 0 is staged here; tile t+1 is staged (and waited for) in the V phase of tile t
     // constants in LDS instead of registers: a 2 KB block of E4M3 ones (A of the row-sum MFMA) and this wave's second Q fragment (32 B per lane)
     let wid = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
@@ -9906,6 +9921,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         (DType::Frag16, Opnd::Val(s_init[3])),
         if smfv { (DType::Frag4, Opnd::Val(zero4v)) } else if smfrs { (DType::I32, Opnd::Val(c0)) } else { (DType::Frag16, Opnd::Val(zero)) }, // 10 row sums
         (DType::I32, Opnd::Val(c0)),          // 11 ring index (tile mod 3)
+        (DType::I32, Opnd::Val(match kd1_init { Some(v) => v, None => c0 })), // 12 kdp: the K-scale dword of tile t+1 (dsplit, group A)
     ];
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
@@ -9918,6 +9934,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let s_vars = [vars[6], vars[7], vars[8], vars[9]];
     let la = vars[10];
     let idx = vars[11];
+    let kdp = vars[12];
     // 2-slot ring: tile t in slot t & 1, tile t+1 in the other one
     let ring = |b: &mut FnBuilder| -> (ValueId, ValueId, ValueId, ValueId, ValueId, ValueId, ValueId) {
         let i1 = b.xor_i32(idx, c1);
@@ -10320,15 +10337,23 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };    let iter = |b: &mut FnBuilder, masked: bool, stage: bool, last_barrier: bool| {
         let (_i1, slot_cur, slot_nxt, slot_n2, kds_nxt, key_n2, _kds_cur) = ring(b);
         // V phase (the DMA of tile t+2 runs under it, waited for at its end); M phase: PV(this tile) + QK(next tile)
-        let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
+        let skd = if stage && !(dsplit && role_a) { stage_start(b, key_n2, slot_n2) } else { None };
         let kdg: Option<Vec<ValueId>> = if kdglob && stage { Some(kd_rows(b, key_n2)) } else { None };
         let _ = &kdg;
         // convlate: the P conversion of S tiles 2 and 3 moves from the V phase into the M phase (after PV half 0) to balance the two phases
         let convlate = fmha_t_opt("convlate") && smfv;
         let mut w = if convlate { valu(b, masked, true, 0, 2) } else { valu(b, masked, true, 0, 4) };
         let bias_now = w.pop().expect("bias word");
-        if stage {
+        if stage && !dsplit {
             stage_end(b, skd, kds_nxt);
+        }
+        if stage && dsplit && role_a {
+            // wait for the K tile + scales issued in the previous M phase, publish the scales of tile t+1
+            if !ablate.contains("novmwait") {
+                b.wait_vm(0);
+            }
+            let a = b.add_i32(kdb0, kds_nxt);
+            b.store_lds_b32(Opnd::Val(a), Opnd::Var(kdp));
         }
         if !noprio {
             b.set_prio(1);
@@ -10337,6 +10362,17 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if !no_bar && !nobar1 {
             b.barrier();
         }
+        // dsplit, group A: K(t+2) DMA + scales into the K region of the slot of tile t (free: its K was consumed by QK(t) in the previous M phase)
+        let kd_t2: Option<ValueId> = if stage && dsplit && role_a && !no_stage {
+            let it_p2 = b.add_i32(it, c2);
+            let has_n2 = b.cmp_lt_i32(it_p2, cx.nkv);
+            let nkv_m1c = b.add_i32(cx.nkv, cm1);
+            let nn2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_n2), a: Opnd::Val(it_p2), b: Opnd::Val(nkv_m1c) });
+            let key_t2 = b.shl_i32(nn2, c7d);
+            stage_start(b, key_t2, slot_cur)
+        } else {
+            None
+        };
         // kdearly: the four K-scale dwords of the next tile are read at the START of the M phase (right after the barrier), so their lgkmcnt
         // wait retires behind the PV MFMAs instead of sitting in front of the first QK MFMA (4 VGPR live during PV)
         let kdg: Option<Vec<ValueId>> = if fmha_t_opt("kdearly") && stage {
@@ -10400,6 +10436,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         if !noprio {
             b.set_prio(0);
+        }
+        if stage && dsplit && !role_a && !ablate.contains("novmwait") {
+            b.wait_vm(0); // group B: the V(t+1) DMA issued at the start of V(t) has had V + M to land
+        }
+        if let Some(kn) = kd_t2 {
+            b.set_var(kdp, kn);
         }
         b.wait_lds(0);
         if !no_bar && !nobar2 && last_barrier {
