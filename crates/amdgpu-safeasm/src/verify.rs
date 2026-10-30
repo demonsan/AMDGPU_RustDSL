@@ -15,6 +15,7 @@ use std::collections::HashMap;
 const MATRIX_RESULT: u32 = 20;
 const VALU_TO_MATRIX_READ: u32 = 2;
 const VCC: u32 = u32::MAX;
+use crate::seq::{PK_TO_TRANS, TRANS_RESULT};
 
 fn is_matrix(op: &str) -> bool {
     op.starts_with("VMfma") || op.starts_with("VSmfmac")
