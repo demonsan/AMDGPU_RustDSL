@@ -10476,30 +10476,86 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
         b.begin_if(Opnd::Val(wave_live));
         b.store_f32(l_ptr, 0, lse_v);
-        if p16 {
-            for e in 0..(if ablate.contains("nopartial") { 0usize } else { 4usize }) {
+        if p16 && !ablate.contains("nopartial") {
+            // fp16 partials through the same LDS transpose as the fp32 path, two fragments (64 dims = 128 bytes per row) per round
+            let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
+            let c4096e = b.c_i32(4096);
+            let wb0 = b.mul_i32(wid_e, c4096e);
+            let c69632 = b.c_i32(69632);
+            let lbase = b.add_i32(wb0, c69632);
+            let c7e = b.c_i32(7);
+            let c3e = b.c_i32(3);
+            let jm = b.let_(Op::AndI32(Opnd::Val(cx.j), Opnd::Val(c7e)));
+            let j128 = b.shl_i32(cx.j, c7e);
+            let jbase = b.add_i32(lbase, j128);
+            let half8 = b.shl_i32(half, c3e); // 8 bytes per lane half
+            // write address of chunk (4 e' + q) of this lane's row: (chunk ^ (j & 7)) * 16 + 8 half
+            let mut waddr: Vec<ValueId> = Vec::with_capacity(8);
+            for ec in 0..2usize {
                 for q in 0..4usize {
-                    let mut hv: Vec<ValueId> = Vec::with_capacity(4);
-                    for k in 0..4usize {
-                        let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
-                        let lanev = b.bitcast_f32(lane);
-                        let v = b.mul_f32(lanev, fin);
-                        hv.push(b.let_(Op::CvtF32ToF16(Opnd::Val(v))));
-                    }
-                    let s0 = b.shl_i32(hv[1], c16i);
-                    let s1 = b.shl_i32(hv[3], c16i);
-                    let w0 = b.let_(Op::AddI32(Opnd::Val(hv[0]), Opnd::Val(s0)));
-                    let w1 = b.let_(Op::AddI32(Opnd::Val(hv[2]), Opnd::Val(s1)));
-                    // dims 32 e + 8 q + 4 half + 0..3 -> bytes 64 e + 16 q + 8 half
-                    let off = (64 * e + 16 * q) as u32;
-                    let f0 = b.bitcast_f32(w0);
-                    let f1 = b.bitcast_f32(w1);
-                    b.store_f32(o_ptr0, off, f0);
-                    b.store_f32(o_ptr0, off + 4, f1);
+                    let cch = b.c_i32((4 * ec + q) as i32);
+                    let px = b.xor_i32(cch, jm);
+                    let po = b.shl_i32(px, c4);
+                    let a0 = b.add_i32(jbase, po);
+                    waddr.push(b.add_i32(a0, half8));
                 }
             }
-        }
-        if !p16 && !ablate.contains("nopartial") && !ablate.contains("nolds") {
+            let lrow = b.let_(Op::LshrI32(Opnd::Val(lane_q), Opnd::Val(c3e)));
+            let lch = b.let_(Op::AndI32(Opnd::Val(lane_q), Opnd::Val(c7e)));
+            let pch = b.xor_i32(lch, lrow);
+            let pch16 = b.shl_i32(pch, c4);
+            let cm1e = b.c_i32(-1);
+            let s_lastk = b.add_i32(cx.s_len, cm1e);
+            let ch16 = b.shl_i32(lch, c4);
+            let mut raddr: Vec<ValueId> = Vec::with_capacity(4);
+            let mut gptr: Vec<ValueId> = Vec::with_capacity(4);
+            for i in 0..4usize {
+                let c8i = b.c_i32(8 * i as i32);
+                let r = b.add_i32(c8i, lrow);
+                let r128 = b.shl_i32(r, c7e);
+                let ra0 = b.add_i32(lbase, r128);
+                raddr.push(b.add_i32(ra0, pch16));
+                let rg_raw = b.add_i32(cx.row0, r);
+                let inr = b.cmp_lt_i32(rg_raw, cx.s_len);
+                let rg = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(inr), a: Opnd::Val(rg_raw), b: Opnd::Val(s_lastk) });
+                let q1 = b.mul_i32(cx.bidx, cx.s_len);
+                let q2 = b.add_i32(q1, rg);
+                let q3 = b.mul_i32(q2, kv.heads);
+                let q4 = b.add_i32(q3, cx.hidx);
+                let prow_i = b.add_i32(kv.part_row0, q4);
+                let po = b.mul_i32(prow_i, c512i); // 256 bytes per fp16 row
+                let po2 = b.add_i32(po, ch16);
+                gptr.push(b.ptr_add(kv.ptr_ohat, po2));
+            }
+            for pr in 0..2usize {
+                for ec in 0..2usize {
+                    let e = 2 * pr + ec;
+                    for q in 0..4usize {
+                        let mut hv: Vec<ValueId> = Vec::with_capacity(4);
+                        for k in 0..4usize {
+                            let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                            let lanev = b.bitcast_f32(lane);
+                            let v = b.mul_f32(lanev, fin);
+                            hv.push(b.let_(Op::CvtF32ToF16(Opnd::Val(v))));
+                        }
+                        let s0 = b.shl_i32(hv[1], c16i);
+                        let s1 = b.shl_i32(hv[3], c16i);
+                        let w0 = b.let_(Op::AddI32(Opnd::Val(hv[0]), Opnd::Val(s0)));
+                        let w1 = b.let_(Op::AddI32(Opnd::Val(hv[2]), Opnd::Val(s1)));
+                        let ad = waddr[4 * ec + q];
+                        b.store_lds_b32(Opnd::Val(ad), Opnd::Val(w0));
+                        let ad4 = b.add_i32(ad, c4);
+                        b.store_lds_b32(Opnd::Val(ad4), Opnd::Val(w1));
+                    }
+                }
+                b.wait_lds(0);
+                for i in 0..4usize {
+                    let v = b.load_lds_b128(Opnd::Val(raddr[i]));
+                    b.store_f32x4(gptr[i], (128 * pr) as u32, v);
+                }
+                b.wait_lds(0);
+            }
+        }        if !p16 && !ablate.contains("nopartial") && !ablate.contains("nolds") {
             // coalesced partial store: each wave stages its 32 x 32-dim slab (fragment e) through its private 4 KB of the (dead) Q staging region of the
             // LDS (rows of 128 bytes, 16-byte chunks XOR-swizzled by row & 7), reads it back as full 128-byte row segments and stores them with 16-byte
             // lane stores whose addresses are consecutive across the lanes of a row: 8 lanes x 16 B = one 128-byte line per row
