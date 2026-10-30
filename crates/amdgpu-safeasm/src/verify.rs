@@ -47,10 +47,20 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
     let mut matrix_reads: Vec<(u32, u32, usize)> = Vec::new();
     let mut lgkm: Vec<Option<u32>> = Vec::new();
     let mut vm: Vec<Option<u32>> = Vec::new();
+    let mut trans_write: HashMap<u32, u32> = HashMap::new();
+    let mut pk_write: HashMap<u32, u32> = HashMap::new();
+    // per-dword written halves (bit0 = low, bit1 = high) of registers built by the partial-write converts
+    let mut halves: HashMap<u32, u8> = HashMap::new();
 
     for (k, i) in b.insts.iter().enumerate() {
         let here = |m: String| format!("inst {k} ({}): {m}", i.op);
+        if !op_allowed(i.op) {
+            errs.push(here(format!("`{}` is raw-only: not modelled by the verifier, not allowed in a sequence", i.op)));
+        }
         let matrix = is_matrix(i.op);
+        let is_trans = matches!(i.op, "VExpF32" | "VRcpF32" | "VLogF32");
+        let partial_lo = matches!(i.op, "VCvtPkFp8Lo" | "VCvtPkFp8F32");
+        let partial_hi = matches!(i.op, "VCvtPkFp8Hi" | "VCvtPkFp8F32Hi");
         let reads: Vec<u32> = i.srcs.iter().filter_map(|s| if let ASrc::Reg(r) = s { Some(*r) } else { None }).collect();
         let dst = i.dst.map(canon);
 
@@ -78,8 +88,29 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
                     }
                 }
             }
+            if let Some(w) = trans_write.get(&r).copied() {
+                let have = slot.saturating_sub(w).saturating_sub(1);
+                if have < TRANS_RESULT {
+                    errs.push(here(format!("reads r{r}, a transcendental result issued {have} wait states ago: needs {TRANS_RESULT}")));
+                }
+            }
+            if is_trans {
+                if let Some(w) = pk_write.get(&r).copied() {
+                    let have = slot.saturating_sub(w).saturating_sub(1);
+                    if have < PK_TO_TRANS {
+                        errs.push(here(format!("transcendental op reads r{r}, a packed-fp32 result issued {have} wait states ago: needs {PK_TO_TRANS}")));
+                    }
+                }
+            }
+            if let Some(h) = halves.get(&r).copied() {
+                // the tied source of a `hi` convert is the register's own earlier half: not a read of unwritten data
+                let tied_self = partial_hi && Some(r) == dst;
+                if h != 3 && !tied_self {
+                    errs.push(here(format!("reads r{r} of which only the {} half was written (partial-write convert)", if h == 1 { "low" } else { "high" })));
+                }
+            }
             if let Some(w) = valu_write.get(&r).copied() {
-                if matrix || i.op == "VReadFirstLane" || is_mask || r == VCC {
+                if matrix || i.op == "VReadFirstLane" || i.op == "VPermlane32Swap" || is_mask || r == VCC {
                     let have = slot.saturating_sub(w).saturating_sub(1);
                     if have < VALU_TO_MATRIX_READ {
                         errs.push(here(format!("reads r{r} written by a VALU instruction {have} wait states ago: needs {VALU_TO_MATRIX_READ}")));
@@ -91,6 +122,13 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
         if let Some(d) = dst {
             if input_regs.contains(&d) {
                 errs.push(here(format!("writes r{d}, an INPUT port: a sequence may not clobber the caller's register")));
+            }
+            if partial_lo || partial_hi {
+                let was_defined = defined.contains(&d) || input_regs.contains(&d) || b.inputs.iter().any(|p| p.mutable && canon(p.reg) == d);
+                let h = halves.entry(d).or_insert(if was_defined { 3 } else { 0 });
+                *h |= if partial_lo { 1 } else { 2 };
+            } else if halves.contains_key(&d) {
+                halves.insert(d, 3);
             }
             defined.insert(d);
             if let Some((w, wop)) = matrix_write.get(&d).copied() {
@@ -164,6 +202,24 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
         } else if is_valu_writer(i.op) {
             if let Some(d) = dst {
                 valu_write.insert(d, slot);
+                if is_trans {
+                    trans_write.insert(d, slot);
+                } else {
+                    trans_write.remove(&d);
+                }
+                if matches!(i.op, "VPkAddF32" | "VPkMulF32") {
+                    pk_write.insert(d, slot);
+                } else {
+                    pk_write.remove(&d);
+                }
+            }
+            if i.op == "VPermlane32Swap" {
+                // swaps two registers in place: the second operand is rewritten too
+                if let Some(ASrc::Reg(r2)) = i.srcs.get(1) {
+                    let c2 = canon(*r2);
+                    valu_write.insert(c2, slot);
+                    defined.insert(c2);
+                }
             }
             if i.op.starts_with("VCmp") && dst.is_none() {
                 valu_write.insert(VCC, slot);
@@ -172,6 +228,9 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
         slot = slot.saturating_add(1);
     }
 
+    if b.loop_body && !b.exit_in_flight.is_empty() {
+        errs.push("a loop body must be drain-closed: it may not export a matrix result in flight (output_exit)".to_string());
+    }
     for p in &b.outputs {
         let c = canon(p.reg);
         if !defined.contains(&c) && !input_regs.contains(&c) && !b.inputs.iter().any(|p| p.mutable && canon(p.reg) == c) {
@@ -203,4 +262,11 @@ fn static_name(op: &str) -> &'static str {
         "VSmfmac16x16x128Fp8" => "VSmfmac16x16x128Fp8",
         _ => "matrix op",
     }
+}
+/// Names a sequence may contain: the typed templates (generated from opspec.tbl), the hand-written ones, and the internal bookkeeping ops.
+fn op_allowed(op: &str) -> bool {
+    const INTERNAL: &[&str] = &["SNop", "SWaitVm", "SWaitLgkm", "VWriteSub", "VMovB32", "VCmpMaskLtI32", "VCndmaskM"];
+    INTERNAL.contains(&op)
+        || crate::ops::TYPED_OPS.iter().any(|t| t.1 == op)
+        || crate::ops::HAND_WRITTEN_OPS.iter().any(|t| t.1 == op)
 }
