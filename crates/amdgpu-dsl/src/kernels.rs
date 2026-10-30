@@ -9780,7 +9780,11 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let a1 = b.add_i32(q0_addr0, c1024_);
         b.load_lds_b128x2(Opnd::Val(q0_addr0), Opnd::Val(a1))
     };
+    let q1_reg = fmha_t_opt("q1reg"); // keep Q b1 in registers too
     let load_q1 = |b: &mut FnBuilder| -> ValueId {
+        if q1_reg {
+            return cx.b1;
+        }
         let c1024_ = b.c_i32(1024);
         let a1 = b.add_i32(q_addr0, c1024_);
         b.load_lds_b128x2(Opnd::Val(q_addr0), Opnd::Val(a1))
