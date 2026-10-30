@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
     const int s_gx = (S + s_rows_pb - 1) / s_rows_pb;
     const double part_elem_bytes = (double)envi("REF_PARTIAL_BYTES", 2);   // fp16 partials (default of the split kernel; `nop16` builds use 4)
     const double comb_threads_d = (double)envi("REF_COMBINE_THREADS", 256);
+    const int combine_elems = envi("REF_COMBINE_ELEMS", 1);   // 4 for the vectorised combine4 kernel
 
     // Dispatch guard for the KV-split candidate (docs/kvsplit-results.md, docs/gen4-tiling-design.md section 11): use it only when
     // N256 <= 128 and N256*s <= 256 (one full block wave), every split owns a tile, and the modelled T_kvsplit(s) < 0.95 * T_current;
