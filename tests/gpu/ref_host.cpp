@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
     const char* kname_split = std::getenv("REF_KNAME2_SPLIT") ? std::getenv("REF_KNAME2_SPLIT") : "fmha_fwd_hd128_mxfp8_kvsplit";
     const char* co_comb = std::getenv("REF_CO2_COMBINE");
     const char* kname_comb = std::getenv("REF_KNAME2_COMBINE") ? std::getenv("REF_KNAME2_COMBINE") : "fmha_fwd_hd128_mxfp8_kvsplit_combine4h";
-    const int splits = envi("REF_SPLIT", 0);
+    int splits = envi("REF_SPLIT", 0);
     const bool force_split = envi("REF_SPLIT_FORCE", 0) != 0;
     const long rows_total = (long)B * S * H;
     const int vendor_rows = envi("REF_VENDOR_ROWS_PER_BLOCK", 256);
@@ -72,40 +72,58 @@ int main(int argc, char** argv) {
     const long blocks256 = (long)((S + 255) / 256) * H * B;
     const int s_rows_pb = 256;                            // split kernel uses the _vs128 8-wave block shape
     const int s_gx = (S + s_rows_pb - 1) / s_rows_pb;
-    const long s_blocks = (long)s_gx * H * B * (splits > 1 ? splits : 1);
-    const double ohat_bytes = (double)splits * rows_total * D * 4;
-    const double lse_bytes = (double)splits * rows_total * 4;
+    const double part_elem_bytes = (double)envi("REF_PARTIAL_BYTES", 2);   // fp16 partials (default of the split kernel; `nop16` builds use 4)
     const double comb_threads_d = (double)envi("REF_COMBINE_THREADS", 256);
 
-    // Dispatch guard for the KV-split candidate (docs/gen4-tiling-design.md section 11):
-    //   use it only when N256 <= 128 and N256*s <= 256 (one full block wave) and the modelled
-    //   T_kvsplit(s) < 0.95 * T_current; otherwise fall back to the certified _t128/_vs128 rule.
-    bool use_split = false; const char* split_why = "REF_SPLIT unset";
-    if (splits > 1 && co_split) {
+    // Dispatch guard for the KV-split candidate (docs/kvsplit-results.md, docs/gen4-tiling-design.md section 11): use it only when
+    // N256 <= 128 and N256*s <= 256 (one full block wave), every split owns a tile, and the modelled T_kvsplit(s) < 0.95 * T_current;
+    // otherwise fall back to the certified _t128/_vs128 rule. The model is the one fitted to the measurements (kernel-opt, B1H8S2048 and 1 8 1024):
+    //   T_t128    = F / (5.9e12 * min(256, 2 N256)) + 10.9 us            (4-wave blocks: 5.9 TFLOP/s per CU-pair + the fixed per-launch cost)
+    //   T_vs128   = F / (5.9e12 * min(256, N256))                        (filling grids)
+    //   T_kvsplit = F / (5.9e12 * min(256, N256 s)) + 7 us               (phase 1: compute + fixed prologue/epilogue)
+    //             + partial bytes / 4.0 TB/s                              (epilogue write, not hidden: the normalised partial exists only after
+    //                                                                     the last tile and all blocks finish together)
+    //             + (partial + out bytes) / 4.2 TB/s + 1.5 us             (combine + launch gap)
+    // The split launch counts BOTH kernels in the timing window.
+    struct SplitEval { bool guard; double t_cur; double t_kv; int tps; bool tiles_ok; };
+    auto eval_split = [&](int s) {
+        SplitEval r{};
         const double F = 4.0 * B * H * (double)S * SK * D;
-        const double t_current = (blocks256 <= 128)
-            ? F / (4.03e12 * std::min<double>(256.0, 2.0 * (double)blocks256))
-            : F / (5.90e12 * std::min<double>(256.0, (double)blocks256));
-        const double part_b = ohat_bytes + lse_bytes;
-        const double comb_b = part_b + rows_total * D * 2;
-        const double t_kv = std::max(F / (5.90e12 * std::min<double>(256.0, (double)blocks256 * splits)),
-                                     part_b / 4.8e12)
-                          + comb_b / 7.4e12 + 1.5e-6;
-        // Split key ranges are 128-key tile aligned (kernel-opt contract): tiles_per_split = ceil(ntiles/splits),
-        // split i owns [i*tps, min(ntiles,(i+1)*tps)); every split must own >= 1 tile for the Step A kernel.
+        r.t_cur = (blocks256 <= 128)
+            ? F / (5.9e12 * std::min<double>(256.0, 2.0 * (double)blocks256)) + 10.9e-6
+            : F / (5.9e12 * std::min<double>(256.0, (double)blocks256));
+        const double part_b = (double)s * rows_total * D * part_elem_bytes + (double)s * rows_total * 4;
+        const double comb_b = part_b + (double)rows_total * D * 2;
+        r.t_kv = F / (5.9e12 * std::min<double>(256.0, (double)blocks256 * s)) + 7.0e-6 + part_b / 4.0e12 + comb_b / 4.2e12 + 1.5e-6;
         const int ntiles = (SK + 127) / 128;
-        const int tps = (ntiles + splits - 1) / splits;
-        const bool tiles_ok = (splits >= 1) && (tps >= 1) && ((splits - 1) * tps < ntiles);
-        const bool guard = (blocks256 <= 128) && (blocks256 * splits <= 256) && tiles_ok && (t_kv < 0.95 * t_current);
+        r.tps = (ntiles + s - 1) / s;
+        r.tiles_ok = (s >= 1) && (r.tps >= 1) && ((s - 1) * r.tps < ntiles);
+        r.guard = (blocks256 <= 128) && (blocks256 * s <= 256) && r.tiles_ok && (r.t_kv < 0.95 * r.t_cur);
+        return r;
+    };
+    bool use_split = false; const char* split_why = "split not requested";
+    if (co_split && co_comb && splits <= 1 && envi("REF_NO_AUTO_SPLIT", 0) == 0) {
+        // default auto dispatch: best guard-passing split among {2, 4}
+        int best = 0; double best_t = 1e9;
+        for (int s : {2, 4}) {
+            const SplitEval r = eval_split(s);
+            std::printf("[split] auto candidate s=%d: blocks256=%ld ntiles=%d tps=%d tiles_ok=%d model T_current=%.2f us T_kvsplit=%.2f us guard=%d\n",
+                        s, blocks256, (SK + 127) / 128, r.tps, (int)r.tiles_ok, r.t_cur * 1e6, r.t_kv * 1e6, (int)r.guard);
+            if (r.guard && r.t_kv < best_t) { best = s; best_t = r.t_kv; }
+        }
+        if (best > 0) { splits = best; use_split = true; split_why = "auto dispatch: guard N256<=128 && N256*s<=256 && tiles && T_kv < 0.95 T_current"; }
+        else split_why = "auto dispatch: no split passes the guard (fallback to t128/_vs128)";
+    } else if (splits > 1 && co_split) {
+        const SplitEval r = eval_split(splits);
         if (force_split) { use_split = true; split_why = "REF_SPLIT_FORCE"; }
-        else if (guard) { use_split = true; split_why = "auto-split guard: N256<=128 && N256*s<=256 && model win"; }
+        else if (r.guard) { use_split = true; split_why = "REF_SPLIT + guard: N256<=128 && N256*s<=256 && model win"; }
         else { split_why = "split guard rejected (fallback)"; }
-        std::printf("[split] s=%d %s: blocks256=%ld phase1 blocks=%ld ntiles=%d tps=%d; model T_current=%.2f us T_kvsplit=%.2f us; %s\n",
-                    splits, use_split ? "CHOSEN" : "not chosen", blocks256, s_blocks,
-                    (SK + 127) / 128, ((SK + 127) / 128 + splits - 1) / splits,
-                    t_current * 1e6, t_kv * 1e6, split_why);
+        std::printf("[split] s=%d %s: blocks256=%ld ntiles=%d tps=%d; model T_current=%.2f us T_kvsplit=%.2f us; %s\n",
+                    splits, use_split ? "CHOSEN" : "not chosen", blocks256, (SK + 127) / 128, r.tps, r.t_cur * 1e6, r.t_kv * 1e6, split_why);
     }
-    int rows_pb; const char* why;
+    const long s_blocks = (long)s_gx * H * B * (splits > 1 ? splits : 1);
+    const double ohat_bytes = (double)splits * rows_total * D * part_elem_bytes;
+    const double lse_bytes = (double)splits * rows_total * 4;    int rows_pb; const char* why;
     if (use_split) { rows_pb = s_rows_pb; why = "KV-split (main+combine)"; }
     else if (forced_rows == 128 || forced_rows == 256) { rows_pb = forced_rows; why = "REF_ROWS_PER_BLOCK override"; }
     else if (envi("REF_GRID128", 0) != 0) { rows_pb = 128; why = "REF_GRID128=1"; }

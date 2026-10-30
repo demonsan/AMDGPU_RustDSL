@@ -31,10 +31,20 @@ if [[ "$OUR_KERNEL" == *_auto_split ]]; then
     SPLIT_KNAME="${P}_kvsplit"
     COMBINE_KNAME="${P}_kvsplit_combine4h"
 elif [[ "$OUR_KERNEL" == *_auto ]]; then
-    KNAME="${OUR_KERNEL%_auto}_vs128"
+    # default auto dispatch: _vs128 / _t128 / KV-split (_kvsplit + _kvsplit_combine4h); ref_host applies the guard per shape (REF_SPLIT=s forces a
+    # split candidate, REF_NO_AUTO_SPLIT=1 disables the split, REF_ROWS_PER_BLOCK overrides the tiling)
+    P="${OUR_KERNEL%_auto}"
+    KNAME="${P}_vs128"
     build_one "$KNAME" build/fmha_ours.co
-    build_one "${OUR_KERNEL%_auto}_t128" build/fmha_ours_small.co
+    build_one "${P}_t128" build/fmha_ours_small.co
+    build_one "${P}_kvsplit" build/fmha_ours_split.co
+    build_one "${P}_kvsplit_combine4h" build/fmha_combine.co
     SMALL_ENV="build/fmha_ours_small.co"
+    SPLIT_ENV="build/fmha_ours_split.co"
+    COMBINE_ENV="build/fmha_combine.co"
+    SPLIT_N="${REF_SPLIT:-0}"
+    SPLIT_KNAME="${P}_kvsplit"
+    COMBINE_KNAME="${P}_kvsplit_combine4h"
 else
     build_one "$OUR_KERNEL" build/fmha_ours.co
 fi
