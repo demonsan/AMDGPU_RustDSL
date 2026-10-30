@@ -6961,13 +6961,23 @@ pub fn fmha_fwd_hd128_mxfp8() -> Function {
 
     // Q fragments: chunk c, bytes 0..15 = K 64c+16g.., bytes 16..31 = K 64c+32+16g..
     let mut a8: Vec<ValueId> = Vec::with_capacity(2);
+    let qvec = fmha_t_opt("qvec");
     for c in 0..2u32 {
         let qp = b.ptr_add(ptr_q, q_off);
         let mut w: Vec<ValueId> = Vec::with_capacity(8);
-        for i in 0..8u32 {
-            let off = 64 * c + if i < 4 { 4 * i } else { 32 + 4 * (i - 4) };
-            let v = b.load_f32(qp, off);
-            w.push(b.bitcast_i32(v));
+        if qvec {
+            for half in 0..2u32 {
+                let v = b.load_b128(qp, 64 * c + 32 * half);
+                for k in 0..4u8 {
+                    w.push(b.frag4_lane(v, k));
+                }
+            }
+        } else {
+            for i in 0..8u32 {
+                let off = 64 * c + if i < 4 { 4 * i } else { 32 + 4 * (i - 4) };
+                let v = b.load_f32(qp, off);
+                w.push(b.bitcast_i32(v));
+            }
         }
         a8.push(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]));
     }
@@ -8849,21 +8859,23 @@ fn emit_fmha_sv_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
     let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
     b.begin_if(Opnd::Val(wave_live));
-    for e in 0..4usize {
-        for q in 0..4usize {
-            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
-            for k in 0..4usize {
-                let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
-                let lanev = b.bitcast_f32(lane);
-                v4.push(b.mul_f32(lanev, fin));
+    if !fmha_t_opt("noout") {
+        for e in 0..4usize {
+            for q in 0..4usize {
+                let mut v4: Vec<ValueId> = Vec::with_capacity(4);
+                for k in 0..4usize {
+                    let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                    let lanev = b.bitcast_f32(lane);
+                    v4.push(b.mul_f32(lanev, fin));
+                }
+                let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
+                let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+                let off = (64 * e + 16 * q) as u32;
+                let f0 = b.bitcast_f32(w0);
+                let f1 = b.bitcast_f32(w1);
+                b.store_f32(o_ptr0, off, f0);
+                b.store_f32(o_ptr0, off + 4, f1);
             }
-            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
-            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
-            let off = (64 * e + 16 * q) as u32;
-            let f0 = b.bitcast_f32(w0);
-            let f1 = b.bitcast_f32(w1);
-            b.store_f32(o_ptr0, off, f0);
-            b.store_f32(o_ptr0, off + 4, f1);
         }
     }
     b.end_if();
@@ -16446,13 +16458,23 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let mut bq: Vec<ValueId> = Vec::with_capacity(2);
     let mut bq1_words: Vec<ValueId> = Vec::new();
     let mut bq0_words: Vec<ValueId> = Vec::new();
+    let qvec = fmha_t_opt("qvec");
     for c in 0..2u32 {
         let qp = b.ptr_add(ptr_q, q_off);
         let mut w: Vec<ValueId> = Vec::with_capacity(8);
-        for i in 0..8u32 {
-            let off = 64 * c + if i < 4 { 4 * i } else { 32 + 4 * (i - 4) };
-            let v = b.load_f32(qp, off);
-            w.push(b.bitcast_i32(v));
+        if qvec {
+            for half in 0..2u32 {
+                let v = b.load_b128(qp, 64 * c + 32 * half);
+                for k in 0..4u8 {
+                    w.push(b.frag4_lane(v, k));
+                }
+            }
+        } else {
+            for i in 0..8u32 {
+                let off = 64 * c + if i < 4 { 4 * i } else { 32 + 4 * (i - 4) };
+                let v = b.load_f32(qp, off);
+                w.push(b.bitcast_i32(v));
+            }
         }
         if c == 1 {
             bq1_words = w.clone();
