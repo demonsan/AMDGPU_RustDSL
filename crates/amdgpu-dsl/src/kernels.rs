@@ -16996,6 +16996,35 @@ pub fn probe_store_x2() -> Function {
     b.finish()
 }
 
+/// Scaled MFMA with an explicit C operand (persistent bias accumulator form): bias = ones x ones (every element 64.0), S = ones x ones + bias (a loop
+/// variable written through `var_mfma_scale_c`, C != dst) = 128.0 in every element; out[tid] = S[0].
+pub fn probe_mfma_cform() -> Function {
+    let mut b = FnBuilder::new("probe_mfma_cform", 64);
+    b.arg("outp", DType::Ptr, 0, 8);
+    let outp = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let c127 = b.c_i32(127);
+    let ones = b.c_i32(0x3838_3838);
+    let a8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let b8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let z = b.frag_zero(DType::Frag16);
+    let bias = b.mfma_scale_fp8(a8, b8, z, c127, c127); // 64.0 everywhere
+    let z2 = b.frag_zero(DType::Frag16);
+    let vars = b.begin_loop(&[(DType::Frag16, Opnd::Val(z2))]);
+    b.var_mfma_scale_c(vars[0], a8, b8, bias, c127, c127);
+    let zero = b.c_i32(0);
+    let stop = b.cmp_lt_i32(zero, c127); // always true: one iteration
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+    let l = b.frag16_lane(Opnd::Var(vars[0]), 0);
+    let lf = b.bitcast_f32(l);
+    let off = b.mul_i32(tid, c4);
+    let po = b.ptr_add(outp, off);
+    b.store_f32(po, 0, lf);
+    b.finish()
+}
+
 pub fn probe_log_store4() -> Function {
     // out[4*tid + j] = log2(in[tid]) for j in 0..4: covers v_log_f32 and global_store_dwordx4 on both backends
     let mut b = FnBuilder::new("probe_log_store4", 64);
