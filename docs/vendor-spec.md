@@ -1355,6 +1355,56 @@ fails early otherwise); (b) **`REF_DUMP2` md5 = `faadf00c...` bit-identical**, s
 (d) same-run per-CU best/median up and filled B4H8S2048/B1H8S8192 absolute close to 1243.5/1853.9;
 (e) auto-path gate 15/15 @16 rows, determinism 5/5, KV-split dispatch unchanged (same chosen kernels).
 
+## 7.10.4 The INST_LEVEL_VMEM anomaly: source, verdict and reducible part
+
+Question: `SQ_INST_LEVEL_VMEM` is 121.7 per wave-iteration for us vs 50.8 for the vendor (2.4x), while
+VMEM instruction count is only 7.6 vs 5.7 and LDS is equal (52.3 vs 52.5); `nodma` is only -3.7% wall.
+Measured on Main `82ff0bf`, own backend, same-run vendor, per wave-iteration (GPU 5).
+
+**Source attribution (counter ablations + static asm).** Baseline: level 121.59, VMEM inst 7.62,
+level/inst **15.95**, wave cycles 1538.4.
+
+| ablation | level/wave | VMEM inst/wave | level/inst | wave cycles/wave | removes |
+|---|---|---|---|---|---|
+| baseline | **121.59** | 7.62 | 15.95 | 1538.4 | - |
+| `nodma` | 82.66 | 3.62 | 22.80 | 1416.7 | K/V staging: 4 inst/wave, **-38.9 level (9.7/inst)** |
+| `nostage` | 78.32 | 3.12 | 25.06 | 1528.6 | + kddma: -4.3 level (small) |
+| `qvec` (prototype: Q 16 scalar -> 4 dwordx4) | **86.62** | 6.88 | 12.60 | **1435.2 (-6.7%)** | **Q prologue: -35.0 level** |
+| `noout` (diagnostic: skip 32 scalar output stores) | 83.33 | 5.56 | 14.98 | **1377.8 (-10.4%)** | **O epilogue stores: -38.3 level** |
+| `qvec+noout` | **49.88** | 4.81 | 10.36 | **1283.3 (-16.6%)** | residual = staging+kddma+descales, **49.9 ~= vendor's whole 50.8** |
+
+Static asm (whole kernel, per role copy): **18 `global_load_dword`** (16 Q prologue + 2 descale loads),
+**32 `global_load_lds_dwordx4`** (K/V staging: 4/wave/tile), **4 `global_load_lds_dword`** (kddma),
+**128 `global_store_dword`** (epilogue: 32 scalar 4-byte output stores per wave). The staging's
+per-instruction level is **9.7 cycles, essentially the vendor's 9.0** (50.8/5.66) - so `global_load_lds`
+accounting is not inflated; the level deficit is the **scalar Q prologue loads (16x 4 B/lane) and the
+scalar output epilogue stores (32x 4 B/lane)**, whose VMEM residence is paid once per launch and
+amortized over the 16 tile iterations. That is why the metric reads 2.4x while the tile-loop DMA
+(`nodma`) is only -3.7% wall: the anomaly is a *prologue/epilogue* cost, not a per-tile DMA cost.
+
+**Verdict: real, reducible, and worth 5-8% per-CU; not an artifact of level accounting.**
+Interleaved timing (8 samples each, same session): base median 390.9 TFLOP/s (best 413.9), `qvec` prototype
+median **415.5** (best 416.6) = **+6.3% median**, consistent with the -6.7% wave-cycle drop (node noisy; a
+clean confirmation is needed). The prototype is **not bit-identical yet** (md5 9d35a02e... vs faadf00c...,
+one bad element on 4 8 2048 - a lane/alignment extraction issue), so it is a candidate implementation, not
+a ready patch; the counter evidence for the *source* is independent of that bug.
+
+**Concrete changes handed to kernel-opt (ranked):**
+1. **Vectorise the Q prologue**: 16 scalar `global_load_dword` (4 B; offsets 0,4,8,12 + 32,36,40,44 per
+   fragment, 16-byte-group aligned) -> **4 `global_load_dwordx4`** (bytes 0,32,64,96) + dword unpack.
+   Expected: level 121.6 -> 86.6, VMEM inst 7.62 -> 6.88, wave cycles -6.7%, **+3-6% per-CU**; md5 gate
+   `faadf00c...` mandatory. One-function change in `fmha_t_build`'s Q-fragment loop.
+2. **Vectorise the epilogue output stores**: the two contiguous dwords at `off, off+4` -> add
+   `GlobalStoreF32x2` (`global_store_dwordx2`, 8 B) + `store_f32x2`; 32 -> 16 stores/wave (or 8 if the
+   lane map allows 16 B groups). Diagnostic removal is -38 level / -10.4% wave cycles; dwordx2 should
+   recover ~half -> **+2-4% per-CU**; bit-identity gate mandatory. (The 8 B chunks are 16 B apart, so
+   dwordx2 is the safe first step; 16 B needs a packing/lane-map check.)
+3. **Do not change kddma or the K/V staging**: kddma is 4.3 level; staging is 38.9 at 9.7 cycles/inst
+   (vendor 9.0) - already vendor-like. `nodma`'s -3.7% is the unavoidable staging cost.
+
+If both are implemented correctly the level should land near the vendor's 50.8 and the per-CU rate should
+gain 5-8% (391 -> 411-422 at 64 blocks), with the prologue part also shrinking the 3.1 us fixed cost.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as
