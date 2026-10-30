@@ -78,7 +78,7 @@ fn the_wait_carries_across_a_block_boundary() {
     let mfma = MInst::new(MOp::VMfma32x32x8F16Z).def(2).srcreg(0).srcreg(1);
     let tmp = MInst::new(MOp::VMovB32).def(3).imm(7);
     let mut m = func(vec![vec![mfma], vec![tmp]], classes());
-    m.blocks[0].term = Term::Br(1);
+    m.blocks[0].term = Term::Goto(1);
     pad_physical_war(&mut m, &alloc(vec![2, 4, 144, 146, 20]));
     let pad: usize = m.blocks[1].insts.iter().take_while(|i| i.op == MOp::SNop).map(|i| i.imm as usize + 1).sum::<usize>()
         + m.blocks[0].insts.iter().rev().take_while(|i| i.op == MOp::SNop).map(|i| i.imm as usize + 1).sum::<usize>();
