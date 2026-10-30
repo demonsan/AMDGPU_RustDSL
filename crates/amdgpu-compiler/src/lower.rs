@@ -549,6 +549,7 @@ impl Lowerer {
         }
         let mut inout_iter = inouts.iter();
         let mut map: Vec<Option<VReg>> = vec![None; block.regs().len()];
+        let n_before_inputs = self.mir.blocks[self.cur].insts.len();
         let mut bound = inputs.iter();
         for p in block.inputs().iter() {
             if p.mutable {
@@ -566,6 +567,15 @@ impl Lowerer {
             };
             self.touch(&[Src::Reg(r)]);
             map[p.reg as usize] = Some(r);
+        }
+        if block.is_pinned() {
+            // the waits for loads the block's inputs depend on must stay at the START of the pinned run: make them explicit so the wait pass keeps them
+            // there instead of re-deriving them in front of the first (possibly mid-run) use
+            for i in &mut self.mir.blocks[self.cur].insts[n_before_inputs..] {
+                if matches!(i.op, MOp::SWaitVm | MOp::SWaitLgkm) {
+                    i.auto = false;
+                }
+            }
         }
         // constants: a one-dword register written once by `v_mov_b32 imm` is the region's cached constant register
         let mut ndefs = vec![0u32; block.regs().len()];

@@ -26,6 +26,7 @@ v_or_b32             | VOrB32        | vop2
 v_xor_b32            | VXorB32       | vop2
 v_lshrrev_b32        | VLshrB32      | vop2_imm0
 v_lshlrev_b32        | VLshlB32      | vop2_imm0
+v_lshrrev_b32_v      | VLshrB32      | vop2
 v_cvt_f32_f16        | VCvtF32F16    | vop1
 v_cvt_f16_f32        | VCvtF16F32    | vop1
 v_mul_lo_u32         | VMulLoU32     | vop3_2

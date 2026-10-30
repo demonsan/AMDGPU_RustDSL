@@ -114,3 +114,68 @@ pub fn global_probe_block() -> AsmBlock {
     s.output(r);
     s.finish().expect("global_probe_block is a verified sequence")
 }
+
+/// The softmax conversion chain of one 8-score group, hand-authored: per pair `v_pk_add_f32` (shift), `v_pk_mul_f32` (scale), `v_cvt_pknorm_u16_f32`,
+/// the svcorr correction (`v_lshrrev_b32 4`, `v_and_b32 mask`, `v_perm_b32`, `v_pk_sub_u16`), then two fp8 P words from the half-write converts
+/// (`v_cvt_scalef32_pk_fp8_bf16` lo/hi on `Pw`), written to LDS with `ds_write_b32`, drained, and read back transposed with `ds_read_b64_tr_b8`.
+/// Ports: inputs = [scores0 (V4), scores1 (V4), delta2 (V2), scale2 (V2), lds address (V1)]; output = the transposed pair (V2). Pinned.
+pub fn cvt_chain_block() -> AsmBlock {
+    let mut s = Seq::new();
+    s.pin();
+    let sc0 = s.input::<4>();
+    let sc1 = s.input::<4>();
+    let delta2 = s.input::<2>();
+    let scale2 = s.input::<2>();
+    let addr = s.input::<1>();
+    let cmask = s.splat(0x0007_0007);
+    let csel = s.splat(0x0c0c_0400);
+    let cscale = s.splat(127);
+    let mut words: Vec<Vgpr<1>> = Vec::new();
+    for sc in [&sc0, &sc1] {
+        let mut ys: Vec<Vgpr<1>> = Vec::new();
+        for j in 0..2u8 {
+            // pair (2j, 2j+1) of the score vector
+            let mut p = s.vgpr::<2>();
+            for (k, lane) in [2 * j, 2 * j + 1].into_iter().enumerate() {
+                let src = match lane {
+                    0 => s.lane::<4, 0>(sc),
+                    1 => s.lane::<4, 1>(sc),
+                    2 => s.lane::<4, 2>(sc),
+                    _ => s.lane::<4, 3>(sc),
+                };
+                let dstv = if k == 0 { s.lane_mut::<2, 0>(&mut p) } else { s.lane_mut::<2, 1>(&mut p) };
+                s.v_mov_b32(dstv, src);
+            }
+            let mut q = s.vgpr::<2>();
+            s.v_pk_add_f32(&mut q, &p, &delta2);
+            let mut r = s.vgpr::<2>();
+            s.v_pk_mul_f32(&mut r, &q, &scale2);
+            let mut u = s.vgpr::<1>();
+            {
+                let (lo, hi) = (s.lane::<2, 0>(&r), s.lane::<2, 1>(&r));
+                s.v_cvt_pknorm_u16_f32(&mut u, lo, hi);
+            }
+            let mut v = s.vgpr::<1>();
+            s.v_lshrrev_b32(&mut v, Imm::<4>::new(), &u);
+            let mut m = s.vgpr::<1>();
+            s.v_and_b32(&mut m, &cmask, &v);
+            let mut x = s.vgpr::<1>();
+            s.v_perm_b32(&mut x, &m, &m, &csel);
+            let mut y = s.vgpr::<1>();
+            s.v_pk_sub_u16(&mut y, &u, &x);
+            ys.push(y);
+        }
+        let d = s.vgpr::<1>();
+        let pw = s.partial(d);
+        let pw = s.v_cvt_scalef32_pk_fp8_bf16_lo(pw, &ys[0], &cscale);
+        let pw = s.v_cvt_scalef32_pk_fp8_bf16_hi(pw, &ys[1], &cscale);
+        words.push(pw.done());
+    }
+    s.ds_write_b32::<0>(&addr, &words[0]);
+    s.ds_write_b32::<4>(&addr, &words[1]);
+    s.wait_lgkm_all();
+    let t = s.vgpr::<2>();
+    let t = s.ds_read_b64_tr_b8::<0, _>(t, &addr).wait(&mut s);
+    s.output(t);
+    s.finish().expect("cvt_chain_block is a verified sequence")
+}

@@ -94,7 +94,7 @@ impl Seq {
         let issued = self.clock;
         self.push(inst("VMfmaScale32x32x64Fp8", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(acc.id), ASrc::Reg(sa.id), ASrc::Reg(sb.id)]));
         self.note_write(acc.id, MATRIX_RESULT);
-        Mfma { issued, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
+        Mfma { issued, lat: MATRIX_RESULT, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
     }
 
     /// The same with an implicit zero accumulator (`D = A x B`): `acc` is only written.
@@ -102,7 +102,16 @@ impl Seq {
         let issued = self.clock;
         self.push(inst("VMfmaScale32x32x64Fp8Z", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(sa.id), ASrc::Reg(sb.id)]));
         self.note_write(acc.id, MATRIX_RESULT);
-        Mfma { issued, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
+        Mfma { issued, lat: MATRIX_RESULT, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
+    }
+
+    /// `v_mfma_f32_32x32x8_f16 acc, a, b, 0` (the bias MFMA): implicit zero accumulator, `A` and `B` are 2-dword f16 fragments. A different opcode from
+    /// the scaled MFMA: a scaled MFMA that accumulates into this result needs the full result latency (`retire`: 12 wait states), not the in-place chain.
+    pub fn v_mfma_f32_32x32x8_f16_zero<'a>(&mut self, acc: Vgpr<16>, a: Ready<'a, 2>, b: Ready<'a, 2>) -> Mfma<'a, OP_MFMA_F16_ZERO> {
+        let issued = self.clock;
+        self.push(inst("VMfma32x32x8F16Z", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id)]));
+        self.note_write(acc.id, MATRIX_RESULT_F16);
+        Mfma { issued, lat: MATRIX_RESULT_F16, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
     }
 
     /// `v_smfmac_f32_16x16x128_fp8_fp8 acc, a_sparse, b, idx`: the accumulator C is `acc` itself (implicit in the ISA, explicit here).
@@ -243,7 +252,7 @@ impl<'a> Mfma<'a, OP_MFMA_SCALE> {
         let acc = self.acc.take().expect("accumulator");
         s.push(inst("VMfmaScale32x32x64Fp8", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(acc.id), ASrc::Reg(sa.id), ASrc::Reg(sb.id)]));
         s.note_write(acc.id, MATRIX_RESULT);
-        Mfma { issued, acc: Some(acc), poison: s.poison.clone(), _p: PhantomData }
+        Mfma { issued, lat: MATRIX_RESULT, acc: Some(acc), poison: s.poison.clone(), _p: PhantomData }
     }
 }
 
@@ -268,6 +277,7 @@ pub const HAND_WRITTEN_OPS: &[(&str, &str, &str)] = &[
     ("v_readfirstlane_b32", "VReadFirstLane", "Ready operand"),
     ("v_mfma_scale_f32_32x32x64_f8f6f4", "VMfmaScale32x32x64Fp8", "matrix token (chainable)"),
     ("v_mfma_scale_f32_32x32x64_f8f6f4_zero", "VMfmaScale32x32x64Fp8Z", "matrix token"),
+    ("v_mfma_f32_32x32x8_f16_zero", "VMfma32x32x8F16Z", "matrix token (12-state result)"),
     ("v_smfmac_f32_16x16x128_fp8_fp8", "VSmfmac16x16x128Fp8", "matrix token (chainable)"),
     ("ds_read_b128", "LdsReadB128", "Pending (lgkmcnt)"),
     ("ds_read_b32", "LdsReadB32", "Pending (lgkmcnt)"),
