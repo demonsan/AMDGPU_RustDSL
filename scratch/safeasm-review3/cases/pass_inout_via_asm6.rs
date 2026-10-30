@@ -17,7 +17,8 @@ fn main() {
     let pa = f.frag8(c0, c0, c0, c0, c0, c0, c0, c0);
     let pb = f.frag8(c0, c0, c0, c0, c0, c0, c0, c0);
     let _r = f.asm(blk, &[Opnd::Val(acc), Opnd::Val(a_rs), Opnd::Val(pa), Opnd::Val(pb), Opnd::Val(c3), Opnd::Val(c4)]);
-    f.store_f32(o, 0, c0);
+    let zero = f.c_f32(0.0);
+    f.store_f32(o, 0, zero);
     let func = f.finish();
     println!("  DSL verify = {:?}", amdgpu_dsl::verify(&func));
     println!("  compile    = {:?}", compile(&func).map(|c| format!("Ok({} vgpr, {} sgpr)", c.vgpr, c.sgpr)).map_err(|e| e.chars().take(300).collect::<String>()));
