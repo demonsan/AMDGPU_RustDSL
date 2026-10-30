@@ -10566,7 +10566,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
         b.begin_if(Opnd::Val(wave_live));
         let fused = kv.counters.is_some();
-        if fused { b.store_f32_wt(l_ptr, 0, lse_v); } else { b.store_f32(l_ptr, 0, lse_v); }
+        let fwt = fused && !ablate.contains("fnowt"); // fnowt (diagnostic): plain stores
+        if fwt { b.store_f32_wt(l_ptr, 0, lse_v); } else { b.store_f32(l_ptr, 0, lse_v); }
         if p16 && !ablate.contains("nopartial") {
             // fp16 partials through the same LDS transpose as the fp32 path, two fragments (64 dims = 128 bytes per row) per round
             let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
@@ -10655,7 +10656,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.wait_lds(0);
                 for i in 0..4usize {
                     let v = b.load_lds_b128(Opnd::Val(raddr[i]));
-                    if fused { b.store_f32x4_wt(gptr[i], (128 * pr) as u32, v); } else { b.store_f32x4(gptr[i], (128 * pr) as u32, v); }
+                    if fwt { b.store_f32x4_wt(gptr[i], (128 * pr) as u32, v); } else { b.store_f32x4(gptr[i], (128 * pr) as u32, v); }
                 }
                 b.wait_lds(0);
             }
@@ -10683,6 +10684,15 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let old0 = b.read_first_lane(Opnd::Val(old));
                 let c_last = b.c_i32(nsp as i32 - 1);
                 let is_last = b.let_(Op::CmpGeI32(Opnd::Val(old0), Opnd::Val(c_last)));
+                if ablate.contains("fnocomb") {
+                    // diagnostic: ticket only (no reduction, no counter reset: counters wrap, nobody cares)
+                    let zf0 = b.c_f32(0.0);
+                    b.begin_if(Opnd::Val(is_last));
+                    b.store_f32_wt(cptr, 0, zf0);
+                    b.end_if();
+                    b.end_if();
+                    return;
+                }
                 b.begin_if(Opnd::Val(is_last));
                 if lite { b.fence_acquire_lite(); } else { b.fence_acquire(); }
                 let rows_tot = b.let_(Op::KernargI32 { offset: 0x284 });
