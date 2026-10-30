@@ -39,9 +39,12 @@ fn then_fence(x: &Effects, f: Fence, alu_across: bool) -> bool {
     }
 }
 
+/// Per-kernel switch (set by `compile_mir` for `_vs6`) or the env var `AMDC_PIN_VMWAIT=1`.
+pub static PIN_VMWAIT_KERNEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn pin_vm_wait() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("AMDC_PIN_VMWAIT").map_or(false, |v| v == "1"))
+    PIN_VMWAIT_KERNEL.load(std::sync::atomic::Ordering::Relaxed) || *V.get_or_init(|| std::env::var("AMDC_PIN_VMWAIT").map_or(false, |v| v == "1"))
 }
 
 /// Must `a` (earlier in program order) stay before `b` because of memory / fence semantics?

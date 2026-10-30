@@ -36,6 +36,7 @@ pub fn compile_mir_alloc(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, re
 
 /// The final (allocated, scheduled, hazard-padded) MIR of a kernel, for model reports.
 pub fn compile_mir(f: &amdgpu_dsl::Function) -> Result<mir::MFunction, String> {
+    sched::order::PIN_VMWAIT_KERNEL.store(f.name.ends_with("_vs6"), std::sync::atomic::Ordering::Relaxed);
     lower_and_allocate(f).map(|(m, _)| m)
 }
 
