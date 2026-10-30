@@ -32,7 +32,9 @@ pub fn check(m: &MFunction) -> Vec<String> {
                 continue;
             }
             if let Some(o) = orig.insts.get(oi) {
-                if o.pin && pending_nops > 0 {
+                // padding at the BOUNDARY of a run (against an instruction outside it) is the pass's normal work; padding INSIDE the run changes the schedule
+                let inside = oi > 0 && orig.insts[oi - 1].pin;
+                if o.pin && inside && pending_nops > 0 {
                     errs.push(format!("block {bi} inst {oi} ({:?}): the value-hazard pass would pad {pending_nops} s_nop before this pinned instruction (the sequence's own padding is weaker than the pass's rules)", o.op));
                 }
             }
@@ -50,7 +52,13 @@ pub fn check(m: &MFunction) -> Vec<String> {
     for (bi, b) in w.blocks.iter().enumerate() {
         let _ = before[bi];
         for k in 1..b.insts.len() {
-            if b.insts[k - 1].auto && matches!(b.insts[k - 1].op, MOp::SWaitVm | MOp::SWaitLgkm) && b.insts[k].pin {
+            // an automatic wait at the boundary of a run (before its first instruction) covers loads issued outside; one INSIDE the run is a violation
+            let mut back = k;
+            while back > 0 && b.insts[back - 1].auto && matches!(b.insts[back - 1].op, MOp::SWaitVm | MOp::SWaitLgkm) {
+                back -= 1;
+            }
+            let inside = back > 0 && b.insts[back - 1].pin;
+            if inside && b.insts[k - 1].auto && matches!(b.insts[k - 1].op, MOp::SWaitVm | MOp::SWaitLgkm) && b.insts[k].pin {
                 errs.push(format!("block {bi}: pinned {:?} needs an automatic {:?}({}) the sequence did not provide (its explicit s_waitcnt do not cover an outstanding load it reads)", b.insts[k].op, b.insts[k - 1].op, b.insts[k - 1].imm));
             }
         }

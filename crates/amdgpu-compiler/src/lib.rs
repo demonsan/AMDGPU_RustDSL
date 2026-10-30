@@ -262,6 +262,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_dma" => Some(amdgpu_dsl::kernels::probe_dma()),
         "probe_safeasm_e2e" => Some(amdgpu_dsl::kernels::probe_safeasm_e2e()),
         "probe_log_store4" => Some(amdgpu_dsl::kernels::probe_log_store4()),
+        "probe_cvtchain_dsl" => Some(amdgpu_dsl::kernels::probe_cvtchain_dsl()),
+        "probe_cvtchain_asm" => Some(amdgpu_dsl::kernels::probe_cvtchain_asm()),
         "probe_la8" => Some(amdgpu_dsl::kernels::probe_la8()),
         "probe_la8_lite" => Some(amdgpu_dsl::kernels::probe_la8_lite()),
         "probe_la8_plain_fenced" => Some(amdgpu_dsl::kernels::probe_la8_plain_fenced()),

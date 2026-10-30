@@ -679,3 +679,27 @@ fn var_asm_n_binds_inout_ports_in_declaration_order() {
     assert_eq!(smf(&fa), 2);
     assert_eq!(smf(&fa), smf(&fd));
 }
+/// The safe-asm conversion chain (pinned block: DS write/transposed read, pk_add/mul, pknorm, svcorr, scalef32 lo/hi) emits the SAME sequence of
+/// chain instructions as the DSL path of the same phase (the DSL path adds its own address `v_add` and copies; the chain ops and their order match).
+#[test]
+fn cvt_chain_instruction_sequence_matches_the_dsl_path() {
+    use amdgpu_compiler::backend::OwnTail;
+    let chain = |name: &str| -> Vec<String> {
+        let f = amdgpu_compiler::kernel_by_name(name).unwrap();
+        let asm = amdgpu_compiler::compile_with(&f, &OwnTail).unwrap().asm;
+        asm.lines()
+            .map(|l| l.trim().split_whitespace().next().unwrap_or("").to_string())
+            .filter(|m| {
+                matches!(
+                    m.as_str(),
+                    "v_pk_add_f32" | "v_pk_mul_f32" | "v_cvt_pknorm_u16_f32_e32" | "v_cvt_pknorm_u16_f32" | "v_lshrrev_b32_e32" | "v_and_b32_e32" | "v_perm_b32" | "v_pk_sub_u16"
+                        | "v_cvt_scalef32_pk_fp8_bf16" | "ds_write_b32" | "ds_read_b64_tr_b8"
+                )
+            })
+            .collect()
+    };
+    let d = chain("probe_cvtchain_dsl");
+    let a = chain("probe_cvtchain_asm");
+    assert!(d.len() >= 30, "unexpectedly short chain: {d:?}");
+    assert_eq!(a, d, "safe-asm chain differs from the DSL chain");
+}
