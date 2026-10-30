@@ -9716,12 +9716,41 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.load_global_lds(sp, lbase, -(1024 * (3 - q)), 4);
         }
     };
+    // kddma: the K-scale dwords go straight from global memory into the LDS K-scale ring with `global_load_lds_dword` (no VGPR round trip, no ds_write, the
+    // same vmcnt wait as the K tile): wave w (waves 2, 3 duplicate waves 0, 1) covers rows 64 (w & 1) + lane, written to lds_kd + slot*512 + 4 row
+    let kddma = fmha_t_opt("kddma");
+    let kd_dma = |b: &mut FnBuilder, key0: ValueId, slot_off: ValueId| {
+        let wlo = b.let_(Op::AndI32(Opnd::Val(cx.wave4), Opnd::Val(c1)));
+        let w64r = b.shl_i32(wlo, c6d);
+        let kr0 = b.add_i32(key0, w64r);
+        let kr1 = b.add_i32(kr0, lane_v);
+        let kok = b.cmp_lt_i32(kr1, cx.kv_len);
+        let krow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kok), a: Opnd::Val(kr1), b: Opnd::Val(cx.kv_last) });
+        let kdr = b.mul_i32(krow, hq4_d);
+        let kdo = b.add_i32(kdr, cx.kd_base);
+        let kdp_ptr = b.ptr_add(cx.ptr_kd, kdo);
+        let kslot = b.let_(Op::LshrI32(Opnd::Val(slot_off), Opnd::Val(c6d)));
+        let c256w = b.c_i32(256);
+        let wl256 = b.mul_i32(wlo, c256w);
+        let ka = b.add_i32(lds_kd, kslot);
+        let kb = b.add_i32(ka, wl256);
+        b.load_global_lds(kdp_ptr, kb, 0, 1);
+    };
     // stage a tile into ring slot `slot_off` (K scales of role A at `kd_slot`) and wait for it
     let stage_start = |b: &mut FnBuilder, key0: ValueId, slot_off: ValueId| -> Option<ValueId> {
         if no_stage {
             return None;
         }
-        let kd = if role_a && !kdglob { Some(kd_row_load(b, key0)) } else { None };
+        let kd = if role_a && !kdglob {
+            if kddma {
+                kd_dma(b, key0, slot_off);
+                None
+            } else {
+                Some(kd_row_load(b, key0))
+            }
+        } else {
+            None
+        };
         dma_issue(b, key0, slot_off);
         kd
     };
@@ -10352,8 +10381,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             if !ablate.contains("novmwait") {
                 b.wait_vm(0);
             }
-            let a = b.add_i32(kdb0, kds_nxt);
-            b.store_lds_b32(Opnd::Val(a), Opnd::Var(kdp));
+            if !kddma {
+                let a = b.add_i32(kdb0, kds_nxt);
+                b.store_lds_b32(Opnd::Val(a), Opnd::Var(kdp));
+            }
         }
         if !noprio {
             b.set_prio(1);
