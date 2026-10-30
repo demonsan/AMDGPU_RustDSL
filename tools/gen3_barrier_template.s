@@ -101,6 +101,10 @@ Ldone___NAME__:
     .amdhsa_kernarg_size 16
     .amdhsa_user_sgpr_count 2
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    .amdhsa_system_sgpr_workgroup_id_x 1
+    .amdhsa_system_sgpr_workgroup_id_y 1
+    .amdhsa_system_sgpr_workgroup_id_z 1
+    .amdhsa_system_vgpr_workitem_id 0
     .amdhsa_next_free_vgpr 40
     .amdhsa_next_free_sgpr 24
     .amdhsa_accum_offset 40
