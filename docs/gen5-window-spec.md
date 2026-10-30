@@ -125,3 +125,20 @@ swaps are *not* expected to move performance by themselves (they re-express inst
 timing after EACH swap - so that any gain or loss is attributed to the block that caused it. The gen5 window is also not just a reordering: it changes the cross-barrier contract (section 7: `_vs128` has the QK(t+1) MFMAs
 in flight at barrier B2, gen5 retires them inside the window), so a timing difference after Block B includes that effect. Reporting format for every step: asm md5 (emitted `.s`) AND the bf16 output-dump md5 (`REF_DUMP2`, 4194304
 bytes for B1H8S2048) next to kernel-occ's frozen table.
+
+## 9. Results so far (kernel-opt) and a correction to section 3 (Block B is not valid with the current ring)
+**Measured, own backend, B1H8S2048 (`_vs128` 387.6-389.7 TFLOP/s in the same runs):**
+| block | md5 (REF_DUMP2) | 15 shapes / det | TFLOP/s | verdict |
+|---|---|---|---|---|
+| C: PV + SMFMAC pinned (`winc`) | identical (6 shapes) | 15/15, 5/5 | 375.5 (1-step read lookahead) / 380 (2-step) | -3.3% / -2.5% (pinning the PV half alone removes the PV/QK interleave) |
+| M: whole M phase pinned (`winm`, lookahead 1) | identical (4 shapes) | 15/15, parity 15/15, 5/5 x3 | 389.7-391.3 vs 389.1-389.7 | +0.5% (neutral base); B4H8S2048 / B1H8S8192 within +-0.8% |
+| M with a 2-item read lookahead | identical | - | 375.5 | -3.1% (+8 VGPR of operand buffers: the list scheduler no longer fits and falls back to unscheduled code for the whole kernel) |
+**Correction (found while writing Block B):** section 3 puts the 12 QK(t+1) MFMAs and the K-fragment reads of tile t+1 into the V window of tile t. With the `_vs128` 2-slot ring that is not
+possible: the DMA of tile t+1 (K, K scales, V) is issued at the START of V(t) and only waited (`vmcnt(0)`) at the END of V(t), before barrier B1; K(t+1) is therefore not in LDS while the V-window VALU
+runs, and the QK(t+1) reads/MFMAs can only issue after B1, i.e. in the M window (where Block M already has them, interleaved with PV). A valid Block B needs the K tile one tile EARLIER than today: K(t+1)
+issued at V(t-1) (it can be: the K region of slot (t+1)%2 is free after QK(t-1), which would then have run in V(t-2)... i.e. the K ring runs one tile ahead of V), waited before V(t) starts, and K(t+2) issued at
+V(t) start. That is exactly the merged-window structure that the earlier DSL experiments `_g2/_g3/_g3o` built (3-slot ring, QK(t+1) inside the V window, 1-2 barriers) and measured at -9% / -6% / -9%
+(333.4-344.2 vs 367 TFLOP/s at that time), with the asm checked to contain the intended interleave (QK MFMAs between the conversion VALU, partial waits), so a hand-authored pinned version of the same order is
+expected to reproduce that result rather than the +5..+11% of the optimistic range: what hurt those variants was the phase imbalance across the two wave groups (the V window grows by ~0.5k cycles of matrix work while the M window
+shrinks, and the half-tile offset between the groups no longer lines the two windows up), not the instruction order inside the window. The conversion chain itself (per word `v_cvt_pknorm_u16_f32` x2 +
+`v_cvt_scalef32_pk_fp8_bf16` lo/hi on a partial-write register; no pk_add/pk_mul: those 32+32 instructions belong to the rollback branch) is already available as typed ops.
