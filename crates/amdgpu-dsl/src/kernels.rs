@@ -10343,6 +10343,11 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             pv_w(b, slot_cur, &w);
         } else {
             pv_w(b, slot_cur, &w);
+            if stage && fmha_t_opt("midbar") && !no_bar {
+                // midbar: a third barrier per tile between PV and QK (finer phase granularity: the partner group may start its VALU earlier)
+                b.wait_lds(0);
+                b.barrier();
+            }
             if stage {
                 qk(b, slot_nxt, kds_nxt, kdg.as_deref());
             }
