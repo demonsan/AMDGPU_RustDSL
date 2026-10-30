@@ -11406,7 +11406,10 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let key_n = b.shl_i32(nn, c7d);
         (i1, slot_cur, slot_nxt, slot_nxt, kds_nxt, key_n, kds_cur)
     };    // QK of the whole tile (4 x 32 keys) in ring slot `slot`: S' = bias + scaled K.Q^T, in place
-    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId, kdv: Option<&[ValueId]>, bias_v: ValueId| {
+    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId, kdv: Option<&[ValueId]>, bias_v: ValueId, tl0: usize, tl1: usize| {
+        if tl0 >= tl1 {
+            return;
+        }
         if no_qk {
             return;
         }
@@ -11449,7 +11452,7 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         } else {
             None
         };
-        for s in 0..4usize {
+        for s in tl0..tl1 {
             if biasf_once.is_none() && !fmha_t_opt("biasv") {
                 b.var_mfma_f16_z(s_vars[s], ones_f16, Opnd::Val(bias_v));
             }
@@ -11799,7 +11802,8 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 chain(b, ps[0], ps[1]);
             }
         }
-    };    let iter = |b: &mut FnBuilder, masked: bool, stage: bool, last_barrier: bool| {
+    };    let qkv_n: usize = fmha_t_num("qkv").map(|v| v as usize).unwrap_or(4).min(4); // QK(t+1) tiles issued in the V window (the rest in the M window)
+    let iter = |b: &mut FnBuilder, masked: bool, stage: bool, last_barrier: bool| {
         let (_i1, slot_cur, slot_nxt, slot_n2, kds_nxt, key_n2, _kds_cur) = ring(b);
         // V phase (the DMA of tile t+2 runs under it, waited for at its end); M phase: PV(this tile) + QK(next tile)
         // _vs6: group A stages K(t+2) (+ scales) into the K region of the slot of tile t (free: QK(t) ran in the V window of tile t-1), waited at the end of M(t);
@@ -11814,7 +11818,7 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let bias_now = w.pop().expect("bias word");
         if stage {
             // QK(t+1) (K(t+1) is already in LDS) right after the conversion of S(t): each S tile is overwritten as soon as its scores were consumed
-            qk(b, slot_nxt, kds_nxt, None, bias_now);
+            qk(b, slot_nxt, kds_nxt, None, bias_now, 0, qkv_n);
         }
         if stage && !role_a && !ablate.contains("novmwait") {
             b.wait_vm(0); // group B: V(t+1) landed
@@ -11924,6 +11928,10 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.var_asm_n(&[s_vars[0], s_vars[1], s_vars[2], s_vars[3], o_vars[0], o_vars[1], o_vars[2], o_vars[3], la], pv_qk_window_block(), &ins);
         } else {
             pv_w(b, slot_cur, &w);
+            if stage {
+                // the remaining QK tiles (qkv < 4) stay in the M window after PV
+                qk(b, slot_nxt, kds_nxt, None, bias_now, qkv_n, 4);
+            }
             if false && stage && fmha_t_opt("midbar") && !no_bar {
                 // midbar: a third barrier per tile between PV and QK (finer phase granularity: the partner group may start its VALU earlier)
                 b.wait_lds(0);
