@@ -417,7 +417,6 @@ int main(int argc, char** argv) {
             std::printf("our kernel vs vendor kernel (all %zu outputs): worst_diff=%.4e mean_diff=%.4e\n", no, wd, md / no);
             if (const char* dump2 = std::getenv("REF_DUMP2")) { FILE* fo = std::fopen(dump2, "wb"); std::fwrite(out2.data(), 2, no, fo); std::fclose(fo); }
         }
-    }
     }    if (const char* dump = std::getenv("REF_DUMP")) {
         FILE* fo = std::fopen(dump, "wb");
         std::fwrite(out.data(), 2, no, fo);
