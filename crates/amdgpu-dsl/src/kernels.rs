@@ -10934,6 +10934,11 @@ fn emit_fmha_g2_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
     };
     // VALU phase of the whole tile: ONE max / rollback decision over its 64 scores, then P (16 words)
+    // conversion constants shared by all per-tile calls
+    let c4s = b.c_i32(4);
+    let cmk = b.c_i32(0x0007_0007);
+    let lut_lo = b.c_i32(i32::from_le_bytes([0, 6, 9, 11]));
+    let lut_hi = b.c_i32(i32::from_le_bytes([11, 10, 7, 3]));
     let valu = |b: &mut FnBuilder, masked: bool, do_decide: bool, t0: usize, t1: usize| -> Vec<ValueId> {
         let mut words_out: Vec<ValueId> = Vec::with_capacity(16);
         if no_valu {
@@ -11073,10 +11078,6 @@ fn emit_fmha_g2_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         b.end_if();
         }
-        let c4s = b.c_i32(4);
-        let cmk = b.c_i32(0x0007_0007);
-        let lut_lo = b.c_i32(i32::from_le_bytes([0, 6, 9, 11]));
-        let lut_hi = b.c_i32(i32::from_le_bytes([11, 10, 7, 3]));
         for s in t0..t1 {
             let mut xs: Vec<ValueId> = Vec::with_capacity(16);
             for r in 0..16u8 {
