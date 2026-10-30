@@ -35,7 +35,7 @@ fn main() {
         let (m, k, form) = (f[0], f[1], f[2]);
         let want = match form {
             "vop1" => 1,
-            "vop2" | "vop2_imm0" | "vop3_2" | "cmp" | "store_vm" => 2,
+            "vop2" | "vop2_imm0" | "vop3_2" | "cmp" | "store_vm" | "store_vm2" | "store_vm4" => 2,
             "vop3_3" => 3,
             other => panic!("opspec.tbl:{}: unknown form `{other}`", n + 1),
         };
@@ -66,6 +66,10 @@ fn main() {
             }
             "store_vm" => {
                 let _ = write!(out, "    /// `{m} vaddr[2], vdata offset:N`: occupies a vmcnt slot, no value comes back (generated from opspec.tbl: `{k}`).\n    pub fn {m}(&mut self, addr: &impl Readable<2>, data: &impl Readable<1>, offset: i32) {{\n        self.push(AInst {{ op: \"{k}\", dst: None, srcs: vec![ASrc::Reg(addr.reg_id()), ASrc::Reg(data.reg_id())], imm: offset as i64 }});\n        self.issue_store(Queue::Vm);\n    }}\n\n");
+            }
+            "store_vm2" | "store_vm4" => {
+                let w = if form == "store_vm2" { 2 } else { 4 };
+                let _ = write!(out, "    /// `{m} vaddr[2], vdata[{w}] offset:N`: occupies a vmcnt slot, no value comes back (generated from opspec.tbl: `{k}`).\n    pub fn {m}(&mut self, addr: &impl Readable<2>, data: &impl Readable<{w}>, offset: i32) {{\n        self.push(AInst {{ op: \"{k}\", dst: None, srcs: vec![ASrc::Reg(addr.reg_id()), ASrc::Reg(data.reg_id())], imm: offset as i64 }});\n        self.issue_store(Queue::Vm);\n    }}\n\n");
             }
             _ => unreachable!(),
         }
