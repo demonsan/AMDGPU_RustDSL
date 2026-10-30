@@ -15842,6 +15842,14 @@ pub fn pv_window_block() -> amdgpu_safeasm::AsmBlock {
             [s.ds_read_b64_tr_b8::<8192, _>(d0, addr), s.ds_read_b64_tr_b8::<10240, _>(d1, addr), s.ds_read_b64_tr_b8::<12288, _>(d2, addr), s.ds_read_b64_tr_b8::<14336, _>(d3, addr)]
         }
     }
+    /// wait for the four reads of one operand with ONE s_waitcnt (the last-issued read first: it implies the older three)
+    fn wait4(s: &mut Seq, p: [Pending<SubMut<'_, 2>>; 4]) {
+        let [p0, p1, p2, p3] = p;
+        let _ = p3.wait(s);
+        let _ = p2.wait(s);
+        let _ = p1.wait(s);
+        let _ = p0.wait(s);
+    }
     let mut s = Seq::new();
     s.pin();
     let o0 = s.inout::<16>();
@@ -15872,38 +15880,38 @@ pub fn pv_window_block() -> amdgpu_safeasm::AsmBlock {
     let trb = [&trb0, &trb1, &trb2, &trb3];
     let p0 = rd(&mut s, &mut v0, trb[0], 0);
     let p1 = rd(&mut s, &mut v1, trb[1], 0);
-    for pk in p0 { let _ = pk.wait(&mut s); }
+    let p2 = rd(&mut s, &mut v2, trb[2], 0);
+    wait4(&mut s, p0);
     let rv0 = s.ready(&v0);
     let t0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o0, rv0, rpa, rs127, rs123);
-    let p2 = rd(&mut s, &mut v2, trb[2], 0);
-    for pk in p1 { let _ = pk.wait(&mut s); }
+    let p3 = rd(&mut s, &mut v3, trb[3], 0);
+    wait4(&mut s, p1);
     let rv1 = s.ready(&v1);
     let t1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o1, rv1, rpa, rs127, rs123);
-    let p3 = rd(&mut s, &mut v3, trb[3], 0);
-    for pk in p2 { let _ = pk.wait(&mut s); }
+    let p4 = rd(&mut s, &mut v4, trb[0], 1);
+    wait4(&mut s, p2);
     let rv2 = s.ready(&v2);
     let t2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o2, rv2, rpa, rs127, rs123);
     let ts = s.v_smfmac_f32_16x16x128_fp8_fp8(la, rra, rpa, ri01);
     let ts = ts.chain(&mut s, rra, rpb, ri01);
-    let p4 = rd(&mut s, &mut v4, trb[0], 1);
-    for pk in p3 { let _ = pk.wait(&mut s); }
+    let p5 = rd(&mut s, &mut v5, trb[1], 1);
+    wait4(&mut s, p3);
     let rv3 = s.ready(&v3);
     let t3 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o3, rv3, rpa, rs127, rs123);
-    let p5 = rd(&mut s, &mut v5, trb[1], 1);
-    for pk in p4 { let _ = pk.wait(&mut s); }
+    let p6 = rd(&mut s, &mut v6, trb[2], 1);
+    wait4(&mut s, p4);
     let rv4 = s.ready(&v4);
     let t0 = t0.chain(&mut s, rv4, rpb, rs127, rs123);
-    let p6 = rd(&mut s, &mut v6, trb[2], 1);
-    for pk in p5 { let _ = pk.wait(&mut s); }
+    let p7 = rd(&mut s, &mut v7, trb[3], 1);
+    wait4(&mut s, p5);
     let rv5 = s.ready(&v5);
     let t1 = t1.chain(&mut s, rv5, rpb, rs127, rs123);
     let ts = ts.chain(&mut s, rra, rpa, ri23);
     let ts = ts.chain(&mut s, rra, rpb, ri23);
-    let p7 = rd(&mut s, &mut v7, trb[3], 1);
-    for pk in p6 { let _ = pk.wait(&mut s); }
+    wait4(&mut s, p6);
     let rv6 = s.ready(&v6);
     let t2 = t2.chain(&mut s, rv6, rpb, rs127, rs123);
-    for pk in p7 { let _ = pk.wait(&mut s); }
+    wait4(&mut s, p7);
     let rv7 = s.ready(&v7);
     let t3 = t3.chain(&mut s, rv7, rpb, rs127, rs123);
     let ex0 = t0.exit();
