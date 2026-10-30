@@ -1155,6 +1155,8 @@ impl Lowerer {
                     self.pending_vmem.clear();
                     if *inv {
                         self.push(MInst::new(MOp::BufferInv));
+                        // BUFFER_INV returns an ACK through VM_CNT: wait for it before the first coherent load (strict full sequence)
+                        self.push(MInst::new(MOp::SWaitVm).imm(0));
                     }
                 }
                 Stmt::StoreF32x4 { base, byte_off, value } => {
