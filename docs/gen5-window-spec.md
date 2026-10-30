@@ -118,3 +118,10 @@ check at every step.
 * Straight-line blocks end at every `s_barrier` and at the branch: the asm blocks never span a barrier (the loop contract carries the (drained) wait clock across it).
 **Integration switch**: `_vs5` with `FMHA_OPT=winasm` (`vs5_winasm_requested()` in `kernels.rs`, called at the top of `emit_fmha_vs128_role`; today it stops with an explicit message because the ops do not exist
 yet); without the flag `_vs5` is byte-identical to `_vs128` (control point). Swap order: Block C -> Block A -> Block B, each verified by md5 (same arithmetic) + 15 shapes + determinism.
+
+## 8. Where the gain is expected, and how it is attributed
+The win is expected from **Block B** (QK(t+1) issued under the V-side VALU, i.e. the in-wave overlap that the scheduler never produced). Block C (PV + SMFMAC) and Block A (max chain + decision + DMA issue)
+swaps are *not* expected to move performance by themselves (they re-express instructions the scheduler already emits in about this order) and are gated separately - md5 (same arithmetic) + 15 shapes + determinism +
+timing after EACH swap - so that any gain or loss is attributed to the block that caused it. The gen5 window is also not just a reordering: it changes the cross-barrier contract (section 7: `_vs128` has the QK(t+1) MFMAs
+in flight at barrier B2, gen5 retires them inside the window), so a timing difference after Block B includes that effect. Reporting format for every step: asm md5 (emitted `.s`) AND the bf16 output-dump md5 (`REF_DUMP2`, 4194304
+bytes for B1H8S2048) next to kernel-occ's frozen table.
