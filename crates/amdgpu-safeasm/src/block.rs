@@ -47,6 +47,8 @@ pub struct AInst {
 pub struct AsmPort {
     pub reg: u32,
     pub class: AClass,
+    /// An in/out port (`Seq::inout`): bound to a loop variable's own register, which the sequence updates in place.
+    pub mutable: bool,
 }
 
 /// A verified sequence. Only `Seq::finish` can create one (the fields are private), and creation runs the hazard verifier, so a block

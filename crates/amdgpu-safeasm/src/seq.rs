@@ -136,8 +136,19 @@ impl Seq {
         Wd<N>: VectorWidth,
     {
         let r = self.vgpr::<N>();
-        self.inputs.push(AsmPort { reg: r.id, class: <Wd<N> as VectorWidth>::CLASS });
+        self.inputs.push(AsmPort { reg: r.id, class: <Wd<N> as VectorWidth>::CLASS, mutable: false });
         In { id: r.id }
+    }
+
+    /// A register tuple the kernel owns and the sequence UPDATES IN PLACE (a loop variable, bound by `Stmt::VarAsm`). Writable, unlike `input`;
+    /// hand it back with `output` / `output_exit`.
+    pub fn inout<const N: usize>(&mut self) -> Vgpr<N>
+    where
+        Wd<N>: VectorWidth,
+    {
+        let r = self.vgpr::<N>();
+        self.inputs.push(AsmPort { reg: r.id, class: <Wd<N> as VectorWidth>::CLASS, mutable: true });
+        r
     }
 
     /// Hand a finished register tuple back to the kernel as the sequence's result (consumes it: it cannot be used afterwards).
@@ -145,7 +156,7 @@ impl Seq {
     where
         Wd<N>: VectorWidth,
     {
-        self.outputs.push(AsmPort { reg: r.id, class: <Wd<N> as VectorWidth>::CLASS });
+        self.outputs.push(AsmPort { reg: r.id, class: <Wd<N> as VectorWidth>::CLASS, mutable: false });
     }
 
     /// Hand back a result whose matrix write is still in flight; the consumer after the sequence is padded by the compiler's hazard pass.
@@ -155,7 +166,7 @@ impl Seq {
     {
         let owed = MATRIX_RESULT.saturating_sub(self.clock - (e.issued + 1));
         self.exit_in_flight.push((e.id, owed));
-        self.outputs.push(AsmPort { reg: e.id, class: <Wd<N> as VectorWidth>::CLASS });
+        self.outputs.push(AsmPort { reg: e.id, class: <Wd<N> as VectorWidth>::CLASS, mutable: false });
     }
 
     /// A one-dword register holding the constant `k` (`v_mov_b32 v, k`).

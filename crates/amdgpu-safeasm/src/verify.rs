@@ -38,7 +38,7 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
     let alias: HashMap<u32, u32> = b.alias.iter().map(|(a, base, _)| (*a, *base)).collect();
     let canon = |r: u32| alias.get(&r).copied().unwrap_or(r);
 
-    let input_regs: Vec<u32> = b.inputs.iter().map(|p| canon(p.reg)).collect();
+    let input_regs: Vec<u32> = b.inputs.iter().filter(|p| !p.mutable).map(|p| canon(p.reg)).collect();
     let mut defined: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut slot: u32 = 0;
     let mut valu_write: HashMap<u32, u32> = HashMap::new();
@@ -174,7 +174,7 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
 
     for p in &b.outputs {
         let c = canon(p.reg);
-        if !defined.contains(&c) && !input_regs.contains(&c) {
+        if !defined.contains(&c) && !input_regs.contains(&c) && !b.inputs.iter().any(|p| p.mutable && canon(p.reg) == c) {
             errs.push(format!("output port r{} is never written by the sequence (an undefined value would flow into the kernel)", p.reg));
         }
     }

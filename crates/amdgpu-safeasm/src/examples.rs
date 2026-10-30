@@ -62,3 +62,22 @@ pub fn rowsum_chain_block() -> AsmBlock {
     s.output_exit(ex);
     s.finish().expect("rowsum_chain_block is a verified sequence")
 }
+/// The `_vs128` row-sum chain exactly as the kernel runs it (`smfv`): the four SMFMACs accumulate IN PLACE into the Frag4 loop variable `la`
+/// (dword 2 = 16 x row sum), ports = [inout la, a_rs, pa, pb, idx01, idx23]. The last SMFMAC stays in flight at exit.
+pub fn rowsum_var_block() -> AsmBlock {
+    let mut s = Seq::new();
+    let acc = s.inout::<4>();
+    let a_rs = s.input::<4>();
+    let pa = s.input::<8>();
+    let pb = s.input::<8>();
+    let idx01 = s.input::<1>();
+    let idx23 = s.input::<1>();
+    let (ra, rpa, rpb, ri01, ri23) = (s.ready(&a_rs), s.ready(&pa), s.ready(&pb), s.ready(&idx01), s.ready(&idx23));
+    let t = s.v_smfmac_f32_16x16x128_fp8_fp8(acc, ra, rpa, ri01);
+    let t = t.chain(&mut s, ra, rpb, ri01);
+    let t = t.chain(&mut s, ra, rpa, ri23);
+    let t = t.chain(&mut s, ra, rpb, ri23);
+    let ex = t.exit();
+    s.output_exit(ex);
+    s.finish().expect("rowsum_var_block is a verified sequence")
+}

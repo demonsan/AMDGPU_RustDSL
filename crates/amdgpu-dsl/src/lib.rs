@@ -410,6 +410,9 @@ pub enum Stmt {
     VarMfmaScaleC { var: VarId, a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
     /// `var += smfmac_16x16x128_fp8(a, b, idx)`: sparse-A MFMA accumulating into a `Frag4` loop variable in place.
     VarSmfmac { var: VarId, a: Opnd, b: Opnd, idx: Opnd },
+    /// A safe-asm sequence updating the loop variable `var` in place through its in/out port (the first input port, `Seq::inout`);
+    /// ``inputs`` bind to the remaining input ports in order.
+    VarAsm { var: VarId, block: std::sync::Arc<amdgpu_safeasm::AsmBlock>, inputs: Vec<Opnd> },
     BeginLoop { vars: Vec<VarId>, init: Vec<Opnd> },
     BreakIf { cond: Opnd },
     EndLoop,
@@ -527,6 +530,9 @@ impl Function {
                 }
                 Stmt::VarSmfmac { var, a, b, idx } => {
                     let _ = writeln!(s, "{pad}var{} += smfmac({a:?}, {b:?}; {idx:?})", var.0);
+                }
+                Stmt::VarAsm { var, block, inputs } => {
+                    let _ = writeln!(s, "{pad}var{} <- asm `{}` ({} insts; {inputs:?})", var.0, block.name(), block.insts().len());
                 }
                 Stmt::BeginLoop { vars, init } => {
                     let _ = writeln!(s, "{pad}loop vars={vars:?} init={init:?}");
@@ -1046,6 +1052,11 @@ impl FnBuilder {
     /// `var += smfmac_16x16x128_fp8_fp8(a, b, idx)`: accumulate into a `Frag4` loop variable in place.
     pub fn var_smfmac_fp8(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, idx: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::VarSmfmac { var, a: a.into(), b: b.into(), idx: idx.into() });
+    }
+
+    /// Update the Frag4 loop variable `var` in place with a safe-asm sequence (its leading in/out port is the variable).
+    pub fn var_asm(&mut self, var: VarId, block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) {
+        self.f.stmts.push(Stmt::VarAsm { var, block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
     }
 
     pub fn load_lds_tr_b8(&mut self, addr: impl Into<Opnd>) -> ValueId {
@@ -1639,6 +1650,31 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
+            Stmt::VarAsm { var, block, inputs } => {
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
+                if !ok {
+                    errs.push(here(format!("var{var} updated by an asm block outside its loop")));
+                }
+                let ports: Vec<_> = block.inputs().iter().collect();
+                match ports.first() {
+                    Some(p0) if p0.mutable => {
+                        if !f.var_ty(*var).map_or(false, |t| asm_port_accepts(p0.class, t)) {
+                            errs.push(here(format!("asm block `{}`: in/out port {:?} does not match var{var}", block.name(), p0.class)));
+                        }
+                    }
+                    _ => errs.push(here(format!("asm block `{}` has no leading in/out port for var{var}", block.name()))),
+                }
+                if ports.len() != inputs.len() + 1 || ports.iter().skip(1).any(|p| p.mutable) {
+                    errs.push(here(format!("asm block `{}`: {} inputs bound for {} remaining ports", block.name(), inputs.len(), ports.len().saturating_sub(1))));
+                } else {
+                    for (k, (p, o)) in ports.iter().skip(1).zip(inputs).enumerate() {
+                        match opnd_ty(f, *o) {
+                            Ok(t) if asm_port_accepts(p.class, t) => {}
+                            other => errs.push(here(format!("asm block `{}`: input {k} is {other:?}, the port is {:?}", block.name(), p.class))),
+                        }
+                    }
+                }
+            }
             Stmt::VarSmfmac { var, a, b, idx } => {
                 let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
@@ -1770,6 +1806,7 @@ fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         }
         Stmt::VarMfmaScaleC { a, b, c, scale_a, scale_b, .. } => vec![*a, *b, *c, *scale_a, *scale_b],
         Stmt::VarSmfmac { a, b, idx, .. } => vec![*a, *b, *idx],
+        Stmt::VarAsm { inputs, .. } => inputs.clone(),
         Stmt::BeginLoop { init, .. } => init.clone(),
         Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => vec![*cond],
         _ => Vec::new(),

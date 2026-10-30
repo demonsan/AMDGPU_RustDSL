@@ -10153,6 +10153,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let smford = fmha_t_opt("smford");
         let smf2 = fmha_t_opt("smf2");
         let chain = |b: &mut FnBuilder, pa: ValueId, pb: ValueId| {
+            if smfv && fmha_t_opt("safeasm") {
+                // the same four in-place SMFMACs, authored in safe Rust (crates/amdgpu-safeasm) and embedded through Stmt::VarAsm
+                use amdgpu_safeasm::examples::rowsum_var_block;
+                b.var_asm(la, rowsum_var_block(), &[Opnd::Val(a_rs), Opnd::Val(pa), Opnd::Val(pb), Opnd::Val(idx01), Opnd::Val(idx23)]);
+                return;
+            }
             if smfv {
                 b.var_smfmac_fp8(la, a_rs, pa, idx01);
                 b.var_smfmac_fp8(la, a_rs, pb, idx01);

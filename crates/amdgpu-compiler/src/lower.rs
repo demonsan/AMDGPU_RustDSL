@@ -527,7 +527,7 @@ impl Lowerer {
 
     /// Lower a safe-asm block (`amdgpu-safeasm`) into ordinary MIR: ports bind to DSL values, constants join the region's constant cache,
     /// everything else becomes fresh virtual registers; the instructions then go through the normal scheduling / allocation / hazard pipeline.
-    fn lower_asm(&mut self, dst: ValueId, block: &amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) -> Result<(), String> {
+    fn lower_asm(&mut self, dst: Option<ValueId>, block: &amdgpu_safeasm::AsmBlock, inputs: &[Opnd], inout: Option<VReg>) -> Result<(), String> {
         use amdgpu_safeasm::{AClass, ASrc};
         let rc = |c: AClass| match c {
             AClass::V1 => RClass::V1,
@@ -540,11 +540,18 @@ impl Lowerer {
         };
         // belt and braces: the block was verified when it was built, a lowered block is re-verified (it may come from another build)
         block.verify().map_err(|e| format!("asm block `{}` fails the hazard verifier: {}", block.name(), e.join("; ")))?;
-        if inputs.len() != block.inputs().len() {
-            return Err(format!("asm block `{}`: {} inputs bound, {} ports", block.name(), inputs.len(), block.inputs().len()));
+        let n_bound = block.inputs().iter().filter(|p| !p.mutable).count();
+        if inputs.len() != n_bound || block.inputs().iter().any(|p| p.mutable) != inout.is_some() {
+            return Err(format!("asm block `{}`: {} inputs bound for {} read-only ports (in/out port bound: {})", block.name(), inputs.len(), n_bound, inout.is_some()));
         }
         let mut map: Vec<Option<VReg>> = vec![None; block.regs().len()];
-        for (p, o) in block.inputs().iter().zip(inputs) {
+        let mut bound = inputs.iter();
+        for p in block.inputs().iter() {
+            if p.mutable {
+                map[p.reg as usize] = inout;
+                continue;
+            }
+            let o = bound.next().expect("input count checked");
             let r = match p.class {
                 AClass::V1 => self.as_v1(*o)?,
                 AClass::V2 => self.as_v2(*o)?,
@@ -620,9 +627,11 @@ impl Lowerer {
             n_pushed += 1;
         }
         let out = block.outputs().first().ok_or("asm block has no output port")?;
-        self.val.insert(dst, m(out.reg));
-        // F8: the lowered MIR must not write a register the kernel handed in
-        let inputs_c: Vec<VReg> = block.inputs().iter().map(|p| self.mir.canon(m(p.reg))).collect();
+        if let Some(dst) = dst {
+            self.val.insert(dst, m(out.reg));
+        }
+        // F8: the lowered MIR must not write a register the kernel handed in (in/out ports excepted)
+        let inputs_c: Vec<VReg> = block.inputs().iter().filter(|p| !p.mutable).map(|p| self.mir.canon(m(p.reg))).collect();
         let start = self.mir.blocks[self.cur].insts.len() - n_pushed;
         for i in &self.mir.blocks[self.cur].insts[start..] {
             if let Some(d) = i.dst {
@@ -1234,6 +1243,10 @@ impl Lowerer {
                     let ri = self.as_v1(*idx)?;
                     // C is the destination in place; it is also listed as the 4th (hazard-visible) source
                     self.push(MInst::new(MOp::VSmfmac16x16x128Fp8).def(v).srcreg(ra).srcreg(rb).srcreg(ri).srcreg(v));
+                }
+                Stmt::VarAsm { var, block, inputs } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    self.lower_asm(None, block, inputs, Some(v))?;
                 }
                 Stmt::BeginLoop { vars, init } => {
                     for (i, var) in vars.iter().enumerate() {
@@ -2096,7 +2109,7 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::Asm { block, inputs } => {
-                self.lower_asm(dst, block, inputs)?;
+                self.lower_asm(Some(dst), block, inputs, None)?;
             }
             Op::SmfmacFp8_16x16x128 { a, b, idx, c } => {
                 // Sparse MFMA: the accumulator D is also the input C. A (4 dwords) is the
@@ -2762,7 +2775,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                 }
                 // any other statement that writes a variable in place makes it non-scalar
                 Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
-                | Stmt::VarScaleLane { var, .. } | Stmt::VarLoadB128 { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarSmfmac { var, .. } => {
+                | Stmt::VarScaleLane { var, .. } | Stmt::VarLoadB128 { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarAsm { var, .. } => {
                     if uvars.remove(var) {
                         changed = true;
                     }
