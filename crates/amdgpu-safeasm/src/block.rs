@@ -49,16 +49,47 @@ pub struct AsmPort {
     pub class: AClass,
 }
 
+/// A verified sequence. Only `Seq::finish` can create one (the fields are private), and creation runs the hazard verifier, so a block
+/// cannot carry a violation of the clock model; the compiler re-verifies it before lowering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsmBlock {
-    pub name: String,
-    pub regs: Vec<AClass>,
+    pub(crate) name: String,
+    pub(crate) regs: Vec<AClass>,
+    pub(crate) alias: Vec<(u32, u32, u8)>,
+    pub(crate) insts: Vec<AInst>,
+    pub(crate) inputs: Vec<AsmPort>,
+    pub(crate) outputs: Vec<AsmPort>,
+    pub(crate) exit_in_flight: Vec<(u32, u32)>,
+}
+
+impl AsmBlock {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn regs(&self) -> &[AClass] {
+        &self.regs
+    }
     /// (alias register, base tuple register, dword offset): views of a tuple.
-    pub alias: Vec<(u32, u32, u8)>,
-    pub insts: Vec<AInst>,
-    pub inputs: Vec<AsmPort>,
-    pub outputs: Vec<AsmPort>,
+    pub fn alias(&self) -> &[(u32, u32, u8)] {
+        &self.alias
+    }
+    pub fn insts(&self) -> &[AInst] {
+        &self.insts
+    }
+    pub fn inputs(&self) -> &[AsmPort] {
+        &self.inputs
+    }
+    pub fn outputs(&self) -> &[AsmPort] {
+        &self.outputs
+    }
     /// Registers whose last matrix write is still in flight at block exit (the consumer after the block is padded by the compiler's
     /// hazard pass, which sees the whole instruction stream): `(register, wait states still owed)`.
-    pub exit_in_flight: Vec<(u32, u32)>,
+    pub fn exit_in_flight(&self) -> &[(u32, u32)] {
+        &self.exit_in_flight
+    }
+
+    /// Re-walk the instruction list with the crate's wait-state model and report every violation (see `verify`).
+    pub fn verify(&self) -> Result<(), Vec<String>> {
+        crate::verify::verify_block(self)
+    }
 }

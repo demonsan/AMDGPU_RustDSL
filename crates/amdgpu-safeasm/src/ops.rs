@@ -114,29 +114,29 @@ impl Seq {
     // ---- matrix ----------------------------------------------------------------------------------------------------------------------
     /// `v_mfma_scale_f32_32x32x64_f8f6f4 acc, a, b, acc, sa, sb` (accumulate in place). The accumulator moves into the returned token and
     /// every operand stays borrowed until the token is retired / exited.
-    pub fn v_mfma_scale_f32_32x32x64_f8f6f4<'a>(&mut self, acc: Vgpr<16>, a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>) -> Mfma<'a> {
+    pub fn v_mfma_scale_f32_32x32x64_f8f6f4<'a>(&mut self, acc: Vgpr<16>, a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>) -> Mfma<'a, OP_MFMA_SCALE> {
         self.make_ready_pub(acc.id); // the accumulator is read as C: a recent VALU write of it needs the 2 wait states too
         let issued = self.clock;
         self.push(inst("VMfmaScale32x32x64Fp8", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(acc.id), ASrc::Reg(sa.id), ASrc::Reg(sb.id)]));
         self.note_write(acc.id, MATRIX_RESULT);
-        Mfma { issued, acc, _p: PhantomData }
+        Mfma { issued, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
     }
 
     /// The same with an implicit zero accumulator (`D = A x B`): `acc` is only written.
-    pub fn v_mfma_scale_f32_32x32x64_f8f6f4_zero<'a>(&mut self, acc: Vgpr<16>, a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>) -> Mfma<'a> {
+    pub fn v_mfma_scale_f32_32x32x64_f8f6f4_zero<'a>(&mut self, acc: Vgpr<16>, a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>) -> Mfma<'a, OP_MFMA_SCALE_ZERO> {
         let issued = self.clock;
         self.push(inst("VMfmaScale32x32x64Fp8Z", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(sa.id), ASrc::Reg(sb.id)]));
         self.note_write(acc.id, MATRIX_RESULT);
-        Mfma { issued, acc, _p: PhantomData }
+        Mfma { issued, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
     }
 
     /// `v_smfmac_f32_16x16x128_fp8_fp8 acc, a_sparse, b, idx`: the accumulator C is `acc` itself (implicit in the ISA, explicit here).
-    pub fn v_smfmac_f32_16x16x128_fp8_fp8<'a>(&mut self, acc: Vgpr<4>, a: Ready<'a, 4>, b: Ready<'a, 8>, idx: Ready<'a, 1>) -> Smfmac<'a> {
+    pub fn v_smfmac_f32_16x16x128_fp8_fp8<'a>(&mut self, acc: Vgpr<4>, a: Ready<'a, 4>, b: Ready<'a, 8>, idx: Ready<'a, 1>) -> Smfmac<'a, OP_SMFMAC_FP8> {
         self.make_ready_pub(acc.id);
         let issued = self.clock;
         self.push(inst("VSmfmac16x16x128Fp8", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(idx.id), ASrc::Reg(acc.id)]));
         self.note_write(acc.id, MATRIX_RESULT);
-        Smfmac { issued, acc, _p: PhantomData }
+        Smfmac { issued, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
     }
 
     // ---- loads (Pending tokens) -----------------------------------------------------------------------------------------------------
@@ -168,23 +168,24 @@ impl Seq {
     }
 }
 
-impl<'a> Mfma<'a> {
-    /// Dependent MFMA of the same opcode accumulating in place into the same register: hardware-interlocked, no wait needed.
-    pub fn chain(self, s: &mut Seq, a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>) -> Mfma<'a> {
+impl<'a> Mfma<'a, OP_MFMA_SCALE> {
+    /// Dependent MFMA of the SAME accumulate opcode accumulating in place into the same register: hardware-interlocked, no wait needed.
+    /// (Not defined for the `_zero` form: a different opcode needs the full result latency, i.e. `retire`.)
+    pub fn chain(mut self, s: &mut Seq, a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>) -> Mfma<'a, OP_MFMA_SCALE> {
         let issued = s.clock;
-        let acc = self.acc;
+        let acc = self.acc.take().expect("accumulator");
         s.push(inst("VMfmaScale32x32x64Fp8", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(acc.id), ASrc::Reg(sa.id), ASrc::Reg(sb.id)]));
         s.note_write(acc.id, MATRIX_RESULT);
-        Mfma { issued, acc, _p: PhantomData }
+        Mfma { issued, acc: Some(acc), poison: s.poison.clone(), _p: PhantomData }
     }
 }
 
-impl<'a> Smfmac<'a> {
-    pub fn chain(self, s: &mut Seq, a: Ready<'a, 4>, b: Ready<'a, 8>, idx: Ready<'a, 1>) -> Smfmac<'a> {
+impl<'a> Smfmac<'a, OP_SMFMAC_FP8> {
+    pub fn chain(mut self, s: &mut Seq, a: Ready<'a, 4>, b: Ready<'a, 8>, idx: Ready<'a, 1>) -> Smfmac<'a, OP_SMFMAC_FP8> {
         let issued = s.clock;
-        let acc = self.acc;
+        let acc = self.acc.take().expect("accumulator");
         s.push(inst("VSmfmac16x16x128Fp8", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(idx.id), ASrc::Reg(acc.id)]));
         s.note_write(acc.id, MATRIX_RESULT);
-        Smfmac { issued, acc, _p: PhantomData }
+        Smfmac { issued, acc: Some(acc), poison: s.poison.clone(), _p: PhantomData }
     }
 }

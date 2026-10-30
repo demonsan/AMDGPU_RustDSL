@@ -18,11 +18,12 @@ pub fn pv_rowsum_phase(s: &mut Seq) {
     let l_old = s.splat(0);
 
     // PV: o = pa x v0, then o += pb x v1 (in place, same opcode: no wait between)
+    // the `_zero` form is a different opcode from the accumulate form: its result needs the full latency before the dependent MFMA (retire)
     let o = s.vgpr::<16>();
     let (rpa, rv0, rsa, rsb) = (s.ready(&pa), s.ready(&v0), s.ready(&sa), s.ready(&sb));
-    let t = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(o, rpa, rv0, rsa, rsb);
+    let o = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(o, rpa, rv0, rsa, rsb).retire(s);
     let (rpb, rv1) = (s.ready(&pb), s.ready(&v1));
-    let t = t.chain(s, rpb, rv1, rsa, rsb);
+    let t = s.v_mfma_scale_f32_32x32x64_f8f6f4(o, rpb, rv1, rsa, rsb);
     let _o = t.retire(s);
 
     // row sums: r = sum over the four sparse index patterns (in place chain of four SMFMACs)
@@ -59,5 +60,5 @@ pub fn rowsum_chain_block() -> AsmBlock {
     let t = t.chain(&mut s, ra, rpb, ri23);
     let ex = t.exit();
     s.output_exit(ex);
-    s.finish()
+    s.finish().expect("rowsum_chain_block is a verified sequence")
 }

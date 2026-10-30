@@ -9,7 +9,7 @@
 //! let mut sg = s.sgpr::<1>();
 //! let r = s.ready(&x);                  // pads the 2 wait states a v_readfirstlane needs
 //! s.v_readfirstlane_b32(&mut sg, r);
-//! let block = s.finish();               // plain data: the DSL embeds it (`Op::Asm`), the compiler lowers it to MIR
+//! let block = s.finish().unwrap();      // verified plain data: the DSL embeds it (`Op::Asm`), the compiler lowers it to MIR
 //! assert!(!block.insts.is_empty());
 //! ```
 //!
@@ -21,7 +21,8 @@ pub mod examples;
 pub mod ops;
 pub mod regs;
 pub mod seq;
+mod verify;
 
 pub use block::*;
 pub use regs::*;
-pub use seq::{Free, Live, Mfma, Pending, Seq, Smfmac, Vcc};
+pub use seq::{Free, Live, Mfma, Pending, Seq, Smfmac, Vcc, OP_MFMA_SCALE, OP_MFMA_SCALE_ZERO, OP_SMFMAC_FP8};

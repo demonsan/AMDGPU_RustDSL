@@ -4,8 +4,10 @@
 
 use crate::block::*;
 use crate::regs::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 /// Wait states (instructions or `s_nop` slots) that must separate a VALU write of a VGPR from a hazard-sensitive reader
 /// (matrix operand, `v_readfirstlane`): "2 required waits", CDNA4 ISA 7.6, LLVM hazard recognizer.
@@ -50,12 +52,17 @@ pub(crate) enum Queue {
 #[must_use = "a load in flight must be waited for before its value is used"]
 #[derive(Debug)]
 pub struct Pending<T> {
-    value: T,
+    value: Option<T>,
+    poison: Poison,
     id: u32,
     queue: Queue,
 }
 
+/// Problems recorded by `Drop` of tokens abandoned without being retired / waited for; reported by `finish`.
+pub(crate) type Poison = Rc<RefCell<Vec<String>>>;
+
 pub struct Seq {
+    pub(crate) poison: Poison,
     pub(crate) insts: Vec<AInst>,
     pub(crate) regs: Vec<AClass>,
     pub(crate) alias: Vec<(u32, u32, u8)>,
@@ -82,6 +89,7 @@ impl Default for Seq {
 impl Seq {
     pub fn new() -> Seq {
         Seq {
+            poison: Rc::new(RefCell::new(Vec::new())),
             insts: Vec::new(),
             regs: Vec::new(),
             alias: Vec::new(),
@@ -284,10 +292,12 @@ impl Seq {
 
     // ---- vcc ------------------------------------------------------------------------------------------------------------------
     /// The `vcc` token. There is exactly one per sequence (panics if taken twice: that is a sequence-construction bug, not a data bug).
-    pub fn vcc(&mut self) -> Vcc<Free> {
-        assert!(!self.vcc_taken, "vcc already taken: there is one vcc per sequence");
+    pub fn vcc(&mut self) -> Option<Vcc<Free>> {
+        if self.vcc_taken {
+            return None;
+        }
         self.vcc_taken = true;
-        Vcc { _s: PhantomData }
+        Some(Vcc { _s: PhantomData })
     }
 
     pub(crate) fn vcc_written(&mut self) {
@@ -307,7 +317,7 @@ impl Seq {
             Queue::Lgkm => self.lgkm.push(id),
             Queue::Vm => self.vm.push(id),
         }
-        Pending { value, id, queue: q }
+        Pending { value: Some(value), poison: self.poison.clone(), id, queue: q }
     }
 
     /// Outstanding loads issued after `id` (the `k` of `s_waitcnt ...cnt(k)`), completing everything up to and including `id`.
@@ -353,14 +363,32 @@ impl Seq {
         self.insts.iter().map(|i| i.op.to_string()).collect::<Vec<_>>().join("\n")
     }
 
-    /// Finish the sequence into a plain-data block. A sequence may not leave loads outstanding (their destination registers would be
-    /// unreadable for the consumer): wait for them first.
-    pub fn finish(self) -> AsmBlock {
-        assert!(self.lgkm.is_empty() && self.vm.is_empty(), "sequence ends with loads still outstanding: wait for them (Pending::wait / wait_*_all)");
-        AsmBlock { name: "safeasm".into(), regs: self.regs, alias: self.alias, insts: self.insts, inputs: self.inputs, outputs: self.outputs, exit_in_flight: self.exit_in_flight }
+    /// Finish the sequence into a verified plain-data block. Fails (with every reason) if a token was abandoned without being retired /
+    /// waited for, loads are still outstanding, or the hazard verifier finds a violation of the wait-state model.
+    pub fn finish(self) -> Result<AsmBlock, String> {
+        let mut errs: Vec<String> = self.poison.borrow().clone();
+        if !self.lgkm.is_empty() || !self.vm.is_empty() {
+            errs.push("sequence ends with loads still outstanding: wait for them (Pending::wait / wait_*_all)".to_string());
+        }
+        let block = AsmBlock {
+            name: "safeasm".into(),
+            regs: self.regs,
+            alias: self.alias,
+            insts: self.insts,
+            inputs: self.inputs,
+            outputs: self.outputs,
+            exit_in_flight: self.exit_in_flight,
+        };
+        if let Err(v) = block.verify() {
+            errs.extend(v);
+        }
+        if errs.is_empty() {
+            Ok(block)
+        } else {
+            Err(errs.join("; "))
+        }
     }
 }
-
 struct LaneCheck<const I: usize, const N: usize>;
 impl<const I: usize, const N: usize> LaneCheck<I, N> {
     const OK: () = assert!(I < N, "lane index out of range for this register tuple");
@@ -369,7 +397,7 @@ impl<const I: usize, const N: usize> LaneCheck<I, N> {
 impl<T> Pending<T> {
     /// Wait for this load (and, in order, every load issued before it): emits `s_waitcnt lgkmcnt(k)` / `vmcnt(k)` with the partial count
     /// from the scoreboard (nothing if an earlier wait already covered it) and returns the register, now readable.
-    pub fn wait(self, s: &mut Seq) -> T {
+    pub fn wait(mut self, s: &mut Seq) -> T {
         if let Some(k) = s.complete(self.queue, self.id) {
             let op = match self.queue {
                 Queue::Lgkm => "SWaitLgkm",
@@ -377,49 +405,86 @@ impl<T> Pending<T> {
             };
             s.push(AInst { op, dst: None, srcs: vec![], imm: k as i64 });
         }
-        self.value
+        self.value.take().expect("pending value")
     }
 }
 
-/// An in-flight scaled MFMA. Owns the accumulator and holds the borrows of every operand until it is retired: the result cannot be read, and an
-/// operand the instruction is still reading cannot be overwritten (borrow-check errors).
+impl<T> Drop for Pending<T> {
+    fn drop(&mut self) {
+        if self.value.is_some() {
+            self.poison.borrow_mut().push("a load was abandoned without wait(): its destination register is never made readable".to_string());
+        }
+    }
+}
+
+/// Opcode identities of the matrix tokens: `chain` is only defined for the accumulate opcodes (the hardware interlocks a dependent in-place op of
+/// the SAME opcode; a different opcode, including the `_zero` form, needs the full result latency).
+pub const OP_MFMA_SCALE: u32 = 0;
+pub const OP_MFMA_SCALE_ZERO: u32 = 1;
+pub const OP_SMFMAC_FP8: u32 = 2;
+
+/// An in-flight matrix instruction of opcode `OP`. Owns the accumulator and holds the borrows of every operand until it is retired / exited:
+/// the result cannot be read and an operand the instruction is still reading cannot be overwritten (borrow-check errors). Abandoning the token
+/// (`drop`, `let _ =`) loses the accumulator register, and `Seq::finish` reports it ("unretired matrix result").
 #[must_use = "an in-flight MFMA must be retired (or chained, or exited) before its result is used"]
-pub struct Mfma<'a> {
+pub struct Mfma<'a, const OP: u32> {
     pub(crate) issued: u32,
-    pub(crate) acc: Vgpr<16>,
+    pub(crate) acc: Option<Vgpr<16>>,
+    pub(crate) poison: Poison,
     pub(crate) _p: PhantomData<&'a ()>,
 }
 
 /// An in-flight SMFMAC (same discipline as `Mfma`).
 #[must_use = "an in-flight SMFMAC must be retired (or chained, or exited) before its result is used"]
-pub struct Smfmac<'a> {
+pub struct Smfmac<'a, const OP: u32> {
     pub(crate) issued: u32,
-    pub(crate) acc: Vgpr<4>,
+    pub(crate) acc: Option<Vgpr<4>>,
+    pub(crate) poison: Poison,
     pub(crate) _p: PhantomData<&'a ()>,
 }
 
-impl<'a> Mfma<'a> {
+impl<'a, const OP: u32> Mfma<'a, OP> {
     /// Wait until the result is readable (pads exactly the missing wait states), release the operands and give the accumulator back.
-    pub fn retire(self, s: &mut Seq) -> Vgpr<16> {
+    pub fn retire(mut self, s: &mut Seq) -> Vgpr<16> {
         s.pad_after(self.issued, MATRIX_RESULT);
-        s.clear_write(self.acc.id);
-        self.acc
+        let acc = self.acc.take().expect("accumulator");
+        s.clear_write(acc.id);
+        acc
     }
 
     /// Leave the sequence with the result still in flight (the compiler's hazard pass pads the consumer after the block).
-    pub fn exit(self) -> Exit<16> {
-        Exit { id: self.acc.id, issued: self.issued }
+    pub fn exit(mut self) -> Exit<16> {
+        let acc = self.acc.take().expect("accumulator");
+        Exit { id: acc.id, issued: self.issued }
     }
 }
 
-impl<'a> Smfmac<'a> {
-    pub fn retire(self, s: &mut Seq) -> Vgpr<4> {
+impl<'a, const OP: u32> Drop for Mfma<'a, OP> {
+    fn drop(&mut self) {
+        if self.acc.is_some() {
+            self.poison.borrow_mut().push("unretired matrix result: an MFMA token was dropped without retire()/exit()".to_string());
+        }
+    }
+}
+
+impl<'a, const OP: u32> Smfmac<'a, OP> {
+    pub fn retire(mut self, s: &mut Seq) -> Vgpr<4> {
         s.pad_after(self.issued, MATRIX_RESULT);
-        s.clear_write(self.acc.id);
-        self.acc
+        let acc = self.acc.take().expect("accumulator");
+        s.clear_write(acc.id);
+        acc
     }
 
-    pub fn exit(self) -> Exit<4> {
-        Exit { id: self.acc.id, issued: self.issued }
+    pub fn exit(mut self) -> Exit<4> {
+        let acc = self.acc.take().expect("accumulator");
+        Exit { id: acc.id, issued: self.issued }
+    }
+}
+
+impl<'a, const OP: u32> Drop for Smfmac<'a, OP> {
+    fn drop(&mut self) {
+        if self.acc.is_some() {
+            self.poison.borrow_mut().push("unretired matrix result: an SMFMAC token was dropped without retire()/exit()".to_string());
+        }
     }
 }
