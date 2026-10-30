@@ -1,4 +1,4 @@
-// error-contains: mismatched types
+// error-contains: Dst<2>
 use amdgpu_safeasm::*;
 fn main() {
     let mut s = Seq::new();
