@@ -183,3 +183,42 @@ pub struct Exit<const N: usize> {
     pub(crate) id: VReg,
     pub(crate) issued: u32,
 }
+/// A register tuple the sequence RECEIVES from the kernel (an input port). Read-only by construction: it has no `Dst` implementation, no
+/// `&mut` path and no view that can be written, so a sequence cannot clobber the caller's live register (the verifier and the lowering
+/// check the same rule on the instruction stream).
+#[derive(Debug)]
+pub struct In<const N: usize> {
+    pub(crate) id: VReg,
+}
+
+/// A register that can be read as a width-`N` operand (owned tuples and input ports).
+pub trait Readable<const N: usize>: Sealed {
+    #[doc(hidden)]
+    fn reg_id(&self) -> VReg;
+}
+impl<const N: usize> Sealed for Vgpr<N> {}
+impl<const N: usize> Readable<N> for Vgpr<N> {
+    fn reg_id(&self) -> VReg {
+        self.id
+    }
+}
+impl<const N: usize> Sealed for In<N> {}
+impl<const N: usize> Readable<N> for In<N> {
+    fn reg_id(&self) -> VReg {
+        self.id
+    }
+}
+impl<const N: usize> Sealed for &In<N> {}
+impl<const N: usize> Src<N> for &In<N> {
+    fn src_id(&self) -> VReg {
+        self.id
+    }
+}
+impl Sealed for &In<1> {}impl Operand for &In<1> {
+    const BUS: u8 = 0;
+    const VOP3_OK: bool = true;
+    fn to_src(&self) -> ASrc {
+        ASrc::Reg(self.id)
+    }
+}
+impl VgprOnly for &In<1> {}

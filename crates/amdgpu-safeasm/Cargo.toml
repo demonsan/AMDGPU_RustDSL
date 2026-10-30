@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Safe-Rust authoring of gfx950 instruction sequences: the type system enforces the ISA rules (operand legality, hazards). No dependencies: sequences are exported as plain-data AsmBlocks that the compiler lowers to MIR."
+[features]
+# exposes orge_for_tests (used only by the verifier's tests)
+test-support = []
