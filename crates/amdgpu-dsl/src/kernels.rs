@@ -6964,10 +6964,21 @@ pub fn fmha_fwd_hd128_mxfp8() -> Function {
     for c in 0..2u32 {
         let qp = b.ptr_add(ptr_q, q_off);
         let mut w: Vec<ValueId> = Vec::with_capacity(8);
-        for i in 0..8u32 {
-            let off = 64 * c + if i < 4 { 4 * i } else { 32 + 4 * (i - 4) };
-            let v = b.load_f32(qp, off);
-            w.push(b.bitcast_i32(v));
+        if fmha_t_opt("qdw") {
+            for i in 0..8u32 {
+                let off = 64 * c + if i < 4 { 4 * i } else { 32 + 4 * (i - 4) };
+                let v = b.load_f32(qp, off);
+                w.push(b.bitcast_i32(v));
+            }
+        } else {
+            // two 16-byte loads (words 0-3 and 8-11 of this 64-byte group) instead of eight dword loads
+            for half in 0..2u32 {
+                let f4 = b.load_b128(qp, 64 * c + 32 * half);
+                for k in 0..4u8 {
+                    let l = b.frag4_lane(f4, k);
+                    w.push(b.bitcast_i32(l));
+                }
+            }
         }
         a8.push(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]));
     }
@@ -18084,10 +18095,21 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     for c in 0..2u32 {
         let qp = b.ptr_add(ptr_q, q_off);
         let mut w: Vec<ValueId> = Vec::with_capacity(8);
-        for i in 0..8u32 {
-            let off = 64 * c + if i < 4 { 4 * i } else { 32 + 4 * (i - 4) };
-            let v = b.load_f32(qp, off);
-            w.push(b.bitcast_i32(v));
+        if fmha_t_opt("qdw") {
+            for i in 0..8u32 {
+                let off = 64 * c + if i < 4 { 4 * i } else { 32 + 4 * (i - 4) };
+                let v = b.load_f32(qp, off);
+                w.push(b.bitcast_i32(v));
+            }
+        } else {
+            // two 16-byte loads (words 0-3 and 8-11 of this 64-byte group) instead of eight dword loads
+            for half in 0..2u32 {
+                let f4 = b.load_b128(qp, 64 * c + 32 * half);
+                for k in 0..4u8 {
+                    let l = b.frag4_lane(f4, k);
+                    w.push(b.bitcast_i32(l));
+                }
+            }
         }
         if c == 1 {
             bq1_words = w.clone();
