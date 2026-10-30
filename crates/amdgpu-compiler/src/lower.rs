@@ -1124,6 +1124,38 @@ impl Lowerer {
                             .imm(*byte_off as i64),
                     );
                 }
+                Stmt::StoreF32Wt { base, byte_off, value } => {
+                    let b = self.as_v2(*base)?;
+                    let v = self.as_v1(*value)?;
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(MInst::new(MOp::GlobalStoreF32Sc1).srcreg(b).srcreg(v).imm(*byte_off as i64));
+                }
+                Stmt::StoreF32x4Wt { base, byte_off, value } => {
+                    let b = self.as_v2(*base)?;
+                    let v = self.as_v4(*value)?;
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(MInst::new(MOp::GlobalStoreF32x4Sc1).srcreg(b).srcreg(v).imm(*byte_off as i64));
+                }
+                Stmt::FenceRelease { wb } => {
+                    // everything issued so far must be complete (stores acknowledged) before the L2 write-back and before the releasing atomic
+                    self.push(MInst::new(MOp::SWaitVm).imm(0));
+                    self.push(MInst::new(MOp::SWaitLgkm).imm(0));
+                    if *wb {
+                        self.push(MInst::new(MOp::BufferWbl2));
+                        self.push(MInst::new(MOp::SWaitVm).imm(0));
+                    }
+                    self.pending_vmem.clear();
+                    self.pending_lds.clear();
+                    self.pending_smem.clear();
+                }
+                Stmt::FenceAcquire { inv } => {
+                    // the ticket (atomic result) must have returned; then drop stale cache lines before the loads that follow
+                    self.push(MInst::new(MOp::SWaitVm).imm(0));
+                    self.pending_vmem.clear();
+                    if *inv {
+                        self.push(MInst::new(MOp::BufferInv));
+                    }
+                }
                 Stmt::StoreF32x4 { base, byte_off, value } => {
                     let b = self.as_v2(*base)?;
                     let v = self.as_v4(*value)?;
@@ -1770,6 +1802,29 @@ impl Lowerer {
                     let rb = self.as_v2(*base)?;
                     self.push(MInst::new(MOp::GlobalLoadF32).def(d).srcreg(rb).imm(*byte_off as i64));
                 }
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::LoadF32Coherent { base, byte_off } => {
+                let d = self.new_vreg(RClass::V1);
+                let rb = self.as_v2(*base)?;
+                self.push(MInst::new(MOp::GlobalLoadF32Sc1).def(d).srcreg(rb).imm(*byte_off as i64));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::LoadB128Coherent { base, byte_off } => {
+                let d = self.new_vreg(RClass::V4);
+                let rb = self.as_v2(*base)?;
+                self.push(MInst::new(MOp::GlobalLoadB128Sc1).def(d).srcreg(rb).imm(*byte_off as i64));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::AtomicAddU32 { base, byte_off, value } => {
+                let d = self.new_vreg(RClass::V1);
+                let rb = self.as_v2(*base)?;
+                let rv = self.as_v1(*value)?;
+                self.touch(&[Src::Reg(rv)]);
+                self.push(MInst::new(MOp::GlobalAtomicAddRet).def(d).srcreg(rb).srcreg(rv).imm(*byte_off as i64));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }

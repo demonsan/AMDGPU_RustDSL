@@ -173,7 +173,7 @@ pub fn export_mir(f: &amdgpu_dsl::Function, tail: &backend::LlvmTail) -> Result<
 /// Does the kernel contain own-backend-only MOps (the LDS-DMA loads)? The LLVM tail cannot express them.
 pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
     match lower::lower_with_extra(f, &[]) {
-        Ok(m) => m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, mir::MOp::GlobalLoadLdsB128 | mir::MOp::GlobalLoadLdsB32))),
+        Ok(m) => m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, mir::MOp::GlobalLoadLdsB128 | mir::MOp::GlobalLoadLdsB32) || (!llvm_tail_has_rows() && matches!(i.op, mir::MOp::BufferWbl2 | mir::MOp::BufferInv | mir::MOp::GlobalAtomicAddRet)))),
         Err(_) => false,
     }
 }
@@ -278,4 +278,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "sched_occ_chain" => Some(amdgpu_dsl::kernels::sched_occ_chain()),
         _ => None,
     }
+}
+/// The atomic/fence ops of the last-arriver pattern have rows in the LLVM tables only when `llvm_tail_has_rows` says so (set by the table probe).
+fn llvm_tail_has_rows() -> bool {
+    true
 }
