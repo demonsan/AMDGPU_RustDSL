@@ -10041,7 +10041,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let w_u = b.frag2_lane(Opnd::Val(bias_v), 0);
             let w_i = b.bitcast_i32(w_u);
             let hi = b.let_(Op::CvtF16ToF32(Opnd::Val(w_i)));
-            let lo_s = b.lshr_i32(Opnd::Val(w_i), Opnd::Val(c16i));
+            let lo_s = b.let_(Op::LshrI32(Opnd::Val(w_i), Opnd::Val(c16i)));
             let lo = b.let_(Op::CvtF16ToF32(Opnd::Val(lo_s)));
             let sum = b.add_f32(hi, lo);
             let c4fb = b.c_f32(4.0);
