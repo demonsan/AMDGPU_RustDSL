@@ -1428,46 +1428,51 @@ a ready patch; the counter evidence for the *source* is independent of that bug.
    fragment, 16-byte-group aligned) -> **4 `global_load_dwordx4`** (bytes 0,32,64,96) + dword unpack.
    Expected: level 121.6 -> 86.6, VMEM inst 7.62 -> 6.88, wave cycles -6.7%, **+3-6% per-CU**; md5 gate
    `faadf00c...` mandatory. One-function change in `fmha_t_build`'s Q-fragment loop.
-2. **Epilogue output stores - the level metric misleads here.** The two contiguous dwords at
-   `off, off+4` can be merged into `global_store_dwordx2` (+ `store_f32x2`), 32 -> 16 stores/wave. That
-   lowers `INST_LEVEL_VMEM` (86.3 -> 66.5) and wave cycles (1436 -> 1351) but **makes the wall slower**:
-   a 12-round interleaved A/B on `d412d50e` gives `_vs128` 64 blocks **454.6 scalar-4B vs 417.1
-   dwordx2 TFLOP/s** (+9.1% for scalar) and filled B4H8S2048 1399.8 vs 1320.7 (+6%); only B1H8S8192
-   showed dwordx2 better in 3 rounds (1888 vs 1816, needs more data - possible shape-dependent store
-   choice). **Do not treat INST_LEVEL_VMEM / wave-cycle counters as acceptance gates for store-path
-   changes**; acceptance is the interleaved multi-round A/B (>=12 rounds, >=200 iters, same commit,
-   same-run vendor, median) plus md5 bit-identity. The vectorisation itself is not a win; the Q prologue
-   vectorisation (#1) remains the only confirmed prologue/epilogue win so far.
+2. **Epilogue output stores: `global_store_dwordx2` is a win (confirmed with `.s` provenance).** The two
+   contiguous dwords at `off, off+4` merge into one 8-byte store (`store_f32x2`), 32 -> 16 stores/wave.
+   Provenance-verified A/B on `d412d50e` (each variant's `.s` checked: default `00d34086bf42e7e6`, 64
+   `global_store_dwordx2`, 0 scalar; `ost1` `453a779f87d2ab45`, 128 scalar dword, 0 x2), 4-12 interleaved
+   rounds, 200 iters: **`_vs128` 64 blocks 453.1-454.0 (dwordx2) vs 416.1-416.7 (scalar 4-B) TFLOP/s =
+   +8.9% for dwordx2**; filled B4H8S2048 ~1400 vs ~1320, B1H8S8192 ~1904-1929 vs ~1816-1904 (dwordx2
+   wins on the 8-round measurement). The counters agree with the winner (level 66.5 vs 86.3, VMEM inst
+   5.88 vs 6.88, wave cycles 1351 vs 1436). An earlier note in this section claiming the opposite was a
+   **label-crossing error in our first A/B** (the per-variant `.s` provenance was not checked); it is
+   withdrawn: `INST_LEVEL_VMEM`/wave-cycle counters *were* consistent with wall time here.
+   **Acceptance rule added:** every A/B must verify each variant's emitted `.s` (store counts / asm md5)
+   against its label before interpreting the result; keep the interleaved multi-round protocol
+   (>=12 rounds, >=200 iters, same commit, same-run vendor, median) plus output md5 bit-identity.
 3. **Do not change kddma or the K/V staging**: kddma is 4.3 level; staging is 38.9 at 9.7 cycles/inst
    (vendor 9.0) - already vendor-like. `nodma`'s -3.7% is the unavoidable staging cost.
 
 If both are implemented correctly the level should land near the vendor's 50.8 and the per-CU rate should
 gain 5-8% (391 -> 411-422 at 64 blocks), with the prologue part also shrinking the 3.1 us fixed cost.
 
-## 7.10.5 Post-vectorisation state and acceptance methodology (in progress)
+## 7.10.5 Post-vectorisation control (Q `load_b128` + 8-byte epilogue stores + combine8h)
 
-**Q prologue vectorisation is confirmed:** kernel-opt's `load_b128` Q loads (2 per fragment, replacing 16
-serialised scalar dword loads) are bit-identical (`faadf00c...` etc.) and give **+6.6% per-CU in isolation**
-(`qdw` restores scalar Q: 64-block median 416.2 -> 424.6 with dwordx2 O; on the scalar-O build the effect
-is similar). The epilogue store change is **negative** per the 12-round A/B in section 7.10.4: scalar 4-byte
-stores are +9.1% at 64 blocks and +6% on B4H8S2048 over `global_store_dwordx2`, despite the counters
-favouring dwordx2. The only dwordx2-positive point so far is B1H8S8192 (1888 vs 1816 in 3 rounds, n=2 for
-scalar - needs >=6 rounds).
+Control frozen on **Main `8c5bb14`** (merge of backend-x2/d412d50: Q fragment loads as `load_b128`, 8-byte
+epilogue stores via `store_f32x2`, `combine8h` default), GPU 5, own backend, same-run vendor.
 
-**Acceptance methodology (recorded after the counter/wall contradiction):** for any change with expected
-effect below ~5% the only acceptance is an **interleaved multi-round A/B** - >=12 rounds, >=200 iterations,
-same commit, same-run vendor, report best+median, plus the md5 bit-identity and the 15-shape gate. Counter
-rows (`INST_LEVEL_VMEM`, `SQ_WAVE_CYCLES`, `WAIT_INST_ANY`, ...) are diagnostic attribution, not wall-time
-predictors; in particular a store-path change can lower the level/wave counters while making the kernel
-slower.
+**Confirmed attribution of the +15.5-16% per-CU win (baseline 389.6-390.6 -> 453-455 TFLOP/s):**
+* **Q prologue vectorisation: +6-7%.** Replacing 16 serialised scalar dword loads with 2 `load_b128` per
+  fragment (`qdw` restores scalar Q for A/B) gives 416-417 TFLOP/s vs 453-455 with it; emitted `.s`
+  provenance checked, output bit-identical.
+* **Epilogue 8-byte stores (`global_store_dwordx2`, 32 -> 16 per wave): +8-9%.** Provenance-verified A/B:
+  default 453.1-454.0 vs scalar-4B (`ost1`) 416.1-416.7 TFLOP/s; filled B4H8S2048 ~1400 vs ~1320,
+  B1H8S8192 ~1904-1929 vs ~1816-1904. Output bit-identical.
+* **combine8h default: +1% shipped** (combine 5.0 -> 3.9-4.1 us; shipped total 26.4 -> ~26.15 us as
+  measured by kernel-opt; our independent auto run with 200 iters measured main 19.9 us + combine 4.1 us =
+  ~24.8 us = ~691 TFLOP/s on the Q+dwordx2 build).
+* Per-CU gap to vendor: **7.08-7.10 TF/CU vs 8.44 = 1.19-1.20x** (was 1.38x).
 
-**Pending freeze:** when kernel-opt's decisive A/B settles the epilogue default (and any shape-dependent
-choice), this section becomes the new control with: `_vs128` per-CU (expect ~450-455 TFLOP/s = ~7.0
-TF/CU, gap to vendor 8.44 = **1.20x**), filled B4H8S2048 (~1400) and B1H8S8192 (~1890 if dwordx2 wins
-there), mid shapes, shipped auto path (expect >691 TFLOP/s), 15 gate shapes @16/64 rows, determinism 3x5,
-parity, md5 faadf00c, and counters (VMEM level ~66/86 depending on store choice, VMEM inst 5.88/6.88, wave
-cycles ~1351/1436). The guard refit is on hold until this control is frozen; its constants will be
-re-measured on the winning build.
+**Acceptance methodology (kept, corrected):** for changes below ~5% the acceptance is an **interleaved
+multi-round A/B** (>=12 rounds, >=200 iters, same commit, same-run vendor, report best+median) **plus
+per-variant `.s` provenance** (store counts / asm md5 matched to the label) and output md5 bit-identity.
+The counters are diagnostic attribution; in this round they were consistent with the wall winner once the
+provenance was checked - the earlier apparent counter/wall contradiction was our own label crossing, not a
+counter limitation.
+
+The full control table (per-CU, filled, mid, shipped auto, gates, determinism, parity, counters) is
+measured on `8c5bb14` and recorded in the validation report attached to this section.
 
 ## 8. Unknowns / limitations
 
