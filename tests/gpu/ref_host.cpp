@@ -91,12 +91,18 @@ int main(int argc, char** argv) {
         const double t_kv = std::max(F / (5.90e12 * std::min<double>(256.0, (double)blocks256 * splits)),
                                      part_b / 4.8e12)
                           + comb_b / 7.4e12 + 1.5e-6;
-        const bool guard = (blocks256 <= 128) && (blocks256 * splits <= 256) && (t_kv < 0.95 * t_current);
+        // Split key ranges are 128-key tile aligned (kernel-opt contract): tiles_per_split = ceil(ntiles/splits),
+        // split i owns [i*tps, min(ntiles,(i+1)*tps)); every split must own >= 1 tile for the Step A kernel.
+        const int ntiles = (SK + 127) / 128;
+        const int tps = (ntiles + splits - 1) / splits;
+        const bool tiles_ok = (splits >= 1) && (tps >= 1) && ((splits - 1) * tps < ntiles);
+        const bool guard = (blocks256 <= 128) && (blocks256 * splits <= 256) && tiles_ok && (t_kv < 0.95 * t_current);
         if (force_split) { use_split = true; split_why = "REF_SPLIT_FORCE"; }
         else if (guard) { use_split = true; split_why = "auto-split guard: N256<=128 && N256*s<=256 && model win"; }
         else { split_why = "split guard rejected (fallback)"; }
-        std::printf("[split] s=%d %s: blocks256=%ld phase1 blocks=%ld; model T_current=%.2f us T_kvsplit=%.2f us; %s\n",
+        std::printf("[split] s=%d %s: blocks256=%ld phase1 blocks=%ld ntiles=%d tps=%d; model T_current=%.2f us T_kvsplit=%.2f us; %s\n",
                     splits, use_split ? "CHOSEN" : "not chosen", blocks256, s_blocks,
+                    (SK + 127) / 128, ((SK + 127) / 128 + splits - 1) / splits,
                     t_current * 1e6, t_kv * 1e6, split_why);
     }
     int rows_pb; const char* why;
@@ -213,12 +219,13 @@ int main(int argc, char** argv) {
         put64(args, 0x000, outp);
         put32(args, 0x080, (uint32_t)((size_t)stride_rows * H * D));
     };
-    // KV-split kernarg extension (documented in docs/kvsplit-design.md section 3): 0x270 ptr Ohat,
-    // 0x278 ptr lse, 0x280 u32 splits; kernarg segment 720 bytes (base ABI unchanged at 656).
+    // KV-split kernarg extension (docs/kvsplit-design.md section 3, agreed with kernel-opt): 0x270 ptr Ohat,
+    // 0x278 ptr lse, 0x280 u32 splits, 0x284 u32 rows_total (= B*S*H, the per-split stride); segment 720 bytes.
     auto set_split_args = [&](void* ohat, void* lse) {
         put64(args, 0x270, ohat);
         put64(args, 0x278, lse);
         put32(args, 0x280, (uint32_t)splits);
+        put32(args, 0x284, (uint32_t)rows_total);
         asz = 720;
     };
     asz = 656; set_launch(dout, vendor_stride_rows);
