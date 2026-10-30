@@ -10464,7 +10464,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let rb4 = b.add_i32(rb3, cx.hidx);
         let prow = b.add_i32(kv.part_row0, rb4);
         // p16: fp16 partials (128 x 2 bytes per row, halves the write and the combine read); default fp32
-        let p16 = fmha_t_opt("p16");
+        let p16 = !fmha_t_opt("nop16"); // fp16 partials by default (`nop16`: fp32)
         let c512i = b.c_i32(if p16 { 256 } else { 512 });
         let ooff = b.mul_i32(prow, c512i); // 128 fp32 (or fp16) per row
         let half = b.let_(Op::LshrI32(Opnd::Val(cx.g4), Opnd::Val(c2)));

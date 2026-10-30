@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
     const char* co_split = std::getenv("REF_CO2_SPLIT");
     const char* kname_split = std::getenv("REF_KNAME2_SPLIT") ? std::getenv("REF_KNAME2_SPLIT") : "fmha_fwd_hd128_mxfp8_kvsplit";
     const char* co_comb = std::getenv("REF_CO2_COMBINE");
-    const char* kname_comb = std::getenv("REF_KNAME2_COMBINE") ? std::getenv("REF_KNAME2_COMBINE") : "fmha_fwd_hd128_mxfp8_kvsplit_combine";
+    const char* kname_comb = std::getenv("REF_KNAME2_COMBINE") ? std::getenv("REF_KNAME2_COMBINE") : "fmha_fwd_hd128_mxfp8_kvsplit_combine4h";
     const int splits = envi("REF_SPLIT", 0);
     const bool force_split = envi("REF_SPLIT_FORCE", 0) != 0;
     const long rows_total = (long)B * S * H;
@@ -323,7 +323,9 @@ int main(int argc, char** argv) {
             size_t casz = sizeof(cargs);
             void* cextra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, cargs, HIP_LAUNCH_PARAM_BUFFER_SIZE, &casz, HIP_LAUNCH_PARAM_END};
             const unsigned cthreads = (unsigned)envi("REF_COMBINE_THREADS", 256);
-            long cgrid = (long)std::ceil((double)rows_total * D / (double)cthreads);
+            // `..._combine4` / `..._combine4h` kernels handle 4 output elements per thread
+            const double comb_ept = std::string(kname_comb).find("combine4") != std::string::npos ? 4.0 : 1.0;
+            long cgrid = (long)std::ceil((double)rows_total * D / ((double)cthreads * comb_ept));
             if (const char* cg = std::getenv("REF_COMBINE_GRID")) cgrid = std::atol(cg);
             if (cgrid < 1) cgrid = 1;
             auto launch_split = [&] {
