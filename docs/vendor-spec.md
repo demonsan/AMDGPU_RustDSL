@@ -1571,6 +1571,62 @@ a kernel determinism defect; the shipped path is deterministic by construction (
 and the flake did not reproduce in 14 x 15 shape-runs (210 dumps). If it ever recurs, capture the failing
 shape's three `REF_DUMP2` md5s and compare against `faadf00c...` before treating it as a kernel issue.
 
+## 7.10.7 Micro-lever closure: M-window/bias removal, VALU/SALU, IFETCH
+
+After the Q/epilogue/combine/guard round the remaining per-CU gap is 7.07-7.09 vs vendor 8.41 TF/CU
+(1.19x). Counters/wave: ours 1349 vs vendor 1151; XDL 1216 vs 1086-1088; VALU 351 vs 251; IFETCH 100.3
+vs 81.4; WAIT_ANY 485.6 vs 412.4. Three levers were investigated; **all are closed or capped**:
+
+**A. M-window / bias MFMAs (closed, negative).** The 4 f16 bias MFMAs (128 XDL) are the post-barrier
+latency cover, not waste: base long-copy M window starts with the bias MFMA at +1, issues address math +16
+V/K LDS reads, and the first scaled PV MFMA follows at ~+34 instructions after `s_waitcnt lgkmcnt`; base
+WAIT_INST_LDS is **17.6** vs vendor **33.3** (we hide better). Vendor instead pre-reads QK operand
+fragments in the V window and starts the M window with 2 SMFMACs + 2 unscaled `v_mfma_f32_32x32x64` whose
+A/B are registers written before the barrier (~160 XDL cycles of ready work). Removing the bias work is
+bit-identical but not recoverable with fragment prefetch (branch `mstart-prototype` @ 1379d5d; all variants
+md5 `faadf00c...`, `.s` provenance checked, 10-11 interleaved rounds, same-run vendor 538-539):
+
+| variant | XDL | VALU | wave | best/median TF |
+|---|---|---|---|---|
+| base | 1216 | 353 | 1353 | **454.0 / 453.2** |
+| `biasc` (C fragment via VALU, 0 bias MFMAs) | 1096 | 369 | 1400 | 453.2 / 437.2 (-3.5%) |
+| `biasc,vpre1` / `biasc,vpre2` (1-2 V fragments pre-read) | 1096 | 370/371 | 1416/1425 | 453.1 / 432.5 / 430.8 (-4.6/-4.9%) |
+| `biasc,qkfirst` | 1096 | 369 | 1428 | 453.2 / 431.2 (-4.8%) |
+| `biasc,qkfirst,kpre2` (2 QK K fragments pre-read, Option A) | 1096 | 373 | 1439 | 453.2 / 428.3 (-5.5%) |
+| `biasc,kpre2` / `qkfirst` alone | 1096/1216 | 373/357 | 1393/1412 | 453.2 / 439.7 / 436.8 (-3.0/-3.6%) |
+
+The exposed dependency after removing the bias work is deeper than the first V or QK K read - prefetching
+1-2 fragments does not recover it, and QK-first perturbs the ring/DMA schedule. **Keep `biasf`; the
+M-window/bias-removal lever is closed.**
+
+**B. VALU/SALU (capped at <=1%).** Executed long-copy loop asm (456/435 instructions, VALU 314/298) is
+not dominated by address math: per tile there are only ~10-15 real address adds (most constant offsets are
+already folded into `ds_read` immediate fields), while the bulk is P conversion (2 `v_cvt_pknorm_u16_f32`
++ 2 `v_cvt_scalef32_pk_fp8_bf16` per 4-word group = 64 VALU/tile), max/decision (~39), LUT/svcorr
+lshr/and/perm (only in the short-sequence copy), constant materialisation (`v_mov` for MFMA scale/index/
+ones, ~45, many rematerialised each loop due to register pressure), and bias coefficient (~20). Hoisting
+ring/slot math to SALU would save only ~8-15 VALU (not the 20-35 estimated from the first breakdown), and
+the remaining VALU is per-lane conversion/decision data that cannot move to SALU. `cvt_pknorm_p8x4`
+already lowers to the two-instruction form; a single-step P conversion needs a new opcode/lowering and has
+a medium accuracy risk. Realistic VALU/SALU gain **<=1%**, below the 1.5% landing gate.
+
+**C. IFETCH +19 (not the code copies).** Removing the short-sequence (svcorr) code copy with `onecopy`
+halves `.s` size (350,692 -> 167,606 B) but IFETCH stays **100.7** (base 100.3) and timing drops 453 ->
+447.3; `peelone` gives IFETCH 104 and 437.0. The +19 IFETCH follows the executed loop instruction
+footprint (VALU +100, MFMA +2), not the unused copy; keep both copies for short-sequence accuracy.
+Rollback S/O updates (64 static VALU) are effectively runtime-free: `rbnos`/`rbnoo`/`thr` ablations leave
+wave/VALU unchanged (branch rarely taken), so moving the S shift into the MFMA scale operand has no runtime
+win.
+
+**Per-CU accounting / reachability statement.** Residual gap ~1.19x = ~198 wave cycles: **+128 XDL from the
+bias MFMAs (9.5% wave; real work that also covers the M-window latency - removing it costs more than it
+saves)**, **+100 VALU (~109 active cycles, 8%; at most ~10-15 hoistable, rest per-lane conversion/decision
+and constant rematerialisation)**, **+19 IFETCH, +73 WAIT_ANY** (partly the same latency cover, vendor's
+shorter loop). **Per-CU parity is NOT reachable by micro-optimization on the current two-wave structure:
+realistic VALU/SALU cuts cap at <=1%, leaving a ~1.16-1.18x gap; closing it requires a structural change -
+vendor-style M-window/QK staging with preloaded operands and unscaled QK (or another scheme that removes
+the 128 XDL bias cover without re-exposing the post-barrier LDS latency) - not a micro-lever.**
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as
