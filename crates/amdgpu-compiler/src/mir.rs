@@ -141,6 +141,7 @@ pub enum MOp {
     GlobalStoreU16,
     GlobalStoreF32,
     GlobalStoreF32x4,
+    GlobalStoreF32x2,
     /// Device-scope (`sc1`) coherent loads / write-through stores, the returning device-scope atomic add (`sc0` = return) and the L2 fences
     /// of the last-arriver pattern (`buffer_wbl2 sc1` / `buffer_inv sc1`).
     GlobalLoadF32Sc1,
@@ -359,7 +360,7 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                         errs.push(format!("block {bi} inst {ii}: load needs a base register"));
                     }
                 }
-                MOp::GlobalStoreU16 | MOp::GlobalStoreF32 | MOp::GlobalStoreF32x4 => {
+                MOp::GlobalStoreU16 | MOp::GlobalStoreF32 | MOp::GlobalStoreF32x4 | MOp::GlobalStoreF32x2 => {
                     if let Some(Src::Reg(a)) = inst.srcs.first() {
                         if m.vreg_class(*a) != RClass::V2 {
                             errs.push(format!("block {bi} inst {ii}: store base must be V2"));

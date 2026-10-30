@@ -242,6 +242,7 @@ pub const ALL_MOPS: &[crate::mir::MOp] = &[
     MOp::BufferWbl2,
     MOp::BufferInv,
     MOp::GlobalStoreF32x4,
+    MOp::GlobalStoreF32x2,
     MOp::SLoadDword,
     MOp::SLoadDwordx2,
     MOp::SReadPhys,
