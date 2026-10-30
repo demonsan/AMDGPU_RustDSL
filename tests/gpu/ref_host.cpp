@@ -165,7 +165,11 @@ int main(int argc, char** argv) {
         set_launch(outp, rows);
         hipEvent_t e0, e1;
         CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
-        for (int w = 0; w < 3; ++w) CK(hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, extra));
+        // Warm-up launches: on a shared node the GPU sits in its idle clock state, so a cold 3-launch
+        // warm-up under-states the first kernel timed. REF_WARMUP (default 3 = historical) lets the
+        // measurement protocol pump enough work through the GPU to reach the boost clock first.
+        const int warm = envi("REF_WARMUP", 3);
+        for (int w = 0; w < warm; ++w) CK(hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, extra));
         CK(hipDeviceSynchronize());
         CK(hipEventRecord(e0));
         for (int w = 0; w < iters; ++w) CK(hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, extra));
