@@ -1522,10 +1522,17 @@ filling shapes (B4H8S2048/B1H8S8192) all stay on the single-launch path. Missed 
 `B1H2S1024 SK1088` split +1.0% (not worth a rule).
 **Re-measured on the patched auto path:** B1H16S256 split **16.4-16.5 us = 129.8-130.7 TFLOP/s** vs
 fallback ~18.9 us (t128) and vendor 112.6 (1.15-1.16x vendor); B2H4S1024 18.8-18.9 us = 227.7 TFLOP/s
-(neutral, above vendor 224); B1H8S1024 18.9 us = 226.7 (neutral, above vendor 223). Auto gate @16 rows
-**15/15 OK, parity 15/15, ours bad=0** with the refit; the 15-shape determinism and 64-row gate are run at
-landing. The change is harness-only (`tests/gpu/ref_host.cpp` eval_split constants/threshold) - **zero
-kernel risk**, one shipped-path win of +13-15% on B1H16S256, neutral on two N=32 shapes.
+(neutral, above vendor 224); B1H8S1024 18.9 us = 226.7 (neutral, above vendor 223).
+
+**Final validation on the post-refit branch rebased onto Main 171f317 (`guard-refit` @ 3b609cc):**
+`_vs128` 64-block **best 453.3 / median 452.4 TFLOP/s**; auto benchmark **707.4 / 696.4 TFLOP/s** (main
+19.9 us, combine 4.0 us); md5 `faadf00c...` bad=0; vs128 `.s` `00d34086...` (0 scalar / 64 dwordx2
+stores); auto gate @16 rows **15/15 OK, parity 15/15, ours bad=0**, @64 rows **12/15 + 3 vendor-fail,
+ours bad=0, parity 15/15**; determinism **5/5 x3**; counters level **66.9**, VMEM inst **5.88**, wave
+cycles **1353.0**, ACTIVE_VALU 403.1, WAIT_INST_ANY 372.7. The 20-shape GRID_ONLY decisions are exactly
+the table above (7 gate splits incl B1H16S256; fills unchanged). The change is harness-only
+(`tests/gpu/ref_host.cpp` eval_split constants/threshold) - **zero kernel risk**, one shipped-path win of
++13-15% on B1H16S256, neutral on two N=32 shapes.
 
 ## 8. Unknowns / limitations
 
