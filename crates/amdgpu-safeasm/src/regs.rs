@@ -68,7 +68,7 @@ pub struct SubMut<'a, const M: usize> {
 #[derive(Debug, Clone, Copy)]
 pub struct Imm<const K: i32>;
 impl<const K: i32> Imm<K> {
-    const OK: () = assert!(K >= -16 && K <= 64, "inline constants are -16..=64; use Lit for a 32-bit literal (VOP2/VOP1/VOPC src0 only)");
+    pub(crate) const OK: () = assert!(K >= -16 && K <= 64, "inline constants are -16..=64; use Lit for a 32-bit literal (VOP2/VOP1/VOPC src0 only)");
     pub const fn new() -> Self {
         let () = Self::OK;
         Imm

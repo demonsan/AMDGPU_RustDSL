@@ -29,6 +29,14 @@ impl<A: Operand, B: Operand> Bus2<A, B> {
     );
 }
 
+struct Bus3<A, B, C>(PhantomData<(A, B, C)>);
+impl<A: Operand, B: Operand, C: Operand> Bus3<A, B, C> {
+    const OK: () = assert!(
+        A::BUS + B::BUS + C::BUS <= 1 && A::VOP3_OK && B::VOP3_OK && C::VOP3_OK,
+        "gfx9 VOP3: at most one SGPR/literal source per instruction (constant bus limit 1) and no 32-bit literal"
+    );
+}
+
 fn inst(op: &'static str, dst: Option<u32>, srcs: Vec<ASrc>) -> AInst {
     AInst { op, dst, srcs, imm: 0 }
 }
@@ -45,40 +53,7 @@ impl Seq {
         self.note_valu_write(dst.dst_id());
     }
 
-    /// `v_add_u32_e32 dst, src0, vsrc1`.
-    pub fn v_add_u32<D: Dst<1>, A: Operand, B: VgprOnly>(&mut self, dst: D, a: A, b: B) {
-        self.push(inst("VAddU32", Some(dst.dst_id()), vec![a.to_src(), b.to_src()]));
-        self.note_valu_write(dst.dst_id());
-    }
-
-    /// `v_add_f32_e32 dst, src0, vsrc1`.
-    pub fn v_add_f32<D: Dst<1>, A: Operand, B: VgprOnly>(&mut self, dst: D, a: A, b: B) {
-        self.push(inst("VAddF32", Some(dst.dst_id()), vec![a.to_src(), b.to_src()]));
-        self.note_valu_write(dst.dst_id());
-    }
-
-    /// `v_add_f32_e32 acc, src0, acc` (accumulate in place).
-    pub fn v_add_f32_acc<A: Operand>(&mut self, acc: &mut Vgpr<1>, a: A) {
-        self.push(inst("VAddF32", Some(acc.id), vec![a.to_src(), ASrc::Reg(acc.id)]));
-        self.note_valu_write(acc.id);
-    }
-
-    // ---- VALU, VOP3 -------------------------------------------------------------------------------------------------------------
-    /// `v_mul_lo_u32 dst, a, b` (VOP3: one scalar source at most, no literal).
-    pub fn v_mul_lo_u32<D: Dst<1>, A: Operand, B: Operand>(&mut self, dst: D, a: A, b: B) {
-        let () = Bus1::<A, B>::OK;
-        self.push(inst("VMulLoU32", Some(dst.dst_id()), vec![a.to_src(), b.to_src()]));
-        self.note_valu_write(dst.dst_id());
-    }
-
     // ---- compare / select through vcc ---------------------------------------------------------------------------------------------
-    /// `v_cmp_lt_i32_e32 vcc, src0, vsrc1`: `Vcc<Free>` in, `Vcc<Live>` out.
-    pub fn v_cmp_lt_i32<A: Operand, B: VgprOnly>(&mut self, _vcc: Vcc<Free>, a: A, b: B) -> Vcc<Live> {
-        self.push(inst("VCmpLtI32", None, vec![a.to_src(), b.to_src()]));
-        self.vcc_written();
-        Vcc { _s: PhantomData }
-    }
-
     /// `v_cndmask_b32_e32 dst, if_false, if_true, vcc`: VGPR sources only (vcc already uses the constant bus). Consumes the mask.
     pub fn v_cndmask_b32<D: Dst<1>, F: VgprOnly, T: VgprOnly>(&mut self, _vcc: Vcc<Live>, dst: D, if_false: F, if_true: T) -> Vcc<Free> {
         self.vcc_ready();
@@ -141,29 +116,29 @@ impl Seq {
 
     // ---- loads (Pending tokens) -----------------------------------------------------------------------------------------------------
     /// `ds_read_b128 dst, vaddr offset:N`: LDS read (lgkmcnt queue). The destination moves into the token.
-    pub fn ds_read_b128(&mut self, dst: Vgpr<4>, addr: &Vgpr<1>, offset: u16) -> Pending<Vgpr<4>> {
-        self.push(AInst { op: "LdsReadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.id)], imm: offset as i64 });
+    pub fn ds_read_b128(&mut self, dst: Vgpr<4>, addr: &impl Readable<1>, offset: u16) -> Pending<Vgpr<4>> {
+        self.push(AInst { op: "LdsReadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: offset as i64 });
         self.clear_write(dst.id);
         self.issue_load(Queue::Lgkm, dst)
     }
 
     /// `ds_read_b32 dst, vaddr offset:N`.
-    pub fn ds_read_b32(&mut self, dst: Vgpr<1>, addr: &Vgpr<1>, offset: u16) -> Pending<Vgpr<1>> {
-        self.push(AInst { op: "LdsReadB32", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.id)], imm: offset as i64 });
+    pub fn ds_read_b32(&mut self, dst: Vgpr<1>, addr: &impl Readable<1>, offset: u16) -> Pending<Vgpr<1>> {
+        self.push(AInst { op: "LdsReadB32", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: offset as i64 });
         self.clear_write(dst.id);
         self.issue_load(Queue::Lgkm, dst)
     }
 
     /// `global_load_dwordx4 dst, vaddr[2], off offset:N` (vmcnt queue).
-    pub fn global_load_dwordx4(&mut self, dst: Vgpr<4>, addr: &Vgpr<2>, offset: i32) -> Pending<Vgpr<4>> {
-        self.push(AInst { op: "GlobalLoadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.id)], imm: offset as i64 });
+    pub fn global_load_dwordx4(&mut self, dst: Vgpr<4>, addr: &impl Readable<2>, offset: i32) -> Pending<Vgpr<4>> {
+        self.push(AInst { op: "GlobalLoadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: offset as i64 });
         self.clear_write(dst.id);
         self.issue_load(Queue::Vm, dst)
     }
 
     /// `ds_write_b32 vaddr, vdata offset:N`: occupies a lgkmcnt slot (no value comes back).
-    pub fn ds_write_b32(&mut self, addr: &Vgpr<1>, data: &Vgpr<1>, offset: u16) {
-        self.push(AInst { op: "LdsWriteB32", dst: None, srcs: vec![ASrc::Reg(addr.id), ASrc::Reg(data.id)], imm: offset as i64 });
+    pub fn ds_write_b32(&mut self, addr: &impl Readable<1>, data: &impl Readable<1>, offset: u16) {
+        self.push(AInst { op: "LdsWriteB32", dst: None, srcs: vec![ASrc::Reg(addr.reg_id()), ASrc::Reg(data.reg_id())], imm: offset as i64 });
         self.issue_store(Queue::Lgkm);
     }
 }
@@ -189,3 +164,23 @@ impl<'a> Smfmac<'a, OP_SMFMAC_FP8> {
         Smfmac { issued, acc: Some(acc), poison: s.poison.clone(), _p: PhantomData }
     }
 }
+
+include!(concat!(env!("OUT_DIR"), "/generated_ops.rs"));
+
+/// Hand-written templates (they carry tokens or type-state): (method, MOp key, kind).
+pub const HAND_WRITTEN_OPS: &[(&str, &str, &str)] = &[
+    ("v_mov_b32", "VMovB32", "vop1 (immediate form)"),
+    ("v_cmp_lt_i32_e64", "VCmpMaskLtI32", "vop3 compare into an SGPR pair (own-backend op)"),
+    ("v_cndmask_b32", "VCndmask", "vcc type-state"),
+    ("v_cndmask_b32_e64", "VCndmaskM", "SGPR-pair mask"),
+    ("v_readfirstlane_b32", "VReadFirstLane", "Ready operand"),
+    ("v_mfma_scale_f32_32x32x64_f8f6f4", "VMfmaScale32x32x64Fp8", "matrix token (chainable)"),
+    ("v_mfma_scale_f32_32x32x64_f8f6f4_zero", "VMfmaScale32x32x64Fp8Z", "matrix token"),
+    ("v_smfmac_f32_16x16x128_fp8_fp8", "VSmfmac16x16x128Fp8", "matrix token (chainable)"),
+    ("ds_read_b128", "LdsReadB128", "Pending (lgkmcnt)"),
+    ("ds_read_b32", "LdsReadB32", "Pending (lgkmcnt)"),
+    ("ds_write_b32", "LdsWriteB32", "lgkm slot"),
+    ("global_load_dwordx4", "GlobalLoadB128", "Pending (vmcnt)"),
+    ("v_add_f32_acc", "VAddF32", "in-place accumulate"),
+    ("v_writesub (zeroed)", "VWriteSub", "register init"),
+];

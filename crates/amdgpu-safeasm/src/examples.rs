@@ -81,3 +81,36 @@ pub fn rowsum_var_block() -> AsmBlock {
     s.output_exit(ex);
     s.finish().expect("rowsum_var_block is a verified sequence")
 }
+
+/// End-to-end runnable fragment (`probe_safeasm_e2e`): ports = [input pointer (V2), output pointer (V2)]. Per lane it loads a float4 from global
+/// memory (vmcnt), runs a scaled MFMA with all-ones fp8 operands while the load is in flight (every D element = 64.0), waits for the load with the
+/// partial count the scoreboard derives, sums the four floats, adds D[0] and stores the result.
+pub fn global_probe_block() -> AsmBlock {
+    let mut s = Seq::new();
+    let p_in = s.input::<2>();
+    let p_out = s.input::<2>();
+    let d = s.vgpr::<4>();
+    let pending = s.global_load_dwordx4(d, &p_in, 0);
+
+    // independent work while the load is in flight: 0x38 is fp8 e4m3 1.0, scale 127 is 2^0
+    let a = s.filled::<8>(0x3838_3838);
+    let b = s.filled::<8>(0x3838_3838);
+    let sa = s.splat(127);
+    let sb = s.splat(127);
+    let acc = s.vgpr::<16>();
+    let (ra, rb, rsa, rsb) = (s.ready(&a), s.ready(&b), s.ready(&sa), s.ready(&sb));
+    let acc = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(acc, ra, rb, rsa, rsb).retire(&mut s);
+
+    let d = pending.wait(&mut s); // s_waitcnt vmcnt(0)
+    let (l0, l1, l2, l3) = (s.lane::<4, 0>(&d), s.lane::<4, 1>(&d), s.lane::<4, 2>(&d), s.lane::<4, 3>(&d));
+    let (mut x, mut y, mut t, mut r) = (s.vgpr::<1>(), s.vgpr::<1>(), s.vgpr::<1>(), s.vgpr::<1>());
+    s.v_add_f32(&mut x, l0, l1);
+    s.v_add_f32(&mut y, l2, l3);
+    s.v_add_f32(&mut t, &x, &y);
+    let c = s.lane::<16, 0>(&acc);
+    s.v_add_f32(&mut r, c, &t);
+    s.global_store_dword(&p_out, &r, 0);
+    s.wait_vm_all();
+    s.output(r);
+    s.finish().expect("global_probe_block is a verified sequence")
+}
