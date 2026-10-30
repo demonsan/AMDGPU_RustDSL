@@ -23,7 +23,7 @@ fn is_matrix(op: &str) -> bool {
 fn is_load(op: &str) -> Option<bool> {
     // Some(true) = lgkm queue, Some(false) = vm queue
     match op {
-        "LdsReadB32" | "LdsReadB128" | "LdsReadB64" => Some(true),
+        "LdsReadB32" | "LdsReadB128" | "LdsReadB64" | "LdsReadB64TrB8" => Some(true),
         o if o.starts_with("GlobalLoad") => Some(false),
         _ => None,
     }
@@ -148,7 +148,7 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
             if let Some(d) = d {
                 valu_write.remove(&d);
             }
-        } else if i.op == "LdsWriteB32" {
+        } else if i.op == "LdsWriteB32" || i.op == "LdsWriteB128" {
             lgkm.push(None);
         } else if matrix {
             if let Some(d) = dst {

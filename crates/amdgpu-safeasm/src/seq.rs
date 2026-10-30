@@ -14,6 +14,10 @@ use std::rc::Rc;
 pub const VALU_TO_MATRIX_READ: u32 = 2;
 /// Wait states between a (scaled) MFMA / SMFMAC and the first reader of its result (hardware-confirmed: 19 is still stale).
 pub const MATRIX_RESULT: u32 = 20;
+/// Wait states between a transcendental op (`v_exp/rcp/log_f32`) and any reader of its result (hazards.rs TRANS_LATENCY = 5 slots).
+pub const TRANS_RESULT: u32 = 4;
+/// Wait states between a packed-fp32 op and a transcendental op that reads its result (hazards.rs `pkw`).
+pub const PK_TO_TRANS: u32 = 1;
 /// Wait states between a compare that writes `vcc` and the `v_cndmask` that reads it.
 pub const VCC_TO_CNDMASK: u32 = 2;
 
@@ -70,6 +74,7 @@ pub struct Seq {
     pub(crate) clock: u32,
     writes: HashMap<VReg, Write>,
     vcc_taken: bool,
+    pk_writes: HashMap<VReg, u32>,
     vcc_written_at: u32,
     zero: Option<VReg>,
     inputs: Vec<AsmPort>,
@@ -97,6 +102,7 @@ impl Seq {
             clock: 0,
             writes: HashMap::new(),
             vcc_taken: false,
+            pk_writes: HashMap::new(),
             vcc_written_at: 0,
             zero: None,
             inputs: Vec::new(),
@@ -262,6 +268,19 @@ impl Seq {
         let c = self.canon(r);
         let at = self.clock - 1;
         self.writes.insert(c, Write { at, need });
+    }
+
+    pub(crate) fn note_pk_write(&mut self, r: VReg) {
+        let c = self.canon(r);
+        let at = self.clock - 1;
+        self.pk_writes.insert(c, at);
+    }
+
+    pub(crate) fn pad_for_pk(&mut self, r: VReg) {
+        let c = self.canon(r);
+        if let Some(at) = self.pk_writes.get(&c).copied() {
+            self.pad_after(at, PK_TO_TRANS);
+        }
     }
 
     pub(crate) fn clear_write(&mut self, r: VReg) {

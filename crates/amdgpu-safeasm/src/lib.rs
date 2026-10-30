@@ -19,12 +19,15 @@
 pub mod block;
 pub mod examples;
 pub mod ops;
+pub mod partial;
 pub mod regs;
 pub mod seq;
 mod verify;
 
 pub use block::*;
 pub use regs::*;
+pub use ops::Trans;
+pub use partial::{Pw, Set, Unset};
 pub use seq::{Free, Live, Mfma, Pending, Seq, Smfmac, Vcc, OP_MFMA_SCALE, OP_MFMA_SCALE_ZERO, OP_SMFMAC_FP8};
 /// Verify an alternative instruction list (same registers and ports) with the block's rules: lets the compiler check that a rewrite of the
 /// stream (constant folding) keeps every wait-state distance.
