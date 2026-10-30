@@ -55,11 +55,14 @@ int main(int argc, char** argv) {
     //   Overrides: REF_ROWS_PER_BLOCK=128|256, REF_GRID128=1, REF_OURS_BLOCK_THREADS.
     const char* kname_env = std::getenv("REF_KNAME2");
     const char* co_small = std::getenv("REF_CO2_SMALL");
+    if (co_small && !*co_small) co_small = nullptr;   // run_ref.sh passes empty strings for the variants it does not build
     const char* kname_small = std::getenv("REF_KNAME2_SMALL") ? std::getenv("REF_KNAME2_SMALL") : "fmha_fwd_hd128_mxfp8_t128";
     // KV-split candidate (docs/kvsplit-design.md): split kernel writes Ohat/lse partials, combine kernel merges.
     const char* co_split = std::getenv("REF_CO2_SPLIT");
+    if (co_split && !*co_split) co_split = nullptr;
     const char* kname_split = std::getenv("REF_KNAME2_SPLIT") ? std::getenv("REF_KNAME2_SPLIT") : "fmha_fwd_hd128_mxfp8_kvsplit";
     const char* co_comb = std::getenv("REF_CO2_COMBINE");
+    if (co_comb && !*co_comb) co_comb = nullptr;
     const char* kname_comb = std::getenv("REF_KNAME2_COMBINE") ? std::getenv("REF_KNAME2_COMBINE") : "fmha_fwd_hd128_mxfp8_kvsplit_combine4h";
     int splits = envi("REF_SPLIT", 0);
     const bool force_split = envi("REF_SPLIT_FORCE", 0) != 0;
