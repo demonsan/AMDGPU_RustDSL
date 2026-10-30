@@ -538,11 +538,13 @@ impl Lowerer {
             AClass::S1 => RClass::S1,
             AClass::S2 => RClass::S2,
         };
-        if inputs.len() != block.inputs.len() {
-            return Err(format!("asm block `{}`: {} inputs bound, {} ports", block.name, inputs.len(), block.inputs.len()));
+        // belt and braces: the block was verified when it was built, a lowered block is re-verified (it may come from another build)
+        block.verify().map_err(|e| format!("asm block `{}` fails the hazard verifier: {}", block.name(), e.join("; ")))?;
+        if inputs.len() != block.inputs().len() {
+            return Err(format!("asm block `{}`: {} inputs bound, {} ports", block.name(), inputs.len(), block.inputs().len()));
         }
-        let mut map: Vec<Option<VReg>> = vec![None; block.regs.len()];
-        for (p, o) in block.inputs.iter().zip(inputs) {
+        let mut map: Vec<Option<VReg>> = vec![None; block.regs().len()];
+        for (p, o) in block.inputs().iter().zip(inputs) {
             let r = match p.class {
                 AClass::V1 => self.as_v1(*o)?,
                 AClass::V2 => self.as_v2(*o)?,
@@ -555,35 +557,35 @@ impl Lowerer {
             map[p.reg as usize] = Some(r);
         }
         // constants: a one-dword register written once by `v_mov_b32 imm` is the region's cached constant register
-        let mut ndefs = vec![0u32; block.regs.len()];
-        for i in &block.insts {
+        let mut ndefs = vec![0u32; block.regs().len()];
+        for i in &block.insts() {
             if let Some(d) = i.dst {
                 ndefs[d as usize] += 1;
             }
         }
-        let aliased: std::collections::HashSet<u32> = block.alias.iter().map(|a| a.0).collect();
-        let mut skip = vec![false; block.insts.len()];
-        let is_port = |r: u32| block.inputs.iter().chain(block.outputs.iter()).any(|p| p.reg == r);
-        for (k, i) in block.insts.iter().enumerate() {
+        let aliased: std::collections::HashSet<u32> = block.alias().iter().map(|a| a.0).collect();
+        let mut skip = vec![false; block.insts().len()];
+        let is_port = |r: u32| block.inputs().iter().chain(block.outputs().iter()).any(|p| p.reg == r);
+        for (k, i) in block.insts().iter().enumerate() {
             if let ("VMovB32", Some(d), true) = (i.op, i.dst, i.srcs.is_empty()) {
                 let d = d as usize;
-                if ndefs[d] == 1 && block.regs[d] == AClass::V1 && map[d].is_none() && !aliased.contains(&(d as u32)) && !is_port(d as u32) {
+                if ndefs[d] == 1 && block.regs()[d] == AClass::V1 && map[d].is_none() && !aliased.contains(&(d as u32)) && !is_port(d as u32) {
                     map[d] = Some(self.const_vreg(i.imm));
                     skip[k] = true;
                 }
             }
         }
-        for (i, c) in block.regs.iter().enumerate() {
+        for (i, c) in block.regs().iter().enumerate() {
             if map[i].is_none() && !aliased.contains(&(i as u32)) {
                 map[i] = Some(self.new_vreg(rc(*c)));
             }
         }
-        for (a, base, off) in &block.alias {
+        for (a, base, off) in block.alias() {
             let b = map[*base as usize].ok_or("asm block: alias of an unmapped register")?;
-            map[*a as usize] = Some(self.sub_alias(b, *off, rc(block.regs[*a as usize])));
+            map[*a as usize] = Some(self.sub_alias(b, *off, rc(block.regs()[*a as usize])));
         }
         let m = |r: u32| map[r as usize].expect("unmapped asm register");
-        for (k, i) in block.insts.iter().enumerate() {
+        for (k, i) in block.insts().iter().enumerate() {
             if skip[k] {
                 continue;
             }
@@ -600,7 +602,7 @@ impl Lowerer {
             }
             self.push(mi.imm(i.imm));
         }
-        let out = block.outputs.first().ok_or("asm block has no output port")?;
+        let out = block.outputs().first().ok_or("asm block has no output port")?;
         self.val.insert(dst, m(out.reg));
         Ok(())
     }

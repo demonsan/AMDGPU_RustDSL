@@ -1159,10 +1159,10 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
                 match op {
                     Op::Asm { block, inputs } => {
-                        if inputs.len() != block.inputs.len() {
-                            errs.push(here(format!("asm block `{}`: {} inputs bound, {} ports", block.name, inputs.len(), block.inputs.len())));
+                        if inputs.len() != block.inputs().len() {
+                            errs.push(here(format!("asm block `{}`: {} inputs bound, {} ports", block.name(), inputs.len(), block.inputs().len())));
                         } else {
-                            for (k, (p, o)) in block.inputs.iter().zip(inputs).enumerate() {
+                            for (k, (p, o)) in block.inputs().iter().zip(inputs).enumerate() {
                                 let ty = match o {
                                     Opnd::Val(v) => f.value_ty(*v),
                                     Opnd::Var(v) => f.var_ty(*v),
@@ -1171,12 +1171,12 @@ pub fn verify(f: &Function) -> Vec<String> {
                                 };
                                 match ty {
                                     Some(t) if asm_port_accepts(p.class, t) => {}
-                                    other => errs.push(here(format!("asm block `{}`: input {k} is {other:?}, the port is {:?}", block.name, p.class))),
+                                    other => errs.push(here(format!("asm block `{}`: input {k} is {other:?}, the port is {:?}", block.name(), p.class))),
                                 }
                             }
                         }
-                        if block.outputs.is_empty() {
-                            errs.push(here(format!("asm block `{}` has no output port", block.name)));
+                        if block.outputs().is_empty() {
+                            errs.push(here(format!("asm block `{}` has no output port", block.name())));
                         }
                     }
                     Op::AddI32(a, b)
@@ -1824,7 +1824,7 @@ pub fn lint(f: &Function) -> Vec<String> {
 /// Value type of a safe-asm block's single output port (`I32` for one dword: callers bitcast as needed).
 pub fn asm_out_ty(b: &amdgpu_safeasm::AsmBlock) -> DType {
     use amdgpu_safeasm::AClass;
-    match b.outputs.first().map(|p| p.class) {
+    match b.outputs().first().map(|p| p.class) {
         Some(AClass::V2) => DType::Frag2,
         Some(AClass::V4) => DType::Frag4,
         Some(AClass::V8) => DType::Frag8,

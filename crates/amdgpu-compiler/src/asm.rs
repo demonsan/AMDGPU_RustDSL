@@ -31,7 +31,7 @@ pub fn mop_by_name(n: &str) -> Option<MOp> {
 
 /// The block's instructions as MIR instructions with registers numbered as in the block.
 pub fn block_insts(b: &AsmBlock) -> Result<Vec<MInst>, String> {
-    b.insts
+    b.insts()
         .iter()
         .map(|i| {
             let op = mop_by_name(i.op).ok_or_else(|| format!("unknown op `{}`", i.op))?;
@@ -51,6 +51,7 @@ pub fn block_insts(b: &AsmBlock) -> Result<Vec<MInst>, String> {
 }
 
 pub fn block_to_mfunction(b: &AsmBlock, name: &str) -> Result<MFunction, String> {
+    b.verify().map_err(|e| format!("unverified sequence: {}", e.join("; ")))?;
     let mut blk = Block::new(0);
     blk.insts = block_insts(b)?;
     Ok(MFunction {
@@ -60,9 +61,9 @@ pub fn block_to_mfunction(b: &AsmBlock, name: &str) -> Result<MFunction, String>
         workgroup_size: 64,
         lds_bytes: 0,
         blocks: vec![blk],
-        vregs: b.regs.iter().map(|c| rclass(*c)).collect(),
+        vregs: b.regs().iter().map(|c| rclass(*c)).collect(),
         loops: Vec::new(),
-        alias: b.alias.iter().map(|(a, base, off)| (*a, (*base, *off))).collect(),
+        alias: b.alias().iter().map(|(a, base, off)| (*a, (*base, *off))).collect(),
         elide_fallthrough: false,
     })
 }
