@@ -15390,6 +15390,82 @@ pub fn probe_la_verify() -> Function {
     b.finish()
 }
 
+/// Conversion-chain probe, DSL path vs safe-asm path (`probe_cvtchain_asm` embeds `examples::cvt_chain_block`): each lane loads 8 scores, runs
+/// pk_add / pk_mul / pknorm / svcorr (lshr, and, perm, pk_sub) / scalef32 fp8 packing, stages the two P words in LDS and reads them back with the
+/// transposed `ds_read_b64_tr_b8`; the two results are stored. Both kernels must produce bit-identical outputs.
+fn probe_cvtchain(name: &str, use_asm: bool) -> Function {
+    let mut b = FnBuilder::new(name, 64);
+    b.lds(512);
+    b.arg("inp", DType::Ptr, 0, 8);
+    b.arg("outp", DType::Ptr, 8, 8);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let outp = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c32 = b.c_i32(32);
+    let c8 = b.c_i32(8);
+    let off_in = b.mul_i32(tid, c32);
+    let pin = b.ptr_add(inp, off_in);
+    let v0 = b.load_b128(pin, 0);
+    let v1 = b.load_b128(pin, 16);
+    let dl = b.c_f32(0.25);
+    let sl = b.c_f32(0.5);
+    let delta2 = b.frag2_dup(dl);
+    let scale2 = b.frag2_dup(sl);
+    let addr = b.mul_i32(tid, c8);
+    let t = if use_asm {
+        b.asm(amdgpu_safeasm::examples::cvt_chain_block(), &[Opnd::Val(v0), Opnd::Val(v1), Opnd::Val(delta2), Opnd::Val(scale2), Opnd::Val(addr)])
+    } else {
+        let cmask = b.c_i32(0x0007_0007);
+        let csel = b.c_i32(0x0c0c_0400);
+        let cscale = b.c_i32(127);
+        let c4 = b.c_i32(4);
+        let mut words = Vec::new();
+        for v in [v0, v1] {
+            let mut ys = Vec::new();
+            for j in 0..2u8 {
+                let a = b.frag4_lane(v, 2 * j);
+                let a = b.bitcast_f32(a);
+                let c = b.frag4_lane(v, 2 * j + 1);
+                let c = b.bitcast_f32(c);
+                let p = b.frag2(a, c);
+                let q = b.pk_add_f32(p, delta2);
+                let r = b.pk_mul_f32(q, scale2);
+                let lo = b.frag2_lane(r, 0);
+                let hi = b.frag2_lane(r, 1);
+                let u = b.cvt_pknorm_u16_f32(lo, hi);
+                let sh = b.let_(Op::LshrI32(Opnd::Val(u), Opnd::Val(c4)));
+                let m = b.let_(Op::AndI32(Opnd::Val(sh), Opnd::Val(cmask)));
+                let x = b.perm_b32(m, m, csel);
+                let y = b.pk_sub_u16(u, x);
+                ys.push(y);
+            }
+            words.push(b.cvt_p8x4_from_u16(ys[0], ys[1], cscale));
+        }
+        let c4b = b.c_i32(4);
+        let addr1 = b.add_i32(addr, c4b);
+        b.store_lds_b32(addr, words[0]);
+        b.store_lds_b32(addr1, words[1]);
+        b.wait_lds(0);
+        b.load_lds_tr_b8(addr)
+    };
+    let l0 = b.frag2_lane(t, 0);
+    let l1 = b.frag2_lane(t, 1);
+    let f0 = b.bitcast_f32(l0);
+    let f1 = b.bitcast_f32(l1);
+    let off_out = b.mul_i32(tid, c8);
+    let po = b.ptr_add(outp, off_out);
+    b.store_f32(po, 0, f0);
+    b.store_f32(po, 4, f1);
+    b.finish()
+}
+
+pub fn probe_cvtchain_dsl() -> Function {
+    probe_cvtchain("probe_cvtchain_dsl", false)
+}
+pub fn probe_cvtchain_asm() -> Function {
+    probe_cvtchain("probe_cvtchain_asm", true)
+}
+
 pub fn probe_log_store4() -> Function {
     // out[4*tid + j] = log2(in[tid]) for j in 0..4: covers v_log_f32 and global_store_dwordx4 on both backends
     let mut b = FnBuilder::new("probe_log_store4", 64);
