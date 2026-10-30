@@ -396,6 +396,8 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
     let overlaps = |x: (u32, u32), y: (u32, u32)| x.0 < y.1 && y.0 < x.1;
     // MFMA DESTINATIONS still being written when the block is left (per block: canonical vreg, physical range, remaining wait states). A register reuse
     // by a different value in the successor must wait too. Computed from the unpadded block (padding only shortens what remains).
+    // AMDC_NO_PHYS_WAW=1 disables the MFMA-destination padding (A/B audit of the shipped kernels only)
+    let waw_on = std::env::var("AMDC_NO_PHYS_WAW").map(|v| v.is_empty() || v == "0").unwrap_or(true);
     let succs = crate::sched::liveness::successors(m);
     let exit_dst: Vec<Vec<(VReg, (u32, u32), usize)>> = m
         .blocks
@@ -404,7 +406,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
             let mut cycle = 0usize;
             let mut live: Vec<(usize, usize, VReg, (u32, u32))> = Vec::new();
             for inst in &b.insts {
-                if let (Some(l), Some(d)) = (mfma_latency(inst.op), inst.dst) {
+                if let (true, Some(l), Some(d)) = (waw_on, mfma_latency(inst.op), inst.dst) {
                     live.push((cycle, mfma_dst_wait(l), m.canon(d), rng(m, d)));
                 }
                 if matches!(inst.op, MOp::SNop) {
@@ -531,7 +533,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
                 inflight.push((cycle, need, inst.op, srcs));
             }
-            if let (Some(l), Some(d)) = (mfma_latency(inst.op), inst.dst) {
+            if let (true, Some(l), Some(d)) = (waw_on, mfma_latency(inst.op), inst.dst) {
                 dst_inflight.push((cycle, mfma_dst_wait(l), m.canon(d), rng(m, d)));
             }
             if matches!(inst.op, MOp::SNop) {

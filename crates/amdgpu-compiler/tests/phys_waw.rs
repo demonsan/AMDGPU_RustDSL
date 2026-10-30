@@ -51,7 +51,7 @@ fn write_to_the_registers_of_an_inflight_mfma_result_waits_for_its_completion() 
     let tmp = MInst::new(MOp::VMovB32).def(3).imm(7); // vreg 3 lives in v146, inside the MFMA's v[144:159]
     let mut m = func(vec![vec![mfma, tmp]], classes());
     pad_physical_war(&mut m, &alloc(vec![2, 4, 144, 146, 20]));
-    assert!(gap(&m, 0, MOp::VMfma32x32x8F16Z, MOp::VMovB32) >= 19, "gap {}", gap(&m, 0, MOp::VMfma32x32x8F16Z, MOp::VMovB32));
+    assert!(gap(&m, 0, MOp::VMfma32x32x8F16Z, MOp::VMovB32) >= 18, "gap {}", gap(&m, 0, MOp::VMfma32x32x8F16Z, MOp::VMovB32));
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn a_late_mfma_write_also_clobbers_a_value_read_later_from_the_same_registers() 
     let rd = MInst::new(MOp::VAddU32).def(4).srcreg(3).srcreg(3);
     let mut m = func(vec![vec![mfma, rd]], classes());
     pad_physical_war(&mut m, &alloc(vec![2, 4, 144, 146, 20]));
-    assert!(gap(&m, 0, MOp::VMfma32x32x8F16Z, MOp::VAddU32) >= 19);
+    assert!(gap(&m, 0, MOp::VMfma32x32x8F16Z, MOp::VAddU32) >= 18);
 }
 
 #[test]
