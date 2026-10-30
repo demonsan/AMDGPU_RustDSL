@@ -87,7 +87,7 @@ pub fn cost(op: MOp) -> OpCost {
         | VCvtF16F32 | VCndmask | VReadSub | VWriteSub | VCmpLtI32 | VCmpGeI32 | VCmpGtI32 | VCmpNeI32 | VCmpLtF32 | VCmpMaskLtI32 | VCmpMaskGeI32 | VCmpMaskGtI32 | VCmpMaskLtF32 | VCndmaskM
         | VAddCoU32 | VAddcCoU32 | VPkAddF32 | VPkMulF32 => c(Valu, 4, 4, Verified),
         // 8 cycles (V): fp8 conversion, permlane32_swap, exp/rcp (no separate trans pipe: 8 + 4k for k adds).
-        VCvtPkFp8F32 | VCvtPkFp8Lo | VCvtPkFp8Hi | VCvtPkFp8F32Hi | VPermlane32Swap | VExpF32 | VRcpF32 => {
+        VCvtPkFp8F32 | VCvtPkFp8Lo | VCvtPkFp8Hi | VCvtPkFp8F32Hi | VPermlane32Swap | VExpF32 | VLogF32 | VRcpF32 => {
             c(Valu, 8, 8, Verified)
         }
         VMulLoU32 => c(Valu, 16, 16, Unknown),
@@ -110,7 +110,7 @@ pub fn cost(op: MOp) -> OpCost {
         GlobalLoadU16 | GlobalLoadF32 | GlobalLoadF32S => c(Vmem, 4, 220, Experimental),
         GlobalLoadB128 | GlobalLoadB128S => c(Vmem, 14, 240, Experimental),
         GlobalLoadLdsB128 | GlobalLoadLdsB32 => c(Vmem, 14, 240, Unknown),
-        GlobalStoreU16 | GlobalStoreF32 => c(Vmem, 8, 4, Unknown),
+        GlobalStoreU16 | GlobalStoreF32 | GlobalStoreF32x4 => c(Vmem, 8, 4, Unknown),
         SLoadDword | SLoadDwordx2 => c(Smem, 4, 200, Unknown),
         SReadPhys | SMovB32 | SAddU32 | SAddcU32 | SMulI32 | SShlB32 | SLshrB32 | SAndB32 | SXorB32 | SCmpLtI32 => c(Salu, 4, 4, Verified),
         SBarrier | SSetPrio | SNop | SWaitVm | SWaitLgkm | SEndpgm => c(Ctrl, 4, 4, Verified),    }

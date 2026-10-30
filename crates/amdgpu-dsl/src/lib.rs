@@ -231,6 +231,8 @@ pub enum Op {
     CvtPkBf16F32(Opnd, Opnd),
     /// Base-2 exponential: the hardware primitive (_exp_f32), no log2(e) scaling.
     Exp2F32(Opnd),
+    /// Base-2 logarithm: the hardware primitive (v_log_f32).
+    Log2F32(Opnd),
     /// Dwords `index` and `index + 1` (`index` even) of a fragment as a `Frag2` (register alias, no instruction).
     Frag16Pair { frag: Opnd, index: u8 },
     /// A `Frag2` with both dwords set to one 32-bit value.
@@ -265,7 +267,7 @@ impl Op {
             Op::AddF32(..) | Op::SubF32(..) | Op::MulF32(..) | Op::MaxF32(..) | Op::FmaF32(..) => {
                 DType::F32
             }
-            Op::ExpF32(..) | Op::Exp2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } => DType::F32,
+            Op::ExpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } => DType::F32,
             Op::CvtF32ToF16(..) => DType::I32,
             Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
             Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::CmpLtF32(..) | Op::NotI1(..) => DType::I1,
@@ -325,7 +327,7 @@ impl Op {
             | Op::PtrAdd { base: a, byte_off: b } => vec![*a, *b],
             Op::FmaF32(a, b, c) => vec![*a, *b, *c],
             Op::Max3F32(a, b, c) => vec![*a, *b, *c],
-            Op::ExpF32(a) | Op::Exp2F32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
+            Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
                 vec![*a]
             }
             Op::Select { cond, a, b, .. } => vec![*cond, *a, *b],
@@ -374,6 +376,8 @@ pub enum Stmt {
     Let { dst: ValueId, op: Op },
     StoreU16 { base: Opnd, byte_off: u32, value: Opnd },
     StoreF32 { base: Opnd, byte_off: u32, value: Opnd },
+    /// 16-byte global store of a Frag4 (`global_store_dwordx4`).
+    StoreF32x4 { base: Opnd, byte_off: u32, value: Opnd },
     /// Write one dword into workgroup LDS; `addr` is a byte offset.
     StoreLdsB32 { addr: Opnd, value: Opnd },
     /// Write four dwords (16 B) into workgroup LDS.
@@ -476,6 +480,9 @@ impl Function {
                 }
                 Stmt::StoreF32 { base, byte_off, value } => {
                     let _ = writeln!(s, "{pad}store f32 [{base:?}+{byte_off}] <- {value:?}");
+                }
+                Stmt::StoreF32x4 { base, byte_off, value } => {
+                    let _ = writeln!(s, "{pad}store f32x4 [{base:?}+{byte_off}] <- {value:?}");
                 }
                 Stmt::StoreLdsB32 { addr, value } => {
                     let _ = writeln!(s, "{pad}lds[{addr:?}] <- {value:?}");
@@ -617,6 +624,10 @@ impl FnBuilder {
 
     pub fn store_f32(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::StoreF32 { base: base.into(), byte_off, value: value.into() });
+    }
+
+    pub fn store_f32x4(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::StoreF32x4 { base: base.into(), byte_off, value: value.into() });
     }
 
     pub fn set_var(&mut self, var: VarId, value: impl Into<Opnd>) {
@@ -845,6 +856,10 @@ impl FnBuilder {
     /// Pack two f32 into two E4M3 fp8 bytes (upper 16 bits are zero).
     pub fn exp2_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Exp2F32(a.into()))
+    }
+
+    pub fn log2_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Log2F32(a.into()))
     }
 
     pub fn cvt_pk_bf16_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
@@ -1227,7 +1242,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
-                    Op::ExpF32(a) | Op::Exp2F32(a) | Op::RcpF32(a) => {
+                    Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) => {
                         if let Err(e) = expect_float(f, *a, "unary float") {
                             errs.push(here(e));
                         }
@@ -1504,6 +1519,11 @@ pub fn verify(f: &Function) -> Vec<String> {
                     if !vars_defined.contains(v) {
                         errs.push(here(format!("var{v} used before its loop")));
                     }
+                }
+            }
+            Stmt::StoreF32x4 { base, .. } => {
+                if let Err(e) = expect_ptr(f, *base, "store") {
+                    errs.push(here(e));
                 }
             }
             Stmt::StoreF32 { base, value, .. } => {
@@ -1793,7 +1813,7 @@ pub mod kernels;
 fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
     match st {
         Stmt::Let { op, .. } => op.operands(),
-        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } => vec![*base, *value],
+        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } => vec![*base, *value],
         Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } => vec![*addr, *value],
         Stmt::LoadGlobalLds { base, lds_addr, .. } => vec![*base, *lds_addr],
         Stmt::SetVar { value, .. } => vec![*value],

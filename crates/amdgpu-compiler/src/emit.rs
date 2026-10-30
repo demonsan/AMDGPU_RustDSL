@@ -326,6 +326,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[2])
         )],
         MOp::VExpF32 => un(a, inst, "v_exp_f32_e32"),
+        MOp::VLogF32 => un(a, inst, "v_log_f32_e32"),
         MOp::VRcpF32 => un(a, inst, "v_rcp_f32_e32"),
         MOp::VCvtF32F16 => un(a, inst, "v_cvt_f32_f16_e32"),
         MOp::VCvtF16F32 => un(a, inst, "v_cvt_f16_f32_e32"),
@@ -531,6 +532,12 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             "global_store_dword {}, {}, off{}",
             pair(a, reg_of(&inst.srcs[0])),
             vr(a, reg_of(&inst.srcs[1])),
+            if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
+        )],
+        MOp::GlobalStoreF32x4 => vec![format!(
+            "global_store_dwordx4 {}, {}, off{}",
+            pair(a, reg_of(&inst.srcs[0])),
+            tuple(a, reg_of(&inst.srcs[1]), 4),
             if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
         )],
         MOp::SLoadDword => vec![format!("s_load_dword {}, s[0:1], {}", d_s(a, inst), inst.imm)],
