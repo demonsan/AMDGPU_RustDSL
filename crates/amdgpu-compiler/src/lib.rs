@@ -62,7 +62,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
     // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
     // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/status.md round 47).
-    let base = if f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
+    let base = if (f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") || f.name.ends_with("_g2")) && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
         // measured on vs128 (15/15, 301.9-304.0 vs 280.6 TFLOP/s): retarget2 (cvt results written straight into the MFMA fragment
         // lanes), imm and sgpr cut ~230 copies/VALU and free 12 VGPRs; addrfold and shl are slower and stay off. `imm` also gives
         // the vs128/vsm builds the register slack they need (docs/status.md rounds 49-50).
@@ -85,13 +85,13 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // transposed kernel, bit-identical results (measured, docs/status.md round 44). AMDC_SCHED=0 turns it off.
     let sched_opts = match sched_opts {
         None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0")
-            && (f.name.starts_with("fmha_fwd_hd128_mxfp8_t") || f.name.starts_with("fmha_fwd_hd128_mxfp8_sv") || f.name.starts_with("fmha_fwd_hd128_mxfp8_vs")) =>
+            && (f.name.starts_with("fmha_fwd_hd128_mxfp8_t") || f.name.starts_with("fmha_fwd_hd128_mxfp8_sv") || f.name.starts_with("fmha_fwd_hd128_mxfp8_vs") || f.name.ends_with("_g2")) =>
         {
             // "ld" preset: scoreboard (partial) waits + ds_read hoisting, no instruction reordering. Measured best on the
             // merged tree (docs/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
             let mut o = sched::Options::default();
             // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/status.md round 49)
-            if !f.name.ends_with("_vs128") && !f.name.ends_with("_vsm") {
+            if !f.name.ends_with("_vs128") && !f.name.ends_with("_vsm") && !f.name.ends_with("_g2") {
                 o.reorder = false;
                 o.alu_across_barrier = true;
                 o.ldshoist = true; // hoist ds_read above independent work (docs/scheduling.md); AMDC_SCHED=0 / 1 / auto / OPTS override
@@ -183,7 +183,7 @@ pub fn resolve_backend(name: &str, f: &amdgpu_dsl::Function) -> (String, Option<
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
-    &["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_pp", "fmha_fwd_hd128_mxfp8_sv", "sched_coissue_both", "sched_coissue_mfma", "sched_coissue_valu", "sched_coissue_cboth", "sched_coissue_cvalu", "sched_valu_mul", "sched_valu_max3", "sched_valu_exp", "sched_mfma_chain", "sched_mfma_valu16", "sched_mfma_valu4", "sched_diamond", "sched_occ_chain"]
+    &["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_pp", "fmha_fwd_hd128_mxfp8_sv", "sched_ovl_both", "sched_ovl_mfma", "sched_ovl_valu", "sched_ovl_vfirst", "sched_coissue_both", "sched_coissue_mfma", "sched_coissue_valu", "sched_coissue_cboth", "sched_coissue_cvalu", "sched_valu_mul", "sched_valu_max3", "sched_valu_exp", "sched_mfma_chain", "sched_mfma_valu16", "sched_mfma_valu4", "sched_diamond", "sched_occ_chain"]
 }
 
 pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
@@ -247,6 +247,11 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "sched_mfma_chain" => Some(amdgpu_dsl::kernels::sched_mfma_chain()),
         "sched_mfma_valu16" => Some(amdgpu_dsl::kernels::sched_mfma_valu16()),
         "sched_coissue_both" => Some(amdgpu_dsl::kernels::sched_coissue_both()),
+        "fmha_fwd_hd128_mxfp8_g2" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_g2()),
+        "sched_ovl_both" => Some(amdgpu_dsl::kernels::sched_ovl_both()),
+        "sched_ovl_mfma" => Some(amdgpu_dsl::kernels::sched_ovl_mfma()),
+        "sched_ovl_valu" => Some(amdgpu_dsl::kernels::sched_ovl_valu()),
+        "sched_ovl_vfirst" => Some(amdgpu_dsl::kernels::sched_ovl_vfirst()),
         "sched_coissue_mfma" => Some(amdgpu_dsl::kernels::sched_coissue_mfma()),
         "sched_coissue_valu" => Some(amdgpu_dsl::kernels::sched_coissue_valu()),
         "sched_coissue_cboth" => Some(amdgpu_dsl::kernels::sched_coissue_cboth()),
