@@ -41,3 +41,27 @@ LDS per block 99840 B (1 block/CU); the Q staging region is gone (Q resident). L
 2. Kernel: `emit_fmha_t128_role` = `g3` role with a single group doing both staging roles; ring 3 slots; one barrier per tile.
 3. Correctness (bit-identical md5 on 1 8 2048 2048 vs `_vs128`), 15 shapes, bad = 0 at 64 rows, determinism, parity.
 4. Measure absolute TFLOP/s on all 15 shapes (B1H8S2048 first), per-CU rate, the single-wave tile time T by ablation, and a large filled shape for the no-regression check.
+
+## 9. Prototype results (`fmha_fwd_hd128_mxfp8_t128`, own backend, by name only)
+Kernel: 4 waves (256 threads) per block, 128 rows per block, `g3` merged window (one barrier per tile), 3-slot ring (LDS 135168 B: one block per CU), cooperative staging (wave w stages K rows [32w, 32w+32) and V rows [32w, 32w+32): the 4 waves cover the tile exactly once; 8 DMA per wave per tile, 32 per block = 32 KB, nothing redundant), short/long recipe copies like `_vs128`; host launches `ceil(S/128)` blocks of 256 threads (`ref_host` does it automatically for `*t128`).
+**Scheduler fit (the decisive item).** The default lowering list made the full list scheduler fall back to the unscheduled code ("out of VGPRs allocating r2040 (V8)": eight V16 loop-carried S/O tiles + five V8 P/Q fragments + 54 single registers = 252 of 256): 416.5 TFLOP/s. Adding the `addrfold` lowering option (DMA address folding; `_t128` only) makes it fit (vgpr 252) with the full scheduler: **494.1**. The `ld` preset (no reordering) gave 456.8-464.1. Defaults for `_t128` in `lib.rs`: lowering + `addrfold`, full list scheduler.
+**B1H8S2048 (64 blocks of 256 rows today, 128 blocks of 128 rows)**: `_vs128` 367.8 -> **t128 484.8-494.1 TFLOP/s (1.32-1.34x)**; output bit-identical (md5 faadf00c); T = (0.0348 ms - 0.011 ms) x 2.4e9 / 16 = **3.57k cycles per tile** (4.5k with the fallback code, 3.9k with `ld`). Per-CU: 494 / 128 = 3.8 TFLOP/s/CU vs 5.75 for `_vs128` (0.66x) vs the vendor 8.05; absolute 494 vs the vendor's 515 (0.96x) on a grid where the vendor uses 25% of the CUs.
+**Gates (default recipe, vsx two-copy)**: 15/15 vs the CPU reference at 16 rows, 0 bad on all 15 shapes at 16 and 64 rows (the 3 REF_KERNEL_FAIL verdicts at 64 rows are the vendor's own 1/4/5 bad elements), parity 15/15 at REF_ROWS=64, determinism 5/5 x3, output bit-identical to `_vs128` on 1 8 2048 2048 and 4 8 2048 2048.
+**Filling shapes.** Sweep, absolute TFLOP/s (`_vs128` | `t128` | ratio), blocks of 256 rows / 128 rows:
+| shape (B H S) | blocks 256 / 128 | `_vs128` | `t128` | t128 / vs128 |
+|---|---|---|---|---|
+| 1 8 1024 | 32 / 64 | 127.9 | 191.9 | 1.50 |
+| 1 8 2048 | 64 / 128 | 367.8 | 484.8 | 1.32 |
+| 2 8 2048 | 128 / 256 | 700.0 | 870.0 | 1.24 |
+| 1 16 2048 | 128 / 256 | 696.0 | 865.1 | 1.24 |
+| 1 8 4096 | 128 / 256 | 838.2 | 1034.4 | 1.23 |
+| 4 8 2048 | 256 / 512 | 1215.4 | 905.3 | **0.74** |
+| 1 32 2048 | 256 / 512 | 1202.1 | 899.6 | 0.75 |
+| 1 8 8192 | 256 / 512 | 1546.9 | 1158.8 | 0.75 |
+| 8 8 2048 | 512 / 1024 | 1219.9 | 932.2 | 0.76 |
+| 2 16 4096 | 512 / 1024 | 1440.6 | 1079.0 | 0.75 |
+| 4 16 4096 | 1024 / 2048 | 1462.6 | 1093.0 | 0.75 |
+Reading: t128 wins 1.23-1.5x while the 256-row grid has at most 128 blocks (<= 50% of the CUs) and loses 25% as soon as the 256-row grid fills the GPU (>= 256 blocks), where the per-SIMD rate of the 2-waves-per-SIMD kernel is higher (per CU: `_vs128` ~5.7 vs `t128` ~4.3 TFLOP/s). A launcher rule follows: use t128 when `ceil(S/256) * H * B < 256`, `_vs128` otherwise (the kernels share the ABI; only the grid and block size differ).
+**K/V L2 traffic** (rocprofv3, B1H8S2048): TCC_REQ_sum 666k (`_vs128`) -> 831k (t128), +25%; TCP_TCC_READ_REQ 318k -> 482k (+52%); TCC_HIT 461k -> 626k; HBM-bound reads (TCC_EA0_RDREQ) 173.5k -> 173.0k (identical: the unique K/V data); so the per-FLOP L2 request traffic is 1.25-1.5x (not 2x: Q, O and the K-scale traffic are per row) and the HBM traffic is unchanged. On B4H8S2048: TCC_REQ 2.64M -> 3.29M (+24%), EA reads 684k = 684k.
+**Why the per-CU rate is lower**: with one wave per SIMD the dependency latency the partner used to hide is exposed (single-wave VALU-only skeleton 1.8k vs 1.15k per tile in the two-wave kernel; MFMA/LDS-only 1.8k vs 1.5k). Wall per tile 3.57k = ~1.8k V + 1.8k M with only partial overlap (the full scheduler fits and gives the QK(t+1) MFMAs room inside the convert VALU).
+Next (not done): overlapping more of V and M inside the wave (the full scheduler fit is the first step; an explicit `Stmt::Asm` window is the second), and the K/V-split across blocks (sequence-parallel with a cross-block merge) that is the only way to have more than 512 waves on this shape (total waves = 16384 rows / 32 = 512 of 1024 SIMDs).
