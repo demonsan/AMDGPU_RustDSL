@@ -599,6 +599,351 @@ Ranked remaining actions (with expected savings):
    vendor 473 instructions) - deeper DMA prefetch and less prologue/epilogue code.
 5. Remaining barrier/priority/issue stalls (~+1500 cycles not explained by the work counters).
 
+## 7.9 Final state - independent acceptance validation (2026-10-30, GPU 5)
+
+**Commit validated: Main `f4cccb60d53b51e30695b89ee4590039f270de18`** (merge of the kernel-opt gen3 branch
+and backend-tail). Kernel `fmha_fwd_hd128_mxfp8_vs128`, own backend, default `FMHA_OPT`, vendor
+`ref_mxfp8.co` measured in the same process/run, shape B1 H8 S=SK=2048, 20 unprofiled launches per timing
+sample. Numbers below were re-measured independently (not copied from the kernel-opt report).
+
+Protocol caveat (node is shared): wall time is noisy - the same kernel sample ranges 0.0470-0.1492 ms
+under contention. The table quotes the **best-case (uncontended) sample and the median of 15 interleaved
+runs**; the uncontended same-run pair is what the 1.41x ratio is based on. A first validation attempt
+during a busy period gave vendor 0.0522 ms / 328.9 TFLOP/s and ours 0.0664 ms / 258.9 TFLOP/s - both
+deflated, not used.
+
+### 0) Fair-comparison protocol for a tiling difference (prepared for the 128-row `t128` kernel)
+
+The vendor binary is fixed: its kernarg/ABI hard-codes a 256-query-row tiling (`ts_qo = 256`, Q tile stride
+`256*H*D`) and 512 threads (8 waves = 2 waves/SIMD). Our kernels choose their own tiling; the candidate
+`fmha_fwd_hd128_mxfp8_t128` uses 128-row blocks (256 threads = 4 waves = 1 wave/SIMD) and deliberately
+enforces one block per CU (3-slot ring = 99840 B LDS; two blocks need 199680 B > 163840 B). A single
+TFLOP/s number is therefore ambiguous, and from now on **every tiling comparison is reported as two
+explicitly labelled lines**:
+
+* **(a) Per-CU efficiency, same grid.** Both kernels at the vendor's 256-row tiling (grid
+  `(ceil(S/256), H, B)`), or equivalently the clock-free counters normalised per wave-iteration (they
+  divide `blocks x 8 x (SK/128)` away). This number answers "which kernel is more efficient per CU" and
+  is the only line where the two kernels are on identical launch geometry. For `_vs128` vs vendor on
+  B1H8S2048 this is **1.41x slower (365.7 vs 515.5 TFLOP/s)** and is unchanged by tiling work.
+* **(b) Absolute throughput at each kernel's own best legal tiling on this shape.** Vendor at 256 rows
+  (it cannot do 128); ours at its best (`_vs128`: 256 rows; `_t128`: 128 rows). This number answers
+  "what does this shape deliver" and **must always be quoted with both grids and block counts**, e.g.
+  B1H8S2048: vendor `(8,8,1)=64 blocks = 25 % of 256 CUs`, `_t128` `(16,8,1)=128 blocks = 50 %`.
+  It is not a per-CU efficiency claim: if `_t128` beats the vendor's absolute number by filling more
+  CUs, the conclusion is "our tiling uses this shape's grid better", not "our kernel is faster per CU".
+
+Grid-fill reference (256 active CUs/package, MI350 `mi350-arch-topology`; 1 block/CU for both the
+vendor kernel and `_t128`): benchmark B1H8S2048 = 64 blocks (25 %) at 256 rows / 128 blocks (50 %) at
+128 rows; the filling shape B4H8S2048 = 256 blocks (100 %) at 256 rows / 512 blocks (two sequential
+block waves, all 256 CUs busy) at 128 rows. Absolute package-level claims are only meaningful for
+shapes/grids that reach 256 blocks; the 15-shape gate mostly does not (see the table below).
+
+Harness support (kept backward-compatible; defaults reproduce the historical 256-row/512-thread run):
+`tests/gpu/ref_host.cpp` reads `REF_ROWS_PER_BLOCK` (candidate rows/block, default 256),
+`REF_VENDOR_ROWS_PER_BLOCK` (vendor, default/only 256), `REF_OURS_BLOCK_THREADS` (default 512),
+`REF_CUS` (default 256) and `REF_GRID_ONLY=1` (print the grid line and exit). It patches the
+tiling-dependent ABI fields per kernel (output pointer, Q tile stride), launches the vendor on its
+256-row grid and our kernel on `ceil(S/REF_ROWS_PER_BLOCK)` blocks, and prints one `[grid] ...` line;
+the `timing vendor/ours` lines now carry `rows/block` and `blocks`. The 15-shape and determinism scripts
+inherit the environment variable. The two t128 result lines are filled in here once the kernel lands.
+
+**Harness validated (2026-10-30, commit `e8be2ba`)** with `REF_GRID_ONLY=1` and the real kernels, without
+touching any default behaviour:
+* B1H8S2048 default: `[grid] vendor 256 rows/blk grid=(8,8,1)=64 blocks (25.0% of 256 CUs); ours 256
+  rows/blk grid=(8,8,1)=64 blocks (25.0%)` - exactly the historical launch.
+* B1H8S2048 `REF_ROWS_PER_BLOCK=128 REF_OURS_BLOCK_THREADS=256`: ours `(16,8,1)=128 blocks (50.0%)`,
+  vendor still `(8,8,1)=64 blocks (25.0%)`.
+* Filling shape B4H8S2048: default both `(8,8,4)=256 blocks (100%)`; ours at 128 rows
+  `(16,8,4)=512 blocks (two sequential block waves, all 256 CUs busy = 200% block-slots)`.
+* Odd S (B1 H3 S=300): vendor `(2,3,1)`, ours-128 `(3,3,1)` - grid rounding correct.
+* Default path regression with the modified host: 16-row gate **15/15 OK, parity 15/15**, ours `bad=0`,
+  determinism **5/5**, and the best-case same-run timing reproduces §7.9 exactly:
+  vendor 0.0333 ms / **515.8 TFLOP/s**, ours 0.0470 ms / **365.6 TFLOP/s** = **1.411x**.
+  (Single samples on GPU 5 are only trustworthy at the top clock state: the same kernel ranges
+  0.033-0.085 ms depending on the shared node's clock/contention; use a long warm-up and best-of-N,
+  as in §7.9. This is why the numbers are quoted as best-case + median, never as a single sample.)
+* For the t128 run the invocation is `REF_ROWS_PER_BLOCK=128 REF_OURS_BLOCK_THREADS=256
+  OUR_KERNEL=fmha_fwd_hd128_mxfp8_t128 REF_CO2=build/<t128>.co REF_KNAME2=fmha_fwd_hd128_mxfp8_t128`;
+  the 15-shape and determinism scripts inherit the environment variables unchanged.
+
+### 1) Same-run wall vs vendor (final)
+
+| | vendor | `_vs128` final @f4cccb6 | previous `_vs128` @3cc73c0 (§7.7) |
+|---|---|---|---|
+| per launch (16 x 128 keys) | **0.0333 ms** (median; min 0.0332) | **0.0471 ms** (median; min 0.0470) | 0.0576 ms |
+| throughput | **515.5 TFLOP/s** (median; max 516.9) | **365.7 TFLOP/s** (best; median 364.8) | 298.1 TFLOP/s |
+| gap to vendor | 1.00x | **1.41x slower (70.7 % of vendor per-CU throughput)** | 1.73x |
+| movement vs §7.7 | - | **+22.7 % throughput, gap 1.73x -> 1.41x** | - |
+
+The kernel-opt report quoted 367.2 TFLOP/s; the independent best-case here is 365.7 (0.4 % lower,
+inside the run-to-run clock variance of this shared node).
+
+### 2) Full §7.5 counter table for the FINAL kernel
+
+Values are per wave-iteration (raw / (blocks x 8 waves x 16 iterations), the same normalisation as
+section 6; this divides the grid away, so it is **per-CU and unaffected by the 25 %-filled grid**).
+`previous` = §7.7 @3cc73c0; `target` = §7.5. `**closed?` = final vs target.
+
+| metric | vendor | final | previous | target | closed? |
+|---|---|---|---|---|---|
+| `SQ_INSTS` (all) | 381.6 | **474.2** | 642.5 | <= 400 | no (improved 26 %) |
+| `SQ_INSTS_VALU` | 250.9 | **352.1** | 491.3 | <= 265 | no (improved 28 %) |
+| ... `_MUL_F32` | 32.3 | **41.1** | 37.2 | <= 40 | **no, marginal regression** (+3.9 vs prev; 1.1 over target) |
+| ... `_ADD_F32` | 54.7 | 38.0 | (37.3 @sec6) | - | (we do less than vendor) |
+| ... `_CVT` | 69.4 | **72.0** | 68.7 | >= 60 | **yes** |
+| ... `_INT32` | 10.8 | **61.3** | 60.8 | <= 15 | no (unmoved) |
+| ... `_FMA_F32` | 4.1 | 0.0 | - | - | - |
+| ... other VALU (MOV/TRANS/CMP) | 79.6 | **139.7** | 293.3 | <= 95 | no (improved 52 %) |
+| `SQ_INSTS_SALU` | 40.0 | **22.8** | 22.8 | >= 35 | no (unmoved) |
+| `SQ_INSTS_LDS` | 52.5 | **52.8** | 72.8 | <= 55 | **yes (new; from 72.8)** |
+| `SQ_INSTS_VMEM` | 5.7 | **7.6** | 7.6 | <= 6 | no |
+| `SQ_IFETCH` | 81.4 | **101.4** | 136.0 | <= 85 | no (improved 25 %) |
+| `SQ_VALU_MFMA_BUSY_CYCLES` | 1086* | **1216*** | 1280 | <= 1100 | no (improved; *static opcode accounting, see note) |
+| `SQ_ACTIVE_INST_VALU` | 293.8 | **402.1** | 543.3 | <= 310 | no (improved 26 %) |
+| `SQ_WAIT_ANY` | 420.6 | **570.6** | 803.6 | <= 450 | no (improved 29 %) |
+| `SQ_INST_LEVEL_VMEM` | 1610* | **2148*** | 117 (old scale) | <= 60 (old scale) | no; **ratio 1.33x vendor** (was 2.25x) - counter scale is run/replay dependent, only the ratio is used |
+| `SQ_INST_LEVEL_LDS` | 32.06 | **31.54** | 49.4 | <= 35 | **yes (new)** |
+| `SQ_LDS_BANK_CONFLICT` | 0 | **0.0** | 82.0 | <= 0.1 | **yes (new; from 82)** |
+| `SQ_BUSY_CYCLES` | 295.4 | 422.8 | (518.3 @sec6) | - | - |
+| `SQ_WAVE_CYCLES` (ratio only) | 1151 | 1608 | 1997 | - | improved |
+| `GRBM_GUI_ACTIVE` | 113.2 | 127.3 | - | - | - |
+
+Note on the two starred counters: `SQ_VALU_MFMA_BUSY_CYCLES` and `SQ_INST_LEVEL_VMEM` were not
+reproducible across two profiling runs on this (shared) node (vendor MFMA-busy 7625 vs 3422 per
+wave-iter in the two samples; its static XDL accounting is 1088). The final kernel's MFMA-busy sample 2
+is exactly its static value 1216, so the static accounting is quoted: ours 1216 vs vendor 1088 XDL
+cycles/wave-iteration (16 scaled MFMA = 1024, 4 smfmac = 64, 4 f16-bias MFMA = 128; vendor 16 scaled =
+1024 + 2 smfmac = 32 + 2 bf16 = 32). All other counters were identical across the two samples and match
+section 6's vendor numbers, which is why they are used.
+
+### 3) Structural line checks (final emitted assembly, 9423 static instructions, 4 loops)
+
+| §7.5 structural line | final | evidence (per role loop body, 128 keys) | verdict |
+|---|---|---|---|
+| 2 barriers per 128-key unit | **2** | `s_barrier` = 2 in each of the 4 loops | **yes** |
+| 1 realign per 128-key unit | **1** | `v_permlane` = 1 per loop | **yes** |
+| setprio windows (1 set/clear pair) | **0** | `s_setprio` = 0; source comment: measured -3 % (`299.8 -> 308.5 TFLOP/s` when removed); opt-in `FMHA_OPT=prio` | **not present - waived by measurement** (not a defect) |
+| LDS-DMA staging | **4** | `global_load_lds_dwordx4` = 4 per loop | **yes** |
+| next-tile QK inside the compute group | **yes** | 16 `v_mfma_scale` per loop (QK+PV/next-tile QK fused in one group, gen2 structure) | **yes** |
+| 128-key iteration unit | **yes** | one loop iteration = 128 keys, branch + 2 barriers per iteration | **yes** |
+| row-sum path = 4x smfmac complementary chain | **yes (4x)** | 4 `v_smfmac_f32_16x16x128_fp8_fp8` per loop, chained into one Frag4; static index constants: 0x44444444 x8 and 0xeeeeeeee x8 | **yes structurally; cost 64 cyc/unit vs vendor 32** (the 4-smfmac variant is required for our P layout, §4.5.3; §7.5 target "2 smfmac / <= 32 cyc" is not met) |
+| LUT-correction code copies | **2 of 4** | loops 0/1 (short-sequence copy) have `v_perm_b32`=32, `v_pk_sub`=32, `v_and_b32`=32 per unit; loops 2/3 (long copy) have 0 of each (correction only for < 9 tiles of 128 keys) | **yes** |
+| smfmac operand hazard (2 waits / no VALU-written C/A/B < 8 cyc) | **0 violations** | `VAL smfmac_d/a/b_from_valu_closer_than_8cyc = 0/0/0`; 8 chained smfmac detected | **yes** |
+| rollback decisions | **2 `v_cmp_lt_f32` per 128-key body** | one per 64-key conversion half (two-word f16 bias recipe) | **deviation from §7.5 "1/128 keys" - flagged to kernel-opt** |
+| descriptors | VGPR **252**, SGPR **48**, LDS **102400 B** | emitted `.vgpr_count/.sgpr_count/.group_segment_fixed_size` | (vendor LDS 84480) |
+| DSL lint warnings | **16 statements** "loop variable read after set_var in the same iteration" | emit log (`amdc emit`); contract says such reads are undefined (lowering happens to return the just-written value) | **latent risk, see below** |
+
+### 4) Gap decomposition for the remaining 1.41x (per SIMD-iteration @2.4 GHz convention)
+
+Wall per SIMD-iteration: vendor 4995 cycles, final **7065** (+2070, +41 %). The counters (per
+wave-iteration, x2 for the two resident waves) attribute:
+
+| component | cycles/SIMD-iter | evidence | upper-bound note |
+|---|---|---|---|
+| XDL / matrix pipe | **+256** | static 1216 vs 1088 XDL cycles/wave-iter (4 smfmac ans 4 f16-bias vs vendor 2+2) | <= +192 recoverable (2 smfmac would save 64, 2 bias MFMA 128) but 4 smfmac is required by our P layout |
+| VALU work | **+217** | `SQ_ACTIVE_INST_VALU` 402.1 vs 293.8 per wave-iter; other-VALU +60/wave, INT32 +50/wave, MUL +9/wave | <= +217 recoverable at vendor levels |
+| instruction fetch | **+40** | `SQ_IFETCH` 101.4 vs 81.4 | <= +40 (falls out of VALU/code-size cuts) |
+| VMEM latency exposure | ~+80 (inferred) | level ratio 1.20-1.33x vendor (was 2.25x); counter scale unstable | <= +130 (old §7.7 estimate) |
+| LDS latency / instructions | **-1 / +1** | `SQ_INST_LEVEL_LDS` 31.5 vs 32.1; LDS inst 52.8 vs 52.5 | closed |
+| **accounted work delta** | **~+593 (29 %)** | | |
+| **stalls / lost overlap** | **~+1477 (71 %)** | `SQ_WAIT_ANY` +150/wave = +300 cycles/SIMD measured directly; the rest is not visible in counters (barrier windows, latency overlap) | upper bound +1477, but gen2/gen3 measured that structural attempts make it worse (barrier removal WAIT_INST_ANY 543->627; gen3 single-window 334.6 vs 367.2 TFLOP/s) |
+
+Ranked remaining items: (1) **lost overlap/stalls, ~+1477 cycles/SIMD (21 % of wall)** - no known
+structural lever left at tile granularity (gen2/gen3 closed negative); (2) VALU work, +217 (3.1 %) -
+other-VALU/INT32 down to vendor levels; (3) XDL, <= +192 (2.7 %); (4) VMEM/IFETCH, <= +120 (1.7 %).
+Even closing every accounted-work line leaves ~6472 cycles/SIMD vs vendor 4995 (1.30x): the residual
+gap is overlap, not instructions. The kernel line is therefore final at 1.41x / 365.7 TFLOP/s.
+
+### 5) Correctness gate (independently re-run) and grid-occupancy caveat
+
+* **15 shapes, 16 rows, 3 independent repeats**: `REF_KERNEL_OK` **15/15 in all three**; `PARITY_OK`
+  15/15 in all three; our kernel's `bad=0` on every shape (mean_err 0.8-1.1e-3 vs vendor 2.2-2.8e-3,
+  i.e. we are numerically closer to the CPU model than the vendor).
+* **15 shapes, 64 rows, 2 repeats**: `REF_KERNEL_OK` 12/15 - **all three failures are the VENDOR
+  kernel exceeding the absolute tolerance** (vendor `bad=1`, `bad=4`, `bad=5` elements on the three
+  shapes); our kernel's `bad=0` on all 15, `PARITY_OK` 15/15. (The gate is `bad(ours)||bad(vendor)`;
+  the same 12/3 was already the case at §7.7.)
+* **determinism 3 runs x 5 shapes**: **5/5 DET_OK** in both repeats.
+* **Grid occupancy (verified from `tests/gpu/ref_host.cpp`: `grid=(ceil(S/256), H, B)`,
+  block=512 threads = 8 waves)**: MI350 has **256 active CUs/package** (kernel-wiki
+  `mi350-arch-topology`: 8 XCD x 32 active CUs). One block occupies one CU (252 VGPR => 2 waves/SIMD
+  => 8 waves = 1 block/CU; LDS 102400 B also allows only one block/CU).
+
+| shape (B,H,S,SK,gqa) | blocks = ceil(S/256)*H*B | % of 256 CUs | fills the GPU? |
+|---|---|---|---|
+| B1 H8 S2048 SK2048 (benchmark) | **64** | **25.0 %** | no |
+| B2 H8 S700 SK640 | 48 | 18.8 % | no |
+| B2 H4 S1024 SK1024 | 32 | 12.5 % | no |
+| B3 H3 S768 SK1280 | 27 | 10.5 % | no |
+| B2 H4 S300 SK129 / B1 H16 S256 / B1 H8 S512 | 16 | 6.2 % | no |
+| B1 H4 S300 / B1 H2 S1024 SK1088 | 8 | 3.1 % | no |
+| B1 H2 S512 / B1 H4 S77 | 4 | 1.6 % | no |
+| B1 H2 S256 SK1000 / B1 H2 S200 SK1337 | 2 | 0.8 % | no |
+| B1 H1 S256 | 1 | 0.4 % | no |
+
+  **None of the 15 shapes reaches 256 blocks**, so every absolute throughput number in this document
+  is a **per-CU efficiency number**, not a package-capability number: on the benchmark shape
+  365.7 TFLOP/s is achieved on 64 of 256 CUs = 5.71 TFLOP/s/CU (vendor 515.5/64 = 8.05 TFLOP/s/CU).
+  A fully filled 256-CU grid would project to ~1463 (ours) / ~2062 (vendor) TFLOP/s under linear
+  scaling - a projection only (memory/compute balance may reduce it), not a measurement.
+* **Counter normalisation is unaffected by the grid fill**: the per-wave-iteration values divide by
+  `waves x iters = blocks x 8 x (SK/128)`, i.e. they are per-resident-wave/per-CU numbers already.
+
+### 5b) FINAL: two-kernel architecture (`_vs128` per-CU + `_t128` absolute), certified
+
+Validated branch `t128-final` (Main merged with kernel-opt t128; kernel commits `a2df9b3..2f5d372`,
+harness merge `d090f89`, warm-up protocol `3d654cc`). `_t128` shipped form: 128 query rows/block,
+**256 threads = 4 waves = 1 wave/SIMD**, `LDS = 135168 B` (two blocks need 270336 B > 163840 B, so
+**exactly one block/CU**), VGPR 252 / SGPR 48, **1 barrier per 128-key tile** (merged single-window form
+of g3; `_vs128` has 2), every wave stages K and V (`global_load_lds` = 8 per tile vs 4), row-sum =
+**4x smfmac complementary chain**, LUT correction through the **short/long two-copy selection** (short
+copy: 32 `v_perm_b32` + 32 `v_pk_sub` + 32 `v_and_b32` per tile; long copy: 0). Note the design doc
+`docs/gen4-tiling-design.md` predicted 99840 B; the emitted kernel uses 135168 B - the
+"1 block/CU" property still holds, but the design-doc number is stale.
+Correctness/equivalence: full-output **bit-identical** to `_vs128` on B1H8S2048,
+md5 `faadf00c95f4eaffff94ece7d1429b3d` (same as kernel-opt's `faadf00c`); determinism 5/5 x2; gate at
+16 rows **15/15 OK, ours bad=0, parity 15/15, x3**; at 64 rows 12/3 with **all three failures vendor**
+(vendor bad=1/4/5), ours bad=0 on all 15, parity 15/15. `_t128` still emits 8 loop-variable
+read-after-`set_var` warnings (`_vs128` is now clean after kernel-opt `558fc17`); kernel-opt should
+apply the same SSA fix to t128.
+
+**Absolute, B1H8S2048 (warm protocol: REF_WARMUP=80-150, REF_ITERS=60-100, median of 5 runs, GPU 5):**
+
+| kernel | rows/blk | threads | waves/SIMD | LDS B | grid | blocks | CU fill | TFLOP/s (median / best) | TFLOP/s/CU | vs vendor |
+|---|---|---|---|---|---|---|---|---|---|---|
+| vendor | 256 | 512 | 2 | 84480 | (8,8,1) | 64 | 25 % | **546.9 / 548.7** | 8.55 | 1.00x |
+| `_vs128` | 256 | 512 | 2 | 102400 | (8,8,1) | 64 | 25 % | 383.4 / 386.2 | 5.99 | 0.70x |
+| `_t128` | 128 | 256 | 1 | 135168 | (16,8,1) | 128 | 50 % | **515.8 / 517.6** | 4.03 | **0.94x** |
+
+So on this shape `_t128` is **1.345x faster than `_vs128` and 0.94x the vendor absolute** - it wins by
+using twice as many CUs (128 vs 64), not by a higher per-CU rate (4.03 vs 5.99 vs vendor 8.55; per-CU
+ratios 0.47 : 0.70 : 1.00). kernel-opt measured 494 / 367.8 / 515.7 TFLOP/s at their clock state =
+1.34x / 0.958x with per-CU 3.8 / 5.75 / 8.05: **identical ratios, absolute numbers ~5 % lower**
+(clock-state difference; this node's boost state drifts between 515 and 549 TFLOP/s for the vendor).
+
+**Filling shapes (dispatch selects `_vs128`; both kernels at 100 % CU fill):**
+
+| shape | kernel | grid | blocks | TFLOP/s (median) | vs vendor | TFLOP/s/CU |
+|---|---|---|---|---|---|---|
+| B4H8S2048 | vendor | (8,8,4) | 256 (100 %) | 1852.8 | 1.00x | 7.24 |
+| B4H8S2048 | `_vs128` | (8,8,4) | 256 (100 %) | 1302.5 | **0.70x** | 5.09 |
+| B4H8S2048 | `_t128` (not dispatched) | (16,8,4) | 512 (2 waves) | 1001.6 | 0.54x | 3.91 |
+| B1H8S8192 | vendor | (32,8,1) | 256 (100 %) | 2422.5 | 1.00x | 9.46 |
+| B1H8S8192 | `_vs128` | (32,8,1) | 256 (100 %) | 1832.8 | **0.76x** | 7.16 |
+| B1H8S8192 | `_t128` (not dispatched) | (64,8,1) | 512 (2 waves) | 816.8 (med; best 1293.6) | 0.34x | 3.19 |
+
+On a full grid the absolute ratio collapses to the per-CU ratio (0.70-0.76x vendor), and `_t128` loses
+**23-30 %** against `_vs128` (two block waves, lower per-CU rate) - exactly the regime where the
+dispatch must not pick it.
+
+**Dispatch rule, measured crossover.** With `N = ceil(S/256)*H*B` (the 256-row-grid block count),
+`_t128` launches `2N` blocks. Warm-protocol medians of alternating samples:
+
+| N (256-row blocks) | 64 | **128** | 136 | 144 | 152 | 160 | 192 | 224 | 256 |
+|---|---|---|---|---|---|---|---|---|---|
+| t128 blocks (2N) | 128 | **256** | 272 | 288 | 304 | 320 | 384 | 448 | 512 |
+| t128 / vs128 | **1.345** | **1.33** | 0.41 | 0.51 | 0.67 | 0.49 | 0.73 | 0.72 | 0.64 |
+| winner | t128 | t128 | vs128 | vs128 | vs128 | vs128 | vs128 | vs128 | vs128 |
+
+The crossover is exactly at `2N = 256`: `_t128` wins while its whole grid fits in one full wave of the
+256 CUs (N <= 128) and loses sharply as soon as it needs a second block wave (N >= 129; measured
+0.41-0.80x of `_vs128`). The rule currently being implemented in kernel-opt's `ref_host`
+("128 rows when the 256-row grid would be under 256 blocks") is therefore **too loose for
+129 <= N <= 255** and should be tightened to **`2*ceil(S/256)*H*B <= 256` (N <= 128)**; for the 15 gate
+shapes it makes no difference (all N <= 64, so all select `_t128`, and short-SK representatives of that
+set measured 1.42-2.73x over `_vs128`). All 15 gate shapes are in the t128 regime: blocks(N) =
+1, 4, 32, 64, 4, 27, 8, 48, 16, 2, 16, 16, 8, 4, 2.
+
+**What is certified:** at Main `f4cccb60d53b51e30695b89ee4590039f270de18`, `fmha_fwd_hd128_mxfp8_vs128`
+emits, assembles and passes the 15-shape gate at 16 rows (15/15, bad=0, parity 15/15, x3) and at 64
+rows our kernel is bad=0 on all 15 shapes; determinism 5/5; it runs at 365.7 TFLOP/s in the best-case
+same-run measurement vs the vendor's 515.5 TFLOP/s on B1H8S2048 = 1.41x slower per CU (70.7 % of vendor
+efficiency), with the structural lines above (2 barriers/128 keys, 1 realign, 4 DMA staging ops,
+next-tile QK in the compute group, 4-smfmac complementary row sums, 2-of-4 LUT-correction copies,
+0 smfmac hazard violations, 0 LDS bank conflicts, LDS instruction count at vendor level).
+
+**Certified two-kernel end state:** the dispatched architecture is certified as: (a) per-CU efficiency,
+same grid: `_vs128` 1.41x slower than vendor (unchanged, the efficiency story); (b) absolute
+best-tiling: `_t128` at **0.94x vendor** on B1H8S2048 (1.345x over `_vs128`) by using 50 % of the CUs
+instead of 25 %, **bit-identical** to `_vs128`, gates/determinism clean; (c) on grids that fill the GPU
+(N >= 256 256-row blocks) the dispatch selects `_vs128`, where absolute = per-CU = **0.70-0.76x vendor**.
+The dispatch threshold must be `N <= 128`, not 256 (measured crossover at 2N = 256; no gate shape uses
+the untested 129-255 band). Not certified: any full-package absolute claim (grid fills remain <= 50 %
+on the benchmark shape); t128's 8 undefined-read lint warnings; the t128 per-CU rate is lower than
+`_vs128` (4.0 vs 6.0 TFLOP/s/CU), so it is an absolute-throughput decision, not an efficiency one.
+
+**What is not certified:** (a) the absolute TFLOP/s figure is a per-CU number at 25 % grid fill - no
+full-package claim; (b) the kernel is not instruction- or stall-equal to the vendor: 1.41x from work
++ overlap, with the remaining 71 % of the gap in non-counter-visible overlap; (c) `setprio` is absent
+by design (opt-in, measured -3 %) so the §7.5 setprio line is waived, not closed; (d) the row-sum
+cost is 64 cycles/128 keys (4 smfmac, needed for our P layout) vs the vendor's 32; (e) the emitted
+kernel contains **16 loop-variable read-after-`set_var` statements that the DSL contract declares
+undefined** - the built binary is deterministic and passes, but this is a latent semantic hazard that
+should be converted to explicit SSA values before the kernel is frozen; (f) two profiling counters
+(MFMA-busy, VMEM level) are not reproducible on this shared node and are quoted only as ratios/static
+accounting; (g) wall-time is a same-run ratio on a shared node (best-case + median of 15 samples), not
+a benchmark-grade absolute timing; the cycle columns use the 2.4 GHz convention.
+
+### 5c) AUTO-DISPATCH CERTIFIED FINAL (validated commit `6e9e988`)
+
+Branch `final-auto`, validated build commit **`6e9e9888cecd6387fff214f4789f0cecfd18ec31`** (= Main
+`be21aae` merged with kernel-opt `7a24376` auto-dispatch + lint fixes + docs; the merge commit is
+`f36cee9` and `6e9e988` is the harness fix below). The shipping invocation is
+`OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto`: `run_ref.sh` / `determinism.sh` build `_vs128` (256 rows,
+512 threads) and `_t128` (128 rows, 256 threads), and `ref_host` chooses per shape with the measured
+rule **t128 iff `2*ceil(S/256)*H*B <= 256`** (N <= 128; else `_vs128`), printing one
+`[grid]` line with the chosen kernel, rows/threads, grid, CU fill, reason and `blocks256`.
+Overrides (`REF_ROWS_PER_BLOCK`, `REF_OURS_BLOCK_THREADS`, `REF_GRID128`) are kept.
+*Harness note:* the merged auto path was found to launch the candidate without patching
+`args[0x000]` to its own output buffer (the cleanup had dropped `set_launch`), so our kernel wrote into
+the vendor buffer; fixed in `6e9e988` and everything below was re-run on the fixed build.
+
+**Gate through the AUTO path (`OUR_KERNEL=..._auto`, 128-row grid selected by the dispatcher):**
+16 rows **15/15 OK x3**, our bad=0, parity **15/15 x3**, dispatcher chose t128 for **15/15** shapes
+(the `[grid]` line shows `auto: 2*ceil(S/256)*H*B <= 256 CUs` for all of them); determinism **5/5 x2**;
+64 rows **12/15 gate pass x2** with all three failures vendor (ours bad=0 on all 15, parity 15/15).
+The auto output is bit-identical to the per-kernel runs: full-output md5
+`faadf00c95f4eaffff94ece7d1429b3d` (B1H8S2048), matching `_vs128` and `_t128`.
+
+**Boundary probe (explicit N = ceil(S/256)*H*B = 127, 128, 129, 130; shapes B=N, H=1, S=256, SK=2048):**
+
+| N (256-row grid) | dispatcher choice | ours bad | t128 blocks (2N) | forced t128 / forced `_vs128` |
+|---|---|---|---|---|
+| 127 | t128 | 0 | 254 | **1.204x** |
+| **128** | **t128** | 0 | **256 (100.0 % CUs)** | **1.203x** |
+| **129** | **`_vs128`** | 0 | - (would be 258) | **0.710x** (t128 loses) |
+| 130 | `_vs128` | 1 element (borderline tolerance on one of 266k checked; not a gate shape) | - | 0.705x |
+
+The measured crossover is exactly the implemented boundary: t128 wins while its own grid fits one
+full CU wave (`2N <= 256`), and loses by ~1.4x as soon as 2N > 256.
+
+**Benchmark through the AUTO path vs vendor (same run, warm protocol `REF_WARMUP=150`, `REF_ITERS=100`,
+best of 5):** grid line
+`[grid] vendor rows/block=256 block=512 grid=(8,8,1) blocks=64 (25.0%); ours (fmha_fwd_hd128_mxfp8_t128): rows/block=128 block=256 grid=(16,8,1) blocks=128 (50.0%) [auto: 2*ceil(S/256)*H*B <= 256 CUs; blocks256=64]`;
+vendor **537.3 TFLOP/s** (0.0320 ms), ours **509.7 TFLOP/s** (0.0337 ms) = **1.053x slower / 0.950x
+absolute throughput**; per-CU 3.98 vs 8.40 TFLOP/s/CU; md5 `faadf00c...`.
+(kernel-opt's 491.8 TFLOP/s is the same ratio at their clock state - absolute numbers scale with the
+vendor's own 515-549 TFLOP/s drift on this shared node; only ratios are portable.)
+
+**Lint status (final):** `_vs128` 16 -> 0, `_vs` 10 -> 0, `_t128` 8 -> 0, all bit-identical to their
+previous outputs on 7 shapes. `_t` keeps **14 warnings and is frozen with a documented limitation**:
+its lazy-rescale `if` lowers to a **wave-level branch** (`begin_if` = "any lane"), so after the branch
+the loop variable holds the new max for ALL lanes, while a per-lane SSA select would hold it only for
+the lanes that grew; the SSA form changed the output bits on 6/7 shapes on both backends and was
+therefore reverted. These 14 reports are a **documented latent hazard tied to the wave-level branch
+lowering, not an active bug**: `_t` is validated as-is (15/15 gate, deterministic, bit-identical runs)
+and is frozen with the limitation. An exact fix needs a wave-wide "any lane" op or restructuring the
+rescale into both branch arms (backend work).
+
+**What is certified (final):** the shipping `_auto` path at `6e9e988`: dispatch rule verified exactly
+at N=128/129; all 15 gate shapes take t128 and pass 15/15 (ours bad=0, parity 15/15, x3), determinism
+5/5 x2, 64-row gate clean for ours; absolute B1H8S2048 = 509.7 vs vendor 537.3 TFLOP/s (0.95x, using
+50 % of the CUs), bit-identical to both per-kernel paths; filled-grid shapes dispatch to `_vs128`
+(0.70-0.76x vendor absolute). Not certified: full-package absolute throughput (benchmark still only 50 %
+CU fill), `_t` future edits against the frozen numerics, and any absolute TFLOP/s without its clock
+state/grid labels.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as

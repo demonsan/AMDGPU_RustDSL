@@ -1,0 +1,44 @@
+# Operand-class table for the safe-asm opcode templates (read by build.rs, which also checks every row against the backend table
+# crates/amdgpu-compiler/src/backend/llvm24.tbl: key must exist and the arity must match its signature).
+#
+#   method | MOp key | form
+#
+# forms (the Rust signature each one generates; see build.rs):
+#   vop1       v_x dst, src0                       dst: Dst<1>, src0: Operand (VGPR/SGPR/inline/literal)
+#   vop2       v_x_e32 dst, src0, vsrc1            src0: Operand, src1: VgprOnly (the e32 encoding)
+#   vop2_imm0  v_x_rev dst, imm, vsrc              shift forms: src0 is a compile-time inline constant
+#   vop3_2     v_x dst, a, b                       VOP3: constant-bus <= 1 scalar, no literal (compile-time assertion)
+#   vop3_3     v_x dst, a, b, c                    same, three sources
+#   cmp        v_cmp_x_e32 vcc, src0, vsrc1        Vcc<Free> -> Vcc<Live>
+#   store_vm   global_store_dword addr[2], data    occupies a vmcnt slot
+#
+# Not generated (hand-written with tokens): matrix ops (Mfma/Smfmac), loads (Pending), v_cndmask (vcc type-state), v_readfirstlane, v_mov.
+# Raw-only on purpose (their result hazards are not modelled by the verifier): transcendental ops (v_exp/v_rcp), packed fp32 (v_pk_*_f32),
+# partial-write converts (v_cvt_pk_fp8 lo/hi), v_permlane32_swap, carry ops, scalar ops, branches, barriers.
+
+v_add_u32            | VAddU32       | vop2
+v_add_f32            | VAddF32       | vop2
+v_sub_f32            | VSubF32       | vop2
+v_mul_f32            | VMulF32       | vop2
+v_max_f32            | VMaxF32       | vop2
+v_and_b32            | VAndB32       | vop2
+v_or_b32             | VOrB32        | vop2
+v_xor_b32            | VXorB32       | vop2
+v_lshrrev_b32        | VLshrB32      | vop2_imm0
+v_lshlrev_b32        | VLshlB32      | vop2_imm0
+v_cvt_f32_f16        | VCvtF32F16    | vop1
+v_cvt_f16_f32        | VCvtF16F32    | vop1
+v_mul_lo_u32         | VMulLoU32     | vop3_2
+v_cvt_pknorm_u16_f32 | VCvtPknormU16 | vop3_2
+v_cvt_pk_fp8_f32     | VCvtPkFp8F32  | vop3_2
+v_cvt_pk_bf16_f32    | VCvtPkBf16F32 | vop3_2
+v_pk_sub_u16         | VPkSubU16     | vop3_2
+v_perm_b32           | VPermB32      | vop3_3
+v_max3_f32           | VMax3F32      | vop3_3
+v_fma_f32            | VFmaF32       | vop3_3
+v_cmp_lt_i32         | VCmpLtI32     | cmp
+v_cmp_ge_i32         | VCmpGeI32     | cmp
+v_cmp_gt_i32         | VCmpGtI32     | cmp
+v_cmp_ne_i32         | VCmpNeI32     | cmp
+v_cmp_lt_f32         | VCmpLtF32     | cmp
+global_store_dword   | GlobalStoreF32 | store_vm

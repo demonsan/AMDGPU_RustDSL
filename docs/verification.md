@@ -168,6 +168,17 @@ FMHA_OPT="..." REF_CO=<vendor.co> BACKEND=own OUR_KERNEL=fmha_fwd_hd128_mxfp8_t 
 A *loop variable* (`begin_loop` / `set_var`, `Opnd::Var`) is loop-carried state. Contract: a read of a variable **before** the first `set_var` of that variable in an iteration sees the value the previous iteration left (the initial value in the first iteration). A read **after** a `set_var` of the same variable in the same iteration is **not part of the contract**: our lowering keeps the variable in one mutable register and often retargets the producer of the `set_var` operand straight into it, so such a read usually sees the newly written value, but that depends on the producer, on in-place `Var*` statements, on nested `if`s and on instruction movement, and kernel-opt measured stale data (39% wrong rows, varying from run to run) in one such pattern. For an intra-iteration producer/consumer pair use the plain SSA value that was passed to `set_var`.
 `amdgpu_dsl::lint(&Function)` reports every such read conservatively (a `set_var` inside an `if` counts); `amdc emit` prints the reports as warnings; `FnBuilder::allow_var_rereads()` opts a kernel out. Cross-iteration reads (read before the set) and loop conditions expressed on SSA values are not reported. `tests/var_lint.rs`: the lint precision test, and a guard that only the kernels listed in `KNOWN_REREADERS` (fmha_*, sched_diamond; plus the `probe_*` research kernels) re-read after set - any other kernel must be clean.
 
+**Frozen exception: `_t`'s 14 loop-variable reports.** `_t` (`fmha_fwd_hd128_mxfp8_t`, the
+llvm-tail kernel) keeps its 14 conservative re-read reports and is frozen with a documented limitation:
+its lazy-rescale `if` lowers to a **wave-level branch** (`begin_if` = "any lane"), so after the branch
+the loop variable holds the new max for ALL lanes, while a per-lane SSA select would hold it only for
+the lanes that grew; the SSA form changed the output bits on 6/7 shapes on both backends, so it was
+reverted (`3ed2c42`). The 14 warnings are therefore a **documented latent hazard tied to the wave-level
+branch lowering, not an active bug**: `_t` is validated as-is (15/15 gate, 0 bad at 16/64 rows,
+deterministic, bit-identical runs) and stays frozen; an exact fix needs a wave-wide any-lane op
+(`Op::AnyLane`) or restructuring the rescale into both branch arms (backend work). `_vs128`, `_vs` and
+`t128` are clean (0 reports) and bit-identical to their pre-fix outputs.
+
 ## Validate the model against hardware: the ghost-liveness lesson
 
 Two wrong allocator results in one day had the same class of cause - a *model* (our liveness) that disagreed with the machine (or with LLVM's liveness on the exported MIR) - and both were caught only by independent checks: the 2/15 shapes of `_vs128` on hardware and the physical reaching-writer test (`tests/mir_invariants.rs`, now also `regalloc::check_reaching` inside the compiler for the hole-aware packing). Rules: (1) every new allocation/liveness policy must pass the physical reaching-writer analysis on all kernels with the policy forced on; (2) run the kernels on hardware (CPU reference, bit-exactness for deterministic kernels) with it forced; (3) when a number looks too good (a kernel suddenly "fits") or too bad (an "infeasible" peak), check the model on kernels that DO allocate first (pruned peak vs allocated vgpr_count for `_t`, `_sv`, `_pp`, `_vs`).

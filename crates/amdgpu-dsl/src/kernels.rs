@@ -10211,6 +10211,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let smford = fmha_t_opt("smford");
         let smf2 = fmha_t_opt("smf2");
         let chain = |b: &mut FnBuilder, pa: ValueId, pb: ValueId| {
+            if smfv && fmha_t_opt("safeasm") {
+                // the same four in-place SMFMACs, authored in safe Rust (crates/amdgpu-safeasm) and embedded through Stmt::VarAsm
+                use amdgpu_safeasm::examples::rowsum_var_block;
+                b.var_asm(la, rowsum_var_block(), &[Opnd::Val(a_rs), Opnd::Val(pa), Opnd::Val(pb), Opnd::Val(idx01), Opnd::Val(idx23)]);
+                return;
+            }
             if smfv {
                 b.var_smfmac_fp8(la, a_rs, pa, idx01);
                 b.var_smfmac_fp8(la, a_rs, pb, idx01);
@@ -14749,6 +14755,25 @@ fn emit_fmha_vsm_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// and LDS holds only the K and V tiles.
 /// LDS row pitch (bytes) of the K/V tiles of the transposed FMHA kernel (env FMHA_PITCH, read at
 /// build time, for bank-conflict experiments; default 144: 16-byte aligned and conflict-free enough, 128 = unpadded).
+/// End-to-end probe for the safe-asm path: loads a float4 per lane, MFMA + VALU, stores one float per lane (all written in safe Rust, see
+/// `amdgpu_safeasm::examples::global_probe_block`). out[tid] = in[4*tid..4*tid+4].sum() + 64.0.
+pub fn probe_safeasm_e2e() -> Function {
+    let mut b = FnBuilder::new("probe_safeasm_e2e", 64);
+    b.arg("inp", DType::Ptr, 0, 8);
+    b.arg("outp", DType::Ptr, 8, 8);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let outp = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c16 = b.c_i32(16);
+    let c4 = b.c_i32(4);
+    let off_in = b.mul_i32(tid, c16);
+    let off_out = b.mul_i32(tid, c4);
+    let pin = b.ptr_add(inp, off_in);
+    let pout = b.ptr_add(outp, off_out);
+    let _r = b.asm(amdgpu_safeasm::examples::global_probe_block(), &[Opnd::Val(pin), Opnd::Val(pout)]);
+    b.finish()
+}
+
 fn fmha_t_opt(name: &str) -> bool {
     let v = std::env::var("FMHA_OPT").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "cvt4,pksub,lazy,msum,permlane,kdlds,dbuf,lacc1,psh2,svpk,svcorr,swz".to_string());
     let has = |n: &str| v.split(',').any(|x| x == n);
