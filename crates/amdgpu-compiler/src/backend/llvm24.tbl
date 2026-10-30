@@ -88,7 +88,7 @@ GlobalLoadF32Sc1 | V1 <- V2 | {d} = GLOBAL_LOAD_DWORD {s0}, {imm}, 16, implicit 
 GlobalLoadB128Sc1 | V4 <- V2 | {d} = GLOBAL_LOAD_DWORDX4 {s0}, {imm}, 16, implicit $exec :: (load (s128), addrspace 1)
 GlobalStoreF32Sc1 | <- V2 V1 | GLOBAL_STORE_DWORD {s0}, {s1}, {imm}, 16, implicit $exec :: (store (s32), addrspace 1)
 GlobalStoreF32x4Sc1 | <- V2 V4 | GLOBAL_STORE_DWORDX4 {s0}, {s1}, {imm}, 16, implicit $exec :: (store (s128), addrspace 1)
-GlobalAtomicAddRet | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_ADD_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store monotonic (s32), addrspace 1)
+GlobalAtomicAddRet | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_ADD_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
 BufferWbl2 | <- | BUFFER_WBL2 16, implicit $exec
 BufferInv | <- | BUFFER_INV 16, implicit $exec
 GlobalStoreF32x4 | <- V2 V4 | GLOBAL_STORE_DWORDX4 {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s128), addrspace 1)
