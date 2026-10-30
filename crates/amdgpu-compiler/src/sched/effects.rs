@@ -167,6 +167,27 @@ pub fn effects(m: &MFunction, inst: &MInst) -> Effects {
         MOp::GlobalLoadU16 => {
             e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 2 })
         }
+        MOp::GlobalLoadF32Sc1 => {
+            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 4 })
+        }
+        MOp::GlobalLoadB128Sc1 => {
+            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 16 })
+        }
+        MOp::GlobalStoreF32Sc1 => {
+            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 4 })
+        }
+        MOp::GlobalStoreF32x4Sc1 => {
+            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 16 })
+        }
+        // read-modify-write with a result: a global access (vmcnt queue entry whose destination is the old value)
+        MOp::GlobalAtomicAddRet => {
+            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 4 })
+        }
+        // cache maintenance: ordered against every memory access, never reordered, no register effects
+        MOp::BufferWbl2 | MOp::BufferInv => {
+            e.fence = Fence::Barrier;
+            return e;
+        }
         MOp::GlobalLoadF32 => {
             e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 4 })
         }

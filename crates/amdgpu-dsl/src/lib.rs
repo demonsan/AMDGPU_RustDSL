@@ -169,6 +169,11 @@ pub enum Op {
     LoadF32 { base: Opnd, byte_off: u32 },
     /// 16-byte global load (`global_load_dwordx4`) into a `Frag4`.
     LoadGlobalB128 { base: Opnd, byte_off: u32 },
+    /// Device-scope coherent loads (`sc1`): bypass the non-coherent cache levels, see the other XCDs' write-through stores.
+    LoadF32Coherent { base: Opnd, byte_off: u32 },
+    LoadB128Coherent { base: Opnd, byte_off: u32 },
+    /// `global_atomic_add` (device scope, returns the OLD value): every active lane adds `value` at `base + byte_off`.
+    AtomicAddU32 { base: Opnd, byte_off: u32, value: Opnd },
     /// Read one dword from workgroup LDS; `addr` is a byte offset.
     LoadLdsB32 { addr: Opnd },
     /// Read four dwords (16 B) from workgroup LDS.
@@ -269,7 +274,9 @@ impl Op {
             Op::AddF32(..) | Op::SubF32(..) | Op::MulF32(..) | Op::MaxF32(..) | Op::FmaF32(..) => {
                 DType::F32
             }
-            Op::ExpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } => DType::F32,
+            Op::ExpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } | Op::LoadF32Coherent { .. } => DType::F32,
+            Op::AtomicAddU32 { .. } => DType::U32,
+            Op::LoadB128Coherent { .. } => DType::Frag4,
             Op::CvtF32ToF16(..) => DType::I32,
             Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
             Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::CmpLtF32(..) | Op::NotI1(..) => DType::I1,
@@ -366,7 +373,8 @@ impl Op {
             Op::LoadLdsB128 { addr } => vec![*addr],
             Op::LoadLdsTrB8 { addr } => vec![*addr],
             Op::LoadLdsTr4B8 { addrs } => addrs.to_vec(),
-            Op::LoadGlobalB128 { base, .. } => vec![*base],
+            Op::LoadGlobalB128 { base, .. } | Op::LoadF32Coherent { base, .. } | Op::LoadB128Coherent { base, .. } => vec![*base],
+        Op::AtomicAddU32 { base, value, .. } => vec![*base, *value],
             Op::LoadLdsB128x2 { lo, hi } => vec![*lo, *hi],
             Op::ReadFirstLane(a) => vec![*a],
         }
@@ -381,6 +389,13 @@ pub enum Stmt {
     StoreF32 { base: Opnd, byte_off: u32, value: Opnd },
     /// 16-byte global store of a Frag4 (`global_store_dwordx4`).
     StoreF32x4 { base: Opnd, byte_off: u32, value: Opnd },
+    /// Device-scope write-through stores (`sc1`): visible to coherent loads / atomics of other workgroups on other XCDs.
+    StoreF32Wt { base: Opnd, byte_off: u32, value: Opnd },
+    StoreF32x4Wt { base: Opnd, byte_off: u32, value: Opnd },
+    /// Release fence at device scope: `s_waitcnt vmcnt(0) lgkmcnt(0)` [+ `buffer_wbl2 sc1` + `s_waitcnt vmcnt(0)` when `wb`].
+    FenceRelease { wb: bool },
+    /// Acquire fence at device scope: `s_waitcnt vmcnt(0)` [+ `buffer_inv sc1` when `inv`]; later loads cannot move above it.
+    FenceAcquire { inv: bool },
     /// Write one dword into workgroup LDS; `addr` is a byte offset.
     StoreLdsB32 { addr: Opnd, value: Opnd },
     /// Write four dwords (16 B) into workgroup LDS.
@@ -486,6 +501,18 @@ impl Function {
                 }
                 Stmt::StoreF32x4 { base, byte_off, value } => {
                     let _ = writeln!(s, "{pad}store f32x4 [{base:?}+{byte_off}] <- {value:?}");
+                }
+                Stmt::StoreF32Wt { base, byte_off, value } => {
+                    let _ = writeln!(s, "{pad}store.wt f32 [{base:?}+{byte_off}] <- {value:?}");
+                }
+                Stmt::StoreF32x4Wt { base, byte_off, value } => {
+                    let _ = writeln!(s, "{pad}store.wt f32x4 [{base:?}+{byte_off}] <- {value:?}");
+                }
+                Stmt::FenceRelease { wb } => {
+                    let _ = writeln!(s, "{pad}fence.release(wb={wb})");
+                }
+                Stmt::FenceAcquire { inv } => {
+                    let _ = writeln!(s, "{pad}fence.acquire(inv={inv})");
                 }
                 Stmt::StoreLdsB32 { addr, value } => {
                     let _ = writeln!(s, "{pad}lds[{addr:?}] <- {value:?}");
@@ -760,6 +787,48 @@ impl FnBuilder {
 
     pub fn load_u16(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
         self.let_(Op::LoadU16 { base: base.into(), byte_off })
+    }
+
+    /// Coherent (`sc1`) f32 load: reads through to the device-coherent level.
+    pub fn load_f32_coherent(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
+        self.let_(Op::LoadF32Coherent { base: base.into(), byte_off })
+    }
+
+    pub fn load_b128_coherent(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
+        self.let_(Op::LoadB128Coherent { base: base.into(), byte_off })
+    }
+
+    /// `global_atomic_add` returning the OLD value, device scope. Per-lane semantics: every active lane adds ITS `value`; pass `1` in lane 0 and `0`
+    /// elsewhere for a one-ticket-per-wave counter, then `read_first_lane` the result.
+    pub fn atomic_add_u32(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::AtomicAddU32 { base: base.into(), byte_off, value: value.into() })
+    }
+
+    pub fn store_f32_wt(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::StoreF32Wt { base: base.into(), byte_off, value: value.into() });
+    }
+
+    pub fn store_f32x4_wt(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::StoreF32x4Wt { base: base.into(), byte_off, value: value.into() });
+    }
+
+    /// Device-scope release: wait for all earlier loads/stores, write back L2 (`buffer_wbl2 sc1`), wait again.
+    pub fn fence_release(&mut self) {
+        self.f.stmts.push(Stmt::FenceRelease { wb: true });
+    }
+
+    /// Release without the L2 write-back (valid when every shared store used `store_*_wt`).
+    pub fn fence_release_lite(&mut self) {
+        self.f.stmts.push(Stmt::FenceRelease { wb: false });
+    }
+
+    /// Device-scope acquire: wait for the ticket, invalidate (`buffer_inv sc1`).
+    pub fn fence_acquire(&mut self) {
+        self.f.stmts.push(Stmt::FenceAcquire { inv: true });
+    }
+
+    pub fn fence_acquire_lite(&mut self) {
+        self.f.stmts.push(Stmt::FenceAcquire { inv: false });
     }
 
     pub fn load_f32(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
@@ -1294,7 +1363,15 @@ pub fn verify(f: &Function) -> Vec<String> {
                             errs.push(here(e));
                         }
                     }
-                    Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } => {
+                    Op::AtomicAddU32 { base, value, .. } => {
+                        if let Err(e) = expect_ptr(f, *base, "atomic add") {
+                            errs.push(here(e));
+                        }
+                        if let Err(e) = expect_int(f, *value, "atomic add value") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } | Op::LoadF32Coherent { base, .. } | Op::LoadB128Coherent { base, .. } => {
                         if let Err(e) = expect_ptr(f, *base, "load") {
                             errs.push(here(e));
                         }
@@ -1529,8 +1606,17 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::StoreF32x4 { base, .. } => {
+            Stmt::StoreF32x4 { base, .. } | Stmt::StoreF32x4Wt { base, .. } => {
                 if let Err(e) = expect_ptr(f, *base, "store") {
+                    errs.push(here(e));
+                }
+            }
+            Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => {}
+            Stmt::StoreF32Wt { base, value, .. } => {
+                if let Err(e) = expect_ptr(f, *base, "store") {
+                    errs.push(here(e));
+                }
+                if let Err(e) = expect_float(f, *value, "store.wt f32") {
                     errs.push(here(e));
                 }
             }
@@ -1821,7 +1907,8 @@ pub mod kernels;
 fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
     match st {
         Stmt::Let { op, .. } => op.operands(),
-        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } => vec![*base, *value],
+        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32Wt { base, value, .. } | Stmt::StoreF32x4Wt { base, value, .. } => vec![*base, *value],
+        Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => vec![],
         Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } => vec![*addr, *value],
         Stmt::LoadGlobalLds { base, lds_addr, .. } => vec![*base, *lds_addr],
         Stmt::SetVar { value, .. } => vec![*value],
