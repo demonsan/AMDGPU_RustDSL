@@ -193,7 +193,7 @@ pub fn resolve_backend(name: &str, f: &amdgpu_dsl::Function) -> (String, Option<
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
-    &["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_pp", "fmha_fwd_hd128_mxfp8_sv", "sched_ovl_both", "sched_ovl_mfma", "sched_ovl_valu", "sched_ovl_vfirst", "sched_coissue_both", "sched_coissue_mfma", "sched_coissue_valu", "sched_coissue_cboth", "sched_coissue_cvalu", "sched_valu_mul", "sched_valu_max3", "sched_valu_exp", "sched_mfma_chain", "sched_mfma_valu16", "sched_mfma_valu4", "sched_diamond", "sched_occ_chain", "probe_log_store4", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "fmha_fwd_hd128_mxfp8_kvsplit_combine", "fmha_fwd_hd128_mxfp8_kvsplit_combine4"]
+    &["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_pp", "fmha_fwd_hd128_mxfp8_sv", "sched_ovl_both", "sched_ovl_mfma", "sched_ovl_valu", "sched_ovl_vfirst", "sched_coissue_both", "sched_coissue_mfma", "sched_coissue_valu", "sched_coissue_cboth", "sched_coissue_cvalu", "sched_valu_mul", "sched_valu_max3", "sched_valu_exp", "sched_mfma_chain", "sched_mfma_valu16", "sched_mfma_valu4", "sched_diamond", "sched_occ_chain", "probe_log_store4", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "fmha_fwd_hd128_mxfp8_kvsplit_combine", "fmha_fwd_hd128_mxfp8_kvsplit_combine4"]
 }
 
 pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
@@ -250,6 +250,12 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_dma" => Some(amdgpu_dsl::kernels::probe_dma()),
         "probe_safeasm_e2e" => Some(amdgpu_dsl::kernels::probe_safeasm_e2e()),
         "probe_log_store4" => Some(amdgpu_dsl::kernels::probe_log_store4()),
+        "probe_la8" => Some(amdgpu_dsl::kernels::probe_la8()),
+        "probe_la8_lite" => Some(amdgpu_dsl::kernels::probe_la8_lite()),
+        "probe_la8_plain_fenced" => Some(amdgpu_dsl::kernels::probe_la8_plain_fenced()),
+        "probe_la8_plain" => Some(amdgpu_dsl::kernels::probe_la8_plain()),
+        "probe_la8_nodrain" => Some(amdgpu_dsl::kernels::probe_la8_nodrain()),
+        "probe_la_verify" => Some(amdgpu_dsl::kernels::probe_la_verify()),
         "probe_last_arriver" => Some(amdgpu_dsl::kernels::probe_last_arriver()),
         "probe_last_arriver_lite" => Some(amdgpu_dsl::kernels::probe_last_arriver_lite()),
         "probe_last_arriver_plain" => Some(amdgpu_dsl::kernels::probe_last_arriver_plain()),

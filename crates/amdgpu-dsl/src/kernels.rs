@@ -14856,6 +14856,156 @@ pub fn probe_last_arriver_plain_fenced() -> Function {
     probe_last_arriver_mode("probe_last_arriver_plain_fenced", 4)
 }
 
+/// 8-wave (512-thread) last-arriver probe: the shape of the real fused KV-split combine. `s_barrier` does NOT drain VM_CNT, so each wave drains its own stores
+/// before the block barrier; only then does thread 0 take the ticket (value 1, other threads add 0), the ticket is broadcast through LDS, and in the
+/// last block EVERY wave does the acquire and copies a slice of the partials with coherent loads into `out` (exact per-element verification by
+/// `probe_la_verify`). `mode`: 0 = full fences, 1 = lite (sc1 accesses, per-wave drain only), 2 = plain accesses + full fences, 3 = plain accesses + no
+/// drain/fence at all (must be able to fail), 4 = sc1 accesses but NO per-wave drain before the barrier (shows whether the drain matters).
+/// Partial value = hash(global index + seed); `stagger` (kernarg) adds a block-dependent busy loop before the stores to skew arrival order.
+fn probe_la8_mode(name: &str, mode: u8) -> Function {
+    let mut b = FnBuilder::new(name, 512);
+    b.lds(2048);
+    b.arg("part", DType::Ptr, 0, 8);
+    b.arg("counter", DType::Ptr, 8, 8);
+    b.arg("out", DType::Ptr, 16, 8);
+    b.arg("nblocks", DType::I32, 24, 4);
+    b.arg("seed", DType::I32, 28, 4);
+    b.arg("stagger", DType::I32, 32, 4);
+    let part = b.let_(Op::KernargPtr { offset: 0 });
+    let counter = b.let_(Op::KernargPtr { offset: 8 });
+    let out = b.let_(Op::KernargPtr { offset: 16 });
+    let nb = b.let_(Op::KernargI32 { offset: 24 });
+    let seed = b.let_(Op::KernargI32 { offset: 28 });
+    let stagger = b.let_(Op::KernargI32 { offset: 32 });
+    let tid = b.let_(Op::WorkitemId);
+    let bid = b.let_(Op::WorkgroupIdX);
+    let c512 = b.c_i32(512);
+    let c4 = b.c_i32(4);
+    let c1 = b.c_i32(1);
+    let c0 = b.c_i32(0);
+    let c37 = b.c_i32(37);
+    let c63 = b.c_i32(63);
+    let chash = b.c_i32(-1640531535); // 0x9E3779B1
+    // block-dependent delay: ((bid*37 + seed) & 63) * stagger loop iterations
+    let d0 = b.mul_i32(bid, c37);
+    let d1 = b.add_i32(d0, seed);
+    let d2 = b.let_(Op::AndI32(Opnd::Val(d1), Opnd::Val(c63)));
+    let iters = b.mul_i32(d2, stagger);
+    let dv = b.begin_loop(&[(DType::I32, Opnd::Val(c0))]);
+    let dn = b.add_i32(dv[0], c1);
+    b.set_var(dv[0], Opnd::Val(dn));
+    let dmore = b.cmp_lt_i32(dn, iters);
+    let dstop = b.let_(Op::NotI1(Opnd::Val(dmore)));
+    b.break_if(Opnd::Val(dstop));
+    b.end_loop();
+    // partial store: element idx = bid*512 + tid
+    let row = b.mul_i32(bid, c512);
+    let idx = b.add_i32(row, tid);
+    let hv = b.add_i32(idx, seed);
+    let val = b.mul_i32(hv, chash);
+    let valf = b.bitcast_f32(Opnd::Val(val));
+    let off = b.mul_i32(idx, c4);
+    let pp = b.ptr_add(part, off);
+    if mode == 2 || mode == 3 {
+        b.store_f32(pp, 0, Opnd::Val(valf));
+    } else {
+        b.store_f32_wt(pp, 0, Opnd::Val(valf));
+    }
+    match mode {
+        0 | 2 => b.fence_release(),     // per-wave: drain, wbl2, drain
+        1 => b.fence_release_lite(),    // per-wave drain
+        _ => {}                         // 3, 4: no drain before the barrier
+    }
+    b.barrier();
+    // ticket: thread 0 adds 1, everybody else adds 0
+    let is0 = b.cmp_lt_i32(tid, c1);
+    let one = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::Val(c1), b: Opnd::Val(c0) });
+    let old = b.atomic_add_u32(counter, 0, Opnd::Val(one));
+    let lo = b.mul_i32(tid, c4);
+    b.store_lds_b32(Opnd::Val(lo), Opnd::Val(old));
+    b.wait_lds(0);
+    b.barrier();
+    let ticket = b.load_lds_b32(Opnd::Val(c0)); // thread 0's old value: broadcast
+    let nbm1 = b.add_i32(nb, b.c_i32(-1));
+    let is_last = b.let_(Op::CmpGeI32(Opnd::Val(ticket), Opnd::Val(nbm1)));
+    b.begin_if(Opnd::Val(is_last));
+    match mode {
+        0 | 2 => b.fence_acquire(),
+        1 | 4 => b.fence_acquire_lite(),
+        _ => {}
+    }
+    let total = b.mul_i32(nb, c512);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(tid))]);
+    let i = vars[0];
+    let io = b.mul_i32(i, c4);
+    let q = b.ptr_add(part, io);
+    let x = if mode == 2 || mode == 3 { b.load_f32(q, 0) } else { b.load_f32_coherent(q, 0) };
+    let qo = b.ptr_add(out, io);
+    b.store_f32(qo, 0, Opnd::Val(x));
+    let i2 = b.add_i32(i, c512);
+    b.set_var(i, Opnd::Val(i2));
+    let more = b.cmp_lt_i32(i2, total);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+    b.end_if();
+    b.finish()
+}
+
+pub fn probe_la8() -> Function {
+    probe_la8_mode("probe_la8", 0)
+}
+pub fn probe_la8_lite() -> Function {
+    probe_la8_mode("probe_la8_lite", 1)
+}
+pub fn probe_la8_plain_fenced() -> Function {
+    probe_la8_mode("probe_la8_plain_fenced", 2)
+}
+pub fn probe_la8_plain() -> Function {
+    probe_la8_mode("probe_la8_plain", 3)
+}
+pub fn probe_la8_nodrain() -> Function {
+    probe_la8_mode("probe_la8_nodrain", 4)
+}
+
+/// Exact per-element verifier for the probes above: counts elements of `out` that differ from hash(i + seed) with a device atomic.
+pub fn probe_la_verify() -> Function {
+    let mut b = FnBuilder::new("probe_la_verify", 256);
+    b.arg("out", DType::Ptr, 0, 8);
+    b.arg("bad", DType::Ptr, 8, 8);
+    b.arg("total", DType::I32, 16, 4);
+    b.arg("seed", DType::I32, 20, 4);
+    let out = b.let_(Op::KernargPtr { offset: 0 });
+    let bad = b.let_(Op::KernargPtr { offset: 8 });
+    let total = b.let_(Op::KernargI32 { offset: 16 });
+    let seed = b.let_(Op::KernargI32 { offset: 20 });
+    let tid = b.let_(Op::WorkitemId);
+    let bid = b.let_(Op::WorkgroupIdX);
+    let c256 = b.c_i32(256);
+    let c4 = b.c_i32(4);
+    let c1 = b.c_i32(1);
+    let c0 = b.c_i32(0);
+    let chash = b.c_i32(-1640531535);
+    let row = b.mul_i32(bid, c256);
+    let i = b.add_i32(row, tid);
+    let inb = b.cmp_lt_i32(i, total);
+    b.begin_if(Opnd::Val(inb));
+    let off = b.mul_i32(i, c4);
+    let p = b.ptr_add(out, off);
+    let x = b.load_f32(p, 0);
+    let xi = b.bitcast_i32(Opnd::Val(x));
+    let hv = b.add_i32(i, seed);
+    let want = b.mul_i32(hv, chash);
+    let d = b.let_(Op::XorI32(Opnd::Val(xi), Opnd::Val(want)));
+    let neg = b.cmp_lt_i32(d, c0);
+    let pos = b.cmp_lt_i32(c0, d);
+    let inner = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(pos), a: Opnd::Val(c1), b: Opnd::Val(c0) });
+    let nz = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(neg), a: Opnd::Val(c1), b: Opnd::Val(inner) });
+    let _old = b.atomic_add_u32(bad, 0, Opnd::Val(nz));
+    b.end_if();
+    b.finish()
+}
+
 pub fn probe_log_store4() -> Function {
     // out[4*tid + j] = log2(in[tid]) for j in 0..4: covers v_log_f32 and global_store_dwordx4 on both backends
     let mut b = FnBuilder::new("probe_log_store4", 64);
