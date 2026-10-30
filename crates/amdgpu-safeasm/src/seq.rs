@@ -177,6 +177,20 @@ impl Seq {
         Vgpr { id: r }
     }
 
+    /// A tuple whose `N` dwords all hold the constant `k` (one `v_mov` plus the per-dword copies).
+    pub fn filled<const N: usize>(&mut self, k: i32) -> Vgpr<N>
+    where
+        Wd<N>: VectorWidth,
+    {
+        let c = self.splat(k);
+        let d = self.vgpr::<N>();
+        for i in 0..N {
+            self.push(AInst { op: "VWriteSub", dst: Some(d.id), srcs: vec![ASrc::Reg(c.id)], imm: i as i64 });
+        }
+        self.note_valu_write(d.id);
+        d
+    }
+
     /// A tuple whose dwords are all zero.
     pub fn zeroed<const N: usize>(&mut self) -> Vgpr<N>
     where
@@ -367,6 +381,29 @@ impl Seq {
             self.vm.clear();
             self.push(AInst { op: "SWaitVm", dst: None, srcs: vec![], imm: 0 });
         }
+    }
+
+    /// `s_waitcnt lgkmcnt(k)`: wait until at most `k` DS/scalar-memory operations are outstanding. A count that does not wait for anything (`k` >= the
+    /// number outstanding) is an error, not a silent no-op: it means the author's model of the queue is wrong.
+    pub fn wait_lgkm_cnt(&mut self, k: u32) -> Result<(), String> {
+        if k as usize >= self.lgkm.len() {
+            return Err(format!("lgkmcnt({k}) waits for nothing: only {} operation(s) outstanding", self.lgkm.len()));
+        }
+        let n = self.lgkm.len() - k as usize;
+        self.lgkm.drain(..n);
+        self.push(AInst { op: "SWaitLgkm", dst: None, srcs: vec![], imm: k as i64 });
+        Ok(())
+    }
+
+    /// `s_waitcnt vmcnt(k)` (same rule).
+    pub fn wait_vm_cnt(&mut self, k: u32) -> Result<(), String> {
+        if k as usize >= self.vm.len() {
+            return Err(format!("vmcnt({k}) waits for nothing: only {} operation(s) outstanding", self.vm.len()));
+        }
+        let n = self.vm.len() - k as usize;
+        self.vm.drain(..n);
+        self.push(AInst { op: "SWaitVm", dst: None, srcs: vec![], imm: k as i64 });
+        Ok(())
     }
 
     /// Loads still outstanding (for tests and the exit contract): (lgkm, vm).

@@ -1875,7 +1875,7 @@ pub fn asm_port_accepts(c: amdgpu_safeasm::AClass, ty: DType) -> bool {
     use amdgpu_safeasm::AClass;
     match c {
         AClass::V1 => matches!(ty, DType::I32 | DType::U32 | DType::F32 | DType::F16),
-        AClass::V2 => ty == DType::Frag2,
+        AClass::V2 => matches!(ty, DType::Frag2 | DType::Ptr),
         AClass::V4 => ty == DType::Frag4,
         AClass::V8 => ty == DType::Frag8,
         AClass::V16 => ty == DType::Frag16,
