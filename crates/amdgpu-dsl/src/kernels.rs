@@ -10280,7 +10280,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         words_out
     };
     // PV of the whole tile (V in ring slot `slot`, P words `w`) and its row sums
-    let pv_w = |b: &mut FnBuilder, slot: ValueId, w: &[ValueId]| {
+    let pv_w = |b: &mut FnBuilder, slot: ValueId, w: &[ValueId], pre: &[ValueId]| {
         if no_pv {
             return;
         }
@@ -10362,7 +10362,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if fmha_t_opt("pvpipe") {
             // software pipeline: the tr reads of step i+1 are issued before the MFMA of step i (partial lgkmcnt waits, reads in flight
             // during the MFMA); +8 VGPR for the second fragment
-            let mut nxt = load_v(b, 0, 0);
+            let mut nxt = match pre.first() { Some(&v) => v, None => load_v(b, 0, 0) };
             for hh in 0..2usize {
                 let o = 8 * hh;
                 let p8 = match &p_pre { Some(ps) => ps[hh], None => b.frag8(w[o], w[o + 1], w[o + 2], w[o + 3], w[o + 4], w[o + 5], w[o + 6], w[o + 7]) };
@@ -10371,10 +10371,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                     b.var_mfma_scale(la, ones8, p8, c127, c123);
                 }
                 for e in 0..4usize {
-                    let cur = nxt;
                     let step = hh * 4 + e;
+                    let cur = if step < pre.len() { pre[step] } else { nxt };
                     if step + 1 < 8 {
-                        nxt = load_v(b, (step + 1) / 4, (step + 1) % 4);
+                        nxt = if step + 1 < pre.len() { pre[step + 1] } else { load_v(b, (step + 1) / 4, (step + 1) % 4) };
                     }
                     b.var_mfma_scale(o_vars[e], cur, p8, c127, c123);
                 }
@@ -10391,7 +10391,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
             }
             for e in 0..4usize {
-                let v8 = load_v(b, hh, e);
+                let v8 = if hh == 0 && e < pre.len() { pre[e] } else { load_v(b, hh, e) };
                 b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
             }
         }
@@ -10427,6 +10427,26 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.set_prio(1);
         }
         b.wait_lds(0);
+        // vpre: issue the first 1-2 V-fragment (hh=0, e=0..n-1) LDS transposing reads BEFORE the barrier so the M window
+        // can start the first PV MFMAs with register operands; used with biasv (no bias MFMAs) + SMFMAC-first ordering.
+        let pre_v: Vec<ValueId> = {
+            let n = fmha_t_num("vpre").unwrap_or(0).min(2) as usize;
+            if n > 0 && !no_pv {
+                let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot_cur)).collect();
+                (0..n)
+                    .map(|e| {
+                        let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+                        for r in 0..4i32 {
+                            let off = b.c_i32(2048 * r);
+                            addrs.push(b.add_i32(trb[e], off));
+                        }
+                        b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3])
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
         if !no_bar && !nobar1 {
             b.barrier();
         }
@@ -10490,7 +10510,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             if stage {
                 qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
             }
-            pv_w(b, slot_cur, &w);
+            pv_w(b, slot_cur, &w, &pre_v);
         } else if win_m && stage && smfrs && smfv && q0_reg && !fmha_t_opt("qonce") && !fmha_t_opt("biasonce") && !fmha_t_opt("biasv") {
             // Block M: PV(t) + QK(t+1) (bias MFMAs, K reads, K scales, QK MFMAs) + row sums as ONE pinned safe-asm block
             let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot_nxt)).collect();
@@ -10507,7 +10527,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             ];
             b.var_asm_n(&[s_vars[0], s_vars[1], s_vars[2], s_vars[3], o_vars[0], o_vars[1], o_vars[2], o_vars[3], la], pv_qk_window_block(), &ins);
         } else {
-            pv_w(b, slot_cur, &w);
+            pv_w(b, slot_cur, &w, &pre_v);
             if stage && fmha_t_opt("midbar") && !no_bar {
                 // midbar: a third barrier per tile between PV and QK (finer phase granularity: the partner group may start its VALU earlier)
                 b.wait_lds(0);
