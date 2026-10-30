@@ -17,6 +17,14 @@ const VALU_TO_MATRIX_READ: u32 = 2;
 const VCC: u32 = u32::MAX;
 use crate::seq::{PK_TO_TRANS, TRANS_RESULT};
 
+/// Result latency in wait states of a matrix op (hazards.rs `mfma_latency`; the scaled/sparse ops use 20).
+fn result_latency(op: &str) -> u32 {
+    match op {
+        "VMfma32x32x8F16Z" | "VMfma32x32x8F16" | "VMfma16x16x16F16" | "VMfma16x16x32Fp8" | "VMfma32x32x16Fp8" => 12,
+        _ => MATRIX_RESULT,
+    }
+}
+
 fn is_matrix(op: &str) -> bool {
     op.starts_with("VMfma") || op.starts_with("VSmfmac")
 }
@@ -84,8 +92,9 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
             if let Some((w, wop)) = matrix_write.get(&r).copied() {
                 if Some(r) != chain_reg {
                     let have = slot.saturating_sub(w).saturating_sub(1);
-                    if have < MATRIX_RESULT {
-                        errs.push(here(format!("reads r{r}, the result of {wop} issued {have} wait states ago: needs {MATRIX_RESULT} (unretired matrix result)")));
+                    let need = result_latency(wop);
+                    if have < need {
+                        errs.push(here(format!("reads r{r}, the result of {wop} issued {have} wait states ago: needs {need} (unretired matrix result)")));
                     }
                 }
             }
@@ -133,7 +142,7 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
             }
             defined.insert(d);
             if let Some((w, wop)) = matrix_write.get(&d).copied() {
-                if Some(d) != chain_reg && slot.saturating_sub(w).saturating_sub(1) < MATRIX_RESULT {
+                if Some(d) != chain_reg && slot.saturating_sub(w).saturating_sub(1) < result_latency(wop) {
                     errs.push(here(format!("writes r{d} while the {wop} writing it is still in flight (WAW)")));
                 }
             }
@@ -242,7 +251,7 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
         errs.push("sequence ends with DS/VMEM loads outstanding".to_string());
     }
     for (r, (w, wop)) in &matrix_write {
-        if slot.saturating_sub(*w).saturating_sub(1) < MATRIX_RESULT {
+        if slot.saturating_sub(*w).saturating_sub(1) < result_latency(wop) {
             let declared = b.exit_in_flight.iter().any(|(x, _)| canon(*x) == *r) && b.outputs.iter().any(|p| canon(p.reg) == *r);
             if !declared {
                 errs.push(format!("end of sequence: r{r}, the result of {wop}, is still in flight and not exported with output_exit (unretired matrix result)"));
@@ -261,6 +270,7 @@ fn static_name(op: &str) -> &'static str {
         "VMfmaScale32x32x64Fp8" => "VMfmaScale32x32x64Fp8",
         "VMfmaScale32x32x64Fp8Z" => "VMfmaScale32x32x64Fp8Z",
         "VSmfmac16x16x128Fp8" => "VSmfmac16x16x128Fp8",
+        "VMfma32x32x8F16Z" => "VMfma32x32x8F16Z",
         _ => "matrix op",
     }
 }

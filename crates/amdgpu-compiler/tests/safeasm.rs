@@ -703,3 +703,34 @@ fn cvt_chain_instruction_sequence_matches_the_dsl_path() {
     assert!(d.len() >= 30, "unexpectedly short chain: {d:?}");
     assert_eq!(a, d, "safe-asm chain differs from the DSL chain");
 }
+/// Bias MFMA (f16 32x32x8, zero C) followed by a scaled MFMA accumulating into its result: different opcode => the full result latency (12 wait
+/// states for the f16 op) is padded by `retire`, then the scaled MFMA chains in place; per-lane VGPR shift via `v_lshrrev_b32_v`.
+#[test]
+fn bias_mfma_then_scaled_accumulate_and_vgpr_shift() {
+    let mut s = Seq::new();
+    let a2 = s.input::<2>();
+    let b2 = s.input::<2>();
+    let a8 = s.input::<8>();
+    let b8 = s.input::<8>();
+    let sa = s.input::<1>();
+    let sb = s.input::<1>();
+    let kd = s.input::<1>();
+    let g8 = s.input::<1>();
+    let acc = s.vgpr::<16>();
+    let (ra, rb) = (s.ready(&a2), s.ready(&b2));
+    let acc = s.v_mfma_f32_32x32x8_f16_zero(acc, ra, rb).retire(&mut s);
+    let (r8a, r8b, rsa, rsb) = (s.ready(&a8), s.ready(&b8), s.ready(&sa), s.ready(&sb));
+    let t = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc, r8a, r8b, rsa, rsb);
+    let mut sk0 = s.vgpr::<1>();
+    s.v_lshrrev_b32_v(&mut sk0, &g8, &kd); // per-lane shift count in a VGPR
+    let acc = t.retire(&mut s);
+    s.output(acc);
+    s.output(sk0);
+    let blk = s.finish().unwrap();
+    let ops = blk.insts();
+    let f = ops.iter().position(|i| i.op == "VMfma32x32x8F16Z").unwrap();
+    let m = ops.iter().position(|i| i.op == "VMfmaScale32x32x64Fp8").unwrap();
+    let gap: i64 = ops[f + 1..m].iter().map(|i| if i.op == "SNop" { i.imm + 1 } else { 1 }).sum();
+    assert!(gap >= 12, "{gap}");
+    assert!(ops.iter().any(|i| i.op == "VLshrB32" && matches!(i.srcs[0], ASrc::Reg(_))));
+}
