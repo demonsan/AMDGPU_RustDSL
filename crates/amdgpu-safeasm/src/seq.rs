@@ -244,6 +244,23 @@ impl Seq {
         Sub { id: self.alias_of(r.reg_id(), if HI { 4 } else { 0 }, AClass::V4), _p: PhantomData }
     }
 
+    /// Dwords `2*I .. 2*I+2` of an 8-dword tuple as a writable pair (I in 0..4); the parent stays mutably borrowed while the view lives.
+    pub fn pair_mut<'a, const I: usize>(&mut self, r: &'a mut Vgpr<8>) -> SubMut<'a, 2> {
+        let () = ViewCheck::<I, 4>::OK;
+        SubMut { id: self.alias_of(r.id, (2 * I) as u8, AClass::V2), _p: PhantomData }
+    }
+
+    /// Low (`HI` = false) or high half of an 8-dword tuple as a writable 4-dword view.
+    pub fn half8_mut<'a, const HI: bool>(&mut self, r: &'a mut Vgpr<8>) -> SubMut<'a, 4> {
+        SubMut { id: self.alias_of(r.id, if HI { 4 } else { 0 }, AClass::V4), _p: PhantomData }
+    }
+
+    /// Dwords `4*I .. 4*I+4` of a 16-dword tuple as a writable quad (I in 0..4).
+    pub fn quarter16_mut<'a, const I: usize>(&mut self, r: &'a mut Vgpr<16>) -> SubMut<'a, 4> {
+        let () = ViewCheck::<I, 4>::OK;
+        SubMut { id: self.alias_of(r.id, (4 * I) as u8, AClass::V4), _p: PhantomData }
+    }
+
     fn alias_of(&mut self, parent: VReg, off: u8, class: AClass) -> VReg {
         let (base, o) = self.alias_base.get(&parent).copied().unwrap_or((parent, 0));
         let a = self.new_reg(class);
@@ -486,6 +503,11 @@ impl Seq {
         }
     }
 }
+struct ViewCheck<const I: usize, const N: usize>;
+impl<const I: usize, const N: usize> ViewCheck<I, N> {
+    const OK: () = assert!(I < N, "view index out of range for this register tuple");
+}
+
 struct LaneCheck<const I: usize, const N: usize>;
 impl<const I: usize, const N: usize> LaneCheck<I, N> {
     const OK: () = assert!(I < N, "lane index out of range for this register tuple");

@@ -116,26 +116,26 @@ impl Seq {
 
     // ---- loads / DS (Pending tokens; offsets are compile-time constants with alignment checks) ---------------------------------------
     /// `ds_read_b128 dst, vaddr offset:OFF`: LDS read (lgkmcnt queue). OFF is 16-byte aligned (compile-time). The destination moves into the token.
-    pub fn ds_read_b128<const OFF: u32>(&mut self, dst: Vgpr<4>, addr: &impl Readable<1>) -> Pending<Vgpr<4>> {
+    pub fn ds_read_b128<const OFF: u32, D: Dst<4>>(&mut self, dst: D, addr: &impl Readable<1>) -> Pending<D> {
         let () = DsOff::<OFF, 16>::OK;
-        self.push(AInst { op: "LdsReadB128", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: OFF as i64 });
-        self.clear_write(dst.id);
+        self.push(AInst { op: "LdsReadB128", dst: Some(dst.dst_id()), srcs: vec![ASrc::Reg(addr.reg_id())], imm: OFF as i64 });
+        self.clear_write(dst.dst_id());
         self.issue_load(Queue::Lgkm, dst)
     }
 
     /// `ds_read_b64_tr_b8 dst, vaddr offset:OFF`: transposed 8-bit read (2 dwords). OFF is 8-byte aligned.
-    pub fn ds_read_b64_tr_b8<const OFF: u32>(&mut self, dst: Vgpr<2>, addr: &impl Readable<1>) -> Pending<Vgpr<2>> {
+    pub fn ds_read_b64_tr_b8<const OFF: u32, D: Dst<2>>(&mut self, dst: D, addr: &impl Readable<1>) -> Pending<D> {
         let () = DsOff::<OFF, 8>::OK;
-        self.push(AInst { op: "LdsReadB64TrB8", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: OFF as i64 });
-        self.clear_write(dst.id);
+        self.push(AInst { op: "LdsReadB64TrB8", dst: Some(dst.dst_id()), srcs: vec![ASrc::Reg(addr.reg_id())], imm: OFF as i64 });
+        self.clear_write(dst.dst_id());
         self.issue_load(Queue::Lgkm, dst)
     }
 
     /// `ds_read_b32 dst, vaddr offset:OFF` (OFF 4-byte aligned).
-    pub fn ds_read_b32<const OFF: u32>(&mut self, dst: Vgpr<1>, addr: &impl Readable<1>) -> Pending<Vgpr<1>> {
+    pub fn ds_read_b32<const OFF: u32, D: Dst<1>>(&mut self, dst: D, addr: &impl Readable<1>) -> Pending<D> {
         let () = DsOff::<OFF, 4>::OK;
-        self.push(AInst { op: "LdsReadB32", dst: Some(dst.id), srcs: vec![ASrc::Reg(addr.reg_id())], imm: OFF as i64 });
-        self.clear_write(dst.id);
+        self.push(AInst { op: "LdsReadB32", dst: Some(dst.dst_id()), srcs: vec![ASrc::Reg(addr.reg_id())], imm: OFF as i64 });
+        self.clear_write(dst.dst_id());
         self.issue_load(Queue::Lgkm, dst)
     }
 

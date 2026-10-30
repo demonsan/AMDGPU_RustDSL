@@ -529,7 +529,7 @@ impl Lowerer {
 
     /// Lower a safe-asm block (`amdgpu-safeasm`) into ordinary MIR: ports bind to DSL values, constants join the region's constant cache,
     /// everything else becomes fresh virtual registers; the instructions then go through the normal scheduling / allocation / hazard pipeline.
-    fn lower_asm(&mut self, dst: Option<ValueId>, block: &amdgpu_safeasm::AsmBlock, inputs: &[Opnd], inout: Option<VReg>) -> Result<(), String> {
+    fn lower_asm(&mut self, dst: Option<ValueId>, block: &amdgpu_safeasm::AsmBlock, inputs: &[Opnd], inouts: &[VReg]) -> Result<(), String> {
         use amdgpu_safeasm::{AClass, ASrc};
         let rc = |c: AClass| match c {
             AClass::V1 => RClass::V1,
@@ -543,14 +543,16 @@ impl Lowerer {
         // belt and braces: the block was verified when it was built, a lowered block is re-verified (it may come from another build)
         block.verify().map_err(|e| format!("asm block `{}` fails the hazard verifier: {}", block.name(), e.join("; ")))?;
         let n_bound = block.inputs().iter().filter(|p| !p.mutable).count();
-        if inputs.len() != n_bound || block.inputs().iter().any(|p| p.mutable) != inout.is_some() {
-            return Err(format!("asm block `{}`: {} inputs bound for {} read-only ports (in/out port bound: {})", block.name(), inputs.len(), n_bound, inout.is_some()));
+        let n_mut = block.inputs().iter().filter(|p| p.mutable).count();
+        if inputs.len() != n_bound || n_mut != inouts.len() {
+            return Err(format!("asm block `{}`: {} inputs bound for {} read-only ports; {} in/out variables bound for {} in/out ports", block.name(), inputs.len(), n_bound, inouts.len(), n_mut));
         }
+        let mut inout_iter = inouts.iter();
         let mut map: Vec<Option<VReg>> = vec![None; block.regs().len()];
         let mut bound = inputs.iter();
         for p in block.inputs().iter() {
             if p.mutable {
-                map[p.reg as usize] = inout;
+                map[p.reg as usize] = inout_iter.next().copied();
                 continue;
             }
             let o = bound.next().expect("input count checked");
@@ -1295,7 +1297,11 @@ impl Lowerer {
                 }
                 Stmt::VarAsm { var, block, inputs } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
-                    self.lower_asm(None, block, inputs, Some(v))?;
+                    self.lower_asm(None, block, inputs, &[v])?;
+                }
+                Stmt::VarAsmN { vars, block, inputs } => {
+                    let regs: Vec<VReg> = vars.iter().map(|v| self.vars.get(v.0 as usize).copied().ok_or("var not lowered")).collect::<Result<_, _>>()?;
+                    self.lower_asm(None, block, inputs, &regs)?;
                 }
                 Stmt::BeginLoop { vars, init } => {
                     for (i, var) in vars.iter().enumerate() {
@@ -2183,7 +2189,7 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::Asm { block, inputs } => {
-                self.lower_asm(Some(dst), block, inputs, None)?;
+                self.lower_asm(Some(dst), block, inputs, &[])?;
             }
             Op::SmfmacFp8_16x16x128 { a, b, idx, c } => {
                 // Sparse MFMA: the accumulator D is also the input C. A (4 dwords) is the
@@ -2853,6 +2859,13 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                 | Stmt::VarScaleLane { var, .. } | Stmt::VarLoadB128 { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarAsm { var, .. } => {
                     if uvars.remove(var) {
                         changed = true;
+                    }
+                }
+                Stmt::VarAsmN { vars, .. } => {
+                    for var in vars {
+                        if uvars.remove(var) {
+                            changed = true;
+                        }
                     }
                 }
                 _ => {}

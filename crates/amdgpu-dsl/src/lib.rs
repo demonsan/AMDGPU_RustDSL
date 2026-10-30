@@ -435,6 +435,8 @@ pub enum Stmt {
     /// A safe-asm sequence updating the loop variable `var` in place through its in/out port (the first input port, `Seq::inout`);
     /// ``inputs`` bind to the remaining input ports in order.
     VarAsm { var: VarId, block: std::sync::Arc<amdgpu_safeasm::AsmBlock>, inputs: Vec<Opnd> },
+    /// A safe-asm sequence updating SEVERAL loop variables in place: the i-th in/out port (declaration order) is bound to `vars[i]`.
+    VarAsmN { vars: Vec<VarId>, block: std::sync::Arc<amdgpu_safeasm::AsmBlock>, inputs: Vec<Opnd> },
     BeginLoop { vars: Vec<VarId>, init: Vec<Opnd> },
     BreakIf { cond: Opnd },
     EndLoop,
@@ -570,6 +572,10 @@ impl Function {
                 }
                 Stmt::VarAsm { var, block, inputs } => {
                     let _ = writeln!(s, "{pad}var{} <- asm `{}` ({} insts; {inputs:?})", var.0, block.name(), block.insts().len());
+                }
+                Stmt::VarAsmN { vars, block, inputs } => {
+                    let ids: Vec<u32> = vars.iter().map(|v| v.0 as u32).collect();
+                    let _ = writeln!(s, "{pad}vars{ids:?} <- asm `{}` ({} insts; {inputs:?})", block.name(), block.insts().len());
                 }
                 Stmt::BeginLoop { vars, init } => {
                     let _ = writeln!(s, "{pad}loop vars={vars:?} init={init:?}");
@@ -1143,6 +1149,11 @@ impl FnBuilder {
     /// `var += smfmac_16x16x128_fp8_fp8(a, b, idx)`: accumulate into a `Frag4` loop variable in place.
     pub fn var_smfmac_fp8(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, idx: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::VarSmfmac { var, a: a.into(), b: b.into(), idx: idx.into() });
+    }
+
+    /// Update several loop variables in place: the i-th `Seq::inout` port is bound to `vars[i]`.
+    pub fn var_asm_n(&mut self, vars: &[VarId], block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) {
+        self.f.stmts.push(Stmt::VarAsmN { vars: vars.to_vec(), block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
     }
 
     /// Update the Frag4 loop variable `var` in place with a safe-asm sequence (its leading in/out port is the variable).
@@ -1789,6 +1800,33 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
+            Stmt::VarAsmN { vars, block, inputs } => {
+                let muts: Vec<_> = block.inputs().iter().filter(|p| p.mutable).collect();
+                if muts.len() != vars.len() {
+                    errs.push(here(format!("asm block `{}` has {} in/out ports, {} variables bound", block.name(), muts.len(), vars.len())));
+                } else {
+                    for (k, (p, v)) in muts.iter().zip(vars).enumerate() {
+                        let ok = loop_vars.iter().rev().any(|vs| vs.contains(v)) || done_vars.contains(v);
+                        if !ok {
+                            errs.push(here(format!("var{v} updated by an asm block outside its loop")));
+                        }
+                        if !f.var_ty(*v).map_or(false, |t| asm_port_accepts(p.class, t)) {
+                            errs.push(here(format!("asm block `{}`: in/out port {k} ({:?}) does not match var{v}", block.name(), p.class)));
+                        }
+                    }
+                }
+                let ro: Vec<_> = block.inputs().iter().filter(|p| !p.mutable).collect();
+                if ro.len() != inputs.len() {
+                    errs.push(here(format!("asm block `{}`: {} inputs bound for {} read-only ports", block.name(), inputs.len(), ro.len())));
+                } else {
+                    for (k, (p, o)) in ro.iter().zip(inputs).enumerate() {
+                        match opnd_ty(f, *o) {
+                            Ok(t) if asm_port_accepts(p.class, t) => {}
+                            other => errs.push(here(format!("asm block `{}`: input {k} is {other:?}, the port is {:?}", block.name(), p.class))),
+                        }
+                    }
+                }
+            }
             Stmt::VarSmfmac { var, a, b, idx } => {
                 let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
@@ -1921,7 +1959,7 @@ fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         }
         Stmt::VarMfmaScaleC { a, b, c, scale_a, scale_b, .. } => vec![*a, *b, *c, *scale_a, *scale_b],
         Stmt::VarSmfmac { a, b, idx, .. } => vec![*a, *b, *idx],
-        Stmt::VarAsm { inputs, .. } => inputs.clone(),
+        Stmt::VarAsm { inputs, .. } | Stmt::VarAsmN { inputs, .. } => inputs.clone(),
         Stmt::BeginLoop { init, .. } => init.clone(),
         Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => vec![*cond],
         _ => Vec::new(),
