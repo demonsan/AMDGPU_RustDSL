@@ -16040,6 +16040,15 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
         let _ = p1.wait(s);
         let _ = p0.wait(s);
     }
+    fn rd_k<'a, const OFF: u32>(s: &mut Seq, v8: &'a mut Vgpr<8>, a0: &In<1>, a1: &In<1>) -> [Pending<SubMut<'a, 4>>; 2] {
+        let [h0, h1] = s.split_halves8_mut(v8);
+        [s.ds_read_b128::<OFF, _>(h0, a0), s.ds_read_b128::<OFF, _>(h1, a1)]
+    }
+    fn wait2(s: &mut Seq, p: [Pending<SubMut<'_, 4>>; 2]) {
+        let [p0, p1] = p;
+        let _ = p1.wait(s);
+        let _ = p0.wait(s);
+    }
     let mut s = Seq::new();
     s.pin();
     let sv0 = s.inout::<16>();
@@ -16116,16 +16125,16 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     wait4(&mut s, pk1);
     let rv1 = s.ready(&v1);
     let t1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o1, rv1, rpa, rs127, rs123);
-    let pk4 = { let [h0, h1] = s.split_halves8_mut(&mut v4); [s.ds_read_b128::<0, _>(h0, &kfb0), s.ds_read_b128::<0, _>(h1, &kfb1)] };
+    let pk4 = rd_k::<0>(&mut s, &mut v4, &kfb0, &kfb1);
     wait4(&mut s, pk2);
     let rv2 = s.ready(&v2);
     let t2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o2, rv2, rpa, rs127, rs123);
-    let pk5 = { let [h0, h1] = s.split_halves8_mut(&mut v5); [s.ds_read_b128::<4096, _>(h0, &kfb0), s.ds_read_b128::<4096, _>(h1, &kfb1)] };
+    let pk5 = rd_k::<4096>(&mut s, &mut v5, &kfb0, &kfb1);
     wait4(&mut s, pk3);
     let rv3 = s.ready(&v3);
     let t3 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o3, rv3, rpa, rs127, rs123);
-    let pk6 = { let [h0, h1] = s.split_halves8_mut(&mut v6); [s.ds_read_b128::<8192, _>(h0, &kfb0), s.ds_read_b128::<8192, _>(h1, &kfb1)] };
-    { let [pa0, pa1] = pk4; let _ = pa1.wait(&mut s); let _ = pa0.wait(&mut s); }
+    let pk6 = rd_k::<8192>(&mut s, &mut v6, &kfb0, &kfb1);
+    wait2(&mut s, pk4);
     let rv4 = s.ready(&v4);
     let _ = pkd3.wait(&mut s);
     let _ = pkd2.wait(&mut s);
@@ -16138,8 +16147,8 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     let (rk0_0, rk1_0) = (s.ready(&sk0_0), s.ready(&sk1_0));
     let acc0 = tb0.retire(&mut s);
     let tq0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc0, rv4, rq0, rk0_0, rsq0);
-    let pk7 = { let [h0, h1] = s.split_halves8_mut(&mut v7); [s.ds_read_b128::<12288, _>(h0, &kfb0), s.ds_read_b128::<12288, _>(h1, &kfb1)] };
-    { let [pa0, pa1] = pk5; let _ = pa1.wait(&mut s); let _ = pa0.wait(&mut s); }
+    let pk7 = rd_k::<12288>(&mut s, &mut v7, &kfb0, &kfb1);
+    wait2(&mut s, pk5);
     let rv5 = s.ready(&v5);
     let mut sk0_1 = s.vgpr::<1>();
     let mut sk1_1 = s.vgpr::<1>();
@@ -16149,7 +16158,7 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     let acc1 = tb1.retire(&mut s);
     let tq1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc1, rv5, rq0, rk0_1, rsq0);
     let pk8 = rd_v(&mut s, &mut v8, trb[0], 1);
-    { let [pa0, pa1] = pk6; let _ = pa1.wait(&mut s); let _ = pa0.wait(&mut s); }
+    wait2(&mut s, pk6);
     let rv6 = s.ready(&v6);
     let mut sk0_2 = s.vgpr::<1>();
     let mut sk1_2 = s.vgpr::<1>();
@@ -16159,7 +16168,7 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     let acc2 = tb2.retire(&mut s);
     let tq2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc2, rv6, rq0, rk0_2, rsq0);
     let pk9 = rd_v(&mut s, &mut v9, trb[1], 1);
-    { let [pa0, pa1] = pk7; let _ = pa1.wait(&mut s); let _ = pa0.wait(&mut s); }
+    wait2(&mut s, pk7);
     let rv7 = s.ready(&v7);
     let mut sk0_3 = s.vgpr::<1>();
     let mut sk1_3 = s.vgpr::<1>();
@@ -16178,26 +16187,26 @@ pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
     wait4(&mut s, pk9);
     let rv9 = s.ready(&v9);
     let t1 = t1.chain(&mut s, rv9, rpb, rs127, rs123);
-    let pk12 = { let [h0, h1] = s.split_halves8_mut(&mut v12); [s.ds_read_b128::<0, _>(h0, &kfb2), s.ds_read_b128::<0, _>(h1, &kfb3)] };
+    let pk12 = rd_k::<0>(&mut s, &mut v12, &kfb2, &kfb3);
     wait4(&mut s, pk10);
     let rv10 = s.ready(&v10);
     let t2 = t2.chain(&mut s, rv10, rpb, rs127, rs123);
-    let pk13 = { let [h0, h1] = s.split_halves8_mut(&mut v13); [s.ds_read_b128::<4096, _>(h0, &kfb2), s.ds_read_b128::<4096, _>(h1, &kfb3)] };
+    let pk13 = rd_k::<4096>(&mut s, &mut v13, &kfb2, &kfb3);
     wait4(&mut s, pk11);
     let rv11 = s.ready(&v11);
     let t3 = t3.chain(&mut s, rv11, rpb, rs127, rs123);
-    let pk14 = { let [h0, h1] = s.split_halves8_mut(&mut v14); [s.ds_read_b128::<8192, _>(h0, &kfb2), s.ds_read_b128::<8192, _>(h1, &kfb3)] };
-    { let [pa0, pa1] = pk12; let _ = pa1.wait(&mut s); let _ = pa0.wait(&mut s); }
+    let pk14 = rd_k::<8192>(&mut s, &mut v14, &kfb2, &kfb3);
+    wait2(&mut s, pk12);
     let rv12 = s.ready(&v12);
     let tq0 = tq0.chain(&mut s, rv12, rq1, rk1_0, rsq1);
-    let pk15 = { let [h0, h1] = s.split_halves8_mut(&mut v15); [s.ds_read_b128::<12288, _>(h0, &kfb2), s.ds_read_b128::<12288, _>(h1, &kfb3)] };
-    { let [pa0, pa1] = pk13; let _ = pa1.wait(&mut s); let _ = pa0.wait(&mut s); }
+    let pk15 = rd_k::<12288>(&mut s, &mut v15, &kfb2, &kfb3);
+    wait2(&mut s, pk13);
     let rv13 = s.ready(&v13);
     let tq1 = tq1.chain(&mut s, rv13, rq1, rk1_1, rsq1);
-    { let [pa0, pa1] = pk14; let _ = pa1.wait(&mut s); let _ = pa0.wait(&mut s); }
+    wait2(&mut s, pk14);
     let rv14 = s.ready(&v14);
     let tq2 = tq2.chain(&mut s, rv14, rq1, rk1_2, rsq1);
-    { let [pa0, pa1] = pk15; let _ = pa1.wait(&mut s); let _ = pa0.wait(&mut s); }
+    wait2(&mut s, pk15);
     let rv15 = s.ready(&v15);
     let tq3 = tq3.chain(&mut s, rv15, rq1, rk1_3, rsq1);
     let ts = ts.chain(&mut s, rra, rpa, ri23);
