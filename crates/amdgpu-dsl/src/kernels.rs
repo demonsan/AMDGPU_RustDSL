@@ -12458,14 +12458,19 @@ fn emit_fmha_t128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             return;
         }
         let rb = b.add_i32(key0, rowb);
-        for (sq, bo, pt, lt) in [(seqs, base_off, ptr, lds_tile), (cx.v_seqs, cx.vbase_off, cx.ptr_v, lds_tile_v)] {
-            let lbase = b.add_i32(lt, buf_off);
-            for q in 0..4i32 {
+        // the (clamped) source rows are the same for the K and the V tile: computed once per q, shared by both passes
+        let rows: Vec<ValueId> = (0..4i32)
+            .map(|q| {
                 let cq = b.c_i32(8 * q);
                 let row_raw = b.add_i32(rb, cq);
                 let ok = b.cmp_lt_i32(row_raw, cx.kv_len);
-                let row = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(row_raw), b: Opnd::Val(cx.kv_last) });
-                let o0 = b.mul_i32(row, sq);
+                b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(row_raw), b: Opnd::Val(cx.kv_last) })
+            })
+            .collect();
+        for (sq, bo, pt, lt) in [(seqs, base_off, ptr, lds_tile), (cx.v_seqs, cx.vbase_off, cx.ptr_v, lds_tile_v)] {
+            let lbase = b.add_i32(lt, buf_off);
+            for q in 0..4i32 {
+                let o0 = b.mul_i32(rows[q as usize], sq);
                 let o1 = b.add_i32(o0, bo);
                 let cbytes = if q & 1 == 0 { cbytes_even } else { cbytes_odd };
                 let o2 = b.add_i32(o1, cbytes);
