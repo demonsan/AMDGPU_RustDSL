@@ -7077,6 +7077,8 @@ struct KvsCtx {
     part_row0: ValueId,
     /// number of query heads (row_lin = (b * S + row) * H + h)
     heads: ValueId,
+    /// fused combine (FMHA_OPT=fused): per-32-row-tile ticket counters (u32, zeroed once, reset by the last arriver)
+    counters: Option<ValueId>,
     /// ceil(SK / 128): the TOTAL tile count of the sequence (the LUT-correction copy is chosen by it, like `_vs128`, not by the tiles of one split)
     ntiles_total: ValueId,
 }
@@ -10563,7 +10565,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let l_ptr = b.ptr_add(kv.ptr_lse, lse_off);
         let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
         b.begin_if(Opnd::Val(wave_live));
-        b.store_f32(l_ptr, 0, lse_v);
+        let fused = kv.counters.is_some();
+        if fused { b.store_f32_wt(l_ptr, 0, lse_v); } else { b.store_f32(l_ptr, 0, lse_v); }
         if p16 && !ablate.contains("nopartial") {
             // fp16 partials through the same LDS transpose as the fp32 path, two fragments (64 dims = 128 bytes per row) per round
             let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
@@ -10652,9 +10655,105 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.wait_lds(0);
                 for i in 0..4usize {
                     let v = b.load_lds_b128(Opnd::Val(raddr[i]));
-                    b.store_f32x4(gptr[i], (128 * pr) as u32, v);
+                    if fused { b.store_f32x4_wt(gptr[i], (128 * pr) as u32, v); } else { b.store_f32x4(gptr[i], (128 * pr) as u32, v); }
                 }
                 b.wait_lds(0);
+            }
+            if let Some(counters) = kv.counters {
+                // fused combine: release -> ticket (lane 0 adds 1) -> the LAST arriver of the 4 splits of this 32-row tile reduces the partials in fixed order
+                let nsp = fmha_t_num("fs").unwrap_or(4) as usize;
+                b.fence_release();
+                let lane0 = b.cmp_lt_i32(lane_q, c1);
+                let one_v = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lane0), a: Opnd::Val(c1), b: Opnd::Val(c0) });
+                let c5f = b.c_i32(5);
+                let hq = b.mul_i32(cx.bidx, kv.heads);
+                let hq2 = b.add_i32(hq, cx.hidx);
+                let s32 = {
+                    let t31 = b.c_i32(31);
+                    let sl = b.add_i32(cx.s_len, t31);
+                    b.let_(Op::LshrI32(Opnd::Val(sl), Opnd::Val(c5f)))
+                };
+                let tile0 = b.mul_i32(hq2, s32);
+                let rt = b.let_(Op::LshrI32(Opnd::Val(cx.row0), Opnd::Val(c5f)));
+                let tile = b.add_i32(tile0, rt);
+                let tile4 = b.shl_i32(tile, c2);
+                let cptr = b.ptr_add(counters, tile4);
+                let old = b.atomic_add_u32(cptr, 0, Opnd::Val(one_v));
+                let old0 = b.read_first_lane(Opnd::Val(old));
+                let c_last = b.c_i32(nsp as i32 - 1);
+                let is_last = b.let_(Op::CmpGeI32(Opnd::Val(old0), Opnd::Val(c_last)));
+                b.begin_if(Opnd::Val(is_last));
+                b.fence_acquire();
+                let rows_tot = b.let_(Op::KernargI32 { offset: 0x284 });
+                let lr = b.let_(Op::LshrI32(Opnd::Val(lane_q), Opnd::Val(c1)));
+                let hh = b.let_(Op::AndI32(Opnd::Val(lane_q), Opnd::Val(c1)));
+                let rg_raw = b.add_i32(cx.row0, lr);
+                let s_last2 = {
+                    let cm = b.c_i32(-1);
+                    b.add_i32(cx.s_len, cm)
+                };
+                let rg = b.min_i32(rg_raw, s_last2);
+                let q1 = b.mul_i32(cx.bidx, cx.s_len);
+                let q2 = b.add_i32(q1, rg);
+                let q3 = b.mul_i32(q2, kv.heads);
+                let lin = b.add_i32(q3, cx.hidx); // linear row of this lane pair
+                let c256 = b.c_i32(256);
+                let c128b = b.c_i32(128);
+                let hh128 = b.mul_i32(hh, c128b);
+                let mut lses: Vec<ValueId> = Vec::new();
+                let mut pptr: Vec<ValueId> = Vec::new();
+                for s in 0..nsp {
+                    let cs = b.c_i32(s as i32);
+                    let soff = b.mul_i32(cs, rows_tot);
+                    let prow_s = b.add_i32(soff, lin);
+                    let lo = b.shl_i32(prow_s, c2);
+                    let lp = b.ptr_add(kv.ptr_lse, lo);
+                    lses.push(b.load_f32_coherent(lp, 0));
+                    let ro = b.mul_i32(prow_s, c256);
+                    let ro2 = b.add_i32(ro, hh128);
+                    pptr.push(b.ptr_add(kv.ptr_ohat, ro2));
+                }
+                let mut m = lses[0];
+                for s in 1..nsp { m = b.max_f32(m, lses[s]); }
+                let neg1 = b.c_f32(-1.0);
+                let nm = b.mul_f32(m, neg1);
+                let mut ws: Vec<ValueId> = Vec::new();
+                for s in 0..nsp {
+                    let d = b.add_f32(lses[s], nm);
+                    ws.push(b.exp2_f32(d));
+                }
+                let mut den = ws[0];
+                for s in 1..nsp { den = b.add_f32(den, ws[s]); }
+                let rden = b.rcp_f32(den);
+                let wn: Vec<ValueId> = ws.iter().map(|w| b.mul_f32(*w, rden)).collect();
+                let lin128 = b.mul_i32(lin, c256);
+                let ob = b.add_i32(lin128, hh128);
+                let optr = b.ptr_add(cx.ptr_o, ob);
+                for c in 0..8usize {
+                    let mut ld: Vec<ValueId> = Vec::new();
+                    for s in 0..nsp { ld.push(b.load_b128_coherent(pptr[s], (16 * c) as u32)); }
+                    let mut acc: Vec<Option<ValueId>> = vec![None; 8];
+                    for s in 0..nsp {
+                        for wi in 0..4usize {
+                            let wd = b.frag4_lane(ld[s], wi as u8);
+                            let lo_f = b.let_(Op::CvtF16ToF32(Opnd::Val(wd)));
+                            let hi_s = b.let_(Op::LshrI32(Opnd::Val(wd), Opnd::Val(c16i)));
+                            let hi_f = b.let_(Op::CvtF16ToF32(Opnd::Val(hi_s)));
+                            for (k, vv) in [(2 * wi, lo_f), (2 * wi + 1, hi_f)] {
+                                let prod = b.mul_f32(wn[s], vv);
+                                acc[k] = Some(match acc[k] { None => prod, Some(a0) => b.add_f32(a0, prod) });
+                            }
+                        }
+                    }
+                    let mut ow: Vec<ValueId> = Vec::new();
+                    for k in 0..4usize { ow.push(b.cvt_pk_bf16_f32(acc[2 * k].unwrap(), acc[2 * k + 1].unwrap())); }
+                    let f4 = b.frag4(ow[0], ow[1], ow[2], ow[3]);
+                    b.store_f32x4(optr, (16 * c) as u32, f4);
+                }
+                // reset the ticket for the next launch (all lanes write the same zero)
+                let zf = b.c_f32(0.0);
+                b.store_f32_wt(cptr, 0, zf);
+                b.end_if();
             }
         }        if !p16 && !ablate.contains("nopartial") && !ablate.contains("nolds") {
             // coalesced partial store: each wave stages its 32 x 32-dim slab (fragment e) through its private 4 KB of the (dead) Q staging region of the
@@ -15607,6 +15706,9 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         b.arg("ptr_lse", DType::Ptr, 0x278, 8);
         b.arg("kvs_splits", DType::I32, 0x280, 4);
         b.arg("kvs_rows_total", DType::I32, 0x284, 4);
+        if fmha_t_opt("fused") {
+            b.arg("kvs_counters", DType::Ptr, 0x288, 8);
+        }
     } else {
         b.arg("abi_tail", DType::I32, 0x280, 16);
     }
@@ -16001,7 +16103,8 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         let c7t = b.c_i32(7);
         let kvl_r = b.add_i32(kvl0, c127t);
         let ntiles_total = b.let_(Op::LshrI32(Opnd::Val(kvl_r), Opnd::Val(c7t)));
-        Some(KvsCtx { ptr_ohat, ptr_lse, part_row0, heads, ntiles_total })
+        let counters = if fmha_t_opt("fused") { Some(b.let_(Op::KernargPtr { offset: 0x288 })) } else { None };
+        Some(KvsCtx { ptr_ohat, ptr_lse, part_row0, heads, counters, ntiles_total })
     } else {
         None
     };
