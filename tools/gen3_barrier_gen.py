@@ -15,7 +15,7 @@ READ = [
     "    s_waitcnt lgkmcnt(0)",
     "    v_mov_b32_e32 v11, s14",
     "    v_cmp_ne_u32_e32 vcc, v6, v11",
-    "    v_cndmask_b32_e32 v23, 0, 1, vcc",
+    "    v_cndmask_b32_e32 v23, v24, v25, vcc",
     "    ds_add_u32 v23, v18",
     "    s_waitcnt lgkmcnt(0)",
 ]

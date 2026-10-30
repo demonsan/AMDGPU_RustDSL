@@ -30,6 +30,8 @@ __NAME__:
     v_add_u32_e32 v19, 16, v3               ; group timeout flag
     v_mov_b32_e32 v27, 0
     v_mov_b32_e32 v28, 0
+    v_mov_b32_e32 v24, 0
+    v_mov_b32_e32 v25, 1
     ; limit = group ? __LIMIT_B__ : __LIMIT_A__  (n in s6; s7 = 2n for the asymmetric variant)
     s_add_u32 s7, s6, s6
     v_readfirstlane_b32 s16, v12
@@ -83,12 +85,12 @@ Ldone___NAME__:
     v_mov_b32_e32 v23, s9
     global_store_dword v[20:21], v22, off
     global_store_dword v[20:21], v23, off offset:4
-    ds_read_b32 v25, v18
+    ds_read_b32 v30, v18
     s_waitcnt lgkmcnt(0)
-    global_store_dword v[20:21], v25, off offset:8
-    ds_read_b32 v26, v19
+    global_store_dword v[20:21], v30, off offset:8
+    ds_read_b32 v31, v19
     s_waitcnt lgkmcnt(0)
-    global_store_dword v[20:21], v26, off offset:12
+    global_store_dword v[20:21], v31, off offset:12
     s_mov_b64 exec, s[10:11]
     s_endpgm
 .size __NAME__, .-__NAME__
