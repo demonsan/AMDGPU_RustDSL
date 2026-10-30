@@ -4,6 +4,7 @@ members = [
     "crates/amdgpu-dsl",
     "crates/amdgpu-compiler",
     "crates/amdc",
+    "crates/amdgpu-safeasm",
 ]
 
 [workspace.package]
