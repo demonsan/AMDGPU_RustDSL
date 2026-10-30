@@ -944,6 +944,75 @@ at N=128/129; all 15 gate shapes take t128 and pass 15/15 (ours bad=0, parity 15
 CU fill), `_t` future edits against the frozen numerics, and any absolute TFLOP/s without its clock
 state/grid labels.
 
+## 7.10 KV-split final - default auto dispatch certification (GPU 5)
+
+**Certified build: kernels/dispatch from Main `dd6aa2d`** (kernel-opt `8188e1f` default auto dispatch:
+`fmha_fwd_hd128_mxfp8_auto` builds `_vs128` + `_t128` + `fmha_fwd_hd128_mxfp8_kvsplit` +
+`..._kvsplit_combine4h` and picks the path per shape with the calibrated guard); certification harness
+commit **`5b04fd2`** (this branch: ULP gate in the `max_abs <= 1 bf16 ULP(max|ref|)` form + the refitted
+guard model below). Validated with `OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto`, **no sentinel env**; GPU 5,
+warm protocol `REF_WARMUP=200`, `REF_ITERS=100`, best/median of 5.
+
+**Two-line protocol (§7.9.0):**
+* **(a) per-CU efficiency, same grid:** unchanged: `_vs128`/`_t128` are 1.41x slower than the vendor per CU
+  (365-527 TFLOP/s vs 515-537 on their respective grids). KV-split does **not** improve the per-CU rate
+  (split total 2.35 TFLOP/s/CU over its 256 busy CUs, main phase 2.89; `_t128` 4.12, vendor 8.38) - it wins
+  absolute throughput by filling 256 CUs at 2 waves/SIMD instead of 64/128.
+* **(b) absolute at each kernel's best legal tiling, both launches counted:** on B1H8S2048 the default auto
+  path (split s=4, main+combine in one event window) measures **28.4-28.8 us = 596.7-605.5 TFLOP/s**
+  (median 601); the vendor in the same run is **534.0-538.9 TFLOP/s** => **1.11-1.13x faster absolute**;
+  `_t128` in the same run is 526-527 TFLOP/s => 1.14x. Breakdown: main 23.2-23.5 us, combine 5.2-5.3 us,
+  launch gap <=0.3 us.
+
+**Measured table (default auto path unless noted):**
+
+| shape | chosen kernel | TFLOP/s | comparison |
+|---|---|---|---|
+| B1H8S2048 (benchmark) | **kvsplit s=4** (256 blocks, 100% CUs) | **601** (vendor 537, t128 527) | **1.12x vendor, 1.14x t128** |
+| B2H4S1024 SK1024 (N=32) | t128 (split rejected by guard) | 196-197 (split was 190-193; vendor 223) | guards the 1.4%-loss case |
+| B1H8S1024 (N=32) | t128 | 196-197 (split 192.6; vendor 223) | same |
+| B3H3S768 SK1280 (N=27) | kvsplit s=4 | 193.8-197.1 (t128 195.3-195.8; vendor 208-209) | 0.4% over t128 (noise) |
+| B1H16S256 SK1024 (N=16) | t128 (conservative) | 100.1 (split 111.1-111.6) | split would win 11% - guard is conservative here |
+| B2H8S2048 (N=128) | t128 | 949.9-951.2 (vendor 1016-1029) | boundary, correct fallback |
+| **B4H8S2048** (filling) | **_vs128** single launch | 1292.8-1301.1 (vendor 1689-1715; t128 950) | 0.76x vendor, **no regression** (certified 1302.5 same run) |
+| **B1H8S8192** (filling) | **_vs128** single launch | 1861-1864 (vendor 2377-2385; t128 935-951) | 0.78x vendor, **no regression** (certified 1832.8) |
+
+**Gate/determinism/parity (default auto path):** 15 shapes at 16 rows **15/15 OK**, ours bad=0, parity
+**15/15**; 64 rows **12/15 OK** with all three failures vendor (vendor bad=1/4/5), ours bad=0 on all 15 and
+parity 15/15; determinism **5/5 x2**. Combined-output md5 `a82ed4d67882104d251959c07cf4fd41`; our mean
+error vs the CPU model **7.356e-4** (vendor 2.5e-3), worst 6.6e-3.
+
+**Split-vs-`_vs128` difference (fp16 partials; not bit-identical):** `SPLIT_ULP split=4: max_abs=7.812e-3`
+= **0.50 bf16 ULP of max|ref|=2.0**, `mean_abs=5.535e-5`, 4.86% of words differ at all (1.69% by >1
+word-ULP, which is meaningless near zero); `SPLIT_ULP_OK`. This is the expected cost of fp16 partials (fp32
+partials were 6.6e-6 mean_abs but cost 2.2 us more). **The CPU-reference and vendor-parity gates are the
+certification, not bit-identity**; `mean_abs=5.5e-5` is 7.5% of our current CPU mean error and 1/280 of a
+bf16 ULP.
+
+**Guard model (refitted, this branch):** `T_cur` keeps the physical form `F/(5.9e12*min(256,2N)) + 9.4us`
+(fits measured t128 within 7%, except N=128 -10% where the guard rejects anyway);
+`T_kv = max(physics_floor, empirical_fit)` with `physics_floor = F/(5.9e12*min(256,N*s)) + 7us +
+part_b/4.0TB/s + max(3us, (part_b+out_b)/4.2TB/s) + 1.5us` and
+`fit[us] = 17.1965 + 0.0937013*F[GFLOP] - 0.00103388*(N*s) + 0.620991*rows[k]` (fit to 6 measured totals:
+benchmark, B1H8S1024, B2H4S1024, B3H3S768, B1H16S256, N128 s=2; residuals <=5%). Measured vs model
+`T_kv`: 28.6/29.19, 22.3/22.55, 22.4/22.55, 22.9/21.80, 19.3/19.88, 40.5/41.6 (<=5% everywhere); decisions
+verified against measured totals: benchmark split (13% win), N=32 shapes fall back (avoid 1.4-1.8% loss),
+B3H3 split (neutral, chosen), N=128 and N=127/128 boundary fall back (measured t128 is 1.14x better than
+split s=2 there), N=129/130 fall back to `_vs128`, filling shapes stay `_vs128`, tile-edge cases
+(SK=640/1088/s=4 empty split; SK=512/384/128) all fall back.
+
+**What is certified:** the default auto path at Main `dd6aa2d` + harness `5b04fd2` is a shippable dispatch
+option today: on B1H8S2048 it is **1.11-1.13x faster than the vendor in absolute throughput** (both launches
+counted, same run) while the certified CPU-reference gate, parity and determinism stay clean; filling shapes
+are unchanged on the single-launch `_vs128` path; mid underfilled shapes either fall back (N=32, conservative)
+or are within noise of `_t128`. **Not certified:** bit-identity (fp16 partials: mean_abs 5.5e-5, max 0.5-1
+bf16 ULP); per-CU efficiency (still lower: 2.35 vs vendor 8.38 TFLOP/s/CU - the win is CU fill, not per-CU);
+a full-package absolute claim (benchmark is now 50%->100% of the planned wave slots but the shape is still a
+single 256-CU package exercise); write-bandwidth counters (rocprofv3 hung on GPU 5 and was killed; the
+epilogue write cost is measured by ablation instead: main 23.0 us with partials vs 18.8 us without = **4.2 us
+for 17.04 MB fp16 partials, ~4.0 TB/s serial**, matching the model; combine 5.2 us for 21.3 MB = 4.1 TB/s);
+tiny shapes where s=4 would have an empty split (guard rejects), and the pending kernel-opt optimisations.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as

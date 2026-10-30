@@ -69,3 +69,40 @@ The first version of the guard (kernel-occ's constants with fp16 bytes, no combi
 Filling and mid shapes are unchanged (the guard keeps them on `_vs128` / t128); the 15-shape gate takes the split on 7 shapes (B2H4S1024, B1H8S2048, B1H2S512 SK2048, B3H3S768, B1H16S256 SK1024, B1H2S256 SK1000, B1H2S200 SK1337) and the certified t128 on the other 8.
 **Gates through the default auto path** (no REF_SPLIT env): 15/15 vs the CPU reference at 16 rows, 0 bad at 16 and 64 rows, parity 15/15 (REF_ROWS=64), determinism 5/5 x3, max combined mean error 1.84e-3 (16 rows) / 1.88e-3 (64 rows), vendor 1.5-2.9e-3. The three REF_KERNEL_FAIL verdicts at 64 rows are the vendor's own bad elements.
 **Why the partial write cannot be hidden (keep):** the normalised `Ohat = O / l` and `lse` exist only after the LAST tile of the split, every block finishes at the same moment, and the combine kernel cannot start before the main kernel's stores have drained; per-tile stores would have to write unnormalised running state (a different algorithm). The ~4 us of write that remains (fp16, coalesced) is the floor for this algorithm; the other ~19 us of the main kernel is compute (11.4 us) plus fixed per-launch/prologue/epilogue cost.
+
+## Independent validation (kernel-occ, GPU 5, final default-auto build)
+
+Validated build: Main `dd6aa2d` + certification harness `5b04fd2` (ULP gate in `max_abs <= 1 bf16 ULP(max|ref|)`
+form + refitted guard model). Default `OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto`, no sentinel env, warm protocol
+`REF_WARMUP=200`, `REF_ITERS=100`.
+
+**Benchmark B1H8S2048 (same run, default auto):** split s=4 chosen; main 23.2-23.5 us, combine 5.2-5.3 us,
+total **28.4-28.8 us = 596.7-605.5 TFLOP/s** vs vendor **534.0-538.9** => **1.11-1.13x absolute**; `_t128`
+526-527 TFLOP/s. Combined-output md5 `a82ed4d67882104d251959c07cf4fd41`, our mean error vs CPU 7.356e-4
+(vendor 2.5e-3), bad=0.
+
+**Gate/determinism/parity:** 15/15 at 16 rows (ours bad=0, parity 15/15); 64 rows 12/15 with all three
+failures vendor (ours bad=0, parity 15/15); determinism 5/5 x2.
+
+**ULP vs `_vs128` (fp16 partials):** max_abs 7.812e-3 = **0.50 bf16 ULP** of max|ref|=2.0, mean_abs
+5.535e-5, 4.86% of words differ at all (1.69% >1 word-ULP - meaningless near zero); `SPLIT_ULP_OK`.
+Not bit-identical by construction; CPU/parity gates are the certification.
+
+**No-regression checks (default auto):** B4H8S2048 -> `_vs128` single launch 1292.8-1301.1 TFLOP/s (vendor
+1689-1715, `_t128` 950; certified `_vs128` was 1302.5 same run); B1H8S8192 -> `_vs128` 1861-1864 (vendor
+2377-2385, `_t128` 935-951). Mid shapes: B2H8S2048 (N=128) -> `_t128` 949.9-951.2 (guard rejects split);
+B1H8S1024/B2H4S1024 (N=32) -> `_t128` 196-197 (guard now rejects split; measured split would have been
+190-193 = 1.4-1.8% slower); B3H3S768 (N=27) -> split 193.8-197.1 vs t128 195.3-195.8 (neutral); B1H16S256
+(N=16) -> `_t128` 100.1 (split 111.1-111.6 would win 11% - conservative guard, no regression).
+
+**Guard model refit:** `T_cur = F/(5.9e12*min(256,2N)) + 9.4us`; `T_kv = max(physics_floor, linear fit)` with
+`fit[us] = 17.1965 + 0.0937013*F[GFLOP] - 0.00103388*(N*s) + 0.620991*rows[k]` and
+`physics_floor = F/(5.9e12*min(256,N*s)) + 7us + part_b/4.0TB/s + max(3us,(part_b+out_b)/4.2TB/s) + 1.5us`.
+Fit: 6 measured s=2/s=4 totals, `T_kv` residuals <=5% (28.6/29.19, 22.3/22.55, 22.4/22.55, 22.9/21.80,
+19.3/19.88, 40.5/41.6 us), `T_cur` physical form within 7% except N=128 (-10%, guard rejects there).
+Boundary decisions verified: N256=127/128 -> `_t128` (measured split s=2 is 14% worse), N256=129/130 ->
+`_vs128`, tile-edge empty-split shapes -> fallback; benchmark stays split (guard predicts 0.91 ratio, measured
+0.87). Write traffic: counters unavailable (rocprofv3 hung on GPU 5), but ablation gives main 23.0 us with
+partials vs 18.8 us without = 4.2 us for 17.04 MB fp16 = ~4.0 TB/s serial write, combine 5.2 us for 21.3 MB
+= 4.1 TB/s; consistent with the cost model.
+
