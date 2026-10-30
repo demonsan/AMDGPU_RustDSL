@@ -230,7 +230,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         break;
                     }
                     let cand = &insts[j];
-                    let mut ok = (movable(cand.op) || (VCC_FILL.with(|c| c.get()) && movable_wide(cand.op)))
+                    // pinned (hand-authored) instructions are never moved, and nothing is moved across them
+                    let mut ok = !cand.pin
+                        && !insts[i..j].iter().any(|x| x.pin)
+                        && (movable(cand.op) || (VCC_FILL.with(|c| c.get()) && movable_wide(cand.op)))
                         && cand.dst.is_some()
                         && earliest_of(cand, &ready, &vw, &pkw, cycle) <= cycle;
                     if ok {
