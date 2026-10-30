@@ -45,6 +45,28 @@ int main(int argc, char** argv) {
     const int D = 128;
     const float softmax_scale = 1.0f / std::sqrt((float)D);
 
+    // ---- tiling configuration (defaults preserve the historical 256-row / 512-thread launch) ----------------
+    // The vendor binary has a fixed 256-query-row tiling (ts_qo = 256) and must keep REF_VENDOR_ROWS_PER_BLOCK=256.
+    // `REF_ROWS_PER_BLOCK` (default 256) selects OUR kernel's rows per block: set it to 128 for the 128-row tiling
+    // variants (the candidate kernel must implement exactly that tiling; the host cannot change the kernel's ABI).
+    const int vendor_rows = envi("REF_VENDOR_ROWS_PER_BLOCK", 256);
+    const int ours_rows = envi("REF_ROWS_PER_BLOCK", 256);
+    const int cus = envi("REF_CUS", 256);                 // MI350: 256 active CUs/package
+    const unsigned vendor_block = 512;                    // vendor: 512 threads = 8 waves
+    const unsigned ours_block = (unsigned)envi("REF_OURS_BLOCK_THREADS", 512);
+    const int gvx = (S + vendor_rows - 1) / vendor_rows, gy = H, gz = B;
+    const int gox = (S + ours_rows - 1) / ours_rows;
+    const long gv_blocks = (long)gvx * gy * gz, go_blocks = (long)gox * gy * gz;
+    std::printf("[grid] vendor rows/block=%d block=%u grid=(%d,%d,%d) blocks=%ld (%.1f%% of %d CUs); "
+                "ours rows/block=%d block=%u grid=(%d,%d,%d) blocks=%ld (%.1f%% of %d CUs)\n",
+                vendor_rows, vendor_block, gvx, gy, gz, gv_blocks, 100.0 * (double)gv_blocks / cus, cus,
+                ours_rows, ours_block, gox, gy, gz, go_blocks, 100.0 * (double)go_blocks / cus, cus);
+    if (vendor_rows != 256)
+        std::printf("[grid] WARNING: the vendor binary is fixed at 256 rows/block; REF_VENDOR_ROWS_PER_BLOCK=%d is not supported by it\n", vendor_rows);
+    if (ours_rows != 256)
+        std::printf("[grid] note: the candidate kernel must implement the %d-row/block tiling (REF_ROWS_PER_BLOCK) and %u threads\n", ours_rows, ours_block);
+    if (std::getenv("REF_GRID_ONLY")) return 0;
+
     unsigned int seed = 20260101u;
     auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 16) & 0xFFu; };
     static const unsigned char palette[11] = {0x00, 0x20, 0x28, 0x30, 0x38, 0x3C, 0x40, 0xA0, 0xA8, 0xB0, 0xB8};
@@ -121,26 +143,34 @@ int main(int argc, char** argv) {
     CK(hipModuleGetFunction(&fn, mod, "_ZN5aiter28fmha_fwd_hd128_mxfp8_gfx950E"));
     size_t asz = sizeof(args);
     void* extra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};
-    CK(hipModuleLaunchKernel(fn, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
+    // Per-kernel ABI fields that depend on the tiling: output pointer and the Q tile stride (offset 0x080).
+    auto set_launch = [&](void* outp, int rows) {
+        put64(args, 0x000, outp);
+        put32(args, 0x080, (uint32_t)((size_t)rows * H * D));
+    };
+    set_launch(dout, vendor_rows);
+    CK(hipModuleLaunchKernel(fn, gvx, gy, gz, vendor_block, 1, 1, 0, nullptr, nullptr, extra));
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(out.data(), dout, no * 2, hipMemcpyDeviceToHost));
     const int iters = envi("REF_ITERS", 0);
     const double flops = 4.0 * B * H * (double)S * SK * D;
-    auto time_kernel = [&](hipFunction_t f, const char* label) {
+    auto time_kernel = [&](hipFunction_t f, const char* label, void* outp, int rows, int gx, unsigned block) {
         if (iters <= 0) return;
+        set_launch(outp, rows);
         hipEvent_t e0, e1;
         CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
-        for (int w = 0; w < 3; ++w) CK(hipModuleLaunchKernel(f, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
+        for (int w = 0; w < 3; ++w) CK(hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, extra));
         CK(hipDeviceSynchronize());
         CK(hipEventRecord(e0));
-        for (int w = 0; w < iters; ++w) CK(hipModuleLaunchKernel(f, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
+        for (int w = 0; w < iters; ++w) CK(hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, extra));
         CK(hipEventRecord(e1));
         CK(hipEventSynchronize(e1));
         float ms = 0; CK(hipEventElapsedTime(&ms, e0, e1));
         const double per = ms / iters;
-        std::printf("timing %-8s: %.4f ms/iter, %.2f TFLOP/s (%d iters)\n", label, per, flops / (per * 1e-3) / 1e12, iters);
+        std::printf("timing %-8s: %.4f ms/iter, %.2f TFLOP/s (%d iters, %d rows/block, %d blocks)\n",
+                    label, per, flops / (per * 1e-3) / 1e12, iters, rows, gx * gy * gz);
     };
-    time_kernel(fn, "vendor");
+    time_kernel(fn, "vendor", dout, vendor_rows, gvx, vendor_block);
 
     // CPU reference.
     auto bf2f = [](uint16_t x) { uint32_t u = (uint32_t)x << 16; float f; std::memcpy(&f, &u, 4); return f; };
@@ -189,16 +219,16 @@ int main(int argc, char** argv) {
         void* dout2;
         CK(hipMalloc(&dout2, no * 2));
         CK(hipMemset(dout2, 0, no * 2));
-        put64(args, 0x000, dout2);
+        set_launch(dout2, ours_rows);
         hipModule_t mod2; hipFunction_t fn2;
         CK(hipModuleLoad(&mod2, co2));
         CK(hipModuleGetFunction(&fn2, mod2, kname2));
-        CK(hipModuleLaunchKernel(fn2, (S + 255) / 256, H, B, 512, 1, 1, 0, nullptr, nullptr, extra));
+        CK(hipModuleLaunchKernel(fn2, gox, gy, gz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
         CK(hipDeviceSynchronize());
         std::vector<uint16_t> out2(no, 0);
         CK(hipMemcpy(out2.data(), dout2, no * 2, hipMemcpyDeviceToHost));
         bad2 = check(out2, "our kernel   vs CPU");
-        time_kernel(fn2, "ours");
+        time_kernel(fn2, "ours", dout2, ours_rows, gox, ours_block);
         double wd = 0.0, md = 0.0;
         for (size_t i = 0; i < no; ++i) {
             const double dd = std::fabs((double)bf2f(out[i]) - (double)bf2f(out2[i]));
