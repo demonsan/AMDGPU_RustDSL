@@ -89,3 +89,83 @@ movs), four back-to-back `v_smfmac_f32_16x16x128_fp8_fp8 v[24:27], ...`, `s_nop 
 2. `Pending` tokens for DS/VMEM loads (scoreboard counts) and `s_waitcnt` derived from them.
 3. Block-boundary contracts (`Seq<Entry, Exit>`) for software-pipelined loops.
 4. More opcode templates, generated from `backend/llvm24.tbl` plus a small per-opcode operand-class table (the legality rules live in one place).
+
+## Adversarial review - what holds and what does not
+
+Independent review (kernel-occ) of `crates/amdgpu-safeasm` @ Main `a50369d`. Reproducers live in
+`scratch/safeasm-review/` (not a workspace member; `run_cases.sh` compiles each case with rustc against the
+crate rlibs, `hw/run_hw.sh` runs raw-asm ISA probes on GPU 5). The crate's own suite passes (5 ui/queue
+tests, 18 compile-fail cases, `pv_phase`).
+
+### Coverage table: (a)-(l) from the review brief
+
+| # | attack | result | evidence |
+|---|---|---|---|
+| a | read in-flight MFMA D, token alive | **caught** (E0502 cannot borrow acc as immutable while mutably borrowed) | `cases/fail_read_inflight_mfma_d.rs` |
+| a' | read in-flight MFMA D after **dropping the token** (`let _ = t;` / `mem::forget`) and reading via `lane()` as a plain `Operand` | **BYPASS - compiles, 0 wait states, wrong data** | `cases/pass_read_drop.rs`: emitted `v_mfma...` immediately followed by `v_add_f32 v1, v32, v32`; `hw/run_hw.sh` `rawread_nopad` reads **0** where the correct value is **64** (`rawread_pad20`), i.e. a real hardware stale read |
+| b | overwrite a register an in-flight MFMA reads, token alive | **caught** (E0502) | `cases/fail_write_operand_of_inflight_mfma.rs` |
+| b' | same after dropping the token | **BYPASS - compiles, no padding** | `cases/pass_war_drop.rs` (and WAW variant `pass_waw_drop.rs`); raw-asm `war_nopad` did not change the result in this probe, so the hazard is ISA-illegal but not observed here |
+| c | forget the 2-wait rule before `v_readfirstlane` / matrix operand | **caught by construction** (`Ready` is the only path; plain register is `E0308`) | `cases/fail_matrix_operand_without_ready.rs`; crate ui case |
+| d | SMFMAC implicit C written by VALU with no padding | **holds - the builder pads automatically** (the accumulator is passed through `make_ready_pub`); emitted `s_nop 1` (2 states) right before the SMFMAC | `cases/pass_smfmac_implicit_c.rs` |
+| e | SGPR in a VGPR-only slot / constant-bus violations (`v_cndmask_b32_e32` vcc, e64 mask, two SGPRs in VOP3) | **caught** (E0277 `VgprOnly`, E0080 constant-bus const assert) | `cases/fail_cndmask_e32_literal.rs`, `fail_two_sgprs_vop3.rs`; crate ui cases |
+| f | two compares with a live vcc | **caught** (E0308 `Vcc<Free>` vs `Vcc<Live>`); a second `vcc()` after dropping the token compiles but **panics at run time** ("vcc already taken") - safe but a DoS, not a compile error | `cases/fail_second_compare_while_mask_live.rs`, `cases/pass_second_vcc.rs` |
+| g | wrong-width fragment/operand | **caught** (`Wd<N>` sealed; `Operand` only for V1/Sub<1>/Sgpr<1>) | `cases/fail_wrong_operand_width.rs`; crate ui cases |
+| h | literal in VOP3 / inline constant out of range | **caught** (E0277/E0080 with readable messages) | `cases/fail_literal_in_vop3.rs`, `fail_inline_constant_range.rs` |
+| i | hazard across a Seq boundary | **not expressible in the safe API** (no splice/merge method; `Seq` owns its register table) - but the raw-MIR escape hatch below makes it possible | `cases/fail_cross_seq_splice.rs`, `pass_no_cross_boundary.rs` |
+| j | loop-carried wait-distance violation | **not expressible** (no loop construct in `Seq`) - same escape hatch caveat | as (i) |
+| k | DS/VMEM partial-wait misuse | **not expressible yet** (no memory ops in the crate); the Pending-token design is not implemented, so this rule is simply absent rather than enforced | as (i) |
+| l | raw `MOp` escape hatch | **BYPASS - full**: `amdgpu-compiler` is a public dependency and `Seq::to_mfunction` returns a mutable `MFunction`, so a caller can push arbitrary `MInst` (any `MOp`) after the checked sequence and emit it; this also provides loops, memory ops and cross-boundary sequences | `cases/pass_escape_mfunction.rs` (raw `v_add_u32` injected and emitted) |
+
+### Findings (ranked)
+
+1. **F1 - dropping a matrix token releases its borrows without adding the 20 wait states.** `Mfma`/`Smfmac`
+   are `#[must_use]` but Rust only warns; `let _ = t;` (or `mem::forget(t)`) ends the borrows, and any
+   *VALU* read of the result (`Seq::lane`/`half8` -> `Operand`) needs no `Ready`, so the sequence compiles
+   and emits with zero padding. Hardware probe: reading the D of a fresh scaled MFMA immediately gives
+   **0 instead of 64** (`hw/rawread_nopad` vs `rawread_pad20`). This is exactly the bug class the crate
+   claims to eliminate. **Fix:** share a drop flag (`Rc<Cell<bool>>`) with the token, set it in
+   `impl Drop`, and make `to_asm`/`to_mfunction` return `Err("unretired matrix result")` when set; or make
+   the token hold `&'a mut Seq` (linear session type) so no other sequence operation is possible until
+   `retire`. The same drop hole gives WAR/WAW bypasses (F2).
+2. **F2 - WAR/WAW on in-flight operands/accumulator via the same drop hole** (`pass_war_drop`,
+   `pass_waw_drop`). A raw-asm WAR probe (`war_nopad`) did not change the result at this latency, so it is
+   ISA-illegal but not demonstrated to corrupt on gfx950; still the same fix as F1.
+3. **F3 - the raw-MIR escape hatch defeats every type rule** (`pass_escape_mfunction`): `MFunction` fields
+   are public and `to_mfunction` hands one out, so a caller can append arbitrary `MInst { MOp, ... }`.
+   This is arguably "the compiler crate is the raw layer", but the doc should say so explicitly, and the
+   public API should not invite it: return an opaque wrapper from `to_mfunction`, or make
+   `MFunction`/`Block`/`MInst` construction/fields non-public in `amdgpu-compiler`.
+   Recommended strongest fix: a **hazard verifier** in `to_asm`/`to_mfunction` that re-walks the MIR with
+   the same wait-state model and rejects the sequence if any rule is violated - it catches F1/F2 and any
+   future API hole in one place, and is cheap (the crate already owns the clock).
+4. **F4 - the token does not encode the opcode**, so `chain` can follow a `_zero`-variant MFMA with the
+   *different* accumulate opcode back to back (`examples::pv_rowsum_phase` itself does this). The type
+   comment says the interlock is same-opcode only. Raw-asm probe: different-opcode back-to-back gives the
+   correct result (`zerochain_nopad == zerochain_pad20 == 128`), i.e. hardware tolerated it here, but the
+   type-level invariant is still weaker than the documented rule. **Fix:** `Mfma<'a, const OP: Opcode>`
+   (or two token types) and make `chain` generic over a single opcode.
+5. **F5 - `VALU_TO_MATRIX_READ = 2` is empirically sufficient for the A/B operand path** (raw-asm
+   `valu2mfma_pad1 == valu2mfma_pad7 == 64`), but it is only 2 clocks while the CDNA4 table (p74/PASS=4)
+   suggests the required wait is larger; it held here, but the evidence should be pinned with a hardware
+   regression probe (or raised to 8 if further probes show otherwise; it costs 6 states per matrix op).
+6. **F6 - a second `vcc()` after a dropped `Vcc<Live>` panics** (`seq.rs:212`) instead of failing to
+   compile; panic is safe but user-hostile. Return `Option`/`Result` or use a type-state method.
+7. **F7 - PoC is sequence-level only:** the ported phase emits the *same matrix/VALU ops* in the same
+   order as the kernel path (6 MFMA/SMFMAC + 1 add; assembly-checked after register renaming), but the
+   safe asm contains **51 `s_nop` wait states vs 4** in the kernel path (it pads 20 states after the PV
+   chain even though the row-sum SMFMAC does not read D, plus 20 after the row-sum chain). Both assemble;
+   the safe sequence is therefore *more conservative*, not instruction-identical, and it cannot be run as
+   an observable kernel because `Seq` has no loads/stores and the PoC operands are all zero. The "bit
+   identical results" claim is true at the matrix-op level (same operands/opcodes) but is not testable
+   end-to-end until memory ops exist.
+
+### Residual risks
+
+* `Safe` here means "cannot express the ISA-hazard classes through the checked builder"; it does not
+  cover the compiler crate, which remains a fully safe Rust API that can emit illegal sequences.
+* Value-level mistakes (using a register before writing it, wrong fragment *contents*, wrong scale
+  operand) are not addressed; only shape/hazard classes are.
+* Releasing a token is not linear (F1/F2). This is the single most important gap.
+* The wait-state constants are only hardware-evidenced for the matrix-result rule (20, confirmed earlier);
+  VALU->matrix (2) and vcc->cndmask (2) still rest on the ISA table, not on a regression probe.
+* `Sealed`/`#[forbid(unsafe_code)]` hold: no `unsafe` in the crate and no way to invent operand kinds.
