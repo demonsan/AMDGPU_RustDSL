@@ -14773,10 +14773,12 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     b.arg("counter", DType::Ptr, 8, 8);
     b.arg("result", DType::Ptr, 16, 8);
     b.arg("nblocks", DType::I32, 24, 4);
+    b.arg("seed", DType::I32, 28, 4);
     let part = b.let_(Op::KernargPtr { offset: 0 });
     let counter = b.let_(Op::KernargPtr { offset: 8 });
     let result = b.let_(Op::KernargPtr { offset: 16 });
     let nb = b.let_(Op::KernargI32 { offset: 24 });
+    let seed = b.let_(Op::KernargI32 { offset: 28 });
     let tid = b.let_(Op::WorkitemId);
     let bid = b.let_(Op::WorkgroupIdX);
     let c64 = b.c_i32(64);
@@ -14789,6 +14791,7 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     let bp1 = b.add_i32(bid, c1);
     let val = b.mul_i32(bp1, c1000);
     let val = b.add_i32(val, tid);
+    let val = b.add_i32(val, seed); // different data every run: stale cache lines from an earlier run cannot match by accident
     let valf = b.bitcast_f32(Opnd::Val(val));
     let off = b.mul_i32(idx, c4);
     let pp = b.ptr_add(part, off);

@@ -22,15 +22,17 @@ int main(int argc, char** argv) {
         for (int b = 0; b < n; ++b) for (int t = 0; t < 64; ++t) want += (uint32_t)((b + 1) * 1000 + t);
         int bad = 0; uint32_t first_bad = 0;
         for (int r = 0; r < reps; ++r) {
+            const int seed = 7919 * (r + 1) + n;
+            const uint32_t want_r = want + (uint32_t)seed * (uint32_t)n * 64u;
             CK(hipMemset(dpart, 0, (size_t)n * 64 * 4)); CK(hipMemset(dcnt, 0, 64)); CK(hipMemset(dres, 0, 64));
             CK(hipDeviceSynchronize());
-            void* a0 = dpart; void* a1 = dcnt; void* a2 = dres; int a3 = n;
-            void* params[] = {&a0, &a1, &a2, &a3};
+            void* a0 = dpart; void* a1 = dcnt; void* a2 = dres; int a3 = n; int a4 = seed;
+            void* params[] = {&a0, &a1, &a2, &a3, &a4};
             CK(hipModuleLaunchKernel(fn, n, 1, 1, 64, 1, 1, 0, nullptr, params, nullptr));
             CK(hipDeviceSynchronize());
             uint32_t got = 0, cnt = 0;
             CK(hipMemcpy(&got, dres, 4, hipMemcpyDeviceToHost)); CK(hipMemcpy(&cnt, dcnt, 4, hipMemcpyDeviceToHost));
-            if (got != want || cnt != (uint32_t)n * 64) { if (!bad) first_bad = got; ++bad; }
+            if (got != want_r || cnt != (uint32_t)n * 64) { if (!bad) first_bad = got; ++bad; }
         }
         std::printf("[last_arriver] blocks=%5d reps=%d bad=%d%s\n", n, reps, bad, bad ? " (first bad result differs)" : "");
         (void)first_bad;
