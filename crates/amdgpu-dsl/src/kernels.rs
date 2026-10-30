@@ -9991,7 +9991,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
     };
     // VALU phase of the whole tile: ONE max / rollback decision over its 64 scores, then P (16 words)
-    let valu = |b: &mut FnBuilder, masked: bool| -> Vec<ValueId> {
+    let valu = |b: &mut FnBuilder, masked: bool, do_decide: bool, t0: usize, t1: usize| -> Vec<ValueId> {
         let mut words_out: Vec<ValueId> = Vec::with_capacity(16);
         if no_valu {
             for _ in 0..16 {
@@ -10027,6 +10027,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.var_add_pk(s_vars[s], bpair);
             }
         }
+        if do_decide {
         let mut flat: Vec<ValueId> = Vec::with_capacity(64);
         for s in 0..4usize {
             for r in 0..16u8 {
@@ -10128,11 +10129,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.set_var(bias2, nb);
         }
         b.end_if();
+        }
         let c4s = b.c_i32(4);
         let cmk = b.c_i32(0x0007_0007);
         let lut_lo = b.c_i32(i32::from_le_bytes([0, 6, 9, 11]));
         let lut_hi = b.c_i32(i32::from_le_bytes([11, 10, 7, 3]));
-        for s in 0..4usize {
+        for s in t0..t1 {
             let mut xs: Vec<ValueId> = Vec::with_capacity(16);
             for r in 0..16u8 {
                 let lane = b.frag16_lane(s_vars[s], r);
@@ -10276,7 +10278,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
         let kdg: Option<Vec<ValueId>> = if kdglob && stage { Some(kd_rows(b, key_n2)) } else { None };
         let _ = &kdg;
-        let w = valu(b, masked);
+        // convlate: the P conversion of S tiles 2 and 3 moves from the V phase into the M phase (after PV half 0) to balance the two phases
+        let convlate = fmha_t_opt("convlate") && smfv;
+        let w = if convlate { valu(b, masked, true, 0, 2) } else { valu(b, masked, true, 0, 4) };
         if stage {
             stage_end(b, skd, kds_nxt);
         }
@@ -10303,7 +10307,35 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         } else {
             kdg
         };
-        if fmha_t_opt("qkfirst") {
+        if convlate {
+            let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot_cur)).collect();
+            let load_v = |b: &mut FnBuilder, hh: usize, e: usize| -> ValueId {
+                let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+                for r in 0..4i32 {
+                    let off = b.c_i32((hh as i32) * 8192 + 2048 * r);
+                    addrs.push(b.add_i32(trb[e], off));
+                }
+                b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3])
+            };
+            let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            for e in 0..4usize {
+                let v8 = load_v(b, 0, e);
+                b.var_mfma_scale(o_vars[e], v8, pa, c127, c123);
+            }
+            let w2 = valu(b, masked, false, 2, 4);
+            let pb = b.frag8(w2[0], w2[1], w2[2], w2[3], w2[4], w2[5], w2[6], w2[7]);
+            for e in 0..4usize {
+                let v8 = load_v(b, 1, e);
+                b.var_mfma_scale(o_vars[e], v8, pb, c127, c123);
+            }
+            b.var_smfmac_fp8(la, a_rs, pa, idx01);
+            b.var_smfmac_fp8(la, a_rs, pb, idx01);
+            b.var_smfmac_fp8(la, a_rs, pa, idx23);
+            b.var_smfmac_fp8(la, a_rs, pb, idx23);
+            if stage {
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref());
+            }
+        } else if fmha_t_opt("qkfirst") {
             // QK(i+1) first: S(i) was consumed by the V phase; the PV tr reads then queue behind the QK fragment reads
             if stage {
                 qk(b, slot_nxt, kds_nxt, kdg.as_deref());
