@@ -1,10 +1,15 @@
 //! The lite fused-combine contract, checked statically on emitted assembly (own backend and LLVM tail).
 use amdgpu_compiler::asm_check::check_lite_contract;
+use amdgpu_compiler::backend::{LlvmTail, OwnTail};
 use amdgpu_compiler::{compile_with, kernel_by_name};
 
 fn asm_of(name: &str, backend: &str) -> String {
     let f = kernel_by_name(name).unwrap();
-    compile_with(&f, backend).unwrap().asm
+    if backend == "own" {
+        compile_with(&f, &OwnTail).unwrap().asm
+    } else {
+        compile_with(&f, &LlvmTail::new()).unwrap().asm
+    }
 }
 
 #[test]
