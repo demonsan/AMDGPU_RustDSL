@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <string>
 #include <limits>
 
 #define CK(x)                                                                  \
