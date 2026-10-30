@@ -169,3 +169,74 @@ tests, 18 compile-fail cases, `pv_phase`).
 * The wait-state constants are only hardware-evidenced for the matrix-result rule (20, confirmed earlier);
   VALU->matrix (2) and vcc->cndmask (2) still rest on the ISA table, not on a regression probe.
 * `Sealed`/`#[forbid(unsafe_code)]` hold: no `unsafe` in the crate and no way to invent operand kinds.
+
+## Adversarial review, round 2 - the hardened API (Main `7aecae5`)
+
+Independent re-review (kernel-occ) after token ownership, the poison flag + `Seq::finish() -> Result`, the hazard
+verifier (`verify.rs`), opcode-typed tokens, `vcc() -> Option`, the `AsmBlock`/`Op::Asm` bridge and the DS/VMEM
+`Pending` tokens. Reproducers: `scratch/safeasm-review2/` (`run_cases.sh` compiles each case against the crate rlibs
+in the pinned container; `hw/run_hw.sh` runs the raw-asm wait-state probes on GPU 5). The crate's own suite (15
+tests incl. the attack tests) and the compiler's `tests/safeasm.rs` (15 tests) pass.
+
+### Coverage: closed vs still open
+
+| # | round-1 attack | round-2 result | evidence |
+|---|---|---|---|
+| 1 | drop the MFMA/SMFMAC token, then read D | **CLOSED.** The accumulator is *moved* into the token: reading it later is `E0382 borrow of moved value`; aliasing it before the op blocks the move (`E0505`); an `Option` slot cannot be taken while borrowed (`E0502`); `drop`/`let _` sets the poison flag and `finish()` reports "unretired matrix result"; `mem::forget` skips `Drop` but the verifier's end-of-sequence rule still refuses; `exit()` without `output_exit` is refused | `cases/fail_drop_read_d.rs`, `fail_alias_before_token.rs`, `fail_option_take_while_borrowed.rs`, `pass_war_poison.rs`, `pass_forget_token.rs`, `pass_exit_dropped.rs` |
+| 2 | WAR/WAW with the new ownership | **CLOSED.** Dropping the token releases the operand borrows, but the write then trips both the poison flag and the verifier's WAR rule ("writes r2, an operand instruction 21 is still reading (WAR, issued 1 wait states ago)"); `finish()` returns both reasons | `cases/pass_war_poison.rs` |
+| 3 | chain across opcodes | **CLOSED.** `chain` exists only on `Mfma<'a, OP_MFMA_SCALE>`; the `_zero` form is `Mfma<'a, OP_MFMA_SCALE_ZERO>` and only `retire` exists: `E0599 Mfma<'_, 1> is not an iterator` (method not found). The ported phase retires the `_zero` form before the accumulate form and gets the full 20 states | `cases/fail_chain_after_zero.rs`; compiler test `zero_form_then_accumulate_form_gets_the_full_latency` |
+| 4 | `AsmBlock` without `finish()`/the verifier | **MOSTLY CLOSED, two holes.** `forge_for_tests` is `pub` (only `#[doc(hidden)]`), so it *is* callable from a normal build (verified: `pass_forge_reachable`), but it needs an existing verified block and every forged block is re-verified by `AsmBlock::verify`, `block_to_asm`, `block_to_mfunction` and the compiler's `Op::Asm` lowering - hazard violations are rejected with precise per-instruction messages. Holes: (a) the verifier **panics** on a forged `SNop` with negative `imm` (`attempt to add with overflow`, `verify.rs:105`; in release the `slot +=` wraps and can corrupt the state accounting); (b) the verifier checks only hazards, not encoding legality: a forged 3-source `VAddF32` passes `verify()` and `block_to_asm` silently emits `v_add_f32_e32 v1, v1, v1`; a forged `VReadFirstLane` with a VGPR destination passes and is silently re-typed to an SGPR | `cases/pass_forge_emit.rs`, `pass_forge_reachable.rs` |
+| 5 | wait states on hardware: is 2 states enough (CDNA4 p74 suggests PASS = 4)? | **2 is safe, and conservative**: VALU -> MFMA A/B operand, VALU -> `v_readfirstlane`, VALU -> SMFMAC operand, compare -> `v_cndmask` mask all produced the *fresh* value already with **1** wait state and stayed correct at 2, 3, 4 (four probes each). The matrix-result rule is conservative too: reading D 1 state after the MFMA gives stale 0, but **8 states already gives the correct 64** (12/16/20 also correct), while the verifier/crate require 20. So the constants can stay as they are | `hw/run_hw.sh`, GPU 5 |
+| 6 | remaining escape into raw MIR from a safe path | only `forge_for_tests` (4) and the compiler crate itself (raw layer by design); `Pending` tokens cannot be used as registers (`E0308`), a load destination cannot be used before `wait` (`E0382`), `Exit` has no public constructor (`E0451`) | `cases/fail_pending_as_operand.rs`, `fail_load_dest_before_wait.rs`, `fail_forge_exit.rs` |
+
+### New findings from round 2 (all reproduced from the *safe* API unless noted)
+
+1. **F8 - input ports are writable and silently clobber the caller's register (hardware-confirmed wrong result).**
+   `Seq::input::<N>()` returns an ordinary owned `Vgpr<N>`, so `&mut x` type-checks; `finish()`/the verifier do not
+   enforce the documented read-only contract, and the DSL lowering maps the port straight onto the caller's register.
+   Reproducer: block writes its input (= 2), kernel stores the DSL value 7.0 before the block and after it; GPU
+   output: before `0x40E00000` (7.0), after **2**. A safe-authored sequence can therefore corrupt a live kernel value.
+   **Fix:** return a read-only handle from `input()` (no `Dst` impl), and/or a verifier rule "no instruction may
+   define a register listed in `inputs`" plus a lowering check. This is the most important remaining issue.
+2. **F9 - outputs are not checked to be defined.** `let x = s.vgpr::<4>(); s.output(x); s.finish()` succeeds with a
+   0-instruction block, so an undefined register is handed to the kernel. **Fix:** verifier rule "every output must be
+   written before the end (or declared through `output_exit`)".
+3. **F10 - `ds_write_b32` can never be used: it always poisons the sequence.** `ops::ds_write_b32` does
+   `let _ = self.issue_load(Queue::Lgkm, ());`, and the immediately dropped `Pending<()>` reports "a load was
+   abandoned without wait()" in `finish()` - even if the caller later calls `wait_lgkm_all`. **Fix:** track a value-less
+   scoreboard entry (or return a `Pending<()>` that must be waited) instead of dropping a `Pending` internally.
+4. **F11 - model/lowering asymmetry on constant moves (no wrong result escaped).** `Seq`/the verifier count a
+   materialised constant (`splat`) as one wait state, while the embedding lowering's constant cache can drop such
+   moves. A block that puts 19 dropped `splat`s between an MFMA and its reader passes `finish()`; `block_to_asm` does
+   not const-cache and emits all 19, and the kernel path's own MIR hazard pass re-pads the reader end-to-end (GPU
+   result was the correct 64.0), so the safety net held - but the two models should be aligned (e.g. the verifier should
+   re-run on the *lowered* MIR, or the lowering must keep the instruction count).
+5. **F12 - the verifier's malformed-input behaviour is a panic, not a diagnostic** (see 4a). Use checked arithmetic and
+   reject `SNop` `imm` outside `0..=7` (the only values emission produces).
+
+### Hardware-measured minimum wait states (gfx950, MI355X, GPU 5)
+
+| rule | states tried | first state count giving the fresh value | crate/verifier requires | verdict |
+|---|---|---|---|---|
+| VALU write -> MFMA A/B operand | 1,2,3,4 | **1** | 2 | 2 is safe (conservative) |
+| VALU write -> `v_readfirstlane` | 1,2,3,4 | **1** | 2 | 2 is safe (conservative) |
+| VALU write -> SMFMAC operand | 1,2,3,4 | **1** | 2 | 2 is safe (conservative) |
+| compare (vcc) -> `v_cndmask` mask | 1,2,3,4 | **1** | 2 | 2 is safe (conservative) |
+| MFMA result -> VALU reader | 1,8,12,16,20 | **8** (1 state = stale 0 vs 64) | 20 | 20 is safe (conservative) |
+
+### Verdict
+
+For the bug classes it was built for - dropped matrix tokens (F1), WAR/WAW on in-flight operands (F2), reading a
+matrix result too early, the 2-state VALU rule, unretired loads, and opcode-mismatched chains (F4) - the hardened
+crate **can be quoted as a guarantee, but only "inside its own API"**: the type discipline is backed by an independent
+verifier, the poison flag and the MIR hazard pass, and every round-1 bypass we found is now a compile error or a
+`finish()` error. It is **not yet a guarantee for "a safe sequence cannot corrupt the surrounding kernel"**: F8
+(writable input ports) and F9 (undefined outputs) are real safe-path holes with a hardware-confirmed wrong result, and
+`forge_for_tests` is reachable in normal builds with a verifier that panics on malformed input and does not validate
+encoding legality. F8/F9 should be fixed (and `forge_for_tests` feature-gated) before the sentence "a safe-asm
+sequence cannot produce a wrong kernel" is used.
+
+**Final integration claim (`_vs128` row-sum behind the safe-asm flag): NOT YET VERIFIABLE** - as of Main/`backend-tail`
+`7aecae5` the bridge exists (`Op::Asm`, `examples::rowsum_chain_block`, compiler tests pass incl. identical asm vs
+the DSL chain) but the kernel does not use it behind a flag yet, so the 15-shape md5 + determinism comparison could
+not be run. Re-run `scratch/safeasm-review2` + the standard 15-shape harness as soon as the flag lands.
