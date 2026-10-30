@@ -38,6 +38,8 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
     let alias: HashMap<u32, u32> = b.alias.iter().map(|(a, base, _)| (*a, *base)).collect();
     let canon = |r: u32| alias.get(&r).copied().unwrap_or(r);
 
+    let input_regs: Vec<u32> = b.inputs.iter().map(|p| canon(p.reg)).collect();
+    let mut defined: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut slot: u32 = 0;
     let mut valu_write: HashMap<u32, u32> = HashMap::new();
     let mut matrix_write: HashMap<u32, (u32, &'static str)> = HashMap::new();
@@ -87,6 +89,10 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
         }
 
         if let Some(d) = dst {
+            if input_regs.contains(&d) {
+                errs.push(here(format!("writes r{d}, an INPUT port: a sequence may not clobber the caller's register")));
+            }
+            defined.insert(d);
             if let Some((w, wop)) = matrix_write.get(&d).copied() {
                 if Some(d) != chain_reg && slot.saturating_sub(w).saturating_sub(1) < MATRIX_RESULT {
                     errs.push(here(format!("writes r{d} while the {wop} writing it is still in flight (WAW)")));
@@ -102,18 +108,29 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
         // state updates
         match i.op {
             "SNop" => {
-                slot += i.imm as u32 + 1;
+                if !(0..=15).contains(&i.imm) {
+                    errs.push(here(format!("s_nop immediate {} out of range", i.imm)));
+                    slot = slot.saturating_add(1);
+                } else {
+                    slot = slot.saturating_add(i.imm as u32 + 1);
+                }
                 continue;
             }
             "SWaitLgkm" => {
-                let keep = i.imm as usize;
+                if i.imm < 0 {
+                    errs.push(here(format!("negative wait count {}", i.imm)));
+                }
+                let keep = i.imm.max(0) as usize;
                 if lgkm.len() > keep {
                     let n = lgkm.len() - keep;
                     lgkm.drain(..n);
                 }
             }
             "SWaitVm" => {
-                let keep = i.imm as usize;
+                if i.imm < 0 {
+                    errs.push(here(format!("negative wait count {}", i.imm)));
+                }
+                let keep = i.imm.max(0) as usize;
                 if vm.len() > keep {
                     let n = vm.len() - keep;
                     vm.drain(..n);
@@ -155,6 +172,12 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
         slot = slot.saturating_add(1);
     }
 
+    for p in &b.outputs {
+        let c = canon(p.reg);
+        if !defined.contains(&c) && !input_regs.contains(&c) {
+            errs.push(format!("output port r{} is never written by the sequence (an undefined value would flow into the kernel)", p.reg));
+        }
+    }
     if lgkm.iter().chain(vm.iter()).next().is_some() {
         errs.push("sequence ends with DS/VMEM loads outstanding".to_string());
     }

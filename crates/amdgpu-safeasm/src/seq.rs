@@ -130,14 +130,14 @@ impl Seq {
         Sgpr { id: self.new_reg(<Wd<N> as ScalarWidth>::CLASS) }
     }
 
-    /// A register tuple provided by the surrounding kernel (a DSL value). Read-only contract: the sequence must not write it.
-    pub fn input<const N: usize>(&mut self) -> Vgpr<N>
+    /// A register tuple provided by the surrounding kernel (a DSL value): a READ-ONLY handle (`In<N>`), it can never be a destination.
+    pub fn input<const N: usize>(&mut self) -> In<N>
     where
         Wd<N>: VectorWidth,
     {
         let r = self.vgpr::<N>();
         self.inputs.push(AsmPort { reg: r.id, class: <Wd<N> as VectorWidth>::CLASS });
-        r
+        In { id: r.id }
     }
 
     /// Hand a finished register tuple back to the kernel as the sequence's result (consumes it: it cannot be used afterwards).
@@ -193,9 +193,9 @@ impl Seq {
     }
 
     /// Dword `I` of a tuple as a one-dword read-only view (bounds checked at compile time).
-    pub fn lane<'a, const N: usize, const I: usize>(&mut self, r: &'a Vgpr<N>) -> Sub<'a, 1> {
+    pub fn lane<'a, const N: usize, const I: usize>(&mut self, r: &'a impl Readable<N>) -> Sub<'a, 1> {
         let () = LaneCheck::<I, N>::OK;
-        Sub { id: self.alias_of(r.id, I as u8, AClass::V1), _p: PhantomData }
+        Sub { id: self.alias_of(r.reg_id(), I as u8, AClass::V1), _p: PhantomData }
     }
 
     /// Dword `I` of a tuple as a one-dword writable view.
@@ -205,8 +205,8 @@ impl Seq {
     }
 
     /// Low (`HI` = false) or high half of an 8-dword tuple as a 4-dword view; the parent stays borrowed.
-    pub fn half8<'a, const HI: bool>(&mut self, r: &'a Vgpr<8>) -> Sub<'a, 4> {
-        Sub { id: self.alias_of(r.id, if HI { 4 } else { 0 }, AClass::V4), _p: PhantomData }
+    pub fn half8<'a, const HI: bool>(&mut self, r: &'a impl Readable<8>) -> Sub<'a, 4> {
+        Sub { id: self.alias_of(r.reg_id(), if HI { 4 } else { 0 }, AClass::V4), _p: PhantomData }
     }
 
     fn alias_of(&mut self, parent: VReg, off: u8, class: AClass) -> VReg {
@@ -264,9 +264,10 @@ impl Seq {
 
     /// Hazard-sensitive read proof for a whole register: pads exactly the missing wait states since its last write (zero when
     /// enough instructions were already issued in between). The only way to obtain a `Ready`.
-    pub fn ready<'a, const N: usize>(&mut self, r: &'a Vgpr<N>) -> Ready<'a, N> {
-        self.make_ready(r.id);
-        Ready { id: r.id, _p: PhantomData }
+    pub fn ready<'a, const N: usize>(&mut self, r: &'a impl Readable<N>) -> Ready<'a, N> {
+        let id = r.reg_id();
+        self.make_ready(id);
+        Ready { id, _p: PhantomData }
     }
 
     /// Same for a view.
@@ -310,6 +311,16 @@ impl Seq {
     }
 
     // ---- DS / VMEM scoreboards ---------------------------------------------------------------------------------------------------
+    /// A store occupies a scoreboard slot but returns no value: nothing to wait for individually (`wait_lgkm_all` / a later load wait covers it).
+    pub(crate) fn issue_store(&mut self, q: Queue) {
+        let id = self.next_token;
+        self.next_token += 1;
+        match q {
+            Queue::Lgkm => self.lgkm.push(id),
+            Queue::Vm => self.vm.push(id),
+        }
+    }
+
     pub(crate) fn issue_load<T>(&mut self, q: Queue, value: T) -> Pending<T> {
         let id = self.next_token;
         self.next_token += 1;

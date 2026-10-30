@@ -26,9 +26,16 @@ mod verify;
 pub use block::*;
 pub use regs::*;
 pub use seq::{Free, Live, Mfma, Pending, Seq, Smfmac, Vcc, OP_MFMA_SCALE, OP_MFMA_SCALE_ZERO, OP_SMFMAC_FP8};
+/// Verify an alternative instruction list (same registers and ports) with the block's rules: lets the compiler check that a rewrite of the
+/// stream (constant folding) keeps every wait-state distance.
+pub fn verify_insts(like: &AsmBlock, insts: Vec<AInst>) -> Result<(), Vec<String>> {
+    AsmBlock { insts, ..like.clone() }.verify()
+}
+
 /// Test support: a block with the same registers but a different instruction list, NOT verified. It exists so the verifier can be tested against
 /// hand-forged sequences; `AsmBlock::verify` (and the compiler's lowering) still reject whatever it produces if it is illegal.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn forge_for_tests(like: &AsmBlock, insts: Vec<AInst>) -> AsmBlock {
     AsmBlock { insts, ..like.clone() }
 }

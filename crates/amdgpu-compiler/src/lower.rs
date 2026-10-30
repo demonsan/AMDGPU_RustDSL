@@ -566,13 +566,28 @@ impl Lowerer {
         let aliased: std::collections::HashSet<u32> = block.alias().iter().map(|a| a.0).collect();
         let mut skip = vec![false; block.insts().len()];
         let is_port = |r: u32| block.inputs().iter().chain(block.outputs().iter()).any(|p| p.reg == r);
+        let mut const_of: Vec<Option<(usize, i64)>> = vec![None; block.regs().len()];
         for (k, i) in block.insts().iter().enumerate() {
             if let ("VMovB32", Some(d), true) = (i.op, i.dst, i.srcs.is_empty()) {
                 let d = d as usize;
                 if ndefs[d] == 1 && block.regs()[d] == AClass::V1 && map[d].is_none() && !aliased.contains(&(d as u32)) && !is_port(d as u32) {
-                    map[d] = Some(self.const_vreg(i.imm));
+                    const_of[d] = Some((k, i.imm));
                     skip[k] = true;
                 }
+            }
+        }
+        // the constant cache removes those moves: the wait-state distances inside the block must still hold without them. If the
+        // verifier (which counts every instruction) would reject the stream with the moves removed, keep the moves instead.
+        if skip.iter().any(|s| *s) {
+            let kept: Vec<amdgpu_safeasm::AInst> = block.insts().iter().enumerate().filter(|(k, _)| !skip[*k]).map(|(_, i)| i.clone()).collect();
+            if amdgpu_safeasm::verify_insts(block, kept).is_err() {
+                skip.iter_mut().for_each(|s| *s = false);
+                const_of.iter_mut().for_each(|c| *c = None);
+            }
+        }
+        for (d, c) in const_of.iter().enumerate() {
+            if let Some((_, k)) = c {
+                map[d] = Some(self.const_vreg(*k));
             }
         }
         for (i, c) in block.regs().iter().enumerate() {
@@ -585,6 +600,7 @@ impl Lowerer {
             map[*a as usize] = Some(self.sub_alias(b, *off, rc(block.regs()[*a as usize])));
         }
         let m = |r: u32| map[r as usize].expect("unmapped asm register");
+        let mut n_pushed = 0usize;
         for (k, i) in block.insts().iter().enumerate() {
             if skip[k] {
                 continue;
@@ -601,9 +617,20 @@ impl Lowerer {
                 };
             }
             self.push(mi.imm(i.imm));
+            n_pushed += 1;
         }
         let out = block.outputs().first().ok_or("asm block has no output port")?;
         self.val.insert(dst, m(out.reg));
+        // F8: the lowered MIR must not write a register the kernel handed in
+        let inputs_c: Vec<VReg> = block.inputs().iter().map(|p| self.mir.canon(m(p.reg))).collect();
+        let start = self.mir.blocks[self.cur].insts.len() - n_pushed;
+        for i in &self.mir.blocks[self.cur].insts[start..] {
+            if let Some(d) = i.dst {
+                if inputs_c.contains(&self.mir.canon(d)) {
+                    return Err(format!("asm block `{}` writes one of its input registers", block.name()));
+                }
+            }
+        }
         Ok(())
     }
 
