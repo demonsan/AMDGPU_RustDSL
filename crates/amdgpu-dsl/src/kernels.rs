@@ -17723,7 +17723,85 @@ fn vs5_win(name: &str) -> bool {
         panic!("FMHA_OPT={name}: this safe-asm window block is not wired yet (docs/gen5-window-spec.md section 7)");
     }
     want
-}pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
+}/// 8-elements-per-thread fp16-partial combine (`..._kvsplit_combine8h`): grid = ceil(rows_total * 128 / 8 / 256); one 16-byte load per split, one 16-byte store.
+pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine8h() -> Function {
+    let mut b = FnBuilder::new("fmha_fwd_hd128_mxfp8_kvsplit_combine8h", 256);
+    b.arg("ptr_ohat", DType::Ptr, 0x00, 8); b.arg("ptr_lse", DType::Ptr, 0x08, 8); b.arg("ptr_out", DType::Ptr, 0x10, 8);
+    b.arg("rows_total", DType::I32, 0x18, 4); b.arg("d", DType::I32, 0x1C, 4); b.arg("splits", DType::I32, 0x20, 4);
+    let ohat = b.let_(Op::KernargPtr { offset: 0x00 });
+    let lse = b.let_(Op::KernargPtr { offset: 0x08 });
+    let out = b.let_(Op::KernargPtr { offset: 0x10 });
+    let rows = b.let_(Op::KernargI32 { offset: 0x18 });
+    let splits = b.let_(Op::KernargI32 { offset: 0x20 });
+    let tid = b.let_(Op::WorkitemId);
+    let bx = b.let_(Op::WorkgroupIdX);
+    let c0 = b.c_i32(0); let c2 = b.c_i32(2); let c4 = b.c_i32(4); let c16 = b.c_i32(16); let c8 = b.c_i32(8); let cm1 = b.c_i32(-1);
+    let bx256 = b.shl_i32(bx, c8);
+    let t_raw = b.add_i32(bx256, tid);
+    let total8 = b.shl_i32(rows, c4); // rows * 128 / 8
+    let last = b.add_i32(total8, cm1);
+    let ok = b.cmp_lt_i32(t_raw, total8);
+    let t8 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(t_raw), b: Opnd::Val(last) });
+    let row = b.let_(Op::LshrI32(Opnd::Val(t8), Opnd::Val(c4)));
+    let neg_big = b.c_f32(-1.0e30); let neg_big_i = b.bitcast_i32(neg_big);
+    let zero_f = b.c_f32(0.0); let zero_i = b.bitcast_i32(zero_f);
+    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(neg_big_i))];
+    for _ in 0..9 { inits.push((DType::I32, Opnd::Val(zero_i))); }
+    let vars = b.begin_loop(&inits);
+    let rs = b.mul_i32(vars[0], rows);
+    let lrow = b.add_i32(rs, row);
+    let lse_off = b.shl_i32(lrow, c2);
+    let lp = b.ptr_add(lse, lse_off);
+    let l = b.load_f32(lp, 0);
+    let rs16 = b.shl_i32(rs, c4);
+    let oidx = b.add_i32(rs16, t8);
+    let o_off = b.shl_i32(oidx, c4); // 16 bytes per thread
+    let op = b.ptr_add(ohat, o_off);
+    let ov = b.load_b128(op, 0);
+    let m_old = b.bitcast_f32(vars[1]);
+    let den = b.bitcast_f32(vars[2]);
+    let m_new = b.max_f32(m_old, l);
+    let neg1 = b.c_f32(-1.0);
+    let dm = b.mul_f32(m_new, neg1);
+    let d_old = b.add_f32(m_old, dm);
+    let d_new = b.add_f32(l, dm);
+    let a = b.exp2_f32(d_old);
+    let w = b.exp2_f32(d_new);
+    let den_s = b.mul_f32(den, a);
+    let den_n = b.add_f32(den_s, w);
+    let m_i = b.bitcast_i32(m_new);
+    let den_i = b.bitcast_i32(den_n);
+    b.set_var(vars[1], m_i);
+    b.set_var(vars[2], den_i);
+    for wi in 0..4usize {
+        let wd = b.frag4_lane(ov, wi as u8);
+        let hs = b.let_(Op::LshrI32(Opnd::Val(wd), Opnd::Val(c16)));
+        let lo = b.let_(Op::CvtF16ToF32(Opnd::Val(wd)));
+        let hi = b.let_(Op::CvtF16ToF32(Opnd::Val(hs)));
+        for (k, vv) in [(2 * wi, lo), (2 * wi + 1, hi)] {
+            let acc = b.bitcast_f32(vars[3 + k]);
+            let acc_s = b.mul_f32(acc, a);
+            let wv = b.mul_f32(w, vv);
+            let acc_n = b.add_f32(acc_s, wv);
+            let acc_i = b.bitcast_i32(acc_n);
+            b.set_var(vars[3 + k], acc_i);
+        }
+    }
+    sched_end_loop(&mut b, vars[0], splits);
+    let denf = b.bitcast_f32(Opnd::Var(vars[2]));
+    let rd = b.rcp_f32(denf);
+    let mut res: Vec<ValueId> = Vec::new();
+    for k in 0..8usize { let accf = b.bitcast_f32(Opnd::Var(vars[3 + k])); res.push(b.mul_f32(accf, rd)); }
+    let mut ow: Vec<ValueId> = Vec::new();
+    for k in 0..4usize { ow.push(b.cvt_pk_bf16_f32(res[2 * k], res[2 * k + 1])); }
+    let f4 = b.frag4(ow[0], ow[1], ow[2], ow[3]);
+    let o_byte = b.shl_i32(t8, c4);
+    let optr = b.ptr_add(out, o_byte);
+    b.store_f32x4(optr, 0, f4);
+    b.finish()
+}
+
+pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     let f = fmha_t_build("fmha_fwd_hd128_mxfp8_vs128", false, true);
     VS_MODE.store(false, std::sync::atomic::Ordering::SeqCst);
