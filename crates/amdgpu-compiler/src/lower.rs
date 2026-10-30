@@ -525,8 +525,125 @@ impl Lowerer {
         true
     }
 
-    /// Bit pattern of a constant operand (integer or f32), for in-line operands.
-    /// `base` = `PtrAdd{ scalar kernarg pointer, vector byte offset }`: (scalar pair, 32-bit vector offset) for the SADDR form.
+    /// Lower a safe-asm block (`amdgpu-safeasm`) into ordinary MIR: ports bind to DSL values, constants join the region's constant cache,
+    /// everything else becomes fresh virtual registers; the instructions then go through the normal scheduling / allocation / hazard pipeline.
+    fn lower_asm(&mut self, dst: Option<ValueId>, block: &amdgpu_safeasm::AsmBlock, inputs: &[Opnd], inout: Option<VReg>) -> Result<(), String> {
+        use amdgpu_safeasm::{AClass, ASrc};
+        let rc = |c: AClass| match c {
+            AClass::V1 => RClass::V1,
+            AClass::V2 => RClass::V2,
+            AClass::V4 => RClass::V4,
+            AClass::V8 => RClass::V8,
+            AClass::V16 => RClass::V16,
+            AClass::S1 => RClass::S1,
+            AClass::S2 => RClass::S2,
+        };
+        // belt and braces: the block was verified when it was built, a lowered block is re-verified (it may come from another build)
+        block.verify().map_err(|e| format!("asm block `{}` fails the hazard verifier: {}", block.name(), e.join("; ")))?;
+        let n_bound = block.inputs().iter().filter(|p| !p.mutable).count();
+        if inputs.len() != n_bound || block.inputs().iter().any(|p| p.mutable) != inout.is_some() {
+            return Err(format!("asm block `{}`: {} inputs bound for {} read-only ports (in/out port bound: {})", block.name(), inputs.len(), n_bound, inout.is_some()));
+        }
+        let mut map: Vec<Option<VReg>> = vec![None; block.regs().len()];
+        let mut bound = inputs.iter();
+        for p in block.inputs().iter() {
+            if p.mutable {
+                map[p.reg as usize] = inout;
+                continue;
+            }
+            let o = bound.next().expect("input count checked");
+            let r = match p.class {
+                AClass::V1 => self.as_v1(*o)?,
+                AClass::V2 => self.as_v2(*o)?,
+                AClass::V4 => self.as_v4(*o)?,
+                AClass::V8 => self.as_v8(*o)?,
+                AClass::V16 => self.as_v16(*o)?,
+                other => return Err(format!("asm block: input port class {other:?} is not supported")),
+            };
+            self.touch(&[Src::Reg(r)]);
+            map[p.reg as usize] = Some(r);
+        }
+        // constants: a one-dword register written once by `v_mov_b32 imm` is the region's cached constant register
+        let mut ndefs = vec![0u32; block.regs().len()];
+        for i in block.insts() {
+            if let Some(d) = i.dst {
+                ndefs[d as usize] += 1;
+            }
+        }
+        let aliased: std::collections::HashSet<u32> = block.alias().iter().map(|a| a.0).collect();
+        let mut skip = vec![false; block.insts().len()];
+        let is_port = |r: u32| block.inputs().iter().chain(block.outputs().iter()).any(|p| p.reg == r);
+        let mut const_of: Vec<Option<(usize, i64)>> = vec![None; block.regs().len()];
+        for (k, i) in block.insts().iter().enumerate() {
+            if let ("VMovB32", Some(d), true) = (i.op, i.dst, i.srcs.is_empty()) {
+                let d = d as usize;
+                if ndefs[d] == 1 && block.regs()[d] == AClass::V1 && map[d].is_none() && !aliased.contains(&(d as u32)) && !is_port(d as u32) {
+                    const_of[d] = Some((k, i.imm));
+                    skip[k] = true;
+                }
+            }
+        }
+        // the constant cache removes those moves: the wait-state distances inside the block must still hold without them. If the
+        // verifier (which counts every instruction) would reject the stream with the moves removed, keep the moves instead.
+        if skip.iter().any(|s| *s) {
+            let kept: Vec<amdgpu_safeasm::AInst> = block.insts().iter().enumerate().filter(|(k, _)| !skip[*k]).map(|(_, i)| i.clone()).collect();
+            if amdgpu_safeasm::verify_insts(block, kept).is_err() {
+                skip.iter_mut().for_each(|s| *s = false);
+                const_of.iter_mut().for_each(|c| *c = None);
+            }
+        }
+        for (d, c) in const_of.iter().enumerate() {
+            if let Some((_, k)) = c {
+                map[d] = Some(self.const_vreg(*k));
+            }
+        }
+        for (i, c) in block.regs().iter().enumerate() {
+            if map[i].is_none() && !aliased.contains(&(i as u32)) {
+                map[i] = Some(self.new_vreg(rc(*c)));
+            }
+        }
+        for (a, base, off) in block.alias() {
+            let b = map[*base as usize].ok_or("asm block: alias of an unmapped register")?;
+            map[*a as usize] = Some(self.sub_alias(b, *off, rc(block.regs()[*a as usize])));
+        }
+        let m = |r: u32| map[r as usize].expect("unmapped asm register");
+        let mut n_pushed = 0usize;
+        for (k, i) in block.insts().iter().enumerate() {
+            if skip[k] {
+                continue;
+            }
+            let op = mop_by_name(i.op).ok_or_else(|| format!("asm block: unknown op `{}`", i.op))?;
+            let mut mi = MInst::new(op);
+            if let Some(d) = i.dst {
+                mi = mi.def(m(d));
+            }
+            for s in &i.srcs {
+                mi = match s {
+                    ASrc::Reg(r) => mi.srcreg(m(*r)),
+                    ASrc::Imm(v) => mi.src(Src::Imm(*v)),
+                };
+            }
+            self.push(mi.imm(i.imm));
+            n_pushed += 1;
+        }
+        let out = block.outputs().first().ok_or("asm block has no output port")?;
+        if let Some(dst) = dst {
+            self.val.insert(dst, m(out.reg));
+        }
+        // F8: the lowered MIR must not write a register the kernel handed in (in/out ports excepted)
+        let inputs_c: Vec<VReg> = block.inputs().iter().filter(|p| !p.mutable).map(|p| self.mir.canon(m(p.reg))).collect();
+        let start = self.mir.blocks[self.cur].insts.len() - n_pushed;
+        for i in &self.mir.blocks[self.cur].insts[start..] {
+            if let Some(d) = i.dst {
+                if inputs_c.contains(&self.mir.canon(d)) {
+                    return Err(format!("asm block `{}` writes one of its input registers", block.name()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bit pattern of a constant operand (integer or f32), for in-line operands.    /// `base` = `PtrAdd{ scalar kernarg pointer, vector byte offset }`: (scalar pair, 32-bit vector offset) for the SADDR form.
     fn saddr_parts(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
         if !opt_on("saddr") {
             return Ok(None);
@@ -1126,6 +1243,10 @@ impl Lowerer {
                     let ri = self.as_v1(*idx)?;
                     // C is the destination in place; it is also listed as the 4th (hazard-visible) source
                     self.push(MInst::new(MOp::VSmfmac16x16x128Fp8).def(v).srcreg(ra).srcreg(rb).srcreg(ri).srcreg(v));
+                }
+                Stmt::VarAsm { var, block, inputs } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    self.lower_asm(None, block, inputs, Some(v))?;
                 }
                 Stmt::BeginLoop { vars, init } => {
                     for (i, var) in vars.iter().enumerate() {
@@ -1987,6 +2108,9 @@ impl Lowerer {
                 );
                 self.val.insert(dst, d);
             }
+            Op::Asm { block, inputs } => {
+                self.lower_asm(Some(dst), block, inputs, None)?;
+            }
             Op::SmfmacFp8_16x16x128 { a, b, idx, c } => {
                 // Sparse MFMA: the accumulator D is also the input C. A (4 dwords) is the
                 // 2:4-compressed operand, B (8 dwords) the dense matrix, idx a single dword.
@@ -2651,7 +2775,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                 }
                 // any other statement that writes a variable in place makes it non-scalar
                 Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
-                | Stmt::VarScaleLane { var, .. } | Stmt::VarLoadB128 { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarSmfmac { var, .. } => {
+                | Stmt::VarScaleLane { var, .. } | Stmt::VarLoadB128 { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarAsm { var, .. } => {
                     if uvars.remove(var) {
                         changed = true;
                     }
@@ -3213,3 +3337,4 @@ fn mask_regs(m: &mut MFunction, stride: usize) {
         }
     }
 }
+use crate::asm::mop_by_name;

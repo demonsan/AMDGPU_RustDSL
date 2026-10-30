@@ -6,3 +6,4 @@ rust-version.workspace = true
 description = "Typed structured IR and builder for AMDGPU kernels"
 
 [dependencies]
+amdgpu-safeasm = { path = "../amdgpu-safeasm" }
