@@ -48,6 +48,8 @@ pub struct Effects {
     pub fence: Fence,
     /// Scalar memory load (kernarg): returns through lgkmcnt but touches no shared state.
     pub smem: bool,
+    /// Pinned (hand-authored) instruction: never reordered, see `MInst::pin`.
+    pub pinned: bool,
 }
 
 /// Dword slots occupied by `r` (an alias maps into its tuple).
@@ -64,6 +66,12 @@ fn push_unique(v: &mut Vec<Slot>, s: Slot) {
 }
 
 pub fn effects(m: &MFunction, inst: &MInst) -> Effects {
+    let mut e = effects_core(m, inst);
+    e.pinned = inst.pin;
+    e
+}
+
+fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
     let mut e = Effects::default();
     match inst.op {
         MOp::SNop | MOp::SEndpgm => {

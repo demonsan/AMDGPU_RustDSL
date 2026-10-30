@@ -111,6 +111,9 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
         // mask compares write an SGPR pair that the cndmask reads: same 2 wait states as the vcc form (conservative)
         MOp::VCmpMaskLtI32 | MOp::VCmpMaskGeI32 | MOp::VCmpMaskGtI32 | MOp::VCmpMaskLtF32 => Some(2),
         MOp::VWriteSub | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VCvtPknormU16 => Some(2),
+        // audit (safe-asm review): VALU writers that were missing from the class - the scalef32 half-write converts (P words feeding the PV MFMA),
+        // the permlane swap, and the register reads that expand to v_mov
+        MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VPermlane32Swap | MOp::VReadPhys | MOp::VReadSub => Some(2),
         _ => None,
     }
 }
@@ -227,7 +230,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         break;
                     }
                     let cand = &insts[j];
-                    let mut ok = (movable(cand.op) || (VCC_FILL.with(|c| c.get()) && movable_wide(cand.op)))
+                    // pinned (hand-authored) instructions are never moved, and nothing is moved across them
+                    let mut ok = !cand.pin
+                        && !insts[i..j].iter().any(|x| x.pin)
+                        && (movable(cand.op) || (VCC_FILL.with(|c| c.get()) && movable_wide(cand.op)))
                         && cand.dst.is_some()
                         && earliest_of(cand, &ready, &vw, &pkw, cycle) <= cycle;
                     if ok {
@@ -285,6 +291,12 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 if let Some(dly) = valu_writer_delay(inst.op) {
                     vw.insert(canon(d), cycle + 1 + dly);
                 }
+                if inst.op == MOp::VPermlane32Swap {
+                    // the swap rewrites its second operand too
+                    if let Some(Src::Reg(r2)) = inst.srcs.get(1) {
+                        vw.insert(canon(*r2), cycle + 1 + 2);
+                    }
+                }
             }
             if strict {
                 if let Some(d) = inst.dst {
@@ -315,8 +327,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             if strict && matches!(inst.op, MOp::VPtrAdd) {
                 vccw.set(cycle + 3);
             }
+            // an explicit `s_nop N` already in the stream (hand-authored blocks) covers N+1 wait states
+            let spent = if inst.op == MOp::SNop { inst.imm.max(0) as usize + 1 } else { 1 };
             out.push(inst);
-            cycle += 1;
+            cycle += spent;
             i += 1;
         }
         if pad_block_end {

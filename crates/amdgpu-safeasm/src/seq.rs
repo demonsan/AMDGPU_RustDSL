@@ -14,6 +14,10 @@ use std::rc::Rc;
 pub const VALU_TO_MATRIX_READ: u32 = 2;
 /// Wait states between a (scaled) MFMA / SMFMAC and the first reader of its result (hardware-confirmed: 19 is still stale).
 pub const MATRIX_RESULT: u32 = 20;
+/// Wait states between a transcendental op (`v_exp/rcp/log_f32`) and any reader of its result (hazards.rs TRANS_LATENCY = 5 slots).
+pub const TRANS_RESULT: u32 = 4;
+/// Wait states between a packed-fp32 op and a transcendental op that reads its result (hazards.rs `pkw`).
+pub const PK_TO_TRANS: u32 = 1;
 /// Wait states between a compare that writes `vcc` and the `v_cndmask` that reads it.
 pub const VCC_TO_CNDMASK: u32 = 2;
 
@@ -70,12 +74,15 @@ pub struct Seq {
     pub(crate) clock: u32,
     writes: HashMap<VReg, Write>,
     vcc_taken: bool,
+    pk_writes: HashMap<VReg, u32>,
     vcc_written_at: u32,
     zero: Option<VReg>,
     inputs: Vec<AsmPort>,
     outputs: Vec<AsmPort>,
     exit_in_flight: Vec<(u32, u32)>,
     next_token: u32,
+    loop_body: bool,
+    pinned: bool,
     lgkm: Vec<u32>,
     vm: Vec<u32>,
 }
@@ -97,12 +104,15 @@ impl Seq {
             clock: 0,
             writes: HashMap::new(),
             vcc_taken: false,
+            pk_writes: HashMap::new(),
             vcc_written_at: 0,
             zero: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             exit_in_flight: Vec::new(),
             next_token: 0,
+            loop_body: false,
+            pinned: false,
             lgkm: Vec::new(),
             vm: Vec::new(),
         }
@@ -234,6 +244,42 @@ impl Seq {
         Sub { id: self.alias_of(r.reg_id(), if HI { 4 } else { 0 }, AClass::V4), _p: PhantomData }
     }
 
+    /// Dwords `2*I .. 2*I+2` of an 8-dword tuple as a writable pair (I in 0..4); the parent stays mutably borrowed while the view lives.
+    pub fn pair_mut<'a, const I: usize>(&mut self, r: &'a mut Vgpr<8>) -> SubMut<'a, 2> {
+        let () = ViewCheck::<I, 4>::OK;
+        SubMut { id: self.alias_of(r.id, (2 * I) as u8, AClass::V2), _p: PhantomData }
+    }
+
+    /// All four dword pairs of an 8-dword tuple at once: DISJOINT writable views under ONE mutable borrow of the parent, so four DS reads can be in
+    /// flight together; the parent is usable again (e.g. `ready`) only after every pending token has been waited and dropped.
+    pub fn split_pairs_mut<'a>(&mut self, r: &'a mut Vgpr<8>) -> [SubMut<'a, 2>; 4] {
+        let id = r.id;
+        [0u8, 2, 4, 6].map(|o| SubMut { id: self.alias_of(id, o, AClass::V2), _p: PhantomData })
+    }
+
+    /// Both halves of an 8-dword tuple (disjoint writable 4-dword views).
+    pub fn split_halves8_mut<'a>(&mut self, r: &'a mut Vgpr<8>) -> [SubMut<'a, 4>; 2] {
+        let id = r.id;
+        [0u8, 4].map(|o| SubMut { id: self.alias_of(id, o, AClass::V4), _p: PhantomData })
+    }
+
+    /// All four quarters of a 16-dword tuple (disjoint writable 4-dword views).
+    pub fn split_quarters16_mut<'a>(&mut self, r: &'a mut Vgpr<16>) -> [SubMut<'a, 4>; 4] {
+        let id = r.id;
+        [0u8, 4, 8, 12].map(|o| SubMut { id: self.alias_of(id, o, AClass::V4), _p: PhantomData })
+    }
+
+    /// Low (`HI` = false) or high half of an 8-dword tuple as a writable 4-dword view.
+    pub fn half8_mut<'a, const HI: bool>(&mut self, r: &'a mut Vgpr<8>) -> SubMut<'a, 4> {
+        SubMut { id: self.alias_of(r.id, if HI { 4 } else { 0 }, AClass::V4), _p: PhantomData }
+    }
+
+    /// Dwords `4*I .. 4*I+4` of a 16-dword tuple as a writable quad (I in 0..4).
+    pub fn quarter16_mut<'a, const I: usize>(&mut self, r: &'a mut Vgpr<16>) -> SubMut<'a, 4> {
+        let () = ViewCheck::<I, 4>::OK;
+        SubMut { id: self.alias_of(r.id, (4 * I) as u8, AClass::V4), _p: PhantomData }
+    }
+
     fn alias_of(&mut self, parent: VReg, off: u8, class: AClass) -> VReg {
         let (base, o) = self.alias_base.get(&parent).copied().unwrap_or((parent, 0));
         let a = self.new_reg(class);
@@ -262,6 +308,19 @@ impl Seq {
         let c = self.canon(r);
         let at = self.clock - 1;
         self.writes.insert(c, Write { at, need });
+    }
+
+    pub(crate) fn note_pk_write(&mut self, r: VReg) {
+        let c = self.canon(r);
+        let at = self.clock - 1;
+        self.pk_writes.insert(c, at);
+    }
+
+    pub(crate) fn pad_for_pk(&mut self, r: VReg) {
+        let c = self.canon(r);
+        if let Some(at) = self.pk_writes.get(&c).copied() {
+            self.pad_after(at, PK_TO_TRANS);
+        }
     }
 
     pub(crate) fn clear_write(&mut self, r: VReg) {
@@ -422,6 +481,19 @@ impl Seq {
         self.insts.iter().map(|i| i.op.to_string()).collect::<Vec<_>>().join("\n")
     }
 
+    /// Pin the block: the hand-authored instruction order is preserved by the scheduler (no instruction moves into, out of or across it).
+    pub fn pin(&mut self) {
+        self.pinned = true;
+    }
+
+    /// Finish a LOOP BODY: the block runs once per iteration, so it must be DRAIN-CLOSED. It enters with nothing in flight (the previous iteration
+    /// ended clean) and must exit the same way: every matrix result retired (20 wait states), no outstanding DS/VMEM loads, no matrix `output_exit`.
+    /// The straight-line verifier is then sound for every iteration because the entry and exit wait clocks are defined (all waits satisfied).
+    pub fn finish_loop_body(mut self) -> Result<AsmBlock, String> {
+        self.loop_body = true;
+        self.finish()
+    }
+
     /// Finish the sequence into a verified plain-data block. Fails (with every reason) if a token was abandoned without being retired /
     /// waited for, loads are still outstanding, or the hazard verifier finds a violation of the wait-state model.
     pub fn finish(self) -> Result<AsmBlock, String> {
@@ -437,6 +509,8 @@ impl Seq {
             inputs: self.inputs,
             outputs: self.outputs,
             exit_in_flight: self.exit_in_flight,
+            loop_body: self.loop_body,
+            pinned: self.pinned,
         };
         if let Err(v) = block.verify() {
             errs.extend(v);
@@ -448,6 +522,11 @@ impl Seq {
         }
     }
 }
+struct ViewCheck<const I: usize, const N: usize>;
+impl<const I: usize, const N: usize> ViewCheck<I, N> {
+    const OK: () = assert!(I < N, "view index out of range for this register tuple");
+}
+
 struct LaneCheck<const I: usize, const N: usize>;
 impl<const I: usize, const N: usize> LaneCheck<I, N> {
     const OK: () = assert!(I < N, "lane index out of range for this register tuple");
