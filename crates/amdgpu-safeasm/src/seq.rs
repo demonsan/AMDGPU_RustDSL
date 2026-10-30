@@ -560,6 +560,11 @@ impl<T> Drop for Pending<T> {
 pub const OP_MFMA_SCALE: u32 = 0;
 pub const OP_MFMA_SCALE_ZERO: u32 = 1;
 pub const OP_SMFMAC_FP8: u32 = 2;
+/// The f16 32x32x8 MFMA with an implicit zero accumulator (the bias MFMA). A different opcode from the scaled one: the scaled MFMA that accumulates
+/// into its result must wait for the full result latency (`retire`), 12 wait states for this opcode (hazards.rs `mfma_latency`).
+pub const OP_MFMA_F16_ZERO: u32 = 3;
+/// Result latency in wait states of the f16 32x32x8 MFMA (hazards.rs).
+pub const MATRIX_RESULT_F16: u32 = 12;
 
 /// An in-flight matrix instruction of opcode `OP`. Owns the accumulator and holds the borrows of every operand until it is retired / exited:
 /// the result cannot be read and an operand the instruction is still reading cannot be overwritten (borrow-check errors). Abandoning the token
@@ -567,6 +572,7 @@ pub const OP_SMFMAC_FP8: u32 = 2;
 #[must_use = "an in-flight MFMA must be retired (or chained, or exited) before its result is used"]
 pub struct Mfma<'a, const OP: u32> {
     pub(crate) issued: u32,
+    pub(crate) lat: u32,
     pub(crate) acc: Option<Vgpr<16>>,
     pub(crate) poison: Poison,
     pub(crate) _p: PhantomData<&'a ()>,
@@ -584,7 +590,7 @@ pub struct Smfmac<'a, const OP: u32> {
 impl<'a, const OP: u32> Mfma<'a, OP> {
     /// Wait until the result is readable (pads exactly the missing wait states), release the operands and give the accumulator back.
     pub fn retire(mut self, s: &mut Seq) -> Vgpr<16> {
-        s.pad_after(self.issued, MATRIX_RESULT);
+        s.pad_after(self.issued, self.lat);
         let acc = self.acc.take().expect("accumulator");
         s.clear_write(acc.id);
         acc
