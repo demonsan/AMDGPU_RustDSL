@@ -15424,15 +15424,15 @@ fn probe_cvtchain(name: &str, use_asm: bool) -> Function {
             let mut ys = Vec::new();
             for j in 0..2u8 {
                 let a = b.frag4_lane(v, 2 * j);
-                let a = b.bitcast_f32(a);
                 let c = b.frag4_lane(v, 2 * j + 1);
-                let c = b.bitcast_f32(c);
                 let p = b.frag2(a, c);
                 let q = b.pk_add_f32(p, delta2);
                 let r = b.pk_mul_f32(q, scale2);
                 let lo = b.frag2_lane(r, 0);
                 let hi = b.frag2_lane(r, 1);
-                let u = b.cvt_pknorm_u16_f32(lo, hi);
+                let lof = b.bitcast_f32(lo);
+                let hif = b.bitcast_f32(hi);
+                let u = b.cvt_pknorm_u16_f32(lof, hif);
                 let sh = b.let_(Op::LshrI32(Opnd::Val(u), Opnd::Val(c4)));
                 let m = b.let_(Op::AndI32(Opnd::Val(sh), Opnd::Val(cmask)));
                 let x = b.perm_b32(m, m, csel);
