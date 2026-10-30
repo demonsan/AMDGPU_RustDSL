@@ -7,9 +7,22 @@ ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 REF_CO="${REF_CO:?set REF_CO to the vendor fwd_hd128_mxfp8.co}"
 OUR_KERNEL="${OUR_KERNEL:-fmha_fwd_hd128_mxfp8}"
 cd "$REPO"; mkdir -p build
-bash tools/container/cargo.sh run -q --bin amdc -- emit "$OUR_KERNEL" --backend "${BACKEND:-auto}" ${AMDC_EXTRA_FLAGS:-} --out "/work/build/$OUR_KERNEL.s"
-"${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
-    -o build/fmha_ours.co "build/$OUR_KERNEL.s"
+# OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto: build the 256-row kernel (_vs128) and the 128-row kernel (_t128); ref_host then picks per shape
+# (ceil(S/256)*H*B < 256 -> 128 rows / 256 threads, else 256 / 512; REF_ROWS_PER_BLOCK overrides)
+build_one() { # kernel, out.co
+    bash tools/container/cargo.sh run -q --bin amdc -- emit "$1" --backend "${BACKEND:-auto}" ${AMDC_EXTRA_FLAGS:-} --out "/work/build/$1.s"
+    "${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
+        -o "$2" "build/$1.s"
+}
+KNAME="$OUR_KERNEL"; SMALL_ENV=""
+if [[ "$OUR_KERNEL" == *_auto ]]; then
+    KNAME="${OUR_KERNEL%_auto}_vs128"
+    build_one "$KNAME" build/fmha_ours.co
+    build_one "${OUR_KERNEL%_auto}_t128" build/fmha_ours_small.co
+    SMALL_ENV="build/fmha_ours_small.co"
+else
+    build_one "$OUR_KERNEL" build/fmha_ours.co
+fi
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/ref_host.cpp -o build/ref_host \
     -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib"
 rc=0
@@ -17,7 +30,7 @@ for CFG in "1 1 256 256 1" "1 2 512 512 1" "2 4 1024 1024 1" "1 8 2048 2048 1" "
     set -- $CFG
     echo "=== B=$1 H=$2 S=$3 SK=$4 gqa=$5"
     out=$(REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_HK=$(( $2 / $5 )) REF_ROWS="${REF_ROWS:-16}" REF_ITERS="${REF_ITERS:-20}" \
-        REF_CO2=build/fmha_ours.co REF_KNAME2="$OUR_KERNEL" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
+        REF_CO2=build/fmha_ours.co REF_KNAME2="$KNAME" REF_CO2_SMALL="$SMALL_ENV" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
         ./build/ref_host "$REF_CO" 2>&1 | grep -E "vs|timing|REF_") || rc=1
     echo "$out"
     # Second gate, VENDOR PARITY: our MEAN error against the CPU model must be within PARITY_MARGIN (default 1.10) of the vendor's on the same
