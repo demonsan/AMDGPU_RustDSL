@@ -9936,6 +9936,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     if !no_bar {
         b.barrier(); // A: P1, B: P2
     }
+    if ablate.split(',').any(|x| x == "quitpro") {
+        return; // diagnostic: prologue only (Q, first tile DMA, QK(0)), no loop, no epilogue
+    }
     let zero4v = b.frag_zero(DType::Frag4);
     let mut init_vars = vec![
         (DType::I32, Opnd::Val(c0)),          // 0 it
@@ -15935,6 +15938,9 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     };
     // vsx: short sequences (<= 2 tiles of 128 keys) keep the LUT correction (their error does not average out), long ones skip it (-128 VALU per
     // tile): two complete code copies selected once at kernel start
+    if std::env::var("FMHA_ABLATE").unwrap_or_default().split(|c| c == ',').any(|x| x == "quit") {
+        return b.finish(); // diagnostic: the kernel exits immediately (launch + dispatch cost only)
+    }
     let vsx_split = sv && (name.ends_with("_vs128") || is_kvs) && (vs128_vsx() || fmha_t_opt("corrshort"));
     if sv && name.ends_with("_t128") {
         if vs128_vsx() || fmha_t_opt("corrshort") {
