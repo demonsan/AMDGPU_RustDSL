@@ -97,6 +97,18 @@ impl Seq {
         Mfma { issued, lat: MATRIX_RESULT, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
     }
 
+    /// Scaled MFMA with an EXPLICIT accumulator input: `dst = A x B + C` (`v_mfma_scale ... dst, a, b, c, sa, sb`, the persistent-bias form: C is a
+    /// register the sequence only READS, dst is a different register that the token owns). Same opcode as the accumulate form, so `.chain()` (in place
+    /// on dst) works afterwards. `c` is a `Ready` proof: it is borrowed for the life of the token (cannot be overwritten while the MFMA reads it), and a C
+    /// produced by a matrix op is only reachable after `retire` (20 wait states): the verifier rejects a C read less than 20 states after its producer
+    /// (the interlocked same-opcode exemption applies only to the in-place chain dst == C).
+    pub fn v_mfma_scale_f32_32x32x64_f8f6f4_c<'a>(&mut self, dst: Vgpr<16>, c: Ready<'a, 16>, a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>) -> Mfma<'a, OP_MFMA_SCALE> {
+        let issued = self.clock;
+        self.push(inst("VMfmaScale32x32x64Fp8", Some(dst.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(c.id), ASrc::Reg(sa.id), ASrc::Reg(sb.id)]));
+        self.note_write(dst.id, MATRIX_RESULT);
+        Mfma { issued, lat: MATRIX_RESULT, acc: Some(dst), poison: self.poison.clone(), _p: PhantomData }
+    }
+
     /// The same with an implicit zero accumulator (`D = A x B`): `acc` is only written.
     pub fn v_mfma_scale_f32_32x32x64_f8f6f4_zero<'a>(&mut self, acc: Vgpr<16>, a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>) -> Mfma<'a, OP_MFMA_SCALE_ZERO> {
         let issued = self.clock;
@@ -278,6 +290,7 @@ pub const HAND_WRITTEN_OPS: &[(&str, &str, &str)] = &[
     ("v_mfma_scale_f32_32x32x64_f8f6f4", "VMfmaScale32x32x64Fp8", "matrix token (chainable)"),
     ("v_mfma_scale_f32_32x32x64_f8f6f4_zero", "VMfmaScale32x32x64Fp8Z", "matrix token"),
     ("v_mfma_f32_32x32x8_f16_zero", "VMfma32x32x8F16Z", "matrix token (12-state result)"),
+    ("v_mfma_scale_f32_32x32x64_f8f6f4_c", "VMfmaScale32x32x64Fp8", "matrix token with explicit C operand (dst != C)"),
     ("v_smfmac_f32_16x16x128_fp8_fp8", "VSmfmac16x16x128Fp8", "matrix token (chainable)"),
     ("ds_read_b128", "LdsReadB128", "Pending (lgkmcnt)"),
     ("ds_read_b32", "LdsReadB32", "Pending (lgkmcnt)"),

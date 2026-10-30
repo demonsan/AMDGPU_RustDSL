@@ -749,3 +749,76 @@ fn wide_global_stores_are_typed_and_use_a_vm_slot() {
     s.output(x);
     s.finish().unwrap();
 }
+
+// ---- scaled MFMA with an explicit C operand (persistent bias accumulator form) ---------------------------------------------------------------
+
+#[test]
+fn scaled_mfma_with_c_operand_reads_c_and_writes_a_different_register() {
+    let mut s = Seq::new();
+    let (a, b, c) = (s.input::<8>(), s.input::<8>(), s.input::<16>());
+    let (sa, sb) = (s.splat(127), s.splat(127));
+    let dst = s.vgpr::<16>();
+    let (ra, rb, rc, rsa, rsb) = (s.ready(&a), s.ready(&b), s.ready(&c), s.ready(&sa), s.ready(&sb));
+    let t = s.v_mfma_scale_f32_32x32x64_f8f6f4_c(dst, rc, ra, rb, rsa, rsb);
+    let t = t.chain(&mut s, ra, rb, rsa, rsb); // a second scaled MFMA accumulates in place on dst: same opcode, no wait
+    let d = t.retire(&mut s);
+    s.output(d);
+    let blk = s.finish().unwrap();
+    let m: Vec<_> = blk.insts().iter().filter(|i| i.op == "VMfmaScale32x32x64Fp8").collect();
+    assert_eq!(m.len(), 2);
+    let (d0, c0) = (m[0].dst.unwrap(), if let ASrc::Reg(r) = m[0].srcs[2] { r } else { unreachable!() });
+    assert_ne!(d0, c0, "dst and C are different registers");
+    // chain member is back to back
+    let pos: Vec<usize> = blk.insts().iter().enumerate().filter(|(_, i)| i.op == "VMfmaScale32x32x64Fp8").map(|(k, _)| k).collect();
+    assert_eq!(pos[1], pos[0] + 1);
+}
+
+/// The verifier treats C as a read of a matrix result: a C produced by an MFMA less than 20 states earlier is rejected (forged stream: the
+/// type system already refuses it, see ui/fail_mfma_c_still_in_flight.rs).
+#[test]
+fn verifier_rejects_a_c_operand_younger_than_20_states() {
+    let mut s = Seq::new();
+    let (a, b) = (s.input::<8>(), s.input::<8>());
+    let (sa, sb) = (s.splat(127), s.splat(127));
+    let o1 = s.vgpr::<16>();
+    let o2 = s.vgpr::<16>();
+    let (ra, rb, rsa, rsb) = (s.ready(&a), s.ready(&b), s.ready(&sa), s.ready(&sb));
+    let o1 = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(o1, ra, rb, rsa, rsb).retire(&mut s);
+    let rc = s.ready(&o1);
+    let o2 = s.v_mfma_scale_f32_32x32x64_f8f6f4_c(o2, rc, ra, rb, rsa, rsb).retire(&mut s);
+    s.output(o2);
+    let ok = s.finish().unwrap();
+    // forge: remove the padding between the producer of C and the C-form MFMA
+    let v: Vec<AInst> = ok.insts().iter().filter(|i| i.op != "SNop").cloned().collect();
+    let e = amdgpu_safeasm::forge_for_tests(&ok, v).verify().unwrap_err().join("; ");
+    assert!(e.contains("unretired matrix result"), "{e}");
+}
+
+/// DSL level: `var_mfma_scale_c` reads a separate C and writes the loop variable (dst != C); the C operand of a persistent accumulator that a
+/// previous scaled MFMA wrote is NOT padded (same-opcode interlock, in-order chain), one written by a VALU copy is padded 2 states.
+#[test]
+fn dsl_var_mfma_scale_c_lowers_with_distinct_dst_and_c() {
+    use amdgpu_dsl::{DType, FnBuilder, Op, Opnd};
+    let mut b = FnBuilder::new("mfma_c", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let c0 = b.c_i32(0);
+    let c127 = b.c_i32(127);
+    let a8 = b.frag8(c0, c0, c0, c0, c0, c0, c0, c0);
+    let b8 = b.frag8(c0, c0, c0, c0, c0, c0, c0, c0);
+    let z = b.frag_zero(DType::Frag16);
+    let bias = b.frag_zero(DType::Frag16);
+    let vars = b.begin_loop(&[(DType::Frag16, Opnd::Val(z))]);
+    b.var_mfma_scale_c(vars[0], a8, b8, bias, c127, c127);
+    let stop = b.cmp_lt_i32(c0, c127);
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+    let l = b.frag16_lane(Opnd::Var(vars[0]), 0);
+    let lf = b.bitcast_f32(l);
+    b.store_f32(o, 0, lf);
+    let m = amdgpu_compiler::lower::lower(&b.finish()).unwrap();
+    let mf = m.blocks.iter().flat_map(|bl| bl.insts.iter()).find(|i| i.op == MOp::VMfmaScale32x32x64Fp8).unwrap();
+    let d = mf.dst.unwrap();
+    let c = if let Src::Reg(r) = mf.srcs[2] { r } else { panic!() };
+    assert_ne!(d, c);
+}
