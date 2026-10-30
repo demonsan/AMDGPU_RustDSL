@@ -11808,7 +11808,9 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         // V phase (the DMA of tile t+2 runs under it, waited for at its end); M phase: PV(this tile) + QK(next tile)
         // _vs6: group A stages K(t+2) (+ scales) into the K region of the slot of tile t (free: QK(t) ran in the V window of tile t-1), waited at the end of M(t);
         // group B stages V(t+1) as before (waited at the end of V(t))
-        let skd: Option<ValueId> = if stage && !role_a { stage_start(b, key_n2, slot_n2) } else { None };
+        // vmv: group B issues V(t+1) after barrier B1 (M window start; waited at the end of M(t)) instead of at the V window start
+        let vmv = fmha_t_opt("vmv");
+        let skd: Option<ValueId> = if stage && !role_a && !vmv { stage_start(b, key_n2, slot_n2) } else { None };
         let kmv = fmha_t_opt("kmv"); // kmv: always issue A's K(t+2) after barrier B1 (cover = M phase only); default: at V start, except in iteration 0
         if stage && role_a && !no_stage && !kmv {
             // iteration 0: group B is still computing QK(0) (prologue) from the K region this DMA would overwrite: issued after B1 there
@@ -11835,7 +11837,7 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             // QK(t+1) (K(t+1) is already in LDS) right after the conversion of S(t): each S tile is overwritten as soon as its scores were consumed
             qk(b, slot_nxt, kds_nxt, None, bias_now, 0, qkv_n);
         }
-        if stage && !role_a && !ablate.contains("novmwait") {
+        if stage && !role_a && !vmv && !ablate.contains("novmwait") {
             b.wait_vm(0); // group B: V(t+1) landed
         }
         if stage && dsplit && role_a {
@@ -11871,6 +11873,9 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             if !kmv {
                 b.end_if();
             }
+        }
+        if stage && !role_a && vmv && !no_stage {
+            let _ = stage_start(b, key_n2, slot_n2);
         }
         // dsplit, group A: K(t+2) DMA + scales into the K region of the slot of tile t (free: its K was consumed by QK(t) in the previous M phase)
         let kd_t2: Option<ValueId> = if stage && dsplit && role_a && !no_stage {
@@ -11963,8 +11968,8 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if !noprio {
             b.set_prio(0);
         }
-        if stage && role_a && !ablate.contains("novmwait") {
-            b.wait_vm(0); // group A: K(t+2) + scales landed (they had V(t) + M(t) to arrive)
+        if stage && (role_a || vmv) && !ablate.contains("novmwait") {
+            b.wait_vm(0); // group A: K(t+2) + scales landed; group B (vmv): V(t+1) landed
         }
         if stage && dsplit && !role_a && !ablate.contains("novmwait") {
             b.wait_vm(0); // group B: the V(t+1) DMA issued at the start of V(t) has had V + M to land
