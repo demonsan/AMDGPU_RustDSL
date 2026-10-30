@@ -64,6 +64,8 @@ pub struct AsmBlock {
     pub(crate) exit_in_flight: Vec<(u32, u32)>,
     /// Built with `Seq::finish_loop_body`: drain-closed at both ends (nothing in flight at entry or exit).
     pub(crate) loop_body: bool,
+    /// Pinned: the compiler may not reorder these instructions or move others across them (hand-authored schedule).
+    pub(crate) pinned: bool,
 }
 
 impl AsmBlock {
@@ -88,6 +90,9 @@ impl AsmBlock {
     }
     /// Registers whose last matrix write is still in flight at block exit (the consumer after the block is padded by the compiler's
     /// hazard pass, which sees the whole instruction stream): `(register, wait states still owed)`.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
     pub fn is_loop_body(&self) -> bool {
         self.loop_body
     }

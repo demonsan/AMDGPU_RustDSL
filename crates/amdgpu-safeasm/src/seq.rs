@@ -82,6 +82,7 @@ pub struct Seq {
     exit_in_flight: Vec<(u32, u32)>,
     next_token: u32,
     loop_body: bool,
+    pinned: bool,
     lgkm: Vec<u32>,
     vm: Vec<u32>,
 }
@@ -111,6 +112,7 @@ impl Seq {
             exit_in_flight: Vec::new(),
             next_token: 0,
             loop_body: false,
+            pinned: false,
             lgkm: Vec::new(),
             vm: Vec::new(),
         }
@@ -443,6 +445,11 @@ impl Seq {
         self.insts.iter().map(|i| i.op.to_string()).collect::<Vec<_>>().join("\n")
     }
 
+    /// Pin the block: the hand-authored instruction order is preserved by the scheduler (no instruction moves into, out of or across it).
+    pub fn pin(&mut self) {
+        self.pinned = true;
+    }
+
     /// Finish a LOOP BODY: the block runs once per iteration, so it must be DRAIN-CLOSED. It enters with nothing in flight (the previous iteration
     /// ended clean) and must exit the same way: every matrix result retired (20 wait states), no outstanding DS/VMEM loads, no matrix `output_exit`.
     /// The straight-line verifier is then sound for every iteration because the entry and exit wait clocks are defined (all waits satisfied).
@@ -467,6 +474,7 @@ impl Seq {
             outputs: self.outputs,
             exit_in_flight: self.exit_in_flight,
             loop_body: self.loop_body,
+            pinned: self.pinned,
         };
         if let Err(v) = block.verify() {
             errs.extend(v);

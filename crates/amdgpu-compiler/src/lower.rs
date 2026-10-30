@@ -625,7 +625,9 @@ impl Lowerer {
                     ASrc::Imm(v) => mi.src(Src::Imm(*v)),
                 };
             }
-            self.push(mi.imm(i.imm));
+            let mut mi = mi.imm(i.imm);
+            mi.pin = block.is_pinned();
+            self.push(mi);
             n_pushed += 1;
         }
         let out = block.outputs().first().ok_or("asm block has no output port")?;
@@ -2541,7 +2543,7 @@ fn coalesce(m: &mut MFunction) {
                 let inst = &b.insts[i];
                 (inst.op, inst.dst, inst.srcs.clone())
             };
-            if op == MOp::VMovB32 && srcs.len() == 1 {
+            if op == MOp::VMovB32 && srcs.len() == 1 && !b.insts[i].pin && !b.insts[i - 1].pin {
                 if let (Some(d), Src::Reg(s)) = (dst, srcs[0]) {
                     let prev = &b.insts[i - 1];
                     let prev_defs_s = prev.dst == Some(s);
@@ -2991,7 +2993,7 @@ fn sink_defs(m: &mut MFunction) {
             i -= 1;
             let inst = m.blocks[bi].insts[i].clone();
             let Some(d) = inst.dst else { continue };
-            if !pure(inst.op) || m.vreg_class(d) != RClass::V1 || !single(&d) {
+            if inst.pin || !pure(inst.op) || m.vreg_class(d) != RClass::V1 || !single(&d) {
                 continue;
             }
             if !inst.srcs.iter().all(|s| match s {
@@ -3094,7 +3096,7 @@ fn remat_exprs(m: &mut MFunction) {
             return None;
         }
         let inst = m.blocks[b].insts[i].clone();
-        if !pure(inst.op) {
+        if inst.pin || !pure(inst.op) {
             return None;
         }
         for s in &inst.srcs {
