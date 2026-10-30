@@ -11218,10 +11218,13 @@ fn emit_fmha_g2_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };    let iter = |b: &mut FnBuilder, masked: bool, stage: bool, last_barrier: bool| {
         let (_i1, slot_cur, slot_nxt, slot_n2, kds_nxt, kds_n2, key_n2) = ring(b);
         // V phase: DMA of tile t+2; max + rollback of tile t; then for every S tile: convert it, issue QK(t+1, s) into the freed registers
+        // (g2split: only tiles 0,1 here; tiles 2,3 are converted/QK-ed in the M phase, after PV half 0, to balance the two windows)
+        let g2split = fmha_t_opt("g2split");
+        let n_v = if g2split { 2usize } else { 4usize };
         let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
         let _ = valu(b, masked, true, 0, 0);
         let mut words: Vec<ValueId> = Vec::with_capacity(16);
-        for s in 0..4usize {
+        for s in 0..n_v {
             let ws = valu(b, masked, false, s, s + 1);
             words.extend(ws);
             if stage {
@@ -11238,7 +11241,41 @@ fn emit_fmha_g2_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if !no_bar && !nobar1 {
             b.barrier();
         }
-        pv_w(b, slot_cur, &words);
+        if g2split {
+            let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot_cur)).collect();
+            let load_v = |b: &mut FnBuilder, hh: usize, e: usize| -> ValueId {
+                let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+                for r in 0..4i32 {
+                    let off = b.c_i32((hh as i32) * 8192 + 2048 * r);
+                    addrs.push(b.add_i32(trb[e], off));
+                }
+                b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3])
+            };
+            let pa = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+            for e in 0..4usize {
+                let v8 = load_v(b, 0, e);
+                b.var_mfma_scale(o_vars[e], v8, pa, c127, c123);
+            }
+            let mut w2: Vec<ValueId> = Vec::with_capacity(8);
+            for s in 2..4usize {
+                let ws = valu(b, masked, false, s, s + 1);
+                w2.extend(ws);
+                if stage {
+                    qk(b, slot_nxt, kds_nxt, None, s, s + 1);
+                }
+            }
+            let pb = b.frag8(w2[0], w2[1], w2[2], w2[3], w2[4], w2[5], w2[6], w2[7]);
+            for e in 0..4usize {
+                let v8 = load_v(b, 1, e);
+                b.var_mfma_scale(o_vars[e], v8, pb, c127, c123);
+            }
+            b.var_smfmac_fp8(la, a_rs, pa, idx01);
+            b.var_smfmac_fp8(la, a_rs, pb, idx01);
+            b.var_smfmac_fp8(la, a_rs, pa, idx23);
+            b.var_smfmac_fp8(la, a_rs, pb, idx23);
+        } else {
+            pv_w(b, slot_cur, &words);
+        }
         if !noprio {
             b.set_prio(0);
         }
