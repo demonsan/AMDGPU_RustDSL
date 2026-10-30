@@ -734,3 +734,18 @@ fn bias_mfma_then_scaled_accumulate_and_vgpr_shift() {
     assert!(gap >= 12, "{gap}");
     assert!(ops.iter().any(|i| i.op == "VLshrB32" && matches!(i.srcs[0], ASrc::Reg(_))));
 }
+#[test]
+fn wide_global_stores_are_typed_and_use_a_vm_slot() {
+    let mut s = Seq::new();
+    let addr = s.vgpr::<2>();
+    let d2 = s.zeroed::<2>();
+    let d4 = s.zeroed::<4>();
+    s.global_store_dwordx2(&addr, &d2, 8);
+    s.global_store_dwordx4(&addr, &d4, 0);
+    assert_eq!(s.outstanding(), (0, 2));
+    s.wait_vm_all();
+    let mut x = s.vgpr::<1>();
+    s.v_mov_b32(&mut x, Imm::<1>::new());
+    s.output(x);
+    s.finish().unwrap();
+}

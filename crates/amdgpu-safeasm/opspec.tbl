@@ -43,3 +43,5 @@ v_cmp_gt_i32         | VCmpGtI32     | cmp
 v_cmp_ne_i32         | VCmpNeI32     | cmp
 v_cmp_lt_f32         | VCmpLtF32     | cmp
 global_store_dword   | GlobalStoreF32 | store_vm
+global_store_dwordx2 | GlobalStoreF32x2 | store_vm2
+global_store_dwordx4 | GlobalStoreF32x4 | store_vm4
