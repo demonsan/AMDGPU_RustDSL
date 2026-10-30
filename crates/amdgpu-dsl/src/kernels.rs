@@ -10614,7 +10614,20 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                         for k in 0..4usize {
                             let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
                             let lanev = b.bitcast_f32(lane);
-                            let v = b.mul_f32(lanev, fin);
+                            let v0 = b.mul_f32(lanev, fin);
+                            // q3 / q7: diagnostic emulation of an e4m3 (3 mantissa bits) / bf16 (7 bits) partial: round the f32 mantissa to nb bits
+                            let qbits = if fmha_t_opt("q3") { 3 } else if fmha_t_opt("q7") { 7 } else { 0 };
+                            let v = if qbits > 0 {
+                                let sh = 23 - qbits;
+                                let vi = b.bitcast_i32(v0);
+                                let half = b.c_i32(1 << (sh - 1));
+                                let msk = b.c_i32(!((1i32 << sh) - 1));
+                                let r1 = b.add_i32(vi, half);
+                                let r2 = b.let_(Op::AndI32(Opnd::Val(r1), Opnd::Val(msk)));
+                                b.bitcast_f32(r2)
+                            } else {
+                                v0
+                            };
                             hv.push(b.let_(Op::CvtF32ToF16(Opnd::Val(v))));
                         }
                         let s0 = b.shl_i32(hv[1], c16i);
