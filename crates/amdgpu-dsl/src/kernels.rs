@@ -15179,10 +15179,15 @@ fn emit_fmha_t128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
             let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
             let off = (64 * e + 16 * q) as u32;
-            let f0 = b.bitcast_f32(w0);
-            let f1 = b.bitcast_f32(w1);
-            b.store_f32(o_ptr0, off, f0);
-            b.store_f32(o_ptr0, off + 4, f1);
+            if fmha_t_opt("ost1") {
+                let f0 = b.bitcast_f32(w0);
+                let f1 = b.bitcast_f32(w1);
+                b.store_f32(o_ptr0, off, f0);
+                b.store_f32(o_ptr0, off + 4, f1);
+            } else {
+                let f2 = b.frag2(w0, w1);
+                b.store_f32x2(o_ptr0, off, f2);
+            }
         }
     }
     b.end_if();
