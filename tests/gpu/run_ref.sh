@@ -14,8 +14,23 @@ build_one() { # kernel, out.co
     "${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
         -o "$2" "build/$1.s"
 }
-KNAME="$OUR_KERNEL"; SMALL_ENV=""
-if [[ "$OUR_KERNEL" == *_auto ]]; then
+KNAME="$OUR_KERNEL"; SMALL_ENV=""; SPLIT_ENV=""; COMBINE_ENV=""; SPLIT_N="0"; SPLIT_KNAME=""; COMBINE_KNAME=""
+if [[ "$OUR_KERNEL" == *_auto_split ]]; then
+    # KV-split auto path: build _vs128 + _t128 + _kvsplit + _kvsplit_combine; ref_host applies the
+    # dispatch guard (docs/gen4-tiling-design.md section 11) and falls back to _t128/_vs128 when rejected.
+    P="${OUR_KERNEL%_auto_split}"
+    KNAME="${P}_vs128"
+    build_one "$KNAME" build/fmha_ours.co
+    build_one "${P}_t128" build/fmha_ours_small.co
+    build_one "${P}_kvsplit" build/fmha_ours_split.co
+    build_one "${P}_kvsplit_combine" build/fmha_combine.co
+    SMALL_ENV="build/fmha_ours_small.co"
+    SPLIT_ENV="build/fmha_ours_split.co"
+    COMBINE_ENV="build/fmha_combine.co"
+    SPLIT_N="${REF_SPLIT:-2}"
+    SPLIT_KNAME="${P}_kvsplit"
+    COMBINE_KNAME="${P}_kvsplit_combine"
+elif [[ "$OUR_KERNEL" == *_auto ]]; then
     KNAME="${OUR_KERNEL%_auto}_vs128"
     build_one "$KNAME" build/fmha_ours.co
     build_one "${OUR_KERNEL%_auto}_t128" build/fmha_ours_small.co
@@ -30,7 +45,8 @@ for CFG in "1 1 256 256 1" "1 2 512 512 1" "2 4 1024 1024 1" "1 8 2048 2048 1" "
     set -- $CFG
     echo "=== B=$1 H=$2 S=$3 SK=$4 gqa=$5"
     out=$(REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_HK=$(( $2 / $5 )) REF_ROWS="${REF_ROWS:-16}" REF_ITERS="${REF_ITERS:-20}" \
-        REF_CO2=build/fmha_ours.co REF_KNAME2="$KNAME" REF_CO2_SMALL="$SMALL_ENV" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
+        REF_CO2=build/fmha_ours.co REF_KNAME2="$KNAME" REF_CO2_SMALL="$SMALL_ENV" \
+            REF_CO2_SPLIT="$SPLIT_ENV" REF_KNAME2_SPLIT="$SPLIT_KNAME" REF_CO2_COMBINE="$COMBINE_ENV" REF_KNAME2_COMBINE="$COMBINE_KNAME" REF_SPLIT="$SPLIT_N" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
         ./build/ref_host "$REF_CO" 2>&1 | grep -E "vs|timing|REF_|^\[grid\]") || rc=1
     echo "$out"
     # Second gate, VENDOR PARITY: our MEAN error against the CPU model must be within PARITY_MARGIN (default 1.10) of the vendor's on the same

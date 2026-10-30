@@ -70,3 +70,41 @@ Next (not done): overlapping more of V and M inside the wave (the full scheduler
 1. **Dispatch threshold.** The measured crossover is where the 128-row grid (2N blocks, N = ceil(S/256)*H*B) stops fitting the 256 CUs: t128 / `_vs128` = 1.345 (N = 64), 1.33 (N = 128, 256 t128 blocks), then it collapses: N = 136 -> 0.41, 144 -> 0.51, 152 -> 0.67, 160 -> 0.49, 192 -> 0.73, 224 -> 0.72, 256 -> 0.64. The rule is **t128 iff 2N <= 256 (N <= 128)**, else `_vs128`; `ref_host` implements it (`[grid]` line: chosen tiling + reason; overrides `REF_ROWS_PER_BLOCK`, `REF_OURS_BLOCK_THREADS`, `REF_GRID128`). The earlier "N < 256" statement in §9 was wrong for N = 129..255 (the 15 gate shapes all have N <= 64 and take t128).
 2. **LDS of the emitted kernel is 135168 B, not 99840 B.** The geometry (`fmha_t_build`, `vs_active()` kernels `_vsm/_g2/_g3/_t128`): 3 ring slots x 32768 B (K tile 16384 + V tile 16384 each) = 98304, + K-scale ring 3 x 512 = 1536 (declared as 2048), + 2048 B ones block + 16384 B Q b1 + 16384 B Q b0 staging regions inherited from the `g3` code = 3*32768 + 2048 + 2048 + 16384 + 16384 = **135168**. The ones/Q regions are only written (the Q fragments are register-resident) and could be dropped (99840 B); either size exceeds 81920 B, so two blocks cannot co-reside on a CU (the occupancy argument of §1 holds).
 3. **Loop-variable lint**: `t128` now has the same SSA bias-word fix as `_vs128` (0 warnings, bit-identical output, 491.8 TFLOP/s); the new bias word is written to the loop variable at the end of the window (writing it early kept two copies of the bias live and pushed the kernel over the 256-VGPR limit: the full scheduler fell back, 410 TFLOP/s).
+
+## 11. Dispatch guard for the KV-split candidate (design, harness implemented)
+
+The KV-split prototype (`docs/kvsplit-design.md`) is a second way to spend the same waves: split the key
+dimension `s` ways, keep the `_vs128` 8-wave block shape (one block/CU = 2 waves/SIMD), and merge the `s`
+normalized partials (`Ohat` fp32 + `lse` fp32) with a small combine kernel. It only helps when it can turn an
+under-filled grid into a full one, and its partial-write + combine cost is a fixed overhead, so it must not be
+selected blindly. The harness (`tests/gpu/ref_host.cpp`) applies this guard (implemented, waiting for the Step A
+kernel):
+
+```
+N256     = ceil(S/256) * H * B                      # blocks of the 256-row tiling
+rows     = B * S * H                                # output rows (D = 128)
+F        = 4 * B * H * S * SK * D                   # attention FLOPs
+T_cur    = F / (4.03e12 * min(256, 2*N256))         # _t128 model (N256 <= 128), else
+           F / (5.90e12 * min(256, N256))           # _vs128 model
+part_b   = s*rows*D*4 + s*rows*4                    # Ohat (fp32) + lse write bytes
+comb_b   = part_b + rows*D*2                        # combine read + bf16 write bytes
+T_kv(s)  = max(F / (5.90e12 * min(256, N256*s)),    # phase-1 compute at the measured 2-wave/SIMD rate
+               part_b / 4.8e12)                     # measured partial-write BW (partially hidden)
+         + comb_b / 7.4e12 + 1.5e-6                 # measured combine BW + launch gap
+use_split = (N256 <= 128) && (N256*s <= 256) && (T_kv(s) < 0.95 * T_cur)
+```
+
+* `N256 <= 128` keeps the rule inside the regime where the 256-row grid is under-filled (the certified auto
+  boundary: `t128` wins iff `2*N256 <= 256`).
+* `N256*s <= 256` requires the split grid to fit **one** block wave; two block waves give no extra CU fill and
+  only add traffic (measured `_t128` collapse at 2N > 256, `docs/vendor-spec.md` §7.9.5c).
+* `T_kv < 0.95*T_cur` keeps a 5% safety margin and prevents the fixed ~5 us combine from eating tiny shapes.
+* The constants are the measured rates from `docs/kvsplit-design.md` (5.9/4.03 TFLOP/s/CU, 4.8 TB/s write,
+  7.4 TB/s combine); they are model inputs, to be re-calibrated after the Step A measurement.
+* Overrides: `REF_SPLIT=s`, `REF_CO2_SPLIT`/`REF_KNAME2_SPLIT`, `REF_CO2_COMBINE`/`REF_KNAME2_COMBINE`,
+  `REF_SPLIT_FORCE=1` (bypasses the guard for the gate), `REF_SPLIT_ULP`, `REF_COMBINE_THREADS/GRID`.
+  `REF_SPLIT` unset -> the certified `_auto` path is byte-unchanged.
+* Interaction with the certified dispatch: if the guard rejects the split candidate, `ref_host` falls back to
+  the normal rule (`_t128` for `N256 <= 128`, `_vs128` for `N256 > 128`), so filling shapes keep the
+  single-launch path and cannot regress.
+
