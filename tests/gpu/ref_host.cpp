@@ -240,6 +240,7 @@ int main(int argc, char** argv) {
         CK(hipMalloc(&dout2, no * 2));
         CK(hipMemset(dout2, 0, no * 2));
         // dispatch (t128 / _vs128) was decided at the top; use_co/use_kn/ours_rows/ours_block
+        set_launch(dout2, ours_stride_rows);   // args 0x000 = our output buffer (+ Q tile stride field)
         hipModule_t mod2; hipFunction_t fn2;
         CK(hipModuleLoad(&mod2, use_co));
         CK(hipModuleGetFunction(&fn2, mod2, use_kn));        CK(hipModuleLaunchKernel(fn2, gox, gy, gz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
