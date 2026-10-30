@@ -11804,20 +11804,7 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         // V phase (the DMA of tile t+2 runs under it, waited for at its end); M phase: PV(this tile) + QK(next tile)
         // _vs6: group A stages K(t+2) (+ scales) into the K region of the slot of tile t (free: QK(t) ran in the V window of tile t-1), waited at the end of M(t);
         // group B stages V(t+1) as before (waited at the end of V(t))
-        let skd: Option<ValueId> = if stage {
-            if role_a {
-                let it_p2 = b.add_i32(it, c2);
-                let has_n2 = b.cmp_lt_i32(it_p2, cx.nkv);
-                let nkv_m1c = b.add_i32(cx.nkv, cm1);
-                let nn2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_n2), a: Opnd::Val(it_p2), b: Opnd::Val(nkv_m1c) });
-                let key_t2 = b.shl_i32(nn2, c7d);
-                stage_start(b, key_t2, slot_cur)
-            } else {
-                stage_start(b, key_n2, slot_n2)
-            }
-        } else {
-            None
-        };
+        let skd: Option<ValueId> = if stage && !role_a { stage_start(b, key_n2, slot_n2) } else { None };
         let _ = skd;
         let kdg: Option<Vec<ValueId>> = if kdglob && stage { Some(kd_rows(b, key_n2)) } else { None };
         let _ = &kdg;
@@ -11848,6 +11835,16 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.wait_lds(0);
         if !no_bar && !nobar1 {
             b.barrier();
+        }
+        // _vs6, group A: K(t+2) + scales after barrier B1 (group B has finished its QK(t) -- in iteration 0 its QK(0) of the prologue runs until the first barrier -- so the K region of the
+        // slot of tile t is free), waited at the end of M(t)
+        if stage && role_a && !no_stage {
+            let it_p2 = b.add_i32(it, c2);
+            let has_n2 = b.cmp_lt_i32(it_p2, cx.nkv);
+            let nkv_m1c = b.add_i32(cx.nkv, cm1);
+            let nn2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_n2), a: Opnd::Val(it_p2), b: Opnd::Val(nkv_m1c) });
+            let key_t2 = b.shl_i32(nn2, c7d);
+            let _ = stage_start(b, key_t2, slot_cur);
         }
         // dsplit, group A: K(t+2) DMA + scales into the K region of the slot of tile t (free: its K was consumed by QK(t) in the previous M phase)
         let kd_t2: Option<ValueId> = if stage && dsplit && role_a && !no_stage {
