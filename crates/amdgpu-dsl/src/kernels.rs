@@ -7399,7 +7399,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     if dma {
         dma_issue(b, key_next, buf_nxt);
     }
-    let compute = |b: &mut FnBuilder, masked: bool| {        // the running max is threaded through the two 64-key halves as an SSA value (the second half must see the first half's update; the loop
+    let compute = |b: &mut FnBuilder, masked: bool, m_in: ValueId| {        // the running max is threaded through the two 64-key halves as an SSA value (the second half must see the first half's update; the loop
         // variable is read once, at the start of the iteration, and only written afterwards)
         let mut m_carry: Option<ValueId> = None;
         for hh in 0..2usize {
@@ -7509,7 +7509,7 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             };
             let m_old = match m_carry {
                 Some(v) => v,
-                None => b.bitcast_f32(m_var),
+                None => m_in,
             };
             let corr_eager: Option<ValueId>;
             let m_use: ValueId;
@@ -7671,16 +7671,18 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             }
         }
     };
+    // the running max (loop variable) is read ONCE per iteration, before any branch / set_var of the iteration
+    let m_in = b.bitcast_f32(m_var);
     // the last iteration may hold fewer than 128 keys: only that one pays for the key mask
     if peel {
-        compute(b, masked_iter);
+        compute(b, masked_iter, m_in);
     } else {
         let key_end = b.add_i32(key0, c128v);
         let is_tail = b.cmp_lt_i32(cx.kv_len, key_end);
         b.begin_if(Opnd::Val(is_tail));
-        compute(b, true);
+        compute(b, true, m_in);
         b.else_();
-        compute(b, false);
+        compute(b, false, m_in);
         b.end_if();
     }
     // all waves are done with this iteration's K/V; then publish the prefetched tile
