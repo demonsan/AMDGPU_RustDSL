@@ -9514,7 +9514,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let no_pv = ablate.contains("nopv");
     let no_stage = ablate.contains("nostage");
     let seq_mode = ablate.contains("seq"); // diagnostic: both groups run group A's schedule (no phase offset)
-    let q0_reg = fmha_t_opt("q0reg"); // keep Q b0 in registers (8 VGPR) instead of 8 ds_read_b128 per tile
+    let q0_reg = fmha_t_opt("q0reg") || !fmha_t_opt("noqreg"); // Q fragments resident in registers by default (`noqreg` reads them from LDS) // keep Q b0 in registers (8 VGPR) instead of 8 ds_read_b128 per tile
     let c0 = b.c_i32(0);
     let c1 = b.c_i32(1);
     let c2 = b.c_i32(2);
@@ -9780,7 +9780,11 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let a1 = b.add_i32(q0_addr0, c1024_);
         b.load_lds_b128x2(Opnd::Val(q0_addr0), Opnd::Val(a1))
     };
+    let q1_reg = fmha_t_opt("q1reg") || !fmha_t_opt("noqreg");
     let load_q1 = |b: &mut FnBuilder| -> ValueId {
+        if q1_reg {
+            return cx.b1;
+        }
         let c1024_ = b.c_i32(1024);
         let a1 = b.add_i32(q_addr0, c1024_);
         b.load_lds_b128x2(Opnd::Val(q_addr0), Opnd::Val(a1))
@@ -9828,14 +9832,15 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             None
         };
         for s in 0..4usize {
-            let biasf = b.mfma_f16_wide(ones_f16, bias_init, zero);
+            // biasv: the carried reference is added to the scores with packed VALU adds at the start of the V phase instead of 4 f16 MFMAs
+            let biasf = if fmha_t_opt("biasv") { zero } else { b.mfma_f16_wide(ones_f16, bias_init, zero) };
             let ko = b.c_i32(4096 * (s as i32));
             let a0 = b.add_i32(cx.kfx[0], ko);
             let a1 = b.add_i32(cx.kfx[1], ko);
             let a2 = b.add_i32(cx.kfx[2], ko);
             let a3 = b.add_i32(cx.kfx[3], ko);
-            let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
-            let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
+            let k8_0 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)) };
+            let k8_1 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)) };
             let kd = if let Some(v) = &kd0g {
                 v[s]
             } else if let Some(f) = kdf0 {
@@ -9944,7 +9949,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             None
         };
         for s in 0..4usize {
-            if biasf_once.is_none() {
+            if biasf_once.is_none() && !fmha_t_opt("biasv") {
                 b.var_mfma_f16_z(s_vars[s], ones_f16, bias2);
             }
             let ko = b.c_i32(4096 * (s as i32));
@@ -9952,8 +9957,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a1 = b.add_i32(kfb[1], ko);
             let a2 = b.add_i32(kfb[2], ko);
             let a3 = b.add_i32(kfb[3], ko);
-            let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
-            let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
+            let k8_0 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)) };
+            let k8_1 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)) };
             let kd = if let Some(v) = kdv {
                 v[s]
             } else if ablate.contains("kdc") {
@@ -9976,6 +9981,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let qb0 = if let Some((q0, _)) = q_pre { q0 } else if q0_reg { cx.b0 } else { load_q0(b) };
             if let Some(bf) = biasf_once {
                 b.var_mfma_scale_c(s_vars[s], k8_0, qb0, bf, sk0, sq0m);
+            } else if fmha_t_opt("biasv") {
+                b.var_mfma_scale_z(s_vars[s], k8_0, qb0, sk0, sq0m);
             } else {
                 b.var_mfma_scale(s_vars[s], k8_0, qb0, sk0, sq0m);
             }
@@ -10006,6 +10013,20 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let kidx = b.add_i32(kb[s], kc);
             b.cmp_lt_i32(kidx, cx.kv_len)
         };
+        if fmha_t_opt("biasv") {
+            let w_cur_u = b.frag2_lane(bias2, 0);
+            let w_cur = b.bitcast_i32(w_cur_u);
+            let hi_c = b.let_(Op::CvtF16ToF32(Opnd::Val(w_cur)));
+            let lo_s = b.let_(Op::LshrI32(Opnd::Val(w_cur), Opnd::Val(c16i)));
+            let lo_c = b.let_(Op::CvtF16ToF32(Opnd::Val(lo_s)));
+            let c4fb = b.c_f32(4.0);
+            let sum_c = b.add_f32(hi_c, lo_c);
+            let b_cur = b.mul_f32(sum_c, c4fb);
+            let bpair = b.frag2_dup(b_cur);
+            for s in 0..4usize {
+                b.var_add_pk(s_vars[s], bpair);
+            }
+        }
         let mut flat: Vec<ValueId> = Vec::with_capacity(64);
         for s in 0..4usize {
             for r in 0..16u8 {
@@ -10206,7 +10227,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let off = b.c_i32((hh as i32) * 8192 + 2048 * r);
                 addrs.push(b.add_i32(trb[e], off));
             }
-            b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3])
+            if ablate.contains("notr") {
+                let cz = b.c_i32(0x38383838);
+                let f4 = b.frag4(cz, cz, cz, cz);
+                b.cat_frag8(f4, f4)
+            } else {
+                b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3])
+            }
         };
         if fmha_t_opt("pvpipe") {
             // software pipeline: the tr reads of step i+1 are issued before the MFMA of step i (partial lgkmcnt waits, reads in flight
