@@ -14912,6 +14912,28 @@ fn emit_fmha_vsm_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// build time, for bank-conflict experiments; default 144: 16-byte aligned and conflict-free enough, 128 = unpadded).
 /// End-to-end probe for the safe-asm path: loads a float4 per lane, MFMA + VALU, stores one float per lane (all written in safe Rust, see
 /// `amdgpu_safeasm::examples::global_probe_block`). out[tid] = in[4*tid..4*tid+4].sum() + 64.0.
+pub fn probe_log_store4() -> Function {
+    // out[4*tid + j] = log2(in[tid]) for j in 0..4: covers v_log_f32 and global_store_dwordx4 on both backends
+    let mut b = FnBuilder::new("probe_log_store4", 64);
+    b.arg("inp", DType::Ptr, 0, 8);
+    b.arg("outp", DType::Ptr, 8, 8);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let outp = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let c16 = b.c_i32(16);
+    let off_in = b.mul_i32(tid, c4);
+    let off_out = b.mul_i32(tid, c16);
+    let pin = b.ptr_add(inp, off_in);
+    let pout = b.ptr_add(outp, off_out);
+    let x = b.load_f32(pin, 0);
+    let l = b.log2_f32(x);
+    let li = b.bitcast_i32(l);
+    let f4 = b.frag4(li, li, li, li);
+    b.store_f32x4(pout, 0, f4);
+    b.finish()
+}
+
 pub fn probe_safeasm_e2e() -> Function {
     let mut b = FnBuilder::new("probe_safeasm_e2e", 64);
     b.arg("inp", DType::Ptr, 0, 8);

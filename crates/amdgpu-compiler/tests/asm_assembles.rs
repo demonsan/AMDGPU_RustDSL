@@ -34,7 +34,7 @@ fn emitted_kernels_assemble_with_the_aggressive_option_sets() {
     }
     let mut bad = Vec::new();
     let mut names: Vec<&str> = kernel_names().to_vec();
-    names.extend(["fmha_fwd_hd128_mxfp8_vs", "fmha_fwd_hd128_mxfp8_vs128"]);
+    names.extend(["fmha_fwd_hd128_mxfp8_vs", "fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_kvsplit", "probe_safeasm_e2e"]);
     for k in names {
         if !(k.starts_with("fmha_fwd") || k == "attention_fwd") {
             continue;
