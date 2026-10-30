@@ -885,6 +885,65 @@ should be converted to explicit SSA values before the kernel is frozen; (f) two 
 accounting; (g) wall-time is a same-run ratio on a shared node (best-case + median of 15 samples), not
 a benchmark-grade absolute timing; the cycle columns use the 2.4 GHz convention.
 
+### 5c) AUTO-DISPATCH CERTIFIED FINAL (validated commit `6e9e988`)
+
+Branch `final-auto`, validated build commit **`6e9e9888cecd6387fff214f4789f0cecfd18ec31`** (= Main
+`be21aae` merged with kernel-opt `7a24376` auto-dispatch + lint fixes + docs; the merge commit is
+`f36cee9` and `6e9e988` is the harness fix below). The shipping invocation is
+`OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto`: `run_ref.sh` / `determinism.sh` build `_vs128` (256 rows,
+512 threads) and `_t128` (128 rows, 256 threads), and `ref_host` chooses per shape with the measured
+rule **t128 iff `2*ceil(S/256)*H*B <= 256`** (N <= 128; else `_vs128`), printing one
+`[grid]` line with the chosen kernel, rows/threads, grid, CU fill, reason and `blocks256`.
+Overrides (`REF_ROWS_PER_BLOCK`, `REF_OURS_BLOCK_THREADS`, `REF_GRID128`) are kept.
+*Harness note:* the merged auto path was found to launch the candidate without patching
+`args[0x000]` to its own output buffer (the cleanup had dropped `set_launch`), so our kernel wrote into
+the vendor buffer; fixed in `6e9e988` and everything below was re-run on the fixed build.
+
+**Gate through the AUTO path (`OUR_KERNEL=..._auto`, 128-row grid selected by the dispatcher):**
+16 rows **15/15 OK x3**, our bad=0, parity **15/15 x3**, dispatcher chose t128 for **15/15** shapes
+(the `[grid]` line shows `auto: 2*ceil(S/256)*H*B <= 256 CUs` for all of them); determinism **5/5 x2**;
+64 rows **12/15 gate pass x2** with all three failures vendor (ours bad=0 on all 15, parity 15/15).
+The auto output is bit-identical to the per-kernel runs: full-output md5
+`faadf00c95f4eaffff94ece7d1429b3d` (B1H8S2048), matching `_vs128` and `_t128`.
+
+**Boundary probe (explicit N = ceil(S/256)*H*B = 127, 128, 129, 130; shapes B=N, H=1, S=256, SK=2048):**
+
+| N (256-row grid) | dispatcher choice | ours bad | t128 blocks (2N) | forced t128 / forced `_vs128` |
+|---|---|---|---|---|
+| 127 | t128 | 0 | 254 | **1.204x** |
+| **128** | **t128** | 0 | **256 (100.0 % CUs)** | **1.203x** |
+| **129** | **`_vs128`** | 0 | - (would be 258) | **0.710x** (t128 loses) |
+| 130 | `_vs128` | 1 element (borderline tolerance on one of 266k checked; not a gate shape) | - | 0.705x |
+
+The measured crossover is exactly the implemented boundary: t128 wins while its own grid fits one
+full CU wave (`2N <= 256`), and loses by ~1.4x as soon as 2N > 256.
+
+**Benchmark through the AUTO path vs vendor (same run, warm protocol `REF_WARMUP=150`, `REF_ITERS=100`,
+best of 5):** grid line
+`[grid] vendor rows/block=256 block=512 grid=(8,8,1) blocks=64 (25.0%); ours (fmha_fwd_hd128_mxfp8_t128): rows/block=128 block=256 grid=(16,8,1) blocks=128 (50.0%) [auto: 2*ceil(S/256)*H*B <= 256 CUs; blocks256=64]`;
+vendor **537.3 TFLOP/s** (0.0320 ms), ours **509.7 TFLOP/s** (0.0337 ms) = **1.053x slower / 0.950x
+absolute throughput**; per-CU 3.98 vs 8.40 TFLOP/s/CU; md5 `faadf00c...`.
+(kernel-opt's 491.8 TFLOP/s is the same ratio at their clock state - absolute numbers scale with the
+vendor's own 515-549 TFLOP/s drift on this shared node; only ratios are portable.)
+
+**Lint status (final):** `_vs128` 16 -> 0, `_vs` 10 -> 0, `_t128` 8 -> 0, all bit-identical to their
+previous outputs on 7 shapes. `_t` keeps **14 warnings and is frozen with a documented limitation**:
+its lazy-rescale `if` lowers to a **wave-level branch** (`begin_if` = "any lane"), so after the branch
+the loop variable holds the new max for ALL lanes, while a per-lane SSA select would hold it only for
+the lanes that grew; the SSA form changed the output bits on 6/7 shapes on both backends and was
+therefore reverted. These 14 reports are a **documented latent hazard tied to the wave-level branch
+lowering, not an active bug**: `_t` is validated as-is (15/15 gate, deterministic, bit-identical runs)
+and is frozen with the limitation. An exact fix needs a wave-wide "any lane" op or restructuring the
+rescale into both branch arms (backend work).
+
+**What is certified (final):** the shipping `_auto` path at `6e9e988`: dispatch rule verified exactly
+at N=128/129; all 15 gate shapes take t128 and pass 15/15 (ours bad=0, parity 15/15, x3), determinism
+5/5 x2, 64-row gate clean for ours; absolute B1H8S2048 = 509.7 vs vendor 537.3 TFLOP/s (0.95x, using
+50 % of the CUs), bit-identical to both per-kernel paths; filled-grid shapes dispatch to `_vs128`
+(0.70-0.76x vendor absolute). Not certified: full-package absolute throughput (benchmark still only 50 %
+CU fill), `_t` future edits against the frozen numerics, and any absolute TFLOP/s without its clock
+state/grid labels.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as

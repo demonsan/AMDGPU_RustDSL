@@ -46,32 +46,43 @@ int main(int argc, char** argv) {
     const int D = 128;
     const float softmax_scale = 1.0f / std::sqrt((float)D);
 
-    // ---- tiling configuration (defaults preserve the historical 256-row / 512-thread launch) ----------------
-    // The vendor binary has a fixed 256-query-row tiling (ts_qo = 256) and must keep REF_VENDOR_ROWS_PER_BLOCK=256.
-    // `REF_ROWS_PER_BLOCK` (default 256) selects OUR kernel's rows per block: set it to 128 for the 128-row tiling
-    // variants (the candidate kernel must implement exactly that tiling; the host cannot change the kernel's ABI).
-    // Kernel-name based default for the t128 family: 128-row blocks of 256 threads. An explicit
-    // REF_ROWS_PER_BLOCK / REF_OURS_BLOCK_THREADS always wins.
+    // ---- tiling configuration / dispatch (defaults preserve the historical 256-row / 512-thread run) ----
+    // Vendor: fixed 256-row tiling (ts_qo=256), 512 threads, grid (ceil(S/256), H, B).
+    // Ours: two tilings share the ABI - 256 rows/512 threads (_vs128) and 128 rows/256 threads (_t128).
+    //   REF_CO2 / REF_KNAME2             = the 256-row kernel (or a single kernel)
+    //   REF_CO2_SMALL / REF_KNAME2_SMALL = the 128-row kernel; when present, dispatch is automatic:
+    //       t128 iff 2*ceil(S/256)*H*B <= 256 (its own grid fits the 256 CUs in one wave), else _vs128.
+    //   Overrides: REF_ROWS_PER_BLOCK=128|256, REF_GRID128=1, REF_OURS_BLOCK_THREADS.
     const char* kname_env = std::getenv("REF_KNAME2");
-    const bool k_t128 = kname_env && std::strstr(kname_env, "t128") != nullptr;
+    const char* co_small = std::getenv("REF_CO2_SMALL");
+    const char* kname_small = std::getenv("REF_KNAME2_SMALL") ? std::getenv("REF_KNAME2_SMALL") : "fmha_fwd_hd128_mxfp8_t128";
     const int vendor_rows = envi("REF_VENDOR_ROWS_PER_BLOCK", 256);
-    const int ours_rows = envi("REF_ROWS_PER_BLOCK", k_t128 ? 128 : 256);
     const int cus = envi("REF_CUS", 256);                 // MI350: 256 active CUs/package
     const unsigned vendor_block = 512;                    // vendor: 512 threads = 8 waves
-    const unsigned ours_block = (unsigned)envi("REF_OURS_BLOCK_THREADS", k_t128 ? 256 : 512);
+    const int forced_rows = envi("REF_ROWS_PER_BLOCK", 0);
+    const bool k_t128 = kname_env && std::strstr(kname_env, "t128") != nullptr;
+    const long blocks256 = (long)((S + 255) / 256) * H * B;
+    int rows_pb; const char* why;
+    if (forced_rows == 128 || forced_rows == 256) { rows_pb = forced_rows; why = "REF_ROWS_PER_BLOCK override"; }
+    else if (envi("REF_GRID128", 0) != 0) { rows_pb = 128; why = "REF_GRID128=1"; }
+    else if (co_small) { rows_pb = blocks256 <= 128 ? 128 : 256; why = blocks256 <= 128 ? "auto: 2*ceil(S/256)*H*B <= 256 CUs" : "auto: 2*ceil(S/256)*H*B > 256 CUs"; }
+    else { rows_pb = k_t128 ? 128 : 256; why = "kernel name"; }
+    const char* use_co = (rows_pb == 128 && co_small) ? co_small : std::getenv("REF_CO2");
+    const char* use_kn = (rows_pb == 128 && co_small) ? kname_small : (kname_env ? kname_env : "fmha_fwd_hd128_mxfp8");
+    const int ours_rows = rows_pb;
+    const unsigned ours_block = (unsigned)envi("REF_OURS_BLOCK_THREADS", rows_pb == 128 ? 256 : 512);
     const int vendor_stride_rows = envi("REF_VENDOR_TILE_STRIDE_ROWS", 256);
     const int ours_stride_rows = envi("REF_OURS_TILE_STRIDE_ROWS", ours_rows);
     const int gvx = (S + vendor_rows - 1) / vendor_rows, gy = H, gz = B;
     const int gox = (S + ours_rows - 1) / ours_rows;
     const long gv_blocks = (long)gvx * gy * gz, go_blocks = (long)gox * gy * gz;
     std::printf("[grid] vendor rows/block=%d block=%u grid=(%d,%d,%d) blocks=%ld (%.1f%% of %d CUs); "
-                "ours rows/block=%d block=%u grid=(%d,%d,%d) blocks=%ld (%.1f%% of %d CUs)\n",
+                "ours (%s): rows/block=%d block=%u grid=(%d,%d,%d) blocks=%ld (%.1f%% of %d CUs) [%s; blocks256=%ld]\n",
                 vendor_rows, vendor_block, gvx, gy, gz, gv_blocks, 100.0 * (double)gv_blocks / cus, cus,
-                ours_rows, ours_block, gox, gy, gz, go_blocks, 100.0 * (double)go_blocks / cus, cus);
+                use_kn, ours_rows, ours_block, gox, gy, gz, go_blocks, 100.0 * (double)go_blocks / cus, cus,
+                why, blocks256);
     if (vendor_rows != 256)
         std::printf("[grid] WARNING: the vendor binary is fixed at 256 rows/block; REF_VENDOR_ROWS_PER_BLOCK=%d is not supported by it\n", vendor_rows);
-    if (ours_rows != 256)
-        std::printf("[grid] note: the candidate kernel must implement the %d-row/block tiling (REF_ROWS_PER_BLOCK) and %u threads\n", ours_rows, ours_block);
     if (std::getenv("REF_GRID_ONLY")) return 0;
 
     unsigned int seed = 20260101u;
@@ -225,44 +236,20 @@ int main(int argc, char** argv) {
 
     // Optional second kernel (ours) on the same inputs.
     size_t bad2 = 0;
-    if (const char* co2 = std::getenv("REF_CO2")) {
-        const char* kname2 = std::getenv("REF_KNAME2") ? std::getenv("REF_KNAME2") : "fmha_fwd_hd128_mxfp8";
+    if (std::getenv("REF_CO2") || std::getenv("REF_CO2_SMALL")) {
         void* dout2;
         CK(hipMalloc(&dout2, no * 2));
         CK(hipMemset(dout2, 0, no * 2));
-        // Tiling dispatch (our kernel only; the vendor line stays at 256 rows x 512 threads). Two tilings share the ABI:
-        //   256 rows / 512 threads per block (e.g. fmha_fwd_hd128_mxfp8_vs128) and 128 rows / 256 threads (fmha_fwd_hd128_mxfp8_t128).
-        // The measured rule (docs/gen4-tiling-design.md, kernel-occ validation): use the 128-row kernel iff 2 * ceil(S/256) * H * B <= 256, i.e. its
-        // own grid (2N blocks) fits the 256 CUs (N <= 128: t128 wins 1.33-1.5x); above that (N = 129..255 the 128-row grid oversubscribes the CUs and
-        // t128 collapses to 0.4-0.8x; N >= 256: 0.64-0.75x) use the 256-row kernel.
-        // REF_CO2/REF_KNAME2 = the 256-row kernel (or a single kernel); REF_CO2_SMALL/REF_KNAME2_SMALL = the 128-row kernel (enables the automatic
-        // choice). Overrides: REF_ROWS_PER_BLOCK=128|256 forces the tiling, REF_OURS_BLOCK_THREADS forces the block size.
-        const std::string kn2(kname2);
-        const char* co_small = std::getenv("REF_CO2_SMALL");
-        const char* kname_small = std::getenv("REF_KNAME2_SMALL") ? std::getenv("REF_KNAME2_SMALL") : "fmha_fwd_hd128_mxfp8_t128";
-        const long blocks256 = (long)((S + 255) / 256) * H * B;
-        const int forced_rows = envi("REF_ROWS_PER_BLOCK", 0);
-        const bool name128 = (kn2.size() >= 4 && kn2.compare(kn2.size() - 4, 4, "t128") == 0);
-        int rows_pb; const char* why;
-        if (forced_rows == 128 || forced_rows == 256) { rows_pb = forced_rows; why = "REF_ROWS_PER_BLOCK override"; }
-        else if (envi("REF_GRID128", 0) != 0) { rows_pb = 128; why = "REF_GRID128=1"; }
-        else if (co_small) { rows_pb = blocks256 <= 128 ? 128 : 256; why = blocks256 <= 128 ? "auto: 2*ceil(S/256)*H*B <= 256 CUs" : "auto: 2*ceil(S/256)*H*B > 256 CUs"; }
-        else { rows_pb = name128 ? 128 : 256; why = "kernel name"; }
-        const int gdiv2 = rows_pb;
-        const int bdim2 = envi("REF_OURS_BLOCK_THREADS", rows_pb == 128 ? 256 : 512);
-        const char* use_co = (rows_pb == 128 && co_small) ? co_small : co2;
-        const char* use_kn = (rows_pb == 128 && co_small) ? kname_small : kname2;
-        set_launch(dout2, rows_pb);   // output pointer + Q tile stride at 0x080 for the chosen tiling (rows_pb * H * D)
-        std::printf("[grid] vendor: rows/block=256 threads=512 blocks=%ld | ours (%s): rows/block=%d threads=%d blocks=%d (%s; blocks256=%ld)\n",
-                    blocks256, use_kn, rows_pb, bdim2, (int)(((S + gdiv2 - 1) / gdiv2) * H * B), why, blocks256);
+        // dispatch (t128 / _vs128) was decided at the top; use_co/use_kn/ours_rows/ours_block
+        set_launch(dout2, ours_stride_rows);   // args 0x000 = our output buffer (+ Q tile stride field)
         hipModule_t mod2; hipFunction_t fn2;
         CK(hipModuleLoad(&mod2, use_co));
-        CK(hipModuleGetFunction(&fn2, mod2, use_kn));        CK(hipModuleLaunchKernel(fn2, (S + gdiv2 - 1) / gdiv2, H, B, bdim2, 1, 1, 0, nullptr, nullptr, extra));
+        CK(hipModuleGetFunction(&fn2, mod2, use_kn));        CK(hipModuleLaunchKernel(fn2, gox, gy, gz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
         CK(hipDeviceSynchronize());
         std::vector<uint16_t> out2(no, 0);
         CK(hipMemcpy(out2.data(), dout2, no * 2, hipMemcpyDeviceToHost));
         bad2 = check(out2, "our kernel   vs CPU");
-        time_kernel(fn2, "ours", dout2, rows_pb, (S + rows_pb - 1) / rows_pb, bdim2);
+        time_kernel(fn2, "ours", dout2, ours_rows, gox, ours_block);
         double wd = 0.0, md = 0.0;
         for (size_t i = 0; i < no; ++i) {
             const double dd = std::fabs((double)bf2f(out[i]) - (double)bf2f(out2[i]));
