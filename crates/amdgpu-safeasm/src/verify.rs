@@ -70,7 +70,7 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
             }
             if let Some((w, wop)) = matrix_write.get(&r).copied() {
                 if Some(r) != chain_reg {
-                    let have = slot - w - 1;
+                    let have = slot.saturating_sub(w).saturating_sub(1);
                     if have < MATRIX_RESULT {
                         errs.push(here(format!("reads r{r}, the result of {wop} issued {have} wait states ago: needs {MATRIX_RESULT} (unretired matrix result)")));
                     }
@@ -78,7 +78,7 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
             }
             if let Some(w) = valu_write.get(&r).copied() {
                 if matrix || i.op == "VReadFirstLane" || is_mask || r == VCC {
-                    let have = slot - w - 1;
+                    let have = slot.saturating_sub(w).saturating_sub(1);
                     if have < VALU_TO_MATRIX_READ {
                         errs.push(here(format!("reads r{r} written by a VALU instruction {have} wait states ago: needs {VALU_TO_MATRIX_READ}")));
                     }
@@ -88,13 +88,13 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
 
         if let Some(d) = dst {
             if let Some((w, wop)) = matrix_write.get(&d).copied() {
-                if Some(d) != chain_reg && slot - w - 1 < MATRIX_RESULT {
+                if Some(d) != chain_reg && slot.saturating_sub(w).saturating_sub(1) < MATRIX_RESULT {
                     errs.push(here(format!("writes r{d} while the {wop} writing it is still in flight (WAW)")));
                 }
             }
             for (r, at, ki) in &matrix_reads {
-                if *r == d && Some(d) != chain_reg && slot - at - 1 < MATRIX_RESULT && *ki != k {
-                    errs.push(here(format!("writes r{d}, an operand instruction {ki} is still reading (WAR, issued {} wait states ago)", slot - at - 1)));
+                if *r == d && Some(d) != chain_reg && slot.saturating_sub(*at).saturating_sub(1) < MATRIX_RESULT && *ki != k {
+                    errs.push(here(format!("writes r{d}, an operand instruction {ki} is still reading (WAR, issued {} wait states ago)", slot.saturating_sub(*at).saturating_sub(1))));
                 }
             }
         }
@@ -152,14 +152,14 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
                 valu_write.insert(VCC, slot);
             }
         }
-        slot += 1;
+        slot = slot.saturating_add(1);
     }
 
     if lgkm.iter().chain(vm.iter()).next().is_some() {
         errs.push("sequence ends with DS/VMEM loads outstanding".to_string());
     }
     for (r, (w, wop)) in &matrix_write {
-        if slot - w - 1 < MATRIX_RESULT {
+        if slot.saturating_sub(w).saturating_sub(1) < MATRIX_RESULT {
             let declared = b.exit_in_flight.iter().any(|(x, _)| canon(*x) == *r) && b.outputs.iter().any(|p| canon(p.reg) == *r);
             if !declared {
                 errs.push(format!("end of sequence: r{r}, the result of {wop}, is still in flight and not exported with output_exit (unretired matrix result)"));

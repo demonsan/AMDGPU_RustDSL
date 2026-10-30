@@ -164,7 +164,7 @@ impl Seq {
     /// `ds_write_b32 vaddr, vdata offset:N`: occupies a lgkmcnt slot (no value comes back).
     pub fn ds_write_b32(&mut self, addr: &Vgpr<1>, data: &Vgpr<1>, offset: u16) {
         self.push(AInst { op: "LdsWriteB32", dst: None, srcs: vec![ASrc::Reg(addr.id), ASrc::Reg(data.id)], imm: offset as i64 });
-        let _ = self.issue_load(Queue::Lgkm, ());
+        self.issue_store(Queue::Lgkm);
     }
 }
 
