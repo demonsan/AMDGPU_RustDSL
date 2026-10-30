@@ -79,3 +79,4 @@ REF_CO=/path/to/fwd_hd128_mxfp8.co OUR_KERNEL=fmha_fwd_hd128_mxfp8_t bash tests/
 - **快速路径** `fmha_fwd_hd128_mxfp8_vs128`（仅 own 后端：global->LDS DMA 暂存）：厂商结构（128 键单位、每 128 键 2 个 barrier、DMA 暂存、双 wave 组互补相位）+ 精确参考 recipe（每单位重对齐的 rollback 阈值 120/512、两字 f16 bias、长序列不用 LUT 修正、短序列 <9 tile 用 LUT 修正的第二份代码）+ smfmac 行和 + Q 常驻寄存器。B1H8S2048 **367 TFLOP/s**（厂商 ~514，差 1.40 倍），对 CPU 平均误差 6.9e-4（厂商 2.42e-3），15/15 形状、64 行下 bad=0、确定性 5/5。
 - **精确默认** `fmha_fwd_hd128_mxfp8_t`（llvm-tail 可用）：292 TFLOP/s，mean err 1.25e-3。
 - **实验** `fmha_fwd_hd128_mxfp8_g2`（仅按名字注册，own 后端）：QK(t+1) 放进 V 相位（3-slot ring），输出与 `_vs128` 逐位一致，333/344 TFLOP/s（低于 `_vs128`）；结论与第二代前置条件见 `docs/kernel-gen2-design.md` §6-7 与 `docs/status.md` 第 57 轮。
+- **结论**：FMHA 快速路径为 367 TFLOP/s = 距厂商 1.40 倍；其后测过的所有调度/结构变体均为负或在噪声内，文档化的后续工作需要算法/分块（tile）层面的改变（tile 几何、基于 AGPR 的 512 寄存器 wave、不同的 softmax recipe），而不是调度（见 `docs/gen3-design.md` 第 7-8 节与 `docs/status.md` 第 58 轮）。
