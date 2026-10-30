@@ -87,7 +87,7 @@ pub fn cost(op: MOp) -> OpCost {
         | VCvtF16F32 | VCndmask | VReadSub | VWriteSub | VCmpLtI32 | VCmpGeI32 | VCmpGtI32 | VCmpNeI32 | VCmpLtF32 | VCmpMaskLtI32 | VCmpMaskGeI32 | VCmpMaskGtI32 | VCmpMaskLtF32 | VCndmaskM
         | VAddCoU32 | VAddcCoU32 | VPkAddF32 | VPkMulF32 => c(Valu, 4, 4, Verified),
         // 8 cycles (V): fp8 conversion, permlane32_swap, exp/rcp (no separate trans pipe: 8 + 4k for k adds).
-        VCvtPkFp8F32 | VCvtPkFp8Lo | VCvtPkFp8Hi | VCvtPkFp8F32Hi | VPermlane32Swap | VExpF32 | VRcpF32 => {
+        VCvtPkFp8F32 | VCvtPkFp8Lo | VCvtPkFp8Hi | VCvtPkFp8F32Hi | VPermlane32Swap | VExpF32 | VLogF32 | VRcpF32 => {
             c(Valu, 8, 8, Verified)
         }
         VMulLoU32 => c(Valu, 16, 16, Unknown),

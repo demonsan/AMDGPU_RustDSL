@@ -46,6 +46,7 @@ VPermB32    | V1 <- V1 V1 V1 | {d} = V_PERM_B32_e64 {s0}, {s1}, {s2}, implicit $
 VMax3F32    | V1 <- V1 V1 V1 | {d} = nofpexcept V_MAX3_F32_e64 0, {s0}, 0, {s1}, 0, {s2}, 0, 0, implicit $mode, implicit $exec
 VFmaF32     | V1 <- V1 V1 V1 | {d} = nofpexcept V_FMA_F32_e64 0, {s0}, 0, {s1}, 0, {s2}, 0, 0, implicit $mode, implicit $exec
 VExpF32     | V1 <- V1 | {d} = nofpexcept V_EXP_F32_e32 {s0}, implicit $mode, implicit $exec
+VLogF32     | V1 <- V1 | {d} = nofpexcept V_LOG_F32_e32 {s0}, implicit $mode, implicit $exec
 VRcpF32     | V1 <- V1 | {d} = nofpexcept V_RCP_F32_e32 {s0}, implicit $mode, implicit $exec
 VCvtF32F16  | V1 <- V1 | {d} = nofpexcept V_CVT_F32_F16_e32 {s0}, implicit $mode, implicit $exec
 VCvtF16F32  | V1 <- V1 | {d} = nofpexcept V_CVT_F16_F32_e32 {s0}, implicit $mode, implicit $exec

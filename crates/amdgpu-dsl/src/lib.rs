@@ -228,6 +228,8 @@ pub enum Op {
     CvtPkBf16F32(Opnd, Opnd),
     /// Base-2 exponential: the hardware primitive (_exp_f32), no log2(e) scaling.
     Exp2F32(Opnd),
+    /// Base-2 logarithm: the hardware primitive (v_log_f32).
+    Log2F32(Opnd),
     /// Dwords `index` and `index + 1` (`index` even) of a fragment as a `Frag2` (register alias, no instruction).
     Frag16Pair { frag: Opnd, index: u8 },
     /// A `Frag2` with both dwords set to one 32-bit value.
@@ -262,7 +264,7 @@ impl Op {
             Op::AddF32(..) | Op::SubF32(..) | Op::MulF32(..) | Op::MaxF32(..) | Op::FmaF32(..) => {
                 DType::F32
             }
-            Op::ExpF32(..) | Op::Exp2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } => DType::F32,
+            Op::ExpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } => DType::F32,
             Op::CvtF32ToF16(..) => DType::I32,
             Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
             Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::CmpLtF32(..) | Op::NotI1(..) => DType::I1,
@@ -321,7 +323,7 @@ impl Op {
             | Op::PtrAdd { base: a, byte_off: b } => vec![*a, *b],
             Op::FmaF32(a, b, c) => vec![*a, *b, *c],
             Op::Max3F32(a, b, c) => vec![*a, *b, *c],
-            Op::ExpF32(a) | Op::Exp2F32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
+            Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
                 vec![*a]
             }
             Op::Select { cond, a, b, .. } => vec![*cond, *a, *b],
@@ -831,6 +833,10 @@ impl FnBuilder {
         self.let_(Op::Exp2F32(a.into()))
     }
 
+    pub fn log2_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Log2F32(a.into()))
+    }
+
     pub fn cvt_pk_bf16_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPkBf16F32(a.into(), b.into()))
     }
@@ -1185,7 +1191,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
-                    Op::ExpF32(a) | Op::Exp2F32(a) | Op::RcpF32(a) => {
+                    Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) => {
                         if let Err(e) = expect_float(f, *a, "unary float") {
                             errs.push(here(e));
                         }

@@ -326,6 +326,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[2])
         )],
         MOp::VExpF32 => un(a, inst, "v_exp_f32_e32"),
+        MOp::VLogF32 => un(a, inst, "v_log_f32_e32"),
         MOp::VRcpF32 => un(a, inst, "v_rcp_f32_e32"),
         MOp::VCvtF32F16 => un(a, inst, "v_cvt_f32_f16_e32"),
         MOp::VCvtF16F32 => un(a, inst, "v_cvt_f16_f32_e32"),

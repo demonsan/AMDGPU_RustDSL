@@ -75,6 +75,7 @@ pub enum MOp {
     VPkSubU16,
     VFmaF32,
     VExpF32,
+    VLogF32,
     VRcpF32,
     VCvtF32F16,
     VCvtF16F32,

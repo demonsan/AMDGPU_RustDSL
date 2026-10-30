@@ -7068,7 +7068,20 @@ pub fn fmha_fwd_hd128_mxfp8() -> Function {
     b.finish()
 }
 /// Values shared by the two role loops of the transposed FMHA kernel.
+/// KV-split partial epilogue (`fmha_fwd_hd128_mxfp8_kvsplit`): where this block writes its normalised partial output and LSE.
+#[derive(Clone, Copy)]
+struct KvsCtx {
+    ptr_ohat: ValueId,
+    ptr_lse: ValueId,
+    /// split * rows_total (rows of partial storage before this split)
+    part_row0: ValueId,
+    /// number of query heads (row_lin = (b * S + row) * H + h)
+    heads: ValueId,
+    _unused: ValueId,
+}
+
 struct FmhaTCtx {
+    kvs: Option<KvsCtx>,
     ptr_o: ValueId,
     ptr_k: ValueId,
     ptr_v: ValueId,
@@ -10422,6 +10435,53 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     let inv_l = b.rcp_f32(l_tot);
     let fin = b.mul_f32(inv_l, cx.vd_raw);
+    if let Some(kv) = cx.kvs {
+        // KV-split partial epilogue: Ohat = O * V_descale / l (fp32, normalised) and lse = log2(l) - 512 b_final (the P of this kernel is
+        // 2^(x + 512 b - 127): the additive constants are split-independent and cancel in the combine weights 2^(lse_s - max lse))
+        let bw_u = b.frag2_lane(Opnd::Var(bias2), 0);
+        let bw = b.bitcast_i32(bw_u);
+        let hi_f = b.let_(Op::CvtF16ToF32(Opnd::Val(bw)));
+        let lo_s = b.let_(Op::LshrI32(Opnd::Val(bw), Opnd::Val(c16i)));
+        let lo_f = b.let_(Op::CvtF16ToF32(Opnd::Val(lo_s)));
+        let hl = b.add_f32(hi_f, lo_f);
+        let c2048 = b.c_f32(2048.0);
+        let b512 = b.mul_f32(hl, c2048); // 512 * b = 512 * 4 (hi + lo)
+        let lg_l = b.log2_f32(l_tot);
+        let cneg = b.c_f32(-1.0);
+        let nb_t = b.mul_f32(b512, cneg);
+        let lse_v = b.add_f32(lg_l, nb_t);
+        // linear partial row = split * rows_total + (b * S + row) * H + h
+        let rb = b.mul_i32(cx.bidx, cx.s_len);
+        let rb2 = b.add_i32(rb, cx.row);
+        let rb3 = b.mul_i32(rb2, kv.heads);
+        let rb4 = b.add_i32(rb3, cx.hidx);
+        let prow = b.add_i32(kv.part_row0, rb4);
+        let c512i = b.c_i32(512);
+        let ooff = b.mul_i32(prow, c512i); // 128 fp32 per row
+        let half = b.let_(Op::LshrI32(Opnd::Val(cx.g4), Opnd::Val(c2)));
+        let hb = b.shl_i32(half, c4); // 16 bytes per lane half
+        let ooff2 = b.add_i32(ooff, hb);
+        let o_ptr0 = b.ptr_add(kv.ptr_ohat, ooff2);
+        let lse_off = b.shl_i32(prow, c2);
+        let l_ptr = b.ptr_add(kv.ptr_lse, lse_off);
+        let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
+        b.begin_if(Opnd::Val(wave_live));
+        b.store_f32(l_ptr, 0, lse_v);
+        for e in 0..4usize {
+            for q in 0..4usize {
+                for k in 0..4usize {
+                    let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                    let lanev = b.bitcast_f32(lane);
+                    let v = b.mul_f32(lanev, fin);
+                    // dims 32 e + 8 q + 4 half + k  ->  bytes 128 e + 32 q + 16 half + 4 k
+                    let off = (128 * e + 32 * q + 4 * k) as u32;
+                    b.store_f32(o_ptr0, off, v);
+                }
+            }
+        }
+        b.end_if();
+        return;
+    }
     let ob0 = b.mul_i32(cx.bidx, cx.o_bs);
     let ob1 = b.mul_i32(cx.hidx, cx.o_hs);
     let orow = b.mul_i32(cx.row, cx.o_seqs);
@@ -14773,6 +14833,98 @@ pub fn fmha_fwd_hd128_mxfp8_vsm() -> Function {
     f
 }
 
+/// KV-split kernel (phase 1 of the sequence-parallel attention, docs/kvsplit-design.md): the `_vs128` block shape (256 rows, 512 threads) over one
+/// key range per block; writes normalised fp32 partials (`Ohat`, `lse`) instead of the bf16 output. Kernarg: the 656-byte base ABI + 0x270 `Ohat`,
+/// 0x278 `lse`, 0x280 `splits`, 0x284 `rows_total`; grid `(ceil(S/256), H, B * splits)`.
+pub fn fmha_fwd_hd128_mxfp8_kvsplit() -> Function {
+    VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let f = fmha_t_build("fmha_fwd_hd128_mxfp8_kvsplit", false, true);
+    VS_MODE.store(false, std::sync::atomic::Ordering::SeqCst);
+    f
+}
+
+/// KV-split combine kernel (phase 2): one thread per output element; `m = max_s lse_s`, `w_s = 2^(lse_s - m)`, `out = sum_s w_s Ohat_s / sum_s w_s` (bf16).
+/// Kernarg: 0x00 `Ohat`, 0x08 `lse`, 0x10 `out`, 0x18 `rows_total`, 0x1C `D` (128), 0x20 `splits`; grid `ceil(rows_total * 128 / 256)` x 256 threads.
+pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine() -> Function {
+    let mut b = FnBuilder::new("fmha_fwd_hd128_mxfp8_kvsplit_combine", 256);
+    b.arg("ptr_ohat", DType::Ptr, 0x00, 8);
+    b.arg("ptr_lse", DType::Ptr, 0x08, 8);
+    b.arg("ptr_out", DType::Ptr, 0x10, 8);
+    b.arg("rows_total", DType::I32, 0x18, 4);
+    b.arg("d", DType::I32, 0x1C, 4);
+    b.arg("splits", DType::I32, 0x20, 4);
+    let ohat = b.let_(Op::KernargPtr { offset: 0x00 });
+    let lse = b.let_(Op::KernargPtr { offset: 0x08 });
+    let out = b.let_(Op::KernargPtr { offset: 0x10 });
+    let rows = b.let_(Op::KernargI32 { offset: 0x18 });
+    let splits = b.let_(Op::KernargI32 { offset: 0x20 });
+    let tid = b.let_(Op::WorkitemId);
+    let bx = b.let_(Op::WorkgroupIdX);
+    let c0 = b.c_i32(0);
+    let c2 = b.c_i32(2);
+    let c7 = b.c_i32(7);
+    let c8 = b.c_i32(8);
+    let cm1 = b.c_i32(-1);
+    let bx256 = b.shl_i32(bx, c8);
+    let idx_raw = b.add_i32(bx256, tid);
+    let total = b.shl_i32(rows, c7);
+    let last = b.add_i32(total, cm1);
+    let ok = b.cmp_lt_i32(idx_raw, total);
+    // threads past the end recompute (and re-store) the last element: same value, same address
+    let idx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(idx_raw), b: Opnd::Val(last) });
+    let row = b.let_(Op::LshrI32(Opnd::Val(idx), Opnd::Val(c7)));
+    let neg_big = b.c_f32(-1.0e30);
+    let neg_big_i = b.bitcast_i32(neg_big);
+    let zero_f = b.c_f32(0.0);
+    let zero_i = b.bitcast_i32(zero_f);
+    let inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(neg_big_i)), (DType::I32, Opnd::Val(zero_i)), (DType::I32, Opnd::Val(zero_i))];
+    let vars = b.begin_loop(&inits);
+    let rs = b.mul_i32(vars[0], rows);
+    let lrow = b.add_i32(rs, row);
+    let lse_off = b.shl_i32(lrow, c2);
+    let lp = b.ptr_add(lse, lse_off);
+    let l = b.load_f32(lp, 0);
+    let rs128 = b.shl_i32(rs, c7);
+    let oidx = b.add_i32(rs128, idx);
+    let o_off = b.shl_i32(oidx, c2);
+    let op = b.ptr_add(ohat, o_off);
+    let ov = b.load_f32(op, 0);
+    let m_old = b.bitcast_f32(vars[1]);
+    let acc = b.bitcast_f32(vars[2]);
+    let den = b.bitcast_f32(vars[3]);
+    let m_new = b.max_f32(m_old, l);
+    let neg1 = b.c_f32(-1.0);
+    let dm = b.mul_f32(m_new, neg1);
+    let d_old = b.add_f32(m_old, dm);
+    let d_new = b.add_f32(l, dm);
+    let a = b.exp2_f32(d_old);
+    let w = b.exp2_f32(d_new);
+    let acc_s = b.mul_f32(acc, a);
+    let wv = b.mul_f32(w, ov);
+    let acc_n = b.add_f32(acc_s, wv);
+    let den_s = b.mul_f32(den, a);
+    let den_n = b.add_f32(den_s, w);
+    let m_i = b.bitcast_i32(m_new);
+    let acc_i = b.bitcast_i32(acc_n);
+    let den_i = b.bitcast_i32(den_n);
+    b.set_var(vars[1], m_i);
+    b.set_var(vars[2], acc_i);
+    b.set_var(vars[3], den_i);
+    sched_end_loop(&mut b, vars[0], splits);
+    let accf = b.bitcast_f32(Opnd::Var(vars[2]));
+    let denf = b.bitcast_f32(Opnd::Var(vars[3]));
+    let rd = b.rcp_f32(denf);
+    let res = b.mul_f32(accf, rd);
+    let packed = b.cvt_pk_bf16_f32(res, res);
+    let o_byte = b.shl_i32(idx, c1_const(&mut b));
+    let optr = b.ptr_add(out, o_byte);
+    b.store_u16(optr, 0, packed);
+    b.finish()
+}
+
+fn c1_const(b: &mut FnBuilder) -> ValueId {
+    b.c_i32(1)
+}
 pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     let f = fmha_t_build("fmha_fwd_hd128_mxfp8_vs128", false, true);
@@ -14802,7 +14954,7 @@ pub fn fmha_fwd_hd128_mxfp8_sv() -> Function {
 
 fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let mut b = FnBuilder::new(name, if name.ends_with("_t128") { 256 } else { 512 });
-    let nbuf = if VS_MODE.load(std::sync::atomic::Ordering::SeqCst) { if name.ends_with("_vs128") { 2 } else { 3 } } else if fmha_t_opt("dbuf") { 2 } else { 1 };
+    let nbuf = if VS_MODE.load(std::sync::atomic::Ordering::SeqCst) { if name.ends_with("_vs128") || name.ends_with("_kvsplit") { 2 } else { 3 } } else if fmha_t_opt("dbuf") { 2 } else { 1 };
     if pp {
         b.lds((512 * fmha_t_pitch() + 2048) as u32);
     } else {
@@ -14810,7 +14962,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         let cb = if fmha_t_opt("dma") && !vs_active() { 33280 } else { 256 * fmha_t_pitch() };
         // vendor-structure kernels: + a 2 KB block of E4M3 ones and 16 KB for the per-wave second Q fragment (vs128)
         if vs_active() {
-            b.lds(if name.ends_with("_vs128") { VS128_LDS_BYTES } else if name.ends_with("_g3o") { 4 * 32768 + 2048 } else if name.ends_with("_vsm") || name.ends_with("_g2") || name.ends_with("_g3") || name.ends_with("_t128") { 3 * 32768 + 2048 + 2048 + 16384 + 16384 } else { VS_LDS_BYTES } + pad as u32);
+            b.lds(if name.ends_with("_vs128") || name.ends_with("_kvsplit") { VS128_LDS_BYTES } else if name.ends_with("_g3o") { 4 * 32768 + 2048 } else if name.ends_with("_vsm") || name.ends_with("_g2") || name.ends_with("_g3") || name.ends_with("_t128") { 3 * 32768 + 2048 + 2048 + 16384 + 16384 } else { VS_LDS_BYTES } + pad as u32);
         } else {
             b.lds((nbuf * cb + 2048 + 1024 + 1024 + pad) as u32);
         }
@@ -14842,7 +14994,16 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     b.arg("s_descale_q_Hs", DType::I32, 0x240, 4);
     b.arg("s_descale_k_Bs", DType::I32, 0x250, 4);
     b.arg("s_descale_k_Hs", DType::I32, 0x260, 4);
-    b.arg("abi_tail", DType::I32, 0x280, 16);
+    let is_kvs = name.ends_with("_kvsplit");
+    if is_kvs {
+        // KV-split kernel: the 656-byte base ABI plus the partial buffers and the split count (docs/kvsplit-design.md; harness contract of kernel-occ)
+        b.arg("ptr_ohat", DType::Ptr, 0x270, 8);
+        b.arg("ptr_lse", DType::Ptr, 0x278, 8);
+        b.arg("kvs_splits", DType::I32, 0x280, 4);
+        b.arg("kvs_rows_total", DType::I32, 0x284, 4);
+    } else {
+        b.arg("abi_tail", DType::I32, 0x280, 16);
+    }
 
     let ptr_o = b.let_(Op::KernargPtr { offset: 0x000 });
     let ptr_q = b.let_(Op::KernargPtr { offset: 0x010 });
@@ -14874,7 +15035,25 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let tid_full = b.let_(Op::WorkitemId);
     let qtile = b.let_(Op::WorkgroupIdX);
     let hidx = b.let_(Op::WorkgroupIdY);
-    let bidx = b.let_(Op::WorkgroupIdZ);
+    let zz = b.let_(Op::WorkgroupIdZ);
+    // KV split: grid z = b * splits + split (splits in {2, 4, 8}: log2 = (s >> 1) - (s >> 3))
+    let (bidx, kvs_split, kvs_lg) = if is_kvs {
+        let spl = b.let_(Op::KernargI32 { offset: 0x280 });
+        let ck1 = b.c_i32(1);
+        let ck3 = b.c_i32(3);
+        let cn1 = b.c_i32(-1);
+        let s_h = b.let_(Op::LshrI32(Opnd::Val(spl), Opnd::Val(ck1)));
+        let s_e = b.let_(Op::LshrI32(Opnd::Val(spl), Opnd::Val(ck3)));
+        let s_en = b.mul_i32(s_e, cn1);
+        let lg = b.add_i32(s_h, s_en);
+        let bi = b.let_(Op::LshrI32(Opnd::Val(zz), Opnd::Val(lg)));
+        let one_l = b.shl_i32(ck1, lg);
+        let msk = b.add_i32(one_l, cn1);
+        let sp = b.let_(Op::AndI32(Opnd::Val(zz), Opnd::Val(msk)));
+        (bi, Some(sp), Some(lg))
+    } else {
+        (zz, None, None)
+    };
 
     let c1 = b.c_i32(1);
     let c2 = b.c_i32(2);
@@ -14991,6 +15170,38 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let kd_b = b.mul_i32(bidx, dk_bs);
     let kd_h = b.mul_i32(kvh, dk_hs);
     let kd_base = b.add_i32(kd_b, kd_h);
+    // KV split: this block owns the 128-key tiles [split * tps, min(ntiles, (split + 1) * tps)) of the key range; the K/V/K-scale base offsets are shifted
+    // by the first key so that every key index inside the kernel is relative to it (kv_len := keys of this split)
+    let (kbase_off, vbase_off, kd_base, kv_len) = if let (Some(sp), Some(lg)) = (kvs_split, kvs_lg) {
+        let c127k = b.c_i32(127);
+        let c7k = b.c_i32(7);
+        let cn1 = b.c_i32(-1);
+        let nt_r = b.add_i32(kv_len, c127k);
+        let ntiles = b.let_(Op::LshrI32(Opnd::Val(nt_r), Opnd::Val(c7k)));
+        let one_l = b.shl_i32(c1, lg);
+        let spl_m1 = b.add_i32(one_l, cn1);
+        let tps_r = b.add_i32(ntiles, spl_m1);
+        let tps = b.let_(Op::LshrI32(Opnd::Val(tps_r), Opnd::Val(lg)));
+        let tile_lo = b.mul_i32(sp, tps);
+        let tile_hi_r = b.add_i32(tile_lo, tps);
+        let hi_gt = b.cmp_lt_i32(ntiles, tile_hi_r);
+        let tile_hi = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(hi_gt), a: Opnd::Val(ntiles), b: Opnd::Val(tile_hi_r) });
+        let key_lo = b.shl_i32(tile_lo, c7k);
+        let key_hi_t = b.shl_i32(tile_hi, c7k);
+        let hi_lt = b.cmp_lt_i32(key_hi_t, kv_len);
+        let key_hi = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(hi_lt), a: Opnd::Val(key_hi_t), b: Opnd::Val(kv_len) });
+        let key_lo_n = b.mul_i32(key_lo, cn1);
+        let kv_eff = b.add_i32(key_hi, key_lo_n);
+        let ko = b.mul_i32(key_lo, k_seqs);
+        let vo = b.mul_i32(key_lo, v_seqs);
+        let kdo = b.mul_i32(key_lo, kd_stride);
+        let kb2 = b.add_i32(kbase_off, ko);
+        let vb2 = b.add_i32(vbase_off, vo);
+        let kd2 = b.add_i32(kd_base, kdo);
+        (kb2, vb2, kd2, kv_eff)
+    } else {
+        (kbase_off, vbase_off, kd_base, kv_len)
+    };
 
     // wave-group split (which 4 of the 8 waves form role A): FMHA_OPT split0 = waves 0-3 (default), split1 = even waves, split2 = bit-1 of the wave id.
     // The group-local thread id (rt) must stay a permutation of 0..255 inside a group: rt = 64 * (index of the wave in its group) + lane.
@@ -15173,7 +15384,18 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         }
     }
 
+    let kvs = if is_kvs {
+        let ptr_ohat = b.let_(Op::KernargPtr { offset: 0x270 });
+        let ptr_lse = b.let_(Op::KernargPtr { offset: 0x278 });
+        let rows_total = b.let_(Op::KernargI32 { offset: 0x284 });
+        let heads = b.let_(Op::KernargI32 { offset: 0x140 });
+        let part_row0 = b.mul_i32(kvs_split.expect("split"), rows_total);
+        Some(KvsCtx { ptr_ohat, ptr_lse, part_row0, heads, _unused: rows_total })
+    } else {
+        None
+    };
     let cx = FmhaTCtx {
+        kvs,
         ptr_o,
         ptr_k,
         ptr_v,
@@ -15222,7 +15444,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     };
     // vsx: short sequences (<= 2 tiles of 128 keys) keep the LUT correction (their error does not average out), long ones skip it (-128 VALU per
     // tile): two complete code copies selected once at kernel start
-    let vsx_split = sv && name.ends_with("_vs128") && (vs128_vsx() || fmha_t_opt("corrshort"));
+    let vsx_split = sv && (name.ends_with("_vs128") || is_kvs) && (vs128_vsx() || fmha_t_opt("corrshort"));
     if sv && name.ends_with("_t128") {
         if vs128_vsx() || fmha_t_opt("corrshort") {
             // same two code copies as `_vs128`: sequences with fewer than `cs` (9) tiles of 128 keys keep the LUT correction
