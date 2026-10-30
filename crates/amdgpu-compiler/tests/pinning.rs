@@ -1,7 +1,7 @@
 //! Pinned (hand-authored) instruction runs survive the list scheduler verbatim; the unpinned control is reordered.
-use amdgpu_compiler::mir::*;
+use amdgpu_compiler::mir::{Block, MFunction, MInst, MOp, RClass, Src, VReg};
 use amdgpu_compiler::sched;
-use amdgpu_safeasm::*;
+use amdgpu_safeasm::{Imm, Seq};
 
 /// A straight-line block: independent ALU work followed by a global load and a consumer chain. The list scheduler hoists the long-latency load
 /// above the ALU work when nothing pins it.
