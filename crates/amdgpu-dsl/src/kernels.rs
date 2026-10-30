@@ -15886,7 +15886,7 @@ pub fn pv_window_block() -> amdgpu_safeasm::AsmBlock {
     for pk in p1.take().expect("reads issued") { let _ = pk.wait(&mut s); }
     let rv1 = s.ready(&v1);
     let t1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o1, rv1, rpa, rs127, rs123);
-    p3 = Some(rd(&mut s, &mut v3, trb[3], 1));
+    p3 = Some(rd(&mut s, &mut v3, trb[3], 0));
     for pk in p2.take().expect("reads issued") { let _ = pk.wait(&mut s); }
     let rv2 = s.ready(&v2);
     let t2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o2, rv2, rpa, rs127, rs123);
@@ -15895,18 +15895,18 @@ pub fn pv_window_block() -> amdgpu_safeasm::AsmBlock {
     p4 = Some(rd(&mut s, &mut v4, trb[0], 1));
     for pk in p3.take().expect("reads issued") { let _ = pk.wait(&mut s); }
     let rv3 = s.ready(&v3);
-    let t3 = t3.chain(&mut s, rv3, rpb, rs127, rs123);
+    let t3 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o3, rv3, rpa, rs127, rs123);
     p5 = Some(rd(&mut s, &mut v5, trb[1], 1));
     for pk in p4.take().expect("reads issued") { let _ = pk.wait(&mut s); }
     let rv4 = s.ready(&v4);
     let t0 = t0.chain(&mut s, rv4, rpb, rs127, rs123);
-    p6 = Some(rd(&mut s, &mut v6, trb[2], 2));
+    p6 = Some(rd(&mut s, &mut v6, trb[2], 1));
     for pk in p5.take().expect("reads issued") { let _ = pk.wait(&mut s); }
     let rv5 = s.ready(&v5);
     let t1 = t1.chain(&mut s, rv5, rpb, rs127, rs123);
     let ts = ts.chain(&mut s, rra, rpa, ri23);
     let ts = ts.chain(&mut s, rra, rpb, ri23);
-    p7 = Some(rd(&mut s, &mut v7, trb[3], 2));
+    p7 = Some(rd(&mut s, &mut v7, trb[3], 1));
     for pk in p6.take().expect("reads issued") { let _ = pk.wait(&mut s); }
     let rv6 = s.ready(&v6);
     let t2 = t2.chain(&mut s, rv6, rpb, rs127, rs123);
@@ -15925,7 +15925,6 @@ pub fn pv_window_block() -> amdgpu_safeasm::AsmBlock {
     s.output_exit(exl);
     s.finish().expect("pv_window_block is a verified sequence")
 }
-
 pub fn fmha_fwd_hd128_mxfp8_vs5() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     VS5_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
