@@ -9839,8 +9839,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a1 = b.add_i32(cx.kfx[1], ko);
             let a2 = b.add_i32(cx.kfx[2], ko);
             let a3 = b.add_i32(cx.kfx[3], ko);
-            let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
-            let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
+            let k8_0 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)) };
+            let k8_1 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)) };
             let kd = if let Some(v) = &kd0g {
                 v[s]
             } else if let Some(f) = kdf0 {
@@ -9957,8 +9957,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a1 = b.add_i32(kfb[1], ko);
             let a2 = b.add_i32(kfb[2], ko);
             let a3 = b.add_i32(kfb[3], ko);
-            let k8_0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
-            let k8_1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
+            let k8_0 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)) };
+            let k8_1 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)) };
             let kd = if let Some(v) = kdv {
                 v[s]
             } else if ablate.contains("kdc") {
@@ -10221,7 +10221,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let off = b.c_i32((hh as i32) * 8192 + 2048 * r);
                 addrs.push(b.add_i32(trb[e], off));
             }
-            b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3])
+            if ablate.contains("notr") {
+                let cz = b.c_i32(0x38383838);
+                let f4 = b.frag4(cz, cz, cz, cz);
+                b.cat_frag8(f4, f4)
+            } else {
+                b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3])
+            }
         };
         if fmha_t_opt("pvpipe") {
             // software pipeline: the tr reads of step i+1 are issued before the MFMA of step i (partial lgkmcnt waits, reads in flight
