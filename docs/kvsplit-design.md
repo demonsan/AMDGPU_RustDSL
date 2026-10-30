@@ -78,6 +78,16 @@ Epilogue stores the **normalized** partial and the **log2-domain LSE**:
 Ohat_s(r,:) = O_s(r,:) / l_s(r)          # fp32, divided once per row element
 lse_s(r)    = m_s(r) + log2(l_s(r))      # fp32 (one v_log2_f32 per row)
 ```
+Two implementation details agreed with kernel-opt (they preserve the combine algebra):
+* **Key ranges are 128-key-tile aligned**, not byte-balanced: `ntiles = ceil(SK/128)`,
+  `tps = ceil(ntiles/splits)`, split `i` owns tiles `[i*tps, min(ntiles,(i+1)*tps))`. Every split must own at
+  least one tile, i.e. `(splits-1)*tps < ntiles`; the harness dispatch guard enforces this (Step A writes no
+  `-inf` empty split). For the benchmark (ntiles=16): s=2 -> 8+8 tiles, s=4 -> 4+4+4+4.
+* **`lse` is stored in the kernel's own base-2 domain** where `P = 2^(x + 512 b - 127)` with the carried
+  reference bias `b`, so `lse_s = log2(l_s) - 512 b_final_s` up to a split-independent additive constant. The
+  absolute values are **not** the textbook `m + log2(l)`; only differences between splits of the same row are
+  meaningful, and `w_s = 2^(lse_s - max lse)` is unchanged. The harness treats lse as opaque (it only compares
+  per-row weights), and Ohat already includes the V descale exactly as today's epilogue does.
 Storage: `Ohat`: `[s][rows_total][128] fp32` (or fp16 option, §4); `lse`: `[s][rows_total] fp32`;
 row index = `((b*S + row)*H + h)`, i.e. the same linear order as the output, so the combine writes coalesced
 bf16 output with no transpose. For B1H8S2048 `rows_total = 16384`: Ohat = 8.39 MB per split, lse = 64 KB per split
@@ -125,8 +135,9 @@ histogram (test in §4); if fp32 partials are kept, expect 4e-6-level diffs, not
 
 **Buffers and ABI.** Both kernel families already live behind the 656-byte kernarg ABI in `ref_host`; the split
 kernel is our own code and can extend its own args (the vendor args stay untouched, `ref_host` already patches
-per-kernel fields). Add three fields: `Ohat` pointer, `lse` pointer at 0x270/0x278 (and the grid z decode needs no
-extra arg). Vendored ABI sizes stay at 656 for vendor; ours grows to 0x280/0x290. Buffers are allocated once,
+per-kernel fields). Add four fields: `Ohat` pointer at 0x270, `lse` pointer at 0x278, `u32 splits` at 0x280 and
+`u32 rows_total = B*S*H` at 0x284 (the per-split stride; the kernel cannot derive B from the base args),
+kernarg segment 720 bytes; the vendor/`_vs128`/`_t128` 656-byte ABI is untouched. Vendored ABI sizes stay at 656 for vendor; ours grows to 0x280/0x290. Buffers are allocated once,
 outside the timed region: `Ohat` `s*rows_total*128*4` B, `lse` `s*rows_total*4` B (`rows_total = B*S*H`; gate
 maximum is 16384 rows -> 33.6 MB at s=4, trivial against 192 GB HBM).
 

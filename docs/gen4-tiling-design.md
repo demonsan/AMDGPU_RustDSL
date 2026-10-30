@@ -91,7 +91,8 @@ comb_b   = part_b + rows*D*2                        # combine read + bf16 write 
 T_kv(s)  = max(F / (5.90e12 * min(256, N256*s)),    # phase-1 compute at the measured 2-wave/SIMD rate
                part_b / 4.8e12)                     # measured partial-write BW (partially hidden)
          + comb_b / 7.4e12 + 1.5e-6                 # measured combine BW + launch gap
-use_split = (N256 <= 128) && (N256*s <= 256) && (T_kv(s) < 0.95 * T_cur)
+ntiles   = ceil(SK/128); tps = ceil(ntiles/s)
+use_split = (N256 <= 128) && (N256*s <= 256) && ((s-1)*tps < ntiles) && (T_kv(s) < 0.95 * T_cur)
 ```
 
 * `N256 <= 128` keeps the rule inside the regime where the 256-row grid is under-filled (the certified auto
