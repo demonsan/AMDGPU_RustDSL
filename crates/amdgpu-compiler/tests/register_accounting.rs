@@ -504,7 +504,7 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// cannot emit their MIR), so a `kernel_names()` sweep alone would miss them.
 /// The vendor-structure kernels (mha_fwd_hd128_mxfp8_vs, _vs128) use the own-backend-only DMA MOps too and are audited by name;
 /// _vs128 is skipped while it does not allocate (out of VGPRs, see docs/status.md).
-const DMA_PROBES: &[&str] = &["probe_dma", "probe_dma_tile", "probe_dma_seq", "probe_dma_kread", "probe_dma_map", "fmha_fwd_hd128_mxfp8_vs", "fmha_fwd_hd128_mxfp8_vs128"];
+const DMA_PROBES: &[&str] = &["probe_dma", "probe_dma_tile", "probe_dma_seq", "probe_dma_kread", "probe_dma_map", "fmha_fwd_hd128_mxfp8_vs", "fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_kvsplit"];
 
 fn allocates(name: &str) -> bool {
     match kernel_by_name(name) {
