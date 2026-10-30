@@ -10662,7 +10662,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             if let Some(counters) = kv.counters {
                 // fused combine: release -> ticket (lane 0 adds 1) -> the LAST arriver of the 4 splits of this 32-row tile reduces the partials in fixed order
                 let nsp = fmha_t_num("fs").unwrap_or(4) as usize;
-                b.fence_release();
+                let lite = fmha_t_opt("fusedlite"); // waits only (no buffer_wbl2 / buffer_inv): valid because every shared store is write-through and every shared load coherent
+                if lite { b.fence_release_lite(); } else { b.fence_release(); }
                 let lane0 = b.cmp_lt_i32(lane_q, c1);
                 let one_v = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lane0), a: Opnd::Val(c1), b: Opnd::Val(c0) });
                 let c5f = b.c_i32(5);
@@ -10683,7 +10684,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let c_last = b.c_i32(nsp as i32 - 1);
                 let is_last = b.let_(Op::CmpGeI32(Opnd::Val(old0), Opnd::Val(c_last)));
                 b.begin_if(Opnd::Val(is_last));
-                b.fence_acquire();
+                if lite { b.fence_acquire_lite(); } else { b.fence_acquire(); }
                 let rows_tot = b.let_(Op::KernargI32 { offset: 0x284 });
                 let lr = b.let_(Op::LshrI32(Opnd::Val(lane_q), Opnd::Val(c1)));
                 let hh = b.let_(Op::AndI32(Opnd::Val(lane_q), Opnd::Val(c1)));
