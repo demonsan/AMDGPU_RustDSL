@@ -16977,6 +16977,25 @@ pub fn probe_cvtchain_asm() -> Function {
     probe_cvtchain("probe_cvtchain_asm", true)
 }
 
+/// out[2*tid] = tid + 1000, out[2*tid+1] = tid + 2000 through one `global_store_dwordx2` per lane (covers the x2 store on both backends).
+pub fn probe_store_x2() -> Function {
+    let mut b = FnBuilder::new("probe_store_x2", 64);
+    b.arg("outp", DType::Ptr, 0, 8);
+    let outp = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c8 = b.c_i32(8);
+    let c1000 = b.c_i32(1000);
+    let c2000 = b.c_i32(2000);
+    let a = b.add_i32(tid, c1000);
+    let c = b.add_i32(tid, c2000);
+    let f2 = b.frag2(a, c);
+    let off = b.mul_i32(tid, c8);
+    let po = b.ptr_add(outp, off);
+    b.store_f32x2(po, 8, f2);
+    b.store_f32x2(po, 0, f2); // offset 0 and a non-zero offset form
+    b.finish()
+}
+
 pub fn probe_log_store4() -> Function {
     // out[4*tid + j] = log2(in[tid]) for j in 0..4: covers v_log_f32 and global_store_dwordx4 on both backends
     let mut b = FnBuilder::new("probe_log_store4", 64);
