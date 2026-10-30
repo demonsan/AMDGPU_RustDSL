@@ -389,6 +389,8 @@ pub enum Stmt {
     StoreF32 { base: Opnd, byte_off: u32, value: Opnd },
     /// 16-byte global store of a Frag4 (`global_store_dwordx4`).
     StoreF32x4 { base: Opnd, byte_off: u32, value: Opnd },
+    /// 8-byte global store of a Frag2 (`global_store_dwordx2`).
+    StoreF32x2 { base: Opnd, byte_off: u32, value: Opnd },
     /// Device-scope write-through stores (`sc1`): visible to coherent loads / atomics of other workgroups on other XCDs.
     StoreF32Wt { base: Opnd, byte_off: u32, value: Opnd },
     StoreF32x4Wt { base: Opnd, byte_off: u32, value: Opnd },
@@ -503,6 +505,9 @@ impl Function {
                 }
                 Stmt::StoreF32x4 { base, byte_off, value } => {
                     let _ = writeln!(s, "{pad}store f32x4 [{base:?}+{byte_off}] <- {value:?}");
+                }
+                Stmt::StoreF32x2 { base, byte_off, value } => {
+                    let _ = writeln!(s, "{pad}store f32x2 [{base:?}+{byte_off}] <- {value:?}");
                 }
                 Stmt::StoreF32Wt { base, byte_off, value } => {
                     let _ = writeln!(s, "{pad}store.wt f32 [{base:?}+{byte_off}] <- {value:?}");
@@ -660,6 +665,10 @@ impl FnBuilder {
 
     pub fn store_f32(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::StoreF32 { base: base.into(), byte_off, value: value.into() });
+    }
+
+    pub fn store_f32x2(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::StoreF32x2 { base: base.into(), byte_off, value: value.into() });
     }
 
     pub fn store_f32x4(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
@@ -1617,7 +1626,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::StoreF32x4 { base, .. } | Stmt::StoreF32x4Wt { base, .. } => {
+            Stmt::StoreF32x4 { base, .. } | Stmt::StoreF32x4Wt { base, .. } | Stmt::StoreF32x2 { base, .. } => {
                 if let Err(e) = expect_ptr(f, *base, "store") {
                     errs.push(here(e));
                 }
@@ -1945,7 +1954,7 @@ pub mod kernels;
 fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
     match st {
         Stmt::Let { op, .. } => op.operands(),
-        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32Wt { base, value, .. } | Stmt::StoreF32x4Wt { base, value, .. } => vec![*base, *value],
+        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32Wt { base, value, .. } | Stmt::StoreF32x4Wt { base, value, .. } | Stmt::StoreF32x2 { base, value, .. } => vec![*base, *value],
         Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => vec![],
         Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } => vec![*addr, *value],
         Stmt::LoadGlobalLds { base, lds_addr, .. } => vec![*base, *lds_addr],

@@ -558,6 +558,12 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         )],
         MOp::BufferWbl2 => vec!["buffer_wbl2 sc1".to_string()],
         MOp::BufferInv => vec!["buffer_inv sc1".to_string()],
+        MOp::GlobalStoreF32x2 => vec![format!(
+            "global_store_dwordx2 {}, {}, off{}",
+            pair(a, reg_of(&inst.srcs[0])),
+            pair(a, reg_of(&inst.srcs[1])),
+            if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
+        )],
         MOp::GlobalStoreF32x4 => vec![format!(
             "global_store_dwordx4 {}, {}, off{}",
             pair(a, reg_of(&inst.srcs[0])),

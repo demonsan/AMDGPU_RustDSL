@@ -219,6 +219,9 @@ fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
         MOp::GlobalStoreF32 => {
             e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 4 })
         }
+        MOp::GlobalStoreF32x2 => {
+            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 8 })
+        }
         MOp::GlobalStoreF32x4 => {
             e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 16 })
         }

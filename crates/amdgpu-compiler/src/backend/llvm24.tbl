@@ -93,6 +93,7 @@ GlobalAtomicAddRet | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_ADD_RTN {s0}, {s1}, {imm}
 BufferWbl2 | <- | BUFFER_WBL2 16, implicit $exec
 BufferInv | <- | BUFFER_INV 16, implicit $exec
 GlobalStoreF32x4 | <- V2 V4 | GLOBAL_STORE_DWORDX4 {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s128), addrspace 1)
+GlobalStoreF32x2 | <- V2 V2 | GLOBAL_STORE_DWORDX2 {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s64), addrspace 1)
 SLoadDword  | S1 <-    | {d} = S_LOAD_DWORD_IMM $sgpr0_sgpr1, {imm}, 0 :: (dereferenceable invariant load (s32), addrspace 4)
 SLoadDwordx2 | S2 <-   | {d} = S_LOAD_DWORDX2_IMM $sgpr0_sgpr1, {imm}, 0 :: (dereferenceable invariant load (s64), addrspace 4)
 SReadPhys   | S1 <-    | {d} = S_MOV_B32 {ps}
