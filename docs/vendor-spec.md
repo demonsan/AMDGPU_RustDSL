@@ -1291,6 +1291,58 @@ saving **~2.5-3.5 us = +9-13% on the shipped path**, not the full 5 us. At 28.4 
    (zero), barrier count (already 2 = vendor), setprio (already 1 pair), safe-asm global replacement
    (not applicable), dsplit/dmah/min_i32/barrier variants (negative list).
 
+## 7.10.2 Safe-asm inner-window certification baseline (control experiment)
+
+Frozen before the `_vs128` hand-authored inner window lands, so its effect is unambiguous. GPU 5 on
+**Main `c63e209`** (the most recent Main at freeze time; includes kddma + the round-62 close-out),
+`_vs128` built with the default `FMHA_OPT` and the own backend; vendor `ref_mxfp8.co` measured in the
+same process/run; warm protocol `REF_WARMUP=200`, `REF_ITERS=100`, best and median of 5 (node shared -
+wall is noisy; medians are quoted too).
+
+**Performance baseline (freeze):**
+
+| metric | value |
+|---|---|
+| `_vs128` B1H8S2048, 64 blocks (2 waves/SIMD, 256 CUs) | **best 390.1 TFLOP/s (0.0440 ms), median 385.1** |
+| per-CU | **6.10 TF/CU best / 6.02 median** |
+| vendor same run (64 blocks) | **537.4 TFLOP/s = 8.40 TF/CU** => **1.38x per-CU gap** |
+| filled shape B4H8S2048 absolute (256 blocks) | **1225-1258 TFLOP/s (certified baseline; see note)** |
+| filled shape B1H8S8192 absolute (256 blocks) | ~1833-1864 TFLOP/s (certified baseline) |
+| correctness reference md5 (bf16 output dump, B1H8S2048, 4,194,304 B) | **8074adbfddbd4db7ec5fb0adaa605478** |
+| CPU gate | bad=0 on 2048 checked rows, worst_err 6.627e-3, mean_err **7.3333e-4** |
+| auto path gate @16 rows | **15/15 REF_KERNEL_OK, parity 15/15, ours bad=0** |
+
+Note on the filled absolute: the frozen numbers are the certified same-run values from the KV-split
+certification; a quick re-measure during the freeze window hit a heavily loaded node (B4H8S2048 best only
+824.7 vs vendor 1135.4; B1H8S8192 1184.5 vs vendor 1516.6) - those are contention artefacts, kept only
+here to show they must not be used as absolutes. Window validation will compare the **same-run best/median
+and same-run ratio** and use 1225-1258 as the independent absolute cross-check on a quiet node.
+
+**Counter baseline (per wave-iteration, same run, rocprofv3 1.1.0; vendor -> ours):**
+
+| counter | vendor | ours | delta |
+|---|---|---|---|
+| SQ_WAVE_CYCLES | 1148.1 | **1569.3** | +421.3 |
+| SQ_VALU_MFMA_BUSY_CYCLES (XDL) | 1124.3 | **1273.0** | +148.7 |
+| SQ_WAIT_INST_ANY (issue wait) | 336.5 | **533.0** | +196.5 |
+| SQ_WAIT_ANY (dependency wait) | 430.6 | **545.2** | +114.6 |
+| SQ_WAIT_INST_LDS | 33.2 | 17.6 | -15.6 |
+| SQ_ACTIVE_INST_VALU | 293.8 | 401.1 | +107.3 |
+| SQ_INSTS_VALU | 250.9 | 351.1 | +100.2 |
+| - INT32 / other-VALU | 10.9 / 79.6 | 60.3 / 139.7 | +49.4 / +60.0 |
+| SQ_INSTS_LDS / SQ_INSTS_VMEM | 52.5 / 5.7 | 52.3 / 7.6 | -0.2 / +2.0 |
+| SQ_IFETCH | 81.4 | 101.0 | +19.5 |
+| SQ_INST_LEVEL_LDS / _VMEM | 32.1 / 55.5 | 31.5 / 125.4 | -0.6 / +70.0 |
+| LDS bank conflicts | 0 | 0 | 0 |
+
+This is the exact control: the safe-asm window must (a) keep the **md5 identical** (arithmetic unchanged),
+(b) move **WAIT_INST_ANY down / XDL busy up / wave cycles down**, not merely reshuffle waits, (c) improve
+per-CU best/median and the filled-shape absolute in the same run, (d) keep the auto-path gate 15/15 at
+16 rows and determinism 5/5, with the KV-split dispatch unchanged. Earlier pre-tag snapshot for
+traceability (kernel-opt `07cae94`): 390.2 TFLOP/s; WAIT_INST_ANY 527.3; WAIT_ANY 516.4; XDL 1216; wave
+cycles 1549.1 - the small differences to `c63e209` above are the round-62 kernel changes, so `c63e209`
+is the frozen control.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as

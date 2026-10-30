@@ -261,3 +261,59 @@ software-pipelined loops are still not modelled); and anything outside a safe bl
 an unchecked IR for hand-written code). The independent round-3 evidence above (byte-identical `_vs128` assembly,
 15/15 + 12/3 gates matching the default, 5/5 determinism, equal timing) is what upgrades the claim from "inside its
 own API" to "usable in the real kernel".
+
+## Loop-level contract: adversarial opinion (kernel-occ, validator)
+
+**Verdict: a loop-level contract can be enforced well enough to trust a hand-authored window, but the
+current design does not yet do it - for the cross-iteration part where the window's win lives, the trust
+boundary today is still "the author plus the MIR hazard pass". Ship the window opt-in; make it default only
+after the three conditions below.**
+
+Why the current guarantee does not cover a loop:
+1. **The verifier is straight-line and starts its clock at 0.** `verify_block` walks one `Seq` with its own
+   clock, requires no outstanding DS/VMEM loads at the end and allows matrix writes in flight only if
+   declared via `output_exit`/`exit_in_flight`. It has no notion of a back edge, fixed point, or entry state.
+   `Stmt::VarAsm` carries **values** through in/out ports, not scoreboard in-flight state. A window that
+   overlaps tile N's VALU with tile N-1's MFMA (exactly what recovers issue overlap) needs a non-empty
+   entry state; the verifier cannot check the first/last iteration distances or loop-carried WAR/WAW. The
+   MIR hazard pass is then the only net, and it does not know the author's intended in-flight set.
+2. **Coverage is partial by design.** The coverage matrix has 54 raw-only ops out of 91 backend-table rows:
+   `v_exp`/`v_rcp`, `v_pk_*_f32`, `v_permlane32_swap`, carry ops, the 16x16/32x32x8 f16/fp8 MFMAs,
+   `ds_write_b128`, scalar-address global loads, etc. A real inner window needs several of these; using
+   them through the raw MOp escape hatch leaves the safe-path guarantee, and the verifier pattern-matches
+   only the op classes it knows (`VMfma`/`VSmfmac`/`V*`/loads), so packed-result hazards, multi-dword DS
+   store hazards and transcendental wait classes are not modelled. The crate's own doc admits this.
+3. **The static-contract precedent is linear, not CFG-aware.** `asm_check::check_lite_contract` explicitly
+   says "a drain on any path before the use counts" and "control flow is not followed"; exact for the
+   straight-line release, but a loop contract cannot be enforced by that style of checker on the loop back
+   edge.
+
+What an enforceable loop contract needs (all feasible, none free):
+* **Drain-closed block boundaries or explicit state.** Either require the loop-bound block to enter and
+  exit with no matrix ops in flight and no outstanding DS/VMEM loads (all outputs retired; forbid
+  `output_exit` in loops) - then the per-iteration verifier composes and trust reduces to arithmetic
+  intent - or add `Seq<Entry, Exit>` state tokens and a fixed-point check that the entry state equals the
+  exit state each iteration (and that first-iteration entry matches the loop prologue, last-iteration exit
+  matches the epilogue).
+* **Op whitelist for loop-bound blocks**: only generated typed templates (extend `opspec.tbl`/verifier to
+  cover the ops the window actually needs), or an explicit verifier rule per raw op used; reject unknown
+  raw MOps in a loop context.
+* **Verify at the right level**: run the verifier on the final lowered + scheduled MIR/asm with CFG
+  (including the back edge), not only on the `Seq`; the list/SWP scheduler is allowed to add waits, never
+  remove them, but the final asm must be re-checked because block boundaries can move. Add the CFG-aware
+  loop check alongside `asm_check` (a linear checker is not enough).
+* **Independent validation is still mandatory**: md5 bit-identity vs `_vs128`, the counter direction
+  (WAIT_INST_ANY down, XDL busy up, wave cycles down), same-run per-CU/filled timing, and the 15-shape
+  gate/determinism through the auto path. A contract can prove legality, not that the window implements
+  the right arithmetic.
+
+Residual "trust the author" even with the contract: fragment contents/scale semantics/index patterns
+(value correctness), and anything outside a safe block. Those cannot be typed away by a loop contract;
+they are covered by the bit-identical md5 gate and the CPU/vendor correctness gates.
+
+**Recommendation:** opt-in first. The minimal defensible contract for this window is a **drain-closed
+per-tile block** (start/end no matrix in flight, no outstanding loads, all ops typed or verifier-covered,
+`VarAsm` in/out ports only); if the window must pipeline across tiles, require the explicit `Seq<Entry,Exit>`
+fixed-point contract before it can be a default path. Until then a green hardware run is evidence about the
+tested schedules, not a proof.
+
