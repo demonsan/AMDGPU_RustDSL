@@ -1,4 +1,4 @@
-﻿# Gen5 window spec: the hand-authored (safe-asm) inner tile window of `_vs128`
+# Gen5 window spec: the hand-authored (safe-asm) inner tile window of `_vs128`
 
 Status: **spec + scaffolding** (kernel-opt, 2026-10-30). Target kernel `fmha_fwd_hd128_mxfp8_vs5` (registered, builds, asm and output bit-identical to `_vs128`:
 `diff` of the emitted `.s` = 0 lines, md5 faadf00c / c8b7a893 / d17778b0 on 1 8 2048 2048, 4 8 2048 2048, 3 3 768 1280). Everything below was extracted from the
@@ -99,3 +99,29 @@ check at every step.
 * Step 1: replace Block C (PV + SMFMAC, the part that is already mostly typed) by `Op::Asm`; gate = md5 identical + timing >= `_vs128`.
 * Step 2: Block A (max chain + decision) as asm; Step 3: Block B with the QK interleave (the actual win); each step gated by md5 + 15 shapes + determinism, the per-CU gain is measured at Step 3.
 * Selection by `FMHA_OPT=gen5w` inside `emit_fmha_vs128_role` for `_vs5` only (so `_vs128`, the t128 / KV-split paths are untouched until the gate is passed).
+
+## 7. Drain-closed boundary (explicit contract, for kernel-occ's validation) and the integration switch
+**Rule**: the overlap lives WITHIN one tile window; every loop iteration boundary (the back edge, i.e. after barrier B2 and before Block A of the next tile) is drained:
+* **No matrix instruction in flight and no unresolved DS load / VMEM load across the back edge.** Block C ends with the 20-state retire of the last PV accumulator and the last
+  in-place SMFMAC (the builder's `retire(&mut seq)` padding; the `s_nop` padding sits in the shadow of the `s_waitcnt lgkmcnt(0)` + `s_barrier` that follow, so it costs ~0 on the critical path
+  of the faster group), then `s_waitcnt lgkmcnt(0)`, then `s_barrier` (B2). The QK(t+1) MFMAs (the S(t+1) tiles) are issued in Block B, i.e. before barrier B1 and before the whole of Block C
+  (8 PV MFMA + 4 SMFMAC = ~700 XDL cycles), so they are long retired (>> 20 states) at the back edge; their results are resolved values in VGPRs, not in-flight matrix results.
+  (Today's DSL `_vs128` is NOT drain-closed in this sense: its QK(t+1) MFMAs are the last matrix instructions of the M phase and are in flight at barrier B2, covered by the MIR hazard pass;
+  the gen5 order removes that.)
+* The DMA of tile t+1 is issued in Block A and waited with `s_waitcnt vmcnt(0)` before barrier B1 (the 2-slot ring: the same as `_vs128`); the K-scale `global_load_lds_dword` is part of the same
+  vmcnt group. At the back edge vmcnt = 0 and lgkmcnt = 0 (wait clock 0 for both counters).
+* **The only cross-iteration state is VALUES in VGPRs and loop variables**: the O accumulators (4 x 16 fp32, already retired), the row sums `la` (Frag4, retired), the bias word `bias2` (loop var),
+  the S(t+1) scores (4 x 16 fp32, produced by retired MFMAs), and the scalar loop counters; no P words (P(t) is produced in Block B and consumed in Block C of the SAME iteration), no K/V
+  fragments, no K scales (re-read every tile), no pending Ready/Pending/Mfma token. Entry wait clock of every iteration = 0 for lgkmcnt and vmcnt and "all matrix results retired".
+* Inside the window: Block B -> barrier B1 -> Block C is straight-line, only the rollback `begin_if(grow)` sits between Block A and Block B (it is a wave-level branch; its live-in/out set
+  = S(t), O, la, bias word, delta/grow; at both of its edges the wait clock is 0 for lgkmcnt and the matrix state is "O accumulators retired" because the rescale `v_pk_mul_f32` reads O).
+* Straight-line blocks end at every `s_barrier` and at the branch: the asm blocks never span a barrier (the loop contract carries the (drained) wait clock across it).
+**Integration switch**: `_vs5` with `FMHA_OPT=winasm` (`vs5_winasm_requested()` in `kernels.rs`, called at the top of `emit_fmha_vs128_role`; today it stops with an explicit message because the ops do not exist
+yet); without the flag `_vs5` is byte-identical to `_vs128` (control point). Swap order: Block C -> Block A -> Block B, each verified by md5 (same arithmetic) + 15 shapes + determinism.
+
+## 8. Where the gain is expected, and how it is attributed
+The win is expected from **Block B** (QK(t+1) issued under the V-side VALU, i.e. the in-wave overlap that the scheduler never produced). Block C (PV + SMFMAC) and Block A (max chain + decision + DMA issue)
+swaps are *not* expected to move performance by themselves (they re-express instructions the scheduler already emits in about this order) and are gated separately - md5 (same arithmetic) + 15 shapes + determinism +
+timing after EACH swap - so that any gain or loss is attributed to the block that caused it. The gen5 window is also not just a reordering: it changes the cross-barrier contract (section 7: `_vs128` has the QK(t+1) MFMAs
+in flight at barrier B2, gen5 retires them inside the window), so a timing difference after Block B includes that effect. Reporting format for every step: asm md5 (emitted `.s`) AND the bf16 output-dump md5 (`REF_DUMP2`, 4194304
+bytes for B1H8S2048) next to kernel-occ's frozen table.

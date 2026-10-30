@@ -9529,6 +9529,10 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 
 /// 128-key-unit variant of the vendor-structure kernel (mha_fwd_hd128_mxfp8_vs128): one rollback decision and two barriers per 128 keys.
 fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
+    let win_c = vs5_win("winc");
+    let win_m = vs5_win("winm");
+    let _win_a = vs5_win("wina");
+    let _win_b = vs5_win("winb");
     let ablate = std::env::var("FMHA_ABLATE").unwrap_or_default();
     let no_bar = ablate.contains("nobar");
     let nobar1 = ablate.contains("nobar1"); // drop the V->M barrier only
@@ -10314,6 +10318,14 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let l_new_i = b.bitcast_i32(l_new);
             b.set_var(la, l_new_i);
         };
+        if win_c && smfrs && smfv {
+            // Block C: the whole PV window (16 V-fragment reads, 8 PV MFMAs, 4 row-sum SMFMACs) as one pinned safe-asm block
+            let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            let pb = b.frag8(w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+            let ins = [Opnd::Val(trb[0]), Opnd::Val(trb[1]), Opnd::Val(trb[2]), Opnd::Val(trb[3]), Opnd::Val(pa), Opnd::Val(pb), Opnd::Val(a_rs), Opnd::Val(idx01), Opnd::Val(idx23), Opnd::Val(c127), Opnd::Val(c123)];
+            b.var_asm_n(&[o_vars[0], o_vars[1], o_vars[2], o_vars[3], la], pv_window_block(), &ins);
+            return;
+        }
         if smfrs {
             let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             let pb = b.frag8(w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
@@ -10468,6 +10480,21 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
             }
             pv_w(b, slot_cur, &w);
+        } else if win_m && stage && smfrs && smfv && q0_reg && !fmha_t_opt("qonce") && !fmha_t_opt("biasonce") && !fmha_t_opt("biasv") {
+            // Block M: PV(t) + QK(t+1) (bias MFMAs, K reads, K scales, QK MFMAs) + row sums as ONE pinned safe-asm block
+            let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot_nxt)).collect();
+            let kd_rd = b.add_i32(kd_cur, kds_nxt);
+            let sh16 = b.add_i32(cx.g8, c16i);
+            let q1v = load_q1(b);
+            let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot_cur)).collect();
+            let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            let pb = b.frag8(w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+            let ins = [
+                Opnd::Val(kfb[0]), Opnd::Val(kfb[1]), Opnd::Val(kfb[2]), Opnd::Val(kfb[3]), Opnd::Val(kd_rd), Opnd::Val(cx.g8), Opnd::Val(sh16),
+                Opnd::Val(cx.b0), Opnd::Val(q1v), Opnd::Val(sq0m), Opnd::Val(sq1m), Opnd::Val(ones_f16), Opnd::Val(bias_now),
+                Opnd::Val(trb[0]), Opnd::Val(trb[1]), Opnd::Val(trb[2]), Opnd::Val(trb[3]), Opnd::Val(pa), Opnd::Val(pb), Opnd::Val(a_rs), Opnd::Val(idx01), Opnd::Val(idx23), Opnd::Val(c127), Opnd::Val(c123),
+            ];
+            b.var_asm_n(&[s_vars[0], s_vars[1], s_vars[2], s_vars[3], o_vars[0], o_vars[1], o_vars[2], o_vars[3], la], pv_qk_window_block(), &ins);
         } else {
             pv_w(b, slot_cur, &w);
             if stage && fmha_t_opt("midbar") && !no_bar {
@@ -15891,13 +15918,337 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4h() -> Function {
 }
 /// `_vs5` (gen5 scaffolding, docs/gen5-window-spec.md): identical to `_vs128` in everything except that its inner tile window is meant to be replaced by a
 /// hand-authored safe-asm window (`Op::Asm`). While the window is still the DSL one it must be bit-identical to `_vs128` (control point).
+/// Set while `_vs5` is being built: only then does `FMHA_OPT=winasm` swap the DSL window of `emit_fmha_vs128_role` for the safe-asm window.
+static VS5_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Block C of docs/gen5-window-spec.md (`FMHA_OPT=winc` on `_vs5`): the PV window of one tile (8 scaled MFMAs on the four O accumulators with the V fragments read by
+/// `ds_read_b64_tr_b8` in a one-step software pipeline, plus the four in-place row-sum SMFMACs), authored in safe Rust and PINNED (order preserved verbatim).
+/// Ports: inout o0..o3 (Frag16), inout la (Frag4); in trb0..trb3 (tile slot + e column address), pa, pb (P words), a_rs, idx01, idx23, c127, c123.
+pub fn pv_window_block() -> amdgpu_safeasm::AsmBlock {
+    use amdgpu_safeasm::{In, Pending, Seq, SubMut, Vgpr};
+    fn rd<'a>(s: &mut Seq, v8: &'a mut Vgpr<8>, addr: &In<1>, hh: usize) -> [Pending<SubMut<'a, 2>>; 4] {
+        let [d0, d1, d2, d3] = s.split_pairs_mut(v8);
+        if hh == 0 {
+            [s.ds_read_b64_tr_b8::<0, _>(d0, addr), s.ds_read_b64_tr_b8::<2048, _>(d1, addr), s.ds_read_b64_tr_b8::<4096, _>(d2, addr), s.ds_read_b64_tr_b8::<6144, _>(d3, addr)]
+        } else {
+            [s.ds_read_b64_tr_b8::<8192, _>(d0, addr), s.ds_read_b64_tr_b8::<10240, _>(d1, addr), s.ds_read_b64_tr_b8::<12288, _>(d2, addr), s.ds_read_b64_tr_b8::<14336, _>(d3, addr)]
+        }
+    }
+    /// wait for the four reads of one operand with ONE s_waitcnt (the last-issued read first: it implies the older three)
+    fn wait4(s: &mut Seq, p: [Pending<SubMut<'_, 2>>; 4]) {
+        let [p0, p1, p2, p3] = p;
+        let _ = p3.wait(s);
+        let _ = p2.wait(s);
+        let _ = p1.wait(s);
+        let _ = p0.wait(s);
+    }
+    let mut s = Seq::new();
+    s.pin();
+    let o0 = s.inout::<16>();
+    let o1 = s.inout::<16>();
+    let o2 = s.inout::<16>();
+    let o3 = s.inout::<16>();
+    let la = s.inout::<4>();
+    let trb0 = s.input::<1>();
+    let trb1 = s.input::<1>();
+    let trb2 = s.input::<1>();
+    let trb3 = s.input::<1>();
+    let pa = s.input::<8>();
+    let pb = s.input::<8>();
+    let a_rs = s.input::<4>();
+    let idx01 = s.input::<1>();
+    let idx23 = s.input::<1>();
+    let c127 = s.input::<1>();
+    let c123 = s.input::<1>();
+    let (rpa, rpb, rra, ri01, ri23, rs127, rs123) = (s.ready(&pa), s.ready(&pb), s.ready(&a_rs), s.ready(&idx01), s.ready(&idx23), s.ready(&c127), s.ready(&c123));
+    let mut v0 = s.vgpr::<8>();
+    let mut v1 = s.vgpr::<8>();
+    let mut v2 = s.vgpr::<8>();
+    let mut v3 = s.vgpr::<8>();
+    let mut v4 = s.vgpr::<8>();
+    let mut v5 = s.vgpr::<8>();
+    let mut v6 = s.vgpr::<8>();
+    let mut v7 = s.vgpr::<8>();
+    let trb = [&trb0, &trb1, &trb2, &trb3];
+    let p0 = rd(&mut s, &mut v0, trb[0], 0);
+    let p1 = rd(&mut s, &mut v1, trb[1], 0);
+    let p2 = rd(&mut s, &mut v2, trb[2], 0);
+    wait4(&mut s, p0);
+    let rv0 = s.ready(&v0);
+    let t0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o0, rv0, rpa, rs127, rs123);
+    let p3 = rd(&mut s, &mut v3, trb[3], 0);
+    wait4(&mut s, p1);
+    let rv1 = s.ready(&v1);
+    let t1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o1, rv1, rpa, rs127, rs123);
+    let p4 = rd(&mut s, &mut v4, trb[0], 1);
+    wait4(&mut s, p2);
+    let rv2 = s.ready(&v2);
+    let t2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o2, rv2, rpa, rs127, rs123);
+    let ts = s.v_smfmac_f32_16x16x128_fp8_fp8(la, rra, rpa, ri01);
+    let ts = ts.chain(&mut s, rra, rpb, ri01);
+    let p5 = rd(&mut s, &mut v5, trb[1], 1);
+    wait4(&mut s, p3);
+    let rv3 = s.ready(&v3);
+    let t3 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o3, rv3, rpa, rs127, rs123);
+    let p6 = rd(&mut s, &mut v6, trb[2], 1);
+    wait4(&mut s, p4);
+    let rv4 = s.ready(&v4);
+    let t0 = t0.chain(&mut s, rv4, rpb, rs127, rs123);
+    let p7 = rd(&mut s, &mut v7, trb[3], 1);
+    wait4(&mut s, p5);
+    let rv5 = s.ready(&v5);
+    let t1 = t1.chain(&mut s, rv5, rpb, rs127, rs123);
+    let ts = ts.chain(&mut s, rra, rpa, ri23);
+    let ts = ts.chain(&mut s, rra, rpb, ri23);
+    wait4(&mut s, p6);
+    let rv6 = s.ready(&v6);
+    let t2 = t2.chain(&mut s, rv6, rpb, rs127, rs123);
+    wait4(&mut s, p7);
+    let rv7 = s.ready(&v7);
+    let t3 = t3.chain(&mut s, rv7, rpb, rs127, rs123);
+    let ex0 = t0.exit();
+    s.output_exit(ex0);
+    let ex1 = t1.exit();
+    s.output_exit(ex1);
+    let ex2 = t2.exit();
+    s.output_exit(ex2);
+    let ex3 = t3.exit();
+    s.output_exit(ex3);
+    let exl = ts.exit();
+    s.output_exit(exl);
+    s.finish().expect("pv_window_block is a verified sequence")
+}
+/// Block M of docs/gen5-window-spec.md (`FMHA_OPT=winm` on `_vs5`): the WHOLE M phase of a tile as one pinned safe-asm block: 4 bias MFMAs (f16), PV (8 scaled MFMAs, V fragments by
+/// `ds_read_b64_tr_b8`), QK(t+1) (8 scaled MFMAs accumulating into the S tiles, K fragments by `ds_read_b128`, K scales by `ds_read_b32` + VGPR shifts) and the four in-place row-sum
+/// SMFMACs, in the order the list scheduler produces today (bias x4, PV half 0 x4, QK first MFMA x4, PV half 1 x4, QK second MFMA x4, SMFMAC pairs after item 7 and at the end),
+/// with a two-item read lookahead and exact partial lgkmcnt waits from the Pending tokens. Control block: expected neutral.
+/// Inout ports: S0..S3, O0..O3 (Frag16), la (Frag4). Inputs: kfb0..3, kdrd, g8, sh16, q0, q1, sq0, sq1, ones, bias, trb0..3, pa, pb, a_rs, idx01, idx23, c127, c123.
+pub fn pv_qk_window_block() -> amdgpu_safeasm::AsmBlock {
+    use amdgpu_safeasm::{In, Pending, Seq, SubMut, Vgpr};
+    fn rd_v<'a>(s: &mut Seq, v8: &'a mut Vgpr<8>, addr: &In<1>, hh: usize) -> [Pending<SubMut<'a, 2>>; 4] {
+        let [d0, d1, d2, d3] = s.split_pairs_mut(v8);
+        if hh == 0 {
+            [s.ds_read_b64_tr_b8::<0, _>(d0, addr), s.ds_read_b64_tr_b8::<2048, _>(d1, addr), s.ds_read_b64_tr_b8::<4096, _>(d2, addr), s.ds_read_b64_tr_b8::<6144, _>(d3, addr)]
+        } else {
+            [s.ds_read_b64_tr_b8::<8192, _>(d0, addr), s.ds_read_b64_tr_b8::<10240, _>(d1, addr), s.ds_read_b64_tr_b8::<12288, _>(d2, addr), s.ds_read_b64_tr_b8::<14336, _>(d3, addr)]
+        }
+    }
+    fn wait4(s: &mut Seq, p: [Pending<SubMut<'_, 2>>; 4]) {
+        let [p0, p1, p2, p3] = p;
+        let _ = p3.wait(s);
+        let _ = p2.wait(s);
+        let _ = p1.wait(s);
+        let _ = p0.wait(s);
+    }
+    fn rd_k<'a, const OFF: u32>(s: &mut Seq, v8: &'a mut Vgpr<8>, a0: &In<1>, a1: &In<1>) -> [Pending<SubMut<'a, 4>>; 2] {
+        let [h0, h1] = s.split_halves8_mut(v8);
+        [s.ds_read_b128::<OFF, _>(h0, a0), s.ds_read_b128::<OFF, _>(h1, a1)]
+    }
+    fn wait2(s: &mut Seq, p: [Pending<SubMut<'_, 4>>; 2]) {
+        let [p0, p1] = p;
+        let _ = p1.wait(s);
+        let _ = p0.wait(s);
+    }
+    let mut s = Seq::new();
+    s.pin();
+    let sv0 = s.inout::<16>();
+    let sv1 = s.inout::<16>();
+    let sv2 = s.inout::<16>();
+    let sv3 = s.inout::<16>();
+    let o0 = s.inout::<16>();
+    let o1 = s.inout::<16>();
+    let o2 = s.inout::<16>();
+    let o3 = s.inout::<16>();
+    let la = s.inout::<4>();
+    let kfb0 = s.input::<1>();
+    let kfb1 = s.input::<1>();
+    let kfb2 = s.input::<1>();
+    let kfb3 = s.input::<1>();
+    let kdrd = s.input::<1>();
+    let g8 = s.input::<1>();
+    let sh16 = s.input::<1>();
+    let q0 = s.input::<8>();
+    let q1 = s.input::<8>();
+    let sq0 = s.input::<1>();
+    let sq1 = s.input::<1>();
+    let ones = s.input::<2>();
+    let bias = s.input::<2>();
+    let trb0 = s.input::<1>();
+    let trb1 = s.input::<1>();
+    let trb2 = s.input::<1>();
+    let trb3 = s.input::<1>();
+    let pa = s.input::<8>();
+    let pb = s.input::<8>();
+    let a_rs = s.input::<4>();
+    let idx01 = s.input::<1>();
+    let idx23 = s.input::<1>();
+    let c127 = s.input::<1>();
+    let c123 = s.input::<1>();
+    let (rpa, rpb, rra, ri01, ri23, rs127, rs123) = (s.ready(&pa), s.ready(&pb), s.ready(&a_rs), s.ready(&idx01), s.ready(&idx23), s.ready(&c127), s.ready(&c123));
+    let (rq0, rq1, rsq0, rsq1, rones, rbias) = (s.ready(&q0), s.ready(&q1), s.ready(&sq0), s.ready(&sq1), s.ready(&ones), s.ready(&bias));
+    let trb = [&trb0, &trb1, &trb2, &trb3];
+    let mut v0 = s.vgpr::<8>();
+    let mut v1 = s.vgpr::<8>();
+    let mut v2 = s.vgpr::<8>();
+    let mut v3 = s.vgpr::<8>();
+    let mut v4 = s.vgpr::<8>();
+    let mut v5 = s.vgpr::<8>();
+    let mut v6 = s.vgpr::<8>();
+    let mut v7 = s.vgpr::<8>();
+    let mut v8 = s.vgpr::<8>();
+    let mut v9 = s.vgpr::<8>();
+    let mut v10 = s.vgpr::<8>();
+    let mut v11 = s.vgpr::<8>();
+    let mut v12 = s.vgpr::<8>();
+    let mut v13 = s.vgpr::<8>();
+    let mut v14 = s.vgpr::<8>();
+    let mut v15 = s.vgpr::<8>();
+    let mut kd0 = s.vgpr::<1>();
+    let mut kd1 = s.vgpr::<1>();
+    let mut kd2 = s.vgpr::<1>();
+    let mut kd3 = s.vgpr::<1>();
+    let pkd0 = s.ds_read_b32::<0, _>(&mut kd0, &kdrd);
+    let pkd1 = s.ds_read_b32::<128, _>(&mut kd1, &kdrd);
+    let pkd2 = s.ds_read_b32::<256, _>(&mut kd2, &kdrd);
+    let pkd3 = s.ds_read_b32::<384, _>(&mut kd3, &kdrd);
+    let pk0 = rd_v(&mut s, &mut v0, trb[0], 0);
+    let tb0 = s.v_mfma_f32_32x32x8_f16_zero(sv0, rones, rbias);
+    let tb1 = s.v_mfma_f32_32x32x8_f16_zero(sv1, rones, rbias);
+    let tb2 = s.v_mfma_f32_32x32x8_f16_zero(sv2, rones, rbias);
+    let tb3 = s.v_mfma_f32_32x32x8_f16_zero(sv3, rones, rbias);
+    let pk1 = rd_v(&mut s, &mut v1, trb[1], 0);
+    wait4(&mut s, pk0);
+    let rv0 = s.ready(&v0);
+    let t0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o0, rv0, rpa, rs127, rs123);
+    let pk2 = rd_v(&mut s, &mut v2, trb[2], 0);
+    wait4(&mut s, pk1);
+    let rv1 = s.ready(&v1);
+    let t1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o1, rv1, rpa, rs127, rs123);
+    let pk3 = rd_v(&mut s, &mut v3, trb[3], 0);
+    wait4(&mut s, pk2);
+    let rv2 = s.ready(&v2);
+    let t2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o2, rv2, rpa, rs127, rs123);
+    let pk4 = rd_k::<0>(&mut s, &mut v4, &kfb0, &kfb1);
+    wait4(&mut s, pk3);
+    let rv3 = s.ready(&v3);
+    let t3 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o3, rv3, rpa, rs127, rs123);
+    let pk5 = rd_k::<4096>(&mut s, &mut v5, &kfb0, &kfb1);
+    wait2(&mut s, pk4);
+    let rv4 = s.ready(&v4);
+    let _ = pkd3.wait(&mut s);
+    let _ = pkd2.wait(&mut s);
+    let _ = pkd1.wait(&mut s);
+    let _ = pkd0.wait(&mut s);
+    let mut sk0_0 = s.vgpr::<1>();
+    let mut sk1_0 = s.vgpr::<1>();
+    s.v_lshrrev_b32_v(&mut sk0_0, &g8, &kd0);
+    s.v_lshrrev_b32_v(&mut sk1_0, &sh16, &kd0);
+    let (rk0_0, rk1_0) = (s.ready(&sk0_0), s.ready(&sk1_0));
+    let acc0 = tb0.retire(&mut s);
+    let tq0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc0, rv4, rq0, rk0_0, rsq0);
+    let pk6 = rd_k::<8192>(&mut s, &mut v6, &kfb0, &kfb1);
+    wait2(&mut s, pk5);
+    let rv5 = s.ready(&v5);
+    let mut sk0_1 = s.vgpr::<1>();
+    let mut sk1_1 = s.vgpr::<1>();
+    s.v_lshrrev_b32_v(&mut sk0_1, &g8, &kd1);
+    s.v_lshrrev_b32_v(&mut sk1_1, &sh16, &kd1);
+    let (rk0_1, rk1_1) = (s.ready(&sk0_1), s.ready(&sk1_1));
+    let acc1 = tb1.retire(&mut s);
+    let tq1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc1, rv5, rq0, rk0_1, rsq0);
+    let pk7 = rd_k::<12288>(&mut s, &mut v7, &kfb0, &kfb1);
+    wait2(&mut s, pk6);
+    let rv6 = s.ready(&v6);
+    let mut sk0_2 = s.vgpr::<1>();
+    let mut sk1_2 = s.vgpr::<1>();
+    s.v_lshrrev_b32_v(&mut sk0_2, &g8, &kd2);
+    s.v_lshrrev_b32_v(&mut sk1_2, &sh16, &kd2);
+    let (rk0_2, rk1_2) = (s.ready(&sk0_2), s.ready(&sk1_2));
+    let acc2 = tb2.retire(&mut s);
+    let tq2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc2, rv6, rq0, rk0_2, rsq0);
+    let pk8 = rd_v(&mut s, &mut v8, trb[0], 1);
+    wait2(&mut s, pk7);
+    let rv7 = s.ready(&v7);
+    let mut sk0_3 = s.vgpr::<1>();
+    let mut sk1_3 = s.vgpr::<1>();
+    s.v_lshrrev_b32_v(&mut sk0_3, &g8, &kd3);
+    s.v_lshrrev_b32_v(&mut sk1_3, &sh16, &kd3);
+    let (rk0_3, rk1_3) = (s.ready(&sk0_3), s.ready(&sk1_3));
+    let acc3 = tb3.retire(&mut s);
+    let tq3 = s.v_mfma_scale_f32_32x32x64_f8f6f4(acc3, rv7, rq0, rk0_3, rsq0);
+    let ts = s.v_smfmac_f32_16x16x128_fp8_fp8(la, rra, rpa, ri01);
+    let ts = ts.chain(&mut s, rra, rpb, ri01);
+    let pk9 = rd_v(&mut s, &mut v9, trb[1], 1);
+    wait4(&mut s, pk8);
+    let rv8 = s.ready(&v8);
+    let t0 = t0.chain(&mut s, rv8, rpb, rs127, rs123);
+    let pk10 = rd_v(&mut s, &mut v10, trb[2], 1);
+    wait4(&mut s, pk9);
+    let rv9 = s.ready(&v9);
+    let t1 = t1.chain(&mut s, rv9, rpb, rs127, rs123);
+    let pk11 = rd_v(&mut s, &mut v11, trb[3], 1);
+    wait4(&mut s, pk10);
+    let rv10 = s.ready(&v10);
+    let t2 = t2.chain(&mut s, rv10, rpb, rs127, rs123);
+    let pk12 = rd_k::<0>(&mut s, &mut v12, &kfb2, &kfb3);
+    wait4(&mut s, pk11);
+    let rv11 = s.ready(&v11);
+    let t3 = t3.chain(&mut s, rv11, rpb, rs127, rs123);
+    let pk13 = rd_k::<4096>(&mut s, &mut v13, &kfb2, &kfb3);
+    wait2(&mut s, pk12);
+    let rv12 = s.ready(&v12);
+    let tq0 = tq0.chain(&mut s, rv12, rq1, rk1_0, rsq1);
+    let pk14 = rd_k::<8192>(&mut s, &mut v14, &kfb2, &kfb3);
+    wait2(&mut s, pk13);
+    let rv13 = s.ready(&v13);
+    let tq1 = tq1.chain(&mut s, rv13, rq1, rk1_1, rsq1);
+    let pk15 = rd_k::<12288>(&mut s, &mut v15, &kfb2, &kfb3);
+    wait2(&mut s, pk14);
+    let rv14 = s.ready(&v14);
+    let tq2 = tq2.chain(&mut s, rv14, rq1, rk1_2, rsq1);
+    wait2(&mut s, pk15);
+    let rv15 = s.ready(&v15);
+    let tq3 = tq3.chain(&mut s, rv15, rq1, rk1_3, rsq1);
+    let ts = ts.chain(&mut s, rra, rpa, ri23);
+    let ts = ts.chain(&mut s, rra, rpb, ri23);
+    let ex_o0 = t0.exit();
+    s.output_exit(ex_o0);
+    let ex_o1 = t1.exit();
+    s.output_exit(ex_o1);
+    let ex_o2 = t2.exit();
+    s.output_exit(ex_o2);
+    let ex_o3 = t3.exit();
+    s.output_exit(ex_o3);
+    let ex_s0 = tq0.exit();
+    s.output_exit(ex_s0);
+    let ex_s1 = tq1.exit();
+    s.output_exit(ex_s1);
+    let ex_s2 = tq2.exit();
+    s.output_exit(ex_s2);
+    let ex_s3 = tq3.exit();
+    s.output_exit(ex_s3);
+    let exl = ts.exit();
+    s.output_exit(exl);
+    s.finish().expect("pv_qk_window_block is a verified sequence")
+}
 pub fn fmha_fwd_hd128_mxfp8_vs5() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
+    VS5_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
     let f = fmha_t_build("fmha_fwd_hd128_mxfp8_vs5", false, true);
+    VS5_BUILD.store(false, std::sync::atomic::Ordering::SeqCst);
     VS_MODE.store(false, std::sync::atomic::Ordering::SeqCst);
     f
 }
-pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
+
+/// `_vs5` only: `FMHA_OPT=winc` (Block C: PV + row sums as a pinned safe-asm block), `wina` (Block A), `winb` (Block B, the QK-under-VALU overlap); see docs/gen5-window-spec.md.
+/// Each block is gated separately (md5 + 15 shapes + determinism + timing). `wina` / `winb` are not wired yet and stop the build with a message.
+fn vs5_win(name: &str) -> bool {
+    let want = fmha_t_opt(name) && VS5_BUILD.load(std::sync::atomic::Ordering::SeqCst);
+    if want && name != "winc" && name != "winm" {
+        panic!("FMHA_OPT={name}: this safe-asm window block is not wired yet (docs/gen5-window-spec.md section 7)");
+    }
+    want
+}pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     let f = fmha_t_build("fmha_fwd_hd128_mxfp8_vs128", false, true);
     VS_MODE.store(false, std::sync::atomic::Ordering::SeqCst);
