@@ -10,7 +10,7 @@
 //! let r = s.ready(&x);                  // pads the 2 wait states a v_readfirstlane needs
 //! s.v_readfirstlane_b32(&mut sg, r);
 //! let block = s.finish().unwrap();      // verified plain data: the DSL embeds it (`Op::Asm`), the compiler lowers it to MIR
-//! assert!(!block.insts.is_empty());
+//! assert!(!block.insts().is_empty());
 //! ```
 //!
 //! See `docs/safe-asm-design.md` for the rules the types enforce and what they cannot.
