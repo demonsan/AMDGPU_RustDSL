@@ -14761,6 +14761,85 @@ fn emit_fmha_vsm_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
 /// build time, for bank-conflict experiments; default 144: 16-byte aligned and conflict-free enough, 128 = unpadded).
 /// End-to-end probe for the safe-asm path: loads a float4 per lane, MFMA + VALU, stores one float per lane (all written in safe Rust, see
 /// `amdgpu_safeasm::examples::global_probe_block`). out[tid] = in[4*tid..4*tid+4].sum() + 64.0.
+/// Memory-order probe for the fused-combine (last-arriver) pattern. `mode`: 0 = full fences (`fence_release` + `fence_acquire`: wait, `buffer_wbl2 sc1`,
+/// wait / wait, `buffer_inv sc1`), 1 = lite (waits only, no L2 write-back / invalidate), 2 = none (no fence at all: expected to be able to fail; it proves
+/// the probe can detect a violation). Every lane of every 64-thread block writes `(bid+1)*1000+tid` to `part[bid*64+tid]` with a write-through store,
+/// releases, does `old = atomic_add(counter, 1)` (per lane: the lane that gets `old == nblocks*64-1` is the last arriver in the whole grid), and that
+/// wave acquires and sums all partials with coherent loads into `result[0]`.
+fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
+    let mut b = FnBuilder::new(name, 64);
+    b.arg("part", DType::Ptr, 0, 8);
+    b.arg("counter", DType::Ptr, 8, 8);
+    b.arg("result", DType::Ptr, 16, 8);
+    b.arg("nblocks", DType::I32, 24, 4);
+    let part = b.let_(Op::KernargPtr { offset: 0 });
+    let counter = b.let_(Op::KernargPtr { offset: 8 });
+    let result = b.let_(Op::KernargPtr { offset: 16 });
+    let nb = b.let_(Op::KernargI32 { offset: 24 });
+    let tid = b.let_(Op::WorkitemId);
+    let bid = b.let_(Op::WorkgroupIdX);
+    let c64 = b.c_i32(64);
+    let c1000 = b.c_i32(1000);
+    let c1 = b.c_i32(1);
+    let c4 = b.c_i32(4);
+    let cm1 = b.c_i32(-1);
+    let row = b.mul_i32(bid, c64);
+    let idx = b.add_i32(row, tid);
+    let bp1 = b.add_i32(bid, c1);
+    let val = b.mul_i32(bp1, c1000);
+    let val = b.add_i32(val, tid);
+    let valf = b.bitcast_f32(Opnd::Val(val));
+    let off = b.mul_i32(idx, c4);
+    let pp = b.ptr_add(part, off);
+    b.store_f32_wt(pp, 0, Opnd::Val(valf));
+    match mode {
+        0 => b.fence_release(),
+        1 => b.fence_release_lite(),
+        _ => {}
+    }
+    let old = b.atomic_add_u32(counter, 0, Opnd::Val(c1));
+    let total = b.mul_i32(nb, c64);
+    let last_ticket = b.add_i32(total, cm1);
+    let is_last = b.let_(Op::CmpGeI32(Opnd::Val(old), Opnd::Val(last_ticket)));
+    b.begin_if(Opnd::Val(is_last));
+    match mode {
+        0 => b.fence_acquire(),
+        1 => b.fence_acquire_lite(),
+        _ => {}
+    }
+    let zero = b.c_i32(0);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(zero)), (DType::I32, Opnd::Val(zero))]);
+    let (i, s) = (vars[0], vars[1]);
+    let io = b.mul_i32(i, c4);
+    let q = b.ptr_add(part, io);
+    let x = b.load_f32_coherent(q, 0);
+    let xi = b.bitcast_i32(Opnd::Val(x));
+    let s2 = b.add_i32(s, xi);
+    b.set_var(s, Opnd::Val(s2));
+    let i2 = b.add_i32(i, c1);
+    b.set_var(i, Opnd::Val(i2));
+    let more = b.cmp_lt_i32(i2, total);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+    let sf = b.bitcast_f32(Opnd::Var(s));
+    b.store_f32_wt(result, 0, Opnd::Val(sf));
+    b.end_if();
+    b.finish()
+}
+
+pub fn probe_last_arriver() -> Function {
+    probe_last_arriver_mode("probe_last_arriver", 0)
+}
+
+pub fn probe_last_arriver_lite() -> Function {
+    probe_last_arriver_mode("probe_last_arriver_lite", 1)
+}
+
+pub fn probe_last_arriver_nofence() -> Function {
+    probe_last_arriver_mode("probe_last_arriver_nofence", 2)
+}
+
 pub fn probe_log_store4() -> Function {
     // out[4*tid + j] = log2(in[tid]) for j in 0..4: covers v_log_f32 and global_store_dwordx4 on both backends
     let mut b = FnBuilder::new("probe_log_store4", 64);
