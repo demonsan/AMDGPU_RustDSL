@@ -11767,12 +11767,15 @@ fn emit_fmha_g3_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let key_n2 = b.shl_i32(n2, c7d);
         (i1, slot_cur, slot_nxt, slot_n2, kds_nxt, kds_n2, key_n2)
     };    // QK of the whole tile (4 x 32 keys) in ring slot `slot`: S' = bias + scaled K.Q^T, in place
-    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId, kdv: Option<&[ValueId]>, s_lo: usize, s_hi: usize| {
+    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId, kdv: Option<&[ValueId]>, s_lo: usize, s_hi: usize, pre: Option<(&[ValueId], ValueId)>| {
         if no_qk {
             return;
         }
-        let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot)).collect();
-        let kd_rd = b.add_i32(kd_cur, kdslot);
+        // `pre`: the per-window address values (kfb, kd_rd) computed once by the caller instead of once per S-tile call
+        let (kfb, kd_rd): (Vec<ValueId>, ValueId) = match pre {
+            Some((k, d)) => (k.to_vec(), d),
+            None => ((0..4usize).map(|k| b.add_i32(cx.kfx[k], slot)).collect(), b.add_i32(kd_cur, kdslot)),
+        };
         // kdpre: the four K-scale dwords are read up front (4 VGPR) so that their lgkmcnt waits do not sit in front of every tile's MFMAs
         let kd_pre: Vec<ValueId> = if kdv4 {
             let f = b.load_lds_b128(Opnd::Val(kd_rd));
@@ -12141,6 +12144,10 @@ fn emit_fmha_g3_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         // issue QK(t+1, s) into the freed registers; PV + smfmac row sums; then the single block barrier (ring recycle) after the DMA wait.
         let skd = if stage { stage_start(b, key_n2, slot_n2) } else { None };
         let _ = valu(b, masked, true, 0, 0);
+        let hoist = !fmha_t_opt("nohoist");
+        let kfb_w: Vec<ValueId> = if hoist && stage { (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot_nxt)).collect() } else { Vec::new() };
+        let kdrd_w: Option<ValueId> = if hoist && stage { Some(b.add_i32(kd_cur, kds_nxt)) } else { None };
+        let pre_w: Option<(&[ValueId], ValueId)> = match kdrd_w { Some(d) => Some((&kfb_w[..], d)), None => None };
         let mut words: Vec<ValueId> = Vec::with_capacity(16);
         if fmha_t_opt("g3pv") {
             // g3pv: PV half 0 (P of S tiles 0,1) is issued between the conversions of tiles 1 and 2, PV half 1 + the row sums at the end
@@ -12158,7 +12165,7 @@ fn emit_fmha_g3_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let ws = valu(b, masked, false, s, s + 1);
                 words.extend(ws);
                 if stage {
-                    qk(b, slot_nxt, kds_nxt, None, s, s + 1);
+                    qk(b, slot_nxt, kds_nxt, None, s, s + 1, pre_w);
                 }
                 if s == 1 {
                     let pa = b.frag8(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
@@ -12184,7 +12191,7 @@ fn emit_fmha_g3_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let ws = valu(b, masked, false, s, s + 1);
                 words.extend(ws);
                 if stage {
-                    qk(b, slot_nxt, kds_nxt, None, s, s + 1);
+                    qk(b, slot_nxt, kds_nxt, None, s, s + 1, pre_w);
                 }
             }
             pv_w(b, slot_cur, &words);
