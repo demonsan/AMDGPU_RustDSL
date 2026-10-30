@@ -10007,7 +10007,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let key_n = b.shl_i32(nn, c7d);
         (i1, slot_cur, slot_nxt, slot_nxt, kds_nxt, key_n, kds_cur)
     };    // QK of the whole tile (4 x 32 keys) in ring slot `slot`: S' = bias + scaled K.Q^T, in place
-    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId, kdv: Option<&[ValueId]>, bias_v: ValueId| {
+    let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId, kdv: Option<&[ValueId]>, bias_v: ValueId, kpre: Option<&[ValueId]>| {
         if no_qk {
             return;
         }
@@ -10076,8 +10076,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a1 = b.add_i32(kfb[1], ko);
             let a2 = b.add_i32(kfb[2], ko);
             let a3 = b.add_i32(kfb[3], ko);
-            let k8_0 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)) };
-            let k8_1 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)) };
+            let k8_0 = if s == 0 && kpre.map(|p| !p.is_empty()).unwrap_or(false) {
+                kpre.unwrap()[0]
+            } else if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)) };
+            let k8_1 = if s == 0 && kpre.map(|p| p.len() > 1).unwrap_or(false) {
+                kpre.unwrap()[1]
+            } else if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)) };
             let kd = if let Some(v) = kdv {
                 v[s]
             } else if ablate.contains("kdc") {
@@ -10464,6 +10468,21 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 Vec::new()
             }
         };
+        // kpre2: prefetch the two K fragments of s=0 for QK(t+1) in the V window (16 VGPR); with qkfirst+biasc the M
+        // window can issue two QK scaled MFMAs with register operands before any LDS read.
+        let kpre_v: Vec<ValueId> = {
+            if fmha_t_num("kpre").unwrap_or(0) >= 2 && stage && !no_qk {
+                let a0 = b.add_i32(cx.kfx[0], slot_nxt);
+                let a1 = b.add_i32(cx.kfx[1], slot_nxt);
+                let a2 = b.add_i32(cx.kfx[2], slot_nxt);
+                let a3 = b.add_i32(cx.kfx[3], slot_nxt);
+                let k0 = b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1));
+                let k1 = b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3));
+                vec![k0, k1]
+            } else {
+                Vec::new()
+            }
+        };
         if !no_bar && !nobar1 {
             b.barrier();
         }
@@ -10520,12 +10539,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.var_smfmac_fp8(la, a_rs, pa, idx23);
             b.var_smfmac_fp8(la, a_rs, pb, idx23);
             if stage {
-                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now, Some(&kpre_v));
             }
         } else if fmha_t_opt("qkfirst") {
             // QK(i+1) first: S(i) was consumed by the V phase; the PV tr reads then queue behind the QK fragment reads
             if stage {
-                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now, Some(&kpre_v));
             }
             pv_w(b, slot_cur, &w, &pre_v);
         } else if win_m && stage && smfrs && smfv && q0_reg && !fmha_t_opt("qonce") && !fmha_t_opt("biasonce") && !fmha_t_opt("biasv") {
@@ -10551,7 +10570,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.barrier();
             }
             if stage {
-                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
+                qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now, Some(&kpre_v));
             }
         }
         if !noprio {
