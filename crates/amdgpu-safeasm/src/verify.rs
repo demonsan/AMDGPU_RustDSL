@@ -182,7 +182,7 @@ pub(crate) fn verify_block(b: &AsmBlock) -> Result<(), Vec<String>> {
         errs.push("sequence ends with DS/VMEM loads outstanding".to_string());
     }
     for (r, (w, wop)) in &matrix_write {
-        if slot.saturating_sub(w).saturating_sub(1) < MATRIX_RESULT {
+        if slot.saturating_sub(*w).saturating_sub(1) < MATRIX_RESULT {
             let declared = b.exit_in_flight.iter().any(|(x, _)| canon(*x) == *r) && b.outputs.iter().any(|p| canon(p.reg) == *r);
             if !declared {
                 errs.push(format!("end of sequence: r{r}, the result of {wop}, is still in flight and not exported with output_exit (unretired matrix result)"));

@@ -214,7 +214,7 @@ impl<const N: usize> Src<N> for &In<N> {
         self.id
     }
 }
-impl Sealed for &In<1> {}impl Operand for &In<1> {
+impl Operand for &In<1> {
     const BUS: u8 = 0;
     const VOP3_OK: bool = true;
     fn to_src(&self) -> ASrc {
