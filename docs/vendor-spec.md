@@ -1355,6 +1355,40 @@ fails early otherwise); (b) **`REF_DUMP2` md5 = `faadf00c...` bit-identical**, s
 (d) same-run per-CU best/median up and filled B4H8S2048/B1H8S8192 absolute close to 1243.5/1853.9;
 (e) auto-path gate 15/15 @16 rows, determinism 5/5, KV-split dispatch unchanged (same chosen kernels).
 
+## 7.10.3 Gen6 control baseline (Main `82ff0bf`, repo-cleaned tree)
+
+Frozen before the gen6 window (K-ahead ring + merged window + explicit phase rebalance). The repo has been
+cleaned to **Main + milestone tags only**: `v0.1-auto-dispatch`, `v0.2-kvsplit`, `v0.3-safeasm`,
+`v0.4-gen5-closed`, `v1.0-final`, plus `archive/vs-validate` and `archive/kernel-occ-probes` (the two
+superseded local branches); all work branches are merged. GPU 5, own backend, vendor `ref_mxfp8.co` in the
+same process/run; `REF_WARMUP=200`, `REF_ITERS=100`, best/median of 5 (node shared).
+
+| metric (Main `82ff0bf`) | value |
+|---|---|
+| `_vs128` B1H8S2048 64-block | **best 390.6 TFLOP/s (0.0440 ms), median 389.5** |
+| per-CU | **6.10 / 6.09 TF/CU** |
+| vendor same run, 64 blocks | **540.1 TFLOP/s = 8.44 TF/CU** (1.38x per-CU gap) |
+| filled B4H8S2048 (256 blocks) | **best 1239.7 / median 1236.2 TFLOP/s** (vendor 1644.0) |
+| filled B1H8S8192 | **best 1853.4 / median 1851.9 TFLOP/s** (vendor 2270.2) |
+| `_vs128` full-output md5 (REF_DUMP2, 4194304 B) | **faadf00c95f4eaffff94ece7d1429b3d** |
+| CPU gate (REF_ROWS=4) | bad=0, worst 6.627e-3, mean 6.9498e-4 |
+| auto path gate @16 rows | **15/15 OK, parity 15/15, ours bad=0** |
+| auto path gate @64 rows | **12/15 OK / 3 vendor-fail, ours bad=0, parity 15/15** |
+| determinism | **5/5 x2** |
+| shipped auto path (B1H8S2048) | split s=4 CHOSEN (guard); quiet certified state 596.7-605.5 TFLOP/s vs vendor 534-539 (1.11-1.13x, §7.10) |
+
+Counter control (per wave-iteration, `82ff0bf`, same run): SQ_WAVE_CYCLES 1157.5 -> **1534.3**;
+XDL busy 1086 -> **1216**; WAIT_INST_ANY 337.5 -> **523.8**; WAIT_ANY 414.3 -> **516.8**;
+WAIT_INST_LDS 32.9 -> 17.7; ACTIVE_INST_VALU 293.8 -> 401.1; VALU 250.9 -> 351.1 (INT32 60.3,
+other-VALU 139.7); LDS inst 52.3; VMEM inst 7.6; IFETCH 101.0; INST_LEVEL_LDS 31.5;
+INST_LEVEL_VMEM 121.7; SALU 24.4; bank conflicts 0.
+
+Gen6 acceptance = this control: same md5 `faadf00c...`; per-CU best >= 410 TFLOP/s (>= +5%);
+filled B4H8S2048/B1H8S8192 no regression vs 1239.7/1853.4; auto gate/det unchanged; counters must show
+WAIT_INST_ANY down / XDL busy up / wave cycles down. Note: the shipped-timing check this round hit a
+heavily loaded node (vendor samples 318-406 TFLOP/s at 64 blocks instead of ~540), so the shipped absolute
+is quoted from the quiet §7.10 certification and will be re-measured in the gen6 gate.
+
 ## 7.10.4 The INST_LEVEL_VMEM anomaly: source, verdict and reducible part
 
 Question: `SQ_INST_LEVEL_VMEM` is 121.7 per wave-iteration for us vs 50.8 for the vendor (2.4x), while
