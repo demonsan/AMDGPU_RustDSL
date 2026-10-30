@@ -32,9 +32,16 @@ fn then_fence(x: &Effects, f: Fence, alu_across: bool) -> bool {
         Fence::SetPrio => true,
         Fence::Barrier | Fence::Nop => !alu_across || x.mem.is_some(),
         Fence::WaitLgkm(_) => x.smem || matches!(&x.mem, Some(m) if m.space == Space::Lds),
-        Fence::WaitVm(_) => matches!(&x.mem, Some(m) if m.space == Space::Global),
+        // AMDC_PIN_VMWAIT=1: an explicit `s_waitcnt vmcnt` also stays after everything that precedes it in program order (the list scheduler would
+        // otherwise hoist it above the independent MFMA work and re-serialise a deliberately deferred DMA wait)
+        Fence::WaitVm(_) => pin_vm_wait() || matches!(&x.mem, Some(m) if m.space == Space::Global),
         Fence::None => false,
     }
+}
+
+fn pin_vm_wait() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("AMDC_PIN_VMWAIT").map_or(false, |v| v == "1"))
 }
 
 /// Must `a` (earlier in program order) stay before `b` because of memory / fence semantics?
