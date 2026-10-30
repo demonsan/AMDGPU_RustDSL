@@ -15200,7 +15200,21 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     // tile): two complete code copies selected once at kernel start
     let vsx_split = sv && name.ends_with("_vs128") && (vs128_vsx() || fmha_t_opt("corrshort"));
     if sv && name.ends_with("_t128") {
-        emit_fmha_t128_role(&mut b, &cx, true);
+        if vs128_vsx() || fmha_t_opt("corrshort") {
+            // same two code copies as `_vs128`: sequences with fewer than `cs` (9) tiles of 128 keys keep the LUT correction
+            let c9k = b.c_i32(fmha_t_num("cs").unwrap_or(9) as i32);
+            let short = b.cmp_lt_i32(cx.nkv, c9k);
+            b.begin_if(Opnd::Val(short));
+            VS_CORR_FORCE.store(1, std::sync::atomic::Ordering::SeqCst);
+            emit_fmha_t128_role(&mut b, &cx, true);
+            b.else_();
+            VS_CORR_FORCE.store(2, std::sync::atomic::Ordering::SeqCst);
+            emit_fmha_t128_role(&mut b, &cx, true);
+            b.end_if();
+            VS_CORR_FORCE.store(0, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            emit_fmha_t128_role(&mut b, &cx, true);
+        }
         return b.finish();
     }
     if vsx_split && fmha_t_opt("onecopy") {
