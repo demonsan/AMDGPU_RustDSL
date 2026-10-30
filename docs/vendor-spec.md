@@ -599,6 +599,137 @@ Ranked remaining actions (with expected savings):
    vendor 473 instructions) - deeper DMA prefetch and less prologue/epilogue code.
 5. Remaining barrier/priority/issue stalls (~+1500 cycles not explained by the work counters).
 
+## 7.8 Fused-combine last-arriver memory model - independent review (gfx950/MI355X)
+
+Reviewed: backend-tail `038ee24` (`docs/last-arriver-memory-model.md`), ops `global_atomic_add` (return,
+device scope), `global_store_*_wt` (`sc1`), `global_load_*_coherent` (`sc1`), `fence_release` =
+`s_waitcnt vmcnt(0)`+`s_waitcnt lgkmcnt(0)`+`buffer_wbl2 sc1`+`s_waitcnt vmcnt(0)`, `fence_acquire` =
+`s_waitcnt vmcnt(0)`+`buffer_inv sc1`, and the `probe_last_arriver*` evidence. Primary sources: CDNA4 ISA
+9.1.10 p92-94 (Tables 49/50/51/52) and 4.4 p27; kernel-wiki `mi350-isa-memory-ordering`,
+`mi350-isa-waitcnt-hazards`, `mi350-arch-memory-coherency-translation`; production precedent: aiter
+`csrc/kernels/mega_mhc.cu` `finish_last_split` (same last-arriver pattern on MI350) and
+`op_tests/opus/device/test_workgroup_barrier.cu` (agent-scope release/acquire fences).
+
+### Encoding check (all correct as emitted)
+* Loads/stores use SC[1:0]: 0=wave, 1=group, 2=device, 3=system (ISA p93). `sc1` sets SC1 with SC0=0, i.e.
+  **device scope** = 2. Device scope on a >1-L2 part (MI355X has one L2 per XCD, so >1) is *Coherent Cache
+  Bypass* in the L2 column of Tables 49/50: the access goes to the coherence point/fabric instead of a
+  non-coherent L2, which is exactly what makes it legal across XCDs.
+* Atomic: for atomics SC0 = return pre-op value, SC1 = 0 device / 1 system (ISA p93). The emitted
+  `global_atomic_add ... sc0` is therefore return-old + **device scope** - correct, and no `sc1` may be
+  added (that would make it system scope and slower; LLVM's `syncscope("agent")` does the same).
+* `buffer_wbl2 sc1`: SC1=1/SC0=0 -> CU nop, L2 (>1 L2) write-back dirty data; `buffer_inv sc1` -> SC1=1
+  invalidates the CU cache and (>1 L2) invalidates non-coherently cached lines (Table 51/52). Both are
+  MUBUF ops tracked by VM_CNT and return an ACK.
+
+### Verdict
+**(a) Is the full sequence sufficient for cross-XCD visibility on MI355X? Yes in principle, with one formal
+gap and one missing contract clause.**
+* The release side is sound: partial stores are device-scope (already coherent at the fabric, so the
+  `buffer_wbl2 sc1` is belt-and-braces), `s_waitcnt vmcnt(0)` waits until stores have completed *and*
+  memory ops complete in issue order (ISA p27), then the device-scope return-old atomic is issued. The
+  last arriver's `s_waitcnt vmcnt(0)` (ticket old value) + `buffer_inv sc1` + device-scope loads sees all
+  partials. There is no need for system scope (SC=3) for a same-GPU handoff; system scope is only for host
+  visibility, and kernel completion+stream sync already give that.
+* Formal gap: `fence_acquire` does **not** wait for `buffer_inv sc1`'s ACK. BUFFER_INV returns an ACK and
+  is a VM_CNT op, so the strict sequence is `s_waitcnt vmcnt(0)`; `buffer_inv sc1`;
+  `s_waitcnt vmcnt(0)` before the first partial load. This is harmless for the current contract because
+  every shared load is `sc1` (coherent; the invalidation is redundant), but if the code ever relies on the
+  invalidation for a default-scope load it is a real bug. Either add the trailing wait, or document the
+  acquire as "drain only; correctness comes from sc1 loads".
+* Missing contract clause for the real kernel: **the probe blocks are one wave (64 threads)**. The fused
+  KV-split kernel runs 512-thread = 8-wave blocks, and `s_barrier` does *not* drain counters (waitcnt
+  hazard page). If only wave 0 (or lane 0's wave) executes `fence_release`, the other 7 waves' partial
+  stores may still be in flight at the ticket. Required: **every wave that wrote a partial executes
+  `s_waitcnt vmcnt(0)` before the block-wide `s_barrier`; only after the barrier may lane 0 issue the
+  ticket atomic.** The last-arriver block's **every reading wave** must likewise execute the acquire drain
+  before its partial loads (same for `buffer_inv` if used). The probe as written cannot detect a violation
+  of this clause.
+
+**(b) Is `_lite` safe when all shared accesses use `sc1`? Yes, architecturally - that is the cleaner
+contract.** With every shared store `sc1` (device scope, Coherent Cache Bypass) and every shared load
+`sc1` (device scope, CU Miss Evict + Coherent Cache Bypass), the cache levels cannot serve stale data;
+the two VM_CNT drains (all writes before ticket; ticket before reads) plus the ordered completion of
+memory ops are sufficient. `buffer_wbl2`/`buffer_inv` add no correctness for sc1-only accesses; they are
+not free (L2 write-back/invalidate across the package) and their ACK handling is the only formal gap in
+the full sequence. So: ship **lite** if and only if the contract is enforced - all global accesses to
+`Ohat`/`lse`/any cross-block shared buffer are `sc1` (this must include the fp16 `dwordx4` reads of
+`Ohat`, the fp32 `lse` reads, and all partial stores), ticket is `sc0` device scope, one +1 per block,
+counter zeroed per launch, fixed read order for determinism. Keep the full sequence as the debug/a-b
+variant and for any path that mixes a default-scope access.
+
+**(c) What could break it:**
+1. *Any* plain/wave/group-scope access to a shared buffer (a forgotten conversion, a future code path, or
+   a compiler choosing a default-scope load) - across XCDs it is only guaranteed at the L2 it hit; the
+   plain-nofence probe's 1/12000 failure is exactly this mode. This is the #1 risk: static-verify the
+   emitted assembly of the fused kernel (all `global_*` ops touching the partials are `sc1`/atomic `sc0`).
+2. Missing per-wave drain before the block barrier (see (a)); the barrier orders execution, not VM_CNT.
+3. Missing acquire drain before reads, or a scheduler/compiler hoisting a read across the atomic/fence.
+   The scheduler must model the atomic and `s_waitcnt`/cache-ops as memory barriers (backend already
+   models `BufferWbl2`/`BufferInv` as `Fence::Barrier`; verify the same for the atomic result and the
+   `SWaitVm` in the fused kernel, and that the list scheduler cannot move a `sc1` load above the ticket
+   wait).
+4. Buffers shared with another kernel/launch: the counter/partials must be exclusively owned by this
+   launch in this stream (no concurrent kernel from another stream/process touching them; reset the
+   counter before every launch, and treat the fused output as normal kernel output only after stream
+   sync). Concurrent kernels on other XCDs are otherwise harmless for sc1 accesses, but the *full*
+   sequence's `buffer_wbl2`/`buffer_inv` are package-wide cache-maintenance ops: they are not
+   address-scoped, so a concurrent kernel/context could see extra cache traffic; this is another reason
+   to prefer the lite sequence in the shipped kernel.
+5. `buffer_inv` ACK not waited (formal issue 1 above); only matters if a non-sc1 load relies on it.
+6. Ticket wrap / stale counter: 32-bit counter is fine (max 2432 blocks x 64 = 155k per launch), but if
+   the buffer is reused without reset the last-arriver condition may never fire (wrong output, not a
+   hang) - memset per launch and assert host-side expected count.
+7. L2 eviction is not a break for sc1 (bypass) or for rule-1 plain+fenced (an evicted dirty line is
+   written back before eviction; the acquire invalidation prevents stale reads). TLB/XNACK replay is
+   also not a break: a replayed global access completes before its VM_CNT decrement, so the drain waits
+   for the successful completion; page migration/faults do not occur inside the kernel's mapped window.
+8. Atomic correctness itself is solid: device-scope atomics serialize at the L2 owning the counter
+   address, including atomics from other XCDs through the fabric; all zeros plus one +1 per block gives
+   exactly one lane the total-1 ticket.
+
+**(d) Probe sensitivity is not adequate for a production contract.** 1/12000 in the plain-nofence
+positive control proves only ~1e-4 detection; a race that needs a rare L2/XCD interleaving (e.g., a
+missing per-wave drain that only shows when 7 waves are in flight at the ticket) would not be caught.
+Strengthen it, in order of value:
+1. **8-wave 512-thread block variant** matching the split kernel exactly: each wave writes its own
+   partials, per-wave drain, `s_barrier`, lane 0 ticket, broadcast last, the last-arriver block's 8 waves
+   each drain+acquire and read 4 strided split partials, combine in fixed order, and verify the full
+   output vector (not a checksum) against the host expectation. This is the clause the current probe
+   cannot test.
+2. **>=1e6 runs per variant** across the 12 block counts (including 2432 and odd counts), random seed per
+   run, exact per-lane comparison (or a 128-bit hash pair) instead of the current integer sum; require
+   zero mismatches for lite and full; keep nofence as a positive control and expect failures.
+3. **Adversarial timing**: stagger/delay writer blocks (spin loops scaled by bid), reverse block order,
+   maximize writer-reader XCD distance, make the last arriver read immediately after the ticket; add a
+   concurrent streaming kernel on another stream (256MB buffer) to thrash L2 and vary L2 pressure; repeat
+   with the GPU otherwise loaded.
+4. **Layout pressure**: put splits' partials in the same 128B line (false sharing), put the counter on a
+   different XCD than the readers, vary block counts so some row-blocks' 4 splits land on 4 different
+   XCDs; iterate all layouts.
+5. Run the **real fused kernel** once merged: 100+ launches with varying block counts/order and a
+   deliberately different L2 state; assert md5 identical every run and matches the two-launch result
+   within the fp16-partial tolerance (mean_abs <= 1e-4, max_abs <= 1 bf16 ULP(max|ref|)).
+Pass criterion for the contract: lite + full zero mismatches at >=1e6 runs and in the real-kernel stress;
+any failure cancels the fused experiment. Until then, keep the full sequence as the written contract and
+implement Target-1 fused combine against the **lite** discipline (all shared accesses sc1) as the fast
+path.
+
+**Required sequence to hand to kernel-opt/backend (both kernels, per row-block):**
+```
+writer block (8 waves):
+  per wave: partial stores (Ohat fp16 store_f32x?  -> sc1; lse -> sc1)
+  per wave: s_waitcnt vmcnt(0)                     # every wave, BEFORE the barrier
+  s_barrier                                        # block-wide
+  lane0: global_atomic_add_u32 sc0 (device, return old) ticket; s_waitcnt vmcnt(0)
+  lane0: write last to LDS; s_barrier; all waves read last
+  if last: per reading wave: s_waitcnt vmcnt(0)    # ticket/acquire drain
+           [if any load is NOT sc1: buffer_inv sc1; s_waitcnt vmcnt(0)]
+           all partial reads via sc1 (Ohat dwordx4, lse dword); s_waitcnt vmcnt(0); combine
+```
+Lite = identical but omit `buffer_inv` (and omit `buffer_wbl2` on the writer side) - valid only with the
+sc1-only access discipline above.
+
 ## 7.9 Final state - independent acceptance validation (2026-10-30, GPU 5)
 
 **Commit validated: Main `f4cccb60d53b51e30695b89ee4590039f270de18`** (merge of the kernel-opt gen3 branch
