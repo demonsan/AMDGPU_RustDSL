@@ -166,3 +166,21 @@ impl<'a> Smfmac<'a, OP_SMFMAC_FP8> {
 }
 
 include!(concat!(env!("OUT_DIR"), "/generated_ops.rs"));
+
+/// Hand-written templates (they carry tokens or type-state): (method, MOp key, kind).
+pub const HAND_WRITTEN_OPS: &[(&str, &str, &str)] = &[
+    ("v_mov_b32", "VMovB32", "vop1 (immediate form)"),
+    ("v_cmp_lt_i32_e64", "VCmpMaskLtI32", "vop3 compare into an SGPR pair (own-backend op)"),
+    ("v_cndmask_b32", "VCndmask", "vcc type-state"),
+    ("v_cndmask_b32_e64", "VCndmaskM", "SGPR-pair mask"),
+    ("v_readfirstlane_b32", "VReadFirstLane", "Ready operand"),
+    ("v_mfma_scale_f32_32x32x64_f8f6f4", "VMfmaScale32x32x64Fp8", "matrix token (chainable)"),
+    ("v_mfma_scale_f32_32x32x64_f8f6f4_zero", "VMfmaScale32x32x64Fp8Z", "matrix token"),
+    ("v_smfmac_f32_16x16x128_fp8_fp8", "VSmfmac16x16x128Fp8", "matrix token (chainable)"),
+    ("ds_read_b128", "LdsReadB128", "Pending (lgkmcnt)"),
+    ("ds_read_b32", "LdsReadB32", "Pending (lgkmcnt)"),
+    ("ds_write_b32", "LdsWriteB32", "lgkm slot"),
+    ("global_load_dwordx4", "GlobalLoadB128", "Pending (vmcnt)"),
+    ("v_add_f32_acc", "VAddF32", "in-place accumulate"),
+    ("v_writesub (zeroed)", "VWriteSub", "register init"),
+];

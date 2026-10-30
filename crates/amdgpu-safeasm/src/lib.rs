@@ -39,3 +39,4 @@ pub fn verify_insts(like: &AsmBlock, insts: Vec<AInst>) -> Result<(), Vec<String
 pub fn forge_for_tests(like: &AsmBlock, insts: Vec<AInst>) -> AsmBlock {
     AsmBlock { insts, ..like.clone() }
 }
+pub use ops::{HAND_WRITTEN_OPS, TYPED_OPS};

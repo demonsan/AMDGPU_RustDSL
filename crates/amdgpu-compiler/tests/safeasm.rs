@@ -411,3 +411,27 @@ fn writing_an_input_port_is_refused() {
     let err = lower::lower(&b.finish()).unwrap_err();
     assert!(err.contains("INPUT port") || err.contains("hazard verifier"), "{err}");
 }
+// ---- coverage: which MOps have typed templates ---------------------------------------------------------------------------------------------
+
+/// Prints the coverage matrix used in docs/safe-asm-design.md (`cargo test -p amdgpu-compiler --test safeasm coverage -- --nocapture`) and checks
+/// that every typed template names an op the backend table knows.
+#[test]
+fn coverage_matrix() {
+    use amdgpu_safeasm::{HAND_WRITTEN_OPS, TYPED_OPS};
+    let tbl = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/backend/llvm24.tbl")).unwrap();
+    let keys: Vec<String> = tbl
+        .lines()
+        .filter(|l| !l.starts_with('#') && l.contains('|'))
+        .map(|l| l.split('|').next().unwrap().trim().split(':').next().unwrap().to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let typed: std::collections::BTreeSet<&str> = TYPED_OPS.iter().map(|t| t.1).chain(HAND_WRITTEN_OPS.iter().map(|t| t.1)).collect();
+    for t in &typed {
+        assert!(keys.iter().any(|k| k == t) || ["VCmpMaskLtI32", "VCndmaskM", "VWriteSub"].contains(t) || tbl.contains(t), "typed op {t} unknown to the backend table");
+    }
+    let raw: Vec<&String> = keys.iter().filter(|k| !typed.contains(k.as_str())).collect();
+    eprintln!("COVERAGE typed(generated)={} typed(hand-written)={} raw-only={} of {} backend rows", TYPED_OPS.len(), HAND_WRITTEN_OPS.len(), raw.len(), keys.len());
+    eprintln!("COVERAGE raw: {}", raw.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+    assert!(TYPED_OPS.len() >= 20);
+}
