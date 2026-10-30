@@ -327,8 +327,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             if strict && matches!(inst.op, MOp::VPtrAdd) {
                 vccw.set(cycle + 3);
             }
+            // an explicit `s_nop N` already in the stream (hand-authored blocks) covers N+1 wait states
+            let spent = if inst.op == MOp::SNop { inst.imm.max(0) as usize + 1 } else { 1 };
             out.push(inst);
-            cycle += 1;
+            cycle += spent;
             i += 1;
         }
         if pad_block_end {
