@@ -1,5 +1,7 @@
 //! Backend for the AMDGPU Rust DSL: lowering, register allocation, emission.
 
+#![forbid(unsafe_code)]
+
 pub mod asm;
 pub mod asm_check;
 pub mod pin_check;

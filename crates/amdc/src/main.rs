@@ -1,5 +1,7 @@
 //! `amdc` - command line driver for the AMDGPU Rust DSL compiler.
 
+#![forbid(unsafe_code)]
+
 use amdgpu_compiler::backend::{self, probe, LlvmTail, LlvmTools, TailBackend};
 use std::env;
 use std::fs;

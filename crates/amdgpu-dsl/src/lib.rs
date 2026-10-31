@@ -12,6 +12,8 @@
 //!   numbers or machine encodings appear at this level.
 //! * Effects are explicit: only `Load*`/`Store*`/`Kernarg*` touch memory.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
