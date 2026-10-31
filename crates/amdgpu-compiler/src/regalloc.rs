@@ -888,6 +888,15 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
         }
     }
     let mut report = Vec::new();
+    // where each slot is written (diagnostics: names the instructions behind a reported writer set)
+    let mut wloc: HashMap<Slot, Vec<(usize, usize, MOp)>> = HashMap::new();
+    for (b, blk) in m.blocks.iter().enumerate() {
+        for (ii, inst) in blk.insts.iter().enumerate() {
+            for w in &effects(m, inst).writes {
+                wloc.entry(*w).or_default().push((b, ii, inst.op));
+            }
+        }
+    }
     for b in 0..nb {
         let Some(mut st) = in_st[b].clone() else { continue };
         for (ii, inst) in m.blocks[b].insts.iter().enumerate() {
@@ -902,7 +911,8 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
                 let p = phys(*r);
                 if let Some(ws) = st.get(&p) {
                     if !ws.contains(r) || ws.len() > 1 {
-                        report.push(format!("block {b} inst {ii} {:?}: reads slot {r} ({}{}) but the reaching writers are {:?}", inst.op, if p.0 { "v" } else { "s" }, p.1, ws));
+                        let at: Vec<String> = ws.iter().map(|w| format!("{w}={:?}", wloc.get(w).map(|v| v.iter().take(4).collect::<Vec<_>>()).unwrap_or_default())).collect();
+                        report.push(format!("block {b} inst {ii} {:?}: reads slot {r} ({}{}) but the reaching writers are {:?} [{}]", inst.op, if p.0 { "v" } else { "s" }, p.1, ws, at.join("; ")));
                     }
                 }
             }
