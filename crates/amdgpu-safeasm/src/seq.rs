@@ -563,6 +563,9 @@ pub const OP_SMFMAC_FP8: u32 = 2;
 /// The f16 32x32x8 MFMA with an implicit zero accumulator (the bias MFMA). A different opcode from the scaled one: the scaled MFMA that accumulates
 /// into its result must wait for the full result latency (`retire`), 12 wait states for this opcode (hazards.rs `mfma_latency`).
 pub const OP_MFMA_F16_ZERO: u32 = 3;
+/// The UNSCALED fp8 MFMA (accumulate form: chainable in place) and its zero-accumulator form (a different opcode: `retire` before an accumulating one).
+pub const OP_MFMA_FP8: u32 = 4;
+pub const OP_MFMA_FP8_ZERO: u32 = 5;
 /// Result latency in wait states of the f16 32x32x8 MFMA (hazards.rs).
 pub const MATRIX_RESULT_F16: u32 = 12;
 

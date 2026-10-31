@@ -1281,6 +1281,25 @@ impl Lowerer {
                         self.push(MInst::new(MOp::VPkMulF32).def(a).srcreg(a).srcreg(p));
                     }
                 }
+                Stmt::VarMfmaFp8Z { var, a, b } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let ra = self.as_v8(*a)?;
+                    let rb = self.as_v8(*b)?;
+                    self.push(MInst::new(MOp::VMfma32x32x64Fp8Z).def(v).srcreg(ra).srcreg(rb));
+                }
+                Stmt::VarMfmaFp8C { var, a, b, c } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let ra = self.as_v8(*a)?;
+                    let rb = self.as_v8(*b)?;
+                    let rc = self.as_v16(*c)?;
+                    self.push(MInst::new(MOp::VMfma32x32x64Fp8).def(v).srcreg(ra).srcreg(rb).srcreg(rc));
+                }
+                Stmt::VarMfmaFp8 { var, a, b } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let ra = self.as_v8(*a)?;
+                    let rb = self.as_v8(*b)?;
+                    self.push(MInst::new(MOp::VMfma32x32x64Fp8).def(v).srcreg(ra).srcreg(rb).srcreg(v));
+                }
                 Stmt::VarMfmaScaleZ { var, a, b, scale_a, scale_b } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let ra = self.as_v8(*a)?;
@@ -2164,6 +2183,32 @@ impl Lowerer {
                 }
                 self.val.insert(dst, v);
             }
+            Op::MfmaFp8_32x32x64 { a, b, c } => {
+                let ra = self.as_v8(*a)?;
+                let rb = self.as_v8(*b)?;
+                let c_is_zero = matches!(c, Opnd::Val(cv) if matches!(self.defs.get(cv), Some(Op::FragZero { ty: DType::Frag16 })));
+                if c_is_zero {
+                    let d = self.new_vreg(RClass::V16);
+                    self.push(MInst::new(MOp::VMfma32x32x64Fp8Z).def(d).srcreg(ra).srcreg(rb));
+                    self.val.insert(dst, d);
+                    return Ok(());
+                }
+                let rc = self.as_v16(*c)?;
+                let reusable = matches!(
+                    c,
+                    Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1)
+                        && matches!(self.defs.get(cv), Some(Op::MfmaScaleFp8_32x32x64 { .. }) | Some(Op::MfmaFp8_32x32x64 { .. }) | Some(Op::Frag16Build(_)))
+                );
+                let d = if reusable {
+                    rc
+                } else {
+                    let d = self.new_vreg(RClass::V16);
+                    self.copy_reg(d, rc)?;
+                    d
+                };
+                self.push(MInst::new(MOp::VMfma32x32x64Fp8).def(d).srcreg(ra).srcreg(rb).srcreg(d));
+                self.val.insert(dst, d);
+            }
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 let ra = self.as_v8(*a)?;
                 let rb = self.as_v8(*b)?;
@@ -2893,7 +2938,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                 }
                 // any other statement that writes a variable in place makes it non-scalar
                 Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
-                | Stmt::VarScaleLane { var, .. } | Stmt::VarLoadB128 { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarAsm { var, .. } => {
+                | Stmt::VarScaleLane { var, .. } | Stmt::VarLoadB128 { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8 { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarAsm { var, .. } => {
                     if uvars.remove(var) {
                         changed = true;
                     }

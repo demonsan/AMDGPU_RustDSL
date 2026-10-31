@@ -18614,6 +18614,56 @@ pub fn probe_mfma_cform() -> Function {
     b.finish()
 }
 
+/// Unscaled fp8 MFMA (`v_mfma_f32_32x32x64_f8f6f4`) vs the scaled form with both scales 127: S1 = ones x ones (zero-C form) then accumulate in place (loop var),
+/// plus a separate-C form; every result must equal the scaled-form result (exactly 64, 128 and 192 per element). out[tid] = S[0] (unscaled path),
+/// out[64+tid] = scaled path.
+pub fn probe_mfma_unscaled() -> Function {
+    let mut b = FnBuilder::new("probe_mfma_unscaled", 64);
+    b.arg("outp", DType::Ptr, 0, 8);
+    let outp = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let c127 = b.c_i32(127);
+    let zero = b.c_i32(0);
+    let ones = b.c_i32(0x3838_3838);
+    let a8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let b8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let z = b.frag_zero(DType::Frag16);
+    // unscaled: zero-C then +64 in place (loop var), then a separate-C form (+64): 64 * 3 = 192
+    let s0 = b.mfma_fp8_32x32x64(a8, b8, z);
+    let z2 = b.frag_zero(DType::Frag16);
+    let vars = b.begin_loop(&[(DType::Frag16, Opnd::Val(z2))]);
+    b.var_mfma_fp8_32x32x64_z(vars[0], a8, b8);
+    b.var_mfma_fp8_32x32x64(vars[0], a8, b8);
+    let stop = b.cmp_lt_i32(zero, c127);
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+    let z3 = b.frag_zero(DType::Frag16);
+    let vars2 = b.begin_loop(&[(DType::Frag16, Opnd::Val(z3))]);
+    b.var_mfma_fp8_32x32x64_c(vars2[0], a8, b8, s0); // = 64 (s0) + 64
+    let stop2 = b.cmp_lt_i32(zero, c127);
+    b.break_if(Opnd::Val(stop2));
+    b.end_loop();
+    // scaled reference: 64, then 128 by accumulation, then 192 by a third
+    let r0 = b.mfma_scale_fp8(a8, b8, z, c127, c127);
+    let r1 = b.mfma_scale_fp8(a8, b8, r0, c127, c127);
+    let off = b.mul_i32(tid, c4);
+    let po = b.ptr_add(outp, off);
+    let u1 = b.frag16_lane(Opnd::Var(vars[0]), 0); // 128
+    let u2 = b.frag16_lane(Opnd::Var(vars2[0]), 5); // 128
+    let rr = b.frag16_lane(r1, 0); // 128
+    let s_unscaled = b.frag16_lane(s0, 3); // 64
+    let f1 = b.bitcast_f32(u1);
+    let f2 = b.bitcast_f32(u2);
+    let fr = b.bitcast_f32(rr);
+    let fs = b.bitcast_f32(s_unscaled);
+    b.store_f32(po, 0, f1);
+    b.store_f32(po, 256, f2);
+    b.store_f32(po, 512, fr);
+    b.store_f32(po, 768, fs);
+    b.finish()
+}
+
 pub fn probe_log_store4() -> Function {
     // out[4*tid + j] = log2(in[tid]) for j in 0..4: covers v_log_f32 and global_store_dwordx4 on both backends
     let mut b = FnBuilder::new("probe_log_store4", 64);

@@ -95,7 +95,7 @@ pub fn cost(op: MOp) -> OpCost {
         VReadFirstLane => c(Valu, 4, 12, Unknown),
         // MFMA issue spacing 64/32/16 (V), same for dependent chains; latency = wait states until the
         // last D register is readable (20/11/7 s_nop slots of 4 cycles; V) -> hazards pass pads the rest.
-        VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z => c(Mfma, 64, 84, Verified),
+        VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z | VMfma32x32x64Fp8 | VMfma32x32x64Fp8Z => c(Mfma, 64, 84, Verified),
         VMfma32x32x16Fp8 | VMfma32x32x8F16 | VMfma32x32x8F16Z => c(Mfma, 32, 48, Verified),
         VMfma16x16x32Fp8 | VMfma16x16x16F16 => c(Mfma, 16, 32, Verified),
         // Sparse fp8 16x16x128: arch table says 32 cycles (MI350X, F8 involved); latency not measured.

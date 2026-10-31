@@ -97,6 +97,30 @@ impl Seq {
         Mfma { issued, lat: MATRIX_RESULT, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
     }
 
+    /// UNSCALED fp8 MFMA accumulating in place (`v_mfma_f32_32x32x64_f8f6f4 acc, a, b, acc`): no scale operands, otherwise the rules of the scaled form
+    /// (20-state result, chainable in place, ready proofs for the operands).
+    pub fn v_mfma_f32_32x32x64_f8f6f4<'a>(&mut self, acc: Vgpr<16>, a: Ready<'a, 8>, b: Ready<'a, 8>) -> Mfma<'a, OP_MFMA_FP8> {
+        let issued = self.clock;
+        self.push(inst("VMfma32x32x64Fp8", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(acc.id)]));
+        self.note_write(acc.id, MATRIX_RESULT);
+        Mfma { issued, lat: MATRIX_RESULT, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
+    }
+
+    /// The same with an implicit zero accumulator (`D = A x B`).
+    pub fn v_mfma_f32_32x32x64_f8f6f4_zero<'a>(&mut self, acc: Vgpr<16>, a: Ready<'a, 8>, b: Ready<'a, 8>) -> Mfma<'a, OP_MFMA_FP8_ZERO> {
+        let issued = self.clock;
+        self.push(inst("VMfma32x32x64Fp8Z", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id)]));
+        self.note_write(acc.id, MATRIX_RESULT);
+        Mfma { issued, lat: MATRIX_RESULT, acc: Some(acc), poison: self.poison.clone(), _p: PhantomData }
+    }
+
+    /// Unscaled fp8 MFMA with an explicit accumulator input (`dst = A x B + C`, C read-only `Ready`, dst owned by the token; see the scaled `_c` form).
+    pub fn v_mfma_f32_32x32x64_f8f6f4_c<'a>(&mut self, dst: Vgpr<16>, c: Ready<'a, 16>, a: Ready<'a, 8>, b: Ready<'a, 8>) -> Mfma<'a, OP_MFMA_FP8> {
+        let issued = self.clock;
+        self.push(inst("VMfma32x32x64Fp8", Some(dst.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(c.id)]));
+        self.note_write(dst.id, MATRIX_RESULT);
+        Mfma { issued, lat: MATRIX_RESULT, acc: Some(dst), poison: self.poison.clone(), _p: PhantomData }
+    }
     /// Scaled MFMA with an EXPLICIT accumulator input: `dst = A x B + C` (`v_mfma_scale ... dst, a, b, c, sa, sb`, the persistent-bias form: C is a
     /// register the sequence only READS, dst is a different register that the token owns). Same opcode as the accumulate form, so `.chain()` (in place
     /// on dst) works afterwards. `c` is a `Ready` proof: it is borrowed for the life of the token (cannot be overwritten while the MFMA reads it), and a C
@@ -268,6 +292,17 @@ impl<'a> Mfma<'a, OP_MFMA_SCALE> {
     }
 }
 
+impl<'a> Mfma<'a, OP_MFMA_FP8> {
+    /// Dependent unscaled MFMA accumulating in place (same opcode: hardware-interlocked, no wait).
+    pub fn chain(mut self, s: &mut Seq, a: Ready<'a, 8>, b: Ready<'a, 8>) -> Mfma<'a, OP_MFMA_FP8> {
+        let issued = s.clock;
+        let acc = self.acc.take().expect("accumulator");
+        s.push(inst("VMfma32x32x64Fp8", Some(acc.id), vec![ASrc::Reg(a.id), ASrc::Reg(b.id), ASrc::Reg(acc.id)]));
+        s.note_write(acc.id, MATRIX_RESULT);
+        Mfma { issued, lat: MATRIX_RESULT, acc: Some(acc), poison: s.poison.clone(), _p: PhantomData }
+    }
+}
+
 impl<'a> Smfmac<'a, OP_SMFMAC_FP8> {
     pub fn chain(mut self, s: &mut Seq, a: Ready<'a, 4>, b: Ready<'a, 8>, idx: Ready<'a, 1>) -> Smfmac<'a, OP_SMFMAC_FP8> {
         let issued = s.clock;
@@ -288,6 +323,8 @@ pub const HAND_WRITTEN_OPS: &[(&str, &str, &str)] = &[
     ("v_cndmask_b32_e64", "VCndmaskM", "SGPR-pair mask"),
     ("v_readfirstlane_b32", "VReadFirstLane", "Ready operand"),
     ("v_mfma_scale_f32_32x32x64_f8f6f4", "VMfmaScale32x32x64Fp8", "matrix token (chainable)"),
+    ("v_mfma_f32_32x32x64_f8f6f4 / _c", "VMfma32x32x64Fp8", "unscaled fp8 matrix token (chainable)"),
+    ("v_mfma_f32_32x32x64_f8f6f4_zero", "VMfma32x32x64Fp8Z", "unscaled fp8 matrix token"),
     ("v_mfma_scale_f32_32x32x64_f8f6f4_zero", "VMfmaScale32x32x64Fp8Z", "matrix token"),
     ("v_mfma_f32_32x32x8_f16_zero", "VMfma32x32x8F16Z", "matrix token (12-state result)"),
     ("v_mfma_scale_f32_32x32x64_f8f6f4_c", "VMfmaScale32x32x64Fp8", "matrix token with explicit C operand (dst != C)"),

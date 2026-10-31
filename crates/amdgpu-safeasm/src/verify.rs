@@ -269,6 +269,8 @@ fn static_name(op: &str) -> &'static str {
     match op {
         "VMfmaScale32x32x64Fp8" => "VMfmaScale32x32x64Fp8",
         "VMfmaScale32x32x64Fp8Z" => "VMfmaScale32x32x64Fp8Z",
+        "VMfma32x32x64Fp8" => "VMfma32x32x64Fp8",
+        "VMfma32x32x64Fp8Z" => "VMfma32x32x64Fp8Z",
         "VSmfmac16x16x128Fp8" => "VSmfmac16x16x128Fp8",
         "VMfma32x32x8F16Z" => "VMfma32x32x8F16Z",
         _ => "matrix op",

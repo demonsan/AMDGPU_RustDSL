@@ -405,6 +405,18 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
                 tuple(a, b_reg, 2)
             )]
         }
+        MOp::VMfma32x32x64Fp8Z => {
+            vec![format!("v_mfma_f32_32x32x64_f8f6f4 {}, {}, {}, 0", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 8))]
+        }
+        MOp::VMfma32x32x64Fp8 => {
+            vec![format!(
+                "v_mfma_f32_32x32x64_f8f6f4 {}, {}, {}, {}",
+                tuple(a, inst.dst.expect("dst"), 16),
+                tuple(a, reg_of(&inst.srcs[0]), 8),
+                tuple(a, reg_of(&inst.srcs[1]), 8),
+                tuple(a, reg_of(&inst.srcs[2]), 16)
+            )]
+        }
         MOp::VMfmaScale32x32x64Fp8Z => {
             let a_reg = reg_of(&inst.srcs[0]);
             let b_reg = reg_of(&inst.srcs[1]);

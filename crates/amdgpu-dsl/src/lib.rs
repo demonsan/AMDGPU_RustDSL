@@ -217,6 +217,8 @@ pub enum Op {
     /// `v_mfma_scale_f32_32x32x64_f8f6f4`: block-scaled fp8 MFMA. The two scale
     /// operands are E8M0 exponents in scalar registers.
     MfmaScaleFp8_32x32x64 { a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
+    /// `v_mfma_f32_32x32x64_f8f6f4`: the UNSCALED fp8 (e4m3 x e4m3) MFMA (no scale operands; identical to the scaled form with both scales = 127).
+    MfmaFp8_32x32x64 { a: Opnd, b: Opnd, c: Opnd },
     /// `v_smfmac_f32_16x16x128_fp8_fp8`: sparse (2:4) fp8 A times dense fp8 B, f32 accumulate.
     /// `a` is a Frag4 (the 2:4-compressed A operand), `b` a Frag8 (dense B, 128 K x 16 N),
     /// `idx` the SRC2 dword of sixteen 2-bit sparse indices, `c` the Frag4 accumulator.
@@ -293,7 +295,7 @@ impl Op {
             Op::CatFrag8(..) => DType::Frag8,
             Op::Frag16Build(..) => DType::Frag16,
             Op::CvtPknormU16(..) | Op::CvtScalef32PkFp8Bf16 { .. } | Op::CvtPkFp8F32(..) | Op::CvtPkBf16F32(..) => DType::U32,
-            Op::MfmaScaleFp8_32x32x64 { .. } => DType::Frag16,
+            Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. } => DType::Frag16,
             Op::SmfmacFp8_16x16x128 { .. } => DType::Frag4,
             Op::Asm { block, .. } => asm_out_ty(block),
             Op::FragZero { ty } => *ty,
@@ -358,6 +360,7 @@ impl Op {
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 vec![*a, *b, *c, *scale_a, *scale_b]
             }
+            Op::MfmaFp8_32x32x64 { a, b, c } => vec![*a, *b, *c],
             Op::SmfmacFp8_16x16x128 { a, b, idx, c } => vec![*a, *b, *idx, *c],
             Op::Asm { inputs, .. } => inputs.clone(),
             Op::Frag16Lane { frag, .. } | Op::Frag16Pair { frag, .. } => vec![*frag],
@@ -432,6 +435,12 @@ pub enum Stmt {
     VarMfmaScaleZ { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
     /// `var = a x b + c` (c a Frag16 VALUE, not the variable itself: the accumulator input and the destination are different registers)
     VarMfmaScaleC { var: VarId, a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
+    /// UNSCALED fp8 MFMA (`v_mfma_f32_32x32x64_f8f6f4`) into a loop variable: in place `var += a x b`
+    VarMfmaFp8 { var: VarId, a: Opnd, b: Opnd },
+    /// ... with a zero accumulator (`var = a x b`)
+    VarMfmaFp8Z { var: VarId, a: Opnd, b: Opnd },
+    /// ... with a separate accumulator input (`var = a x b + c`, c a Frag16 value, dst != c)
+    VarMfmaFp8C { var: VarId, a: Opnd, b: Opnd, c: Opnd },
     /// `var += smfmac_16x16x128_fp8(a, b, idx)`: sparse-A MFMA accumulating into a `Frag4` loop variable in place.
     VarSmfmac { var: VarId, a: Opnd, b: Opnd, idx: Opnd },
     /// A safe-asm sequence updating the loop variable `var` in place through its in/out port (the first input port, `Seq::inout`);
@@ -565,6 +574,15 @@ impl Function {
                 }
                 Stmt::VarMfmaScaleZ { var, a, b, scale_a, scale_b } => {
                     let _ = writeln!(s, "{pad}var{} = mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
+                }
+                Stmt::VarMfmaFp8 { var, a, b } => {
+                    let _ = writeln!(s, "{pad}var{} += mfma_fp8({a:?}, {b:?})", var.0);
+                }
+                Stmt::VarMfmaFp8Z { var, a, b } => {
+                    let _ = writeln!(s, "{pad}var{} = mfma_fp8({a:?}, {b:?})", var.0);
+                }
+                Stmt::VarMfmaFp8C { var, a, b, c } => {
+                    let _ = writeln!(s, "{pad}var{} = mfma_fp8({a:?}, {b:?}, c={c:?})", var.0);
                 }
                 Stmt::VarMfmaScaleC { var, a, b, c, scale_a, scale_b } => {
                     let _ = writeln!(s, "{pad}var{} = mfma_scale({a:?}, {b:?}, c={c:?}; {scale_a:?}, {scale_b:?})", var.0);
@@ -1103,6 +1121,22 @@ impl FnBuilder {
         self.f.stmts.push(Stmt::VarMfmaScaleC { var, a: a.into(), b: b.into(), c: c.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
     }
 
+    /// Unscaled fp8 MFMA `a x b + c` (value form; c = frag_zero gives the zero-accumulator instruction).
+    pub fn mfma_fp8_32x32x64(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::MfmaFp8_32x32x64 { a: a.into(), b: b.into(), c: c.into() })
+    }
+    /// `var += a x b` (unscaled fp8, in place).
+    pub fn var_mfma_fp8_32x32x64(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::VarMfmaFp8 { var, a: a.into(), b: b.into() });
+    }
+    /// `var = a x b` (unscaled fp8, zero accumulator).
+    pub fn var_mfma_fp8_32x32x64_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::VarMfmaFp8Z { var, a: a.into(), b: b.into() });
+    }
+    /// `var = a x b + c` (unscaled fp8; c a separate Frag16 value).
+    pub fn var_mfma_fp8_32x32x64_c(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::VarMfmaFp8C { var, a: a.into(), b: b.into(), c: c.into() });
+    }
     pub fn var_mfma_scale_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::VarMfmaScaleZ { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
     }
@@ -1532,6 +1566,15 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
+                    Op::MfmaFp8_32x32x64 { a, b, c } => {
+                        for (o, want, what) in [(*a, DType::Frag8, "a"), (*b, DType::Frag8, "b"), (*c, DType::Frag16, "c")] {
+                            if let Ok(t) = opnd_ty(f, o) {
+                                if t != want {
+                                    errs.push(here(format!("fp8 mfma: operand {what} is {}, expected {}", t.name(), want.name())));
+                                }
+                            }
+                        }
+                    }
                     Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                         for (o, want, what) in [
                             (*a, DType::Frag8, "a"),
@@ -1758,9 +1801,24 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } => {
+            Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } => {
                 if f.var_ty(*var) != Some(DType::Frag16) {
                     errs.push(here(format!("var{var} must be a frag16 accumulator")));
+                }
+            }
+            Stmt::VarMfmaFp8 { var, a, b } => {
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
+                if !ok {
+                    errs.push(here(format!("var{var} accumulated outside its loop")));
+                }
+                if f.var_ty(*var) != Some(DType::Frag16) {
+                    errs.push(here(format!("var{var} must be a frag16 accumulator")));
+                }
+                for o in [a, b] {
+                    match opnd_ty(f, *o) {
+                        Ok(DType::Frag8) => {}
+                        other => errs.push(here(format!("fp8 mfma operand is {other:?}, expected frag8"))),
+                    }
                 }
             }
             Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
@@ -1967,6 +2025,8 @@ fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
             vec![*a, *b, *scale_a, *scale_b]
         }
         Stmt::VarMfmaScaleC { a, b, c, scale_a, scale_b, .. } => vec![*a, *b, *c, *scale_a, *scale_b],
+        Stmt::VarMfmaFp8 { a, b, .. } | Stmt::VarMfmaFp8Z { a, b, .. } => vec![*a, *b],
+        Stmt::VarMfmaFp8C { a, b, c, .. } => vec![*a, *b, *c],
         Stmt::VarSmfmac { a, b, idx, .. } => vec![*a, *b, *idx],
         Stmt::VarAsm { inputs, .. } | Stmt::VarAsmN { inputs, .. } => inputs.clone(),
         Stmt::BeginLoop { init, .. } => init.clone(),
