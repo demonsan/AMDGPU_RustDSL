@@ -1,199 +1,176 @@
-# 设计规格：Rust DSL 与自研 AMDGPU Compiler
+# 设计规格：Rust DSL 与自研 AMDGPU Compiler（最终架构）
+
+> 本文是**设计规格**（做什么、为什么、边界在哪），不是状态记录。当前数字与结论见 `docs/current-status.md`，逐轮证据见 `docs/status.md`。
+> 2026-10-27 的初版描述的是一个更大的目标（Resource SSA / Async Graph、MachineDAG、跨卡通信）；最终落地的是下面的架构。初版中**未采纳**的部分与原因集中在 §13。
 
 ## 1. 一句话模型
 
-**Rust 源码表达值、所有权与协议；内部 IR 表达可优化的 SSA 与资源/异步关系；物理寄存器与指令顺序由独立 witness 约束；LLVM 只提供 MIR/target/ABI/编码发射基础设施。**
-
-这三层各司其职，不能互相冒充：
+**Rust 类型化 DSL 表达值、所有权与协议；内部 typed IR 经验证后降到我们自己的 MIR；寄存器分配与指令调度始终是我们自己的；LLVM 只作为 post-RA tail（hazard / wait / descriptor / 编码）；`own` 后端是不依赖 LLVM 的完整实现，同时充当 tail 的 oracle。**
 
 | 层 | 负责 | 不负责 |
 |---|---|---|
-| Rust 类型系统 | 构图期非法描述（move-after-use、重复 writer、Pending 当 Ready、跨 graph 混用） | GPU 异步 hazard、alias、可见性 |
-| 内部 IR verifier | 所有设备执行路径上的 SSA 支配、资源版本、effects、completion、epoch、收敛 | 真实堆内存寿命、外部框架 race |
-| Runtime / adapter | allocation、module、ABI/context、stream ordering、in-flight 资源 | 编译期正确性 |
+| Rust 类型系统（DSL、safe-asm） | 构图期非法描述（move-after-use、Pending 当 Ready、写只读端口、跨 token 混用）；`#![forbid(unsafe_code)]` | GPU 异步 hazard 的最终判定、数值正确性 |
+| IR verifier（`amdgpu-dsl`） | 类型/uniformity/循环变量单赋值（`var_lint`）/立即数范围/描述符类型 | 物理寄存器、指令顺序 |
+| MIR 层（`amdgpu-compiler`） | 效应模型、调度、RA、hazard/wait 插入、`pin_check`、`mir::verify` | 指令选择之外的 LLVM 级优化 |
+| 后端（`llvm-tail` / `own`） | post-RA 的 hazard、waitcnt、descriptor、编码；两者指令流逐条一致（`tail_invariance`） | 寄存器与顺序决策 |
+| Runtime / 测试 harness | 模块加载、ABI、同轮厂商对照、确定性压力 | 编译期正确性 |
 
 ## 2. 编译管线
 
 ```text
-Rust typed DSL（kernel 源码）
-        │  值 / 所有权 / 协议，无物理寄存器编号
-        ▼
-Semantic SSA（数值图）
-        │
-        ▼
-Resource SSA + Async/Event（存储版本、读取租约、完成事实）
-        │
-        ▼
-内部优化：StateSROA / Fragmentation / PackCombine / ResourceLifetime /
-          PipelineFormation / Fusion / Dataflow CSE-DCE
-        │
-        ▼
-Recipe Expansion → MachineDAG（virtual tuple，无固定编号）
-        │
-        ▼
-AllocationPlan + SchedulePlan（可由 witness 固定）
-        │
-        ▼
-Physical MIR → post-RA 依赖/编码/mode 收尾 → 内部最终验证
-        │
-        ▼
-LLVM AsmPrinter / MC → .o → lld → .co
+DSL(Rust) ─► typed IR（Op 83 种 / Stmt 40 种）─► IR 验证器
+          ─► lowering（uniform 分析、remat、zeroinit、cmpfold、retarget…）─► 我们的 MIR
+          ─► 调度栈（list / hoist / swp / taildup；等待重算）
+          ─► pin_check（含 pinned 段的 hazard / wait / 半写校验）
+          ─► hazard 填充 / 值级 hazard pass（fix_value_hazards）
+          ─► 寄存器分配（线性扫描 → 两阶段 + path-aware 检查；LDS spill；S4 描述符类）
+          ─► 物理级 hazard pass（pad_physical_war）
+          ─► post-RA MIR（物理寄存器、已排序）
+               ├─ llvm-tail（默认）：导出 MIR → llc -start-before=gcn-create-vopd（只跑 tail pass）
+               └─ own：自己的 hazard / wait / descriptor 实现与 emit.rs 文本发射
+          ─► .s ─► ROCm clang 仅做汇编 ─► .co ─► HIP 启动
 ```
 
-### 2.1 为什么不是 LLVM 全后端
+### 2.1 所有权分界：我们的 vs LLVM tail 的
 
-LLVM 的 AMDGPU RA 与指令调度不满足本项目需求，且 LLVM 源码不可修改。因此：
-
-- 生产路径**不运行** LLVM 的 SGPR/WWM/VGPR allocator，也不运行 pre/post machine scheduler。
-- 复用 LLVM 中能直接满足合同的现成能力：机器表示、target/operand/register 描述、必要合法化、ABI 准备、部分 post-RA 修复、AsmPrinter/MC、lld。
-- 会破坏 hard pin、Strict 顺序或通信证明的 late pass 由内部 pass 接管，而不是修改 LLVM。
-
-## 3. Rust 前端
-
-### 3.1 类型角色
-
-| 类型 | Rust 层行为 | GPU 语义 |
-|---|---|---|
-| `Tile` | 可共享 immutable SSA handle | 数值，无固定 physical register |
-| `Accumulator` / `OnlineState` | affine，不 `Clone`；更新消费旧值返回新值 | loop-carried 数值与显式 update 链 |
-| `Slot<Ready/Free/Writing>` | affine capability，writer 不可复制 | physical storage 生命周期 |
-| `PendingReadBatch` | move-only，拥有 source read capability | 已 issue 未完成的 fragment reads |
-| `ReadyFragment` | immutable value，不再借用 source slot | 指定 fragment 的读取已完成 |
-| `ReadCompleteLease` | 不可伪造、move-only | 全部所需 source reads 结束，可 release |
-| `Pred<Wave>` / `Pred<Workgroup>` | 不是 Rust `bool` | device 条件与 uniformity 范围 |
-
-graph / region 使用 invariant brand，禁止跨 kernel、跨 region 混用。物理寄存器编号不出现在这些类型中。
-
-### 3.2 异步读取合同
-
-```rust
-fn issue_read(slot: Slot<Ready>, plan: ReadPlan) -> PendingReadBatch;
-fn complete_subset(batch: PendingReadBatch, group: FragmentGroup)
-    -> (ReadyFragment, PendingReadBatch);
-fn complete_remaining(batch: PendingReadBatch) -> ReadCompleteLease;
-fn release_reads(done: ReadCompleteLease) -> Slot<Reusable>;
-```
-
-必须成立的语义：
-
-- source slot 在 issue 时被 move 进 batch，读取完成前不可重写。
-- `complete_subset` 只把对应 fragment 标为 ready；**partial `lgkmcnt(4)` 不等于整 tile ready**。
-- `ReadyFragment` 不再借用 LDS lease：读取完成后 LDS 可回收，register compute 可继续。
-- `complete_*` 只构建 completion 义务；最终必须由展开后的机器图与 wait/interlock 证据满足。
-- 不采用「`ReadDone` 借用 lease，再 move lease 去 release」的自相矛盾签名。
-
-### 3.3 控制流按 move 构造
-
-```rust
-b.loop_by_move(init, |body, state| { ... });
-b.if_wave_by_move(pred, state, then_fn, else_fn);
-b.if_wg_by_move(pred, state, then_fn, else_fn);
-```
-
-- body 是 `FnOnce`，只在构图期调用一次；运行时迭代由 SSA block argument / backedge 表示。
-- 互斥分支由内部 builder 派生 block-arg capabilities，用户不需要 `Clone` affine state。
-- join 检查每条路径的初始化、资源状态、receipts 与 versions 一致。
-- reference kernel 在 half 中间有 drain exit，因此使用显式 `guard_or_drain` / `LoopOutcome`，不自动生成额外 loop header 或 end guard。
-
-### 3.4 Role 与 paired barrier
-
-- `Role<0,4>` / `Role<4,4>` 仅表示 wave 集合，不表示集合内 predicate 相同。
-- overflow 条件是 `Uniform<Wave>`；drain / continuation 条件需要 `Uniform<Workgroup>` 或经验证的 phase-equivalent 协议。
-- GroupProtocol 在外层声明 participants 与 phase 序列，把唯一 endpoint/ticket 分配给两个 role closure。
-- rendezvous receipt 只证明参与与到达，不证明 payload 完成或 cache 可见。
-
-## 4. 内部 IR
-
-### 4.1 Layer A：Semantic SSA
-
-```text
-Value { id, dtype, shape, layout, uniformity, numerical_contract }
-Op    { id, kind, inputs, outputs, source_span }
-Region{ block_args, operations, yields, role, control_kind }
-```
-
-无 VGPR/SGPR 编号。核心 op 包含 tile view、native max/compare、packing、scaled dot、PV dot、row reduction、state projection、structured if/loop。
-
-### 4.2 Layer B：Resource SSA / Async Graph
-
-```text
-Resource  { id, space, extent, layout, owner_domain }
-Access    { resource, version/epoch, footprint, R/W, source_lease }
-Event     { id, producer, completion_domain, fragment_set }
-Transition{ issue, complete, publish, acquire, release, reclaim }
-Phase     { participants, arrival_sites, memory_handoff }
-```
-
-按 resource / subrange 建 effects，不用单一全局 token 串行化。**phase receipt、payload completion、visibility 是三个独立事实。**
-
-### 4.3 Layer C：MachineDAG
-
-Recipe expansion 产生具体 opcode、virtual tuple、partial write、implicit registers、def/use 与 memory/event edge。每个节点带：
-
-```text
-MachineOpKey = (SemanticOpId, Role, Half, Fragment, RecipeStep)
-```
-
-### 4.4 Layer D：Physical IR
-
-AllocationPlan / SchedulePlan 决定 physical tuple、顺序、wait placement 和 mode。此时才出现 `v52` 之类的编号，并保留 origin、resource/event 与 constraint sidecar。
-
-### 4.5 数据结构为低延迟设计
-
-arena + index vector、u32 ID、interned dtype/layout、紧凑 operand array 与 use-list。不使用每节点 `Arc`/`Mutex`。基础 IR 不可变，agent plan 以 delta 表达，各 pass 结果按 fingerprint 缓存。
-
-## 5. 优化 Pass
-
-| Pass | 内容与安全条件 |
+| 事项 | 归属 |
 |---|---|
-| Type/Layout Propagation | 消除无指令 view/bitcast；不混淆 FP8、scale 与 opaque bits |
-| StateSROA | 拆分 OnlineState 为独立 state 链，避免整 struct 串行化 |
-| Fragmentation | 把 PV/QK 分解为实际 MMA fragment，使 partial readiness 可独立调度 |
-| PackCombine | 纯 SSA low/high 合成带精确 partial-write 的 machine recipe |
-| ResourceLifetime | 按实际 read-complete 缩短 LDS/source 占用 |
-| PipelineFormation | issue/complete/compute/release 组成 stage graph，跨迭代用 epoch SSA |
-| Fusion/Placement | 合并 producer/consumer 并选择 Reg/LDS/Global，保留多 reader 义务 |
-| Dataflow CSE/DCE | 仅在同一 value/version/effect/数值合同下进行 |
-| Bank/RA/Schedule | 基于 virtual value、physical alias 与 hardware reservation |
-| FinalDependency/Protocol | 验证最终 wait、mode、NoSpill、pin 与传输生命周期 |
+| 寄存器分配（含 hole-aware 打包、LDS spill、remat） | **我们** |
+| 指令顺序、跨基本块调度、软件流水、尾部复制、ds_read 提升 | **我们** |
+| wait 计数的语义来源（scoreboard 模型、partial `lgkmcnt/vmcnt`） | 我们（`waits.rs`）；tail 阶段由 LLVM（`SIInsertWaitcnts`）或 own 实现重新插入 |
+| 值/物理级 hazard 的**判定** | 我们的 pass 先行；LLVM tail / own 各自补齐并必须与之一致 |
+| descriptor（`.amdhsa_*`、kernarg 元数据）、汇编文本、编码 | LLVM tail 或 own |
+| LLVM 的 RA、MachineScheduler、IGLP | **不使用**（它们按基本块工作；LLVM 源码不可修改） |
 
-## 6. Pin、命名寄存器与 Strict
+**后端选择**：`amdc emit --backend auto|llvm-tail|own`（`AMDC_BACKEND`）。`auto` 对含 own-only 操作（DMA / LDS 直达 / `buffer_load … lds`）的 kernel 选 own，其余选 llvm-tail。找不到 pin 的 LLVM 工具时 llvm-tail **直接报错**，不静默降级为 own。
 
-```text
-Pin(value/fragment, bank, base, width, region, Must|Prefer, spill_policy)
-```
+**LLVM pin**：ROCm 10.1.0（AMD LLVM 24.0.0git，方言 `llvm24`，默认）；ROCm 7.0.2（`llvm20`）作为第二方言（`AMDC_DIALECT`，由 `llc --version` 探测）。ROCm 10.x 不带 `llc`，`tools/llvm_build_llc.sh` 用同一 commit 的 `llc.cpp` 对已安装头文件编译并链接已安装的 `libLLVM.so`（2 个 TU，数秒）。
 
-- `Must`：最终物理 tuple 必须兑现，否则编译失败；不得静默降级或自动 spill。
-- `Prefer`：可调整，但报告真实 placement 与原因。
-- `named_reg`：无 GPU 内存地址的版本化固定槽，读写带 version 与 loop phi。
-- 循环累加读取必须由 backedge 新值决定，不能折叠回循环前初始值。
-- MFMA bank form 逐指令选择，一个 pinned AGPR 不得迫使无关 accumulator 迁移。
-- Strict schedule 只在允许边界补 wait/NOP；内部 hazard 无法解决则报错。
-- post-RA 的 copy、operand 交换、MSB 状态插入都会使旧证明失效，必须重新验证。
+## 3. DSL 与 typed IR
 
-## 7. LLVM 复用边界
+- **入口**：`FnBuilder`（约 140 个公开方法）→ `Function`（kernarg ABI；与厂商 kernel 逐字节兼容的 656 字节布局由 kernel 层负责）。
+- **值模型**：`ValueId`（单次定义）、`VarId`（循环变量）、`Opnd`、`DType`（`F16/F32/I32/U32/I1/Ptr/Frag2/4/8/16/Rsrc`）。`Rsrc` 只存在于 SGPR 四元组。
+- **控制流**：`begin_loop … end_loop` 是 do-while，循环变量以 `begin_loop(&[(DType, init)])` 声明、`set_var` 更新（`var_lint` 检查单赋值与作用域）；`begin_if` 是 **wave 级**分支（对 `vcc` 的 any 判断，**没有 exec 掩码**），因此体内整 wave 执行。
+- **Uniformity**：lowering 的 `uniform_analysis` 判定波内一致的整数值与循环变量，落入 SGPR（`scalarize`），其余走 VGPR。`s_operand` 对非一致值报错而不是静默降级。
+- **指令族**：MFMA（scaled 32x32x64 f8f6f4 的累加 / zero-C / **C 操作数** 三形式；**unscaled** 同三形式；f16/bf16；`v_smfmac`）、VALU（int/fp、`pk_add/mul/sub`、`perm`、`permlane32_swap`、`pknorm`、`scalef32`/`cvt_pk_fp8` 半写、`exp/rcp/log`、`max3`、`readfirstlane`）、内存（见 §9）、同步（`barrier`、`wait_vm/lds`、`fence_release/acquire` 与 coherent/write-through 访问）。
+- **实验面**：`FMHA_OPT` token 做 A/B；每个优化与负结果都可复现。
+- **IR 验证器**在 lowering 之前运行：类型、立即数位宽（如 MUBUF `imm` 12 位、DS offset 对齐）、描述符操作数必须是 `Rsrc`、soffset 必须是一致整数。
 
-复用：MIR/target/ABI 基础设施、AsmPrinter、MC、lld、必要 late 修复。
-不复用：LLVM RA、pre/post machine scheduler、会改变 placement/order/CFG 的优化、设备 LLVM IR 生成。
-禁止：应用 LLVM 补丁、修改安装目录、依赖未公开内部符号。
+## 4. MIR 与效应模型
 
-LLVM 不认识的 opcode/modifier：优先降级为已支持的指令序列；确需原始编码时，必须在完成内部依赖与资源分析后，经现有 INLINEASM / MC raw-byte 通道承载，并显式登记 physical def/use/clobber 与 memory effects。**不能因为装进 opaque asm 就声称 LLVM 的 hazard 分析仍然完整。**
+- `MFunction { blocks, vregs: Vec<RClass>, alias, loops, … }`；`RClass` = `V1/V2/V4/V8/V16`（VGPR 元组）、`S1/S2/S4`（SGPR；`S4` 为 4 对齐的 MUBUF 描述符四元组）。
+- `MInst { op: MOp, dst, srcs: Vec<Src>, imm, auto, pin }`。`auto` 标记由 wait 重算 pass 管理的等待；`pin` 标记手写（safe-asm）指令。
+- **效应模型**（`sched/effects.rs`）是调度、RA 活跃性与 wait 重算共用的唯一事实来源：每条指令的读/写 **dword 槽**（`Slot = vreg·16 + dword`，含 `vcc/scc` 槽）、内存访问描述（空间 Global/Lds、读写、基址槽、偏移、大小）、fence 类别（Barrier / WaitVm / WaitLgkm / SetPrio / Nop）。MUBUF 访问以“未知基址”建模（恒 may-alias）；LDS 直达形式 = 全局读 + `Fence::Barrier`，无 VGPR 目的。
+- **MIR 验证器**（`mir::verify`）检查操作数类别与范围（如 `SBufferRsrc` 必须由 S2 构造 S4、buffer imm ≤ 4095）。
 
-## 8. 跨卡通信（后续阶段）
+## 5. 调度栈
 
-基于 MORI CCO，首版单机多卡，LSA / SDMA / GDA(PSD, 同机 FULL QP) 三条路径。核心要求：
+`sched/` 共 15 个模块、约 2,700 行：
 
-- RemoteView 是版本化 capability，不是裸指针。
-- completion facts 分离：submitted / committed / source-safe / delivered / GPU-visible / consumer-complete。
-- publish 必须汇合全部 writer；全部 reader Ack 后才能 reclaim。
-- timeout / abort 不等于停止访问，资源 quarantine 直到真实 quiescence。
-- 无前进性保证的阻塞等待环拒绝。
+| 模块 | 作用 |
+|---|---|
+| `effects` / `order` | 效应与内存/fence 排序规则（图与验证器共用） |
+| `depgraph` | 块内依赖图（寄存器、内存、fence、pinned 屏障边） |
+| `model` | 机器模型表（延迟、发射、资源类；证据等级 Verified/Experimental/Unknown） |
+| `list` | 压力感知 list scheduler（多窗口，取不超压力上限的最优，否则保持原序） |
+| `hoist` | `ds_read` 上提（受压力与距离上限约束） |
+| `swp` / `taildup` / `cfg` | 软件流水；if/else 菱形尾部复制；CFG 清理 |
+| `waits` | scoreboard 等待重算：剥离 `auto` 等待，按 vmcnt/lgkmcnt 队列重新插入 **partial** 等待（SMEM 乱序时退化为 0） |
+| `verify` / `sim` / `liveness` | 独立验证器（顺序置换、等待充分性）、简易模拟、活跃性 |
 
-## 9. 待验证事项
+- **默认关闭**（`AMDC_SCHED` 未设）；FMHA kernel 由 `lib.rs` 按名称给出预设：`ld`（只重算 wait + `ds_read` 提升，不重排）用于 `_t`/`_sv`，`_vs128/_t128/_kvsplit/_g*` 使用完整 list scheduler（含各自的压力上限/跨 barrier 设置）。`AMDC_SCHED=0` 关闭。
+- **失败回退**：出现 “out of VGPRs” 时依次收缩 hoist 距离、压力上限，最后回到未调度代码。
+- **pinned 屏障语义**：`MInst.pin` 的指令在依赖图中是屏障节点——run 内保持原序，run 之前的所有指令先于 run 的首条，run 的末条先于其后的所有指令；hazard 填充与 `sink_defs/coalesce` 等 lowering pass 也不得移动或跨越 pinned 指令。
+- 调度器对 **ALU 受限** 的假设已被量化证伪（§12）：它保留为可选工具，不是性能杠杆。
 
-以下在实现前必须补齐证据，当前不得当作契约：
+## 6. 寄存器分配
 
-- gfx1250 Expert2 的完整 `va_vdst` / `vm_vsrc` 硬件语义（公开 CDNA5 文档未完整覆盖）。
-- LLVM 锁定版本中 late pass 对 operand / MSB / clause 的具体改写行为。
-- MORI CCO 在本项目目标版本的 queue/packet/visibility 细节。
-- 参考 kernel descriptor 中 kernarg_size=0 与 metadata 656 的差异来源。
+- **分配策略链**：线性扫描（紧凑）→ 单寄存器从高位打包 → **两阶段**（宽元组优先，窄值按 dword 级精确活跃段填进空洞）；仍不够时由 lowering 驱动 remat（`remat1..4`）与 **LDS spill**（`ldsspill8..64`）。每一步失败才进入下一步；不会静默产生 spill 之外的降级。
+- **活跃性**：块级 + dword 级精确段（`precise_segments`），带“可达定义”剪枝（无可达定义的槽不占寄存器）；循环回边把 header 的 live-in 延伸到 latch。
+- **reaching-writer 检查**（两阶段结果的守卫，`check_reaching`）：路径感知——每个物理寄存器记录“当前写者 → 在该路径上先于它的写者集合（history）”。读槽 r 违规，当且仅当 (a) r 自己的值从未到达而他者到达，或 (b) 存在他者写者其 history 含 r（r 被写后在同一路径上被覆盖，即真实 clobber）。“他者的路径上 r 从未被写”（循环体内定义、循环后读取时经零趟路径）**不是**违规：该路径上读本就是未定义值。平坦的“写者集合 ≤ 1”判据会误拒任何持久循环变量。
+- **MFMA 操作数检查**（`check_mfma_operand_aliasing`）：A/B 与 D 不得重叠，C/D 同址或不相交，起址对齐。
+- **S4 描述符类**：SGPR 四元组、4 对齐，参与普通 SGPR 分配与复用；描述符是普通 SSA 值，在值变化处重新构造。
+
+## 7. Hazard / Wait 模型
+
+分层（每层只做自己能证明的事）：
+
+1. **lowering 等待**：按 `pending_vmem/lgkm` 在读取前插入 `auto` 等待。
+2. **wait 重算**（`waits.rs`）：调度后剥离 `auto` 等待并按 scoreboard 重新插入；显式等待保留。存储与 LDS 写也占队列槽，因此 partial 计数精确。
+3. **值级 hazard pass**（`fix_value_hazards`，按虚拟寄存器）：MFMA 结果延迟（f16/fp8 16×16/32×32×16 为 12，scaled / unscaled 32×32×64 与 `smfmac` 为 20；strict 模式 +1）、同 opcode 就地累加链豁免、VALU 写 → 矩阵操作数/`readfirstlane`/`permlane` 需 2 等待态（进位输出 4）、超越函数 5 槽、packed fp32 → 超越函数 2 槽、`vcc` 生产-消费、`s_nop N` 计 N+1 态；可选 stall 填充（pinned 指令不参与）。
+4. **物理级 hazard pass**（`pad_physical_war`，RA 之后，因为 RA 会重用寄存器，值级 pass 看不到）：
+   - 在途 MFMA 的 **C 源** WAR；
+   - 在途 MFMA 的 **目的** WAW/RAW 对*另一虚拟寄存器*（19/21 槽，沿 CFG 传播到后继块）；
+   - **宽存储数据 WAR**：`global_store_dwordx4`/`buffer_store_dwordx4` 发射后 2 个等待态内不得有 VALU 写其数据寄存器（对应 LLVM `has12DWordStoreHazard`，gfx940+ 为 2）。
+5. **`pin_check`**：对含 pinned 指令的 kernel，在调度后的 MIR 上用编译器自己的 hazard / wait / 半写模型复查——如果这些 pass 需要在 pinned run **内部**补 nop/wait，则编译失败（边界处的 padding 属正常）。
+
+**三类真实 bug（均由硬件现象驱动，均有 MIR 级回归测试）**
+
+| 类别 | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 物理 WAW vs 在途 MFMA 目的 | opt-in 组合下输出非确定（~2.7% 元素，6 次 6 个 md5） | 结果已死的 MFMA 其目的寄存器被 RA 分配给新值，MFMA 在 ~19–21 槽后落笔覆盖 | `pad_physical_war` 跟踪在途目的区间 |
+| VMEM 宽存储数据 WAR | 出厂 split 路径偶发数据损坏（~5%，时序扰动下 97%） | `global_store_dwordx4` 异步读数据 VGPR，后随 VALU 在 1 等待态内覆盖 | 宽存储数据区间 + 2 等待态（`_kvsplit` 仅 +4 `s_nop`） |
+| reaching-writer 误报 | 任何持久循环变量使两阶段 RA 编译失败 | 平坦写者集合把零趟路径当成歧义 | 路径感知检查（§6） |
+
+**一致性守卫**：`tail_invariance`（llvm-tail 与 own 的指令流除 nop/wait/`delay_alu` 外逐条相同）、`hazard_oracle`（约 1 万对指令的 own 模型 vs LLVM 插入量）、`hazard_classes`、`phys_waw`、`pin_check`、`pinning`、`smfmac_hazards`、`dma_hazards`。
+
+## 8. 指令覆盖
+
+- **101 个 MOp**，每个在 `llvm20.tbl` 和 `llvm24.tbl` 中有行（`Key[:kinds] | 签名 | MIR 文本`，`kinds` 区分寄存器/立即数源，最具体的行胜出），并有 own emit。
+- **own-only**：DMA（`global_load_lds*`）、LDS 直达的 `buffer_load … lds`、以及含它们的 kernel——LLVM MIR 对这些要么无法表达要么与我们的 m0 序列模型不符；`uses_own_only_ops` 据 MIR 实际内容判定，`auto` 后端据此选择。
+- 每个新增 MOp 的最小闭环：DSL op/stmt → lowering → emit → 效应/代价/hazard → 两个 `.tbl` 行（或登记 own-only）→ 探针 kernel 进 `kernel_names()`（覆盖 `asm_assembles`、`tail_invariance`、`llvm_tail`、`register_accounting`）→ 硬件探针。
+- 已知限制：`llvm20` 行是 `llvm24` 行的拷贝，仅由 llvm24 的 `llc` 做机器验证；hazard-oracle 跳过 S4 描述符操作（128 位 SGPR live-in 无法在其按块 live-in 中表达），这些操作由逐行机器验证和硬件探针覆盖。
+
+## 9. 内存路径
+
+| 路径 | 要点 |
+|---|---|
+| FLAT（`global_*`） | 64 位 VGPR 地址；offset 13 位有符号；`sc1` 写穿/一致性读、`global_atomic_add`（返回旧值，设备作用域）；SADDR 形式（标量基址 + 32 位 VGPR 偏移） |
+| LDS | `ds_read_b32/b128/b64_tr_b8`、`ds_write_b32/b128`；offset 为编译期常量并检查对齐；读写都占 lgkm 队列槽 |
+| 全局→LDS DMA | `global_load_lds_dwordx4/dword`：LDS 目的 = `M0` + imm + lane·size（`s_mov m0` + `s_nop 0`）；vmcnt 跟踪，效应上带 Barrier fence；own-only |
+| **MUBUF** | 见下 |
+| last-arriver / 内存序 | 完整契约见 `docs/last-arriver-memory-model.md` |
+
+**MUBUF**（`buffer_load/store_dword{,x2,x4}`、`buffer_load_dword{,x4} … lds`）：
+
+- **描述符**：4 个连续 SGPR `[base lo, base hi & 0xffff, num_records, 0x00020000]`（dword3 在 gfx950 硬件验证）；由标量 kernarg 指针经 `s_mov/s_and/s_mov/s_mov` 构造；`buffer_rsrc`（size = 0xFFFFFFFF，关边界检查）、`buffer_desc(ptr, bytes)`、**`buffer_desc_dyn(ptr, runtime_bytes)`**（dword2 取自一致的 SGPR 值/循环变量，可在每块/每 tile 重新构造）。
+- **寻址**：`vaddr`（逐 lane 32 位字节偏移，或省略为 `off` 形式）+ `soffset`（一致 SGPR 值/循环变量，或 0..64 的内联常量）+ 12 位 `imm` + 需要时 `m0`；LDS 形式中 `imm` 同时加到内存地址与 LDS 目的。
+- **越界语义（gfx950 硬件验证）**：偏移 ≥ `num_records` 的读返回 0；写被丢弃；**LDS 直达形式把越界 lane 以 0 写入 LDS**（不是丢弃）。range check **不含 soffset**，大小须已包含意图中的基偏移。该语义使“最后一个 partial tile”无需 clamp 或分支。
+- **Hazard**：与 FLAT 同属 VMEM 类、占 vmcnt 槽；`buffer_store_dwordx4` 数据适用宽存储 WAR（数据是 MIR 源 0）；LDS 形式无 VGPR 目的、走与 `global_load_lds` 相同的 vmcnt 记账。
+- **LLVM 行**：`SBufferRsrc(Dyn)` 与全部 load/store（OFFEN/OFFSET，操作数序 `vaddr, srsrc, soffset, offset, cpol, swz`，内存操作数 `addrspace 8`）；两个 LDS 直达形式为 own-only。
+
+## 10. safe-asm 桥与 pin
+
+手写热点窗口用 `crates/amdgpu-safeasm`（详见 `docs/safe-asm-design.md`）：
+
+- **接入**：`Op::Asm`（值形式）、`Stmt::VarAsm`（一个 in/out 循环变量）、`Stmt::VarAsmN`（多 in/out，按声明顺序绑定）。`AsmBlock` 是纯数据（指令 + 端口 + 常量 + pin/loop_body 标志），经 `lower_asm` 降成普通 MIR，**之后与 DSL 代码一起**走调度、RA、hazard、tail。
+- **类型层**：端口（`In<N>` 只读、`inout`、输出）、所有权 token（`Pending`、`Mfma`、`Smfmac`、`Trans`、`Pw<L,H>` 半写 type-state）、`Ready` 证明、const-assert 常量总线、部分 `lgkmcnt/vmcnt` 由 scoreboard 精确给出。
+- **验证器**：直线、自带时钟；含 **op 白名单**（raw-only 操作直接拒绝）。
+- **循环契约**：循环体 `Seq::finish_loop_body()` 必须 **drain-closed**（入口与出口都无在途矩阵结果、无未完成 DS/VMEM、不得 `output_exit`），这样直线验证器对每次迭代都成立。
+- **pin**：`Seq::pin()` 使整段成为调度器屏障（§5）；编译器在调度后的 MIR 上运行 `pin_check`（§7.5）。
+
+## 11. 验证体系
+
+| 守卫 | 保证 |
+|---|---|
+| `cargo test`（28 个目标 / 111 项） | 全部单元/集成/硬件无关测试（`tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`llvm_tail`、hazard 系列、`ra_reaching`、`pin*`、safe-asm ui compile-fail …） |
+| `register_accounting` / `mir_invariants` | 描述符声明了每个用到的寄存器；RA 从不 clobber 活值；已知错误类能被检出 |
+| 硬件探针（`tools/*_probe.sh`） | 新原语的硬件语义（越界、半写、等待态、last-arriver、MUBUF、unscaled MFMA …） |
+| 测量协议 | 溯源核对 `.s/.co`、交错 A/B、同轮厂商、split 形状反复启动比对 md5 |
+
+## 12. 设计结论（已量化）
+
+- **指令数与关键路径**：削减 VALU 8.7% 只带来 wave 周期 +1.2%——kernel 不是 VALU/指令受限，去掉的槽变成依赖停顿；因此调度器微调与地址 VALU 削减（含 MUBUF，纯 buffer 上界 +0.1…1.0%）对性能中性。这是把调度栈保留为工具而非杠杆的依据。
+- **正确性优先**：本设计里最有价值的部分是“能把每一类硬件 hazard 变成编译期/测试期可复现的模型”（§7），而非某个优化。
+
+## 13. 初版中未采纳的部分
+
+| 初版设想 | 结局 |
+|---|---|
+| Resource SSA / Async Graph、`Event/Transition/Phase` 全套资源版本模型 | 未实现；由“效应模型 + scoreboard + 显式 `Pending` token（safe-asm）+ hazard pass”取代，覆盖了实际踩到的全部 bug 类 |
+| MachineDAG / AllocationPlan + SchedulePlan witness | 未实现；RA 与调度直接作用于 MIR；`pin_check` 承担“手写顺序必须被保留且被校验”的职责 |
+| 复用 LLVM late pass 并接管破坏 pin 的 pass | 简化为“导出 post-RA MIR，只跑 tail pass”；pinned 顺序由我们的 hazard 层保证 |
+| 跨卡通信（MORI CCO、RemoteView capability） | 不在本项目范围 |
+| gfx1250 / CDNA5 硬件语义 | 不在本项目范围（目标为 gfx950） |
+
+初版中**保留下来的原则**：类型系统管构图期非法描述、验证器管全路径事实、LLVM 源码不可修改、`Must` 语义的 pin（pinned 指令顺序不得被悄悄改写）、被替换的证明必须重新验证（post-RA 的任何改写都要重新过 `pin_check`/hazard）。

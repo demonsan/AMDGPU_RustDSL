@@ -1,9 +1,36 @@
 # Instruction scheduling (crates/amdgpu-compiler/src/sched/)
 
-Branch `sched-xblock`. Default OFF; enable with `amdc emit --sched` or `AMDC_SCHED=1`
-(`AMDC_SCHED_OPTS=rewait,xbar,noverify,stats,drain,limit=N,xbar=B,only=B1+B2`).
-LLVM is not used for scheduling (its MachineScheduler/IGLP work per basic block); LLVM stays only a tail.
+## Status (final; merged into Main, numbers as in `docs/current-status.md`)
 
+* **Switches.** The scheduler is OFF by default for arbitrary kernels: `AMDC_SCHED` unset = the old pipeline. Enable with `amdc emit --sched` or
+  `AMDC_SCHED=1|ld|auto` (`AMDC_SCHED_OPTS=rewait,xbar,noverify,stats,drain,limit=N,xbar=B,only=B1+B2,hoist=N,swp,taildup`). `AMDC_SCHED=0` forces it
+  off for the FMHA kernels, which otherwise get a per-kernel preset chosen by name in `lib.rs` (`lower_and_allocate_with`):
+  * `ld` preset (`reorder = false`, `ldshoist = true`, `alu_across_barrier = true`): scoreboard-recomputed partial `vmcnt/lgkmcnt` waits and `ds_read` hoisting,
+    **no instruction reordering** - used for the `_t` / `_sv` family (bit-identical results, measured best on those kernels);
+  * the **full list scheduler** (reordering) for `_vs128`, `_vs5/6/9`, `_kvsplit`, `_vsm`, `_t128` and `_g*` (`_t128` additionally lets ALU cross the single barrier
+    and uses pressure limit 248, a heuristic knob that must be re-measured on changes).
+  A failed allocation retries with a smaller hoist distance, then smaller pressure limits (-16/-32/-48), finally the unscheduled code.
+* **What the model covers.** `effects.rs` (per-dword read/write slots of the canonical tuple, `vcc`/`scc` slots, memory access descriptors with space/base/offset/size,
+  fence classes), `order.rs` (the one set of memory/fence ordering rules shared by the dependence graph and the independent verifier), `depgraph.rs`, `model.rs`
+  (issue/latency/resource classes with an evidence grade per row), `list.rs`, `hoist.rs`, `swp.rs`, `taildup.rs`, `cfg.rs`, `waits.rs` (scoreboard wait recomputation:
+  partial `vmcnt/lgkmcnt`, stores and LDS writes occupy queue slots, SMEM forces `lgkmcnt(0)`), `verify.rs` (permutation + wait-sufficiency checks), `sim.rs`, `liveness.rs`:
+  15 modules, ~2,700 lines. MUBUF accesses are modelled with an unknown base (always may-alias); the LDS-direct forms (`global_load_lds`, `buffer_load ... lds`) are a
+  global read plus a `Fence::Barrier`, vmcnt-tracked, without a VGPR destination.
+* **Pinned instructions (safe-asm).** `MInst.pin` instructions are barrier nodes in the dependence graph: a run of consecutive pinned instructions keeps its order verbatim,
+  every earlier instruction precedes the run's first one and its last one precedes every later instruction (all edges point forward, so the graph stays acyclic).
+  `hoist.rs` inherits this through the graph; the hazard pass's stall filling and the lowering passes that move or merge instructions (`sink_defs`, `coalesce`) skip pinned
+  instructions. Waits for the loads a pinned block's inputs depend on are emitted explicitly at the START of the run. `pin_check` (before the hazard pass) rejects any
+  padding or wait the compiler would need to insert INSIDE a pinned run (at the run boundary it is normal) - see `docs/safe-asm-design.md`.
+* **Measured conclusion.** The shipped FMHA kernels are **not VALU / instruction-issue limited**: removing 8.7% of the VALU instructions moved the wave cycles by only +1.2%
+  (the removed slots became dependency stalls, `WAIT_INST_ANY` +14.8%); address-VALU removal through MUBUF is bounded at +0.1..1.0%; pinned M-window / K-ahead ring variants were
+  -5..-7% / -10.5% (in-order issue + padding + VGPR pressure / phase imbalance). Consequently scheduling micro-edits are **performance-neutral** on these kernels. The scheduler stays as an optional, verified tool (and as the consumer of the
+  hazard/wait model), not as a performance lever. Numbers: `docs/current-status.md` §5.
+* **Bugs this layer exposed (all fixed, MIR-level regression tests):** physical WAW against in-flight MFMA destinations (`pad_physical_war`), the VMEM wide-store data WAR,
+  and the two-phase RA reaching-writer false positive - see `docs/design.md` §7.
+
+(The remainder of this file is the original design/evidence record of the branch `sched-xblock`.)
+
+LLVM is not used for scheduling (its MachineScheduler/IGLP work per basic block); LLVM stays only a tail.
 ## Pipeline
 
 `lower -> [sched::run] -> hazards (strict) -> mir::verify -> regalloc -> pad_physical_war -> tail (own | llvm)`.

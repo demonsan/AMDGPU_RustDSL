@@ -1,5 +1,11 @@
 # LLVM tail integration ("our middle end + LLVM tail")
 
+> **Current status (final).** Pinned LLVM: ROCm 10.1.0 / AMD LLVM 24.0.0git (dialect `llvm24`, default; `llc` built by `tools/llvm_build_llc.sh`); the `llvm20` dialect (ROCm 7.0.2) is also supported.
+> `tail_invariance` guarantees that the llvm-tail and own backends emit the same instruction streams modulo nops / waits / `delay_alu`. `cargo test`: 111 tests / 28 targets green
+> (numbers as in `docs/current-status.md`). 101 MOps have rows in both `llvm20.tbl` and `llvm24.tbl`; the DMA, LDS-direct and `buffer_load ... lds` forms are own-only (kernels using them auto-select the own backend).
+> Known limitations: (1) the `llvm20.tbl` rows are copies of the `llvm24.tbl` rows and are machine-verified only by the llvm24 `llc`; (2) the hazard-oracle test skips the S4 buffer-descriptor ops (a 128-bit SGPR live-in
+> is not expressible in its per-block live-ins), which are covered by the one-row-per-op machine-verifier test and the hardware probes. Design context: `docs/design.md` §2 and §8.
+
 NOTE (round 3): the primary pin is now ROCm 10.1.0 (AMD LLVM 24.0.0git, dialect `llvm24`), ROCm 7.0.2 (`llvm20`) stays supported; see docs/llvm-tail-conformance.md. Numbers below were measured with 7.0.2 unless stated.
 
 Status: prototype on branch `backend-tail`. Evidence grades: **Verified** = measured/observed in this
