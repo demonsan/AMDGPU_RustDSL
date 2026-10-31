@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """gen9 accuracy / vendor-parity gate over a `tests/gpu/run_ref.sh` log (stdin or file).
 
 Per shape (blocks start with `=== B=...`): our mean_err <= --mean-max (default 2.6e-3), our bad count <= the vendor's bad count on the SAME shape,

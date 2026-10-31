@@ -10988,8 +10988,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.end_if();
 }
 
-
-/// `_vs9` (gen9 scaffold, docs/gen9-vendor-mirror-design.md): starts as an exact copy of `emit_fmha_vs128_role` so that it passes every `_vs128` gate at step 0; the vendor structure is grafted\n/// window by window (V window, M window, conversion chain as separate replaceable units). Do not edit `emit_fmha_vs128_role` for gen9.\nfn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
+/// `_vs9` (gen9 scaffold, docs/gen9-vendor-mirror-design.md): starts as an exact copy of `emit_fmha_vs128_role` so that it passes every `_vs128` gate at step 0; the vendor structure is grafted
+/// window by window (V window, M window, conversion chain as separate replaceable units). Do not edit `emit_fmha_vs128_role` for gen9.
+fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let win_c = vs5_win("winc");
     let win_m = vs5_win("winm");
     let _win_a = vs5_win("wina");

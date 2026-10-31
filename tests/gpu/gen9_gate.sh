@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # gen9 acceptance gates for `_vs9` (docs/gen9-vendor-mirror-design.md). gen9 output is NOT bit-identical to `_vs128` (different reference math): the gate is
 # accuracy / vendor parity (tools/gen9_gate.py), determinism, and per-CU throughput milestones, not an md5.
 #   REF_CO=/path/vendor.co [GEN9_KERNEL=fmha_fwd_hd128_mxfp8_vs9] [GEN9_MD5=<md5>  (step 0 only: output md5 of B1H8S2048 via REF_DUMP2)] bash tests/gpu/gen9_gate.sh
