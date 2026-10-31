@@ -912,7 +912,40 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
                 if let Some(ws) = st.get(&p) {
                     if !ws.contains(r) || ws.len() > 1 {
                         let at: Vec<String> = ws.iter().map(|w| format!("{w}={:?}", wloc.get(w).map(|v| v.iter().take(4).collect::<Vec<_>>()).unwrap_or_default())).collect();
-                        report.push(format!("block {b} inst {ii} {:?}: reads slot {r} ({}{}) but the reaching writers are {:?} [{}]", inst.op, if p.0 { "v" } else { "s" }, p.1, ws, at.join("; ")));
+                        // witness: a CFG path from a foreign writer's block to this read that never passes a block writing the slot read
+                        let own: std::collections::HashSet<usize> = wloc.get(r).map(|v| v.iter().map(|x| x.0).collect()).unwrap_or_default();
+                        let mut wit = String::new();
+                        for w in ws.iter().filter(|w| *w != r) {
+                            if let Some(src) = wloc.get(w).and_then(|v| v.first()).map(|x| x.0) {
+                                let mut prev: HashMap<usize, usize> = HashMap::new();
+                                let mut q = std::collections::VecDeque::from([src]);
+                                let mut seen = std::collections::HashSet::from([src]);
+                                while let Some(x) = q.pop_front() {
+                                    if x == b && x != src {
+                                        break;
+                                    }
+                                    for &s in &succs[x] {
+                                        if !seen.contains(&s) && (!own.contains(&s) || s == b) {
+                                            seen.insert(s);
+                                            prev.insert(s, x);
+                                            q.push_back(s);
+                                        }
+                                    }
+                                }
+                                let mut path = vec![b];
+                                let mut cur = b;
+                                while let Some(&pv) = prev.get(&cur) {
+                                    path.push(pv);
+                                    cur = pv;
+                                    if cur == src {
+                                        break;
+                                    }
+                                }
+                                path.reverse();
+                                wit = format!(" witness path {:?}", path);
+                            }
+                        }
+                        report.push(format!("block {b} inst {ii} {:?}: reads slot {r} ({}{}) but the reaching writers are {:?} [{}]{}", inst.op, if p.0 { "v" } else { "s" }, p.1, ws, at.join("; "), wit));
                     }
                 }
             }
