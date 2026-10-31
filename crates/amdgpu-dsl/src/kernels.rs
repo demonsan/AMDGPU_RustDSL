@@ -18644,24 +18644,26 @@ pub fn probe_buffer_rw() -> Function {
     let v1s = b.buffer_load_f32(rin, o4, s_off, 0); // soffset (SGPR) = 3072
     b.buffer_store_f32(rout, o4, c0, 2048, v1s); // out[2048..2304) <- in[3072..3328)
     // --- FLAT path, same data, 4096 bytes further
+    let c4096f = b.c_i32(4096);
+    let outf = b.ptr_add(outp, c4096f);
     let pin16 = b.ptr_add(inp, o16);
-    let pout16 = b.ptr_add(outp, o16);
+    let pout16 = b.ptr_add(outf, o16);
     let f4 = b.load_b128(pin16, 0);
-    b.store_f32x4(pout16, 4096, f4);
+    b.store_f32x4(pout16, 0, f4);
     let pin8 = b.ptr_add(inp, o8);
-    let pout8 = b.ptr_add(outp, o8);
+    let pout8 = b.ptr_add(outf, o8);
     let g2 = b.load_f32(pin8, 1024);
     let g2b = b.load_f32(pin8, 1028);
-    b.store_f32(pout8, 4096 + 1024, g2);
-    b.store_f32(pout8, 4096 + 1028, g2b);
+    b.store_f32(pout8, 1024, g2);
+    b.store_f32(pout8, 1028, g2b);
     let pin4 = b.ptr_add(inp, o4);
-    let pout4 = b.ptr_add(outp, o4);
+    let pout4 = b.ptr_add(outf, o4);
     let g1 = b.load_f32(pin4, 2048);
-    b.store_f32(pout4, 4096 + 1536, g1);
+    b.store_f32(pout4, 1536, g1);
     let g1s = b.add_i32(o4, s_off);
     let pins = b.ptr_add(inp, g1s);
     let g1v = b.load_f32(pins, 0);
-    b.store_f32(pout4, 4096 + 2048, g1v);
+    b.store_f32(pout4, 2048, g1v);
     // --- out-of-range: a descriptor of 512 bytes (lanes >= 32 read offset >= num_records: zero; their stores are dropped)
     let rin_s = b.buffer_desc(inp, 512);
     let z4 = b.buffer_load_b128(rin_s, o16, c0, 0);
