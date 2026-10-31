@@ -12,13 +12,13 @@ Two groups of 4 waves (all 8 waves own 32 query rows) run the SAME code one barr
 | MFMA | 1 | 2 x `v_smfmac_f32_16x16x128_fp8_fp8` (row sums), 8 UNSCALED `v_mfma_f32_32x32x64_f8f6f4` (PV), 1 `v_mfma_f32_32x32x8_bf16` (bias C, reused by the 4 QK tiles), 8 `v_mfma_scale_f32_32x32x64_f8f6f4` (QK of the NEXT 128 keys); `buffer_load_dwordx4 ... lds` DMA of later tiles interleaved |
 | barrier | `s_setprio 0` + `s_barrier` | |
 
-2 barriers per 128 keys, loop body is 2x unrolled (two ring-slot parities). ~113 VALU per 128 keys on the fast path (ours ~400). Staging is global->LDS DMA only (no VGPR round trip), 1040-byte runs. The row-sum smfmac uses per-lane A / index operands built with `v_cndmask` from a lane mask (not a constant).
+2 barriers per 128 keys, loop body is 2x unrolled (two ring-slot parities). ~113 VALU per 128 keys on the fast path (the early `_vs` scaffold was ~400; the final `_vs128` is described below). Staging is global->LDS DMA only (no VGPR round trip), 1040-byte runs. The row-sum smfmac uses per-lane A / index operands built with `v_cndmask` from a lane mask (not a constant).
 
 ## Final `_vs128` implementation (Main v2.2-round75-final)
 
 This supersedes the early `_vs` scaffold; the shipped kernel is `fmha_fwd_hd128_mxfp8_vs128`
-(own backend), selected by `fmha_fwd_hd128_mxfp8_auto` for the 128-row/256-row fallback and for
-filled grids.
+(own backend), selected by `fmha_fwd_hd128_mxfp8_auto` for the 64-block benchmark and for filled grids;
+the 128-row fallback is the separate `_t128` kernel.
 
 - **256-row blocks** (8 waves x 32 query rows, 512 threads); 1 block/CU, 2 waves/SIMD, 8 waves/CU.
 - **Q prologue:** Q staged with **16-byte (`b128`) loads** and held resident in registers for the

@@ -1755,7 +1755,7 @@ an opt-in fallback (bit-identical, ~11% split cost) if a future hazard is found.
 ## 7.12 Certified closure (Main v2.2-round75-final)
 
 Snapshot: **Main `8fec359`, tag `v2.2-round75-final`**. This is the certified our-vs-vendor table; historical
-round tables below are superseded for headline numbers.
+round tables above are superseded for headline numbers.
 
 | metric | ours | vendor (same-run) | ratio |
 |---|---:|---:|---:|
