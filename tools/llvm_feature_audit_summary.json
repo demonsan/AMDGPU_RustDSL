@@ -1,0 +1,2061 @@
+{
+ "universe": {
+  "n_mops": 123,
+  "rows_llvm20": 112,
+  "rows_llvm24": 112,
+  "n_universe_mnemonics": 99
+ },
+ "summary": {
+  "n_tests": 4996,
+  "by_ext": {
+   "ll": 3450,
+   "mir": 1546
+  },
+  "by_dir": {
+   ".": 3831,
+   "GlobalISel": 1130,
+   "NextUseAnalysis": 35
+  },
+  "by_kind": {
+   "codegen": 2844,
+   "mir-pass": 1807,
+   "pass": 322,
+   "other": 23
+  },
+  "by_status": {
+   "OUT-OF-SCOPE": 4912,
+   "COVERED": 26,
+   "PARTIAL": 58
+  },
+  "globalisel_tests": 1148,
+  "tests_with_requires": 65,
+  "tests_with_unsupported": 2,
+  "tests_with_xfail": 10,
+  "by_target_class(any_run)": {
+   "pre-gfx9": 2595,
+   "gfx10": 1047,
+   "gfx9x": 1988,
+   "gfx950": 125,
+   "gfx11": 1199,
+   "gfx12": 1031,
+   "r600": 229,
+   "gfx94x": 357,
+   "unknown": 27
+  },
+  "by_target_primary": {
+   "pre-gfx9": 1435,
+   "gfx10": 179,
+   "gfx9x": 825,
+   "gfx950-class": 459,
+   "mixed:gfx10+gfx11+gfx12+gfx9x+pre-gfx9": 99,
+   "mixed:gfx9x+r600": 1,
+   "gfx12": 363,
+   "mixed:gfx10+gfx11+gfx9x+pre-gfx9": 225,
+   "mixed:gfx10+gfx11+gfx9x": 63,
+   "mixed:gfx11+gfx12": 94,
+   "mixed:gfx12+pre-gfx9": 86,
+   "mixed:gfx9x+pre-gfx9": 190,
+   "r600": 116,
+   "mixed:gfx11+gfx9x+pre-gfx9": 80,
+   "mixed:pre-gfx9+r600": 58,
+   "mixed:gfx10+gfx9x": 48,
+   "mixed:gfx10+gfx11": 65,
+   "mixed:gfx12+gfx9x": 32,
+   "gfx11": 159,
+   "mixed:gfx10+gfx11+pre-gfx9": 53,
+   "mixed:gfx11+gfx12+gfx9x+pre-gfx9": 23,
+   "mixed:gfx12+gfx9x+pre-gfx9": 12,
+   "unknown": 23,
+   "mixed:gfx9x+pre-gfx9+r600": 26,
+   "mixed:gfx10+gfx11+gfx12": 21,
+   "mixed:gfx10+gfx11+gfx12+gfx9x": 36,
+   "mixed:gfx10+gfx9x+pre-gfx9": 38,
+   "mixed:gfx10+pre-gfx9": 17,
+   "mixed:gfx11+pre-gfx9": 48,
+   "mixed:gfx11+gfx12+pre-gfx9": 19,
+   "mixed:gfx11+gfx12+gfx9x": 4,
+   "mixed:gfx11+gfx9x": 10,
+   "mixed:gfx10+gfx11+gfx12+gfx9x+pre-gfx9+r600": 4,
+   "mixed:gfx10+gfx11+pre-gfx9+r600": 4,
+   "mixed:gfx10+pre-gfx9+r600": 2,
+   "mixed:gfx11+pre-gfx9+r600": 4,
+   "mixed:gfx10+gfx12": 16,
+   "mixed:gfx10+gfx12+gfx9x": 2,
+   "mixed:gfx10+gfx12+gfx9x+pre-gfx9": 2,
+   "mixed:gfx10+gfx11+gfx12+pre-gfx9": 41,
+   "mixed:gfx10+gfx11+gfx9x+pre-gfx9+r600": 1,
+   "mixed:gfx11+gfx9x+pre-gfx9+r600": 4,
+   "mixed:gfx12+pre-gfx9+r600": 6,
+   "mixed:gfx12+gfx9x+pre-gfx9+r600": 1,
+   "mixed:r600+unknown": 1,
+   "mixed:gfx10+gfx12+pre-gfx9": 1
+  },
+  "by_mcpu": [
+   [
+    "gfx900",
+    1447
+   ],
+   [
+    "gfx600",
+    1140
+   ],
+   [
+    "gfx1100",
+    1135
+   ],
+   [
+    "gfx1010",
+    857
+   ],
+   [
+    "gfx803",
+    851
+   ],
+   [
+    "gfx1200",
+    744
+   ],
+   [
+    "gfx802",
+    594
+   ],
+   [
+    "gfx90a",
+    430
+   ],
+   [
+    "gfx1250",
+    405
+   ],
+   [
+    "gfx942",
+    357
+   ],
+   [
+    "gfx700",
+    342
+   ],
+   [
+    "(default amdgcn = SI generic)",
+    327
+   ],
+   [
+    "gfx908",
+    242
+   ],
+   [
+    "gfx701",
+    226
+   ],
+   [
+    "gfx1030",
+    166
+   ],
+   [
+    "redwood",
+    156
+   ],
+   [
+    "gfx950",
+    125
+   ],
+   [
+    "gfx601",
+    117
+   ],
+   [
+    "gfx906",
+    114
+   ],
+   [
+    "gfx704",
+    107
+   ],
+   [
+    "gfx1310",
+    76
+   ],
+   [
+    "gfx1170",
+    66
+   ],
+   [
+    "gfx810",
+    60
+   ],
+   [
+    "gfx801",
+    49
+   ],
+   [
+    "cypress",
+    47
+   ],
+   [
+    "cayman",
+    44
+   ],
+   [
+    "gfx1012",
+    33
+   ],
+   [
+    "gfx1031",
+    32
+   ],
+   [
+    "gfx1150",
+    32
+   ],
+   [
+    "gfx1251",
+    31
+   ],
+   [
+    "gfx1011",
+    28
+   ],
+   [
+    "gfx902",
+    14
+   ],
+   [
+    "gfx125",
+    13
+   ],
+   [
+    "gfx94",
+    12
+   ],
+   [
+    "gfx1201",
+    10
+   ],
+   [
+    "gfx703",
+    10
+   ],
+   [
+    "gfx1101",
+    8
+   ],
+   [
+    "gfx1102",
+    8
+   ],
+   [
+    "gfx602",
+    8
+   ],
+   [
+    "gfx705",
+    8
+   ],
+   [
+    "gfx101",
+    7
+   ],
+   [
+    "juniper",
+    7
+   ],
+   [
+    "gfx117",
+    6
+   ],
+   [
+    "cedar",
+    6
+   ],
+   [
+    "gfx1013",
+    6
+   ],
+   [
+    "gfx103",
+    5
+   ],
+   [
+    "barts",
+    5
+   ],
+   [
+    "caicos",
+    5
+   ],
+   [
+    "rv710",
+    4
+   ],
+   [
+    "sumo",
+    4
+   ],
+   [
+    "turks",
+    4
+   ],
+   [
+    "gfx1103",
+    4
+   ],
+   [
+    "gfx1151",
+    4
+   ],
+   [
+    "gfx1152",
+    4
+   ],
+   [
+    "gfx1153",
+    4
+   ],
+   [
+    "gfx702",
+    4
+   ],
+   [
+    "gfx805",
+    4
+   ],
+   [
+    "gfx904",
+    4
+   ],
+   [
+    "gfx90c",
+    4
+   ],
+   [
+    "rs880",
+    4
+   ]
+  ],
+  "by_status_x_kind": {
+   "codegen": {
+    "OUT-OF-SCOPE": 2760,
+    "COVERED": 26,
+    "PARTIAL": 58
+   },
+   "mir-pass": {
+    "OUT-OF-SCOPE": 1807
+   },
+   "other": {
+    "OUT-OF-SCOPE": 23
+   },
+   "pass": {
+    "OUT-OF-SCOPE": 322
+   }
+  },
+  "by_status_x_ext": {
+   "ll": {
+    "OUT-OF-SCOPE": 3368,
+    "COVERED": 25,
+    "PARTIAL": 57
+   },
+   "mir": {
+    "OUT-OF-SCOPE": 1544,
+    "PARTIAL": 1,
+    "COVERED": 1
+   }
+  },
+  "oos_reasons": [
+   [
+    "subtarget not gfx950-class",
+    2494
+   ],
+   [
+    "MIR pass test (llc -run-pass/-stop-after)",
+    1807
+   ],
+   [
+    "IR pass test (opt)",
+    322
+   ],
+   [
+    "IR feature not modelled by the kernel DSL",
+    266
+   ],
+   [
+    "no codegen RUN line",
+    23
+   ]
+  ],
+  "gfx950_class_codegen": {
+   "OUT-OF-SCOPE": 266,
+   "COVERED": 26,
+   "PARTIAL": 58
+  },
+  "gfx950_only_codegen": {
+   "OUT-OF-SCOPE": 76,
+   "PARTIAL": 9,
+   "COVERED": 12
+  },
+  "features": [
+   [
+    "non_kernel_function",
+    2393
+   ],
+   [
+    "kernarg",
+    1349
+   ],
+   [
+    "generic_mir",
+    670
+   ],
+   [
+    "lds",
+    552
+   ],
+   [
+    "workitem_id",
+    467
+   ],
+   [
+    "call_nonintrinsic",
+    433
+   ],
+   [
+    "private_memory",
+    339
+   ],
+   [
+    "alloca",
+    217
+   ],
+   [
+    "scratch_instructions",
+    199
+   ],
+   [
+    "spill_or_scratch_checked",
+    196
+   ],
+   [
+    "atomicrmw",
+    171
+   ],
+   [
+    "kernel_entry",
+    129
+   ],
+   [
+    "stack_objects",
+    111
+   ],
+   [
+    "indirect_call",
+    97
+   ],
+   [
+    "barrier",
+    84
+   ],
+   [
+    "atomics",
+    82
+   ],
+   [
+    "debug_info",
+    78
+   ],
+   [
+    "atomic_load",
+    55
+   ],
+   [
+    "cmpxchg",
+    54
+   ],
+   [
+    "atomic_store",
+    53
+   ],
+   [
+    "abi_pointers",
+    52
+   ],
+   [
+    "workgroup_id",
+    45
+   ],
+   [
+    "varargs",
+    42
+   ],
+   [
+    "fence",
+    35
+   ],
+   [
+    "waitcnt_or_sched_intrinsic",
+    23
+   ],
+   [
+    "dynamic_alloca",
+    7
+   ],
+   [
+    "stacksave",
+    3
+   ],
+   [
+    "exceptions",
+    1
+   ]
+  ],
+  "calling_conventions": [
+   [
+    "amdgpu_kernel",
+    1720
+   ],
+   [
+    "amdgpu_ps",
+    762
+   ],
+   [
+    "amdgpu_cs",
+    127
+   ],
+   [
+    "amdgpu_vs",
+    66
+   ],
+   [
+    "amdgpu_gs",
+    60
+   ],
+   [
+    "amdgpu_gfx",
+    45
+   ],
+   [
+    "amdgpu_cs_chain",
+    26
+   ],
+   [
+    "amdgpu_hs",
+    24
+   ],
+   [
+    "fastcc",
+    19
+   ],
+   [
+    "amdgpu_es",
+    10
+   ],
+   [
+    "amdgpu_ls",
+    10
+   ],
+   [
+    "amdgpu_cs_chain_preserve",
+    6
+   ],
+   [
+    "coldcc",
+    2
+   ],
+   [
+    "spir_kernel",
+    2
+   ]
+  ],
+  "attributes": [
+   [
+    "amdgpu-flat-work-group-size",
+    103
+   ],
+   [
+    "amdgpu-waves-per-eu",
+    77
+   ],
+   [
+    "amdgpu-no-workitem-id-y",
+    57
+   ],
+   [
+    "amdgpu-no-workitem-id-z",
+    57
+   ],
+   [
+    "amdgpu-no-dispatch-ptr",
+    53
+   ],
+   [
+    "amdgpu-no-dispatch-id",
+    51
+   ],
+   [
+    "amdgpu-no-queue-ptr",
+    51
+   ],
+   [
+    "amdgpu-no-implicitarg-ptr",
+    49
+   ],
+   [
+    "amdgpu-no-workgroup-id-y",
+    48
+   ],
+   [
+    "amdgpu-no-workgroup-id-z",
+    48
+   ],
+   [
+    "amdgpu-no-workgroup-id-x",
+    45
+   ],
+   [
+    "amdgpu-no-workitem-id-x",
+    44
+   ],
+   [
+    "amdgpu-no-lds-kernel-id",
+    41
+   ],
+   [
+    "target-features",
+    36
+   ],
+   [
+    "amdgpu-agpr-alloc",
+    26
+   ],
+   [
+    "amdgpu-no-cluster-id-y",
+    23
+   ],
+   [
+    "amdgpu-no-cluster-id-z",
+    23
+   ],
+   [
+    "amdgpu-no-cluster-id-x",
+    22
+   ],
+   [
+    "amdgpu-ieee",
+    20
+   ],
+   [
+    "amdgpu-num-vgpr",
+    19
+   ],
+   [
+    "amdgpu-no-multigrid-sync-arg",
+    19
+   ],
+   [
+    "amdgpu-no-heap-ptr",
+    18
+   ],
+   [
+    "amdgpu-no-hostcall-ptr",
+    18
+   ],
+   [
+    "frame-pointer",
+    15
+   ],
+   [
+    "uniform-work-group-size",
+    15
+   ],
+   [
+    "no-builtins",
+    14
+   ],
+   [
+    "amdgpu-dynamic-vgpr-block-size",
+    13
+   ],
+   [
+    "amdgpu-no-completion-action",
+    12
+   ],
+   [
+    "amdgpu-no-default-queue",
+    12
+   ],
+   [
+    "amdgpu-no-flat-scratch-init",
+    12
+   ],
+   [
+    "amdgpu-implicitarg-num-bytes",
+    10
+   ],
+   [
+    "no-nans-fp-math",
+    10
+   ],
+   [
+    "no-signed-zeros-fp-math",
+    10
+   ],
+   [
+    "amdgpu-num-sgpr",
+    9
+   ],
+   [
+    "amdgpu-dx10-clamp",
+    6
+   ],
+   [
+    "amdgpu-unroll-threshold",
+    5
+   ],
+   [
+    "amdgpu-max-num-workgroups",
+    4
+   ],
+   [
+    "no-infs-fp-math",
+    4
+   ],
+   [
+    "no-trapping-math",
+    4
+   ],
+   [
+    "stack-protector-buffer-size",
+    4
+   ]
+  ],
+  "address_spaces": [
+   [
+    "1",
+    1812
+   ],
+   [
+    "3",
+    552
+   ],
+   [
+    "5",
+    338
+   ],
+   [
+    "4",
+    278
+   ],
+   [
+    "8",
+    239
+   ],
+   [
+    "7",
+    47
+   ],
+   [
+    "6",
+    41
+   ],
+   [
+    "0",
+    25
+   ],
+   [
+    "2",
+    24
+   ],
+   [
+    "999",
+    9
+   ],
+   [
+    "9",
+    4
+   ],
+   [
+    "1234",
+    2
+   ],
+   [
+    "12345",
+    1
+   ],
+   [
+    "42",
+    1
+   ],
+   [
+    "998",
+    1
+   ],
+   [
+    "10",
+    1
+   ],
+   [
+    "11",
+    1
+   ],
+   [
+    "12",
+    1
+   ],
+   [
+    "13",
+    1
+   ],
+   [
+    "14",
+    1
+   ]
+  ],
+  "types": [
+   [
+    "vector",
+    1808
+   ],
+   [
+    "i64",
+    1126
+   ],
+   [
+    "f16",
+    781
+   ],
+   [
+    "i16",
+    739
+   ],
+   [
+    "i8",
+    632
+   ],
+   [
+    "f64",
+    486
+   ],
+   [
+    "bf16",
+    198
+   ],
+   [
+    "i128",
+    82
+   ],
+   [
+    "wide_int",
+    25
+   ]
+  ],
+  "mattr": [
+   [
+    "-real-true16",
+    510
+   ],
+   [
+    "+real-true16",
+    479
+   ],
+   [
+    "-flat-for-global",
+    223
+   ],
+   [
+    "+wavefrontsize64",
+    126
+   ],
+   [
+    "+cumode",
+    54
+   ],
+   [
+    "+wavefrontsize32",
+    48
+   ],
+   [
+    "+enable-flat-scratch",
+    39
+   ],
+   [
+    "+flat-for-global",
+    20
+   ],
+   [
+    "+unaligned-access-mode",
+    17
+   ],
+   [
+    "-unaligned-access-mode",
+    12
+   ],
+   [
+    "-enable-ds128",
+    10
+   ],
+   [
+    "+load-store-opt",
+    8
+   ],
+   [
+    "+dx10-clamp-and-ieee-mode",
+    7
+   ],
+   [
+    "+mad-mac-f32-insts",
+    7
+   ],
+   [
+    "+enable-ds128",
+    7
+   ],
+   [
+    "-wavefrontsize64",
+    5
+   ],
+   [
+    "+architected-sgprs",
+    5
+   ],
+   [
+    "-enable-prt-strict-null",
+    4
+   ],
+   [
+    "-wavefrontsize32",
+    4
+   ],
+   [
+    "-trap-handler",
+    3
+   ],
+   [
+    "+architected-flat-scratch",
+    3
+   ],
+   [
+    "+max-private-element-size-16",
+    3
+   ],
+   [
+    "-mfma-inline-literal-bug",
+    3
+   ],
+   [
+    "-wait-xcnt",
+    3
+   ],
+   [
+    "+block-vgpr-csr",
+    3
+   ],
+   [
+    "+trap-handler",
+    2
+   ],
+   [
+    "-back-off-barrier",
+    2
+   ],
+   [
+    "dumpcode",
+    2
+   ],
+   [
+    "+fast-fmaf",
+    2
+   ],
+   [
+    "-fast-fmaf",
+    2
+   ],
+   [
+    "+max-private-element-size-4",
+    2
+   ],
+   [
+    "+wavefrontsize64\"",
+    2
+   ],
+   [
+    "+safe-smem-prefetch",
+    2
+   ],
+   [
+    "-architected-sgprs",
+    2
+   ],
+   [
+    "si-scheduler",
+    2
+   ],
+   [
+    "-cumode",
+    1
+   ],
+   [
+    "+volcanic-islands",
+    1
+   ],
+   [
+    "+unsafe-ds-offset-folding",
+    1
+   ],
+   [
+    "+unaligned-scratch-access",
+    1
+   ],
+   [
+    "-unaligned-scratch-access",
+    1
+   ]
+  ],
+  "intrinsics_amdgcn_top": [
+   [
+    "llvm.amdgcn.workitem.id.x",
+    465
+   ],
+   [
+    "llvm.amdgcn.workitem.id.y",
+    50
+   ],
+   [
+    "llvm.amdgcn.workgroup.id.x",
+    44
+   ],
+   [
+    "llvm.amdgcn.exp.f32",
+    44
+   ],
+   [
+    "llvm.amdgcn.s.barrier",
+    40
+   ],
+   [
+    "llvm.amdgcn.implicitarg.ptr",
+    36
+   ],
+   [
+    "llvm.amdgcn.mbcnt.lo",
+    27
+   ],
+   [
+    "llvm.amdgcn.dispatch.ptr",
+    26
+   ],
+   [
+    "llvm.amdgcn.readfirstlane",
+    25
+   ],
+   [
+    "llvm.amdgcn.workgroup.id.y",
+    22
+   ],
+   [
+    "llvm.amdgcn.workgroup.id.z",
+    19
+   ],
+   [
+    "llvm.amdgcn.s.getpc",
+    19
+   ],
+   [
+    "llvm.amdgcn.cvt.pkrtz",
+    19
+   ],
+   [
+    "llvm.amdgcn.image.sample.2d.v4f32.f32",
+    17
+   ],
+   [
+    "llvm.amdgcn.interp.p1",
+    17
+   ],
+   [
+    "llvm.amdgcn.interp.p2",
+    17
+   ],
+   [
+    "llvm.amdgcn.workitem.id.z",
+    16
+   ],
+   [
+    "llvm.amdgcn.queue.ptr",
+    16
+   ],
+   [
+    "llvm.amdgcn.ptr.s.buffer.load.i32",
+    16
+   ],
+   [
+    "llvm.amdgcn.update.dpp.i32",
+    16
+   ],
+   [
+    "llvm.amdgcn.mfma.f32.32x32x1f32",
+    15
+   ],
+   [
+    "llvm.amdgcn.mbcnt.hi",
+    15
+   ],
+   [
+    "llvm.amdgcn.raw.ptr.buffer.store.f32",
+    15
+   ],
+   [
+    "llvm.amdgcn.raw.buffer.store.i32",
+    15
+   ],
+   [
+    "llvm.amdgcn.kill",
+    15
+   ],
+   [
+    "llvm.amdgcn.s.barrier.wait",
+    14
+   ],
+   [
+    "llvm.amdgcn.set.inactive.i32",
+    14
+   ],
+   [
+    "llvm.amdgcn.strict.wwm.i32",
+    14
+   ],
+   [
+    "llvm.amdgcn.exp.compr.v2f16",
+    14
+   ],
+   [
+    "llvm.amdgcn.dispatch.id",
+    13
+   ],
+   [
+    "llvm.amdgcn.raw.ptr.buffer.store.i32",
+    13
+   ],
+   [
+    "llvm.amdgcn.ballot.i64",
+    13
+   ],
+   [
+    "llvm.amdgcn.image.sample.1d.v4f32.f32",
+    13
+   ],
+   [
+    "llvm.amdgcn.raw.ptr.buffer.load.f32",
+    13
+   ],
+   [
+    "llvm.amdgcn.rcp.f32",
+    11
+   ],
+   [
+    "llvm.amdgcn.raw.buffer.load.i32",
+    11
+   ],
+   [
+    "llvm.amdgcn.fmed3.f32",
+    11
+   ],
+   [
+    "llvm.amdgcn.s.waitcnt",
+    10
+   ],
+   [
+    "llvm.amdgcn.raw.buffer.atomic.fadd.v2f16",
+    10
+   ],
+   [
+    "llvm.amdgcn.raw.ptr.buffer.store.v4f32",
+    10
+   ]
+  ],
+  "n_distinct_amdgcn_intrinsics": 2381,
+  "n_distinct_opcodes_in_tests": 2848,
+  "top_opcodes_in_tests": [
+   [
+    "s_endpgm",
+    1867
+   ],
+   [
+    "v_mov_b32",
+    1858
+   ],
+   [
+    "s_mov_b32",
+    1599
+   ],
+   [
+    "s_waitcnt",
+    1552
+   ],
+   [
+    "s_setpc_b64",
+    906
+   ],
+   [
+    "s_mov_b64",
+    901
+   ],
+   [
+    "v_and_b32",
+    647
+   ],
+   [
+    "buffer_store_dword",
+    601
+   ],
+   [
+    "v_lshlrev_b32",
+    595
+   ],
+   [
+    "s_nop",
+    580
+   ],
+   [
+    "s_load_dwordx2",
+    531
+   ],
+   [
+    "s_delay_alu",
+    527
+   ],
+   [
+    "buffer_load_dword",
+    518
+   ],
+   [
+    "s_and_b32",
+    484
+   ],
+   [
+    "v_cndmask_b32",
+    483
+   ],
+   [
+    "v_readfirstlane_b32",
+    473
+   ],
+   [
+    "v_add_u32",
+    463
+   ],
+   [
+    "s_load_dword",
+    448
+   ],
+   [
+    "s_branch",
+    434
+   ],
+   [
+    "v_or_b32",
+    432
+   ],
+   [
+    "s_add_u32",
+    430
+   ],
+   [
+    "s_add_i32",
+    418
+   ],
+   [
+    "s_and_b64",
+    411
+   ],
+   [
+    "v_cmp_eq_u32",
+    410
+   ],
+   [
+    "s_addc_u32",
+    405
+   ],
+   [
+    "s_load_dwordx4",
+    401
+   ],
+   [
+    "global_store_dword",
+    383
+   ],
+   [
+    "s_wait_kmcnt",
+    373
+   ],
+   [
+    "v_lshrrev_b32",
+    373
+   ],
+   [
+    "v_dual_mov_b32",
+    358
+   ]
+  ],
+  "top_missing_opcodes_gfx950_class": [
+   {
+    "opcode": "s_setpc_b64",
+    "tests": 200,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "arbitrary-fp-to-float-fp8-hw.ll",
+     "atomicrmw-expand.ll",
+     "bf16.ll"
+    ]
+   },
+   {
+    "opcode": "s_mov_b64",
+    "tests": 60,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "amdgpu-cs-chain-fp-nosave.ll",
+     "atomicrmw-expand.ll",
+     "av-split-dead-valno-crash.ll"
+    ]
+   },
+   {
+    "opcode": "v_mov_b64",
+    "tests": 60,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "av-split-dead-valno-crash.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll"
+    ]
+   },
+   {
+    "opcode": "v_alignbit_b32",
+    "tests": 39,
+    "examples": [
+     "bitop3-shared-operand.ll",
+     "div-rem-by-constant-64.ll",
+     "i1-to-bf16.ll",
+     "shufflevector.v2bf16.v2bf16.ll",
+     "shufflevector.v2bf16.v3bf16.ll"
+    ]
+   },
+   {
+    "opcode": "s_load_dwordx4",
+    "tests": 37,
+    "examples": [
+     "av-split-dead-valno-crash.ll",
+     "build_vector.ll",
+     "dagcombine-select.ll",
+     "fp64-atomics-gfx90a.ll",
+     "imm.ll"
+    ]
+   },
+   {
+    "opcode": "v_cmp_eq_u32",
+    "tests": 36,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "bf16.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll"
+    ]
+   },
+   {
+    "opcode": "s_or_b64",
+    "tests": 35,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "bf16.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll"
+    ]
+   },
+   {
+    "opcode": "v_bfi_b32",
+    "tests": 35,
+    "examples": [
+     "bf16.ll",
+     "bitop3-shared-operand.ll",
+     "insert_vector_elt.v2bf16.ll",
+     "llvm.amdgcn.fdot2.ll",
+     "shufflevector.v2bf16.v2bf16.ll"
+    ]
+   },
+   {
+    "opcode": "s_pack_ll_b32_b16",
+    "tests": 32,
+    "examples": [
+     "build_vector.ll",
+     "insert_vector_elt.v2bf16.ll",
+     "shufflevector.v2bf16.v2bf16.ll",
+     "shufflevector.v2bf16.v3bf16.ll",
+     "shufflevector.v2bf16.v4bf16.ll"
+    ]
+   },
+   {
+    "opcode": "s_movk_i32",
+    "tests": 30,
+    "examples": [
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll",
+     "dagcombine-reassociate-multi-memop.ll",
+     "flat-atomicrmw-fadd.ll"
+    ]
+   },
+   {
+    "opcode": "s_cbranch_execnz",
+    "tests": 27,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll"
+    ]
+   },
+   {
+    "opcode": "s_and_b64",
+    "tests": 26,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "av-split-dead-valno-crash.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll"
+    ]
+   },
+   {
+    "opcode": "s_andn2_b64",
+    "tests": 25,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll"
+    ]
+   },
+   {
+    "opcode": "scratch_load_dword",
+    "tests": 23,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "bf16.ll",
+     "flat-scratch.ll",
+     "fold-gep-offset.ll"
+    ]
+   },
+   {
+    "opcode": "v_lshl_add_u64",
+    "tests": 23,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "dagcombine-select.ll",
+     "div-rem-by-constant-64.ll",
+     "dpp64_combine.ll"
+    ]
+   },
+   {
+    "opcode": "v_add3_u32",
+    "tests": 23,
+    "examples": [
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll",
+     "div-rem-by-constant-64.ll",
+     "flat-atomicrmw-fadd.ll"
+    ]
+   },
+   {
+    "opcode": "v_pk_mov_b32",
+    "tests": 23,
+    "examples": [
+     "rewrite-vgpr-mfma-to-agpr.ll",
+     "shufflevector-physreg-copy.ll",
+     "shufflevector.v2f32.v2f32.ll",
+     "shufflevector.v2f32.v3f32.ll",
+     "shufflevector.v2f32.v4f32.ll"
+    ]
+   },
+   {
+    "opcode": "s_add_i32",
+    "tests": 21,
+    "examples": [
+     "amdgpu-cs-chain-fp-nosave.ll",
+     "bf16.ll",
+     "div-rem-fast-path.ll",
+     "flat-scratch-alloca-issue-155902.ll",
+     "flat-scratch.ll"
+    ]
+   },
+   {
+    "opcode": "v_and_or_b32",
+    "tests": 21,
+    "examples": [
+     "bitop3-shared-operand.ll",
+     "bitop3.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll"
+    ]
+   },
+   {
+    "opcode": "v_cmp_u_f32",
+    "tests": 20,
+    "examples": [
+     "bf16.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll",
+     "flat-atomicrmw-fadd.ll"
+    ]
+   },
+   {
+    "opcode": "v_bfe_u32",
+    "tests": 20,
+    "examples": [
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll",
+     "flat-atomicrmw-fadd.ll",
+     "flat-atomicrmw-fmax.ll"
+    ]
+   },
+   {
+    "opcode": "s_and_saveexec_b64",
+    "tests": 18,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll",
+     "dagcombine-select.ll"
+    ]
+   },
+   {
+    "opcode": "v_accvgpr_write_b32",
+    "tests": 18,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "av-split-dead-valno-crash.ll",
+     "bf16.ll",
+     "bitop3-shared-operand.ll"
+    ]
+   },
+   {
+    "opcode": "v_not_b32",
+    "tests": 18,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "bf16.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll"
+    ]
+   },
+   {
+    "opcode": "v_accvgpr_read_b32",
+    "tests": 17,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "av-split-dead-valno-crash.ll",
+     "bf16.ll",
+     "bitop3-shared-operand.ll"
+    ]
+   },
+   {
+    "opcode": "v_pk_max_f16",
+    "tests": 17,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll",
+     "flat-atomicrmw-fmax.ll"
+    ]
+   },
+   {
+    "opcode": "v_min_f32",
+    "tests": 16,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "bf16.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll",
+     "flat-atomicrmw-fmin.ll"
+    ]
+   },
+   {
+    "opcode": "s_xor_b64",
+    "tests": 15,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "av-split-dead-valno-crash.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll"
+    ]
+   },
+   {
+    "opcode": "v_add_f64",
+    "tests": 14,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "flat-atomicrmw-fadd.ll",
+     "flat-atomicrmw-fsub.ll"
+    ]
+   },
+   {
+    "opcode": "global_load_dwordx2",
+    "tests": 14,
+    "examples": [
+     "a-v-global-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "bf16.ll",
+     "global-atomicrmw-fsub.ll",
+     "inline-asm-vgpr-sgpr-copy.ll"
+    ]
+   }
+  ],
+  "top_missing_opcodes_all_codegen": [
+   {
+    "opcode": "s_setpc_b64",
+    "tests": 880,
+    "examples": [
+     "a-v-ds-atomic-cmpxchg.ll",
+     "a-v-ds-atomicrmw.ll",
+     "a-v-flat-atomic-cmpxchg.ll",
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomic-cmpxchg.ll"
+    ]
+   },
+   {
+    "opcode": "s_mov_b64",
+    "tests": 681,
+    "examples": [
+     "a-v-flat-atomic-cmpxchg.ll",
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "abi-attribute-hints-undefined-behavior.ll",
+     "add-max.ll"
+    ]
+   },
+   {
+    "opcode": "s_delay_alu",
+    "tests": 520,
+    "examples": [
+     "abs_i16.ll",
+     "add-max.ll",
+     "add.ll",
+     "add.v2i16.ll",
+     "add_i1.ll"
+    ]
+   },
+   {
+    "opcode": "s_load_dwordx4",
+    "tests": 399,
+    "examples": [
+     "32-bit-local-address-space.ll",
+     "add.ll",
+     "add.v2i16.ll",
+     "add_i1.ll",
+     "add_i128.ll"
+    ]
+   },
+   {
+    "opcode": "s_wait_kmcnt",
+    "tests": 358,
+    "examples": [
+     "abs_i16.ll",
+     "add.ll",
+     "addrspacecast-gas.ll",
+     "amdgcn-call-whole-wave.ll",
+     "amdgpu-cs-chain-fp-nosave.ll"
+    ]
+   },
+   {
+    "opcode": "v_dual_mov_b32",
+    "tests": 357,
+    "examples": [
+     "add.ll",
+     "add.v2i16.ll",
+     "add_u64.ll",
+     "amdgcn-call-whole-wave.ll",
+     "amdgcn.bitcast.1024bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_add_i32",
+    "tests": 335,
+    "examples": [
+     "32-bit-local-address-space.ll",
+     "abi-attribute-hints-undefined-behavior.ll",
+     "add.ll",
+     "add.v2i16.ll",
+     "add3.ll"
+    ]
+   },
+   {
+    "opcode": "s_clause",
+    "tests": 276,
+    "examples": [
+     "add.ll",
+     "add.v2i16.ll",
+     "add_i1.ll",
+     "amdgcn-call-whole-wave.ll",
+     "amdgcn.bitcast.1024bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_or_b32",
+    "tests": 275,
+    "examples": [
+     "absdiff.ll",
+     "add.v2i16.ll",
+     "add_i1.ll",
+     "amdgcn.bitcast.1024bit.ll",
+     "amdgcn.bitcast.128bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_cselect_b32",
+    "tests": 273,
+    "examples": [
+     "32-bit-local-address-space.ll",
+     "a-v-flat-atomicrmw.ll",
+     "add.ll",
+     "add_i1.ll",
+     "addrspacecast-gas.ll"
+    ]
+   },
+   {
+    "opcode": "s_wait_loadcnt_dscnt",
+    "tests": 270,
+    "examples": [
+     "abs_i16.ll",
+     "amdgcn-call-whole-wave.ll",
+     "amdgpu-cs-chain-fp-nosave.ll",
+     "andorn2.ll",
+     "arbitrary-fp-to-float-fp8-hw.ll"
+    ]
+   },
+   {
+    "opcode": "flat_store_dword",
+    "tests": 267,
+    "examples": [
+     "abi-attribute-hints-undefined-behavior.ll",
+     "add.ll",
+     "add.v2i16.ll",
+     "addrspacecast.ll",
+     "always-uniform.ll"
+    ]
+   },
+   {
+    "opcode": "s_and_b64",
+    "tests": 261,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "add.ll",
+     "add_i1.ll",
+     "addrspacecast.ll",
+     "addsub64_carry.ll"
+    ]
+   },
+   {
+    "opcode": "s_or_b64",
+    "tests": 259,
+    "examples": [
+     "a-v-flat-atomic-cmpxchg.ll",
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "add_i1.ll",
+     "amdgcn.bitcast.1024bit.ll"
+    ]
+   },
+   {
+    "opcode": "v_cmp_eq_u32",
+    "tests": 253,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "abi-attribute-hints-undefined-behavior.ll",
+     "add_i1.ll",
+     "amdgcn.bitcast.ll"
+    ]
+   },
+   {
+    "opcode": "global_store_b32",
+    "tests": 239,
+    "examples": [
+     "add.ll",
+     "add.v2i16.ll",
+     "amdgcn-call-whole-wave.ll",
+     "amdgcn.bitcast.ll",
+     "amdgpu-miscellaneous-uniform-intrinsic.ll"
+    ]
+   },
+   {
+    "opcode": "v_add_i32",
+    "tests": 235,
+    "examples": [
+     "add.ll",
+     "add_i128.ll",
+     "add_i64.ll",
+     "addrspacecast.gfx6.ll",
+     "amdgcn.bitcast.1024bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_load_b64",
+    "tests": 231,
+    "examples": [
+     "add.ll",
+     "add.v2i16.ll",
+     "add_i1.ll",
+     "addrspacecast-gas.ll",
+     "amdgcn.bitcast.ll"
+    ]
+   },
+   {
+    "opcode": "s_wait_loadcnt",
+    "tests": 228,
+    "examples": [
+     "add.ll",
+     "amdgcn-call-whole-wave.ll",
+     "asyncmark-gfx12plus.ll",
+     "atomic_optimizations_buffer.ll",
+     "atomic_optimizations_dpp_lds_expected_active_lanes.ll"
+    ]
+   },
+   {
+    "opcode": "s_cmp_lg_u32",
+    "tests": 222,
+    "examples": [
+     "32-bit-local-address-space.ll",
+     "a-v-flat-atomicrmw.ll",
+     "add.ll",
+     "addrspacecast.ll",
+     "agpr-copy-no-free-registers.ll"
+    ]
+   },
+   {
+    "opcode": "s_movk_i32",
+    "tests": 219,
+    "examples": [
+     "32-bit-local-address-space.ll",
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "amdgcn.bitcast.1024bit.ll",
+     "amdgcn.bitcast.128bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_xor_b64",
+    "tests": 196,
+    "examples": [
+     "a-v-flat-atomic-cmpxchg.ll",
+     "a-v-flat-atomicrmw.ll",
+     "add_i1.ll",
+     "agpr-copy-no-free-registers.ll",
+     "amdgcn.bitcast.1024bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_setreg_imm32_b32",
+    "tests": 195,
+    "examples": [
+     "add-max.ll",
+     "add_u64.ll",
+     "addrspacecast-gas.ll",
+     "asyncmark-gfx12plus.ll",
+     "bf16-conversions.ll"
+    ]
+   },
+   {
+    "opcode": "s_cbranch_execz",
+    "tests": 194,
+    "examples": [
+     "a-v-flat-atomic-cmpxchg.ll",
+     "a-v-flat-atomicrmw.ll",
+     "add_i1.ll",
+     "amdgcn.bitcast.1024bit.ll",
+     "amdgcn.bitcast.128bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_and_saveexec_b64",
+    "tests": 193,
+    "examples": [
+     "a-v-flat-atomic-cmpxchg.ll",
+     "a-v-flat-atomicrmw.ll",
+     "add_i1.ll",
+     "amdgcn.bitcast.1024bit.ll",
+     "amdgcn.bitcast.128bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_load_b32",
+    "tests": 189,
+    "examples": [
+     "add.v2i16.ll",
+     "amdgcn.bitcast.ll",
+     "amdgpu-miscellaneous-uniform-intrinsic.ll",
+     "ashr.v2i16.ll",
+     "asyncmark-gfx12plus.ll"
+    ]
+   },
+   {
+    "opcode": "s_wait_samplecnt",
+    "tests": 185,
+    "examples": [
+     "abs_i16.ll",
+     "amdgcn-call-whole-wave.ll",
+     "amdgpu-cs-chain-fp-nosave.ll",
+     "andorn2.ll",
+     "atomicrmw-expand.ll"
+    ]
+   },
+   {
+    "opcode": "v_cmp_ne_u32",
+    "tests": 183,
+    "examples": [
+     "a-v-flat-atomic-cmpxchg.ll",
+     "a-v-flat-atomicrmw.ll",
+     "addrspacecast.gfx6.ll",
+     "addrspacecast.ll",
+     "amdgcn.bitcast.1024bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_load_b128",
+    "tests": 183,
+    "examples": [
+     "add.ll",
+     "add.v2i16.ll",
+     "add_i1.ll",
+     "amdgcn.bitcast.ll",
+     "amdgcn.bitcast.ptr.ll"
+    ]
+   },
+   {
+    "opcode": "v_nop",
+    "tests": 179,
+    "examples": [
+     "add-max.ll",
+     "add_u64.ll",
+     "addrspacecast-gas.ll",
+     "asyncmark-gfx12plus.ll",
+     "bf16-conversions.ll"
+    ]
+   }
+  ],
+  "codegen_tests_with_opcode_checks": 2244,
+  "codegen_tests_all_opcodes_in_our_universe(any_target)": 119,
+  "opcodes_in_universe_that_tests_use": [
+   "buffer_inv",
+   "buffer_load_dword",
+   "buffer_load_dwordx2",
+   "buffer_load_dwordx4",
+   "buffer_store_dword",
+   "buffer_store_dwordx2",
+   "buffer_store_dwordx4",
+   "buffer_wbl2",
+   "ds_read_b128",
+   "ds_read_b32",
+   "ds_read_b64_tr_b8",
+   "ds_write_b128",
+   "ds_write_b32",
+   "global_atomic_add",
+   "global_atomic_add_rtn",
+   "global_load_dword",
+   "global_load_dwordx4",
+   "global_load_lds_dword",
+   "global_load_lds_dwordx4",
+   "global_load_ushort",
+   "global_store_dword",
+   "global_store_dwordx2",
+   "global_store_dwordx4",
+   "global_store_short",
+   "s_add_u32",
+   "s_addc_u32",
+   "s_and_b32",
+   "s_barrier",
+   "s_branch",
+   "s_cbranch_scc0",
+   "s_cbranch_scc1",
+   "s_cbranch_vccnz",
+   "s_cbranch_vccz",
+   "s_cmp_lt_i32",
+   "s_endpgm",
+   "s_load_dword",
+   "s_load_dword_imm",
+   "s_load_dwordx2",
+   "s_load_dwordx2_imm",
+   "s_lshl_b32",
+   "s_lshr_b32",
+   "s_mov_b32",
+   "s_mul_i32",
+   "s_nop",
+   "s_setprio",
+   "s_waitcnt",
+   "s_xor_b32",
+   "v_add_co_u32",
+   "v_add_f32",
+   "v_add_u32",
+   "v_addc_co_u32",
+   "v_addc_u32",
+   "v_and_b32",
+   "v_cmp_ge_i32",
+   "v_cmp_gt_i32",
+   "v_cmp_lt_f32",
+   "v_cmp_lt_i32",
+   "v_cndmask_b32",
+   "v_cvt_f16_f32",
+   "v_cvt_f32_f16",
+   "v_cvt_pk_bf16_f32",
+   "v_cvt_pk_fp8_f32",
+   "v_cvt_pknorm_u16_f32",
+   "v_cvt_scalef32_pk_fp8_bf16",
+   "v_exp_f32",
+   "v_fma_f32",
+   "v_log_f32",
+   "v_lshlrev_b32",
+   "v_lshrrev_b32",
+   "v_max3_f32",
+   "v_max_f32",
+   "v_mfma_f32_16x16x16_f16",
+   "v_mfma_f32_16x16x16f16_vgprcd",
+   "v_mfma_f32_16x16x32_fp8_fp8",
+   "v_mfma_f32_32x32x16_fp8_fp8",
+   "v_mfma_f32_32x32x64_f8f6f4",
+   "v_mfma_f32_32x32x8_f16",
+   "v_mfma_f32_32x32x8f16_vgprcd",
+   "v_mfma_scale_f32_32x32x64_f8f6f4",
+   "v_min_i32",
+   "v_mov_b32",
+   "v_mul_f32",
+   "v_mul_lo_u32",
+   "v_or_b32",
+   "v_perm_b32",
+   "v_permlane32_swap_b32",
+   "v_pk_add_f32",
+   "v_pk_mul_f32",
+   "v_pk_sub_u16",
+   "v_rcp_f32",
+   "v_readfirstlane_b32",
+   "v_smfmac_f32_16x16x128_fp8_fp8",
+   "v_sub_f32",
+   "v_xor_b32"
+  ],
+  "opcodes_in_tests_that_we_have": 94
+ }
+}

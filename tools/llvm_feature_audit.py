@@ -22,7 +22,7 @@ import argparse, collections, json, os, re, sys
 # normalisation
 MN_PREFIXES = ("v_", "s_", "buffer_", "global_", "ds_", "flat_", "scratch_", "image_", "tbuffer_", "exp")
 ASM_SUFFIXES = ("_e32", "_e64", "_sdwa", "_dpp", "_vop3", "_vop3p", "_nsa", "_vi", "_si", "_ci", "_gfx9", "_gfx90a", "_gfx940", "_gfx10", "_gfx11", "_gfx12")
-MIR_ADDR_SUFFIXES = ("_offen", "_offset", "_idxen", "_bothen", "_addr64", "_saddr", "_lds_offen", "_lds_offset", "_lds_idxen", "_lds_bothen", "_vbuffer")
+MIR_ADDR_SUFFIXES = ("_vgprcd", "_f8_f8", "_agprcd", "_mac", "_twoaddr", "_offen", "_offset", "_idxen", "_bothen", "_addr64", "_saddr", "_lds_offen", "_lds_offset", "_lds_idxen", "_lds_bothen", "_vbuffer")
 
 
 def norm_mn(s, mir=False):
@@ -110,7 +110,7 @@ def class_of_run(mcpu, triple):
 # RUN lines
 RUN_RE = re.compile(r"^\s*[;#]\s*RUN:\s?(.*)$")
 DIRECTIVE_RE = re.compile(r"^\s*[;#]\s*(REQUIRES|UNSUPPORTED|XFAIL):\s*(.*)$")
-CHECK_RE = re.compile(r"^\s*[;#]\s*([A-Za-z0-9_]+?)(-NEXT|-DAG|-LABEL|-SAME|-NOT|-EMPTY|-COUNT-\d+)?:\s*(.*)$")
+CHECK_RE = re.compile(r"^\s*[;#]\s*([A-Za-z0-9_-]+?)(-NEXT|-DAG|-LABEL|-SAME|-NOT|-EMPTY|-COUNT-\d+)?:\s*(.*)$")
 PIPELINE_TOOLS = {"llc": "llc", "opt": "opt", "llvm-mc": "llvm-mc", "llvm-objdump": "binary-tool", "llvm-readobj": "binary-tool", "llvm-readelf": "binary-tool",
                   "llvm-dis": "other", "llvm-as": "other", "filecheck": "FileCheck", "ld.lld": "binary-tool", "lld": "binary-tool", "clang": "clang", "llvm-link": "other"}
 MIR_PASS_FLAGS = ("-run-pass", "-stop-after", "-stop-before", "-start-before", "-start-after", "-passes=", "-print-after", "-mir-")
@@ -466,9 +466,13 @@ def our_universe(repo):
     # control-flow / terminator mnemonics are emitted by render_term / terminators, not in match arms
     for extra in ("s_branch", "s_cbranch_vccnz", "s_cbranch_vccz", "s_cbranch_scc0", "s_cbranch_scc1", "s_endpgm", "s_nop", "s_barrier", "s_waitcnt", "s_setprio"):
         mnemonics.add(extra)
+    enum_src = open(os.path.join(repo, "crates", "amdgpu-compiler", "src", "mir.rs"), errors="replace").read()
+    em = re.search(r"pub enum MOp \{(.*?)\n\}", enum_src, re.S)
+    n_enum = len(re.findall(r"^\s{4}([A-Z]\w*)\s*(?:,|\(|\{|=)", em.group(1), re.M)) if em else -1
     mops = sorted(set(by_mop) | set(k for k in tbl_ops if not k.startswith("__rows_")))
     return {
         "n_mops": len(mops),
+        "n_mop_enum": n_enum,
         "mop_to_mnemonics": {k: sorted(v) for k, v in sorted(by_mop.items())},
         "emit_mnemonics": sorted(mnemonics),
         "table_mir_opcodes_normalised": sorted(tbl_mn),
