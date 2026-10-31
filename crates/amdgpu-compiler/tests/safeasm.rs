@@ -1,4 +1,3 @@
-use amdgpu_compiler::mir::{MInst as MInst, MOp as MOp};
 //! Safe-asm sequences through the compiler: standalone assembly, hazard padding, equality with the DSL-built path, embedding via `Op::Asm`
 //! and the DS/VMEM scoreboard (`Pending` tokens).
 
