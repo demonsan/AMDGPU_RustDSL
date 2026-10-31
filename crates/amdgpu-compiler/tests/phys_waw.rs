@@ -84,3 +84,39 @@ fn the_wait_carries_across_a_block_boundary() {
         + m.blocks[0].insts.iter().rev().take_while(|i| i.op == MOp::SNop).map(|i| i.imm as usize + 1).sum::<usize>();
     assert!(pad >= 18, "only {pad} wait states of padding between the MFMA and the reuse in the successor");
 }
+// ---- VMEM store data hazard: a global_store_dwordx4 followed by a VALU write of its data registers ------------------------------------------
+
+// vregs: 0 = V2 address, 1 = V4 store data (phys v4..v7), 2 = V1 temp reusing v4 (VALU writer), 3 = V4 LDS-read destination reusing v4..v7, 4 = V1 unrelated
+fn store_classes() -> Vec<RClass> {
+    vec![RClass::V2, RClass::V4, RClass::V1, RClass::V4, RClass::V1]
+}
+
+#[test]
+fn a_valu_write_of_the_wide_store_data_registers_waits_two_wait_states() {
+    let st = MInst::new(MOp::GlobalStoreF32x4).srcreg(0).srcreg(1).imm(0);
+    let wr = MInst::new(MOp::VMovB32).def(2).imm(1); // v4 = ...
+    let mut m = func(vec![vec![st, MInst::new(MOp::SWaitLgkm).imm(0), wr]], store_classes());
+    pad_physical_war(&mut m, &alloc(vec![2, 4, 4, 4, 40]));
+    // s_waitcnt counts as one wait state: one more is needed
+    assert!(gap(&m, 0, MOp::GlobalStoreF32x4, MOp::VMovB32) >= 2, "gap {}", gap(&m, 0, MOp::GlobalStoreF32x4, MOp::VMovB32));
+}
+
+#[test]
+fn the_store_data_hazard_does_not_touch_unrelated_registers_lds_reads_or_narrow_stores() {
+    let wide = MInst::new(MOp::GlobalStoreF32x4).srcreg(0).srcreg(1).imm(0);
+    // unrelated VALU destination (v40): no padding
+    let mut m = func(vec![vec![wide.clone(), MInst::new(MOp::VMovB32).def(4).imm(1)]], store_classes());
+    pad_physical_war(&mut m, &alloc(vec![2, 4, 4, 4, 40]));
+    assert_eq!(gap(&m, 0, MOp::GlobalStoreF32x4, MOp::VMovB32), 0);
+    // an LDS read returning into the data registers is not a VALU write (a nop in between changed nothing on hardware)
+    let rd = MInst::new(MOp::LdsReadB128).def(3).srcreg(4).imm(0);
+    let mut m = func(vec![vec![wide, rd]], store_classes());
+    pad_physical_war(&mut m, &alloc(vec![2, 4, 4, 4, 40]));
+    assert_eq!(gap(&m, 0, MOp::GlobalStoreF32x4, MOp::LdsReadB128), 0);
+    // an 8-byte store has no such hazard
+    let narrow = MInst::new(MOp::GlobalStoreF32x2).srcreg(0).srcreg(1).imm(0);
+    let wr = MInst::new(MOp::VMovB32).def(2).imm(1);
+    let mut m = func(vec![vec![narrow, wr]], store_classes());
+    pad_physical_war(&mut m, &alloc(vec![2, 4, 4, 4, 40]));
+    assert_eq!(gap(&m, 0, MOp::GlobalStoreF32x2, MOp::VMovB32), 0);
+}

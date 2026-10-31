@@ -372,6 +372,20 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         b.insts = out;
     }
 }
+/// Wait slots (issue distance) after a VMEM store of more than 8 bytes before a VALU may overwrite its data registers: 2 wait states on gfx940+ (so the
+/// next write may issue 3 slots after the store; an `s_waitcnt` between counts as one).
+const STORE_DATA_WAIT: usize = 3;
+
+/// Global stores of more than 64 bits of data (`global_store_dwordx3/x4`): the data VGPRs are read over several cycles after issue.
+fn is_wide_vmem_store(op: MOp) -> bool {
+    matches!(op, MOp::GlobalStoreF32x4 | MOp::GlobalStoreF32x4Sc1)
+}
+
+/// A VALU (non-memory, non-matrix) instruction that writes a vector register.
+fn is_valu_vgpr_write(m: &MFunction, inst: &MInst) -> bool {
+    inst.dst.map_or(false, |d| m.vreg_class(d).is_vector()) && mfma_latency(inst.op).is_none() && crate::sched::effects::effects(m, inst).mem.is_none() && !matches!(inst.op, MOp::VSmfmac16x16x128Fp8)
+}
+
 /// Wait states until an MFMA has finished WRITING its destination (not the value-level RAW latency): 16-pass ops need 18 + 1 (CDNA4 ISA 7.6 "XDL write
 /// VGPR -> VALU write of the same VGPR"), the 32x32x64 scaled and sparse forms 21.
 fn mfma_dst_wait(lat: usize) -> usize {
@@ -434,6 +448,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
         let mut out: Vec<MInst> = Vec::with_capacity(b.insts.len() + 8);
         // in-flight MFMA destinations: (issue cycle, wait states, canonical dst vreg, physical range). Entries inherited from predecessors are issued
         // at cycle 0 with only their remaining wait states left.
+        let mut store_data_inflight: Vec<(usize, usize, Vec<(u32, u32)>)> = Vec::new();
         let mut dst_inflight: Vec<(usize, usize, VReg, (u32, u32))> = entry_dst[bi].iter().map(|(d, r, rem)| (0usize, *rem, *d, *r)).collect();
         // (issue cycle, wait states needed, op, source ranges)
         let mut inflight: Vec<(usize, usize, MOp, Vec<(u32, u32)>)> = Vec::new();
@@ -467,6 +482,17 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 // two-instruction expansions write the whole pair (already covered by dst range)
             }
             let mut earliest = cycle;
+            // VMEM store data hazard (CDNA3/4: LLVM `has12DWordStoreHazard`, `VALUWaitStates` = 2 on gfx940+): a store of MORE than 8 bytes may still be reading
+            // its data VGPRs when the next instructions issue; a VALU write of those registers needs 2 wait states first. Found on hardware as intermittent
+            // corruption of the first dword of every `global_store_dwordx4` data (an LDS read-back into v[4:7] followed by the store, then the VALU chain that
+            // rebuilds v4..v7 one `s_waitcnt` later): only VALU writers are affected (a nop between the store and a following LDS read changed nothing).
+            if !store_data_inflight.is_empty() && is_valu_vgpr_write(m, &inst) {
+                for (issue, need, srcs) in &store_data_inflight {
+                    if wr.iter().any(|w| srcs.iter().any(|s| overlaps(*w, *s))) {
+                        earliest = earliest.max(issue + need);
+                    }
+                }
+            }
             // physical WAW/RAW through a DIFFERENT value: another vreg whose register range overlaps the destination of an MFMA that is still writing
             // it (typically the MFMA result was dead - e.g. the last tile of an unrolled loop copy - so allocation handed its registers to a new value).
             // The late MFMA write would overwrite that value. The MFMA's own vreg is the value-level pass's business.
@@ -533,6 +559,13 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
                 inflight.push((cycle, need, inst.op, srcs));
             }
+            if is_wide_vmem_store(inst.op) {
+                if let Some(Src::Reg(d)) = inst.srcs.get(1) {
+                    if m.vreg_class(*d).is_vector() {
+                        store_data_inflight.push((cycle, STORE_DATA_WAIT, vec![rng(m, *d)]));
+                    }
+                }
+            }
             if let (true, Some(l), Some(d)) = (waw_on, mfma_latency(inst.op), inst.dst) {
                 dst_inflight.push((cycle, mfma_dst_wait(l), m.canon(d), rng(m, d)));
             }
@@ -543,6 +576,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
             cycle += 1;
             inflight.retain(|(issue, need, _, _)| issue + need > cycle);
             dst_inflight.retain(|(issue, need, _, _)| issue + need > cycle);
+            store_data_inflight.retain(|(issue, need, _)| issue + need > cycle);
         }
         let mut missing = inflight.iter().map(|(i, n, _, _)| (i + n).saturating_sub(cycle)).max().unwrap_or(0);
         while missing > 0 {
