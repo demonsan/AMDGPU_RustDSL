@@ -18,19 +18,37 @@ static int cmp(const char* what, const uint8_t* a, const uint8_t* b, size_t n) {
 int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: %s rw|lds kernel.co\n", argv[0]); return 2; }
     const bool rw = std::strcmp(argv[1], "rw") == 0;
-    const char* kname = rw ? "probe_buffer_rw" : "probe_buffer_lds";
+    const bool dyn = std::strcmp(argv[1], "dyn") == 0;
+    const char* kname = rw ? "probe_buffer_rw" : (dyn ? "probe_buffer_dyn" : "probe_buffer_lds");
     std::vector<uint32_t> in(4096);
     for (size_t i = 0; i < in.size(); ++i) in[i] = (uint32_t)(i * 2654435761u + 7u);
     std::vector<uint8_t> out(16384, 0xA5);
     void *din, *dout; CK(hipMalloc(&din, 16384)); CK(hipMalloc(&dout, 16384));
     CK(hipMemcpy(din, in.data(), in.size() * 4, hipMemcpyHostToDevice)); CK(hipMemcpy(dout, out.data(), out.size(), hipMemcpyHostToDevice));
     hipModule_t mod; hipFunction_t fn; CK(hipModuleLoad(&mod, argv[2])); CK(hipModuleGetFunction(&fn, mod, kname));
-    int soff = rw ? 3072 : 2048;
+    int soff = rw ? 3072 : (dyn ? 512 : 2048); // dyn: the runtime num_records in bytes
     void *a0 = din, *a1 = dout; void* params[] = {&a0, &a1, &soff};
     CK(hipModuleLaunchKernel(fn, 1, 1, 1, 64, 1, 1, 0, nullptr, params, nullptr)); CK(hipDeviceSynchronize());
     CK(hipMemcpy(out.data(), dout, out.size(), hipMemcpyDeviceToHost));
     const uint8_t* I = reinterpret_cast<const uint8_t*>(in.data());
     int bad = 0;
+    if (dyn) {
+        std::vector<uint8_t> zeros(512, 0), sent(512, 0xCD);
+        bad += cmp("runtime num_records: plain load in-range lanes", &out[0], I, 512);
+        bad += cmp("runtime num_records: plain load OOB lanes == 0", &out[512], zeros.data(), 512);
+        bad += cmp("LDS dwordx4 form: in-range lanes", &out[1024], I, 512);
+        // the question that matters for kernel-opt: what does an out-of-range LDS-direct load do to the LDS bytes?
+        const uint8_t* o = &out[1024 + 512];
+        bool allz = true, alls = true; for (int i = 0; i < 512; ++i) { allz &= (o[i] == 0); alls &= (o[i] == 0xCD); }
+        std::printf("  LDS dwordx4 form, OOB lanes (32..63): %s\n", allz ? "ZERO-FILL (OOB data lands as 0)" : alls ? "DROPPED (LDS keeps its old bytes)" : "MIXED/OTHER");
+        const uint8_t* w = &out[2048]; // dword form: 4 bytes per lane, voffset = tid*16 -> lanes >= 32 OOB
+        bool wz = true, ws = true; for (int i = 128; i < 256; ++i) { wz &= (w[i] == 0); ws &= (w[i] == 0xCD); }
+        std::printf("  LDS dword form,   OOB lanes (32..63): %s\n", wz ? "ZERO-FILL" : ws ? "DROPPED (LDS keeps its old bytes)" : "MIXED/OTHER");
+        for (int l = 0; l < 32; ++l) { uint32_t g; std::memcpy(&g, &w[l * 4], 4); uint32_t want; std::memcpy(&want, I + l * 16, 4); if (g != want) { ++bad; break; } }
+        std::printf("  LDS dword form, in-range lanes match input: %s\n", bad ? "NO" : "yes");
+        std::printf("%s\n", bad ? "BUFFER_FAIL" : "BUFFER_OK");
+        return bad != 0;
+    }
     if (rw) {
         bad += cmp("buffer x4 copy        == in[0..1024)", &out[0], I, 1024);
         bad += cmp("buffer x2 (imm 1024)  == in[1024..1536)", &out[1024], I + 1024, 512);

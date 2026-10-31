@@ -158,6 +158,8 @@ pub enum MOp {
     BufferLoadDwordX1Lds,
     /// Buffer resource descriptor: dst S4 <- base pointer (S2); imm = num_records. dword0 = base lo, dword1 = base hi & 0xffff, dword2 = num_records, dword3 = flags.
     SBufferRsrc,
+    /// The same with a RUNTIME num_records: srcs = [base (S2), num_records (S1)].
+    SBufferRsrcDyn,
     GlobalStoreU16,
     GlobalStoreF32,
     GlobalStoreF32x4,
@@ -408,6 +410,14 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                         if m.vreg_class(*s) != RClass::S1 {
                             errs.push(format!("block {bi} inst {ii}: buffer soffset must be S1"));
                         }
+                    }
+                }
+                MOp::SBufferRsrcDyn => {
+                    if inst.dst.map_or(true, |d| m.vreg_class(d) != RClass::S4)
+                        || !matches!(inst.srcs.first(), Some(Src::Reg(b)) if m.vreg_class(*b) == RClass::S2)
+                        || !matches!(inst.srcs.get(1), Some(Src::Reg(n)) if m.vreg_class(*n) == RClass::S1)
+                    {
+                        errs.push(format!("block {bi} inst {ii}: s_buffer_rsrc_dyn builds an S4 from an S2 base and an S1 size"));
                     }
                 }
                 MOp::SBufferRsrc => {
