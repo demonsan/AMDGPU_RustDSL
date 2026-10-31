@@ -42,3 +42,12 @@ Probe: kernels `probe_la8*` (512 threads, per-element hash(i+seed) partials, new
 | `probe_la8` (full) | sc1/sc1 | drain + `buffer_wbl2` / drain + `buffer_inv` + drain | 0 of 20000 (smoke; the long run was killed by an external process on the shared node, see below) |
 | `probe_la8_plain` | plain/plain | none | **10966 bad runs of 20000 (55%)** |
 The 8-wave probe is ~3 orders of magnitude more sensitive than the 1-wave one (plain/no-fence failed 1/12000 there). Honest limitation: the longer full / plain_fenced / nodrain runs (>= 1e5 each) were terminated repeatedly by an external SIGTERM on the shared node (other sessions' guard scripts run on the same account/GPU), so only the lite 4e5 and the 20000-run smoke numbers above are final; `tools/last_arriver8_probe.sh` reproduces any of them (`RUNS=... THRASH=1 STAGGER=4`).
+
+## Final status (Main v2.2-round75-final)
+
+Primitives validated as documented: **lite contract 0 failures / 400000 runs**, **full-fence 0 / 20000**
+(smoke; long runs externally terminated), and the **plain no-fence probe fails 10966 / 20000 = 55%**, so the
+probe is sensitive and the lite/full results are meaningful. The fused-combine kernel using these primitives
+was measured **negative: best 36.6 us vs 26.8-27.0 us for the two-launch split+combine path**, so it stays
+**opt-in** and is not used by the shipped `_kvsplit` + `combine8h` path. See `docs/current-status.md` for the
+authoritative snapshot and `docs/vendor-spec.md` section 7.8 for the memory-order contract.

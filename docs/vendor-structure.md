@@ -1,4 +1,4 @@
-# Vendor FMHA (MXFP8, hd128) - structure, and our `_vs` re-implementation
+# Vendor FMHA (MXFP8, hd128) - structure, and our final `_vs128` re-implementation
 
 Source: disassembly of `fwd_hd128_mxfp8.co` (9229 lines), rocprof counters, kernel-wiki; cross-checked with `docs/vendor-spec.md` (kernel-occ).
 
@@ -14,12 +14,28 @@ Two groups of 4 waves (all 8 waves own 32 query rows) run the SAME code one barr
 
 2 barriers per 128 keys, loop body is 2x unrolled (two ring-slot parities). ~113 VALU per 128 keys on the fast path (ours ~400). Staging is global->LDS DMA only (no VGPR round trip), 1040-byte runs. The row-sum smfmac uses per-lane A / index operands built with `v_cndmask` from a lane mask (not a constant).
 
-## What `fmha_fwd_hd128_mxfp8_vs` implements (own backend only)
-- same two-group ping-pong, `s_setprio 1/0` pair per phase, but 64-key units (4 barriers per 128 keys) - 128-key units do not fit the register file (see below);
-- QK of the next unit inside the MFMA phase; DMA of tile t+2 issued in the VALU phase of tile t into a 3-slot ring, one deferred `vmcnt` wait;
-- dense XOR-swizzled LDS layout (`swz`), 0 bank conflicts (524288 -> 0);
-- sv recipe (bias in C, pknorm + scalef32, `svcorr` LUT, rollback); masked last tile peeled; group B = group A's sequence one phase later (a carried P fragment gave non-determinism);
-- `scalarize` lowering opt by default (needed to fit).
+## Final `_vs128` implementation (Main v2.2-round75-final)
 
-## Measured (B1 H8 S2048, own backend, GPU 0, 30 iters)
-default `_t` 292 | `_vs` (svcorr) 255 | `_vs`+svscale 312 | vendor 515. See `docs/status.md` round 47 for ablations and negatives.
+This supersedes the early `_vs` scaffold; the shipped kernel is `fmha_fwd_hd128_mxfp8_vs128`
+(own backend), selected by `fmha_fwd_hd128_mxfp8_auto` for the 128-row/256-row fallback and for
+filled grids.
+
+- **256-row blocks** (8 waves x 32 query rows, 512 threads); 1 block/CU, 2 waves/SIMD, 8 waves/CU.
+- **Q prologue:** Q staged with **16-byte (`b128`) loads** and held resident in registers for the
+  loop (`q0reg`/`q1reg`); one Q load per tile instead of per S tile.
+- **8-byte epilogue stores** (`StoreF32x2`): fp16 partial/output stores are 8 B, halving the epilogue
+  write traffic; the exact-reference recipe and the 4-`smfmac` row sums are unchanged.
+- **KV-split inherits the Q prologue vectorisation:** `_kvsplit` + `combine8h` uses the same 16 B Q
+  loads and the same 8 B epilogue stores; the split path is bit-identical to the single kernel
+  (`c3301d1c` on B1H2S200 SK1337) and 1200/1200 repeated launches are a single md5.
+- LDS 102400 B, VGPR 249 (`next_free_vgpr` 252), SGPR 48; dense XOR-swizzled K/V staging with
+  `kdlds,dbuf`; own backend only (own-only DMA/ops).
+- **Certified numbers (Main `8fec359`, `v2.2-round75-final`):** per-CU 64-block
+  **453-455 TFLOP/s = 7.07-7.10 TF/CU** vs vendor 8.41 (1.19x gap); filled B4H8S2048
+  **0.846x** (1443.6/1454.8 vs 1706.8), filled B1H8S8192 **0.841x** (1998.6/2002.7 vs 2376.5);
+  accuracy mean **8.3e-4** vs vendor 1.5-2.9e-3. Full certified table and closure statement:
+  `docs/current-status.md` and `docs/vendor-spec.md` section 7.12.
+
+## Measured (historical `_vs` scaffold, B1 H8 S2048, own backend, GPU 0, 30 iters)
+default `_t` 292 | `_vs` (svcorr) 255 | `_vs`+svscale 312 | vendor 515. See `docs/status.md` round 47
+for the historical ablations and negatives; those numbers are not the shipped `_vs128`.
