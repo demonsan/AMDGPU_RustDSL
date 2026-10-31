@@ -19005,6 +19005,325 @@ pub fn probe_buffer_dyn() -> Function {
     b.finish()
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+// probe_llvm_* : function / ABI level feature kernels for the LLVM-test coverage audit (tools/llvm_feature_probe.sh runs them on the GPU).
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+/// Kernarg layout: three pointers, an i32, an f32 at a 4-byte (not 8-byte) aligned offset, another i32. c[i] = a[i] + b[i] + s (f32); c[64] = n, c[65] = m (raw bits).
+pub fn probe_llvm_kernarg() -> Function {
+    let mut b = FnBuilder::new("probe_llvm_kernarg", 64);
+    b.arg("a", DType::Ptr, 0, 8);
+    b.arg("b", DType::Ptr, 8, 8);
+    b.arg("n", DType::I32, 16, 4);
+    b.arg("s", DType::F32, 20, 4);
+    b.arg("c", DType::Ptr, 24, 8);
+    b.arg("m", DType::I32, 32, 4);
+    let pa = b.let_(Op::KernargPtr { offset: 0 });
+    let pb = b.let_(Op::KernargPtr { offset: 8 });
+    let n = b.let_(Op::KernargI32 { offset: 16 });
+    let s = b.let_(Op::KernargF32 { offset: 20 });
+    let pc = b.let_(Op::KernargPtr { offset: 24 });
+    let m = b.let_(Op::KernargI32 { offset: 32 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let off = b.mul_i32(tid, c4);
+    let qa = b.ptr_add(pa, off);
+    let qb = b.ptr_add(pb, off);
+    let qc = b.ptr_add(pc, off);
+    let x = b.load_f32(qa, 0);
+    let y = b.load_f32(qb, 0);
+    let xy = b.add_f32(x, y);
+    let r = b.add_f32(xy, s);
+    b.store_f32(qc, 0, r);
+    let nf = b.bitcast_f32(n);
+    let mf = b.bitcast_f32(m);
+    b.store_f32(pc, 256, nf);
+    b.store_f32(pc, 260, mf);
+    b.finish()
+}
+
+/// Workgroup / workitem ids on a (3, 2, 2) grid of 64-thread blocks: out[((z * 2 + y) * 3 + x) * 64 + tid] = (z * 100 + y * 10 + x) * 1000 + tid.
+pub fn probe_llvm_ids() -> Function {
+    let mut b = FnBuilder::new("probe_llvm_ids", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let x = b.let_(Op::WorkgroupIdX);
+    let y = b.let_(Op::WorkgroupIdY);
+    let z = b.let_(Op::WorkgroupIdZ);
+    let c2 = b.c_i32(2);
+    let c3 = b.c_i32(3);
+    let c4 = b.c_i32(4);
+    let c10 = b.c_i32(10);
+    let c64 = b.c_i32(64);
+    let c100 = b.c_i32(100);
+    let c1000 = b.c_i32(1000);
+    let z2 = b.mul_i32(z, c2);
+    let zy = b.add_i32(z2, y);
+    let zy3 = b.mul_i32(zy, c3);
+    let lin = b.add_i32(zy3, x);
+    let blk = b.mul_i32(lin, c64);
+    let idx = b.add_i32(blk, tid);
+    let z100 = b.mul_i32(z, c100);
+    let y10 = b.mul_i32(y, c10);
+    let t1 = b.add_i32(z100, y10);
+    let t2 = b.add_i32(t1, x);
+    let t3 = b.mul_i32(t2, c1000);
+    let val = b.add_i32(t3, tid);
+    let off = b.mul_i32(idx, c4);
+    let q = b.ptr_add(o, off);
+    let vf = b.bitcast_f32(val);
+    b.store_f32(q, 0, vf);
+    b.finish()
+}
+
+/// Wave roles (A = waves 0-3, B = waves 4-7) with an if / else on a wave-uniform condition, static LDS, barrier and waitcnt: A writes 1000 + tid, B writes 2000 + tid,
+/// then every lane reads the partner role's slot (tid +- 256): out[tid] = (tid < 256) ? 2000 + tid + 256 : 1000 + tid - 256.
+pub fn probe_llvm_roles() -> Function {
+    let mut b = FnBuilder::new("probe_llvm_roles", 512);
+    b.lds(2048);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let c256 = b.c_i32(256);
+    let c512 = b.c_i32(512);
+    let c1000 = b.c_i32(1000);
+    let c2000 = b.c_i32(2000);
+    let off = b.mul_i32(tid, c4);
+    let role_a = b.cmp_lt_i32(tid, c256);
+    b.begin_if(Opnd::Val(role_a));
+    let va = b.add_i32(tid, c1000);
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(va));
+    b.else_();
+    let vb = b.add_i32(tid, c2000);
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(vb));
+    b.end_if();
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    // partner slot: (tid + 256) mod 512 = tid + 256 for A, tid - 256 for B
+    let plus = b.add_i32(tid, c256);
+    let minus = b.add_i32(tid, c256);
+    let wrap = b.let_(Op::CmpLtI32(Opnd::Val(plus), Opnd::Val(c512)));
+    let neg = b.mul_i32(c256, b.c_i32(-2));
+    let wrapped = b.add_i32(plus, neg);
+    let _ = minus;
+    let pidx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wrap), a: Opnd::Val(plus), b: Opnd::Val(wrapped) });
+    let poff = b.mul_i32(pidx, c4);
+    let got = b.load_lds_b32(Opnd::Val(poff));
+    let q = b.ptr_add(o, off);
+    let gf = b.bitcast_f32(got);
+    b.store_f32(q, 0, gf);
+    b.finish()
+}
+
+/// Static LDS (8 KiB) with b32 and b128 accesses, barrier and partial waitcnt: lane t writes t at [4 t] and (t, t + 1000, t + 2000, t + 3000) at [4096 + 16 t];
+/// after the barrier it reads the mirrored lane (63 - t): out[t] = 63 - t, out[64 + t] = word 2 of the mirrored b128 = (63 - t) + 2000.
+pub fn probe_llvm_lds() -> Function {
+    let mut b = FnBuilder::new("probe_llvm_lds", 64);
+    b.lds(8192);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let c16 = b.c_i32(16);
+    let c63 = b.c_i32(63);
+    let c1000 = b.c_i32(1000);
+    let c2000 = b.c_i32(2000);
+    let c3000 = b.c_i32(3000);
+    let c4096 = b.c_i32(4096);
+    let off4 = b.mul_i32(tid, c4);
+    let off16a = b.mul_i32(tid, c16);
+    let off16 = b.add_i32(off16a, c4096);
+    b.store_lds_b32(Opnd::Val(off4), Opnd::Val(tid));
+    let w1 = b.add_i32(tid, c1000);
+    let w2 = b.add_i32(tid, c2000);
+    let w3 = b.add_i32(tid, c3000);
+    let f4 = b.frag4(tid, w1, w2, w3);
+    b.store_lds_b128(Opnd::Val(off16), Opnd::Val(f4));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let mirror = b.let_(Op::AddI32(Opnd::Val(c63), Opnd::Val(tid)));
+    let _ = mirror;
+    let neg = b.mul_i32(tid, b.c_i32(-1));
+    let m = b.add_i32(c63, neg);
+    let mo4 = b.mul_i32(m, c4);
+    let mo16a = b.mul_i32(m, c16);
+    let mo16 = b.add_i32(mo16a, c4096);
+    let v = b.load_lds_b32(Opnd::Val(mo4));
+    let vv = b.load_lds_b128(Opnd::Val(mo16));
+    let w2l = b.frag4_lane(vv, 2);
+    let q = b.ptr_add(o, off4);
+    let vf = b.bitcast_f32(v);
+    let wf = b.bitcast_f32(w2l);
+    b.store_f32(q, 0, vf);
+    b.store_f32(q, 256, wf);
+    b.finish()
+}
+
+/// Wave-level (uniform) branching with nesting on the workgroup id: out[wg] = wg is even ? (wg < 4 ? 11 : 12) : (wg < 4 ? 21 : 22), 8 workgroups, lane 0 stores.
+pub fn probe_llvm_branch() -> Function {
+    let mut b = FnBuilder::new("probe_llvm_branch", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let wg = b.let_(Op::WorkgroupIdX);
+    let tid = b.let_(Op::WorkitemId);
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c4 = b.c_i32(4);
+    let c11 = b.c_i32(11);
+    let c12 = b.c_i32(12);
+    let c21 = b.c_i32(21);
+    let c22 = b.c_i32(22);
+    let odd = b.let_(Op::AndI32(Opnd::Val(wg), Opnd::Val(c1)));
+    let is_even = b.cmp_lt_i32(odd, c1);
+    let low = b.cmp_lt_i32(wg, c4);
+    let lane0 = b.cmp_lt_i32(tid, c1);
+    let _ = c0;
+    let off = b.mul_i32(wg, c4);
+    let q = b.ptr_add(o, off);
+    b.begin_if(Opnd::Val(is_even));
+    b.begin_if(Opnd::Val(low));
+    let v11 = b.bitcast_f32(c11);
+    b.begin_if(Opnd::Val(lane0));
+    b.store_f32(q, 0, v11);
+    b.end_if();
+    b.else_();
+    let v12 = b.bitcast_f32(c12);
+    b.begin_if(Opnd::Val(lane0));
+    b.store_f32(q, 0, v12);
+    b.end_if();
+    b.end_if();
+    b.else_();
+    b.begin_if(Opnd::Val(low));
+    let v21 = b.bitcast_f32(c21);
+    b.begin_if(Opnd::Val(lane0));
+    b.store_f32(q, 0, v21);
+    b.end_if();
+    b.else_();
+    let v22 = b.bitcast_f32(c22);
+    b.begin_if(Opnd::Val(lane0));
+    b.store_f32(q, 0, v22);
+    b.end_if();
+    b.end_if();
+    b.end_if();
+    b.finish()
+}
+
+/// Loop variables: for i in 0..n (n from the kernarg): acc += i (i32), facc += 0.5 (f32). out[tid] = acc (raw bits), out[64 + tid] = facc.
+pub fn probe_llvm_loop() -> Function {
+    let mut b = FnBuilder::new("probe_llvm_loop", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("n", DType::I32, 8, 4);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let n = b.let_(Op::KernargI32 { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c4 = b.c_i32(4);
+    let zf = b.c_f32(0.0);
+    let half = b.c_f32(0.5);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(c0)), (DType::F32, Opnd::Val(zf))]);
+    let it = vars[0];
+    let acc = vars[1];
+    let facc = vars[2];
+    let more = b.cmp_lt_i32(Opnd::Var(it), n);
+    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
+    b.break_if(Opnd::Val(stop));
+    let acc_n = b.add_i32(Opnd::Var(acc), Opnd::Var(it));
+    let facc_n = b.add_f32(Opnd::Var(facc), half);
+    let it_n = b.add_i32(Opnd::Var(it), c1);
+    b.set_var(acc, acc_n);
+    b.set_var(facc, facc_n);
+    b.set_var(it, it_n);
+    b.end_loop();
+    let off = b.mul_i32(tid, c4);
+    let q = b.ptr_add(o, off);
+    let accf = b.bitcast_f32(Opnd::Var(acc));
+    b.store_f32(q, 0, accf);
+    b.store_f32(q, 256, Opnd::Var(facc));
+    b.finish()
+}
+
+/// Global atomics: every lane of every workgroup adds 1 to a counter and stores the returned old value: out[wg * 64 + tid] = old; counter ends at 64 * grid.
+pub fn probe_llvm_atomic() -> Function {
+    let mut b = FnBuilder::new("probe_llvm_atomic", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("ctr", DType::Ptr, 8, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let ctr = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let wg = b.let_(Op::WorkgroupIdX);
+    let c1 = b.c_i32(1);
+    let c4 = b.c_i32(4);
+    let c64 = b.c_i32(64);
+    let old = b.atomic_add_u32(ctr, 0, c1);
+    let blk = b.mul_i32(wg, c64);
+    let idx = b.add_i32(blk, tid);
+    let off = b.mul_i32(idx, c4);
+    let q = b.ptr_add(o, off);
+    let of = b.bitcast_f32(old);
+    b.store_f32(q, 0, of);
+    b.finish()
+}
+
+/// Compare / select forms: out[t] = (t >= thr) ? 1.0 : 2.0 with an i32 greater-or-equal compare feeding a select (the `maskreg` lowering turns it into a mask compare), plus a
+/// float compare `x < y` select.
+pub fn probe_llvm_maskge() -> Function {
+    let mut b = FnBuilder::new("probe_llvm_maskge", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("thr", DType::I32, 8, 4);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let thr = b.let_(Op::KernargI32 { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let one = b.c_f32(1.0);
+    let two = b.c_f32(2.0);
+    let ge = b.let_(Op::CmpGeI32(Opnd::Val(tid), Opnd::Val(thr)));
+    let r = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ge), a: Opnd::Val(one), b: Opnd::Val(two) });
+    let tf = b.bitcast_f32(tid);
+    let lt = b.cmp_lt_f32(tf, one);
+    let r2 = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(lt), a: Opnd::Val(two), b: Opnd::Val(r) });
+    let off = b.mul_i32(tid, c4);
+    let q = b.ptr_add(o, off);
+    b.store_f32(q, 0, r2);
+    b.finish()
+}
+
+/// Two independent kernels (each its own code object / kernel descriptor): k1 writes out[t] = t, k2 reads it and writes out[t] = 2 * out[t] + 1.
+pub fn probe_llvm_k1() -> Function {
+    let mut b = FnBuilder::new("probe_llvm_k1", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let off = b.mul_i32(tid, c4);
+    let q = b.ptr_add(o, off);
+    let tf = b.bitcast_f32(tid);
+    b.store_f32(q, 0, tf);
+    b.finish()
+}
+
+pub fn probe_llvm_k2() -> Function {
+    let mut b = FnBuilder::new("probe_llvm_k2", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let off = b.mul_i32(tid, c4);
+    let q = b.ptr_add(o, off);
+    let x = b.load_f32(q, 0);
+    let xi = b.bitcast_i32(x);
+    let two = b.c_i32(2);
+    let one = b.c_i32(1);
+    let y = b.mul_i32(xi, two);
+    let z = b.add_i32(y, one);
+    let zf = b.bitcast_f32(z);
+    b.store_f32(q, 0, zf);
+    b.finish()
+}
 pub fn probe_log_store4() -> Function {
     // out[4*tid + j] = log2(in[tid]) for j in 0..4: covers v_log_f32 and global_store_dwordx4 on both backends
     let mut b = FnBuilder::new("probe_log_store4", 64);
