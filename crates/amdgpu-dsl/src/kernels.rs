@@ -9570,7 +9570,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let c32v = b.c_i32(32);
     let c64 = b.c_i32(64);
     let shd: i32 = if fmha_t_opt("sh4") { 4 } else if fmha_t_opt("sh2") { 2 } else { 0 };
-    let c123 = b.c_i32(123 + shd);
+    // p4 (gen-next, docs/status.md round 70): the P scale moves from the PV MFMA scale operand (2^-4 on the P operand) into the fp8 conversion (scalef32 scale 0.25 = the vendor's s89), the PV MFMAs
+    // are then unscaled-equivalent (scale 127 / 127) and the epilogue normalisation takes the 2^-4 (fin x 1/16): O and the row sum both carry the same P scale
+    let p4 = fmha_t_opt("p4");
+    let c123 = b.c_i32(if p4 { 127 } else { 123 + shd });
     let c127 = b.c_i32(127);
     let neg_big = b.c_f32(-1.0e30);
     let c128v = b.c_i32(128);
@@ -9588,7 +9591,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let c8f = b.c_f32(8.0);
     let c0125 = b.c_f32(0.125);
     let c512f = b.c_f32(512.0);
-    let one_f = b.c_f32(1.0);
+    let one_f = b.c_f32(if p4 { 0.25 } else { 1.0 });
     let zero_f = b.c_f32(0.0);
     let cffff = b.c_i32(0xffff);
     let cm9 = b.c_i32(-9);
@@ -10621,7 +10624,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         b.bitcast_f32(l0)
     };
     let inv_l = b.rcp_f32(l_tot);
-    let fin = b.mul_f32(inv_l, cx.vd_raw);
+    let fin = if p4 {
+        let c16th = b.c_f32(0.0625);
+        let f0 = b.mul_f32(inv_l, cx.vd_raw);
+        b.mul_f32(f0, c16th)
+    } else {
+        b.mul_f32(inv_l, cx.vd_raw)
+    };
     if let Some(kv) = cx.kvs {
         // KV-split partial epilogue: Ohat = O * V_descale / l (fp32, normalised) and lse = log2(l) - 512 b_final (the P of this kernel is
         // 2^(x + 512 b - 127): the additive constants are split-independent and cancel in the combine weights 2^(lse_s - max lse))
