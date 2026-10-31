@@ -840,16 +840,37 @@ pub fn live_at(m: &MFunction, pos: usize) -> Vec<VReg> {
     let segs = precise_segments(m, &idx_of, &succs);
     segs.iter().enumerate().filter(|(r, sg)| m.vreg_class(*r as VReg).is_vector() && !m.alias.contains_key(&(*r as VReg)) && sg.iter().any(|(a, b)| *a <= pos && pos <= *b)).map(|(r, _)| r as VReg).collect()
 }
-/// Physical reaching-writer check (the same analysis as tests/mir_invariants.rs): every register dword read must be
-/// reached by the write of the virtual register dword it names, and by no other value, on every path. Returns the
-/// violations; used to guard the hole-filling packing and for allocator experiments.
+/// Physical reaching-writer check (the same analysis as tests/mir_invariants.rs, made PATH-AWARE): a register dword read must see the write of the
+/// virtual register dword it names; a foreign value (another vreg placed on the same physical register) must not have overwritten it on any path
+/// on which the reader's own value had been written.
+///
+/// The state per physical register maps the CURRENT writer to the set of writers that preceded it on the paths reaching here ("history"). A read of
+/// slot `r` is a violation when
+///  * no path delivers `r` at all but a foreign value reaches it (the own value never arrives), or
+///  * some foreign current writer has `r` in its history: `r` was written, then overwritten by the foreign value, on one and the same path (a clobber).
+/// A foreign writer whose paths never wrote `r` is NOT a clobber: on those paths the read is of an undefined value whatever the allocation is (typical
+/// shape: a loop-carried value defined inside the loop body and read after it, with the zero-trip path through the loop test - the precise-liveness
+/// packing deliberately lets another value use the register there). This is exactly the case the flat "set of reaching writers" test rejected, which
+/// made the two-phase packing fail on any persistent loop-carried slot (`FMHA_OPT=constres1..6`).
+/// Returns the violations; used to guard the hole-filling packing and for allocator experiments.
 pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
     use crate::sched::effects::{effects, Slot, SCC, VCC};
-    use std::collections::{BTreeSet, HashMap};
-    type Writers = HashMap<(bool, u32), BTreeSet<Slot>>;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    // physical register -> current writer -> writers that preceded it on the paths ending in that writer
+    type Writers = HashMap<(bool, u32), BTreeMap<Slot, BTreeSet<Slot>>>;
     let phys = |slot: Slot| -> (bool, u32) {
         let t = slot / 16;
         (m.vreg_class(t).is_vector(), a.phys[t as usize] + (slot - t * 16))
+    };
+    let write = |st: &mut Writers, w: Slot| {
+        let e = st.entry(phys(w)).or_default();
+        let mut hist: BTreeSet<Slot> = BTreeSet::new();
+        for (cur, prev) in e.iter() {
+            hist.insert(*cur);
+            hist.extend(prev.iter().copied());
+        }
+        e.clear();
+        e.insert(w, hist);
     };
     let succs = crate::sched::liveness::successors(m);
     let nb = m.blocks.len();
@@ -862,7 +883,7 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
             for inst in &m.blocks[b].insts {
                 for w in &effects(m, inst).writes {
                     if *w != VCC && *w != SCC {
-                        st.insert(phys(*w), BTreeSet::from([*w]));
+                        write(&mut st, *w);
                     }
                 }
             }
@@ -875,8 +896,14 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
                     Some(x) => {
                         for (k, v) in &st {
                             let e = x.entry(*k).or_default();
-                            for s2 in v {
-                                changed |= e.insert(*s2);
+                            for (cur, prev) in v {
+                                let slot = e.entry(*cur).or_insert_with(|| {
+                                    changed = true;
+                                    BTreeSet::new()
+                                });
+                                for p in prev {
+                                    changed |= slot.insert(*p);
+                                }
                             }
                         }
                     }
@@ -888,7 +915,7 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
         }
     }
     let mut report = Vec::new();
-    // where each slot is written (diagnostics: names the instructions behind a reported writer set)
+    // where each slot is written (diagnostics: names the instructions behind a reported writer)
     let mut wloc: HashMap<Slot, Vec<(usize, usize, MOp)>> = HashMap::new();
     for (b, blk) in m.blocks.iter().enumerate() {
         for (ii, inst) in blk.insts.iter().enumerate() {
@@ -910,61 +937,25 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
                 }
                 let p = phys(*r);
                 if let Some(ws) = st.get(&p) {
-                    if !ws.contains(r) || ws.len() > 1 {
-                        let at: Vec<String> = ws.iter().map(|w| format!("{w}={:?}", wloc.get(w).map(|v| v.iter().take(4).collect::<Vec<_>>()).unwrap_or_default())).collect();
-                        // witness: a CFG path from a foreign writer's block to this read that never passes a block writing the slot read
-                        let own: std::collections::HashSet<usize> = wloc.get(r).map(|v| v.iter().map(|x| x.0).collect()).unwrap_or_default();
-                        let mut wit = String::new();
-                        for w in ws.iter().filter(|w| *w != r) {
-                            if let Some(src) = wloc.get(w).and_then(|v| v.first()).map(|x| x.0) {
-                                let mut prev: HashMap<usize, usize> = HashMap::new();
-                                let mut q = std::collections::VecDeque::from([src]);
-                                let mut seen = std::collections::HashSet::from([src]);
-                                while let Some(x) = q.pop_front() {
-                                    if x == b && x != src {
-                                        break;
-                                    }
-                                    for &s in &succs[x] {
-                                        if !seen.contains(&s) && (!own.contains(&s) || s == b) {
-                                            seen.insert(s);
-                                            prev.insert(s, x);
-                                            q.push_back(s);
-                                        }
-                                    }
-                                }
-                                let mut path = vec![b];
-                                let mut cur = b;
-                                while let Some(&pv) = prev.get(&cur) {
-                                    path.push(pv);
-                                    cur = pv;
-                                    if cur == src {
-                                        break;
-                                    }
-                                }
-                                path.reverse();
-                                let mut edges: Vec<String> = path.iter().chain(own.iter()).map(|x| format!("{x}->{:?}({} insts)", succs[*x], m.blocks[*x].insts.len())).collect();
-                                edges.sort();
-                                edges.dedup();
-                                wit = format!(" witness path {:?}; edges {}; own-writer blocks {:?}; loops {:?}", path, edges.join(" "), own, m.loops);
-                                if std::env::var("AMDC_RA_DEBUG_BLOCKS").is_ok() {
-                                    let mut d = String::new();
-                                    for x in path.iter().chain(own.iter()).chain([3usize, 4, 5, 6, 7].iter()) {
-                                        d.push_str(&format!("\n  block {x} label {} term {:?} ({} insts)", m.blocks[*x].label, m.blocks[*x].term, m.blocks[*x].insts.len()));
-                                        for (k, i) in m.blocks[*x].insts.iter().enumerate().take(6) {
-                                            d.push_str(&format!("\n    [{k}] {:?} dst={:?} srcs={:?} imm={}", i.op, i.dst, i.srcs, i.imm));
-                                        }
-                                    }
-                                    wit.push_str(&d);
-                                }
-                            }
-                        }
-                        report.push(format!("block {b} inst {ii} {:?}: reads slot {r} ({}{}) but the reaching writers are {:?} [{}]{}", inst.op, if p.0 { "v" } else { "s" }, p.1, ws, at.join("; "), wit));
+                    let own_arrives = ws.contains_key(r);
+                    let clobbered: Vec<Slot> = ws.iter().filter(|(w, prev)| *w != r && prev.contains(r)).map(|(w, _)| *w).collect();
+                    if !own_arrives || !clobbered.is_empty() {
+                        let list: Vec<Slot> = if own_arrives { clobbered } else { ws.keys().copied().collect() };
+                        let at: Vec<String> = list.iter().map(|w| format!("{w}={:?}", wloc.get(w).map(|v| v.iter().take(3).collect::<Vec<_>>()).unwrap_or_default())).collect();
+                        report.push(format!(
+                            "block {b} inst {ii} {:?}: reads slot {r} ({}{}) but {} [{}]",
+                            inst.op,
+                            if p.0 { "v" } else { "s" },
+                            p.1,
+                            if own_arrives { "it was overwritten by another value on a path where it had been written, writers" } else { "its own value never arrives; the reaching writers are" },
+                            at.join("; ")
+                        ));
                     }
                 }
             }
             for w in &e.writes {
                 if *w != VCC && *w != SCC {
-                    st.insert(phys(*w), BTreeSet::from([*w]));
+                    write(&mut st, *w);
                 }
             }
         }
