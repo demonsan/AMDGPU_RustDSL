@@ -18665,7 +18665,9 @@ pub fn probe_buffer_rw() -> Function {
     // --- out-of-range: a descriptor of 512 bytes (lanes >= 32 read offset >= num_records: zero; their stores are dropped)
     let rin_s = b.buffer_desc(inp, 512);
     let z4 = b.buffer_load_b128(rin_s, o16, c0, 0);
-    b.buffer_store_b128(rout, o16, c0, 8192, z4); // out[8192..9216): lanes 32..63 must be ZERO
+    let c8192 = b.c_i32(8192);
+    let o16c = b.add_i32(o16, c8192);
+    b.buffer_store_b128(rout, o16c, c0, 0, z4); // out[8192..9216): lanes 32..63 must be ZERO
     let rout_s = b.buffer_desc(outp, 9216 + 512);
     let c9216 = b.c_i32(9216);
     let o16b = b.add_i32(o16, c9216);
