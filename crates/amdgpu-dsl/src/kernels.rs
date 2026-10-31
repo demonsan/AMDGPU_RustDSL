@@ -18719,23 +18719,30 @@ pub fn probe_buffer_lds() -> Function {
     b.barrier();
     // copy the staged slots out: out[0..4096) = LDS[0..4096) ordered 16 B/lane, flat copies after it
     let pout16 = b.ptr_add(outp, o16);
-    let pout4 = b.ptr_add(outp, o4);
+    let c4096o = b.c_i32(4096);
+    let outf = b.ptr_add(outp, c4096o);
+    let pout16f = b.ptr_add(outf, o16);
     for (k, base) in [0i32, 1024, 3072, 4096, 5120, 7168].into_iter().enumerate() {
         let ca = b.c_i32(base);
         let a = b.add_i32(o16, ca);
         let v = b.load_lds_b128(a);
-        b.store_f32x4(pout16, (k * 1024) as u32, v);
+        if k < 4 {
+            b.store_f32x4(pout16, (k * 1024) as u32, v);
+        } else {
+            b.store_f32x4(pout16f, ((k - 4) * 1024) as u32, v);
+        }
     }
+    let pout4 = b.ptr_add(outf, o4);
     let ca = b.c_i32(2048);
     let a = b.add_i32(o4, ca);
     let v = b.load_lds_b32(a);
     let vf = b.bitcast_f32(v);
-    b.store_f32(pout4, 6144, vf);
+    b.store_f32(pout4, 2048, vf);
     let cb = b.c_i32(6144);
     let a2 = b.add_i32(o4, cb);
     let v2 = b.load_lds_b32(a2);
     let vf2 = b.bitcast_f32(v2);
-    b.store_f32(pout4, 6400, vf2);
+    b.store_f32(pout4, 2304, vf2);
     b.finish()
 }
 
