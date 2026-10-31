@@ -13,7 +13,7 @@ while IFS=$'\t' read -r ID IR RX EX LAB; do
   case "$ID" in \#*|"") continue;; esac
   n=$((n+1))
   "$LLC" -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -O2 "tools/llvm_compare/$IR" -o "$OUT/$ID.s" 2> "$OUT/$ID.err" || { printf "%-26s %-9s | %s\n" "$ID" LLC_ERROR "$(head -1 "$OUT/$ID.err" | cut -c1-100)"; miss=$((miss+1)); continue; }
-  pick() { f="$1"; if [ "$EX" = "-" ]; then grep -E "$RX" "$f" 2>/dev/null | head -1; else grep -E "$RX" "$f" 2>/dev/null | grep -v -E "$EX" | head -1; fi; }
+  pick() { f="$1"; if [ "$EX" = "-" ]; then sed -E 's/^[[:space:]]+//' "$f" 2>/dev/null | grep -E "$RX" | head -1; else sed -E 's/^[[:space:]]+//' "$f" 2>/dev/null | grep -E "$RX" | grep -v -E "$EX" | head -1; fi; }
   L=$(pick "$OUT/$ID.s" | norm)
   O=""
   if [ "$LAB" != "-" ] && [ -f "$SW/s/$LAB.s" ]; then O=$(pick "$SW/s/$LAB.s" | norm); fi
