@@ -74,7 +74,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         if f.name.ends_with("_t128") {
             v.push("addrfold");
         }
-        if std::env::var("AMDC_SADDRLDS").map_or(false, |x| !x.is_empty() && x != "0") {
+        if std::env::var("FMHA_OPT").map_or(false, |x| x.split([','  ']).any(|t| t == "saddrlds")) {
             v.push("saddrlds");
         }
         v.extend_from_slice(extra);
