@@ -145,6 +145,11 @@ DMA、LDS 直达、`buffer_load … lds` 等为 own-only（使用它们的 kerne
   `mfma_unscaled_probe.sh`、`mfma_cform_probe.sh`、`store_x2_probe.sh`、`last_arriver{,8}_probe.sh`、
   `safeasm_window_validate.sh`、`race_repro.sh`、`llvm_build_llc.sh`、`llvm_conformance.sh` …
 - **环境开关**：`AMDC_BACKEND/DIALECT/SCHED/SCHED_OPTS/LOWER_OPTS/RA_*/KEEP_MIR/PIN_VMWAIT/…` 共 18 个
+- **LLVM 测试覆盖审计**（`docs/llvm-feature-audit.md` + `tools/llvm_feature_audit.py`）：对 LLVM AMDGPU CodeGen 的
+  **4996 个测试**（3450 `.ll` + 1546 `.mir`）逐一核对"能否用我们的 Rust DSL 构建并编译正确"→ COVERED 16 / PARTIAL 68 /
+  OUT-OF-SCOPE 4912；可执行侧 `tools/llvm_opcode_sweep.sh` 独立复跑 **141/141 次运行发射+汇编通过、90 个助记符全部汇编、
+  MOp 变体 108/114 可达**；`tools/llvm_feature_probe.sh` 函数级特性 **9/9 PASS**；与 `llc` 对照 **5 IDENTICAL / 17
+  SAME_MNEMONIC / 0 DIFFER**。
 - **调度预设**：`_t` / `_sv` 家族用 `ld` 预设（scoreboard 部分 wait + `ds_read` 提升）；`_vs128` / `_vs5/6/9` /
   `_kvsplit` / `_vsm` / `_t128` / `_g*` 用完整重排 list scheduler；`AMDC_SCHED=0` 可关。
 - **测量协议**（写进验收规则）：`.s`/`.co` 溯源核对每条变体、≥8–12 轮交错 A/B、同轮厂商、
@@ -179,6 +184,7 @@ bash tools/ohat_repro.sh fmha_fwd_hd128_mxfp8_kvsplit          # 300 次启动 m
 | 文档 | 内容 |
 |---|---|
 | `current-status.md` | **本文件：权威当前快照** |
+| `llvm-feature-audit.md` | **LLVM AMDGPU CodeGen 测试覆盖审计**（4996 个测试逐一核对 + 可执行验证 + llc 对照） |
 | `design.md` | Rust DSL 与自研编译器设计规格 |
 | `status.md` | 25 轮逐轮实现记录（含所有正负结果与归因） |
 | `vendor-spec.md` | 厂商 kernel 事实 + §7.5–§7.11 认证表与归因 |

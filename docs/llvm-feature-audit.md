@@ -211,3 +211,71 @@ python3 tools/llvm_feature_audit.py \
 ```
 
 JSON 每条记录的字段：`path, ext, dir, kind(s), globalisel, n_run, mcpus, target_classes, triples, os, mattr, requires/unsupported/xfail, opcodes_by_class, opcodes, opcodes_gfx950_class, missing_opcodes, intrinsics, amdgcn_intrinsics, intrinsics_unmodelled, calling_conventions, attributes, address_spaces, types, features, status, reasons, vacuous`。
+
+## 8. 可执行验证（kernel-opt 的 probe 阶段，补充静态审计）
+
+静态审计回答"测试要求的操作码/特性在不在我们的宇宙里"；本节回答"在我们宇宙里的那些，**能不能真的从 Rust DSL 发射出来并汇编/运行正确**"。
+
+### 8.1 Opcode 发射-汇编 sweep（`tools/llvm_opcode_sweep.sh`）
+
+- 覆盖：`kernel_by_name` 全部 kernel（含 10 个新增 `probe_llvm_*`）+ 28 组 `FMHA_OPT` / `AMDC_LOWER_OPTS` 组合 = **141 次运行**，
+  **141/141 经 own 后端发射并由 clang 汇编为 gfx950 `.co`**。
+- MOp 变体：`mir.rs` 中 **108/114** 个变体出现在至少一次成功发射+汇编的最终 MIR 中；`llvm24.tbl` 行键覆盖 **97/112**。
+- 产出的 **90 个不同汇编助记符全部汇编通过**（含 MFMA/smfmac/scaled、buffer/lds/global、waitcnt 等）。
+- **DSL 不可达（6 个 MOp 变体）**：`SAddcU32`、`SCmpLtI32`（助记符 `s_addc_u32` / `s_cmp_lt_i32` 在任何 kernel 中都不出现）、
+  `VReadSub`（子寄存器读伪操作）、`VAddCoU32`/`VAddcCoU32`（死变体，`v_add_co_u32` 经 `VPtrAdd` 展开发射）、
+  `SEndpgm`（死变体，`s_endpgm` 经 `Term::Endpgm` 发射）。→ **助记符层面真正不可达的只有 2 条**。
+- 未覆盖的 15 个表键 = 上述 6 个 + 9 个未按 MOp 名出现的键（未逐一判定）。
+
+### 8.2 函数级特性 probe（`tools/llvm_feature_probe.sh`，GPU 真机）
+
+9/9 **FEATURE_PASS**：kernarg 布局（3 指针 + i32 + f32 + i32，40 字节）、workgroup/workitem id（3×2×2 网格）、
+wave 角色 A/B + 静态 LDS + barrier + waitcnt、静态 LDS 8 KiB（b32/b128）、嵌套 uniform 分支、循环变量（3 个，数据相关 trip count）、
+`global_atomic_add` 带返回值、i32 ge / f32 lt 比较+选择、两个 kernel 两份 descriptor 串联。
+
+**DSL 不建模（明确 out of scope）**：函数调用/间接调用、动态栈/`alloca`、异常、调试信息、varargs、非 gfx950 子目标、
+动态 LDS（`extern __shared__`，我们只有静态 `b.lds(bytes)`）、一个 `.s` 里多个 kernel、非 ptr/i32/f32 的 kernarg 类型、链接与 `llvm.*` intrinsic。
+
+### 8.3 与 `llc` 的逐条对照（`tools/llvm_compare.sh`，23 个指令/特性 case）
+
+**5 IDENTICAL、17 SAME_MNEMONIC、0 DIFFER、1 无 llc 对应**（寄存器编号与默认修饰符归一化后比较）。
+- IDENTICAL：`v_smfmac_f32_16x16x128_fp8_fp8`、`v_permlane32_swap_b32_e32`、`ds_read_b64_tr_b8`、`s_barrier`、`s_waitcnt lgkmcnt(0)`。
+- SAME_MNEMONIC 的差异都是操作数类别/修饰符写法：llc 把 kernarg 值留在 SGPR（`sN` vs 我们的 `vN`）；
+  `v_mfma_f32_32x32x8_f16` 的 C llc 用字面 0 我们用寄存器；scaled MFMA llc 显式写 `op_sel_hi:[0,0,0]`；
+  buffer/global 形式 soffset 与 vaddr/saddr 写法不同；`global_atomic_add` 的 scope（llc 由 `monotonic` 得 `sc0 sc1`，我们设备域 `sc0`）。
+- 无 llc 对应：**unscaled `v_mfma_f32_32x32x64_f8f6f4`**——LLVM 没有该 intrinsic（只有 scaled 版），这条形态只在我们的 DSL 里存在。
+
+### 8.4 复现
+
+```bash
+bash tools/llvm_opcode_sweep.sh build/llvm_sweep      # 141 次运行 + 汇编；产出 kernels.tsv / ops.tsv / unreachable.txt
+bash tools/llvm_compare.sh build/llvm_sweep           # 与 llc 逐条对照
+bash tools/llvm_feature_probe.sh                      # 9 个函数级特性真机 probe
+```
+
+---
+
+## 9. 最终回答：能"用 Rust 构建并编译正确"多少 LLVM 测试？
+
+| 层次 | 数字 |
+|---|---|
+| LLVM AMDGPU CodeGen 测试总数 | **4996**（3450 `.ll` + 1546 `.mir`） |
+| 静态审计：**OUT-OF-SCOPE** | **4912**（非 gfx950 级子目标 2494、MIR/opt pass 测试 2129、无 codegen RUN 23、未建模 IR/ABI 特性 266） |
+| 静态审计：**PARTIAL**（缺操作码/特性） | **68**（其中 11 个只缺 1 条操作码） |
+| 静态审计：**COVERED**（检查的助记符都在我们宇宙里） | **16**（其中 14 个是"空覆盖"——只检查 ELF 标志/诊断/元数据，不检查指令；真正检查指令的只有 2 个） |
+| 只按 gfx950 级 codegen 测试看（350 个） | 全部所需操作码都在我们宇宙里的只有 **8** 个；MFMA 检查类：**0 COVERED** |
+| 可执行验证：我们的 DSL/编译器能发射+汇编的操作码 | **141/141 次运行、90 个助记符全通过**；MOp 变体 108/114 可达、**助记符层面仅 2 条不可达** |
+| 可执行验证：函数级特性 | **9/9 FEATURE_PASS** |
+| 与 llc 对照 | **5 IDENTICAL / 17 SAME_MNEMONIC / 0 DIFFER / 1 无对应** |
+
+**结论（一句话）**：**不能**——按"把 LLVM 仓库里每个 Function 测试都翻译成 Rust、再经我们的 pipeline 生成与 llc 一致的代码"这个意义，
+LLVM 的 AMDGPU CodeGen 测试绝大多数与我们的 DSL 不重叠：它们测的是**任意 LLVM IR 函数**（调用/栈/调试/异常/子目标/通用 IR pass），
+而我们的 DSL 是**kernel DSL**（无 `.ll`/`.mir` ingestion、无函数调用、固定 gfx950、面向 FMHA 的指令子集）。
+
+**能把什么做对**：在我们覆盖的 universe 内，**发射与汇编是完备的**（141/141 运行、90 助记符、108/114 MOp 变体），
+**函数级特性 probe 9/9 通过**，**与 llc 的对照 0 DIFFER**。也就是说：真正需要的是"**LLVM-IR 函数 → 我们 DSL 的翻译层 +
+通用函数支持（调用/栈/调试/子目标）**"，那是一个通用编译器项目，不是当前 kernel DSL 的增量。
+
+**如果要提升静态覆盖率，最划算的三步**（按缺失操作码的影响面）：① 补 `s_setpc_b64`（函数返回，210 个 gfx950 级测试需要）；
+② 补 64 位移动/整数 ALU 家族（`v_mov_b64`、`s_mov_b64`、`s_add_i32`、`s_and_b64` 等）；③ 补 `scratch_load/store` 与
+`flat_*`（私有内存/平坦寻址）——但注意：这些都属于"通用函数/非 kernel 场景"，与 FMHA kernel 的性能目标无关。
