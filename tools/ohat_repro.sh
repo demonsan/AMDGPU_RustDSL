@@ -10,6 +10,7 @@ P=fmha_fwd_hd128_mxfp8
 CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 build_one() { bash tools/container/cargo.sh run -q --bin amdc -- emit "$1" --backend "${BACKEND:-own}" --out "/work/build/oh_${TAG}_$1.s" >/dev/null 2>&1 || { echo "emit $1 failed"; exit 1; }
   if [ "$1" = "${P}_kvsplit" ] && [ -n "${ASM_SED:-}" ]; then sed -i -E "$ASM_SED" "build/oh_${TAG}_$1.s"; fi
+  if [ "$1" = "${P}_kvsplit" ] && [ -n "${ASM_PERL:-}" ]; then perl -0pi -e "$ASM_PERL" "build/oh_${TAG}_$1.s"; fi
   "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "build/oh_${TAG}_$2.co" "build/oh_${TAG}_$1.s" || exit 1; }
 build_one ${P}_vs128 main; build_one ${P}_t128 small; build_one ${P}_kvsplit split; build_one ${P}_kvsplit_combine8h comb
 [ -x build/ref_host ] || g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/ref_host.cpp -o build/ref_host -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib"
