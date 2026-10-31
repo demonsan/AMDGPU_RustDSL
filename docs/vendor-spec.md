@@ -1660,6 +1660,36 @@ VALU-to-wave translation the stacked (i)+(ii) win is only +0.5-0.85% (~7.12-7.15
 reachable by micro-optimization; the residual 1.15-1.17x requires the structural M-window/QK-staging
 change (or another way to remove the 128 XDL bias cover without re-exposing latency).**
 
+### Small-opt measurement after the RA fix (GPU 5, Main `ee7c361`, quiet run: base best 454.1, vendor med 538.4)
+
+backend-llvm-tail fixed the **check**, not the allocation: the flat reaching-writer set falsely rejected the
+infeasible zero-trip path where the loop body defining the loop-carried value never executes; the check is now
+path-aware (history of overwritten writers) and still rejects real clobbers (MIR regression
+`tests/ra_reaching.rs`; shipped kernels' own-backend asm byte-identical; `AMDC_RA_FORCE_TWOPHASE=1` passes all
+five shipped kernels). Verified end-to-end: `constres6` builds at **vgpr 236**, output md5 `faadf00c...`
+bit-identical, 3-4/4 deterministic.
+
+Measured stacked small-opts (10 interleaved rounds x 200 iters, `.s` provenance checked, all md5
+`faadf00c`):
+
+| `_vs128` B1H8S2048 64-block | vgpr | static v_mov | VALU/wave | wave | best / median TF |
+|---|---|---|---|---|---|
+| base | 249 | 1850 | 353.1 | 1351.8 | **454.1 / 452.7** |
+| `constres6` | 236 | 1837 | 351.1 | 1412.5 | 454.1 / 431.9 (-4.6%) |
+| `saddrlds,pmdead` | 249 | 1814 | 340.1 | 1355.1 | 454.1 / 450.6 (-0.5%; kernel-opt +0.5-0.8%) |
+| `constres6,saddrlds,pmdead` | 238 | 1801 | 338.1 | 1417.1 | 454.1 / 432.1 (-4.6%) |
+| filled B4H8S2048 base vs c6sp | - | - | - | - | 1423.8/1419.3 vs 1408.9/1387.0 (-2%) |
+| shipped auto, kernel-opt's run | - | - | - | - | base 701.6/709.9, both-opt 695.2/709.2 (median -0.9%, best equal) |
+
+**Result: resident loop-carried constants are a loss** - the RA fix permits the code, but the persistent live
+range costs +61 wave cycles and only 2 VALU/wave are actually removed (scheduling/rematerialisation changes),
+so (ii) is dropped; `saddrlds,pmdead` stays opt-in (+0.5-0.8%, below the 1% default gate; shipped-auto median
+slightly negative/best equal). (i) bias f32 hi/lo would need the same loop-var persistence and is blocked by
+the DSL loop-variable contract (single write, no read-after-write) unless a select forces the computation -
+not a win. **No combination >=1%; defaults unchanged. Per-CU stays 7.07-7.09 TF/CU / 1.19x; the structural
+conclusion is unchanged.** The RA fix itself is a valuable compiler finding/fix (documented, regression-tested)
+even though the kernel optimisation it unblocked did not pay off.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as
