@@ -18650,8 +18650,6 @@ pub fn probe_buffer_rw() -> Function {
     b.store_f32x4(pout16, 4096, f4);
     let pin8 = b.ptr_add(inp, o8);
     let pout8 = b.ptr_add(outp, o8);
-    let f2 = b.load_b128(pin8, 1024); // 16 bytes per lane: only the low 8 bytes of each are compared by the host (lane stride 8)
-    let _ = f2;
     let g2 = b.load_f32(pin8, 1024);
     let g2b = b.load_f32(pin8, 1028);
     b.store_f32(pout8, 4096 + 1024, g2);
@@ -18669,8 +18667,8 @@ pub fn probe_buffer_rw() -> Function {
     let z4 = b.buffer_load_b128(rin_s, o16, c0, 0);
     b.buffer_store_b128(rout, o16, c0, 8192, z4); // out[8192..9216): lanes 32..63 must be ZERO
     let rout_s = b.buffer_desc(outp, 9216 + 512);
-    b.buffer_store_b128(rout_s, o16, c0, 0, v4); // would write out[0..1024) again for lanes < 32 only (same data): harmless
-    let o16b = b.add_i32(o16, b.c_i32(9216));
+    let c9216 = b.c_i32(9216);
+    let o16b = b.add_i32(o16, c9216);
     b.buffer_store_b128(rout_s, o16b, c0, 0, v4); // out[9216..10240): lanes 32..63 (offset >= 9728) DROPPED, sentinel must survive
     b.finish()
 }
