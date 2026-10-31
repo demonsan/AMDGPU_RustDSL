@@ -10201,7 +10201,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 (sk0, sk1)
             };
             let qb0 = if let Some((q0, _)) = q_pre { q0 } else if q0_reg { cx.b0 } else { load_q0(b) };
-            if let Some(ba) = bacc {
+            if fmha_t_opt("qkzero") && bacc.is_some() {
+                // DIAGNOSTIC (wrong numerics): the first QK MFMA with a zero C operand, to attribute the XDL-busy cost of the separate C operand
+                b.var_mfma_scale_z(s_vars[s], k8_0, qb0, sk0, sq0m);
+            } else if let Some(ba) = bacc {
                 b.var_mfma_scale_c(s_vars[s], k8_0, qb0, Opnd::Var(ba), sk0, sq0m);
             } else if let Some(bf) = biasf_once {
                 b.var_mfma_scale_c(s_vars[s], k8_0, qb0, bf, sk0, sq0m);
