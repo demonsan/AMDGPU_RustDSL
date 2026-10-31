@@ -411,6 +411,8 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
     // MFMA DESTINATIONS still being written when the block is left (per block: canonical vreg, physical range, remaining wait states). A register reuse
     // by a different value in the successor must wait too. Computed from the unpadded block (padding only shortens what remains).
     // AMDC_NO_PHYS_WAW=1 disables the MFMA-destination padding (A/B audit of the shipped kernels only)
+    // AMDC_NO_PHYS_STORE=1 disables the wide-store data padding (A/B audit of the shipped kernels only)
+    let store_haz_on = std::env::var("AMDC_NO_PHYS_STORE").map(|v| v.is_empty() || v == "0").unwrap_or(true);
     let waw_on = std::env::var("AMDC_NO_PHYS_WAW").map(|v| v.is_empty() || v == "0").unwrap_or(true);
     let succs = crate::sched::liveness::successors(m);
     let exit_dst: Vec<Vec<(VReg, (u32, u32), usize)>> = m
@@ -559,7 +561,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
                 inflight.push((cycle, need, inst.op, srcs));
             }
-            if is_wide_vmem_store(inst.op) {
+            if store_haz_on && is_wide_vmem_store(inst.op) {
                 if let Some(Src::Reg(d)) = inst.srcs.get(1) {
                     if m.vreg_class(*d).is_vector() {
                         store_data_inflight.push((cycle, STORE_DATA_WAIT, vec![rng(m, *d)]));
