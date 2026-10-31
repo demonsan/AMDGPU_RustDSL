@@ -154,6 +154,35 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        "mops" => {
+            // amdc mops <kernel>: the distinct machine opcodes (MOp variants) of the final MIR of a kernel, one per line (the coverage sweep tools/llvm_opcode_sweep.sh uses it)
+            let Some(name) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let Some(f) = amdgpu_compiler::kernel_by_name(name) else {
+                eprintln!("unknown kernel: {name}");
+                return ExitCode::from(2);
+            };
+            match amdgpu_compiler::compile_mir(&f) {
+                Ok(m) => {
+                    let mut set = std::collections::BTreeSet::new();
+                    for b in &m.blocks {
+                        for i in &b.insts {
+                            set.insert(format!("{:?}", i.op));
+                        }
+                    }
+                    for s in set {
+                        println!("{s}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("compile error:\n{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         "backend" => backend_cmd(&args),
         "mir-roundtrip" => mir_roundtrip_cmd(&args),
         "mir-table-report" => mir_table_report_cmd(&args),
