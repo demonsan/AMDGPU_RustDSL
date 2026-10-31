@@ -351,10 +351,21 @@ same run (vendor 538.4 TFLOP/s), 10 interleaved rounds x 200 iters, `REF_WARMUP=
 
 filled B4H8S2048: base 1417.2/1410.2, `_vs9` 1384.9/1341.8 (-5% median). Accuracy gate: 15/15 shapes
 at 64 and 16 rows, parity 15/15, bad 0, det 5/5x3 - **but the output md5 is still `faadf00c` identical
-to `_vs128` and the mean is unchanged 8.276e-4, so the vendor reference math (f32 `r`,
+to `_vs128` and the mean is unchanged 8.276e-4, so the literal vendor reference math (f32 `r`,
 `s91-r` bias matrix, `s92`/`s93` rollback, Q scale -9, P `scalef32`) is NOT in this binary**; only the
-bit-identical `biasacc` path was enabled. M2 fails the >=460 per-CU bar; the pinned block adds VALU
-(+26/wave), wave +152, vgpr 256 and 9.6 KB code because it emits scaled PV MFMAs and its own
-K-scale/address work instead of the vendor's unscaled PV. Recommendation: stop at `nom2`/shipped
-state; if one more iteration is attempted, free >=7 VGPR before the V preload, use unscaled PV and
-move K-scale/address work out of the pinned region, and implement M1 vendor math before gating it.
+bit-identical `biasacc` path was enabled. kernel-opt's round-68 position is that M1 is "nothing to
+implement" because our carried reference is already exact hi/lo f16 (2^-22), the rollback is the same
+algorithm, and our accuracy is ~3x better than the vendor; **that is an accuracy-equivalence claim, not
+the literal vendor algorithm** - if the M1 gate is vendor-class accuracy it is met by the scaffold; if
+it is vendor-equivalent math it is not implemented. Either way the performance-relevant M2 change (one
+bias MFMA instead of four + preloaded V) was implemented and lost.
+
+Further M2 commits (`544f290` interleave first reads with register-fed MFMAs, `78154cd` Q-from-LDS
+window variant) do not recover: resident Q 410.8 (our independent gate), `noqreg` **421.9 vs base
+444.3 = -5.0%**, interleave unchanged; filled -5%. Best 421.9 is still 38 TFLOP/s short of the 460
+bar. The pinned block carries 24 NOPs (vs 10) of explicit wait padding, 58 DS reads (vs 52, the Q
+fragments), K-scale `lshr`/address work inside the pinned region, an `lgkmcnt(0)` entry wait, and uses
+scaled PV MFMAs (c127/c123) instead of the vendor's unscaled PV. Recommendation: stop at
+`nom2`/shipped state; do not change defaults. If one bounded attempt is authorized, the untried levers
+are unscaled PV (numerics change), vendor per-step bf16 bias instead of the persistent 16-VGPR matrix,
+and moving K-scale/address work out of the pinned region.
