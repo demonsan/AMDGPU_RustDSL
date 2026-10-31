@@ -969,5 +969,8 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
             }
         }
     }
+    if let Ok(path) = std::env::var("AMDC_RA_DEBUG_FILE") {
+        let _ = std::fs::write(path, report.join("\n"));
+    }
     report
 }
