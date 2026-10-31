@@ -43,6 +43,16 @@ def is_mnemonic(tok):
 
 MIR_OPC = re.compile(r"\b((?:V|S|BUFFER|GLOBAL|DS|FLAT|SCRATCH|IMAGE|TBUFFER|SI|G)_[A-Z0-9_a-z]+)\b")
 MIR_EXCLUDE = ("VGPR_", "SGPR_", "AGPR_", "SReg_", "VReg_", "VS_", "SI_RETURN_TO_EPILOG_")  # register classes, not opcodes
+MIR_INSTR = re.compile(r"^\s+(?:[^=\n]*?=\s*)?(?:(?:early-clobber|dead|renamable|undef|killed|implicit-def|internal)\s+)*([A-Z][A-Z0-9]*(?:_[A-Za-z0-9]+)+)\b")
+VARREF = re.compile(r"\[\[[^\]]*\]\]|\{\{[^}]*\}\}")
+
+
+def valid_mir_opcode(op):
+    if op.startswith(MIR_EXCLUDE):
+        return False
+    if re.search(r"_\d+$", op) and not re.search(r"_[A-Za-z]\d+$", op) and not re.search(r"_B\d+$|_F\d+$|_U\d+$|_I\d+$|_X\d+$|_DWORDX?\d+$", op):
+        return False  # a CHECK variable name such as V_ADD_F32_E32_1
+    return True
 
 # --------------------------------------------------------------------------------------------------------------------------------------------
 # targets
@@ -363,25 +373,26 @@ def analyse(path, rel):
         if tok and is_mnemonic(tok.group(1)):
             for c in classes_here:
                 asm_by_class[c].add(norm_mn(tok.group(1)))
-        # MIR syntax inside CHECK lines
-        for mm in MIR_OPC.finditer(rest):
-            op = mm.group(1)
-            if op.startswith(MIR_EXCLUDE) or not re.search(r"[A-Z]", op):
-                continue
-            if op.upper() == op or re.match(r"^[A-Z0-9_]+_[eE]\d+$", op) or re.match(r"^[A-Z0-9_]+(_[a-z0-9]+)*$", op):
-                for c in classes_here:
-                    mir_by_class[c].add(norm_mn(op, mir=True))
+        # MIR syntax inside CHECK lines (after removing FileCheck variable references)
+        mm = MIR_INSTR.match("  " + VARREF.sub("", rest))
+        if mm and valid_mir_opcode(mm.group(1)) and not mm.group(1).startswith(("G_", "SI_")):
+            for c in classes_here:
+                mir_by_class[c].add(norm_mn(mm.group(1), mir=True))
     if is_mir:
         # the MIR input itself defines the instructions the test needs
-        body = "\n".join(l for l in lines if not l.lstrip().startswith(("#", ";")))
         ops = set()
-        for mm in MIR_OPC.finditer(body):
-            op = mm.group(1)
-            if op.startswith(MIR_EXCLUDE) or op.startswith("G_") or op.startswith("SI_"):
+        in_body = False
+        for l in lines:
+            if re.match(r"^body:", l):
+                in_body = True
                 continue
-            if op != op.upper() and not re.match(r"^[A-Z0-9_]+_[eE]\d+$", op):
+            if in_body and re.match(r"^[a-z]", l):
+                in_body = False
+            if not in_body or l.lstrip().startswith(("#", ";")):
                 continue
-            ops.add(norm_mn(op, mir=True))
+            mm = MIR_INSTR.match(VARREF.sub("", l))
+            if mm and valid_mir_opcode(mm.group(1)) and not mm.group(1).startswith(("G_", "SI_")):
+                ops.add(norm_mn(mm.group(1), mir=True))
         allc = sorted(set(classes)) or ["unknown"]
         for c in allc:
             mir_by_class[c] |= ops
