@@ -942,7 +942,10 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
                                     }
                                 }
                                 path.reverse();
-                                wit = format!(" witness path {:?}", path);
+                                let mut edges: Vec<String> = path.iter().chain(own.iter()).map(|x| format!("{x}->{:?}({} insts)", succs[*x], m.blocks[*x].insts.len())).collect();
+                                edges.sort();
+                                edges.dedup();
+                                wit = format!(" witness path {:?}; edges {}; own-writer blocks {:?}; loops {:?}", path, edges.join(" "), own, m.loops);
                             }
                         }
                         report.push(format!("block {b} inst {ii} {:?}: reads slot {r} ({}{}) but the reaching writers are {:?} [{}]{}", inst.op, if p.0 { "v" } else { "s" }, p.1, ws, at.join("; "), wit));
