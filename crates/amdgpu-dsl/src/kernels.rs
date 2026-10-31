@@ -5186,7 +5186,7 @@ pub fn probe_fp8_fmha_hd128() -> Function {
     let c4096 = b.c_i32(4096);
     let c16384 = b.c_i32(16384);
     let c36864 = b.c_i32(36864);
-    let c69632 = b.c_i32(69632);
+    let c69632 = b.c_i32(if fmha_t_opt("epreloc") { 102400 } else { 69632 }); // epreloc (diagnostic): scratch disjoint from every live LDS region
     let c70144 = b.c_i32(70144);
     let c74240 = b.c_i32(74240);
     let c90624 = b.c_i32(90624);
@@ -5528,7 +5528,7 @@ pub fn probe_fp8_fmha_hd128b() -> Function {
     let c4096 = b.c_i32(4096);
     let c16384 = b.c_i32(16384);
     let c36864 = b.c_i32(36864);
-    let c69632 = b.c_i32(69632);
+    let c69632 = b.c_i32(if fmha_t_opt("epreloc") { 102400 } else { 69632 }); // epreloc (diagnostic): scratch disjoint from every live LDS region
     let c70144 = b.c_i32(70144);
     let c74240 = b.c_i32(74240);
     let c90624 = b.c_i32(90624);
@@ -10677,7 +10677,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
             let c4096e = b.c_i32(4096);
             let wb0 = b.mul_i32(wid_e, c4096e);
-            let c69632 = b.c_i32(69632);
+            let c69632 = b.c_i32(if fmha_t_opt("epreloc") { 102400 } else { 69632 }); // epreloc (diagnostic): scratch disjoint from every live LDS region
             let lbase = b.add_i32(wb0, c69632);
             let c7e = b.c_i32(7);
             let c3e = b.c_i32(3);
@@ -10897,7 +10897,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
             let c4096e = b.c_i32(4096);
             let wb0 = b.mul_i32(wid_e, c4096e);
-            let c69632 = b.c_i32(69632);
+            let c69632 = b.c_i32(if fmha_t_opt("epreloc") { 102400 } else { 69632 }); // epreloc (diagnostic): scratch disjoint from every live LDS region
             let lbase = b.add_i32(wb0, c69632);
             let c7e = b.c_i32(7);
             let c3e = b.c_i32(3);
@@ -12192,7 +12192,7 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
             let c4096e = b.c_i32(4096);
             let wb0 = b.mul_i32(wid_e, c4096e);
-            let c69632 = b.c_i32(69632);
+            let c69632 = b.c_i32(if fmha_t_opt("epreloc") { 102400 } else { 69632 }); // epreloc (diagnostic): scratch disjoint from every live LDS region
             let lbase = b.add_i32(wb0, c69632);
             let c7e = b.c_i32(7);
             let c3e = b.c_i32(3);
@@ -12409,7 +12409,7 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
             let c4096e = b.c_i32(4096);
             let wb0 = b.mul_i32(wid_e, c4096e);
-            let c69632 = b.c_i32(69632);
+            let c69632 = b.c_i32(if fmha_t_opt("epreloc") { 102400 } else { 69632 }); // epreloc (diagnostic): scratch disjoint from every live LDS region
             let lbase = b.add_i32(wb0, c69632);
             let c7e = b.c_i32(7);
             let c3e = b.c_i32(3);
@@ -13660,7 +13660,7 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
             let c4096e = b.c_i32(4096);
             let wb0 = b.mul_i32(wid_e, c4096e);
-            let c69632 = b.c_i32(69632);
+            let c69632 = b.c_i32(if fmha_t_opt("epreloc") { 102400 } else { 69632 }); // epreloc (diagnostic): scratch disjoint from every live LDS region
             let lbase = b.add_i32(wb0, c69632);
             let c7e = b.c_i32(7);
             let c3e = b.c_i32(3);
@@ -13877,7 +13877,7 @@ fn emit_fmha_vs6_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
             let c4096e = b.c_i32(4096);
             let wb0 = b.mul_i32(wid_e, c4096e);
-            let c69632 = b.c_i32(69632);
+            let c69632 = b.c_i32(if fmha_t_opt("epreloc") { 102400 } else { 69632 }); // epreloc (diagnostic): scratch disjoint from every live LDS region
             let lbase = b.add_i32(wb0, c69632);
             let c7e = b.c_i32(7);
             let c3e = b.c_i32(3);
@@ -19988,7 +19988,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         let cb = if fmha_t_opt("dma") && !vs_active() { 33280 } else { 256 * fmha_t_pitch() };
         // vendor-structure kernels: + a 2 KB block of E4M3 ones and 16 KB for the per-wave second Q fragment (vs128)
         if vs_active() {
-            b.lds(if (name.ends_with("_vs128") || name.ends_with("_vs5") || name.ends_with("_vs6") || name.ends_with("_vs9")) || name.ends_with("_kvsplit") { VS128_LDS_BYTES } else if name.ends_with("_g3o") { 4 * 32768 + 2048 } else if name.ends_with("_vsm") || name.ends_with("_g2") || name.ends_with("_g3") || name.ends_with("_t128") { 3 * 32768 + 2048 + 2048 + 16384 + 16384 } else { VS_LDS_BYTES } + pad as u32);
+            b.lds(if (name.ends_with("_vs128") || name.ends_with("_vs5") || name.ends_with("_vs6") || name.ends_with("_vs9")) || name.ends_with("_kvsplit") { VS128_LDS_BYTES + if fmha_t_opt("epreloc") { 32768 } else { 0 } } else if name.ends_with("_g3o") { 4 * 32768 + 2048 } else if name.ends_with("_vsm") || name.ends_with("_g2") || name.ends_with("_g3") || name.ends_with("_t128") { 3 * 32768 + 2048 + 2048 + 16384 + 16384 } else { VS_LDS_BYTES } + pad as u32);
         } else {
             b.lds((nbuf * cb + 2048 + 1024 + 1024 + pad) as u32);
         }
