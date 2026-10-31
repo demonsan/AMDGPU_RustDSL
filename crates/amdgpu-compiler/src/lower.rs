@@ -660,10 +660,16 @@ impl Lowerer {
     }
 
     /// Bit pattern of a constant operand (integer or f32), for in-line operands.    /// `base` = `PtrAdd{ scalar kernarg pointer, vector byte offset }`: (scalar pair, 32-bit vector offset) for the SADDR form.
+    fn saddr_parts_force(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
+        self.saddr_parts_impl(base)
+    }
     fn saddr_parts(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
         if !opt_on("saddr") {
             return Ok(None);
         }
+        self.saddr_parts_impl(base)
+    }
+    fn saddr_parts_impl(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
         let Opnd::Val(v) = base else { return Ok(None) };
         let Some(Op::PtrAdd { base: pb, byte_off }) = self.defs.get(&v).cloned() else { return Ok(None) };
         let Opnd::Val(pv) = pb else { return Ok(None) };
@@ -1463,7 +1469,8 @@ impl Lowerer {
                     self.push(MInst::new(MOp::SWaitVm).imm(*count as i64));
                 }
                 Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
-                    let rb = self.as_v2(*base)?;
+                    let sad = if opt_on("saddrlds") { self.saddr_parts_force(*base)? } else { None };
+                    let rb = if sad.is_some() { u32::MAX } else { self.as_v2(*base)? };
                     // scalarize: a wave-uniform LDS base already lives in an SGPR (or is a constant): no v_mov + v_readfirstlane
                     let direct: Option<VReg> = if opt_on("scalarize") {
                         let r = match *lds_addr {
@@ -1482,8 +1489,8 @@ impl Lowerer {
                     } else {
                         None
                     };
-                    let lv = if direct.is_some() { rb } else { self.as_v1(*lds_addr)? };
-                    self.touch(&[Src::Reg(rb), Src::Reg(lv)]);
+                    let lv = if direct.is_some() { if let Some((_, off)) = sad { off } else { rb } } else { self.as_v1(*lds_addr)? };
+                    if let Some((sr0, off0)) = sad { self.touch(&[Src::Reg(sr0), Src::Reg(off0), Src::Reg(lv)]); } else { self.touch(&[Src::Reg(rb), Src::Reg(lv)]); }
                     let sreg = if let Some(s) = direct {
                         self.touch(&[Src::Reg(s)]);
                         s
@@ -1496,9 +1503,14 @@ impl Lowerer {
                             s
                         }
                     } };
-                    let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128 } else { MOp::GlobalLoadLdsB32 };
                     // imm = instruction offset: added to the global address AND to the LDS destination (M0 + imm + 16 lane)
-                    self.push(MInst::new(mop).srcreg(rb).srcreg(sreg).imm(*byte_off as i64));
+                    if let Some((sr0, off0)) = sad {
+                        let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128S } else { MOp::GlobalLoadLdsB32S };
+                        self.push(MInst::new(mop).srcreg(sr0).srcreg(off0).srcreg(sreg).imm(*byte_off as i64));
+                    } else {
+                        let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128 } else { MOp::GlobalLoadLdsB32 };
+                        self.push(MInst::new(mop).srcreg(rb).srcreg(sreg).imm(*byte_off as i64));
+                    }
                 }
                 Stmt::SetPrio { prio } => {
                     self.push(MInst::new(MOp::SSetPrio).imm(*prio as i64));

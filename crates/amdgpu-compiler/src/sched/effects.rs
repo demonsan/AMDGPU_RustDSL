@@ -208,6 +208,10 @@ fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
         MOp::GlobalLoadB128 => {
             e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 16 })
         }
+        MOp::GlobalLoadLdsB128S | MOp::GlobalLoadLdsB32S => {
+            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(1), off: inst.imm, size: 16 });
+            e.fence = Fence::Barrier;
+        }
         MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 => {
             // reads global memory and writes LDS through M0: modelled as a global read with a fence-like LDS write
             e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 16 });

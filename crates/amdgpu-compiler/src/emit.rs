@@ -514,6 +514,20 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             tuple(a, inst.dst.expect("dst"), 4),
             mem_op(a, inst.srcs[0], inst.imm)
         )],
+        MOp::GlobalLoadLdsB128S | MOp::GlobalLoadLdsB32S => {
+            let m0 = sr(a, reg_of(&inst.srcs[2]));
+            let mn = if inst.op == MOp::GlobalLoadLdsB128S { "global_load_lds_dwordx4" } else { "global_load_lds_dword" };
+            vec![
+                format!("s_mov_b32 m0, {m0}"),
+                "s_nop 0".to_string(),
+                format!(
+                    "{mn} {}, {}{}",
+                    vr(a, reg_of(&inst.srcs[1])),
+                    spair(a, reg_of(&inst.srcs[0])),
+                    if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
+                ),
+            ]
+        }
         MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 => {
             let m0 = sr(a, reg_of(&inst.srcs[1]));
             let mn = if inst.op == MOp::GlobalLoadLdsB128 { "global_load_lds_dwordx4" } else { "global_load_lds_dword" };
