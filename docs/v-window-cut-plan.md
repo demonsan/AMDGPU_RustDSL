@@ -20,13 +20,41 @@ The 353/wave-iteration counter includes M-phase VALU and LUT/short copies; this 
 long/no-LUT V phase only. The LUT path adds ~130 VALU (perm/sub/and/lshr) to short copies; filled
 shapes use the long/no-LUT body.
 
+## Dynamic vs static (measured, rocprofv3, B1H8S2048)
+
+The static V-phase table above is NOT the dynamic cost. Ablations that disable the rollback branch
+body leave the hardware counters exactly unchanged:
+
+| build | SQ_INSTS_VALU | SQ_INSTS_VALU_INT32 | SQ_WAVE_CYCLES |
+|---|---:|---:|---:|
+| base | 2,892,288 | 493,824 | 11,167,268 |
+| `rbnos` (no S pk_add rescale) | 2,892,288 | 493,824 | 11,226,252 |
+| `rbnoo` (no O pk_mul rescale) | 2,892,288 | 493,824 | 11,147,253 |
+| `rbnos,rbnoo` | 2,892,288 | 493,824 | 11,130,331 |
+| `biasv` (bias via 32 pk_add) | 3,080,704 | 493,824 | 13,347,630 |
+
+So the 32 `VarAddPk` + 32 `VarScalePk` + `exp2` in the rollback body are **branch-only and never
+executed on this shape**. Dynamic V-phase VALU is instead:
+
+* conversion 64
+* bias coefficient/unpack **18** (executed every tile)
+* max chain 34
+* decision/masks 20/17
+* address/INT32 44/35
+* constants/mov 23/20
+* plus rollback-only 64 (not dynamic)
+
+`biasv` confirms VALU-issue sensitivity: +23 dynamic VALU/wave costs ~12% throughput. The real
+cut-1 target is only the **18-VALU coefficient chain**, not 82.
+
 ## Ranked cuts
 
-1. **Fold the reference/bias into the QK C operand only** (remove pk_add x32, pk_mul x32 and the
-   hi/lo unpack): **-82 VALU**, at the cost of the vendor's 4 bias f16 MFMAs in M (128 XDL). This is
-   exactly the vendor scheme (`x` already contains `s91-r`); p4 makes the bias coefficient work
-   unnecessary. Risk: exact reference/rollback bookkeeping; accuracy should be bit-equal if the same
-   bf16 bias matrix is used. **Highest-value, lowest-risk cut.**
+1. **Replace the hi/lo f16 reference carry with an exact f32 reference + one f16/bf16 word for the
+   QK C matrix** (vendor structure; the 4 bias f16 MFMAs stay). Delete only the 18-VALU coefficient
+   unpack; the 64 pk_add/pk_mul are branch-only and give no dynamic win. **-14..-18 dynamic VALU
+   (~1.5-2% wave)**. Accuracy: reference delta/O rescale stays f32-exact; only the C matrix word is
+   rounded (vendor-equivalent); gate 15/15 and compare output. Risk: low-medium.
+   Do NOT plan -82: the static rollback body is not executed.
 2. **Move address/INT32 ring math to SALU / hoist per-tile:** **-35..-44 VALU** (vendor does it in
    ~40 SALU). Requires ring state in SGPR (vendor 99 SGPR vs our 45) and scalar pointer bumps; risk
    SGPR pressure and barrier/ring correctness. Second-highest value.
@@ -37,15 +65,14 @@ shapes use the long/no-LUT body.
 6. **LUT/svcorr:** not on the filled long body; removing it only helps short copies/IFETCH. No filled
    VALU gain.
 
-Realistic total: **-100..-115 VALU** (V 267->~155-165; below vendor 251 in count, but V is not the
-whole wave).
+Realistic **dynamic** total: **-55..-75 VALU** (cut1 -14..-18, SALU/address -25..-35, decision -8..
+-12, constants -8..-10); the static code shrinks more but static size is not a run-time lever
+(`onecopy` measured neutral).
 
 ## Honest payoff
 
-VALU issue is ~1.17 cycles/instruction. -110 VALU ~= -129 cycles of V phase; wave time 1349->~1220
-(**~9.5%**). MUBUF/filled staging may add a few percent. The target wave is 1157, i.e. **-14.2% /
-+16-19% throughput**; V-window cuts alone therefore **narrow the gap but do not reach absolute
-parity** unless the M window also loses XDL/waits (ours XDL 1216 vs vendor 1088) or the overlap
-improves. Recommended sequence: bias fold (largest, exact) -> SALU address -> MUBUF verification ->
-decision/const trims; measure wave/VALU counters after each. Expected outcome: fill ratio ~0.84 ->
-~0.91-0.94, not >=1.0, on current evidence.
+VALU issue is ~1.17 cycles/instruction. -65 dynamic VALU ~= -76 cycles; wave time 1349->~1273
+(**~5.6%**), and only if the V phase is critical after MUBUF. The target wave is 1157 = **-14.2% /
++16-19% throughput**; the dynamic V cuts alone **cannot reach parity**; with MUBUF and a smaller M
+window it may narrow the fill ratio from ~0.84 to ~0.89-0.92. M-window XDL (ours 1216 vs vendor
+1088) and phase overlap remain the largest missing terms.
