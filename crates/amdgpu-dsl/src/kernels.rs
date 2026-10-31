@@ -9711,10 +9711,28 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     } else {
         Vec::new()
     };
-    let dma_issue = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId| {
-        if no_dma {
-            return;
-        }
+    // mubuf (MUBUF K/V DMA, docs/status.md round 71): FULL tiles go through `buffer_load_dwordx4 ... lds` with ONE descriptor per tensor, a loop-invariant per-lane byte offset (4 VGPR),
+    // soffset = key0 * row stride (SALU) and the per-q slot in imm (added to the memory offset AND the LDS destination, compensated in the per-lane offset): no per-DMA VALU address, no row clamp.
+    // The PARTIAL last tile keeps the clamped global-load path (the raw-buffer range check ignores soffset and num_records is a constant, so the clamp cannot be a zero-fill).
+    let mubuf = fmha_t_opt("mubuf");
+    let rsrc: Option<ValueId> = if mubuf { Some(b.buffer_rsrc(ptr)) } else { None };
+    let voffq: Vec<ValueId> = if mubuf {
+        (0..4i32)
+            .map(|q| {
+                let c8q = b.c_i32(8 * q);
+                let r = b.add_i32(rowb, c8q);
+                let o = b.mul_i32(r, seqs);
+                let o1 = b.add_i32(o, base_off);
+                let cbytes = if q & 1 == 0 { cbytes_even } else { cbytes_odd };
+                let o2 = b.add_i32(o1, cbytes);
+                let cc = b.c_i32(-1024 * q);
+                b.add_i32(o2, cc)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let dma_issue_global = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId| {
         let rb = b.add_i32(key0, rowb);
         let lbase = b.add_i32(lds_tile, buf_off);
         for q in 0..4i32 {
@@ -9740,6 +9758,33 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let sp = b.ptr_add(ptr, o3);
             b.load_global_lds(sp, lbase, -(1024 * (3 - q)), 4);
         }
+    };
+    let dma_issue = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId| {
+        if no_dma {
+            return;
+        }
+        if mubuf {
+            let c127k = b.c_i32(127);
+            let key_last = b.add_i32(key0, c127k);
+            let full = b.cmp_lt_i32(key_last, cx.kv_len); // every row of the tile is < kv_len
+            let c3072m = b.c_i32(-3072);
+            let lbase_b = b.add_i32(lds_tile, buf_off);
+            let m0v = b.add_i32(lbase_b, c3072m);
+            let soff = b.mul_i32(key0, seqs);
+            b.begin_if(Opnd::Val(full));
+            for q in 0..4usize {
+                b.load_buffer_lds(rsrc.expect("rsrc"), voffq[q], soff, m0v, (1024 * q) as u32, 4);
+            }
+            b.end_if();
+            let partial = b.cmp_lt_i32(cx.kv_len, key_last); // kv_len <= key0 + 127: some row is past the end
+            let pcc = b.c_i32(1);
+            let _ = pcc;
+            b.begin_if(Opnd::Val(partial));
+            dma_issue_global(b, key0, buf_off);
+            b.end_if();
+            return;
+        }
+        dma_issue_global(b, key0, buf_off);
     };
     // kddma: the K-scale dwords go straight from global memory into the LDS K-scale ring with `global_load_lds_dword` (no VGPR round trip, no ds_write, the
     // same vmcnt wait as the K tile): wave w (waves 2, 3 duplicate waves 0, 1) covers rows 64 (w & 1) + lane, written to lds_kd + slot*512 + 4 row
