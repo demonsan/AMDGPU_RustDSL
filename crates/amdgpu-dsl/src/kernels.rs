@@ -10598,7 +10598,15 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             iter(b, false, false, role_a);
             b.end_if();
         }
-    }    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
+    }
+    // KV-split fp16 partial epilogue: the per-wave 4 KB LDS transpose scratch starts at the Q staging base (69632) and overlaps the 2 KB Q b1/b0 slots of the neighbouring waves. The drain's
+    // final barrier is role-dependent (last_barrier = role_a), so a wave that finishes first could overwrite a partner wave's still-live Q staging during its last QK/PV (intermittent stale/zero
+    // chunks in the fp16 Ohat transpose). Synchronise all waves before the epilogue reuses the dead Q staging. (The first version of this fix was merged into emit_fmha_vs9_role by mistake: the two roles
+    // contain identical text and the 3-way merge picked the copy; _kvsplit runs the vs128 role.)
+    if !no_bar && cx.kvs.is_some() {
+        b.barrier();
+    }
+    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
     let l_tot = if smfv {
         let d2 = b.frag4_lane(la, 2);
         let lf = b.bitcast_f32(d2);
