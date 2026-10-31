@@ -336,3 +336,25 @@ instability - stop at M4, no default swap without per-CU ≥ vendor.
 
 Tools: `tools/vendor_disasm.sh` (survey/phase/mfma/lds/staging), `tools/vendor_counters.sh`;
 reproduce section addresses with `llvm-objdump -d --mcpu=gfx950 --no-show-raw-insn`.
+
+## 8. Implementation status (measured, GPU 5)
+
+First implementation attempt: kernel-opt4 commit `e2e1733` (M1 "bias path" + M2 pinned M-window
+`pv_qk_window_block_v2`; `nom2` restores the scaffold). Independent gate, GPU 5, `_vs128` base in the
+same run (vendor 538.4 TFLOP/s), 10 interleaved rounds x 200 iters, `REF_WARMUP=300`, md5 checked:
+
+| variant | vgpr | wave | XDL | VALU | WAIT_ANY | best / median TF |
+|---|---|---|---|---|---|---|
+| `_vs128` base | 249 | 1349.2 | 1216 | 353.1 | 484.8 | **454.7 / 453.1** |
+| `_vs9` M1+M2 | 256 | 1501.2 | 1130 | 378.7 | 522.9 | 454.7 / **410.8 (-9.3%)** |
+| `_vs9,nom2` | 249 | - | - | - | - | 454.7 / 453.0 |
+
+filled B4H8S2048: base 1417.2/1410.2, `_vs9` 1384.9/1341.8 (-5% median). Accuracy gate: 15/15 shapes
+at 64 and 16 rows, parity 15/15, bad 0, det 5/5x3 - **but the output md5 is still `faadf00c` identical
+to `_vs128` and the mean is unchanged 8.276e-4, so the vendor reference math (f32 `r`,
+`s91-r` bias matrix, `s92`/`s93` rollback, Q scale -9, P `scalef32`) is NOT in this binary**; only the
+bit-identical `biasacc` path was enabled. M2 fails the >=460 per-CU bar; the pinned block adds VALU
+(+26/wave), wave +152, vgpr 256 and 9.6 KB code because it emits scaled PV MFMAs and its own
+K-scale/address work instead of the vendor's unscaled PV. Recommendation: stop at `nom2`/shipped
+state; if one more iteration is attempted, free >=7 VGPR before the V preload, use unscaled PV and
+move K-scale/address work out of the pinned region, and implement M1 vendor math before gating it.
