@@ -1638,15 +1638,27 @@ these constants as loop-carried I32/F32 vars and shadows the constants with Var 
 construction). It **does not compile**: the compiler's two-phase allocation fails the reaching-writer check
 with 88 violations (`block 12 inst 388 VSmfmac16x16x128Fp8: reads slot 13136 (v192) but the reaching
 writers are {9952,13136}`) - i.e. adding persistent loop vars breaks the in-place SMFMAC accumulator
-allocation in the two-phase register allocator. The same machinery would be needed for (i), so **the
-constants/bias small-optimization items are not realisable without a compiler RA fix**, and the LDS-spill
-alternative would add ~6 LDS ops/tile (LDS is already at the vendor level, 52.3 vs 52.5) for a VALU saving
-of the same size, with no evidence of a net win. The remaining small-item ceiling is therefore only the
-P-conversion route (medium accuracy risk) and address hoist (<1%), which do not change the earlier
-conclusion: **per-CU parity is not reachable by micro-optimization on the current compiler/kernel
-structure; ~1.16-1.18x remains unless the compiler two-phase RA is fixed to allow persistent constants
-(via a real constraint/alias model rather than the current reaching-writer check) and/or the structural
-M-window/QK staging is changed.**
+allocation in the two-phase register allocator. **This is a genuine compiler/RA finding, not a dead end
+in the kernel idea:** the check uses a flat reaching-def set, but a loop-carried slot has one slot with a
+merge/header definition point, and an in-place accumulator (`dst==src`) is a single def per iteration; the
+check needs to be CFG-aware (a reaching-writer check with a merge/header definition for loop-carried
+slots) while still rejecting genuinely ambiguous slots. It was handed to backend-llvm-tail with a
+MIR-level regression test and the requirement that `constres` build bit-identically while shipped kernels
+stay byte-identical. The same machinery is needed for (i) bias hi/lo; the LDS-spill alternative would add
+~6 LDS ops/tile (LDS already at vendor level 52.3 vs 52.5) for a VALU saving of the same size, with no
+evidence of a net win. Until the RA fix lands, the executable small-item ceiling is only the P-conversion
+route (medium accuracy risk) and address hoist (<1%), which do not change the earlier conclusion.
+
+**Theoretical stacked small-opt win (before/without the RA fix, 1:1 VALU-cycle-to-wave upper bound):**
+base 453.5 TF / 7.086 TF/CU / wave 1349.3, VALU 353.1. (ii) 7-13 VALU -> +0.5-1.0% -> 455.8-458.0 TF
+(7.12-7.16 TF/CU, gap 1.174-1.181); (i) 6-10 -> +0.44-0.74%; stacked (i)+(ii) 13-23 -> +0.96-1.70% ->
+457.9-461.2 TF (7.15-7.21, gap 1.166-1.176); + address hoist 8-15 (0.6-1.1%) -> +1.6-2.8% ->
+460.8-466.2 TF (7.20-7.28, gap 1.155-1.168); + a direct P conversion (-16 VALU but accuracy-risk) ->
+theoretical +2.8-4.0% -> 466-472 TF (7.29-7.37, gap 1.14-1.15) - **still not parity**. At 50%
+VALU-to-wave translation the stacked (i)+(ii) win is only +0.5-0.85% (~7.12-7.15 TF/CU). Parity needs
++18.7% (252 wave cycles); micro-optimization's realistic ceiling is 1.6-2.8%, i.e. **per-CU parity is not
+reachable by micro-optimization; the residual 1.15-1.17x requires the structural M-window/QK-staging
+change (or another way to remove the 128 XDL bias cover without re-exposing latency).**
 
 ## 8. Unknowns / limitations
 
