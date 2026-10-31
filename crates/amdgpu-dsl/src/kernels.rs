@@ -19111,6 +19111,7 @@ pub fn pv_window_block() -> amdgpu_safeasm::AsmBlock {
 /// SMFMACs, in the order the list scheduler produces today (bias x4, PV half 0 x4, QK first MFMA x4, PV half 1 x4, QK second MFMA x4, SMFMAC pairs after item 7 and at the end),
 /// with a two-item read lookahead and exact partial lgkmcnt waits from the Pending tokens. Control block: expected neutral.
 /// Inout ports: S0..S3, O0..O3 (Frag16), la (Frag4). Inputs: kfb0..3, kdrd, g8, sh16, q0, q1, sq0, sq1, ones, bias, trb0..3, pa, pb, a_rs, idx01, idx23, c127, c123.
+
 /// gen9 M2 (docs/gen9-vendor-mirror-design.md section 2): the M window of `_vs9` as ONE pinned safe-asm block, vendor order: the first matrix work after the barrier needs no LDS read:
 /// 2 row-sum SMFMACs (P from registers) and PV MFMAs (0,0) / (0,1) on the two V fragments read BEFORE the barrier; then the remaining PV / QK stream behind `ds_read`s with exact partial waits.
 /// The 4 f16 bias MFMAs are gone: the persistent bias matrix `bacc` (recomputed only in the rollback branch) is the C operand of the first scaled QK MFMA of every S tile.
@@ -19198,15 +19199,15 @@ pub fn pv_qk_window_block_v2() -> amdgpu_safeasm::AsmBlock {
     let mut kd1 = s.vgpr::<1>();
     let mut kd2 = s.vgpr::<1>();
     let mut kd3 = s.vgpr::<1>();
+    let ts = s.v_smfmac_f32_16x16x128_fp8_fp8(la, rra, rpa, ri01);
     let pk0 = rd_v(&mut s, &mut v0, trb[2], 0);
+    let ts = ts.chain(&mut s, rra, rpb, ri01);
     let pk1 = rd_v(&mut s, &mut v1, trb[3], 0);
+    let t0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o0, rvp0, rpa, rs127, rs123);
     let pkd0 = s.ds_read_b32::<0, _>(&mut kd0, &kdrd);
     let pkd1 = s.ds_read_b32::<128, _>(&mut kd1, &kdrd);
     let pkd2 = s.ds_read_b32::<256, _>(&mut kd2, &kdrd);
     let pkd3 = s.ds_read_b32::<384, _>(&mut kd3, &kdrd);
-    let ts = s.v_smfmac_f32_16x16x128_fp8_fp8(la, rra, rpa, ri01);
-    let ts = ts.chain(&mut s, rra, rpb, ri01);
-    let t0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o0, rvp0, rpa, rs127, rs123);
     let t1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o1, rvp1, rpa, rs127, rs123);
     let pk2 = rd_k::<0>(&mut s, &mut v2, &kfb0, &kfb1);
     wait4(&mut s, pk0);
@@ -19402,15 +19403,15 @@ pub fn pv_qk_window_block_v2q() -> amdgpu_safeasm::AsmBlock {
     let mut kd1 = s.vgpr::<1>();
     let mut kd2 = s.vgpr::<1>();
     let mut kd3 = s.vgpr::<1>();
+    let ts = s.v_smfmac_f32_16x16x128_fp8_fp8(la, rra, rpa, ri01);
     let pk0 = rd_v(&mut s, &mut v0, trb[2], 0);
+    let ts = ts.chain(&mut s, rra, rpb, ri01);
     let pk1 = rd_v(&mut s, &mut v1, trb[3], 0);
+    let t0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o0, rvp0, rpa, rs127, rs123);
     let pkd0 = s.ds_read_b32::<0, _>(&mut kd0, &kdrd);
     let pkd1 = s.ds_read_b32::<128, _>(&mut kd1, &kdrd);
     let pkd2 = s.ds_read_b32::<256, _>(&mut kd2, &kdrd);
     let pkd3 = s.ds_read_b32::<384, _>(&mut kd3, &kdrd);
-    let ts = s.v_smfmac_f32_16x16x128_fp8_fp8(la, rra, rpa, ri01);
-    let ts = ts.chain(&mut s, rra, rpb, ri01);
-    let t0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o0, rvp0, rpa, rs127, rs123);
     let t1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o1, rvp1, rpa, rs127, rs123);
     let pk2 = rd_k::<0>(&mut s, &mut v2, &kfb0, &kfb1);
     let pq0 = rd_q(&mut s, &mut qf0, &qa0);
