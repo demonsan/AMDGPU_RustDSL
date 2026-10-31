@@ -18904,6 +18904,49 @@ pub fn probe_buffer_lds() -> Function {
     b.finish()
 }
 
+/// Runtime `num_records` descriptor (a kernarg value = 512 bytes): plain load, `buffer_load_dwordx4 ... lds` and `buffer_load_dword ... lds` through it; the LDS is
+/// pre-filled with 0xCDCDCDCD so the host can tell zero-fill from dropped out-of-range lanes (tools/buffer_probe.sh dyn).
+pub fn probe_buffer_dyn() -> Function {
+    let mut b = FnBuilder::new("probe_buffer_dyn", 64);
+    b.lds(4096);
+    b.arg("inp", DType::Ptr, 0, 8);
+    b.arg("outp", DType::Ptr, 8, 8);
+    b.arg("num", DType::I32, 16, 4);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let outp = b.let_(Op::KernargPtr { offset: 8 });
+    let s_num = b.let_(Op::KernargI32 { offset: 16 });
+    let tid = b.let_(Op::WorkitemId);
+    let c0 = b.c_i32(0);
+    let c4 = b.c_i32(4);
+    let c16 = b.c_i32(16);
+    let o4 = b.mul_i32(tid, c4);
+    let o16 = b.mul_i32(tid, c16);
+    let d = b.buffer_desc_dyn(inp, s_num);
+    let v = b.buffer_load_b128(d, o16, c0, 0);
+    let pout16 = b.ptr_add(outp, o16);
+    b.store_f32x4(pout16, 0, v); // out[0..1024): plain load, lanes with offset >= num read zero
+    // LDS sentinel
+    let cd = b.c_i32(0xCDCD_CDCDu32 as i32);
+    let sent = b.frag4(cd, cd, cd, cd);
+    b.store_lds_b128(o16, sent);
+    let c1024 = b.c_i32(1024);
+    let a1 = b.add_i32(o4, c1024);
+    b.store_lds_b32(a1, cd);
+    b.wait_lds(0);
+    b.barrier();
+    b.load_buffer_lds(d, o16, c0, c0, 0, 4); // LDS[0..1024)
+    b.load_buffer_lds(d, o16, c0, c1024, 0, 1); // LDS[1024..1280): dword form, same voffset (lanes >= 32 out of range)
+    b.wait_vm(0);
+    b.barrier();
+    let lv = b.load_lds_b128(o16);
+    b.store_f32x4(pout16, 1024, lv); // out[1024..2048)
+    let lw = b.load_lds_b32(a1);
+    let lwf = b.bitcast_f32(lw);
+    let pout4 = b.ptr_add(outp, o4);
+    b.store_f32(pout4, 2048, lwf); // out[2048..2304)
+    b.finish()
+}
+
 pub fn probe_log_store4() -> Function {
     // out[4*tid + j] = log2(in[tid]) for j in 0..4: covers v_log_f32 and global_store_dwordx4 on both backends
     let mut b = FnBuilder::new("probe_log_store4", 64);
