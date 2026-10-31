@@ -1627,6 +1627,27 @@ realistic VALU/SALU cuts cap at <=1%, leaving a ~1.16-1.18x gap; closing it requ
 vendor-style M-window/QK staging with preloaded operands and unscaled QK (or another scheme that removes
 the 128 XDL bias cover without re-exposing the post-barrier LDS latency) - not a micro-lever.**
 
+## 7.10.8 Small-optimization attempt: resident constants blocked by the two-phase RA
+
+The only remaining VALU items were: (i) carry the two-f16 bias word as an f32 hi/lo pair (save 6-10 VALU/tile),
+(ii) force the 7 per-tile materialised constants (`0x7f`, `0x7b`, `0x44444444`, `0xeeeeeeee`, `1.0`,
+`0x3e700000`, `0x100`; ~7 `v_mov`/tile in the executed long-copy loop) into persistent loop-carried VGPRs,
+(iii) a direct unscaled f32->fp8 P conversion (no f32+scale op exists; at best -16 VALU with changed
+rounding), and (iv) address hoist to SALU (<1%). A `constres` prototype on branch `smallwin` pushes 6 of
+these constants as loop-carried I32/F32 vars and shadows the constants with Var reads (bit-identical by
+construction). It **does not compile**: the compiler's two-phase allocation fails the reaching-writer check
+with 88 violations (`block 12 inst 388 VSmfmac16x16x128Fp8: reads slot 13136 (v192) but the reaching
+writers are {9952,13136}`) - i.e. adding persistent loop vars breaks the in-place SMFMAC accumulator
+allocation in the two-phase register allocator. The same machinery would be needed for (i), so **the
+constants/bias small-optimization items are not realisable without a compiler RA fix**, and the LDS-spill
+alternative would add ~6 LDS ops/tile (LDS is already at the vendor level, 52.3 vs 52.5) for a VALU saving
+of the same size, with no evidence of a net win. The remaining small-item ceiling is therefore only the
+P-conversion route (medium accuracy risk) and address hoist (<1%), which do not change the earlier
+conclusion: **per-CU parity is not reachable by micro-optimization on the current compiler/kernel
+structure; ~1.16-1.18x remains unless the compiler two-phase RA is fixed to allow persistent constants
+(via a real constraint/alias model rather than the current reaching-writer check) and/or the structural
+M-window/QK staging is changed.**
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as

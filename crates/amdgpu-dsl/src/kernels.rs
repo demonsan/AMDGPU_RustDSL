@@ -9991,17 +9991,14 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     }
     // constres: force the 6 per-tile materialised constants into persistent loop-carried VGPRs so the RA cannot
     // rematerialise them every iteration (0x7f/0x7b MFMA scales, idx01/idx23 SMFMAC indexes, 1.0 P scale, threshold).
-    let constres = fmha_t_opt("constres");
+    let cn = fmha_t_num("constres").unwrap_or(0).min(6);
+    let constres = cn > 0;
     let cbase = init_vars.len();
-    if constres {
-        init_vars.push((DType::I32, Opnd::Val(c127)));
-        init_vars.push((DType::I32, Opnd::Val(c123)));
-        init_vars.push((DType::I32, Opnd::Val(idx01)));
-        init_vars.push((DType::I32, Opnd::Val(idx23)));
-        let one_bits = b.bitcast_i32(one_f);
-        let cthr_bits = b.bitcast_i32(c_thr);
-        init_vars.push((DType::I32, Opnd::Val(one_bits)));
-        init_vars.push((DType::I32, Opnd::Val(cthr_bits)));
+    let one_bits = b.bitcast_i32(one_f);
+    let cthr_bits = b.bitcast_i32(c_thr);
+    let const_vals = [c127, c123, idx01, idx23, one_bits, cthr_bits];
+    for &cv in const_vals.iter().take(cn) {
+        init_vars.push((DType::I32, Opnd::Val(cv)));
     }
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
@@ -10017,12 +10014,12 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let kdp = vars[12];
     let bacc: Option<VarId> = if biasacc { Some(vars[13]) } else { None };
     // shadow the constants with loop-carried Var reads when constres is on (all later uses capture the shadow)
-    let c127 = if constres { b.bitcast_i32(Opnd::Var(vars[cbase])) } else { c127 };
-    let c123 = if constres { b.bitcast_i32(Opnd::Var(vars[cbase + 1])) } else { c123 };
-    let idx01 = if constres { b.bitcast_i32(Opnd::Var(vars[cbase + 2])) } else { idx01 };
-    let idx23 = if constres { b.bitcast_i32(Opnd::Var(vars[cbase + 3])) } else { idx23 };
-    let one_f = if constres { b.bitcast_f32(Opnd::Var(vars[cbase + 4])) } else { one_f };
-    let c_thr = if constres { b.bitcast_f32(Opnd::Var(vars[cbase + 5])) } else { c_thr };
+    let c127 = if cn >= 1 { b.bitcast_i32(Opnd::Var(vars[cbase])) } else { c127 };
+    let c123 = if cn >= 2 { b.bitcast_i32(Opnd::Var(vars[cbase + 1])) } else { c123 };
+    let idx01 = if cn >= 3 { b.bitcast_i32(Opnd::Var(vars[cbase + 2])) } else { idx01 };
+    let idx23 = if cn >= 4 { b.bitcast_i32(Opnd::Var(vars[cbase + 3])) } else { idx23 };
+    let one_f = if cn >= 5 { b.bitcast_f32(Opnd::Var(vars[cbase + 4])) } else { one_f };
+    let c_thr = if cn >= 6 { b.bitcast_f32(Opnd::Var(vars[cbase + 5])) } else { c_thr };
     // 2-slot ring: tile t in slot t & 1, tile t+1 in the other one
     let ring = |b: &mut FnBuilder| -> (ValueId, ValueId, ValueId, ValueId, ValueId, ValueId, ValueId) {
         let i1 = b.xor_i32(idx, c1);
