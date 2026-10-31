@@ -940,14 +940,14 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
                     let own_arrives = ws.contains_key(r);
                     let clobbered: Vec<Slot> = ws.iter().filter(|(w, prev)| *w != r && prev.contains(r)).map(|(w, _)| *w).collect();
                     if !own_arrives || !clobbered.is_empty() {
-                        let list: Vec<Slot> = if own_arrives { clobbered } else { ws.keys().copied().collect() };
+                        let list: Vec<Slot> = if !clobbered.is_empty() { clobbered.clone() } else { ws.keys().copied().collect() };
                         let at: Vec<String> = list.iter().map(|w| format!("{w}={:?}", wloc.get(w).map(|v| v.iter().take(3).collect::<Vec<_>>()).unwrap_or_default())).collect();
                         report.push(format!(
                             "block {b} inst {ii} {:?}: reads slot {r} ({}{}) but {} [{}]",
                             inst.op,
                             if p.0 { "v" } else { "s" },
                             p.1,
-                            if own_arrives { "it was overwritten by another value on a path where it had been written, writers" } else { "its own value never arrives; the reaching writers are" },
+                            if !clobbered.is_empty() { "it was overwritten by another value on a path where it had been written, writers" } else { "its own value never arrives; the reaching writers are" },
                             at.join("; ")
                         ));
                     }
