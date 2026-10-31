@@ -19106,7 +19106,8 @@ pub fn probe_llvm_roles() -> Function {
     let plus = b.add_i32(tid, c256);
     let minus = b.add_i32(tid, c256);
     let wrap = b.let_(Op::CmpLtI32(Opnd::Val(plus), Opnd::Val(c512)));
-    let neg = b.mul_i32(c256, b.c_i32(-2));
+    let cm2 = b.c_i32(-2);
+    let neg = b.mul_i32(c256, cm2);
     let wrapped = b.add_i32(plus, neg);
     let _ = minus;
     let pidx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wrap), a: Opnd::Val(plus), b: Opnd::Val(wrapped) });
@@ -19147,7 +19148,8 @@ pub fn probe_llvm_lds() -> Function {
     b.wait_lds(0);
     let mirror = b.let_(Op::AddI32(Opnd::Val(c63), Opnd::Val(tid)));
     let _ = mirror;
-    let neg = b.mul_i32(tid, b.c_i32(-1));
+    let cm1 = b.c_i32(-1);
+    let neg = b.mul_i32(tid, cm1);
     let m = b.add_i32(c63, neg);
     let mo4 = b.mul_i32(m, c4);
     let mo16a = b.mul_i32(m, c16);
