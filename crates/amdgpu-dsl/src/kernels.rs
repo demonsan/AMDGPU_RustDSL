@@ -11924,7 +11924,7 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
         // M2: the first two V fragments of the PV window (half 0, column groups 0 and 1) are read BEFORE the barrier (their tile is already in LDS); the M window block
         // starts with matrix work that needs no LDS read. The LDS wait before the barrier is dropped for them (no LDS writes in this loop).
-        let m2 = !nom2 && stage && smfrs && smfv && q0_reg && !convlate;
+        let m2 = !nom2 && stage && smfrs && smfv && !convlate;
         let vpre_m2: Option<(ValueId, ValueId)> = if m2 {
             let mut fr: Vec<ValueId> = Vec::with_capacity(2);
             for e in 0..2usize {
@@ -12007,6 +12007,30 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
             }
             pv_w(b, slot_cur, &w);
+        } else if let Some((vp0, vp1)) = vpre_m2 {
+            // gen9 M2: the whole M window as one pinned block (vendor order), see pv_qk_window_block_v2
+            let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot_nxt)).collect();
+            let kd_rd = b.add_i32(kd_cur, kds_nxt);
+            let sh16 = b.add_i32(cx.g8, c16i);
+            let q1v = load_q1(b);
+            let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot_cur)).collect();
+            let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            let pb = b.frag8(w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+            let ba = bacc.expect("M2 needs the bias matrix");
+            let ins = [
+                Opnd::Val(kfb[0]), Opnd::Val(kfb[1]), Opnd::Val(kfb[2]), Opnd::Val(kfb[3]), Opnd::Val(kd_rd), Opnd::Val(cx.g8), Opnd::Val(sh16),
+                Opnd::Val(cx.b0), Opnd::Val(q1v), Opnd::Val(sq0m), Opnd::Val(sq1m), Opnd::Var(ba), Opnd::Val(vp0), Opnd::Val(vp1),
+                Opnd::Val(trb[0]), Opnd::Val(trb[1]), Opnd::Val(trb[2]), Opnd::Val(trb[3]), Opnd::Val(pa), Opnd::Val(pb), Opnd::Val(a_rs), Opnd::Val(idx01), Opnd::Val(idx23), Opnd::Val(c127), Opnd::Val(c123),
+            ];
+            if q0_reg {
+                b.var_asm_n(&[s_vars[0], s_vars[1], s_vars[2], s_vars[3], o_vars[0], o_vars[1], o_vars[2], o_vars[3], la], pv_qk_window_block_v2(), &ins);
+            } else {
+                // Q fragments are not resident (FMHA_OPT=noqreg): the window reads them from LDS (addresses instead of the two fragments)
+                let mut insq = ins.to_vec();
+                insq[7] = Opnd::Val(q0_addr0);
+                insq[8] = Opnd::Val(q_addr0);
+                b.var_asm_n(&[s_vars[0], s_vars[1], s_vars[2], s_vars[3], o_vars[0], o_vars[1], o_vars[2], o_vars[3], la], pv_qk_window_block_v2q(), &insq);
+            }
         } else if let Some((vp0, vp1)) = vpre_m2 {
             // gen9 M2: the whole M window as one pinned block (vendor order), see pv_qk_window_block_v2
             let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot_nxt)).collect();
@@ -19252,6 +19276,216 @@ pub fn pv_qk_window_block_v2() -> amdgpu_safeasm::AsmBlock {
     let t3 = t3.chain(&mut s, rv9, rpb, rs127, rs123);
     let pk12 = rd_k::<8192>(&mut s, &mut v12, &kfb2, &kfb3);
     wait2(&mut s, pk10);
+    let rv10 = s.ready(&v10);
+    let tq0 = tq0.chain(&mut s, rv10, rq1, rk1_0, rsq1);
+    let pk13 = rd_k::<12288>(&mut s, &mut v13, &kfb2, &kfb3);
+    wait2(&mut s, pk11);
+    let rv11 = s.ready(&v11);
+    let tq1 = tq1.chain(&mut s, rv11, rq1, rk1_1, rsq1);
+    wait2(&mut s, pk12);
+    let rv12 = s.ready(&v12);
+    let tq2 = tq2.chain(&mut s, rv12, rq1, rk1_2, rsq1);
+    wait2(&mut s, pk13);
+    let rv13 = s.ready(&v13);
+    let tq3 = tq3.chain(&mut s, rv13, rq1, rk1_3, rsq1);
+    let ex_o0 = t0.exit();
+    s.output_exit(ex_o0);
+    let ex_o1 = t1.exit();
+    s.output_exit(ex_o1);
+    let ex_o2 = t2.exit();
+    s.output_exit(ex_o2);
+    let ex_o3 = t3.exit();
+    s.output_exit(ex_o3);
+    let ex_s0 = tq0.exit();
+    s.output_exit(ex_s0);
+    let ex_s1 = tq1.exit();
+    s.output_exit(ex_s1);
+    let ex_s2 = tq2.exit();
+    s.output_exit(ex_s2);
+    let ex_s3 = tq3.exit();
+    s.output_exit(ex_s3);
+    let exl = ts.exit();
+    s.output_exit(exl);
+    s.finish().expect("pv_qk_window_block_v2 is a verified sequence")
+}
+
+/// gen9 M2 (docs/gen9-vendor-mirror-design.md section 2): the M window of `_vs9` as ONE pinned safe-asm block, vendor order: the first matrix work after the barrier needs no LDS read:
+/// 2 row-sum SMFMACs (P from registers) and PV MFMAs (0,0) / (0,1) on the two V fragments read BEFORE the barrier; then the remaining PV / QK stream behind `ds_read`s with exact partial waits.
+/// The 4 f16 bias MFMAs are gone: the persistent bias matrix `bacc` (recomputed only in the rollback branch) is the C operand of the first scaled QK MFMA of every S tile.
+/// Inout: S0..S3, O0..O3 (Frag16), la (Frag4). Inputs: kfb0..3, kdrd, g8, sh16, q0, q1, sq0, sq1, bacc (Frag16), vp0, vp1 (Frag8), trb0..3, pa, pb, a_rs, idx01, idx23, c127, c123.
+pub fn pv_qk_window_block_v2q() -> amdgpu_safeasm::AsmBlock {
+    use amdgpu_safeasm::{In, Pending, Seq, SubMut, Vgpr};
+    fn rd_v<'a>(s: &mut Seq, v8: &'a mut Vgpr<8>, addr: &In<1>, hh: usize) -> [Pending<SubMut<'a, 2>>; 4] {
+        let [d0, d1, d2, d3] = s.split_pairs_mut(v8);
+        if hh == 0 {
+            [s.ds_read_b64_tr_b8::<0, _>(d0, addr), s.ds_read_b64_tr_b8::<2048, _>(d1, addr), s.ds_read_b64_tr_b8::<4096, _>(d2, addr), s.ds_read_b64_tr_b8::<6144, _>(d3, addr)]
+        } else {
+            [s.ds_read_b64_tr_b8::<8192, _>(d0, addr), s.ds_read_b64_tr_b8::<10240, _>(d1, addr), s.ds_read_b64_tr_b8::<12288, _>(d2, addr), s.ds_read_b64_tr_b8::<14336, _>(d3, addr)]
+        }
+    }
+    fn wait4(s: &mut Seq, p: [Pending<SubMut<'_, 2>>; 4]) {
+        let [p0, p1, p2, p3] = p;
+        let _ = p3.wait(s);
+        let _ = p2.wait(s);
+        let _ = p1.wait(s);
+        let _ = p0.wait(s);
+    }
+    fn rd_k<'a, const OFF: u32>(s: &mut Seq, v8: &'a mut Vgpr<8>, a0: &In<1>, a1: &In<1>) -> [Pending<SubMut<'a, 4>>; 2] {
+        let [h0, h1] = s.split_halves8_mut(v8);
+        [s.ds_read_b128::<OFF, _>(h0, a0), s.ds_read_b128::<OFF, _>(h1, a1)]
+    }
+    fn rd_q<'a>(s: &mut Seq, v8: &'a mut Vgpr<8>, addr: &In<1>) -> [Pending<SubMut<'a, 4>>; 2] {
+        let [h0, h1] = s.split_halves8_mut(v8);
+        [s.ds_read_b128::<0, _>(h0, addr), s.ds_read_b128::<1024, _>(h1, addr)]
+    }
+    fn wait2(s: &mut Seq, p: [Pending<SubMut<'_, 4>>; 2]) {
+        let [p0, p1] = p;
+        let _ = p1.wait(s);
+        let _ = p0.wait(s);
+    }
+    let mut s = Seq::new();
+    s.pin();
+    let sv0 = s.inout::<16>();
+    let sv1 = s.inout::<16>();
+    let sv2 = s.inout::<16>();
+    let sv3 = s.inout::<16>();
+    let o0 = s.inout::<16>();
+    let o1 = s.inout::<16>();
+    let o2 = s.inout::<16>();
+    let o3 = s.inout::<16>();
+    let la = s.inout::<4>();
+    let kfb0 = s.input::<1>();
+    let kfb1 = s.input::<1>();
+    let kfb2 = s.input::<1>();
+    let kfb3 = s.input::<1>();
+    let kdrd = s.input::<1>();
+    let g8 = s.input::<1>();
+    let sh16 = s.input::<1>();
+    let qa0 = s.input::<1>();
+    let qa1 = s.input::<1>();
+    let sq0 = s.input::<1>();
+    let sq1 = s.input::<1>();
+    let bacc = s.input::<16>();
+    let vp0 = s.input::<8>();
+    let vp1 = s.input::<8>();
+    let trb0 = s.input::<1>();
+    let trb1 = s.input::<1>();
+    let trb2 = s.input::<1>();
+    let trb3 = s.input::<1>();
+    let pa = s.input::<8>();
+    let pb = s.input::<8>();
+    let a_rs = s.input::<4>();
+    let idx01 = s.input::<1>();
+    let idx23 = s.input::<1>();
+    let c127 = s.input::<1>();
+    let c123 = s.input::<1>();
+    let (rpa, rpb, rra, ri01, ri23, rs127, rs123) = (s.ready(&pa), s.ready(&pb), s.ready(&a_rs), s.ready(&idx01), s.ready(&idx23), s.ready(&c127), s.ready(&c123));
+    let (rsq0, rsq1, rbacc, rvp0, rvp1) = (s.ready(&sq0), s.ready(&sq1), s.ready(&bacc), s.ready(&vp0), s.ready(&vp1));
+    let trb = [&trb0, &trb1, &trb2, &trb3];
+    let mut v0 = s.vgpr::<8>();
+    let mut v1 = s.vgpr::<8>();
+    let mut v2 = s.vgpr::<8>();
+    let mut v3 = s.vgpr::<8>();
+    let mut v4 = s.vgpr::<8>();
+    let mut v5 = s.vgpr::<8>();
+    let mut v6 = s.vgpr::<8>();
+    let mut v7 = s.vgpr::<8>();
+    let mut v8 = s.vgpr::<8>();
+    let mut v9 = s.vgpr::<8>();
+    let mut v10 = s.vgpr::<8>();
+    let mut v11 = s.vgpr::<8>();
+    let mut v12 = s.vgpr::<8>();
+    let mut v13 = s.vgpr::<8>();
+    let mut qf0 = s.vgpr::<8>();
+    let mut qf1 = s.vgpr::<8>();
+    let mut kd0 = s.vgpr::<1>();
+    let mut kd1 = s.vgpr::<1>();
+    let mut kd2 = s.vgpr::<1>();
+    let mut kd3 = s.vgpr::<1>();
+    let pk0 = rd_v(&mut s, &mut v0, trb[2], 0);
+    let pk1 = rd_v(&mut s, &mut v1, trb[3], 0);
+    let pkd0 = s.ds_read_b32::<0, _>(&mut kd0, &kdrd);
+    let pkd1 = s.ds_read_b32::<128, _>(&mut kd1, &kdrd);
+    let pkd2 = s.ds_read_b32::<256, _>(&mut kd2, &kdrd);
+    let pkd3 = s.ds_read_b32::<384, _>(&mut kd3, &kdrd);
+    let ts = s.v_smfmac_f32_16x16x128_fp8_fp8(la, rra, rpa, ri01);
+    let ts = ts.chain(&mut s, rra, rpb, ri01);
+    let t0 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o0, rvp0, rpa, rs127, rs123);
+    let t1 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o1, rvp1, rpa, rs127, rs123);
+    let pk2 = rd_k::<0>(&mut s, &mut v2, &kfb0, &kfb1);
+    let pq0 = rd_q(&mut s, &mut qf0, &qa0);
+    wait4(&mut s, pk0);
+    let rv0 = s.ready(&v0);
+    let t2 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o2, rv0, rpa, rs127, rs123);
+    let pk3 = rd_k::<4096>(&mut s, &mut v3, &kfb0, &kfb1);
+    wait4(&mut s, pk1);
+    let rv1 = s.ready(&v1);
+    let t3 = s.v_mfma_scale_f32_32x32x64_f8f6f4(o3, rv1, rpa, rs127, rs123);
+    let pk4 = rd_k::<8192>(&mut s, &mut v4, &kfb0, &kfb1);
+    wait2(&mut s, pk2);
+    wait2(&mut s, pq0);
+    let rq0 = s.ready(&qf0);
+    let rv2 = s.ready(&v2);
+    let _ = pkd3.wait(&mut s);
+    let _ = pkd2.wait(&mut s);
+    let _ = pkd1.wait(&mut s);
+    let _ = pkd0.wait(&mut s);
+    let mut sk0_0 = s.vgpr::<1>();
+    let mut sk1_0 = s.vgpr::<1>();
+    s.v_lshrrev_b32_v(&mut sk0_0, &g8, &kd0);
+    s.v_lshrrev_b32_v(&mut sk1_0, &sh16, &kd0);
+    let (rk0_0, rk1_0) = (s.ready(&sk0_0), s.ready(&sk1_0));
+    let tq0 = s.v_mfma_scale_f32_32x32x64_f8f6f4_c(sv0, rbacc, rv2, rq0, rk0_0, rsq0);
+    let pk5 = rd_k::<12288>(&mut s, &mut v5, &kfb0, &kfb1);
+    wait2(&mut s, pk3);
+    let rv3 = s.ready(&v3);
+    let mut sk0_1 = s.vgpr::<1>();
+    let mut sk1_1 = s.vgpr::<1>();
+    s.v_lshrrev_b32_v(&mut sk0_1, &g8, &kd1);
+    s.v_lshrrev_b32_v(&mut sk1_1, &sh16, &kd1);
+    let (rk0_1, rk1_1) = (s.ready(&sk0_1), s.ready(&sk1_1));
+    let tq1 = s.v_mfma_scale_f32_32x32x64_f8f6f4_c(sv1, rbacc, rv3, rq0, rk0_1, rsq0);
+    let ts = ts.chain(&mut s, rra, rpa, ri23);
+    let ts = ts.chain(&mut s, rra, rpb, ri23);
+    let pk6 = rd_v(&mut s, &mut v6, trb[0], 1);
+    wait2(&mut s, pk4);
+    let rv4 = s.ready(&v4);
+    let mut sk0_2 = s.vgpr::<1>();
+    let mut sk1_2 = s.vgpr::<1>();
+    s.v_lshrrev_b32_v(&mut sk0_2, &g8, &kd2);
+    s.v_lshrrev_b32_v(&mut sk1_2, &sh16, &kd2);
+    let (rk0_2, rk1_2) = (s.ready(&sk0_2), s.ready(&sk1_2));
+    let tq2 = s.v_mfma_scale_f32_32x32x64_f8f6f4_c(sv2, rbacc, rv4, rq0, rk0_2, rsq0);
+    let pk7 = rd_v(&mut s, &mut v7, trb[1], 1);
+    wait2(&mut s, pk5);
+    let rv5 = s.ready(&v5);
+    let mut sk0_3 = s.vgpr::<1>();
+    let mut sk1_3 = s.vgpr::<1>();
+    s.v_lshrrev_b32_v(&mut sk0_3, &g8, &kd3);
+    s.v_lshrrev_b32_v(&mut sk1_3, &sh16, &kd3);
+    let (rk0_3, rk1_3) = (s.ready(&sk0_3), s.ready(&sk1_3));
+    let tq3 = s.v_mfma_scale_f32_32x32x64_f8f6f4_c(sv3, rbacc, rv5, rq0, rk0_3, rsq0);
+    let pk8 = rd_v(&mut s, &mut v8, trb[2], 1);
+    wait4(&mut s, pk6);
+    let rv6 = s.ready(&v6);
+    let t0 = t0.chain(&mut s, rv6, rpb, rs127, rs123);
+    let pk9 = rd_v(&mut s, &mut v9, trb[3], 1);
+    wait4(&mut s, pk7);
+    let rv7 = s.ready(&v7);
+    let t1 = t1.chain(&mut s, rv7, rpb, rs127, rs123);
+    let pk10 = rd_k::<0>(&mut s, &mut v10, &kfb2, &kfb3);
+    let pq1 = rd_q(&mut s, &mut qf1, &qa1);
+    wait4(&mut s, pk8);
+    let rv8 = s.ready(&v8);
+    let t2 = t2.chain(&mut s, rv8, rpb, rs127, rs123);
+    let pk11 = rd_k::<4096>(&mut s, &mut v11, &kfb2, &kfb3);
+    wait4(&mut s, pk9);
+    let rv9 = s.ready(&v9);
+    let t3 = t3.chain(&mut s, rv9, rpb, rs127, rs123);
+    let pk12 = rd_k::<8192>(&mut s, &mut v12, &kfb2, &kfb3);
+    wait2(&mut s, pk10);
+    wait2(&mut s, pq1);
+    let rq1 = s.ready(&qf1);
     let rv10 = s.ready(&v10);
     let tq0 = tq0.chain(&mut s, rv10, rq1, rk1_0, rsq1);
     let pk13 = rd_k::<12288>(&mut s, &mut v13, &kfb2, &kfb3);
