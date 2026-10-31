@@ -378,7 +378,16 @@ const STORE_DATA_WAIT: usize = 3;
 
 /// Global stores of more than 64 bits of data (`global_store_dwordx3/x4`): the data VGPRs are read over several cycles after issue.
 fn is_wide_vmem_store(op: MOp) -> bool {
-    matches!(op, MOp::GlobalStoreF32x4 | MOp::GlobalStoreF32x4Sc1)
+    matches!(op, MOp::GlobalStoreF32x4 | MOp::GlobalStoreF32x4Sc1 | MOp::BufferStoreDwordX4)
+}
+
+/// Index of the data register among the sources of a wide store (global stores: [ptr, data]; buffer stores: [data, rsrc, voff, soff]).
+fn wide_store_data_idx(op: MOp) -> usize {
+    if op == MOp::BufferStoreDwordX4 {
+        0
+    } else {
+        1
+    }
 }
 
 /// A VALU (non-memory, non-matrix) instruction that writes a vector register.
@@ -562,7 +571,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 inflight.push((cycle, need, inst.op, srcs));
             }
             if store_haz_on && is_wide_vmem_store(inst.op) {
-                if let Some(Src::Reg(d)) = inst.srcs.get(1) {
+                if let Some(Src::Reg(d)) = inst.srcs.get(wide_store_data_idx(inst.op)) {
                     if m.vreg_class(*d).is_vector() {
                         store_data_inflight.push((cycle, STORE_DATA_WAIT, vec![rng(m, *d)]));
                     }

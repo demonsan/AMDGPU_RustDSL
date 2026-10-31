@@ -594,7 +594,7 @@ fn llvm_tail_register_accounting() {
         let f = kernel_by_name(name).unwrap();
         // own-backend-only DMA kernels (e.g. fmha_fwd_hd128_mxfp8_vs) cannot go through the LLVM tail
         if let Ok(m) = amdgpu_compiler::compile_mir(&f) {
-            if m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, amdgpu_compiler::mir::MOp::GlobalLoadLdsB128 | amdgpu_compiler::mir::MOp::GlobalLoadLdsB32))) {
+            if m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, amdgpu_compiler::mir::MOp::GlobalLoadLdsB128 | amdgpu_compiler::mir::MOp::GlobalLoadLdsB32 | amdgpu_compiler::mir::MOp::BufferLoadDwordX4Lds | amdgpu_compiler::mir::MOp::BufferLoadDwordX1Lds))) {
                 continue;
             }
         }

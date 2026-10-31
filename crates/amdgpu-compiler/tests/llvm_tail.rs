@@ -340,7 +340,7 @@ fn metadata_args_match_the_dsl_args_without_padding() {
 fn llvm_tail_supported(name: &str) -> bool {
     let Some(f) = amdgpu_compiler::kernel_by_name(name) else { return true };
     match amdgpu_compiler::compile_mir(&f) {
-        Ok(m) => !m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32))),
+        Ok(m) => !m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 | MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds))),
         Err(_) => true,
     }
 }

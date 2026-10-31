@@ -192,6 +192,22 @@ impl Lowerer {
                     count(addr);
                     count(value);
                 }
+                Stmt::BufferStore { rsrc, voff, soff, value, .. } => {
+                    count(rsrc);
+                    for o in voff.iter() {
+                        count(o);
+                    }
+                    count(soff);
+                    count(value);
+                }
+                Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, .. } => {
+                    count(rsrc);
+                    for o in voff.iter() {
+                        count(o);
+                    }
+                    count(soff);
+                    count(lds_addr);
+                }
                 Stmt::SetVar { value, .. } => count(value),
                 Stmt::BeginLoop { init, .. } => {
                     for o in init {
@@ -680,6 +696,57 @@ impl Lowerer {
         let off = self.as_v1(byte_off)?;
         self.touch(&[Src::Reg(sreg), Src::Reg(off)]);
         Ok(Some((sreg, off)))
+    }
+
+    /// MUBUF operands: (descriptor S4 register, voffset source, soffset source). `voffset` None = the `off` form (encoded as `Src::Imm(0)`); `soffset` is an
+    /// SGPR value (wave-uniform integer, loop variable allowed) or a small constant (0..64, an inline constant of the encoding).
+    fn buffer_operands(&mut self, rsrc: Opnd, voff: Option<Opnd>, soff: Opnd) -> Result<(VReg, Src, Src), String> {
+        let rr = match rsrc {
+            Opnd::Val(v) => *self.val.get(&v).ok_or_else(|| format!("descriptor v{v} not lowered"))?,
+            _ => return Err("buffer descriptor operand must be a value".to_string()),
+        };
+        if self.mir.vreg_class(rr) != RClass::S4 {
+            return Err("buffer access: the descriptor operand is not an S4 register".to_string());
+        }
+        let vs = match voff {
+            Some(o) => Src::Reg(self.as_v1(o)?),
+            None => Src::Imm(0),
+        };
+        let ss = match self.const_bits(soff) {
+            Some(k) if (0..=64).contains(&k) => Src::Imm(k),
+            Some(k) => return Err(format!("buffer soffset constant {k} must be 0..64 (an inline constant); put larger values in an SGPR")),
+            None => self.s_operand(soff)?,
+        };
+        let mut t = vec![Src::Reg(rr), vs];
+        t.push(ss);
+        self.touch(&t);
+        Ok((rr, vs, ss))
+    }
+
+    /// The `M0` source of an LDS-DMA load: a wave-uniform SGPR (or constant moved into one), else the first lane of a VGPR.
+    fn m0_source(&mut self, lds_addr: Opnd) -> Result<VReg, String> {
+        let r = match lds_addr {
+            Opnd::Var(v) => self.vars.get(v.0 as usize).copied().filter(|r| self.mir.vreg_class(*r) == RClass::S1),
+            o => self.scalar_reg(o),
+        };
+        match (r, self.const_bits(lds_addr)) {
+            (Some(r), _) => {
+                self.touch(&[Src::Reg(r)]);
+                Ok(r)
+            }
+            (None, Some(k)) => {
+                let t = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SMovB32).def(t).imm(k));
+                Ok(t)
+            }
+            _ => {
+                let lv = self.as_v1(lds_addr)?;
+                self.touch(&[Src::Reg(lv)]);
+                let s = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(lv));
+                Ok(s)
+            }
+        }
     }
 
     /// A scalar source operand: an immediate (SALU takes 32-bit literals) or an SGPR value / scalar loop variable.
@@ -1178,6 +1245,22 @@ impl Lowerer {
                         // BUFFER_INV returns an ACK through VM_CNT: wait for it before the first coherent load (strict full sequence)
                         self.push(MInst::new(MOp::SWaitVm).imm(0));
                     }
+                }
+                Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => {
+                    let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
+                    let (v, mop) = match dwords {
+                        1 => (self.as_v1(*value)?, MOp::BufferStoreDwordX1),
+                        2 => (self.as_v2(*value)?, MOp::BufferStoreDwordX2),
+                        _ => (self.as_v4(*value)?, MOp::BufferStoreDwordX4),
+                    };
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(MInst::new(mop).srcreg(v).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
+                }
+                Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
+                    let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
+                    let m0 = self.m0_source(*lds_addr)?;
+                    let mop = if *dwords == 4 { MOp::BufferLoadDwordX4Lds } else { MOp::BufferLoadDwordX1Lds };
+                    self.push(MInst::new(mop).srcreg(rr).src(vs).src(ss).srcreg(m0).imm(*imm as i64));
                 }
                 Stmt::StoreF32x2 { base, byte_off, value } => {
                     let b = self.as_v2(*base)?;
@@ -1854,6 +1937,29 @@ impl Lowerer {
                 let d = self.new_vreg(RClass::V1);
                 let rb = self.as_v2(*base)?;
                 self.push(MInst::new(MOp::GlobalLoadF32Sc1).def(d).srcreg(rb).imm(*byte_off as i64));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::BufferRsrc { base, num_records } => {
+                let Opnd::Val(bv) = *base else { return Err("buffer descriptor base must be a kernarg pointer value".to_string()) };
+                let br = *self.val.get(&bv).ok_or_else(|| format!("value v{bv} not lowered"))?;
+                if self.mir.vreg_class(br) != RClass::S2 {
+                    return Err("buffer descriptor base must be a scalar (kernarg) pointer: a per-lane pointer cannot form a descriptor".to_string());
+                }
+                self.touch(&[Src::Reg(br)]);
+                let d = self.new_vreg(RClass::S4);
+                self.push(MInst::new(MOp::SBufferRsrc).def(d).srcreg(br).imm(*num_records as i64));
+                self.val.insert(dst, d);
+            }
+            Op::BufferLoad { rsrc, voff, soff, imm, dwords } => {
+                let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
+                let (cls, mop) = match dwords {
+                    1 => (RClass::V1, MOp::BufferLoadDwordX1),
+                    2 => (RClass::V2, MOp::BufferLoadDwordX2),
+                    _ => (RClass::V4, MOp::BufferLoadDwordX4),
+                };
+                let d = self.new_vreg(cls);
+                self.push(MInst::new(mop).def(d).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
