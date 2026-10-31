@@ -12110,6 +12110,15 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             iter(b, false, false, role_a);
             b.end_if();
         }
+    // KV-split fp16 partial epilogue: the per-wave 4 KB LDS transpose scratch starts at the Q staging base
+    // (69632) and therefore overlaps the 2 KB Q b1/b0 slot of the neighbouring waves. The drain's final
+    // barrier is role-dependent (`last_barrier = role_a`), so a wave that finishes first can overwrite a
+    // partner wave's still-live Q staging while it is in its last QK/PV, producing intermittent stale/zero
+    // chunks in the fp16 Ohat transpose (observed 5/80 runs on B1H2S200 SK1337, output hash mismatch,
+    // partials only, lse stable). Synchronise all waves before the epilogue overwrites the dead Q staging.
+    if !no_bar && cx.kvs.is_some() {
+        b.barrier();
+    }
     }    // ---- epilogue: O * (V descale / l) -> BF16 (l = MFMA row sum of the quantised P) ----
     let l_tot = if smfv {
         let d2 = b.frag4_lane(la, 2);
