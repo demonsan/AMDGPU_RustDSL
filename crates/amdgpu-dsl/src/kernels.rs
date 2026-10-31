@@ -10442,6 +10442,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     // PV of the whole tile (V in ring slot `slot`, P words `w`) and its row sums
     // vpre: the first V fragment (half 0, column group 0) of the PV window is read in the V window (its tile is already in LDS), carried in this cell to pv_w
     let vpre_cell: std::cell::Cell<Option<ValueId>> = std::cell::Cell::new(None);
+    // vpre2 (round 73): the first two V fragments of the PV window (half 0, column groups 0 and 1) are read BEFORE the barrier (the vendor's M-window head: its first MFMAs need no LDS read
+    // after the barrier); no LDS wait before the barrier (the loop has no LDS writes); consumed by pv_w as its first two fragments; unpinned (the list scheduler interleaves the rest)
+    let vpre2 = fmha_t_opt("vpre2");
+    let vpre_cell1: std::cell::Cell<Option<ValueId>> = std::cell::Cell::new(None);
     let pv_w = |b: &mut FnBuilder, slot: ValueId, w: &[ValueId]| {
         if no_pv {
             return;
@@ -10553,7 +10557,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
             }
             for e in 0..4usize {
-                let v8 = if hh == 0 && e == 0 { match vpre_cell.take() { Some(v) => v, None => load_v(b, hh, e) } } else { load_v(b, hh, e) };
+                let v8 = if hh == 0 && e == 0 {
+                    match vpre_cell.take() { Some(v) => v, None => load_v(b, hh, e) }
+                } else if hh == 0 && e == 1 {
+                    match vpre_cell1.take() { Some(v) => v, None => load_v(b, hh, e) }
+                } else {
+                    load_v(b, hh, e)
+                };
                 b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
             }
         }
@@ -10598,7 +10608,21 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if !noprio {
             b.set_prio(1);
         }
-        b.wait_lds(0);
+        let pre2 = vpre2 && stage && smfrs && !fmha_t_opt("convlate");
+        if pre2 {
+            for e in 0..2usize {
+                let tb = b.add_i32(cx.trx[e], slot_cur);
+                let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+                for r in 0..4i32 {
+                    let off = b.c_i32(2048 * r);
+                    addrs.push(b.add_i32(tb, off));
+                }
+                let v = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+                if e == 0 { vpre_cell.set(Some(v)); } else { vpre_cell1.set(Some(v)); }
+            }
+        } else {
+            b.wait_lds(0);
+        }
         if !no_bar && !nobar1 {
             b.barrier();
         }
