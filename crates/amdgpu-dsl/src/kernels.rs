@@ -9714,8 +9714,20 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     // mubuf (MUBUF K/V DMA, docs/status.md round 71): FULL tiles go through `buffer_load_dwordx4 ... lds` with ONE descriptor per tensor, a loop-invariant per-lane byte offset (4 VGPR),
     // soffset = key0 * row stride (SALU) and the per-q slot in imm (added to the memory offset AND the LDS destination, compensated in the per-lane offset): no per-DMA VALU address, no row clamp.
     // The PARTIAL last tile keeps the clamped global-load path (the raw-buffer range check ignores soffset and num_records is a constant, so the clamp cannot be a zero-fill).
-    let mubuf = fmha_t_opt("mubuf");
-    let rsrc: Option<ValueId> = if mubuf { Some(b.buffer_rsrc(ptr)) } else { None };
+    // mubufd: NO branch and NO clamp - a runtime-sized descriptor (num_records = base_off + kv_len * row stride, per block): rows past kv_len are zero-filled into LDS by the hardware
+    // (confirmed for the LDS-direct forms on gfx950); the per-lane offset carries the tile offset (4 VALU per tile).
+    let mubufd = fmha_t_opt("mubufd");
+    let mubuf = fmha_t_opt("mubuf") || mubufd;
+    let rsrc: Option<ValueId> = if mubufd {
+        let kvb = b.mul_i32(cx.kv_len, seqs);
+        let nrec0 = b.add_i32(kvb, base_off);
+        let nrec = b.read_first_lane(nrec0);
+        Some(b.buffer_desc_dyn(ptr, nrec))
+    } else if mubuf {
+        Some(b.buffer_rsrc(ptr))
+    } else {
+        None
+    };
     let voffq: Vec<ValueId> = if mubuf {
         (0..4i32)
             .map(|q| {
@@ -9761,6 +9773,20 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     let dma_issue = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId| {
         if no_dma {
+            return;
+        }
+        if mubufd {
+            let c3072m = b.c_i32(-3072);
+            let lbase_b = b.add_i32(lds_tile, buf_off);
+            let m0v0 = b.add_i32(lbase_b, c3072m);
+            let m0v = b.read_first_lane(m0v0);
+            let toff0 = b.mul_i32(key0, seqs);
+            let toff = b.read_first_lane(toff0);
+            let zero_s = b.c_i32(0);
+            for q in 0..4usize {
+                let vo = b.add_i32(voffq[q], toff);
+                b.load_buffer_lds(rsrc.expect("rsrc"), vo, zero_s, m0v, (1024 * q) as u32, 4);
+            }
             return;
         }
         if mubuf {
