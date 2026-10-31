@@ -18,7 +18,13 @@ struct Case {
 }
 
 fn is_special(op: MOp) -> bool {
+    // the MUBUF ops need an S4 descriptor quad: a 128-bit SGPR live-in is not expressible in the oracle's per-block liveins (they are covered by the one-row-per-op
+    // machine-verifier tests and the hardware probes instead)
     matches!(op, MOp::SNop | MOp::SWaitVm | MOp::SWaitLgkm | MOp::SEndpgm | MOp::SBarrier)
+        || matches!(
+            op,
+            MOp::SBufferRsrc | MOp::BufferLoadDwordX1 | MOp::BufferLoadDwordX2 | MOp::BufferLoadDwordX4 | MOp::BufferStoreDwordX1 | MOp::BufferStoreDwordX2 | MOp::BufferStoreDwordX4
+        )
 }
 
 #[test]
