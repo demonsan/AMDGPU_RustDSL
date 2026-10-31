@@ -18670,6 +18670,9 @@ pub fn probe_mfma_unscaled() -> Function {
     b.store_f32(po, 256, f2);
     b.store_f32(po, 512, fr);
     b.store_f32(po, 768, fs);
+    b.finish()
+}
+
 /// MUBUF read/write probe (see tools/buffer_probe.sh): copies through a buffer descriptor (x4 / x2 / x1 loads and stores, 12-bit immediates, SGPR soffset) into
 /// out[0..], the same copies through the FLAT path into out[4096..], then the out-of-range behaviour of a sized descriptor into out[8192..].
 pub fn probe_buffer_rw() -> Function {
