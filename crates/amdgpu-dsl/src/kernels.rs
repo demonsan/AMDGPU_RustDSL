@@ -10258,7 +10258,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         // read once at the start of the iteration and written once here, never read after the write (DSL contract)
             let w_old_u = b.frag2_lane(bias2, 0);
             let w_old = b.bitcast_i32(w_old_u);
-            let mut cut_vals: Option<(ValueId, ValueId)> = None;
+            let mut cut_vals: Option<(ValueId, ValueId, ValueId)> = None;
             let (delta, w_new) = if cut1 {
                 let b_old = b.bitcast_f32(Opnd::Var(bqv.expect("bq")));
                 let c025 = b.c_f32(0.25);
@@ -10270,13 +10270,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h_raw)));
                 let r = b.sub_f32(q, hq);
                 let l_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(r)));
-                let lq = b.let_(Op::CvtF16ToF32(Opnd::Val(l_raw)));
-                let sum_q = b.add_f32(hq, lq);
-                let b_q = b.mul_f32(sum_q, c4f);
-                cut_vals = Some((b_q, b_old));
-                let b_next = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(b_q), b: Opnd::Val(b_old) });
-                let b_next_i = b.bitcast_i32(b_next);
-                b.set_var(bqv.expect("bq"), b_next_i);
+                let _ = c4f;
+                // the quantised sum, the shift delta and the carried reference are only needed when a lane rolls back: computed inside the branch (b_old aliases the loop variable register
+                // until it is written, so the variable is written last)
+                cut_vals = Some((hq, l_raw, b_old));
                 let l_sh = b.shl_i32(l_raw, c16i);
                 let w_q = b.let_(Op::AddI32(Opnd::Val(h_raw), Opnd::Val(l_sh)));
                 let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
@@ -10334,9 +10331,17 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 b.var_mfma_f16_z(ba, ones_f16, nb);
             }
             // the branch is taken when ANY lane rolls back and runs without an exec mask: lanes that do not roll back must see delta = 0
-            let delta = if let Some((bq_, bo_)) = cut_vals {
-                let d_full = b.sub_f32(bq_, bo_);
-                b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(d_full), b: Opnd::Val(zero_f) })
+            let delta = if let Some((hq_, lraw_, bo_)) = cut_vals {
+                let lq_ = b.let_(Op::CvtF16ToF32(Opnd::Val(lraw_)));
+                let sum_q = b.add_f32(hq_, lq_);
+                let c4g = b.c_f32(4.0);
+                let b_q = b.mul_f32(sum_q, c4g);
+                let d_full = b.sub_f32(b_q, bo_);
+                let dsel = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(d_full), b: Opnd::Val(zero_f) });
+                let b_next = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(b_q), b: Opnd::Val(bo_) });
+                let b_next_i = b.bitcast_i32(b_next);
+                b.set_var(bqv.expect("bq"), b_next_i);
+                dsel
             } else {
                 delta
             };
