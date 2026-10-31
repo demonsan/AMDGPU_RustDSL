@@ -21,7 +21,8 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 | 中等形状 | ≥ 厂商：B2H8S2048 1.00x、B1H8S4096 1.07x、B3H3S768 1.11x、B1H16S256 1.16x |
 | 精度 | mean err **8.3e-4**（厂商 1.5–2.9e-3，好 2–3 倍）；15/15 形状、64 行 bad=0 |
 | 确定性 | 5/5 × N；uneven-tile split 形状 **1200/1200 次启动单一 md5** |
-| 测试 | `cargo test` **28 个目标 / 111 项全绿**；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
+| 测试 | `cargo test` **29 个目标 / 115 项全绿**；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
+| Rust 安全 | **四个 crate 全部 `#![forbid(unsafe_code)]`、零第三方依赖、无 FFI/裸指针**；ISA 规则编码进类型系统；见 [`docs/rust-safety.md`](docs/rust-safety.md) |
 | 正确性 | 本会话修复 3 个真实编译器/内核 bug（物理 WAW、两阶段 RA reaching-writer、**VMEM 宽存储数据 WAR**） |
 
 功能：head dim 128，fp8(e4m3) Q/K/V，E8M0 1×32 Q/K 缩放，标量 V 缩放，BF16 输出，在线 softmax，
@@ -78,6 +79,7 @@ docs/                   设计、逐轮状态、厂商 spec、认证与归因（
 | 文档 | 内容 |
 |---|---|
 | [`docs/current-status.md`](docs/current-status.md) | **权威当前快照**（架构、DSL、kernel、数字、已关闭方向、复现命令） |
+| [`docs/rust-safety.md`](docs/rust-safety.md) | **Rust 安全性如何保证**（`#![forbid(unsafe_code)]`、零依赖、类型层 ISA 规则、验证器、panic 策略、安全边界） |
 | [`docs/design.md`](docs/design.md) | Rust DSL 与自研 compiler 设计规格 |
 | [`docs/status.md`](docs/status.md) | 25 轮逐轮实现记录（所有正负结果 + 归因） |
 | [`docs/vendor-spec.md`](docs/vendor-spec.md) | 厂商 kernel 事实 + §7.5–§7.11 认证表与归因 |

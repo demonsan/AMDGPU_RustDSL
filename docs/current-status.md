@@ -15,8 +15,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - 单 kernel 每 CU（64 blocks）：**7.07–7.10 TF/CU**，厂商 8.41 → **1.19x 差距**（本设计下限）
 - 铺满网格（B4H8S2048 / B1H8S8192）：**0.846x / 0.841x 厂商**（结构线已量化关闭）
 - 精度 **mean 8.3e-4**（厂商 1.5–2.9e-3，好 2–3 倍），15/15 形状、64 行 bad=0、确定性全过、1200/1200 次启动单一 md5
-- `cargo test` **111 项 / 28 个测试目标全绿**
-
+- `cargo test` **115 项 / 29 个测试目标全绿**
 ---
 
 ## 2. 编译器流水线
@@ -137,7 +136,7 @@ DMA、LDS 直达、`buffer_load … lds` 等为 own-only（使用它们的 kerne
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **28 个目标 / 111 项全绿**；21 个测试文件（`tail_invariance`、`mir_invariants`、
+- **测试**：`cargo test` **29 个目标 / 115 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
   `register_accounting`、`asm_assembles`、`hazard_classes`、`hazard_oracle`、`phys_waw`、`ra_reaching`、
   `pin_check`、`pinning`、`dead_loads`、`var_lint`、`smfmac_hazards`、`dma_hazards`、`lite_contract` …）
 - **硬件探针**（`tools/`，**29 个脚本**）：`vendor_validate.sh`、`vendor_counters.sh`、`vendor_disasm.sh`、
@@ -162,7 +161,7 @@ DMA、LDS 直达、`buffer_load … lds` 等为 own-only（使用它们的 kerne
 ```bash
 # 构建
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                 # 期望 28 targets / 111 tests 全绿
+bash tools/container/cargo.sh test                 # 期望 29 targets / 115 tests 全绿
 
 # 发射 kernel 并汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_vs128 --out vs128.s
@@ -184,6 +183,7 @@ bash tools/ohat_repro.sh fmha_fwd_hd128_mxfp8_kvsplit          # 300 次启动 m
 | 文档 | 内容 |
 |---|---|
 | `current-status.md` | **本文件：权威当前快照** |
+| `rust-safety.md` | **Rust 安全性如何保证**（全 crate `#![forbid(unsafe_code)]`、零依赖、类型层 ISA 规则、验证器、panic 策略、安全边界） |
 | `llvm-feature-audit.md` | **LLVM AMDGPU CodeGen 测试覆盖审计**（4996 个测试逐一核对 + 可执行验证 + llc 对照） |
 | `design.md` | Rust DSL 与自研编译器设计规格 |
 | `status.md` | 25 轮逐轮实现记录（含所有正负结果与归因） |
