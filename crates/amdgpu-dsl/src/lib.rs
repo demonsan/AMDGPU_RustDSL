@@ -48,6 +48,8 @@ pub enum DType {
     Frag8,
     /// Sixteen-dword opaque fragment (an MFMA 32x32 accumulator).
     Frag16,
+    /// MUBUF buffer resource descriptor: 4 consecutive SGPRs (base, size, flags). Only exists in scalar registers; built by `Op::BufferRsrc`.
+    Rsrc,
 }
 
 impl DType {
@@ -71,6 +73,7 @@ impl DType {
             DType::Frag4 => "frag4",
             DType::Frag8 => "frag8",
             DType::Frag16 => "frag16",
+            DType::Rsrc => "rsrc",
         }
     }
 
@@ -80,6 +83,7 @@ impl DType {
             DType::Frag4 => 4,
             DType::Frag8 => 8,
             DType::Frag16 => 16,
+            DType::Rsrc => 4,
             _ => 1,
         }
     }
@@ -172,6 +176,12 @@ pub enum Op {
     /// Device-scope coherent loads (`sc1`): bypass the non-coherent cache levels, see the other XCDs' write-through stores.
     LoadF32Coherent { base: Opnd, byte_off: u32 },
     LoadB128Coherent { base: Opnd, byte_off: u32 },
+    /// Buffer resource descriptor over the scalar (kernarg) pointer `base`: 4 SGPRs = [base lo, base hi (bits 47:32), num_records, flags]. Bounds checking
+    /// is off with `num_records = 0xFFFF_FFFF`; the descriptor is allocated and reused by the compiler like any other SGPR value.
+    BufferRsrc { base: Opnd, num_records: u32 },
+    /// MUBUF load (`buffer_load_dword[x2|x4]`): address = resource base + `voff` (per-lane byte offset, absent = `off` form) + `soff` (wave-uniform byte
+    /// offset, SGPR or 0) + `imm` (12-bit). `dwords` = 1 (f32), 2 (frag2), 4 (frag4).
+    BufferLoad { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, dwords: u8 },
     /// `global_atomic_add` (device scope, returns the OLD value): every active lane adds `value` at `base + byte_off`.
     AtomicAddU32 { base: Opnd, byte_off: u32, value: Opnd },
     /// Read one dword from workgroup LDS; `addr` is a byte offset.
@@ -279,6 +289,12 @@ impl Op {
             Op::ExpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } | Op::LoadF32Coherent { .. } => DType::F32,
             Op::AtomicAddU32 { .. } => DType::U32,
             Op::LoadB128Coherent { .. } => DType::Frag4,
+            Op::BufferRsrc { .. } => DType::Rsrc,
+            Op::BufferLoad { dwords, .. } => match dwords {
+                1 => DType::F32,
+                2 => DType::Frag2,
+                _ => DType::Frag4,
+            },
             Op::CvtF32ToF16(..) => DType::I32,
             Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => DType::U32,
             Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::CmpLtF32(..) | Op::NotI1(..) => DType::I1,
@@ -379,6 +395,13 @@ impl Op {
             Op::LoadGlobalB128 { base, .. } | Op::LoadF32Coherent { base, .. } | Op::LoadB128Coherent { base, .. } => vec![*base],
         Op::AtomicAddU32 { base, value, .. } => vec![*base, *value],
             Op::LoadLdsB128x2 { lo, hi } => vec![*lo, *hi],
+            Op::BufferRsrc { base, .. } => vec![*base],
+            Op::BufferLoad { rsrc, voff, soff, .. } => {
+                let mut v = vec![*rsrc];
+                v.extend(voff.iter().copied());
+                v.push(*soff);
+                v
+            }
             Op::ReadFirstLane(a) => vec![*a],
         }
     }
@@ -394,6 +417,11 @@ pub enum Stmt {
     StoreF32x4 { base: Opnd, byte_off: u32, value: Opnd },
     /// 8-byte global store of a Frag2 (`global_store_dwordx2`).
     StoreF32x2 { base: Opnd, byte_off: u32, value: Opnd },
+    /// MUBUF store (`buffer_store_dword[x2|x4]`), same addressing as `Op::BufferLoad`; `value` is f32 (1), frag2 (2) or frag4 (4).
+    BufferStore { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, dwords: u8, value: Opnd },
+    /// MUBUF global -> LDS DMA (`buffer_load_dword[x4] ... lds`, the analogue of `LoadGlobalLds`): the LDS destination is `M0 = lds_addr` (wave-uniform,
+    /// first lane's value) + imm + 4*dwords*lane; `dwords` = 1 or 4.
+    BufferLoadLds { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, lds_addr: Opnd, imm: u32, dwords: u8 },
     /// Device-scope write-through stores (`sc1`): visible to coherent loads / atomics of other workgroups on other XCDs.
     StoreF32Wt { base: Opnd, byte_off: u32, value: Opnd },
     StoreF32x4Wt { base: Opnd, byte_off: u32, value: Opnd },
@@ -517,6 +545,12 @@ impl Function {
                 }
                 Stmt::StoreF32x2 { base, byte_off, value } => {
                     let _ = writeln!(s, "{pad}store f32x2 [{base:?}+{byte_off}] <- {value:?}");
+                }
+                Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => {
+                    let _ = writeln!(s, "{pad}buffer_store x{dwords} [{rsrc:?} voff={voff:?} soff={soff:?} +{imm}] <- {value:?}");
+                }
+                Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
+                    let _ = writeln!(s, "{pad}buffer_load_lds x{dwords} [{rsrc:?} voff={voff:?} soff={soff:?} +{imm}] -> lds[{lds_addr:?}]");
                 }
                 Stmt::StoreF32Wt { base, byte_off, value } => {
                     let _ = writeln!(s, "{pad}store.wt f32 [{base:?}+{byte_off}] <- {value:?}");
@@ -683,6 +717,54 @@ impl FnBuilder {
 
     pub fn store_f32(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::StoreF32 { base: base.into(), byte_off, value: value.into() });
+    }
+
+    // ---- MUBUF (buffer_load/buffer_store): SGPR resource descriptor + per-lane 32-bit byte offset + SGPR soffset + 12-bit immediate ----
+    /// Resource descriptor over the kernarg pointer `base` (bounds checking off: num_records = 0xFFFFFFFF). The descriptor lives in 4 SGPRs.
+    pub fn buffer_rsrc(&mut self, base: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::BufferRsrc { base: base.into(), num_records: 0xFFFF_FFFF })
+    }
+    /// Descriptor with an explicit `num_records` (byte range; out-of-range accesses read 0 / are dropped).
+    pub fn buffer_rsrc_sized(&mut self, base: impl Into<Opnd>, num_records: u32) -> ValueId {
+        self.let_(Op::BufferRsrc { base: base.into(), num_records })
+    }
+    pub fn buffer_load_f32(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32) -> ValueId {
+        self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 1 })
+    }
+    pub fn buffer_load_b64(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32) -> ValueId {
+        self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 2 })
+    }
+    pub fn buffer_load_b128(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32) -> ValueId {
+        self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 4 })
+    }
+    /// `off` forms (no per-lane vaddr): every lane reads the same address (resource base + soff + imm).
+    pub fn buffer_load_b128_off(&mut self, rsrc: ValueId, soff: impl Into<Opnd>, imm: u32) -> ValueId {
+        self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: None, soff: soff.into(), imm, dwords: 4 })
+    }
+    pub fn buffer_store_f32(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 1, value: value.into() });
+    }
+    pub fn buffer_store_b64(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 2, value: value.into() });
+    }
+    pub fn buffer_store_b128(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 4, value: value.into() });
+    }
+    /// MUBUF -> LDS DMA of 16 bytes per lane (`buffer_load_dwordx4 ... lds`): LDS destination = M0 (`lds_addr`) + imm + 16 * lane.
+    pub fn buffer_load_lds_b128(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, lds_addr: impl Into<Opnd>, imm: u32) {
+        self.f.stmts.push(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords: 4 });
+    }
+    /// Alias names used by the kernels: descriptor over a kernarg pointer with `num_records` bytes (reads at offset >= num_records return 0, writes are dropped).
+    pub fn buffer_desc(&mut self, ptr: impl Into<Opnd>, num_records_bytes: u32) -> ValueId {
+        self.buffer_rsrc_sized(ptr, num_records_bytes)
+    }
+    /// `buffer_load_dword[x4] ... lds` with the LDS slot base `lds_addr` (M0) and `dwords` = 1 or 4.
+    pub fn load_buffer_lds(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, lds_addr: impl Into<Opnd>, imm: u32, dwords: u8) {
+        self.f.stmts.push(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords });
+    }
+    /// 4 bytes per lane (`buffer_load_dword ... lds`).
+    pub fn buffer_load_lds_b32(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, lds_addr: impl Into<Opnd>, imm: u32) {
+        self.f.stmts.push(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords: 1 });
     }
 
     pub fn store_f32x2(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
@@ -1269,6 +1351,29 @@ fn expect_float(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
     }
 }
 
+/// Shared checks of a MUBUF access: descriptor operand type, integer offsets, 12-bit immediate, supported width.
+fn check_buffer_access(f: &Function, rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, dwords: u8) -> Vec<String> {
+    let mut errs = Vec::new();
+    match opnd_ty(f, rsrc) {
+        Ok(DType::Rsrc) => {}
+        other => errs.push(format!("buffer access: descriptor operand is {other:?}, expected rsrc (use buffer_rsrc)")),
+    }
+    if let Some(v) = voff {
+        if let Err(e) = expect_int(f, v, "buffer voffset") {
+            errs.push(e);
+        }
+    }
+    if let Err(e) = expect_int(f, soff, "buffer soffset") {
+        errs.push(e);
+    }
+    if imm > 4095 {
+        errs.push(format!("buffer immediate offset {imm} does not fit the 12-bit field"));
+    }
+    if !matches!(dwords, 1 | 2 | 4) {
+        errs.push(format!("buffer access of {dwords} dwords is not supported (1, 2 or 4)"));
+    }
+    errs
+}
 fn expect_ptr(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
     let t = opnd_ty(f, o)?;
     if t == DType::Ptr {
@@ -1427,6 +1532,16 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                     Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } | Op::LoadF32Coherent { base, .. } | Op::LoadB128Coherent { base, .. } => {
                         if let Err(e) = expect_ptr(f, *base, "load") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::BufferRsrc { base, .. } => {
+                        if let Err(e) = expect_ptr(f, *base, "buffer descriptor base") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::BufferLoad { rsrc, voff, soff, imm, dwords } => {
+                        for e in check_buffer_access(f, *rsrc, *voff, *soff, *imm, *dwords) {
                             errs.push(here(e));
                         }
                     }
@@ -1671,6 +1786,31 @@ pub fn verify(f: &Function) -> Vec<String> {
             }
             Stmt::StoreF32x4 { base, .. } | Stmt::StoreF32x4Wt { base, .. } | Stmt::StoreF32x2 { base, .. } => {
                 if let Err(e) = expect_ptr(f, *base, "store") {
+                    errs.push(here(e));
+                }
+            }
+            Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => {
+                for e in check_buffer_access(f, *rsrc, *voff, *soff, *imm, *dwords) {
+                    errs.push(here(e));
+                }
+                let want = match dwords {
+                    1 => DType::F32,
+                    2 => DType::Frag2,
+                    _ => DType::Frag4,
+                };
+                match opnd_ty(f, *value) {
+                    Ok(t) if t == want || (*dwords == 1 && t == DType::U32) => {}
+                    other => errs.push(here(format!("buffer_store x{dwords} value is {other:?}, expected {}", want.name()))),
+                }
+            }
+            Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
+                if !matches!(dwords, 1 | 4) {
+                    errs.push(here(format!("buffer_load lds supports 1 or 4 dwords, not {dwords}")));
+                }
+                for e in check_buffer_access(f, *rsrc, *voff, *soff, *imm, *dwords) {
+                    errs.push(here(e));
+                }
+                if let Err(e) = expect_int(f, *lds_addr, "buffer_load lds address") {
                     errs.push(here(e));
                 }
             }
@@ -2016,6 +2156,20 @@ fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => vec![],
         Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } => vec![*addr, *value],
         Stmt::LoadGlobalLds { base, lds_addr, .. } => vec![*base, *lds_addr],
+        Stmt::BufferStore { rsrc, voff, soff, value, .. } => {
+            let mut v = vec![*rsrc];
+            v.extend(voff.iter().copied());
+            v.push(*soff);
+            v.push(*value);
+            v
+        }
+        Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, .. } => {
+            let mut v = vec![*rsrc];
+            v.extend(voff.iter().copied());
+            v.push(*soff);
+            v.push(*lds_addr);
+            v
+        }
         Stmt::SetVar { value, .. } => vec![*value],
         Stmt::VarScaleF32 { scalar, .. } | Stmt::VarScaleLane { scalar, .. } => vec![*scalar],
         Stmt::VarScalePk { pair, .. } | Stmt::VarAddPk { pair, .. } => vec![*pair],

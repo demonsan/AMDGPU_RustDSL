@@ -163,6 +163,25 @@ fn sr(a: &Alloc, r: VReg) -> String {
     format!("s{}", a.phys[r as usize])
 }
 
+fn squad(a: &Alloc, r: VReg) -> String {
+    let b = a.phys[r as usize];
+    format!("s[{b}:{}]", b + 3)
+}
+
+/// MUBUF operand tail: `voffset|off, s[rsrc], soffset` + modifiers.
+fn mubuf_tail(a: &Alloc, rsrc: &Src, voff: &Src, soff: &Src, imm: i64, lds: bool) -> String {
+    let rs = squad(a, reg_of(rsrc));
+    let (vo, offen) = match voff {
+        Src::Reg(v) => (vr(a, *v), " offen"),
+        Src::Imm(_) => ("off".to_string(), ""),
+    };
+    let so = match soff {
+        Src::Reg(s) => sr(a, *s),
+        Src::Imm(i) => format!("{i}"),
+    };
+    format!("{vo}, {rs}, {so}{offen}{}{}", if imm == 0 { String::new() } else { format!(" offset:{imm}") }, if lds { " lds" } else { "" })
+}
+
 fn spair(a: &Alloc, r: VReg) -> String {
     let b = a.phys[r as usize];
     format!("s[{b}:{}]", b + 1)
@@ -526,6 +545,38 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             tuple(a, inst.dst.expect("dst"), 4),
             mem_op(a, inst.srcs[0], inst.imm)
         )],
+        MOp::BufferLoadDwordX1 | MOp::BufferLoadDwordX2 | MOp::BufferLoadDwordX4 => {
+            let (mn, dst) = match inst.op {
+                MOp::BufferLoadDwordX1 => ("buffer_load_dword", vr(a, inst.dst.unwrap())),
+                MOp::BufferLoadDwordX2 => ("buffer_load_dwordx2", pair(a, inst.dst.unwrap())),
+                _ => ("buffer_load_dwordx4", tuple(a, inst.dst.unwrap(), 4)),
+            };
+            vec![format!("{mn} {dst}, {}", mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))]
+        }
+        MOp::BufferStoreDwordX1 | MOp::BufferStoreDwordX2 | MOp::BufferStoreDwordX4 => {
+            let r = reg_of(&inst.srcs[0]);
+            let (mn, data) = match inst.op {
+                MOp::BufferStoreDwordX1 => ("buffer_store_dword", vr(a, r)),
+                MOp::BufferStoreDwordX2 => ("buffer_store_dwordx2", pair(a, r)),
+                _ => ("buffer_store_dwordx4", tuple(a, r, 4)),
+            };
+            vec![format!("{mn} {data}, {}", mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))]
+        }
+        MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds => {
+            let m0 = sr(a, reg_of(&inst.srcs[3]));
+            let mn = if inst.op == MOp::BufferLoadDwordX4Lds { "buffer_load_dwordx4" } else { "buffer_load_dword" };
+            vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), format!("{mn} {}", mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, true))]
+        }
+        MOp::SBufferRsrc => {
+            let d = a.phys[inst.dst.unwrap() as usize];
+            let b = a.phys[reg_of(&inst.srcs[0]) as usize];
+            vec![
+                format!("s_mov_b32 s{d}, s{b}"),
+                format!("s_and_b32 s{}, s{}, 0xffff", d + 1, b + 1),
+                format!("s_mov_b32 s{}, {}", d + 2, inst.imm as u32),
+                format!("s_mov_b32 s{}, 0x00020000", d + 3),
+            ]
+        }
         MOp::GlobalLoadLdsB128S | MOp::GlobalLoadLdsB32S => {
             let m0 = sr(a, reg_of(&inst.srcs[2]));
             let mn = if inst.op == MOp::GlobalLoadLdsB128S { "global_load_lds_dwordx4" } else { "global_load_lds_dword" };

@@ -76,6 +76,7 @@ fn parse_class(s: &str) -> Result<SigClass, String> {
         "V16" => SigClass::Reg(RClass::V16),
         "S1" => SigClass::Reg(RClass::S1),
         "S2" => SigClass::Reg(RClass::S2),
+        "S4" => SigClass::Reg(RClass::S4),
         "I" => SigClass::Imm,
         _ => return Err(format!("unknown signature class '{s}'")),
     })

@@ -18670,6 +18670,135 @@ pub fn probe_mfma_unscaled() -> Function {
     b.store_f32(po, 256, f2);
     b.store_f32(po, 512, fr);
     b.store_f32(po, 768, fs);
+/// MUBUF read/write probe (see tools/buffer_probe.sh): copies through a buffer descriptor (x4 / x2 / x1 loads and stores, 12-bit immediates, SGPR soffset) into
+/// out[0..], the same copies through the FLAT path into out[4096..], then the out-of-range behaviour of a sized descriptor into out[8192..].
+pub fn probe_buffer_rw() -> Function {
+    let mut b = FnBuilder::new("probe_buffer_rw", 64);
+    b.arg("inp", DType::Ptr, 0, 8);
+    b.arg("outp", DType::Ptr, 8, 8);
+    b.arg("soff", DType::I32, 16, 4);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let outp = b.let_(Op::KernargPtr { offset: 8 });
+    let s_off = b.let_(Op::KernargI32 { offset: 16 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let c8 = b.c_i32(8);
+    let c16 = b.c_i32(16);
+    let c0 = b.c_i32(0);
+    let o4 = b.mul_i32(tid, c4);
+    let o8 = b.mul_i32(tid, c8);
+    let o16 = b.mul_i32(tid, c16);
+    let rin = b.buffer_rsrc(inp);
+    let rout = b.buffer_rsrc(outp);
+    // --- MUBUF path
+    let v4 = b.buffer_load_b128(rin, o16, c0, 0);
+    b.buffer_store_b128(rout, o16, c0, 0, v4); // out[0..1024)
+    let v2 = b.buffer_load_b64(rin, o8, c0, 1024);
+    b.buffer_store_b64(rout, o8, c0, 1024, v2); // out[1024..1536)  <- in[1024..1536)
+    let v1 = b.buffer_load_f32(rin, o4, c0, 2048);
+    b.buffer_store_f32(rout, o4, c0, 1536, v1); // out[1536..1792)  <- in[2048..2304)
+    let v1s = b.buffer_load_f32(rin, o4, s_off, 0); // soffset (SGPR) = 3072
+    b.buffer_store_f32(rout, o4, c0, 2048, v1s); // out[2048..2304) <- in[3072..3328)
+    // --- FLAT path, same data, 4096 bytes further
+    let c4096f = b.c_i32(4096);
+    let outf = b.ptr_add(outp, c4096f);
+    let pin16 = b.ptr_add(inp, o16);
+    let pout16 = b.ptr_add(outf, o16);
+    let f4 = b.load_b128(pin16, 0);
+    b.store_f32x4(pout16, 0, f4);
+    let pin8 = b.ptr_add(inp, o8);
+    let pout8 = b.ptr_add(outf, o8);
+    let g2 = b.load_f32(pin8, 1024);
+    let g2b = b.load_f32(pin8, 1028);
+    b.store_f32(pout8, 1024, g2);
+    b.store_f32(pout8, 1028, g2b);
+    let pin4 = b.ptr_add(inp, o4);
+    let pout4 = b.ptr_add(outf, o4);
+    let g1 = b.load_f32(pin4, 2048);
+    b.store_f32(pout4, 1536, g1);
+    let g1s = b.add_i32(o4, s_off);
+    let pins = b.ptr_add(inp, g1s);
+    let g1v = b.load_f32(pins, 0);
+    b.store_f32(pout4, 2048, g1v);
+    // --- out-of-range: a descriptor of 512 bytes (lanes >= 32 read offset >= num_records: zero; their stores are dropped)
+    let rin_s = b.buffer_desc(inp, 512);
+    let z4 = b.buffer_load_b128(rin_s, o16, c0, 0);
+    let c8192 = b.c_i32(8192);
+    let o16c = b.add_i32(o16, c8192);
+    b.buffer_store_b128(rout, o16c, c0, 0, z4); // out[8192..9216): lanes 32..63 must be ZERO
+    let rout_s = b.buffer_desc(outp, 9216 + 512);
+    let c9216 = b.c_i32(9216);
+    let o16b = b.add_i32(o16, c9216);
+    b.buffer_store_b128(rout_s, o16b, c0, 0, v4); // out[9216..10240): lanes 32..63 (offset >= 9728) DROPPED, sentinel must survive
+    b.finish()
+}
+
+/// MUBUF -> LDS DMA probe: `buffer_load_dwordx4 ... lds` / `buffer_load_dword ... lds` (M0 slot base + imm + lane*size, SGPR soffset) vs the FLAT `global_load_lds`
+/// equivalents; the staged LDS contents are copied out and compared by the host.
+pub fn probe_buffer_lds() -> Function {
+    let mut b = FnBuilder::new("probe_buffer_lds", 64);
+    b.lds(8192);
+    b.arg("inp", DType::Ptr, 0, 8);
+    b.arg("outp", DType::Ptr, 8, 8);
+    b.arg("soff", DType::I32, 16, 4);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let outp = b.let_(Op::KernargPtr { offset: 8 });
+    let s_off = b.let_(Op::KernargI32 { offset: 16 });
+    let tid = b.let_(Op::WorkitemId);
+    let c0 = b.c_i32(0);
+    let c4 = b.c_i32(4);
+    let c16 = b.c_i32(16);
+    let o4 = b.mul_i32(tid, c4);
+    let o16 = b.mul_i32(tid, c16);
+    let rin = b.buffer_rsrc(inp);
+    // MUBUF: slot 0 <- in[0..1024), slot 1024 <- in[soff..] (soffset 2048), dword form slot 2048 <- in[0..256), imm form: slot (0 + imm 3072)
+    b.load_buffer_lds(rin, o16, c0, c0, 0, 4);
+    let c1024 = b.c_i32(1024);
+    b.load_buffer_lds(rin, o16, s_off, c1024, 0, 4);
+    let c2048 = b.c_i32(2048);
+    b.load_buffer_lds(rin, o4, c0, c2048, 0, 1);
+    b.load_buffer_lds(rin, o16, c0, c0, 3072, 4); // M0 = 0, imm 3072: LDS dest 3072 + 16*lane, memory offset 3072 + voff
+    // FLAT global_load_lds equivalents into the upper half
+    let pin16 = b.ptr_add(inp, o16);
+    let c4096 = b.c_i32(4096);
+    b.load_global_lds(pin16, c4096, 0, 4);
+    let c5120 = b.c_i32(5120);
+    let g_s = b.add_i32(o16, s_off);
+    let pin_s = b.ptr_add(inp, g_s);
+    b.load_global_lds(pin_s, c5120, 0, 4);
+    let pin4 = b.ptr_add(inp, o4);
+    let c6144 = b.c_i32(6144);
+    b.load_global_lds(pin4, c6144, 0, 1);
+    // global_load_lds adds the instruction offset to BOTH the memory address and the LDS destination (like the MUBUF form): 4096 + 3072 = 7168
+    b.load_global_lds(pin16, c4096, 3072, 4);
+    b.wait_vm(0);
+    b.barrier();
+    // copy the staged slots out: out[0..4096) = LDS[0..4096) ordered 16 B/lane, flat copies after it
+    let pout16 = b.ptr_add(outp, o16);
+    let c4096o = b.c_i32(4096);
+    let outf = b.ptr_add(outp, c4096o);
+    let pout16f = b.ptr_add(outf, o16);
+    for (k, base) in [0i32, 1024, 3072, 4096, 5120, 7168].into_iter().enumerate() {
+        let ca = b.c_i32(base);
+        let a = b.add_i32(o16, ca);
+        let v = b.load_lds_b128(a);
+        if k < 4 {
+            b.store_f32x4(pout16, (k * 1024) as u32, v);
+        } else {
+            b.store_f32x4(pout16f, ((k - 4) * 1024) as u32, v);
+        }
+    }
+    let pout4 = b.ptr_add(outf, o4);
+    let ca = b.c_i32(2048);
+    let a = b.add_i32(o4, ca);
+    let v = b.load_lds_b32(a);
+    let vf = b.bitcast_f32(v);
+    b.store_f32(pout4, 2048, vf);
+    let cb = b.c_i32(6144);
+    let a2 = b.add_i32(o4, cb);
+    let v2 = b.load_lds_b32(a2);
+    let vf2 = b.bitcast_f32(v2);
+    b.store_f32(pout4, 2304, vf2);
     b.finish()
 }
 

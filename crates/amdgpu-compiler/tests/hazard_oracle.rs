@@ -18,7 +18,13 @@ struct Case {
 }
 
 fn is_special(op: MOp) -> bool {
+    // the MUBUF ops need an S4 descriptor quad: a 128-bit SGPR live-in is not expressible in the oracle's per-block liveins (they are covered by the one-row-per-op
+    // machine-verifier tests and the hardware probes instead)
     matches!(op, MOp::SNop | MOp::SWaitVm | MOp::SWaitLgkm | MOp::SEndpgm | MOp::SBarrier)
+        || matches!(
+            op,
+            MOp::SBufferRsrc | MOp::BufferLoadDwordX1 | MOp::BufferLoadDwordX2 | MOp::BufferLoadDwordX4 | MOp::BufferStoreDwordX1 | MOp::BufferStoreDwordX2 | MOp::BufferStoreDwordX4
+        )
 }
 
 #[test]
@@ -104,6 +110,11 @@ fn hazard_matrix() {
     let mir = llvm_mir::export_with(&m, &a, true).expect("export").mir;
     let mut tail = LlvmTail::new();
     tail.skip_lock = true;
+    if let Ok(p) = std::env::var("AMDC_ORACLE_OUT") {
+        if !p.is_empty() {
+            let _ = std::fs::write(format!("{p}.mir"), &mir); // written BEFORE llc so a failing llc can be reproduced by hand
+        }
+    }
     let asm = tail.run_llc("oracle", &mir, "gcn-create-vopd").expect("llc");
     if let Ok(p) = std::env::var("AMDC_ORACLE_OUT") {
         if !p.is_empty() {

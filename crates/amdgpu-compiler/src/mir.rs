@@ -18,13 +18,15 @@ pub enum RClass {
     V16,
     S1,
     S2,
+    /// Four consecutive SGPRs (a MUBUF buffer resource descriptor), 4-aligned.
+    S4,
 }
 
 impl RClass {
     pub fn dwords(self) -> u32 {
         match self {
             RClass::V2 | RClass::S2 => 2,
-            RClass::V4 => 4,
+            RClass::V4 | RClass::S4 => 4,
             RClass::V8 => 8,
             RClass::V16 => 16,
             _ => 1,
@@ -144,6 +146,18 @@ pub enum MOp {
     /// scalar-base (SADDR) forms: srcs = [saddr pair, 32-bit vector offset, M0 source]
     GlobalLoadLdsB128S,
     GlobalLoadLdsB32S,
+    // ---- MUBUF (buffer) memory ops. Loads: srcs = [rsrc (S4), voffset (V1 reg, or Imm = the `off` form), soffset (S1 reg or Imm)], imm = 12-bit offset.
+    // Stores: srcs = [data, rsrc, voffset, soffset]. LDS DMA forms: srcs = [rsrc, voffset, soffset, M0 source (S1)] (data lands in LDS, no VGPR destination).
+    BufferLoadDwordX1,
+    BufferLoadDwordX2,
+    BufferLoadDwordX4,
+    BufferStoreDwordX1,
+    BufferStoreDwordX2,
+    BufferStoreDwordX4,
+    BufferLoadDwordX4Lds,
+    BufferLoadDwordX1Lds,
+    /// Buffer resource descriptor: dst S4 <- base pointer (S2); imm = num_records. dword0 = base lo, dword1 = base hi & 0xffff, dword2 = num_records, dword3 = flags.
+    SBufferRsrc,
     GlobalStoreU16,
     GlobalStoreF32,
     GlobalStoreF32x4,
@@ -371,6 +385,34 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                         if m.vreg_class(*a) != RClass::V2 {
                             errs.push(format!("block {bi} inst {ii}: store base must be V2"));
                         }
+                    }
+                }
+                MOp::BufferLoadDwordX1 | MOp::BufferLoadDwordX2 | MOp::BufferLoadDwordX4 | MOp::BufferStoreDwordX1 | MOp::BufferStoreDwordX2 | MOp::BufferStoreDwordX4 | MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds => {
+                    let ri = match inst.op {
+                        MOp::BufferStoreDwordX1 | MOp::BufferStoreDwordX2 | MOp::BufferStoreDwordX4 => 1,
+                        _ => 0,
+                    };
+                    match inst.srcs.get(ri) {
+                        Some(Src::Reg(r)) if m.vreg_class(*r) == RClass::S4 => {}
+                        _ => errs.push(format!("block {bi} inst {ii}: buffer access needs an S4 resource descriptor as source {ri}")),
+                    }
+                    if inst.imm < 0 || inst.imm > 4095 {
+                        errs.push(format!("block {bi} inst {ii}: buffer immediate offset {} does not fit 12 bits", inst.imm));
+                    }
+                    if let Some(Src::Reg(v)) = inst.srcs.get(ri + 1) {
+                        if m.vreg_class(*v) != RClass::V1 {
+                            errs.push(format!("block {bi} inst {ii}: buffer voffset must be V1"));
+                        }
+                    }
+                    if let Some(Src::Reg(s)) = inst.srcs.get(ri + 2) {
+                        if m.vreg_class(*s) != RClass::S1 {
+                            errs.push(format!("block {bi} inst {ii}: buffer soffset must be S1"));
+                        }
+                    }
+                }
+                MOp::SBufferRsrc => {
+                    if inst.dst.map_or(true, |d| m.vreg_class(d) != RClass::S4) || !matches!(inst.srcs.first(), Some(Src::Reg(b)) if m.vreg_class(*b) == RClass::S2) {
+                        errs.push(format!("block {bi} inst {ii}: s_buffer_rsrc builds an S4 from an S2 base"));
                     }
                 }
                 MOp::SLoadDwordx2 => {

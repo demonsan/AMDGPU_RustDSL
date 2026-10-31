@@ -208,6 +208,18 @@ fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
         MOp::GlobalLoadB128 => {
             e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 16 })
         }
+        // MUBUF: the per-lane address is not an affine function of one base register, so the access is modelled with an unknown base (always may-alias)
+        MOp::BufferLoadDwordX1 => e.mem = Some(MemAccess { space: Space::Global, write: false, base: None, off: inst.imm, size: 4 }),
+        MOp::BufferLoadDwordX2 => e.mem = Some(MemAccess { space: Space::Global, write: false, base: None, off: inst.imm, size: 8 }),
+        MOp::BufferLoadDwordX4 => e.mem = Some(MemAccess { space: Space::Global, write: false, base: None, off: inst.imm, size: 16 }),
+        MOp::BufferStoreDwordX1 => e.mem = Some(MemAccess { space: Space::Global, write: true, base: None, off: inst.imm, size: 4 }),
+        MOp::BufferStoreDwordX2 => e.mem = Some(MemAccess { space: Space::Global, write: true, base: None, off: inst.imm, size: 8 }),
+        MOp::BufferStoreDwordX4 => e.mem = Some(MemAccess { space: Space::Global, write: true, base: None, off: inst.imm, size: 16 }),
+        MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds => {
+            // reads global memory and writes LDS through M0 (no VGPR destination): same model as the global_load_lds DMA
+            e.mem = Some(MemAccess { space: Space::Global, write: false, base: None, off: inst.imm, size: 16 });
+            e.fence = Fence::Barrier;
+        }
         MOp::GlobalLoadLdsB128S | MOp::GlobalLoadLdsB32S => {
             e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(1), off: inst.imm, size: 16 });
             e.fence = Fence::Barrier;
