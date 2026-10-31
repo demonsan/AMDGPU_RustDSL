@@ -10650,7 +10650,29 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let fused = kv.counters.is_some();
         let fwt = fused && !ablate.contains("fnowt"); // fnowt (diagnostic): plain stores
         if fwt { b.store_f32_wt(l_ptr, 0, lse_v); } else { b.store_f32(l_ptr, 0, lse_v); }
-        if p16 && !ablate.contains("nopartial") {
+        if p16 && fmha_t_opt("epdirect") {
+            // diagnostic D1: no LDS transpose scratch - every lane stores its own 4 fp16 (8 bytes) per (round, fragment, quarter) straight to its (clamped) partial row
+            for pr in 0..2usize {
+                for ec in 0..2usize {
+                    let e = 2 * pr + ec;
+                    for q in 0..4usize {
+                        let mut hv: Vec<ValueId> = Vec::with_capacity(4);
+                        for k in 0..4usize {
+                            let lane = b.frag16_lane(o_vars[e], (4 * q + k) as u8);
+                            let lanev = b.bitcast_f32(lane);
+                            let v0 = b.mul_f32(lanev, fin);
+                            hv.push(b.let_(Op::CvtF32ToF16(Opnd::Val(v0))));
+                        }
+                        let s0 = b.shl_i32(hv[1], c16i);
+                        let s1 = b.shl_i32(hv[3], c16i);
+                        let w0 = b.let_(Op::AddI32(Opnd::Val(hv[0]), Opnd::Val(s0)));
+                        let w1 = b.let_(Op::AddI32(Opnd::Val(hv[2]), Opnd::Val(s1)));
+                        let f2 = b.frag2(w0, w1);
+                        b.store_f32x2(o_ptr0, (128 * pr + 64 * ec + 16 * q) as u32, f2);
+                    }
+                }
+            }
+        } else if p16 && !ablate.contains("nopartial") {
             // fp16 partials through the same LDS transpose as the fp32 path, two fragments (64 dims = 128 bytes per row) per round
             let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
             let c4096e = b.c_i32(4096);
