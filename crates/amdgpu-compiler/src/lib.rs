@@ -74,6 +74,12 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         if f.name.ends_with("_t128") {
             v.push("addrfold");
         }
+        if std::env::var("FMHA_OPT").map_or(false, |x| x.split(|c: char| c == ',' || c == ' ').any(|t| t == "saddrlds")) {
+            v.push("saddrlds");
+        }
+        if std::env::var("FMHA_OPT").map_or(false, |x| x.split(|c: char| c == ',' || c == ' ').any(|t| t == "pmdead")) {
+            v.push("pmdead");
+        }
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
     } else if f.name.starts_with("fmha_fwd_hd128_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
@@ -184,7 +190,7 @@ pub fn export_mir(f: &amdgpu_dsl::Function, tail: &backend::LlvmTail) -> Result<
 /// Does the kernel contain own-backend-only MOps (the LDS-DMA loads)? The LLVM tail cannot express them.
 pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
     match lower::lower_with_extra(f, &[]) {
-        Ok(m) => m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, mir::MOp::GlobalLoadLdsB128 | mir::MOp::GlobalLoadLdsB32) || (!llvm_tail_has_rows() && matches!(i.op, mir::MOp::BufferWbl2 | mir::MOp::BufferInv | mir::MOp::GlobalAtomicAddRet)))),
+        Ok(m) => m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, mir::MOp::GlobalLoadLdsB128 | mir::MOp::GlobalLoadLdsB32 | mir::MOp::GlobalLoadLdsB128S | mir::MOp::GlobalLoadLdsB32S) || (!llvm_tail_has_rows() && matches!(i.op, mir::MOp::BufferWbl2 | mir::MOp::BufferInv | mir::MOp::GlobalAtomicAddRet)))),
         Err(_) => false,
     }
 }

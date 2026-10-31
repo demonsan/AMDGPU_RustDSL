@@ -138,6 +138,9 @@ pub enum MOp {
     /// Global -> LDS DMA (M0 = LDS base from srcs[1], an S1 register): srcs: ptr (V2), lds base (S1); imm = byte offset.
     GlobalLoadLdsB128,
     GlobalLoadLdsB32,
+    /// scalar-base (SADDR) forms: srcs = [saddr pair, 32-bit vector offset, M0 source]
+    GlobalLoadLdsB128S,
+    GlobalLoadLdsB32S,
     GlobalStoreU16,
     GlobalStoreF32,
     GlobalStoreF32x4,

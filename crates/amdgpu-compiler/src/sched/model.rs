@@ -114,7 +114,7 @@ pub fn cost(op: MOp) -> OpCost {
         GlobalStoreF32Sc1 | GlobalStoreF32x4Sc1 => c(Vmem, 8, 4, Unknown),
         GlobalAtomicAddRet => c(Vmem, 8, 900, Unknown),
         BufferWbl2 | BufferInv => c(Ctrl, 4, 4, Unknown),
-        GlobalLoadLdsB128 | GlobalLoadLdsB32 => c(Vmem, 14, 240, Unknown),
+        GlobalLoadLdsB128 | GlobalLoadLdsB32 | GlobalLoadLdsB128S | GlobalLoadLdsB32S => c(Vmem, 14, 240, Unknown),
         GlobalStoreU16 | GlobalStoreF32 | GlobalStoreF32x4 | GlobalStoreF32x2 => c(Vmem, 8, 4, Unknown),
         SLoadDword | SLoadDwordx2 => c(Smem, 4, 200, Unknown),
         SReadPhys | SMovB32 | SAddU32 | SAddcU32 | SMulI32 | SShlB32 | SLshrB32 | SAndB32 | SXorB32 | SCmpLtI32 => c(Salu, 4, 4, Verified),
