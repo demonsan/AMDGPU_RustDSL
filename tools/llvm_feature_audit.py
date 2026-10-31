@@ -79,6 +79,23 @@ def cls_of_cpu(cpu):
 
 GFX950_CLASS = ("gfx950", "gfx94x")
 
+
+def effective_cpu(mcpu, triple):
+    """-mcpu if given, else the cpu encoded in a versioned triple (amdgpu9.42 = gfx942, amdgpu10.30 = gfx1030, amdgpu6.00 = gfx600, amdgpu9.0a = gfx90a)."""
+    if mcpu:
+        return mcpu
+    m = re.match(r"amdgpu(\d+)\.([0-9a-f]+)", (triple or "").lower())
+    if m:
+        return "gfx" + m.group(1) + m.group(2)
+    return ""
+
+
+def class_of_run(mcpu, triple):
+    tr = triple or ""
+    if tr.startswith("r600"):
+        return "r600"
+    return cls_of_cpu(effective_cpu(mcpu, triple))
+
 # --------------------------------------------------------------------------------------------------------------------------------------------
 # RUN lines
 RUN_RE = re.compile(r"^\s*[;#]\s*RUN:\s?(.*)$")
@@ -298,13 +315,10 @@ def analyse(path, rel):
     mcpus, classes, triples, mattrs = [], [], [], []
     for r in runs:
         if r["kind"] in ("codegen", "mir-pass", "assembler", "pass"):
-            c = r["mcpu"] or ""
+            c = effective_cpu(r["mcpu"], r["triple"])
             tr = (r["triple"] or "")
-            if tr.startswith("r600"):
-                cl = "r600"
-            else:
-                cl = cls_of_cpu(c)
-            mcpus.append(c or "(default)")
+            cl = class_of_run(r["mcpu"], r["triple"])
+            mcpus.append(c or "(default amdgcn = SI generic)")
             classes.append(cl)
             triples.append(tr)
             mattrs += r["mattr"]
@@ -329,8 +343,7 @@ def analyse(path, rel):
     for r in runs:
         if r["kind"] not in ("codegen", "mir-pass"):
             continue
-        tr = r["triple"] or ""
-        cl = "r600" if tr.startswith("r600") else cls_of_cpu(r["mcpu"])
+        cl = class_of_run(r["mcpu"], r["triple"])
         for p in r["prefixes"]:
             pf_class[p].add(cl)
     asm_by_class = collections.defaultdict(set)
