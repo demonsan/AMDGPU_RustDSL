@@ -130,3 +130,30 @@ T_Endpgm    | <- | S_ENDPGM 0
 X_Marker    | <- | S_SETPRIO {imm}
 X_Sep       | <- | S_NOP 15
 X_Drain     | <- | S_WAITCNT 0
+
+# ---- MUBUF (buffer) memory ops: srcs [rsrc S4, voffset (V1 = OFFEN, I = the OFFSET form), soffset (S1 or I)]; stores [data, rsrc, voffset, soffset]. The LDS-DMA forms are own-only (like global_load_lds).
+SBufferRsrc | S4 <- S2 | {d.0} = S_MOV_B32 {s0.0} ;; {d.1} = S_AND_B32 {s0.1}, 65535, implicit-def dead $scc ;; {d.2} = S_MOV_B32 {imm32} ;; {d.3} = S_MOV_B32 131072
+BufferLoadDwordX1:rrr | V1 <- S4 V1 S1 | {d} = BUFFER_LOAD_DWORD_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s32), addrspace 8)
+BufferLoadDwordX1:rri | V1 <- S4 V1 I | {d} = BUFFER_LOAD_DWORD_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s32), addrspace 8)
+BufferLoadDwordX1:rir | V1 <- S4 I S1 | {d} = BUFFER_LOAD_DWORD_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s32), addrspace 8)
+BufferLoadDwordX1:rii | V1 <- S4 I I | {d} = BUFFER_LOAD_DWORD_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s32), addrspace 8)
+BufferLoadDwordX2:rrr | V2 <- S4 V1 S1 | {d} = BUFFER_LOAD_DWORDX2_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s64), addrspace 8)
+BufferLoadDwordX2:rri | V2 <- S4 V1 I | {d} = BUFFER_LOAD_DWORDX2_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s64), addrspace 8)
+BufferLoadDwordX2:rir | V2 <- S4 I S1 | {d} = BUFFER_LOAD_DWORDX2_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s64), addrspace 8)
+BufferLoadDwordX2:rii | V2 <- S4 I I | {d} = BUFFER_LOAD_DWORDX2_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s64), addrspace 8)
+BufferLoadDwordX4:rrr | V4 <- S4 V1 S1 | {d} = BUFFER_LOAD_DWORDX4_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s128), addrspace 8)
+BufferLoadDwordX4:rri | V4 <- S4 V1 I | {d} = BUFFER_LOAD_DWORDX4_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s128), addrspace 8)
+BufferLoadDwordX4:rir | V4 <- S4 I S1 | {d} = BUFFER_LOAD_DWORDX4_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s128), addrspace 8)
+BufferLoadDwordX4:rii | V4 <- S4 I I | {d} = BUFFER_LOAD_DWORDX4_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s128), addrspace 8)
+BufferStoreDwordX1:rrrr | <- V1 S4 V1 S1 | BUFFER_STORE_DWORD_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s32), addrspace 8)
+BufferStoreDwordX1:rrri | <- V1 S4 V1 I | BUFFER_STORE_DWORD_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s32), addrspace 8)
+BufferStoreDwordX1:rrir | <- V1 S4 I S1 | BUFFER_STORE_DWORD_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s32), addrspace 8)
+BufferStoreDwordX1:rrii | <- V1 S4 I I | BUFFER_STORE_DWORD_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s32), addrspace 8)
+BufferStoreDwordX2:rrrr | <- V2 S4 V1 S1 | BUFFER_STORE_DWORDX2_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s64), addrspace 8)
+BufferStoreDwordX2:rrri | <- V2 S4 V1 I | BUFFER_STORE_DWORDX2_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s64), addrspace 8)
+BufferStoreDwordX2:rrir | <- V2 S4 I S1 | BUFFER_STORE_DWORDX2_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s64), addrspace 8)
+BufferStoreDwordX2:rrii | <- V2 S4 I I | BUFFER_STORE_DWORDX2_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s64), addrspace 8)
+BufferStoreDwordX4:rrrr | <- V4 S4 V1 S1 | BUFFER_STORE_DWORDX4_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s128), addrspace 8)
+BufferStoreDwordX4:rrri | <- V4 S4 V1 I | BUFFER_STORE_DWORDX4_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s128), addrspace 8)
+BufferStoreDwordX4:rrir | <- V4 S4 I S1 | BUFFER_STORE_DWORDX4_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s128), addrspace 8)
+BufferStoreDwordX4:rrii | <- V4 S4 I I | BUFFER_STORE_DWORDX4_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s128), addrspace 8)
