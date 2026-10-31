@@ -12027,6 +12027,11 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.var_asm_n(&[s_vars[0], s_vars[1], s_vars[2], s_vars[3], o_vars[0], o_vars[1], o_vars[2], o_vars[3], la], pv_qk_window_block(), &ins);
         } else {
             pv_w(b, slot_cur, &w);
+            // fencepv: pin the vendor M order - PV (including the preloaded O0 MFMAs and row-sum SMFMACs)
+            // before any QK/bias work. s_setprio is a full scheduling fence in our order model.
+            if fmha_t_opt("fencepv") && !noprio {
+                b.set_prio(1);
+            }
             if stage && fmha_t_opt("midbar") && !no_bar {
                 // midbar: a third barrier per tile between PV and QK (finer phase granularity: the partner group may start its VALU earlier)
                 b.wait_lds(0);
