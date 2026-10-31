@@ -9773,6 +9773,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let m0v = b.read_first_lane(m0v0);
             let soff0 = b.mul_i32(key0, seqs);
             let soff = b.read_first_lane(soff0);
+            if fmha_t_opt("mubufnb") {
+                // diagnostic upper bound: no full/partial branch (WRONG for kv_len not a multiple of 128)
+                for q in 0..4usize {
+                    b.load_buffer_lds(rsrc.expect("rsrc"), voffq[q], soff, m0v, (1024 * q) as u32, 4);
+                }
+                return;
+            }
             b.begin_if(Opnd::Val(full));
             for q in 0..4usize {
                 b.load_buffer_lds(rsrc.expect("rsrc"), voffq[q], soff, m0v, (1024 * q) as u32, 4);
