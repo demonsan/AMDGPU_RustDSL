@@ -115,7 +115,9 @@ pub fn cost(op: MOp) -> OpCost {
         GlobalAtomicAddRet => c(Vmem, 8, 900, Unknown),
         BufferWbl2 | BufferInv => c(Ctrl, 4, 4, Unknown),
         GlobalLoadLdsB128 | GlobalLoadLdsB32 | GlobalLoadLdsB128S | GlobalLoadLdsB32S => c(Vmem, 14, 240, Unknown),
-        GlobalStoreU16 | GlobalStoreF32 | GlobalStoreF32x4 | GlobalStoreF32x2 => c(Vmem, 8, 4, Unknown),
+        GlobalStoreU16 | GlobalStoreF32 | GlobalStoreF32x4 | GlobalStoreF32x2 | BufferStoreDwordX1 | BufferStoreDwordX2 | BufferStoreDwordX4 => c(Vmem, 8, 4, Unknown),
+        BufferLoadDwordX4Lds | BufferLoadDwordX1Lds => c(Vmem, 14, 240, Unknown),
+        SBufferRsrc => c(Salu, 4, 4, Unknown),
         SLoadDword | SLoadDwordx2 => c(Smem, 4, 200, Unknown),
         SReadPhys | SMovB32 | SAddU32 | SAddcU32 | SMulI32 | SShlB32 | SLshrB32 | SAndB32 | SXorB32 | SCmpLtI32 => c(Salu, 4, 4, Verified),
         SBarrier | SSetPrio | SNop | SWaitVm | SWaitLgkm | SEndpgm => c(Ctrl, 4, 4, Verified),    }
