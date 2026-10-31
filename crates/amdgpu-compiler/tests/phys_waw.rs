@@ -120,3 +120,18 @@ fn the_store_data_hazard_does_not_touch_unrelated_registers_lds_reads_or_narrow_
     pad_physical_war(&mut m, &alloc(vec![2, 4, 4, 4, 40]));
     assert_eq!(gap(&m, 0, MOp::GlobalStoreF32x2, MOp::VMovB32), 0);
 }
+#[test]
+fn buffer_store_dwordx4_data_gets_the_same_two_wait_states() {
+    // vregs: 0 = V4 store data (v4..v7), 1 = S4 descriptor, 2 = V1 offset, 3 = V1 temp reusing v4
+    let classes = vec![RClass::V4, RClass::S4, RClass::V1, RClass::V1];
+    let st = MInst::new(MOp::BufferStoreDwordX4).srcreg(0).srcreg(1).srcreg(2).src(amdgpu_compiler::mir::Src::Imm(0)).imm(0);
+    let wr = MInst::new(MOp::VMovB32).def(3).imm(1);
+    let mut m = func(vec![vec![st.clone(), MInst::new(MOp::SWaitLgkm).imm(0), wr.clone()]], classes.clone());
+    pad_physical_war(&mut m, &alloc(vec![4, 8, 20, 4]));
+    assert!(gap(&m, 0, MOp::BufferStoreDwordX4, MOp::VMovB32) >= 2, "gap {}", gap(&m, 0, MOp::BufferStoreDwordX4, MOp::VMovB32));
+    // a narrow buffer store has no such hazard
+    let narrow = MInst::new(MOp::BufferStoreDwordX2).srcreg(0).srcreg(1).srcreg(2).src(amdgpu_compiler::mir::Src::Imm(0)).imm(0);
+    let mut m = func(vec![vec![narrow, wr]], classes);
+    pad_physical_war(&mut m, &alloc(vec![4, 8, 20, 4]));
+    assert_eq!(gap(&m, 0, MOp::BufferStoreDwordX2, MOp::VMovB32), 0);
+}
