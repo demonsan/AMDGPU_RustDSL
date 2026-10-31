@@ -1,3 +1,4 @@
+use amdgpu_compiler::mir::{MInst as MInst, MOp as MOp};
 //! Safe-asm sequences through the compiler: standalone assembly, hazard padding, equality with the DSL-built path, embedding via `Op::Asm`
 //! and the DS/VMEM scoreboard (`Pending` tokens).
 
@@ -821,4 +822,47 @@ fn dsl_var_mfma_scale_c_lowers_with_distinct_dst_and_c() {
     let d = mf.dst.unwrap();
     let c = if let Src::Reg(r) = mf.srcs[2] { r } else { panic!() };
     assert_ne!(d, c);
+}
+// ---- unscaled fp8 MFMA (v_mfma_f32_32x32x64_f8f6f4) ---------------------------------------------------------------------------------------
+
+#[test]
+fn unscaled_fp8_mfma_chain_zero_and_c_forms() {
+    let mut s = Seq::new();
+    let (a, b, c) = (s.input::<8>(), s.input::<8>(), s.input::<16>());
+    let (o1, o2) = (s.vgpr::<16>(), s.vgpr::<16>());
+    let (ra, rb, rc) = (s.ready(&a), s.ready(&b), s.ready(&c));
+    // zero-C form, then the in-place accumulate form needs the full result latency (different opcode), then chain back to back
+    let o1 = s.v_mfma_f32_32x32x64_f8f6f4_zero(o1, ra, rb).retire(&mut s);
+    let t = s.v_mfma_f32_32x32x64_f8f6f4(o1, ra, rb);
+    let t = t.chain(&mut s, ra, rb);
+    let o1 = t.retire(&mut s);
+    // separate-C form reading a register the sequence only reads
+    let o2 = s.v_mfma_f32_32x32x64_f8f6f4_c(o2, rc, ra, rb).retire(&mut s);
+    s.output(o1);
+    s.output(o2);
+    let blk = s.finish().unwrap();
+    let ops: Vec<&str> = blk.insts().iter().filter(|i| i.op.starts_with("VMfma32x32x64")).map(|i| i.op).collect();
+    assert_eq!(ops, vec!["VMfma32x32x64Fp8Z", "VMfma32x32x64Fp8", "VMfma32x32x64Fp8", "VMfma32x32x64Fp8"]);
+    let pos: Vec<usize> = blk.insts().iter().enumerate().filter(|(_, i)| i.op == "VMfma32x32x64Fp8").map(|(k, _)| k).collect();
+    assert_eq!(pos[1], pos[0] + 1, "in-place chain of the same opcode is back to back");
+}
+
+#[test]
+fn own_tail_chains_unscaled_mfma_without_nops_but_pads_after_the_zero_form() {
+    use amdgpu_compiler::hazards::fix_value_hazards_opts;
+    use amdgpu_compiler::mir::{Block, MFunction, RClass};
+    let mk = |insts: Vec<MInst>| {
+        let mut b = Block::new(0);
+        b.insts = insts;
+        MFunction { name: "u".into(), args: Vec::new(), kernarg_size: 0, workgroup_size: 64, lds_bytes: 0, blocks: vec![b], vregs: vec![RClass::V8, RClass::V8, RClass::V16], loops: Vec::new(), alias: Default::default(), elide_fallthrough: false }
+    };
+    let chain = |op| MInst::new(op).def(2).srcreg(0).srcreg(1).srcreg(2);
+    // in-place accumulate then accumulate: hardware-interlocked, no s_nop
+    let mut m = mk(vec![chain(MOp::VMfma32x32x64Fp8), chain(MOp::VMfma32x32x64Fp8)]);
+    fix_value_hazards_opts(&mut m, true);
+    assert!(m.blocks[0].insts.iter().all(|i| i.op != MOp::SNop), "{:?}", m.blocks[0].insts.iter().map(|i| i.op).collect::<Vec<_>>());
+    // zero form then accumulate (different opcode): padded for the result latency
+    let mut m = mk(vec![MInst::new(MOp::VMfma32x32x64Fp8Z).def(2).srcreg(0).srcreg(1), chain(MOp::VMfma32x32x64Fp8)]);
+    fix_value_hazards_opts(&mut m, true);
+    assert!(m.blocks[0].insts.iter().any(|i| i.op == MOp::SNop));
 }
