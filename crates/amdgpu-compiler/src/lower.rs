@@ -2325,9 +2325,13 @@ impl Lowerer {
             Op::PartnerMaxF32(a) => {
                 let ra = self.as_v1(*a)?;
                 self.touch(&[Src::Reg(ra)]);
-                let d1 = self.new_vreg(RClass::V1);
+                // pmdead: the operand is a max computed just for this lane exchange (single use): swap it in place, one copy less
+                let dead = opt_on("pmdead") && matches!(*a, Opnd::Val(v) if self.use_counts.get(&v).copied() == Some(1) && matches!(self.defs.get(&v), Some(Op::Max3F32(..)) | Some(Op::MaxF32(..))));
+                let d1 = if dead { ra } else { self.new_vreg(RClass::V1) };
                 let d2 = self.new_vreg(RClass::V1);
-                self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
+                if !dead {
+                    self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
+                }
                 self.push(MInst::new(MOp::VMovB32).def(d2).srcreg(ra));
                 // afterwards d1 = [lo, lo], d2 = [hi, hi]
                 self.push(MInst::new(MOp::VPermlane32Swap).def(d1).srcreg(d1).srcreg(d2));
