@@ -1,6 +1,7 @@
 # Implementation status
 
-Updated after the first end-to-end milestone on gfx950 (`mi355-gpu-53`).
+> **当前认证状态与文档索引见 [`current-status.md`](current-status.md)。** 本文件是逐轮实现记录（25 轮，按时间顺序），
+> 包含所有正负结果与归因；最新的数字以 `current-status.md` 为准。
 
 ## Verified working
 
