@@ -1,108 +1,123 @@
-# 最终总结与对照（第 37 轮）
+# 最终总结与对照（第 75 轮）
 
-本文把整个工作按"目标 → 现状 → 证据 → 差距"整理一遍。逐轮的验证记录和硬件事实在 `status.md`，设计在 `design.md`。所有数值结论都能用 `README.md` 里的命令复现。
+> 元数据：Main `8fec359`，tag `v2.2-round75-final`，第 75 轮收官。主快照见 `docs/current-status.md`（含已关闭路线的完整清单 §5）；逐轮验证记录、硬件事实和所有数值在 `docs/status.md`；设计在 `docs/design.md`；厂商 kernel 的逐条事实在 `docs/vendor-spec.md`。所有数值结论都能用 `README.md` 里的命令复现。
+
+本文按"目标 → 现状 → 证据 → 差距"整理整个工作。第 37 轮版本只覆盖了最初的 `fmha_fwd_hd128_mxfp8_t`（186 TFLOP/s，厂商的 0.36 倍）；之后的 38 轮把它推进到发布路径 1.25–1.31 倍厂商、单 CU 0.84 倍厂商，并把"能不能再进一步"的问题用测量关闭。
 
 ## 1. 目标逐项对照
 
 | 目标 | 现状 | 证据 |
 |---|---|---|
-| Rust AMDGPU kernel DSL | 已实现：类型化 `Op` / `Stmt`、`FnBuilder`、循环 / 分支 / 循环携带变量、fragment 类型（`Frag2/4/8/16`）、MFMA / LDS / 全局访存 / pack 指令、lane / 子寄存器操作 | `crates/amdgpu-dsl`，`cargo test` |
-| 内部 SSA / 资源 IR | SSA 值 + 循环变量；资源部分只落地了 LDS 区域和"待完成加载"的 wait 跟踪，设计文档里的完整 Resource / Async IR **未实现** | `docs/design.md` 与实现的差距见 §4 |
-| 验证 | DSL 验证器（类型、可见性、循环变量作用域）、MIR 验证器（寄存器类、MFMA 操作数、vcc 邻接）、RA 后检查（MFMA 对齐 / 重叠）；GPU-free 回归测试 10 项 | `cargo test` |
-| RA / 调度 | 线性扫描 RA（紧凑策略失败时改用窄操作数从顶部分配的回退策略）、copy coalescing、DCE、sub-register 别名、hazard / wait 插入（`s_nop`、`s_waitcnt vmcnt(n)` / `lgkmcnt`），以及一个**块内局部调度**：hazard 空档优先用后面不相关的 ALU 指令填充，只有填不满才补 `s_nop`（第 39 轮）。**没有全局 / 跨块的指令调度器** | `lower.rs`、`regalloc.rs`、`hazards.rs` |
-| asm 发射，不修改 LLVM | 发射 `.s`，由 ROCm `clang -x assembler` 汇编成 `.co`；LLVM 源码未改 | `emit.rs`、`tests/gpu/run.sh` |
-| 在 gfx950 真机运行的 attention kernel，并通过数值验证 | **达成**：`attention_fwd`（fp16）与 `fmha_fwd_hd128_mxfp8_t`（MXFP8，厂商 ABI）都在 MI355X 上运行并对拍通过 | `tests/gpu/run.sh`、`tests/gpu/run_ref.sh` |
-| 推进 FMHA 参考 core loop 的 1:1 复刻 | **部分**：见 §2。ABI、网格、缩放用法、主要指令族、wave 分工一致；指令级结构和性能不一致 | §2、§3 |
+| Rust AMDGPU kernel DSL | 已实现：类型化 `Op` / `Stmt`、`FnBuilder`、循环 / 分支 / 循环携带变量、fragment 类型、MFMA（含缩放 / 非缩放 fp8、f16 偏置）/ SMFMAC / LDS（含转置读、DMA）/ 全局访存 / MUBUF（描述符、`buffer_*`、LDS 直通形式）/ 原子 / pack 指令 | `crates/amdgpu-dsl`，`cargo test` |
+| 自研编译器（SSA → MIR → 寄存器分配 → 调度 → asm） | 已实现，默认后端是 `llvm-tail`（自研 lowering / RA / 调度，LLVM 只负责 wait / hazard / memory legalizer）；`--backend=own` 保留完整自研 tail | `docs/llvm-tail-integration.md`，`tests/tail_invariance.rs` |
+| 验证 | DSL / MIR 验证器、RA 后检查、safe-asm 序列的 `pin_check`（对最终 MIR 重跑 value-hazard pass），`cargo test` 28 个目标共 110 项通过 | `cargo test` |
+| 在 gfx950 真机运行并通过数值验证的 attention kernel | **达成并超过**：`attention_fwd`（fp16）与 MXFP8 厂商 ABI 的 FMHA 家族在 MI355X 上运行，15 个形状逐元素对拍 | `tests/gpu/run.sh`、`tests/gpu/run_ref.sh`、`tools/gen9_gate.py` |
+| 推进 FMHA 参考 core loop 的 1:1 复刻 | **功能与接口 1:1，指令级结构不同**：ABI、网格、缩放用法、数值约定、主要硬件指令族一致，并已通过 15 形状对拍与真机计数器对账；核心循环是另一种实现（`Sᵀ = K Qᵀ`，分数全在寄存器，128-key 单元，一个 rollback，每 tile 两个 barrier）。结构层面的逐指令复刻（vendor-order M 窗口、持久偏置 C、V 预读）做了完整的有界实验，结论为负（§6、§7） | `docs/gen9-vendor-mirror-design.md`、`docs/status.md` 第 68/70/73/75 轮 |
+| 性能 | 发布路径（`_auto`）B1H8S2048 **674–705 TFLOP/s = 厂商同轮 536–539 的 1.25–1.31 倍**；单 CU 453–455 TFLOP/s = 7.07–7.10 TF/CU，厂商 8.41 TF/CU（我们是它的 0.84 倍）；填满网格 B4H8S2048 0.846 倍、B1H8S8192 0.841 倍；中等形状 ≥ 厂商（1.00–1.16 倍） | §2 |
 
-## 2. 与参考 kernel（aiter `fwd_hd128_mxfp8.co`，commit 7061cbd）的对照
+## 2. 认证数字（Main `8fec359`）
 
-| 项 | 参考 kernel | 我们的 `fmha_fwd_hd128_mxfp8_t` | 一致？ |
-|---|---|---|---|
-| kernarg ABI | 656 字节，固定槽位 | 相同槽位（逐字节读取同一布局） | 是（实测对拍） |
-| grid / block | `(ceil(S/256), H, B)`，512 线程 | 相同 | 是 |
-| 数据格式 | e4m3 Q/K/V，E8M0 1×32 Q/K 缩放，标量 V 缩放，BF16 输出 | 相同 | 是 |
-| softmax 约定 | `exp2(S)`，忽略 kernarg 里的 softmax scale | 相同（实测发现） | 是 |
-| 缩放 MFMA | `v_mfma_scale_f32_32x32x64_f8f6f4`（16 字节编码，VGPR 缩放） | 相同指令，K 排列与缩放字节选择经真机验证 | 是 |
-| LDS 转置读 | `ds_read_b64_tr_b8` / `ds_read_b128` | 相同指令，lane 映射经真机测量 | 是 |
-| wave 分工 | `s62 < 4` 分 A / B 两条独立循环 | wave 0–3 / 4–7 各跑独立循环（A 搬 K，B 搬 V），同一 barrier 日程 | 结构类似，功能不同 |
-| barrier | 每轮 4 个 phase，成对 | 每轮 2 个 | 否 |
-| P 量化 | `v_cvt_pknorm_u16_f32` ×32 + `v_cvt_scalef32_pk_fp8_bf16` ×64 | `v_cvt_pk_fp8_f32` ×32，`P·16` 折进 exp2 参数 | 否 |
-| PV 乘法 | `v_smfmac_f32_16x16x128_fp8_fp8`（稀疏 MFMA，原地累加）+ 缩放 MFMA | 32×32×64 缩放 MFMA | 否 |
-| 行最大值 | `v_max3_f32` 链 + `v_cmp_nge_f32` 触发的 rollback 出口 | `v_max3_f32` 链 + 与 `lane ^ 32` 交换；无 rollback（试验过惰性重缩放，收益 ≤3%，已回退） | 部分 |
-| 资源 | 246 VGPR，AGPR 0，LDS 84,224 B | 208 VGPR，LDS 34.8 KB | 否 |
-| 吞吐（1×8×2048×2048） | ≈ 518 TFLOP/s | ≈ 186 TFLOP/s | 慢约 2.7× |
+### 2.1 吞吐（TFLOP/s，同轮厂商对照，own 后端，GPU 0 / GPU 5）
 
-结论：**我们没有逐指令复刻参考 kernel**。复刻的是它的接口契约、数据布局、缩放 / softmax 约定和主要硬件指令族，并且与它在 15 个形状上逐元素对拍。核心循环本身是另一种实现（转置形式 `Sᵀ = K Qᵀ`，分数全在寄存器里）。
+| 形状 / 口径 | 我们 | 厂商 | 比值 | 说明 |
+|---|---|---|---|---|
+| B1H8S2048，发布路径 `_auto`（64 个 256 行块，自动走 KV-split） | **674–705** | 536–539 | **1.25–1.31×** | 欠填充网格：128 行分块 + KV-split 补满 CU |
+| B1H8S2048，`_vs128` 单 CU（64 块 = 64 CU） | 453–455（7.07–7.10 TF/CU） | 8.41 TF/CU | 0.84× | 每 CU 关键路径差距 1.19× |
+| B4H8S2048（256 块，填满） | 1443.6 / 1454.8 | 1706.8 | **0.846×** | 一块一 CU，与厂商占用率相同 |
+| B1H8S8192（256 块，填满） | 1998.6 / 2002.7 | 2376.5 | **0.841×** | 同上 |
+| 中等形状（B2H8S2048、B1H8S4096、B1H8S1024 等） | — | — | **1.00–1.16×** | `_t128` / `_vs128` / KV-split 按守卫自动选择 |
 
-## 3. 性能归因（第 31–36 轮）
+占用率与厂商相同：厂商 LDS 84224 B / vgpr 246 / sgpr 99 / 512 线程，我们 LDS 102400 B / vgpr 249 / sgpr 48 / 512 线程；任一方都放不下第二个块（2×84224、2×102400 都超过 163840 B；2 个 wave/SIMD × ~250 VGPR 占满 512），填满网格里每个 CU 恰好一块 8 个 wave。因此填满网格的差距就是单 CU 关键路径差距，不是占用率。
 
-- 第一版（行 per lane，分数经 LDS）约 15 TFLOP/s；转置版 88；去掉大部分 `v_mov`（sub-register 别名）118；批量 16 字节加载 + 预取 + 地址折叠 190。
-- 消融实验：暂存 + barrier 约 23%，PV 约 10%，exp 约 6%，其余一半以上是 S 路径（QKᵀ MFMA + hazard 补 nop + 最大值交换 + `sub` / `cvt`）。
-- 否定的优化：先发四个 score tile（VGPR ↑，更慢）、惰性重缩放（≤3%）、前置 K 缩放加载（更慢）。
-- 剩余差距需要调度级改动（两个 wave 在同一 SIMD 上的 ping-pong 重叠、MFMA 与 VALU 交错），当前线性 lowering 无法表达。
+### 2.2 精度与正确性
 
-## 4. 编译延迟（实测，第 37 轮）
-
-release 构建，整个进程（启动 + DSL 构建 + 编译 + 写文件），取 5 次最小值：
-
-| kernel | 汇编行数 | Rust 编译侧耗时 |
-|---|---|---|
-| `attention_fwd` | 1264 | 1.8 ms |
-| `fmha_fwd_hd128_mxfp8_t` | 4413 | 5.7 ms |
-| `probe_fp8_fmha_hd128c` | 6569 | 14.5 ms |
-
-再加上 `clang -x assembler`（独立进程，进程启动占主要部分）：`attention_fwd` 16 ms，`fmha_fwd_hd128_mxfp8_t` 22 ms。所以**自研编译侧在 10 ms 目标之内（对中等大小的 kernel），但端到端经子进程 clang 汇编不满足 ≤10 ms**；要达标需要进程内汇编（设计里的 LLVM bridge，未实现）。
-
-## 5. 未实现 / 设计中的部分
-
-- 完整的 Resource / Async IR、provenance、witness 驱动的 1:1 复刻管线（`design.md` §Witness）：只有设计，没有实现。
-- 指令调度器。
-- 跨卡通信（MORI LSA / SDMA / GDA）、gfx1250 后端、JIT 与框架适配（DeepInfer / SGLang）。
-- LSE 输出；`+0x80` KV 进度更新与 rollback 出口。
-
-## 6. 发现并修复的编译器问题（价值最高的部分）
-
-这些问题都是先在真机上表现为"随机错误"或"寄存器不够"，再定位到编译器：
-
-1. MFMA 结果读取缺少延迟补 nop（第 12 轮）。
-2. V1/V2 加载作为 scale 操作数被消费时没有 `s_waitcnt`（第 14 轮）。
-3. 控制流两侧共享"待完成加载"状态：一侧发的 wait 让另一侧漏等（第 23 轮）。
-4. 常量 / 转换缓存没有按控制流区域隔离：一侧物化的常量被另一侧当作已存在（第 23 轮）。
-5. 空 block 把跨过它的值的活跃区间拉到位置 0，造成大量虚假寄存器压力（第 28 轮）。
-6. DSL 变量遮蔽（`g8` / `g16`）：不是编译器 bug，但被真机对拍立即发现（第 34 轮）。
-
-每一项都有对应的回归（GPU-free 测试或真机 probe）。
-
-## 7. 从干净克隆复现（第 38 轮）
-
-在 GPU 节点上从 `Main` 的提交 `16df21b`（与 `origin/Main` 一致，工作区干净）全新克隆，只按 README 里的命令执行：
-
-| 步骤 | 结果 |
+| 项 | 结果 |
 |---|---|
-| `bash tools/container/cargo.sh test` | 10 passed, 0 failed |
-| `bash tests/gpu/run.sh`（`attention_fwd`，fp16，B=1 H=2 S=128） | `max_abs_err=5.99623e-05`，`bad=0/16384`，`ATTENTION_FWD OK`；`vgpr=205` |
-| `REF_CO=<厂商 .co> OUR_KERNEL=fmha_fwd_hd128_mxfp8_t bash tests/gpu/run_ref.sh` | 15 个形状全部 `REF_KERNEL_OK`；我们 vs CPU 平均误差 1.1–1.8e-3（SK=1 时为 0）；我们 vs 厂商全部输出逐个比较，平均差异 1.3–2.8e-3；1×8×2048×2048 上 185.9 TFLOP/s（厂商 517.5） |
+| 精度（对 CPU 参考，REF_ROWS=64） | 平均误差 **8.3e-4**（厂商 1.5–2.9e-3，我们约好 3 倍）；`bad = 0`（厂商自己在 3 个形状上各有 1–5 个坏点） |
+| 15 个形状 | 16 行 / 64 行门禁均 15/15，vendor-parity 15/15（`tools/gen9_gate.py`） |
+| 确定性 | `determinism.sh` 5/5 ×多轮；**重复启动压力 1200/1200**（4 个不均匀 tile 数的 KV-split 形状，每个 300 次，逐次比较完整输出 md5）；`FMHA_OPT=eplds,epw` 敏感度探测器 100–200/200 干净 |
+| 单元测试 | `cargo test`：28 个目标、110 项全部通过；发布路径汇编 md5 在所有非 KV-split 改动中保持不变 |
 
-与 §2、§3 里的数字一致，没有需要更正的地方。
+### 2.3 发布路径（`_auto`）的组成
 
-## 8. 块内调度 pass（第 39 轮）
+见 `docs/fmha-reference.md` 末节"我们的实现状态"：`_auto`（默认，按守卫模型选 `_vs128` / `_t128` / `_kvsplit`+combine）、`_vs128`（256 行块，填满网格与单 CU 基准）、`_t128`（128 行块，欠填充形状）、`_kvsplit` + `_kvsplit_combine8h`（序列并行 + 精确合并）、`_t`（冻结的精确参考实现）。
 
-`hazards.rs` 现在不只是补 `s_nop`：消费者因为 MFMA / 超越函数结果还没就绪而要停顿时，在同一基本块、后面 48 条指令的窗口内寻找可以提前的 ALU 指令（`v_mov` / 加减乘 / 位运算 / `v_max3` / `v_cvt_pk_*` 等纯寄存器指令；不碰内存、标量状态、`vcc`、墙 / barrier），并检查它与被它跨过的所有指令没有 RAW / WAR / WAW 依赖（按子寄存器别名所属的 tuple 保守判断），自己的源操作数也已就绪；这样的指令被搬到消费者前面填空档。同一 pass 还放宽了"同一缩放 MFMA 在原地链式累加 C 操作数"的保守补 nop（ISA §7.6：同操作码原地累加不需要额外等待）。
+## 3. 优化历程（B1H8S2048，发布路径 TFLOP/s）
 
-效果（诚实）：`fmha_fwd_hd128_mxfp8_t` 汇编 4413 → 4365 行，`s_nop` 条数下降；吞吐不变（185.5 TFLOP/s），符合第 34 轮消融的预期（nop 只占循环的很小一部分）。价值在于编译器现在有了一个经过真机回归验证的调度步骤，回归测试 `hazard_gaps_are_filled_with_independent_work` 锁定了它的行为。
+| 里程碑 | TFLOP/s | 主要来源 |
+|---|---|---|
+| 第 37 轮 `_t` 初版 | 186 | 转置形式 `Sᵀ = K Qᵀ`，批量 16 字节加载，地址折叠 |
+| `_t` + LLVM tail + 调度默认 | **292** | LLVM tail 接管 wait / hazard；XOR swizzle，LDS bank conflict 524288 → 8704（第 4 轮） |
+| `_vs128`（128-key 单元、一个 rollback、两个 barrier、smfmac 行和、Q 常驻寄存器） | **367** | 第 49–56 轮 |
+| `_t128`（128 行块） | **485–505** | 欠填充网格的分块收益（第 59 轮） |
+| + KV-split（fp16 partial、LDS 转置 16 字节存储、combine 合并） | **605–613** | 第 60–61 轮 |
+| + K-scale LDS-DMA（`kddma`） | **622–635** | 第 61 轮 |
+| + Q 加载向量化、8 字节尾部存储、`combine8h`、三个编译器 bug 修复 | **674–705** | 第 65–69 轮 |
 
-## 9. 默认后端改为 LLVM tail（第 3 轮，gfx950）
+单 CU 基准（`_vs128`，64 块）：389.6 → 413（Q 加载 `load_b128`）→ 449–455（8 字节输出存储 `global_store_dwordx2`）。
 
-* 默认：`llvm-tail`（寄存器分配、调度、lowering 仍是自研；LLVM 只负责 wait / hazard / memory legalizer / descriptor）。`--backend=own` / `BACKEND=own` 保留完整自研 tail。
-* 不变量（`tests/tail_invariance.rs`）：两个后端的指令流逐条一致（忽略 nop / waitcnt / 分支标签写法），MIR 为纯物理寄存器；在 `AMDC_SCHED=1`、`swp`、`taildup,swp`、`auto` 下同样成立（唯一允许的额外指令是 LLVM 的 vccz 错误规避 `s_mov_b64 vcc, vcc`，在 `sched_diamond` 的 taildup 构建里出现）。
-* 真机（GPU 4，ROCm 10.1 tail + 10.1 汇编器）：`cargo test` 34 通过；`attention_fwd` OK；fmha_t 15/15 REF_KERNEL_OK、determinism 5/5，在无调度、`swp`、`taildup,swp`、`auto` 下均成立。B1H8S2048：own 224.7 / llvm-tail 224.0–226.3 / llvm-tail+auto 224.7–225.6 TFLOP/s（无回归）。
-* `--sched=auto`：只对模拟器预测收益 ≥3% 的循环做块内调度；swp 自带 3% 门限；taildup 只在其“与无 taildup 方案相比，两者共有的循环总模型周期下降 ≥3%”时启用。含 `s_barrier` 的循环不参与（模型没有跨 wave 同步项：在 FMHA 上模型预测 −23%，而真机是 221.7 vs 225.0 TFLOP/s），所以 FMHA 在 auto 下保持未调度；sched_* 微内核真机 1 wave/2 waves 每次迭代周期：valu_mul −37%/−36%，valu_max3 −35%/−22%，valu_exp −23%/−14%，mfma_chain −40%/−1%，mfma_valu16 −37%/−15%，mfma_valu4 −56%/−24%，diamond −32%/−14%。
-* 未完成项：导出 kill/dead 标志（目前 3 个 LLVM peephole 测试因此不能折叠，保守且正确）、DSL 引入原子/LDS-DMA 时需导出 MMO（ordering/syncscope）、2 个 verifier 个案（`waitcnt.mir`, `waitcnt-agpr.mir`）尚未查明。
+## 4. 与厂商 kernel（aiter `fwd_hd128_mxfp8.co`）的对照（现状）
 
-## 10. 编译器侧 FMHA 收益（第 4 轮，合并后的 Main）
+| 项 | 厂商 | 我们（`_vs128`） | 一致？ |
+|---|---|---|---|
+| kernarg ABI / grid / block / 数据格式 / softmax 约定 | 656 字节、`(ceil(S/256),H,B)`、512 线程、e4m3 + E8M0、`exp2` | 相同 | 是（逐元素对拍） |
+| 缩放 MFMA、LDS 转置读、smfmac 行和、pknorm + scalef32 的 P 量化 | 是 | 是（P 量化与 rollback 的数值路径已对账） | 是 |
+| 参考 / rollback | f32 参考，rollback 时 `r += s93·s26·δ` | 精确 hi/lo f16 参考对（约 2⁻²²），同样的惰性 rollback；我们的 P 近似误差更小（平均误差约好 3 倍） | 数值等价或更优 |
+| 每 tile 矩阵工作 | 16 个 64 周期 MFMA + 2 smfmac + 1 偏置 MFMA = 1088 XDL 周期 | 16 个 64 周期 MFMA + 4 smfmac + 4 偏置 MFMA = 1216 | 否（见 §6） |
+| 每 tile VALU | ≈ 251 | ≈ 353（热路径循环体 ≈ 222） | 否，但已证明不是限制因素（§6） |
+| 占用率 | 1 块 / 8 wave 每 CU | 相同 | 是 |
+| 吞吐（填满网格） | 1706.8（B4H8S2048） | 1443.6–1454.8 | 0.846× |
 
-* 构建与口径：fmha_fwd_hd128_mxfp8_t，B1H8S2048，30 iters，GPU 4，LLVM tail；全部与 plain（`AMDC_SCHED=0 AMDC_LOWER_OPTS=none`）在 15 个 shape 上逐位一致。
-* 默认路径（`dce,cmpfold` + fmha 调度默认 `rewait,xbar,ldshoist`）：**288.2-289.2 TFLOP/s**（plain 260.5-262.3，`AMDC_SCHED=0` 264.5-265.0）；打开 XOR swizzle（`FMHA_OPT=...,swz`）：**292.6-293.1**，LDS bank conflict 524288 -> 8704（vendor 0）。own 后端默认 282.9-284.2。
-* 计数器（plain / 默认 / 默认+swz）：VALU 3.302M / 3.196M / 3.314M（vendor 2.055M），WAIT_ANY 7.29M / 6.22M / 6.07M，BUSY 4.58M / 4.33M / 4.26M（vendor 2.39M），WAVE_CYCLES 17.5M / 16.7M / 16.4M（vendor 9.4M），IFETCH 834k / 782k / 797k（vendor 667k）。
-* 负面/中性结果：只减少 VALU（imm/saddr/sgpr/shl/dce/cmpfold，-14% VALU）在 LDS 延迟未解决前为 0%；imm/saddr/sgpr/shl 在最终配置上中性（关闭）；全量重排调度器比 rewait 差；`AMDC_LOOP_ALIGN` 仅 +0.1%（噪声级，默认关闭）。
-* 本轮发现并修复的问题：空的 `AMDC_LOWER_OPTS`（cargo.sh 在未设置时转发空值）曾让默认优化静默失效；调度器在寄存器不足时重试逻辑只尝试一次，导致 swz 构建退回未调度代码（260 -> 292.6）。详见 docs/llvm-tail-integration.md 末节。
+## 5. 发现并修复的三个真实编译器正确性 bug（价值最高的部分）
+
+这三个 bug 都是先在真机上表现为"随机错误"，再追到编译器；每一个都有 GPU-free 回归测试或真机重现脚本。
+
+1. **物理寄存器 WAW（physical WAW）**：MFMA / 长延迟指令的写回与后续对同一物理寄存器的写之间缺少排序，在 own 后端的某些 DSL 结构下产生随机输出。修复：由 backend 在 hazard 层对物理寄存器的 WAW / WAR 补齐等待（`AMDC_NO_PHYS_WAR=1` 保留为 A/B 开关）。
+2. **two-phase RA 的 reaching-writer 错误**：两阶段寄存器分配在循环携带 / 条件写路径上选错了到达写者，导致把仍活跃的值覆盖（`biasacc,vpre` 组合在全重排调度器下非确定性，其他调度配置下确定）。修复由 backend（`backend-race` 分支）在两阶段 RA 中完成，`AMDC_RA_FORCE_TWOPHASE` 保留为回归开关。
+3. **VMEM 宽存储数据 WAR（第 69 轮，影响最大）**：`global_store_dwordx4` 在发射之后的数个周期里才读取它的数据 VGPR；我们自己的 tail 没有为"宽存储之后 2 个 wait state 内对同一数据寄存器的 VALU 写"补 `s_nop`（LLVM 的 `has12DWordStoreHazard` 有）。KV-split 的 fp16 partial 尾部在 4 个 lane（j = 25/27/29/31）的 `ec = 1` 字上间歇性被新值污染：均匀 tile 数形状无感，不均匀 tile 数（B1H2S200 SK1337）0–5% 的启动出错，时序漂移时升到 30%。修复：`hazards::pad_physical_war` 记录宽存储数据范围并为后续 VALU 写补 `s_nop`（`_kvsplit` 仅多 4 条 `s_nop`，成本 0.3%，噪声级），`AMDC_NO_PHYS_STORE=1` 保留为 A/B 开关。附带结论：单次 5/5 确定性测试不足以认证，必须做重复启动完整输出 md5 压力（1200/1200）并保留 `epw` 探测器；`emit_fmha_vs9_role` 是 vs128 role 的逐字节副本，补丁必须落在 vs128 role。
+
+早期修复的编译器问题（MFMA 结果读取缺 nop、scale 操作数缺 `s_waitcnt`、控制流两侧共享 pending-load、常量缓存未按区域隔离、空 block 拉长活跃区间等）仍保留回归测试，见 `docs/status.md` 前 40 轮。
+
+## 6. 已关闭的负面路线（每条一句归因；完整数据见 `docs/status.md` 与 `docs/current-status.md` §5）
+
+| 路线 | 结果 | 一句归因 |
+|---|---|---|
+| gen2 / gen3：单 wave 内 VALU 与 MFMA 重叠、合并窗口、barrier 位置偏移（第 57–58 轮） | 负 | 两个 wave 组本来就处于互补相位，进一步合并只增加寄存器压力和调度脆弱性 |
+| dsplit（延迟 DMA wait）、`dmah`、`dmin`（第 61 轮） | −6..−11% / −0.9% / −1.0% | DMA 延迟不在关键路径上，付代价的是 DMA 发射与 barrier 对齐 |
+| 融合 last-arriver combine（第 62 轮） | 最终负（默认关闭，代码保留） | 单发射的 combine 需要跨 XCD 一致性 fence，成本高于它省下的 ~2.5 µs 启动底 |
+| 占用率路线：4 wave/SIMD 的维度分割 O（第 46 轮起） | 负 | VGPR / LDS 预算放不下，且厂商是同样的 1 块/CU 占用率 |
+| gen5 安全汇编窗口（第 63 轮） | Block C −2.5%，Block M 中性，Block B 在 2 槽 K 环下无法构建 | 手写顺序不比列表调度器更优，关键路径是依赖链而不是指令顺序 |
+| gen6 K-ahead 环 + 合并窗口 + 再平衡（第 64 轮） | −10.5% / −12..−17% | 在 M 窗口里塞暂存 VALU 加长了关键路径 |
+| 偏置路线：`biasacc` / `biasv` / `biasc` / `biasonce` / `vpre` / `kpre2` / `qkfirst`（第 66–68、73、75 轮） | −0.8%..−15% | 省下的 XDL 周期原样变成屏障 / 相位会合等待（`biasacc`：XDL −86、WAIT_ANY +91） |
+| gen9 vendor 风格 M 窗口（固定顺序、V 预读、持久偏置 C，第 68–70 轮） | 未达 460 TF 门槛（−5..−8%） | 固定顺序的块强制 MFMA 顺序发射、`pin_check` 补 17 个 wait state、VGPR 255–256 |
+| `p4` 非缩放 PV（第 70 轮，需要 `v_mfma_f32_32x32x64_f8f6f4`） | 单独 −1.2..−2.2%（保留 opt-in） | 数值正确但本身不提速，只是前置条件 |
+| VALU 削减：`saddrlds` / `pmdead` / `mubufd` / `cut1`（第 67、71 轮） | 全部 ±1%；组合 `mubufd,cut1` 墙钟周期 +1.2–1.7%（VALU −8.7% 但 WAIT_INST_ANY +14%） | 循环不是 VALU 发射受限，移除的 VALU 槽位变成依赖停顿 |
+| MUBUF K/V DMA（第 71 轮） | 位等价、中性（`mubufd` −0.5%，带分支版 −1.3..−2.1%） | 地址 VALU 已被隐藏；运行时大小描述符 + 硬件零填充是有价值的编译器新能力，内核转换保持 opt-in |
+| gen10 有界周期（第 75 轮） | 硬门槛失败：墙钟周期与 XDL 需同时 ≥ 8% 下降，所有有效变体墙钟 +5..+15%，XDL 地板 1130 | 省下的 XDL 周期以屏障会合等待的形式回来：`qkzero`（XDL 1111、VALU 310）的墙钟仍是 1355 ≈ 基线 |
+
+## 7. 对任何未来相位 / XDL 重设计的三项要求
+
+第 73–75 轮的计数器给出了明确结论：这个 kernel 受**两个 wave 组的相位会合（barrier + LDS 等待）**限制，不是受 XDL / VALU / VGPR / 指令数限制。因此任何后续设计必须同时满足：
+
+1. **必须让会合等待本身变短，而不只是移除矩阵或向量工作。** 省下的工作若不重排两个角色的相位长度，只会让该 wave 更早到 barrier 然后等待（WAIT_ANY 上升）。验收看**墙钟周期**（`SQ_WAVE_CYCLES`）而不是 XDL 或 VALU 计数：硬门槛 = 墙钟周期与 XDL 同时 ≥ 8% 低于同轮对照（B1H8S2048，对照 wave ≈ 1354–1373 / XDL 1216），并且 `SQ_WAIT_ANY` 不能同比上升。
+2. **必须在 VGPR ≤ 256、调度器不回退的条件下成立，并避免强制顺序块的发射顺序与 wait-state 惩罚。** 已测量的限制：pinned safe-asm 窗口内 MFMA 按序发射、`pin_check` 在寄存器复用处补 17 个 wait state（71 对 22 个 NOP 状态 / tile）、VGPR 255–256 触发 `falling back to the unscheduled code`；kernel 无调度回退时才有可比性。
+3. **必须保持逐位或精度门禁，并通过重复启动确定性认证。** 不改变数学的改动要求输出 md5 逐位一致；改变舍入的改动要求 15/15、`bad ≤ 厂商`、平均误差 ≤ 2.6e-3；任何触及宽存储 / 尾部的改动要通过 KV-split 不均匀形状的完整输出 md5 重复启动压力（≥ 300 次 × 4 形状）和 `epw` 探测器，而不是单次 5/5。
+
+## 8. 未实现 / 范围外
+
+- 完整的 Resource / Async IR、witness 驱动的 1:1 复刻管线（`design.md` §Witness）：仍只是设计。
+- 跨块指令调度器、软件流水线的通用化（只有块内调度、`swp`、`taildup`）。
+- 跨卡通信（MORI LSA / SDMA / GDA）、gfx1250 后端、JIT 与框架适配（DeepInfer / SGLang）。
+- LSE 输出的对外接口（KV-split 内部使用 lse）；厂商的 `+0x80` KV 进度更新结构。
+- 进程内汇编（LLVM bridge）：端到端经 `clang -x assembler` 子进程，不满足 ≤10 ms 目标；自研编译侧耗时在目标之内。
+
+## 9. 复现
+
+```bash
+bash tools/container/cargo.sh test                      # 28 个目标、110 项
+OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto BACKEND=own REF_ROWS=64 REF_CO=<厂商 .co> bash tests/gpu/run_ref.sh
+python3 tools/gen9_gate.py <run_ref 日志>               # 精度 / vendor-parity 门禁
+BACKEND=own bash tests/gpu/determinism.sh               # 5 个形状；认证还需要重复启动完整输出 md5 压力
+```
+
+重复启动压力与 `epw` 探测器的用法见 `docs/vendor-spec.md` §7.11 与 `docs/status.md` 第 69 轮。

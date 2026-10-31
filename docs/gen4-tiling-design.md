@@ -1,5 +1,7 @@
 # Generation 4: 128-row blocks (tiling change) - design
 
+> Status: ADOPTED - the 128-row tiling shipped as `_t128` (the default path for under-filled grids, selected by `_auto`); see docs/current-status.md and round 59 of docs/status.md.
+
 Status: design (kernel-opt). Baseline `fmha_fwd_hd128_mxfp8_vs128` 367 TFLOP/s on B1H8S2048 (own backend).
 Origin: kernel-occ §7.9: the grid is only 25% full. `ref_host` launches `(ceil(S/256), H, B)` blocks of 512 threads (8 waves, 32 query rows per wave, 256 rows per block); B1H8S2048 = 8 x 8 x 1 = **64 blocks on 256 CUs** (none of the 15 shapes fills the GPU). 367 vs 515 TFLOP/s is a per-CU ratio (5.7 vs 8.05 TFLOP/s/CU).
 

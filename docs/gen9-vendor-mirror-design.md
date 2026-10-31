@@ -1,5 +1,7 @@
 # gen9: vendor-mirror FMHA design (from `ref_mxfp8.co` disassembly)
 
+> Status: closed - the vendor-order M window (persistent bias C, V pre-read, pinned or unpinned) failed the 460 TF/CU bar (-5..-8% on the current base) and the bounded gen10 cycle failed its wave-cycles + XDL hard gate; see docs/current-status.md §5 and rounds 68, 70, 73, 75 of docs/status.md.
+
 Status: design spec, no kernel code yet. Derived from the vendor code object
 `/shared/amdgpu/home/blyu_qle/sessions/ref_mxfp8.co` (disassembly: `tools/vendor_disasm.sh`,
 `llvm-objdump -d --mcpu=gfx950 --no-show-raw-insn`) and the MI350/gfx950 kernel-wiki

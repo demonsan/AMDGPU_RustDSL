@@ -1,5 +1,7 @@
 # Kernel generation 2: overlapping the VALU and MFMA work inside one wave
 
+> Status: closed (negative) - the gen2 experiment (`_g2`: VALU/MFMA overlap inside one wave) was correct but not faster; see docs/current-status.md §5 and round 57 of docs/status.md.
+
 Status: design for review (kernel-opt). Baseline = `fmha_fwd_hd128_mxfp8_vs128` (own backend, B1H8S2048): **366.7 TFLOP/s**, vgpr 252, vendor ~514 (gap 1.40x).
 Everything below is derived from measurements already in `docs/status.md` (rounds 49-56) plus one new probe (section 2). Predictions are ranges, with the assumption that decides the range stated explicitly.
 

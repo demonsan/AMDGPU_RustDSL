@@ -1,4 +1,6 @@
-﻿# Gen6 results (kernel-opt): K-ahead ring + merged window + rebalance - FINAL NEGATIVE
+# Gen6 results (kernel-opt): K-ahead ring + merged window + rebalance - FINAL NEGATIVE
+
+> Status: FINAL NEGATIVE (K-ahead ring -10.5%, staging VALU in the M window -12..-17%); see docs/current-status.md §5 and round 64 of docs/status.md.
 
 Kernel `fmha_fwd_hd128_mxfp8_vs6` (by name only; `_vs128` and the auto dispatch are untouched). Base: Main 82ff0bf (kernel-occ control: `_vs128` 390.6 best / 389.5 median TFLOP/s at 64 blocks, md5 `faadf00c95f4eaffff94ece7d1429b3d`).
 

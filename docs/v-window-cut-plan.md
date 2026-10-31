@@ -1,5 +1,7 @@
 # V-window VALU audit and cut plan (filled-grid parity)
 
+> Status: closed - the cuts were measured neutral or negative (VALU -8.7% leaves wave cycles +1.2% and WAIT_INST_ANY +14%); see rounds 71-72 of docs/status.md and docs/current-status.md §5.
+
 Measured from the emitted `_vs128` long/no-LUT hot loop on Main 5f4a3cf (own backend), per loop-body
 V phase (one 128-key step, role A / role B). Method: barrier-delimited regions of the emitted asm;
 loop bodies at backedges BB7/BB26/BB48/BB67; the long/no-LUT bodies are the last two (251/267); the

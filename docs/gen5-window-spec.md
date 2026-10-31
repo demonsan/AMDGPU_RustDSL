@@ -1,5 +1,7 @@
 # Gen5 window spec: the hand-authored (safe-asm) inner tile window of `_vs128`
 
+> Status: closed - Block C -2.5%, Block M neutral, Block B not buildable under the 2-slot K ring; see docs/current-status.md §5 and round 63 of docs/status.md.
+
 Status: **spec + scaffolding** (kernel-opt, 2026-10-30). Target kernel `fmha_fwd_hd128_mxfp8_vs5` (registered, builds, asm and output bit-identical to `_vs128`:
 `diff` of the emitted `.s` = 0 lines, md5 faadf00c / c8b7a893 / d17778b0 on 1 8 2048 2048, 4 8 2048 2048, 3 3 768 1280). Everything below was extracted from the
 emitted asm of `_vs128` (own backend, long/no-LUT recipe copy, `loop 2` = group A, `loop 3` = group B) and the DSL role `emit_fmha_vs128_role`
