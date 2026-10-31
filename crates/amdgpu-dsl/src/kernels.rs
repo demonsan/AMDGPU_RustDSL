@@ -10052,7 +10052,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let bq_idx = init_vars.len();
     if cut1 {
         let c64f = b.c_f32(64.0); // the initial word pair (0x4800 | 0x4800 << 16) = 4 (8 + 8)
-        init_vars.push((DType::F32, Opnd::Val(c64f)));
+        let c64i = b.bitcast_i32(c64f);
+        init_vars.push((DType::I32, Opnd::Val(c64i)));
     }
     // constres: force the 6 per-tile materialised constants into persistent loop-carried VGPRs so the RA cannot
     // rematerialise them every iteration (0x7f/0x7b MFMA scales, idx01/idx23 SMFMAC indexes, 1.0 P scale, threshold).
@@ -10274,7 +10275,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let b_q = b.mul_f32(sum_q, c4f);
                 cut_vals = Some((b_q, b_old));
                 let b_next = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(b_q), b: Opnd::Val(b_old) });
-                b.set_var(bqv.expect("bq"), b_next);
+                let b_next_i = b.bitcast_i32(b_next);
+                b.set_var(bqv.expect("bq"), b_next_i);
                 let l_sh = b.shl_i32(l_raw, c16i);
                 let w_q = b.let_(Op::AddI32(Opnd::Val(h_raw), Opnd::Val(l_sh)));
                 let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
