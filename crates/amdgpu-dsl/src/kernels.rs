@@ -11434,7 +11434,8 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     ];
     // biasacc: the bias accumulator (ones x bias, f16 MFMA) is a persistent loop variable, recomputed only in the rollback branch; every tile's first scaled QK MFMA
     // takes it as its C operand (removes the 4 f16 bias MFMAs per tile from the common path)
-    let biasacc = fmha_t_opt("biasacc");
+    let nom2 = fmha_t_opt("nom2");
+    let biasacc = !nom2; // gen9: the persistent bias matrix is the default of _vs9 (nom2 restores the scaffold)
     if biasacc {
         let zero16b = b.frag_zero(DType::Frag16);
         let bacc0 = b.mfma_f16_wide(ones_f16, Opnd::Val(bias_init), zero16b);
@@ -11921,7 +11922,27 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         if !noprio {
             b.set_prio(1);
         }
-        b.wait_lds(0);
+        // M2: the first two V fragments of the PV window (half 0, column groups 0 and 1) are read BEFORE the barrier (their tile is already in LDS); the M window block
+        // starts with matrix work that needs no LDS read. The LDS wait before the barrier is dropped for them (no LDS writes in this loop).
+        let m2 = !nom2 && stage && smfrs && smfv && q0_reg && !convlate;
+        let vpre_m2: Option<(ValueId, ValueId)> = if m2 {
+            let mut fr: Vec<ValueId> = Vec::with_capacity(2);
+            for e in 0..2usize {
+                let tb = b.add_i32(cx.trx[e], slot_cur);
+                let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+                for r in 0..4i32 {
+                    let off = b.c_i32(2048 * r);
+                    addrs.push(b.add_i32(tb, off));
+                }
+                fr.push(b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]));
+            }
+            Some((fr[0], fr[1]))
+        } else {
+            None
+        };
+        if vpre_m2.is_none() {
+            b.wait_lds(0);
+        }
         if !no_bar && !nobar1 {
             b.barrier();
         }
@@ -11986,6 +12007,22 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 qk(b, slot_nxt, kds_nxt, kdg.as_deref(), bias_now);
             }
             pv_w(b, slot_cur, &w);
+        } else if let Some((vp0, vp1)) = vpre_m2 {
+            // gen9 M2: the whole M window as one pinned block (vendor order), see pv_qk_window_block_v2
+            let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot_nxt)).collect();
+            let kd_rd = b.add_i32(kd_cur, kds_nxt);
+            let sh16 = b.add_i32(cx.g8, c16i);
+            let q1v = load_q1(b);
+            let trb: Vec<ValueId> = (0..4usize).map(|e| b.add_i32(cx.trx[e], slot_cur)).collect();
+            let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            let pb = b.frag8(w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+            let ba = bacc.expect("M2 needs the bias matrix");
+            let ins = [
+                Opnd::Val(kfb[0]), Opnd::Val(kfb[1]), Opnd::Val(kfb[2]), Opnd::Val(kfb[3]), Opnd::Val(kd_rd), Opnd::Val(cx.g8), Opnd::Val(sh16),
+                Opnd::Val(cx.b0), Opnd::Val(q1v), Opnd::Val(sq0m), Opnd::Val(sq1m), Opnd::Var(ba), Opnd::Val(vp0), Opnd::Val(vp1),
+                Opnd::Val(trb[0]), Opnd::Val(trb[1]), Opnd::Val(trb[2]), Opnd::Val(trb[3]), Opnd::Val(pa), Opnd::Val(pb), Opnd::Val(a_rs), Opnd::Val(idx01), Opnd::Val(idx23), Opnd::Val(c127), Opnd::Val(c123),
+            ];
+            b.var_asm_n(&[s_vars[0], s_vars[1], s_vars[2], s_vars[3], o_vars[0], o_vars[1], o_vars[2], o_vars[3], la], pv_qk_window_block_v2(), &ins);
         } else if win_m && stage && smfrs && smfv && q0_reg && !fmha_t_opt("qonce") && !fmha_t_opt("biasonce") && !fmha_t_opt("biasv") {
             // Block M: PV(t) + QK(t+1) (bias MFMAs, K reads, K scales, QK MFMAs) + row sums as ONE pinned safe-asm block
             let kfb: Vec<ValueId> = (0..4usize).map(|k| b.add_i32(cx.kfx[k], slot_nxt)).collect();
