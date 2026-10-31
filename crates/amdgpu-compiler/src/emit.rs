@@ -555,6 +555,17 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             let mn = if inst.op == MOp::BufferLoadDwordX4Lds { "buffer_load_dwordx4" } else { "buffer_load_dword" };
             vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), format!("{mn} {}", mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, true))]
         }
+        MOp::SBufferRsrcDyn => {
+            let d = a.phys[inst.dst.unwrap() as usize];
+            let b = a.phys[reg_of(&inst.srcs[0]) as usize];
+            let n = a.phys[reg_of(&inst.srcs[1]) as usize];
+            vec![
+                format!("s_mov_b32 s{d}, s{b}"),
+                format!("s_and_b32 s{}, s{}, 0xffff", d + 1, b + 1),
+                format!("s_mov_b32 s{}, s{n}", d + 2),
+                format!("s_mov_b32 s{}, 0x00020000", d + 3),
+            ]
+        }
         MOp::SBufferRsrc => {
             let d = a.phys[inst.dst.unwrap() as usize];
             let b = a.phys[reg_of(&inst.srcs[0]) as usize];

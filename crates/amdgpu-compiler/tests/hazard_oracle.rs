@@ -23,7 +23,7 @@ fn is_special(op: MOp) -> bool {
     matches!(op, MOp::SNop | MOp::SWaitVm | MOp::SWaitLgkm | MOp::SEndpgm | MOp::SBarrier)
         || matches!(
             op,
-            MOp::SBufferRsrc | MOp::BufferLoadDwordX1 | MOp::BufferLoadDwordX2 | MOp::BufferLoadDwordX4 | MOp::BufferStoreDwordX1 | MOp::BufferStoreDwordX2 | MOp::BufferStoreDwordX4
+            MOp::SBufferRsrc | MOp::SBufferRsrcDyn | MOp::BufferLoadDwordX1 | MOp::BufferLoadDwordX2 | MOp::BufferLoadDwordX4 | MOp::BufferStoreDwordX1 | MOp::BufferStoreDwordX2 | MOp::BufferStoreDwordX4
         )
 }
 

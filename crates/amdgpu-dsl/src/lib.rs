@@ -179,6 +179,8 @@ pub enum Op {
     /// Buffer resource descriptor over the scalar (kernarg) pointer `base`: 4 SGPRs = [base lo, base hi (bits 47:32), num_records, flags]. Bounds checking
     /// is off with `num_records = 0xFFFF_FFFF`; the descriptor is allocated and reused by the compiler like any other SGPR value.
     BufferRsrc { base: Opnd, num_records: u32 },
+    /// Descriptor with a RUNTIME `num_records` (a wave-uniform integer value or loop variable, in bytes): dword2 of the descriptor is an SGPR copy.
+    BufferRsrcDyn { base: Opnd, num_records: Opnd },
     /// MUBUF load (`buffer_load_dword[x2|x4]`): address = resource base + `voff` (per-lane byte offset, absent = `off` form) + `soff` (wave-uniform byte
     /// offset, SGPR or 0) + `imm` (12-bit). `dwords` = 1 (f32), 2 (frag2), 4 (frag4).
     BufferLoad { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, dwords: u8 },
@@ -287,7 +289,7 @@ impl Op {
             Op::ExpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } | Op::LoadF32Coherent { .. } => DType::F32,
             Op::AtomicAddU32 { .. } => DType::U32,
             Op::LoadB128Coherent { .. } => DType::Frag4,
-            Op::BufferRsrc { .. } => DType::Rsrc,
+            Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } => DType::Rsrc,
             Op::BufferLoad { dwords, .. } => match dwords {
                 1 => DType::F32,
                 2 => DType::Frag2,
@@ -393,6 +395,7 @@ impl Op {
         Op::AtomicAddU32 { base, value, .. } => vec![*base, *value],
             Op::LoadLdsB128x2 { lo, hi } => vec![*lo, *hi],
             Op::BufferRsrc { base, .. } => vec![*base],
+            Op::BufferRsrcDyn { base, num_records } => vec![*base, *num_records],
             Op::BufferLoad { rsrc, voff, soff, .. } => {
                 let mut v = vec![*rsrc];
                 v.extend(voff.iter().copied());
@@ -735,6 +738,11 @@ impl FnBuilder {
     /// MUBUF -> LDS DMA of 16 bytes per lane (`buffer_load_dwordx4 ... lds`): LDS destination = M0 (`lds_addr`) + imm + 16 * lane.
     pub fn buffer_load_lds_b128(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, lds_addr: impl Into<Opnd>, imm: u32) {
         self.f.stmts.push(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords: 4 });
+    }
+    /// Descriptor with a RUNTIME byte range: `num_records` is a wave-uniform integer (kernarg value, scalar arithmetic or loop variable). Rebuild it where the
+    /// value changes (the descriptor is an ordinary SGPR-quad value). Reads at offset >= num_records return 0, writes are dropped.
+    pub fn buffer_desc_dyn(&mut self, ptr: impl Into<Opnd>, num_records_bytes: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::BufferRsrcDyn { base: ptr.into(), num_records: num_records_bytes.into() })
     }
     /// Alias names used by the kernels: descriptor over a kernarg pointer with `num_records` bytes (reads at offset >= num_records return 0, writes are dropped).
     pub fn buffer_desc(&mut self, ptr: impl Into<Opnd>, num_records_bytes: u32) -> ValueId {
@@ -1503,6 +1511,14 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                     Op::BufferRsrc { base, .. } => {
                         if let Err(e) = expect_ptr(f, *base, "buffer descriptor base") {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::BufferRsrcDyn { base, num_records } => {
+                        if let Err(e) = expect_ptr(f, *base, "buffer descriptor base") {
+                            errs.push(here(e));
+                        }
+                        if let Err(e) = expect_int(f, *num_records, "buffer descriptor num_records") {
                             errs.push(here(e));
                         }
                     }

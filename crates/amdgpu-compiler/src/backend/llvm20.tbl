@@ -132,6 +132,7 @@ X_Sep       | <- | S_NOP 15
 X_Drain     | <- | S_WAITCNT 0
 
 # ---- MUBUF (buffer) memory ops: srcs [rsrc S4, voffset (V1 = OFFEN, I = the OFFSET form), soffset (S1 or I)]; stores [data, rsrc, voffset, soffset]. The LDS-DMA forms are own-only (like global_load_lds).
+SBufferRsrcDyn | S4 <- S2 S1 | {d.0} = S_MOV_B32 {s0.0} ;; {d.1} = S_AND_B32 {s0.1}, 65535, implicit-def dead $scc ;; {d.2} = S_MOV_B32 {s1} ;; {d.3} = S_MOV_B32 131072
 SBufferRsrc | S4 <- S2 | {d.0} = S_MOV_B32 {s0.0} ;; {d.1} = S_AND_B32 {s0.1}, 65535, implicit-def dead $scc ;; {d.2} = S_MOV_B32 {imm32} ;; {d.3} = S_MOV_B32 131072
 BufferLoadDwordX1:rrr | V1 <- S4 V1 S1 | {d} = BUFFER_LOAD_DWORD_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s32), addrspace 8)
 BufferLoadDwordX1:rri | V1 <- S4 V1 I | {d} = BUFFER_LOAD_DWORD_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s32), addrspace 8)

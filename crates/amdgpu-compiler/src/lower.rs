@@ -1951,6 +1951,23 @@ impl Lowerer {
                 self.push(MInst::new(MOp::SBufferRsrc).def(d).srcreg(br).imm(*num_records as i64));
                 self.val.insert(dst, d);
             }
+            Op::BufferRsrcDyn { base, num_records } => {
+                let Opnd::Val(bv) = *base else { return Err("buffer descriptor base must be a kernarg pointer value".to_string()) };
+                let br = *self.val.get(&bv).ok_or_else(|| format!("value v{bv} not lowered"))?;
+                if self.mir.vreg_class(br) != RClass::S2 {
+                    return Err("buffer descriptor base must be a scalar (kernarg) pointer".to_string());
+                }
+                self.touch(&[Src::Reg(br)]);
+                let d = self.new_vreg(RClass::S4);
+                match self.s_operand(*num_records)? {
+                    Src::Imm(k) => self.push(MInst::new(MOp::SBufferRsrc).def(d).srcreg(br).imm(k)),
+                    Src::Reg(n) => {
+                        self.touch(&[Src::Reg(n)]);
+                        self.push(MInst::new(MOp::SBufferRsrcDyn).def(d).srcreg(br).srcreg(n));
+                    }
+                }
+                self.val.insert(dst, d);
+            }
             Op::BufferLoad { rsrc, voff, soff, imm, dwords } => {
                 let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
                 let (cls, mop) = match dwords {
