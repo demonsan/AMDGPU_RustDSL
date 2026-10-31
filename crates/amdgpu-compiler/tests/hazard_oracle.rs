@@ -104,6 +104,11 @@ fn hazard_matrix() {
     let mir = llvm_mir::export_with(&m, &a, true).expect("export").mir;
     let mut tail = LlvmTail::new();
     tail.skip_lock = true;
+    if let Ok(p) = std::env::var("AMDC_ORACLE_OUT") {
+        if !p.is_empty() {
+            let _ = std::fs::write(format!("{p}.mir"), &mir); // written BEFORE llc so a failing llc can be reproduced by hand
+        }
+    }
     let asm = tail.run_llc("oracle", &mir, "gcn-create-vopd").expect("llc");
     if let Ok(p) = std::env::var("AMDC_ORACLE_OUT") {
         if !p.is_empty() {
