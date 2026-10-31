@@ -1752,6 +1752,43 @@ address-provenance table for every LDS region and a wide-store WAR hazard check.
 symmetric "barrier before epilogue" as a correctness fix; it can widen this window. `epdirect` remains
 an opt-in fallback (bit-identical, ~11% split cost) if a future hazard is found.
 
+## 7.12 Certified closure (Main v2.2-round75-final)
+
+Snapshot: **Main `8fec359`, tag `v2.2-round75-final`**. This is the certified our-vs-vendor table; historical
+round tables above are superseded for headline numbers.
+
+| metric | ours | vendor (same-run) | ratio |
+|---|---:|---:|---:|
+| shipped auto, B1H8S2048 (split s=4 + combine8h) | **674-705 TFLOP/s** | 536-539 | **1.25-1.31x** |
+| per-CU, `_vs128`, 64 blocks | **453-455 TFLOP/s = 7.07-7.10 TF/CU** | 8.41 TF/CU | **1.19x gap** |
+| filled B4H8S2048 | 1443.6 / 1454.8 (med/best) | 1706.8 | **0.846x** |
+| filled B1H8S8192 | 1998.6 / 2002.7 (med/best) | 2376.5 | **0.841x** |
+| mid shapes (auto path) | 1.00-1.16x vendor (e.g. B2H8S2048 1.00x, B1H8S4096 1.07x, B3H3S768 1.11x, B1H16S256 1.16x, B1H8S1024 1.01x) | same-run | - |
+| accuracy | mean **8.3e-4**; 15/15 gate, 16/64-row parity 15/15, our bad 0 | mean 1.5-2.9e-3 | 2-3x better |
+
+**Vendor XDL arithmetic (verified from disassembly).** The vendor hot loop has, per 128-key tile, 8 scaled QK
+MFMAs + 8 unscaled PV MFMAs, **2 smfmac row sums, and 1 bf16 bias MFMA** (the bias C is computed once per tile
+inside the loop at 0x29b8/0x3098 and reused as the QK C operand; rollback 0x9d4c has its own copy):
+`16*64 + 2*16 + 1*32 = 1088` XDL cycles. Ours is `16*64 + 4*16 + 4*32 = 1216`: the extra **2 smfmac** and
+**3 bias MFMAs** account for the 128-cycle difference. The scaled-vs-unscaled mix is not a cost: the `p4`
+build switches PV to unscaled and XDL remains 1216.
+
+**Gen10 attribution (bounded structural cycle, hard gate failed).** Best valid variant: wave **1453**, XDL
+**1130** (gate required <=1263 and <=1119). The 42-cycle gap to the 1088 instruction-count floor is
+**19 cycles from the separate-C scaled MFMA form** (`qkzero` diagnostic 1130->1111) plus **23 cycles
+consistent with our 4 smfmac vs the vendor's 2** (2x16=32, partly overlapped). Even the numerically invalid
+`qkzero` build is at 1111, 23 above 1088, and its wave is still 1355. The saved XDL reappears as WAIT_ANY
+(+118 for `biasacc` vs base), i.e. at the barrier rendezvous; it does not become wall time. Per-CU/filled
+sweeps of all gen10 variants are in `docs/status.md` round 75 and `docs/current-status.md` section 5.
+
+**Closure statement.** The structural line is closed with the filled ratios **0.846x / 0.841x**; occupancy is
+identical to the vendor (1 block/8 waves per CU, 2 waves/SIMD, LDS 102400 vs 84224 B, VGPR 249 vs 246), so the
+gap is purely the per-CU critical path. A future phase design must achieve all three: (1) match the vendor's
+**2-smfmac row-sum structure** (not our 4), (2) eliminate the **19-cycle separate-C QK overhead**, and
+(3) redesign the **half-tile phase offset/barrier rendezvous** so the 128 freed XDL cycles become wall time.
+No instruction-level or cover patch has achieved this; the vendor 1088/1157 is physically possible at the same
+occupancy, but only with a from-scratch M-window/phase design.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as

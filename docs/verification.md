@@ -190,3 +190,77 @@ Five bugs of one family - "a consumer reads a register or a flag whose content i
 Constant-bus corollary found the same day: gfx9 allows ONE distinct scalar source per VALU instruction and `v_cndmask_b32_e32` reads `vcc` through it, so an SGPR source there is illegal (assembler error "violates constant bus restrictions"); `tests/asm_assembles.rs` now runs every fmha kernel through the real assembler.
 
 Measured negatives on `_vs128` (current Main, base 351-353 TFLOP/s): `sbound`+`waveuni` (INT32 VALU -8% static, SALU x3.5) = -1..0%; `vccfill` (independent instructions between a `v_cmp` and its `v_cndmask`, s_nop 236 -> 200) = +0.3% (inside noise); `maskreg` (compares into SGPR pairs + `v_cndmask_e64`, several masks in flight, s_nop cycles 644 -> 348) = -0.8% (all pairs), +0.1% (every 4th); scheduler knobs `ldshoist`, `hoist=24`, `xbar` = -1..+0.5%. Conclusion: the per-wave instruction count and the s_nop padding are not on the critical path of `_vs128` (other waves of the SIMD cover them); the lgkmcnt(0) waits in the MFMA blocks come from explicit `wait_lds` in the kernel DSL, not from the wait pass. All of these stay opt-in flags.
+
+---
+
+## Current verification status (final)
+
+Snapshot: **Main `8fec359` (`v2.2-round75-final`)**, MI355X / gfx950, node 53, GPU 5. All numbers here
+match `docs/current-status.md`; this section supersedes earlier per-round test/probe counts below.
+
+### cargo test
+
+`cargo test` = **111 tests / 28 test targets, all green**. 21 integration test files (plus `tests/common/mod.rs`
+and the safe-asm `tests/ui/*.rs` compile-fail corpus):
+
+| test file | what it guards |
+|---|---|
+| `tail_invariance.rs` | RA and scheduling stay ours; the LLVM tail only adds waits/padding and writes the descriptor |
+| `mir_invariants.rs` | default-on lowering (`dce`, `cmpfold`) + allocation invariants |
+| `register_accounting.rs` | independent audit of the final asm: descriptor ranges, tuple shapes, defined-before-use, mutation self-test |
+| `asm_assembles.rs` | every emitted kernel passes the real assembler (constant-bus / operand legality) |
+| `hazard_classes.rs` | own tail pads every "VALU write -> hazard-sensitive reader" writer class |
+| `hazard_oracle.rs` | per-(producer,consumer,slot) hardware oracle for hazard padding |
+| `phys_waw.rs` | physical WAW: RA must not reuse the destination of an in-flight MFMA |
+| `ra_reaching.rs` | two-phase RA reaching-writer: path-aware accept/reject (`constres1..6`) |
+| `pin_check.rs` / `pinning.rs` | pinned safe-asm blocks survive scheduling verbatim and pass the final-MIR checks |
+| `dead_loads.rs` | async load result may not share a register with a live value |
+| `var_lint.rs` | loop-variable re-read lint precision and known-rereader scope |
+| `smfmac_hazards.rs` | SMFMAC implicit accumulator C / 16-wait-state hazard |
+| `dma_hazards.rs` | VALU write -> `v_readfirstlane` wait model |
+| `lite_contract.rs` | fused-combine lite memory contract on emitted asm |
+| `safeasm.rs` | safe-asm sequences through the compiler and DSL equivalence |
+| `sgpr_legality.rs` | gfx9 VALU constant-bus/SGPR legality |
+| `backend.rs` / `backend_auto.rs` | backend regressions and own-only auto selection |
+| `llvm_tail.rs` | LLVM-tail backend tests (loud skip if pinned llc unavailable) |
+| `compile_fail.rs` | 28 `ui/fail_*` must fail with the expected diagnostic; one pass case must compile |
+
+### Hardware probe suite
+
+`tools/` contains **29 shell scripts** (the current tree; earlier snapshots listed ~26): `vendor_validate.sh`,
+`vendor_counters.sh`, `vendor_disasm.sh`, `vendor_smfmac_probe.sh`, `ab.sh`, `opt_ab.sh`, `bit_exactness.sh`,
+`ohat_repro.sh`, `buffer_probe.sh`, `cvtchain_probe.sh`, `mfma_unscaled_probe.sh`, `mfma_cform_probe.sh`,
+`store_x2_probe.sh`, `last_arriver_probe.sh`, `last_arriver8_probe.sh`, `safeasm_window_validate.sh`,
+`safeasm_e2e_probe.sh`, `race_repro.sh`, `hazard_oracle.sh`, `gen3_barrier_probe.sh`, `gen3_sync_probe.sh`,
+`sched_ab.sh`, `sched_hw.sh`, `sched_model_vs_hw.sh`, `llvm_build_llc.sh`, `llvm_conformance.sh`,
+`log_store4_probe.sh`, `auto_vs_plain.sh`, `counters.sh`.
+
+### Three real correctness bugs found and fixed this session
+
+1. **Physical WAW (MFMA in-flight result registers).** The `biasacc,vpre` combination produced **6 different
+   md5s** across launches; after the physical-WAW padding (`pad_physical_war` tracks in-flight MFMA destination
+   intervals and propagates them across basic blocks) the same build gave **8/8 identical** outputs.
+   Guard: `tests/phys_waw.rs` + MIR regression.
+2. **Two-phase RA reaching-writer false positive.** `FMHA_OPT=constres1` produced **48 violations** (the broad
+   kernel sweep later counted **88**); ordinary persistent loop variables could not compile. Fixed with a
+   path-aware/history check that still rejects real clobbers. Guard: `tests/ra_reaching.rs`.
+3. **VMEM wide-store data WAR.** `global_store_dwordx4` reads its data VGPRs for several cycles after issue; a
+   VALU write within 2 wait states overwrote unread store data. On the shipped split path this gave **~5%
+   non-majority outputs at quiet load and up to 97% under timing shifts** on B1H2S200 SK1337 (specific
+   role-B/lane/column signature), while `epdirect` and non-split shapes were clean. `pad_physical_war` now
+   records wide-store data ranges; the only shipped-asm change is **`_kvsplit` +4 `s_nop`**, and
+   **1200/1200 launches** across four uneven-tile split shapes are a single md5. Guard: `tools/ohat_repro.sh`
+   (300 launches) + `_kvsplit` 4-shape stress.
+
+### Measurement-protocol rules (enforced from this session)
+
+* Every variant's `.s` and `.co` are traced to the exact source/commit; never compare a rebuild against a
+  stale binary.
+* **>=8-12 interleaved rounds** per A/B (alternating base/variant within one process/session), not a single
+  back-to-back run; record same-run vendor TFLOP/s as the load indicator.
+* Filled-grid/absolute numbers always include the **same-run vendor**.
+* Split/uneven-tile shapes require **repeated launches with full-output md5**, not a single 5/5 determinism run.
+* `FMHA_OPT=eplds,epw` is the **sensitivity control** for the wide-VMEM-store hazard: a clean 100/100 is
+  required; pre-fix it failed 94-97%.
+* Occupancy/resource claims come from the code-object descriptor (`llvm-readelf --notes`), not profiler trace
+  columns.
