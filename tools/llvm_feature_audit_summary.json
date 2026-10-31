@@ -3,7 +3,7 @@
   "n_mops": 123,
   "rows_llvm20": 112,
   "rows_llvm24": 112,
-  "n_universe_mnemonics": 99
+  "n_universe_mnemonics": 95
  },
  "summary": {
   "n_tests": 4996,
@@ -24,8 +24,8 @@
   },
   "by_status": {
    "OUT-OF-SCOPE": 4912,
-   "COVERED": 26,
-   "PARTIAL": 58
+   "COVERED": 16,
+   "PARTIAL": 68
   },
   "globalisel_tests": 1148,
   "tests_with_requires": 65,
@@ -335,8 +335,8 @@
   "by_status_x_kind": {
    "codegen": {
     "OUT-OF-SCOPE": 2760,
-    "COVERED": 26,
-    "PARTIAL": 58
+    "COVERED": 16,
+    "PARTIAL": 68
    },
    "mir-pass": {
     "OUT-OF-SCOPE": 1807
@@ -351,13 +351,12 @@
   "by_status_x_ext": {
    "ll": {
     "OUT-OF-SCOPE": 3368,
-    "COVERED": 25,
-    "PARTIAL": 57
+    "COVERED": 16,
+    "PARTIAL": 66
    },
    "mir": {
     "OUT-OF-SCOPE": 1544,
-    "PARTIAL": 1,
-    "COVERED": 1
+    "PARTIAL": 2
    }
   },
   "oos_reasons": [
@@ -384,13 +383,13 @@
   ],
   "gfx950_class_codegen": {
    "OUT-OF-SCOPE": 266,
-   "COVERED": 26,
-   "PARTIAL": 58
+   "COVERED": 16,
+   "PARTIAL": 68
   },
   "gfx950_only_codegen": {
    "OUT-OF-SCOPE": 76,
-   "PARTIAL": 9,
-   "COVERED": 12
+   "PARTIAL": 12,
+   "COVERED": 9
   },
   "features": [
    [
@@ -422,16 +421,16 @@
     339
    ],
    [
-    "alloca",
-    217
-   ],
-   [
     "scratch_instructions",
-    199
+    245
    ],
    [
     "spill_or_scratch_checked",
-    196
+    222
+   ],
+   [
+    "alloca",
+    217
    ],
    [
     "atomicrmw",
@@ -1171,155 +1170,144 @@
    ]
   ],
   "n_distinct_amdgcn_intrinsics": 2381,
-  "n_distinct_opcodes_in_tests": 2848,
+  "n_distinct_opcodes_in_tests": 3010,
   "top_opcodes_in_tests": [
    [
-    "s_endpgm",
-    1867
+    "v_mov_b32",
+    2017
    ],
    [
-    "v_mov_b32",
-    1858
+    "s_endpgm",
+    1982
    ],
    [
     "s_mov_b32",
-    1599
+    1743
    ],
    [
     "s_waitcnt",
-    1552
-   ],
-   [
-    "s_setpc_b64",
-    906
+    1657
    ],
    [
     "s_mov_b64",
-    901
+    993
+   ],
+   [
+    "s_setpc_b64",
+    955
    ],
    [
     "v_and_b32",
-    647
-   ],
-   [
-    "buffer_store_dword",
-    601
+    749
    ],
    [
     "v_lshlrev_b32",
-    595
+    678
    ],
    [
-    "s_nop",
-    580
-   ],
-   [
-    "s_load_dwordx2",
-    531
+    "buffer_store_dword",
+    674
    ],
    [
     "s_delay_alu",
-    527
+    669
+   ],
+   [
+    "s_nop",
+    651
+   ],
+   [
+    "s_load_dwordx2",
+    594
    ],
    [
     "buffer_load_dword",
-    518
-   ],
-   [
-    "s_and_b32",
-    484
-   ],
-   [
-    "v_cndmask_b32",
-    483
+    574
    ],
    [
     "v_readfirstlane_b32",
-    473
+    571
    ],
    [
-    "v_add_u32",
-    463
+    "s_and_b32",
+    557
    ],
    [
-    "s_load_dword",
-    448
-   ],
-   [
-    "s_branch",
-    434
+    "v_cndmask_b32",
+    535
    ],
    [
     "v_or_b32",
-    432
+    512
    ],
    [
-    "s_add_u32",
-    430
+    "s_load_dword",
+    506
    ],
    [
-    "s_add_i32",
-    418
-   ],
-   [
-    "s_and_b64",
-    411
-   ],
-   [
-    "v_cmp_eq_u32",
-    410
-   ],
-   [
-    "s_addc_u32",
-    405
+    "v_add_u32",
+    505
    ],
    [
     "s_load_dwordx4",
-    401
+    473
    ],
    [
-    "global_store_dword",
-    383
-   ],
-   [
-    "s_wait_kmcnt",
-    373
-   ],
-   [
-    "v_lshrrev_b32",
-    373
+    "s_add_u32",
+    469
    ],
    [
     "v_dual_mov_b32",
-    358
+    468
+   ],
+   [
+    "s_add_i32",
+    459
+   ],
+   [
+    "v_lshrrev_b32",
+    450
+   ],
+   [
+    "s_wait_kmcnt",
+    446
+   ],
+   [
+    "s_addc_u32",
+    444
+   ],
+   [
+    "s_and_b64",
+    443
+   ],
+   [
+    "s_branch",
+    441
+   ],
+   [
+    "global_store_dword",
+    431
+   ],
+   [
+    "v_cmp_eq_u32",
+    430
    ]
   ],
   "top_missing_opcodes_gfx950_class": [
    {
     "opcode": "s_setpc_b64",
-    "tests": 200,
+    "tests": 210,
     "examples": [
      "a-v-flat-atomicrmw.ll",
      "a-v-global-atomicrmw.ll",
+     "amdgcn-av-scopes.ll",
      "arbitrary-fp-to-float-fp8-hw.ll",
-     "atomicrmw-expand.ll",
-     "bf16.ll"
-    ]
-   },
-   {
-    "opcode": "s_mov_b64",
-    "tests": 60,
-    "examples": [
-     "a-v-flat-atomicrmw.ll",
-     "a-v-global-atomicrmw.ll",
-     "amdgpu-cs-chain-fp-nosave.ll",
-     "atomicrmw-expand.ll",
-     "av-split-dead-valno-crash.ll"
+     "atomicrmw-expand.ll"
     ]
    },
    {
     "opcode": "v_mov_b64",
-    "tests": 60,
+    "tests": 86,
     "examples": [
      "a-v-flat-atomicrmw.ll",
      "a-v-global-atomicrmw.ll",
@@ -1329,8 +1317,52 @@
     ]
    },
    {
+    "opcode": "s_mov_b64",
+    "tests": 74,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "amdgpu-cs-chain-fp-nosave.ll",
+     "atomicrmw-expand.ll",
+     "attributor-flatscratchinit-undefined-behavior2.ll"
+    ]
+   },
+   {
+    "opcode": "scratch_load_dword",
+    "tests": 45,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "attributor-flatscratchinit-undefined-behavior2.ll",
+     "bf16.ll",
+     "flat-scratch.ll"
+    ]
+   },
+   {
+    "opcode": "s_load_dwordx4",
+    "tests": 45,
+    "examples": [
+     "av-split-dead-valno-crash.ll",
+     "buffer-fat-pointers-memcpy.ll",
+     "build_vector.ll",
+     "dagcombine-select.ll",
+     "fp64-atomics-gfx90a.ll"
+    ]
+   },
+   {
+    "opcode": "v_cmp_eq_u32",
+    "tests": 44,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "bf16-conversions.ll",
+     "bf16.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll"
+    ]
+   },
+   {
     "opcode": "v_alignbit_b32",
-    "tests": 39,
+    "tests": 44,
     "examples": [
      "bitop3-shared-operand.ll",
      "div-rem-by-constant-64.ll",
@@ -1340,73 +1372,117 @@
     ]
    },
    {
-    "opcode": "s_load_dwordx4",
-    "tests": 37,
+    "opcode": "s_movk_i32",
+    "tests": 40,
     "examples": [
-     "av-split-dead-valno-crash.ll",
-     "build_vector.ll",
-     "dagcombine-select.ll",
-     "fp64-atomics-gfx90a.ll",
-     "imm.ll"
+     "bf16-conversions.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll",
+     "dagcombine-reassociate-multi-memop.ll"
     ]
    },
    {
-    "opcode": "v_cmp_eq_u32",
-    "tests": 36,
+    "opcode": "s_or_b64",
+    "tests": 39,
     "examples": [
      "a-v-flat-atomicrmw.ll",
      "a-v-global-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "bf16-conversions.ll",
+     "bf16.ll"
+    ]
+   },
+   {
+    "opcode": "v_bfi_b32",
+    "tests": 37,
+    "examples": [
      "bf16.ll",
+     "bitop3-shared-operand.ll",
+     "bitop3.ll",
+     "insert_vector_elt.v2bf16.ll",
+     "llvm.amdgcn.fdot2.f32.bf16.ll"
+    ]
+   },
+   {
+    "opcode": "s_add_i32",
+    "tests": 34,
+    "examples": [
+     "amdgpu-cs-chain-fp-nosave.ll",
+     "attributor-flatscratchinit-undefined-behavior2.ll",
+     "bf16-conversions.ll",
+     "bf16.ll",
+     "buffer-fat-pointers-memcpy.ll"
+    ]
+   },
+   {
+    "opcode": "s_pack_ll_b32_b16",
+    "tests": 34,
+    "examples": [
+     "bf16-conversions.ll",
+     "build_vector.ll",
+     "fptrunc.f16.ll",
+     "insert_vector_elt.v2bf16.ll",
+     "shufflevector.v2bf16.v2bf16.ll"
+    ]
+   },
+   {
+    "opcode": "v_lshl_add_u64",
+    "tests": 33,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "dagcombine-select.ll",
+     "div-rem-by-constant-64.ll",
+     "dpp64_combine.ll"
+    ]
+   },
+   {
+    "opcode": "s_and_b64",
+    "tests": 32,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "atomicrmw-expand.ll",
+     "av-split-dead-valno-crash.ll",
+     "bf16-conversions.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll"
+    ]
+   },
+   {
+    "opcode": "s_cbranch_execnz",
+    "tests": 29,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "atomicrmw-expand.ll",
      "buffer-fat-pointer-atomicrmw-fadd.ll",
      "buffer-fat-pointer-atomicrmw-fmax.ll"
     ]
    },
    {
-    "opcode": "s_or_b64",
-    "tests": 35,
+    "opcode": "v_bfe_u32",
+    "tests": 28,
     "examples": [
-     "a-v-flat-atomicrmw.ll",
-     "a-v-global-atomicrmw.ll",
-     "atomicrmw-expand.ll",
-     "bf16.ll",
-     "buffer-fat-pointer-atomicrmw-fadd.ll"
-    ]
-   },
-   {
-    "opcode": "v_bfi_b32",
-    "tests": 35,
-    "examples": [
-     "bf16.ll",
-     "bitop3-shared-operand.ll",
-     "insert_vector_elt.v2bf16.ll",
-     "llvm.amdgcn.fdot2.ll",
-     "shufflevector.v2bf16.v2bf16.ll"
-    ]
-   },
-   {
-    "opcode": "s_pack_ll_b32_b16",
-    "tests": 32,
-    "examples": [
-     "build_vector.ll",
-     "insert_vector_elt.v2bf16.ll",
-     "shufflevector.v2bf16.v2bf16.ll",
-     "shufflevector.v2bf16.v3bf16.ll",
-     "shufflevector.v2bf16.v4bf16.ll"
-    ]
-   },
-   {
-    "opcode": "s_movk_i32",
-    "tests": 30,
-    "examples": [
+     "bf16-conversions.ll",
      "buffer-fat-pointer-atomicrmw-fadd.ll",
      "buffer-fat-pointer-atomicrmw-fmax.ll",
      "buffer-fat-pointer-atomicrmw-fmin.ll",
-     "dagcombine-reassociate-multi-memop.ll",
      "flat-atomicrmw-fadd.ll"
     ]
    },
    {
-    "opcode": "s_cbranch_execnz",
+    "opcode": "v_and_or_b32",
+    "tests": 28,
+    "examples": [
+     "bitop3-shared-operand.ll",
+     "bitop3.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll"
+    ]
+   },
+   {
+    "opcode": "s_andn2_b64",
     "tests": 27,
     "examples": [
      "a-v-flat-atomicrmw.ll",
@@ -1417,58 +1493,36 @@
     ]
    },
    {
-    "opcode": "s_and_b64",
-    "tests": 26,
-    "examples": [
-     "a-v-flat-atomicrmw.ll",
-     "atomicrmw-expand.ll",
-     "av-split-dead-valno-crash.ll",
-     "buffer-fat-pointer-atomicrmw-fadd.ll",
-     "buffer-fat-pointer-atomicrmw-fmax.ll"
-    ]
-   },
-   {
-    "opcode": "s_andn2_b64",
-    "tests": 25,
-    "examples": [
-     "a-v-flat-atomicrmw.ll",
-     "a-v-global-atomicrmw.ll",
-     "atomicrmw-expand.ll",
-     "buffer-fat-pointer-atomicrmw-fadd.ll",
-     "buffer-fat-pointer-atomicrmw-fmax.ll"
-    ]
-   },
-   {
-    "opcode": "scratch_load_dword",
-    "tests": 23,
-    "examples": [
-     "a-v-flat-atomicrmw.ll",
-     "a-v-global-atomicrmw.ll",
-     "bf16.ll",
-     "flat-scratch.ll",
-     "fold-gep-offset.ll"
-    ]
-   },
-   {
-    "opcode": "v_lshl_add_u64",
-    "tests": 23,
-    "examples": [
-     "a-v-flat-atomicrmw.ll",
-     "atomicrmw-expand.ll",
-     "dagcombine-select.ll",
-     "div-rem-by-constant-64.ll",
-     "dpp64_combine.ll"
-    ]
-   },
-   {
     "opcode": "v_add3_u32",
-    "tests": 23,
+    "tests": 27,
     "examples": [
+     "bf16-conversions.ll",
      "buffer-fat-pointer-atomicrmw-fadd.ll",
      "buffer-fat-pointer-atomicrmw-fmax.ll",
      "buffer-fat-pointer-atomicrmw-fmin.ll",
-     "div-rem-by-constant-64.ll",
-     "flat-atomicrmw-fadd.ll"
+     "div-rem-by-constant-64.ll"
+    ]
+   },
+   {
+    "opcode": "scratch_store_dword",
+    "tests": 23,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "amdgpu-cs-chain-fp-nosave.ll",
+     "attributor-flatscratchinit-undefined-behavior2.ll",
+     "bf16.ll"
+    ]
+   },
+   {
+    "opcode": "v_cmp_u_f32",
+    "tests": 23,
+    "examples": [
+     "bf16-conversions.ll",
+     "bf16.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "buffer-fat-pointer-atomicrmw-fmax.ll",
+     "buffer-fat-pointer-atomicrmw-fmin.ll"
     ]
    },
    {
@@ -1483,52 +1537,19 @@
     ]
    },
    {
-    "opcode": "s_add_i32",
-    "tests": 21,
+    "opcode": "v_pk_max_f16",
+    "tests": 22,
     "examples": [
-     "amdgpu-cs-chain-fp-nosave.ll",
-     "bf16.ll",
-     "div-rem-fast-path.ll",
-     "flat-scratch-alloca-issue-155902.ll",
-     "flat-scratch.ll"
-    ]
-   },
-   {
-    "opcode": "v_and_or_b32",
-    "tests": 21,
-    "examples": [
-     "bitop3-shared-operand.ll",
-     "bitop3.ll",
-     "buffer-fat-pointer-atomicrmw-fadd.ll",
-     "buffer-fat-pointer-atomicrmw-fmax.ll",
-     "buffer-fat-pointer-atomicrmw-fmin.ll"
-    ]
-   },
-   {
-    "opcode": "v_cmp_u_f32",
-    "tests": 20,
-    "examples": [
-     "bf16.ll",
-     "buffer-fat-pointer-atomicrmw-fadd.ll",
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
      "buffer-fat-pointer-atomicrmw-fmax.ll",
      "buffer-fat-pointer-atomicrmw-fmin.ll",
-     "flat-atomicrmw-fadd.ll"
-    ]
-   },
-   {
-    "opcode": "v_bfe_u32",
-    "tests": 20,
-    "examples": [
-     "buffer-fat-pointer-atomicrmw-fadd.ll",
-     "buffer-fat-pointer-atomicrmw-fmax.ll",
-     "buffer-fat-pointer-atomicrmw-fmin.ll",
-     "flat-atomicrmw-fadd.ll",
      "flat-atomicrmw-fmax.ll"
     ]
    },
    {
     "opcode": "s_and_saveexec_b64",
-    "tests": 18,
+    "tests": 21,
     "examples": [
      "a-v-flat-atomicrmw.ll",
      "buffer-fat-pointer-atomicrmw-fadd.ll",
@@ -1539,29 +1560,18 @@
    },
    {
     "opcode": "v_accvgpr_write_b32",
-    "tests": 18,
+    "tests": 21,
     "examples": [
      "a-v-flat-atomicrmw.ll",
      "a-v-global-atomicrmw.ll",
      "av-split-dead-valno-crash.ll",
      "bf16.ll",
      "bitop3-shared-operand.ll"
-    ]
-   },
-   {
-    "opcode": "v_not_b32",
-    "tests": 18,
-    "examples": [
-     "a-v-flat-atomicrmw.ll",
-     "a-v-global-atomicrmw.ll",
-     "bf16.ll",
-     "buffer-fat-pointer-atomicrmw-fadd.ll",
-     "buffer-fat-pointer-atomicrmw-fmax.ll"
     ]
    },
    {
     "opcode": "v_accvgpr_read_b32",
-    "tests": 17,
+    "tests": 20,
     "examples": [
      "a-v-flat-atomicrmw.ll",
      "a-v-global-atomicrmw.ll",
@@ -1571,19 +1581,41 @@
     ]
    },
    {
-    "opcode": "v_pk_max_f16",
-    "tests": 17,
+    "opcode": "flat_load_dword",
+    "tests": 19,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "back-off-barrier-subtarget-feature.ll",
+     "flat-atomicrmw-fadd.ll",
+     "flat-atomicrmw-fmax.ll",
+     "flat-atomicrmw-fmin.ll"
+    ]
+   },
+   {
+    "opcode": "v_not_b32",
+    "tests": 19,
     "examples": [
      "a-v-flat-atomicrmw.ll",
      "a-v-global-atomicrmw.ll",
-     "buffer-fat-pointer-atomicrmw-fmax.ll",
-     "buffer-fat-pointer-atomicrmw-fmin.ll",
-     "flat-atomicrmw-fmax.ll"
+     "bf16.ll",
+     "bitop3.ll",
+     "buffer-fat-pointer-atomicrmw-fadd.ll"
+    ]
+   },
+   {
+    "opcode": "s_cselect_b32",
+    "tests": 18,
+    "examples": [
+     "a-v-flat-atomicrmw.ll",
+     "attributor-flatscratchinit-undefined-behavior2.ll",
+     "av-split-dead-valno-crash.ll",
+     "bf16-conversions.ll",
+     "dagcombine-select.ll"
     ]
    },
    {
     "opcode": "v_min_f32",
-    "tests": 16,
+    "tests": 17,
     "examples": [
      "a-v-flat-atomicrmw.ll",
      "a-v-global-atomicrmw.ll",
@@ -1591,45 +1623,12 @@
      "buffer-fat-pointer-atomicrmw-fmin.ll",
      "flat-atomicrmw-fmin.ll"
     ]
-   },
-   {
-    "opcode": "s_xor_b64",
-    "tests": 15,
-    "examples": [
-     "a-v-flat-atomicrmw.ll",
-     "atomicrmw-expand.ll",
-     "av-split-dead-valno-crash.ll",
-     "buffer-fat-pointer-atomicrmw-fadd.ll",
-     "buffer-fat-pointer-atomicrmw-fmax.ll"
-    ]
-   },
-   {
-    "opcode": "v_add_f64",
-    "tests": 14,
-    "examples": [
-     "a-v-flat-atomicrmw.ll",
-     "a-v-global-atomicrmw.ll",
-     "atomicrmw-expand.ll",
-     "flat-atomicrmw-fadd.ll",
-     "flat-atomicrmw-fsub.ll"
-    ]
-   },
-   {
-    "opcode": "global_load_dwordx2",
-    "tests": 14,
-    "examples": [
-     "a-v-global-atomicrmw.ll",
-     "atomicrmw-expand.ll",
-     "bf16.ll",
-     "global-atomicrmw-fsub.ll",
-     "inline-asm-vgpr-sgpr-copy.ll"
-    ]
    }
   ],
   "top_missing_opcodes_all_codegen": [
    {
     "opcode": "s_setpc_b64",
-    "tests": 880,
+    "tests": 929,
     "examples": [
      "a-v-ds-atomic-cmpxchg.ll",
      "a-v-ds-atomicrmw.ll",
@@ -1640,7 +1639,7 @@
    },
    {
     "opcode": "s_mov_b64",
-    "tests": 681,
+    "tests": 771,
     "examples": [
      "a-v-flat-atomic-cmpxchg.ll",
      "a-v-flat-atomicrmw.ll",
@@ -1651,7 +1650,7 @@
    },
    {
     "opcode": "s_delay_alu",
-    "tests": 520,
+    "tests": 662,
     "examples": [
      "abs_i16.ll",
      "add-max.ll",
@@ -1662,7 +1661,7 @@
    },
    {
     "opcode": "s_load_dwordx4",
-    "tests": 399,
+    "tests": 471,
     "examples": [
      "32-bit-local-address-space.ll",
      "add.ll",
@@ -1672,30 +1671,30 @@
     ]
    },
    {
-    "opcode": "s_wait_kmcnt",
-    "tests": 358,
-    "examples": [
-     "abs_i16.ll",
-     "add.ll",
-     "addrspacecast-gas.ll",
-     "amdgcn-call-whole-wave.ll",
-     "amdgpu-cs-chain-fp-nosave.ll"
-    ]
-   },
-   {
     "opcode": "v_dual_mov_b32",
-    "tests": 357,
+    "tests": 467,
     "examples": [
      "add.ll",
      "add.v2i16.ll",
      "add_u64.ll",
-     "amdgcn-call-whole-wave.ll",
-     "amdgcn.bitcast.1024bit.ll"
+     "addrspacecast-gas.ll",
+     "amd.endpgm.ll"
+    ]
+   },
+   {
+    "opcode": "s_wait_kmcnt",
+    "tests": 431,
+    "examples": [
+     "abs_i16.ll",
+     "add.ll",
+     "addrspacecast-gas.ll",
+     "amdgcn-av-scopes.ll",
+     "amdgcn-call-whole-wave.ll"
     ]
    },
    {
     "opcode": "s_add_i32",
-    "tests": 335,
+    "tests": 374,
     "examples": [
      "32-bit-local-address-space.ll",
      "abi-attribute-hints-undefined-behavior.ll",
@@ -1706,7 +1705,7 @@
    },
    {
     "opcode": "s_clause",
-    "tests": 276,
+    "tests": 357,
     "examples": [
      "add.ll",
      "add.v2i16.ll",
@@ -1716,19 +1715,8 @@
     ]
    },
    {
-    "opcode": "s_or_b32",
-    "tests": 275,
-    "examples": [
-     "absdiff.ll",
-     "add.v2i16.ll",
-     "add_i1.ll",
-     "amdgcn.bitcast.1024bit.ll",
-     "amdgcn.bitcast.128bit.ll"
-    ]
-   },
-   {
     "opcode": "s_cselect_b32",
-    "tests": 273,
+    "tests": 320,
     "examples": [
      "32-bit-local-address-space.ll",
      "a-v-flat-atomicrmw.ll",
@@ -1739,18 +1727,18 @@
    },
    {
     "opcode": "s_wait_loadcnt_dscnt",
-    "tests": 270,
+    "tests": 315,
     "examples": [
      "abs_i16.ll",
+     "amdgcn-av-scopes.ll",
      "amdgcn-call-whole-wave.ll",
-     "amdgpu-cs-chain-fp-nosave.ll",
-     "andorn2.ll",
-     "arbitrary-fp-to-float-fp8-hw.ll"
+     "amdgcn-cs-chain-intrinsic-dyn-vgpr-w32.ll",
+     "amdgpu-cs-chain-fp-nosave.ll"
     ]
    },
    {
     "opcode": "flat_store_dword",
-    "tests": 267,
+    "tests": 310,
     "examples": [
      "abi-attribute-hints-undefined-behavior.ll",
      "add.ll",
@@ -1760,8 +1748,41 @@
     ]
    },
    {
+    "opcode": "s_or_b32",
+    "tests": 310,
+    "examples": [
+     "absdiff.ll",
+     "add.v2i16.ll",
+     "add_i1.ll",
+     "amdgcn.bitcast.1024bit.ll",
+     "amdgcn.bitcast.128bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_load_b64",
+    "tests": 303,
+    "examples": [
+     "add.ll",
+     "add.v2i16.ll",
+     "add_i1.ll",
+     "addrspacecast-gas.ll",
+     "amd.endpgm.ll"
+    ]
+   },
+   {
+    "opcode": "s_or_b64",
+    "tests": 299,
+    "examples": [
+     "a-v-flat-atomic-cmpxchg.ll",
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "add_i1.ll",
+     "amdgcn.bitcast.1024bit.ll"
+    ]
+   },
+   {
     "opcode": "s_and_b64",
-    "tests": 261,
+    "tests": 292,
     "examples": [
      "a-v-flat-atomicrmw.ll",
      "add.ll",
@@ -1771,30 +1792,8 @@
     ]
    },
    {
-    "opcode": "s_or_b64",
-    "tests": 259,
-    "examples": [
-     "a-v-flat-atomic-cmpxchg.ll",
-     "a-v-flat-atomicrmw.ll",
-     "a-v-global-atomicrmw.ll",
-     "add_i1.ll",
-     "amdgcn.bitcast.1024bit.ll"
-    ]
-   },
-   {
-    "opcode": "v_cmp_eq_u32",
-    "tests": 253,
-    "examples": [
-     "a-v-flat-atomicrmw.ll",
-     "a-v-global-atomicrmw.ll",
-     "abi-attribute-hints-undefined-behavior.ll",
-     "add_i1.ll",
-     "amdgcn.bitcast.ll"
-    ]
-   },
-   {
     "opcode": "global_store_b32",
-    "tests": 239,
+    "tests": 292,
     "examples": [
      "add.ll",
      "add.v2i16.ll",
@@ -1804,52 +1803,30 @@
     ]
    },
    {
-    "opcode": "v_add_i32",
-    "tests": 235,
+    "opcode": "s_wait_loadcnt",
+    "tests": 289,
     "examples": [
      "add.ll",
-     "add_i128.ll",
-     "add_i64.ll",
-     "addrspacecast.gfx6.ll",
-     "amdgcn.bitcast.1024bit.ll"
+     "amdgcn-av-scopes.ll",
+     "amdgcn-call-whole-wave.ll",
+     "anyext-s16-to-s64.ll",
+     "asyncmark-gfx12plus.ll"
     ]
    },
    {
-    "opcode": "s_load_b64",
-    "tests": 231,
+    "opcode": "v_cmp_eq_u32",
+    "tests": 273,
     "examples": [
-     "add.ll",
-     "add.v2i16.ll",
+     "a-v-flat-atomicrmw.ll",
+     "a-v-global-atomicrmw.ll",
+     "abi-attribute-hints-undefined-behavior.ll",
      "add_i1.ll",
-     "addrspacecast-gas.ll",
      "amdgcn.bitcast.ll"
     ]
    },
    {
-    "opcode": "s_wait_loadcnt",
-    "tests": 228,
-    "examples": [
-     "add.ll",
-     "amdgcn-call-whole-wave.ll",
-     "asyncmark-gfx12plus.ll",
-     "atomic_optimizations_buffer.ll",
-     "atomic_optimizations_dpp_lds_expected_active_lanes.ll"
-    ]
-   },
-   {
-    "opcode": "s_cmp_lg_u32",
-    "tests": 222,
-    "examples": [
-     "32-bit-local-address-space.ll",
-     "a-v-flat-atomicrmw.ll",
-     "add.ll",
-     "addrspacecast.ll",
-     "agpr-copy-no-free-registers.ll"
-    ]
-   },
-   {
     "opcode": "s_movk_i32",
-    "tests": 219,
+    "tests": 272,
     "examples": [
      "32-bit-local-address-space.ll",
      "a-v-flat-atomicrmw.ll",
@@ -1859,85 +1836,30 @@
     ]
    },
    {
-    "opcode": "s_xor_b64",
-    "tests": 196,
+    "opcode": "s_cmp_lg_u32",
+    "tests": 255,
     "examples": [
-     "a-v-flat-atomic-cmpxchg.ll",
+     "32-bit-local-address-space.ll",
      "a-v-flat-atomicrmw.ll",
-     "add_i1.ll",
-     "agpr-copy-no-free-registers.ll",
-     "amdgcn.bitcast.1024bit.ll"
-    ]
-   },
-   {
-    "opcode": "s_setreg_imm32_b32",
-    "tests": 195,
-    "examples": [
-     "add-max.ll",
-     "add_u64.ll",
+     "add.ll",
      "addrspacecast-gas.ll",
-     "asyncmark-gfx12plus.ll",
-     "bf16-conversions.ll"
+     "addrspacecast.ll"
     ]
    },
    {
-    "opcode": "s_cbranch_execz",
-    "tests": 194,
+    "opcode": "v_add_i32",
+    "tests": 251,
     "examples": [
-     "a-v-flat-atomic-cmpxchg.ll",
-     "a-v-flat-atomicrmw.ll",
-     "add_i1.ll",
-     "amdgcn.bitcast.1024bit.ll",
-     "amdgcn.bitcast.128bit.ll"
-    ]
-   },
-   {
-    "opcode": "s_and_saveexec_b64",
-    "tests": 193,
-    "examples": [
-     "a-v-flat-atomic-cmpxchg.ll",
-     "a-v-flat-atomicrmw.ll",
-     "add_i1.ll",
-     "amdgcn.bitcast.1024bit.ll",
-     "amdgcn.bitcast.128bit.ll"
-    ]
-   },
-   {
-    "opcode": "s_load_b32",
-    "tests": 189,
-    "examples": [
-     "add.v2i16.ll",
-     "amdgcn.bitcast.ll",
-     "amdgpu-miscellaneous-uniform-intrinsic.ll",
-     "ashr.v2i16.ll",
-     "asyncmark-gfx12plus.ll"
-    ]
-   },
-   {
-    "opcode": "s_wait_samplecnt",
-    "tests": 185,
-    "examples": [
-     "abs_i16.ll",
-     "amdgcn-call-whole-wave.ll",
-     "amdgpu-cs-chain-fp-nosave.ll",
-     "andorn2.ll",
-     "atomicrmw-expand.ll"
-    ]
-   },
-   {
-    "opcode": "v_cmp_ne_u32",
-    "tests": 183,
-    "examples": [
-     "a-v-flat-atomic-cmpxchg.ll",
-     "a-v-flat-atomicrmw.ll",
+     "add.ll",
+     "add_i128.ll",
+     "add_i64.ll",
      "addrspacecast.gfx6.ll",
-     "addrspacecast.ll",
      "amdgcn.bitcast.1024bit.ll"
     ]
    },
    {
     "opcode": "s_load_b128",
-    "tests": 183,
+    "tests": 249,
     "examples": [
      "add.ll",
      "add.v2i16.ll",
@@ -1947,19 +1869,96 @@
     ]
    },
    {
-    "opcode": "v_nop",
-    "tests": 179,
+    "opcode": "s_load_b32",
+    "tests": 247,
+    "examples": [
+     "add.v2i16.ll",
+     "addrspacecast-gas.ll",
+     "amd.endpgm.ll",
+     "amdgcn.bitcast.ll",
+     "amdgpu-miscellaneous-uniform-intrinsic.ll"
+    ]
+   },
+   {
+    "opcode": "s_wait_samplecnt",
+    "tests": 246,
+    "examples": [
+     "abs_i16.ll",
+     "amdgcn-call-whole-wave.ll",
+     "amdgcn-cs-chain-intrinsic-dyn-vgpr-w32.ll",
+     "amdgpu-cs-chain-fp-nosave.ll",
+     "andorn2.ll"
+    ]
+   },
+   {
+    "opcode": "s_wait_bvhcnt",
+    "tests": 236,
+    "examples": [
+     "abs_i16.ll",
+     "amdgcn-call-whole-wave.ll",
+     "amdgcn-cs-chain-intrinsic-dyn-vgpr-w32.ll",
+     "amdgpu-cs-chain-fp-nosave.ll",
+     "andorn2.ll"
+    ]
+   },
+   {
+    "opcode": "v_mov_b16",
+    "tests": 236,
+    "examples": [
+     "add.v2i16.ll",
+     "amdgcn.bitcast.1024bit.ll",
+     "amdgcn.bitcast.128bit.ll",
+     "amdgcn.bitcast.16bit.ll",
+     "amdgcn.bitcast.256bit.ll"
+    ]
+   },
+   {
+    "opcode": "s_setreg_imm32_b32",
+    "tests": 229,
     "examples": [
      "add-max.ll",
      "add_u64.ll",
      "addrspacecast-gas.ll",
-     "asyncmark-gfx12plus.ll",
-     "bf16-conversions.ll"
+     "anyext-s16-to-s64.ll",
+     "asyncmark-gfx12plus.ll"
+    ]
+   },
+   {
+    "opcode": "v_nop",
+    "tests": 210,
+    "examples": [
+     "add-max.ll",
+     "add_u64.ll",
+     "addrspacecast-gas.ll",
+     "anyext-s16-to-s64.ll",
+     "asyncmark-gfx12plus.ll"
+    ]
+   },
+   {
+    "opcode": "s_wait_expcnt",
+    "tests": 208,
+    "examples": [
+     "abs_i16.ll",
+     "amdgcn-call-whole-wave.ll",
+     "amdgcn-cs-chain-intrinsic-dyn-vgpr-w32.ll",
+     "amdgpu-cs-chain-fp-nosave.ll",
+     "andorn2.ll"
+    ]
+   },
+   {
+    "opcode": "s_and_saveexec_b64",
+    "tests": 207,
+    "examples": [
+     "a-v-flat-atomic-cmpxchg.ll",
+     "a-v-flat-atomicrmw.ll",
+     "add_i1.ll",
+     "amdgcn.bitcast.1024bit.ll",
+     "amdgcn.bitcast.128bit.ll"
     ]
    }
   ],
-  "codegen_tests_with_opcode_checks": 2244,
-  "codegen_tests_all_opcodes_in_our_universe(any_target)": 119,
+  "codegen_tests_with_opcode_checks": 2386,
+  "codegen_tests_all_opcodes_in_our_universe(any_target)": 118,
   "opcodes_in_universe_that_tests_use": [
    "buffer_inv",
    "buffer_load_dword",
@@ -2033,12 +2032,12 @@
    "v_max3_f32",
    "v_max_f32",
    "v_mfma_f32_16x16x16_f16",
-   "v_mfma_f32_16x16x16f16_vgprcd",
+   "v_mfma_f32_16x16x16f16",
    "v_mfma_f32_16x16x32_fp8_fp8",
    "v_mfma_f32_32x32x16_fp8_fp8",
    "v_mfma_f32_32x32x64_f8f6f4",
    "v_mfma_f32_32x32x8_f16",
-   "v_mfma_f32_32x32x8f16_vgprcd",
+   "v_mfma_f32_32x32x8f16",
    "v_mfma_scale_f32_32x32x64_f8f6f4",
    "v_min_i32",
    "v_mov_b32",
