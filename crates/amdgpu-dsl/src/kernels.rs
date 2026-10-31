@@ -18713,8 +18713,8 @@ pub fn probe_buffer_lds() -> Function {
     let pin4 = b.ptr_add(inp, o4);
     let c6144 = b.c_i32(6144);
     b.load_global_lds(pin4, c6144, 0, 1);
-    let c7168 = b.c_i32(7168);
-    b.load_global_lds(pin16, c7168, 3072, 4);
+    // global_load_lds adds the instruction offset to BOTH the memory address and the LDS destination (like the MUBUF form): 4096 + 3072 = 7168
+    b.load_global_lds(pin16, c4096, 3072, 4);
     b.wait_vm(0);
     b.barrier();
     // copy the staged slots out: out[0..4096) = LDS[0..4096) ordered 16 B/lane, flat copies after it
