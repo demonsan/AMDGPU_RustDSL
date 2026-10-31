@@ -41,6 +41,12 @@ awk -F'|' '!/^[ \t]*#/ && NF>=3 {k=$1; gsub(/[ \t]/,"",k); sub(/:.*/,"",k); prin
   echo "vs128+vpre2|$V|FMHA_OPT=vpre2"
   echo "vs128+lower-sgpr|$V|AMDC_LOWER_OPTS=dce,cmpfold,scalarize,saddr,sgpr,imm"
   echo "vs128+lower-addrfold|$V|AMDC_LOWER_OPTS=dce,cmpfold,addrfold,shl"
+  echo "vs128+maskreg|$V|AMDC_LOWER_OPTS=dce,cmpfold,maskreg"
+  echo "vs128+maskreg2|$V|AMDC_LOWER_OPTS=dce,cmpfold,maskreg2"
+  echo "vs128+sbound|$V|AMDC_LOWER_OPTS=dce,cmpfold,sbound,scalarize,imm"
+  echo "t128+maskreg|$T|AMDC_LOWER_OPTS=dce,cmpfold,maskreg,sbound,scalarize,imm"
+  echo "t+maskreg|$TT|AMDC_LOWER_OPTS=dce,cmpfold,maskreg,sbound,scalarize,imm"
+  echo "t+all|$TT|AMDC_LOWER_OPTS=all"
   echo "vs128+epdirect|$V|FMHA_OPT=epdirect"
   echo "vs128+smfv-off|$V|FMHA_OPT=nosmfv"
   echo "t128+lower-sgpr|$T|AMDC_LOWER_OPTS=dce,cmpfold,scalarize,saddr,sgpr,imm"
@@ -82,3 +88,7 @@ echo "OPCODES (MOp variants of mir.rs): $NOK / $NALL emitted by at least one run
 TB=$(wc -l < "$OUT/tbl_keys.txt"); TOK=$(awk -F'\t' '$4=="OK"{print $1}' "$OUT/ops.tsv" | grep -c -x -F -f "$OUT/tbl_keys.txt")
 echo "LLVM-table keys (llvm24.tbl): $TOK / $TB covered"
 echo "UNREACHABLE (no run exercises them):"; sed 's/^/  /' "$OUT/unreachable.txt"
+
+# 4) mnemonic inventory of everything that emitted and assembled
+cat "$OUT"/s/*.s 2>/dev/null | sed -E 's/;.*$//' | awk '/^[ \t]+[a-z][a-z0-9_]*[ \t]*/{print $1}' | grep -v "^\." | sort -u > "$OUT/mnemonics.txt"
+echo "DISTINCT ASM MNEMONICS emitted (all assembled by clang): $(wc -l < "$OUT/mnemonics.txt")"
