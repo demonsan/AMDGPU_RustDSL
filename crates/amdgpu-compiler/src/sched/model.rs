@@ -107,8 +107,8 @@ pub fn cost(op: MOp) -> OpCost {
         LdsWriteB128 => c(Lds, 26, 4, Experimental),
         LdsWriteB32 => c(Lds, 8, 4, Unknown),
         // Global: L1 hit ~100-108, L2 ~210-250 (E); streaming dwordx4 issue 14.
-        GlobalLoadU16 | GlobalLoadF32 | GlobalLoadF32S => c(Vmem, 4, 220, Experimental),
-        GlobalLoadB128 | GlobalLoadB128S => c(Vmem, 14, 240, Experimental),
+        GlobalLoadU16 | GlobalLoadF32 | GlobalLoadF32S | BufferLoadDwordX1 => c(Vmem, 4, 220, Experimental),
+        GlobalLoadB128 | GlobalLoadB128S | BufferLoadDwordX2 | BufferLoadDwordX4 => c(Vmem, 14, 240, Experimental),
         GlobalLoadF32Sc1 => c(Vmem, 4, 900, Unknown),
         GlobalLoadB128Sc1 => c(Vmem, 14, 900, Unknown),
         GlobalStoreF32Sc1 | GlobalStoreF32x4Sc1 => c(Vmem, 8, 4, Unknown),
