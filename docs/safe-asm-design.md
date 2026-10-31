@@ -397,3 +397,43 @@ sequence cannot produce a wrong kernel" is used.
 `7aecae5` the bridge exists (`Op::Asm`, `examples::rowsum_chain_block`, compiler tests pass incl. identical asm vs
 the DSL chain) but the kernel does not use it behind a flag yet, so the 15-shape md5 + determinism comparison could
 not be run. Re-run `scratch/safeasm-review2` + the standard 15-shape harness as soon as the flag lands.
+
+## Status: complete
+
+The safe-asm line is finished: the crate, the compiler bridge and the contract are done and validated on hardware; the window experiments that motivated the last rounds are closed.
+
+**Coverage.** 29 generated + 27 hand-written typed templates (`opspec.tbl` + `build.rs` for the VALU/store families; tokens and type-states by hand), 51 of 102 backend rows raw-only
+(`cargo test -p amdgpu-compiler --test safeasm coverage_matrix`), and 29 ui cases (28 compile-fail + 1 pass control; one `rustc` driver, no `trybuild` because the container cargo is 1.83).
+Typed families: VALU int/fp, `pk_add/mul/sub`, `perm`, `permlane32_swap`, `pknorm`, half-write converts (`Pw<L,H>` type-state), transcendental (`Trans` token, 4 wait states), all MFMA forms
+(scaled accumulate / zero-C / explicit-C, unscaled accumulate / zero-C / explicit-C, f16 zero-C with its 12-state result), `smfmac`, DS (`ds_read_b32/b128/b64_tr_b8`, `ds_write_b32/b128`
+with const-generic aligned offsets and writable views as destinations), `global_load_dwordx4`, `global_store_dwordx2/x4`.
+
+**The four adversarial review rounds (independent, kernel-occ) and what each closed.**
+
+| round | found | closed by |
+|---|---|---|
+| 1 (`a50369d`) | dropped matrix token / early read of D, WAR/WAW against in-flight operands, verifier not run on `finish`, chain-opcode mixups, 2-wait VALU->matrix, `vcc` reuse | ownership tokens + poison-on-drop, finish-time verifier, per-opcode chain rules, `Vcc<Free/Live>` type-state |
+| 2 (`7aecae5`) | **F8** writable input ports, **F9** undefined outputs, F10 `ds_write` without a scoreboard slot, F11 constant folding that broke the verified stream, F12 verifier panics / unvalidated encodings | read-only `In<N>`, every output must be written, stores take queue slots, fold only if the verifier still accepts, saturating verifier, `forge_for_tests` gated |
+| 3 (final verification, hardware) | integration claim unverifiable until a flag existed | generated templates, `Pending` tokens, e2e probe (64/64 exact), `FMHA_OPT=...,safeasm`: the `_vs128` row-sum chain is **byte-identical** to the DSL path (15 shapes x3 REF_OK, determinism) |
+| 4 (loop-level contract opinion) | a straight-line verifier is not sound across loop iterations; raw-only ops could sneak into a window; scheduler/RA could rewrite hand order | drain-closed boundaries, op whitelist, instruction pinning + the final-MIR `pin_check` |
+
+**The loop contract (drain-closed boundary).** A loop-body `Seq` is finished with `finish_loop_body()`: it must enter and exit with NO matrix op in flight and NO outstanding DS/VMEM loads, and
+`output_exit` (an in-flight matrix result at the exit) is rejected. The entry/exit wait clock is therefore defined, and the straight-line verifier is sound for every iteration.
+**Op whitelist.** The verifier accepts only generated templates, hand-written templates and internal bookkeeping ops; a raw-only `MOp` forged into a stream is rejected ("not modelled").
+**Pin + `pin_check`.** `Seq::pin()` marks the block's instructions as scheduler barriers (order preserved verbatim, nothing moves into, out of or across; see `docs/scheduling.md`); after
+scheduling, `pin_check` re-derives value-hazard padding, DS/VMEM waits and half-written dwords with the COMPILER's models and fails the compile if any padding or wait would have to be inserted
+inside a pinned run. The waits for the loads a pinned block's inputs depend on are made explicit at the start of the run.
+
+**Bridge.** `Op::Asm` (value form), `Stmt::VarAsm` (one in/out loop variable), `Stmt::VarAsmN` (several, in declaration order); writable views (`pair_mut`, `half8_mut`, `quarter16_mut`
+and the disjoint splitters) let several DS reads fill one MFMA operand.
+
+**Hardware-validated reference blocks.** `rowsum_var_block` (the four in-place SMFMACs of the `_vs128` row sum, byte-identical asm), `pv_rowsum_phase` (PV + row sum), `cvt_chain_block`
+(pk_add/pk_mul -> pknorm -> svcorr (lshr/and/perm/pk_sub) -> two fp8 P words with `v_cvt_scalef32_pk_fp8_bf16` lo/hi -> `ds_write_b32` -> `ds_read_b64_tr_b8`: bit-identical outputs vs the DSL path on
+50 data sets, identical chain instruction sequence), `global_probe_block` (`probe_safeasm_e2e`: load in flight -> scaled MFMA -> `vmcnt(0)` -> VALU -> store, 64/64 exact).
+
+**Real windows and the closure of the gen5 line.** Two real hand-authored windows of `_vs128` were built on top of the finished crate: Block C (PV + row sums, pinned) **-2.5%** and Block M
+(the whole M phase as one pinned `VarAsmN` block) **neutral**; both bit-identical to the DSL path, both correct under the full gates. Pinning removes the scheduler's PV/QK interleave and the
+shipped kernels are not instruction-issue limited (`docs/scheduling.md`), so the gen5 window line is **closed**; the crate stays as a verified tool and a hazard-model oracle, not as a performance lever.
+
+**Hazards found with it (fixed in the compiler, regression-tested).** Physical WAW against in-flight MFMA destinations, the VMEM wide-store data WAR (2 wait states for `dwordx4` store data), the
+missing VALU-writer classes (`scalef32` half-write converts, `permlane32_swap`, register reads), an explicit `s_nop N` counting as one state, and the two-phase RA reaching-writer false positive.
