@@ -946,6 +946,16 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
                                 edges.sort();
                                 edges.dedup();
                                 wit = format!(" witness path {:?}; edges {}; own-writer blocks {:?}; loops {:?}", path, edges.join(" "), own, m.loops);
+                                if std::env::var("AMDC_RA_DEBUG_BLOCKS").is_ok() {
+                                    let mut d = String::new();
+                                    for x in path.iter().chain(own.iter()).chain([3usize, 4, 5, 6, 7].iter()) {
+                                        d.push_str(&format!("\n  block {x} label {} term {:?} ({} insts)", m.blocks[*x].label, m.blocks[*x].term, m.blocks[*x].insts.len()));
+                                        for (k, i) in m.blocks[*x].insts.iter().enumerate().take(6) {
+                                            d.push_str(&format!("\n    [{k}] {:?} dst={:?} srcs={:?} imm={}", i.op, i.dst, i.srcs, i.imm));
+                                        }
+                                    }
+                                    wit.push_str(&d);
+                                }
                             }
                         }
                         report.push(format!("block {b} inst {ii} {:?}: reads slot {r} ({}{}) but the reaching writers are {:?} [{}]{}", inst.op, if p.0 { "v" } else { "s" }, p.1, ws, at.join("; "), wit));
