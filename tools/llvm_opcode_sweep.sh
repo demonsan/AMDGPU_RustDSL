@@ -41,6 +41,7 @@ awk -F'|' '!/^[ \t]*#/ && NF>=3 {k=$1; gsub(/[ \t]/,"",k); sub(/:.*/,"",k); prin
   echo "vs128+vpre2|$V|FMHA_OPT=vpre2"
   echo "vs128+lower-sgpr|$V|AMDC_LOWER_OPTS=dce,cmpfold,scalarize,saddr,sgpr,imm"
   echo "vs128+lower-addrfold|$V|AMDC_LOWER_OPTS=dce,cmpfold,addrfold,shl"
+  echo "maskge+maskreg|probe_llvm_maskge|AMDC_LOWER_OPTS=dce,cmpfold,maskreg"
   echo "vs128+maskreg|$V|AMDC_LOWER_OPTS=dce,cmpfold,maskreg"
   echo "vs128+maskreg2|$V|AMDC_LOWER_OPTS=dce,cmpfold,maskreg2"
   echo "vs128+sbound|$V|AMDC_LOWER_OPTS=dce,cmpfold,sbound,scalarize,imm"
