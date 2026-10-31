@@ -11764,7 +11764,7 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     };
     // PV of the whole tile (V in ring slot `slot`, P words `w`) and its row sums
     // vpre: the first V fragment (half 0, column group 0) of the PV window is read in the V window (its tile is already in LDS), carried in this cell to pv_w
-    let vpre_cell: std::cell::Cell<Option<ValueId>> = std::cell::Cell::new(None);
+    let vpre_cell: std::cell::Cell<Option<[ValueId; 2]>> = std::cell::Cell::new(None);
     let pv_w = |b: &mut FnBuilder, slot: ValueId, w: &[ValueId]| {
         if no_pv {
             return;
@@ -11866,6 +11866,8 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             }
             return;
         }
+        let pre_pair = vpre_cell.take();
+        let vpre2_on = fmha_t_opt("vpre2");
         for hh in 0..2usize {
             let o = 8 * hh;
             let p8 = match &p_pre { Some(ps) => ps[hh], None => b.frag8(w[o], w[o + 1], w[o + 2], w[o + 3], w[o + 4], w[o + 5], w[o + 6], w[o + 7]) };
@@ -11876,7 +11878,13 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
             }
             for e in 0..4usize {
-                let v8 = if hh == 0 && e == 0 { match vpre_cell.take() { Some(v) => v, None => load_v(b, hh, e) } } else { load_v(b, hh, e) };
+                let v8 = if e == 0 && hh == 0 {
+                    match pre_pair { Some(p) => p[0], None => load_v(b, hh, e) }
+                } else if e == 0 && hh == 1 && vpre2_on {
+                    match pre_pair { Some(p) => p[1], None => load_v(b, hh, e) }
+                } else {
+                    load_v(b, hh, e)
+                };
                 b.var_mfma_scale(o_vars[e], v8, p8, c127, c123);
             }
         }
@@ -11897,7 +11905,7 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 addrs.push(b.add_i32(trb0, off));
             }
             let v = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
-            vpre_cell.set(Some(v));
+            vpre_cell.set(Some([v, v]));
         }
         let kdg: Option<Vec<ValueId>> = if kdglob && stage { Some(kd_rows(b, key_n2)) } else { None };
         let _ = &kdg;
@@ -11922,6 +11930,22 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             b.set_prio(1);
         }
         b.wait_lds(0);
+        // gen9 M2: preload both V fragments of O tile 0 (P halves 0/1, 16 VGPR) after P conversion and
+        // immediately before the barrier, so the first 2 row-sum SMFMACs + the two O0 PV MFMAs after the
+        // barrier have register operands (vendor order 0x2e88-0x2f1c).
+        if fmha_t_opt("vpre2") && !no_pv {
+            let trb0 = b.add_i32(cx.trx[0], slot_cur);
+            let mut pair: [ValueId; 2] = [c0, c0];
+            for hh in 0..2usize {
+                let mut addrs: Vec<ValueId> = Vec::with_capacity(4);
+                for r in 0..4i32 {
+                    let off = b.c_i32((hh as i32) * 8192 + 2048 * r);
+                    addrs.push(b.add_i32(trb0, off));
+                }
+                pair[hh] = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+            }
+            vpre_cell.set(Some(pair));
+        }
         if !no_bar && !nobar1 {
             b.barrier();
         }
