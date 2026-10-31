@@ -10333,7 +10333,13 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             if let Some(ba) = bacc {
                 b.var_mfma_f16_z(ba, ones_f16, nb);
             }
-            let delta = if let Some((bq_, bo_)) = cut_vals { b.sub_f32(bq_, bo_) } else { delta };
+            // the branch is taken when ANY lane rolls back and runs without an exec mask: lanes that do not roll back must see delta = 0
+            let delta = if let Some((bq_, bo_)) = cut_vals {
+                let d_full = b.sub_f32(bq_, bo_);
+                b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(d_full), b: Opnd::Val(zero_f) })
+            } else {
+                delta
+            };
             let dupd = b.frag2_dup(delta);
             if !ablate.contains("rbnos") {
                 for s in 0..4usize {
