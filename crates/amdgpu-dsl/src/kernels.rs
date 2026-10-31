@@ -10755,6 +10755,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                         b.store_lds_b32(Opnd::Val(ad), Opnd::Val(w0));
                         let ad4 = b.add_i32(ad, c4);
                         b.store_lds_b32(Opnd::Val(ad4), Opnd::Val(w1));
+                        if fmha_t_opt("epw") {
+                            b.wait_lds(0); // diagnostic: the DS pair has read its data registers before they are reused
+                        }
                     }
                 }
                 b.wait_lds(0);
