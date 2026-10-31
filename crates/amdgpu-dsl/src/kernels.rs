@@ -19287,10 +19287,13 @@ pub fn probe_llvm_maskge() -> Function {
     let r = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(ge), a: Opnd::Val(one), b: Opnd::Val(two) });
     let tf = b.bitcast_f32(tid);
     let lt = b.cmp_lt_f32(tf, one);
-    let r2 = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(lt), a: Opnd::Val(two), b: Opnd::Val(r) });
+    let five = b.c_f32(5.0);
+    let six = b.c_f32(6.0);
+    let r2 = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(lt), a: Opnd::Val(five), b: Opnd::Val(six) });
     let off = b.mul_i32(tid, c4);
     let q = b.ptr_add(o, off);
-    b.store_f32(q, 0, r2);
+    b.store_f32(q, 0, r);
+    b.store_f32(q, 256, r2);
     b.finish()
 }
 
