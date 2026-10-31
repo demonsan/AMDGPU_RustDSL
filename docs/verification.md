@@ -200,7 +200,7 @@ match `docs/current-status.md`; this section supersedes earlier per-round test/p
 
 ### cargo test
 
-`cargo test` = **111 tests / 28 test targets, all green**. 21 integration test files (plus `tests/common/mod.rs`
+`cargo test` = **117 tests / 29 test targets, all green**. 22 integration test files (plus `tests/common/mod.rs`
 and the safe-asm `tests/ui/*.rs` compile-fail corpus):
 
 | test file | what it guards |

@@ -16,7 +16,7 @@
 | `llvm-bridge/`（项目自有 C++/C ABI） | 未做 C++ bridge；改为 **MIR 导出 + 复用 LLVM 后 RA tail pass**（不修改 LLVM），见 `docs/llvm-tail-integration.md` | 采纳（不同实现） |
 | —（计划外） | `crates/amdgpu-safeasm`：安全 Rust 手写汇编序列（`Ready` / `Pending` 证明、`pin()`、`pin_check`、部分 `lgkmcnt` 令牌），经 `Stmt::VarAsm[N]` 嵌入 | 完成（计划外增项），见 `docs/safe-asm-design.md` |
 | `examples/` | FMHA frontend 即 `kernels.rs` 中的 `fmha_*` 构造器与 `tests/gpu/`、`tools/` 脚本 | 完成 |
-| `tests/`、`fixtures/` | `cargo test` 28 个目标 110 项（GPU-free）；GPU 回归脚本 `tests/gpu/*.sh`、`tools/*probe*.sh`、`tools/gen9_gate.py`；独立 witness 夹具未做 | 完成（witness 未做） |
+| `tests/`、`fixtures/` | `cargo test` 29 个目标 117 项（GPU-free）；GPU 回归脚本 `tests/gpu/*.sh`、`tools/*probe*.sh`、`tools/gen9_gate.py`；独立 witness 夹具未做 | 完成（witness 未做） |
 | `docs/` | 设计 / 状态 / 结果文档，见 §6 导航 | 完成 |
 
 ## 2. 阶段：M0–M5
@@ -47,7 +47,7 @@
 |---|---|---|
 | 3.1 Rust compile-fail | 跨 graph brand 等 | **部分**（safe-asm 的借用 / 证明级拒绝已测；完整套件未做） |
 | 3.2 IR verifier 负例 | 错误 epoch / 遗漏 release 等 | **部分**（DSL / MIR 验证器负例；Async Event IR 未实现） |
-| 3.3 机器层负例 | pin 冲突、MFMA hazard、资源少报 | **完成**（`cargo test` 110 项，含 hazard 与 `pin_check` 回归） |
+| 3.3 机器层负例 | pin 冲突、MFMA hazard、资源少报 | **完成**（`cargo test` 117 项，含 hazard 与 `pin_check` 回归） |
 | 3.4 端到端 | ASM / byte differential、CPU reference、真机重复运行、边界 shape | **完成**：15 形状对拍（16 / 64 行）、确定性 5/5、重复启动压力 1200/1200、`tail_invariance`（两后端指令流一致） |
 | 3.5 性能 | 冷启动、disk hit、loaded hit、graph replay 分别统计 | **部分**：编译延迟已实测（自研编译侧 5.7 ms / 中等 kernel，端到端经子进程 clang 不满足 ≤10 ms）；缓存路径未做（无 JIT） |
 

@@ -21,7 +21,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 | 中等形状 | ≥ 厂商：B2H8S2048 1.00x、B1H8S4096 1.07x、B3H3S768 1.11x、B1H16S256 1.16x |
 | 精度 | mean err **8.3e-4**（厂商 1.5–2.9e-3，好 2–3 倍）；15/15 形状、64 行 bad=0 |
 | 确定性 | 5/5 × N；uneven-tile split 形状 **1200/1200 次启动单一 md5** |
-| 测试 | `cargo test` **29 个目标 / 115 项全绿**；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
+| 测试 | `cargo test` **29 个目标 / 117 项全绿**；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
 | Rust 安全 | **四个 crate 全部 `#![forbid(unsafe_code)]`、零第三方依赖、无 FFI/裸指针**；ISA 规则编码进类型系统；见 [`docs/rust-safety.md`](docs/rust-safety.md) |
 | 正确性 | 本会话修复 3 个真实编译器/内核 bug（物理 WAW、两阶段 RA reaching-writer、**VMEM 宽存储数据 WAR**） |
 
@@ -35,7 +35,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 ```bash
 # 构建与测试（容器脚本会挂载 ROCm 与 pinned LLVM 工具）
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                    # 期望 28 targets / 111 tests 全绿
+bash tools/container/cargo.sh test                    # 期望 29 targets / 117 tests 全绿
 
 # 发射一个 kernel 的汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_vs128 --out vs128.s

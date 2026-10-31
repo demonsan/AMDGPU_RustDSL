@@ -10,7 +10,7 @@
 |---|---|---|
 | Rust AMDGPU kernel DSL | 已实现：类型化 `Op` / `Stmt`、`FnBuilder`、循环 / 分支 / 循环携带变量、fragment 类型、MFMA（含缩放 / 非缩放 fp8、f16 偏置）/ SMFMAC / LDS（含转置读、DMA）/ 全局访存 / MUBUF（描述符、`buffer_*`、LDS 直通形式）/ 原子 / pack 指令 | `crates/amdgpu-dsl`，`cargo test` |
 | 自研编译器（SSA → MIR → 寄存器分配 → 调度 → asm） | 已实现，默认后端是 `llvm-tail`（自研 lowering / RA / 调度，LLVM 只负责 wait / hazard / memory legalizer）；`--backend=own` 保留完整自研 tail | `docs/llvm-tail-integration.md`，`tests/tail_invariance.rs` |
-| 验证 | DSL / MIR 验证器、RA 后检查、safe-asm 序列的 `pin_check`（对最终 MIR 重跑 value-hazard pass），`cargo test` 28 个目标共 110 项通过 | `cargo test` |
+| 验证 | DSL / MIR 验证器、RA 后检查、safe-asm 序列的 `pin_check`（对最终 MIR 重跑 value-hazard pass），`cargo test` 29 个目标共 117 项通过 | `cargo test` |
 | 在 gfx950 真机运行并通过数值验证的 attention kernel | **达成并超过**：`attention_fwd`（fp16）与 MXFP8 厂商 ABI 的 FMHA 家族在 MI355X 上运行，15 个形状逐元素对拍 | `tests/gpu/run.sh`、`tests/gpu/run_ref.sh`、`tools/gen9_gate.py` |
 | 推进 FMHA 参考 core loop 的 1:1 复刻 | **功能与接口 1:1，指令级结构不同**：ABI、网格、缩放用法、数值约定、主要硬件指令族一致，并已通过 15 形状对拍与真机计数器对账；核心循环是另一种实现（`Sᵀ = K Qᵀ`，分数全在寄存器，128-key 单元，一个 rollback，每 tile 两个 barrier）。结构层面的逐指令复刻（vendor-order M 窗口、持久偏置 C、V 预读）做了完整的有界实验，结论为负（§6、§7） | `docs/gen9-vendor-mirror-design.md`、`docs/status.md` 第 68/70/73/75 轮 |
 | 性能 | 发布路径（`_auto`）B1H8S2048 **674–705 TFLOP/s = 厂商同轮 536–539 的 1.25–1.31 倍**；单 CU 453–455 TFLOP/s = 7.07–7.10 TF/CU，厂商 8.41 TF/CU（我们是它的 0.84 倍）；填满网格 B4H8S2048 0.846 倍、B1H8S8192 0.841 倍；中等形状 ≥ 厂商（1.00–1.16 倍） | §2 |
@@ -36,7 +36,7 @@
 | 精度（对 CPU 参考，REF_ROWS=64） | 平均误差 **8.3e-4**（厂商 1.5–2.9e-3，我们约好 3 倍）；`bad = 0`（厂商自己在 3 个形状上各有 1–5 个坏点） |
 | 15 个形状 | 16 行 / 64 行门禁均 15/15，vendor-parity 15/15（`tools/gen9_gate.py`） |
 | 确定性 | `determinism.sh` 5/5 ×多轮；**重复启动压力 1200/1200**（4 个不均匀 tile 数的 KV-split 形状，每个 300 次，逐次比较完整输出 md5）；`FMHA_OPT=eplds,epw` 敏感度探测器 100–200/200 干净 |
-| 单元测试 | `cargo test`：28 个目标、110 项全部通过；发布路径汇编 md5 在所有非 KV-split 改动中保持不变 |
+| 单元测试 | `cargo test`：29 个目标、117 项全部通过；发布路径汇编 md5 在所有非 KV-split 改动中保持不变 |
 
 ### 2.3 发布路径（`_auto`）的组成
 
@@ -114,7 +114,7 @@
 ## 9. 复现
 
 ```bash
-bash tools/container/cargo.sh test                      # 28 个目标、110 项
+bash tools/container/cargo.sh test                      # 29 个目标、117 项
 OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto BACKEND=own REF_ROWS=64 REF_CO=<厂商 .co> bash tests/gpu/run_ref.sh
 python3 tools/gen9_gate.py <run_ref 日志>               # 精度 / vendor-parity 门禁
 BACKEND=own bash tests/gpu/determinism.sh               # 5 个形状；认证还需要重复启动完整输出 md5 压力

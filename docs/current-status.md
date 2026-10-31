@@ -136,7 +136,7 @@ DMA、LDS 直达、`buffer_load … lds` 等为 own-only（使用它们的 kerne
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **29 个目标 / 115 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
+- **测试**：`cargo test` **29 个目标 / 117 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
   `register_accounting`、`asm_assembles`、`hazard_classes`、`hazard_oracle`、`phys_waw`、`ra_reaching`、
   `pin_check`、`pinning`、`dead_loads`、`var_lint`、`smfmac_hazards`、`dma_hazards`、`lite_contract` …）
 - **硬件探针**（`tools/`，**29 个脚本**）：`vendor_validate.sh`、`vendor_counters.sh`、`vendor_disasm.sh`、
@@ -161,7 +161,7 @@ DMA、LDS 直达、`buffer_load … lds` 等为 own-only（使用它们的 kerne
 ```bash
 # 构建
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                 # 期望 29 targets / 115 tests 全绿
+bash tools/container/cargo.sh test                 # 期望 29 targets / 117 tests 全绿
 
 # 发射 kernel 并汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_vs128 --out vs128.s
