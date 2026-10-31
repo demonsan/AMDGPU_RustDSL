@@ -364,12 +364,12 @@ def analyse(path, rel):
         if not m:
             continue
         pfx, mod, rest = m.group(1), m.group(2) or "", m.group(3)
-        if pfx not in pf_class or mod == "-NOT":
+        if pfx not in pf_class or mod in ("-NOT", "-LABEL"):  # -LABEL lines name the function under test, they are not instructions
             continue
         classes_here = pf_class[pfx]
         if re.search(r"[Ss]pill|ScratchSize|private_segment_fixed_size", rest):
             spill = True
-        tok = re.match(r"([a-z][a-z0-9_]*)\b", rest.lstrip())
+        tok = re.match(r"([a-z][a-z0-9_]*)\b(?!:)", rest.lstrip())
         if tok and is_mnemonic(tok.group(1)):
             for c in classes_here:
                 asm_by_class[c].add(norm_mn(tok.group(1)))
