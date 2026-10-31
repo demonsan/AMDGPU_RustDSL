@@ -9998,8 +9998,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         init_vars.push((DType::I32, Opnd::Val(c123)));
         init_vars.push((DType::I32, Opnd::Val(idx01)));
         init_vars.push((DType::I32, Opnd::Val(idx23)));
-        init_vars.push((DType::F32, Opnd::Val(one_f)));
-        init_vars.push((DType::F32, Opnd::Val(c_thr)));
+        let one_bits = b.bitcast_i32(one_f);
+        let cthr_bits = b.bitcast_i32(c_thr);
+        init_vars.push((DType::I32, Opnd::Val(one_bits)));
+        init_vars.push((DType::I32, Opnd::Val(cthr_bits)));
     }
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
