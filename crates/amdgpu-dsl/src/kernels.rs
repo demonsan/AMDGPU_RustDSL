@@ -10046,6 +10046,14 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let bacc0 = b.mfma_f16_wide(ones_f16, Opnd::Val(bias_init), zero16b);
         init_vars.push((DType::Frag16, Opnd::Val(bacc0))); // 13 bias accumulator
     }
+    // cut1 (docs/status.md round 71): the exact quantised reference b (= 4 (hi + lo), the value the two f16 words represent) is carried as an f32 loop variable, so the per-tile hi/lo unpack
+    // (2 cvt + lshr + add + mul) disappears; the shift delta = b_q - b_old and its select are computed inside the rollback branch only. Bit-identical to the unpack form.
+    let cut1 = fmha_t_opt("cut1");
+    let bq_idx = init_vars.len();
+    if cut1 {
+        let c64f = b.c_f32(64.0); // the initial word pair (0x4800 | 0x4800 << 16) = 4 (8 + 8)
+        init_vars.push((DType::F32, Opnd::Val(c64f)));
+    }
     // constres: force the 6 per-tile materialised constants into persistent loop-carried VGPRs so the RA cannot
     // rematerialise them every iteration (0x7f/0x7b MFMA scales, idx01/idx23 SMFMAC indexes, 1.0 P scale, threshold).
     let cn = fmha_t_num("constres").unwrap_or(0).min(6);
@@ -10070,6 +10078,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let idx = vars[11];
     let kdp = vars[12];
     let bacc: Option<VarId> = if biasacc { Some(vars[13]) } else { None };
+    let bqv: Option<VarId> = if cut1 { Some(vars[bq_idx]) } else { None };
     // shadow the constants with loop-carried Var reads when constres is on (all later uses capture the shadow)
     let c127 = if cn >= 1 { b.bitcast_i32(Opnd::Var(vars[cbase])) } else { c127 };
     let c123 = if cn >= 2 { b.bitcast_i32(Opnd::Var(vars[cbase + 1])) } else { c123 };
@@ -10248,7 +10257,29 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         // read once at the start of the iteration and written once here, never read after the write (DSL contract)
             let w_old_u = b.frag2_lane(bias2, 0);
             let w_old = b.bitcast_i32(w_old_u);
-            let (delta, w_new) = if fmha_t_opt("bias2w") || vs128_vsx() {
+            let mut cut_vals: Option<(ValueId, ValueId)> = None;
+            let (delta, w_new) = if cut1 {
+                let b_old = b.bitcast_f32(Opnd::Var(bqv.expect("bq")));
+                let c025 = b.c_f32(0.25);
+                let c4f = b.c_f32(4.0);
+                let tt = b.sub_f32(c_b131, mt);
+                let b_new = b.add_f32(b_old, tt);
+                let q = b.mul_f32(b_new, c025);
+                let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q)));
+                let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h_raw)));
+                let r = b.sub_f32(q, hq);
+                let l_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(r)));
+                let lq = b.let_(Op::CvtF16ToF32(Opnd::Val(l_raw)));
+                let sum_q = b.add_f32(hq, lq);
+                let b_q = b.mul_f32(sum_q, c4f);
+                cut_vals = Some((b_q, b_old));
+                let b_next = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(b_q), b: Opnd::Val(b_old) });
+                b.set_var(bqv.expect("bq"), b_next);
+                let l_sh = b.shl_i32(l_raw, c16i);
+                let w_q = b.let_(Op::AddI32(Opnd::Val(h_raw), Opnd::Val(l_sh)));
+                let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
+                (zero_f, w_new)
+            } else if fmha_t_opt("bias2w") || vs128_vsx() {
                 // bias2w: the bias is the sum of TWO f16 words (hi + residual, 4 (hi + lo) over the 8 K slots) instead of one rounded f16: the
                 // reference shift delta = b_q - b_old that is added to the scores and used for the O/l rescale is then exact to ~2^-22 (the
                 // single f16 word quantised it to ~1.2e-4 in x, i.e. 4-6% of P per rollback)
@@ -10300,6 +10331,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             if let Some(ba) = bacc {
                 b.var_mfma_f16_z(ba, ones_f16, nb);
             }
+            let delta = if let Some((bq_, bo_)) = cut_vals { b.sub_f32(bq_, bo_) } else { delta };
             let dupd = b.frag2_dup(delta);
             if !ablate.contains("rbnos") {
                 for s in 0..4usize {
