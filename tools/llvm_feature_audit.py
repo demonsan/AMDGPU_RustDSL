@@ -38,7 +38,7 @@ def norm_mn(s, mir=False):
 
 
 def is_mnemonic(tok):
-    return tok.startswith(MN_PREFIXES) and re.fullmatch(r"[a-z][a-z0-9_]*", tok) is not None
+    return not tok.endswith("_") and len(tok) > 3 and tok.startswith(MN_PREFIXES) and re.fullmatch(r"[a-z][a-z0-9_]*", tok) is not None
 
 
 MIR_OPC = re.compile(r"\b((?:V|S|BUFFER|GLOBAL|DS|FLAT|SCRATCH|IMAGE|TBUFFER|SI|G)_[A-Z0-9_a-z]+)\b")
@@ -48,7 +48,7 @@ VARREF = re.compile(r"\[\[[^\]]*\]\]|\{\{[^}]*\}\}")
 
 
 def valid_mir_opcode(op):
-    if op.startswith(MIR_EXCLUDE):
+    if op.startswith(MIR_EXCLUDE) or not op.startswith(("V_", "S_", "BUFFER_", "GLOBAL_", "DS_", "FLAT_", "SCRATCH_", "IMAGE_", "TBUFFER_")) or op.endswith("_"):
         return False
     if re.search(r"_\d+$", op) and not re.search(r"_[A-Za-z]\d+$", op) and not re.search(r"_B\d+$|_F\d+$|_U\d+$|_I\d+$|_X\d+$|_DWORDX?\d+$", op):
         return False  # a CHECK variable name such as V_ADD_F32_E32_1
