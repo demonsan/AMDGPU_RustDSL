@@ -1690,6 +1690,68 @@ not a win. **No combination >=1%; defaults unchanged. Per-CU stays 7.07-7.09 TF/
 conclusion is unchanged.** The RA fix itself is a valuable compiler finding/fix (documented, regression-tested)
 even though the kernel optimisation it unblocked did not pay off.
 
+## 7.11 KV-split epilogue corruption: wide-VMEM-store data WAR hazard (round 69/70)
+
+**Symptom (measured).** The forced KV-split shape B1H2S200 SK1337 gqa2 (11 tiles over 4 splits =
+3,3,3,2) produced a different full-output md5 in 0-5% of launches at quiet load, up to 94-97% with
+`FMHA_OPT=epw` (a diagnostic `s_waitcnt lgkmcnt(0)` after every `ds_write` pair). Signature: only the
+fp16 Ohat partial, exactly the first dword of chunks 4-7 (columns 32/33, 40/41, 48/49, 56/57), for
+lanes j = 25/27/29/31 of the role-B waves in the `ec=1` writes; `lse`, the combine, and all non-split
+shapes stay clean. The corruption changes with timing and total LDS footprint, not with addresses;
+3000+ repeated launches with full output md5 are needed to see it (a 3x5 determinism run is not enough).
+
+**Wrong hypotheses / symptom fixes (do not repeat).** Scheduler/RA (`AMDC_SCHED=0|ld`,
+`AMDC_RA_FORCE_TWOPHASE=1` same rate); role-shared scratch (the scratch is
+`69632 + (wave & 3 + 4*role_b)*4096`, eight disjoint 4 KB regions; only Q staging, already dead, is
+aliased); XOR swizzle (`epnoswz`); missing MFMA/VALU wait (69+ wait states present). A symmetric
+"barrier before the epilogue" made it worse (29-45/100 non-majority vs 0-1/100 without; role-A-only
+and role-B-only barriers 0/100; barriers between scratch writes/reads 98/100) because it changes VMEM
+drain timing. Contiguous-scratch relocation and padded rows also only moved the rate. None of these is
+the fix.
+
+**Root cause (backend-llvm-tail, verified).** A **wide-VMEM-store data WAR hazard**:
+`global_store_dwordx4` reads its data VGPRs over several cycles after issue; a VALU write of those
+registers within **2 wait states** overwrites store data that has not been read yet. LLVM pads this via
+`has12DWordStoreHazard`; our own tail never modelled it. The fp16 LDS-transposed epilogue has a
+16-byte `global_store_dwordx4` followed by VALU writes into the same data registers; the timing of that
+window shifted with barriers/waits/LDS footprint, which is exactly why `epw` and the "fixes" above
+changed the rate instead of eliminating it. `epdirect` (direct `global_store_dwordx2`, no LDS scratch)
+does not use a dwordx4 store there and was clean - it was the right fallback but not the explanation.
+
+**Fix (backend-lds 29058c8, merged Main 5f4a3cf).** `pad_physical_war` now covers wide VMEM store data
+ranges: 2 wait states before a VALU write to a `global_store_dwordx4` data register. The only emitted
+difference in the shipped kernels is **+4 `s_nop 0` in `_kvsplit`**, immediately after each of the
+four `global_store_dwordx4` in the fp16 epilogue and before the following VALU writes; `_vs128`,
+`_t128`, `_kvsplit_combine8h` are byte-identical (verified by independent build: asm md5
+`00d34086bf42e7e6`, `f83c02ce422d0cfe`, `19bdd5df48184156`; `_kvsplit` `148b329d...` current vs
+`e53a0cfb...` pre-fix, 10689 vs 10685 lines, `s_nop` 180 vs 176). `epw` is the acceptance detector:
+a correct wait model makes `epw` clean, not worse.
+
+**Final verified state (GPU 5, Main 5f4a3cf, fast LDS epilogue restored, epdirect opt-in).**
+- 300 launches x4 uneven-tile split shapes (B1H2S200 SK1337 split4; B3H3S768 SK1280 split4;
+  B2H8S700 SK640 split2; B1H2S1024 SK1088 split2): **all one md5 each, 1200/1200 clean**
+  (`c3301..., dac6a31..., 0764b7..., d3446b...`).
+- `FMHA_OPT=eplds,epw` detector: **100/100 clean** (was 94-97% failing before the hazard fix).
+- 15 shapes at 64 and 16 rows: `gen9_gate.py` **15/15 PASS**, parity 15/15, our bad 0 (the 3
+  `REF_KERNEL_FAIL` at 64 rows are the vendor's own bad counts).
+- determinism.sh: **10/10 runs, 5/5 DET_OK**.
+- Shipped fast path timing (B1H8S2048, 64 blocks, 200 iters, quiet-ish node, vendor 538-540):
+  split total **683-700, median 690.9 TFLOP/s**; `_vs128` 452.2-455.0, median 453.1 (7.08 TF/CU);
+  split = **1.28x the vendor** in the same run; epdirect was ~623 (-11%) so the fast path is restored.
+  Filled B4H8S2048 / B1H8S8192 use `_vs128`, whose asm is byte-identical to pre-fix, so their
+  previously certified values are unchanged (1427.9/1416.1 and 1975.7/1963.9, best/median).
+- Node load indicator for the run: vendor median 538-540 TFLOP/s, load average ~38 during timing.
+
+**Acceptance protocol addition (permanent).** (1) `tools/ohat_repro.sh` with `RUNS=300` on B1H2S200
+SK1337 is part of the split/determinism gate: full output md5 must be one value; include at least two
+other uneven-tile split shapes (`ceil(SK/128) % splits != 0`), e.g. B3H3S768 SK1280 s4, B2H8S700 SK640
+s2, B1H2S1024 SK1088 s2. (2) `FMHA_OPT=eplds,epw` must be clean over 100 launches: it is the
+wait-model sensitivity detector, not a performance mode. (3) Run at both quiet and loaded node states;
+record the same-run vendor TFLOP/s as the load indicator. (4) Any async LDS/VEM store change gets an
+address-provenance table for every LDS region and a wide-store WAR hazard check. (5) Do not use a
+symmetric "barrier before epilogue" as a correctness fix; it can widen this window. `epdirect` remains
+an opt-in fallback (bit-identical, ~11% split cost) if a future hazard is found.
+
 ## 8. Unknowns / limitations
 
 * **Clock assumption.** Counters are clock-free; the cycle columns use the 2.4 GHz MI355X boost clock as
