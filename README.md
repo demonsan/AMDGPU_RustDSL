@@ -80,6 +80,7 @@ docs/                   设计、逐轮状态、厂商 spec、认证与归因（
 |---|---|
 | [`docs/current-status.md`](docs/current-status.md) | **权威当前快照**（架构、DSL、kernel、数字、已关闭方向、复现命令） |
 | [`docs/rust-safety.md`](docs/rust-safety.md) | **Rust 安全性如何保证**（`#![forbid(unsafe_code)]`、零依赖、类型层 ISA 规则、验证器、panic 策略、安全边界） |
+| [`docs/rust-safety-by-example.md`](docs/rust-safety-by-example.md) | **逐项 + 真实代码**：写 DSL kernel 时编译器如何保证 Rust safe（A1–A10），手写 asm 时 safe-asm 如何保证（B1–B16），29 个编译失败负例 |
 | [`docs/design.md`](docs/design.md) | Rust DSL 与自研 compiler 设计规格 |
 | [`docs/status.md`](docs/status.md) | 25 轮逐轮实现记录（所有正负结果 + 归因） |
 | [`docs/vendor-spec.md`](docs/vendor-spec.md) | 厂商 kernel 事实 + §7.5–§7.11 认证表与归因 |
