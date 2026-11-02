@@ -11,6 +11,7 @@
 //! * waits, barriers, the role phase offset, the tile counter contract and the peeled tail - `pipeline::Pipeline::run`.
 
 pub mod copy;
+pub mod frag;
 pub mod lane;
 pub mod pipeline;
 pub mod shared;
