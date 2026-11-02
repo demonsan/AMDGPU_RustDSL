@@ -539,7 +539,7 @@ fn periodic_cone(f: &Function) -> Result<(), String> {
 /// Conservative bound M such that the tile markers are periodic in the loop iteration with a period dividing 2^M: every `& mask` contributes its width (msb + 1), every `>> k`
 /// in the cone adds k (bit j of `x >> k` is bit j + k of x), and a counter toggled by `^ const` contributes 1. (`+ const` counters are affine: only their low bits matter for a
 /// mask, and versions only matter through their differences.)
-fn period_bits(f: &Function) -> u32 {
+fn period_bits(f: &Function) -> (u32, u32) {
     fn konst(f: &Function, o: &Opnd) -> Option<i64> {
         match o {
             Opnd::I32(c) => Some(*c as i64),
@@ -552,6 +552,8 @@ fn period_bits(f: &Function) -> u32 {
     }
     struct Acc {
         mask_bits: u32,
+        /// log2 of the product of all constant multipliers / left shifts in the cone (wrap-around guard)
+        mul_log2: u32,
         shifts: u32,
         xor_counter: bool,
         seen: HashSet<(bool, u32)>,
@@ -571,9 +573,29 @@ fn period_bits(f: &Function) -> u32 {
                             }
                         }
                     }
+                    // x ^ c: the bits of c flip bits of x, so the per-iteration relation of the (affine) value to its neighbours changes every 2^(width(c)) iterations
+                    Op::XorI32(x, y) => {
+                        for k in [x, y] {
+                            if let Some(c) = konst(f, k) {
+                                a.mask_bits = a.mask_bits.max(32 - (c as u32).leading_zeros());
+                            }
+                        }
+                    }
                     Op::LshrI32(_, y) => {
                         if let Some(k) = konst(f, y) {
                             a.shifts += k.max(0) as u32;
+                        }
+                    }
+                    Op::ShlI32(_, y) => {
+                        if let Some(k) = konst(f, y) {
+                            a.mul_log2 += k.max(0) as u32;
+                        }
+                    }
+                    Op::MulI32(x, y) => {
+                        for k in [x, y] {
+                            if let Some(c) = konst(f, k) {
+                                a.mul_log2 += 64 - (c.unsigned_abs().max(1) - 1).leading_zeros();
+                            }
                         }
                     }
                     _ => {}
@@ -599,7 +621,7 @@ fn period_bits(f: &Function) -> u32 {
             _ => {}
         }
     }
-    let mut a = Acc { mask_bits: 0, shifts: 0, xor_counter: false, seen: HashSet::new() };
+    let mut a = Acc { mask_bits: 0, mul_log2: 0, shifts: 0, xor_counter: false, seen: HashSet::new() };
     for s in &f.stmts {
         if let Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } = s {
             if !f.contract.tiles.iter().any(|t| &t.name == tile && t.private) {
@@ -609,7 +631,34 @@ fn period_bits(f: &Function) -> u32 {
         }
     }
     let m = if a.mask_bits > 0 { a.mask_bits + a.shifts } else { 0 };
-    m.max(if a.xor_counter { 1 } else { 0 })
+    (m.max(if a.xor_counter { 1 } else { 0 }), a.mul_log2)
+}
+
+/// The claimed period must be a TRUE period of what the simulator actually executes: for every marker statement the simulated slot sequence must repeat after `p` iterations
+/// and the version must advance by a constant over `p` iterations.
+fn verify_period_claim(f: &Function, traces: &[&Trace], p: usize) -> Result<(), String> {
+    for (role, t) in traces.iter().enumerate() {
+        let mut by_stmt: HashMap<usize, Vec<(i64, i64)>> = HashMap::new();
+        for ev in &t.evs {
+            by_stmt.entry(ev.stmt).or_default().push((ev.slot, ev.ver));
+        }
+        for (stmt, seq) in by_stmt {
+            if seq.len() < p + 2 {
+                continue;
+            }
+            let dv = seq[p].1 - seq[0].1;
+            for i in 0..seq.len() - p {
+                if seq[i + p].0 != seq[i].0 {
+                    return Err(format!("stmt {stmt} (role {role}): the simulated slot sequence {:?}... is not periodic with the claimed period {p}", seq.iter().take(p * 2 + 2).map(|s| s.0).collect::<Vec<_>>()));
+                }
+                if seq[i + p].1 - seq[i].1 != dv {
+                    return Err(format!("stmt {stmt} (role {role}): the simulated version advances by {} then {} over {p} iteration(s): not a constant step, so the claimed period {p} is not a true period", dv, seq[i + p].1 - seq[i].1));
+                }
+            }
+        }
+    }
+    let _ = f;
+    Ok(())
 }
 
 fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, diags: &mut Vec<(&'static str, Severity, usize, String)>, untagged: &mut BTreeSet<usize>) -> Vec<Trace> {
@@ -778,11 +827,12 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
     // horizon: the markers' period bound P = 2^M must fit twice into the simulated iterations
     let max_slots = tiles.iter().map(|t| t.slots as usize).max().unwrap_or(1);
     let base_h = 10usize.max(2 * max_slots + 4);
-    let m = period_bits(f);
+    let (m, mul_log2) = period_bits(f);
     let pbound = 1usize << m.min(20);
     let need = base_h.max(2 * pbound + 2);
     const HORIZON_CAP: usize = 70;
     let nmax;
+    let mut period_claim: Option<usize> = None;
     match (&f.contract.tile_trust, periodic_cone(f)) {
         (Some(reason), _) => {
             nmax = base_h;
@@ -796,6 +846,14 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
                 format!("{why}, which is not an affine/periodic function of the loop counters: the protocol is simulated for at most {nmax} loop iterations, so a launch with more iterations is NOT covered (express slot/version with counters stepped by + const / ^ const, or declare b.tile_trust_periodic(reason) when the structure is periodic by construction)"),
             );
         }
+        (None, Ok(())) if mul_log2 >= 16 => {
+            nmax = base_h;
+            rep.add(
+                "GV-TILE-UNROLL-LIMIT",
+                Severity::Error,
+                format!("the tile markers multiply / shift left by a total of 2^{mul_log2}: the 32-bit slot / version may wrap within about {} iterations, beyond the {nmax} simulated, so a longer launch is NOT covered (use smaller strides, or declare b.tile_trust_periodic(reason); i32 arithmetic is otherwise assumed not to wrap, A3)", 1u64 << (31 - mul_log2.min(31))),
+            );
+        }
         (None, Ok(())) => {
             if need > HORIZON_CAP {
                 nmax = base_h;
@@ -806,7 +864,8 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
                 );
             } else {
                 nmax = need;
-                rep.add("GV-TILE-PERIOD", Severity::Info, format!("tile markers are periodic with a period dividing {pbound} iteration(s); {nmax} iterations (>= 2 x period + 2, >= 2 x ring slots + 4) are simulated for every exit parity, which covers any trip count"));
+                period_claim = Some(pbound);
+                rep.add("GV-TILE-PERIOD", Severity::Info, format!("tile markers claim a period dividing {pbound} iteration(s) (slot repeats, version advances by a constant; multiplications/shifts by constants assumed not to wrap, A3); {nmax} iterations (>= 2 x period + 2, >= 2 x ring slots + 4) are simulated for every exit parity and the claim is VERIFIED on the simulated sequences, which covers any trip count"));
             }
         }
     }
@@ -824,6 +883,16 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
                     paths += 1;
                     check_pair(f, [a, b], n, &mut diags, &mut checked);
                 }
+            }
+        }
+    }
+    // the claimed period must be real: verify it on the longest simulated trace of each role
+    if let Some(p) = period_claim {
+        let ta = enumerate_traces(f, 0, nmax, &div, &mut diags, &mut untagged);
+        let tb = enumerate_traces(f, 1, nmax, &div, &mut diags, &mut untagged);
+        if let (Some(a), Some(b)) = (ta.first(), tb.first()) {
+            if let Err(e) = verify_period_claim(f, &[a, b], p) {
+                diags.push(("GV-TILE-UNROLL-LIMIT", Severity::Error, 0, format!("{e}; a launch with more iterations than {nmax} is NOT covered")));
             }
         }
     }
