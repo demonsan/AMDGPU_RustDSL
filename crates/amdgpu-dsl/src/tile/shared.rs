@@ -3,6 +3,10 @@
 //! declared time-multiplexing (`overlays`). A real overlap that was not declared is a build-time panic (it would otherwise be silently aliased).
 
 use super::{ev, ox};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use crate::{FnBuilder, Opnd, ValueId, I32};
 
 /// Byte layout of a buffer.
@@ -94,11 +98,27 @@ impl Shared {
 pub struct SlotIdx {
     pub slot: Opnd,
     pub gen: Opnd,
+    /// bound slot * stride values, shared by every consumer of this slot instance (clones share the cache): the manual kernels compute
+    /// slot_cur / slot_nxt / kds_nxt once per iteration. A cached value is only valid in the scope it was bound in: the pipeline creates a fresh
+    /// SlotIdx per iteration at the iteration's top-level scope, and the components bind at that scope.
+    offs: Rc<RefCell<HashMap<i64, ValueId>>>,
 }
 
 impl SlotIdx {
     pub fn new(slot: impl Into<Opnd>, gen: impl Into<Opnd>) -> SlotIdx {
-        SlotIdx { slot: slot.into(), gen: gen.into() }
+        SlotIdx { slot: slot.into(), gen: gen.into(), offs: Default::default() }
+    }
+    /// slot * stride bound once per slot instance and stride (0 for a constant slot 0).
+    pub fn off_v(&self, b: &mut FnBuilder, stride: i64) -> I32 {
+        if let Opnd::I32(c) = self.slot {
+            return I32::c(c * stride as i32);
+        }
+        if let Some(v) = self.offs.borrow().get(&stride) {
+            return ev(*v);
+        }
+        let v = b.bind_i32(self.slot() * (stride as i32));
+        self.offs.borrow_mut().insert(stride, v);
+        ev(v)
     }
     /// The slot index as an expression.
     pub fn slot(&self) -> I32 {
@@ -114,9 +134,16 @@ pub struct SlotRef<'a> {
 }
 
 impl SlotRef<'_> {
-    /// Slot offset relative to the buffer base (`slot * stride`).
+    /// Slot offset relative to the buffer base (`slot * stride`) as an unbound expression (re-emitted at every bind: prefer `off_v`).
     pub fn off(&self) -> I32 {
         self.sh.slot_off(&self.idx.slot())
+    }
+    /// Slot offset bound once per slot instance and stride (shared with every other buffer of the same slot stride, e.g. the K and V halves of a ring group).
+    pub fn off_v(&self, b: &mut FnBuilder) -> I32 {
+        if self.sh.slots == 1 {
+            return I32::c(0);
+        }
+        self.idx.off_v(b, self.sh.slot_stride)
     }
     /// Absolute LDS byte address of the slot.
     pub fn base(&self) -> I32 {

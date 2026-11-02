@@ -203,7 +203,7 @@ impl RowsReader {
     /// Per-slot addresses (4 adds, once per tile).
     pub fn at<'a>(&self, b: &mut FnBuilder, slot: &SlotRef<'a>) -> RowsSlot<'a> {
         assert_eq!(slot.sh.name, self.sh.name);
-        let off = slot.off();
+        let off = slot.off_v(b);
         let kfb = std::array::from_fn(|k| b.let_i32(&self.kfx[k] + &off));
         RowsSlot { slot: slot.clone(), kfb }
     }
@@ -257,7 +257,7 @@ impl TrReader {
     }
     pub fn at<'a>(&self, b: &mut FnBuilder, slot: &SlotRef<'a>) -> TrSlot<'a> {
         assert_eq!(slot.sh.name, self.sh.name);
-        let off = slot.off();
+        let off = slot.off_v(b);
         let trb = std::array::from_fn(|e| b.let_i32(&self.trx[e] + &off));
         TrSlot { slot: slot.clone(), trb }
     }
@@ -289,7 +289,8 @@ impl RowScaleReader {
     /// Base address in `slot` (one add per tile).
     pub fn at<'a>(&self, b: &mut FnBuilder, slot: &SlotRef<'a>) -> (SlotRef<'a>, I32) {
         assert_eq!(slot.sh.name, self.sh.name);
-        let a = b.let_i32(&self.cur + slot.off());
+        let off = slot.off_v(b);
+        let a = b.let_i32(&self.cur + off);
         (slot.clone(), a)
     }
     /// The scale word of row group `s`.
