@@ -308,47 +308,41 @@ pub enum QkOut<'t> {
     Values(ValueId),
 }
 
-/// `S[s] (+)= K(rows 32 s ..) . Q^T` for s = 0..3: per s the optional f16 bias MFMA, the two K fragments, the K-scale word, the scale bytes, two scaled
-/// MFMAs (the manual `qk` closure, statement for statement). Returns the 4 S values in the `Values` mode.
+/// `S[s] (+)= K(rows 32 s ..) . Q^T` for s = 0..3 (`qk_block` for each s). Returns the 4 S values in the `Values` mode.
 #[allow(clippy::too_many_arguments)]
-pub fn qk_tile(
-    b: &mut FnBuilder,
-    out: QkOut,
-    bias: Option<(ValueId, ValueId)>,
-    k: &RowsSlot,
-    kd: &(SlotRef, I32),
-    q: &[Frag<B32x32x64Fp8>; 2],
-    sq: [ValueId; 2],
-    sel: &ScaleSel,
-) -> Vec<ValueId> {
-    let mut vals = Vec::new();
-    for s in 0..4usize {
-        let start: Option<ValueId> = match (&out, bias) {
-            (QkOut::Vars(t), Some((ones, w))) => {
-                b.var_mfma_f16_z(t.accs[s].var, ones, w);
-                None
-            }
-            (QkOut::Values(z), Some((ones, w))) => Some(b.mfma_f16_wide(ones, w, *z)),
-            (QkOut::Values(z), None) => Some(*z),
-            (QkOut::Vars(_), None) => None,
-        };
-        let [k0, k1] = k.read_pair(b, s);
-        let kw = RowScaleReader::read(b, kd, s);
-        let (sk0, sk1) = sel.pair(b, kw);
-        match &out {
-            QkOut::Vars(t) => {
-                mma_scaled(b, &t.accs[s], &k0, &q[0], sk0, sq[0]);
-                mma_scaled(b, &t.accs[s], &k1, &q[1], sk1, sq[1]);
-            }
-            QkOut::Values(_) => {
-                let s0 = mma_scaled_v(b, &k0, &q[0], start.expect("start"), sk0, sq[0]);
-                vals.push(mma_scaled_v(b, &k1, &q[1], s0, sk1, sq[1]));
-            }
-        }
-    }
-    vals
+pub fn qk_tile(b: &mut FnBuilder, out: QkOut, bias: Option<(ValueId, ValueId)>, k: &RowsSlot, kd: &(SlotRef, I32), q: &[Frag<B32x32x64Fp8>; 2], sq: [ValueId; 2], sel: &ScaleSel) -> Vec<ValueId> {
+    (0..4usize).filter_map(|s| qk_block(b, &out, bias, k, kd, q, sq, sel, s)).collect()
 }
 
+/// One 32-key block `s` of the QK tile: the optional f16 bias MFMA, the two K fragments, the K-scale word, the scale bytes, two scaled MFMAs (the manual
+/// `qk` closure body, statement for statement). The slot addresses (`k`, `kd`) are computed once by the caller (`RowsReader::at` / `RowScaleReader::at`)
+/// and shared by the four blocks, which may be interleaved with other work (`_t128`: convert P(s), then QK(t+1, s)). Returns the S value in `Values` mode.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_block(b: &mut FnBuilder, out: &QkOut, bias: Option<(ValueId, ValueId)>, k: &RowsSlot, kd: &(SlotRef, I32), q: &[Frag<B32x32x64Fp8>; 2], sq: [ValueId; 2], sel: &ScaleSel, s: usize) -> Option<ValueId> {
+    let start: Option<ValueId> = match (out, bias) {
+        (QkOut::Vars(t), Some((ones, w))) => {
+            b.var_mfma_f16_z(t.accs[s].var, ones, w);
+            None
+        }
+        (QkOut::Values(z), Some((ones, w))) => Some(b.mfma_f16_wide(ones, w, *z)),
+        (QkOut::Values(z), None) => Some(*z),
+        (QkOut::Vars(_), None) => None,
+    };
+    let [k0, k1] = k.read_pair(b, s);
+    let kw = RowScaleReader::read(b, kd, s);
+    let (sk0, sk1) = sel.pair(b, kw);
+    match out {
+        QkOut::Vars(t) => {
+            mma_scaled(b, &t.accs[s], &k0, &q[0], sk0, sq[0]);
+            mma_scaled(b, &t.accs[s], &k1, &q[1], sk1, sq[1]);
+            None
+        }
+        QkOut::Values(_) => {
+            let s0 = mma_scaled_v(b, &k0, &q[0], start.expect("start"), sk0, sq[0]);
+            Some(mma_scaled_v(b, &k1, &q[1], s0, sk1, sq[1]))
+        }
+    }
+}
 /// `O[e] += V^T(keys 64 hh ..) . P[hh]` for hh = 0..1, e = 0..3 (8 scaled MFMAs, the V fragments read with the transposing reads).
 pub fn pv_tile(b: &mut FnBuilder, o: &AccTile<C32x32F32, 4>, v: &TrSlot, p: &[Frag<B32x32x64Fp8>; 2], sa: impl Into<Opnd> + Copy, sb: impl Into<Opnd> + Copy) {
     for (hh, pf) in p.iter().enumerate() {

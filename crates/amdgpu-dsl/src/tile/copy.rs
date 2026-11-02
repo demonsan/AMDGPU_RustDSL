@@ -103,6 +103,60 @@ impl RowsCopy {
     }
 }
 
+/// Several `RowsCopy` of the SAME rows (same producer waves, same lanes, same row clamp - e.g. the K and the V tile staged by one group in `_t128`): the
+/// clamped rows are computed once and shared, each copy adds its own stride / base / column bytes and writes its own slot (own marker).
+pub fn issue_rows_shared(b: &mut FnBuilder, key0: &I32, copies: &[(&RowsCopy, &SlotRef)]) {
+    let (first, _) = copies[0];
+    assert!(copies.iter().all(|(c, _)| c.dmas == first.dmas), "issue_rows_shared: copies of different shapes");
+    let rb = b.let_i32(key0 + &first.rowb);
+    let rows: Vec<I32> = (0..first.dmas).map(|q| b.let_i32(first.src.row(&rb + 8 * q))).collect();
+    for (c, slot) in copies {
+        assert_eq!(slot.sh.name, c.dst.name, "issue_rows_shared: slot of another buffer");
+        let off = slot.off_v(b);
+        let lbase = b.bind_i32(&c.lds_wave + off);
+        slot.write(b, |b| {
+            for q in 0..c.dmas {
+                let comp = 1024 * (c.dmas - 1 - q);
+                let o = b.bind_i32((add0(&rows[q as usize] * &c.src.stride, &c.src.base) + &c.cbytes[(q & 1) as usize]) + comp);
+                let sp = b.ptr_add(c.src.ptr, o);
+                b.load_global_lds(sp, lbase, -comp, 4);
+            }
+        });
+    }
+}
+
+/// One dword per row through a VGPR (the `_t128` K-scale path): `issue` loads the dword of row `key0 + row` (clamped) into a register, `complete` (after the
+/// pipeline's `wait_vm(0)`, i.e. in `PipeBody::stage_complete`) writes it to `base + 4 row` of the slot with `ds_write_b32` (marked as a write of the slot).
+pub struct DwordRowsVgpr {
+    src: RowSource,
+    dst: Shared,
+    row: I32,
+    lds_row: I32,
+}
+
+impl DwordRowsVgpr {
+    /// `row` = the tile row this lane copies (several lanes may copy the same row: the duplicate writes carry the same value).
+    pub fn new(b: &mut FnBuilder, src: RowSource, dst: &Shared, row: ValueId) -> DwordRowsVgpr {
+        let lds_row = b.let_i32((ev(row) << 2) + dst.base as i32);
+        DwordRowsVgpr { src, dst: dst.clone(), row: ev(row), lds_row }
+    }
+    /// The pending dword (an i32 value) of the tile whose first row is `key0`.
+    pub fn issue(&self, b: &mut FnBuilder, key0: &I32) -> ValueId {
+        let r = self.src.row(key0 + &self.row);
+        let off = b.bind_i32(add0(r * &self.src.stride, &self.src.base));
+        let p = b.ptr_add(self.src.ptr, off);
+        let v = b.load_f32(p, 0);
+        b.bitcast_i32(v)
+    }
+    /// Writes the (completed) dword into `slot`.
+    pub fn complete(&self, b: &mut FnBuilder, v: ValueId, slot: &SlotRef) {
+        assert_eq!(slot.sh.name, self.dst.name, "DwordRowsVgpr: slot of another buffer");
+        let off = slot.off_v(b);
+        let a = b.bind_i32(&self.lds_row + off);
+        slot.write(b, |b| b.store_lds_b32(a, v));
+    }
+}
+
 /// Copy of one dword per row (e.g. the K scales: 128 rows x 4 B): wave w covers rows `64 (w & 1) + lane` (waves 2, 3 duplicate waves 0, 1), one
 /// `global_load_lds_dword` per wave.
 pub struct DwordRowsCopy {

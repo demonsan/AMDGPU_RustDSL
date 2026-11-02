@@ -21,7 +21,7 @@ pub mod shared;
 pub mod softmax;
 pub mod tensor;
 
-pub use copy::{DwordRowsCopy, RowSource, RowsCopy};
+pub use copy::{issue_rows_shared, DwordRowsCopy, DwordRowsVgpr, RowSource, RowsCopy};
 pub use lane::{versioned, Lane, Role, Roles};
 pub use pipeline::{Cadence, PipeBody, Pipeline, TileIt};
 pub use shared::{fmha_swz, LdsPlan, Layout, PrivRef, Shared, SlotIdx, SlotRef, Swz};

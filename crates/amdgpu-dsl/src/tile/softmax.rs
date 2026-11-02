@@ -79,6 +79,18 @@ impl OnlineSoftmax {
     /// The decision of one tile: row max, the new reference word (an SSA value, also written to the bias variable exactly once), and the rollback branch
     /// rescaling `s`, `o` and the row sum. Returns the new bias word (the C input of the next tile's bias MFMAs).
     pub fn decide(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> ValueId {
+        self.decide_opts(b, s, o, mask, true)
+    }
+    /// `decide` without writing the bias variable (`write_bias = false`): the caller writes it later with `commit_bias` (`_t128` writes it at the END of
+    /// its window; writing it early lengthens the live range of the old word and made the scheduler fall back, 494 -> 410 TFLOP/s).
+    pub fn decide_deferred(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> ValueId {
+        self.decide_opts(b, s, o, mask, false)
+    }
+    /// Writes the new bias word (once per iteration, after every read of the old one).
+    pub fn commit_bias(&self, b: &mut FnBuilder, nb: ValueId) {
+        b.set_var(self.bias.expect("OnlineSoftmax: state not bound"), nb);
+    }
+    fn decide_opts(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, write_bias: bool) -> ValueId {
         let bias2 = self.bias.expect("OnlineSoftmax: state not bound");
         let mut flat: Vec<ValueId> = Vec::with_capacity(64);
         for i in 0..4usize {
@@ -112,7 +124,9 @@ impl OnlineSoftmax {
         let w_q = b.let_(Op::AddI32(Opnd::Val(h_raw), Opnd::Val(l_sh)));
         let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
         let nb = b.frag2(w_new, w_new);
-        b.set_var(bias2, nb);
+        if write_bias {
+            b.set_var(bias2, nb);
+        }
         b.begin_if(Opnd::Val(grow));
         {
             let dupd = b.frag2_dup(delta);
