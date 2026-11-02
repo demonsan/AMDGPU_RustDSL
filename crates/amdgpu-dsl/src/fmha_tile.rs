@@ -105,7 +105,6 @@ impl PipeBody for AttnBody<'_> {
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let (r, blk) = (self.ring, self.blk);
         let (s, o) = (self.s.unwrap(), self.o.unwrap());
-        r.bind_offsets(b, t);
         let mask = t.masked.then(|| KeyMask::new(b, t, blk.g4, blk.kv_len));
         let nb = self.sm.decide_deferred(b, &s, &o, mask.as_ref());
         let next = t.staged.then(|| (r.kr.at(b, &r.ks.at(&t.next)), r.kdr.at(b, &r.kd.at(&t.next))));
@@ -193,7 +192,8 @@ pub fn fmha_fwd_hd128_mxfp8_dsl_t128() -> Function {
     let blk = io.block(b, 7);
     let roles = Roles::single(&blk.lane, 4);
     let ring = KvRing::new(b, &io, &blk, &roles, 3);
-    let pipe = Pipeline::new(Cadence::OneWindow, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    let mut pipe = Pipeline::new(Cadence::OneWindow, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    pipe.prebind = vec![32768, 512]; // ring slot offsets (K|V, K scales) bound at the top of every iteration, as the hand kernel's `ring()`
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         let mut body = AttnBody::new(b, &ring, &blk, blk.lane.wave, lut);
