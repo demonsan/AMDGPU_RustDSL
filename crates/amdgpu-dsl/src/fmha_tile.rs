@@ -71,9 +71,10 @@ impl Vs128Body<'_> {
         let bk = self.bk;
         let kref = self.ks.at(slot);
         let kdref = self.kd.at(slot);
-        let koff = kref.off();
+        let koff = ev(b.bind_i32(kref.off()));
         let kfb: Vec<ValueId> = (0..4).map(|k| b.bind_i32(ev(bk.kfx[k]) + koff.clone())).collect();
-        let kd_rd = b.bind_i32(ev(bk.kd_cur) + kdref.off());
+        let kdoff = ev(b.bind_i32(kdref.off()));
+        let kd_rd = b.bind_i32(ev(bk.kd_cur) + kdoff);
         for s in 0..4usize {
             b.var_mfma_f16_z(self.s[s], self.ones_f16, Opnd::Val(bias));
             let ko = 4096 * s as i32;
@@ -210,7 +211,7 @@ impl Vs128Body<'_> {
         let bk = self.bk;
         let la = self.la.unwrap();
         let vref = self.vs.at(slot);
-        let voff = vref.off();
+        let voff = ev(b.bind_i32(vref.off()));
         let trb: Vec<ValueId> = (0..4).map(|e| b.bind_i32(ev(bk.trx[e]) + voff.clone())).collect();
         let pa = b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
         let pb = b.frag8(w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
