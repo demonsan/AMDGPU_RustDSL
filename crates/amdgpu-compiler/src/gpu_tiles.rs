@@ -754,20 +754,17 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         if c.done.is_none() && traces[c.role].items.get(c.ev.last + 1).is_some() {
             diags.push(("GV-TILE-PENDING", Severity::Warn, stmt, format!("stmt {stmt}: reads of `{}`[{}] are not completed (wait_lds(0)) before the next barrier, so the barrier does not separate them from the next writer {where_}", name(c.ev.tile), c.ev.slot)));
         }
-        let visible = |p: &Info| -> bool {
-            if p.role == c.role {
-                p.done.map_or(false, |d| d < c.ev.start)
-            } else {
-                p.publish.map_or(false, |v| v <= c.ev.ord)
-            }
-        };
+        // SHARED tile: the data is produced by OTHER waves (even of the same role) and consumed independently by every wave. A producer's own completion
+        // (wait_vm / wait_lds(0)) is only what lets the next barrier PUBLISH it; visibility is always the barrier publication, for every role. Only private regions
+        // (lds_private) may be self-produced and self-consumed.
+        let visible = |p: &Info| -> bool { p.publish.map_or(false, |v| v <= c.ev.ord) };
         let mut vis: Vec<&&Info> = prods.iter().filter(|p| visible(p)).collect();
         vis.sort_by_key(|p| (p.ev.ord, p.ev.start));
         match vis.last() {
             None => {
                 let pending = prods.iter().find(|p| p.ev.ver == c.ev.ver);
                 let why = match pending {
-                    Some(p) if p.role == c.role => format!("the {} of version {} (stmt {}) by this wave is not completed (wait_vm(0)/wait_lds(0)) before the read", if p.ev.dma { "DMA" } else { "write" }, p.ev.ver, p.ev.stmt),
+                    Some(p) if p.role == c.role && p.publish.map_or(true, |v| v > c.ev.ord) => format!("version {} (stmt {}) is produced by the waves of THIS role too, but a shared tile is only visible after a barrier publishes it (own wait_vm/wait_lds(0) is not enough: the other waves' parts may not be written yet); published at phase {}", p.ev.ver, p.ev.stmt, p.publish.map_or("never (no barrier after its completion)".to_string(), |v| v.to_string())),
                     Some(p) => format!("version {} is produced by role {} (stmt {}, phase {}) but is only published at phase {}", p.ev.ver, p.role, p.ev.stmt, p.ev.ord, p.publish.map_or("never (no barrier after its completion)".to_string(), |v| v.to_string())),
                     None => format!("no producer of `{}`[{}] with version {} exists in the simulated schedule", name(c.ev.tile), c.ev.slot, c.ev.ver),
                 };
@@ -787,11 +784,8 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
             }
         }
         for q in prods.iter().filter(|q| q.ev.ver != c.ev.ver) {
-            let overlap = if q.role == c.role {
-                q.ev.start < c.ev.start && !q.done.map_or(false, |d| d < c.ev.start)
-            } else {
-                q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord)
-            };
+            // the read window [c.ord, c.done_ord] against the write window [q.ord, q.publish) of ANY wave (same role included)
+            let overlap = q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord);
             if overlap {
                 diags.push(("GV-TILE-RACE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] (version {}, phases {}..{}) overlaps the write of version {} by role {} (stmt {}, issued at phase {}, published at {}): no barrier separates them {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, c.done_ord, q.ev.ver, q.role, q.ev.stmt, q.ev.ord, q.publish.map_or("never".to_string(), |v| v.to_string()))));
             }

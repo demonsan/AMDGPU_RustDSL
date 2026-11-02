@@ -542,3 +542,55 @@ fn a_genuine_period_two_ring_still_reports_a_verified_true_period() {
     assert!(r.errors().is_empty(), "{}", errors(&r));
     assert!(r.findings.iter().any(|x| x.code == "GV-TILE-PERIOD" && x.msg.contains("dividing 2 ") && x.msg.contains("VERIFIED")), "{}", r.render());
 }
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// shared tiles are produced by OTHER waves and consumed independently by each wave: no "self-produced, self-consumed" shortcut, not even within one role
+
+fn same_role(barrier: bool, wait: bool) -> Function {
+    let mut b = FnBuilder::new("same_role", 256);
+    b.lds(4096);
+    b.lds_tile("t", 0, 4096);
+    let t = b.let_(Op::WorkitemId);
+    let lane = b.let_(Op::AndI32(Opnd::Val(t), Opnd::I32(255)));
+    let c16 = b.c_i32(16);
+    let a = b.mul_i32(lane, c16);
+    let z = b.c_i32(0);
+    let v = b.frag4(z, z, z, z);
+    // every wave writes its own 1 KB slice of the tile ...
+    b.tile_produce("t", Opnd::I32(0), Opnd::I32(0));
+    b.store_lds_b128(a, v);
+    b.tile_end();
+    if wait {
+        b.wait_lds(0);
+    }
+    if barrier {
+        b.barrier();
+    }
+    // ... and then reads the WHOLE tile (parts written by the other waves)
+    b.tile_consume("t", Opnd::I32(0), Opnd::I32(0));
+    let ra = b.add_i32(a, Opnd::I32(1024));
+    let ra = b.let_(Op::AndI32(Opnd::Val(ra), Opnd::I32(4095)));
+    let _r = b.load_lds_b128(ra);
+    b.tile_end();
+    b.finish()
+}
+
+#[test]
+fn a_shared_tile_written_waited_and_read_without_a_barrier_is_stale() {
+    // the wave's own wait_lds(0) says nothing about the OTHER waves' slices: "self-produced, self-consumed" is unsound for a shared tile
+    let r = verify_ir(&same_role(false, true));
+    assert!(has(&r, "GV-TILE-STALE"), "{}", r.render());
+    assert!(r.errors().iter().any(|e| e.msg.contains("only visible after a barrier")), "{}", r.render());
+}
+
+#[test]
+fn a_shared_tile_published_by_a_barrier_is_consumed_independently_by_every_wave() {
+    let r = verify_ir(&same_role(true, true));
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+    assert!(r.proven.get("tile-reads").copied().unwrap_or(0) > 0, "{}", r.render());
+}
+
+#[test]
+fn a_barrier_without_the_producers_wait_does_not_publish() {
+    let r = verify_ir(&same_role(true, false));
+    assert!(has(&r, "GV-TILE-STALE"), "{}", r.render());
+}
