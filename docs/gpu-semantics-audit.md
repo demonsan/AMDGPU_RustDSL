@@ -1,97 +1,90 @@
-# gpu_verify v16 audit of record - shared-tile visibility fix
+# gpu_verify v4 audit of record - four-axis protocol model
 
-Auditor: `kernel-occ`. Branch: **`gpu-semantics-occ`** (this doc). Tested Main:
-**`origin/Main` = `a645265`** (v16 fixed shared-tile visibility = barrier publication for every role;
-`a742a09` + docs 13.1). Independent audit tests are in this branch:
-`gpu_tile_self_visibility.rs` (7/7), `shipped_ring_layout.rs` (1/1), plus the earlier
-`gpu_tile_attacks` / `gpu_tile_tripcount` / `gpu_tile_horizon` suites. On the tested tree:
-**28/28 `gpu_semantics` + 33/33 `gpu_tiles` + 7/7 self-visibility + 2/2 host-truth pass.**
+Auditor: `kernel-occ`. Branch: **`gpu-semantics-occ`** (this doc). Tested **`origin/Main` = `7b8c5e0`**
+(v4 generalized protocol engine `gpu_protocol.rs`: arrival / completion / visibility / generation;
+LDS instance + global regions + last-arriver pattern + counted trust ledger).
+On the tested tree: **17/17 `gpu_protocol`**, **14/14 independent `gpu_protocol_audit`**,
+**2/2 `contract_host_truth`**, and `--shipped --strict` is clean. Hardware: MI355X/gfx950, node 53,
+GPU 6 (probes only).
 
-## 1. The corrected rule (user-visible)
+## 1. Axis-separation attacks (independent `gpu_protocol_audit`)
 
-**Shared LDS tiles are produced by OTHER waves (including waves of the same role) and consumed
-independently by every wave. Visibility is barrier/`publish`-based for every role; a wave's own
-`wait_lds(0)` only completes its own writes and does NOT make the tile visible to itself.
-"Self-produced, self-consumed" is valid only for private per-wave regions (`lds_private`).**
-The v16 `gpu_tiles::check_pair` no longer has the `if p.role == c.role { p.done < c.start }` shortcut;
-for shared tiles `visible = p.publish <= c.ord`, and read/write overlap is checked across same-role
-waves too.
+| attack | expected | actual on 7b8c5e0 |
+|---|---|---|
+| (a) LDS barrier (arrival) but producer DS write **not completed** by `wait_lds(0)` | NO-COMPLETION | **REJECTED** `GV-TILE-STALE|GV-PROTO-NO-COMPLETION`: "the write ... is never completed (no wait_vm/wait_lds/fence_release between the write and the next barrier), so no barrier can publish it" |
+| (b1) LDS producer wrote+waited, but **no barrier publication** | UNPUBLISHED | **REJECTED** `GV-PROTO-UNPUBLISHED`: "version 0 ... only published at phase never (no barrier after its completion)" |
+| (b2) global wrote+waited but **no `fence_release`** | NOT-VISIBLE | **REJECTED** `GV-PROTO-NOT-VISIBLE`: "completed and a barrier followed, but the write was NOT released ... other waves may read stale lines" |
+| (b3) global released but **no `fence_acquire`** before read | NOT-VISIBLE | **REJECTED** `GV-PROTO-NOT-VISIBLE`: "runs before the acquire ... may still hit stale cache lines (no acquire)" |
+| (c) barrier present but consumer reads a **stale generation** | STALE-GEN | **REJECTED** `GV-PROTO-STALE-GEN`: expects version 1, latest published 0 |
+| (d) visibility satisfied but **next generation written in the read window** (O3) | RACE | **REJECTED** `GV-PROTO-RACE`: "read of r[0] (version 0, phases 1..1) overlaps the write of version 1 ... no barrier separates them" |
+| (e) roles derive **inconsistent generation** (producer version vs consumer version) | STALE-GEN | **REJECTED** both LDS and global `GV-PROTO-STALE-GEN` |
 
-## 2. Independent attack table (`gpu_tile_self_visibility`, all pass)
+The axis separation holds: an arrival (barrier) never substitutes for completion; completion never
+substitutes for publication; a published generation may still be stale if the consumer expects the
+wrong generation; and a visible generation can still race with the next write.
 
-| attack | expected | actual on v16 | verdict |
-|---|---|---|---|
-| (a) same-role: every wave writes its slice, `wait_lds(0)`, reads the whole tile, **no barrier** | reject | **`GV-TILE-STALE`** "produced by the waves of THIS role too, but a shared tile is only visible after a barrier publishes it (own wait_vm/wait_lds(0) is not enough ...), published at phase never" | SOUND (old rule accepted) |
-| (b) barrier only on the producer role's path | reject | **`GV-BAR`** (then 1 / else 0 barriers) + **`GV-TILE-STALE`** | SOUND |
-| (c1) consumer before the publishing barrier | reject | **`GV-TILE-STALE`** (published phase 1, consumer phase 0; evidence: version 0 not visible) | SOUND |
-| (c2) consumer at the publish phase (immediately after barrier) | accept | **clean**, `tile-reads: 20` | SOUND boundary |
-| (d) `ds_write` then barrier, **no `wait_lds(0)`** | reject | **`GV-TILE-STALE`** "own wait ... is not enough", published at phase never | SOUND |
-| (e1) same-version cooperative fill by both roles (P low half, C high half), wait, barrier, consume version 0 | accept | **clean**, `barrier-balanced-ifs: 2`, `tile-reads: 20` | SOUND |
-| (e2) different versions of the same slot written by the two roles in overlapping phases | reject | **`GV-TILE-RACE`** (write-write versions 0/1, phases 0..1 / 0..1) + **`GV-TILE-STALE`** | SOUND |
+## 2. Multi-producer / multi-consumer
 
-Additional: (f) non-counter marker version -> `GV-TILE-INDEX`; DMA producer without `wait_vm(0)` ->
-`GV-TILE-STALE`; slots=1 overwrite/read-before-publish/alias/escape -> `GV-TILE-RACE`/`STALE`/
-`OVERLAP`/`ESCAPE`; period-256 attack -> `GV-TILE-UNROLL-LIMIT`. `tile_trust_periodic` and
-`assume_trusted` remain listed/counted trust boundaries.
+| case | expected | actual |
+|---|---|---|
+| two producer roles fill the **same generation** (cooperative, each writes half) and two consumer roles read independently | allow | **clean**, `tile-reads: 20`, `region-cover: 4` |
+| two producer roles write **different generations** of the same region in overlapping phases | RACE | **REJECTED** `GV-PROTO-RACE` (write-write, versions 0/1, phases 0..1 / 0..1) + `GV-PROTO-STALE-GEN` for both readers |
+| readers in **all roles** (no same-role exemption; inherited from v16) | independent obligations | both role traces checked; same-generation cooperative case accepted, different-generation case rejected |
+| fused KV-split combine (last-arriver) | pattern proven | shipped `probe_last_arriver`, `_lite`, `_plain_fenced` **clean**; negative controls `_nofence`, `_plain` rejected |
+| missing release in fused pattern | NO-COMPLETION | **REJECTED** `GV-PROTO-NO-COMPLETION` |
+| missing acquire after ticket | NOT-VISIBLE | **REJECTED** `GV-PROTO-NOT-VISIBLE` |
+| ticket argument/region mismatch | ARRIVAL-MISMATCH | **REJECTED** `GV-PROTO-ARRIVAL-MISMATCH` |
+| lite acquire + plain (non-sc1) loads | NOT-VISIBLE | **REJECTED** |
+| generation not the block's split id | STALE-GEN | **REJECTED** `GV-PROTO-STALE-GEN` |
 
-## 3. Shipped certificate (`--shipped --strict`, 0 errors AND 0 warnings)
+## 3. Trust ledger
 
-`amdc gpu-verify --shipped --strict -v`: **rc=0, 0 Error lines, 0 Warn lines on all 8 shipped
-kernels**, aggregate **44 trusted assumes / 216 trusted contracts / 0 unproven**. **No shipped kernel
-fails the new visibility rule**, so there is no candidate missing-barrier kernel bug.
+Every escape is listed and counted by `Report::ledger()` and the certificate line. I built a
+deliberately unsafe **global-region** kernel with `buf_trust("r", ...)` and **no completion, release,
+acquire, or ticket**. It passes `--strict` (by design, the region is trusted), and the checker makes
+the escape visible:
 
-| kernel | errors | tile-reads | tile-cover | certificate |
-|---|---:|---:|---:|---|
-| `_vs128` | 0 | 58880 | 600 | 6/29/0 |
-| `_vs5` | 0 | 58880 | 600 | 6/29/0 |
-| `_kvsplit` | 0 | 240640 | 760 | 12/36/0 |
-| `_t128` | 0 | - | - | 4/29/0 |
-| `_t` | 0 | - | - | 4/29/0 |
-| `_vs9` | 0 | - | - | 6/29/0 |
-| `_vs` | 0 | - | - | 4/29/0 |
-| `_combine8h` | 0 | - | - | 2/6/0 |
+`certificate: 1 trusted assumes (0 assume_trusted, 0 tile_trust_periodic, 1 region_trust),
+1 trusted contracts, 0 unproven`
 
-Counter note: v16 reports more `tile-reads` than the v15 certificate (vs128/vs5 58880 vs 16640;
-kvsplit 240640 vs 66560; kvsplit tile-cover 760 vs 600). This is the stricter visibility/path
-enumeration, not a regression: every event is proven, there are 0 errors and 0 warnings, and K=0
-unproven. The v15 numbers were produced under the old same-role shortcut and are not comparable.
+with `[GV-ASSUME|GV-PROTO-TRUST] Info: buf_trust 'r': TRUSTED, the protocol of this region is not
+checked (...)`. So a trust escape can hide a real protocol violation, but it is **not silent**: it
+appears in `-v`, in the `GV-PROTO-TRUST` finding, and in the per-kernel/aggregate ledger. Same for
+`assume_trusted`, `tile_trust_periodic`, aliases and host contracts. `--strict` still prints the
+certificate line (Info/trust entries are not Errors).
 
-## 4. Block-level shipped K/V ring check (independent of the verifier)
+## 4. Shipped certificate (`--shipped --strict`)
 
-`shipped_ring_layout.rs` splits the shipped kernel's top-level role branch and, **inside each role
-branch independently**, checks for a barrier between the K/V/KD tile producer and first matching
-consumer. On `a645265`:
-
-| kernel | branch | K/V/KD producers | consumers | publishing barrier stmt |
-|---|---|---:|---:|---:|
-| `_vs128` | roleA | 6 | 80 | **506** |
-| `_vs128` | roleB | 6 | 80 | **6820** |
-| `_kvsplit` | roleA | 6 | 80 | **559** |
-| `_kvsplit` | roleB | 6 | 80 | **7516** |
-
-Both roles have their own publishing barrier in the marker/barrier layout; no role-local missing
-barrier was hidden.
+**rc=0, 0 errors 0 warnings on all 8 shipped kernels**, aggregate **44 trusted assumes
+(44 assume_trusted, 0 tile_trust_periodic, 0 region_trust) / 216 trusted contracts / 0 unproven**.
+Per-kernel: vs128 6/29/0, vs5 6/29/0, vs9 6/29/0, vs 4/29/0, t128 4/29/0, t 4/29/0, kvsplit 12/36/0,
+combine8h 2/6/0. `tile-reads` vs128/vs5 **58880**, kvsplit **240640**; tile-cover 600/760. The v16
+shared-tile visibility rule remains in force (barrier publication for every role, no same-role
+exemption); v4 only generalizes the engine and adds global regions/last-arriver/ledger.
 
 ## 5. Host truth
 
-`contract_host_truth.rs` on v16: **2/2 pass** for B1H8S2048/B4H8S2048/B1H2S200; every extent,
-`grid_is`, `ka_is`, `ka_range`, `sym_range` matches ref_host/attn_host; no overstatement. Remaining
-contract gaps: `kvs_counters`@0x288 has no `arg_tensor`; split domain not constrained to {2,4,8}.
+`contract_host_truth.rs` on Main `7b8c5e0`: **2/2 pass** for B1H8S2048/B4H8S2048/B1H2S200; every
+extent, `grid_is`, `ka_is`, `ka_range`, `sym_range` matches ref_host/attn_host; no overstatement.
+Remaining contract gaps: `kvs_counters`@0x288 has no `arg_tensor`; split domain not constrained to
+{2,4,8}.
 
-## 6. Final soundness statement (README-ready)
+## 6. Final soundness statement (generalized model, README-ready)
 
-**"The compiler is GPU-semantics-aware: shared LDS tile visibility is barrier-publication based for
-every wave, never self-produced."** v16 certifies all **8 shipped FMHA kernels** with
-`--shipped --strict` at **0 errors and 0 warnings**, 0 unproven facts, and a countable trust budget of
-**44 trusted assumes / 216 host contracts**. It rejects a wave that writes/waits/reads a shared tile
-without a barrier (`GV-TILE-STALE`), a barrier on only one role's path (`GV-BAR`), reads strictly
-before the publishing phase, producers crossing a barrier without completing their writes, and
-different-version overlap (`GV-TILE-RACE`); it accepts consumer-at-publish-phase, same-version
-cooperative fills, and private per-wave regions. The same certificate covers LDS/DMA bounds, global
-buffers, VGPR/SGPR legality, barrier/role balance, path-sensitive/loop-carried waits and the tile
-protocol. Trust is explicit: `assume_trusted`, `tile_trust_periodic`, and host
-`arg_tensor`/`ka_is`/`grid_is` (44/216, printed per kernel as `N trusted assumes, M trusted contracts,
-K unproven`). Documented limits remain: raw safe-asm interiors, untagged LDS, partial-byte tile
-overlap, runtime-if outcomes, `period_bits` under-approximation for version-only `^`/`<<`/`*`,
-`kvs_counters` contract gap, i32 wrap, cross-workgroup races and >2 wave roles. Within those limits,
-this is the audit of record for "no OOB / wrong lifetime for global/LDS/VGPR/SGPR" on the shipped set.
+**"The compiler proves GPU memory protocols as four separate axes: arrival (barrier count), completion
+(`wait_vm`/`wait_lds`/`fence_release`), visibility (LDS barrier; global release + barrier + acquire),
+and generation (periodic slot/version), with multi-producer and multi-consumer obligations discharged
+bidirectionally."** On the shipped FMHA set, `--shipped --strict` is **0 errors / 0 warnings / 0
+unproven** under a countable trust budget of **44 trusted assumptions and 216 host contracts**;
+cooperative same-generation fills by multiple waves are accepted, while missing completion, missing
+publication, missing release/acquire, stale generations, next-generation read/write overlap,
+different-generation write races, ticket/arrival mismatches and lark-arriver fence omissions are all
+rejected. Escapes (`assume_trusted`, `tile_trust_periodic`, `region_trust`/`buf_trust`, aliases, host
+contracts) are listed, counted and printed; they are trust boundaries, not silent passes. **Scope
+limits:** global regions are intra-workgroup plus the explicit last-arriver pattern (cross-kernel
+split launches are out of scope); last-arriver checks "reads more than one slice", not
+count==splits; only two roles and equal trip counts; byte-level partial tile overlap is conflated;
+safe-asm interiors are not checked; i32 wrap is assumed away; interactive hardware visibility
+(`buffer_wbl2`/`buffer_inv`) is supported by the `tests/gpu/` probes, not proved. Within these stated
+limits, v4 generalizes the v1.6 LDS certificate to multi-producer/multi-consumer LDS and intra-WG
+global protocols with an explicit, countable trust ledger.
