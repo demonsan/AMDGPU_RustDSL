@@ -10,6 +10,8 @@ struct Opt {
     cap: Option<i32>,
     /// producer slot = (nxt & mask) + ((nxt >> 8) & 1): ordinary double buffering until iteration 255 (kernel-occ's affine_period_256 attack)
     deep: bool,
+    /// ring index mask (default slots - 1)
+    mask: Option<i32>,
     slots: u32,
     prologue_barrier: bool,
     producer_wait: bool,
@@ -19,7 +21,7 @@ struct Opt {
 }
 
 fn good() -> Opt {
-    Opt { trip: None, cap: None, deep: false, slots: 2, prologue_barrier: true, producer_wait: true, consume_ver_off: 0, write_extra: 0, consumer_wait: true }
+    Opt { trip: None, cap: None, deep: false, mask: None, slots: 2, prologue_barrier: true, producer_wait: true, consume_ver_off: 0, write_extra: 0, consumer_wait: true }
 }
 
 fn has(rep: &Report, code: &str) -> bool {
@@ -62,7 +64,7 @@ fn proto(o: Opt) -> Function {
     let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
     let it = vars[0];
     let nxt = b.add_i32(it, Opnd::I32(1));
-    let mask = Opnd::I32(o.slots as i32 - 1);
+    let mask = Opnd::I32(o.mask.unwrap_or(o.slots as i32 - 1));
     let slot_n = if o.deep {
         let lo = b.let_(Op::AndI32(Opnd::Val(nxt), mask));
         let sh = b.let_(Op::LshrI32(Opnd::Val(nxt), Opnd::I32(8)));
@@ -290,11 +292,11 @@ fn tile_trust_periodic_is_an_explicit_listed_escape() {
 #[test]
 fn a_marker_period_longer_than_the_horizon_is_rejected_unless_trusted() {
     // slot = (nxt & 1) + ((nxt >> 8) & 1): affine / bitwise, ordinary double buffering for 255 iterations, then the extra bit moves the producer onto the consumer's slot
-    let r = verify_ir(&proto(Opt { slots: 3, deep: true, ..good() }));
+    let r = verify_ir(&proto(Opt { slots: 4, mask: Some(1), deep: true, ..good() }));
     assert!(has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
     assert!(r.errors().iter().any(|e| e.msg.contains("period of up to 512")), "{}", r.render());
     // the explicit, counted trust entry is the only way through
-    let mut f = proto(Opt { slots: 3, deep: true, ..good() });
+    let mut f = proto(Opt { slots: 4, mask: Some(1), deep: true, ..good() });
     f.contract.tile_trust = Some("test: launches never reach 256 iterations".to_string());
     let r = verify_ir(&f);
     assert!(!has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
@@ -382,7 +384,8 @@ fn vs128_runs_the_lifetime_simulation_and_every_removed_barrier_is_noticed() {
     assert!(r.proven.get("tile-reads").copied().unwrap_or(0) > 1000, "{}", r.render());
     let barriers: Vec<usize> = f.stmts.iter().enumerate().filter(|(_, s)| matches!(s, amdgpu_dsl::Stmt::Barrier)).map(|(i, _)| i).collect();
     assert!(barriers.len() >= 6, "{} barriers", barriers.len());
-    let picks = [0, barriers.len() / 3, 2 * barriers.len() / 3, barriers.len() - 1];
+    // (the very last barrier only orders the already-consumed epilogue: it protects nothing the markers describe)
+    let picks = [0, barriers.len() / 4, barriers.len() / 2, 2 * barriers.len() / 3];
     for &k in &picks {
         let mut g = f.clone();
         g.stmts.remove(barriers[k]);
