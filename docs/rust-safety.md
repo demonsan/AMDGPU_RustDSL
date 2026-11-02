@@ -15,6 +15,15 @@
 
 本文重点讲 L1/L2（Rust 的安全性），并明确 L3 的分界，避免把 "safe Rust" 误读成 "生成的 kernel 一定正确"。
 
+> **关于 "这是不是假 safe"（`#![forbid(unsafe_code)]` 只是必要条件）：** 逐项的真实机制与真实 rustc 诊断见
+> [`rust-safety-by-example.md`](rust-safety-by-example.md) **Part D**。要点：
+> (a) lifetime/借用检查**确实在关键规则上工作**（在途矩阵操作数被改写 → `error[E0502]: cannot borrow … as mutable
+> because it is also borrowed as immutable`），不是"假 safe"；
+> (b) 但**不是全部保证都在编译期**——"忘记 wait/retire"由 `Drop` + `finish()` 以 `Err` 兜底（构建期），等待态组合由
+> `verify_block` 兜底（构建期），**DSL 层（`FnBuilder`/`ValueId` 索引 IR）不是 lifetime 管理的**（靠类型化构造 + 编译器
+> verifier）；
+> (c) 最根本的边界：Rust 的 lifetime 保护的是**宿主机程序的内存安全**，它不知道 GPU 指令的语义——L3 永远不由 Rust 保证。
+
 ---
 
 ## 1. L1：语言级安全（可编译期强制、可机器检查）

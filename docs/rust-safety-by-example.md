@@ -452,3 +452,105 @@ bash tools/container/cargo.sh test                                              
 **Part B**：手写 asm 不是 `unsafe`，而是**把 ISA 规则编码进类型**——寄存器宽度是类型参数、等待是线性 token、
 矩阵结果必须 `retire`、部分写是 typestate、常量总线是 const assert、偏移对齐是 const generic；类型系统判不了的由
 `verify_block`/`finish`/`pin_check` 以 `Err` 兜底。29 个编译失败用例是这套规则的负例目录。
+
+---
+
+# Part D — 澄清："这是不是假 safe？"
+
+> 这一节回应一个尖锐但正确的质疑：**Rust 的 safe 是靠编译期生命周期/借用检查管理的，而前面是不是只是"让 `unsafe` 不报错"？**
+
+## D1. 先修正一个措辞
+
+`#![forbid(unsafe_code)]` **不是"让 `unsafe` 不报错"**——它让 `unsafe` **无法存在**：任何 `unsafe {}`/`unsafe fn`/
+`unsafe impl` 都会让整个 crate **编译失败**。它的作用是证明"类型系统/借用检查器的规则对全部代码都生效、没有被绕过"。
+这是 Rust 安全性的**必要条件**，不是充分条件。真正的保证来自**检查器本身做了什么**——所以问题应该是：
+**lifetime/借用检查在我们这里到底在哪些地方干活？** 下面用真实 rustc 诊断回答。
+
+## D2. 机制分工表（每类保证的真实来源与检查时机）
+
+| 保证（我们声称的） | Rust 机制 | 检查时机 | 违反时的真实诊断 |
+|---|---|---|---|
+| 在途矩阵运算期间**操作数不被改写**（WAR） | **借用 + 生命周期**：`Ready<'a,N>` 由 `&'a` 共享借用产生，`Mfma<'a,OP>` 持有到 `retire()` | **编译期** | `error[E0502]: cannot borrow 'a' as mutable because it is also borrowed as immutable`（`fail_write_operand_of_inflight_mfma`） |
+| 矩阵结果**retire 前不可读** | **所有权（move）**：目的地 `Vgpr<16>` 被 move 进 `Mfma` token | **编译期** | `error[E0382]: borrow of moved value: 'o'`（`fail_read_inflight_mfma_d`） |
+| load 目的寄存器**wait 前不可读、不可重复 wait** | **所有权（move）**：目的地 move 进 `Pending<T>` | **编译期** | `error[E0382]: borrow of moved value: 'dst'` / `use of moved value: 'pending'` |
+| 矩阵操作数必须是 `Ready`（不能拿裸寄存器喂矩阵） | 类型 + 生命周期 | **编译期** | `expected 'Ready<'_, 8>', found '&Vgpr<8>'`（`fail_matrix_operand_without_ready`） |
+| `vcc` 掩码**未消费前不能再比较** | typestate：`Vcc<Live>` → `Vcc<Free>` | **编译期** | `expected 'Vcc<Free>', found 'Vcc<Live>'`（`fail_second_compare_while_mask_live`） |
+| 部分写**未写的半边不可读** | typestate：`Pw<Set,Unset>` 没有 `done()` | **编译期** | `no method named 'done' found for struct 'Pw<Set, Unset>'`（`fail_partial_unwritten_half`） |
+| SGPR 不能进 VGPR-only 槽 / 输入端口只读 / 用户不能伪造操作数 | trait 约束（sealed） | **编译期** | `the trait bound '&Sgpr<1>: VgprOnly' is not satisfied` 等（E0277） |
+| 对齐/常量总线/立即数范围/lane 下标 | **const eval 断言** | **编译期** | `error[E0080]: evaluation of 'Bus1::<…>::OK' failed … "constant bus limit 1"`（E0080） |
+| **忘记 wait / 忘记 retire** | `Drop` 记录 poison，`Seq::finish()` 汇总 | **构建期（运行期）** | `finish() -> Err("… abandoned without waiting")` |
+| 等待态距离、scoreboard 计数、WAR/WAW 组合、资源上限 | 序列验证器 `verify_block` | **构建期（运行期）** | `Err(Vec<String>)` |
+| DSL 层 IR 合法（dtype/作用域/循环变量） | 类型化构造 + 编译器 verifier | **编译期 + 编译期（lowering/MIR）** | `Err(String)`（编译失败） |
+| kernel 数值正确 / 不越界 | **不是 Rust**：硬件门禁 | 测试期 | 精度/确定性/1200 启动压力 |
+
+**结论**：lifetime/借用检查**确实在关键规则上工作**（WAR、在途操作数），不是"假 safe"；但**并非全部保证都在编译期**，
+也并非都来自 lifetime。诚实的分工是上面这张表。
+
+## D3. lifetime 的真实工作点（源码 + 诊断）
+
+```rust
+// crates/amdgpu-safeasm/src/regs.rs
+pub struct Ready<'a, const N: usize> {   // 读权限的"借用证明"
+    pub(crate) id: VReg,
+    pub(crate) _p: PhantomData<&'a ()>,  // ← 绑定到产生它的 &'a 借用
+}
+// crates/amdgpu-safeasm/src/seq.rs
+pub fn ready<'a, const N: usize>(&mut self, r: &'a impl Readable<N>) -> Ready<'a, N> { … }
+
+// crates/amdgpu-safeasm/src/seq.rs
+pub struct Mfma<'a, const OP: u32> {
+    …
+    pub(crate) _p: PhantomData<&'a ()>,  // ← 持有输入的 Ready，直到 retire
+}
+// crates/amdgpu-safeasm/src/ops.rs
+pub fn v_mfma_scale_f32_32x32x64_f8f6f4_zero<'a>(
+    &mut self, acc: Vgpr<16>,
+    a: Ready<'a, 8>, b: Ready<'a, 8>, sa: Ready<'a, 1>, sb: Ready<'a, 1>,
+) -> Mfma<'a, OP_MFMA_SCALE>
+```
+
+只要 `Mfma<'a, …>` 还活着，`a/b/sa/sb` 的 `&'a` 共享借用就还在，**任何 `&mut a` 都会被借用检查器拒绝**：
+
+```rust
+// crates/amdgpu-safeasm/tests/ui/fail_write_operand_of_inflight_mfma.rs
+let (ra, rb, rsa) = (s.ready(&a), s.ready(&b), s.ready(&sa));
+let t = s.v_mfma_scale_f32_32x32x64_f8f6f4_zero(o, ra, rb, rsa, rsa);
+let _w = s.lane_mut::<8, 0>(&mut a);   // ← E0502：cannot borrow `a` as mutable …
+let _o = t.retire(&mut s);
+```
+
+**这就是你理解的"编译期生命周期管理"，它在这里真实存在并且真的拦住了 WAR。** 类似地还有 `Ready` 作为矩阵操作数的强制
+（`fail_matrix_operand_without_ready`）、`Vcc<Live>` 的掩码生命周期（`fail_second_compare_while_mask_live`）。
+
+## D4. 编译期抓不到的三类（必须诚实）
+
+1. **"忘记"而不是"用错"**：move 语义只能防"重复使用/提前使用"；**忘了调用 `wait`/`retire`** 时，token 会被 `Drop`，
+   `Drop` 把问题写进 `poison`，由 `Seq::finish()` 返回 `Err` —— 这是**构建期**检查，不是编译期
+   （Rust 没有线性类型，无法在编译期禁止"泄漏 token"；`#[must_use]` 只是警告）。
+2. **硬件规则的组合**：等待态距离（`lgkmcnt`/`vmcnt` 计数）、WAR/WAW 组合、DS 部分计数、资源上限——这些需要看到
+   **整条序列**，由 `verify_block` 在构建期检查并返回 `Err`。
+3. **DSL 层不是 lifetime 管理**：`FnBuilder`/`Op`/`Stmt` 是 **SSA 索引 IR**（`ValueId` 是 `u32` 下标，不是借用）。
+   DSL 的安全性来自"类型化构造 + 编译器 verifier"，**不是**借用检查器管寄存器生命周期。说"lifetime 管理 DSL 寄存器"
+   是不准确的——这里只有"安全的宿主机代码 + 编译器拒绝非法 IR"。
+
+## D5. 最根本的边界：host 安全 ≠ target 安全
+
+Rust 的 lifetime/借用检查保护的是**宿主机程序的内存安全**（无悬垂、无数据竞争、无越界）。它**对 GPU 指令的语义一无所知**：
+即使整条序列 100% 通过借用检查与验证器，它仍可能算错数。因此本项目的 "safe" 必须分三层读：
+
+| 层 | 保证 | 机制 | 本文档哪节 |
+|---|---|---|---|
+| L1 | 宿主机程序无 UB | `forbid(unsafe_code)` + 借用检查 + move + 类型 | 本文 Part A/B、`rust-safety.md` §1 |
+| L2 | 生成的 GPU 序列**合法**（按我们的硬件模型） | 类型 + const-eval + verifier（构建期 `Err`） | Part B §B10、`rust-safety.md` §3 |
+| L3 | 生成的 kernel **算得对**、不越界 | **不是 Rust**：精度/确定性/1200 启动压力/硬件探针 | `rust-safety.md` §6 |
+
+**所以：L1 是"真 safe"（lifetime 在关键处真的工作），L2 是"模型内验证"，L3 不是 Rust 能保证的。** 任何把 L3 也说成
+"Rust safe" 的表述都是过度声明——本文档与 `rust-safety.md` 已明确区分。
+
+## D6. 结论
+
+- **不是假 safe**：不安全代码在编译期被禁止；lifetime/借用检查在"在途操作数被改写"这类关键规则上**真实拦截**
+  （E0502 诊断可复现，28 个负例覆盖）。
+- **但也不是"全编译期"**：忘记 wait、等待态组合、DSL 的索引 IR 由构建期 verifier 以 `Err` 兜底；这一点之前的文档
+  表述不够精确，本节修正。
+- **更不是"kernel 因此正确"**：Rust 保证的是宿主机程序的 memory safety，不是 GPU 语义。
