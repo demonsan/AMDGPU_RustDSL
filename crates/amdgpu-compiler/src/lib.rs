@@ -7,6 +7,7 @@ pub mod asm_check;
 pub mod pin_check;
 pub mod backend;
 pub mod emit;
+pub mod gpu_tiles;
 pub mod gpu_verify;
 pub mod hazards;
 pub mod lower;

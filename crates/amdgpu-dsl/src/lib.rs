@@ -533,7 +533,7 @@ pub enum Stmt {
     TileEnd,
     /// Contract fact: from here on `target` (a value or a loop variable) lies in [lo, hi]. For loop variables the analyzer PROVES it inductively when it can
     /// (initial value and every `set_var` stay inside) and otherwise records it as a TRUSTED assumption in the report. Lowers to nothing.
-    Assume { target: Opnd, lo: Ext, hi: Ext },
+    Assume { target: Opnd, lo: Ext, hi: Ext, trusted: Option<String> },
     Let { dst: ValueId, op: Op },
     StoreU16 { base: Opnd, byte_off: u32, value: Opnd },
     StoreF32 { base: Opnd, byte_off: u32, value: Opnd },
@@ -698,8 +698,8 @@ impl Function {
                 Stmt::WaitLds { count } => {
                     let _ = writeln!(s, "{pad}waitlds({count})");
                 }
-                Stmt::Assume { target, lo, hi } => {
-                    let _ = writeln!(s, "{pad}assume {target:?} in [{lo:?}, {hi:?}]");
+                Stmt::Assume { target, lo, hi, trusted } => {
+                    let _ = writeln!(s, "{pad}assume{} {target:?} in [{lo:?}, {hi:?}]", if trusted.is_some() { "_trusted" } else { "" });
                 }
                 Stmt::TileProduce { tile, slot, version } => {
                     let _ = writeln!(s, "{pad}tile_produce {tile}[{slot:?}] v={version:?}");
@@ -880,7 +880,12 @@ impl FnBuilder {
     }
     /// Contract fact `lo <= target <= hi` from this point on (see `Stmt::Assume`). Emits no code.
     pub fn assume(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext) {
-        self.f.stmts.push(Stmt::Assume { target: target.into(), lo, hi });
+        self.f.stmts.push(Stmt::Assume { target: target.into(), lo, hi, trusted: None });
+    }
+    /// Like `assume`, but for a loop variable whose range holds by a guard the analyzer cannot see (e.g. a counter bounded by the loop exit test): the induction
+    /// check failing is NOT an error, the assumption is listed as TRUSTED with `reason`.
+    pub fn assume_trusted(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext, reason: &str) {
+        self.f.stmts.push(Stmt::Assume { target: target.into(), lo, hi, trusted: Some(reason.to_string()) });
     }
 
     pub fn arg(&mut self, name: &str, ty: DType, offset: u32, size: u32) {

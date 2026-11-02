@@ -41,12 +41,12 @@ pub struct Report {
 }
 
 impl Report {
-    fn add(&mut self, code: &'static str, severity: Severity, msg: String) {
+    pub(crate) fn add(&mut self, code: &'static str, severity: Severity, msg: String) {
         if self.quiet == 0 {
             self.findings.push(Finding { code, severity, msg });
         }
     }
-    fn ok(&mut self, what: &'static str) {
+    pub(crate) fn ok(&mut self, what: &'static str) {
         if self.quiet == 0 {
             *self.proven.entry(what).or_insert(0) += 1;
         }
@@ -532,6 +532,8 @@ struct An<'a> {
     vars: HashMap<VarId, Itv>,
     var_init: HashMap<VarId, Itv>,
     assumed: HashMap<VarId, Itv>,
+    assumed_trusted: HashMap<VarId, String>,
+    tag: Option<(usize, Itv)>,
     acc: HashMap<VarId, Itv>,
     defs: HashMap<ValueId, Op>,
     ovr: Option<(Opnd, Itv)>,
@@ -655,7 +657,23 @@ impl<'a> An<'a> {
         }
     }
 
+    /// Under a tile marker, the access must lie inside the marked tile / ring (hull over the slot interval).
+    fn tile_cover(&mut self, what: &str, addr: &Itv, size: i128) {
+        let Some((ti, slot)) = self.tag.clone() else { return };
+        let t = &self.f.contract.tiles[ti];
+        let reg = slot.scale(Q::int(t.slot_size as i128)).add_const(t.base as i128);
+        let lo_ok = reg.lo.iter().any(|r| addr.lo.iter().any(|a| self.cx.le(r, a)));
+        let hi_ok = addr.hi.iter().any(|h| reg.hi.iter().any(|rh| self.cx.le(&h.add(&Poly::int(size)), &rh.add(&Poly::int(t.slot_size as i128)))));
+        if lo_ok && hi_ok {
+            self.rep.ok("tile-cover");
+        } else {
+            let m = format!("stmt {}: {what}: LDS access {} (+{size}) is not provably inside tile `{}` (slot interval {}, slot size {}, base {})", self.idx, addr.show(), t.name, slot.show(), t.slot_size, t.base);
+            self.rep.add("GV-TILE-ESCAPE", Severity::Error, m);
+        }
+    }
+
     fn check_lds(&mut self, what: &str, addr: &Itv, size: i128) {
+        self.tile_cover(what, addr, size);
         let limit = Itv::konst(self.f.lds_bytes as i128);
         match self.prove_range(addr, size, &limit) {
             Ok(()) => self.rep.ok("lds"),
@@ -996,7 +1014,7 @@ impl<'a> An<'a> {
         }
     }
 
-    fn assume(&mut self, target: &Opnd, lo: &Ext, hi: &Ext) {
+    fn assume(&mut self, target: &Opnd, lo: &Ext, hi: &Ext, trusted: &Option<String>) {
         let a = Itv { lo: ext_itv(&self.cx, lo).lo, hi: ext_itv(&self.cx, hi).hi };
         match target {
             Opnd::Var(v) => {
@@ -1006,8 +1024,18 @@ impl<'a> An<'a> {
                 };
                 self.assumed.insert(*v, a.clone());
                 self.vars.insert(*v, a.clone());
-                let m = format!("stmt {}: assume var{} in {}: {}", self.idx, v.0, a.show(), if init_ok { "initial value proven inside; every set_var is checked against it" } else { "TRUSTED (the initial value is not provably inside); every set_var is checked against it" });
-                self.rep.add("GV-ASSUME", Severity::Info, m);
+                if let Some(r) = trusted {
+                    self.assumed_trusted.insert(*v, r.clone());
+                    let m = format!("stmt {}: assume_trusted var{} in {} ({r}): TRUSTED, the induction is not checked", self.idx, v.0, a.show());
+                    self.rep.add("GV-ASSUME", Severity::Info, m);
+                } else if init_ok {
+                    let m = format!("stmt {}: assume var{} in {}: initial value proven inside; every set_var is checked against it (an unproven step is an error)", self.idx, v.0, a.show());
+                    self.rep.add("GV-ASSUME", Severity::Info, m);
+                } else {
+                    let init = self.var_init.get(v).map(|i| i.show()).unwrap_or_default();
+                    let m = format!("stmt {}: assume var{} in {}: the initial value {init} is not provably inside the assumed range (use assume_trusted(.., reason) if it holds by a guard the analyzer cannot see)", self.idx, v.0, a.show());
+                    self.rep.add("GV-ASSUME-VIOLATED", Severity::Error, m);
+                }
             }
             Opnd::Val(v) => {
                 let cur = self.int_of(target);
@@ -1058,7 +1086,11 @@ impl<'a> An<'a> {
                     }
                     self.env.insert(*dst, v);
                 }
-                Stmt::Assume { target, lo, hi } => self.assume(target, lo, hi),
+                Stmt::Assume { target, lo, hi, trusted } => self.assume(target, lo, hi, trusted),
+                Stmt::TileProduce { tile, slot, .. } | Stmt::TileConsume { tile, slot, .. } => {
+                    self.tag = f.contract.tiles.iter().position(|t| &t.name == tile).map(|ti| (ti, self.int_of(slot)));
+                }
+                Stmt::TileEnd | Stmt::Barrier | Stmt::EndLoop | Stmt::Else | Stmt::EndIf => self.tag = None,
                 Stmt::StoreU16 { base, byte_off, .. } => {
                     let b = self.av_of(base);
                     self.check_global("store_u16", &b, *byte_off as i128, 2, true)
@@ -1105,6 +1137,7 @@ impl<'a> An<'a> {
                 Stmt::StoreLdsB32 { addr, .. } => self.check_lds_at("ds_write_b32", addr, 4),
                 Stmt::StoreLdsB128 { addr, .. } => self.check_lds_at("ds_write_b128", addr, 16),
                 Stmt::BeginLoop { vars, init } => {
+                    self.tag = None;
                     let close = self.matching_end(i);
                     let mut cur: Vec<Itv> = Vec::new();
                     for (v, i0) in vars.iter().zip(init.iter()) {
@@ -1177,13 +1210,21 @@ impl<'a> An<'a> {
                     }
                     if let Some(a) = self.assumed.get(var).cloned() {
                         if !nv.within(&a, &self.cx) {
-                            let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {} (the assumption is TRUSTED here)", var.0, nv.show(), a.show());
-                            self.rep.add("GV-ASSUME", Severity::Info, m);
+                            if let Some(r) = self.assumed_trusted.get(var).cloned() {
+                                let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {} (TRUSTED: {r})", var.0, nv.show(), a.show());
+                                self.rep.add("GV-ASSUME", Severity::Info, m);
+                            } else {
+                                let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {}: the assumption is not inductive (a loop-carried assume that the loop itself can violate is a proof hole; weaken it, or use assume_trusted(.., reason) when a guard the analyzer cannot see bounds it)", var.0, nv.show(), a.show());
+                                self.rep.add("GV-ASSUME-VIOLATED", Severity::Error, m);
+                            }
                         }
                     }
                 }
                 Stmt::EndLoop => {}
-                Stmt::BeginIf { .. } => self.if_stack.push((self.env.clone(), None)),
+                Stmt::BeginIf { .. } => {
+                    self.tag = None;
+                    self.if_stack.push((self.env.clone(), None))
+                }
                 Stmt::Else => {
                     if let Some(top) = self.if_stack.last_mut() {
                         top.1 = Some(self.env.clone());
@@ -1333,7 +1374,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: Ctx::new(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), acc: HashMap::new(), ovr: None, defs: f.stmts.iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: Ctx::new(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, acc: HashMap::new(), ovr: None, defs: f.stmts.iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
@@ -1346,6 +1387,7 @@ pub fn verify_ir(f: &Function) -> Report {
         rep.add("GV-ASM", Severity::Info, "safe-asm blocks present: their internal memory accesses are NOT bounds-checked by v1 (address inputs come from IR values that are)".to_string());
     }
     barrier_balance(f, &mut rep);
+    crate::gpu_tiles::verify_tiles(f, &mut rep);
     rep
 }
 
@@ -1396,8 +1438,13 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             if p < 1 {
                 rep.add("GV-REG-RESERVED", Severity::Error, format!("vreg {r} ({c:?}) allocated to v{p}: v0 holds the workitem id"));
             }
-            if n >= 2 && p % n != 0 {
-                rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at v{p}: a {n}-dword VGPR tuple must start at a multiple of {n} (ISA: even for 64-bit and wider; MFMA operands)"));
+            // ISA: 64-bit tuples start at even registers, 128-bit and wider tuples (MFMA operands / accumulators) at multiples of 4 (assembler-observed on gfx950:
+            // v[4:19] and v[52:67] are accepted). The allocator additionally aligns to the tuple width: reported as a policy deviation, not an error.
+            let need = if n >= 4 { 4 } else { 2 };
+            if n >= 2 && p % need != 0 {
+                rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at v{p}: a {n}-dword VGPR tuple must start at a multiple of {need} (ISA)"));
+            } else if n >= 2 && p % n != 0 {
+                rep.add("GV-REG-POLICY", Severity::Info, format!("vreg {r} ({c:?}) at v{p}: ISA-legal, but not aligned to the tuple width {n} (the allocator normally aligns to the width)"));
             }
             if p + n > VGPR_LIMIT {
                 rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at v{p}..v{}: exceeds the {VGPR_LIMIT}-VGPR per-wave limit", p + n - 1));
@@ -1406,8 +1453,9 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             if p < 8 {
                 rep.add("GV-REG-RESERVED", Severity::Error, format!("vreg {r} ({c:?}) allocated to s{p}: s0..s7 hold the kernarg pointer / workgroup ids"));
             }
-            if n >= 2 && p % n != 0 {
-                rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at s{p}: an SGPR {} must start at a multiple of {n} (64-bit pairs even, 128-bit descriptors multiple of 4)", if n == 4 { "descriptor quad" } else { "pair" }));
+            let need = if n >= 4 { 4 } else { 2 };
+            if n >= 2 && p % need != 0 {
+                rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at s{p}: an SGPR {} must start at a multiple of {need} (64-bit pairs even, 128-bit descriptors multiple of 4)", if n == 4 { "descriptor quad" } else { "tuple" }));
             }
             if p + n > SGPR_LIMIT {
                 rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at s{p}..s{}: exceeds the {SGPR_LIMIT}-SGPR limit", p + n - 1));
