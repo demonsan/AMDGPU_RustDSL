@@ -324,3 +324,27 @@ fn one_window_three_slot_ring_verifies() {
     let n = |m: &str| c.asm.lines().filter(|l| l.trim_start().starts_with(m)).count();
     assert_eq!(n("s_barrier"), 2, "P0 + one per steady tile (the tail has none)");
 }
+
+#[test]
+fn kv_split_and_gqa_components_verify() {
+    use amdgpu_dsl::tile::components::*;
+    let mut b = FnBuilder::new("tile_demo_kvs", 64);
+    let mut ka = KArgs::new();
+    let _ = ka.dim(&mut b, "skv", 0x00, 1, i64::MAX);
+    let kv_len = ka.i32(&mut b, "skv", 0x00);
+    ka.arg(&mut b, "gqa", DType::I32, 0x04, 4);
+    b.ka_range(0x04, 1, 16);
+    let gqa = ka.i32(&mut b, "gqa", 0x04);
+    let _ = ka.dim(&mut b, "splits", 0x08, 1, i64::MAX);
+    let splits = ka.i32(&mut b, "splits", 0x08);
+    b.grid_is(2, Ext::sym("B") * Ext::ka(0x08));
+    let z = b.let_(amdgpu_dsl::Op::WorkgroupIdZ);
+    let h = b.let_(amdgpu_dsl::Op::WorkgroupIdY);
+    let (_bi, sp, lg) = kv_split_decode(&mut b, z, splits, 0x08, "B");
+    let (_klo, _keff) = kv_split_range(&mut b, kv_len, sp, lg, 0x00);
+    let _kvh = gqa_kv_head(&mut b, h, gqa, "HK");
+    let f = b.finish();
+    assert!(errs(&f).is_empty(), "{:?}", errs(&f));
+    let r = analyse(&f).unwrap();
+    assert_eq!(r.ledger().assume_trusted, 7, "the components' trusted facts are counted in the certificate");
+}

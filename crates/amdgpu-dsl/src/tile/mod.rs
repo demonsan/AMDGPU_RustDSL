@@ -10,6 +10,7 @@
 //! * the global->LDS DMA lane addressing (swizzle, M0, negative immediates) - `copy::RowsCopy` / `copy::DwordRowsCopy`;
 //! * waits, barriers, the role phase offset, the tile counter contract and the peeled tail - `pipeline::Pipeline::run`.
 
+pub mod components;
 pub mod copy;
 pub mod epilogue;
 pub mod frag;
