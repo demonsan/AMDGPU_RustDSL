@@ -419,3 +419,22 @@ impl Vs128Body<'_> {
 2. L4（`frag.rs`）+ `tile_mma.rs`（demo：QK 一个 tile，asm 中 8 条 `v_mfma_scale_f32_32x32x64_f8f6f4` + 8 对 `ds_read_b128` + 标记）。
 3. L5/L6（`reduce.rs`、`softmax.rs`、`epilogue.rs`）+ `tile_softmax.rs`、`tile_epilogue.rs`、`tile_combine.rs`（combine8h 用库重写的 demo 与原 kernel 的数值等价性：host 解释器/同 op 序列）。
 4. 每层落地后报告 lead；kernel-opt 在 L1–L4 齐备后开始移植。
+
+---
+
+## 13. 实现状态（as-built，分支 `dsl-tile`）
+
+| 层 | 模块 | 实际 API（与 §3–§8 设计的差异） | 测试 |
+|---|---|---|---|
+| D1 | `amdgpu_dsl::CompileProfile`、`Function.compile_profile`、`b.compile_profile(..)`；编译器 `policy_name(f)` | profile 映射到对应出厂 kernel 的名字，所有按名字选策略的检查（lowering 选项、调度预设、vcc fill、pin_vmwait）看到的就是该 kernel 的策略；`None` = 旧行为 | 出厂 asm md5 不变 |
+| L0 | `expr.rs` | 新增循环变量叶子 `b.i32var(VarId)` / `tile::varx`，`b.bind_opnd`（裸变量根返回 `Opnd::Var`） | `expr_layer` |
+| L1 | `tile/tensor.rs` | `KArgs{arg,i32,ptr,dim,tensor}`，`Dim{C,Ka,Sym,Grid}`，`Stride{Unit,Ka(name,off),Derived(expr)}`，`TensorDecl.packed()/same_strides_as()/alloc()/slack()/declare()`；`TileView.clamp(dim,limit,last)/clamp_min` 作用在**相对**索引上，`offset/ptr/row_source`。元素类型用 `elem_bytes` 而不是 `Elem` 枚举 | `tile_l123`：生成的 Q/K/V/O 合同与出厂合同**结构相等** |
+| L2 | `tile/shared.rs` | `LdsPlan{ring_group,ring,tile,private(..,overlays),overlay,at,total,commit}`，`Layout{Linear,Rows{row_bytes,swz}}`、`Layout::FMHA_SWZ`、`fmha_swz`；`SlotIdx{slot,gen}`（带按 stride 的绑定偏移缓存）、`SlotRef{off,off_v,base,read,write}`、`PrivRef{base,write,read_back}` | `tile_l123`：复现 `fmha_vs_tiles`（偏移、102400、7 对别名完全一致）；未声明真实重叠 → panic |
+| L3 | `tile/copy.rs`、`tile/pipeline.rs`、`tile/lane.rs` | `RowsCopy::new(b,src,&dst,wave,&lane,waves).issue(b,&key0,&slot_ref)`、`DwordRowsCopy`；`Pipeline::new(Cadence,nkv,kv_len,128,bound)`（`ring_var_last` 旋钮）`.run(b,role,&mut body)`，`trait PipeBody{stage,stage_complete,prologue_stores,prologue_compute,loop_state,bind_state,v_phase,m_phase,window}`，`TileIt{it,cur,next,n2,masked,staged}`；`Lane`、`Roles{split,single,each,wave_id}`、`versioned` | `tile_l123`：两角色 DMA 环 0 错误、DMA/barrier 数精确；错代/提前读被拒；OneWindow 3 槽环 0 错误 |
+| L4 | `tile/frag.rs` | 布局类型 `A32x32x64Fp8/B32x32x64Fp8/C32x32F32/C16x16F32`，`Frag<L>/Acc<L>/AccTile<L,N>`，`RowFrags::load`（Q），`RowsReader`（kfx）、`TrReader`（trx）、`RowScaleReader`、`ScaleSel`；tile 级 MMA 为 `qk_tile(QkOut::{Vars,Values})` 与 `pv_tile`（取代设计稿里泛化的 `mma_tile`） | `tile_l4`：MFMA/ds_read/tr 计数精确 |
+| L5 | `tile/reduce.rs` | `KeyMask::new(b,t,half_base,limit).valid`，`masked_values`，`row_max`，`to_p8(PkNorm/PkNormLut)`+`LutConsts`，`SmfmacOnes{new,row_sum}` | `tile_l56` |
+| L6 | `tile/softmax.rs`、`tile/epilogue.rs` | `OnlineSoftmax::new(b,&lane,Recipe::vsx(lut))`，`state/bind/decide/convert/row_sum/l_total/lse`；`store_bf16`、`kvsplit_partial_f16`、`combine_splits(8|16)` | `tile_l56`：只用库组件写成的完整 attention（LUT/非 LUT、bf16/KV-split 尾声）0 错误可编译；库版 combine8h 与出厂指令构成一致 |
+
+验证器的两处增强（都不改变出厂证书：44 trusted / 216 contracts / 0 unproven，proven 计数不变）：
+1. `ka_is` 定义按**不动点**代换（与声明顺序无关；kernel-opt 发现：外层 stride 关系先于内层声明时出现伪 `GV-GLB-OOB`）。
+2. **有限状态环计数器**：单一更新是"自身 + 常量"的 select/compare 函数的循环变量（如 3 槽环 `idx < 2 ? idx + 1 : 0`），在宿主上求出其循环长度 p；标记的周期声明 = lcm(p, 仿射界)，仍在模拟轨迹上校验。`_t128` 的 3 槽环因此**无需** `tile_trust_periodic`（决策 D2）。
