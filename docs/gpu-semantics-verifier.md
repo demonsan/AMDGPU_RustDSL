@@ -217,7 +217,7 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 ## 11. v1 在出厂 kernel 上的结果（Main + 本分支，AMDC_GPU_VERIFY=warn，commit 见 PR）
 
 * 全部 88 个 `kernel_names()` kernel + 出厂集：**寄存器合法性与路径敏感等待 0 错误**（即默认强制检查全绿；出厂 asm md5 不变：`_vs128` 00d34086、`_t128` f83c02ce、`_kvsplit` 148b329d、`_combine8h` 19bdd5df）。
-* **出厂集切换（2026-11-02，`fmha-port`）**：默认路径改为 tile 库组合的 4 个 kernel，asm md5（`--backend own`，`fmha-port` 9dc4c05）：`dsl_vs128` d72f9015、`dsl_t128` ce68211d、`dsl_kvsplit` db0dd681、`dsl_kvsplit_combine8h` ab3d6b09；`amdc gpu-verify --shipped --strict`：0 错误 0 警告，24 trusted assumes / 100 contracts / 0 unproven（proven 计数与旧集逐项相同；`dsl_t128` 另有 tile 协议证明 tile-reads 29440，无 periodic trust）。旧手写集 `--legacy` 的 asm md5 不变（上行 4 个值），供 A/B。
+* **出厂集切换（2026-11-02，`fmha-port`）**：默认路径改为 tile 库组合的 4 个 kernel，asm md5（`--backend own`，`fmha-port` e7cc33e）：`dsl_vs128` 438452c1、`dsl_t128` ef706387、`dsl_kvsplit` ef8c37ab、`dsl_kvsplit_combine8h` ab3d6b09；`amdc gpu-verify --shipped --strict`：0 错误 0 警告，24 trusted assumes / 100 contracts / 0 unproven（proven 计数与旧集逐项相同；`dsl_t128` 另有 tile 协议证明 tile-reads 29440，无 periodic trust）。旧手写集 `--legacy` 的 asm md5 不变（上行 4 个值），供 A/B。
 * **LDS 访问全部被证明**（无需任何 `assume`）：`_vs128` 600、`_vs5` 600、`_kvsplit` 760、`_t128` 320、`_t` 225、`_vs9` 424、`_vs` 310 个访问；其中 DMA 目的区间按 64 lane 计。
 * **角色 barrier 平衡**：`_vs128` 18、`_t128` 8、`_kvsplit` 18、`_t` 11 个 wave 分歧的 if/else 全部平衡。
 * 全局访存：未标注合同的 kernel 报 `GV-GLB-NOEXT`（这是预期的缺口清单——合同由 kernel 作者补）；已标注者（kernel-opt 分支）的残差见其报告。
