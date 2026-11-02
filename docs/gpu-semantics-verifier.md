@@ -302,3 +302,27 @@ LDS 是块内 8 个 wave 共享的地址空间，硬件**不做任何边界或�
 | buffer rsrc | 类型化 `Rsrc` 描述符 | `GV-BUF-OVER`（静态+运行时 num_records ≤ extent）+ 无界哨兵走 global 证明 + lite 契约（sc1/sc0/排空） | 越界读 0 / 写丢弃 / lds 形式零填充（`buffer_probe.sh`） | 运行时 num_records 表达式写错会被拒；跨 WG 竞争不建模 |
 | atomic | 类型化 `AtomicAddU32`（device scope） | store 语义的 extent 检查 + vm 队列 + 路径敏感等待 + lite 契约 scope 纪律 | 单指令原子性（硬件） | 无 acquire/release 证明；无跨 WG 竞争建模；仅 1 种形式 |
 | TDM | **不支持**（DSL/MIR/emit 均无；raw 被白名单拒绝） | — | — | 目标 gfx950 无此 ISA；模型设计可复用 |
+### 13.6 `buffer_load … lds`（MUBUF global→LDS DMA）覆盖情况
+
+`buffer_load_dwordx1/x4 … lds` 与 `global_load_lds` 一样是 **DMA 类**，两侧分别检查、生命周期按 produce 处理：
+
+| 侧 | 检查 | 错误码 |
+|---|---|---|
+| **全局侧（源）** | 描述符 `num_records` 不得高估分配（静态/运行时） | `GV-BUF-OVER` |
+| **全局侧（无界哨兵）** | `0xFFFFFFFF` 不享受硬件范围检查 → 按普通 global 访问证明（需 extent/形状关系） | `GV-GLB-NOEXT` / `GV-GLB-OOB` |
+| **LDS 侧（目的）** | `M0 + imm + lane*size` 的**全部 64 lane** 落在声明 LDS 段内 | `GV-LDS-OOB` |
+| **tile 内** | DMA 目的区间落在其 tile/ring 内，不允许越出 | `GV-TILE-ESCAPE`（别名 `GV-PROTO-*`） |
+| **生命周期** | DMA 是 **produce** 事件：发布需要 `wait_vm(0)` **完成** + barrier；barrier 单独不能发布在途 DMA | `GV-TILE-STALE|GV-PROTO-NO-COMPLETION` |
+| **消费/代际** | 消费者在发布相位之后读、代际一致（同 LDS tile 规则） | `GV-TILE-STALE|GV-PROTO-{STALE-GEN,RACE}` |
+| **调度/完成轴** | effects 模型把 DMA 记为 Global 读进入 **vm 队列**（`BufferLoadDwordX4Lds`/`GlobalLoadLdsB128`），等待 pass 跟踪 issue order | `GV-WAIT` |
+
+代码位置：`gpu_verify.rs` 的 `Stmt::BufferLoadLds`（同时调 `check_buffer` 与 `check_lds(… 64*size)`）；
+`gpu_protocol.rs::is_lds_access` 把 `Stmt::BufferLoadLds` 映射为 `(dma=true, write=true)`；`sched/effects.rs` 把 DMA 记为 Global 读。
+
+**测试**（`tests/gpu_buffer_lds.rs`，6 项全过）：descriptor 高估 → `GV-BUF-OVER`；无 extent → 拒绝；64-lane 目的越界 → `GV-LDS-OOB`；
+合法 DMA 证明通过；DMA produce 在 `wait_vm(0)` 后发布 → 通过；**未 wait 的 DMA 即使有 barrier 也不能发布** → `GV-TILE-STALE`。
+
+**验证现状（诚实）**：出厂默认路径用 `global_load_lds`，`--shipped --strict` 全绿；
+`FMHA_OPT=mubuf/mubufd` 的 opt-in MUBUF DMA 变体**目前未认证**——运行检查器会报 `GV-BUF-OVER`（K/V 描述符的 num_records 表达式在未声明形状关系时不能证明 ≤ 分配）
+以及 `mubuf` 变体的大量 `GV-GLB-OOB`/屏障问题。这些变体本就不在出货路径（此前的 A/B 也证明它们无收益），
+要认证需要像默认 kernel 一样补 `ka_is`/extent 合同或修正描述符公式；检查器本身对 `buffer_load … lds` 的覆盖由上述 6 项测试证明。
