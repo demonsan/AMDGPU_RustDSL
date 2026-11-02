@@ -84,12 +84,14 @@ pub struct Pipeline {
     pub tile_rows: i32,
     /// contract upper bound of the tile counter (e.g. `ceil(SK / 128)`)
     pub nkv_bound: Ext,
+    /// loop-variable order: [it, state.., idx] (the manual kernels' order) instead of [it, idx, state..]; a register-allocation knob only
+    pub ring_var_last: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -143,10 +145,18 @@ impl Pipeline {
         let z = b.c_i32(0);
         inits[0].1 = Opnd::Val(z);
         inits[1].1 = Opnd::Val(z);
-        inits.extend(body.loop_state(b));
+        let state = body.loop_state(b);
+        let ns = state.len();
+        if self.ring_var_last {
+            let idx0 = inits.pop().expect("idx");
+            inits.extend(state);
+            inits.push(idx0);
+        } else {
+            inits.extend(state);
+        }
         let vars = b.begin_loop(&inits);
-        let (it, idx) = (vars[0], vars[1]);
-        body.bind_state(&vars[2..]);
+        let (it, idx) = if self.ring_var_last { (vars[0], vars[1 + ns]) } else { (vars[0], vars[1]) };
+        body.bind_state(if self.ring_var_last { &vars[1..1 + ns] } else { &vars[2..] });
         b.assume_trusted(
             it,
             Ext::c(0),
