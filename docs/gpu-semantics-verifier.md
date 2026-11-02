@@ -241,6 +241,7 @@ LDS 是块内 8 个 wave 共享的地址空间，硬件**不做任何边界或�
 * **标记**：`tile_produce(name, slot, version)` / `tile_consume(name, slot, version)` / `tile_end()`，
   槽位/版本必须是循环计数器的**仿射函数**（常数、`+ - * << & ^` by 常数；计数器初值常数、步进 `+ const` / `^ const`）；
 * **证明**（`gpu_tiles.rs` 模拟器，按角色路径 DFS、运行时 if 的两种结果都探索、相位按动态 barrier 计数）：
+  * **共享 tile：数据由其他 wave 生产，每个 wave 独立消费；可见性一律以 barrier 发布为准，同角色不豁免；私有区（`lds_private`）才允许自产自销。**（一个角色代表该角色的全部 wave：自己写完切片并 `wait_lds(0)` 后读整块 tile、中间没有 barrier = 读到其他 wave 尚未写的部分，报 `GV-TILE-STALE`。）
   * `GV-TILE-STALE`：读到未发布/版本不匹配的数据（生产者必须在 barrier 后才算发布；DMA 要 `wait_vm(0)`，
     DS 写要 `wait_lds(0)`）；
   * `GV-TILE-RACE`：读窗口内另一个 wave 写了不同版本（单缓冲被下一轮覆盖 = 典型竞态）；
