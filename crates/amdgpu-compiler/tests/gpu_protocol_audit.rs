@@ -249,3 +249,55 @@ fn region_trust_escape_is_listed_and_counted_but_can_hide_a_violation() {
     assert_eq!(r.errors().len(), 0, "the escape must be a trust boundary, not silently rejected: {}", errors(&r));
     assert!(r.findings.iter().any(|f| f.alias == "GV-PROTO-TRUST" && f.msg.contains("buf_trust")), "{}", r.render());
 }
+
+fn probe(name: &str) -> Function {
+    amdgpu_compiler::kernel_by_name(name).unwrap_or_else(|| panic!("unknown kernel {name}"))
+}
+fn without(f: &Function, pred: &dyn Fn(&Stmt) -> bool) -> Function {
+    let mut g = f.clone();
+    let i = g.stmts.iter().position(pred).expect("statement to remove");
+    g.stmts.remove(i);
+    g
+}
+
+#[test]
+fn fused_last_arriver_missing_release_is_no_completion() {
+    let f = probe("probe_last_arriver");
+    let r = verify_ir(&without(&f, &|s| matches!(s, Stmt::FenceRelease { .. })));
+    println!("fused no release: {}", r.render());
+    assert!(has_alias(&r, "GV-PROTO-NO-COMPLETION"), "{}", errors(&r));
+}
+
+#[test]
+fn fused_last_arriver_missing_acquire_is_not_visible() {
+    let f = probe("probe_last_arriver");
+    let r = verify_ir(&without(&f, &|s| matches!(s, Stmt::FenceAcquire { .. })));
+    println!("fused no acquire: {}", r.render());
+    assert!(has_alias(&r, "GV-PROTO-NOT-VISIBLE"), "{}", errors(&r));
+}
+
+#[test]
+fn fused_last_arriver_missing_ticket_is_arrival_mismatch() {
+    let mut f = probe("probe_last_arriver");
+    f.contract.last_arrivers[0].counter_arg = "result".to_string();
+    let r = verify_ir(&f);
+    println!("fused wrong ticket arg: {}", r.render());
+    assert!(has_alias(&r, "GV-PROTO-ARRIVAL-MISMATCH"), "{}", errors(&r));
+    assert!(has_alias(&r, "GV-PROTO-STALE-GEN"), "{}", errors(&r));
+}
+
+#[test]
+fn fused_last_arriver_lite_with_plain_loads_is_not_visible() {
+    let f = probe("probe_last_arriver_lite");
+    let mut g = f.clone();
+    for s in g.stmts.iter_mut() {
+        if let Stmt::Let { op, .. } = s {
+            if let Op::LoadF32Coherent { base, byte_off } = op.clone() {
+                *op = Op::LoadF32 { base, byte_off };
+            }
+        }
+    }
+    let r = verify_ir(&g);
+    println!("fused lite plain loads: {}", r.render());
+    assert!(has_alias(&r, "GV-PROTO-NOT-VISIBLE"), "{}", errors(&r));
+}
