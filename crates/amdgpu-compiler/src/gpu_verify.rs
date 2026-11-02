@@ -453,6 +453,10 @@ impl Itv {
                 lo.push(y.clone());
             }
         }
+        // two operands that are both provably non-negative: 0 bounds the join even when their symbolic lower bounds are incomparable
+        if self.nonneg(cx) && o.nonneg(cx) {
+            lo.push(Poly::int(0));
+        }
         Itv { lo: cap(lo), hi: cap(hi) }
     }
     /// min(a, b): any upper bound of either operand bounds it; a lower bound must bound both.
@@ -546,6 +550,8 @@ struct An<'a> {
     tag: Option<(usize, Itv)>,
     acc: HashMap<VarId, Itv>,
     defs: HashMap<ValueId, Op>,
+    /// values constrained by `assume`: their interval is a contract fact, so `recompute` (select-arm refinement) must not re-derive them from their operands
+    assumed_vals: std::collections::HashSet<ValueId>,
     ovr: Option<(Opnd, Itv)>,
     if_stack: Vec<(HashMap<ValueId, AV>, Option<HashMap<ValueId, AV>>)>,
     rep: Report,
@@ -751,6 +757,9 @@ impl<'a> An<'a> {
                 return i.clone();
             }
         }
+        if self.assumed_vals.contains(v) {
+            return self.int_of(o);
+        }
         let Some(op) = self.defs.get(v).cloned() else { return self.int_of(o) };
         if !is_int_ty(op.result_ty()) || matches!(op, Op::Asm { .. }) {
             return self.int_of(o);
@@ -793,18 +802,31 @@ impl<'a> An<'a> {
         }
         let refine = match cond {
             Opnd::Val(c) => match self.defs.get(c) {
-                Some(Op::CmpLtI32(x, k)) => Some((*x, self.int_of(k), true)),
-                Some(Op::CmpGeI32(x, k)) => Some((*x, self.int_of(k), false)),
+                Some(Op::CmpLtI32(x, k)) => {
+                    // `c < v` with a constant on the left refines `v` (mode 2: v >= c + 1 / v <= c); otherwise `x < k` refines x (mode 0)
+                    let xi = self.int_of(x);
+                    if xi.point_const().is_some() && self.int_of(k).point_const().is_none() { Some((*k, xi, 2u8)) } else { Some((*x, self.int_of(k), 0u8)) }
+                }
+                Some(Op::CmpGeI32(x, k)) => Some((*x, self.int_of(k), 1u8)),
                 _ => None,
             },
             _ => None,
         };
-        let (ia, ib) = if let Some((x, k, lt)) = refine {
+        let (ia, ib) = if let Some((x, k, mode)) = refine {
             let xi = self.int_of(&x);
             // x < k : x <= k.hi - 1 ; x >= k : x >= k.lo
             let below = Itv { lo: Vec::new(), hi: k.hi.iter().map(|p| p.add(&Poly::int(-1))).collect() };
             let above = Itv { lo: k.lo.clone(), hi: Vec::new() };
-            let (t_itv, f_itv) = if lt { (xi.meet(&below), xi.meet(&above)) } else { (xi.meet(&above), xi.meet(&below)) };
+            let (t_itv, f_itv) = match mode {
+                0 => (xi.meet(&below), xi.meet(&above)),
+                1 => (xi.meet(&above), xi.meet(&below)),
+                _ => {
+                    // k is the constant c: true  => x >= c + 1 ; false => x <= c
+                    let ge = Itv { lo: k.lo.iter().map(|p| p.add(&Poly::int(1))).collect(), hi: Vec::new() };
+                    let le = Itv { lo: Vec::new(), hi: k.hi.clone() };
+                    (xi.meet(&ge), xi.meet(&le))
+                }
+            };
             self.ovr = Some((x, t_itv));
             let ia = self.recompute(a, 3);
             self.ovr = Some((x, f_itv));
@@ -1052,6 +1074,7 @@ impl<'a> An<'a> {
                 let proved = cur.within(&a, &self.cx);
                 let refined = cur.meet(&a);
                 self.env.insert(*v, AV::Int(refined));
+                self.assumed_vals.insert(*v);
                 let m = format!("stmt {}: assume v{v} in {}: {}", self.idx, a.show(), if proved { "already implied by the analysis (redundant)" } else { "TRUSTED" });
                 self.rep.add("GV-ASSUME", Severity::Info, m);
             }
@@ -1384,7 +1407,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: Ctx::new(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, acc: HashMap::new(), ovr: None, defs: f.stmts.iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: Ctx::new(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts.iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
