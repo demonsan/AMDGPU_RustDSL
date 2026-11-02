@@ -57,6 +57,7 @@ for CFG in "2 8 700 640 2" "1 2 200 1337 2" "1 4 300 512 1" "2 4 300 129 1" "1 8
     set -- $CFG
     sums=""
     for run in 1 2 3; do
+        rm -f build/det_$run.bin   # a failed launch must not reuse the previous shape's dump
         REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_HK=$(( $2 / $5 )) REF_ROWS=4 REF_ITERS=5 REF_DUMP2=build/det_$run.bin \
             REF_CO2=build/fmha_ours.co REF_KNAME2="$KNAME" REF_CO2_SMALL="$SMALL_ENV" REF_KNAME2_SMALL="$SMALL_KNAME" \
             REF_CO2_SPLIT="$SPLIT_ENV" REF_KNAME2_SPLIT="$SPLIT_KNAME" REF_CO2_COMBINE="$COMBINE_ENV" REF_KNAME2_COMBINE="$COMBINE_KNAME" REF_COMBINE_ELEMS=4 REF_SPLIT="$SPLIT_N" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
