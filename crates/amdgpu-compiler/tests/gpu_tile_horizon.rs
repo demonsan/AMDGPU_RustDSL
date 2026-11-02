@@ -13,7 +13,7 @@ fn errors(rep: &Report) -> String {
 
 /// Two-role double buffer; `slot_mode` 0 = normal, 1 = affine large-period perturbation
 /// (normal slot + ((nxt >> 8) & 1)), 2 = non-affine `Select` late perturbation.
-fn ring(slot_mode: u8, trust_periodic: bool) -> Function {
+fn ring(slot_mode: u8, version_mode: u8, trust_periodic: bool) -> Function {
     let mut b = FnBuilder::new(if trust_periodic { "ring_trust" } else { "ring_gate" }, 128);
     b.lds(8192);
     b.arg("n", DType::I32, 0, 4);
@@ -70,13 +70,48 @@ fn ring(slot_mode: u8, trust_periodic: bool) -> Function {
         }
         _ => unreachable!(),
     };
-    b.tile_produce("buf", slot_p, nxt);
+    let ver_p = match version_mode {
+        0 => nxt,
+        1 => {
+            // SHL is ignored by period_bits: the version sequence 0,256,512,... has no finite period
+            let c8 = b.c_i32(8);
+            b.shl_i32(nxt, Opnd::Val(c8))
+        }
+        2 => {
+            // MUL by a constant is ignored by period_bits as well
+            let c256 = b.c_i32(256);
+            b.mul_i32(nxt, c256)
+        }
+        3 => {
+            // XOR with a constant has period 512 here, but period_bits ignores marker XOR constants
+            let c256 = b.c_i32(256);
+            b.xor_i32(nxt, c256)
+        }
+        _ => unreachable!(),
+    };
+    b.tile_produce("buf", slot_p, ver_p);
     let base_n = b.mul_i32(slot_p, c1024);
     let wa = b.add_i32(base_n, lane16);
     b.store_lds_b128(wa, v);
     b.tile_end();
     b.else_();
-    b.tile_consume("buf", slot_c, it);
+    let ver_c: Opnd = match version_mode {
+        0 => Opnd::Var(it),
+        1 => {
+            let c8 = b.c_i32(8);
+            Opnd::Val(b.shl_i32(it, Opnd::Val(c8)))
+        }
+        2 => {
+            let c256 = b.c_i32(256);
+            Opnd::Val(b.mul_i32(it, c256))
+        }
+        3 => {
+            let c256 = b.c_i32(256);
+            Opnd::Val(b.xor_i32(it, c256))
+        }
+        _ => unreachable!(),
+    };
+    b.tile_consume("buf", slot_c, ver_c);
     let base_c = b.mul_i32(slot_c, c1024);
     let ra = b.add_i32(base_c, lane16);
     let _ = b.load_lds_b128(ra);
@@ -92,25 +127,55 @@ fn ring(slot_mode: u8, trust_periodic: bool) -> Function {
 }
 
 #[test]
-fn affine_period_256_is_missed_by_the_horizon() {
-    // FINDING: an affine/bitwise marker can have a period > the 10-iteration horizon. The gate accepts
-    // it (no GV-TILE-UNROLL-LIMIT) and the simulator sees no race, but a launch with >=257 iterations
-    // executes the race at it=255. This test records the current (unsound) behaviour.
-    let r = verify_ir(&ring(1, false));
+fn affine_period_256_is_now_rejected_by_the_period_bound() {
+    // slot = (nxt & 1) + ((nxt >> 8) & 1): real period 256. v1.3 must reject because the period
+    // bound is 2^9 = 512, needing 1026 simulated iterations > HORIZON_CAP 70.
+    let r = verify_ir(&ring(1, 0, false));
     println!("ring affine period 256: {}", r.render());
-    assert!(!has(&r, "GV-TILE-UNROLL-LIMIT"), "gate unexpectedly rejected the affine form: {}", errors(&r));
-    let tile_errors: Vec<_> = r.errors().into_iter().filter(|e| e.code.starts_with("GV-TILE")).collect();
-    assert!(tile_errors.is_empty(), "gate/model unexpectedly caught the late race: {}", errors(&r));
-    assert_eq!(r.errors().len(), 0, "unexpected non-tile error: {}", errors(&r));
+    assert!(has(&r, "GV-TILE-UNROLL-LIMIT"), "period-256 attack not gated: {}", errors(&r));
+    assert!(r.errors().iter().any(|e| e.msg.contains("period") || e.msg.contains("shift") || e.msg.contains("bit")), "message must name the period/shift: {}", r.render());
+}
+
+#[test]
+fn shl_scaled_version_has_no_finite_period_but_is_accepted() {
+    // version = nxt << 8: Shift-left is accepted by periodic_cone but ignored by period_bits.
+    // The version sequence 0,256,512,... has no finite period, so the "period dividing 2" claim
+    // printed by GV-TILE-PERIOD is mathematically false (no concrete race was found in this
+    // protocol because only version differences matter).
+    let r = verify_ir(&ring(0, 1, false));
+    println!("ring version << 8: {}", r.render());
+    assert!(!has(&r, "GV-TILE-UNROLL-LIMIT"), "SHL form unexpectedly gated: {}", errors(&r));
+    assert!(r.findings.iter().any(|f| f.code == "GV-TILE-PERIOD"), "expected a GV-TILE-PERIOD info line: {}", r.render());
+}
+
+#[test]
+fn mul_scaled_version_has_no_finite_period_but_is_accepted() {
+    // version = nxt * 256: MUL by a constant is ignored by period_bits.
+    let r = verify_ir(&ring(0, 2, false));
+    println!("ring version * 256: {}", r.render());
+    assert!(!has(&r, "GV-TILE-UNROLL-LIMIT"), "MUL form unexpectedly gated: {}", errors(&r));
+    assert!(r.findings.iter().any(|f| f.code == "GV-TILE-PERIOD"), "expected a GV-TILE-PERIOD info line: {}", r.render());
 }
 
 #[test]
 fn tile_trust_periodic_escape_is_listed_but_can_hide_a_late_race() {
-    let r = verify_ir(&ring(3, true));
+    let r = verify_ir(&ring(3, 0, true));
     println!("ring Select(256) + tile_trust_periodic: {}", r.render());
     assert!(!has(&r, "GV-TILE-UNROLL-LIMIT"), "escape should skip the gate");
     let trusted: Vec<_> = r.findings.iter().filter(|f| f.code == "GV-ASSUME" && f.msg.contains("tile_trust_periodic")).collect();
     assert_eq!(trusted.len(), 1, "tile_trust_periodic must be listed once: {}", r.render());
     // The escape is a trust boundary: it can hide a real race beyond the simulated horizon.
     assert_eq!(r.errors().len(), 0, "with the trusted escape the late race is not simulated: {}", errors(&r));
+}
+
+#[test]
+fn xor_marker_period_512_is_underestimated_as_2() {
+    // version = nxt ^ 256: 0,257,258,...,511,0,1,... has period 512. period_bits only sees the
+    // low-bit mask of the slot and prints "period dividing 2"; the gate accepts the marker.
+    let r = verify_ir(&ring(0, 3, false));
+    println!("ring version ^ 256: {}", r.render());
+    assert!(!has(&r, "GV-TILE-UNROLL-LIMIT"), "XOR form unexpectedly gated: {}", errors(&r));
+    let period = r.findings.iter().find(|f| f.code == "GV-TILE-PERIOD" && f.msg.contains("period dividing")).map(|f| f.msg.clone());
+    assert!(period.is_some(), "expected a period claim: {}", r.render());
+    assert!(period.unwrap().contains("dividing 2"), "the claim should be wrong (2, real 512): {}", r.render());
 }
