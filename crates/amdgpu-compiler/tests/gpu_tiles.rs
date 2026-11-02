@@ -198,3 +198,27 @@ fn a_non_constant_slot_expression_is_reported() {
     let r = verify_ir(&b.finish());
     assert!(has(&r, "GV-TILE-INDEX"), "{}", r.render());
 }
+#[test]
+fn the_shipped_cross_wave_exchange_probe_proves_its_tile_protocol() {
+    let f = amdgpu_compiler::kernel_by_name("probe_roles_loop").unwrap();
+    let r = verify_ir(&f);
+    let tile_errors: Vec<_> = r.errors().into_iter().filter(|e| e.code.starts_with("GV-TILE")).collect();
+    assert!(tile_errors.is_empty(), "{}", r.render());
+    assert!(r.proven.get("tile-reads").copied().unwrap_or(0) > 0, "{}", r.render());
+}
+
+#[test]
+fn removing_the_separating_barrier_of_the_shipped_probe_is_caught() {
+    // mutate the shipped kernel: drop the SECOND barrier of each iteration (the one that separates the partner reads from the next iteration's writes)
+    let mut f = amdgpu_compiler::kernel_by_name("probe_roles_loop").unwrap();
+    let mut seen = 0;
+    f.stmts.retain(|s| {
+        if matches!(s, amdgpu_dsl::Stmt::Barrier) {
+            seen += 1;
+            return seen != 2;
+        }
+        true
+    });
+    let r = verify_ir(&f);
+    assert!(r.errors().iter().any(|e| e.code == "GV-TILE-RACE" || e.code == "GV-TILE-STALE"), "{}", r.render());
+}
