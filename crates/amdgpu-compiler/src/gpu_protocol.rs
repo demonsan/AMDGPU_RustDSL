@@ -545,7 +545,7 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
 }
 /// Is every tile marker operand an AFFINE / PERIODIC function of loop counters? (constants, + - of counters, * << & ^ by constants; each counter used must be updated by
 /// `+ const` or `^ const` of itself and start at a constant.) Only then does simulating a bounded number of iterations cover every trip count.
-fn periodic_cone(f: &Function) -> Result<(), String> {
+fn periodic_cone(f: &Function) -> Result<usize, String> {
     fn konst(f: &Function, o: &Opnd) -> Option<i64> {
         match o {
             Opnd::I32(c) => Some(*c as i64),
@@ -587,11 +587,16 @@ fn periodic_cone(f: &Function) -> Result<(), String> {
                         walk(f, a, seen)?;
                         walk(f, b, seen)
                     }
+                    // a finite-state function (compare / select / not) of finite-state ring counters and constants only: periodic with their period
+                    Op::Select { .. } | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) if fs_cone(f, &Opnd::Val(*v)) => Ok(()),
                     _ => Err(name),
                 }
             }
             Opnd::Var(x) => {
                 if !seen.insert((true, x.0)) {
+                    return Ok(());
+                }
+                if finite_state_period(f, *x).is_some() {
                     return Ok(());
                 }
                 let mut ok_update = false;
@@ -635,9 +640,113 @@ fn periodic_cone(f: &Function) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    // the markers are periodic with lcm(periods of the finite-state counters in their cones) x the power-of-two bound of `period_bits`
+    let mut l = 1usize;
+    // (conservatively over every finite-state counter of the kernel: a longer claimed period only lengthens the simulated horizon, and the claim is verified)
+    for s in &f.stmts {
+        if let Stmt::BeginLoop { vars, .. } = s {
+            for x in vars {
+                if let Some(p) = finite_state_period(f, *x) {
+                    l = lcm(l, p);
+                }
+            }
+        }
+    }
+    Ok(l)
 }
 
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+fn lcm(a: usize, b: usize) -> usize {
+    a / gcd(a, b) * b
+}
+
+/// A FINITE-STATE ring counter: a loop variable with a constant initial value and exactly one update `x := F(x)` where F uses only `x` and constants
+/// (+ ^ & * << >> compare select not). Its sequence x0, F(x0), ... is evaluated here; when it returns to x0 after p steps (a pure cycle, p <= 64) the
+/// counter is periodic with period p (e.g. the 3-slot ring index `idx < 2 ? idx + 1 : 0` of the `_t128` cadence: p = 3). A counter stepped by `^ const`
+/// is also finite-state, but stays on the affine path (`period_bits`) so the existing kernels' claims do not change.
+fn finite_state_period(f: &Function, x: VarId) -> Option<usize> {
+    let mut init: Option<i64> = None;
+    for s in &f.stmts {
+        if let Stmt::BeginLoop { vars, init: iv } = s {
+            if let Some(k) = vars.iter().position(|y| *y == x) {
+                init = fs_eval(f, &iv[k], x, 0);
+            }
+        }
+    }
+    let x0 = init?;
+    let ups: Vec<&Opnd> = f.stmts.iter().filter_map(|s| if let Stmt::SetVar { var, value } = s { if *var == x { Some(value) } else { None } } else { None }).collect();
+    if ups.len() != 1 {
+        return None;
+    }
+    // only a genuine selection counter: the plain `+ const` / `^ const` steps are handled (and bounded) by the affine analysis
+    if let Opnd::Val(u) = ups[0] {
+        if let Some(Op::AddI32(..) | Op::XorI32(..)) = f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == u { Some(op) } else { None } } else { None }) {
+            return None;
+        }
+    }
+    let mut cur = x0;
+    for p in 1..=64usize {
+        cur = fs_eval(f, ups[0], x, cur)?;
+        if cur == x0 {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Does the cone of `o` contain only constants and finite-state counters (through finite-state ops)?
+fn fs_cone(f: &Function, o: &Opnd) -> bool {
+    match o {
+        Opnd::I32(_) => true,
+        Opnd::F32(_) => false,
+        Opnd::Var(x) => finite_state_period(f, *x).is_some(),
+        Opnd::Val(v) => match f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) {
+            Some(Op::ConstI32(_)) => true,
+            Some(op @ (Op::AddI32(..) | Op::XorI32(..) | Op::AndI32(..) | Op::MulI32(..) | Op::ShlI32(..) | Op::LshrI32(..) | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) | Op::Select { .. })) => op.operands().iter().all(|u| fs_cone(f, u)),
+            _ => false,
+        },
+    }
+}
+
+/// Host evaluation (i32 semantics) of a finite-state expression in which the variable `x` has the value `xv`; `None` for anything else.
+fn fs_eval(f: &Function, o: &Opnd, x: VarId, xv: i64) -> Option<i64> {
+    let w = |v: i64| v as i32 as i64;
+    match o {
+        Opnd::I32(c) => Some(*c as i64),
+        Opnd::Var(y) if *y == x => Some(xv),
+        Opnd::Val(v) => {
+            let op = f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None })?;
+            let e = |u: &Opnd| fs_eval(f, u, x, xv);
+            Some(match op {
+                Op::ConstI32(c) => *c as i64,
+                Op::AddI32(a, b) => w(e(a)? + e(b)?),
+                Op::XorI32(a, b) => w(e(a)? ^ e(b)?),
+                Op::AndI32(a, b) => w(e(a)? & e(b)?),
+                Op::MulI32(a, b) => w(e(a)?.wrapping_mul(e(b)?)),
+                Op::ShlI32(a, b) => w(((e(a)? as u32).wrapping_shl(e(b)? as u32)) as i64),
+                Op::LshrI32(a, b) => w(((e(a)? as u32).wrapping_shr(e(b)? as u32)) as i64),
+                Op::CmpLtI32(a, b) => (e(a)? < e(b)?) as i64,
+                Op::CmpGeI32(a, b) => (e(a)? >= e(b)?) as i64,
+                Op::NotI1(a) => (e(a)? == 0) as i64,
+                Op::Select { cond, a, b, .. } => {
+                    if e(cond)? != 0 {
+                        e(a)?
+                    } else {
+                        e(b)?
+                    }
+                }
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
+}
 /// Conservative bound M such that the tile markers are periodic in the loop iteration with a period dividing 2^M: every `& mask` contributes its width (msb + 1), every `>> k`
 /// in the cone adds k (bit j of `x >> k` is bit j + k of x), and a counter toggled by `^ const` contributes 1. (`+ const` counters are affine: only their low bits matter for a
 /// mask, and versions only matter through their differences.)
@@ -956,7 +1065,11 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
     const HORIZON_CAP: usize = 70;
     let nmax;
     let mut period_claim: Option<usize> = None;
-    match (&f.contract.tile_trust, periodic_cone(f)) {
+    let cone = periodic_cone(f);
+    let fs_period = *cone.as_ref().unwrap_or(&1);
+    let pbound = if fs_period > 1 { lcm(pbound, fs_period) } else { pbound };
+    let need = base_h.max(2 * pbound + 2);
+    match (&f.contract.tile_trust, cone) {
         (Some(reason), _) => {
             nmax = base_h;
             rep.add("GV-ASSUME", Severity::Info, format!("tile_trust_periodic: TRUSTED that the protocol is periodic in the loop iteration ({reason}); {nmax} iterations are simulated"));
@@ -969,7 +1082,7 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
                 format!("{why}, which is not an affine/periodic function of the loop counters: the protocol is simulated for at most {nmax} loop iterations, so a launch with more iterations is NOT covered (express slot/version with counters stepped by + const / ^ const, or declare b.tile_trust_periodic(reason) when the structure is periodic by construction)"),
             );
         }
-        (None, Ok(())) if mul_log2 >= 16 => {
+        (None, Ok(_)) if mul_log2 >= 16 => {
             nmax = base_h;
             rep.add(
                 "GV-TILE-UNROLL-LIMIT",
@@ -977,7 +1090,7 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
                 format!("the tile markers multiply / shift left by a total of 2^{mul_log2}: the 32-bit slot / version may wrap within about {} iterations, beyond the {nmax} simulated, so a longer launch is NOT covered (use smaller strides, or declare b.tile_trust_periodic(reason); i32 arithmetic is otherwise assumed not to wrap, A3)", 1u64 << (31 - mul_log2.min(31))),
             );
         }
-        (None, Ok(())) => {
+        (None, Ok(_)) => {
             if need > HORIZON_CAP {
                 nmax = base_h;
                 rep.add(
