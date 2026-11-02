@@ -967,7 +967,9 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         let stmt = c.ev.stmt;
         let gl = c.ev.global;
         let where_ = format!("(role {}, {} iteration(s) simulated){}", c.role, n, if gl { " [global region]" } else { "" });
-        if c.done.is_none() && traces[c.role].items.get(c.ev.last + 1).is_some() {
+        // only a BARRIER after the uncompleted reads can order them against a next writer: reads still in flight when the wave's trace ends (the last tile of a
+        // pipeline without a closing barrier, e.g. the `_t128` cadence) have no next writer to race with
+        if c.done.is_none() && traces[c.role].items.iter().skip(c.ev.last + 1).any(|it| matches!(it, Item::Barrier { .. })) {
             diags.push(("GV-TILE-PENDING", Severity::Warn, stmt, format!("stmt {stmt}: reads of `{}`[{}] are not completed (wait_lds(0)) before the next barrier, so the barrier does not separate them from the next writer {where_}", name(c.ev.tile), c.ev.slot)));
         }
         // SHARED tile: the data is produced by OTHER waves (even of the same role) and consumed independently by every wave. A producer's own completion
