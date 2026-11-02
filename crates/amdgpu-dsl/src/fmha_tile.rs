@@ -127,6 +127,11 @@ impl PipeBody for AttnBody<'_> {
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let (r, blk) = (self.ring, self.blk);
         let (s, o) = (self.s.unwrap(), self.o.unwrap());
+        // slot offsets of this window bound at its top (as the hand kernel's `ring()`), not at their first use after the decision
+        let _ = r.ks.at(&t.cur).off_v(b);
+        if t.staged {
+            let _ = (r.ks.at(&t.next).off_v(b), r.kd.at(&t.next).off_v(b));
+        }
         let mask = t.masked.then(|| KeyMask::new(b, t, blk.g4, blk.kv_len));
         let nb = self.sm.decide_deferred(b, &s, &o, mask.as_ref());
         let next = t.staged.then(|| (r.kr.at(b, &r.ks.at(&t.next)), r.kdr.at(b, &r.kd.at(&t.next))));
