@@ -252,7 +252,7 @@ fn a_non_periodic_marker_beyond_the_simulated_iterations_is_gated_not_certified(
     // min(it, 40) & 1: indistinguishable from it & 1 within the simulated iterations; only the periodicity gate can catch it
     let r = verify_ir(&proto(Opt { cap: Some(40), ..good() }));
     assert!(has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
-    assert!(r.errors().iter().any(|e| e.msg.contains("not covered") && e.msg.contains("Min")), "{}", r.render());
+    assert!(r.errors().iter().any(|e| e.msg.contains("NOT covered") && e.msg.contains("Min")), "{}", r.render());
 }
 
 #[test]
