@@ -421,6 +421,8 @@ pub enum Ext {
     Ka(u32),
     /// Launch grid dimension in workgroups (0 = x, 1 = y, 2 = z).
     Grid(u8),
+    /// A free named non-negative symbol (>= 1 unless `sym_range` says otherwise), e.g. the batch count `B` that is not a kernarg; related to the grid by `grid_is`.
+    Sym(String),
     Add(Box<Ext>, Box<Ext>),
     Sub(Box<Ext>, Box<Ext>),
     Mul(Box<Ext>, Box<Ext>),
@@ -435,6 +437,9 @@ impl Ext {
     }
     pub fn ka(offset: u32) -> Ext {
         Ext::Ka(offset)
+    }
+    pub fn sym(name: &str) -> Ext {
+        Ext::Sym(name.to_string())
     }
     pub fn grid_x() -> Ext {
         Ext::Grid(0)
@@ -494,6 +499,11 @@ pub struct Contract {
     pub extents: Vec<ArgExtent>,
     /// (kernarg offset, lo, hi): the 32-bit scalar at that offset lies in [lo, hi] (host contract; `hi` = i64::MAX = unbounded).
     pub ka_ranges: Vec<(u32, i64, i64)>,
+    /// (axis, expr): the launch grid dimension equals `expr` (host contract), e.g. grid z = `sym("B") * ka(0x280)` for a split launch; the analyzer substitutes it, so
+    /// products and quotients by the same factor simplify exactly without a division operator.
+    pub grid_defs: Vec<(u8, Ext)>,
+    /// (symbol name, lo, hi) bounds of free symbols.
+    pub sym_ranges: Vec<(String, i64, i64)>,
 }
 
 /// Statements: a flat sequence with explicit structured markers.
@@ -801,6 +811,14 @@ impl FnBuilder {
     /// Host contract: the 32-bit kernarg scalar at `offset` lies in [lo, hi] (use `i64::MAX` for no upper bound).
     pub fn ka_range(&mut self, offset: u32, lo: i64, hi: i64) {
         self.f.contract.ka_ranges.push((offset, lo, hi));
+    }
+    /// Host contract: launch grid axis (0 = x, 1 = y, 2 = z) equals `expr`, e.g. `b.grid_is(2, Ext::sym("B") * Ext::ka(0x280))` for B batches x splits.
+    pub fn grid_is(&mut self, axis: u8, expr: Ext) {
+        self.f.contract.grid_defs.push((axis, expr));
+    }
+    /// Bounds of a free `Ext::sym` (default [1, +inf)).
+    pub fn sym_range(&mut self, name: &str, lo: i64, hi: i64) {
+        self.f.contract.sym_ranges.push((name.to_string(), lo, hi));
     }
     /// Contract fact `lo <= target <= hi` from this point on (see `Stmt::Assume`). Emits no code.
     pub fn assume(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext) {
