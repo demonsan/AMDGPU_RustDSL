@@ -1,125 +1,121 @@
-# Independent adversarial audit: gpu_verify v1
+# Independent adversarial audit: gpu_verify v1.1 (tile lifetime + assume soundness)
 
-Auditor: `kernel-occ`. Branch: `gpu-semantics-occ`. Tested verifier commit: **`4e6d58f`**
-(`origin/gpu-semantics`; analyzer `818838c`). Hardware: MI355X / gfx950, node 53, GPU 6.
-The verifier's own `cargo test -p amdgpu-compiler --test gpu_semantics` passes **22/22** on this commit.
+Auditor: `kernel-occ`. Branch: `gpu-semantics-occ`. Re-audited verifier: **Main `4c4909a`**
+(v1.1 tile model + `GV-ASSUME-VIOLATED` + `assume_trusted` + assembler-measured alignment).
+Host-truth integration: Main + kernel-opt annotations (`gpu-semantics-opt@5f923d8`, branch
+`truth-main`). Hardware: MI355X / gfx950, node 53, GPU 6.
 
-## 1. Soundness attacks (DSL test kernels in `gv_attack_*`)
+Verifier tests on `4c4909a`: **28/28 `gpu_semantics` + 11/11 `gpu_tiles` pass** (full Main per lead:
+156 tests /31 targets). Host-truth tests on `truth-main`: **2/2 pass**.
 
-Each attack is a real DSL kernel, checked with `amdc gpu-verify <kernel> --strict`; the attack is
-`PASS` (unsound) if the checker exits 0, `REJECT` if it finds an Error.
+## 1. Soundness attacks - assume layer
 
-| attack | class | expected | actual | verdict |
-|---|---|---|---|---|
-| `gv_attack_lds_const` (declared 256 B, `ds_read` at 512) | LDS bounds | reject | **reject** `GV-LDS-OOB`, address `[512,512]` vs limit `[256,256]` | correct |
-| `gv_attack_desc_over` (64 B extent, `buffer_desc(q,4096)`) | descriptor num_records | reject | **reject** `GV-BUF-OVER` (4096 vs allocation `[64,64]`) | correct |
-| `gv_attack_clamp_path` (min-clamp on one branch, raw index on the other) | clamp provenance | reject | **reject** `GV-GLB-OOB`, address `[0,1008]` vs `[512,512]` | correct |
-| `gv_attack_false_contract` (declares 1 MiB for a host 64 B pointer, then loads +4096) | host contract | flag/unproven | **PASS** (`0 errors`; `global: 2` proven) | **trust boundary - not a proof of host truth** |
-| `gv_attack_assume_loop` (loop var assumed `[0,0]`, `set_var`=+1, global load at the updated index) | assume induction | reject | **PASS** (`0 errors`; only 2 `GV-ASSUME` **Info** lines) | **UNSOUND** |
+| attack | expected | actual on Main 4c4909a | verdict |
+|---|---|---|---|
+| `gv_attack_assume_loop` - var assumed `[0,0]`, `set_var`=+1, load at updated index | reject | **reject** `GV-ASSUME-VIOLATED` (stmt 8), 1 error, `--strict` rc=1 | **fixed** |
+| `gv_attack_assume_trusted` - same loop but `assume_trusted(..., "loop exits before i=1")` | pass but listed | **pass strict** (0 errors); `-v` prints 2 `GV-ASSUME` **Info** lines, both marked `TRUSTED` with the reason; summary counts them as 2 findings | **documented trust boundary; listed and countable** |
+| `gv_attack_false_contract` - declares 1 MiB for a 64 B host pointer, loads +4096 | flag/unproven | **pass** (0 errors; 2 global accesses proven) | **trust boundary (host contract)** |
+| `gv_attack_lds_const` - declared 256 B, read at 512 | reject | **reject** `GV-LDS-OOB`, `[512,512]` vs `[256,256]` | correct |
+| `gv_attack_desc_over` - 64 B extent, `num_records=4096` | reject | **reject** `GV-BUF-OVER` | correct |
+| `gv_attack_clamp_path` - clamp only one branch | reject | **reject** `GV-GLB-OOB`, `[0,1008]` vs `[512,512]` | correct |
 
-**Critical finding:** `assume` induction violations are recorded as `Severity::Info`, not `Error`. A
-kernel that assumes a loop variable stays in a range but updates it outside that range still passes
-`--strict`; the access is then justified by the assumption. The attack is a real OOB on the second
-iteration. Recommended fix: an unproved `set_var` against an assumed range must be an **Error**
-(or the kernel must be marked non-certified), not Info.
+**`assume_trusted` is a real escape:** a kernel can use it to certify an access the loop actually
+violates (the attack is an OOB on iteration 2). It is not silent: every use is `Info`/`TRUSTED` with
+the reason, and the finding count includes it. That is acceptable only if the trust list is reviewed;
+`--strict` alone cannot distinguish it from a proof. Same class as false contracts.
 
-**False contract is the second trust boundary:** `arg_tensor`/`arg_tensor_slack` are HOST declarations.
-If they overstate the allocation, every affected access is "proven" and `--strict` passes. This is not a
-checker implementation bug, but it means the certificate is only as good as the host-truth check. A
-false-contract attack is included as `gv_attack_false_contract`.
+## 2. Tile-lifetime attacks (v1.1 model)
 
-## 2. False-positive audit
+| attack | expected | actual | verdict |
+|---|---|---|---|
+| `gpu_tile_attacks::non_counter_version` - consume version from a kernarg | reject | **reject** `GV-TILE-INDEX` | correct |
+| `gpu_tile_attacks::dma_without_wait_vm` - DMA producer, barrier, no `wait_vm(0)` | reject | **reject** `GV-TILE-STALE` in all 1..4 unroll scenarios ("published at phase never") | correct |
+| same with `wait_vm(0)` | accept | **clean**, `tile-reads: 4` | correct |
+| ring slots=1 with next-iteration overwrite (`gpu_tiles` negative test) | reject | **reject** `GV-TILE-RACE` | correct |
+| read before the publishing barrier, role-divergent barrier, alias without `lds_alias`, escape from marker (`gpu_tiles` negatives) | reject | **all rejected** (`GV-TILE-STALE`/`GV-TILE-RACE`/`GV-TILE-OVERLAP`/`GV-TILE-ESCAPE`/`GV-BAR`) | correct |
 
-`amdc gpu-verify --all` on the tested commit: **93 kernels, 2 clean, 2926 errors** -
-`GV-GLB-NOEXT` 2906, `GV-LDS-OOB` 18, `GV-GLB-OOB` 1, `GV-BUF-OVER` 1. The 2 clean kernels are the two
-false-contract/assume attacks; every unannotated production/probe kernel gets `GV-GLB-NOEXT` by design.
+**Open soundness gap - loop unrolling is 1..=4 only.** `gpu_tile_tripcount::late_race` is a
+double-buffered two-role ring that is correct for iterations 0..4 and races only when `it >= 5`
+(producer overwrites the consumer's current slot version). On Main 4c4909a the verifier returns
+**no tile errors** (`tile-reads: 10`, `tile-cover: 3`) and would certify it, yet a host launcher with
+`n >= 6` executes the race. This is the documented trip-count<=4 assumption, but it is a real
+conditional soundness hole: a >4-iteration loop must either be proven bounded by 4 (or the model must
+unroll/abstract all iterations), otherwise the certificate is not valid. This should be reported in
+the verifier doc's honest-gaps section and gated in `--strict` (e.g. `GV-TILE-UNROLL-LIMIT` when the
+trip count cannot be proven <=4).
 
-Shipped kernels (all safe/certified; all rejections are global-contract false positives on `4e6d58f`,
-which has no shape equalities yet):
+Other model limits (documented, not soundness bugs): same-tile partial-byte overlap is not
+distinguished; untagged LDS accesses are `Warn` only; wave-uniform runtime `if` containing
+barriers/markers is `GV-TILE-UNSUPPORTED` (Warn); cross-workgroup races and more than two roles are
+out of scope; all loops are assumed to run the same iteration count in every role.
 
-| kernel | findings | proven | notes |
+## 3. Host-truth check (`tests/contract_host_truth.rs`)
+
+Implemented on `truth-main` (Main `4c4909a` + annotations `5f923d8`); **2/2 pass**. For three shapes
+(B1H8S2048, B4H8S2048, B1H2S200) it evaluates every `Function.contract`:
+`arg_tensor` alloc/logical extents, `grid_is`, `ka_is`, `ka_range`, `sym_range`, and compares them with
+`tests/gpu/ref_host.cpp`/`attn_host.cpp` formulas. It covers Q/K/V/O, Q/K scale logical+zeroed slack,
+V scale, split `grid_z = B*splits`, Ohat/lse `splits*rows_total*128*4` / `*4`, and combine
+`out=rows_total*128*2`. **No declared extent exceeds the host allocation; all grid/ka relations match.**
+Remaining contract gaps: `kvs_counters`@0x288 still has no `arg_tensor`; the split contract does not
+state `splits in {2,4,8}` (auto uses2/4; `REF_SPLIT` could force other values); assumptions added to
+shipped kernels are currently **not inductive** (next item).
+
+## 4. False positives after Main + annotations
+
+Safe shipped kernels (certified) on `truth-main`:
+
+| kernel | errors | codes | proven |
 |---|---:|---|---|
-| `_vs128` | **106 errors** | LDS 600, barriers 18, waits clean | all `GV-GLB-OOB`; Q/K/V/Q-scale/K-scale/out |
-| `_t128` | 108 | LDS 320, barriers 8 | same |
-| `_kvsplit` | 78 | LDS 760, barriers 18 | same |
-| `_kvsplit_combine8h` | 3 | waits clean | loop-index bounds on lse/ohat/out |
-| `_t` | 89 | LDS 225, barriers 11 | same |
+| `_vs128` | 34 | 30 `GV-GLB-OOB` + 4 `GV-ASSUME-VIOLATED` | LDS 600, global 76, barriers 18 |
+| `_t128` | 66 | 48 `GV-GLB-OOB` + 16 `GV-LDS-OOB` + 2 `GV-ASSUME-VIOLATED` | LDS 320, global 44 |
+| `_kvsplit` | 64 | 60 `GV-GLB-OOB` + 4 `GV-ASSUME-VIOLATED` | LDS 760, global 18 |
+| `_combine8h` | 1 | `GV-ASSUME-VIOLATED` | global 3 |
+| `_t` | 3 | 1 `GV-LDS-OOB` + 2 `GV-ASSUME-VIOLATED` | LDS 225, global 88 |
 
-Representative exact residual (Kernel-opt's own diagnostic, matches my run):
-`Q` load upper bound is
-`ka(0x60)*ka(0x70) - ka(0x70) - ka(0x90) + ka(0x90)*grid_y - ka(0xA0) + ka(0xA0)*grid_z`
-vs limit `ka(0xA0)*grid_z`; the missing relation is the host ABI equality
-`0xA0 = 0x60*0x70`, `0x70 = grid_y*0x90`, i.e. `ka_is(0xA0, ka(0x60)*ka(0x70))`,
-`grid_is(1, ka(0x140))`. `K` DMA lower bounds are `[-inf,+inf]` because the split/ring loop variable
-is not yet related to the contract; the LDS accesses are fully proven (600/760), so this is purely
-a missing contract, not a checker failure. After `ka_is` equalities land these should be re-run.
+These are **all false positives on certified kernels**:
+* `GV-ASSUME-VIOLATED` on kernel-opt's new assumes: e.g. `set_var var0 = [1, 255/128 +
+  1/128*ka(0x110)]` outside assumed `[0, 127/128 + 1/128*ka(0x110)]`; exit-test-bounded counters need
+  `assume_trusted` (with a reason) or a tighter inductive range.
+* `GV-GLB-OOB` global/DMA lower bounds are `[-inf,+inf]` for K/V/Q-scale because the split/loop
+  variable is still not related to the contract; LDS/DS side is proven for vs128/kvsplit, but t128/t
+  have 16/1 DMA-LDS-side false positives with M0 expressions involving `Select`/loop vars.
+* `_t128` grid rows_per_block is 128, and its contract is correct; the remaining errors are analysis
+  precision, not contract errors (host-truth test passes).
 
-**141-run sweep:** not fully certified in this audit because the sweep includes every probe and option
-combination and the verifier branch has no contracts for them; the `--all` run above is the same
-universe (93 kernels) and shows the expected `NOEXT` pattern. Do not treat `--strict` on the sweep as
-a correctness signal until all kernels carry contracts.
+Earlier `4e6d58f` run had 93 kernels / 2 clean / 2926 errors (2906 `NOEXT`); after annotations the
+global count drops sharply (e.g. vs128 106 -> 34). The 141-run sweep is still not a certificate: it
+contains all probes and option combinations without contracts; do not gate on `--strict` over it.
 
-## 3. Hardware confirmations (GPU 6)
+## 5. Hardware confirmations (unchanged, GPU 6)
 
-* **MUBUF OOB read/write** (`tools/buffer_probe.sh both`, own backend): **BUFFER_OK** for `rw`, `lds`,
-  and the runtime-sized `dyn` descriptor. OOB loads return zero, OOB stores are dropped, LDS-DMA forms
-  are byte-identical to `global_load_lds`; the model's "hardware-guarded descriptor" assumption holds.
-* **LDS OOB has no bounds check and is not zero-filled.** Probe `probe_lds_oob` declares a 256-byte
-  segment, writes/reads a sentinel at lane offsets, then reads at +256, +1024 and reads back a write at
-  +4096. Results (3 launches identical): valid sentinel read OK; **+256 = 0x00000000**;
-  **+1024 = 0x3f800000 (stale non-zero data, not zero-fill)**; write at +4096 is not observable on
-  readback (dropped or aliased), no fault. Conclusion: hardware does **not** zero-fill OOB LDS; the
-  verifier must reject all out-of-segment accesses by construction (as it does).
-* **MFMA destination alignment:** the assembler accepts `v[52:67]` and `v[4:19]` (both multiples of 4)
-  and rejects `v[1:16]`; vendor hot-loop MFMA destinations are e.g. `v52:67`, `v100:115`. The verifier's
-  generic rule `p % dwords == 0` requires a 16-dword tuple to start at a multiple of **16**, which is
-  **stricter than the observed ISA/toolchain requirement (multiple of 4)**. This is a false-positive
-  rule, not a soundness hole; it should be corrected to the ISA alignment (or justified if a stricter
-  allocator invariant is intended). S4 descriptor alignment is covered by the unit tests; I did not
-  find a hardware counterexample.
+* MUBUF OOB (`tools/buffer_probe.sh both`): **BUFFER_OK** for rw / lds / runtime-sized dyn (zero-fill
+  / dropped stores hold).
+* LDS OOB (`probe_lds_oob`, 3 runs): valid sentinel OK; read at +256 = `0x00000000`, read at +1024 =
+  **`0x3f800000` stale non-zero (not zero-filled)**; write at +4096 not observable; no fault. LDS has
+  no hardware bounds check; the verifier must reject OOB by construction.
+* MFMA register alignment: Main 4c4909a now models the assembler-measured **even VGPR tuple** rule
+  (v1.1 fix); my earlier finding v52/v4 accepted / v1 rejected matches the new model. S4 alignment
+  covered by tests.
 
-## 4. Host-contract truth and coverage gaps
+## 6. Final soundness statement
 
-The annotation formulas themselves match `tests/gpu/ref_host.cpp` for Q/K/V/O, Q/K scales (logical +
-zeroed slack), V scale, split Ohat/lse, and combine Ohat/lse/out:
-`Q=B*S*H*D`, `K=V=B*SK*HK*D`, `O=B*S*H*D*2`, `Qd=B*S*H*4 + 512*H*4`, `Kd=B*SK*HK*4 + 640*H*4`,
-`Vd=4096`, `Ohat=splits*B*S*H*128*4`, `lse=splits*B*S*H*4`, combine `out=B*S*H*128*2`.
-No **overstated** declared extent was found in the existing annotation set. Gaps:
+**Provably catches (Main 4c4909a):** LDS DS/DMA segment overflow/wrap; unbounded ring/loop vars;
+global extent/no-extent/provenance and one-path clamps; descriptor `num_records` overstatement;
+role-barrier balance; VGPR/SGPR limits, tuple/descriptor alignment and MFMA overlap; path-sensitive
+and loop-carried wait-before-use; tile overlap/escape/kind/stale/race/DMA-completion for simulated
+1..=4-iteration, two-role protocols; non-counter tile versions; `GV-ASSUME-VIOLATED` for
+non-inductive `assume`.
 
-1. **`kvs_counters` (0x288) has no `arg_tensor`** in the fused path; contract coverage gap.
-2. **Split contract does not constrain `splits` to {2,4,8}** (`ka_range(0x280,1,MAX)` only); the
-   `bi=z>>lg`, `sp=z&(splits-1)` assumes are valid only for power-of-two splits. Host auto uses2/4,
-   but `REF_SPLIT` can force other values; the contract should state the domain or the assume is not
-   host-guaranteed.
-3. **`rows_total` (0x284) is not tied to B*S*H**; the Ohat/lse extents use the supplied value. A wrong
-   host value is a false proof; contract should state `rows_total == B*S*H` or the verifier should
-   derive it from shape scalars.
-4. **Raw safe-asm is explicitly unchecked**: `verify_ir` records `GV-ASM` Info "internal memory
-   accesses are NOT bounds-checked by v1"; any `Op::Asm`/`Stmt::VarAsm` can hide an OOB. This is a
-   documented scope limit, not a regression, but it means "no OOB" is not end-to-end for asm blocks.
-5. **Contract declarations are trusted** (false-contract attack): the checker cannot know
-   `malloc` sizes. A host-truth check is required (below).
+**Trusted / not proven:** host contract extents (`arg_tensor`/`ka_*`/`grid_is`) are assumptions; the
+new `assume_trusted(reason)` escape (listed, countable, but can hide a real OOB); loop trip counts
+are assumed <=4 and equal across roles (my `late_race` attack certifies a >4-iteration race - the
+main open gap); raw safe-asm interiors are not checked (`GV-ASM` Info); untagged LDS lifetime is
+Warn-only; partial-byte tile overlap is conflated.
 
-## 5. Recommended host-truth check (executable)
-
-Cheap version to add as `crates/amdgpu-compiler/tests/contract_host_truth.rs` (not committed here because
-the annotated kernels are on `gpu-semantics-opt`, not on the tested verifier commit):
-evaluate each `Function.contract.extents[*].alloc/logical` with the test's shape values and assert
-equality to the host formulas above for B1H8S2048, B4H8S2048, B1H2S200; also assert
-`grid_defs`/`sym_ranges` imply the split assumptions. This turns the documented host contract into a
-checked one and catches overstatement. A `ref_host` launch-time assertion `alloc_bytes >= logical`
-would cover the C++ side; the Rust test covers the DSL side.
-
-## 6. Overall soundness statement
-
-* **Provably catches now:** constant/derived LDS segment overflow and negative/wraparound addressing;
-  unbounded ring/loop variables; global extent/no-extent/provenance and clamp-path bounds; descriptor
-  `num_records` overstatement; role/barrier balance; VGPR/SGPR limits, tuple/descriptor alignment and
-  MFMA destination overlap; path-sensitive and loop-carried wait-before-use; 22 unit tests pass.
-* **Does not yet guarantee:** host allocation truth (declarations are trusted); `assume` induction
-  violations (Info, not Error - **critical gap**); safe-asm interior accesses (Info/skipped); fused
-  counter buffer and split-domain/shape relations not annotated; MFMA alignment rule stricter than the
-  observed hardware requirement.
-* **Verdict for v1:** useful as a *finding engine* over IR/MIR; it is **not yet a sound end-to-end
-  "no OOB" certificate** because of the assume-severity gap, trusted contracts and asm scope. The first
-  two must be fixed before strict mode gates shipping; the contract/`ka_is` work is already in flight.
+**Out of scope:** cross-workgroup races/memory model, i32 arithmetic wrap-around (the analysis assumes
+no wrap; a wrapping index can invalidate a proof), hardware faults for OOB LDS/MUBUF (MUBUF is
+hardware-guarded, LDS is not), and multi-role protocols beyond two wave roles. Therefore v1.1 is a
+strong *finding engine* and a useful certificate for bounded (<=4 iteration) two-role LDS protocols,
+but not yet an unconditional end-to-end "no OOB / no race" guarantee until the unroll gap and the
+trusted-assume list are gated.
