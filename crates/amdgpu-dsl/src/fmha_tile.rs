@@ -2,13 +2,12 @@
 //! docs/dsl-tile-abstractions.md). They replace the hand-written `kernels.rs` builders (`fmha_t_build` + `emit_fmha_vs128_role` /
 //! `emit_fmha_t128_role`, ~3,300 lines), default recipe only. The FMHA ABI, block setup and K/V ring are library components (`tile::fmha`);
 //! this file holds the attention algorithm (`AttnBody`: QK -> online softmax -> PV per 128-key tile, as a `PipeBody`) and one short builder per kernel.
-use crate::tile::epilogue::{combine_splits, kvsplit_partial_f16, store_bf16};
 use crate::tile::frag::*;
 use crate::tile::reduce::KeyMask;
 use crate::tile::softmax::{OnlineSoftmax, Recipe};
-use crate::tile::fmha::{FmhaBlock, FmhaIo, KdCopy, KvRing};
+use crate::tile::fmha::{combine_kernel, FmhaBlock, FmhaIo, KvRing};
 use crate::tile::*;
-use crate::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId, VarId, I32};
+use crate::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, ValueId, VarId, I32};
 
 pub struct AttnBody<'a> {
     ring: &'a KvRing,
@@ -49,61 +48,40 @@ impl<'a> AttnBody<'a> {
         self.sm.row_sum(b, p[0].v, p[1].v);
         pv_tile(b, &self.o.unwrap(), &v, &p, self.c127, self.c123);
     }
+    /// The output scale after the pipeline: `V descale / l`.
+    pub fn out_scale(&self, b: &mut FnBuilder) -> ValueId {
+        let l = self.sm.l_total(b);
+        self.blk.out_scale(b, l)
+    }
 }
 
 impl PipeBody for AttnBody<'_> {
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
-        let r = self.ring;
-        match (role, &r.kdc) {
-            (Role::A, KdCopy::Dma(kd)) => {
-                kd.issue(b, key0, &r.kd.at(slot));
-                r.kcp.issue(b, key0, &r.ks.at(slot));
-            }
-            (Role::B, _) => r.vcp.issue(b, key0, &r.vs.at(slot)),
-            (_, KdCopy::Vgpr(kd)) => {
-                self.kd_pending = Some(kd.issue(b, key0));
-                issue_rows_shared(b, key0, &[(&r.kcp, &r.ks.at(slot)), (&r.vcp, &r.vs.at(slot))]);
-            }
-            _ => unreachable!("role / K-scale staging combination"),
-        }
+        self.kd_pending = self.ring.stage(b, role, key0, slot);
     }
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, slot: &SlotIdx) {
-        if let (KdCopy::Vgpr(kd), Some(v)) = (&self.ring.kdc, self.kd_pending.take()) {
-            kd.complete(b, v, &self.ring.kd.at(slot));
-        }
+        self.ring.stage_complete(b, self.kd_pending.take(), slot);
     }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
-        // the shipped kernel's constant LDS data: a block of E4M3 ones and this wave's Q fragments (32 B per lane each)
-        let (r, lane) = (self.ring, &self.blk.lane);
-        let s0 = SlotIdx::new(0, 0);
-        let ones_w = b.c_i32(0x38383838);
-        let oa = b.bind_i32((ev(self.wid) * 64 + lane.lane()) * 4 + r.ones.base as i32);
-        r.ones.at(&s0).write(b, |b| b.store_lds_b32(oa, ones_w));
-        for (sh, w) in [(&r.q0, &self.blk.q.words[0]), (&r.q1, &self.blk.q.words[1])] {
-            let a0 = b.bind_i32((ev(self.wid) * 2048 + sh.base as i32) + (lane.lane() << 4));
-            let a1 = b.bind_i32(ev(a0) + 1024);
-            let (g0, g1) = (b.frag4(w[0], w[1], w[2], w[3]), b.frag4(w[4], w[5], w[6], w[7]));
-            sh.at(&s0).write(b, |b| {
-                b.store_lds_b128(a0, g0);
-                b.store_lds_b128(a1, g1);
-            });
-        }
+        self.ring.store_constants(b, self.wid, &self.blk.lane, &self.blk.q);
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         self.s_init = self.qk(b, &t0.cur, QkOut::Values(self.zero16), self.sm.bias_init);
     }
+    /// loop state, in the hand kernels' order: [bias, O x4, S x4, row sums]
     fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
-        let st = self.sm.state();
-        let mut v = vec![st[0]];
-        v.extend((0..4).map(|_| (DType::Frag16, Opnd::Val(self.zero16))));
-        v.extend(self.s_init.iter().map(|&s| (DType::Frag16, Opnd::Val(s))));
-        v.push(st[1]);
-        v
+        let [bias, la]: [(DType, Opnd); 2] = self.sm.state().try_into().expect("softmax state");
+        let o = (0..4).map(|_| (DType::Frag16, Opnd::Val(self.zero16)));
+        let s = self.s_init.iter().map(|&s| (DType::Frag16, Opnd::Val(s)));
+        std::iter::once(bias).chain(o).chain(s).chain(std::iter::once(la)).collect()
     }
     fn bind_state(&mut self, vars: &[VarId]) {
-        self.sm.bind(&[vars[0], vars[9]]);
-        self.o = Some(AccTile::from_vars(&vars[1..5]));
-        self.s = Some(AccTile::from_vars(&vars[5..9]));
+        let (bias, rest) = vars.split_first().expect("state");
+        let (o, rest) = rest.split_at(4);
+        let (s, la) = rest.split_at(4);
+        self.sm.bind(&[*bias, la[0]]);
+        self.o = Some(AccTile::from_vars(o));
+        self.s = Some(AccTile::from_vars(s));
     }
     /// softmax of tile t: one max / reference decision over the tile, P = fp8(2^S')
     fn v_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
@@ -127,11 +105,7 @@ impl PipeBody for AttnBody<'_> {
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let (r, blk) = (self.ring, self.blk);
         let (s, o) = (self.s.unwrap(), self.o.unwrap());
-        // slot offsets of this window bound at its top (as the hand kernel's `ring()`), not at their first use after the decision
-        let _ = r.ks.at(&t.cur).off_v(b);
-        if t.staged {
-            let _ = (r.ks.at(&t.next).off_v(b), r.kd.at(&t.next).off_v(b));
-        }
+        r.bind_offsets(b, t);
         let mask = t.masked.then(|| KeyMask::new(b, t, blk.g4, blk.kv_len));
         let nb = self.sm.decide_deferred(b, &s, &o, mask.as_ref());
         let next = t.staged.then(|| (r.kr.at(b, &r.ks.at(&t.next)), r.kdr.at(b, &r.kd.at(&t.next))));
@@ -151,31 +125,25 @@ impl PipeBody for AttnBody<'_> {
 // Kernels
 // ------------------------------------------------------------------------------------------------------------------------------------------------------
 
-/// `_vs128` on the tile library: 256 query rows per block (8 waves in two groups of 4, ping-pong), 128-key tiles in a 2-slot LDS ring,
-/// two code copies (LUT-corrected P conversion for sequences shorter than 9 tiles).
+/// `_vs128`: 256 query rows per block (8 waves in two groups of 4, ping-pong), 128-key tiles in a 2-slot LDS ring, two code copies (LUT-corrected P
+/// conversion for sequences shorter than 9 tiles).
 pub fn fmha_fwd_hd128_mxfp8_dsl_vs128() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_dsl_vs128", 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
-    let mut ka = KArgs::new();
-    let io = FmhaIo::declare(b, &mut ka, 256, false);
-    ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
+    let io = FmhaIo::declare(b, 256, false);
     let blk = io.block(b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
     let ring = KvRing::new(b, &io, &blk, &roles, 2);
     let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
-    let short = b.bind_cond(ev(blk.nkv).lt(9));
-    versioned(b, short, |b, lut| {
+    let lut = blk.lut_copy(b);
+    versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody::new(b, &ring, &blk, wid, lut);
             pipe.run(b, role, &mut body);
-            // O * (V descale / l) -> bf16 (rows past S recompute and store the last row)
-            let l = body.sm.l_total(b);
-            let inv_l = b.rcp_f32(l);
-            let fin = b.mul_f32(inv_l, blk.vd);
-            let (row_ptr, live) = io.out_row(b, &blk);
-            store_bf16(b, &body.o.unwrap(), fin, row_ptr, live);
+            let fin = body.out_scale(b);
+            io.store_out(b, &blk, &body.o.unwrap(), fin);
         });
     });
     fb.finish()
@@ -187,98 +155,51 @@ pub fn fmha_fwd_hd128_mxfp8_dsl_kvsplit() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_dsl_kvsplit", 512);
     fb.compile_profile(CompileProfile::KvSplit);
     let b = &mut fb;
-    let mut ka = KArgs::new();
-    let io = FmhaIo::declare(b, &mut ka, 256, true);
-    let heads = ka.i32(b, "s_q_head_num", 0x140);
-    let kv = io.kvs.as_ref().expect("kv-split args");
+    let io = FmhaIo::declare(b, 256, true);
     let blk = io.block(b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
     let ring = KvRing::new(b, &io, &blk, &roles, 2);
-    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
-    pipe.ring_var_last = true;
-    // linear partial row of a query row: split * rows_total + (b * S + row) * H + h
-    let part_row0 = b.bind_i32(ev(blk.split.expect("split")) * ev(kv.rows_total));
-    let prow = |row: I32| ev(part_row0) + (((ev(blk.bidx) * io.s_len.clone()) + row) * ev(heads) + ev(blk.hidx));
-    // the recipe copy is chosen by the tile count of the WHOLE sequence: identical numerics to `_vs128` per split
-    let short = b.bind_cond(ev(blk.ntiles_total).lt(9));
-    versioned(b, short, |b, lut| {
+    let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    let lut = blk.lut_copy(b);
+    versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody::new(b, &ring, &blk, wid, lut);
             pipe.run(b, role, &mut body);
-            // every wave: the epilogue scratch reuses the Q staging of the neighbouring waves (the drain's last barrier is role-dependent)
-            b.barrier();
+            let fin = body.out_scale(b);
             let l = body.sm.l_total(b);
-            let inv_l = b.rcp_f32(l);
-            let fin = b.mul_f32(inv_l, blk.vd);
             let lse = body.sm.lse(b, l);
-            let lse_ptr = {
-                let off = b.bind_i32(prow(blk.row_c.clone()) << 2);
-                b.ptr_add(kv.lse, off)
-            };
-            let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
-            let lane = blk.lane;
-            kvsplit_partial_f16(b, &body.o.unwrap(), fin, &lane, &ring.epi.mine(wid), lse_ptr, lse, live, &mut |b, i| {
-                let r = b.let_i32((&blk.row0 + 8 * i as i32) + lane.lane().lshr(3));
-                let rg = r.lt(io.s_len.clone()).select_i32(r.clone(), blk.s_last.clone());
-                let off = b.bind_i32((prow(rg) << 8) + ((lane.lane() & 7) << 4));
-                b.ptr_add(kv.ohat, off)
-            });
+            io.store_partial(b, &blk, &ring.epi.mine(wid), &body.o.unwrap(), fin, lse);
         });
     });
     fb.finish()
 }
 
 /// KV-split combine (phase 2), 8 output elements per thread: `out = sum_s 2^(lse_s - m) Ohat_s / sum_s 2^(lse_s - m)` (bf16).
-/// Kernarg: 0x00 Ohat, 0x08 lse, 0x10 out, 0x18 rows_total, 0x1C D (128), 0x20 splits; grid `ceil(rows_total * 16 / 256)` x 256 threads.
 pub fn fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h", 256);
     fb.compile_profile(CompileProfile::Combine);
-    let b = &mut fb;
-    let mut ka = KArgs::new();
-    let ohat = ka.ptr(b, "ptr_ohat", 0x00);
-    let lse = ka.ptr(b, "ptr_lse", 0x08);
-    let out = ka.ptr(b, "ptr_out", 0x10);
-    let rows = ka.dim(b, "rows_total", 0x18, 1, i64::MAX).val().unwrap();
-    ka.dim(b, "d", 0x1C, 128, 128);
-    let splits = ka.dim(b, "splits", 0x20, 1, i64::MAX).val().unwrap();
-    b.arg_tensor("ptr_ohat", Ext::ka(0x20) * Ext::ka(0x18) * Ext::c(128 * 4));
-    b.arg_tensor("ptr_lse", Ext::ka(0x20) * Ext::ka(0x18) * Ext::c(4));
-    b.arg_tensor("ptr_out", Ext::ka(0x18) * Ext::c(128 * 2));
-    // thread -> 8-element group of the output (clamped: the tail threads redo the last group), its row
-    let tid = b.let_(Op::WorkitemId);
-    let bx = b.let_(Op::WorkgroupIdX);
-    let groups = b.let_i32(rows.clone() << 4);
-    let t_raw = b.let_i32((ev(bx) << 8) + ev(tid));
-    let t = b.bind_i32(t_raw.lt(groups.clone()).select_i32(t_raw.clone(), groups - 1));
-    let row = b.bind_i32(ev(t).lshr(4));
-    b.assume_trusted(row, Ext::c(0), Ext::ka(0x18) - Ext::c(1), "row = clamped thread index >> k <= rows - 1: the engine keeps the rational upper bound of a shift");
-    let (rows_v, splits_v) = (b.bind_i32(rows), b.bind_i32(splits));
-    combine_splits(b, ohat, lse, out, rows_v, splits_v, t, row, 8, Ext::ka(0x20) - Ext::c(1));
+    combine_kernel(&mut fb, 8);
     fb.finish()
 }
+
 /// `_t128`: 128 query rows per block (ONE group of 4 waves), a 3-slot LDS ring staged by all waves (K and V share the row clamp, the K scales go through
 /// a VGPR), one window and one barrier per 128-key tile, two code copies as `_vs128`.
 pub fn fmha_fwd_hd128_mxfp8_dsl_t128() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_dsl_t128", 256);
     fb.compile_profile(CompileProfile::T128);
     let b = &mut fb;
-    let mut ka = KArgs::new();
-    let io = FmhaIo::declare(b, &mut ka, 128, false);
-    ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
+    let io = FmhaIo::declare(b, 128, false);
     let blk = io.block(b, 7);
     let roles = Roles::single(&blk.lane, 4);
     let ring = KvRing::new(b, &io, &blk, &roles, 3);
     let pipe = Pipeline::new(Cadence::OneWindow, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
-    let short = b.bind_cond(ev(blk.nkv).lt(9));
-    versioned(b, short, |b, lut| {
+    let lut = blk.lut_copy(b);
+    versioned(b, lut, |b, lut| {
         let mut body = AttnBody::new(b, &ring, &blk, blk.lane.wave, lut);
         pipe.run(b, Role::All, &mut body);
-        let l = body.sm.l_total(b);
-        let inv_l = b.rcp_f32(l);
-        let fin = b.mul_f32(inv_l, blk.vd);
-        let (row_ptr, live) = io.out_row(b, &blk);
-        store_bf16(b, &body.o.unwrap(), fin, row_ptr, live);
+        let fin = body.out_scale(b);
+        io.store_out(b, &blk, &body.o.unwrap(), fin);
     });
     fb.finish()
 }
