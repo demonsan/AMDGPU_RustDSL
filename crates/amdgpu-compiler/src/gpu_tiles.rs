@@ -621,17 +621,23 @@ fn period_bits(f: &Function) -> (u32, u32) {
             _ => {}
         }
     }
-    let mut a = Acc { mask_bits: 0, mul_log2: 0, shifts: 0, xor_counter: false, seen: HashSet::new() };
+    // each marker operand is its own cone: the bounds are maxima over cones, not sums over unrelated nodes
+    let (mut m_best, mut mul_best, mut xor_any) = (0u32, 0u32, false);
     for s in &f.stmts {
         if let Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } = s {
-            if !f.contract.tiles.iter().any(|t| &t.name == tile && t.private) {
-                walk(f, slot, &mut a);
+            let private = f.contract.tiles.iter().any(|t| &t.name == tile && t.private);
+            let ops: Vec<&Opnd> = if private { vec![version] } else { vec![slot, version] };
+            for o in ops {
+                let mut a = Acc { mask_bits: 0, mul_log2: 0, shifts: 0, xor_counter: false, seen: HashSet::new() };
+                walk(f, o, &mut a);
+                let m = if a.mask_bits > 0 { a.mask_bits + a.shifts } else { 0 };
+                m_best = m_best.max(m);
+                mul_best = mul_best.max(a.mul_log2);
+                xor_any |= a.xor_counter;
             }
-            walk(f, version, &mut a);
         }
     }
-    let m = if a.mask_bits > 0 { a.mask_bits + a.shifts } else { 0 };
-    (m.max(if a.xor_counter { 1 } else { 0 }), a.mul_log2)
+    (m_best.max(if xor_any { 1 } else { 0 }), mul_best)} else { 0 }), a.mul_log2)
 }
 
 /// The claimed period must be a TRUE period of what the simulator actually executes: for every marker statement the simulated slot sequence must repeat after `p` iterations
