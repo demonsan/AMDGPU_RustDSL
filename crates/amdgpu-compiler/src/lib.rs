@@ -226,6 +226,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_math" => Some(amdgpu_dsl::kernels::probe_math()),
         "probe_mfma" => Some(amdgpu_dsl::kernels::probe_mfma()),
         "probe_lds" => Some(amdgpu_dsl::kernels::probe_lds()),
+        "probe_lds_oob" => Some(amdgpu_dsl::kernels::probe_lds_oob()),
         "probe_mfma_wide" => Some(amdgpu_dsl::kernels::probe_mfma_wide()),
         "probe_mfma_fp8" => Some(amdgpu_dsl::kernels::probe_mfma_fp8()),
         "probe_mfma_scale" => Some(amdgpu_dsl::kernels::probe_mfma_scale()),

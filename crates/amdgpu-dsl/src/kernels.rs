@@ -305,6 +305,47 @@ pub fn probe_lds() -> Function {
     b.store_f32(dst, 0, Opnd::Val(value));
     b.finish()
 }
+/// LDS OOB probe (gpu-semantics audit): declares a 256-byte LDS segment, writes/reads sentinels
+/// inside it, then reads and writes at offsets past the declared segment. There is no LDS bounds
+/// checking on gfx950; the host records whether OOB returns 0, stale data or the written sentinel.
+pub fn probe_lds_oob() -> Function {
+    let mut b = FnBuilder::new("probe_lds_oob", 64);
+    b.lds(256);
+    b.arg("o", DType::Ptr, 0, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let off = b.mul_i32(tid, c4);
+    let s_valid = b.c_i32(0x1111_1111u32 as i32);
+    let s_oob = b.c_i32(0x2222_2222u32 as i32);
+    b.store_lds_b32(Opnd::Val(off), Opnd::Val(s_valid));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let valid = b.load_lds_b32(Opnd::Val(off));
+    let c256 = b.c_i32(256);
+    let c1024 = b.c_i32(1024);
+    let c4096 = b.c_i32(4096);
+    let a256 = b.add_i32(off, c256);
+    let a1024 = b.add_i32(off, c1024);
+    let a4096 = b.add_i32(off, c4096);
+    let r256 = b.load_lds_b32(Opnd::Val(a256));
+    let r1024 = b.load_lds_b32(Opnd::Val(a1024));
+    b.store_lds_b32(Opnd::Val(a4096), Opnd::Val(s_oob));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let r4096 = b.load_lds_b32(Opnd::Val(a4096));
+    let c16 = b.c_i32(16);
+    let row = b.mul_i32(tid, c16);
+    let p = b.ptr_add(o, row);
+    b.store_f32(p, 0, Opnd::Val(b.bitcast_f32(Opnd::Val(valid))));
+    b.store_f32(p, 4, Opnd::Val(b.bitcast_f32(Opnd::Val(r256))));
+    b.store_f32(p, 8, Opnd::Val(b.bitcast_f32(Opnd::Val(r1024))));
+    b.store_f32(p, 12, Opnd::Val(b.bitcast_f32(Opnd::Val(r4096))));
+    b.finish()
+}
+
 /// Wide MFMA probe: `v_mfma_f32_32x32x8_f16` with all-ones operands and a
 /// zeroed 16-dword accumulator, so every element must be exactly K = 8.0.
 pub fn probe_mfma_wide() -> Function {
