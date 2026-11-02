@@ -568,7 +568,7 @@ fn same_role(barrier: bool, wait: bool) -> Function {
     // ... and then reads the WHOLE tile (parts written by the other waves)
     b.tile_consume("t", Opnd::I32(0), Opnd::I32(0));
     let ra = b.add_i32(a, Opnd::I32(1024));
-    let ra = b.let_(Op::AndI32(Opnd::Val(ra), Opnd::I32(4095)));
+    let ra = b.let_(Op::AndI32(Opnd::Val(ra), Opnd::I32(4080)));
     let _r = b.load_lds_b128(ra);
     b.tile_end();
     b.finish()
