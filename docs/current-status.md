@@ -176,7 +176,7 @@ RACE,ARRIVAL-MISMATCH,NO-COMPLETION,UNROLL-LIMIT,TRUST}` 别名，全部既有�
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **39 个目标 / 232 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
+- **测试**：`cargo test` **40 个目标 / 238 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
   `register_accounting`、`asm_assembles`、`hazard_classes`、`hazard_oracle`、`phys_waw`、`ra_reaching`、
   `pin_check`、`pinning`、`dead_loads`、`var_lint`、`smfmac_hazards`、`dma_hazards`、`lite_contract` …）
 - **硬件探针**（`tools/`，**29 个脚本**）：`vendor_validate.sh`、`vendor_counters.sh`、`vendor_disasm.sh`、
@@ -223,6 +223,7 @@ bash tools/ohat_repro.sh fmha_fwd_hd128_mxfp8_kvsplit          # 300 次启动 m
 | 文档 | 内容 |
 |---|---|
 | `current-status.md` | **本文件：权威当前快照** |
+| `dsl-expression-layer.md` | **运算符表达式层**：`I32/F32/Cond/Ptr` + Rust 运算符，纯数据树经 `bind_*` 1:1 降低到现有 Op；demo 与手写版 asm 逐字节相同；不能自动做的（fma/packed/fragment/协议）及原因 |
 | `fmha-dsl-tour.md` | **FMHA 逐段教程**：真实 kernel 逐段特性 + Rust safe 保证（面向没写过 Rust kernel 的读者） |
 | `rust-safety.md` | **Rust 安全性如何保证**（全 crate `#![forbid(unsafe_code)]`、零依赖、类型层 ISA 规则、验证器、panic 策略、安全边界） |
 | `rust-safety-by-example.md` | **逐项 + 真实代码**：DSL kernel 写法下编译器如何保证 Rust safe（A1–A10），手写 asm 时 safe-asm 如何保证（B1–B16），29 个编译失败负例 |
