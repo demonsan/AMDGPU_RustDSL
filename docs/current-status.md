@@ -46,6 +46,36 @@ DSL(Rust) ──► typed IR (Op 83 种 / Stmt 40 种) ──► IR 验证器
 **指令覆盖**：101 个 MOp 在 `llvm20.tbl` **和** `llvm24.tbl` 都有行；own emit 全覆盖。
 DMA、LDS 直达、`buffer_load … lds` 等为 own-only（使用它们的 kernel 自动选 own 后端）。
 
+### 2.1 GPU 语义验证（`gpu_verify`，`AMDC_GPU_VERIFY=off|warn|strict`）
+
+编译器现在**感知 GPU 指令语义**：在 DSL IR 层做符号区间分析（多项式 + 循环不动点 + 合同），在最终 MIR 层检查寄存器类别与
+**路径敏感**的等待/生命周期。文档：[`gpu-semantics-verifier.md`](gpu-semantics-verifier.md)（模型与边界）、
+[`gpu-semantics-audit.md`](gpu-semantics-audit.md)（独立对抗审计）。命令行：
+
+```bash
+amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]   # 报告 proven/发现/trusted 清单/证书
+cargo run --bin amdc -- gpu-verify --shipped --strict      # 出厂 kernel 的严格证书
+```
+
+**已证明（出厂 kernel，`--strict` 0 错误）**：
+
+| 类别 | 证明内容 | 出厂覆盖 |
+|---|---|---|
+| **LDS** | 每次 DS 访存/DMA（含 64 lane）在声明段内；环形/双缓冲槽位由不动点证明；无下溢/回绕 | 600（`_vs128`/`_vs5`）、760（`_kvsplit`）、336/226/424/318 |
+| **LDS tile 生命周期** | tile 分区/别名、produce/consume/version（发布于 barrier）、跨角色 stale/race/pending；周期门（period ≤ horizon） | `_vs128`/`_vs5` **16,640** 次读、`_kvsplit` **66,560** 次读，0 错误 |
+| **全局/buffer** | 访问落在声明 extent 内（`arg_tensor` + 形状关系 `ka_is/grid_is/ka_one_of`）；描述符不得高估 `num_records` | 106/92/78/3/88/97/318/424 次访问；`tests/contract_host_truth.rs` 校验合同与 host 公式一致 |
+| **VGPR/SGPR** | v0、s0–s7 保留；元组对齐（VGPR 偶数、SGPR 对偶数/四元组×4）、≤256/≤102；MFMA A/B 与 D 不重叠 | 全部 88 个 kernel 0 错误（默认强制） |
+| **寄存器生命周期** | 路径敏感 use-before-wait（任一路径、含循环携带在途值） | 默认强制；出厂 0 错误 |
+| **barrier 协议** | 波分歧 if/else 两侧动态 barrier 数相等 | `_vs128` 18、`_t128` 8、`_kvsplit` 18、`_t` 11 |
+
+**信任预算（证书里逐条列出）**：出厂 8 个 kernel 合计 **44 条 trusted assumes**（10 条理由，全部 `assume_trusted` 带理由）、
+**216 条 trusted host contracts**、**0 unproven**。每次运行打印 `certificate: N trusted assumes, M trusted contracts, K unproven`。
+
+**未证明/范围外（诚实清单）**：跨工作组数据竞争与别名、i32 回绕（A3 假设）、从内存加载的指针/索引、safe-asm 块内部访存、
+tile 内字节级重叠、`_kvsplit` 的 160 处 epilogue scratch（界已证、生命周期未证，Warn）、角色数 2 / 迭代数相等假设。
+独立审计发现并修复了 2 个 soundness 漏洞（`assume` 归纳违反应为 Error；仿射长周期 marker 逃逸 horizon），
+并用硬件实测校正了 MFMA 对齐规则（VGPR 偶数，不是 16 对齐）。
+
 ---
 
 ## 3. DSL 设计
@@ -186,6 +216,8 @@ bash tools/ohat_repro.sh fmha_fwd_hd128_mxfp8_kvsplit          # 300 次启动 m
 | `rust-safety.md` | **Rust 安全性如何保证**（全 crate `#![forbid(unsafe_code)]`、零依赖、类型层 ISA 规则、验证器、panic 策略、安全边界） |
 | `rust-safety-by-example.md` | **逐项 + 真实代码**：DSL kernel 写法下编译器如何保证 Rust safe（A1–A10），手写 asm 时 safe-asm 如何保证（B1–B16），29 个编译失败负例 |
 | `llvm-feature-audit.md` | **LLVM AMDGPU CodeGen 测试覆盖审计**（4996 个测试逐一核对 + 可执行验证 + llc 对照） |
+| `gpu-semantics-verifier.md` | **GPU 语义验证器**：global/LDS/VGPR/SGPR 的越界与生命周期证明（模型、合同、错误分类、trust 预算） |
+| `gpu-semantics-audit.md` | **独立对抗审计**：攻击表、发现的 soundness 漏洞与修复、最终 verdict 与剩余边界 |
 | `design.md` | Rust DSL 与自研编译器设计规格 |
 | `status.md` | 25 轮逐轮实现记录（含所有正负结果与归因） |
 | `vendor-spec.md` | 厂商 kernel 事实 + §7.5–§7.11 认证表与归因 |
