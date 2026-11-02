@@ -417,6 +417,96 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> (Option<usize>, Option<u32>, u32) {
     }
 }
 
+/// Is every tile marker operand an AFFINE / PERIODIC function of loop counters? (constants, + - of counters, * << & ^ by constants; each counter used must be updated by
+/// `+ const` or `^ const` of itself and start at a constant.) Only then does simulating a bounded number of iterations cover every trip count.
+fn periodic_cone(f: &Function) -> Result<(), String> {
+    fn konst(f: &Function, o: &Opnd) -> Option<i64> {
+        match o {
+            Opnd::I32(c) => Some(*c as i64),
+            Opnd::Val(v) => f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op: Op::ConstI32(c) } = s { if dst == v { Some(*c as i64) } else { None } } else { None }),
+            _ => None,
+        }
+    }
+    fn def<'a>(f: &'a Function, v: ValueId) -> Option<&'a Op> {
+        f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if *dst == v { Some(op) } else { None } } else { None })
+    }
+    fn walk(f: &Function, o: &Opnd, seen: &mut HashSet<(bool, u32)>) -> Result<(), String> {
+        match o {
+            Opnd::I32(_) => Ok(()),
+            Opnd::F32(_) => Err("a float".to_string()),
+            Opnd::Val(v) => {
+                if !seen.insert((false, *v)) {
+                    return Ok(());
+                }
+                let Some(op) = def(f, *v) else { return Err(format!("v{v} (no definition)")) };
+                let name = format!("{op:?}");
+                let name = name.split(|c: char| c == '(' || c == ' ').next().unwrap_or("?").to_string();
+                match op {
+                    Op::ConstI32(_) => Ok(()),
+                    Op::AddI32(a, b) => {
+                        walk(f, a, seen)?;
+                        walk(f, b, seen)
+                    }
+                    Op::MulI32(a, b) => {
+                        if konst(f, a).is_none() && konst(f, b).is_none() {
+                            return Err("a product of two counters".to_string());
+                        }
+                        walk(f, a, seen)?;
+                        walk(f, b, seen)
+                    }
+                    Op::ShlI32(a, b) | Op::AndI32(a, b) | Op::XorI32(a, b) | Op::LshrI32(a, b) => {
+                        if konst(f, b).is_none() && konst(f, a).is_none() {
+                            return Err(format!("{name} of two non-constant operands"));
+                        }
+                        walk(f, a, seen)?;
+                        walk(f, b, seen)
+                    }
+                    _ => Err(name),
+                }
+            }
+            Opnd::Var(x) => {
+                if !seen.insert((true, x.0)) {
+                    return Ok(());
+                }
+                let mut ok_update = false;
+                for s in &f.stmts {
+                    match s {
+                        Stmt::BeginLoop { vars, init } => {
+                            if let Some(k) = vars.iter().position(|y| y == x) {
+                                if konst(f, &init[k]).is_none() {
+                                    return Err(format!("loop counter var{} with a non-constant initial value", x.0));
+                                }
+                            }
+                        }
+                        Stmt::SetVar { var, value } if var == x => {
+                            let Opnd::Val(u) = value else { return Err(format!("loop counter var{} updated by a non-expression", x.0)) };
+                            let good = match def(f, *u) {
+                                Some(Op::AddI32(a, b)) | Some(Op::XorI32(a, b)) => (matches!(a, Opnd::Var(y) if y == x) && konst(f, b).is_some()) || (matches!(b, Opnd::Var(y) if y == x) && konst(f, a).is_some()),
+                                _ => false,
+                            };
+                            if !good {
+                                return Err(format!("loop counter var{} updated by something other than `+ const` / `^ const` of itself", x.0));
+                            }
+                            ok_update = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if ok_update { Ok(()) } else { Err(format!("loop counter var{} (never updated by an affine step)", x.0)) }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    for (i, s) in f.stmts.iter().enumerate() {
+        if let Stmt::TileProduce { slot, version, .. } | Stmt::TileConsume { slot, version, .. } = s {
+            for o in [slot, version] {
+                walk(f, o, &mut seen).map_err(|why| format!("stmt {i}: the tile marker depends on {why}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
     let tiles = &f.contract.tiles;
     if tiles.is_empty() {
@@ -438,11 +528,22 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
             }
         }
     }
+    let max_slots = tiles.iter().map(|t| t.slots as usize).max().unwrap_or(1);
+    let nmax = 10usize.max(2 * max_slots + 4);
+    match (&f.contract.tile_trust, periodic_cone(f)) {
+        (Some(reason), _) => rep.add("GV-ASSUME", Severity::Info, format!("tile_trust_periodic: TRUSTED that the protocol is periodic in the loop iteration ({reason}); {nmax} iterations are simulated")),
+        (None, Err(why)) => rep.add(
+            "GV-TILE-UNROLL-LIMIT",
+            Severity::Error,
+            format!("{why}, which is not an affine/periodic function of the loop counters: the protocol is simulated for at most {nmax} loop iterations, so a launch with more iterations is NOT covered (express slot/version with counters stepped by + const / ^ const, or declare b.tile_trust_periodic(reason) when the structure is periodic by construction)"),
+        ),
+        (None, Ok(())) => {}
+    }
     let div = divergent_ifs(f);
     let mut diags: Vec<(&'static str, Severity, usize, String)> = Vec::new();
     let mut untagged: BTreeSet<usize> = BTreeSet::new();
     let mut checked = 0usize;
-    for n in 1..=4usize {
+    for n in 1..=nmax {
         let mut traces: Vec<Trace> = Vec::new();
         for role in 0..2usize {
             let mut sim = Sim { f, role, n, div: &div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, diags: &mut diags, untagged: &mut untagged, steps: 0, break_taken: false };

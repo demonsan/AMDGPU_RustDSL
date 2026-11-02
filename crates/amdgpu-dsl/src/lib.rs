@@ -519,6 +519,8 @@ pub struct Contract {
     /// LDS tiles / rings (v1.1 lifetime model) and the explicitly aliased pairs (allowed to overlap).
     pub tiles: Vec<TileDecl>,
     pub tile_aliases: Vec<(String, String)>,
+    /// Explicit trust that the tile protocol is periodic in the loop iteration (see `tile_trust_periodic`): skips the affine-counter check.
+    pub tile_trust: Option<String>,
     /// (symbol name, lo, hi) bounds of free symbols.
     pub sym_ranges: Vec<(String, i64, i64)>,
 }
@@ -872,6 +874,11 @@ impl FnBuilder {
     /// The two tiles are allowed to overlap (time-multiplexed storage): the lifetime check then requires their events to be ordered like versions of one tile.
     pub fn lds_alias(&mut self, a: &str, b: &str) {
         self.f.contract.tile_aliases.push((a.to_string(), b.to_string()));
+    }
+    /// Trust entry for the tile simulator: the slot / version expressions are NOT plain affine counters (xor/add/and/mul by constants) but the protocol is periodic in
+    /// the loop iteration by construction, so the simulated iterations (>= 10 and >= 2 x ring slots + 4) cover every launch. Listed as TRUSTED in the report.
+    pub fn tile_trust_periodic(&mut self, reason: &str) {
+        self.f.contract.tile_trust = Some(reason.to_string());
     }
     /// See `Stmt::TileProduce`.
     pub fn tile_produce(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>) {
