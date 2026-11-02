@@ -1,0 +1,242 @@
+//! L3b: the tile pipeline driver. The cadence (who stages which tile when, the waits, the barriers, the phase offset of the two wave groups, the peeled
+//! last tile, the tile-counter contract) is data (`Cadence`); the kernel supplies only the work of each phase (`PipeBody`). Every (slot, generation) a body
+//! sees comes from `TileIt`, so the protocol markers are consistent by construction.
+//!
+//! `Cadence::TwoPhaseOffset` (the `_vs128` / `_kvsplit` structure, kernels.rs `emit_fmha_vs128_role`):
+//! ```text
+//! prologue: stage(0) wait_vm(0) | stores | wait_vm(0) wait_lds(0) barrier | [B: barrier] | compute(0) wait_lds(0) barrier
+//! loop t:   stage(t+1) | v_phase(t) | wait_vm(0) | wait_lds(0) barrier | m_phase(t) | wait_lds(0) barrier
+//! tail:     if partial { iter(masked) } else { iter }  (no stage; the last barrier only in group A: equal barrier counts in both groups)
+//! ```
+//! `Cadence::OneWindow` (the `_t128` structure, `emit_fmha_t128_role`): a 3-slot ring, one group, one barrier per tile:
+//! ```text
+//! prologue: stage(0) wait_vm(0) | stage(1) wait_vm(0) | stores | wait_vm(0) wait_lds(0) barrier | compute(0) wait_lds(0)
+//! loop t:   stage(t+2) | window(t) | wait_vm(0) wait_lds(0) barrier
+//! tail:     if partial { window(masked) } else { window }   (no stage, no barrier)
+//! ```
+
+use super::lane::Role;
+use super::shared::SlotIdx;
+use super::{ev, varx};
+use crate::{DType, Ext, FnBuilder, Opnd, ValueId, VarId, I32};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cadence {
+    TwoPhaseOffset,
+    OneWindow,
+}
+
+/// One iteration of the pipeline as the body sees it.
+#[derive(Clone, Debug)]
+pub struct TileIt {
+    /// tile counter (0 in the prologue, the loop variable inside the loop and in the tail)
+    pub it: Opnd,
+    /// the tile being computed: slot `idx`, generation `it`
+    pub cur: SlotIdx,
+    /// tile t+1: slot / generation (`_vs128`: staged in this iteration; `_t128`: staged in the previous one)
+    pub next: SlotIdx,
+    /// tile t+2 (`OneWindow` only)
+    pub n2: Option<SlotIdx>,
+    /// the masked copy of the last (partial) tile
+    pub masked: bool,
+    /// a tile is staged in this iteration (false in the peeled tail)
+    pub staged: bool,
+    /// rows per tile
+    pub tile_rows: i32,
+}
+
+impl TileIt {
+    /// First row (key) of the current tile: `it * tile_rows`.
+    pub fn key0(&self) -> I32 {
+        super::ox(self.it) << (self.tile_rows.trailing_zeros() as i32)
+    }
+}
+
+/// What a kernel supplies to the pipeline. `role` is the compile-time group tag of the branch being emitted.
+pub trait PipeBody {
+    /// Issue the copies of tile `key0` (first row) into `slot` for the stages this role produces (e.g. `RowsCopy::issue` on `buf.at(slot)`).
+    fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx);
+    /// Called right after the pipeline's `wait_vm(0)` that completes the stage of `slot` (e.g. the VGPR path of the K scales: `ds_write` them now).
+    fn stage_complete(&mut self, _b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {}
+    /// Constant LDS data written once before the first barrier (Q staging, ones block).
+    fn prologue_stores(&mut self, _b: &mut FnBuilder, _role: Role) {}
+    /// Work on tile 0 before the loop (e.g. QK(0)); its results usually become loop-state initial values.
+    fn prologue_compute(&mut self, b: &mut FnBuilder, role: Role, t0: &TileIt);
+    /// Initial values of the body's loop-carried state (called after `prologue_compute`).
+    fn loop_state(&mut self, b: &mut FnBuilder) -> Vec<(DType, Opnd)>;
+    /// The loop variables of that state, in the same order (called once, right after `begin_loop`).
+    fn bind_state(&mut self, vars: &[VarId]);
+    /// `TwoPhaseOffset`: the VALU phase of tile t (between the stage and the first barrier).
+    fn v_phase(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
+    /// `TwoPhaseOffset`: the matrix phase (between the two barriers).
+    fn m_phase(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
+    /// `OneWindow`: the whole window of tile t.
+    fn window(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
+}
+
+/// The pipeline over `nkv` tiles of `tile_rows` rows (the last one possibly partial: `kv_len` rows in total).
+pub struct Pipeline {
+    pub cadence: Cadence,
+    /// number of tiles (>= 1), wave-uniform
+    pub nkv: ValueId,
+    /// valid rows in total (the last tile is partial when `kv_len < nkv * tile_rows`)
+    pub kv_len: ValueId,
+    pub tile_rows: i32,
+    /// contract upper bound of the tile counter (e.g. `ceil(SK / 128)`)
+    pub nkv_bound: Ext,
+}
+
+impl Pipeline {
+    pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
+        assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound }
+    }
+    pub fn slots(&self) -> u32 {
+        match self.cadence {
+            Cadence::TwoPhaseOffset => 2,
+            Cadence::OneWindow => 3,
+        }
+    }
+    fn lg(&self) -> i32 {
+        self.tile_rows.trailing_zeros() as i32
+    }
+
+    /// Emits the whole pipeline for one role (call it inside `Roles::each`, or once with `Role::All`).
+    pub fn run(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody) {
+        let t0 = TileIt {
+            it: Opnd::I32(0),
+            cur: SlotIdx::new(0, 0),
+            next: SlotIdx::new(1, 1),
+            n2: if self.cadence == Cadence::OneWindow { Some(SlotIdx::new(2, 2)) } else { None },
+            masked: false,
+            staged: true,
+            tile_rows: self.tile_rows,
+        };
+        // ---- prologue ----
+        let s0 = SlotIdx::new(0, 0);
+        body.stage(b, role, &I32::c(0), &s0);
+        b.wait_vm(0);
+        body.stage_complete(b, role, &s0);
+        if self.cadence == Cadence::OneWindow {
+            // tile 1 (clamped to the last tile: a one-tile sequence re-stages tile 0 as generation 1)
+            let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
+            let s1 = SlotIdx::new(1, 1);
+            body.stage(b, role, &key1, &s1);
+            b.wait_vm(0);
+            body.stage_complete(b, role, &s1);
+        }
+        body.prologue_stores(b, role);
+        b.wait_vm(0);
+        b.wait_lds(0);
+        b.barrier();
+        if self.cadence == Cadence::TwoPhaseOffset && role == Role::B {
+            b.barrier(); // group B runs one phase behind group A (A computes tile 0 before this barrier)
+        }
+        body.prologue_compute(b, role, &t0);
+        b.wait_lds(0);
+        if self.cadence == Cadence::TwoPhaseOffset {
+            b.barrier();
+        }
+        // ---- steady loop ----
+        let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::I32, Opnd::I32(0))];
+        // the variable inits must be values (materialised before the loop)
+        let z = b.c_i32(0);
+        inits[0].1 = Opnd::Val(z);
+        inits[1].1 = Opnd::Val(z);
+        inits.extend(body.loop_state(b));
+        let vars = b.begin_loop(&inits);
+        let (it, idx) = (vars[0], vars[1]);
+        body.bind_state(&vars[2..]);
+        b.assume_trusted(
+            it,
+            Ext::c(0),
+            self.nkv_bound.clone(),
+            "tile counter (tile::Pipeline): starts at 0 and the loop exits at it >= nkv - 1, so the body only runs with it <= nkv - 2 <= ceil(rows / tile_rows); the guard compares against a derived value the interval engine cannot relate to the bound",
+        );
+        let nkv_m1 = b.let_i32(ev(self.nkv) - 1);
+        let stop = b.bind_cond(!varx(it).lt(&nkv_m1));
+        b.break_if(stop);
+        let i_next = self.iter(b, role, body, it, idx, false, true, true);
+        b.set_var(idx, i_next);
+        let it_next = b.bind_i32(varx(it) + 1);
+        b.set_var(it, it_next);
+        let stop2 = b.bind_cond(!ev(it_next).lt(&nkv_m1));
+        b.break_if(stop2);
+        b.end_loop();
+        // ---- peeled last tile ----
+        let is_tail = b.bind_cond(ev(self.kv_len).lt((varx(it) << self.lg()) + self.tile_rows));
+        let last_barrier = role != Role::B;
+        b.begin_if(is_tail);
+        self.iter(b, role, body, it, idx, true, false, last_barrier);
+        b.else_();
+        self.iter(b, role, body, it, idx, false, false, last_barrier);
+        b.end_if();
+    }
+
+    /// One iteration; returns the next ring index.
+    #[allow(clippy::too_many_arguments)]
+    fn iter(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: VarId, idx: VarId, masked: bool, staged: bool, last_barrier: bool) -> ValueId {
+        let nkv = ev(self.nkv);
+        match self.cadence {
+            Cadence::TwoPhaseOffset => {
+                let i1 = b.bind_i32(varx(idx) ^ 1);
+                let it_p1 = b.let_i32(varx(it) + 1);
+                let nn = it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1);
+                let t = TileIt {
+                    it: Opnd::Var(it),
+                    cur: SlotIdx::new(idx, it),
+                    next: SlotIdx::new(i1, b.bind_opnd(&it_p1)),
+                    n2: None,
+                    masked,
+                    staged,
+                    tile_rows: self.tile_rows,
+                };
+                if staged {
+                    let key_n = b.let_i32(nn << self.lg());
+                    body.stage(b, role, &key_n, &t.next);
+                }
+                body.v_phase(b, role, &t);
+                if staged {
+                    b.wait_vm(0);
+                    body.stage_complete(b, role, &t.next);
+                }
+                b.wait_lds(0);
+                b.barrier();
+                body.m_phase(b, role, &t);
+                b.wait_lds(0);
+                if last_barrier {
+                    b.barrier();
+                }
+                i1
+            }
+            Cadence::OneWindow => {
+                let i1 = b.bind_i32(varx(idx).lt(2).select_i32(varx(idx) + 1, 0));
+                let i2 = b.bind_i32(I32::c(0).lt(varx(idx)).select_i32(varx(idx) - 1, 2));
+                let it_p1 = b.let_i32(varx(it) + 1);
+                let it_p2 = b.let_i32(varx(it) + 2);
+                let t = TileIt {
+                    it: Opnd::Var(it),
+                    cur: SlotIdx::new(idx, it),
+                    next: SlotIdx::new(i1, b.bind_opnd(&it_p1)),
+                    n2: Some(SlotIdx::new(i2, b.bind_opnd(&it_p2))),
+                    masked,
+                    staged,
+                    tile_rows: self.tile_rows,
+                };
+                let n2 = t.n2.clone().expect("n2");
+                if staged {
+                    let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
+                    body.stage(b, role, &key_n2, &n2);
+                }
+                body.window(b, role, &t);
+                if staged {
+                    b.wait_vm(0);
+                    body.stage_complete(b, role, &n2);
+                    b.wait_lds(0);
+                    b.barrier();
+                }
+                i1
+            }
+        }
+    }
+}
