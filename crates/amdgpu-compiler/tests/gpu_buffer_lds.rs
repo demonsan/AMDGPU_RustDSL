@@ -35,9 +35,8 @@ fn dma_kernel(desc_bytes: u32, extent: Option<Ext>, lds_bytes: u32) -> Function 
     }
     let p = b.let_(Op::KernargPtr { offset: 0 });
     let rsrc = b.buffer_desc(p, desc_bytes);
-    let l = lane(&mut b);
-    let c16 = b.c_i32(16);
-    let lds_base = b.mul_i32(l, c16);
+    // M0 is the LDS base only: the hardware adds `lane*16` itself, so the checked extent is [,1024) for 64 lanes.
+    let lds_base = b.c_i32(0);
     let voff = b.c_i32(0);
     let soff = b.c_i32(0);
     b.buffer_load_lds_b128(rsrc, voff, soff, lds_base, 0);
@@ -83,9 +82,7 @@ fn dma_protocol_kernel(wait_before_barrier: bool) -> Function {
     b.arg_tensor("p", Ext::c(1024));
     let p = b.let_(Op::KernargPtr { offset: 0 });
     let rsrc = b.buffer_desc(p, 1024);
-    let l = lane(&mut b);
-    let c16 = b.c_i32(16);
-    let lds_base = b.mul_i32(l, c16);
+    let lds_base = b.c_i32(0); // M0 base; lane*16 is added by the hardware
     let voff = b.c_i32(0);
     let soff = b.c_i32(0);
     b.tile_produce("t", Opnd::I32(0), Opnd::I32(0));
