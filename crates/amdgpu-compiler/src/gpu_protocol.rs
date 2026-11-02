@@ -64,6 +64,11 @@ struct Trace {
     path: Vec<(usize, bool, bool)>,
 }
 
+/// Regions whose markers the intra-workgroup simulator must not interpret: counted-trust regions and inter-block (last-arriver) regions.
+fn region_skipped(f: &Function, name: &str) -> bool {
+    f.contract.buf_trusts.iter().any(|(n, _)| n == name) || f.contract.last_arrivers.iter().any(|l| l.region == name)
+}
+
 /// The v4 name of a verdict (obligation O1 complete-before-publish, O2 publish-before-read, O3 read-before-overwrite, O4 generation-consistency).
 pub(crate) fn proto_alias(code: &str, msg: &str) -> &'static str {
     match code {
@@ -291,8 +296,8 @@ impl<'a> Sim<'a> {
         // a private (per-wave) region: the slot operand is the WAVE KEY, checked symbolically against the access address by the interval analysis; the simulation needs no value for it
         let private = self.f.contract.tiles[ti].private;
         let global = self.f.contract.tiles[ti].global;
-        if self.f.contract.buf_trusts.iter().any(|(n, _)| n == tile) {
-            self.open = None; // a TRUSTED region (buf_trust): not checked, counted in the certificate
+        if region_skipped(self.f, tile) {
+            self.open = None; // a TRUSTED region (buf_trust) or an inter-block last-arriver region (verify_last_arrivers): not simulated here
             return;
         }
         let slot_cv = if private { CV::K(0) } else { self.cv(slot) };
@@ -620,6 +625,9 @@ fn periodic_cone(f: &Function) -> Result<(), String> {
     let mut seen = HashSet::new();
     for (i, s) in f.stmts.iter().enumerate() {
         if let Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } = s {
+            if region_skipped(f, tile) {
+                continue;
+            }
             // the slot of a private (per-wave) region is the wave key: it does not evolve with the loop iteration
             let private = f.contract.tiles.iter().any(|t| &t.name == tile && t.private);
             for o in if private { vec![version] } else { vec![slot, version] } {
@@ -719,6 +727,9 @@ fn period_bits(f: &Function) -> (u32, u32) {
     let (mut m_best, mut mul_best, mut xor_any) = (0u32, 0u32, false);
     for s in &f.stmts {
         if let Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } = s {
+            if region_skipped(f, tile) {
+                continue;
+            }
             let private = f.contract.tiles.iter().any(|t| &t.name == tile && t.private);
             let ops: Vec<&Opnd> = if private { vec![version] } else { vec![slot, version] };
             for o in ops {

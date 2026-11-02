@@ -181,15 +181,19 @@ fn main() -> ExitCode {
                         println!("== {name}: {} finding(s), {errs} error(s); proven {:?}", r.findings.len(), r.proven);
                         for fd in &r.findings {
                             if args.iter().any(|a| a == "-v") || fd.severity != amdgpu_compiler::gpu_verify::Severity::Info {
-                                println!("  [{}] {:?}: {}", fd.code, fd.severity, fd.msg);
+                                println!("  [{}{}] {:?}: {}", fd.code, if fd.alias.is_empty() || fd.alias == fd.code { String::new() } else { format!("|{}", fd.alias) }, fd.severity, fd.msg);
                             }
                         }
                         // the trust budget at a glance: explicit trusted assumptions, declared host contracts, unproven properties
                         let trusted = r.findings.iter().filter(|x| x.code == "GV-ASSUME" && x.msg.contains("TRUSTED") && !x.msg.contains("set_var")).count();
                         let c = &f.contract;
                         let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.sym_ranges.len();
-                        println!("   certificate: {trusted} trusted assumes, {contracts} trusted contracts, {errs} unproven");
-                        tot_trusted += trusted;
+                        // the trust LEDGER: every escape is counted by kind
+                        let l = r.ledger();
+                        let trusted = l.total();
+                        let c = &f.contract;
+                        let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.sym_ranges.len();
+                        println!("   certificate: {trusted} trusted assumes ({} assume_trusted, {} tile_trust_periodic, {} region_trust), {contracts} trusted contracts, {errs} unproven", l.assume_trusted, l.tile_trust, l.region_trust);                        tot_trusted += trusted;
                         tot_contracts += contracts;
                         tot_unproven += errs;
                         bad |= errs > 0;

@@ -24,6 +24,23 @@ pub enum Severity {
     Info,
 }
 
+/// The counted trust LEDGER of a report: every escape hatch the certificate relies on, by kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ledger {
+    /// `assume_trusted` loop-counter ranges + unproven value assumes
+    pub assume_trusted: usize,
+    /// `tile_trust_periodic`
+    pub tile_trust: usize,
+    /// `buf_trust` (region trust)
+    pub region_trust: usize,
+}
+
+impl Ledger {
+    pub fn total(&self) -> usize {
+        self.assume_trusted + self.tile_trust + self.region_trust
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Finding {
     pub code: &'static str,
@@ -63,10 +80,32 @@ impl Report {
             *self.proven.entry(k).or_insert(0) += v;
         }
     }
+    /// The trust ledger: how many escapes (by kind) this report relies on.
+    pub fn ledger(&self) -> Ledger {
+        let mut l = Ledger::default();
+        for f in &self.findings {
+            if f.code != "GV-ASSUME" || !f.msg.contains("TRUSTED") || f.msg.contains("set_var") {
+                continue;
+            }
+            if f.msg.contains("tile_trust_periodic") {
+                l.tile_trust += 1;
+            } else if f.msg.contains("buf_trust") {
+                l.region_trust += 1;
+            } else {
+                l.assume_trusted += 1;
+            }
+        }
+        l
+    }
+
     pub fn render(&self) -> String {
         let mut s = String::new();
         for f in &self.findings {
-            s.push_str(&format!("[{}] {:?}: {}\n", f.code, f.severity, f.msg));
+            if f.alias.is_empty() || f.alias == f.code {
+                s.push_str(&format!("[{}] {:?}: {}\n", f.code, f.severity, f.msg));
+            } else {
+                s.push_str(&format!("[{}|{}] {:?}: {}\n", f.code, f.alias, f.severity, f.msg));
+            }
         }
         s.push_str(&format!("proven accesses: {:?}\n", self.proven));
         s
