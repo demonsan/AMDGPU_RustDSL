@@ -64,7 +64,7 @@ struct Trace {
     path: Vec<(usize, bool, bool)>,
 }
 
-pub(crate) /// The v4 name of a verdict (obligation O1 complete-before-publish, O2 publish-before-read, O3 read-before-overwrite, O4 generation-consistency).
+/// The v4 name of a verdict (obligation O1 complete-before-publish, O2 publish-before-read, O3 read-before-overwrite, O4 generation-consistency).
 pub(crate) fn proto_alias(code: &str, msg: &str) -> &'static str {
     match code {
         "GV-TILE-STALE" | "GV-PROTO-UNPUBLISHED" | "GV-PROTO-NOT-VISIBLE" | "GV-PROTO-NO-COMPLETION" | "GV-PROTO-STALE-GEN" => {
@@ -88,7 +88,7 @@ pub(crate) fn proto_alias(code: &str, msg: &str) -> &'static str {
     }
 }
 
-fn divergent_ifs(f: &Function) -> HashSet<usize> {
+pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
     let mut tv: HashSet<ValueId> = HashSet::new();
     let mut tvars: HashSet<VarId> = HashSet::new();
     let tainted = |o: &Opnd, tv: &HashSet<ValueId>, tvars: &HashSet<VarId>| match o {
