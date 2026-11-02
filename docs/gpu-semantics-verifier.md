@@ -14,7 +14,7 @@
 | A1 | `arg_tensor(name, nbytes)` / `arg_tensor_slack(name, logical, alloc)` 声明的分配大小**由调用者保证**（内存真实可读写这么多字节）。loads 以 `alloc` 为界，stores/atomics 以 `logical`（缺省 `alloc`）为界。 | 主机 |
 | A2 | `ka_range`、`ka_is`（kernarg 标量等式）、`grid_is`（网格维度等式）、`sym_range` 为真；工作组 id ∈ `[0, grid-1]`，工作项 id ∈ `[0, wg-1]`。 | 主机 |
 | A3 | **i32 运算不回绕**（每个地址算术结果 < 2^31）；验证器不逐运算证明，而是把它记为全局假设。 | 主机（张量 < 2 GiB） |
-| A4 | `Stmt::Assume`（`b.assume(target, lo, hi)`）是 kernel 作者的断言：对循环变量**归纳检查**（初值与每个 `set_var` 是否落在范围内），能证明则标 proved，否则标 TRUSTED 并作为 `GV-ASSUME`（Info）列出；对普通值，若分析本身已蕴含则标冗余，否则 TRUSTED。 | kernel 作者 |
+| A4 | `b.assume(var, lo, hi)`（循环变量）**必须是归纳的**：初值和每个 `set_var` 都要被证明落在范围内，**否则是 Error**（`GV-ASSUME-VIOLATED`，`--strict` 不能认证；见 kernel-occ 的 `gv_attack_assume_loop`：assume 为 [0,0] 而每轮 +1，会在第 2 轮越界）。确实由分析器看不见的守卫（例如循环退出条件）保证的计数器，必须写 `b.assume_trusted(var, lo, hi, "原因")`：它不检查归纳，作为 TRUSTED（Info）逐条列出，评审时只审这些行。对普通**值**的 `b.assume(value, lo, hi)`：若分析已蕴含则标冗余，否则 TRUSTED（Info）。 | kernel 作者 |
 | A5 | MUBUF 越界语义是硬件定义的（gfx950 实测：越界读返回 0、越界写被丢弃，包括 `... lds` 形式向 LDS 写 0）；有界描述符的访问因此不需要额外证明，**但描述符不得高估分配**（见 4.3）。 | 硬件 + 验证器 |
 | A6 | 单次 launch 内**工作组间无数据竞争**、全局内存别名不在本验证器范围（见第 8 节）。 | 作者 |
 
@@ -71,6 +71,35 @@ hi + size <= limit           （存在 hi 候选 h 与 limit 下界 l，使 l - 
 * MIR 层补充：`m.lds_bytes`（含 LDS 溢出区）≤ 160 KiB 且 ≥ DSL 声明值。
 * **v1 不证明**：tile 的版本/生命周期与 barrier 的对应（谁在何时写、读者在哪个 barrier 之后）。v1 只保证“不越界”，不保证“读到的是正确版本”（第 8 节）。
 
+### 3.1 LDS tile 生命周期 / 版本模型（v1.1，`gpu_tiles.rs`）
+
+v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到过期/未发布的版本、读一个已被下一轮覆盖的槽、缺 barrier、DMA 未等待就发布、两个 live tile 重叠。
+
+**合同 API（均不生成代码）**
+
+| API | 含义 |
+|---|---|
+| `b.lds_tile(name, base, size)` / `b.lds_ring(name, base, slot_size, slots)` | 声明命名 tile / 环（槽 k = `[base + k*slot_size, +slot_size)`） |
+| `b.lds_alias(a, b)` | 允许两个 tile 重叠（时间复用同一存储） |
+| `b.tile_produce(name, slot, version)` | 此后（至 `tile_end`/下一个标记/barrier/控制流边界）**本 wave 发出的 LDS 写与 DMA** 产生 `(name, slot)` 的版本 `version` |
+| `b.tile_consume(name, slot, version)` | 此后本 wave 的 **LDS 读** 期望 `(name, slot)` 的版本 `version` |
+| `b.tile_end()` | 结束标记作用域（barrier 与 if/loop 边界也会结束它） |
+
+`slot`/`version` 是 IR 值，必须是**循环计数器与常量的编译期函数**（环形计数器：`it & 1`、`it + 1` …）；否则 `GV-TILE-INDEX`。
+
+**静态检查**：(a) 声明的 tile 都在 `lds()` 段内，且两两不相交，除非 `lds_alias`（`GV-TILE-OVERLAP`）；(b) 标记作用域内每个 LDS 访问（含 DMA 的 64 lane 目的区间）必须落在被标记的 tile/环内（`GV-TILE-ESCAPE`，复用 v1 的区间分析）；写不能出现在 `tile_consume` 下、读不能出现在 `tile_produce` 下（`GV-TILE-KIND`）；作用域外的 LDS 访问计入 `GV-TILE-UNTAGGED`（Warn：其生命周期未检查）。
+
+**协议模拟**：对 kernel 的控制骨架按**波角色**（工作项 id 相关的 `if` 的 then/else 两侧）分别**具体执行**，每个循环展开 1..=4 次（`BreakIf` 条件已知为真则提前退出），以**动态 barrier 序号**（phase）给每个事件编号；slot/version 表达式按循环变量的具体值求值。
+
+* **发布**：一次 `tile_produce` 在其写**完成**（DMA 须 `wait_vm(0)`，DS 写须 `wait_lds(0)`；部分计数不视为完成）之后的**第一个 barrier** 处对其他 wave 发布（可见相位 = 该 barrier 序号 + 1）；同一 wave 自己读则只需完成。
+* **读**（`tile_consume`）必须：(1) 看到**已发布的**最新版本，且版本号 **恰为期望值**（否则 `GV-TILE-STALE`，消息给出看到的版本、生产者角色/语句、发布相位）；(2) 同版本的所有协作生产者（多 wave 各写一部分）都已发布；(3) 其读在下一个 barrier 前**完成**（`wait_lds(0)`），否则 barrier 不能把它与下一个写者隔开（`GV-TILE-PENDING`，Warn）；(4) 其他 wave 对同一槽写**别的版本**的窗口 `[发出相位, 发布相位)` 不得与读窗口 `[读相位, 完成相位]` 重叠（否则 `GV-TILE-RACE`：例如单缓冲被下一轮覆盖、读旧版本时下一版本已落地）。
+* **写写**：不同 wave 并发写同一槽**不同版本** → `GV-TILE-RACE`；同一版本（协作填充）允许。
+* **每条 producer→consumer 边在所有角色上都跨 barrier**：由“发布相位 ≤ 读相位”与两侧动态 barrier 计数相等（v1 的 `GV-BAR`）共同保证。
+
+**已证明 / 假设计数**：报告的 `proven` 里 `tile-reads` 为已证明的读事件数（按展开场景累计），`tile-cover` 为证明落在标记 tile 内的访问数；对 `slot/version` 的唯一假设是“循环最多展开 4 次、各循环同一迭代数”，以及角色只有两个（then/else）。
+
+**v1.1 的边界**：(i) 同一 tile 内按**字节**的部分重叠（两个 wave 写同一槽的不同子区间）不被区分——它们靠“同版本协作”语义被允许；(ii) 波一致、运行时条件的 `if` 内含 barrier/标记/LDS 访问时只给 `GV-TILE-UNSUPPORTED`（Warn），不建模两个分支；(iii) 未带标记的 LDS 访问（`GV-TILE-UNTAGGED`）不被检查；(iv) 跨 workgroup 与跨 kernel 的别名、数据竞争不在范围内。
+
 ## 4. 寄存器类别合法性（MIR，RA 之后）
 
 对每个被指令引用的虚拟寄存器（`verify_mir`）：
@@ -78,7 +107,7 @@ hi + size <= limit           （存在 hi 候选 h 与 limit 下界 l，使 l - 
 | 检查 | 规则 | 错误码 |
 |---|---|---|
 | 保留寄存器 | VGPR 不得分配到 `v0`（工作项 id）；SGPR 不得分配到 `s0..s7`（kernarg 指针、工作组 id） | `GV-REG-RESERVED` |
-| 对齐 | 宽度 n≥2 的 VGPR 元组起点为 n 的倍数（ISA 要求 64 位及以上为偶数、MFMA 操作数；我们的策略更严）；SGPR 对（偶数）与 4 元组描述符（4 的倍数） | `GV-REG-ALIGN` |
+| 对齐（**gfx950 汇编器实测**） | 任意宽度（2/4/8/16）的 VGPR 元组（MFMA 的 A/B/C/D、`global/ds/buffer` 数据、packed 运算）起点必须是**偶数**（`v[2:17]`、`v[6:21]`、`v[14:29]` 合法，奇数起点被拒）；SGPR 对起点为偶数，4 元组（buffer 描述符、`s_load_dwordx4`）和 8 元组（`s_load_dwordx8`）起点为 4 的倍数（`s2/s10` 被拒，`s4/s8` 合法）。我们的 RA 额外把元组对齐到其宽度：偏离只作为 `GV-REG-POLICY`（Info），不是错误 | `GV-REG-ALIGN`（Error）、`GV-REG-POLICY`（Info） |
 | 上限 | VGPR ≤ 256/wave；SGPR ≤ 102；整个 kernel 的 `max_v/max_s` 也受此限 | `GV-REG-LIMIT` |
 | 矩阵操作数 | MFMA/SMFMA 的 A、B 与目的 D 不得重叠；D 的宽度/对齐沿用上面规则 | `GV-REG-MFMA` |
 
@@ -122,7 +151,8 @@ hi + size <= limit           （存在 hi 候选 h 与 limit 下界 l，使 l - 
 3. **i32 回绕**（A3）：作为假设，不逐运算证明。
 4. **从内存加载的整数/指针**（运行时索引表等）：区间无界；`LoadU16` 是唯一有规则的加载（`[0, 65535]`）。
 5. **变量位移/除法/取模、两边符号不明的 `and/xor`**：无规则 → 无界。
-6. **safe-asm 块内部**的访存不被检查（其地址输入来自被检查的 IR 值；报告里有 `GV-ASM` Info）。
+6. **safe-asm 块内部**的访存**明确不被检查**（`Op::Asm`/`Stmt::VarAsm`/`VarAsmN`）：其地址输入来自被检查的 IR 值，但块内的 `ds_*`/`global_*` 偏移、宽度与顺序只由 safe-asm 自己的类型/验证器负责；报告里有 `GV-ASM` Info，不能把含 safe-asm 的 kernel 的 LDS/全局证明读成覆盖了块内访问。
+6b. **合同缺口（由 kernel 作者补，验证器能表达但不会代劳）**：(a) 任何指针 kernarg（包括计数器/信号区，如 `kvs_counters`）都用 `arg_tensor` 声明它的分配大小，否则 `GV-GLB-NOEXT`；(b) 取值受限的标量用 `ka_one_of(offset, &[2, 4, 8])`（例如 KV 切分数；分析使用其 min/max，**幂次/整除性质仍由 `assume` 的作者负责**）；(c) 由形状推出的标量用 `ka_is` 写成等式（例如 `rows_total = B * S * H`：`b.ka_is(0x284, Ext::sym("B") * Ext::ka(S_off) * Ext::ka(H_off))`）；(d) 合同的真实性（声明的分配是否等于主机真正传入的大小）是 A1 的内容，需要主机侧测试（kernel-occ 提议的 `contract_host_truth`）核对，验证器本身无法检查。
 7. **LLVM tail 重新插入的等待**：v1 检查的是我们自己的 MIR（tail 之前）；tail 与 own 后端的一致性仍由 `tail_invariance` 守护。
 8. 证明是**充分判定**：`GV-GLB-OOB` 表示“证不出”，可能是分析过弱（需要补合同）而不是真的越界；反之，合同写错（例如声明了过大的分配）会使证明失去意义——这是 A1 的代价。
 9. 寄存器活跃重叠、SGPR 的 VCC/exec/m0 等隐式寄存器由其它 pass 负责。
@@ -139,6 +169,14 @@ hi + size <= limit           （存在 hi 候选 h 与 limit 下界 l，使 l - 
 | `GV-REG-RESERVED/ALIGN/LIMIT/MFMA` | Error | 第 4 节 | `vreg 7 (V16) at v40: a 16-dword VGPR tuple must start at a multiple of 16 …` | 编译器 bug（RA 输出非法）——报告给编译器组 |
 | `GV-WAIT` | Error | 任一路径上，指令读/写了有在途加载的寄存器 | `block 3 inst 0 (VMovB32) touches a register with a load in flight (on at least one control-flow path, including loop back edges)` | 加 `wait_vm/wait_lds` 或调整调度 |
 | `GV-BAR` | Error | 工作项 id 相关的 `if/else` 两侧动态 barrier 数不同 | `wave-divergent if/else … executes a different number of barriers: then [3, 4] vs else [3, 4, …]` | 平衡两侧 barrier |
+| `GV-ASSUME-VIOLATED` | Error | 循环变量的 `assume` 不是归纳的：初值或某个 `set_var` 不能被证明落在假设范围内 | `set_var var0 = [1, 1] is not provably inside the assumed range [0, 0]: the assumption is not inductive …` | 放宽 assume，或在守卫确实存在时用 `assume_trusted(.., 原因)` |
+| `GV-TILE-OVERLAP` | Error | 声明的 tile 超出 LDS 段，或两个 live tile 相交且未 `lds_alias` | `live tiles \`a\` [0, 2048) and \`b\` [1024, 3072) overlap and are not declared as aliases` | 调整布局或声明别名 |
+| `GV-TILE-ESCAPE` | Error | 标记作用域内的 LDS 访问不在被标记的 tile/环内 | `LDS access [..] is not provably inside tile \`buf\` (slot interval …)` | 修地址或标记 |
+| `GV-TILE-KIND` | Error | 读出现在 `tile_produce` 下或写/DMA 出现在 `tile_consume` 下 | `an LDS write / DMA is issued under a tile_consume marker` | 修标记 |
+| `GV-TILE-STALE` | Error | 读者看不到期望版本：未发布（缺 barrier/未等待完成）、版本不符（槽已被覆盖/下一版本未到）、协作生产者未全部发布 | `read of \`buf\`[1] expecting version 3 at phase 4 finds NO published version: version 3 is produced by role 0 … but is only published at phase 5` | 补 barrier / 等待，或修 slot/version 表达式 |
+| `GV-TILE-RACE` | Error | 其他 wave 在读窗口内写（或仍在落地）同一槽的别的版本；或不同 wave 并发写不同版本 | `read of \`buf\`[0] (version 1, phases 1..1) overlaps the write of version 2 by role 0 … no barrier separates them` | 双缓冲/加 barrier |
+| `GV-TILE-INDEX` | Error | slot/version 不是循环计数器与常量的编译期函数，或槽越界 | `the slot / version of the \`buf\` marker is not a compile-time function of the loop counters` | 用环形计数器表达 |
+| `GV-TILE-PENDING/UNTAGGED/UNSUPPORTED/EMPTY` | Warn | 见 3.1 | | |
 | `GV-CONTRACT` | Error | 合同引用的参数不是指针 kernarg | `extent declared for \`x\` which is not a pointer kernarg` | 修正合同 |
 | `GV-ASSUME` | Info | 每条 `assume`；`set_var` 不在假设范围内时也记录 | `assume var3 in [0, 1]: initial value proven inside; every set_var is checked against it` | 审阅 TRUSTED 项 |
 | `GV-ASM` | Info | kernel 含 safe-asm 块 | `safe-asm blocks present: their internal memory accesses are NOT bounds-checked by v1` | — |
