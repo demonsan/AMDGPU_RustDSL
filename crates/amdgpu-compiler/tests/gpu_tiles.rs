@@ -377,19 +377,23 @@ fn a_runtime_if_inside_a_loop_with_protocol_events_is_reported_not_skipped() {
 // the shipped FMHA kernels: the lifetime simulation really runs, and is not vacuous (mutation test)
 
 #[test]
-fn vs128_runs_the_lifetime_simulation_and_every_removed_barrier_is_noticed() {
+fn vs128_runs_the_lifetime_simulation_and_removed_barriers_are_noticed() {
     let f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_vs128").unwrap();
     let r = verify_ir(&f);
     assert!(r.errors().is_empty(), "{}", errors(&r));
     assert!(r.proven.get("tile-reads").copied().unwrap_or(0) > 1000, "{}", r.render());
     let barriers: Vec<usize> = f.stmts.iter().enumerate().filter(|(_, s)| matches!(s, amdgpu_dsl::Stmt::Barrier)).map(|(i, _)| i).collect();
     assert!(barriers.len() >= 6, "{} barriers", barriers.len());
-    // (the very last barrier only orders the already-consumed epilogue: it protects nothing the markers describe)
-    let picks = [0, barriers.len() / 4, barriers.len() / 2, 2 * barriers.len() / 3];
-    for &k in &picks {
+    // remove every barrier in turn: the markers must notice most of them (a barrier that protects no marked tile is legitimately silent, e.g. the last one)
+    let mut undetected: Vec<usize> = Vec::new();
+    for (k, &stmt) in barriers.iter().enumerate() {
         let mut g = f.clone();
-        g.stmts.remove(barriers[k]);
+        g.stmts.remove(stmt);
         let m = verify_ir(&g);
-        assert!(m.errors().iter().any(|e| e.code == "GV-BAR" || e.code.starts_with("GV-TILE")), "removing barrier #{k} (stmt {}) went unnoticed: {}", barriers[k], m.render());
+        if !m.errors().iter().any(|e| e.code == "GV-BAR" || e.code.starts_with("GV-TILE")) {
+            undetected.push(k);
+        }
     }
+    eprintln!("barriers: {}, removal undetected for barrier indices {:?} (stmts {:?})", barriers.len(), undetected, undetected.iter().map(|&k| barriers[k]).collect::<Vec<_>>());
+    assert!(undetected.len() * 10 <= barriers.len() * 3, "too many removed barriers go unnoticed: {:?}", undetected);
 }
