@@ -7353,6 +7353,8 @@ fn emit_fmha_t_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     }
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
+    // host contract: the tile counter runs 0 .. ceil(kv_len / 128) (the loop breaks at it >= nkv - 1; the inductive step it + 1 <= nkv is TRUSTED, listed in the report)
+    b.assume_trusted(it, Ext::c(0), Ext::ka(0x110).ceil_div(128), "tile counter: starts at 0 and the loop exits at it >= nkv - 1 with nkv = ceil(kv_len / 128), so the body only runs with it <= nkv - 2; the guard is a compare against a derived value the interval engine cannot relate to ceil(SK/128)");
     let par = vars[7];
     let lacc = if msum { Some(vars[8]) } else { None };
     let m_var = vars[1];
@@ -9153,6 +9155,8 @@ fn emit_fmha_vs_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     }
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
+    // host contract: the tile counter runs 0 .. ceil(kv_len / 128) (the loop breaks at it >= nkv - 1; the inductive step it + 1 <= nkv is TRUSTED, listed in the report)
+    b.assume_trusted(it, Ext::c(0), Ext::ka(0x110).ceil_div(128), "tile counter: starts at 0 and the loop exits at it >= nkv - 1 with nkv = ceil(kv_len / 128), so the body only runs with it <= nkv - 2; the guard is a compare against a derived value the interval engine cannot relate to ceil(SK/128)");
     // the loop runs the full tiles 0 .. nkv-2; the last tile (possibly partial) is peeled after it
     let nkv_m1h = b.add_i32(cx.nkv, cm1);
     let go = b.cmp_lt_i32(it, nkv_m1h);
@@ -9856,14 +9860,21 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let kb = b.add_i32(ka, wl256);
         b.load_global_lds(kdp_ptr, kb, 0, 1);
     };
+    // LDS tile protocol (fmha_vs_tiles): (slot, version) of the tile the next stage / QK / PV belongs to, set by the loop code
+    let stage_tag: std::cell::Cell<(Opnd, Opnd)> = std::cell::Cell::new((Opnd::I32(0), Opnd::I32(0)));
+    let qk_tag: std::cell::Cell<(Opnd, Opnd)> = std::cell::Cell::new((Opnd::I32(0), Opnd::I32(0)));
+    let pv_tag: std::cell::Cell<(Opnd, Opnd)> = std::cell::Cell::new((Opnd::I32(0), Opnd::I32(0)));
     // stage a tile into ring slot `slot_off` (K scales of role A at `kd_slot`) and wait for it
     let stage_start = |b: &mut FnBuilder, key0: ValueId, slot_off: ValueId| -> Option<ValueId> {
         if no_stage {
             return None;
         }
+        let (tslot, tver) = stage_tag.get();
         let kd = if role_a && !kdglob {
             if kddma {
+                b.tile_produce("KD", tslot, tver);
                 kd_dma(b, key0, slot_off);
+                b.tile_end();
                 None
             } else {
                 Some(kd_row_load(b, key0))
@@ -9871,7 +9882,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         } else {
             None
         };
+        b.tile_produce(if role_a { "K" } else { "V" }, tslot, tver);
         dma_issue(b, key0, slot_off);
+        b.tile_end();
         kd
     };
     let stage_end = |b: &mut FnBuilder, kd: Option<ValueId>, kd_slot: ValueId| {
@@ -9924,7 +9937,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let ones_w0 = b.c_i32(0x38383838);
     let ones_wr = b.shl_i32(tid_q, c2);
     let ones_wa = b.add_i32(ones_base, ones_wr);
+    b.tile_produce("ones", Opnd::I32(0), Opnd::I32(0));
     b.store_lds_b32(Opnd::Val(ones_wa), Opnd::Val(ones_w0));
+    b.tile_end();
     let wq2048 = b.c_i32(2048);
     let wq_off = b.mul_i32(wid, wq2048);
     // conflict-free layout: the first 16 B of every lane contiguous (lane*16), the second 16 B in the next KB (1024 + lane*16)
@@ -9943,15 +9958,19 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let q0_addr1 = b.add_i32(q0_addr0, c1024q);
         let g0 = b.frag4(cx.bq0_words[0], cx.bq0_words[1], cx.bq0_words[2], cx.bq0_words[3]);
         let g1 = b.frag4(cx.bq0_words[4], cx.bq0_words[5], cx.bq0_words[6], cx.bq0_words[7]);
+        b.tile_produce("Q0", Opnd::I32(0), Opnd::I32(0));
         b.store_lds_b128(Opnd::Val(q0_addr0), Opnd::Val(g0));
         b.store_lds_b128(Opnd::Val(q0_addr1), Opnd::Val(g1));
+        b.tile_end();
     }
     {
         let q_addr1 = b.add_i32(q_addr0, c1024q);
         let f0 = b.frag4(cx.bq1_words[0], cx.bq1_words[1], cx.bq1_words[2], cx.bq1_words[3]);
         let f1 = b.frag4(cx.bq1_words[4], cx.bq1_words[5], cx.bq1_words[6], cx.bq1_words[7]);
+        b.tile_produce("Q1", Opnd::I32(0), Opnd::I32(0));
         b.store_lds_b128(Opnd::Val(q_addr0), Opnd::Val(f0));
         b.store_lds_b128(Opnd::Val(q_addr1), Opnd::Val(f1));
+        b.tile_end();
     }
     let ones_addr0 = b.mul_i32(lane_q, c16l);
     let ones_addr = b.add_i32(ones_base, ones_addr0);
@@ -10030,8 +10049,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a1 = b.add_i32(cx.kfx[1], ko);
             let a2 = b.add_i32(cx.kfx[2], ko);
             let a3 = b.add_i32(cx.kfx[3], ko);
+            b.tile_consume("K", Opnd::I32(0), Opnd::I32(0));
             let k8_0 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)) };
             let k8_1 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)) };
+            b.tile_end();
             let kd = if let Some(v) = &kd0g {
                 v[s]
             } else if let Some(f) = kdf0 {
@@ -10040,7 +10061,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             } else {
                 let koff = b.c_i32(128 * s as i32);
                 let ka = b.add_i32(kd_cur, koff);
-                b.load_lds_b32(Opnd::Val(ka))
+                b.tile_consume("KD", Opnd::I32(0), Opnd::I32(0));
+                let kdv_ = b.load_lds_b32(Opnd::Val(ka));
+                b.tile_end();
+                kdv_
             };
             let sk0 = b.let_(Op::LshrI32(Opnd::Val(kd), Opnd::Val(cx.g8)));
             let sh16 = b.add_i32(cx.g8, c16i);
@@ -10105,6 +10129,8 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     }
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
+    // host contract: the tile counter runs 0 .. ceil(kv_len / 128) (the loop breaks at it >= nkv - 1; the inductive step it + 1 <= nkv is TRUSTED, listed in the report)
+    b.assume_trusted(it, Ext::c(0), Ext::ka(0x110).ceil_div(128), "tile counter: starts at 0 and the loop exits at it >= nkv - 1 with nkv = ceil(kv_len / 128), so the body only runs with it <= nkv - 2; the guard is a compare against a derived value the interval engine cannot relate to ceil(SK/128)");
     let nkv_m1h = b.add_i32(cx.nkv, cm1);
     let go = b.cmp_lt_i32(it, nkv_m1h);
     let stop_h = b.let_(Op::NotI1(Opnd::Val(go)));
@@ -10125,7 +10151,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let one_f = if cn >= 5 { b.bitcast_f32(Opnd::Var(vars[cbase + 4])) } else { one_f };
     let c_thr = if cn >= 6 { b.bitcast_f32(Opnd::Var(vars[cbase + 5])) } else { c_thr };
     // 2-slot ring: tile t in slot t & 1, tile t+1 in the other one
-    let ring = |b: &mut FnBuilder| -> (ValueId, ValueId, ValueId, ValueId, ValueId, ValueId, ValueId) {
+    let ring = |b: &mut FnBuilder| -> (ValueId, ValueId, ValueId, ValueId, ValueId, ValueId, ValueId, ValueId) {
         let i1 = b.xor_i32(idx, c1);
         let slot_cur = b.mul_i32(idx, cbuf);
         let slot_nxt = b.mul_i32(i1, cbuf);
@@ -10136,7 +10162,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let nkv_m1b = b.add_i32(cx.nkv, cm1);
         let nn = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(has_n), a: Opnd::Val(it_p1), b: Opnd::Val(nkv_m1b) });
         let key_n = b.shl_i32(nn, c7d);
-        (i1, slot_cur, slot_nxt, slot_nxt, kds_nxt, key_n, kds_cur)
+        (i1, slot_cur, slot_nxt, slot_nxt, kds_nxt, key_n, kds_cur, it_p1)
     };    // QK of the whole tile (4 x 32 keys) in ring slot `slot`: S' = bias + scaled K.Q^T, in place
     let qk = |b: &mut FnBuilder, slot: ValueId, kdslot: ValueId, kdv: Option<&[ValueId]>, bias_v: ValueId| {
         if no_qk {
@@ -10190,8 +10216,11 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             let a1 = b.add_i32(kfb[1], ko);
             let a2 = b.add_i32(kfb[2], ko);
             let a3 = b.add_i32(kfb[3], ko);
+            let (qs_slot, qs_ver) = qk_tag.get();
+            b.tile_consume("K", qs_slot, qs_ver);
             let k8_0 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a0), Opnd::Val(a1)) };
             let k8_1 = if ablate.contains("nokread") { let cz = b.c_i32(0x38383838); let f4 = b.frag4(cz, cz, cz, cz); b.cat_frag8(f4, f4) } else { b.load_lds_b128x2(Opnd::Val(a2), Opnd::Val(a3)) };
+            b.tile_end();
             let kd = if let Some(v) = kdv {
                 v[s]
             } else if ablate.contains("kdc") {
@@ -10199,7 +10228,10 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             } else if kd_pre.is_empty() {
                 let koff = b.c_i32(128 * s as i32);
                 let ka = b.add_i32(kd_rd, koff);
-                b.load_lds_b32(Opnd::Val(ka))
+                b.tile_consume("KD", qs_slot, qs_ver);
+                let kdv_ = b.load_lds_b32(Opnd::Val(ka));
+                b.tile_end();
+                kdv_
             } else {
                 kd_pre[s]
             };
@@ -10541,7 +10573,11 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 let f4 = b.frag4(cz, cz, cz, cz);
                 b.cat_frag8(f4, f4)
             } else {
-                b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3])
+                let (pv_slot, pv_ver) = pv_tag.get();
+                b.tile_consume("V", pv_slot, pv_ver);
+                let vv = b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]);
+                b.tile_end();
+                vv
             }
         };
         if fmha_t_opt("pvpipe") {
@@ -10592,7 +10628,11 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
             }
         }
     };    let iter = |b: &mut FnBuilder, masked: bool, stage: bool, last_barrier: bool| {
-        let (_i1, slot_cur, slot_nxt, slot_n2, kds_nxt, key_n2, _kds_cur) = ring(b);
+        let (tag_i1, slot_cur, slot_nxt, slot_n2, kds_nxt, key_n2, _kds_cur, tag_it_p1) = ring(b);
+        // tile t = this iteration (slot idx, version it); the next tile is staged in slot i1 with version it + 1 and read (K) in this iteration's M phase
+        stage_tag.set((Opnd::Val(tag_i1), Opnd::Val(tag_it_p1)));
+        qk_tag.set((Opnd::Val(tag_i1), Opnd::Val(tag_it_p1)));
+        pv_tag.set((Opnd::Var(idx), Opnd::Var(it)));
         // V phase (the DMA of tile t+2 runs under it, waited for at its end); M phase: PV(this tile) + QK(next tile)
         let skd = if stage && !(dsplit && role_a) { stage_start(b, key_n2, slot_n2) } else { None };
         if fmha_t_opt("vpre") && smfrs && !fmha_t_opt("pvpipe") && !fmha_t_opt("convlate") {
@@ -10747,7 +10787,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         }
     };
     iter(b, false, true, true);
-    let (i1_l, _a, _b, _c, _d, _e, _f) = ring(b);
+    let (i1_l, _a, _b, _c, _d, _e, _f, _g) = ring(b);
     b.set_var(idx, i1_l);
     let it_next = b.add_i32(it, c1);
     b.set_var(it, it_next);
@@ -11664,6 +11704,8 @@ fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     }
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
+    // host contract: the tile counter runs 0 .. ceil(kv_len / 128) (the loop breaks at it >= nkv - 1; the inductive step it + 1 <= nkv is TRUSTED, listed in the report)
+    b.assume_trusted(it, Ext::c(0), Ext::ka(0x110).ceil_div(128), "tile counter: starts at 0 and the loop exits at it >= nkv - 1 with nkv = ceil(kv_len / 128), so the body only runs with it <= nkv - 2; the guard is a compare against a derived value the interval engine cannot relate to ceil(SK/128)");
     let nkv_m1h = b.add_i32(cx.nkv, cm1);
     let go = b.cmp_lt_i32(it, nkv_m1h);
     let stop_h = b.let_(Op::NotI1(Opnd::Val(go)));
@@ -16407,6 +16449,8 @@ fn emit_fmha_t128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     ];
     let vars = b.begin_loop(&init_vars);
     let it = vars[0];
+    // host contract: the tile counter runs 0 .. ceil(kv_len / 128) (the loop breaks at it >= nkv - 1; the inductive step it + 1 <= nkv is TRUSTED, listed in the report)
+    b.assume_trusted(it, Ext::c(0), Ext::ka(0x110).ceil_div(128), "tile counter: starts at 0 and the loop exits at it >= nkv - 1 with nkv = ceil(kv_len / 128), so the body only runs with it <= nkv - 2; the guard is a compare against a derived value the interval engine cannot relate to ceil(SK/128)");
     let nkv_m1h = b.add_i32(cx.nkv, cm1);
     let go = b.cmp_lt_i32(it, nkv_m1h);
     let stop_h = b.let_(Op::NotI1(Opnd::Val(go)));
@@ -19483,6 +19527,7 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine() -> Function {
     b.arg("rows_total", DType::I32, 0x18, 4);
     b.arg("d", DType::I32, 0x1C, 4);
     b.arg("splits", DType::I32, 0x20, 4);
+    combine_contract(&mut b);
     let ohat = b.let_(Op::KernargPtr { offset: 0x00 });
     let lse = b.let_(Op::KernargPtr { offset: 0x08 });
     let out = b.let_(Op::KernargPtr { offset: 0x10 });
@@ -19503,12 +19548,16 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine() -> Function {
     // threads past the end recompute (and re-store) the last element: same value, same address
     let idx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(idx_raw), b: Opnd::Val(last) });
     let row = b.let_(Op::LshrI32(Opnd::Val(idx), Opnd::Val(c7)));
+    // the clamped thread index is <= rows * (elements per row / elements per thread) - 1, so row <= rows - 1 (the interval engine keeps the rational upper bound of a shift)
+    b.assume_trusted(row, Ext::c(0), Ext::ka(0x18) - Ext::c(1), "row = clamped thread index >> k <= rows - 1: the engine keeps the rational upper bound of a shift");
     let neg_big = b.c_f32(-1.0e30);
     let neg_big_i = b.bitcast_i32(neg_big);
     let zero_f = b.c_f32(0.0);
     let zero_i = b.bitcast_i32(zero_f);
     let inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(neg_big_i)), (DType::I32, Opnd::Val(zero_i)), (DType::I32, Opnd::Val(zero_i))];
     let vars = b.begin_loop(&inits);
+    // host contract: the split counter runs 0 .. splits - 1 inside the body (the loop exits at splits; the step s + 1 <= splits is TRUSTED)
+    b.assume_trusted(vars[0], Ext::c(0), Ext::ka(0x20) - Ext::c(1), "split counter: starts at 0 and the loop exits when s + 1 >= splits (sched_end_loop), so the body only runs with s <= splits - 1");
     let rs = b.mul_i32(vars[0], rows);
     let lrow = b.add_i32(rs, row);
     let lse_off = b.shl_i32(lrow, c2);
@@ -19566,6 +19615,7 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4() -> Function {
     b.arg("rows_total", DType::I32, 0x18, 4);
     b.arg("d", DType::I32, 0x1C, 4);
     b.arg("splits", DType::I32, 0x20, 4);
+    combine_contract(&mut b);
     let ohat = b.let_(Op::KernargPtr { offset: 0x00 });
     let lse = b.let_(Op::KernargPtr { offset: 0x08 });
     let out = b.let_(Op::KernargPtr { offset: 0x10 });
@@ -19588,6 +19638,8 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4() -> Function {
     let ok = b.cmp_lt_i32(t_raw, total4);
     let t4 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(t_raw), b: Opnd::Val(last) });
     let row = b.let_(Op::LshrI32(Opnd::Val(t4), Opnd::Val(c5)));
+    // the clamped thread index is <= rows * (elements per row / elements per thread) - 1, so row <= rows - 1 (the interval engine keeps the rational upper bound of a shift)
+    b.assume_trusted(row, Ext::c(0), Ext::ka(0x18) - Ext::c(1), "row = clamped thread index >> k <= rows - 1: the engine keeps the rational upper bound of a shift");
     let neg_big = b.c_f32(-1.0e30);
     let neg_big_i = b.bitcast_i32(neg_big);
     let zero_f = b.c_f32(0.0);
@@ -19602,6 +19654,8 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4() -> Function {
         (DType::I32, Opnd::Val(zero_i)),
     ];
     let vars = b.begin_loop(&inits);
+    // host contract: the split counter runs 0 .. splits - 1 inside the body (the loop exits at splits; the step s + 1 <= splits is TRUSTED)
+    b.assume_trusted(vars[0], Ext::c(0), Ext::ka(0x20) - Ext::c(1), "split counter: starts at 0 and the loop exits when s + 1 >= splits (sched_end_loop), so the body only runs with s <= splits - 1");
     let rs = b.mul_i32(vars[0], rows);
     let lrow = b.add_i32(rs, row);
     let lse_off = b.shl_i32(lrow, c2);
@@ -19666,6 +19720,7 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4h() -> Function {
     b.arg("rows_total", DType::I32, 0x18, 4);
     b.arg("d", DType::I32, 0x1C, 4);
     b.arg("splits", DType::I32, 0x20, 4);
+    combine_contract(&mut b);
     let ohat = b.let_(Op::KernargPtr { offset: 0x00 });
     let lse = b.let_(Op::KernargPtr { offset: 0x08 });
     let out = b.let_(Op::KernargPtr { offset: 0x10 });
@@ -19687,6 +19742,8 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4h() -> Function {
     let ok = b.cmp_lt_i32(t_raw, total4);
     let t4 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(t_raw), b: Opnd::Val(last) });
     let row = b.let_(Op::LshrI32(Opnd::Val(t4), Opnd::Val(c5)));
+    // the clamped thread index is <= rows * (elements per row / elements per thread) - 1, so row <= rows - 1 (the interval engine keeps the rational upper bound of a shift)
+    b.assume_trusted(row, Ext::c(0), Ext::ka(0x18) - Ext::c(1), "row = clamped thread index >> k <= rows - 1: the engine keeps the rational upper bound of a shift");
     let neg_big = b.c_f32(-1.0e30);
     let neg_big_i = b.bitcast_i32(neg_big);
     let zero_f = b.c_f32(0.0);
@@ -19701,6 +19758,8 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4h() -> Function {
         (DType::I32, Opnd::Val(zero_i)),
     ];
     let vars = b.begin_loop(&inits);
+    // host contract: the split counter runs 0 .. splits - 1 inside the body (the loop exits at splits; the step s + 1 <= splits is TRUSTED)
+    b.assume_trusted(vars[0], Ext::c(0), Ext::ka(0x20) - Ext::c(1), "split counter: starts at 0 and the loop exits when s + 1 >= splits (sched_end_loop), so the body only runs with s <= splits - 1");
     let rs = b.mul_i32(vars[0], rows);
     let lrow = b.add_i32(rs, row);
     let lse_off = b.shl_i32(lrow, c2);
@@ -20530,6 +20589,7 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine8h() -> Function {
     let mut b = FnBuilder::new("fmha_fwd_hd128_mxfp8_kvsplit_combine8h", 256);
     b.arg("ptr_ohat", DType::Ptr, 0x00, 8); b.arg("ptr_lse", DType::Ptr, 0x08, 8); b.arg("ptr_out", DType::Ptr, 0x10, 8);
     b.arg("rows_total", DType::I32, 0x18, 4); b.arg("d", DType::I32, 0x1C, 4); b.arg("splits", DType::I32, 0x20, 4);
+    combine_contract(&mut b);
     let ohat = b.let_(Op::KernargPtr { offset: 0x00 });
     let lse = b.let_(Op::KernargPtr { offset: 0x08 });
     let out = b.let_(Op::KernargPtr { offset: 0x10 });
@@ -20545,11 +20605,15 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine8h() -> Function {
     let ok = b.cmp_lt_i32(t_raw, total8);
     let t8 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(t_raw), b: Opnd::Val(last) });
     let row = b.let_(Op::LshrI32(Opnd::Val(t8), Opnd::Val(c4)));
+    // t8 <= rows * 16 - 1 (clamped), so row = t8 >> 4 <= rows - 1 (the interval engine keeps the rational upper bound of a shift)
+    b.assume_trusted(row, Ext::c(0), Ext::ka(0x18) - Ext::c(1), "row = clamped thread index >> k <= rows - 1: the engine keeps the rational upper bound of a shift");
     let neg_big = b.c_f32(-1.0e30); let neg_big_i = b.bitcast_i32(neg_big);
     let zero_f = b.c_f32(0.0); let zero_i = b.bitcast_i32(zero_f);
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(neg_big_i))];
     for _ in 0..9 { inits.push((DType::I32, Opnd::Val(zero_i))); }
     let vars = b.begin_loop(&inits);
+    // host contract: the split counter runs 0 .. splits - 1 inside the body (the loop exits at splits; the step s + 1 <= splits is TRUSTED)
+    b.assume_trusted(vars[0], Ext::c(0), Ext::ka(0x20) - Ext::c(1), "split counter: starts at 0 and the loop exits when s + 1 >= splits (sched_end_loop), so the body only runs with s <= splits - 1");
     let rs = b.mul_i32(vars[0], rows);
     let lrow = b.add_i32(rs, row);
     let lse_off = b.shl_i32(lrow, c2);
@@ -20608,6 +20672,7 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine16h() -> Function {
     let mut b = FnBuilder::new("fmha_fwd_hd128_mxfp8_kvsplit_combine16h", 256);
     b.arg("ptr_ohat", DType::Ptr, 0x00, 8); b.arg("ptr_lse", DType::Ptr, 0x08, 8); b.arg("ptr_out", DType::Ptr, 0x10, 8);
     b.arg("rows_total", DType::I32, 0x18, 4); b.arg("d", DType::I32, 0x1C, 4); b.arg("splits", DType::I32, 0x20, 4);
+    combine_contract(&mut b);
     let ohat = b.let_(Op::KernargPtr { offset: 0x00 });
     let lse = b.let_(Op::KernargPtr { offset: 0x08 });
     let out = b.let_(Op::KernargPtr { offset: 0x10 });
@@ -20624,11 +20689,15 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine16h() -> Function {
     let ok = b.cmp_lt_i32(t_raw, total8);
     let t8 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(t_raw), b: Opnd::Val(last) });
     let row = b.let_(Op::LshrI32(Opnd::Val(t8), Opnd::Val(c3)));
+    // the clamped thread index is <= rows * (elements per row / elements per thread) - 1, so row <= rows - 1 (the interval engine keeps the rational upper bound of a shift)
+    b.assume_trusted(row, Ext::c(0), Ext::ka(0x18) - Ext::c(1), "row = clamped thread index >> k <= rows - 1: the engine keeps the rational upper bound of a shift");
     let neg_big = b.c_f32(-1.0e30); let neg_big_i = b.bitcast_i32(neg_big);
     let zero_f = b.c_f32(0.0); let zero_i = b.bitcast_i32(zero_f);
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(neg_big_i))];
     for _ in 0..17 { inits.push((DType::I32, Opnd::Val(zero_i))); }
     let vars = b.begin_loop(&inits);
+    // host contract: the split counter runs 0 .. splits - 1 inside the body (the loop exits at splits; the step s + 1 <= splits is TRUSTED)
+    b.assume_trusted(vars[0], Ext::c(0), Ext::ka(0x20) - Ext::c(1), "split counter: starts at 0 and the loop exits when s + 1 >= splits (sched_end_loop), so the body only runs with s <= splits - 1");
     let rs = b.mul_i32(vars[0], rows);
     let lrow = b.add_i32(rs, row);
     let lse_off = b.shl_i32(lrow, c2);
@@ -20712,6 +20781,101 @@ pub fn fmha_fwd_hd128_mxfp8_sv() -> Function {
     fmha_t_build("fmha_fwd_hd128_mxfp8_sv", false, true)
 }
 
+/// GPU-semantics host contract of the 656-byte FMHA kernarg ABI (docs/gpu-semantics-verifier.md): exactly the allocations `tests/gpu/ref_host.cpp` passes.
+/// Annotation only: it emits no code. B (batch) = `grid_z` for the single-kernel paths; the KV-split kernel launches `grid_z = B * splits`.
+///   Q  (0x010): B * S*H*D bytes                = grid_z * ka(0x0A0)            K, V (0x020, 0x030): B * SK*HK*D = grid_z * ka(0x0E0) / ka(0x170)
+///   O  (0x000): B * S*H*D*2 bytes (bf16)       = grid_z * ka(0x1A0)
+///   Q scale (0x200): B * S*H*4 logical + 512*H*4 zeroed slack;  K scale (0x210): B * SK*HK*4 logical + 640*H*4 zeroed slack;  V scale (0x220): 4096 bytes
+///   KV-split: Ohat (0x270) = splits * rows_total * 128 * 4 (fp32-sized allocation), lse (0x278) = splits * rows_total * 4
+/// LDS tile protocol of the vendor-structure kernels (`_vs128`, `_kvsplit`, `_vs5`; docs/gpu-semantics-verifier.md 3.1). Layout (bytes): 2-slot ring, slot k = [32768 k, +32768) with the K tile in its first 16 KB
+/// and the V tile in its second 16 KB; K-scale ring [65536 + 512 k, +512); ones block 67584 (2 KB); Q b1 staging 69632 (16 KB); Q b0 staging 86016 (16 KB). Tile t lives in slot t & 1 with version t:
+/// group A stages K(t+1) and its scales at the start of the V phase of tile t, group B stages V(t+1); both wait for their DMA (`wait_vm(0)`) at the end of the V phase and the barrier that follows
+/// publishes them; the M phase of tile t reads V(t) and K(t+1); the second barrier of the iteration keeps the next DMA (which reuses the slot of tile t) behind the last read of tile t.
+fn fmha_vs_tiles(b: &mut FnBuilder) {
+    b.lds_ring("K", 0, 32768, 2);
+    b.lds_ring("V", 16384, 32768, 2);
+    b.lds_ring("KD", 65536, 512, 2);
+    b.lds_tile("ones", 67584, 2048);
+    b.lds_tile("Q1", 69632, 16384);
+    b.lds_tile("Q0", 86016, 16384);
+    // the K and V rings share the 2 x 32 KB window (disjoint halves of every slot) and the V ring's declared extent also covers the small regions behind it
+    b.lds_alias("K", "V");
+    b.lds_alias("V", "KD");
+    b.lds_alias("V", "ones");
+    b.lds_alias("V", "Q1");
+}
+
+fn fmha_abi_contract(b: &mut FnBuilder, is_kvs: bool, rows_per_block: i64) {
+    // host contract on the scalars the proofs need (the shapes are positive; the vendor ABI carries D = 128 in every stride)
+    for off in [0x060u32, 0x110] {
+        b.ka_range(off, 1, i64::MAX);
+    }
+    // Shape relations of the vendor ABI (BSHD tensors, head dim 128; the strides are BYTES) - every line is what tests/gpu/ref_host.cpp (and the aiter caller) passes:
+    //   Q seq stride 0x70 = H*128, head stride 0x90 = 128, batch stride 0xA0 = S*(H*128);   K seq stride 0xC0 = HK*128, head stride 0xD0 = 128, batch stride 0xE0 = SK*(HK*128)
+    //   V strides 0x150/0x160/0x170 = the K strides;   O seq stride 0x180 = H*256, head stride 0x190 = 256, batch stride 0x1A0 = S*(H*256)
+    //   Q descale: batch 0x230 = S*H*4, head 0x240 = 4;   K descale: batch 0x250 = SK*HK*4, head 0x260 = 4
+    //   GQA: H = HK * gqa with gqa a power of two <= 16 (the kernels use kv_head = head >> log2(gqa));   launch grid y = H, grid x = ceil(S / rows_per_block)
+    let hk = Ext::sym("HK");
+    b.ka_range(0x0B0, 1, 16);
+    b.ka_is(0x140, hk.clone() * Ext::ka(0x0B0));
+    b.grid_is(1, Ext::ka(0x140));
+    b.grid_is(0, Ext::ka(0x060).ceil_div(rows_per_block));
+    b.ka_range(0x090, 128, 128);
+    b.ka_range(0x0D0, 128, 128);
+    b.ka_range(0x160, 128, 128);
+    b.ka_range(0x190, 256, 256);
+    b.ka_range(0x240, 4, 4);
+    b.ka_range(0x260, 4, 4);
+    b.ka_is(0x070, Ext::ka(0x140) * Ext::c(128));
+    b.ka_is(0x0A0, Ext::ka(0x060) * Ext::ka(0x070));
+    b.ka_is(0x0C0, hk.clone() * Ext::c(128));
+    b.ka_is(0x0E0, Ext::ka(0x110) * Ext::ka(0x0C0));
+    b.ka_is(0x150, Ext::ka(0x0C0));
+    b.ka_is(0x170, Ext::ka(0x0E0));
+    b.ka_is(0x180, Ext::ka(0x140) * Ext::c(256));
+    b.ka_is(0x1A0, Ext::ka(0x060) * Ext::ka(0x180));
+    b.ka_is(0x230, Ext::ka(0x060) * Ext::ka(0x140) * Ext::c(4));
+    b.ka_is(0x250, Ext::ka(0x110) * hk * Ext::c(4));
+    let h = Ext::ka(0x140);
+    // batch count: the grid z axis for the single-kernel paths, grid z / splits for the KV-split launch (grid z = B * splits + split)
+    let batch = if is_kvs {
+        b.ka_range(0x280, 1, i64::MAX);
+        b.ka_range(0x284, 1, i64::MAX);
+        let bsym = Ext::sym("B");
+        b.grid_is(2, bsym.clone() * Ext::ka(0x280));
+        // rows_total = B * S * H (the per-split stride of the partial buffers; ref_host: `rows_total = B*S*H`)
+        b.ka_is(0x284, bsym.clone() * Ext::ka(0x060) * Ext::ka(0x140));
+        let splits = Ext::ka(0x280);
+        let rows_total = Ext::ka(0x284);
+        b.arg_tensor("ptr_ohat", splits.clone() * rows_total.clone() * Ext::c(128 * 4));
+        b.arg_tensor("ptr_lse", splits * rows_total * Ext::c(4));
+        bsym
+    } else {
+        Ext::grid_z()
+    };
+    b.arg_tensor("ptr_q", batch.clone() * Ext::ka(0x0A0));
+    b.arg_tensor("ptr_k", batch.clone() * Ext::ka(0x0E0));
+    b.arg_tensor("ptr_v", batch.clone() * Ext::ka(0x170));
+    b.arg_tensor("ptr_o", batch.clone() * Ext::ka(0x1A0));
+    let qs = batch.clone() * Ext::ka(0x230);
+    b.arg_tensor_slack("ptr_q_descale", qs.clone(), qs + Ext::c(512 * 4) * h.clone());
+    let ks = batch * Ext::ka(0x250);
+    b.arg_tensor_slack("ptr_k_descale", ks.clone(), ks + Ext::c(640 * 4) * h);
+    b.arg_tensor("ptr_v_descale", Ext::c(4096));
+}
+
+/// Host contract of the five `fmha_fwd_hd128_mxfp8_kvsplit_combine*` kernels (kernarg: ohat@0, lse@8, out@0x10, rows_total@0x18, d@0x1C, splits@0x20):
+/// Ohat = splits * rows_total * 128 * 4 (the host allocation is fp32-sized so fp16 and fp32 partials fit), lse = splits * rows_total * 4, out = rows_total * 128 * 2 (bf16).
+fn combine_contract(b: &mut FnBuilder) {
+    b.ka_range(0x18, 1, i64::MAX);
+    b.ka_range(0x1C, 128, 128);
+    b.ka_range(0x20, 1, i64::MAX);
+    let rows = Ext::ka(0x18);
+    let splits = Ext::ka(0x20);
+    b.arg_tensor("ptr_ohat", splits.clone() * rows.clone() * Ext::c(128 * 4));
+    b.arg_tensor("ptr_lse", splits * rows.clone() * Ext::c(4));
+    b.arg_tensor("ptr_out", rows * Ext::c(128 * 2));
+}
 fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let mut b = FnBuilder::new(name, if name.ends_with("_t128") { 256 } else { 512 });
     let nbuf = if VS_MODE.load(std::sync::atomic::Ordering::SeqCst) { if (name.ends_with("_vs128") || name.ends_with("_vs5") || name.ends_with("_vs6") || name.ends_with("_vs9")) || name.ends_with("_kvsplit") { 2 } else { 3 } } else if fmha_t_opt("dbuf") { 2 } else { 1 };
@@ -20768,6 +20932,10 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     } else {
         b.arg("abi_tail", DType::I32, 0x280, 16);
     }
+    fmha_abi_contract(&mut b, is_kvs, if name.ends_with("_t128") { 128 } else { 256 });
+    if name.ends_with("_vs128") || name.ends_with("_kvsplit") || name.ends_with("_vs5") {
+        fmha_vs_tiles(&mut b);
+    }
 
     let ptr_o = b.let_(Op::KernargPtr { offset: 0x000 });
     let ptr_q = b.let_(Op::KernargPtr { offset: 0x010 });
@@ -20814,6 +20982,9 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         let one_l = b.shl_i32(ck1, lg);
         let msk = b.add_i32(one_l, cn1);
         let sp = b.let_(Op::AndI32(Opnd::Val(zz), Opnd::Val(msk)));
+        // host contract: grid z = B * splits with splits a power of two in {2, 4, 8}: bi = z >> log2(splits) in [0, B-1], sp = z & (splits-1) in [0, splits-1]
+        b.assume_trusted(bi, Ext::c(0), Ext::sym("B") - Ext::c(1), "batch = grid_z >> log2(splits) with grid_z = B * splits (grid_is): variable shift, no interval rule");
+        b.assume_trusted(sp, Ext::c(0), Ext::ka(0x280) - Ext::c(1), "split index = grid_z & (splits - 1), splits a power of two: and with a variable mask");
         (bi, Some(sp), Some(lg))
     } else {
         (zz, None, None)
@@ -20936,6 +21107,8 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let s3 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gq8), a: Opnd::Val(c3), b: Opnd::Val(s2) });
     let gshift = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gq16), a: Opnd::Val(c4), b: Opnd::Val(s3) });
     let kvh = if ablate_pre.contains("nogqa") { hidx } else { b.let_(Op::LshrI32(Opnd::Val(hidx), Opnd::Val(gshift))) };
+    // contract (derivation under the host relations H = HK * gqa, gqa a power of two <= 16, head < H): kv_head = head >> log2(gqa) is in [0, HK - 1]; the interval engine has no rule for a variable shift
+    b.assume_trusted(kvh, Ext::c(0), Ext::sym("HK") - Ext::c(1), "kv head = head >> log2(gqa) with head < H = HK * gqa (gqa a power of two <= 16): variable shift, no interval rule");
     let kb0 = b.mul_i32(bidx, k_bs);
     let kb1 = b.mul_i32(kvh, k_hs);
     let kbase_off = b.add_i32(kb0, kb1);
@@ -20957,16 +21130,25 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
         let spl_m1 = b.add_i32(one_l, cn1);
         let tps_r = b.add_i32(ntiles, spl_m1);
         let tps = b.let_(Op::LshrI32(Opnd::Val(tps_r), Opnd::Val(lg)));
+        // host contract of the KV-split launch (the host guard "every split is non-empty": splits <= ceil(SK / 128)): tiles-per-split tps = ceil(ntiles / splits) in [1, ceil(SK/128)],
+        // this split's first tile in [0, ceil(SK/128) - 1] (its key row key_lo = 128 * tile_lo <= SK - 1) and the split length kv_eff in [1, SK]; the shifts by a variable log2(splits) have no interval rule
+        b.assume_trusted(tps, Ext::c(1), Ext::ka(0x110).ceil_div(128), "tiles per split = ceil(ntiles / splits) in [1, ntiles] (host guard: splits <= ntiles); variable shift by log2(splits)");
         let tile_lo = b.mul_i32(sp, tps);
+        b.assume_trusted(tile_lo, Ext::c(0), Ext::ka(0x110).ceil_div(128) - Ext::c(1), "first tile of this split = split * tps <= ntiles - 1 (host guard: every split is non-empty, (splits - 1) * tps < ntiles)");
         let tile_hi_r = b.add_i32(tile_lo, tps);
         let hi_gt = b.cmp_lt_i32(ntiles, tile_hi_r);
         let tile_hi = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(hi_gt), a: Opnd::Val(ntiles), b: Opnd::Val(tile_hi_r) });
         let key_lo = b.shl_i32(tile_lo, c7k);
+        // KL names this split's first key row (a free symbol with range [0, +inf)): the analysis cannot correlate key_lo with the split length (kv_eff = key_hi - key_lo, key_hi <= SK), so the
+        // correlation is stated through the shared symbol: key_lo = KL and kv_eff <= SK - KL (arithmetic fact of the code below, listed as TRUSTED in the report)
+        b.sym_range("KL", 0, i64::MAX);
+        b.assume_trusted(key_lo, Ext::sym("KL"), Ext::sym("KL"), "KL is only a NAME for key_lo = tile_lo << 7 (free symbol >= 0) so the next assume can state the correlation with the split length");
         let key_hi_t = b.shl_i32(tile_hi, c7k);
         let hi_lt = b.cmp_lt_i32(key_hi_t, kv_len);
         let key_hi = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(hi_lt), a: Opnd::Val(key_hi_t), b: Opnd::Val(kv_len) });
         let key_lo_n = b.mul_i32(key_lo, cn1);
         let kv_eff = b.add_i32(key_hi, key_lo_n);
+        b.assume_trusted(kv_eff, Ext::c(1), Ext::ka(0x110) - Ext::sym("KL"), "split length kv_eff = key_hi - key_lo with key_hi = min(tile_hi << 7, SK) <= SK (correlation lost by the interval engine) and >= 1 by the host guard");
         let ko = b.mul_i32(key_lo, k_seqs);
         let vo = b.mul_i32(key_lo, v_seqs);
         let kdo = b.mul_i32(key_lo, kd_stride);
@@ -21067,6 +21249,9 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     let c127p = b.c_i32(127);
     let kv_len_r = b.add_i32(kv_len, c127p);
     let nkv = b.let_(Op::LshrI32(Opnd::Val(kv_len_r), Opnd::Val(c7)));
+    // contract: nkv = (kv_len + 127) >> 7 is in [1, ceil(SK / 128)] (SK >= 1; for the KV-split launch kv_len is the split length, >= 1 by the host guard splits <= ceil(SK / 128));
+    // the interval engine floors the lower bound of a right shift to 0
+    b.assume_trusted(nkv, Ext::c(1), Ext::ka(0x110).ceil_div(128), "nkv = (kv_len + 127) >> 7 with 1 <= kv_len <= SK (KV-split: kv_len is the split length, >= 1 by the host guard splits <= ceil(SK/128)); the engine floors the lower bound of a shift to 0");
     let cm1k = b.c_i32(-1);
     let kv_last = b.add_i32(kv_len, cm1k);
     let g4 = b.shl_i32(pblk, c2);
