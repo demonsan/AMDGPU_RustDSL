@@ -326,3 +326,42 @@ LDS 是块内 8 个 wave 共享的地址空间，硬件**不做任何边界或�
 `FMHA_OPT=mubuf/mubufd` 的 opt-in MUBUF DMA 变体**目前未认证**——运行检查器会报 `GV-BUF-OVER`（K/V 描述符的 num_records 表达式在未声明形状关系时不能证明 ≤ 分配）
 以及 `mubuf` 变体的大量 `GV-GLB-OOB`/屏障问题。这些变体本就不在出货路径（此前的 A/B 也证明它们无收益），
 要认证需要像默认 kernel 一样补 `ka_is`/extent 合同或修正描述符公式；检查器本身对 `buffer_load … lds` 的覆盖由上述 6 项测试证明。
+### 13.7 gfx1250 的 TDM 与 split barrier：是否有独立建模？
+
+**结论：没有，而且当前 target（gfx950/CDNA4）上不需要——因为它们不在这个 ISA 里。** 实测工具链能力表（`llvm-mc -mcpu=…`，两条路径一致）：
+
+| 指令 | gfx942 (CDNA3) | **gfx950 (CDNA4，我们的 target)** | gfx1200 | gfx1250 |
+|---|---|---|---|---|
+| `s_barrier`（完整块屏障） | ✅ | ✅ | ❌ | ❌ |
+| `s_barrier_signal N` | ❌ | **❌** | ✅ | ✅ |
+| `s_barrier_wait N` | ❌ | **❌** | ✅ | ✅ |
+| `s_barrier_leave` / `s_barrier_init m0` | ❌ | **❌** | ✅ | ✅ |
+| `s_barrier_signal_isfirst N` / `s_get_barrier_state` | ❌ | **❌** | ✅ | ✅ |
+| TDM 指令族 | ❌ | **❌** | ❌ | ✅（MI400） |
+
+也就是说：
+1. **split barrier（named barrier：init/signal/wait/leave/isfirst/get_state）是 gfx12xx / gfx1250 的族**。
+   我们的编译器只有 `MOp::SBarrier` → `s_barrier` 一种屏障（`emit.rs`、`effects.rs` 的 `Fence::Barrier`），
+   协议引擎的"相位 = 动态 `s_barrier` 计数"、"所有 wave 都到达同一个块屏障"也都建立在这唯一的语义上。
+   **所以：gfx950 上不存在需要独立建模的 split barrier**；我们的模型对它是"不可表达"而非"未检查"——
+   `Op::Asm` 的 raw 路径受 safe-asm op 白名单限制，未知助记符写不进来。
+2. **TDM 同样不存在于 gfx950**，crate 图里 TDM 相关 op = 0（见 §13.4）；不存在"能写出来但绕过检查"的路径。
+3. 历史上我们**探查过**这条路：`tools/gen3_sync_probe.sh`（gen3 设计的一次能力探针）Part 1 就是
+   "gfx12 named/split barrier opcodes vs gfx950 (CDNA4)" 的逐指令接受表，Part 2 在硬件上对比了
+   `block s_barrier` vs 软件 4-wave 组屏障（LDS 原子计数 + 自旋）vs 无同步；结论是 CDNA4 只有块屏障，
+   "更细粒度同步"的 gen3 设计最终关闭（软件组屏障也慢且有风险，见 `docs/gen3-design.md`、`kernel-gen2-design.md`）。
+
+**若将来做 gfx1250 后端，需要新增的独立建模（按四轴映射）**：
+
+| 原语 | 到达轴 | 完成轴 | 可见轴 | 代际轴 | 额外义务 |
+|---|---|---|---|---|---|
+| split/named barrier | `s_barrier_signal(token)` 记一次到达（可带计数） | `s_barrier_wait(token)` 才表示"到达完成" | barrier 本身**不**传递内存可见性（仍要 fence/等待，与 LDS 不同） | token 的多实例相位：`(token → signal_count, wait_count, generation)` 取代"全局 barrier 计数" | init/leave 配对；signal 后重复 init；`isfirst` 的"最后一个到达者"语义；计数不匹配（死锁/早发布） |
+| TDM | TDM 完成事件（是否接 vmcnt 需硬件证据） | DMA 完成 + `wait_vm(0)` 才发布 | TDM 写入 LDS/global 的可见性规则 | 与 tile/region 的 version 代数复用 | 描述符 base/size/stride 的"不得高估"检查（复用 `GV-BUF-OVER` 式规则）；OOB 语义（TDM 是否零填充需实测） |
+
+注意 gfx1250 上连 `s_barrier` 都被替换成 init/signal/wait 族，因此**即使只想支持"完整屏障"也要重做屏障表示**；
+另外 gfx1250 的 `s_waitcnt` 拆成独立 `S_WAIT_*`（`docs/llvm-tail-integration.md` §117 已列为待办），
+VALU 重配对（`gcn-create-vopd`）也需要重新确认。所以这不是"补两个 op"，而是一个新的 target 后端 + 协议引擎相位泛化。
+
+**当前文档口径**：gfx950 只建模 `s_barrier` + waitcnt + fence + version 四轴；TDM 与 split barrier 明确列为
+"目标 ISA 不存在 / 不在范围"，且有可执行能力表作为证据（本节）。多生产者/多消费者义务 O1–O4 与信任账本
+与资源种类无关，新增原语时复用。
