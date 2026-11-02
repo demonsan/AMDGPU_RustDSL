@@ -107,22 +107,8 @@ impl FmhaIo {
         let (bidx, kv_len, key_lo, split) = match &self.kvs {
             None => (zz, kv_all, I32::c(0), None),
             Some(kv) => {
-                let sp = ev(kv.splits);
-                let lg = b.bind_i32(sp.lshr(1) - sp.lshr(3));
-                let bi = b.bind_i32(ev(zz).lshr(ev(lg)));
-                let si = b.bind_i32(ev(zz) & ((I32::c(1) << ev(lg)) - 1));
-                b.assume_trusted(bi, Ext::c(0), Ext::sym("B") - Ext::c(1), "batch = grid_z >> log2(splits) with grid_z = B * splits (grid_is): variable shift, no interval rule");
-                b.assume_trusted(si, Ext::c(0), Ext::ka(0x280) - Ext::c(1), "split index = grid_z & (splits - 1), splits a power of two: and with a variable mask");
-                let tps = b.bind_i32((ev(ntiles_total) + ((I32::c(1) << ev(lg)) - 1)).lshr(ev(lg)));
-                b.assume_trusted(tps, Ext::c(1), Ext::ka(0x110).ceil_div(128), "tiles per split = ceil(ntiles / splits) in [1, ntiles] (host guard: splits <= ntiles); variable shift by log2(splits)");
-                let tile_lo = b.bind_i32(ev(si) * ev(tps));
-                b.assume_trusted(tile_lo, Ext::c(0), Ext::ka(0x110).ceil_div(128) - Ext::c(1), "first tile of this split = split * tps <= ntiles - 1 (host guard: every split is non-empty, (splits - 1) * tps < ntiles)");
-                let tile_hi = b.let_i32((ev(tile_lo) + ev(tps)).min(ev(ntiles_total)));
-                let key_lo = b.bind_i32(ev(tile_lo) << 7);
-                b.sym_range("KL", 0, i64::MAX);
-                b.assume_trusted(key_lo, Ext::sym("KL"), Ext::sym("KL"), "KL is only a NAME for key_lo = tile_lo << 7 (free symbol >= 0) so the next assume can state the correlation with the split length");
-                let kv_eff = b.bind_i32((tile_hi << 7).min(ev(kv_all)) - ev(key_lo));
-                b.assume_trusted(kv_eff, Ext::c(1), Ext::ka(0x110) - Ext::sym("KL"), "split length kv_eff = key_hi - key_lo with key_hi = min(tile_hi << 7, SK) <= SK (correlation lost by the interval engine) and >= 1 by the host guard");
+                let (bi, si, lg) = components::kv_split_decode(b, zz, kv.splits, 0x280, "B");
+                let (key_lo, kv_eff) = components::kv_split_range(b, kv_all, si, lg, 0x110);
                 (bi, kv_eff, ev(key_lo), Some(si))
             }
         };
@@ -142,11 +128,7 @@ impl FmhaIo {
         let (sq0, sq1) = sel.pair(b, qd);
         let sq = [b.bind_i32(ev(sq0) - 9), b.bind_i32(ev(sq1) - 9)];
         let vd = b.load_f32(self.ptr_vd, 0);
-        // KV head = head >> log2(gqa)
-        let g = ev(self.gqa);
-        let gshift = b.bind_i32(g.gt(8).select_i32(4, g.gt(4).select_i32(3, g.gt(2).select_i32(2, g.gt(1).select_i32(1, 0)))));
-        let kvh = b.bind_i32(ev(hidx).lshr(ev(gshift)));
-        b.assume_trusted(kvh, Ext::c(0), Ext::sym("HK") - Ext::c(1), "kv head = head >> log2(gqa) with head < H = HK * gqa (gqa a power of two <= 16): variable shift, no interval rule");
+        let kvh = components::gqa_kv_head(b, hidx, self.gqa, "HK");
         let nkv = b.bind_i32((ev(kv_len) + 127).lshr(7));
         b.assume_trusted(nkv, Ext::c(1), Ext::ka(0x110).ceil_div(128), "nkv = (kv_len + 127) >> 7 with 1 <= kv_len <= SK; the engine floors the lower bound of a shift to 0");
         let g4 = b.bind_i32(C32x32F32::half_base(&lane));
