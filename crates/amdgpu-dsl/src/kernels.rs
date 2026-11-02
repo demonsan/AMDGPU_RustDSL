@@ -336,13 +336,17 @@ pub fn probe_lds_oob() -> Function {
     b.barrier();
     b.wait_lds(0);
     let r4096 = b.load_lds_b32(Opnd::Val(a4096));
+    let f_valid = b.bitcast_f32(Opnd::Val(valid));
+    let f_256 = b.bitcast_f32(Opnd::Val(r256));
+    let f_1024 = b.bitcast_f32(Opnd::Val(r1024));
+    let f_4096 = b.bitcast_f32(Opnd::Val(r4096));
     let c16 = b.c_i32(16);
     let row = b.mul_i32(tid, c16);
     let p = b.ptr_add(o, row);
-    b.store_f32(p, 0, Opnd::Val(b.bitcast_f32(Opnd::Val(valid))));
-    b.store_f32(p, 4, Opnd::Val(b.bitcast_f32(Opnd::Val(r256))));
-    b.store_f32(p, 8, Opnd::Val(b.bitcast_f32(Opnd::Val(r1024))));
-    b.store_f32(p, 12, Opnd::Val(b.bitcast_f32(Opnd::Val(r4096))));
+    b.store_f32(p, 0, Opnd::Val(f_valid));
+    b.store_f32(p, 4, Opnd::Val(f_256));
+    b.store_f32(p, 8, Opnd::Val(f_1024));
+    b.store_f32(p, 12, Opnd::Val(f_4096));
     b.finish()
 }
 
