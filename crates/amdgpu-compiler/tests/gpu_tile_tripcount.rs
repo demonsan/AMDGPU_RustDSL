@@ -71,9 +71,8 @@ fn late_race() -> Function {
 }
 
 #[test]
-#[ignore = "audit: documents the >4-iteration tile unroll gap (expected to be missed by v1.1)"]
 fn a_race_only_on_iteration_five_is_missed() {
     let r = verify_ir(&late_race());
     println!("late_race: {}", r.render());
-    assert!(has(&r, "GV-TILE-RACE") || has(&r, "GV-TILE-STALE"), "MISSED: verifier certified a >4-iteration race: {}", errors(&r));
+    assert!(has(&r, "GV-TILE-UNROLL-LIMIT") || has(&r, "GV-TILE-RACE") || has(&r, "GV-TILE-STALE"), "MISSED: verifier certified a >4-iteration race: {}", errors(&r));
 }

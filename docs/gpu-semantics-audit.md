@@ -1,121 +1,110 @@
-# Independent adversarial audit: gpu_verify v1.1 (tile lifetime + assume soundness)
+# Independent adversarial audit: gpu_verify v1.2 (periodicity gate + tile lifetime)
 
-Auditor: `kernel-occ`. Branch: `gpu-semantics-occ`. Re-audited verifier: **Main `4c4909a`**
-(v1.1 tile model + `GV-ASSUME-VIOLATED` + `assume_trusted` + assembler-measured alignment).
-Host-truth integration: Main + kernel-opt annotations (`gpu-semantics-opt@5f923d8`, branch
-`truth-main`). Hardware: MI355X / gfx950, node 53, GPU 6.
+Auditor: `kernel-occ`. Branch: `gpu-semantics-occ`. Verifier commit: **Main `bb4fce0`** (v1.2
+periodic-counter gate, certificate line). Host-truth integration: Main `bb4fce0` + kernel-opt
+annotations, branch **`truth-final` @ `080f406`**. Hardware: MI355X / gfx950, node 53, GPU 6.
 
-Verifier tests on `4c4909a`: **28/28 `gpu_semantics` + 11/11 `gpu_tiles` pass** (full Main per lead:
-156 tests /31 targets). Host-truth tests on `truth-main`: **2/2 pass**.
+On `bb4fce0`: **28/28 `gpu_semantics` + 15/15 `gpu_tiles` pass**. On `truth-final`:
+`contract_host_truth` **2/2 pass**.
 
-## 1. Soundness attacks - assume layer
+## 1. Assume layer (unchanged, re-verified)
 
-| attack | expected | actual on Main 4c4909a | verdict |
-|---|---|---|---|
-| `gv_attack_assume_loop` - var assumed `[0,0]`, `set_var`=+1, load at updated index | reject | **reject** `GV-ASSUME-VIOLATED` (stmt 8), 1 error, `--strict` rc=1 | **fixed** |
-| `gv_attack_assume_trusted` - same loop but `assume_trusted(..., "loop exits before i=1")` | pass but listed | **pass strict** (0 errors); `-v` prints 2 `GV-ASSUME` **Info** lines, both marked `TRUSTED` with the reason; summary counts them as 2 findings | **documented trust boundary; listed and countable** |
-| `gv_attack_false_contract` - declares 1 MiB for a 64 B host pointer, loads +4096 | flag/unproven | **pass** (0 errors; 2 global accesses proven) | **trust boundary (host contract)** |
-| `gv_attack_lds_const` - declared 256 B, read at 512 | reject | **reject** `GV-LDS-OOB`, `[512,512]` vs `[256,256]` | correct |
-| `gv_attack_desc_over` - 64 B extent, `num_records=4096` | reject | **reject** `GV-BUF-OVER` | correct |
-| `gv_attack_clamp_path` - clamp only one branch | reject | **reject** `GV-GLB-OOB`, `[0,1008]` vs `[512,512]` | correct |
+| attack | result on bb4fce0 |
+|---|---|
+| `gv_attack_assume_loop` (assume `[0,0]`, `set_var`=+1) | **REJECT** `GV-ASSUME-VIOLATED`, `--strict` rc=1 |
+| `gv_attack_assume_trusted` (same, trusted reason) | **pass**, 2 `GV-ASSUME` Info `TRUSTED` lines with reason, counted |
+| `gv_attack_false_contract` (1 MiB declared, 64 B real) | **pass**, 2 globals "proven" - host-contract trust boundary |
+| `gv_attack_lds_const`, `gv_attack_desc_over`, `gv_attack_clamp_path` | **all REJECT** with the expected codes |
 
-**`assume_trusted` is a real escape:** a kernel can use it to certify an access the loop actually
-violates (the attack is an OOB on iteration 2). It is not silent: every use is `Info`/`TRUSTED` with
-the reason, and the finding count includes it. That is acceptable only if the trust list is reviewed;
-`--strict` alone cannot distinguish it from a proof. Same class as false contracts.
+`certificate: N trusted assumes, M trusted contracts, K unproven` is printed per kernel and for the
+whole list; on pure Main (no annotations) `_vs128` shows `0 trusted assumes, 0 trusted contracts,
+106 unproven`, which is the honest state.
 
-## 2. Tile-lifetime attacks (v1.1 model)
+## 2. v1.2 tile-periodicity gate - new results
 
-| attack | expected | actual | verdict |
-|---|---|---|---|
-| `gpu_tile_attacks::non_counter_version` - consume version from a kernarg | reject | **reject** `GV-TILE-INDEX` | correct |
-| `gpu_tile_attacks::dma_without_wait_vm` - DMA producer, barrier, no `wait_vm(0)` | reject | **reject** `GV-TILE-STALE` in all 1..4 unroll scenarios ("published at phase never") | correct |
-| same with `wait_vm(0)` | accept | **clean**, `tile-reads: 4` | correct |
-| ring slots=1 with next-iteration overwrite (`gpu_tiles` negative test) | reject | **reject** `GV-TILE-RACE` | correct |
-| read before the publishing barrier, role-divergent barrier, alias without `lds_alias`, escape from marker (`gpu_tiles` negatives) | reject | **all rejected** (`GV-TILE-STALE`/`GV-TILE-RACE`/`GV-TILE-OVERLAP`/`GV-TILE-ESCAPE`/`GV-BAR`) | correct |
+**The old `late_race` is fixed:** a marker using `Select`/`Cmp` is rejected with
+`GV-TILE-UNROLL-LIMIT` ("not an affine/periodic function ... at most 10 iterations"), and the
+simulation (now 10 iterations) also finds the race:
+`[GV-TILE-RACE] read of buf[1] ... overlaps write version 6 ...`, plus `GV-TILE-STALE`; `--strict`
+fails. Good.
 
-**Open soundness gap - loop unrolling is 1..=4 only.** `gpu_tile_tripcount::late_race` is a
-double-buffered two-role ring that is correct for iterations 0..4 and races only when `it >= 5`
-(producer overwrites the consumer's current slot version). On Main 4c4909a the verifier returns
-**no tile errors** (`tile-reads: 10`, `tile-cover: 3`) and would certify it, yet a host launcher with
-`n >= 6` executes the race. This is the documented trip-count<=4 assumption, but it is a real
-conditional soundness hole: a >4-iteration loop must either be proven bounded by 4 (or the model must
-unroll/abstract all iterations), otherwise the certificate is not valid. This should be reported in
-the verifier doc's honest-gaps section and gated in `--strict` (e.g. `GV-TILE-UNROLL-LIMIT` when the
-trip count cannot be proven <=4).
+**New finding - the affine gate accepts periods longer than the 10-iteration horizon.**
+`gpu_tile_horizon::affine_period_256_is_missed`: producer slot =
+`(nxt & 1) + ((nxt >> 8) & 1)`, version = `nxt`; this is affine/bitwise of the counter, so the gate
+accepts it, and the simulator sees only the first 10 iterations. At iteration 255 the extra bit flips
+the producer slot onto the consumer's slot with the next version (real race), yet `bb4fce0` returns
+**no tile error** (`tile-reads: 55`, no `GV-TILE-UNROLL-LIMIT`), so a launch with >=257 iterations is
+certified although it races. **This is a conditional soundness hole:** the gate checks the FORM of
+the marker, not that the simulation horizon covers its period. A rigorous gate must bound the
+period/cone (e.g. reject shifts/masks that can have period > `nmax`, or simulate an iteration count
+exponential in the expression's bit-width) or state the horizon as a trusted assumption.
+Non-affine-but-periodic forms (`Select` with period 2) are conservatively rejected - a false positive,
+but safe.
 
-Other model limits (documented, not soundness bugs): same-tile partial-byte overlap is not
-distinguished; untagged LDS accesses are `Warn` only; wave-uniform runtime `if` containing
-barriers/markers is `GV-TILE-UNSUPPORTED` (Warn); cross-workgroup races and more than two roles are
-out of scope; all loops are assumed to run the same iteration count in every role.
+**`tile_trust_periodic(reason)` escape:** it skips the gate, is listed once as
+`GV-ASSUME` Info `tile_trust_periodic: TRUSTED ... reason ...`, and is counted. With it a
+`Select`-based marker whose race starts at iteration 256 is **accepted with 0 errors**, i.e. the
+escape can hide a late race. It is a documented trust boundary, like `assume_trusted` and host
+contracts; reviewers must inspect the TRUSTED list, `--strict` cannot.
 
-## 3. Host-truth check (`tests/contract_host_truth.rs`)
+**Correct v1.2 tile rejections:** non-counter marker version -> `GV-TILE-INDEX`; DMA producer without
+`wait_vm(0)` -> `GV-TILE-STALE` in all 1..10 unrolls, with wait clean; slots=1 overwrite ->
+`GV-TILE-RACE`; read-before-publish, role-divergent barrier, alias without `lds_alias`, marker
+escape -> rejected. Remaining documented limits: same-tile partial-byte overlap conflated; untagged
+LDS `Warn`; wave-uniform runtime `if` with barriers/markers `GV-TILE-UNSUPPORTED` (Warn); >2 roles
+and cross-workgroup out of scope.
 
-Implemented on `truth-main` (Main `4c4909a` + annotations `5f923d8`); **2/2 pass**. For three shapes
-(B1H8S2048, B4H8S2048, B1H2S200) it evaluates every `Function.contract`:
-`arg_tensor` alloc/logical extents, `grid_is`, `ka_is`, `ka_range`, `sym_range`, and compares them with
-`tests/gpu/ref_host.cpp`/`attn_host.cpp` formulas. It covers Q/K/V/O, Q/K scale logical+zeroed slack,
-V scale, split `grid_z = B*splits`, Ohat/lse `splits*rows_total*128*4` / `*4`, and combine
-`out=rows_total*128*2`. **No declared extent exceeds the host allocation; all grid/ka relations match.**
-Remaining contract gaps: `kvs_counters`@0x288 still has no `arg_tensor`; the split contract does not
-state `splits in {2,4,8}` (auto uses2/4; `REF_SPLIT` could force other values); assumptions added to
-shipped kernels are currently **not inductive** (next item).
+## 3. Host-truth check and final verdict table
 
-## 4. False positives after Main + annotations
+`tests/contract_host_truth.rs` on `truth-final` (Main `bb4fce0` + annotations) evaluates every
+`Function.contract` extent, `grid_is`, `ka_is`, `ka_range`, `sym_range` for 3 shapes against
+`ref_host.cpp`/`attn_host.cpp`: Q/K/V/O, Q/K scale logical+zeroed slack, V scale, split
+`grid_z = B*splits`, Ohat/lse `splits*rows_total*128*4`/`*4`, combine `out=rows_total*128*2`.
+**2/2 pass; no declared logical/alloc extent overstates the host allocation; all grid/ka relations
+match.** Remaining contract gaps: `kvs_counters`@0x288 still has no `arg_tensor`; split domain is not
+constrained to {2,4,8}; `rows_total` is now tied to B*S*H.
 
-Safe shipped kernels (certified) on `truth-main`:
+With the annotated kernels + the pending kernel-opt verifier fixes, `amdc gpu-verify` gives:
 
-| kernel | errors | codes | proven |
+| kernel | errors | certificate | notes |
 |---|---:|---|---|
-| `_vs128` | 34 | 30 `GV-GLB-OOB` + 4 `GV-ASSUME-VIOLATED` | LDS 600, global 76, barriers 18 |
-| `_t128` | 66 | 48 `GV-GLB-OOB` + 16 `GV-LDS-OOB` + 2 `GV-ASSUME-VIOLATED` | LDS 320, global 44 |
-| `_kvsplit` | 64 | 60 `GV-GLB-OOB` + 4 `GV-ASSUME-VIOLATED` | LDS 760, global 18 |
-| `_combine8h` | 1 | `GV-ASSUME-VIOLATED` | global 3 |
-| `_t` | 3 | 1 `GV-LDS-OOB` + 2 `GV-ASSUME-VIOLATED` | LDS 225, global 88 |
+| `_vs128` | **0** | 6 trusted assumes, 29 trusted contracts, 0 unproven | LDS600 + tile-cover600 + barriers18 |
+| `_t128` | **0** | 4 trusted assumes, 29 trusted contracts, 0 unproven | LDS336 |
+| `_kvsplit` | **0** | 12 trusted assumes, 36 trusted contracts, 0 unproven | LDS760 + tile-cover600 |
+| `_kvsplit_combine8h` | **0** | 2 trusted assumes, 6 trusted contracts, 0 unproven | global3 |
+| `_t` | **1** | 4 trusted assumes, 29 trusted contracts, 1 unproven | one `GV-LDS-OOB`: `ds_write_b32` at address `[67584 | 66450 | 67582 | 66448, 69756 | 362364 | 657276 | 70268]` vs 69632 B - a certified-safe kernel; analysis precision, not a contract error |
 
-These are **all false positives on certified kernels**:
-* `GV-ASSUME-VIOLATED` on kernel-opt's new assumes: e.g. `set_var var0 = [1, 255/128 +
-  1/128*ka(0x110)]` outside assumed `[0, 127/128 + 1/128*ka(0x110)]`; exit-test-bounded counters need
-  `assume_trusted` (with a reason) or a tighter inductive range.
-* `GV-GLB-OOB` global/DMA lower bounds are `[-inf,+inf]` for K/V/Q-scale because the split/loop
-  variable is still not related to the contract; LDS/DS side is proven for vs128/kvsplit, but t128/t
-  have 16/1 DMA-LDS-side false positives with M0 expressions involving `Select`/loop vars.
-* `_t128` grid rows_per_block is 128, and its contract is correct; the remaining errors are analysis
-  precision, not contract errors (host-truth test passes).
+The `_t` case is the only remaining shipped false positive; it is a real LDS address built from
+`Lshr/Shl/Xor` of loop values and is safe (kernel certified), but the interval engine cannot close the
+bound. All other shipped kernels are clean on the integration branch. Earlier plain Main without
+annotations had `_vs128` 106 unproven (all `GV-GLB-*`), showing why the contract layer is required.
 
-Earlier `4e6d58f` run had 93 kernels / 2 clean / 2926 errors (2906 `NOEXT`); after annotations the
-global count drops sharply (e.g. vs128 106 -> 34). The 141-run sweep is still not a certificate: it
-contains all probes and option combinations without contracts; do not gate on `--strict` over it.
+## 4. Hardware confirmations (unchanged, GPU 6)
 
-## 5. Hardware confirmations (unchanged, GPU 6)
+* MUBUF OOB (`buffer_probe.sh both`): **BUFFER_OK** rw/lds/dyn; zero-fill and dropped OOB stores hold.
+* LDS OOB (`probe_lds_oob`, 3 runs): read +256 = 0, read +1024 = **0x3f800000 stale non-zero** (not
+  zero-filled), write +4096 not observable, no fault. LDS has no hardware bounds check.
+* MFMA alignment: Main v1.1+ uses the assembler-measured even-tuple rule; earlier v52/v4 accepted /
+  v1 rejected evidence matches.
 
-* MUBUF OOB (`tools/buffer_probe.sh both`): **BUFFER_OK** for rw / lds / runtime-sized dyn (zero-fill
-  / dropped stores hold).
-* LDS OOB (`probe_lds_oob`, 3 runs): valid sentinel OK; read at +256 = `0x00000000`, read at +1024 =
-  **`0x3f800000` stale non-zero (not zero-filled)**; write at +4096 not observable; no fault. LDS has
-  no hardware bounds check; the verifier must reject OOB by construction.
-* MFMA register alignment: Main 4c4909a now models the assembler-measured **even VGPR tuple** rule
-  (v1.1 fix); my earlier finding v52/v4 accepted / v1 rejected matches the new model. S4 alignment
-  covered by tests.
+## 5. Final soundness statement (v1.2)
 
-## 6. Final soundness statement
+**Provably rejects:** LDS DS/DMA segment overflow/wrap; unbounded ring/loop vars; global
+extent/no-extent/provenance and one-path clamps; descriptor `num_records` overstatement; barrier
+balance; VGPR/SGPR limits, tuple/descriptor alignment and MFMA overlap; path-sensitive/loop-carried
+wait-before-use; tile overlap/escape/kind/stale/race/DMA-completion and non-counter markers; non-affine
+or non-periodic marker forms (`GV-TILE-UNROLL-LIMIT`); non-inductive `assume` (`GV-ASSUME-VIOLATED`).
+`certificate` counts every trusted assume/contract and every unproven fact.
 
-**Provably catches (Main 4c4909a):** LDS DS/DMA segment overflow/wrap; unbounded ring/loop vars;
-global extent/no-extent/provenance and one-path clamps; descriptor `num_records` overstatement;
-role-barrier balance; VGPR/SGPR limits, tuple/descriptor alignment and MFMA overlap; path-sensitive
-and loop-carried wait-before-use; tile overlap/escape/kind/stale/race/DMA-completion for simulated
-1..=4-iteration, two-role protocols; non-counter tile versions; `GV-ASSUME-VIOLATED` for
-non-inductive `assume`.
+**Trusted / still not proven:** host contracts (`arg_tensor`/`ka_*`/`grid_is`); `assume_trusted` and
+`tile_trust_periodic` escapes (listed/countable, but can hide real OOB/race); the v1.2 periodicity
+gate's 10-iteration horizon is not a soundness guarantee for affine markers whose period exceeds it
+(my `affine_period_256` attack is certified although it races at it=255); raw safe-asm interiors
+(`GV-ASM` Info); untagged LDS lifetime (Warn); partial-byte tile overlap conflated; runtime if with
+barriers `Warn`.
 
-**Trusted / not proven:** host contract extents (`arg_tensor`/`ka_*`/`grid_is`) are assumptions; the
-new `assume_trusted(reason)` escape (listed, countable, but can hide a real OOB); loop trip counts
-are assumed <=4 and equal across roles (my `late_race` attack certifies a >4-iteration race - the
-main open gap); raw safe-asm interiors are not checked (`GV-ASM` Info); untagged LDS lifetime is
-Warn-only; partial-byte tile overlap is conflated.
-
-**Out of scope:** cross-workgroup races/memory model, i32 arithmetic wrap-around (the analysis assumes
-no wrap; a wrapping index can invalidate a proof), hardware faults for OOB LDS/MUBUF (MUBUF is
-hardware-guarded, LDS is not), and multi-role protocols beyond two wave roles. Therefore v1.1 is a
-strong *finding engine* and a useful certificate for bounded (<=4 iteration) two-role LDS protocols,
-but not yet an unconditional end-to-end "no OOB / no race" guarantee until the unroll gap and the
-trusted-assume list are gated.
+**Out of scope:** cross-workgroup races/memory model; i32 arithmetic wrap-around; hardware faults for
+OOB LDS/MUBUF; protocols beyond two wave roles. Consequently v1.2 is a strong finding engine and
+certifies the shipped FMHA kernels except `_t` (precision), but **the affine long-period tile gap must
+be closed (or the horizon made explicit/trusted) before "any loop trip count" can be claimed**. The
+periodicity gate fixed the original `late_race` but not this larger-period variant.
