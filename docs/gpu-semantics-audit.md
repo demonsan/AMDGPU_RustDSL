@@ -78,7 +78,7 @@ bidirectionally."** On the shipped FMHA set, `--shipped --strict` is **0 errors 
 unproven** under a countable trust budget of **44 trusted assumptions and 216 host contracts**;
 cooperative same-generation fills by multiple waves are accepted, while missing completion, missing
 publication, missing release/acquire, stale generations, next-generation read/write overlap,
-different-generation write races, ticket/arrival mismatches and lark-arriver fence omissions are all
+different-generation write races, ticket/arrival mismatches and last-arriver fence omissions are all
 rejected. Escapes (`assume_trusted`, `tile_trust_periodic`, `region_trust`/`buf_trust`, aliases, host
 contracts) are listed, counted and printed; they are trust boundaries, not silent passes. **Scope
 limits:** global regions are intra-workgroup plus the explicit last-arriver pattern (cross-kernel
