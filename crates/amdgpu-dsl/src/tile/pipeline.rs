@@ -84,14 +84,15 @@ pub struct Pipeline {
     pub tile_rows: i32,
     /// contract upper bound of the tile counter (e.g. `ceil(SK / 128)`)
     pub nkv_bound: Ext,
-    /// loop-variable order: [it, state.., idx] (the manual kernels' order) instead of [it, idx, state..]; a register-allocation knob only
+    /// loop-variable order: [it, state.., idx] (the manual kernels' order; DEFAULT, measured +2.3% per-CU on the _vs128 port vs [it, idx, state..]) or,
+    /// when false, [it, idx, state..]; a register-allocation knob only
     pub ring_var_last: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
