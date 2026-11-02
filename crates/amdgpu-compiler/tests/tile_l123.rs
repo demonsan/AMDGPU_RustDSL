@@ -238,3 +238,89 @@ fn library_ring_pipeline_catches_a_read_before_publication() {
     let e = errs(&demo(2));
     assert!(e.iter().any(|x| x.contains("GV-TILE")), "a read before the publishing barrier must be rejected: {e:?}");
 }
+
+// ---- the `_t128` cadence: one group, 3-slot ring, one barrier per tile ------------------------------------------------------------------------------------------
+
+struct Demo3 {
+    ks: Shared,
+    vs: Shared,
+    kd: Shared,
+    kcp: RowsCopy,
+    vcp: RowsCopy,
+    kdcp: DwordRowsCopy,
+    lane: Lane,
+}
+
+impl Demo3 {
+    fn rd(&self, b: &mut FnBuilder, sh: &Shared, slot: &SlotIdx, shift: i32) {
+        let r = sh.at(slot);
+        let a = b.bind_i32(r.base() + (self.lane.lane() << shift));
+        let _ = r.read(b, |b| if shift == 4 { b.load_lds_b128(a) } else { b.load_lds_b32(a) });
+    }
+}
+
+impl PipeBody for Demo3 {
+    fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
+        self.kdcp.issue(b, key0, &self.kd.at(slot));
+        self.kcp.issue(b, key0, &self.ks.at(slot));
+        self.vcp.issue(b, key0, &self.vs.at(slot));
+    }
+    fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
+        let (ks, kd) = (self.ks.clone(), self.kd.clone());
+        self.rd(b, &ks, &t0.cur, 4);
+        self.rd(b, &kd, &t0.cur, 2);
+    }
+    fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
+        vec![]
+    }
+    fn bind_state(&mut self, _vars: &[VarId]) {}
+    fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+        let (ks, vs, kd) = (self.ks.clone(), self.vs.clone(), self.kd.clone());
+        self.rd(b, &vs, &t.cur, 4);
+        if t.staged {
+            self.rd(b, &ks, &t.next, 4);
+            self.rd(b, &kd, &t.next, 2);
+        }
+    }
+}
+
+fn demo3() -> Function {
+    let mut b = FnBuilder::new("tile_demo_ring3", 256);
+    b.compile_profile(CompileProfile::Default);
+    let mut ka = KArgs::new();
+    let skv = ka.dim(&mut b, "kv_len", 0x10, 1, i64::MAX);
+    let kv_len = ka.i32(&mut b, "kv_len", 0x10);
+    let k = ka.tensor("ptr_k", 0x00, 1, vec![skv.clone(), Dim::c(128)], vec![Stride::Derived(I32::c(128)), Stride::Unit]).packed().declare(&mut ka, &mut b);
+    let v = ka.tensor("ptr_v", 0x08, 1, vec![skv.clone(), Dim::c(128)], vec![Stride::Derived(I32::c(128)), Stride::Unit]).packed().declare(&mut ka, &mut b);
+    let kd = ka.tensor("ptr_kd", 0x18, 4, vec![skv, Dim::c(1)], vec![Stride::Derived(I32::c(4)), Stride::Unit]).packed().declare(&mut ka, &mut b);
+    let mut lds = LdsPlan::new();
+    let [ks, vs] = lds.ring_group(3, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
+    let kds = lds.ring("KD", 512, 3, Layout::Linear);
+    lds.commit(&mut b);
+    let lane = Lane::new(&mut b);
+    let roles = Roles::single(&lane, 4);
+    let kv_last = b.let_i32(ev(kv_len) - 1);
+    let nkv = b.bind_i32((ev(kv_len) + 127).lshr(7));
+    b.assume_trusted(nkv, Ext::c(1), Ext::ka(0x10).ceil_div(128), "nkv = ceil(kv_len / 128) >= 1");
+    let src = |t: &Tensor, b: &mut FnBuilder| t.tile(vec![I32::c(0), I32::c(0)]).clamp(0, ev(kv_len), kv_last.clone()).row_source(b, 0);
+    let (ksrc, vsrc, kdsrc) = (src(&k, &mut b), src(&v, &mut b), src(&kd, &mut b));
+    let kcp = RowsCopy::new(&mut b, ksrc, &ks, roles.wave_in_group, &lane, 4);
+    let vcp = RowsCopy::new(&mut b, vsrc, &vs, roles.wave_in_group, &lane, 4);
+    let kdcp = DwordRowsCopy::new(&mut b, kdsrc, &kds, roles.wave_in_group, &lane);
+    let pipe = Pipeline::new(Cadence::OneWindow, nkv, kv_len, 128, Ext::ka(0x10).ceil_div(128));
+    let mut body = Demo3 { ks, vs, kd: kds, kcp, vcp, kdcp, lane };
+    pipe.run(&mut b, Role::All, &mut body);
+    b.finish()
+}
+
+#[test]
+fn one_window_three_slot_ring_verifies() {
+    let f = demo3();
+    let r = analyse(&f).expect("analyse");
+    let e: Vec<String> = r.findings.iter().filter(|x| x.severity != Severity::Info).map(|x| format!("[{}] {:?} {}", x.code, x.severity, x.msg)).collect();
+    eprintln!("ring3 findings:\n{}\nproven {:?}", e.join("\n"), r.proven);
+    assert!(errs(&f).is_empty(), "{}", e.join("\n"));
+    let c = amdgpu_compiler::compile(&f).expect("compile");
+    let n = |m: &str| c.asm.lines().filter(|l| l.trim_start().starts_with(m)).count();
+    assert_eq!(n("s_barrier"), 2, "P0 + one per steady tile (the tail has none)");
+}
