@@ -18527,6 +18527,14 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     b.arg("result", DType::Ptr, 16, 8);
     b.arg("nblocks", DType::I32, 24, 4);
     b.arg("seed", DType::I32, 28, 4);
+    // GPU-semantics (v4 protocol): `part` is a global region written by every block (generation = split id = block id) and read in full by the LAST ARRIVER only
+    b.ka_range(24, 1, i64::MAX);
+    b.grid_is(0, Ext::ka(24));
+    b.arg_tensor("part", Ext::ka(24) * Ext::c(256));
+    b.arg_tensor("counter", Ext::c(4));
+    b.arg_tensor("result", Ext::c(4));
+    b.buf_region("part", "part", Ext::c(0), Ext::ka(24) * Ext::c(256));
+    b.buf_last_arriver("part", "counter", Ext::ka(24));
     let part = b.let_(Op::KernargPtr { offset: 0 });
     let counter = b.let_(Op::KernargPtr { offset: 8 });
     let result = b.let_(Op::KernargPtr { offset: 16 });
@@ -18548,11 +18556,13 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     let valf = b.bitcast_f32(Opnd::Val(val));
     let off = b.mul_i32(idx, c4);
     let pp = b.ptr_add(part, off);
+    b.buf_produce("part", bid);
     if mode >= 3 {
         b.store_f32(pp, 0, Opnd::Val(valf));
     } else {
         b.store_f32_wt(pp, 0, Opnd::Val(valf));
     }
+    b.tile_end();
     match mode {
         0 | 4 => b.fence_release(),
         1 => b.fence_release_lite(),
@@ -18571,9 +18581,13 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     let zero = b.c_i32(0);
     let vars = b.begin_loop(&[(DType::I32, Opnd::Val(zero)), (DType::I32, Opnd::Val(zero))]);
     let (i, s) = (vars[0], vars[1]);
+    b.assume_trusted(i, Ext::c(0), Ext::ka(24) * Ext::c(64) - Ext::c(1), "the loop exits once i + 1 >= nblocks * 64, so the body only runs with i <= nblocks * 64 - 1");
     let io = b.mul_i32(i, c4);
     let q = b.ptr_add(part, io);
+    let slice = b.let_(Op::LshrI32(Opnd::Var(i), Opnd::I32(6)));
+    b.buf_consume("part", slice);
     let x = if mode >= 3 { b.load_f32(q, 0) } else { b.load_f32_coherent(q, 0) };
+    b.tile_end();
     let xi = b.bitcast_i32(Opnd::Val(x));
     let s2 = b.add_i32(s, xi);
     b.set_var(s, Opnd::Val(s2));
