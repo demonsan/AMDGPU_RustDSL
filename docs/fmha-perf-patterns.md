@@ -383,3 +383,27 @@
 （以 `fmha_fwd_hd128_mxfp8_vs` 开头 → 得到 vendor-structure lowering 选项与 full scheduler；后缀 `_t128`/`_kvsplit` 触发各自附加项；
 combine 名字含 `combine8` 供 ref_host 推断每线程元素数）。注意 `..._vs2_kvsplit_combine8h` 会比出厂 combine 多拿到 lowering 选项和调度器 —— 需要在 PERF 中确认不回退。
 门禁命令：`HIP_VISIBLE_DEVICES=6 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_vs2`（未移植的 kernel 用 `KN_T128=fmha_fwd_hd128_mxfp8_t128` 等回落到出厂）。
+
+---
+
+## 附录 B. 移植状态（M4，2026-11-02，`fmha-port` 基于 `dsl-tile` e42a808）
+
+四个出厂 kernel 已全部用 tile 库重写，位于 `crates/amdgpu-dsl/src/fmha_tile.rs`（共 501 行，含共享 FMHA 胶水）：
+
+| 新 kernel | kernel 函数行数 | 使用的库组件 |
+|---|---|---|
+| `fmha_fwd_hd128_mxfp8_dsl_vs128` | 30 | FmhaIo/FmhaBlock（KArgs+Tensor 合同、gqa_kv_head）、KvRing（LdsPlan、RowsCopy、DwordRowsCopy、RowsReader/TrReader/RowScaleReader）、Roles、versioned、Pipeline(TwoPhaseOffset)、AttnBody(qk_tile/pv_tile/OnlineSoftmax)、store_bf16 |
+| `fmha_fwd_hd128_mxfp8_dsl_kvsplit` | 45 | 同上 + kv_split_decode/kv_split_range、OnlineSoftmax::lse、kvsplit_partial_f16 |
+| `fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h` | 25 | combine_splits |
+| `fmha_fwd_hd128_mxfp8_dsl_t128` | 25 | Pipeline(OneWindow 3 槽)、issue_rows_shared、DwordRowsVgpr、decide_deferred/commit_bias、qk_block |
+
+共享胶水（`FmhaIo` ABI/张量 ~120 行、`FmhaBlock`、`KvRing`、`AttnBody: PipeBody` ~190 行）替代了 `fmha_t_build`（640 行）+ `emit_fmha_vs128_role`（1,700 行）+ `emit_fmha_t128_role`（950 行）。
+
+**门禁（`port_gate.sh fmha_fwd_hd128_mxfp8_dsl m4`，GPU 6，同轮出厂对照）：OVERALL PASS**
+- VERIFY `--strict`：4 个 kernel 0 错误 0 警告；trusted assumes 6/4/12/2 与出厂相同；proven 计数与出厂相同（`_t128` 额外获得 tile 协议证明：tile-reads 29440，无 periodic trust）
+- ACC16 15/15 + parity 15/15；ACC64 四条路径 bad=0；DET 5/5；STRESS 0 失败
+- PERF：B1H8S2048 出厂路径 679.5 vs 682.2（-0.4%）；per-CU 布局中位数 449.6 vs 451.6（-0.4%）；B4H8S2048 1419 vs 1439（-1.4%）；B1H8S8192 1967 vs 1968（-0.1%）；B2H8S2048（`_t128`）1012 vs 1015（-0.3%）
+
+**测量注意**：per-CU `_vs128` 对代码布局敏感 ±1.5%（同一 kernel 前置 0..14 条 `s_nop`：444–456 TF/s，出厂与移植版相同）；单一布局的比较不可信，门禁用 8 种布局的中位数。
+
+**移植中发现并修复（库/验证器）**：`ka_is` 代入依赖声明顺序（改为不动点）；读取器每次重算 slot 偏移乘法（改为每 slot 缓存）；循环变量顺序（`ring_var_last`，-2.4% → 0）；OneWindow 尾部的 GV-TILE-PENDING 误报。
