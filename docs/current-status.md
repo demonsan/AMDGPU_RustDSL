@@ -62,13 +62,13 @@ cargo run --bin amdc -- gpu-verify --shipped --strict      # 出厂 kernel 的�
 | 类别 | 证明内容 | 出厂覆盖 |
 |---|---|---|
 | **LDS** | 每次 DS 访存/DMA（含 64 lane）在声明段内；环形/双缓冲槽位由不动点证明；无下溢/回绕 | 600（`_vs128`/`_vs5`）、760（`_kvsplit`）、336/226/424/318 |
-| **LDS tile 生命周期** | tile 分区/别名、produce/consume/version（发布于 barrier）、跨角色 stale/race/pending；周期门（period ≤ horizon） | `_vs128`/`_vs5` **16,640** 次读、`_kvsplit` **66,560** 次读，0 错误 |
+| **LDS tile 生命周期** | tile 分区/别名、produce/consume/version（发布于 barrier）、跨角色 stale/race/pending；周期门（period ≤ horizon） | `_vs128`/`_vs5` **58,880** 次读、`_kvsplit` **240,640** 次读（tile-cover 600/760），0 错误 0 警告 |
 | **全局/buffer** | 访问落在声明 extent 内（`arg_tensor` + 形状关系 `ka_is/grid_is/ka_one_of`）；描述符不得高估 `num_records` | 106/92/78/3/88/97/318/424 次访问；`tests/contract_host_truth.rs` 校验合同与 host 公式一致 |
 | **VGPR/SGPR** | v0、s0–s7 保留；元组对齐（VGPR 偶数、SGPR 对偶数/四元组×4）、≤256/≤102；MFMA A/B 与 D 不重叠 | 全部 88 个 kernel 0 错误（默认强制） |
 | **寄存器生命周期** | 路径敏感 use-before-wait（任一路径、含循环携带在途值） | 默认强制；出厂 0 错误 |
 | **barrier 协议** | 波分歧 if/else 两侧动态 barrier 数相等 | `_vs128` 18、`_t128` 8、`_kvsplit` 18、`_t` 11 |
 
-**信任预算（证书里逐条列出）**：出厂 8 个 kernel 合计 **44 条 trusted assumes**（10 条理由，全部 `assume_trusted` 带理由）、
+**信任预算（证书里逐条列出）**：出厂 8 个 kernel `--strict`：**0 错误 0 警告**；合计 **44 条 trusted assumes**（10 条理由，全部 `assume_trusted` 带理由）、
 **216 条 trusted host contracts**、**0 unproven**。每次运行打印 `certificate: N trusted assumes, M trusted contracts, K unproven`。
 
 **未证明/范围外（诚实清单）**：跨工作组数据竞争与别名、i32 回绕（A3 假设）、从内存加载的指针/索引、safe-asm 块内部访存、
@@ -166,7 +166,7 @@ tile 内字节级重叠、`_kvsplit` 的 160 处 epilogue scratch（界已证、
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **29 个目标 / 117 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
+- **测试**：`cargo test` **35 个目标 / 186 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
   `register_accounting`、`asm_assembles`、`hazard_classes`、`hazard_oracle`、`phys_waw`、`ra_reaching`、
   `pin_check`、`pinning`、`dead_loads`、`var_lint`、`smfmac_hazards`、`dma_hazards`、`lite_contract` …）
 - **硬件探针**（`tools/`，**29 个脚本**）：`vendor_validate.sh`、`vendor_counters.sh`、`vendor_disasm.sh`、
