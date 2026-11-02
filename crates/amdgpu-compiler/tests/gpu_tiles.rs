@@ -347,8 +347,8 @@ fn uniform_if_kernel(want: i32, in_loop: bool) -> Function {
         b.barrier();
         let nx = b.add_i32(vs[0], Opnd::I32(1));
         b.set_var(vs[0], nx);
-        let stop = b.cmp_ge_i32(nx, Opnd::I32(3));
-        b.break_if(stop);
+        let stop = b.let_(Op::CmpGeI32(Opnd::Val(nx), Opnd::I32(3)));
+        b.break_if(Opnd::Val(stop));
         b.end_loop();
     }
     b.finish()
