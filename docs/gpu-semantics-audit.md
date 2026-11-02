@@ -80,6 +80,23 @@ state `splits in {2,4,8}`; the 160 untagged kvsplit LDS accesses are outside the
   must reject OOB by construction.
 * MFMA alignment: assembler-measured even-tuple rule in v1.1+; v52/v4 accepted, v1 rejected.
 
+## 5. Block-level shipped K/V ring check (independent of the verifier)
+
+`tests/shipped_ring_layout.rs` splits the shipped kernel's top-level role `if (tid < 256) { role A } else { role B }`
+and checks, **inside each role branch independently**, that there is a barrier between the K/V/KD tile
+producer marker and the first matching consumer marker. Result on `6cafb6f`:
+
+| kernel | branch | K/V/KD producers | consumers | publishing barrier stmt |
+|---|---|---:|---:|---:|
+| `_vs128` | roleA | 6 | 80 | **506** |
+| `_vs128` | roleB | 6 | 80 | **6820** |
+| `_kvsplit` | roleA | 6 | 80 | **559** |
+| `_kvsplit` | roleB | 6 | 80 | **7516** |
+
+Both roles have their own publishing barrier between ring production and consumption; the old
+same-role shortcut could not hide a role-local missing barrier for these shipped kernels. This is a
+structural marker/barrier check, independent of `gpu_verify`'s tile simulator.
+
 ## 5. Final soundness statement (for README)
 
 **"The compiler is GPU-semantics-aware and proves the properties it claims."** On gfx950 (MI355X),
