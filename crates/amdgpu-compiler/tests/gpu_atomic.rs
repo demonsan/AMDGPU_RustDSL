@@ -7,7 +7,7 @@
 //! `gpu_semantics.rs`).
 
 use amdgpu_compiler::gpu_verify::{verify_ir, verify_mir, Report, Severity};
-use amdgpu_compiler::mir::{Block, MFunction, MInst, MOp, RClass, Term};
+use amdgpu_compiler::mir::{Block, MFunction, MInst, MOp, Pred, RClass, Term};
 use amdgpu_compiler::regalloc::Alloc;
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op};
 
