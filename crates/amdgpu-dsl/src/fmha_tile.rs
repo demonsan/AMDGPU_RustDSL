@@ -312,6 +312,10 @@ pub fn fmha_fwd_hd128_mxfp8_dsl_vs128() -> Function {
 fn build_vs128(b: &mut FnBuilder) {
     // ---- ABI: tensors (+ the host contract they imply) ----
     let mut ka = KArgs::new();
+    // GQA (H = HK * gqa, gqa a power of two <= 16) first: the tensor contracts below are stated in terms of H
+    let gqa = ka.i32(b, "s_gqa", 0x0B0);
+    b.ka_range(0x0B0, 1, 16);
+    b.ka_is(0x140, Ext::sym("HK") * Ext::ka(0x0B0));
     let s = ka.dim(b, "s_seq_len", 0x060, 1, i64::MAX);
     let skv = ka.dim(b, "s_kv_seq_len", 0x110, 1, i64::MAX);
     let h = Dim::Ka { off: 0x140, val: ka.i32(b, "s_q_head_num", 0x140) };
@@ -327,11 +331,7 @@ fn build_vs128(b: &mut FnBuilder) {
     let ksc = ka.tensor("ptr_k_descale", 0x210, 1, vec![bat, skv.clone(), hk, Dim::c(4)], vec![Stride::Ka("s_descale_k_Bs", 0x250), Stride::Derived(kd_stride), Stride::Ka("s_descale_k_Hs", 0x260), Stride::Unit]).packed().slack(Ext::c(640 * 4) * Ext::ka(0x140)).declare(&mut ka, b);
     let ptr_vd = ka.ptr(b, "ptr_v_descale", 0x220);
     b.arg_tensor("ptr_v_descale", Ext::c(4096));
-    let gqa = ka.i32(b, "s_gqa", 0x0B0);
     ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
-    // GQA (H = HK * gqa, gqa a power of two <= 16) and the launch grid
-    b.ka_range(0x0B0, 1, 16);
-    b.ka_is(0x140, Ext::sym("HK") * Ext::ka(0x0B0));
     b.grid_is(1, Ext::ka(0x140));
     b.grid_is(0, Ext::ka(0x060).ceil_div(256));
     let (s_len, kv_len) = (s.val().unwrap(), skv.val().unwrap());
