@@ -13,6 +13,7 @@
 pub mod components;
 pub mod copy;
 pub mod epilogue;
+pub mod fmha;
 pub mod frag;
 pub mod lane;
 pub mod pipeline;
