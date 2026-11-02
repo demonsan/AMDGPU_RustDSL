@@ -22410,3 +22410,28 @@ pub fn gv_attack_clamp_path() -> Function {
     b.end_if();
     b.finish()
 }
+
+/// ATTACK (trust boundary): `assume_trusted` can certify an access the loop actually violates.
+pub fn gv_attack_assume_trusted() -> Function {
+    let mut b = FnBuilder::new("gv_attack_assume_trusted", 64);
+    b.arg_tensor("q", Ext::c(64));
+    b.arg("q", DType::Ptr, 0, 8);
+    b.arg("o", DType::Ptr, 8, 8);
+    b.arg_tensor("o", Ext::c(64));
+    let q = b.let_(Op::KernargPtr { offset: 0 });
+    let o = b.let_(Op::KernargPtr { offset: 8 });
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c4 = b.c_i32(4);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0))]);
+    let i = vars[0];
+    b.assume_trusted(Opnd::Var(i), Ext::c(0), Ext::c(0), "loop exits before i reaches 1");
+    let ni = b.add_i32(Opnd::Var(i), c1);
+    b.set_var(i, ni);
+    let off = b.mul_i32(Opnd::Var(i), c4);
+    let p = b.ptr_add(q, off);
+    let v = b.load_f32(p, 0);
+    b.store_f32(o, 0, v);
+    b.end_loop();
+    b.finish()
+}

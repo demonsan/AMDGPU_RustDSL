@@ -229,6 +229,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_lds_oob" => Some(amdgpu_dsl::kernels::probe_lds_oob()),
         "gv_attack_false_contract" => Some(amdgpu_dsl::kernels::gv_attack_false_contract()),
         "gv_attack_assume_loop" => Some(amdgpu_dsl::kernels::gv_attack_assume_loop()),
+        "gv_attack_assume_trusted" => Some(amdgpu_dsl::kernels::gv_attack_assume_trusted()),
         "gv_attack_lds_const" => Some(amdgpu_dsl::kernels::gv_attack_lds_const()),
         "gv_attack_desc_over" => Some(amdgpu_dsl::kernels::gv_attack_desc_over()),
         "gv_attack_clamp_path" => Some(amdgpu_dsl::kernels::gv_attack_clamp_path()),
