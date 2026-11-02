@@ -223,3 +223,79 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 
 正例：LDS 声明段内、全局带形状下界、`min` 夹紧（n≥1）、描述符不高估（静态/运行时）、环形 `xor` 变量、平衡的角色 barrier、合法 MFMA 寄存器、两分支都等待、循环体内等待、出厂 kernel 的强制检查与默认编译。
 反例（每类一个）：LDS 溢出、LDS 下溢、全局无形状下界（打印 `ka(0x8)` 残差）、全局无合同、`min` 夹紧但 n 可能为 0、写入 zeroed slack、描述符高估（静态与运行时 +16）、无界增长的环形变量、不平衡的角色 barrier、MFMA 目的错位、MFMA 乘数与目的重叠、S4 描述符错位/SGPR 超限/VGPR 超限、分支一侧漏等待、循环携带的在途值跨迭代使用前未等待。
+## 13. 四类"共享 / 边界"资源的保证方式（跨 wave LDS、buffer rsrc、atomic、TDM）
+
+本节回答一个常见问题：LDS 这种会被不同 wave 共享的空间、MUBUF 描述符（`buffer_rsrc`）的边界、atomic、以及 TDM，
+在 Rust 里各自**如何保证 safe 使用**、保证到哪一层、边界在哪。总原则：**DSL 侧是安全 Rust 的类型化 API（无 unsafe），
+语义安全由"声明式合同 + 编译期证明义务 + 硬件实测语义"三者合成，任何不能证明的都报 `Error` 或进入可计数的 trust 清单。**
+
+### 13.1 跨 wave 共享的 LDS（tile 协议）
+
+LDS 是块内 8 个 wave 共享的地址空间，硬件**不做任何边界或竞争检查**（实测：越界读不回零、不 fault；写被丢弃）。
+因此"共享正确性"必须由编译器建模：
+
+* **声明**（不产生代码）：`b.lds_tile(name, base, size)` / `b.lds_ring(name, base, slot_size, slots)` /
+  `b.lds_private(name, base, size_per_wave, waves)` / `b.lds_alias(a, b)`；
+* **标记**：`tile_produce(name, slot, version)` / `tile_consume(name, slot, version)` / `tile_end()`，
+  槽位/版本必须是循环计数器的**仿射函数**（常数、`+ - * << & ^` by 常数；计数器初值常数、步进 `+ const` / `^ const`）；
+* **证明**（`gpu_tiles.rs` 模拟器，按角色路径 DFS、运行时 if 的两种结果都探索、相位按动态 barrier 计数）：
+  * `GV-TILE-STALE`：读到未发布/版本不匹配的数据（生产者必须在 barrier 后才算发布；DMA 要 `wait_vm(0)`，
+    DS 写要 `wait_lds(0)`）；
+  * `GV-TILE-RACE`：读窗口内另一个 wave 写了不同版本（单缓冲被下一轮覆盖 = 典型竞态）；
+  * `GV-TILE-PENDING`：读未完成就进入下一个 barrier；
+  * `GV-TILE-OVERLAP` / `GV-TILE-ESCAPE` / `GV-TILE-INDEX` / `GV-TILE-UNROLL-LIMIT`；
+  * **私有区**（`lds_private`）：每 wave 一段，读只能读自己那段（`GV-TILE-PRIVATE-ESCAPE` 拒绝读别人/非线性地址），
+    生命周期按"自己 produce + 自己 wait"判定，不需要别的 wave 发布；
+  * **未标记的 LDS 访问** = `GV-TILE-UNTAGGED` Warn（界已证、生命周期未证）——出厂 kernel 已全部标记（0 warning）。
+
+**实测结果**：`_vs128`/`_vs5` tile-cover 600/600（58,880 次读事件）、`_kvsplit` 760/760（全部 LDS，240,640 次读事件），
+`--strict` 0 错误 0 警告。**边界**：只建模 2 个角色、各循环迭代数相等、tile 内字节级重叠、跨工作组/跨 kernel 别名。
+
+### 13.2 MUBUF `buffer_rsrc` 的边界
+
+* **类型化**：描述符是 DSL 的 `Rsrc` 值（4 个 SGPR 四元组）；`buffer_rsrc`（静态 `num_records`）与
+  `buffer_desc_dyn`（运行时 `num_records`，如 `min(nbytes, …)/stride`）都走同一套 IR。
+* **证明 1（描述符不得高估）**：在描述符构造点检查 `num_records.hi <= extent.lo` → `GV-BUF-OVER`。
+  理由：MUBUF 越界读返回 0、越界写被丢弃（硬件实测 `tools/buffer_probe.sh` 的 rw/lds/dyn 全 `BUFFER_OK`），
+  所以"有界描述符"的访问是**硬件定义的安全**；但如果描述符高估了分配，越界就会静默读到别的张量的数据。
+* **证明 2（无界哨兵）**：`num_records = 0xFFFFFFFF`（`buffer_rsrc` 的 no-bounds 形式）不享受硬件范围检查，
+  其访问按普通 global 访问证明（需要 `arg_tensor` 与形状关系）。
+* **证明 3（可见性/顺序）**：`sc1` 写穿透 / `sc0` atomic 纪律 + `buffer_wbl2`/`buffer_inv` 的顺序由
+  `asm_check::check_lite_contract` 检查（last-arriver 融合路径），保证跨工作组看到的是排空后的数据。
+* **边界**：运行时 `num_records` 表达式若写错（区间不足以证明 ≤ 分配）会被拒绝；跨工作组数据竞争不建模。
+
+### 13.3 atomic
+
+当前 DSL 只有 `global_atomic_add`（device scope `sc0`，返回旧值），`Op::AtomicAddU32` / `b.atomic_add_u32`。
+
+* **边界**：`check_global(..., size=4, store=true)` —— atomic 是读-改-写，因此**按 store 检查 logical extent**
+  （不允许打到 `arg_tensor_slack` 的 zeroed slack）；无 extent → `GV-GLB-NOEXT`，越界 → `GV-GLB-OOB`。
+  单测：`tests/gpu_atomic.rs` 的 4 个界测试。
+* **返回值生命周期**：`global_atomic_add` 的旧值经 VMEM（`vmcnt`）返回。效果模型是
+  `MemAccess { space: Global, write: true }` → 进入 **vm 队列**；等待 pass 在任何路径使用它之前插入 `s_waitcnt`，
+  `gpu_verify::verify_waits` 做**路径敏感**检查（分支一侧漏等、循环携带都会报 `GV-WAIT`）。
+  单测：`tests/gpu_atomic.rs` 的 `using_the_atomic_result_before_a_wait_is_rejected`。
+* **作用域/顺序纪律**：`check_lite_contract` 要求 `global_atomic_*` 用 `sc0`、不得用 `sc1`，且 barrier 前必须 vmcnt 排空。
+* **边界（诚实）**：没有 acquire/release/模型序证明；跨工作组数据竞争、原子性的"证明"不在范围内
+  （原子性由硬件保证，我们只约束地址、等待与 scope）；目前只有 1 种 atomic 形式（无 `buffer_atomic_*`、无 system scope）；
+  safe-asm 窗口内的 atomic 只在 `GV-ASM` Info 中标注为"内部未检查"。
+
+### 13.4 TDM（Tensor Data Mover）
+
+**当前不支持，且目标 ISA 上不存在**：`gfx950` 没有 TDM；整个 crate 图里 TDM 相关 op 数为 **0**
+（`grep -r "tdm\|TDM" crates/` = 0）。因此：
+
+* DSL 无法表达 TDM（没有 builder API）；`Op::Asm` 的 raw 路径受 safe-asm **op 白名单**限制，无法偷偷塞入未知助记符；
+  编译器也没有对应 MOp / emit 行 → **不存在"能写出来但没被检查"的 TDM 路径**。
+* 若将来支持 `gfx1250` 的 TDM，架构上是复用的：TDM 描述符（base/size/stride）用 `arg_tensor`/extent 合同 +
+  `GV-BUF-OVER` 式"描述符不得高估"检查；TDM 写入 LDS 的落点用 `tile_produce` + `wait_vm(0)` 发布 +
+  `ds` 消费者用 `tile_consume` 验证版本；越界/回绕用同一区间分析。即：**ISA 支持是缺的，模型不缺**。
+
+### 13.5 汇总表
+
+| 资源 | Rust 侧保证 | 证明/检查 | 硬件实测语义 | 诚实边界 |
+|---|---|---|---|---|
+| 跨 wave LDS | 类型化 tile API（安全 Rust，无 unsafe） | `gpu_tiles` 协议模拟：STALE/RACE/PENDING/OVERLAP/ESCAPE/PERIOD（出厂 0 错误 0 警告） | LDS 无边界检查、越界不回零 | 2 角色/等迭代数/字节级重叠/跨 WG 别名 |
+| buffer rsrc | 类型化 `Rsrc` 描述符 | `GV-BUF-OVER`（静态+运行时 num_records ≤ extent）+ 无界哨兵走 global 证明 + lite 契约（sc1/sc0/排空） | 越界读 0 / 写丢弃 / lds 形式零填充（`buffer_probe.sh`） | 运行时 num_records 表达式写错会被拒；跨 WG 竞争不建模 |
+| atomic | 类型化 `AtomicAddU32`（device scope） | store 语义的 extent 检查 + vm 队列 + 路径敏感等待 + lite 契约 scope 纪律 | 单指令原子性（硬件） | 无 acquire/release 证明；无跨 WG 竞争建模；仅 1 种形式 |
+| TDM | **不支持**（DSL/MIR/emit 均无；raw 被白名单拒绝） | — | — | 目标 gfx950 无此 ISA；模型设计可复用 |
