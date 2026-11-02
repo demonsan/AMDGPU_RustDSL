@@ -516,6 +516,10 @@ pub fn probe_roles_loop() -> Function {
     let mut b = FnBuilder::new("probe_roles_loop", 512);
     b.lds(2048);
     b.arg("o", DType::Ptr, 0, 8);
+    // GPU-semantics: the output holds 4 iterations x 512 lanes x 4 bytes; one 2 KB exchange tile (v1.1): both wave groups write their own half (same version =
+    // cooperative fill) and read the partner's data one barrier later
+    b.arg_tensor("o", Ext::c(4 * 512 * 4));
+    b.lds_tile("xchg", 0, 2048);
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let tid = b.let_(Op::WorkitemId);
 
@@ -546,16 +550,22 @@ pub fn probe_roles_loop() -> Function {
     let scaled = b.mul_i32(iter, c1000);
     let base = b.add_i32(scaled, tid);
     b.begin_if(Opnd::Val(is_a));
+    b.tile_produce("xchg", Opnd::I32(0), Opnd::Var(iter));
     b.store_lds_b32(Opnd::Val(lds_off), Opnd::Val(base));
+    b.tile_end();
     b.else_();
     let marked = b.add_i32(base, c100000);
+    b.tile_produce("xchg", Opnd::I32(0), Opnd::Var(iter));
     b.store_lds_b32(Opnd::Val(lds_off), Opnd::Val(marked));
+    b.tile_end();
     b.end_if();
     b.wait_lds(0);
     b.barrier();
     b.wait_lds(0);
 
+    b.tile_consume("xchg", Opnd::I32(0), Opnd::Var(iter));
     let got = b.load_lds_b32(Opnd::Val(partner_off));
+    b.tile_end();
     let out_index_base = b.mul_i32(iter, c512);
     let out_index = b.add_i32(out_index_base, tid);
     let out_off = b.mul_i32(out_index, c4);
