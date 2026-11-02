@@ -105,7 +105,8 @@ fn demo() -> Function {
     let bias = b.frag2(wi, wi);
     let zero = b.frag_zero(DType::Frag16);
     let mut body = Body { ks, vs, kd: kds, kcp, vcp, kdcp, kr, vr, kdr, sel, q: qf, sq, ones, bias, zero, s_init: vec![], s: None, o: None };
-    let pipe = Pipeline::new(Cadence::TwoPhaseOffset, nkv, kv_len, 128, Ext::ka(0x20).ceil_div(128));
+    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, nkv, kv_len, 128, Ext::ka(0x20).ceil_div(128));
+    pipe.prebind = vec![32768, 512];
     pipe.run(&mut b, Role::All, &mut body);
     b.finish()
 }
