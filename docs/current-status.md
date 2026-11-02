@@ -16,6 +16,11 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - 铺满网格（B4H8S2048 / B1H8S8192）：**0.846x / 0.841x 厂商**（结构线已量化关闭）
 - 精度 **mean 8.3e-4**（厂商 1.5–2.9e-3，好 2–3 倍），15/15 形状、64 行 bad=0、确定性全过、1200/1200 次启动单一 md5
 - `cargo test` **115 项 / 29 个测试目标全绿**
+- **出厂 kernel 由 tile 抽象库组合（2026-11-02，分支 `fmha-port`，待 Main 合并）**：默认路径 `fmha_fwd_hd128_mxfp8_auto` 的 4 个 kernel 改为
+  `fmha_fwd_hd128_mxfp8_dsl_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-dsl/src/fmha_tile.rs`：kernel 函数 21/19/23/6 行 + 注意力
+  `AttnBody` 111 行；FMHA ABI/块设置/K-V 环/epilogue/combine 是库组件 `tile/fmha.rs`）。与旧手写集同轮对照：精度/确定性/压力全过，
+  `_vs128` B1H8S2048 bf16 输出 **逐位相同**（`faadf00c…`），split 路径 300/300 单一 md5 与旧集相同；性能见 §4.5。旧手写集保留为
+  `fmha_fwd_hd128_mxfp8_legacy_auto`（`amdc gpu-verify --legacy`），asm md5 不变。
 ---
 
 ## 2. 编译器流水线
@@ -127,13 +132,26 @@ RACE,ARRIVAL-MISMATCH,NO-COMPLETION,UNROLL-LIMIT,TRUST}` 别名，全部既有�
 
 | Kernel | 状态 |
 |---|---|
-| `fmha_fwd_hd128_mxfp8_auto` | **默认**（guard 选择下面三者） |
-| `_vs128` | 单 kernel 快路径（铺满网格 / 64-block 基准），256-row block |
-| `_t128` | 128-row block，中等/混合形状的 fallback |
-| `_kvsplit` + `combine{4,4h,8h,16h}` | KV-split 两段启动（split 形状）；`combine8h` 为默认 combine |
+| `fmha_fwd_hd128_mxfp8_auto` | **默认**（guard 选择下面三者）：`dsl_vs128` / `dsl_t128` / `dsl_kvsplit` + `dsl_kvsplit_combine8h`（tile 库组合，`fmha_tile.rs`） |
+| `fmha_fwd_hd128_mxfp8_legacy_auto` | 旧手写集（下面四行），A/B 对照用 |
+| `_vs128` | 单 kernel 快路径（铺满网格 / 64-block 基准），256-row block（旧手写） |
+| `_t128` | 128-row block，中等/混合形状的 fallback（旧手写） |
+| `_kvsplit` + `combine{4,4h,8h,16h}` | KV-split 两段启动（split 形状）；`combine8h` 为默认 combine（旧手写） |
 | `_t` | 精确 recipe kernel（llvm-tail，311 TFLOP/s；冻结，仅作正确性对照） |
 | `_g2/_g3/_g3o/_pp/_sv/_vs5/_vs6/_vs9/_vsm` | 历史/实验变体，opt-in 或仅按名（负结果记录） |
 | `biasacc` / `p4` / `mubufd` / `cut1` / `saddrlds` / `pmdead` / `epdirect` / `eplds,epw` | opt-in 实验（多数中性或负；`epw` 是 VMEM 宽存储 WAR 的灵敏度探测器） |
+
+### 4.5 tile 库出厂集 vs 旧手写集（同轮，`tools/port_gate.sh fmha_fwd_hd128_mxfp8_dsl`，GPU 6）
+
+| 项 | tile 库（dsl） | 旧手写 | 比值 |
+|---|---|---|---|
+| B1H8S2048 出厂路径（split+combine） | 684.5 | 672.6 | 1.018 |
+| per-CU 64 blocks，8 种代码布局中位数 | 447.0 | 451.2 | 0.991 |
+| B4H8S2048 / B1H8S8192（`_vs128`） | 1409.6 / 1972.3 | 1432.0 / 1993.5 | 0.984 / 0.989 |
+| B2H8S2048 `_t128`，8 布局中位数（24 次） | 1004.3 | 1027.3 | 0.978 |
+
+**代码布局敏感性**：同一 kernel 前置 0..14 条 `s_nop` 使 per-CU `_vs128` 在 444–456 TF/s 间变化（旧、新集相同），单一布局对比不可信；门禁用布局中位数。
+`gpu-verify --shipped --strict`（dsl 四个）：0 错误 0 警告，24 trusted / 100 contracts / 0 unproven，proven 计数与旧集逐项相同。
 
 ### 4.3 精度与确定性
 
@@ -212,8 +230,9 @@ REF_ROWS=64 OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto REF_CO=<vendor.co> bash tests/g
 REF_B=1 REF_H=8 REF_S=2048 REF_SK=2048 REF_WARMUP=150 REF_ITERS=100 ./build/ref_host <vendor.co>
 
 # 确定性 / split 形状压力
-OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto bash tests/gpu/determinism.sh
-bash tools/ohat_repro.sh fmha_fwd_hd128_mxfp8_kvsplit          # 300 次启动 md5
+OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto bash tests/gpu/determinism.sh      # _legacy_auto = 旧手写集
+RUNS=300 bash tools/ohat_repro.sh                                       # 300 次启动 md5（OHAT_PREFIX=fmha_fwd_hd128_mxfp8 = 旧集）
+HIP_VISIBLE_DEVICES=6 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_dsl  # 全套验收 + 同轮旧集对照 + 布局中位数
 ```
 
 ---
