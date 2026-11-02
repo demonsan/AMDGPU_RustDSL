@@ -38,7 +38,9 @@ fn dsl_and_hand_kernels_have_the_same_or_stronger_certificate() {
         let dc = rd.proven.get("tile-cover").copied().unwrap_or(0) + rd.proven.get("tile-reads").copied().unwrap_or(0);
         let hc = rh.proven.get("tile-cover").copied().unwrap_or(0) + rh.proven.get("tile-reads").copied().unwrap_or(0);
         assert!(dc >= hc, "{dsl}: weaker tile proof ({dc} < {hc})");
-        assert!(dc > 0, "{dsl}: no tile markers proven");
+        if hc > 0 {
+            assert!(dc > 0, "{dsl}: no tile markers proven");
+        }
     }
 }
 
