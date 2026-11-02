@@ -178,6 +178,23 @@ if ! skip SKIP_PERF; then
         v=$(awk -v c="$mc" -v r="$base" -v t="$PERF_TOL" 'BEGIN{print (c >= t * r) ? "PASS" : "FAIL"}'); [ "$key" = b2h8s2048 ] && v="INFO($v)"
         row PERF "$key $mode -> $path" "$(printf '%s TF/s (%.3fx vendor %s; runs: %s)' "$mc" "$(awk -v a=$mc -v b=$mv 'BEGIN{print (b > 0) ? a / b : 0}')" "$mv" "$(tr '\n' ' ' < $B/pf_cand)")" "$refs, tol $PERF_TOL" "$v"
     done
+    # Code-layout sensitivity (measured 2026-11-02: shifting the SAME kernel by 0..14 leading s_nop moves per-CU _vs128 by 444..456 TF/s, shipped AND
+    # ported alike): the per-CU comparison is repeated over LAYOUT_PADS code shifts (leading s_nop in the entry block) and the medians are compared.
+    if [ $SAME_AS_SHIP = 0 ] && [ -n "${LAYOUT_PADS-0 1 2 3 4 5 6 7}" ]; then
+        : > "$B/lp_cand"; : > "$B/lp_ship"
+        for pad in ${LAYOUT_PADS-0 1 2 3 4 5 6 7}; do
+            for side in cand ship; do
+                k=$([ $side = cand ] && echo "$KN_VS128" || echo "${SHIP}_vs128")
+                awk -v p=$pad 'BEGIN{d=0} {print} /^BB0:$/ && !d {for (i = 0; i < p; i++) print "    s_nop 0"; d=1}' "$B/$k.s" > "$B/lp.s"
+                "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "$B/lp_$side.co" "$B/lp.s"
+                tf=$(env REF_B=1 REF_H=8 REF_S=2048 REF_SK=2048 REF_ROWS=1 REF_WARMUP=150 REF_ITERS=100 REF_CO2="$B/lp_$side.co" REF_KNAME2="$k" REF_ROWS_PER_BLOCK=256 "$RH" "$REF_CO" 2>&1 | awk '/^timing ours +:/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}')
+                echo "${tf:-0}" >> "$B/lp_$side"
+            done
+        done
+        mc=$(median < "$B/lp_cand"); ms=$(median < "$B/lp_ship")
+        v=$(awk -v c="$mc" -v r="$ms" -v t="$PERF_TOL" 'BEGIN{print (c >= t * r) ? "PASS" : "FAIL"}')
+        row PERF "percu64 layout-median (pads: ${LAYOUT_PADS-0..7})" "$mc TF/s (cand: $(tr '\n' ' ' < $B/lp_cand))" "shipped $ms ($(tr '\n' ' ' < $B/lp_ship))" "$v"
+    fi
 fi
 
 # ---------------------------------------------------------------- table
