@@ -500,6 +500,8 @@ pub struct TileDecl {
     pub base: i64,
     pub slot_size: i64,
     pub slots: u32,
+    /// Per-WAVE private region: slot k (= wave key k) is the scratch of one wave only (`lds_private`): its events never interact with other waves.
+    pub private: bool,
 }
 
 /// The kernel's GPU-semantics contract, checked by `amdgpu_compiler::gpu_verify`.
@@ -865,11 +867,17 @@ impl FnBuilder {
     }
     /// Declares an LDS tile `[base, base+size)` (one slot). Tiles must not overlap each other unless aliased with `lds_alias`.
     pub fn lds_tile(&mut self, name: &str, base: i64, size: i64) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size, slots: 1 });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size, slots: 1, private: false });
     }
     /// Declares a ring of `slots` equal slots starting at `base`.
     pub fn lds_ring(&mut self, name: &str, base: i64, slot_size: i64, slots: u32) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size, slots });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size, slots, private: false });
+    }
+    /// Declares a per-WAVE private LDS region: `waves` slices of `size_per_wave` bytes at `base + wave * size_per_wave`. Mark accesses with `tile_produce/tile_consume(name,
+    /// wave_key, version)` where `wave_key` is THE value the address is computed from (e.g. `base + wave_key * size + lane * 16`): the verifier proves the access lies in the
+    /// slice of that very key (own wave) and that the wave reads only versions it produced and completed itself (no cross-wave publish is needed or assumed).
+    pub fn lds_private(&mut self, name: &str, base: i64, size_per_wave: i64, waves: u32) {
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size_per_wave, slots: waves, private: true });
     }
     /// The two tiles are allowed to overlap (time-multiplexed storage): the lifetime check then requires their events to be ordered like versions of one tile.
     pub fn lds_alias(&mut self, a: &str, b: &str) {

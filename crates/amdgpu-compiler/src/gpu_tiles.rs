@@ -239,10 +239,13 @@ impl<'a> Sim<'a> {
 
     fn open_marker(&mut self, i: usize, produce: bool, tile: &str, slot: &Opnd, ver: &Opnd) {
         let Some(ti) = self.f.contract.tiles.iter().position(|t| t.name == tile) else { return };
-        match (self.cv(slot), self.cv(ver)) {
+        // a private (per-wave) region: the slot operand is the WAVE KEY, checked symbolically against the access address by the interval analysis; the simulation needs no value for it
+        let private = self.f.contract.tiles[ti].private;
+        let slot_cv = if private { CV::K(0) } else { self.cv(slot) };
+        match (slot_cv, self.cv(ver)) {
             (CV::K(s), CV::K(v)) => {
                 let slots = self.f.contract.tiles[ti].slots as i64;
-                if s < 0 || s >= slots {
+                if !private && (s < 0 || s >= slots) {
                     self.diag("GV-TILE-INDEX", Severity::Error, i, format!("stmt {i}: tile `{tile}` slot {s} is outside the declared ring of {slots} slot(s)"));
                     self.open = None;
                     return;
@@ -663,6 +666,28 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     let name = |ti: usize| f.contract.tiles[ti].name.clone();
     for c in infos.iter().filter(|x| !x.ev.produce) {
         *checked += 1;
+        if f.contract.tiles[c.ev.tile].private {
+            // own-wave semantics: the wave reads a version it produced AND completed (wait_vm/wait_lds(0)) itself; no other wave is involved, so no barrier is required
+            let tname = f.contract.tiles[c.ev.tile].name.clone();
+            let own: Vec<&Info> = infos.iter().filter(|p| p.ev.produce && p.ev.tile == c.ev.tile && p.role == c.role).collect();
+            let completed: Vec<&&Info> = own.iter().filter(|p| p.done.map_or(false, |d| d < c.ev.start)).collect();
+            let stmt = c.ev.stmt;
+            let where_ = format!("(role {}, {} iteration(s) simulated)", c.role, n);
+            match completed.iter().max_by_key(|p| p.ev.start) {
+                None => {
+                    let why = match own.iter().find(|p| p.ev.start < c.ev.start) {
+                        Some(p) => format!("the write of version {} (stmt {}) is not completed by this wave (wait_lds(0) / wait_vm(0)) before the read", p.ev.ver, p.ev.stmt),
+                        None => "this wave has produced nothing in the region before the read".to_string(),
+                    };
+                    diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of the private region `{tname}` expecting version {} finds no completed own-wave version: {why} {where_}", c.ev.ver)));
+                }
+                Some(p) if p.ev.ver != c.ev.ver => {
+                    diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of the private region `{tname}` expects version {} but this wave's latest completed version is {} (stmt {}) {where_}", c.ev.ver, p.ev.ver, p.ev.stmt)));
+                }
+                Some(_) => {}
+            }
+            continue;
+        }
         let key = (c.ev.tile, c.ev.slot);
         let prods: Vec<&Info> = infos.iter().filter(|p| p.ev.produce && (p.ev.tile, p.ev.slot) == key).collect();
         let stmt = c.ev.stmt;
@@ -715,7 +740,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
     }
     for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
         for b in infos.iter().skip(i + 1).filter(|x| x.ev.produce) {
-            if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver {
+            if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver && !f.contract.tiles[a.ev.tile].private {
                 let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
                 if aw.0 < bw.1 && bw.0 < aw.1 {
                     diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, format!("stmt {} / stmt {}: roles {} and {} write different versions ({} / {}) of `{}`[{}] in overlapping phases {}..{} / {}..{} (write-write race)", a.ev.stmt, b.ev.stmt, a.role, b.role, a.ev.ver, b.ev.ver, name(a.ev.tile), a.ev.slot, aw.0, aw.1, bw.0, bw.1)));
