@@ -334,6 +334,12 @@ impl Neg for &I32 {
         mul_i(self, &I32::c(-1))
     }
 }
+impl Not for &I32 {
+    type Output = I32;
+    fn not(self) -> I32 {
+        xor_i(self, &I32::c(-1))
+    }
+}
 impl Not for I32 {
     type Output = I32;
     fn not(self) -> I32 {
