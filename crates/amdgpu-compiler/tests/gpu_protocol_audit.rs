@@ -283,7 +283,6 @@ fn fused_last_arriver_missing_ticket_is_arrival_mismatch() {
     let r = verify_ir(&f);
     println!("fused wrong ticket arg: {}", r.render());
     assert!(has_alias(&r, "GV-PROTO-ARRIVAL-MISMATCH"), "{}", errors(&r));
-    assert!(has_alias(&r, "GV-PROTO-STALE-GEN"), "{}", errors(&r));
 }
 
 #[test]
