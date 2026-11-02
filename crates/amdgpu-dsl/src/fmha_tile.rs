@@ -121,7 +121,7 @@ impl FmhaIo {
         let qt = self.q.tile(origin.clone()).clamp(1, self.s_len.clone(), s_last.clone());
         let q_off = b.bind_i32(qt.offset(&[I32::c(0), row.clone(), I32::c(0), lane.half() << 4]));
         let q = RowFrags::load(b, self.q.ptr, q_off);
-        let qdp = self.qsc.tile(origin.clone()).clamp(1, self.s_len.clone(), s_last).ptr(b, &[I32::c(0), row.clone(), I32::c(0), I32::c(0)]);
+        let qdp = self.qsc.tile(origin.clone()).clamp(1, self.s_len.clone(), s_last.clone()).ptr(b, &[I32::c(0), row.clone(), I32::c(0), I32::c(0)]);
         let qd_raw = b.load_f32(qdp, 0);
         let qd = b.bitcast_i32(qd_raw);
         let sel = ScaleSel::new(b, &lane);
