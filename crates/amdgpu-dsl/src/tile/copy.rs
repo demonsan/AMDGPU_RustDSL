@@ -122,12 +122,12 @@ impl DwordRowsCopy {
     }
     pub fn issue(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotRef) {
         assert_eq!(slot.sh.name, self.dst.name, "DwordRowsCopy: slot of another buffer");
-        let off = slot.off_v(b);
+        let soff = slot.off_v(b);
         slot.write(b, |b| {
             let row = self.src.row(key0 + &self.row0);
             let off = b.bind_i32(add0(row * &self.src.stride, &self.src.base));
             let p = b.ptr_add(self.src.ptr, off);
-            let la = b.bind_i32(&self.lds_wave + off);
+            let la = b.bind_i32(&self.lds_wave + soff);
             b.load_global_lds(p, la, 0, 1);
         });
     }
