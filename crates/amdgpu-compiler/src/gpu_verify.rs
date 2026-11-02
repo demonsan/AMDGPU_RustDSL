@@ -298,9 +298,13 @@ impl Ctx {
                 c.konst.insert(s, *lo);
             }
         }
-        for (off, e) in &f.contract.ka_defs {
-            if let Some(p) = c.ext_poly(e) {
-                c.subst.insert(Sym::Ka(*off), p);
+        // kernarg definitions: substituted to a fixpoint, so the result does not depend on the declaration order (an acyclic set of n definitions is fully
+        // substituted after n passes; for definitions already in dependency order every pass after the first reproduces the same polynomials)
+        for _ in 0..f.contract.ka_defs.len().max(1) {
+            for (off, e) in &f.contract.ka_defs {
+                if let Some(p) = c.ext_poly(e) {
+                    c.subst.insert(Sym::Ka(*off), p);
+                }
             }
         }
         // grid definitions: substitute (the right-hand side is converted with the substitutions known so far)

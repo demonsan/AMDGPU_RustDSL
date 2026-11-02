@@ -189,27 +189,29 @@ impl TensorDecl {
                 },
             };
         }
+        // loads in declaration order
         let mut vals: Vec<I32> = Vec::with_capacity(n);
-        for (i, s) in self.strides.iter().enumerate() {
+        for s in &self.strides {
             match s {
                 Stride::Unit => vals.push(I32::c(self.elem_bytes as i32)),
                 Stride::Derived(e) => vals.push(e.clone()),
-                Stride::Ka(sname, off) => {
-                    let v = ka.i32(b, sname, *off);
-                    vals.push(ev(v));
-                    if self.packed && self.same_strides.is_none() {
-                        match &packed_v[i] {
-                            Cx::K(k) => b.ka_range(*off, *k, *k),
-                            Cx::E(e) => b.ka_is(*off, e.clone()),
-                        }
-                    }
-                    if let Some(o) = &self.same_strides {
-                        match (&o.contract_strides[i], o.stride_offs[i]) {
-                            (Cx::K(k), _) => b.ka_range(*off, *k, *k),
-                            (_, Some(ooff)) => b.ka_is(*off, Ext::ka(ooff)),
-                            (Cx::E(e), None) => b.ka_is(*off, e.clone()),
-                        }
-                    }
+                Stride::Ka(sname, off) => vals.push(ev(ka.i32(b, sname, *off))),
+            }
+        }
+        // contract relations innermost first (a relation refers only to inner strides: the definitions are emitted in dependency order)
+        for i in (0..n).rev() {
+            let Stride::Ka(_, off) = &self.strides[i] else { continue };
+            if self.packed && self.same_strides.is_none() {
+                match &packed_v[i] {
+                    Cx::K(k) => b.ka_range(*off, *k, *k),
+                    Cx::E(e) => b.ka_is(*off, e.clone()),
+                }
+            }
+            if let Some(o) = &self.same_strides {
+                match (&o.contract_strides[i], o.stride_offs[i]) {
+                    (Cx::K(k), _) => b.ka_range(*off, *k, *k),
+                    (_, Some(ooff)) => b.ka_is(*off, Ext::ka(ooff)),
+                    (Cx::E(e), None) => b.ka_is(*off, e.clone()),
                 }
             }
         }
