@@ -11022,9 +11022,11 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                         let w0 = b.let_(Op::AddI32(Opnd::Val(hv[0]), Opnd::Val(s0)));
                         let w1 = b.let_(Op::AddI32(Opnd::Val(hv[2]), Opnd::Val(s1)));
                         let ad = waddr[4 * ec + q];
+                        b.tile_produce("epi", Opnd::Val(wid_e), Opnd::I32(0));
                         b.store_lds_b32(Opnd::Val(ad), Opnd::Val(w0));
                         let ad4 = b.add_i32(ad, c4);
                         b.store_lds_b32(Opnd::Val(ad4), Opnd::Val(w1));
+                        b.tile_end();
                         if fmha_t_opt("epw") {
                             b.wait_lds(0); // diagnostic: the DS pair has read its data registers before they are reused
                         }
@@ -11032,7 +11034,9 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                 }
                 b.wait_lds(0);
                 for i in 0..4usize {
+                    b.tile_consume("epi", Opnd::Val(wid_e), Opnd::I32(0));
                     let v = b.load_lds_b128(Opnd::Val(raddr[i]));
+                    b.tile_end();
                     if fwt { b.store_f32x4_wt(gptr[i], (128 * pr) as u32, v); } else { b.store_f32x4(gptr[i], (128 * pr) as u32, v); }
                 }
                 b.wait_lds(0);
@@ -11221,11 +11225,15 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
                         wv.push(b.bitcast_i32(v));
                     }
                     let f4 = b.frag4(wv[0], wv[1], wv[2], wv[3]);
+                    b.tile_produce("epi", Opnd::Val(wid_e), Opnd::I32(0));
                     b.store_lds_b128(Opnd::Val(waddr[q]), Opnd::Val(f4));
+                    b.tile_end();
                 }
                 b.wait_lds(0);
                 for i in 0..4usize {
+                    b.tile_consume("epi", Opnd::Val(wid_e), Opnd::I32(0));
                     let v = b.load_lds_b128(Opnd::Val(raddr[i]));
+                    b.tile_end();
                     b.store_f32x4(gptr[i], (128 * e) as u32, v);
                 }
                 b.wait_lds(0);
@@ -20843,6 +20851,11 @@ fn fmha_vs_tiles(b: &mut FnBuilder) {
     b.lds_tile("ones", 67584, 2048);
     b.lds_tile("Q1", 69632, 16384);
     b.lds_tile("Q0", 86016, 16384);
+    // epilogue: every wave transposes through its own 4 KB scratch (8 x 4096 from the Q staging base, which is dead after the loop and a barrier): private to the wave, written and read back by it
+    b.lds_private("epi", 69632, 4096, 8);
+    b.lds_alias("epi", "Q1");
+    b.lds_alias("epi", "Q0");
+    b.lds_alias("epi", "V");
     // the K and V rings share the 2 x 32 KB window (disjoint halves of every slot) and the V ring's declared extent also covers the small regions behind it
     b.lds_alias("K", "V");
     b.lds_alias("V", "KD");
