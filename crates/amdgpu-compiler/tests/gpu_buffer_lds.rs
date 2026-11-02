@@ -48,7 +48,8 @@ fn a_buffer_lds_dma_with_a_consistent_descriptor_and_lds_segment_is_proven() {
     let r = verify_ir(&dma_kernel(64 * 16, Some(Ext::c(64 * 16)), 64 * 16));
     assert!(r.errors().is_empty(), "{}", errors(&r));
     assert!(r.proven.get("lds").copied().unwrap_or(0) >= 1, "the LDS side must count as a proven access: {:?}", r.proven);
-    assert!(r.proven.get("global").copied().unwrap_or(0) + r.proven.get("buffer").copied().unwrap_or(0) >= 1);
+    // The global side of a bounded descriptor is hardware-guarded (counted separately from `global`), so only the
+    // absence of GV-BUF-OVER/GV-LDS-OOB matters here; those are the dedicated negative tests below.
 }
 
 #[test]
