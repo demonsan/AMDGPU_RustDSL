@@ -637,7 +637,7 @@ fn period_bits(f: &Function) -> (u32, u32) {
             }
         }
     }
-    (m_best.max(if xor_any { 1 } else { 0 }), mul_best)} else { 0 }), a.mul_log2)
+    (m_best.max(if xor_any { 1 } else { 0 }), mul_best)
 }
 
 /// The claimed period must be a TRUE period of what the simulator actually executes: for every marker statement the simulated slot sequence must repeat after `p` iterations
