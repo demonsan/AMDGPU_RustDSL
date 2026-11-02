@@ -82,6 +82,7 @@ docs/                   设计、逐轮状态、厂商 spec、认证与归因（
 | [`docs/current-status.md`](docs/current-status.md) | **权威当前快照**（架构、DSL、kernel、数字、已关闭方向、复现命令） |
 | [`docs/gpu-semantics-verifier.md`](docs/gpu-semantics-verifier.md) | **GPU 语义验证器**：global/LDS/VGPR/SGPR 越界与生命周期证明（地址模型、LDS tile 协议、寄存器规则、路径敏感等待、barrier 协议、trust 预算、诚实边界） |
 | [`docs/gpu-semantics-audit.md`](docs/gpu-semantics-audit.md) | **独立对抗审计**：攻击表、发现的 soundness 漏洞与修复、最终 verdict（v4 四轴审计） |`n| [`docs/gpu-semantic-protocol.md`](docs/gpu-semantic-protocol.md) | **四轴协议模型（v4）**：到达/完成/可见/代际分开建模；多生产者/多消费者双向义务 O1–O4 的静态 discharge；全局内存 region + last-arriver 模式；信任账本 |
+| [`docs/fmha-dsl-tour.md`](docs/fmha-dsl-tour.md) | **FMHA 逐段教程**：用真实 kernel 讲每一段的 DSL 特性与 Rust safe 怎么保证（面向没写过 Rust kernel 的读者） |
 | [`docs/rust-safety.md`](docs/rust-safety.md) | **Rust 安全性如何保证**（`#![forbid(unsafe_code)]`、零依赖、类型层 ISA 规则、验证器、panic 策略、安全边界） |
 | [`docs/rust-safety-by-example.md`](docs/rust-safety-by-example.md) | **逐项 + 真实代码**：写 DSL kernel 时编译器如何保证 Rust safe（A1–A10），手写 asm 时 safe-asm 如何保证（B1–B16），29 个编译失败负例 |
 | [`docs/design.md`](docs/design.md) | Rust DSL 与自研 compiler 设计规格 |
