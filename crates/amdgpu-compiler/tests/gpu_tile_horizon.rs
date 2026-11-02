@@ -169,13 +169,11 @@ fn tile_trust_periodic_escape_is_listed_but_can_hide_a_late_race() {
 }
 
 #[test]
-fn xor_marker_period_512_is_underestimated_as_2() {
-    // version = nxt ^ 256: 0,257,258,...,511,0,1,... has period 512. period_bits only sees the
-    // low-bit mask of the slot and prints "period dividing 2"; the gate accepts the marker.
+fn xor_marker_period_512_is_gated_not_underestimated() {
+    // version = nxt ^ 256: 0,257,258,...,511,0,1,... has period 512. v1.5 counts the width of XOR constants in the period bound, so the marker is gated
+    // (GV-TILE-UNROLL-LIMIT naming the 512-iteration period) instead of being accepted with a wrong "period dividing 2" claim.
     let r = verify_ir(&ring(0, 3, false));
-    println!("ring version ^ 256: {}", r.render());
-    assert!(!has(&r, "GV-TILE-UNROLL-LIMIT"), "XOR form unexpectedly gated: {}", errors(&r));
-    let period = r.findings.iter().find(|f| f.code == "GV-TILE-PERIOD" && f.msg.contains("period dividing")).map(|f| f.msg.clone());
-    assert!(period.is_some(), "expected a period claim: {}", r.render());
-    assert!(period.unwrap().contains("dividing 2"), "the claim should be wrong (2, real 512): {}", r.render());
+    assert!(has(&r, "GV-TILE-UNROLL-LIMIT"), "the XOR form must be gated: {}", r.render());
+    assert!(r.errors().iter().any(|e| e.msg.contains("period of up to 512")), "{}", r.render());
+    assert!(!r.findings.iter().any(|f| f.code == "GV-TILE-PERIOD" && f.msg.contains("dividing 2 ")), "no wrong period claim may be printed: {}", r.render());
 }

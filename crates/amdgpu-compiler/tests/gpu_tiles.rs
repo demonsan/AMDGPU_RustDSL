@@ -12,6 +12,8 @@ struct Opt {
     deep: bool,
     /// ring index mask (default slots - 1)
     mask: Option<i32>,
+    /// version transform applied to the produced AND the expected version: 0 none, 1 ^256, 2 <<8, 3 *256, 4 <<24
+    vt: u8,
     slots: u32,
     prologue_barrier: bool,
     producer_wait: bool,
@@ -21,7 +23,7 @@ struct Opt {
 }
 
 fn good() -> Opt {
-    Opt { trip: None, cap: None, deep: false, mask: None, slots: 2, prologue_barrier: true, producer_wait: true, consume_ver_off: 0, write_extra: 0, consumer_wait: true }
+    Opt { trip: None, cap: None, deep: false, mask: None, vt: 0, slots: 2, prologue_barrier: true, producer_wait: true, consume_ver_off: 0, write_extra: 0, consumer_wait: true }
 }
 
 fn has(rep: &Report, code: &str) -> bool {
@@ -30,6 +32,16 @@ fn has(rep: &Report, code: &str) -> bool {
 
 fn errors(rep: &Report) -> String {
     rep.errors().iter().map(|e| format!("[{}] {}", e.code, e.msg)).collect::<Vec<_>>().join("\n")
+}
+
+fn vtrans(b: &mut FnBuilder, vt: u8, v: amdgpu_dsl::ValueId) -> amdgpu_dsl::ValueId {
+    match vt {
+        1 => b.let_(Op::XorI32(Opnd::Val(v), Opnd::I32(256))),
+        2 => b.let_(Op::ShlI32(Opnd::Val(v), Opnd::I32(8))),
+        3 => b.mul_i32(v, Opnd::I32(256)),
+        4 => b.let_(Op::ShlI32(Opnd::Val(v), Opnd::I32(24))),
+        _ => v,
+    }
 }
 
 /// role P (waves with tid < 64) produces slot (it+1)&mask version it+1 while role C reads slot it&mask version it, one barrier per iteration.
@@ -82,7 +94,8 @@ fn proto(o: Opt) -> Function {
     };
     let c1024 = b.c_i32(1024);
     b.begin_if(is_p);
-    b.tile_produce("buf", slot_n, nxt);
+    let pv = vtrans(&mut b, o.vt, nxt);
+    b.tile_produce("buf", slot_n, pv);
     let base_n = b.mul_i32(slot_n, c1024);
     let wa = b.add_i32(base_n, lane16);
     let wa = b.add_i32(wa, Opnd::I32(o.write_extra));
@@ -90,7 +103,8 @@ fn proto(o: Opt) -> Function {
     b.tile_end();
     b.else_();
     let ver = b.add_i32(it, Opnd::I32(o.consume_ver_off));
-    b.tile_consume("buf", slot_c, ver);
+    let cvv = vtrans(&mut b, o.vt, ver);
+    b.tile_consume("buf", slot_c, cvv);
     let base_c = b.mul_i32(slot_c, c1024);
     let ra = b.add_i32(base_c, lane16);
     let _r = b.load_lds_b128(ra);
@@ -492,4 +506,39 @@ fn a_private_region_overlapping_a_shared_tile_is_rejected() {
 fn an_unmarked_access_that_may_touch_a_private_region_is_rejected() {
     let r = verify_ir(&private_kernel(Priv { untagged_poke: true, ..good_priv() }));
     assert!(has(&r, "GV-TILE-PRIVATE-ESCAPE"), "{}", r.render());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// the period claim must be a TRUE period (kernel-occ audit-of-record)
+
+#[test]
+fn a_version_xored_with_a_wide_constant_has_a_long_period_and_is_rejected() {
+    // version = nxt ^ 256: the relation between neighbouring versions changes every 512 iterations
+    let r = verify_ir(&proto(Opt { vt: 1, ..good() }));
+    assert!(has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
+    assert!(r.errors().iter().any(|e| e.msg.contains("period of up to 512")), "{}", r.render());
+}
+
+#[test]
+fn a_huge_multiplier_or_shift_that_can_wrap_the_version_is_rejected() {
+    let r = verify_ir(&proto(Opt { vt: 4, ..good() })); // << 24: wraps after 256 iterations
+    assert!(has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
+    assert!(r.errors().iter().any(|e| e.msg.contains("wrap")), "{}", r.render());
+}
+
+#[test]
+fn affine_scalings_report_a_verified_period_not_a_made_up_one() {
+    // version = nxt << 8 and nxt * 256 advance by a constant 256 per iteration: truly period 1 in the relative sense; the claim is verified on the simulated sequence
+    for vt in [2u8, 3] {
+        let r = verify_ir(&proto(Opt { vt, ..good() }));
+        assert!(r.errors().is_empty(), "vt {vt}: {}", errors(&r));
+        assert!(r.findings.iter().any(|x| x.code == "GV-TILE-PERIOD" && x.msg.contains("VERIFIED")), "{}", r.render());
+    }
+}
+
+#[test]
+fn a_genuine_period_two_ring_still_reports_a_verified_true_period() {
+    let r = verify_ir(&proto(good()));
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+    assert!(r.findings.iter().any(|x| x.code == "GV-TILE-PERIOD" && x.msg.contains("dividing 2 ") && x.msg.contains("VERIFIED")), "{}", r.render());
 }
