@@ -18,7 +18,8 @@
 //! `a - b` (I32) = `a + b * -1` (`a + (-k)` for a literal), `-a` = `a * -1`, `!a` (bitwise) = `a ^ -1`, `a | b` = `(a ^ b) + (a & b)`, `a.max(b)` (I32) =
 //! `select(a < b, b, a)`, `a > b` = `b < a`, `a <= b` = `b >= a`, `a.ne(b)` = `min(a - b, -(a - b)) < 0`, `a.eq(b)` = `!a.ne(b)`, `-x` (F32) = `x * -1.0`, `x > y` (F32) = `y < x`.
 //! There is deliberately NO `/` and NO implicit fma: `a * b + c` stays `MulF32` + `AddF32` (a fused multiply-add changes rounding); write `a.fma(b, c)` to get `FmaF32`.
-//! There is no expression-level optimisation or CSE beyond the per-`bind` sharing: what you write is what is emitted.
+//! There is no expression-level optimisation or CSE beyond the per-`bind` sharing: what you write is what is emitted. Literals become `ConstI32/ConstF32` statements at their first use
+//! (`hoist_i32` / `hoist_f32` place them up front, like manual code) and are reused afterwards in the same or an inner scope; the reuse table is cleared when an `if`/`else`/loop scope closes.
 
 use std::collections::HashMap;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Mul, Neg, Not, Shl, Shr, Sub};
@@ -463,8 +464,22 @@ impl Lower<'_> {
         }
         let v = match &**x {
             Node::Val(v) => *v,
-            Node::CI(c) => self.b.c_i32(*c),
-            Node::CF(c) => self.b.c_f32(*c),
+            Node::CI(c) => match self.b.expr_consts.get(&(false, *c as u32)) {
+                Some(v) => *v,
+                None => {
+                    let v = self.b.c_i32(*c);
+                    self.b.expr_consts.insert((false, *c as u32), v);
+                    v
+                }
+            },
+            Node::CF(c) => match self.b.expr_consts.get(&(true, c.to_bits())) {
+                Some(v) => *v,
+                None => {
+                    let v = self.b.c_f32(*c);
+                    self.b.expr_consts.insert((true, c.to_bits()), v);
+                    v
+                }
+            },
             Node::AddI(a, c) => {
                 let (a, c) = (self.go(a), self.go(c));
                 self.b.add_i32(a, c)
@@ -572,6 +587,24 @@ impl FnBuilder {
     #[doc(hidden)]
     pub fn stmt_count(&self) -> usize {
         self.f.stmts.len()
+    }
+    /// Materialises these i32 constants NOW, in this order, and lets every later expression reuse them (the manual style declares its constants up front; this keeps the
+    /// emitted instruction order - and so the register allocation - identical to such a kernel). Without it a literal is materialised at its first use and then reused.
+    pub fn hoist_i32(&mut self, vals: &[i32]) {
+        for &v in vals {
+            if !self.expr_consts.contains_key(&(false, v as u32)) {
+                let id = self.c_i32(v);
+                self.expr_consts.insert((false, v as u32), id);
+            }
+        }
+    }
+    pub fn hoist_f32(&mut self, vals: &[f32]) {
+        for &v in vals {
+            if !self.expr_consts.contains_key(&(true, v.to_bits())) {
+                let id = self.c_f32(v);
+                self.expr_consts.insert((true, v.to_bits()), id);
+            }
+        }
     }
     /// An already-bound i32 value as an expression leaf.
     pub fn i32v(&self, v: ValueId) -> I32 {

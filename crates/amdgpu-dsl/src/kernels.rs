@@ -19211,6 +19211,7 @@ pub fn probe_expr_ids() -> Function {
     let o = b.let_(Op::KernargPtr { offset: 0 });
     let (tid, x, y, z) = (b.let_(Op::WorkitemId), b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
     let (tid, x, y, z) = (b.i32v(tid), b.i32v(x), b.i32v(y), b.i32v(z));
+    b.hoist_i32(&[2, 3, 4, 10, 64, 100, 1000]); // the manual kernel declares its constants up front: same order => same register allocation
     let idx = b.let_i32(((&z * 2 + &y) * 3 + &x) * 64 + &tid);
     let val = b.bind_i32(((&z * 100 + &y * 10 + &x) * 1000) + &tid);
     let q = b.bind_ptr(b.ptrv(o) + idx * 4);

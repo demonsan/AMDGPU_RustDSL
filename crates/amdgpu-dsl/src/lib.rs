@@ -830,6 +830,8 @@ impl Function {
 /// Builder that allocates ids and keeps the statement stream balanced.
 pub struct FnBuilder {
     pub f: Function,
+    /// constants materialised by the expression layer (`expr.rs`), keyed by (is_float, bits): reused by later `bind`s in the same or an inner scope, cleared when a scope closes
+    pub(crate) expr_consts: std::collections::HashMap<(bool, u32), ValueId>,
 }
 
 impl FnBuilder {
@@ -847,6 +849,7 @@ impl FnBuilder {
                 value_tys: Vec::new(),
                 allow_var_rereads: false,
             },
+            expr_consts: Default::default(),
         }
     }
 
@@ -1067,6 +1070,7 @@ impl FnBuilder {
     }
 
     pub fn end_loop(&mut self) {
+        self.expr_consts.clear();
         self.f.stmts.push(Stmt::EndLoop);
     }
 
@@ -1075,10 +1079,12 @@ impl FnBuilder {
     }
 
     pub fn else_(&mut self) {
+        self.expr_consts.clear();
         self.f.stmts.push(Stmt::Else);
     }
 
     pub fn end_if(&mut self) {
+        self.expr_consts.clear();
         self.f.stmts.push(Stmt::EndIf);
     }
 
