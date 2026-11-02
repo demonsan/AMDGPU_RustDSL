@@ -7,6 +7,7 @@ pub mod asm_check;
 pub mod pin_check;
 pub mod backend;
 pub mod emit;
+pub mod gpu_verify;
 pub mod hazards;
 pub mod lower;
 pub mod mir;
@@ -27,6 +28,7 @@ pub fn compile(f: &amdgpu_dsl::Function) -> Result<Compiled, String> {
 /// Same pipeline, with a selectable tail backend (OwnTail or LlvmTail).
 pub fn compile_with(f: &amdgpu_dsl::Function, tail: &dyn backend::TailBackend) -> Result<Compiled, String> {
     let (m, alloc) = lower_and_allocate(f)?;
+    gpu_verify::enforce(f, &m, &alloc)?;
     let asm = tail.finish(&m, &alloc)?;
     Ok(Compiled { asm, vgpr: alloc.max_v, sgpr: alloc.max_s })
 }

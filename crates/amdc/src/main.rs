@@ -156,6 +156,47 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        "gpu-verify" => {
+            // amdc gpu-verify <kernel|--all> [--strict]: the GPU-semantics report (docs/gpu-semantics-verifier.md); exit 1 when --strict and an error was found
+            let strict = args.iter().any(|a| a == "--strict");
+            let names: Vec<String> = match args.get(1).map(|s| s.as_str()) {
+                Some("--all") => amdgpu_compiler::kernel_names().iter().map(|s| s.to_string()).collect(),
+                Some("--shipped") => ["fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_t128", "fmha_fwd_hd128_mxfp8_kvsplit", "fmha_fwd_hd128_mxfp8_kvsplit_combine8h", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_vs5", "fmha_fwd_hd128_mxfp8_vs9", "fmha_fwd_hd128_mxfp8_vs", "fmha_fwd_hd128_mxfp8_auto"].iter().map(|s| s.to_string()).collect(),
+                Some(n) => vec![n.to_string()],
+                None => {
+                    usage();
+                    return ExitCode::from(2);
+                }
+            };
+            let mut bad = false;
+            for name in names {
+                let Some(f) = amdgpu_compiler::kernel_by_name(&name) else {
+                    eprintln!("unknown kernel: {name}");
+                    return ExitCode::from(2);
+                };
+                match amdgpu_compiler::gpu_verify::analyse(&f) {
+                    Ok(r) => {
+                        let errs = r.errors().len();
+                        println!("== {name}: {} finding(s), {errs} error(s); proven {:?}", r.findings.len(), r.proven);
+                        for fd in &r.findings {
+                            if args.iter().any(|a| a == "-v") || fd.severity != amdgpu_compiler::gpu_verify::Severity::Info {
+                                println!("  [{}] {:?}: {}", fd.code, fd.severity, fd.msg);
+                            }
+                        }
+                        bad |= errs > 0;
+                    }
+                    Err(e) => {
+                        println!("== {name}: compile error: {e}");
+                        bad = true;
+                    }
+                }
+            }
+            if strict && bad {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         "mops" => {
             // amdc mops <kernel>: the distinct machine opcodes (MOp variants) of the final MIR of a kernel, one per line (the coverage sweep tools/llvm_opcode_sweep.sh uses it)
             let Some(name) = args.get(1) else {

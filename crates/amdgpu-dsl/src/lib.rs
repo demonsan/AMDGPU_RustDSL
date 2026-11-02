@@ -502,6 +502,9 @@ pub struct Contract {
     /// (axis, expr): the launch grid dimension equals `expr` (host contract), e.g. grid z = `sym("B") * ka(0x280)` for a split launch; the analyzer substitutes it, so
     /// products and quotients by the same factor simplify exactly without a division operator.
     pub grid_defs: Vec<(u8, Ext)>,
+    /// (kernarg offset, expr): the 32-bit kernarg scalar at that offset EQUALS `expr` (host contract), e.g. a row stride `ka(0x70) == grid_y * ka(0x90)`; substituted by
+    /// the analyzer like the grid definitions.
+    pub ka_defs: Vec<(u32, Ext)>,
     /// (symbol name, lo, hi) bounds of free symbols.
     pub sym_ranges: Vec<(String, i64, i64)>,
 }
@@ -815,6 +818,10 @@ impl FnBuilder {
     /// Host contract: launch grid axis (0 = x, 1 = y, 2 = z) equals `expr`, e.g. `b.grid_is(2, Ext::sym("B") * Ext::ka(0x280))` for B batches x splits.
     pub fn grid_is(&mut self, axis: u8, expr: Ext) {
         self.f.contract.grid_defs.push((axis, expr));
+    }
+    /// Host contract: the u32 kernarg scalar at `offset` equals `expr` (e.g. strides derived from the shape: `b.ka_is(0x70, Ext::grid_y() * Ext::ka(0x90))`).
+    pub fn ka_is(&mut self, offset: u32, expr: Ext) {
+        self.f.contract.ka_defs.push((offset, expr));
     }
     /// Bounds of a free `Ext::sym` (default [1, +inf)).
     pub fn sym_range(&mut self, name: &str, lo: i64, hi: i64) {
