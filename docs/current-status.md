@@ -75,6 +75,16 @@ cargo run --bin amdc -- gpu-verify --shipped --strict      # 出厂 kernel 的�
 tile 内字节级重叠、`_kvsplit` 的 160 处 epilogue scratch（界已证、生命周期未证，Warn）、角色数 2 / 迭代数相等假设。
 独立审计发现并修复了 2 个 soundness 漏洞（`assume` 归纳违反应为 Error；仿射长周期 marker 逃逸 horizon），
 并用硬件实测校正了 MFMA 对齐规则（VGPR 偶数，不是 16 对齐）。
+**v4 通用协议模型**（[`gpu-semantic-protocol.md`](gpu-semantic-protocol.md)）：把上述检查统一成 **四轴分离** 的协议 —
+**到达**（`s_barrier` tick，只表示到达）、**完成**（`wait_vm(0)/wait_lds(0)/fence_release`，每 wave 队列计数）、
+**可见**（LDS 用 barrier 传递；全局用 release→barrier→acquire + `sc1`）、**代际**（仿射/周期 version-slot 代数 + 周期门）。
+参与者是 **多生产者**（同角色多 wave 协作填充 / 多分支 / 多 block）与 **多消费者**（每个角色、每个 wave 独立消费），
+编译器静态 discharge 四条双向义务：**O1 完成先于发布**、**O2 发布先于读**、**O3 读完先于覆写**、**O4 代际一致**；
+判不出的进 **可计数信任账本**（`assume_trusted` / `tile_trust_periodic` / `region_trust`，证书行逐项打印）。
+全局内存也有实例（`buf_region/buf_produce/buf_consume`，v1 限工作组内）+ 显式 **last-arriver 融合 combine 模式**
+（release → ticket atomic → acquire → 读所有 split）：`probe_last_arriver` 的 full/lite/plain_fenced 三种模式 `--strict` 0 错误，
+`nofence/plain` 负例被拒。LDS 实例的 verdict 保留旧 `GV-TILE-*` 为主名、新增 `GV-PROTO-{UNPUBLISHED,NOT-VISIBLE,STALE-GEN,
+RACE,ARRIVAL-MISMATCH,NO-COMPLETION,UNROLL-LIMIT,TRUST}` 别名，全部既有测试不变、判定未放宽。
 
 ---
 
@@ -166,7 +176,7 @@ tile 内字节级重叠、`_kvsplit` 的 160 处 epilogue scratch（界已证、
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **36 个目标 / 195 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
+- **测试**：`cargo test` **37 个目标 / 212 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
   `register_accounting`、`asm_assembles`、`hazard_classes`、`hazard_oracle`、`phys_waw`、`ra_reaching`、
   `pin_check`、`pinning`、`dead_loads`、`var_lint`、`smfmac_hazards`、`dma_hazards`、`lite_contract` …）
 - **硬件探针**（`tools/`，**29 个脚本**）：`vendor_validate.sh`、`vendor_counters.sh`、`vendor_disasm.sh`、
@@ -217,7 +227,7 @@ bash tools/ohat_repro.sh fmha_fwd_hd128_mxfp8_kvsplit          # 300 次启动 m
 | `rust-safety-by-example.md` | **逐项 + 真实代码**：DSL kernel 写法下编译器如何保证 Rust safe（A1–A10），手写 asm 时 safe-asm 如何保证（B1–B16），29 个编译失败负例 |
 | `llvm-feature-audit.md` | **LLVM AMDGPU CodeGen 测试覆盖审计**（4996 个测试逐一核对 + 可执行验证 + llc 对照） |
 | `gpu-semantics-verifier.md` | **GPU 语义验证器**：global/LDS/VGPR/SGPR 的越界与生命周期证明（模型、合同、错误分类、trust 预算） |
-| `gpu-semantics-audit.md` | **独立对抗审计**：攻击表、发现的 soundness 漏洞与修复、最终 verdict 与剩余边界 |
+| `gpu-semantics-audit.md` | **独立对抗审计**（v4 审计 of record）：攻击表、发现的 soundness 漏洞与修复、四轴分离 verdict、信任账本与剩余边界 |`n| `gpu-semantic-protocol.md` | **四轴协议模型（v4）**：到达/完成/可见/代际分开建模；多生产者/多消费者双向义务 O1–O4 静态 discharge；全局 region + last-arriver 模式；信任账本 |
 | `design.md` | Rust DSL 与自研编译器设计规格 |
 | `status.md` | 25 轮逐轮实现记录（含所有正负结果与归因） |
 | `vendor-spec.md` | 厂商 kernel 事实 + §7.5–§7.11 认证表与归因 |
