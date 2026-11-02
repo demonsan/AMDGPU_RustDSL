@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Mul, Neg, Not, Shl, Shr, Sub};
 use std::rc::Rc;
 
-use crate::{DType, FnBuilder, Op, Opnd, ValueId};
+use crate::{DType, FnBuilder, Op, Opnd, ValueId, VarId};
 
 type N = Rc<Node>;
 
@@ -33,6 +33,8 @@ type N = Rc<Node>;
 #[derive(Debug)]
 pub enum Node {
     Val(ValueId),
+    /// A loop variable read (lowered to an Opnd::Var operand of its user: no statement of its own).
+    Var(VarId),
     CI(i32),
     CF(f32),
     AddI(N, N),
@@ -450,20 +452,22 @@ impl Add<i32> for Ptr {
 
 struct Lower<'a> {
     b: &'a mut FnBuilder,
-    memo: HashMap<*const Node, ValueId>,
+    memo: HashMap<*const Node, Opnd>,
 }
 
 impl Lower<'_> {
-    fn go(&mut self, x: &N) -> ValueId {
-        if let Node::Val(v) = &**x {
-            return *v;
+    fn go(&mut self, x: &N) -> Opnd {
+        match &**x {
+            Node::Val(v) => return Opnd::Val(*v),
+            Node::Var(v) => return Opnd::Var(*v),
+            _ => {}
         }
         let key = Rc::as_ptr(x);
-        if let Some(v) = self.memo.get(&key) {
-            return *v;
+        if let Some(v) = self.memo.get(&key).copied() {
+            return v;
         }
-        let v = match &**x {
-            Node::Val(v) => *v,
+        let v: ValueId = match &**x {
+            Node::Val(_) | Node::Var(_) => unreachable!("leaves return early"),
             Node::CI(c) => match self.b.expr_consts.get(&(false, *c as u32)) {
                 Some(v) => *v,
                 None => {
@@ -494,11 +498,11 @@ impl Lower<'_> {
             }
             Node::LshrI(a, c) => {
                 let (a, c) = (self.go(a), self.go(c));
-                self.b.let_(Op::LshrI32(Opnd::Val(a), Opnd::Val(c)))
+                self.b.let_(Op::LshrI32(a, c))
             }
             Node::AndI(a, c) => {
                 let (a, c) = (self.go(a), self.go(c));
-                self.b.let_(Op::AndI32(Opnd::Val(a), Opnd::Val(c)))
+                self.b.let_(Op::AndI32(a, c))
             }
             Node::XorI(a, c) => {
                 let (a, c) = (self.go(a), self.go(c));
@@ -526,11 +530,11 @@ impl Lower<'_> {
             }
             Node::FmaF(a, c, d) => {
                 let (a, c, d) = (self.go(a), self.go(c), self.go(d));
-                self.b.let_(Op::FmaF32(Opnd::Val(a), Opnd::Val(c), Opnd::Val(d)))
+                self.b.let_(Op::FmaF32(a, c, d))
             }
             Node::ExpF(a) => {
                 let a = self.go(a);
-                self.b.let_(Op::ExpF32(Opnd::Val(a)))
+                self.b.let_(Op::ExpF32(a))
             }
             Node::Exp2F(a) => {
                 let a = self.go(a);
@@ -538,7 +542,7 @@ impl Lower<'_> {
             }
             Node::Log2F(a) => {
                 let a = self.go(a);
-                self.b.let_(Op::Log2F32(Opnd::Val(a)))
+                self.b.let_(Op::Log2F32(a))
             }
             Node::RcpF(a) => {
                 let a = self.go(a);
@@ -550,19 +554,19 @@ impl Lower<'_> {
             }
             Node::CmpGeI(a, c) => {
                 let (a, c) = (self.go(a), self.go(c));
-                self.b.let_(Op::CmpGeI32(Opnd::Val(a), Opnd::Val(c)))
+                self.b.let_(Op::CmpGeI32(a, c))
             }
             Node::CmpLtF(a, c) => {
                 let (a, c) = (self.go(a), self.go(c));
-                self.b.let_(Op::CmpLtF32(Opnd::Val(a), Opnd::Val(c)))
+                self.b.let_(Op::CmpLtF32(a, c))
             }
             Node::NotC(a) => {
                 let a = self.go(a);
-                self.b.let_(Op::NotI1(Opnd::Val(a)))
+                self.b.let_(Op::NotI1(a))
             }
             Node::Select(ty, c, a, d) => {
                 let (c, a, d) = (self.go(c), self.go(a), self.go(d));
-                self.b.let_(Op::Select { ty: *ty, cond: Opnd::Val(c), a: Opnd::Val(a), b: Opnd::Val(d) })
+                self.b.let_(Op::Select { ty: *ty, cond: c, a, b: d })
             }
             Node::PtrAdd(base, off) => {
                 let (base, off) = (self.go(base), self.go(off));
@@ -577,8 +581,8 @@ impl Lower<'_> {
                 self.b.bitcast_i32(a)
             }
         };
-        self.memo.insert(key, v);
-        v
+        self.memo.insert(key, Opnd::Val(v));
+        Opnd::Val(v)
     }
 }
 
@@ -619,20 +623,38 @@ impl FnBuilder {
     pub fn ptrv(&self, v: ValueId) -> Ptr {
         Ptr(n(Node::Val(v)))
     }
+    fn lower_val(&mut self, root: &N) -> ValueId {
+        match (Lower { b: self, memo: HashMap::new() }).go(root) {
+            Opnd::Val(v) => v,
+            o => panic!("bind_*: the expression root is a bare loop variable ({o:?}); use bind_opnd (or pass Opnd::Var directly)"),
+        }
+    }
+    /// Lowers the tree and returns its root as an operand: a bare loop-variable leaf stays `Opnd::Var` (no statement), anything else is the bound value.
+    pub fn bind_opnd(&mut self, e: impl Into<I32>) -> Opnd {
+        let e = e.into();
+        (Lower { b: self, memo: HashMap::new() }).go(&e.0)
+    }
+    /// A loop variable (i32) as an expression leaf: lowered to an `Opnd::Var` operand of its user (exactly what manual code passes).
+    pub fn i32var(&self, v: VarId) -> I32 {
+        I32(n(Node::Var(v)))
+    }
+    pub fn f32var(&self, v: VarId) -> F32 {
+        F32(n(Node::Var(v)))
+    }
     /// Lowers the tree post-order to the same `Op`s the manual API emits and returns the value of its root.
     pub fn bind_i32(&mut self, e: impl Into<I32>) -> ValueId {
         let e = e.into();
-        Lower { b: self, memo: HashMap::new() }.go(&e.0)
+        self.lower_val(&e.0)
     }
     pub fn bind_f32(&mut self, e: impl Into<F32>) -> ValueId {
         let e = e.into();
-        Lower { b: self, memo: HashMap::new() }.go(&e.0)
+        self.lower_val(&e.0)
     }
     pub fn bind_cond(&mut self, e: Cond) -> ValueId {
-        Lower { b: self, memo: HashMap::new() }.go(&e.0)
+        self.lower_val(&e.0)
     }
     pub fn bind_ptr(&mut self, e: Ptr) -> ValueId {
-        Lower { b: self, memo: HashMap::new() }.go(&e.0)
+        self.lower_val(&e.0)
     }
     /// `bind_i32` returning the bound value as a leaf expression (so it can be reused in later expressions without re-lowering).
     pub fn let_i32(&mut self, e: impl Into<I32>) -> I32 {

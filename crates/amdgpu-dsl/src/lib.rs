@@ -659,6 +659,24 @@ pub struct Function {
     pub value_tys: Vec<DType>,
     /// Opt-out of the loop-variable re-read lint (see [`lint`]).
     pub allow_var_rereads: bool,
+    /// Explicit compile policy (lowering options + scheduler preset). `None` = the compiler derives it from the kernel name (the historical behaviour,
+    /// which every existing kernel keeps); kernels written on the tile library set it so their policy does not depend on their name.
+    pub compile_profile: Option<CompileProfile>,
+}
+
+/// Compile policy of a kernel (see `amdgpu-compiler/src/lib.rs`): which lowering options and which scheduler preset it gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CompileProfile {
+    /// The policy of `fmha_fwd_hd128_mxfp8_vs128` (scalarize/retarget2/imm/sgpr/zeroinit lowering, full reordering list scheduler).
+    Vs128,
+    /// The policy of `fmha_fwd_hd128_mxfp8_t128` (as Vs128 + addrfold; scheduler: ALU across the barrier, VGPR pressure limit 248).
+    T128,
+    /// The policy of `fmha_fwd_hd128_mxfp8_kvsplit` (same as Vs128).
+    KvSplit,
+    /// The policy of the KV-split combine kernels (FMHA zeroinit lowering, no scheduler preset).
+    Combine,
+    /// No FMHA-specific policy (plain lowering, scheduler only when requested by the environment).
+    Default,
 }
 
 impl Function {
@@ -848,6 +866,7 @@ impl FnBuilder {
                 var_tys: Vec::new(),
                 value_tys: Vec::new(),
                 allow_var_rereads: false,
+                compile_profile: None,
             },
             expr_consts: Default::default(),
         }
@@ -856,6 +875,11 @@ impl FnBuilder {
     /// Declares that this kernel intentionally re-reads loop variables after `set_var` in the same iteration.
     pub fn allow_var_rereads(&mut self) {
         self.f.allow_var_rereads = true;
+    }
+
+    /// Sets the explicit compile policy (see [`CompileProfile`]); without it the compiler keeps deriving the policy from the kernel name.
+    pub fn compile_profile(&mut self, p: CompileProfile) {
+        self.f.compile_profile = Some(p);
     }
 
     /// Declares how many bytes of workgroup LDS the kernel uses.
