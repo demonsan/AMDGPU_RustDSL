@@ -173,7 +173,15 @@ impl FmhaBlock {
 // The attention body: per 128-key tile, QK (S = ones x bias + K Q^T), online softmax, PV + row sums
 // ------------------------------------------------------------------------------------------------------------------------------------------------------
 
-/// LDS buffers + copies + readers of the K/V/K-scale ring (the `_vs128` / `_kvsplit` plan = `fmha_vs_tiles`).
+/// K-scale staging: straight into LDS by DMA (`_vs128` / `_kvsplit`: one `global_load_lds_dword` per wave) or through a VGPR and a `ds_write` after the
+/// DMA wait (`_t128`).
+pub enum KdCopy {
+    Dma(DwordRowsCopy),
+    Vgpr(DwordRowsVgpr),
+}
+
+/// LDS buffers + copies + readers of the K/V/K-scale ring: `_vs128` / `_kvsplit` (= `fmha_vs_tiles`: 2 slots, K by group A, V by group B) or `_t128`
+/// (3 slots, one group stages K and V with a shared row clamp).
 pub struct KvRing {
     pub ks: Shared,
     pub vs: Shared,
@@ -184,18 +192,18 @@ pub struct KvRing {
     pub epi: Shared,
     kcp: RowsCopy,
     vcp: RowsCopy,
-    kdcp: DwordRowsCopy,
+    kdc: KdCopy,
     kr: RowsReader,
     vr: TrReader,
     kdr: RowScaleReader,
 }
 
 impl KvRing {
-    pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles) -> KvRing {
+    pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing {
         let mut lds = LdsPlan::new();
-        let [ks, vs] = lds.ring_group(2, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
-        let kd = lds.ring("KD", 512, 2, Layout::Linear);
-        lds.at(67584);
+        let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
+        let kd = lds.ring("KD", 512, slots, Layout::Linear);
+        lds.at(32768 * slots as i64 + 2048);
         let ones = lds.tile("ones", 2048, Layout::Linear);
         let q1 = lds.tile("Q1", 16384, Layout::Linear);
         let q0 = lds.tile("Q0", 16384, Layout::Linear);
@@ -209,8 +217,14 @@ impl KvRing {
         let (ksrc, vsrc, kdsrc) = (kt.row_source(b, 1), vt.row_source(b, 1), kdt.row_source(b, 1));
         let kcp = RowsCopy::new(b, ksrc, &ks, roles.wave_in_group, lane, 4);
         let vcp = RowsCopy::new(b, vsrc, &vs, roles.wave_in_group, lane, 4);
-        let kdcp = DwordRowsCopy::new(b, kdsrc, &kd, roles.wave_in_group, lane);
-        KvRing { ks, vs, kd, ones, q1, q0, epi, kcp, vcp, kdcp, kr, vr, kdr }
+        let kdc = if slots == 2 {
+            KdCopy::Dma(DwordRowsCopy::new(b, kdsrc, &kd, roles.wave_in_group, lane))
+        } else {
+            // one dword per row: thread t covers row t >> 1 (two threads per row)
+            let rt_row = b.bind_i32(lane.tid().lshr(1));
+            KdCopy::Vgpr(DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
+        };
+        KvRing { ks, vs, kd, ones, q1, q0, epi, kcp, vcp, kdc, kr, vr, kdr }
     }
 }
 
@@ -227,6 +241,8 @@ pub struct AttnBody<'a> {
     pub o: Option<AccTile<C32x32F32, 4>>,
     /// P words of the tile + the new bias word, from the V phase to the M phase
     p: Vec<ValueId>,
+    /// the K-scale word in flight (VGPR staging)
+    kd_pending: Option<ValueId>,
 }
 
 impl<'a> AttnBody<'a> {
@@ -234,7 +250,7 @@ impl<'a> AttnBody<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new() }
+        AttnBody { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None }
     }
     /// QK of the tile in `slot`: either in place into S (each S block first set to ones x bias) or (prologue) as fresh values.
     fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, out: QkOut, bias: ValueId) -> Vec<ValueId> {
@@ -243,17 +259,35 @@ impl<'a> AttnBody<'a> {
         let kd = r.kdr.at(b, &r.kd.at(slot));
         qk_tile(b, out, Some((self.sm.ones_f16, bias)), &k, &kd, &blk.q.frags, blk.sq, &blk.sel)
     }
+    /// PV of the tile in `slot` with the P words `w` (16), the row sums first (4 smfmacs).
+    fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
+        let r = self.ring;
+        let v = r.vr.at(b, &r.vs.at(slot));
+        let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])];
+        self.sm.row_sum(b, p[0].v, p[1].v);
+        pv_tile(b, &self.o.unwrap(), &v, &p, self.c127, self.c123);
+    }
 }
 
 impl PipeBody for AttnBody<'_> {
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
         let r = self.ring;
-        match role {
-            Role::A => {
-                r.kdcp.issue(b, key0, &r.kd.at(slot));
+        match (role, &r.kdc) {
+            (Role::A, KdCopy::Dma(kd)) => {
+                kd.issue(b, key0, &r.kd.at(slot));
                 r.kcp.issue(b, key0, &r.ks.at(slot));
             }
-            _ => r.vcp.issue(b, key0, &r.vs.at(slot)),
+            (Role::B, _) => r.vcp.issue(b, key0, &r.vs.at(slot)),
+            (_, KdCopy::Vgpr(kd)) => {
+                self.kd_pending = Some(kd.issue(b, key0));
+                issue_rows_shared(b, key0, &[(&r.kcp, &r.ks.at(slot)), (&r.vcp, &r.vs.at(slot))]);
+            }
+            _ => unreachable!("role / K-scale staging combination"),
+        }
+    }
+    fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, slot: &SlotIdx) {
+        if let (KdCopy::Vgpr(kd), Some(v)) = (&self.ring.kdc, self.kd_pending.take()) {
+            kd.complete(b, v, &self.ring.kd.at(slot));
         }
     }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
@@ -299,16 +333,30 @@ impl PipeBody for AttnBody<'_> {
     }
     /// PV(t) with the row sums, then QK(t+1) (its K tile was staged during the V phase)
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
-        let r = self.ring;
         let mut w = std::mem::take(&mut self.p);
         let bias = w.pop().expect("bias word");
-        let v = r.vr.at(b, &r.vs.at(&t.cur));
-        let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])];
-        self.sm.row_sum(b, p[0].v, p[1].v);
-        pv_tile(b, &self.o.unwrap(), &v, &p, self.c127, self.c123);
+        self.pv(b, &t.cur, &w);
         if t.staged {
             self.qk(b, &t.next, QkOut::Vars(&self.s.unwrap()), bias);
         }
+    }
+    /// `_t128`: ONE window per tile - the decision of tile t, then per 32-key block its P conversion and QK(t+1) into the freed S block, the bias variable
+    /// written last (an early write costs the scheduler its fit), then PV(t) with the row sums
+    fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+        let (r, blk) = (self.ring, self.blk);
+        let (s, o) = (self.s.unwrap(), self.o.unwrap());
+        let mask = t.masked.then(|| KeyMask::new(b, t, blk.g4, blk.kv_len));
+        let nb = self.sm.decide_deferred(b, &s, &o, mask.as_ref());
+        let next = t.staged.then(|| (r.kr.at(b, &r.ks.at(&t.next)), r.kdr.at(b, &r.kd.at(&t.next))));
+        let mut w = Vec::with_capacity(16);
+        for i in 0..4usize {
+            w.extend(self.sm.convert(b, &s, mask.as_ref(), i, i + 1));
+            if let Some((k, kd)) = &next {
+                qk_block(b, &QkOut::Vars(&s), Some((self.sm.ones_f16, nb)), k, kd, &blk.q.frags, blk.sq, &blk.sel, i);
+            }
+        }
+        self.sm.commit_bias(b, nb);
+        self.pv(b, &t.cur, &w);
     }
 }
 
@@ -327,7 +375,7 @@ pub fn fmha_fwd_hd128_mxfp8_dsl_vs128() -> Function {
     ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
     let blk = io.block(b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
-    let ring = KvRing::new(b, &io, &blk, &roles);
+    let ring = KvRing::new(b, &io, &blk, &roles, 2);
     let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     let o_tile = io.o.tile(vec![ev(blk.bidx), I32::c(0), ev(blk.hidx), I32::c(0)]).clamp(1, io.s_len.clone(), &io.s_len - 1);
     let short = b.bind_cond(ev(blk.nkv).lt(9));
@@ -360,7 +408,7 @@ pub fn fmha_fwd_hd128_mxfp8_dsl_kvsplit() -> Function {
     let kv = io.kvs.as_ref().expect("kv-split args");
     let blk = io.block(b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
-    let ring = KvRing::new(b, &io, &blk, &roles);
+    let ring = KvRing::new(b, &io, &blk, &roles, 2);
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     pipe.ring_var_last = true;
     // linear partial row of a query row: split * rows_total + (b * S + row) * H + h
@@ -422,5 +470,32 @@ pub fn fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h() -> Function {
     b.assume_trusted(row, Ext::c(0), Ext::ka(0x18) - Ext::c(1), "row = clamped thread index >> k <= rows - 1: the engine keeps the rational upper bound of a shift");
     let (rows_v, splits_v) = (b.bind_i32(rows), b.bind_i32(splits));
     combine_splits(b, ohat, lse, out, rows_v, splits_v, t, row, 8, Ext::ka(0x20) - Ext::c(1));
+    fb.finish()
+}
+/// `_t128`: 128 query rows per block (ONE group of 4 waves), a 3-slot LDS ring staged by all waves (K and V share the row clamp, the K scales go through
+/// a VGPR), one window and one barrier per 128-key tile, two code copies as `_vs128`.
+pub fn fmha_fwd_hd128_mxfp8_dsl_t128() -> Function {
+    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_dsl_t128", 256);
+    fb.compile_profile(CompileProfile::T128);
+    let b = &mut fb;
+    let mut ka = KArgs::new();
+    let io = FmhaIo::declare(b, &mut ka, 128, false);
+    ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
+    let blk = io.block(b, 7);
+    let roles = Roles::single(&blk.lane, 4);
+    let ring = KvRing::new(b, &io, &blk, &roles, 3);
+    let pipe = Pipeline::new(Cadence::OneWindow, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    let o_tile = io.o.tile(vec![ev(blk.bidx), I32::c(0), ev(blk.hidx), I32::c(0)]).clamp(1, io.s_len.clone(), &io.s_len - 1);
+    let short = b.bind_cond(ev(blk.nkv).lt(9));
+    versioned(b, short, |b, lut| {
+        let mut body = AttnBody::new(b, &ring, &blk, blk.lane.wave, lut);
+        pipe.run(b, Role::All, &mut body);
+        let l = body.sm.l_total(b);
+        let inv_l = b.rcp_f32(l);
+        let fin = b.mul_f32(inv_l, blk.vd);
+        let row_ptr = o_tile.ptr(b, &[I32::c(0), &blk.row0 + blk.lane.j(), I32::c(0), blk.lane.half() << 2]);
+        let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
+        store_bf16(b, &body.o.unwrap(), fin, row_ptr, live);
+    });
     fb.finish()
 }
