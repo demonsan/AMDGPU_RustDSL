@@ -4,6 +4,10 @@ use amdgpu_dsl::{DType, FnBuilder, Function, Op, Opnd};
 
 #[derive(Clone, Copy)]
 struct Opt {
+    /// a compile-time trip-count bound (the loop exits once it+1 >= k) instead of the kernarg bound
+    trip: Option<i32>,
+    /// consumer slot = (min(it, cap)) & mask: equals it & mask up to `cap`, then sticks (a protocol that is only right for the first iterations)
+    cap: Option<i32>,
     slots: u32,
     prologue_barrier: bool,
     producer_wait: bool,
@@ -13,7 +17,7 @@ struct Opt {
 }
 
 fn good() -> Opt {
-    Opt { slots: 2, prologue_barrier: true, producer_wait: true, consume_ver_off: 0, write_extra: 0, consumer_wait: true }
+    Opt { trip: None, cap: None, slots: 2, prologue_barrier: true, producer_wait: true, consume_ver_off: 0, write_extra: 0, consumer_wait: true }
 }
 
 fn has(rep: &Report, code: &str) -> bool {
@@ -58,7 +62,13 @@ fn proto(o: Opt) -> Function {
     let nxt = b.add_i32(it, Opnd::I32(1));
     let mask = Opnd::I32(o.slots as i32 - 1);
     let slot_n = b.let_(Op::AndI32(Opnd::Val(nxt), mask));
-    let slot_c = b.let_(Op::AndI32(Opnd::Var(it), mask));
+    let slot_c = match o.cap {
+        Some(cap) => {
+            let m = b.let_(Op::MinI32(Opnd::Var(it), Opnd::I32(cap)));
+            b.let_(Op::AndI32(Opnd::Val(m), mask))
+        }
+        None => b.let_(Op::AndI32(Opnd::Var(it), mask)),
+    };
     let c1024 = b.c_i32(1024);
     b.begin_if(is_p);
     b.tile_produce("buf", slot_n, nxt);
@@ -80,7 +90,10 @@ fn proto(o: Opt) -> Function {
     }
     b.barrier();
     b.set_var(it, nxt);
-    let stop = b.let_(Op::CmpGeI32(Opnd::Val(nxt), Opnd::Val(n)));
+    let stop = match o.trip {
+        Some(k) => b.let_(Op::CmpGeI32(Opnd::Val(nxt), Opnd::I32(k))),
+        None => b.let_(Op::CmpGeI32(Opnd::Val(nxt), Opnd::Val(n))),
+    };
     b.break_if(Opnd::Val(stop));
     b.end_loop();
     b.finish()
@@ -221,4 +234,43 @@ fn removing_the_separating_barrier_of_the_shipped_probe_is_caught() {
     });
     let r = verify_ir(&f);
     assert!(r.errors().iter().any(|e| e.code == "GV-TILE-RACE" || e.code == "GV-TILE-STALE"), "{}", r.render());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// the unroll gate: the simulator covers a bounded number of iterations, so the markers must be periodic in the loop counter (or explicitly trusted)
+
+#[test]
+fn a_protocol_that_is_right_only_for_the_first_iterations_is_rejected() {
+    // consumer slot = min(it, 4) & 1: identical to it & 1 for it <= 4 (the old 1..=4 unroll saw nothing), then it sticks while the producer keeps alternating
+    let r = verify_ir(&proto(Opt { cap: Some(4), ..good() }));
+    assert!(has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
+    assert!(has(&r, "GV-TILE-RACE") || has(&r, "GV-TILE-STALE"), "the simulation (10 iterations) also sees the late failure: {}", r.render());
+}
+
+#[test]
+fn a_non_periodic_marker_beyond_the_simulated_iterations_is_gated_not_certified() {
+    // min(it, 40) & 1: indistinguishable from it & 1 within the simulated iterations; only the periodicity gate can catch it
+    let r = verify_ir(&proto(Opt { cap: Some(40), ..good() }));
+    assert!(has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
+    assert!(r.errors().iter().any(|e| e.msg.contains("not covered") && e.msg.contains("Min")), "{}", r.render());
+}
+
+#[test]
+fn a_periodic_protocol_is_clean_for_any_trip_count_and_for_a_constant_bound() {
+    for trip in [None, Some(3), Some(4)] {
+        let r = verify_ir(&proto(Opt { trip, ..good() }));
+        assert!(r.errors().is_empty(), "trip {trip:?}: {}", errors(&r));
+    }
+    // a 3-slot ring (period 3) with a runtime trip count
+    let r = verify_ir(&proto(Opt { slots: 4, ..good() }));
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+}
+
+#[test]
+fn tile_trust_periodic_is_an_explicit_listed_escape() {
+    let mut f = proto(Opt { cap: Some(40), ..good() });
+    f.contract.tile_trust = Some("test: the cap never binds in the launches this kernel is used for".to_string());
+    let r = verify_ir(&f);
+    assert!(!has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
+    assert!(r.findings.iter().any(|x| x.code == "GV-ASSUME" && x.msg.contains("tile_trust_periodic")), "{}", r.render());
 }

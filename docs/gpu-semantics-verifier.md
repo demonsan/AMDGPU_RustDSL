@@ -96,6 +96,8 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 * **写写**：不同 wave 并发写同一槽**不同版本** → `GV-TILE-RACE`；同一版本（协作填充）允许。
 * **每条 producer→consumer 边在所有角色上都跨 barrier**：由“发布相位 ≤ 读相位”与两侧动态 barrier 计数相等（v1 的 `GV-BAR`）共同保证。
 
+**展开上限与“周期性闸门”（`GV-TILE-UNROLL-LIMIT`）**：模拟只展开有限次迭代（`max(10, 2×最大槽数+4)`），所以一个只在前几轮正确、之后才竞争的协议（kernel-occ 的 `gpu_tile_tripcount::late_race`：第 0..4 轮正确，第 5 轮起覆盖消费者的槽）不能靠“模拟过了”被认证。闸门：**每个 tile 标记的 `slot`/`version` 表达式必须是循环计数器的仿射/周期函数**——只由常量、计数器的加减、乘/移位/`&`/`^` 常量构成，且用到的每个计数器初值为常量、只被 `+ 常量` 或 `^ 常量` 更新（`min`、比较、`select`、两个计数器的乘积都不允许）。满足时，所有相对量（槽号 mod 环大小、版本差、相位偏移）对迭代数是周期的，违例只依赖相邻 ≤ 环大小+1 轮，展开 ≥ 2×槽数+4 轮即覆盖任意迭代数；不满足则 `GV-TILE-UNROLL-LIMIT`（Error，`--strict` 不可认证），消息指出依赖的运算，并说明协议只模拟了 N 轮。若结构确实“按构造周期”但不是上述形式，作者必须显式写 `b.tile_trust_periodic("原因")`：作为 TRUSTED（Info）列出。这是对“迭代抽象”的一个**保守、可判定**的实现（不展开到任意轮的符号证明）；假设为：循环迭代数 ≥ 1、所有循环同一迭代数。
+
 **已证明 / 假设计数**：报告的 `proven` 里 `tile-reads` 为已证明的读事件数（按展开场景累计），`tile-cover` 为证明落在标记 tile 内的访问数；对 `slot/version` 的唯一假设是“循环最多展开 4 次、各循环同一迭代数”，以及角色只有两个（then/else）。
 
 **v1.1 的边界**：(i) 同一 tile 内按**字节**的部分重叠（两个 wave 写同一槽的不同子区间）不被区分——它们靠“同版本协作”语义被允许；(ii) 波一致、运行时条件的 `if` 内含 barrier/标记/LDS 访问时只给 `GV-TILE-UNSUPPORTED`（Warn），不建模两个分支；(iii) 未带标记的 LDS 访问（`GV-TILE-UNTAGGED`）不被检查；(iv) 跨 workgroup 与跨 kernel 的别名、数据竞争不在范围内。
@@ -140,7 +142,11 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 | 循环计数器区间 | **需要 `assume`** | 归纳检查，TRUSTED 项逐条列出 |
 | 运行时守卫 | `buffer_desc_dyn`（硬件范围检查）、显式 `min` 夹紧 | 不是“证明”，而是让不可证的访问变成硬件定义的行为 |
 
-### 7.1 `assume` 的审计
+### 7.1 信任预算（certificate）与 `assume` 的审计
+
+`amdc gpu-verify <kernel>|--all|--shipped` 在每个 kernel 后打印 `certificate: N trusted assumes, M trusted contracts, K unproven`（最后还有合计行）：**N** = 显式被信任的假设（`assume_trusted`、对普通值的未被蕴含的 `assume`、`tile_trust_periodic`），**M** = 声明的主机合同条数（`arg_tensor*`、`ka_range`、`ka_is`、`ka_one_of`、`grid_is`、`sym_range`），**K** = 未证明的性质（Error 数）。K = 0 且 N、M 被评审接受才算“认证”；`--strict` 在 K > 0 时失败。
+
+### 7.2 `assume` 的审计
 
 `amdc gpu-verify <kernel> -v` 打印每条 `GV-ASSUME`：`proved`（归纳成立）、`already implied`、`TRUSTED`。**kernel 的“被信任清单”就是这些行**；评审时只需要审阅它们。
 
@@ -175,6 +181,7 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 | `GV-TILE-KIND` | Error | 读出现在 `tile_produce` 下或写/DMA 出现在 `tile_consume` 下 | `an LDS write / DMA is issued under a tile_consume marker` | 修标记 |
 | `GV-TILE-STALE` | Error | 读者看不到期望版本：未发布（缺 barrier/未等待完成）、版本不符（槽已被覆盖/下一版本未到）、协作生产者未全部发布 | `read of \`buf\`[1] expecting version 3 at phase 4 finds NO published version: version 3 is produced by role 0 … but is only published at phase 5` | 补 barrier / 等待，或修 slot/version 表达式 |
 | `GV-TILE-RACE` | Error | 其他 wave 在读窗口内写（或仍在落地）同一槽的别的版本；或不同 wave 并发写不同版本 | `read of \`buf\`[0] (version 1, phases 1..1) overlaps the write of version 2 by role 0 … no barrier separates them` | 双缓冲/加 barrier |
+| `GV-TILE-UNROLL-LIMIT` | Error | tile 标记依赖的运算不是循环计数器的仿射/周期函数，协议只模拟了有限轮，更多轮的启动**未被覆盖** | `the tile marker depends on Min, which is not an affine/periodic function … a launch with more iterations is NOT covered` | 用 `+ 常量`/`^ 常量` 更新的计数器表达 slot/version，或 `tile_trust_periodic(原因)` |
 | `GV-TILE-INDEX` | Error | slot/version 不是循环计数器与常量的编译期函数，或槽越界 | `the slot / version of the \`buf\` marker is not a compile-time function of the loop counters` | 用环形计数器表达 |
 | `GV-TILE-PENDING/UNTAGGED/UNSUPPORTED/EMPTY` | Warn | 见 3.1 | | |
 | `GV-CONTRACT` | Error | 合同引用的参数不是指针 kernarg | `extent declared for \`x\` which is not a pointer kernarg` | 修正合同 |

@@ -169,6 +169,7 @@ fn main() -> ExitCode {
                 }
             };
             let mut bad = false;
+            let (mut tot_trusted, mut tot_contracts, mut tot_unproven) = (0usize, 0usize, 0usize);
             for name in names {
                 let Some(f) = amdgpu_compiler::kernel_by_name(&name) else {
                     eprintln!("unknown kernel: {name}");
@@ -183,6 +184,14 @@ fn main() -> ExitCode {
                                 println!("  [{}] {:?}: {}", fd.code, fd.severity, fd.msg);
                             }
                         }
+                        // the trust budget at a glance: explicit trusted assumptions, declared host contracts, unproven properties
+                        let trusted = r.findings.iter().filter(|x| x.code == "GV-ASSUME" && x.msg.contains("TRUSTED") && !x.msg.contains("set_var")).count();
+                        let c = &f.contract;
+                        let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.sym_ranges.len();
+                        println!("   certificate: {trusted} trusted assumes, {contracts} trusted contracts, {errs} unproven");
+                        tot_trusted += trusted;
+                        tot_contracts += contracts;
+                        tot_unproven += errs;
                         bad |= errs > 0;
                     }
                     Err(e) => {
@@ -191,6 +200,7 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            println!("certificate (all kernels listed): {tot_trusted} trusted assumes, {tot_contracts} trusted contracts, {tot_unproven} unproven");
             if strict && bad {
                 ExitCode::from(1)
             } else {
