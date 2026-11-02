@@ -5,7 +5,8 @@
 #   The candidate set is ${prefix}_vs128, ${prefix}_t128, ${prefix}_kvsplit, ${prefix}_kvsplit_combine8h; any of them can be overridden
 #   (e.g. while only _vs128 is ported): KN_VS128=... KN_T128=... KN_KVSPLIT=... KN_COMBINE=... (the combine name must contain "combine8":
 #   ref_host derives the elements/thread from the name).
-#   Baseline (shipped):  bash tools/port_gate.sh fmha_fwd_hd128_mxfp8
+#   The reference set is the LEGACY hand-written set (fmha_fwd_hd128_mxfp8_{vs128,t128,kvsplit,kvsplit_combine8h}), measured in the same run.
+#   Shipped default (tile-library kernels): bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_dsl;  legacy self-baseline: bash tools/port_gate.sh fmha_fwd_hd128_mxfp8
 #
 # Sections (each prints PASS/FAIL; SKIP_<SECTION>=1 skips one):
 #   BUILD    emit (+ --backend ${BACKEND:-auto}) and assemble the 4 kernels, build ref_host
@@ -173,7 +174,7 @@ if ! skip SKIP_PERF; then
             done
         done
         mc=$(median < "$B/pf_cand"); mv=$(median < "$B/pf_vend")
-        if [ $SAME_AS_SHIP = 0 ]; then ms=$(median < "$B/pf_ship"); refs="shipped $ms (same run)"; base=$ms
+        if [ $SAME_AS_SHIP = 0 ]; then ms=$(median < "$B/pf_ship"); refs="legacy $ms (same run)"; base=$ms
         else base=${REC[$key]}; refs="recorded $base"; fi
         v=$(awk -v c="$mc" -v r="$base" -v t="$PERF_TOL" 'BEGIN{print (c >= t * r) ? "PASS" : "FAIL"}'); [ "$key" = b2h8s2048 ] && v="INFO($v)"
         row PERF "$key $mode -> $path" "$(printf '%s TF/s (%.3fx vendor %s; runs: %s)' "$mc" "$(awk -v a=$mc -v b=$mv 'BEGIN{print (b > 0) ? a / b : 0}')" "$mv" "$(tr '\n' ' ' < $B/pf_cand)")" "$refs, tol $PERF_TOL" "$v"
@@ -193,7 +194,7 @@ if ! skip SKIP_PERF; then
         done
         mc=$(median < "$B/lp_cand"); ms=$(median < "$B/lp_ship")
         v=$(awk -v c="$mc" -v r="$ms" -v t="$PERF_TOL" 'BEGIN{print (c >= t * r) ? "PASS" : "FAIL"}')
-        row PERF "percu64 layout-median (pads: ${LAYOUT_PADS-0..7})" "$mc TF/s (cand: $(tr '\n' ' ' < $B/lp_cand))" "shipped $ms ($(tr '\n' ' ' < $B/lp_ship))" "$v"
+        row PERF "percu64 layout-median (pads: ${LAYOUT_PADS-0..7})" "$mc TF/s (cand: $(tr '\n' ' ' < $B/lp_cand))" "legacy $ms ($(tr '\n' ' ' < $B/lp_ship))" "$v"
     fi
 fi
 

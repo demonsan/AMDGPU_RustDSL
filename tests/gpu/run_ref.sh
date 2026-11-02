@@ -14,11 +14,14 @@ build_one() { # kernel, out.co
     "${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
         -o "$2" "build/$1.s"
 }
+# The shipped default `fmha_fwd_hd128_mxfp8_auto` runs the tile-library kernels (`fmha_fwd_hd128_mxfp8_dsl_*`); `fmha_fwd_hd128_mxfp8_legacy_auto`
+# runs the previous hand-written set (`fmha_fwd_hd128_mxfp8_{vs128,t128,kvsplit,kvsplit_combine8h}`, kept for A/B); any other prefix is used as is.
+kernel_prefix() { case "$1" in fmha_fwd_hd128_mxfp8) echo fmha_fwd_hd128_mxfp8_dsl ;; fmha_fwd_hd128_mxfp8_legacy) echo fmha_fwd_hd128_mxfp8 ;; *) echo "$1" ;; esac; }
 KNAME="$OUR_KERNEL"; SMALL_ENV=""; SPLIT_ENV=""; COMBINE_ENV=""; SPLIT_N="0"; SPLIT_KNAME=""; COMBINE_KNAME=""
 if [[ "$OUR_KERNEL" == *_auto_split ]]; then
     # KV-split auto path: build _vs128 + _t128 + _kvsplit + _kvsplit_combine; ref_host applies the
     # dispatch guard (docs/gen4-tiling-design.md section 11) and falls back to _t128/_vs128 when rejected.
-    P="${OUR_KERNEL%_auto_split}"
+    P="${OUR_KERNEL%_auto_split}"; P="$(kernel_prefix "$P")"
     KNAME="${P}_vs128"
     build_one "$KNAME" build/fmha_ours.co
     build_one "${P}_t128" build/fmha_ours_small.co
@@ -33,7 +36,7 @@ if [[ "$OUR_KERNEL" == *_auto_split ]]; then
 elif [[ "$OUR_KERNEL" == *_auto ]]; then
     # default auto dispatch: _vs128 / _t128 / KV-split (_kvsplit + _kvsplit_combine8h); ref_host applies the guard per shape (REF_SPLIT=s forces a
     # split candidate, REF_NO_AUTO_SPLIT=1 disables the split, REF_ROWS_PER_BLOCK overrides the tiling)
-    P="${OUR_KERNEL%_auto}"
+    P="${OUR_KERNEL%_auto}"; P="$(kernel_prefix "$P")"
     KNAME="${P}_vs128"
     build_one "$KNAME" build/fmha_ours.co
     build_one "${P}_t128" build/fmha_ours_small.co

@@ -6,7 +6,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 cd "$REPO"; mkdir -p build
 TAG="${TAG:-x}"; REF_CO="${REF_CO:-/shared/amdgpu/home/blyu_qle/sessions/ref_mxfp8.co}"
-P=fmha_fwd_hd128_mxfp8
+P="${OHAT_PREFIX:-fmha_fwd_hd128_mxfp8_dsl}"   # shipped default (tile-library kernels); OHAT_PREFIX=fmha_fwd_hd128_mxfp8 = the legacy hand-written set
 CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 build_one() { bash tools/container/cargo.sh run -q --bin amdc -- emit "$1" --backend "${BACKEND:-own}" --out "/work/build/oh_${TAG}_$1.s" >/dev/null 2>&1 || { echo "emit $1 failed"; exit 1; }
   if [ "$1" = "${P}_kvsplit" ] && [ -n "${ASM_SED:-}" ]; then sed -i -E "$ASM_SED" "build/oh_${TAG}_$1.s"; fi

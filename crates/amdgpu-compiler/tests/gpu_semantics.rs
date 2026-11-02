@@ -420,6 +420,10 @@ fn shipped_kernels_pass_the_enforced_mir_level_checks() {
         "fmha_fwd_hd128_mxfp8_vs128",
         "fmha_fwd_hd128_mxfp8_kvsplit",
         "fmha_fwd_hd128_mxfp8_kvsplit_combine8h",
+        "fmha_fwd_hd128_mxfp8_dsl_vs128",
+        "fmha_fwd_hd128_mxfp8_dsl_t128",
+        "fmha_fwd_hd128_mxfp8_dsl_kvsplit",
+        "fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h",
     ] {
         let f = amdgpu_compiler::kernel_by_name(name).unwrap_or_else(|| panic!("unknown kernel {name}"));
         let rep = analyse(&f).unwrap_or_else(|e| panic!("{name}: {e}"));
