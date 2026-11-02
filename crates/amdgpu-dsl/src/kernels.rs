@@ -19199,6 +19199,58 @@ pub fn probe_llvm_ids() -> Function {
     b.finish()
 }
 
+/// `probe_llvm_ids` written with the operator expression layer (`expr.rs`): the same arithmetic, ONE expression per quantity instead of a constant + mul/add per step.
+/// The emitted instructions are identical to the manual kernel (tests/expr_layer.rs); the contract lines add no code.
+pub fn probe_expr_ids() -> Function {
+    let mut b = FnBuilder::new("probe_expr_ids", 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.grid_is(0, Ext::c(3));
+    b.grid_is(1, Ext::c(2));
+    b.grid_is(2, Ext::c(2));
+    b.arg_tensor("o", Ext::c(3 * 2 * 2 * 64 * 4));
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let (tid, x, y, z) = (b.let_(Op::WorkitemId), b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
+    let (tid, x, y, z) = (b.i32v(tid), b.i32v(x), b.i32v(y), b.i32v(z));
+    let idx = b.let_i32(((&z * 2 + &y) * 3 + &x) * 64 + &tid);
+    let val = b.bind_i32(((&z * 100 + &y * 10 + &x) * 1000) + &tid);
+    let q = b.bind_ptr(b.ptrv(o) + idx * 4);
+    let vf = b.bind_f32(b.i32v(val).bitcast_f32());
+    b.store_f32(q, 0, vf);
+    b.finish()
+}
+
+/// `probe_llvm_kernarg` with operators: address arithmetic `tid * 4`, the pointer offsets, the f32 sum and the bit-casts are expressions.
+pub fn probe_expr_kernarg() -> Function {
+    let mut b = FnBuilder::new("probe_expr_kernarg", 64);
+    b.arg("a", DType::Ptr, 0, 8);
+    b.arg("b", DType::Ptr, 8, 8);
+    b.arg("n", DType::I32, 16, 4);
+    b.arg("s", DType::F32, 20, 4);
+    b.arg("c", DType::Ptr, 24, 8);
+    b.arg("m", DType::I32, 32, 4);
+    b.arg_tensor("a", Ext::c(256));
+    b.arg_tensor("b", Ext::c(256));
+    b.arg_tensor("c", Ext::c(264));
+    let pa = b.let_(Op::KernargPtr { offset: 0 });
+    let pb = b.let_(Op::KernargPtr { offset: 8 });
+    let n = b.let_(Op::KernargI32 { offset: 16 });
+    let s = b.let_(Op::KernargF32 { offset: 20 });
+    let pc = b.let_(Op::KernargPtr { offset: 24 });
+    let m = b.let_(Op::KernargI32 { offset: 32 });
+    let tid = b.let_(Op::WorkitemId);
+    let (pa, pb, pc, n, s, m, tid) = (b.ptrv(pa), b.ptrv(pb), b.ptrv(pc), b.i32v(n), b.f32v(s), b.i32v(m), b.i32v(tid));
+    let off = b.let_i32(&tid * 4);
+    let (qa, qb, qc) = (b.bind_ptr(&pa + &off), b.bind_ptr(&pb + &off), b.bind_ptr(&pc + &off));
+    let x = b.load_f32(qa, 0);
+    let y = b.load_f32(qb, 0);
+    let r = b.bind_f32(b.f32v(x) + b.f32v(y) + &s);
+    b.store_f32(qc, 0, r);
+    let (nf, mf) = (b.bind_f32(n.bitcast_f32()), b.bind_f32(m.bitcast_f32()));
+    let pc = b.bind_ptr(pc);
+    b.store_f32(pc, 256, nf);
+    b.store_f32(pc, 260, mf);
+    b.finish()
+}
 /// Wave roles (A = waves 0-3, B = waves 4-7) with an if / else on a wave-uniform condition, static LDS, barrier and waitcnt: A writes 1000 + tid, B writes 2000 + tid,
 /// then every lane reads the partner role's slot (tid +- 256): out[tid] = (tid < 256) ? 2000 + tid + 256 : 1000 + tid - 256.
 pub fn probe_llvm_roles() -> Function {
