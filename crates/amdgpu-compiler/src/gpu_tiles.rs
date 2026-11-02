@@ -525,8 +525,10 @@ fn periodic_cone(f: &Function) -> Result<(), String> {
     }
     let mut seen = HashSet::new();
     for (i, s) in f.stmts.iter().enumerate() {
-        if let Stmt::TileProduce { slot, version, .. } | Stmt::TileConsume { slot, version, .. } = s {
-            for o in [slot, version] {
+        if let Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } = s {
+            // the slot of a private (per-wave) region is the wave key: it does not evolve with the loop iteration
+            let private = f.contract.tiles.iter().any(|t| &t.name == tile && t.private);
+            for o in if private { vec![version] } else { vec![slot, version] } {
                 walk(f, o, &mut seen).map_err(|why| format!("stmt {i}: the tile marker depends on {why}"))?;
             }
         }
@@ -599,8 +601,10 @@ fn period_bits(f: &Function) -> u32 {
     }
     let mut a = Acc { mask_bits: 0, shifts: 0, xor_counter: false, seen: HashSet::new() };
     for s in &f.stmts {
-        if let Stmt::TileProduce { slot, version, .. } | Stmt::TileConsume { slot, version, .. } = s {
-            walk(f, slot, &mut a);
+        if let Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } = s {
+            if !f.contract.tiles.iter().any(|t| &t.name == tile && t.private) {
+                walk(f, slot, &mut a);
+            }
             walk(f, version, &mut a);
         }
     }
