@@ -22462,3 +22462,26 @@ pub fn gv_attack_assume_trusted() -> Function {
     b.end_loop();
     b.finish()
 }
+
+/// AUDIT: unsafe global-region protocol made "certified" by the counted `buf_trust` escape. There is
+/// no completion/release/acquire; the region check is skipped and the ledger must expose the trust.
+pub fn gv_audit_region_trust() -> Function {
+    let mut b = FnBuilder::new("gv_audit_region_trust", 128);
+    b.arg("buf", DType::Ptr, 0, 8);
+    b.arg_tensor("buf", Ext::c(8192));
+    b.buf_region("r", "buf", Ext::c(0), Ext::c(8192));
+    b.buf_trust("r", "host launch order / cross-kernel visibility argued outside the verifier");
+    let p = b.let_(Op::KernargPtr { offset: 0 });
+    let t = b.let_(Op::WorkitemId);
+    let c64 = b.c_i32(64);
+    let is_p = b.cmp_lt_i32(t, c64);
+    b.begin_if(Opnd::Val(is_p));
+    b.buf_produce("r", Opnd::I32(0));
+    b.store_f32(p, 0, Opnd::F32(1.0));
+    b.tile_end();
+    b.buf_consume("r", Opnd::I32(0));
+    let _ = b.load_f32(p, 0);
+    b.tile_end();
+    b.end_if();
+    b.finish()
+}
