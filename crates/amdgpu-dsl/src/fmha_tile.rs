@@ -324,7 +324,7 @@ fn build_vs128(b: &mut FnBuilder) {
     let qd_stride = ev(b.bind_i32(q.strides[1].clone().lshr(5)));
     let kd_stride = ev(b.bind_i32(k.strides[1].clone().lshr(5)));
     let qsc = ka.tensor("ptr_q_descale", 0x200, 1, vec![bat.clone(), s.clone(), h.clone(), Dim::c(4)], vec![Stride::Ka("s_descale_q_Bs", 0x230), Stride::Derived(qd_stride), Stride::Ka("s_descale_q_Hs", 0x240), Stride::Unit]).packed().slack(Ext::c(512 * 4) * Ext::ka(0x140)).declare(&mut ka, b);
-    let ksc = ka.tensor("ptr_k_descale", 0x210, 1, vec![bat, skv, hk, Dim::c(4)], vec![Stride::Ka("s_descale_k_Bs", 0x250), Stride::Derived(kd_stride), Stride::Ka("s_descale_k_Hs", 0x260), Stride::Unit]).packed().slack(Ext::c(640 * 4) * Ext::ka(0x140)).declare(&mut ka, b);
+    let ksc = ka.tensor("ptr_k_descale", 0x210, 1, vec![bat, skv.clone(), hk, Dim::c(4)], vec![Stride::Ka("s_descale_k_Bs", 0x250), Stride::Derived(kd_stride), Stride::Ka("s_descale_k_Hs", 0x260), Stride::Unit]).packed().slack(Ext::c(640 * 4) * Ext::ka(0x140)).declare(&mut ka, b);
     let ptr_vd = ka.ptr(b, "ptr_v_descale", 0x220);
     b.arg_tensor("ptr_v_descale", Ext::c(4096));
     let gqa = ka.i32(b, "s_gqa", 0x0B0);
