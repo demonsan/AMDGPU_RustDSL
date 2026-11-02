@@ -5,7 +5,7 @@
 //! GQA head, key range, resident Q fragments); `AttnBody` = the per-tile work of the transposed attention (`S^T = K Q^T`, online softmax, `O^T += V^T P`)
 //! as a `PipeBody`; then one short builder per kernel.
 
-use crate::tile::epilogue::store_bf16;
+use crate::tile::epilogue::{combine_splits, kvsplit_partial_f16, store_bf16};
 use crate::tile::frag::*;
 use crate::tile::reduce::KeyMask;
 use crate::tile::softmax::{OnlineSoftmax, Recipe};
@@ -29,10 +29,20 @@ pub struct FmhaIo {
     pub gqa: ValueId,
     pub s_len: I32,
     pub kv_len: I32,
+    /// KV-split launch (phase 1): the partial outputs and the split count
+    pub kvs: Option<KvsArgs>,
+}
+
+/// KV-split kernarg extension (0x270 Ohat, 0x278 lse, 0x280 splits, 0x284 rows_total = B*S*H; grid z = B * splits).
+pub struct KvsArgs {
+    pub ohat: ValueId,
+    pub lse: ValueId,
+    pub splits: ValueId,
+    pub rows_total: ValueId,
 }
 
 impl FmhaIo {
-    pub fn declare(b: &mut FnBuilder, ka: &mut KArgs, rows_per_block: i64) -> FmhaIo {
+    pub fn declare(b: &mut FnBuilder, ka: &mut KArgs, rows_per_block: i64, kvsplit: bool) -> FmhaIo {
         // GQA (H = HK * gqa, gqa a power of two <= 16) and the grid; the tensor contracts below are stated in terms of H
         let gqa = ka.i32(b, "s_gqa", 0x0B0);
         b.ka_range(0x0B0, 1, 16);
@@ -40,7 +50,9 @@ impl FmhaIo {
         let s = ka.dim(b, "s_seq_len", 0x060, 1, i64::MAX);
         let skv = ka.dim(b, "s_kv_seq_len", 0x110, 1, i64::MAX);
         let h = Dim::Ka { off: 0x140, val: ka.i32(b, "s_q_head_num", 0x140) };
-        let (hk, bat, d) = (Dim::sym("HK"), Dim::grid(2), Dim::c(128));
+        let (hk, d) = (Dim::sym("HK"), Dim::c(128));
+        // the batch: grid z for the single-kernel launch, the symbol B with grid z = B * splits for the KV-split launch
+        let bat = if kvsplit { Dim::sym("B") } else { Dim::grid(2) };
         let bshd = |ka: &mut KArgs, b: &mut FnBuilder, name: &str, off: u32, eb: i64, n: &Dim, hh: &Dim, st: [(&'static str, u32); 3]| {
             ka.tensor(name, off, eb, vec![bat.clone(), n.clone(), hh.clone(), d.clone()], vec![Stride::Ka(st[0].0, st[0].1), Stride::Ka(st[1].0, st[1].1), Stride::Ka(st[2].0, st[2].1), Stride::Unit])
         };
@@ -65,19 +77,59 @@ impl FmhaIo {
         b.arg_tensor("ptr_v_descale", Ext::c(4096));
         b.grid_is(1, Ext::ka(0x140));
         b.grid_is(0, Ext::ka(0x060).ceil_div(rows_per_block));
-        FmhaIo { q, k, v, o, qsc, ksc, ptr_vd, gqa, s_len: s.val().unwrap(), kv_len: skv.val().unwrap() }
+        let kvs = if kvsplit {
+            let splits = ka.dim(b, "kvs_splits", 0x280, 1, i64::MAX).val().unwrap();
+            let rows_total = ka.dim(b, "kvs_rows_total", 0x284, 1, i64::MAX).val().unwrap();
+            b.grid_is(2, Ext::sym("B") * Ext::ka(0x280));
+            b.ka_is(0x284, Ext::sym("B") * Ext::ka(0x060) * Ext::ka(0x140));
+            let ohat = ka.ptr(b, "ptr_ohat", 0x270);
+            let lse = ka.ptr(b, "ptr_lse", 0x278);
+            // fp16 partials in an fp32-sized allocation (the host serves both widths)
+            b.arg_tensor("ptr_ohat", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(128 * 4));
+            b.arg_tensor("ptr_lse", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(4));
+            Some(KvsArgs { ohat, lse, splits: b.bind_i32(splits), rows_total: b.bind_i32(rows_total) })
+        } else {
+            None
+        };
+        FmhaIo { q, k, v, o, qsc, ksc, ptr_vd, gqa, s_len: s.val().unwrap(), kv_len: skv.val().unwrap(), kvs }
     }
 
     /// Block ids, lane ids, this lane's query row (clamped), the resident Q fragments + scales, the KV head and the key range (all keys).
     pub fn block(&self, b: &mut FnBuilder, rows_lg: i32) -> FmhaBlock {
         let qtile = b.let_(Op::WorkgroupIdX);
         let hidx = b.let_(Op::WorkgroupIdY);
-        let bidx = b.let_(Op::WorkgroupIdZ);
-        let kv_len = b.bind_i32(self.kv_len.clone());
+        let zz = b.let_(Op::WorkgroupIdZ);
         let lane = Lane::new(b);
+        // KV split: grid z = batch * splits + split (splits in {2, 4, 8}: log2 = (s >> 1) - (s >> 3)); this block owns the 128-key tiles
+        // [split * tps, min(ntiles, (split + 1) * tps)) - every key index below is relative to its first key
+        let kv_all = b.bind_i32(self.kv_len.clone());
+        let ntiles_total = b.bind_i32((ev(kv_all) + 127).lshr(7));
+        let (bidx, kv_len, key_lo, split) = match &self.kvs {
+            None => (zz, kv_all, I32::c(0), None),
+            Some(kv) => {
+                let sp = ev(kv.splits);
+                let lg = b.bind_i32(sp.lshr(1) - sp.lshr(3));
+                let bi = b.bind_i32(ev(zz).lshr(ev(lg)));
+                let si = b.bind_i32(ev(zz) & ((I32::c(1) << ev(lg)) - 1));
+                b.assume_trusted(bi, Ext::c(0), Ext::sym("B") - Ext::c(1), "batch = grid_z >> log2(splits) with grid_z = B * splits (grid_is): variable shift, no interval rule");
+                b.assume_trusted(si, Ext::c(0), Ext::ka(0x280) - Ext::c(1), "split index = grid_z & (splits - 1), splits a power of two: and with a variable mask");
+                let tps = b.bind_i32((ev(ntiles_total) + ((I32::c(1) << ev(lg)) - 1)).lshr(ev(lg)));
+                b.assume_trusted(tps, Ext::c(1), Ext::ka(0x110).ceil_div(128), "tiles per split = ceil(ntiles / splits) in [1, ntiles] (host guard: splits <= ntiles); variable shift by log2(splits)");
+                let tile_lo = b.bind_i32(ev(si) * ev(tps));
+                b.assume_trusted(tile_lo, Ext::c(0), Ext::ka(0x110).ceil_div(128) - Ext::c(1), "first tile of this split = split * tps <= ntiles - 1 (host guard: every split is non-empty, (splits - 1) * tps < ntiles)");
+                let tile_hi = b.let_i32((ev(tile_lo) + ev(tps)).min(ev(ntiles_total)));
+                let key_lo = b.bind_i32(ev(tile_lo) << 7);
+                b.sym_range("KL", 0, i64::MAX);
+                b.assume_trusted(key_lo, Ext::sym("KL"), Ext::sym("KL"), "KL is only a NAME for key_lo = tile_lo << 7 (free symbol >= 0) so the next assume can state the correlation with the split length");
+                let kv_eff = b.bind_i32((tile_hi << 7).min(ev(kv_all)) - ev(key_lo));
+                b.assume_trusted(kv_eff, Ext::c(1), Ext::ka(0x110) - Ext::sym("KL"), "split length kv_eff = key_hi - key_lo with key_hi = min(tile_hi << 7, SK) <= SK (correlation lost by the interval engine) and >= 1 by the host guard");
+                (bi, kv_eff, ev(key_lo), Some(si))
+            }
+        };
         let row0 = b.let_i32((ev(qtile) << rows_lg) + (lane.wave() << 5));
         let row = b.let_i32(&row0 + lane.j());
         let s_last = b.let_i32(&self.s_len - 1);
+        let row_c = b.let_i32(row.lt(self.s_len.clone()).select_i32(row.clone(), s_last.clone()));
         let origin = vec![ev(bidx), I32::c(0), ev(hidx), I32::c(0)];
         // Q: two 16-byte loads per 64-byte k-group, kept in registers for the whole kernel; its E8M0 scales (- 9: S in units of 1/512)
         let qt = self.q.tile(origin.clone()).clamp(1, self.s_len.clone(), s_last.clone());
@@ -98,7 +150,7 @@ impl FmhaIo {
         let nkv = b.bind_i32((ev(kv_len) + 127).lshr(7));
         b.assume_trusted(nkv, Ext::c(1), Ext::ka(0x110).ceil_div(128), "nkv = (kv_len + 127) >> 7 with 1 <= kv_len <= SK; the engine floors the lower bound of a shift to 0");
         let g4 = b.bind_i32(C32x32F32::half_base(&lane));
-        FmhaBlock { lane, bidx, hidx, kvh, row0, kv_len, nkv, q, sq, sel, vd, g4 }
+        FmhaBlock { lane, bidx, hidx, kvh, row0, row_c, s_last, kv_len, key_lo, nkv, ntiles_total, split, q, sq, sel, vd, g4 }
     }
 }
 
@@ -109,9 +161,16 @@ pub struct FmhaBlock {
     pub kvh: ValueId,
     /// first query row of this wave
     pub row0: I32,
-    /// keys of this block / number of 128-key tiles
+    /// this lane's query row clamped to S - 1, and S - 1
+    pub row_c: I32,
+    pub s_last: I32,
+    /// keys of this block (relative to its first key `key_lo`) / number of 128-key tiles; tiles of the whole sequence
     pub kv_len: ValueId,
+    pub key_lo: I32,
     pub nkv: ValueId,
+    pub ntiles_total: ValueId,
+    /// KV split index of this block
+    pub split: Option<ValueId>,
     pub q: RowFrags,
     pub sq: [ValueId; 2],
     pub sel: ScaleSel,
@@ -124,7 +183,7 @@ impl FmhaBlock {
     /// A K/V-shaped tensor (rows = keys) as a tile of this block's KV head, rows clamped to the last key.
     fn kv_tile(&self, b: &mut FnBuilder, t: &Tensor) -> TileView {
         let last = b.let_i32(ev(self.kv_len) - 1);
-        t.tile(vec![ev(self.bidx), I32::c(0), ev(self.kvh), I32::c(0)]).clamp(1, ev(self.kv_len), last)
+        t.tile(vec![ev(self.bidx), self.key_lo.clone(), ev(self.kvh), I32::c(0)]).clamp(1, ev(self.kv_len), last)
     }
 }
 
@@ -282,7 +341,7 @@ pub fn fmha_fwd_hd128_mxfp8_dsl_vs128() -> Function {
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let mut ka = KArgs::new();
-    let io = FmhaIo::declare(b, &mut ka, 256);
+    let io = FmhaIo::declare(b, &mut ka, 256, false);
     ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
     let blk = io.block(b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
@@ -304,5 +363,82 @@ pub fn fmha_fwd_hd128_mxfp8_dsl_vs128() -> Function {
             store_bf16(b, &body.o.unwrap(), fin, row_ptr, live);
         });
     });
+    fb.finish()
+}
+
+/// `_kvsplit` (phase 1 of the sequence-parallel attention, docs/kvsplit-design.md): the `_vs128` block over one key range per block; writes the fp16
+/// normalised partial `Ohat` and `lse` instead of the output. Grid `(ceil(S/256), H, B * splits)`; kernarg = the base ABI + 0x270..0x287.
+pub fn fmha_fwd_hd128_mxfp8_dsl_kvsplit() -> Function {
+    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_dsl_kvsplit", 512);
+    fb.compile_profile(CompileProfile::KvSplit);
+    let b = &mut fb;
+    let mut ka = KArgs::new();
+    let io = FmhaIo::declare(b, &mut ka, 256, true);
+    let heads = ka.i32(b, "s_q_head_num", 0x140);
+    let kv = io.kvs.as_ref().expect("kv-split args");
+    let blk = io.block(b, 8);
+    let roles = Roles::split(b, &blk.lane, 4);
+    let ring = KvRing::new(b, &io, &blk, &roles);
+    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    pipe.ring_var_last = true;
+    // linear partial row of a query row: split * rows_total + (b * S + row) * H + h
+    let part_row0 = b.bind_i32(ev(blk.split.expect("split")) * ev(kv.rows_total));
+    let prow = |row: I32| ev(part_row0) + (((ev(blk.bidx) * io.s_len.clone()) + row) * ev(heads) + ev(blk.hidx));
+    // the recipe copy is chosen by the tile count of the WHOLE sequence: identical numerics to `_vs128` per split
+    let short = b.bind_cond(ev(blk.ntiles_total).lt(9));
+    versioned(b, short, |b, lut| {
+        roles.each(b, |b, role| {
+            let wid = roles.wave_id(b, role);
+            let mut body = AttnBody::new(b, &ring, &blk, wid, lut);
+            pipe.run(b, role, &mut body);
+            // every wave: the epilogue scratch reuses the Q staging of the neighbouring waves (the drain's last barrier is role-dependent)
+            b.barrier();
+            let l = body.sm.l_total(b);
+            let inv_l = b.rcp_f32(l);
+            let fin = b.mul_f32(inv_l, blk.vd);
+            let lse = body.sm.lse(b, l);
+            let lse_ptr = {
+                let off = b.bind_i32(prow(blk.row_c.clone()) << 2);
+                b.ptr_add(kv.lse, off)
+            };
+            let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
+            let lane = blk.lane;
+            kvsplit_partial_f16(b, &body.o.unwrap(), fin, &lane, &ring.epi.mine(wid), lse_ptr, lse, live, &mut |b, i| {
+                let r = b.let_i32((&blk.row0 + 8 * i as i32) + lane.lane().lshr(3));
+                let rg = r.lt(io.s_len.clone()).select_i32(r.clone(), blk.s_last.clone());
+                let off = b.bind_i32((prow(rg) << 8) + ((lane.lane() & 7) << 4));
+                b.ptr_add(kv.ohat, off)
+            });
+        });
+    });
+    fb.finish()
+}
+
+/// KV-split combine (phase 2), 8 output elements per thread: `out = sum_s 2^(lse_s - m) Ohat_s / sum_s 2^(lse_s - m)` (bf16).
+/// Kernarg: 0x00 Ohat, 0x08 lse, 0x10 out, 0x18 rows_total, 0x1C D (128), 0x20 splits; grid `ceil(rows_total * 16 / 256)` x 256 threads.
+pub fn fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h() -> Function {
+    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h", 256);
+    fb.compile_profile(CompileProfile::Combine);
+    let b = &mut fb;
+    let mut ka = KArgs::new();
+    let ohat = ka.ptr(b, "ptr_ohat", 0x00);
+    let lse = ka.ptr(b, "ptr_lse", 0x08);
+    let out = ka.ptr(b, "ptr_out", 0x10);
+    let rows = ka.dim(b, "rows_total", 0x18, 1, i64::MAX).val().unwrap();
+    ka.dim(b, "d", 0x1C, 128, 128);
+    let splits = ka.dim(b, "splits", 0x20, 1, i64::MAX).val().unwrap();
+    b.arg_tensor("ptr_ohat", Ext::ka(0x20) * Ext::ka(0x18) * Ext::c(128 * 4));
+    b.arg_tensor("ptr_lse", Ext::ka(0x20) * Ext::ka(0x18) * Ext::c(4));
+    b.arg_tensor("ptr_out", Ext::ka(0x18) * Ext::c(128 * 2));
+    // thread -> 8-element group of the output (clamped: the tail threads redo the last group), its row
+    let tid = b.let_(Op::WorkitemId);
+    let bx = b.let_(Op::WorkgroupIdX);
+    let groups = b.let_i32(rows.clone() << 4);
+    let t_raw = b.let_i32((ev(bx) << 8) + ev(tid));
+    let t = b.bind_i32(t_raw.lt(groups.clone()).select_i32(t_raw.clone(), groups - 1));
+    let row = b.bind_i32(ev(t).lshr(4));
+    b.assume_trusted(row, Ext::c(0), Ext::ka(0x18) - Ext::c(1), "row = clamped thread index >> k <= rows - 1: the engine keeps the rational upper bound of a shift");
+    let (rows_v, splits_v) = (b.bind_i32(rows), b.bind_i32(splits));
+    combine_splits(b, ohat, lse, out, rows_v, splits_v, t, row, 8, Ext::ka(0x20) - Ext::c(1));
     fb.finish()
 }
