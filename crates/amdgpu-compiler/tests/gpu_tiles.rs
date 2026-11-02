@@ -8,6 +8,10 @@ struct Opt {
     trip: Option<i32>,
     /// consumer slot = (min(it, cap)) & mask: equals it & mask up to `cap`, then sticks (a protocol that is only right for the first iterations)
     cap: Option<i32>,
+    /// producer slot = (nxt & mask) + ((nxt >> 8) & 1): ordinary double buffering until iteration 255 (kernel-occ's affine_period_256 attack)
+    deep: bool,
+    /// ring index mask (default slots - 1)
+    mask: Option<i32>,
     slots: u32,
     prologue_barrier: bool,
     producer_wait: bool,
@@ -17,7 +21,7 @@ struct Opt {
 }
 
 fn good() -> Opt {
-    Opt { trip: None, cap: None, slots: 2, prologue_barrier: true, producer_wait: true, consume_ver_off: 0, write_extra: 0, consumer_wait: true }
+    Opt { trip: None, cap: None, deep: false, mask: None, slots: 2, prologue_barrier: true, producer_wait: true, consume_ver_off: 0, write_extra: 0, consumer_wait: true }
 }
 
 fn has(rep: &Report, code: &str) -> bool {
@@ -60,8 +64,15 @@ fn proto(o: Opt) -> Function {
     let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
     let it = vars[0];
     let nxt = b.add_i32(it, Opnd::I32(1));
-    let mask = Opnd::I32(o.slots as i32 - 1);
-    let slot_n = b.let_(Op::AndI32(Opnd::Val(nxt), mask));
+    let mask = Opnd::I32(o.mask.unwrap_or(o.slots as i32 - 1));
+    let slot_n = if o.deep {
+        let lo = b.let_(Op::AndI32(Opnd::Val(nxt), mask));
+        let sh = b.let_(Op::LshrI32(Opnd::Val(nxt), Opnd::I32(8)));
+        let hi = b.let_(Op::AndI32(Opnd::Val(sh), Opnd::I32(1)));
+        b.add_i32(lo, hi)
+    } else {
+        b.let_(Op::AndI32(Opnd::Val(nxt), mask))
+    };
     let slot_c = match o.cap {
         Some(cap) => {
             let m = b.let_(Op::MinI32(Opnd::Var(it), Opnd::I32(cap)));
@@ -273,4 +284,116 @@ fn tile_trust_periodic_is_an_explicit_listed_escape() {
     let r = verify_ir(&f);
     assert!(!has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
     assert!(r.findings.iter().any(|x| x.code == "GV-ASSUME" && x.msg.contains("tile_trust_periodic")), "{}", r.render());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// horizon vs period: a marker whose slot has a period longer than the simulated horizon must not be certified
+
+#[test]
+fn a_marker_period_longer_than_the_horizon_is_rejected_unless_trusted() {
+    // slot = (nxt & 1) + ((nxt >> 8) & 1): affine / bitwise, ordinary double buffering for 255 iterations, then the extra bit moves the producer onto the consumer's slot
+    let r = verify_ir(&proto(Opt { slots: 4, mask: Some(1), deep: true, ..good() }));
+    assert!(has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
+    assert!(r.errors().iter().any(|e| e.msg.contains("period of up to 512")), "{}", r.render());
+    // the explicit, counted trust entry is the only way through
+    let mut f = proto(Opt { slots: 4, mask: Some(1), deep: true, ..good() });
+    f.contract.tile_trust = Some("test: launches never reach 256 iterations".to_string());
+    let r = verify_ir(&f);
+    assert!(!has(&r, "GV-TILE-UNROLL-LIMIT"), "{}", r.render());
+    assert!(r.findings.iter().any(|x| x.code == "GV-ASSUME" && x.msg.contains("tile_trust_periodic")), "{}", r.render());
+}
+
+#[test]
+fn a_true_period_two_ring_reports_its_period_and_is_clean_for_any_trip_count() {
+    let r = verify_ir(&proto(good()));
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+    assert!(r.findings.iter().any(|x| x.code == "GV-TILE-PERIOD" && x.msg.contains("dividing 2 ")), "{}", r.render());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// wave-uniform runtime ifs: BOTH outcomes are explored
+
+fn uniform_if_kernel(want: i32, in_loop: bool) -> Function {
+    let mut b = FnBuilder::new("uif", 128);
+    b.lds(4096);
+    b.arg("flag", DType::I32, 0, 4);
+    b.lds_tile("t", 0, 1024);
+    let flag = b.let_(Op::KernargI32 { offset: 0 });
+    let t = b.let_(Op::WorkitemId);
+    let c64 = b.c_i32(64);
+    let is_p = b.cmp_lt_i32(t, c64);
+    let z = b.c_i32(0);
+    let v = b.frag4(z, z, z, z);
+    let go = b.cmp_lt_i32(z, flag);
+    let lane = b.let_(Op::AndI32(Opnd::Val(t), Opnd::I32(63)));
+    let c16 = b.c_i32(16);
+    let a = b.mul_i32(lane, c16);
+    b.begin_if(is_p);
+    b.tile_produce("t", Opnd::I32(0), Opnd::I32(0));
+    b.store_lds_b128(a, v);
+    b.tile_end();
+    b.end_if();
+    b.wait_lds(0);
+    b.barrier();
+    let vars = if in_loop { Some(b.begin_loop(&[(DType::I32, Opnd::I32(0))])) } else { None };
+    b.begin_if(go); // wave-uniform, runtime condition
+    b.begin_if(is_p); // not the producer role: the consumer role
+    b.else_();
+    b.tile_consume("t", Opnd::I32(0), Opnd::I32(want));
+    let _r = b.load_lds_b128(a);
+    b.tile_end();
+    b.end_if();
+    b.end_if();
+    b.wait_lds(0);
+    if let Some(vs) = vars {
+        b.barrier();
+        let nx = b.add_i32(vs[0], Opnd::I32(1));
+        b.set_var(vs[0], nx);
+        let stop = b.let_(Op::CmpGeI32(Opnd::Val(nx), Opnd::I32(3)));
+        b.break_if(Opnd::Val(stop));
+        b.end_loop();
+    }
+    b.finish()
+}
+
+#[test]
+fn both_outcomes_of_a_wave_uniform_runtime_if_are_explored() {
+    // the read sits in the `then` arm of a runtime if: the correct version passes, the wrong one is found - so that arm really is simulated
+    let r = verify_ir(&uniform_if_kernel(0, false));
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+    assert!(r.proven.get("tile-reads").copied().unwrap_or(0) > 0, "{}", r.render());
+    let r = verify_ir(&uniform_if_kernel(1, false));
+    assert!(has(&r, "GV-TILE-STALE"), "{}", r.render());
+}
+
+#[test]
+fn a_runtime_if_inside_a_loop_with_protocol_events_is_reported_not_skipped() {
+    let r = verify_ir(&uniform_if_kernel(0, true));
+    assert!(has(&r, "GV-TILE-UNSUPPORTED"), "{}", r.render());
+    assert!(r.errors().iter().any(|e| e.msg.contains("INSIDE a loop")), "{}", r.render());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// the shipped FMHA kernels: the lifetime simulation really runs, and is not vacuous (mutation test)
+
+#[test]
+fn vs128_runs_the_lifetime_simulation_and_removed_barriers_are_noticed() {
+    let f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_vs128").unwrap();
+    let r = verify_ir(&f);
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+    assert!(r.proven.get("tile-reads").copied().unwrap_or(0) > 1000, "{}", r.render());
+    let barriers: Vec<usize> = f.stmts.iter().enumerate().filter(|(_, s)| matches!(s, amdgpu_dsl::Stmt::Barrier)).map(|(i, _)| i).collect();
+    assert!(barriers.len() >= 6, "{} barriers", barriers.len());
+    // remove every barrier in turn: the markers must notice most of them (a barrier that protects no marked tile is legitimately silent, e.g. the last one)
+    let mut undetected: Vec<usize> = Vec::new();
+    for (k, &stmt) in barriers.iter().enumerate() {
+        let mut g = f.clone();
+        g.stmts.remove(stmt);
+        let m = verify_ir(&g);
+        if !m.errors().iter().any(|e| e.code == "GV-BAR" || e.code.starts_with("GV-TILE")) {
+            undetected.push(k);
+        }
+    }
+    eprintln!("barriers: {}, removal undetected for barrier indices {:?} (stmts {:?})", barriers.len(), undetected, undetected.iter().map(|&k| barriers[k]).collect::<Vec<_>>());
+    assert!(undetected.len() * 10 <= barriers.len() * 3, "too many removed barriers go unnoticed: {:?}", undetected);
 }

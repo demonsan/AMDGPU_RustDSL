@@ -100,7 +100,13 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 
 **已证明 / 假设计数**：报告的 `proven` 里 `tile-reads` 为已证明的读事件数（按展开场景累计），`tile-cover` 为证明落在标记 tile 内的访问数；对 `slot/version` 的唯一假设是“循环最多展开 4 次、各循环同一迭代数”，以及角色只有两个（then/else）。
 
-**v1.1 的边界**：(i) 同一 tile 内按**字节**的部分重叠（两个 wave 写同一槽的不同子区间）不被区分——它们靠“同版本协作”语义被允许；(ii) 波一致、运行时条件的 `if` 内含 barrier/标记/LDS 访问时只给 `GV-TILE-UNSUPPORTED`（Warn），不建模两个分支；(iii) 未带标记的 LDS 访问（`GV-TILE-UNTAGGED`）不被检查；(iv) 跨 workgroup 与跨 kernel 的别名、数据竞争不在范围内。
+**控制流（v1.3）**：(1) **角色分裂**只指“工作项 id 相关、且分支内含 barrier/tile 标记的、尚未处于某个角色内的 `if`”（then = 角色 0，else = 角色 1）；其余工作项相关的嵌套 `if`（如 `wave_live`）和所有**波一致的运行时 `if`**（如 `is_tail`、`is_last`，条件取决于 kernarg/运行时值而模拟器不可知）都**探索两个结局**：每个结局是一条独立的路径（对每个角色做深度优先的路径枚举，上限 64 条），两个角色的路径两两配对，**工作组一致的条件在两个角色里必须取同一结局**；每对路径都做完整的协议检查（因此 `is_tail` 的两个迭代副本、epilogue 的 `wave_live`/`is_last` 都被分别验证）。(2) 循环**内部**含 barrier/标记/LDS 访问的运行时 `if` 不展开（路径数随迭代数指数增长）：`GV-TILE-UNSUPPORTED`（**Error**，不可认证），消息写明是哪个 `if`；两路径总数超过 64、或模拟超过 200 万条语句同样是 Error。
+
+**周期与展开范围（v1.3 修正）**：展开次数必须不小于标记表达式的**周期**。周期上界由表达式锥推出：每个 `& mask` 贡献其位宽（msb+1），每个 `>> k` 贡献 k（`x >> k` 的第 j 位是 x 的第 j+k 位），被 `^ 常量` 翻转的计数器贡献 1；周期整除 `2^M`（`M = Σ>> + max 掩码位宽`）。模拟迭代数取 `max(10, 2×最大槽数+4, 2×2^M+2)`（不超过 70）。若 `2×2^M+2 > 70`（例如 kernel-occ 的 `affine_period_256`：槽 `(nxt&1)+((nxt>>8)&1)` 在第 255 轮才让生产者落到消费者的槽上，M=9）→ `GV-TILE-UNROLL-LIMIT`（Error），消息写明周期上界与 horizon 上限；只有显式 `tile_trust_periodic(原因)`（作为 TRUSTED 计入证书）才能通过。真正的二周期环（M=1）报告 `GV-TILE-PERIOD`（Info）：“周期整除 2，模拟 10 轮 × 每种退出奇偶，覆盖任意迭代数”。
+
+**出厂 kernel 的结果**：`_vs128`：80 条角色路径组合 × 10 个迭代场景，**16,640 个读事件**被检查，0 个 tile 错误；`_kvsplit`：320 × 10，**66,560** 个读事件，0 错误（另有 160 个未带标记的访问 `GV-TILE-UNTAGGED`，Warn）；`_vs5` 同 `_vs128`。变异测试：逐个删除 `_vs128` 的 30 个 barrier，**24 个**被协议检查或 `GV-BAR` 发现；未被发现的 6 个（barrier 序号 6、7、14、21、22、29，语句 3106/3214/6246/8940/9048/11600，集中在 `is_tail` 的两个迭代副本和 kernel 末尾）要么不保护任何已标记的 tile，要么该区域的标记不完整——应由 kernel 作者复核。
+
+**v1.3 的边界**：(i) 同一 tile 内按**字节**的部分重叠（两个 wave 写同一槽的不同子区间）不被区分——它们靠“同版本协作”语义被允许；(ii) 角色只有两个，且所有循环迭代数相同；(iii) 未带标记的 LDS 访问（`GV-TILE-UNTAGGED`）不被检查；(iv) 跨 workgroup 与跨 kernel 的别名、数据竞争不在范围内。
 
 ## 4. 寄存器类别合法性（MIR，RA 之后）
 
@@ -183,7 +189,9 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 | `GV-TILE-RACE` | Error | 其他 wave 在读窗口内写（或仍在落地）同一槽的别的版本；或不同 wave 并发写不同版本 | `read of \`buf\`[0] (version 1, phases 1..1) overlaps the write of version 2 by role 0 … no barrier separates them` | 双缓冲/加 barrier |
 | `GV-TILE-UNROLL-LIMIT` | Error | tile 标记依赖的运算不是循环计数器的仿射/周期函数，协议只模拟了有限轮，更多轮的启动**未被覆盖** | `the tile marker depends on Min, which is not an affine/periodic function … a launch with more iterations is NOT covered` | 用 `+ 常量`/`^ 常量` 更新的计数器表达 slot/version，或 `tile_trust_periodic(原因)` |
 | `GV-TILE-INDEX` | Error | slot/version 不是循环计数器与常量的编译期函数，或槽越界 | `the slot / version of the \`buf\` marker is not a compile-time function of the loop counters` | 用环形计数器表达 |
-| `GV-TILE-PENDING/UNTAGGED/UNSUPPORTED/EMPTY` | Warn | 见 3.1 | | |
+| `GV-TILE-UNSUPPORTED` | Error | 循环内部的运行时 `if` 含 protocol 事件；路径数 > 64；模拟步数超预算 | `a runtime if INSIDE a loop contains barriers / tile markers / LDS accesses …` | 把 `if` 提到循环外或让两臂一致 |
+| `GV-TILE-PERIOD` | Info | 周期与模拟范围、路径组合数、已检查读事件数 | `tile markers are periodic with a period dividing 2 iteration(s); 10 iterations … cover any trip count` | — |
+| `GV-TILE-PENDING/UNTAGGED/EMPTY` | Warn | 见 3.1 | | |
 | `GV-CONTRACT` | Error | 合同引用的参数不是指针 kernarg | `extent declared for \`x\` which is not a pointer kernarg` | 修正合同 |
 | `GV-ASSUME` | Info | 每条 `assume`；`set_var` 不在假设范围内时也记录 | `assume var3 in [0, 1]: initial value proven inside; every set_var is checked against it` | 审阅 TRUSTED 项 |
 | `GV-ASM` | Info | kernel 含 safe-asm 块 | `safe-asm blocks present: their internal memory accesses are NOT bounds-checked by v1` | — |

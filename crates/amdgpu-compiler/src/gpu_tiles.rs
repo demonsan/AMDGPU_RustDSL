@@ -49,6 +49,8 @@ struct Ev {
 struct Trace {
     items: Vec<Item>,
     evs: Vec<Ev>,
+    /// the outcomes taken at wave-uniform runtime ifs: (stmt, outcome, workgroup-uniform)
+    path: Vec<(usize, bool, bool)>,
 }
 
 pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
@@ -164,6 +166,12 @@ struct Sim<'a> {
     untagged: &'a mut BTreeSet<usize>,
     steps: usize,
     break_taken: bool,
+    decisions: Vec<bool>,
+    dpos: usize,
+    taken: Vec<(usize, bool, bool)>,
+    loop_depth: usize,
+    in_role: bool,
+    unsupported: &'a mut Vec<(usize, String)>,
 }
 
 impl<'a> Sim<'a> {
@@ -219,6 +227,14 @@ impl<'a> Sim<'a> {
 
     fn close(&mut self) {
         self.open = None;
+    }
+
+    /// Outcome of a wave-uniform runtime if: replay the recorded prefix, then take `true` and remember that `false` is still to be explored.
+    fn choose(&mut self, stmt: usize, uniform: bool) -> bool {
+        let d = if self.dpos < self.decisions.len() { self.decisions[self.dpos] } else { true };
+        self.dpos += 1;
+        self.taken.push((stmt, d, uniform));
+        d
     }
 
     fn open_marker(&mut self, i: usize, produce: bool, tile: &str, slot: &Opnd, ver: &Opnd) {
@@ -303,6 +319,7 @@ impl<'a> Sim<'a> {
                         let k = self.cv(i0);
                         self.vars.insert(*v, k);
                     }
+                    self.loop_depth += 1;
                     for _ in 0..self.n {
                         self.exec_loop_body(i + 1, close);
                         if self.break_taken {
@@ -310,6 +327,7 @@ impl<'a> Sim<'a> {
                         }
                     }
                     self.break_taken = false;
+                    self.loop_depth -= 1;
                     self.close();
                     i = close + 1;
                     continue;
@@ -327,27 +345,34 @@ impl<'a> Sim<'a> {
                     let (els, endif) = if_span(f, i);
                     let then_range = (i + 1, els.unwrap_or(endif));
                     let else_range = els.map(|e| (e + 1, endif));
-                    if self.div.contains(&i) {
-                        if self.role == 0 {
-                            self.exec(then_range.0, then_range.1);
+                    let proto = |a: usize, b: usize| f.stmts[a..b].iter().any(|s| matches!(s, Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. }));
+                    let anything = |a: usize, b: usize| f.stmts[a..b].iter().any(|s| matches!(s, Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. }) || is_lds_access(s).is_some());
+                    let has_proto = proto(then_range.0, then_range.1) || else_range.map_or(false, |r| proto(r.0, r.1));
+                    let has_any = anything(then_range.0, then_range.1) || else_range.map_or(false, |r| anything(r.0, r.1));
+                    let run_arm = |s: &mut Self, then: bool| {
+                        if then {
+                            s.exec(then_range.0, then_range.1);
                         } else if let Some(r) = else_range {
-                            self.exec(r.0, r.1);
+                            s.exec(r.0, r.1);
                         }
+                    };
+                    if self.div.contains(&i) && !self.in_role && has_proto {
+                        // the wave ROLE split: role 0 takes the then arm, role 1 the else arm
+                        self.in_role = true;
+                        run_arm(self, self.role == 0);
+                        self.in_role = false;
                     } else {
                         match self.cv(cond) {
-                            CV::K(c) => {
-                                if c != 0 {
-                                    self.exec(then_range.0, then_range.1);
-                                } else if let Some(r) = else_range {
-                                    self.exec(r.0, r.1);
-                                }
-                            }
+                            CV::K(c) => run_arm(self, c != 0),
                             CV::U => {
-                                // a wave-uniform if with an unknown condition: its body must not carry protocol events
-                                let interesting = |a: usize, b: usize| f.stmts[a..b].iter().any(|s| matches!(s, Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. }) || is_lds_access(s).is_some());
-                                let bad = interesting(then_range.0, then_range.1) || else_range.map_or(false, |r| interesting(r.0, r.1));
-                                if bad {
-                                    self.diag("GV-TILE-UNSUPPORTED", Severity::Warn, i, format!("stmt {i}: wave-uniform if with a runtime condition contains barriers / tile markers / LDS accesses: both outcomes are NOT modelled (restructure or hoist them)"));
+                                if has_any {
+                                    if self.loop_depth > 0 {
+                                        self.unsupported.push((i, format!("stmt {i}: a runtime if INSIDE a loop contains barriers / tile markers / LDS accesses: its two outcomes are not explored per iteration (a 2^iterations path set); hoist it out of the loop, make both arms identical, or restructure")));
+                                    } else {
+                                        let uniform = !self.div.contains(&i);
+                                        let d = self.choose(i, uniform);
+                                        run_arm(self, d);
+                                    }
                                 }
                             }
                         }
@@ -358,8 +383,7 @@ impl<'a> Sim<'a> {
                     }
                     i = endif + 1;
                     continue;
-                }
-                _ => {}
+                }                _ => {}
             }
             i += 1;
         }
@@ -507,6 +531,200 @@ fn periodic_cone(f: &Function) -> Result<(), String> {
     Ok(())
 }
 
+/// Conservative bound M such that the tile markers are periodic in the loop iteration with a period dividing 2^M: every `& mask` contributes its width (msb + 1), every `>> k`
+/// in the cone adds k (bit j of `x >> k` is bit j + k of x), and a counter toggled by `^ const` contributes 1. (`+ const` counters are affine: only their low bits matter for a
+/// mask, and versions only matter through their differences.)
+fn period_bits(f: &Function) -> u32 {
+    fn konst(f: &Function, o: &Opnd) -> Option<i64> {
+        match o {
+            Opnd::I32(c) => Some(*c as i64),
+            Opnd::Val(v) => f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op: Op::ConstI32(c) } = s { if dst == v { Some(*c as i64) } else { None } } else { None }),
+            _ => None,
+        }
+    }
+    fn def<'a>(f: &'a Function, v: ValueId) -> Option<&'a Op> {
+        f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if *dst == v { Some(op) } else { None } } else { None })
+    }
+    struct Acc {
+        mask_bits: u32,
+        shifts: u32,
+        xor_counter: bool,
+        seen: HashSet<(bool, u32)>,
+    }
+    fn walk(f: &Function, o: &Opnd, a: &mut Acc) {
+        match o {
+            Opnd::Val(v) => {
+                if !a.seen.insert((false, *v)) {
+                    return;
+                }
+                let Some(op) = def(f, *v) else { return };
+                match op {
+                    Op::AndI32(x, y) => {
+                        for k in [x, y] {
+                            if let Some(c) = konst(f, k) {
+                                a.mask_bits = a.mask_bits.max(32 - (c as u32).leading_zeros());
+                            }
+                        }
+                    }
+                    Op::LshrI32(_, y) => {
+                        if let Some(k) = konst(f, y) {
+                            a.shifts += k.max(0) as u32;
+                        }
+                    }
+                    _ => {}
+                }
+                for x in op.operands() {
+                    walk(f, &x, a);
+                }
+            }
+            Opnd::Var(x) => {
+                if !a.seen.insert((true, x.0)) {
+                    return;
+                }
+                for s in &f.stmts {
+                    if let Stmt::SetVar { var, value: Opnd::Val(u) } = s {
+                        if var == x {
+                            if let Some(Op::XorI32(..)) = def(f, *u) {
+                                a.xor_counter = true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut a = Acc { mask_bits: 0, shifts: 0, xor_counter: false, seen: HashSet::new() };
+    for s in &f.stmts {
+        if let Stmt::TileProduce { slot, version, .. } | Stmt::TileConsume { slot, version, .. } = s {
+            walk(f, slot, &mut a);
+            walk(f, version, &mut a);
+        }
+    }
+    let m = if a.mask_bits > 0 { a.mask_bits + a.shifts } else { 0 };
+    m.max(if a.xor_counter { 1 } else { 0 })
+}
+
+fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, diags: &mut Vec<(&'static str, Severity, usize, String)>, untagged: &mut BTreeSet<usize>) -> Vec<Trace> {
+    let mut out: Vec<Trace> = Vec::new();
+    let mut work: Vec<Vec<bool>> = vec![Vec::new()];
+    let mut unsupported: Vec<(usize, String)> = Vec::new();
+    while let Some(prefix) = work.pop() {
+        if out.len() + work.len() > 64 {
+            diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, format!("more than 64 control-flow paths through the wave-uniform runtime ifs of role {role}: the tile protocol is not simulated for all of them")));
+            break;
+        }
+        let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported };
+        sim.exec(0, f.stmts.len());
+        if sim.steps > 2_000_000 {
+            sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));
+        }
+        for k in prefix.len()..sim.taken.len() {
+            let mut alt: Vec<bool> = sim.taken[..k].iter().map(|t| t.1).collect();
+            alt.push(!sim.taken[k].1);
+            work.push(alt);
+        }
+        let taken = sim.taken.clone();
+        let (items, evs) = (std::mem::take(&mut sim.items), std::mem::take(&mut sim.evs));
+        out.push(Trace { items, evs, path: taken });
+    }
+    for (stmt, msg) in unsupported {
+        if !diags.iter().any(|d| d.0 == "GV-TILE-UNSUPPORTED" && d.2 == stmt) {
+            diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, stmt, msg));
+        }
+    }
+    out
+}
+
+fn compatible(a: &Trace, b: &Trace) -> bool {
+    // a workgroup-uniform runtime condition has the same outcome in both roles
+    a.path.iter().filter(|p| p.2).all(|pa| b.path.iter().filter(|p| p.2 && p.0 == pa.0).all(|pb| pb.1 == pa.1))
+}
+
+fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'static str, Severity, usize, String)>, checked: &mut usize) {
+    struct Info {
+        role: usize,
+        ev: Ev,
+        done: Option<usize>,
+        publish: Option<u32>,
+        done_ord: u32,
+    }
+    let mut infos: Vec<Info> = Vec::new();
+    for (role, t) in traces.iter().enumerate() {
+        for ev in &t.evs {
+            if ev.n_acc == 0 {
+                diags.push(("GV-TILE-EMPTY", Severity::Warn, ev.stmt, format!("stmt {}: tile marker `{}` covers no LDS access", ev.stmt, f.contract.tiles[ev.tile].name)));
+                continue;
+            }
+            let (done, publish, ord) = analyse_trace(&t.items, ev);
+            infos.push(Info { role, ev: ev.clone(), done, publish, done_ord: ord });
+        }
+    }
+    let name = |ti: usize| f.contract.tiles[ti].name.clone();
+    for c in infos.iter().filter(|x| !x.ev.produce) {
+        *checked += 1;
+        let key = (c.ev.tile, c.ev.slot);
+        let prods: Vec<&Info> = infos.iter().filter(|p| p.ev.produce && (p.ev.tile, p.ev.slot) == key).collect();
+        let stmt = c.ev.stmt;
+        let where_ = format!("(role {}, {} iteration(s) simulated)", c.role, n);
+        if c.done.is_none() && traces[c.role].items.get(c.ev.last + 1).is_some() {
+            diags.push(("GV-TILE-PENDING", Severity::Warn, stmt, format!("stmt {stmt}: reads of `{}`[{}] are not completed (wait_lds(0)) before the next barrier, so the barrier does not separate them from the next writer {where_}", name(c.ev.tile), c.ev.slot)));
+        }
+        let visible = |p: &Info| -> bool {
+            if p.role == c.role {
+                p.done.map_or(false, |d| d < c.ev.start)
+            } else {
+                p.publish.map_or(false, |v| v <= c.ev.ord)
+            }
+        };
+        let mut vis: Vec<&&Info> = prods.iter().filter(|p| visible(p)).collect();
+        vis.sort_by_key(|p| (p.ev.ord, p.ev.start));
+        match vis.last() {
+            None => {
+                let pending = prods.iter().find(|p| p.ev.ver == c.ev.ver);
+                let why = match pending {
+                    Some(p) if p.role == c.role => format!("the {} of version {} (stmt {}) by this wave is not completed (wait_vm(0)/wait_lds(0)) before the read", if p.ev.dma { "DMA" } else { "write" }, p.ev.ver, p.ev.stmt),
+                    Some(p) => format!("version {} is produced by role {} (stmt {}, phase {}) but is only published at phase {}", p.ev.ver, p.role, p.ev.stmt, p.ev.ord, p.publish.map_or("never (no barrier after its completion)".to_string(), |v| v.to_string())),
+                    None => format!("no producer of `{}`[{}] with version {} exists in the simulated schedule", name(c.ev.tile), c.ev.slot, c.ev.ver),
+                };
+                diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] expecting version {} at phase {} finds NO published version: {why} {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord)));
+                continue;
+            }
+            Some(p) => {
+                if p.ev.ver != c.ev.ver {
+                    diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] expects version {} but the latest published version at phase {} is {} (produced by role {}, stmt {}): the slot was overwritten before this read, or the next version is not yet published {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, p.ev.ver, p.role, p.ev.stmt)));
+                    continue;
+                }
+            }
+        }
+        for p in prods.iter().filter(|p| p.ev.ver == c.ev.ver && p.ev.ord <= c.ev.ord) {
+            if !visible(p) {
+                diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] version {} at phase {}: the part produced by role {} (stmt {}) is not yet published (publish phase {}) {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, p.role, p.ev.stmt, p.publish.map_or("never".to_string(), |v| v.to_string()))));
+            }
+        }
+        for q in prods.iter().filter(|q| q.ev.ver != c.ev.ver) {
+            let overlap = if q.role == c.role {
+                q.ev.start < c.ev.start && !q.done.map_or(false, |d| d < c.ev.start)
+            } else {
+                q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord)
+            };
+            if overlap {
+                diags.push(("GV-TILE-RACE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] (version {}, phases {}..{}) overlaps the write of version {} by role {} (stmt {}, issued at phase {}, published at {}): no barrier separates them {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, c.done_ord, q.ev.ver, q.role, q.ev.stmt, q.ev.ord, q.publish.map_or("never".to_string(), |v| v.to_string()))));
+            }
+        }
+    }
+    for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
+        for b in infos.iter().skip(i + 1).filter(|x| x.ev.produce) {
+            if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver {
+                let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
+                if aw.0 < bw.1 && bw.0 < aw.1 {
+                    diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, format!("stmt {} / stmt {}: roles {} and {} write different versions ({} / {}) of `{}`[{}] in overlapping phases {}..{} / {}..{} (write-write race)", a.ev.stmt, b.ev.stmt, a.role, b.role, a.ev.ver, b.ev.ver, name(a.ev.tile), a.ev.slot, aw.0, aw.1, bw.0, bw.1)));
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
     let tiles = &f.contract.tiles;
     if tiles.is_empty() {
@@ -528,112 +746,54 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
             }
         }
     }
+    // horizon: the markers' period bound P = 2^M must fit twice into the simulated iterations
     let max_slots = tiles.iter().map(|t| t.slots as usize).max().unwrap_or(1);
-    let nmax = 10usize.max(2 * max_slots + 4);
+    let base_h = 10usize.max(2 * max_slots + 4);
+    let m = period_bits(f);
+    let pbound = 1usize << m.min(20);
+    let need = base_h.max(2 * pbound + 2);
+    const HORIZON_CAP: usize = 70;
+    let nmax;
     match (&f.contract.tile_trust, periodic_cone(f)) {
-        (Some(reason), _) => rep.add("GV-ASSUME", Severity::Info, format!("tile_trust_periodic: TRUSTED that the protocol is periodic in the loop iteration ({reason}); {nmax} iterations are simulated")),
-        (None, Err(why)) => rep.add(
-            "GV-TILE-UNROLL-LIMIT",
-            Severity::Error,
-            format!("{why}, which is not an affine/periodic function of the loop counters: the protocol is simulated for at most {nmax} loop iterations, so a launch with more iterations is NOT covered (express slot/version with counters stepped by + const / ^ const, or declare b.tile_trust_periodic(reason) when the structure is periodic by construction)"),
-        ),
-        (None, Ok(())) => {}
+        (Some(reason), _) => {
+            nmax = base_h;
+            rep.add("GV-ASSUME", Severity::Info, format!("tile_trust_periodic: TRUSTED that the protocol is periodic in the loop iteration ({reason}); {nmax} iterations are simulated"));
+        }
+        (None, Err(why)) => {
+            nmax = base_h;
+            rep.add(
+                "GV-TILE-UNROLL-LIMIT",
+                Severity::Error,
+                format!("{why}, which is not an affine/periodic function of the loop counters: the protocol is simulated for at most {nmax} loop iterations, so a launch with more iterations is NOT covered (express slot/version with counters stepped by + const / ^ const, or declare b.tile_trust_periodic(reason) when the structure is periodic by construction)"),
+            );
+        }
+        (None, Ok(())) => {
+            if need > HORIZON_CAP {
+                nmax = base_h;
+                rep.add(
+                    "GV-TILE-UNROLL-LIMIT",
+                    Severity::Error,
+                    format!("the tile markers' slot/version expressions may have a period of up to {pbound} iterations (a shift/mask in their cone reaches bit {}), which needs {need} simulated iterations; the horizon is capped at {HORIZON_CAP}: a launch with more iterations than {nmax} is NOT covered (simplify the index arithmetic or declare b.tile_trust_periodic(reason))", m.saturating_sub(1)),
+                );
+            } else {
+                nmax = need;
+                rep.add("GV-TILE-PERIOD", Severity::Info, format!("tile markers are periodic with a period dividing {pbound} iteration(s); {nmax} iterations (>= 2 x period + 2, >= 2 x ring slots + 4) are simulated for every exit parity, which covers any trip count"));
+            }
+        }
     }
     let div = divergent_ifs(f);
     let mut diags: Vec<(&'static str, Severity, usize, String)> = Vec::new();
     let mut untagged: BTreeSet<usize> = BTreeSet::new();
     let mut checked = 0usize;
+    let mut paths = 0usize;
     for n in 1..=nmax {
-        let mut traces: Vec<Trace> = Vec::new();
-        for role in 0..2usize {
-            let mut sim = Sim { f, role, n, div: &div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, diags: &mut diags, untagged: &mut untagged, steps: 0, break_taken: false };
-            sim.exec(0, f.stmts.len());
-            traces.push(Trace { items: sim.items, evs: sim.evs });
-        }
-        // per event derived data
-        struct Info {
-            role: usize,
-            ev: Ev,
-            done: Option<usize>,
-            publish: Option<u32>,
-            done_ord: u32,
-        }
-        let mut infos: Vec<Info> = Vec::new();
-        for (role, t) in traces.iter().enumerate() {
-            for ev in &t.evs {
-                if ev.n_acc == 0 {
-                    diags.push(("GV-TILE-EMPTY", Severity::Warn, ev.stmt, format!("stmt {}: tile marker `{}` covers no LDS access", ev.stmt, f.contract.tiles[ev.tile].name)));
-                    continue;
-                }
-                let (done, publish, ord) = analyse_trace(&t.items, ev);
-                infos.push(Info { role, ev: ev.clone(), done, publish, done_ord: ord });
-            }
-        }
-        let name = |ti: usize| f.contract.tiles[ti].name.clone();
-        for c in infos.iter().filter(|x| !x.ev.produce) {
-            checked += 1;
-            let key = (c.ev.tile, c.ev.slot);
-            let prods: Vec<&Info> = infos.iter().filter(|p| p.ev.produce && (p.ev.tile, p.ev.slot) == key).collect();
-            let stmt = c.ev.stmt;
-            let where_ = format!("(role {}, {} iteration(s) simulated)", c.role, n);
-            if c.done.is_none() && !matches!(traces[c.role].items.get(c.ev.last + 1), None) {
-                diags.push(("GV-TILE-PENDING", Severity::Warn, stmt, format!("stmt {stmt}: reads of `{}`[{}] are not completed (wait_lds(0)) before the next barrier, so the barrier does not separate them from the next writer {where_}", name(c.ev.tile), c.ev.slot)));
-            }
-            let visible = |p: &Info| -> bool {
-                if p.role == c.role {
-                    p.done.map_or(false, |d| d < c.ev.start)
-                } else {
-                    p.publish.map_or(false, |v| v <= c.ev.ord)
-                }
-            };
-            let mut vis: Vec<&&Info> = prods.iter().filter(|p| visible(p)).collect();
-            vis.sort_by_key(|p| (p.ev.ord, p.ev.start));
-            match vis.last() {
-                None => {
-                    // is there a producer of the expected version that is merely not yet published?
-                    let pending = prods.iter().find(|p| p.ev.ver == c.ev.ver);
-                    let why = match pending {
-                        Some(p) if p.role == c.role => format!("the {} of version {} (stmt {}) by this wave is not completed (wait_vm(0)/wait_lds(0)) before the read", if p.ev.dma { "DMA" } else { "write" }, p.ev.ver, p.ev.stmt),
-                        Some(p) => format!("version {} is produced by role {} (stmt {}, phase {}) but is only published at phase {}", p.ev.ver, p.role, p.ev.stmt, p.ev.ord, p.publish.map_or("never (no barrier after its completion)".to_string(), |v| v.to_string())),
-                        None => format!("no producer of `{}`[{}] with version {} exists in the simulated schedule", name(c.ev.tile), c.ev.slot, c.ev.ver),
-                    };
-                    diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] expecting version {} at phase {} finds NO published version: {why} {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord)));
-                    continue;
-                }
-                Some(p) => {
-                    if p.ev.ver != c.ev.ver {
-                        diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] expects version {} but the latest published version at phase {} is {} (produced by role {}, stmt {}): the slot was overwritten before this read, or the next version is not yet published {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, p.ev.ver, p.role, p.ev.stmt)));
-                        continue;
-                    }
-                }
-            }
-            // every co-producer of the expected version issued so far must be published too (cooperative fill)
-            for p in prods.iter().filter(|p| p.ev.ver == c.ev.ver && p.ev.ord <= c.ev.ord) {
-                if !visible(p) {
-                    diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] version {} at phase {}: the part produced by role {} (stmt {}) is not yet published (publish phase {}) {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, p.role, p.ev.stmt, p.publish.map_or("never".to_string(), |v| v.to_string()))));
-                }
-            }
-            // no other version may be written / landing while this read is in progress
-            for q in prods.iter().filter(|q| q.ev.ver != c.ev.ver) {
-                let overlap = if q.role == c.role {
-                    // same wave: a write issued BEFORE the read (program order) and not completed races with it; later writes are ordered after it
-                    q.ev.start < c.ev.start && !q.done.map_or(false, |d| d < c.ev.start)
-                } else {
-                    q.ev.ord <= c.done_ord && q.publish.map_or(true, |v| v > c.ev.ord)
-                };
-                if overlap {
-                    diags.push(("GV-TILE-RACE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] (version {}, phases {}..{}) overlaps the write of version {} by role {} (stmt {}, issued at phase {}, published at {}): no barrier separates them {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, c.done_ord, q.ev.ver, q.role, q.ev.stmt, q.ev.ord, q.publish.map_or("never".to_string(), |v| v.to_string()))));
-                }
-            }
-        }
-        // write-write: different waves writing one slot concurrently must write the same version
-        for (i, a) in infos.iter().enumerate().filter(|(_, x)| x.ev.produce) {
-            for b in infos.iter().skip(i + 1).filter(|x| x.ev.produce) {
-                if a.role != b.role && (a.ev.tile, a.ev.slot) == (b.ev.tile, b.ev.slot) && a.ev.ver != b.ev.ver {
-                    let (aw, bw) = ((a.ev.ord, a.publish.unwrap_or(u32::MAX)), (b.ev.ord, b.publish.unwrap_or(u32::MAX)));
-                    if aw.0 < bw.1 && bw.0 < aw.1 {
-                        diags.push(("GV-TILE-RACE", Severity::Error, a.ev.stmt, format!("stmt {} / stmt {}: roles {} and {} write different versions ({} / {}) of `{}`[{}] in overlapping phases {}..{} / {}..{} (write-write race)", a.ev.stmt, b.ev.stmt, a.role, b.role, a.ev.ver, b.ev.ver, name(a.ev.tile), a.ev.slot, aw.0, aw.1, bw.0, bw.1)));
-                    }
+        let t0 = enumerate_traces(f, 0, n, &div, &mut diags, &mut untagged);
+        let t1 = enumerate_traces(f, 1, n, &div, &mut diags, &mut untagged);
+        for a in &t0 {
+            for b in &t1 {
+                if compatible(a, b) {
+                    paths += 1;
+                    check_pair(f, [a, b], n, &mut diags, &mut checked);
                 }
             }
         }
@@ -648,6 +808,7 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
     if !untagged.is_empty() {
         rep.add("GV-TILE-UNTAGGED", Severity::Warn, format!("{} LDS access statement(s) executed outside any tile marker scope (first at stmt {}): their lifetime is not checked", untagged.len(), untagged.iter().next().unwrap()));
     }
+    rep.add("GV-TILE-PERIOD", Severity::Info, format!("tile simulation: {paths} role-path combination(s) over {nmax} loop-iteration scenarios, {checked} read events checked"));
     if errs == 0 {
         for _ in 0..checked {
             rep.ok("tile-reads");
