@@ -166,7 +166,7 @@ fn library_attention_bf16_verifies_and_has_the_fmha_signature() {
         assert_eq!(n(&asm, "v_smfmac_f32_16x16x128_fp8_fp8"), 3 * 4, "row sums: loop + 2 tail copies");
         assert!(n(&asm, "v_max3_f32") >= 3 * 31, "row max chain");
         assert!(n(&asm, "v_pk_mul_f32") > 0 && n(&asm, "v_pk_add_f32") > 0, "rollback rescale");
-        assert_eq!(n(&asm, "global_store_dwordx2"), 64);
+        assert_eq!(n(&asm, "global_store_dwordx2"), 16, "4 x 4 eight-byte stores per lane (the shipped _vs128 has 4 code copies = 64)");
         assert_eq!(n(&asm, "v_perm_b32") > 0, lut, "the LUT correction only in the lut copy");
     }
 }
