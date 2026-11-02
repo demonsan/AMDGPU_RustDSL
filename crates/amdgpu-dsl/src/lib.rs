@@ -493,6 +493,15 @@ pub struct ArgExtent {
     pub logical: Option<Ext>,
 }
 
+/// A named LDS tile (or ring of equal slots): slot k occupies `[base + k*slot_size, base + (k+1)*slot_size)`.
+#[derive(Clone, Debug)]
+pub struct TileDecl {
+    pub name: String,
+    pub base: i64,
+    pub slot_size: i64,
+    pub slots: u32,
+}
+
 /// The kernel's GPU-semantics contract, checked by `amdgpu_compiler::gpu_verify`.
 #[derive(Clone, Debug, Default)]
 pub struct Contract {
@@ -505,6 +514,9 @@ pub struct Contract {
     /// (kernarg offset, expr): the 32-bit kernarg scalar at that offset EQUALS `expr` (host contract), e.g. a row stride `ka(0x70) == grid_y * ka(0x90)`; substituted by
     /// the analyzer like the grid definitions.
     pub ka_defs: Vec<(u32, Ext)>,
+    /// LDS tiles / rings (v1.1 lifetime model) and the explicitly aliased pairs (allowed to overlap).
+    pub tiles: Vec<TileDecl>,
+    pub tile_aliases: Vec<(String, String)>,
     /// (symbol name, lo, hi) bounds of free symbols.
     pub sym_ranges: Vec<(String, i64, i64)>,
 }
@@ -512,6 +524,13 @@ pub struct Contract {
 /// Statements: a flat sequence with explicit structured markers.
 #[derive(Clone, Debug)]
 pub enum Stmt {
+    /// LDS tile protocol marker (v1.1): from here until the next tile marker / `TileEnd`, the LDS writes and DMA issued by this wave are version `version` of slot
+    /// `slot` of tile `tile`. Emits no code.
+    TileProduce { tile: String, slot: Opnd, version: Opnd },
+    /// ... the LDS reads issued by this wave expect version `version` of slot `slot` of tile `tile`.
+    TileConsume { tile: String, slot: Opnd, version: Opnd },
+    /// Ends the current tile marker scope.
+    TileEnd,
     /// Contract fact: from here on `target` (a value or a loop variable) lies in [lo, hi]. For loop variables the analyzer PROVES it inductively when it can
     /// (initial value and every `set_var` stay inside) and otherwise records it as a TRUSTED assumption in the report. Lowers to nothing.
     Assume { target: Opnd, lo: Ext, hi: Ext },
@@ -682,6 +701,15 @@ impl Function {
                 Stmt::Assume { target, lo, hi } => {
                     let _ = writeln!(s, "{pad}assume {target:?} in [{lo:?}, {hi:?}]");
                 }
+                Stmt::TileProduce { tile, slot, version } => {
+                    let _ = writeln!(s, "{pad}tile_produce {tile}[{slot:?}] v={version:?}");
+                }
+                Stmt::TileConsume { tile, slot, version } => {
+                    let _ = writeln!(s, "{pad}tile_consume {tile}[{slot:?}] v={version:?}");
+                }
+                Stmt::TileEnd => {
+                    let _ = writeln!(s, "{pad}tile_end");
+                }
                 Stmt::Barrier => {
                     let _ = writeln!(s, "{pad}barrier");
                 }
@@ -826,6 +854,29 @@ impl FnBuilder {
     /// Bounds of a free `Ext::sym` (default [1, +inf)).
     pub fn sym_range(&mut self, name: &str, lo: i64, hi: i64) {
         self.f.contract.sym_ranges.push((name.to_string(), lo, hi));
+    }
+    /// Declares an LDS tile `[base, base+size)` (one slot). Tiles must not overlap each other unless aliased with `lds_alias`.
+    pub fn lds_tile(&mut self, name: &str, base: i64, size: i64) {
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size, slots: 1 });
+    }
+    /// Declares a ring of `slots` equal slots starting at `base`.
+    pub fn lds_ring(&mut self, name: &str, base: i64, slot_size: i64, slots: u32) {
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size, slots });
+    }
+    /// The two tiles are allowed to overlap (time-multiplexed storage): the lifetime check then requires their events to be ordered like versions of one tile.
+    pub fn lds_alias(&mut self, a: &str, b: &str) {
+        self.f.contract.tile_aliases.push((a.to_string(), b.to_string()));
+    }
+    /// See `Stmt::TileProduce`.
+    pub fn tile_produce(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::TileProduce { tile: tile.to_string(), slot: slot.into(), version: version.into() });
+    }
+    /// See `Stmt::TileConsume`.
+    pub fn tile_consume(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::TileConsume { tile: tile.to_string(), slot: slot.into(), version: version.into() });
+    }
+    pub fn tile_end(&mut self) {
+        self.f.stmts.push(Stmt::TileEnd);
     }
     /// Contract fact `lo <= target <= hi` from this point on (see `Stmt::Assume`). Emits no code.
     pub fn assume(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext) {
@@ -2019,6 +2070,17 @@ pub fn verify(f: &Function) -> Vec<String> {
                     errs.push(here(e));
                 }
             }
+            Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } => {
+                if !f.contract.tiles.iter().any(|t| &t.name == tile) {
+                    errs.push(here(format!("tile marker names undeclared tile `{tile}` (lds_tile / lds_ring)")));
+                }
+                for (o, what) in [(*slot, "tile slot"), (*version, "tile version")] {
+                    if let Err(e) = expect_int(f, o, what) {
+                        errs.push(here(e));
+                    }
+                }
+            }
+            Stmt::TileEnd => {}
             Stmt::LoadGlobalLds { base, lds_addr, dwords, .. } => {
                 if let Err(e) = expect_ptr(f, *base, "dma base") {
                     errs.push(here(e));

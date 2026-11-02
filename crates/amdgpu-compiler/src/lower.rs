@@ -1564,7 +1564,7 @@ impl Lowerer {
                 Stmt::WaitLds { count } => {
                     self.push(MInst::new(MOp::SWaitLgkm).imm(*count as i64));
                 }
-                Stmt::Assume { .. } => {} // contract fact for gpu_verify: no code
+                Stmt::Assume { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd => {} // contract markers for gpu_verify: no code
                 Stmt::Barrier => {
                     self.push(MInst::new(MOp::SBarrier));
                 }
