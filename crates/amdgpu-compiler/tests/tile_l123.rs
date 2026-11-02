@@ -348,3 +348,75 @@ fn kv_split_and_gqa_components_verify() {
     let r = analyse(&f).unwrap();
     assert_eq!(r.ledger().assume_trusted, 7, "the components' trusted facts are counted in the certificate");
 }
+
+// ---- `_t128` staging: K and V of the same rows with one shared row clamp, K scales through a VGPR written after the DMA wait ----------------------------------------
+
+struct Demo3v {
+    base: Demo3,
+    kdv: DwordRowsVgpr,
+    pending: Option<amdgpu_dsl::ValueId>,
+}
+
+impl PipeBody for Demo3v {
+    fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
+        self.pending = Some(self.kdv.issue(b, key0));
+        let (ks, vs) = (self.base.ks.clone(), self.base.vs.clone());
+        issue_rows_shared(b, key0, &[(&self.base.kcp, &ks.at(slot)), (&self.base.vcp, &vs.at(slot))]);
+    }
+    fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, slot: &SlotIdx) {
+        let kd = self.base.kd.clone();
+        self.kdv.complete(b, self.pending.take().expect("pending K scale"), &kd.at(slot));
+    }
+    fn prologue_compute(&mut self, b: &mut FnBuilder, role: Role, t0: &TileIt) {
+        self.base.prologue_compute(b, role, t0)
+    }
+    fn loop_state(&mut self, b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
+        self.base.loop_state(b)
+    }
+    fn bind_state(&mut self, v: &[VarId]) {
+        self.base.bind_state(v)
+    }
+    fn window(&mut self, b: &mut FnBuilder, role: Role, t: &TileIt) {
+        self.base.window(b, role, t)
+    }
+}
+
+#[test]
+fn t128_style_staging_verifies() {
+    let mut f = demo3();
+    // rebuild with the t128 staging (same declarations)
+    let mut b = FnBuilder::new("tile_demo_ring3v", 256);
+    b.compile_profile(CompileProfile::Default);
+    let mut ka = KArgs::new();
+    let skv = ka.dim(&mut b, "kv_len", 0x10, 1, i64::MAX);
+    let kv_len = ka.i32(&mut b, "kv_len", 0x10);
+    let k = ka.tensor("ptr_k", 0x00, 1, vec![skv.clone(), Dim::c(128)], vec![Stride::Derived(I32::c(128)), Stride::Unit]).packed().declare(&mut ka, &mut b);
+    let v = ka.tensor("ptr_v", 0x08, 1, vec![skv.clone(), Dim::c(128)], vec![Stride::Derived(I32::c(128)), Stride::Unit]).packed().declare(&mut ka, &mut b);
+    let kd = ka.tensor("ptr_kd", 0x18, 4, vec![skv, Dim::c(1)], vec![Stride::Derived(I32::c(4)), Stride::Unit]).packed().declare(&mut ka, &mut b);
+    let mut lds = LdsPlan::new();
+    let [ks, vs] = lds.ring_group(3, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
+    let kds = lds.ring("KD", 512, 3, Layout::Linear);
+    lds.commit(&mut b);
+    let lane = Lane::new(&mut b);
+    let roles = Roles::single(&lane, 4);
+    let kv_last = b.let_i32(ev(kv_len) - 1);
+    let nkv = b.bind_i32((ev(kv_len) + 127).lshr(7));
+    b.assume_trusted(nkv, Ext::c(1), Ext::ka(0x10).ceil_div(128), "nkv = ceil(kv_len / 128) >= 1");
+    let src = |t: &Tensor, b: &mut FnBuilder| t.tile(vec![I32::c(0), I32::c(0)]).clamp(0, ev(kv_len), kv_last.clone()).row_source(b, 0);
+    let (ksrc, vsrc, kdsrc) = (src(&k, &mut b), src(&v, &mut b), src(&kd, &mut b));
+    let kcp = RowsCopy::new(&mut b, ksrc, &ks, roles.wave_in_group, &lane, 4);
+    let vcp = RowsCopy::new(&mut b, vsrc.clone(), &vs, roles.wave_in_group, &lane, 4);
+    let kdcp = DwordRowsCopy::new(&mut b, vsrc, &kds, roles.wave_in_group, &lane); // unused placeholder of Demo3
+    let rt_row = b.bind_i32((lane.tid() & 255).lshr(1));
+    let kdv = DwordRowsVgpr::new(&mut b, kdsrc, &kds, rt_row);
+    let pipe = Pipeline::new(Cadence::OneWindow, nkv, kv_len, 128, Ext::ka(0x10).ceil_div(128));
+    let mut body = Demo3v { base: Demo3 { ks, vs, kd: kds, kcp, vcp, kdcp, lane }, kdv, pending: None };
+    pipe.run(&mut b, Role::All, &mut body);
+    f = b.finish();
+    let e = errs(&f);
+    assert!(e.is_empty(), "{}", e.join("\n"));
+    let c = amdgpu_compiler::compile(&f).expect("compile");
+    let n = |m: &str| c.asm.lines().filter(|l| l.trim_start().starts_with(m)).count();
+    assert_eq!(n("global_load_lds_dwordx4"), 3 * 8, "K + V per stage, 3 stages (2 prologue + loop)");
+    assert_eq!(n("ds_write_b32"), 3, "the K-scale dword of each stage");
+}
