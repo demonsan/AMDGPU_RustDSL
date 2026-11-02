@@ -166,7 +166,7 @@ tile 内字节级重叠、`_kvsplit` 的 160 处 epilogue scratch（界已证、
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **36 个目标 / 192 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
+- **测试**：`cargo test` **36 个目标 / 195 项全绿**；22 个测试文件（`tail_invariance`、`mir_invariants`、`rust_safety`、
   `register_accounting`、`asm_assembles`、`hazard_classes`、`hazard_oracle`、`phys_waw`、`ra_reaching`、
   `pin_check`、`pinning`、`dead_loads`、`var_lint`、`smfmac_hazards`、`dma_hazards`、`lite_contract` …）
 - **硬件探针**（`tools/`，**29 个脚本**）：`vendor_validate.sh`、`vendor_counters.sh`、`vendor_disasm.sh`、
