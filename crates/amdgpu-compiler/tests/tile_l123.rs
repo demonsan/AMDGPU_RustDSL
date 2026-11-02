@@ -72,7 +72,7 @@ fn tile_view_offsets_clamp_the_relative_row() {
     let text = f.dump();
     // clamp = cmp + select, then the offset terms and one ptr_add
     assert!(f.stmts.len() - before >= 6, "{text}");
-    assert!(text.contains("select"), "the row index must be clamped:\n{text}");
+    assert!(text.to_lowercase().contains("select"), "the row index must be clamped:\n{text}");
 }
 
 #[test]
@@ -162,14 +162,16 @@ impl PipeBody for Demo {
         let r = self.vs.at(&t.cur);
         let a = b.bind_i32(r.base() + (self.lane.lane() << 4));
         let _v = r.read(b, |b| b.load_lds_b128(a));
-        let kd = self.kd.at(&t.cur);
-        let ka = b.bind_i32(kd.base() + (self.lane.lane() << 2));
-        let s = kd.read(b, |b| b.load_lds_b32(ka));
-        let acc = self.acc.unwrap();
-        let n = b.bind_i32(varx(acc) + ev(s));
-        b.set_var(acc, n);
         if t.staged {
+            // the K scales are consumed with their K tile (tile t+1, read in this M phase): reading KD(t) here would race with group A's DMA of
+            // KD(t+2) into the same slot while group B (one phase behind) is still in this phase - the verifier reports exactly that (GV-TILE-RACE)
             let nx = if self.bug == 1 { SlotIdx::new(t.next.slot, t.cur.gen) } else { t.next.clone() };
+            let kd = self.kd.at(&nx);
+            let ka = b.bind_i32(kd.base() + (self.lane.lane() << 2));
+            let s = kd.read(b, |b| b.load_lds_b32(ka));
+            let acc = self.acc.unwrap();
+            let n = b.bind_i32(varx(acc) + ev(s));
+            b.set_var(acc, n);
             let _ = self.read_k(b, &nx);
         }
     }
