@@ -502,6 +502,25 @@ pub struct TileDecl {
     pub slots: u32,
     /// Per-WAVE private region: slot k (= wave key k) is the scratch of one wave only (`lds_private`): its events never interact with other waves.
     pub private: bool,
+    /// A global-memory region (`buf_region`): not LDS; its protocol (produce / release / complete / barrier-publish / acquire / consume) is checked by gpu_protocol.
+    pub global: bool,
+}
+
+/// A global-memory region of a pointer kernarg: bytes `[base, base + size)` of `arg` (v4 protocol model, intra-workgroup + the opt-in last-arriver pattern).
+#[derive(Clone, Debug)]
+pub struct BufRegion {
+    pub name: String,
+    pub arg: String,
+    pub base: Ext,
+    pub size: Ext,
+}
+
+/// Opt-in fused-combine pattern: every block stores its slice of `region`, releases, takes a ticket on `counter_arg`; the last arriver acquires and reads all `splits` slices.
+#[derive(Clone, Debug)]
+pub struct LastArriver {
+    pub region: String,
+    pub counter_arg: String,
+    pub splits: Ext,
 }
 
 /// The kernel's GPU-semantics contract, checked by `amdgpu_compiler::gpu_verify`.
@@ -523,6 +542,10 @@ pub struct Contract {
     pub tile_aliases: Vec<(String, String)>,
     /// Explicit trust that the tile protocol is periodic in the loop iteration (see `tile_trust_periodic`): skips the affine-counter check.
     pub tile_trust: Option<String>,
+    /// Global-memory regions, the last-arriver patterns and the per-region trust entries (name, reason) of the v4 protocol model.
+    pub buf_regions: Vec<BufRegion>,
+    pub last_arrivers: Vec<LastArriver>,
+    pub buf_trusts: Vec<(String, String)>,
     /// (symbol name, lo, hi) bounds of free symbols.
     pub sym_ranges: Vec<(String, i64, i64)>,
 }
@@ -867,17 +890,17 @@ impl FnBuilder {
     }
     /// Declares an LDS tile `[base, base+size)` (one slot). Tiles must not overlap each other unless aliased with `lds_alias`.
     pub fn lds_tile(&mut self, name: &str, base: i64, size: i64) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size, slots: 1, private: false });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size, slots: 1, private: false, global: false });
     }
     /// Declares a ring of `slots` equal slots starting at `base`.
     pub fn lds_ring(&mut self, name: &str, base: i64, slot_size: i64, slots: u32) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size, slots, private: false });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size, slots, private: false, global: false });
     }
     /// Declares a per-WAVE private LDS region: `waves` slices of `size_per_wave` bytes at `base + wave * size_per_wave`. Mark accesses with `tile_produce/tile_consume(name,
     /// wave_key, version)` where `wave_key` is THE value the address is computed from (e.g. `base + wave_key * size + lane * 16`): the verifier proves the access lies in the
     /// slice of that very key (own wave) and that the wave reads only versions it produced and completed itself (no cross-wave publish is needed or assumed).
     pub fn lds_private(&mut self, name: &str, base: i64, size_per_wave: i64, waves: u32) {
-        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size_per_wave, slots: waves, private: true });
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size_per_wave, slots: waves, private: true, global: false });
     }
     /// The two tiles are allowed to overlap (time-multiplexed storage): the lifetime check then requires their events to be ordered like versions of one tile.
     pub fn lds_alias(&mut self, a: &str, b: &str) {
@@ -887,6 +910,31 @@ impl FnBuilder {
     /// the loop iteration by construction, so the simulated iterations (>= 10 and >= 2 x ring slots + 4) cover every launch. Listed as TRUSTED in the report.
     pub fn tile_trust_periodic(&mut self, reason: &str) {
         self.f.contract.tile_trust = Some(reason.to_string());
+    }
+    /// Declares a GLOBAL-memory region: bytes `[base, base + size)` of the pointer kernarg `arg`. Mark the writes with `buf_produce(name, gen)` and the reads with
+    /// `buf_consume(name, gen)`: the verifier then checks the four protocol obligations (complete before publish: `wait_vm(0)` / `fence_release`; publish before read:
+    /// release -> barrier -> acquire inside the workgroup; read before overwrite; generation consistency). `gen` follows the same affine/periodic rules as tile versions.
+    pub fn buf_region(&mut self, name: &str, arg: &str, base: Ext, size: Ext) {
+        self.f.contract.tiles.push(TileDecl { name: name.to_string(), base: 0, slot_size: 1, slots: 1, private: false, global: true });
+        self.f.contract.buf_regions.push(BufRegion { name: name.to_string(), arg: arg.to_string(), base, size });
+    }
+    /// The global writes issued from here (until `tile_end` / the next marker / barrier / control boundary) produce generation `gen` of the region.
+    pub fn buf_produce(&mut self, name: &str, generation: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::TileProduce { tile: name.to_string(), slot: Opnd::I32(0), version: generation.into() });
+    }
+    /// The global reads issued from here expect generation `gen` of the region.
+    pub fn buf_consume(&mut self, name: &str, generation: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::TileConsume { tile: name.to_string(), slot: Opnd::I32(0), version: generation.into() });
+    }
+    /// Declares the fused-combine (last-arriver) pattern over `region`: the stores marked `buf_produce` (generation = the block's split id, derived from the workgroup id)
+    /// must be followed by `fence_release`, then an atomic ticket on the pointer kernarg `counter_arg`; the reads marked `buf_consume` must sit in the branch guarded by the
+    /// ticket result, after `fence_acquire` (or with `sc1` loads for the lite variant), and cover more than one slice.
+    pub fn buf_last_arriver(&mut self, region: &str, counter_arg: &str, splits: Ext) {
+        self.f.contract.last_arrivers.push(LastArriver { region: region.to_string(), counter_arg: counter_arg.to_string(), splits });
+    }
+    /// Counted trust escape for one region: the verifier does not check it (e.g. a visibility argument it cannot make); listed in the certificate.
+    pub fn buf_trust(&mut self, region: &str, reason: &str) {
+        self.f.contract.buf_trusts.push((region.to_string(), reason.to_string()));
     }
     /// See `Stmt::TileProduce`.
     pub fn tile_produce(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>) {

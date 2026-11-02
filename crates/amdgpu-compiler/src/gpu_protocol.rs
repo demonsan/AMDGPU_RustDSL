@@ -1,4 +1,7 @@
-//! LDS tile lifetime / versioning (gpu_verify v1.1). Design: docs/gpu-semantics-verifier.md section 3.x.
+//! Protocol engine (gpu_verify v4): LDS tiles / rings / private regions AND global-memory regions. The four axes - ARRIVAL (s_barrier), COMPLETION (wait_vm / wait_lds /
+//! fence_release), VISIBILITY (barrier for LDS; release -> barrier -> acquire for global) and GENERATION (version algebra, periodic) - are separate events here; see
+//! docs/gpu-semantic-protocol.md. Legacy GV-TILE-* codes stay the primary names of the LDS instance; `proto_alias` maps every verdict onto GV-PROTO-*.
+//! (earlier header: LDS tile lifetime / versioning, gpu_verify v1.1.) Design: docs/gpu-semantics-verifier.md section 3.x.
 //!
 //! The kernel declares tiles / rings (`lds_tile`, `lds_ring`) and marks, with no-code statements, which LDS writes / DMA produce which VERSION of which slot
 //! (`tile_produce`) and which reads expect which version (`tile_consume`). This module executes the kernel's control skeleton concretely for each wave ROLE
@@ -28,6 +31,10 @@ enum Item {
     WaitLds { ord: u32 },
     Open { ev: usize },
     Access { dma: bool },
+    /// `fence_release`: waits vmcnt(0)/lgkmcnt(0) (completion) and, with `wb`, writes L2 back (device-scope visibility of plain stores)
+    Release { ord: u32 },
+    /// `fence_acquire`: `inv` invalidates the non-coherent caches
+    Acquire { ord: u32, inv: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +51,10 @@ struct Ev {
     dma: bool,
     ds: bool,
     n_acc: usize,
+    /// a global-memory region event (stores / loads), not LDS
+    global: bool,
+    /// every read of a consume event was a coherent (sc1) load
+    coherent: bool,
 }
 
 struct Trace {
@@ -53,7 +64,31 @@ struct Trace {
     path: Vec<(usize, bool, bool)>,
 }
 
-pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
+pub(crate) /// The v4 name of a verdict (obligation O1 complete-before-publish, O2 publish-before-read, O3 read-before-overwrite, O4 generation-consistency).
+pub(crate) fn proto_alias(code: &str, msg: &str) -> &'static str {
+    match code {
+        "GV-TILE-STALE" | "GV-PROTO-UNPUBLISHED" | "GV-PROTO-NOT-VISIBLE" | "GV-PROTO-NO-COMPLETION" | "GV-PROTO-STALE-GEN" => {
+            if msg.contains("NOT released") || msg.contains("no acquire") || msg.contains("before the acquire") {
+                "GV-PROTO-NOT-VISIBLE"
+            } else if msg.contains("never completed") || msg.contains("not completed") || msg.contains("not completed by this wave") {
+                "GV-PROTO-NO-COMPLETION"
+            } else if msg.contains("expects version") || msg.contains("generation") {
+                "GV-PROTO-STALE-GEN"
+            } else {
+                "GV-PROTO-UNPUBLISHED"
+            }
+        }
+        "GV-TILE-RACE" | "GV-PROTO-RACE" => "GV-PROTO-RACE",
+        "GV-TILE-PENDING" => "GV-PROTO-NO-COMPLETION",
+        "GV-TILE-INDEX" => "GV-PROTO-STALE-GEN",
+        "GV-BAR" => "GV-PROTO-ARRIVAL-MISMATCH",
+        "GV-TILE-UNROLL-LIMIT" | "GV-TILE-UNSUPPORTED" => "GV-PROTO-UNROLL-LIMIT",
+        "GV-ASSUME" if msg.contains("TRUSTED") => "GV-PROTO-TRUST",
+        _ => "",
+    }
+}
+
+fn divergent_ifs(f: &Function) -> HashSet<usize> {
     let mut tv: HashSet<ValueId> = HashSet::new();
     let mut tvars: HashSet<VarId> = HashSet::new();
     let tainted = |o: &Opnd, tv: &HashSet<ValueId>, tvars: &HashSet<VarId>| match o {
@@ -136,6 +171,20 @@ fn if_span(f: &Function, begin: usize) -> (Option<usize>, usize) {
         }
     }
     (els, f.stmts.len())
+}
+
+/// (is_write, is_coherent) of a global-memory access statement.
+fn is_global_access(st: &Stmt) -> Option<(bool, bool)> {
+    match st {
+        Stmt::StoreU16 { .. } | Stmt::StoreF32 { .. } | Stmt::StoreF32x2 { .. } | Stmt::StoreF32x4 { .. } => Some((true, false)),
+        Stmt::StoreF32Wt { .. } | Stmt::StoreF32x4Wt { .. } => Some((true, true)),
+        Stmt::Let { op, .. } => match op {
+            Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } => Some((false, false)),
+            Op::LoadF32Coherent { .. } | Op::LoadB128Coherent { .. } => Some((false, true)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn is_lds_access(st: &Stmt) -> Option<(bool, bool)> {
@@ -241,6 +290,11 @@ impl<'a> Sim<'a> {
         let Some(ti) = self.f.contract.tiles.iter().position(|t| t.name == tile) else { return };
         // a private (per-wave) region: the slot operand is the WAVE KEY, checked symbolically against the access address by the interval analysis; the simulation needs no value for it
         let private = self.f.contract.tiles[ti].private;
+        let global = self.f.contract.tiles[ti].global;
+        if self.f.contract.buf_trusts.iter().any(|(n, _)| n == tile) {
+            self.open = None; // a TRUSTED region (buf_trust): not checked, counted in the certificate
+            return;
+        }
         let slot_cv = if private { CV::K(0) } else { self.cv(slot) };
         match (slot_cv, self.cv(ver)) {
             (CV::K(s), CV::K(v)) => {
@@ -250,7 +304,7 @@ impl<'a> Sim<'a> {
                     self.open = None;
                     return;
                 }
-                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, role: self.role, start: self.items.len(), last: self.items.len(), dma: false, ds: false, n_acc: 0 };
+                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, role: self.role, start: self.items.len(), last: self.items.len(), dma: false, ds: false, n_acc: 0, global, coherent: true };
                 self.evs.push(ev);
                 let idx = self.evs.len() - 1;
                 self.items.push(Item::Open { ev: idx });
@@ -272,8 +326,30 @@ impl<'a> Sim<'a> {
                 return;
             }
             let st = &f.stmts[i];
+            if let Some((write, coh)) = is_global_access(st) {
+                if let Some(e) = self.open {
+                    if self.evs[e].global {
+                        if self.evs[e].produce != write {
+                            self.diag("GV-TILE-KIND", Severity::Error, i, format!("stmt {i}: a global {} is issued under a buf_{} marker (stmt {})", if write { "write" } else { "read" }, if self.evs[e].produce { "produce" } else { "consume" }, self.evs[e].stmt));
+                        } else {
+                            self.items.push(Item::Access { dma: true });
+                            let pos = self.items.len() - 1;
+                            let ev = &mut self.evs[e];
+                            ev.last = pos;
+                            ev.n_acc += 1;
+                            ev.dma = true;
+                            if !write && !coh {
+                                ev.coherent = false;
+                            }
+                        }
+                    }
+                }
+            }
             if let Some((dma, write)) = is_lds_access(st) {
                 match self.open {
+                    Some(e) if self.evs[e].global => {
+                        self.diag("GV-TILE-KIND", Severity::Error, i, format!("stmt {i}: an LDS access is issued under a buf_ (global region) marker"));
+                    }
                     Some(e) => {
                         let produce = self.evs[e].produce;
                         if produce != write {
@@ -310,6 +386,8 @@ impl<'a> Sim<'a> {
                     self.ord += 1;
                     self.close();
                 }
+                Stmt::FenceRelease { .. } => self.items.push(Item::Release { ord: self.ord }),
+                Stmt::FenceAcquire { inv } => self.items.push(Item::Acquire { ord: self.ord, inv: *inv }),
                 Stmt::WaitVm { count: 0 } => self.items.push(Item::WaitVm { ord: self.ord }),
                 Stmt::WaitLds { count: 0 } => self.items.push(Item::WaitLds { ord: self.ord }),
                 Stmt::TileProduce { tile, slot, version } => self.open_marker(i, true, tile, slot, version),
@@ -397,53 +475,69 @@ impl<'a> Sim<'a> {
     }
 }
 
-fn analyse_trace(items: &[Item], ev: &Ev) -> (Option<usize>, Option<u32>, u32) {
-    // (completion item, publish ordinal, completion ordinal)
+struct TraceInfo {
+    /// item index at which the event is complete in its own wave
+    done: Option<usize>,
+    /// first phase at which every other wave may rely on it (barrier after completion, + a release for global regions)
+    publish: Option<u32>,
+    /// phase at which a consumer's reads are complete
+    done_ord: u32,
+    /// global produce: a fence_release sits between the last write and the publishing barrier
+    released: bool,
+}
+
+fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
     let after = ev.last + 1;
     let find = |pred: &dyn Fn(&Item) -> bool| items.iter().enumerate().skip(after).find(|(_, it)| pred(it)).map(|(k, _)| k);
+    let ord_of = |it: &Item, dflt: u32| match it {
+        Item::WaitVm { ord } | Item::WaitLds { ord } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } => *ord,
+        _ => dflt,
+    };
     if ev.produce {
-        let vm = if ev.dma { find(&|it| matches!(it, Item::WaitVm { .. })) } else { None };
-        let ds = if ev.ds { find(&|it| matches!(it, Item::WaitLds { .. })) } else { None };
-        let done = match (ev.dma, ev.ds) {
-            (true, true) => match (vm, ds) {
-                (Some(a), Some(b)) => Some(a.max(b)),
+        let done = if ev.global {
+            // COMPLETION of global writes: wait_vm(0) or a fence_release (which waits vmcnt(0) itself)
+            find(&|it| matches!(it, Item::WaitVm { .. } | Item::Release { .. }))
+        } else {
+            let vm = if ev.dma { find(&|it| matches!(it, Item::WaitVm { .. })) } else { None };
+            let ds = if ev.ds { find(&|it| matches!(it, Item::WaitLds { .. })) } else { None };
+            match (ev.dma, ev.ds) {
+                (true, true) => match (vm, ds) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                },
+                (true, false) => vm,
+                (false, true) => ds,
                 _ => None,
-            },
-            (true, false) => vm,
-            (false, true) => ds,
-            _ => None,
+            }
         };
         match done {
             Some(d) => {
-                let ord = match &items[d] {
-                    Item::WaitVm { ord } | Item::WaitLds { ord } => *ord,
-                    _ => ev.ord,
-                };
-                let publish = items.iter().skip(d + 1).find_map(|it| if let Item::Barrier { ord } = it { Some(ord + 1) } else { None });
-                (Some(d), publish, ord)
+                let ord = ord_of(&items[d], ev.ord);
+                let bar = items.iter().enumerate().skip(d + 1).find_map(|(k, it)| if let Item::Barrier { ord } = it { Some((k, *ord)) } else { None });
+                let released = if ev.global { items.iter().enumerate().skip(after).any(|(k, it)| matches!(it, Item::Release { .. }) && bar.map_or(true, |(bk, _)| k < bk)) } else { true };
+                TraceInfo { done: Some(d), publish: bar.map(|(_, o)| o + 1), done_ord: ord, released }
             }
-            None => (None, None, ev.ord),
+            None => TraceInfo { done: None, publish: None, done_ord: ev.ord, released: false },
         }
     } else {
-        // consumer: its reads are complete at the first wait_lds(0) after the last read
-        match find(&|it| matches!(it, Item::WaitLds { .. })) {
+        // consumer: its reads are complete at the first wait after the last read (wait_lds(0) for LDS; wait_vm(0) / a fence for global reads)
+        let is_wait = |it: &Item| if ev.global { matches!(it, Item::WaitVm { .. } | Item::Release { .. } | Item::Acquire { .. }) } else { matches!(it, Item::WaitLds { .. }) };
+        match find(&|it| is_wait(it)) {
             Some(d) => {
                 let barrier_first = items.iter().enumerate().skip(after).find(|(_, it)| matches!(it, Item::Barrier { .. })).map(|(k, _)| k);
-                if barrier_first.map_or(false, |b| b < d) {
-                    (None, None, match items[barrier_first.unwrap()] { Item::Barrier { ord } => ord + 1, _ => ev.ord })
+                if barrier_first.map_or(false, |bk| bk < d) {
+                    TraceInfo { done: None, publish: None, done_ord: match items[barrier_first.unwrap()] { Item::Barrier { ord } => ord + 1, _ => ev.ord }, released: true }
                 } else {
-                    let ord = if let Item::WaitLds { ord } = &items[d] { *ord } else { ev.ord };
-                    (Some(d), None, ord)
+                    TraceInfo { done: Some(d), publish: None, done_ord: ord_of(&items[d], ev.ord), released: true }
                 }
             }
             None => {
                 let b = items.iter().skip(after).find_map(|it| if let Item::Barrier { ord } = it { Some(ord + 1) } else { None });
-                (None, None, b.unwrap_or(ev.ord))
+                TraceInfo { done: None, publish: None, done_ord: b.unwrap_or(ev.ord), released: true }
             }
         }
     }
 }
-
 /// Is every tile marker operand an AFFINE / PERIODIC function of loop counters? (constants, + - of counters, * << & ^ by constants; each counter used must be updated by
 /// `+ const` or `^ const` of itself and start at a constant.) Only then does simulating a bounded number of iterations cover every trip count.
 fn periodic_cone(f: &Function) -> Result<(), String> {
@@ -710,6 +804,7 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         done: Option<usize>,
         publish: Option<u32>,
         done_ord: u32,
+        released: bool,
     }
     let mut infos: Vec<Info> = Vec::new();
     for (role, t) in traces.iter().enumerate() {
@@ -718,8 +813,8 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
                 diags.push(("GV-TILE-EMPTY", Severity::Warn, ev.stmt, format!("stmt {}: tile marker `{}` covers no LDS access", ev.stmt, f.contract.tiles[ev.tile].name)));
                 continue;
             }
-            let (done, publish, ord) = analyse_trace(&t.items, ev);
-            infos.push(Info { role, ev: ev.clone(), done, publish, done_ord: ord });
+            let ti = analyse_trace(&t.items, ev);
+            infos.push(Info { role, ev: ev.clone(), done: ti.done, publish: ti.publish, done_ord: ti.done_ord, released: ti.released });
         }
     }
     let name = |ti: usize| f.contract.tiles[ti].name.clone();
@@ -750,20 +845,24 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
         let key = (c.ev.tile, c.ev.slot);
         let prods: Vec<&Info> = infos.iter().filter(|p| p.ev.produce && (p.ev.tile, p.ev.slot) == key).collect();
         let stmt = c.ev.stmt;
-        let where_ = format!("(role {}, {} iteration(s) simulated)", c.role, n);
+        let gl = c.ev.global;
+        let where_ = format!("(role {}, {} iteration(s) simulated){}", c.role, n, if gl { " [global region]" } else { "" });
         if c.done.is_none() && traces[c.role].items.get(c.ev.last + 1).is_some() {
             diags.push(("GV-TILE-PENDING", Severity::Warn, stmt, format!("stmt {stmt}: reads of `{}`[{}] are not completed (wait_lds(0)) before the next barrier, so the barrier does not separate them from the next writer {where_}", name(c.ev.tile), c.ev.slot)));
         }
         // SHARED tile: the data is produced by OTHER waves (even of the same role) and consumed independently by every wave. A producer's own completion
         // (wait_vm / wait_lds(0)) is only what lets the next barrier PUBLISH it; visibility is always the barrier publication, for every role. Only private regions
         // (lds_private) may be self-produced and self-consumed.
-        let visible = |p: &Info| -> bool { p.publish.map_or(false, |v| v <= c.ev.ord) };
+        // (a global region additionally needs the producer's fence_release before the publishing barrier: the barrier alone does not push plain stores out of the wave's cache)
+        let visible = |p: &Info| -> bool { p.publish.map_or(false, |v| v <= c.ev.ord) && (!gl || p.released) };
         let mut vis: Vec<&&Info> = prods.iter().filter(|p| visible(p)).collect();
         vis.sort_by_key(|p| (p.ev.ord, p.ev.start));
         match vis.last() {
             None => {
                 let pending = prods.iter().find(|p| p.ev.ver == c.ev.ver);
                 let why = match pending {
+                    Some(p) if gl && p.done.is_some() && p.publish.map_or(false, |v| v <= c.ev.ord) && !p.released => format!("version {} (stmt {}) was completed and a barrier followed, but the write was NOT released (no fence_release between the write and the publishing barrier): the other waves may read stale lines", p.ev.ver, p.ev.stmt),
+                    Some(p) if p.done.is_none() => format!("the {} of version {} (stmt {}) is never completed (no wait_vm(0) / wait_lds(0) / fence_release between the write and the next barrier), so no barrier can publish it", if p.ev.global { "global write" } else if p.ev.dma { "DMA" } else { "write" }, p.ev.ver, p.ev.stmt),
                     Some(p) if p.role == c.role && p.publish.map_or(true, |v| v > c.ev.ord) => format!("version {} (stmt {}) is produced by the waves of THIS role too, but a shared tile is only visible after a barrier publishes it (own wait_vm/wait_lds(0) is not enough: the other waves' parts may not be written yet); published at phase {}", p.ev.ver, p.ev.stmt, p.publish.map_or("never (no barrier after its completion)".to_string(), |v| v.to_string())),
                     Some(p) => format!("version {} is produced by role {} (stmt {}, phase {}) but is only published at phase {}", p.ev.ver, p.role, p.ev.stmt, p.ev.ord, p.publish.map_or("never (no barrier after its completion)".to_string(), |v| v.to_string())),
                     None => format!("no producer of `{}`[{}] with version {} exists in the simulated schedule", name(c.ev.tile), c.ev.slot, c.ev.ver),
@@ -775,6 +874,19 @@ fn check_pair(f: &Function, traces: [&Trace; 2], n: usize, diags: &mut Vec<(&'st
                 if p.ev.ver != c.ev.ver {
                     diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of `{}`[{}] expects version {} but the latest published version at phase {} is {} (produced by role {}, stmt {}): the slot was overwritten before this read, or the next version is not yet published {where_}", name(c.ev.tile), c.ev.slot, c.ev.ver, c.ev.ord, p.ev.ver, p.role, p.ev.stmt)));
                     continue;
+                }
+            }
+        }
+        if gl {
+            // VISIBILITY on the consumer side: an acquire (invalidate) after the publishing barrier and before the first read, unless every read is a coherent (sc1) load
+            let need = prods.iter().filter(|p| p.ev.ver == c.ev.ver && p.ev.ord <= c.ev.ord).filter_map(|p| p.publish).max();
+            if let Some(pub_ord) = need {
+                let ok = traces[c.role].items.iter().enumerate().take(c.ev.start).any(|(_, it)| match it {
+                    Item::Acquire { ord, inv } => *ord >= pub_ord && (*inv || c.ev.coherent),
+                    _ => false,
+                });
+                if !ok {
+                    diags.push(("GV-TILE-STALE", Severity::Error, stmt, format!("stmt {stmt}: read of the global region `{}` generation {} at phase {} runs before the acquire: no fence_acquire(inv) (or acquire + coherent sc1 loads) after the publishing barrier (phase {pub_ord}) and before the read, so the wave may still hit stale cache lines (no acquire) {where_}", name(c.ev.tile), c.ev.ver, c.ev.ord)));
                 }
             }
         }
@@ -809,14 +921,14 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
         return;
     }
     // (a) declarations: inside the segment, pairwise disjoint unless aliased
-    for t in tiles {
+    for t in tiles.iter().filter(|t| !t.global) {
         let end = t.base + t.slot_size * t.slots as i64;
         if t.base < 0 || end > f.lds_bytes as i64 {
             rep.add("GV-TILE-OVERLAP", Severity::Error, format!("tile `{}` [{}, {}) is not inside the declared {}-byte LDS segment", t.name, t.base, end, f.lds_bytes));
         }
     }
-    for (i, a) in tiles.iter().enumerate() {
-        for b in tiles.iter().skip(i + 1) {
+    for (i, a) in tiles.iter().enumerate().filter(|(_, t)| !t.global) {
+        for b in tiles.iter().skip(i + 1).filter(|t| !t.global) {
             let (ae, be) = (a.base + a.slot_size * a.slots as i64, b.base + b.slot_size * b.slots as i64);
             let aliased = f.contract.tile_aliases.iter().any(|(x, y)| (x == &a.name && y == &b.name) || (x == &b.name && y == &a.name));
             if a.base < be && b.base < ae && !aliased {
@@ -901,7 +1013,12 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
         if sev == Severity::Error {
             errs += 1;
         }
+        // the global instance has no legacy names: its primary code is the protocol verdict itself
+        let code = if msg.contains("[global region]") && !proto_alias(code, &msg).is_empty() { proto_alias(code, &msg) } else { code };
         rep.add(code, sev, msg);
+    }
+    for (name, reason) in &f.contract.buf_trusts {
+        rep.add("GV-ASSUME", Severity::Info, format!("buf_trust `{name}`: TRUSTED, the protocol of this region is not checked ({reason})"));
     }
     if !untagged.is_empty() {
         rep.add("GV-TILE-UNTAGGED", Severity::Warn, format!("{} LDS access statement(s) executed outside any tile marker scope (first at stmt {}): their lifetime is not checked", untagged.len(), untagged.iter().next().unwrap()));
@@ -912,4 +1029,168 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
             rep.ok("tile-reads");
         }
     }
+}
+// --------------------------------------------------------------------------------------------------------------------------------------------
+// the opt-in fused KV-split combine (last-arriver) pattern over a global region
+
+fn ptr_arg(f: &Function, o: &Opnd, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    let Opnd::Val(v) = o else { return None };
+    let op = f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None })?;
+    match op {
+        Op::KernargPtr { offset } => f.args.iter().find(|a| a.kernarg_offset == *offset).map(|a| a.name.clone()),
+        Op::PtrAdd { base, .. } => ptr_arg(f, base, depth + 1),
+        _ => None,
+    }
+}
+
+fn cone_has(f: &Function, o: &Opnd, pred: &dyn Fn(&Op) -> bool, seen: &mut HashSet<u32>) -> bool {
+    match o {
+        Opnd::Val(v) => {
+            if !seen.insert(*v) {
+                return false;
+            }
+            let Some(op) = f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) else { return false };
+            pred(op) || op.operands().iter().any(|x| cone_has(f, x, pred, seen))
+        }
+        Opnd::Var(x) => {
+            // a loop counter: its initial value and every update
+            if !seen.insert(1_000_000 + x.0) {
+                return false;
+            }
+            f.stmts.iter().any(|s| match s {
+                Stmt::SetVar { var, value } if var == x => cone_has(f, value, pred, seen),
+                Stmt::BeginLoop { vars, init } => vars.iter().position(|y| y == x).map_or(false, |k| cone_has(f, &init[k], pred, seen)),
+                _ => false,
+            })
+        }
+        _ => false,
+    }
+}
+
+/// O1 (stores complete + released before the ticket), O2 (the last arriver reads only after the acquire, inside the branch guarded by the ticket), O4 (generation = the block''s
+/// split id, derived from the workgroup id; all splits'' slices are read). Cross-kernel (two-launch) split stays out of scope.
+pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
+    for la in &f.contract.last_arrivers {
+        let region = &la.region;
+        if !f.contract.tiles.iter().any(|t| &t.name == region && t.global) {
+            rep.add("GV-CONTRACT", Severity::Error, format!("last-arriver pattern names `{region}` which is not a buf_region"));
+            continue;
+        }
+        if f.contract.buf_trusts.iter().any(|(n, _)| n == region) {
+            continue;
+        }
+        // scan: marker scopes, enclosing ifs, loop depth
+        let mut open: Option<(bool, usize)> = None;
+        let mut prod: Vec<(usize, bool)> = Vec::new();
+        let mut prod_marker: Option<usize> = None;
+        let mut cons: Vec<(usize, bool, Vec<usize>, usize)> = Vec::new(); // (stmt, coherent, enclosing ifs, loop depth)
+        let mut ifs: Vec<usize> = Vec::new();
+        let mut depth = 0usize;
+        for (i, s) in f.stmts.iter().enumerate() {
+            match s {
+                Stmt::TileProduce { tile, .. } if tile == region => {
+                    open = Some((true, i));
+                    prod_marker.get_or_insert(i);
+                }
+                Stmt::TileConsume { tile, .. } if tile == region => open = Some((false, i)),
+                Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd | Stmt::Barrier => open = None,
+                Stmt::BeginLoop { .. } => {
+                    open = None;
+                    depth += 1;
+                }
+                Stmt::EndLoop => {
+                    open = None;
+                    depth -= 1;
+                }
+                Stmt::BeginIf { .. } => {
+                    open = None;
+                    ifs.push(i);
+                }
+                Stmt::Else | Stmt::EndIf => {
+                    open = None;
+                    if matches!(s, Stmt::EndIf) {
+                        ifs.pop();
+                    }
+                }
+                _ => {}
+            }
+            if let (Some((is_prod, _)), Some((write, coh))) = (open, is_global_access(s)) {
+                if is_prod && write {
+                    prod.push((i, coh));
+                } else if !is_prod && !write {
+                    cons.push((i, coh, ifs.clone(), depth));
+                }
+            }
+        }
+        let fail = |rep: &mut Report, code: &'static str, msg: String| rep.add(code, Severity::Error, format!("last-arriver `{region}`: {msg}"));
+        let Some(&(last_store, _)) = prod.last() else {
+            fail(rep, "GV-PROTO-UNPUBLISHED", "no global store is marked buf_produce: nothing is published".to_string());
+            continue;
+        };
+        // ticket: the atomic on the counter after the stores
+        let ticket = f.stmts.iter().enumerate().skip(last_store + 1).find_map(|(i, s)| match s {
+            Stmt::Let { dst, op: Op::AtomicAddU32 { base, .. } } if ptr_arg(f, base, 0).as_deref() == Some(la.counter_arg.as_str()) => Some((i, *dst)),
+            _ => None,
+        });
+        let Some((ticket_idx, ticket_val)) = ticket else {
+            fail(rep, "GV-PROTO-ARRIVAL-MISMATCH", format!("no ticket atomic_add on `{}` after the last produced store (stmt {last_store})", la.counter_arg));
+            continue;
+        };
+        // O1: complete + release before the ticket
+        let rel = f.stmts.iter().enumerate().skip(last_store + 1).take(ticket_idx - last_store - 1).find_map(|(i, s)| if let Stmt::FenceRelease { wb } = s { Some((i, *wb)) } else { None });
+        match rel {
+            None => fail(rep, "GV-PROTO-NO-COMPLETION", format!("O1: no fence_release between the last produced store (stmt {last_store}) and the ticket (stmt {ticket_idx}): the ticket can be taken before the data is complete / visible, so the last arriver may read stale or missing slices")),
+            Some((ri, false)) if prod.iter().any(|(_, wt)| !*wt) => fail(rep, "GV-PROTO-NOT-VISIBLE", format!("O1: the release at stmt {ri} is the lite variant (no L2 write-back) but some produced stores are plain, not write-through (store_*_wt): their lines may stay in the producer's L2")),
+            Some(_) => {}
+        }
+        // O2: the reads sit in the branch guarded by the ticket result, after the acquire
+        if cons.is_empty() {
+            fail(rep, "GV-PROTO-UNPUBLISHED", "no global load is marked buf_consume".to_string());
+            continue;
+        }
+        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = &f.stmts[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. }), &mut HashSet::new()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
+        if let Some((i, ..)) = cons.iter().find(|(_, _, ifs, _)| !guarded(ifs)) {
+            fail(rep, "GV-PROTO-ARRIVAL-MISMATCH", format!("the read at stmt {i} is not inside the branch guarded by the ticket result (stmt {ticket_idx}): a block that is not the last arriver may read slices other blocks have not written yet"));
+        }
+        let first_read = cons.iter().map(|c| c.0).min().unwrap();
+        let acq = f.stmts.iter().enumerate().skip(ticket_idx + 1).take(first_read - ticket_idx - 1).find_map(|(i, s)| if let Stmt::FenceAcquire { inv } = s { Some((i, *inv)) } else { None });
+        match acq {
+            None => fail(rep, "GV-PROTO-NOT-VISIBLE", format!("O2: the first read (stmt {first_read}) runs before any fence_acquire after the ticket (stmt {ticket_idx}) - no acquire: the last arriver may hit stale cache lines")),
+            Some((ai, false)) if cons.iter().any(|c| !c.1) => fail(rep, "GV-PROTO-NOT-VISIBLE", format!("O2: the acquire at stmt {ai} is the lite variant (no invalidate) but some reads are not coherent (sc1) loads")),
+            Some(_) => {}
+        }
+        // O4: the produced generation is the block's split id
+        if let Some(mi) = prod_marker {
+            if let Stmt::TileProduce { version, .. } = &f.stmts[mi] {
+                let from_block = cone_has(f, version, &|op| matches!(op, Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ), &mut HashSet::new());
+                if !from_block {
+                    fail(rep, "GV-PROTO-STALE-GEN", format!("O4: the generation of the produce marker (stmt {mi}) is not derived from the workgroup id: the blocks do not agree on which slice (split) each of them owns"));
+                }
+            }
+        }
+        if cons.len() < 2 && !cons.iter().any(|c| c.3 > 0) {
+            fail(rep, "GV-PROTO-STALE-GEN", "O4: the last arriver reads a single slice (no loop over the splits, fewer than two loads): not all splits'' slices are consumed".to_string());
+        }
+        if !rep.errors().iter().any(|e| e.msg.contains(&format!("last-arriver `{region}`"))) {
+            rep.ok("last-arriver");
+        }
+    }
+}
+
+fn cone_has_val(f: &Function, o: &Opnd, target: u32) -> bool {
+    fn go(f: &Function, o: &Opnd, target: u32, seen: &mut HashSet<u32>) -> bool {
+        let Opnd::Val(v) = o else { return false };
+        if *v == target {
+            return true;
+        }
+        if !seen.insert(*v) {
+            return false;
+        }
+        let Some(op) = f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) else { return false };
+        op.operands().iter().any(|x| go(f, x, target, seen))
+    }
+    go(f, o, target, &mut HashSet::new())
 }

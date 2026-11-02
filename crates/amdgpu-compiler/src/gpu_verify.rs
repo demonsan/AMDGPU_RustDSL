@@ -29,6 +29,8 @@ pub struct Finding {
     pub code: &'static str,
     pub severity: Severity,
     pub msg: String,
+    /// The v4 protocol-model name of this verdict (GV-PROTO-*; empty when the finding is not a protocol obligation).
+    pub alias: &'static str,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -43,7 +45,8 @@ pub struct Report {
 impl Report {
     pub(crate) fn add(&mut self, code: &'static str, severity: Severity, msg: String) {
         if self.quiet == 0 {
-            self.findings.push(Finding { code, severity, msg });
+            let alias = crate::gpu_protocol::proto_alias(code, &msg);
+            self.findings.push(Finding { code, severity, msg, alias });
         }
     }
     pub(crate) fn ok(&mut self, what: &'static str) {
@@ -692,6 +695,9 @@ impl<'a> An<'a> {
             return;
         };
         let t = &self.f.contract.tiles[ti];
+        if t.global {
+            return; // an LDS access under a global-region marker is reported by the protocol engine (GV-TILE-KIND)
+        }
         if t.private {
             // the access must lie in the slice of THIS marker's wave key: addr - key*size - base in [0, size - accsize]
             let (key_atoms, key_c) = self.lin(&slot_o).unwrap_or((std::collections::BTreeMap::new(), 0));
@@ -811,6 +817,29 @@ impl<'a> An<'a> {
             self.rep.add("GV-GLB-NOEXT", Severity::Error, m);
             return;
         };
+        // under a global-region marker the access must also lie inside the declared region of THAT argument
+        if let Some((ti, _, _)) = self.tag.clone() {
+            let tname = self.f.contract.tiles[ti].name.clone();
+            if self.f.contract.tiles[ti].global {
+                if let Some(br) = self.f.contract.buf_regions.iter().find(|r| r.name == tname).cloned() {
+                    if br.arg != self.arg_name(arg) {
+                        let m = format!("stmt {}: {what}: the access goes through `{}` but the marked global region `{}` belongs to `{}`", self.idx, self.arg_name(arg), tname, br.arg);
+                        self.rep.add("GV-TILE-ESCAPE", Severity::Error, m);
+                    } else {
+                        let (bi, si) = (ext_itv(&self.cx, &br.base), ext_itv(&self.cx, &br.size));
+                        let a = off.add_const(imm);
+                        let lo_ok = bi.hi.iter().any(|bh| a.lo.iter().any(|al| self.cx.le(bh, al)));
+                        let hi_ok = a.hi.iter().any(|ah| bi.lo.iter().any(|bl| si.lo.iter().any(|sl| self.cx.le(&ah.add(&Poly::int(size)), &bl.add(sl)))));
+                        if lo_ok && hi_ok {
+                            self.rep.ok("region-cover");
+                        } else {
+                            let m = format!("stmt {}: {what}: access {} (+{size}) is not provably inside the global region `{}` [{}, +{}) of `{}`", self.idx, a.show(), tname, bi.show(), si.show(), br.arg);
+                            self.rep.add("GV-TILE-ESCAPE", Severity::Error, m);
+                        }
+                    }
+                }
+            }
+        }
         let lim_e = if store { ext.logical.clone().unwrap_or(ext.alloc.clone()) } else { ext.alloc.clone() };
         let limit = ext_itv(&self.cx, &lim_e);
         let addr = off.add_const(imm);
@@ -1512,6 +1541,16 @@ pub fn verify_ir(f: &Function) -> Report {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
         }
     }
+    for r in &f.contract.buf_regions {
+        if !f.args.iter().any(|a| a.name == r.arg && a.ty == amdgpu_dsl::DType::Ptr) {
+            an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: buf_region `{}` names `{}` which is not a pointer kernarg of `{}`", r.name, r.arg, f.name));
+        }
+    }
+    for la in &f.contract.last_arrivers {
+        if !f.args.iter().any(|a| a.name == la.counter_arg && a.ty == amdgpu_dsl::DType::Ptr) {
+            an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: last-arriver counter `{}` is not a pointer kernarg of `{}`", la.counter_arg, f.name));
+        }
+    }
     an.run();
     let has_asm = an.has_asm;
     let mut rep = an.rep;
@@ -1519,7 +1558,8 @@ pub fn verify_ir(f: &Function) -> Report {
         rep.add("GV-ASM", Severity::Info, "safe-asm blocks present: their internal memory accesses are NOT bounds-checked by v1 (address inputs come from IR values that are)".to_string());
     }
     barrier_balance(f, &mut rep);
-    crate::gpu_tiles::verify_tiles(f, &mut rep);
+    crate::gpu_protocol::verify_tiles(f, &mut rep);
+    crate::gpu_protocol::verify_last_arrivers(f, &mut rep);
     rep
 }
 
