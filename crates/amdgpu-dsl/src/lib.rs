@@ -412,9 +412,96 @@ impl Op {
     }
 }
 
+/// Symbolic integer expression for the GPU-semantics contract (extents, ranges): constants, 32-bit kernarg scalars (by kernarg byte offset) and the launch grid
+/// dimensions (in workgroups). Non-negative quantities; `Sub` is allowed (the analyzer works with intervals, see docs/gpu-semantics-verifier.md).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Ext {
+    Const(i64),
+    /// The 32-bit unsigned kernarg scalar at this kernarg byte offset.
+    Ka(u32),
+    /// Launch grid dimension in workgroups (0 = x, 1 = y, 2 = z).
+    Grid(u8),
+    Add(Box<Ext>, Box<Ext>),
+    Sub(Box<Ext>, Box<Ext>),
+    Mul(Box<Ext>, Box<Ext>),
+    /// ceil(e / k) and floor(e / k) for a positive constant k.
+    CeilDiv(Box<Ext>, i64),
+    FloorDiv(Box<Ext>, i64),
+}
+
+impl Ext {
+    pub fn c(v: i64) -> Ext {
+        Ext::Const(v)
+    }
+    pub fn ka(offset: u32) -> Ext {
+        Ext::Ka(offset)
+    }
+    pub fn grid_x() -> Ext {
+        Ext::Grid(0)
+    }
+    pub fn grid_y() -> Ext {
+        Ext::Grid(1)
+    }
+    pub fn grid_z() -> Ext {
+        Ext::Grid(2)
+    }
+    pub fn ceil_div(self, k: i64) -> Ext {
+        Ext::CeilDiv(Box::new(self), k)
+    }
+    pub fn floor_div(self, k: i64) -> Ext {
+        Ext::FloorDiv(Box::new(self), k)
+    }
+}
+
+impl From<i64> for Ext {
+    fn from(v: i64) -> Ext {
+        Ext::Const(v)
+    }
+}
+
+impl std::ops::Add for Ext {
+    type Output = Ext;
+    fn add(self, o: Ext) -> Ext {
+        Ext::Add(Box::new(self), Box::new(o))
+    }
+}
+impl std::ops::Sub for Ext {
+    type Output = Ext;
+    fn sub(self, o: Ext) -> Ext {
+        Ext::Sub(Box::new(self), Box::new(o))
+    }
+}
+impl std::ops::Mul for Ext {
+    type Output = Ext;
+    fn mul(self, o: Ext) -> Ext {
+        Ext::Mul(Box::new(self), Box::new(o))
+    }
+}
+
+/// Declared extent of a global buffer reachable from a pointer kernarg (the HOST CONTRACT: the caller guarantees the allocation).
+/// Loads are checked against `alloc` (the full allocation, including any zeroed slack the kernel is allowed to read); stores and atomics against `logical`
+/// when given (the slack must not be written), else against `alloc`.
+#[derive(Clone, Debug)]
+pub struct ArgExtent {
+    pub arg: String,
+    pub alloc: Ext,
+    pub logical: Option<Ext>,
+}
+
+/// The kernel's GPU-semantics contract, checked by `amdgpu_compiler::gpu_verify`.
+#[derive(Clone, Debug, Default)]
+pub struct Contract {
+    pub extents: Vec<ArgExtent>,
+    /// (kernarg offset, lo, hi): the 32-bit scalar at that offset lies in [lo, hi] (host contract; `hi` = i64::MAX = unbounded).
+    pub ka_ranges: Vec<(u32, i64, i64)>,
+}
+
 /// Statements: a flat sequence with explicit structured markers.
 #[derive(Clone, Debug)]
 pub enum Stmt {
+    /// Contract fact: from here on `target` (a value or a loop variable) lies in [lo, hi]. For loop variables the analyzer PROVES it inductively when it can
+    /// (initial value and every `set_var` stay inside) and otherwise records it as a TRUSTED assumption in the report. Lowers to nothing.
+    Assume { target: Opnd, lo: Ext, hi: Ext },
     Let { dst: ValueId, op: Op },
     StoreU16 { base: Opnd, byte_off: u32, value: Opnd },
     StoreF32 { base: Opnd, byte_off: u32, value: Opnd },
@@ -505,6 +592,7 @@ pub struct Function {
     pub workgroup_size: u32,
     /// Bytes of workgroup LDS this kernel declares.
     pub lds_bytes: u32,
+    pub contract: Contract,
     pub stmts: Vec<Stmt>,
     pub var_tys: Vec<DType>,
     pub value_tys: Vec<DType>,
@@ -577,6 +665,9 @@ impl Function {
                 }
                 Stmt::WaitLds { count } => {
                     let _ = writeln!(s, "{pad}waitlds({count})");
+                }
+                Stmt::Assume { target, lo, hi } => {
+                    let _ = writeln!(s, "{pad}assume {target:?} in [{lo:?}, {hi:?}]");
                 }
                 Stmt::Barrier => {
                     let _ = writeln!(s, "{pad}barrier");
@@ -680,6 +771,7 @@ impl FnBuilder {
                 kernarg_size: 0,
                 workgroup_size,
                 lds_bytes: 0,
+                contract: Contract::default(),
                 stmts: Vec::new(),
                 var_tys: Vec::new(),
                 value_tys: Vec::new(),
@@ -696,6 +788,23 @@ impl FnBuilder {
     /// Declares how many bytes of workgroup LDS the kernel uses.
     pub fn lds(&mut self, bytes: u32) {
         self.f.lds_bytes = bytes;
+    }
+
+    /// GPU-semantics contract: the pointer kernarg `name` points to an allocation of `alloc_bytes` bytes (an expression over kernarg scalars and the grid).
+    pub fn arg_tensor(&mut self, name: &str, alloc_bytes: Ext) {
+        self.f.contract.extents.push(ArgExtent { arg: name.to_string(), alloc: alloc_bytes, logical: None });
+    }
+    /// Like `arg_tensor` with a zeroed slack at the end: reads may use `alloc_bytes`, writes must stay within `logical_bytes`.
+    pub fn arg_tensor_slack(&mut self, name: &str, logical_bytes: Ext, alloc_bytes: Ext) {
+        self.f.contract.extents.push(ArgExtent { arg: name.to_string(), alloc: alloc_bytes, logical: Some(logical_bytes) });
+    }
+    /// Host contract: the 32-bit kernarg scalar at `offset` lies in [lo, hi] (use `i64::MAX` for no upper bound).
+    pub fn ka_range(&mut self, offset: u32, lo: i64, hi: i64) {
+        self.f.contract.ka_ranges.push((offset, lo, hi));
+    }
+    /// Contract fact `lo <= target <= hi` from this point on (see `Stmt::Assume`). Emits no code.
+    pub fn assume(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext) {
+        self.f.stmts.push(Stmt::Assume { target: target.into(), lo, hi });
     }
 
     pub fn arg(&mut self, name: &str, ty: DType, offset: u32, size: u32) {
@@ -1880,6 +1989,11 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
             }
             Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::WaitVm { .. } => {}
+            Stmt::Assume { target, .. } => {
+                if let Err(e) = expect_int(f, *target, "assume target") {
+                    errs.push(here(e));
+                }
+            }
             Stmt::LoadGlobalLds { base, lds_addr, dwords, .. } => {
                 if let Err(e) = expect_ptr(f, *base, "dma base") {
                     errs.push(here(e));
