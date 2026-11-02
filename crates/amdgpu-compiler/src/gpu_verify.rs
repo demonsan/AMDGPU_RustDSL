@@ -547,7 +547,9 @@ struct An<'a> {
     var_init: HashMap<VarId, Itv>,
     assumed: HashMap<VarId, Itv>,
     assumed_trusted: HashMap<VarId, String>,
-    tag: Option<(usize, Itv)>,
+    tag: Option<(usize, Itv, Opnd)>,
+    /// the address operand (and constant offset) of the LDS access being checked: private-region checks need it symbolically
+    cur_addr: Option<(Opnd, i128)>,
     acc: HashMap<VarId, Itv>,
     defs: HashMap<ValueId, Op>,
     /// values constrained by `assume`: their interval is a contract fact, so `recompute` (select-arm refinement) must not re-derive them from their operands
@@ -661,6 +663,7 @@ impl<'a> An<'a> {
     }
 
     fn check_lds_at(&mut self, what: &str, o: &Opnd, size: i128) {
+        self.cur_addr = Some((*o, 0));
         let a = self.int_of(o);
         let before = self.rep.findings.len();
         self.check_lds(what, &a, size);
@@ -675,8 +678,55 @@ impl<'a> An<'a> {
 
     /// Under a tile marker, the access must lie inside the marked tile / ring (hull over the slot interval).
     fn tile_cover(&mut self, what: &str, addr: &Itv, size: i128) {
-        let Some((ti, slot)) = self.tag.clone() else { return };
+        let Some((ti, slot, slot_o)) = self.tag.clone() else {
+            // untagged: must provably stay out of every private (per-wave) region
+            for t in self.f.contract.tiles.iter().filter(|t| t.private) {
+                let (lo, hi) = (t.base as i128, (t.base + t.slot_size * t.slots as i64) as i128);
+                let below = addr.hi.iter().any(|h| self.cx.le(&h.add(&Poly::int(size)), &Poly::int(lo)));
+                let above = addr.lo.iter().any(|l| self.cx.le(&Poly::int(hi), l));
+                if !(below || above) {
+                    let m = format!("stmt {}: {what}: LDS access {} (+{size}) outside any tile marker may touch the private per-wave region `{}` [{lo}, {hi}): an unmarked access cannot be proven to be the owning wave", self.idx, addr.show(), t.name);
+                    self.rep.add("GV-TILE-PRIVATE-ESCAPE", Severity::Error, m);
+                }
+            }
+            return;
+        };
         let t = &self.f.contract.tiles[ti];
+        if t.private {
+            // the access must lie in the slice of THIS marker's wave key: addr - key*size - base in [0, size - accsize]
+            let (key_atoms, key_c) = self.lin(&slot_o).unwrap_or((std::collections::BTreeMap::new(), 0));
+            let ok = match self.cur_addr.clone().and_then(|(o, imm)| self.lin(&o).map(|l| (l, imm))) {
+                Some(((mut atoms, c), imm)) => {
+                    for (k, v) in key_atoms {
+                        *atoms.entry(k).or_insert(0) -= v * t.slot_size as i128;
+                    }
+                    atoms.retain(|_, v| *v != 0);
+                    let mut r = Itv::konst(c + imm - key_c * t.slot_size as i128 - t.base as i128);
+                    for ((is_var, id), coef) in atoms {
+                        let o = if is_var { Opnd::Var(amdgpu_dsl::VarId(id)) } else { Opnd::Val(id) };
+                        r = r.add(&self.int_of(&o).scale(Q::int(coef)));
+                    }
+                    let limit = Itv::konst(t.slot_size as i128);
+                    match self.prove_range(&r, size, &limit) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            let m = format!("stmt {}: {what}: LDS access is not provably inside the private slice of wave key {slot_o:?} of `{}` (slice size {}): another wave's slice may be touched: {e}", self.idx, t.name, t.slot_size);
+                            self.rep.add("GV-TILE-PRIVATE-ESCAPE", Severity::Error, m);
+                            false
+                        }
+                    }
+                }
+                None => {
+                    let m = format!("stmt {}: {what}: the address of an access to the private region `{}` is not a linear function of the wave key {slot_o:?} (cannot prove it stays in the own-wave slice)", self.idx, t.name);
+                    self.rep.add("GV-TILE-PRIVATE-ESCAPE", Severity::Error, m);
+                    false
+                }
+            };
+            if ok {
+                self.rep.ok("tile-cover");
+            }
+            return;
+        }
         let reg = slot.scale(Q::int(t.slot_size as i128)).add_const(t.base as i128);
         let lo_ok = reg.lo.iter().any(|r| addr.lo.iter().any(|a| self.cx.le(r, a)));
         let hi_ok = addr.hi.iter().any(|h| reg.hi.iter().any(|rh| self.cx.le(&h.add(&Poly::int(size)), &rh.add(&Poly::int(t.slot_size as i128)))));
@@ -688,8 +738,55 @@ impl<'a> An<'a> {
         }
     }
 
+    /// Linear form over atoms (values / loop variables that are not +, constant*, << constant of others): atom coefficients and a constant.
+    fn lin(&self, o: &Opnd) -> Option<(std::collections::BTreeMap<(bool, u32), i128>, i128)> {
+        use std::collections::BTreeMap;
+        fn go(s: &An, o: &Opnd, depth: usize) -> Option<(BTreeMap<(bool, u32), i128>, i128)> {
+            if depth > 24 {
+                return None;
+            }
+            match o {
+                Opnd::I32(c) => Some((BTreeMap::new(), *c as i128)),
+                Opnd::Var(v) => Some((BTreeMap::from([((true, v.0), 1)]), 0)),
+                Opnd::Val(v) => match s.defs.get(v) {
+                    Some(Op::ConstI32(c)) => Some((BTreeMap::new(), *c as i128)),
+                    Some(Op::AddI32(a, b)) => {
+                        let (mut x, c1) = go(s, a, depth + 1)?;
+                        let (y, c2) = go(s, b, depth + 1)?;
+                        for (k, v) in y {
+                            *x.entry(k).or_insert(0) += v;
+                        }
+                        x.retain(|_, v| *v != 0);
+                        Some((x, c1 + c2))
+                    }
+                    Some(Op::MulI32(a, b)) => {
+                        let (x, c1) = go(s, a, depth + 1)?;
+                        let (y, c2) = go(s, b, depth + 1)?;
+                        let (m, (atoms, c), k) = if x.is_empty() { (c1, (y, c2), 0) } else if y.is_empty() { (c2, (x, c1), 0) } else { return Some((BTreeMap::from([((false, *v), 1)]), 0)) };
+                        let _ = k;
+                        Some((atoms.into_iter().map(|(a, v)| (a, v * m)).filter(|(_, v)| *v != 0).collect(), c * m))
+                    }
+                    Some(Op::ShlI32(a, b)) => {
+                        let (x, c1) = go(s, a, depth + 1)?;
+                        let (y, c2) = go(s, b, depth + 1)?;
+                        if y.is_empty() && (0..31).contains(&c2) {
+                            let m = 1i128 << c2;
+                            Some((x.into_iter().map(|(a, v)| (a, v * m)).collect(), c1 * m))
+                        } else {
+                            Some((BTreeMap::from([((false, *v), 1)]), 0))
+                        }
+                    }
+                    _ => Some((BTreeMap::from([((false, *v), 1)]), 0)),
+                },
+                Opnd::F32(_) => None,
+            }
+        }
+        go(self, o, 0)
+    }
+
     fn check_lds(&mut self, what: &str, addr: &Itv, size: i128) {
         self.tile_cover(what, addr, size);
+        self.cur_addr = None;
         let limit = Itv::konst(self.f.lds_bytes as i128);
         match self.prove_range(addr, size, &limit) {
             Ok(()) => self.rep.ok("lds"),
@@ -1121,7 +1218,7 @@ impl<'a> An<'a> {
                 }
                 Stmt::Assume { target, lo, hi, trusted } => self.assume(target, lo, hi, trusted),
                 Stmt::TileProduce { tile, slot, .. } | Stmt::TileConsume { tile, slot, .. } => {
-                    self.tag = f.contract.tiles.iter().position(|t| &t.name == tile).map(|ti| (ti, self.int_of(slot)));
+                    self.tag = f.contract.tiles.iter().position(|t| &t.name == tile).map(|ti| (ti, self.int_of(slot), *slot));
                 }
                 Stmt::TileEnd | Stmt::Barrier | Stmt::EndLoop | Stmt::Else | Stmt::EndIf => self.tag = None,
                 Stmt::StoreU16 { base, byte_off, .. } => {
@@ -1152,12 +1249,14 @@ impl<'a> An<'a> {
                     let r = self.av_of(rsrc);
                     self.check_buffer("buffer load ... lds (global side)", &r, voff, soff, *imm as i128, 4 * *dwords as i128, false);
                     let a = self.int_of(lds_addr).add_const(*imm as i128);
+                    self.cur_addr = Some((*lds_addr, *imm as i128));
                     self.check_lds("buffer load ... lds (LDS side: M0 + imm + lane*size, 64 lanes)", &a, 64 * 4 * *dwords as i128);
                 }
                 Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
                     let b = self.av_of(base);
                     self.check_global("global_load_lds (global side)", &b, *byte_off as i128, 4 * *dwords as i128, false);
                     let a = self.int_of(lds_addr).add_const(*byte_off as i128);
+                    self.cur_addr = Some((*lds_addr, *byte_off as i128));
                     let before = self.rep.findings.len();
                     self.check_lds("global_load_lds (LDS side: M0 + imm + lane*size, 64 lanes)", &a, 64 * 4 * *dwords as i128);
                     if self.rep.findings.len() > before {
@@ -1407,7 +1506,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: Ctx::new(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts.iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: Ctx::new(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts.iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));

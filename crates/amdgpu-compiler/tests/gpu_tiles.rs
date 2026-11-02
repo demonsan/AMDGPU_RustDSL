@@ -397,3 +397,99 @@ fn vs128_runs_the_lifetime_simulation_and_removed_barriers_are_noticed() {
     eprintln!("barriers: {}, removal undetected for barrier indices {:?} (stmts {:?})", barriers.len(), undetected, undetected.iter().map(|&k| barriers[k]).collect::<Vec<_>>());
     assert!(undetected.len() * 10 <= barriers.len() * 3, "too many removed barriers go unnoticed: {:?}", undetected);
 }
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// private (per-wave) LDS regions: own-wave lifetime, symbolic own-slice proof
+
+#[derive(Clone, Copy)]
+struct Priv {
+    /// read the slice of wave `wid ^ 1` instead of the own one
+    other_wave: bool,
+    own_wait: bool,
+    read_ver: i32,
+    overlap_shared: bool,
+    untagged_poke: bool,
+}
+
+fn private_kernel(p: Priv) -> Function {
+    let mut b = FnBuilder::new("priv", 128);
+    b.lds(8192);
+    b.lds_private("scr", 0, 1024, 2);
+    if p.overlap_shared {
+        b.lds_tile("shared", 1024, 1024); // inside wave 1's slice
+    }
+    let t = b.let_(Op::WorkitemId);
+    let wid = b.let_(Op::LshrI32(Opnd::Val(t), Opnd::I32(6)));
+    let lane = b.let_(Op::AndI32(Opnd::Val(t), Opnd::I32(63)));
+    let c1024 = b.c_i32(1024);
+    let c16 = b.c_i32(16);
+    let base = b.mul_i32(wid, c1024);
+    let l16 = b.mul_i32(lane, c16);
+    let a = b.add_i32(base, l16);
+    let z = b.c_i32(0);
+    let v = b.frag4(z, z, z, z);
+    b.tile_produce("scr", wid, Opnd::I32(0));
+    b.store_lds_b128(a, v);
+    b.tile_end();
+    if p.own_wait {
+        b.wait_lds(0);
+    }
+    // a barrier between produce and consume is NOT needed for own-wave data, but must be harmless
+    b.barrier();
+    let ra = if p.other_wave {
+        let o = b.let_(Op::XorI32(Opnd::Val(wid), Opnd::I32(1)));
+        let ob = b.mul_i32(o, c1024);
+        b.add_i32(ob, l16)
+    } else {
+        a
+    };
+    b.tile_consume("scr", wid, Opnd::I32(p.read_ver));
+    let _r = b.load_lds_b128(ra);
+    b.tile_end();
+    if p.untagged_poke {
+        let _q = b.load_lds_b128(l16); // untagged, lands in wave 0's slice
+    }
+    b.finish()
+}
+
+fn good_priv() -> Priv {
+    Priv { other_wave: false, own_wait: true, read_ver: 0, overlap_shared: false, untagged_poke: false }
+}
+
+#[test]
+fn a_private_per_wave_scratch_is_proven_without_cross_wave_publication() {
+    let r = verify_ir(&private_kernel(good_priv()));
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+    assert!(r.proven.get("tile-reads").copied().unwrap_or(0) > 0, "{}", r.render());
+    assert!(r.proven.get("tile-cover").copied().unwrap_or(0) >= 2, "{}", r.render());
+}
+
+#[test]
+fn reading_another_waves_private_slice_is_rejected() {
+    let r = verify_ir(&private_kernel(Priv { other_wave: true, ..good_priv() }));
+    assert!(has(&r, "GV-TILE-PRIVATE-ESCAPE"), "{}", r.render());
+}
+
+#[test]
+fn reading_a_private_slice_before_the_own_wait_is_rejected() {
+    let r = verify_ir(&private_kernel(Priv { own_wait: false, ..good_priv() }));
+    assert!(has(&r, "GV-TILE-STALE"), "{}", r.render());
+    assert!(r.errors().iter().any(|e| e.msg.contains("not completed by this wave")), "{}", r.render());
+}
+
+#[test]
+fn reading_the_wrong_private_version_is_stale() {
+    let r = verify_ir(&private_kernel(Priv { read_ver: 1, ..good_priv() }));
+    assert!(has(&r, "GV-TILE-STALE"), "{}", r.render());
+}
+
+#[test]
+fn a_private_region_overlapping_a_shared_tile_is_rejected() {
+    let r = verify_ir(&private_kernel(Priv { overlap_shared: true, ..good_priv() }));
+    assert!(has(&r, "GV-TILE-OVERLAP"), "{}", r.render());
+}
+
+#[test]
+fn an_unmarked_access_that_may_touch_a_private_region_is_rejected() {
+    let r = verify_ir(&private_kernel(Priv { untagged_poke: true, ..good_priv() }));
+    assert!(has(&r, "GV-TILE-PRIVATE-ESCAPE"), "{}", r.render());
+}

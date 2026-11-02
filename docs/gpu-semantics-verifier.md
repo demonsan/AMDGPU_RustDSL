@@ -106,6 +106,7 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 
 **出厂 kernel 的结果**：`_vs128`：80 条角色路径组合 × 10 个迭代场景，**16,640 个读事件**被检查，0 个 tile 错误；`_kvsplit`：320 × 10，**66,560** 个读事件，0 错误（另有 160 个未带标记的访问 `GV-TILE-UNTAGGED`，Warn）；`_vs5` 同 `_vs128`。变异测试：逐个删除 `_vs128` 的 30 个 barrier，**24 个**被协议检查或 `GV-BAR` 发现；未被发现的 6 个（barrier 序号 6、7、14、21、22、29，语句 3106/3214/6246/8940/9048/11600，集中在 `is_tail` 的两个迭代副本和 kernel 末尾）要么不保护任何已标记的 tile，要么该区域的标记不完整——应由 kernel 作者复核。
 
+**私有（每 wave）区域（v1.4）**：epilogue 转置之类的暂存区只被**同一个 wave** 先写后读（例如 `base + wave*4096`），不需要也不应要求其他 wave 的发布。`b.lds_private(name, base, size_per_wave, waves)` 声明 `waves` 个互不相交的切片；用 `tile_produce/tile_consume(name, wave_key, version)` 标记，其中 `wave_key` 必须是**地址所用的同一个值**（例如 `wid`，地址 = `wid*size + lane*16 + base`）。语义：(1) **自己的切片**：验证器把地址与 `wave_key` 都线性化（`+`、乘/左移常量，其余值作为原子），要求 `地址 − wave_key×size − base ∈ [0, size − 访问宽度]`；读到别的 wave 的切片（如 `wid ^ 1`）或地址不是 wave_key 的线性函数 → `GV-TILE-PRIVATE-ESCAPE`（Error）；(2) **未标记**的 LDS 访问若不能证明与任何私有区域不相交 → 同一错误码；(3) **生命周期按 wave 本身**：读者必须读到**本 wave 自己已完成**（`wait_lds(0)`/`wait_vm(0)`）的最新版本，且版本号相符，否则 `GV-TILE-STALE`（“not completed by this wave” 或版本不符）；不需要 barrier，也不与其他 wave 的事件配对；(4) 私有区域与任何共享 tile 重叠 → `GV-TILE-OVERLAP`；(5) 私有标记的 wave_key 不参与循环周期分析。
 **v1.3 的边界**：(i) 同一 tile 内按**字节**的部分重叠（两个 wave 写同一槽的不同子区间）不被区分——它们靠“同版本协作”语义被允许；(ii) 角色只有两个，且所有循环迭代数相同；(iii) 未带标记的 LDS 访问（`GV-TILE-UNTAGGED`）不被检查；(iv) 跨 workgroup 与跨 kernel 的别名、数据竞争不在范围内。
 
 ## 4. 寄存器类别合法性（MIR，RA 之后）
@@ -188,6 +189,7 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 | `GV-TILE-STALE` | Error | 读者看不到期望版本：未发布（缺 barrier/未等待完成）、版本不符（槽已被覆盖/下一版本未到）、协作生产者未全部发布 | `read of \`buf\`[1] expecting version 3 at phase 4 finds NO published version: version 3 is produced by role 0 … but is only published at phase 5` | 补 barrier / 等待，或修 slot/version 表达式 |
 | `GV-TILE-RACE` | Error | 其他 wave 在读窗口内写（或仍在落地）同一槽的别的版本；或不同 wave 并发写不同版本 | `read of \`buf\`[0] (version 1, phases 1..1) overlaps the write of version 2 by role 0 … no barrier separates them` | 双缓冲/加 barrier |
 | `GV-TILE-UNROLL-LIMIT` | Error | tile 标记依赖的运算不是循环计数器的仿射/周期函数，协议只模拟了有限轮，更多轮的启动**未被覆盖** | `the tile marker depends on Min, which is not an affine/periodic function … a launch with more iterations is NOT covered` | 用 `+ 常量`/`^ 常量` 更新的计数器表达 slot/version，或 `tile_trust_periodic(原因)` |
+| `GV-TILE-PRIVATE-ESCAPE` | Error | 访问私有（每 wave）区域的地址不能证明落在 wave_key 对应的自己的切片内；或未标记访问可能触及私有区域 | `LDS access is not provably inside the private slice of wave key … another wave's slice may be touched` | 用同一个 wave_key 计算地址并标记；让其他访问与私有区域分离 |
 | `GV-TILE-INDEX` | Error | slot/version 不是循环计数器与常量的编译期函数，或槽越界 | `the slot / version of the \`buf\` marker is not a compile-time function of the loop counters` | 用环形计数器表达 |
 | `GV-TILE-UNSUPPORTED` | Error | 循环内部的运行时 `if` 含 protocol 事件；路径数 > 64；模拟步数超预算 | `a runtime if INSIDE a loop contains barriers / tile markers / LDS accesses …` | 把 `if` 提到循环外或让两臂一致 |
 | `GV-TILE-PERIOD` | Info | 周期与模拟范围、路径组合数、已检查读事件数 | `tile markers are periodic with a period dividing 2 iteration(s); 10 iterations … cover any trip count` | — |
