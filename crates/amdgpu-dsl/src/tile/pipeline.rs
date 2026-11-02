@@ -87,12 +87,15 @@ pub struct Pipeline {
     /// loop-variable order: [it, state.., idx] (the manual kernels' order; DEFAULT, measured +2.3% per-CU on the _vs128 port vs [it, idx, state..]) or,
     /// when false, [it, idx, state..]; a register-allocation knob only
     pub ring_var_last: bool,
+    /// ring slot strides whose `slot * stride` offsets (cur, next, n2) are bound at the TOP of every iteration, like the manual `ring()` (otherwise the
+    /// first consumer binds them, possibly late in the window: `_t128` measured 4 `v_mul_lo_u32` at the window head). E.g. `vec![32768, 512]`.
+    pub prebind: Vec<i64>,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new() }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -184,6 +187,16 @@ impl Pipeline {
         b.end_if();
     }
 
+    fn prebind(&self, b: &mut FnBuilder, t: &TileIt) {
+        for s in &self.prebind {
+            t.cur.off_v(b, *s);
+            t.next.off_v(b, *s);
+            if let Some(n2) = &t.n2 {
+                n2.off_v(b, *s);
+            }
+        }
+    }
+
     /// One iteration; returns the next ring index.
     #[allow(clippy::too_many_arguments)]
     fn iter(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: VarId, idx: VarId, masked: bool, staged: bool, last_barrier: bool) -> ValueId {
@@ -202,6 +215,7 @@ impl Pipeline {
                     staged,
                     tile_rows: self.tile_rows,
                 };
+                self.prebind(b, &t);
                 if staged {
                     let key_n = b.let_i32(nn << self.lg());
                     body.stage(b, role, &key_n, &t.next);
@@ -234,6 +248,7 @@ impl Pipeline {
                     staged,
                     tile_rows: self.tile_rows,
                 };
+                self.prebind(b, &t);
                 let n2 = t.n2.clone().expect("n2");
                 if staged {
                     let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
