@@ -546,6 +546,7 @@ pub fn probe_roles_loop() -> Function {
     let iter_init = b.c_i32(0);
     let vars = b.begin_loop(&[(DType::I32, Opnd::Val(iter_init))]);
     let iter = vars[0];
+    b.assume_trusted(iter, Ext::c(0), Ext::c(3), "counter bounded by the loop exit test (next < 4)");
 
     let scaled = b.mul_i32(iter, c1000);
     let base = b.add_i32(scaled, tid);
