@@ -304,8 +304,16 @@ fn legal_mfma_register_assignment_is_accepted() {
 
 #[test]
 fn misaligned_mfma_destination_is_rejected() {
-    let r = mfma_case(vec![16, 24, 40]); // 16-dword accumulator at v40
+    let r = mfma_case(vec![16, 24, 41]); // 16-dword accumulator at an ODD register: the assembler rejects it
     assert!(has(&r, "GV-REG-ALIGN"), "{}", r.render());
+}
+
+#[test]
+fn isa_legal_but_width_unaligned_tuples_are_a_policy_note_not_an_error() {
+    // measured with the gfx950 assembler: V16 / V8 tuples are legal at any EVEN start register (v[2:17], v[6:21]); our allocator aligns to the width (policy)
+    let r = mfma_case(vec![18, 26, 42]);
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+    assert!(r.findings.iter().any(|f| f.code == "GV-REG-POLICY"), "{}", r.render());
 }
 
 #[test]
@@ -318,7 +326,7 @@ fn mfma_multiplicand_overlapping_the_destination_is_rejected() {
 fn descriptor_quad_and_pair_alignment_and_limits_are_checked() {
     let classes = vec![RClass::S4, RClass::S2];
     let m = mfunc(vec![(vec![MInst::new(MOp::SBufferRsrc).def(0).srcreg(1).imm(0)], Term::Endpgm)], classes.clone());
-    let r = verify_mir(&dummy(), &m, &alloc(vec![10, 8], &classes)); // S4 at s10: not a multiple of 4
+    let r = verify_mir(&dummy(), &m, &alloc(vec![10, 8], &classes)); // S4 at s10: not a multiple of 4 (assembler-measured: s_load_dwordx4 / descriptors at s2, s10 are rejected)
     assert!(has(&r, "GV-REG-ALIGN"), "{}", r.render());
     let r = verify_mir(&dummy(), &m, &alloc(vec![200, 8], &classes)); // beyond the SGPR file
     assert!(has(&r, "GV-REG-LIMIT"), "{}", r.render());
@@ -420,4 +428,82 @@ fn shipped_kernels_pass_the_enforced_mir_level_checks() {
         // and the default-mode compile (which enforces them) succeeds
         amdgpu_compiler::compile(&f).unwrap_or_else(|e| panic!("{name}: compile failed: {e}"));
     }
+}
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// assume soundness (kernel-occ's gv_attack_assume_loop): a loop-carried `assume` must be inductive, otherwise it is a proof hole
+
+fn assume_loop(trusted: bool, init: i32) -> Function {
+    let mut b = FnBuilder::new("assume_loop", 64);
+    b.lds(64);
+    let z = b.c_i32(init);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
+    let i = vars[0];
+    if trusted {
+        b.assume_trusted(i, Ext::c(0), Ext::c(0), "test: bounded by a guard the analyzer cannot see");
+    } else {
+        b.assume(i, Ext::c(0), Ext::c(0));
+    }
+    let c16 = b.c_i32(16);
+    let a = b.mul_i32(i, c16);
+    let zero = b.c_i32(0);
+    let v = b.frag4(zero, zero, zero, zero);
+    b.store_lds_b128(a, v);
+    let nx = b.add_i32(i, Opnd::I32(1)); // the loop DOES leave the assumed range [0, 0]
+    b.set_var(i, nx);
+    let stop = b.cmp_lt_i32(zero, zero);
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+    b.finish()
+}
+
+#[test]
+fn a_non_inductive_loop_assume_is_an_error_not_a_certification() {
+    let r = verify_ir(&assume_loop(false, 0));
+    assert!(has(&r, "GV-ASSUME-VIOLATED"), "{}", r.render());
+    assert!(r.errors().iter().any(|e| e.msg.contains("not inductive")), "{}", r.render());
+}
+
+#[test]
+fn an_assume_whose_initial_value_is_outside_the_range_is_an_error() {
+    let r = verify_ir(&assume_loop(false, 5));
+    assert!(has(&r, "GV-ASSUME-VIOLATED"), "{}", r.render());
+}
+
+#[test]
+fn assume_trusted_is_explicit_and_listed_not_an_error() {
+    let r = verify_ir(&assume_loop(true, 0));
+    assert!(!has(&r, "GV-ASSUME-VIOLATED"), "{}", r.render());
+    assert!(r.findings.iter().any(|f| f.code == "GV-ASSUME" && f.msg.contains("TRUSTED")), "{}", r.render());
+}
+
+#[test]
+fn an_inductive_assume_is_proven() {
+    // i in [0, 1], toggled by xor 1: the step stays inside
+    let mut b = FnBuilder::new("assume_ok", 64);
+    b.lds(64);
+    let z = b.c_i32(0);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(z))]);
+    let i = vars[0];
+    b.assume(i, Ext::c(0), Ext::c(1));
+    let nx = b.let_(Op::XorI32(Opnd::Var(i), Opnd::I32(1)));
+    b.set_var(i, nx);
+    let stop = b.cmp_lt_i32(z, z);
+    b.break_if(Opnd::Val(stop));
+    b.end_loop();
+    let r = verify_ir(&b.finish());
+    assert!(r.errors().is_empty(), "{}", errors(&r));
+}
+
+#[test]
+fn a_kernarg_scalar_restricted_to_a_set_uses_its_min_and_max() {
+    // splits in {2, 4, 8}: an access n*4 bytes into a tensor of 8 bytes is in bounds only because splits >= 2
+    let mut b = FnBuilder::new("oneof", 64);
+    b.arg("p", DType::Ptr, 0, 8);
+    b.arg("s", DType::I32, 8, 4);
+    b.ka_one_of(8, &[2, 4, 8]);
+    b.arg_tensor("p", Ext::ka(8) * Ext::c(4));
+    let p = b.let_(Op::KernargPtr { offset: 0 });
+    let _v = b.load_f32(p, 4);
+    let r = verify_ir(&b.finish());
+    assert!(r.errors().is_empty(), "{}", errors(&r));
 }

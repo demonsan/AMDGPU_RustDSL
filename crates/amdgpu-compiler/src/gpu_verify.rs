@@ -239,6 +239,16 @@ impl Ctx {
                 c.konst.insert(s, *lo);
             }
         }
+        for (off, vals) in &f.contract.ka_sets {
+            if let (Some(lo), Some(hi)) = (vals.iter().min(), vals.iter().max()) {
+                let s = Sym::Ka(*off);
+                let e = c.lb.entry(s.clone()).or_insert(0);
+                *e = (*e).max(*lo);
+                if lo == hi {
+                    c.konst.insert(s, *lo);
+                }
+            }
+        }
         for (n, lo, hi) in &f.contract.sym_ranges {
             let s = Sym::Named(n.clone());
             c.lb.insert(s.clone(), *lo);
@@ -1438,11 +1448,12 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             if p < 1 {
                 rep.add("GV-REG-RESERVED", Severity::Error, format!("vreg {r} ({c:?}) allocated to v{p}: v0 holds the workitem id"));
             }
-            // ISA: 64-bit tuples start at even registers, 128-bit and wider tuples (MFMA operands / accumulators) at multiples of 4 (assembler-observed on gfx950:
-            // v[4:19] and v[52:67] are accepted). The allocator additionally aligns to the tuple width: reported as a policy deviation, not an error.
-            let need = if n >= 4 { 4 } else { 2 };
+            // ISA (measured with the gfx950 assembler, 2025-11: every multi-dword VGPR tuple - MFMA A/B/C/D of any width, global/ds/buffer data, packed ops -
+            // is accepted at EVEN start registers and rejected at odd ones: v[2:17], v[6:21], v[14:29] are legal V16 tuples). The allocator additionally aligns to the
+            // tuple width: reported as a policy deviation (Info), not an error.
+            let need = 2;
             if n >= 2 && p % need != 0 {
-                rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at v{p}: a {n}-dword VGPR tuple must start at a multiple of {need} (ISA)"));
+                rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at v{p}: a {n}-dword VGPR tuple must start at an even register (ISA, assembler-measured)"));
             } else if n >= 2 && p % n != 0 {
                 rep.add("GV-REG-POLICY", Severity::Info, format!("vreg {r} ({c:?}) at v{p}: ISA-legal, but not aligned to the tuple width {n} (the allocator normally aligns to the width)"));
             }
@@ -1453,9 +1464,10 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             if p < 8 {
                 rep.add("GV-REG-RESERVED", Severity::Error, format!("vreg {r} ({c:?}) allocated to s{p}: s0..s7 hold the kernarg pointer / workgroup ids"));
             }
+            // measured: pairs at even registers; quads (buffer descriptors, s_load_dwordx4) and octets (s_load_dwordx8) at multiples of 4
             let need = if n >= 4 { 4 } else { 2 };
             if n >= 2 && p % need != 0 {
-                rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at s{p}: an SGPR {} must start at a multiple of {need} (64-bit pairs even, 128-bit descriptors multiple of 4)", if n == 4 { "descriptor quad" } else { "tuple" }));
+                rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at s{p}: an SGPR {} must start at a multiple of {need} (64-bit pairs even, 128-bit descriptors / wider multiple of 4; assembler-measured)", if n == 4 { "descriptor quad" } else { "tuple" }));
             }
             if p + n > SGPR_LIMIT {
                 rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at s{p}..s{}: exceeds the {SGPR_LIMIT}-SGPR limit", p + n - 1));

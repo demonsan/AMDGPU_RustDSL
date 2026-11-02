@@ -161,7 +161,7 @@ fn main() -> ExitCode {
             let strict = args.iter().any(|a| a == "--strict");
             let names: Vec<String> = match args.get(1).map(|s| s.as_str()) {
                 Some("--all") => amdgpu_compiler::kernel_names().iter().map(|s| s.to_string()).collect(),
-                Some("--shipped") => ["fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_t128", "fmha_fwd_hd128_mxfp8_kvsplit", "fmha_fwd_hd128_mxfp8_kvsplit_combine8h", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_vs5", "fmha_fwd_hd128_mxfp8_vs9", "fmha_fwd_hd128_mxfp8_vs", "fmha_fwd_hd128_mxfp8_auto"].iter().map(|s| s.to_string()).collect(),
+                Some("--shipped") => ["fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_t128", "fmha_fwd_hd128_mxfp8_kvsplit", "fmha_fwd_hd128_mxfp8_kvsplit_combine8h", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_vs5", "fmha_fwd_hd128_mxfp8_vs9", "fmha_fwd_hd128_mxfp8_vs"].iter().map(|s| s.to_string()).collect(),
                 Some(n) => vec![n.to_string()],
                 None => {
                     usage();

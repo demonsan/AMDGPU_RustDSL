@@ -514,6 +514,8 @@ pub struct Contract {
     /// (kernarg offset, expr): the 32-bit kernarg scalar at that offset EQUALS `expr` (host contract), e.g. a row stride `ka(0x70) == grid_y * ka(0x90)`; substituted by
     /// the analyzer like the grid definitions.
     pub ka_defs: Vec<(u32, Ext)>,
+    /// (kernarg offset, allowed values): the scalar takes one of these values (host contract; the analyzer uses their min/max as the range).
+    pub ka_sets: Vec<(u32, Vec<i64>)>,
     /// LDS tiles / rings (v1.1 lifetime model) and the explicitly aliased pairs (allowed to overlap).
     pub tiles: Vec<TileDecl>,
     pub tile_aliases: Vec<(String, String)>,
@@ -846,6 +848,10 @@ impl FnBuilder {
     /// Host contract: launch grid axis (0 = x, 1 = y, 2 = z) equals `expr`, e.g. `b.grid_is(2, Ext::sym("B") * Ext::ka(0x280))` for B batches x splits.
     pub fn grid_is(&mut self, axis: u8, expr: Ext) {
         self.f.contract.grid_defs.push((axis, expr));
+    }
+    /// Host contract: the u32 kernarg scalar at `offset` is one of `values` (e.g. the number of KV splits in {2, 4, 8}); the min/max become its range.
+    pub fn ka_one_of(&mut self, offset: u32, values: &[i64]) {
+        self.f.contract.ka_sets.push((offset, values.to_vec()));
     }
     /// Host contract: the u32 kernarg scalar at `offset` equals `expr` (e.g. strides derived from the shape: `b.ka_is(0x70, Ext::grid_y() * Ext::ka(0x90))`).
     pub fn ka_is(&mut self, offset: u32, expr: Ext) {
