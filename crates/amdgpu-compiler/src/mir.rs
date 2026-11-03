@@ -187,6 +187,10 @@ pub enum MOp {
     LdsReadB32,
     LdsWriteB128,
     LdsReadB128,
+    /// `ds_read_b64`: dst V2 <- [addr + imm]
+    LdsReadB64,
+    /// `ds_write_b64`: srcs [addr, value V2], imm offset
+    LdsWriteB64,
     LdsReadB64TrB8,
     SBarrier,
     /// `s_setprio` imm.

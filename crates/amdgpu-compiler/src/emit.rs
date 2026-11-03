@@ -762,6 +762,8 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[0]),
             lds_off(inst.imm)
         )],
+        MOp::LdsReadB64 => vec![format!("ds_read_b64 {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsWriteB64 => vec![format!("ds_write_b64 {}, {}{}", src1(a, inst.srcs[0]), tuple(a, reg_of(&inst.srcs[1]), 2), lds_off(inst.imm))],
         MOp::LdsReadB64TrB8 => vec![format!(
             "ds_read_b64_tr_b8 {}, {}{}",
             tuple(a, inst.dst.expect("dst"), 2),

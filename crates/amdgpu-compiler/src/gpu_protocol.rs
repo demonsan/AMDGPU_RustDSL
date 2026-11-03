@@ -197,9 +197,9 @@ fn is_lds_access(st: &Stmt) -> Option<(bool, bool)> {
     // (dma, is_write)
     match st {
         Stmt::LoadGlobalLds { .. } | Stmt::BufferLoadLds { .. } => Some((true, true)),
-        Stmt::StoreLdsB32 { .. } | Stmt::StoreLdsB128 { .. } => Some((false, true)),
+        Stmt::StoreLdsB32 { .. } | Stmt::StoreLdsB128 { .. } | Stmt::StoreLdsB64 { .. } => Some((false, true)),
         Stmt::Let { op, .. } => match op {
-            Op::LoadLdsB32 { .. } | Op::LoadLdsB128 { .. } | Op::LoadLdsTrB8 { .. } | Op::LoadLdsTr4B8 { .. } | Op::LoadLdsB128x2 { .. } => Some((false, false)),
+            Op::LoadLdsB32 { .. } | Op::LoadLdsB128 { .. } | Op::LoadLdsB64 { .. } | Op::LoadLdsTrB8 { .. } | Op::LoadLdsTr4B8 { .. } | Op::LoadLdsB128x2 { .. } => Some((false, false)),
             _ => None,
         },
         _ => None,

@@ -1173,6 +1173,7 @@ impl<'a> An<'a> {
             }
             Op::LoadLdsB32 { addr } => self.check_lds_at("ds_read_b32", addr, 4),
             Op::LoadLdsB128 { addr } => self.check_lds_at("ds_read_b128", addr, 16),
+            Op::LoadLdsB64 { addr } => self.check_lds_at("ds_read_b64", addr, 8),
             Op::LoadLdsTrB8 { addr } => self.check_lds_at("ds_read_b64_tr_b8", addr, 8),
             Op::LoadLdsTr4B8 { addrs } => {
                 for ad in addrs.iter() {
@@ -1340,6 +1341,7 @@ impl<'a> An<'a> {
                 }
                 Stmt::StoreLdsB32 { addr, .. } => self.check_lds_at("ds_write_b32", addr, 4),
                 Stmt::StoreLdsB128 { addr, .. } => self.check_lds_at("ds_write_b128", addr, 16),
+            Stmt::StoreLdsB64 { addr, .. } => self.check_lds_at("ds_write_b64", addr, 8),
                 Stmt::BeginLoop { vars, init } => {
                     self.tag = None;
                     let close = self.matching_end(i);

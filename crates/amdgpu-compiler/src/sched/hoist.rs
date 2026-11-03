@@ -12,7 +12,7 @@ use super::{liveness, verify, Options};
 use crate::mir::*;
 
 fn is_lds_read(op: MOp) -> bool {
-    matches!(op, MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64TrB8)
+    matches!(op, MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64 | MOp::LdsReadB64TrB8)
 }
 
 pub fn run(m: &mut MFunction, o: &Options) -> usize {
