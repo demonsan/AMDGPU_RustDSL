@@ -214,7 +214,7 @@ pub fn generate(f: &Function) -> Result<Generated, String> {
     for (o, vs) in &c.ka_sets { json_ka_set.push(format!("{{\"offset\":{},\"values\":[{}]}}", o, vs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))); }
     let mut json_syms = Vec::new();
     for s in &syms { let lo = c.sym_ranges.iter().find(|(n, _, _)| c_ident(n) == *s).map(|x| x.1).unwrap_or(1); json_syms.push(format!("{{\"name\":\"{}\",\"lo\":{}}}", s, lo)); }
-    let json = format!("{{\n  \"kernel\": \"{}\",\n  \"kernarg_size\": {},\n  \"workgroup_size\": {},\n  \"lds_bytes\": {},\n  \"compile_profile\": \"{}\",\n  \"args\": [{}],\n  \"extents\": [{}],\n  \"ka_is\": [{}],\n  \"ka_range\": [{}],\n  \"ka_one_of\": [{}],\n  \"grid_is\": [{}],\n  \"symbols\": [{}]\n}}\n",
+    let json = format!("{{\n  \"schema_version\": 1,\n  \"generated_by\": \"amdc gen-host\",\n  \"kernel\": \"{}\",\n  \"kernarg_size\": {},\n  \"workgroup_size\": {},\n  \"lds_bytes\": {},\n  \"compile_profile\": \"{}\",\n  \"args\": [{}],\n  \"extents\": [{}],\n  \"ka_is\": [{}],\n  \"ka_range\": [{}],\n  \"ka_one_of\": [{}],\n  \"grid_is\": [{}],\n  \"symbols\": [{}]\n}}\n",
         json_escape(&f.name), f.kernarg_size, f.workgroup_size, f.lds_bytes, profile,
         json_args.join(","), json_ext.join(","), json_ka_is.join(","), json_ka_range.join(","), json_ka_set.join(","), json_grid.join(","), json_syms.join(","));
     let stem = c_ident(&f.name);
