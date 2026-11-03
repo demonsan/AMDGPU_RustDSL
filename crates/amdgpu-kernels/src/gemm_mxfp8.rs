@@ -422,7 +422,8 @@ impl PipeBody for Body {
             let next = if i + 1 < nm { let v = if let Some(z) = zf { z } else { ar.read(b, i + 1) }; Some(mark(b, v)) } else { None };
             if let Some((k, s, done, mut cache)) = deferred.take() {
                 let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
-                let per = (total + nm - 1) / nm;
+                let rows = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("dmarows").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(nm).clamp(1, nm);
+                let per = (total + rows - 1) / rows;
                 self.stage_now(b, &k, &s, done..done + per, &mut cache);
                 if done + per < total {
                     deferred = Some((k, s, done + per, cache));
