@@ -299,6 +299,9 @@ int main(int argc, char** argv) {
         std::memcpy(&a, args, sizeof(a));
         a.ptr_o = outp;
         *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(&a) + 0x080) = (uint32_t)((size_t)stride_rows * H * D);
+        for (size_t i = 0; i < sizeof(a); ++i)
+            if (reinterpret_cast<unsigned char*>(&a)[i] != args[i])
+                std::fprintf(stderr, "ABIDIFF t128 off=0x%zx gen=%02x hand=%02x\n", i, reinterpret_cast<unsigned char*>(&a)[i], args[i]);
         GenT::BufferSizes sz{};
         sz.ptr_q = nq; sz.ptr_k = nk; sz.ptr_v = nk; sz.ptr_o = no * 2;
         sz.ptr_q_descale = qs.size(); sz.ptr_k_descale = ks.size(); sz.ptr_v_descale = 4096;
