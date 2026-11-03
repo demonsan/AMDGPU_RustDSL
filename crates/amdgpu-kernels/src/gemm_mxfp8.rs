@@ -144,6 +144,8 @@ struct Body {
     sc_wave: ValueId,
     rsrc_a: ValueId,
     rsrc_b: ValueId,
+    rsrc_sfa: ValueId,
+    rsrc_sfb: ValueId,
     ptr_sfa: ValueId,
     ptr_sfb: ValueId,
     m_v: ValueId,
@@ -175,10 +177,11 @@ impl Body {
         let scr = self.sc_s.at(slot);
         let so = scr.off_v(b);
         let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
+        let sab = b.bind_i32(ev(scb) + ev(self.sa_dw[0]));
         let (wa, wb) = scr.read(b, |b| {
             let wa: Vec<ValueId> = (0..nm).map(|i| {
                 // rows 16 i apart: the same lane dword + 16 i (an immediate)
-                let a = b.bind_i32(ev(scb) + ev(self.sa_dw[0]) + 16 * i as i32);
+                let a = b.bind_i32(ev(sab) + 16 * i as i32);
                 b.load_lds_b32(a)
             }).collect();
             let a = b.bind_i32(ev(scb) + 256);
@@ -327,18 +330,15 @@ impl Body {
         let r = self.sc_s.at(slot);
         let o = r.off_v(b);
         let sbase = b.bind_i32(o + self.sc_s.base as i32 + ev(self.sc_wave));
-        let pa = {
-            let o = b.bind_i32(ev(kbi) * ev(self.m_v) + ev(self.sa_src));
-            b.ptr_add(self.ptr_sfa, o)
-        };
-        let pb = {
-            let o = b.bind_i32((ev(self.sb_src) + ev(kbi)) & -4);
-            b.ptr_add(self.ptr_sfb, o)
-        };
-        let sb_m0 = b.bind_i32(ev(sbase) + 256);
+        // MUBUF: A scales voffset = the lane's 4 bytes of the CTA rows, soffset = kb M; B scale: every lane the same dword, soffset = its offset
+        let soa = { let v = b.bind_i32(ev(kbi) * ev(self.m_v)); b.read_first_lane(v) };
+        let sob = { let v = b.bind_i32((ev(self.sb_src) + ev(kbi)) & -4); b.read_first_lane(v) };
+        let m0a = b.read_first_lane(sbase);
+        let m0b = { let v = b.bind_i32(ev(sbase) + 256); b.read_first_lane(v) };
+        let z = b.c_i32(0);
         r.write(b, |b| {
-            b.load_global_lds(pa, sbase, 0, 1);
-            b.load_global_lds(pb, sb_m0, 0, 1);
+            b.buffer_load_lds_b32(self.rsrc_sfa, self.sa_src, soa, m0a, 0);
+            b.buffer_load_lds_b32(self.rsrc_sfb, z, sob, m0b, 0);
         });
     }
 }
@@ -428,10 +428,11 @@ impl PipeBody for Body {
         let scr = self.sc_s.at(&t.cur);
         let so = scr.off_v(b);
         let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
+        let sab = b.bind_i32(ev(scb) + ev(self.sa_dw[0]));
         let (wa, wb) = scr.read(b, |b| {
             let wa: Vec<ValueId> = (0..nm).map(|i| {
                 // rows 16 i apart: the same lane dword + 16 i (an immediate)
-                let a = b.bind_i32(ev(scb) + ev(self.sa_dw[0]) + 16 * i as i32);
+                let a = b.bind_i32(ev(sab) + 16 * i as i32);
                 b.load_lds_b32(a)
             }).collect();
             let a = b.bind_i32(ev(scb) + 256);
@@ -571,6 +572,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
     // buffer descriptors over A (M K bytes) and the preshuffled B (N K bytes)
     let rsrc_a = { let n = b.bind_i32(ev(m_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_a, n) };
     let rsrc_b = { let n = b.bind_i32(ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) };
+    let rsrc_sfa = { let n = b.bind_i32(ev(m_v) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) };
+    let rsrc_sfb = { let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) };
     let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
     let b_org = b.bind_i32((ev(bx) << lg_n) * ev(k_v));
 
@@ -595,7 +598,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     }
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
-        cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
+        cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
         a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false, npre_done: 0,
     };
     pipe.run(b, Role::All, &mut body);
