@@ -120,8 +120,9 @@ struct Body {
 impl PipeBody for Body {
     fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
         // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0
-        let ka = b.bind_i32(key0.clone() + ev(self.a_org));
-        let kb = b.bind_i32((key0.clone() << 4) + ev(self.b_org));
+        // the tile origins are wave uniform: SGPR soffsets
+        let ka = { let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v) };
+        let kb = { let v = b.bind_i32((key0.clone() << 4) + ev(self.b_org)); b.read_first_lane(v) };
         for (sh, dma, org, rsrc, wave) in [(&self.a_s, &self.a_dma, ka, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, kb, self.rsrc_b, self.b_wave)] {
             let r = sh.at(slot);
             let o = r.off_v(b);
