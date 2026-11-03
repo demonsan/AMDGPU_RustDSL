@@ -158,6 +158,8 @@ struct Body {
     acc: Vec<VarId>,
     /// deferred stage (key0, slot, units issued) and whether the pipeline loop has started
     deferred: Option<(I32, SlotIdx, usize, StageCache)>,
+    /// MMAs of the register tile already issued by `pre_sync`
+    npre_done: usize,
     in_loop: bool,
     /// register-staged tile (`RegStaged`): initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
     staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, ValueId)>,
@@ -226,6 +228,9 @@ impl Body {
         for (lo, hi) in [(0, half), (half, nn)] {
             for i in 0..nm {
                 for j in lo..hi {
+                    if lo == 0 && i * half + j < self.npre_done {
+                        continue; // issued before the barrier (pre_sync)
+                    }
                     // the stage of t+2: one DMA every `gap` MMAs
                     if nmma % gap == 0 {
                         if let Some((k, s, done, mut cache)) = deferred.take() {
@@ -384,6 +389,27 @@ impl PipeBody for Body {
             // 2-slot TwoPhaseOffset: the whole tile is computed between the stage of t+1 and its wait (the matrix phase stays empty)
             self.window(b, role, t);
         }
+    }
+    fn pre_sync(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
+        if !self.cfg.reg_staged {
+            return;
+        }
+        // the first MMAs of the register tile run while the wave waits for the DMA and the barrier (the vendor issues 4 there)
+        let npre = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(',').find_map(|t| t.strip_prefix("npre").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(4);
+        let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
+        let nn = bv.len();
+        let half = nn / 2;
+        let mut n = 0;
+        'o: for i in 0..av.len() {
+            for j in 0..half {
+                if n == npre {
+                    break 'o;
+                }
+                mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[i], sbv);
+                n += 1;
+            }
+        }
+        self.npre_done = n;
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         if self.cfg.reg_staged {
@@ -570,7 +596,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
         cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false, npre_done: 0,
     };
     pipe.run(b, Role::All, &mut body);
     for v in body.acc.iter().take(cfg.acc_agpr) {
