@@ -175,13 +175,14 @@ impl Body {
         let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
         let (wa, wb) = scr.read(b, |b| {
             let wa: Vec<ValueId> = (0..nm).map(|i| {
-                let a = b.bind_i32(ev(scb) + ev(self.sa_dw[i]));
+                // rows 16 i apart: the same lane dword + 16 i (an immediate)
+                let a = b.bind_i32(ev(scb) + ev(self.sa_dw[0]) + 16 * i as i32);
                 b.load_lds_b32(a)
             }).collect();
             let a = b.bind_i32(ev(scb) + 256);
             (wa, b.load_lds_b32(a))
         });
-        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[i])))).collect();
+        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0])))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kb) & 3) << 3));
         (sa, sb)
     }
@@ -389,7 +390,8 @@ impl PipeBody for Body {
         let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
         let (wa, wb) = scr.read(b, |b| {
             let wa: Vec<ValueId> = (0..nm).map(|i| {
-                let a = b.bind_i32(ev(scb) + ev(self.sa_dw[i]));
+                // rows 16 i apart: the same lane dword + 16 i (an immediate)
+                let a = b.bind_i32(ev(scb) + ev(self.sa_dw[0]) + 16 * i as i32);
                 b.load_lds_b32(a)
             }).collect();
             let a = b.bind_i32(ev(scb) + 256);
@@ -402,7 +404,7 @@ impl PipeBody for Body {
         let mut af = { let v = if let Some(z) = zf { z } else { ar.read(b, 0) }; mark(b, v) };
         let bpre = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("bpre").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1).min(nn);
         let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zfb { z } else { br.read(b, j) }; mark(b, v) }).collect();
-        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[i])))).collect();
+        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0])))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
         let prio = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noprio"));
         if prio {
