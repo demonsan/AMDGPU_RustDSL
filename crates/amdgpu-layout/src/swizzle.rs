@@ -64,13 +64,12 @@ impl Swizzle {
     }
     /// The XOR term of a symbolic offset (bit extractions + parity XORs + shifts, like the manual `swz_s`).
     pub fn term_ix(&self, x: &Ix, d: &Dyns) -> Ix {
-        let _ = d;
         let mut acc = Ix::C(0);
         for (i, row) in self.rows.iter().enumerate() {
             let mut par = Ix::C(0);
             for j in 0..self.src_n {
                 if row & (1 << j) != 0 {
-                    par = par.xor(&x.shr(self.src_lo + j).and_c(1));
+                    par = par.xor(&x.div_c(1i64 << (self.src_lo + j), d).mod_c(2, d));
                 }
             }
             // the destination bits are disjoint: OR == ADD

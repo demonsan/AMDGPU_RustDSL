@@ -12,9 +12,11 @@
 #![forbid(unsafe_code)]
 
 pub mod copy;
+pub mod dma;
 pub mod mma;
 
 pub use copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_b, LdsPart, LdsSlotPart, TiledCopy};
+pub use dma::{partition_dma, DmaPart};
 pub use mma::{gemm, make_tiled_mma, TiledMma};
 
 use amdgpu_dsl::I32;
