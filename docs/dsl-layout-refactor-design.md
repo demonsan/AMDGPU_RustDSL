@@ -429,7 +429,7 @@ fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, p: &Fragment /* P 的 B 布局�
 | kernel | md5(? 8 ?) |
 |---|---|
 | `fmha_fwd_hd128_mxfp8_v3_vs128` | `68d2832b` |
-| `fmha_fwd_hd128_mxfp8_v3_t128` | `985d7a02` |
+| `fmha_fwd_hd128_mxfp8_v3_t128` | `f5a43b09`（SADDR DMA；之前 `985d7a02`） |
 | `fmha_fwd_hd128_mxfp8_v3_kvsplit` | `e4fc18b1` |
 | `fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h` | `24a95a51` |
 
@@ -439,3 +439,16 @@ fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, p: &Fragment /* P 的 B 布局�
 ? dsl(`SHIP_REF=fmha_fwd_hd128_mxfp8_dsl`,?? PERF):679.0 vs 687.2?446.4 vs 445.1?????? 449.0 vs 447.3?1408.0 vs 1413.8?1970.9 vs 1967.8?_t128 ????? 1002.4 vs 997.9 ? PASS?
 
 ????????????? `amdgpu_dsl::tile`:LdsPlan/???Pipeline/Roles?softmax/combine?`_t128` ? K-scale VGPR ??? ones/Q ????(??????????)?
+
+### SADDR LDS-DMA A/B（`FMHA_OPT=saddrlds FMHA_OPT_SCOPE=v3s`，别名 `fmha_fwd_hd128_mxfp8_v3s_*`，同轮对照 v3，GPU 6，两轮）
+
+| 行 | 第 1 轮 v3s / v3 | 第 2 轮 v3s / v3 |
+|---|---|---|
+| B1H8S2048 KV-split | 686.9 / 680.9 | 688.4 / 690.3 |
+| 每 CU `_vs128` | 441.2 / 447.2（−1.4%） | 442.0 / 446.3（−1.0%） |
+| `_vs128` 布局中位数 | 446.5 / 447.3（−0.2%） | 447.4 / 448.3（−0.2%） |
+| B4H8S2048 | 1400.8 / 1419.7 | 1401.9 / 1405.0 |
+| B1H8S8192 | 1964.4 / 1975.7 | 1947.0 / 1963.0 |
+| `_t128` 布局中位数 | 1033.1 / 1012.2（+2.1%） | 1019.7 / 1001.5（+1.8%） |
+
+结论：只在 `_t128` 采用（v3 `_t128` 默认 SADDR，md5 `f5a43b09`）；`_vs128` / `_kvsplit` 保持 opt-in。采用后全套门禁（对 legacy）PASS：`_t128` 布局中位数 1035.7 vs legacy 1040.7（之前 1015.4 vs 1033.1）。legacy / dsl md5 不变。
