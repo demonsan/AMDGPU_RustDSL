@@ -64,7 +64,7 @@ inline bool validate(const Args& a, const BufferSizes& sizes, dim3 grid, const S
     if (ka(0x20u) < 1LL || ka(0x20u) > 9223372036854775807LL) { return fail(err, "GV-HOST-KA-RANGE", "ka(0x20) outside contract"); }
     return true;
 }
-inline hipError_t launch(hipFunction_t fn, const Args& a, dim3 grid, dim3 block, size_t lds = LDS_BYTES, hipStream_t stream = nullptr) {
+inline hipError_t launch(hipFunction_t fn, const Args& a, dim3 grid, dim3 block, size_t lds = 0, hipStream_t stream = nullptr) {
     size_t sz = sizeof(Args);
     void* buf = const_cast<void*>(static_cast<const void*>(&a));
     void* extra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, buf, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};

@@ -201,7 +201,7 @@ inline bool validate(const Args& a, const BufferSizes& sizes, dim3 grid, const S
     if (grid.x != ((ka(0x60u)+255LL)/256LL)) { return fail(err, "GV-HOST-GRID", "grid axis 0 relation failed"); }
     return true;
 }
-inline hipError_t launch(hipFunction_t fn, const Args& a, dim3 grid, dim3 block, size_t lds = LDS_BYTES, hipStream_t stream = nullptr) {
+inline hipError_t launch(hipFunction_t fn, const Args& a, dim3 grid, dim3 block, size_t lds = 0, hipStream_t stream = nullptr) {
     size_t sz = sizeof(Args);
     void* buf = const_cast<void*>(static_cast<const void*>(&a));
     void* extra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, buf, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};

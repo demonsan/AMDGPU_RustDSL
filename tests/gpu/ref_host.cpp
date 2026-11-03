@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(dvs, &vdescale, 4, hipMemcpyHostToDevice));
     CK(hipMemset(dout, 0, no * 2));
 
-    unsigned char args[720];   // 656-byte base ABI + KV-split fields at 0x270/0x278/0x280
+    alignas(8) unsigned char args[720];   // 656-byte base ABI + KV-split fields at 0x270/0x278/0x280
     std::memset(args, 0, sizeof(args));
     put64(args, 0x000, dout); put64(args, 0x010, dq); put64(args, 0x020, dk); put64(args, 0x030, dv);
     float passed_scale = softmax_scale * (std::getenv("REF_SCALE_MUL") ? (float)std::atof(std::getenv("REF_SCALE_MUL")) : 1.0f);
@@ -317,12 +317,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "GENLAUNCH k=%s gx=%d gy=%d gz=%d block=%u rows=%d\n", kname ? kname : "(null)", gx, gy, gz, block, rows);
         if (gen_name(kname, "v3_vs128")) {
             auto a = mk_vs(outp, rows);
-            CK(GenVs::launch(f, a, dim3(gx, gy, gz), dim3(block, 1, 1)));
+            std::memcpy(args, &a, sizeof(a));
+            CK(GenVs::launch(f, *reinterpret_cast<const GenVs::Args*>(args), dim3(gx, gy, gz), dim3(block, 1, 1)));
             return true;
         }
         if (gen_name(kname, "v3_t128")) {
             auto a = mk_t(outp, rows);
-            CK(GenT::launch(f, a, dim3(gx, gy, gz), dim3(block, 1, 1)));
+            std::memcpy(args, &a, sizeof(a));
+            CK(GenT::launch(f, *reinterpret_cast<const GenT::Args*>(args), dim3(gx, gy, gz), dim3(block, 1, 1)));
             return true;
         }
         return false;
@@ -469,7 +471,8 @@ int main(int argc, char** argv) {
                 asz = 720; set_split_args(ohat, lse); set_launch(dout2, s_rows_pb);
                 if (gen_abi && gen_name(kname_split, "v3_kvsplit")) {
                     auto a = mk_split();
-                    CK(GenSplit::launch(fn2, a, dim3(gox, gy, goz), dim3(ours_block, 1, 1)));
+                    std::memcpy(args, &a, sizeof(a));
+                    CK(GenSplit::launch(fn2, *reinterpret_cast<const GenSplit::Args*>(args), dim3(gox, gy, goz), dim3(ours_block, 1, 1)));
                 } else {
                     CK(hipModuleLaunchKernel(fn2, gox, gy, goz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
                 }
@@ -478,7 +481,8 @@ int main(int argc, char** argv) {
                 if (fused) return;
                 if (gen_abi && gen_name(kname_comb, "v3_kvsplit_combine8h")) {
                     auto a = mk_comb();
-                    CK(GenComb::launch(fnc, a, dim3((unsigned)cgrid, 1, 1), dim3(cthreads, 1, 1)));
+                    std::memcpy(cargs, &a, sizeof(a));
+                    CK(GenComb::launch(fnc, *reinterpret_cast<const GenComb::Args*>(cargs), dim3((unsigned)cgrid, 1, 1), dim3(cthreads, 1, 1)));
                 } else {
                     CK(hipModuleLaunchKernel(fnc, (unsigned)cgrid, 1, 1, cthreads, 1, 1, 0, nullptr, nullptr, cextra));
                 }
