@@ -273,6 +273,14 @@ struct GemmV1 {
     acc: Vec<VarId>,
     a_wave: ValueId,
     b_wave: ValueId,
+    // scale staging: per slot and wave 512 bytes = [256 A-scale bytes of the CTA rows | the dword holding the B-scale byte, every lane]
+    sc_s: crate::tile::Shared,
+    sc_wave: ValueId,
+    sa_src: ValueId,
+    sb_src: ValueId,
+    kb_v: ValueId,
+    sa_rd: Vec<ValueId>,
+    sb_shift: ValueId,
 }
 
 fn load_scale(b: &mut FnBuilder, ptr: ValueId, byte: I32) -> ValueId {
@@ -301,6 +309,23 @@ impl crate::tile::PipeBody for GemmV1 {
                 }
             });
         }
+        // scales of tile kb = key0 / 128: A rows m_cta.. (256 contiguous bytes of the [K/128][M] tensor), the B-scale dword (same address on every lane)
+        let kb = b.bind_i32(key0.clone().lshr(7));
+        let r = self.sc_s.at(slot);
+        let sbase = b.bind_i32(r.off_v(b) + self.sc_s.base as i32 + crate::tile::ev(self.sc_wave));
+        let pa = {
+            let o = b.bind_i32(crate::tile::ev(kb) * crate::tile::ev(self.m_v) + crate::tile::ev(self.sa_src));
+            b.ptr_add(self.ptr_sfa, o)
+        };
+        let pb = {
+            let o = b.bind_i32((crate::tile::ev(self.sb_src) + crate::tile::ev(kb)) & -4);
+            b.ptr_add(self.ptr_sfb, o)
+        };
+        let sb_m0 = b.bind_i32(crate::tile::ev(sbase) + 256);
+        r.write(b, |b| {
+            b.load_global_lds(pa, sbase, 0, 1);
+            b.load_global_lds(pb, sb_m0, 0, 1);
+        });
     }
     fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: crate::tile::Role, _t0: &crate::tile::TileIt) {}
     fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
@@ -311,8 +336,21 @@ impl crate::tile::PipeBody for GemmV1 {
     }
     fn window(&mut self, b: &mut FnBuilder, _role: crate::tile::Role, t: &crate::tile::TileIt) {
         let kbx = crate::tile::ox(t.it);
-        let sa: Vec<ValueId> = (0..4).map(|i| load_scale(b, self.ptr_sfa, kbx.clone() * crate::tile::ev(self.m_v) + crate::tile::ev(self.sa_byte[i]))).collect();
-        let sb = load_scale(b, self.ptr_sfb, crate::tile::ev(self.sb_byte) + kbx.clone());
+        let scr = self.sc_s.at(&t.cur);
+        let scb = b.bind_i32(scr.off_v(b) + self.sc_s.base as i32 + crate::tile::ev(self.sc_wave));
+        let (sa, sb) = scr.read(b, |b| {
+            let sa: Vec<ValueId> = (0..4).map(|i| {
+                // the dword holding row byte r = 128 wm + 32 i + lane % 32, shifted to byte 0
+                let a = b.bind_i32(crate::tile::ev(scb) + (crate::tile::ev(self.sa_rd[i]) & -4));
+                let w = b.load_lds_b32(a);
+                b.bind_i32(crate::tile::ev(w).lshr((crate::tile::ev(self.sa_rd[i]) & 3) << 3))
+            }).collect();
+            let a = b.bind_i32(crate::tile::ev(scb) + 256);
+            let w = b.load_lds_b32(a);
+            let sb = b.bind_i32(crate::tile::ev(w).lshr((((crate::tile::ev(self.sb_src) + kbx.clone()) & 3) << 3) + crate::tile::ev(self.sb_shift)));
+            (sa, sb)
+        });
+        let _ = (&self.sa_byte, self.sb_byte, self.kb_v);
         let ar = self.a_s.at(&t.cur);
         let br = self.b_s.at(&t.cur);
         let (aoff, boff) = (ar.off_v(b) + self.a_s.base as i32, br.off_v(b) + self.b_s.base as i32);
@@ -439,7 +477,15 @@ pub fn gemm_mxfp8_bs_v1() -> Function {
     let mut lds = LdsPlan::new();
     let a_s = lds.ring("A", CTA_M * 128, 3, crate::tile::Layout::Linear);
     let b_s = lds.ring("B", CTA_N * 128, 3, crate::tile::Layout::Linear);
+    let sc_s = lds.ring("SC", 4 * 512, 3, crate::tile::Layout::Linear);
     lds.commit(b);
+    let sc_wave = b.bind_i32(lane.wave() << 9);
+    // A-scale source: m_cta + 4 lane (bytes); the lane reads back row 128 wm + 32 i + lane % 32
+    let sa_src = b.bind_i32((ev(by) << 8) + (lane.lane() << 2));
+    let sa_rd: Vec<ValueId> = (0..4i32).map(|i| b.bind_i32((ev(wm) << 7) + 32 * i + (lane.lane() & 31))).collect();
+    // B-scale byte (bx KB + kb): dword (bx KB + kb) & ~3, byte (bx KB + kb) & 3 = ((bx KB) & 3 + kb & 3) & 3 -> shift computed per tile
+    let sb_src = b.bind_i32(ev(bx) * ev(kb_v));
+    let sb_shift = b.c_i32(0);
     let nkv = kb_v;
     let roles = Roles::single(&lane, 4);
     let _ = roles;
@@ -451,7 +497,7 @@ pub fn gemm_mxfp8_bs_v1() -> Function {
         a_dma: a_dma.into_iter().map(|(g, l)| (g, l)).collect(),
         b_dma,
         a_org, b_org, ptr_a, ptr_b, a_rd, b_rd, sa_byte, sb_byte, ptr_sfa, ptr_sfb, m_v, zero16, acc: Vec::new(),
-        a_wave, b_wave,
+        a_wave, b_wave, sc_s, sc_wave, sa_src, sb_src, kb_v, sa_rd, sb_shift,
     };
     pipe.run(b, Role::All, &mut body);
 
