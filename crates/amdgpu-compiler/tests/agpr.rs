@@ -58,7 +58,8 @@ fn probe_kernels_emit_agpr_forms_and_assemble() {
         let c = compile(&f).unwrap_or_else(|e| panic!("{k}: {e}"));
         let asm = &c.asm;
         assert!(asm.contains(".agpr_count:"), "{k}: metadata lacks .agpr_count");
-        assert!(asm.contains("v_accvgpr_read_b32"), "{k}: epilogue lane reads must go through v_accvgpr_read_b32");
+        // stores may read an AGPR directly (assembler-verified), so no v_accvgpr_read is needed for the epilogue stores of these probes
+        assert!(asm.lines().any(|l| l.trim_start().starts_with("global_store") && l.contains(", a")), "{k}: the epilogue stores the accumulator lanes straight from AGPRs");
         assert_eq!(asm.contains("ds_read_b128 a["), want_dsread, "{k}: ds_read into AGPR");
         let acd = asm.lines().any(|l| l.trim_start().starts_with("v_mfma") && l.contains(" a["));
         assert_eq!(acd, want_acd, "{k}: acc_cd form MFMA");
