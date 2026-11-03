@@ -91,7 +91,8 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>) -> Dma {
         Ix::Sym(s) => *s,
         _ => unreachable!(),
     };
-    let share = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("novshare"));
+    // opt-in until the soffset adds are SALU (today a v_add + v_readfirstlane per issue costs more than the VGPRs it saves)
+    let share = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("vshare"));
     let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-1024 * (q as i64 % 4))).collect();
     let mut voff: Vec<ValueId> = Vec::new();
     let mut base_of: Vec<usize> = Vec::new(); // issue index whose voffset is shared
