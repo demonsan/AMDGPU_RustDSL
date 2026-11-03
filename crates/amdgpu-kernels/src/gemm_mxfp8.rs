@@ -580,8 +580,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
         let blk = b.bind_i32(((ev(id) & 7) << 1) + ev(loc).lshr(4));
         let nx = b.bind_i32(((ev(blk) & 3) << 2) + (ev(loc) & 3));
         let ny = b.bind_i32((ev(blk).lshr(2) << 2) + (ev(loc).lshr(2) & 3));
-        let px = b.bind_i32(ev(okv).eq(0).select_i32(ev(nx), ev(bx0)));
-        let py = b.bind_i32(ev(okv).eq(0).select_i32(ev(ny), ev(by0)));
+        let s = b.bind_i32(ev(okv).eq(0).select_i32(1, 0));
+        let px = b.bind_i32(ev(bx0) + ev(s) * (ev(nx) - ev(bx0)));
+        let py = b.bind_i32(ev(by0) + ev(s) * (ev(ny) - ev(by0)));
         (px, py)
     } else {
         (bx0, by0)
