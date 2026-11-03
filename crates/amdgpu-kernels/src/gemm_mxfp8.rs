@@ -578,14 +578,16 @@ impl Body {
                 // straight-line: soffset / M0 selected per stage (s_cselect), descriptor and voffsets selected once in the prologue
                 // (UNVERIFIED timing build: the LDS write marker names the A ring only)
                 let isa = ev(wv).lt(2);
-                let org = { let v = b.bind_i32(isa.clone().select_i32(ev(ka), ev(kb))); b.read_first_lane(v) };
+                // (u32 operands: select through an i32 0/1 factor)
+                let s = b.bind_i32(isa.clone().select_i32(1, 0));
+                let org = { let v = b.bind_i32(ev(kb) + ev(s) * (ev(ka) - ev(kb))); b.read_first_lane(v) };
                 let r = self.a_s.at(slot);
                 let issues: Vec<(usize, i32)> = self.a_dma.issues.iter().enumerate().filter(|(q, _)| range.contains(q)).map(|(q, x)| (q, x.1)).collect();
                 let m0s: Vec<ValueId> = issues.iter().map(|(_, lds)| {
                     let grp = *lds - *lds % 4096;
                     let ma = cache.m0.iter().find(|x| x.0 == (0, grp)).unwrap().1;
                     let mb = cache.m0.iter().find(|x| x.0 == (1, grp)).unwrap().1;
-                    let v = b.bind_i32(isa.clone().select_i32(ev(ma), ev(mb)));
+                    let v = b.bind_i32(ev(mb) + ev(s) * (ev(ma) - ev(mb)));
                     b.read_first_lane(v)
                 }).collect();
                 r.write(b, |b| {
@@ -1137,7 +1139,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
             assert!(a_dma.issues.iter().zip(b_dma.issues.iter()).all(|(x, y)| x.1 == y.1), "role DMA: A and B issue the same LDS pattern");
             let c = b.bind_cond(ev(wv).lt(2));
             let rr = b.select_uniform_rsrc(c, rsrc_a, rsrc_b);
-            let vo: Vec<ValueId> = a_dma.issues.iter().zip(b_dma.issues.iter()).map(|(x, y)| b.bind_i32(ev(wv).lt(2).select_i32(ev(x.0), ev(y.0)))).collect();
+            let s = b.bind_i32(ev(wv).lt(2).select_i32(1, 0));
+            let vo: Vec<ValueId> = a_dma.issues.iter().zip(b_dma.issues.iter()).map(|(x, y)| b.bind_i32(ev(y.0) + ev(s) * (ev(x.0) - ev(y.0)))).collect();
             Some((rr, vo))
         }
         _ => None,
