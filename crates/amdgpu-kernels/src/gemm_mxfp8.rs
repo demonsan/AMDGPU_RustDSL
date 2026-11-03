@@ -373,6 +373,10 @@ impl PipeBody for Body {
         let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zf { z } else { br.read(b, j) }; mark(b, v) }).collect();
         let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
+        let prio = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("prio"));
+        if prio {
+            b.set_prio(1);
+        }
         for i in 0..nm {
             // prefetch the next A fragment while this one feeds 4 MMAs
             let next = if i + 1 < nm { let v = if let Some(z) = zf { z } else { ar.read(b, i + 1) }; Some(mark(b, v)) } else { None };
@@ -397,6 +401,9 @@ impl PipeBody for Body {
                 af = n;
             }
         }
+        if prio {
+            b.set_prio(0);
+        }
     }
 }
 
@@ -407,7 +414,7 @@ pub fn gemm_mxfp8_bs_v2() -> Function {
 /// v3: the vendor tile (CTA 256 x 256, 128 x 128 per wave, 64 accumulators): operand fragments in AGPRs, half of the accumulators pinned in AGPRs,
 /// 2-slot LDS ring (2 x 64 KB).
 pub fn gemm_mxfp8_bs_v3() -> Function {
-    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("defer")) })
+    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("nodefer")) })
 }
 
 /// v4: v3 with the register-staged 2-slot cadence (prefetch distance 2): all 16 operand fragments of a tile are read into AGPRs, the slot is refilled
