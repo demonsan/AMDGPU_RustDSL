@@ -131,6 +131,10 @@ pub enum MOp {
     LdsReadB32,
     LdsWriteB128,
     LdsReadB128,
+    /// `ds_read_b64`: dst V2 <- [addr + imm]
+    LdsReadB64,
+    /// `ds_write_b64`: srcs [addr, value V2], imm offset
+    LdsWriteB64,
     LdsReadB64TrB8,
     SBarrier,
     /// `s_setprio` imm.
@@ -188,6 +192,10 @@ pub enum MOp {
     SAndB32,
     SXorB32,
     SCmpLtI32,
+    /// `s_min_i32` (writes SCC)
+    SMinI32,
+    /// `s_cselect_b32 d, a, b`: d = SCC ? a : b (reads SCC; lowered right after its `s_cmp`)
+    SCselectB32,
     // misc
     SNop,
     SWaitVm,

@@ -268,15 +268,21 @@ struct Ctx {
     lb: HashMap<Sym, i64>,
     konst: HashMap<Sym, i64>,
     subst: HashMap<Sym, Poly>,
+    /// declared upper bounds (`ka_range` / `ka_set` / `sym_range` maxima; absent = unbounded)
+    ub: HashMap<Sym, i64>,
 }
 
 impl Ctx {
     fn new(f: &Function) -> Ctx {
-        let mut c = Ctx { lb: HashMap::new(), konst: HashMap::new(), subst: HashMap::new() };
+        let mut c = Ctx { lb: HashMap::new(), konst: HashMap::new(), subst: HashMap::new(), ub: HashMap::new() };
         for (off, lo, hi) in &f.contract.ka_ranges {
             let s = Sym::Ka(*off);
             let e = c.lb.entry(s.clone()).or_insert(0);
             *e = (*e).max(*lo);
+            if *hi < i64::MAX {
+                let u = c.ub.entry(s.clone()).or_insert(*hi);
+                *u = (*u).min(*hi);
+            }
             if lo == hi {
                 c.konst.insert(s, *lo);
             }
@@ -286,6 +292,8 @@ impl Ctx {
                 let s = Sym::Ka(*off);
                 let e = c.lb.entry(s.clone()).or_insert(0);
                 *e = (*e).max(*lo);
+                let u = c.ub.entry(s.clone()).or_insert(*hi);
+                *u = (*u).min(*hi);
                 if lo == hi {
                     c.konst.insert(s, *lo);
                 }
@@ -294,6 +302,9 @@ impl Ctx {
         for (n, lo, hi) in &f.contract.sym_ranges {
             let s = Sym::Named(n.clone());
             c.lb.insert(s.clone(), *lo);
+            if *hi < i64::MAX {
+                c.ub.insert(s.clone(), *hi);
+            }
             if lo == hi {
                 c.konst.insert(s, *lo);
             }
@@ -369,7 +380,31 @@ impl Ctx {
                 *e = e.add(coef);
             }
         }
-        out.values().all(|v| !v.is_neg())
+        out.values().all(|v| !v.is_neg()) || self.nonneg_box(p)
+    }
+    /// Second sufficient test: the minimum of every monomial over the box [lb, ub] of its (non-negative) symbols - `c * prod lb` for c >= 0, `c * prod ub`
+    /// for c < 0 (needs every symbol of the monomial bounded above) - sums to >= 0. Uses the declared maxima (`ka_range`, `ka_set`, `sym_range`).
+    fn nonneg_box(&self, p: &Poly) -> bool {
+        let mut sum = Q::int(0);
+        for (mono, c) in &p.0 {
+            let mut m = *c;
+            for s in mono {
+                let b = if c.is_neg() {
+                    match self.ub.get(s) {
+                        Some(u) => *u as i128,
+                        None => return false,
+                    }
+                } else {
+                    self.lower_bound(s)
+                };
+                if b < 0 {
+                    return false;
+                }
+                m = m.mul(Q::int(b));
+            }
+            sum = sum.add(m);
+        }
+        !sum.is_neg()
     }
     fn le(&self, a: &Poly, b: &Poly) -> bool {
         self.nonneg(&b.sub(a))
@@ -915,6 +950,83 @@ impl<'a> An<'a> {
         self.check_global(what, &base, imm, size, store);
     }
 
+    /// POSSIBLE BITS of an i32 value seen as a 32-bit pattern (a superset of the bits any execution can set; `u32::MAX` = unknown). Structural on the
+    /// value's definition (constants, and / xor / shifts / add / mul / select / min) intersected with the interval bound (a non-negative value <= h has
+    /// no bit above h's). Sound for wrap-around: shifts truncate, sums and products that may exceed 32 bits give `u32::MAX`.
+    fn bits(&self, o: &Opnd, depth: usize) -> u32 {
+        let all = u32::MAX;
+        let from_itv = |i: &Itv| -> u32 {
+            if !i.nonneg(&self.cx) {
+                return all;
+            }
+            match i.hi.iter().filter_map(|p| p.floor_const()).min() {
+                Some(h) if (0..=i32::MAX as i128).contains(&h) => {
+                    let h = h as u64;
+                    ((h + 1).next_power_of_two() - 1) as u32
+                }
+                _ => all,
+            }
+        };
+        let itv_m = from_itv(&self.int_of(o));
+        let v = match o {
+            Opnd::I32(c) => return *c as u32,
+            Opnd::Val(v) => *v,
+            _ => return itv_m,
+        };
+        if depth == 0 || self.assumed_vals.contains(&v) {
+            return itv_m;
+        }
+        let Some(op) = self.defs.get(&v) else { return itv_m };
+        let grow = |s: u64| -> u32 { if s > u32::MAX as u64 { all } else { ((s + 1).next_power_of_two() - 1).min(u32::MAX as u64) as u32 } };
+        let k = |o: &Opnd| -> Option<u32> {
+            match o {
+                Opnd::I32(c) => Some(*c as u32),
+                Opnd::Val(x) => match self.defs.get(x) {
+                    Some(Op::ConstI32(c)) => Some(*c as u32),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let st = match op {
+            Op::ConstI32(c) => *c as u32,
+            Op::AndI32(a, b) => self.bits(a, depth - 1) & self.bits(b, depth - 1),
+            Op::XorI32(a, b) => self.bits(a, depth - 1) | self.bits(b, depth - 1),
+            Op::ShlI32(a, b) => match k(b) {
+                Some(s) if s < 32 => self.bits(a, depth - 1).wrapping_shl(s),
+                _ => all,
+            },
+            Op::LshrI32(a, b) => match k(b) {
+                Some(s) if s < 32 => self.bits(a, depth - 1) >> s,
+                _ => all,
+            },
+            Op::AddI32(a, b) => {
+                let (ma, mb) = (self.bits(a, depth - 1), self.bits(b, depth - 1));
+                if ma & mb == 0 {
+                    ma | mb
+                } else {
+                    grow(ma as u64 + mb as u64)
+                }
+            }
+            Op::MulI32(a, b) => grow((self.bits(a, depth - 1) as u64).saturating_mul(self.bits(b, depth - 1) as u64)),
+            Op::Select { a, b, .. } | Op::MinI32(a, b) => self.bits(a, depth - 1) | self.bits(b, depth - 1),
+            _ => all,
+        };
+        st & itv_m
+    }
+
+    /// Narrows a bitwise result by its possible bits: a pattern with bit 31 clear and no bit above `m` is in `[0, m]`.
+    fn narrow_bits(&self, r: AV, m: u32) -> AV {
+        match r {
+            AV::Int(mut i) if m >> 31 == 0 => {
+                i.lo.push(Poly::int(0));
+                i.hi.push(Poly::int(m as i128));
+                AV::Int(i)
+            }
+            other => other,
+        }
+    }
+
     /// Re-evaluates an integer value under the current override (used for the arms of a `Select` whose condition refines a variable).
     fn recompute(&mut self, o: &Opnd, depth: usize) -> Itv {
         if depth == 0 {
@@ -1012,6 +1124,17 @@ impl<'a> An<'a> {
         if let Op::Select { ty, cond, a, b } = op {
             return self.eval_select(*ty, cond, a, b);
         }
+        // bitwise ops: the interval rules below, narrowed by the possible bits of the operands (xor / and of bounded patterns, masks of any sign)
+        if let Op::XorI32(a, b) | Op::AndI32(a, b) = op {
+            let (ma, mb) = (self.bits(a, 6), self.bits(b, 6));
+            let m = if matches!(op, Op::XorI32(..)) { ma | mb } else { ma & mb };
+            let r = self.eval_core(op);
+            return self.narrow_bits(r, m);
+        }
+        self.eval_core(op)
+    }
+
+    fn eval_core(&mut self, op: &Op) -> AV {
         let cx = &self.cx;
         match op {
             Op::ConstI32(c) => AV::Int(Itv::konst(*c as i128)),
@@ -1173,6 +1296,7 @@ impl<'a> An<'a> {
             }
             Op::LoadLdsB32 { addr } => self.check_lds_at("ds_read_b32", addr, 4),
             Op::LoadLdsB128 { addr } => self.check_lds_at("ds_read_b128", addr, 16),
+            Op::LoadLdsB64 { addr } => self.check_lds_at("ds_read_b64", addr, 8),
             Op::LoadLdsTrB8 { addr } => self.check_lds_at("ds_read_b64_tr_b8", addr, 8),
             Op::LoadLdsTr4B8 { addrs } => {
                 for ad in addrs.iter() {
@@ -1340,6 +1464,7 @@ impl<'a> An<'a> {
                 }
                 Stmt::StoreLdsB32 { addr, .. } => self.check_lds_at("ds_write_b32", addr, 4),
                 Stmt::StoreLdsB128 { addr, .. } => self.check_lds_at("ds_write_b128", addr, 16),
+            Stmt::StoreLdsB64 { addr, .. } => self.check_lds_at("ds_write_b64", addr, 8),
                 Stmt::BeginLoop { vars, init } => {
                     self.tag = None;
                     let close = self.matching_end(i);

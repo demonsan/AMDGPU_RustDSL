@@ -188,7 +188,7 @@ impl Lowerer {
                     count(base);
                     count(value);
                 }
-                Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } => {
+                Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } | Stmt::StoreLdsB64 { addr, value } => {
                     count(addr);
                     count(value);
                 }
@@ -763,6 +763,48 @@ impl Lowerer {
             return Err(format!("operand {o:?} is not in an SGPR (uniform analysis disagrees with lowering)"));
         }
         Ok(Src::Reg(r))
+    }
+
+    /// `dst = cond ? a : b` in SALU: `cond` is a (possibly negated) signed compare of uniform integers, re-emitted as `s_cmp_lt_i32` right before
+    /// `s_cselect_b32` (SCC is not kept live across other SALU work).
+    fn scalar_select(&mut self, dst: ValueId, cond: Opnd, a: Opnd, b: Opnd) -> Result<(), String> {
+        let mut neg = false;
+        let mut c = cond;
+        let (x, y) = loop {
+            let Opnd::Val(v) = c else { return Err("scalar select: the condition is not a value".into()) };
+            match self.defs.get(&v).cloned() {
+                Some(Op::NotI1(n)) => {
+                    neg = !neg;
+                    c = n;
+                }
+                Some(Op::CmpLtI32(x, y)) => break (x, y),
+                Some(Op::CmpGeI32(x, y)) => {
+                    neg = !neg;
+                    break (x, y);
+                }
+                other => return Err(format!("scalar select: condition {other:?} is not a uniform integer compare")),
+            }
+        };
+        let (t, f) = if neg { (b, a) } else { (a, b) };
+        // operands first (literals into SGPRs), then the compare immediately followed by the select
+        let mut ops = Vec::with_capacity(4);
+        for o in [x, y, t, f] {
+            ops.push(self.s_operand(o)?);
+        }
+        for i in [0usize, 2] {
+            if let (Src::Imm(k), Src::Imm(_)) = (ops[i], ops[i + 1]) {
+                let r = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SMovB32).def(r).imm(k));
+                ops[i] = Src::Reg(r);
+            }
+        }
+        let regs: Vec<Src> = ops.iter().copied().filter(|s| matches!(s, Src::Reg(_))).collect();
+        self.touch(&regs);
+        self.push(MInst::new(MOp::SCmpLtI32).src(ops[0]).src(ops[1]));
+        let d = self.new_vreg(RClass::S1);
+        self.push(MInst::new(MOp::SCselectB32).def(d).src(ops[2]).src(ops[3]));
+        self.val.insert(dst, d);
+        Ok(())
     }
 
     /// `dst = a <op> b` in SALU (both operands uniform).
@@ -1563,6 +1605,11 @@ impl Lowerer {
                     let v = self.as_v4(*value)?;
                     self.push(MInst::new(MOp::LdsWriteB128).srcreg(a).srcreg(v).imm(off));
                 }
+                Stmt::StoreLdsB64 { addr, value } => {
+                    let (a, off) = self.lds_addr(*addr)?;
+                    let v = self.as_v2(*value)?;
+                    self.push(MInst::new(MOp::LdsWriteB64).srcreg(a).srcreg(v).imm(off));
+                }
                 Stmt::StoreLdsB32 { addr, value } => {
                     let (a, off) = self.lds_addr(*addr)?;
                     let v = self.as_v1(*value)?;
@@ -1790,6 +1837,13 @@ impl Lowerer {
             Op::LshrI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SLshrB32, *a, *b)?,
             Op::AndI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAndB32, *a, *b)?,
             Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
+            Op::MinI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SMinI32, *a, *b)?,
+            Op::Select { ty: DType::I32, cond, a, b } if self.uniform.contains(&dst) => self.scalar_select(dst, *cond, *a, *b)?,
+            Op::ReadFirstLane(Opnd::Val(a)) if self.uniform.contains(a) && self.val.get(a).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S1) => {
+                // already wave-uniform in an SGPR: no v_mov + v_readfirstlane round trip
+                let r = self.val[a];
+                self.val.insert(dst, r);
+            }
             Op::AddI32(a, b) if opt_on("addrfold") && self.lazy_add(dst, *a, *b)? => {}
             Op::AddI32(a, b) => self.bin_v1(dst, MOp::VAddU32, *a, *b)?,
             Op::AddF32(a, b) => self.bin_v1(dst, MOp::VAddF32, *a, *b)?,
@@ -2099,6 +2153,13 @@ impl Lowerer {
                 self.touch(&[Src::Reg(r)]);
                 let d = self.new_vreg(RClass::S1);
                 self.push(MInst::new(MOp::VReadFirstLane).def(d).srcreg(r));
+                self.val.insert(dst, d);
+            }
+            Op::LoadLdsB64 { addr } => {
+                let (a, off) = self.lds_addr(*addr)?;
+                let d = self.new_vreg(RClass::V2);
+                self.push(MInst::new(MOp::LdsReadB64).def(d).srcreg(a).imm(off));
+                self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::LoadLdsB32 { addr } => {
@@ -2935,7 +2996,7 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
     fn load_op(op: MOp) -> bool {
         matches!(
             op,
-            MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64TrB8 | MOp::GlobalLoadU16
+            MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64 | MOp::LdsReadB64TrB8 | MOp::GlobalLoadU16
                 | MOp::GlobalLoadF32 | MOp::GlobalLoadB128 | MOp::GlobalLoadB128S | MOp::GlobalLoadF32S
         )
     }
@@ -3021,6 +3082,9 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
         let mut u: HashSet<ValueId> = HashSet::new();
         let mut wi: HashSet<ValueId> = HashSet::new(); // workitem id values (waveuni)
         let mut cst: HashMap<ValueId, i64> = HashMap::new();
+        // `scalarize2`: uniform integer compares (only consumed by uniform selects: the select re-emits them as s_cmp + s_cselect)
+        let ext = opt_on("scalarize2");
+        let mut ucond: HashSet<ValueId> = HashSet::new();
         let is_u = |o: &Opnd, u: &HashSet<ValueId>, uvars: &HashSet<amdgpu_dsl::VarId>| match o {
             Opnd::I32(_) => true,
             Opnd::Val(v) => u.contains(v),
@@ -3048,6 +3112,22 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         Op::AddI32(a, b) | Op::MulI32(a, b) | Op::ShlI32(a, b) | Op::LshrI32(a, b) | Op::AndI32(a, b) | Op::XorI32(a, b) => {
                             is_u(a, &u, &uvars) && is_u(b, &u, &uvars)
                         }
+                        Op::MinI32(a, b) if ext => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
+                        Op::CmpLtI32(a, b) | Op::CmpGeI32(a, b) if ext => {
+                            if is_u(a, &u, &uvars) && is_u(b, &u, &uvars) {
+                                ucond.insert(*dst);
+                            }
+                            false
+                        }
+                        Op::NotI1(Opnd::Val(c)) if ext => {
+                            if ucond.contains(c) {
+                                ucond.insert(*dst);
+                            }
+                            false
+                        }
+                        Op::Select { ty: DType::I32, cond: Opnd::Val(c), a, b } if ext => ucond.contains(c) && is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
+                        // the result of v_readfirstlane is wave-uniform by definition
+                        Op::ReadFirstLane(_) if ext => true,
                         _ => false,
                     };
                     if uni {

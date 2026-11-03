@@ -57,6 +57,7 @@ fn buffer_dma_partition_matches_the_layouts() {
     let dst = ComposedLayout::plain(make_layout(tup![tup![8, 32], 128], tup![tup![128, 1056], 1]));
     let part = partition_buffer_dma(&mut b, &ctx, BUFFER_LDS_X4, &tv, &src, &dst, 8, &l, &w, &a_s);
     let soff = 0x1_0000;
+    assert_eq!(part.voffsets(), 1, "the source advances by a thread-independent amount per issue: one voffset, the rest in the soffset");
     part.issue(&mut b, rsrc, Opnd::I32(soff), &a_s.at(&SlotIdx::new(1, 1)));
     let f = b.finish();
     let _ = ev;
