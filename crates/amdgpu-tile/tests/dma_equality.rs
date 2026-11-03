@@ -27,7 +27,7 @@ fn eval(defs: &HashMap<u32, Op>, o: &Opnd, tid: i64, memo: &mut HashMap<u32, i64
                 Op::WorkitemId => tid,
                 Op::KernargI32 { .. } => KV_LEN,
                 Op::KernargPtr { .. } => 0,
-                Op::PtrAdd(a, b) => e(a) + e(b),
+                Op::PtrAdd { base, byte_off } => e(base) + e(byte_off),
                 Op::AddI32(a, b) => w(e(a) + e(b)),
                 Op::MulI32(a, b) => w(e(a) * e(b)),
                 Op::ShlI32(a, b) => w(e(a) << e(b)),
