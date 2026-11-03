@@ -330,9 +330,9 @@ impl Body {
         if let Some(p) = &self.panel {
             // scale panel (loaded once): A rows [kb][256], B bytes [wn][KB] (+ the alignment delta of the B source)
             let pr = p.sh.at(&SlotIdx::new(0, 0));
-            let sab = b.bind_i32(((kb.clone() & (PANEL_KB as i32 - 1)) << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
+            let sab = b.bind_i32((kb.clone() << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
             let bo = b.bind_i32(ev(p.b_off) + kb);
-            let sbb = b.bind_i32(((ev(bo).lshr(2) << 2) & 508) + (p.sh.base as i32 + p.b_base as i32));
+            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (p.sh.base as i32 + p.b_base as i32));
             let (wa, wb) = pr.read(b, |b| {
                 let wa: Vec<ValueId> = (0..nm).map(|i| {
                     let a = b.bind_i32(ev(sab) + 16 * i as i32);
@@ -361,9 +361,9 @@ impl Body {
     /// With the transposed panel the A words are NOT shifted (2 words, the MMA selects byte i % 4 of word i / 4: `sa_sel`).
     fn load_scales(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId) {
         if let Some((base, b_base, b_off, lo, pr)) = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0))))) {
-            let sab = b.bind_i32(((kb.clone() & (PANEL_KB as i32 - 1)) << 8) + (base as i32) + ev(lo));
+            let sab = b.bind_i32((kb.clone() << 8) + (base as i32) + ev(lo));
             let bo = b.bind_i32(ev(b_off) + kb);
-            let sbb = b.bind_i32(((ev(bo).lshr(2) << 2) & 508) + (base + b_base) as i32);
+            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (base + b_base) as i32);
             let (wa, wb) = pr.read(b, |b| {
                 let a1 = b.bind_i32(ev(sab) + 4);
                 let wa = vec![b.load_lds_b32(sab), b.load_lds_b32(a1)];
@@ -637,9 +637,9 @@ impl PipeBody for Body {
         let (wa, wb, sbsh) = if let Some((base, b_base, b_off, lo, ref pr)) = tr {
             // transposed panel: 2 dwords hold the 8 A-scale bytes of this lane; the B byte as before
             // K group < KT <= PANEL_KB (contract): the masks are no-ops that bound the panel offsets for the verifier
-            let sab = b.bind_i32(((kbx.clone() & (PANEL_KB as i32 - 1)) << 8) + (base as i32) + ev(lo));
+            let sab = b.bind_i32((kbx.clone() << 8) + (base as i32) + ev(lo));
             let bo = b.bind_i32(ev(b_off) + kbx.clone());
-            let sbb = b.bind_i32(((ev(bo).lshr(2) << 2) & 508) + (base + b_base) as i32);
+            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (base + b_base) as i32);
             let (wa, wb) = pr.read(b, |b| {
                 let a1 = b.bind_i32(ev(sab) + 4);
                 let wa = vec![b.load_lds_b32(sab), b.load_lds_b32(a1)];
@@ -854,8 +854,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
     // the view bases lie inside one 16-row block (< 2048 bytes): the mask is a no-op that gives the verifier the bound the XOR swizzle hides
     // (bases include the buffer base; 16-byte reads: the low 4 bits are zero)
     let (ab, bb) = (a_s.base as i32, b_s.base as i32);
-    a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32((((x.clone() - ab) & 2032) + ab) + &a_wo)).collect();
-    b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32((((x.clone() - bb) & 2032) + bb) + &b_wo)).collect();
+    let _ = (ab, bb);
+    a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32(x + &a_wo)).collect();
+    b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32(x + &b_wo)).collect();
 
     // ---- DMA (A row-major, B preshuffled), wave parts of M0, CTA origins ----
     let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
