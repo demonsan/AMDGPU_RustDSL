@@ -210,6 +210,10 @@ impl Body {
 }
 impl PipeBody for Body {
     fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
+        // diagnostic ablations (wrong results): FMHA_ABLATE=gemm_nodma skips the copies
+        if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nodma")) {
+            return;
+        }
         // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0
         // the tile origins are wave uniform: SGPR soffsets
         let ka = { let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v) };
@@ -316,7 +320,9 @@ impl PipeBody for Body {
                     let v = br.read(b, j + 1);
                     bf.push(mark(b, v));
                 }
-                gemm(b, &self.mma, self.acc[nn * i + j], af, bf[j], sa[i], sb, 0, 0);
+                if !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nomma")) {
+                    gemm(b, &self.mma, self.acc[nn * i + j], af, bf[j], sa[i], sb, 0, 0);
+                }
             }
             if let Some(n) = next {
                 af = n;
