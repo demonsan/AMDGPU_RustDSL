@@ -99,6 +99,34 @@ fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, 
     Dma { issues: gofs.iter().enumerate().map(|(q, g)| (b.bind_i32(ctx.lower(g) - 1024 * (q as i32 % 4)), 1024 * q as i32)).collect() }
 }
 
+/// A-tile DMA for the row-major LDS image with the FMHA 128-byte-row swizzle (`swz o (r, k) -> 128 r + k`): one instruction moves 8 whole
+/// 128-byte rows (coalesced 128-byte segments, like the vendor), the swizzle is applied on the source side (the LDS landing is linear in the lane).
+/// LDS byte d -> element (r, k) = swz(d) (the swizzle is an involution) -> global offset `glob(r, k)`; proved for sampled threads.
+fn dma_plan_rows_swz(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64) -> Dma {
+    let issues = rows * 128 / 1024 / 4;
+    let swz = Swizzle::fmha128();
+    let d = &ctx.dyns;
+    let tid_id = match s_tid {
+        Ix::Sym(s) => *s,
+        _ => unreachable!(),
+    };
+    let mut out = Vec::new();
+    for q in 0..issues {
+        let lds = s_tid.mod_c(64, d).mul_c(16).add(&s_tid.div_c(64, d).mul_c(1024 * issues)).add_c(1024 * q);
+        let e = swz.apply_ix(&lds, d);
+        let g = glob.crd2idx(&tup![e.div_c(128, d), e.mod_c(128, d)], d);
+        for th in [0i64, 1, 7, 8, 63, 64, 100, 255] {
+            let env = |s: u32| if s == tid_id { th } else { proof_k };
+            let lb = 1024 * (issues * (th / 64) + q) + 16 * (th % 64);
+            let lin = swz.apply(lb);
+            let want = glob.crd2idx(&tup![lin / 128, lin % 128], d).eval(&env);
+            assert_eq!(g.eval(&env), want, "A DMA thread {th} issue {q}");
+        }
+        out.push((b.bind_i32(ctx.lower(&g) - 1024 * (q as i32 % 4)), 1024 * q as i32));
+    }
+    Dma { issues: out }
+}
+
 struct Body {
     cfg: Cfg,
     mma: TiledMma,
@@ -393,9 +421,11 @@ fn build(name: &str, cfg: Cfg) -> Function {
 
     // ---- operand reads: the 16-row blocks of the wave (placements (row block) 2048), the wave offset added to the bases ----
     let view = ComposedLayout::new(Swizzle::none(), smem_block());
+    // A: 128-byte rows with the FMHA swizzle (a 16-row block = 2048 bytes; the swizzle only depends on row bits 0..3)
+    let a_view = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![16, 128], tup![128, 1]));
     let a_place: Vec<i64> = (0..wave_m / 16).map(|i| 2048 * i).collect();
     let b_place: Vec<i64> = (0..wave_n / 16).map(|j| 2048 * j).collect();
-    let mut a_rd = copy_a.partition_lds(b, &ctx, &s_lane, &a_s, &view, &a_place);
+    let mut a_rd = copy_a.partition_lds(b, &ctx, &s_lane, &a_s, &a_view, &a_place);
     let mut b_rd = copy_b.partition_lds(b, &ctx, &s_lane, &b_s, &view, &b_place);
     let a_wo = ctx.lower(&s_wm.mul_c(wave_m / 16 * 2048));
     let b_wo = ctx.lower(&s_wn.mul_c(wave_n / 16 * 2048));
@@ -405,7 +435,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     // ---- DMA (A row-major, B preshuffled), wave parts of M0, CTA origins ----
     let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
     let b_glob = make_layout(tup![tup![16, cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]);
-    let a_dma = dma_plan(b, &ctx, &s_tid, cta_m, &a_glob, 8192);
+    let a_dma = dma_plan_rows_swz(b, &ctx, &s_tid, cta_m, &a_glob, 8192);
     let b_dma = dma_plan(b, &ctx, &s_tid, cta_n, &b_glob, 8192);
     let a_wave = b.bind_i32(lane.wave() * (cta_m * 128 / 4) as i32);
     let b_wave = b.bind_i32(lane.wave() * (cta_n * 128 / 4) as i32);
