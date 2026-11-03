@@ -15,7 +15,7 @@ fn kernel(lds: u32, addr: impl Fn(I32) -> I32) -> Function {
 
 fn lds_oob(f: &Function) -> usize {
     let r = amdgpu_compiler::gpu_verify::analyse(f).expect("analyse");
-    r.errors().iter().filter(|e| e.contains("GV-LDS-OOB")).count()
+    r.errors().iter().filter(|e| e.code == "GV-LDS-OOB").count()
 }
 
 #[test]
