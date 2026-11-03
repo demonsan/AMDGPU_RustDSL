@@ -340,38 +340,44 @@ impl crate::tile::PipeBody for GemmV1 {
         let scr = self.sc_s.at(&t.cur);
         let so = scr.off_v(b);
         let scb = b.bind_i32(so + self.sc_s.base as i32 + crate::tile::ev(self.sc_wave));
-        let (sa, sb) = scr.read(b, |b| {
-            let sa: Vec<ValueId> = (0..4).map(|i| {
-                // the dword holding row byte r = 128 wm + 32 i + lane % 32, shifted to byte 0
+        // all scale words first (one LDS round trip), then the byte selects
+        let (wa, wb) = scr.read(b, |b| {
+            let wa: Vec<ValueId> = (0..4).map(|i| {
                 let a = b.bind_i32(crate::tile::ev(scb) + (crate::tile::ev(self.sa_rd[i]) & -4));
-                let w = b.load_lds_b32(a);
-                b.bind_i32(crate::tile::ev(w).lshr((crate::tile::ev(self.sa_rd[i]) & 3) << 3))
+                b.load_lds_b32(a)
             }).collect();
             let a = b.bind_i32(crate::tile::ev(scb) + 256);
-            let w = b.load_lds_b32(a);
-            let sb = b.bind_i32(crate::tile::ev(w).lshr((((crate::tile::ev(self.sb_src) + kbx.clone()) & 3) << 3) + crate::tile::ev(self.sb_shift)));
-            (sa, sb)
+            (wa, b.load_lds_b32(a))
         });
         let _ = (&self.sa_byte, self.sb_byte, self.kb_v);
         let ar = self.a_s.at(&t.cur);
         let br = self.b_s.at(&t.cur);
         let (aoff, boff) = (ar.off_v(b) + self.a_s.base as i32, br.off_v(b) + self.b_s.base as i32);
+        let rd = |b: &mut FnBuilder, r: &crate::tile::SlotRef, off: &I32, p: &[(ValueId, i64); 2]| -> ValueId {
+            let a0 = b.bind_i32(off.clone() + crate::tile::ev(p[0].0) + p[0].1 as i32);
+            let a1 = b.bind_i32(off.clone() + crate::tile::ev(p[1].0) + p[1].1 as i32);
+            r.read(b, |b| b.load_lds_b128x2(a0, a1))
+        };
+        // k-step 0 operands: B (both) then A (4)
+        let mut bf: Vec<ValueId> = (0..2).map(|j| rd(b, &br, &boff, &self.b_rd[j][0])).collect();
+        let mut af: Vec<ValueId> = (0..4).map(|i| rd(b, &ar, &aoff, &self.a_rd[i][0])).collect();
+        let sa: Vec<ValueId> = (0..4).map(|i| b.bind_i32(crate::tile::ev(wa[i]).lshr((crate::tile::ev(self.sa_rd[i]) & 3) << 3))).collect();
+        let sb = b.bind_i32(crate::tile::ev(wb).lshr((((crate::tile::ev(self.sb_src) + kbx.clone()) & 3) << 3) + crate::tile::ev(self.sb_shift)));
+        // k-step 1 B operands prefetched into their own registers while k-step 0 runs
+        let bf1: Vec<ValueId> = (0..2).map(|j| rd(b, &br, &boff, &self.b_rd[j][1])).collect();
         for h in 0..2usize {
-            let rd = |b: &mut FnBuilder, r: &crate::tile::SlotRef, off: &I32, p: &[(ValueId, i64); 2]| -> ValueId {
-                let a0 = b.bind_i32(off.clone() + crate::tile::ev(p[0].0) + p[0].1 as i32);
-                let a1 = b.bind_i32(off.clone() + crate::tile::ev(p[1].0) + p[1].1 as i32);
-                r.read(b, |b| b.load_lds_b128x2(a0, a1))
-            };
-            let af: Vec<ValueId> = (0..4).map(|i| rd(b, &ar, &aoff, &self.a_rd[i][h])).collect();
-            let bf: Vec<ValueId> = (0..2).map(|j| rd(b, &br, &boff, &self.b_rd[j][h])).collect();
             for i in 0..4usize {
                 for j in 0..2usize {
                     // swapped MFMA: hardware A = B fragment (rows n), hardware B = A fragment (rows m); scale_a = sb, scale_b = sa
                     b.var_mfma_scale(self.acc[2 * i + j], bf[j], af[i], sb, sa[i]);
                 }
+                if h == 0 {
+                    // A_i is dead for k-step 0: reload it in place for k-step 1
+                    af[i] = rd(b, &ar, &aoff, &self.a_rd[i][1]);
+                }
             }
-        }
-    }
+            bf = bf1.clone();
+        }    }
 }
 
 /// Evaluates a symbolic offset for concrete symbol values (build-time proofs).
