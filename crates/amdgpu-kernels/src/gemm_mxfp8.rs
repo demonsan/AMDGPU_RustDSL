@@ -215,6 +215,10 @@ impl Body {
         let mut deferred = self.deferred.take();
         let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
         let per = (total + 2 * nm - 1) / (2 * nm);
+        let prio = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noprio"));
+        if prio {
+            b.set_prio(1);
+        }
         let half = nn / 2;
         for (lo, hi) in [(0, half), (half, nn)] {
             for i in 0..nm {
@@ -241,6 +245,9 @@ impl Body {
                     b.set_var(bv[j], v);
                 }
             }
+        }
+        if prio {
+            b.set_prio(0);
         }
         if t.staged {
             // the scales of t+1 last (their byte selects would otherwise wait at the top of the MMAs)
