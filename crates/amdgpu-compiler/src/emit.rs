@@ -771,6 +771,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         }
         MOp::SBarrier => vec!["s_barrier".to_string()],
         MOp::SSetPrio => vec![format!("s_setprio {}", inst.imm)],
+        MOp::SchedGroup => Vec::new(),
         MOp::SEndpgm => vec!["s_endpgm".to_string()],
     }
 }

@@ -592,6 +592,8 @@ pub enum Stmt {
     Barrier,
     /// `s_setprio`: wave issue priority 0..3.
     SetPrio { prio: u8 },
+    /// Scheduler directive (`sched_group_barrier`): see `FnBuilder::sched_group_barrier`. No instruction is emitted.
+    SchedGroup { mask: u32, size: u32, sync: u32 },
     /// `s_waitcnt vmcnt(count)`: wait until at most `count` global/LDS-DMA loads are outstanding.
     WaitVm { count: u8 },
     /// Global -> LDS DMA load (`global_load_lds_dwordx4` or `_dword`): lane i of the wave writes its 16 (4) bytes at
@@ -647,6 +649,17 @@ pub struct Arg {
     pub kernarg_offset: u32,
     pub size: u32,
 }
+
+pub const SCHED_ALU: u32 = 0x1;
+pub const SCHED_VALU: u32 = 0x2;
+pub const SCHED_SALU: u32 = 0x4;
+pub const SCHED_MFMA: u32 = 0x8;
+pub const SCHED_VMEM: u32 = 0x10;
+pub const SCHED_VMEM_READ: u32 = 0x20;
+pub const SCHED_VMEM_WRITE: u32 = 0x40;
+pub const SCHED_DS: u32 = 0x80;
+pub const SCHED_DS_READ: u32 = 0x100;
+pub const SCHED_DS_WRITE: u32 = 0x200;
 
 /// What an AGPR request applies to (see FnBuilder::pin_agpr / FnBuilder::agpr).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -789,6 +802,9 @@ impl Function {
                 }
                 Stmt::SetPrio { prio } => {
                     let _ = writeln!(s, "{pad}setprio {prio}");
+                }
+                Stmt::SchedGroup { mask, size, sync } => {
+                    let _ = writeln!(s, "{pad}sched_group_barrier mask=0x{mask:x} size={size} sync={sync}");
                 }
                 Stmt::WaitVm { count } => {
                     let _ = writeln!(s, "{pad}waitvm({count})");
@@ -1679,6 +1695,25 @@ impl FnBuilder {
     pub fn wait_vm(&mut self, count: u8) {
         self.f.stmts.push(Stmt::WaitVm { count });
     }
+    /// Scheduler directive, the analogue of ``__builtin_amdgcn_sched_group_barrier(mask, size, sync)``. Consecutive directives of one basic block form the issue
+    /// pipeline of that block: group 1 = the next ``size`` instructions of the ``mask`` class (in program order, among those not placed yet), then group 2, ...;
+    /// everything a selected instruction depends on is pulled in just before it, every register / memory / barrier dependence is respected, and the instructions
+    /// no group selects follow in program order. Honoured by the scheduler of ``CompileProfile::Gemm`` (or explicit ``sched_opts``); otherwise ignored.
+    /// Mask bits as in LLVM: ``SCHED_ALU`` 0x1 (any ALU incl. MFMA), ``SCHED_VALU`` 0x2, ``SCHED_SALU`` 0x4, ``SCHED_MFMA`` 0x8, ``SCHED_VMEM`` 0x10,
+    /// ``SCHED_VMEM_READ`` 0x20 (buffer/global loads, LDS-DMA included), ``SCHED_VMEM_WRITE`` 0x40, ``SCHED_DS`` 0x80, ``SCHED_DS_READ`` 0x100, ``SCHED_DS_WRITE`` 0x200.
+    pub fn sched_group_barrier(&mut self, mask: u32, size: u32, sync: u32) {
+        self.f.stmts.push(Stmt::SchedGroup { mask, size, sync });
+    }
+
+    /// ``repeat`` times the group sequence ``groups`` (``(mask, size)`` pairs) as ``sched_group_barrier`` directives, e.g. one MFMA then two ``ds_read``s then one DMA:
+    /// ``b.sched_pattern(&[(SCHED_MFMA, 1), (SCHED_DS_READ, 2), (SCHED_VMEM_READ, 1)], 64)``.
+    pub fn sched_pattern(&mut self, groups: &[(u32, u32)], repeat: u32) {
+        for _ in 0..repeat {
+            for &(mask, size) in groups {
+                self.sched_group_barrier(mask, size, 0);
+            }
+        }
+    }
     /// 16-byte (dwords = 4) or 4-byte (dwords = 1) global -> LDS DMA load; see `Stmt::LoadGlobalLds`.
     pub fn load_global_lds(&mut self, base: impl Into<Opnd>, lds_addr: impl Into<Opnd>, byte_off: i32, dwords: u8) {
         self.f.stmts.push(Stmt::LoadGlobalLds { base: base.into(), lds_addr: lds_addr.into(), byte_off, dwords });
@@ -2240,7 +2275,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::WaitVm { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } => {}
             Stmt::Assume { target, .. } => {
                 if let Err(e) = expect_int(f, *target, "assume target") {
                     errs.push(here(e));

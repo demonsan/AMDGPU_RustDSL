@@ -133,6 +133,7 @@ VPkMulF32   | V2 <- V2 V2 | {d} = nofpexcept V_PK_MUL_F32 8, {s0}, 8, {s1}, 0, 0
 VPermlane32Swap | V1 <- V1 V1 | {s0}, {s1} = V_PERMLANE32_SWAP_B32_e32 {s0}(tied-def 0), {s1}(tied-def 1), implicit $exec
 SSetPrio    | <- | S_SETPRIO {imm}
 SNop        | <- | DROP
+SchedGroup | <- | DROP
 SWaitVm     | <- | S_WAITCNT {vmcnt}
 SWaitLgkm   | <- | S_WAITCNT {lgkmcnt}
 SEndpgm     | <- | S_ENDPGM 0

@@ -1718,6 +1718,9 @@ impl Lowerer {
                         self.push(MInst::new(mop).srcreg(rb).srcreg(sreg).imm(*byte_off as i64));
                     }
                 }
+                Stmt::SchedGroup { mask, size, sync } => {
+                    self.push(MInst::new(MOp::SchedGroup).imm((*mask as i64 & 0xffff) | ((*size as i64 & 0xffff) << 16) | ((*sync as i64) << 32)));
+                }
                 Stmt::SetPrio { prio } => {
                     self.push(MInst::new(MOp::SSetPrio).imm(*prio as i64));
                 }

@@ -213,6 +213,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(if std::env::var("AMDC_SCHED_VERBOSE").is_ok() { 6000 } else { 120 }).collect::<String>());
     }
     let mut m = base;
+    sched::phase::strip(&mut m); // scheduler directives are meaningless without the scheduler
     let pe = pin_check::check(&m);
     if !pe.is_empty() {
         return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));

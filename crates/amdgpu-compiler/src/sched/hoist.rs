@@ -21,7 +21,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
     for bi in 0..m.blocks.len() {
         let insts = m.blocks[bi].insts.clone();
         let n = insts.len();
-        if n < 8 {
+        if n < 8 || super::phase::has_markers(&insts) {
             continue;
         }
         let term = m.blocks[bi].term.clone();

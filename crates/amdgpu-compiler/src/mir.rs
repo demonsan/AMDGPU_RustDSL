@@ -191,6 +191,8 @@ pub enum MOp {
     SBarrier,
     /// `s_setprio` imm.
     SSetPrio,
+    /// Scheduler directive (no instruction): `sched_group_barrier(mask, size, sync)`, imm = mask | size << 16 | sync << 32. Consumed (and removed) by `sched::phase`.
+    SchedGroup,
     // global memory
     GlobalLoadU16,
     GlobalLoadF32,
