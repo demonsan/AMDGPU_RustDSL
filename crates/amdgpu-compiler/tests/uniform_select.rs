@@ -133,7 +133,9 @@ fn wave_role_select_with_the_wave_id() {
     let p = b.ptr_add(po, vo);
     b.store_f32(p, 0, x);
     let f = b.finish();
-    assert!(errors(&f).is_empty(), "{:?}", errors(&f));
-    let s = amdgpu_compiler::lower::with_opts(&["dce", "cmpfold", "scalarize", "scalarize2", "waveuni"], || amdgpu_compiler::compile(&f)).expect("compile").asm;
+    let opts = ["dce", "cmpfold", "scalarize", "scalarize2", "waveuni"];
+    let e = amdgpu_compiler::lower::with_opts(&opts, || errors(&f));
+    assert!(e.is_empty(), "{e:?}");
+    let s = amdgpu_compiler::lower::with_opts(&opts, || amdgpu_compiler::compile(&f)).expect("compile").asm;
     assert_eq!(s.lines().filter(|l| l.trim().starts_with("s_cselect_b64")).count(), 2, "{s}");
 }
