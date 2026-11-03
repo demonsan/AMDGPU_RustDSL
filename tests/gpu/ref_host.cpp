@@ -39,10 +39,10 @@ static void put64(unsigned char* a, int off, const void* p) {
 static void put32(unsigned char* a, int off, uint32_t v) { std::memcpy(a + off, &v, 4); }
 
 namespace hg = amdc_hostgen;
-using GenVs = hg::fmha_fwd_hd128_mxfp8_v3_vs128;
-using GenT = hg::fmha_fwd_hd128_mxfp8_v3_t128;
-using GenSplit = hg::fmha_fwd_hd128_mxfp8_v3_kvsplit;
-using GenComb = hg::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h;
+namespace GenVs = hg::fmha_fwd_hd128_mxfp8_v3_vs128;
+namespace GenT = hg::fmha_fwd_hd128_mxfp8_v3_t128;
+namespace GenSplit = hg::fmha_fwd_hd128_mxfp8_v3_kvsplit;
+namespace GenComb = hg::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h;
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
