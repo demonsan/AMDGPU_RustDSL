@@ -75,6 +75,36 @@ fn declare_abi(b: &mut FnBuilder) {
     }
 }
 
+/// The host contract of the ABI for a `cta_m x cta_n` CTA (what `gpu-verify` proves the accesses against): M = MT cta_m, N = NT cta_n, K = KT 128
+/// (the kernel has no partial tiles), the grid (NT, MT), dense strides (stride_a = stride_b = K, stride_c = N, stride_sfa = M, stride_sfb = K / 128),
+/// batch 1, and the tensor extents A M K, B N K (preshuffled, same size), C 2 M N, sa (K / 128) M, sb (N / 128) (K / 128) bytes.
+fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64) {
+    let (mt, nt, kt) = (Ext::sym("MT"), Ext::sym("NT"), Ext::sym("KT"));
+    // int32 offsets: M K, N K and 2 M N stay below 2^31 (16384 x 65536 tiles of bytes at most)
+    b.sym_range("MT", 1, (1 << 14) / cta_m);
+    b.sym_range("NT", 1, (1 << 14) / cta_n);
+    b.sym_range("KT", 1, (1 << 16) / 128);
+    let m = mt.clone() * Ext::c(cta_m);
+    let n = nt.clone() * Ext::c(cta_n);
+    let k = kt.clone() * Ext::c(128);
+    b.ka_is(24, m.clone());
+    b.ka_is(28, n.clone());
+    b.ka_is(32, k.clone());
+    b.ka_is(36, Ext::c(1));
+    b.ka_is(40, k.clone());
+    b.ka_is(44, k.clone());
+    b.ka_is(48, n.clone());
+    b.ka_is(80, m.clone());
+    b.ka_is(84, kt.clone());
+    b.grid_is(0, nt.clone());
+    b.grid_is(1, mt.clone());
+    b.arg_tensor("ptr_a", m.clone() * k.clone());
+    b.arg_tensor("ptr_b", n.clone() * k.clone());
+    b.arg_tensor("ptr_c", Ext::c(2) * m.clone() * n.clone());
+    b.arg_tensor("ptr_sfa", kt.clone() * m);
+    b.arg_tensor("ptr_sfb", nt * Ext::c(cta_n / 128) * kt);
+}
+
 /// One DMA stage of a [rows x 128 B] tile: per issue the global offset (relative to the tile origin) and the M0 offset inside the slot.
 struct Dma {
     /// per issue: the lane's voffset (bound once, loop invariant, shared by the issues whose sources differ by a wave-uniform amount), that
@@ -616,6 +646,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     fb.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
     let b = &mut fb;
     declare_abi(b);
+    declare_contract(b, cta_m, cta_n);
     let ptr_a = b.let_(Op::KernargPtr { offset: 0 });
     let ptr_b = b.let_(Op::KernargPtr { offset: 8 });
     let ptr_c = b.let_(Op::KernargPtr { offset: 16 });
