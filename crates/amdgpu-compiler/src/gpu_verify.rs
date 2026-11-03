@@ -268,15 +268,21 @@ struct Ctx {
     lb: HashMap<Sym, i64>,
     konst: HashMap<Sym, i64>,
     subst: HashMap<Sym, Poly>,
+    /// declared upper bounds (`ka_range` / `ka_set` / `sym_range` maxima; absent = unbounded)
+    ub: HashMap<Sym, i64>,
 }
 
 impl Ctx {
     fn new(f: &Function) -> Ctx {
-        let mut c = Ctx { lb: HashMap::new(), konst: HashMap::new(), subst: HashMap::new() };
+        let mut c = Ctx { lb: HashMap::new(), konst: HashMap::new(), subst: HashMap::new(), ub: HashMap::new() };
         for (off, lo, hi) in &f.contract.ka_ranges {
             let s = Sym::Ka(*off);
             let e = c.lb.entry(s.clone()).or_insert(0);
             *e = (*e).max(*lo);
+            if *hi < i64::MAX {
+                let u = c.ub.entry(s.clone()).or_insert(*hi);
+                *u = (*u).min(*hi);
+            }
             if lo == hi {
                 c.konst.insert(s, *lo);
             }
@@ -286,6 +292,8 @@ impl Ctx {
                 let s = Sym::Ka(*off);
                 let e = c.lb.entry(s.clone()).or_insert(0);
                 *e = (*e).max(*lo);
+                let u = c.ub.entry(s.clone()).or_insert(*hi);
+                *u = (*u).min(*hi);
                 if lo == hi {
                     c.konst.insert(s, *lo);
                 }
@@ -294,6 +302,9 @@ impl Ctx {
         for (n, lo, hi) in &f.contract.sym_ranges {
             let s = Sym::Named(n.clone());
             c.lb.insert(s.clone(), *lo);
+            if *hi < i64::MAX {
+                c.ub.insert(s.clone(), *hi);
+            }
             if lo == hi {
                 c.konst.insert(s, *lo);
             }
@@ -369,7 +380,31 @@ impl Ctx {
                 *e = e.add(coef);
             }
         }
-        out.values().all(|v| !v.is_neg())
+        out.values().all(|v| !v.is_neg()) || self.nonneg_box(p)
+    }
+    /// Second sufficient test: the minimum of every monomial over the box [lb, ub] of its (non-negative) symbols - `c * prod lb` for c >= 0, `c * prod ub`
+    /// for c < 0 (needs every symbol of the monomial bounded above) - sums to >= 0. Uses the declared maxima (`ka_range`, `ka_set`, `sym_range`).
+    fn nonneg_box(&self, p: &Poly) -> bool {
+        let mut sum = Q::int(0);
+        for (mono, c) in &p.0 {
+            let mut m = *c;
+            for s in mono {
+                let b = if c.is_neg() {
+                    match self.ub.get(s) {
+                        Some(u) => *u as i128,
+                        None => return false,
+                    }
+                } else {
+                    self.lower_bound(s)
+                };
+                if b < 0 {
+                    return false;
+                }
+                m = m.mul(Q::int(b));
+            }
+            sum = sum.add(m);
+        }
+        !sum.is_neg()
     }
     fn le(&self, a: &Poly, b: &Poly) -> bool {
         self.nonneg(&b.sub(a))
