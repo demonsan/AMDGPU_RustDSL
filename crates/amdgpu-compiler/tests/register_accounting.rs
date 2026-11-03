@@ -41,13 +41,15 @@ use amdgpu_compiler::{compile, compile_with, kernel_by_name, kernel_names};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Reg {
     scalar: bool,
+    /// accumulation register ([], gfx90a+ unified file): a separate index space from the arch VGPRs
+    agpr: bool,
     base: u32,
     width: u32,
 }
 
 impl Reg {
     fn keys(&self) -> impl Iterator<Item = u32> + '_ {
-        let class = if self.scalar { 512 } else { 0 };
+        let class = if self.scalar { 512 } else if self.agpr { 1024 } else { 0 };
         (self.base..self.base + self.width).map(move |i| class + i)
     }
 }
@@ -82,7 +84,7 @@ fn scan_regs(s: &str) -> Vec<Reg> {
                         n2 += 1;
                     }
                     if n2 > 0 && k < b.len() && b[k] == b']' && end >= base {
-                        out.push(Reg { scalar: c == 's', base: base as u32, width: (end - base + 1) as u32 });
+                        out.push(Reg { scalar: c == 's', agpr: c == 'a', base: base as u32, width: (end - base + 1) as u32 });
                         i = k + 1;
                         continue;
                     }
@@ -94,7 +96,7 @@ fn scan_regs(s: &str) -> Vec<Reg> {
                     val = val * 10 + (b[j] - b'0') as u64;
                     j += 1;
                 }
-                out.push(Reg { scalar: c == 's', base: val as u32, width: 1 });
+                out.push(Reg { scalar: c == 's', agpr: c == 'a', base: val as u32, width: 1 });
                 i = j;
                 continue;
             }
@@ -326,7 +328,7 @@ const VGPR_KEYS: u32 = 512;
 const SGPR_KEYS: u32 = 128;
 
 fn universe() -> HashSet<u32> {
-    (0..VGPR_KEYS + SGPR_KEYS).collect()
+    (0..VGPR_KEYS + SGPR_KEYS).chain(1024..1280).collect()
 }
 
 /// Run every check on one kernel's assembly text and return human-readable violations.
@@ -344,8 +346,14 @@ fn audit_asm(kernel: &str, asm: &str) -> Vec<String> {
             return vec![format!("{kernel}: .amdhsa_next_free_sgpr missing")];
         }
     };
-    if decl_v == 0 || decl_v > 256 {
+    // unified register file: .amdhsa_accum_offset = arch VGPRs, .agpr_count = AGPRs (metadata), next_free_vgpr covers both (<= 512)
+    let accum = declared(asm, ".amdhsa_accum_offset").unwrap_or(decl_v);
+    let agprs = asm.lines().find_map(|l| l.trim().strip_prefix(".agpr_count:").and_then(|r| r.trim().parse::<u32>().ok())).unwrap_or(0);
+    if decl_v == 0 || decl_v > if agprs > 0 { 512 } else { 256 } {
         bad.push(format!("{kernel}: implausible next_free_vgpr {decl_v}"));
+    }
+    if agprs > 0 && (accum % 4 != 0 || accum > 256 || accum + agprs > decl_v) {
+        bad.push(format!("{kernel}: AGPR accounting inconsistent: accum_offset {accum}, agpr_count {agprs}, next_free_vgpr {decl_v}"));
     }
     if decl_s == 0 || decl_s > 128 {
         bad.push(format!("{kernel}: implausible next_free_sgpr {decl_s}"));
@@ -365,14 +373,14 @@ fn audit_asm(kernel: &str, asm: &str) -> Vec<String> {
         for (m, ops) in &b.insts {
             for (i, o) in ops.iter().enumerate() {
                 for r in scan_regs(o) {
-                    let (decl, class) = if r.scalar { (decl_s, "s") } else { (decl_v, "v") };
+                    let (decl, class) = if r.scalar { (decl_s, "s") } else if r.agpr { (agprs, "a") } else if agprs > 0 { (accum, "v") } else { (decl_v, "v") };
                     if r.base + r.width > decl {
                         bad.push(format!(
                             "{kernel}: {m} operand {} uses {class}[{}:{}] but next_free_{} = {decl}",
                             i + 1,
                             r.base,
                             r.base + r.width - 1,
-                            if r.scalar { "sgpr" } else { "vgpr" },
+                            if r.scalar { "sgpr" } else if r.agpr { "agpr_count" } else { "vgpr" },
                         ));
                     }
                     if m.starts_with("v_mfma") && r.width > 1 && !r.scalar {
