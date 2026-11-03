@@ -330,9 +330,9 @@ impl Body {
         if let Some(p) = &self.panel {
             // scale panel (loaded once): A rows [kb][256], B bytes [wn][KB] (+ the alignment delta of the B source)
             let pr = p.sh.at(&SlotIdx::new(0, 0));
-            let sab = b.bind_i32((kb.clone() << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
+            let sab = b.bind_i32(((kb.clone() & (PANEL_KB as i32 - 1)) << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
             let bo = b.bind_i32(ev(p.b_off) + kb);
-            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (p.sh.base as i32 + p.b_base as i32));
+            let sbb = b.bind_i32(((ev(bo).lshr(2) << 2) & 508) + (p.sh.base as i32 + p.b_base as i32));
             let (wa, wb) = pr.read(b, |b| {
                 let wa: Vec<ValueId> = (0..nm).map(|i| {
                     let a = b.bind_i32(ev(sab) + 16 * i as i32);
@@ -361,12 +361,13 @@ impl Body {
     /// With the transposed panel the A words are NOT shifted (2 words, the MMA selects byte i % 4 of word i / 4: `sa_sel`).
     fn load_scales(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId) {
         if let Some((base, b_base, b_off, lo, pr)) = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0))))) {
-            let sab = b.bind_i32((kb.clone() << 8) + (base as i32) + ev(lo));
+            let sab = b.bind_i32(((kb.clone() & (PANEL_KB as i32 - 1)) << 8) + (base as i32) + ev(lo));
             let bo = b.bind_i32(ev(b_off) + kb);
-            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (base + b_base) as i32);
+            let sbb = b.bind_i32(((ev(bo).lshr(2) << 2) & 508) + (base + b_base) as i32);
             let (wa, wb) = pr.read(b, |b| {
-                let a1 = b.bind_i32(ev(sab) + 4);
-                let wa = vec![b.load_lds_b32(sab), b.load_lds_b32(a1)];
+                // the 8 A-scale bytes of this lane: one ds_read_b64
+                let w2 = b.load_lds_b64(sab);
+                let wa = vec![b.frag2_lane(w2, 0), b.frag2_lane(w2, 1)];
                 (wa, b.load_lds_b32(sbb))
             });
             let sb = b.bind_i32(ev(wb).lshr((ev(bo) & 3) << 3));
@@ -637,12 +638,13 @@ impl PipeBody for Body {
         let (wa, wb, sbsh) = if let Some((base, b_base, b_off, lo, ref pr)) = tr {
             // transposed panel: 2 dwords hold the 8 A-scale bytes of this lane; the B byte as before
             // K group < KT <= PANEL_KB (contract): the masks are no-ops that bound the panel offsets for the verifier
-            let sab = b.bind_i32((kbx.clone() << 8) + (base as i32) + ev(lo));
+            let sab = b.bind_i32(((kbx.clone() & (PANEL_KB as i32 - 1)) << 8) + (base as i32) + ev(lo));
             let bo = b.bind_i32(ev(b_off) + kbx.clone());
-            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (base + b_base) as i32);
+            let sbb = b.bind_i32(((ev(bo).lshr(2) << 2) & 508) + (base + b_base) as i32);
             let (wa, wb) = pr.read(b, |b| {
-                let a1 = b.bind_i32(ev(sab) + 4);
-                let wa = vec![b.load_lds_b32(sab), b.load_lds_b32(a1)];
+                // the 8 A-scale bytes of this lane: one ds_read_b64
+                let w2 = b.load_lds_b64(sab);
+                let wa = vec![b.frag2_lane(w2, 0), b.frag2_lane(w2, 1)];
                 (wa, b.load_lds_b32(sbb))
             });
             (wa, wb, (ev(bo) & 3) << 3)
@@ -1020,7 +1022,7 @@ fn lds_epilogue(
     let base = b.bind_i32(me.base());
     // staging layout over the C block element index m + 16 n of one 16 x 16 block: (m, n) -> m EPI_PITCH + 2 n
     let e_blk = make_layout(tup![16, 16], tup![EPI_PITCH, 2]);
-    let w_plan = IssuePlan::new(mma.c_tv(), 2); // 2 bf16 = one ds_write_b32
+    let w_plan = IssuePlan::new(mma.c_tv(), 4); // 4 bf16 = one ds_write_b64
     let mut exprs = Vec::new();
     for i in 0..nm as i64 {
         for j in 0..nn as i64 {
@@ -1035,12 +1037,13 @@ fn lds_epilogue(
                 let l = b.frag4_lane(Opnd::Var(*a), r);
                 b.bitcast_f32(l)
             }).collect();
-            for h in 0..2usize {
-                let w = b.cvt_pk_bf16_f32(v[2 * h], v[2 * h + 1]);
-                let (bi, imm) = wp.issues[2 * n + h];
-                let ad = b.bind_i32(ev(wbases[bi]) + imm as i32);
-                b.store_lds_b32(ad, w);
-            }
+            // 4 bf16 = one ds_write_b64
+            let w0 = b.cvt_pk_bf16_f32(v[0], v[1]);
+            let w1 = b.cvt_pk_bf16_f32(v[2], v[3]);
+            let f2 = b.frag2(w0, w1);
+            let (bi, imm) = wp.issues[n];
+            let ad = b.bind_i32(ev(wbases[bi]) + imm as i32);
+            b.store_lds_b64(ad, f2);
         }
     });
     b.wait_lds(0);
