@@ -493,7 +493,7 @@ pub fn gemm_mxfp8_bs_v1() -> Function {
     let _ = roles;
     let mut pipe = Pipeline::new(Cadence::OneWindow, nkv, k_v, 128, crate::Ext::ka(84));
     // one stage = A 8 + B 4 + 2 scale DMAs per wave: keep tile t+2 in flight across the next window
-    pipe.vm_inflight = (issues_a + issues_b + 2) as u32;
+    pipe.vm_inflight = (issues_a + issues_b + 2) as u8;
     let zero16 = b.frag_zero(DType::Frag16);
     let a_dma = a_dma.into_iter().map(|(g, l)| (g, l)).collect::<Vec<_>>();
     let mut body = GemmV1 {

@@ -93,7 +93,7 @@ pub struct Pipeline {
     /// `OneWindow`: vector-memory operations allowed in flight at the end of a window (`s_waitcnt vmcnt(n)` instead of 0): the number of VMEM ops ONE
     /// stage issues per wave, so that the wait completes tile t+1 (published by the barrier) while tile t+2, issued at this window's start, keeps
     /// loading across the next window. Only valid when the body issues no other VMEM in the window and does not use `stage_complete`.
-    pub vm_inflight: u32,
+    pub vm_inflight: u8,
 }
 
 impl Pipeline {
