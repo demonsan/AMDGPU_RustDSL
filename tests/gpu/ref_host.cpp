@@ -279,11 +279,15 @@ int main(int argc, char** argv) {
     auto gen_name = [](const char* n, const char* suffix) { return n && std::string(n).find(suffix) != std::string::npos; };
     auto mk_vs = [&](void* outp, int stride_rows) {
         GenVs::Args a{};
-        std::memcpy(&a, args, sizeof(a));
-        a.ptr_o = outp;
-        // 0x080 is the Q tile stride used by the hand ABI but not a declared Tensor scalar;
-        // preserve it in the generated struct's padding (the kernel metadata still contains it).
-        *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(&a) + 0x080) = (uint32_t)((size_t)stride_rows * H * D);
+        a.ptr_o = outp; a.ptr_q = dq; a.ptr_k = dk; a.ptr_v = dv;
+        a.s_seq_len = (uint32_t)S; a.s_Seqs = (uint32_t)(H * D); a.s_Hs = (uint32_t)D; a.s_Bs = (uint32_t)((size_t)S * H * D);
+        a.s_gqa = (uint32_t)GQA; a.s_k_Seqs = (uint32_t)(HK * D); a.s_k_Hs = (uint32_t)D; a.s_k_Bs = (uint32_t)((size_t)SK * HK * D);
+        a.s_kv_seq_len = (uint32_t)SK; a.s_q_head_num = (uint32_t)H;
+        a.s_v_Seqs = (uint32_t)(HK * D); a.s_v_Hs = (uint32_t)D; a.s_v_Bs = (uint32_t)((size_t)SK * HK * D);
+        a.s_o_Seqs = (uint32_t)(H * D * 2); a.s_o_Hs = (uint32_t)(D * 2); a.s_o_Bs = (uint32_t)((size_t)S * H * D * 2);
+        a.ptr_q_descale = dqs; a.ptr_k_descale = dks; a.ptr_v_descale = dvs;
+        a.s_descale_q_Bs = (uint32_t)((size_t)qrows * H * 4); a.s_descale_q_Hs = 4;
+        a.s_descale_k_Bs = (uint32_t)((size_t)krows * HK * 4); a.s_descale_k_Hs = 4;
         GenVs::BufferSizes sz{};
         sz.ptr_q = nq; sz.ptr_k = nk; sz.ptr_v = nk; sz.ptr_o = no * 2;
         sz.ptr_q_descale = qs.size(); sz.ptr_k_descale = ks.size(); sz.ptr_v_descale = 4096;
@@ -296,9 +300,15 @@ int main(int argc, char** argv) {
     };
     auto mk_t = [&](void* outp, int stride_rows) {
         GenT::Args a{};
-        std::memcpy(&a, args, sizeof(a));
-        a.ptr_o = outp;
-        *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(&a) + 0x080) = (uint32_t)((size_t)stride_rows * H * D);
+        a.ptr_o = outp; a.ptr_q = dq; a.ptr_k = dk; a.ptr_v = dv;
+        a.s_seq_len = (uint32_t)S; a.s_Seqs = (uint32_t)(H * D); a.s_Hs = (uint32_t)D; a.s_Bs = (uint32_t)((size_t)S * H * D);
+        a.s_gqa = (uint32_t)GQA; a.s_k_Seqs = (uint32_t)(HK * D); a.s_k_Hs = (uint32_t)D; a.s_k_Bs = (uint32_t)((size_t)SK * HK * D);
+        a.s_kv_seq_len = (uint32_t)SK; a.s_q_head_num = (uint32_t)H;
+        a.s_v_Seqs = (uint32_t)(HK * D); a.s_v_Hs = (uint32_t)D; a.s_v_Bs = (uint32_t)((size_t)SK * HK * D);
+        a.s_o_Seqs = (uint32_t)(H * D * 2); a.s_o_Hs = (uint32_t)(D * 2); a.s_o_Bs = (uint32_t)((size_t)S * H * D * 2);
+        a.ptr_q_descale = dqs; a.ptr_k_descale = dks; a.ptr_v_descale = dvs;
+        a.s_descale_q_Bs = (uint32_t)((size_t)qrows * H * 4); a.s_descale_q_Hs = 4;
+        a.s_descale_k_Bs = (uint32_t)((size_t)krows * HK * 4); a.s_descale_k_Hs = 4;
         GenT::BufferSizes sz{};
         sz.ptr_q = nq; sz.ptr_k = nk; sz.ptr_v = nk; sz.ptr_o = no * 2;
         sz.ptr_q_descale = qs.size(); sz.ptr_k_descale = ks.size(); sz.ptr_v_descale = 4096;
@@ -313,14 +323,12 @@ int main(int argc, char** argv) {
         if (!gen_abi) return false;
         if (gen_name(kname, "v3_vs128")) {
             auto a = mk_vs(outp, rows);
-            std::memcpy(args, &a, sizeof(a));
-            CK(GenVs::launch(f, *reinterpret_cast<const GenVs::Args*>(args), dim3(gx, gy, gz), dim3(block, 1, 1)));
+            CK(GenVs::launch(f, a, dim3(gx, gy, gz), dim3(block, 1, 1)));
             return true;
         }
         if (gen_name(kname, "v3_t128")) {
             auto a = mk_t(outp, rows);
-            std::memcpy(args, &a, sizeof(a));
-            CK(GenT::launch(f, *reinterpret_cast<const GenT::Args*>(args), dim3(gx, gy, gz), dim3(block, 1, 1)));
+            CK(GenT::launch(f, a, dim3(gx, gy, gz), dim3(block, 1, 1)));
             return true;
         }
         return false;
@@ -441,7 +449,18 @@ int main(int argc, char** argv) {
             if (const char* cg = std::getenv("REF_COMBINE_GRID")) cgrid = std::atol(cg);
             if (cgrid < 1) cgrid = 1;
             auto mk_split = [&] {
-                GenSplit::Args a{}; std::memcpy(&a, args, sizeof(a));
+                GenSplit::Args a{};
+                a.ptr_o = dout2; a.ptr_q = dq; a.ptr_k = dk; a.ptr_v = dv;
+                a.s_seq_len = (uint32_t)S; a.s_Seqs = (uint32_t)(H * D); a.s_Hs = (uint32_t)D; a.s_Bs = (uint32_t)((size_t)S * H * D);
+                a.s_gqa = (uint32_t)GQA; a.s_k_Seqs = (uint32_t)(HK * D); a.s_k_Hs = (uint32_t)D; a.s_k_Bs = (uint32_t)((size_t)SK * HK * D);
+                a.s_kv_seq_len = (uint32_t)SK; a.s_q_head_num = (uint32_t)H;
+                a.s_v_Seqs = (uint32_t)(HK * D); a.s_v_Hs = (uint32_t)D; a.s_v_Bs = (uint32_t)((size_t)SK * HK * D);
+                a.s_o_Seqs = (uint32_t)(H * D * 2); a.s_o_Hs = (uint32_t)(D * 2); a.s_o_Bs = (uint32_t)((size_t)S * H * D * 2);
+                a.ptr_q_descale = dqs; a.ptr_k_descale = dks; a.ptr_v_descale = dvs;
+                a.s_descale_q_Bs = (uint32_t)((size_t)qrows * H * 4); a.s_descale_q_Hs = 4;
+                a.s_descale_k_Bs = (uint32_t)((size_t)krows * HK * 4); a.s_descale_k_Hs = 4;
+                a.ptr_ohat = ohat; a.ptr_lse = lse;
+                a.kvs_splits = (uint32_t)splits; a.kvs_rows_total = (uint32_t)rows_total;
                 GenSplit::BufferSizes sz{};
                 sz.ptr_q = nq; sz.ptr_k = nk; sz.ptr_v = nk; sz.ptr_o = no * 2;
                 sz.ptr_q_descale = qs.size(); sz.ptr_k_descale = ks.size(); sz.ptr_v_descale = 4096;
@@ -454,7 +473,9 @@ int main(int argc, char** argv) {
                 return a;
             };
             auto mk_comb = [&] {
-                GenComb::Args a{}; std::memcpy(&a, cargs, sizeof(a));
+                GenComb::Args a{};
+                a.ptr_ohat = ohat; a.ptr_lse = lse; a.ptr_out = dout2;
+                a.rows_total = (uint32_t)rows_total; a.d = (uint32_t)D; a.splits = (uint32_t)splits;
                 GenComb::BufferSizes sz{};
                 sz.ptr_ohat = (uint64_t)ohat_alloc_bytes; sz.ptr_lse = (uint64_t)lse_bytes; sz.ptr_out = no * 2;
                 std::string err;
@@ -467,8 +488,7 @@ int main(int argc, char** argv) {
                 asz = 720; set_split_args(ohat, lse); set_launch(dout2, s_rows_pb);
                 if (gen_abi && gen_name(kname_split, "v3_kvsplit")) {
                     auto a = mk_split();
-                    std::memcpy(args, &a, sizeof(a));
-                    CK(GenSplit::launch(fn2, *reinterpret_cast<const GenSplit::Args*>(args), dim3(gox, gy, goz), dim3(ours_block, 1, 1)));
+                    CK(GenSplit::launch(fn2, a, dim3(gox, gy, goz), dim3(ours_block, 1, 1)));
                 } else {
                     CK(hipModuleLaunchKernel(fn2, gox, gy, goz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
                 }
@@ -477,8 +497,7 @@ int main(int argc, char** argv) {
                 if (fused) return;
                 if (gen_abi && gen_name(kname_comb, "v3_kvsplit_combine8h")) {
                     auto a = mk_comb();
-                    std::memcpy(cargs, &a, sizeof(a));
-                    CK(GenComb::launch(fnc, *reinterpret_cast<const GenComb::Args*>(cargs), dim3((unsigned)cgrid, 1, 1), dim3(cthreads, 1, 1)));
+                    CK(GenComb::launch(fnc, a, dim3((unsigned)cgrid, 1, 1), dim3(cthreads, 1, 1)));
                 } else {
                     CK(hipModuleLaunchKernel(fnc, (unsigned)cgrid, 1, 1, cthreads, 1, 1, 0, nullptr, nullptr, cextra));
                 }
