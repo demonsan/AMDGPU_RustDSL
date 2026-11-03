@@ -49,5 +49,5 @@ fn scaled_mfma_16x16x128_lowers_verifies_and_emits_op_sel() {
     assert!(line.contains("op_sel:[1,0,0] op_sel_hi:[0,1,0]"), "scale byte selects A=1, B=2: {line}");
     let plain = amdgpu_compiler::compile(&mfma16_demo(0, 0)).expect("compile").asm;
     assert!(!plain.contains("op_sel"), "byte 0 / 0 is the default encoding");
-    std::fs::write(std::env::temp_dir().join("mfma16.s"), &c.asm).ok();
+    std::fs::write(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("mfma16.s"), &c.asm).ok();
 }
