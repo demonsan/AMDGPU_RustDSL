@@ -892,6 +892,55 @@ impl Lowerer {
         Ok(())
     }
 
+    /// `dst = cond ? a : b` for a 64-bit pointer (S2) or a 128-bit buffer descriptor (S4) held in SGPRs: `s_cmp_lt_i32` + `s_cselect_b64` (x2 for the
+    /// descriptor) - no branch, no VGPR round trip. `cond` must be a (possibly negated) signed compare of wave-uniform integers.
+    fn scalar_select_wide(&mut self, dst: ValueId, ty: DType, cond: Opnd, a: Opnd, b: Opnd) -> Result<(), String> {
+        let mut neg = false;
+        let mut c = cond;
+        let (x, y) = loop {
+            let Opnd::Val(v) = c else { return Err("uniform select: the condition is not a value".into()) };
+            match self.defs.get(&v).cloned() {
+                Some(Op::NotI1(n)) => {
+                    neg = !neg;
+                    c = n;
+                }
+                Some(Op::CmpLtI32(x, y)) => break (x, y),
+                Some(Op::CmpGeI32(x, y)) => {
+                    neg = !neg;
+                    break (x, y);
+                }
+                other => return Err(format!("uniform select: condition {other:?} is not a signed compare of wave-uniform integers")),
+            }
+        };
+        let (t, f) = if neg { (b, a) } else { (a, b) };
+        let cls = if ty == DType::Rsrc { RClass::S4 } else { RClass::S2 };
+        let mut arm = |o: Opnd| -> Result<VReg, String> {
+            let r = match o {
+                Opnd::Val(v) => *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?,
+                _ => return Err("uniform select: an arm is not a value".into()),
+            };
+            if self.mir.vreg_class(r) != cls {
+                return Err(format!("uniform select of {}: arm {o:?} is in {:?}, not an SGPR {:?} (only wave-uniform pointers / descriptors)", ty.name(), self.mir.vreg_class(r), cls));
+            }
+            Ok(r)
+        };
+        let (rt, rf) = (arm(t)?, arm(f)?);
+        let (mut sx, sy) = (self.s_operand(x)?, self.s_operand(y)?);
+        if let (Src::Imm(k), Src::Imm(_)) = (sx, sy) {
+            let r = self.new_vreg(RClass::S1);
+            self.push(MInst::new(MOp::SMovB32).def(r).imm(k));
+            sx = Src::Reg(r);
+        }
+        let regs: Vec<Src> = [sx, sy, Src::Reg(rt), Src::Reg(rf)].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+        self.touch(&regs);
+        self.push(MInst::new(MOp::SCmpLtI32).src(sx).src(sy));
+        let d = self.new_vreg(cls);
+        let op = if cls == RClass::S4 { MOp::SCselectB128 } else { MOp::SCselectB64 };
+        self.push(MInst::new(op).def(d).srcreg(rt).srcreg(rf));
+        self.val.insert(dst, d);
+        Ok(())
+    }
+
     /// `dst = a <op> b` in SALU (both operands uniform).
     fn scalar_bin(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
         let (mut sa, mut sb) = (self.s_operand(a)?, self.s_operand(b)?);
@@ -1953,6 +2002,7 @@ impl Lowerer {
             Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
             Op::MinI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SMinI32, *a, *b)?,
             Op::Select { ty: DType::I32, cond, a, b } if self.uniform.contains(&dst) => self.scalar_select(dst, *cond, *a, *b)?,
+            Op::Select { ty: ty @ (DType::Ptr | DType::Rsrc), cond, a, b } => self.scalar_select_wide(dst, *ty, *cond, *a, *b)?,
             Op::ReadFirstLane(Opnd::Val(a)) if self.uniform.contains(a) && self.val.get(a).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S1) => {
                 // already wave-uniform in an SGPR: no v_mov + v_readfirstlane round trip
                 let r = self.val[a];

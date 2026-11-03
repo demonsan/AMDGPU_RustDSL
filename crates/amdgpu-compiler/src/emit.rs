@@ -733,6 +733,11 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SAndB32 => vec![format!("s_and_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SXorB32 => vec![format!("s_xor_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SMinI32 => vec![format!("s_min_i32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
+        MOp::SCselectB64 | MOp::SCselectB128 => {
+            let (d, x, y) = (a.phys[inst.dst.expect("dst") as usize], a.phys[reg_of(&inst.srcs[0]) as usize], a.phys[reg_of(&inst.srcs[1]) as usize]);
+            let halves = if inst.op == MOp::SCselectB128 { 2 } else { 1 };
+            (0..halves).map(|h| format!("s_cselect_b64 s[{}:{}], s[{}:{}], s[{}:{}]", d + 2 * h, d + 2 * h + 1, x + 2 * h, x + 2 * h + 1, y + 2 * h, y + 2 * h + 1)).collect()
+        }
         MOp::SCselectB32 => vec![format!("s_cselect_b32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::SCmpLtI32 => vec![format!(
             "s_cmp_lt_i32 {}, {}",

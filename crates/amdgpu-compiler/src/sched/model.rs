@@ -125,6 +125,6 @@ pub fn cost(op: MOp) -> OpCost {
         BufferLoadDwordX4Lds | BufferLoadDwordX1Lds => c(Vmem, 14, 240, Unknown),
         SBufferRsrc | SBufferRsrcDyn => c(Salu, 4, 4, Unknown),
         SLoadDword | SLoadDwordx2 => c(Smem, 4, 200, Unknown),
-        SReadPhys | SMovB32 | SAddU32 | SAddcU32 | SMulI32 | SShlB32 | SLshrB32 | SAndB32 | SXorB32 | SCmpLtI32 | SMinI32 | SCselectB32 => c(Salu, 4, 4, Verified),
+        SReadPhys | SMovB32 | SAddU32 | SAddcU32 | SMulI32 | SShlB32 | SLshrB32 | SAndB32 | SXorB32 | SCmpLtI32 | SMinI32 | SCselectB32 | SCselectB64 | SCselectB128 => c(Salu, 4, 4, Verified),
         SBarrier | SSetPrio | SNop | SWaitVm | SWaitLgkm | SEndpgm | SchedGroup => c(Ctrl, 4, 4, Verified),    }
 }
