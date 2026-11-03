@@ -1,0 +1,14 @@
+{
+  "kernel": "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h",
+  "kernarg_size": 36,
+  "workgroup_size": 256,
+  "lds_bytes": 0,
+  "compile_profile": "Combine",
+  "args": [{"name":"ptr_ohat","offset":0,"size":8,"type":"Ptr"},{"name":"ptr_lse","offset":8,"size":8,"type":"Ptr"},{"name":"ptr_out","offset":16,"size":8,"type":"Ptr"},{"name":"rows_total","offset":24,"size":4,"type":"I32"},{"name":"d","offset":28,"size":4,"type":"I32"},{"name":"splits","offset":32,"size":4,"type":"I32"}],
+  "extents": [{"arg":"ptr_ohat","alloc":"((ka(0x20)*ka(0x18))*512)","logical":null},{"arg":"ptr_lse","alloc":"((ka(0x20)*ka(0x18))*4)","logical":null},{"arg":"ptr_out","alloc":"(ka(0x18)*256)","logical":null}],
+  "ka_is": [],
+  "ka_range": [{"offset":24,"lo":1,"hi":9223372036854775807},{"offset":28,"lo":128,"hi":128},{"offset":32,"lo":1,"hi":9223372036854775807}],
+  "ka_one_of": [],
+  "grid_is": [],
+  "symbols": []
+}

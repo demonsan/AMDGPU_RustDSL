@@ -87,6 +87,7 @@ fn collect_syms(f: &Function) -> std::collections::BTreeSet<String> {
     for e in &c.extents { collect_syms_into(&e.alloc, &mut out); if let Some(l) = &e.logical { collect_syms_into(l, &mut out); } }
     for (_, e) in &c.grid_defs { collect_syms_into(e, &mut out); }
     for (_, e) in &c.ka_defs { collect_syms_into(e, &mut out); }
+    for (n, _, _) in &c.sym_ranges { out.insert(c_ident(n)); }
     out
 }
 
