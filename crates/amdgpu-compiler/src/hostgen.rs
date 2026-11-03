@@ -128,19 +128,22 @@ pub fn generate(f: &Function) -> Result<Generated, String> {
             fields.push_str(&format!("    uint8_t _pad{pads}[{n}];\n"));
             pads += 1;
         }
-        let ty = ty_name(a.ty);
         let field = &names[i];
-        if matches!(a.ty, DType::Ptr | DType::I32 | DType::U32 | DType::F32 | DType::F16 | DType::I1) && a.size as usize == std::mem::size_of::<usize>().max(4) || true {
-            // all scalar types are emitted as their C type; arrays fall back to a byte array
-        }
-        match a.ty {
-            DType::Ptr => fields.push_str(&format!("    {ty} {field};\n")),
-            DType::I32 | DType::U32 | DType::I1 => fields.push_str(&format!("    {ty} {field};\n")),
-            DType::F32 => fields.push_str(&format!("    {ty} {field};\n")),
-            DType::F16 => fields.push_str(&format!("    uint16_t {field};\n")),
-            _ => fields.push_str(&format!("    uint8_t {field}[{}];\n", a.size.max(1))),
+        let typed = match a.ty {
+            DType::Ptr if a.size == 8 => Some("void*".to_string()),
+            DType::I32 | DType::U32 | DType::I1 if a.size == 4 => Some("uint32_t".to_string()),
+            DType::F32 if a.size == 4 => Some("float".to_string()),
+            DType::F16 if a.size == 2 => Some("uint16_t".to_string()),
+            _ => None,
+        };
+        match typed {
+            Some(ty) => fields.push_str(&format!("    {ty} {field};\n")),
+            None => fields.push_str(&format!("    uint8_t {field}[{}];\n", a.size.max(1))),
         }
         asserts.push_str(&format!("static_assert(offsetof(Args, {field}) == 0x{:X}, \"{field} offset\");\n", a.kernarg_offset));
+        if typed.is_some() {
+            asserts.push_str(&format!("static_assert(sizeof(Args::{field}) == {}, \"{field} size\");\n", a.size));
+        }
         off = a.kernarg_offset + sz;
     }
     // trailing padding is emitted by the header template below
@@ -149,7 +152,7 @@ pub fn generate(f: &Function) -> Result<Generated, String> {
     let mut ka_arms = String::new();
     for a in &args {
         if matches!(a.ty, DType::Ptr) { continue; }
-        if a.size >= 4 {
+        if a.size == 4 {
             let n = c_ident(&a.name);
             ka_arms.push_str(&format!("        case 0x{:X}u: return (int64_t)a.{n};\n", a.kernarg_offset));
         }
