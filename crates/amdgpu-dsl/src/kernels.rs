@@ -22859,7 +22859,10 @@ pub fn probe_dma_voff_spill() -> Function {
     let mul = b.c_i32(0x01010101);
     let add = b.c_i32(0x04030201);
     let o16 = b.mul_i32(tid, c16);
-    let w = b.let_(Op::AndI32(Opnd::Val(b.add_i32(b.mul_i32(tid, mul), add)), Opnd::Val(b.c_i32(0x3f3f3f3f))));
+    let t1 = b.mul_i32(tid, mul);
+    let t2 = b.add_i32(t1, add);
+    let mask = b.c_i32(0x3f3f3f3f);
+    let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
     let data = b.frag4(w, w, w, w);
     // stage the input in the upper part of the output buffer: in[tid*16 ..] = pattern(tid)
     let base = b.ptr_add(o, c65536);
@@ -22867,7 +22870,8 @@ pub fn probe_dma_voff_spill() -> Function {
     b.store_f32x4(pin, 0, data);
     b.wait_vm(0);
     let rin = b.buffer_rsrc(base);
-    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(b.c_i32(6))));
+    let c6 = b.c_i32(6);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
     let ldsb = b.mul_i32(wave, c1024);
     let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
     let lane16 = b.mul_i32(lane, c16);
