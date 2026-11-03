@@ -108,7 +108,8 @@ int main() {
     int rc = 0;
     for (const char* which : {"REF", "OURS"}) {
         // per-kernel CTA tile (REF_TILE / OURS_TILE, default TILE_M x TILE_N): grid (N / tile, M / tile)
-        const int tm = envi((std::string(which) + "_TILE").c_str(), TM), tn = envi((std::string(which) + "_TILE").c_str(), TN);
+        const int tsq = envi((std::string(which) + "_TILE").c_str(), 0);
+        const int tm = envi((std::string(which) + "_TILE_M").c_str(), tsq ? tsq : TM), tn = envi((std::string(which) + "_TILE_N").c_str(), tsq ? tsq : TN);
         const int tiles = (M / tm) * (N / tn);
         dim3 grid = grid_mode == "xcd" ? dim3((tiles + 7) / 8 * 8) : grid_mode == "linear" ? dim3(tiles) : dim3(N / tn, M / tm);
         const char* co = std::getenv((std::string(which) + "_CO").c_str());

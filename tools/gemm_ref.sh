@@ -23,7 +23,7 @@ if [ -n "${OURS_KERNEL:-}" ]; then
     [ -f "build/$OURS_KERNEL.s" ] || exit 1
     "${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
         -o "build/$OURS_KERNEL.co" "build/$OURS_KERNEL.s" || exit 1
-    OURS_ENV=(OURS_CO="build/$OURS_KERNEL.co" OURS_KNAME="$OURS_KERNEL" OURS_TILE="${OURS_TILE:-128}")
+    OURS_ENV=(OURS_CO="build/$OURS_KERNEL.co" OURS_KNAME="$OURS_KERNEL" OURS_TILE_M="${OURS_TILE_M:-128}" OURS_TILE_N="${OURS_TILE_N:-128}")
 fi
 [ -n "${SKIP_REF:-}" ] && IMG=""
 env REF_CO="$IMG" REF_KNAME="$SYM" "${OURS_ENV[@]}" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-6}" ./build/gemm_ref_host

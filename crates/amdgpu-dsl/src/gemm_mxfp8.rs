@@ -8,7 +8,7 @@
 //! The MFMA runs "swapped" (hardware A = the B fragment, hardware B = the A fragment, scales swapped), so a lane holds 4 consecutive N of one row M
 //! of C (one 8-byte bf16 store per 4 values), exactly like the vendor kernel.
 
-use amdgpu_layout::{layout_to_offsets, make_layout, tup, Dyns, ImmRange, IssuePlan, Ix, Layout, Swizzle};
+use amdgpu_layout::{composition, layout_to_offsets, make_layout, right_inverse, tup, Dyns, ImmRange, IssuePlan, Ix, Layout, Swizzle};
 
 use crate::{DType, FnBuilder, Function, Op, Opnd, ValueId, I32};
 
@@ -233,4 +233,264 @@ pub fn gemm_mxfp8_bs_v0() -> Function {
 /// Byte address of the dword containing byte `x` (scale tensors are read a dword at a time; the MFMA uses scale byte 0 after the shift).
 fn byte_dword(x: &I32) -> I32 {
     x.clone() & -4
+}
+
+// ======================================================================================================================================================
+// v1: LDS-staged, 3-slot ring (tile::Pipeline OneWindow), CTA 256 (M) x 128 (N), 4 waves 2x2 of 128x64, still VGPR-only (8 accumulators)
+// ======================================================================================================================================================
+
+/// LDS layout of a [rows x 128 bytes] K-tile (rows = M for A, N for B): 16-row x 16-byte interleave, the same pattern as the aiter B preshuffle
+/// ((r, k) -> (r / 16) 2048 + (k / 16) 256 + (r % 16) 16 + k % 16): every ds_read_b128 of an MFMA operand (16 consecutive rows, one 16-byte chunk per
+/// 16 lanes) touches 256 consecutive bytes = all 64 banks once.
+fn smem_tile(rows: i64) -> Layout {
+    make_layout(tup![tup![16, rows / 16], tup![16, 8]], tup![tup![16, 2048], tup![1, 256]])
+}
+
+const CTA_M: i64 = 256;
+const CTA_N: i64 = 128;
+
+struct GemmV1 {
+    // ring buffers
+    a_s: crate::tile::Shared,
+    b_s: crate::tile::Shared,
+    // DMA: per issue (global byte offset expression relative to the tile origin + k, LDS byte offset inside the slot); M0 = slot base + lds offset
+    a_dma: Vec<(I32, i64)>,
+    b_dma: Vec<(I32, i64)>,
+    a_org: ValueId,
+    b_org: ValueId,
+    ptr_a: ValueId,
+    ptr_b: ValueId,
+    // fragment reads: [subtile][h] -> two (base, imm) LDS byte offsets inside a slot
+    a_rd: Vec<Vec<[(ValueId, i64); 2]>>,
+    b_rd: Vec<Vec<[(ValueId, i64); 2]>>,
+    // scales: per m-subtile the sa byte offset of row (kb = 0), the sb byte offset (kb = 0)
+    sa_byte: Vec<ValueId>,
+    sb_byte: ValueId,
+    ptr_sfa: ValueId,
+    ptr_sfb: ValueId,
+    m_v: ValueId,
+    zero16: ValueId,
+    acc: Vec<VarId>,
+    a_wave: ValueId,
+    b_wave: ValueId,
+}
+
+fn load_scale(b: &mut FnBuilder, ptr: ValueId, byte: I32) -> ValueId {
+    let byte = b.bind_i32(byte);
+    let dw = b.bind_i32(crate::tile::ev(byte) & -4);
+    let p = b.ptr_add(ptr, dw);
+    let w = b.load_f32(p, 0);
+    let wi = b.bitcast_i32(w);
+    b.bind_i32(crate::tile::ev(wi).lshr((crate::tile::ev(byte) & 3) << 3))
+}
+
+impl crate::tile::PipeBody for GemmV1 {
+    fn stage(&mut self, b: &mut FnBuilder, _role: crate::tile::Role, key0: &I32, slot: &crate::tile::SlotIdx) {
+        // A: + k bytes; B preshuffled: + (k / 16) 256 = 16 k bytes
+        let ka = b.bind_i32(key0.clone() + crate::tile::ev(self.a_org));
+        let kb = b.bind_i32((key0.clone() << 4) + crate::tile::ev(self.b_org));
+        for (sh, dma, org, ptr, wave) in [(&self.a_s, &self.a_dma, ka, self.ptr_a, self.a_wave), (&self.b_s, &self.b_dma, kb, self.ptr_b, self.b_wave)] {
+            let r = sh.at(slot);
+            let sbase = r.off_v(b) + sh.base as i32 + crate::tile::ev(wave);
+            r.write(b, |b| {
+                for (g, lds) in dma {
+                    let off = b.bind_i32(crate::tile::ev(org) + g.clone());
+                    let p = b.ptr_add(ptr, off);
+                    let m0 = b.bind_i32(sbase.clone() + *lds as i32);
+                    b.load_global_lds(p, m0, 0, 4);
+                }
+            });
+        }
+    }
+    fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: crate::tile::Role, _t0: &crate::tile::TileIt) {}
+    fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
+        (0..8).map(|_| (DType::Frag16, Opnd::Val(self.zero16))).collect()
+    }
+    fn bind_state(&mut self, vars: &[VarId]) {
+        self.acc = vars.to_vec();
+    }
+    fn window(&mut self, b: &mut FnBuilder, _role: crate::tile::Role, t: &crate::tile::TileIt) {
+        let kbx = crate::tile::ox(t.it);
+        let sa: Vec<ValueId> = (0..4).map(|i| load_scale(b, self.ptr_sfa, kbx.clone() * crate::tile::ev(self.m_v) + crate::tile::ev(self.sa_byte[i]))).collect();
+        let sb = load_scale(b, self.ptr_sfb, crate::tile::ev(self.sb_byte) + kbx.clone());
+        let ar = self.a_s.at(&t.cur);
+        let br = self.b_s.at(&t.cur);
+        let (aoff, boff) = (ar.off_v(b) + self.a_s.base as i32, br.off_v(b) + self.b_s.base as i32);
+        for h in 0..2usize {
+            let rd = |b: &mut FnBuilder, r: &crate::tile::SlotRef, off: &I32, p: &[(ValueId, i64); 2]| -> ValueId {
+                let a0 = b.bind_i32(off.clone() + crate::tile::ev(p[0].0) + p[0].1 as i32);
+                let a1 = b.bind_i32(off.clone() + crate::tile::ev(p[1].0) + p[1].1 as i32);
+                r.read(b, |b| b.load_lds_b128x2(a0, a1))
+            };
+            let af: Vec<ValueId> = (0..4).map(|i| rd(b, &ar, &aoff, &self.a_rd[i][h])).collect();
+            let bf: Vec<ValueId> = (0..2).map(|j| rd(b, &br, &boff, &self.b_rd[j][h])).collect();
+            for i in 0..4usize {
+                for j in 0..2usize {
+                    // swapped MFMA: hardware A = B fragment (rows n), hardware B = A fragment (rows m); scale_a = sb, scale_b = sa
+                    b.var_mfma_scale(self.acc[2 * i + j], bf[j], af[i], sb, sa[i]);
+                }
+            }
+        }
+    }
+}
+
+/// Evaluates a symbolic offset for concrete symbol values (build-time proofs).
+fn ev_ix(e: &Ix, env: &[i64]) -> i64 {
+    e.eval(&|s| env[s as usize])
+}
+
+pub fn gemm_mxfp8_bs_v1() -> Function {
+    use crate::tile::{ev, Cadence, LdsPlan, Pipeline, Role, Roles};
+    let mut fb = FnBuilder::new("gemm_mxfp8_bs_v1", 256);
+    let b = &mut fb;
+    declare_abi(b);
+    let ptr_a = b.let_(Op::KernargPtr { offset: 0 });
+    let ptr_b = b.let_(Op::KernargPtr { offset: 8 });
+    let ptr_c = b.let_(Op::KernargPtr { offset: 16 });
+    let ptr_sfa = b.let_(Op::KernargPtr { offset: 64 });
+    let ptr_sfb = b.let_(Op::KernargPtr { offset: 72 });
+    let m_v = b.let_(Op::KernargI32 { offset: 24 });
+    let n_v = b.let_(Op::KernargI32 { offset: 28 });
+    let k_v = b.let_(Op::KernargI32 { offset: 32 });
+    let kb_v = b.let_(Op::KernargI32 { offset: 84 });
+    let tid = b.let_(Op::WorkitemId);
+    let lane = crate::tile::Lane::from_tid(b, tid);
+    let bx = b.let_(Op::WorkgroupIdX); // N tile (128)
+    let by = b.let_(Op::WorkgroupIdY); // M tile (256)
+    let wm = b.bind_i32(lane.wave() & 1);
+    let wn = b.bind_i32(lane.wave().lshr(1));
+
+    // ---- the GPU values the layouts are written in ----
+    let mut d = Dyns::new();
+    let s_lane = d.sym("lane", 0, 63); // 0
+    let s_tid = d.sym("tid", 0, 255); // 1
+    let s_k = d.sym_aligned("K", 128, 1 << 20, 128); // 2
+    let s_n = d.sym_aligned("N", 128, 1 << 20, 128); // 3
+    let s_wm = d.sym("wm", 0, 1); // 4
+    let s_wn = d.sym("wn", 0, 1); // 5
+    let vals = [lane.lane, tid, k_v, n_v, wm, wn];
+    let symf = |s: u32| -> I32 { ev(vals[s as usize]) };
+    let proof_env = |lane: i64, tid: i64, wm: i64, wn: i64| [lane, tid, 8192, 4096, wm, wn];
+
+    // ---- tensor layouts over the CTA tile (byte offsets relative to the tile origin, K block 0) ----
+    let a_glob = make_layout(tup![CTA_M, 128], tup![s_k.clone(), 1]); // A row-major
+    let b_glob = make_layout(tup![tup![16, CTA_N / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]); // B preshuffled
+    let a_sm = smem_tile(CTA_M);
+    let b_sm = smem_tile(CTA_N);
+
+    // ---- DMA: LDS byte = 1024 (issues (tid / 64) + q) + 16 (tid % 64) -> global offset = glob o right_inverse(smem) ----
+    let dma = |rows: i64, glob: &Layout, sm: &Layout| -> Vec<(I32, i64)> {
+        let issues = rows * 128 / 1024 / 4;
+        let tv = make_layout(tup![tup![64, 4], tup![16, issues]], tup![tup![16, 1024 * issues], tup![1, 1024]]);
+        let g = composition(glob, &right_inverse(sm));
+        let gofs = IssuePlan::new(tv, 16).offsets(&g, &s_tid, &Ix::C(0), &d);
+        // build-time proof: the source of every LDS byte this thread writes is the element the LDS layout puts there
+        for th in [0i64, 1, 15, 16, 63, 64, 100, 255] {
+            for q in 0..issues {
+                let lds = 1024 * (issues * (th / 64) + q) + 16 * (th % 64);
+                let (r, c) = (0..rows).flat_map(|r| (0..8).map(move |c| (r, 16 * c))).find(|&(r, c)| sm.at(r + rows * c) == lds).expect("LDS byte covered");
+                let want = ev_ix(&glob.crd2idx(&tup![r, c], &d), &proof_env(0, th, 0, 0));
+                assert_eq!(ev_ix(&gofs[q as usize], &proof_env(0, th, 0, 0)), want, "DMA rows {rows} thread {th} issue {q}");
+            }
+        }
+        // M0 part: the wave's 1 KB block (the lane adds 16 lane itself)
+        gofs.iter().enumerate().map(|(q, g)| (lower(g, &symf), 1024 * q as i64)).collect()
+    };
+    let a_dma = dma(CTA_M, &a_glob, &a_sm);
+    let b_dma = dma(CTA_N, &b_glob, &b_sm);
+    let issues_a = CTA_M * 128 / 4096;
+    let issues_b = CTA_N * 128 / 4096;
+    // wave part of M0 (1024 issues wave)
+    let a_wave = b.bind_i32(lane.wave() * (1024 * issues_a) as i32);
+    let b_wave = b.bind_i32(lane.wave() * (1024 * issues_b) as i32);
+    let a_dma: Vec<(I32, i64)> = a_dma.into_iter().map(|(g, l)| (g, l)).collect();
+    let b_dma: Vec<(I32, i64)> = b_dma.into_iter().map(|(g, l)| (g, l)).collect();
+    // CTA origins: A rows by*256 -> by*256 K; B rows bx*128 (16-row groups) -> bx*128 K
+    let a_org = b.bind_i32((ev(by) << 8) * ev(k_v));
+    let b_org = b.bind_i32((ev(bx) << 7) * ev(k_v));
+
+    // ---- fragment reads: smem o MFMA operand TV, origin = (wave rows + 32 subtile, 64 h); bases + ds immediates ----
+    let rd = |sm: &Layout, rows0: Ix, nsub: i64, b: &mut FnBuilder| -> Vec<Vec<[(ValueId, i64); 2]>> {
+        let plan = IssuePlan::new(mfma_op_32x32x64(), 16);
+        let mut exprs = Vec::new();
+        for i in 0..nsub {
+            for h in 0..2i64 {
+                let org = sm.crd2idx(&tup![rows0.add_c(32 * i), 64 * h], &d);
+                let sub = make_layout(tup![tup![16, 2], tup![16, 4]], tup![tup![16, 2048], tup![1, 256]]);
+                exprs.extend(plan.offsets(&sub, &s_lane, &org, &d));
+            }
+        }
+        let op = layout_to_offsets(&exprs, &Swizzle::none(), ImmRange::DS, &d);
+        let bases: Vec<ValueId> = op.bases.iter().map(|e| b.bind_i32(lower(e, &symf))).collect();
+        (0..nsub as usize)
+            .map(|i| (0..2usize).map(|h| { let n = 4 * i + 2 * h; [(bases[op.issues[n].0], op.issues[n].1), (bases[op.issues[n + 1].0], op.issues[n + 1].1)] }).collect())
+            .collect()
+    };
+    let a_rd = rd(&a_sm, s_wm.mul_c(128), 4, b);
+    let b_rd = rd(&b_sm, s_wn.mul_c(64), 2, b);
+    // scales: sa byte (kb = 0) of row m_cta + 128 wm + 32 i + lane % 32; sb byte (kb = 0) of column block bx (CTA_N = 128 = one block)
+    let sa_byte: Vec<ValueId> = (0..4i64).map(|i| {
+        let r = s_wm.mul_c(128).add_c(32 * i).add(&s_lane.mod_c(32, &d));
+        b.bind_i32((ev(by) << 8) + lower(&r, &symf))
+    }).collect();
+    let sb_byte = b.bind_i32(ev(bx) * ev(kb_v));
+
+    // ---- LDS ring (3 slots: A 32 KB + B 16 KB each) and the pipeline ----
+    let mut lds = LdsPlan::new();
+    let a_s = lds.ring("A", CTA_M * 128, 3, crate::tile::Layout::Linear);
+    let b_s = lds.ring("B", CTA_N * 128, 3, crate::tile::Layout::Linear);
+    lds.commit(b);
+    let nkv = kb_v;
+    let roles = Roles::single(&lane, 4);
+    let _ = roles;
+    let pipe = Pipeline::new(Cadence::OneWindow, nkv, k_v, 128, crate::Ext::ka(84));
+    let zero16 = b.frag_zero(DType::Frag16);
+    let a_dma = a_dma.into_iter().map(|(g, l)| (g, l)).collect::<Vec<_>>();
+    let mut body = GemmV1 {
+        a_s, b_s,
+        a_dma: a_dma.into_iter().map(|(g, l)| (g, l)).collect(),
+        b_dma,
+        a_org, b_org, ptr_a, ptr_b, a_rd, b_rd, sa_byte, sb_byte, ptr_sfa, ptr_sfb, m_v, zero16, acc: Vec::new(),
+        a_wave, b_wave,
+    };
+    pipe.run(b, Role::All, &mut body);
+
+    // ---- epilogue: bf16 8-byte stores (swapped C TV layout x C row-major) ----
+    let c_tile = make_layout(tup![32, 32], tup![2, s_n.mul_c(2)]);
+    let c_plan = IssuePlan::new(mfma_c_32x32_swapped(), 4);
+    let c_org = b.bind_i32((((ev(by) << 8) * ev(n_v)) + (ev(bx) << 7)) << 1);
+    let cb = b.ptr_add(ptr_c, c_org);
+    for i in 0..4i64 {
+        for j in 0..2i64 {
+            let org = s_wm.mul_c(128).add_c(32 * i).mul(&s_n).mul_c(2).add(&s_wn.mul_c(64).add_c(32 * j).mul_c(2));
+            let exprs = c_plan.offsets(&c_tile, &s_lane, &org, &d);
+            let plan = layout_to_offsets(&exprs, &Swizzle::none(), ImmRange::GLOBAL, &d);
+            let bases: Vec<ValueId> = plan.bases.iter().map(|e| { let o = b.bind_i32(lower(e, &symf)); b.ptr_add(cb, o) }).collect();
+            let acc = body.acc[(2 * i + j) as usize];
+            for g in 0..4usize {
+                let v: Vec<ValueId> = (0..4).map(|q| { let l = b.frag16_lane(Opnd::Var(acc), (4 * g + q) as u8); b.bitcast_f32(l) }).collect();
+                let w0 = b.cvt_pk_bf16_f32(v[0], v[1]);
+                let w1 = b.cvt_pk_bf16_f32(v[2], v[3]);
+                let f2 = b.frag2(w0, w1);
+                let (bi, imm) = plan.issues[g];
+                b.store_f32x2(bases[bi], imm as u32, f2);
+            }
+        }
+    }
+    let _ = (m_v, s_wn);
+    fb.finish()
+}
+/// The 96-byte ABI (opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950), declared in offset order.
+fn declare_abi(b: &mut FnBuilder) {
+    let ptrs = [("ptr_a", 0u32), ("ptr_b", 8), ("ptr_c", 16), ("ptr_sfa", 64), ("ptr_sfb", 72)];
+    let ints = [("m", 24u32), ("n", 28), ("k", 32), ("batch", 36), ("stride_a", 40), ("stride_b", 44), ("stride_c", 48), ("stride_a_batch", 52), ("stride_b_batch", 56), ("stride_c_batch", 60), ("stride_sfa", 80), ("stride_sfb", 84), ("stride_sfa_batch", 88), ("stride_sfb_batch", 92)];
+    let mut all: Vec<(&str, u32, bool)> = ptrs.iter().map(|&(n, o)| (n, o, true)).chain(ints.iter().map(|&(n, o)| (n, o, false))).collect();
+    all.sort_by_key(|x| x.1);
+    for (name, off, is_ptr) in all {
+        if is_ptr {
+            b.arg(name, DType::Ptr, off, 8)
+        } else {
+            b.arg(name, DType::I32, off, 4)
+        }
+    }
 }
