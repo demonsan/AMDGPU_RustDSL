@@ -13,10 +13,10 @@ build_one() { # kernel, out.co
         -o "$2" "build/$1.s"
 }
 # OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto: _vs128 + _t128, ref_host picks the tiling per shape (see run_ref.sh)
-# The shipped default `fmha_fwd_hd128_mxfp8_auto` runs the tile-library kernels (`fmha_fwd_hd128_mxfp8_dsl_*`); `fmha_fwd_hd128_mxfp8_legacy_auto`
+# The shipped default `fmha_fwd_hd128_mxfp8_auto` runs the layout-layer kernels (`fmha_fwd_hd128_mxfp8_v3_*`; `fmha_fwd_hd128_mxfp8_dsl_auto` = the previous tile-library set); `fmha_fwd_hd128_mxfp8_legacy_auto`
 # runs the previous hand-written set (`fmha_fwd_hd128_mxfp8_{vs128,t128,kvsplit,kvsplit_combine8h}`, kept for A/B); any other prefix is used as is.
-kernel_prefix() { case "$1" in fmha_fwd_hd128_mxfp8) echo fmha_fwd_hd128_mxfp8_dsl ;; fmha_fwd_hd128_mxfp8_legacy) echo fmha_fwd_hd128_mxfp8 ;; *) echo "$1" ;; esac; }
-KNAME="$OUR_KERNEL"; SMALL_ENV=""; SMALL_KNAME="fmha_fwd_hd128_mxfp8_dsl_t128"; SPLIT_ENV=""; COMBINE_ENV=""; SPLIT_N="0"; SPLIT_KNAME=""; COMBINE_KNAME=""
+kernel_prefix() { case "$1" in fmha_fwd_hd128_mxfp8) echo fmha_fwd_hd128_mxfp8_v3 ;; fmha_fwd_hd128_mxfp8_legacy) echo fmha_fwd_hd128_mxfp8 ;; *) echo "$1" ;; esac; }
+KNAME="$OUR_KERNEL"; SMALL_ENV=""; SMALL_KNAME="fmha_fwd_hd128_mxfp8_v3_t128"; SPLIT_ENV=""; COMBINE_ENV=""; SPLIT_N="0"; SPLIT_KNAME=""; COMBINE_KNAME=""
 if [[ "$OUR_KERNEL" == *_auto_split ]]; then
     # KV-split auto path: build _vs128 + _t128 + _kvsplit + _kvsplit_combine; ref_host applies the
     # dispatch guard (docs/gen4-tiling-design.md section 11) and falls back to _t128/_vs128 when rejected.

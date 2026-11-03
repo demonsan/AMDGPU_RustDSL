@@ -28,6 +28,10 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
         out.push_str(&format!("BB{}:\n", b.label));
         for inst in &b.insts {
             for line in inst_lines(a, inst) {
+                // perf experiment only (AMDC_EXP_NO_NOPS=1: results may be wrong): how much do the hazard pads cost?
+                if line.starts_with("s_nop") && std::env::var("AMDC_EXP_NO_NOPS").map_or(false, |v| v == "1") {
+                    continue;
+                }
                 out.push_str("    ");
                 out.push_str(&line);
                 out.push('\n');
@@ -601,7 +605,8 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds => {
             let m0 = sr(a, reg_of(&inst.srcs[3]));
             let mn = if inst.op == MOp::BufferLoadDwordX4Lds { "buffer_load_dwordx4" } else { "buffer_load_dword" };
-            vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), format!("{mn} {}", mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, true))]
+            let load = format!("{mn} {}", mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, true));
+            if inst.skip_m0 { vec![load] } else { vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), load] }
         }
         MOp::SBufferRsrcDyn => {
             let d = a.phys[inst.dst.unwrap() as usize];
@@ -627,25 +632,19 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::GlobalLoadLdsB128S | MOp::GlobalLoadLdsB32S => {
             let m0 = sr(a, reg_of(&inst.srcs[2]));
             let mn = if inst.op == MOp::GlobalLoadLdsB128S { "global_load_lds_dwordx4" } else { "global_load_lds_dword" };
-            vec![
-                format!("s_mov_b32 m0, {m0}"),
-                "s_nop 0".to_string(),
-                format!(
-                    "{mn} {}, {}{}",
-                    vr(a, reg_of(&inst.srcs[1])),
-                    spair(a, reg_of(&inst.srcs[0])),
-                    if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
-                ),
-            ]
+            let load = format!(
+                "{mn} {}, {}{}",
+                vr(a, reg_of(&inst.srcs[1])),
+                spair(a, reg_of(&inst.srcs[0])),
+                if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
+            );
+            if inst.skip_m0 { vec![load] } else { vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), load] }
         }
         MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 => {
             let m0 = sr(a, reg_of(&inst.srcs[1]));
             let mn = if inst.op == MOp::GlobalLoadLdsB128 { "global_load_lds_dwordx4" } else { "global_load_lds_dword" };
-            vec![
-                format!("s_mov_b32 m0, {m0}"),
-                "s_nop 0".to_string(),
-                format!("{mn} {}", mem_op(a, inst.srcs[0], inst.imm)),
-            ]
+            let load = format!("{mn} {}", mem_op(a, inst.srcs[0], inst.imm));
+            if inst.skip_m0 { vec![load] } else { vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), load] }
         }
         MOp::GlobalStoreU16 => vec![format!(
             "global_store_short {}, {}, off{}",

@@ -12,11 +12,15 @@
 #![forbid(unsafe_code)]
 
 pub mod bufdma;
+pub mod contract;
 pub mod copy;
 pub mod dma;
+pub mod fmha;
+pub mod global;
 pub mod mma;
 
-pub use copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_b, LdsPart, LdsSlotPart, TiledCopy};
+pub use copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_b, make_tiled_copy_bcast, LdsPart, LdsPrivPart, LdsSlotPart, TiledCopy};
+pub use global::GlobalPart;
 pub use bufdma::{partition_buffer_dma, BufDmaPart};
 pub use dma::{partition_dma, DmaPart};
 pub use mma::{gemm, make_tiled_mma, TiledMma};
@@ -28,7 +32,11 @@ use amdgpu_layout::{Dyns, Ix};
 #[derive(Default)]
 pub struct Ctx {
     pub dyns: Dyns,
-    vals: Vec<I32>,
+    vals: Vec<Option<I32>>,
+    /// the contract expression of each symbol (host-contract generation), when it has one
+    exts: Vec<Option<amdgpu_dsl::Ext>>,
+    /// bound subexpressions (CSE across every expression bound through `bind`; valid at the scope of the first bind - the kernel's top level)
+    memo: std::cell::RefCell<std::collections::HashMap<Ix, amdgpu_dsl::ValueId>>,
 }
 
 impl Ctx {
@@ -38,14 +46,101 @@ impl Ctx {
     /// A dynamic symbol with range `[lo, hi]` standing for the IR value `v`.
     pub fn sym(&mut self, name: &str, lo: i64, hi: i64, v: I32) -> Ix {
         let s = self.dyns.sym(name, lo, hi);
-        self.vals.push(v);
+        self.vals.push(Some(v));
+        self.exts.push(None);
         s
+    }
+    /// A symbol with an IR value (`None`: contract-only, e.g. `HK`) and a contract expression (a kernarg, a grid dimension, a named symbol).
+    pub fn sym_ext(&mut self, name: &str, lo: i64, hi: i64, v: Option<I32>, ext: amdgpu_dsl::Ext) -> Ix {
+        let s = self.dyns.sym(name, lo, hi);
+        self.vals.push(v);
+        self.exts.push(Some(ext));
+        s
+    }
+    /// The contract expression of a layout expression (sums, products, floor divisions by constants of contract symbols).
+    pub fn ext(&self, x: &Ix) -> amdgpu_dsl::Ext {
+        use amdgpu_dsl::Ext;
+        match x {
+            Ix::C(k) => Ext::c(*k),
+            Ix::Sym(s) => self.exts[*s as usize].clone().unwrap_or_else(|| panic!("Ctx::ext: symbol {} has no contract expression", self.dyns.info(*s).name)),
+            Ix::Sum(t, k) => {
+                let mut acc: Option<Ext> = None;
+                for (term, m) in t {
+                    let e = if *m == 1 { self.ext(term) } else { self.ext(term) * Ext::c(*m) };
+                    acc = Some(match acc {
+                        None => e,
+                        Some(a) => a + e,
+                    });
+                }
+                let a = acc.expect("terms");
+                if *k == 0 {
+                    a
+                } else {
+                    a + Ext::c(*k)
+                }
+            }
+            Ix::Mul(a, b) => self.ext(a) * self.ext(b),
+            Ix::Div(a, k) => self.ext(a).floor_div(*k),
+            other => panic!("Ctx::ext: {other} has no contract form"),
+        }
+    }
+    /// Binds a layout expression, sharing every compound subexpression already bound through this context (one IR value per distinct subterm).
+    pub fn bind(&self, b: &mut amdgpu_dsl::FnBuilder, x: &Ix) -> I32 {
+        match x {
+            Ix::C(_) | Ix::Sym(_) => return self.lower(x),
+            _ => {}
+        }
+        if let Some(v) = self.memo.borrow().get(x) {
+            return amdgpu_dsl::tile::ev(*v);
+        }
+        let e = match x {
+            Ix::Sum(t, k) => {
+                let mut acc: Option<I32> = None;
+                for (term, m) in t {
+                    let v = self.bind(b, term);
+                    let v = if *m == 1 {
+                        v
+                    } else if *m > 0 && (*m as u64).is_power_of_two() {
+                        v << ((*m as u64).trailing_zeros() as i32)
+                    } else {
+                        v * (*m as i32)
+                    };
+                    acc = Some(match acc {
+                        None => v,
+                        Some(a) => a + v,
+                    });
+                }
+                let a = acc.expect("a sum has terms");
+                if *k == 0 {
+                    a
+                } else {
+                    a + (*k as i32)
+                }
+            }
+            Ix::Mul(a, c) => self.bind(b, a) * self.bind(b, c),
+            Ix::Div(a, k) => {
+                assert!((*k as u64).is_power_of_two(), "Ctx::bind: division by {k}");
+                self.bind(b, a).lshr((*k as u64).trailing_zeros() as i32)
+            }
+            Ix::Mod(a, k) => {
+                assert!((*k as u64).is_power_of_two(), "Ctx::bind: remainder by {k}");
+                self.bind(b, a) & ((*k - 1) as i32)
+            }
+            Ix::Xor(a, c) => self.bind(b, a) ^ self.bind(b, c),
+            Ix::And(a, m) => self.bind(b, a) & (*m as i32),
+            Ix::Shl(a, s) => self.bind(b, a) << (*s as i32),
+            Ix::Shr(a, s) => self.bind(b, a).lshr(*s as i32),
+            Ix::C(_) | Ix::Sym(_) => unreachable!(),
+        };
+        let v = b.bind_i32(e);
+        self.memo.borrow_mut().insert(x.clone(), v);
+        amdgpu_dsl::tile::ev(v)
     }
     /// The IR expression of a layout expression. Divisions and remainders must be by powers of two (shift / and); other constants multiply.
     pub fn lower(&self, x: &Ix) -> I32 {
         match x {
             Ix::C(k) => I32::c(*k as i32),
-            Ix::Sym(s) => self.vals[*s as usize].clone(),
+            Ix::Sym(s) => self.vals[*s as usize].clone().unwrap_or_else(|| panic!("Ctx::lower: {} is a contract-only symbol", self.dyns.info(*s).name)),
             Ix::Sum(t, k) => {
                 let mut acc: Option<I32> = None;
                 for (term, m) in t {
