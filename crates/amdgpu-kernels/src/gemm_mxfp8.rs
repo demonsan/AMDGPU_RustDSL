@@ -28,7 +28,12 @@ struct Cfg {
     reg_staged: bool,
     /// spread the DMA of the next tile over the MMA rows of the window (instead of issuing it all before the window)
     defer_dma: bool,
+    /// all scales of the CTA in one LDS panel loaded in the prologue (K <= 128 x PANEL_KB), no per-tile scale DMA
+    scale_panel: bool,
 }
+
+/// Scale panel capacity in K groups of 128 (the vendor `sp64`): K <= 8192.
+const PANEL_KB: i64 = 64;
 impl Cfg {
     fn wave_m(&self) -> i64 {
         self.cta_m / 2
@@ -129,8 +134,18 @@ fn dma_plan_rows_swz(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: 
     Dma { issues: out }
 }
 
+/// The scale panel: every K group's scales of the CTA, loaded once in the prologue (`Cfg::scale_panel`).
+struct Panel {
+    sh: Shared,
+    /// LDS offset of the B part inside the panel
+    b_base: i64,
+    /// byte offset of this wave's B scales inside the B part (wave column block x KB + the source alignment delta)
+    b_off: ValueId,
+}
+
 struct Body {
     cfg: Cfg,
+    panel: Option<Panel>,
     mma: TiledMma,
     a_s: Shared,
     b_s: Shared,
@@ -172,8 +187,25 @@ impl Body {
     /// Loads of tile `t`'s operands from `slot`: scale words (one round trip) + byte selects, then the fragments in the order of `order`
     /// (`(is_b, index)`), each handed to `sink` right after its load (in place of the dead fragment).
     #[allow(clippy::type_complexity)]
-    fn load_scales(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId) {
+    /// The scale words of tile `kb` (one LDS round trip; ring slot or the panel) and the B byte shift: `(A words, B word, B shift)`.
+    fn scale_words(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId, I32) {
         let nm = (self.cfg.wave_m() / 16) as usize;
+        if let Some(p) = &self.panel {
+            // scale panel (loaded once): A rows [kb][256], B bytes [wn][KB] (+ the alignment delta of the B source)
+            let pr = p.sh.at(&SlotIdx::new(0, 0));
+            let kb = b.bind_i32(kb);
+            let sab = b.bind_i32((ev(kb) << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
+            let bo = b.bind_i32(ev(p.b_off) + ev(kb));
+            let sbb = b.bind_i32((ev(bo) & -4) + (p.sh.base as i32 + p.b_base as i32));
+            let (wa, wb) = pr.read(b, |b| {
+                let wa: Vec<ValueId> = (0..nm).map(|i| {
+                    let a = b.bind_i32(ev(sab) + 16 * i as i32);
+                    b.load_lds_b32(a)
+                }).collect();
+                (wa, b.load_lds_b32(sbb))
+            });
+            return (wa, wb, (ev(bo) & 3) << 3);
+        }
         let scr = self.sc_s.at(slot);
         let so = scr.off_v(b);
         let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
@@ -187,11 +219,15 @@ impl Body {
             let a = b.bind_i32(ev(scb) + 256);
             (wa, b.load_lds_b32(a))
         });
-        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0])))).collect();
-        let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kb) & 3) << 3));
-        (sa, sb)
+        (wa, wb, ((ev(self.sb_src) + kb) & 3) << 3)
     }
-    fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
+    /// Scale words + byte selects (shifted to byte 0).
+    fn load_scales(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId) {
+        let (wa, wb, sh) = self.scale_words(b, slot, kb);
+        let sa: Vec<ValueId> = wa.iter().map(|w| b.bind_i32(ev(*w).lshr(ev(self.sa_sh[0])))).collect();
+        let sb = b.bind_i32(ev(wb).lshr(sh));
+        (sa, sb)
+    }    fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
         let v = part.read(b, o);
         if self.cfg.agpr_ops {
             b.agpr(v)
@@ -322,6 +358,9 @@ impl Body {
                 }
             });
         }
+        if self.panel.is_some() {
+            return; // the scales come from the panel
+        }
         // scales of tile kb: the CTA's 256 A-scale bytes (contiguous in [K/128][M]) and the dword holding the B-scale byte, into the wave's 512 bytes
         if !range.contains(&unit) {
             return;
@@ -424,20 +463,8 @@ impl PipeBody for Body {
         let zfb = if nords { let z = b.frag_zero(DType::Frag4); let o = b.frag_zero(DType::Frag4); Some(b.cat_frag8(o, z)) } else { None };
         let mark = |b: &mut FnBuilder, v: ValueId| if agpr { b.agpr(v) } else { v };
         let kbx = ox(t.it);
-        // scale words (one LDS round trip), then the byte selects (shifted to byte 0)
-        let scr = self.sc_s.at(&t.cur);
-        let so = scr.off_v(b);
-        let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
-        let sab = b.bind_i32(ev(scb) + ev(self.sa_dw[0]));
-        let (wa, wb) = scr.read(b, |b| {
-            let wa: Vec<ValueId> = (0..nm).map(|i| {
-                // rows 16 i apart: the same lane dword + 16 i (an immediate)
-                let a = b.bind_i32(ev(sab) + 16 * i as i32);
-                b.load_lds_b32(a)
-            }).collect();
-            let a = b.bind_i32(ev(scb) + 256);
-            (wa, b.load_lds_b32(a))
-        });
+        // scale words (one LDS round trip), then the byte selects (shifted to byte 0) after the first fragment reads
+        let (wa, wb, sbsh) = self.scale_words(b, &t.cur, kbx.clone());
         let mut deferred = self.deferred.take();
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
@@ -446,7 +473,7 @@ impl PipeBody for Body {
         let bpre = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("bpre").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1).min(nn);
         let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zfb { z } else { br.read(b, j) }; mark(b, v) }).collect();
         let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0])))).collect();
-        let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
+        let sb = b.bind_i32(ev(wb).lshr(sbsh));
         let prio = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noprio"));
         if prio {
             b.set_prio(1);
@@ -489,19 +516,19 @@ impl PipeBody for Body {
 }
 
 pub fn gemm_mxfp8_bs_v2() -> Function {
-    build("gemm_mxfp8_bs_v2", Cfg { cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false })
+    build("gemm_mxfp8_bs_v2", Cfg { cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, scale_panel: false })
 }
 
 /// v3: the vendor tile (CTA 256 x 256, 128 x 128 per wave, 64 accumulators): operand fragments in AGPRs, half of the accumulators pinned in AGPRs,
 /// 2-slot LDS ring (2 x 64 KB).
 pub fn gemm_mxfp8_bs_v3() -> Function {
-    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("nodefer")) })
+    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("nodefer")), scale_panel: std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("panel")) })
 }
 
 /// v4: v3 with the register-staged 2-slot cadence (prefetch distance 2): all 16 operand fragments of a tile are read into AGPRs, the slot is refilled
 /// with tile t+2 while the 64 MMAs run.
 pub fn gemm_mxfp8_bs_v4() -> Function {
-    build("gemm_mxfp8_bs_v4", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("accagpr").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(24), three_slots: false, reg_staged: true, defer_dma: std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("defer4")) })
+    build("gemm_mxfp8_bs_v4", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("accagpr").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(24), three_slots: false, reg_staged: true, defer_dma: std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("defer4")), scale_panel: std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("panel")) })
 }
 
 fn build(name: &str, cfg: Cfg) -> Function {
@@ -547,6 +574,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let a_s = lds.ring("A", cta_m * 128, slots, amdgpu_dsl::tile::Layout::Linear);
     let b_s = lds.ring("B", cta_n * 128, slots, amdgpu_dsl::tile::Layout::Linear);
     let sc_s = lds.ring("SC", 4 * 512, slots, amdgpu_dsl::tile::Layout::Linear);
+    // scale panel: A [PANEL_KB][256 rows] + B [2 blocks][PANEL_KB] (+ 4 bytes of source alignment slack, padded to 256 for the dword DMA)
+    let panel_sh = if cfg.scale_panel { Some(lds.tile("SCP", PANEL_KB * 256 + 512, amdgpu_dsl::tile::Layout::Linear)) } else { None };
     lds.commit(b);
 
     // ---- operand reads: the 16-row blocks of the wave (placements (row block) 2048), the wave offset added to the bases ----
@@ -592,13 +621,39 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let sa_dw: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32(ev(*r) & -4)).collect();
 
     let cadence = if cfg.reg_staged { Cadence::RegStaged } else if cfg.three_slots { Cadence::OneWindow } else { Cadence::TwoSlot };
+    // the panel DMA (before the pipeline prologue, whose wait_vm(0) + barrier publish it): wave w loads K groups 16 w .. 16 w + 15 (zeros past KB:
+    // the descriptor bound), and wave 0 the CTA's B-scale rows (2 x KB bytes from the dword-aligned start)
+    let panel = panel_sh.map(|sh| {
+        assert!(cta_m == 256 && cta_n == 256, "scale panel: 256 x 256 CTA");
+        let per_wave = PANEL_KB / 4;
+        let pr = sh.at(&SlotIdx::new(0, 0));
+        let m0w = { let v = b.bind_i32((lane.wave() << 12) + sh.base as i32); b.read_first_lane(v) };
+        let b_src = b.bind_i32(((ev(bx) << 1) * ev(kb_v)) & -4);
+        let b_delta = b.bind_i32(((ev(bx) << 1) * ev(kb_v)) & 3);
+        pr.write(b, |b| {
+            for q in 0..per_wave {
+                // K group 16 w + q: soffset = its row (16 w + q) M, voffset = the CTA rows + 4 lane (sa_src), M0 + imm = panel + 256 (16 w + q)
+                let so = { let v = b.bind_i32((lane.wave() * (per_wave as i32) + q as i32) * ev(m_v)); b.read_first_lane(v) };
+                b.buffer_load_lds_b32(rsrc_sfa, sa_src, so, m0w, (256 * q) as u32);
+            }
+        });
+        let w0 = b.bind_cond(lane.wave().eq(0));
+        b.begin_if(w0);
+        let m0b = b.c_i32((sh.base + PANEL_KB * 256) as i32);
+        let zv = b.bind_i32(lane.lane() << 2);
+        let sob = b.read_first_lane(b_src);
+        pr.write(b, |b| b.buffer_load_lds_b32(rsrc_sfb, zv, sob, m0b, 0));
+        b.end_if();
+        let b_off = b.bind_i32((ev(wn) * ev(kb_v)) + ev(b_delta));
+        Panel { sh, b_base: PANEL_KB * 256, b_off }
+    });
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
     if cfg.three_slots || cfg.reg_staged {
         pipe.vm_inflight = (a_dma.issues.len() + b_dma.issues.len() + 2) as u8;
     }
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
-        cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
+        cfg, panel, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
         a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false, npre_done: 0,
     };
     pipe.run(b, Role::All, &mut body);
