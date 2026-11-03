@@ -45,3 +45,24 @@ fn attacks_are_rejected() {
     // xor of bounded parts that really exceed the segment
     assert!(lds_oob(&kernel(2032, |t| ((t.clone() & 15) << 7) ^ (((t.lshr(4)) & 7) << 4))) > 0, "2032 + 16 > 2032");
 }
+
+/// `ds_read_b128` at `ka(8) * 16` with the kernarg range `[0, hi]` (None: no range) in a 2 KB segment.
+fn ka_kernel(hi: Option<i64>) -> Function {
+    let mut b = FnBuilder::new("gv_box", 64);
+    b.arg("n", amdgpu_dsl::DType::I32, 8, 4);
+    if let Some(h) = hi {
+        b.ka_range(8, 0, h);
+    }
+    b.lds(2048);
+    let n = b.let_(Op::KernargI32 { offset: 8 });
+    let a = b.bind_i32(ev(n) * 16);
+    let _ = b.load_lds_b128(a);
+    b.finish()
+}
+
+#[test]
+fn declared_maxima_bound_symbolic_addresses() {
+    assert_eq!(lds_oob(&ka_kernel(Some(100))), 0, "16 * n + 16 <= 2048 for n <= 100 (the declared maximum)");
+    assert!(lds_oob(&ka_kernel(Some(200))) > 0, "n <= 200 overruns");
+    assert!(lds_oob(&ka_kernel(None)) > 0, "an unbounded kernarg is not bounded by a box");
+}
