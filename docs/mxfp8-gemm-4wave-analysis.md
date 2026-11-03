@@ -402,3 +402,31 @@ scalarize/imm/sgpr 降级选项（中性）。
    全卡级的实验（per-XCD L2 命中/带宽计数、请求形态复刻：wave 角色分工 A/B、或 8 wave），超出本轮预算。
 
 保留的选项（默认关）：`GemmConfig::split_sync` + `Pipeline::top_vm`（经 strict verify，可作为后续全卡实验的起点）。
+
+### 12.1 全卡计数器（同进程、同输入，rocprofv3 `_sum`，vendor vs v4，中位数/每次 dispatch）
+
+| 计数器 | vendor | v4 | 比 |
+|---|---|---|---|
+| GRBM_GUI_ACTIVE（kernel 周期，计数器开销下） | 1.454e6 | 1.673e6 | 1.15 |
+| TCP_TOTAL_CACHE_ACCESSES | 1.737e7 | 1.763e7 | 1.02 |
+| TCP_TCC_READ_REQ（L1→L2 读请求） | 8.42e6 | 8.55e6 | 1.02 |
+| TA_BUFFER_READ_WAVEFRONTS | 1.053e6 | 1.082e6 | 1.03 |
+| TCC_HIT / TCC_MISS | 6.36e6 / 2.62e6 | 7.28e6 / 1.84e6 | 1.14 / 0.70 |
+| TCC_EA0_RDREQ（L2→MALL/HBM）/ RDREQ_LEVEL | 2.36e6 / 1.29e9 | 1.58e6 / 0.83e9 | 0.67 / 0.64 |
+| TCC_BUSY | 1.736e7 | 1.735e7 | 1.00 |
+| TCC_TAG_STALL / TCC_IB_STALL | 2.76e5 / 2.88e5 | 2.05e5 / 3.00e5 | 0.74 / 1.04 |
+| TA_TA_BUSY | 2.04e7 | 2.57e7 | 1.26 |
+| TA_ADDR_STALLED_BY_TC_CYCLES | 1.20e5 | 3.19e5 | 2.66 |
+| TA_DATA_STALLED_BY_TC_CYCLES | 4.10e5 | 8.52e5 | 2.08 |
+| TCP_PENDING_STALL_CYCLES | 1.25e7 | 1.76e7 | 1.41 |
+| TCP_TCR_TCP_STALL_CYCLES（L2→L1 返回路径停顿） | 1.45e6 | 2.48e6 | 1.71 |
+
+解读：请求数与访问形态相同（L1 访问、L1→L2 请求、TA wavefront 都在 ±3%），且我们因 XCD raster 的 L2 未命中少 30%、对 MALL/HBM 的读少 33%，L2 本身同样忙。
+差别全在 **CU 侧的 L1/TA 前端**：TA 因 TC 背压停顿 2–2.7×，TCP 等待未完成请求 1.4×，L2→L1 返回路径停顿 1.7×。即同样的字节、同样的请求，到达/返回的
+**时序**更拥塞。最可能的原因：DMA 返回数据写 LDS 与 ds_read 重载在时间上重叠（我们的 DMA 分散在 48 个 MMA 上、重载从第 32 个 MMA 开始；vendor 的 DMA 在前
+~34 个 MMA 内发完、重载集中在后段），LDS 端口仲裁把返回路径顶住；以及每 wave 同时发 A+B。对应的结构实验（A/B 交替发射 −1.3%、split_sync −0.5%、
+DMA 间隔 1/2 −5%/−0.2%、prefill −0.7%）都没有把这部分转化为收益；wave 角色分工（wave 0/1 搬 A、2/3 搬 B）需要按 wave 选择 buffer 描述符（DSL 目前没有
+指针/描述符的 uniform select），本轮未实现。
+
+**结论**：v4 = 0.94–0.95× vendor 是本结构 + 本编译器下的稳定上限；剩余差距是 CU 内存前端（TA/TCP/返回路径）的拥塞时序，而不是指令数、单 CU 延迟或 L2/HBM
+带宽。下一步若要继续：(a) DSL 支持描述符 select 后做 wave 角色分工 + vendor 的 DMA/重载分相时序，(b) 用 SPM/ATT 的 TA/TCP 活动计数对齐两者的时序。
