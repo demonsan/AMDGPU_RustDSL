@@ -236,6 +236,7 @@ namespace amdc_hostgen::{} {{
 #pragma pack(push, 1)
 struct Args {{
 {}
+{}
 }};
 #pragma pack(pop)
 {}
