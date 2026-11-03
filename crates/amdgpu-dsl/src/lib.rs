@@ -192,6 +192,8 @@ pub enum Op {
     LoadLdsB32 { addr: Opnd },
     /// Read four dwords (16 B) from workgroup LDS.
     LoadLdsB128 { addr: Opnd },
+    /// Read two dwords (8 B, `ds_read_b64`) from workgroup LDS: a `Frag2`.
+    LoadLdsB64 { addr: Opnd },
     /// 8-bit transposing LDS read (ds_read_b64_tr_b8), two dwords per lane.
     LoadLdsTrB8 { addr: Opnd },
     /// Four `ds_read_b64_tr_b8` reads written straight into the four quarters of one `Frag8`.
@@ -330,7 +332,7 @@ impl Op {
             Op::BitcastI32(..) => DType::I32,
             Op::LoadLdsB32 { .. } => DType::U32,
             Op::LoadLdsB128 { .. } => DType::Frag4,
-            Op::LoadLdsTrB8 { .. } => DType::Frag2,
+            Op::LoadLdsTrB8 { .. } | Op::LoadLdsB64 { .. } => DType::Frag2,
             Op::LoadLdsTr4B8 { .. } | Op::LoadLdsB128x2 { .. } => DType::Frag8,
             Op::LoadGlobalB128 { .. } => DType::Frag4,
             Op::ReadFirstLane(..) => DType::U32,
@@ -394,6 +396,7 @@ impl Op {
             Op::BitcastF32(a) | Op::BitcastI32(a) => vec![*a],
             Op::LoadLdsB32 { addr } => vec![*addr],
             Op::LoadLdsB128 { addr } => vec![*addr],
+            Op::LoadLdsB64 { addr } => vec![*addr],
             Op::LoadLdsTrB8 { addr } => vec![*addr],
             Op::LoadLdsTr4B8 { addrs } => addrs.to_vec(),
             Op::LoadGlobalB128 { base, .. } | Op::LoadF32Coherent { base, .. } | Op::LoadB128Coherent { base, .. } => vec![*base],
@@ -586,6 +589,8 @@ pub enum Stmt {
     StoreLdsB32 { addr: Opnd, value: Opnd },
     /// Write four dwords (16 B) into workgroup LDS.
     StoreLdsB128 { addr: Opnd, value: Opnd },
+    /// Write two dwords (8 B, `ds_write_b64`; the value is a `Frag2`) into workgroup LDS.
+    StoreLdsB64 { addr: Opnd, value: Opnd },
     /// `s_waitcnt lgkmcnt(count)`.
     WaitLds { count: u8 },
     /// `s_barrier`: synchronise every wave in the workgroup.
@@ -744,6 +749,9 @@ impl Function {
                 }
                 Stmt::StoreLdsB128 { addr, value } => {
                     let _ = writeln!(s, "{pad}lds128[{addr:?}] <- {value:?}");
+                }
+                Stmt::StoreLdsB64 { addr, value } => {
+                    let _ = writeln!(s, "{pad}lds64[{addr:?}] <- {value:?}");
                 }
                 Stmt::WaitLds { count } => {
                     let _ = writeln!(s, "{pad}waitlds({count})");
@@ -1456,6 +1464,11 @@ impl FnBuilder {
         self.let_(Op::LoadLdsB128 { addr: addr.into() })
     }
 
+    /// `ds_read_b64`: two dwords from LDS (8-byte aligned) as a `Frag2`.
+    pub fn load_lds_b64(&mut self, addr: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::LoadLdsB64 { addr: addr.into() })
+    }
+
     /// Four dwords (16 B) write into workgroup LDS.
     /// Transposing 8-bit LDS read into two dwords per lane.
     /// 16-byte global load into a `Frag4`.
@@ -1604,6 +1617,11 @@ impl FnBuilder {
 
     pub fn store_lds_b128(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
         self.f.stmts.push(Stmt::StoreLdsB128 { addr: addr.into(), value: value.into() });
+    }
+
+    /// `ds_write_b64`: a `Frag2` into LDS (8-byte aligned).
+    pub fn store_lds_b64(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
+        self.f.stmts.push(Stmt::StoreLdsB64 { addr: addr.into(), value: value.into() });
     }
 
     /// Broadcast lane 0 of a vector value into a scalar register.
@@ -2076,6 +2094,11 @@ pub fn verify(f: &Function) -> Vec<String> {
                             errs.push(here(e));
                         }
                     }
+                    Op::LoadLdsB64 { addr } => {
+                        if let Err(e) = expect_int(f, *addr, "lds64 load address") {
+                            errs.push(here(e));
+                        }
+                    }
                     Op::LoadLdsB32 { addr } => {
                         if let Err(e) = expect_int(f, *addr, "lds load address") {
                             errs.push(here(e));
@@ -2169,6 +2192,16 @@ pub fn verify(f: &Function) -> Vec<String> {
                             errs.push(here(format!("operand v{v} is not visible here")));
                         }
                     }
+                }
+            }
+            Stmt::StoreLdsB64 { addr, value } => {
+                if let Err(e) = expect_int(f, *addr, "lds64 store address") {
+                    errs.push(here(e));
+                }
+                match opnd_ty(f, *value) {
+                    Ok(DType::Frag2) => {}
+                    Ok(t) => errs.push(here(format!("lds64 store: expected frag2, found {}", t.name()))),
+                    Err(e) => errs.push(here(e)),
                 }
             }
             Stmt::StoreLdsB128 { addr, value } => {
@@ -2515,7 +2548,7 @@ fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::Let { op, .. } => op.operands(),
         Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32Wt { base, value, .. } | Stmt::StoreF32x4Wt { base, value, .. } | Stmt::StoreF32x2 { base, value, .. } => vec![*base, *value],
         Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => vec![],
-        Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } => vec![*addr, *value],
+        Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } | Stmt::StoreLdsB64 { addr, value } => vec![*addr, *value],
         Stmt::LoadGlobalLds { base, lds_addr, .. } => vec![*base, *lds_addr],
         Stmt::BufferStore { rsrc, voff, soff, value, .. } => {
             let mut v = vec![*rsrc];

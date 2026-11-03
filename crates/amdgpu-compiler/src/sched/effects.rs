@@ -164,6 +164,12 @@ fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
         MOp::LdsReadB128 => {
             e.mem = Some(MemAccess { space: Space::Lds, write: false, base: base_slot(0), off: inst.imm, size: 16 })
         }
+        MOp::LdsReadB64 => {
+            e.mem = Some(MemAccess { space: Space::Lds, write: false, base: base_slot(0), off: inst.imm, size: 8 })
+        }
+        MOp::LdsWriteB64 => {
+            e.mem = Some(MemAccess { space: Space::Lds, write: true, base: base_slot(0), off: inst.imm, size: 8 })
+        }
         MOp::LdsReadB64TrB8 => {
             e.mem = Some(MemAccess { space: Space::Lds, write: false, base: base_slot(0), off: inst.imm, size: 8 })
         }
