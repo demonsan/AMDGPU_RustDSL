@@ -90,6 +90,42 @@ The vendor kernel and legacy/dsl/env-override kernels keep the historical hand p
 | B2 H4 S300 SK129 gqa1 | `bc1b855aedf0` x3 | `bc1b855aedf0` x3 |
 | B1 H8 S2048 SK2048 gqa1 | `a82ed4d67882` x3 | `a82ed4d67882` x3 |
 
+## Named-field completion (FMHA shipped path)
+
+`ref_host.cpp` now fills the generated `Args` fields by name for every generated launch
+(`a.ptr_q`, `a.s_seq`, `a.ptr_sfa`, ...); the generated path does not construct the old 720-byte
+hand buffer at all. The hand `put32`/`put64` calls remain only for the vendor kernel and for
+legacy/dsl kernel names / `REF_GEN_ABI_OFF=1`. The five determinism shapes were re-run after the
+switch and are still bit-identical to the hand path (same md5 table as above).
+
+## GEMM (`gemm_p4` worktree / local `host-gen-gemm` branch)
+
+The generator is kernel-agnostic; run it on the GEMM worktree after merging `origin/gemm-p4` locally:
+
+```bash
+amdc gen-host gemm_mxfp8_bs_v3 gemm_mxfp8_bs_v4 --out tests/gpu/generated_gemm
+```
+
+This emits a 96-byte `Args` matching the aiter `opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950`
+ABI, including `MT`/`NT`/`KT` symbols and the `m/n/k/stride_*` host relations. On branch
+`host-gen-gemm` (local merge only; the host-gen commits above stay based on `origin/Main`),
+`tests/gpu/gemm_ref_host.cpp` uses the generated `Args`/`validate`/`launch` for the `OURS` path and
+the historical hand path for `REF`; `REF_GEMM_ABI_OFF=1` forces the hand OURS path for A/B.
+
+Evidence on GPU 7, `GEMM_M=1280 GEMM_N=6144 GEMM_K=7168`, both kernels:
+
+| kernel | generated | hand | md5 generated == hand |
+|---|---|---|---|
+| `gemm_mxfp8_bs_v3` | `GEMM_OK` bad=0 | `GEMM_OK` bad=0 | `9ad0527dc3c39627520e6b36f0559677` |
+| `gemm_mxfp8_bs_v4` | `GEMM_OK` bad=0 | `GEMM_OK` bad=0 | `9ad0527dc3c39627520e6b36f0559677` |
+
+## JSON schema + Python example
+
+See `docs/hostgen-json-schema.md` (schema version 1). `tests/hostgen/json_kernarg.py` is a tiny
+stdlib-only example that reads the JSON and packs the kernarg bytes from `args[].offset/size/type`;
+`tests/hostgen/test_json_kernarg.py` is its GPU-free host test and packs all four shipped JSON ABIs
+(656/648/96/96 bytes), reading every field back at its declared offset.
+
 ## Scope and limitations
 
 - Host-checkable contracts only. Tile lifetime/protocol and kernel-side proofs remain `gpu_verify`;
