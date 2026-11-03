@@ -141,6 +141,8 @@ struct Panel {
     b_base: i64,
     /// byte offset of this wave's B scales inside the B part (wave column block x KB + the source alignment delta)
     b_off: ValueId,
+    /// A part transposed in the prologue: [kb][wm][lane % 16][m block i] (8 bytes per lane: 2 dwords, MFMA byte selects instead of shifts)
+    tr: Option<ValueId>,
 }
 
 struct Body {
@@ -463,7 +465,21 @@ impl PipeBody for Body {
         let mark = |b: &mut FnBuilder, v: ValueId| if agpr { b.agpr(v) } else { v };
         let kbx = ox(t.it);
         // scale words (one LDS round trip), then the byte selects (shifted to byte 0) after the first fragment reads
-        let (wa, wb, sbsh) = self.scale_words(b, &t.cur, kbx.clone());
+        let tr = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0)))));
+        let (wa, wb, sbsh) = if let Some((base, b_base, b_off, lo, pr)) = tr {
+            // transposed panel: 2 dwords hold the 8 A-scale bytes of this lane; the B byte as before
+            let sab = b.bind_i32((kbx.clone() << 8) + (base as i32) + ev(lo));
+            let bo = b.bind_i32(ev(b_off) + kbx.clone());
+            let sbb = b.bind_i32((ev(bo) & -4) + (base + b_base) as i32);
+            let (wa, wb) = pr.read(b, |b| {
+                let a1 = b.bind_i32(ev(sab) + 4);
+                let wa = vec![b.load_lds_b32(sab), b.load_lds_b32(a1)];
+                (wa, b.load_lds_b32(sbb))
+            });
+            (wa, wb, (ev(bo) & 3) << 3)
+        } else {
+            self.scale_words(b, &t.cur, kbx.clone())
+        };
         let mut deferred = self.deferred.take();
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
@@ -471,7 +487,12 @@ impl PipeBody for Body {
         let mut af = { let v = if let Some(z) = zf { z } else { ar.read(b, 0) }; mark(b, v) };
         let bpre = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("bpre").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1).min(nn);
         let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zfb { z } else { br.read(b, j) }; mark(b, v) }).collect();
-        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0])))).collect();
+        // A scale of m block i: (word, byte select)
+        let sa: Vec<(ValueId, u8)> = if tr.is_some() {
+            (0..nm).map(|i| (wa[i / 4], (i % 4) as u8)).collect()
+        } else {
+            (0..nm).map(|i| (b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0]))), 0u8)).collect()
+        };
         let sb = b.bind_i32(ev(wb).lshr(sbsh));
         let prio = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noprio"));
         if prio {
@@ -497,7 +518,7 @@ impl PipeBody for Body {
                     bf.push(mark(b, v));
                 }
                 if !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nomma")) {
-                    gemm(b, &self.mma, self.acc[nn * i + j], af, bf[j], sa[i], sb, 0, 0);
+                    gemm(b, &self.mma, self.acc[nn * i + j], af, bf[j], sa[i].0, sb, sa[i].1, 0);
                 }
             }
             if let Some(n) = next {
@@ -645,7 +666,38 @@ fn build(name: &str, cfg: Cfg) -> Function {
         pr.write(b, |b| b.buffer_load_lds_b32(rsrc_sfb, zv, sob, m0b, 0));
         b.end_if();
         let b_off = b.bind_i32((ev(wn) * ev(kb_v)) + ev(b_delta));
-        Panel { sh, b_base: PANEL_KB * 256, b_off }
+        // transpose the A part in place, 8 K groups per round: thread (r = tid % 16, wm = tid / 16 % 2, k = tid / 32) gathers the bytes of rows
+        // 128 wm + 16 i + r (i < 8) of K group 8 round + k and writes them as 8 consecutive bytes at 128 wm + 8 r
+        let tr = if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("notr")) { None } else {
+            b.wait_vm(0);
+            b.barrier();
+            let r = b.bind_i32(ev(tid) & 15);
+            let wmq = b.bind_i32((ev(tid).lshr(4)) & 1);
+            let kq = b.bind_i32(ev(tid).lshr(5));
+            let sh_r = b.bind_i32((ev(r) & 3) << 3);
+            let rd0 = b.bind_i32((ev(wmq) << 7) + (ev(r) & -4) + (ev(kq) << 8) + sh.base as i32);
+            let wr0 = b.bind_i32((ev(wmq) << 7) + (ev(r) << 3) + (ev(kq) << 8) + sh.base as i32);
+            for round in 0..(PANEL_KB / 8) as i32 {
+                let words: Vec<ValueId> = pr.read(b, |b| (0..8).map(|i| { let a = b.bind_i32(ev(rd0) + (2048 * round + 16 * i)); b.load_lds_b32(a) }).collect());
+                let byte = |b: &mut FnBuilder, w: ValueId| b.bind_i32(ev(w).lshr(ev(sh_r)) & 255);
+                let bs: Vec<ValueId> = words.iter().map(|w| byte(b, *w)).collect();
+                let d0 = b.bind_i32(ev(bs[0]) | (ev(bs[1]) << 8) | (ev(bs[2]) << 16) | (ev(bs[3]) << 24));
+                let d1 = b.bind_i32(ev(bs[4]) | (ev(bs[5]) << 8) | (ev(bs[6]) << 16) | (ev(bs[7]) << 24));
+                b.wait_lds(0);
+                b.barrier();
+                pr.write(b, |b| {
+                    let a0 = b.bind_i32(ev(wr0) + 2048 * round);
+                    let a1 = b.bind_i32(ev(wr0) + 2048 * round + 4);
+                    b.store_lds_b32(a0, d0);
+                    b.store_lds_b32(a1, d1);
+                });
+                b.wait_lds(0);
+                b.barrier();
+            }
+            // the lane's read offset: 128 wm + 8 (lane % 16)
+            Some(b.bind_i32((ev(wm) << 7) + ((lane.lane() & 15) << 3)))
+        };
+        Panel { sh, b_base: PANEL_KB * 256, b_off, tr }
     });
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
     if cfg.three_slots || cfg.reg_staged {
