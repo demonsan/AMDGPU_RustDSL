@@ -249,6 +249,8 @@ struct Demo3 {
     vcp: RowsCopy,
     kdcp: DwordRowsCopy,
     lane: Lane,
+    /// the window also reads tile t+1 (the FMHA QK(t+1)); false = a GEMM-like window that consumes only tile t
+    next_reads: bool,
 }
 
 impl Demo3 {
@@ -277,7 +279,11 @@ impl PipeBody for Demo3 {
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let (ks, vs, kd) = (self.ks.clone(), self.vs.clone(), self.kd.clone());
         self.rd(b, &vs, &t.cur, 4);
-        if t.staged {
+        if !self.next_reads {
+            self.rd(b, &ks, &t.cur, 4);
+            self.rd(b, &kd, &t.cur, 2);
+        }
+        if t.staged && self.next_reads {
             self.rd(b, &ks, &t.next, 4);
             self.rd(b, &kd, &t.next, 2);
         }
@@ -285,10 +291,10 @@ impl PipeBody for Demo3 {
 }
 
 fn demo3() -> Function {
-    demo3_vm(0)
+    demo3_vm(0, true)
 }
 
-fn demo3_vm(vm_inflight: u8) -> Function {
+fn demo3_vm(vm_inflight: u8, next_reads: bool) -> Function {
     let mut b = FnBuilder::new("tile_demo_ring3", 256);
     b.compile_profile(CompileProfile::Default);
     let mut ka = KArgs::new();
@@ -313,7 +319,7 @@ fn demo3_vm(vm_inflight: u8) -> Function {
     let kdcp = DwordRowsCopy::new(&mut b, kdsrc, &kds, roles.wave_in_group, &lane);
     let mut pipe = Pipeline::new(Cadence::OneWindow, nkv, kv_len, 128, Ext::ka(0x10).ceil_div(128));
     pipe.vm_inflight = vm_inflight;
-    let mut body = Demo3 { ks, vs, kd: kds, kcp, vcp, kdcp, lane };
+    let mut body = Demo3 { ks, vs, kd: kds, kcp, vcp, kdcp, lane, next_reads };
     pipe.run(&mut b, Role::All, &mut body);
     b.finish()
 }
@@ -415,7 +421,7 @@ fn t128_style_staging_verifies() {
     let rt_row = b.bind_i32((lane.tid() & 255).lshr(1));
     let kdv = DwordRowsVgpr::new(&mut b, kdsrc, &kds, rt_row);
     let pipe = Pipeline::new(Cadence::OneWindow, nkv, kv_len, 128, Ext::ka(0x10).ceil_div(128));
-    let mut body = Demo3v { base: Demo3 { ks, vs, kd: kds, kcp, vcp, kdcp, lane }, kdv, pending: None };
+    let mut body = Demo3v { base: Demo3 { ks, vs, kd: kds, kcp, vcp, kdcp, lane, next_reads: true }, kdv, pending: None };
     pipe.run(&mut b, Role::All, &mut body);
     f = b.finish();
     let e = errs(&f);
@@ -429,9 +435,13 @@ fn t128_style_staging_verifies() {
 #[test]
 fn counted_vmcnt_keeps_the_next_stage_in_flight() {
     // one stage = 1 (K scales) + 4 (K) + 4 (V) DMAs per wave: vmcnt(9) at the window end completes tile t+1 and leaves tile t+2 in flight
-    let e = errs(&demo3_vm(9));
+    // (a window that consumes only its own tile t: tile t+1 is published by this window's barrier and read in the next window)
+    let e = errs(&demo3_vm(9, false));
     assert!(e.is_empty(), "vmcnt(9) completes the published stage: {}", e.join("\n"));
     // vmcnt(10) does not prove tile t+1 complete before its publishing barrier
-    let e = errs(&demo3_vm(10));
+    let e = errs(&demo3_vm(10, false));
+    assert!(e.iter().any(|x| x.contains("GV-TILE") || x.contains("GV-PROTO")), "vmcnt(10) must be rejected: {e:?}");
+    // the FMHA window reads tile t+1 in window t: tile t+1 must be complete at the end of window t-1, so vm_inflight > 0 is rejected there
+    let e = errs(&demo3_vm(9, true));
     assert!(e.iter().any(|x| x.contains("GV-TILE") || x.contains("GV-PROTO")), "vmcnt(10) must be rejected: {e:?}");
 }
