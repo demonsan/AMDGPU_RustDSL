@@ -22855,7 +22855,6 @@ pub fn probe_dma_voff_spill() -> Function {
     let c16 = b.c_i32(16);
     let c63 = b.c_i32(63);
     let c1024 = b.c_i32(1024);
-    let c65536 = b.c_i32(65536);
     let mul = b.c_i32(0x01010101);
     let add = b.c_i32(0x04030201);
     let o16 = b.mul_i32(tid, c16);
@@ -22864,9 +22863,8 @@ pub fn probe_dma_voff_spill() -> Function {
     let mask = b.c_i32(0x3f3f3f3f);
     let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
     let data = b.frag4(w, w, w, w);
-    // stage the input in the upper part of the output buffer: in[tid*16 ..] = pattern(tid)
-    let base = b.ptr_add(o, c65536);
-    let pin = b.ptr_add(base, o16);
+    // stage the input in the output buffer: out[tid*16 ..] = pattern(tid)
+    let pin = b.ptr_add(o, o16);
     b.store_f32x4(pin, 0, data);
     b.wait_vm(0);
     let rin = b.buffer_rsrc(o);
@@ -22878,7 +22876,7 @@ pub fn probe_dma_voff_spill() -> Function {
     let rd = b.add_i32(ldsb, lane16);
     let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(c0))]);
     let (it, acc) = (vars[0], vars[1]);
-    b.buffer_load_lds_b128(rin, o16, c65536, ldsb, 0); // descriptor base = o, scalar soffset 65536 = the staged input
+    b.buffer_load_lds_b128(rin, o16, c0, ldsb, 0); // descriptor base = o: the input staged in out[0 .. 16*tid) (overwritten by the result after the loop)
     b.wait_vm(0);
     let x = b.load_lds_b32(rd);
     let a2 = b.add_i32(acc, x);
