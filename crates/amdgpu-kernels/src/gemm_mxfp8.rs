@@ -24,6 +24,8 @@ struct Cfg {
     acc_agpr: usize,
     /// 3-slot OneWindow ring (prefetch distance 2) or the 2-slot cadence (distance 1, for tiles whose 3 slots do not fit the LDS)
     three_slots: bool,
+    /// 2-slot `RegStaged` cadence: the whole tile is read into registers first, its slot then receives tile t+2 (distance 2 with two slots)
+    reg_staged: bool,
 }
 impl Cfg {
     fn wave_m(&self) -> i64 {
@@ -115,6 +117,45 @@ struct Body {
     b_rd: LdsPart,
     zero4: ValueId,
     acc: Vec<VarId>,
+    /// register-staged tile: B fragments, A fragments, A scales, B scale
+    staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, ValueId)>,
+}
+
+impl Body {
+    /// Reads the whole tile of `t` into registers (fragments in AGPRs when configured) and selects the scale bytes.
+    fn load_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
+        let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
+        let agpr = self.cfg.agpr_ops;
+        let mark = |b: &mut FnBuilder, v: ValueId| if agpr { b.agpr(v) } else { v };
+        let kbx = ox(t.it);
+        let scr = self.sc_s.at(&t.cur);
+        let so = scr.off_v(b);
+        let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
+        let (wa, wb) = scr.read(b, |b| {
+            let wa: Vec<ValueId> = (0..nm).map(|i| {
+                let a = b.bind_i32(ev(scb) + (ev(self.sa_rd[i]) & -4));
+                b.load_lds_b32(a)
+            }).collect();
+            let a = b.bind_i32(ev(scb) + 256);
+            (wa, b.load_lds_b32(a))
+        });
+        let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
+        let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
+        let bf: Vec<ValueId> = (0..nn).map(|j| { let v = br.read(b, j); mark(b, v) }).collect();
+        let af: Vec<ValueId> = (0..nm).map(|i| { let v = ar.read(b, i); mark(b, v) }).collect();
+        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
+        let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
+        self.staged = Some((bf, af, sa, sb));
+    }
+    fn compute_tile(&mut self, b: &mut FnBuilder) {
+        let (bf, af, sa, sb) = self.staged.take().expect("tile loaded");
+        let nn = bf.len();
+        for i in 0..af.len() {
+            for j in 0..nn {
+                gemm(b, &self.mma, self.acc[nn * i + j], af[i], bf[j], sa[i], sb, 0, 0);
+            }
+        }
+    }
 }
 
 impl PipeBody for Body {
@@ -167,8 +208,17 @@ impl PipeBody for Body {
         self.acc = vars.to_vec();
     }
     fn v_phase(&mut self, b: &mut FnBuilder, role: Role, t: &TileIt) {
-        // 2-slot cadence: the whole tile is computed between the stage of t+1 and its wait (the matrix phase stays empty)
-        self.window(b, role, t);
+        if self.cfg.reg_staged {
+            self.load_tile(b, t);
+        } else {
+            // 2-slot TwoPhaseOffset: the whole tile is computed between the stage of t+1 and its wait (the matrix phase stays empty)
+            self.window(b, role, t);
+        }
+    }
+    fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
+        if self.cfg.reg_staged {
+            self.compute_tile(b);
+        }
     }
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
@@ -207,13 +257,19 @@ impl PipeBody for Body {
 }
 
 pub fn gemm_mxfp8_bs_v2() -> Function {
-    build("gemm_mxfp8_bs_v2", Cfg { cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true })
+    build("gemm_mxfp8_bs_v2", Cfg { cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false })
 }
 
 /// v3: the vendor tile (CTA 256 x 256, 128 x 128 per wave, 64 accumulators): operand fragments in AGPRs, half of the accumulators pinned in AGPRs,
 /// 2-slot LDS ring (2 x 64 KB).
 pub fn gemm_mxfp8_bs_v3() -> Function {
-    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false })
+    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false })
+}
+
+/// v4: v3 with the register-staged 2-slot cadence (prefetch distance 2): all 16 operand fragments of a tile are read into AGPRs, the slot is refilled
+/// with tile t+2 while the 64 MMAs run.
+pub fn gemm_mxfp8_bs_v4() -> Function {
+    build("gemm_mxfp8_bs_v4", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: true })
 }
 
 fn build(name: &str, cfg: Cfg) -> Function {
@@ -295,14 +351,15 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let sb_row = b.bind_i32(((ev(bx) << lg_n) + (ev(wn) * wave_n as i32)).lshr(7));
     let sb_src = b.bind_i32(ev(sb_row) * ev(kb_v));
 
-    let mut pipe = Pipeline::new(if cfg.three_slots { Cadence::OneWindow } else { Cadence::TwoPhaseOffset }, kb_v, k_v, 128, Ext::ka(84));
-    if cfg.three_slots {
+    let cadence = if cfg.reg_staged { Cadence::RegStaged } else if cfg.three_slots { Cadence::OneWindow } else { Cadence::TwoPhaseOffset };
+    let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
+    if cfg.three_slots || cfg.reg_staged {
         pipe.vm_inflight = (a_dma.issues.len() + b_dma.issues.len() + 2) as u8;
     }
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
         cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd,
-        a_rd, b_rd, zero4, acc: Vec::new(),
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None,
     };
     pipe.run(b, Role::All, &mut body);
     for v in body.acc.iter().take(cfg.acc_agpr) {
