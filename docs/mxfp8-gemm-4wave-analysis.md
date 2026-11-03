@@ -310,3 +310,67 @@ hipModuleLaunchKernel(fn, N/256, M/256, 1, 256, 1, 1, 0, stream, nullptr, cfg);
 - MFMA：静态 320 条 `v_mfma_scale_f32_16x16x128_f8f6f4`；**225 条 VGPR 形式（dst/srcC = v）、95 条 AGPR 形式（dst/srcC = a）**；srcA/srcB 绝大多数为 AGPR（`dst=v srcA=a srcB=a` 219 条，`dst=a srcA=a srcB=a` 86 条）——印证 §4：操作数 pin 在 AGPR、累加器大部分在 VGPR、C01 + C11 尾在 AGPR。
 - AGPR 搬运：`v_accvgpr_write_b32` 173、`v_accvgpr_read_b32` 84、`v_accvgpr_mov_b32` 83（主要在 prologue 初始化 / epilogue 读 C01 / 暂存交换处；主循环内需逐段核对）。
 - 其它：`ds_read_b128` 192、`buffer_load_dwordx4` 93（含 LDS 直达形式）、`v_mov_b32_dpp` 104 + `v_perm_b32` 104（SFA 4×4 字节转置）、`v_cvt_pk_bf16_f32` 128、`ds_write_b64` 32 + `buffer_store_dwordx4` 32（epilogue）、`s_nop` 423（MFMA 相关等待态）、`s_barrier` 16、`s_waitcnt` 68。
+
+---
+
+## 11. 结果：tile 库实现的 MXFP8 blockscale GEMM（P4 收尾，2026-11-03）
+
+代码：`crates/amdgpu-kernels/src/gemm_mxfp8.rs`（只用 route-B 层：amdgpu-layout 推导全部地址、amdgpu-isa atom、amdgpu-tile `TiledMma`(16x16x128, swap_ab) /
+`TiledCopy`(`partition_lds`)、`tile::Pipeline`）；配置 `GemmConfig::{v2,v3,v4}`，最佳 = **v4**（vendor 结构：操作数作为 AGPR 循环变量、在最后一次使用后原地重载
+下一块，`Cadence::RegStaged` + `Pipeline::unroll2`）。门禁 `tools/gemm_gate.sh <kernel>`（cargo test、`gpu-verify --strict`、3 个形状 GEMM_OK、3 次启动确定性、
+与 vendor 交错 7 进程 × 3 次的中位数）。
+
+**最终门禁（GPU 5，分支 gemm-final = Main 30a035f + gemm-p4）**：
+
+| kernel | strict verify | 正确性 | 确定性 | 4096×4096×8192 TFLOP/s（交错中位数） |
+|---|---|---|---|---|
+| gemm_mxfp8_bs_v4 | 0 错误 0 警告，3 trusted assumes，19 contracts，0 unproven | GEMM_OK ×3 形状（vendor 同样） | 3/3 md5 一致 | **3064 vs vendor 3237 = 0.947** |
+| gemm_mxfp8_bs_v3 | 同上 | GEMM_OK ×3 | 3/3 | 2984 vs 3236 = 0.922 |
+
+trust ledger：pipeline 的 tile 计数器（`assume_trusted`）+ XCD raster 置换的两个上下界（`assume_trusted`，理由写在代码里）。无 tile/region trust。
+
+### 11.1 逐步结果（同形状；vendor 基线 3255–3303，视会话）
+
+| 步骤 | TFLOP/s | 说明 |
+|---|---|---|
+| v0：无 LDS，全局直读片段，32x32x64 | 652 | 正确性起点（布局推导的全部地址） |
+| v1：LDS 环 OneWindow 3 槽 + DMA | 863 | |
+| + `Pipeline::vm_inflight`（t+2 跨窗口在途） | 1248 | |
+| + 窗口交错（B 预取、A 原地预取） | 1367 | VGPR-only 的上限 |
+| v2：P2 API（TiledMma 16x16x128 swap_ab、TiledCopy） | 1324 | 同结构换 API |
+| v3：AGPR 操作数 + 32 个 AGPR 累加器，CTA 256×256 | 1690 | sched 的 AGPR 支持 |
+| A tile 改为 128B 行 + FMHA swizzle（每条 DMA 读整行，合并访存） | 2084 | 计数器：问题不在带宽而在指令开销 |
+| 部分 lgkmcnt 等待（`lgkmn`，CompileProfile::Gemm） | 2188 | |
+| `Cadence::TwoSlot`（每块一个 barrier） | 2228 | |
+| 下一块 DMA 分散到 MMA 之间 | 2367→2691 | 每 2 个 MMA 一条 |
+| VALU 削减（DMA SGPR 原点/M0 每 stage 一次、scale 移位不变量外提） | 2600 | |
+| scale panel（vendor sp64：所有 scale 一次进 LDS）+ 预转置（2 dword/块 + MFMA op_sel 选字节）+ XCD raster | 2786 | |
+| SALU 地址链（backend-llvm-tail：scalarize2/waveuni）+ DMA 间隔 3 | 2894 | |
+| LDS 转置 16 字节 epilogue（ds_write → ds_read_b128 → buffer_store_dwordx4） | 2963 | VGPR 200→168 |
+| v4：原地重载 + t+1 scale 读提前（sched ATT 发现）+ `rewait,hoistchain` | 3007 | |
+| `Pipeline::unroll2`（静态环槽） | 3030 | |
+| prologue：panel 转置放进 pipeline prologue、在 tile DMA 后面跑（17 → 2 个 barrier） | 3067 | 多 wave ATT 发现 prologue 多 9.4k 周期 |
+| 门禁（交错中位数，gemm-final） | **3064（0.947）** | |
+
+### 11.2 测过、未采用（v4，同会话，除注明外 ±0.5% 以内）
+
+`s_setprio` 包围 MMA（−0.4%）；DMA 间隔 1/2/4（−5%/−0.2%/−0.6%）；pre_sync（barrier 前先发 0/4/8/16/32 个 MMA，32+间隔 2 −2%）；32 个 AGPR 累加器（−0.5%）；
+共享 voffset + SGPR 增量（−1%）；B 预取深度 4/6（v3，−0.5/−0.8%）；XCD raster 8×4（中性；关闭 raster −3%）；ds_read_b64/ds_write_b64（中性）；
+scalarize/imm/sgpr 降级选项（中性）。
+
+### 11.3 消融与剩余差距
+
+* 只有 MMA 指令流（无 DMA、无 LDS 读）：0.0823 ms = 3340 TF/s —— 这是该指令在此形状下的上限；vendor（0.084 ms）几乎贴着它，即 vendor 把 DMA 与 LDS 读完全
+  藏在 MMA 后面。
+* 多 wave ATT（CU 1，4 个 SIMD）：barrier 到达偏差不是问题（中位 48 vs vendor 80 周期）；prologue 曾多 9.4k 周期（已修）；剩余在 MMA 区间内：ours 每块在块首
+  `vmcnt(0)` 上等 ~660 周期（DMA 延迟/带宽，预取距离 1），vendor 在 `vmcnt(0) lgkmcnt(0)` 上等 ~548 周期 + DMA 发射反压 ~25k/wave。两边都受 DMA（64 KB/CU/块，
+  ≈13 TB/s 聚合）约束，差别在暴露位置。
+* 剩余 ~5%：MMA 流内的 DMA 等待 + MFMA 管线邻近等待处的空泡 + 残余 prologue/epilogue。
+
+### 11.4 达到持平需要什么
+
+1. **第三个 LDS 级**（预取距离 2）：256×256×128 需要 3×64 KB + 17 KB panel > 160 KB——要么缩小 panel（按需刷新的 sp16/sp32），要么把 A/B 的一部分留在寄存器
+   （vendor 用寄存器当第 3 级：我们已用 AGPR 原地重载，但 DMA 仍是距离 1）。
+2. **更大的 K 块**：K=256/块 LDS 不够（2×128 KB）。
+3. **8 wave（每 SIMD 2 wave）**：用另一 wave 的 MMA 覆盖本 wave 的 `vmcnt` 等待；需要重新划分寄存器（每 wave 128×64）与 barrier 结构，属大改。
+4. 编译器侧：DMA 发射与 MMA 的精确交错（sched_group_barrier 模式，已可用但简单模式无收益），以及 hazard `s_nop` 的进一步削减。
