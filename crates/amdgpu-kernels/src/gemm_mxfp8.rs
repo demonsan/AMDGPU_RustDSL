@@ -319,6 +319,8 @@ impl PipeBody for Body {
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
         let agpr = self.cfg.agpr_ops;
+        let nords = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nords"));
+        let zf = if nords { Some(b.frag_zero(DType::Frag8)) } else { None };
         let mark = |b: &mut FnBuilder, v: ValueId| if agpr { b.agpr(v) } else { v };
         let kbx = ox(t.it);
         // scale words (one LDS round trip), then the byte selects (shifted to byte 0)
@@ -336,16 +338,16 @@ impl PipeBody for Body {
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
         // A0 and B0 first; the other B fragments are issued one ahead of the first row of MMAs (partial lgkm waits)
-        let mut af = { let v = ar.read(b, 0); mark(b, v) };
-        let mut bf: Vec<ValueId> = vec![{ let v = br.read(b, 0); mark(b, v) }];
+        let mut af = { let v = if let Some(z) = zf { z } else { ar.read(b, 0) }; mark(b, v) };
+        let mut bf: Vec<ValueId> = vec![{ let v = if let Some(z) = zf { z } else { br.read(b, 0) }; mark(b, v) }];
         let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
         for i in 0..nm {
             // prefetch the next A fragment while this one feeds 4 MMAs
-            let next = if i + 1 < nm { let v = ar.read(b, i + 1); Some(mark(b, v)) } else { None };
+            let next = if i + 1 < nm { let v = if let Some(z) = zf { z } else { ar.read(b, i + 1) }; Some(mark(b, v)) } else { None };
             for j in 0..nn {
                 if i == 0 && j + 1 < nn {
-                    let v = br.read(b, j + 1);
+                    let v = if let Some(z) = zf { z } else { br.read(b, j + 1) };
                     bf.push(mark(b, v));
                 }
                 if !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nomma")) {
