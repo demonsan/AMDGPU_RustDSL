@@ -23,7 +23,7 @@ fn demo() -> Function {
     let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0))]);
     let it = vars[0];
     // key0 = clamp(it + 1, nkv - 1) << 7 ; org = min(key0 * kk, 65536) ; soff = read_first_lane(org) + 256
-    let nx = amdgpu_dsl::I32::from(Opnd::Var(it)) + 1;
+    let nx = b.i32var(it) + 1;
     let last = ev(nkv) - 1;
     let key0 = b.bind_i32(nx.lt(ev(nkv)).select_i32(nx.clone(), last) << 7);
     let org = b.bind_i32((ev(key0) * ev(kk)).min(65536));
