@@ -65,7 +65,7 @@ fn opcode_probe_every_row_assembles() {
     keys.sort();
     for key in keys {
         let row = &t.rows[key];
-        let opname = key.split(':').next().unwrap();
+        let opname = key.split(|c| c == ':' || c == '@').next().unwrap();
         let op = *ALL_MOPS.iter().find(|o| format!("{o:?}") == opname).expect("row for unknown MOp");
         if row.text.len() == 1 && row.text[0] == "DROP" {
             continue;

@@ -38,7 +38,7 @@ fn hazard_matrix() {
     let mut keys: Vec<&String> = t.rows.keys().filter(|k| !k.starts_with("T_") && !k.starts_with("X_")).collect();
     keys.sort();
     let variant = |k: &str| -> (MOp, &amdgpu_compiler::backend::llvm20::Row) {
-        let name = k.split(':').next().unwrap();
+        let name = k.split(|c| c == ':' || c == '@').next().unwrap();
         (*ALL_MOPS.iter().find(|o| format!("{o:?}") == name).unwrap(), &t.rows[k])
     };
     let mut sm = Samples::new();
