@@ -89,6 +89,13 @@ fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
     f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_M0_REUSE").map_or(true, |v| v != "0")
 }
 
+/// An `FMHA_OPT` token for this kernel: `FMHA_OPT_SCOPE=<substring>` restricts the tokens to kernels whose name contains it (same-run A/B of a token
+/// on an alias of the shipped kernels, e.g. `fmha_fwd_hd128_mxfp8_v3s_*`).
+fn fmha_opt(f: &amdgpu_dsl::Function, tok: &str) -> bool {
+    let on = std::env::var("FMHA_OPT").map_or(false, |x| x.split(|c: char| c == ',' || c == ' ').any(|t| t == tok));
+    on && std::env::var("FMHA_OPT_SCOPE").map_or(true, |s| s.is_empty() || f.name.contains(s.as_str()))
+}
+
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
     let pname = policy_name(f);
     // per-kernel lowering options (Function::lower_opts) are appended to the caller's extras
@@ -106,10 +113,12 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         if pname.ends_with("_t128") {
             v.push("addrfold");
         }
-        if std::env::var("FMHA_OPT").map_or(false, |x| x.split(|c: char| c == ',' || c == ' ').any(|t| t == "saddrlds")) {
+        // v3 `_t128`: the SADDR DMA form (scalar tensor base + per-lane 32-bit offset: no 64-bit pointer add per DMA) measured +1.8..+2.1% on the
+        // B2H8S2048 layout median (two same-run A/Bs, docs/dsl-layout-refactor-design.md); on _vs128 / _kvsplit it is -0.2..-1.4%: not adopted there
+        if fmha_opt(f, "saddrlds") || (pname.ends_with("_t128") && f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_")) {
             v.push("saddrlds");
         }
-        if std::env::var("FMHA_OPT").map_or(false, |x| x.split(|c: char| c == ',' || c == ' ').any(|t| t == "pmdead")) {
+        if fmha_opt(f, "pmdead") {
             v.push("pmdead");
         }
         v.extend_from_slice(extra);
@@ -360,6 +369,11 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),
+        // A/B aliases of the shipped set (same code; FMHA_OPT_SCOPE=v3s scopes experiment tokens to them)
+        n if n.starts_with("fmha_fwd_hd128_mxfp8_v3s_") => kernel_by_name(&n.replace("_v3s_", "_v3_")).map(|mut f| {
+            f.name = n.to_string();
+            f
+        }),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine4h" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine4h()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine4" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine4()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine()),

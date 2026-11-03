@@ -28,6 +28,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e FMHA_ABLATE="${FMHA_ABLATE:-}" \
     -e FMHA_PITCH="${FMHA_PITCH:-}" \
     -e FMHA_OPT="${FMHA_OPT:-}" \
+    -e FMHA_OPT_SCOPE="${FMHA_OPT_SCOPE:-}" \
     -e AMDC_RA_DEBUG_FILE="${AMDC_RA_DEBUG_FILE:-}" \
     -e AMDC_NO_PHYS_STORE="${AMDC_NO_PHYS_STORE:-}" \
     -e AMDC_NO_PHYS_WAW="${AMDC_NO_PHYS_WAW:-}" \
