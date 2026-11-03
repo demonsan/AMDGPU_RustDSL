@@ -116,6 +116,8 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
         // audit (safe-asm review): VALU writers that were missing from the class - the scalef32 half-write converts (P words feeding the PV MFMA),
         // the permlane swap, and the register reads that expand to v_mov
         MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VPermlane32Swap | MOp::VReadPhys | MOp::VReadSub => Some(2),
+        // v_accvgpr_read/write/mov are VALU writes of a VGPR/AGPR: VALU write -> MFMA read = 2 wait states (CDNA4 ISA 7.6 table 38; the ISA table does not separate the files)
+        MOp::VAccvgprRead | MOp::VAccvgprWrite | MOp::VAccvgprMov => Some(2),
         _ => None,
     }
 }
@@ -392,9 +394,14 @@ fn wide_store_data_idx(op: MOp) -> usize {
     }
 }
 
+/// VGPR or AGPR (the two files of the unified register file): the hazards below apply to both. Physical ranges are tagged per file (AGPR_TAG), so a\n/// VGPR range never overlaps an AGPR range.
+fn vl(c: RClass) -> bool {
+    c.is_vector() || c.is_agpr()
+}
+
 /// A VALU (non-memory, non-matrix) instruction that writes a vector register.
 fn is_valu_vgpr_write(m: &MFunction, inst: &MInst) -> bool {
-    inst.dst.map_or(false, |d| m.vreg_class(d).is_vector()) && mfma_latency(inst.op).is_none() && crate::sched::effects::effects(m, inst).mem.is_none() && !matches!(inst.op, MOp::VSmfmac16x16x128Fp8)
+    inst.dst.map_or(false, |d| vl(m.vreg_class(d))) && mfma_latency(inst.op).is_none() && crate::sched::effects::effects(m, inst).mem.is_none() && !matches!(inst.op, MOp::VSmfmac16x16x128Fp8)
 }
 
 /// Wait states until an MFMA has finished WRITING its destination (not the value-level RAW latency): 16-pass ops need 18 + 1 (CDNA4 ISA 7.6 "XDL write
@@ -485,7 +492,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
                 _ => {
                     if let Some(d) = inst.dst {
-                        if m.vreg_class(d).is_vector() {
+                        if vl(m.vreg_class(d)) {
                             wr.push(rng(m, d));
                         }
                     }
@@ -525,7 +532,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
                 for (issue, need, dv, drange) in &dst_inflight {
                     for r in &touched {
-                        if !m.vreg_class(*r).is_vector() || m.canon(*r) == *dv {
+                        if !vl(m.vreg_class(*r)) || m.canon(*r) == *dv {
                             continue;
                         }
                         if overlaps(rng(m, *r), *drange) {
@@ -558,14 +565,14 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                     // SMFMAC reads A, B and SRC2 over several passes; the accumulator C is D itself (value-level pass)
                     for s in inst.srcs.iter().take(3) {
                         if let Src::Reg(r) = s {
-                            if m.vreg_class(*r).is_vector() {
+                            if vl(m.vreg_class(*r)) {
                                 srcs.push(rng(m, *r));
                             }
                         }
                     }
                 } else if !matches!(inst.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x64Fp8Z | MOp::VMfma32x32x8F16Z) {
                     if let Some(Src::Reg(r)) = inst.srcs.get(2) {
-                        if m.vreg_class(*r).is_vector() {
+                        if vl(m.vreg_class(*r)) {
                             srcs.push(rng(m, *r));
                         }
                     }
