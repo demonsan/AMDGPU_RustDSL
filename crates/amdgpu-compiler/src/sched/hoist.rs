@@ -82,8 +82,8 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
                 q += 1;
             }
             if q < p {
-                // movers: the members positioned after q, in program order (members already at or before q stay: their moved successors land after them)
-                let mut movers: Vec<usize> = members.iter().copied().filter(|&y| pos[y] > q).collect();
+                // movers: the members positioned at or after q, in program order (members before q stay: their moved successors land after them)
+                let mut movers: Vec<usize> = members.iter().copied().filter(|&y| pos[y] >= q).collect();
                 movers.sort_by_key(|&y| pos[y]);
                 if movers.is_empty() {
                     continue;
