@@ -106,7 +106,7 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         lw.uvars = v;
     }
     lw.run(f)?;
-    Ok(lw.finish())
+    lw.finish()
 }
 
 struct Lowerer {
@@ -137,6 +137,8 @@ struct Lowerer {
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
+    /// AGPR requests from the IR (resolved to vregs in inish).
+    agpr_marks: Vec<amdgpu_dsl::AgprMark>,
     /// `scalarize`: DSL values / loop variables that are wave-uniform integers (computed in SGPRs).
     uniform: HashSet<ValueId>,
     uvars: HashSet<amdgpu_dsl::VarId>,
@@ -166,6 +168,7 @@ impl Lowerer {
             loops: Vec::new(),
             alias: HashMap::new(),
             elide_fallthrough: false,
+            agpr_pin: Default::default(),
         };
         mir.blocks.push(Block::new(0));
 
@@ -239,13 +242,14 @@ impl Lowerer {
             use_counts,
             alias_cache: HashMap::new(),
             else_started: HashSet::new(),
+            agpr_marks: f.agpr.clone(),
             uniform: HashSet::new(),
             uvars: HashSet::new(),
             lazy: HashMap::new(),
         }
     }
 
-    fn finish(mut self) -> MFunction {
+    fn finish(mut self) -> Result<MFunction, String> {
         if !self.pending_vmem.is_empty() {
             self.push(MInst::new(MOp::SWaitVm).auto());
         }
@@ -253,6 +257,25 @@ impl Lowerer {
             self.push(MInst::new(MOp::SWaitLgkm).imm(0).auto());
         }
         self.set_term(Term::Endpgm);
+        // AGPR requests: record the canonical vregs now (before the clean-up passes can rename anything)
+        for mk in std::mem::take(&mut self.agpr_marks) {
+            let r = match mk.target {
+                amdgpu_dsl::AgprTarget::Var(v) => self.vars.get(v.0 as usize).copied(),
+                amdgpu_dsl::AgprTarget::Val(v) => self.val.get(&v).copied(),
+            };
+            if let Some(r) = r {
+                let c = self.mir.canon(r);
+                // an exact pin is never weakened by a later ny request on the same register (e.g. `agpr(load)` coalesced into a `pin_agpr_at` variable)
+                let want = mk.pin.unwrap_or(crate::agpr::AGPR_ANY);
+                match self.mir.agpr_pin.get(&c) {
+                    Some(old) if *old != crate::agpr::AGPR_ANY && want == crate::agpr::AGPR_ANY => {}
+                    Some(old) if *old != crate::agpr::AGPR_ANY && want != *old => return Err(format!("conflicting exact AGPR pins a{old} and a{want} on one register")),
+                    _ => {
+                        self.mir.agpr_pin.insert(c, want);
+                    }
+                }
+            }
+        }
         if opt_on("cmpfold") {
             fold_select_cmp(&mut self.mir);
             dce_cmp_pairs(&mut self.mir);
@@ -296,7 +319,7 @@ impl Lowerer {
         }
         coalesce(&mut self.mir);
         dce(&mut self.mir);
-        self.mir
+        Ok(self.mir)
     }
 
     fn fresh_label(&mut self) -> u32 {
@@ -346,6 +369,7 @@ impl Lowerer {
         // (a prefetch, for instance) stay in flight.
         let mut vm_newest: Option<usize> = None;
         let mut need_lgkm = false;
+        let mut lds_newest: Option<usize> = None;
         for s in srcs {
             if let Src::Reg(r) = s {
                 let r = &self.mir.canon(*r);
@@ -354,6 +378,22 @@ impl Lowerer {
                 }
                 if self.pending_smem.contains(r) || self.pending_lds.contains(r) {
                     need_lgkm = true;
+                }
+                if let Some(pos) = self.pending_lds.iter().rposition(|x| x == r) {
+                    lds_newest = Some(lds_newest.map_or(pos, |p| p.max(pos)));
+                }
+            }
+        }
+        // `lgkmn` (opt-in, the GEMM kernels): LDS reads return in issue order: with no scalar load in flight, `lgkmcnt(n)` (n = LDS read INSTRUCTIONS issued after the newest one
+        // feeding `srcs`; `pending_lds` holds one entry per instruction) keeps later reads (prefetches) in flight. Untracked LDS writes only make
+        // the count conservative (issued earlier: they complete first; issued later: they are not counted in n). The 4-bit counter caps n at 15.
+        if need_lgkm && self.pending_smem.is_empty() && opt_on("lgkmn") {
+            if let Some(pos) = lds_newest {
+                let after = self.pending_lds.len() - 1 - pos;
+                if after <= 15 {
+                    self.push(MInst::new(MOp::SWaitLgkm).imm(after as i64).auto());
+                    self.pending_lds.drain(..=pos);
+                    need_lgkm = false;
                 }
             }
         }
@@ -393,6 +433,51 @@ impl Lowerer {
         self.alias_vreg(base, o + off, class)
     }
 
+    /// Rewrite the `ds_read_b128`s that produced `v` (`LoadLdsB128` / `LoadLdsB128x2`, current block) to write the register of loop variable
+    /// `dst` directly. Legal only when no instruction after the first of those reads issues a read of `dst` (the old value) or writes it.
+    fn try_coalesce_lds_reload(&mut self, v: ValueId, dst: VReg) -> bool {
+        let want = match self.defs.get(&v) {
+            Some(Op::LoadLdsB128 { .. }) => (RClass::V4, 1usize),
+            Some(Op::LoadLdsB128x2 { .. }) => (RClass::V8, 2usize),
+            _ => return false,
+        };
+        let Some(&d) = self.val.get(&v) else { return false };
+        if self.mir.vreg_class(d) != want.0 || self.mir.vreg_class(dst) != want.0 || self.mir.alias.contains_key(&d) || self.mir.alias.contains_key(&dst) {
+            return false;
+        }
+        let insts = &self.mir.blocks[self.cur].insts;
+        let prod: Vec<usize> = insts.iter().enumerate().filter(|(_, i)| i.op == MOp::LdsReadB128 && i.dst.map_or(false, |x| self.mir.canon(x) == d)).map(|(k, _)| k).collect();
+        if prod.len() != want.1 {
+            return false;
+        }
+        let first = prod[0];
+        for (k, i) in insts.iter().enumerate().skip(first) {
+            if prod.contains(&k) {
+                continue;
+            }
+            if i.uses().iter().any(|u| self.mir.canon(*u) == dst) || i.dst.map_or(false, |x| self.mir.canon(x) == dst) {
+                return false;
+            }
+        }
+        // new destinations (the variable's tuple or its halves)
+        let mut news: Vec<(usize, VReg)> = Vec::new();
+        for &k in &prod {
+            let old = self.mir.blocks[self.cur].insts[k].dst.unwrap();
+            let off = self.mir.alias.get(&old).map(|a| a.1).unwrap_or(0);
+            let nd = if want.0 == RClass::V4 { dst } else { self.alias_vreg(dst, off, RClass::V4) };
+            news.push((k, nd));
+        }
+        for (k, nd) in news {
+            self.mir.blocks[self.cur].insts[k].dst = Some(nd);
+        }
+        for e in self.pending_lds.iter_mut() {
+            if *e == d {
+                *e = dst;
+            }
+        }
+        self.val.insert(v, dst);
+        true
+    }
     /// Make the instruction that produced value `v` write `new_dst` directly (instead of a fresh
     /// register that would then be moved into a fragment). Only for single-use results of plain
     /// ALU ops defined earlier in the current block.
@@ -765,6 +850,48 @@ impl Lowerer {
         Ok(Src::Reg(r))
     }
 
+    /// `dst = cond ? a : b` in SALU: `cond` is a (possibly negated) signed compare of uniform integers, re-emitted as `s_cmp_lt_i32` right before
+    /// `s_cselect_b32` (SCC is not kept live across other SALU work).
+    fn scalar_select(&mut self, dst: ValueId, cond: Opnd, a: Opnd, b: Opnd) -> Result<(), String> {
+        let mut neg = false;
+        let mut c = cond;
+        let (x, y) = loop {
+            let Opnd::Val(v) = c else { return Err("scalar select: the condition is not a value".into()) };
+            match self.defs.get(&v).cloned() {
+                Some(Op::NotI1(n)) => {
+                    neg = !neg;
+                    c = n;
+                }
+                Some(Op::CmpLtI32(x, y)) => break (x, y),
+                Some(Op::CmpGeI32(x, y)) => {
+                    neg = !neg;
+                    break (x, y);
+                }
+                other => return Err(format!("scalar select: condition {other:?} is not a uniform integer compare")),
+            }
+        };
+        let (t, f) = if neg { (b, a) } else { (a, b) };
+        // operands first (literals into SGPRs), then the compare immediately followed by the select
+        let mut ops = Vec::with_capacity(4);
+        for o in [x, y, t, f] {
+            ops.push(self.s_operand(o)?);
+        }
+        for i in [0usize, 2] {
+            if let (Src::Imm(k), Src::Imm(_)) = (ops[i], ops[i + 1]) {
+                let r = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SMovB32).def(r).imm(k));
+                ops[i] = Src::Reg(r);
+            }
+        }
+        let regs: Vec<Src> = ops.iter().copied().filter(|s| matches!(s, Src::Reg(_))).collect();
+        self.touch(&regs);
+        self.push(MInst::new(MOp::SCmpLtI32).src(ops[0]).src(ops[1]));
+        let d = self.new_vreg(RClass::S1);
+        self.push(MInst::new(MOp::SCselectB32).def(d).src(ops[2]).src(ops[3]));
+        self.val.insert(dst, d);
+        Ok(())
+    }
+
     /// `dst = a <op> b` in SALU (both operands uniform).
     fn scalar_bin(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
         let (mut sa, mut sb) = (self.s_operand(a)?, self.s_operand(b)?);
@@ -1079,7 +1206,16 @@ impl Lowerer {
                     Err(format!("value v{v} is not an eight-dword fragment"))
                 }
             }
-            _ => Err("eight-dword fragment operand must be an SSA value".to_string()),
+            Opnd::Var(v) => {
+                let r = *self.vars.get(v.0 as usize).ok_or_else(|| format!("var{} not lowered", v.0))?;
+                if self.mir.vreg_class(r) == RClass::V8 {
+                    self.touch(&[Src::Reg(r)]);
+                    Ok(r)
+                } else {
+                    Err(format!("var{} is not an eight-dword fragment", v.0))
+                }
+            }
+            _ => Err("eight-dword fragment operand must be an SSA value or a loop variable".to_string()),
         }
     }
 
@@ -1303,6 +1439,15 @@ impl Lowerer {
                         }
                         continue;
                     }
+                    // in-place reload: set_var(var, load_lds(..)) where the load is the value's only use and nothing reads the variable after the load
+                    // was issued - the ds_read writes the variable's own registers (no copy, no second fragment; the AGPR pipelining pattern)
+                    if matches!(class, RClass::V4 | RClass::V8) {
+                        if let Opnd::Val(v) = value {
+                            if self.use_counts.get(v).copied() == Some(1) && self.try_coalesce_lds_reload(*v, dst) {
+                                continue;
+                            }
+                        }
+                    }
                     let src = match class {
                         RClass::V1 => self.as_v1(*value)?,
                         RClass::V2 => self.as_v2(*value)?,
@@ -1472,6 +1617,14 @@ impl Lowerer {
                             }
                             continue;
                         }
+                        // loop-entry in-place load: init = load_lds(..) (single use) writes the variable's own registers instead of a second fragment + copy
+                        if matches!(class, RClass::V4 | RClass::V8) {
+                            if let Opnd::Val(v) = init[i] {
+                                if self.use_counts.get(&v).copied() == Some(1) && self.try_coalesce_lds_reload(v, r) {
+                                    continue;
+                                }
+                            }
+                        }
                         let src = match class {
                             RClass::V1 => self.as_v1(init[i])?,
                             RClass::V2 => self.as_v2(init[i])?,
@@ -1622,6 +1775,9 @@ impl Lowerer {
                         let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128 } else { MOp::GlobalLoadLdsB32 };
                         self.push(MInst::new(mop).srcreg(rb).srcreg(sreg).imm(*byte_off as i64));
                     }
+                }
+                Stmt::SchedGroup { mask, size, sync } => {
+                    self.push(MInst::new(MOp::SchedGroup).imm((*mask as i64 & 0xffff) | ((*size as i64 & 0xffff) << 16) | ((*sync as i64) << 32)));
                 }
                 Stmt::SetPrio { prio } => {
                     self.push(MInst::new(MOp::SSetPrio).imm(*prio as i64));
@@ -1790,6 +1946,13 @@ impl Lowerer {
             Op::LshrI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SLshrB32, *a, *b)?,
             Op::AndI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SAndB32, *a, *b)?,
             Op::XorI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SXorB32, *a, *b)?,
+            Op::MinI32(a, b) if self.uniform.contains(&dst) => self.scalar_bin(dst, MOp::SMinI32, *a, *b)?,
+            Op::Select { ty: DType::I32, cond, a, b } if self.uniform.contains(&dst) => self.scalar_select(dst, *cond, *a, *b)?,
+            Op::ReadFirstLane(Opnd::Val(a)) if self.uniform.contains(a) && self.val.get(a).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S1) => {
+                // already wave-uniform in an SGPR: no v_mov + v_readfirstlane round trip
+                let r = self.val[a];
+                self.val.insert(dst, r);
+            }
             Op::AddI32(a, b) if opt_on("addrfold") && self.lazy_add(dst, *a, *b)? => {}
             Op::AddI32(a, b) => self.bin_v1(dst, MOp::VAddU32, *a, *b)?,
             Op::AddF32(a, b) => self.bin_v1(dst, MOp::VAddF32, *a, *b)?,
@@ -2270,7 +2433,9 @@ impl Lowerer {
                     let part = self.alias_vreg(d, (2 * r) as u8, RClass::V2);
                     self.push(MInst::new(MOp::LdsReadB64TrB8).def(part).srcreg(a).imm(off));
                 }
-                self.pending_lds.push(d);
+                for _ in 0..addrs.len() {
+                    self.pending_lds.push(d);
+                }
                 self.val.insert(dst, d);
             }
             Op::LoadLdsB128x2 { lo, hi } => {
@@ -2281,6 +2446,7 @@ impl Lowerer {
                 let (a_hi, off_hi) = self.lds_addr(*hi)?;
                 let part_hi = self.alias_vreg(d, 4, RClass::V4);
                 self.push(MInst::new(MOp::LdsReadB128).def(part_hi).srcreg(a_hi).imm(off_hi));
+                self.pending_lds.push(d);
                 self.pending_lds.push(d);
                 self.val.insert(dst, d);
             }            Op::Frag8(a, b, c, d, e, f, g, h) => {
@@ -2748,6 +2914,7 @@ impl Lowerer {
 fn coalesce(m: &mut MFunction) {
     let classes: Vec<RClass> = m.vregs.clone();
     let aliased = m.alias.clone();
+    let apin = m.agpr_pin.clone();
     let mut uses: HashMap<VReg, u32> = HashMap::new();
     for b in &m.blocks {
         for inst in &b.insts {
@@ -2772,7 +2939,9 @@ fn coalesce(m: &mut MFunction) {
                     let prev_is_move_to_s = prev.op == MOp::VMovB32;
                     // A lane of a fragment is not a standalone value: the whole tuple may still be read.
                     let s_is_alias = aliased.contains_key(&s);
-                    if prev_defs_s && single_use && same_class && !prev_is_move_to_s && !s_is_alias {
+                    // an AGPR-requested vreg keeps its own mov (it becomes a v_accvgpr_* op)
+                    let agpr_involved = apin.contains_key(&aliased.get(&d).map(|a| a.0).unwrap_or(d)) || apin.contains_key(&aliased.get(&s).map(|a| a.0).unwrap_or(s));
+                    if prev_defs_s && single_use && same_class && !prev_is_move_to_s && !s_is_alias && !agpr_involved {
                         if let Some(pd) = b.insts[i - 1].dst.as_mut() {
                             *pd = d;
                         }
@@ -3021,6 +3190,9 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
         let mut u: HashSet<ValueId> = HashSet::new();
         let mut wi: HashSet<ValueId> = HashSet::new(); // workitem id values (waveuni)
         let mut cst: HashMap<ValueId, i64> = HashMap::new();
+        // `scalarize2`: uniform integer compares (only consumed by uniform selects: the select re-emits them as s_cmp + s_cselect)
+        let ext = opt_on("scalarize2");
+        let mut ucond: HashSet<ValueId> = HashSet::new();
         let is_u = |o: &Opnd, u: &HashSet<ValueId>, uvars: &HashSet<amdgpu_dsl::VarId>| match o {
             Opnd::I32(_) => true,
             Opnd::Val(v) => u.contains(v),
@@ -3048,6 +3220,22 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         Op::AddI32(a, b) | Op::MulI32(a, b) | Op::ShlI32(a, b) | Op::LshrI32(a, b) | Op::AndI32(a, b) | Op::XorI32(a, b) => {
                             is_u(a, &u, &uvars) && is_u(b, &u, &uvars)
                         }
+                        Op::MinI32(a, b) if ext => is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
+                        Op::CmpLtI32(a, b) | Op::CmpGeI32(a, b) if ext => {
+                            if is_u(a, &u, &uvars) && is_u(b, &u, &uvars) {
+                                ucond.insert(*dst);
+                            }
+                            false
+                        }
+                        Op::NotI1(Opnd::Val(c)) if ext => {
+                            if ucond.contains(c) {
+                                ucond.insert(*dst);
+                            }
+                            false
+                        }
+                        Op::Select { ty: DType::I32, cond: Opnd::Val(c), a, b } if ext => ucond.contains(c) && is_u(a, &u, &uvars) && is_u(b, &u, &uvars),
+                        // the result of v_readfirstlane is wave-uniform by definition
+                        Op::ReadFirstLane(_) if ext => true,
                         _ => false,
                     };
                     if uni {
@@ -3416,7 +3604,8 @@ fn remat_exprs(m: &mut MFunction) {
 /// then only lives from its definition to its last use outside loops. Costs one DS read per (value, loop block) per
 /// iteration and `256 * values * waves` bytes of LDS (appended after the kernel's own LDS). Returns (#values, total bytes).
 fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
-    const TARGET: u32 = 236; // stop when the true peak is this low (alignment / reserved registers need slack)
+    // stop when the true peak is this low (alignment / reserved registers need slack); AMDC_RA_LDS_SPILL_TARGET lowers it for the regression probe
+    let target: u32 = std::env::var("AMDC_RA_LDS_SPILL_TARGET").ok().and_then(|v| v.parse().ok()).unwrap_or(236);
     let nwaves = (m.workgroup_size / 64).max(1);
     let base = (m.lds_bytes + 15) / 16 * 16;
     let newv = |m: &mut MFunction| -> VReg {
@@ -3442,7 +3631,7 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
     let mut spilled = 0usize;
     for _ in 0..count {
         let (peak, ppos, pblk) = crate::regalloc::pressure_profile(m);
-        if peak <= TARGET {
+        if peak <= target {
             break;
         }
         let pidx = ppos - m.blocks[..pblk].iter().map(|b| b.insts.len()).sum::<usize>();

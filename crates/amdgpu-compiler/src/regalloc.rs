@@ -18,6 +18,9 @@ pub struct Alloc {
 }
 
 const VGPR_COUNT: usize = 256;
+/// AGPRs per wave (a0..a255); arch VGPR + AGPR together must fit the unified 512-register file.
+const AGPR_COUNT: usize = 256;
+pub const UNIFIED_FILE: u32 = 512;
 // 102 usable SGPRs (the descriptor's next_free_sgpr must stay <= 102; vcc is separate)
 const SGPR_COUNT: usize = 102;
 
@@ -368,7 +371,7 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     // SGPRs.
     let mut sregs: Vec<(usize, usize, VReg, RClass)> = Vec::new();
     for (r, c) in m.vregs.iter().enumerate() {
-        if !c.is_vector() {
+        if c.is_scalar() {
             let s = if start[r] == usize::MAX { 0 } else { start[r] };
             sregs.push((s, end[r], r as VReg, *c));
         }
@@ -397,9 +400,68 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
         sactive.push((e, r, c));
     }
 
+    // AGPRs: a separate register file (one unified 512-register budget with the arch VGPRs). Explicit pins first, then first fit
+    // over per-register occupancy intervals (hulls, like the scan above).
+    let mut max_a = 0usize;
+    {
+        let mut avs: Vec<(usize, usize, VReg, RClass)> = Vec::new();
+        for (r, c) in m.vregs.iter().enumerate() {
+            if c.is_agpr() && !m.alias.contains_key(&(r as VReg)) && start[r] != usize::MAX {
+                avs.push((start[r], end[r], r as VReg, *c));
+            }
+        }
+        avs.sort_by_key(|x| (x.0, x.1));
+        let mut occ: Vec<Vec<(usize, usize)>> = vec![Vec::new(); AGPR_COUNT];
+        let fits = |occ: &Vec<Vec<(usize, usize)>>, i: usize, w: usize, s: usize, e: usize| -> bool {
+            i + w <= AGPR_COUNT && (0..w).all(|k| occ[i + k].iter().all(|(os, oe)| *oe < s || e < *os))
+        };
+        for &(s, e, r, c) in avs.iter().filter(|x| m.agpr_pin.contains_key(&x.2)) {
+            let w = c.dwords() as usize;
+            let base = m.agpr_pin[&r] as usize;
+            if base % w != 0 {
+                return Err(format!("AGPR pin of r{r} ({c:?}) at a{base} is not aligned to its width {w}"));
+            }
+            if !fits(&occ, base, w, s, e) {
+                return Err(format!("AGPR pin of r{r} ({c:?}) at a{base}..a{} overlaps another value live at the same time (or leaves the file)", base + w - 1));
+            }
+            for k in 0..w {
+                occ[base + k].push((s, e));
+            }
+            phys[r as usize] = AGPR_TAG + base as u32;
+            max_a = max_a.max(base + w);
+        }
+        for &(s, e, r, c) in avs.iter().filter(|x| !m.agpr_pin.contains_key(&x.2)) {
+            let w = c.dwords() as usize;
+            let mut i = 0usize;
+            let slot = loop {
+                if i + w > AGPR_COUNT {
+                    return Err(format!("out of AGPRs allocating r{r} ({c:?}, live {s}..{e})"));
+                }
+                if i % w == 0 && fits(&occ, i, w, s, e) {
+                    break i;
+                }
+                i += 1;
+            };
+            for k in 0..w {
+                occ[slot + k].push((s, e));
+            }
+            phys[r as usize] = AGPR_TAG + slot as u32;
+            max_a = max_a.max(slot + w);
+        }
+    }
+    {
+        // unified budget: accum_offset (arch VGPRs rounded to 4) + AGPRs <= 512; arch VGPRs alone <= 256
+        let arch = (max_v + 3) / 4 * 4;
+        if max_a > 0 && arch + max_a > UNIFIED_FILE as usize {
+            return Err(format!("out of AGPRs: {arch} arch VGPRs + {max_a} AGPRs exceed the unified {UNIFIED_FILE}-register file"));
+        }
+    }
     // Sub-register views live inside their tuple.
     for (a, (t, off)) in &m.alias {
-        phys[*a as usize] = phys[*t as usize] + *off as u32;
+        // (a tuple that was never allocated - e.g. a load coalesced into a loop variable - leaves its views unallocated too)
+        if phys[*t as usize] != u32::MAX {
+            phys[*a as usize] = phys[*t as usize] + *off as u32;
+        }
     }
 
     for (i, u) in used_v.iter().enumerate() {
@@ -433,7 +495,27 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
         }
     }
 
-    Ok(Alloc { phys: patched, max_v: max_v as u32, max_s: max_s as u32, scalar: m.vregs.iter().map(|c| !c.is_vector()).collect() })
+    Ok(Alloc { phys: patched, max_v: max_v as u32, max_s: max_s as u32, scalar: m.vregs.iter().map(|c| c.is_scalar()).collect() })
+}
+
+/// Number of AGPRs a function uses (highest allocated AGPR + 1), from an allocation.
+pub fn agpr_count(m: &MFunction, a: &Alloc) -> u32 {
+    let mut n = 0u32;
+    for (r, c) in m.vregs.iter().enumerate() {
+        if c.is_agpr() && is_agpr_phys(a.phys[r]) {
+            n = n.max(a.phys[r] - AGPR_TAG + c.dwords());
+        }
+    }
+    n
+}
+
+/// Unified-file accounting of an allocation: (accum_offset, next_free_vgpr, waves per SIMD). accum_offset is the arch VGPR count rounded to 4
+/// (.amdhsa_accum_offset), next_free_vgpr = accum_offset + AGPRs rounded to 8; waves per SIMD = floor(512 / next_free_vgpr) (at most 8).
+pub fn unified_budget(max_v: u32, agprs: u32) -> (u32, u32, u32) {
+    let accum = ((max_v + 3) / 4 * 4).max(4);
+    let total = if agprs == 0 { accum } else { ((accum + agprs + 7) / 8) * 8 };
+    let waves = (UNIFIED_FILE / total.max(1)).min(8).max(1);
+    (accum, total, waves)
 }
 
 fn mark_used(used: &mut [bool], slot: usize, c: RClass) {

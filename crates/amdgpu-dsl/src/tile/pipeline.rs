@@ -24,6 +24,22 @@ use crate::{DType, Ext, FnBuilder, Opnd, ValueId, VarId, I32};
 pub enum Cadence {
     TwoPhaseOffset,
     OneWindow,
+    /// 2-slot ring with the operands staged through REGISTERS (the aiter 4-wave GEMM): the body keeps tile t in registers (loop state) and, while
+    /// computing it, reloads them in place from the slot of tile t+1; one wait + barrier per tile publishes t+1 and frees the slot of t, which then
+    /// receives tile t+2 (one tile of DMA latency hidden behind the compute, the LDS reads of t+1 behind the MMAs of t):
+    /// ```text
+    /// prologue: stage(0) | stage(1) | stores | wait_vm(0) wait_lds(0) barrier | compute(0) = load tile 0 into registers
+    /// loop t:   wait_vm(0) wait_lds(0) barrier | stage(t+2) -> slot(t) | m_phase(t): MMAs of t + in-place loads of t+1 (`t.next`)
+    /// tail:     m_phase (no loads: `staged` = false)
+    /// ```
+    RegStaged,
+    /// 2-slot ring, one group, ONE barrier per tile (prefetch distance 1, for tiles whose 3 slots do not fit the LDS):
+    /// ```text
+    /// prologue: stage(0) wait_vm(0) | stores | wait_vm(0) wait_lds(0) barrier | compute(0) wait_lds(0)
+    /// loop t:   stage(t+1) | window(t) | wait_vm(0) wait_lds(0) barrier
+    /// ```
+    /// The barrier both publishes tile t+1 and retires the reads of tile t before stage(t+2) overwrites its slot.
+    TwoSlot,
 }
 
 /// One iteration of the pipeline as the body sees it.
@@ -72,6 +88,9 @@ pub trait PipeBody {
     fn m_phase(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
     /// `OneWindow`: the whole window of tile t.
     fn window(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
+    /// `RegStaged`: register-only work of tile t issued BEFORE the iteration's wait + barrier (e.g. the first MMAs, which then run while the wave
+    /// waits for the DMA / the other waves); it must not touch the LDS slots.
+    fn pre_sync(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
 }
 
 /// The pipeline over `nkv` tiles of `tile_rows` rows (the last one possibly partial: `kv_len` rows in total).
@@ -106,6 +125,8 @@ impl Pipeline {
         match self.cadence {
             Cadence::TwoPhaseOffset => 2,
             Cadence::OneWindow => 3,
+            Cadence::RegStaged => 2,
+            Cadence::TwoSlot => 2,
         }
     }
     fn lg(&self) -> i32 {
@@ -118,7 +139,11 @@ impl Pipeline {
             it: Opnd::I32(0),
             cur: SlotIdx::new(0, 0),
             next: SlotIdx::new(1, 1),
-            n2: if self.cadence == Cadence::OneWindow { Some(SlotIdx::new(2, 2)) } else { None },
+            n2: match self.cadence {
+                Cadence::OneWindow => Some(SlotIdx::new(2, 2)),
+                Cadence::RegStaged => Some(SlotIdx::new(0, 2)),
+                Cadence::TwoPhaseOffset | Cadence::TwoSlot => None,
+            },
             masked: false,
             staged: true,
             tile_rows: self.tile_rows,
@@ -128,6 +153,11 @@ impl Pipeline {
         body.stage(b, role, &I32::c(0), &s0);
         b.wait_vm(0);
         body.stage_complete(b, role, &s0);
+        if self.cadence == Cadence::RegStaged {
+            // tile 1 into slot 1 (clamped as below); both complete at the prologue wait
+            let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
+            body.stage(b, role, &key1, &SlotIdx::new(1, 1));
+        }
         if self.cadence == Cadence::OneWindow {
             // tile 1 (clamped to the last tile: a one-tile sequence re-stages tile 0 as generation 1)
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
@@ -237,6 +267,58 @@ impl Pipeline {
                 if last_barrier {
                     b.barrier();
                 }
+                i1
+            }
+            Cadence::TwoSlot => {
+                let i1 = b.bind_i32(varx(idx) ^ 1);
+                let it_p1 = b.let_i32(varx(it) + 1);
+                let nn = it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1);
+                let t = TileIt {
+                    it: Opnd::Var(it),
+                    cur: SlotIdx::new(idx, it),
+                    next: SlotIdx::new(i1, b.bind_opnd(&it_p1)),
+                    n2: None,
+                    masked,
+                    staged,
+                    tile_rows: self.tile_rows,
+                };
+                self.prebind(b, &t);
+                if staged {
+                    let key_n = b.let_i32(nn << self.lg());
+                    body.stage(b, role, &key_n, &t.next);
+                }
+                body.window(b, role, &t);
+                if staged {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
+                }
+                i1
+            }
+            Cadence::RegStaged => {
+                let i1 = b.bind_i32(varx(idx) ^ 1);
+                let it_p1 = b.let_i32(varx(it) + 1);
+                let it_p2 = b.let_i32(varx(it) + 2);
+                let t = TileIt {
+                    it: Opnd::Var(it),
+                    cur: SlotIdx::new(idx, it),
+                    next: SlotIdx::new(i1, b.bind_opnd(&it_p1)),
+                    // tile t+2 reuses the slot of tile t (its registers were loaded in the previous iteration)
+                    n2: Some(SlotIdx::new(idx, b.bind_opnd(&it_p2))),
+                    masked,
+                    staged,
+                    tile_rows: self.tile_rows,
+                };
+                self.prebind(b, &t);
+                body.pre_sync(b, role, &t);
+                if staged {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
+                    let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
+                    body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
+                }
+                body.m_phase(b, role, &t);
                 i1
             }
             Cadence::OneWindow => {

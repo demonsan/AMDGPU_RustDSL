@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agpr;
 pub mod asm;
 pub mod asm_check;
 pub mod pin_check;
@@ -33,7 +34,7 @@ pub fn policy_name(f: &amdgpu_dsl::Function) -> &str {
         Some(P::T128) => "fmha_fwd_hd128_mxfp8_t128",
         Some(P::KvSplit) => "fmha_fwd_hd128_mxfp8_kvsplit",
         Some(P::Combine) => "fmha_fwd_hd128_mxfp8_kvsplit_combine8h",
-        Some(P::Default) => "",
+        Some(P::Default) | Some(P::Gemm) => "",
     }
 }
 
@@ -85,6 +86,10 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
 
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
     let pname = policy_name(f);
+    // per-kernel lowering options (Function::lower_opts) are appended to the caller's extras
+    let mut extra_all: Vec<&str> = extra.to_vec();
+    extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
+    let extra: &[&str] = &extra_all;
     // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
     // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/status.md round 47).
     let base = if (pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || pname.ends_with("_kvsplit") || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))) && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
@@ -104,6 +109,12 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
+    } else if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
+        // CompileProfile::Gemm: partial lgkmcnt waits keep the prefetched fragment reads in flight (`lgkmn`)
+        // + scalarize / scalarize2 / waveuni: the wave-uniform DMA address chains (tile origins with clamps/selects, slot bases, M0, soffsets) in SALU
+        let mut v: Vec<&str> = vec!["dce", "cmpfold", "lgkmn", "zeroinit", "scalarize", "scalarize2", "waveuni"];
+        v.extend_from_slice(extra);
+        lower::with_opts(&v, || lower::lower(f))?
     } else if pname.starts_with("fmha_fwd_hd128_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
         // the FMHA kernels zero their accumulators in place (bit-exact on all 15 shapes, -160 v_mov on _t, docs/status.md)
         let mut v: Vec<&str> = vec!["zeroinit"];
@@ -112,6 +123,12 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     } else {
         lower::lower_with_extra(f, extra)?
     };
+    // AGPR requests (DSL pin_agpr / gpr): move the vregs to the AGPR file and repair the instructions that cannot touch it
+    let base = {
+        let mut b = base;
+        agpr::assign(&mut b)?;
+        b
+    };
     let sched_opts = match sched::Options::from_env() {
         Some(o) if o.auto => sched::auto_plan(&base, &o),
         other => other,
@@ -119,6 +136,18 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // The FMHA kernels default to the wait-recomputing pass (partial vmcnt/lgkmcnt waits, ALU across barriers, ds_read hoisting): +9% on the
     // transposed kernel, bit-identical results (measured, docs/status.md round 44). AMDC_SCHED=0 turns it off.
     let sched_opts = match sched_opts {
+        // GEMM profile / explicit Function::sched_opts: the scoreboard wait pass (+ ds_read hoisting, no reordering) with the kernel's own tokens on top
+        None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0") && (f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) || f.sched_opts.is_some()) => {
+            let mut o = sched::Options::default();
+            if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) {
+                o.reorder = false;
+                o.ldshoist = true;
+            }
+            if let Some(s) = &f.sched_opts {
+                o.apply_tokens(s);
+            }
+            Some(o)
+        }
         None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0")
             && (pname.starts_with("fmha_fwd_hd128_mxfp8_t") || pname.starts_with("fmha_fwd_hd128_mxfp8_sv") || pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))) =>
         {
@@ -185,6 +214,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         eprintln!("sched: falling back to the unscheduled code ({})", last_err.chars().take(if std::env::var("AMDC_SCHED_VERBOSE").is_ok() { 6000 } else { 120 }).collect::<String>());
     }
     let mut m = base;
+    sched::phase::strip(&mut m); // scheduler directives are meaningless without the scheduler
     let pe = pin_check::check(&m);
     if !pe.is_empty() {
         return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
@@ -194,6 +224,8 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     if !errs.is_empty() {
         return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
     }
+    // the unscheduled path trusted its lowering-time waits; passes after lowering (LDS spill, ...) can invalidate them: re-check on every path
+    sched::waits::verify_waits(&m).map_err(|e| format!("wait verification failed: {e}"))?;
     let alloc = regalloc::allocate(&m)?;
     // Register reuse (especially the hole-filling packing) can place a new value in a register an in-flight MFMA still reads:
     // pad the physical write-after-read hazard on every path, not only for scheduled code (AMDC_NO_PHYS_WAR=1 disables, testing).
@@ -232,11 +264,22 @@ pub fn resolve_backend(name: &str, f: &amdgpu_dsl::Function) -> (String, Option<
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
-    &["attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_pp", "fmha_fwd_hd128_mxfp8_sv", "sched_ovl_both", "sched_ovl_mfma", "sched_ovl_valu", "sched_ovl_vfirst", "sched_coissue_both", "sched_coissue_mfma", "sched_coissue_valu", "sched_coissue_cboth", "sched_coissue_cvalu", "sched_valu_mul", "sched_valu_max3", "sched_valu_exp", "sched_mfma_chain", "sched_mfma_valu16", "sched_mfma_valu4", "sched_diamond", "sched_occ_chain", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "fmha_fwd_hd128_mxfp8_kvsplit_combine", "fmha_fwd_hd128_mxfp8_kvsplit_combine4", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg"]
+    &["probe_agpr_reload4_ref", "probe_agpr_reload4", "probe_agpr_reload_ref", "probe_agpr_reload", "probe_agpr_m16_ref", "probe_agpr_m16_mix", "probe_agpr_ref", "probe_agpr_acc", "probe_agpr_full", "probe_agpr_pinned", "attention_fwd", "attn_debug", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_wide", "probe_mfma_fp8", "probe_mfma_scale", "probe_roles", "probe_waves2", "probe_lds_self2", "probe_roles_loop", "probe_fmha_datapath", "probe_ab_loops", "probe_nested_acc", "probe_loop_mfma", "probe_fmha_core", "probe_pack", "probe_fp8_matmul", "probe_fp8_load", "probe_fp8_min", "probe_fp8_minload", "probe_fp8_softmax", "probe_fp8_fmha_tile", "probe_fp8_fmha_2tile", "probe_fp8_fmha_online", "probe_fp8_fmha_oreg", "probe_fp8_fmha_multiwave", "probe_fp8_fmha_pingpong", "probe_fp8_fmha_abloops", "probe_lds_tr_b8", "probe_fp8_matmul_tr", "probe_fp8_fmha_tr", "probe_fp8_fmha_trab", "probe_fp8_fmha_hd128", "probe_fp8_fmha_hd128b", "probe_fp8_fmha_hd128c", "probe_fp8_matmul_blk", "fmha_fwd_hd128_mxfp8", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_pp", "fmha_fwd_hd128_mxfp8_sv", "sched_ovl_both", "sched_ovl_mfma", "sched_ovl_valu", "sched_ovl_vfirst", "sched_coissue_both", "sched_coissue_mfma", "sched_coissue_valu", "sched_coissue_cboth", "sched_coissue_cvalu", "sched_valu_mul", "sched_valu_max3", "sched_valu_exp", "sched_mfma_chain", "sched_mfma_valu16", "sched_mfma_valu4", "sched_diamond", "sched_occ_chain", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "fmha_fwd_hd128_mxfp8_kvsplit_combine", "fmha_fwd_hd128_mxfp8_kvsplit_combine4", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg"]
 }
 
 pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
     match name {
+        "probe_agpr_m16_ref" => Some(amdgpu_dsl::kernels::probe_agpr_m16_ref()),
+        "probe_agpr_m16_mix" => Some(amdgpu_dsl::kernels::probe_agpr_m16_mix()),
+        "probe_agpr_reload_ref" => Some(amdgpu_dsl::kernels::probe_agpr_reload_ref()),
+        "probe_agpr_reload" => Some(amdgpu_dsl::kernels::probe_agpr_reload()),
+        "probe_agpr_reload4_ref" => Some(amdgpu_dsl::kernels::probe_agpr_reload4_ref()),
+        "probe_agpr_reload4" => Some(amdgpu_dsl::kernels::probe_agpr_reload4()),
+        "probe_dma_voff_spill" => Some(amdgpu_dsl::kernels::probe_dma_voff_spill()),
+        "probe_agpr_ref" => Some(amdgpu_dsl::kernels::probe_agpr_ref()),
+        "probe_agpr_acc" => Some(amdgpu_dsl::kernels::probe_agpr_acc()),
+        "probe_agpr_full" => Some(amdgpu_dsl::kernels::probe_agpr_full()),
+        "probe_agpr_pinned" => Some(amdgpu_dsl::kernels::probe_agpr_pinned()),
         "attention_fwd" => Some(amdgpu_dsl::kernels::attention_fwd()),
         "attn_debug" => Some(amdgpu_dsl::kernels::attn_debug()),
         "probe_store" => Some(amdgpu_dsl::kernels::probe_store()),
@@ -294,6 +337,9 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_kvsplit" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine16h" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine16h()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine8h" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine8h()),
+        "gemm_mxfp8_bs_v0" => Some(amdgpu_dsl::gemm_mxfp8::gemm_mxfp8_bs_v0()),
+        "gemm_mxfp8_bs_v1" => Some(amdgpu_dsl::gemm_mxfp8::gemm_mxfp8_bs_v1()),
+        n if n.starts_with("gemm_mxfp8_bs_v") && amdgpu_kernels::gemm_mxfp8::by_name(n).is_some() => amdgpu_kernels::gemm_mxfp8::by_name(n),
         "fmha_fwd_hd128_mxfp8_dsl_vs128" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_vs128()),
         "fmha_fwd_hd128_mxfp8_dsl_t128" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_t128()),
         "fmha_fwd_hd128_mxfp8_dsl_kvsplit" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_kvsplit()),

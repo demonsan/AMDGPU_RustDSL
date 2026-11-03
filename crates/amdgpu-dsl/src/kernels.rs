@@ -22538,3 +22538,355 @@ pub fn gv_audit_region_trust() -> Function {
     b.end_if();
     b.finish()
 }
+
+// ---------------------------------------------------------------------------------------------
+// probe_agpr_*: AGPR support probes (docs/agpr.md). The three variants compute the same thing: a scaled-MFMA accumulation loop whose A/B
+// fragments come from LDS. `ref` keeps everything in arch VGPRs; `acc` pins the accumulator in AGPRs (acc_cd form MFMA); `full` also reads the
+// fragments with ds_read_b128 straight into AGPRs. Output (identical for all three): per-thread 16 accumulator lanes at o[tid * 64 ..].
+// ---------------------------------------------------------------------------------------------
+fn probe_agpr_kernel(name: &str, pin_acc: bool, pin_frags: bool, acc_base: Option<u32>) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c16 = b.c_i32(16);
+    let c64 = b.c_i32(64);
+    let c8192 = b.c_i32(8192);
+    let mul = b.c_i32(0x01010101);
+    let add = b.c_i32(0x04030201);
+    let mask = b.c_i32(0x3f3f3f3f);
+    let t1 = b.mul_i32(tid, mul);
+    let t2 = b.add_i32(t1, add);
+    let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
+    let data = b.frag4(w, w, w, w);
+    let off = b.mul_i32(tid, c16);
+    let off2 = b.add_i32(off, c8192);
+    b.store_lds_b128(Opnd::Val(off), Opnd::Val(data));
+    b.store_lds_b128(Opnd::Val(off2), Opnd::Val(data));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let mut a8 = b.load_lds_b128x2(Opnd::Val(off), Opnd::Val(off2));
+    let mut b8 = b.load_lds_b128x2(Opnd::Val(off2), Opnd::Val(off));
+    if pin_frags {
+        a8 = b.agpr(a8);
+        b8 = b.agpr(b8);
+    }
+    let zero = b.frag_zero(DType::Frag16);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::Frag16, Opnd::Val(zero))]);
+    if pin_acc {
+        match acc_base {
+            Some(base) => b.pin_agpr_at(vars[1], base),
+            None => b.pin_agpr(vars[1]),
+        }
+    }
+    b.var_mfma_scale(vars[1], a8, b8, 127, 127);
+    sched_end_loop(&mut b, vars[0], n);
+    let row_off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, row_off);
+    for i in 0..16u8 {
+        let l = b.frag16_lane(vars[1], i);
+        let x = b.bitcast_f32(l);
+        b.store_f32(row, 4 * i as u32, x);
+    }
+    b.finish()
+}
+
+pub fn probe_agpr_ref() -> Function {
+    probe_agpr_kernel("probe_agpr_ref", false, false, None)
+}
+pub fn probe_agpr_acc() -> Function {
+    probe_agpr_kernel("probe_agpr_acc", true, false, None)
+}
+pub fn probe_agpr_full() -> Function {
+    probe_agpr_kernel("probe_agpr_full", true, true, None)
+}
+/// Accumulator pinned at a[64:79] (exact placement), fragments in AGPRs.
+pub fn probe_agpr_pinned() -> Function {
+    probe_agpr_kernel("probe_agpr_pinned", true, true, Some(64))
+}
+
+/// The 4-wave GEMM mix in miniature (docs/agpr.md): four 16x16x128 scaled-MFMA accumulators (Frag4), A/B fragments read from LDS. `mix`: accumulators 0 and 1 live
+/// in AGPRs (acc_cd form, pinned at a[96:99] / a[100:103]) next to two VGPR accumulators (vgpr form), and the fragments are read straight into AGPRs.
+fn probe_agpr_m16_kernel(name: &str, mix: bool) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c16 = b.c_i32(16);
+    let c64 = b.c_i32(64);
+    let c8192 = b.c_i32(8192);
+    let c127 = b.c_i32(127);
+    let mul = b.c_i32(0x01010101);
+    let add = b.c_i32(0x04030201);
+    let mask = b.c_i32(0x3f3f3f3f);
+    let t1 = b.mul_i32(tid, mul);
+    let t2 = b.add_i32(t1, add);
+    let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
+    let data = b.frag4(w, w, w, w);
+    let off = b.mul_i32(tid, c16);
+    let off2 = b.add_i32(off, c8192);
+    b.store_lds_b128(Opnd::Val(off), Opnd::Val(data));
+    b.store_lds_b128(Opnd::Val(off2), Opnd::Val(data));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let mut a8 = b.load_lds_b128x2(Opnd::Val(off), Opnd::Val(off2));
+    let mut b8 = b.load_lds_b128x2(Opnd::Val(off2), Opnd::Val(off));
+    if mix {
+        a8 = b.agpr(a8);
+        b8 = b.agpr(b8);
+    }
+    let zero = b.frag_zero(DType::Frag4);
+    let vars = b.begin_loop(&[
+        (DType::I32, Opnd::Val(c0)),
+        (DType::Frag4, Opnd::Val(zero)),
+        (DType::Frag4, Opnd::Val(zero)),
+        (DType::Frag4, Opnd::Val(zero)),
+        (DType::Frag4, Opnd::Val(zero)),
+    ]);
+    if mix {
+        b.pin_agpr_at(vars[1], 96);
+        b.pin_agpr_at(vars[2], 100);
+    }
+    b.var_mfma_scale16(vars[1], a8, b8, c127, c127, 0, 0);
+    b.var_mfma_scale16(vars[2], b8, a8, c127, c127, 0, 0);
+    b.var_mfma_scale16(vars[3], a8, b8, c127, c127, 1, 0);
+    b.var_mfma_scale16(vars[4], b8, a8, c127, c127, 0, 1);
+    sched_end_loop(&mut b, vars[0], n);
+    let row_off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, row_off);
+    for (q, v) in vars[1..].iter().enumerate() {
+        for i in 0..4u8 {
+            let l = b.frag4_lane(*v, i);
+            let x = b.bitcast_f32(l);
+            b.store_f32(row, 4 * (4 * q as u32 + i as u32), x);
+        }
+    }
+    b.finish()
+}
+
+pub fn probe_agpr_m16_ref() -> Function {
+    probe_agpr_m16_kernel("probe_agpr_m16_ref", false)
+}
+pub fn probe_agpr_m16_mix() -> Function {
+    probe_agpr_m16_kernel("probe_agpr_m16_mix", true)
+}
+
+/// In-place reload of loop-carried AGPR fragments (the 4-wave GEMM pattern): tile t's A/B fragments are loop variables read by the MFMAs; right after
+/// their last use the fragments of tile t+1 are read from LDS straight into the same registers (`set_var(var, load_lds_b128x2(..))` is coalesced into
+/// the variable). `inplace`: the variables and the accumulator live in AGPRs and the reload is the coalesced form; the reference reloads through
+/// `cat_frag8` copies in plain VGPRs. Both print the same 4 accumulator lanes per thread.
+fn probe_agpr_reload_kernel(name: &str, inplace: bool) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c16 = b.c_i32(16);
+    let c64 = b.c_i32(64);
+    let c8192 = b.c_i32(8192);
+    let c127 = b.c_i32(127);
+    let mul = b.c_i32(0x01010101);
+    let add = b.c_i32(0x04030201);
+    let mask = b.c_i32(0x3f3f3f3f);
+    let t1 = b.mul_i32(tid, mul);
+    let t2 = b.add_i32(t1, add);
+    let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
+    let w1 = b.add_i32(w, mul);
+    let data0 = b.frag4(w, w, w, w);
+    let data1 = b.frag4(w1, w1, w1, w1);
+    let off = b.mul_i32(tid, c16);
+    let off2 = b.add_i32(off, c8192);
+    b.store_lds_b128(Opnd::Val(off), Opnd::Val(data0));
+    b.store_lds_b128(Opnd::Val(off2), Opnd::Val(data1));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let a_init = b.load_lds_b128x2(Opnd::Val(off), Opnd::Val(off2));
+    let b_init = b.load_lds_b128x2(Opnd::Val(off2), Opnd::Val(off));
+    let zero = b.frag_zero(DType::Frag4);
+    let vars = b.begin_loop(&[
+        (DType::I32, Opnd::Val(c0)),
+        (DType::Frag4, Opnd::Val(zero)),
+        (DType::Frag8, Opnd::Val(a_init)),
+        (DType::Frag8, Opnd::Val(b_init)),
+    ]);
+    let (it, acc, av, bv) = (vars[0], vars[1], vars[2], vars[3]);
+    if inplace {
+        b.pin_agpr(acc);
+        b.pin_agpr(av);
+        b.pin_agpr(bv);
+    }
+    b.var_mfma_scale16(acc, Opnd::Var(av), Opnd::Var(bv), c127, c127, 0, 0);
+    // next tile: alternate the LDS region so every iteration's fragments differ
+    let nxt = b.add_i32(it, c1);
+    let par = b.let_(Op::AndI32(Opnd::Val(nxt), Opnd::Val(c1)));
+    let r0 = b.mul_i32(par, c8192);
+    let r1 = b.xor_i32(r0, c8192);
+    let la = b.add_i32(off, r0);
+    let lb = b.add_i32(off, r1);
+    if inplace {
+        let na = b.load_lds_b128x2(Opnd::Val(la), Opnd::Val(lb));
+        b.set_var(av, na);
+        let nb = b.load_lds_b128x2(Opnd::Val(lb), Opnd::Val(la));
+        b.set_var(bv, nb);
+    } else {
+        let a_lo = b.load_lds_b128(Opnd::Val(la));
+        let a_hi = b.load_lds_b128(Opnd::Val(lb));
+        let na = b.cat_frag8(a_lo, a_hi);
+        b.set_var(av, na);
+        let b_lo = b.load_lds_b128(Opnd::Val(lb));
+        let b_hi = b.load_lds_b128(Opnd::Val(la));
+        let nb = b.cat_frag8(b_lo, b_hi);
+        b.set_var(bv, nb);
+    }
+    sched_end_loop(&mut b, it, n);
+    let row_off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, row_off);
+    for i in 0..4u8 {
+        let l = b.frag4_lane(acc, i);
+        let x = b.bitcast_f32(l);
+        b.store_f32(row, 4 * i as u32, x);
+    }
+    b.finish()
+}
+
+pub fn probe_agpr_reload_ref() -> Function {
+    probe_agpr_reload_kernel("probe_agpr_reload_ref", false)
+}
+pub fn probe_agpr_reload() -> Function {
+    probe_agpr_reload_kernel("probe_agpr_reload", true)
+}
+
+/// The GEMM reload pattern with several fragment pairs: MFMA j reads (av[j], bv[j]); right after it both are reloaded in place for the next tile. The reload reads of one pair are
+/// 4 ds_reads, so the next iteration's MFMA j needs only the reads of pair j: with the scoreboard wait pass the waits are partial (`lgkmcnt(12)`, `(8)`, `(4)`, `(0)`), not `lgkmcnt(0)`.
+fn probe_agpr_reload4_kernel(name: &str, inplace: bool) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c16 = b.c_i32(16);
+    let c64 = b.c_i32(64);
+    let c8192 = b.c_i32(8192);
+    let c127 = b.c_i32(127);
+    let mul = b.c_i32(0x01010101);
+    let add = b.c_i32(0x04030201);
+    let mask = b.c_i32(0x3f3f3f3f);
+    let t1 = b.mul_i32(tid, mul);
+    let t2 = b.add_i32(t1, add);
+    let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
+    let w1 = b.add_i32(w, mul);
+    let data0 = b.frag4(w, w, w, w);
+    let data1 = b.frag4(w1, w1, w1, w1);
+    let off = b.mul_i32(tid, c16);
+    let off2 = b.add_i32(off, c8192);
+    b.store_lds_b128(Opnd::Val(off), Opnd::Val(data0));
+    b.store_lds_b128(Opnd::Val(off2), Opnd::Val(data1));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let zero = b.frag_zero(DType::Frag4);
+    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0))];
+    for _ in 0..4 {
+        inits.push((DType::Frag4, Opnd::Val(zero)));
+    }
+    for j in 0..8 {
+        let (lo, hi) = if j % 2 == 0 { (off, off2) } else { (off2, off) };
+        let f = b.load_lds_b128x2(Opnd::Val(lo), Opnd::Val(hi));
+        inits.push((DType::Frag8, Opnd::Val(f)));
+    }
+    let vars = b.begin_loop(&inits);
+    let it = vars[0];
+    let acc: Vec<VarId> = vars[1..5].to_vec();
+    let av: Vec<VarId> = vars[5..9].to_vec();
+    let bv: Vec<VarId> = vars[9..13].to_vec();
+    if inplace {
+        for v in acc.iter().chain(av.iter()).chain(bv.iter()) {
+            b.pin_agpr(*v);
+        }
+    }
+    let nxt = b.add_i32(it, c1);
+    let par = b.let_(Op::AndI32(Opnd::Val(nxt), Opnd::Val(c1)));
+    let r0 = b.mul_i32(par, c8192);
+    let r1 = b.xor_i32(r0, c8192);
+    let la = b.add_i32(off, r0);
+    let lb = b.add_i32(off, r1);
+    for j in 0..4 {
+        b.var_mfma_scale16(acc[j], Opnd::Var(av[j]), Opnd::Var(bv[j]), c127, c127, 0, 0);
+        let (x, y) = if j % 2 == 0 { (la, lb) } else { (lb, la) };
+        if inplace {
+            let na = b.load_lds_b128x2(Opnd::Val(x), Opnd::Val(y));
+            b.set_var(av[j], na);
+            let nb = b.load_lds_b128x2(Opnd::Val(y), Opnd::Val(x));
+            b.set_var(bv[j], nb);
+        } else {
+            let a_lo = b.load_lds_b128(Opnd::Val(x));
+            let a_hi = b.load_lds_b128(Opnd::Val(y));
+            let na = b.cat_frag8(a_lo, a_hi);
+            b.set_var(av[j], na);
+            let b_lo = b.load_lds_b128(Opnd::Val(y));
+            let b_hi = b.load_lds_b128(Opnd::Val(x));
+            let nb = b.cat_frag8(b_lo, b_hi);
+            b.set_var(bv[j], nb);
+        }
+    }
+    sched_end_loop(&mut b, it, n);
+    let row_off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, row_off);
+    for (q, v) in acc.iter().enumerate() {
+        for i in 0..4u8 {
+            let l = b.frag4_lane(*v, i);
+            let x = b.bitcast_f32(l);
+            b.store_f32(row, 4 * (4 * q as u32 + i as u32), x);
+        }
+    }
+    b.finish()
+}
+
+pub fn probe_agpr_reload4_ref() -> Function {
+    probe_agpr_reload4_kernel("probe_agpr_reload4_ref", false)
+}
+pub fn probe_agpr_reload4() -> Function {
+    probe_agpr_reload4_kernel("probe_agpr_reload4", true)
+}
+
+/// Regression probe for the silent miscompile found in the GEMM (docs/agpr.md "LDS spill + DMA operand wait"): the loop-invariant buffer voffset of an LDS-DMA load is spilled to LDS by the
+/// register-pressure ladder (`AMDC_RA_LDS_SPILL=N AMDC_RA_LDS_SPILL_TARGET=0` forces it) and reloaded by a `ds_read` right before the DMA; the DMA must wait for that read.
+/// Without the fix (`AMDC_WAITS_SKIP_FENCE_OPERANDS=1`) the wait is missing and the DMA reads a stale voffset. Output: per thread, n * (first dword of the 16 bytes it DMA-ed), identical
+/// with and without the spill.
+pub fn probe_dma_voff_spill() -> Function {
+    let (mut b, o, n, tid) = sched_begin("probe_dma_voff_spill");
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c16 = b.c_i32(16);
+    let c63 = b.c_i32(63);
+    let c1024 = b.c_i32(1024);
+    let mul = b.c_i32(0x01010101);
+    let add = b.c_i32(0x04030201);
+    let o16 = b.mul_i32(tid, c16);
+    let t1 = b.mul_i32(tid, mul);
+    let t2 = b.add_i32(t1, add);
+    let mask = b.c_i32(0x3f3f3f3f);
+    let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
+    let data = b.frag4(w, w, w, w);
+    // stage the input in the output buffer: out[tid*16 ..] = pattern(tid)
+    let pin = b.ptr_add(o, o16);
+    b.store_f32x4(pin, 0, data);
+    b.wait_vm(0);
+    let rin = b.buffer_rsrc(o);
+    let c6 = b.c_i32(6);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let ldsb = b.mul_i32(wave, c1024);
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
+    let lane16 = b.mul_i32(lane, c16);
+    let rd = b.add_i32(ldsb, lane16);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(c0))]);
+    let (it, acc) = (vars[0], vars[1]);
+    b.buffer_load_lds_b128(rin, o16, c0, ldsb, 0); // descriptor base = o: the input staged in out[0 .. 16*tid) (overwritten by the result after the loop)
+    b.wait_vm(0);
+    let x = b.load_lds_b32(rd);
+    let a2 = b.add_i32(acc, x);
+    b.set_var(acc, a2);
+    let _ = c1;
+    sched_end_loop(&mut b, it, n);
+    let c4 = b.c_i32(4);
+    let off4 = b.mul_i32(tid, c4);
+    let row = b.ptr_add(o, off4);
+    let r = b.bitcast_f32(acc);
+    b.store_f32(row, 0, r);
+    b.finish()
+}

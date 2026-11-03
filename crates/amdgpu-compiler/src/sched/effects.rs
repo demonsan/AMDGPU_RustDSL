@@ -152,7 +152,8 @@ fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
         }
         MOp::VCmpLtI32 | MOp::VCmpGeI32 | MOp::VCmpGtI32 | MOp::VCmpNeI32 | MOp::VCmpLtF32 => push_unique(&mut e.writes, VCC),
         MOp::VCndmask => push_unique(&mut e.reads, VCC),
-        MOp::SAddU32 | MOp::SShlB32 | MOp::SLshrB32 | MOp::SAndB32 | MOp::SXorB32 | MOp::SCmpLtI32 => push_unique(&mut e.writes, SCC),
+        MOp::SAddU32 | MOp::SShlB32 | MOp::SLshrB32 | MOp::SAndB32 | MOp::SXorB32 | MOp::SCmpLtI32 | MOp::SMinI32 => push_unique(&mut e.writes, SCC),
+        MOp::SCselectB32 => push_unique(&mut e.reads, SCC),
         MOp::SAddcU32 => {
             push_unique(&mut e.reads, SCC);
             push_unique(&mut e.writes, SCC);

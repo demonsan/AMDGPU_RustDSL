@@ -77,6 +77,11 @@ fn parse_class(s: &str) -> Result<SigClass, String> {
         "S1" => SigClass::Reg(RClass::S1),
         "S2" => SigClass::Reg(RClass::S2),
         "S4" => SigClass::Reg(RClass::S4),
+        "A1" => SigClass::Reg(RClass::A1),
+        "A2" => SigClass::Reg(RClass::A2),
+        "A4" => SigClass::Reg(RClass::A4),
+        "A8" => SigClass::Reg(RClass::A8),
+        "A16" => SigClass::Reg(RClass::A16),
         "I" => SigClass::Imm,
         _ => return Err(format!("unknown signature class '{s}'")),
     })
@@ -149,13 +154,15 @@ pub fn waitcnt_imm(vm: Option<u32>, lgkm: Option<u32>) -> u32 {
 }
 
 fn reg_name(class: RClass, phys: u32) -> String {
-    let (prefix, n) = if class.is_vector() { ("vgpr", class.dwords()) } else { ("sgpr", class.dwords()) };
+    let (prefix, n) = if class.is_agpr() { ("agpr", class.dwords()) } else if class.is_vector() { ("vgpr", class.dwords()) } else { ("sgpr", class.dwords()) };
+    let phys = if class.is_agpr() { phys - AGPR_TAG } else { phys };
     let parts: Vec<String> = (0..n).map(|k| format!("{prefix}{}", phys + k)).collect();
     format!("${}", parts.join("_"))
 }
 
 fn dword_name(class: RClass, phys: u32, k: u32) -> String {
-    let prefix = if class.is_vector() { "vgpr" } else { "sgpr" };
+    let prefix = if class.is_agpr() { "agpr" } else if class.is_vector() { "vgpr" } else { "sgpr" };
+    let phys = if class.is_agpr() { phys - AGPR_TAG } else { phys };
     format!("${prefix}{}", phys + k)
 }
 
@@ -210,6 +217,9 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
             let r = src_reg(inst, 0)?;
             dword_name(RClass::V1, cx.phys(r), inst.imm as u32)
         }
+        // scaled MFMA byte selects (inst.imm: bits 0..1 scale A byte, bits 4..5 scale B byte): MIR op_sel immediates are 4 * byte (llc dump: A=3,B=2 -> 12, 8)
+        "opselA" => format!("{}", 4 * (inst.imm & 3)),
+        "opselB" => format!("{}", 4 * ((inst.imm >> 4) & 3)),
         "pv" => format!("$vgpr{}", inst.imm),
         "ps" => format!("$sgpr{}", inst.imm),
         "vmcnt" => format!("{}", waitcnt_imm(Some(inst.imm as u32), None)),
@@ -246,9 +256,13 @@ pub fn render_text(tpl: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, St
 /// MIR lines for one instruction (empty for dropped ones such as `s_nop`).
 pub fn render_inst(t: &Table, inst: &MInst, cx: &RenderCtx) -> Result<Vec<String>, String> {
     let name = format!("{:?}", inst.op);
-    let row = t
-        .lookup(&name, &kinds_of(inst))
-        .ok_or_else(|| format!("llvm20.tbl has no row for {name} (kinds '{}')", kinds_of(inst)))?;
+    // Op@a rows: the accumulator-register (acc_cd) form of an MFMA, chosen when the destination is an AGPR; other ops use their normal row
+    // (a ds_read/global_load into an AGPR tuple is the same LLVM opcode).
+    let kinds = kinds_of(inst);
+    let a_form = inst.dst.map_or(false, |d| cx.class(d).is_agpr());
+    let row = (if a_form { t.lookup(&format!("{name}@a"), &kinds) } else { None })
+        .or_else(|| t.lookup(&name, &kinds))
+        .ok_or_else(|| format!("llvm20.tbl has no row for {name} (kinds '{kinds}')"))?;
     if row.text.len() == 1 && row.text[0] == "DROP" {
         return Ok(Vec::new());
     }
