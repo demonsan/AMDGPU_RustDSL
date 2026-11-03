@@ -89,6 +89,9 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
                     continue;
                 }
                 let extra: i64 = movers.iter().filter(|&&y| y != idx).map(|&y| insts[y].dst.map(|d| width(canon(d))).unwrap_or(0)).sum();
+                if std::env::var("AMDC_HOIST_DEBUG").is_ok() {
+                    eprintln!("hoist block {bi}: load {idx} (pos {p}) q={q} members={:?} movers={:?} ops={:?}", members.iter().map(|&y| (y, pos[y])).collect::<Vec<_>>(), movers.iter().map(|&y| (y, pos[y])).collect::<Vec<_>>(), movers.iter().map(|&y| insts[y].op).collect::<Vec<_>>());
+                }
                 let first_old = pos[movers[0]];
                 let lo = q.min(first_old);
                 order.retain(|k| !movers.contains(k));
