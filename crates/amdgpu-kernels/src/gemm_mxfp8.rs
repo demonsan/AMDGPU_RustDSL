@@ -632,7 +632,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
         pr.write(b, |b| {
             for q in 0..per_wave {
                 // K group 16 w + q: soffset = its row (16 w + q) M, voffset = the CTA rows + 4 lane (sa_src), M0 + imm = panel + 256 (16 w + q)
-                let so = { let v = b.bind_i32((lane.wave() * (per_wave as i32) + q as i32) * ev(m_v)); b.read_first_lane(v) };
+                // (the instruction offset also moves the source: compensated in soffset)
+                let so = { let v = b.bind_i32((lane.wave() * (per_wave as i32) + q as i32) * ev(m_v) - (256 * q) as i32); b.read_first_lane(v) };
                 b.buffer_load_lds_b32(rsrc_sfa, sa_src, so, m0w, (256 * q) as u32);
             }
         });
