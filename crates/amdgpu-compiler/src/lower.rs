@@ -3536,7 +3536,8 @@ fn remat_exprs(m: &mut MFunction) {
 /// then only lives from its definition to its last use outside loops. Costs one DS read per (value, loop block) per
 /// iteration and `256 * values * waves` bytes of LDS (appended after the kernel's own LDS). Returns (#values, total bytes).
 fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
-    const TARGET: u32 = 236; // stop when the true peak is this low (alignment / reserved registers need slack)
+    // stop when the true peak is this low (alignment / reserved registers need slack); AMDC_RA_LDS_SPILL_TARGET lowers it for the regression probe
+    let target: u32 = std::env::var("AMDC_RA_LDS_SPILL_TARGET").ok().and_then(|v| v.parse().ok()).unwrap_or(236);
     let nwaves = (m.workgroup_size / 64).max(1);
     let base = (m.lds_bytes + 15) / 16 * 16;
     let newv = |m: &mut MFunction| -> VReg {
@@ -3562,7 +3563,7 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
     let mut spilled = 0usize;
     for _ in 0..count {
         let (peak, ppos, pblk) = crate::regalloc::pressure_profile(m);
-        if peak <= TARGET {
+        if peak <= target {
             break;
         }
         let pidx = ppos - m.blocks[..pblk].iter().map(|b| b.insts.len()).sum::<usize>();

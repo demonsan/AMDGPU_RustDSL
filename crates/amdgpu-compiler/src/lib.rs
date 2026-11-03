@@ -222,6 +222,8 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     if !errs.is_empty() {
         return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
     }
+    // the unscheduled path trusted its lowering-time waits; passes after lowering (LDS spill, ...) can invalidate them: re-check on every path
+    sched::waits::verify_waits(&m).map_err(|e| format!("wait verification failed: {e}"))?;
     let alloc = regalloc::allocate(&m)?;
     // Register reuse (especially the hole-filling packing) can place a new value in a register an in-flight MFMA still reads:
     // pad the physical write-after-read hazard on every path, not only for scheduled code (AMDC_NO_PHYS_WAR=1 disables, testing).
