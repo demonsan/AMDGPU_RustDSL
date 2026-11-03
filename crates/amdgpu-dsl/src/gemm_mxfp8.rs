@@ -64,11 +64,12 @@ fn mfma_c_32x32_swapped() -> Layout {
 pub fn gemm_mxfp8_bs_v0() -> Function {
     let mut b = FnBuilder::new("gemm_mxfp8_bs_v0", 256);
     // ---- 96-byte ABI (opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950) ----
-    for (name, off) in [("ptr_a", 0u32), ("ptr_b", 8), ("ptr_c", 16), ("ptr_sfa", 64), ("ptr_sfb", 72)] {
-        b.arg(name, DType::Ptr, off, 8);
-    }
-    for (name, off) in [("m", 24u32), ("n", 28), ("k", 32), ("batch", 36), ("stride_a", 40), ("stride_b", 44), ("stride_c", 48), ("stride_a_batch", 52), ("stride_b_batch", 56), ("stride_c_batch", 60), ("stride_sfa", 80), ("stride_sfb", 84), ("stride_sfa_batch", 88), ("stride_sfb_batch", 92)] {
-        b.arg(name, DType::I32, off, 4);
+    let ptrs = [("ptr_a", 0u32), ("ptr_b", 8), ("ptr_c", 16), ("ptr_sfa", 64), ("ptr_sfb", 72)];
+    let ints = [("m", 24u32), ("n", 28), ("k", 32), ("batch", 36), ("stride_a", 40), ("stride_b", 44), ("stride_c", 48), ("stride_a_batch", 52), ("stride_b_batch", 56), ("stride_c_batch", 60), ("stride_sfa", 80), ("stride_sfb", 84), ("stride_sfa_batch", 88), ("stride_sfb_batch", 92)];
+    let mut all: Vec<(&str, u32, bool)> = ptrs.iter().map(|&(n, o)| (n, o, true)).chain(ints.iter().map(|&(n, o)| (n, o, false))).collect();
+    all.sort_by_key(|x| x.1);
+    for (name, off, is_ptr) in all {
+        if is_ptr { b.arg(name, DType::Ptr, off, 8) } else { b.arg(name, DType::I32, off, 4) }
     }
     let ptr_a = b.let_(Op::KernargPtr { offset: 0 });
     let ptr_b = b.let_(Op::KernargPtr { offset: 8 });
