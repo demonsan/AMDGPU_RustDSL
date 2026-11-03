@@ -307,6 +307,7 @@ int main(int argc, char** argv) {
     };
     auto launch_gen = [&](hipFunction_t f, const char* kname, void* outp, int rows, int gx, unsigned block) -> bool {
         if (!gen_abi) return false;
+        std::fprintf(stderr, "GENLAUNCH k=%s gx=%d gy=%d gz=%d block=%u rows=%d\n", kname ? kname : "(null)", gx, gy, gz, block, rows);
         if (gen_name(kname, "v3_vs128")) {
             auto a = mk_vs(outp, rows);
             CK(GenVs::launch(f, a, dim3(gx, gy, gz), dim3(block, 1, 1)));
