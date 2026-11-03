@@ -150,6 +150,8 @@ struct Body {
     sa_src: ValueId,
     sb_src: ValueId,
     sa_rd: Vec<ValueId>,
+    sa_sh: Vec<ValueId>,
+    sa_dw: Vec<ValueId>,
     a_rd: LdsPart,
     b_rd: LdsPart,
     zero4: ValueId,
@@ -173,13 +175,13 @@ impl Body {
         let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
         let (wa, wb) = scr.read(b, |b| {
             let wa: Vec<ValueId> = (0..nm).map(|i| {
-                let a = b.bind_i32(ev(scb) + (ev(self.sa_rd[i]) & -4));
+                let a = b.bind_i32(ev(scb) + ev(self.sa_dw[i]));
                 b.load_lds_b32(a)
             }).collect();
             let a = b.bind_i32(ev(scb) + 256);
             (wa, b.load_lds_b32(a))
         });
-        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
+        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[i])))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kb) & 3) << 3));
         (sa, sb)
     }
@@ -366,7 +368,7 @@ impl PipeBody for Body {
         let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
         let (wa, wb) = scr.read(b, |b| {
             let wa: Vec<ValueId> = (0..nm).map(|i| {
-                let a = b.bind_i32(ev(scb) + (ev(self.sa_rd[i]) & -4));
+                let a = b.bind_i32(ev(scb) + ev(self.sa_dw[i]));
                 b.load_lds_b32(a)
             }).collect();
             let a = b.bind_i32(ev(scb) + 256);
@@ -379,7 +381,7 @@ impl PipeBody for Body {
         let mut af = { let v = if let Some(z) = zf { z } else { ar.read(b, 0) }; mark(b, v) };
         let bpre = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("bpre").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1).min(nn);
         let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zfb { z } else { br.read(b, j) }; mark(b, v) }).collect();
-        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
+        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[i])))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
         let prio = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noprio"));
         if prio {
@@ -512,6 +514,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
     assert!(wave_n <= 128 && 128 % wave_n == 0);
     let sb_row = b.bind_i32(((ev(bx) << lg_n) + (ev(wn) * wave_n as i32)).lshr(7));
     let sb_src = b.bind_i32(ev(sb_row) * ev(kb_v));
+    // loop-invariant byte-select shifts of the A scales and the dword offsets of their rows
+    let sa_sh: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32((ev(*r) & 3) << 3)).collect();
+    let sa_dw: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32(ev(*r) & -4)).collect();
 
     let cadence = if cfg.reg_staged { Cadence::RegStaged } else if cfg.three_slots { Cadence::OneWindow } else { Cadence::TwoSlot };
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
@@ -520,7 +525,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     }
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
-        cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd,
+        cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
         a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false,
     };
     pipe.run(b, Role::All, &mut body);
