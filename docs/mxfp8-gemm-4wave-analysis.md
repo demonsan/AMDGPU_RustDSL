@@ -430,3 +430,28 @@ DMA 间隔 1/2 −5%/−0.2%、prefill −0.7%）都没有把这部分转化为�
 
 **结论**：v4 = 0.94–0.95× vendor 是本结构 + 本编译器下的稳定上限；剩余差距是 CU 内存前端（TA/TCP/返回路径）的拥塞时序，而不是指令数、单 CU 延迟或 L2/HBM
 带宽。下一步若要继续：(a) DSL 支持描述符 select 后做 wave 角色分工 + vendor 的 DMA/重载分相时序，(b) 用 SPM/ATT 的 TA/TCP 活动计数对齐两者的时序。
+
+### 12.2 最后一轮：vendor 的请求形态（wave 角色分工）
+
+实现：wave 0/1 搬整个 A tile、wave 2/3 搬整个 B tile（每 wave 16 条，DMA 计划按 2 个 wave 的角色内 tid 推导并在构建期证明）。描述符用 backend-llvm-tail 的
+`select_uniform_rsrc`（s_cmp + s_cselect_b64，无分支）在 prologue 选一次，voffset 一次性选好，soffset/M0 每 stage 用 s_cselect 选一次。
+**仅为计时构建**（`GemmConfig::wave_roles_select`，默认关、未验证：LDS 写标记只写 A 环）。按分支实现（每条 DMA 一个 uniform 分支）的版本因 v_cmp→vcc 的
+17 个 s_nop 冒险填充只有 2061，不作数。
+
+| | vendor | v4 | v4 + wave roles（gap 2，DMA 在前 32 个 MMA 内、重载在后半，即 vendor 的分相） |
+|---|---|---|---|
+| 计时（同会话） | — | 3060 | **2985（−2.5%）** |
+| GRBM_GUI_ACTIVE（计数器下） | 1.461e6 | 1.651e6 | 1.736e6 |
+| TA_TA_BUSY | 2.03e7 | 2.57e7 | 2.08e7 |
+| TA_ADDR_STALLED_BY_TC | 1.10e5 | 3.26e5 | 0.60e5 |
+| TA_DATA_STALLED_BY_TC | 4.02e5 | 8.62e5 | 8.60e5 |
+| TCP_PENDING_STALL | 1.27e7 | 1.76e7 | 1.27e7 |
+| TCP_TCR_TCP_STALL | 1.21e6 | 2.65e6 | 1.42e6 |
+| TCC_HIT / MISS / L1→L2 读 | 6.36e6 / 2.63e6 / 8.42e6 | 7.28e6 / 1.84e6 / 8.55e6 | 7.29e6 / 1.84e6 / 8.55e6 |
+
+结论：wave 角色分工把 §12.1 里 5 个前端计数器中的 4 个拉到 vendor 水平（甚至更低），**但墙钟时间变差 2.5%**；唯一仍是 2.1× 的是
+TA_DATA_STALLED_BY_TC。所以前端拥塞计数器是请求形态的“症状”，不是我们比 vendor 慢的原因。按约定（<1%）彻底停止。
+
+**最终上限**：gemm_mxfp8_bs_v4 = 0.94–0.95× vendor（门禁交错中位数 3060–3116 vs 3246–3267）。已排除：指令数/VALU、发射顺序、预取距离（单 CU 延迟）、
+寄存器形式（sched 微基准）、L2/HBM 带宽、请求形态与前端拥塞。未解释的剩余项只有 TA 数据路径（TA_DATA_STALLED_BY_TC 2.1×）——即 DMA 返回数据写 LDS 的
+路径——它对 LDS 写入与 ds_read 的仲裁敏感；进一步需要硬件级（SPM/ATT 的 TA/TD/LDS 活动）对齐实验。
