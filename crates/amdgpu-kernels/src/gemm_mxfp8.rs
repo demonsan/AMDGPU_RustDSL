@@ -59,6 +59,8 @@ pub struct GemmConfig {
     pub lds_epilogue: bool,
     /// `RegStaged`: the scale reads of t+1 issued before the fragment reloads (otherwise after them: an lgkmcnt(0) drain)
     pub early_scales: bool,
+    /// extra scheduler tokens for this kernel (Function::sched_opts, on top of the Gemm profile's wait pass), e.g. "hoistchain"
+    pub sched: &'static str,
     pub ablate: Ablate,
 }
 
@@ -67,7 +69,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -75,12 +77,12 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
     pub fn v4() -> GemmConfig {
-        GemmConfig { acc_agpr: 24, reg_staged: true, pre_sync_mmas: 4, ..GemmConfig::v3() }
+        GemmConfig { acc_agpr: 24, reg_staged: true, pre_sync_mmas: 4, sched: "rewait,hoistchain", ..GemmConfig::v3() }
     }
 }
 
@@ -784,6 +786,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let mut fb = FnBuilder::new(name, 256);
     // compile policy: lowering `lgkmn,zeroinit` + the scoreboard wait pass (partial waits across the loop back edge, ds_read hoisting); nothing name-keyed
     fb.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
+    if !cfg.sched.is_empty() {
+        fb.sched_opts(cfg.sched);
+    }
     let b = &mut fb;
     declare_abi(b);
     declare_contract(b, cta_m, cta_n);
