@@ -51,17 +51,19 @@ fn mfma_latency(op: MOp) -> Option<usize> {
         MOp::VMfma32x32x16Fp8 => Some(12),
         MOp::VMfmaScale32x32x64Fp8 | MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x64Fp8 | MOp::VMfma32x32x64Fp8Z => Some(20),
         MOp::VSmfmac16x16x128Fp8 => Some(20),
+        // 8-pass XDL op: conservatively the 16-pass wait count until the gfx950 table entry is pinned
+        MOp::VMfmaScale16x16x128Fp8 => Some(20),
         _ => None,
     }
 }
 
 /// In-place accumulating matrix ops whose dependent same-opcode chain is interlocked by the hardware.
 fn chains_in_place(op: MOp) -> bool {
-    matches!(op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VSmfmac16x16x128Fp8)
+    matches!(op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VSmfmac16x16x128Fp8 | MOp::VMfmaScale16x16x128Fp8)
 }
 
 fn is_scaled_mfma(op: MOp) -> bool {
-    matches!(op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x64Fp8 | MOp::VMfma32x32x64Fp8Z)
+    matches!(op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x64Fp8 | MOp::VMfma32x32x64Fp8Z | MOp::VMfmaScale16x16x128Fp8)
 }
 
 /// Plain ALU instructions that may be moved ahead of a stalled consumer: no memory, no scalar
@@ -184,7 +186,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 }
             }
             let c_reg = match inst.op {
-                MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 if inst.srcs.len() > 2 => match inst.srcs[2] {
+                MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VMfmaScale16x16x128Fp8 if inst.srcs.len() > 2 => match inst.srcs[2] {
                     Src::Reg(r) => Some(canon(r)),
                     _ => None,
                 },
@@ -350,7 +352,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         let touches = x.uses().iter().any(|u| canon(*u) == *reg) || x.dst.map(|y| canon(y) == *reg).unwrap_or(false);
                         if touches {
                             let chain = *from_mfma
-                                && matches!(x.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8)
+                                && matches!(x.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VMfmaScale16x16x128Fp8)
                                 && matches!(x.srcs.get(2), Some(Src::Reg(c)) if canon(*c) == *reg);
                             found = Some(if chain { usize::MAX } else { d });
                             break;
@@ -533,7 +535,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
             }
             for (issue, need, op, srcs) in &inflight {
-                if inst.op == *op && matches!(inst.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VSmfmac16x16x128Fp8) {
+                if inst.op == *op && matches!(inst.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VSmfmac16x16x128Fp8 | MOp::VMfmaScale16x16x128Fp8) {
                     continue; // in-place accumulation chain of the same opcode
                 }
                 if wr.iter().any(|w| srcs.iter().any(|s| overlaps(*w, *s))) {
