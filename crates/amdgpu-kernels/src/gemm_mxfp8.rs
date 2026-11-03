@@ -65,6 +65,8 @@ pub struct GemmConfig {
     pub unroll2: bool,
     /// XCD raster: each XCD's two 4 x 4 blocks stacked vertically (8 x 4 tiles) instead of side by side
     pub raster_tall: bool,
+    /// `RegStaged`: B DMAs first; the top-of-tile wait leaves the A DMAs in flight and a mid-tile wait + barrier publishes A before its reloads
+    pub split_sync: bool,
     pub ablate: Ablate,
 }
 
@@ -73,7 +75,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -81,7 +83,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -457,6 +459,13 @@ impl Body {
         let mut nmma = 0usize;
         let _ = per;
         for (lo, hi) in [(0, half), (half, nn)] {
+            if lo == half && self.cfg.split_sync && next.is_some() {
+                // the A half of tile t+1 (issued after its B half, one tile ago) is published here, before its first reload; the DMAs of this
+                // tile's stage issued so far stay in flight
+                let issued = deferred.as_ref().map_or(self.a_dma.issues.len() + self.b_dma.issues.len(), |d| d.2.min(self.a_dma.issues.len() + self.b_dma.issues.len()));
+                b.wait_vm(issued.min(63) as u8);
+                b.barrier();
+            }
             for i in 0..nm {
                 for j in lo..hi {
                     if lo == 0 && i * half + j < self.npre_done {
@@ -514,6 +523,15 @@ impl Body {
     /// The DMA of one tile (A issues, B issues, the 2 scale loads); `range` selects which of them to issue now (the deferred form spreads them
     /// over the MMA rows).
     fn stage_now(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, range: std::ops::Range<usize>, cache: &mut StageCache) {
+        // `split_sync`: the B issues go first (single-step ranges are remapped: step k < nb -> B unit k, then the A units)
+        let (na, nb) = (self.a_dma.issues.len(), self.b_dma.issues.len());
+        let range = if self.cfg.split_sync && range.len() == 1 && range.start < na + nb {
+            let k = range.start;
+            let u = if k < nb { na + k } else { k - nb };
+            u..u + 1
+        } else {
+            range
+        };
         // diagnostic ablations (wrong results): FMHA_ABLATE=gemm_nodma skips the copies
         if self.cfg.ablate.no_dma {
             return;
@@ -819,6 +837,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_noxcd" => GemmConfig { xcd_raster: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_u1" => GemmConfig { unroll2: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_tall" => GemmConfig { raster_tall: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_split" => GemmConfig { split_sync: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_split2" => GemmConfig { split_sync: true, dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_prio" => GemmConfig { setprio: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_gap4" => GemmConfig { dma_gap: 4, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_acc32h" => GemmConfig { acc_agpr: 32, sched: "rewait,hoistchain", ..GemmConfig::v4() },
@@ -1027,6 +1047,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
     });
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
     pipe.unroll2 = cfg.unroll2;
+    if cfg.split_sync {
+        pipe.top_vm = a_dma.issues.len() as u8;
+    }
     if cfg.three_slots || cfg.reg_staged {
         pipe.vm_inflight = (a_dma.issues.len() + b_dma.issues.len() + 2) as u8;
     }

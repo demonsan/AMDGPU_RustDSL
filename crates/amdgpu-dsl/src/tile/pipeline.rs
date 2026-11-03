@@ -117,12 +117,15 @@ pub struct Pipeline {
     /// `RegStaged`: two tiles per loop pass with STATIC ring slots (0 then 1: the tile counter is even at the top), so the slot offsets are
     /// constants (the vendor `u2`); the loop may exit between the two halves.
     pub unroll2: bool,
+    /// `RegStaged`: the vmcnt allowed at the top-of-tile wait (default 0). A body that publishes part of the stage later (its own wait + barrier
+    /// before the first read of that part) sets this to the number of DMAs issued after the part needed first.
+    pub top_vm: u8,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0 }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -287,7 +290,7 @@ impl Pipeline {
         self.prebind(b, &t);
         body.pre_sync(b, role, &t);
         if staged {
-            b.wait_vm(0);
+            b.wait_vm(self.top_vm);
             b.wait_lds(0);
             b.barrier();
             let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
@@ -376,7 +379,7 @@ impl Pipeline {
                 self.prebind(b, &t);
                 body.pre_sync(b, role, &t);
                 if staged {
-                    b.wait_vm(0);
+                    b.wait_vm(self.top_vm);
                     b.wait_lds(0);
                     b.barrier();
                     let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
