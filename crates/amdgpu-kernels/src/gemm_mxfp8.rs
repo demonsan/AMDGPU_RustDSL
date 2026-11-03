@@ -77,8 +77,57 @@ fn declare_abi(b: &mut FnBuilder) {
 
 /// One DMA stage of a [rows x 128 B] tile: per issue the global offset (relative to the tile origin) and the M0 offset inside the slot.
 struct Dma {
-    /// per issue: the lane's global offset (bound once, loop invariant) and the LDS offset of its 1 KB block in the wave's slice
+    /// per issue: the lane's voffset (bound once, loop invariant, shared by the issues whose sources differ by a wave-uniform amount), that
+    /// wave-uniform source delta (an SGPR added to the soffset, like the vendor's one `s_add` per DMA) and the LDS offset of its 1 KB block
     issues: Vec<(ValueId, i32)>,
+    delta: Vec<Option<ValueId>>,
+}
+
+/// Turns the per-issue source offsets (minus the instruction offset 1024 (q % 4)) into voffsets: an issue whose offset differs from an earlier
+/// issue's by an amount independent of the thread (checked for all 256 threads at two K values) reuses that issue's voffset and adds the delta
+/// to the soffset (SGPR, computed once).
+fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>) -> Dma {
+    let tid_id = match s_tid {
+        Ix::Sym(s) => *s,
+        _ => unreachable!(),
+    };
+    let share = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("novshare"));
+    let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-1024 * (q as i64 % 4))).collect();
+    let mut voff: Vec<ValueId> = Vec::new();
+    let mut base_of: Vec<usize> = Vec::new(); // issue index whose voffset is shared
+    let mut issues = Vec::new();
+    let mut delta = Vec::new();
+    for (q, g) in adj.iter().enumerate() {
+        let found = if share {
+            base_of.iter().copied().find(|&r| {
+                let d = g.sub(&adj[r]);
+                [4096i64, 8192].iter().all(|&k| {
+                    let v0 = d.eval(&|s| if s == tid_id { 0 } else { k });
+                    (0..256).all(|th| d.eval(&|s| if s == tid_id { th } else { k }) == v0)
+                })
+            })
+        } else {
+            None
+        };
+        match found {
+            Some(r) => {
+                let d = g.sub(&adj[r]);
+                let dv = b.bind_i32(ctx.lower(&d));
+                let ds = b.read_first_lane(dv);
+                issues.push((issues[r].0, 1024 * q as i32));
+                delta.push(Some(ds));
+                let _ = &voff;
+            }
+            None => {
+                let v = b.bind_i32(ctx.lower(g));
+                voff.push(v);
+                base_of.push(q);
+                issues.push((v, 1024 * q as i32));
+                delta.push(None);
+            }
+        }
+    }
+    Dma { issues, delta }
 }
 
 /// LDS byte `d = 1024 (issues (tid / 64) + q) + 16 (tid % 64)` holds tile element `smem^-1(d)`, so the source offset is `glob o right_inverse(smem)`;
@@ -102,8 +151,8 @@ fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, 
             assert_eq!(gofs[q as usize].eval(&env), want, "DMA rows {rows} thread {th} issue {q}");
         }
     }
-    // MUBUF form: voffset (loop invariant, bound here) + the instruction offset 1024 (q % 4) = the global offset; M0 = the group's first 1 KB block
-    Dma { issues: gofs.iter().enumerate().map(|(q, g)| (b.bind_i32(ctx.lower(g) - 1024 * (q as i32 % 4)), 1024 * q as i32)).collect() }
+    // MUBUF form: voffset (loop invariant) + soffset + the instruction offset 1024 (q % 4) = the global offset; M0 = the group's first 1 KB block
+    finish_dma(b, ctx, s_tid, gofs)
 }
 
 /// A-tile DMA for the row-major LDS image with the FMHA 128-byte-row swizzle (`swz o (r, k) -> 128 r + k`): one instruction moves 8 whole
@@ -129,9 +178,9 @@ fn dma_plan_rows_swz(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: 
             let want = glob.crd2idx(&tup![lin / 128, lin % 128], d).eval(&env);
             assert_eq!(g.eval(&env), want, "A DMA thread {th} issue {q}");
         }
-        out.push((b.bind_i32(ctx.lower(&g) - 1024 * (q as i32 % 4)), 1024 * q as i32));
+        out.push(g);
     }
-    Dma { issues: out }
+    finish_dma(b, ctx, s_tid, out)
 }
 
 /// The scale panel: every K group's scales of the CTA, loaded once in the prologue (`Cfg::scale_panel`).
@@ -329,7 +378,8 @@ impl Body {
         });
         let mut unit = 0usize;
         for (bi, (sh, dma, org, rsrc, wave)) in [(&self.a_s, &self.a_dma, ka, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, kb, self.rsrc_b, self.b_wave)].into_iter().enumerate() {
-            let mine: Vec<(ValueId, i32)> = dma.issues.iter().enumerate().filter(|(q, _)| range.contains(&(unit + q))).map(|(_, x)| *x).collect();
+            let mine: Vec<(ValueId, i32, Option<ValueId>)> =
+                dma.issues.iter().zip(dma.delta.iter()).enumerate().filter(|(q, _)| range.contains(&(unit + q))).map(|(_, (x, d))| (x.0, x.1, *d)).collect();
             unit += dma.issues.len();
             if mine.is_empty() {
                 continue;
@@ -341,7 +391,7 @@ impl Body {
             }
             let sbase = cache.sbase[bi].unwrap();
             let mut m0s: Vec<(i32, ValueId)> = Vec::new();
-            for (_, lds) in mine.iter() {
+            for (_, lds, _) in mine.iter() {
                 let grp = *lds - *lds % 4096;
                 let key = (bi, grp);
                 if !cache.m0.iter().any(|x| x.0 == key) {
@@ -354,8 +404,13 @@ impl Body {
             r.write(b, |b| {
                 // buffer_load_dwordx4 ... lds: voffset = the lane's loop-invariant offset, soffset = the tile origin (wave uniform), M0 = the first 1 KB
                 // block of each group of 4 issues (SGPR, once per stage), instruction offset 1024 (q % 4) moves both the LDS and the global address
-                for ((g, lds), (_, m0)) in mine.iter().zip(m0s.iter()) {
-                    b.load_buffer_lds(rsrc, *g, org, *m0, (*lds % 4096) as u32, 4);
+                for ((g, lds, d), (_, m0)) in mine.iter().zip(m0s.iter()) {
+                    // shared voffset: the issue's wave-uniform source delta goes into the soffset (one scalar add)
+                    let so = match d {
+                        Some(d) => b.bind_i32(ev(org) + ev(*d)),
+                        None => org,
+                    };
+                    b.load_buffer_lds(rsrc, *g, so, *m0, (*lds % 4096) as u32, 4);
                 }
             });
         }
