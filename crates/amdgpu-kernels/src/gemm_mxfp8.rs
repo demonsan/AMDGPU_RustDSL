@@ -69,6 +69,8 @@ pub struct GemmConfig {
     pub split_sync: bool,
     /// the vendor request shape: waves 0/1 DMA the whole A tile, waves 2/3 the whole B tile (16 issues each)
     pub wave_roles: bool,
+    /// wave roles in the straight-line form (descriptor / soffset / M0 selected, no branch) - UNVERIFIED timing builds only
+    pub wave_roles_select: bool,
     pub ablate: Ablate,
 }
 
@@ -77,7 +79,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -85,7 +87,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -307,6 +309,8 @@ struct Body {
     cfg: Cfg,
     /// wave roles: the (SGPR) wave id; waves 0/1 move A, 2/3 move B
     role_a: Option<ValueId>,
+    /// wave roles, straight-line form: the role's descriptor (s_cselect) and per-issue voffsets (selected once)
+    role_rsrc: Option<(ValueId, Vec<ValueId>)>,
     /// K / 128 (kernarg)
     kb_v: ValueId,
     panel: Option<Panel>,
@@ -568,6 +572,27 @@ impl Body {
             }
             let n = self.a_dma.issues.len();
             if !(0..n).any(|q| range.contains(&q)) {
+                return;
+            }
+            if let Some((rr, vo)) = &self.role_rsrc {
+                // straight-line: soffset / M0 selected per stage (s_cselect), descriptor and voffsets selected once in the prologue
+                // (UNVERIFIED timing build: the LDS write marker names the A ring only)
+                let isa = ev(wv).lt(2);
+                let org = { let v = b.bind_i32(isa.clone().select_i32(ev(ka), ev(kb))); b.read_first_lane(v) };
+                let r = self.a_s.at(slot);
+                let issues: Vec<(usize, i32)> = self.a_dma.issues.iter().enumerate().filter(|(q, _)| range.contains(q)).map(|(q, x)| (q, x.1)).collect();
+                let m0s: Vec<ValueId> = issues.iter().map(|(_, lds)| {
+                    let grp = *lds - *lds % 4096;
+                    let ma = cache.m0.iter().find(|x| x.0 == (0, grp)).unwrap().1;
+                    let mb = cache.m0.iter().find(|x| x.0 == (1, grp)).unwrap().1;
+                    let v = b.bind_i32(isa.clone().select_i32(ev(ma), ev(mb)));
+                    b.read_first_lane(v)
+                }).collect();
+                r.write(b, |b| {
+                    for ((q, lds), m0) in issues.iter().zip(m0s.iter()) {
+                        b.load_buffer_lds(*rr, vo[*q], org, *m0, (*lds % 4096) as u32, 4);
+                    }
+                });
                 return;
             }
             let isa = b.bind_cond(ev(wv).lt(2));
@@ -885,6 +910,9 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_split2" => GemmConfig { split_sync: true, dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_roles" => GemmConfig { wave_roles: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_roles2" => GemmConfig { wave_roles: true, dma_gap: 2, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_rs" => GemmConfig { wave_roles: true, wave_roles_select: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_rs2" => GemmConfig { wave_roles: true, wave_roles_select: true, dma_gap: 2, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_rs1" => GemmConfig { wave_roles: true, wave_roles_select: true, dma_gap: 1, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_prio" => GemmConfig { setprio: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_gap4" => GemmConfig { dma_gap: 4, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_acc32h" => GemmConfig { acc_agpr: 32, sched: "rewait,hoistchain", ..GemmConfig::v4() },
@@ -1104,6 +1132,16 @@ fn build(name: &str, cfg: Cfg) -> Function {
         let (tr, job) = match tr { Some((o, j)) => (Some(o), Some(j)), None => (None, None) };
         Panel { sh, b_base: PANEL_KB * 256, b_off, tr, job }
     });
+    let role_rsrc = match role_a {
+        Some(wv) if cfg.wave_roles_select => {
+            assert!(a_dma.issues.iter().zip(b_dma.issues.iter()).all(|(x, y)| x.1 == y.1), "role DMA: A and B issue the same LDS pattern");
+            let c = b.bind_cond(ev(wv).lt(2));
+            let rr = b.select_uniform_rsrc(c, rsrc_a, rsrc_b);
+            let vo: Vec<ValueId> = a_dma.issues.iter().zip(b_dma.issues.iter()).map(|(x, y)| b.bind_i32(ev(wv).lt(2).select_i32(ev(x.0), ev(y.0)))).collect();
+            Some((rr, vo))
+        }
+        _ => None,
+    };
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
     pipe.unroll2 = cfg.unroll2;
     if cfg.split_sync {
@@ -1114,7 +1152,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     }
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
-        cfg, kb_v, role_a, panel, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
+        cfg, kb_v, role_a, role_rsrc, panel, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
         a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false, npre_done: 0,
     };
     pipe.run(b, Role::All, &mut body);
