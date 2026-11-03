@@ -1,5 +1,7 @@
 [
 {
+  "schema_version": 1,
+  "generated_by": "amdc gen-host",
   "kernel": "gemm_mxfp8_bs_v3",
   "kernarg_size": 96,
   "workgroup_size": 256,
@@ -14,6 +16,8 @@
   "symbols": [{"name":"KT","lo":1},{"name":"MT","lo":1},{"name":"NT","lo":1}]
 },
 {
+  "schema_version": 1,
+  "generated_by": "amdc gen-host",
   "kernel": "gemm_mxfp8_bs_v4",
   "kernarg_size": 96,
   "workgroup_size": 256,

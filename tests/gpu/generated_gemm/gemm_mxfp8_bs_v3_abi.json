@@ -1,4 +1,6 @@
 {
+  "schema_version": 1,
+  "generated_by": "amdc gen-host",
   "kernel": "gemm_mxfp8_bs_v3",
   "kernarg_size": 96,
   "workgroup_size": 256,
