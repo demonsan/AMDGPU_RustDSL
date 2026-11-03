@@ -30,6 +30,8 @@ use amdgpu_layout::{Dyns, Ix};
 pub struct Ctx {
     pub dyns: Dyns,
     vals: Vec<I32>,
+    /// bound subexpressions (CSE across every expression bound through `bind`; valid at the scope of the first bind - the kernel's top level)
+    memo: std::cell::RefCell<std::collections::HashMap<Ix, amdgpu_dsl::ValueId>>,
 }
 
 impl Ctx {
@@ -41,6 +43,58 @@ impl Ctx {
         let s = self.dyns.sym(name, lo, hi);
         self.vals.push(v);
         s
+    }
+    /// Binds a layout expression, sharing every compound subexpression already bound through this context (one IR value per distinct subterm).
+    pub fn bind(&self, b: &mut amdgpu_dsl::FnBuilder, x: &Ix) -> I32 {
+        match x {
+            Ix::C(_) | Ix::Sym(_) => return self.lower(x),
+            _ => {}
+        }
+        if let Some(v) = self.memo.borrow().get(x) {
+            return amdgpu_dsl::tile::ev(*v);
+        }
+        let e = match x {
+            Ix::Sum(t, k) => {
+                let mut acc: Option<I32> = None;
+                for (term, m) in t {
+                    let v = self.bind(b, term);
+                    let v = if *m == 1 {
+                        v
+                    } else if *m > 0 && (*m as u64).is_power_of_two() {
+                        v << ((*m as u64).trailing_zeros() as i32)
+                    } else {
+                        v * (*m as i32)
+                    };
+                    acc = Some(match acc {
+                        None => v,
+                        Some(a) => a + v,
+                    });
+                }
+                let a = acc.expect("a sum has terms");
+                if *k == 0 {
+                    a
+                } else {
+                    a + (*k as i32)
+                }
+            }
+            Ix::Mul(a, c) => self.bind(b, a) * self.bind(b, c),
+            Ix::Div(a, k) => {
+                assert!((*k as u64).is_power_of_two(), "Ctx::bind: division by {k}");
+                self.bind(b, a).lshr((*k as u64).trailing_zeros() as i32)
+            }
+            Ix::Mod(a, k) => {
+                assert!((*k as u64).is_power_of_two(), "Ctx::bind: remainder by {k}");
+                self.bind(b, a) & ((*k - 1) as i32)
+            }
+            Ix::Xor(a, c) => self.bind(b, a) ^ self.bind(b, c),
+            Ix::And(a, m) => self.bind(b, a) & (*m as i32),
+            Ix::Shl(a, s) => self.bind(b, a) << (*s as i32),
+            Ix::Shr(a, s) => self.bind(b, a).lshr(*s as i32),
+            Ix::C(_) | Ix::Sym(_) => unreachable!(),
+        };
+        let v = b.bind_i32(e);
+        self.memo.borrow_mut().insert(x.clone(), v);
+        amdgpu_dsl::tile::ev(v)
     }
     /// The IR expression of a layout expression. Divisions and remainders must be by powers of two (shift / and); other constants multiply.
     pub fn lower(&self, x: &Ix) -> I32 {

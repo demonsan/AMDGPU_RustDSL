@@ -86,8 +86,8 @@ pub fn partition_buffer_dma(b: &mut FnBuilder, ctx: &Ctx, atom: CopyAtom, tv: &L
         let mi = intern(&mut m0s, m0d);
         out.push((vo, mi, m0c, imm));
     }
-    let voffs = voffs.iter().map(|x| b.let_i32(ctx.lower(x))).collect();
-    let m0s = m0s.iter().map(|x| b.let_i32(ctx.lower(x) + sh.base as i32)).collect();
+    let voffs = voffs.iter().map(|x| ctx.bind(b, x)).collect();
+    let m0s = m0s.iter().map(|x| { let v = ctx.bind(b, x); if sh.base == 0 { v } else { b.let_i32(v + sh.base as i32) } }).collect();
     BufDmaPart { sh: sh.clone(), bytes: atom.bytes, voffs, m0s, issues: out }
 }
 

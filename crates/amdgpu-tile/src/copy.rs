@@ -82,7 +82,7 @@ impl TiledCopy {
         // build-time proofs on the concrete lanes (the lane symbol must be the first dynamic symbol of a single-symbol plan)
         let insts = self.atom.insts as usize;
         assert!(op.issues.len() % insts == 0, "partition_lds: {} instructions are not whole {}-instruction operations", op.issues.len(), insts);
-        let bases: Vec<I32> = op.bases.iter().map(|x| b.let_i32(ctx.lower(x) + sh.base as i32)).collect();
+        let bases: Vec<I32> = op.bases.iter().map(|x| { let v = ctx.bind(b, x); if sh.base == 0 { v } else { b.let_i32(v + sh.base as i32) } }).collect();
         let ops: Vec<Vec<(usize, i64)>> = op.issues.chunks(insts).map(|c| c.to_vec()).collect();
         LdsPart { sh: sh.clone(), atom: self.atom, bases, ops }
     }

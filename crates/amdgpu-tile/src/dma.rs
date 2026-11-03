@@ -45,7 +45,7 @@ pub fn partition_dma(b: &mut FnBuilder, ctx: &Ctx, atom: CopyAtom, lane: &Ix, wa
     // the slot byte of lane / instruction q, split into its dynamic part and the static step
     let a = lane.mul_c(lane_stride).add(&wave.mul_c(slice));
     let row_a = a.div_c(row_bytes, d);
-    let row_dyn = b.let_i32(ctx.lower(&row_a));
+    let row_dyn = ctx.bind(b, &row_a);
     let mut cols: Vec<Ix> = Vec::new();
     let mut col_of = Vec::new();
     let mut row_c = Vec::new();
@@ -66,7 +66,7 @@ pub fn partition_dma(b: &mut FnBuilder, ctx: &Ctx, atom: CopyAtom, lane: &Ix, wa
         };
         col_of.push(i);
     }
-    let cols: Vec<I32> = cols.iter().map(|c| b.let_i32(ctx.lower(c))).collect();
+    let cols: Vec<I32> = cols.iter().map(|c| ctx.bind(b, c)).collect();
     let top = slice - step;
     let lds_wave = b.let_i32((wave_val * slice as i32 + top as i32) + sh.base as i32);
     DmaPart { atom, src, sh: sh.clone(), row_dyn, row_c, cols, col_of, lds_wave, step }
