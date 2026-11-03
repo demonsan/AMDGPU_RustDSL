@@ -106,7 +106,7 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         lw.uvars = v;
     }
     lw.run(f)?;
-    Ok(lw.finish())
+    lw.finish()
 }
 
 struct Lowerer {
@@ -249,7 +249,7 @@ impl Lowerer {
         }
     }
 
-    fn finish(mut self) -> MFunction {
+    fn finish(mut self) -> Result<MFunction, String> {
         if !self.pending_vmem.is_empty() {
             self.push(MInst::new(MOp::SWaitVm).auto());
         }
@@ -265,7 +265,15 @@ impl Lowerer {
             };
             if let Some(r) = r {
                 let c = self.mir.canon(r);
-                self.mir.agpr_pin.insert(c, mk.pin.unwrap_or(crate::agpr::AGPR_ANY));
+                // an exact pin is never weakened by a later ny request on the same register (e.g. `agpr(load)` coalesced into a `pin_agpr_at` variable)
+                let want = mk.pin.unwrap_or(crate::agpr::AGPR_ANY);
+                match self.mir.agpr_pin.get(&c) {
+                    Some(old) if *old != crate::agpr::AGPR_ANY && want == crate::agpr::AGPR_ANY => {}
+                    Some(old) if *old != crate::agpr::AGPR_ANY && want != *old => return Err(format!("conflicting exact AGPR pins a{old} and a{want} on one register")),
+                    _ => {
+                        self.mir.agpr_pin.insert(c, want);
+                    }
+                }
             }
         }
         if opt_on("cmpfold") {
@@ -311,7 +319,7 @@ impl Lowerer {
         }
         coalesce(&mut self.mir);
         dce(&mut self.mir);
-        self.mir
+        Ok(self.mir)
     }
 
     fn fresh_label(&mut self) -> u32 {
@@ -1566,6 +1574,14 @@ impl Lowerer {
                                 self.push(MInst::new(MOp::VWriteSub).def(r).srcreg(zero).imm(k as i64));
                             }
                             continue;
+                        }
+                        // loop-entry in-place load: init = load_lds(..) (single use) writes the variable's own registers instead of a second fragment + copy
+                        if matches!(class, RClass::V4 | RClass::V8) {
+                            if let Opnd::Val(v) = init[i] {
+                                if self.use_counts.get(&v).copied() == Some(1) && self.try_coalesce_lds_reload(v, r) {
+                                    continue;
+                                }
+                            }
                         }
                         let src = match class {
                             RClass::V1 => self.as_v1(init[i])?,
