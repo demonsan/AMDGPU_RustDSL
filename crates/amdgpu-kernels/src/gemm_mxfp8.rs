@@ -279,8 +279,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let a_wave = b.bind_i32(lane.wave() * (cta_m * 128 / 4) as i32);
     let b_wave = b.bind_i32(lane.wave() * (cta_n * 128 / 4) as i32);
     // buffer descriptors over A (M K bytes) and the preshuffled B (N K bytes)
-    let rsrc_a = { let n = b.bind_i32(ev(m_v) * ev(k_v)); b.buffer_desc_dyn(ptr_a, n) };
-    let rsrc_b = { let n = b.bind_i32(ev(n_v) * ev(k_v)); b.buffer_desc_dyn(ptr_b, n) };
+    let rsrc_a = { let n = b.bind_i32(ev(m_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_a, n) };
+    let rsrc_b = { let n = b.bind_i32(ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) };
     let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
     let b_org = b.bind_i32((ev(bx) << lg_n) * ev(k_v));
 
