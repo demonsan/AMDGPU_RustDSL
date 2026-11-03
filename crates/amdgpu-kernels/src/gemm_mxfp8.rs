@@ -57,6 +57,10 @@ pub struct GemmConfig {
     pub shared_voffsets: bool,
     /// epilogue through LDS: bf16 C block transposed in a wave-private staging area, then 16-byte row-contiguous stores (the vendor form)
     pub lds_epilogue: bool,
+    /// `RegStaged`: the scale reads of t+1 issued before the fragment reloads (otherwise after them: an lgkmcnt(0) drain)
+    pub early_scales: bool,
+    /// extra scheduler tokens for this kernel (Function::sched_opts, on top of the Gemm profile's wait pass), e.g. "hoistchain"
+    pub sched: &'static str,
     pub ablate: Ablate,
 }
 
@@ -65,7 +69,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -73,12 +77,12 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
     pub fn v4() -> GemmConfig {
-        GemmConfig { acc_agpr: 24, reg_staged: true, pre_sync_mmas: 4, ..GemmConfig::v3() }
+        GemmConfig { acc_agpr: 24, reg_staged: true, pre_sync_mmas: 4, sched: "rewait,hoistchain", ..GemmConfig::v3() }
     }
 }
 
@@ -330,9 +334,9 @@ impl Body {
         if let Some(p) = &self.panel {
             // scale panel (loaded once): A rows [kb][256], B bytes [wn][KB] (+ the alignment delta of the B source)
             let pr = p.sh.at(&SlotIdx::new(0, 0));
-            let sab = b.bind_i32(((kb.clone() & (PANEL_KB as i32 - 1)) << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
+            let sab = b.bind_i32((kb.clone() << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
             let bo = b.bind_i32(ev(p.b_off) + kb);
-            let sbb = b.bind_i32(((ev(bo).lshr(2) << 2) & 508) + (p.sh.base as i32 + p.b_base as i32));
+            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (p.sh.base as i32 + p.b_base as i32));
             let (wa, wb) = pr.read(b, |b| {
                 let wa: Vec<ValueId> = (0..nm).map(|i| {
                     let a = b.bind_i32(ev(sab) + 16 * i as i32);
@@ -358,26 +362,34 @@ impl Body {
         (wa, wb, ((ev(self.sb_src) + kb) & 3) << 3)
     }
     /// Scale words + byte selects (shifted to byte 0).
-    /// With the transposed panel the A words are NOT shifted (2 words, the MMA selects byte i % 4 of word i / 4: `sa_sel`).
-    fn load_scales(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId) {
+    /// The scale reads of tile `kb` (issue only): the A words (transposed panel: final, 2 words; otherwise to be shifted), the B word and its shift.
+    fn scale_issue(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId, I32, bool) {
         if let Some((base, b_base, b_off, lo, pr)) = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0))))) {
-            let sab = b.bind_i32(((kb.clone() & (PANEL_KB as i32 - 1)) << 8) + (base as i32) + ev(lo));
+            let sab = b.bind_i32((kb.clone() << 8) + (base as i32) + ev(lo));
             let bo = b.bind_i32(ev(b_off) + kb);
-            let sbb = b.bind_i32(((ev(bo).lshr(2) << 2) & 508) + (base + b_base) as i32);
+            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (base + b_base) as i32);
             let (wa, wb) = pr.read(b, |b| {
-                let a1 = b.bind_i32(ev(sab) + 4);
-                let wa = vec![b.load_lds_b32(sab), b.load_lds_b32(a1)];
+                // the 8 A-scale bytes of this lane: one ds_read_b64
+                let w2 = b.load_lds_b64(sab);
+                let wa = vec![b.frag2_lane(w2, 0), b.frag2_lane(w2, 1)];
                 (wa, b.load_lds_b32(sbb))
             });
-            let sb = b.bind_i32(ev(wb).lshr((ev(bo) & 3) << 3));
-            return (wa, sb);
+            return (wa, wb, (ev(bo) & 3) << 3, true);
         }
         let (wa, wb, sh) = self.scale_words(b, slot, kb);
-        let sa: Vec<ValueId> = wa.iter().map(|w| b.bind_i32(ev(*w).lshr(ev(self.sa_sh[0])))).collect();
-        let sb = b.bind_i32(ev(wb).lshr(sh));
-        (sa, sb)
+        (wa, wb, sh, false)
     }
-    /// The (word, byte) of the A scale of m block i in the `load_scales` words.
+    /// The byte selects of `scale_issue`'s words (shifts to byte 0 where the MMA cannot select).
+    fn scale_finish(&self, b: &mut FnBuilder, w: (Vec<ValueId>, ValueId, I32, bool)) -> (Vec<ValueId>, ValueId) {
+        let (wa, wb, sh, fin) = w;
+        let sa = if fin { wa } else { wa.iter().map(|x| b.bind_i32(ev(*x).lshr(ev(self.sa_sh[0])))).collect() };
+        (sa, b.bind_i32(ev(wb).lshr(sh)))
+    }
+    /// With the transposed panel the A words are NOT shifted (2 words, the MMA selects byte i % 4 of word i / 4: `sa_sel`).
+    fn load_scales(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId) {
+        let w = self.scale_issue(b, slot, kb);
+        self.scale_finish(b, w)
+    }    /// The (word, byte) of the A scale of m block i in the `load_scales` words.
     fn sa_sel(&self, i: usize) -> (usize, u8) {
         if self.panel.as_ref().map_or(false, |p| p.tr.is_some()) {
             (i / 4, (i % 4) as u8)
@@ -411,6 +423,8 @@ impl Body {
         let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
         let (nm, nn) = (av.len(), bv.len());
         let next = if t.staged { Some((self.a_rd.at(b, &self.a_s.at(&t.next)), self.b_rd.at(b, &self.b_s.at(&t.next)), (), ())) } else { None };
+        // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and selected at the end (partial lgkm waits)
+        let early = if t.staged && self.cfg.early_scales { Some(self.scale_issue(b, &t.next, ox(t.it) + 1)) } else { None };
         let mut deferred = self.deferred.take();
         let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
         let per = (total + 2 * nm - 1) / (2 * nm);
@@ -460,8 +474,11 @@ impl Body {
             b.set_prio(0);
         }
         if t.staged {
-            // the scales of t+1 last (their byte selects would otherwise wait at the top of the MMAs)
-            let (sa, sb) = self.load_scales(b, &t.next, ox(t.it) + 1);
+            // the scales of t+1 (read early, or here)
+            let (sa, sb) = match early {
+                Some(w) => self.scale_finish(b, w),
+                None => self.load_scales(b, &t.next, ox(t.it) + 1),
+            };
             for (i, v) in sa.iter().enumerate() {
                 b.set_var(sav[i], *v);
             }
@@ -636,13 +653,13 @@ impl PipeBody for Body {
         let tr = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0)))));
         let (wa, wb, sbsh) = if let Some((base, b_base, b_off, lo, ref pr)) = tr {
             // transposed panel: 2 dwords hold the 8 A-scale bytes of this lane; the B byte as before
-            // K group < KT <= PANEL_KB (contract): the masks are no-ops that bound the panel offsets for the verifier
-            let sab = b.bind_i32(((kbx.clone() & (PANEL_KB as i32 - 1)) << 8) + (base as i32) + ev(lo));
+            let sab = b.bind_i32((kbx.clone() << 8) + (base as i32) + ev(lo));
             let bo = b.bind_i32(ev(b_off) + kbx.clone());
-            let sbb = b.bind_i32(((ev(bo).lshr(2) << 2) & 508) + (base + b_base) as i32);
+            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (base + b_base) as i32);
             let (wa, wb) = pr.read(b, |b| {
-                let a1 = b.bind_i32(ev(sab) + 4);
-                let wa = vec![b.load_lds_b32(sab), b.load_lds_b32(a1)];
+                // the 8 A-scale bytes of this lane: one ds_read_b64
+                let w2 = b.load_lds_b64(sab);
+                let wa = vec![b.frag2_lane(w2, 0), b.frag2_lane(w2, 1)];
                 (wa, b.load_lds_b32(sbb))
             });
             (wa, wb, (ev(bo) & 3) << 3)
@@ -738,6 +755,12 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v3_vshare" => GemmConfig { shared_voffsets: true, ..GemmConfig::v3() },
         "gemm_mxfp8_bs_v4_vshare" => GemmConfig { shared_voffsets: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_acc32" => GemmConfig { acc_agpr: 32, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_pre0" => GemmConfig { pre_sync_mmas: 0, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_pre8" => GemmConfig { pre_sync_mmas: 8, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_gap2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_late" => GemmConfig { early_scales: false, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v3_bpre4" => GemmConfig { b_prefetch: 4, ..GemmConfig::v3() },
+        "gemm_mxfp8_bs_v3_bpre6" => GemmConfig { b_prefetch: 6, ..GemmConfig::v3() },
         "gemm_mxfp8_bs_v3_prio" => GemmConfig { setprio: true, ..GemmConfig::v3() },
         "gemm_mxfp8_bs_v3_gap3" => GemmConfig { dma_gap: 3, ..GemmConfig::v3() },
         "gemm_mxfp8_bs_v3_directc" => GemmConfig { lds_epilogue: false, ..GemmConfig::v3() },
@@ -763,6 +786,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let mut fb = FnBuilder::new(name, 256);
     // compile policy: lowering `lgkmn,zeroinit` + the scoreboard wait pass (partial waits across the loop back edge, ds_read hoisting); nothing name-keyed
     fb.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
+    if !cfg.sched.is_empty() {
+        fb.sched_opts(cfg.sched);
+    }
     let b = &mut fb;
     declare_abi(b);
     declare_contract(b, cta_m, cta_n);
@@ -851,8 +877,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
     // the view bases lie inside one 16-row block (< 2048 bytes): the mask is a no-op that gives the verifier the bound the XOR swizzle hides
     // (bases include the buffer base; 16-byte reads: the low 4 bits are zero)
     let (ab, bb) = (a_s.base as i32, b_s.base as i32);
-    a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32((((x.clone() - ab) & 2032) + ab) + &a_wo)).collect();
-    b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32((((x.clone() - bb) & 2032) + bb) + &b_wo)).collect();
+    let _ = (ab, bb);
+    a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32(x + &a_wo)).collect();
+    b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32(x + &b_wo)).collect();
 
     // ---- DMA (A row-major, B preshuffled), wave parts of M0, CTA origins ----
     let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
@@ -1016,7 +1043,7 @@ fn lds_epilogue(
     let base = b.bind_i32(me.base());
     // staging layout over the C block element index m + 16 n of one 16 x 16 block: (m, n) -> m EPI_PITCH + 2 n
     let e_blk = make_layout(tup![16, 16], tup![EPI_PITCH, 2]);
-    let w_plan = IssuePlan::new(mma.c_tv(), 2); // 2 bf16 = one ds_write_b32
+    let w_plan = IssuePlan::new(mma.c_tv(), 4); // 4 bf16 = one ds_write_b64
     let mut exprs = Vec::new();
     for i in 0..nm as i64 {
         for j in 0..nn as i64 {
@@ -1031,12 +1058,13 @@ fn lds_epilogue(
                 let l = b.frag4_lane(Opnd::Var(*a), r);
                 b.bitcast_f32(l)
             }).collect();
-            for h in 0..2usize {
-                let w = b.cvt_pk_bf16_f32(v[2 * h], v[2 * h + 1]);
-                let (bi, imm) = wp.issues[2 * n + h];
-                let ad = b.bind_i32(ev(wbases[bi]) + imm as i32);
-                b.store_lds_b32(ad, w);
-            }
+            // 4 bf16 = one ds_write_b64
+            let w0 = b.cvt_pk_bf16_f32(v[0], v[1]);
+            let w1 = b.cvt_pk_bf16_f32(v[2], v[3]);
+            let f2 = b.frag2(w0, w1);
+            let (bi, imm) = wp.issues[n];
+            let ad = b.bind_i32(ev(wbases[bi]) + imm as i32);
+            b.store_lds_b64(ad, f2);
         }
     });
     b.wait_lds(0);
