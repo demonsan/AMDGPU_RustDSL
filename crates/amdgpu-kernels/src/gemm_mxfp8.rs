@@ -76,7 +76,7 @@ impl GemmConfig {
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
     pub fn v4() -> GemmConfig {
-        GemmConfig { acc_agpr: 24, reg_staged: true, panel_transposed: false, pre_sync_mmas: 4, ..GemmConfig::v3() }
+        GemmConfig { acc_agpr: 24, reg_staged: true, pre_sync_mmas: 4, ..GemmConfig::v3() }
     }
 }
 
@@ -103,10 +103,11 @@ fn smem_block() -> Layout {
 }
 
 /// `gemm` on loop variables (the operands of the register-staged tile are loop-carried): same operand / scale exchange as `amdgpu_tile::gemm`.
-fn mma_var(b: &mut FnBuilder, mma: &TiledMma, acc: VarId, a: VarId, bf: VarId, sa: VarId, sb: VarId) {
+#[allow(clippy::too_many_arguments)]
+fn mma_var(b: &mut FnBuilder, mma: &TiledMma, acc: VarId, a: VarId, bf: VarId, sa: VarId, sb: VarId, byte_a: u8) {
     assert_eq!(mma.atom().name, "MfmaScale16x16x128F8");
-    let (x, y, sx, sy) = if mma.swap_ab { (bf, a, sb, sa) } else { (a, bf, sa, sb) };
-    b.var_mfma_scale16(acc, Opnd::Var(x), Opnd::Var(y), Opnd::Var(sx), Opnd::Var(sy), 0, 0);
+    let (x, y, sx, sy, bx, by) = if mma.swap_ab { (bf, a, sb, sa, 0, byte_a) } else { (a, bf, sa, sb, byte_a, 0) };
+    b.var_mfma_scale16(acc, Opnd::Var(x), Opnd::Var(y), Opnd::Var(sx), Opnd::Var(sy), bx, by);
 }
 
 /// The 96-byte ABI (opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950), declared in offset order.
@@ -352,12 +353,34 @@ impl Body {
         (wa, wb, ((ev(self.sb_src) + kb) & 3) << 3)
     }
     /// Scale words + byte selects (shifted to byte 0).
+    /// With the transposed panel the A words are NOT shifted (2 words, the MMA selects byte i % 4 of word i / 4: `sa_sel`).
     fn load_scales(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId) {
+        if let Some((base, b_base, b_off, lo, pr)) = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0))))) {
+            let sab = b.bind_i32(((kb.clone() & (PANEL_KB as i32 - 1)) << 8) + (base as i32) + ev(lo));
+            let bo = b.bind_i32(ev(b_off) + kb);
+            let sbb = b.bind_i32(((ev(bo).lshr(2) << 2) & 508) + (base + b_base) as i32);
+            let (wa, wb) = pr.read(b, |b| {
+                let a1 = b.bind_i32(ev(sab) + 4);
+                let wa = vec![b.load_lds_b32(sab), b.load_lds_b32(a1)];
+                (wa, b.load_lds_b32(sbb))
+            });
+            let sb = b.bind_i32(ev(wb).lshr((ev(bo) & 3) << 3));
+            return (wa, sb);
+        }
         let (wa, wb, sh) = self.scale_words(b, slot, kb);
         let sa: Vec<ValueId> = wa.iter().map(|w| b.bind_i32(ev(*w).lshr(ev(self.sa_sh[0])))).collect();
         let sb = b.bind_i32(ev(wb).lshr(sh));
         (sa, sb)
-    }    fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
+    }
+    /// The (word, byte) of the A scale of m block i in the `load_scales` words.
+    fn sa_sel(&self, i: usize) -> (usize, u8) {
+        if self.panel.as_ref().map_or(false, |p| p.tr.is_some()) {
+            (i / 4, (i % 4) as u8)
+        } else {
+            (i, 0)
+        }
+    }
+    fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
         let v = part.read(b, o);
         if self.cfg.agpr_ops {
             b.agpr(v)
@@ -410,7 +433,8 @@ impl Body {
                         }
                     }
                     nmma += 1;
-                    mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[i], sbv);
+                    let (w, by) = self.sa_sel(i);
+                    mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
                 }
                 if lo == half {
                     if let Some((ar, _, _, _)) = &next {
@@ -433,8 +457,8 @@ impl Body {
         if t.staged {
             // the scales of t+1 last (their byte selects would otherwise wait at the top of the MMAs)
             let (sa, sb) = self.load_scales(b, &t.next, ox(t.it) + 1);
-            for i in 0..nm {
-                b.set_var(sav[i], sa[i]);
+            for (i, v) in sa.iter().enumerate() {
+                b.set_var(sav[i], *v);
             }
             b.set_var(sbv, sb);
         }
@@ -583,7 +607,8 @@ impl PipeBody for Body {
                 if n == npre {
                     break 'o;
                 }
-                mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[i], sbv);
+                let (w, by) = self.sa_sel(i);
+                mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
                 n += 1;
             }
         }
