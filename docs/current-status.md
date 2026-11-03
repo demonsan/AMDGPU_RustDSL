@@ -22,7 +22,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
   `TiledCopy`/`TiledMma`/`partition_*` 生成 IR；主机合同由张量布局导出。全套门禁对旧手写集与对 tile 库集均通过（§4.6），证书与两者相同。
   上一版（tile 库集 `dsl_*`）保留为 `fmha_fwd_hd128_mxfp8_dsl_auto`，旧手写集保留为 `fmha_fwd_hd128_mxfp8_legacy_auto`，两者 md5 不变。
 - **主机侧生成（P5）**：`amdc gen-host` 从 kernel 合同生成 C++ 启动/ABI 头与 JSON（[`host-gen.md`](host-gen.md)）；出厂 `ref_host` 使用生成的命名字段。
-- **MXFP8 blockscale GEMM（P4）**：`gemm_mxfp8_bs_v3` 对照 aiter PR #6696 4-wave pin-AGPR —— **_（待 kernel-opt 填写最终数字）_**；见 §4.7。
+- **MXFP8 blockscale GEMM（P4）**：`gemm_mxfp8_bs_v4` 对照 aiter PR #6696 4-wave pin-AGPR —— **3064 vs 3237 TF/s = 0.947×**（同轮），门禁 PASS；见 §4.7。
 - 上一版说明（2026-11-02）：默认路径 `fmha_fwd_hd128_mxfp8_auto` 的 4 个 kernel 曾为
   `fmha_fwd_hd128_mxfp8_dsl_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-dsl/src/fmha_tile.rs`：kernel 函数 21/19/23/6 行 + 注意力
   `AttnBody` 111 行；FMHA ABI/块设置/K-V 环/epilogue/combine 是库组件 `tile/fmha.rs`）。与旧手写集同轮对照：精度/确定性/压力全过，
@@ -196,9 +196,9 @@ v3 asm md5：`_vs128` `68d2832b`、`_t128` `f5a43b09`、`_kvsplit` `e4fc18b1`、
 
 | 项 | 数值 |
 |---|---|
-| kernel / 形状 | `gemm_mxfp8_bs_v3`，M=N=4096、K=8192，256×256×128 tile，4 wave，`v_mfma_scale_f32_16x16x128_f8f6f4`（swap_ab） |
-| 性能 vs 厂商（同轮） | **_（待 kernel-opt 填写）_** |
-| 门禁 | `tools/gemm_gate.sh`：BUILD / VERIFY（strict）/ ACC（3 形状 GEMM_OK）/ DET / PERF —— **_（待填写）_** |
+| kernel / 形状 | `gemm_mxfp8_bs_v4`（v3 为不做原地重载的变体），M=N=4096、K=8192，256×256×128 tile，4 wave，`v_mfma_scale_f32_16x16x128_f8f6f4`（swap_ab） |
+| 性能 vs 厂商（同轮） | v4 **3064 vs 3237 TF/s = 0.947×**；v3 2984 vs 3236 = 0.922×（交替 7 进程中位数，GPU 5）；演进 652 → 3064，详见 `mxfp8-gemm-4wave-analysis.md` §11 |
+| 门禁 | `tools/gemm_gate.sh`：BUILD / VERIFY（strict 0 错误 0 警告，3 trusted assumes，0 unproven）/ ACC（4096²×8192、8192×7168×7168、1280×6144×7168 GEMM_OK）/ DET 3/3 / PERF —— **PASS**；剩余约 5%：一级预取深度下 DMA 延迟暴露（需第三个 LDS stage 或 8 wave） |
 | 编译器配套 | AGPR 寄存器类与 acc_cd MFMA（sched）、SALU 地址链 `scalarize2`（2771 → 2867 TF/s）、`ds_read_b64`/`ds_write_b64`、验证器 possible-bits 与 box 规则（去掉仅为验证器加的掩码） |
 
 ### 4.3 精度与确定性
