@@ -217,12 +217,9 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
             let r = src_reg(inst, 0)?;
             dword_name(RClass::V1, cx.phys(r), inst.imm as u32)
         }
-        "opsel0" => {
-            if inst.imm != 0 {
-                return Err(format!("{:?}: scale byte selects (op_sel) are not supported by the LLVM tail rows yet", inst.op));
-            }
-            "0".to_string()
-        }
+        // scaled MFMA byte selects (inst.imm: bits 0..1 scale A byte, bits 4..5 scale B byte): MIR op_sel immediates are 4 * byte (llc dump: A=3,B=2 -> 12, 8)
+        "opselA" => format!("{}", 4 * (inst.imm & 3)),
+        "opselB" => format!("{}", 4 * ((inst.imm >> 4) & 3)),
         "pv" => format!("$vgpr{}", inst.imm),
         "ps" => format!("$sgpr{}", inst.imm),
         "vmcnt" => format!("{}", waitcnt_imm(Some(inst.imm as u32), None)),
