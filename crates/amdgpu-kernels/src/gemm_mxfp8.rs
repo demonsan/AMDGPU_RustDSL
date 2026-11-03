@@ -568,8 +568,24 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let kb_v = b.let_(Op::KernargI32 { offset: 84 });
     let tid = b.let_(Op::WorkitemId);
     let lane = Lane::from_tid(b, tid);
-    let bx = b.let_(Op::WorkgroupIdX); // N tile
-    let by = b.let_(Op::WorkgroupIdY); // M tile
+    let bx0 = b.let_(Op::WorkgroupIdX); // N tile
+    let by0 = b.let_(Op::WorkgroupIdY); // M tile
+    // XCD-aware raster (FMHA_ABLATE=xcd, experiment): workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
+    // give every XCD whole 4 x 4 blocks of tiles (4 A + 4 B panels instead of all A panels). Only for a 16 x 16 tile grid here; identity otherwise.
+    let (bx, by) = if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("xcd")) {
+        let ok = b.bind_cond(ev(n_v).eq((16 * cfg.cta_n) as i32) & ev(m_v).eq((16 * cfg.cta_m) as i32));
+        let id = b.bind_i32(ev(bx0) + (ev(by0) << 4));
+        let loc = b.bind_i32(ev(id).lshr(3));
+        // block (of 16) = 2 (id % 8) + loc / 16 -> (row, col) = (block / 4, block % 4); inside the block: loc % 16 -> (n4, m4)
+        let blk = b.bind_i32(((ev(id) & 7) << 1) + ev(loc).lshr(4));
+        let nx = b.bind_i32(((ev(blk) & 3) << 2) + (ev(loc) & 3));
+        let ny = b.bind_i32((ev(blk).lshr(2) << 2) + (ev(loc).lshr(2) & 3));
+        let px = b.bind_i32(ok.clone().select_i32(ev(nx), ev(bx0)));
+        let py = b.bind_i32(ok.select_i32(ev(ny), ev(by0)));
+        (px, py)
+    } else {
+        (bx0, by0)
+    };
     let (lg_m, lg_n) = (cta_m.trailing_zeros() as i32, cta_n.trailing_zeros() as i32);
     let wm = b.bind_i32(lane.wave() & 1);
     let wn = b.bind_i32(lane.wave().lshr(1));
