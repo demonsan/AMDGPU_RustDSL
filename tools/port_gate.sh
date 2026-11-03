@@ -25,7 +25,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 P="${1:?usage: tools/port_gate.sh <kernel_prefix> [tag]}"
 TAG="${2:-$(echo "$P" | tr -c 'A-Za-z0-9_\n' '_')}"
-SHIP=fmha_fwd_hd128_mxfp8
+SHIP="${SHIP_REF:-fmha_fwd_hd128_mxfp8}"   # reference set (default: the legacy hand-written kernels)
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 REF_CO="${REF_CO:-/shared/amdgpu/home/blyu_qle/sessions/ref_mxfp8.co}"
