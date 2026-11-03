@@ -312,7 +312,8 @@ impl crate::tile::PipeBody for GemmV1 {
         // scales of tile kb = key0 / 128: A rows m_cta.. (256 contiguous bytes of the [K/128][M] tensor), the B-scale dword (same address on every lane)
         let kb = b.bind_i32(key0.clone().lshr(7));
         let r = self.sc_s.at(slot);
-        let sbase = b.bind_i32(r.off_v(b) + self.sc_s.base as i32 + crate::tile::ev(self.sc_wave));
+        let ro = r.off_v(b);
+        let sbase = b.bind_i32(ro + self.sc_s.base as i32 + crate::tile::ev(self.sc_wave));
         let pa = {
             let o = b.bind_i32(crate::tile::ev(kb) * crate::tile::ev(self.m_v) + crate::tile::ev(self.sa_src));
             b.ptr_add(self.ptr_sfa, o)
@@ -337,7 +338,8 @@ impl crate::tile::PipeBody for GemmV1 {
     fn window(&mut self, b: &mut FnBuilder, _role: crate::tile::Role, t: &crate::tile::TileIt) {
         let kbx = crate::tile::ox(t.it);
         let scr = self.sc_s.at(&t.cur);
-        let scb = b.bind_i32(scr.off_v(b) + self.sc_s.base as i32 + crate::tile::ev(self.sc_wave));
+        let so = scr.off_v(b);
+        let scb = b.bind_i32(so + self.sc_s.base as i32 + crate::tile::ev(self.sc_wave));
         let (sa, sb) = scr.read(b, |b| {
             let sa: Vec<ValueId> = (0..4).map(|i| {
                 // the dword holding row byte r = 128 wm + 32 i + lane % 32, shifted to byte 0
