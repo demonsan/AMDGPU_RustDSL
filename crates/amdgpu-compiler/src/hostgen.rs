@@ -136,7 +136,7 @@ pub fn generate(f: &Function) -> Result<Generated, String> {
             DType::F16 if a.size == 2 => Some("uint16_t".to_string()),
             _ => None,
         };
-        match typed {
+        match &typed {
             Some(ty) => fields.push_str(&format!("    {ty} {field};\n")),
             None => fields.push_str(&format!("    uint8_t {field}[{}];\n", a.size.max(1))),
         }
