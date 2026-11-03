@@ -82,7 +82,15 @@ impl Options {
             o.ldshoist = true;
         }
         if let Ok(s) = std::env::var("AMDC_SCHED_OPTS") {
-            for t in s.split(',') {
+            o.apply_tokens(&s);
+        }
+        Some(o)
+    }
+
+    /// Apply comma-separated scheduler option tokens (AMDC_SCHED_OPTS vocabulary; also Function::sched_opts).
+    pub fn apply_tokens(&mut self, s: &str) {
+        let o = self;
+        for t in s.split(',') {
                 let t = t.trim();
                 match t {
                     "rewait" => o.reorder = false,
@@ -116,8 +124,6 @@ impl Options {
                     }
                 }
             }
-        }
-        Some(o)
     }
 }
 

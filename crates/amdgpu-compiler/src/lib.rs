@@ -33,6 +33,7 @@ pub fn policy_name(f: &amdgpu_dsl::Function) -> &str {
         Some(P::T128) => "fmha_fwd_hd128_mxfp8_t128",
         Some(P::KvSplit) => "fmha_fwd_hd128_mxfp8_kvsplit",
         Some(P::Combine) => "fmha_fwd_hd128_mxfp8_kvsplit_combine8h",
+        Some(P::Gemm) => "gemm_mxfp8",
         Some(P::Default) => "",
     }
 }
@@ -85,6 +86,10 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
 
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
     let pname = policy_name(f);
+    // per-kernel lowering options (Function::lower_opts) are appended to the caller's extras
+    let mut extra_all: Vec<&str> = extra.to_vec();
+    extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
+    let extra: &[&str] = &extra_all;
     // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
     // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/status.md round 47).
     let base = if (pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || pname.ends_with("_kvsplit") || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))) && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
@@ -130,6 +135,18 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // The FMHA kernels default to the wait-recomputing pass (partial vmcnt/lgkmcnt waits, ALU across barriers, ds_read hoisting): +9% on the
     // transposed kernel, bit-identical results (measured, docs/status.md round 44). AMDC_SCHED=0 turns it off.
     let sched_opts = match sched_opts {
+        // GEMM profile / explicit Function::sched_opts: the scoreboard wait pass (+ ds_read hoisting, no reordering) with the kernel's own tokens on top
+        None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0") && (f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) || f.sched_opts.is_some()) => {
+            let mut o = sched::Options::default();
+            if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) {
+                o.reorder = false;
+                o.ldshoist = true;
+            }
+            if let Some(s) = &f.sched_opts {
+                o.apply_tokens(s);
+            }
+            Some(o)
+        }
         None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0")
             && (pname.starts_with("fmha_fwd_hd128_mxfp8_t") || pname.starts_with("fmha_fwd_hd128_mxfp8_sv") || pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))) =>
         {

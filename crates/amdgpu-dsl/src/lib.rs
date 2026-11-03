@@ -682,6 +682,10 @@ pub struct Function {
     /// Explicit compile policy (lowering options + scheduler preset). `None` = the compiler derives it from the kernel name (the historical behaviour,
     /// which every existing kernel keeps); kernels written on the tile library set it so their policy does not depend on their name.
     pub compile_profile: Option<CompileProfile>,
+    /// Extra lowering option tokens for this kernel (the AMDC_LOWER_OPTS vocabulary, e.g. lgkmn), on top of its profile - so nothing is name-keyed.
+    pub lower_opts: Vec<String>,
+    /// Scheduler option tokens (the AMDC_SCHED_OPTS vocabulary: ewait,ldshoist,xbar,hoist=N,limit=N,...); Some turns the scheduler on for this kernel (unless AMDC_SCHED=0).
+    pub sched_opts: Option<String>,
 }
 
 /// Compile policy of a kernel (see `amdgpu-compiler/src/lib.rs`): which lowering options and which scheduler preset it gets.
@@ -695,6 +699,9 @@ pub enum CompileProfile {
     KvSplit,
     /// The policy of the KV-split combine kernels (FMHA zeroinit lowering, no scheduler preset).
     Combine,
+    /// The MXFP8 GEMM kernels (mdgpu-kernels::gemm_mxfp8): lowering dce,cmpfold,lgkmn,zeroinit, scheduler = the scoreboard wait pass (partial mcnt/lgkmcnt,
+    /// including across the loop back edge) + ds_read hoisting, no instruction reordering. Kernel-specific additions go through Function::lower_opts / Function::sched_opts.
+    Gemm,
     /// No FMHA-specific policy (plain lowering, scheduler only when requested by the environment).
     Default,
 }
@@ -891,6 +898,8 @@ impl FnBuilder {
                 allow_var_rereads: false,
             agpr: Vec::new(),
                 compile_profile: None,
+            lower_opts: Vec::new(),
+            sched_opts: None,
             },
             expr_consts: Default::default(),
         }
@@ -904,6 +913,16 @@ impl FnBuilder {
     /// Sets the explicit compile policy (see [`CompileProfile`]); without it the compiler keeps deriving the policy from the kernel name.
     pub fn compile_profile(&mut self, p: CompileProfile) {
         self.f.compile_profile = Some(p);
+    }
+
+    /// Extra lowering option tokens for this kernel (see Function::lower_opts).
+    pub fn lower_opts(&mut self, opts: &[&str]) {
+        self.f.lower_opts.extend(opts.iter().map(|s| s.to_string()));
+    }
+
+    /// Scheduler option tokens for this kernel (see Function::sched_opts).
+    pub fn sched_opts(&mut self, opts: &str) {
+        self.f.sched_opts = Some(opts.to_string());
     }
 
     /// Declares how many bytes of workgroup LDS the kernel uses.

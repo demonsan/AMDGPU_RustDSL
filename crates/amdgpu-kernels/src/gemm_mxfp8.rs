@@ -434,6 +434,8 @@ pub fn gemm_mxfp8_bs_v4() -> Function {
 fn build(name: &str, cfg: Cfg) -> Function {
     let (cta_m, cta_n, wave_m, wave_n) = (cfg.cta_m, cfg.cta_n, cfg.wave_m(), cfg.wave_n());
     let mut fb = FnBuilder::new(name, 256);
+    // compile policy: lowering `lgkmn,zeroinit` + the scoreboard wait pass (partial waits across the loop back edge, ds_read hoisting); nothing name-keyed
+    fb.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
     let b = &mut fb;
     declare_abi(b);
     let ptr_a = b.let_(Op::KernargPtr { offset: 0 });
