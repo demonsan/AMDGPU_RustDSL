@@ -7,7 +7,7 @@
 //! (`DS_READ_B128X2`) partitioned over the LDS view; global -> LDS DMA derived from the inverse of the LDS layout; scales staged through LDS by DMA;
 //! `tile::Pipeline` OneWindow (3-slot ring, tile t+2 in flight).
 
-use amdgpu_dsl::tile::{ev, ox, Cadence, LdsPlan, Lane, PipeBody, Pipeline, Role, Shared, SlotIdx, SlotRef, TileIt};
+use amdgpu_dsl::tile::{ev, ox, Cadence, LdsPlan, Lane, PipeBody, Pipeline, Role, Shared, SlotIdx, TileIt};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, Opnd, ValueId, VarId, I32};
 use amdgpu_isa::{MmaAtom, DS_READ_B128X2};
 use amdgpu_layout::{composition, layout_to_offsets, make_layout, right_inverse, tup, ComposedLayout, ImmRange, IssuePlan, Ix, Layout, Swizzle};
@@ -282,6 +282,5 @@ pub fn gemm_mxfp8_bs_v2() -> Function {
         let (bi, imm) = plan.issues[n];
         b.store_f32x2(bases[bi], imm as u32, f2);
     }
-    let _ = (SlotRef::off as fn(&SlotRef) -> I32,);
     fb.finish()
 }
