@@ -466,7 +466,7 @@ impl PipeBody for Body {
         let kbx = ox(t.it);
         // scale words (one LDS round trip), then the byte selects (shifted to byte 0) after the first fragment reads
         let tr = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0)))));
-        let (wa, wb, sbsh) = if let Some((base, b_base, b_off, lo, pr)) = tr {
+        let (wa, wb, sbsh) = if let Some((base, b_base, b_off, lo, ref pr)) = tr {
             // transposed panel: 2 dwords hold the 8 A-scale bytes of this lane; the B byte as before
             let sab = b.bind_i32((kbx.clone() << 8) + (base as i32) + ev(lo));
             let bo = b.bind_i32(ev(b_off) + kbx.clone());
