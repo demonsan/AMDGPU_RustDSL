@@ -217,6 +217,12 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
             let r = src_reg(inst, 0)?;
             dword_name(RClass::V1, cx.phys(r), inst.imm as u32)
         }
+        "opsel0" => {
+            if inst.imm != 0 {
+                return Err(format!("{:?}: scale byte selects (op_sel) are not supported by the LLVM tail rows yet", inst.op));
+            }
+            "0".to_string()
+        }
         "pv" => format!("$vgpr{}", inst.imm),
         "ps" => format!("$sgpr{}", inst.imm),
         "vmcnt" => format!("{}", waitcnt_imm(Some(inst.imm as u32), None)),
@@ -253,9 +259,13 @@ pub fn render_text(tpl: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, St
 /// MIR lines for one instruction (empty for dropped ones such as `s_nop`).
 pub fn render_inst(t: &Table, inst: &MInst, cx: &RenderCtx) -> Result<Vec<String>, String> {
     let name = format!("{:?}", inst.op);
-    let row = t
-        .lookup(&name, &kinds_of(inst))
-        .ok_or_else(|| format!("llvm20.tbl has no row for {name} (kinds '{}')", kinds_of(inst)))?;
+    // Op@a rows: the accumulator-register (acc_cd) form of an MFMA, chosen when the destination is an AGPR; other ops use their normal row
+    // (a ds_read/global_load into an AGPR tuple is the same LLVM opcode).
+    let kinds = kinds_of(inst);
+    let a_form = inst.dst.map_or(false, |d| cx.class(d).is_agpr());
+    let row = (if a_form { t.lookup(&format!("{name}@a"), &kinds) } else { None })
+        .or_else(|| t.lookup(&name, &kinds))
+        .ok_or_else(|| format!("llvm20.tbl has no row for {name} (kinds '{kinds}')"))?;
     if row.text.len() == 1 && row.text[0] == "DROP" {
         return Ok(Vec::new());
     }

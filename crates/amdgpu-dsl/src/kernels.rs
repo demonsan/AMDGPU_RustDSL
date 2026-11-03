@@ -22668,3 +22668,87 @@ pub fn probe_agpr_m16_ref() -> Function {
 pub fn probe_agpr_m16_mix() -> Function {
     probe_agpr_m16_kernel("probe_agpr_m16_mix", true)
 }
+
+/// In-place reload of loop-carried AGPR fragments (the 4-wave GEMM pattern): tile t's A/B fragments are loop variables read by the MFMAs; right after
+/// their last use the fragments of tile t+1 are read from LDS straight into the same registers (`set_var(var, load_lds_b128x2(..))` is coalesced into
+/// the variable). `inplace`: the variables and the accumulator live in AGPRs and the reload is the coalesced form; the reference reloads through
+/// `cat_frag8` copies in plain VGPRs. Both print the same 4 accumulator lanes per thread.
+fn probe_agpr_reload_kernel(name: &str, inplace: bool) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c16 = b.c_i32(16);
+    let c64 = b.c_i32(64);
+    let c8192 = b.c_i32(8192);
+    let c127 = b.c_i32(127);
+    let mul = b.c_i32(0x01010101);
+    let add = b.c_i32(0x04030201);
+    let mask = b.c_i32(0x3f3f3f3f);
+    let t1 = b.mul_i32(tid, mul);
+    let t2 = b.add_i32(t1, add);
+    let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
+    let w1 = b.add_i32(w, mul);
+    let data0 = b.frag4(w, w, w, w);
+    let data1 = b.frag4(w1, w1, w1, w1);
+    let off = b.mul_i32(tid, c16);
+    let off2 = b.add_i32(off, c8192);
+    b.store_lds_b128(Opnd::Val(off), Opnd::Val(data0));
+    b.store_lds_b128(Opnd::Val(off2), Opnd::Val(data1));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let a_init = b.load_lds_b128x2(Opnd::Val(off), Opnd::Val(off2));
+    let b_init = b.load_lds_b128x2(Opnd::Val(off2), Opnd::Val(off));
+    let zero = b.frag_zero(DType::Frag4);
+    let vars = b.begin_loop(&[
+        (DType::I32, Opnd::Val(c0)),
+        (DType::Frag4, Opnd::Val(zero)),
+        (DType::Frag8, Opnd::Val(a_init)),
+        (DType::Frag8, Opnd::Val(b_init)),
+    ]);
+    let (it, acc, av, bv) = (vars[0], vars[1], vars[2], vars[3]);
+    if inplace {
+        b.pin_agpr(acc);
+        b.pin_agpr(av);
+        b.pin_agpr(bv);
+    }
+    b.var_mfma_scale16(acc, Opnd::Var(av), Opnd::Var(bv), c127, c127, 0, 0);
+    // next tile: alternate the LDS region so every iteration's fragments differ
+    let nxt = b.add_i32(it, c1);
+    let par = b.let_(Op::AndI32(Opnd::Val(nxt), Opnd::Val(c1)));
+    let r0 = b.mul_i32(par, c8192);
+    let r1 = b.xor_i32(r0, c8192);
+    let la = b.add_i32(off, r0);
+    let lb = b.add_i32(off, r1);
+    if inplace {
+        let na = b.load_lds_b128x2(Opnd::Val(la), Opnd::Val(lb));
+        b.set_var(av, na);
+        let nb = b.load_lds_b128x2(Opnd::Val(lb), Opnd::Val(la));
+        b.set_var(bv, nb);
+    } else {
+        let a_lo = b.load_lds_b128(Opnd::Val(la));
+        let a_hi = b.load_lds_b128(Opnd::Val(lb));
+        let na = b.cat_frag8(a_lo, a_hi);
+        b.set_var(av, na);
+        let b_lo = b.load_lds_b128(Opnd::Val(lb));
+        let b_hi = b.load_lds_b128(Opnd::Val(la));
+        let nb = b.cat_frag8(b_lo, b_hi);
+        b.set_var(bv, nb);
+    }
+    sched_end_loop(&mut b, it, n);
+    let row_off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, row_off);
+    for i in 0..4u8 {
+        let l = b.frag4_lane(acc, i);
+        let x = b.bitcast_f32(l);
+        b.store_f32(row, 4 * i as u32, x);
+    }
+    b.finish()
+}
+
+pub fn probe_agpr_reload_ref() -> Function {
+    probe_agpr_reload_kernel("probe_agpr_reload_ref", false)
+}
+pub fn probe_agpr_reload() -> Function {
+    probe_agpr_reload_kernel("probe_agpr_reload", true)
+}

@@ -458,7 +458,10 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     }
     // Sub-register views live inside their tuple.
     for (a, (t, off)) in &m.alias {
-        phys[*a as usize] = phys[*t as usize] + *off as u32;
+        // (a tuple that was never allocated - e.g. a load coalesced into a loop variable - leaves its views unallocated too)
+        if phys[*t as usize] != u32::MAX {
+            phys[*a as usize] = phys[*t as usize] + *off as u32;
+        }
     }
 
     for (i, u) in used_v.iter().enumerate() {

@@ -425,6 +425,51 @@ impl Lowerer {
         self.alias_vreg(base, o + off, class)
     }
 
+    /// Rewrite the `ds_read_b128`s that produced `v` (`LoadLdsB128` / `LoadLdsB128x2`, current block) to write the register of loop variable
+    /// `dst` directly. Legal only when no instruction after the first of those reads issues a read of `dst` (the old value) or writes it.
+    fn try_coalesce_lds_reload(&mut self, v: ValueId, dst: VReg) -> bool {
+        let want = match self.defs.get(&v) {
+            Some(Op::LoadLdsB128 { .. }) => (RClass::V4, 1usize),
+            Some(Op::LoadLdsB128x2 { .. }) => (RClass::V8, 2usize),
+            _ => return false,
+        };
+        let Some(&d) = self.val.get(&v) else { return false };
+        if self.mir.vreg_class(d) != want.0 || self.mir.vreg_class(dst) != want.0 || self.mir.alias.contains_key(&d) || self.mir.alias.contains_key(&dst) {
+            return false;
+        }
+        let insts = &self.mir.blocks[self.cur].insts;
+        let prod: Vec<usize> = insts.iter().enumerate().filter(|(_, i)| i.op == MOp::LdsReadB128 && i.dst.map_or(false, |x| self.mir.canon(x) == d)).map(|(k, _)| k).collect();
+        if prod.len() != want.1 {
+            return false;
+        }
+        let first = prod[0];
+        for (k, i) in insts.iter().enumerate().skip(first) {
+            if prod.contains(&k) {
+                continue;
+            }
+            if i.uses().iter().any(|u| self.mir.canon(*u) == dst) || i.dst.map_or(false, |x| self.mir.canon(x) == dst) {
+                return false;
+            }
+        }
+        // new destinations (the variable's tuple or its halves)
+        let mut news: Vec<(usize, VReg)> = Vec::new();
+        for &k in &prod {
+            let old = self.mir.blocks[self.cur].insts[k].dst.unwrap();
+            let off = self.mir.alias.get(&old).map(|a| a.1).unwrap_or(0);
+            let nd = if want.0 == RClass::V4 { dst } else { self.alias_vreg(dst, off, RClass::V4) };
+            news.push((k, nd));
+        }
+        for (k, nd) in news {
+            self.mir.blocks[self.cur].insts[k].dst = Some(nd);
+        }
+        for e in self.pending_lds.iter_mut() {
+            if *e == d {
+                *e = dst;
+            }
+        }
+        self.val.insert(v, dst);
+        true
+    }
     /// Make the instruction that produced value `v` write `new_dst` directly (instead of a fresh
     /// register that would then be moved into a fragment). Only for single-use results of plain
     /// ALU ops defined earlier in the current block.
@@ -1111,17 +1156,16 @@ impl Lowerer {
                     Err(format!("value v{v} is not an eight-dword fragment"))
                 }
             }
-            // a loop-carried fragment (e.g. the register-staged GEMM operands, reloaded in place inside the loop)
             Opnd::Var(v) => {
-                let r = self.vars.get(v.0 as usize).copied().ok_or_else(|| format!("var{v} not lowered"))?;
-                if self.mir.vreg_class(r).same_width_vector(RClass::V8) {
+                let r = *self.vars.get(v.0 as usize).ok_or_else(|| format!("var{} not lowered", v.0))?;
+                if self.mir.vreg_class(r) == RClass::V8 {
                     self.touch(&[Src::Reg(r)]);
                     Ok(r)
                 } else {
-                    Err(format!("var{v} is not an eight-dword fragment"))
+                    Err(format!("var{} is not an eight-dword fragment", v.0))
                 }
             }
-            _ => Err("eight-dword fragment operand must be a value or a variable".to_string()),
+            _ => Err("eight-dword fragment operand must be an SSA value or a loop variable".to_string()),
         }
     }
 
@@ -1344,6 +1388,15 @@ impl Lowerer {
                             self.push(MInst::new(MOp::VWriteSub).def(dst).srcreg(zero).imm(i as i64));
                         }
                         continue;
+                    }
+                    // in-place reload: set_var(var, load_lds(..)) where the load is the value's only use and nothing reads the variable after the load
+                    // was issued - the ds_read writes the variable's own registers (no copy, no second fragment; the AGPR pipelining pattern)
+                    if matches!(class, RClass::V4 | RClass::V8) {
+                        if let Opnd::Val(v) = value {
+                            if self.use_counts.get(v).copied() == Some(1) && self.try_coalesce_lds_reload(*v, dst) {
+                                continue;
+                            }
+                        }
                     }
                     let src = match class {
                         RClass::V1 => self.as_v1(*value)?,
