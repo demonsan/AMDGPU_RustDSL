@@ -84,7 +84,7 @@ impl GemmConfig {
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
     pub fn v4() -> GemmConfig {
-        GemmConfig { acc_agpr: 24, reg_staged: true, pre_sync_mmas: 4, sched: "rewait,hoistchain", ..GemmConfig::v3() }
+        GemmConfig { acc_agpr: 24, reg_staged: true, pre_sync_mmas: 4, sched: "rewait,hoistchain", unroll2: true, ..GemmConfig::v3() }
     }
 }
 
@@ -762,7 +762,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_gap2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_late" => GemmConfig { early_scales: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_noxcd" => GemmConfig { xcd_raster: false, ..GemmConfig::v4() },
-        "gemm_mxfp8_bs_v4_u2" => GemmConfig { unroll2: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_u1" => GemmConfig { unroll2: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_prio" => GemmConfig { setprio: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_gap4" => GemmConfig { dma_gap: 4, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_acc32h" => GemmConfig { acc_agpr: 32, sched: "rewait,hoistchain", ..GemmConfig::v4() },
