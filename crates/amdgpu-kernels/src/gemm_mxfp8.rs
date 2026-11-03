@@ -720,8 +720,10 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let a_wo = ctx.lower(&s_wm.mul_c(wave_m / 16 * 2048));
     let b_wo = ctx.lower(&s_wn.mul_c(wave_n / 16 * 2048));
     // the view bases lie inside one 16-row block (< 2048 bytes): the mask is a no-op that gives the verifier the bound the XOR swizzle hides
-    a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32((x.clone() & 2047) + &a_wo)).collect();
-    b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32((x.clone() & 2047) + &b_wo)).collect();
+    // (bases include the buffer base; 16-byte reads: the low 4 bits are zero)
+    let (ab, bb) = (a_s.base as i32, b_s.base as i32);
+    a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32((((x.clone() - ab) & 2032) + ab) + &a_wo)).collect();
+    b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32((((x.clone() - bb) & 2032) + bb) + &b_wo)).collect();
 
     // ---- DMA (A row-major, B preshuffled), wave parts of M0, CTA origins ----
     let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
