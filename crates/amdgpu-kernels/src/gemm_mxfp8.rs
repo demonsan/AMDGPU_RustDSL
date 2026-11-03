@@ -412,6 +412,19 @@ impl PipeBody for Body {
         if prio {
             b.set_prio(0);
         }
+        // scheduler-side interleave (CompileProfile::Gemm): FMHA_ABLATE=phase[mN][rM][dK]: N MFMAs, then K ds_reads, every M-th step one DMA issue
+        if let Some(spec) = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(',').find(|t| t.starts_with("phase")).map(|t| t.to_string())) {
+            let num = |c: char, d: u32| spec.split(c).nth(1).and_then(|s| s.chars().take_while(|x| x.is_ascii_digit()).collect::<String>().parse::<u32>().ok()).unwrap_or(d);
+            let (nmf, every, nds) = (num('m', 2), num('r', 2), num('d', 1));
+            let steps = (nm * nn) as u32 / nmf;
+            for s in 0..steps {
+                b.sched_group_barrier(amdgpu_dsl::SCHED_MFMA, nmf, 0);
+                b.sched_group_barrier(amdgpu_dsl::SCHED_DS_READ, nds, 0);
+                if s % every == 0 {
+                    b.sched_group_barrier(amdgpu_dsl::SCHED_VMEM_READ, 1, 0);
+                }
+            }
+        }
     }
 }
 
