@@ -420,16 +420,18 @@ impl PipeBody for Body {
         for i in 0..nm {
             // prefetch the next A fragment while this one feeds 4 MMAs
             let next = if i + 1 < nm { let v = if let Some(z) = zf { z } else { ar.read(b, i + 1) }; Some(mark(b, v)) } else { None };
-            if let Some((k, s, done, mut cache)) = deferred.take() {
-                let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
-                let rows = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("dmarows").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(nm).clamp(1, nm);
-                let per = (total + rows - 1) / rows;
-                self.stage_now(b, &k, &s, done..done + per, &mut cache);
-                if done + per < total {
-                    deferred = Some((k, s, done + per, cache));
-                }
-            }
             for j in 0..nn {
+                // the next tile's DMA: one issue every `gap` MMAs (FMHA_ABLATE=dmagapN), from the first row on
+                let gap = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("dmagap").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(4).max(1);
+                if (nn * i + j) % gap == 0 {
+                    if let Some((k, s, done, mut cache)) = deferred.take() {
+                        let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
+                        self.stage_now(b, &k, &s, done..done + 1, &mut cache);
+                        if done + 1 < total {
+                            deferred = Some((k, s, done + 1, cache));
+                        }
+                    }
+                }
                 if i == 0 && j + bpre < nn {
                     let v = if let Some(z) = zfb { z } else { br.read(b, j + bpre) };
                     bf.push(mark(b, v));
@@ -441,6 +443,10 @@ impl PipeBody for Body {
             if let Some(n) = next {
                 af = n;
             }
+        }
+        // whatever is left of the stage (when gap x issues exceeds the MMAs)
+        if let Some((k, s, done, mut cache)) = deferred.take() {
+            self.stage_now(b, &k, &s, done..usize::MAX, &mut cache);
         }
         if prio {
             b.set_prio(0);
