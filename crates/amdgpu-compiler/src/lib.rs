@@ -102,7 +102,9 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         if pname.ends_with("_t128") {
             v.push("addrfold");
         }
-        if fmha_opt(f, "saddrlds") {
+        // v3 `_t128`: the SADDR DMA form (scalar tensor base + per-lane 32-bit offset: no 64-bit pointer add per DMA) measured +1.8..+2.1% on the
+        // B2H8S2048 layout median (two same-run A/Bs, docs/dsl-layout-refactor-design.md); on _vs128 / _kvsplit it is -0.2..-1.4%: not adopted there
+        if fmha_opt(f, "saddrlds") || (pname.ends_with("_t128") && f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_")) {
             v.push("saddrlds");
         }
         if fmha_opt(f, "pmdead") {
