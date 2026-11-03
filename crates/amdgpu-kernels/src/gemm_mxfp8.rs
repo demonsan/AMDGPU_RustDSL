@@ -459,7 +459,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let sb_row = b.bind_i32(((ev(bx) << lg_n) + (ev(wn) * wave_n as i32)).lshr(7));
     let sb_src = b.bind_i32(ev(sb_row) * ev(kb_v));
 
-    let cadence = if cfg.reg_staged { Cadence::RegStaged } else if cfg.three_slots { Cadence::OneWindow } else { Cadence::TwoPhaseOffset };
+    let cadence = if cfg.reg_staged { Cadence::RegStaged } else if cfg.three_slots { Cadence::OneWindow } else { Cadence::TwoSlot };
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
     if cfg.three_slots || cfg.reg_staged {
         pipe.vm_inflight = (a_dma.issues.len() + b_dma.issues.len() + 2) as u8;

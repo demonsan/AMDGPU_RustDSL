@@ -33,6 +33,13 @@ pub enum Cadence {
     /// tail:     m_phase (no loads: `staged` = false)
     /// ```
     RegStaged,
+    /// 2-slot ring, one group, ONE barrier per tile (prefetch distance 1, for tiles whose 3 slots do not fit the LDS):
+    /// ```text
+    /// prologue: stage(0) wait_vm(0) | stores | wait_vm(0) wait_lds(0) barrier | compute(0) wait_lds(0)
+    /// loop t:   stage(t+1) | window(t) | wait_vm(0) wait_lds(0) barrier
+    /// ```
+    /// The barrier both publishes tile t+1 and retires the reads of tile t before stage(t+2) overwrites its slot.
+    TwoSlot,
 }
 
 /// One iteration of the pipeline as the body sees it.
@@ -116,6 +123,7 @@ impl Pipeline {
             Cadence::TwoPhaseOffset => 2,
             Cadence::OneWindow => 3,
             Cadence::RegStaged => 2,
+            Cadence::TwoSlot => 2,
         }
     }
     fn lg(&self) -> i32 {
@@ -131,7 +139,7 @@ impl Pipeline {
             n2: match self.cadence {
                 Cadence::OneWindow => Some(SlotIdx::new(2, 2)),
                 Cadence::RegStaged => Some(SlotIdx::new(0, 2)),
-                Cadence::TwoPhaseOffset => None,
+                Cadence::TwoPhaseOffset | Cadence::TwoSlot => None,
             },
             masked: false,
             staged: true,
@@ -254,6 +262,32 @@ impl Pipeline {
                 body.m_phase(b, role, &t);
                 b.wait_lds(0);
                 if last_barrier {
+                    b.barrier();
+                }
+                i1
+            }
+            Cadence::TwoSlot => {
+                let i1 = b.bind_i32(varx(idx) ^ 1);
+                let it_p1 = b.let_i32(varx(it) + 1);
+                let nn = it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1);
+                let t = TileIt {
+                    it: Opnd::Var(it),
+                    cur: SlotIdx::new(idx, it),
+                    next: SlotIdx::new(i1, b.bind_opnd(&it_p1)),
+                    n2: None,
+                    masked,
+                    staged,
+                    tile_rows: self.tile_rows,
+                };
+                self.prebind(b, &t);
+                if staged {
+                    let key_n = b.let_i32(nn << self.lg());
+                    body.stage(b, role, &key_n, &t.next);
+                }
+                body.window(b, role, &t);
+                if staged {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
                     b.barrier();
                 }
                 i1
