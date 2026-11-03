@@ -22603,3 +22603,68 @@ pub fn probe_agpr_full() -> Function {
 pub fn probe_agpr_pinned() -> Function {
     probe_agpr_kernel("probe_agpr_pinned", true, true, Some(64))
 }
+
+/// The 4-wave GEMM mix in miniature (docs/agpr.md): four 16x16x128 scaled-MFMA accumulators (Frag4), A/B fragments read from LDS. `mix`: accumulators 0 and 1 live
+/// in AGPRs (acc_cd form, pinned at a[96:99] / a[100:103]) next to two VGPR accumulators (vgpr form), and the fragments are read straight into AGPRs.
+fn probe_agpr_m16_kernel(name: &str, mix: bool) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c16 = b.c_i32(16);
+    let c64 = b.c_i32(64);
+    let c8192 = b.c_i32(8192);
+    let c127 = b.c_i32(127);
+    let mul = b.c_i32(0x01010101);
+    let add = b.c_i32(0x04030201);
+    let mask = b.c_i32(0x3f3f3f3f);
+    let t1 = b.mul_i32(tid, mul);
+    let t2 = b.add_i32(t1, add);
+    let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
+    let data = b.frag4(w, w, w, w);
+    let off = b.mul_i32(tid, c16);
+    let off2 = b.add_i32(off, c8192);
+    b.store_lds_b128(Opnd::Val(off), Opnd::Val(data));
+    b.store_lds_b128(Opnd::Val(off2), Opnd::Val(data));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let mut a8 = b.load_lds_b128x2(Opnd::Val(off), Opnd::Val(off2));
+    let mut b8 = b.load_lds_b128x2(Opnd::Val(off2), Opnd::Val(off));
+    if mix {
+        a8 = b.agpr(a8);
+        b8 = b.agpr(b8);
+    }
+    let zero = b.frag_zero(DType::Frag4);
+    let vars = b.begin_loop(&[
+        (DType::I32, Opnd::Val(c0)),
+        (DType::Frag4, Opnd::Val(zero)),
+        (DType::Frag4, Opnd::Val(zero)),
+        (DType::Frag4, Opnd::Val(zero)),
+        (DType::Frag4, Opnd::Val(zero)),
+    ]);
+    if mix {
+        b.pin_agpr_at(vars[1], 96);
+        b.pin_agpr_at(vars[2], 100);
+    }
+    b.var_mfma_scale16(vars[1], a8, b8, c127, c127, 0, 0);
+    b.var_mfma_scale16(vars[2], b8, a8, c127, c127, 0, 0);
+    b.var_mfma_scale16(vars[3], a8, a8, c127, c127, 0, 0);
+    b.var_mfma_scale16(vars[4], b8, b8, c127, c127, 0, 0);
+    sched_end_loop(&mut b, vars[0], n);
+    let row_off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, row_off);
+    for (q, v) in vars[1..].iter().enumerate() {
+        for i in 0..4u8 {
+            let l = b.frag4_lane(*v, i);
+            let x = b.bitcast_f32(l);
+            b.store_f32(row, 4 * (4 * q as u32 + i as u32), x);
+        }
+    }
+    b.finish()
+}
+
+pub fn probe_agpr_m16_ref() -> Function {
+    probe_agpr_m16_kernel("probe_agpr_m16_ref", false)
+}
+pub fn probe_agpr_m16_mix() -> Function {
+    probe_agpr_m16_kernel("probe_agpr_m16_mix", true)
+}
