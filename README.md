@@ -11,19 +11,22 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 
 ---
 
-## 当前状态（MI355X / gfx950 实测，`Main` = tag `v2.2-round75-final`）
+## 当前状态（MI355X / gfx950 实测；出厂集 = v3 布局层 kernel，tag `v4.1-layout-p3` 之后）
 
 | 项 | 结果 |
 |---|---|
 | **出厂 kernel 的写法（v3，布局层）** | 默认路径的 4 个 kernel（`fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`，`crates/amdgpu-tile/src/fmha.rs`）建在 **布局代数层**上：`amdgpu-layout`（CuTe/FlyDSL 布局代数 + GF(2) swizzle + 构建期证明）、`amdgpu-isa`（gfx950 copy/MMA atom 表）、`amdgpu-tile`（TiledCopy/TiledMma/partition、DMA 分区、由布局导出的主机合同）——K/V/K-scale/Q 的每个地址、DMA、epilogue 存储和 KV-split 转置暂存均由布局推导；见 [`docs/dsl-layout-refactor-design.md`](docs/dsl-layout-refactor-design.md)。上一版 tile 库集 `fmha_fwd_hd128_mxfp8_dsl_*`（`fmha_fwd_hd128_mxfp8_dsl_auto`）与手写旧集（`fmha_fwd_hd128_mxfp8_legacy_auto`）保留供 A/B |
-| **上一版（tile 库）** | 4 个 kernel（mha_fwd_hd128_mxfp8_dsl_{vs128,t128,kvsplit,kvsplit_combine8h}）全部由 **tile 抽象库**（`crates/amdgpu-dsl/src/tile/`：张量视图+自动合同、LDS 计划/环、DMA copy、流水线、片段/MMA、在线 softmax、epilogue/combine、FMHA ABI 组件）组合而成：`crates/amdgpu-dsl/src/fmha_tile.rs` 每个 kernel 函数 25–45 行；原手写版（`fmha_fwd_hd128_mxfp8_{vs128,…}`）保留为 `fmha_fwd_hd128_mxfp8_legacy_auto` 供 A/B。见 [`docs/dsl-tile-abstractions.md`](docs/dsl-tile-abstractions.md)、[`docs/fmha-perf-patterns.md`](docs/fmha-perf-patterns.md) 附录 B |
+| **布局层（路线 B）** | `amdgpu-layout`（`Layout`/`IntTuple`/`Swizzle`/TV 布局/`IssuePlan`/构建期证明）→ `amdgpu-isa`（copy 与 MMA atom 表）→ `amdgpu-tile`（`TiledCopy`/`TiledMma`/`partition_*`、v3 FMHA）；入门教程 [`docs/layout-tour.md`](docs/layout-tour.md)，实施结果 [`docs/dsl-layout-refactor-design.md`](docs/dsl-layout-refactor-design.md) §9 |
+| **主机侧生成** | `amdc gen-host <kernel>` / `--shipped`：从 kernel 合同生成 C++ 启动/ABI 头（打包 `Args`、`validate()`）与 JSON 元数据，出厂 `ref_host` 用生成的命名字段；见 [`docs/host-gen.md`](docs/host-gen.md) |
+| **MXFP8 blockscale GEMM（P4）** | `gemm_mxfp8_bs_v3`（4096×4096×8192，对照 aiter PR #6696 4-wave pin-AGPR）：**_（待 kernel-opt 填写最终数字：TF/s、相对厂商、门禁）_** |
+| **上一版（tile 库）** | 4 个 kernel（`fmha_fwd_hd128_mxfp8_dsl_{vs128,t128,kvsplit,kvsplit_combine8h}`）全部由 **tile 抽象库**（`crates/amdgpu-dsl/src/tile/`：张量视图+自动合同、LDS 计划/环、DMA copy、流水线、片段/MMA、在线 softmax、epilogue/combine、FMHA ABI 组件）组合而成：`crates/amdgpu-dsl/src/fmha_tile.rs` 每个 kernel 函数 25–45 行；原手写版（`fmha_fwd_hd128_mxfp8_{vs128,…}`）保留为 `fmha_fwd_hd128_mxfp8_legacy_auto` 供 A/B。见 [`docs/dsl-tile-abstractions.md`](docs/dsl-tile-abstractions.md)、[`docs/fmha-perf-patterns.md`](docs/fmha-perf-patterns.md) 附录 B |
 | **基准形状 B1H8S2048**（默认 `fmha_fwd_hd128_mxfp8_auto` = KV-split + `combine8h`） | **674–705 TFLOP/s**；同轮厂商 536–539 → **1.25–1.31x 更快** |
 | 单 kernel 每 CU（`_vs128`，64 blocks） | **453–455 TFLOP/s = 7.07–7.10 TF/CU**（厂商 8.41 → 1.19x 差距） |
 | 铺满网格 B4H8S2048 / B1H8S8192 | **0.846x / 0.841x** 厂商（结构线已量化关闭） |
 | 中等形状 | ≥ 厂商：B2H8S2048 1.00x、B1H8S4096 1.07x、B3H3S768 1.11x、B1H16S256 1.16x |
 | 精度 | mean err **8.3e-4**（厂商 1.5–2.9e-3，好 2–3 倍）；15/15 形状、64 行 bad=0 |
 | 确定性 | 5/5 × N；uneven-tile split 形状 **1200/1200 次启动单一 md5** |
-| 测试 | `cargo test` **40 个目标 / 238 项全绿**；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
+| 测试 | `cargo test` **56 个目标 / 282 项全绿**（Main@7f937f8；`salu` 分支另加 `scalarize2` / `lds_b64` / `gv_bits` 三个目标）；布局层：`amdgpu-layout` 19 项（CuTe/FlyDSL 例子、`_vs128` 手写地址复现）、`amdgpu-tile` 地址等价测试（发射 IR 逐 lane 对照旧 reader/copy）；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
 | GPU 语义验证 | **编译器感知指令语义**：LDS/global/buffer 越界、VGPR/SGPR 类别与对齐、路径敏感等待、LDS tile 生命周期均被证明；出厂 4 kernel（`amdc gpu-verify --shipped --strict`）**0 错误 0 警告**（24 trusted assumes / 100 host contracts / 0 unproven）；手写旧集 `--legacy` 8 kernel 不变（44 / 216 / 0）；见 [`docs/gpu-semantics-verifier.md`](docs/gpu-semantics-verifier.md) |
 | Rust 安全 | **七个 crate（含 amdgpu-layout / amdgpu-isa / amdgpu-tile）全部 `#![forbid(unsafe_code)]`、零第三方依赖、无 FFI/裸指针**；ISA 规则编码进类型系统；见 [`docs/rust-safety.md`](docs/rust-safety.md) |
 | 正确性 | 本会话修复 3 个真实编译器/内核 bug（物理 WAW、两阶段 RA reaching-writer、**VMEM 宽存储数据 WAR**） |
@@ -38,7 +41,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 ```bash
 # 构建与测试（容器脚本会挂载 ROCm 与 pinned LLVM 工具）
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                    # 期望 29 targets / 117 tests 全绿
+bash tools/container/cargo.sh test                    # 期望 56 targets / 282 tests 全绿（Main@7f937f8）
 
 # 发射一个 kernel 的汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --out vs128.s
@@ -56,6 +59,8 @@ REF_B=1 REF_H=8 REF_S=2048 REF_SK=2048 REF_WARMUP=150 REF_ITERS=100 ./build/ref_
 OUR_KERNEL=fmha_fwd_hd128_mxfp8_auto bash tests/gpu/determinism.sh        # fmha_fwd_hd128_mxfp8_legacy_auto = 旧手写集
 bash tools/ohat_repro.sh                                                  # OHAT_PREFIX=fmha_fwd_hd128_mxfp8 = 旧手写集
 HIP_VISIBLE_DEVICES=6 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3     # 全套验收（同轮对照旧手写集；SHIP_REF=fmha_fwd_hd128_mxfp8_dsl 对照 tile 库集）
+bash tools/container/cargo.sh run -q --bin amdc -- gen-host --shipped --out tests/gpu/generated   # 生成主机 ABI 头 + JSON
+HIP_VISIBLE_DEVICES=6 bash tools/gemm_gate.sh gemm_mxfp8_bs_v3   # GEMM 门禁（P4；BUILD/VERIFY/ACC/DET/PERF 对照厂商）
 bash tools/vendor_validate.sh          # 厂商 kernel 复核（disasm + 计数 + 64 行 bad 检查）
 bash tools/vendor_counters.sh          # 逐轮 PMC
 ```
@@ -69,10 +74,14 @@ bash tools/vendor_counters.sh          # 逐轮 PMC
 ## 目录
 
 ```
+crates/amdgpu-layout    布局代数（零依赖）：Ix / IntTuple / Layout / Swizzle / TV 布局 / IssuePlan / 构建期证明
+crates/amdgpu-isa       gfx950 atom 表：copy atom（宽度、立即数域、计数器、LDS-direct 形式）与 MMA atom（A/B/C 的 TV 布局、provenance）
+crates/amdgpu-tile      TiledCopy / TiledMma / partition_{lds,dma,buffer_dma,global}、布局导出的主机合同、出厂 v3 FMHA（src/fmha.rs）
+crates/amdgpu-kernels   MXFP8 blockscale GEMM（P4，kernel-opt；随 integrate 合入）
 crates/amdgpu-dsl       类型化 kernel DSL（Op 83 / Stmt 40 / FnBuilder 140 方法）+ tile 抽象库（src/tile/）+ 出厂 FMHA（src/fmha_tile.rs）+ 旧手写 kernel（src/kernels.rs）
 crates/amdgpu-compiler  内部 IR/MIR、lowering、调度器、线性扫描 RA、hazard/wait、asm 发射、LLVM MIR 桥
 crates/amdgpu-safeasm   手写热点窗口用的 safe Rust asm DSL（typed 寄存器 + 所有权 token + 验证器 + pin）
-crates/amdc             CLI（emit / check / list / backend / simmodel / dump / probe）
+crates/amdc             CLI（emit / check / list / backend / simmodel / dump / probe / gpu-verify / gen-host）
 tests/gpu/              端到端：ref_host（我们 vs 厂商 vs CPU）、run_ref、determinism、split 压力
 tools/                  厂商对照、计数器、探针、A/B、LLVM 构建、容器 cargo 等约 26 个脚本
 docs/                   设计、逐轮状态、厂商 spec、认证与归因（见下）
