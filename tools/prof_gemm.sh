@@ -23,7 +23,8 @@ k=sys.argv[1]
 disp=collections.defaultdict(dict)   # (who, file, dispatch) -> counter -> value (summed over agents/dims)
 for f in glob.glob(f"/tmp/prof_{k}/p*/**/*counter_collection.csv", recursive=True):
     for r in csv.DictReader(open(f)):
-        name=r["Kernel_Name"]; who="vendor" if name.startswith("opus_gemm") else "ours"
+        name=r["Kernel_Name"]; who="vendor" if name.startswith("opus_gemm") else ("ours" if k in name else None)
+        if who is None: continue
         key=(who,f,r["Dispatch_Id"]); c=r["Counter_Name"]
         disp[key][c]=disp[key].get(c,0)+float(r["Counter_Value"])
 agg=collections.defaultdict(lambda: collections.defaultdict(list))
