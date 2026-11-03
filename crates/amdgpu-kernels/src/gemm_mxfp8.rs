@@ -13,28 +13,77 @@ use amdgpu_isa::{MmaAtom, DS_READ_B128X2};
 use amdgpu_layout::{composition, layout_to_offsets, make_layout, right_inverse, tup, ComposedLayout, ImmRange, IssuePlan, Ix, Layout, Swizzle};
 use amdgpu_tile::{gemm, make_tiled_copy_a, make_tiled_copy_b, make_tiled_mma, Ctx, LdsPart, TiledMma};
 
-/// Build configuration (4 waves 2 x 2 in every variant).
-#[derive(Clone, Copy)]
-struct Cfg {
-    cta_m: i64,
-    cta_n: i64,
-    /// A/B MMA operand fragments in AGPRs (ds_read straight into a[..])
-    agpr_ops: bool,
-    /// accumulators (16x16 blocks, m-block-major) pinned in AGPRs: the first `acc_agpr`
-    acc_agpr: usize,
-    /// 3-slot OneWindow ring (prefetch distance 2) or the 2-slot cadence (distance 1, for tiles whose 3 slots do not fit the LDS)
-    three_slots: bool,
-    /// 2-slot `RegStaged` cadence: the whole tile is read into registers first, its slot then receives tile t+2 (distance 2 with two slots)
-    reg_staged: bool,
-    /// spread the DMA of the next tile over the MMA rows of the window (instead of issuing it all before the window)
-    defer_dma: bool,
-    /// all scales of the CTA in one LDS panel loaded in the prologue (K <= 128 x PANEL_KB), no per-tile scale DMA
-    scale_panel: bool,
+/// Diagnostic ablations (wrong results, timing only): remove one stream to measure the others.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ablate {
+    /// no global -> LDS copies
+    pub no_dma: bool,
+    /// no MMAs
+    pub no_mma: bool,
+    /// no operand LDS reads (zero fragments)
+    pub no_lds_reads: bool,
 }
 
+/// Build configuration of the MXFP8 blockscale GEMM (4 waves 2 x 2 in every variant). `GemmConfig::v3()` is the best measured one.
+#[derive(Clone, Copy, Debug)]
+pub struct GemmConfig {
+    pub cta_m: i64,
+    pub cta_n: i64,
+    /// A/B MMA operand fragments in AGPRs (ds_read straight into a[..])
+    pub agpr_ops: bool,
+    /// accumulators (16x16 blocks, m-block-major) pinned in AGPRs: the first `acc_agpr`
+    pub acc_agpr: usize,
+    /// 3-slot OneWindow ring (prefetch distance 2) or the 2-slot cadence (distance 1, for tiles whose 3 slots do not fit the LDS)
+    pub three_slots: bool,
+    /// 2-slot `RegStaged` cadence: operands are loop-carried registers reloaded in place from tile t+1 (the vendor structure)
+    pub reg_staged: bool,
+    /// spread the DMA of the next tile over the MMAs of the window (instead of issuing it as one burst)
+    pub defer_dma: bool,
+    /// one DMA instruction every `dma_gap` MMAs (with `defer_dma`)
+    pub dma_gap: usize,
+    /// B fragments read ahead of the first row of MMAs (window cadences)
+    pub b_prefetch: usize,
+    /// `s_setprio 1` around the MMAs of the window
+    pub setprio: bool,
+    /// all scales of the CTA in one LDS panel loaded in the prologue (K <= 128 x PANEL_KB), no per-tile scale DMA
+    pub scale_panel: bool,
+    /// panel A part transposed in the prologue: 2 dword reads per tile + MFMA byte selects (window cadences)
+    pub panel_transposed: bool,
+    /// XCD-aware 4 x 4 tile raster (16 x 16 tile grids)
+    pub xcd_raster: bool,
+    /// `RegStaged`: MMAs issued before the wait + barrier of the iteration
+    pub pre_sync_mmas: usize,
+    /// DMA issues share voffsets, the wave-uniform source deltas go to the soffset (pays off once soffset adds are SALU)
+    pub shared_voffsets: bool,
+    pub ablate: Ablate,
+}
+
+impl GemmConfig {
+    /// VGPR-only, CTA 256 x 128, 3-slot OneWindow ring.
+    pub fn v2() -> GemmConfig {
+        GemmConfig {
+            cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, ablate: Ablate::default(),
+        }
+    }
+    /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 2 MMAs, transposed
+    /// scale panel, XCD raster.
+    pub fn v3() -> GemmConfig {
+        GemmConfig {
+            cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 2, b_prefetch: 2,
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, ablate: Ablate::default(),
+        }
+    }
+    /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
+    pub fn v4() -> GemmConfig {
+        GemmConfig { acc_agpr: 24, reg_staged: true, panel_transposed: false, pre_sync_mmas: 4, ..GemmConfig::v3() }
+    }
+}
+
+type Cfg = GemmConfig;
 /// Scale panel capacity in K groups of 128 (the vendor `sp64`): K <= 8192.
 const PANEL_KB: i64 = 64;
-impl Cfg {
+impl GemmConfig {
     fn wave_m(&self) -> i64 {
         self.cta_m / 2
     }
@@ -117,13 +166,12 @@ struct Dma {
 /// Turns the per-issue source offsets (minus the instruction offset 1024 (q % 4)) into voffsets: an issue whose offset differs from an earlier
 /// issue's by an amount independent of the thread (checked for all 256 threads at two K values) reuses that issue's voffset and adds the delta
 /// to the soffset (SGPR, computed once).
-fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>) -> Dma {
+fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bool) -> Dma {
     let tid_id = match s_tid {
         Ix::Sym(s) => *s,
         _ => unreachable!(),
     };
-    // opt-in until the soffset adds are SALU (today a v_add + v_readfirstlane per issue costs more than the VGPRs it saves)
-    let share = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("vshare"));
+    // `GemmConfig::shared_voffsets` (today a v_add + v_readfirstlane per issue costs more than the VGPRs it saves)
     let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-1024 * (q as i64 % 4))).collect();
     let mut voff: Vec<ValueId> = Vec::new();
     let mut base_of: Vec<usize> = Vec::new(); // issue index whose voffset is shared
@@ -164,7 +212,7 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>) -> Dma {
 
 /// LDS byte `d = 1024 (issues (tid / 64) + q) + 16 (tid % 64)` holds tile element `smem^-1(d)`, so the source offset is `glob o right_inverse(smem)`;
 /// proved here for sampled threads against a direct search of the LDS layout.
-fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64) -> Dma {
+fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, share: bool) -> Dma {
     let issues = rows * 128 / 1024 / 4;
     let sm = smem_tile(rows);
     let tv = make_layout(tup![tup![64, 4], tup![16, issues]], tup![tup![16, 1024 * issues], tup![1, 1024]]);
@@ -184,13 +232,13 @@ fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, 
         }
     }
     // MUBUF form: voffset (loop invariant) + soffset + the instruction offset 1024 (q % 4) = the global offset; M0 = the group's first 1 KB block
-    finish_dma(b, ctx, s_tid, gofs)
+    finish_dma(b, ctx, s_tid, gofs, share)
 }
 
 /// A-tile DMA for the row-major LDS image with the FMHA 128-byte-row swizzle (`swz o (r, k) -> 128 r + k`): one instruction moves 8 whole
 /// 128-byte rows (coalesced 128-byte segments, like the vendor), the swizzle is applied on the source side (the LDS landing is linear in the lane).
 /// LDS byte d -> element (r, k) = swz(d) (the swizzle is an involution) -> global offset `glob(r, k)`; proved for sampled threads.
-fn dma_plan_rows_swz(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64) -> Dma {
+fn dma_plan_rows_swz(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, share: bool) -> Dma {
     let issues = rows * 128 / 1024 / 4;
     let swz = Swizzle::fmha128();
     let d = &ctx.dyns;
@@ -212,7 +260,7 @@ fn dma_plan_rows_swz(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: 
         }
         out.push(g);
     }
-    finish_dma(b, ctx, s_tid, out)
+    finish_dma(b, ctx, s_tid, out, share)
 }
 
 /// The scale panel: every K group's scales of the CTA, loaded once in the prologue (`Cfg::scale_panel`).
@@ -338,12 +386,12 @@ impl Body {
         let mut deferred = self.deferred.take();
         let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
         let per = (total + 2 * nm - 1) / (2 * nm);
-        let prio = std::env::var("FMHA_ABLATE").map_or(false, |v| v.split(",").any(|t| t == "prio"));
+        let prio = self.cfg.setprio;
         if prio {
             b.set_prio(1);
         }
         let half = nn / 2;
-        let gap = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("dmagap").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1);
+        let gap = self.cfg.dma_gap.max(1);
         let mut nmma = 0usize;
         let _ = per;
         for (lo, hi) in [(0, half), (half, nn)] {
@@ -397,7 +445,7 @@ impl Body {
     /// over the MMA rows).
     fn stage_now(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, range: std::ops::Range<usize>, cache: &mut StageCache) {
         // diagnostic ablations (wrong results): FMHA_ABLATE=gemm_nodma skips the copies
-        if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nodma")) {
+        if self.cfg.ablate.no_dma {
             return;
         }
         // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0
@@ -525,7 +573,7 @@ impl PipeBody for Body {
             return;
         }
         // the first MMAs of the register tile run while the wave waits for the DMA and the barrier (the vendor issues 4 there)
-        let npre = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(',').find_map(|t| t.strip_prefix("npre").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(4);
+        let npre = self.cfg.pre_sync_mmas;
         let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
         let nn = bv.len();
         let half = nn / 2;
@@ -549,7 +597,7 @@ impl PipeBody for Body {
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
         let agpr = self.cfg.agpr_ops;
-        let nords = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nords"));
+        let nords = self.cfg.ablate.no_lds_reads;
         let zf = if nords { let z = b.frag_zero(DType::Frag4); Some(b.cat_frag8(z, z)) } else { None };
         let zfb = if nords { let z = b.frag_zero(DType::Frag4); let o = b.frag_zero(DType::Frag4); Some(b.cat_frag8(o, z)) } else { None };
         let mark = |b: &mut FnBuilder, v: ValueId| if agpr { b.agpr(v) } else { v };
@@ -576,7 +624,7 @@ impl PipeBody for Body {
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
         // A0 and B0 first; the other B fragments are issued one ahead of the first row of MMAs (partial lgkm waits)
         let mut af = { let v = if let Some(z) = zf { z } else { ar.read(b, 0) }; mark(b, v) };
-        let bpre = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("bpre").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1).min(nn);
+        let bpre = self.cfg.b_prefetch.max(1).min(nn);
         let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zfb { z } else { br.read(b, j) }; mark(b, v) }).collect();
         // A scale of m block i: (word, byte select)
         let sa: Vec<(ValueId, u8)> = if tr.is_some() {
@@ -585,7 +633,7 @@ impl PipeBody for Body {
             (0..nm).map(|i| (b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0]))), 0u8)).collect()
         };
         let sb = b.bind_i32(ev(wb).lshr(sbsh));
-        let prio = std::env::var("FMHA_ABLATE").map_or(false, |v| v.split(",").any(|t| t == "prio"));
+        let prio = self.cfg.setprio;
         if prio {
             b.set_prio(1);
         }
@@ -594,7 +642,7 @@ impl PipeBody for Body {
             let next = if i + 1 < nm { let v = if let Some(z) = zf { z } else { ar.read(b, i + 1) }; Some(mark(b, v)) } else { None };
             for j in 0..nn {
                 // the next tile's DMA: one issue every `gap` MMAs (FMHA_ABLATE=dmagapN), from the first row on
-                let gap = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("dmagap").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1);
+                let gap = self.cfg.dma_gap.max(1);
                 if (nn * i + j) % gap == 0 {
                     if let Some((k, s, done, mut cache)) = deferred.take() {
                         let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
@@ -608,7 +656,7 @@ impl PipeBody for Body {
                     let v = if let Some(z) = zfb { z } else { br.read(b, j + bpre) };
                     bf.push(mark(b, v));
                 }
-                if !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nomma")) {
+                if !self.cfg.ablate.no_mma {
                     gemm(b, &self.mma, self.acc[nn * i + j], af, bf[j], sa[i].0, sb, sa[i].1, 0);
                 }
             }
@@ -627,21 +675,35 @@ impl PipeBody for Body {
 }
 
 pub fn gemm_mxfp8_bs_v2() -> Function {
-    build("gemm_mxfp8_bs_v2", Cfg { cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, scale_panel: false })
+    gemm_mxfp8_bs("gemm_mxfp8_bs_v2", GemmConfig::v2())
 }
-
-/// v3: the vendor tile (CTA 256 x 256, 128 x 128 per wave, 64 accumulators): operand fragments in AGPRs, half of the accumulators pinned in AGPRs,
-/// 2-slot LDS ring (2 x 64 KB).
 pub fn gemm_mxfp8_bs_v3() -> Function {
-    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("nodefer")), scale_panel: !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("nopanel")) })
+    gemm_mxfp8_bs("gemm_mxfp8_bs_v3", GemmConfig::v3())
 }
-
-/// v4: v3 with the register-staged 2-slot cadence (prefetch distance 2): all 16 operand fragments of a tile are read into AGPRs, the slot is refilled
-/// with tile t+2 while the 64 MMAs run.
 pub fn gemm_mxfp8_bs_v4() -> Function {
-    build("gemm_mxfp8_bs_v4", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("accagpr").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(24), three_slots: false, reg_staged: true, defer_dma: std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("defer4")), scale_panel: std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("panel")) })
+    gemm_mxfp8_bs("gemm_mxfp8_bs_v4", GemmConfig::v4())
 }
 
+/// The registered names: the variants and the v3 ablations (`_nodma`, `_nomma`, `_nords`, `_nodma_nords`: timing diagnostics, wrong results).
+pub fn by_name(name: &str) -> Option<Function> {
+    let abl = |a: Ablate| GemmConfig { ablate: a, ..GemmConfig::v3() };
+    let cfg = match name {
+        "gemm_mxfp8_bs_v2" => GemmConfig::v2(),
+        "gemm_mxfp8_bs_v3" => GemmConfig::v3(),
+        "gemm_mxfp8_bs_v4" => GemmConfig::v4(),
+        "gemm_mxfp8_bs_v3_nodma" => abl(Ablate { no_dma: true, ..Ablate::default() }),
+        "gemm_mxfp8_bs_v3_nomma" => abl(Ablate { no_mma: true, ..Ablate::default() }),
+        "gemm_mxfp8_bs_v3_nords" => abl(Ablate { no_lds_reads: true, ..Ablate::default() }),
+        "gemm_mxfp8_bs_v3_nodma_nords" => abl(Ablate { no_dma: true, no_lds_reads: true, ..Ablate::default() }),
+        _ => return None,
+    };
+    Some(gemm_mxfp8_bs(name, cfg))
+}
+
+/// Builds the GEMM for `cfg` under `name`.
+pub fn gemm_mxfp8_bs(name: &str, cfg: GemmConfig) -> Function {
+    build(name, cfg)
+}
 fn build(name: &str, cfg: Cfg) -> Function {
     let (cta_m, cta_n, wave_m, wave_n) = (cfg.cta_m, cfg.cta_n, cfg.wave_m(), cfg.wave_n());
     let mut fb = FnBuilder::new(name, 256);
@@ -664,7 +726,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let by0 = b.let_(Op::WorkgroupIdY); // M tile
     // XCD-aware raster (FMHA_ABLATE=xcd, experiment): workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
     // give every XCD whole 4 x 4 blocks of tiles (4 A + 4 B panels instead of all A panels). Only for a 16 x 16 tile grid here; identity otherwise.
-    let (bx, by) = if !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noxcd")) {
+    let (bx, by) = if cfg.xcd_raster {
         let okv = b.bind_i32((ev(n_v) ^ (16 * cfg.cta_n) as i32) | (ev(m_v) ^ (16 * cfg.cta_m) as i32));
         let id = b.bind_i32(ev(bx0) + (ev(by0) << 4));
         let loc = b.bind_i32(ev(id).lshr(3));
@@ -728,8 +790,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
     // ---- DMA (A row-major, B preshuffled), wave parts of M0, CTA origins ----
     let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
     let b_glob = make_layout(tup![tup![16, cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]);
-    let a_dma = dma_plan_rows_swz(b, &ctx, &s_tid, cta_m, &a_glob, 8192);
-    let b_dma = dma_plan(b, &ctx, &s_tid, cta_n, &b_glob, 8192);
+    let a_dma = dma_plan_rows_swz(b, &ctx, &s_tid, cta_m, &a_glob, 8192, cfg.shared_voffsets);
+    let b_dma = dma_plan(b, &ctx, &s_tid, cta_n, &b_glob, 8192, cfg.shared_voffsets);
     let a_wave = b.bind_i32(lane.wave() * (cta_m * 128 / 4) as i32);
     let b_wave = b.bind_i32(lane.wave() * (cta_n * 128 / 4) as i32);
     // buffer descriptors over A (M K bytes) and the preshuffled B (N K bytes)
@@ -782,7 +844,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
         let b_off = b.bind_i32((ev(wn) * ev(kb_v)) + ev(b_delta));
         // transpose the A part in place, 8 K groups per round: thread (r = tid % 16, wm = tid / 16 % 2, k = tid / 32) gathers the bytes of rows
         // 128 wm + 16 i + r (i < 8) of K group 8 round + k and writes them as 8 consecutive bytes at 128 wm + 8 r
-        let tr = if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("notr")) { None } else {
+        let tr = if !cfg.panel_transposed { None } else {
             b.wait_vm(0);
             b.barrier();
             let r = b.bind_i32(ev(tid) & 15);
