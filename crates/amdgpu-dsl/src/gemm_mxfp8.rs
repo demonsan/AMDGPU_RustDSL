@@ -10,7 +10,7 @@
 
 use amdgpu_layout::{composition, layout_to_offsets, make_layout, right_inverse, tup, Dyns, ImmRange, IssuePlan, Ix, Layout, Swizzle};
 
-use crate::{DType, FnBuilder, Function, Op, Opnd, ValueId, I32};
+use crate::{DType, FnBuilder, Function, Op, Opnd, ValueId, VarId, I32};
 
 /// Lowers a symbolic layout index (`amdgpu_layout::Ix`) to a DSL integer expression; `sym` maps the dynamic symbols to bound values.
 fn lower(ix: &Ix, sym: &dyn Fn(u32) -> I32) -> I32 {
