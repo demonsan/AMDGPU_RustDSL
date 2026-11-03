@@ -366,6 +366,9 @@ impl Body {
     /// Scale words + byte selects (shifted to byte 0).
     /// The scale reads of tile `kb` (issue only): the A words (transposed panel: final, 2 words; otherwise to be shifted), the B word and its shift.
     fn scale_issue(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId, I32, bool) {
+        // K group of a real tile (t + 1 is read only when it exists): the clamp is a no-op that bounds it for the verifier's loop-exit-blind intervals
+        let kb = b.bind_i32(kb.lt(ev(self.kb_v)).select_i32(kb.clone(), ev(self.kb_v) - 1));
+        let kb = ev(kb);
         if let Some((base, b_base, b_off, lo, pr)) = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0))))) {
             let sab = b.bind_i32((kb.clone() << 8) + (base as i32) + ev(lo));
             let bo = b.bind_i32(ev(b_off) + kb);

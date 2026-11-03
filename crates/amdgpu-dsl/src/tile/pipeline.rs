@@ -209,29 +209,30 @@ impl Pipeline {
         let stop = b.bind_cond(!varx(it).lt(&nkv_m1));
         b.break_if(stop);
         if self.unroll2 && self.cadence == Cadence::RegStaged {
+            // `it` steps by 2 per pass (an affine counter for the protocol model); `idx` = which half the loop left from (0: after the pass, 1:
+            // between the halves) - the last tile is it + idx, in slot idx
             // first half: tile `it` (even) in slot 0
-            self.iter_rs(b, role, body, Opnd::Var(it), 0, true);
-            let it1 = b.bind_i32(varx(it) + 1);
-            b.set_var(it, it1);
+            self.iter_rs(b, role, body, Opnd::Var(it), Opnd::I32(0), false, true);
             let one = b.c_i32(1);
             b.set_var(idx, one);
-            let stop1 = b.bind_cond(!ev(it1).lt(&nkv_m1));
+            let mid = b.bind_i32(varx(it) + 1);
+            let stop1 = b.bind_cond(!ev(mid).lt(&nkv_m1));
             b.break_if(stop1);
             // second half: tile it + 1 (odd) in slot 1
-            self.iter_rs(b, role, body, Opnd::Val(it1), 1, true);
-            let it2 = b.bind_i32(ev(it1) + 1);
-            b.set_var(it, it2);
+            self.iter_rs(b, role, body, Opnd::Val(mid), Opnd::I32(1), false, true);
             let zero = b.c_i32(0);
             b.set_var(idx, zero);
+            let it2 = b.bind_i32(varx(it) + 2);
+            b.set_var(it, it2);
             let stop2 = b.bind_cond(!ev(it2).lt(&nkv_m1));
             b.break_if(stop2);
             b.end_loop();
-            let is_tail = b.bind_cond(ev(self.kv_len).lt((varx(it) << self.lg()) + self.tile_rows));
-            let last_barrier = role != Role::B;
+            let it_t = b.bind_i32(varx(it) + varx(idx));
+            let is_tail = b.bind_cond(ev(self.kv_len).lt((ev(it_t) << self.lg()) + self.tile_rows));
             b.begin_if(is_tail);
-            self.iter(b, role, body, it, idx, true, false, last_barrier);
+            self.iter_rs(b, role, body, Opnd::Val(it_t), Opnd::Var(idx), true, false);
             b.else_();
-            self.iter(b, role, body, it, idx, false, false, last_barrier);
+            self.iter_rs(b, role, body, Opnd::Val(it_t), Opnd::Var(idx), false, false);
             b.end_if();
             return;
         }
@@ -263,16 +264,20 @@ impl Pipeline {
     }
 
     /// One `RegStaged` iteration of tile `it` (a bound value) in the static ring slot `slot` (unroll2).
-    fn iter_rs(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: i32, staged: bool) {
+    fn iter_rs(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: Opnd, masked: bool, staged: bool) {
         let nkv = ev(self.nkv);
         let it_p1 = b.let_i32(super::ox(it) + 1);
         let it_p2 = b.let_i32(super::ox(it) + 2);
+        let other = match slot {
+            Opnd::I32(k) => Opnd::I32(1 - k),
+            o => b.bind_opnd(&(super::ox(o) ^ 1)),
+        };
         let t = TileIt {
             it,
-            cur: SlotIdx::new(Opnd::I32(slot), it),
-            next: SlotIdx::new(Opnd::I32(1 - slot), b.bind_opnd(&it_p1)),
-            n2: Some(SlotIdx::new(Opnd::I32(slot), b.bind_opnd(&it_p2))),
-            masked: false,
+            cur: SlotIdx::new(slot, it),
+            next: SlotIdx::new(other, b.bind_opnd(&it_p1)),
+            n2: Some(SlotIdx::new(slot, b.bind_opnd(&it_p2))),
+            masked,
             staged,
             tile_rows: self.tile_rows,
         };
