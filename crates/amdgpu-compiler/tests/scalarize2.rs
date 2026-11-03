@@ -44,7 +44,7 @@ fn demo() -> Function {
 }
 
 fn asm(opts: &[&str]) -> String {
-    amdgpu_compiler::lower::with_opts(opts, || amdgpu_compiler::compile(&demo())).expect("compile").asm
+    amdgpu_compiler::lower::with_opts(opts, || amdgpu_compiler::compile(&demo())).unwrap_or_else(|e| panic!("compile with {opts:?}: {e}\n{}", demo().dump())).asm
 }
 
 fn count(s: &str, pat: &str) -> usize {
