@@ -193,9 +193,8 @@ impl Body {
         if let Some(p) = &self.panel {
             // scale panel (loaded once): A rows [kb][256], B bytes [wn][KB] (+ the alignment delta of the B source)
             let pr = p.sh.at(&SlotIdx::new(0, 0));
-            let kb = b.bind_i32(kb);
-            let sab = b.bind_i32((ev(kb) << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
-            let bo = b.bind_i32(ev(p.b_off) + ev(kb));
+            let sab = b.bind_i32((kb.clone() << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
+            let bo = b.bind_i32(ev(p.b_off) + kb);
             let sbb = b.bind_i32((ev(bo) & -4) + (p.sh.base as i32 + p.b_base as i32));
             let (wa, wb) = pr.read(b, |b| {
                 let wa: Vec<ValueId> = (0..nm).map(|i| {
