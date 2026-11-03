@@ -1,0 +1,11 @@
+[package]
+name = "amdgpu-tile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Tile layer on the layout algebra: TiledCopy / TiledMma / partition (FlyDSL names) over gfx950 atoms, emitting amdgpu-dsl IR (docs/dsl-layout-refactor-design.md section 3)."
+
+[dependencies]
+amdgpu-dsl = { path = "../amdgpu-dsl" }
+amdgpu-layout = { path = "../amdgpu-layout" }
+amdgpu-isa = { path = "../amdgpu-isa" }

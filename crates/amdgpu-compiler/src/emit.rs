@@ -489,6 +489,19 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
                 vr(a, sb)
             )]
         }
+        MOp::VMfmaScale16x16x128Fp8 => {
+            let (sa_b, sb_b) = (inst.imm & 3, (inst.imm >> 4) & 3);
+            let ops = if sa_b == 0 && sb_b == 0 { String::new() } else { format!(" op_sel:[{},{},0] op_sel_hi:[{},{},0]", sa_b & 1, sb_b & 1, sa_b >> 1, sb_b >> 1) };
+            vec![format!(
+                "v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{ops}",
+                tuple(a, inst.dst.expect("dst"), 4),
+                tuple(a, reg_of(&inst.srcs[0]), 8),
+                tuple(a, reg_of(&inst.srcs[1]), 8),
+                tuple(a, reg_of(&inst.srcs[2]), 4),
+                vr(a, reg_of(&inst.srcs[3])),
+                vr(a, reg_of(&inst.srcs[4]))
+            )]
+        }
         MOp::VSmfmac16x16x128Fp8 => {
             // D (4) += sparse A (4) x dense B (8); SRC2 is the sparse-index dword.
             let a_reg = reg_of(&inst.srcs[0]);

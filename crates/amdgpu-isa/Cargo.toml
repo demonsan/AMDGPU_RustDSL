@@ -1,0 +1,9 @@
+[package]
+name = "amdgpu-isa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "gfx950 instruction atoms: copy and MMA atoms with their thread-value layouts, vector widths, immediate fields and completion counters (docs/dsl-layout-refactor-design.md section 3). No dependencies besides amdgpu-layout."
+
+[dependencies]
+amdgpu-layout = { path = "../amdgpu-layout" }

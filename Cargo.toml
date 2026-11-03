@@ -6,6 +6,8 @@ members = [
     "crates/amdc",
     "crates/amdgpu-safeasm",
     "crates/amdgpu-layout",
+    "crates/amdgpu-isa",
+    "crates/amdgpu-tile",
 ]
 
 [workspace.package]

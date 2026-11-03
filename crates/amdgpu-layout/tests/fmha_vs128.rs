@@ -10,11 +10,6 @@ fn swz_s(r: i64) -> i64 {
     ((u2 ^ p) << 2) + (u0 << 1) + (u1 ^ p)
 }
 
-/// The K tile in LDS: [key, d] bytes, 128-byte rows, FMHA swizzle.
-fn k_smem() -> ComposedLayout {
-    ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![128, 128], tup![128, 1]))
-}
-
 /// A operand of v_mfma_scale_f32_32x32x64_f8f6f4 (bytes; element index m + 32 k): lane l holds row l % 32 and k = 16 (l / 32) + {0..15} and
 /// 32 + 16 (l / 32) + {0..15} (the two 16-byte halves of the 32 operand bytes).
 fn mfma_a_32x32x64_f8() -> Layout {

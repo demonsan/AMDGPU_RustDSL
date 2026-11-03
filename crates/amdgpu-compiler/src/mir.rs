@@ -163,6 +163,8 @@ pub enum MOp {
     VMfma16x16x32Fp8,
     VMfma32x32x16Fp8,
     VMfmaScale32x32x64Fp8,
+    /// `v_mfma_scale_f32_16x16x128_f8f6f4`: dst V4 <- a (V8), b (V8), c (V4), scale_a (V1), scale_b (V1); `imm` = op_sel byte selects (bits 0..1 A, 4..5 B).
+    VMfmaScale16x16x128Fp8,
     /// Scaled MFMA with an inline-zero accumulator (no C operand): D = A x B.
     VMfmaScale32x32x64Fp8Z,
     /// UNSCALED fp8 MFMA (_mfma_f32_32x32x64_f8f6f4): dst V16 <- a (V8), b (V8), c (V16); the Z form has no C (inline zero).
@@ -571,6 +573,18 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                             _ => errs.push(format!(
                                 "block {bi} inst {ii}: scaled mfma operand {k} is not a register"
                             )),
+                        }
+                    }
+                }
+                MOp::VMfmaScale16x16x128Fp8 => {
+                    let want = [RClass::V8, RClass::V8, RClass::V4, RClass::V1, RClass::V1];
+                    if inst.dst.map(|d| m.vreg_class(d)) != Some(RClass::V4) {
+                        errs.push(format!("block {bi} inst {ii}: 16x16x128 scaled mfma dst must be V4"));
+                    }
+                    for (k, w) in want.iter().enumerate() {
+                        match inst.srcs.get(k) {
+                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            _ => errs.push(format!("block {bi} inst {ii}: 16x16x128 scaled mfma operand {k} must be a {w:?} register")),
                         }
                     }
                 }

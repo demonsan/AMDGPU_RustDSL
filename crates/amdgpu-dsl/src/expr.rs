@@ -121,6 +121,14 @@ impl I32 {
     pub fn bitcast_f32(&self) -> F32 {
         F32(n(Node::BitcastF(self.0.clone())))
     }
+    /// The literal value when the expression is a constant.
+    pub fn as_const(&self) -> Option<i32> {
+        if let Node::CI(c) = &*self.0 {
+            Some(*c)
+        } else {
+            None
+        }
+    }
     /// Evaluates a tree on the host (wrapping i32 semantics; `env` supplies the leaf values). Used to test the documented decompositions.
     pub fn eval(&self, env: &dyn Fn(ValueId) -> i32) -> i32 {
         eval_i(&self.0, env)

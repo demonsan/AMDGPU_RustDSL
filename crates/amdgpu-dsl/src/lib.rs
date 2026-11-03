@@ -624,6 +624,9 @@ pub enum Stmt {
     VarMfmaFp8C { var: VarId, a: Opnd, b: Opnd, c: Opnd },
     /// `var += smfmac_16x16x128_fp8(a, b, idx)`: sparse-A MFMA accumulating into a `Frag4` loop variable in place.
     VarSmfmac { var: VarId, a: Opnd, b: Opnd, idx: Opnd },
+    /// `var += v_mfma_scale_f32_16x16x128_f8f6f4(a, b; scale_a, scale_b)` in place on a `Frag4` loop variable (E4M3 operands, 8 dwords each).
+    /// `opsel` selects the E8M0 byte of each scale dword: bits 0..1 = byte of `scale_a`, bits 4..5 = byte of `scale_b` (`op_sel` / `op_sel_hi`).
+    VarMfmaScale16 { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd, opsel: u8 },
     /// A safe-asm sequence updating the loop variable `var` in place through its in/out port (the first input port, `Seq::inout`);
     /// ``inputs`` bind to the remaining input ports in order.
     VarAsm { var: VarId, block: std::sync::Arc<amdgpu_safeasm::AsmBlock>, inputs: Vec<Opnd> },
@@ -824,6 +827,9 @@ impl Function {
                 }
                 Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
                     let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
+                }
+                Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, opsel } => {
+                    let _ = writeln!(s, "{pad}var{} += mfma_scale16({a:?}, {b:?}; {scale_a:?}, {scale_b:?}; opsel 0x{opsel:02x})", var.0);
                 }
                 Stmt::VarSmfmac { var, a, b, idx } => {
                     let _ = writeln!(s, "{pad}var{} += smfmac({a:?}, {b:?}; {idx:?})", var.0);
@@ -1615,6 +1621,13 @@ impl FnBuilder {
         self.f.stmts.push(Stmt::VarSmfmac { var, a: a.into(), b: b.into(), idx: idx.into() });
     }
 
+    /// `var += v_mfma_scale_f32_16x16x128_f8f6f4(a, b; scale_a.byte[byte_a], scale_b.byte[byte_b])` on a `Frag4` loop variable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn var_mfma_scale16(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>, byte_a: u8, byte_b: u8) {
+        assert!(byte_a < 4 && byte_b < 4, "scale byte select is 0..3");
+        self.f.stmts.push(Stmt::VarMfmaScale16 { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into(), opsel: byte_a | (byte_b << 4) });
+    }
+
     /// Update several loop variables in place: the i-th `Seq::inout` port is bound to `vars[i]`.
     pub fn var_asm_n(&mut self, vars: &[VarId], block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) {
         self.f.stmts.push(Stmt::VarAsmN { vars: vars.to_vec(), block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
@@ -2397,6 +2410,27 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
+            Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, .. } => {
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
+                if !ok {
+                    errs.push(here(format!("var{var} accumulated outside its loop")));
+                }
+                if f.var_ty(*var) != Some(DType::Frag4) {
+                    errs.push(here(format!("var{var} must be a frag4 accumulator (16x16 MFMA)")));
+                }
+                for (o, ty) in [(a, DType::Frag8), (b, DType::Frag8)] {
+                    match opnd_ty(f, *o) {
+                        Ok(t) if t == ty => {}
+                        Ok(t) => errs.push(here(format!("mfma 16x16x128 operand is {}, expected {}", t.name(), ty.name()))),
+                        Err(e) => errs.push(here(e)),
+                    }
+                }
+                for (o, what) in [(scale_a, "scale_a"), (scale_b, "scale_b")] {
+                    if let Err(e) = expect_int(f, *o, what) {
+                        errs.push(here(e));
+                    }
+                }
+            }
             Stmt::VarSmfmac { var, a, b, idx } => {
                 let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
@@ -2549,6 +2583,7 @@ fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::VarMfmaFp8 { a, b, .. } | Stmt::VarMfmaFp8Z { a, b, .. } => vec![*a, *b],
         Stmt::VarMfmaFp8C { a, b, c, .. } => vec![*a, *b, *c],
         Stmt::VarSmfmac { a, b, idx, .. } => vec![*a, *b, *idx],
+        Stmt::VarMfmaScale16 { a, b, scale_a, scale_b, .. } => vec![*a, *b, *scale_a, *scale_b],
         Stmt::VarAsm { inputs, .. } | Stmt::VarAsmN { inputs, .. } => inputs.clone(),
         Stmt::BeginLoop { init, .. } => init.clone(),
         Stmt::BreakIf { cond } | Stmt::BeginIf { cond } => vec![*cond],

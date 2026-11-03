@@ -633,6 +633,7 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
                     | MOp::VMfma16x16x32Fp8
                     | MOp::VMfma32x32x16Fp8
                     | MOp::VMfmaScale32x32x64Fp8
+                    | MOp::VMfmaScale16x16x128Fp8
                     | MOp::VMfma32x32x64Fp8
             );
             if !is_mfma || inst.srcs.len() < 3 {

@@ -1622,6 +1622,7 @@ fn is_matrix_op(op: MOp) -> bool {
             | MOp::VMfma16x16x32Fp8
             | MOp::VMfma32x32x16Fp8
             | MOp::VMfmaScale32x32x64Fp8
+            | MOp::VMfmaScale16x16x128Fp8
             | MOp::VMfmaScale32x32x64Fp8Z
             | MOp::VMfma32x32x64Fp8
             | MOp::VMfma32x32x64Fp8Z

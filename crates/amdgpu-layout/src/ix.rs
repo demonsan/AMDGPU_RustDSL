@@ -115,6 +115,29 @@ fn mk_sum(mut terms: Vec<(Ix, i64)>, k: i64) -> Ix {
     }
 }
 
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        a.abs()
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// `x = g * x'` with g = gcd(coefficients, constant, k): returns (x', k / g).
+fn reduce_gcd(x: &Ix, k: i64) -> (Ix, i64) {
+    let (t, c) = sum_parts(x);
+    if t.is_empty() {
+        return (x.clone(), k);
+    }
+    let mut g = gcd(k, c);
+    for (_, m) in &t {
+        g = gcd(g, *m);
+    }
+    if g <= 1 {
+        return (x.clone(), k);
+    }
+    (mk_sum(t.into_iter().map(|(y, m)| (y, m / g)).collect(), c / g), k / g)
+}
 impl Ix {
     pub fn c(&self) -> Option<i64> {
         if let Ix::C(k) = self {
@@ -195,9 +218,25 @@ impl Ix {
                     return Ix::C(0);
                 }
             }
-            return Ix::Div(Box::new(self.clone()), k);
+            let (r2, k2) = reduce_gcd(self, k);
+            if k2 == 1 {
+                return r2;
+            }
+            let (lo2, hi2) = r2.range(d);
+            if lo2 >= 0 && hi2 < k2 {
+                return Ix::C(0);
+            }
+            return Ix::Div(Box::new(r2), k2);
         }
-        mk_sum(q, qc).add(&Ix::Div(Box::new(rest), k))
+        let (rest, k2) = reduce_gcd(&rest, k);
+        if k2 == 1 {
+            return mk_sum(q, qc).add(&rest);
+        }
+        let (lo2, hi2) = rest.range(d);
+        if lo2 >= 0 && hi2 < k2 {
+            return mk_sum(q, qc);
+        }
+        mk_sum(q, qc).add(&Ix::Div(Box::new(rest), k2))
     }
     /// self mod k (self >= 0), simplified with the symbol ranges.
     pub fn mod_c(&self, k: i64, d: &Dyns) -> Ix {
@@ -220,6 +259,12 @@ impl Ix {
                 return rest.clone();
             }
             let _ = x;
+        }
+        // g | every coefficient, the constant and k: (g x) mod k = g (x mod k/g)
+        let (r2, k2) = reduce_gcd(&rest, k);
+        let g = k / k2;
+        if g > 1 {
+            return r2.mod_c(k2, d).mul_c(g);
         }
         Ix::Mod(Box::new(rest), k)
     }
