@@ -357,6 +357,7 @@ impl PipeBody for Body {
         let agpr = self.cfg.agpr_ops;
         let nords = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nords"));
         let zf = if nords { let z = b.frag_zero(DType::Frag4); Some(b.cat_frag8(z, z)) } else { None };
+        let zfb = if nords { let z = b.frag_zero(DType::Frag4); let o = b.frag_zero(DType::Frag4); Some(b.cat_frag8(o, z)) } else { None };
         let mark = |b: &mut FnBuilder, v: ValueId| if agpr { b.agpr(v) } else { v };
         let kbx = ox(t.it);
         // scale words (one LDS round trip), then the byte selects (shifted to byte 0)
@@ -377,7 +378,7 @@ impl PipeBody for Body {
         // A0 and B0 first; the other B fragments are issued one ahead of the first row of MMAs (partial lgkm waits)
         let mut af = { let v = if let Some(z) = zf { z } else { ar.read(b, 0) }; mark(b, v) };
         let bpre = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("bpre").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1).min(nn);
-        let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zf { z } else { br.read(b, j) }; mark(b, v) }).collect();
+        let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zfb { z } else { br.read(b, j) }; mark(b, v) }).collect();
         let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
         let prio = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("prio"));
@@ -397,7 +398,7 @@ impl PipeBody for Body {
             }
             for j in 0..nn {
                 if i == 0 && j + bpre < nn {
-                    let v = if let Some(z) = zf { z } else { br.read(b, j + bpre) };
+                    let v = if let Some(z) = zfb { z } else { br.read(b, j + bpre) };
                     bf.push(mark(b, v));
                 }
                 if !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nomma")) {
