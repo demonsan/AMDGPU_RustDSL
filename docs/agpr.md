@@ -50,3 +50,13 @@ reload of loop-carried fragments): outputs bit-identical to the all-VGPR version
 ## Not done
 Unknown/ungraded: the exact minimum wait states for `v_accvgpr_write` -> MFMA srcC and MFMA -> `v_accvgpr_read` on the hardware (modelled as VGPR; ISA table + oracle, hardware probes only show correctness
 of the generated schedules). `b64` LDS-transpose reloads (`ds_read_b64_tr_b8`) are not coalesced into variables yet. Scheduler register-pressure accounting does not model AGPRs (RA checks the budget).
+## Wait placement: LDS-DMA operands (silent-miscompile postmortem)
+`sched/waits.rs` (scoreboard of `s_waitcnt`) treated every `Fence`-class instruction as "ordering only" and returned before checking its register operands. The LDS-DMA loads
+(`buffer_load ... lds`, `global_load_lds`) are fences for the list scheduler *and* read registers (voffset / soffset), so a `ds_read` result feeding a DMA address was consumed without
+`s_waitcnt lgkmcnt` (`insert_waits` added none, `verify_waits` did not look). It surfaced only when the register-pressure ladder (`lower_and_allocate`) reached the **LDS spill** (`ldsspillN`:
+spilled loop-invariant addresses are reloaded by a `ds_read_b32` right before the DMA): GEMM v4 with 16 of 64 accumulators in AGPRs (VGPR-bound) returned wrong values for 75% of the outputs.
+Fix: fence-class instructions that read registers go through the normal operand check; `verify_waits` checks them too; the unscheduled path now runs `verify_waits` as well (it used to trust the
+lowering-time waits). Regression: `tests/wait_operands.rs` (MIR) and the GPU probe `probe_dma_voff_spill` (`AMDC_RA_LDS_SPILL=8 AMDC_RA_LDS_SPILL_TARGET=0` forces the spill; with
+`AMDC_WAITS_SKIP_FENCE_OPERANDS=1` the old behaviour is restored and the probe's output changes).
+Loop-entry loads (`begin_loop` init values defined by `load_lds_b128(x2)` with no other use) are coalesced into the loop variable like `set_var` reloads, which removes the second fragment
+copy and makes 32 pinned accumulators + 16 pinned fragments (256 AGPRs) fit.
