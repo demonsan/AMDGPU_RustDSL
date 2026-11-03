@@ -9630,7 +9630,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let c32v = b.c_i32(32);
     let c64 = b.c_i32(64);
     let shd: i32 = if fmha_t_opt("sh4") { 4 } else if fmha_t_opt("sh2") { 2 } else { 0 };
-    // p4 (gen-next, docs/status.md round 70): the P scale moves from the PV MFMA scale operand (2^-4 on the P operand) into the fp8 conversion (scalef32 scale 0.25 = the vendor's s89), the PV MFMAs
+    // p4 (gen-next, docs/archive/status.md round 70): the P scale moves from the PV MFMA scale operand (2^-4 on the P operand) into the fp8 conversion (scalef32 scale 0.25 = the vendor's s89), the PV MFMAs
     // are then unscaled-equivalent (scale 127 / 127) and the epilogue normalisation takes the 2^-4 (fin x 1/16): O and the row sum both carry the same P scale
     let p4 = fmha_t_opt("p4");
     let c123 = b.c_i32(if p4 { 127 } else { 123 + shd });
@@ -9771,7 +9771,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     } else {
         Vec::new()
     };
-    // mubuf (MUBUF K/V DMA, docs/status.md round 71): FULL tiles go through `buffer_load_dwordx4 ... lds` with ONE descriptor per tensor, a loop-invariant per-lane byte offset (4 VGPR),
+    // mubuf (MUBUF K/V DMA, docs/archive/status.md round 71): FULL tiles go through `buffer_load_dwordx4 ... lds` with ONE descriptor per tensor, a loop-invariant per-lane byte offset (4 VGPR),
     // soffset = key0 * row stride (SALU) and the per-q slot in imm (added to the memory offset AND the LDS destination, compensated in the per-lane offset): no per-DMA VALU address, no row clamp.
     // The PARTIAL last tile keeps the clamped global-load path (the raw-buffer range check ignores soffset and num_records is a constant, so the clamp cannot be a zero-fill).
     // mubufd: NO branch and NO clamp - a runtime-sized descriptor (num_records = base_off + kv_len * row stride, per block): rows past kv_len are zero-filled into LDS by the hardware
@@ -10152,7 +10152,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
         let bacc0 = b.mfma_f16_wide(ones_f16, Opnd::Val(bias_init), zero16b);
         init_vars.push((DType::Frag16, Opnd::Val(bacc0))); // 13 bias accumulator
     }
-    // cut1 (docs/status.md round 71): the exact quantised reference b (= 4 (hi + lo), the value the two f16 words represent) is carried as an f32 loop variable, so the per-tile hi/lo unpack
+    // cut1 (docs/archive/status.md round 71): the exact quantised reference b (= 4 (hi + lo), the value the two f16 words represent) is carried as an f32 loop variable, so the per-tile hi/lo unpack
     // (2 cvt + lshr + add + mul) disappears; the shift delta = b_q - b_old and its select are computed inside the rollback branch only. Bit-identical to the unpack form.
     let cut1 = fmha_t_opt("cut1");
     let bq_idx = init_vars.len();
@@ -11291,7 +11291,7 @@ fn emit_fmha_vs128_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     b.end_if();
 }
 
-/// `_vs9` (gen9 scaffold, docs/gen9-vendor-mirror-design.md): starts as an exact copy of `emit_fmha_vs128_role` so that it passes every `_vs128` gate at step 0; the vendor structure is grafted
+/// `_vs9` (gen9 scaffold, docs/archive/gen9-vendor-mirror-design.md): starts as an exact copy of `emit_fmha_vs128_role` so that it passes every `_vs128` gate at step 0; the vendor structure is grafted
 /// window by window (V window, M window, conversion chain as separate replaceable units). Do not edit `emit_fmha_vs128_role` for gen9.
 fn emit_fmha_vs9_role(b: &mut FnBuilder, cx: &FmhaTCtx, role_a: bool) {
     let win_c = vs5_win("winc");
@@ -19627,7 +19627,7 @@ pub fn fmha_fwd_hd128_mxfp8_vsm() -> Function {
     f
 }
 
-/// KV-split kernel (phase 1 of the sequence-parallel attention, docs/kvsplit-design.md): the `_vs128` block shape (256 rows, 512 threads) over one
+/// KV-split kernel (phase 1 of the sequence-parallel attention, docs/archive/kvsplit-design.md): the `_vs128` block shape (256 rows, 512 threads) over one
 /// key range per block; writes normalised fp32 partials (`Ohat`, `lse`) instead of the bf16 output. Kernarg: the 656-byte base ABI + 0x270 `Ohat`,
 /// 0x278 `lse`, 0x280 `splits`, 0x284 `rows_total`; grid `(ceil(S/256), H, B * splits)`.
 pub fn fmha_fwd_hd128_mxfp8_kvsplit() -> Function {
@@ -19942,12 +19942,12 @@ pub fn fmha_fwd_hd128_mxfp8_kvsplit_combine4h() -> Function {
     b.store_f32(optr, 4, f1);
     b.finish()
 }
-/// `_vs5` (gen5 scaffolding, docs/gen5-window-spec.md): identical to `_vs128` in everything except that its inner tile window is meant to be replaced by a
+/// `_vs5` (gen5 scaffolding, docs/archive/gen5-window-spec.md): identical to `_vs128` in everything except that its inner tile window is meant to be replaced by a
 /// hand-authored safe-asm window (`Op::Asm`). While the window is still the DSL one it must be bit-identical to `_vs128` (control point).
 /// Set while `_vs5` is being built: only then does `FMHA_OPT=winasm` swap the DSL window of `emit_fmha_vs128_role` for the safe-asm window.
 static VS5_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Block C of docs/gen5-window-spec.md (`FMHA_OPT=winc` on `_vs5`): the PV window of one tile (8 scaled MFMAs on the four O accumulators with the V fragments read by
+/// Block C of docs/archive/gen5-window-spec.md (`FMHA_OPT=winc` on `_vs5`): the PV window of one tile (8 scaled MFMAs on the four O accumulators with the V fragments read by
 /// `ds_read_b64_tr_b8` in a one-step software pipeline, plus the four in-place row-sum SMFMACs), authored in safe Rust and PINNED (order preserved verbatim).
 /// Ports: inout o0..o3 (Frag16), inout la (Frag4); in trb0..trb3 (tile slot + e column address), pa, pb (P words), a_rs, idx01, idx23, c127, c123.
 pub fn pv_window_block() -> amdgpu_safeasm::AsmBlock {
@@ -20044,13 +20044,13 @@ pub fn pv_window_block() -> amdgpu_safeasm::AsmBlock {
     s.output_exit(exl);
     s.finish().expect("pv_window_block is a verified sequence")
 }
-/// Block M of docs/gen5-window-spec.md (`FMHA_OPT=winm` on `_vs5`): the WHOLE M phase of a tile as one pinned safe-asm block: 4 bias MFMAs (f16), PV (8 scaled MFMAs, V fragments by
+/// Block M of docs/archive/gen5-window-spec.md (`FMHA_OPT=winm` on `_vs5`): the WHOLE M phase of a tile as one pinned safe-asm block: 4 bias MFMAs (f16), PV (8 scaled MFMAs, V fragments by
 /// `ds_read_b64_tr_b8`), QK(t+1) (8 scaled MFMAs accumulating into the S tiles, K fragments by `ds_read_b128`, K scales by `ds_read_b32` + VGPR shifts) and the four in-place row-sum
 /// SMFMACs, in the order the list scheduler produces today (bias x4, PV half 0 x4, QK first MFMA x4, PV half 1 x4, QK second MFMA x4, SMFMAC pairs after item 7 and at the end),
 /// with a two-item read lookahead and exact partial lgkmcnt waits from the Pending tokens. Control block: expected neutral.
 /// Inout ports: S0..S3, O0..O3 (Frag16), la (Frag4). Inputs: kfb0..3, kdrd, g8, sh16, q0, q1, sq0, sq1, ones, bias, trb0..3, pa, pb, a_rs, idx01, idx23, c127, c123.
 
-/// gen9 M2 (docs/gen9-vendor-mirror-design.md section 2): the M window of `_vs9` as ONE pinned safe-asm block, vendor order: the first matrix work after the barrier needs no LDS read:
+/// gen9 M2 (docs/archive/gen9-vendor-mirror-design.md section 2): the M window of `_vs9` as ONE pinned safe-asm block, vendor order: the first matrix work after the barrier needs no LDS read:
 /// 2 row-sum SMFMACs (P from registers) and PV MFMAs (0,0) / (0,1) on the two V fragments read BEFORE the barrier; then the remaining PV / QK stream behind `ds_read`s with exact partial waits.
 /// The 4 f16 bias MFMAs are gone: the persistent bias matrix `bacc` (recomputed only in the rollback branch) is the C operand of the first scaled QK MFMA of every S tile.
 /// Inout: S0..S3, O0..O3 (Frag16), la (Frag4). Inputs: kfb0..3, kdrd, g8, sh16, q0, q1, sq0, sq1, bacc (Frag16), vp0, vp1 (Frag8), trb0..3, pa, pb, a_rs, idx01, idx23, c127, c123.
@@ -20248,7 +20248,7 @@ pub fn pv_qk_window_block_v2() -> amdgpu_safeasm::AsmBlock {
     s.finish().expect("pv_qk_window_block_v2 is a verified sequence")
 }
 
-/// gen9 M2 (docs/gen9-vendor-mirror-design.md section 2): the M window of `_vs9` as ONE pinned safe-asm block, vendor order: the first matrix work after the barrier needs no LDS read:
+/// gen9 M2 (docs/archive/gen9-vendor-mirror-design.md section 2): the M window of `_vs9` as ONE pinned safe-asm block, vendor order: the first matrix work after the barrier needs no LDS read:
 /// 2 row-sum SMFMACs (P from registers) and PV MFMAs (0,0) / (0,1) on the two V fragments read BEFORE the barrier; then the remaining PV / QK stream behind `ds_read`s with exact partial waits.
 /// The 4 f16 bias MFMAs are gone: the persistent bias matrix `bacc` (recomputed only in the rollback branch) is the C operand of the first scaled QK MFMA of every S tile.
 /// Inout: S0..S3, O0..O3 (Frag16), la (Frag4). Inputs: kfb0..3, kdrd, g8, sh16, q0, q1, sq0, sq1, bacc (Frag16), vp0, vp1 (Frag8), trb0..3, pa, pb, a_rs, idx01, idx23, c127, c123.
@@ -20696,12 +20696,12 @@ pub fn fmha_fwd_hd128_mxfp8_vs5() -> Function {
     f
 }
 
-/// `_vs5` only: `FMHA_OPT=winc` (Block C: PV + row sums as a pinned safe-asm block), `wina` (Block A), `winb` (Block B, the QK-under-VALU overlap); see docs/gen5-window-spec.md.
+/// `_vs5` only: `FMHA_OPT=winc` (Block C: PV + row sums as a pinned safe-asm block), `wina` (Block A), `winb` (Block B, the QK-under-VALU overlap); see docs/archive/gen5-window-spec.md.
 /// Each block is gated separately (md5 + 15 shapes + determinism + timing). `wina` / `winb` are not wired yet and stop the build with a message.
 fn vs5_win(name: &str) -> bool {
     let want = fmha_t_opt(name) && VS5_BUILD.load(std::sync::atomic::Ordering::SeqCst);
     if want && name != "winc" && name != "winm" {
-        panic!("FMHA_OPT={name}: this safe-asm window block is not wired yet (docs/gen5-window-spec.md section 7)");
+        panic!("FMHA_OPT={name}: this safe-asm window block is not wired yet (docs/archive/gen5-window-spec.md section 7)");
     }
     want
 }/// 8-elements-per-thread fp16-partial combine (`..._kvsplit_combine8h`): grid = ceil(rows_total * 128 / 8 / 256); one 16-byte load per split, one 16-byte store.
@@ -21048,7 +21048,7 @@ fn fmha_t_build(name: &str, pp: bool, sv: bool) -> Function {
     b.arg("s_descale_k_Hs", DType::I32, 0x260, 4);
     let is_kvs = name.ends_with("_kvsplit");
     if is_kvs {
-        // KV-split kernel: the 656-byte base ABI plus the partial buffers and the split count (docs/kvsplit-design.md; harness contract of kernel-occ)
+        // KV-split kernel: the 656-byte base ABI plus the partial buffers and the split count (docs/archive/kvsplit-design.md; harness contract of kernel-occ)
         b.arg("ptr_ohat", DType::Ptr, 0x270, 8);
         b.arg("ptr_lse", DType::Ptr, 0x278, 8);
         b.arg("kvs_splits", DType::I32, 0x280, 4);
@@ -22061,7 +22061,7 @@ pub fn sched_diamond() -> Function {
 /// per SIMD on one CU) is a build-time choice (SCHED_WG=256/512/1024 -> 1/2/4 waves/SIMD), so the
 /// same instruction stream can be timed at 2 vs 4 waves/SIMD. Used to decide whether a
 /// <=128-VGPR split of the FMHA kernel could hide the dependency stalls measured in
-/// docs/status.md (round 45 columns); see docs/scheduling.md.
+/// docs/archive/status.md (round 45 columns); see docs/scheduling.md.
 pub fn sched_occ_chain() -> Function {
     let (mut b, o, n, tid) = sched_begin("sched_occ_chain");
     let c0 = b.c_i32(0);

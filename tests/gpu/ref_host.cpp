@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
     const char* co_small = std::getenv("REF_CO2_SMALL");
     if (co_small && !*co_small) co_small = nullptr;   // run_ref.sh passes empty strings for the variants it does not build
     const char* kname_small = std::getenv("REF_KNAME2_SMALL") ? std::getenv("REF_KNAME2_SMALL") : "fmha_fwd_hd128_mxfp8_v3_t128";
-    // KV-split candidate (docs/kvsplit-design.md): split kernel writes Ohat/lse partials, combine kernel merges.
+    // KV-split candidate (docs/archive/kvsplit-design.md): split kernel writes Ohat/lse partials, combine kernel merges.
     const char* co_split = std::getenv("REF_CO2_SPLIT");
     if (co_split && !*co_split) co_split = nullptr;
     const char* kname_split = std::getenv("REF_KNAME2_SPLIT") ? std::getenv("REF_KNAME2_SPLIT") : "fmha_fwd_hd128_mxfp8_v3_kvsplit";
@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
     const double comb_threads_d = (double)envi("REF_COMBINE_THREADS", 256);
     const int combine_elems = envi("REF_COMBINE_ELEMS", 1);   // 4 for the vectorised combine4 kernel
 
-    // Dispatch guard for the KV-split candidate (docs/kvsplit-results.md, docs/gen4-tiling-design.md section 11): use it only when
+    // Dispatch guard for the KV-split candidate (docs/archive/kvsplit-results.md, docs/archive/gen4-tiling-design.md section 11): use it only when
     // N256 <= 128 and N256*s <= 256 (one full block wave), every split owns a tile, and the modelled T_kvsplit(s) < 0.95 * T_current;
     // otherwise fall back to the certified _t128/_vs128 rule. The model is the one fitted to the measurements (kernel-opt, B1H8S2048 and 1 8 1024):
     //   T_t128    = F / (5.9e12 * min(256, 2 N256)) + 9.4 us             (4-wave blocks: compute + the fixed per-launch cost; 9.4 us is the floor measured at SK = 1)
@@ -259,7 +259,7 @@ int main(int argc, char** argv) {
         put64(args, 0x000, outp);
         put32(args, 0x080, (uint32_t)((size_t)stride_rows * H * D));
     };
-    // KV-split kernarg extension (docs/kvsplit-design.md section 3, agreed with kernel-opt): 0x270 ptr Ohat,
+    // KV-split kernarg extension (docs/archive/kvsplit-design.md section 3, agreed with kernel-opt): 0x270 ptr Ohat,
     // 0x278 ptr lse, 0x280 u32 splits, 0x284 u32 rows_total (= B*S*H, the per-split stride); segment 720 bytes.
     size_t fused_dummy_off = 0;
     void* fused_counters = nullptr;   // REF_FUSED=1: per-32-row-tile ticket counters at 0x288 (zeroed once, reset by the last arriver)
@@ -416,7 +416,7 @@ int main(int argc, char** argv) {
         std::vector<uint16_t> out2(no, 0);
         if (use_split) {
             if (!co_comb) { std::printf("[split] missing REF_CO2_COMBINE\n"); return 1; }
-            // Partials: allocated ONCE, outside every timed window (docs/kvsplit-design.md section 3).
+            // Partials: allocated ONCE, outside every timed window (docs/archive/kvsplit-design.md section 3).
             void *ohat, *lse;
             CK(hipMalloc(&ohat, (size_t)ohat_alloc_bytes));
             CK(hipMalloc(&lse, (size_t)lse_bytes));

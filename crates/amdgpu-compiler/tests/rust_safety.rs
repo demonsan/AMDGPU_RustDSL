@@ -15,7 +15,7 @@ fn workspace_root() -> PathBuf {
 
 fn crates() -> Vec<(&'static str, PathBuf)> {
     let root = workspace_root();
-    ["amdgpu-dsl", "amdgpu-compiler", "amdgpu-safeasm", "amdgpu-layout", "amdgpu-isa", "amdgpu-tile", "amdc"]
+    ["amdgpu-dsl", "amdgpu-compiler", "amdgpu-safeasm", "amdgpu-layout", "amdgpu-isa", "amdgpu-tile", "amdgpu-kernels", "amdc"]
         .iter()
         .map(|c| (*c, root.join("crates").join(c)))
         .collect()

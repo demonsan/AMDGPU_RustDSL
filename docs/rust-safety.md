@@ -39,7 +39,7 @@
 
 `forbid` 是**编译期硬约束**：任何后续出现的 `unsafe {}`、`unsafe fn`、`unsafe impl`、`unsafe trait` 都会直接编译失败，
 而不是靠 code review 拦住。`crates/amdgpu-compiler/tests/rust_safety.rs::every_crate_forbids_unsafe_code`
-会检查各 crate root 都声明了该属性（防止有人删掉）。仓库现有 8 个 crate（`amdgpu-dsl`、`amdgpu-layout`、`amdgpu-isa`、`amdgpu-tile`、`amdgpu-kernels`、`amdgpu-compiler`、`amdgpu-safeasm`、`amdc`），全部在 crate root 写了 `#![forbid(unsafe_code)]`；该测试的 crate 列表目前覆盖其中 7 个（`amdgpu-kernels` 尚未加入列表，属于测试侧的待补项，不影响 `forbid` 本身的编译期效力）。
+会检查各 crate root 都声明了该属性（防止有人删掉）。仓库现有 8 个 crate（`amdgpu-dsl`、`amdgpu-layout`、`amdgpu-isa`、`amdgpu-tile`、`amdgpu-kernels`、`amdgpu-compiler`、`amdgpu-safeasm`、`amdc`），全部在 crate root 写了 `#![forbid(unsafe_code)]`，该测试逐个检查全部 8 个。
 
 ### 1.2 零第三方依赖
 
@@ -223,7 +223,7 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
 
 | 检查 | 位置 | 当前结果 |
 |---|---|---|
-| 每个 crate forbid unsafe | `tests/rust_safety.rs::every_crate_forbids_unsafe_code` | ✅ 7/7（列表内）；`amdgpu-kernels` 的 `forbid` 在其 `lib.rs`，未在列表中 |
+| 每个 crate forbid unsafe | `tests/rust_safety.rs::every_crate_forbids_unsafe_code` | ✅ 8/8 |
 | 禁用构造逐行扫描 | `tests/rust_safety.rs::no_forbidden_constructs_in_any_source_line` | ✅ 0 命中 |
 | 零第三方依赖 | `tests/rust_safety.rs::no_third_party_dependencies` | ✅ 全 path 依赖 |
 | panic 面报告 | `tests/rust_safety.rs::panic_surface_report` | ✅ 每次打印数字 |

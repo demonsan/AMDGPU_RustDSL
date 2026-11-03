@@ -8,7 +8,8 @@ Checks every tracked Markdown file of the repository (README.md, docs/**.md, cra
 2. in LIVE documents (everything outside ``docs/archive/``), back-quoted repository paths such as
    ``crates/amdgpu-tile/src/fmha.rs:83`` or ``docs/host-gen.md`` must exist, and a ``:line`` / ``:a-b`` suffix must not
    exceed the file's line count. Archived documents are historical records: their path mentions are not checked.
-3. no encoding damage: neither ``???`` nor U+FFFD may appear outside code blocks, and no file may start with a UTF-8 BOM.
+3. every ``docs/<name>.md`` mentioned in a tracked source file (``.rs``, ``.sh``, ``.py``, ``.cpp``, ``.h``, ``.toml``) must exist;
+4. no encoding damage: neither ``???`` nor U+FFFD may appear outside code blocks, and no file may start with a UTF-8 BOM.
 
 Usage: ``python tools/check_doc_links.py`` (exit status 1 on any finding). No third-party dependencies.
 """
@@ -106,9 +107,21 @@ def main():
                 continue
             if not os.path.exists(os.path.normpath(os.path.join(base, t.split("#", 1)[0]))):
                 findings.append(f"{rel}: broken reference definition -> {t}")
+    # source files: every docs/<name>.md they mention must exist
+    out = subprocess.run(["git", "ls-files", "*.rs", "*.sh", "*.py", "*.cpp", "*.h", "*.toml"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    docref = re.compile(r"docs/[A-Za-z0-9_./\-]+?\.md")
+    nsrc = 0
+    for rel in [p for p in out.splitlines() if p]:
+        nsrc += 1
+        with open(os.path.join(ROOT, rel), "rb") as f:
+            text = f.read().decode("utf-8", errors="replace")
+        for lineno, ln in enumerate(text.split("\n"), 1):
+            for m in docref.finditer(ln):
+                if not os.path.exists(os.path.join(ROOT, m.group(0))):
+                    findings.append(f"{rel}:{lineno}: missing doc `{m.group(0)}`")
     for f in findings:
         print(f)
-    print(f"checked {len(files)} markdown files: {len(findings)} finding(s)")
+    print(f"checked {len(files)} markdown files and {nsrc} source files: {len(findings)} finding(s)")
     return 1 if findings else 0
 
 

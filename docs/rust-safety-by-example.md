@@ -398,7 +398,7 @@ Block C（PV+行和，`winc`，−2.5%）与 Block M（整个 M 相，`winm`，�
 
 | 检查 | 位置 | 当前结果 |
 |---|---|---|
-| 各 crate 都 forbid unsafe | `tests/rust_safety.rs::every_crate_forbids_unsafe_code` | ✅ 7/7（列表内）；`amdgpu-kernels` 的 `forbid` 在其 `lib.rs`，未在列表中 |
+| 各 crate 都 forbid unsafe | `tests/rust_safety.rs::every_crate_forbids_unsafe_code` | ✅ 8/8 |
 | 16 类危险构造逐行扫描 | `tests/rust_safety.rs::no_forbidden_constructs_in_any_source_line` | ✅ 0 命中 |
 | 零第三方依赖 | `tests/rust_safety.rs::no_third_party_dependencies` | ✅ 全 path |
 | panic 面报告 | `tests/rust_safety.rs::panic_surface_report` | ✅ 每次打印 |

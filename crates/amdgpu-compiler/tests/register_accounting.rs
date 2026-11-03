@@ -28,7 +28,7 @@
 //!
 //! A negative result here is not hypothetical: the SGPR under-declaration found on this branch
 //! (a loop after allocation overwrote `max_s` with "last still-live slot + 1") is exactly what check
-//! (1) reports. See `docs/verification.md`. This test supersedes the duplicate
+//! (1) reports. See `docs/archive/verification.md`. This test supersedes the duplicate
 //! `tests/reg_declaration.rs` (same descriptor coverage plus MFMA tuple shape, defined-before-use, the
 //! `probe_dma*` kernels and a mutation self-test).
 
@@ -511,7 +511,7 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The `probe_dma*` kernels are registered but deliberately not in `kernel_names()` (the LLVM tail
 /// cannot emit their MIR), so a `kernel_names()` sweep alone would miss them.
 /// The vendor-structure kernels (mha_fwd_hd128_mxfp8_vs, _vs128) use the own-backend-only DMA MOps too and are audited by name;
-/// _vs128 is skipped while it does not allocate (out of VGPRs, see docs/status.md).
+/// _vs128 is skipped while it does not allocate (out of VGPRs, see docs/archive/status.md).
 const DMA_PROBES: &[&str] = &["probe_dma", "probe_dma_tile", "probe_dma_seq", "probe_dma_kread", "probe_dma_map", "fmha_fwd_hd128_mxfp8_vs", "fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_kvsplit"];
 
 fn allocates(name: &str) -> bool {

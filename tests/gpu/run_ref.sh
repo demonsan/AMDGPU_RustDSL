@@ -20,7 +20,7 @@ kernel_prefix() { case "$1" in fmha_fwd_hd128_mxfp8) echo fmha_fwd_hd128_mxfp8_v
 KNAME="$OUR_KERNEL"; SMALL_ENV=""; SMALL_KNAME="fmha_fwd_hd128_mxfp8_v3_t128"; SPLIT_ENV=""; COMBINE_ENV=""; SPLIT_N="0"; SPLIT_KNAME=""; COMBINE_KNAME=""
 if [[ "$OUR_KERNEL" == *_auto_split ]]; then
     # KV-split auto path: build _vs128 + _t128 + _kvsplit + _kvsplit_combine; ref_host applies the
-    # dispatch guard (docs/gen4-tiling-design.md section 11) and falls back to _t128/_vs128 when rejected.
+    # dispatch guard (docs/archive/gen4-tiling-design.md section 11) and falls back to _t128/_vs128 when rejected.
     P="${OUR_KERNEL%_auto_split}"; P="$(kernel_prefix "$P")"
     KNAME="${P}_vs128"
     build_one "$KNAME" build/fmha_ours.co

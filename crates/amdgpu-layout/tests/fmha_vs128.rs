@@ -140,7 +140,7 @@ fn the_fmha_swizzle_is_bank_conflict_free_where_the_plain_layout_is_not() {
         }
         (k_conf, v_conf)
     };
-    assert_eq!(model(&Swizzle::fmha128()), (0, 0), "docs/status.md: zero conflicts for the K reads and the transposing V reads");
+    assert_eq!(model(&Swizzle::fmha128()), (0, 0), "docs/archive/status.md: zero conflicts for the K reads and the transposing V reads");
     let (k, v) = model(&Swizzle::none());
     assert!(k > 0 && v > 0, "the dense 128-byte rows without the swizzle conflict (K {k}, V {v})");
 }

@@ -103,11 +103,11 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     extra_all.extend(f.lower_opts.iter().map(|s| s.as_str()));
     let extra: &[&str] = &extra_all;
     // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
-    // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/status.md round 47).
+    // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/archive/status.md round 47).
     let base = if (pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || pname.ends_with("_kvsplit") || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))) && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
         // measured on vs128 (15/15, 301.9-304.0 vs 280.6 TFLOP/s): retarget2 (cvt results written straight into the MFMA fragment
         // lanes), imm and sgpr cut ~230 copies/VALU and free 12 VGPRs; addrfold and shl are slower and stay off. `imm` also gives
-        // the vs128/vsm builds the register slack they need (docs/status.md rounds 49-50).
+        // the vs128/vsm builds the register slack they need (docs/archive/status.md rounds 49-50).
         let mut v: Vec<&str> = vec!["dce", "cmpfold", "scalarize", "retarget2", "imm", "sgpr", "zeroinit"];
         // `_t128` (4-wave blocks, one wave per SIMD): addrfold frees the DMA address temporaries so the full scheduler fits (416 -> 494 TFLOP/s)
         if pname.ends_with("_t128") {
@@ -130,7 +130,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
     } else if pname.starts_with("fmha_fwd_hd128_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
-        // the FMHA kernels zero their accumulators in place (bit-exact on all 15 shapes, -160 v_mov on _t, docs/status.md)
+        // the FMHA kernels zero their accumulators in place (bit-exact on all 15 shapes, -160 v_mov on _t, docs/archive/status.md)
         let mut v: Vec<&str> = vec!["zeroinit"];
         v.extend_from_slice(extra);
         lower::lower_with_extra(f, &v)?
@@ -148,7 +148,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         other => other,
     };
     // The FMHA kernels default to the wait-recomputing pass (partial vmcnt/lgkmcnt waits, ALU across barriers, ds_read hoisting): +9% on the
-    // transposed kernel, bit-identical results (measured, docs/status.md round 44). AMDC_SCHED=0 turns it off.
+    // transposed kernel, bit-identical results (measured, docs/archive/status.md round 44). AMDC_SCHED=0 turns it off.
     let sched_opts = match sched_opts {
         // GEMM profile / explicit Function::sched_opts: the scoreboard wait pass (+ ds_read hoisting, no reordering) with the kernel's own tokens on top
         None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0") && (f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) || f.sched_opts.is_some()) => {
@@ -166,7 +166,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
             && (pname.starts_with("fmha_fwd_hd128_mxfp8_t") || pname.starts_with("fmha_fwd_hd128_mxfp8_sv") || pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))) =>
         {
             // "ld" preset: scoreboard (partial) waits + ds_read hoisting, no instruction reordering. Measured best on the
-            // merged tree (docs/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
+            // merged tree (docs/archive/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
             let mut o = sched::Options::default();
             // `_t128`: ALU may cross the single barrier per tile and the pressure limit 248 lets the list scheduler take a schedule at vgpr 256
             // (measured 489 -> 505 TFLOP/s on B1H8S2048; limit 246/248 only, 244/250 give the old schedule: a heuristic knob, re-measure on changes)
@@ -174,7 +174,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 o.alu_across_barrier = true;
                 o.max_vgprs = 248;
             }
-            // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/status.md round 49)
+            // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/archive/status.md round 49)
             if !pname.ends_with("_vs128") && !pname.ends_with("_vs5") && !pname.ends_with("_vs6") && !pname.ends_with("_vs9") && !pname.ends_with("_kvsplit") && !pname.ends_with("_vsm") && !pname.ends_with("_t128") && !(pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o")) {
                 o.reorder = false;
                 o.alu_across_barrier = true;

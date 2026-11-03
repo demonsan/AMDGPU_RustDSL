@@ -2681,7 +2681,7 @@ fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
 
 /// Semantics of loop variables: a read of a loop variable (`Opnd::Var`) **after a `set_var` of the same variable in
 /// the same iteration** is easy to get wrong - the author usually expects the value just written, but the variable is
-/// loop-carried state whose value after a `set_var` is not guaranteed by the contract (docs/verification.md); use a
+/// loop-carried state whose value after a `set_var` is not guaranteed by the contract (docs/archive/verification.md); use a
 /// plain SSA value (the operand you passed to `set_var`) for intra-iteration producer/consumer pairs.
 /// This lint reports such reads conservatively (a `set_var` inside an `if` counts). Cross-iteration reads (read before
 /// the `set_var`, the common case), reads of the loop condition value held in an SSA value, and reads after the loop are
