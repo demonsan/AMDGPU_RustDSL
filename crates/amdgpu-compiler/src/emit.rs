@@ -51,7 +51,14 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
 
     out.push_str(&format!(".size {}, .-{}\n", m.name, m.name));
 
-    let vgpr = round_up(a.max_v, 4).max(4);
+    let agprs = crate::regalloc::agpr_count(m, a);
+    // gfx950 unified register file: accum_offset = arch VGPRs (rounded to 4), next_free_vgpr = arch + AGPRs (rounded to 8).
+    let (accum_offset, vgpr, _waves) = if agprs == 0 {
+        let v = round_up(a.max_v, 4).max(4);
+        (v, v, 0)
+    } else {
+        crate::regalloc::unified_budget(a.max_v, agprs)
+    };
     let sgpr = round_up(a.max_s, 8).max(8);
 
     // The kernel descriptor is a fixed 64-byte record and the runtime requires
@@ -76,7 +83,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str("    .amdhsa_system_vgpr_workitem_id 0\n");
     out.push_str(&format!("    .amdhsa_next_free_vgpr {}\n", vgpr));
     out.push_str(&format!("    .amdhsa_next_free_sgpr {}\n", sgpr));
-    out.push_str(&format!("    .amdhsa_accum_offset {}\n", vgpr));
+    out.push_str(&format!("    .amdhsa_accum_offset {}\n", accum_offset));
     out.push_str("    .amdhsa_float_denorm_mode_32 3\n");
     out.push_str("    .amdhsa_float_denorm_mode_16_64 3\n");
     out.push_str("    .amdhsa_ieee_mode 0\n");
@@ -95,6 +102,9 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push('\n');
     out.push_str(&format!("    .sgpr_count: {}\n", sgpr));
     out.push_str(&format!("    .vgpr_count: {}\n", vgpr));
+    if agprs > 0 {
+        out.push_str(&format!("    .agpr_count: {}\n", agprs));
+    }
     out.push_str("    .sgpr_spill_count: 0\n");
     out.push_str("    .vgpr_spill_count: 0\n");
     out.push_str("    .args:\n");
@@ -144,19 +154,29 @@ fn v(a: &Alloc, r: VReg) -> u32 {
     a.phys[r as usize]
 }
 
+/// `v` / `a` prefix and index of a (possibly AGPR-tagged) physical register.
+fn file(p: u32) -> (char, u32) {
+    if is_agpr_phys(p) {
+        ('a', p - AGPR_TAG)
+    } else {
+        ('v', p)
+    }
+}
+
 fn vr(a: &Alloc, r: VReg) -> String {
-    format!("v{}", v(a, r))
+    let (c, i) = file(v(a, r));
+    format!("{c}{i}")
 }
 
 fn pair(a: &Alloc, r: VReg) -> String {
-    let b = v(a, r);
-    format!("v[{b}:{}]", b + 1)
+    let (c, b) = file(v(a, r));
+    format!("{c}[{b}:{}]", b + 1)
 }
 
-/// A register tuple of `n` consecutive dwords, e.g. `v[8:9]` or `v[4:7]`.
+/// A register tuple of `n` consecutive dwords, e.g. `v[8:9]`, `v[4:7]` or `a[0:3]`.
 fn tuple(a: &Alloc, r: VReg, n: u32) -> String {
-    let b = v(a, r);
-    format!("v[{b}:{}]", b + n - 1)
+    let (c, b) = file(v(a, r));
+    format!("{c}[{b}:{}]", b + n - 1)
 }
 
 fn sr(a: &Alloc, r: VReg) -> String {
@@ -217,6 +237,9 @@ fn mem_op(a: &Alloc, base: Src, off: i64) -> String {
 fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
     let d = |a: &Alloc| vr(a, inst.dst.expect("dst"));
     match inst.op {
+        MOp::VAccvgprRead => vec![format!("v_accvgpr_read_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
+        MOp::VAccvgprWrite => vec![format!("v_accvgpr_write_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
+        MOp::VAccvgprMov => vec![format!("v_accvgpr_mov_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
         MOp::VMovB32 => {
             // A register-to-register move carries its source in `srcs`; a
             // constant carries its 32-bit pattern in `imm`.

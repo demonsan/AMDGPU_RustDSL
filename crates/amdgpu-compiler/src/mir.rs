@@ -20,22 +20,72 @@ pub enum RClass {
     S2,
     /// Four consecutive SGPRs (a MUBUF buffer resource descriptor), 4-aligned.
     S4,
+    /// Accumulation VGPRs (gfx90a+/gfx950 unified file: arch VGPRs v0..accum_offset-1, AGPRs a0.. above them). Written by MFMA with
+    /// cc_cd, by ds_read/loads, and by _accvgpr_write; read by MFMA (any operand), stores and _accvgpr_read, never by VALU.
+    A1,
+    A2,
+    A4,
+    A8,
+    A16,
+}
+
+/// Allocated AGPR registers are stored in Alloc::phys as AGPR_TAG + index so one table serves both files.
+pub const AGPR_TAG: u32 = 0x4000_0000;
+
+pub fn is_agpr_phys(p: u32) -> bool {
+    p >= AGPR_TAG
 }
 
 impl RClass {
     pub fn dwords(self) -> u32 {
         match self {
-            RClass::V2 | RClass::S2 => 2,
-            RClass::V4 | RClass::S4 => 4,
-            RClass::V8 => 8,
-            RClass::V16 => 16,
+            RClass::V2 | RClass::S2 | RClass::A2 => 2,
+            RClass::V4 | RClass::S4 | RClass::A4 => 4,
+            RClass::V8 | RClass::A8 => 8,
+            RClass::V16 | RClass::A16 => 16,
             _ => 1,
         }
     }
 
-    /// Vector register classes share one physical file.
+    /// Arch-VGPR register classes share one physical file (AGPR classes are a separate file: is_agpr).
     pub fn is_vector(self) -> bool {
         matches!(self, RClass::V1 | RClass::V2 | RClass::V4 | RClass::V8 | RClass::V16)
+    }
+
+    pub fn is_agpr(self) -> bool {
+        matches!(self, RClass::A1 | RClass::A2 | RClass::A4 | RClass::A8 | RClass::A16)
+    }
+
+    pub fn is_scalar(self) -> bool {
+        matches!(self, RClass::S1 | RClass::S2 | RClass::S4)
+    }
+
+    /// The vector-register class of the same width (V* <-> A*).
+    pub fn to_agpr(self) -> Option<RClass> {
+        Some(match self {
+            RClass::V1 | RClass::A1 => RClass::A1,
+            RClass::V2 | RClass::A2 => RClass::A2,
+            RClass::V4 | RClass::A4 => RClass::A4,
+            RClass::V8 | RClass::A8 => RClass::A8,
+            RClass::V16 | RClass::A16 => RClass::A16,
+            _ => return None,
+        })
+    }
+
+    pub fn to_vgpr(self) -> Option<RClass> {
+        Some(match self {
+            RClass::V1 | RClass::A1 => RClass::V1,
+            RClass::V2 | RClass::A2 => RClass::V2,
+            RClass::V4 | RClass::A4 => RClass::V4,
+            RClass::V8 | RClass::A8 => RClass::V8,
+            RClass::V16 | RClass::A16 => RClass::V16,
+            _ => return None,
+        })
+    }
+
+    /// Same width, ignoring the register file (V4 ~ A4).
+    pub fn same_width_vector(self, o: RClass) -> bool {
+        (self.is_vector() || self.is_agpr()) && (o.is_vector() || o.is_agpr()) && self.dwords() == o.dwords()
     }
 }
 
@@ -124,6 +174,12 @@ pub enum MOp {
     /// ISA, explicit here so every pass sees the read). Semantics:
     /// D += A_sparse(16x128, 64 nonzeros/row) x B(128x16).
     VSmfmac16x16x128Fp8,
+    /// _accvgpr_read_b32 vD, aS: dst V1 <- src A1.
+    VAccvgprRead,
+    /// _accvgpr_write_b32 aD, src: dst A1 <- V1 / S1 / inline constant (Imm).
+    VAccvgprWrite,
+    /// _accvgpr_mov_b32 aD, aS: dst A1 <- A1.
+    VAccvgprMov,
     // workgroup LDS
     LdsWriteB32,
     LdsReadB32,
@@ -327,6 +383,8 @@ pub struct MFunction {
     pub alias: HashMap<VReg, (VReg, u8)>,
     /// Emit no s_branch to the immediately following block (set by the scheduler pipeline only).
     pub elide_fallthrough: bool,
+    /// Explicit AGPR placement (mdgpu_pin_agpr): AGPR-class vreg -> first AGPR index. Honoured exactly by the allocator.
+    pub agpr_pin: HashMap<VReg, u32>,
 }
 
 impl MFunction {

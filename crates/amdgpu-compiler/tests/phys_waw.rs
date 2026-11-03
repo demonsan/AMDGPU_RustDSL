@@ -24,6 +24,7 @@ fn func(blocks: Vec<Vec<MInst>>, classes: Vec<RClass>) -> MFunction {
         loops: Vec::new(),
         alias: Default::default(),
         elide_fallthrough: false,
+        agpr_pin: Default::default(),
     }
 }
 

@@ -77,6 +77,11 @@ fn parse_class(s: &str) -> Result<SigClass, String> {
         "S1" => SigClass::Reg(RClass::S1),
         "S2" => SigClass::Reg(RClass::S2),
         "S4" => SigClass::Reg(RClass::S4),
+        "A1" => SigClass::Reg(RClass::A1),
+        "A2" => SigClass::Reg(RClass::A2),
+        "A4" => SigClass::Reg(RClass::A4),
+        "A8" => SigClass::Reg(RClass::A8),
+        "A16" => SigClass::Reg(RClass::A16),
         "I" => SigClass::Imm,
         _ => return Err(format!("unknown signature class '{s}'")),
     })
@@ -149,13 +154,15 @@ pub fn waitcnt_imm(vm: Option<u32>, lgkm: Option<u32>) -> u32 {
 }
 
 fn reg_name(class: RClass, phys: u32) -> String {
-    let (prefix, n) = if class.is_vector() { ("vgpr", class.dwords()) } else { ("sgpr", class.dwords()) };
+    let (prefix, n) = if class.is_agpr() { ("agpr", class.dwords()) } else if class.is_vector() { ("vgpr", class.dwords()) } else { ("sgpr", class.dwords()) };
+    let phys = if class.is_agpr() { phys - AGPR_TAG } else { phys };
     let parts: Vec<String> = (0..n).map(|k| format!("{prefix}{}", phys + k)).collect();
     format!("${}", parts.join("_"))
 }
 
 fn dword_name(class: RClass, phys: u32, k: u32) -> String {
-    let prefix = if class.is_vector() { "vgpr" } else { "sgpr" };
+    let prefix = if class.is_agpr() { "agpr" } else if class.is_vector() { "vgpr" } else { "sgpr" };
+    let phys = if class.is_agpr() { phys - AGPR_TAG } else { phys };
     format!("${prefix}{}", phys + k)
 }
 
