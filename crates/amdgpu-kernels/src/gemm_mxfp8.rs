@@ -86,7 +86,8 @@ fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, 
             assert_eq!(gofs[q as usize].eval(&env), want, "DMA rows {rows} thread {th} issue {q}");
         }
     }
-    Dma { issues: gofs.iter().enumerate().map(|(q, g)| (b.bind_i32(ctx.lower(g)), 1024 * q as i32)).collect() }
+    // MUBUF form: voffset (loop invariant, bound here) + the instruction offset 1024 (q % 4) = the global offset; M0 = the group's first 1 KB block
+    Dma { issues: gofs.iter().enumerate().map(|(q, g)| (b.bind_i32(ctx.lower(g) - 1024 * (q as i32 % 4)), 1024 * q as i32)).collect() }
 }
 
 struct Body {
@@ -102,8 +103,8 @@ struct Body {
     a_wave: ValueId,
     b_wave: ValueId,
     sc_wave: ValueId,
-    ptr_a: ValueId,
-    ptr_b: ValueId,
+    rsrc_a: ValueId,
+    rsrc_b: ValueId,
     ptr_sfa: ValueId,
     ptr_sfb: ValueId,
     m_v: ValueId,
@@ -121,23 +122,20 @@ impl PipeBody for Body {
         // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0
         let ka = b.bind_i32(key0.clone() + ev(self.a_org));
         let kb = b.bind_i32((key0.clone() << 4) + ev(self.b_org));
-        for (sh, dma, org, ptr, wave) in [(&self.a_s, &self.a_dma, ka, self.ptr_a, self.a_wave), (&self.b_s, &self.b_dma, kb, self.ptr_b, self.b_wave)] {
+        for (sh, dma, org, rsrc, wave) in [(&self.a_s, &self.a_dma, ka, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, kb, self.rsrc_b, self.b_wave)] {
             let r = sh.at(slot);
             let o = r.off_v(b);
             let sbase = b.bind_i32(o + sh.base as i32 + ev(wave));
             r.write(b, |b| {
-                // M0 = top 1 KB block of each group of 4 issues; the instruction offset -(1024 (3 - q)) moves both addresses, the global side is
-                // compensated (a negative 32-bit pointer offset would wrap)
+                // buffer_load_dwordx4 ... lds: voffset = the lane's loop-invariant offset, soffset = the tile origin (wave uniform), M0 = the first 1 KB
+                // block of each group of 4 issues, instruction offset 1024 (q % 4) moves both the LDS and the global address
                 let mut m0: Option<(i32, ValueId)> = None;
-                for (n, (g, lds)) in dma.issues.iter().enumerate() {
-                    let top = 1024 * (4 * (n as i32 / 4) + 3);
-                    if m0.map(|x| x.0) != Some(top) {
-                        m0 = Some((top, b.bind_i32(ev(sbase) + top)));
+                for (g, lds) in dma.issues.iter() {
+                    let grp = *lds - *lds % 4096;
+                    if m0.map(|x| x.0) != Some(grp) {
+                        m0 = Some((grp, b.bind_i32(ev(sbase) + grp)));
                     }
-                    let comp = top - *lds;
-                    let off = b.bind_i32((ev(org) + ev(*g)) + comp);
-                    let p = b.ptr_add(ptr, off);
-                    b.load_global_lds(p, m0.unwrap().1, -comp, 4);
+                    b.load_buffer_lds(rsrc, *g, org, m0.unwrap().1, (*lds % 4096) as u32, 4);
                 }
             });
         }
@@ -279,6 +277,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let b_dma = dma_plan(b, &ctx, &s_tid, cta_n, &b_glob, 8192);
     let a_wave = b.bind_i32(lane.wave() * (cta_m * 128 / 4) as i32);
     let b_wave = b.bind_i32(lane.wave() * (cta_n * 128 / 4) as i32);
+    // buffer descriptors over A (M K bytes) and the preshuffled B (N K bytes)
+    let rsrc_a = { let n = b.bind_i32(ev(m_v) * ev(k_v)); b.buffer_desc_dyn(ptr_a, n) };
+    let rsrc_b = { let n = b.bind_i32(ev(n_v) * ev(k_v)); b.buffer_desc_dyn(ptr_b, n) };
     let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
     let b_org = b.bind_i32((ev(bx) << lg_n) * ev(k_v));
 
@@ -299,7 +300,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     }
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
-        cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, ptr_a, ptr_b, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd,
+        cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd,
         a_rd, b_rd, zero4, acc: Vec::new(),
     };
     pipe.run(b, Role::All, &mut body);
