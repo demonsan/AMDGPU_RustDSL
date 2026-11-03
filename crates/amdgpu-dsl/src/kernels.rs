@@ -22538,3 +22538,68 @@ pub fn gv_audit_region_trust() -> Function {
     b.end_if();
     b.finish()
 }
+
+// ---------------------------------------------------------------------------------------------
+// probe_agpr_*: AGPR support probes (docs/agpr.md). The three variants compute the same thing: a scaled-MFMA accumulation loop whose A/B
+// fragments come from LDS. `ref` keeps everything in arch VGPRs; `acc` pins the accumulator in AGPRs (acc_cd form MFMA); `full` also reads the
+// fragments with ds_read_b128 straight into AGPRs. Output (identical for all three): per-thread 16 accumulator lanes at o[tid * 64 ..].
+// ---------------------------------------------------------------------------------------------
+fn probe_agpr_kernel(name: &str, pin_acc: bool, pin_frags: bool, acc_base: Option<u32>) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c16 = b.c_i32(16);
+    let c64 = b.c_i32(64);
+    let c8192 = b.c_i32(8192);
+    let mul = b.c_i32(0x01010101);
+    let add = b.c_i32(0x04030201);
+    let mask = b.c_i32(0x3f3f3f3f);
+    let t1 = b.mul_i32(tid, mul);
+    let t2 = b.add_i32(t1, add);
+    let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
+    let data = b.frag4(w, w, w, w);
+    let off = b.mul_i32(tid, c16);
+    let off2 = b.add_i32(off, c8192);
+    b.store_lds_b128(Opnd::Val(off), Opnd::Val(data));
+    b.store_lds_b128(Opnd::Val(off2), Opnd::Val(data));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let mut a8 = b.load_lds_b128x2(Opnd::Val(off), Opnd::Val(off2));
+    let mut b8 = b.load_lds_b128x2(Opnd::Val(off2), Opnd::Val(off));
+    if pin_frags {
+        a8 = b.agpr(a8);
+        b8 = b.agpr(b8);
+    }
+    let zero = b.frag_zero(DType::Frag16);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::Frag16, Opnd::Val(zero))]);
+    if pin_acc {
+        match acc_base {
+            Some(base) => b.pin_agpr_at(vars[1], base),
+            None => b.pin_agpr(vars[1]),
+        }
+    }
+    b.var_mfma_scale(vars[1], a8, b8, 127, 127);
+    sched_end_loop(&mut b, vars[0], n);
+    let row_off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, row_off);
+    for i in 0..16u8 {
+        let l = b.frag16_lane(vars[1], i);
+        let x = b.bitcast_f32(l);
+        b.store_f32(row, 4 * i as u32, x);
+    }
+    b.finish()
+}
+
+pub fn probe_agpr_ref() -> Function {
+    probe_agpr_kernel("probe_agpr_ref", false, false, None)
+}
+pub fn probe_agpr_acc() -> Function {
+    probe_agpr_kernel("probe_agpr_acc", true, false, None)
+}
+pub fn probe_agpr_full() -> Function {
+    probe_agpr_kernel("probe_agpr_full", true, true, None)
+}
+/// Accumulator pinned at a[64:79] (exact placement), fragments in AGPRs.
+pub fn probe_agpr_pinned() -> Function {
+    probe_agpr_kernel("probe_agpr_pinned", true, true, Some(64))
+}

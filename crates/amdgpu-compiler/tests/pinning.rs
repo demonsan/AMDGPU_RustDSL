@@ -42,6 +42,7 @@ fn block(pin_middle: bool) -> MFunction {
         loops: Vec::new(),
         alias: Default::default(),
         elide_fallthrough: false,
+        agpr_pin: Default::default(),
     }
 }
 

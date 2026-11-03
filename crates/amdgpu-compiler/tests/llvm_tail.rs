@@ -73,10 +73,15 @@ fn opcode_probe_every_row_assembles() {
         // Sample function: one vreg per signature slot.
         let mut vregs = Vec::new();
         let mut phys = Vec::new();
-        let (mut vnext, mut snext) = (8u32, 8u32);
+        let (mut vnext, mut snext, mut anext) = (8u32, 8u32, 0u32);
         let mut alloc = |c: RClass, vregs: &mut Vec<RClass>, phys: &mut Vec<u32>| -> u32 {
             let n = c.dwords();
-            let p = if c.is_vector() {
+            let p = if c.is_agpr() {
+                anext = (anext + n - 1) / n * n;
+                let p = AGPR_TAG + anext;
+                anext += n;
+                p
+            } else if c.is_vector() {
                 vnext = (vnext + n - 1) / n * n;
                 let p = vnext;
                 vnext += n;
@@ -112,7 +117,7 @@ fn opcode_probe_every_row_assembles() {
         };
         let mut b = Block::new(0);
         b.insts.push(inst);
-        let scalar: Vec<bool> = vregs.iter().map(|c| !c.is_vector()).collect();
+        let scalar: Vec<bool> = vregs.iter().map(|c| c.is_scalar()).collect();
         let m = MFunction {
             name: "probe".into(),
             args: vec![],
@@ -124,6 +129,7 @@ fn opcode_probe_every_row_assembles() {
             loops: vec![],
             alias: HashMap::new(),
             elide_fallthrough: false,
+            agpr_pin: Default::default(),
         };
         let a = Alloc { scalar, phys, max_v: vnext, max_s: snext };
         let mir = match tail.export_mir(&m, &a) {

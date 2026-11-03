@@ -137,6 +137,8 @@ struct Lowerer {
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
+    /// AGPR requests from the IR (resolved to vregs in inish).
+    agpr_marks: Vec<amdgpu_dsl::AgprMark>,
     /// `scalarize`: DSL values / loop variables that are wave-uniform integers (computed in SGPRs).
     uniform: HashSet<ValueId>,
     uvars: HashSet<amdgpu_dsl::VarId>,
@@ -166,6 +168,7 @@ impl Lowerer {
             loops: Vec::new(),
             alias: HashMap::new(),
             elide_fallthrough: false,
+            agpr_pin: Default::default(),
         };
         mir.blocks.push(Block::new(0));
 
@@ -239,6 +242,7 @@ impl Lowerer {
             use_counts,
             alias_cache: HashMap::new(),
             else_started: HashSet::new(),
+            agpr_marks: f.agpr.clone(),
             uniform: HashSet::new(),
             uvars: HashSet::new(),
             lazy: HashMap::new(),
@@ -253,6 +257,17 @@ impl Lowerer {
             self.push(MInst::new(MOp::SWaitLgkm).imm(0).auto());
         }
         self.set_term(Term::Endpgm);
+        // AGPR requests: record the canonical vregs now (before the clean-up passes can rename anything)
+        for mk in std::mem::take(&mut self.agpr_marks) {
+            let r = match mk.target {
+                amdgpu_dsl::AgprTarget::Var(v) => self.vars.get(v.0 as usize).copied(),
+                amdgpu_dsl::AgprTarget::Val(v) => self.val.get(&v).copied(),
+            };
+            if let Some(r) = r {
+                let c = self.mir.canon(r);
+                self.mir.agpr_pin.insert(c, mk.pin.unwrap_or(crate::agpr::AGPR_ANY));
+            }
+        }
         if opt_on("cmpfold") {
             fold_select_cmp(&mut self.mir);
             dce_cmp_pairs(&mut self.mir);
@@ -2748,6 +2763,7 @@ impl Lowerer {
 fn coalesce(m: &mut MFunction) {
     let classes: Vec<RClass> = m.vregs.clone();
     let aliased = m.alias.clone();
+    let apin = m.agpr_pin.clone();
     let mut uses: HashMap<VReg, u32> = HashMap::new();
     for b in &m.blocks {
         for inst in &b.insts {
@@ -2772,7 +2788,9 @@ fn coalesce(m: &mut MFunction) {
                     let prev_is_move_to_s = prev.op == MOp::VMovB32;
                     // A lane of a fragment is not a standalone value: the whole tuple may still be read.
                     let s_is_alias = aliased.contains_key(&s);
-                    if prev_defs_s && single_use && same_class && !prev_is_move_to_s && !s_is_alias {
+                    // an AGPR-requested vreg keeps its own mov (it becomes a v_accvgpr_* op)
+                    let agpr_involved = apin.contains_key(&aliased.get(&d).map(|a| a.0).unwrap_or(d)) || apin.contains_key(&aliased.get(&s).map(|a| a.0).unwrap_or(s));
+                    if prev_defs_s && single_use && same_class && !prev_is_move_to_s && !s_is_alias && !agpr_involved {
                         if let Some(pd) = b.insts[i - 1].dst.as_mut() {
                             *pd = d;
                         }

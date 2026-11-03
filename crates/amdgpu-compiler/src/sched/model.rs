@@ -90,6 +90,8 @@ pub fn cost(op: MOp) -> OpCost {
         VCvtPkFp8F32 | VCvtPkFp8Lo | VCvtPkFp8Hi | VCvtPkFp8F32Hi | VPermlane32Swap | VExpF32 | VLogF32 | VRcpF32 => {
             c(Valu, 8, 8, Verified)
         }
+        // accumulation-register moves are ordinary VALU issue slots (Unknown: not microbenchmarked yet)
+        VAccvgprRead | VAccvgprWrite | VAccvgprMov => c(Valu, 4, 8, Unknown),
         VMulLoU32 => c(Valu, 16, 16, Unknown),
         VMovFromSPair | VPtrAdd => c(Valu, 8, 8, Experimental),
         VReadFirstLane => c(Valu, 4, 12, Unknown),

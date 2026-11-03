@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <algorithm>
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::printf("HIP error %s at line %d\n", hipGetErrorString(e_), __LINE__); return 1; } } while (0)
@@ -33,6 +34,7 @@ int main(int argc, char** argv) {
   std::vector<uint32_t> out(obytes / 4); CK(hipMemcpy(out.data(), d, obytes, hipMemcpyDeviceToHost));
   uint64_t h = 1469598103934665603ull; for (size_t i = 0; i < 4096 * 4 && i < out.size(); ++i) { h ^= out[i]; h *= 1099511628211ull; }
   double cyc = best * 1e-3 * ghz * 1e9;
+  if (getenv("SH_DUMP")) { int nd = atoi(getenv("SH_DUMP")); for (int i = 0; i < nd; ++i) { float f; std::memcpy(&f, &out[i], 4); std::printf("out[%d]=%08x(%g) ", i, out[i], f); } std::printf("\n"); }
   std::printf("RESULT kernel=%s block=%d n=%d ms=%.4f cycles_per_iter=%.1f hash=%016llx\n", name, block, n, best, cyc / n, (unsigned long long)h);
   return 0;
 }
