@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agpr;
 pub mod asm;
 pub mod asm_check;
 pub mod pin_check;
@@ -110,6 +111,12 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         lower::lower_with_extra(f, &v)?
     } else {
         lower::lower_with_extra(f, extra)?
+    };
+    // AGPR requests (DSL pin_agpr / gpr): move the vregs to the AGPR file and repair the instructions that cannot touch it
+    let base = {
+        let mut b = base;
+        agpr::assign(&mut b)?;
+        b
     };
     let sched_opts = match sched::Options::from_env() {
         Some(o) if o.auto => sched::auto_plan(&base, &o),

@@ -645,6 +645,21 @@ pub struct Arg {
     pub size: u32,
 }
 
+/// What an AGPR request applies to (see FnBuilder::pin_agpr / FnBuilder::agpr).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgprTarget {
+    Var(VarId),
+    Val(ValueId),
+}
+
+/// One request to keep a loop variable / value in the accumulation-register file (gfx90a+/gfx950), optionally at an exact AGPR index
+/// (the analogue of clang's mdgpu_pin_agpr).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgprMark {
+    pub target: AgprTarget,
+    pub pin: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
@@ -659,6 +674,8 @@ pub struct Function {
     pub value_tys: Vec<DType>,
     /// Opt-out of the loop-variable re-read lint (see [`lint`]).
     pub allow_var_rereads: bool,
+    /// AGPR placement requests (empty for every existing kernel).
+    pub agpr: Vec<AgprMark>,
     /// Explicit compile policy (lowering options + scheduler preset). `None` = the compiler derives it from the kernel name (the historical behaviour,
     /// which every existing kernel keeps); kernels written on the tile library set it so their policy does not depend on their name.
     pub compile_profile: Option<CompileProfile>,
@@ -866,6 +883,7 @@ impl FnBuilder {
                 var_tys: Vec::new(),
                 value_tys: Vec::new(),
                 allow_var_rereads: false,
+            agpr: Vec::new(),
                 compile_profile: None,
             },
             expr_consts: Default::default(),
@@ -1112,6 +1130,28 @@ impl FnBuilder {
         self.f.stmts.push(Stmt::EndIf);
     }
 
+    /// Keep the loop variable `var` in the AGPR file (any placement). MFMAs that accumulate into it use the `acc_cd` form; VALU access is
+    /// done through `v_accvgpr_read/write` inserted by the compiler (docs/agpr.md).
+    pub fn pin_agpr(&mut self, var: VarId) {
+        self.f.agpr.push(AgprMark { target: AgprTarget::Var(var), pin: None });
+    }
+
+    /// As `pin_agpr`, at the exact AGPR index `base` (aligned to the register width).
+    pub fn pin_agpr_at(&mut self, var: VarId, base: u32) {
+        self.f.agpr.push(AgprMark { target: AgprTarget::Var(var), pin: Some(base) });
+    }
+
+    /// Mark the register tuple that holds `v` (an LDS/global load result, an MFMA result, a fragment) as AGPR-resident; returns `v`.
+    pub fn agpr(&mut self, v: ValueId) -> ValueId {
+        self.f.agpr.push(AgprMark { target: AgprTarget::Val(v), pin: None });
+        v
+    }
+
+    /// As `agpr`, at the exact AGPR index `base`.
+    pub fn agpr_at(&mut self, v: ValueId, base: u32) -> ValueId {
+        self.f.agpr.push(AgprMark { target: AgprTarget::Val(v), pin: Some(base) });
+        v
+    }
     pub fn finish(self) -> Function {
         self.f
     }
