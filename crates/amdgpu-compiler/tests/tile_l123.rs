@@ -285,6 +285,10 @@ impl PipeBody for Demo3 {
 }
 
 fn demo3() -> Function {
+    demo3_vm(0)
+}
+
+fn demo3_vm(vm_inflight: u8) -> Function {
     let mut b = FnBuilder::new("tile_demo_ring3", 256);
     b.compile_profile(CompileProfile::Default);
     let mut ka = KArgs::new();
@@ -307,7 +311,8 @@ fn demo3() -> Function {
     let kcp = RowsCopy::new(&mut b, ksrc, &ks, roles.wave_in_group, &lane, 4);
     let vcp = RowsCopy::new(&mut b, vsrc, &vs, roles.wave_in_group, &lane, 4);
     let kdcp = DwordRowsCopy::new(&mut b, kdsrc, &kds, roles.wave_in_group, &lane);
-    let pipe = Pipeline::new(Cadence::OneWindow, nkv, kv_len, 128, Ext::ka(0x10).ceil_div(128));
+    let mut pipe = Pipeline::new(Cadence::OneWindow, nkv, kv_len, 128, Ext::ka(0x10).ceil_div(128));
+    pipe.vm_inflight = vm_inflight;
     let mut body = Demo3 { ks, vs, kd: kds, kcp, vcp, kdcp, lane };
     pipe.run(&mut b, Role::All, &mut body);
     b.finish()
@@ -419,4 +424,14 @@ fn t128_style_staging_verifies() {
     let n = |m: &str| c.asm.lines().filter(|l| l.trim_start().starts_with(m)).count();
     assert_eq!(n("global_load_lds_dwordx4"), 3 * 8, "K + V per stage, 3 stages (2 prologue + loop)");
     assert_eq!(n("ds_write_b32"), 3, "the K-scale dword of each stage");
+}
+
+#[test]
+fn counted_vmcnt_keeps_the_next_stage_in_flight() {
+    // one stage = 1 (K scales) + 4 (K) + 4 (V) DMAs per wave: vmcnt(9) at the window end completes tile t+1 and leaves tile t+2 in flight
+    let e = errs(&demo3_vm(9));
+    assert!(e.is_empty(), "vmcnt(9) completes the published stage: {}", e.join("\n"));
+    // vmcnt(10) does not prove tile t+1 complete before its publishing barrier
+    let e = errs(&demo3_vm(10));
+    assert!(e.iter().any(|x| x.contains("GV-TILE") || x.contains("GV-PROTO")), "vmcnt(10) must be rejected: {e:?}");
 }
