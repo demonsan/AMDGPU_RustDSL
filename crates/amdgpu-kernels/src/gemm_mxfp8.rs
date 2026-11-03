@@ -490,6 +490,10 @@ impl Body {
                 }
             }
         }
+        // whatever is left of the stage (more DMA issues than MMAs after the barrier)
+        if let Some((k, s, done, mut cache)) = deferred.take() {
+            self.stage_now(b, &k, &s, done..usize::MAX, &mut cache);
+        }
         if prio {
             b.set_prio(0);
         }
@@ -808,6 +812,9 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_pre8" => GemmConfig { pre_sync_mmas: 8, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_gap2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_gap1" => GemmConfig { dma_gap: 1, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_pre16" => GemmConfig { pre_sync_mmas: 16, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_pre32g2" => GemmConfig { pre_sync_mmas: 32, dma_gap: 2, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_pre32g1" => GemmConfig { pre_sync_mmas: 32, dma_gap: 1, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_late" => GemmConfig { early_scales: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_noxcd" => GemmConfig { xcd_raster: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_u1" => GemmConfig { unroll2: false, ..GemmConfig::v4() },
