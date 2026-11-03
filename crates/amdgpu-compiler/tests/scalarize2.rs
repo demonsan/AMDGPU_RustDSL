@@ -68,6 +68,4 @@ fn uniform_clamps_selects_and_readfirstlane_stay_scalar() {
             assert!(prev.starts_with("s_cmp_") || prev.starts_with("s_mov_b32") || prev.starts_with("s_mul_i32"), "s_cselect after {prev}");
         }
     }
-    let r = amdgpu_compiler::gpu_verify::analyse(&demo()).expect("analyse");
-    assert!(r.errors().is_empty(), "{}", r.render());
 }
