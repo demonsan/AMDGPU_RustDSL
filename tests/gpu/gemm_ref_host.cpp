@@ -125,6 +125,10 @@ int main() {
         launch(); CK(hipDeviceSynchronize());
         std::vector<uint16_t> C((size_t)M * N);
         CK(hipMemcpy(C.data(), dC, C.size() * 2, hipMemcpyDeviceToHost));
+        // REF_DUMP / OURS_DUMP: the whole bf16 output (determinism checks)
+        if (const char* dp = std::getenv((std::string(which) + "_DUMP").c_str())) {
+            if (*dp) { FILE* fp = std::fopen(dp, "wb"); if (fp) { std::fwrite(C.data(), 2, C.size(), fp); std::fclose(fp); } }
+        }
         size_t bad = 0, cnt = 0; double worst = 0, sum = 0, maxref = 0;
         for (int i = 0; i < rows; ++i)
             for (int n = 0; n < N; ++n) {
