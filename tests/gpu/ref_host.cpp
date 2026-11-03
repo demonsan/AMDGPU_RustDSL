@@ -281,6 +281,9 @@ int main(int argc, char** argv) {
         GenVs::Args a{};
         std::memcpy(&a, args, sizeof(a));
         a.ptr_o = outp;
+        // 0x080 is the Q tile stride used by the hand ABI but not a declared Tensor scalar;
+        // preserve it in the generated struct's padding (the kernel metadata still contains it).
+        *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(&a) + 0x080) = (uint32_t)((size_t)stride_rows * H * D);
         GenVs::BufferSizes sz{};
         sz.ptr_q = nq; sz.ptr_k = nk; sz.ptr_v = nk; sz.ptr_o = no * 2;
         sz.ptr_q_descale = qs.size(); sz.ptr_k_descale = ks.size(); sz.ptr_v_descale = 4096;
@@ -295,6 +298,7 @@ int main(int argc, char** argv) {
         GenT::Args a{};
         std::memcpy(&a, args, sizeof(a));
         a.ptr_o = outp;
+        *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(&a) + 0x080) = (uint32_t)((size_t)stride_rows * H * D);
         GenT::BufferSizes sz{};
         sz.ptr_q = nq; sz.ptr_k = nk; sz.ptr_v = nk; sz.ptr_o = no * 2;
         sz.ptr_q_descale = qs.size(); sz.ptr_k_descale = ks.size(); sz.ptr_v_descale = 4096;
