@@ -122,6 +122,7 @@ impl LdsSlotPart<'_> {
             (16, 1, false) => b.load_lds_b128(Opnd::Val(addrs[0])),
             (16, 2, false) => b.load_lds_b128x2(Opnd::Val(addrs[0]), Opnd::Val(addrs[1])),
             (4, 1, false) => b.load_lds_b32(Opnd::Val(addrs[0])),
+            (8, 1, false) => b.load_lds_b64(Opnd::Val(addrs[0])),
             (8, 4, true) => b.load_lds_tr_b8x4(addrs[0], addrs[1], addrs[2], addrs[3]),
             (8, 1, true) => b.load_lds_tr_b8(Opnd::Val(addrs[0])),
             _ => panic!("LdsSlotPart::read: no IR form for the atom {}", a.name),

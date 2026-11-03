@@ -191,7 +191,7 @@ impl Lowerer {
                     count(base);
                     count(value);
                 }
-                Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } => {
+                Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } | Stmt::StoreLdsB64 { addr, value } => {
                     count(addr);
                     count(value);
                 }
@@ -1716,6 +1716,11 @@ impl Lowerer {
                     let v = self.as_v4(*value)?;
                     self.push(MInst::new(MOp::LdsWriteB128).srcreg(a).srcreg(v).imm(off));
                 }
+                Stmt::StoreLdsB64 { addr, value } => {
+                    let (a, off) = self.lds_addr(*addr)?;
+                    let v = self.as_v2(*value)?;
+                    self.push(MInst::new(MOp::LdsWriteB64).srcreg(a).srcreg(v).imm(off));
+                }
                 Stmt::StoreLdsB32 { addr, value } => {
                     let (a, off) = self.lds_addr(*addr)?;
                     let v = self.as_v1(*value)?;
@@ -2262,6 +2267,13 @@ impl Lowerer {
                 self.touch(&[Src::Reg(r)]);
                 let d = self.new_vreg(RClass::S1);
                 self.push(MInst::new(MOp::VReadFirstLane).def(d).srcreg(r));
+                self.val.insert(dst, d);
+            }
+            Op::LoadLdsB64 { addr } => {
+                let (a, off) = self.lds_addr(*addr)?;
+                let d = self.new_vreg(RClass::V2);
+                self.push(MInst::new(MOp::LdsReadB64).def(d).srcreg(a).imm(off));
+                self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
             Op::LoadLdsB32 { addr } => {
@@ -3104,7 +3116,7 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
     fn load_op(op: MOp) -> bool {
         matches!(
             op,
-            MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64TrB8 | MOp::GlobalLoadU16
+            MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64 | MOp::LdsReadB64TrB8 | MOp::GlobalLoadU16
                 | MOp::GlobalLoadF32 | MOp::GlobalLoadB128 | MOp::GlobalLoadB128S | MOp::GlobalLoadF32S
         )
     }

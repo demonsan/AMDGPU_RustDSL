@@ -106,6 +106,8 @@ pub fn cost(op: MOp) -> OpCost {
         VMfmaScale16x16x128Fp8 => c(Mfma, 32, 48, Experimental),
         // LDS (E): b128 issue 8, b32 4, tr_b8 ~6, write b128 ~26; latency ~52 (reads) / ~75 (write).
         LdsReadB128 => c(Lds, 8, 52, Experimental),
+        LdsReadB64 => c(Lds, 4, 48, Experimental),
+        LdsWriteB64 => c(Lds, 8, 4, Experimental),
         LdsReadB32 => c(Lds, 4, 52, Experimental),
         LdsReadB64TrB8 => c(Lds, 6, 52, Experimental),
         LdsWriteB128 => c(Lds, 26, 4, Experimental),
