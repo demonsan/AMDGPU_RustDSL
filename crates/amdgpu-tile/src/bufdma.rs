@@ -18,8 +18,8 @@ pub struct BufDmaPart {
     bytes: i64,
     voffs: Vec<I32>,
     m0s: Vec<I32>,
-    /// per issue: (voffset index, M0 index, M0 constant, immediate)
-    issues: Vec<(usize, usize, i64, i64)>,
+    /// per issue: (voffset index, M0 index, M0 constant, immediate, static soffset delta)
+    issues: Vec<(usize, usize, i64, i64, i64)>,
 }
 
 fn intern(v: &mut Vec<Ix>, x: Ix) -> usize {
@@ -80,11 +80,20 @@ pub fn partition_buffer_dma(b: &mut FnBuilder, ctx: &Ctx, atom: CopyAtom, tv: &L
         let (_, dq0) = sd(0, q * vec);
         let step = dq0 - d00;
         let imm = if atom.imm.fits(step) { step } else { 0 };
-        let vo = intern(&mut voffs, s.add_c(-imm));
+        // the vendor form: one voffset for every issue whose source differs from an earlier one by a thread-independent, non-negative amount;
+        // that amount goes into the soffset (one SALU add per tile)
+        let x = s.add_c(-imm);
+        let (vo, sdelta) = match voffs.iter().enumerate().find_map(|(i, y)| match x.sub(y) {
+            Ix::C(k) if k >= 0 => Some((i, k)),
+            _ => None,
+        }) {
+            Some(found) => found,
+            None => (intern(&mut voffs, x), 0),
+        };
         let m0 = dd.subst(*lane_id, &Ix::C(0), d).add_c(-imm);
         let (m0d, m0c) = m0.split_const();
         let mi = intern(&mut m0s, m0d);
-        out.push((vo, mi, m0c, imm));
+        out.push((vo, mi, m0c, imm, sdelta));
     }
     let voffs = voffs.iter().map(|x| ctx.bind(b, x)).collect();
     let m0s = m0s.iter().map(|x| { let v = ctx.bind(b, x); if sh.base == 0 { v } else { b.let_i32(v + sh.base as i32) } }).collect();
@@ -98,17 +107,22 @@ impl BufDmaPart {
         let off = slot.off_v(b);
         let m0b: Vec<I32> = self.m0s.iter().map(|m| if off.as_const() == Some(0) { m.clone() } else { b.let_i32(m + &off) }).collect();
         slot.write(b, |b| {
-            for &(vo, mi, mc, imm) in &self.issues {
+            for &(vo, mi, mc, imm, sd) in &self.issues {
                 let lds: ValueId = if mc == 0 { b.bind_i32(&m0b[mi]) } else { b.bind_i32(&m0b[mi] + mc as i32) };
                 let v = self.voffs[vo].clone();
                 let vv = b.bind_i32(v);
+                let so: Opnd = if sd == 0 { soff.into() } else { Opnd::Val(b.let_(amdgpu_dsl::Op::AddI32(soff.into(), Opnd::I32(sd as i32)))) };
                 match self.bytes {
-                    16 => b.buffer_load_lds_b128(rsrc, vv, soff, lds, imm as u32),
-                    4 => b.buffer_load_lds_b32(rsrc, vv, soff, lds, imm as u32),
+                    16 => b.buffer_load_lds_b128(rsrc, vv, so, lds, imm as u32),
+                    4 => b.buffer_load_lds_b32(rsrc, vv, so, lds, imm as u32),
                     n => panic!("BufDmaPart: no {n}-byte LDS-direct buffer load"),
                 }
             }
         });
+    }
+    /// Distinct per-lane voffsets (VGPRs held for the whole kernel).
+    pub fn voffsets(&self) -> usize {
+        self.voffs.len()
     }
     /// Instructions per tile.
     pub fn len(&self) -> usize {
