@@ -61,12 +61,13 @@ fn declare_abi(b: &mut FnBuilder) {
 
 /// One DMA stage of a [rows x 128 B] tile: per issue the global offset (relative to the tile origin) and the M0 offset inside the slot.
 struct Dma {
-    issues: Vec<(I32, i32)>,
+    /// per issue: the lane's global offset (bound once, loop invariant) and the LDS offset of its 1 KB block in the wave's slice
+    issues: Vec<(ValueId, i32)>,
 }
 
 /// LDS byte `d = 1024 (issues (tid / 64) + q) + 16 (tid % 64)` holds tile element `smem^-1(d)`, so the source offset is `glob o right_inverse(smem)`;
 /// proved here for sampled threads against a direct search of the LDS layout.
-fn dma_plan(ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64) -> Dma {
+fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64) -> Dma {
     let issues = rows * 128 / 1024 / 4;
     let sm = smem_tile(rows);
     let tv = make_layout(tup![tup![64, 4], tup![16, issues]], tup![tup![16, 1024 * issues], tup![1, 1024]]);
@@ -85,7 +86,7 @@ fn dma_plan(ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64) -> Dm
             assert_eq!(gofs[q as usize].eval(&env), want, "DMA rows {rows} thread {th} issue {q}");
         }
     }
-    Dma { issues: gofs.iter().enumerate().map(|(q, g)| (ctx.lower(g), 1024 * q as i32)).collect() }
+    Dma { issues: gofs.iter().enumerate().map(|(q, g)| (b.bind_i32(ctx.lower(g)), 1024 * q as i32)).collect() }
 }
 
 struct Body {
@@ -125,11 +126,18 @@ impl PipeBody for Body {
             let o = r.off_v(b);
             let sbase = b.bind_i32(o + sh.base as i32 + ev(wave));
             r.write(b, |b| {
-                for (g, lds) in &dma.issues {
-                    let off = b.bind_i32(ev(org) + g.clone());
+                // M0 = top 1 KB block of each group of 4 issues; the instruction offset -(1024 (3 - q)) moves both addresses, the global side is
+                // compensated (a negative 32-bit pointer offset would wrap)
+                let mut m0: Option<(i32, ValueId)> = None;
+                for (n, (g, lds)) in dma.issues.iter().enumerate() {
+                    let top = 1024 * (4 * (n as i32 / 4) + 3);
+                    if m0.map(|x| x.0) != Some(top) {
+                        m0 = Some((top, b.bind_i32(ev(sbase) + top)));
+                    }
+                    let comp = top - *lds;
+                    let off = b.bind_i32((ev(org) + ev(*g)) + comp);
                     let p = b.ptr_add(ptr, off);
-                    let m0 = b.bind_i32(ev(sbase) + *lds);
-                    b.load_global_lds(p, m0, 0, 4);
+                    b.load_global_lds(p, m0.unwrap().1, -comp, 4);
                 }
             });
         }
@@ -267,8 +275,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
     // ---- DMA (A row-major, B preshuffled), wave parts of M0, CTA origins ----
     let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
     let b_glob = make_layout(tup![tup![16, cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]);
-    let a_dma = dma_plan(&ctx, &s_tid, cta_m, &a_glob, 8192);
-    let b_dma = dma_plan(&ctx, &s_tid, cta_n, &b_glob, 8192);
+    let a_dma = dma_plan(b, &ctx, &s_tid, cta_m, &a_glob, 8192);
+    let b_dma = dma_plan(b, &ctx, &s_tid, cta_n, &b_glob, 8192);
     let a_wave = b.bind_i32(lane.wave() * (cta_m * 128 / 4) as i32);
     let b_wave = b.bind_i32(lane.wave() * (cta_n * 128 / 4) as i32);
     let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
