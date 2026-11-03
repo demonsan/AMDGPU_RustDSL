@@ -8,6 +8,7 @@ members = [
     "crates/amdgpu-layout",
     "crates/amdgpu-isa",
     "crates/amdgpu-tile",
+    "crates/amdgpu-kernels",
 ]
 
 [workspace.package]
