@@ -578,12 +578,13 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                 }
                 MOp::VMfmaScale16x16x128Fp8 => {
                     let want = [RClass::V8, RClass::V8, RClass::V4, RClass::V1, RClass::V1];
-                    if inst.dst.map(|d| m.vreg_class(d)) != Some(RClass::V4) {
-                        errs.push(format!("block {bi} inst {ii}: 16x16x128 scaled mfma dst must be V4"));
+                    // A/B/C/D may be AGPR tuples of the same width (agpr.rs); the scales are VGPRs
+                    if inst.dst.map_or(true, |d| !m.vreg_class(d).same_width_vector(RClass::V4)) {
+                        errs.push(format!("block {bi} inst {ii}: 16x16x128 scaled mfma dst must be V4/A4"));
                     }
                     for (k, w) in want.iter().enumerate() {
                         match inst.srcs.get(k) {
-                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) if (k < 3 && m.vreg_class(*r).same_width_vector(*w)) || m.vreg_class(*r) == *w => {}
                             _ => errs.push(format!("block {bi} inst {ii}: 16x16x128 scaled mfma operand {k} must be a {w:?} register")),
                         }
                     }
