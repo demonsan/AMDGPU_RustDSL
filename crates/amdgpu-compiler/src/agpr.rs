@@ -31,7 +31,7 @@ pub fn legal_src(op: MOp, k: usize) -> bool {
         LdsWriteB32 | LdsWriteB128 => k == 1,
         GlobalStoreU16 | GlobalStoreF32 | GlobalStoreF32x4 | GlobalStoreF32x2 | GlobalStoreF32Sc1 | GlobalStoreF32x4Sc1 => k == 1,
         BufferStoreDwordX1 | BufferStoreDwordX2 | BufferStoreDwordX4 => k == 0,
-        VMfma16x16x16F16 | VMfma32x32x8F16 | VMfma16x16x32Fp8 | VMfma32x32x16Fp8 | VMfmaScale32x32x64Fp8 | VMfma32x32x64Fp8 => k <= 2,
+        VMfma16x16x16F16 | VMfma32x32x8F16 | VMfma16x16x32Fp8 | VMfma32x32x16Fp8 | VMfmaScale32x32x64Fp8 | VMfma32x32x64Fp8 | VMfmaScale16x16x128Fp8 => k <= 2,
         VMfma32x32x8F16Z | VMfmaScale32x32x64Fp8Z | VMfma32x32x64Fp8Z => k <= 1,
         VAccvgprRead | VAccvgprMov => k == 0,
         _ => false,
@@ -42,7 +42,7 @@ pub fn is_mfma(op: MOp) -> bool {
     use MOp::*;
     matches!(
         op,
-        VMfma16x16x16F16 | VMfma32x32x8F16 | VMfma32x32x8F16Z | VMfma16x16x32Fp8 | VMfma32x32x16Fp8 | VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z | VMfma32x32x64Fp8 | VMfma32x32x64Fp8Z
+        VMfma16x16x16F16 | VMfma32x32x8F16 | VMfma32x32x8F16Z | VMfma16x16x32Fp8 | VMfma32x32x16Fp8 | VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z | VMfma32x32x64Fp8 | VMfma32x32x64Fp8Z | VMfmaScale16x16x128Fp8
     )
 }
 
