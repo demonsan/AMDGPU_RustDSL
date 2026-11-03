@@ -22752,3 +22752,94 @@ pub fn probe_agpr_reload_ref() -> Function {
 pub fn probe_agpr_reload() -> Function {
     probe_agpr_reload_kernel("probe_agpr_reload", true)
 }
+
+/// The GEMM reload pattern with several fragment pairs: MFMA j reads (av[j], bv[j]); right after it both are reloaded in place for the next tile. The reload reads of one pair are
+/// 4 ds_reads, so the next iteration's MFMA j needs only the reads of pair j: with the scoreboard wait pass the waits are partial (`lgkmcnt(12)`, `(8)`, `(4)`, `(0)`), not `lgkmcnt(0)`.
+fn probe_agpr_reload4_kernel(name: &str, inplace: bool) -> Function {
+    let (mut b, o, n, tid) = sched_begin(name);
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c16 = b.c_i32(16);
+    let c64 = b.c_i32(64);
+    let c8192 = b.c_i32(8192);
+    let c127 = b.c_i32(127);
+    let mul = b.c_i32(0x01010101);
+    let add = b.c_i32(0x04030201);
+    let mask = b.c_i32(0x3f3f3f3f);
+    let t1 = b.mul_i32(tid, mul);
+    let t2 = b.add_i32(t1, add);
+    let w = b.let_(Op::AndI32(Opnd::Val(t2), Opnd::Val(mask)));
+    let w1 = b.add_i32(w, mul);
+    let data0 = b.frag4(w, w, w, w);
+    let data1 = b.frag4(w1, w1, w1, w1);
+    let off = b.mul_i32(tid, c16);
+    let off2 = b.add_i32(off, c8192);
+    b.store_lds_b128(Opnd::Val(off), Opnd::Val(data0));
+    b.store_lds_b128(Opnd::Val(off2), Opnd::Val(data1));
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let zero = b.frag_zero(DType::Frag4);
+    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(c0))];
+    for _ in 0..4 {
+        inits.push((DType::Frag4, Opnd::Val(zero)));
+    }
+    for j in 0..8 {
+        let (lo, hi) = if j % 2 == 0 { (off, off2) } else { (off2, off) };
+        let f = b.load_lds_b128x2(Opnd::Val(lo), Opnd::Val(hi));
+        inits.push((DType::Frag8, Opnd::Val(f)));
+    }
+    let vars = b.begin_loop(&inits);
+    let it = vars[0];
+    let acc: Vec<VarId> = vars[1..5].to_vec();
+    let av: Vec<VarId> = vars[5..9].to_vec();
+    let bv: Vec<VarId> = vars[9..13].to_vec();
+    if inplace {
+        for v in acc.iter().chain(av.iter()).chain(bv.iter()) {
+            b.pin_agpr(*v);
+        }
+    }
+    let nxt = b.add_i32(it, c1);
+    let par = b.let_(Op::AndI32(Opnd::Val(nxt), Opnd::Val(c1)));
+    let r0 = b.mul_i32(par, c8192);
+    let r1 = b.xor_i32(r0, c8192);
+    let la = b.add_i32(off, r0);
+    let lb = b.add_i32(off, r1);
+    for j in 0..4 {
+        b.var_mfma_scale16(acc[j], Opnd::Var(av[j]), Opnd::Var(bv[j]), c127, c127, 0, 0);
+        let (x, y) = if j % 2 == 0 { (la, lb) } else { (lb, la) };
+        if inplace {
+            let na = b.load_lds_b128x2(Opnd::Val(x), Opnd::Val(y));
+            b.set_var(av[j], na);
+            let nb = b.load_lds_b128x2(Opnd::Val(y), Opnd::Val(x));
+            b.set_var(bv[j], nb);
+        } else {
+            let a_lo = b.load_lds_b128(Opnd::Val(x));
+            let a_hi = b.load_lds_b128(Opnd::Val(y));
+            let na = b.cat_frag8(a_lo, a_hi);
+            b.set_var(av[j], na);
+            let b_lo = b.load_lds_b128(Opnd::Val(y));
+            let b_hi = b.load_lds_b128(Opnd::Val(x));
+            let nb = b.cat_frag8(b_lo, b_hi);
+            b.set_var(bv[j], nb);
+        }
+    }
+    sched_end_loop(&mut b, it, n);
+    let row_off = b.mul_i32(tid, c64);
+    let row = b.ptr_add(o, row_off);
+    for (q, v) in acc.iter().enumerate() {
+        for i in 0..4u8 {
+            let l = b.frag4_lane(*v, i);
+            let x = b.bitcast_f32(l);
+            b.store_f32(row, 4 * (4 * q as u32 + i as u32), x);
+        }
+    }
+    b.finish()
+}
+
+pub fn probe_agpr_reload4_ref() -> Function {
+    probe_agpr_reload4_kernel("probe_agpr_reload4_ref", false)
+}
+pub fn probe_agpr_reload4() -> Function {
+    probe_agpr_reload4_kernel("probe_agpr_reload4", true)
+}
