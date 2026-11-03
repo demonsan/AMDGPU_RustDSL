@@ -610,20 +610,28 @@ impl PipeBody for Body {
         // the panel DMA was issued before the two tile stages: wait for it only (in-order VMEM returns)
         let after = 2 * (self.a_dma.issues.len() + self.b_dma.issues.len());
         b.wait_vm(after.min(63) as u8);
+        // publish the panel (the protocol is cross-wave), gather every round, one barrier, write every round (the pipeline prologue barrier
+        // publishes the result): 2 barriers in all, the tiles' DMA keeps running behind
+        b.barrier();
         let pr = p.sh.at(&SlotIdx::new(0, 0));
+        let mut packed: Vec<(ValueId, ValueId)> = Vec::new();
         for round in 0..(PANEL_KB / 8) as i32 {
             let words: Vec<ValueId> = pr.read(b, |b| (0..8).map(|i| { let a = b.bind_i32(ev(job.rd0) + (2048 * round + 16 * i)); b.load_lds_b32(a) }).collect());
             let bs: Vec<ValueId> = words.iter().map(|w| b.bind_i32(ev(*w).lshr(ev(job.sh_r)) & 255)).collect();
             let d0 = b.bind_i32(ev(bs[0]) | (ev(bs[1]) << 8) | (ev(bs[2]) << 16) | (ev(bs[3]) << 24));
             let d1 = b.bind_i32(ev(bs[4]) | (ev(bs[5]) << 8) | (ev(bs[6]) << 16) | (ev(bs[7]) << 24));
-            // the same wave read these bytes: in-order LDS, the data dependency is the only wait
-            pr.write(b, |b| {
-                let a0 = b.bind_i32(ev(job.wr0) + 2048 * round);
-                let a1 = b.bind_i32(ev(job.wr0) + 2048 * round + 4);
-                b.store_lds_b32(a0, d0);
-                b.store_lds_b32(a1, d1);
-            });
+            packed.push((d0, d1));
         }
+        b.wait_lds(0);
+        b.barrier();
+        pr.write(b, |b| {
+            for (round, (d0, d1)) in packed.iter().enumerate() {
+                let a0 = b.bind_i32(ev(job.wr0) + 2048 * round as i32);
+                let a1 = b.bind_i32(ev(job.wr0) + 2048 * round as i32 + 4);
+                b.store_lds_b32(a0, *d0);
+                b.store_lds_b32(a1, *d1);
+            }
+        });
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         self.in_loop = true;
