@@ -307,7 +307,7 @@ impl Body {
         let mut deferred = self.deferred.take();
         let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
         let per = (total + 2 * nm - 1) / (2 * nm);
-        let prio = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noprio"));
+        let prio = std::env::var("FMHA_ABLATE").map_or(false, |v| v.split(",").any(|t| t == "prio"));
         if prio {
             b.set_prio(1);
         }
@@ -553,7 +553,7 @@ impl PipeBody for Body {
             (0..nm).map(|i| (b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0]))), 0u8)).collect()
         };
         let sb = b.bind_i32(ev(wb).lshr(sbsh));
-        let prio = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noprio"));
+        let prio = std::env::var("FMHA_ABLATE").map_or(false, |v| v.split(",").any(|t| t == "prio"));
         if prio {
             b.set_prio(1);
         }
@@ -601,7 +601,7 @@ pub fn gemm_mxfp8_bs_v2() -> Function {
 /// v3: the vendor tile (CTA 256 x 256, 128 x 128 per wave, 64 accumulators): operand fragments in AGPRs, half of the accumulators pinned in AGPRs,
 /// 2-slot LDS ring (2 x 64 KB).
 pub fn gemm_mxfp8_bs_v3() -> Function {
-    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("nodefer")), scale_panel: std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("panel")) })
+    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("nodefer")), scale_panel: !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("nopanel")) })
 }
 
 /// v4: v3 with the register-staged 2-slot cadence (prefetch distance 2): all 16 operand fragments of a tile are read into AGPRs, the slot is refilled
@@ -631,7 +631,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let by0 = b.let_(Op::WorkgroupIdY); // M tile
     // XCD-aware raster (FMHA_ABLATE=xcd, experiment): workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
     // give every XCD whole 4 x 4 blocks of tiles (4 A + 4 B panels instead of all A panels). Only for a 16 x 16 tile grid here; identity otherwise.
-    let (bx, by) = if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("xcd")) {
+    let (bx, by) = if !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noxcd")) {
         let okv = b.bind_i32((ev(n_v) ^ (16 * cfg.cta_n) as i32) | (ev(m_v) ^ (16 * cfg.cta_m) as i32));
         let id = b.bind_i32(ev(bx0) + (ev(by0) << 4));
         let loc = b.bind_i32(ev(id).lshr(3));
