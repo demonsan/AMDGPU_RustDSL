@@ -210,16 +210,15 @@ impl Pipeline {
         b.break_if(stop);
         if self.unroll2 && self.cadence == Cadence::RegStaged {
             // first half: tile `it` (even) in slot 0
-            let it0 = b.bind_i32(varx(it));
-            self.iter_rs(b, role, body, it0, 0, true);
-            let it1 = b.bind_i32(ev(it0) + 1);
+            self.iter_rs(b, role, body, Opnd::Var(it), 0, true);
+            let it1 = b.bind_i32(varx(it) + 1);
             b.set_var(it, it1);
             let one = b.c_i32(1);
             b.set_var(idx, one);
             let stop1 = b.bind_cond(!ev(it1).lt(&nkv_m1));
             b.break_if(stop1);
             // second half: tile it + 1 (odd) in slot 1
-            self.iter_rs(b, role, body, it1, 1, true);
+            self.iter_rs(b, role, body, Opnd::Val(it1), 1, true);
             let it2 = b.bind_i32(ev(it1) + 1);
             b.set_var(it, it2);
             let zero = b.c_i32(0);
@@ -264,12 +263,12 @@ impl Pipeline {
     }
 
     /// One `RegStaged` iteration of tile `it` (a bound value) in the static ring slot `slot` (unroll2).
-    fn iter_rs(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: ValueId, slot: i32, staged: bool) {
+    fn iter_rs(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: i32, staged: bool) {
         let nkv = ev(self.nkv);
-        let it_p1 = b.let_i32(ev(it) + 1);
-        let it_p2 = b.let_i32(ev(it) + 2);
+        let it_p1 = b.let_i32(super::ox(it) + 1);
+        let it_p2 = b.let_i32(super::ox(it) + 2);
         let t = TileIt {
-            it: Opnd::Val(it),
+            it,
             cur: SlotIdx::new(Opnd::I32(slot), it),
             next: SlotIdx::new(Opnd::I32(1 - slot), b.bind_opnd(&it_p1)),
             n2: Some(SlotIdx::new(Opnd::I32(slot), b.bind_opnd(&it_p2))),
