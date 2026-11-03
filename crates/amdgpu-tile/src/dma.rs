@@ -54,7 +54,9 @@ pub fn partition_dma(b: &mut FnBuilder, ctx: &Ctx, atom: CopyAtom, lane: &Ix, wa
         assert!(a.bits(d) & c as u64 == 0, "partition_dma: lane bytes and the instruction step overlap");
         row_c.push(c / row_bytes);
         // column of the destination byte, un-swizzled: (a mod row_bytes) ^ s(row of a + c)
-        let col = a.add_c(c).mod_c(row_bytes, d).xor(&view.swz.term_ix(&a.add_c(c), d));
+        // in 16-byte chunks (the swizzle moves whole chunks): (chunk ^ s) << 4 keeps the verifier's interval of the column inside the row
+        let chunk = a.add_c(c).mod_c(row_bytes, d).div_c(16, d).xor(&view.swz.term_ix_down(&a.add_c(c), d, 4));
+        let col = chunk.shl(4);
         let i = match cols.iter().position(|x| *x == col) {
             Some(i) => i,
             None => {
