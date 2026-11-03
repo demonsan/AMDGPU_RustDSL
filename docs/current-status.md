@@ -22,11 +22,11 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
   `_vs128` 每 CU 64 blocks **446.4**（8 布局中位数 449.9，旧手写 453.7）；铺满网格 B4H8S2048 **1421.3** / B1H8S8192 **1978.6**（≈0.84× 厂商）；
   B2H8S2048 `_t128` **1025.0**。
 - **MXFP8 blockscale GEMM**：`gemm_mxfp8_bs_v4`（`crates/amdgpu-kernels`）对照 aiter PR #6696 4-wave pin-AGPR，4096×4096×8192：
-  **3116 vs 3267 TF/s = 0.954×**（截至 `v5.0-route-b` 的最终门禁，差距仍在优化），`tools/gemm_gate.sh` PASS（§4.7）。
+  **3130 vs 3275 TF/s = 0.956×**（v5.1 最终门禁；追平尝试已收口，证据见分析文档 §12），`tools/gemm_gate.sh` PASS（§4.7）。
 - **AGPR 已支持**（寄存器类 A1–A16、acc_cd MFMA、`ds_read_b128 → AGPR`、`v_accvgpr_*`、统一 512 寄存器预算与 hazard）：[`agpr.md`](agpr.md)。
 - **主机侧生成**：`amdc gen-host` 从 kernel 合同生成 C++ 启动/ABI 头与 JSON（[`host-gen.md`](host-gen.md)）；出厂 `ref_host` 使用生成的命名字段。
 - 精度 **mean 8.3e-4**（厂商 1.5–2.9e-3）；15/15 形状、64 行 bad=0；确定性与 split 压力全过。
-- `cargo test` **65 个测试目标 / 306 项全绿**。
+- `cargo test` **66 个测试目标 / 311 项全绿**。
 - 严格 GPU 语义证书：`--shipped` **24 trusted assumes / 100 trusted contracts / 0 unproven**；`--legacy` **44 / 216 / 0**；GEMM v3 / v4 **3 / 19 / 0**。
 
 ---
@@ -190,7 +190,7 @@ v3 asm md5：`68d2832b` / `f5a43b09` / `e4fc18b1` / `24a95a51`。`_t128` 默认�
 | 项 | 数值（截至 `v5.0-route-b`） |
 |---|---|
 | kernel / 形状 | `gemm_mxfp8_bs_v4`，M=N=4096、K=8192，256×256×128 CTA tile，4 wave，`v_mfma_scale_f32_16x16x128_f8f6f4`（swap_ab），A/B 片段与部分 C 在 AGPR |
-| 性能 vs 厂商（同轮） | **3116 vs 3267 TF/s = 0.954×**（最终门禁）；演进与分析见 [`mxfp8-gemm-4wave-analysis.md`](mxfp8-gemm-4wave-analysis.md) §11、[`gemm-issue-comparison.md`](gemm-issue-comparison.md) |
+| 性能 vs 厂商（同轮） | **3130 vs 3275 TF/s = 0.956×**（v5.1 最终门禁，交替 7 进程中位数）；稳定区间 0.94–0.96×，追平尝试与上限证据见 §12；演进与分析见 [`mxfp8-gemm-4wave-analysis.md`](mxfp8-gemm-4wave-analysis.md) §11、[`gemm-issue-comparison.md`](gemm-issue-comparison.md) |
 | 门禁 | `tools/gemm_gate.sh`：BUILD / VERIFY（strict 0 错误 0 警告，3 trusted assumes / 19 contracts / 0 unproven）/ ACC（4096²×8192、8192×7168×7168、1280×6144×7168 GEMM_OK）/ DET 3/3 / PERF —— **PASS** |
 | 编译器配套 | AGPR 寄存器类与 acc_cd MFMA（[`agpr.md`](agpr.md)）、SALU 地址链 `scalarize2`、`ds_read_b64`/`ds_write_b64`、验证器 possible-bits 与盒子规则、`Pipeline::vm_inflight` + 计数版 `vmcnt(n)` |
 
@@ -223,7 +223,7 @@ v3 asm md5：`68d2832b` / `f5a43b09` / `e4fc18b1` / `24a95a51`。`_t128` 默认�
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **65 个目标 / 306 项全绿**。主要测试文件：`tail_invariance`、`mir_invariants`、`rust_safety`、`register_accounting`、
+- **测试**：`cargo test` **66 个目标 / 311 项全绿**。主要测试文件：`tail_invariance`、`mir_invariants`、`rust_safety`、`register_accounting`、
   `asm_assembles`、`hazard_*`、`phys_waw`、`ra_reaching`、`pin*`、`var_lint`、`gpu_*`（语义/协议/攻击）、`gv_bits`、`agpr`、`mfma16x16x128`、
   `lds_b64`、`scalarize2`、`gemm_mxfp8`、`tile_l*`；布局层 `crates/amdgpu-layout/tests/{algebra,fmha_vs128}.rs`、
   `crates/amdgpu-tile/tests/{address_equality,dma_equality,bufdma}.rs`（发射 IR 逐 lane 对照旧 reader/copy）；safe-asm `tests/ui` 29 个用例。
@@ -242,7 +242,7 @@ v3 asm md5：`68d2832b` / `f5a43b09` / `e4fc18b1` / `24a95a51`。`_t128` 默认�
 ```bash
 # 构建与测试
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                 # 期望 65 targets / 306 tests 全绿
+bash tools/container/cargo.sh test                 # 期望 66 targets / 311 tests 全绿
 
 # 发射 kernel 并汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --out vs128.s
