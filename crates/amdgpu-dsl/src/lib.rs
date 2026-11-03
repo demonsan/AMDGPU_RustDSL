@@ -684,7 +684,7 @@ pub struct Function {
     pub compile_profile: Option<CompileProfile>,
     /// Extra lowering option tokens for this kernel (the AMDC_LOWER_OPTS vocabulary, e.g. lgkmn), on top of its profile - so nothing is name-keyed.
     pub lower_opts: Vec<String>,
-    /// Scheduler option tokens (the AMDC_SCHED_OPTS vocabulary: ewait,ldshoist,xbar,hoist=N,limit=N,...); Some turns the scheduler on for this kernel (unless AMDC_SCHED=0).
+    /// Scheduler option tokens (the AMDC_SCHED_OPTS vocabulary: rewait,ldshoist,xbar,hoist=N,limit=N,...); Some turns the scheduler on for this kernel (unless AMDC_SCHED=0).
     pub sched_opts: Option<String>,
 }
 
