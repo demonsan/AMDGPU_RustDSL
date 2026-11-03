@@ -56,9 +56,9 @@ inline bool fail(std::string* err, const char* code, const std::string& msg) {
 inline bool validate(const Args& a, const BufferSizes& sizes, dim3 grid, const Symbols& syms, std::string* err = nullptr) {
     auto ka = [&](uint32_t o) -> int64_t { return ka_at(a, o); };
     (void)grid; (void)syms; (void)sizes;
-    if (sizes.ptr_ohat < (uint64_t)(((ka_at(0x20u)*ka_at(0x18u))*512LL))) { return fail(err, "GV-HOST-EXTENT", "ptr_ohat: buffer ptr_ohat smaller than declared allocation"); }
-    if (sizes.ptr_lse < (uint64_t)(((ka_at(0x20u)*ka_at(0x18u))*4LL))) { return fail(err, "GV-HOST-EXTENT", "ptr_lse: buffer ptr_lse smaller than declared allocation"); }
-    if (sizes.ptr_out < (uint64_t)((ka_at(0x18u)*256LL))) { return fail(err, "GV-HOST-EXTENT", "ptr_out: buffer ptr_out smaller than declared allocation"); }
+    if (sizes.ptr_ohat < (uint64_t)(((ka(0x20u)*ka(0x18u))*512LL))) { return fail(err, "GV-HOST-EXTENT", "ptr_ohat: buffer ptr_ohat smaller than declared allocation"); }
+    if (sizes.ptr_lse < (uint64_t)(((ka(0x20u)*ka(0x18u))*4LL))) { return fail(err, "GV-HOST-EXTENT", "ptr_lse: buffer ptr_lse smaller than declared allocation"); }
+    if (sizes.ptr_out < (uint64_t)((ka(0x18u)*256LL))) { return fail(err, "GV-HOST-EXTENT", "ptr_out: buffer ptr_out smaller than declared allocation"); }
     if (ka(0x18u) < 1LL || ka(0x18u) > 9223372036854775807LL) { return fail(err, "GV-HOST-KA-RANGE", "ka(0x18) outside contract"); }
     if (ka(0x1Cu) < 128LL || ka(0x1Cu) > 128LL) { return fail(err, "GV-HOST-KA-RANGE", "ka(0x1C) outside contract"); }
     if (ka(0x20u) < 1LL || ka(0x20u) > 9223372036854775807LL) { return fail(err, "GV-HOST-KA-RANGE", "ka(0x20) outside contract"); }

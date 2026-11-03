@@ -137,6 +137,7 @@ static_assert(sizeof(Args) == 648, "kernarg size");
 struct Symbols {
     int64_t B = 1;
     int64_t HK = 1;
+    int64_t KL = 0;
 };
 struct BufferSizes {
     uint64_t ptr_q = 0;
@@ -185,15 +186,15 @@ inline bool fail(std::string* err, const char* code, const std::string& msg) {
 inline bool validate(const Args& a, const BufferSizes& sizes, dim3 grid, const Symbols& syms, std::string* err = nullptr) {
     auto ka = [&](uint32_t o) -> int64_t { return ka_at(a, o); };
     (void)grid; (void)syms; (void)sizes;
-    if (sizes.ptr_q < (uint64_t)((syms.B*ka_at(0xA0u)))) { return fail(err, "GV-HOST-EXTENT", "ptr_q: buffer ptr_q smaller than declared allocation"); }
-    if (sizes.ptr_k < (uint64_t)((syms.B*ka_at(0xE0u)))) { return fail(err, "GV-HOST-EXTENT", "ptr_k: buffer ptr_k smaller than declared allocation"); }
-    if (sizes.ptr_v < (uint64_t)((syms.B*ka_at(0x170u)))) { return fail(err, "GV-HOST-EXTENT", "ptr_v: buffer ptr_v smaller than declared allocation"); }
-    if (sizes.ptr_o < (uint64_t)((syms.B*ka_at(0x1A0u)))) { return fail(err, "GV-HOST-EXTENT", "ptr_o: buffer ptr_o smaller than declared allocation"); }
-    if (sizes.ptr_q_descale < (uint64_t)(((syms.B*ka_at(0x230u))+(2048LL*ka_at(0x140u))))) { return fail(err, "GV-HOST-EXTENT", "ptr_q_descale: buffer ptr_q_descale smaller than declared allocation"); }
-    if (sizes.ptr_k_descale < (uint64_t)(((syms.B*ka_at(0x250u))+(2560LL*ka_at(0x140u))))) { return fail(err, "GV-HOST-EXTENT", "ptr_k_descale: buffer ptr_k_descale smaller than declared allocation"); }
+    if (sizes.ptr_q < (uint64_t)((syms.B*ka(0xA0u)))) { return fail(err, "GV-HOST-EXTENT", "ptr_q: buffer ptr_q smaller than declared allocation"); }
+    if (sizes.ptr_k < (uint64_t)((syms.B*ka(0xE0u)))) { return fail(err, "GV-HOST-EXTENT", "ptr_k: buffer ptr_k smaller than declared allocation"); }
+    if (sizes.ptr_v < (uint64_t)((syms.B*ka(0x170u)))) { return fail(err, "GV-HOST-EXTENT", "ptr_v: buffer ptr_v smaller than declared allocation"); }
+    if (sizes.ptr_o < (uint64_t)((syms.B*ka(0x1A0u)))) { return fail(err, "GV-HOST-EXTENT", "ptr_o: buffer ptr_o smaller than declared allocation"); }
+    if (sizes.ptr_q_descale < (uint64_t)(((syms.B*ka(0x230u))+(2048LL*ka(0x140u))))) { return fail(err, "GV-HOST-EXTENT", "ptr_q_descale: buffer ptr_q_descale smaller than declared allocation"); }
+    if (sizes.ptr_k_descale < (uint64_t)(((syms.B*ka(0x250u))+(2560LL*ka(0x140u))))) { return fail(err, "GV-HOST-EXTENT", "ptr_k_descale: buffer ptr_k_descale smaller than declared allocation"); }
     if (sizes.ptr_v_descale < (uint64_t)(4096LL)) { return fail(err, "GV-HOST-EXTENT", "ptr_v_descale: buffer ptr_v_descale smaller than declared allocation"); }
-    if (sizes.ptr_ohat < (uint64_t)(((ka_at(0x280u)*ka_at(0x284u))*512LL))) { return fail(err, "GV-HOST-EXTENT", "ptr_ohat: buffer ptr_ohat smaller than declared allocation"); }
-    if (sizes.ptr_lse < (uint64_t)(((ka_at(0x280u)*ka_at(0x284u))*4LL))) { return fail(err, "GV-HOST-EXTENT", "ptr_lse: buffer ptr_lse smaller than declared allocation"); }
+    if (sizes.ptr_ohat < (uint64_t)(((ka(0x280u)*ka(0x284u))*512LL))) { return fail(err, "GV-HOST-EXTENT", "ptr_ohat: buffer ptr_ohat smaller than declared allocation"); }
+    if (sizes.ptr_lse < (uint64_t)(((ka(0x280u)*ka(0x284u))*4LL))) { return fail(err, "GV-HOST-EXTENT", "ptr_lse: buffer ptr_lse smaller than declared allocation"); }
     if (ka(0xB0u) < 1LL || ka(0xB0u) > 16LL) { return fail(err, "GV-HOST-KA-RANGE", "ka(0xB0) outside contract"); }
     if (ka(0x60u) < 1LL || ka(0x60u) > 9223372036854775807LL) { return fail(err, "GV-HOST-KA-RANGE", "ka(0x60) outside contract"); }
     if (ka(0x110u) < 1LL || ka(0x110u) > 9223372036854775807LL) { return fail(err, "GV-HOST-KA-RANGE", "ka(0x110) outside contract"); }
@@ -205,21 +206,21 @@ inline bool validate(const Args& a, const BufferSizes& sizes, dim3 grid, const S
     if (ka(0x260u) < 4LL || ka(0x260u) > 4LL) { return fail(err, "GV-HOST-KA-RANGE", "ka(0x260) outside contract"); }
     if (ka(0x280u) < 1LL || ka(0x280u) > 9223372036854775807LL) { return fail(err, "GV-HOST-KA-RANGE", "ka(0x280) outside contract"); }
     if (ka(0x284u) < 1LL || ka(0x284u) > 9223372036854775807LL) { return fail(err, "GV-HOST-KA-RANGE", "ka(0x284) outside contract"); }
-    if (ka(0x140u) != (syms.HK*ka_at(0xB0u))) { return fail(err, "GV-HOST-KA-IS", "ka(0x140) relation failed"); }
-    if (ka(0x70u) != (ka_at(0x140u)*128LL)) { return fail(err, "GV-HOST-KA-IS", "ka(0x70) relation failed"); }
-    if (ka(0xA0u) != (ka_at(0x60u)*ka_at(0x70u))) { return fail(err, "GV-HOST-KA-IS", "ka(0xA0) relation failed"); }
+    if (ka(0x140u) != (syms.HK*ka(0xB0u))) { return fail(err, "GV-HOST-KA-IS", "ka(0x140) relation failed"); }
+    if (ka(0x70u) != (ka(0x140u)*128LL)) { return fail(err, "GV-HOST-KA-IS", "ka(0x70) relation failed"); }
+    if (ka(0xA0u) != (ka(0x60u)*ka(0x70u))) { return fail(err, "GV-HOST-KA-IS", "ka(0xA0) relation failed"); }
     if (ka(0xC0u) != (syms.HK*128LL)) { return fail(err, "GV-HOST-KA-IS", "ka(0xC0) relation failed"); }
-    if (ka(0xE0u) != (ka_at(0x110u)*ka_at(0xC0u))) { return fail(err, "GV-HOST-KA-IS", "ka(0xE0) relation failed"); }
-    if (ka(0x150u) != ka_at(0xC0u)) { return fail(err, "GV-HOST-KA-IS", "ka(0x150) relation failed"); }
-    if (ka(0x170u) != ka_at(0xE0u)) { return fail(err, "GV-HOST-KA-IS", "ka(0x170) relation failed"); }
-    if (ka(0x180u) != (ka_at(0x140u)*256LL)) { return fail(err, "GV-HOST-KA-IS", "ka(0x180) relation failed"); }
-    if (ka(0x1A0u) != (ka_at(0x60u)*ka_at(0x180u))) { return fail(err, "GV-HOST-KA-IS", "ka(0x1A0) relation failed"); }
-    if (ka(0x230u) != (ka_at(0x60u)*(ka_at(0x140u)*4LL))) { return fail(err, "GV-HOST-KA-IS", "ka(0x230) relation failed"); }
-    if (ka(0x250u) != (ka_at(0x110u)*(syms.HK*4LL))) { return fail(err, "GV-HOST-KA-IS", "ka(0x250) relation failed"); }
-    if (ka(0x284u) != ((syms.B*ka_at(0x60u))*ka_at(0x140u))) { return fail(err, "GV-HOST-KA-IS", "ka(0x284) relation failed"); }
-    if (grid.y != ka_at(0x140u)) { return fail(err, "GV-HOST-GRID", "grid axis 1 relation failed"); }
-    if (grid.x != ((ka_at(0x60u)+255LL)/256LL)) { return fail(err, "GV-HOST-GRID", "grid axis 0 relation failed"); }
-    if (grid.z != (syms.B*ka_at(0x280u))) { return fail(err, "GV-HOST-GRID", "grid axis 2 relation failed"); }
+    if (ka(0xE0u) != (ka(0x110u)*ka(0xC0u))) { return fail(err, "GV-HOST-KA-IS", "ka(0xE0) relation failed"); }
+    if (ka(0x150u) != ka(0xC0u)) { return fail(err, "GV-HOST-KA-IS", "ka(0x150) relation failed"); }
+    if (ka(0x170u) != ka(0xE0u)) { return fail(err, "GV-HOST-KA-IS", "ka(0x170) relation failed"); }
+    if (ka(0x180u) != (ka(0x140u)*256LL)) { return fail(err, "GV-HOST-KA-IS", "ka(0x180) relation failed"); }
+    if (ka(0x1A0u) != (ka(0x60u)*ka(0x180u))) { return fail(err, "GV-HOST-KA-IS", "ka(0x1A0) relation failed"); }
+    if (ka(0x230u) != (ka(0x60u)*(ka(0x140u)*4LL))) { return fail(err, "GV-HOST-KA-IS", "ka(0x230) relation failed"); }
+    if (ka(0x250u) != (ka(0x110u)*(syms.HK*4LL))) { return fail(err, "GV-HOST-KA-IS", "ka(0x250) relation failed"); }
+    if (ka(0x284u) != ((syms.B*ka(0x60u))*ka(0x140u))) { return fail(err, "GV-HOST-KA-IS", "ka(0x284) relation failed"); }
+    if (grid.y != ka(0x140u)) { return fail(err, "GV-HOST-GRID", "grid axis 1 relation failed"); }
+    if (grid.x != ((ka(0x60u)+255LL)/256LL)) { return fail(err, "GV-HOST-GRID", "grid axis 0 relation failed"); }
+    if (grid.z != (syms.B*ka(0x280u))) { return fail(err, "GV-HOST-GRID", "grid axis 2 relation failed"); }
     if (syms.KL < 0LL || syms.KL > 9223372036854775807LL) { return fail(err, "GV-HOST-SYM", "symbol KL outside contract"); }
     return true;
 }
@@ -230,6 +231,6 @@ inline hipError_t launch(hipFunction_t fn, const Args& a, dim3 grid, dim3 block,
     return hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, block.x, block.y, block.z, lds, stream, nullptr, extra);
 }
 inline dim3 block() { return dim3(WORKGROUP_SIZE, 1, 1); }
-inline dim3 grid(const Args& a, const Symbols& syms) { auto ka = [&](uint32_t o) -> int64_t { return ka_at(a, o); }; return dim3((unsigned)((ka_at(0x60u)+255LL)/256LL), (unsigned)ka_at(0x140u), (unsigned)(syms.B*ka_at(0x280u))); }
+inline dim3 grid(const Args& a, const Symbols& syms) { (void)a; (void)syms; return dim3((unsigned)((ka_at(a,0x60u)+255LL)/256LL), (unsigned)ka_at(a,0x140u), (unsigned)(syms.B*ka_at(a,0x280u))); }
 
 } // namespace

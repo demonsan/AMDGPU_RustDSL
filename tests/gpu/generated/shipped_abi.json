@@ -39,7 +39,7 @@
   "ka_range": [{"offset":176,"lo":1,"hi":16},{"offset":96,"lo":1,"hi":9223372036854775807},{"offset":272,"lo":1,"hi":9223372036854775807},{"offset":144,"lo":128,"hi":128},{"offset":208,"lo":128,"hi":128},{"offset":352,"lo":128,"hi":128},{"offset":400,"lo":256,"hi":256},{"offset":576,"lo":4,"hi":4},{"offset":608,"lo":4,"hi":4},{"offset":640,"lo":1,"hi":9223372036854775807},{"offset":644,"lo":1,"hi":9223372036854775807}],
   "ka_one_of": [],
   "grid_is": [{"axis":1,"expr":"ka(0x140)"},{"axis":0,"expr":"ceil(ka(0x60)/256)"},{"axis":2,"expr":"(B*ka(0x280))"}],
-  "symbols": [{"name":"B","lo":1},{"name":"HK","lo":1}]
+  "symbols": [{"name":"B","lo":1},{"name":"HK","lo":1},{"name":"KL","lo":0}]
 },
 {
   "kernel": "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h",

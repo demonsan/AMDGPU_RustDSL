@@ -2,6 +2,7 @@
 // Q/K descales and compares it with a CPU reference. Also dumps the bf16 output so our own kernel
 // can be compared against the vendor kernel on identical inputs.
 #include <hip/hip_runtime.h>
+#include "generated/shipped_abi.h"
 
 #include <algorithm>
 #include <cmath>
@@ -36,6 +37,12 @@ static void put64(unsigned char* a, int off, const void* p) {
     std::memcpy(a + off, &v, 8);
 }
 static void put32(unsigned char* a, int off, uint32_t v) { std::memcpy(a + off, &v, 4); }
+
+namespace hg = amdc_hostgen;
+using GenVs = hg::fmha_fwd_hd128_mxfp8_v3_vs128;
+using GenT = hg::fmha_fwd_hd128_mxfp8_v3_t128;
+using GenSplit = hg::fmha_fwd_hd128_mxfp8_v3_kvsplit;
+using GenComb = hg::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h;
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -264,13 +271,63 @@ int main(int argc, char** argv) {
         put32(args, 0x284, (uint32_t)rows_total);
         asz = 720;
     };
+    // Generated host ABI (route-B P5): typed kernarg structs, host-contract validation and launch
+    // from tests/gpu/generated/*.h. The hand bytes above remain only for the vendor/legacy paths; when
+    // a shipped v3 kernel is launched, the generated Args is built from the same values and the
+    // generated launch() is used (REF_GEN_ABI_OFF=1 disables this for A/B).
+    const bool gen_abi = std::getenv("REF_GEN_ABI_OFF") == nullptr;
+    auto gen_name = [](const char* n, const char* suffix) { return n && std::string(n).find(suffix) != std::string::npos; };
+    auto mk_vs = [&](void* outp, int stride_rows) {
+        GenVs::Args a{};
+        std::memcpy(&a, args, sizeof(a));
+        a.ptr_o = outp;
+        a.s_o_Seqs = (uint32_t)((size_t)stride_rows * H * D);
+        GenVs::BufferSizes sz{};
+        sz.ptr_q = nq; sz.ptr_k = nk; sz.ptr_v = nk; sz.ptr_o = no * 2;
+        sz.ptr_q_descale = qs.size(); sz.ptr_k_descale = ks.size(); sz.ptr_v_descale = 4096;
+        GenVs::Symbols sy{}; sy.HK = (int64_t)HK;
+        std::string err;
+        if (!GenVs::validate(a, sz, dim3(gox, gy, gz), sy, &err)) {
+            std::fprintf(stderr, "generated vs128 validate failed: %s\n", err.c_str()); std::exit(1);
+        }
+        return a;
+    };
+    auto mk_t = [&](void* outp, int stride_rows) {
+        GenT::Args a{};
+        std::memcpy(&a, args, sizeof(a));
+        a.ptr_o = outp;
+        a.s_o_Seqs = (uint32_t)((size_t)stride_rows * H * D);
+        GenT::BufferSizes sz{};
+        sz.ptr_q = nq; sz.ptr_k = nk; sz.ptr_v = nk; sz.ptr_o = no * 2;
+        sz.ptr_q_descale = qs.size(); sz.ptr_k_descale = ks.size(); sz.ptr_v_descale = 4096;
+        GenT::Symbols sy{}; sy.HK = (int64_t)HK;
+        std::string err;
+        if (!GenT::validate(a, sz, dim3(gox, gy, gz), sy, &err)) {
+            std::fprintf(stderr, "generated t128 validate failed: %s\n", err.c_str()); std::exit(1);
+        }
+        return a;
+    };
+    auto launch_gen = [&](hipFunction_t f, const char* kname, void* outp, int rows, int gx, unsigned block) -> bool {
+        if (!gen_abi) return false;
+        if (gen_name(kname, "v3_vs128")) {
+            auto a = mk_vs(outp, rows);
+            CK(GenVs::launch(f, a, dim3(gx, gy, gz), dim3(block, 1, 1)));
+            return true;
+        }
+        if (gen_name(kname, "v3_t128")) {
+            auto a = mk_t(outp, rows);
+            CK(GenT::launch(f, a, dim3(gx, gy, gz), dim3(block, 1, 1)));
+            return true;
+        }
+        return false;
+    };
     asz = 656; set_launch(dout, vendor_stride_rows);
     CK(hipModuleLaunchKernel(fn, gvx, gy, gz, vendor_block, 1, 1, 0, nullptr, nullptr, extra));
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(out.data(), dout, no * 2, hipMemcpyDeviceToHost));
     const int iters = envi("REF_ITERS", 0);
     const double flops = 4.0 * B * H * (double)S * SK * D;
-    auto time_kernel = [&](hipFunction_t f, const char* label, void* outp, int rows, int gx, unsigned block) {
+    auto time_kernel = [&](hipFunction_t f, const char* label, void* outp, int rows, int gx, unsigned block, const char* kname = nullptr) {
         if (iters <= 0) return;
         set_launch(outp, rows);
         hipEvent_t e0, e1;
@@ -279,10 +336,15 @@ int main(int argc, char** argv) {
         // warm-up under-states the first kernel timed. REF_WARMUP (default 3 = historical) lets the
         // measurement protocol pump enough work through the GPU to reach the boost clock first.
         const int warm = envi("REF_WARMUP", 3);
-        for (int w = 0; w < warm; ++w) CK(hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, extra));
+        auto one = [&] {
+            if (launch_gen(f, kname, outp, rows, gx, block)) return;
+            set_launch(outp, rows);
+            CK(hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, extra));
+        };
+        for (int w = 0; w < warm; ++w) one();
         CK(hipDeviceSynchronize());
         CK(hipEventRecord(e0));
-        for (int w = 0; w < iters; ++w) CK(hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, extra));
+        for (int w = 0; w < iters; ++w) one();
         CK(hipEventRecord(e1));
         CK(hipEventSynchronize(e1));
         float ms = 0; CK(hipEventElapsedTime(&ms, e0, e1));
@@ -290,7 +352,7 @@ int main(int argc, char** argv) {
         std::printf("timing %-8s: %.4f ms/iter, %.2f TFLOP/s (%d iters, %d rows/block, %d blocks)\n",
                     label, per, flops / (per * 1e-3) / 1e12, iters, rows, gx * gy * gz);
     };
-    time_kernel(fn, "vendor", dout, vendor_rows, gvx, vendor_block);
+    time_kernel(fn, "vendor", dout, vendor_rows, gvx, vendor_block, nullptr);
 
     // CPU reference.
     auto bf2f = [](uint16_t x) { uint32_t u = (uint32_t)x << 16; float f; std::memcpy(&f, &u, 4); return f; };
@@ -374,13 +436,46 @@ int main(int argc, char** argv) {
             long cgrid = (long)std::ceil((double)rows_total * D / ((double)cthreads * comb_ept));
             if (const char* cg = std::getenv("REF_COMBINE_GRID")) cgrid = std::atol(cg);
             if (cgrid < 1) cgrid = 1;
+            auto mk_split = [&] {
+                GenSplit::Args a{}; std::memcpy(&a, args, sizeof(a));
+                GenSplit::BufferSizes sz{};
+                sz.ptr_q = nq; sz.ptr_k = nk; sz.ptr_v = nk; sz.ptr_o = no * 2;
+                sz.ptr_q_descale = qs.size(); sz.ptr_k_descale = ks.size(); sz.ptr_v_descale = 4096;
+                sz.ptr_ohat = (uint64_t)ohat_alloc_bytes; sz.ptr_lse = (uint64_t)lse_bytes;
+                GenSplit::Symbols sy{}; sy.B = B; sy.HK = HK; sy.KL = 0;
+                std::string err;
+                if (!GenSplit::validate(a, sz, dim3(gox, gy, goz), sy, &err)) {
+                    std::fprintf(stderr, "generated kvsplit validate failed: %s\n", err.c_str()); std::exit(1);
+                }
+                return a;
+            };
+            auto mk_comb = [&] {
+                GenComb::Args a{}; std::memcpy(&a, cargs, sizeof(a));
+                GenComb::BufferSizes sz{};
+                sz.ptr_ohat = (uint64_t)ohat_alloc_bytes; sz.ptr_lse = (uint64_t)lse_bytes; sz.ptr_out = no * 2;
+                std::string err;
+                if (!GenComb::validate(a, sz, dim3((unsigned)cgrid, 1, 1), GenComb::Symbols{}, &err)) {
+                    std::fprintf(stderr, "generated combine validate failed: %s\n", err.c_str()); std::exit(1);
+                }
+                return a;
+            };
             auto launch_split = [&] {
                 asz = 720; set_split_args(ohat, lse); set_launch(dout2, s_rows_pb);
-                CK(hipModuleLaunchKernel(fn2, gox, gy, goz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
+                if (gen_abi && gen_name(kname_split, "v3_kvsplit")) {
+                    auto a = mk_split();
+                    CK(GenSplit::launch(fn2, a, dim3(gox, gy, goz), dim3(ours_block, 1, 1)));
+                } else {
+                    CK(hipModuleLaunchKernel(fn2, gox, gy, goz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
+                }
             };
             auto launch_comb = [&] {
                 if (fused) return;
-                CK(hipModuleLaunchKernel(fnc, (unsigned)cgrid, 1, 1, cthreads, 1, 1, 0, nullptr, nullptr, cextra));
+                if (gen_abi && gen_name(kname_comb, "v3_kvsplit_combine8h")) {
+                    auto a = mk_comb();
+                    CK(GenComb::launch(fnc, a, dim3((unsigned)cgrid, 1, 1), dim3(cthreads, 1, 1)));
+                } else {
+                    CK(hipModuleLaunchKernel(fnc, (unsigned)cgrid, 1, 1, cthreads, 1, 1, 0, nullptr, nullptr, cextra));
+                }
             };
             const int warm = envi("REF_WARMUP", 3);
             for (int w = 0; w < warm; ++w) { launch_split(); launch_comb(); }
@@ -422,7 +517,8 @@ int main(int argc, char** argv) {
                     CK(hipModuleLoad(&modv, co_vs));
                     CK(hipModuleGetFunction(&fnv, modv, kname_env ? kname_env : "fmha_fwd_hd128_mxfp8_v3_vs128"));
                     asz = 656; set_launch(dout_ref, 256);
-                    CK(hipModuleLaunchKernel(fnv, gvx, gy, gz, 512, 1, 1, 0, nullptr, nullptr, extra));
+                    if (!launch_gen(fnv, kname_env ? kname_env : "fmha_fwd_hd128_mxfp8_v3_vs128", dout_ref, 256, gvx, 512))
+                        CK(hipModuleLaunchKernel(fnv, gvx, gy, gz, 512, 1, 1, 0, nullptr, nullptr, extra));
                     CK(hipDeviceSynchronize());
                     std::vector<uint16_t> ref(no, 0);
                     CK(hipMemcpy(ref.data(), dout_ref, no * 2, hipMemcpyDeviceToHost));
@@ -459,11 +555,12 @@ int main(int argc, char** argv) {
             hipModule_t mod2; hipFunction_t fn2;
             CK(hipModuleLoad(&mod2, use_co));
             CK(hipModuleGetFunction(&fn2, mod2, use_kn));
-            CK(hipModuleLaunchKernel(fn2, gox, gy, gz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
+            if (!launch_gen(fn2, use_kn, dout2, ours_stride_rows, gox, ours_block))
+                CK(hipModuleLaunchKernel(fn2, gox, gy, gz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
             CK(hipDeviceSynchronize());
             CK(hipMemcpy(out2.data(), dout2, no * 2, hipMemcpyDeviceToHost));
             bad2 = check(out2, "our kernel   vs CPU");
-            time_kernel(fn2, "ours", dout2, ours_rows, gox, ours_block);
+            time_kernel(fn2, "ours", dout2, ours_rows, gox, ours_block, use_kn);
             double wd = 0.0, md = 0.0;
             for (size_t i = 0; i < no; ++i) { const double dd = std::fabs((double)bf2f(out[i]) - (double)bf2f(out2[i])); wd = std::max(wd, dd); md += dd; }
             std::printf("our kernel vs vendor kernel (all %zu outputs): worst_diff=%.4e mean_diff=%.4e\n", no, wd, md / no);

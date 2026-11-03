@@ -184,3 +184,46 @@ fn fmha_contracts_are_present() {
         assert!(!f.contract.extents.is_empty(), "{k}: no contract extents (annotations missing)");
     }
 }
+
+#[test]
+fn generated_host_abi_matches_the_hand_offsets_and_sizes() {
+    // (kernel, [(field, offset, size)]): the hand-written 656-byte / 720-byte ABI facts that
+    // ref_host.cpp used before gen-host. The generated Args/static_asserts must reproduce them.
+    let hand: &[(&str, &[(&str, u32, u32)])] = &[
+        ("fmha_fwd_hd128_mxfp8_v3_vs128", &[
+            ("ptr_o", 0x000, 8), ("ptr_q", 0x010, 8), ("ptr_k", 0x020, 8), ("ptr_v", 0x030, 8),
+            ("s_seq_len", 0x060, 4), ("s_Seqs", 0x070, 4), ("s_Hs", 0x090, 4), ("s_Bs", 0x0A0, 4),
+            ("s_gqa", 0x0B0, 4), ("s_k_Seqs", 0x0C0, 4), ("s_k_Hs", 0x0D0, 4), ("s_k_Bs", 0x0E0, 4),
+            ("s_kv_seq_len", 0x110, 4), ("s_q_head_num", 0x140, 4),
+            ("ptr_q_descale", 0x200, 8), ("ptr_k_descale", 0x210, 8), ("ptr_v_descale", 0x220, 8),
+        ]),
+        ("fmha_fwd_hd128_mxfp8_v3_t128", &[
+            ("ptr_o", 0x000, 8), ("ptr_q", 0x010, 8), ("ptr_k", 0x020, 8), ("ptr_v", 0x030, 8),
+            ("s_seq_len", 0x060, 4), ("s_Seqs", 0x070, 4), ("ptr_q_descale", 0x200, 8),
+        ]),
+        ("fmha_fwd_hd128_mxfp8_v3_kvsplit", &[
+            ("ptr_o", 0x000, 8), ("ptr_q", 0x010, 8), ("ptr_k", 0x020, 8), ("ptr_v", 0x030, 8),
+            ("s_seq_len", 0x060, 4), ("ptr_q_descale", 0x200, 8),
+            ("kvs_splits", 0x280, 4), ("kvs_rows_total", 0x284, 4),
+        ]),
+        ("fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h", &[
+            ("ptr_ohat", 0x00, 8), ("ptr_lse", 0x08, 8), ("ptr_out", 0x10, 8),
+            ("rows_total", 0x18, 4), ("d", 0x1C, 4), ("splits", 0x20, 4),
+        ]),
+    ];
+    for (name, fields) in hand {
+        let f = amdgpu_compiler::kernel_by_name(name).expect(name);
+        let g = amdgpu_compiler::hostgen::generate(&f).expect("generate");
+        assert!(g.header.contains(&format!("static_assert(sizeof(Args) == {}, \"kernarg size\");", f.kernarg_size)), "{name}: generated sizeof mismatch");
+        for (field, off, sz) in *fields {
+            let a = f.args.iter().find(|a| a.name == *field).unwrap_or_else(|| panic!("{name}: no hand arg {field}"));
+            assert_eq!(a.kernarg_offset, *off, "{name}/{field}: hand offset");
+            assert_eq!(a.size, *sz, "{name}/{field}: hand size");
+            assert!(g.header.contains(&format!("static_assert(offsetof(Args, {field}) == 0x{off:X}")), "{name}/{field}: generated offset assert missing");
+            assert!(g.json.contains(&format!("\"name\":\"{field}\",\"offset\":{off},\"size\":{sz}")), "{name}/{field}: generated JSON mismatch");
+        }
+        assert!(g.json.contains(&format!("\"kernel\": \"{name}\"")), "{name}: JSON kernel");
+        assert!(g.json.contains(&format!("\"kernarg_size\": {}", f.kernarg_size)), "{name}: JSON kernarg_size");
+    }
+}
+
