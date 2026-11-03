@@ -121,7 +121,8 @@ VMfmaScale32x32x64Fp8@a | A16 <- V8 V8 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X
 VMfma32x32x64Fp8@a | A16 <- V8 V8 A16 | {d} = V_MFMA_F32_32X32X64_F8F6F4_f8_f8_e64 {s0}, {s1}, {s2}, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x64Fp8Z@a | A16 <- V8 V8 | {d} = V_MFMA_F32_32X32X64_F8F6F4_f8_f8_e64 {s0}, {s1}, 0, 0, 0, implicit $mode, implicit $exec
 VMfmaScale32x32x64Fp8Z@a | A16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_e64 {s0}, {s1}, 0, 0, 0, {s2}, {s3}, 0, 0, implicit $mode, implicit $exec
-VMfmaScale16x16x128Fp8@a | A4 <- V8 V8 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_e64 {s0}, {s1}, {s2}, 0, 0, {s3}, {s4}, {opsel0}, {opsel0}, implicit $mode, implicit $execVSmfmac16x16x128Fp8 | V4 <- V4 V8 V1 | {d} = V_SMFMAC_F32_16X16X128_FP8_FP8_e64 {s0}, {s1}, {s2}, 0, 0, {d}, implicit $mode, implicit $exec
+VMfmaScale16x16x128Fp8@a | A4 <- V8 V8 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_e64 {s0}, {s1}, {s2}, 0, 0, {s3}, {s4}, {opsel0}, {opsel0}, implicit $mode, implicit $exec
+VSmfmac16x16x128Fp8 | V4 <- V4 V8 V1 | {d} = V_SMFMAC_F32_16X16X128_FP8_FP8_e64 {s0}, {s1}, {s2}, 0, 0, {d}, implicit $mode, implicit $exec
 VSmfmac16x16x128Fp8 | V4 <- V4 V8 V1 | {d} = V_SMFMAC_F32_16X16X128_FP8_FP8_e64 {s0}, {s1}, {s2}, 0, 0, {d}, implicit $mode, implicit $exec
 SLshrB32    | S1 <- S1 I  | {d} = S_LSHR_B32 {s0}, {s1}, implicit-def $scc
 SAndB32     | S1 <- S1 S1 | {d} = S_AND_B32 {s0}, {s1}, implicit-def $scc
