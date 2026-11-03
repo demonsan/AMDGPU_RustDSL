@@ -83,6 +83,11 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     Err(last)
 }
 
+/// M0 reuse for LDS-DMA loads is part of the GEMM profile (AMDC_M0_REUSE=0 turns it off for A/B runs); the FMHA kernels keep their shipped output.
+fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
+    f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_M0_REUSE").map_or(true, |v| v != "0")
+}
+
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
     let pname = policy_name(f);
     // per-kernel lowering options (Function::lower_opts) are appended to the caller's extras
@@ -190,6 +195,9 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
             let mut m = base.clone();
             let attempt = (|| -> Result<regalloc::Alloc, String> {
                 sched::run(&mut m, &o)?;
+                if m0_reuse_on(f) {
+                    sched::m0::reuse(&mut m);
+                }
                 let pe = pin_check::check(&m);
                 if !pe.is_empty() {
                     return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
@@ -214,6 +222,9 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     }
     let mut m = base;
     sched::phase::strip(&mut m); // scheduler directives are meaningless without the scheduler
+    if m0_reuse_on(f) {
+        sched::m0::reuse(&mut m);
+    }
     let pe = pin_check::check(&m);
     if !pe.is_empty() {
         return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));

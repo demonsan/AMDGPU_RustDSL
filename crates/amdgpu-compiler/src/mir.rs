@@ -292,11 +292,14 @@ pub struct MInst {
     /// Pinned instruction (safe-asm blocks built with `Seq::pin`): the scheduler keeps it in program order and treats a run of pinned
     /// instructions as a barrier (nothing moves into, out of or across it).
     pub pin: bool,
+    /// LDS-DMA load whose M0 already holds its LDS base (the previous DMA of the block used the same source register): emit neither the s_mov_b32 m0 nor the
+    /// s_nop 0 that must follow an M0 write (set by sched::m0::reuse).
+    pub skip_m0: bool,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false }
     }
 
     pub fn def(mut self, r: VReg) -> Self {

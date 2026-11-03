@@ -60,6 +60,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e AMDC_RA_FORCE_TWOPHASE="${AMDC_RA_FORCE_TWOPHASE:-}" \
     -e AMDC_RA_LDS_SPILL="${AMDC_RA_LDS_SPILL:-}" \
     -e AMDC_RA_LDS_SPILL_TARGET="${AMDC_RA_LDS_SPILL_TARGET:-}" \
+    -e AMDC_M0_REUSE="${AMDC_M0_REUSE:-}" \
     -e AMDC_WAITS_SKIP_FENCE_OPERANDS="${AMDC_WAITS_SKIP_FENCE_OPERANDS:-}" \
     -e AMDC_NO_PHYS_WAR="${AMDC_NO_PHYS_WAR:-}" \
     -e AMDC_VCC_FILL="${AMDC_VCC_FILL:-}" \
