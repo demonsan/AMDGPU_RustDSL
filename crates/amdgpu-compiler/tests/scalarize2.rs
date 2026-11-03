@@ -28,7 +28,8 @@ fn demo() -> Function {
     let key0 = b.bind_i32(nx.lt(ev(nkv)).select_i32(nx.clone(), last) << 7);
     let org = b.bind_i32((ev(key0) * ev(kk)).min(65536));
     let rf = b.read_first_lane(org);
-    let soff = b.bind_i32(ev(rf) + 256);
+    let soff_v = b.bind_i32(ev(rf) + 256);
+    let soff = b.read_first_lane(soff_v); // the MUBUF soffset must be an SGPR: free when the chain is already scalar
     let m0 = b.c_i32(0);
     b.tile_produce("T", 0, Opnd::Var(it));
     b.buffer_load_lds_b128(rsrc, voff, soff, m0, 0);
