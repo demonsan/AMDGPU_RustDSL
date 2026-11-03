@@ -485,11 +485,11 @@ int main(int argc, char** argv) {
                 return a;
             };
             auto launch_split = [&] {
-                asz = 720; set_split_args(ohat, lse); set_launch(dout2, s_rows_pb);
                 if (gen_abi && gen_name(kname_split, "v3_kvsplit")) {
                     auto a = mk_split();
                     CK(GenSplit::launch(fn2, a, dim3(gox, gy, goz), dim3(ours_block, 1, 1)));
                 } else {
+                    asz = 720; set_split_args(ohat, lse); set_launch(dout2, s_rows_pb);
                     CK(hipModuleLaunchKernel(fn2, gox, gy, goz, ours_block, 1, 1, 0, nullptr, nullptr, extra));
                 }
             };
@@ -541,8 +541,9 @@ int main(int argc, char** argv) {
                     hipModule_t modv; hipFunction_t fnv;
                     CK(hipModuleLoad(&modv, co_vs));
                     CK(hipModuleGetFunction(&fnv, modv, kname_env ? kname_env : "fmha_fwd_hd128_mxfp8_v3_vs128"));
-                    asz = 656; set_launch(dout_ref, 256);
-                    if (!launch_gen(fnv, kname_env ? kname_env : "fmha_fwd_hd128_mxfp8_v3_vs128", dout_ref, 256, gvx, 512))
+                    const char* ulp_kname = kname_env ? kname_env : "fmha_fwd_hd128_mxfp8_v3_vs128";
+                    if (!gen_abi || !gen_name(ulp_kname, "v3_vs128")) { asz = 656; set_launch(dout_ref, 256); }
+                    if (!launch_gen(fnv, ulp_kname, dout_ref, 256, gvx, 512))
                         CK(hipModuleLaunchKernel(fnv, gvx, gy, gz, 512, 1, 1, 0, nullptr, nullptr, extra));
                     CK(hipDeviceSynchronize());
                     std::vector<uint16_t> ref(no, 0);
@@ -575,8 +576,9 @@ int main(int argc, char** argv) {
             if (const char* dumps = std::getenv("REF_SPLIT_DUMP")) { FILE* fo = std::fopen(dumps, "wb"); std::fwrite(out2.data(), 2, no, fo); std::fclose(fo); }
             CK(hipFree(ohat)); CK(hipFree(lse));
         } else {
-            // Single-kernel path (unchanged behaviour).
-            asz = 656; set_launch(dout2, ours_stride_rows);
+            // Single-kernel path: generated v3 path fills named Args fields; hand bytes only for fallback.
+            const bool gen_single = gen_abi && (gen_name(use_kn, "v3_vs128") || gen_name(use_kn, "v3_t128"));
+            if (!gen_single) { asz = 656; set_launch(dout2, ours_stride_rows); }
             hipModule_t mod2; hipFunction_t fn2;
             CK(hipModuleLoad(&mod2, use_co));
             CK(hipModuleGetFunction(&fn2, mod2, use_kn));
