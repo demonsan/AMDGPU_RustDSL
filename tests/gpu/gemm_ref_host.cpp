@@ -10,6 +10,7 @@
 //      REF_ITERS (100), REF_REPS (7), GRID_MODE (nm: grid(N/256, M/256) [default]; xcd: grid(roundup8(tiles)); linear: grid(tiles)),
 //      TILE_M/TILE_N (256), BLOCK (256), SEED
 #include <hip/hip_runtime.h>
+#include "generated_gemm/shipped_abi.h"
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -47,6 +49,9 @@ struct Kargs {
     int stride_sfa, stride_sfb, stride_sfa_batch, stride_sfb_batch;
 };
 static_assert(sizeof(Kargs) == 96, "ABI");
+
+namespace Gen3 = amdc_hostgen::gemm_mxfp8_bs_v3;
+namespace Gen4 = amdc_hostgen::gemm_mxfp8_bs_v4;
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -120,7 +125,46 @@ int main() {
         CK(hipModuleGetFunction(&fn, mod, kn));
         size_t asz = sizeof(ka);
         void* extra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};
-        auto launch = [&] { CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, BLOCK, 1, 1, 0, nullptr, nullptr, extra)); };
+        std::function<void()> launch;
+        bool generated = false;
+        // Route-B P5: for OURS, launch from the generated ABI/validate/launch header. REF/vendor keeps
+        // the historical hand path. REF_GEMM_ABI_OFF=1 forces the hand path for an A/B md5 check.
+        Gen3::Args ga3{};
+        Gen4::Args ga4{};
+        auto fill_common = [&](auto& a) {
+            a.ptr_a = dA; a.ptr_b = dB; a.ptr_c = dC;
+            a.m = M; a.n = N; a.k = K; a.batch = 1;
+            a.stride_a = K; a.stride_b = K; a.stride_c = N;
+            a.stride_a_batch = M * K; a.stride_b_batch = N * K; a.stride_c_batch = (int)((uint64_t)M * N);
+            a.ptr_sfa = dSa; a.ptr_sfb = dSb; a.stride_sfa = M; a.stride_sfb = KB;
+            a.stride_sfa_batch = M * KB; a.stride_sfb_batch = (N / 128) * KB;
+        };
+        const dim3 logical_grid(N / tn, M / tm, 1);
+        const bool use_generated = which[0] == 'O' && std::getenv("REF_GEMM_ABI_OFF") == nullptr;
+        if (use_generated && kn && std::strstr(kn, "v4")) {
+            fill_common(ga4);
+            Gen4::BufferSizes sz{};
+            sz.ptr_a = A.size(); sz.ptr_b = Bsh.size(); sz.ptr_c = (size_t)M * N * 2;
+            sz.ptr_sfa = sa.size(); sz.ptr_sfb = sb.size();
+            Gen4::Symbols sy{}; sy.MT = M / tm; sy.NT = N / tn; sy.KT = K / 128;
+            std::string err;
+            if (!Gen4::validate(ga4, sz, logical_grid, sy, &err)) { std::fprintf(stderr, "generated v4 validate failed: %s\n", err.c_str()); std::exit(1); }
+            if (BLOCK != (int)Gen4::WORKGROUP_SIZE) { std::fprintf(stderr, "generated v4 block mismatch: %d vs %u\n", BLOCK, Gen4::WORKGROUP_SIZE); std::exit(1); }
+            launch = [&] { CK(Gen4::launch(fn, ga4, grid, dim3(BLOCK, 1, 1))); };
+            generated = true;
+        } else if (use_generated && kn && std::strstr(kn, "v3")) {
+            fill_common(ga3);
+            Gen3::BufferSizes sz{};
+            sz.ptr_a = A.size(); sz.ptr_b = Bsh.size(); sz.ptr_c = (size_t)M * N * 2;
+            sz.ptr_sfa = sa.size(); sz.ptr_sfb = sb.size();
+            Gen3::Symbols sy{}; sy.MT = M / tm; sy.NT = N / tn; sy.KT = K / 128;
+            std::string err;
+            if (!Gen3::validate(ga3, sz, logical_grid, sy, &err)) { std::fprintf(stderr, "generated v3 validate failed: %s\n", err.c_str()); std::exit(1); }
+            if (BLOCK != (int)Gen3::WORKGROUP_SIZE) { std::fprintf(stderr, "generated v3 block mismatch: %d vs %u\n", BLOCK, Gen3::WORKGROUP_SIZE); std::exit(1); }
+            launch = [&] { CK(Gen3::launch(fn, ga3, grid, dim3(BLOCK, 1, 1))); };
+            generated = true;
+        }
+        if (!generated) launch = [&] { CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, BLOCK, 1, 1, 0, nullptr, nullptr, extra)); };
         CK(hipMemset(dC, 0xFF, (size_t)M * N * 2));   // NaN pattern: unwritten outputs fail the check
         launch(); CK(hipDeviceSynchronize());
         std::vector<uint16_t> C((size_t)M * N);
