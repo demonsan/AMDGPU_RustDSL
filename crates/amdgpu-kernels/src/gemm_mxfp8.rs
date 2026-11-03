@@ -407,7 +407,10 @@ impl Body {
                 for ((g, lds, d), (_, m0)) in mine.iter().zip(m0s.iter()) {
                     // shared voffset: the issue's wave-uniform source delta goes into the soffset (one scalar add)
                     let so = match d {
-                        Some(d) => b.bind_i32(ev(org) + ev(*d)),
+                        Some(d) => {
+                            let v = b.bind_i32(ev(org) + ev(*d));
+                            b.read_first_lane(v)
+                        }
                         None => org,
                     };
                     b.load_buffer_lds(rsrc, *g, so, *m0, (*lds % 4096) as u32, 4);
