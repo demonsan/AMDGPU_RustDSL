@@ -1094,7 +1094,17 @@ impl Lowerer {
                     Err(format!("value v{v} is not an eight-dword fragment"))
                 }
             }
-            _ => Err("eight-dword fragment operand must be an SSA value".to_string()),
+            // a loop-carried fragment (e.g. the register-staged GEMM operands, reloaded in place inside the loop)
+            Opnd::Var(v) => {
+                let r = self.vars.get(v.0 as usize).copied().ok_or_else(|| format!("var{v} not lowered"))?;
+                if self.mir.vreg_class(r).same_width_vector(RClass::V8) {
+                    self.touch(&[Src::Reg(r)]);
+                    Ok(r)
+                } else {
+                    Err(format!("var{v} is not an eight-dword fragment"))
+                }
+            }
+            _ => Err("eight-dword fragment operand must be a value or a variable".to_string()),
         }
     }
 
