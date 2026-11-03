@@ -1,0 +1,8 @@
+[package]
+name = "amdgpu-layout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "CuTe/FlyDSL-style layout algebra for gfx950 kernels (IntTuple, Layout, GF(2) swizzles, thread-value layouts, OPUS issue-space offset plans with immediate folding) and the build-time layout proofs. Pure Rust, no dependencies, host-testable."
+
+[dependencies]
