@@ -571,7 +571,7 @@ impl Body {
                 }
             }
             let n = self.a_dma.issues.len();
-            if !(0..n).any(|q| range.contains(&q)) {
+            if !(0..n).any(|q| range.contains(&q)) && self.role_rsrc.is_none() {
                 return;
             }
             if let Some((rr, vo)) = &self.role_rsrc {
@@ -579,17 +579,27 @@ impl Body {
                 // (UNVERIFIED timing build: the LDS write marker names the A ring only)
                 let isa = ev(wv).lt(2);
                 // (u32 operands: select through an i32 0/1 factor)
-                let s = b.bind_i32(isa.clone().select_i32(1, 0));
-                let org = { let v = b.bind_i32(ev(kb) + ev(s) * (ev(ka) - ev(kb))); b.read_first_lane(v) };
+                if cache.role.is_none() {
+                    // once per stage: soffset and every M0 of the role
+                    let s = b.bind_i32(isa.clone().select_i32(1, 0));
+                    let org = { let v = b.bind_i32(ev(kb) + ev(s) * (ev(ka) - ev(kb))); b.read_first_lane(v) };
+                    let mut m = Vec::new();
+                    for (_, lds) in self.a_dma.issues.iter() {
+                        let grp = *lds - *lds % 4096;
+                        if m.iter().any(|x: &(i32, ValueId)| x.0 == grp) {
+                            continue;
+                        }
+                        let ma = cache.m0.iter().find(|x| x.0 == (0, grp)).unwrap().1;
+                        let mb = cache.m0.iter().find(|x| x.0 == (1, grp)).unwrap().1;
+                        let v = b.bind_i32(ev(mb) + ev(s) * (ev(ma) - ev(mb)));
+                        m.push((grp, b.read_first_lane(v)));
+                    }
+                    cache.role = Some((org, m));
+                }
+                let (org, rm) = cache.role.clone().unwrap();
                 let r = self.a_s.at(slot);
                 let issues: Vec<(usize, i32)> = self.a_dma.issues.iter().enumerate().filter(|(q, _)| range.contains(q)).map(|(q, x)| (q, x.1)).collect();
-                let m0s: Vec<ValueId> = issues.iter().map(|(_, lds)| {
-                    let grp = *lds - *lds % 4096;
-                    let ma = cache.m0.iter().find(|x| x.0 == (0, grp)).unwrap().1;
-                    let mb = cache.m0.iter().find(|x| x.0 == (1, grp)).unwrap().1;
-                    let v = b.bind_i32(ev(mb) + ev(s) * (ev(ma) - ev(mb)));
-                    b.read_first_lane(v)
-                }).collect();
+                let m0s: Vec<ValueId> = issues.iter().map(|(_, lds)| rm.iter().find(|x| x.0 == *lds - *lds % 4096).unwrap().1).collect();
                 r.write(b, |b| {
                     for ((q, lds), m0) in issues.iter().zip(m0s.iter()) {
                         b.load_buffer_lds(*rr, vo[*q], org, *m0, (*lds % 4096) as u32, 4);
@@ -683,6 +693,8 @@ impl Body {
 /// Per-stage values shared by the chunks of a deferred stage: SGPR tile origins, slot bases, M0 per (buffer, 4 KB group).
 #[derive(Default, Clone)]
 struct StageCache {
+    /// wave roles: the role's soffset and M0 per 4 KB group
+    role: Option<(ValueId, Vec<(i32, ValueId)>)>,
     org: Option<(ValueId, ValueId)>,
     sbase: [Option<ValueId>; 2],
     m0: Vec<((usize, i32), ValueId)>,
