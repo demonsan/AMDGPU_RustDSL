@@ -320,7 +320,7 @@ impl PipeBody for Body {
         let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
         let agpr = self.cfg.agpr_ops;
         let nords = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nords"));
-        let zf = if nords { Some(b.frag_zero(DType::Frag8)) } else { None };
+        let zf = if nords { let z = b.frag_zero(DType::Frag4); Some(b.cat_frag8(z, z)) } else { None };
         let mark = |b: &mut FnBuilder, v: ValueId| if agpr { b.agpr(v) } else { v };
         let kbx = ox(t.it);
         // scale words (one LDS round trip), then the byte selects (shifted to byte 0)
