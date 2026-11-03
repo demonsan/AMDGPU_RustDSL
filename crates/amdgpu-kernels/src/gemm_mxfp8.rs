@@ -222,14 +222,15 @@ impl Body {
                 }
                 if lo == half {
                     if let Some((ar, _, _, _)) = &next {
-                        let v = self.frag(b, ar, i);
+                        // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
+                        let v = ar.read(b, i);
                         b.set_var(av[i], v);
                     }
                 }
             }
             if let Some((_, br, _, _)) = &next {
                 for j in lo..hi {
-                    let v = self.frag(b, br, j);
+                    let v = br.read(b, j);
                     b.set_var(bv[j], v);
                 }
             }
@@ -420,7 +421,7 @@ pub fn gemm_mxfp8_bs_v3() -> Function {
 /// v4: v3 with the register-staged 2-slot cadence (prefetch distance 2): all 16 operand fragments of a tile are read into AGPRs, the slot is refilled
 /// with tile t+2 while the 64 MMAs run.
 pub fn gemm_mxfp8_bs_v4() -> Function {
-    build("gemm_mxfp8_bs_v4", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 24, three_slots: false, reg_staged: true, defer_dma: false })
+    build("gemm_mxfp8_bs_v4", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: true, defer_dma: false })
 }
 
 fn build(name: &str, cfg: Cfg) -> Function {
