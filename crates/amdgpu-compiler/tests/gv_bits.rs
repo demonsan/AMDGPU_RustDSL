@@ -5,7 +5,7 @@ use amdgpu_dsl::{FnBuilder, Function, Op, I32};
 
 /// One `ds_read_b128` at the address built by `addr` from the workitem id, in an `lds`-byte segment.
 fn kernel(lds: u32, addr: impl Fn(I32) -> I32) -> Function {
-    let mut b = FnBuilder::new("gv_bits", 64);
+    let mut b = FnBuilder::new("gv_bits", 256);
     b.lds(lds);
     let tid = b.let_(Op::WorkitemId);
     let a = b.bind_i32(addr(ev(tid)));
@@ -30,7 +30,7 @@ fn swizzled_row_xor_chunk_is_inside_the_block() {
 
 #[test]
 fn negative_masks_of_non_negative_values() {
-    let f = kernel(1024, |t| (t * 16) & -16);
+    let f = kernel(1024, |t| ((t & 63) * 16) & -16);
     assert_eq!(lds_oob(&f), 0, "x & -16 of x in [0, 1008]");
 }
 
