@@ -57,6 +57,8 @@ pub struct Options {
     pub trust_model: bool,
     /// `ldshoist`: hoist `ds_read` above independent instructions (`hoist=N`: max distance).
     pub ldshoist: bool,
+    /// `hoistchain`: ldshoist also moves the pure ALU producers of a load's address (and of theirs) up with it, so a load whose address is computed right before it can still be issued early
+    pub hoist_chain: bool,
     pub hoist_dist: usize,
     /// Restrict block scheduling to blocks whose label is in the set or above the floor (blocks created
     /// by swp / taildup). Used by uto_plan.
@@ -65,7 +67,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, auto: false, trust_model: false, ldshoist: false, hoist_dist: 64, sched_labels: None }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, auto: false, trust_model: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, sched_labels: None }
     }
 }
 
@@ -105,6 +107,10 @@ impl Options {
                     "taildup" => o.taildup = true,
                     "trustmodel" => o.trust_model = true,
                     "ldshoist" => o.ldshoist = true,
+                    "hoistchain" => {
+                        o.ldshoist = true;
+                        o.hoist_chain = true;
+                    }
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
