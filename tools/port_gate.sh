@@ -6,7 +6,7 @@
 #   (e.g. while only _vs128 is ported): KN_VS128=... KN_T128=... KN_KVSPLIT=... KN_COMBINE=... (the combine name must contain "combine8":
 #   ref_host derives the elements/thread from the name).
 #   The reference set is the LEGACY hand-written set (fmha_fwd_hd128_mxfp8_{vs128,t128,kvsplit,kvsplit_combine8h}), measured in the same run.
-#   Shipped default (tile-library kernels): bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_dsl;  legacy self-baseline: bash tools/port_gate.sh fmha_fwd_hd128_mxfp8
+#   Shipped default (layout-layer kernels): bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3 (SHIP_REF=fmha_fwd_hd128_mxfp8_dsl: against the previous tile-library set);  legacy self-baseline: bash tools/port_gate.sh fmha_fwd_hd128_mxfp8
 #
 # Sections (each prints PASS/FAIL; SKIP_<SECTION>=1 skips one):
 #   BUILD    emit (+ --backend ${BACKEND:-auto}) and assemble the 4 kernels, build ref_host
@@ -25,7 +25,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 P="${1:?usage: tools/port_gate.sh <kernel_prefix> [tag]}"
 TAG="${2:-$(echo "$P" | tr -c 'A-Za-z0-9_\n' '_')}"
-SHIP=fmha_fwd_hd128_mxfp8
+SHIP="${SHIP_REF:-fmha_fwd_hd128_mxfp8}"   # reference set (default: the legacy hand-written kernels)
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 REF_CO="${REF_CO:-/shared/amdgpu/home/blyu_qle/sessions/ref_mxfp8.co}"

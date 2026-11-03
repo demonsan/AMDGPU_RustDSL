@@ -56,14 +56,14 @@ int main(int argc, char** argv) {
     const char* kname_env = std::getenv("REF_KNAME2");
     const char* co_small = std::getenv("REF_CO2_SMALL");
     if (co_small && !*co_small) co_small = nullptr;   // run_ref.sh passes empty strings for the variants it does not build
-    const char* kname_small = std::getenv("REF_KNAME2_SMALL") ? std::getenv("REF_KNAME2_SMALL") : "fmha_fwd_hd128_mxfp8_dsl_t128";
+    const char* kname_small = std::getenv("REF_KNAME2_SMALL") ? std::getenv("REF_KNAME2_SMALL") : "fmha_fwd_hd128_mxfp8_v3_t128";
     // KV-split candidate (docs/kvsplit-design.md): split kernel writes Ohat/lse partials, combine kernel merges.
     const char* co_split = std::getenv("REF_CO2_SPLIT");
     if (co_split && !*co_split) co_split = nullptr;
-    const char* kname_split = std::getenv("REF_KNAME2_SPLIT") ? std::getenv("REF_KNAME2_SPLIT") : "fmha_fwd_hd128_mxfp8_dsl_kvsplit";
+    const char* kname_split = std::getenv("REF_KNAME2_SPLIT") ? std::getenv("REF_KNAME2_SPLIT") : "fmha_fwd_hd128_mxfp8_v3_kvsplit";
     const char* co_comb = std::getenv("REF_CO2_COMBINE");
     if (co_comb && !*co_comb) co_comb = nullptr;
-    const char* kname_comb = std::getenv("REF_KNAME2_COMBINE") ? std::getenv("REF_KNAME2_COMBINE") : "fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h";
+    const char* kname_comb = std::getenv("REF_KNAME2_COMBINE") ? std::getenv("REF_KNAME2_COMBINE") : "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h";
     int splits = envi("REF_SPLIT", 0);
     const bool force_split = envi("REF_SPLIT_FORCE", 0) != 0;
     const long rows_total = (long)B * S * H;
@@ -420,7 +420,7 @@ int main(int argc, char** argv) {
                     void* dout_ref; CK(hipMalloc(&dout_ref, no * 2)); CK(hipMemset(dout_ref, 0, no * 2));
                     hipModule_t modv; hipFunction_t fnv;
                     CK(hipModuleLoad(&modv, co_vs));
-                    CK(hipModuleGetFunction(&fnv, modv, kname_env ? kname_env : "fmha_fwd_hd128_mxfp8_dsl_vs128"));
+                    CK(hipModuleGetFunction(&fnv, modv, kname_env ? kname_env : "fmha_fwd_hd128_mxfp8_v3_vs128"));
                     asz = 656; set_launch(dout_ref, 256);
                     CK(hipModuleLaunchKernel(fnv, gvx, gy, gz, 512, 1, 1, 0, nullptr, nullptr, extra));
                     CK(hipDeviceSynchronize());

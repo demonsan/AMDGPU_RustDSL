@@ -344,6 +344,11 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_dsl_t128" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_t128()),
         "fmha_fwd_hd128_mxfp8_dsl_kvsplit" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_kvsplit()),
         "fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h()),
+        // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
+        "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
+        "fmha_fwd_hd128_mxfp8_v3_t128" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
+        "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
+        "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine4h" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine4h()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine4" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine4()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine()),

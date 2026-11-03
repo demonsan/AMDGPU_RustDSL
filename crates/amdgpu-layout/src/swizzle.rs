@@ -77,6 +77,22 @@ impl Swizzle {
         }
         acc
     }
+    /// The XOR term shifted down by `down` bits (`down <= dst_lo`): the term in units of `2^down` bytes (e.g. 16-byte chunks), so that a chunk index
+    /// and its swizzle combine as small integers before the final scaling.
+    pub fn term_ix_down(&self, x: &Ix, d: &Dyns, down: u32) -> Ix {
+        assert!(down <= self.dst_lo, "term_ix_down: {down} > dst_lo {}", self.dst_lo);
+        let mut acc = Ix::C(0);
+        for (i, row) in self.rows.iter().enumerate() {
+            let mut par = Ix::C(0);
+            for j in 0..self.src_n {
+                if row & (1 << j) != 0 {
+                    par = par.xor(&x.div_c(1i64 << (self.src_lo + j), d).mod_c(2, d));
+                }
+            }
+            acc = acc.add(&par.shl(self.dst_lo - down + i as u32));
+        }
+        acc
+    }
     pub fn apply_ix(&self, x: &Ix, d: &Dyns) -> Ix {
         if self.is_identity() {
             return x.clone();

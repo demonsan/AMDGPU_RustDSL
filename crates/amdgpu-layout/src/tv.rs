@@ -113,7 +113,13 @@ pub fn layout_to_offsets(exprs: &[Ix], swz: &Swizzle, imm: ImmRange, d: &Dyns) -
         let mask = ab | swz.dst_mask();
         let cx = (c2 as u64 & mask) as i64;
         let cf = (c2 as u64 & !mask) as i64;
-        let base = swz.apply_ix(&a, d).xor(&Ix::C(cx));
+        // structured as `(a without its destination bits) + ((dst bits of a ^ swizzle term ^ static xor) << dst_lo)`: the same value as
+        // `swz(a) ^ cx` (cx lies in the destination bits), but a sum of bounded terms - the hand formulas' shape, and tight for interval analysis
+        assert_eq!(cx as u64 & !swz.dst_mask(), 0, "layout_to_offsets: the static xor part lies in the swizzle destination bits");
+        let lo = swz.dst_lo;
+        let low = a.div_c(1i64 << lo, d).mod_c(1i64 << swz.dst_n, d);
+        let high = a.sub(&low.shl(lo));
+        let base = high.add(&low.xor(&swz.term_ix_down(&a, d, lo)).xor(&Ix::C(cx >> lo)).shl(lo));
         issues.push(push(base, cf, &mut bases));
     }
     OffsetPlan { bases, issues }

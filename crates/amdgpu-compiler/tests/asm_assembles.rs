@@ -34,7 +34,7 @@ fn emitted_kernels_assemble_with_the_aggressive_option_sets() {
     }
     let mut bad = Vec::new();
     let mut names: Vec<&str> = kernel_names().to_vec();
-    names.extend(["fmha_fwd_hd128_mxfp8_vs", "fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_kvsplit", "fmha_fwd_hd128_mxfp8_dsl_vs128", "fmha_fwd_hd128_mxfp8_dsl_t128", "fmha_fwd_hd128_mxfp8_dsl_kvsplit", "fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h", "probe_safeasm_e2e", "probe_buffer_lds", "probe_buffer_dyn"]);
+    names.extend(["fmha_fwd_hd128_mxfp8_vs", "fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_kvsplit", "fmha_fwd_hd128_mxfp8_dsl_vs128", "fmha_fwd_hd128_mxfp8_dsl_t128", "fmha_fwd_hd128_mxfp8_dsl_kvsplit", "fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h", "fmha_fwd_hd128_mxfp8_v3_vs128", "fmha_fwd_hd128_mxfp8_v3_t128", "fmha_fwd_hd128_mxfp8_v3_kvsplit", "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h", "probe_safeasm_e2e", "probe_buffer_lds", "probe_buffer_dyn"]);
     for k in names {
         if !(k.starts_with("fmha_fwd") || k == "attention_fwd") {
             continue;
