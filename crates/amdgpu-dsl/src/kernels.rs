@@ -22843,3 +22843,48 @@ pub fn probe_agpr_reload4_ref() -> Function {
 pub fn probe_agpr_reload4() -> Function {
     probe_agpr_reload4_kernel("probe_agpr_reload4", true)
 }
+
+/// Regression probe for the silent miscompile found in the GEMM (docs/agpr.md "LDS spill + DMA operand wait"): the loop-invariant buffer voffset of an LDS-DMA load is spilled to LDS by the
+/// register-pressure ladder (`AMDC_RA_LDS_SPILL=N AMDC_RA_LDS_SPILL_TARGET=0` forces it) and reloaded by a `ds_read` right before the DMA; the DMA must wait for that read.
+/// Without the fix (`AMDC_WAITS_SKIP_FENCE_OPERANDS=1`) the wait is missing and the DMA reads a stale voffset. Output: per thread, n * (first dword of the 16 bytes it DMA-ed), identical
+/// with and without the spill.
+pub fn probe_dma_voff_spill() -> Function {
+    let (mut b, o, n, tid) = sched_begin("probe_dma_voff_spill");
+    let c0 = b.c_i32(0);
+    let c1 = b.c_i32(1);
+    let c16 = b.c_i32(16);
+    let c63 = b.c_i32(63);
+    let c1024 = b.c_i32(1024);
+    let c65536 = b.c_i32(65536);
+    let mul = b.c_i32(0x01010101);
+    let add = b.c_i32(0x04030201);
+    let o16 = b.mul_i32(tid, c16);
+    let w = b.let_(Op::AndI32(Opnd::Val(b.add_i32(b.mul_i32(tid, mul), add)), Opnd::Val(b.c_i32(0x3f3f3f3f))));
+    let data = b.frag4(w, w, w, w);
+    // stage the input in the upper part of the output buffer: in[tid*16 ..] = pattern(tid)
+    let base = b.ptr_add(o, c65536);
+    let pin = b.ptr_add(base, o16);
+    b.store_f32x4(pin, 0, data);
+    b.wait_vm(0);
+    let rin = b.buffer_rsrc(base);
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(b.c_i32(6))));
+    let ldsb = b.mul_i32(wave, c1024);
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
+    let lane16 = b.mul_i32(lane, c16);
+    let rd = b.add_i32(ldsb, lane16);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(c0))]);
+    let (it, acc) = (vars[0], vars[1]);
+    b.buffer_load_lds_b128(rin, o16, c0, ldsb, 0);
+    b.wait_vm(0);
+    let x = b.load_lds_b32(rd);
+    let a2 = b.add_i32(acc, x);
+    b.set_var(acc, a2);
+    let _ = c1;
+    sched_end_loop(&mut b, it, n);
+    let c4 = b.c_i32(4);
+    let off4 = b.mul_i32(tid, c4);
+    let row = b.ptr_add(o, off4);
+    let r = b.bitcast_f32(acc);
+    b.store_f32(row, 0, r);
+    b.finish()
+}
