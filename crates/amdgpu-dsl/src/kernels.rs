@@ -22717,7 +22717,7 @@ fn probe_agpr_reload_kernel(name: &str, inplace: bool) -> Function {
     let nxt = b.add_i32(it, c1);
     let par = b.let_(Op::AndI32(Opnd::Val(nxt), Opnd::Val(c1)));
     let r0 = b.mul_i32(par, c8192);
-    let r1 = b.sub_i32(c8192, r0);
+    let r1 = b.xor_i32(r0, c8192);
     let la = b.add_i32(off, r0);
     let lb = b.add_i32(off, r1);
     if inplace {
