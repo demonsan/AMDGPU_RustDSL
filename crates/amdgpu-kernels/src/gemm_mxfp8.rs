@@ -61,6 +61,8 @@ pub struct GemmConfig {
     pub early_scales: bool,
     /// extra scheduler tokens for this kernel (Function::sched_opts, on top of the Gemm profile's wait pass), e.g. "hoistchain"
     pub sched: &'static str,
+    /// `RegStaged`: two tiles per loop pass with static ring slots (Pipeline::unroll2, the vendor u2)
+    pub unroll2: bool,
     pub ablate: Ablate,
 }
 
@@ -69,7 +71,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -77,7 +79,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -760,6 +762,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_gap2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_late" => GemmConfig { early_scales: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_noxcd" => GemmConfig { xcd_raster: false, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_u2" => GemmConfig { unroll2: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_prio" => GemmConfig { setprio: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_gap4" => GemmConfig { dma_gap: 4, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_acc32h" => GemmConfig { acc_agpr: 32, sched: "rewait,hoistchain", ..GemmConfig::v4() },
@@ -976,6 +979,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
         Panel { sh, b_base: PANEL_KB * 256, b_off, tr }
     });
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
+    pipe.unroll2 = cfg.unroll2;
     if cfg.three_slots || cfg.reg_staged {
         pipe.vm_inflight = (a_dma.issues.len() + b_dma.issues.len() + 2) as u8;
     }
