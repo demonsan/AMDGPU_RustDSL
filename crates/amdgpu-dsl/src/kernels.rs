@@ -22647,8 +22647,8 @@ fn probe_agpr_m16_kernel(name: &str, mix: bool) -> Function {
     }
     b.var_mfma_scale16(vars[1], a8, b8, c127, c127, 0, 0);
     b.var_mfma_scale16(vars[2], b8, a8, c127, c127, 0, 0);
-    b.var_mfma_scale16(vars[3], a8, a8, c127, c127, 0, 0);
-    b.var_mfma_scale16(vars[4], b8, b8, c127, c127, 0, 0);
+    b.var_mfma_scale16(vars[3], a8, b8, c127, c127, 1, 0);
+    b.var_mfma_scale16(vars[4], b8, a8, c127, c127, 0, 1);
     sched_end_loop(&mut b, vars[0], n);
     let row_off = b.mul_i32(tid, c64);
     let row = b.ptr_add(o, row_off);
