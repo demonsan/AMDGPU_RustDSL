@@ -376,10 +376,10 @@ impl Lowerer {
                 }
             }
         }
-        // LDS reads return in issue order: with no scalar load in flight, `lgkmcnt(n)` (n = LDS read INSTRUCTIONS issued after the newest one
+        // `lgkmn` (opt-in, the GEMM kernels): LDS reads return in issue order: with no scalar load in flight, `lgkmcnt(n)` (n = LDS read INSTRUCTIONS issued after the newest one
         // feeding `srcs`; `pending_lds` holds one entry per instruction) keeps later reads (prefetches) in flight. Untracked LDS writes only make
         // the count conservative (issued earlier: they complete first; issued later: they are not counted in n). The 4-bit counter caps n at 15.
-        if need_lgkm && self.pending_smem.is_empty() && !opt_on("lgkm0") {
+        if need_lgkm && self.pending_smem.is_empty() && opt_on("lgkmn") {
             if let Some(pos) = lds_newest {
                 let after = self.pending_lds.len() - 1 - pos;
                 if after <= 15 {
