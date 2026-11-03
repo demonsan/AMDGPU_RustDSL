@@ -374,3 +374,31 @@ scalarize/imm/sgpr 降级选项（中性）。
 2. **更大的 K 块**：K=256/块 LDS 不够（2×128 KB）。
 3. **8 wave（每 SIMD 2 wave）**：用另一 wave 的 MMA 覆盖本 wave 的 `vmcnt` 等待；需要重新划分寄存器（每 wave 128×64）与 barrier 结构，属大改。
 4. 编译器侧：DMA 发射与 MMA 的精确交错（sched_group_barrier 模式，已可用但简单模式无收益），以及 hazard `s_nop` 的进一步削减。
+
+---
+
+## 12. 补差距轮（2026-11-03 晚）：结论与上限证据
+
+基线（Main 125ab58，GPU 5，交错门禁）：v4 3060 vs vendor 3246 = 0.943。本轮所有候选均未达到 ≥1% 收益，停止并记录证据。
+
+| 候选 | 结果（同会话） | 说明 |
+|---|---|---|
+| vendor 发射顺序复刻（barrier 前 4/8 MMA、DMA 每 2–3 MMA、2nd half 原地重载、ds_read_b64+op_sel、u2） | 已一致 | 我们的 v4 循环与 vendor 结构等价 |
+| barrier 后的标量准备 + t+1 scale 读提前到 barrier 前（prefill） | 3030 / 3041（+8 pre-MMA） | 负 |
+| DMA A/B 交替发射 | 3011（gap 3）/ 3031（gap 2） | 负 |
+| panel 不转置（缩短 prologue） | 3029 | 负 |
+| MFMA 累加器轮换（vdst ≠ srcC，vendor 的寄存器形式） | — | sched 微基准：in-place/轮换/VGPR/AGPR 都是 ~32 cyc/条（±0.2%），ATT 上 vendor 更短的间隔是归因假象 |
+| **split_sync**：B 半 DMA 先发，块首只等 B（vmcnt(8)），块中段 wait+barrier 发布 A（A 多半块延迟预算） | 3046 vs 3060（−0.5%），strict verify 通过 | 单 CU ATT：vmcnt 等待 38k → 0.5k 周期、wave 周期 221k → 198k（−10%），但整卡热态计时不变 |
+| 缩小 scale panel 换出半个 stage | 不可行 | 释放 ≤ 13–15 KB，一个半 stage 需要 32 KB |
+| K=64 tile（32x32x64） | 未做 | 预算只从 1 增到 1.5 个 K128 tile，且 A 回到 64 B 行段（G1 时代 −20%）；在 split_sync 的证据下预期无收益 |
+
+**上限证据**：
+1. MMA-only 流 0.0823 ms（3340 TF/s，指令上限）；DMA+LDS 读+epilogue（无 MMA）0.075 ms；完全重叠时应为 0.0823 ms，我们 0.090 ms，vendor 0.084 ms。
+2. split_sync 把被追踪 CU 上的 DMA 等待几乎清零、该 wave 缩短 10%，整卡热态时间却不变（−0.5%）——瓶颈不在单个 CU 的延迟/排序，而在全卡共享的数据供给
+   （L2/MALL→CU 的带宽与各 CU 之间的竞争、尾部 CTA）。每次 GEMM 从 L2 搬 ~1 GB（256 CTA × 64 块 × 64 KB），≈ 11.6 TB/s。
+3. 计数器（G3/G4）：MFMA、L2/EA 流量与 vendor 相同；剩余差别是每个 CU 的请求形态（vendor 由 wave 0/1 专搬 A、2/3 专搬 B，发射时承受 TA FIFO 反压，
+   ATT 中每条 DMA ~24 周期发射停顿），而我们每个 wave 搬 A+B、停顿暴露在 vmcnt。
+4. 因此剩余 ~5.7% 属于全卡数据供给效率（请求形态/时序对 L2 与 fabric 的影响），用单 CU 的指令顺序、预取距离、寄存器形式都无法再改善；要继续需要
+   全卡级的实验（per-XCD L2 命中/带宽计数、请求形态复刻：wave 角色分工 A/B、或 8 wave），超出本轮预算。
+
+保留的选项（默认关）：`GemmConfig::split_sync` + `Pipeline::top_vm`（经 strict verify，可作为后续全卡实验的起点）。
