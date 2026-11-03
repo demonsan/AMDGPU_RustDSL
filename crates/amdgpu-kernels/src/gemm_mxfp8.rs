@@ -46,6 +46,13 @@ fn smem_block() -> Layout {
     make_layout(tup![16, tup![16, 8]], tup![16, tup![1, 256]])
 }
 
+/// `gemm` on loop variables (the operands of the register-staged tile are loop-carried): same operand / scale exchange as `amdgpu_tile::gemm`.
+fn mma_var(b: &mut FnBuilder, mma: &TiledMma, acc: VarId, a: VarId, bf: VarId, sa: VarId, sb: VarId) {
+    assert_eq!(mma.atom().name, "MfmaScale16x16x128F8");
+    let (x, y, sx, sy) = if mma.swap_ab { (bf, a, sb, sa) } else { (a, bf, sa, sb) };
+    b.var_mfma_scale16(acc, Opnd::Var(x), Opnd::Var(y), Opnd::Var(sx), Opnd::Var(sy), 0, 0);
+}
+
 /// The 96-byte ABI (opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950), declared in offset order.
 fn declare_abi(b: &mut FnBuilder) {
     let ptrs = [("ptr_a", 0u32), ("ptr_b", 8), ("ptr_c", 16), ("ptr_sfa", 64), ("ptr_sfb", 72)];
@@ -117,18 +124,18 @@ struct Body {
     b_rd: LdsPart,
     zero4: ValueId,
     acc: Vec<VarId>,
-    /// register-staged tile: B fragments, A fragments, A scales, B scale
+    /// register-staged tile (`RegStaged`): initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
     staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, ValueId)>,
+    rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, VarId)>,
 }
 
 impl Body {
-    /// Reads the whole tile of `t` into registers (fragments in AGPRs when configured) and selects the scale bytes.
-    fn load_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
-        let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
-        let agpr = self.cfg.agpr_ops;
-        let mark = |b: &mut FnBuilder, v: ValueId| if agpr { b.agpr(v) } else { v };
-        let kbx = ox(t.it);
-        let scr = self.sc_s.at(&t.cur);
+    /// Loads of tile `t`'s operands from `slot`: scale words (one round trip) + byte selects, then the fragments in the order of `order`
+    /// (`(is_b, index)`), each handed to `sink` right after its load (in place of the dead fragment).
+    #[allow(clippy::type_complexity)]
+    fn load_scales(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId) {
+        let nm = (self.cfg.wave_m() / 16) as usize;
+        let scr = self.sc_s.at(slot);
         let so = scr.off_v(b);
         let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
         let (wa, wb) = scr.read(b, |b| {
@@ -139,25 +146,68 @@ impl Body {
             let a = b.bind_i32(ev(scb) + 256);
             (wa, b.load_lds_b32(a))
         });
+        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
+        let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kb) & 3) << 3));
+        (sa, sb)
+    }
+    fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
+        let v = part.read(b, o);
+        if self.cfg.agpr_ops {
+            b.agpr(v)
+        } else {
+            v
+        }
+    }
+    /// The whole tile `t` into registers (prologue: tile 0).
+    fn load_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
+        let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
+        let (sa, sb) = self.load_scales(b, &t.cur, ox(t.it));
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
-        let bf: Vec<ValueId> = (0..nn).map(|j| { let v = br.read(b, j); mark(b, v) }).collect();
-        let af: Vec<ValueId> = (0..nm).map(|i| { let v = ar.read(b, i); mark(b, v) }).collect();
-        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
-        let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
+        let bf: Vec<ValueId> = (0..nn).map(|j| self.frag(b, &br, j)).collect();
+        let af: Vec<ValueId> = (0..nm).map(|i| self.frag(b, &ar, i)).collect();
         self.staged = Some((bf, af, sa, sb));
     }
-    fn compute_tile(&mut self, b: &mut FnBuilder) {
-        let (bf, af, sa, sb) = self.staged.take().expect("tile loaded");
-        let nn = bf.len();
-        for i in 0..af.len() {
-            for j in 0..nn {
-                gemm(b, &self.mma, self.acc[nn * i + j], af[i], bf[j], sa[i], sb, 0, 0);
+    /// The MMAs of the register tile; when `t.staged`, each fragment is reloaded from tile t+1 right after its last use: first half of the B
+    /// fragments with every A fragment, then the B halves are reloaded; second half, after which every A fragment is reloaded; the scales of t+1
+    /// are read before the MMAs.
+    fn compute_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
+        let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
+        let (nm, nn) = (av.len(), bv.len());
+        let next = if t.staged {
+            let (sa, sb) = self.load_scales(b, &t.next, ox(t.it) + 1);
+            Some((self.a_rd.at(b, &self.a_s.at(&t.next)), self.b_rd.at(b, &self.b_s.at(&t.next)), sa, sb))
+        } else {
+            None
+        };
+        let half = nn / 2;
+        for (lo, hi) in [(0, half), (half, nn)] {
+            for i in 0..nm {
+                for j in lo..hi {
+                    mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[i], sbv);
+                }
+                if lo == half {
+                    if let Some((ar, _, _, _)) = &next {
+                        let v = self.frag(b, ar, i);
+                        b.set_var(av[i], v);
+                    }
+                }
             }
+            if let Some((_, br, _, _)) = &next {
+                for j in lo..hi {
+                    let v = self.frag(b, br, j);
+                    b.set_var(bv[j], v);
+                }
+            }
+        }
+        if let Some((_, _, sa, sb)) = next {
+            for i in 0..nm {
+                b.set_var(sav[i], sa[i]);
+            }
+            b.set_var(sbv, sb);
         }
     }
 }
-
 impl PipeBody for Body {
     fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
         // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0
@@ -200,24 +250,38 @@ impl PipeBody for Body {
             b.load_global_lds(pb, sb_m0, 0, 1);
         });
     }
-    fn prologue_compute(&mut self, _b: &mut FnBuilder, _role: Role, _t0: &TileIt) {}
+    fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
+        if self.cfg.reg_staged {
+            self.load_tile(b, t0);
+        }
+    }
     fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
-        (0..(self.cfg.wave_m() / 16) * (self.cfg.wave_n() / 16)).map(|_| (DType::Frag4, Opnd::Val(self.zero4))).collect()
+        let mut v: Vec<(DType, Opnd)> = (0..(self.cfg.wave_m() / 16) * (self.cfg.wave_n() / 16)).map(|_| (DType::Frag4, Opnd::Val(self.zero4))).collect();
+        if let Some((bf, af, sa, sb)) = &self.staged {
+            v.extend(bf.iter().chain(af.iter()).map(|x| (DType::Frag8, Opnd::Val(*x))));
+            v.extend(sa.iter().map(|x| (DType::I32, Opnd::Val(*x))));
+            v.push((DType::I32, Opnd::Val(*sb)));
+        }
+        v
     }
     fn bind_state(&mut self, vars: &[VarId]) {
-        self.acc = vars.to_vec();
+        let na = ((self.cfg.wave_m() / 16) * (self.cfg.wave_n() / 16)) as usize;
+        self.acc = vars[..na].to_vec();
+        if let Some((bf, af, sa, _)) = self.staged.take() {
+            let (nb, nf, ns) = (bf.len(), af.len(), sa.len());
+            let r = &vars[na..];
+            self.rv = Some((r[..nb].to_vec(), r[nb..nb + nf].to_vec(), r[nb + nf..nb + nf + ns].to_vec(), r[nb + nf + ns]));
+        }
     }
     fn v_phase(&mut self, b: &mut FnBuilder, role: Role, t: &TileIt) {
-        if self.cfg.reg_staged {
-            self.load_tile(b, t);
-        } else {
+        if !self.cfg.reg_staged {
             // 2-slot TwoPhaseOffset: the whole tile is computed between the stage of t+1 and its wait (the matrix phase stays empty)
             self.window(b, role, t);
         }
     }
-    fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
+    fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         if self.cfg.reg_staged {
-            self.compute_tile(b);
+            self.compute_tile(b, t);
         }
     }
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
@@ -364,6 +428,11 @@ fn build(name: &str, cfg: Cfg) -> Function {
     pipe.run(b, Role::All, &mut body);
     for v in body.acc.iter().take(cfg.acc_agpr) {
         b.pin_agpr(*v);
+    }
+    if let (Some((bv, av, _, _)), true) = (&body.rv, cfg.agpr_ops) {
+        for v in bv.iter().chain(av.iter()) {
+            b.pin_agpr(*v);
+        }
     }
 
     // ---- epilogue: the (swapped) C layout of the atom x C row-major (bf16); 4 consecutive N per lane = one 8-byte store ----

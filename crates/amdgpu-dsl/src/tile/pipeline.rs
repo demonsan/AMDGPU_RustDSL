@@ -24,13 +24,13 @@ use crate::{DType, Ext, FnBuilder, Opnd, ValueId, VarId, I32};
 pub enum Cadence {
     TwoPhaseOffset,
     OneWindow,
-    /// 2-slot ring with the operands staged through REGISTERS (the aiter 4-wave GEMM): the body reads the whole tile t into registers (`v_phase`),
-    /// one barrier frees its slot, tile t+2 is issued into that slot, the body computes (`m_phase`), `wait_vm(vm_inflight)` completes tile t+1 and a
-    /// barrier publishes it - prefetch distance 2 with two LDS slots:
+    /// 2-slot ring with the operands staged through REGISTERS (the aiter 4-wave GEMM): the body keeps tile t in registers (loop state) and, while
+    /// computing it, reloads them in place from the slot of tile t+1; one wait + barrier per tile publishes t+1 and frees the slot of t, which then
+    /// receives tile t+2 (one tile of DMA latency hidden behind the compute, the LDS reads of t+1 behind the MMAs of t):
     /// ```text
-    /// prologue: stage(0) | stage(1) | stores | wait_vm(0) wait_lds(0) barrier
-    /// loop t:   v_phase(t) | wait_lds(0) barrier | stage(t+2) -> slot(t) | m_phase(t) | wait_vm(n) barrier
-    /// tail:     v_phase | wait_lds(0) barrier | m_phase
+    /// prologue: stage(0) | stage(1) | stores | wait_vm(0) wait_lds(0) barrier | compute(0) = load tile 0 into registers
+    /// loop t:   wait_vm(0) wait_lds(0) barrier | stage(t+2) -> slot(t) | m_phase(t): MMAs of t + in-place loads of t+1 (`t.next`)
+    /// tail:     m_phase (no loads: `staged` = false)
     /// ```
     RegStaged,
 }
@@ -265,26 +265,21 @@ impl Pipeline {
                     it: Opnd::Var(it),
                     cur: SlotIdx::new(idx, it),
                     next: SlotIdx::new(i1, b.bind_opnd(&it_p1)),
-                    // tile t+2 reuses the slot of tile t once its registers are loaded
+                    // tile t+2 reuses the slot of tile t (its registers were loaded in the previous iteration)
                     n2: Some(SlotIdx::new(idx, b.bind_opnd(&it_p2))),
                     masked,
                     staged,
                     tile_rows: self.tile_rows,
                 };
                 self.prebind(b, &t);
-                body.v_phase(b, role, &t);
-                b.wait_lds(0);
-                b.barrier();
                 if staged {
+                    b.wait_vm(0);
+                    b.wait_lds(0);
+                    b.barrier();
                     let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
                     body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
                 }
                 body.m_phase(b, role, &t);
-                if staged {
-                    b.wait_vm(self.vm_inflight);
-                    b.wait_lds(0);
-                    b.barrier();
-                }
                 i1
             }
             Cadence::OneWindow => {
