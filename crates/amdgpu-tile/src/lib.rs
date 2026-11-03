@@ -14,6 +14,7 @@
 pub mod bufdma;
 pub mod copy;
 pub mod dma;
+pub mod fmha;
 pub mod mma;
 
 pub use copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_b, LdsPart, LdsSlotPart, TiledCopy};

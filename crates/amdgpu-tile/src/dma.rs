@@ -98,3 +98,27 @@ fn add0(a: I32, b: &I32) -> I32 {
         a + b
     }
 }
+
+/// Several DMA partitions over the SAME rows (one producer group staging K and V of a tile, `_t128`): the clamped rows are computed once and shared;
+/// each partition adds its own stride, base and column offsets and writes its own slot (own marker).
+pub fn issue_rows_shared(b: &mut FnBuilder, key0: &I32, parts: &[(&DmaPart, &SlotRef)]) {
+    let (first, _) = parts[0];
+    assert!(parts.iter().all(|(p, _)| p.row_c == first.row_c), "issue_rows_shared: partitions of different row shapes");
+    let rb = b.let_i32(key0 + &first.row_dyn);
+    let rows: Vec<I32> = first.row_c.iter().map(|&c| b.let_i32(first.src.row(&rb + c as i32))).collect();
+    for (p, slot) in parts {
+        assert_eq!(slot.sh.name, p.sh.name, "issue_rows_shared: slot of another buffer");
+        let off = slot.off_v(b);
+        let lbase: ValueId = b.bind_i32(&p.lds_wave + off);
+        let n = p.row_c.len() as i64;
+        let dwords = (p.atom.bytes / 4) as u8;
+        slot.write(b, |b| {
+            for q in 0..n as usize {
+                let comp = (p.step * (n - 1 - q as i64)) as i32;
+                let o = b.bind_i32((add0(&rows[q] * &p.src.stride, &p.src.base) + &p.cols[p.col_of[q]]) + comp);
+                let sp = b.ptr_add(p.src.ptr, o);
+                b.load_global_lds(sp, lbase, -comp, dwords);
+            }
+        });
+    }
+}
