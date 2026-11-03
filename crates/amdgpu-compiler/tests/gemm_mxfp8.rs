@@ -14,14 +14,16 @@ fn gemm_variants_build_with_their_layout_proofs_and_compile() {
 }
 
 #[test]
-fn gemm_v3_passes_strict_verification() {
-    let f = amdgpu_compiler::kernel_by_name("gemm_mxfp8_bs_v3").expect("v3");
-    let rep = analyse(&f).expect("analyse");
-    let errs: Vec<String> = rep.errors().iter().map(|e| format!("[{}] {}", e.code, e.msg)).collect();
-    assert!(errs.is_empty(), "{}", errs.join("\n"));
-    let warns = rep.findings.iter().filter(|x| x.severity == Severity::Warning).count();
-    assert_eq!(warns, 0, "{}", rep.render());
-    // the trust ledger: the pipeline tile counter + the two XCD-raster permutation bounds
-    let trusted = rep.findings.iter().filter(|x| x.code == "GV-ASSUME" && x.msg.contains("TRUSTED")).count();
-    assert!(trusted <= 3, "trusted assumes: {trusted}\n{}", rep.render());
+fn gemm_v3_v4_pass_strict_verification() {
+    for name in ["gemm_mxfp8_bs_v3", "gemm_mxfp8_bs_v4"] {
+        let f = amdgpu_compiler::kernel_by_name(name).expect("kernel");
+        let rep = analyse(&f).expect("analyse");
+        let errs: Vec<String> = rep.errors().iter().map(|e| format!("[{}] {}", e.code, e.msg)).collect();
+        assert!(errs.is_empty(), "{name}:\n{}", errs.join("\n"));
+        let warns = rep.findings.iter().filter(|x| x.severity == Severity::Warn).count();
+        assert_eq!(warns, 0, "{name}: {}", rep.render());
+        // the trust ledger: the pipeline tile counter + the two XCD-raster permutation bounds
+        let l = rep.ledger();
+        assert!(l.total() <= 3 && l.tile_trust == 0 && l.region_trust == 0, "{name}: ledger {l:?}");
+    }
 }
