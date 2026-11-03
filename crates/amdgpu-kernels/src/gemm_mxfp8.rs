@@ -195,6 +195,7 @@ impl Body {
     fn load_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
         let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
         let (sa, sb) = self.load_scales(b, &t.cur, ox(t.it));
+        let mut deferred = self.deferred.take();
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
         let bf: Vec<ValueId> = (0..nn).map(|j| self.frag(b, &br, j)).collect();
@@ -244,7 +245,7 @@ impl Body {
 impl Body {
     /// The DMA of one tile (A issues, B issues, the 2 scale loads); `range` selects which of them to issue now (the deferred form spreads them
     /// over the MMA rows).
-    fn stage_now(&mut self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, range: std::ops::Range<usize>) {
+    fn stage_now(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, range: std::ops::Range<usize>) {
         // diagnostic ablations (wrong results): FMHA_ABLATE=gemm_nodma skips the copies
         if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nodma")) {
             return;
@@ -363,6 +364,7 @@ impl PipeBody for Body {
             let a = b.bind_i32(ev(scb) + 256);
             (wa, b.load_lds_b32(a))
         });
+        let mut deferred = self.deferred.take();
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
         // A0 and B0 first; the other B fragments are issued one ahead of the first row of MMAs (partial lgkm waits)
@@ -374,12 +376,12 @@ impl PipeBody for Body {
         for i in 0..nm {
             // prefetch the next A fragment while this one feeds 4 MMAs
             let next = if i + 1 < nm { let v = if let Some(z) = zf { z } else { ar.read(b, i + 1) }; Some(mark(b, v)) } else { None };
-            if let Some((k, s, done)) = self.deferred.take() {
+            if let Some((k, s, done)) = deferred.take() {
                 let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
                 let per = (total + nm - 1) / nm;
                 self.stage_now(b, &k, &s, done..done + per);
                 if done + per < total {
-                    self.deferred = Some((k, s, done + per));
+                    deferred = Some((k, s, done + per));
                 }
             }
             for j in 0..nn {
