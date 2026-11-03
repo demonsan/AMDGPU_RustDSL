@@ -33,9 +33,15 @@ for i in 1 2 3; do
   sums="$sums $(md5sum build/gate/det_$i.bin 2>/dev/null | cut -c1-12)"
 done
 echo "md5:$sums"; [ "$(echo $sums | tr ' ' '\n' | sort -u | wc -l)" = 1 ] && [ -n "$(echo $sums | tr -d ' ')" ] || bad "determinism"
-echo "==== PERF (same run, median of 5 x 100)"
-out=$(REF_ROWS=1 REF_REPS=5 OURS_KERNEL="$K" OURS_TILE_M=256 OURS_TILE_N=256 bash tools/gemm_ref.sh 2>&1)
-r=$(echo "$out" | grep -E '^timing REF' | grep -oE 'median [0-9.]+' | awk '{print $2}'); o=$(echo "$out" | grep -E '^timing OURS' | grep -oE 'median [0-9.]+' | awk '{print $2}')
+echo "==== PERF (interleaved: 7 processes x (vendor, ours) x 3 reps x 100, median of the per-process medians)"
+RS=""; OS=""
+for i in 1 2 3 4 5 6 7; do
+  out=$(REF_ROWS=1 REF_REPS=3 OURS_KERNEL="$K" OURS_TILE_M=256 OURS_TILE_N=256 bash tools/gemm_ref.sh 2>&1)
+  RS="$RS $(echo "$out" | grep -E '^timing REF' | grep -oE 'median [0-9.]+' | awk '{print $2}')"
+  OS="$OS $(echo "$out" | grep -E '^timing OURS' | grep -oE 'median [0-9.]+' | awk '{print $2}')"
+done
+med() { echo $* | tr ' ' '\n' | grep . | sort -g | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'; }
+r=$(med $RS); o=$(med $OS); echo "vendor runs:$RS"; echo "ours runs:  $OS"
 echo "4096x4096x8192: ours $o TF/s vs vendor $r TF/s -> $(awk -v a="$o" -v b="$r" 'BEGIN{printf "%.3f", a/b}')"
 [ -n "$o" ] || bad "perf"
 echo "==== GATE $([ $FAIL = 0 ] && echo PASS || echo FAIL)"
