@@ -137,6 +137,8 @@ struct Lowerer {
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
+    /// AGPR requests from the IR (resolved to vregs in inish).
+    agpr_marks: Vec<amdgpu_dsl::AgprMark>,
     /// `scalarize`: DSL values / loop variables that are wave-uniform integers (computed in SGPRs).
     uniform: HashSet<ValueId>,
     uvars: HashSet<amdgpu_dsl::VarId>,

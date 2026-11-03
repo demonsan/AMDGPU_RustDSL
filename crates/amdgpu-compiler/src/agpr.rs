@@ -190,7 +190,8 @@ pub fn assign(m: &mut MFunction) -> Result<AgprStats, String> {
                 out.push(inst);
                 continue;
             }
-            let ctx = |e: String| format!("block {bi} inst {ii} ({:?}): {e}", inst.op);
+            let opname = inst.op;
+            let ctx = move |e: String| format!("block {bi} inst {ii} ({:?}): {e}", opname);
             match inst.op {
                 MOp::VMovB32 => {
                     let d = inst.dst.unwrap();
