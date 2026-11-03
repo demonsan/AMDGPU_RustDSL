@@ -208,15 +208,19 @@ impl Body {
     fn compute_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
         let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
         let (nm, nn) = (av.len(), bv.len());
-        let next = if t.staged {
-            let (sa, sb) = self.load_scales(b, &t.next, ox(t.it) + 1);
-            Some((self.a_rd.at(b, &self.a_s.at(&t.next)), self.b_rd.at(b, &self.b_s.at(&t.next)), sa, sb))
-        } else {
-            None
-        };
+        let next = if t.staged { Some((self.a_rd.at(b, &self.a_s.at(&t.next)), self.b_rd.at(b, &self.b_s.at(&t.next)), (), ())) } else { None };
+        let mut deferred = self.deferred.take();
+        let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
+        let per = (total + 2 * nm - 1) / (2 * nm);
         let half = nn / 2;
         for (lo, hi) in [(0, half), (half, nn)] {
             for i in 0..nm {
+                if let Some((k, s, done)) = deferred.take() {
+                    self.stage_now(b, &k, &s, done..done + per);
+                    if done + per < total {
+                        deferred = Some((k, s, done + per));
+                    }
+                }
                 for j in lo..hi {
                     mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[i], sbv);
                 }
@@ -235,7 +239,9 @@ impl Body {
                 }
             }
         }
-        if let Some((_, _, sa, sb)) = next {
+        if t.staged {
+            // the scales of t+1 last (their byte selects would otherwise wait at the top of the MMAs)
+            let (sa, sb) = self.load_scales(b, &t.next, ox(t.it) + 1);
             for i in 0..nm {
                 b.set_var(sav[i], sa[i]);
             }
@@ -421,7 +427,7 @@ pub fn gemm_mxfp8_bs_v3() -> Function {
 /// v4: v3 with the register-staged 2-slot cadence (prefetch distance 2): all 16 operand fragments of a tile are read into AGPRs, the slot is refilled
 /// with tile t+2 while the 64 MMAs run.
 pub fn gemm_mxfp8_bs_v4() -> Function {
-    build("gemm_mxfp8_bs_v4", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 24, three_slots: false, reg_staged: true, defer_dma: false })
+    build("gemm_mxfp8_bs_v4", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 24, three_slots: false, reg_staged: true, defer_dma: true })
 }
 
 fn build(name: &str, cfg: Cfg) -> Function {
