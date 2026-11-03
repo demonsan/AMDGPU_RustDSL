@@ -15,4 +15,15 @@ SYM="${REF_KNAME:-$(strings -a "$IMG" | grep -m1 -E '^opus_gemm_gfx950_4wave_pin
     g++ -O3 -march=native -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/gemm_ref_host.cpp -o build/gemm_ref_host \
         -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib" || exit 1
 echo "aiter co: $(basename "$IMG")  symbol: $SYM"
-REF_CO="$IMG" REF_KNAME="$SYM" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-6}" ./build/gemm_ref_host
+# ours: OURS_KERNEL=<amdc kernel name> (OURS_TILE = its CTA tile, default 128)
+OURS_ENV=()
+if [ -n "${OURS_KERNEL:-}" ]; then
+    rm -f "build/$OURS_KERNEL.s"
+    bash tools/container/cargo.sh run -q --bin amdc -- emit "$OURS_KERNEL" ${AMDC_EXTRA_FLAGS:-} --out "/work/build/$OURS_KERNEL.s" 2>&1 | tail -3
+    [ -f "build/$OURS_KERNEL.s" ] || exit 1
+    "${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 \
+        -o "build/$OURS_KERNEL.co" "build/$OURS_KERNEL.s" || exit 1
+    OURS_ENV=(OURS_CO="build/$OURS_KERNEL.co" OURS_KNAME="$OURS_KERNEL" OURS_TILE="${OURS_TILE:-128}")
+fi
+[ -n "${SKIP_REF:-}" ] && IMG=""
+env REF_CO="$IMG" REF_KNAME="$SYM" "${OURS_ENV[@]}" HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-6}" ./build/gemm_ref_host

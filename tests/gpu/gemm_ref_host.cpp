@@ -105,10 +105,12 @@ int main() {
     const double flops = 2.0 * M * N * K;
     const char* gm = std::getenv("GRID_MODE");
     const std::string grid_mode = gm && *gm ? gm : "nm";
-    const int tiles = (M / TM) * (N / TN);
-    dim3 grid = grid_mode == "xcd" ? dim3((tiles + 7) / 8 * 8) : grid_mode == "linear" ? dim3(tiles) : dim3(N / TN, M / TM);
     int rc = 0;
     for (const char* which : {"REF", "OURS"}) {
+        // per-kernel CTA tile (REF_TILE / OURS_TILE, default TILE_M x TILE_N): grid (N / tile, M / tile)
+        const int tm = envi((std::string(which) + "_TILE").c_str(), TM), tn = envi((std::string(which) + "_TILE").c_str(), TN);
+        const int tiles = (M / tm) * (N / tn);
+        dim3 grid = grid_mode == "xcd" ? dim3((tiles + 7) / 8 * 8) : grid_mode == "linear" ? dim3(tiles) : dim3(N / tn, M / tm);
         const char* co = std::getenv((std::string(which) + "_CO").c_str());
         const char* kn = std::getenv((std::string(which) + "_KNAME").c_str());
         if (!co || !*co) continue;
