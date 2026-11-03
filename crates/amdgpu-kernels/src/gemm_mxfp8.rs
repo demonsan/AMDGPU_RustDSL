@@ -61,6 +61,10 @@ pub struct GemmConfig {
     pub early_scales: bool,
     /// extra scheduler tokens for this kernel (Function::sched_opts, on top of the Gemm profile's wait pass), e.g. "hoistchain"
     pub sched: &'static str,
+    /// `RegStaged`: two tiles per loop pass with static ring slots (Pipeline::unroll2, the vendor u2)
+    pub unroll2: bool,
+    /// XCD raster: each XCD's two 4 x 4 blocks stacked vertically (8 x 4 tiles) instead of side by side
+    pub raster_tall: bool,
     pub ablate: Ablate,
 }
 
@@ -69,7 +73,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -77,12 +81,12 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
     pub fn v4() -> GemmConfig {
-        GemmConfig { acc_agpr: 24, reg_staged: true, pre_sync_mmas: 4, sched: "rewait,hoistchain", ..GemmConfig::v3() }
+        GemmConfig { acc_agpr: 24, reg_staged: true, pre_sync_mmas: 4, sched: "rewait,hoistchain", unroll2: true, ..GemmConfig::v3() }
     }
 }
 
@@ -286,6 +290,8 @@ struct Panel {
 
 struct Body {
     cfg: Cfg,
+    /// K / 128 (kernarg)
+    kb_v: ValueId,
     panel: Option<Panel>,
     mma: TiledMma,
     a_s: Shared,
@@ -364,6 +370,9 @@ impl Body {
     /// Scale words + byte selects (shifted to byte 0).
     /// The scale reads of tile `kb` (issue only): the A words (transposed panel: final, 2 words; otherwise to be shifted), the B word and its shift.
     fn scale_issue(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId, I32, bool) {
+        // K group of a real tile (t + 1 is read only when it exists): the clamp is a no-op that bounds it for the verifier's loop-exit-blind intervals
+        let kb = b.bind_i32(kb.lt(ev(self.kb_v)).select_i32(kb.clone(), ev(self.kb_v) - 1));
+        let kb = ev(kb);
         if let Some((base, b_base, b_off, lo, pr)) = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0))))) {
             let sab = b.bind_i32((kb.clone() << 8) + (base as i32) + ev(lo));
             let bo = b.bind_i32(ev(b_off) + kb);
@@ -759,6 +768,14 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_pre8" => GemmConfig { pre_sync_mmas: 8, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_gap2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_late" => GemmConfig { early_scales: false, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_noxcd" => GemmConfig { xcd_raster: false, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_u1" => GemmConfig { unroll2: false, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_tall" => GemmConfig { raster_tall: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_prio" => GemmConfig { setprio: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_gap4" => GemmConfig { dma_gap: 4, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_acc32h" => GemmConfig { acc_agpr: 32, sched: "rewait,hoistchain", ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_pre0h" => GemmConfig { pre_sync_mmas: 0, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_pre8h" => GemmConfig { pre_sync_mmas: 8, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v3_bpre4" => GemmConfig { b_prefetch: 4, ..GemmConfig::v3() },
         "gemm_mxfp8_bs_v3_bpre6" => GemmConfig { b_prefetch: 6, ..GemmConfig::v3() },
         "gemm_mxfp8_bs_v3_prio" => GemmConfig { setprio: true, ..GemmConfig::v3() },
@@ -813,8 +830,10 @@ fn build(name: &str, cfg: Cfg) -> Function {
         let loc = b.bind_i32(ev(id).lshr(3));
         // block (of 16) = 2 (id % 8) + loc / 16 -> (row, col) = (block / 4, block % 4); inside the block: loc % 16 -> (n4, m4)
         let blk = b.bind_i32(((ev(id) & 7) << 1) + ev(loc).lshr(4));
-        let nx = b.bind_i32(((ev(blk) & 3) << 2) + (ev(loc) & 3));
-        let ny = b.bind_i32((ev(blk).lshr(2) << 2) + (ev(loc).lshr(2) & 3));
+        // raster_tall: an XCD's two blocks stacked (8 x 4 tiles) instead of side by side (4 x 8)
+        let (bc, br) = if cfg.raster_tall { (ev(blk).lshr(2), ev(blk) & 3) } else { (ev(blk) & 3, ev(blk).lshr(2)) };
+        let nx = b.bind_i32((bc << 2) + (ev(loc) & 3));
+        let ny = b.bind_i32((br << 2) + (ev(loc).lshr(2) & 3));
         let s = b.bind_i32(ev(okv).eq(0).select_i32(1, 0));
         let px = b.bind_i32(ev(bx0) + ev(s) * (ev(nx) - ev(bx0)));
         let py = b.bind_i32(ev(by0) + ev(s) * (ev(ny) - ev(by0)));
@@ -970,12 +989,13 @@ fn build(name: &str, cfg: Cfg) -> Function {
         Panel { sh, b_base: PANEL_KB * 256, b_off, tr }
     });
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
+    pipe.unroll2 = cfg.unroll2;
     if cfg.three_slots || cfg.reg_staged {
         pipe.vm_inflight = (a_dma.issues.len() + b_dma.issues.len() + 2) as u8;
     }
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
-        cfg, panel, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
+        cfg, kb_v, panel, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
         a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false, npre_done: 0,
     };
     pipe.run(b, Role::All, &mut body);

@@ -114,12 +114,15 @@ pub struct Pipeline {
     /// loading across the next window. Only valid when the body issues no other VMEM in the window and does not use `stage_complete` (the
     /// verifier checks the completion with the counted-vmcnt rule).
     pub vm_inflight: u8,
+    /// `RegStaged`: two tiles per loop pass with STATIC ring slots (0 then 1: the tile counter is even at the top), so the slot offsets are
+    /// constants (the vendor `u2`); the loop may exit between the two halves.
+    pub unroll2: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0 }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -205,6 +208,34 @@ impl Pipeline {
         let nkv_m1 = b.let_i32(ev(self.nkv) - 1);
         let stop = b.bind_cond(!varx(it).lt(&nkv_m1));
         b.break_if(stop);
+        if self.unroll2 && self.cadence == Cadence::RegStaged {
+            // `it` steps by 2 per pass (an affine counter for the protocol model); `idx` = which half the loop left from (0: after the pass, 1:
+            // between the halves) - the last tile is it + idx, in slot idx
+            // first half: tile `it` (even) in slot 0
+            self.iter_rs(b, role, body, Opnd::Var(it), Opnd::I32(0), false, true);
+            let one = b.c_i32(1);
+            b.set_var(idx, one);
+            let mid = b.bind_i32(varx(it) + 1);
+            let stop1 = b.bind_cond(!ev(mid).lt(&nkv_m1));
+            b.break_if(stop1);
+            // second half: tile it + 1 (odd) in slot 1
+            self.iter_rs(b, role, body, Opnd::Val(mid), Opnd::I32(1), false, true);
+            let zero = b.c_i32(0);
+            b.set_var(idx, zero);
+            let it2 = b.bind_i32(varx(it) + 2);
+            b.set_var(it, it2);
+            let stop2 = b.bind_cond(!ev(it2).lt(&nkv_m1));
+            b.break_if(stop2);
+            b.end_loop();
+            let it_t = b.bind_i32(varx(it) + varx(idx));
+            let is_tail = b.bind_cond(ev(self.kv_len).lt((ev(it_t) << self.lg()) + self.tile_rows));
+            b.begin_if(is_tail);
+            self.iter_rs(b, role, body, Opnd::Val(it_t), Opnd::Var(idx), true, false);
+            b.else_();
+            self.iter_rs(b, role, body, Opnd::Val(it_t), Opnd::Var(idx), false, false);
+            b.end_if();
+            return;
+        }
         let i_next = self.iter(b, role, body, it, idx, false, true, true);
         b.set_var(idx, i_next);
         let it_next = b.bind_i32(varx(it) + 1);
@@ -230,6 +261,36 @@ impl Pipeline {
                 n2.off_v(b, *s);
             }
         }
+    }
+
+    /// One `RegStaged` iteration of tile `it` (a bound value) in the static ring slot `slot` (unroll2).
+    fn iter_rs(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: Opnd, masked: bool, staged: bool) {
+        let nkv = ev(self.nkv);
+        let it_p1 = b.let_i32(super::ox(it) + 1);
+        let it_p2 = b.let_i32(super::ox(it) + 2);
+        let other = match slot {
+            Opnd::I32(k) => Opnd::I32(1 - k),
+            o => b.bind_opnd(&(super::ox(o) ^ 1)),
+        };
+        let t = TileIt {
+            it,
+            cur: SlotIdx::new(slot, it),
+            next: SlotIdx::new(other, b.bind_opnd(&it_p1)),
+            n2: Some(SlotIdx::new(slot, b.bind_opnd(&it_p2))),
+            masked,
+            staged,
+            tile_rows: self.tile_rows,
+        };
+        self.prebind(b, &t);
+        body.pre_sync(b, role, &t);
+        if staged {
+            b.wait_vm(0);
+            b.wait_lds(0);
+            b.barrier();
+            let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
+            body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
+        }
+        body.m_phase(b, role, &t);
     }
 
     /// One iteration; returns the next ring index.
