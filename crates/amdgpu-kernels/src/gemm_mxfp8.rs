@@ -303,14 +303,19 @@ impl PipeBody for Body {
         });
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
-        let bf: Vec<ValueId> = (0..nn).map(|j| { let v = br.read(b, j); mark(b, v) }).collect();
+        // A0 and B0 first; the other B fragments are issued one ahead of the first row of MMAs (partial lgkm waits)
         let mut af = { let v = ar.read(b, 0); mark(b, v) };
+        let mut bf: Vec<ValueId> = vec![{ let v = br.read(b, 0); mark(b, v) }];
         let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
         for i in 0..nm {
             // prefetch the next A fragment while this one feeds 4 MMAs
             let next = if i + 1 < nm { let v = ar.read(b, i + 1); Some(mark(b, v)) } else { None };
             for j in 0..nn {
+                if i == 0 && j + 1 < nn {
+                    let v = br.read(b, j + 1);
+                    bf.push(mark(b, v));
+                }
                 gemm(b, &self.mma, self.acc[nn * i + j], af, bf[j], sa[i], sb, 0, 0);
             }
             if let Some(n) = next {
