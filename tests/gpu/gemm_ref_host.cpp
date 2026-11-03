@@ -6,8 +6,8 @@
 // Launches one or two code objects with the same ABI on identical inputs (REF_CO = the aiter .co, OURS_CO = ours, optional), checks a sample
 // of output rows against a double-precision CPU reference and times each kernel (median of REF_REPS repetitions of REF_ITERS launches).
 //
-// env: GEMM_M/N/K (4096/4096/8192), REF_CO + REF_KNAME (symbol), OURS_CO + OURS_KNAME, REF_ROWS (rows checked, 64), REF_WARMUP (50),
-//      REF_ITERS (50), REF_REPS (5), GRID_MODE (nm: grid(N/256, M/256) [default]; xcd: grid(roundup8(tiles)); linear: grid(tiles)),
+// env: GEMM_M/N/K (4096/4096/8192), REF_CO + REF_KNAME (symbol), OURS_CO + OURS_KNAME, REF_ROWS (rows checked, 64), REF_WARMUP (300),
+//      REF_ITERS (100), REF_REPS (7), GRID_MODE (nm: grid(N/256, M/256) [default]; xcd: grid(roundup8(tiles)); linear: grid(tiles)),
 //      TILE_M/TILE_N (256), BLOCK (256), SEED
 #include <hip/hip_runtime.h>
 
@@ -101,7 +101,7 @@ int main() {
             for (int n = 0; n < N; ++n) { double acc = 0; const double* bp = &bdq[(size_t)n * K]; for (int k = 0; k < K; ++k) acc += af[k] * bp[k]; ref[(size_t)i * N + n] = acc; }
         }
     }
-    const int iters = envi("REF_ITERS", 50), warm = envi("REF_WARMUP", 50), reps = envi("REF_REPS", 5);
+    const int iters = envi("REF_ITERS", 100), warm = envi("REF_WARMUP", 300), reps = envi("REF_REPS", 7);
     const double flops = 2.0 * M * N * K;
     const char* gm = std::getenv("GRID_MODE");
     const std::string grid_mode = gm && *gm ? gm : "nm";
