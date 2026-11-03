@@ -26,7 +26,7 @@ def kernel(name, acc_f, ops_f, rot):
     o.append(f"    s_mov_b32 s20, {iters}")
     o.append(f"    v_mov_b32 v{ssc}, 127")
     o.append(f"    v_mov_b32 v{ssc+1}, 127")
-    o.append("LOOP:")
+    o.append(f"{name}_LOOP:")
     for rnd in range(2):
         for i in range(4):
             for j in range(4):
@@ -40,7 +40,7 @@ def kernel(name, acc_f, ops_f, rot):
                 o.append(f"    v_mfma_scale_f32_16x16x128_f8f6f4 {d}, {a}, {b}, {c}, v{ssc}, v{ssc+1}")
     o.append("    s_sub_u32 s20, s20, 1")
     o.append("    s_cmp_lg_u32 s20, 0")
-    o.append("    s_cbranch_scc1 LOOP")
+    o.append(f"    s_cbranch_scc1 {name}_LOOP")
     o.append("    s_endpgm")
     o.append(f".size {name}, .-{name}")
     o.append("\n.p2align 6")
