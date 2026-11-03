@@ -90,12 +90,16 @@ pub struct Pipeline {
     /// ring slot strides whose `slot * stride` offsets (cur, next, n2) are bound at the TOP of every iteration, like the manual `ring()` (otherwise the
     /// first consumer binds them, possibly late in the window: `_t128` measured 4 `v_mul_lo_u32` at the window head). E.g. `vec![32768, 512]`.
     pub prebind: Vec<i64>,
+    /// `OneWindow`: vector-memory operations allowed in flight at the end of a window (`s_waitcnt vmcnt(n)` instead of 0): the number of VMEM ops ONE
+    /// stage issues per wave, so that the wait completes tile t+1 (published by the barrier) while tile t+2, issued at this window's start, keeps
+    /// loading across the next window. Only valid when the body issues no other VMEM in the window and does not use `stage_complete`.
+    pub vm_inflight: u32,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new() }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0 }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -256,7 +260,7 @@ impl Pipeline {
                 }
                 body.window(b, role, &t);
                 if staged {
-                    b.wait_vm(0);
+                    b.wait_vm(self.vm_inflight);
                     body.stage_complete(b, role, &n2);
                     b.wait_lds(0);
                     b.barrier();
