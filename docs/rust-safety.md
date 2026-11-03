@@ -39,12 +39,12 @@
 
 `forbid` 是**编译期硬约束**：任何后续出现的 `unsafe {}`、`unsafe fn`、`unsafe impl`、`unsafe trait` 都会直接编译失败，
 而不是靠 code review 拦住。`crates/amdgpu-compiler/tests/rust_safety.rs::every_crate_forbids_unsafe_code`
-会检查四个 crate root 都声明了该属性（防止有人删掉）。
+会检查各 crate root 都声明了该属性（防止有人删掉）。仓库现有 8 个 crate（`amdgpu-dsl`、`amdgpu-layout`、`amdgpu-isa`、`amdgpu-tile`、`amdgpu-kernels`、`amdgpu-compiler`、`amdgpu-safeasm`、`amdc`），全部在 crate root 写了 `#![forbid(unsafe_code)]`，该测试逐个检查全部 8 个。
 
 ### 1.2 零第三方依赖
 
-四个 crate 的 `[dependencies]` 只有互为 `path` 依赖（`amdgpu-dsl` → `amdgpu-safeasm`，`amdgpu-compiler` → dsl + safeasm，
-`amdc` → dsl + compiler）。**没有任何 crates.io 依赖**，因此不存在 "外部 crate 里的 `unsafe` 我们无法审计" 的问题
+所有 crate 的 `[dependencies]` 只有互为 `path` 依赖（`amdgpu-dsl` → `amdgpu-safeasm`；`amdgpu-isa` → layout；`amdgpu-tile` → dsl + layout + isa；`amdgpu-kernels` → dsl + layout + isa + tile；
+`amdgpu-compiler` → dsl + safeasm + tile + kernels；`amdc` → dsl + compiler；`amdgpu-layout` 无依赖）。**没有任何 crates.io 依赖**，因此不存在 "外部 crate 里的 `unsafe` 我们无法审计" 的问题
 （`tests/rust_safety.rs::no_third_party_dependencies` 强制）。
 
 ### 1.3 无 FFI、无裸指针、无危险构造
@@ -223,13 +223,13 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
 
 | 检查 | 位置 | 当前结果 |
 |---|---|---|
-| 每个 crate forbid unsafe | `tests/rust_safety.rs::every_crate_forbids_unsafe_code` | ✅ 4/4 |
+| 每个 crate forbid unsafe | `tests/rust_safety.rs::every_crate_forbids_unsafe_code` | ✅ 8/8 |
 | 禁用构造逐行扫描 | `tests/rust_safety.rs::no_forbidden_constructs_in_any_source_line` | ✅ 0 命中 |
 | 零第三方依赖 | `tests/rust_safety.rs::no_third_party_dependencies` | ✅ 全 path 依赖 |
 | panic 面报告 | `tests/rust_safety.rs::panic_surface_report` | ✅ 每次打印数字 |
 | safe-asm crate 无 unsafe + 含 forbid | `tests/safeasm.rs::safeasm_crate_forbids_unsafe_and_contains_none` | ✅ |
 | ui 编译失败用例 | `crates/amdgpu-safeasm/tests/ui/` + `compile_fail.rs` | ✅ 29 个（28 fail + 1 pass） |
-| 全量测试 | `cargo test` | ✅ **29 个目标 / 117 项** |
+| 全量测试 | `cargo test` | ✅ **65 个目标 / 306 项** |
 | 禁用构造静态 grep | 见 §1.3 清单 | 全部 **0** |
 
 复现：
@@ -238,5 +238,5 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
 bash tools/container/cargo.sh test -p amdgpu-compiler --test rust_safety -- --nocapture   # 4 项 + panic 面数字
 bash tools/container/cargo.sh test -p amdgpu-compiler --test safeasm | grep forbids      # safe-asm 无 unsafe
 bash tools/container/cargo.sh test -p amdgpu-compiler --test compile_fail                # 29 个 ui 用例
-bash tools/container/cargo.sh test                                                       # 29 targets / 117 tests
+bash tools/container/cargo.sh test                                                       # 65 targets / 306 tests
 ```

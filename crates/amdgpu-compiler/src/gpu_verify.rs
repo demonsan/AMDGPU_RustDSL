@@ -617,6 +617,8 @@ enum AV {
     Ptr { arg: Option<usize>, off: Itv },
     /// A buffer descriptor: the kernarg it was built from and its `num_records` (None = the 0xFFFFFFFF "no bounds" sentinel).
     Rsrc { arg: Option<usize>, num: Option<Itv> },
+    /// A wave-uniform select of pointers / descriptors with different provenance: every access through it is checked against EACH arm.
+    Either(Vec<AV>),
     Other,
 }
 
@@ -882,6 +884,12 @@ impl<'a> An<'a> {
     }
 
     fn check_global(&mut self, what: &str, base: &AV, imm: i128, size: i128, store: bool) {
+        if let AV::Either(arms) = base {
+            for x in arms.clone() {
+                self.check_global(what, &x, imm, size, store);
+            }
+            return;
+        }
         let (arg, off) = match base {
             AV::Ptr { arg: Some(a), off } => (*a, off.clone()),
             _ => {
@@ -931,6 +939,12 @@ impl<'a> An<'a> {
     }
 
     fn check_buffer(&mut self, what: &str, rsrc: &AV, voff: &Option<Opnd>, soff: &Opnd, imm: i128, size: i128, store: bool) {
+        if let AV::Either(arms) = rsrc {
+            for x in arms.clone() {
+                self.check_buffer(what, &x, voff, soff, imm, size, store);
+            }
+            return;
+        }
         let AV::Rsrc { arg, num } = rsrc else {
             let m = format!("stmt {}: {what}: descriptor operand is not a known buffer descriptor", self.idx);
             self.rep.add("GV-GLB-PROV", Severity::Error, m);
@@ -1074,10 +1088,23 @@ impl<'a> An<'a> {
     /// `Select(cond, a, b)` where `cond` compares a value/variable `x` with a bound: evaluate the arms under the refined `x`.
     fn eval_select(&mut self, ty: amdgpu_dsl::DType, cond: &Opnd, a: &Opnd, b: &Opnd) -> AV {
         if !is_int_ty(ty) {
-            if let (AV::Ptr { arg: x, off: ox }, AV::Ptr { arg: y, off: oy }) = (self.av_of(a), self.av_of(b)) {
+            let (va, vb) = (self.av_of(a), self.av_of(b));
+            if let (AV::Ptr { arg: x, off: ox }, AV::Ptr { arg: y, off: oy }) = (&va, &vb) {
                 if x == y {
-                    return AV::Ptr { arg: x, off: ox.join(&oy, &self.cx) };
+                    return AV::Ptr { arg: *x, off: ox.join(oy, &self.cx) };
                 }
+            }
+            // pointers / descriptors of different provenance: keep both arms (flattened)
+            if matches!(ty, amdgpu_dsl::DType::Ptr | amdgpu_dsl::DType::Rsrc) {
+                let mut arms = Vec::new();
+                for v in [va, vb] {
+                    match v {
+                        AV::Either(xs) => arms.extend(xs),
+                        AV::Ptr { .. } | AV::Rsrc { .. } => arms.push(v),
+                        _ => return AV::Other,
+                    }
+                }
+                return AV::Either(arms);
             }
             return AV::Other;
         }
@@ -1238,6 +1265,10 @@ impl<'a> An<'a> {
             Op::ReadFirstLane(a) => AV::Int(self.int_of(a)),
             Op::PtrAdd { base, byte_off } => match self.av_of(base) {
                 AV::Ptr { arg, off } => AV::Ptr { arg, off: off.add(&self.int_of(byte_off)) },
+                AV::Either(arms) => {
+                    let o = self.int_of(byte_off);
+                    AV::Either(arms.into_iter().map(|x| match x { AV::Ptr { arg, off } => AV::Ptr { arg, off: off.add(&o) }, _ => AV::Ptr { arg: None, off: Itv::top() } }).collect())
+                }
                 _ => AV::Ptr { arg: None, off: Itv::top() },
             },
             Op::LoadU16 { .. } => AV::Int(Itv::range(Poly::int(0), Poly::int(65535))),

@@ -158,7 +158,7 @@ pub fn let_(&mut self, op: Op) -> ValueId {
 ### 2.0 先认识它的整体结构
 
 出厂默认路径叫 `fmha_fwd_hd128_mxfp8_auto`——这不是一个单独 kernel，而是**主机侧按形状挑选**
-`_vs128` / `_t128` / `_kvsplit`（见 `tests/gpu/run_ref.sh` 的 `*_auto` 分支与 `docs/current-status.md` §4.1）。
+`_vs128` / `_t128` / `_kvsplit`（今天是 v3 版本 `fmha_fwd_hd128_mxfp8_v3_*`；见 `tests/gpu/run_ref.sh` 的 `*_auto` 分支与 `docs/current-status.md` §4.1）。
 本文拆解单 kernel 快路径 **`_vs128`**：
 
 ```rust
@@ -685,9 +685,9 @@ A 组在最后的剥离迭代多一个（`iter(b, true, false, role_a)`，`kerne
 **代际**（槽/版本是循环计数器 `it`、`idx` 的仿射/周期函数）。编译器静态证明四条义务：
 O1 完成先于发布、O2 发布先于读、O3 读完先于覆写、O4 代际一致。另外：
 - 依赖 wave 号的 `if/else` 两侧动态 barrier 数必须相等，否则死锁（`GV-BAR` / `GV-PROTO-ARRIVAL-MISMATCH`）；
-  出厂 `_vs128` 两侧各 18 个（`current-status.md` §2.1）。
+  `_vs128`（旧手写版与 v3 版相同）两侧各 18 个（`current-status.md` §2.1）。
 - MIR 层还有**路径敏感**的"用前等待"检查：任一路径（含分支一侧、含跨迭代回边）读了在途加载的寄存器 → `GV-WAIT`。
-- 出厂 `_vs128` 的协议模拟检查了 **58,880 个读事件**，0 错误（`gpu-semantics-verifier.md` §3.1）。
+- 旧手写 `_vs128` 的协议模拟检查了 **58,880 个读事件**（v3 `_vs128` 为 73,600 个），0 错误（`gpu-semantics-verifier.md` §3.1）。
 
 **如果写错了会怎样**：
 - 删掉 B 组开头那个 barrier → `GV-BAR|GV-PROTO-ARRIVAL-MISMATCH`："wave-divergent if/else … executes a different number of barriers"。
@@ -789,7 +789,7 @@ pub fn rowsum_var_block() -> AsmBlock {
 certificate: N trusted assumes (a assume_trusted, p tile_trust_periodic, r region_trust), M trusted contracts, K unproven
 ```
 
-出厂 8 个 kernel `--strict` 的合计：**44 trusted assumes / 216 trusted contracts / 0 unproven**（`current-status.md` §2.1）。
+出厂 v3 四个 kernel `--shipped --strict` 的合计：**24 trusted assumes / 100 trusted contracts / 0 unproven**；旧手写集 8 个 kernel `--legacy --strict`：44 / 216 / 0（`current-status.md` §2.1）。
 "认证" = **K = 0，且评审接受这 44 + 216 条**。评审只需要读这些行（例如上文 `kvh` 的那条 `assume_trusted` 及其理由）。
 
 ---
@@ -934,7 +934,7 @@ bash tools/container/cargo.sh run --bin amdc -- emit fmha_fwd_hd128_mxfp8_vs128 
 # 2) 用官方汇编器校验编码并生成 code object
 clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o vs128.co vs128.s
 
-# 3) 严格的 GPU 语义证书（出厂 8 个 kernel；任一 Error → 退出码 1）
+# 3) 严格的 GPU 语义证书（出厂 4 个 kernel；任一 Error → 退出码 1；--legacy 查旧手写集）
 bash tools/container/cargo.sh run --bin amdc -- gpu-verify --shipped --strict
 #    单个 kernel、连 Info（含每条 TRUSTED）一起看：
 bash tools/container/cargo.sh run --bin amdc -- gpu-verify fmha_fwd_hd128_mxfp8_vs128 -v
@@ -990,5 +990,5 @@ MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 => {
 全仓库 `#![forbid(unsafe_code)]`、零第三方依赖——宿主程序本身不可能有 UB；而在手写汇编（safe-asm）里，Rust 的所有权与生命周期真的在把关
 （`Pending` 防提前读/重复等、`Ready<'a>`/`Mfma<'a>` 防覆盖在途操作数）。**第二**，GPU 侧的安全（不越界、读到已完成且已发布的正确那一代、
 barrier 两侧数目相等、寄存器合法、用前等待）是编译器验证器在**你声明的合同之下**证明的，证不出就报带符号残差的 `GV-*` 错误，
-所有被信任的东西都在 `certificate` 账本里可数（出厂：44 / 216 / 0 unproven）。**第三**，"safe" 不等于"算得对"，也不覆盖跨工作组竞争、
+所有被信任的东西都在 `certificate` 账本里可数（出厂 v3：24 / 100 / 0 unproven）。**第三**，"safe" 不等于"算得对"，也不覆盖跨工作组竞争、
 i32 回绕和 safe-asm 块内部访存；改了 kernel 一定重跑 `amdc gpu-verify --shipped --strict` 并跑精度/确定性门禁。

@@ -1,6 +1,6 @@
 # Gen6 results (kernel-opt): K-ahead ring + merged window + rebalance - FINAL NEGATIVE
 
-> Status: FINAL NEGATIVE (K-ahead ring -10.5%, staging VALU in the M window -12..-17%); see docs/current-status.md §5 and round 64 of docs/status.md.
+> Status: FINAL NEGATIVE (K-ahead ring -10.5%, staging VALU in the M window -12..-17%); see docs/current-status.md §5 and round 64 of docs/archive/status.md.
 
 Kernel `fmha_fwd_hd128_mxfp8_vs6` (by name only; `_vs128` and the auto dispatch are untouched). Base: Main 82ff0bf (kernel-occ control: `_vs128` 390.6 best / 389.5 median TFLOP/s at 64 blocks, md5 `faadf00c95f4eaffff94ece7d1429b3d`).
 
@@ -13,7 +13,7 @@ Gates for the DSL control: bf16 dump md5 identical to `_vs128` on 1 8 2048, 4 8 
 **Timing (B1H8S2048, same runs, 300 iters): `_vs128` 387.4-390.0 vs `_vs6` 347.4-347.9 (V-start K issue) = -10.5%** (341.2 with K issued after B1, 321-337 with the V DMA also moved to the M window). Same as g2/g3 (-6..-9%), now with a verified-correct protocol and a deterministic output.
 
 ## Step 2: rebalance iteration - the model's direction is not what the hardware does
-kernel-occ's model (`docs/gen6-rebalance.md`: equal windows iff y = x - 0.175k) says: with the QK work (x ~ 0.5k) moved into V, move ~0.3k of VALU into M. Measured, all md5-identical, TFLOP/s on B1H8S2048 (`_vs128` 387.4-388.1 in the same runs):
+kernel-occ's model (`docs/archive/gen6-rebalance.md`: equal windows iff y = x - 0.175k) says: with the QK work (x ~ 0.5k) moved into V, move ~0.3k of VALU into M. Measured, all md5-identical, TFLOP/s on B1H8S2048 (`_vs128` 387.4-388.1 in the same runs):
 | variant | TFLOP/s | vs `_vs128` |
 |---|---|---|
 | all QK in V, K(t+2) DMA issued at the V start (A), V(t+1) at the V start (B) (`qkv4`) | 347.4-347.9 | -10.5% |

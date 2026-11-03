@@ -1,8 +1,8 @@
 # LLVM tail conformance (pinned LLVM: ROCm 10.1.0, AMD LLVM 24.0.0git)
 
 > **Current status (final).** Pinned LLVM: ROCm 10.1.0 / AMD LLVM 24.0.0git (dialect `llvm24`, default; `llc` built by `tools/llvm_build_llc.sh`); the `llvm20` dialect (ROCm 7.0.2) is also supported.
-> `tail_invariance` guarantees that the llvm-tail and own backends emit the same instruction streams modulo nops / waits / `delay_alu`. `cargo test`: 117 tests / 29 targets green
-> (numbers as in `docs/current-status.md`). 101 MOps have rows in both `llvm20.tbl` and `llvm24.tbl`; the DMA, LDS-direct and `buffer_load ... lds` forms are own-only (kernels using them auto-select the own backend).
+> `tail_invariance` guarantees that the llvm-tail and own backends emit the same instruction streams modulo nops / waits / `delay_alu`. `cargo test`: 306 tests / 65 targets green
+> (numbers as in `docs/current-status.md`). 117 of the 123 MOps have rows in both `llvm20.tbl` and `llvm24.tbl`; the DMA, LDS-direct and `buffer_load ... lds` forms are own-only (kernels using them auto-select the own backend).
 > Known limitations: (1) the `llvm20.tbl` rows are copies of the `llvm24.tbl` rows and are machine-verified only by the llvm24 `llc`; (2) the hazard-oracle test skips the S4 buffer-descriptor ops (a 128-bit SGPR live-in
 > is not expressible in its per-block live-ins), which are covered by the one-row-per-op machine-verifier test and the hardware probes. Design context: `docs/design.md` §2 and §8.
 
@@ -93,7 +93,7 @@ our rows are the gfx950 forms that the pinned llc accepts, validated by the opco
 * Pre-RA MIR tests (490 files; 6 with tail-pass RUN lines): CHECK lines encode LLVM's RA by construction; our RA cannot ingest them (no MOp mapping). Only (C) applies.
 * `.ll` tests (about 7 mention tail passes): need LLVM's whole pipeline.
 * Tests for gfx6-gfx12 variants inside the 178: they run (they are in the identity/differential numbers) but exercise hazards the DSL can never produce.
-* A scheduler level on raw MIR (B). Unknown: how much of LLVM's hazard-rule coverage is reachable from gfx950 DSL code; `tools/hazard_oracle` (pairwise matrix) answers that question for the rules that matter, from the other direction.
+* A scheduler level on raw MIR (B). Unknown: how much of LLVM's hazard-rule coverage is reachable from gfx950 DSL code; `tools/hazard_oracle.sh` (pairwise matrix) answers that question for the rules that matter, from the other direction.
 
 ## 5. Hardware with the ROCm 10.1 tail (GPU 4, Verified)
 `BACKEND=llvm-tail ASM_ROC=<rocm-10.1.0>`: `cargo test` 33 passed; `attention_fwd` ATTENTION_FWD OK; fmha_t 15/15 REF_KERNEL_OK and determinism 5/5 DET_OK with no scheduler, with `AMDC_SCHED=1 AMDC_SCHED_OPTS=swp`, and with `taildup,swp` (Rust RA + Rust scheduler -> LLVM tail).

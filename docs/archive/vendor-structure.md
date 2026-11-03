@@ -37,5 +37,5 @@ the 128-row fallback is the separate `_t128` kernel.
   `docs/current-status.md` and `docs/vendor-spec.md` section 7.12.
 
 ## Measured (historical `_vs` scaffold, B1 H8 S2048, own backend, GPU 0, 30 iters)
-default `_t` 292 | `_vs` (svcorr) 255 | `_vs`+svscale 312 | vendor 515. See `docs/status.md` round 47
+default `_t` 292 | `_vs` (svcorr) 255 | `_vs`+svscale 312 | vendor 515. See `docs/archive/status.md` round 47
 for the historical ablations and negatives; those numbers are not the shipped `_vs128`.

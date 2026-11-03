@@ -8,8 +8,8 @@
 > 缩写：`K` = [`crates/amdgpu-dsl/src/kernels.rs`](../crates/amdgpu-dsl/src/kernels.rs)（22.5k 行），
 > `C` = [`crates/amdgpu-compiler/src/lib.rs`](../crates/amdgpu-compiler/src/lib.rs)，
 > `H` = [`crates/amdgpu-compiler/src/hazards.rs`](../crates/amdgpu-compiler/src/hazards.rs)，
-> `S.rN` = [`docs/status.md`](status.md) 第 N 轮，`CS` = [`docs/current-status.md`](current-status.md)，
-> `VS` = [`docs/vendor-spec.md`](vendor-spec.md)，`KR` = [`docs/kvsplit-results.md`](kvsplit-results.md)。
+> `S.rN` = [`docs/archive/status.md`](archive/status.md) 第 N 轮，`CS` = [`docs/current-status.md`](current-status.md)，
+> `VS` = [`docs/vendor-spec.md`](vendor-spec.md)，`KR` = [`docs/archive/kvsplit-results.md`](archive/kvsplit-results.md)。
 > 行号均在分支 `fmha-port`（HEAD `071f9c5`）上核对过。性能数字默认是 B1H8S2048、own 后端、`_vs128` 强制 64 blocks（per-CU 视角），
 > 除非另注。不同轮次的绝对值基线不同（299 → 453 TFLOP/s），**看相对变化**。
 >
@@ -388,7 +388,7 @@ combine 名字含 `combine8` 供 ref_host 推断每线程元素数）。注意 `
 
 ## 附录 B. 移植状态（M4，2026-11-02，`fmha-port` 基于 `dsl-tile` e42a808）
 
-四个出厂 kernel 已全部用 tile 库重写，位于 `crates/amdgpu-dsl/src/fmha_tile.rs`（共 501 行，含共享 FMHA 胶水）：
+（历史记录）四个当时的出厂 kernel 已全部用 tile 库重写，位于 `crates/amdgpu-dsl/src/fmha_tile.rs`（共 501 行，含共享 FMHA 胶水）。这一组 `dsl_*` 后来被布局层的 v3 集取代为出厂集（`crates/amdgpu-tile/src/fmha.rs`，见 [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9），本清单的模式同样是 v3 移植的 parity 依据：
 
 | 新 kernel | kernel 函数行数 | 使用的库组件 |
 |---|---|---|

@@ -7,7 +7,7 @@
 #   sched : sched_host output hash (FNV of the first 4096 dwords)
 #   probes: attn_host / probe_host printed results (PASS/FAIL plus bad/max_abs_err numbers)
 # Any DIFF means the two tails do not produce the same values -> red flag (the own backend can be
-# silently corrupted; see docs/verification.md).
+# silently corrupted; see docs/archive/verification.md).
 #
 # Usage: HIP_VISIBLE_DEVICES=5 bash tools/bit_exactness.sh [fmha|sched|probes|all]
 # Env:   REF_CO      vendor .co (default: the session copy)

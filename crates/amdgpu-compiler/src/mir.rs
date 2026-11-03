@@ -254,6 +254,10 @@ pub enum MOp {
     SMinI32,
     /// `s_cselect_b32 d, a, b`: d = SCC ? a : b (reads SCC; lowered right after its `s_cmp`)
     SCselectB32,
+    /// `s_cselect_b64 d, a, b` on SGPR pairs (a wave-uniform pointer select; reads SCC)
+    SCselectB64,
+    /// two `s_cselect_b64` on the halves of SGPR quads (a wave-uniform buffer-descriptor select; reads SCC)
+    SCselectB128,
     // misc
     SNop,
     SWaitVm,

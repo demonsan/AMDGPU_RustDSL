@@ -1,6 +1,6 @@
 # 最终总结与对照（第 75 轮）
 
-> 元数据：Main `8fec359`，tag `v2.2-round75-final`，第 75 轮收官。主快照见 `docs/current-status.md`（含已关闭路线的完整清单 §5）；逐轮验证记录、硬件事实和所有数值在 `docs/status.md`；设计在 `docs/design.md`；厂商 kernel 的逐条事实在 `docs/vendor-spec.md`。所有数值结论都能用 `README.md` 里的命令复现。
+> 元数据：Main `8fec359`，tag `v2.2-round75-final`，第 75 轮收官。主快照见 `docs/current-status.md`（含已关闭路线的完整清单 §5）；逐轮验证记录、硬件事实和所有数值在 `docs/archive/status.md`；设计在 `docs/design.md`；厂商 kernel 的逐条事实在 `docs/vendor-spec.md`。所有数值结论都能用 `README.md` 里的命令复现。
 
 本文按"目标 → 现状 → 证据 → 差距"整理整个工作。第 37 轮版本只覆盖了最初的 `fmha_fwd_hd128_mxfp8_t`（186 TFLOP/s，厂商的 0.36 倍）；之后的 38 轮把它推进到发布路径 1.25–1.31 倍厂商、单 CU 0.84 倍厂商，并把"能不能再进一步"的问题用测量关闭。
 
@@ -12,7 +12,7 @@
 | 自研编译器（SSA → MIR → 寄存器分配 → 调度 → asm） | 已实现，默认后端是 `llvm-tail`（自研 lowering / RA / 调度，LLVM 只负责 wait / hazard / memory legalizer）；`--backend=own` 保留完整自研 tail | `docs/llvm-tail-integration.md`，`tests/tail_invariance.rs` |
 | 验证 | DSL / MIR 验证器、RA 后检查、safe-asm 序列的 `pin_check`（对最终 MIR 重跑 value-hazard pass），`cargo test` 29 个目标共 117 项通过 | `cargo test` |
 | 在 gfx950 真机运行并通过数值验证的 attention kernel | **达成并超过**：`attention_fwd`（fp16）与 MXFP8 厂商 ABI 的 FMHA 家族在 MI355X 上运行，15 个形状逐元素对拍 | `tests/gpu/run.sh`、`tests/gpu/run_ref.sh`、`tools/gen9_gate.py` |
-| 推进 FMHA 参考 core loop 的 1:1 复刻 | **功能与接口 1:1，指令级结构不同**：ABI、网格、缩放用法、数值约定、主要硬件指令族一致，并已通过 15 形状对拍与真机计数器对账；核心循环是另一种实现（`Sᵀ = K Qᵀ`，分数全在寄存器，128-key 单元，一个 rollback，每 tile 两个 barrier）。结构层面的逐指令复刻（vendor-order M 窗口、持久偏置 C、V 预读）做了完整的有界实验，结论为负（§6、§7） | `docs/gen9-vendor-mirror-design.md`、`docs/status.md` 第 68/70/73/75 轮 |
+| 推进 FMHA 参考 core loop 的 1:1 复刻 | **功能与接口 1:1，指令级结构不同**：ABI、网格、缩放用法、数值约定、主要硬件指令族一致，并已通过 15 形状对拍与真机计数器对账；核心循环是另一种实现（`Sᵀ = K Qᵀ`，分数全在寄存器，128-key 单元，一个 rollback，每 tile 两个 barrier）。结构层面的逐指令复刻（vendor-order M 窗口、持久偏置 C、V 预读）做了完整的有界实验，结论为负（§6、§7） | `docs/archive/gen9-vendor-mirror-design.md`、`docs/archive/status.md` 第 68/70/73/75 轮 |
 | 性能 | 发布路径（`_auto`）B1H8S2048 **674–705 TFLOP/s = 厂商同轮 536–539 的 1.25–1.31 倍**；单 CU 453–455 TFLOP/s = 7.07–7.10 TF/CU，厂商 8.41 TF/CU（我们是它的 0.84 倍）；填满网格 B4H8S2048 0.846 倍、B1H8S8192 0.841 倍；中等形状 ≥ 厂商（1.00–1.16 倍） | §2 |
 
 ## 2. 认证数字（Main `8fec359`）
@@ -76,9 +76,9 @@
 2. **two-phase RA 的 reaching-writer 错误**：两阶段寄存器分配在循环携带 / 条件写路径上选错了到达写者，导致把仍活跃的值覆盖（`biasacc,vpre` 组合在全重排调度器下非确定性，其他调度配置下确定）。修复由 backend（`backend-race` 分支）在两阶段 RA 中完成，`AMDC_RA_FORCE_TWOPHASE` 保留为回归开关。
 3. **VMEM 宽存储数据 WAR（第 69 轮，影响最大）**：`global_store_dwordx4` 在发射之后的数个周期里才读取它的数据 VGPR；我们自己的 tail 没有为"宽存储之后 2 个 wait state 内对同一数据寄存器的 VALU 写"补 `s_nop`（LLVM 的 `has12DWordStoreHazard` 有）。KV-split 的 fp16 partial 尾部在 4 个 lane（j = 25/27/29/31）的 `ec = 1` 字上间歇性被新值污染：均匀 tile 数形状无感，不均匀 tile 数（B1H2S200 SK1337）0–5% 的启动出错，时序漂移时升到 30%。修复：`hazards::pad_physical_war` 记录宽存储数据范围并为后续 VALU 写补 `s_nop`（`_kvsplit` 仅多 4 条 `s_nop`，成本 0.3%，噪声级），`AMDC_NO_PHYS_STORE=1` 保留为 A/B 开关。附带结论：单次 5/5 确定性测试不足以认证，必须做重复启动完整输出 md5 压力（1200/1200）并保留 `epw` 探测器；`emit_fmha_vs9_role` 是 vs128 role 的逐字节副本，补丁必须落在 vs128 role。
 
-早期修复的编译器问题（MFMA 结果读取缺 nop、scale 操作数缺 `s_waitcnt`、控制流两侧共享 pending-load、常量缓存未按区域隔离、空 block 拉长活跃区间等）仍保留回归测试，见 `docs/status.md` 前 40 轮。
+早期修复的编译器问题（MFMA 结果读取缺 nop、scale 操作数缺 `s_waitcnt`、控制流两侧共享 pending-load、常量缓存未按区域隔离、空 block 拉长活跃区间等）仍保留回归测试，见 `docs/archive/status.md` 前 40 轮。
 
-## 6. 已关闭的负面路线（每条一句归因；完整数据见 `docs/status.md` 与 `docs/current-status.md` §5）
+## 6. 已关闭的负面路线（每条一句归因；完整数据见 `docs/archive/status.md` 与 `docs/current-status.md` §5）
 
 | 路线 | 结果 | 一句归因 |
 |---|---|---|
@@ -120,4 +120,4 @@ python3 tools/gen9_gate.py <run_ref 日志>               # 精度 / vendor-pari
 BACKEND=own bash tests/gpu/determinism.sh               # 5 个形状；认证还需要重复启动完整输出 md5 压力
 ```
 
-重复启动压力与 `epw` 探测器的用法见 `docs/vendor-spec.md` §7.11 与 `docs/status.md` 第 69 轮。
+重复启动压力与 `epw` 探测器的用法见 `docs/vendor-spec.md` §7.11 与 `docs/archive/status.md` 第 69 轮。

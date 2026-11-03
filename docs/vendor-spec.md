@@ -467,7 +467,7 @@ reference. A faster kernel that changes numerics fails the correctness gate rega
 | row-sum cycle cost per 128 keys | 32 (2 smfmac) | 128 (2 scaled MFMA) | <= 32 |
 | smfmac operand hazard | no VALU-written A/B/C within 8 clocks (2 waits) of an smfmac; no non-zero VALU-initialised accumulator feeding an smfmac | n/a (no smfmac yet) | required (see 4.5.2) |
 | iteration unit | 128 keys per barrier pair | checked per push | required |
-| correctness | 15/15 REF shapes + determinism | same | unchanged (docs/verification.md) |
+| correctness | 15/15 REF shapes + determinism | same | unchanged (docs/archive/verification.md) |
 
 Failure of the wall/throughput lines with all counter lines green means the scheduler/prefetch structure
 (item 5) is still wrong; failure of the VALU lines points at the emitter/codegen (items 1, 4).
@@ -930,7 +930,7 @@ harness merge `d090f89`, warm-up protocol `3d654cc`). `_t128` shipped form: 128 
 of g3; `_vs128` has 2), every wave stages K and V (`global_load_lds` = 8 per tile vs 4), row-sum =
 **4x smfmac complementary chain**, LUT correction through the **short/long two-copy selection** (short
 copy: 32 `v_perm_b32` + 32 `v_pk_sub` + 32 `v_and_b32` per tile; long copy: 0). Note the design doc
-`docs/gen4-tiling-design.md` predicted 99840 B; the emitted kernel uses 135168 B - the
+`docs/archive/gen4-tiling-design.md` predicted 99840 B; the emitted kernel uses 135168 B - the
 "1 block/CU" property still holds, but the design-doc number is stale.
 Correctness/equivalence: full-output **bit-identical** to `_vs128` on B1H8S2048,
 md5 `faadf00c95f4eaffff94ece7d1429b3d` (same as kernel-opt's `faadf00c`); determinism 5/5 x2; gate at
@@ -1754,8 +1754,9 @@ an opt-in fallback (bit-identical, ~11% split cost) if a future hazard is found.
 
 ## 7.12 Certified closure (Main v2.2-round75-final)
 
-Snapshot: **Main `8fec359`, tag `v2.2-round75-final`**. This is the certified our-vs-vendor table; historical
-round tables above are superseded for headline numbers.
+Snapshot: **Main `8fec359`, tag `v2.2-round75-final`**. This is the certified our-vs-vendor table of the hand-written kernel set at
+round 75; historical round tables above are superseded for headline numbers. The shipped set has since moved to the layout-layer kernels
+`fmha_fwd_hd128_mxfp8_v3_*` (within the 3% port gate of this table); current numbers: [`current-status.md`](current-status.md) §4.
 
 | metric | ours | vendor (same-run) | ratio |
 |---|---:|---:|---:|
@@ -1779,7 +1780,7 @@ build switches PV to unscaled and XDL remains 1216.
 consistent with our 4 smfmac vs the vendor's 2** (2x16=32, partly overlapped). Even the numerically invalid
 `qkzero` build is at 1111, 23 above 1088, and its wave is still 1355. The saved XDL reappears as WAIT_ANY
 (+118 for `biasacc` vs base), i.e. at the barrier rendezvous; it does not become wall time. Per-CU/filled
-sweeps of all gen10 variants are in `docs/status.md` round 75 and `docs/current-status.md` section 5.
+sweeps of all gen10 variants are in `docs/archive/status.md` round 75 and `docs/current-status.md` section 5.
 
 **Closure statement.** The structural line is closed with the filled ratios **0.846x / 0.841x**; occupancy is
 identical to the vendor (1 block/8 waves per CU, 2 waves/SIMD, LDS 102400 vs 84224 B, VGPR 249 vs 246), so the

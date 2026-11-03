@@ -148,7 +148,7 @@ pub fn fmha_fwd_hd128_mxfp8_dsl_vs128() -> Function {
     fb.finish()
 }
 
-/// `_kvsplit` (phase 1 of the sequence-parallel attention, docs/kvsplit-design.md): the `_vs128` block over one key range per block; writes the fp16
+/// `_kvsplit` (phase 1 of the sequence-parallel attention, docs/archive/kvsplit-design.md): the `_vs128` block over one key range per block; writes the fp16
 /// normalised partial `Ohat` and `lse` instead of the output. Grid `(ceil(S/256), H, B * splits)`; kernarg = the base ABI + 0x270..0x287.
 pub fn fmha_fwd_hd128_mxfp8_dsl_kvsplit() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_dsl_kvsplit", 512);

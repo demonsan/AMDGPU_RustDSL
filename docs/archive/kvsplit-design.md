@@ -1,6 +1,6 @@
 # KV-split design study (sequence-parallel attention with an exact cross-block merge)
 
-> Status: ADOPTED - shipped as one of the default dispatch paths (`_kvsplit` + `_kvsplit_combine8h` selected by `_auto`); see docs/kvsplit-results.md, docs/current-status.md and rounds 60-62, 69 of docs/status.md.
+> Status: ADOPTED - shipped as one of the default dispatch paths (`_kvsplit` + `_kvsplit_combine8h` selected by `_auto`); see docs/archive/kvsplit-results.md, docs/current-status.md and rounds 60-62, 69 of docs/archive/status.md.
 
 Status: **design study, no kernel implementation** (2026-10-30). Baseline: branch `final-auto`, validated build
 `6e9e988` (auto dispatch certified in `docs/vendor-spec.md` §7.9.5c), GPU 5, MI355X (gfx950). Numbers marked

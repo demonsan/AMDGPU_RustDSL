@@ -1,6 +1,6 @@
 # Generation 4: 128-row blocks (tiling change) - design
 
-> Status: ADOPTED - the 128-row tiling shipped as `_t128` (the default path for under-filled grids, selected by `_auto`); see docs/current-status.md and round 59 of docs/status.md.
+> Status: ADOPTED - the 128-row tiling shipped as `_t128` (the default path for under-filled grids, selected by `_auto`); see docs/current-status.md and round 59 of docs/archive/status.md.
 
 Status: design (kernel-opt). Baseline `fmha_fwd_hd128_mxfp8_vs128` 367 TFLOP/s on B1H8S2048 (own backend).
 Origin: kernel-occ §7.9: the grid is only 25% full. `ref_host` launches `(ceil(S/256), H, B)` blocks of 512 threads (8 waves, 32 query rows per wave, 256 rows per block); B1H8S2048 = 8 x 8 x 1 = **64 blocks on 256 CUs** (none of the 15 shapes fills the GPU). 367 vs 515 TFLOP/s is a per-CU ratio (5.7 vs 8.05 TFLOP/s/CU).
@@ -75,7 +75,7 @@ Next (not done): overlapping more of V and M inside the wave (the full scheduler
 
 ## 11. Dispatch guard for the KV-split candidate (design, harness implemented)
 
-The KV-split prototype (`docs/kvsplit-design.md`) is a second way to spend the same waves: split the key
+The KV-split prototype (`docs/archive/kvsplit-design.md`) is a second way to spend the same waves: split the key
 dimension `s` ways, keep the `_vs128` 8-wave block shape (one block/CU = 2 waves/SIMD), and merge the `s`
 normalized partials (`Ohat` fp32 + `lse` fp32) with a small combine kernel. It only helps when it can turn an
 under-filled grid into a full one, and its partial-write + combine cost is a fixed overhead, so it must not be
@@ -104,7 +104,7 @@ use_split = (N256 <= 128) && (N256*s <= 256) && ((s-1)*tps < ntiles) && (T_kv < 
 * `N256*s <= 256` requires the split grid to fit **one** block wave; two block waves give no extra CU fill and
   only add traffic (measured `_t128` collapse at 2N > 256, `docs/vendor-spec.md` §7.9.5c).
 * `T_kv < 0.95*T_cur` keeps a 5% safety margin and prevents the fixed ~5 us combine from eating tiny shapes.
-* The constants are the measured rates from `docs/kvsplit-design.md` (5.9/4.03 TFLOP/s/CU, 4.8 TB/s write,
+* The constants are the measured rates from `docs/archive/kvsplit-design.md` (5.9/4.03 TFLOP/s/CU, 4.8 TB/s write,
   7.4 TB/s combine); they are model inputs, to be re-calibrated after the Step A measurement.
 * Overrides: `REF_SPLIT=s`, `REF_CO2_SPLIT`/`REF_KNAME2_SPLIT`, `REF_CO2_COMBINE`/`REF_KNAME2_COMBINE`,
   `REF_SPLIT_FORCE=1` (bypasses the guard for the gate), `REF_SPLIT_ULP`, `REF_COMBINE_THREADS/GRID`.

@@ -1,6 +1,6 @@
 # DSL tile 抽象层设计（`amdgpu_dsl::tile`）
 
-> 状态：Phase 1 设计稿 + 实现路线（分支 `dsl-tile`）。作者：backend-llvm-tail（DSL 架构 + 库实现）。
+> 状态：**已实现**（`crates/amdgpu-dsl/src/tile/`；用它写成的 `fmha_fwd_hd128_mxfp8_dsl_*` 曾是出厂集，现保留为 `fmha_fwd_hd128_mxfp8_dsl_auto` 供 A/B）。本文是 Phase 1 设计稿 + 实现路线（分支 `dsl-tile`）。作者：backend-llvm-tail（DSL 架构 + 库实现）。
 > 目标（用户原话）："我专门开 dsl 出来，就是为了让你增加一些抽象来简化上层 kernel 的编写负担。不是把 asm 包一层隐藏起来。"
 > 验收（用户批准）：四条出厂 FMHA fwd 路径（`_vs128`、`_t128`、`_kvsplit`、`_kvsplit_combine8h`）全部在新抽象上重写；性能与当前手写 kernel 相差 ≤ ~3%；
 > 数值过现有门禁（15 形状、64 行 bad=0、确定性、split 形状重复启动压力）；不要求 bit-identical；`amdc gpu-verify --shipped --strict` 0 错误；`cargo test` 绿；

@@ -1540,6 +1540,17 @@ impl FnBuilder {
     }
 
     /// `ds_read_b64`: two dwords from LDS (8-byte aligned) as a `Frag2`.
+    /// Wave-uniform select of two buffer descriptors (`s_cmp` + 2 x `s_cselect_b64`, no branch): `cond` must be a (possibly negated) signed compare
+    /// of wave-uniform integers. The GPU-semantics verifier proves every access through the result against BOTH descriptors.
+    pub fn select_uniform_rsrc(&mut self, cond: impl Into<Opnd>, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Select { ty: DType::Rsrc, cond: cond.into(), a: a.into(), b: b.into() })
+    }
+    /// Wave-uniform select of two SGPR pointers (kernarg pointers or uniform pointer arithmetic; `s_cmp` + `s_cselect_b64`). Accesses through the
+    /// result are proven against BOTH pointers' extents.
+    pub fn select_uniform_ptr(&mut self, cond: impl Into<Opnd>, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Select { ty: DType::Ptr, cond: cond.into(), a: a.into(), b: b.into() })
+    }
+
     pub fn load_lds_b64(&mut self, addr: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsB64 { addr: addr.into() })
     }
@@ -2681,7 +2692,7 @@ fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
 
 /// Semantics of loop variables: a read of a loop variable (`Opnd::Var`) **after a `set_var` of the same variable in
 /// the same iteration** is easy to get wrong - the author usually expects the value just written, but the variable is
-/// loop-carried state whose value after a `set_var` is not guaranteed by the contract (docs/verification.md); use a
+/// loop-carried state whose value after a `set_var` is not guaranteed by the contract (docs/archive/verification.md); use a
 /// plain SSA value (the operand you passed to `set_var`) for intra-iteration producer/consumer pairs.
 /// This lint reports such reads conservatively (a `set_var` inside an `if` counts). Cross-iteration reads (read before
 /// the `set_var`, the common case), reads of the loop condition value held in an SSA value, and reads after the loop are

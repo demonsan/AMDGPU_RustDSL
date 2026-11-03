@@ -2,7 +2,7 @@
 //!
 //! A swizzle XORs a GF(2)-linear function of some SOURCE bits of an offset into disjoint DESTINATION bits: `y = x ^ (M * x[src] << dst_lo)`. CuTe's
 //! `Swizzle<B, M, S>` (`x ^ ((x >> S) & mask_B) << M`, i.e. bits [M+S, M+S+B) into [M, M+B)) is the special case with the identity matrix. The FMHA K/V
-//! tiles use a non-identity matrix (`FMHA128`, docs/status.md: found by brute force, zero LDS bank conflicts for the K reads, the transposing V reads and
+//! tiles use a non-identity matrix (`FMHA128`, docs/archive/status.md: found by brute force, zero LDS bank conflicts for the K reads, the transposing V reads and
 //! the DMA writes): 16-byte chunk `c` (offset bits 4..6) of row `r` (offset bits 7..10 = r mod 16) is stored at chunk `c ^ s(r)` with
 //! `s0 = r2 ^ r0, s1 = r1, s2 = r3 ^ r0`.
 

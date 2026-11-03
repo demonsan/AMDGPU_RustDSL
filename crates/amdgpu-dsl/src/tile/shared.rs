@@ -22,7 +22,7 @@ pub enum Layout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Swz {
     None,
-    /// the FMHA bank-conflict-free swizzle (docs/status.md, `swz`): `s2 = u2 ^ p, s1 = u0, s0 = u1 ^ p` with `u = (r >> 1) & 7`, `p = r & 1`
+    /// the FMHA bank-conflict-free swizzle (docs/archive/status.md, `swz`): `s2 = u2 ^ p, s1 = u0, s0 = u1 ^ p` with `u = (r >> 1) & 7`, `p = r & 1`
     Fmha,
 }
 

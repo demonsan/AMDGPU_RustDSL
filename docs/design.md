@@ -1,6 +1,6 @@
 # 设计规格：Rust DSL 与自研 AMDGPU Compiler（最终架构）
 
-> 本文是**设计规格**（做什么、为什么、边界在哪），不是状态记录。当前数字与结论见 `docs/current-status.md`，逐轮证据见 `docs/status.md`。
+> 本文是**设计规格**（做什么、为什么、边界在哪），不是状态记录。当前数字与结论见 [`current-status.md`](current-status.md)，逐轮证据（第 1–75 轮）归档在 [`archive/status.md`](archive/status.md)。路线 B（布局代数层、GEMM、AGPR、主机侧生成）之后的库结构见 §3.1。
 > 2026-10-27 的初版描述的是一个更大的目标（Resource SSA / Async Graph、MachineDAG、跨卡通信）；最终落地的是下面的架构。初版中**未采纳**的部分与原因集中在 §13。
 
 ## 1. 一句话模型
@@ -18,12 +18,12 @@
 ## 2. 编译管线
 
 ```text
-DSL(Rust) ─► typed IR（Op 83 种 / Stmt 40 种）─► IR 验证器
+DSL(Rust) ─► typed IR（Op 84 种 / Stmt 47 种）─► IR 验证器 + gpu_verify
           ─► lowering（uniform 分析、remat、zeroinit、cmpfold、retarget…）─► 我们的 MIR
           ─► 调度栈（list / hoist / swp / taildup；等待重算）
           ─► pin_check（含 pinned 段的 hazard / wait / 半写校验）
           ─► hazard 填充 / 值级 hazard pass（fix_value_hazards）
-          ─► 寄存器分配（线性扫描 → 两阶段 + path-aware 检查；LDS spill；S4 描述符类）
+          ─► 寄存器分配（线性扫描 → 两阶段 + path-aware 检查；LDS spill；S4 描述符类；AGPR 类 A1–A16）
           ─► 物理级 hazard pass（pad_physical_war）
           ─► post-RA MIR（物理寄存器、已排序）
                ├─ llvm-tail（默认）：导出 MIR → llc -start-before=gcn-create-vopd（只跑 tail pass）
@@ -48,17 +48,29 @@ DSL(Rust) ─► typed IR（Op 83 种 / Stmt 40 种）─► IR 验证器
 
 ## 3. DSL 与 typed IR
 
-- **入口**：`FnBuilder`（约 140 个公开方法）→ `Function`（kernarg ABI；与厂商 kernel 逐字节兼容的 656 字节布局由 kernel 层负责）。
+- **入口**：`FnBuilder`（约 160 个公开方法）→ `Function`（kernarg ABI；与厂商 kernel 逐字节兼容的 656 字节布局由 kernel 层负责）。
 - **值模型**：`ValueId`（单次定义）、`VarId`（循环变量）、`Opnd`、`DType`（`F16/F32/I32/U32/I1/Ptr/Frag2/4/8/16/Rsrc`）。`Rsrc` 只存在于 SGPR 四元组。
 - **控制流**：`begin_loop … end_loop` 是 do-while，循环变量以 `begin_loop(&[(DType, init)])` 声明、`set_var` 更新（`var_lint` 检查单赋值与作用域）；`begin_if` 是 **wave 级**分支（对 `vcc` 的 any 判断，**没有 exec 掩码**），因此体内整 wave 执行。
-- **Uniformity**：lowering 的 `uniform_analysis` 判定波内一致的整数值与循环变量，落入 SGPR（`scalarize`），其余走 VGPR。`s_operand` 对非一致值报错而不是静默降级。
-- **指令族**：MFMA（scaled 32x32x64 f8f6f4 的累加 / zero-C / **C 操作数** 三形式；**unscaled** 同三形式；f16/bf16；`v_smfmac`）、VALU（int/fp、`pk_add/mul/sub`、`perm`、`permlane32_swap`、`pknorm`、`scalef32`/`cvt_pk_fp8` 半写、`exp/rcp/log`、`max3`、`readfirstlane`）、内存（见 §9）、同步（`barrier`、`wait_vm/lds`、`fence_release/acquire` 与 coherent/write-through 访问）。
-- **实验面**：`FMHA_OPT` token 做 A/B；每个优化与负结果都可复现。
+- **Uniformity**：lowering 的 `uniform_analysis` 判定波内一致的整数值与循环变量，落入 SGPR（`scalarize`；`scalarize2` 另把一致的 `min`、一致比较上的 `select`（`s_cmp` + `s_cselect`）与 `readfirstlane` 结果留在 SGPR；`waveuni` 把 `tid >> 6` 视为一致），其余走 VGPR。`s_operand` 对非一致值报错而不是静默降级。
+- **指令族**：MFMA（scaled 32x32x64 f8f6f4 的累加 / zero-C / **C 操作数** 三形式；scaled **16x16x128** f8f6f4（op_sel 选 E8M0 字节）；AGPR（acc_cd）形式；**unscaled** 同三形式；f16/bf16；`v_smfmac`）、VALU（int/fp、`pk_add/mul/sub`、`perm`、`permlane32_swap`、`pknorm`、`scalef32`/`cvt_pk_fp8` 半写、`exp/rcp/log`、`max3`、`readfirstlane`）、内存（见 §9）、同步（`barrier`、`wait_vm/lds`、`fence_release/acquire` 与 coherent/write-through 访问）。
+- **实验面**：`FMHA_OPT` token 做 A/B（`FMHA_OPT_SCOPE` 把 token 限定到别名 kernel 做同轮对照）；每个优化与负结果都可复现。
+
+### 3.1 库分层（路线 B 之后）
+
+| crate | 层 |
+|---|---|
+| `amdgpu-layout` | 布局代数：`Ix`、`IntTuple`、`Layout`、GF(2) `Swizzle`、TV 布局、`IssuePlan` / `layout_to_offsets`、构建期证明（零依赖） |
+| `amdgpu-isa` | gfx950 copy / MMA atom 表（宽度、立即数域、计数器、LDS-direct 形式；A/B/C 的 TV 布局与 provenance） |
+| `amdgpu-tile` | `TiledCopy` / `TiledMma` / `partition_{lds,dma,buffer_dma,global}`、布局导出的主机合同、出厂 v3 FMHA |
+| `amdgpu-kernels` | MXFP8 blockscale GEMM |
+| `amdgpu-dsl` | IR、`FnBuilder`、表达式层、tile 库 L1–L6（上一版出厂集仍可构建）、旧手写 kernel |
+
+布局层只决定**地址与每次操作发射哪些指令**；指令顺序仍由 kernel 作者与调度器决定，安全仍由 `gpu_verify` 证明。入门：[`layout-tour.md`](layout-tour.md)；实施记录：[`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9。主机侧：`amdc gen-host` 从 kernel 合同生成 C++ 头与 JSON（[`host-gen.md`](host-gen.md)）。
 - **IR 验证器**在 lowering 之前运行：类型、立即数位宽（如 MUBUF `imm` 12 位、DS offset 对齐）、描述符操作数必须是 `Rsrc`、soffset 必须是一致整数。
 
 ## 4. MIR 与效应模型
 
-- `MFunction { blocks, vregs: Vec<RClass>, alias, loops, … }`；`RClass` = `V1/V2/V4/V8/V16`（VGPR 元组）、`S1/S2/S4`（SGPR；`S4` 为 4 对齐的 MUBUF 描述符四元组）。
+- `MFunction { blocks, vregs: Vec<RClass>, alias, loops, … }`；`RClass` = `V1/V2/V4/V8/V16`（VGPR 元组）、`A1/A2/A4/A8/A16`（AGPR 元组，见 [`agpr.md`](agpr.md)）、`S1/S2/S4`（SGPR；`S4` 为 4 对齐的 MUBUF 描述符四元组）。
 - `MInst { op: MOp, dst, srcs: Vec<Src>, imm, auto, pin }`。`auto` 标记由 wait 重算 pass 管理的等待；`pin` 标记手写（safe-asm）指令。
 - **效应模型**（`sched/effects.rs`）是调度、RA 活跃性与 wait 重算共用的唯一事实来源：每条指令的读/写 **dword 槽**（`Slot = vreg·16 + dword`，含 `vcc/scc` 槽）、内存访问描述（空间 Global/Lds、读写、基址槽、偏移、大小）、fence 类别（Barrier / WaitVm / WaitLgkm / SetPrio / Nop）。MUBUF 访问以“未知基址”建模（恒 may-alias）；LDS 直达形式 = 全局读 + `Fence::Barrier`，无 VGPR 目的。
 - **MIR 验证器**（`mir::verify`）检查操作数类别与范围（如 `SBufferRsrc` 必须由 S2 构造 S4、buffer imm ≤ 4095）。
@@ -116,7 +128,7 @@ DSL(Rust) ─► typed IR（Op 83 种 / Stmt 40 种）─► IR 验证器
 
 ## 8. 指令覆盖
 
-- **101 个 MOp**，每个在 `llvm20.tbl` 和 `llvm24.tbl` 中有行（`Key[:kinds] | 签名 | MIR 文本`，`kinds` 区分寄存器/立即数源，最具体的行胜出），并有 own emit。
+- **123 个 MOp** 都有 own emit；其中 **117 个**在 `llvm20.tbl` 和 `llvm24.tbl` 中有行（`Key[:kinds] | 签名 | MIR 文本`，`kinds` 区分寄存器/立即数源，最具体的行胜出），其余为 own-only（DMA / LDS 直达 / 16x16x128 scaled MFMA 等）。
 - **own-only**：DMA（`global_load_lds*`）、LDS 直达的 `buffer_load … lds`、以及含它们的 kernel——LLVM MIR 对这些要么无法表达要么与我们的 m0 序列模型不符；`uses_own_only_ops` 据 MIR 实际内容判定，`auto` 后端据此选择。
 - 每个新增 MOp 的最小闭环：DSL op/stmt → lowering → emit → 效应/代价/hazard → 两个 `.tbl` 行（或登记 own-only）→ 探针 kernel 进 `kernel_names()`（覆盖 `asm_assembles`、`tail_invariance`、`llvm_tail`、`register_accounting`）→ 硬件探针。
 - 已知限制：`llvm20` 行是 `llvm24` 行的拷贝，仅由 llvm24 的 `llc` 做机器验证；hazard-oracle 跳过 S4 描述符操作（128 位 SGPR live-in 无法在其按块 live-in 中表达），这些操作由逐行机器验证和硬件探针覆盖。
@@ -126,10 +138,10 @@ DSL(Rust) ─► typed IR（Op 83 种 / Stmt 40 种）─► IR 验证器
 | 路径 | 要点 |
 |---|---|
 | FLAT（`global_*`） | 64 位 VGPR 地址；offset 13 位有符号；`sc1` 写穿/一致性读、`global_atomic_add`（返回旧值，设备作用域）；SADDR 形式（标量基址 + 32 位 VGPR 偏移） |
-| LDS | `ds_read_b32/b128/b64_tr_b8`、`ds_write_b32/b128`；offset 为编译期常量并检查对齐；读写都占 lgkm 队列槽 |
+| LDS | `ds_read_b32/b64/b128/b64_tr_b8`、`ds_write_b32/b64/b128`；offset 为编译期常量并检查对齐（`x + 常数` 链由 lowering 折进立即数）；读写都占 lgkm 队列槽；`ds_read_b128` 可直接写 AGPR |
 | 全局→LDS DMA | `global_load_lds_dwordx4/dword`：LDS 目的 = `M0` + imm + lane·size（`s_mov m0` + `s_nop 0`）；vmcnt 跟踪，效应上带 Barrier fence；own-only |
 | **MUBUF** | 见下 |
-| last-arriver / 内存序 | 完整契约见 `docs/last-arriver-memory-model.md` |
+| last-arriver / 内存序 | 完整契约见 [`last-arriver-memory-model.md`](last-arriver-memory-model.md) |
 
 **MUBUF**（`buffer_load/store_dword{,x2,x4}`、`buffer_load_dword{,x4} … lds`）：
 
@@ -141,7 +153,7 @@ DSL(Rust) ─► typed IR（Op 83 种 / Stmt 40 种）─► IR 验证器
 
 ## 10. safe-asm 桥与 pin
 
-手写热点窗口用 `crates/amdgpu-safeasm`（详见 `docs/safe-asm-design.md`）：
+手写热点窗口用 `crates/amdgpu-safeasm`（详见 [`safe-asm-design.md`](safe-asm-design.md)）：
 
 - **接入**：`Op::Asm`（值形式）、`Stmt::VarAsm`（一个 in/out 循环变量）、`Stmt::VarAsmN`（多 in/out，按声明顺序绑定）。`AsmBlock` 是纯数据（指令 + 端口 + 常量 + pin/loop_body 标志），经 `lower_asm` 降成普通 MIR，**之后与 DSL 代码一起**走调度、RA、hazard、tail。
 - **类型层**：端口（`In<N>` 只读、`inout`、输出）、所有权 token（`Pending`、`Mfma`、`Smfmac`、`Trans`、`Pw<L,H>` 半写 type-state）、`Ready` 证明、const-assert 常量总线、部分 `lgkmcnt/vmcnt` 由 scoreboard 精确给出。
@@ -153,7 +165,7 @@ DSL(Rust) ─► typed IR（Op 83 种 / Stmt 40 种）─► IR 验证器
 
 | 守卫 | 保证 |
 |---|---|
-| `cargo test`（29 个目标 / 117 项） | 全部单元/集成/硬件无关测试（`tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`llvm_tail`、hazard 系列、`ra_reaching`、`pin*`、safe-asm ui compile-fail …） |
+| `cargo test`（65 个目标 / 306 项） | 全部单元/集成/硬件无关测试（`tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`llvm_tail`、hazard 系列、`ra_reaching`、`pin*`、safe-asm ui compile-fail …） |
 | `register_accounting` / `mir_invariants` | 描述符声明了每个用到的寄存器；RA 从不 clobber 活值；已知错误类能被检出 |
 | 硬件探针（`tools/*_probe.sh`） | 新原语的硬件语义（越界、半写、等待态、last-arriver、MUBUF、unscaled MFMA …） |
 | 测量协议 | 溯源核对 `.s/.co`、交错 A/B、同轮厂商、split 形状反复启动比对 md5 |
