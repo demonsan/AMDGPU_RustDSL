@@ -691,6 +691,12 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v2" => GemmConfig::v2(),
         "gemm_mxfp8_bs_v3" => GemmConfig::v3(),
         "gemm_mxfp8_bs_v4" => GemmConfig::v4(),
+        // experiments
+        "gemm_mxfp8_bs_v3_vshare" => GemmConfig { shared_voffsets: true, ..GemmConfig::v3() },
+        "gemm_mxfp8_bs_v4_vshare" => GemmConfig { shared_voffsets: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_acc32" => GemmConfig { acc_agpr: 32, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v3_prio" => GemmConfig { setprio: true, ..GemmConfig::v3() },
+        "gemm_mxfp8_bs_v3_gap3" => GemmConfig { dma_gap: 3, ..GemmConfig::v3() },
         "gemm_mxfp8_bs_v3_nodma" => abl(Ablate { no_dma: true, ..Ablate::default() }),
         "gemm_mxfp8_bs_v3_nomma" => abl(Ablate { no_mma: true, ..Ablate::default() }),
         "gemm_mxfp8_bs_v3_nords" => abl(Ablate { no_lds_reads: true, ..Ablate::default() }),
