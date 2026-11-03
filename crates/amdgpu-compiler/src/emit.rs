@@ -28,6 +28,10 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
         out.push_str(&format!("BB{}:\n", b.label));
         for inst in &b.insts {
             for line in inst_lines(a, inst) {
+                // perf experiment only (AMDC_EXP_NO_NOPS=1: results may be wrong): how much do the hazard pads cost?
+                if line.starts_with("s_nop") && std::env::var("AMDC_EXP_NO_NOPS").map_or(false, |v| v == "1") {
+                    continue;
+                }
                 out.push_str("    ");
                 out.push_str(&line);
                 out.push('\n');
