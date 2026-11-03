@@ -1,6 +1,6 @@
 # 当前状态总览（authoritative snapshot）
 
-本文件是仓库的**唯一权威当前状态快照**，最后更新于 `Main` = `8fec359`（tag `v2.2-round75-final`）。
+本文件是仓库的**唯一权威当前状态快照**，最后更新于路线 B 完成后（`Main` = `7f937f8` + integrate；出厂集 = v3 布局层 kernel）。
 所有数字都来自同轮硬件测量（MI355X / gfx950，`mi355-gpu-53`），复现命令见 §8。
 历史逐轮记录在 `docs/status.md`（25 轮），供应商事实在 `docs/vendor-spec.md`，设计规格在 `docs/design.md`。
 
@@ -15,8 +15,15 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - 单 kernel 每 CU（64 blocks）：**7.07–7.10 TF/CU**，厂商 8.41 → **1.19x 差距**（本设计下限）
 - 铺满网格（B4H8S2048 / B1H8S8192）：**0.846x / 0.841x 厂商**（结构线已量化关闭）
 - 精度 **mean 8.3e-4**（厂商 1.5–2.9e-3，好 2–3 倍），15/15 形状、64 行 bad=0、确定性全过、1200/1200 次启动单一 md5
-- `cargo test` **115 项 / 29 个测试目标全绿**
-- **出厂 kernel 由 tile 抽象库组合（2026-11-02，分支 `fmha-port`，待 Main 合并）**：默认路径 `fmha_fwd_hd128_mxfp8_auto` 的 4 个 kernel 改为
+- `cargo test` **282 项 / 56 个测试目标全绿**（Main@7f937f8）
+- **出厂集 = v3 布局层 kernel（路线 B，tag `v4.1-layout-p3` 起）**：默认路径 `fmha_fwd_hd128_mxfp8_auto` 的 4 个 kernel 是
+  `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-tile/src/fmha.rs`）。K/V/K-scale/Q 的每个地址、
+  K/V/K-scale DMA、bf16 epilogue 与 KV-split 转置暂存都由 `amdgpu-layout` 的布局推导，`amdgpu-isa` 的 atom 描述指令，`amdgpu-tile` 的
+  `TiledCopy`/`TiledMma`/`partition_*` 生成 IR；主机合同由张量布局导出。全套门禁对旧手写集与对 tile 库集均通过（§4.6），证书与两者相同。
+  上一版（tile 库集 `dsl_*`）保留为 `fmha_fwd_hd128_mxfp8_dsl_auto`，旧手写集保留为 `fmha_fwd_hd128_mxfp8_legacy_auto`，两者 md5 不变。
+- **主机侧生成（P5）**：`amdc gen-host` 从 kernel 合同生成 C++ 启动/ABI 头与 JSON（[`host-gen.md`](host-gen.md)）；出厂 `ref_host` 使用生成的命名字段。
+- **MXFP8 blockscale GEMM（P4）**：`gemm_mxfp8_bs_v3` 对照 aiter PR #6696 4-wave pin-AGPR —— **_（待 kernel-opt 填写最终数字）_**；见 §4.7。
+- 上一版说明（2026-11-02）：默认路径 `fmha_fwd_hd128_mxfp8_auto` 的 4 个 kernel 曾为
   `fmha_fwd_hd128_mxfp8_dsl_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-dsl/src/fmha_tile.rs`：kernel 函数 21/19/23/6 行 + 注意力
   `AttnBody` 111 行；FMHA ABI/块设置/K-V 环/epilogue/combine 是库组件 `tile/fmha.rs`）。与旧手写集同轮对照：精度/确定性/压力全过，
   `_vs128` B1H8S2048 bf16 输出 **逐位相同**（`faadf00c…`），split 路径 300/300 单一 md5 与旧集相同；性能见 §4.5。旧手写集保留为
@@ -107,6 +114,20 @@ RACE,ARRIVAL-MISMATCH,NO-COMPLETION,UNROLL-LIMIT,TRUST}` 别名，全部既有�
 | 控制流 | `begin_loop`/`end_loop`、`begin_if`（wave 级）、peel last tile、双 code copy（`svcorr`）、`StoreF32x2/x4`、`Stmt::VarAsm(N)` 桥接手写 asm |
 | 实验面 | **`FMHA_OPT` 108 个 token**：每个优化与负结果都可 A/B、可复现 |
 | ABI | 与厂商**逐字节兼容的 656 字节 kernarg + 网格/数据布局**；`_auto` 按形状 guard 调度 |
+| 布局层（路线 B） | `amdgpu-layout`：`Ix`（静态/动态符号）、`IntTuple`、`Layout` 与 FlyDSL 对齐的代数、GF(2) `Swizzle`、TV 布局、`IssuePlan`/`layout_to_offsets`、构建期证明；`amdgpu-isa`：copy / MMA atom 表；`amdgpu-tile`：`TiledCopy`/`TiledMma`/`partition_{lds,dma,buffer_dma,global}`、布局导出的合同。入门：[`layout-tour.md`](layout-tour.md) |
+
+**crate 地图**：
+
+| crate | 内容 |
+|---|---|
+| `amdgpu-layout` | 布局代数（零依赖） |
+| `amdgpu-isa` | gfx950 copy / MMA atom（依赖 layout） |
+| `amdgpu-tile` | TiledCopy / TiledMma / partition、v3 FMHA kernel（依赖 layout、isa、dsl） |
+| `amdgpu-kernels` | MXFP8 GEMM（P4，随 integrate 合入） |
+| `amdgpu-dsl` | IR、`FnBuilder`、上一版 tile 库（`src/tile/`）、dsl 与旧手写 kernel |
+| `amdgpu-compiler` | lowering、调度、RA、hazard/wait、emit、`gpu_verify`、host-gen（`hostgen`） |
+| `amdgpu-safeasm` | safe-asm 窗口 |
+| `amdc` | CLI（emit / gpu-verify / gen-host / …） |
 
 ### safe-asm 子系统（`crates/amdgpu-safeasm`，`#![forbid(unsafe_code)]`）
 
@@ -132,7 +153,10 @@ RACE,ARRIVAL-MISMATCH,NO-COMPLETION,UNROLL-LIMIT,TRUST}` 别名，全部既有�
 
 | Kernel | 状态 |
 |---|---|
-| `fmha_fwd_hd128_mxfp8_auto` | **默认**（guard 选择下面三者）：`dsl_vs128` / `dsl_t128` / `dsl_kvsplit` + `dsl_kvsplit_combine8h`（tile 库组合，`fmha_tile.rs`） |
+| `fmha_fwd_hd128_mxfp8_auto` | **默认**（guard 选择下面三者）：`v3_vs128` / `v3_t128` / `v3_kvsplit` + `v3_kvsplit_combine8h`（布局层，`crates/amdgpu-tile/src/fmha.rs`） |
+| `fmha_fwd_hd128_mxfp8_dsl_auto` | 上一版 tile 库集 `dsl_*`（`crates/amdgpu-dsl/src/fmha_tile.rs`），A/B 对照用 |
+| `fmha_fwd_hd128_mxfp8_v3s_*` | v3 的别名（同代码），配合 `FMHA_OPT_SCOPE=v3s` 对实验 token 做同轮 A/B |
+| `gemm_mxfp8_bs_v3` / `_v4` | MXFP8 blockscale GEMM（P4，`crates/amdgpu-kernels`，随 integrate 合入）；v4 = 厂商结构（RegStaged、AGPR 原地重载） |
 | `fmha_fwd_hd128_mxfp8_legacy_auto` | 旧手写集（下面四行），A/B 对照用 |
 | `_vs128` | 单 kernel 快路径（铺满网格 / 64-block 基准），256-row block（旧手写） |
 | `_t128` | 128-row block，中等/混合形状的 fallback（旧手写） |
@@ -152,6 +176,30 @@ RACE,ARRIVAL-MISMATCH,NO-COMPLETION,UNROLL-LIMIT,TRUST}` 别名，全部既有�
 
 **代码布局敏感性**：同一 kernel 前置 0..14 条 `s_nop` 使 per-CU `_vs128` 在 444–456 TF/s 间变化（旧、新集相同），单一布局对比不可信；门禁用布局中位数。
 `gpu-verify --shipped --strict`（dsl 四个）：0 错误 0 警告，24 trusted / 100 contracts / 0 unproven，proven 计数与旧集逐项相同。
+
+### 4.6 v3 布局层出厂集（同轮，`tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3`，GPU 6）
+
+| 项 | v3 | 旧手写（同轮） | dsl（另一轮同轮，`SHIP_REF=fmha_fwd_hd128_mxfp8_dsl`） |
+|---|---|---|---|
+| B1H8S2048 出厂路径（split+combine） | 681.1 | 677.1 | 679.0 vs 687.2 |
+| per-CU 64 blocks（单一布局） | 445.1 | 453.1 | 446.4 vs 445.1 |
+| per-CU 8 布局中位数 | 448.1 | 451.8 | 449.0 vs 447.3 |
+| B4H8S2048 / B1H8S8192 | 1418.7 / 1974.8 | 1446.7 / 1986.7 | 1408.0 vs 1413.8 / 1970.9 vs 1967.8 |
+| B2H8S2048 `_t128` 8 布局中位数 | 1035.7（SADDR DMA） | 1040.7 | 1002.4 vs 997.9（SADDR 之前） |
+
+VERIFY 0 错误（trusted 6/29、4/29、12/36、2/6，与 dsl/legacy 相同）、ACC16 15/15、ACC64 四路径 bad=0、DET 5/5、STRESS 300/300 + 100/100：**OVERALL PASS**。
+v3 asm md5：`_vs128` `68d2832b`、`_t128` `f5a43b09`、`_kvsplit` `e4fc18b1`、`_kvsplit_combine8h` `24a95a51`。
+`_t128` 默认用 SADDR 形式的 LDS-DMA（两轮 A/B 布局中位数 +1.8% / +2.1%），`_vs128`/`_kvsplit` 上为 −0.2..−1.4%，保持 opt-in；数字见
+[`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9.4。
+
+### 4.7 MXFP8 blockscale GEMM（P4）
+
+| 项 | 数值 |
+|---|---|
+| kernel / 形状 | `gemm_mxfp8_bs_v3`，M=N=4096、K=8192，256×256×128 tile，4 wave，`v_mfma_scale_f32_16x16x128_f8f6f4`（swap_ab） |
+| 性能 vs 厂商（同轮） | **_（待 kernel-opt 填写）_** |
+| 门禁 | `tools/gemm_gate.sh`：BUILD / VERIFY（strict）/ ACC（3 形状 GEMM_OK）/ DET / PERF —— **_（待填写）_** |
+| 编译器配套 | AGPR 寄存器类与 acc_cd MFMA（sched）、SALU 地址链 `scalarize2`（2771 → 2867 TF/s）、`ds_read_b64`/`ds_write_b64`、验证器 possible-bits 与 box 规则（去掉仅为验证器加的掩码） |
 
 ### 4.3 精度与确定性
 

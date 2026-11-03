@@ -6,6 +6,39 @@
 > 验证器模型见 [`gpu-semantics-verifier.md`](gpu-semantics-verifier.md) 与 [`gpu-semantic-protocol.md`](gpu-semantic-protocol.md)、
 > 当前数字见 [`current-status.md`](current-status.md) §2。
 
+> **路线 B 之后的更新（必读）**：出厂 kernel 现在是 `fmha_fwd_hd128_mxfp8_v3_*`，写在**布局层**上
+> （`amdgpu-layout` → `amdgpu-isa` → `amdgpu-tile`）。本文 §2 逐段拆解的 IR 语义（kernarg 合同、LDS 计划、DMA、MFMA、softmax、
+> barrier、验证器）**全部不变**；变化的是"地址从哪里来"：以前每个 lane 的 LDS/全局地址是手写公式（`RowsReader` 的 `kfx`、`TrReader`
+> 的 `trx`、`RowsCopy` 的列 swizzle），现在由 `Layout`/`Swizzle`/TV 布局推导，再由同一个编译器与验证器处理。
+> 对照阅读 v3 `_vs128`：
+>
+> ```rust
+> // crates/amdgpu-tile/src/fmha.rs:79-90（KvRing3::new，节选）
+> let mma = make_tiled_mma(MmaAtom::mfma_scale_32x32x64_f8(), false);
+> // K: the A operand (32 keys x 64 bytes) at rows 32 s, k-group c
+> let kview = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![32, 64], tup![128, 1]));
+> let placements: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect();
+> let kpart = make_tiled_copy_a(DS_READ_B128X2, &mma).partition_lds(b, &ctx, &l, &ks, &kview, &placements);
+> let vpart = make_tiled_copy(DS_READ_TR_B8X4, vt_tr_source(), 128 * 128, 8).partition_lds(b, &ctx, &l, &vs, &kv_view(), &[0]);
+> …
+> let kdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, ksrc, &ks, &kv_view());
+> ```
+>
+> ```rust
+> // crates/amdgpu-tile/src/fmha.rs:179-187（qk_block：两条 K 片段读、K-scale 字、两次带缩放 MFMA）
+> let k0 = k.read(b, 2 * s);
+> let k1 = k.read(b, 2 * s + 1);
+> let kw = kd.read(b, s);
+> let (sk0, sk1) = blk.sel.pair(b, kw);
+> …
+> gemm(b, &self.ring.mma, t.accs[s].var, k0, q[0].v, sk0, blk.sq[0], 0, 0);
+> gemm(b, &self.ring.mma, t.accs[s].var, k1, q[1].v, sk1, blk.sq[1], 0, 0);
+> ```
+>
+> kernel 函数本身（`fmha.rs:283-303`）与 dsl 版结构相同：`declare_io` → `block3` → `Roles::split` → `KvRing3::new` → `Pipeline` → `store_out3`。
+> 布局层从零讲起的入门见 [`layout-tour.md`](layout-tour.md)；实施记录见 [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9。
+> 下文 §2 的节选仍来自 legacy/dsl 版本（行号以写作时为准），用来解释 IR 层的每个特性。
+
 ---
 
 ## 目录

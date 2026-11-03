@@ -6,6 +6,21 @@
 > 数值过现有门禁（15 形状、64 行 bad=0、确定性、split 形状重复启动压力）；不要求 bit-identical；`amdc gpu-verify --shipped --strict` 0 错误；`cargo test` 绿；
 > 主 kernel 从 ~1600 行降到 ~100–200 行。
 
+> **后续（路线 B，已出厂）**：本文描述的 tile 库（L1–L6，`amdgpu_dsl::tile`）是上一版出厂集 `dsl_*` 的基础。之后按
+> [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) 把其中**与布局有关的层**换成了布局代数：
+>
+> | 本文的层 | 路线 B 中的替代 |
+> |---|---|
+> | L1 张量 `TensorDecl` 自动合同 | 合同从 `amdgpu_layout::Layout` 推出：`amdgpu_tile::contract::compact_tensor` / `same_strides`（`crates/amdgpu-tile/src/fmha.rs:358-430` 的 `declare_io`） |
+> | L3 copy（`RowsCopy`、`DwordRowsCopy`、`RowFrags::load`） | `partition_dma`、`partition_buffer_dma`、`partition_global`（`crates/amdgpu-tile/src/{dma,bufdma,global}.rs`） |
+> | L4 片段读（`RowsReader`、`TrReader`、`RowScaleReader`） | `make_tiled_copy_a/_b/_bcast` + `partition_lds`（`crates/amdgpu-tile/src/copy.rs`），atom 来自 `amdgpu-isa` |
+> | L4 MMA（`qk_tile`/`pv_tile` 中的 MFMA） | `TiledMma` + `gemm`（`crates/amdgpu-tile/src/mma.rs`；支持 `swap_ab`） |
+> | L2 `LdsPlan`/标记、L5 `Pipeline`、L6 softmax / epilogue 语义 / combine | **保留**，v3 直接复用 |
+>
+> 新的出厂 kernel：`crates/amdgpu-tile/src/fmha.rs`（`fmha_fwd_hd128_mxfp8_v3_vs128` 在 `:283`，K/V 环在 `KvRing3::new` `:64-101`）。
+> 地址等价性由测试保证：`crates/amdgpu-tile/tests/address_equality.rs`（TiledCopy == RowsReader / TrReader，逐 lane）、
+> `crates/amdgpu-tile/tests/dma_equality.rs`（partition_dma == RowsCopy）。入门教程：[`layout-tour.md`](layout-tour.md)。
+
 ---
 
 ## 0. 现状：为什么今天的 kernel 是"带类型的汇编"
