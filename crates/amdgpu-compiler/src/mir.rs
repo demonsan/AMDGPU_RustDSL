@@ -246,6 +246,10 @@ pub enum MOp {
     SAndB32,
     SXorB32,
     SCmpLtI32,
+    /// `s_min_i32` (writes SCC)
+    SMinI32,
+    /// `s_cselect_b32 d, a, b`: d = SCC ? a : b (reads SCC; lowered right after its `s_cmp`)
+    SCselectB32,
     // misc
     SNop,
     SWaitVm,
