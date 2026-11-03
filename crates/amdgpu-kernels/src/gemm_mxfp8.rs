@@ -55,6 +55,8 @@ pub struct GemmConfig {
     pub pre_sync_mmas: usize,
     /// DMA issues share voffsets, the wave-uniform source deltas go to the soffset (pays off once soffset adds are SALU)
     pub shared_voffsets: bool,
+    /// epilogue through LDS: bf16 C block transposed in a wave-private staging area, then 16-byte row-contiguous stores (the vendor form)
+    pub lds_epilogue: bool,
     pub ablate: Ablate,
 }
 
@@ -63,7 +65,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -71,7 +73,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -81,6 +83,9 @@ impl GemmConfig {
 }
 
 type Cfg = GemmConfig;
+/// Epilogue staging row pitch (bytes): 256-byte bf16 rows + 16 bytes of padding (the 16 rows a write instruction touches spread over the banks).
+const EPI_PITCH: i64 = 272;
+
 /// Scale panel capacity in K groups of 128 (the vendor `sp64`): K <= 8192.
 const PANEL_KB: i64 = 64;
 impl GemmConfig {
@@ -735,6 +740,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_acc32" => GemmConfig { acc_agpr: 32, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v3_prio" => GemmConfig { setprio: true, ..GemmConfig::v3() },
         "gemm_mxfp8_bs_v3_gap3" => GemmConfig { dma_gap: 3, ..GemmConfig::v3() },
+        "gemm_mxfp8_bs_v3_directc" => GemmConfig { lds_epilogue: false, ..GemmConfig::v3() },
+        "gemm_mxfp8_bs_v4_directc" => GemmConfig { lds_epilogue: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v3_gap4" => GemmConfig { dma_gap: 4, ..GemmConfig::v3() },
         "gemm_mxfp8_bs_v3_gap3_bpre4" => GemmConfig { dma_gap: 3, b_prefetch: 4, ..GemmConfig::v3() },
         "gemm_mxfp8_bs_v4_gap3" => GemmConfig { dma_gap: 3, ..GemmConfig::v4() },
@@ -817,6 +824,18 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let sc_s = lds.ring("SC", 4 * 512, slots, amdgpu_dsl::tile::Layout::Linear);
     // scale panel: A [PANEL_KB][256 rows] + B [2 blocks][PANEL_KB] (+ 4 bytes of source alignment slack, padded to 256 for the dword DMA)
     let panel_sh = if cfg.scale_panel { Some(lds.tile("SCP", PANEL_KB * 256 + 512, amdgpu_dsl::tile::Layout::Linear)) } else { None };
+    // epilogue staging (wave-private, reusing the dead ring / panel storage): the wave's C block, bf16 rows of EPI_PITCH bytes
+    let epi = if cfg.lds_epilogue {
+        let mut ov: Vec<&Shared> = vec![&a_s, &b_s, &sc_s];
+        if let Some(p) = &panel_sh {
+            ov.push(p);
+        }
+        let per_wave = wave_m * EPI_PITCH;
+        assert!(4 * per_wave <= 160 * 1024 - 16, "epilogue staging does not fit the LDS");
+        Some(lds.private("EPI", per_wave, 4, &ov))
+    } else {
+        None
+    };
     lds.commit(b);
 
     // ---- operand reads: the 16-row blocks of the wave (placements (row block) 2048), the wave offset added to the bases ----
@@ -942,6 +961,10 @@ fn build(name: &str, cfg: Cfg) -> Function {
         }
     }
 
+    if let Some(epi) = &epi {
+        lds_epilogue(b, &ctx, &mma, epi, &body.acc, &lane, &s_lane, &s_n, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n);
+        return fb.finish();
+    }
     // ---- epilogue: the (swapped) C layout of the atom x C row-major (bf16); 4 consecutive N per lane = one 8-byte store ----
     let c_blk = make_layout(tup![16, 16], tup![s_n.mul_c(2), 2]); // element m + 16 n
     let c_plan = IssuePlan::new(mma.c_tv(), 4);
@@ -971,4 +994,82 @@ fn build(name: &str, cfg: Cfg) -> Function {
         b.store_f32x2(bases[bi], imm as u32, f2);
     }
     fb.finish()
+}
+
+/// The LDS-staged epilogue: every accumulator (16 x 16, lane = row m, 4 consecutive n) is converted to bf16 and written to the wave's staging
+/// block E[m][n] (row pitch EPI_PITCH); then each lane reads 16 bytes = 8 consecutive n of one row and stores them with one `buffer_store_dwordx4`
+/// (16 lanes cover a 256-byte row segment). All addresses from layouts: the C TV layout of the atom over E, a row-contiguous read TV layout over E
+/// and the same TV layout over the global C (voffset per lane, the wave-uniform per-issue row step in the SGPR soffset).
+#[allow(clippy::too_many_arguments)]
+fn lds_epilogue(
+    b: &mut FnBuilder, ctx: &Ctx, mma: &TiledMma, epi: &Shared, acc: &[VarId], lane: &Lane, s_lane: &Ix, s_n: &Ix, ptr_c: ValueId, m_v: ValueId,
+    n_v: ValueId, bx: ValueId, by: ValueId, wm: ValueId, wn: ValueId, lg_m: i32, lg_n: i32, wave_m: i64, wave_n: i64,
+) {
+    let d = &ctx.dyns;
+    let (nm, nn) = ((wave_m / 16) as usize, (wave_n / 16) as usize);
+    assert_eq!(wave_n * 2, 256, "lds_epilogue: 128-column wave blocks (256-byte rows)");
+    // every wave is done with the ring / panel storage the staging reuses
+    b.wait_lds(0);
+    b.barrier();
+    let wid = b.bind_i32(lane.wave());
+    let me = epi.mine(wid);
+    let base = b.bind_i32(me.base());
+    // staging layout over the C block element index m + 16 n of one 16 x 16 block: (m, n) -> m EPI_PITCH + 2 n
+    let e_blk = make_layout(tup![16, 16], tup![EPI_PITCH, 2]);
+    let w_plan = IssuePlan::new(mma.c_tv(), 2); // 2 bf16 = one ds_write_b32
+    let mut exprs = Vec::new();
+    for i in 0..nm as i64 {
+        for j in 0..nn as i64 {
+            exprs.extend(w_plan.offsets(&e_blk, s_lane, &Ix::C(16 * i * EPI_PITCH + 32 * j), d));
+        }
+    }
+    let wp = layout_to_offsets(&exprs, &Swizzle::none(), ImmRange::DS, d);
+    let wbases: Vec<ValueId> = wp.bases.iter().map(|e| b.bind_i32(ev(base) + ctx.lower(e))).collect();
+    me.write(b, 0, |b| {
+        for (n, a) in acc.iter().enumerate() {
+            let v: Vec<ValueId> = (0..4u8).map(|r| {
+                let l = b.frag4_lane(Opnd::Var(*a), r);
+                b.bitcast_f32(l)
+            }).collect();
+            for h in 0..2usize {
+                let w = b.cvt_pk_bf16_f32(v[2 * h], v[2 * h + 1]);
+                let (bi, imm) = wp.issues[2 * n + h];
+                let ad = b.bind_i32(ev(wbases[bi]) + imm as i32);
+                b.store_lds_b32(ad, w);
+            }
+        }
+    });
+    b.wait_lds(0);
+    // read / store TV over the wave block element index n + wave_n m: lane -> (chunk = lane % 16: 8 n, row = lane / 16), value -> (8 n, row step 4)
+    let rows_per = 64 / (wave_n / 8); // 4
+    let issues = wave_m / rows_per; // 32
+    let tv = make_layout(tup![tup![wave_n / 8, rows_per], tup![8, issues]], tup![tup![8, wave_n], tup![1, wave_n * rows_per]]);
+    let e_blk2 = make_layout(tup![wave_n, wave_m], tup![2, EPI_PITCH]);
+    let rp = IssuePlan::new(tv.clone(), 8);
+    let rexprs = rp.offsets(&e_blk2, s_lane, &Ix::C(0), d);
+    let rpl = layout_to_offsets(&rexprs, &Swizzle::none(), ImmRange::DS, d);
+    let rbases: Vec<ValueId> = rpl.bases.iter().map(|e| b.bind_i32(ev(base) + ctx.lower(e))).collect();
+    let vals: Vec<ValueId> = me.read_back(b, 0, |b| {
+        rpl.issues.iter().map(|&(bi, imm)| {
+            let ad = b.bind_i32(ev(rbases[bi]) + imm as i32);
+            b.load_lds_b128(ad)
+        }).collect()
+    });
+    // global: C row-major bf16, the wave block at rows m_cta + wave_m wm, cols n_cta + wave_n wn
+    let g_blk = make_layout(tup![wave_n, wave_m], tup![2, s_n.mul_c(2)]);
+    let gofs = rp.offsets(&g_blk, s_lane, &Ix::C(0), d);
+    let voff = b.bind_i32(ctx.lower(&gofs[0]) + (ev(wm) * (wave_m as i32) * ev(n_v) + ev(wn) * (wave_n as i32)) * 2);
+    let rsrc_c = {
+        let nr = b.bind_i32(ev(m_v) * ev(n_v) * 2);
+        let nr = b.read_first_lane(nr);
+        b.buffer_desc_dyn(ptr_c, nr)
+    };
+    let c_org = { let v = b.bind_i32((((ev(by) << lg_m) * ev(n_v)) + (ev(bx) << lg_n)) << 1); b.read_first_lane(v) };
+    for (q, v) in vals.iter().enumerate() {
+        // the per-issue step is wave-uniform (rows_per rows): checked on the layout expressions
+        let dq = gofs[q].sub(&gofs[0]);
+        let dv = b.bind_i32(ev(c_org) + ctx.lower(&dq));
+        let so = b.read_first_lane(dv);
+        b.buffer_store_b128(rsrc_c, voff, so, 0, *v);
+    }
 }
