@@ -73,44 +73,44 @@ fn run(insts: Vec<MInst>) -> (String, MFunction) {
 fn interleaves_independent_mfmas_and_reads_in_the_requested_order() {
     // source: R0..R3 (frags 0..3 of the A side) then M0..M3 (MFMA k reads frag regs 1+2k, 2+2k = ds_read-written tuples only for k < 2 here)
     // -> use reads that feed nothing the MFMAs read: reads write A_2/B_2.. views (k = 2, 3), MFMA 0/1 are independent of them
-    let mut insts = vec![ds_read(2, 0), ds_read(2, 1), ds_read(3, 0), ds_read(3, 1), mfma(0), mfma(1)];
+    let mut insts = vec![ds_read(4, 0), ds_read(4, 1), ds_read(5, 0), ds_read(5, 1), mfma(0), mfma(1)];
     // pattern: MFMA, DS read, MFMA, DS read x3
     insts.push(marker(phase::MFMA, 1));
     insts.push(marker(phase::DS_READ, 1));
     insts.push(marker(phase::MFMA, 1));
     insts.push(marker(phase::DS_READ, 3));
     let (got, _) = run(insts);
-    assert_eq!(got, "M0 R1 M1 R1 R2 R2", "{got}");
+    assert_eq!(got, "M0 R4 M1 R4 R5 R5", "{got}");
 }
 
 #[test]
 fn a_selected_mfma_pulls_the_reads_it_consumes() {
     // M0 consumes A_0/B_0 views loaded by R0 (halves 0,1 of frag 0: regs 14,15 = alias of tuple 1) - ds_read(0,*) writes tuple 1 = MFMA 0's A operand
-    let mut insts = vec![ds_read(0, 0), ds_read(0, 1), ds_read(2, 0), ds_read(2, 1), mfma(0)];
+    let mut insts = vec![ds_read(0, 0), ds_read(0, 1), ds_read(4, 0), ds_read(4, 1), mfma(0)];
     insts.push(marker(phase::MFMA, 1));
     let (got, _) = run(insts);
     // M0 needs R0 (both halves) only; the unrelated reads follow in program order
-    assert_eq!(got, "R0 R0 M0 R1 R1", "{got}");
+    assert_eq!(got, "R0 R0 M0 R4 R4", "{got}");
 }
 
 #[test]
 fn s_setprio_stays_anchored_to_the_mfma_stream() {
-    let mut insts = vec![ds_read(2, 0), mfma(0), MInst::new(MOp::SSetPrio).imm(1), mfma(1), MInst::new(MOp::SSetPrio).imm(0)];
+    let mut insts = vec![ds_read(4, 0), mfma(0), MInst::new(MOp::SSetPrio).imm(1), mfma(1), MInst::new(MOp::SSetPrio).imm(0)];
     insts.push(marker(phase::DS_READ, 1));
     insts.push(marker(phase::MFMA, 2));
     let (got, _) = run(insts);
-    assert_eq!(got, "R1 M0 P1 M1 P0", "{got}");
+    assert_eq!(got, "R4 M0 P1 M1 P0", "{got}");
 }
 
 #[test]
 fn markers_are_removed_and_unmarked_blocks_are_untouched() {
-    let mut m = mk_fn(vec![ds_read(2, 0), mfma(0), marker(phase::MFMA, 1)]);
+    let mut m = mk_fn(vec![ds_read(4, 0), mfma(0), marker(phase::MFMA, 1)]);
     assert!(phase::has_markers(&m.blocks[0].insts));
     phase::strip(&mut m);
     assert!(!phase::has_markers(&m.blocks[0].insts));
     assert_eq!(m.blocks[0].insts.len(), 2);
     // run() on a function without markers changes nothing
-    let mut m2 = mk_fn(vec![ds_read(2, 0), mfma(0)]);
+    let mut m2 = mk_fn(vec![ds_read(4, 0), mfma(0)]);
     let before = names(&m2.blocks[0].insts);
     phase::run(&mut m2, &Options::default()).unwrap();
     assert_eq!(names(&m2.blocks[0].insts), before);
