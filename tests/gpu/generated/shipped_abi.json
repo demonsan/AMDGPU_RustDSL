@@ -1,5 +1,7 @@
 [
 {
+  "schema_version": 1,
+  "generated_by": "amdc gen-host",
   "kernel": "fmha_fwd_hd128_mxfp8_v3_vs128",
   "kernarg_size": 656,
   "workgroup_size": 512,
@@ -14,6 +16,8 @@
   "symbols": [{"name":"HK","lo":1}]
 },
 {
+  "schema_version": 1,
+  "generated_by": "amdc gen-host",
   "kernel": "fmha_fwd_hd128_mxfp8_v3_t128",
   "kernarg_size": 656,
   "workgroup_size": 256,
@@ -28,6 +32,8 @@
   "symbols": [{"name":"HK","lo":1}]
 },
 {
+  "schema_version": 1,
+  "generated_by": "amdc gen-host",
   "kernel": "fmha_fwd_hd128_mxfp8_v3_kvsplit",
   "kernarg_size": 648,
   "workgroup_size": 512,
@@ -42,6 +48,8 @@
   "symbols": [{"name":"B","lo":1},{"name":"HK","lo":1},{"name":"KL","lo":0}]
 },
 {
+  "schema_version": 1,
+  "generated_by": "amdc gen-host",
   "kernel": "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h",
   "kernarg_size": 36,
   "workgroup_size": 256,

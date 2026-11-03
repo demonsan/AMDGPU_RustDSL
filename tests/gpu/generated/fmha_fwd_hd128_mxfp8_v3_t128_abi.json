@@ -1,4 +1,6 @@
 {
+  "schema_version": 1,
+  "generated_by": "amdc gen-host",
   "kernel": "fmha_fwd_hd128_mxfp8_v3_t128",
   "kernarg_size": 656,
   "workgroup_size": 256,
