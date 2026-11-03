@@ -341,7 +341,8 @@ int main(int argc, char** argv) {
     const double flops = 4.0 * B * H * (double)S * SK * D;
     auto time_kernel = [&](hipFunction_t f, const char* label, void* outp, int rows, int gx, unsigned block, const char* kname = nullptr) {
         if (iters <= 0) return;
-        set_launch(outp, rows);
+        const bool gen_timed = gen_abi && kname && (gen_name(kname, "v3_vs128") || gen_name(kname, "v3_t128"));
+        if (!gen_timed) set_launch(outp, rows);
         hipEvent_t e0, e1;
         CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
         // Warm-up launches: on a shared node the GPU sits in its idle clock state, so a cold 3-launch
