@@ -12,12 +12,15 @@
 #![forbid(unsafe_code)]
 
 pub mod bufdma;
+pub mod contract;
 pub mod copy;
 pub mod dma;
 pub mod fmha;
+pub mod global;
 pub mod mma;
 
-pub use copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_b, LdsPart, LdsSlotPart, TiledCopy};
+pub use copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_b, make_tiled_copy_bcast, LdsPart, LdsPrivPart, LdsSlotPart, TiledCopy};
+pub use global::GlobalPart;
 pub use bufdma::{partition_buffer_dma, BufDmaPart};
 pub use dma::{partition_dma, DmaPart};
 pub use mma::{gemm, make_tiled_mma, TiledMma};
@@ -29,7 +32,9 @@ use amdgpu_layout::{Dyns, Ix};
 #[derive(Default)]
 pub struct Ctx {
     pub dyns: Dyns,
-    vals: Vec<I32>,
+    vals: Vec<Option<I32>>,
+    /// the contract expression of each symbol (host-contract generation), when it has one
+    exts: Vec<Option<amdgpu_dsl::Ext>>,
     /// bound subexpressions (CSE across every expression bound through `bind`; valid at the scope of the first bind - the kernel's top level)
     memo: std::cell::RefCell<std::collections::HashMap<Ix, amdgpu_dsl::ValueId>>,
 }
@@ -41,8 +46,43 @@ impl Ctx {
     /// A dynamic symbol with range `[lo, hi]` standing for the IR value `v`.
     pub fn sym(&mut self, name: &str, lo: i64, hi: i64, v: I32) -> Ix {
         let s = self.dyns.sym(name, lo, hi);
-        self.vals.push(v);
+        self.vals.push(Some(v));
+        self.exts.push(None);
         s
+    }
+    /// A symbol with an IR value (`None`: contract-only, e.g. `HK`) and a contract expression (a kernarg, a grid dimension, a named symbol).
+    pub fn sym_ext(&mut self, name: &str, lo: i64, hi: i64, v: Option<I32>, ext: amdgpu_dsl::Ext) -> Ix {
+        let s = self.dyns.sym(name, lo, hi);
+        self.vals.push(v);
+        self.exts.push(Some(ext));
+        s
+    }
+    /// The contract expression of a layout expression (sums, products, floor divisions by constants of contract symbols).
+    pub fn ext(&self, x: &Ix) -> amdgpu_dsl::Ext {
+        use amdgpu_dsl::Ext;
+        match x {
+            Ix::C(k) => Ext::c(*k),
+            Ix::Sym(s) => self.exts[*s as usize].clone().unwrap_or_else(|| panic!("Ctx::ext: symbol {} has no contract expression", self.dyns.info(*s).name)),
+            Ix::Sum(t, k) => {
+                let mut acc: Option<Ext> = None;
+                for (term, m) in t {
+                    let e = if *m == 1 { self.ext(term) } else { self.ext(term) * Ext::c(*m) };
+                    acc = Some(match acc {
+                        None => e,
+                        Some(a) => a + e,
+                    });
+                }
+                let a = acc.expect("terms");
+                if *k == 0 {
+                    a
+                } else {
+                    a + Ext::c(*k)
+                }
+            }
+            Ix::Mul(a, b) => self.ext(a) * self.ext(b),
+            Ix::Div(a, k) => self.ext(a).floor_div(*k),
+            other => panic!("Ctx::ext: {other} has no contract form"),
+        }
     }
     /// Binds a layout expression, sharing every compound subexpression already bound through this context (one IR value per distinct subterm).
     pub fn bind(&self, b: &mut amdgpu_dsl::FnBuilder, x: &Ix) -> I32 {
@@ -100,7 +140,7 @@ impl Ctx {
     pub fn lower(&self, x: &Ix) -> I32 {
         match x {
             Ix::C(k) => I32::c(*k as i32),
-            Ix::Sym(s) => self.vals[*s as usize].clone(),
+            Ix::Sym(s) => self.vals[*s as usize].clone().unwrap_or_else(|| panic!("Ctx::lower: {} is a contract-only symbol", self.dyns.info(*s).name)),
             Ix::Sum(t, k) => {
                 let mut acc: Option<I32> = None;
                 for (term, m) in t {

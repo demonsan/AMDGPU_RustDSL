@@ -2,7 +2,7 @@
 
 use crate::mma::TiledMma;
 use crate::Ctx;
-use amdgpu_dsl::tile::shared::{Shared, SlotRef};
+use amdgpu_dsl::tile::shared::{PrivRef, Shared, SlotRef};
 use amdgpu_dsl::{FnBuilder, Opnd, ValueId, I32};
 use amdgpu_isa::{CopyAtom, Space};
 use amdgpu_layout::{layout_to_offsets, proofs, ComposedLayout, IssuePlan, Ix, Layout};
@@ -40,6 +40,16 @@ pub fn make_tiled_copy(atom: CopyAtom, tv: Layout, tile_elems: i64, elem_bits: u
     tc
 }
 
+/// `make_tiled_copy` for a BROADCAST TV layout (several threads read the same elements, e.g. both lane halves of the K-scale words): every element is
+/// covered the same number of times.
+pub fn make_tiled_copy_bcast(atom: CopyAtom, tv: Layout, tile_elems: i64, elem_bits: u32) -> TiledCopy {
+    let tc = TiledCopy { atom, tv, elem_bits };
+    if let Err(e) = proofs::check_tv(&tc.tv, tile_elems, true) {
+        panic!("make_tiled_copy_bcast({}): {e}", atom.name);
+    }
+    tc
+}
+
 /// The copy that loads the A operand of `mma` (registers laid out as the atom expects, K permutation included).
 pub fn make_tiled_copy_a(atom: CopyAtom, mma: &TiledMma) -> TiledCopy {
     let a = mma.atom();
@@ -66,7 +76,7 @@ impl TiledCopy {
     /// `extras` is one placement of the tile inside the slot (a static byte offset, e.g. `4096 s + 64 c` for the K operand tiles of `_vs128`); the
     /// operations are ordered placement-major, then by the atom's instruction groups. The lane parts are bound here (once per kernel).
     pub fn partition_lds(&self, b: &mut FnBuilder, ctx: &Ctx, lane: &Ix, sh: &Shared, view: &ComposedLayout, extras: &[i64]) -> LdsPart {
-        assert!(self.atom.src == Space::Lds && self.atom.dst == Space::Reg, "partition_lds: {} is not an LDS read", self.atom.name);
+        assert!((self.atom.src == Space::Lds && self.atom.dst == Space::Reg) || (self.atom.src == Space::Reg && self.atom.dst == Space::Lds), "partition_lds: {} is not an LDS read or write", self.atom.name);
         let vec = self.vec();
         let plan = IssuePlan::new(self.tv.clone(), vec);
         if !self.atom.transpose {
@@ -96,6 +106,59 @@ impl LdsPart {
         let bases = if off.as_const() == Some(0) { self.bases.clone() } else { self.bases.iter().map(|x| b.let_i32(x + &off)).collect() };
         LdsSlotPart { slot: slot.clone(), atom: self.atom, bases, ops: self.ops.clone() }
     }
+    /// The partition in this wave's slice of a private region (`base + wave * size`, the address derived from the region's wave key).
+    pub fn at_private<'a>(&self, b: &mut FnBuilder, p: &'a PrivRef<'a>) -> LdsPrivPart<'a> {
+        assert_eq!(p.sh.name, self.sh.name, "LdsPart::at_private: another region");
+        assert_eq!(self.sh.base, 0, "at_private: partition the private region with base 0 (the slice base adds it)");
+        let lbase = b.let_i32(p.base());
+        let bases = self.bases.iter().map(|x| if x.as_const() == Some(0) { lbase.clone() } else { b.let_i32(&lbase + x) }).collect();
+        LdsPrivPart { p: p.clone(), atom: self.atom, bases, ops: self.ops.clone() }
+    }
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
+fn addrs(b: &mut FnBuilder, bases: &[I32], op: &[(usize, i64)]) -> Vec<ValueId> {
+    op.iter().map(|&(bi, imm)| if imm == 0 { b.bind_i32(&bases[bi]) } else { b.bind_i32(&bases[bi] + imm as i32) }).collect()
+}
+
+fn emit_write(b: &mut FnBuilder, a: CopyAtom, addrs: &[ValueId], vals: &[ValueId]) {
+    assert_eq!(addrs.len(), vals.len(), "one value per instruction");
+    for (ad, v) in addrs.iter().zip(vals) {
+        match a.bytes {
+            4 => b.store_lds_b32(Opnd::Val(*ad), Opnd::Val(*v)),
+            16 => b.store_lds_b128(Opnd::Val(*ad), Opnd::Val(*v)),
+            n => panic!("no {n}-byte LDS write form"),
+        }
+    }
+}
+
+/// A partition bound to a wave's private slice (generation-marked accesses of the wave's own data).
+#[derive(Clone, Debug)]
+pub struct LdsPrivPart<'a> {
+    pub p: PrivRef<'a>,
+    pub atom: CopyAtom,
+    bases: Vec<I32>,
+    ops: Vec<Vec<(usize, i64)>>,
+}
+
+impl LdsPrivPart<'_> {
+    /// Writes operation `o` (one value per instruction) as generation `gen`.
+    pub fn write(&self, b: &mut FnBuilder, o: usize, gen: i32, vals: &[ValueId]) {
+        let ad = addrs(b, &self.bases, &self.ops[o]);
+        let a = self.atom;
+        self.p.write(b, gen, |b| emit_write(b, a, &ad, vals));
+    }
+    /// Reads operation `o` back (generation `gen`; the writes must have completed: `wait_lds(0)`).
+    pub fn read(&self, b: &mut FnBuilder, o: usize, gen: i32) -> ValueId {
+        let ad = addrs(b, &self.bases, &self.ops[o]);
+        assert!(self.atom.bytes == 16 && self.atom.insts == 1, "LdsPrivPart::read: ds_read_b128 only");
+        self.p.read_back(b, gen, |b| b.load_lds_b128(Opnd::Val(ad[0])))
+    }
     pub fn len(&self) -> usize {
         self.ops.len()
     }
@@ -114,6 +177,12 @@ pub struct LdsSlotPart<'a> {
 }
 
 impl LdsSlotPart<'_> {
+    /// Writes operation `o` (one value per instruction, under the slot's write marker).
+    pub fn write(&self, b: &mut FnBuilder, o: usize, vals: &[ValueId]) {
+        let ad = addrs(b, &self.bases, &self.ops[o]);
+        let a = self.atom;
+        self.slot.write(b, |b| emit_write(b, a, &ad, vals));
+    }
     /// Emits operation `o` (its instructions, under the slot's read marker) and returns the fragment.
     pub fn read(&self, b: &mut FnBuilder, o: usize) -> ValueId {
         let addrs: Vec<ValueId> = self.ops[o].iter().map(|&(bi, imm)| if imm == 0 { b.bind_i32(&self.bases[bi]) } else { b.bind_i32(&self.bases[bi] + imm as i32) }).collect();

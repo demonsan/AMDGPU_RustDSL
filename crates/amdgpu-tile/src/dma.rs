@@ -40,7 +40,7 @@ pub fn partition_dma(b: &mut FnBuilder, ctx: &Ctx, atom: CopyAtom, lane: &Ix, wa
     assert!(fm.len() == 2 && fm[1].1 == Ix::C(1), "partition_dma: the view must be row-major [rows, row_bytes]: {}", view.inner);
     let row_bytes = fm[0].1.st();
     assert_eq!(fm[1].0.st(), row_bytes, "partition_dma: dense rows only");
-    assert!(view.swz.dst_lo >= 4 && view.swz.dst_lo + view.swz.dst_n <= row_bytes.trailing_zeros(), "partition_dma: the swizzle must move whole 16-byte chunks inside a row");
+    assert!(view.swz.is_identity() || view.swz.dst_lo >= 4 && view.swz.dst_lo + view.swz.dst_n <= row_bytes.trailing_zeros(), "partition_dma: the swizzle must move whole 16-byte chunks inside a row");
     let d = &ctx.dyns;
     // the slot byte of lane / instruction q, split into its dynamic part and the static step
     let a = lane.mul_c(lane_stride).add(&wave.mul_c(slice));
@@ -55,7 +55,8 @@ pub fn partition_dma(b: &mut FnBuilder, ctx: &Ctx, atom: CopyAtom, lane: &Ix, wa
         row_c.push(c / row_bytes);
         // column of the destination byte, un-swizzled: (a mod row_bytes) ^ s(row of a + c)
         // in 16-byte chunks (the swizzle moves whole chunks): (chunk ^ s) << 4 keeps the verifier's interval of the column inside the row
-        let chunk = a.add_c(c).mod_c(row_bytes, d).div_c(16, d).xor(&view.swz.term_ix_down(&a.add_c(c), d, 4));
+        let chunk0 = a.add_c(c).mod_c(row_bytes, d).div_c(16, d);
+        let chunk = if view.swz.is_identity() { chunk0 } else { chunk0.xor(&view.swz.term_ix_down(&a.add_c(c), d, 4)) };
         let col = chunk.shl(4);
         let i = match cols.iter().position(|x| *x == col) {
             Some(i) => i,
@@ -85,11 +86,19 @@ impl DmaPart {
             for q in 0..n as usize {
                 let comp = (self.step * (n - 1 - q as i64)) as i32;
                 let row = self.src.row(&rb + self.row_c[q] as i32);
-                let o = b.bind_i32((add0(row * &self.src.stride, &self.src.base) + &self.cols[self.col_of[q]]) + comp);
+                let o = b.bind_i32(add_c(add0(add0(row * &self.src.stride, &self.src.base), &self.cols[self.col_of[q]]), comp));
                 let sp = b.ptr_add(self.src.ptr, o);
                 b.load_global_lds(sp, lbase, -comp, dwords);
             }
         });
+    }
+}
+
+fn add_c(a: I32, k: i32) -> I32 {
+    if k == 0 {
+        a
+    } else {
+        a + k
     }
 }
 
@@ -117,7 +126,7 @@ pub fn issue_rows_shared(b: &mut FnBuilder, key0: &I32, parts: &[(&DmaPart, &Slo
         slot.write(b, |b| {
             for q in 0..n as usize {
                 let comp = (p.step * (n - 1 - q as i64)) as i32;
-                let o = b.bind_i32((add0(&rows[q] * &p.src.stride, &p.src.base) + &p.cols[p.col_of[q]]) + comp);
+                let o = b.bind_i32(add_c(add0(add0(&rows[q] * &p.src.stride, &p.src.base), &p.cols[p.col_of[q]]), comp));
                 let sp = b.ptr_add(p.src.ptr, o);
                 b.load_global_lds(sp, lbase, -comp, dwords);
             }

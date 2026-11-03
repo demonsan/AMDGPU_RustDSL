@@ -6,18 +6,18 @@
 //! * QK / PV = `gemm` of the scaled 32x32x64 atom.
 //! The FMHA ABI, block setup, K-scale staging/reader, softmax, epilogues and the pipeline cadence are the (layout-free) components of `amdgpu_dsl::tile`.
 
-use crate::copy::{make_tiled_copy, make_tiled_copy_a, LdsPart, LdsSlotPart};
+use crate::copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_bcast, LdsPart, LdsSlotPart};
 use crate::dma::{issue_rows_shared, partition_dma, DmaPart};
 use crate::mma::{gemm, make_tiled_mma, TiledMma};
-use crate::Ctx;
-use amdgpu_dsl::tile::fmha::{combine_kernel, FmhaBlock, FmhaIo, KdCopy};
-use amdgpu_dsl::tile::frag::{AccTile, Frag, QkOut, RowScaleReader, B32x32x64Fp8, C32x32F32};
+use crate::{contract, Ctx};
+use amdgpu_dsl::tile::fmha::{combine_kernel, FmhaBlock, FmhaIo};
+use amdgpu_dsl::tile::frag::{AccTile, Frag, QkOut, B32x32x64Fp8, C32x32F32};
 use amdgpu_dsl::tile::reduce::KeyMask;
 use amdgpu_dsl::tile::softmax::{OnlineSoftmax, Recipe};
 use amdgpu_dsl::tile::*;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, ValueId, VarId, I32};
-use amdgpu_isa::{MmaAtom, DS_READ_B128X2, DS_READ_TR_B8X4, GLOBAL_LDS_X4};
-use amdgpu_layout::{make_layout, tup, ComposedLayout, Layout as LLayout, Swizzle};
+use amdgpu_isa::{MmaAtom, DS_READ_B128, DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, DS_WRITE_B32, GLOBAL_LDS_X1, GLOBAL_LDS_X4, GLOBAL_LOAD_X4, GLOBAL_STORE_X2};
+use amdgpu_layout::{make_layout, tup, ComposedLayout, Ix, Layout as LLayout, Swizzle};
 
 /// The K/V tile in LDS: [key, d] bytes, 128-byte rows, the FMHA swizzle.
 pub fn kv_view() -> ComposedLayout {
@@ -31,6 +31,17 @@ pub fn vt_tr_source() -> LLayout {
     make_layout(tup![tup![2, 2, 2, 2, 2, 2], tup![4, 2, 4]], tup![tup![8 * 128, 1, 2, 8, 16 * 128, 4], tup![16, 64, 32 * 128]])
 }
 
+/// K-scale staging: a layout-derived DMA (one dword per row, waves 2 and 3 repeat waves 0 and 1) or the `_t128` VGPR path.
+pub enum KdCopy3 {
+    Dma(DmaPart),
+    Vgpr(copy::DwordRowsVgpr),
+}
+
+/// The K-scale reader TV: thread (j = lane % 32, h = lane / 32 broadcast) x value (row group s) -> row `j + 32 s` of the 128-word tile.
+pub fn kd_read_tv() -> LLayout {
+    make_layout(tup![tup![32, 2], 4], tup![tup![1, 0], 32])
+}
+
 /// The K/V/K-scale ring with layout-derived copies and readers.
 pub struct KvRing3 {
     pub ks: Shared,
@@ -42,10 +53,11 @@ pub struct KvRing3 {
     pub epi: Shared,
     pub kdma: DmaPart,
     pub vdma: DmaPart,
-    pub kdc: KdCopy,
+    pub kdc: KdCopy3,
     pub kpart: LdsPart,
     pub vpart: LdsPart,
-    pub kdr: RowScaleReader,
+    /// the K-scale words: lane (j, h) reads word j + 32 s (both lane halves read the same word: a broadcast TV layout)
+    pub kdpart: LdsPart,
     pub mma: TiledMma,
 }
 
@@ -70,25 +82,28 @@ impl KvRing3 {
         let placements: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect();
         let kpart = make_tiled_copy_a(DS_READ_B128X2, &mma).partition_lds(b, &ctx, &l, &ks, &kview, &placements);
         let vpart = make_tiled_copy(DS_READ_TR_B8X4, vt_tr_source(), 128 * 128, 8).partition_lds(b, &ctx, &l, &vs, &kv_view(), &[0]);
-        let kdr = RowScaleReader::new(b, &kd, lane);
+        let kdpart = make_tiled_copy_bcast(DS_READ_B32, kd_read_tv(), 128, 32).partition_lds(b, &ctx, &l, &kd, &ComposedLayout::plain(make_layout(128, 4)), &[0]);
         let (kt, vt, kdt) = (blk.kv_tile(b, &io.k), blk.kv_tile(b, &io.v), blk.kv_tile(b, &io.ksc));
         let (ksrc, vsrc, kdsrc) = (kt.row_source(b, 1), vt.row_source(b, 1), kdt.row_source(b, 1));
         let wv = ev(roles.wave_in_group);
         let kdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, ksrc, &ks, &kv_view());
         let vdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, vsrc, &vs, &kv_view());
         let kdc = if slots == 2 {
-            KdCopy::Dma(copy::DwordRowsCopy::new(b, kdsrc, &kd, roles.wave_in_group, lane))
+            // 128 rows x 4 bytes, one dword per lane: waves 0 / 1 stage rows 0..63 / 64..127, waves 2 / 3 repeat them (the wave index taken mod 2)
+            let w2 = w.mod_c(2, &ctx.dyns);
+            let wv2 = b.let_i32(ev(roles.wave_in_group) & 1);
+            KdCopy3::Dma(partition_dma(b, &ctx, GLOBAL_LDS_X1, &l, &w2, &wv2, 1, kdsrc, &kd, &ComposedLayout::plain(make_layout(tup![128, 4], tup![4, 1]))))
         } else {
             let rt_row = b.bind_i32(lane.tid().lshr(1));
-            KdCopy::Vgpr(copy::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
+            KdCopy3::Vgpr(copy::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
         };
-        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdr, mma }
+        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma }
     }
 
     /// The copies of the tile at `key0` into `slot` that `role` produces (as `KvRing::stage`).
     pub fn stage(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<ValueId> {
         match (role, &self.kdc) {
-            (Role::A, KdCopy::Dma(kd)) => {
+            (Role::A, KdCopy3::Dma(kd)) => {
                 kd.issue(b, key0, &self.kd.at(slot));
                 self.kdma.issue(b, key0, &self.ks.at(slot));
                 None
@@ -97,7 +112,7 @@ impl KvRing3 {
                 self.vdma.issue(b, key0, &self.vs.at(slot));
                 None
             }
-            (_, KdCopy::Vgpr(kd)) => {
+            (_, KdCopy3::Vgpr(kd)) => {
                 let v = kd.issue(b, key0);
                 issue_rows_shared(b, key0, &[(&self.kdma, &self.ks.at(slot)), (&self.vdma, &self.vs.at(slot))]);
                 Some(v)
@@ -106,7 +121,7 @@ impl KvRing3 {
         }
     }
     pub fn stage_complete(&self, b: &mut FnBuilder, pending: Option<ValueId>, slot: &SlotIdx) {
-        if let (KdCopy::Vgpr(kd), Some(v)) = (&self.kdc, pending) {
+        if let (KdCopy3::Vgpr(kd), Some(v)) = (&self.kdc, pending) {
             kd.complete(b, v, &self.kd.at(slot));
         }
     }
@@ -152,7 +167,7 @@ impl<'a> AttnBody3<'a> {
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
-    fn qk_block(&self, b: &mut FnBuilder, out: &QkOut, bias: ValueId, k: &LdsSlotPart, kd: &(SlotRef, I32), s: usize) -> Option<ValueId> {
+    fn qk_block(&self, b: &mut FnBuilder, out: &QkOut, bias: ValueId, k: &LdsSlotPart, kd: &LdsSlotPart, s: usize) -> Option<ValueId> {
         let blk = self.blk;
         let start = match out {
             QkOut::Vars(t) => {
@@ -163,7 +178,7 @@ impl<'a> AttnBody3<'a> {
         };
         let k0 = k.read(b, 2 * s);
         let k1 = k.read(b, 2 * s + 1);
-        let kw = RowScaleReader::read(b, kd, s);
+        let kw = kd.read(b, s);
         let (sk0, sk1) = blk.sel.pair(b, kw);
         let q = &blk.q.frags;
         match out {
@@ -181,7 +196,7 @@ impl<'a> AttnBody3<'a> {
     fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, out: QkOut, bias: ValueId) -> Vec<ValueId> {
         let r = self.ring;
         let k = r.kpart.at(b, &r.ks.at(slot));
-        let kd = r.kdr.at(b, &r.kd.at(slot));
+        let kd = r.kdpart.at(b, &r.kd.at(slot));
         (0..4).filter_map(|s| self.qk_block(b, &out, bias, &k, &kd, s)).collect()
     }
     /// PV with the row sums first: per half hh and dim group e, the transposed V fragment then the scaled MFMA (fixed scales).
@@ -252,7 +267,7 @@ impl PipeBody for AttnBody3<'_> {
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
         let nb = self.sm.decide_deferred(b, &s, &o, mask.as_ref());
-        let next = t.staged.then(|| (r.kpart.at(b, &r.ks.at(&t.next)), r.kdr.at(b, &r.kd.at(&t.next))));
+        let next = t.staged.then(|| (r.kpart.at(b, &r.ks.at(&t.next)), r.kdpart.at(b, &r.kd.at(&t.next))));
         let mut w = Vec::with_capacity(16);
         for i in 0..4usize {
             w.extend(self.sm.convert(b, &s, mask.as_ref(), i, i + 1));
@@ -269,8 +284,8 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
-    let io = FmhaIo::declare(b, 256, false);
-    let blk = io.block(b, 8);
+    let io = declare_io(b, 256, false);
+    let blk = block3(&io, b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
     let ring = KvRing3::new(b, &io, &blk, &roles, 2);
     let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
@@ -281,7 +296,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
-            io.store_out(b, &blk, &body.o.expect("O"), fin);
+            store_out3(&io, b, &blk, &body.o.expect("O"), fin);
         });
     });
     fb.finish()
@@ -291,8 +306,8 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_kvsplit", 512);
     fb.compile_profile(CompileProfile::KvSplit);
     let b = &mut fb;
-    let io = FmhaIo::declare(b, 256, true);
-    let blk = io.block(b, 8);
+    let io = declare_io(b, 256, true);
+    let blk = block3(&io, b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
     let ring = KvRing3::new(b, &io, &blk, &roles, 2);
     let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
@@ -305,7 +320,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
             let fin = body.out_scale(b);
             let l = body.sm.l_total(b);
             let lse = body.sm.lse(b, l);
-            io.store_partial(b, &blk, &ring.epi.mine(wid), &body.o.expect("O"), fin, lse);
+            store_partial3(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin, lse);
         });
     });
     fb.finish()
@@ -322,8 +337,8 @@ pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_t128", 256);
     fb.compile_profile(CompileProfile::T128);
     let b = &mut fb;
-    let io = FmhaIo::declare(b, 128, false);
-    let blk = io.block(b, 7);
+    let io = declare_io(b, 128, false);
+    let blk = block3(&io, b, 7);
     let roles = Roles::single(&blk.lane, 4);
     let ring = KvRing3::new(b, &io, &blk, &roles, 3);
     let mut pipe = Pipeline::new(Cadence::OneWindow, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
@@ -333,7 +348,243 @@ pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
         let mut body = AttnBody3::new(b, &ring, &blk, blk.lane.wave, lut);
         pipe.run(b, Role::All, &mut body);
         let fin = body.out_scale(b);
-        io.store_out(b, &blk, &body.o.expect("O"), fin);
+        store_out3(&io, b, &blk, &body.o.expect("O"), fin);
     });
     fb.finish()
+}
+
+/// The 656-byte FMHA kernarg ABI (+ the KV-split extension) with the host contract DERIVED from the tensors' layouts (`contract::compact_tensor` /
+/// `same_strides`: allocation = cosize, compactness relations); the kernarg loads and the runtime tensors are those of `FmhaIo::declare`.
+pub fn declare_io(b: &mut FnBuilder, rows_per_block: i64, kvsplit: bool) -> FmhaIo {
+    let ka = &mut KArgs::new();
+    let gqa = ka.i32(b, "s_gqa", 0x0B0);
+    b.ka_range(0x0B0, 1, 16);
+    b.ka_is(0x140, Ext::sym("HK") * Ext::ka(0x0B0));
+    let s = ka.dim(b, "s_seq_len", 0x060, 1, i64::MAX);
+    let skv = ka.dim(b, "s_kv_seq_len", 0x110, 1, i64::MAX);
+    let heads = ka.i32(b, "s_q_head_num", 0x140);
+    let h = Dim::Ka { off: 0x140, val: heads };
+    let (hk, d) = (Dim::sym("HK"), Dim::c(128));
+    let bat = if kvsplit { Dim::sym("B") } else { Dim::grid(2) };
+    let bshd = |ka: &mut KArgs, b: &mut FnBuilder, name: &str, off: u32, eb: i64, n: &Dim, hh: &Dim, st: [(&'static str, u32); 3]| {
+        ka.tensor(name, off, eb, vec![bat.clone(), n.clone(), hh.clone(), d.clone()], vec![Stride::Ka(st[0].0, st[0].1), Stride::Ka(st[1].0, st[1].1), Stride::Ka(st[2].0, st[2].1), Stride::Unit])
+            .external_contract()
+            .declare(ka, b)
+    };
+    let q = bshd(ka, b, "ptr_q", 0x010, 1, &s, &h, [("s_Bs", 0x0A0), ("s_Seqs", 0x070), ("s_Hs", 0x090)]);
+    let k = bshd(ka, b, "ptr_k", 0x020, 1, &skv, &hk, [("s_k_Bs", 0x0E0), ("s_k_Seqs", 0x0C0), ("s_k_Hs", 0x0D0)]);
+    let v = bshd(ka, b, "ptr_v", 0x030, 1, &skv, &hk, [("s_v_Bs", 0x170), ("s_v_Seqs", 0x150), ("s_v_Hs", 0x160)]);
+    let o = bshd(ka, b, "ptr_o", 0x000, 2, &s, &h, [("s_o_Bs", 0x1A0), ("s_o_Seqs", 0x180), ("s_o_Hs", 0x190)]);
+    let qd_stride = ev(b.bind_i32(q.strides[1].clone().lshr(5)));
+    let kd_stride = ev(b.bind_i32(k.strides[1].clone().lshr(5)));
+    let scale = |ka: &mut KArgs, b: &mut FnBuilder, name: &str, off: u32, n: &Dim, hh: &Dim, bs: (&'static str, u32), der: I32, hs: (&'static str, u32)| {
+        ka.tensor(name, off, 1, vec![bat.clone(), n.clone(), hh.clone(), Dim::c(4)], vec![Stride::Ka(bs.0, bs.1), Stride::Derived(der), Stride::Ka(hs.0, hs.1), Stride::Unit])
+            .external_contract()
+            .declare(ka, b)
+    };
+    let qsc = scale(ka, b, "ptr_q_descale", 0x200, &s, &h, ("s_descale_q_Bs", 0x230), qd_stride, ("s_descale_q_Hs", 0x240));
+    let ksc = scale(ka, b, "ptr_k_descale", 0x210, &skv, &hk, ("s_descale_k_Bs", 0x250), kd_stride, ("s_descale_k_Hs", 0x260));
+    // the contract, from the layouts (bytes)
+    let mut ctx = Ctx::new();
+    let big = i64::MAX / 4;
+    let cb = if kvsplit { ctx.sym_ext("B", 1, big, None, Ext::sym("B")) } else { ctx.sym_ext("grid_z", 1, big, None, Ext::grid_z()) };
+    let mut kas = |ctx: &mut Ctx, name: &str, off: u32| ctx.sym_ext(name, 0, big, None, Ext::ka(off));
+    let (cs, cskv, ch) = (kas(&mut ctx, "S", 0x060), kas(&mut ctx, "SK", 0x110), kas(&mut ctx, "H", 0x140));
+    let chk = ctx.sym_ext("HK", 1, big, None, Ext::sym("HK"));
+    let lay = |sh: [&Ix; 4], st: [Ix; 4]| amdgpu_layout::make_layout(tup![sh[0].clone(), sh[1].clone(), sh[2].clone(), sh[3].clone()], tup![st[0].clone(), st[1].clone(), st[2].clone(), st[3].clone()]);
+    let c = |k: i64| Ix::C(k);
+    let ql = lay([&cb, &cs, &ch, &c(128)], [kas(&mut ctx, "s_Bs", 0x0A0), kas(&mut ctx, "s_Seqs", 0x070), c(128), c(1)]);
+    contract::compact_tensor(b, &ctx, "ptr_q", &ql, &[Some(0x0A0), Some(0x070), Some(0x090), None], None);
+    let kl = lay([&cb, &cskv, &chk, &c(128)], [kas(&mut ctx, "s_k_Bs", 0x0E0), kas(&mut ctx, "s_k_Seqs", 0x0C0), c(128), c(1)]);
+    let k_ka = [Some(0x0E0), Some(0x0C0), Some(0x0D0), None];
+    contract::compact_tensor(b, &ctx, "ptr_k", &kl, &k_ka, None);
+    let vl = lay([&cb, &cskv, &chk, &c(128)], [kas(&mut ctx, "s_v_Bs", 0x170), kas(&mut ctx, "s_v_Seqs", 0x150), c(128), c(1)]);
+    contract::same_strides(b, &ctx, "ptr_v", &vl, &[Some(0x170), Some(0x150), Some(0x160), None], &kl, &k_ka);
+    let ol = lay([&cb, &cs, &ch, &c(128)], [kas(&mut ctx, "s_o_Bs", 0x1A0), kas(&mut ctx, "s_o_Seqs", 0x180), c(256), c(2)]);
+    contract::compact_tensor(b, &ctx, "ptr_o", &ol, &[Some(0x1A0), Some(0x180), Some(0x190), None], None);
+    let qsl = lay([&cb, &cs, &ch, &c(4)], [kas(&mut ctx, "s_descale_q_Bs", 0x230), ch.mul_c(4), c(4), c(1)]);
+    contract::compact_tensor(b, &ctx, "ptr_q_descale", &qsl, &[Some(0x230), None, Some(0x240), None], Some(Ext::c(512 * 4) * Ext::ka(0x140)));
+    let ksl = lay([&cb, &cskv, &chk, &c(4)], [kas(&mut ctx, "s_descale_k_Bs", 0x250), chk.mul_c(4), c(4), c(1)]);
+    contract::compact_tensor(b, &ctx, "ptr_k_descale", &ksl, &[Some(0x250), None, Some(0x260), None], Some(Ext::c(640 * 4) * Ext::ka(0x140)));
+    let ptr_vd = ka.ptr(b, "ptr_v_descale", 0x220);
+    b.arg_tensor("ptr_v_descale", Ext::c(4096));
+    b.grid_is(1, Ext::ka(0x140));
+    b.grid_is(0, Ext::ka(0x060).ceil_div(rows_per_block));
+    let kvs = if kvsplit {
+        let splits = ka.dim(b, "kvs_splits", 0x280, 1, i64::MAX).val().expect("splits");
+        let rows_total = ka.dim(b, "kvs_rows_total", 0x284, 1, i64::MAX).val().expect("rows");
+        b.grid_is(2, Ext::sym("B") * Ext::ka(0x280));
+        b.ka_is(0x284, Ext::sym("B") * Ext::ka(0x060) * Ext::ka(0x140));
+        let ohat = ka.ptr(b, "ptr_ohat", 0x270);
+        let lse = ka.ptr(b, "ptr_lse", 0x278);
+        b.arg_tensor("ptr_ohat", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(128 * 4));
+        b.arg_tensor("ptr_lse", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(4));
+        Some(amdgpu_dsl::tile::fmha::KvsArgs { ohat, lse, splits: b.bind_i32(splits), rows_total: b.bind_i32(rows_total) })
+    } else {
+        ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
+        None
+    };
+    FmhaIo { q, k, v, o, qsc, ksc, ptr_vd, gqa, heads, s_len: s.val().expect("S"), kv_len: skv.val().expect("SK"), kvs }
+}
+
+/// `FmhaIo::block` with the Q fragments loaded through a TiledCopy: the B operand of the scaled 32x32x64 atom over the lane's (clamped) query row, two
+/// k-groups of 64 bytes (placements 0 / 64): one pointer (row + 16 (lane >> 5)) and four `global_load_dwordx4` with immediates 0 / 32 / 64 / 96.
+pub fn block3(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32) -> FmhaBlock {
+    let qtile = b.let_(amdgpu_dsl::Op::WorkgroupIdX);
+    let hidx = b.let_(amdgpu_dsl::Op::WorkgroupIdY);
+    let zz = b.let_(amdgpu_dsl::Op::WorkgroupIdZ);
+    let lane = Lane::new(b);
+    let kv_all = b.bind_i32(io.kv_len.clone());
+    let ntiles_total = b.bind_i32((ev(kv_all) + 127).lshr(7));
+    let (bidx, kv_len, key_lo, split) = match &io.kvs {
+        None => (zz, kv_all, I32::c(0), None),
+        Some(kv) => {
+            let (bi, si, lg) = components::kv_split_decode(b, zz, kv.splits, 0x280, "B");
+            let (key_lo, kv_eff) = components::kv_split_range(b, kv_all, si, lg, 0x110);
+            (bi, kv_eff, ev(key_lo), Some(si))
+        }
+    };
+    let row0 = b.let_i32((ev(qtile) << rows_lg) + (lane.wave() << 5));
+    let row = b.let_i32(&row0 + lane.j());
+    let s_last = b.let_i32(&io.s_len - 1);
+    let row_c = b.let_i32(row.lt(io.s_len.clone()).select_i32(row.clone(), s_last.clone()));
+    let origin = vec![ev(bidx), I32::c(0), ev(hidx), I32::c(0)];
+    let qt = io.q.tile(origin.clone()).clamp(1, io.s_len.clone(), s_last.clone());
+    let q_row = b.let_i32(qt.offset(&[I32::c(0), row.clone(), I32::c(0), I32::c(0)]));
+    let mut ctx = Ctx::new();
+    let l = ctx.sym("lane", 0, 63, lane.lane());
+    let mma = make_tiled_mma(MmaAtom::mfma_scale_32x32x64_f8(), false);
+    let qcp = crate::copy::make_tiled_copy_b(GLOBAL_LOAD_X4, &mma);
+    // the row is the lane's (clamped) query row, supplied above: the view gives the byte inside it (k), row stride 0
+    let qpart = qcp.partition_global(b, &ctx, &l, &make_layout(tup![32, 64], tup![0, 1]), &[0, 64]);
+    let ptrs = qpart.ptrs(b, io.q.ptr, &q_row);
+    let mut frags = Vec::with_capacity(2);
+    let mut words = [[0 as ValueId; 8]; 2];
+    for c in 0..2usize {
+        let mut w: Vec<ValueId> = Vec::with_capacity(8);
+        for f4 in qpart.load(b, &ptrs, c) {
+            for k in 0..4u8 {
+                let lv = b.frag4_lane(f4, k);
+                w.push(b.bitcast_i32(lv));
+            }
+        }
+        words[c].copy_from_slice(&w);
+        frags.push(Frag::<B32x32x64Fp8>::from_words(b, &w));
+    }
+    let q = frag::RowFrags { frags: [frags[0], frags[1]], words };
+    let qdp = io.qsc.tile(origin).clamp(1, io.s_len.clone(), s_last.clone()).ptr(b, &[I32::c(0), row.clone(), I32::c(0), I32::c(0)]);
+    let qd_raw = b.load_f32(qdp, 0);
+    let qd = b.bitcast_i32(qd_raw);
+    let sel = frag::ScaleSel::new(b, &lane);
+    let (sq0, sq1) = sel.pair(b, qd);
+    let sq = [b.bind_i32(ev(sq0) - 9), b.bind_i32(ev(sq1) - 9)];
+    let vd = b.load_f32(io.ptr_vd, 0);
+    let kvh = components::gqa_kv_head(b, hidx, io.gqa, "HK");
+    let nkv = b.bind_i32((ev(kv_len) + 127).lshr(7));
+    b.assume_trusted(nkv, Ext::c(1), Ext::ka(0x110).ceil_div(128), "nkv = (kv_len + 127) >> 7 with 1 <= kv_len <= SK; the engine floors the lower bound of a shift to 0");
+    let g4 = b.bind_i32(C32x32F32::half_base(&lane));
+    FmhaBlock { lane, bidx, hidx, kvh, row0, row_c, s_last, kv_len, key_lo, nkv, ntiles_total, split, q, sq, sel, vd, g4 }
+}
+
+/// The bf16 epilogue through a TiledCopy: the C layout of the scaled 32x32x64 atom (O^T: rows = dims, columns = queries) stored with
+/// `global_store_dwordx2` (4 bf16 per instruction) into the lane's (clamped) output row: one pointer (row + 8 (lane >> 5)) and the immediates
+/// `64 e + 16 q` - the shipped instruction stream, under `if row0 < S`.
+pub fn store_out3(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C32x32F32, 4>, fin: ValueId) {
+    let o_tile = io.o.tile(vec![ev(blk.bidx), I32::c(0), ev(blk.hidx), I32::c(0)]).clamp(1, io.s_len.clone(), blk.s_last.clone());
+    let row = b.let_i32(o_tile.offset(&[I32::c(0), &blk.row0 + blk.lane.j(), I32::c(0), I32::c(0)]));
+    let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
+    let mut ctx = Ctx::new();
+    let l = ctx.sym("lane", 0, 63, blk.lane.lane());
+    let mma = make_tiled_mma(MmaAtom::mfma_scale_32x32x64_f8(), false);
+    let st = make_tiled_copy(GLOBAL_STORE_X2, mma.c_tv(), 32 * 32, 16);
+    let part = st.partition_global(b, &ctx, &l, &make_layout(tup![32, 32], tup![2, 0]), &[0, 64, 128, 192]);
+    b.begin_if(Opnd::Val(live));
+    let ptrs = part.ptrs(b, io.o.ptr, &row);
+    for e in 0..4usize {
+        let mut vals = Vec::with_capacity(4);
+        for q in 0..4usize {
+            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
+            for k in 0..4usize {
+                let lv = b.frag16_lane(Opnd::Var(o.accs[e].var), (4 * q + k) as u8);
+                let f = b.bitcast_f32(lv);
+                v4.push(b.mul_f32(f, fin));
+            }
+            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
+            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+            vals.push(b.frag2(w0, w1));
+        }
+        part.store(b, &ptrs, e, &vals);
+    }
+    b.end_if();
+}
+
+/// The KV-split partial epilogue with the private transpose scratch on TiledCopies: the C layout written as 2 x `ds_write_b32` per 4 dims into a
+/// [32 queries x 64 dims] fp16 slice with the 16-byte chunks XOR-swizzled by the query (`Swizzle<3,4,3>`), read back as rows of 16 bytes
+/// (`ds_read_b128`, 8 lanes per row) and stored as 16-byte segments of the partial rows (as `FmhaIo::store_partial`).
+pub fn store_partial3(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, epi: &Shared, wid: ValueId, o: &AccTile<C32x32F32, 4>, fin: ValueId, lse: ValueId) {
+    let kv = io.kvs.as_ref().expect("store_partial3: not a KV-split launch");
+    b.barrier();
+    let part_row0 = b.bind_i32(ev(blk.split.expect("split")) * ev(kv.rows_total));
+    let prow = |row: I32| ev(part_row0) + (((ev(blk.bidx) * io.s_len.clone()) + row) * ev(io.heads) + ev(blk.hidx));
+    let lse_ptr = {
+        let off = b.bind_i32(prow(blk.row_c.clone()) << 2);
+        b.ptr_add(kv.lse, off)
+    };
+    let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
+    let lane = blk.lane;
+    let mut ctx = Ctx::new();
+    let l = ctx.sym("lane", 0, 63, lane.lane());
+    // the per-wave slice [64 dims x 32 queries] fp16 (element dim + 64 query), chunks swizzled by the query
+    let view = ComposedLayout::new(Swizzle::cute(3, 4, 3), make_layout(tup![64, 32], tup![2, 128]));
+    // R2S: thread (query j = lane % 32: element +64, half: dim +4) x value (dim +1 x4, +8 x4, column pair ec: +32)
+    let wtv = make_layout(tup![tup![32, 2], tup![4, 4, 2]], tup![tup![64, 4], tup![1, 8, 32]]);
+    let epi0 = Shared { base: 0, ..epi.clone() };
+    let wpart = make_tiled_copy(DS_WRITE_B32, wtv, 64 * 32, 16).partition_lds(b, &ctx, &l, &epi0, &view, &[0]);
+    // S2R: thread (chunk = lane % 8: dim +8, row = lane / 8: query +1) x value (8 dims, round i: query +8)
+    let rtv = make_layout(tup![tup![8, 8], tup![8, 4]], tup![tup![8, 64], tup![1, 512]]);
+    let rpart = make_tiled_copy(DS_READ_B128, rtv, 64 * 32, 16).partition_lds(b, &ctx, &l, &epi0, &view, &[0]);
+    b.begin_if(Opnd::Val(live));
+    b.store_f32(lse_ptr, 0, lse);
+    let me = epi.mine(wid);
+    let wp = wpart.at_private(b, &me);
+    let rp = rpart.at_private(b, &me);
+    let gptr: Vec<ValueId> = (0..4)
+        .map(|i| {
+            // round i: the lane reads back 16 bytes of row 8 i + (lane >> 3) (clamped), chunk lane & 7, of the 256-byte fp16 partial row
+            let r = b.let_i32((&blk.row0 + 8 * i as i32) + lane.lane().lshr(3));
+            let rg = r.lt(io.s_len.clone()).select_i32(r.clone(), blk.s_last.clone());
+            let off = b.bind_i32((prow(rg) << 8) + ((lane.lane() & 7) << 4));
+            b.ptr_add(kv.ohat, off)
+        })
+        .collect();
+    let c16 = b.c_i32(16);
+    for pr in 0..2usize {
+        for ec in 0..2usize {
+            let e = 2 * pr + ec;
+            for q in 0..4usize {
+                let mut hv: Vec<ValueId> = Vec::with_capacity(4);
+                for k in 0..4usize {
+                    let lv = b.frag16_lane(Opnd::Var(o.accs[e].var), (4 * q + k) as u8);
+                    let f = b.bitcast_f32(lv);
+                    let v0 = b.mul_f32(f, fin);
+                    hv.push(b.let_(amdgpu_dsl::Op::CvtF32ToF16(Opnd::Val(v0))));
+                }
+                let s0 = b.shl_i32(hv[1], c16);
+                let s1 = b.shl_i32(hv[3], c16);
+                let w0 = b.let_(amdgpu_dsl::Op::AddI32(Opnd::Val(hv[0]), Opnd::Val(s0)));
+                let w1 = b.let_(amdgpu_dsl::Op::AddI32(Opnd::Val(hv[2]), Opnd::Val(s1)));
+                // instructions 2 (4 ec + q) and + 1 of the write partition
+                let n = 2 * (4 * ec + q);
+                wp.write(b, n, 0, &[w0]);
+                wp.write(b, n + 1, 0, &[w1]);
+            }
+        }
+        b.wait_lds(0);
+        for (i, g) in gptr.iter().enumerate() {
+            let v = rp.read(b, i, 0);
+            b.store_f32x4(*g, (128 * pr) as u32, v);
+        }
+        b.wait_lds(0);
+    }
+    b.end_if();
 }

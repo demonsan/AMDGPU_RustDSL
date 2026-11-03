@@ -56,7 +56,7 @@ impl KArgs {
     /// A tensor declaration (see [`TensorDecl`]); nothing is emitted until `declare`.
     pub fn tensor(&mut self, name: &str, ptr_off: u32, elem_bytes: i64, dims: Vec<Dim>, strides: Vec<Stride>) -> TensorDecl {
         assert_eq!(dims.len(), strides.len(), "tensor {name}: one stride per dim");
-        TensorDecl { name: name.to_string(), ptr_off, elem_bytes, dims, strides, packed: false, same_strides: None, alloc: None, slack: None }
+        TensorDecl { name: name.to_string(), ptr_off, elem_bytes, dims, strides, packed: false, same_strides: None, alloc: None, slack: None, contract: true }
     }
 }
 
@@ -123,6 +123,8 @@ pub struct TensorDecl {
     same_strides: Option<Tensor>,
     alloc: Option<Ext>,
     slack: Option<Ext>,
+    /// emit the host contract here (false: the caller derives it, e.g. from an `amdgpu_layout::Layout`)
+    contract: bool,
 }
 
 /// The value of a stride in contract terms: a constant when known, else the kernarg itself, else (derived) the packed value.
@@ -164,6 +166,11 @@ impl TensorDecl {
         self.alloc = Some(bytes);
         self
     }
+    /// Declares the kernargs and loads only: the host contract (`arg_tensor`, `ka_is`, `ka_range`) is emitted by the caller.
+    pub fn external_contract(mut self) -> TensorDecl {
+        self.contract = false;
+        self
+    }
     /// The host allocates `extra` zeroed bytes after the logical tensor: reads may use them, writes may not (`arg_tensor_slack`).
     pub fn slack(mut self, extra: Ext) -> TensorDecl {
         self.slack = Some(extra);
@@ -201,6 +208,9 @@ impl TensorDecl {
         // contract relations innermost first (a relation refers only to inner strides: the definitions are emitted in dependency order)
         for i in (0..n).rev() {
             let Stride::Ka(_, off) = &self.strides[i] else { continue };
+            if !self.contract {
+                continue;
+            }
             if self.packed && self.same_strides.is_none() {
                 match &packed_v[i] {
                     Cx::K(k) => b.ka_range(*off, *k, *k),
@@ -216,9 +226,10 @@ impl TensorDecl {
             }
         }
         let alloc = self.alloc.clone().unwrap_or_else(|| cx[0].mul_dim(&self.dims[0]).ext());
-        match &self.slack {
-            None => b.arg_tensor(&self.name, alloc),
-            Some(extra) => b.arg_tensor_slack(&self.name, alloc.clone(), alloc + extra.clone()),
+        match (&self.slack, self.contract) {
+            (_, false) => {}
+            (None, true) => b.arg_tensor(&self.name, alloc),
+            (Some(extra), true) => b.arg_tensor_slack(&self.name, alloc.clone(), alloc + extra.clone()),
         }
         let stride_offs = self.strides.iter().map(|s| if let Stride::Ka(_, o) = s { Some(*o) } else { None }).collect();
         Tensor { name: self.name, ptr, elem_bytes: self.elem_bytes, dims: self.dims, strides: vals, contract_strides: cx, stride_offs }
