@@ -26,21 +26,6 @@ fn c_ident(s: &str) -> String {
     if out.is_empty() { "arg".into() } else { out }
 }
 
-fn ty_name(ty: DType) -> &'static str {
-    match ty {
-        DType::Ptr => "void*",
-        DType::I32 | DType::U32 => "uint32_t",
-        DType::F32 => "float",
-        DType::F16 => "uint16_t",
-        DType::I1 => "uint32_t",
-        DType::Frag2 => "uint8_t",
-        DType::Frag4 => "uint8_t",
-        DType::Frag8 => "uint8_t",
-        DType::Frag16 => "uint8_t",
-        DType::Rsrc => "uint32_t",
-    }
-}
-
 fn ext_expr(e: &Ext) -> String {
     fn p(e: &Ext) -> String {
         match e {
