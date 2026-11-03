@@ -95,8 +95,8 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>) -> Dma {
     let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-1024 * (q as i64 % 4))).collect();
     let mut voff: Vec<ValueId> = Vec::new();
     let mut base_of: Vec<usize> = Vec::new(); // issue index whose voffset is shared
-    let mut issues = Vec::new();
-    let mut delta = Vec::new();
+    let mut issues: Vec<(ValueId, i32)> = Vec::new();
+    let mut delta: Vec<Option<ValueId>> = Vec::new();
     for (q, g) in adj.iter().enumerate() {
         let found = if share {
             base_of.iter().copied().find(|&r| {
