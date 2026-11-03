@@ -28,6 +28,10 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
         out.push_str(&format!("BB{}:\n", b.label));
         for inst in &b.insts {
             for line in inst_lines(a, inst) {
+                // perf experiment only (AMDC_EXP_NO_NOPS=1: results may be wrong): how much do the hazard pads cost?
+                if line.starts_with("s_nop") && std::env::var("AMDC_EXP_NO_NOPS").map_or(false, |v| v == "1") {
+                    continue;
+                }
                 out.push_str("    ");
                 out.push_str(&line);
                 out.push('\n');
@@ -51,7 +55,14 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
 
     out.push_str(&format!(".size {}, .-{}\n", m.name, m.name));
 
-    let vgpr = round_up(a.max_v, 4).max(4);
+    let agprs = crate::regalloc::agpr_count(m, a);
+    // gfx950 unified register file: accum_offset = arch VGPRs (rounded to 4), next_free_vgpr = arch + AGPRs (rounded to 8).
+    let (accum_offset, vgpr, _waves) = if agprs == 0 {
+        let v = round_up(a.max_v, 4).max(4);
+        (v, v, 0)
+    } else {
+        crate::regalloc::unified_budget(a.max_v, agprs)
+    };
     let sgpr = round_up(a.max_s, 8).max(8);
 
     // The kernel descriptor is a fixed 64-byte record and the runtime requires
@@ -76,7 +87,7 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push_str("    .amdhsa_system_vgpr_workitem_id 0\n");
     out.push_str(&format!("    .amdhsa_next_free_vgpr {}\n", vgpr));
     out.push_str(&format!("    .amdhsa_next_free_sgpr {}\n", sgpr));
-    out.push_str(&format!("    .amdhsa_accum_offset {}\n", vgpr));
+    out.push_str(&format!("    .amdhsa_accum_offset {}\n", accum_offset));
     out.push_str("    .amdhsa_float_denorm_mode_32 3\n");
     out.push_str("    .amdhsa_float_denorm_mode_16_64 3\n");
     out.push_str("    .amdhsa_ieee_mode 0\n");
@@ -95,6 +106,9 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
     out.push('\n');
     out.push_str(&format!("    .sgpr_count: {}\n", sgpr));
     out.push_str(&format!("    .vgpr_count: {}\n", vgpr));
+    if agprs > 0 {
+        out.push_str(&format!("    .agpr_count: {}\n", agprs));
+    }
     out.push_str("    .sgpr_spill_count: 0\n");
     out.push_str("    .vgpr_spill_count: 0\n");
     out.push_str("    .args:\n");
@@ -144,19 +158,29 @@ fn v(a: &Alloc, r: VReg) -> u32 {
     a.phys[r as usize]
 }
 
+/// `v` / `a` prefix and index of a (possibly AGPR-tagged) physical register.
+fn file(p: u32) -> (char, u32) {
+    if is_agpr_phys(p) {
+        ('a', p - AGPR_TAG)
+    } else {
+        ('v', p)
+    }
+}
+
 fn vr(a: &Alloc, r: VReg) -> String {
-    format!("v{}", v(a, r))
+    let (c, i) = file(v(a, r));
+    format!("{c}{i}")
 }
 
 fn pair(a: &Alloc, r: VReg) -> String {
-    let b = v(a, r);
-    format!("v[{b}:{}]", b + 1)
+    let (c, b) = file(v(a, r));
+    format!("{c}[{b}:{}]", b + 1)
 }
 
-/// A register tuple of `n` consecutive dwords, e.g. `v[8:9]` or `v[4:7]`.
+/// A register tuple of `n` consecutive dwords, e.g. `v[8:9]`, `v[4:7]` or `a[0:3]`.
 fn tuple(a: &Alloc, r: VReg, n: u32) -> String {
-    let b = v(a, r);
-    format!("v[{b}:{}]", b + n - 1)
+    let (c, b) = file(v(a, r));
+    format!("{c}[{b}:{}]", b + n - 1)
 }
 
 fn sr(a: &Alloc, r: VReg) -> String {
@@ -217,6 +241,9 @@ fn mem_op(a: &Alloc, base: Src, off: i64) -> String {
 fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
     let d = |a: &Alloc| vr(a, inst.dst.expect("dst"));
     match inst.op {
+        MOp::VAccvgprRead => vec![format!("v_accvgpr_read_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
+        MOp::VAccvgprWrite => vec![format!("v_accvgpr_write_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
+        MOp::VAccvgprMov => vec![format!("v_accvgpr_mov_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
         MOp::VMovB32 => {
             // A register-to-register move carries its source in `srcs`; a
             // constant carries its 32-bit pattern in `imm`.
@@ -578,7 +605,8 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds => {
             let m0 = sr(a, reg_of(&inst.srcs[3]));
             let mn = if inst.op == MOp::BufferLoadDwordX4Lds { "buffer_load_dwordx4" } else { "buffer_load_dword" };
-            vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), format!("{mn} {}", mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, true))]
+            let load = format!("{mn} {}", mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, true));
+            if inst.skip_m0 { vec![load] } else { vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), load] }
         }
         MOp::SBufferRsrcDyn => {
             let d = a.phys[inst.dst.unwrap() as usize];
@@ -604,25 +632,19 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::GlobalLoadLdsB128S | MOp::GlobalLoadLdsB32S => {
             let m0 = sr(a, reg_of(&inst.srcs[2]));
             let mn = if inst.op == MOp::GlobalLoadLdsB128S { "global_load_lds_dwordx4" } else { "global_load_lds_dword" };
-            vec![
-                format!("s_mov_b32 m0, {m0}"),
-                "s_nop 0".to_string(),
-                format!(
-                    "{mn} {}, {}{}",
-                    vr(a, reg_of(&inst.srcs[1])),
-                    spair(a, reg_of(&inst.srcs[0])),
-                    if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
-                ),
-            ]
+            let load = format!(
+                "{mn} {}, {}{}",
+                vr(a, reg_of(&inst.srcs[1])),
+                spair(a, reg_of(&inst.srcs[0])),
+                if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
+            );
+            if inst.skip_m0 { vec![load] } else { vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), load] }
         }
         MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 => {
             let m0 = sr(a, reg_of(&inst.srcs[1]));
             let mn = if inst.op == MOp::GlobalLoadLdsB128 { "global_load_lds_dwordx4" } else { "global_load_lds_dword" };
-            vec![
-                format!("s_mov_b32 m0, {m0}"),
-                "s_nop 0".to_string(),
-                format!("{mn} {}", mem_op(a, inst.srcs[0], inst.imm)),
-            ]
+            let load = format!("{mn} {}", mem_op(a, inst.srcs[0], inst.imm));
+            if inst.skip_m0 { vec![load] } else { vec![format!("s_mov_b32 m0, {m0}"), "s_nop 0".to_string(), load] }
         }
         MOp::GlobalStoreU16 => vec![format!(
             "global_store_short {}, {}, off{}",
@@ -752,6 +774,7 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         }
         MOp::SBarrier => vec!["s_barrier".to_string()],
         MOp::SSetPrio => vec![format!("s_setprio {}", inst.imm)],
+        MOp::SchedGroup => Vec::new(),
         MOp::SEndpgm => vec!["s_endpgm".to_string()],
     }
 }

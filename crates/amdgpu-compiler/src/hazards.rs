@@ -116,6 +116,8 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
         // audit (safe-asm review): VALU writers that were missing from the class - the scalef32 half-write converts (P words feeding the PV MFMA),
         // the permlane swap, and the register reads that expand to v_mov
         MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VPermlane32Swap | MOp::VReadPhys | MOp::VReadSub => Some(2),
+        // v_accvgpr_read/write/mov are VALU writes of a VGPR/AGPR: VALU write -> MFMA read = 2 wait states (CDNA4 ISA 7.6 table 38; the ISA table does not separate the files)
+        MOp::VAccvgprRead | MOp::VAccvgprWrite | MOp::VAccvgprMov => Some(2),
         _ => None,
     }
 }
@@ -157,13 +159,24 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         let mut vw: HashMap<VReg, usize> = HashMap::new();
         // strict: v_pk_add/mul_f32 result -> v_exp/v_rcp needs one wait state (LLVM oracle).
         let mut pkw: HashMap<VReg, usize> = HashMap::new();
+        // v_accvgpr_read result -> v_add_co/v_addc pointer arithmetic needs 2 wait states (LLVM oracle, AGPR rows of the hazard matrix)
+        let mut aw: HashMap<VReg, usize> = HashMap::new();
         // strict: VALU write of vcc -> VALU read of vcc needs 2 wait states (LLVM oracle: _cmp -> v_cndmask, _add_co -> v_addc).
         let vccw = std::cell::Cell::new(0usize);
         let mut cycle = 0usize;
 
         // The earliest cycle at which `inst` may issue given the in-flight results.
-        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, usize>, pkw: &HashMap<VReg, usize>, cycle: usize| -> usize {
+        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, usize>, pkw: &HashMap<VReg, usize>, aw: &HashMap<VReg, usize>, cycle: usize| -> usize {
             let mut earliest = cycle;
+            if inst.op == MOp::VPtrAdd {
+                for s in &inst.srcs {
+                    if let Src::Reg(r) = s {
+                        if let Some(rd) = aw.get(&canon(*r)) {
+                            earliest = earliest.max(*rd);
+                        }
+                    }
+                }
+            }
             if strict && inst.op.consumes_vcc() {
                 earliest = earliest.max(vccw.get());
             }
@@ -221,7 +234,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
 
         let mut i = 0usize;
         while i < insts.len() {
-            let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, cycle);
+            let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, &aw, cycle);
 
             // Fill the stall with independent ALU work from further down the block.
             if earliest > cycle && (!insts[i].op.consumes_vcc() || VCC_FILL.with(|c| c.get())) {
@@ -237,7 +250,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         && !insts[i..j].iter().any(|x| x.pin)
                         && (movable(cand.op) || (VCC_FILL.with(|c| c.get()) && movable_wide(cand.op)))
                         && cand.dst.is_some()
-                        && earliest_of(cand, &ready, &vw, &pkw, cycle) <= cycle;
+                        && earliest_of(cand, &ready, &vw, &pkw, &aw, cycle) <= cycle;
                     if ok {
                         let cd = canon(cand.dst.unwrap());
                         let cs: Vec<VReg> = cand.uses().into_iter().map(canon).collect();
@@ -255,6 +268,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     if ok {
                         let x = insts.remove(j);
                         if let Some(d) = x.dst {
+                            aw.remove(&canon(d));
+                            if x.op == MOp::VAccvgprRead {
+                                aw.insert(canon(d), cycle + 3);
+                            }
                             pkw.remove(&canon(d));
                             if strict && matches!(x.op, MOp::VPkAddF32 | MOp::VPkMulF32) {
                                 pkw.insert(canon(d), cycle + 2);
@@ -272,12 +289,12 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         j += 1;
                     }
                     // The consumer may have become ready.
-                    earliest = earliest_of(&insts[i], &ready, &vw, &pkw, cycle);
+                    earliest = earliest_of(&insts[i], &ready, &vw, &pkw, &aw, cycle);
                 }
             }
 
             let inst = insts[i].clone();
-            let earliest = earliest_of(&inst, &ready, &vw, &pkw, cycle);
+            let earliest = earliest_of(&inst, &ready, &vw, &pkw, &aw, cycle);
             if earliest > cycle {
                 let mut missing = earliest - cycle;
                 while missing > 0 {
@@ -290,6 +307,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             if let Some(d) = inst.dst {
                 ready.remove(&canon(d));
                 vw.remove(&canon(d));
+                aw.remove(&canon(d));
+                if inst.op == MOp::VAccvgprRead {
+                    aw.insert(canon(d), cycle + 3);
+                }
                 if let Some(dly) = valu_writer_delay(inst.op) {
                     vw.insert(canon(d), cycle + 1 + dly);
                 }
@@ -392,9 +413,14 @@ fn wide_store_data_idx(op: MOp) -> usize {
     }
 }
 
+/// VGPR or AGPR (the two files of the unified register file): the hazards below apply to both. Physical ranges are tagged per file (AGPR_TAG), so a\n/// VGPR range never overlaps an AGPR range.
+fn vl(c: RClass) -> bool {
+    c.is_vector() || c.is_agpr()
+}
+
 /// A VALU (non-memory, non-matrix) instruction that writes a vector register.
 fn is_valu_vgpr_write(m: &MFunction, inst: &MInst) -> bool {
-    inst.dst.map_or(false, |d| m.vreg_class(d).is_vector()) && mfma_latency(inst.op).is_none() && crate::sched::effects::effects(m, inst).mem.is_none() && !matches!(inst.op, MOp::VSmfmac16x16x128Fp8)
+    inst.dst.map_or(false, |d| vl(m.vreg_class(d))) && mfma_latency(inst.op).is_none() && crate::sched::effects::effects(m, inst).mem.is_none() && !matches!(inst.op, MOp::VSmfmac16x16x128Fp8)
 }
 
 /// Wait states until an MFMA has finished WRITING its destination (not the value-level RAW latency): 16-pass ops need 18 + 1 (CDNA4 ISA 7.6 "XDL write
@@ -485,7 +511,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
                 _ => {
                     if let Some(d) = inst.dst {
-                        if m.vreg_class(d).is_vector() {
+                        if vl(m.vreg_class(d)) {
                             wr.push(rng(m, d));
                         }
                     }
@@ -525,7 +551,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
                 for (issue, need, dv, drange) in &dst_inflight {
                     for r in &touched {
-                        if !m.vreg_class(*r).is_vector() || m.canon(*r) == *dv {
+                        if !vl(m.vreg_class(*r)) || m.canon(*r) == *dv {
                             continue;
                         }
                         if overlaps(rng(m, *r), *drange) {
@@ -558,14 +584,14 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                     // SMFMAC reads A, B and SRC2 over several passes; the accumulator C is D itself (value-level pass)
                     for s in inst.srcs.iter().take(3) {
                         if let Src::Reg(r) = s {
-                            if m.vreg_class(*r).is_vector() {
+                            if vl(m.vreg_class(*r)) {
                                 srcs.push(rng(m, *r));
                             }
                         }
                     }
                 } else if !matches!(inst.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x64Fp8Z | MOp::VMfma32x32x8F16Z) {
                     if let Some(Src::Reg(r)) = inst.srcs.get(2) {
-                        if m.vreg_class(*r).is_vector() {
+                        if vl(m.vreg_class(*r)) {
                             srcs.push(rng(m, *r));
                         }
                     }

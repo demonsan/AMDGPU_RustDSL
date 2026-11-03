@@ -9,22 +9,29 @@ pub struct Samples {
     pub phys: Vec<u32>,
     vnext: u32,
     snext: u32,
+    anext: u32,
 }
 
 impl Samples {
     pub fn new() -> Samples {
-        Samples { vregs: vec![], phys: vec![], vnext: 8, snext: 8 }
+        Samples { vregs: vec![], phys: vec![], vnext: 8, snext: 8, anext: 0 }
     }
 
     /// Restart physical numbering (virtual indices stay unique).
     pub fn reset_phys(&mut self) {
         self.vnext = 8;
         self.snext = 8;
+        self.anext = 0;
     }
 
     pub fn reg(&mut self, c: RClass) -> VReg {
         let n = c.dwords();
-        let p = if c.is_vector() {
+        let p = if c.is_agpr() {
+            self.anext = (self.anext + n - 1) / n * n;
+            let p = AGPR_TAG + self.anext;
+            self.anext += n;
+            p
+        } else if c.is_vector() {
             self.vnext = (self.vnext + n - 1) / n * n;
             let p = self.vnext;
             self.vnext += n;
@@ -62,14 +69,14 @@ impl Samples {
         inst.imm = match op {
             MOp::VWriteSub | MOp::VReadSub => 1,
             MOp::SWaitVm | MOp::SWaitLgkm => 3,
-            MOp::VReadPhys | MOp::SReadPhys => 0,
+            MOp::VReadPhys | MOp::SReadPhys | MOp::VMfmaScale16x16x128Fp8 => 0,
             _ => 16,
         };
         inst
     }
 
     pub fn alloc(&self) -> amdgpu_compiler::regalloc::Alloc {
-        amdgpu_compiler::regalloc::Alloc { phys: self.phys.clone(), max_v: 256, max_s: 100, scalar: self.vregs.iter().map(|c| !c.is_vector()).collect() }
+        amdgpu_compiler::regalloc::Alloc { phys: self.phys.clone(), max_v: 256, max_s: 100, scalar: self.vregs.iter().map(|c| c.is_scalar()).collect() }
     }
 }
 
@@ -85,5 +92,6 @@ pub fn func(name: &str, blocks: Vec<Block>, vregs: Vec<RClass>) -> MFunction {
         loops: vec![],
         alias: std::collections::HashMap::new(),
         elide_fallthrough: false,
+        agpr_pin: Default::default(),
     }
 }

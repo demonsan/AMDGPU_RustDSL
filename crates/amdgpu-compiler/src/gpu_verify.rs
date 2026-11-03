@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use amdgpu_dsl::{Ext, Function, Op, Opnd, Stmt, ValueId, VarId};
 
-use crate::mir::{MFunction, MOp, RClass, Src};
+use crate::mir::{is_agpr_phys, MFunction, MOp, RClass, Src, AGPR_TAG};
 use crate::regalloc::Alloc;
 
 // --------------------------------------------------------------------------------------------------------------------------------------------
@@ -1775,6 +1775,28 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
         let c: RClass = m.vreg_class(r);
         let p = a.phys[r as usize];
         let n = c.dwords();
+        if c.is_agpr() {
+            // AGPR file (gfx90a+/gfx950): index = phys - AGPR_TAG; tuples start at EVEN indices like VGPR tuples (assembler-measured: a[1:4], a[1:2],
+            // a[1:8] are rejected for ds_read / MFMA operands, a[2:5], a[2:3], a[2:9] accepted); 256 AGPRs per wave.
+            if !is_agpr_phys(p) {
+                rep.add("GV-REG-CLASS", Severity::Error, format!("vreg {r} ({c:?}) is an AGPR-class value but was allocated to a non-AGPR register {p}"));
+                continue;
+            }
+            let ai = p - AGPR_TAG;
+            if n >= 2 && ai % 2 != 0 {
+                rep.add("GV-REG-ALIGN", Severity::Error, format!("vreg {r} ({c:?}) at a{ai}: a {n}-dword AGPR tuple must start at an even register (ISA, assembler-measured)"));
+            } else if n >= 2 && ai % n != 0 {
+                rep.add("GV-REG-POLICY", Severity::Info, format!("vreg {r} ({c:?}) at a{ai}: ISA-legal, but not aligned to the tuple width {n}"));
+            }
+            if ai + n > 256 {
+                rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at a{ai}..a{}: exceeds the 256-AGPR per-wave limit", ai + n - 1));
+            }
+            continue;
+        }
+        if is_agpr_phys(p) {
+            rep.add("GV-REG-CLASS", Severity::Error, format!("vreg {r} ({c:?}) is not an AGPR-class value but was allocated to AGPR a{}", p - AGPR_TAG));
+            continue;
+        }
         if c.is_vector() {
             if p < 1 {
                 rep.add("GV-REG-RESERVED", Severity::Error, format!("vreg {r} ({c:?}) allocated to v{p}: v0 holds the workitem id"));
@@ -1803,6 +1825,16 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             if p + n > SGPR_LIMIT {
                 rep.add("GV-REG-LIMIT", Severity::Error, format!("vreg {r} ({c:?}) at s{p}..s{}: exceeds the {SGPR_LIMIT}-SGPR limit", p + n - 1));
             }
+        }
+    }
+    // unified register file: accum_offset (arch VGPRs rounded to 4) + AGPRs must fit the 512 registers of a wave
+    let n_agpr = crate::regalloc::agpr_count(m, a);
+    if n_agpr > 0 {
+        let (accum, total, _) = crate::regalloc::unified_budget(a.max_v, n_agpr);
+        if total > crate::regalloc::UNIFIED_FILE {
+            rep.add("GV-REG-LIMIT", Severity::Error, format!("unified register file: {accum} arch VGPRs (accum_offset) + {n_agpr} AGPRs = {total} > {}", crate::regalloc::UNIFIED_FILE));
+        } else {
+            rep.ok("agpr-unified-budget");
         }
     }
     if a.max_v > VGPR_LIMIT {
@@ -1839,7 +1871,19 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
             }
         }
     }
-    if let Err(e) = crate::sched::waits::verify_waits(m) {
+    // MFMA vdst and srcC must be in the same register file (arch VGPR / AGPR) - the acc_cd bit selects one file for both
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for (ii, i) in b.insts.iter().enumerate() {
+            if !crate::agpr::is_mfma(i.op) || matches!(i.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x8F16Z | MOp::VMfma32x32x64Fp8Z) {
+                continue;
+            }
+            if let (Some(d), Some(Src::Reg(c))) = (i.dst, i.srcs.get(2)) {
+                if is_agpr_phys(a.phys[d as usize]) != is_agpr_phys(a.phys[*c as usize]) {
+                    rep.add("GV-REG-MFMA-FILE", Severity::Error, format!("block {bi} inst {ii} ({:?}): vdst and srcC are in different register files", i.op));
+                }
+            }
+        }
+    }    if let Err(e) = crate::sched::waits::verify_waits(m) {
         rep.add("GV-WAIT", Severity::Error, format!("{e} (on at least one control-flow path, including loop back edges)"));
     } else {
         rep.ok("wait-paths");

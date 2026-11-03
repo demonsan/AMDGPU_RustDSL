@@ -20,22 +20,72 @@ pub enum RClass {
     S2,
     /// Four consecutive SGPRs (a MUBUF buffer resource descriptor), 4-aligned.
     S4,
+    /// Accumulation VGPRs (gfx90a+/gfx950 unified file: arch VGPRs v0..accum_offset-1, AGPRs a0.. above them). Written by MFMA with
+    /// cc_cd, by ds_read/loads, and by _accvgpr_write; read by MFMA (any operand), stores and _accvgpr_read, never by VALU.
+    A1,
+    A2,
+    A4,
+    A8,
+    A16,
+}
+
+/// Allocated AGPR registers are stored in Alloc::phys as AGPR_TAG + index so one table serves both files.
+pub const AGPR_TAG: u32 = 0x4000_0000;
+
+pub fn is_agpr_phys(p: u32) -> bool {
+    p >= AGPR_TAG
 }
 
 impl RClass {
     pub fn dwords(self) -> u32 {
         match self {
-            RClass::V2 | RClass::S2 => 2,
-            RClass::V4 | RClass::S4 => 4,
-            RClass::V8 => 8,
-            RClass::V16 => 16,
+            RClass::V2 | RClass::S2 | RClass::A2 => 2,
+            RClass::V4 | RClass::S4 | RClass::A4 => 4,
+            RClass::V8 | RClass::A8 => 8,
+            RClass::V16 | RClass::A16 => 16,
             _ => 1,
         }
     }
 
-    /// Vector register classes share one physical file.
+    /// Arch-VGPR register classes share one physical file (AGPR classes are a separate file: is_agpr).
     pub fn is_vector(self) -> bool {
         matches!(self, RClass::V1 | RClass::V2 | RClass::V4 | RClass::V8 | RClass::V16)
+    }
+
+    pub fn is_agpr(self) -> bool {
+        matches!(self, RClass::A1 | RClass::A2 | RClass::A4 | RClass::A8 | RClass::A16)
+    }
+
+    pub fn is_scalar(self) -> bool {
+        matches!(self, RClass::S1 | RClass::S2 | RClass::S4)
+    }
+
+    /// The vector-register class of the same width (V* <-> A*).
+    pub fn to_agpr(self) -> Option<RClass> {
+        Some(match self {
+            RClass::V1 | RClass::A1 => RClass::A1,
+            RClass::V2 | RClass::A2 => RClass::A2,
+            RClass::V4 | RClass::A4 => RClass::A4,
+            RClass::V8 | RClass::A8 => RClass::A8,
+            RClass::V16 | RClass::A16 => RClass::A16,
+            _ => return None,
+        })
+    }
+
+    pub fn to_vgpr(self) -> Option<RClass> {
+        Some(match self {
+            RClass::V1 | RClass::A1 => RClass::V1,
+            RClass::V2 | RClass::A2 => RClass::V2,
+            RClass::V4 | RClass::A4 => RClass::V4,
+            RClass::V8 | RClass::A8 => RClass::V8,
+            RClass::V16 | RClass::A16 => RClass::V16,
+            _ => return None,
+        })
+    }
+
+    /// Same width, ignoring the register file (V4 ~ A4).
+    pub fn same_width_vector(self, o: RClass) -> bool {
+        (self.is_vector() || self.is_agpr()) && (o.is_vector() || o.is_agpr()) && self.dwords() == o.dwords()
     }
 }
 
@@ -126,6 +176,12 @@ pub enum MOp {
     /// ISA, explicit here so every pass sees the read). Semantics:
     /// D += A_sparse(16x128, 64 nonzeros/row) x B(128x16).
     VSmfmac16x16x128Fp8,
+    /// _accvgpr_read_b32 vD, aS: dst V1 <- src A1.
+    VAccvgprRead,
+    /// _accvgpr_write_b32 aD, src: dst A1 <- V1 / S1 / inline constant (Imm).
+    VAccvgprWrite,
+    /// _accvgpr_mov_b32 aD, aS: dst A1 <- A1.
+    VAccvgprMov,
     // workgroup LDS
     LdsWriteB32,
     LdsReadB32,
@@ -139,6 +195,8 @@ pub enum MOp {
     SBarrier,
     /// `s_setprio` imm.
     SSetPrio,
+    /// Scheduler directive (no instruction): `sched_group_barrier(mask, size, sync)`, imm = mask | size << 16 | sync << 32. Consumed (and removed) by `sched::phase`.
+    SchedGroup,
     // global memory
     GlobalLoadU16,
     GlobalLoadF32,
@@ -238,11 +296,14 @@ pub struct MInst {
     /// Pinned instruction (safe-asm blocks built with `Seq::pin`): the scheduler keeps it in program order and treats a run of pinned
     /// instructions as a barrier (nothing moves into, out of or across it).
     pub pin: bool,
+    /// LDS-DMA load whose M0 already holds its LDS base (the previous DMA of the block used the same source register): emit neither the s_mov_b32 m0 nor the
+    /// s_nop 0 that must follow an M0 write (set by sched::m0::reuse).
+    pub skip_m0: bool,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false }
     }
 
     pub fn def(mut self, r: VReg) -> Self {
@@ -337,6 +398,8 @@ pub struct MFunction {
     pub alias: HashMap<VReg, (VReg, u8)>,
     /// Emit no s_branch to the immediately following block (set by the scheduler pipeline only).
     pub elide_fallthrough: bool,
+    /// Explicit AGPR placement (mdgpu_pin_agpr): AGPR-class vreg -> first AGPR index. Honoured exactly by the allocator.
+    pub agpr_pin: HashMap<VReg, u32>,
 }
 
 impl MFunction {
@@ -376,11 +439,40 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                     errs.push(format!("block {bi} inst {ii}: def of unknown vreg r{d}"));
                 }
             }
-            // Class sanity for the operations with fixed register shapes.
+            // AGPR legality: only the instructions listed in `agpr::legal_*` may touch the accumulation-register file, and an MFMA needs
+            // vdst and srcC in the same file.
+            for (k, s) in inst.srcs.iter().enumerate() {
+                if let Src::Reg(r) = s {
+                    if (*r as usize) < m.vregs.len() && m.vreg_class(*r).is_agpr() && !crate::agpr::legal_src(inst.op, k) {
+                        errs.push(format!("block {bi} inst {ii} ({:?}): source {k} is an AGPR but this instruction cannot read one", inst.op));
+                    }
+                }
+            }
+            if let Some(d) = inst.dst {
+                if (d as usize) < m.vregs.len() && m.vreg_class(d).is_agpr() && !crate::agpr::legal_dst(inst.op) {
+                    errs.push(format!("block {bi} inst {ii} ({:?}): destination is an AGPR but this instruction cannot write one", inst.op));
+                }
+            }
+            if crate::agpr::is_mfma(inst.op) && !matches!(inst.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x8F16Z | MOp::VMfma32x32x64Fp8Z) {
+                if let (Some(d), Some(Src::Reg(c))) = (inst.dst, inst.srcs.get(2)) {
+                    if (d as usize) < m.vregs.len() && (*c as usize) < m.vregs.len() && m.vreg_class(d).is_agpr() != m.vreg_class(*c).is_agpr() {
+                        errs.push(format!("block {bi} inst {ii} ({:?}): MFMA vdst and srcC are in different register files", inst.op));
+                    }
+                }
+            }
+            if matches!(inst.op, MOp::VAccvgprRead) && !(matches!(inst.srcs.first(), Some(Src::Reg(r)) if m.vreg_class(*r) == RClass::A1) && inst.dst.map_or(false, |d| m.vreg_class(d) == RClass::V1)) {
+                errs.push(format!("block {bi} inst {ii}: v_accvgpr_read_b32 reads one A1 into one V1"));
+            }
+            if matches!(inst.op, MOp::VAccvgprWrite) && !inst.dst.map_or(false, |d| m.vreg_class(d) == RClass::A1) {
+                errs.push(format!("block {bi} inst {ii}: v_accvgpr_write_b32 writes one A1"));
+            }
+            if matches!(inst.op, MOp::VAccvgprMov) && !(matches!(inst.srcs.first(), Some(Src::Reg(r)) if m.vreg_class(*r) == RClass::A1) && inst.dst.map_or(false, |d| m.vreg_class(d) == RClass::A1)) {
+                errs.push(format!("block {bi} inst {ii}: v_accvgpr_mov_b32 moves one A1 to one A1"));
+            }            // Class sanity for the operations with fixed register shapes.
             match inst.op {
                 MOp::GlobalLoadU16 | MOp::GlobalLoadF32 => {
                     if let Some(d) = inst.dst {
-                        if m.vreg_class(d) != RClass::V1 {
+                        if !m.vreg_class(d).same_width_vector(RClass::V1) {
                             errs.push(format!("block {bi} inst {ii}: load dst must be V1"));
                         }
                     }
@@ -458,14 +550,14 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                 }
                 MOp::VMfma16x16x16F16 => {
                     if let Some(d) = inst.dst {
-                        if m.vreg_class(d) != RClass::V4 {
+                        if !m.vreg_class(d).same_width_vector(RClass::V4) {
                             errs.push(format!("block {bi} inst {ii}: mfma dst must be V4"));
                         }
                     }
                     let want = [RClass::V2, RClass::V2, RClass::V4];
                     for (k, w) in want.iter().enumerate() {
                         match inst.srcs.get(k) {
-                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) if m.vreg_class(*r).same_width_vector(*w) => {}
                             Some(Src::Reg(r)) => errs.push(format!(
                                 "block {bi} inst {ii}: mfma operand {k} is {:?}, expected {w:?}",
                                 m.vreg_class(*r)
@@ -480,13 +572,13 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                     // D/A/B/C are 16/8/8/16 dwords, plus two scalar scales.
                     let want = [RClass::V16, RClass::V8, RClass::V8, RClass::V16, RClass::V1, RClass::V1];
                     if let Some(d) = inst.dst {
-                        if m.vreg_class(d) != RClass::V16 {
+                        if !m.vreg_class(d).same_width_vector(RClass::V16) {
                             errs.push(format!("block {bi} inst {ii}: scaled mfma dst must be V16"));
                         }
                     }
                     for (k, w) in want.iter().enumerate().skip(1) {
                         match inst.srcs.get(k - 1) {
-                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) if m.vreg_class(*r).same_width_vector(*w) => {}
                             Some(Src::Reg(r)) => errs.push(format!(
                                 "block {bi} inst {ii}: scaled mfma operand {k} is {:?}, expected {w:?}",
                                 m.vreg_class(*r)
@@ -499,12 +591,12 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                 }
                 MOp::VMfmaScale16x16x128Fp8 => {
                     let want = [RClass::V8, RClass::V8, RClass::V4, RClass::V1, RClass::V1];
-                    if inst.dst.map(|d| m.vreg_class(d)) != Some(RClass::V4) {
+                    if !inst.dst.map_or(false, |d| m.vreg_class(d).same_width_vector(RClass::V4)) {
                         errs.push(format!("block {bi} inst {ii}: 16x16x128 scaled mfma dst must be V4"));
                     }
                     for (k, w) in want.iter().enumerate() {
                         match inst.srcs.get(k) {
-                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) if (k < 3 && m.vreg_class(*r).same_width_vector(*w)) || m.vreg_class(*r) == *w => {}
                             _ => errs.push(format!("block {bi} inst {ii}: 16x16x128 scaled mfma operand {k} must be a {w:?} register")),
                         }
                     }
@@ -512,7 +604,7 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                 MOp::VMfma32x32x64Fp8 | MOp::VMfma32x32x64Fp8Z => {
                     // unscaled fp8 MFMA: D/A/B/C are 16/8/8/16 dwords (the Z form has no C)
                     let want: &[RClass] = if inst.op == MOp::VMfma32x32x64Fp8 { &[RClass::V8, RClass::V8, RClass::V16] } else { &[RClass::V8, RClass::V8] };
-                    if inst.dst.map_or(true, |d| m.vreg_class(d) != RClass::V16) {
+                    if inst.dst.map_or(true, |d| !m.vreg_class(d).same_width_vector(RClass::V16)) {
                         errs.push(format!("block {bi} inst {ii}: fp8 mfma dst must be V16"));
                     }
                     if inst.srcs.len() != want.len() {
@@ -520,7 +612,7 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                     }
                     for (k, w) in want.iter().enumerate() {
                         match inst.srcs.get(k) {
-                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) if m.vreg_class(*r).same_width_vector(*w) => {}
                             _ => errs.push(format!("block {bi} inst {ii}: fp8 mfma operand {k} must be a {w:?} register")),
                         }
                     }
@@ -553,14 +645,14 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                     let wide = inst.op == MOp::VMfma32x32x16Fp8;
                     let acc = if wide { RClass::V16 } else { RClass::V4 };
                     if let Some(d) = inst.dst {
-                        if m.vreg_class(d) != acc {
+                        if !m.vreg_class(d).same_width_vector(acc) {
                             errs.push(format!("block {bi} inst {ii}: fp8 mfma dst class mismatch"));
                         }
                     }
                     let want = [RClass::V2, RClass::V2, acc];
                     for (k, w) in want.iter().enumerate() {
                         match inst.srcs.get(k) {
-                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) if m.vreg_class(*r).same_width_vector(*w) => {}
                             Some(Src::Reg(r)) => errs.push(format!(
                                 "block {bi} inst {ii}: fp8 mfma operand {k} is {:?}, expected {w:?}",
                                 m.vreg_class(*r)
@@ -573,21 +665,21 @@ pub fn verify(m: &MFunction) -> Vec<String> {
                 }
                 MOp::VMfma32x32x8F16Z => {
                     if let Some(d) = inst.dst {
-                        if m.vreg_class(d) != RClass::V16 {
+                        if !m.vreg_class(d).same_width_vector(RClass::V16) {
                             errs.push(format!("block {bi} inst {ii}: f16 mfma dst must be V16"));
                         }
                     }
                 }
                 MOp::VMfma32x32x8F16 => {
                     if let Some(d) = inst.dst {
-                        if m.vreg_class(d) != RClass::V16 {
+                        if !m.vreg_class(d).same_width_vector(RClass::V16) {
                             errs.push(format!("block {bi} inst {ii}: wide mfma dst must be V16"));
                         }
                     }
                     let want = [RClass::V2, RClass::V2, RClass::V16];
                     for (k, w) in want.iter().enumerate() {
                         match inst.srcs.get(k) {
-                            Some(Src::Reg(r)) if m.vreg_class(*r) == *w => {}
+                            Some(Src::Reg(r)) if m.vreg_class(*r).same_width_vector(*w) => {}
                             Some(Src::Reg(r)) => errs.push(format!(
                                 "block {bi} inst {ii}: wide mfma operand {k} is {:?}, expected {w:?}",
                                 m.vreg_class(*r)
