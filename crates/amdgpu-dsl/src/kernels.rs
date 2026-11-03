@@ -22869,7 +22869,7 @@ pub fn probe_dma_voff_spill() -> Function {
     let pin = b.ptr_add(base, o16);
     b.store_f32x4(pin, 0, data);
     b.wait_vm(0);
-    let rin = b.buffer_rsrc(base);
+    let rin = b.buffer_rsrc(o);
     let c6 = b.c_i32(6);
     let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
     let ldsb = b.mul_i32(wave, c1024);
@@ -22878,7 +22878,7 @@ pub fn probe_dma_voff_spill() -> Function {
     let rd = b.add_i32(ldsb, lane16);
     let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0)), (DType::I32, Opnd::Val(c0))]);
     let (it, acc) = (vars[0], vars[1]);
-    b.buffer_load_lds_b128(rin, o16, c0, ldsb, 0);
+    b.buffer_load_lds_b128(rin, o16, c65536, ldsb, 0); // descriptor base = o, scalar soffset 65536 = the staged input
     b.wait_vm(0);
     let x = b.load_lds_b32(rd);
     let a2 = b.add_i32(acc, x);
