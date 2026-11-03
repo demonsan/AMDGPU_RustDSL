@@ -144,18 +144,24 @@ struct Body {
     sc_wave: ValueId,
     rsrc_a: ValueId,
     rsrc_b: ValueId,
+    rsrc_sfa: ValueId,
+    rsrc_sfb: ValueId,
     ptr_sfa: ValueId,
     ptr_sfb: ValueId,
     m_v: ValueId,
     sa_src: ValueId,
     sb_src: ValueId,
     sa_rd: Vec<ValueId>,
+    sa_sh: Vec<ValueId>,
+    sa_dw: Vec<ValueId>,
     a_rd: LdsPart,
     b_rd: LdsPart,
     zero4: ValueId,
     acc: Vec<VarId>,
     /// deferred stage (key0, slot, units issued) and whether the pipeline loop has started
-    deferred: Option<(I32, SlotIdx, usize)>,
+    deferred: Option<(I32, SlotIdx, usize, StageCache)>,
+    /// MMAs of the register tile already issued by `pre_sync`
+    npre_done: usize,
     in_loop: bool,
     /// register-staged tile (`RegStaged`): initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
     staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, ValueId)>,
@@ -171,15 +177,17 @@ impl Body {
         let scr = self.sc_s.at(slot);
         let so = scr.off_v(b);
         let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
+        let sab = b.bind_i32(ev(scb) + ev(self.sa_dw[0]));
         let (wa, wb) = scr.read(b, |b| {
             let wa: Vec<ValueId> = (0..nm).map(|i| {
-                let a = b.bind_i32(ev(scb) + (ev(self.sa_rd[i]) & -4));
+                // rows 16 i apart: the same lane dword + 16 i (an immediate)
+                let a = b.bind_i32(ev(sab) + 16 * i as i32);
                 b.load_lds_b32(a)
             }).collect();
             let a = b.bind_i32(ev(scb) + 256);
             (wa, b.load_lds_b32(a))
         });
-        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
+        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0])))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kb) & 3) << 3));
         (sa, sb)
     }
@@ -212,16 +220,30 @@ impl Body {
         let mut deferred = self.deferred.take();
         let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
         let per = (total + 2 * nm - 1) / (2 * nm);
+        let prio = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noprio"));
+        if prio {
+            b.set_prio(1);
+        }
         let half = nn / 2;
+        let gap = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("dmagap").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1);
+        let mut nmma = 0usize;
+        let _ = per;
         for (lo, hi) in [(0, half), (half, nn)] {
             for i in 0..nm {
-                if let Some((k, s, done)) = deferred.take() {
-                    self.stage_now(b, &k, &s, done..done + per);
-                    if done + per < total {
-                        deferred = Some((k, s, done + per));
-                    }
-                }
                 for j in lo..hi {
+                    if lo == 0 && i * half + j < self.npre_done {
+                        continue; // issued before the barrier (pre_sync)
+                    }
+                    // the stage of t+2: one DMA every `gap` MMAs
+                    if nmma % gap == 0 {
+                        if let Some((k, s, done, mut cache)) = deferred.take() {
+                            self.stage_now(b, &k, &s, done..done + 1, &mut cache);
+                            if done + 1 < total {
+                                deferred = Some((k, s, done + 1, cache));
+                            }
+                        }
+                    }
+                    nmma += 1;
                     mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[i], sbv);
                 }
                 if lo == half {
@@ -239,6 +261,9 @@ impl Body {
                 }
             }
         }
+        if prio {
+            b.set_prio(0);
+        }
         if t.staged {
             // the scales of t+1 last (their byte selects would otherwise wait at the top of the MMAs)
             let (sa, sb) = self.load_scales(b, &t.next, ox(t.it) + 1);
@@ -252,35 +277,48 @@ impl Body {
 impl Body {
     /// The DMA of one tile (A issues, B issues, the 2 scale loads); `range` selects which of them to issue now (the deferred form spreads them
     /// over the MMA rows).
-    fn stage_now(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, range: std::ops::Range<usize>) {
+    fn stage_now(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, range: std::ops::Range<usize>, cache: &mut StageCache) {
         // diagnostic ablations (wrong results): FMHA_ABLATE=gemm_nodma skips the copies
         if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nodma")) {
             return;
         }
         // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0
         // the tile origins are wave uniform: SGPR soffsets
-        let ka = { let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v) };
-        let kb = { let v = b.bind_i32((key0.clone() << 4) + ev(self.b_org)); b.read_first_lane(v) };
+        // computed once per stage (the deferred form issues the stage in chunks)
+        let (ka, kb) = *cache.org.get_or_insert_with(|| {
+            let ka = { let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v) };
+            let kb = { let v = b.bind_i32((key0.clone() << 4) + ev(self.b_org)); b.read_first_lane(v) };
+            (ka, kb)
+        });
         let mut unit = 0usize;
-        for (sh, dma, org, rsrc, wave) in [(&self.a_s, &self.a_dma, ka, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, kb, self.rsrc_b, self.b_wave)] {
+        for (bi, (sh, dma, org, rsrc, wave)) in [(&self.a_s, &self.a_dma, ka, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, kb, self.rsrc_b, self.b_wave)].into_iter().enumerate() {
             let mine: Vec<(ValueId, i32)> = dma.issues.iter().enumerate().filter(|(q, _)| range.contains(&(unit + q))).map(|(_, x)| *x).collect();
             unit += dma.issues.len();
             if mine.is_empty() {
                 continue;
             }
             let r = sh.at(slot);
-            let o = r.off_v(b);
-            let sbase = b.bind_i32(o + sh.base as i32 + ev(wave));
+            if cache.sbase[bi].is_none() {
+                let o = r.off_v(b);
+                cache.sbase[bi] = Some(b.bind_i32(o + sh.base as i32 + ev(wave)));
+            }
+            let sbase = cache.sbase[bi].unwrap();
+            let mut m0s: Vec<(i32, ValueId)> = Vec::new();
+            for (_, lds) in mine.iter() {
+                let grp = *lds - *lds % 4096;
+                let key = (bi, grp);
+                if !cache.m0.iter().any(|x| x.0 == key) {
+                    let v = b.bind_i32(ev(sbase) + grp);
+                    let v = b.read_first_lane(v);
+                    cache.m0.push((key, v));
+                }
+                m0s.push((grp, cache.m0.iter().find(|x| x.0 == key).unwrap().1));
+            }
             r.write(b, |b| {
                 // buffer_load_dwordx4 ... lds: voffset = the lane's loop-invariant offset, soffset = the tile origin (wave uniform), M0 = the first 1 KB
-                // block of each group of 4 issues, instruction offset 1024 (q % 4) moves both the LDS and the global address
-                let mut m0: Option<(i32, ValueId)> = None;
-                for (g, lds) in mine.iter() {
-                    let grp = *lds - *lds % 4096;
-                    if m0.map(|x| x.0) != Some(grp) {
-                        m0 = Some((grp, b.bind_i32(ev(sbase) + grp)));
-                    }
-                    b.load_buffer_lds(rsrc, *g, org, m0.unwrap().1, (*lds % 4096) as u32, 4);
+                // block of each group of 4 issues (SGPR, once per stage), instruction offset 1024 (q % 4) moves both the LDS and the global address
+                for ((g, lds), (_, m0)) in mine.iter().zip(m0s.iter()) {
+                    b.load_buffer_lds(rsrc, *g, org, *m0, (*lds % 4096) as u32, 4);
                 }
             });
         }
@@ -292,30 +330,35 @@ impl Body {
         let r = self.sc_s.at(slot);
         let o = r.off_v(b);
         let sbase = b.bind_i32(o + self.sc_s.base as i32 + ev(self.sc_wave));
-        let pa = {
-            let o = b.bind_i32(ev(kbi) * ev(self.m_v) + ev(self.sa_src));
-            b.ptr_add(self.ptr_sfa, o)
-        };
-        let pb = {
-            let o = b.bind_i32((ev(self.sb_src) + ev(kbi)) & -4);
-            b.ptr_add(self.ptr_sfb, o)
-        };
-        let sb_m0 = b.bind_i32(ev(sbase) + 256);
+        // MUBUF: A scales voffset = the lane's 4 bytes of the CTA rows, soffset = kb M; B scale: every lane the same dword, soffset = its offset
+        let soa = { let v = b.bind_i32(ev(kbi) * ev(self.m_v)); b.read_first_lane(v) };
+        let sob = { let v = b.bind_i32((ev(self.sb_src) + ev(kbi)) & -4); b.read_first_lane(v) };
+        let m0a = b.read_first_lane(sbase);
+        let m0b = { let v = b.bind_i32(ev(sbase) + 256); b.read_first_lane(v) };
+        let z = b.c_i32(0);
         r.write(b, |b| {
-            b.load_global_lds(pa, sbase, 0, 1);
-            b.load_global_lds(pb, sb_m0, 0, 1);
+            b.buffer_load_lds_b32(self.rsrc_sfa, self.sa_src, soa, m0a, 0);
+            b.buffer_load_lds_b32(self.rsrc_sfb, z, sob, m0b, 0);
         });
     }
+}
+
+/// Per-stage values shared by the chunks of a deferred stage: SGPR tile origins, slot bases, M0 per (buffer, 4 KB group).
+#[derive(Default, Clone)]
+struct StageCache {
+    org: Option<(ValueId, ValueId)>,
+    sbase: [Option<ValueId>; 2],
+    m0: Vec<((usize, i32), ValueId)>,
 }
 
 impl PipeBody for Body {
     fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
         if self.cfg.defer_dma && self.in_loop {
             // issued inside the window, spread over the MMA rows
-            self.deferred = Some((key0.clone(), slot.clone(), 0));
+            self.deferred = Some((key0.clone(), slot.clone(), 0, StageCache::default()));
             return;
         }
-        self.stage_now(b, key0, slot, 0..usize::MAX);
+        self.stage_now(b, key0, slot, 0..usize::MAX, &mut StageCache::default());
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         self.in_loop = true;
@@ -347,6 +390,27 @@ impl PipeBody for Body {
             self.window(b, role, t);
         }
     }
+    fn pre_sync(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
+        if !self.cfg.reg_staged {
+            return;
+        }
+        // the first MMAs of the register tile run while the wave waits for the DMA and the barrier (the vendor issues 4 there)
+        let npre = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(',').find_map(|t| t.strip_prefix("npre").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(4);
+        let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
+        let nn = bv.len();
+        let half = nn / 2;
+        let mut n = 0;
+        'o: for i in 0..av.len() {
+            for j in 0..half {
+                if n == npre {
+                    break 'o;
+                }
+                mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[i], sbv);
+                n += 1;
+            }
+        }
+        self.npre_done = n;
+    }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         if self.cfg.reg_staged {
             self.compute_tile(b, t);
@@ -364,9 +428,11 @@ impl PipeBody for Body {
         let scr = self.sc_s.at(&t.cur);
         let so = scr.off_v(b);
         let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
+        let sab = b.bind_i32(ev(scb) + ev(self.sa_dw[0]));
         let (wa, wb) = scr.read(b, |b| {
             let wa: Vec<ValueId> = (0..nm).map(|i| {
-                let a = b.bind_i32(ev(scb) + (ev(self.sa_rd[i]) & -4));
+                // rows 16 i apart: the same lane dword + 16 i (an immediate)
+                let a = b.bind_i32(ev(sab) + 16 * i as i32);
                 b.load_lds_b32(a)
             }).collect();
             let a = b.bind_i32(ev(scb) + 256);
@@ -379,24 +445,27 @@ impl PipeBody for Body {
         let mut af = { let v = if let Some(z) = zf { z } else { ar.read(b, 0) }; mark(b, v) };
         let bpre = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("bpre").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1).min(nn);
         let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zfb { z } else { br.read(b, j) }; mark(b, v) }).collect();
-        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
+        let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0])))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
-        let prio = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("prio"));
+        let prio = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noprio"));
         if prio {
             b.set_prio(1);
         }
         for i in 0..nm {
             // prefetch the next A fragment while this one feeds 4 MMAs
             let next = if i + 1 < nm { let v = if let Some(z) = zf { z } else { ar.read(b, i + 1) }; Some(mark(b, v)) } else { None };
-            if let Some((k, s, done)) = deferred.take() {
-                let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
-                let per = (total + nm - 1) / nm;
-                self.stage_now(b, &k, &s, done..done + per);
-                if done + per < total {
-                    deferred = Some((k, s, done + per));
-                }
-            }
             for j in 0..nn {
+                // the next tile's DMA: one issue every `gap` MMAs (FMHA_ABLATE=dmagapN), from the first row on
+                let gap = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(",").find_map(|t| t.strip_prefix("dmagap").and_then(|n| n.parse::<usize>().ok()))).unwrap_or(2).max(1);
+                if (nn * i + j) % gap == 0 {
+                    if let Some((k, s, done, mut cache)) = deferred.take() {
+                        let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
+                        self.stage_now(b, &k, &s, done..done + 1, &mut cache);
+                        if done + 1 < total {
+                            deferred = Some((k, s, done + 1, cache));
+                        }
+                    }
+                }
                 if i == 0 && j + bpre < nn {
                     let v = if let Some(z) = zfb { z } else { br.read(b, j + bpre) };
                     bf.push(mark(b, v));
@@ -408,6 +477,10 @@ impl PipeBody for Body {
             if let Some(n) = next {
                 af = n;
             }
+        }
+        // whatever is left of the stage (when gap x issues exceeds the MMAs)
+        if let Some((k, s, done, mut cache)) = deferred.take() {
+            self.stage_now(b, &k, &s, done..usize::MAX, &mut cache);
         }
         if prio {
             b.set_prio(0);
@@ -513,6 +586,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
     // buffer descriptors over A (M K bytes) and the preshuffled B (N K bytes)
     let rsrc_a = { let n = b.bind_i32(ev(m_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_a, n) };
     let rsrc_b = { let n = b.bind_i32(ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) };
+    let rsrc_sfa = { let n = b.bind_i32(ev(m_v) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) };
+    let rsrc_sfb = { let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) };
     let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
     let b_org = b.bind_i32((ev(bx) << lg_n) * ev(k_v));
 
@@ -526,6 +601,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
     assert!(wave_n <= 128 && 128 % wave_n == 0);
     let sb_row = b.bind_i32(((ev(bx) << lg_n) + (ev(wn) * wave_n as i32)).lshr(7));
     let sb_src = b.bind_i32(ev(sb_row) * ev(kb_v));
+    // loop-invariant byte-select shifts of the A scales and the dword offsets of their rows
+    let sa_sh: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32((ev(*r) & 3) << 3)).collect();
+    let sa_dw: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32(ev(*r) & -4)).collect();
 
     let cadence = if cfg.reg_staged { Cadence::RegStaged } else if cfg.three_slots { Cadence::OneWindow } else { Cadence::TwoSlot };
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
@@ -534,8 +612,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
     }
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
-        cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false,
+        cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false, npre_done: 0,
     };
     pipe.run(b, Role::All, &mut body);
     for v in body.acc.iter().take(cfg.acc_agpr) {

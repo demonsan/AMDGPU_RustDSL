@@ -88,6 +88,9 @@ pub trait PipeBody {
     fn m_phase(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
     /// `OneWindow`: the whole window of tile t.
     fn window(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
+    /// `RegStaged`: register-only work of tile t issued BEFORE the iteration's wait + barrier (e.g. the first MMAs, which then run while the wave
+    /// waits for the DMA / the other waves); it must not touch the LDS slots.
+    fn pre_sync(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
 }
 
 /// The pipeline over `nkv` tiles of `tile_rows` rows (the last one possibly partial: `kv_len` rows in total).
@@ -307,6 +310,7 @@ impl Pipeline {
                     tile_rows: self.tile_rows,
                 };
                 self.prebind(b, &t);
+                body.pre_sync(b, role, &t);
                 if staged {
                     b.wait_vm(0);
                     b.wait_lds(0);
