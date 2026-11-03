@@ -86,7 +86,7 @@ impl OffsetPlan {
 pub fn layout_to_offsets(exprs: &[Ix], swz: &Swizzle, imm: ImmRange, d: &Dyns) -> OffsetPlan {
     let mut bases: Vec<Ix> = Vec::new();
     let mut issues: Vec<(usize, i64)> = Vec::with_capacity(exprs.len());
-    let mut push = |b: Ix, k: i64, bases: &mut Vec<Ix>| -> (usize, i64) {
+    let push = |b: Ix, k: i64, bases: &mut Vec<Ix>| -> (usize, i64) {
         let (b, k) = if imm.fits(k) { (b, k) } else { (b.add_c(k), 0) };
         let i = match bases.iter().position(|x| *x == b) {
             Some(i) => i,

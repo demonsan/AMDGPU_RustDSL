@@ -178,3 +178,14 @@ fn mfma_c_layout_is_the_keymask_row_formula() {
         }
     }
 }
+
+#[test]
+fn operand_match_with_a_k_permutation() {
+    // a reader that swaps the two 16-byte halves of every 32-byte k block: matches the MFMA A layout only under the same K permutation
+    // (logical k = k0 + 16 a + 32 b  ->  physical k0 + 32 a + 16 b)
+    let perm = make_layout(tup![16, 2, 2], tup![1, 32, 16]);
+    let atom = mfma_a_32x32x64_f8();
+    let tab: Vec<i64> = tv_table(&atom).into_iter().map(|e| (e % 32) + 32 * perm.at(e / 32)).collect();
+    check_operand_match(&tab, &atom, 32, Some(&perm)).unwrap();
+    assert!(check_operand_match(&tab, &atom, 32, None).is_err(), "without the permutation the layouts differ");
+}
