@@ -45,7 +45,7 @@ fn ext_expr(e: &Ext) -> String {
     fn p(e: &Ext) -> String {
         match e {
             Ext::Const(c) => format!("{c}LL"),
-            Ext::Ka(o) => format!("ka_at(0x{o:X}u)"),
+            Ext::Ka(o) => format!("ka(0x{o:X}u)"),
             Ext::Grid(a) => match a { 0 => "grid.x".into(), 1 => "grid.y".into(), 2 => "grid.z".into(), _ => format!("1/*grid{a}*/") },
             Ext::Sym(n) => format!("syms.{}", c_ident(n)),
             Ext::Add(a, b) => format!("({}+{})", p(a), p(b)),
@@ -56,6 +56,11 @@ fn ext_expr(e: &Ext) -> String {
         }
     }
     p(e)
+}
+
+fn ext_expr_grid(e: &Ext) -> String {
+    // inside the generated dim3 grid() helper, kernarg reads need the `a` argument
+    ext_expr(e).replace("ka(", "ka_at(a,")
 }
 
 fn ext_text(e: &Ext) -> String {
@@ -198,9 +203,9 @@ pub fn generate(f: &Function) -> Result<Generated, String> {
     }
     // grid helper (if every axis has a definition; otherwise caller supplies it)
     let mut grid_exprs: Vec<Option<String>> = vec![None, None, None];
-    for (axis, e) in &c.grid_defs { if (*axis as usize) < 3 { grid_exprs[*axis as usize] = Some(ext_expr(e)); } }
+    for (axis, e) in &c.grid_defs { if (*axis as usize) < 3 { grid_exprs[*axis as usize] = Some(ext_expr_grid(e)); } }
     let grid_fn = if grid_exprs.iter().all(|x| x.is_some()) {
-        format!("inline dim3 grid(const Args& a, const Symbols& syms) {{ auto ka = [&](uint32_t o) -> int64_t {{ return ka_at(a, o); }}; return dim3((unsigned){}, (unsigned){}, (unsigned){}); }}\n",
+        format!("inline dim3 grid(const Args& a, const Symbols& syms) {{ (void)a; (void)syms; return dim3((unsigned){}, (unsigned){}, (unsigned){}); }}\n",
             grid_exprs[0].as_ref().unwrap(), grid_exprs[1].as_ref().unwrap(), grid_exprs[2].as_ref().unwrap())
     } else {
         String::new()
