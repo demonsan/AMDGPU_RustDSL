@@ -361,6 +361,7 @@ impl Lowerer {
         // (a prefetch, for instance) stay in flight.
         let mut vm_newest: Option<usize> = None;
         let mut need_lgkm = false;
+        let mut lds_newest: Option<usize> = None;
         for s in srcs {
             if let Src::Reg(r) = s {
                 let r = &self.mir.canon(*r);
@@ -369,6 +370,22 @@ impl Lowerer {
                 }
                 if self.pending_smem.contains(r) || self.pending_lds.contains(r) {
                     need_lgkm = true;
+                }
+                if let Some(pos) = self.pending_lds.iter().rposition(|x| x == r) {
+                    lds_newest = Some(lds_newest.map_or(pos, |p| p.max(pos)));
+                }
+            }
+        }
+        // `lgkmn` (opt-in, the GEMM kernels): LDS reads return in issue order: with no scalar load in flight, `lgkmcnt(n)` (n = LDS read INSTRUCTIONS issued after the newest one
+        // feeding `srcs`; `pending_lds` holds one entry per instruction) keeps later reads (prefetches) in flight. Untracked LDS writes only make
+        // the count conservative (issued earlier: they complete first; issued later: they are not counted in n). The 4-bit counter caps n at 15.
+        if need_lgkm && self.pending_smem.is_empty() && opt_on("lgkmn") {
+            if let Some(pos) = lds_newest {
+                let after = self.pending_lds.len() - 1 - pos;
+                if after <= 15 {
+                    self.push(MInst::new(MOp::SWaitLgkm).imm(after as i64).auto());
+                    self.pending_lds.drain(..=pos);
+                    need_lgkm = false;
                 }
             }
         }
@@ -2348,7 +2365,9 @@ impl Lowerer {
                     let part = self.alias_vreg(d, (2 * r) as u8, RClass::V2);
                     self.push(MInst::new(MOp::LdsReadB64TrB8).def(part).srcreg(a).imm(off));
                 }
-                self.pending_lds.push(d);
+                for _ in 0..addrs.len() {
+                    self.pending_lds.push(d);
+                }
                 self.val.insert(dst, d);
             }
             Op::LoadLdsB128x2 { lo, hi } => {
@@ -2359,6 +2378,7 @@ impl Lowerer {
                 let (a_hi, off_hi) = self.lds_addr(*hi)?;
                 let part_hi = self.alias_vreg(d, 4, RClass::V4);
                 self.push(MInst::new(MOp::LdsReadB128).def(part_hi).srcreg(a_hi).imm(off_hi));
+                self.pending_lds.push(d);
                 self.pending_lds.push(d);
                 self.val.insert(dst, d);
             }            Op::Frag8(a, b, c, d, e, f, g, h) => {

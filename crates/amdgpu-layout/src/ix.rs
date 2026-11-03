@@ -308,6 +308,27 @@ impl Ix {
             other => (other.clone(), 0),
         }
     }
+    /// Replaces symbol `s` by `v` (re-simplifying with the ranges of `d`).
+    pub fn subst(&self, s: u32, v: &Ix, d: &Dyns) -> Ix {
+        match self {
+            Ix::C(_) => self.clone(),
+            Ix::Sym(x) => {
+                if *x == s {
+                    v.clone()
+                } else {
+                    self.clone()
+                }
+            }
+            Ix::Sum(t, k) => t.iter().fold(Ix::C(*k), |acc, (x, m)| acc.add(&x.subst(s, v, d).mul_c(*m))),
+            Ix::Mul(a, b) => a.subst(s, v, d).mul(&b.subst(s, v, d)),
+            Ix::Div(a, k) => a.subst(s, v, d).div_c(*k, d),
+            Ix::Mod(a, k) => a.subst(s, v, d).mod_c(*k, d),
+            Ix::Xor(a, b) => a.subst(s, v, d).xor(&b.subst(s, v, d)),
+            Ix::And(a, m) => a.subst(s, v, d).and_c(*m),
+            Ix::Shl(a, k) => a.subst(s, v, d).shl(*k),
+            Ix::Shr(a, k) => a.subst(s, v, d).shr(*k),
+        }
+    }
     /// Evaluates with concrete symbol values.
     pub fn eval(&self, env: &dyn Fn(u32) -> i64) -> i64 {
         match self {

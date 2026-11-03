@@ -1,0 +1,12 @@
+[package]
+name = "amdgpu-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Kernels composed on the route-B layers (amdgpu-layout + amdgpu-isa atoms + amdgpu-tile TiledCopy/TiledMma + amdgpu-dsl pipeline)."
+
+[dependencies]
+amdgpu-dsl = { path = "../amdgpu-dsl" }
+amdgpu-layout = { path = "../amdgpu-layout" }
+amdgpu-isa = { path = "../amdgpu-isa" }
+amdgpu-tile = { path = "../amdgpu-tile" }

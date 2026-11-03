@@ -11,11 +11,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bufdma;
 pub mod copy;
 pub mod dma;
 pub mod mma;
 
 pub use copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_b, LdsPart, LdsSlotPart, TiledCopy};
+pub use bufdma::{partition_buffer_dma, BufDmaPart};
 pub use dma::{partition_dma, DmaPart};
 pub use mma::{gemm, make_tiled_mma, TiledMma};
 

@@ -104,6 +104,11 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
+    } else if pname.starts_with("gemm_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
+        // the GEMM kernels: partial lgkmcnt waits keep the prefetched fragment reads in flight (`lgkmn`)
+        let mut v: Vec<&str> = vec!["dce", "cmpfold", "lgkmn", "zeroinit"];
+        v.extend_from_slice(extra);
+        lower::with_opts(&v, || lower::lower(f))?
     } else if pname.starts_with("fmha_fwd_hd128_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
         // the FMHA kernels zero their accumulators in place (bit-exact on all 15 shapes, -160 v_mov on _t, docs/status.md)
         let mut v: Vec<&str> = vec!["zeroinit"];
@@ -310,6 +315,11 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_kvsplit" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine16h" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine16h()),
         "fmha_fwd_hd128_mxfp8_kvsplit_combine8h" => Some(amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine8h()),
+        "gemm_mxfp8_bs_v0" => Some(amdgpu_dsl::gemm_mxfp8::gemm_mxfp8_bs_v0()),
+        "gemm_mxfp8_bs_v1" => Some(amdgpu_dsl::gemm_mxfp8::gemm_mxfp8_bs_v1()),
+        "gemm_mxfp8_bs_v2" => Some(amdgpu_kernels::gemm_mxfp8::gemm_mxfp8_bs_v2()),
+        "gemm_mxfp8_bs_v3" => Some(amdgpu_kernels::gemm_mxfp8::gemm_mxfp8_bs_v3()),
+        "gemm_mxfp8_bs_v4" => Some(amdgpu_kernels::gemm_mxfp8::gemm_mxfp8_bs_v4()),
         "fmha_fwd_hd128_mxfp8_dsl_vs128" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_vs128()),
         "fmha_fwd_hd128_mxfp8_dsl_t128" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_t128()),
         "fmha_fwd_hd128_mxfp8_dsl_kvsplit" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_kvsplit()),

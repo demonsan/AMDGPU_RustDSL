@@ -27,7 +27,8 @@ enum CV {
 #[derive(Clone, Debug)]
 enum Item {
     Barrier { ord: u32 },
-    WaitVm { ord: u32 },
+    /// `s_waitcnt vmcnt(count)`: completes the VMEM operations of this wave except the `count` most recent ones (loads return in issue order)
+    WaitVm { ord: u32, count: u8 },
     WaitLds { ord: u32 },
     Open { ev: usize },
     Access { dma: bool },
@@ -337,7 +338,8 @@ impl<'a> Sim<'a> {
                         if self.evs[e].produce != write {
                             self.diag("GV-TILE-KIND", Severity::Error, i, format!("stmt {i}: a global {} is issued under a buf_{} marker (stmt {})", if write { "write" } else { "read" }, if self.evs[e].produce { "produce" } else { "consume" }, self.evs[e].stmt));
                         } else {
-                            self.items.push(Item::Access { dma: true });
+                            // a global-region access: not an LDS-direct DMA (the counted-vmcnt rule only counts in-order DMA loads)
+                            self.items.push(Item::Access { dma: false });
                             let pos = self.items.len() - 1;
                             let ev = &mut self.evs[e];
                             ev.last = pos;
@@ -393,7 +395,7 @@ impl<'a> Sim<'a> {
                 }
                 Stmt::FenceRelease { .. } => self.items.push(Item::Release { ord: self.ord }),
                 Stmt::FenceAcquire { inv } => self.items.push(Item::Acquire { ord: self.ord, inv: *inv }),
-                Stmt::WaitVm { count: 0 } => self.items.push(Item::WaitVm { ord: self.ord }),
+                Stmt::WaitVm { count } => self.items.push(Item::WaitVm { ord: self.ord, count: *count }),
                 Stmt::WaitLds { count: 0 } => self.items.push(Item::WaitLds { ord: self.ord }),
                 Stmt::TileProduce { tile, slot, version } => self.open_marker(i, true, tile, slot, version),
                 Stmt::TileConsume { tile, slot, version } => self.open_marker(i, false, tile, slot, version),
@@ -495,15 +497,33 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
     let after = ev.last + 1;
     let find = |pred: &dyn Fn(&Item) -> bool| items.iter().enumerate().skip(after).find(|(_, it)| pred(it)).map(|(k, _)| k);
     let ord_of = |it: &Item, dflt: u32| match it {
-        Item::WaitVm { ord } | Item::WaitLds { ord } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } => *ord,
+        Item::WaitVm { ord, .. } | Item::WaitLds { ord } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } => *ord,
         _ => dflt,
     };
     if ev.produce {
         let done = if ev.global {
             // COMPLETION of global writes: wait_vm(0) or a fence_release (which waits vmcnt(0) itself)
-            find(&|it| matches!(it, Item::WaitVm { .. } | Item::Release { .. }))
+            find(&|it| matches!(it, Item::WaitVm { count: 0, .. } | Item::Release { .. }))
         } else {
-            let vm = if ev.dma { find(&|it| matches!(it, Item::WaitVm { .. })) } else { None };
+            // a DMA is complete at the first vmcnt(n) after which at least n LATER LDS-direct DMAs of this wave are in flight (in-order load returns; other
+            // VMEM operations are not counted, which only makes the rule more conservative)
+            let vm = if ev.dma {
+                let mut later = 0usize;
+                let mut hit = None;
+                for (k, it) in items.iter().enumerate().skip(after) {
+                    match it {
+                        Item::Access { dma: true } => later += 1,
+                        Item::WaitVm { count, .. } if later >= *count as usize => {
+                            hit = Some(k);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                hit
+            } else {
+                None
+            };
             let ds = if ev.ds { find(&|it| matches!(it, Item::WaitLds { .. })) } else { None };
             match (ev.dma, ev.ds) {
                 (true, true) => match (vm, ds) {
@@ -526,7 +546,7 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
         }
     } else {
         // consumer: its reads are complete at the first wait after the last read (wait_lds(0) for LDS; wait_vm(0) / a fence for global reads)
-        let is_wait = |it: &Item| if ev.global { matches!(it, Item::WaitVm { .. } | Item::Release { .. } | Item::Acquire { .. }) } else { matches!(it, Item::WaitLds { .. }) };
+        let is_wait = |it: &Item| if ev.global { matches!(it, Item::WaitVm { count: 0, .. } | Item::Release { .. } | Item::Acquire { .. }) } else { matches!(it, Item::WaitLds { .. }) };
         match find(&|it| is_wait(it)) {
             Some(d) => {
                 let barrier_first = items.iter().enumerate().skip(after).find(|(_, it)| matches!(it, Item::Barrier { .. })).map(|(k, _)| k);
