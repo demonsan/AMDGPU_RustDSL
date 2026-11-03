@@ -83,7 +83,8 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64) {
     // int32 offsets: M K, N K and 2 M N stay below 2^31 (16384 x 65536 tiles of bytes at most)
     b.sym_range("MT", 1, (1 << 14) / cta_m);
     b.sym_range("NT", 1, (1 << 14) / cta_n);
-    b.sym_range("KT", 1, (1 << 16) / 128);
+    // K <= 128 PANEL_KB: the scale panel holds every K group of the CTA (the vendor sp64 limit)
+    b.sym_range("KT", 1, PANEL_KB);
     let m = mt.clone() * Ext::c(cta_m);
     let n = nt.clone() * Ext::c(cta_n);
     let k = kt.clone() * Ext::c(128);
@@ -277,7 +278,7 @@ impl Body {
             let pr = p.sh.at(&SlotIdx::new(0, 0));
             let sab = b.bind_i32((kb.clone() << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
             let bo = b.bind_i32(ev(p.b_off) + kb);
-            let sbb = b.bind_i32((ev(bo) & -4) + (p.sh.base as i32 + p.b_base as i32));
+            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (p.sh.base as i32 + p.b_base as i32));
             let (wa, wb) = pr.read(b, |b| {
                 let wa: Vec<ValueId> = (0..nm).map(|i| {
                     let a = b.bind_i32(ev(sab) + 16 * i as i32);
@@ -559,7 +560,7 @@ impl PipeBody for Body {
             // transposed panel: 2 dwords hold the 8 A-scale bytes of this lane; the B byte as before
             let sab = b.bind_i32((kbx.clone() << 8) + (base as i32) + ev(lo));
             let bo = b.bind_i32(ev(b_off) + kbx.clone());
-            let sbb = b.bind_i32((ev(bo) & -4) + (base + b_base) as i32);
+            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (base + b_base) as i32);
             let (wa, wb) = pr.read(b, |b| {
                 let a1 = b.bind_i32(ev(sab) + 4);
                 let wa = vec![b.load_lds_b32(sab), b.load_lds_b32(a1)];
@@ -673,6 +674,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
         let s = b.bind_i32(ev(okv).eq(0).select_i32(1, 0));
         let px = b.bind_i32(ev(bx0) + ev(s) * (ev(nx) - ev(bx0)));
         let py = b.bind_i32(ev(by0) + ev(s) * (ev(ny) - ev(by0)));
+        b.assume_trusted(px, Ext::c(0), Ext::sym("NT") - Ext::c(1), "XCD raster: (px, py) is a permutation of the 16 x 16 tile grid when the select applies (N = 16 cta_n, M = 16 cta_m: 4 x 4 blocks, 2 per XCD), the identity (workgroup ids) otherwise");
+        b.assume_trusted(py, Ext::c(0), Ext::sym("MT") - Ext::c(1), "XCD raster: see px");
         (px, py)
     } else {
         (bx0, by0)
@@ -745,7 +748,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let sb_src = b.bind_i32(ev(sb_row) * ev(kb_v));
     // loop-invariant byte-select shifts of the A scales and the dword offsets of their rows
     let sa_sh: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32((ev(*r) & 3) << 3)).collect();
-    let sa_dw: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32(ev(*r) & -4)).collect();
+    let sa_dw: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32(ev(*r).lshr(2) << 2)).collect();
 
     let cadence = if cfg.reg_staged { Cadence::RegStaged } else if cfg.three_slots { Cadence::OneWindow } else { Cadence::TwoSlot };
     // the panel DMA (before the pipeline prologue, whose wait_vm(0) + barrier publish it): wave w loads K groups 16 w .. 16 w + 15 (zeros past KB:
@@ -782,7 +785,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
             let wmq = b.bind_i32((ev(tid).lshr(4)) & 1);
             let kq = b.bind_i32(ev(tid).lshr(5));
             let sh_r = b.bind_i32((ev(r) & 3) << 3);
-            let rd0 = b.bind_i32((ev(wmq) << 7) + (ev(r) & -4) + (ev(kq) << 8) + sh.base as i32);
+            let rd0 = b.bind_i32((ev(wmq) << 7) + (ev(r).lshr(2) << 2) + (ev(kq) << 8) + sh.base as i32);
             let wr0 = b.bind_i32((ev(wmq) << 7) + (ev(r) << 3) + (ev(kq) << 8) + sh.base as i32);
             for round in 0..(PANEL_KB / 8) as i32 {
                 let words: Vec<ValueId> = pr.read(b, |b| (0..8).map(|i| { let a = b.bind_i32(ev(rd0) + (2048 * round + 16 * i)); b.load_lds_b32(a) }).collect());
