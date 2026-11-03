@@ -1,10 +1,10 @@
 # 实施计划：计划 vs 现状（第 75 轮）
 
-> 元数据：Main `8fec359`，tag `v2.2-round75-final`。本文把最初的实施计划逐项对照到最终状态；每一项给出状态（**完成 / 采纳（改用别的实现）/ 关闭（负面）/ opt-in / 未做**）和记录它的文档。总览见 `docs/current-status.md`，终局报告见 `docs/final-report.md`。
+> 元数据：Main `8fec359`，tag `v2.2-round75-final`。本文把最初的实施计划逐项对照到最终状态；每一项给出状态（**完成 / 采纳（改用别的实现）/ 关闭（负面）/ opt-in / 未做**）和记录它的文档。总览见 `docs/current-status.md`，终局报告见 `docs/archive/final-report.md`。
 
 ## 0. 当前状态
 
-不再是"设计基线"：Rust DSL、自研编译器（SSA → MIR → RA → 调度 → asm，默认 `llvm-tail` 后端）、safe-asm 序列库、MUBUF / unscaled MFMA 等指令族已在 gfx950（MI355X）真机运行；发布路径 `_auto` 在 B1H8S2048 上是同轮厂商的 1.25–1.31 倍，单 CU 0.84 倍，填满网格 0.84–0.85 倍；精度、确定性（含 1200/1200 重复启动）、`cargo test`（28 个目标、110 项）全部通过。剩余性能差距经五类有界实验关闭（`docs/final-report.md` §6）。
+不再是"设计基线"：Rust DSL、自研编译器（SSA → MIR → RA → 调度 → asm，默认 `llvm-tail` 后端）、safe-asm 序列库、MUBUF / unscaled MFMA 等指令族已在 gfx950（MI355X）真机运行；发布路径 `_auto` 在 B1H8S2048 上是同轮厂商的 1.25–1.31 倍，单 CU 0.84 倍，填满网格 0.84–0.85 倍；精度、确定性（含 1200/1200 重复启动）、`cargo test`（28 个目标、110 项）全部通过。剩余性能差距经五类有界实验关闭（`docs/archive/final-report.md` §6）。
 
 ## 1. 仓库结构：目标 vs 实际
 
@@ -25,19 +25,19 @@
 |---|---|---|---|
 | M0 Cargo workspace、out-of-tree pass driver | 建立 workspace；不修改 LLVM | **完成**：workspace + `amdc` 命令行；LLVM 未修改（tail 走外部 `llc` / 汇编器） | `README.md`、`docs/llvm-tail-integration.md` |
 | M0 target capability 数据来源与版本记录 | 固化 | **完成**：厂商 `.co` 反汇编事实与 ISA 硬件验证在 `vendor-spec.md`；LLVM 行表按方言版本（20 / 24）固定 | `docs/vendor-spec.md`、`crates/amdgpu-compiler/src/backend/` |
-| M0 出口：空 kernel 走通管线生成可加载 `.co` | 是 | **完成**（`tests/gpu/run.sh`、probe kernels） | `docs/status.md` 前 12 轮 |
+| M0 出口：空 kernel 走通管线生成可加载 `.co` | 是 | **完成**（`tests/gpu/run.sh`、probe kernels） | `docs/archive/status.md` 前 12 轮 |
 | M1 `Tile` / `Accumulator` / `OnlineState` / `Slot` / `PendingReadBatch` / `ReadCompleteLease`；structured `loop_by_move` / `if_wave_by_move` | 仿射资源 API | **采纳（简化）**：类型化 SSA 值 + 循环携带变量（"读一次、写一次"契约）+ `begin_if`；资源与 lease 只在 safe-asm 序列里以 `Ready` / `Pending` / 独占借用的形式实现 | `docs/design.md`、`docs/safe-asm-design.md` |
-| M1 Semantic SSA + Resource SSA + Async Event IR | 完整三层 IR | **未做**（只有 LDS 区域与"待完成加载"的 wait 跟踪） | `docs/final-report.md` §8 |
+| M1 Semantic SSA + Resource SSA + Async Event IR | 完整三层 IR | **未做**（只有 LDS 区域与"待完成加载"的 wait 跟踪） | `docs/archive/final-report.md` §8 |
 | M1 compile-fail 负例与 IR verifier | 全部拒绝 move-after-use 等 | **部分**：DSL / MIR 验证器、RA 后检查、safe-asm 的类型级拒绝（`tests/safeasm.rs`）；完整 compile-fail 套件未做 | `cargo test` |
 | M2 Recipe expansion、MachineDAG | 展开 | **采纳（改用 lowering）**：`Op` / `Stmt` 直接 lowering 为 MIR | `crates/amdgpu-compiler/src/lower.rs` |
-| M2 tuple-aware RA、pressure-aware scheduling | 内部实现 | **完成**：tuple-aware RA（紧凑 / 窄操作数回退 / 两阶段 / remat / LDS spill 重试）、列表调度器（`AMDC_SCHED`）；两阶段 RA 的 reaching-writer 缺陷已修 | `docs/scheduling.md`、`docs/status.md` |
+| M2 tuple-aware RA、pressure-aware scheduling | 内部实现 | **完成**：tuple-aware RA（紧凑 / 窄操作数回退 / 两阶段 / remat / LDS spill 重试）、列表调度器（`AMDC_SCHED`）；两阶段 RA 的 reaching-writer 缺陷已修 | `docs/scheduling.md`、`docs/archive/status.md` |
 | M2 hard pin / `named_reg` / Strict | 支持 | **完成**（safe-asm `pin()`；`pin_check` 对最终 MIR 复核补空档） | `docs/safe-asm-design.md` |
-| M2 post-RA dependency 与 encoding 验证 | 支持 | **完成**，含三类真实 hazard 修复：物理 WAW、两阶段 RA reaching-writer、VMEM 宽存储数据 WAR | `docs/final-report.md` §5，`docs/vendor-spec.md` §7.11 |
-| M2 出口：vector-add 与单 wave MFMA 在 gfx950 通过 CPU reference | 是 | **完成** | `docs/status.md` |
-| M3 无 physical 编号的 FMHA frontend、fast / rollback、PV/QK、half drain | 1:1 复刻参考 | **采纳（功能与接口 1:1，结构不同）**：我们的 `_vs128` 等是另一种实现（128-key 单元、一个 rollback、两个 barrier），与厂商逐元素对拍 | `docs/fmha-reference.md`、`docs/final-report.md` §4 |
+| M2 post-RA dependency 与 encoding 验证 | 支持 | **完成**，含三类真实 hazard 修复：物理 WAW、两阶段 RA reaching-writer、VMEM 宽存储数据 WAR | `docs/archive/final-report.md` §5，`docs/vendor-spec.md` §7.11 |
+| M2 出口：vector-add 与单 wave MFMA 在 gfx950 通过 CPU reference | 是 | **完成** | `docs/archive/status.md` |
+| M3 无 physical 编号的 FMHA frontend、fast / rollback、PV/QK、half drain | 1:1 复刻参考 | **采纳（功能与接口 1:1，结构不同）**：我们的 `_vs128` 等是另一种实现（128-key 单元、一个 rollback、两个 barrier），与厂商逐元素对拍 | `docs/fmha-reference.md`、`docs/archive/final-report.md` §4 |
 | M3 ReferenceWitness 复现 1,692 条参考指令 | witness | **未做**（改为反汇编对账：`vendor-spec.md`、`gen9-vendor-mirror-design.md`） | `docs/vendor-spec.md` |
 | M3 同一 frontend 切换 optimized plan | 优化计划 | **完成（以 `FMHA_OPT` 令牌 + 按名 kernel 的形式）**：默认 `_auto`，所有实验为 opt-in | `docs/current-status.md` |
-| M3 出口：`fmha-reference.md` §7.3 全部条目 | 满足 | **部分 / 关闭**：接口、数值、15 形状对拍满足；指令级 1:1 经 gen5/gen6/gen9/gen10 有界实验关闭（vendor-order M 窗口负） | `docs/gen9-vendor-mirror-design.md`、`docs/status.md` 第 68–75 轮 |
+| M3 出口：`fmha-reference.md` §7.3 全部条目 | 满足 | **部分 / 关闭**：接口、数值、15 形状对拍满足；指令级 1:1 经 gen5/gen6/gen9/gen10 有界实验关闭（vendor-order M 窗口负） | `docs/archive/gen9-vendor-mirror-design.md`、`docs/archive/status.md` 第 68–75 轮 |
 | M4 JIT 与框架（FlyDSL 式调用、Python 绑定、SGLang / DeepInfer） | 全部 | **未做**（范围外） | — |
 | M5 通信（MORI LSA / SDMA / GDA）、gfx1250 Expert2 | 全部 | **未做**（范围外；gfx1250 语义证据未补齐） | — |
 
@@ -67,6 +67,6 @@
 
 ## 6. 文档导航
 
-- 总览与路线清单：`docs/current-status.md`；终局报告：`docs/final-report.md`；逐轮记录：`docs/status.md`。
+- 总览与路线清单：`docs/current-status.md`；终局报告：`docs/archive/final-report.md`；逐轮记录：`docs/archive/status.md`。
 - 厂商事实与硬件规则：`docs/vendor-spec.md`、`docs/fmha-reference.md`；设计：`docs/design.md`、`docs/safe-asm-design.md`、`docs/scheduling.md`、`docs/llvm-tail-*.md`。
 - 已关闭 / 采纳的 kernel 设计文档：`kernel-gen2-design`、`gen3-design`、`gen4-tiling-design`（采纳）、`gen5-window-spec`、`gen6-rebalance` / `gen6-results`、`gen9-vendor-mirror-design`、`unscaled-pv-design`、`v-window-cut-plan`、`occupancy`、`kvsplit-design`（采纳）/ `kvsplit-results`。

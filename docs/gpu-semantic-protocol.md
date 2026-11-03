@@ -10,7 +10,7 @@ GPU 上“数据好了”被混成一句话，实际是四件互相独立的事�
 | 轴 | 事件 | 谁做 | 保证什么 | **不**保证什么 |
 |---|---|---|---|---|
 | **到达 Arrival** | `s_barrier` | 工作组内所有 wave | 所有 wave 都到过这个点（相位 +1）；只是**到达** | 不保证任何写已完成，也不保证可见 |
-| **完成 Completion** | `wait_vm(0)`、`wait_lds(0)`、`fence_release`（含 vm 等待） | **每个 wave 各自**（队列计数；vm 按序，标量 lgkm 可乱序，所以部分计数不算完成） | 本 wave 先前发出的访存已完成 | 不保证别的 wave 的写、不保证其他 CU/XCD 可见 |
+| **完成 Completion** | `wait_vm(0)`、`wait_lds(0)`、`fence_release`（含 vm 等待）；`wait_vm(n)` 对 LDS-direct DMA：其后至少有 n 条更新的 DMA 时才算完成 | **每个 wave 各自**（队列计数；vm 按序，标量 lgkm 可乱序，所以部分 lgkm 计数不算完成） | 本 wave 先前发出的访存已完成 | 不保证别的 wave 的写、不保证其他 CU/XCD 可见 |
 | **可见 Visibility** | LDS：barrier（写必须先完成）；全局：`sc1` 写穿 / `fence_release`（`buffer_wbl2`）→ 到达 → `fence_acquire`（`buffer_inv`）/ `sc1` 读 | 生产者 release，消费者 acquire | 其他 wave（或其他 block）能读到这份数据 | 不保证是**哪一代**数据 |
 | **代际 Generation** | 版本/槽位代数（循环计数器的仿射/周期函数） | 生产者与消费者共同遵守 | 读到的是期望的那一代，且下一代不会在读的过程中落到同一位置 | — |
 

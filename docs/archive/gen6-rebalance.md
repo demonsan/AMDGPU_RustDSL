@@ -1,8 +1,8 @@
 # Gen6 rebalance input: vendor V/M split, our solo windows, equal-window VALU split
 
-> Status: input document for the gen6 round (K-ahead ring + merged window + rebalance), which closed NEGATIVE; see docs/gen6-results.md and round 64 of docs/status.md.
+> Status: input document for the gen6 round (K-ahead ring + merged window + rebalance), which closed NEGATIVE; see docs/archive/gen6-results.md and round 64 of docs/archive/status.md.
 
-Inputs: gen5 asm extraction (`docs/gen5-window-spec.md` §1/§5), our kddma counters (per wave-iteration,
+Inputs: gen5 asm extraction (`docs/archive/gen5-window-spec.md` §1/§5), our kddma counters (per wave-iteration,
 `docs/vendor-spec.md` §7.10.1/§7.10.3), kernel-opt's partner-free solo measurements (V 1.15k + M 1.5k +
 other 0.3k = 2.96k compute; DMA/barrier 1.17k; solo tile 4.1k; paired tile 5.34k cycles). The quick
 solo-ablation re-check on `82ff0bf` was attempted but the node was heavily loaded (aidle/bidle timings and

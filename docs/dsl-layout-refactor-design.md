@@ -1,8 +1,8 @@
 # DSL 布局代数重构设计（"路线 B"）
 
-> 状态：**设计稿，仅供评审，尚无代码改动**（分支 `layout-design`，基于 Main `8fc4ca1`）。作者：backend-llvm-tail。
+> 状态：**已实施**（P1–P5 完成，出厂集为 v3 布局层 kernel；实施结果见 §9 As-built）。§0–§8 是评审时的设计稿（分支 `layout-design`，基于 Main `8fc4ca1`），保留原文供对照。作者：backend-llvm-tail。
 > 用户决策："路线 B"——保留我们自己的 builder 前端 + 自研寄存器分配/调度/验证器，但按 NVIDIA cuda-oxide 的分层方式重组库；tile 层的设计参照 **FlyDSL**（AMD 上的 CuTe 代数）与 **aiter OPUS**（薄、编译期决议的 C++ 模板库）。
-> 参考：cuda-oxide README（crate 划分：`cuda-device` / `ctm-rs` / `cute-layout` / `cute-rs` / `cuda-host` / `cuda-core`）；FlyDSL `docs/layout_system_guide.md`、`docs/kernel_authoring_guide.md`（已读原文）；aiter `csrc/include/opus/opus.hpp`（按 lead 给出的要点；未逐行通读）。
+> 参考：cuda-oxide README（crate 划分：`cuda-device` / `ctm-rs` / `cute-layout` / `cute-rs` / `cuda-host` / `cuda-core`）；FlyDSL 仓库的 `layout_system_guide.md`、`kernel_authoring_guide.md`（已读原文）；aiter `csrc/include/opus/opus.hpp`（按 lead 给出的要点；未逐行通读）。
 > 前作：`docs/dsl-tile-abstractions.md`（今天的 L1–L6 tile 库）、`docs/fmha-perf-patterns.md`（33 条性能模式）。
 
 ---
@@ -104,7 +104,7 @@ pub enum IxExpr { C(i64), Sym(DynId), Add(..), Mul(..), Div(..), Mod(..), Xor(..
 
 ### 2.3 Swizzle：把 FMHA 的 XOR swizzle 写成 `Swizzle ∘ Layout`
 
-CuTe 的 `Swizzle<B, M, S>` 是"把位段 `[M+S, M+S+B)` 异或到 `[M, M+B)`"。我们 FMHA 的 swizzle（`docs/status.md` 第 801 行蛮力搜索的结果）是：128 字节一行，16 字节块号 `c`（字节偏移的位 4..6）异或上 `s(r)`，其中 `r` 是行号（位 7..10），
+CuTe 的 `Swizzle<B, M, S>` 是"把位段 `[M+S, M+S+B)` 异或到 `[M, M+B)`"。我们 FMHA 的 swizzle（`docs/archive/status.md` 第 801 行蛮力搜索的结果）是：128 字节一行，16 字节块号 `c`（字节偏移的位 4..6）异或上 `s(r)`，其中 `r` 是行号（位 7..10），
 
 ```
 p = r0;  u = (r >> 1) & 7 = (r1, r2, r3)
@@ -426,7 +426,7 @@ fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, p: &Fragment /* P 的 B 布局�
 | P1 | `crates/amdgpu-layout`：`Ix`（静态常量 / 带范围与位支撑的动态符号）、`IntTuple`、`Layout`、FlyDSL 对齐的代数（composition、complement、coalesce、left/right inverse、logical/zipped/tiled/flat/blocked/raked product 与 divide、按 mode 的动态外层 divide、`local_tile`、`slice`、`recast_layout`、`make_layout_tv`）、GF(2) `Swizzle`（含 CuTe `Swizzle<B,M,S>` 与 FMHA 128 字节行 swizzle）、`IssuePlan` + `layout_to_offsets`、构建期证明（覆盖/单射/广播、连续性与向量宽度、`tr_b8` 源地址、MFMA 操作数匹配含 K 置换、swizzle 双射、LDS bank 冲突） | 完成。19 个单元测试：CuTe/FlyDSL 文档例子逐个复现；`_vs128` 的 K 片段读（`kfx`）和转置 V 读（`trx`）**逐 lane、逐指令与手写公式一致**，基址寄存器数同为 4 |
 | P2 | `crates/amdgpu-isa`（copy / MMA atom 表，带 provenance 与 `const` 断言）、`crates/amdgpu-tile`（`Ctx`、`TiledCopy`、`partition_lds`、`partition_dma`、`partition_buffer_dma`、`partition_global`、`TiledMma`/`gemm`）；IR 新增 `VarMfmaScale16`（`v_mfma_scale_f32_16x16x128_f8f6f4`，op_sel 选 E8M0 字节）、`LoadLdsB64`/`StoreLdsB64` | 完成。在**发射出的 IR** 上用小解释器逐 lane 比对：TiledCopy 的 K 读 = `RowsReader`，转置 V 读 = `TrReader`，`partition_dma` = `RowsCopy`（全局地址、立即数、LDS 目的地，含尾块钳位），全部逐字相等 |
 | P3 | `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-tile/src/fmha.rs`），**已成为出厂集** | 完成。全套 `port_gate` 对 legacy 与对 dsl 均 PASS（见 §9.4）；证书与 dsl/legacy 相同（6/29、4/29、12/36、2/6） |
-| P4 | MXFP8 blockscale GEMM（aiter PR #6696 4-wave pin-AGPR 结构）：kernel-opt 用同一套 atom / TiledCopy / TiledMma 写成；编译器侧 AGPR（sched）、SALU 地址链 `scalarize2`、`ds_read_b64`/`ds_write_b64`、验证器位/区间规则（本分支） | 进行中，数字见 README 与 `docs/current-status.md` 的 GEMM 行（由 kernel-opt 填写） |
+| P4 | MXFP8 blockscale GEMM（aiter PR #6696 4-wave pin-AGPR 结构）：kernel-opt 用同一套 atom / TiledCopy / TiledMma 写成；编译器侧 AGPR（sched）、SALU 地址链 `scalarize2`、`ds_read_b64`/`ds_write_b64`、验证器位/区间规则 | 完成（截至 `v5.0-route-b`）：`gemm_mxfp8_bs_v4`（`crates/amdgpu-kernels`）4096×4096×8192 **3116 vs 3267 TF/s = 0.954×** 厂商，`tools/gemm_gate.sh` PASS，strict 3 / 19 / 0；差距仍在优化（[`current-status.md`](current-status.md) §4.7） |
 | P5 | 主机侧 (b)+(c)：`amdc gen-host` 从 kernel 合同生成 C++ 启动/ABI 头与 JSON 元数据，零 unsafe | 完成，见 [`host-gen.md`](host-gen.md)、[`hostgen-json-schema.md`](hostgen-json-schema.md) |
 
 ### 9.2 东西搬到了哪里

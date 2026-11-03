@@ -143,16 +143,19 @@ witness 不能修正语义缺失。以下情况直接报错，不自动插 copy/
 - 把 partial completion 当作 whole-tile ready
 
 ## Vendor kernel schedule (disassembly findings)
-See docs/status.md, section Kernel optimisation (round 41+), subsection Vendor kernel schedule.
+See docs/archive/status.md, section Kernel optimisation (round 41+), subsection Vendor kernel schedule.
 
 
 ### Update (round 44): current state of our kernel
 
-Default `fmha_fwd_hd128_mxfp8_t` now includes `kdlds,dbuf` (K scales staged through LDS with the K tile, two LDS buffers, one barrier per iteration): 257.8 TFLOP/s vs vendor 517.5 on B1 H8 S=SK=2048, numerics unchanged (mean err 1.248e-3 vs CPU, vendor 2.418e-3). Opt-in `fmha_fwd_hd128_mxfp8_sv` (vendor-style softmax: bias MFMA, max3 + rollback branch, pknorm + scalef32 Schraudolph exp2, row sums from the quantised P) reaches 285.5 TFLOP/s with mean err 2.186e-3 (better than the vendor's 2.418e-3 on this data) but exceeds the per-element tolerance on a few elements of 4 of the 15 `run_ref.sh` shapes (worst_err ~7e-2), so it is NOT the default; the accurate recipe stays the default. Remaining gap to the vendor (about 1.8-2x): global->LDS DMA staging (staging ~2.0-2.5k cycles/iter, see docs/status.md round 44 for the hardware rules found), the barrier imbalance (~1.2-1.4k cycles/iter from the data-dependent rollback), the rollback itself, and the VALU of the softmax (hot path ~296 vs ~160 VALU per 128 keys).
+Default `fmha_fwd_hd128_mxfp8_t` now includes `kdlds,dbuf` (K scales staged through LDS with the K tile, two LDS buffers, one barrier per iteration): 257.8 TFLOP/s vs vendor 517.5 on B1 H8 S=SK=2048, numerics unchanged (mean err 1.248e-3 vs CPU, vendor 2.418e-3). Opt-in `fmha_fwd_hd128_mxfp8_sv` (vendor-style softmax: bias MFMA, max3 + rollback branch, pknorm + scalef32 Schraudolph exp2, row sums from the quantised P) reaches 285.5 TFLOP/s with mean err 2.186e-3 (better than the vendor's 2.418e-3 on this data) but exceeds the per-element tolerance on a few elements of 4 of the 15 `run_ref.sh` shapes (worst_err ~7e-2), so it is NOT the default; the accurate recipe stays the default. Remaining gap to the vendor (about 1.8-2x): global->LDS DMA staging (staging ~2.0-2.5k cycles/iter, see docs/archive/status.md round 44 for the hardware rules found), the barrier imbalance (~1.2-1.4k cycles/iter from the data-dependent rollback), the rollback itself, and the VALU of the softmax (hot path ~296 vs ~160 VALU per 128 keys).
 
-## 我们的实现状态（第 75 轮，Main `8fec359`，tag `v2.2-round75-final`）
+## 我们的实现状态（历史快照：第 75 轮，Main `8fec359`，tag `v2.2-round75-final`）
 
-上面的内容是厂商 kernel 的已核实事实与 1:1 验收标准（保留不变）；本节记录我们的实现最终做到了什么。完整数据在 `docs/final-report.md`、`docs/current-status.md` 与 `docs/status.md`。
+> **当前状态**：出厂集已换成布局层 kernel `fmha_fwd_hd128_mxfp8_v3_*`（`crates/amdgpu-tile/src/fmha.rs`），旧手写集保留为
+> `fmha_fwd_hd128_mxfp8_legacy_auto`。最新数字见 [`current-status.md`](current-status.md) §4。下面的表格是第 75 轮旧手写集的认证快照。
+
+上面的内容是厂商 kernel 的已核实事实与 1:1 验收标准（保留不变）；本节记录第 75 轮时我们的实现做到了什么。完整数据在 `docs/archive/final-report.md`、`docs/current-status.md` 与 `docs/archive/status.md`。
 
 ### 认证数字（同轮厂商对照，own 后端）
 
@@ -164,7 +167,7 @@ Default `fmha_fwd_hd128_mxfp8_t` now includes `kdlds,dbuf` (K scales staged thro
 | B1H8S8192（填满，256 块） | 1998.6 / 2002.7 | 2376.5 | 0.841× |
 | 中等形状 | — | — | 1.00–1.16× |
 
-精度：对 CPU 参考的平均误差 8.3e-4（厂商 1.5–2.9e-3），15 个形状 16 / 64 行门禁均 15/15，`bad = 0`，vendor-parity 15/15；确定性 5/5，重复启动压力 1200/1200；`cargo test` 29 个目标 117 项通过。占用率与厂商相同（1 块 / 8 wave 每 CU）。
+精度：对 CPU 参考的平均误差 8.3e-4（厂商 1.5–2.9e-3），15 个形状 16 / 64 行门禁均 15/15，`bad = 0`，vendor-parity 15/15；确定性 5/5，重复启动压力 1200/1200；`cargo test`（当时）29 个目标 117 项通过。占用率与厂商相同（1 块 / 8 wave 每 CU）。
 
 ### Kernel 清单
 
@@ -172,12 +175,12 @@ Default `fmha_fwd_hd128_mxfp8_t` now includes `kdlds,dbuf` (K scales staged thro
 |---|---|---|
 | `fmha_fwd_hd128_mxfp8_auto` | **默认发布入口** | 主机侧（`tests/gpu/ref_host.cpp`）按守卫模型在 `_vs128` / `_t128` / `_kvsplit`+combine 之间选择：`T_cur = F/(5.96e12·min(256, 2N)) + 7.48 µs`，`T_kv = F/(7.38e12·min(256, Ns)) + 6.80 µs + part/4.0 + max(3, comb/4.2) + 1.0 µs`，阈值 0.95；门禁形状中 7 个走 split |
 | `fmha_fwd_hd128_mxfp8_vs128` | 256 行块（512 线程） | 填满网格与单 CU 基准；128-key 单元、一个 rollback、两个 barrier、smfmac 行和、Q 常驻寄存器、K-scale LDS-DMA |
-| `fmha_fwd_hd128_mxfp8_t128` | 128 行块（256 线程） | 欠填充网格的分块收益（第 59 轮，`docs/gen4-tiling-design.md`） |
-| `fmha_fwd_hd128_mxfp8_kvsplit` + `_kvsplit_combine8h`（另有 `combine` / `combine4` / `combine4h` / `combine16h`） | 序列并行 + 精确合并 | fp16 partial、LDS 转置 16 字节存储；`combine8h` 为默认合并 kernel（`docs/kvsplit-design.md`、`docs/kvsplit-results.md`） |
+| `fmha_fwd_hd128_mxfp8_t128` | 128 行块（256 线程） | 欠填充网格的分块收益（第 59 轮，`docs/archive/gen4-tiling-design.md`） |
+| `fmha_fwd_hd128_mxfp8_kvsplit` + `_kvsplit_combine8h`（另有 `combine` / `combine4` / `combine4h` / `combine16h`） | 序列并行 + 精确合并 | fp16 partial、LDS 转置 16 字节存储；`combine8h` 为默认合并 kernel（`docs/archive/kvsplit-design.md`、`docs/archive/kvsplit-results.md`） |
 | `fmha_fwd_hd128_mxfp8_t` | **冻结的精确参考实现** | 精确 recipe，输出 md5 作为不变量（`38e3200f…`）；`llvm-tail` 默认后端 |
 
-实验 kernel（`_vs5`、`_vs6`、`_vs9`、`_g2`、`_g3`、`_vsm` 等）与所有 `FMHA_OPT` 实验令牌（`biasacc`、`vpre2`、`p4`、`mubuf` / `mubufd`、`cut1`、`saddrlds`、`pmdead`、`eplds` / `epw` / `epdirect` 等）都是 opt-in；默认路径不受影响。已关闭路线及其一句归因见 `docs/final-report.md` §6。
+实验 kernel（`_vs5`、`_vs6`、`_vs9`、`_g2`、`_g3`、`_vsm` 等）与所有 `FMHA_OPT` 实验令牌（`biasacc`、`vpre2`、`p4`、`mubuf` / `mubufd`、`cut1`、`saddrlds`、`pmdead`、`eplds` / `epw` / `epdirect` 等）都是 opt-in；默认路径不受影响。已关闭路线及其一句归因见 `docs/archive/final-report.md` §6。
 
 ### 与本文 §7.3 验收条目的关系
 
-接口、数据格式、缩放用法、数值约定、主要硬件指令族与 15 形状逐元素对拍满足；指令级 1:1（vendor-order M 窗口、持久偏置 C、V 预读）经 gen5 / gen6 / gen9 / gen10 有界实验验证为**不可行**：节省的 XDL 周期原样变成两个 wave 组的屏障 / 相位会合等待，墙钟周期不降（`docs/status.md` 第 73–75 轮）。
+接口、数据格式、缩放用法、数值约定、主要硬件指令族与 15 形状逐元素对拍满足；指令级 1:1（vendor-order M 窗口、持久偏置 C、V 预读）经 gen5 / gen6 / gen9 / gen10 有界实验验证为**不可行**：节省的 XDL 周期原样变成两个 wave 组的屏障 / 相位会合等待，墙钟周期不降（`docs/archive/status.md` 第 73–75 轮）。

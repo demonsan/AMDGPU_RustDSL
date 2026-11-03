@@ -1,4 +1,4 @@
-﻿# gfx950 (MI355X) scheduler microbenchmarks - measured results
+# gfx950 (MI355X) scheduler microbenchmarks - measured results
 
 Sources: `gen.py` (generates asm kernels `mb*.s`, `tests.json`, `groups.json`), `host.cpp` (hipModuleLaunchKernel harness),
 `analyze.py` (table printer), `src.tgz` (the three files). Raw analyses: `run1_analysis.txt` (all kernels, waves 1/4/8, 3 reps),

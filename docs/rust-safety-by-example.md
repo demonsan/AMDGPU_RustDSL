@@ -388,7 +388,7 @@ b.var_asm(vars, AsmBlock)         // 或 Op::Asm（单值形式）
 
 gen5 阶段用 safe-asm 手写了两个真实窗口并落地验证：
 Block C（PV+行和，`winc`，−2.5%）与 Block M（整个 M 相，`winm`，中性 +0.15–0.5%），两者都 **bit-identical**、通过全部门禁。
-它们证明了"手写窗口 + 类型/验证器保证"在真实 kernel 上可用（性能结论另见 `docs/gen5-window-spec.md`）。
+它们证明了"手写窗口 + 类型/验证器保证"在真实 kernel 上可用（性能结论另见 `docs/archive/gen5-window-spec.md`）。
 
 ---
 
@@ -398,13 +398,13 @@ Block C（PV+行和，`winc`，−2.5%）与 Block M（整个 M 相，`winm`，�
 
 | 检查 | 位置 | 当前结果 |
 |---|---|---|
-| 四个 crate 都 forbid unsafe | `tests/rust_safety.rs::every_crate_forbids_unsafe_code` | ✅ 4/4 |
+| 各 crate 都 forbid unsafe | `tests/rust_safety.rs::every_crate_forbids_unsafe_code` | ✅ 7/7（列表内）；`amdgpu-kernels` 的 `forbid` 在其 `lib.rs`，未在列表中 |
 | 16 类危险构造逐行扫描 | `tests/rust_safety.rs::no_forbidden_constructs_in_any_source_line` | ✅ 0 命中 |
 | 零第三方依赖 | `tests/rust_safety.rs::no_third_party_dependencies` | ✅ 全 path |
 | panic 面报告 | `tests/rust_safety.rs::panic_surface_report` | ✅ 每次打印 |
 | safe-asm crate 无 unsafe | `tests/safeasm.rs::safeasm_crate_forbids_unsafe_and_contains_none` | ✅ |
 | 编译期拒绝的 29 个用例 | `crates/amdgpu-safeasm/tests/ui/`（`compile_fail.rs` 驱动，`// error-contains:`） | ✅ 28 fail + 1 pass |
-| 全量测试 | `cargo test` | ✅ **29 个目标 / 117 项** |
+| 全量测试 | `cargo test` | ✅ **65 个目标 / 306 项** |
 
 ## C2. 29 个 ui 用例（编译期拒绝的"负例目录"）
 
@@ -439,7 +439,7 @@ fail_wrong_fragment_width                   pass_sequence（通过对照）
 bash tools/container/cargo.sh test -p amdgpu-compiler --test rust_safety -- --nocapture   # 4 项 + panic 面
 bash tools/container/cargo.sh test -p amdgpu-compiler --test safeasm | grep forbids      # safe-asm 无 unsafe
 bash tools/container/cargo.sh test -p amdgpu-compiler --test compile_fail                # 29 个 ui 用例
-bash tools/container/cargo.sh test                                                       # 29 targets / 117 tests
+bash tools/container/cargo.sh test                                                       # 65 targets / 306 tests
 ```
 
 ---
@@ -447,7 +447,7 @@ bash tools/container/cargo.sh test                                              
 ## 一句话总结
 
 **Part A**：kernel 是纯安全 Rust 的**类型化数据流**（`FnBuilder`/`Op`/`Stmt`），编译器把非法程序变成 `Err` 而不是 UB，
-四个 crate 用 `#![forbid(unsafe_code)]` + 零第三方依赖 + 16 类构造扫描把"不安全代码"挡在编译期之外。
+全部 8 个 crate 用 `#![forbid(unsafe_code)]` + 零第三方依赖 + 16 类构造扫描把"不安全代码"挡在编译期之外。
 
 **Part B**：手写 asm 不是 `unsafe`，而是**把 ISA 规则编码进类型**——寄存器宽度是类型参数、等待是线性 token、
 矩阵结果必须 `retire`、部分写是 typestate、常量总线是 const assert、偏移对齐是 const generic；类型系统判不了的由

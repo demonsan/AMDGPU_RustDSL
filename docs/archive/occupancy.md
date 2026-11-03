@@ -1,6 +1,6 @@
 # Occupancy hypothesis: would 4 waves/SIMD help `fmha_fwd_hd128_mxfp8_t`? (round 46, branch `kernel-occ`)
 
-> Status: closed (negative) - 4 waves/SIMD does not fit our VGPR/LDS budget and the vendor runs the same 1 block / 8 waves per CU; see docs/current-status.md §5 and rounds 46 and 71-72 of docs/status.md.
+> Status: closed (negative) - 4 waves/SIMD does not fit our VGPR/LDS budget and the vendor runs the same 1 block / 8 waves per CU; see docs/current-status.md §5 and rounds 46 and 71-72 of docs/archive/status.md.
 
 Status: **measured negative -- the <=128-VGPR head-dim-split rewrite was not built.** This document records the proxy
 measurement, the paper design and the decision; it does not change the default kernel.

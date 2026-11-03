@@ -217,6 +217,8 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 ## 11. v1 在出厂 kernel 上的结果（Main + 本分支，AMDC_GPU_VERIFY=warn，commit 见 PR）
 
 * 全部 88 个 `kernel_names()` kernel + 出厂集：**寄存器合法性与路径敏感等待 0 错误**（即默认强制检查全绿；出厂 asm md5 不变：`_vs128` 00d34086、`_t128` f83c02ce、`_kvsplit` 148b329d、`_combine8h` 19bdd5df）。
+* **出厂集再次切换（路线 B，tag `v4.1-layout-p3` 起）**：默认路径为布局层 kernel `fmha_fwd_hd128_mxfp8_v3_*`，asm md5 `68d2832b` / `f5a43b09` / `e4fc18b1` / `24a95a51`；`--shipped --strict` 0 错误 0 警告，**24 / 100 / 0**（与 dsl/legacy 相同）；proven：LDS 600 / 336 / 760，tile-reads 73,600 / 36,800 / 299,520。GEMM `gemm_mxfp8_bs_v3` / `_v4`：3 / 19 / 0。
+* **之后加入的规则**（均有攻击测试）：计数版 `vmcnt(n)` 完成规则（`tests/tile_l123.rs`）；`x ^ y` / `x & m` 的可能位收窄与声明上界参与的多项式盒子检验（`tests/gv_bits.rs`）；AGPR 寄存器类与统一 512 预算检查（`tests/agpr.rs`，[`agpr.md`](agpr.md)）。
 * **出厂集切换（2026-11-02，`fmha-port`）**：默认路径改为 tile 库组合的 4 个 kernel，asm md5（`--backend own`，`fmha-port` e7cc33e）：`dsl_vs128` 438452c1、`dsl_t128` ef706387、`dsl_kvsplit` ef8c37ab、`dsl_kvsplit_combine8h` ab3d6b09；`amdc gpu-verify --shipped --strict`：0 错误 0 警告，24 trusted assumes / 100 contracts / 0 unproven（proven 计数与旧集逐项相同；`dsl_t128` 另有 tile 协议证明 tile-reads 29440，无 periodic trust）。旧手写集 `--legacy` 的 asm md5 不变（上行 4 个值），供 A/B。
 * **LDS 访问全部被证明**（无需任何 `assume`）：`_vs128` 600、`_vs5` 600、`_kvsplit` 760、`_t128` 320、`_t` 225、`_vs9` 424、`_vs` 310 个访问；其中 DMA 目的区间按 64 lane 计。
 * **角色 barrier 平衡**：`_vs128` 18、`_t128` 8、`_kvsplit` 18、`_t` 11 个 wave 分歧的 if/else 全部平衡。
@@ -350,7 +352,7 @@ LDS 是块内 8 个 wave 共享的地址空间，硬件**不做任何边界或�
 3. 历史上我们**探查过**这条路：`tools/gen3_sync_probe.sh`（gen3 设计的一次能力探针）Part 1 就是
    "gfx12 named/split barrier opcodes vs gfx950 (CDNA4)" 的逐指令接受表，Part 2 在硬件上对比了
    `block s_barrier` vs 软件 4-wave 组屏障（LDS 原子计数 + 自旋）vs 无同步；结论是 CDNA4 只有块屏障，
-   "更细粒度同步"的 gen3 设计最终关闭（软件组屏障也慢且有风险，见 `docs/gen3-design.md`、`kernel-gen2-design.md`）。
+   "更细粒度同步"的 gen3 设计最终关闭（软件组屏障也慢且有风险，见 `docs/archive/gen3-design.md`、`kernel-gen2-design.md`）。
 
 **若将来做 gfx1250 后端，需要新增的独立建模（按四轴映射）**：
 

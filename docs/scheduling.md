@@ -4,7 +4,9 @@
 
 * **Switches.** The scheduler is OFF by default for arbitrary kernels: `AMDC_SCHED` unset = the old pipeline. Enable with `amdc emit --sched` or
   `AMDC_SCHED=1|ld|auto` (`AMDC_SCHED_OPTS=rewait,xbar,noverify,stats,drain,limit=N,xbar=B,only=B1+B2,hoist=N,swp,taildup`). `AMDC_SCHED=0` forces it
-  off for the FMHA kernels, which otherwise get a per-kernel preset chosen by name in `lib.rs` (`lower_and_allocate_with`):
+  off for the FMHA kernels, which otherwise get a per-kernel preset chosen in `lib.rs` (`lower_and_allocate_with`) from the kernel's policy name
+  (the hand-written kernels by name; the shipped v3 set and the `dsl_*` set through their `CompileProfile` (`Vs128` / `T128` / `KvSplit` / `Combine`), which maps to the
+  same policy names; the GEMM uses `CompileProfile::Gemm`):
   * `ld` preset (`reorder = false`, `ldshoist = true`, `alu_across_barrier = true`): scoreboard-recomputed partial `vmcnt/lgkmcnt` waits and `ds_read` hoisting,
     **no instruction reordering** - used for the `_t` / `_sv` family (bit-identical results, measured best on those kernels);
   * the **full list scheduler** (reordering) for `_vs128`, `_vs5/6/9`, `_kvsplit`, `_vsm`, `_t128` and `_g*` (`_t128` additionally lets ALU cross the single barrier

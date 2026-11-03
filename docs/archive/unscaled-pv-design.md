@@ -1,6 +1,6 @@
 # Unscaled-PV numerics design (P scale moved into the fp8 conversion)
 
-> Status: prototype implemented as opt-in `FMHA_OPT=p4` (numerics pass the accuracy gate; -1.2..-2.2% alone); a prerequisite for the vendor-order window, which closed negative; see round 70 of docs/status.md and docs/current-status.md §5.
+> Status: prototype implemented as opt-in `FMHA_OPT=p4` (numerics pass the accuracy gate; -1.2..-2.2% alone); a prerequisite for the vendor-order window, which closed negative; see round 70 of docs/archive/status.md and docs/current-status.md §5.
 
 Status: design + prototype on `p4-unscaled` @ 4cc2cff (based kernel-opt9 p4 f5e72fe + backend-mfma
 unscaled op 8db717a). Goal: allow the PV MFMAs to use `v_mfma_f32_32x32x64_f8f6f4` with **no scale

@@ -1,9 +1,9 @@
 # Kernel generation 2: overlapping the VALU and MFMA work inside one wave
 
-> Status: closed (negative) - the gen2 experiment (`_g2`: VALU/MFMA overlap inside one wave) was correct but not faster; see docs/current-status.md §5 and round 57 of docs/status.md.
+> Status: closed (negative) - the gen2 experiment (`_g2`: VALU/MFMA overlap inside one wave) was correct but not faster; see docs/current-status.md §5 and round 57 of docs/archive/status.md.
 
 Status: design for review (kernel-opt). Baseline = `fmha_fwd_hd128_mxfp8_vs128` (own backend, B1H8S2048): **366.7 TFLOP/s**, vgpr 252, vendor ~514 (gap 1.40x).
-Everything below is derived from measurements already in `docs/status.md` (rounds 49-56) plus one new probe (section 2). Predictions are ranges, with the assumption that decides the range stated explicitly.
+Everything below is derived from measurements already in `docs/archive/status.md` (rounds 49-56) plus one new probe (section 2). Predictions are ranges, with the assumption that decides the range stated explicitly.
 
 ## 1. What the measurements say (the model's inputs)
 
@@ -71,5 +71,5 @@ Interpretation: the intra-wave overlap works (QK hidden, dependency stalls down 
 4. `fmha_fwd_hd128_mxfp8_g2` stays registered by name only (own backend, not in `kernel_names()`) as the starting point; `_vs128` (367 TFLOP/s, 1.40x from the vendor) is the fast path and `_t` (292, llvm-tail) the accurate default.
 
 ### 7.1 Merged single window (g3) result
-See docs/status.md round 57 addendum: g3 343.3 TFLOP/s (-6.5%), bit-identical, WAIT_ANY 558 (rendezvous tax gone) but WAIT_INST_ANY 627 (dependency stalls back), wave cycles 1702 vs 1599. The single window trades the barrier rendezvous for dependency stalls; the complementary offset is what hides them. Final negative of the line.
+See docs/archive/status.md round 57 addendum: g3 343.3 TFLOP/s (-6.5%), bit-identical, WAIT_ANY 558 (rendezvous tax gone) but WAIT_INST_ANY 627 (dependency stalls back), wave cycles 1702 vs 1599. The single window trades the barrier rendezvous for dependency stalls; the complementary offset is what hides them. Final negative of the line.
 
