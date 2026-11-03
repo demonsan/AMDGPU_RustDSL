@@ -423,7 +423,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
         cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None,
     };
     pipe.run(b, Role::All, &mut body);
     for v in body.acc.iter().take(cfg.acc_agpr) {
