@@ -20,6 +20,13 @@ use super::effects::*;
 use super::liveness::successors;
 use crate::mir::*;
 
+/// Test-only switch (AMDC_WAITS_SKIP_FENCE_OPERANDS=1): restore the old behaviour in which fence-class instructions (LDS-DMA loads) never wait for their register operands - used by the
+/// regression probe probe_dma_voff_spill to prove that it fails without the fix.
+fn skip_fence_operands() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("AMDC_WAITS_SKIP_FENCE_OPERANDS").map_or(false, |v| v == "1"))
+}
+
 /// Debug: only emit full drains (mcnt(0) / lgkmcnt(0)), never partial waits.
 pub static DRAIN_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -109,13 +116,15 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
             }
             return 0;
         }
-        Fence::Barrier | Fence::SetPrio | Fence::Nop => {
+        // Barrier-class instructions (s_barrier, s_setprio, s_nop, the LDS-DMA loads, cache maintenance) are ordering fences for the list scheduler, but the ones that read
+        // registers (a DMA's voffset / soffset) still need their operands to have arrived: they fall through to the operand check below.
+        Fence::Barrier | Fence::SetPrio | Fence::Nop if e.reads.is_empty() || skip_fence_operands() => {
             if let Some(o) = out {
                 o.push(inst.clone());
             }
             return 0;
         }
-        Fence::None => {}
+        Fence::Barrier | Fence::SetPrio | Fence::Nop | Fence::None => {}
     }
     let mut touched: Vec<Slot> = e.reads.clone();
     for s in &e.writes {
@@ -139,6 +148,13 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
         }
         st.lg.complete(n);
         inserted += 1;
+    }
+    if e.fence != Fence::None {
+        // (not tracked in the queues: a DMA writes no register, and counting it would only loosen the partial waits of the shipped kernels)
+        if let Some(o) = out {
+            o.push(inst.clone());
+        }
+        return inserted;
     }
     if let Some(a) = &e.mem {
         match a.space {
@@ -241,7 +257,7 @@ pub fn verify_waits(m: &MFunction) -> Result<(), String> {
                 let e = effects(m, inst);
                 let mut touched: Vec<Slot> = e.reads.clone();
                 touched.extend(e.writes.iter().copied());
-                if e.fence == Fence::None {
+                if !matches!(e.fence, Fence::WaitVm(_) | Fence::WaitLgkm(_)) && !(skip_fence_operands() && e.fence != Fence::None) {
                     if st.vm.need(&touched).is_some() || st.lg.need(&touched).is_some() {
                         return Err(format!("block {b} inst {ii} ({:?}) touches a register with a load in flight", inst.op));
                     }

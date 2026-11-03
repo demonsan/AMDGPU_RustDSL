@@ -69,7 +69,7 @@ impl Samples {
         inst.imm = match op {
             MOp::VWriteSub | MOp::VReadSub => 1,
             MOp::SWaitVm | MOp::SWaitLgkm => 3,
-            MOp::VReadPhys | MOp::SReadPhys => 0,
+            MOp::VReadPhys | MOp::SReadPhys | MOp::VMfmaScale16x16x128Fp8 => 0,
             _ => 16,
         };
         inst

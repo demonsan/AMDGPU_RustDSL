@@ -16,6 +16,7 @@ use amdgpu_dsl::DType;
 /// Physical register slot used by the liveness computation (per dword).
 type Slot = u32;
 const SGPR_BASE: Slot = 10_000;
+const AGPR_BASE: Slot = 30_000;
 const VCC: Slot = 20_000;
 const SCC: Slot = 20_001;
 
@@ -23,6 +24,7 @@ fn slot_name(s: Slot) -> String {
     match s {
         VCC => "$vcc".to_string(),
         SCC => "$scc".to_string(),
+        s if s >= AGPR_BASE => format!("$agpr{}", s - AGPR_BASE),
         s if s >= SGPR_BASE => format!("$sgpr{}", s - SGPR_BASE),
         s => format!("$vgpr{s}"),
     }
@@ -46,6 +48,10 @@ fn slots_of(name: &str) -> Vec<Slot> {
         } else if let Some(n) = part.strip_prefix("sgpr") {
             if let Ok(n) = n.parse::<u32>() {
                 out.push(SGPR_BASE + n);
+            }
+        } else if let Some(n) = part.strip_prefix("agpr") {
+            if let Ok(n) = n.parse::<u32>() {
+                out.push(AGPR_BASE + n);
             }
         }
     }
@@ -494,7 +500,7 @@ fn livein_text(set: &BTreeSet<Slot>) -> String {
     let mut it = set.iter().copied().peekable();
     while let Some(s) = it.next() {
         // Pair aligned adjacent SGPRs the way the ABI names them ($sgpr0_sgpr1).
-        if s >= SGPR_BASE && s < VCC && (s - SGPR_BASE) % 2 == 0 && it.peek() == Some(&(s + 1)) {
+        if s >= SGPR_BASE && s < VCC && s < AGPR_BASE && (s - SGPR_BASE) % 2 == 0 && it.peek() == Some(&(s + 1)) {
             out.push(format!("$sgpr{}_sgpr{}", s - SGPR_BASE, s + 1 - SGPR_BASE));
             it.next();
         } else {

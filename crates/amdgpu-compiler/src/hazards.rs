@@ -159,13 +159,24 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         let mut vw: HashMap<VReg, usize> = HashMap::new();
         // strict: v_pk_add/mul_f32 result -> v_exp/v_rcp needs one wait state (LLVM oracle).
         let mut pkw: HashMap<VReg, usize> = HashMap::new();
+        // v_accvgpr_read result -> v_add_co/v_addc pointer arithmetic needs 2 wait states (LLVM oracle, AGPR rows of the hazard matrix)
+        let mut aw: HashMap<VReg, usize> = HashMap::new();
         // strict: VALU write of vcc -> VALU read of vcc needs 2 wait states (LLVM oracle: _cmp -> v_cndmask, _add_co -> v_addc).
         let vccw = std::cell::Cell::new(0usize);
         let mut cycle = 0usize;
 
         // The earliest cycle at which `inst` may issue given the in-flight results.
-        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, usize>, pkw: &HashMap<VReg, usize>, cycle: usize| -> usize {
+        let earliest_of = |inst: &MInst, ready: &HashMap<VReg, (usize, bool)>, vw: &HashMap<VReg, usize>, pkw: &HashMap<VReg, usize>, aw: &HashMap<VReg, usize>, cycle: usize| -> usize {
             let mut earliest = cycle;
+            if inst.op == MOp::VPtrAdd {
+                for s in &inst.srcs {
+                    if let Src::Reg(r) = s {
+                        if let Some(rd) = aw.get(&canon(*r)) {
+                            earliest = earliest.max(*rd);
+                        }
+                    }
+                }
+            }
             if strict && inst.op.consumes_vcc() {
                 earliest = earliest.max(vccw.get());
             }
@@ -223,7 +234,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
 
         let mut i = 0usize;
         while i < insts.len() {
-            let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, cycle);
+            let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, &aw, cycle);
 
             // Fill the stall with independent ALU work from further down the block.
             if earliest > cycle && (!insts[i].op.consumes_vcc() || VCC_FILL.with(|c| c.get())) {
@@ -239,7 +250,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         && !insts[i..j].iter().any(|x| x.pin)
                         && (movable(cand.op) || (VCC_FILL.with(|c| c.get()) && movable_wide(cand.op)))
                         && cand.dst.is_some()
-                        && earliest_of(cand, &ready, &vw, &pkw, cycle) <= cycle;
+                        && earliest_of(cand, &ready, &vw, &pkw, &aw, cycle) <= cycle;
                     if ok {
                         let cd = canon(cand.dst.unwrap());
                         let cs: Vec<VReg> = cand.uses().into_iter().map(canon).collect();
@@ -257,6 +268,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     if ok {
                         let x = insts.remove(j);
                         if let Some(d) = x.dst {
+                            aw.remove(&canon(d));
+                            if x.op == MOp::VAccvgprRead {
+                                aw.insert(canon(d), cycle + 3);
+                            }
                             pkw.remove(&canon(d));
                             if strict && matches!(x.op, MOp::VPkAddF32 | MOp::VPkMulF32) {
                                 pkw.insert(canon(d), cycle + 2);
@@ -274,12 +289,12 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         j += 1;
                     }
                     // The consumer may have become ready.
-                    earliest = earliest_of(&insts[i], &ready, &vw, &pkw, cycle);
+                    earliest = earliest_of(&insts[i], &ready, &vw, &pkw, &aw, cycle);
                 }
             }
 
             let inst = insts[i].clone();
-            let earliest = earliest_of(&inst, &ready, &vw, &pkw, cycle);
+            let earliest = earliest_of(&inst, &ready, &vw, &pkw, &aw, cycle);
             if earliest > cycle {
                 let mut missing = earliest - cycle;
                 while missing > 0 {
@@ -292,6 +307,10 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             if let Some(d) = inst.dst {
                 ready.remove(&canon(d));
                 vw.remove(&canon(d));
+                aw.remove(&canon(d));
+                if inst.op == MOp::VAccvgprRead {
+                    aw.insert(canon(d), cycle + 3);
+                }
                 if let Some(dly) = valu_writer_delay(inst.op) {
                     vw.insert(canon(d), cycle + 1 + dly);
                 }

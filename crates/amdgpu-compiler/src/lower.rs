@@ -106,7 +106,7 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         lw.uvars = v;
     }
     lw.run(f)?;
-    Ok(lw.finish())
+    lw.finish()
 }
 
 struct Lowerer {
@@ -249,7 +249,7 @@ impl Lowerer {
         }
     }
 
-    fn finish(mut self) -> MFunction {
+    fn finish(mut self) -> Result<MFunction, String> {
         if !self.pending_vmem.is_empty() {
             self.push(MInst::new(MOp::SWaitVm).auto());
         }
@@ -265,7 +265,15 @@ impl Lowerer {
             };
             if let Some(r) = r {
                 let c = self.mir.canon(r);
-                self.mir.agpr_pin.insert(c, mk.pin.unwrap_or(crate::agpr::AGPR_ANY));
+                // an exact pin is never weakened by a later ny request on the same register (e.g. `agpr(load)` coalesced into a `pin_agpr_at` variable)
+                let want = mk.pin.unwrap_or(crate::agpr::AGPR_ANY);
+                match self.mir.agpr_pin.get(&c) {
+                    Some(old) if *old != crate::agpr::AGPR_ANY && want == crate::agpr::AGPR_ANY => {}
+                    Some(old) if *old != crate::agpr::AGPR_ANY && want != *old => return Err(format!("conflicting exact AGPR pins a{old} and a{want} on one register")),
+                    _ => {
+                        self.mir.agpr_pin.insert(c, want);
+                    }
+                }
             }
         }
         if opt_on("cmpfold") {
@@ -311,7 +319,7 @@ impl Lowerer {
         }
         coalesce(&mut self.mir);
         dce(&mut self.mir);
-        self.mir
+        Ok(self.mir)
     }
 
     fn fresh_label(&mut self) -> u32 {
@@ -1609,6 +1617,14 @@ impl Lowerer {
                             }
                             continue;
                         }
+                        // loop-entry in-place load: init = load_lds(..) (single use) writes the variable's own registers instead of a second fragment + copy
+                        if matches!(class, RClass::V4 | RClass::V8) {
+                            if let Opnd::Val(v) = init[i] {
+                                if self.use_counts.get(&v).copied() == Some(1) && self.try_coalesce_lds_reload(v, r) {
+                                    continue;
+                                }
+                            }
+                        }
                         let src = match class {
                             RClass::V1 => self.as_v1(init[i])?,
                             RClass::V2 => self.as_v2(init[i])?,
@@ -1759,6 +1775,9 @@ impl Lowerer {
                         let mop = if *dwords == 4 { MOp::GlobalLoadLdsB128 } else { MOp::GlobalLoadLdsB32 };
                         self.push(MInst::new(mop).srcreg(rb).srcreg(sreg).imm(*byte_off as i64));
                     }
+                }
+                Stmt::SchedGroup { mask, size, sync } => {
+                    self.push(MInst::new(MOp::SchedGroup).imm((*mask as i64 & 0xffff) | ((*size as i64 & 0xffff) << 16) | ((*sync as i64) << 32)));
                 }
                 Stmt::SetPrio { prio } => {
                     self.push(MInst::new(MOp::SSetPrio).imm(*prio as i64));
@@ -3585,7 +3604,8 @@ fn remat_exprs(m: &mut MFunction) {
 /// then only lives from its definition to its last use outside loops. Costs one DS read per (value, loop block) per
 /// iteration and `256 * values * waves` bytes of LDS (appended after the kernel's own LDS). Returns (#values, total bytes).
 fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
-    const TARGET: u32 = 236; // stop when the true peak is this low (alignment / reserved registers need slack)
+    // stop when the true peak is this low (alignment / reserved registers need slack); AMDC_RA_LDS_SPILL_TARGET lowers it for the regression probe
+    let target: u32 = std::env::var("AMDC_RA_LDS_SPILL_TARGET").ok().and_then(|v| v.parse().ok()).unwrap_or(236);
     let nwaves = (m.workgroup_size / 64).max(1);
     let base = (m.lds_bytes + 15) / 16 * 16;
     let newv = |m: &mut MFunction| -> VReg {
@@ -3611,7 +3631,7 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
     let mut spilled = 0usize;
     for _ in 0..count {
         let (peak, ppos, pblk) = crate::regalloc::pressure_profile(m);
-        if peak <= TARGET {
+        if peak <= target {
             break;
         }
         let pidx = ppos - m.blocks[..pblk].iter().map(|b| b.insts.len()).sum::<usize>();

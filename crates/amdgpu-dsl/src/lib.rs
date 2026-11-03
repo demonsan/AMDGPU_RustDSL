@@ -592,6 +592,8 @@ pub enum Stmt {
     Barrier,
     /// `s_setprio`: wave issue priority 0..3.
     SetPrio { prio: u8 },
+    /// Scheduler directive (`sched_group_barrier`): see `FnBuilder::sched_group_barrier`. No instruction is emitted.
+    SchedGroup { mask: u32, size: u32, sync: u32 },
     /// `s_waitcnt vmcnt(count)`: wait until at most `count` global/LDS-DMA loads are outstanding.
     WaitVm { count: u8 },
     /// Global -> LDS DMA load (`global_load_lds_dwordx4` or `_dword`): lane i of the wave writes its 16 (4) bytes at
@@ -648,6 +650,17 @@ pub struct Arg {
     pub size: u32,
 }
 
+pub const SCHED_ALU: u32 = 0x1;
+pub const SCHED_VALU: u32 = 0x2;
+pub const SCHED_SALU: u32 = 0x4;
+pub const SCHED_MFMA: u32 = 0x8;
+pub const SCHED_VMEM: u32 = 0x10;
+pub const SCHED_VMEM_READ: u32 = 0x20;
+pub const SCHED_VMEM_WRITE: u32 = 0x40;
+pub const SCHED_DS: u32 = 0x80;
+pub const SCHED_DS_READ: u32 = 0x100;
+pub const SCHED_DS_WRITE: u32 = 0x200;
+
 /// What an AGPR request applies to (see FnBuilder::pin_agpr / FnBuilder::agpr).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgprTarget {
@@ -682,6 +695,10 @@ pub struct Function {
     /// Explicit compile policy (lowering options + scheduler preset). `None` = the compiler derives it from the kernel name (the historical behaviour,
     /// which every existing kernel keeps); kernels written on the tile library set it so their policy does not depend on their name.
     pub compile_profile: Option<CompileProfile>,
+    /// Extra lowering option tokens for this kernel (the AMDC_LOWER_OPTS vocabulary, e.g. lgkmn), on top of its profile - so nothing is name-keyed.
+    pub lower_opts: Vec<String>,
+    /// Scheduler option tokens (the AMDC_SCHED_OPTS vocabulary: rewait,ldshoist,xbar,hoist=N,limit=N,...); Some turns the scheduler on for this kernel (unless AMDC_SCHED=0).
+    pub sched_opts: Option<String>,
 }
 
 /// Compile policy of a kernel (see `amdgpu-compiler/src/lib.rs`): which lowering options and which scheduler preset it gets.
@@ -695,10 +712,11 @@ pub enum CompileProfile {
     KvSplit,
     /// The policy of the KV-split combine kernels (FMHA zeroinit lowering, no scheduler preset).
     Combine,
+    /// The MXFP8 GEMM kernels (mdgpu-kernels::gemm_mxfp8): lowering dce,cmpfold,lgkmn,zeroinit, scheduler = the scoreboard wait pass (partial mcnt/lgkmcnt,
+    /// including across the loop back edge) + ds_read hoisting, no instruction reordering. Kernel-specific additions go through Function::lower_opts / Function::sched_opts.
+    Gemm,
     /// No FMHA-specific policy (plain lowering, scheduler only when requested by the environment).
     Default,
-    /// The MXFP8 GEMM kernels (`amdgpu-kernels::gemm_mxfp8`): partial LDS waits (`lgkmn`) + zeroinit lowering, no FMHA scheduler preset.
-    Gemm,
 }
 
 impl Function {
@@ -784,6 +802,9 @@ impl Function {
                 }
                 Stmt::SetPrio { prio } => {
                     let _ = writeln!(s, "{pad}setprio {prio}");
+                }
+                Stmt::SchedGroup { mask, size, sync } => {
+                    let _ = writeln!(s, "{pad}sched_group_barrier mask=0x{mask:x} size={size} sync={sync}");
                 }
                 Stmt::WaitVm { count } => {
                     let _ = writeln!(s, "{pad}waitvm({count})");
@@ -893,6 +914,8 @@ impl FnBuilder {
                 allow_var_rereads: false,
             agpr: Vec::new(),
                 compile_profile: None,
+            lower_opts: Vec::new(),
+            sched_opts: None,
             },
             expr_consts: Default::default(),
         }
@@ -906,6 +929,16 @@ impl FnBuilder {
     /// Sets the explicit compile policy (see [`CompileProfile`]); without it the compiler keeps deriving the policy from the kernel name.
     pub fn compile_profile(&mut self, p: CompileProfile) {
         self.f.compile_profile = Some(p);
+    }
+
+    /// Extra lowering option tokens for this kernel (see Function::lower_opts).
+    pub fn lower_opts(&mut self, opts: &[&str]) {
+        self.f.lower_opts.extend(opts.iter().map(|s| s.to_string()));
+    }
+
+    /// Scheduler option tokens for this kernel (see Function::sched_opts).
+    pub fn sched_opts(&mut self, opts: &str) {
+        self.f.sched_opts = Some(opts.to_string());
     }
 
     /// Declares how many bytes of workgroup LDS the kernel uses.
@@ -1662,6 +1695,25 @@ impl FnBuilder {
     pub fn wait_vm(&mut self, count: u8) {
         self.f.stmts.push(Stmt::WaitVm { count });
     }
+    /// Scheduler directive, the analogue of ``__builtin_amdgcn_sched_group_barrier(mask, size, sync)``. Consecutive directives of one basic block form the issue
+    /// pipeline of that block: group 1 = the next ``size`` instructions of the ``mask`` class (in program order, among those not placed yet), then group 2, ...;
+    /// everything a selected instruction depends on is pulled in just before it, every register / memory / barrier dependence is respected, and the instructions
+    /// no group selects follow in program order. Honoured by the scheduler of ``CompileProfile::Gemm`` (or explicit ``sched_opts``); otherwise ignored.
+    /// Mask bits as in LLVM: ``SCHED_ALU`` 0x1 (any ALU incl. MFMA), ``SCHED_VALU`` 0x2, ``SCHED_SALU`` 0x4, ``SCHED_MFMA`` 0x8, ``SCHED_VMEM`` 0x10,
+    /// ``SCHED_VMEM_READ`` 0x20 (buffer/global loads, LDS-DMA included), ``SCHED_VMEM_WRITE`` 0x40, ``SCHED_DS`` 0x80, ``SCHED_DS_READ`` 0x100, ``SCHED_DS_WRITE`` 0x200.
+    pub fn sched_group_barrier(&mut self, mask: u32, size: u32, sync: u32) {
+        self.f.stmts.push(Stmt::SchedGroup { mask, size, sync });
+    }
+
+    /// ``repeat`` times the group sequence ``groups`` (``(mask, size)`` pairs) as ``sched_group_barrier`` directives, e.g. one MFMA then two ``ds_read``s then one DMA:
+    /// ``b.sched_pattern(&[(SCHED_MFMA, 1), (SCHED_DS_READ, 2), (SCHED_VMEM_READ, 1)], 64)``.
+    pub fn sched_pattern(&mut self, groups: &[(u32, u32)], repeat: u32) {
+        for _ in 0..repeat {
+            for &(mask, size) in groups {
+                self.sched_group_barrier(mask, size, 0);
+            }
+        }
+    }
     /// 16-byte (dwords = 4) or 4-byte (dwords = 1) global -> LDS DMA load; see `Stmt::LoadGlobalLds`.
     pub fn load_global_lds(&mut self, base: impl Into<Opnd>, lds_addr: impl Into<Opnd>, byte_off: i32, dwords: u8) {
         self.f.stmts.push(Stmt::LoadGlobalLds { base: base.into(), lds_addr: lds_addr.into(), byte_off, dwords });
@@ -2223,7 +2275,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::WaitVm { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } => {}
             Stmt::Assume { target, .. } => {
                 if let Err(e) = expect_int(f, *target, "assume target") {
                     errs.push(here(e));

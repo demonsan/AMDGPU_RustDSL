@@ -16,6 +16,7 @@ pub mod list;
 pub mod liveness;
 pub mod model;
 pub mod order;
+pub mod phase;
 pub mod sim;
 pub mod swp;
 pub mod taildup;
@@ -82,7 +83,15 @@ impl Options {
             o.ldshoist = true;
         }
         if let Ok(s) = std::env::var("AMDC_SCHED_OPTS") {
-            for t in s.split(',') {
+            o.apply_tokens(&s);
+        }
+        Some(o)
+    }
+
+    /// Apply comma-separated scheduler option tokens (AMDC_SCHED_OPTS vocabulary; also Function::sched_opts).
+    pub fn apply_tokens(&mut self, s: &str) {
+        let o = self;
+        for t in s.split(',') {
                 let t = t.trim();
                 match t {
                     "rewait" => o.reorder = false,
@@ -116,8 +125,6 @@ impl Options {
                     }
                 }
             }
-        }
-        Some(o)
     }
 }
 
@@ -213,6 +220,11 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         if o.stats {
             eprintln!("ldshoist: {n} loads hoisted");
         }
+    }
+    // `sched_group_barrier` phases (blocks with directives; the directives are removed)
+    let phased = phase::run(m, o)?;
+    if o.stats && phased > 0 {
+        eprintln!("phase: {phased} instructions moved");
     }
     schedule_blocks(m, o, &mut stats)?;
     stats.waits_inserted = waits::insert_waits(m);

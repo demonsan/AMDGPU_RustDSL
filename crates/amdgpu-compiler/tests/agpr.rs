@@ -289,3 +289,14 @@ fn mfma16_sep() -> MInst {
     // dst = r1 (A4), A = r2, B = r3, C = r0, scales r4/r5
     MInst::new(MOp::VMfmaScale16x16x128Fp8).def(1).srcreg(2).srcreg(3).srcreg(0).srcreg(4).srcreg(5)
 }
+
+#[test]
+fn hazards_accvgpr_read_then_pointer_add() {
+    // LLVM oracle (hazard matrix, AGPR rows): v_accvgpr_read result consumed by v_add_co/v_addc pointer arithmetic needs 2 wait states
+    let mut m = one_block(
+        vec![MInst::new(MOp::VAccvgprRead).def(1).srcreg(0), MInst::new(MOp::VPtrAdd).def(3).srcreg(2).srcreg(1)],
+        vec![RClass::A1, RClass::V1, RClass::V2, RClass::V2],
+    );
+    hazards::fix_value_hazards(&mut m);
+    assert!(nops(&m) >= 2, "got {}", nops(&m));
+}
