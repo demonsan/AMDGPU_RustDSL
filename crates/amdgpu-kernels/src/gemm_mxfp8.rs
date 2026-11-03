@@ -286,6 +286,17 @@ struct Panel {
     b_off: ValueId,
     /// A part transposed in the prologue: [kb][wm][lane % 16][m block i] (8 bytes per lane: 2 dwords, MFMA byte selects instead of shifts)
     tr: Option<ValueId>,
+    /// the transposition still to emit (prologue_stores)
+    job: Option<TrJob>,
+}
+
+/// The in-place panel transposition: thread (r = tid % 16, wm = tid / 16 % 2, k = tid / 32) gathers the bytes of rows 128 wm + 16 i + r (i < 8) of
+/// K group 8 round + k (one of the rows its own wave loaded) and writes them as 8 consecutive bytes at 128 wm + 8 r.
+#[derive(Clone, Copy)]
+struct TrJob {
+    rd0: ValueId,
+    wr0: ValueId,
+    sh_r: ValueId,
 }
 
 struct Body {
@@ -592,6 +603,27 @@ impl PipeBody for Body {
             return;
         }
         self.stage_now(b, key0, slot, 0..usize::MAX, &mut StageCache::default());
+    }
+    fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
+        let Some(p) = &self.panel else { return };
+        let Some(job) = p.job else { return };
+        // the panel DMA was issued before the two tile stages: wait for it only (in-order VMEM returns)
+        let after = 2 * (self.a_dma.issues.len() + self.b_dma.issues.len());
+        b.wait_vm(after.min(63) as u8);
+        let pr = p.sh.at(&SlotIdx::new(0, 0));
+        for round in 0..(PANEL_KB / 8) as i32 {
+            let words: Vec<ValueId> = pr.read(b, |b| (0..8).map(|i| { let a = b.bind_i32(ev(job.rd0) + (2048 * round + 16 * i)); b.load_lds_b32(a) }).collect());
+            let bs: Vec<ValueId> = words.iter().map(|w| b.bind_i32(ev(*w).lshr(ev(job.sh_r)) & 255)).collect();
+            let d0 = b.bind_i32(ev(bs[0]) | (ev(bs[1]) << 8) | (ev(bs[2]) << 16) | (ev(bs[3]) << 24));
+            let d1 = b.bind_i32(ev(bs[4]) | (ev(bs[5]) << 8) | (ev(bs[6]) << 16) | (ev(bs[7]) << 24));
+            // the same wave read these bytes: in-order LDS, the data dependency is the only wait
+            pr.write(b, |b| {
+                let a0 = b.bind_i32(ev(job.wr0) + 2048 * round);
+                let a1 = b.bind_i32(ev(job.wr0) + 2048 * round + 4);
+                b.store_lds_b32(a0, d0);
+                b.store_lds_b32(a1, d1);
+            });
+        }
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         self.in_loop = true;
@@ -936,15 +968,21 @@ fn build(name: &str, cfg: Cfg) -> Function {
         assert!(cta_m == 256 && cta_n == 256, "scale panel: 256 x 256 CTA");
         let per_wave = PANEL_KB / 4;
         let pr = sh.at(&SlotIdx::new(0, 0));
-        let m0w = { let v = b.bind_i32((lane.wave() << 12) + sh.base as i32); b.read_first_lane(v) };
+
         let b_src = b.bind_i32(((ev(bx) << 1) * ev(kb_v)) & -4);
         let b_delta = b.bind_i32(((ev(bx) << 1) * ev(kb_v)) & 3);
+        // wave w loads the K groups 8 r + 2 w + h (r < 8, h < 2): exactly the rows its own threads transpose below (thread group tid / 32 = 2 w + h
+        // owns K groups 8 round + tid / 32), so the transposition needs no barrier
+        let _ = per_wave;
+        let m0s: Vec<ValueId> = (0..(PANEL_KB / 8) as i32).map(|r| { let v = b.bind_i32((lane.wave() << 9) + (2048 * r + sh.base as i32)); b.read_first_lane(v) }).collect();
         pr.write(b, |b| {
-            for q in 0..per_wave {
-                // K group 16 w + q: soffset = its row (16 w + q) M, voffset = the CTA rows + 4 lane (sa_src), M0 + imm = panel + 256 (16 w + q)
-                // (the instruction offset also moves the source: compensated in soffset)
-                let so = { let v = b.bind_i32((lane.wave() * (per_wave as i32) + q as i32) * ev(m_v) - (256 * q) as i32); b.read_first_lane(v) };
-                b.buffer_load_lds_b32(rsrc_sfa, sa_src, so, m0w, (256 * q) as u32);
+            for r in 0..(PANEL_KB / 8) as i32 {
+                for h in 0..2i32 {
+                    // soffset = row (8 r + 2 w + h) M; voffset = the CTA rows + 4 lane (sa_src); M0 + imm = panel + 256 (8 r + 2 w) + 256 h (the
+                    // instruction offset also moves the source: compensated in soffset)
+                    let so = { let v = b.bind_i32(((lane.wave() << 1) + (8 * r + h)) * ev(m_v) - 256 * h); b.read_first_lane(v) };
+                    b.buffer_load_lds_b32(rsrc_sfa, sa_src, so, m0s[r as usize], (256 * h) as u32);
+                }
             }
         });
         let w0 = b.bind_cond(lane.wave().eq(0));
@@ -958,35 +996,18 @@ fn build(name: &str, cfg: Cfg) -> Function {
         // transpose the A part in place, 8 K groups per round: thread (r = tid % 16, wm = tid / 16 % 2, k = tid / 32) gathers the bytes of rows
         // 128 wm + 16 i + r (i < 8) of K group 8 round + k and writes them as 8 consecutive bytes at 128 wm + 8 r
         let tr = if !cfg.panel_transposed { None } else {
-            b.wait_vm(0);
-            b.barrier();
             let r = b.bind_i32(ev(tid) & 15);
             let wmq = b.bind_i32((ev(tid).lshr(4)) & 1);
             let kq = b.bind_i32(ev(tid).lshr(5));
             let sh_r = b.bind_i32((ev(r) & 3) << 3);
             let rd0 = b.bind_i32((ev(wmq) << 7) + (ev(r).lshr(2) << 2) + (ev(kq) << 8) + sh.base as i32);
             let wr0 = b.bind_i32((ev(wmq) << 7) + (ev(r) << 3) + (ev(kq) << 8) + sh.base as i32);
-            for round in 0..(PANEL_KB / 8) as i32 {
-                let words: Vec<ValueId> = pr.read(b, |b| (0..8).map(|i| { let a = b.bind_i32(ev(rd0) + (2048 * round + 16 * i)); b.load_lds_b32(a) }).collect());
-                let byte = |b: &mut FnBuilder, w: ValueId| b.bind_i32(ev(w).lshr(ev(sh_r)) & 255);
-                let bs: Vec<ValueId> = words.iter().map(|w| byte(b, *w)).collect();
-                let d0 = b.bind_i32(ev(bs[0]) | (ev(bs[1]) << 8) | (ev(bs[2]) << 16) | (ev(bs[3]) << 24));
-                let d1 = b.bind_i32(ev(bs[4]) | (ev(bs[5]) << 8) | (ev(bs[6]) << 16) | (ev(bs[7]) << 24));
-                b.wait_lds(0);
-                b.barrier();
-                pr.write(b, |b| {
-                    let a0 = b.bind_i32(ev(wr0) + 2048 * round);
-                    let a1 = b.bind_i32(ev(wr0) + 2048 * round + 4);
-                    b.store_lds_b32(a0, d0);
-                    b.store_lds_b32(a1, d1);
-                });
-                b.wait_lds(0);
-                b.barrier();
-            }
-            // the lane's read offset: 128 wm + 8 (lane % 16)
-            Some(b.bind_i32((ev(wm) << 7) + ((lane.lane() & 15) << 3)))
+            // the rounds run in the pipeline prologue (`prologue_stores`), after the first tiles' DMA is issued
+            let job = TrJob { rd0, wr0, sh_r };
+            Some((b.bind_i32((ev(wm) << 7) + ((lane.lane() & 15) << 3)), job))
         };
-        Panel { sh, b_base: PANEL_KB * 256, b_off, tr }
+        let (tr, job) = match tr { Some((o, j)) => (Some(o), Some(j)), None => (None, None) };
+        Panel { sh, b_base: PANEL_KB * 256, b_off, tr, job }
     });
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
     pipe.unroll2 = cfg.unroll2;

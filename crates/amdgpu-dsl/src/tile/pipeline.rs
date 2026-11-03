@@ -154,8 +154,11 @@ impl Pipeline {
         // ---- prologue ----
         let s0 = SlotIdx::new(0, 0);
         body.stage(b, role, &I32::c(0), &s0);
-        b.wait_vm(0);
-        body.stage_complete(b, role, &s0);
+        if self.cadence != Cadence::RegStaged {
+            // (RegStaged bodies do not use stage_complete: tile 0 completes at the prologue wait, overlapped with the stores)
+            b.wait_vm(0);
+            body.stage_complete(b, role, &s0);
+        }
         if self.cadence == Cadence::RegStaged {
             // tile 1 into slot 1 (clamped as below); both complete at the prologue wait
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
