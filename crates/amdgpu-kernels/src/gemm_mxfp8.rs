@@ -26,6 +26,8 @@ struct Cfg {
     three_slots: bool,
     /// 2-slot `RegStaged` cadence: the whole tile is read into registers first, its slot then receives tile t+2 (distance 2 with two slots)
     reg_staged: bool,
+    /// spread the DMA of the next tile over the MMA rows of the window (instead of issuing it all before the window)
+    defer_dma: bool,
 }
 impl Cfg {
     fn wave_m(&self) -> i64 {
@@ -152,6 +154,9 @@ struct Body {
     b_rd: LdsPart,
     zero4: ValueId,
     acc: Vec<VarId>,
+    /// deferred stage (key0, slot, units issued) and whether the pipeline loop has started
+    deferred: Option<(I32, SlotIdx, usize)>,
+    in_loop: bool,
     /// register-staged tile (`RegStaged`): initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
     staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, ValueId)>,
     rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, VarId)>,
@@ -236,8 +241,10 @@ impl Body {
         }
     }
 }
-impl PipeBody for Body {
-    fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
+impl Body {
+    /// The DMA of one tile (A issues, B issues, the 2 scale loads); `range` selects which of them to issue now (the deferred form spreads them
+    /// over the MMA rows).
+    fn stage_now(&mut self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, range: std::ops::Range<usize>) {
         // diagnostic ablations (wrong results): FMHA_ABLATE=gemm_nodma skips the copies
         if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("gemm_nodma")) {
             return;
@@ -246,7 +253,13 @@ impl PipeBody for Body {
         // the tile origins are wave uniform: SGPR soffsets
         let ka = { let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v) };
         let kb = { let v = b.bind_i32((key0.clone() << 4) + ev(self.b_org)); b.read_first_lane(v) };
+        let mut unit = 0usize;
         for (sh, dma, org, rsrc, wave) in [(&self.a_s, &self.a_dma, ka, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, kb, self.rsrc_b, self.b_wave)] {
+            let mine: Vec<(ValueId, i32)> = dma.issues.iter().enumerate().filter(|(q, _)| range.contains(&(unit + q))).map(|(_, x)| *x).collect();
+            unit += dma.issues.len();
+            if mine.is_empty() {
+                continue;
+            }
             let r = sh.at(slot);
             let o = r.off_v(b);
             let sbase = b.bind_i32(o + sh.base as i32 + ev(wave));
@@ -254,7 +267,7 @@ impl PipeBody for Body {
                 // buffer_load_dwordx4 ... lds: voffset = the lane's loop-invariant offset, soffset = the tile origin (wave uniform), M0 = the first 1 KB
                 // block of each group of 4 issues, instruction offset 1024 (q % 4) moves both the LDS and the global address
                 let mut m0: Option<(i32, ValueId)> = None;
-                for (g, lds) in dma.issues.iter() {
+                for (g, lds) in mine.iter() {
                     let grp = *lds - *lds % 4096;
                     if m0.map(|x| x.0) != Some(grp) {
                         m0 = Some((grp, b.bind_i32(ev(sbase) + grp)));
@@ -264,6 +277,9 @@ impl PipeBody for Body {
             });
         }
         // scales of tile kb: the CTA's 256 A-scale bytes (contiguous in [K/128][M]) and the dword holding the B-scale byte, into the wave's 512 bytes
+        if !range.contains(&unit) {
+            return;
+        }
         let kbi = b.bind_i32(key0.clone().lshr(7));
         let r = self.sc_s.at(slot);
         let o = r.off_v(b);
@@ -282,7 +298,19 @@ impl PipeBody for Body {
             b.load_global_lds(pb, sb_m0, 0, 1);
         });
     }
+}
+
+impl PipeBody for Body {
+    fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
+        if self.cfg.defer_dma && self.in_loop {
+            // issued inside the window, spread over the MMA rows
+            self.deferred = Some((key0.clone(), slot.clone(), 0));
+            return;
+        }
+        self.stage_now(b, key0, slot, 0..usize::MAX);
+    }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
+        self.in_loop = true;
         if self.cfg.reg_staged {
             self.load_tile(b, t0);
         }
@@ -346,6 +374,14 @@ impl PipeBody for Body {
         for i in 0..nm {
             // prefetch the next A fragment while this one feeds 4 MMAs
             let next = if i + 1 < nm { let v = if let Some(z) = zf { z } else { ar.read(b, i + 1) }; Some(mark(b, v)) } else { None };
+            if let Some((k, s, done)) = self.deferred.take() {
+                let total = self.a_dma.issues.len() + self.b_dma.issues.len() + 1;
+                let per = (total + nm - 1) / nm;
+                self.stage_now(b, &k, &s, done..done + per);
+                if done + per < total {
+                    self.deferred = Some((k, s, done + per));
+                }
+            }
             for j in 0..nn {
                 if i == 0 && j + bpre < nn {
                     let v = if let Some(z) = zf { z } else { br.read(b, j + bpre) };
@@ -363,19 +399,19 @@ impl PipeBody for Body {
 }
 
 pub fn gemm_mxfp8_bs_v2() -> Function {
-    build("gemm_mxfp8_bs_v2", Cfg { cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false })
+    build("gemm_mxfp8_bs_v2", Cfg { cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false })
 }
 
 /// v3: the vendor tile (CTA 256 x 256, 128 x 128 per wave, 64 accumulators): operand fragments in AGPRs, half of the accumulators pinned in AGPRs,
 /// 2-slot LDS ring (2 x 64 KB).
 pub fn gemm_mxfp8_bs_v3() -> Function {
-    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false })
+    build("gemm_mxfp8_bs_v3", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("defer")) })
 }
 
 /// v4: v3 with the register-staged 2-slot cadence (prefetch distance 2): all 16 operand fragments of a tile are read into AGPRs, the slot is refilled
 /// with tile t+2 while the 64 MMAs run.
 pub fn gemm_mxfp8_bs_v4() -> Function {
-    build("gemm_mxfp8_bs_v4", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 24, three_slots: false, reg_staged: true })
+    build("gemm_mxfp8_bs_v4", Cfg { cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 24, three_slots: false, reg_staged: true, defer_dma: false })
 }
 
 fn build(name: &str, cfg: Cfg) -> Function {
@@ -467,7 +503,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
         cfg, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false,
     };
     pipe.run(b, Role::All, &mut body);
     for v in body.acc.iter().take(cfg.acc_agpr) {
