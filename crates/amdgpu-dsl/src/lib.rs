@@ -697,6 +697,8 @@ pub enum CompileProfile {
     Combine,
     /// No FMHA-specific policy (plain lowering, scheduler only when requested by the environment).
     Default,
+    /// The MXFP8 GEMM kernels (`amdgpu-kernels::gemm_mxfp8`): partial LDS waits (`lgkmn`) + zeroinit lowering, no FMHA scheduler preset.
+    Gemm,
 }
 
 impl Function {

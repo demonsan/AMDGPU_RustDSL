@@ -381,7 +381,7 @@ impl PipeBody for Body {
         let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zfb { z } else { br.read(b, j) }; mark(b, v) }).collect();
         let sa: Vec<ValueId> = (0..nm).map(|i| b.bind_i32(ev(wa[i]).lshr((ev(self.sa_rd[i]) & 3) << 3))).collect();
         let sb = b.bind_i32(ev(wb).lshr(((ev(self.sb_src) + kbx) & 3) << 3));
-        let prio = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("prio"));
+        let prio = !std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("noprio"));
         if prio {
             b.set_prio(1);
         }
@@ -434,6 +434,7 @@ pub fn gemm_mxfp8_bs_v4() -> Function {
 fn build(name: &str, cfg: Cfg) -> Function {
     let (cta_m, cta_n, wave_m, wave_n) = (cfg.cta_m, cfg.cta_n, cfg.wave_m(), cfg.wave_n());
     let mut fb = FnBuilder::new(name, 256);
+    fb.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
     let b = &mut fb;
     declare_abi(b);
     let ptr_a = b.let_(Op::KernargPtr { offset: 0 });

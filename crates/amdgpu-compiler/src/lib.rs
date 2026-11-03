@@ -33,7 +33,7 @@ pub fn policy_name(f: &amdgpu_dsl::Function) -> &str {
         Some(P::T128) => "fmha_fwd_hd128_mxfp8_t128",
         Some(P::KvSplit) => "fmha_fwd_hd128_mxfp8_kvsplit",
         Some(P::Combine) => "fmha_fwd_hd128_mxfp8_kvsplit_combine8h",
-        Some(P::Default) => "",
+        Some(P::Default) | Some(P::Gemm) => "",
     }
 }
 
@@ -104,8 +104,8 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
-    } else if pname.starts_with("gemm_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
-        // the GEMM kernels: partial lgkmcnt waits keep the prefetched fragment reads in flight (`lgkmn`)
+    } else if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
+        // CompileProfile::Gemm: partial lgkmcnt waits keep the prefetched fragment reads in flight (`lgkmn`)
         let mut v: Vec<&str> = vec!["dce", "cmpfold", "lgkmn", "zeroinit"];
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
