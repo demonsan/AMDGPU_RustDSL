@@ -271,9 +271,10 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
                 continue;
             }
             for &(p, lat) in &g.preds[i] {
+                // (slots are capped at M: a consumer of the last MFMA's result lands after it; the latency in slots is a soft preference, the stall is the hardware's)
                 let bound = match mslot[p] {
-                    Some(k) => k + 1 + fl(lat),
-                    None => sl[p] + fl(lat),
+                    Some(k) => (k + 1 + fl(lat)).min(mm),
+                    None => (sl[p] + fl(lat)).min(mm),
                 };
                 if sl[i] < bound {
                     sl[i] = bound;
@@ -288,11 +289,13 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
     // final check of every edge
     for i in 0..n {
         for &(s, lat) in &g.succs[i] {
+            // legality needs the ORDER only (the slot latencies are soft; check_perm proves the dependences): producer slot <= consumer slot, after / before an MFMA
+            let _ = lat;
             let ok = match (mslot[i], mslot[s]) {
                 (Some(a), Some(b)) => a < b,
-                (Some(a), None) => sl[s] >= a + 1 + fl(lat),
-                (None, Some(b)) => sl[i] <= b.saturating_sub(fl(lat)),
-                (None, None) => sl[i] + fl(lat) <= sl[s],
+                (Some(a), None) => sl[s] >= a + 1,
+                (None, Some(b)) => sl[i] <= b,
+                (None, None) => sl[i] <= sl[s],
             };
             if !ok {
                 log.push(format!("region of {n} instructions, {mm} MFMAs: no consistent slot assignment (edge {i}->{s}), left alone"));

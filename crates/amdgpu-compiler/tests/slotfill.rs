@@ -205,3 +205,15 @@ fn the_pressure_model_counts_live_vector_dwords_of_an_order() {
     let out: HashSet<u32> = [47u32].into_iter().collect();
     assert!(peak_live(&m, &insts, &[0, 2, 1, 3], &out) >= tight);
 }
+
+#[test]
+fn a_consumer_of_the_last_mfma_result_lands_after_it_without_overflowing_the_slots() {
+    // an epilogue-style reader of the last accumulator: the latency in slots would point past the region end
+    let mut insts = mfmas(16);
+    insts.push(MInst::new(MOp::VAddF32).def(44).srcreg(15).srcreg(15));
+    insts.push(MInst::new(MOp::VAddF32).def(45).srcreg(44).srcreg(44));
+    let out = run(insts);
+    assert_eq!(out.len(), 18);
+    assert!(pos(&out, "VAddF32") > out.iter().rposition(|s| s == "M15").unwrap(), "{out:?}");
+    assert_eq!(out.iter().filter(|s| s.starts_with('M')).count(), 16);
+}
