@@ -105,6 +105,11 @@ pub struct Trace {
     pub dma_writes: usize,
     pub lds_entries: usize,
     pub tag_entries: usize,
+    pub tag_a: usize,
+    pub tag_b: usize,
+    pub tag_sa: usize,
+    pub tag_sb: usize,
+    pub read_non_u: usize,
 }
 
 struct Ctx<'a> {
@@ -231,6 +236,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                 if let Some((tile, ver)) = &cx.cur_tile {
                     cx.lds.insert((tile.clone(), *ver, dst + b), (tag.clone(), None));
                     cx.trace.dma_writes += 1;
+                    match &tag { Tag::A(..) => cx.trace.tag_a += 1, Tag::B(..) => cx.trace.tag_b += 1, Tag::Sa(..) => cx.trace.tag_sa += 1, Tag::Sb(..) => cx.trace.tag_sb += 1, _ => {} }
                     if tag != Tag::U { cx.trace.tag_by_addr.insert(dst + b, tag); }
                 }
             }
@@ -473,6 +479,7 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     for i in 0..n {
         let mut tag = cx.lds.get(&(tile.clone(), *ver, a + i as i64)).map(|x| x.0.clone()).unwrap_or(Tag::U);
         if tag == Tag::U { if let Some(t) = cx.trace.tag_by_addr.get(&(a + i as i64)) { tag = t.clone(); } }
+        if tag != Tag::U { cx.trace.read_non_u += 1; }
         bytes.push(tag);
     }
     let mut origins = vec![None; n / 4];
