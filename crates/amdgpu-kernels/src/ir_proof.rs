@@ -300,10 +300,9 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                         if *t != Tag::U { cx.trace.borrow_mut().tag_by_addr.insert(a + b as i64, t.clone()); }
                         // Do not replace a known accumulator origin by an unknown DMA/epilogue
                         // write at the same byte: the reference is what the store will read.
-                        match cx.lds.borrow_mut().get_mut(&key) {
-                            Some((_, prev)) if prev.is_some() && o.is_none() => {}
-                            Some(slot) => *slot = (t.clone(), o),
-                            None => { cx.lds.borrow_mut().insert(key, (t.clone(), o)); }
+                        let prev = cx.lds.borrow().get(&key).cloned().and_then(|x| x.1);
+                        if !(prev.is_some() && o.is_none()) {
+                            cx.lds.borrow_mut().insert(key, (t.clone(), o));
                         }
                     }
                 }
