@@ -13,6 +13,7 @@
 
 pub mod bufdma;
 pub mod contract;
+pub mod contract_stage;
 pub mod copy;
 pub mod dma;
 pub mod fmha;
