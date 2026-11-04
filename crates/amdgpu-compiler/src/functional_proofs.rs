@@ -165,7 +165,8 @@ pub fn softmax_invariant_proof() -> Result<(), String> {
     // rebase/rollback: changing the frame from a to b and back is the identity
     let a = exp(sub(var("a"), var("b")));
     let b = exp(sub(var("b"), var("a")));
-    if norm(mul(a, b)) != E::Const(1.0) { return Err("rebase/rollback frame factor is not 1".into()); }
+    let rb = norm(mul(a, b));
+    if rb != E::Const(1.0) { return Err(format!("rebase/rollback frame factor is not 1: {rb}")); }
     Ok(())
 }
 
