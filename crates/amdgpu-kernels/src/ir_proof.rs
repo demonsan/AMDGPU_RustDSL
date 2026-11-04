@@ -121,6 +121,9 @@ pub struct Trace {
     pub sample_operand_tag: Option<String>,
     pub dup_c: usize,
     pub dup_c_sample: Option<i64>,
+    pub sa_mfma: usize,
+    pub sb_mfma: usize,
+    pub sa_sample: Option<String>,
     pub sample_miss: Option<i64>,
     pub sample_hit: Option<i64>,
 }
@@ -341,6 +344,12 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             for t in &b_tags { if let Tag::B(n, k) = t { cx.trace.borrow_mut().b_tags.entry(kb).or_default().insert((*n, *k)); } }
             for t in &sa_tags { if let Tag::Sa(m, k) = t { cx.trace.borrow_mut().sa_tags.entry(kb).or_default().insert((*m, *k)); } }
             for t in &sb_tags { if let Tag::Sb(blk, k) = t { cx.trace.borrow_mut().sb_tags.entry(kb).or_default().insert((*blk, *k)); } }
+            cx.trace.borrow_mut().sa_mfma += sa_tags.len();
+            cx.trace.borrow_mut().sb_mfma += sb_tags.len();
+            if cx.trace.borrow().sa_sample.is_none() {
+                let s = format!("sa_ops={:?} sb_ops={:?}", word_tags(cx.opnd(*scale_a)), word_tags(cx.opnd(*scale_b)));
+                cx.trace.borrow_mut().sa_sample = Some(s);
+            }
             for idx in 0..4u8 { cx.trace.borrow_mut().contrib.entry((cx.tid, var.0, idx)).or_default().push(kb); }
             tag_acc_var(cx, *var);
         }
