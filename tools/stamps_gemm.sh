@@ -12,6 +12,6 @@ for K in ${KERNELS:-gemm_mxfp8_bs_v4 gemm_mxfp8_bs_v3}; do
     GEMM_STAMP=$M "$AMDC" emit $K --backend=own --out build/stamps/${K}_$M.s > /dev/null 2>&1 || { echo "$K $M: emit failed"; continue; }
     "$C" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/stamps/${K}_$M.co build/stamps/${K}_$M.s 2>&1 | head -2
     OURS_CO=build/stamps/${K}_$M.co OURS_KNAME=$K STAMP_DUMP=build/stamps/${K}_$M.u32 ./build/gemm_ref_host > build/stamps/${K}_$M.log 2>&1
-    python3 tools/stamps.py build/stamps/${K}_$M.u32 --phases 1:setup,2:prologue,3:loop,4:epilogue | awk -v k=$K -v m=$M '/setup|prologue|loop|epilogue/ {v[$4]=$6} END {t=v["setup"]+v["prologue"]+v["loop"]+v["epilogue"]; printf "%-30s %-5s %9d %9d %10d %9d %9d %10.0f\n", k, m, v["setup"], v["prologue"], v["loop"], v["epilogue"], t, v["loop"]/64}'
+    python3 tools/stamps.py build/stamps/${K}_$M.u32 --phases 1:setup,2:prologue,3:loop,4:epilogue | awk -v k=$K -v m=$M '/setup|prologue|loop|epilogue/ {v[$5]=$7} END {t=v["setup"]+v["prologue"]+v["loop"]+v["epilogue"]; printf "%-30s %-5s %9d %9d %10d %9d %9d %10.0f\n", k, m, v["setup"], v["prologue"], v["loop"], v["epilogue"], t, v["loop"]/64}'
   done
 done
