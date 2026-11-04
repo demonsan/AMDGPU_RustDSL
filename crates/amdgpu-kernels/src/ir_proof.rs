@@ -296,7 +296,6 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             for idx in 0..4u8 { cx.trace.contrib.entry((var.0, idx)).or_default().push(kb); }
         }
         Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => {
-            if cx.pass_writes { return false; } // output stores are handled in pass 2
             let role = match cx.opnd(*rsrc) { V::Rsrc(r) => r, _ => return false };
             if role != PtrRole::C { return false; }
             let so = cx.int(*soff).unwrap_or(0);
