@@ -1007,12 +1007,18 @@ impl<'a> An<'a> {
                     self.idx = *idx;
                     self.exec_stmt(&Stmt::BeginIf { cond: *cond });
                     *idx += 1;
+                    // branch facts (scoped): inside `then` the condition holds, inside `else` it does not (`if` is wave-level:
+                    // every lane of a wave that runs the branch satisfies it only for wave-uniform conditions - see `branch_fact`)
+                    let undo = self.branch_fact(cond, true);
                     self.walk(then, idx);
+                    self.undo_fact(undo);
                     if let Some(e) = els {
                         self.idx = *idx;
                         self.exec_stmt(&Stmt::Else);
                         *idx += 1;
+                        let undo = self.branch_fact(cond, false);
                         self.walk(e, idx);
+                        self.undo_fact(undo);
                     }
                     self.idx = *idx;
                     self.exec_stmt(&Stmt::EndIf);
@@ -1030,6 +1036,113 @@ impl<'a> An<'a> {
                     self.idx = *idx;
                     self.exec_stmt(&Stmt::TileEnd);
                     *idx += 1;
+                }
+            }
+        }
+    }
+
+    /// The fact a branch adds about a WAVE-UNIFORM operand of its condition: `x < k` (or its negation) refines the interval of `x` for the
+    /// branch. `begin_if` is a wave-level branch (taken when ANY lane's condition holds), so a per-lane value proves nothing about the other
+    /// lanes: only operands that are the same in every lane (loop variables, which the DSL keeps scalar, and values built from kernargs /
+    /// constants / workgroup ids) are refined. Returns how to undo it.
+    fn branch_fact(&mut self, cond: &Opnd, positive: bool) -> Option<(Opnd, Option<AV>, Option<Itv>)> {
+        let Opnd::Val(c) = cond else { return None };
+        let (x, k, lt) = match self.defs.get(c)? {
+            Op::NotI1(n) => return self.branch_fact(&n.clone(), !positive),
+            Op::CmpLtI32(x, k) => (*x, *k, positive),
+            Op::CmpGeI32(x, k) => (*x, *k, !positive),
+            _ => return None,
+        };
+        if !self.uniform_opnd(&x, 6, &mut Vec::new()) || !self.uniform_opnd(&k, 6, &mut Vec::new()) {
+            return None;
+        }
+        let ki = self.int_of(&k);
+        let add = if lt { Itv { lo: Vec::new(), hi: ki.hi.iter().map(|p| p.add(&Poly::int(-1))).collect() } } else { Itv { lo: ki.lo.clone(), hi: Vec::new() } };
+        let xi = self.int_of(&x);
+        // the existing candidates first (never displaced by the cap), then the branch bound
+        let mut lo = xi.lo.clone();
+        lo.extend(add.lo);
+        let mut hi = xi.hi.clone();
+        hi.extend(add.hi);
+        let refined = Itv { lo: cap(lo), hi: cap(hi) };
+        match x {
+            Opnd::Var(v) => {
+                let old = self.vars.insert(v, refined);
+                Some((x, None, old))
+            }
+            Opnd::Val(v) => match self.env.get(&v) {
+                Some(AV::Int(_)) => {
+                    let old = self.env.insert(v, AV::Int(refined));
+                    Some((x, old, None))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn undo_fact(&mut self, undo: Option<(Opnd, Option<AV>, Option<Itv>)>) {
+        match undo {
+            Some((Opnd::Var(v), _, old)) => match old {
+                Some(i) => {
+                    self.vars.insert(v, i);
+                }
+                None => {
+                    self.vars.remove(&v);
+                }
+            },
+            Some((Opnd::Val(v), old, _)) => match old {
+                Some(a) => {
+                    self.env.insert(v, a);
+                }
+                None => {
+                    self.env.remove(&v);
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// Is the operand the same in every lane? Constants, kernargs, workgroup ids, readfirstlane results, integer arithmetic of uniform operands,
+    /// and loop variables whose initial value and every set value are uniform.
+    fn uniform_opnd(&self, o: &Opnd, depth: usize, visiting: &mut Vec<VarId>) -> bool {
+        match o {
+            Opnd::I32(_) => true,
+            Opnd::F32(_) => false,
+            Opnd::Var(v) => {
+                // coinductive: a loop variable is uniform when every value it is set to is uniform assuming it is
+                if visiting.contains(v) {
+                    return true;
+                }
+                if depth == 0 {
+                    return false;
+                }
+                let f = self.f;
+                let mut sets = f.stmts().iter().filter_map(|s| match s {
+                    Stmt::SetVar { var, value } if var == v => Some(*value),
+                    _ => None,
+                });
+                let inits = f.stmts().iter().filter_map(|s| match s {
+                    Stmt::BeginLoop { vars, init } => vars.iter().position(|x| x == v).map(|k| init[k]),
+                    _ => None,
+                });
+                let all: Vec<Opnd> = inits.chain(&mut sets).collect();
+                visiting.push(*v);
+                let r = !all.is_empty() && all.iter().all(|x| self.uniform_opnd(x, depth - 1, visiting));
+                visiting.pop();
+                r
+            }
+            Opnd::Val(v) => {
+                if depth == 0 {
+                    return false;
+                }
+                match self.defs.get(v) {
+                    Some(Op::ConstI32(_) | Op::KernargI32 { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ) => true,
+                    Some(Op::AddI32(a, b) | Op::MulI32(a, b) | Op::ShlI32(a, b) | Op::LshrI32(a, b) | Op::AndI32(a, b) | Op::XorI32(a, b) | Op::MinI32(a, b)) => {
+                        self.uniform_opnd(a, depth - 1, visiting) && self.uniform_opnd(b, depth - 1, visiting)
+                    }
+                    Some(Op::ReadFirstLane(_)) => true,
+                    _ => false,
                 }
             }
         }
