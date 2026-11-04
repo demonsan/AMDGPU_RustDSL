@@ -88,7 +88,7 @@ fn canon_function(f: &Function, include_contract: bool) -> String {
     let _ = writeln!(s, "profile={:?} lower={:?} sched={:?}", f.compile_profile, f.lower_opts, f.sched_opts);
     let _ = writeln!(s, "allow_var_rereads={}", f.allow_var_rereads);
     let _ = writeln!(s, "agpr={}", c.canon_text(&format!("{:?}", f.agpr)));
-    for st in &f.stmts {
+    for st in f.stmts().iter() {
         let line = c.canon_text(&format!("{st:?}"));
         let _ = writeln!(s, "{line}");
     }
@@ -313,7 +313,9 @@ pub fn print_dsl(f: &Function) -> String {
         let _ = writeln!(out, "  arg {}: {} @0x{:X} +{}", a.name, a.ty.name(), a.kernarg_offset, a.size);
     }
     print_contract(&f.contract, &mut out);
-    let (nodes, _) = parse_scope(&f.stmts, 0, Stop::Top);
+    // the linear view of the region tree (Function::stmts, paired by construction since region-ir); the flat parse reproduces the scopes
+    let stmts = f.stmts();
+    let (nodes, _) = parse_scope(&stmts, 0, Stop::Top);
     let _ = writeln!(out, "  body:");
     for n in &nodes { print_node(n, 2, f, &mut out); }
     out
