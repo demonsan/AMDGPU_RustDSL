@@ -275,7 +275,10 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             }
         }
         Stmt::StoreLdsB64 { addr, value } | Stmt::StoreLdsB128 { addr, value } => {
-            if !cx.pass_writes { return false; }
+            // DMA writes only in pass 1; the epilogue staging writes are also needed in pass 2
+            // (they carry accumulator origins), even though pass 2 does not re-run DMA.
+            let epi = cx.cur_tile.as_ref().map(|(t, _)| t == "EPI").unwrap_or(false);
+            if !cx.pass_writes && !epi { return false; }
             if let (Some(a), V::Frag { bytes, origins }) = (cx.int(*addr), cx.opnd(*value)) {
                 cx.trace.lds_store_origins += origins.iter().filter(|x| x.is_some()).count();
                 if let Some((tile, ver)) = &cx.cur_tile {
@@ -506,8 +509,8 @@ pub fn prove_ir(f: &Function, cfg: &GemmConfig, m: i64, n: i64, k: i64) -> Resul
     let mut trace = Trace::default();
     // pass 1: all lanes write global tags into LDS, under the tile-protocol (tile, generation) keys
     for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, true, &mut lds, &mut trace); }
-    // pass 2: reads, MFMA contributions and epilogue stores
-    for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, true, &mut lds, &mut trace); }
+    // pass 2: reads, MFMA contributions and epilogue stores (DMA is not re-run)
+    for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, false, &mut lds, &mut trace); }
     trace.lds_origins_left = lds.values().filter(|(_, o)| o.is_some()).count();
     if !trace.unknown_ops.is_empty() {
         return Err(ProofError(format!("unsupported/unknown IR during symbolic execution: {:?}", trace.unknown_ops)));
