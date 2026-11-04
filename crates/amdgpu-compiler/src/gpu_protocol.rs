@@ -331,7 +331,7 @@ impl<'a> Sim<'a> {
             if self.steps > 2_000_000 {
                 return;
             }
-            let st = f.stmts()[i];
+            let st = &f.stmts()[i];
             if let Some((write, coh)) = is_global_access(st) {
                 if let Some(e) = self.open {
                     if self.evs[e].global {
@@ -1297,7 +1297,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
             fail(rep, "GV-PROTO-UNPUBLISHED", "no global load is marked buf_consume".to_string());
             continue;
         }
-        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = f.stmts()[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. }), &mut HashSet::new()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
+        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = &f.stmts()[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. }), &mut HashSet::new()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
         if let Some((i, ..)) = cons.iter().find(|(_, _, ifs, _)| !guarded(ifs)) {
             fail(rep, "GV-PROTO-ARRIVAL-MISMATCH", format!("the read at stmt {i} is not inside the branch guarded by the ticket result (stmt {ticket_idx}): a block that is not the last arriver may read slices other blocks have not written yet"));
         }
@@ -1310,7 +1310,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
         }
         // O4: the produced generation is the block's split id
         if let Some(mi) = prod_marker {
-            if let Stmt::TileProduce { version, .. } = f.stmts()[mi] {
+            if let Stmt::TileProduce { version, .. } = &f.stmts()[mi] {
                 let from_block = cone_has(f, version, &|op| matches!(op, Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ), &mut HashSet::new());
                 if !from_block {
                     fail(rep, "GV-PROTO-STALE-GEN", format!("O4: the generation of the produce marker (stmt {mi}) is not derived from the workgroup id: the blocks do not agree on which slice (split) each of them owns"));

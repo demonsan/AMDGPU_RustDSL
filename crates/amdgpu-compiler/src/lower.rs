@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use amdgpu_dsl::{DType, Function, Op, Opnd, Stmt, ValueId};
+use amdgpu_dsl::{DType, Function, Node, Op, Opnd, RegionKind, Stmt, ValueId};
 use crate::mir::*;
 
 /// Compiler optimisations that reduce dynamic VALU count (accuracy-preserving: same values, same
@@ -1454,8 +1454,47 @@ impl Lowerer {
         }
     }
 
+    /// Lowers the region tree: every node is handed to `lower_stmt` in program order, the structure markers of loops / ifs / tile
+    /// regions at their boundaries (the handlers keep the label / snapshot stacks), so the emitted code is that of the linear walk.
     fn run(&mut self, f: &Function) -> Result<(), String> {
-        for st in f.stmts() {
+        self.walk(f.body())
+    }
+
+    fn walk(&mut self, nodes: &[Node]) -> Result<(), String> {
+        for n in nodes {
+            match n {
+                Node::S(st) => self.lower_stmt(st)?,
+                Node::Loop { vars, init, body } => {
+                    self.lower_stmt(&Stmt::BeginLoop { vars: vars.clone(), init: init.clone() })?;
+                    self.walk(body)?;
+                    self.lower_stmt(&Stmt::EndLoop)?;
+                }
+                Node::If { cond, then, els } => {
+                    self.lower_stmt(&Stmt::BeginIf { cond: *cond })?;
+                    self.walk(then)?;
+                    if let Some(e) = els {
+                        self.lower_stmt(&Stmt::Else)?;
+                        self.walk(e)?;
+                    }
+                    self.lower_stmt(&Stmt::EndIf)?;
+                }
+                Node::Region { kind, tile, slot, version, body } => {
+                    let open = match kind {
+                        RegionKind::Produce => Stmt::TileProduce { tile: tile.clone(), slot: *slot, version: *version },
+                        RegionKind::Consume => Stmt::TileConsume { tile: tile.clone(), slot: *slot, version: *version },
+                    };
+                    self.lower_stmt(&open)?;
+                    self.walk(body)?;
+                    self.lower_stmt(&Stmt::TileEnd)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One statement (structure markers included: they open / close the CFG regions).
+    fn lower_stmt(&mut self, st: &Stmt) -> Result<(), String> {
+        {
             match st {
                 Stmt::Let { dst, op } => self.lower_op(*dst, op)?,
                 Stmt::StoreU16 { base, byte_off, value } => {
@@ -1561,7 +1600,7 @@ impl Lowerer {
                             self.touch(&[Src::Reg(x)]);
                         }
                         self.push(MInst::new(MOp::SMovB32).def(dst).src(s));
-                        continue;
+                        return Ok(());
                     }
                     if class == RClass::V16 && opt_on("zeroinit") && matches!(value, Opnd::Val(v) if matches!(self.defs.get(v), Some(Op::FragZero { ty: DType::Frag16 }))) {
                         // zero accumulator: zero the variable's own register instead of building a zero tuple and copying it
@@ -1569,14 +1608,14 @@ impl Lowerer {
                         for i in 0..16 {
                             self.push(MInst::new(MOp::VWriteSub).def(dst).srcreg(zero).imm(i as i64));
                         }
-                        continue;
+                        return Ok(());
                     }
                     // in-place reload: set_var(var, load_lds(..)) where the load is the value's only use and nothing reads the variable after the load
                     // was issued - the ds_read writes the variable's own registers (no copy, no second fragment; the AGPR pipelining pattern)
                     if matches!(class, RClass::V4 | RClass::V8) {
                         if let Opnd::Val(v) = value {
                             if self.use_counts.get(v).copied() == Some(1) && self.try_coalesce_lds_reload(*v, dst) {
-                                continue;
+                                return Ok(());
                             }
                         }
                     }
@@ -1962,7 +2001,7 @@ impl Lowerer {
                     self.start_block(end_l);
                 }
             }
-        }
+                }
         Ok(())
     }
 

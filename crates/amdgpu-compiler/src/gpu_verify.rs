@@ -1442,7 +1442,7 @@ impl<'a> An<'a> {
         let f = self.f;
         let mut i = start;
         while i < end {
-            let st = f.stmts()[i];
+            let st = &f.stmts()[i];
             self.idx = i;
             match st {
                 Stmt::Let { dst, op } => {
@@ -1718,7 +1718,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
     let mut pos = 0usize;
     let mut stack: Vec<usize> = Vec::new();
     while pos < f.stmts().len() {
-        if let Stmt::BeginIf { cond } = f.stmts()[pos] {
+        if let Stmt::BeginIf { cond } = &f.stmts()[pos] {
             let divergent = tainted(cond, &tv, &tvars);
             let mut p = pos + 1;
             let t = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::Else | Stmt::EndIf)));
