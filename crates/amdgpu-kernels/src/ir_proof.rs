@@ -96,6 +96,7 @@ pub struct Trace {
     pub pass1_lds_store_origins: usize,
     pub pass2_lds_store_origins: usize,
     pub origin_by_addr: HashMap<i64, (u32, u8)>,
+    pub tag_by_addr: HashMap<i64, Tag>,
     pub sample_read: Option<(String, i64, i64, usize)>,
     pub sample_epi_read: Option<(String, i64, i64, usize)>,
     pub executed_insts: usize,
