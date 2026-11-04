@@ -697,6 +697,10 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SLoadDwordx2 => {
             vec![format!("s_load_dwordx2 {}, s[0:1], {}", spair(a, inst.dst.unwrap()), inst.imm)]
         }
+        MOp::SLoadDwordx4 => {
+            let d = a.phys[inst.dst.unwrap() as usize];
+            vec![format!("s_load_dwordx4 s[{d}:{}], s[0:1], {}", d + 3, inst.imm)]
+        }
         MOp::SMemTime => vec![format!("s_memtime {}", spair(a, inst.dst.unwrap()))],
         MOp::SLoPart => vec![format!("s_mov_b32 {}, s{}", d_s(a, inst), a.phys[reg_of(&inst.srcs[0]) as usize])],
         MOp::SReadPhys => vec![format!("s_mov_b32 {}, s{}", d_s(a, inst), inst.imm)],
@@ -776,6 +780,18 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[0]),
             lds_off(inst.imm)
         )],
+        MOp::VMovDpp => {
+            let c = inst.imm as u32;
+            vec![format!(
+                "v_mov_b32_dpp {}, {} quad_perm:[{},{},{},{}] row_mask:0xf bank_mask:0xf",
+                vr(a, inst.dst.expect("dst")),
+                vr(a, reg_of(&inst.srcs[0])),
+                c & 3,
+                c >> 2 & 3,
+                c >> 4 & 3,
+                c >> 6 & 3
+            )]
+        }
         MOp::VReadFirstLane => {
             vec![format!("v_readfirstlane_b32 {}, {}", sr(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]))]
         }

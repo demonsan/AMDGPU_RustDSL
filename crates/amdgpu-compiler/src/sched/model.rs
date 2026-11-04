@@ -95,6 +95,7 @@ pub fn cost(op: MOp) -> OpCost {
         VMulLoU32 => c(Valu, 16, 16, Unknown),
         VMovFromSPair | VPtrAdd => c(Valu, 8, 8, Experimental),
         VReadFirstLane => c(Valu, 4, 12, Unknown),
+        VMovDpp => c(Valu, 4, 8, Unknown),
         // MFMA issue spacing 64/32/16 (V), same for dependent chains; latency = wait states until the
         // last D register is readable (20/11/7 s_nop slots of 4 cycles; V) -> hazards pass pads the rest.
         VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z | VMfma32x32x64Fp8 | VMfma32x32x64Fp8Z => c(Mfma, 64, 84, Verified),
@@ -124,7 +125,7 @@ pub fn cost(op: MOp) -> OpCost {
         GlobalStoreU16 | GlobalStoreF32 | GlobalStoreF32x4 | GlobalStoreF32x2 | BufferStoreDwordX1 | BufferStoreDwordX2 | BufferStoreDwordX4 => c(Vmem, 8, 4, Unknown),
         BufferLoadDwordX4Lds | BufferLoadDwordX1Lds => c(Vmem, 14, 240, Unknown),
         SBufferRsrc | SBufferRsrcDyn => c(Salu, 4, 4, Unknown),
-        SLoadDword | SLoadDwordx2 | SMemTime => c(Smem, 4, 200, Unknown),
+        SLoadDword | SLoadDwordx2 | SLoadDwordx4 | SMemTime => c(Smem, 4, 200, Unknown),
         SLoPart => c(Salu, 4, 4, Verified),
         SReadPhys | SMovB32 | SAddU32 | SAddcU32 | SMulI32 | SShlB32 | SLshrB32 | SAndB32 | SXorB32 | SCmpLtI32 | SMinI32 | SCselectB32 | SCselectB64 | SCselectB128 => c(Salu, 4, 4, Verified),
         SBarrier | SSetPrio | SNop | SWaitVm | SWaitLgkm | SEndpgm | SchedGroup => c(Ctrl, 4, 4, Verified),    }
