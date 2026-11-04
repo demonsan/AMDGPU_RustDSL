@@ -1049,6 +1049,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let mut ctx = Ctx::new();
     let s_lane = ctx.sym("lane", 0, 63, lane.lane());
     let s_tid = ctx.sym("tid", 0, 255, ev(tid));
+    let s_tr_all = if cfg.wave_roles { ctx.sym("tid_role", 0, 127, ev(tid) & 127) } else { s_tid.clone() };
     let s_k = ctx.sym("K", 128, 1 << 20, ev(k_v));
     let s_n = ctx.sym("N", 128, 1 << 20, ev(n_v));
     let s_wm = ctx.sym("wm", 0, 1, ev(wm));
@@ -1109,7 +1110,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let b_glob = make_layout(tup![tup![16, cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]);
     // wave roles (the vendor request shape): waves 0/1 move the whole A tile, waves 2/3 the whole B tile, each with the role-local thread id
     let (a_dma, b_dma, a_wave, b_wave, role_a) = if cfg.wave_roles {
-        let s_tr = ctx.sym("tid_role", 0, 127, ev(tid) & 127);
+        let s_tr = s_tr_all.clone();
         let a = dma_plan_rows_swz(b, &ctx, &s_tr, cta_m, &a_glob, 8192, false, 2);
         let bb = dma_plan(b, &ctx, &s_tr, cta_n, &b_glob, 8192, false, 2);
         let aw = b.bind_i32((lane.wave() & 1) * (cta_m * 128 / 2) as i32);
