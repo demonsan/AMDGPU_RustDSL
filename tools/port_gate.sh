@@ -121,7 +121,9 @@ if ! skip SKIP_ACC; then
             nshape=$((nshape + 1))
             bad=$(echo "$out" | grep '^our kernel' | field bad); [ "${bad:-1}" = 0 ] || { nbad=$((nbad + 1)); echo "  ACC64 $m bad=${bad:-?} B=$1 H=$2 S=$3 SK=$4 gqa=$5" | tee -a "$LOG"; }
             p=$(echo "$out" | parity); [ "${p%% *}" = OK ] && npar=$((npar + 1)) || echo "  ACC64 $m parity $p B=$1 H=$2 S=$3 SK=$4 gqa=$5" | tee -a "$LOG"
-            vbad=$(echo "$out" | grep  "$out" | grep -q SPLIT_ULP_; then ulp_n=$((ulp_n + 1)); echo "$out" | grep -q SPLIT_ULP_OK && ulp_ok=$((ulp_ok + 1)); fi
+            vbad=$(echo "$out" | grep '^vendor kernel' | field bad)
+            if [ "${p%% *}" = OK ] && [ "${bad:-1}" -le "${vbad:-0}" ]; then nvp=$((nvp + 1)); else echo "  ACC64 $m vendor-parity FAIL (ours bad=${bad:-?}; mean ours/vendor: ${p#* }; vendor bad=${vbad:-?}) B=$1 H=$2 S=$3 SK=$4 gqa=$5" | tee -a "$LOG"; fi
+            if echo "$out" | grep -q SPLIT_ULP_; then ulp_n=$((ulp_n + 1)); echo "$out" | grep -q SPLIT_ULP_OK && ulp_ok=$((ulp_ok + 1)); fi
         done
         if [ "${ACC_STRICT:-0}" = 1 ]; then
             [ $nbad = 0 ] && v=PASS || v=FAIL; row ACC64 "$mode: shapes with bad>0 (64 rows, STRICT)" "$nbad/$nshape" "0" $v
