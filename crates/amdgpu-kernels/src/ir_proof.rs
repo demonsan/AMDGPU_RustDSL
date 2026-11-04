@@ -259,18 +259,15 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             let dst = la + *imm as i64 + nbytes * cx.lane;
             for b in 0..nbytes {
                 let tag = cx.tag_for(role, src + b);
-                if let Some((tile, ver)) = &cx.cur_tile {
-                    let _ = (tile, ver);
-                    cx.lds.borrow_mut().insert(dst + b, (tag.clone(), None));
-                    cx.trace.borrow_mut().dma_writes += 1;
-                    match &tag { Tag::A(..) => cx.trace.borrow_mut().tag_a += 1, Tag::B(..) => cx.trace.borrow_mut().tag_b += 1, Tag::Sa(..) => cx.trace.borrow_mut().tag_sa += 1, Tag::Sb(..) => cx.trace.borrow_mut().tag_sb += 1, _ => {} }
-                    if tag != Tag::U { cx.trace.borrow_mut().tag_by_addr.insert(dst + b, tag); }
-                }
+                cx.lds.borrow_mut().insert(dst + b, (tag.clone(), None));
+                cx.trace.borrow_mut().dma_writes += 1;
+                match &tag { Tag::A(..) => cx.trace.borrow_mut().tag_a += 1, Tag::B(..) => cx.trace.borrow_mut().tag_b += 1, Tag::Sa(..) => cx.trace.borrow_mut().tag_sa += 1, Tag::Sb(..) => cx.trace.borrow_mut().tag_sb += 1, _ => {} }
+                if tag != Tag::U { cx.trace.borrow_mut().tag_by_addr.insert(dst + b, tag); }
             }
         }
         Stmt::StoreLdsB32 { addr, value } => {
             if let (Some(a), V::Word { tags, .. }) = (cx.int(*addr), cx.opnd(*value)) {
-                if cx.cur_tile.is_some() { for b in 0..4 { cx.lds.borrow_mut().insert(a + b, (tags.get(b as usize).cloned().unwrap_or(Tag::U), None)); } }
+                for b in 0..4 { cx.lds.borrow_mut().insert(a + b, (tags.get(b as usize).cloned().unwrap_or(Tag::U), None)); }
             }
         }
         Stmt::StoreLdsB64 { addr, value } | Stmt::StoreLdsB128 { addr, value } => {
@@ -280,10 +277,9 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
 
             if let (Some(a), V::Frag { bytes, origins, .. }) = (cx.int(*addr), cx.opnd(*value)) {
                 cx.trace.borrow_mut().lds_store_origins += origins.iter().filter(|x| x.is_some()).count();
-                if let Some((tile, ver)) = &cx.cur_tile {
-                    if cx.trace.borrow_mut().sample_store.is_none() { cx.trace.borrow_mut().sample_store = Some((tile.clone(), *ver, a)); cx.trace.borrow_mut().sample_store_origin = origins.iter().filter(|x| x.is_some()).count(); }
+                {
+                    if cx.trace.borrow_mut().sample_store.is_none() { cx.trace.borrow_mut().sample_store = Some(("".into(), 0, a)); cx.trace.borrow_mut().sample_store_origin = origins.iter().filter(|x| x.is_some()).count(); }
                     for (b, t) in bytes.iter().enumerate() {
-                        let _ = (tile, ver);
                         let key = a + b as i64;
                         let o = origins.get(b / 4).and_then(|x| *x);
                         if let Some(oo) = o { cx.trace.borrow_mut().origin_by_addr.insert(a + b as i64, oo); }
@@ -512,16 +508,15 @@ fn word_origin(v: V) -> Option<(u32, u8)> { match v { V::Word { origin, .. } => 
 
 fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     let Some(a) = cx.int(addr) else { return V::Unknown };
-    let Some((tile, ver)) = &cx.cur_tile else { return V::Unknown };
+    let (tile, ver) = cx.cur_tile.clone().unwrap_or_else(|| (String::new(), 0));
     let mut bytes = Vec::new();
     for i in 0..n {
-        let _ = (tile, ver);
         let exact = cx.lds.borrow().get(&(a + i as i64)).map(|x| x.0.clone());
         let mut tag = exact.clone().unwrap_or(Tag::U);
         if exact.is_none() && cx.trace.borrow().lds_miss < 16 { cx.trace.borrow_mut().sample_miss = Some(a + i as i64); }
         if exact.is_some() && cx.trace.borrow().sample_hit.is_none() { cx.trace.borrow_mut().sample_hit = Some(a + i as i64); }
         if exact.is_none() { cx.trace.borrow_mut().lds_miss += 1; }
-        if tag == Tag::U { if let Some(t) = cx.trace.borrow_mut().tag_by_addr.get(&(a + i as i64)) { tag = t.clone(); } }
+        if tag == Tag::U { if let Some(t) = cx.trace.borrow().tag_by_addr.get(&(a + i as i64)) { tag = t.clone(); } }
         if tag != Tag::U { cx.trace.borrow_mut().read_non_u += 1; }
         bytes.push(tag);
     }
