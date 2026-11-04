@@ -299,8 +299,11 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             cx.trace.borrow_mut().mfma_seen += 1;
             let av = cx.opnd(*a); let bv = cx.opnd(*b);
             match &av { V::Frag { .. } => cx.trace.borrow_mut().mfma_a_frag += 1, V::Unknown => cx.trace.borrow_mut().mfma_a_unknown += 1, _ => {} }
-            let a_tags = frag_tags_fallback(&av, &cx.trace.borrow());
-            let b_tags = frag_tags_fallback(&bv, &cx.trace.borrow());
+            let lds_snapshot = cx.lds.borrow();
+            let tr = cx.trace.borrow();
+            let a_tags = frag_tags_fallback(&av, &tr, &lds_snapshot);
+            let b_tags = frag_tags_fallback(&bv, &tr, &lds_snapshot);
+            drop(tr); drop(lds_snapshot);
             // The K generation comes from the A/B element tags themselves (actual addresses),
             // with the tile marker as a fallback for an empty fragment.
             let kb = a_tags.iter().find_map(|t| if let Tag::A(_, k) = t { Some(k / 128) } else { None })
@@ -363,11 +366,16 @@ fn let_dst_of(_st: &Stmt) -> Option<ValueId> { None }
 fn frag_tags(v: V) -> Vec<Tag> {
     match v { V::Frag { bytes, .. } => bytes, _ => Vec::new() }
 }
-fn frag_tags_fallback(v: &V, trace: &Trace) -> Vec<Tag> {
+fn frag_tags_fallback(v: &V, trace: &Trace, lds: &HashMap<i64, (Tag, Option<(u32, u8)>)>) -> Vec<Tag> {
     match v {
         V::Frag { bytes, addr, .. } => {
             if !bytes.iter().all(|t| *t == Tag::U) { return bytes.clone(); }
             if let Some(a) = addr {
+                let from_lds: Vec<Tag> = (0..32).map(|i| lds.get(&(a + i))
+                    .map(|x| x.0.clone())
+                    .or_else(|| trace.tag_by_addr.get(&(a + i)).cloned())
+                    .unwrap_or(Tag::U)).collect();
+                if !from_lds.iter().all(|t| *t == Tag::U) { return from_lds; }
                 let out: Vec<Tag> = (0..32).map(|i| trace.tag_by_addr.get(&(a + i)).cloned().unwrap_or(Tag::U)).collect();
                 if !out.iter().all(|t| *t == Tag::U) { return out; }
             }
