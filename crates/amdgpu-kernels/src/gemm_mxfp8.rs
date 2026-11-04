@@ -1175,7 +1175,8 @@ impl PipeBody for Body {
         let proof_drop = std::env::var("GEMM_PROOF_DROP_KB").ok().and_then(|v| v.parse::<i32>().ok());
         if proof_drop.is_some() {
             let it = amdgpu_dsl::tile::ox(t.it);
-            b.begin_if(it.ne(proof_drop.unwrap()));
+            let keep = b.bind_cond(it.ne(proof_drop.unwrap()));
+            b.begin_if(keep);
         }
         for i in 0..nm {
             // prefetch the next A fragment while this one feeds 4 MMAs
