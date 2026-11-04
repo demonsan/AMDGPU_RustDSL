@@ -12,7 +12,7 @@ int main(int argc, char** argv) {
     if (argc < 3) { std::printf("usage: %s probe.co kernel...\n", argv[0]); return 2; }
     const int iters = std::getenv("ITERS") ? std::atoi(std::getenv("ITERS")) : 4096;
     const int reps = std::getenv("REPS") ? std::atoi(std::getenv("REPS")) : 6;
-    const int mfma_per_iter = 32;
+    const int mfma_per_iter = std::getenv("MPI") ? std::atoi(std::getenv("MPI")) : 32;   // MFMAs per loop iteration (64 for tools/mfma_block.py)
     const bool trace = std::getenv("TRACE") != nullptr;   // TRACE=1: one line per launch (clock trajectory under sustained load)
     hipDeviceProp_t prop; CK(hipGetDeviceProperties(&prop, 0));
     const int blocks = std::getenv("BLOCKS") ? std::atoi(std::getenv("BLOCKS")) : prop.multiProcessorCount;
