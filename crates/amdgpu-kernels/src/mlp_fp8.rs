@@ -191,7 +191,6 @@ pub const W_IMG: i64 = 256 * W_PITCH;
 /// the fused kernel's W2 key-permuted) are DMA'd once per CTA into LDS, then every CTA loops over 128-row blocks (block c, c + G, ...): X rows by
 /// direct 16-byte loads (the next block's X prefetched during GEMM 2), W fragments by `ds_read_b128` with immediate offsets, accumulators in
 /// registers, the same zero-cost P hand-off as `build`. ABI: in @0, W1 image @8, W2 image @16, out @24, M @32, G (CTAs) @36.
-<<<<<<< HEAD
 /// The IR stage contract of the P hand-off (block `jb`): the producer / consumer element tables of `p_boundary` on the IR values.
 fn p_stage_val(jb: i64, v: ValueId, producer: bool) -> amdgpu_dsl::StageVal {
     let (p, c) = p_boundary(jb);
@@ -199,8 +198,6 @@ fn p_stage_val(jb: i64, v: ValueId, producer: bool) -> amdgpu_dsl::StageVal {
     amdgpu_dsl::StageVal { name: lf.name.clone(), values: vec![v], table: lf.table.clone(), elem_bits: lf.elem_bits, storage: "vgpr".into() }
 }
 
-=======
->>>>>>> origin/buf-b128x2
 fn build_ws(name: &str, mode: Mode) -> Function {
     if mode == Mode::Fused {
         for jb in 0..N1 / 64 {
@@ -292,13 +289,10 @@ fn build_ws(name: &str, mode: Mode) -> Function {
     let xs: Vec<Opnd> = vars[1..].iter().map(|v| Opnd::Var(*v)).collect();
     let next = b.bind_i32(blk.clone() + ev(g_v));
     let row = b.bind_i32((blk.clone() << 7) + (lane.wave() << 5) + lane.j());
-<<<<<<< HEAD
     let roles = vec!["all 4 waves: same program".to_string()];
     if mode == Mode::Fused {
         b.stage_begin("gemm1_act", amdgpu_dsl::StageContract { barrier_phase: 1, roles: roles.clone(), ..Default::default() });
     }
-=======
->>>>>>> origin/buf-b128x2
     let p_words: Vec<Opnd> = if mode == Mode::G2 {
         xs.clone()
     } else {
@@ -333,7 +327,6 @@ fn build_ws(name: &str, mode: Mode) -> Function {
             (0..N1 / 64).map(|jb| { let w: Vec<ValueId> = words[2 * jb as usize].iter().chain(words[2 * jb as usize + 1].iter()).copied().collect(); Opnd::Val(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])) }).collect()
         }
     };
-<<<<<<< HEAD
     let p_vals: Vec<ValueId> = p_words.iter().filter_map(|o| if let Opnd::Val(v) = o { Some(*v) } else { None }).collect();
     if mode == Mode::Fused {
         // the hand-over is recorded on the stage that produced it: close gemm1_act with its live-out set
@@ -353,11 +346,6 @@ fn build_ws(name: &str, mode: Mode) -> Function {
             ..Default::default()
         });
     }
-=======
-    // the next block's row operand (clamped: past the end it reloads this block, unused)
-    let nclamp = b.bind_i32(ev(next).lt(ev(nb)).select_i32(ev(next), blk.clone()));
-    let xn = rowfrags(b, ev(nclamp));
->>>>>>> origin/buf-b128x2
     if mode != Mode::G1 {
         let w2 = w2s.as_ref().expect("W2");
         let zero = b.frag_zero(DType::Frag16);
@@ -380,12 +368,9 @@ fn build_ws(name: &str, mode: Mode) -> Function {
             }
         }
     }
-<<<<<<< HEAD
     if mode == Mode::Fused {
         b.stage_end();
     }
-=======
->>>>>>> origin/buf-b128x2
     b.set_var(vars[0], next);
     for (v, x) in vars[1..].iter().zip(xn.iter()) {
         b.set_var(*v, *x);
