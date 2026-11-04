@@ -286,6 +286,8 @@ pub struct AttnBody3<'a> {
     pub setprio: bool,
     /// `Vs128Cfg::thr512` with the seeded lazy rollback
     pub seed_first: bool,
+    /// `Vs128Cfg::scaleconv`
+    pub scaleconv: bool,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -293,7 +295,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, scaleconv: false }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -382,6 +384,12 @@ impl PipeBody for AttnBody3<'_> {
         }
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
+        if self.scaleconv {
+            let (nb, sc) = self.sm.decide_scaled(b, &s, &o, mask.as_ref());
+            self.p = self.sm.convert_scaled(b, &s, mask.as_ref(), 0, 4, sc);
+            self.p.push(nb);
+            return;
+        }
         let nb = if self.seed_first {
             let first = b.bind_cond(amdgpu_dsl::tile::ox(t.it).eq(0));
             self.sm.decide_seeded(b, &s, &o, mask.as_ref(), first)
@@ -437,10 +445,12 @@ pub struct Vs128Cfg {
     pub kvpad: bool,
     /// rollback threshold override in 1/512 units (shipped 120: below the 131 target, so a tile whose max equals the running max rolls back)
     pub thr512: Option<u32>,
+    /// the rebase of the current scores folded into the fp8 conversion scale (no `S += delta` on the rollback path)
+    pub scaleconv: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -461,6 +471,7 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
+            body.scaleconv = cfg.scaleconv;
             if let Some(th) = cfg.thr512 {
                 body.sm.set_thr(b, th as f32 / 512.0);
                 body.seed_first = true;

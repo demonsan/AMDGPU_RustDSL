@@ -101,7 +101,31 @@ impl OnlineSoftmax {
     pub fn commit_bias(&self, b: &mut FnBuilder, nb: ValueId) {
         b.set_var(self.bias.expect("OnlineSoftmax: state not bound"), nb);
     }
+    /// `decide` with the rebase of the CURRENT scores folded into the fp8 conversion: instead of `S += delta` (32 `v_pk_add_f32` on the
+    /// rollback path, which runs on most tiles), the conversion scale (the `v_cvt_scalef32` operand) is `2^(512 delta)` - the same factor
+    /// `O` and `l` are rescaled with, so P = fp8(S' + delta) up to the pknorm rounding. A huge jump of the max (x = m > 0.45: the bf16 exponent
+    /// 512 x would leave the finite range) still adds `delta` to S and converts with scale 1. Returns (new bias word, conversion scale).
+    pub fn decide_scaled(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> (ValueId, ValueId) {
+        let mut sc = None;
+        let nb = self.decide_impl(b, s, o, mask, true, None, Some(&mut sc));
+        (nb, sc.expect("scale"))
+    }
+    /// `convert` with a per-lane conversion scale (`decide_scaled`).
+    pub fn convert_scaled(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, t0: usize, t1: usize, scale: ValueId) -> Vec<ValueId> {
+        let lut = if self.recipe.lut { Some(LutConsts::new(b)) } else { None };
+        let conv = if self.recipe.lut { P8Conv::PkNormLut } else { P8Conv::PkNorm };
+        let mut words = Vec::with_capacity(4 * (t1 - t0));
+        for i in t0..t1 {
+            let xs = masked_values(b, s, i, mask, self.zero_f);
+            words.extend(to_p8(b, &xs, scale, conv, lut.as_ref()));
+        }
+        words
+    }
     fn decide_opts(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, write_bias: bool, seed: Option<ValueId>) -> ValueId {
+        self.decide_impl(b, s, o, mask, write_bias, seed, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn decide_impl(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, write_bias: bool, seed: Option<ValueId>, scaled: Option<&mut Option<ValueId>>) -> ValueId {
         let bias2 = self.bias.expect("OnlineSoftmax: state not bound");
         let mut flat: Vec<ValueId> = Vec::with_capacity(64);
         for i in 0..4usize {
@@ -141,6 +165,32 @@ impl OnlineSoftmax {
         let nb = b.frag2(w_new, w_new);
         if write_bias {
             b.set_var(bias2, nb);
+        }
+        if let Some(out) = scaled {
+            // the factor of this tile (1 when the lane does not roll back: delta = 0)
+            let ex = b.mul_f32(delta, self.c512);
+            let corr = b.exp2_f32(ex);
+            let big_t = b.c_f32(0.45);
+            let big = b.cmp_lt_f32(big_t, mt);
+            *out = Some(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(big), a: Opnd::Val(self.one_f), b: Opnd::Val(corr) }));
+            b.begin_if(Opnd::Val(grow));
+            {
+                let cd = b.frag2_dup(corr);
+                for a in &o.accs {
+                    b.var_scale_pk(a.var, cd);
+                }
+                b.var_scale_lane(self.l_acc(), 2, corr);
+            }
+            b.end_if();
+            b.begin_if(Opnd::Val(big));
+            {
+                let dupd = b.frag2_dup(delta);
+                for a in &s.accs {
+                    b.var_add_pk(a.var, dupd);
+                }
+            }
+            b.end_if();
+            return nb;
         }
         b.begin_if(Opnd::Val(grow));
         {
