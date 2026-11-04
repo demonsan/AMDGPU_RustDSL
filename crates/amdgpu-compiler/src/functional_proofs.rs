@@ -97,7 +97,10 @@ fn norm_mul(factors: Vec<E>) -> E {
             other => rest.push(other),
         }
     }
-    if !exps.is_empty() { rest.push(exp(norm_add(exps))); }
+    if !exps.is_empty() {
+        let y = norm_add(exps);
+        rest.push(match y { E::Const(c) => E::Const(c.exp()), other => exp(other) });
+    }
     if c != 1.0 { rest.insert(0, E::Const(c)); }
     match rest.len() { 0 => E::Const(1.0), 1 => rest.pop().unwrap(), _ => E::Mul(rest) }
 }
