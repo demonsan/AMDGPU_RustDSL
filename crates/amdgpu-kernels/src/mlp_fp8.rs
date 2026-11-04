@@ -272,18 +272,18 @@ fn build_ws(name: &str, mode: Mode) -> Function {
     };
     // row operand (X or H): 4 fragments of 64 k, 16 bytes at 64 kb + 16 h and + 32 of row m
     let nb = b.bind_i32(ev(m_v).lshr(7));
-    let rowfrags = |b: &mut FnBuilder, blk: ValueId| -> Vec<ValueId> {
-        let ro = b.bind_i32((((ev(blk) << 7) + (lane.wave() << 5) + lane.j()) << 8) + ev(h16));
+    let rowfrags = |b: &mut FnBuilder, blk: amdgpu_dsl::I32| -> Vec<ValueId> {
+        let ro = b.bind_i32((((blk << 7) + (lane.wave() << 5) + lane.j()) << 8) + ev(h16));
         (0..K1 / 64).map(|kb| { let lo = b.buffer_load_b128(r_in, ro, 0i32, (64 * kb) as u32); let hi = b.buffer_load_b128(r_in, ro, 0i32, (64 * kb + 32) as u32); b.cat_frag8(lo, hi) }).collect()
     };
-    let x0 = rowfrags(b, bx);
+    let x0 = rowfrags(b, ev(bx));
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(bx))];
     inits.extend(x0.iter().map(|x| (DType::Frag8, Opnd::Val(*x))));
     let vars = b.begin_loop(&inits);
-    let blk = b.bind_i32(amdgpu_dsl::tile::varx(vars[0]));
+    let blk = amdgpu_dsl::tile::varx(vars[0]);
     let xs: Vec<Opnd> = vars[1..].iter().map(|v| Opnd::Var(*v)).collect();
-    let next = b.bind_i32(ev(blk) + ev(g_v));
-    let row = b.bind_i32((ev(blk) << 7) + (lane.wave() << 5) + lane.j());
+    let next = b.bind_i32(blk.clone() + ev(g_v));
+    let row = b.bind_i32((blk.clone() << 7) + (lane.wave() << 5) + lane.j());
     let p_words: Vec<Opnd> = if mode == Mode::G2 {
         xs.clone()
     } else {
@@ -319,8 +319,8 @@ fn build_ws(name: &str, mode: Mode) -> Function {
         }
     };
     // the next block's row operand (clamped: past the end it reloads this block, unused)
-    let nclamp = b.bind_i32(ev(next).lt(ev(nb)).select_i32(ev(next), ev(blk)));
-    let xn = rowfrags(b, nclamp);
+    let nclamp = b.bind_i32(ev(next).lt(ev(nb)).select_i32(ev(next), blk.clone()));
+    let xn = rowfrags(b, ev(nclamp));
     if mode != Mode::G1 {
         let w2 = w2s.as_ref().expect("W2");
         let zero = b.frag_zero(DType::Frag16);
