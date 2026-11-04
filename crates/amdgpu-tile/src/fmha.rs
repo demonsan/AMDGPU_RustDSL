@@ -69,6 +69,8 @@ pub struct KvRing3 {
     /// the K-scale words: lane (j, h) reads word j + 32 s (both lane halves read the same word: a broadcast TV layout)
     pub kdpart: LdsPart,
     pub mma: TiledMma,
+    /// MUBUF form of the K / V DMA (`Vs128Cfg::bufdma`): SGPR per-tile advance, loop-invariant voffsets
+    pub buf: Option<(crate::dma::BufForm, crate::dma::BufForm)>,
 }
 
 impl KvRing3 {
@@ -111,7 +113,13 @@ impl KvRing3 {
             let rt_row = b.bind_i32(lane.tid().lshr(1));
             KdCopy3::Vgpr(copy::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
         };
-        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma }
+        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None }
+    }
+    /// Switches the K / V staging to the buffer form (the vendor's `buffer_load_dwordx4 ... lds` with an SGPR soffset).
+    pub fn enable_buffer_dma(&mut self, b: &mut FnBuilder) {
+        let k = self.kdma.buffer_form(b);
+        let v = self.vdma.buffer_form(b);
+        self.buf = Some((k, v));
     }
 
     /// The copies of the tile at `key0` into `slot` that `role` produces (as `KvRing::stage`).
@@ -119,11 +127,17 @@ impl KvRing3 {
         match (role, &self.kdc) {
             (Role::A, KdCopy3::Dma(kd)) => {
                 kd.issue(b, key0, &self.kd.at(slot));
-                self.kdma.issue(b, key0, &self.ks.at(slot));
+                match &self.buf {
+                    Some((kb, _)) => self.kdma.issue_buffer(b, kb, key0, &self.ks.at(slot)),
+                    None => self.kdma.issue(b, key0, &self.ks.at(slot)),
+                }
                 None
             }
             (Role::B, _) => {
-                self.vdma.issue(b, key0, &self.vs.at(slot));
+                match &self.buf {
+                    Some((_, vb)) => self.vdma.issue_buffer(b, vb, key0, &self.vs.at(slot)),
+                    None => self.vdma.issue(b, key0, &self.vs.at(slot)),
+                }
                 None
             }
             (_, KdCopy3::Vgpr(kd)) => {
@@ -302,10 +316,12 @@ pub struct Vs128Cfg {
     /// vendor-style epilogue in registers: v_permlane32_swap pairs the 8-byte words of the two lane halves into 16 contiguous bytes per lane, 8 x
     /// 16-byte row stores per wave, no LDS round trip (takes precedence over `epi_lds`)
     pub epi_perm: bool,
+    /// K / V staging in the MUBUF form (SGPR per-tile soffset, loop-invariant voffsets, out-of-range rows read zeros)
+    pub bufdma: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -315,7 +331,11 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
     let io = declare_io(b, 256, false);
     let blk = block3(&io, b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
-    let ring = KvRing3::new(b, &io, &blk, &roles, 2);
+    let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
+    if cfg.bufdma {
+        ring.enable_buffer_dma(b);
+    }
+    let ring = ring;
     let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
