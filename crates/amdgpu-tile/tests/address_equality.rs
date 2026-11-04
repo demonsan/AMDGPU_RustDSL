@@ -42,7 +42,7 @@ fn eval(defs: &HashMap<u32, Op>, o: &Opnd, tid: i64, memo: &mut HashMap<u32, i64
 fn lds_addresses(f: &Function) -> Vec<Vec<i64>> {
     let mut defs: HashMap<u32, Op> = HashMap::new();
     let mut reads: Vec<Vec<Opnd>> = Vec::new();
-    for s in &f.stmts {
+    for s in f.stmts() {
         if let Stmt::Let { dst, op } = s {
             match op {
                 Op::LoadLdsB128 { addr } | Op::LoadLdsB32 { addr } | Op::LoadLdsTrB8 { addr } => reads.push(vec![*addr]),

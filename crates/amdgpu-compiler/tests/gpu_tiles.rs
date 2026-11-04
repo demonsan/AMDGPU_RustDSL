@@ -250,13 +250,13 @@ fn removing_the_separating_barrier_of_the_shipped_probe_is_caught() {
     // mutate the shipped kernel: drop the SECOND barrier of each iteration (the one that separates the partner reads from the next iteration's writes)
     let mut f = amdgpu_compiler::kernel_by_name("probe_roles_loop").unwrap();
     let mut seen = 0;
-    f.stmts.retain(|s| {
+    f.edit_stmts(|v| v.retain(|s| {
         if matches!(s, amdgpu_dsl::Stmt::Barrier) {
             seen += 1;
             return seen != 2;
         }
         true
-    });
+    }));
     let r = verify_ir(&f);
     assert!(r.errors().iter().any(|e| e.code == "GV-TILE-RACE" || e.code == "GV-TILE-STALE"), "{}", r.render());
 }
@@ -396,13 +396,15 @@ fn vs128_runs_the_lifetime_simulation_and_removed_barriers_are_noticed() {
     let r = verify_ir(&f);
     assert!(r.errors().is_empty(), "{}", errors(&r));
     assert!(r.proven.get("tile-reads").copied().unwrap_or(0) > 1000, "{}", r.render());
-    let barriers: Vec<usize> = f.stmts.iter().enumerate().filter(|(_, s)| matches!(s, amdgpu_dsl::Stmt::Barrier)).map(|(i, _)| i).collect();
+    let barriers: Vec<usize> = f.stmts().iter().enumerate().filter(|(_, s)| matches!(s, amdgpu_dsl::Stmt::Barrier)).map(|(i, _)| i).collect();
     assert!(barriers.len() >= 6, "{} barriers", barriers.len());
     // remove every barrier in turn: the markers must notice most of them (a barrier that protects no marked tile is legitimately silent, e.g. the last one)
     let mut undetected: Vec<usize> = Vec::new();
     for (k, &stmt) in barriers.iter().enumerate() {
         let mut g = f.clone();
-        g.stmts.remove(stmt);
+        g.edit_stmts(|v| {
+            v.remove(stmt);
+        });
         let m = verify_ir(&g);
         if !m.errors().iter().any(|e| e.code == "GV-BAR" || e.code.starts_with("GV-TILE")) {
             undetected.push(k);

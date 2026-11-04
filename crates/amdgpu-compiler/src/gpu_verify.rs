@@ -705,8 +705,8 @@ impl<'a> An<'a> {
     fn top_origin(&self, o: &Opnd, depth: usize) -> String {
         match o {
             Opnd::Var(v) => {
-                let upd: Vec<String> = self.f.stmts.iter().filter_map(|s| if let Stmt::SetVar { var, value } = s { if var == v { Some(self.shape(value, 3)) } else { None } } else { None }).take(2).collect();
-                let init: Vec<String> = self.f.stmts.iter().filter_map(|s| if let Stmt::BeginLoop { vars, init } = s { vars.iter().position(|x| x == v).map(|k| self.shape(&init[k], 3)) } else { None }).take(1).collect();
+                let upd: Vec<String> = self.f.stmts().iter().filter_map(|s| if let Stmt::SetVar { var, value } = s { if var == v { Some(self.shape(value, 3)) } else { None } } else { None }).take(2).collect();
+                let init: Vec<String> = self.f.stmts().iter().filter_map(|s| if let Stmt::BeginLoop { vars, init } = s { vars.iter().position(|x| x == v).map(|k| self.shape(&init[k], 3)) } else { None }).take(1).collect();
                 format!("loop variable var{} = {} (not bounded by the fixpoint; initial {} = {}; updated by {}; add b.assume(var, lo, hi) at the top of the loop body)", v.0, self.vars.get(v).map(|i| i.show()).unwrap_or_default(), init.join(""), self.var_init.get(v).map(|i| i.show()).unwrap_or_default(), upd.join(" / "))
             }
             Opnd::Val(v) => {
@@ -1418,7 +1418,7 @@ impl<'a> An<'a> {
 
     fn matching_end(&self, begin: usize) -> usize {
         let mut depth = 0usize;
-        for (k, s) in self.f.stmts.iter().enumerate().skip(begin) {
+        for (k, s) in self.f.stmts().iter().enumerate().skip(begin) {
             match s {
                 Stmt::BeginLoop { .. } => depth += 1,
                 Stmt::EndLoop => {
@@ -1430,11 +1430,11 @@ impl<'a> An<'a> {
                 _ => {}
             }
         }
-        self.f.stmts.len()
+        self.f.stmts().len()
     }
 
     fn run(&mut self) {
-        let n = self.f.stmts.len();
+        let n = self.f.stmts().len();
         self.exec(0, n);
     }
 
@@ -1442,7 +1442,7 @@ impl<'a> An<'a> {
         let f = self.f;
         let mut i = start;
         while i < end {
-            let st = &f.stmts[i];
+            let st = f.stmts()[i];
             self.idx = i;
             match st {
                 Stmt::Let { dst, op } => {
@@ -1687,7 +1687,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
     };
     loop {
         let mut changed = false;
-        for st in &f.stmts {
+        for st in f.stmts() {
             match st {
                 Stmt::Let { dst, op } => {
                     let t = matches!(op, Op::WorkitemId) || op.operands().iter().any(|o| tainted(o, &tv, &tvars));
@@ -1717,15 +1717,15 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
     // every wave-divergent if/else must have the same barrier signature on both sides
     let mut pos = 0usize;
     let mut stack: Vec<usize> = Vec::new();
-    while pos < f.stmts.len() {
-        if let Stmt::BeginIf { cond } = &f.stmts[pos] {
+    while pos < f.stmts().len() {
+        if let Stmt::BeginIf { cond } = f.stmts()[pos] {
             let divergent = tainted(cond, &tv, &tvars);
             let mut p = pos + 1;
-            let t = trim(bar_counts(&f.stmts, &mut p, &|s| matches!(s, Stmt::Else | Stmt::EndIf)));
+            let t = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::Else | Stmt::EndIf)));
             let mut e = vec![0];
-            if matches!(f.stmts.get(p), Some(Stmt::Else)) {
+            if matches!(f.stmts().get(p), Some(Stmt::Else)) {
                 p += 1;
-                e = trim(bar_counts(&f.stmts, &mut p, &|s| matches!(s, Stmt::EndIf)));
+                e = trim(bar_counts(f.stmts(), &mut p, &|s| matches!(s, Stmt::EndIf)));
             }
             if divergent && t != e {
                 rep.add(
@@ -1744,7 +1744,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: Ctx::new(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts.iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: Ctx::new(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));

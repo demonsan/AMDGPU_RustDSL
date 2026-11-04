@@ -71,7 +71,7 @@ fn tile_view_offsets_clamp_the_relative_row() {
     let f = b.finish();
     let text = f.dump();
     // clamp = cmp + select, then the offset terms and one ptr_add
-    assert!(f.stmts.len() - before >= 6, "{text}");
+    assert!(f.stmts().len() - before >= 6, "{text}");
     assert!(text.to_lowercase().contains("select"), "the row index must be clamped:\n{text}");
 }
 

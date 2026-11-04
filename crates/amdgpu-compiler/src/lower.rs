@@ -249,7 +249,7 @@ impl Lowerer {
                 *use_counts.entry(*v).or_insert(0) += 1;
             }
         };
-        for st in &f.stmts {
+        for st in f.stmts() {
             match st {
                 Stmt::Let { dst, op } => {
                     defs.insert(*dst, op.clone());
@@ -1455,7 +1455,7 @@ impl Lowerer {
     }
 
     fn run(&mut self, f: &Function) -> Result<(), String> {
-        for st in &f.stmts {
+        for st in f.stmts() {
             match st {
                 Stmt::Let { dst, op } => self.lower_op(*dst, op)?,
                 Stmt::StoreU16 { base, byte_off, value } => {
@@ -3369,7 +3369,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
             _ => false,
         };
         let mut changed = false;
-        for st in &f.stmts {
+        for st in f.stmts() {
             match st {
                 Stmt::Let { dst, op } => {
                     if matches!(op, Op::WorkitemId) {

@@ -104,7 +104,7 @@ pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
     };
     loop {
         let mut changed = false;
-        for st in &f.stmts {
+        for st in f.stmts() {
             match st {
                 Stmt::Let { dst, op } => {
                     let t = matches!(op, Op::WorkitemId) || op.operands().iter().any(|o| tainted(o, &tv, &tvars));
@@ -132,7 +132,7 @@ pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
         }
     }
     let mut out = HashSet::new();
-    for (i, st) in f.stmts.iter().enumerate() {
+    for (i, st) in f.stmts().iter().enumerate() {
         if let Stmt::BeginIf { cond } = st {
             if tainted(cond, &tv, &tvars) {
                 out.insert(i);
@@ -144,7 +144,7 @@ pub(crate) fn divergent_ifs(f: &Function) -> HashSet<usize> {
 
 fn matching(f: &Function, begin: usize) -> usize {
     let mut depth = 0usize;
-    for (k, s) in f.stmts.iter().enumerate().skip(begin) {
+    for (k, s) in f.stmts().iter().enumerate().skip(begin) {
         match s {
             Stmt::BeginLoop { .. } => depth += 1,
             Stmt::EndLoop => {
@@ -156,14 +156,14 @@ fn matching(f: &Function, begin: usize) -> usize {
             _ => {}
         }
     }
-    f.stmts.len()
+    f.stmts().len()
 }
 
 /// (else index or end index, end index) of the if starting at `begin`.
 fn if_span(f: &Function, begin: usize) -> (Option<usize>, usize) {
     let mut depth = 0usize;
     let mut els = None;
-    for (k, s) in f.stmts.iter().enumerate().skip(begin) {
+    for (k, s) in f.stmts().iter().enumerate().skip(begin) {
         match s {
             Stmt::BeginIf { .. } => depth += 1,
             Stmt::Else if depth == 1 => els = Some(k),
@@ -176,7 +176,7 @@ fn if_span(f: &Function, begin: usize) -> (Option<usize>, usize) {
             _ => {}
         }
     }
-    (els, f.stmts.len())
+    (els, f.stmts().len())
 }
 
 /// (is_write, is_coherent) of a global-memory access statement.
@@ -331,7 +331,7 @@ impl<'a> Sim<'a> {
             if self.steps > 2_000_000 {
                 return;
             }
-            let st = &f.stmts[i];
+            let st = f.stmts()[i];
             if let Some((write, coh)) = is_global_access(st) {
                 if let Some(e) = self.open {
                     if self.evs[e].global {
@@ -433,8 +433,8 @@ impl<'a> Sim<'a> {
                     let (els, endif) = if_span(f, i);
                     let then_range = (i + 1, els.unwrap_or(endif));
                     let else_range = els.map(|e| (e + 1, endif));
-                    let proto = |a: usize, b: usize| f.stmts[a..b].iter().any(|s| matches!(s, Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. }));
-                    let anything = |a: usize, b: usize| f.stmts[a..b].iter().any(|s| matches!(s, Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. }) || is_lds_access(s).is_some());
+                    let proto = |a: usize, b: usize| f.stmts()[a..b].iter().any(|s| matches!(s, Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. }));
+                    let anything = |a: usize, b: usize| f.stmts()[a..b].iter().any(|s| matches!(s, Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. }) || is_lds_access(s).is_some());
                     let has_proto = proto(then_range.0, then_range.1) || else_range.map_or(false, |r| proto(r.0, r.1));
                     let has_any = anything(then_range.0, then_range.1) || else_range.map_or(false, |r| anything(r.0, r.1));
                     let run_arm = |s: &mut Self, then: bool| {
@@ -569,12 +569,12 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
     fn konst(f: &Function, o: &Opnd) -> Option<i64> {
         match o {
             Opnd::I32(c) => Some(*c as i64),
-            Opnd::Val(v) => f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op: Op::ConstI32(c) } = s { if dst == v { Some(*c as i64) } else { None } } else { None }),
+            Opnd::Val(v) => f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op: Op::ConstI32(c) } = s { if dst == v { Some(*c as i64) } else { None } } else { None }),
             _ => None,
         }
     }
     fn def<'a>(f: &'a Function, v: ValueId) -> Option<&'a Op> {
-        f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if *dst == v { Some(op) } else { None } } else { None })
+        f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if *dst == v { Some(op) } else { None } } else { None })
     }
     fn walk(f: &Function, o: &Opnd, seen: &mut HashSet<(bool, u32)>) -> Result<(), String> {
         match o {
@@ -620,7 +620,7 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
                     return Ok(());
                 }
                 let mut ok_update = false;
-                for s in &f.stmts {
+                for s in f.stmts() {
                     match s {
                         Stmt::BeginLoop { vars, init } => {
                             if let Some(k) = vars.iter().position(|y| y == x) {
@@ -648,7 +648,7 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
         }
     }
     let mut seen = HashSet::new();
-    for (i, s) in f.stmts.iter().enumerate() {
+    for (i, s) in f.stmts().iter().enumerate() {
         if let Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } = s {
             if region_skipped(f, tile) {
                 continue;
@@ -663,7 +663,7 @@ fn periodic_cone(f: &Function) -> Result<usize, String> {
     // the markers are periodic with lcm(periods of the finite-state counters in their cones) x the power-of-two bound of `period_bits`
     let mut l = 1usize;
     // (conservatively over every finite-state counter of the kernel: a longer claimed period only lengthens the simulated horizon, and the claim is verified)
-    for s in &f.stmts {
+    for s in f.stmts() {
         if let Stmt::BeginLoop { vars, .. } = s {
             for x in vars {
                 if let Some(p) = finite_state_period(f, *x) {
@@ -692,7 +692,7 @@ fn lcm(a: usize, b: usize) -> usize {
 /// is also finite-state, but stays on the affine path (`period_bits`) so the existing kernels' claims do not change.
 fn finite_state_period(f: &Function, x: VarId) -> Option<usize> {
     let mut init: Option<i64> = None;
-    for s in &f.stmts {
+    for s in f.stmts() {
         if let Stmt::BeginLoop { vars, init: iv } = s {
             if let Some(k) = vars.iter().position(|y| *y == x) {
                 init = fs_eval(f, &iv[k], x, 0);
@@ -700,13 +700,13 @@ fn finite_state_period(f: &Function, x: VarId) -> Option<usize> {
         }
     }
     let x0 = init?;
-    let ups: Vec<&Opnd> = f.stmts.iter().filter_map(|s| if let Stmt::SetVar { var, value } = s { if *var == x { Some(value) } else { None } } else { None }).collect();
+    let ups: Vec<&Opnd> = f.stmts().iter().filter_map(|s| if let Stmt::SetVar { var, value } = s { if *var == x { Some(value) } else { None } } else { None }).collect();
     if ups.len() != 1 {
         return None;
     }
     // only a genuine selection counter: the plain `+ const` / `^ const` steps are handled (and bounded) by the affine analysis
     if let Opnd::Val(u) = ups[0] {
-        if let Some(Op::AddI32(..) | Op::XorI32(..)) = f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == u { Some(op) } else { None } } else { None }) {
+        if let Some(Op::AddI32(..) | Op::XorI32(..)) = f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == u { Some(op) } else { None } } else { None }) {
             return None;
         }
     }
@@ -726,7 +726,7 @@ fn fs_cone(f: &Function, o: &Opnd) -> bool {
         Opnd::I32(_) => true,
         Opnd::F32(_) => false,
         Opnd::Var(x) => finite_state_period(f, *x).is_some(),
-        Opnd::Val(v) => match f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) {
+        Opnd::Val(v) => match f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) {
             Some(Op::ConstI32(_)) => true,
             Some(op @ (Op::AddI32(..) | Op::XorI32(..) | Op::AndI32(..) | Op::MulI32(..) | Op::ShlI32(..) | Op::LshrI32(..) | Op::CmpLtI32(..) | Op::CmpGeI32(..) | Op::NotI1(..) | Op::Select { .. })) => op.operands().iter().all(|u| fs_cone(f, u)),
             _ => false,
@@ -741,7 +741,7 @@ fn fs_eval(f: &Function, o: &Opnd, x: VarId, xv: i64) -> Option<i64> {
         Opnd::I32(c) => Some(*c as i64),
         Opnd::Var(y) if *y == x => Some(xv),
         Opnd::Val(v) => {
-            let op = f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None })?;
+            let op = f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None })?;
             let e = |u: &Opnd| fs_eval(f, u, x, xv);
             Some(match op {
                 Op::ConstI32(c) => *c as i64,
@@ -774,12 +774,12 @@ fn period_bits(f: &Function) -> (u32, u32) {
     fn konst(f: &Function, o: &Opnd) -> Option<i64> {
         match o {
             Opnd::I32(c) => Some(*c as i64),
-            Opnd::Val(v) => f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op: Op::ConstI32(c) } = s { if dst == v { Some(*c as i64) } else { None } } else { None }),
+            Opnd::Val(v) => f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op: Op::ConstI32(c) } = s { if dst == v { Some(*c as i64) } else { None } } else { None }),
             _ => None,
         }
     }
     fn def<'a>(f: &'a Function, v: ValueId) -> Option<&'a Op> {
-        f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if *dst == v { Some(op) } else { None } } else { None })
+        f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if *dst == v { Some(op) } else { None } } else { None })
     }
     struct Acc {
         mask_bits: u32,
@@ -839,7 +839,7 @@ fn period_bits(f: &Function) -> (u32, u32) {
                 if !a.seen.insert((true, x.0)) {
                     return;
                 }
-                for s in &f.stmts {
+                for s in f.stmts() {
                     if let Stmt::SetVar { var, value: Opnd::Val(u) } = s {
                         if var == x {
                             if let Some(Op::XorI32(..)) = def(f, *u) {
@@ -854,7 +854,7 @@ fn period_bits(f: &Function) -> (u32, u32) {
     }
     // each marker operand is its own cone: the bounds are maxima over cones, not sums over unrelated nodes
     let (mut m_best, mut mul_best, mut xor_any) = (0u32, 0u32, false);
-    for s in &f.stmts {
+    for s in f.stmts() {
         if let Stmt::TileProduce { tile, slot, version } | Stmt::TileConsume { tile, slot, version } = s {
             if region_skipped(f, tile) {
                 continue;
@@ -911,7 +911,7 @@ fn enumerate_traces(f: &Function, role: usize, n: usize, div: &HashSet<usize>, d
             break;
         }
         let mut sim = Sim { f, role, n, div, vals: HashMap::new(), vars: HashMap::new(), items: Vec::new(), evs: Vec::new(), ord: 0, open: None, diags, untagged, steps: 0, break_taken: false, decisions: prefix.clone(), dpos: 0, taken: Vec::new(), loop_depth: 0, in_role: false, unsupported: &mut unsupported };
-        sim.exec(0, f.stmts.len());
+        sim.exec(0, f.stmts().len());
         if sim.steps > 2_000_000 {
             sim.diags.push(("GV-TILE-UNSUPPORTED", Severity::Error, 0, "the tile simulation exceeded its step budget (2M statements): it is incomplete, so the protocol is NOT certified".to_string()));
         }
@@ -1184,7 +1184,7 @@ fn ptr_arg(f: &Function, o: &Opnd, depth: usize) -> Option<String> {
         return None;
     }
     let Opnd::Val(v) = o else { return None };
-    let op = f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None })?;
+    let op = f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None })?;
     match op {
         Op::KernargPtr { offset } => f.args.iter().find(|a| a.kernarg_offset == *offset).map(|a| a.name.clone()),
         Op::PtrAdd { base, .. } => ptr_arg(f, base, depth + 1),
@@ -1198,7 +1198,7 @@ fn cone_has(f: &Function, o: &Opnd, pred: &dyn Fn(&Op) -> bool, seen: &mut HashS
             if !seen.insert(*v) {
                 return false;
             }
-            let Some(op) = f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) else { return false };
+            let Some(op) = f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) else { return false };
             pred(op) || op.operands().iter().any(|x| cone_has(f, x, pred, seen))
         }
         Opnd::Var(x) => {
@@ -1206,7 +1206,7 @@ fn cone_has(f: &Function, o: &Opnd, pred: &dyn Fn(&Op) -> bool, seen: &mut HashS
             if !seen.insert(1_000_000 + x.0) {
                 return false;
             }
-            f.stmts.iter().any(|s| match s {
+            f.stmts().iter().any(|s| match s {
                 Stmt::SetVar { var, value } if var == x => cone_has(f, value, pred, seen),
                 Stmt::BeginLoop { vars, init } => vars.iter().position(|y| y == x).map_or(false, |k| cone_has(f, &init[k], pred, seen)),
                 _ => false,
@@ -1235,7 +1235,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
         let mut cons: Vec<(usize, bool, Vec<usize>, usize)> = Vec::new(); // (stmt, coherent, enclosing ifs, loop depth)
         let mut ifs: Vec<usize> = Vec::new();
         let mut depth = 0usize;
-        for (i, s) in f.stmts.iter().enumerate() {
+        for (i, s) in f.stmts().iter().enumerate() {
             match s {
                 Stmt::TileProduce { tile, .. } if tile == region => {
                     open = Some((true, i));
@@ -1277,7 +1277,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
             continue;
         };
         // ticket: the atomic on the counter after the stores
-        let ticket = f.stmts.iter().enumerate().skip(last_store + 1).find_map(|(i, s)| match s {
+        let ticket = f.stmts().iter().enumerate().skip(last_store + 1).find_map(|(i, s)| match s {
             Stmt::Let { dst, op: Op::AtomicAddU32 { base, .. } } if ptr_arg(f, base, 0).as_deref() == Some(la.counter_arg.as_str()) => Some((i, *dst)),
             _ => None,
         });
@@ -1286,7 +1286,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
             continue;
         };
         // O1: complete + release before the ticket
-        let rel = f.stmts.iter().enumerate().skip(last_store + 1).take(ticket_idx - last_store - 1).find_map(|(i, s)| if let Stmt::FenceRelease { wb } = s { Some((i, *wb)) } else { None });
+        let rel = f.stmts().iter().enumerate().skip(last_store + 1).take(ticket_idx - last_store - 1).find_map(|(i, s)| if let Stmt::FenceRelease { wb } = s { Some((i, *wb)) } else { None });
         match rel {
             None => fail(rep, "GV-PROTO-NO-COMPLETION", format!("O1: no fence_release between the last produced store (stmt {last_store}) and the ticket (stmt {ticket_idx}): the ticket can be taken before the data is complete / visible, so the last arriver may read stale or missing slices")),
             Some((ri, false)) if prod.iter().any(|(_, wt)| !*wt) => fail(rep, "GV-PROTO-NOT-VISIBLE", format!("O1: the release at stmt {ri} is the lite variant (no L2 write-back) but some produced stores are plain, not write-through (store_*_wt): their lines may stay in the producer's L2")),
@@ -1297,12 +1297,12 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
             fail(rep, "GV-PROTO-UNPUBLISHED", "no global load is marked buf_consume".to_string());
             continue;
         }
-        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = &f.stmts[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. }), &mut HashSet::new()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
+        let guarded = |ifs: &Vec<usize>| ifs.iter().any(|&bi| if let Stmt::BeginIf { cond } = f.stmts()[bi] { cone_has(f, cond, &|op| matches!(op, Op::AtomicAddU32 { .. }), &mut HashSet::new()) || matches!(cond, Opnd::Val(v) if *v == ticket_val) || cone_has_val(f, cond, ticket_val) } else { false });
         if let Some((i, ..)) = cons.iter().find(|(_, _, ifs, _)| !guarded(ifs)) {
             fail(rep, "GV-PROTO-ARRIVAL-MISMATCH", format!("the read at stmt {i} is not inside the branch guarded by the ticket result (stmt {ticket_idx}): a block that is not the last arriver may read slices other blocks have not written yet"));
         }
         let first_read = cons.iter().map(|c| c.0).min().unwrap();
-        let acq = f.stmts.iter().enumerate().skip(ticket_idx + 1).take(first_read - ticket_idx - 1).find_map(|(i, s)| if let Stmt::FenceAcquire { inv } = s { Some((i, *inv)) } else { None });
+        let acq = f.stmts().iter().enumerate().skip(ticket_idx + 1).take(first_read - ticket_idx - 1).find_map(|(i, s)| if let Stmt::FenceAcquire { inv } = s { Some((i, *inv)) } else { None });
         match acq {
             None => fail(rep, "GV-PROTO-NOT-VISIBLE", format!("O2: the first read (stmt {first_read}) runs before any fence_acquire after the ticket (stmt {ticket_idx}) - no acquire: the last arriver may hit stale cache lines")),
             Some((ai, false)) if cons.iter().any(|c| !c.1) => fail(rep, "GV-PROTO-NOT-VISIBLE", format!("O2: the acquire at stmt {ai} is the lite variant (no invalidate) but some reads are not coherent (sc1) loads")),
@@ -1310,7 +1310,7 @@ pub(crate) fn verify_last_arrivers(f: &Function, rep: &mut Report) {
         }
         // O4: the produced generation is the block's split id
         if let Some(mi) = prod_marker {
-            if let Stmt::TileProduce { version, .. } = &f.stmts[mi] {
+            if let Stmt::TileProduce { version, .. } = f.stmts()[mi] {
                 let from_block = cone_has(f, version, &|op| matches!(op, Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ), &mut HashSet::new());
                 if !from_block {
                     fail(rep, "GV-PROTO-STALE-GEN", format!("O4: the generation of the produce marker (stmt {mi}) is not derived from the workgroup id: the blocks do not agree on which slice (split) each of them owns"));
@@ -1335,7 +1335,7 @@ fn cone_has_val(f: &Function, o: &Opnd, target: u32) -> bool {
         if !seen.insert(*v) {
             return false;
         }
-        let Some(op) = f.stmts.iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) else { return false };
+        let Some(op) = f.stmts().iter().find_map(|s| if let Stmt::Let { dst, op } = s { if dst == v { Some(op) } else { None } } else { None }) else { return false };
         op.operands().iter().any(|x| go(f, x, target, seen))
     }
     go(f, o, target, &mut HashSet::new())

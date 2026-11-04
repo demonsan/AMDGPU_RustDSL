@@ -68,13 +68,15 @@ fn a_lying_tensor_allocation_is_rejected() {
 fn a_wrong_auto_generated_generation_is_rejected() {
     let mut f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_dsl_vs128").unwrap();
     let mut changed = 0;
-    for s in f.stmts.iter_mut() {
+    let mut flat = f.stmts().to_vec();
+    for s in flat.iter_mut() {
         if let Stmt::TileConsume { version, .. } = s {
             *version = Opnd::I32(1);
             changed += 1;
         }
     }
     assert!(changed > 0, "no auto-generated consume markers found");
+    f.set_stmts(flat);
     let r = verify_ir(&f);
     println!("wrong auto generation: changed={changed}, errors={}, findings={}", r.errors().len(), r.findings.len());
     assert!(has(&r, "GV-TILE-STALE") || has(&r, "GV-PROTO-STALE-GEN"), "wrong generation not rejected: {}", r.render());

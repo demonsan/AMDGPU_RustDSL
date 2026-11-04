@@ -598,7 +598,7 @@ impl FnBuilder {
     /// Number of statements emitted so far (lets tests count what a `bind` lowered to).
     #[doc(hidden)]
     pub fn stmt_count(&self) -> usize {
-        self.f.stmts.len()
+        self.tree_count()
     }
     /// Materialises these i32 constants NOW, in this order, and lets every later expression reuse them (the manual style declares its constants up front; this keeps the
     /// emitted instruction order - and so the register allocation - identical to such a kernel). Without it a literal is materialised at its first use and then reused.

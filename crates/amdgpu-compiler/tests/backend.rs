@@ -92,7 +92,7 @@ fn loop_variables_survive_verification() {
     let errors = verify(&f);
     assert!(errors.is_empty(), "attention IR failed verification: {errors:?}");
     // Sanity: the kernel really does carry loop state.
-    let has_loop = f.stmts.iter().any(|s| matches!(s, amdgpu_dsl::Stmt::BeginLoop { .. }));
+    let has_loop = f.stmts().iter().any(|s| matches!(s, amdgpu_dsl::Stmt::BeginLoop { .. }));
     assert!(has_loop);
     let _ = Op::ConstI32(0);
 }

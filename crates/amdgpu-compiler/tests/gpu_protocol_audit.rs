@@ -255,8 +255,10 @@ fn probe(name: &str) -> Function {
 }
 fn without(f: &Function, pred: &dyn Fn(&Stmt) -> bool) -> Function {
     let mut g = f.clone();
-    let i = g.stmts.iter().position(pred).expect("statement to remove");
-    g.stmts.remove(i);
+    let i = g.stmts().iter().position(pred).expect("statement to remove");
+    g.edit_stmts(|v| {
+        v.remove(i);
+    });
     g
 }
 
@@ -289,13 +291,15 @@ fn fused_last_arriver_missing_ticket_is_arrival_mismatch() {
 fn fused_last_arriver_lite_with_plain_loads_is_not_visible() {
     let f = probe("probe_last_arriver_lite");
     let mut g = f.clone();
-    for s in g.stmts.iter_mut() {
+    let mut flat = g.stmts().to_vec();
+    for s in flat.iter_mut() {
         if let Stmt::Let { op, .. } = s {
             if let Op::LoadF32Coherent { base, byte_off } = op.clone() {
                 *op = Op::LoadF32 { base, byte_off };
             }
         }
     }
+    g.set_stmts(flat);
     let r = verify_ir(&g);
     println!("fused lite plain loads: {}", r.render());
     assert!(has_alias(&r, "GV-PROTO-NOT-VISIBLE"), "{}", errors(&r));

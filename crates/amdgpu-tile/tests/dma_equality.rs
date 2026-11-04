@@ -56,7 +56,7 @@ fn eval(defs: &HashMap<u32, Op>, o: &Opnd, tid: i64, memo: &mut HashMap<u32, i64
 fn dmas(f: &Function) -> Vec<Vec<(i64, i32, i64)>> {
     let mut defs: HashMap<u32, Op> = HashMap::new();
     let mut d: Vec<(Opnd, i32, Opnd)> = Vec::new();
-    for s in &f.stmts {
+    for s in f.stmts() {
         match s {
             Stmt::Let { dst, op } => {
                 defs.insert(*dst, op.clone());

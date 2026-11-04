@@ -65,7 +65,7 @@ fn buffer_dma_partition_matches_the_layouts() {
 
     let mut defs = HashMap::new();
     let mut dmas = Vec::new();
-    for s in &f.stmts {
+    for s in f.stmts() {
         match s {
             Stmt::Let { dst, op } => {
                 defs.insert(*dst, op.clone());

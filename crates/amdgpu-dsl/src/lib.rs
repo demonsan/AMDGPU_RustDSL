@@ -688,6 +688,152 @@ pub struct AgprMark {
     pub pin: Option<u32>,
 }
 
+/// A node of the structured kernel body (region IR): straight-line statements and nested regions. Loops, ifs and tile / buffer
+/// protocol regions are trees, so a begin without its end (or an end without its begin) cannot be represented.
+#[derive(Clone, Debug)]
+pub enum Node {
+    /// a straight-line statement (never a structure marker)
+    S(Stmt),
+    /// `begin_loop(vars = init) ... end_loop` (do-while; `Stmt::BreakIf` inside the body leaves it)
+    Loop { vars: Vec<VarId>, init: Vec<Opnd>, body: Vec<Node> },
+    /// wave-level `if cond { then } else { els }` (`els = None`: no else branch)
+    If { cond: Opnd, then: Vec<Node>, els: Option<Vec<Node>> },
+    /// tile / buffer protocol region: `tile_produce` / `tile_consume` (and `buf_produce` / `buf_consume`) ... `tile_end`
+    Region { kind: RegionKind, tile: String, slot: Opnd, version: Opnd, body: Vec<Node> },
+}
+
+/// Kind of a protocol region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionKind {
+    Produce,
+    Consume,
+}
+
+fn flatten_into(nodes: &[Node], out: &mut Vec<Stmt>) {
+    for n in nodes {
+        match n {
+            Node::S(s) => out.push(s.clone()),
+            Node::Loop { vars, init, body } => {
+                out.push(Stmt::BeginLoop { vars: vars.clone(), init: init.clone() });
+                flatten_into(body, out);
+                out.push(Stmt::EndLoop);
+            }
+            Node::If { cond, then, els } => {
+                out.push(Stmt::BeginIf { cond: *cond });
+                flatten_into(then, out);
+                if let Some(e) = els {
+                    out.push(Stmt::Else);
+                    flatten_into(e, out);
+                }
+                out.push(Stmt::EndIf);
+            }
+            Node::Region { kind, tile, slot, version, body } => {
+                out.push(match kind {
+                    RegionKind::Produce => Stmt::TileProduce { tile: tile.clone(), slot: *slot, version: *version },
+                    RegionKind::Consume => Stmt::TileConsume { tile: tile.clone(), slot: *slot, version: *version },
+                });
+                flatten_into(body, out);
+                out.push(Stmt::TileEnd);
+            }
+        }
+    }
+}
+
+/// Builder / parser frame of an open region.
+#[derive(Clone, Debug)]
+enum Frame {
+    Loop { vars: Vec<VarId>, init: Vec<Opnd>, body: Vec<Node> },
+    If { cond: Opnd, then: Vec<Node>, els: Option<Vec<Node>> },
+    Region { kind: RegionKind, tile: String, slot: Opnd, version: Opnd, body: Vec<Node> },
+}
+
+impl Frame {
+    fn name(&self) -> &'static str {
+        match self {
+            Frame::Loop { .. } => "loop",
+            Frame::If { .. } => "if",
+            Frame::Region { .. } => "tile region",
+        }
+    }
+    fn nodes(&mut self) -> &mut Vec<Node> {
+        match self {
+            Frame::Loop { body, .. } | Frame::Region { body, .. } => body,
+            Frame::If { then, els, .. } => els.as_mut().unwrap_or(then),
+        }
+    }
+    fn close(self) -> Node {
+        match self {
+            Frame::Loop { vars, init, body } => Node::Loop { vars, init, body },
+            Frame::If { cond, then, els } => Node::If { cond, then, els },
+            Frame::Region { kind, tile, slot, version, body } => Node::Region { kind, tile, slot, version, body },
+        }
+    }
+}
+
+/// Region-tree construction shared by the builder and `Function::parse_flat`.
+#[derive(Clone, Debug, Default)]
+struct TreeBuilder {
+    root: Vec<Node>,
+    open: Vec<Frame>,
+    /// statements of the flat view emitted so far (markers included)
+    count: usize,
+}
+
+impl TreeBuilder {
+    fn cur(&mut self) -> &mut Vec<Node> {
+        match self.open.last_mut() {
+            Some(f) => f.nodes(),
+            None => &mut self.root,
+        }
+    }
+    /// Appends one flat statement: a marker opens / switches / closes a region, anything else is a leaf.
+    fn push(&mut self, st: Stmt) -> Result<(), String> {
+        self.count += 1;
+        match st {
+            Stmt::BeginLoop { vars, init } => self.open.push(Frame::Loop { vars, init, body: Vec::new() }),
+            Stmt::BeginIf { cond } => self.open.push(Frame::If { cond, then: Vec::new(), els: None }),
+            Stmt::TileProduce { tile, slot, version } => {
+                if self.open.iter().any(|f| matches!(f, Frame::Region { .. })) {
+                    return Err(format!("tile_produce({tile}) inside an open tile region (close it with tile_end first)"));
+                }
+                self.open.push(Frame::Region { kind: RegionKind::Produce, tile, slot, version, body: Vec::new() })
+            }
+            Stmt::TileConsume { tile, slot, version } => {
+                if self.open.iter().any(|f| matches!(f, Frame::Region { .. })) {
+                    return Err(format!("tile_consume({tile}) inside an open tile region (close it with tile_end first)"));
+                }
+                self.open.push(Frame::Region { kind: RegionKind::Consume, tile, slot, version, body: Vec::new() })
+            }
+            Stmt::Else => match self.open.last_mut() {
+                Some(Frame::If { els, .. }) if els.is_none() => *els = Some(Vec::new()),
+                Some(Frame::If { .. }) => return Err("second else in one if".into()),
+                other => return Err(format!("else without an open if (innermost open region: {})", other.map_or("none", |f| f.name()))),
+            },
+            Stmt::EndLoop => self.close(|f| matches!(f, Frame::Loop { .. }), "end_loop")?,
+            Stmt::EndIf => self.close(|f| matches!(f, Frame::If { .. }), "end_if")?,
+            Stmt::TileEnd => self.close(|f| matches!(f, Frame::Region { .. }), "tile_end")?,
+            other => self.cur().push(Node::S(other)),
+        }
+        Ok(())
+    }
+    fn close(&mut self, is: impl Fn(&Frame) -> bool, what: &str) -> Result<(), String> {
+        match self.open.last() {
+            Some(f) if is(f) => {
+                let n = self.open.pop().unwrap().close();
+                self.cur().push(n);
+                Ok(())
+            }
+            other => Err(format!("{what} without its opening statement (innermost open region: {})", other.map_or("none", |f| f.name()))),
+        }
+    }
+    fn finish(self) -> Result<Vec<Node>, String> {
+        if let Some(f) = self.open.last() {
+            return Err(format!("{} open regions at the end of the kernel (innermost: {})", self.open.len(), f.name()));
+        }
+        Ok(self.root)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
@@ -697,7 +843,10 @@ pub struct Function {
     /// Bytes of workgroup LDS this kernel declares.
     pub lds_bytes: u32,
     pub contract: Contract,
-    pub stmts: Vec<Stmt>,
+    /// the structured body (region IR, canonical)
+    body: Vec<Node>,
+    /// its linearization with structure markers (derived from `body`; what the passes iterate)
+    flat: Vec<Stmt>,
     pub var_tys: Vec<DType>,
     pub value_tys: Vec<DType>,
     /// Opt-out of the loop-variable re-read lint (see [`lint`]).
@@ -732,6 +881,42 @@ pub enum CompileProfile {
 }
 
 impl Function {
+    /// The structured body (region IR).
+    pub fn body(&self) -> &[Node] {
+        &self.body
+    }
+    /// The body linearized with structure markers (`BeginLoop .. EndLoop`, `BeginIf .. Else .. EndIf`, `TileProduce/TileConsume .. TileEnd`); always
+    /// balanced because it is derived from the tree.
+    pub fn stmts(&self) -> &[Stmt] {
+        &self.flat
+    }
+    /// Replaces the body.
+    pub fn set_body(&mut self, body: Vec<Node>) {
+        let mut flat = Vec::new();
+        flatten_into(&body, &mut flat);
+        self.body = body;
+        self.flat = flat;
+    }
+    /// Builds the region tree of a flat statement sequence (fails on an unbalanced sequence).
+    pub fn parse_flat(stmts: Vec<Stmt>) -> Result<Vec<Node>, String> {
+        let mut tb = TreeBuilder::default();
+        for (i, s) in stmts.into_iter().enumerate() {
+            tb.push(s).map_err(|e| format!("stmt {i}: {e}"))?;
+        }
+        tb.finish()
+    }
+    /// Replaces the body by the tree of a flat statement sequence; panics if it is unbalanced.
+    pub fn set_stmts(&mut self, stmts: Vec<Stmt>) {
+        let body = Function::parse_flat(stmts).unwrap_or_else(|e| panic!("set_stmts: {e}"));
+        self.set_body(body);
+    }
+    /// Edits the linearized body (tests: fault injection) and rebuilds the tree; panics if the edit unbalances it.
+    pub fn edit_stmts(&mut self, edit: impl FnOnce(&mut Vec<Stmt>)) {
+        let mut flat = self.flat.clone();
+        edit(&mut flat);
+        let body = Function::parse_flat(flat).unwrap_or_else(|e| panic!("edit_stmts: {e}"));
+        self.set_body(body);
+    }
     pub fn value_ty(&self, v: ValueId) -> Option<DType> {
         self.value_tys.get(v as usize).copied()
     }
@@ -748,7 +933,7 @@ impl Function {
             let _ = writeln!(s, "  arg {} : {} @ {} (+{})", a.name, a.ty.name(), a.kernarg_offset, a.size);
         }
         let mut depth = 0usize;
-        for st in &self.stmts {
+        for st in self.stmts() {
             match st {
                 Stmt::EndLoop | Stmt::EndIf | Stmt::Else => depth = depth.saturating_sub(1),
                 _ => {}
@@ -909,6 +1094,8 @@ impl Function {
 /// Builder that allocates ids and keeps the statement stream balanced.
 pub struct FnBuilder {
     pub f: Function,
+    /// the region tree under construction (open loops / ifs / tile regions)
+    tree: TreeBuilder,
     /// constants materialised by the expression layer (`expr.rs`), keyed by (is_float, bits): reused by later `bind`s in the same or an inner scope, cleared when a scope closes
     pub(crate) expr_consts: std::collections::HashMap<(bool, u32), ValueId>,
 }
@@ -923,7 +1110,8 @@ impl FnBuilder {
                 workgroup_size,
                 lds_bytes: 0,
                 contract: Contract::default(),
-                stmts: Vec::new(),
+                body: Vec::new(),
+                flat: Vec::new(),
                 var_tys: Vec::new(),
                 value_tys: Vec::new(),
                 allow_var_rereads: false,
@@ -933,6 +1121,7 @@ impl FnBuilder {
             sched_opts: None,
             },
             expr_consts: Default::default(),
+            tree: TreeBuilder::default(),
         }
     }
 
@@ -1021,11 +1210,11 @@ impl FnBuilder {
     }
     /// The global writes issued from here (until `tile_end` / the next marker / barrier / control boundary) produce generation `gen` of the region.
     pub fn buf_produce(&mut self, name: &str, generation: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::TileProduce { tile: name.to_string(), slot: Opnd::I32(0), version: generation.into() });
+        self.push_stmt(Stmt::TileProduce { tile: name.to_string(), slot: Opnd::I32(0), version: generation.into() });
     }
     /// The global reads issued from here expect generation `gen` of the region.
     pub fn buf_consume(&mut self, name: &str, generation: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::TileConsume { tile: name.to_string(), slot: Opnd::I32(0), version: generation.into() });
+        self.push_stmt(Stmt::TileConsume { tile: name.to_string(), slot: Opnd::I32(0), version: generation.into() });
     }
     /// Declares the fused-combine (last-arriver) pattern over `region`: the stores marked `buf_produce` (generation = the block's split id, derived from the workgroup id)
     /// must be followed by `fence_release`, then an atomic ticket on the pointer kernarg `counter_arg`; the reads marked `buf_consume` must sit in the branch guarded by the
@@ -1039,23 +1228,23 @@ impl FnBuilder {
     }
     /// See `Stmt::TileProduce`.
     pub fn tile_produce(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::TileProduce { tile: tile.to_string(), slot: slot.into(), version: version.into() });
+        self.push_stmt(Stmt::TileProduce { tile: tile.to_string(), slot: slot.into(), version: version.into() });
     }
     /// See `Stmt::TileConsume`.
     pub fn tile_consume(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::TileConsume { tile: tile.to_string(), slot: slot.into(), version: version.into() });
+        self.push_stmt(Stmt::TileConsume { tile: tile.to_string(), slot: slot.into(), version: version.into() });
     }
     pub fn tile_end(&mut self) {
-        self.f.stmts.push(Stmt::TileEnd);
+        self.push_stmt(Stmt::TileEnd);
     }
     /// Contract fact `lo <= target <= hi` from this point on (see `Stmt::Assume`). Emits no code.
     pub fn assume(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext) {
-        self.f.stmts.push(Stmt::Assume { target: target.into(), lo, hi, trusted: None });
+        self.push_stmt(Stmt::Assume { target: target.into(), lo, hi, trusted: None });
     }
     /// Like `assume`, but for a loop variable whose range holds by a guard the analyzer cannot see (e.g. a counter bounded by the loop exit test): the induction
     /// check failing is NOT an error, the assumption is listed as TRUSTED with `reason`.
     pub fn assume_trusted(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext, reason: &str) {
-        self.f.stmts.push(Stmt::Assume { target: target.into(), lo, hi, trusted: Some(reason.to_string()) });
+        self.push_stmt(Stmt::Assume { target: target.into(), lo, hi, trusted: Some(reason.to_string()) });
     }
 
     pub fn arg(&mut self, name: &str, ty: DType, offset: u32, size: u32) {
@@ -1072,16 +1261,16 @@ impl FnBuilder {
         let ty = op.result_ty();
         let dst = self.f.value_tys.len() as ValueId;
         self.f.value_tys.push(ty);
-        self.f.stmts.push(Stmt::Let { dst, op });
+        self.push_stmt(Stmt::Let { dst, op });
         dst
     }
 
     pub fn store_u16(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::StoreU16 { base: base.into(), byte_off, value: value.into() });
+        self.push_stmt(Stmt::StoreU16 { base: base.into(), byte_off, value: value.into() });
     }
 
     pub fn store_f32(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::StoreF32 { base: base.into(), byte_off, value: value.into() });
+        self.push_stmt(Stmt::StoreF32 { base: base.into(), byte_off, value: value.into() });
     }
 
     // ---- MUBUF (buffer_load/buffer_store): SGPR resource descriptor + per-lane 32-bit byte offset + SGPR soffset + 12-bit immediate ----
@@ -1107,17 +1296,17 @@ impl FnBuilder {
         self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: None, soff: soff.into(), imm, dwords: 4 })
     }
     pub fn buffer_store_f32(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 1, value: value.into() });
+        self.push_stmt(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 1, value: value.into() });
     }
     pub fn buffer_store_b64(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 2, value: value.into() });
+        self.push_stmt(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 2, value: value.into() });
     }
     pub fn buffer_store_b128(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 4, value: value.into() });
+        self.push_stmt(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 4, value: value.into() });
     }
     /// MUBUF -> LDS DMA of 16 bytes per lane (`buffer_load_dwordx4 ... lds`): LDS destination = M0 (`lds_addr`) + imm + 16 * lane.
     pub fn buffer_load_lds_b128(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, lds_addr: impl Into<Opnd>, imm: u32) {
-        self.f.stmts.push(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords: 4 });
+        self.push_stmt(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords: 4 });
     }
     /// Descriptor with a RUNTIME byte range: `num_records` is a wave-uniform integer (kernarg value, scalar arithmetic or loop variable). Rebuild it where the
     /// value changes (the descriptor is an ordinary SGPR-quad value). Reads at offset >= num_records return 0, writes are dropped.
@@ -1130,23 +1319,23 @@ impl FnBuilder {
     }
     /// `buffer_load_dword[x4] ... lds` with the LDS slot base `lds_addr` (M0) and `dwords` = 1 or 4.
     pub fn load_buffer_lds(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, lds_addr: impl Into<Opnd>, imm: u32, dwords: u8) {
-        self.f.stmts.push(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords });
+        self.push_stmt(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords });
     }
     /// 4 bytes per lane (`buffer_load_dword ... lds`).
     pub fn buffer_load_lds_b32(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, lds_addr: impl Into<Opnd>, imm: u32) {
-        self.f.stmts.push(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords: 1 });
+        self.push_stmt(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords: 1 });
     }
 
     pub fn store_f32x2(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::StoreF32x2 { base: base.into(), byte_off, value: value.into() });
+        self.push_stmt(Stmt::StoreF32x2 { base: base.into(), byte_off, value: value.into() });
     }
 
     pub fn store_f32x4(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::StoreF32x4 { base: base.into(), byte_off, value: value.into() });
+        self.push_stmt(Stmt::StoreF32x4 { base: base.into(), byte_off, value: value.into() });
     }
 
     pub fn set_var(&mut self, var: VarId, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::SetVar { var, value: value.into() });
+        self.push_stmt(Stmt::SetVar { var, value: value.into() });
     }
 
     /// Declares `vars` initialised from `init`, then opens the loop body.
@@ -1159,31 +1348,31 @@ impl FnBuilder {
             vars.push(id);
             init.push(*val);
         }
-        self.f.stmts.push(Stmt::BeginLoop { vars: vars.clone(), init });
+        self.push_stmt(Stmt::BeginLoop { vars: vars.clone(), init });
         vars
     }
 
     pub fn break_if(&mut self, cond: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::BreakIf { cond: cond.into() });
+        self.push_stmt(Stmt::BreakIf { cond: cond.into() });
     }
 
     pub fn end_loop(&mut self) {
         self.expr_consts.clear();
-        self.f.stmts.push(Stmt::EndLoop);
+        self.push_stmt(Stmt::EndLoop);
     }
 
     pub fn begin_if(&mut self, cond: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::BeginIf { cond: cond.into() });
+        self.push_stmt(Stmt::BeginIf { cond: cond.into() });
     }
 
     pub fn else_(&mut self) {
         self.expr_consts.clear();
-        self.f.stmts.push(Stmt::Else);
+        self.push_stmt(Stmt::Else);
     }
 
     pub fn end_if(&mut self) {
         self.expr_consts.clear();
-        self.f.stmts.push(Stmt::EndIf);
+        self.push_stmt(Stmt::EndIf);
     }
 
     /// Keep the loop variable `var` in the AGPR file (any placement). MFMAs that accumulate into it use the `acc_cd` form; VALU access is
@@ -1208,8 +1397,60 @@ impl FnBuilder {
         self.f.agpr.push(AgprMark { target: AgprTarget::Val(v), pin: Some(base) });
         v
     }
-    pub fn finish(self) -> Function {
+    pub fn finish(mut self) -> Function {
+        let tree = std::mem::take(&mut self.tree);
+        let body = tree.finish().unwrap_or_else(|e| panic!("kernel `{}`: {e}", self.f.name));
+        self.f.set_body(body);
         self.f
+    }
+
+    /// Statements of the flat view emitted so far (markers included).
+    pub(crate) fn tree_count(&self) -> usize {
+        self.tree.count
+    }
+
+    /// Appends a statement to the innermost open region (markers open / close regions); an unbalanced end panics here, at build time.
+    fn push_stmt(&mut self, st: Stmt) {
+        if let Err(e) = self.tree.push(st) {
+            panic!("kernel `{}`: {e}", self.f.name);
+        }
+    }
+
+    /// Closure form of `begin_loop` / `end_loop`: `body` receives the loop variables.
+    pub fn loop_<R>(&mut self, inits: &[(DType, Opnd)], body: impl FnOnce(&mut Self, &[VarId]) -> R) -> R {
+        let vars = self.begin_loop(inits);
+        let r = body(self, &vars);
+        self.end_loop();
+        r
+    }
+    /// Closure form of `begin_if` / `end_if`.
+    pub fn if_<R>(&mut self, cond: impl Into<Opnd>, then: impl FnOnce(&mut Self) -> R) -> R {
+        self.begin_if(cond);
+        let r = then(self);
+        self.end_if();
+        r
+    }
+    /// Closure form of `begin_if` / `else_` / `end_if`.
+    pub fn if_else(&mut self, cond: impl Into<Opnd>, then: impl FnOnce(&mut Self), els: impl FnOnce(&mut Self)) {
+        self.begin_if(cond);
+        then(self);
+        self.else_();
+        els(self);
+        self.end_if();
+    }
+    /// Closure form of `tile_produce` / `tile_end`.
+    pub fn produce_region<R>(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>, body: impl FnOnce(&mut Self) -> R) -> R {
+        self.tile_produce(tile, slot, version);
+        let r = body(self);
+        self.tile_end();
+        r
+    }
+    /// Closure form of `tile_consume` / `tile_end`.
+    pub fn consume_region<R>(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>, body: impl FnOnce(&mut Self) -> R) -> R {
+        self.tile_consume(tile, slot, version);
+        let r = body(self);
+        self.tile_end();
+        r
     }
 
     // ---- convenience constructors -------------------------------------
@@ -1315,30 +1556,30 @@ impl FnBuilder {
     }
 
     pub fn store_f32_wt(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::StoreF32Wt { base: base.into(), byte_off, value: value.into() });
+        self.push_stmt(Stmt::StoreF32Wt { base: base.into(), byte_off, value: value.into() });
     }
 
     pub fn store_f32x4_wt(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::StoreF32x4Wt { base: base.into(), byte_off, value: value.into() });
+        self.push_stmt(Stmt::StoreF32x4Wt { base: base.into(), byte_off, value: value.into() });
     }
 
     /// Device-scope release: wait for all earlier loads/stores, write back L2 (`buffer_wbl2 sc1`), wait again.
     pub fn fence_release(&mut self) {
-        self.f.stmts.push(Stmt::FenceRelease { wb: true });
+        self.push_stmt(Stmt::FenceRelease { wb: true });
     }
 
     /// Release without the L2 write-back (valid when every shared store used `store_*_wt`).
     pub fn fence_release_lite(&mut self) {
-        self.f.stmts.push(Stmt::FenceRelease { wb: false });
+        self.push_stmt(Stmt::FenceRelease { wb: false });
     }
 
     /// Device-scope acquire: wait for the ticket, invalidate (`buffer_inv sc1`).
     pub fn fence_acquire(&mut self) {
-        self.f.stmts.push(Stmt::FenceAcquire { inv: true });
+        self.push_stmt(Stmt::FenceAcquire { inv: true });
     }
 
     pub fn fence_acquire_lite(&mut self) {
-        self.f.stmts.push(Stmt::FenceAcquire { inv: false });
+        self.push_stmt(Stmt::FenceAcquire { inv: false });
     }
 
     pub fn load_f32(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
@@ -1538,7 +1779,7 @@ impl FnBuilder {
 
     /// One dword write into workgroup LDS.
     pub fn store_lds_b32(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::StoreLdsB32 { addr: addr.into(), value: value.into() });
+        self.push_stmt(Stmt::StoreLdsB32 { addr: addr.into(), value: value.into() });
     }
 
     /// Four dwords (16 B) read from workgroup LDS.
@@ -1588,7 +1829,7 @@ impl FnBuilder {
     /// Load 16 bytes from global memory directly into a `Frag4` loop variable (the load stays in
     /// flight across the code that follows; the loop back edge waits for it).
     pub fn var_load_b128(&mut self, var: VarId, base: impl Into<Opnd>, byte_off: u32) {
-        self.f.stmts.push(Stmt::VarLoadB128 { var, base: base.into(), byte_off });
+        self.push_stmt(Stmt::VarLoadB128 { var, base: base.into(), byte_off });
     }
 
     /// `var *= scalar` on every dword of a `Frag16` loop variable.
@@ -1611,7 +1852,7 @@ impl FnBuilder {
         self.let_(Op::CvtPkFp8x4F32(a.into(), b.into(), c.into(), d.into()))
     }
     pub fn var_mfma_scale_c(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarMfmaScaleC { var, a: a.into(), b: b.into(), c: c.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
+        self.push_stmt(Stmt::VarMfmaScaleC { var, a: a.into(), b: b.into(), c: c.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
     }
 
     /// Unscaled fp8 MFMA `a x b + c` (value form; c = frag_zero gives the zero-accumulator instruction).
@@ -1620,21 +1861,21 @@ impl FnBuilder {
     }
     /// `var += a x b` (unscaled fp8, in place).
     pub fn var_mfma_fp8_32x32x64(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarMfmaFp8 { var, a: a.into(), b: b.into() });
+        self.push_stmt(Stmt::VarMfmaFp8 { var, a: a.into(), b: b.into() });
     }
     /// `var = a x b` (unscaled fp8, zero accumulator).
     pub fn var_mfma_fp8_32x32x64_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarMfmaFp8Z { var, a: a.into(), b: b.into() });
+        self.push_stmt(Stmt::VarMfmaFp8Z { var, a: a.into(), b: b.into() });
     }
     /// `var = a x b + c` (unscaled fp8; c a separate Frag16 value).
     pub fn var_mfma_fp8_32x32x64_c(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarMfmaFp8C { var, a: a.into(), b: b.into(), c: c.into() });
+        self.push_stmt(Stmt::VarMfmaFp8C { var, a: a.into(), b: b.into(), c: c.into() });
     }
     pub fn var_mfma_scale_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarMfmaScaleZ { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
+        self.push_stmt(Stmt::VarMfmaScaleZ { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
     }
     pub fn var_scale_lane(&mut self, var: VarId, index: u8, scalar: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarScaleLane { var, index, scalar: scalar.into() });
+        self.push_stmt(Stmt::VarScaleLane { var, index, scalar: scalar.into() });
     }
     pub fn perm_b32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, sel: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PermB32(a.into(), b.into(), sel.into()))
@@ -1652,16 +1893,16 @@ impl FnBuilder {
         self.let_(Op::CvtPknormP8x4(a.into(), b.into(), c.into(), d.into(), scale.into()))
     }
     pub fn var_add_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarAddPk { var, pair: pair.into() });
+        self.push_stmt(Stmt::VarAddPk { var, pair: pair.into() });
     }
     pub fn var_mfma_f16_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarMfmaF16Z { var, a: a.into(), b: b.into() });
+        self.push_stmt(Stmt::VarMfmaF16Z { var, a: a.into(), b: b.into() });
     }
     pub fn var_scale_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarScalePk { var, pair: pair.into() });
+        self.push_stmt(Stmt::VarScalePk { var, pair: pair.into() });
     }
     pub fn var_scale_f32(&mut self, var: VarId, scalar: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarScaleF32 { var, scalar: scalar.into() });
+        self.push_stmt(Stmt::VarScaleF32 { var, scalar: scalar.into() });
     }
 
     /// `var = scaled_mfma(a, b, var)` in place.
@@ -1673,7 +1914,7 @@ impl FnBuilder {
         scale_a: impl Into<Opnd>,
         scale_b: impl Into<Opnd>,
     ) {
-        self.f.stmts.push(Stmt::VarMfmaScale {
+        self.push_stmt(Stmt::VarMfmaScale {
             var,
             a: a.into(),
             b: b.into(),
@@ -1684,24 +1925,24 @@ impl FnBuilder {
 
     /// `var += smfmac_16x16x128_fp8_fp8(a, b, idx)`: accumulate into a `Frag4` loop variable in place.
     pub fn var_smfmac_fp8(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, idx: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::VarSmfmac { var, a: a.into(), b: b.into(), idx: idx.into() });
+        self.push_stmt(Stmt::VarSmfmac { var, a: a.into(), b: b.into(), idx: idx.into() });
     }
 
     /// `var += v_mfma_scale_f32_16x16x128_f8f6f4(a, b; scale_a.byte[byte_a], scale_b.byte[byte_b])` on a `Frag4` loop variable.
     #[allow(clippy::too_many_arguments)]
     pub fn var_mfma_scale16(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>, byte_a: u8, byte_b: u8) {
         assert!(byte_a < 4 && byte_b < 4, "scale byte select is 0..3");
-        self.f.stmts.push(Stmt::VarMfmaScale16 { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into(), opsel: byte_a | (byte_b << 4) });
+        self.push_stmt(Stmt::VarMfmaScale16 { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into(), opsel: byte_a | (byte_b << 4) });
     }
 
     /// Update several loop variables in place: the i-th `Seq::inout` port is bound to `vars[i]`.
     pub fn var_asm_n(&mut self, vars: &[VarId], block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) {
-        self.f.stmts.push(Stmt::VarAsmN { vars: vars.to_vec(), block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
+        self.push_stmt(Stmt::VarAsmN { vars: vars.to_vec(), block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
     }
 
     /// Update the Frag4 loop variable `var` in place with a safe-asm sequence (its leading in/out port is the variable).
     pub fn var_asm(&mut self, var: VarId, block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) {
-        self.f.stmts.push(Stmt::VarAsm { var, block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
+        self.push_stmt(Stmt::VarAsm { var, block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
     }
 
     pub fn load_lds_tr_b8(&mut self, addr: impl Into<Opnd>) -> ValueId {
@@ -1709,12 +1950,12 @@ impl FnBuilder {
     }
 
     pub fn store_lds_b128(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::StoreLdsB128 { addr: addr.into(), value: value.into() });
+        self.push_stmt(Stmt::StoreLdsB128 { addr: addr.into(), value: value.into() });
     }
 
     /// `ds_write_b64`: a `Frag2` into LDS (8-byte aligned).
     pub fn store_lds_b64(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
-        self.f.stmts.push(Stmt::StoreLdsB64 { addr: addr.into(), value: value.into() });
+        self.push_stmt(Stmt::StoreLdsB64 { addr: addr.into(), value: value.into() });
     }
 
     /// Broadcast lane 0 of a vector value into a scalar register.
@@ -1731,12 +1972,12 @@ impl FnBuilder {
 
     /// `s_waitcnt lgkmcnt(count)`.
     pub fn wait_lds(&mut self, count: u8) {
-        self.f.stmts.push(Stmt::WaitLds { count });
+        self.push_stmt(Stmt::WaitLds { count });
     }
 
     /// `s_barrier`.
     pub fn wait_vm(&mut self, count: u8) {
-        self.f.stmts.push(Stmt::WaitVm { count });
+        self.push_stmt(Stmt::WaitVm { count });
     }
     /// Scheduler directive, the analogue of ``__builtin_amdgcn_sched_group_barrier(mask, size, sync)``. Consecutive directives of one basic block form the issue
     /// pipeline of that block: group 1 = the next ``size`` instructions of the ``mask`` class (in program order, among those not placed yet), then group 2, ...;
@@ -1745,7 +1986,7 @@ impl FnBuilder {
     /// Mask bits as in LLVM: ``SCHED_ALU`` 0x1 (any ALU incl. MFMA), ``SCHED_VALU`` 0x2, ``SCHED_SALU`` 0x4, ``SCHED_MFMA`` 0x8, ``SCHED_VMEM`` 0x10,
     /// ``SCHED_VMEM_READ`` 0x20 (buffer/global loads, LDS-DMA included), ``SCHED_VMEM_WRITE`` 0x40, ``SCHED_DS`` 0x80, ``SCHED_DS_READ`` 0x100, ``SCHED_DS_WRITE`` 0x200.
     pub fn sched_group_barrier(&mut self, mask: u32, size: u32, sync: u32) {
-        self.f.stmts.push(Stmt::SchedGroup { mask, size, sync });
+        self.push_stmt(Stmt::SchedGroup { mask, size, sync });
     }
 
     /// ``repeat`` times the group sequence ``groups`` (``(mask, size)`` pairs) as ``sched_group_barrier`` directives, e.g. one MFMA then two ``ds_read``s then one DMA:
@@ -1759,13 +2000,13 @@ impl FnBuilder {
     }
     /// 16-byte (dwords = 4) or 4-byte (dwords = 1) global -> LDS DMA load; see `Stmt::LoadGlobalLds`.
     pub fn load_global_lds(&mut self, base: impl Into<Opnd>, lds_addr: impl Into<Opnd>, byte_off: i32, dwords: u8) {
-        self.f.stmts.push(Stmt::LoadGlobalLds { base: base.into(), lds_addr: lds_addr.into(), byte_off, dwords });
+        self.push_stmt(Stmt::LoadGlobalLds { base: base.into(), lds_addr: lds_addr.into(), byte_off, dwords });
     }
     pub fn set_prio(&mut self, prio: u8) {
-        self.f.stmts.push(Stmt::SetPrio { prio });
+        self.push_stmt(Stmt::SetPrio { prio });
     }
     pub fn barrier(&mut self) {
-        self.f.stmts.push(Stmt::Barrier);
+        self.push_stmt(Stmt::Barrier);
     }
     /// Timing stamp: the low 32 bits of this wave's `s_memtime` (core-clock ticks), as a wave-uniform i32 value. Subtract two stamps (wrapping `sub`) for cycles;
     /// store them through a debug-buffer argument (`store_f32` of the value / bitcast) to read per-wave stamps on the host (`tools/stamp_host.py`, `docs/stamps.md`).
@@ -1878,7 +2119,7 @@ pub fn verify(f: &Function) -> Vec<String> {
         scopes.iter().any(|s| s.contains(&v))
     };
 
-    for (idx, st) in f.stmts.iter().enumerate() {
+    for (idx, st) in f.stmts().iter().enumerate() {
         let here = |e: String| format!("stmt {idx}: {e}");
         match st {
             Stmt::Let { dst, op } => {
@@ -2748,7 +2989,7 @@ pub fn lint(f: &Function) -> Vec<String> {
     }
     let mut stack: Vec<L> = Vec::new();
     let mut out = Vec::new();
-    for (idx, st) in f.stmts.iter().enumerate() {
+    for (idx, st) in f.stmts().iter().enumerate() {
         for o in stmt_operands(st) {
             if let Opnd::Var(v) = o {
                 if let Some(l) = stack.iter().rev().find(|l| l.vars.contains(&v)) {

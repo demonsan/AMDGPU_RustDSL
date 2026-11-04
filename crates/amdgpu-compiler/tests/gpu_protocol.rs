@@ -247,8 +247,10 @@ fn probe(name: &str) -> Function {
 
 fn without(f: &Function, pred: &dyn Fn(&Stmt) -> bool) -> Function {
     let mut g = f.clone();
-    let i = g.stmts.iter().position(|s| pred(s)).expect("statement to remove");
-    g.stmts.remove(i);
+    let i = g.stmts().iter().position(|s| pred(s)).expect("statement to remove");
+    g.edit_stmts(|v| {
+        v.remove(i);
+    });
     g
 }
 
@@ -280,10 +282,12 @@ fn reading_before_the_acquire_inside_the_last_arriver_branch_is_not_visible() {
     // move the acquire to AFTER the loop: the loads now precede it
     let f = probe("probe_last_arriver");
     let mut g = f.clone();
-    let ai = g.stmts.iter().position(|s| matches!(s, Stmt::FenceAcquire { .. })).unwrap();
-    let acq = g.stmts.remove(ai);
-    let end = g.stmts.iter().rposition(|s| matches!(s, Stmt::EndLoop)).unwrap();
-    g.stmts.insert(end + 1, acq);
+    let ai = g.stmts().iter().position(|s| matches!(s, Stmt::FenceAcquire { .. })).unwrap();
+    g.edit_stmts(|v| {
+        let acq = v.remove(ai);
+        let end = v.iter().rposition(|s| matches!(s, Stmt::EndLoop)).unwrap();
+        v.insert(end + 1, acq);
+    });
     let r = verify_ir(&g);
     assert!(has(&r, "GV-PROTO-NOT-VISIBLE"), "{}", r.render());
 }
@@ -292,18 +296,21 @@ fn reading_before_the_acquire_inside_the_last_arriver_branch_is_not_visible() {
 fn the_lite_acquire_needs_coherent_loads_and_the_lite_release_needs_write_through_stores() {
     let f = probe("probe_last_arriver_lite");
     let mut g = f.clone();
-    for s in g.stmts.iter_mut() {
+    let mut flat = g.stmts().to_vec();
+    for s in flat.iter_mut() {
         if let Stmt::Let { op, .. } = s {
             if let Op::LoadF32Coherent { base, byte_off } = op.clone() {
                 *op = Op::LoadF32 { base, byte_off };
             }
         }
     }
+    g.set_stmts(flat);
     let r = verify_ir(&g);
     assert!(has(&r, "GV-PROTO-NOT-VISIBLE"), "{}", r.render());
     // plain stores under a lite release
     let mut h = f.clone();
-    for s in h.stmts.iter_mut() {
+    let mut flat = h.stmts().to_vec();
+    for s in flat.iter_mut() {
         if let Stmt::StoreF32Wt { base, byte_off, value } = s.clone() {
             // only the produced `part` store (the first write-through store), not the final result store
             if matches!(base, Opnd::Val(_)) {
@@ -312,6 +319,7 @@ fn the_lite_acquire_needs_coherent_loads_and_the_lite_release_needs_write_throug
             }
         }
     }
+    h.set_stmts(flat);
     let r = verify_ir(&h);
     assert!(has(&r, "GV-PROTO-NOT-VISIBLE"), "{}", r.render());
 }
@@ -325,10 +333,12 @@ fn a_missing_ticket_and_an_unguarded_read_are_arrival_mismatches() {
     assert!(has(&r, "GV-PROTO-ARRIVAL-MISMATCH"), "{}", r.render());
     // the last-arriver branch is removed: everybody reads
     let mut g = probe("probe_last_arriver");
-    let bi = g.stmts.iter().position(|s| matches!(s, Stmt::BeginIf { .. })).unwrap();
-    let ei = g.stmts.iter().rposition(|s| matches!(s, Stmt::EndIf)).unwrap();
-    g.stmts.remove(ei);
-    g.stmts.remove(bi);
+    let bi = g.stmts().iter().position(|s| matches!(s, Stmt::BeginIf { .. })).unwrap();
+    let ei = g.stmts().iter().rposition(|s| matches!(s, Stmt::EndIf)).unwrap();
+    g.edit_stmts(|v| {
+        v.remove(ei);
+        v.remove(bi);
+    });
     let r = verify_ir(&g);
     assert!(has(&r, "GV-PROTO-ARRIVAL-MISMATCH"), "{}", r.render());
 }
@@ -336,11 +346,13 @@ fn a_missing_ticket_and_an_unguarded_read_are_arrival_mismatches() {
 #[test]
 fn the_generation_must_be_the_blocks_split_id() {
     let mut f = probe("probe_last_arriver");
-    for s in f.stmts.iter_mut() {
+    let mut flat = f.stmts().to_vec();
+    for s in flat.iter_mut() {
         if let Stmt::TileProduce { version, .. } = s {
             *version = Opnd::I32(0); // every block claims generation 0: no agreement on which slice it owns
         }
     }
+    f.set_stmts(flat);
     let r = verify_ir(&f);
     assert!(has(&r, "GV-PROTO-STALE-GEN"), "{}", r.render());
 }
