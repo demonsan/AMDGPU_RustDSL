@@ -938,6 +938,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_noxcd" => GemmConfig { xcd_raster: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_u1" => GemmConfig { unroll2: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_spread" => GemmConfig { spread_reloads: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_spread2" => GemmConfig { spread_reloads: true, dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_tall" => GemmConfig { raster_tall: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_split" => GemmConfig { split_sync: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_split2" => GemmConfig { split_sync: true, dma_gap: 2, ..GemmConfig::v4() },
