@@ -32,7 +32,7 @@ fn mk(insts: Vec<MInst>) -> MFunction {
 }
 
 fn mfma(k: u32) -> MInst {
-    MInst::new(MOp::VMfmaScale16x16x128Fp8).def(k).srcreg(16).srcreg(17).srcreg(k).srcreg(18).srcreg(18)
+    MInst::new(MOp::VMfmaScale16x16x128Fp8).def(k % 16).srcreg(16).srcreg(17).srcreg(k % 16).srcreg(18).srcreg(18)
 }
 
 fn ds_read(d: u32) -> MInst {
@@ -46,7 +46,7 @@ fn dma(k: i64) -> MInst {
 fn name(i: &MInst) -> String {
     match i.op {
         MOp::VMfmaScale16x16x128Fp8 => format!("M{}", i.dst.unwrap()),
-        MOp::LdsReadB128 => format!("R{}", i.dst.unwrap() - 20),
+        MOp::LdsReadB128 => format!("R{}", i.dst.unwrap() as i64 - 20),
         MOp::BufferLoadDwordX4Lds => format!("D{}", i.imm / 1024),
         MOp::SBarrier => "B".into(),
         MOp::VAddU32 => "a".into(),
@@ -127,7 +127,7 @@ fn a_load_feeding_a_late_mfma_meets_its_deadline_and_a_reload_waits_for_the_last
     let first_read = out.iter().position(|s| s.starts_with('R')).unwrap();
     let last_read = out.iter().rposition(|s| s.starts_with('R')).unwrap();
     assert!(first_read < pos(&out, "M0"), "{out:?}");
-    assert!(last_read > pos(&out, "M15"), "{out:?}");
+    assert!(last_read > out.iter().rposition(|s| s == "M15").unwrap(), "{out:?}");
 }
 
 #[test]
@@ -153,11 +153,11 @@ fn dma_issues_spread_among_ds_reads_only_under_the_contract() {
     // 8 DMAs (in order) then 8 ds_reads then 16 MFMAs: with the relaxation the DMAs interleave with MFMAs and may pass ds_reads
     let mut insts: Vec<MInst> = (0..8).map(|k| dma(k)).collect();
     insts.extend((0..8).map(ds_read));
-    insts.extend(mfmas(16));
+    insts.extend(mfmas(48)); // a region long enough for the DMA latency window (24 slots)
     let out = run(insts);
     let d: Vec<usize> = (0..8).map(|k| pos(&out, &format!("D{k}"))).collect();
     assert!(d.windows(2).all(|w| w[0] < w[1]), "DMAs keep their relative order: {out:?}");
-    assert!(*d.last().unwrap() > pos(&out, "M4"), "{out:?}");
+    assert!(*d.last().unwrap() > pos(&out, "M10"), "{out:?}");
     // outside the pass the strict rules are back: a DMA and a ds_read may not swap
     assert!(!RELAX_DMA_LDS_READ.load(Ordering::Relaxed));
     let strict = mk(vec![dma(0), ds_read(0)]);
