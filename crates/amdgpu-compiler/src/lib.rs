@@ -77,12 +77,20 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     for extra in [&[][..], &["remat1"][..], &["remat2"][..], &["remat3"][..], &["remat4"][..], &["imm", "ldsspill8"][..], &["imm", "ldsspill16"][..], &["imm", "ldsspill24"][..], &["imm", "ldsspill32"][..], &["imm", "ldsspill48"][..], &["imm", "ldsspill64"][..]] {
         match lower_and_allocate_with(f, extra) {
             Ok(r) => {
+                if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("rematdebug")) {
+                    eprintln!("allocation succeeded with extra {extra:?}");
+                }
                 if r.0.lds_bytes > 160 * 1024 {
                     return Err(format!("LDS spill needs {} bytes of LDS (limit 163840)", r.0.lds_bytes));
                 }
                 return Ok(r);
             }
-            Err(e) if e.contains("out of VGPRs") => last = e,
+            Err(e) if e.contains("out of VGPRs") => {
+                if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("rematdebug")) {
+                    eprintln!("allocation failed with extra {extra:?}: {}", e.chars().take(160).collect::<String>());
+                }
+                last = e
+            }
             Err(e) => return Err(e),
         }
     }
@@ -132,6 +140,13 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         let v3_t128 = pname.ends_with("_t128") && (f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_") || f.name.starts_with("fmha_fwd_hd128_mxfp8_v3s_"));
         for tok in ["edgepad", "salubr"] {
             if fmha_opt(f, tok) || v3_t128 {
+                v.push(tok);
+            }
+        }
+        // A/B tokens (FMHA_OPT, scoped by FMHA_OPT_SCOPE): `licm` (loop-invariant pure ALU hoisted to the preheader), `scalarize2` / `waveuni` (uniform
+        // integer chains in SALU, as in the GEMM profile)
+        for tok in ["licm", "scalarize2", "waveuni"] {
+            if fmha_opt(f, tok) {
                 v.push(tok);
             }
         }
