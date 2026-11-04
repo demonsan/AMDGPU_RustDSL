@@ -160,22 +160,9 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
     let fl = |lat: u32| (lat / SLOT_CYCLES) as usize;
     let cls: Vec<Option<Class>> = (0..n).map(|i| class_of(&g.eff[i])).collect();
     // ---- windows ----
-    let mut lo = vec![0usize; n];
-    for i in 0..n {
-        if let Some(k) = mslot[i] {
-            lo[i] = k;
-            continue;
-        }
-        let mut l = orig[i].saturating_sub(hoist_slots);
-        for &(p, lat) in &g.preds[i] {
-            let c = match mslot[p] {
-                Some(k) => k + 1 + fl(lat),
-                None => lo[p] + fl(lat),
-            };
-            l = l.max(c);
-        }
-        lo[i] = l.min(mm);
-    }
+    // deadlines first (they only look at the consumers), then the releases, clamped to their deadline: a chain of loads in front of the first MFMA has a release
+    // (sum of the producer latencies in slots) past its deadline (slot 0) - nothing can be placed earlier than the region start, so the deadline wins and the
+    // hardware stalls (slots are a soft model, legality is the order, proven by check_perm)
     let mut dl = vec![mm; n];
     for i in (0..n).rev() {
         if let Some(k) = mslot[i] {
@@ -195,7 +182,23 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
             };
             d = d.min(ds.saturating_sub(fl(lat)));
         }
-        dl[i] = d.max(lo[i]).min(mm);
+        dl[i] = d.min(mm);
+    }
+    let mut lo = vec![0usize; n];
+    for i in 0..n {
+        if let Some(k) = mslot[i] {
+            lo[i] = k;
+            continue;
+        }
+        let mut l = orig[i].saturating_sub(hoist_slots);
+        for &(p, lat) in &g.preds[i] {
+            let c = match mslot[p] {
+                Some(k) => k + 1 + fl(lat),
+                None => lo[p] + fl(lat),
+            };
+            l = l.max(c);
+        }
+        lo[i] = l.min(mm).min(dl[i]);
     }
     // ---- anchors, class by class ----
     let mut slot: Vec<Option<usize>> = vec![None; n];
@@ -273,8 +276,8 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
             for &(p, lat) in &g.preds[i] {
                 // (slots are capped at M: a consumer of the last MFMA's result lands after it; the latency in slots is a soft preference, the stall is the hardware's)
                 let bound = match mslot[p] {
-                    Some(k) => (k + 1 + fl(lat)).min(mm),
-                    None => (sl[p] + fl(lat)).min(mm),
+                    Some(k) => (k + 1 + fl(lat)).min(mm).min(dl[i].max(k + 1)),
+                    None => (sl[p] + fl(lat)).min(mm).min(dl[i].max(sl[p])),
                 };
                 if sl[i] < bound {
                     sl[i] = bound;
