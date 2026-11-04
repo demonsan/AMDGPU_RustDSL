@@ -94,6 +94,8 @@ pub struct GemmConfig {
     pub b_scale_dword: bool,
     /// `RegStaged`: MMAs of the register tile issued between the top-of-tile waits and the barrier (after `pre_sync_mmas`)
     pub mid_sync_mmas: usize,
+    /// A LDS image padded like the vendor's (1056-byte pitch per 8 rows, linear DMA lanes) instead of the FMHA XOR swizzle
+    pub a_pad: bool,
     pub ablate: Ablate,
 }
 
@@ -102,7 +104,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -110,7 +112,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -207,6 +209,15 @@ struct Dma {
     /// wave-uniform source delta (an SGPR added to the soffset, like the vendor's one `s_add` per DMA) and the LDS offset of its 1 KB block
     issues: Vec<(ValueId, i32)>,
     delta: Vec<Option<ValueId>>,
+    /// LDS bytes per 1 KB issue block (1024, or 1056 for the padded A image); the issue LDS offsets above are in 1 KB units (`act`)
+    pitch: i32,
+}
+
+impl Dma {
+    /// (M0 offset of the issue's group of 4, instruction offset) for the virtual 1 KB offset `lds`
+    fn act(&self, lds: i32) -> (i32, u32) {
+        ((lds - lds % 4096) / 1024 * self.pitch, ((lds % 4096) / 1024 * self.pitch) as u32)
+    }
 }
 
 /// Turns the per-issue source offsets (minus the instruction offset 1024 (q % 4)) into voffsets: an issue whose offset differs from an earlier
@@ -220,12 +231,16 @@ thread_local! {
 }
 
 fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bool) -> Dma {
+    finish_dma_p(b, ctx, s_tid, gofs, share, 1024)
+}
+
+fn finish_dma_p(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bool, pitch: i32) -> Dma {
     let tid_id = match s_tid {
         Ix::Sym(s) => *s,
         _ => unreachable!(),
     };
     // `GemmConfig::shared_voffsets` (today a v_add + v_readfirstlane per issue costs more than the VGPRs it saves)
-    let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-1024 * (q as i64 % 4))).collect();
+    let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-(pitch as i64) * (q as i64 % 4))).collect();
     // the DMA voffsets (pure thread-index math) through the bit-field normal form: shift groups, shared across all plans by Ctx::bind
     ctx.set_bitfield(BITFIELD_VOFF.with(|x| x.get()));
     let mut voff: Vec<ValueId> = Vec::new();
@@ -271,7 +286,7 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bo
         }
     }
     ctx.set_bitfield(false);
-    Dma { issues, delta }
+    Dma { issues, delta, pitch }
 }
 
 /// LDS byte `d = 1024 (issues (tid / 64) + q) + 16 (tid % 64)` holds tile element `smem^-1(d)`, so the source offset is `glob o right_inverse(smem)`;
@@ -325,6 +340,35 @@ fn dma_plan_rows_swz(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: 
         out.push(g);
     }
     finish_dma(b, ctx, s_tid, out, share)
+}
+
+/// A-tile DMA for the PADDED row-major LDS image (the vendor form): 1 KB blocks of 8 whole 128-byte rows at a pitch of 1056 bytes (32 bytes of
+/// padding per block spread the banks of the fragment reads), lanes linear in the source (lane -> row lane / 8, bytes 16 (lane % 8)): fully
+/// monotone 128-byte segments, no source-side permutation. LDS image: (r, k) -> 1056 (r / 8) + 128 (r % 8) + k.
+fn dma_plan_rows_pad(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, waves: i64) -> Dma {
+    let issues = rows * 128 / 1024 / waves;
+    let d = &ctx.dyns;
+    let tid_id = match s_tid {
+        Ix::Sym(s) => *s,
+        _ => unreachable!(),
+    };
+    let mut out = Vec::new();
+    for q in 0..issues {
+        // block index (issues (tid / 64) + q), row inside the block lane / 8, bytes 16 (lane % 8)
+        let blk = s_tid.div_c(64, d).mul_c(issues).add_c(q);
+        let lane = s_tid.mod_c(64, d);
+        let r = blk.mul_c(8).add(&lane.div_c(8, d));
+        let k = lane.mod_c(8, d).mul_c(16);
+        let g = glob.crd2idx(&tup![r.clone(), k.clone()], d);
+        for th in [0i64, 1, 7, 8, 63, 64, 100, 127, 255].into_iter().filter(|t| *t < 64 * waves) {
+            let env = |s: u32| if s == tid_id { th } else { proof_k };
+            let (bb, ll) = (issues * (th / 64) + q, th % 64);
+            let want = glob.crd2idx(&tup![8 * bb + ll / 8, 16 * (ll % 8)], d).eval(&env);
+            assert_eq!(g.eval(&env), want, "padded A DMA thread {th} issue {q}");
+        }
+        out.push(g);
+    }
+    finish_dma_p(b, ctx, s_tid, out, false, 1056)
 }
 
 /// The scale panel: every K group's scales of the CTA, loaded once in the prologue (`Cfg::scale_panel`).
@@ -640,7 +684,7 @@ impl Body {
                     for (_, lds) in dma.issues.iter() {
                         let grp = *lds - *lds % 4096;
                         if !cache.m0.iter().any(|x| x.0 == (bi, grp)) {
-                            let v = b.bind_i32(ev(sb) + grp);
+                            let v = b.bind_i32(ev(sb) + dma.act(*lds).0);
                             let v = b.read_first_lane(v);
                             cache.m0.push(((bi, grp), v));
                         }
@@ -679,7 +723,7 @@ impl Body {
                 let m0s: Vec<ValueId> = issues.iter().map(|(_, lds)| rm.iter().find(|x| x.0 == *lds - *lds % 4096).unwrap().1).collect();
                 r.write(b, |b| {
                     for ((q, lds), m0) in issues.iter().zip(m0s.iter()) {
-                        b.load_buffer_lds(*rr, vo[*q], org, *m0, (*lds % 4096) as u32, 4);
+                        b.load_buffer_lds(*rr, vo[*q], org, *m0, self.a_dma.act(*lds).1, 4);
                     }
                 });
                 return;
@@ -695,7 +739,7 @@ impl Body {
                 let m0s: Vec<ValueId> = issues.iter().map(|(_, lds)| cache.m0.iter().find(|x| x.0 == (bi, *lds - *lds % 4096)).unwrap().1).collect();
                 r.write(b, |b| {
                     for ((g, lds), m0) in issues.iter().zip(m0s.iter()) {
-                        b.load_buffer_lds(*rsrc, *g, *org, *m0, (*lds % 4096) as u32, 4);
+                        b.load_buffer_lds(*rsrc, *g, *org, *m0, dma.act(*lds).1, 4);
                     }
                 });
             }
@@ -721,7 +765,7 @@ impl Body {
                 let grp = *lds - *lds % 4096;
                 let key = (bi, grp);
                 if !cache.m0.iter().any(|x| x.0 == key) {
-                    let v = b.bind_i32(ev(sbase) + grp);
+                    let v = b.bind_i32(ev(sbase) + dma.act(*lds).0);
                     let v = b.read_first_lane(v);
                     cache.m0.push((key, v));
                 }
@@ -739,7 +783,7 @@ impl Body {
                         }
                         None => org,
                     };
-                    b.load_buffer_lds(rsrc, *g, so, *m0, (*lds % 4096) as u32, 4);
+                    b.load_buffer_lds(rsrc, *g, so, *m0, dma.act(*lds).1, 4);
                 }
             });
         }
@@ -1033,6 +1077,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_vo" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 2, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_vo3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 3, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_g2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_pad" => GemmConfig { a_pad: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_pad_g2" => GemmConfig { a_pad: true, dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_mid3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_p4m6" => GemmConfig { pre_sync_mmas: 4, mid_sync_mmas: 6, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_p2m6" => GemmConfig { pre_sync_mmas: 2, mid_sync_mmas: 6, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
@@ -1184,7 +1230,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
     // ---- LDS ring: 3 slots of A 32 KB + B 16 KB + scales 2 KB ----
     let mut lds = LdsPlan::new();
     let slots = if cfg.three_slots { 3 } else { 2 };
-    let a_s = lds.ring("A", cta_m * 128, slots, amdgpu_dsl::tile::Layout::Linear);
+    let a_bytes = if cfg.a_pad { cta_m / 8 * 1056 } else { cta_m * 128 };
+    let a_s = lds.ring("A", a_bytes, slots, amdgpu_dsl::tile::Layout::Linear);
     let b_s = lds.ring("B", cta_n * 128, slots, amdgpu_dsl::tile::Layout::Linear);
     let sc_s = lds.ring("SC", 4 * 512, slots, amdgpu_dsl::tile::Layout::Linear);
     // scale panel: A [PANEL_KB][256 rows] + B [2 blocks][PANEL_KB] (+ 4 bytes of source alignment slack, padded to 256 for the dword DMA)
@@ -1206,8 +1253,14 @@ fn build(name: &str, cfg: Cfg) -> Function {
     // ---- operand reads: the 16-row blocks of the wave (placements (row block) 2048), the wave offset added to the bases ----
     let view = ComposedLayout::new(Swizzle::none(), smem_block());
     // A: 128-byte rows with the FMHA swizzle (a 16-row block = 2048 bytes; the swizzle only depends on row bits 0..3)
-    let a_view = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![16, 128], tup![128, 1]));
-    let a_place: Vec<i64> = (0..wave_m / 16).map(|i| 2048 * i).collect();
+    let a_view = if cfg.a_pad {
+        // padded image: a 16-row block = two 1056-byte blocks of 8 rows
+        ComposedLayout::new(Swizzle::none(), make_layout(tup![tup![8, 2], 128], tup![tup![128, 1056], 1]))
+    } else {
+        ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![16, 128], tup![128, 1]))
+    };
+    let a_blk = if cfg.a_pad { 2112 } else { 2048 };
+    let a_place: Vec<i64> = (0..wave_m / 16).map(|i| a_blk * i).collect();
     let b_place: Vec<i64> = (0..wave_n / 16).map(|j| 2048 * j).collect();
     // operand read partitions (built after the first DMAs when `early_dma`)
     let (a_s2, b_s2) = (a_s.clone(), b_s.clone());
@@ -1216,7 +1269,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let (ctx, s_lane, s_wm, s_wn) = (ctx_r, s_lane_r, s_wm_r, s_wn_r);
     let mut a_rd = copy_a_r.partition_lds(b, ctx, s_lane, &a_s2, &a_view, &a_place);
     let mut b_rd = copy_b_r.partition_lds(b, ctx, s_lane, &b_s2, &view, &b_place);
-    let a_wo = ctx.lower(&s_wm.mul_c(wave_m / 16 * 2048));
+    let a_wo = ctx.lower(&s_wm.mul_c(wave_m / 16 * a_blk));
     let b_wo = ctx.lower(&s_wn.mul_c(wave_n / 16 * 2048));
     // the view bases lie inside one 16-row block (< 2048 bytes): the mask is a no-op that gives the verifier the bound the XOR swizzle hides
     // (bases include the buffer base; 16-byte reads: the low 4 bits are zero)
@@ -1240,9 +1293,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
         let wv = b.read_first_lane(wv);
         (a, bb, aw, bw, Some(wv))
     } else {
-        let a = dma_plan_rows_swz(b, &ctx, &s_tid, cta_m, &a_glob, 8192, cfg.shared_voffsets, 4);
+        let a = if cfg.a_pad { dma_plan_rows_pad(b, &ctx, &s_tid, cta_m, &a_glob, 8192, 4) } else { dma_plan_rows_swz(b, &ctx, &s_tid, cta_m, &a_glob, 8192, cfg.shared_voffsets, 4) };
         let bb = dma_plan(b, &ctx, &s_tid, cta_n, &b_glob, 8192, cfg.shared_voffsets, 4);
-        let aw = b.bind_i32(lane.wave() * (cta_m * 128 / 4) as i32);
+        let aw = b.bind_i32(lane.wave() * (a_bytes / 4) as i32);
         let bw = b.bind_i32(lane.wave() * (cta_n * 128 / 4) as i32);
         (a, bb, aw, bw, None)
     };
