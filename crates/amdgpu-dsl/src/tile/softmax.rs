@@ -110,6 +110,12 @@ impl OnlineSoftmax {
         let nb = self.decide_impl(b, s, o, mask, true, None, Some(&mut sc));
         (nb, sc.expect("scale"))
     }
+    /// `decide_scaled` without writing the bias variable (see `decide_deferred`).
+    pub fn decide_deferred_scaled(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> (ValueId, ValueId) {
+        let mut sc = None;
+        let nb = self.decide_impl(b, s, o, mask, false, None, Some(&mut sc));
+        (nb, sc.expect("scale"))
+    }
     /// `convert` with a per-lane conversion scale (`decide_scaled`).
     pub fn convert_scaled(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, t0: usize, t1: usize, scale: ValueId) -> Vec<ValueId> {
         let lut = if self.recipe.lut { Some(LutConsts::new(b)) } else { None };

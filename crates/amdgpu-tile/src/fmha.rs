@@ -416,11 +416,19 @@ impl PipeBody for AttnBody3<'_> {
         let r = self.ring;
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
-        let nb = self.sm.decide_deferred(b, &s, &o, mask.as_ref());
+        let (nb, sc) = if self.scaleconv {
+            let (nb, sc) = self.sm.decide_deferred_scaled(b, &s, &o, mask.as_ref());
+            (nb, Some(sc))
+        } else {
+            (self.sm.decide_deferred(b, &s, &o, mask.as_ref()), None)
+        };
         let next = t.staged.then(|| (r.kpart.at(b, &r.ks.at(&t.next)), r.kdpart.at(b, &r.kd.at(&t.next))));
         let mut w = Vec::with_capacity(16);
         for i in 0..4usize {
-            w.extend(self.sm.convert(b, &s, mask.as_ref(), i, i + 1));
+            match sc {
+                Some(sc) => w.extend(self.sm.convert_scaled(b, &s, mask.as_ref(), i, i + 1, sc)),
+                None => w.extend(self.sm.convert(b, &s, mask.as_ref(), i, i + 1)),
+            }
             if let Some((k, kd)) = &next {
                 self.qk_block(b, &QkOut::Vars(&s), nb, k, kd, i);
             }
@@ -472,7 +480,8 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
-            body.scaleconv = cfg.scaleconv;
+            // the fast reference only in the long-sequence copy (the short copy keeps the LUT-corrected exact recipe)
+            body.scaleconv = cfg.scaleconv && !lut;
             if let Some(th) = cfg.thr512 {
                 body.sm.set_thr(b, th as f32 / 512.0);
                 body.seed_first = true;
@@ -493,7 +502,12 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_kvsplit", 512);
+    fmha_kvsplit_cfg("fmha_fwd_hd128_mxfp8_v3_kvsplit", false)
+}
+
+/// `scaleconv`: the fast reference path (`Vs128Cfg::scaleconv`) in the long-sequence copy.
+pub fn fmha_kvsplit_cfg(name: &str, scaleconv: bool) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::KvSplit);
     let b = &mut fb;
     let io = declare_io(b, 256, true);
@@ -506,6 +520,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
+            body.scaleconv = scaleconv && !lut;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             let l = body.sm.l_total(b);
@@ -524,7 +539,12 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h() -> Function {
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_t128", 256);
+    fmha_t128_cfg("fmha_fwd_hd128_mxfp8_v3_t128", false)
+}
+
+/// `scaleconv`: the fast reference path in the long-sequence copy.
+pub fn fmha_t128_cfg(name: &str, scaleconv: bool) -> Function {
+    let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::T128);
     let b = &mut fb;
     let io = declare_io(b, 128, false);
@@ -536,6 +556,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         let mut body = AttnBody3::new(b, &ring, &blk, blk.lane.wave, lut);
+        body.scaleconv = scaleconv && !lut;
         pipe.run(b, Role::All, &mut body);
         let fin = body.out_scale(b);
         store_out3(&io, b, &blk, &body.o.expect("O"), fin);
