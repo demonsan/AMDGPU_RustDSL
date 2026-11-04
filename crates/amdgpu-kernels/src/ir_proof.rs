@@ -569,7 +569,13 @@ fn run_all(f: &Function, args: &Args) -> (Trace, usize) {
     let filter = vec![true; lanes.len()];
     exec_nodes(f.body(), &mut lanes, &filter);
     let unknown = lanes.iter().map(|c| c.unknown_control).sum();
-    let t = trace.borrow().clone();
+    let mut t = trace.borrow().clone();
+    let lg = lds.borrow();
+    t.lds_entries = lg.len();
+    t.tag_a = lg.values().filter(|x| matches!(x.0, Tag::A(..))).count();
+    t.tag_b = lg.values().filter(|x| matches!(x.0, Tag::B(..))).count();
+    t.tag_sa = lg.values().filter(|x| matches!(x.0, Tag::Sa(..))).count();
+    t.tag_sb = lg.values().filter(|x| matches!(x.0, Tag::Sb(..))).count();
     (t, unknown)
 }
 
