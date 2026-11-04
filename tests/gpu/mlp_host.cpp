@@ -43,14 +43,15 @@ int main(int argc, char** argv) {
         int jb = n1 / 64, k = n1 % 64;
         w2p[n2 * N1 + n1] = w2[(64 * jb + sigma(k)) * N2 + n2];
     }
+    std::vector<unsigned char> w1i = w1;
     if (ws) {  // images: 272-byte rows (256 data + 16 pad)
         auto img = [](const std::vector<unsigned char>& w) { std::vector<unsigned char> o(256 * 272, 0); for (int r = 0; r < 256; ++r) std::memcpy(&o[r * 272], &w[r * 256], 256); return o; };
-        w1 = img(w1); w2n = img(w2n); w2p = img(w2p);
+        w1i = img(w1); w2n = img(w2n); w2p = img(w2p);
     }
     unsigned char *dx, *dw1, *dw2n, *dw2p, *dh; unsigned short *dyf, *dyu;
-    CK(hipMalloc(&dx, x.size())); CK(hipMalloc(&dw1, w1.size())); CK(hipMalloc(&dw2n, w2n.size())); CK(hipMalloc(&dw2p, w2p.size()));
+    CK(hipMalloc(&dx, x.size())); CK(hipMalloc(&dw1, w1i.size())); CK(hipMalloc(&dw2n, w2n.size())); CK(hipMalloc(&dw2p, w2p.size()));
     CK(hipMalloc(&dh, (size_t)M * N1)); CK(hipMalloc(&dyf, (size_t)M * N2 * 2)); CK(hipMalloc(&dyu, (size_t)M * N2 * 2));
-    CK(hipMemcpy(dx, x.data(), x.size(), hipMemcpyHostToDevice)); CK(hipMemcpy(dw1, w1.data(), w1.size(), hipMemcpyHostToDevice));
+    CK(hipMemcpy(dx, x.data(), x.size(), hipMemcpyHostToDevice)); CK(hipMemcpy(dw1, w1i.data(), w1i.size(), hipMemcpyHostToDevice));
     CK(hipMemcpy(dw2n, w2n.data(), w2n.size(), hipMemcpyHostToDevice)); CK(hipMemcpy(dw2p, w2p.data(), w2p.size(), hipMemcpyHostToDevice));
     hipModule_t mf, m1, m2; hipFunction_t ff, f1, f2;
     std::string P = pre;
