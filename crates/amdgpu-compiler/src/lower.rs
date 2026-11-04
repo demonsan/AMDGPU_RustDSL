@@ -3355,9 +3355,16 @@ fn licm(m: &mut MFunction) {
     for (header, latch) in loops {
         let (Some(&h), Some(&l)) = (label_idx.get(&header), label_idx.get(&latch)) else { continue };
         if h == 0 || h > l || !matches!(m.blocks[h - 1].term, Term::Goto(t) if t == header) {
+            if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("licmdebug")) {
+                eprintln!("licm: loop {header}..{latch}: no preheader (h {h}, l {l})");
+            }
             continue;
         }
         let pre = h - 1;
+        let dbg = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("licmdebug"));
+        if dbg {
+            eprintln!("licm: loop {header}..{latch} blocks {h}..{l} preheader {pre}");
+        }
         loop {
             // definitions per canonical register: total, and inside the loop
             let mut defs_all: HashMap<VReg, usize> = HashMap::new();
@@ -3440,6 +3447,9 @@ fn licm(m: &mut MFunction) {
                         }
                     }
                 }
+            }
+            if dbg {
+                eprintln!("licm:   hoisted {} ({} merged): {:?}", firsts.len(), rename.len(), firsts.iter().map(|i| (i.op, i.imm)).collect::<Vec<_>>());
             }
             m.blocks[pre].insts.extend(firsts);
         }
