@@ -100,6 +100,8 @@ pub struct GemmConfig {
     pub perm_transpose: bool,
     /// `RegStaged`: tile 1 DMA issued after the panel transposition (tile 0 first, less TA back-pressure ahead of the prologue gather)
     pub late_tile1: bool,
+    /// with `late_tile1`: tile 1 issued after the prologue barrier (behind the tile-0 fragment reads)
+    pub tile1_after_barrier: bool,
     pub ablate: Ablate,
 }
 
@@ -108,7 +110,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, tile1_after_barrier: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -116,7 +118,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, tile1_after_barrier: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -1110,6 +1112,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_vo" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 2, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_vo3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 3, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_g2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_t1ab" => GemmConfig { tile1_after_barrier: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_perm" => GemmConfig { perm_transpose: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_lt1" => GemmConfig { late_tile1: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_permlt1" => GemmConfig { perm_transpose: true, late_tile1: true, ..GemmConfig::v4() },
@@ -1444,6 +1447,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     pipe.ablate_no_sync = cfg.ablate.no_sync;
     pipe.late_tile1 = cfg.late_tile1 && cfg.reg_staged;
     pipe.late_tile1_vm = (a_dma.issues.len() + b_dma.issues.len()) as u8;
+    pipe.tile1_after_barrier = cfg.tile1_after_barrier;
     pipe.scalar_exit = true;
     if cfg.reg_staged && cfg.early_tile0 {
         // the prologue waits for tile 0 only (tile 1's DMAs are the last ones issued; it is published by the loop's first top barrier)
