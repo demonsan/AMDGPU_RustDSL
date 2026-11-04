@@ -545,6 +545,93 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
             }
         }
     }
+    // `edgepad`: the SrcC WAR windows of MFMAs still running at a block end are carried into the successors instead of padding every block
+    // end, and both those and the in-flight destinations are carried THROUGH short blocks (fixpoint over the CFG: max remaining per key)
+    let war_of = |m: &MFunction, inst: &MInst| -> Option<(usize, Vec<(u32, u32)>)> {
+        let need = mfma_latency(inst.op).map(|l| match l {
+            20 => 21,
+            _ => 12,
+        })?;
+        let mut srcs = Vec::new();
+        if inst.op == MOp::VSmfmac16x16x128Fp8 {
+            for s in inst.srcs.iter().take(3) {
+                if let Src::Reg(r) = s {
+                    if vl(m.vreg_class(*r)) {
+                        srcs.push(rng(m, *r));
+                    }
+                }
+            }
+        } else if !matches!(inst.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x64Fp8Z | MOp::VMfma32x32x8F16Z) {
+            if let Some(Src::Reg(r)) = inst.srcs.get(2) {
+                if vl(m.vreg_class(*r)) {
+                    srcs.push(rng(m, *r));
+                }
+            }
+        }
+        Some((need, srcs))
+    };
+    let edge = m.edge_pad;
+    let nb = m.blocks.len();
+    let mut entry_war: Vec<Vec<(MOp, Vec<(u32, u32)>, usize)>> = vec![Vec::new(); nb];
+    if edge {
+        loop {
+            let mut changed = false;
+            for bi in 0..nb {
+                let mut cycle = 0usize;
+                let mut w: Vec<(usize, usize, MOp, Vec<(u32, u32)>)> = entry_war[bi].iter().map(|(o, s, r)| (0, *r, *o, s.clone())).collect();
+                let mut dd: Vec<(usize, usize, VReg, (u32, u32))> = entry_dst[bi].iter().map(|(d, r, rem)| (0, *rem, *d, *r)).collect();
+                for inst in &m.blocks[bi].insts {
+                    if let Some((need, srcs)) = war_of(m, inst) {
+                        w.push((cycle, need, inst.op, srcs));
+                    }
+                    if let (true, Some(l), Some(d)) = (waw_on, mfma_latency(inst.op), inst.dst) {
+                        dd.push((cycle, mfma_dst_wait(l), m.canon(d), rng(m, d)));
+                    }
+                    if matches!(inst.op, MOp::SNop) {
+                        cycle += inst.imm as usize;
+                    }
+                    cycle += 1;
+                    w.retain(|(i, n, _, _)| i + n > cycle);
+                    dd.retain(|(i, n, _, _)| i + n > cycle);
+                }
+                for &s in &succs[bi] {
+                    for (i, n, o, sr) in &w {
+                        let rem = i + n - cycle;
+                        match entry_war[s].iter_mut().find(|(o2, s2, _)| o2 == o && s2 == sr) {
+                            Some(e) => {
+                                if e.2 < rem {
+                                    e.2 = rem;
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                entry_war[s].push((*o, sr.clone(), rem));
+                                changed = true;
+                            }
+                        }
+                    }
+                    for (i, n, d, r) in &dd {
+                        let rem = i + n - cycle;
+                        match entry_dst[s].iter_mut().find(|(d2, r2, _)| d2 == d && r2 == r) {
+                            Some(e) => {
+                                if e.2 < rem {
+                                    e.2 = rem;
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                entry_dst[s].push((*d, *r, rem));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
     let blocks = std::mem::take(&mut m.blocks);
     let mut out_blocks = Vec::with_capacity(blocks.len());
     for (bi, mut b) in blocks.into_iter().enumerate() {
@@ -554,7 +641,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
         let mut store_data_inflight: Vec<(usize, usize, Vec<(u32, u32)>)> = Vec::new();
         let mut dst_inflight: Vec<(usize, usize, VReg, (u32, u32))> = entry_dst[bi].iter().map(|(d, r, rem)| (0usize, *rem, *d, *r)).collect();
         // (issue cycle, wait states needed, op, source ranges)
-        let mut inflight: Vec<(usize, usize, MOp, Vec<(u32, u32)>)> = Vec::new();
+        let mut inflight: Vec<(usize, usize, MOp, Vec<(u32, u32)>)> = entry_war[bi].iter().map(|(o, s, r)| (0usize, *r, *o, s.clone())).collect();
         let mut cycle = 0usize;
         for inst in b.insts.drain(..) {
             // destination ranges written by this instruction
@@ -681,7 +768,8 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
             dst_inflight.retain(|(issue, need, _, _)| issue + need > cycle);
             store_data_inflight.retain(|(issue, need, _)| issue + need > cycle);
         }
-        let mut missing = inflight.iter().map(|(i, n, _, _)| (i + n).saturating_sub(cycle)).max().unwrap_or(0);
+        // (edgepad: the successors inherit what is still running instead)
+        let mut missing = if edge { 0 } else { inflight.iter().map(|(i, n, _, _)| (i + n).saturating_sub(cycle)).max().unwrap_or(0) };
         while missing > 0 {
             let n = missing.min(8);
             out.push(MInst::new(MOp::SNop).imm(n as i64 - 1));
