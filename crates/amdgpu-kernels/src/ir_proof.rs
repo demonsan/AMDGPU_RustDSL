@@ -16,7 +16,7 @@
 //! tile generation; setting it to 1 reproduces the "tile 1 swallowed" bug in the KERNEL CODE.
 
 use amdgpu_dsl::tile::ev;
-use amdgpu_dsl::{Function, Op, Opnd, Stmt, VarId, ValueId};
+use amdgpu_dsl::{Function, Node, Op, Opnd, RegionKind, Stmt, VarId, ValueId};
 use std::collections::{HashMap, HashSet};
 
 use crate::gemm_mxfp8::GemmConfig;
@@ -75,167 +75,34 @@ impl Args {
     }
 }
 
-#[derive(Clone, Debug)]
-enum Node<'a> {
-    Leaf(&'a Stmt),
-    Loop { vars: Vec<VarId>, init: Vec<Opnd>, body: Vec<Node<'a>> },
-    If { cond: Opnd, then_body: Vec<Node<'a>>, else_body: Vec<Node<'a>> },
-}
-
-fn parse_seq(stmts: &[Stmt], mut i: usize, stop_loop: bool, stop_if: bool) -> (Vec<Node<'_>>, usize) {
-    let mut nodes = Vec::new();
-    while i < stmts.len() {
-        match &stmts[i] {
-            Stmt::EndLoop if stop_loop => break,
-            Stmt::Else if stop_if => break,
-            Stmt::EndIf if stop_if => break,
-            Stmt::BeginLoop { vars, init } => {
-                let begin = (vars.clone(), init.clone());
-                let (body, j) = parse_seq(stmts, i + 1, true, false);
-                let end = j + usize::from(j < stmts.len() && matches!(stmts[j], Stmt::EndLoop));
-                nodes.push(Node::Loop { vars: begin.0, init: begin.1, body });
-                i = end;
-            }
-            Stmt::BeginIf { cond } => {
-                let (then_body, j) = parse_seq(stmts, i + 1, false, true);
-                let mut else_body = Vec::new();
-                let mut k = j;
-                if k < stmts.len() && matches!(stmts[k], Stmt::Else) {
-                    let (e, l) = parse_seq(stmts, k + 1, false, true);
-                    else_body = e; k = l;
-                }
-                let end = k + usize::from(k < stmts.len() && matches!(stmts[k], Stmt::EndIf));
-                nodes.push(Node::If { cond: *cond, then_body, else_body });
-                i = end;
-            }
-            // Tile markers are state changes, not structured scopes for execution.
-            s => { nodes.push(Node::Leaf(s)); i += 1; }
-        }
-    }
-    (nodes, i)
-}
-
-#[derive(Default)]
-pub struct Trace {
-    pub contrib: HashMap<(i64, u32, u8), Vec<i64>>,   // lane, accumulator var, dword -> K generations
-    pub c_count: HashMap<(i64, i64, i64), usize>,    // m, n, kb
-    pub stores: HashSet<i64>,                        // C address (2-byte element index)
-    pub a_tags: HashMap<i64, HashSet<(i64, i64)>>,   // kb -> (m, k)
-    pub b_tags: HashMap<i64, HashSet<(i64, i64)>>,   // kb -> (n, k)
-    pub sa_tags: HashMap<i64, HashSet<(i64, i64)>>,  // kb -> (m, kb)
-    pub sb_tags: HashMap<i64, HashSet<(i64, i64)>>,  // kb -> (block, kb)
-    pub unknown_ops: HashSet<String>,
-    pub buffer_stores: usize,
-    pub buffer_store_no_origin: usize,
-    pub lds_store_origins: usize,
-    pub lds_read_origins: usize,
-    pub sample_store: Option<(String, i64, i64)>,
-    pub sample_store_origin: usize,
-    pub lds_origins_left: usize,
-    pub pass1_origin_left: usize,
-    pub pass1_lds_store_origins: usize,
-    pub pass2_lds_store_origins: usize,
-    pub origin_by_addr: HashMap<i64, (u32, u8)>,
-    pub tag_by_addr: HashMap<i64, Tag>,
-    pub sample_read: Option<(String, i64, i64, usize)>,
-    pub sample_epi_read: Option<(String, i64, i64, usize)>,
-    pub executed_insts: usize,
-}
-
-struct Ctx<'a> {
-    lane: i64,
-    wave: i64,
-    args: &'a Args,
-    vals: HashMap<ValueId, V>,
-    vars: HashMap<VarId, V>,
-    cur_tile: Option<(String, i64)>,
-    pass_writes: bool,
-    lds: &'a mut HashMap<(String, i64, i64), (Tag, Option<(u32, u8)>)>,
-    trace: &'a mut Trace,
-    unknown_control: usize,
-}
-
-impl<'a> Ctx<'a> {
-    fn opnd(&self, o: Opnd) -> V {
-        match o {
-            Opnd::Val(v) => self.vals.get(&v).cloned().unwrap_or(V::Unknown),
-            Opnd::Var(v) => self.vars.get(&v).cloned().unwrap_or(V::Unknown),
-            Opnd::I32(x) => V::Int(x as i64),
-            Opnd::F32(_) => V::Unknown,
-        }
-    }
-    fn int(&self, o: Opnd) -> Option<i64> {
-        match self.opnd(o) { V::Int(x) => Some(x), V::Ptr(_, x) => Some(x), _ => None }
-    }
-    fn set(&mut self, v: ValueId, val: V) { self.vals.insert(v, val); }
-    fn set_var(&mut self, v: VarId, val: V) { self.vars.insert(v, val); }
-
-    fn tag_for(&self, role: PtrRole, off: i64) -> Tag {
-        let (m, n, k) = (self.args.m, self.args.n, self.args.k);
-        let kb = k / 128;
-        match role {
-            PtrRole::A => {
-                if off >= 0 && off < m * k { Tag::A(off / k, off % k) } else { Tag::U }
-            }
-            PtrRole::B => {
-                // B preshuffled image: (n/16) 16K + (k/16) 256 + (n%16) 16 + k%16
-                if off < 0 || off >= n * k { return Tag::U; }
-                let n0 = off / (16 * k);
-                let rem = off % (16 * k);
-                let k0 = rem / 256;
-                let rem2 = rem % 256;
-                let nn = n0 * 16 + rem2 / 16;
-                let kk = k0 * 16 + rem2 % 16;
-                Tag::B(nn, kk)
-            }
-            PtrRole::Sfa => {
-                if off >= 0 && off < kb * m { Tag::Sa(off % m, off / m) } else { Tag::U }
-            }
-            PtrRole::Sfb => {
-                if off >= 0 && off < (n / 128) * kb { Tag::Sb(off / kb, off % kb) } else { Tag::U }
-            }
-            PtrRole::C => Tag::U,
-        }
-    }
-}
-
-fn find_matching(stmts: &[Stmt], start: usize) -> Option<usize> {
-    // only used as a fallback for malformed control (the parser handles normal nesting)
-    let mut d = 0i32;
-    for (i, s) in stmts.iter().enumerate().skip(start) {
-        match s {
-            Stmt::BeginLoop { .. } | Stmt::BeginIf { .. } => d += 1,
-            Stmt::EndLoop | Stmt::EndIf => { d -= 1; if d == 0 { return Some(i); } }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn exec_nodes(nodes: &[Node<'_>], cx: &mut Ctx<'_>) -> bool {
+fn exec_nodes(nodes: &[Node], cx: &mut Ctx<'_>) -> bool {
     // returns true when a BreakIf fired
     for n in nodes {
         match n {
-            Node::Leaf(st) => {
+            Node::S(st) => {
                 if exec_stmt(st, cx) { return true; }
             }
-            Node::If { cond, then_body, else_body } => {
+            Node::If { cond, then, els } => {
                 let c = match cx.opnd(*cond) {
                     V::Int(x) => x != 0,
                     _ => { cx.unknown_control += 1; false }
                 };
-                if c { if exec_nodes(then_body, cx) { return true; } }
-                else if exec_nodes(else_body, cx) { return true; }
+                let branch = if c { then.as_slice() } else { els.as_deref().unwrap_or(&[]) };
+                if exec_nodes(branch, cx) { return true; }
             }
             Node::Loop { vars, init, body } => {
-                let mut first = true;
+                for (v, o) in vars.iter().zip(init.iter()) { let val = cx.opnd(*o); cx.set_var(*v, val); }
                 for _it in 0..8 {
-                    if first {
-                        for (v, o) in vars.iter().zip(init.iter()) { let val = cx.opnd(*o); cx.set_var(*v, val); }
-                        first = false;
-                    }
                     if exec_nodes(body, cx) { break; }
                 }
+            }
+            Node::Region { kind: _, tile, slot: _, version, body } => {
+                let old = cx.cur_tile.clone();
+                let ver = cx.int(*version).unwrap_or(-1);
+                cx.cur_tile = Some((tile.clone(), ver));
+                let br = exec_nodes(body, cx);
+                cx.cur_tile = old;
+                if br { return true; }
             }
         }
     }
@@ -540,8 +407,7 @@ fn lds_read_word(cx: &mut Ctx<'_>, addr: Opnd) -> V {
 
 fn run_lane(f: &Function, lane: i64, wave: i64, args: &Args, pass_writes: bool, lds: &mut HashMap<(String, i64, i64), (Tag, Option<(u32, u8)>)>, trace: &mut Trace) {
     let mut cx = Ctx { lane, wave, args, vals: HashMap::new(), vars: HashMap::new(), cur_tile: None, pass_writes, lds, trace, unknown_control: 0 };
-    let (nodes, _) = parse_seq(&f.stmts, 0, false, false);
-    exec_nodes(&nodes, &mut cx);
+    exec_nodes(f.body(), &mut cx);
 }
 
 pub fn prove_ir(f: &Function, cfg: &GemmConfig, m: i64, n: i64, k: i64) -> Result<Trace, ProofError> {
