@@ -306,11 +306,21 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             match &av { V::Frag { bytes, addr, .. } => { cx.trace.borrow_mut().mfma_a_frag += 1; if addr.is_none() { cx.trace.borrow_mut().mfma_a_addr_none += 1; } if bytes.is_empty() { cx.trace.borrow_mut().mfma_a_bytes_empty += 1; } }, V::Unknown => cx.trace.borrow_mut().mfma_a_unknown += 1, _ => {} }
             let lds_snapshot = cx.lds.borrow();
             let tr = cx.trace.borrow();
-            let a_tags = frag_tags_fallback(&av, &tr, &lds_snapshot);
-            let b_tags = frag_tags_fallback(&bv, &tr, &lds_snapshot);
+            // gemm v4 is built with `swap_ab`: the hardware src A slot carries the logical B
+            // fragment and src B carries logical A; the scale slots are swapped the same way.
+            // Do not assume the slot role: classify every tag by its logical kind.
+            let mut a_tags = Vec::new();
+            let mut b_tags = Vec::new();
+            for tt in frag_tags_fallback(&av, &tr, &lds_snapshot).into_iter()
+                .chain(frag_tags_fallback(&bv, &tr, &lds_snapshot)) {
+                match tt { Tag::A(..) => a_tags.push(tt), Tag::B(..) => b_tags.push(tt), _ => {} }
+            }
+            let mut sa_tags = Vec::new();
+            let mut sb_tags = Vec::new();
+            for tt in word_tags(cx.opnd(*scale_a)).into_iter().chain(word_tags(cx.opnd(*scale_b))) {
+                match tt { Tag::Sa(..) => sa_tags.push(tt), Tag::Sb(..) => sb_tags.push(tt), _ => {} }
+            }
             drop(tr); drop(lds_snapshot);
-            // The K generation comes from the A/B element tags themselves (actual addresses),
-            // with the tile marker as a fallback for an empty fragment.
             let kb = a_tags.iter().find_map(|t| if let Tag::A(_, k) = t { Some(k / 128) } else { None })
                 .or_else(|| b_tags.iter().find_map(|t| if let Tag::B(_, k) = t { Some(k / 128) } else { None }))
                 .unwrap_or_else(|| cx.cur_tile.as_ref().map(|x| x.1).unwrap_or(-1));
@@ -325,8 +335,6 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                 }
                 return false;
             }
-            let sa_tags = word_tags(cx.opnd(*scale_a));
-            let sb_tags = word_tags(cx.opnd(*scale_b));
             for t in &a_tags { if let Tag::A(m, k) = t { cx.trace.borrow_mut().a_tags.entry(kb).or_default().insert((*m, *k)); } }
             for t in &b_tags { if let Tag::B(n, k) = t { cx.trace.borrow_mut().b_tags.entry(kb).or_default().insert((*n, *k)); } }
             for t in &sa_tags { if let Tag::Sa(m, k) = t { cx.trace.borrow_mut().sa_tags.entry(kb).or_default().insert((*m, *k)); } }
