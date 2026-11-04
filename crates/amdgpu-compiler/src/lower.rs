@@ -3285,28 +3285,13 @@ fn dce_cmp_pairs(m: &mut MFunction) {
 /// options (e.g. the global scale loads replaced by LDS scale reads); this removes them. Same values, same
 /// arithmetic for everything that remains.
 fn dce_full(m: &mut MFunction, loads_only: bool) {
-    fn load_op(op: MOp) -> bool {
-        matches!(
-            op,
-            MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::SLoadDwordx4 | MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64 | MOp::LdsReadB64TrB8 | MOp::GlobalLoadU16
-                | MOp::GlobalLoadF32 | MOp::GlobalLoadB128 | MOp::GlobalLoadB128S | MOp::GlobalLoadF32S
-        )
-    }
+    // op_attrs: `dce` (loads are removable in both modes, pure ALU only in the full mode)
     let removable = |op: MOp| -> bool {
-        if load_op(op) {
-            return true;
+        match crate::op_attrs::attrs(op).dce {
+            crate::op_attrs::Dce::Load => true,
+            crate::op_attrs::Dce::Pure => !loads_only,
+            crate::op_attrs::Dce::Keep => false,
         }
-        if loads_only {
-            return false;
-        }
-        matches!(
-            op,
-            MOp::VMovB32 | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VPtrAdd | MOp::VAddU32 | MOp::VAddCoU32 | MOp::VAddcCoU32
-                | MOp::VAddF32 | MOp::VSubF32 | MOp::VMulF32 | MOp::VMaxF32 | MOp::VMax3F32 | MOp::VFmaF32 | MOp::VExpF32 | MOp::VLogF32
-                | MOp::VRcpF32 | MOp::VAndB32 | MOp::VMinI32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32 | MOp::VMulLoU32
-                | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VReadPhys | MOp::VCmpLtI32 | MOp::VCmpGtI32 | MOp::VCmpGeI32
-                | MOp::VCmpNeI32 | MOp::VCmpLtF32
-        )
     };
     let defines_vcc = |op: MOp| op.defines_vcc() || op == MOp::VPtrAdd;
     loop {

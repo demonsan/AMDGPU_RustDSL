@@ -35,102 +35,41 @@ pub fn with_vcc_fill<R>(on: bool, f: impl FnOnce() -> R) -> R {
 }
 
 fn is_transcendental(op: MOp) -> bool {
-    matches!(op, MOp::VExpF32 | MOp::VLogF32 | MOp::VRcpF32)
+    crate::op_attrs::attrs(op).transcendental
 }
 
-/// Independent instructions that must follow an MFMA before its result may be
-/// read (CDNA4 ISA section 7.6, "Table: XDL write VGPR" -> "VALU read/write of
-/// the destination VGPR"). The table lists 5/8/12/20 depending on the opcode
-/// size; the largest value is used for the F8F6F4 shapes, which take 32 to 64
-/// cycles.
+/// Independent instructions that must follow an MFMA before its result may be read (CDNA4 ISA section 7.6; `op_attrs`: `mfma.latency`).
 fn mfma_latency(op: MOp) -> Option<usize> {
-    match op {
-        MOp::VMfma16x16x16F16 => Some(12),
-        MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z => Some(12),
-        MOp::VMfma16x16x32Fp8 => Some(12),
-        MOp::VMfma32x32x16Fp8 => Some(12),
-        MOp::VMfmaScale32x32x64Fp8 | MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x64Fp8 | MOp::VMfma32x32x64Fp8Z => Some(20),
-        MOp::VSmfmac16x16x128Fp8 => Some(20),
-        // 8-pass XDL op: conservatively the 16-pass wait count until the gfx950 table entry is pinned
-        MOp::VMfmaScale16x16x128Fp8 => Some(20),
-        _ => None,
-    }
+    crate::op_attrs::attrs(op).mfma.map(|m| m.latency)
 }
 
-/// In-place accumulating matrix ops whose dependent same-opcode chain is interlocked by the hardware.
+/// In-place accumulating matrix ops whose dependent same-opcode chain is interlocked by the hardware (`mfma.chain`).
 fn chains_in_place(op: MOp) -> bool {
-    matches!(op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VSmfmac16x16x128Fp8 | MOp::VMfmaScale16x16x128Fp8)
+    crate::op_attrs::attrs(op).mfma.map_or(false, |m| m.chain)
 }
 
 fn is_scaled_mfma(op: MOp) -> bool {
-    matches!(op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x64Fp8 | MOp::VMfma32x32x64Fp8Z | MOp::VMfmaScale16x16x128Fp8)
+    crate::op_attrs::attrs(op).mfma.map_or(false, |m| m.scaled)
 }
 
-/// Plain ALU instructions that may be moved ahead of a stalled consumer: no memory, no scalar
-/// state, no `vcc`, no transcendental latency of their own.
+/// Plain ALU instructions that may be moved ahead of a stalled consumer (`movable`).
 fn movable(op: MOp) -> bool {
-    matches!(
-        op,
-        MOp::VMovB32
-            | MOp::VAddU32
-            | MOp::VMulLoU32
-            | MOp::VAndB32
-            | MOp::VMinI32
-            | MOp::VOrB32
-            | MOp::VXorB32
-            | MOp::VLshrB32
-            | MOp::VLshlB32
-            | MOp::VAddF32
-            | MOp::VSubF32
-            | MOp::VMulF32
-            | MOp::VMaxF32
-            | MOp::VMax3F32
-            | MOp::VPermB32
-            | MOp::VPkSubU16
-            | MOp::VFmaF32
-            | MOp::VCvtPkFp8F32
-            | MOp::VCvtPkFp8F32Hi
-            | MOp::VPkAddF32
-            | MOp::VPkMulF32
-            | MOp::VCvtPkBf16F32
-    )
+    crate::op_attrs::attrs(op).movable == crate::op_attrs::Movable::Yes
 }
 
-/// Extra fill candidates when `vcc` filling is on (none touches vcc; partial writers are guarded by the RAW/WAR/WAW check).
+/// Extra fill candidates when `vcc` filling is on.
 fn movable_wide(op: MOp) -> bool {
-    matches!(op, MOp::VCvtPknormU16 | MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VMovFromS)
+    crate::op_attrs::attrs(op).movable == crate::op_attrs::Movable::VccFill
 }
 
-/// VALU instructions whose VGPR result feeding an MFMA operand or a `v_permlane*_swap` needs wait
-/// states first (LLVM GCNHazardRecognizer: 2 states; 4 after carry-out adds). Found by the LLVM-tail
-/// oracle (docs/llvm-tail-integration.md); the exact count is taken from LLVM, not measured.
+/// VALU instructions whose VGPR result feeding an MFMA operand, a permlane, readfirstlane or DPP needs wait states first
+/// (LLVM GCNHazardRecognizer: 2 states; 4 after carry-out adds; `valu_writer_delay`).
 fn valu_writer_delay(op: MOp) -> Option<usize> {
-    match op {
-        MOp::VAddCoU32 | MOp::VAddcCoU32 | MOp::VPtrAdd => Some(4),
-        MOp::VExpF32 | MOp::VLogF32 | MOp::VRcpF32 => None,
-        o if movable(o) => Some(2),
-        // lane write of a fragment (expands to v_mov): the tuple may feed a matrix op next
-        // mask compares write an SGPR pair that the cndmask reads: same 2 wait states as the vcc form (conservative)
-        MOp::VCmpMaskLtI32 | MOp::VCmpMaskGeI32 | MOp::VCmpMaskGtI32 | MOp::VCmpMaskLtF32 => Some(2),
-        MOp::VWriteSub | MOp::VMovFromS | MOp::VMovFromSPair | MOp::VCndmask | MOp::VCvtF32F16 | MOp::VCvtF16F32 | MOp::VCvtPknormU16 => Some(2),
-        // audit (safe-asm review): VALU writers that were missing from the class - the scalef32 half-write converts (P words feeding the PV MFMA),
-        // the permlane swap, and the register reads that expand to v_mov
-        MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VPermlane32Swap | MOp::VReadPhys | MOp::VReadSub => Some(2),
-        // v_accvgpr_read/write/mov are VALU writes of a VGPR/AGPR: VALU write -> MFMA read = 2 wait states (CDNA4 ISA 7.6 table 38; the ISA table does not separate the files)
-        MOp::VAccvgprRead | MOp::VAccvgprWrite | MOp::VAccvgprMov => Some(2),
-        // a DPP move is a VALU write like any other
-        MOp::VMovDpp => Some(2),
-        _ => None,
-    }
+    crate::op_attrs::attrs(op).valu_writer_delay
 }
 
 fn reads_valu_hazard_operands(op: MOp) -> bool {
-    // v_readfirstlane reading a VGPR the previous VALU instruction wrote needs the same 2 wait states (found on hardware:
-    // v_add d; v_readfirstlane s, d; s_mov m0, s; global_load_lds read a stale lane value)
-    // SMFMAC: a VALU write of A, B, SRC2 or the accumulator C needs 2 wait states (8 clocks) before the matrix op (CDNA4 ISA 7.6,
-    // docs/vendor-spec.md 4.5.2); C is srcs[3] of the MIR op so it is covered like any other source.
-    // DPP: a VALU write of a VGPR read by a DPP instruction needs 2 wait states (gfx9 `VALUWriteVGPR -> DPP read`, LLVM checkDPPHazards)
-    is_scaled_mfma(op) || matches!(op, MOp::VCndmaskM | MOp::VSmfmac16x16x128Fp8 | MOp::VReadFirstLane | MOp::VMovDpp | MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
+    crate::op_attrs::attrs(op).reads_valu_hazard
 }
 
 /// Instructions the scanner must never look past (waits, barriers, nops).
@@ -148,7 +87,7 @@ fn first_touch(s: usize, d0: usize, hops: usize, need: usize, reg: VReg, from_mf
         let touches = x.uses().iter().any(|u| canon(*u) == reg) || x.dst.map(|y| canon(y) == reg).unwrap_or(false);
         if touches {
             let chain = from_mfma
-                && matches!(x.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VMfmaScale16x16x128Fp8)
+                && crate::op_attrs::attrs(x.op).mfma.map_or(false, |m| m.chain && !m.sparse)
                 && matches!(x.srcs.get(2), Some(Src::Reg(c)) if canon(*c) == reg);
             return if chain { usize::MAX } else { d };
         }
@@ -468,16 +407,12 @@ const STORE_DATA_WAIT: usize = 3;
 
 /// Global stores of more than 64 bits of data (`global_store_dwordx3/x4`): the data VGPRs are read over several cycles after issue.
 fn is_wide_vmem_store(op: MOp) -> bool {
-    matches!(op, MOp::GlobalStoreF32x4 | MOp::GlobalStoreF32x4Sc1 | MOp::BufferStoreDwordX4)
+    crate::op_attrs::attrs(op).wide_store_data.is_some()
 }
 
 /// Index of the data register among the sources of a wide store (global stores: [ptr, data]; buffer stores: [data, rsrc, voff, soff]).
 fn wide_store_data_idx(op: MOp) -> usize {
-    if op == MOp::BufferStoreDwordX4 {
-        0
-    } else {
-        1
-    }
+    crate::op_attrs::attrs(op).wide_store_data.unwrap_or(1)
 }
 
 /// VGPR or AGPR (the two files of the unified register file): the hazards below apply to both. Physical ranges are tagged per file (AGPR_TAG), so a\n/// VGPR range never overlaps an AGPR range.
@@ -564,7 +499,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                     }
                 }
             }
-        } else if !matches!(inst.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x64Fp8Z | MOp::VMfma32x32x8F16Z) {
+        } else if !crate::op_attrs::attrs(inst.op).mfma.map_or(false, |m| m.zero_c) {
             if let Some(Src::Reg(r)) = inst.srcs.get(2) {
                 if vl(m.vreg_class(*r)) {
                     srcs.push(rng(m, *r));
@@ -715,7 +650,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
             }
             for (issue, need, op, srcs) in &inflight {
-                if inst.op == *op && matches!(inst.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VSmfmac16x16x128Fp8 | MOp::VMfmaScale16x16x128Fp8) {
+                if inst.op == *op && chains_in_place(inst.op) {
                     continue; // in-place accumulation chain of the same opcode
                 }
                 if wr.iter().any(|w| srcs.iter().any(|s| overlaps(*w, *s))) {
@@ -743,7 +678,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                             }
                         }
                     }
-                } else if !matches!(inst.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x64Fp8Z | MOp::VMfma32x32x8F16Z) {
+                } else if !crate::op_attrs::attrs(inst.op).mfma.map_or(false, |m| m.zero_c) {
                     if let Some(Src::Reg(r)) = inst.srcs.get(2) {
                         if vl(m.vreg_class(*r)) {
                             srcs.push(rng(m, *r));

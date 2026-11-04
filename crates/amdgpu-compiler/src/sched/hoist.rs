@@ -12,12 +12,12 @@ use super::{liveness, verify, Options};
 use crate::mir::*;
 
 fn is_lds_read(op: MOp) -> bool {
-    matches!(op, MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64 | MOp::LdsReadB64TrB8)
+    crate::op_attrs::attrs(op).is_lds_read()
 }
 
 /// Plain ALU / scalar instructions that may travel with a hoisted load: no memory access, no fence, not pinned, not a matrix op.
 fn chain_movable(i: &MInst, e: &Effects) -> bool {
-    e.mem.is_none() && e.fence == Fence::None && !e.smem && !e.pinned && i.op != MOp::SchedGroup && !crate::agpr::is_mfma(i.op) && i.op != MOp::VSmfmac16x16x128Fp8
+    e.mem.is_none() && e.fence == Fence::None && !e.smem && !e.pinned && i.op != MOp::SchedGroup && crate::op_attrs::attrs(i.op).mfma.is_none()
 }
 
 pub fn run(m: &mut MFunction, o: &Options) -> usize {

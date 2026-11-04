@@ -275,23 +275,14 @@ pub enum MOp {
 
 impl MOp {
     /// Does this instruction consume `vcc` from the immediately preceding
-    /// instruction? Used by the verifier to guarantee adjacency.
+    /// instruction? Used by the verifier to guarantee adjacency. (`op_attrs`: `consumes_vcc`)
     pub fn consumes_vcc(self) -> bool {
-        matches!(self, MOp::VAddcCoU32 | MOp::VCndmask)
+        crate::op_attrs::attrs(self).consumes_vcc
     }
 
-    /// Does this instruction define `vcc`?
+    /// Does this instruction define `vcc`? (`op_attrs`: `defines_vcc`)
     pub fn defines_vcc(self) -> bool {
-        matches!(
-            self,
-            MOp::VAddCoU32
-                | MOp::VAddcCoU32
-                | MOp::VCmpLtI32
-                | MOp::VCmpGeI32
-                | MOp::VCmpGtI32
-                | MOp::VCmpNeI32
-                | MOp::VCmpLtF32
-        )
+        crate::op_attrs::attrs(self).defines_vcc
     }
 }
 

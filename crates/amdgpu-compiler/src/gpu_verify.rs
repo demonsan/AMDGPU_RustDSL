@@ -1780,19 +1780,8 @@ const SGPR_LIMIT: u32 = 102;
 const LDS_LIMIT: u32 = 160 * 1024;
 
 fn is_matrix_op(op: MOp) -> bool {
-    matches!(
-        op,
-        MOp::VMfma16x16x16F16
-            | MOp::VMfma32x32x8F16
-            | MOp::VMfma32x32x8F16Z
-            | MOp::VMfma16x16x32Fp8
-            | MOp::VMfma32x32x16Fp8
-            | MOp::VMfmaScale32x32x64Fp8
-            | MOp::VMfmaScale16x16x128Fp8
-            | MOp::VMfmaScale32x32x64Fp8Z
-            | MOp::VMfma32x32x64Fp8
-            | MOp::VMfma32x32x64Fp8Z
-    )
+    // every MFMA except the sparse smfmac (op_attrs)
+    crate::agpr::is_mfma(op)
 }
 
 /// Final-MIR verification: every allocated register obeys the class rules and the declared limits; matrix operands do not overlap their destination;
@@ -1915,7 +1904,7 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
     // MFMA vdst and srcC must be in the same register file (arch VGPR / AGPR) - the acc_cd bit selects one file for both
     for (bi, b) in m.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
-            if !crate::agpr::is_mfma(i.op) || matches!(i.op, MOp::VMfmaScale32x32x64Fp8Z | MOp::VMfma32x32x8F16Z | MOp::VMfma32x32x64Fp8Z) {
+            if !crate::agpr::is_mfma(i.op) || crate::op_attrs::attrs(i.op).mfma.map_or(false, |m| m.zero_c) {
                 continue;
             }
             if let (Some(d), Some(Src::Reg(c))) = (i.dst, i.srcs.get(2)) {

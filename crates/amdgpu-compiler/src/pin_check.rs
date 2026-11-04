@@ -73,8 +73,8 @@ pub fn check(m: &MFunction) -> Vec<String> {
                 }
                 continue;
             }
-            let lo = matches!(i.op, MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8F32);
-            let hi = matches!(i.op, MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi);
+            let lo = crate::op_attrs::attrs(i.op).half == Some(crate::op_attrs::Half::Lo);
+            let hi = crate::op_attrs::attrs(i.op).half == Some(crate::op_attrs::Half::Hi);
             for s in &i.srcs {
                 if let Src::Reg(r) = s {
                     if let Some(h) = halves.get(r) {

@@ -24,7 +24,7 @@ pub const DS_READ: u32 = 0x100;
 pub const DS_WRITE: u32 = 0x200;
 
 fn is_matrix(op: MOp) -> bool {
-    crate::agpr::is_mfma(op) || op == MOp::VSmfmac16x16x128Fp8
+    crate::op_attrs::attrs(op).mfma.is_some()
 }
 
 /// LLVM-style class mask of an instruction.

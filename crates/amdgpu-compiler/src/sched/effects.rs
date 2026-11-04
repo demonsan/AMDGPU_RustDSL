@@ -11,7 +11,7 @@ pub type Slot = u32;
 pub const VCC: Slot = u32::MAX;
 pub const SCC: Slot = u32::MAX - 1;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Space {
     Lds,
     Global,
@@ -72,29 +72,21 @@ pub fn effects(m: &MFunction, inst: &MInst) -> Effects {
 }
 
 fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
+    use crate::op_attrs::{Base, FenceAttr, RegFx};
+    let at = crate::op_attrs::attrs(inst.op);
     let mut e = Effects::default();
-    match inst.op {
-        MOp::SNop | MOp::SEndpgm => {
-            e.fence = Fence::Nop;
-            return e;
-        }
-        MOp::SWaitVm => {
-            e.fence = Fence::WaitVm(inst.imm);
-            return e;
-        }
-        MOp::SWaitLgkm => {
-            e.fence = Fence::WaitLgkm(inst.imm);
-            return e;
-        }
-        MOp::SBarrier => {
-            e.fence = Fence::Barrier;
-            return e;
-        }
-        MOp::SSetPrio => {
-            e.fence = Fence::SetPrio;
-            return e;
-        }
-        _ => {}
+    let fence = match at.fence {
+        FenceAttr::None => Fence::None,
+        FenceAttr::Nop => Fence::Nop,
+        FenceAttr::WaitVm => Fence::WaitVm(inst.imm),
+        FenceAttr::WaitLgkm => Fence::WaitLgkm(inst.imm),
+        FenceAttr::Barrier => Fence::Barrier,
+        FenceAttr::SetPrio => Fence::SetPrio,
+    };
+    // fence-only instructions (nops, waits, barriers, setprio, endpgm): no register effects
+    if at.fence_only {
+        e.fence = fence;
+        return e;
     }
     for s in &inst.srcs {
         if let Src::Reg(r) = s {
@@ -114,29 +106,29 @@ fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
             _ => None,
         }
     };
-    let base_slot = |k: usize| -> Option<Slot> { src_reg(k).map(|r| reg_slots(m, r)[0]) };
-    match inst.op {
-        MOp::VWriteSub => {
+    match at.regfx {
+        RegFx::Plain => {}
+        RegFx::SubWrite => {
             if let Some(d) = inst.dst {
                 let sl = reg_slots(m, d);
                 e.writes = vec![sl[(inst.imm as usize).min(sl.len() - 1)]];
             }
         }
-        MOp::VReadSub => {
+        RegFx::SubRead => {
             if let Some(r) = src_reg(0) {
                 let sl = reg_slots(m, r);
                 e.reads = vec![sl[(inst.imm as usize).min(sl.len() - 1)]];
             }
         }
         // Partial (16-bit) writers: the other half of the destination survives, so the old value is read.
-        MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi => {
+        RegFx::PartialWrite => {
             if let Some(d) = inst.dst {
                 for x in reg_slots(m, d) {
                     push_unique(&mut e.reads, x);
                 }
             }
         }
-        MOp::VPermlane32Swap => {
+        RegFx::SwapSrc01 => {
             for k in 0..2 {
                 if let Some(r) = src_reg(k) {
                     for x in reg_slots(m, r) {
@@ -145,117 +137,28 @@ fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
                 }
             }
         }
-        MOp::VPtrAdd | MOp::VAddCoU32 => push_unique(&mut e.writes, VCC),
-        MOp::VAddcCoU32 => {
-            push_unique(&mut e.reads, VCC);
-            push_unique(&mut e.writes, VCC);
-        }
-        MOp::VCmpLtI32 | MOp::VCmpGeI32 | MOp::VCmpGtI32 | MOp::VCmpNeI32 | MOp::VCmpLtF32 => push_unique(&mut e.writes, VCC),
-        MOp::VCndmask => push_unique(&mut e.reads, VCC),
-        MOp::SAddU32 | MOp::SShlB32 | MOp::SLshrB32 | MOp::SAndB32 | MOp::SXorB32 | MOp::SCmpLtI32 | MOp::SMinI32 => push_unique(&mut e.writes, SCC),
-        MOp::SCselectB32 | MOp::SCselectB64 | MOp::SCselectB128 => push_unique(&mut e.reads, SCC),
-        MOp::SAddcU32 => {
-            push_unique(&mut e.reads, SCC);
-            push_unique(&mut e.writes, SCC);
-        }
-        MOp::LdsReadB32 => {
-            e.mem = Some(MemAccess { space: Space::Lds, write: false, base: base_slot(0), off: inst.imm, size: 4 })
-        }
-        MOp::LdsReadB128 => {
-            e.mem = Some(MemAccess { space: Space::Lds, write: false, base: base_slot(0), off: inst.imm, size: 16 })
-        }
-        MOp::LdsReadB64 => {
-            e.mem = Some(MemAccess { space: Space::Lds, write: false, base: base_slot(0), off: inst.imm, size: 8 })
-        }
-        MOp::LdsWriteB64 => {
-            e.mem = Some(MemAccess { space: Space::Lds, write: true, base: base_slot(0), off: inst.imm, size: 8 })
-        }
-        MOp::LdsReadB64TrB8 => {
-            e.mem = Some(MemAccess { space: Space::Lds, write: false, base: base_slot(0), off: inst.imm, size: 8 })
-        }
-        MOp::LdsWriteB32 => {
-            e.mem = Some(MemAccess { space: Space::Lds, write: true, base: base_slot(0), off: inst.imm, size: 4 })
-        }
-        MOp::LdsWriteB128 => {
-            e.mem = Some(MemAccess { space: Space::Lds, write: true, base: base_slot(0), off: inst.imm, size: 16 })
-        }
-        MOp::GlobalLoadU16 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 2 })
-        }
-        MOp::GlobalLoadF32Sc1 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 4 })
-        }
-        MOp::GlobalLoadB128Sc1 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 16 })
-        }
-        MOp::GlobalStoreF32Sc1 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 4 })
-        }
-        MOp::GlobalStoreF32x4Sc1 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 16 })
-        }
-        // read-modify-write with a result: a global access (vmcnt queue entry whose destination is the old value)
-        MOp::GlobalAtomicAddRet => {
-            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 4 })
-        }
-        // cache maintenance: ordered against every memory access, never reordered, no register effects
-        MOp::BufferWbl2 | MOp::BufferInv => {
-            e.fence = Fence::Barrier;
-            return e;
-        }
-        MOp::GlobalLoadF32 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 4 })
-        }
-        MOp::GlobalLoadB128S => {
-            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(1), off: inst.imm, size: 16 })
-        }
-        MOp::GlobalLoadF32S => {
-            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(1), off: inst.imm, size: 4 })
-        }
-        MOp::GlobalLoadB128 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 16 })
-        }
-        // MUBUF: the per-lane address is not an affine function of one base register, so the access is modelled with an unknown base (always may-alias)
-        MOp::BufferLoadDwordX1 => e.mem = Some(MemAccess { space: Space::Global, write: false, base: None, off: inst.imm, size: 4 }),
-        MOp::BufferLoadDwordX2 => e.mem = Some(MemAccess { space: Space::Global, write: false, base: None, off: inst.imm, size: 8 }),
-        MOp::BufferLoadDwordX4 => e.mem = Some(MemAccess { space: Space::Global, write: false, base: None, off: inst.imm, size: 16 }),
-        MOp::BufferStoreDwordX1 => e.mem = Some(MemAccess { space: Space::Global, write: true, base: None, off: inst.imm, size: 4 }),
-        MOp::BufferStoreDwordX2 => e.mem = Some(MemAccess { space: Space::Global, write: true, base: None, off: inst.imm, size: 8 }),
-        MOp::BufferStoreDwordX4 => e.mem = Some(MemAccess { space: Space::Global, write: true, base: None, off: inst.imm, size: 16 }),
-        MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds => {
-            // reads global memory and writes LDS through M0 (no VGPR destination): same model as the global_load_lds DMA
-            e.mem = Some(MemAccess { space: Space::Global, write: false, base: None, off: inst.imm, size: 16 });
-            e.fence = Fence::Barrier;
-        }
-        MOp::GlobalLoadLdsB128S | MOp::GlobalLoadLdsB32S => {
-            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(1), off: inst.imm, size: 16 });
-            e.fence = Fence::Barrier;
-        }
-        MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 => {
-            // reads global memory and writes LDS through M0: modelled as a global read with a fence-like LDS write
-            e.mem = Some(MemAccess { space: Space::Global, write: false, base: base_slot(0), off: inst.imm, size: 16 });
-            e.fence = Fence::Barrier;
-        }
-        MOp::GlobalStoreU16 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 2 })
-        }
-        MOp::GlobalStoreF32 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 4 })
-        }
-        MOp::GlobalStoreF32x2 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 8 })
-        }
-        MOp::GlobalStoreF32x4 => {
-            e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 16 })
-        }
-        MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::SLoadDwordx4 => e.smem = true,
-        // a timing stamp: SMEM result, and pinned in program order against every other memory op so it measures what it brackets
-        MOp::SMemTime => {
-            e.smem = true;
-            e.fence = Fence::Barrier;
-        }
-        _ => {}
     }
+    if at.vcc_read {
+        push_unique(&mut e.reads, VCC);
+    }
+    if at.vcc_write {
+        push_unique(&mut e.writes, VCC);
+    }
+    if at.scc_read {
+        push_unique(&mut e.reads, SCC);
+    }
+    if at.scc_write {
+        push_unique(&mut e.writes, SCC);
+    }
+    if let Some(ma) = at.mem {
+        let base = match ma.base {
+            Base::Src(k) => src_reg(k).map(|r| reg_slots(m, r)[0]),
+            Base::Unknown => None,
+        };
+        e.mem = Some(MemAccess { space: ma.space, write: ma.write, base, off: inst.imm, size: ma.size });
+    }
+    e.fence = fence;
+    e.smem = at.smem;
     e
 }
 

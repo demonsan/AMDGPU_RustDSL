@@ -15,6 +15,9 @@ pub mod hostgen;
 pub mod hazards;
 pub mod lower;
 pub mod mir;
+pub mod op_attrs;
+#[cfg(test)]
+mod op_attrs_equiv;
 pub mod regalloc;
 pub mod sched;
 
@@ -281,7 +284,13 @@ pub fn export_mir(f: &amdgpu_dsl::Function, tail: &backend::LlvmTail) -> Result<
 /// Does the kernel contain own-backend-only MOps (the LDS-DMA loads)? The LLVM tail cannot express them.
 pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
     match lower::lower_with_extra(f, &[]) {
-        Ok(m) => m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, mir::MOp::GlobalLoadLdsB128 | mir::MOp::GlobalLoadLdsB32 | mir::MOp::GlobalLoadLdsB128S | mir::MOp::GlobalLoadLdsB32S | mir::MOp::BufferLoadDwordX4Lds | mir::MOp::BufferLoadDwordX1Lds | mir::MOp::SMinI32 | mir::MOp::SCselectB32 | mir::MOp::SCselectB64 | mir::MOp::SCselectB128 | mir::MOp::VMovDpp | mir::MOp::SLoadDwordx4) || (!llvm_tail_has_rows() && matches!(i.op, mir::MOp::BufferWbl2 | mir::MOp::BufferInv | mir::MOp::GlobalAtomicAddRet)))),
+        Ok(m) => m.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| match op_attrs::attrs(i.op).backend {
+                op_attrs::Backend::OwnOnly => true,
+                op_attrs::Backend::OwnOnlyIfNoRows => !llvm_tail_has_rows(),
+                op_attrs::Backend::Llvm | op_attrs::Backend::NoRow => false,
+            })
+        }),
         Err(_) => false,
     }
 }

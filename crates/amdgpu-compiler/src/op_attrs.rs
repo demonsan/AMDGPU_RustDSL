@@ -1,0 +1,434 @@
+//! Per-opcode attribute table: the SINGLE source of truth for what a machine op is (docs/op-attributes.md).
+//!
+//! Every pass that needs a property of an opcode class reads it here instead of enumerating opcode names: the scheduler's cost
+//! model and effects (memory space / direction / base operand / size, `smem`, fences, `vcc` / `scc` reads and writes, sub-register
+//! and partial writes), the value- and physical-level hazard passes (MFMA latency / in-place chains / scaled / zero-C, transcendental,
+//! VALU-writer delay, readers of VALU hazards, movable fill candidates, wide-store data operand), AGPR legality, the `M0` source of
+//! LDS-DMA forms, dead-code elimination, the backend policy (LLVM-tail row vs own-only) and the emitted mnemonic.
+//! (TIRx: operators carry attributes; passes look them up.)
+//!
+//! `attrs_of` is an exhaustive `match` (no wildcard): a new `MOp` does not compile until it has a row. Identity checks for one
+//! specific instruction (`op == MOp::SNop`, the builders in `lower.rs`) are not classes and stay where they are.
+
+use crate::mir::MOp;
+use crate::sched::effects::Space;
+use crate::sched::model::{c, co, Grade, OpCost, Pipe};
+
+/// Fence class of an instruction (scheduler ordering).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FenceAttr {
+    None,
+    Nop,
+    /// `s_waitcnt vmcnt(imm)`
+    WaitVm,
+    /// `s_waitcnt lgkmcnt(imm)`
+    WaitLgkm,
+    Barrier,
+    SetPrio,
+}
+
+/// How the register operands map to read / written dword slots beyond "sources read, destination written".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegFx {
+    Plain,
+    /// writes only the dword `imm` of the destination (fragment lane write)
+    SubWrite,
+    /// reads only the dword `imm` of source 0 (fragment lane read)
+    SubRead,
+    /// 16-bit half writer: the other half survives, so the destination is also read
+    PartialWrite,
+    /// `v_permlane32_swap`: sources 0 and 1 are both written
+    SwapSrc01,
+}
+
+/// Base address operand of a memory access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Base {
+    /// the first dword slot of source `k`
+    Src(usize),
+    /// not an affine function of one register (MUBUF): always may-alias
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemAttr {
+    pub space: Space,
+    pub write: bool,
+    pub base: Base,
+    /// bytes
+    pub size: i64,
+}
+
+/// Matrix-core properties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MfmaAttr {
+    /// independent wait states before the destination may be read (CDNA4 ISA 7.6)
+    pub latency: usize,
+    /// a dependent in-place accumulation of the same opcode is interlocked by the hardware
+    pub chain: bool,
+    /// the 32x32x64 f8f6f4 family and the scaled 16x16x128 (reader of VALU hazards; hardware-confirmed +1 wait state)
+    pub scaled: bool,
+    /// inline-zero accumulator (no C operand)
+    pub zero_c: bool,
+    /// sparse `v_smfmac` (A/B/SRC2/C operand rules differ)
+    pub sparse: bool,
+}
+
+/// Candidate for the hazard pass's in-block fill scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Movable {
+    No,
+    Yes,
+    /// only when `vcc` filling is on (`hazards::with_vcc_fill`)
+    VccFill,
+}
+
+/// Dead-code elimination class (`lower::dce_full`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dce {
+    Keep,
+    /// a load: removable when its result is unused (also in the loads-only mode)
+    Load,
+    /// pure ALU: removable when its result (and the `vcc` it writes) is unused
+    Pure,
+}
+
+/// Backend policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// has rows in `llvm20.tbl` and `llvm24.tbl`
+    Llvm,
+    /// the LLVM tail cannot express it: a kernel using it is compiled by the own tail (`uses_own_only_ops`)
+    OwnOnly,
+    /// has rows, but is own-only when the tables carry no rows for it (`llvm_tail_has_rows`)
+    OwnOnlyIfNoRows,
+    /// no LLVM rows and not (yet) routed to the own tail: only the own backend can emit it (documented gap)
+    NoRow,
+}
+
+/// Which 16-bit half a partial writer writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Half {
+    Lo,
+    Hi,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct OpAttrs {
+    /// primary assembly mnemonic (pseudo ops: the expansion's first instruction)
+    pub mnemonic: &'static str,
+    pub cost: OpCost,
+    pub fence: FenceAttr,
+    /// fence-only instruction: no register effects at all (effects return before the operands)
+    pub fence_only: bool,
+    pub mem: Option<MemAttr>,
+    /// scalar memory load (lgkmcnt, out of order)
+    pub smem: bool,
+    pub regfx: RegFx,
+    /// effects: implicit `vcc` read / write (includes the carry of the 64-bit pointer add)
+    pub vcc_read: bool,
+    pub vcc_write: bool,
+    /// `MOp::defines_vcc` / `MOp::consumes_vcc`: the explicit vcc producers / consumers that must stay adjacent (excludes the pointer-add pseudo)
+    pub defines_vcc: bool,
+    pub consumes_vcc: bool,
+    pub scc_read: bool,
+    pub scc_write: bool,
+    /// source index holding the `M0` value (LDS-DMA forms)
+    pub m0_src: Option<usize>,
+    pub mfma: Option<MfmaAttr>,
+    /// `v_exp` / `v_log` / `v_rcp`: result latency (TRANS_LATENCY)
+    pub transcendental: bool,
+    pub movable: Movable,
+    /// wait states a VALU result needs before an MFMA operand / permlane / readfirstlane / DPP read (None: not such a writer)
+    pub valu_writer_delay: Option<usize>,
+    /// reads operands subject to the VALU-write hazard
+    pub reads_valu_hazard: bool,
+    /// wide (> 8 bytes) VMEM store: index of the data source (2 wait states before a VALU may overwrite it)
+    pub wide_store_data: Option<usize>,
+    /// the destination may be an AGPR
+    pub agpr_dst: bool,
+    /// bit k: source k may be an AGPR
+    pub agpr_srcs: u8,
+    /// 16-bit half writer
+    pub half: Option<Half>,
+    pub dce: Dce,
+    pub backend: Backend,
+}
+
+const fn a(mnemonic: &'static str, cost: OpCost) -> OpAttrs {
+    OpAttrs {
+        mnemonic,
+        cost,
+        fence: FenceAttr::None,
+        fence_only: false,
+        mem: None,
+        smem: false,
+        regfx: RegFx::Plain,
+        vcc_read: false,
+        vcc_write: false,
+        defines_vcc: false,
+        consumes_vcc: false,
+        scc_read: false,
+        scc_write: false,
+        m0_src: None,
+        mfma: None,
+        transcendental: false,
+        movable: Movable::No,
+        valu_writer_delay: None,
+        reads_valu_hazard: false,
+        wide_store_data: None,
+        agpr_dst: false,
+        agpr_srcs: 0,
+        half: None,
+        dce: Dce::Keep,
+        backend: Backend::Llvm,
+    }
+}
+
+impl OpAttrs {
+    const fn fence(self, f: FenceAttr) -> Self {
+        OpAttrs { fence: f, ..self }
+    }
+    const fn fence_only(self, f: FenceAttr) -> Self {
+        OpAttrs { fence: f, fence_only: true, ..self }
+    }
+    const fn mem(self, space: Space, write: bool, base: Base, size: i64) -> Self {
+        OpAttrs { mem: Some(MemAttr { space, write, base, size }), ..self }
+    }
+    const fn smem(self) -> Self {
+        OpAttrs { smem: true, ..self }
+    }
+    const fn regfx(self, r: RegFx) -> Self {
+        OpAttrs { regfx: r, ..self }
+    }
+    const fn vcc(self, read: bool, write: bool) -> Self {
+        OpAttrs { vcc_read: read, vcc_write: write, ..self }
+    }
+    const fn def_vcc(self) -> Self {
+        OpAttrs { defines_vcc: true, ..self }
+    }
+    const fn use_vcc(self) -> Self {
+        OpAttrs { consumes_vcc: true, ..self }
+    }
+    const fn scc(self, read: bool, write: bool) -> Self {
+        OpAttrs { scc_read: read, scc_write: write, ..self }
+    }
+    const fn m0(self, k: usize) -> Self {
+        OpAttrs { m0_src: Some(k), ..self }
+    }
+    const fn mfma(self, latency: usize, chain: bool, scaled: bool, zero_c: bool, sparse: bool) -> Self {
+        OpAttrs { mfma: Some(MfmaAttr { latency, chain, scaled, zero_c, sparse }), reads_valu_hazard: true, ..self }
+    }
+    const fn trans(self) -> Self {
+        OpAttrs { transcendental: true, ..self }
+    }
+    const fn movable(self, m: Movable) -> Self {
+        OpAttrs { movable: m, ..self }
+    }
+    const fn wdelay(self, n: usize) -> Self {
+        OpAttrs { valu_writer_delay: Some(n), ..self }
+    }
+    const fn hz_reader(self) -> Self {
+        OpAttrs { reads_valu_hazard: true, ..self }
+    }
+    const fn wide_store(self, k: usize) -> Self {
+        OpAttrs { wide_store_data: Some(k), ..self }
+    }
+    const fn agpr(self, dst: bool, srcs: u8) -> Self {
+        OpAttrs { agpr_dst: dst, agpr_srcs: srcs, ..self }
+    }
+    const fn half(self, h: Half) -> Self {
+        OpAttrs { half: Some(h), ..self }
+    }
+    const fn dce(self, d: Dce) -> Self {
+        OpAttrs { dce: d, ..self }
+    }
+    const fn backend(self, b: Backend) -> Self {
+        OpAttrs { backend: b, ..self }
+    }
+    /// A matrix op of the AGPR-capable family (every MFMA except the sparse `v_smfmac`).
+    pub fn is_mfma(&self) -> bool {
+        matches!(self.mfma, Some(m) if !m.sparse)
+    }
+    /// Source `k` may be an AGPR.
+    pub fn agpr_src(&self, k: usize) -> bool {
+        k < 8 && self.agpr_srcs >> k & 1 == 1
+    }
+    /// An LDS read (hoisting candidate).
+    pub fn is_lds_read(&self) -> bool {
+        matches!(self.mem, Some(m) if m.space as u8 == Space::Lds as u8 && !m.write)
+    }
+}
+
+/// The attributes of `op`.
+pub fn attrs(op: MOp) -> OpAttrs {
+    attrs_of(op)
+}
+
+const fn attrs_of(op: MOp) -> OpAttrs {
+    use Base::*;
+    use Dce::*;
+    use FenceAttr as F;
+    use Grade::*;
+    use MOp::*;
+    use Movable::*;
+    use Pipe::*;
+    use Space::{Global as G, Lds as L};
+    // VALU issue: one wave64 VALU every 4 cycles (V)
+    let valu = c(Valu, 4, 4, Verified);
+    let valu8 = c(Valu, 8, 8, Verified);
+    let salu = c(Salu, 4, 4, Verified);
+    let ctrl = c(Ctrl, 4, 4, Verified);
+    let mfma64 = c(Mfma, 64, 84, Verified);
+    let mfma32 = c(Mfma, 32, 48, Verified);
+    let mfma16 = c(Mfma, 16, 32, Verified);
+    let ld4 = c(Vmem, 4, 220, Experimental);
+    let ld16 = c(Vmem, 14, 240, Experimental);
+    let st = c(Vmem, 8, 4, Unknown);
+    let dma = c(Vmem, 14, 240, Unknown);
+    let smem = c(Smem, 4, 200, Unknown);
+    match op {
+        // ---- vector ALU
+        VMovB32 => a("v_mov_b32", co(Valu, 4, 2, 4, Verified)).movable(Yes).wdelay(2).dce(Pure),
+        VMovFromS => a("v_mov_b32", valu).movable(VccFill).wdelay(2).dce(Pure),
+        VMovFromSPair => a("v_mov_b32", c(Valu, 8, 8, Experimental)).wdelay(2).dce(Pure),
+        VPtrAdd => a("v_add_co_u32", c(Valu, 8, 8, Experimental)).vcc(false, true).wdelay(4).dce(Pure),
+        VReadPhys => a("v_mov_b32", valu).wdelay(2).dce(Pure),
+        VReadFirstLane => a("v_readfirstlane_b32", c(Valu, 4, 12, Unknown)).hz_reader(),
+        VMovDpp => a("v_mov_b32_dpp", c(Valu, 4, 8, Unknown)).wdelay(2).hz_reader().backend(Backend::OwnOnly),
+        VCvtPknormU16 => a("v_cvt_pknorm_u16_f32", valu).movable(VccFill).wdelay(2),
+        VCvtPkFp8F32 => a("v_cvt_pk_fp8_f32", valu8).regfx(RegFx::PartialWrite).half(Half::Lo).movable(Yes).wdelay(2),
+        VCvtPkBf16F32 => a("v_cvt_pk_bf16_f32", valu).movable(Yes).wdelay(2),
+        VCvtPkFp8Lo => a("v_cvt_scalef32_pk_fp8_f32", valu8).regfx(RegFx::PartialWrite).half(Half::Lo).movable(VccFill).wdelay(2),
+        VCvtPkFp8Hi => a("v_cvt_scalef32_pk_fp8_f32", valu8).regfx(RegFx::PartialWrite).half(Half::Hi).movable(VccFill).wdelay(2),
+        VCvtPkFp8F32Hi => a("v_cvt_pk_fp8_f32", valu8).regfx(RegFx::PartialWrite).half(Half::Hi).movable(Yes).wdelay(2),
+        VPkAddF32 => a("v_pk_add_f32", valu).movable(Yes).wdelay(2),
+        VPermlane32Swap => a("v_permlane32_swap_b32", valu8).regfx(RegFx::SwapSrc01).wdelay(2).hz_reader(),
+        VPkMulF32 => a("v_pk_mul_f32", valu).movable(Yes).wdelay(2),
+        VAddU32 => a("v_add_u32", valu).movable(Yes).wdelay(2).dce(Pure),
+        VAddCoU32 => a("v_add_co_u32", valu).vcc(false, true).def_vcc().wdelay(4).dce(Pure),
+        VAddcCoU32 => a("v_addc_co_u32", valu).vcc(true, true).def_vcc().use_vcc().wdelay(4).dce(Pure),
+        VAddF32 => a("v_add_f32", co(Valu, 4, 2, 4, Verified)).movable(Yes).wdelay(2).dce(Pure),
+        VSubF32 => a("v_sub_f32", co(Valu, 4, 2, 4, Verified)).movable(Yes).wdelay(2).dce(Pure),
+        VMulF32 => a("v_mul_f32", co(Valu, 4, 2, 4, Verified)).movable(Yes).wdelay(2).dce(Pure),
+        VMaxF32 => a("v_max_f32", valu).movable(Yes).wdelay(2).dce(Pure),
+        VMax3F32 => a("v_max3_f32", valu).movable(Yes).wdelay(2).dce(Pure),
+        VPermB32 => a("v_perm_b32", valu).movable(Yes).wdelay(2),
+        VPkSubU16 => a("v_pk_sub_u16", valu).movable(Yes).wdelay(2),
+        VFmaF32 => a("v_fma_f32", co(Valu, 4, 2, 4, Verified)).movable(Yes).wdelay(2).dce(Pure),
+        VExpF32 => a("v_exp_f32", valu8).trans().dce(Pure),
+        VLogF32 => a("v_log_f32", valu8).trans().dce(Pure),
+        VRcpF32 => a("v_rcp_f32", valu8).trans().dce(Pure),
+        VCvtF32F16 => a("v_cvt_f32_f16", valu).movable(VccFill).wdelay(2).dce(Pure),
+        VCvtF16F32 => a("v_cvt_f16_f32", valu).movable(VccFill).wdelay(2).dce(Pure),
+        VAndB32 => a("v_and_b32", valu).movable(Yes).wdelay(2).dce(Pure),
+        VMinI32 => a("v_min_i32", valu).movable(Yes).wdelay(2).dce(Pure),
+        VOrB32 => a("v_or_b32", valu).movable(Yes).wdelay(2).dce(Pure),
+        VXorB32 => a("v_xor_b32", valu).movable(Yes).wdelay(2).dce(Pure),
+        VLshrB32 => a("v_lshrrev_b32", valu).movable(Yes).wdelay(2).dce(Pure),
+        VLshlB32 => a("v_lshlrev_b32", valu).movable(Yes).wdelay(2).dce(Pure),
+        VMulLoU32 => a("v_mul_lo_u32", c(Valu, 16, 16, Unknown)).movable(Yes).wdelay(2).dce(Pure),
+        VCmpLtI32 => a("v_cmp_lt_i32", valu).vcc(false, true).def_vcc().dce(Pure),
+        VCmpGeI32 => a("v_cmp_ge_i32", valu).vcc(false, true).def_vcc().dce(Pure),
+        VCmpGtI32 => a("v_cmp_gt_i32", valu).vcc(false, true).def_vcc().dce(Pure),
+        VCmpMaskLtI32 => a("v_cmp_lt_i32_e64", valu).wdelay(2).backend(Backend::NoRow),
+        VCmpMaskGeI32 => a("v_cmp_ge_i32_e64", valu).wdelay(2).backend(Backend::NoRow),
+        VCmpMaskGtI32 => a("v_cmp_gt_i32_e64", valu).wdelay(2).backend(Backend::NoRow),
+        VCmpMaskLtF32 => a("v_cmp_lt_f32_e64", valu).wdelay(2).backend(Backend::NoRow),
+        VCndmaskM => a("v_cndmask_b32_e64", valu).hz_reader().backend(Backend::NoRow),
+        VCmpNeI32 => a("v_cmp_ne_u32", valu).vcc(false, true).def_vcc().dce(Pure),
+        VCmpLtF32 => a("v_cmp_lt_f32", valu).vcc(false, true).def_vcc().dce(Pure),
+        VCndmask => a("v_cndmask_b32", valu).vcc(true, false).use_vcc().wdelay(2).dce(Pure),
+        // ---- fragments / matrix cores
+        VWriteSub => a("v_mov_b32", valu).regfx(RegFx::SubWrite).wdelay(2),
+        VReadSub => a("v_mov_b32", valu).regfx(RegFx::SubRead).wdelay(2),
+        VMfma16x16x16F16 => a("v_mfma_f32_16x16x16_f16", mfma16).mfma(12, false, false, false, false).agpr(true, 0b111),
+        VMfma32x32x8F16 => a("v_mfma_f32_32x32x8_f16", mfma32).mfma(12, false, false, false, false).agpr(true, 0b111),
+        VMfma32x32x8F16Z => a("v_mfma_f32_32x32x8_f16", mfma32).mfma(12, false, false, true, false).agpr(true, 0b11),
+        VMfma16x16x32Fp8 => a("v_mfma_f32_16x16x32_fp8_fp8", mfma16).mfma(12, false, false, false, false).agpr(true, 0b111),
+        VMfma32x32x16Fp8 => a("v_mfma_f32_32x32x16_fp8_fp8", mfma32).mfma(12, false, false, false, false).agpr(true, 0b111),
+        VMfmaScale32x32x64Fp8 => a("v_mfma_scale_f32_32x32x64_f8f6f4", mfma64).mfma(20, true, true, false, false).agpr(true, 0b111),
+        // 8-pass XDL op: conservatively the 16-pass wait count until the gfx950 table entry is pinned; latency from the 16-pass table until measured
+        VMfmaScale16x16x128Fp8 => a("v_mfma_scale_f32_16x16x128_f8f6f4", c(Mfma, 32, 48, Experimental)).mfma(20, true, true, false, false).agpr(true, 0b111),
+        VMfmaScale32x32x64Fp8Z => a("v_mfma_scale_f32_32x32x64_f8f6f4", mfma64).mfma(20, false, true, true, false).agpr(true, 0b11),
+        VMfma32x32x64Fp8 => a("v_mfma_f32_32x32x64_f8f6f4", mfma64).mfma(20, true, true, false, false).agpr(true, 0b111),
+        VMfma32x32x64Fp8Z => a("v_mfma_f32_32x32x64_f8f6f4", mfma64).mfma(20, false, true, true, false).agpr(true, 0b11),
+        // sparse fp8 16x16x128: arch table says 32 cycles (MI350X, F8 involved); latency not measured
+        VSmfmac16x16x128Fp8 => a("v_smfmac_f32_16x16x128_fp8_fp8", c(Mfma, 32, 32, Experimental)).mfma(20, true, false, false, true),
+        VAccvgprRead => a("v_accvgpr_read_b32", c(Valu, 4, 8, Unknown)).wdelay(2).agpr(false, 0b1),
+        VAccvgprWrite => a("v_accvgpr_write_b32", c(Valu, 4, 8, Unknown)).wdelay(2).agpr(true, 0),
+        VAccvgprMov => a("v_accvgpr_mov_b32", c(Valu, 4, 8, Unknown)).wdelay(2).agpr(true, 0b1),
+        // ---- LDS (E): b128 issue 8, b32 4, tr_b8 ~6, write b128 ~26; latency ~52 (reads) / ~75 (write)
+        LdsWriteB32 => a("ds_write_b32", c(Lds, 8, 4, Unknown)).mem(L, true, Src(0), 4).agpr(false, 0b10),
+        LdsReadB32 => a("ds_read_b32", c(Lds, 4, 52, Experimental)).mem(L, false, Src(0), 4).agpr(true, 0).dce(Load),
+        LdsWriteB128 => a("ds_write_b128", c(Lds, 26, 4, Experimental)).mem(L, true, Src(0), 16).agpr(false, 0b10),
+        LdsReadB128 => a("ds_read_b128", c(Lds, 8, 52, Experimental)).mem(L, false, Src(0), 16).agpr(true, 0).dce(Load),
+        LdsReadB64 => a("ds_read_b64", c(Lds, 4, 48, Experimental)).mem(L, false, Src(0), 8).dce(Load).backend(Backend::NoRow),
+        LdsWriteB64 => a("ds_write_b64", c(Lds, 8, 4, Experimental)).mem(L, true, Src(0), 8).backend(Backend::NoRow),
+        LdsReadB64TrB8 => a("ds_read_b64_tr_b8", c(Lds, 6, 52, Experimental)).mem(L, false, Src(0), 8).agpr(true, 0).dce(Load),
+        SBarrier => a("s_barrier", ctrl).fence_only(F::Barrier),
+        SSetPrio => a("s_setprio", ctrl).fence_only(F::SetPrio),
+        SchedGroup => a("sched_group_barrier", ctrl),
+        // ---- global memory: L1 hit ~100-108, L2 ~210-250 (E); streaming dwordx4 issue 14
+        GlobalLoadU16 => a("global_load_ushort", ld4).mem(G, false, Src(0), 2).agpr(true, 0).dce(Load),
+        GlobalLoadF32 => a("global_load_dword", ld4).mem(G, false, Src(0), 4).agpr(true, 0).dce(Load),
+        GlobalLoadB128 => a("global_load_dwordx4", ld16).mem(G, false, Src(0), 16).agpr(true, 0).dce(Load),
+        GlobalLoadB128S => a("global_load_dwordx4", ld16).mem(G, false, Src(1), 16).agpr(true, 0).dce(Load),
+        GlobalLoadF32S => a("global_load_dword", ld4).mem(G, false, Src(1), 4).agpr(true, 0).dce(Load),
+        // global -> LDS DMA: a global read with a fence-like LDS write through M0
+        GlobalLoadLdsB128 => a("global_load_lds_dwordx4", dma).mem(G, false, Src(0), 16).fence(F::Barrier).m0(1).backend(Backend::OwnOnly),
+        GlobalLoadLdsB32 => a("global_load_lds_dword", dma).mem(G, false, Src(0), 16).fence(F::Barrier).m0(1).backend(Backend::OwnOnly),
+        GlobalLoadLdsB128S => a("global_load_lds_dwordx4", dma).mem(G, false, Src(1), 16).fence(F::Barrier).m0(2).backend(Backend::OwnOnly),
+        GlobalLoadLdsB32S => a("global_load_lds_dword", dma).mem(G, false, Src(1), 16).fence(F::Barrier).m0(2).backend(Backend::OwnOnly),
+        // ---- MUBUF: the per-lane address is not an affine function of one base register (unknown base, always may-alias)
+        BufferLoadDwordX1 => a("buffer_load_dword", ld4).mem(G, false, Unknown, 4).agpr(true, 0),
+        BufferLoadDwordX2 => a("buffer_load_dwordx2", ld16).mem(G, false, Unknown, 8).agpr(true, 0),
+        BufferLoadDwordX4 => a("buffer_load_dwordx4", ld16).mem(G, false, Unknown, 16).agpr(true, 0),
+        BufferStoreDwordX1 => a("buffer_store_dword", st).mem(G, true, Unknown, 4).agpr(false, 0b1),
+        BufferStoreDwordX2 => a("buffer_store_dwordx2", st).mem(G, true, Unknown, 8).agpr(false, 0b1),
+        BufferStoreDwordX4 => a("buffer_store_dwordx4", st).mem(G, true, Unknown, 16).wide_store(0).agpr(false, 0b1),
+        BufferLoadDwordX4Lds => a("buffer_load_dwordx4", dma).mem(G, false, Unknown, 16).fence(F::Barrier).m0(3).backend(Backend::OwnOnly),
+        BufferLoadDwordX1Lds => a("buffer_load_dword", dma).mem(G, false, Unknown, 16).fence(F::Barrier).m0(3).backend(Backend::OwnOnly),
+        SBufferRsrc => a("s_mov_b32", c(Salu, 4, 4, Unknown)),
+        SBufferRsrcDyn => a("s_mov_b32", c(Salu, 4, 4, Unknown)),
+        GlobalStoreU16 => a("global_store_short", st).mem(G, true, Src(0), 2).agpr(false, 0b10),
+        GlobalStoreF32 => a("global_store_dword", st).mem(G, true, Src(0), 4).agpr(false, 0b10),
+        GlobalStoreF32x4 => a("global_store_dwordx4", st).mem(G, true, Src(0), 16).wide_store(1).agpr(false, 0b10),
+        GlobalStoreF32x2 => a("global_store_dwordx2", st).mem(G, true, Src(0), 8).agpr(false, 0b10),
+        GlobalLoadF32Sc1 => a("global_load_dword", c(Vmem, 4, 900, Unknown)).mem(G, false, Src(0), 4).agpr(true, 0),
+        GlobalLoadB128Sc1 => a("global_load_dwordx4", c(Vmem, 14, 900, Unknown)).mem(G, false, Src(0), 16).agpr(true, 0),
+        GlobalStoreF32Sc1 => a("global_store_dword", st).mem(G, true, Src(0), 4).agpr(false, 0b10),
+        GlobalStoreF32x4Sc1 => a("global_store_dwordx4", st).mem(G, true, Src(0), 16).wide_store(1).agpr(false, 0b10),
+        // read-modify-write with a result: a global access (vmcnt queue entry whose destination is the old value)
+        GlobalAtomicAddRet => a("global_atomic_add", c(Vmem, 8, 900, Unknown)).mem(G, true, Src(0), 4).backend(Backend::OwnOnlyIfNoRows),
+        // cache maintenance: ordered against every memory access, never reordered
+        BufferWbl2 => a("buffer_wbl2", c(Ctrl, 4, 4, Unknown)).fence(F::Barrier).backend(Backend::OwnOnlyIfNoRows),
+        BufferInv => a("buffer_inv", c(Ctrl, 4, 4, Unknown)).fence(F::Barrier).backend(Backend::OwnOnlyIfNoRows),
+        // ---- scalar ALU / memory
+        SLoadDword => a("s_load_dword", smem).smem().dce(Load),
+        SLoadDwordx2 => a("s_load_dwordx2", smem).smem().dce(Load),
+        SLoadDwordx4 => a("s_load_dwordx4", smem).smem().dce(Load).backend(Backend::OwnOnly),
+        // a timing stamp: SMEM result, pinned in program order against every other memory op
+        SMemTime => a("s_memtime", smem).smem().fence(F::Barrier).backend(Backend::NoRow),
+        SLoPart => a("s_mov_b32", salu).backend(Backend::NoRow),
+        SReadPhys => a("s_mov_b32", salu),
+        SMovB32 => a("s_mov_b32", salu),
+        SAddU32 => a("s_add_u32", salu).scc(false, true),
+        SAddcU32 => a("s_addc_u32", salu).scc(true, true),
+        SMulI32 => a("s_mul_i32", salu),
+        SShlB32 => a("s_lshl_b32", salu).scc(false, true),
+        SLshrB32 => a("s_lshr_b32", salu).scc(false, true),
+        SAndB32 => a("s_and_b32", salu).scc(false, true),
+        SXorB32 => a("s_xor_b32", salu).scc(false, true),
+        SCmpLtI32 => a("s_cmp_lt_i32", salu).scc(false, true),
+        SMinI32 => a("s_min_i32", salu).scc(false, true).backend(Backend::OwnOnly),
+        SCselectB32 => a("s_cselect_b32", salu).scc(true, false).backend(Backend::OwnOnly),
+        SCselectB64 => a("s_cselect_b64", salu).scc(true, false).backend(Backend::OwnOnly),
+        SCselectB128 => a("s_cselect_b64", salu).scc(true, false).backend(Backend::OwnOnly),
+        // ---- misc
+        SNop => a("s_nop", ctrl).fence_only(F::Nop),
+        SWaitVm => a("s_waitcnt", ctrl).fence_only(F::WaitVm),
+        SWaitLgkm => a("s_waitcnt", ctrl).fence_only(F::WaitLgkm),
+        SEndpgm => a("s_endpgm", ctrl).fence_only(F::Nop),
+    }
+}

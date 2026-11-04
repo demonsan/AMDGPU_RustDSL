@@ -629,16 +629,8 @@ fn check_mfma_operand_aliasing(m: &MFunction, phys: &[u32]) -> Result<(), String
                 }
                 continue;
             }
-            let is_mfma = matches!(
-                inst.op,
-                MOp::VMfma16x16x16F16
-                    | MOp::VMfma32x32x8F16
-                    | MOp::VMfma16x16x32Fp8
-                    | MOp::VMfma32x32x16Fp8
-                    | MOp::VMfmaScale32x32x64Fp8
-                    | MOp::VMfmaScale16x16x128Fp8
-                    | MOp::VMfma32x32x64Fp8
-            );
+            // MFMA with a C operand (op_attrs: non-sparse, not zero-C)
+            let is_mfma = crate::op_attrs::attrs(inst.op).mfma.map_or(false, |m| !m.sparse && !m.zero_c);
             if !is_mfma || inst.srcs.len() < 3 {
                 continue;
             }
@@ -1016,7 +1008,7 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
                 if *r == VCC || *r == SCC {
                     continue;
                 }
-                if e.writes.contains(r) && matches!(inst.op, MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi) {
+                if e.writes.contains(r) && crate::op_attrs::attrs(inst.op).regfx == crate::op_attrs::RegFx::PartialWrite {
                     continue;
                 }
                 let p = phys(*r);

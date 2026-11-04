@@ -5,12 +5,8 @@
 use crate::mir::*;
 
 fn m0_src(inst: &MInst) -> Option<VReg> {
-    let k = match inst.op {
-        MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds => 3,
-        MOp::GlobalLoadLdsB128S | MOp::GlobalLoadLdsB32S => 2,
-        MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 => 1,
-        _ => return None,
-    };
+    // the source operand holding M0 (op_attrs: `m0_src`)
+    let k = crate::op_attrs::attrs(inst.op).m0_src?;
     match inst.srcs.get(k) {
         Some(Src::Reg(r)) => Some(*r),
         _ => None,

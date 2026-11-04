@@ -25,53 +25,24 @@ pub struct AgprStats {
     pub movs: usize,
 }
 
+/// May source `k` of `op` be an AGPR? (`op_attrs`: `agpr_srcs`)
 pub fn legal_src(op: MOp, k: usize) -> bool {
-    use MOp::*;
-    match op {
-        LdsWriteB32 | LdsWriteB128 => k == 1,
-        GlobalStoreU16 | GlobalStoreF32 | GlobalStoreF32x4 | GlobalStoreF32x2 | GlobalStoreF32Sc1 | GlobalStoreF32x4Sc1 => k == 1,
-        BufferStoreDwordX1 | BufferStoreDwordX2 | BufferStoreDwordX4 => k == 0,
-        VMfma16x16x16F16 | VMfma32x32x8F16 | VMfma16x16x32Fp8 | VMfma32x32x16Fp8 | VMfmaScale32x32x64Fp8 | VMfma32x32x64Fp8 | VMfmaScale16x16x128Fp8 => k <= 2,
-        VMfma32x32x8F16Z | VMfmaScale32x32x64Fp8Z | VMfma32x32x64Fp8Z => k <= 1,
-        VAccvgprRead | VAccvgprMov => k == 0,
-        _ => false,
-    }
+    crate::op_attrs::attrs(op).agpr_src(k)
 }
 
+/// A matrix op of the AGPR-capable family (every MFMA except the sparse `v_smfmac`).
 pub fn is_mfma(op: MOp) -> bool {
-    use MOp::*;
-    matches!(
-        op,
-        VMfma16x16x16F16 | VMfma32x32x8F16 | VMfma32x32x8F16Z | VMfma16x16x32Fp8 | VMfma32x32x16Fp8 | VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z | VMfma32x32x64Fp8 | VMfma32x32x64Fp8Z | VMfmaScale16x16x128Fp8
-    )
+    crate::op_attrs::attrs(op).is_mfma()
 }
 
+/// May the destination of `op` be an AGPR? (`agpr_dst`)
 pub fn legal_dst(op: MOp) -> bool {
-    use MOp::*;
-    is_mfma(op)
-        || matches!(
-            op,
-            LdsReadB32
-                | LdsReadB128
-                | LdsReadB64TrB8
-                | GlobalLoadU16
-                | GlobalLoadF32
-                | GlobalLoadB128
-                | GlobalLoadB128S
-                | GlobalLoadF32S
-                | GlobalLoadF32Sc1
-                | GlobalLoadB128Sc1
-                | BufferLoadDwordX1
-                | BufferLoadDwordX2
-                | BufferLoadDwordX4
-                | VAccvgprWrite
-                | VAccvgprMov
-        )
+    crate::op_attrs::attrs(op).agpr_dst
 }
 
 /// Ops whose destination is also an input without listing it as a source (16-bit half writers).
 fn rmw_dst(op: MOp) -> bool {
-    matches!(op, MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi | MOp::VPermlane32Swap)
+    matches!(crate::op_attrs::attrs(op).regfx, crate::op_attrs::RegFx::PartialWrite | crate::op_attrs::RegFx::SwapSrc01)
 }
 
 struct Cx<'a> {
@@ -250,7 +221,7 @@ pub fn assign(m: &mut MFunction) -> Result<AgprStats, String> {
             // MFMA: vdst and srcC in one file
             if is_mfma(inst.op) {
                 if let (Some(d), Some(Src::Reg(c))) = (inst.dst, inst.srcs.get(2).copied()) {
-                    if inst.op != MOp::VMfmaScale32x32x64Fp8Z && !matches!(inst.op, MOp::VMfma32x32x8F16Z | MOp::VMfma32x32x64Fp8Z) && cx.is_a(d) != cx.is_a(c) {
+                    if !crate::op_attrs::attrs(inst.op).mfma.map_or(false, |m| m.zero_c) && cx.is_a(d) != cx.is_a(c) {
                         let nc = if cx.is_a(d) {
                             let t = cx.new_vreg(cx.m.vreg_class(c).to_agpr().unwrap());
                             for k in 0..cx.m.vreg_class(c).dwords() {
