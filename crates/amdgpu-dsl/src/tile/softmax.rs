@@ -212,9 +212,11 @@ impl OnlineSoftmax {
                 b.var_scale_lane(self.l_acc(), 2, corr);
             }
             b.end_if();
+            // the branch has no exec mask: lanes that are not `big` (scaled path) must add 0
+            let dbig = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(big), a: Opnd::Val(delta), b: Opnd::Val(self.zero_f) });
             b.begin_if(Opnd::Val(big));
             {
-                let dupd = b.frag2_dup(delta);
+                let dupd = b.frag2_dup(dbig);
                 for a in &s.accs {
                     b.var_add_pk(a.var, dupd);
                 }
