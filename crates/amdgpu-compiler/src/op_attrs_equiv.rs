@@ -175,16 +175,12 @@ fn is_wide_vmem_store(op: MOp) -> bool {
     matches!(op, MOp::GlobalStoreF32x4 | MOp::GlobalStoreF32x4Sc1 | MOp::BufferStoreDwordX4)
 }
 
-}
-
 fn wide_store_data_idx(op: MOp) -> usize {
     if op == MOp::BufferStoreDwordX4 {
         0
     } else {
         1
     }
-}
-
 }
 
 pub fn legal_src_legacy(op: MOp, k: usize) -> bool {
@@ -234,8 +230,6 @@ pub fn legal_dst_legacy(op: MOp) -> bool {
 
 fn rmw_dst_legacy(op: MOp) -> bool {
     matches!(op, MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi | MOp::VPermlane32Swap)
-}
-
 }
 
 fn dce_class_legacy(op: MOp) -> (bool, bool) {
