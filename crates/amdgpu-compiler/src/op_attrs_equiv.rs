@@ -460,7 +460,7 @@ pub fn effects_core_legacy(m: &MFunction, inst: &MInst) -> Effects {
 
 
 fn all_ops() -> Vec<MOp> {
-    crate::backend::ALL_MOPS.to_vec()
+    crate::op_attrs::ALL.to_vec()
 }
 
 #[test]
@@ -472,9 +472,16 @@ fn every_variant_is_listed() {
     let names: Vec<&str> = body.lines().map(|l| l.trim()).filter(|l| l.ends_with(',') && l.chars().next().map_or(false, |c| c.is_ascii_uppercase())).map(|l| l.trim_end_matches(',')).collect();
     let listed: Vec<String> = all_ops().iter().map(|o| format!("{o:?}")).collect();
     for n in &names {
-        assert!(listed.iter().any(|l| l == n), "MOp::{n} is missing from backend::ALL_MOPS");
+        assert!(listed.iter().any(|l| l == n), "MOp::{n} is missing from op_attrs::ALL");
     }
-    assert_eq!(names.len(), listed.len(), "ALL_MOPS has duplicates or unknown entries");
+    assert_eq!(names.len(), listed.len(), "op_attrs::ALL has duplicates or unknown entries");
+    // backend::ALL_MOPS (the LLVM-tail table coverage list) = the ops whose backend attribute says they have rows
+    let rows: Vec<String> = all_ops().into_iter().filter(|o| matches!(crate::op_attrs::attrs(*o).backend, crate::op_attrs::Backend::Llvm | crate::op_attrs::Backend::OwnOnlyIfNoRows)).map(|o| format!("{o:?}")).collect();
+    let mut tail: Vec<String> = crate::backend::ALL_MOPS.iter().map(|o| format!("{o:?}")).collect();
+    let mut r2 = rows.clone();
+    tail.sort();
+    r2.sort();
+    assert_eq!(tail, r2, "backend::ALL_MOPS must be exactly the ops with LLVM rows (backend attribute)");
 }
 
 #[test]
