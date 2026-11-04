@@ -1242,6 +1242,9 @@ impl<'a> An<'a> {
                     let mut p2 = 1i128;
                     while p2 <= m {
                         p2 <<= 1;
+                        if p2 > (1i128 << 100) {
+                            return None; // an unbounded interval (long add / xor chains): no mask bound, never loop on i128 overflow
+                        }
                     }
                     let c_hi = c.n - c.n.rem_euclid(p2);
                     Some(Itv::range(Poly::int(c_hi), Poly::int(c_hi + p2 - 1)))
@@ -1255,6 +1258,9 @@ impl<'a> An<'a> {
                         let mut p2 = 1i128;
                         while p2 <= m {
                             p2 <<= 1;
+                            if p2 > (1i128 << 100) {
+                                return AV::Int(Itv::top()); // see above: the shift would overflow i128 and never terminate
+                            }
                         }
                         AV::Int(Itv::range(Poly::int(0), Poly::int(p2 - 1)))
                     }
