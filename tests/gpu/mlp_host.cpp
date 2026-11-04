@@ -66,10 +66,12 @@ int main(int argc, char** argv) {
     // accuracy on a row sample
     std::vector<unsigned short> yf((size_t)M * N2), yu((size_t)M * N2);
     CK(hipMemcpy(yf.data(), dyf, yf.size() * 2, hipMemcpyDeviceToHost)); CK(hipMemcpy(yu.data(), dyu, yu.size() * 2, hipMemcpyDeviceToHost));
+    std::vector<unsigned char> hh((size_t)M * N1); CK(hipMemcpy(hh.data(), dh, hh.size(), hipMemcpyDeviceToHost));
+    int hbad = 0, hshown = 0;
     double worst_f = 0, worst_u = 0; int bad = 0, same = 0, tot = 0;
     for (int r = 0; r < M; r += std::max(1, M / 512)) {
         float hrow[N1];
-        for (int n1 = 0; n1 < N1; ++n1) { double s = 0; for (int k = 0; k < K1; ++k) s += (double)e4m3(x[(size_t)r * K1 + k]) * e4m3(w1[n1 * K1 + k]); hrow[n1] = e4m3(to_e4m3(std::max((float)s * ALPHA, 0.0f))); }
+        for (int n1 = 0; n1 < N1; ++n1) { double s = 0; for (int k = 0; k < K1; ++k) s += (double)e4m3(x[(size_t)r * K1 + k]) * e4m3(w1[n1 * K1 + k]); hrow[n1] = e4m3(to_e4m3(std::max((float)s * ALPHA, 0.0f))); float gh = e4m3(hh[(size_t)r * N1 + n1]); if (std::fabs(gh - hrow[n1]) > 0.07f * std::fabs(hrow[n1]) + 1e-3f) { if (hshown++ < 4) std::fprintf(stderr, "H row %d n1 %d got %g want %g\n", r, n1, gh, hrow[n1]); ++hbad; } }
         for (int n2 = 0; n2 < N2; ++n2) {
             double s = 0, sa = 0; for (int n1 = 0; n1 < N1; ++n1) { double p = (double)hrow[n1] * e4m3(w2[n1 * N2 + n2]); s += p; sa += std::fabs(p); }
             float gf = bf16(yf[(size_t)r * N2 + n2]), gu = bf16(yu[(size_t)r * N2 + n2]);
@@ -80,7 +82,7 @@ int main(int argc, char** argv) {
             same += (yf[(size_t)r * N2 + n2] == yu[(size_t)r * N2 + n2]); ++tot;
         }
     }
-    std::printf("%s M=%d grid=%d: checked", pre, M, grid); std::printf(" M=%d: checked %d, bad %d, worst rel (|err|/sum|p|) fused %.3e unfused %.3e, fused==unfused bitwise %d/%d -> %s\n", M, tot, bad, worst_f, worst_u, same, tot, bad ? "FAIL" : "OK");
+    std::printf("H bad %d; ", hbad); std::printf("%s M=%d grid=%d: checked", pre, M, grid); std::printf(" M=%d: checked %d, bad %d, worst rel (|err|/sum|p|) fused %.3e unfused %.3e, fused==unfused bitwise %d/%d -> %s\n", M, tot, bad, worst_f, worst_u, same, tot, bad ? "FAIL" : "OK");
     // interleaved timing
     hipEvent_t e0, e1; CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
     std::vector<float> tf, tu;
