@@ -117,7 +117,7 @@ fn parse_seq(stmts: &[Stmt], mut i: usize, stop_loop: bool, stop_if: bool) -> (V
 
 #[derive(Default)]
 pub struct Trace {
-    pub contrib: HashMap<(u32, u8), Vec<i64>>,       // accumulator var, dword -> K generations
+    pub contrib: HashMap<(i64, u32, u8), Vec<i64>>,   // lane, accumulator var, dword -> K generations
     pub c_count: HashMap<(i64, i64, i64), usize>,    // m, n, kb
     pub stores: HashSet<i64>,                        // C address (2-byte element index)
     pub a_tags: HashMap<i64, HashSet<(i64, i64)>>,   // kb -> (m, k)
@@ -304,16 +304,20 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             }
         }
         Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, .. } => {
-            let kb = cx.cur_tile.as_ref().map(|x| x.1).unwrap_or(-1);
             let a_tags = frag_tags(cx.opnd(*a));
             let b_tags = frag_tags(cx.opnd(*b));
+            // The K generation comes from the A/B element tags themselves (actual addresses),
+            // with the tile marker as a fallback for an empty fragment.
+            let kb = a_tags.iter().find_map(|t| if let Tag::A(_, k) = t { Some(k / 128) } else { None })
+                .or_else(|| b_tags.iter().find_map(|t| if let Tag::B(_, k) = t { Some(k / 128) } else { None }))
+                .unwrap_or_else(|| cx.cur_tile.as_ref().map(|x| x.1).unwrap_or(-1));
             let sa_tags = word_tags(cx.opnd(*scale_a));
             let sb_tags = word_tags(cx.opnd(*scale_b));
             for t in &a_tags { if let Tag::A(m, k) = t { cx.trace.a_tags.entry(kb).or_default().insert((*m, *k)); } }
             for t in &b_tags { if let Tag::B(n, k) = t { cx.trace.b_tags.entry(kb).or_default().insert((*n, *k)); } }
             for t in &sa_tags { if let Tag::Sa(m, k) = t { cx.trace.sa_tags.entry(kb).or_default().insert((*m, *k)); } }
             for t in &sb_tags { if let Tag::Sb(blk, k) = t { cx.trace.sb_tags.entry(kb).or_default().insert((*blk, *k)); } }
-            for idx in 0..4u8 { cx.trace.contrib.entry((var.0, idx)).or_default().push(kb); }
+            for idx in 0..4u8 { cx.trace.contrib.entry((cx.lane, var.0, idx)).or_default().push(kb); }
             tag_acc_var(cx, *var);
         }
         Stmt::VarMfmaScale { var, a, b, .. } | Stmt::VarMfmaScaleZ { var, a, b, .. } => {
@@ -321,7 +325,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             let kb = cx.cur_tile.as_ref().map(|x| x.1).unwrap_or(-1);
             for t in frag_tags(cx.opnd(*a)) { if let Tag::A(m, k) = t { cx.trace.a_tags.entry(kb).or_default().insert((m, k)); } }
             for t in frag_tags(cx.opnd(*b)) { if let Tag::B(n, k) = t { cx.trace.b_tags.entry(kb).or_default().insert((n, k)); } }
-            for idx in 0..4u8 { cx.trace.contrib.entry((var.0, idx)).or_default().push(kb); }
+            for idx in 0..4u8 { cx.trace.contrib.entry((cx.lane, var.0, idx)).or_default().push(kb); }
             tag_acc_var(cx, *var);
         }
         Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => {
@@ -340,7 +344,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                 let dword = q / 2;
                 let from_tag = bytes.get(4 * dword).and_then(|t| if let Tag::Acc(v, i) = t { Some((*v, *i)) } else { None });
                 let Some((var, idx)) = origins.get(dword).and_then(|x| *x).or(from_tag) else { continue };
-                let kbs = cx.trace.contrib.get(&(var, idx)).cloned().unwrap_or_default();
+                let kbs = cx.trace.contrib.get(&(cx.lane, var, idx)).cloned().unwrap_or_default();
                 let elem = src / 2 + q as i64;
                 let m = elem / cx.args.n;
                 let n = elem % cx.args.n;
@@ -377,7 +381,7 @@ fn store_c(cx: &mut Ctx<'_>, base: Opnd, byte_off: u32, value: Opnd, nouts: usiz
         let dword = q / 2;
         let origin = origins.get(dword).and_then(|x| *x);
         let Some((var, idx)) = origin else { continue };
-        let kbs = cx.trace.contrib.get(&(var, idx)).cloned().unwrap_or_default();
+        let kbs = cx.trace.contrib.get(&(cx.lane, var, idx)).cloned().unwrap_or_default();
         let elem = (off / 2) as i64 + q as i64;
         let m = elem / cx.args.n;
         let n = elem % cx.args.n;
