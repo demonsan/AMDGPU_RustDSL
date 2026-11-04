@@ -139,7 +139,10 @@ fn norm(e: E) -> E {
                 norm_mul(fs)
             }
         }
-        E::Exp(x) => exp(norm(*x)),
+        E::Exp(x) => match norm(*x) {
+            E::Const(c) => E::Const(c.exp()),
+            y => exp(y),
+        },
     }
 }
 
