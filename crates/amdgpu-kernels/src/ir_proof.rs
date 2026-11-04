@@ -129,6 +129,9 @@ pub struct Trace {
     pub sample_store: Option<(String, i64, i64)>,
     pub sample_store_origin: usize,
     pub lds_origins_left: usize,
+    pub pass1_origin_left: usize,
+    pub pass1_lds_store_origins: usize,
+    pub pass2_lds_store_origins: usize,
     pub sample_read: Option<(String, i64, i64, usize)>,
     pub sample_epi_read: Option<(String, i64, i64, usize)>,
     pub executed_insts: usize,
@@ -509,8 +512,11 @@ pub fn prove_ir(f: &Function, cfg: &GemmConfig, m: i64, n: i64, k: i64) -> Resul
     let mut trace = Trace::default();
     // pass 1: all lanes write global tags into LDS, under the tile-protocol (tile, generation) keys
     for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, true, &mut lds, &mut trace); }
+    trace.pass1_origin_left = lds.values().filter(|(_, o)| o.is_some()).count();
+    trace.pass1_lds_store_origins = trace.lds_store_origins;
     // pass 2: reads, MFMA contributions and epilogue stores (DMA is not re-run)
     for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, false, &mut lds, &mut trace); }
+    trace.pass2_lds_store_origins = trace.lds_store_origins - trace.pass1_lds_store_origins;
     trace.lds_origins_left = lds.values().filter(|(_, o)| o.is_some()).count();
     if !trace.unknown_ops.is_empty() {
         return Err(ProofError(format!("unsupported/unknown IR during symbolic execution: {:?}", trace.unknown_ops)));
