@@ -82,18 +82,31 @@ in-tree checkers rather than an SMT stack. `gpu_verify` remains the memory/synch
 these layers add functional evidence without changing the shipped kernels or their assembly.
 
 
-## E3 status (actual-IR symbolic execution, region-IR tree)
+## E3: symbolic execution of the built kernel Program (region-IR tree)
 
-The E3 prototype is on branch `ir-proof`:
+`crates/amdgpu-kernels/src/ir_proof.rs` executes the **actual `Function::body()` tree** of the v4
+builder at a small symbolic configuration: one 256x256 CTA, K=384 (three K tiles), 256 threads
+enumerated with concrete lane/wave ids (`WorkitemId` 0..255, lane=`tid&63`, wave=`tid>>6`).
+Global loads/DMA produce element tags `A[m,k]`, `B[k,n]`, `Sa[m,kb]`, `Sb[block,kb]` from the
+emitted address expressions; LDS is a byte-value map (`M0 + imm + lane*size` destination per
+`gpu_verify`'s `BufferLoadLds` semantics); reads and MFMAs execute lockstep over all threads, so
+tile-generation correctness is not assumed. MFMA operands are classified by logical tag kind
+because the atom is built with `swap_ab` (hardware src A carries the logical B fragment and src B
+the logical A fragment; the scale slots are swapped the same way). Epilogue store origins carry
+`(accumulator var, dword)`, which maps each stored C element to its K contributions.
 
-- `crates/amdgpu-kernels/src/ir_proof.rs` interprets the **actual built `Function::body()` tree**
-  (region IR), enumerates the 4 waves/64 lanes, unrolls the pipeline loop to 3 K tiles, maps
-  actual global DMA/LDS addresses to element tags and executes actual MFMA/store statements.
-- The proof-only `GEMM_PROOF_DROP_KB` hook is in the real GEMM builder (a real IR `if` around the
-  MMAs of one tile generation), so setting it to 1 changes the kernel Function, not a replica.
-- Current observed counts for the v4 direct-C variant: 1,084,416 executed IR statements, 49,152
-  actual MFMA statements, 65,536 actual C stores, K generations {0,1,2}. The E3 theorem is not yet
-  green: operand provenance through the LDS register-staged path remains incomplete (most MFMAs
-  see empty A/B tags in the current tag map; see `mfma_no_tags` diagnostics). The two E3 tests are
-  marked `#[ignore]` with this reason. This is the remaining work for E3; no counterexample is
-  claimed until operand provenance is sound.
+On the actual built direct-C v4 variant (`gemm_mxfp8_bs_v4_directc`; the default LDS-transpose
+epilogue is a separate byte-layout obligation) the trace is:
+
+- 542,208 executed IR statements, 49,152 actual `VarMfmaScale16` statements, 65,536 actual C
+  stores, 196,608 C contributions = exactly 3 per output (K generations 0,1,2);
+- every C[m,n] has exactly one contribution per K generation and is stored exactly once;
+- every K generation's A/B operand tags cover the full 256x128 tile and the scale tags match the
+  output rows/blocks.
+
+The proof-only `GEMM_PROOF_DROP_KB` hook is a real IR `if` in the reg-staged compute path of the
+kernel (`Body::compute_tile`): it drops one tile generation from the emitted Function, not from a
+replica. Setting it to 1 makes the same checker fail with a concrete counterexample:
+`missing contribution C[0,0] K block 2 (k=256): 0 times; duplicated K blocks [1]`.
+Both the theorem and the kernel-code counterexample are un-gated tests in
+`crates/amdgpu-kernels/tests/functional_gemm_ir.rs`.
