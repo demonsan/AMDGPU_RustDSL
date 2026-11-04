@@ -92,13 +92,13 @@ emitted address expressions; LDS is a byte-value map (`M0 + imm + lane*size` des
 `gpu_verify`'s `BufferLoadLds` semantics); reads and MFMAs execute lockstep over all threads, so
 tile-generation correctness is not assumed. MFMA operands are classified by logical tag kind
 because the atom is built with `swap_ab` (hardware src A carries the logical B fragment and src B
-the logical A fragment; the scale slots are swapped the same way). Epilogue store origins carry
-`(accumulator var, dword)`, which maps each stored C element to its K contributions.
+the logical A fragment; the scale slots are swapped the same way). The epilogue's accumulator
+provenance (`Tag::Acc(var, dword)`) maps each stored C element to its K contributions, for both the
+shipped LDS-transpose epilogue and the direct-C variant.
 
-On the actual built direct-C v4 variant (`gemm_mxfp8_bs_v4_directc`; the default LDS-transpose
-epilogue is a separate byte-layout obligation) the trace is:
+On the **shipped `gemm_mxfp8_bs_v4()` Function** (LDS epilogue) the trace is:
 
-- 542,208 executed IR statements, 49,152 actual `VarMfmaScale16` statements, 65,536 actual C
+- 616,960 executed IR statements, 49,152 actual `VarMfmaScale16` statements, 65,536 actual C
   stores, 196,608 C contributions = exactly 3 per output (K generations 0,1,2);
 - every C[m,n] has exactly one contribution per K generation and is stored exactly once;
 - every K generation's A/B operand tags cover the full 256x128 tile and the scale tags match the
@@ -106,7 +106,8 @@ epilogue is a separate byte-layout obligation) the trace is:
 
 The proof-only `GEMM_PROOF_DROP_KB` hook is a real IR `if` in the reg-staged compute path of the
 kernel (`Body::compute_tile`): it drops one tile generation from the emitted Function, not from a
-replica. Setting it to 1 makes the same checker fail with a concrete counterexample:
-`missing contribution C[0,0] K block 2 (k=256): 0 times; duplicated K blocks [1]`.
-Both the theorem and the kernel-code counterexample are un-gated tests in
-`crates/amdgpu-kernels/tests/functional_gemm_ir.rs`.
+replica. Setting it to 1 makes the same checker fail with a concrete counterexample on the shipped
+v4 Function: `missing C[0,0] K block 2; duplicated K blocks [1]` (one generation is swallowed and
+the shifted pipeline duplicates another). The theorem and the kernel-code counterexample are
+un-gated tests in `crates/amdgpu-kernels/tests/functional_gemm_ir.rs`; the direct-C v4 variant is
+checked by the same checker as well.
