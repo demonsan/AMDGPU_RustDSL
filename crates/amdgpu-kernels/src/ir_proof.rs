@@ -17,7 +17,9 @@
 
 use amdgpu_dsl::tile::ev;
 use amdgpu_dsl::{Function, Node, Op, Opnd, RegionKind, Stmt, VarId, ValueId};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::gemm_mxfp8::GemmConfig;
 
@@ -75,7 +77,7 @@ impl Args {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Trace {
     pub contrib: HashMap<(i64, u32, u8), Vec<i64>>,   // lane, accumulator var, dword -> K generations
     pub c_count: HashMap<(i64, i64, i64), usize>,    // m, n, kb
@@ -121,10 +123,11 @@ struct Ctx<'a> {
     vals: HashMap<ValueId, V>,
     vars: HashMap<VarId, V>,
     cur_tile: Option<(String, i64)>,
-    pass_writes: bool,
-    lds: &'a mut HashMap<i64, (Tag, Option<(u32, u8)>)>,
-    trace: &'a mut Trace,
+    lds: Rc<RefCell<HashMap<i64, (Tag, Option<(u32, u8)>)>>>,
+    trace: Rc<RefCell<Trace>>,
     unknown_control: usize,
+    break_loop: bool,
+    stopped: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -172,42 +175,61 @@ impl<'a> Ctx<'a> {
 }
 
 
-fn exec_nodes(nodes: &[Node], cx: &mut Ctx<'_>) -> bool {
-    // returns true when a BreakIf fired
+fn exec_nodes(nodes: &[Node], lanes: &mut [Ctx<'_>], filter: &[bool]) {
     for n in nodes {
         match n {
             Node::S(st) => {
-                if exec_stmt(st, cx) { return true; }
-            }
-            Node::If { cond, then, els } => {
-                let c = match cx.opnd(*cond) {
-                    V::Int(x) => x != 0,
-                    _ => { cx.unknown_control += 1; false }
-                };
-                let branch = if c { then.as_slice() } else { els.as_deref().unwrap_or(&[]) };
-                if exec_nodes(branch, cx) { return true; }
-            }
-            Node::Loop { vars, init, body } => {
-                for (v, o) in vars.iter().zip(init.iter()) { let val = cx.opnd(*o); cx.set_var(*v, val); }
-                for _it in 0..8 {
-                    if exec_nodes(body, cx) { break; }
+                for i in 0..lanes.len() {
+                    if !filter[i] || lanes[i].stopped { continue; }
+                    if exec_stmt(st, &mut lanes[i]) { lanes[i].break_loop = true; }
                 }
             }
+            Node::If { cond, then, els } => {
+                let mut tf = filter.to_vec();
+                let mut ef = filter.to_vec();
+                for i in 0..lanes.len() {
+                    if !filter[i] { tf[i] = false; ef[i] = false; continue; }
+                    let c = match lanes[i].opnd(*cond) { V::Int(x) => x != 0, _ => { lanes[i].unknown_control += 1; false } };
+                    tf[i] = filter[i] && c;
+                    ef[i] = filter[i] && !c;
+                }
+                exec_nodes(then, lanes, &tf);
+                if let Some(els) = els { exec_nodes(els, lanes, &ef); }
+            }
+            Node::Loop { vars, init, body } => {
+                for i in 0..lanes.len() {
+                    if !filter[i] { continue; }
+                    for (v, o) in vars.iter().zip(init.iter()) { let val = lanes[i].opnd(*o); lanes[i].set_var(*v, val); }
+                    lanes[i].stopped = false;
+                    lanes[i].break_loop = false;
+                }
+                for _it in 0..8 {
+                    let active = (0..lanes.len()).any(|i| filter[i] && !lanes[i].stopped);
+                    if !active { break; }
+                    exec_nodes(body, lanes, filter);
+                    for i in 0..lanes.len() {
+                        if filter[i] && lanes[i].break_loop { lanes[i].break_loop = false; lanes[i].stopped = true; }
+                    }
+                }
+                for i in 0..lanes.len() { if filter[i] { lanes[i].stopped = false; } }
+            }
             Node::Region { kind: _, tile, slot: _, version, body } => {
-                let old = cx.cur_tile.clone();
-                let ver = cx.int(*version).unwrap_or(-1);
-                cx.cur_tile = Some((tile.clone(), ver));
-                let br = exec_nodes(body, cx);
-                cx.cur_tile = old;
-                if br { return true; }
+                let mut old: Vec<Option<(String, i64)>> = vec![None; lanes.len()];
+                for i in 0..lanes.len() {
+                    if !filter[i] { continue; }
+                    let ver = lanes[i].int(*version).unwrap_or(-1);
+                    old[i] = lanes[i].cur_tile.clone();
+                    lanes[i].cur_tile = Some((tile.clone(), ver));
+                }
+                exec_nodes(body, lanes, filter);
+                for i in 0..lanes.len() { if filter[i] { lanes[i].cur_tile = old[i].take(); } }
             }
         }
     }
-    false
 }
 
 fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
-    cx.trace.executed_insts += 1;
+    cx.trace.borrow_mut().executed_insts += 1;
     match st {
         Stmt::Let { dst, op } => {
             let val = eval_op(op, cx);
@@ -223,7 +245,6 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
         Stmt::Barrier | Stmt::WaitLds { .. } | Stmt::WaitVm { .. } | Stmt::SchedGroup { .. }
         | Stmt::SetPrio { .. } | Stmt::Assume { .. } | Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => {}
         Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
-            if !cx.pass_writes { return false; }
             let role = match cx.opnd(*rsrc) { V::Rsrc(r) => r, _ => return false };
             let (so, la) = match (cx.int(*soff), cx.int(*lds_addr)) {
                 (Some(v), Some(l)) => (v, l),
@@ -237,78 +258,74 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                 let tag = cx.tag_for(role, src + b);
                 if let Some((tile, ver)) = &cx.cur_tile {
                     let _ = (tile, ver);
-                    cx.lds.insert(dst + b, (tag.clone(), None));
-                    cx.trace.dma_writes += 1;
-                    match &tag { Tag::A(..) => cx.trace.tag_a += 1, Tag::B(..) => cx.trace.tag_b += 1, Tag::Sa(..) => cx.trace.tag_sa += 1, Tag::Sb(..) => cx.trace.tag_sb += 1, _ => {} }
-                    if tag != Tag::U { cx.trace.tag_by_addr.insert(dst + b, tag); }
+                    cx.lds.borrow_mut().insert(dst + b, (tag.clone(), None));
+                    cx.trace.borrow_mut().dma_writes += 1;
+                    match &tag { Tag::A(..) => cx.trace.borrow_mut().tag_a += 1, Tag::B(..) => cx.trace.borrow_mut().tag_b += 1, Tag::Sa(..) => cx.trace.borrow_mut().tag_sa += 1, Tag::Sb(..) => cx.trace.borrow_mut().tag_sb += 1, _ => {} }
+                    if tag != Tag::U { cx.trace.borrow_mut().tag_by_addr.insert(dst + b, tag); }
                 }
             }
         }
         Stmt::StoreLdsB32 { addr, value } => {
-            if !cx.pass_writes { return false; }
             if let (Some(a), V::Word { tags, .. }) = (cx.int(*addr), cx.opnd(*value)) {
-                if cx.cur_tile.is_some() { for b in 0..4 { cx.lds.insert(a + b, (tags.get(b as usize).cloned().unwrap_or(Tag::U), None)); } }
+                if cx.cur_tile.is_some() { for b in 0..4 { cx.lds.borrow_mut().insert(a + b, (tags.get(b as usize).cloned().unwrap_or(Tag::U), None)); } }
             }
         }
         Stmt::StoreLdsB64 { addr, value } | Stmt::StoreLdsB128 { addr, value } => {
             // DMA writes only in pass 1; the epilogue staging writes are also needed in pass 2
             // (they carry accumulator origins), even though pass 2 does not re-run DMA.
             let epi = cx.cur_tile.as_ref().map(|(t, _)| t == "EPI").unwrap_or(false);
-            if !cx.pass_writes && !epi { return false; }
+
             if let (Some(a), V::Frag { bytes, origins, .. }) = (cx.int(*addr), cx.opnd(*value)) {
-                cx.trace.lds_store_origins += origins.iter().filter(|x| x.is_some()).count();
+                cx.trace.borrow_mut().lds_store_origins += origins.iter().filter(|x| x.is_some()).count();
                 if let Some((tile, ver)) = &cx.cur_tile {
-                    if cx.trace.sample_store.is_none() { cx.trace.sample_store = Some((tile.clone(), *ver, a)); cx.trace.sample_store_origin = origins.iter().filter(|x| x.is_some()).count(); }
+                    if cx.trace.borrow_mut().sample_store.is_none() { cx.trace.borrow_mut().sample_store = Some((tile.clone(), *ver, a)); cx.trace.borrow_mut().sample_store_origin = origins.iter().filter(|x| x.is_some()).count(); }
                     for (b, t) in bytes.iter().enumerate() {
                         let _ = (tile, ver);
                         let key = a + b as i64;
                         let o = origins.get(b / 4).and_then(|x| *x);
-                        if let Some(oo) = o { cx.trace.origin_by_addr.insert(a + b as i64, oo); }
-                        if *t != Tag::U { cx.trace.tag_by_addr.insert(a + b as i64, t.clone()); }
+                        if let Some(oo) = o { cx.trace.borrow_mut().origin_by_addr.insert(a + b as i64, oo); }
+                        if *t != Tag::U { cx.trace.borrow_mut().tag_by_addr.insert(a + b as i64, t.clone()); }
                         // Do not replace a known accumulator origin by an unknown DMA/epilogue
                         // write at the same byte: the reference is what the store will read.
-                        match cx.lds.get_mut(&key) {
+                        match cx.lds.borrow_mut().get_mut(&key) {
                             Some((_, prev)) if prev.is_some() && o.is_none() => {}
                             Some(slot) => *slot = (t.clone(), o),
-                            None => { cx.lds.insert(key, (t.clone(), o)); }
+                            None => { cx.lds.borrow_mut().insert(key, (t.clone(), o)); }
                         }
                     }
                 }
             }
         }
         Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, .. } => {
-            if cx.pass_writes { return false; } // contributions only in pass 2
-            cx.trace.mfma_seen += 1;
+            cx.trace.borrow_mut().mfma_seen += 1;
             let av = cx.opnd(*a); let bv = cx.opnd(*b);
-            match &av { V::Frag { .. } => cx.trace.mfma_a_frag += 1, V::Unknown => cx.trace.mfma_a_unknown += 1, _ => {} }
-            let a_tags = frag_tags_fallback(&av, cx.trace);
-            let b_tags = frag_tags_fallback(&bv, cx.trace);
+            match &av { V::Frag { .. } => cx.trace.borrow_mut().mfma_a_frag += 1, V::Unknown => cx.trace.borrow_mut().mfma_a_unknown += 1, _ => {} }
+            let a_tags = frag_tags_fallback(&av, &cx.trace.borrow());
+            let b_tags = frag_tags_fallback(&bv, &cx.trace.borrow());
             // The K generation comes from the A/B element tags themselves (actual addresses),
             // with the tile marker as a fallback for an empty fragment.
             let kb = a_tags.iter().find_map(|t| if let Tag::A(_, k) = t { Some(k / 128) } else { None })
                 .or_else(|| b_tags.iter().find_map(|t| if let Tag::B(_, k) = t { Some(k / 128) } else { None }))
                 .unwrap_or_else(|| cx.cur_tile.as_ref().map(|x| x.1).unwrap_or(-1));
-            if kb < 0 || kb >= cx.args.k / 128 { cx.trace.mfma_no_tags += 1; return false; }
+            if kb < 0 || kb >= cx.args.k / 128 { cx.trace.borrow_mut().mfma_no_tags += 1; return false; }
             let sa_tags = word_tags(cx.opnd(*scale_a));
             let sb_tags = word_tags(cx.opnd(*scale_b));
-            for t in &a_tags { if let Tag::A(m, k) = t { cx.trace.a_tags.entry(kb).or_default().insert((*m, *k)); } }
-            for t in &b_tags { if let Tag::B(n, k) = t { cx.trace.b_tags.entry(kb).or_default().insert((*n, *k)); } }
-            for t in &sa_tags { if let Tag::Sa(m, k) = t { cx.trace.sa_tags.entry(kb).or_default().insert((*m, *k)); } }
-            for t in &sb_tags { if let Tag::Sb(blk, k) = t { cx.trace.sb_tags.entry(kb).or_default().insert((*blk, *k)); } }
-            for idx in 0..4u8 { cx.trace.contrib.entry((cx.lane, var.0, idx)).or_default().push(kb); }
+            for t in &a_tags { if let Tag::A(m, k) = t { cx.trace.borrow_mut().a_tags.entry(kb).or_default().insert((*m, *k)); } }
+            for t in &b_tags { if let Tag::B(n, k) = t { cx.trace.borrow_mut().b_tags.entry(kb).or_default().insert((*n, *k)); } }
+            for t in &sa_tags { if let Tag::Sa(m, k) = t { cx.trace.borrow_mut().sa_tags.entry(kb).or_default().insert((*m, *k)); } }
+            for t in &sb_tags { if let Tag::Sb(blk, k) = t { cx.trace.borrow_mut().sb_tags.entry(kb).or_default().insert((*blk, *k)); } }
+            for idx in 0..4u8 { cx.trace.borrow_mut().contrib.entry((cx.lane, var.0, idx)).or_default().push(kb); }
             tag_acc_var(cx, *var);
         }
         Stmt::VarMfmaScale { var, a, b, .. } | Stmt::VarMfmaScaleZ { var, a, b, .. } => {
-            if cx.pass_writes { return false; }
             // 32x32 atoms are not used by v3/v4; keep the tag handling generic.
             let kb = cx.cur_tile.as_ref().map(|x| x.1).unwrap_or(-1);
-            for t in frag_tags(cx.opnd(*a)) { if let Tag::A(m, k) = t { cx.trace.a_tags.entry(kb).or_default().insert((m, k)); } }
-            for t in frag_tags(cx.opnd(*b)) { if let Tag::B(n, k) = t { cx.trace.b_tags.entry(kb).or_default().insert((n, k)); } }
-            for idx in 0..4u8 { cx.trace.contrib.entry((cx.lane, var.0, idx)).or_default().push(kb); }
+            for t in frag_tags(cx.opnd(*a)) { if let Tag::A(m, k) = t { cx.trace.borrow_mut().a_tags.entry(kb).or_default().insert((m, k)); } }
+            for t in frag_tags(cx.opnd(*b)) { if let Tag::B(n, k) = t { cx.trace.borrow_mut().b_tags.entry(kb).or_default().insert((n, k)); } }
+            for idx in 0..4u8 { cx.trace.borrow_mut().contrib.entry((cx.lane, var.0, idx)).or_default().push(kb); }
             tag_acc_var(cx, *var);
         }
         Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => {
-            if cx.pass_writes { return false; } // write the C trace once, in pass 2
             let role = match cx.opnd(*rsrc) { V::Rsrc(r) => r, _ => return false };
             if role != PtrRole::C { return false; }
             let so = cx.int(*soff).unwrap_or(0);
@@ -316,19 +333,19 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             if let Some(v) = voff { if let Some(x) = cx.int(*v) { src += x; } else { return false; } }
             let frag = cx.opnd(*value);
             let (bytes, origins) = match frag { V::Frag { bytes, origins, .. } => (bytes, origins), _ => return false };
-            cx.trace.buffer_stores += 1;
-            if origins.iter().all(|x| x.is_none()) { cx.trace.buffer_store_no_origin += 1; }
+            cx.trace.borrow_mut().buffer_stores += 1;
+            if origins.iter().all(|x| x.is_none()) { cx.trace.borrow_mut().buffer_store_no_origin += 1; }
             let nouts = 2 * *dwords as usize;
             for q in 0..nouts {
                 let dword = q / 2;
                 let from_tag = bytes.get(4 * dword).and_then(|t| if let Tag::Acc(v, i) = t { Some((*v, *i)) } else { None });
                 let Some((var, idx)) = origins.get(dword).and_then(|x| *x).or(from_tag) else { continue };
-                let kbs = cx.trace.contrib.get(&(cx.lane, var, idx)).cloned().unwrap_or_default();
+                let kbs = cx.trace.borrow_mut().contrib.get(&(cx.lane, var, idx)).cloned().unwrap_or_default();
                 let elem = src / 2 + q as i64;
                 let m = elem / cx.args.n;
                 let n = elem % cx.args.n;
-                if !cx.trace.stores.insert(elem) { cx.trace.unknown_ops.insert("duplicate C store".into()); }
-                for kb in kbs { *cx.trace.c_count.entry((m, n, kb)).or_insert(0) += 1; }
+                if !cx.trace.borrow_mut().stores.insert(elem) { cx.trace.borrow_mut().unknown_ops.insert("duplicate C store".into()); }
+                for kb in kbs { *cx.trace.borrow_mut().c_count.entry((m, n, kb)).or_insert(0) += 1; }
             }
         }
         Stmt::StoreF32x2 { base, byte_off, value } => store_c(cx, *base, *byte_off, *value, 4),
@@ -365,7 +382,6 @@ fn word_tags(v: V) -> Vec<Tag> {
 }
 
 fn store_c(cx: &mut Ctx<'_>, base: Opnd, byte_off: u32, value: Opnd, nouts: usize) {
-    if cx.pass_writes { return; } // write the C trace once, in pass 2
     let mut off = match cx.opnd(base) { V::Ptr(PtrRole::C, o) => o, _ => return };
     off += byte_off as i64;
     let frag = cx.opnd(value);
@@ -374,13 +390,13 @@ fn store_c(cx: &mut Ctx<'_>, base: Opnd, byte_off: u32, value: Opnd, nouts: usiz
         let dword = q / 2;
         let origin = origins.get(dword).and_then(|x| *x);
         let Some((var, idx)) = origin else { continue };
-        let kbs = cx.trace.contrib.get(&(cx.lane, var, idx)).cloned().unwrap_or_default();
+        let kbs = cx.trace.borrow_mut().contrib.get(&(cx.lane, var, idx)).cloned().unwrap_or_default();
         let elem = (off / 2) as i64 + q as i64;
         let m = elem / cx.args.n;
         let n = elem % cx.args.n;
-        if !cx.trace.stores.insert(elem) { cx.trace.unknown_ops.insert("duplicate C store".into()); }
+        if !cx.trace.borrow_mut().stores.insert(elem) { cx.trace.borrow_mut().unknown_ops.insert("duplicate C store".into()); }
         for kb in kbs {
-            *cx.trace.c_count.entry((m, n, kb)).or_insert(0) += 1;
+            *cx.trace.borrow_mut().c_count.entry((m, n, kb)).or_insert(0) += 1;
         }
         let _ = &bytes;
     }
@@ -474,7 +490,7 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
             let tags: Vec<Tag> = (0..4 * *dwords as i64).map(|b| cx.tag_for(role, src + b)).collect();
             V::Word { tags, origin: None }
         }
-        _ => { cx.trace.unknown_ops.insert(format!("{op:?}").split('(').next().unwrap_or("op").to_string()); V::Unknown }
+        _ => { cx.trace.borrow_mut().unknown_ops.insert(format!("{op:?}").split('(').next().unwrap_or("op").to_string()); V::Unknown }
     }
 }
 
@@ -497,26 +513,26 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     let mut bytes = Vec::new();
     for i in 0..n {
         let _ = (tile, ver);
-        let mut tag = cx.lds.get(&(a + i as i64)).map(|x| x.0.clone()).unwrap_or(Tag::U);
-        if tag == Tag::U { if let Some(t) = cx.trace.tag_by_addr.get(&(a + i as i64)) { tag = t.clone(); } }
-        if tag != Tag::U { cx.trace.read_non_u += 1; }
+        let mut tag = cx.lds.borrow_mut().get(&(a + i as i64)).map(|x| x.0.clone()).unwrap_or(Tag::U);
+        if tag == Tag::U { if let Some(t) = cx.trace.borrow_mut().tag_by_addr.get(&(a + i as i64)) { tag = t.clone(); } }
+        if tag != Tag::U { cx.trace.borrow_mut().read_non_u += 1; }
         bytes.push(tag);
     }
     let mut origins = vec![None; n / 4];
     for d in 0..n / 4 {
         let addr = a + 4 * d as i64;
-        if let Some((_, o)) = cx.lds.get(&addr) { origins[d] = *o; }
+        if let Some((_, o)) = cx.lds.borrow_mut().get(&addr) { origins[d] = *o; }
         if origins[d].is_none() {
             // LDS epilogue aliases the dead ring/panel storage; the same byte may have been
             // written under another (tile, generation) key. Use an existing accumulator
             // provenance at this byte address as the origin fallback.
-            if let Some(o) = cx.trace.origin_by_addr.get(&addr) { origins[d] = Some(*o); }
+            if let Some(o) = cx.trace.borrow_mut().origin_by_addr.get(&addr) { origins[d] = Some(*o); }
         }
     }
     let n_o = origins.iter().filter(|x| x.is_some()).count();
-    cx.trace.lds_read_origins += n_o;
-    if cx.trace.sample_read.is_none() { cx.trace.sample_read = Some((tile.clone(), *ver, a, n_o)); }
-    if tile == "EPI" && cx.trace.sample_epi_read.is_none() { cx.trace.sample_epi_read = Some((tile.clone(), *ver, a, n_o)); }
+    cx.trace.borrow_mut().lds_read_origins += n_o;
+    if cx.trace.borrow_mut().sample_read.is_none() { cx.trace.borrow_mut().sample_read = Some((tile.clone(), *ver, a, n_o)); }
+    if tile == "EPI" && cx.trace.borrow_mut().sample_epi_read.is_none() { cx.trace.borrow_mut().sample_epi_read = Some((tile.clone(), *ver, a, n_o)); }
     V::Frag { bytes, origins, addr: Some(a) }
 }
 fn lds_read_word(cx: &mut Ctx<'_>, addr: Opnd) -> V {
@@ -524,27 +540,34 @@ fn lds_read_word(cx: &mut Ctx<'_>, addr: Opnd) -> V {
     match v { V::Frag { bytes, .. } => V::Word { tags: bytes, origin: None }, _ => V::Unknown }
 }
 
-fn run_lane(f: &Function, lane: i64, wave: i64, args: &Args, pass_writes: bool, lds: &mut HashMap<i64, (Tag, Option<(u32, u8)>)>, trace: &mut Trace) {
-    let mut cx = Ctx { lane, wave, args, vals: HashMap::new(), vars: HashMap::new(), cur_tile: None, pass_writes, lds, trace, unknown_control: 0 };
-    exec_nodes(f.body(), &mut cx);
+fn run_all(f: &Function, args: &Args) -> (Trace, usize) {
+    let lds: Rc<RefCell<HashMap<i64, (Tag, Option<(u32, u8)>)>>> = Rc::new(RefCell::new(HashMap::new()));
+    let trace: Rc<RefCell<Trace>> = Rc::new(RefCell::new(Trace::default()));
+    let mut lanes: Vec<Ctx<'_>> = (0..256i64).map(|lane| Ctx {
+        lane,
+        wave: lane / 64,
+        args,
+        vals: HashMap::new(),
+        vars: HashMap::new(),
+        cur_tile: None,
+        lds: Rc::clone(&lds),
+        trace: Rc::clone(&trace),
+        unknown_control: 0,
+        break_loop: false,
+        stopped: false,
+    }).collect();
+    let filter = vec![true; lanes.len()];
+    exec_nodes(f.body(), &mut lanes, &filter);
+    let unknown = lanes.iter().map(|c| c.unknown_control).sum();
+    let t = trace.borrow().clone();
+    (t, unknown)
 }
 
 pub fn prove_ir(f: &Function, cfg: &GemmConfig, m: i64, n: i64, k: i64) -> Result<Trace, ProofError> {
     if cfg.cta_m != 256 || cfg.cta_n != 256 { return Err(ProofError("E3 expects the 256x256 CTA".into())); }
     if k % 128 != 0 { return Err(ProofError("K must be a multiple of 128".into())); }
     let args = Args::small(m, n, k);
-    let mut lds = HashMap::new();
-    let mut trace = Trace::default();
-    // pass 1: all lanes write global tags into LDS, under the tile-protocol (tile, generation) keys
-    for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, true, &mut lds, &mut trace); }
-    trace.pass1_origin_left = lds.values().filter(|(_, o)| o.is_some()).count();
-    trace.lds_entries = lds.len();
-    trace.tag_entries = trace.tag_by_addr.len();
-    trace.pass1_lds_store_origins = trace.lds_store_origins;
-    // pass 2: reads, MFMA contributions and epilogue stores (DMA is not re-run)
-    for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, false, &mut lds, &mut trace); }
-    trace.pass2_lds_store_origins = trace.lds_store_origins - trace.pass1_lds_store_origins;
-    trace.lds_origins_left = lds.values().filter(|(_, o)| o.is_some()).count();
+    let (trace, _unknown_control) = run_all(f, &args);
     if !trace.unknown_ops.is_empty() {
         return Err(ProofError(format!("unsupported/unknown IR during symbolic execution: {:?}", trace.unknown_ops)));
     }
