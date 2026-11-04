@@ -22,7 +22,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 | **FMHA 性能（最近一次 `port_gate`，v3 vs 同轮旧手写集）** | B1H8S2048 默认路径（KV-split + `combine8h`）**672.7 TF/s**（同轮厂商约 536–539，≈1.25×）；`_vs128` 每 CU 64 blocks **446.4**，8 种代码布局中位数 **449.9 vs 453.7**；B4H8S2048 **1421.3**、B1H8S8192 **1978.6**（铺满网格约 0.84× 厂商）；B2H8S2048 `_t128` **1025.0**，布局中位数 **1022.3 vs 1028.6** |
 | 精度 | mean err **8.3e-4**（厂商 1.5–2.9e-3）；15/15 形状、64 行 bad=0 |
 | 确定性 | 5/5 × N；uneven-tile split 形状重复启动单一 md5 |
-| 测试 | `cargo test` **68 个目标 / 317 项全绿**；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
+| 测试 | `cargo test` **82 个目标 / 362 项全绿**；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
 | GPU 语义验证 | 编译器感知指令语义：LDS/global/buffer 越界、VGPR/SGPR/AGPR 类别与对齐、路径敏感等待、LDS tile 生命周期与同步协议均被证明。严格证书：出厂 4 kernel `--shipped` **24 trusted assumes / 100 host contracts / 0 unproven**；旧手写集 `--legacy` **44 / 216 / 0**；GEMM v3/v4 **3 / 19 / 0**；见 [`docs/gpu-semantics-verifier.md`](docs/gpu-semantics-verifier.md) |
 | Rust 安全 | **八个 crate 全部 `#![forbid(unsafe_code)]`、零第三方依赖、无 FFI/裸指针**；ISA 规则编码进类型系统；见 [`docs/rust-safety.md`](docs/rust-safety.md) |
 
@@ -36,7 +36,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 ```bash
 # 构建与测试（容器脚本会挂载 ROCm 与 pinned LLVM 工具）
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                    # 期望 68 targets / 317 tests 全绿
+bash tools/container/cargo.sh test                    # 期望 82 targets / 362 tests 全绿
 
 # 发射一个 kernel 的汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --out vs128.s
@@ -97,6 +97,15 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 |---|---|
 | [`docs/current-status.md`](docs/current-status.md) | **权威当前快照**（架构、DSL、kernel、数字、证书、已关闭方向、复现命令） |
 | [`docs/design.md`](docs/design.md) | Rust DSL 与自研 compiler 设计规格 |
+| [`docs/op-attributes.md`](docs/op-attributes.md) | **算子属性表**：每个 MOp 的效果/hazard/调度代价/AGPR/后端等属性单一来源（穷尽 match），各 pass 查表而非枚举算子 |
+| [`docs/region-ir.md`](docs/region-ir.md) | **区域化 IR**：函数体为 Loop/If/Region/Stage 树，旧标记序列为派生线性化，配对错误构造期即不可能 |
+| [`docs/sym.md`](docs/sym.md) | **统一符号分析器** `amdgpu-sym`：合同/布局/验证器共用的多项式、约束上下文、区间与位集；验证器按区域树遍历并带入分支事实 |
+| [`docs/slotfill.md`](docs/slotfill.md) | **填空档调度器**：MFMA 骨架 + 截止时间队列 + 周期预算 + 寄存器压力模型；GEMM v4 默认，取代手工搬数布置 |
+| [`docs/ir-printing.md`](docs/ir-printing.md) | **IR 打印与结构相等**：`amdc print-ir --stage dsl|mir|mir-ra`，α-等价比较/哈希 |
+| [`docs/functional-proofs.md`](docs/functional-proofs.md) | **功能证明层**：GEMM 索引级证明（含对已构建 IR 的符号执行 E3 与"跳 tile"反例）、FMHA online softmax 递推的实数证明 |
+| [`docs/fusion-layout-handoff.md`](docs/fusion-layout-handoff.md) | **融合边界**：`convert_layout` 按布局代数分档、MMA 方向搜索（自动推出 FMHA S→P）、`Node::Stage` 资源契约与 GV-STAGE、融合 MLP 示例 |
+| [`docs/stamps.md`](docs/stamps.md) | **in-kernel 时间戳**（`s_memtime`）：按阶段/按 tile 拆分 kernel 周期 |
+| [`docs/mfma-ceiling.md`](docs/mfma-ceiling.md) | **MFMA 发射上限微基准**：各操作数形式 32.25 周期/条，真实数据下的时钟与功耗墙 |
 | [`docs/ir-review-tirx-sftensor.md`](docs/ir-review-tirx-sftensor.md) | **IR 梳理**：对照 TIRx（算子属性表、区域语句、统一符号分析、打印/结构相等、命名轴 layout）与 SF Tensor 形式化正确性，提出属性表 / 区域化 IR / 统一 sym / 功能证明层的改造顺序 |
 | [`docs/layout-tour.md`](docs/layout-tour.md) | **布局层入门**：`Layout` / `Swizzle` / TV 布局 / `IssuePlan` / 证明，用出厂 FMHA 与 GEMM 的真实代码讲 |
 | [`docs/fmha-dsl-tour.md`](docs/fmha-dsl-tour.md) | **FMHA 逐段教程**：每一段的 DSL 特性与 Rust safe 怎么保证 |

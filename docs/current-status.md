@@ -26,7 +26,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - **AGPR 已支持**（寄存器类 A1–A16、acc_cd MFMA、`ds_read_b128 → AGPR`、`v_accvgpr_*`、统一 512 寄存器预算与 hazard）：[`agpr.md`](agpr.md)。
 - **主机侧生成**：`amdc gen-host` 从 kernel 合同生成 C++ 启动/ABI 头与 JSON（[`host-gen.md`](host-gen.md)）；出厂 `ref_host` 使用生成的命名字段。
 - 精度 **mean 8.3e-4**（厂商 1.5–2.9e-3）；15/15 形状、64 行 bad=0；确定性与 split 压力全过。
-- `cargo test` **68 个测试目标 / 317 项全绿**。
+- `cargo test` **82 个测试目标 / 362 项全绿**。
 - 严格 GPU 语义证书：`--shipped` **24 trusted assumes / 100 trusted contracts / 0 unproven**；`--legacy` **44 / 216 / 0**；GEMM v3 / v4 **3 / 19 / 0**。
 
 ---
@@ -223,7 +223,7 @@ v3 asm md5：`68d2832b` / `e4c7e75d` / `e4fc18b1` / `24a95a51`。`_t128` 另外�
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **68 个目标 / 317 项全绿**。主要测试文件：`tail_invariance`、`mir_invariants`、`rust_safety`、`register_accounting`、
+- **测试**：`cargo test` **82 个目标 / 362 项全绿**。主要测试文件：`tail_invariance`、`mir_invariants`、`rust_safety`、`register_accounting`、
   `asm_assembles`、`hazard_*`、`phys_waw`、`ra_reaching`、`pin*`、`var_lint`、`gpu_*`（语义/协议/攻击）、`gv_bits`、`agpr`、`mfma16x16x128`、
   `lds_b64`、`scalarize2`、`gemm_mxfp8`、`tile_l*`；布局层 `crates/amdgpu-layout/tests/{algebra,fmha_vs128}.rs`、
   `crates/amdgpu-tile/tests/{address_equality,dma_equality,bufdma}.rs`（发射 IR 逐 lane 对照旧 reader/copy）；safe-asm `tests/ui` 29 个用例。
@@ -242,7 +242,7 @@ v3 asm md5：`68d2832b` / `e4c7e75d` / `e4fc18b1` / `24a95a51`。`_t128` 另外�
 ```bash
 # 构建与测试
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                 # 期望 68 targets / 317 tests 全绿
+bash tools/container/cargo.sh test                 # 期望 82 targets / 362 tests 全绿
 
 # 发射 kernel 并汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --out vs128.s
