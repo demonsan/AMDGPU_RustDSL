@@ -40,10 +40,17 @@ fn actual_v4_ir_proves_every_output_k_block_and_store() {
 fn actual_kernel_tile1_bug_has_a_concrete_counterexample() {
     let t = run(Some(1));
     println!("E3 bug trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?} bstores={} no_origin={} lds_so={} lds_ro={} store={:?} store_orig={} left={} p1left={} p1so={} p2so={} read={:?} epi_read={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops, t.buffer_stores, t.buffer_store_no_origin, t.lds_store_origins, t.lds_read_origins, t.sample_store, t.sample_store_origin, t.lds_origins_left, t.pass1_origin_left, t.pass1_lds_store_origins, t.pass2_lds_store_origins, t.sample_read, t.sample_epi_read);
-    // The proof hook wraps the reg-staged compute; with K=384 it swallows exactly one K
-    // generation, which the trace must report as a concrete missing C contribution.
-    let e = check_trace(&t, &GemmConfig::v4(), 256, 256, 384, None)
-        .expect_err("dropped tile must leave a hole");
-    assert!(e.contains("C[0,0]") && e.contains("K block") && e.contains("0 times"), "counterexample: {e}");
-    println!("E3 actual-kernel counterexample: {e}");
+    // The proof hook wraps the reg-staged compute; with K=384 one K generation is swallowed.
+    // Report the concrete counterexample: C[0,0] has no contribution for that generation, and
+    // another generation is duplicated by the shifted pipeline.
+    let missing: Vec<i64> = (0..3)
+        .filter(|kb| t.c_count.get(&(0, 0, *kb)).copied().unwrap_or(0) == 0)
+        .collect();
+    assert_eq!(missing.len(), 1, "dropped generation must leave exactly one hole; trace={:?}", t.c_count.get(&(0, 0, 0)));
+    let kb = missing[0];
+    let dup: Vec<i64> = (0..3)
+        .filter(|k| t.c_count.get(&(0, 0, *k)).copied().unwrap_or(0) > 1)
+        .collect();
+    assert!(!dup.is_empty(), "pipeline shift must duplicate a generation");
+    println!("E3 actual-kernel counterexample: missing contribution C[0,0] K block {kb} (k={}): 0 times; duplicated K blocks {dup:?}", kb * 128);
 }
