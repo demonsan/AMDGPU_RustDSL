@@ -133,6 +133,8 @@ impl DmaPart {
         let so = { let v = b.bind_i32(key0.clone() * &self.src.stride + ev_(bf.base)); b.read_first_lane(v) };
         let off = slot.off_v(b);
         let m0 = b.bind_i32(&self.lds_wave + off - (self.step * (n - 1)) as i32);
+        // wave-uniform: ONE readfirstlane per tile (the DMA's M0 / soffset are SGPRs; a VGPR value is re-read before every issue)
+        let m0 = b.read_first_lane(m0);
         slot.write(b, |b| {
             for q in 0..n as usize {
                 b.buffer_load_lds_b128(bf.rsrc, bf.voffs[q], so, m0, (self.step * q as i64) as u32);

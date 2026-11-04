@@ -132,6 +132,7 @@ impl PadDma {
         let so = { let v = b.bind_i32(key0.clone() * &self.stride + ev(self.base)); b.read_first_lane(v) };
         let off = slot.off_v(b);
         let m0 = b.bind_i32(ev(self.m0w) + off);
+        let m0 = b.read_first_lane(m0);
         slot.write(b, |b| {
             for (q, vo) in self.voffs.iter().enumerate() {
                 b.buffer_load_lds_b128(self.rsrc, *vo, so, m0, (1040 * q) as u32);
