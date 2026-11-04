@@ -71,14 +71,87 @@ pub struct KvRing3 {
     pub mma: TiledMma,
     /// MUBUF form of the K / V DMA (`Vs128Cfg::bufdma`): SGPR per-tile advance, loop-invariant voffsets
     pub buf: Option<(crate::dma::BufForm, crate::dma::BufForm)>,
+    /// the padded vendor image's K / V DMA (`KvRing3::new_cfg(.., pad = true)`)
+    pub pad_dma: Option<(PadDma, PadDma)>,
+}
+
+/// Bytes of one padded K / V tile: 16 runs of 1040 bytes.
+pub const PAD_TILE: i64 = 16 * 1040;
+
+/// The padded vendor image of a [128 keys x 128 bytes] tile: key r, byte d -> 1040 (r / 8) + 512 (d / 64) + 64 (r % 8) + d % 64.
+pub fn kv_view_pad() -> ComposedLayout {
+    ComposedLayout::plain(make_layout(tup![tup![8, 16], tup![64, 2]], tup![tup![64, 1040], tup![1, 512]]))
+}
+
+/// The padded image's DMA (MUBUF, the vendor form): wave w of the 4-wave producer group writes runs 4 w + q (q < 4); lane i of run n fetches key
+/// 8 n + (i % 32) / 4, bytes 64 (i / 32) + 16 (i % 4) - which lands at 1040 n + 16 i, i.e. lane-contiguous, no swizzle; voffset = the lane's
+/// source offset minus the instruction immediate 1040 q, soffset = origin + key0 x stride, M0 = slot + 4160 w.
+pub struct PadDma {
+    sh: Shared,
+    rsrc: ValueId,
+    base: ValueId,
+    stride: I32,
+    voffs: Vec<ValueId>,
+    m0w: ValueId,
+}
+
+impl PadDma {
+    pub fn new(b: &mut FnBuilder, sh: &Shared, src: &copy::RowSource, wave: ValueId) -> PadDma {
+        // build-time proof: every (wave, run, lane) lands at the view offset of its element and the 64 lanes of a run are contiguous
+        let v = kv_view_pad();
+        for w in 0..4i64 {
+            for q in 0..4i64 {
+                let n = 4 * w + q;
+                for i in 0..64i64 {
+                    let (r, d) = (8 * n + (i % 32) / 4, 64 * (i / 32) + 16 * (i % 4));
+                    assert_eq!(v.inner.at(r + 128 * d), 1040 * n + 16 * i, "PadDma: run {n} lane {i}");
+                }
+            }
+        }
+        let bo = b.bind_i32(src.base.clone());
+        let bo = b.read_first_lane(bo);
+        let nrec = match &src.clamp {
+            Some(c) => b.bind_i32(ev(bo) + (c.limit.clone() - 1) * &src.stride + 128),
+            None => b.c_i32(0x7fff_ffff),
+        };
+        let nrec = b.read_first_lane(nrec);
+        let rsrc = b.buffer_desc_dyn(src.ptr, nrec);
+        let tid = b.let_(amdgpu_dsl::Op::WorkitemId);
+        let i = b.bind_i32(ev(tid) & 63);
+        let voffs = (0..4i32)
+            .map(|q| {
+                let row = (ev(wave) * 32) + (8 * q) + ((ev(i) & 31).lshr(2));
+                b.bind_i32(row * &src.stride + ((ev(i).lshr(5)) << 6) + ((ev(i) & 3) << 4) - 1040 * q)
+            })
+            .collect();
+        let m0w = b.bind_i32(ev(wave) * 4160 + sh.base as i32);
+        PadDma { sh: sh.clone(), rsrc, base: bo, stride: src.stride.clone(), voffs, m0w }
+    }
+    pub fn issue(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotRef) {
+        assert_eq!(slot.sh.name, self.sh.name, "PadDma: slot of another buffer");
+        let so = { let v = b.bind_i32(key0.clone() * &self.stride + ev(self.base)); b.read_first_lane(v) };
+        let off = slot.off_v(b);
+        let m0 = b.bind_i32(ev(self.m0w) + off);
+        slot.write(b, |b| {
+            for (q, vo) in self.voffs.iter().enumerate() {
+                b.buffer_load_lds_b128(self.rsrc, *vo, so, m0, (1040 * q) as u32);
+            }
+        });
+    }
 }
 
 impl KvRing3 {
     pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
+        Self::new_cfg(b, io, blk, roles, slots, false)
+    }
+    /// `pad`: the vendor's K / V LDS image (1040-byte runs of 8 keys x [2 x 64-byte halves], no swizzle; staged by `PadDma`).
+    pub fn new_cfg(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, pad: bool) -> KvRing3 {
         let mut lds = LdsPlan::new();
-        let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
+        let tile_bytes = if pad { PAD_TILE } else { 16384 };
+        let tl = if pad { Layout::Linear } else { Layout::FMHA_SWZ };
+        let [ks, vs] = lds.ring_group(slots, [("K", tile_bytes, tl), ("V", tile_bytes, tl)]);
         let kd = lds.ring("KD", 512, slots, Layout::Linear);
-        lds.at(32768 * slots as i64 + 2048);
+        lds.at(2 * tile_bytes * slots as i64 + 2048);
         let ones = lds.tile("ones", 2048, Layout::Linear);
         let q1 = lds.tile("Q1", 16384, Layout::Linear);
         let q0 = lds.tile("Q0", 16384, Layout::Linear);
@@ -94,10 +167,18 @@ impl KvRing3 {
         let o = attention_orientation();
         let mma = make_tiled_mma(o.0, false);
         // K: the A operand (32 keys x 64 bytes) at rows 32 s, k-group c
-        let kview = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![32, 64], tup![128, 1]));
-        let placements: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect();
+        let (kview, placements, vview) = if pad {
+            // 32 keys x 64 bytes of run-pairs: key r -> 1040 (r / 8) + 64 (r % 8), block (s, c) at 4160 s + 512 c
+            let kv = ComposedLayout::plain(make_layout(tup![tup![8, 4], 64], tup![tup![64, 1040], 1]));
+            let pl: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4160 * s + 512 * c)).collect();
+            (kv, pl, kv_view_pad())
+        } else {
+            let kv = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![32, 64], tup![128, 1]));
+            let pl: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect();
+            (kv, pl, kv_view())
+        };
         let kpart = make_tiled_copy_a(DS_READ_B128X2, &mma).partition_lds(b, &ctx, &l, &ks, &kview, &placements);
-        let vpart = make_tiled_copy(DS_READ_TR_B8X4, vt_tr_source(), 128 * 128, 8).partition_lds(b, &ctx, &l, &vs, &kv_view(), &[0]);
+        let vpart = make_tiled_copy(DS_READ_TR_B8X4, vt_tr_source(), 128 * 128, 8).partition_lds(b, &ctx, &l, &vs, &vview, &[0]);
         let kdpart = make_tiled_copy_bcast(DS_READ_B32, kd_read_tv(), 128, 32).partition_lds(b, &ctx, &l, &kd, &ComposedLayout::plain(make_layout(128, 4)), &[0]);
         let (kt, vt, kdt) = (blk.kv_tile(b, &io.k), blk.kv_tile(b, &io.v), blk.kv_tile(b, &io.ksc));
         let (ksrc, vsrc, kdsrc) = (kt.row_source(b, 1), vt.row_source(b, 1), kdt.row_source(b, 1));
@@ -113,7 +194,13 @@ impl KvRing3 {
             let rt_row = b.bind_i32(lane.tid().lshr(1));
             KdCopy3::Vgpr(copy::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
         };
-        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None }
+        let pad_dma = if pad {
+            let wvb = b.bind_i32(wv.clone());
+            Some((PadDma::new(b, &ks, &kt.row_source(b, 1), wvb), PadDma::new(b, &vs, &vt.row_source(b, 1), wvb)))
+        } else {
+            None
+        };
+        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None, pad_dma }
     }
     /// Switches the K / V staging to the buffer form (the vendor's `buffer_load_dwordx4 ... lds` with an SGPR soffset).
     pub fn enable_buffer_dma(&mut self, b: &mut FnBuilder) {
@@ -127,6 +214,10 @@ impl KvRing3 {
         match (role, &self.kdc) {
             (Role::A, KdCopy3::Dma(kd)) => {
                 kd.issue(b, key0, &self.kd.at(slot));
+                if let Some((kp, _)) = &self.pad_dma {
+                    kp.issue(b, key0, &self.ks.at(slot));
+                    return None;
+                }
                 match &self.buf {
                     Some((kb, _)) => self.kdma.issue_buffer(b, kb, key0, &self.ks.at(slot)),
                     None => self.kdma.issue(b, key0, &self.ks.at(slot)),
@@ -134,6 +225,10 @@ impl KvRing3 {
                 None
             }
             (Role::B, _) => {
+                if let Some((_, vp)) = &self.pad_dma {
+                    vp.issue(b, key0, &self.vs.at(slot));
+                    return None;
+                }
                 match &self.buf {
                     Some((_, vb)) => self.vdma.issue_buffer(b, vb, key0, &self.vs.at(slot)),
                     None => self.vdma.issue(b, key0, &self.vs.at(slot)),
@@ -328,10 +423,12 @@ pub struct Vs128Cfg {
     pub bufdma: bool,
     /// the vendor's priority ping-pong: `s_setprio 1` at the start of the MFMA phase (PV + next QK), `s_setprio 0` at the softmax phase
     pub setprio: bool,
+    /// the vendor's padded K / V LDS image (1040-byte runs, no swizzle) with its MUBUF DMA
+    pub kvpad: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -341,7 +438,7 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
     let io = declare_io(b, 256, false);
     let blk = block3(&io, b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
-    let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
+    let mut ring = KvRing3::new_cfg(b, &io, &blk, &roles, 2, cfg.kvpad);
     if cfg.bufdma {
         ring.enable_buffer_dma(b);
     }
