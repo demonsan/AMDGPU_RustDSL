@@ -1353,6 +1353,12 @@ impl<'a> An<'a> {
                 let r = self.av_of(rsrc);
                 self.check_buffer("buffer load", &r, voff, soff, *imm as i128, 4 * *dwords as i128, false);
             }
+            Op::BufferLoadB128x2 { rsrc, voff, soff, imm_lo, imm_hi } => {
+                let r = self.av_of(rsrc);
+                for imm in [*imm_lo, *imm_hi] {
+                    self.check_buffer("buffer load (b128x2)", &r, voff, soff, imm as i128, 16, false);
+                }
+            }
             Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } => {}
             _ => {}
         }
