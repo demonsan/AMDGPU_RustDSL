@@ -7,7 +7,11 @@ fn expr_layer_twins_are_structurally_equal() {
     for (manual, expr) in [("probe_llvm_ids", "probe_expr_ids"), ("probe_llvm_kernarg", "probe_expr_kernarg")] {
         let a = kernel_by_name(manual).unwrap();
         let b = kernel_by_name(expr).unwrap();
-        assert!(dsl_structural_eq(&a, &b), "{expr} must be structurally equal to {manual}");
+        if !dsl_structural_eq(&a, &b) {
+            let ca = canonical_dsl(&a); let cb = canonical_dsl(&b);
+            let first = ca.lines().zip(cb.lines()).enumerate().find(|(_, (x, y))| x != y);
+            panic!("{expr} not structurally equal to {manual}; first diff: {first:?}");
+        }
         assert_eq!(dsl_structural_hash(&a), dsl_structural_hash(&b), "{expr} hash");
         // the canonical form is alpha-renamed and does not contain the function name
         let ca = canonical_dsl(&a);
@@ -49,7 +53,7 @@ fn dsl_printer_is_structured_and_shows_types_operands_and_markers() {
         }
     }
     let text = print_dsl(&kernel_by_name("probe_expr_ids").unwrap());
-    assert!(text.lines().any(|l| l.starts_with("  %v")), "a typed Let line");
+    assert!(text.lines().any(|l| l.trim_start().starts_with("%v") && l.contains(": ")), "a typed Let line");
 }
 
 #[test]
