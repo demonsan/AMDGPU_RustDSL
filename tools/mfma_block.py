@@ -23,15 +23,15 @@ def t(f, base, n):
 
 
 def kernel(name, ops, sync):
-    ACC_V, SC, TMP, TID, ADDR = 0, 170, 174, 175, 176
-    accum_off = 192
+    ACC_V, SC, TMP, TID, ADDR = 0, 224, 226, 227, 228
+    accum_off = 232
     # AGPR layout: A frags a[0:31], B frags a[32:63] when AGPR, accumulators a[64:..] (24 accs x 4 = 96)
     aA = 0
     aB = 32
     accA_base = 64
     agprs = 64 + 96
     # VGPR layout: acc V v[0:159], VGPR copies of the operand fragments after the scales
-    vA, vB = 200, 232
+    vA, vB = 160, 192
     nfv = accum_off + agprs
     nfv = (nfv + 7) // 8 * 8
     o = [f".text\n.globl {name}\n.p2align 8\n.type {name},@function\n{name}:"]
