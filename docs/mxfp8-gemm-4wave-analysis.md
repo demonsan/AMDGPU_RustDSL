@@ -528,3 +528,11 @@ wave（像 FMHA 的 A/B 角色乒乓）：每 SIMD 512 个 VGPR+AGPR 分给两�
 约 128 个 AGPR）加 scale/地址 VGPR；8 wave 的 barrier 与 DMA 角色分工、LDS 布局（同样 2 级）都要重做。属于独立项目（数天），不是调参。
 
 **本轮结论**：v4 = **0.951×** vendor（门禁 PASS，strict verify 0/0/0-unproven），gemm-rr 分支。摩擦记录 16 条已交给 sched（rocprof-report / kernel-wiki 改进）。
+
+### 13.6 补充：prologue voffset 位形式化简（backend-llvm-tail，origin/layout-affine @325fe80，已合并）
+
+`amdgpu_layout::BitForm`：只依赖一个非负符号（tid）且是 GF(2) 线性的 Ix（2 的幂次 div/mod/mask、移位、XOR swizzle、无进位求和）化成
+“移位组”异或 `(tid & M) << d` 的正规形式，`Ctx::bind` 跨所有 DMA 计划 CSE。只用于 DMA voffset（`GemmConfig::bitfield_voffsets`，默认开；
+LDS 片段基址保持结构化形式，否则验证器无法给 XOR 组形式定界）。v4：首条 DMA 前的指令 692 → 222，首个 MFMA 前 1715 → 1244，静态 VALU 850 → 459。
+门禁（GPU 5，交错）：**v4 3120 vs vendor 3222 = 0.968**；同会话关掉位形式 3111 vs 3254 = 0.956（vendor 两次跑之间相差 1%，绝对值 +0.3%）；
+v3 3010 vs 3228 = 0.932。全部 PASS（strict 0/0/0-unproven，3 形状 GEMM_OK，确定性一致）。
