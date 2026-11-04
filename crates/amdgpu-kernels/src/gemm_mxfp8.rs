@@ -1228,6 +1228,11 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4" => GemmConfig::v4(),
         // experiments
         "gemm_mxfp8_bs_v3_vshare" => GemmConfig { shared_voffsets: true, ..GemmConfig::v3() },
+        // slot-filling scheduler experiments (sched/slotfill.rs): the hand placement knobs (DMA spread, spread reloads) neutralised = plain program order
+        "gemm_mxfp8_bs_v4_plain" => GemmConfig { defer_dma: false, spread_reloads: false, sched: "rewait", ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_plain_sf" => GemmConfig { defer_dma: false, spread_reloads: false, sched: "rewait,slotfill", ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_plain_hc" => GemmConfig { defer_dma: false, spread_reloads: false, sched: "rewait,hoistchain", ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_sf" => GemmConfig { sched: "rewait,slotfill", ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_vshare" => GemmConfig { shared_voffsets: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_acc32" => GemmConfig { acc_agpr: 32, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_acc16" => GemmConfig { acc_agpr: 16, ..GemmConfig::v4() },

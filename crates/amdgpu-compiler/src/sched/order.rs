@@ -48,7 +48,18 @@ fn pin_vm_wait() -> bool {
 }
 
 /// Must `a` (earlier in program order) stay before `b` because of memory / fence semantics?
+/// `slotfill` legality contract (sched/slotfill.rs): inside a barrier interval an LDS-DMA never writes what a `ds_read` of the same interval reads, so the two may swap.
+/// Set only for the duration of that pass (and its verification).
+pub static RELAX_DMA_LDS_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn dma_vs_lds_read(f: &Effects, x: &Effects) -> bool {
+    f.fence == Fence::Barrier && f.mem.is_some() && x.fence == Fence::None && matches!(&x.mem, Some(m) if m.space == Space::Lds && !m.write)
+}
+
 pub fn mem_must_order(a: &Effects, va: Option<usize>, b: &Effects, vb: Option<usize>, alu_across: bool) -> bool {
+    if RELAX_DMA_LDS_READ.load(std::sync::atomic::Ordering::Relaxed) && (dma_vs_lds_read(a, b) || dma_vs_lds_read(b, a)) {
+        return false;
+    }
     match (a.fence != Fence::None, b.fence != Fence::None) {
         (true, true) => true,
         (true, false) => fence_then(a.fence, b, alu_across),
