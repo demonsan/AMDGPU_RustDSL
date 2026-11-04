@@ -249,7 +249,7 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
     }
     let mut sl: Vec<usize> = slot.iter().map(|s| s.unwrap()).collect();
     // ---- consistency: producers never later than consumers (slot-wise), MFMA edges exact ----
-    for _ in 0..4 {
+    for _ in 0..(n + 4).min(256) {
         let mut changed = false;
         for i in (0..n).rev() {
             if mslot[i].is_some() {
@@ -298,7 +298,7 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
                 (None, None) => sl[i] <= sl[s],
             };
             if !ok {
-                log.push(format!("region of {n} instructions, {mm} MFMAs: no consistent slot assignment (edge {i}->{s}), left alone"));
+                log.push(format!("region of {n} instructions, {mm} MFMAs: no consistent slot assignment (edge {i}->{s} lat {lat}: {:?} lo {} dl {} slot {} -> {:?} lo {} dl {} slot {}), left alone", seg[i].op, lo[i], dl[i], sl[i], seg[s].op, lo[s], dl[s], sl[s]));
                 return Ok(None);
             }
         }
