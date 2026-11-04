@@ -124,6 +124,7 @@ pub struct Trace {
     pub sa_mfma: usize,
     pub sb_mfma: usize,
     pub sa_sample: Option<String>,
+    pub scale_src: Option<(String, i64)>,
     pub sample_miss: Option<i64>,
     pub sample_hit: Option<i64>,
 }
@@ -266,6 +267,9 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             let mut src = so + *imm as i64;
             if let Some(v) = voff { if let Some(x) = cx.int(*v) { src += x; } else { return false; } }
             let nbytes = 4 * *dwords as i64;
+            if matches!(role, PtrRole::Sfa | PtrRole::Sfb) && cx.trace.borrow().scale_src.is_none() {
+                cx.trace.borrow_mut().scale_src = Some((format!("{role:?}"), src));
+            }
             let dst = la + *imm as i64 + nbytes * cx.lane;
             for b in 0..nbytes {
                 let tag = cx.tag_for(role, src + b);
