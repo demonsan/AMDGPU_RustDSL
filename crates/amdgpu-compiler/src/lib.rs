@@ -204,6 +204,16 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         other => other,
     };
+    // experiment switch: AMDC_SLOTFILL=1 (every kernel) or AMDC_SLOTFILL=<substring of the kernel name> adds the slot-filling scheduler to the kernel's options
+    // (reorder stays off unless the kernel already had it); unset = no change at all (sched/slotfill.rs)
+    let sched_opts = match (std::env::var("AMDC_SLOTFILL").ok().filter(|v| !v.is_empty() && v != "0"), sched_opts) {
+        (Some(v), so) if v == "1" || pname.contains(v.as_str()) => {
+            let mut o = so.unwrap_or_else(|| sched::Options { reorder: false, ldshoist: true, ..sched::Options::default() });
+            o.slotfill = true;
+            Some(o)
+        }
+        (_, so) => so,
+    };
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
         // (pressure cut, hoist distance cap): first shrink the LDS-read hoisting (it lengthens live ranges and fragments

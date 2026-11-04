@@ -18,6 +18,7 @@ pub mod m0;
 pub mod model;
 pub mod order;
 pub mod phase;
+pub mod slotfill;
 pub mod sim;
 pub mod swp;
 pub mod taildup;
@@ -60,6 +61,8 @@ pub struct Options {
     /// `hoistchain`: ldshoist also moves the pure ALU producers of a load's address (and of theirs) up with it, so a load whose address is computed right before it can still be issued early
     pub hoist_chain: bool,
     pub hoist_dist: usize,
+    /// `slotfill`: the slot-filling scheduler (sched/slotfill.rs): MFMAs are the skeleton, the other instructions are spread over their deadline windows
+    pub slotfill: bool,
     /// Restrict block scheduling to blocks whose label is in the set or above the floor (blocks created
     /// by swp / taildup). Used by uto_plan.
     pub sched_labels: Option<(std::collections::HashSet<u32>, u32)>,
@@ -67,7 +70,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, auto: false, trust_model: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, sched_labels: None }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, auto: false, trust_model: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, sched_labels: None }
     }
 }
 
@@ -107,6 +110,7 @@ impl Options {
                     "taildup" => o.taildup = true,
                     "trustmodel" => o.trust_model = true,
                     "ldshoist" => o.ldshoist = true,
+                    "slotfill" => o.slotfill = true,
                     "hoistchain" => {
                         o.ldshoist = true;
                         o.hoist_chain = true;
@@ -226,6 +230,12 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         let n = hoist::run(m, o);
         if o.stats {
             eprintln!("ldshoist: {n} loads hoisted");
+        }
+    }
+    if o.slotfill {
+        let n = slotfill::run(m, o)?;
+        if o.stats {
+            eprintln!("slotfill: {n} instructions moved");
         }
     }
     // `sched_group_barrier` phases (blocks with directives; the directives are removed)
