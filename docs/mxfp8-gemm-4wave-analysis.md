@@ -536,3 +536,44 @@ wave（像 FMHA 的 A/B 角色乒乓）：每 SIMD 512 个 VGPR+AGPR 分给两�
 LDS 片段基址保持结构化形式，否则验证器无法给 XOR 组形式定界）。v4：首条 DMA 前的指令 692 → 222，首个 MFMA 前 1715 → 1244，静态 VALU 850 → 459。
 门禁（GPU 5，交错）：**v4 3120 vs vendor 3222 = 0.968**；同会话关掉位形式 3111 vs 3254 = 0.956（vendor 两次跑之间相差 1%，绝对值 +0.3%）；
 v3 3010 vs 3228 = 0.932。全部 PASS（strict 0/0/0-unproven，3 形状 GEMM_OK，确定性一致）。
+
+---
+
+## 14. 修正后的差距分析与收尾轮（2026-11-04）：0.956 → 0.98
+
+**更正前提**：§11–§13 里“MMA-only 流 = 指令上限、vendor 在上限的 97.8%”是错的。sched 的 `s_memtime` 探针（branch mfma-ceiling）测得
+16x16x128 scaled MFMA 每 wave 32.25 周期/条（随机数据与零数据相同；VGPR/AGPR 累加器、AGPR/VGPR 源、op_sel 均无差别；scale 只能放 VGPR），
+上限 ≈ 4096 × 32.3 ≈ 132k 周期/wave；我们的 MMA-only 消融并不在上限上（其中含 prologue/epilogue/启动/尾部 ≈ 30k）。
+
+### 14.1 功耗/时钟（不扰动测量：GPU 5 = amd-smi idx 4，60k 次启动中采样）
+两者都撞功耗墙（≈1370 W）：vendor 1905 MHz × 84.8 µs ≈ 161.5k 周期；我们 2090 MHz × 89.5 µs ≈ 187k 周期（本轮开始时）。我们时钟更高 10%
+但周期多 16%——要减的是周期，不是“降低功耗”。零数据 MMA-only 621 W / 2384 MHz（不受限）。
+
+### 14.2 定位手段
+* 静态循环体对比（u2，每 tile）：vendor 162 条 vs 我们 170 条，MFMA/ds_read/DMA/barrier/waitcnt 数完全相同，只多 ~8 条廉价指令。
+* stamps（`GEMM_STAMP=ends|tiles`，每 wave）：v4 循环 2395 周期/tile vs MFMA 下限 2072；prologue（新增 slot 5–9）逐段拆分。
+* 热态 ATT（`--kernel-iteration-range "[4]"`，4 SIMD）：稳态 tile（barrier→barrier）中位数、MFMA 间隙按其间指令归因。
+
+### 14.3 本轮改动（每步同会话交错门禁；node 有共租户，A/B 另用交替 6–7 次的中位数）
+
+| 步骤 | 依据 | 门禁（ours / vendor） |
+|---|---|---|
+| 起点 v4（8 相 epilogue + BitForm voffset） | — | 0.956 |
+| vendor 同步顺序：5 MMA → vmcnt/lgkm 等待 → 3 MMA（`post_wait` 钩子）→ barrier；重载打散；B scale 预展开为 dword（静态字节选择） | 静态发射距离分析：vendor 每个 DMA 到退休的距离均值 50.2 vs 我们 45.5 MMA，且 barrier 藏在 3 个 MMA 后 | 3128 / 3239 = 0.966 |
+| **A 的 LDS 图像改为 vendor 的 padded 形式**（每 8 行 1 KB + 32 B，1056 B 间距；DMA lane 线性，不再在源端做 XOR swizzle） | ATT：DMA 发射停顿 5.7 vs 2.9、DMA 后 MFMA 停顿 11.5 vs 5.4 周期/次；计数器 TA_BUFFER_COALESCED_READ_CYCLES 32× | 3139 / 3210 = 0.978 |
+| 循环出口比较改 SALU（`s_cmp`+`s_cbranch_scc`）+ `edgepad`（backend-llvm-tail：MFMA SrcC WAR 窗口跨块边传播，块尾不再补 nop） | ATT：循环出口块（v_cmp→vcc + s_nop）造成 ~130 周期/tile 的 MFMA 空泡 | 3183 / 3252 = 0.979 |
+| prologue：panel 转置用 `v_perm_b32` 打包（每 dword 3 条 VALU 而非 ~14），tile 1 的 DMA 放到转置之后 | stamps：tile DMA 发射 2.41k→0.97k，gather 2.57k→1.38k，到循环共 8.47k→6.98k 周期 | 3182 / 3244 = **0.981** |
+
+测过未采用：gap 2 的 DMA 间隔（即使用 padded A 仍慢 1%：我们 DMA→MFMA 的发射耦合多 ~6 周期）、tile 1 推到 barrier 之后（中性；首次实现时
+延迟 stage 路径吞掉了 tile 1，被门禁参考检查抓到，已修）、把下一 stage 的标量准备与 scale 读放到等待与 barrier 之间（prefill，中性）、
+acc_agpr 8/16/32（中性/负）、跨块 MFMA 错位（不合法：原地重载 + 别的 wave 的 DMA 竞争）。
+
+### 14.4 剩余差距（热态 ATT，最终默认）
+wave 周期 166.2k vs vendor 150.8k；稳态 tile 2334 vs 2132 周期（+200/tile ≈ 12.8k）；首个 MFMA 8.0k vs 6.6k；尾部 8.0k vs 7.6k。
+稳态 tile 内 MFMA 间隙：我们 483 vs vendor 448 周期/tile，最大的单项差别是 **barrier 之后到第一个 MFMA：197 vs 50 周期/tile**
+（barrier 后紧跟 ~27 条标量准备 + scale 读 + 第一条 DMA；把它们挪到 barrier 前（prefill）没有改善，说明主要是 barrier 释放后 DMA 发射的开销），
+其余为 DMA/ds_read 周围的空泡（两边量级相同）。setup 段（1.95k 周期）里我们有 9 条 s_load（vendor 5 条，含一条 dwordx8）和 ~57 条用于物化
+常量的 `v_mov`（VALU 立即数未内联）——编译器项，影响 <0.2%。
+
+**结论**：v4 = **0.98×** vendor（交错门禁 PASS，strict 0/0/0-unproven，3 形状 GEMM_OK，确定性一致）；功耗墙下时间 ∝ 每次 GEMM 的周期数，
+剩余 ~2% 集中在每块 barrier 释放后的第一批发射与 prologue。
