@@ -122,7 +122,7 @@ struct Ctx<'a> {
     vars: HashMap<VarId, V>,
     cur_tile: Option<(String, i64)>,
     pass_writes: bool,
-    lds: &'a mut HashMap<(String, i64, i64), (Tag, Option<(u32, u8)>)>,
+    lds: &'a mut HashMap<i64, (Tag, Option<(u32, u8)>)>,
     trace: &'a mut Trace,
     unknown_control: usize,
 }
@@ -232,11 +232,12 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             let mut src = so + *imm as i64;
             if let Some(v) = voff { if let Some(x) = cx.int(*v) { src += x; } else { return false; } }
             let nbytes = 4 * *dwords as i64;
-            let dst = la + *imm as i64 + 16 * cx.lane;
+            let dst = la + *imm as i64 + nbytes * cx.lane;
             for b in 0..nbytes {
                 let tag = cx.tag_for(role, src + b);
                 if let Some((tile, ver)) = &cx.cur_tile {
-                    cx.lds.insert((tile.clone(), *ver, dst + b), (tag.clone(), None));
+                    let _ = (tile, ver);
+                    cx.lds.insert(dst + b, (tag.clone(), None));
                     cx.trace.dma_writes += 1;
                     match &tag { Tag::A(..) => cx.trace.tag_a += 1, Tag::B(..) => cx.trace.tag_b += 1, Tag::Sa(..) => cx.trace.tag_sa += 1, Tag::Sb(..) => cx.trace.tag_sb += 1, _ => {} }
                     if tag != Tag::U { cx.trace.tag_by_addr.insert(dst + b, tag); }
@@ -246,7 +247,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
         Stmt::StoreLdsB32 { addr, value } => {
             if !cx.pass_writes { return false; }
             if let (Some(a), V::Word { tags, .. }) = (cx.int(*addr), cx.opnd(*value)) {
-                if let Some((tile, ver)) = &cx.cur_tile { for b in 0..4 { cx.lds.insert((tile.clone(), *ver, a + b), (tags.get(b as usize).cloned().unwrap_or(Tag::U), None)); } }
+                if cx.cur_tile.is_some() { for b in 0..4 { cx.lds.insert(a + b, (tags.get(b as usize).cloned().unwrap_or(Tag::U), None)); } }
             }
         }
         Stmt::StoreLdsB64 { addr, value } | Stmt::StoreLdsB128 { addr, value } => {
@@ -259,7 +260,8 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                 if let Some((tile, ver)) = &cx.cur_tile {
                     if cx.trace.sample_store.is_none() { cx.trace.sample_store = Some((tile.clone(), *ver, a)); cx.trace.sample_store_origin = origins.iter().filter(|x| x.is_some()).count(); }
                     for (b, t) in bytes.iter().enumerate() {
-                        let key = (tile.clone(), *ver, a + b as i64);
+                        let _ = (tile, ver);
+                        let key = a + b as i64;
                         let o = origins.get(b / 4).and_then(|x| *x);
                         if let Some(oo) = o { cx.trace.origin_by_addr.insert(a + b as i64, oo); }
                         if *t != Tag::U { cx.trace.tag_by_addr.insert(a + b as i64, t.clone()); }
@@ -494,7 +496,8 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     let Some((tile, ver)) = &cx.cur_tile else { return V::Unknown };
     let mut bytes = Vec::new();
     for i in 0..n {
-        let mut tag = cx.lds.get(&(tile.clone(), *ver, a + i as i64)).map(|x| x.0.clone()).unwrap_or(Tag::U);
+        let _ = (tile, ver);
+        let mut tag = cx.lds.get(&(a + i as i64)).map(|x| x.0.clone()).unwrap_or(Tag::U);
         if tag == Tag::U { if let Some(t) = cx.trace.tag_by_addr.get(&(a + i as i64)) { tag = t.clone(); } }
         if tag != Tag::U { cx.trace.read_non_u += 1; }
         bytes.push(tag);
@@ -502,7 +505,7 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     let mut origins = vec![None; n / 4];
     for d in 0..n / 4 {
         let addr = a + 4 * d as i64;
-        if let Some((_, o)) = cx.lds.get(&(tile.clone(), *ver, addr)) { origins[d] = *o; }
+        if let Some((_, o)) = cx.lds.get(&addr) { origins[d] = *o; }
         if origins[d].is_none() {
             // LDS epilogue aliases the dead ring/panel storage; the same byte may have been
             // written under another (tile, generation) key. Use an existing accumulator
@@ -521,7 +524,7 @@ fn lds_read_word(cx: &mut Ctx<'_>, addr: Opnd) -> V {
     match v { V::Frag { bytes, .. } => V::Word { tags: bytes, origin: None }, _ => V::Unknown }
 }
 
-fn run_lane(f: &Function, lane: i64, wave: i64, args: &Args, pass_writes: bool, lds: &mut HashMap<(String, i64, i64), (Tag, Option<(u32, u8)>)>, trace: &mut Trace) {
+fn run_lane(f: &Function, lane: i64, wave: i64, args: &Args, pass_writes: bool, lds: &mut HashMap<i64, (Tag, Option<(u32, u8)>)>, trace: &mut Trace) {
     let mut cx = Ctx { lane, wave, args, vals: HashMap::new(), vars: HashMap::new(), cur_tile: None, pass_writes, lds, trace, unknown_control: 0 };
     exec_nodes(f.body(), &mut cx);
 }
