@@ -119,6 +119,8 @@ pub struct Trace {
     pub mfma_a_bytes_empty: usize,
     pub sample_operand_miss: Option<(i64, usize)>,
     pub sample_operand_tag: Option<String>,
+    pub dup_c: usize,
+    pub dup_c_sample: Option<i64>,
     pub sample_miss: Option<i64>,
     pub sample_hit: Option<i64>,
 }
@@ -369,7 +371,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                 let elem = src / 2 + q as i64;
                 let m = elem / cx.args.n;
                 let n = elem % cx.args.n;
-                if !cx.trace.borrow_mut().stores.insert(elem) { cx.trace.borrow_mut().unknown_ops.insert("duplicate C store".into()); }
+                if !cx.trace.borrow_mut().stores.insert(elem) { cx.trace.borrow_mut().dup_c += 1; if cx.trace.borrow().dup_c_sample.is_none() { cx.trace.borrow_mut().dup_c_sample = Some(elem); } }
                 for kb in kbs { *cx.trace.borrow_mut().c_count.entry((m, n, kb)).or_insert(0) += 1; }
             }
         }
@@ -424,7 +426,7 @@ fn store_c(cx: &mut Ctx<'_>, base: Opnd, byte_off: u32, value: Opnd, nouts: usiz
         let elem = (off / 2) as i64 + q as i64;
         let m = elem / cx.args.n;
         let n = elem % cx.args.n;
-        if !cx.trace.borrow_mut().stores.insert(elem) { cx.trace.borrow_mut().unknown_ops.insert("duplicate C store".into()); }
+        if !cx.trace.borrow_mut().stores.insert(elem) { cx.trace.borrow_mut().dup_c += 1; if cx.trace.borrow().dup_c_sample.is_none() { cx.trace.borrow_mut().dup_c_sample = Some(elem); } }
         for kb in kbs {
             *cx.trace.borrow_mut().c_count.entry((m, n, kb)).or_insert(0) += 1;
         }
