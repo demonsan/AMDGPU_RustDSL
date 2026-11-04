@@ -172,7 +172,10 @@ impl OnlineSoftmax {
             let corr = b.exp2_f32(ex);
             let big_t = b.c_f32(0.45);
             let big = b.cmp_lt_f32(big_t, mt);
-            *out = Some(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(big), a: Opnd::Val(self.one_f), b: Opnd::Val(corr) }));
+            // the v_cvt_scalef32 operand DIVIDES (x / scale): the factor 2^(512 delta) is the scale 2^(-512 delta)
+            let nex = b.sub_f32(self.zero_f, ex);
+            let inv = b.exp2_f32(nex);
+            *out = Some(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(big), a: Opnd::Val(self.one_f), b: Opnd::Val(inv) }));
             b.begin_if(Opnd::Val(grow));
             {
                 let cd = b.frag2_dup(corr);
