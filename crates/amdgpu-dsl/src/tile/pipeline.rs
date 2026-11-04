@@ -228,7 +228,7 @@ impl Pipeline {
         let nkv_m1 = if self.scalar_exit {
             let v = b.bind_i32(ev(self.nkv) - 1);
             let s = b.read_first_lane(v);
-            b.let_i32(ev(s))
+            ev(s)
         } else {
             b.let_i32(ev(self.nkv) - 1)
         };
