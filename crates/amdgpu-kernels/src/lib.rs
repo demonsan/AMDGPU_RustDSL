@@ -4,3 +4,4 @@
 #![forbid(unsafe_code)]
 
 pub mod gemm_mxfp8;
+pub mod handoff_probe;
