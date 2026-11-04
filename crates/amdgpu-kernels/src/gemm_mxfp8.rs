@@ -22,6 +22,10 @@ pub struct Ablate {
     pub no_mma: bool,
     /// no operand LDS reads (zero fragments)
     pub no_lds_reads: bool,
+    /// no top-of-tile wait + barrier (only meaningful together with no_dma + no_lds_reads)
+    pub no_sync: bool,
+    /// no per-tile scale reads / selects (the prologue scales are reused)
+    pub no_scales: bool,
 }
 
 /// Build configuration of the MXFP8 blockscale GEMM (4 waves 2 x 2 in every variant). `GemmConfig::v3()` is the best measured one.
@@ -484,7 +488,7 @@ impl Body {
         let (nm, nn) = (av.len(), bv.len());
         let next = if t.staged { Some((self.a_rd.as_ref().expect("a_rd").at(b, &self.a_s.at(&t.next)), self.b_rd.as_ref().expect("b_rd").at(b, &self.b_s.at(&t.next)), (), ())) } else { None };
         // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and selected at the end (partial lgkm waits)
-        let early = if t.staged && self.cfg.early_scales { Some(self.scale_issue(b, &t.next, ox(t.it) + 1)) } else { None };
+        let early = if t.staged && self.cfg.early_scales && !self.cfg.ablate.no_scales { Some(self.scale_issue(b, &t.next, ox(t.it) + 1)) } else { None };
         let mut deferred = self.deferred.take();
         let total = if self.role_a.is_some() { self.a_dma.issues.len() } else { self.a_dma.issues.len() + self.b_dma.issues.len() + 1 };
         let per = (total + 2 * nm - 1) / (2 * nm);
@@ -560,7 +564,7 @@ impl Body {
         if prio {
             b.set_prio(0);
         }
-        if t.staged {
+        if t.staged && !self.cfg.ablate.no_scales {
             // the scales of t+1 (read early, or here)
             let (sa, sb) = match early {
                 Some(w) => self.scale_finish(b, w),
@@ -958,6 +962,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_acc16" => GemmConfig { acc_agpr: 16, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_acc8" => GemmConfig { acc_agpr: 8, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_nodma_nords" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, ..Ablate::default() }, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_mma_nosync" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, no_sync: true, ..Ablate::default() }, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_mma_nosync_nosc" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, no_sync: true, no_scales: true }, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_pre0" => GemmConfig { pre_sync_mmas: 0, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_pre8" => GemmConfig { pre_sync_mmas: 8, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_gap2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
@@ -1229,6 +1235,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     };
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
     pipe.unroll2 = cfg.unroll2;
+    pipe.ablate_no_sync = cfg.ablate.no_sync;
     if cfg.reg_staged && cfg.early_tile0 {
         // the prologue waits for tile 0 only (tile 1's DMAs are the last ones issued; it is published by the loop's first top barrier)
         pipe.prologue_vm = if cfg.wave_roles { a_dma.issues.len() as u8 } else { (a_dma.issues.len() + b_dma.issues.len() + if cfg.scale_panel { 0 } else { 2 }) as u8 };

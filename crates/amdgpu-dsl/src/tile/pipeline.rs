@@ -124,12 +124,14 @@ pub struct Pipeline {
     pub prologue_vm: u8,
     /// `RegStaged`: the body issued tiles 0 and 1 itself before `run` (as early as their addresses exist); the prologue skips those stages
     pub pre_staged: bool,
+    /// DIAGNOSTIC (wrong results unless the body has no LDS traffic): no top-of-tile wait + barrier in RegStaged
+    pub ablate_no_sync: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -297,9 +299,11 @@ impl Pipeline {
         self.prebind(b, &t);
         body.pre_sync(b, role, &t);
         if staged {
-            b.wait_vm(self.top_vm);
-            b.wait_lds(0);
-            b.barrier();
+            if !self.ablate_no_sync {
+                b.wait_vm(self.top_vm);
+                b.wait_lds(0);
+                b.barrier();
+            }
             let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
             body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
         }
@@ -386,9 +390,11 @@ impl Pipeline {
                 self.prebind(b, &t);
                 body.pre_sync(b, role, &t);
                 if staged {
-                    b.wait_vm(self.top_vm);
-                    b.wait_lds(0);
-                    b.barrier();
+                    if !self.ablate_no_sync {
+                        b.wait_vm(self.top_vm);
+                        b.wait_lds(0);
+                        b.barrier();
+                    }
                     let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
                     body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
                 }
