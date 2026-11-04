@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use amdgpu_dsl::{Ext, Function, Op, Opnd, Stmt, ValueId, VarId};
+use amdgpu_dsl::{Ext, Function, Node, Op, Opnd, RegionKind, Stmt, ValueId, VarId};
 use amdgpu_sym::{cap, Ctx, Itv, Poly, Sym, Q};
 
 use crate::mir::{is_agpr_phys, MFunction, MOp, RClass, Src, AGPR_TAG};
@@ -982,191 +982,255 @@ impl<'a> An<'a> {
     }
 
     fn run(&mut self) {
-        let n = self.f.stmts().len();
-        self.exec(0, n);
+        let f = self.f;
+        let mut idx = 0usize;
+        self.walk(f.body(), &mut idx);
     }
 
-    fn exec(&mut self, start: usize, end: usize) {
-        let f = self.f;
-        let mut i = start;
-        while i < end {
-            let st = &f.stmts()[i];
-            self.idx = i;
-            match st {
-                Stmt::Let { dst, op } => {
-                    self.check_op(op);
-                    let v = self.eval(op);
-                    if matches!(op, Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. }) {
-                        self.check_descriptor(&v);
+    /// Walks the region tree; `idx` is the statement index of the linearization (what findings print as `stmt N`).
+    fn walk(&mut self, nodes: &[Node], idx: &mut usize) {
+        for n in nodes {
+            match n {
+                Node::S(st) => {
+                    self.idx = *idx;
+                    self.exec_stmt(st);
+                    *idx += 1;
+                }
+                Node::Loop { vars, init, body } => {
+                    let begin = *idx;
+                    self.idx = begin;
+                    self.walk_loop(vars, init, body, begin);
+                    // BeginLoop + body + EndLoop (the end marker has no effect of its own)
+                    *idx = begin + 1 + flat_len(body) + 1;
+                }
+                Node::If { cond, then, els } => {
+                    self.idx = *idx;
+                    self.exec_stmt(&Stmt::BeginIf { cond: *cond });
+                    *idx += 1;
+                    self.walk(then, idx);
+                    if let Some(e) = els {
+                        self.idx = *idx;
+                        self.exec_stmt(&Stmt::Else);
+                        *idx += 1;
+                        self.walk(e, idx);
                     }
-                    self.env.insert(*dst, v);
+                    self.idx = *idx;
+                    self.exec_stmt(&Stmt::EndIf);
+                    *idx += 1;
                 }
-                Stmt::Assume { target, lo, hi, trusted } => self.assume(target, lo, hi, trusted),
-                Stmt::TileProduce { tile, slot, .. } | Stmt::TileConsume { tile, slot, .. } => {
-                    self.tag = f.contract.tiles.iter().position(|t| &t.name == tile).map(|ti| (ti, self.int_of(slot), *slot));
+                Node::Region { kind, tile, slot, version, body } => {
+                    self.idx = *idx;
+                    let open = match kind {
+                        RegionKind::Produce => Stmt::TileProduce { tile: tile.clone(), slot: *slot, version: *version },
+                        RegionKind::Consume => Stmt::TileConsume { tile: tile.clone(), slot: *slot, version: *version },
+                    };
+                    self.exec_stmt(&open);
+                    *idx += 1;
+                    self.walk(body, idx);
+                    self.idx = *idx;
+                    self.exec_stmt(&Stmt::TileEnd);
+                    *idx += 1;
                 }
-                Stmt::TileEnd | Stmt::Barrier | Stmt::EndLoop | Stmt::Else | Stmt::EndIf => self.tag = None,
-                Stmt::StoreU16 { base, byte_off, .. } => {
-                    let b = self.av_of(base);
-                    self.check_global("store_u16", &b, *byte_off as i128, 2, true)
-                }
-                Stmt::StoreF32 { base, byte_off, .. } | Stmt::StoreF32Wt { base, byte_off, .. } => {
-                    let b = self.av_of(base);
-                    self.check_global("store_f32", &b, *byte_off as i128, 4, true)
-                }
-                Stmt::StoreF32x2 { base, byte_off, .. } => {
-                    let b = self.av_of(base);
-                    self.check_global("store_f32x2", &b, *byte_off as i128, 8, true)
-                }
-                Stmt::StoreF32x4 { base, byte_off, .. } | Stmt::StoreF32x4Wt { base, byte_off, .. } => {
-                    let b = self.av_of(base);
-                    self.check_global("store_f32x4", &b, *byte_off as i128, 16, true)
-                }
-                Stmt::VarLoadB128 { base, byte_off, .. } => {
-                    let b = self.av_of(base);
-                    self.check_global("var load_b128", &b, *byte_off as i128, 16, false)
-                }
-                Stmt::BufferStore { rsrc, voff, soff, imm, dwords, .. } => {
-                    let r = self.av_of(rsrc);
-                    self.check_buffer("buffer store", &r, voff, soff, *imm as i128, 4 * *dwords as i128, true);
-                }
-                Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
-                    let r = self.av_of(rsrc);
-                    self.check_buffer("buffer load ... lds (global side)", &r, voff, soff, *imm as i128, 4 * *dwords as i128, false);
-                    let a = self.int_of(lds_addr).add_const(*imm as i128);
-                    self.cur_addr = Some((*lds_addr, *imm as i128));
-                    self.check_lds("buffer load ... lds (LDS side: M0 + imm + lane*size, 64 lanes)", &a, 64 * 4 * *dwords as i128);
-                }
-                Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
-                    let b = self.av_of(base);
-                    self.check_global("global_load_lds (global side)", &b, *byte_off as i128, 4 * *dwords as i128, false);
-                    let a = self.int_of(lds_addr).add_const(*byte_off as i128);
-                    self.cur_addr = Some((*lds_addr, *byte_off as i128));
-                    let before = self.rep.findings.len();
-                    self.check_lds("global_load_lds (LDS side: M0 + imm + lane*size, 64 lanes)", &a, 64 * 4 * *dwords as i128);
-                    if self.rep.findings.len() > before {
-                        let sh = self.shape(lds_addr, 5);
-                        if let Some(last) = self.rep.findings.last_mut() {
-                            last.msg.push_str(&format!(" | M0 = {sh} ; imm {byte_off}"));
-                        }
-                    }
-                }
-                Stmt::StoreLdsB32 { addr, .. } => self.check_lds_at("ds_write_b32", addr, 4),
-                Stmt::StoreLdsB128 { addr, .. } => self.check_lds_at("ds_write_b128", addr, 16),
-            Stmt::StoreLdsB64 { addr, .. } => self.check_lds_at("ds_write_b64", addr, 8),
-                Stmt::BeginLoop { vars, init } => {
-                    self.tag = None;
-                    let close = self.matching_end(i);
-                    let mut cur: Vec<Itv> = Vec::new();
-                    for (v, i0) in vars.iter().zip(init.iter()) {
-                        let it = self.int_of(i0);
-                        self.var_init.insert(*v, it.clone());
-                        self.assumed.remove(v);
-                        cur.push(it.norm(&self.cx));
-                    }
-                    // fixpoint of the loop variables over the body (join of the initial value and every set_var value), widened to unbounded after 5 rounds
-                    let mut converged = false;
-                    for round in 0..6 {
-                        for (v, it) in vars.iter().zip(cur.iter()) {
-                            self.vars.insert(*v, it.clone());
-                            self.acc.remove(v);
-                        }
-                        self.rep.quiet += 1;
-                        self.exec(i + 1, close);
-                        self.rep.quiet -= 1;
-                        let mut changed = false;
-                        for (k, v) in vars.iter().enumerate() {
-                            // a variable restricted by `assume` keeps its assumed range (checked in the reporting pass)
-                            if let Some(a) = self.assumed.get(v) {
-                                if cur[k] != *a {
-                                    cur[k] = a.clone();
-                                    changed = true;
-                                }
-                                continue;
-                            }
-                            let joined = match self.acc.get(v) {
-                                Some(x) => cur[k].join(x, &self.cx).norm(&self.cx),
-                                None => cur[k].clone(),
-                            };
-                            if joined != cur[k] {
-                                changed = true;
-                                cur[k] = if round >= 4 { Itv::top() } else { joined };
-                            }
-                        }
-                        if !changed {
-                            converged = true;
-                            break;
-                        }
-                    }
-                    if !converged {
-                        for (k, v) in vars.iter().enumerate() {
-                            if !self.assumed.contains_key(v) {
-                                cur[k] = Itv::top();
-                            }
-                        }
-                    }
-                    for (v, it) in vars.iter().zip(cur.iter()) {
-                        self.vars.insert(*v, it.clone());
-                        self.acc.remove(v);
-                    }
-                    self.exec(i + 1, close);
-                    // after the loop a variable holds its initial value or a set_var value: the loop hull still bounds it
-                    for (v, it) in vars.iter().zip(cur.iter()) {
-                        self.vars.insert(*v, it.clone());
-                    }
-                    i = close + 1;
-                    continue;
-                }
-                Stmt::SetVar { var, value } => {
-                    let nv = self.int_of(value);
-                    if self.rep.quiet > 0 {
-                        let e = match self.acc.get(var) {
-                            Some(x) => x.join(&nv, &self.cx),
-                            None => nv.clone(),
-                        };
-                        self.acc.insert(*var, e);
-                    }
-                    if let Some(a) = self.assumed.get(var).cloned() {
-                        if !nv.within(&a, &self.cx) {
-                            if let Some(r) = self.assumed_trusted.get(var).cloned() {
-                                let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {} (TRUSTED: {r})", var.0, nv.show(), a.show());
-                                self.rep.add("GV-ASSUME", Severity::Info, m);
-                            } else {
-                                let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {}: the assumption is not inductive (a loop-carried assume that the loop itself can violate is a proof hole; weaken it, or use assume_trusted(.., reason) when a guard the analyzer cannot see bounds it)", var.0, nv.show(), a.show());
-                                self.rep.add("GV-ASSUME-VIOLATED", Severity::Error, m);
-                            }
-                        }
-                    }
-                }
-                Stmt::EndLoop => {}
-                Stmt::BeginIf { .. } => {
-                    self.tag = None;
-                    self.if_stack.push((self.env.clone(), None))
-                }
-                Stmt::Else => {
-                    if let Some(top) = self.if_stack.last_mut() {
-                        top.1 = Some(self.env.clone());
-                        self.env = top.0.clone();
-                    }
-                }
-                Stmt::EndIf => {
-                    if let Some((snap, then_env)) = self.if_stack.pop() {
-                        let mut merged = then_env.unwrap_or_default();
-                        for (k, v) in self.env.drain() {
-                            merged.insert(k, v);
-                        }
-                        for (k, v) in snap {
-                            merged.insert(k, v);
-                        }
-                        self.env = merged;
-                    }
-                }
-                Stmt::VarAsm { .. } | Stmt::VarAsmN { .. } => self.has_asm = true,
-                _ => {}
             }
-            i += 1;
         }
     }
+
+    /// A loop: fixpoint of the loop variables over the body, then the reporting pass.
+    fn walk_loop(&mut self, vars: &[VarId], init: &[Opnd], body: &[Node], begin: usize) {
+        self.tag = None;
+        let mut cur: Vec<Itv> = Vec::new();
+        for (v, i0) in vars.iter().zip(init.iter()) {
+            let it = self.int_of(i0);
+            self.var_init.insert(*v, it.clone());
+            self.assumed.remove(v);
+            cur.push(it.norm(&self.cx));
+        }
+        // fixpoint of the loop variables over the body (join of the initial value and every set_var value), widened to unbounded after 5 rounds
+        let mut converged = false;
+        for round in 0..6 {
+            for (v, it) in vars.iter().zip(cur.iter()) {
+                self.vars.insert(*v, it.clone());
+                self.acc.remove(v);
+            }
+            self.rep.quiet += 1;
+            {
+            let mut j = begin + 1;
+            self.walk(body, &mut j);
+        }
+            self.rep.quiet -= 1;
+            let mut changed = false;
+            for (k, v) in vars.iter().enumerate() {
+                // a variable restricted by `assume` keeps its assumed range (checked in the reporting pass)
+                if let Some(a) = self.assumed.get(v) {
+                    if cur[k] != *a {
+                        cur[k] = a.clone();
+                        changed = true;
+                    }
+                    continue;
+                }
+                let joined = match self.acc.get(v) {
+                    Some(x) => cur[k].join(x, &self.cx).norm(&self.cx),
+                    None => cur[k].clone(),
+                };
+                if joined != cur[k] {
+                    changed = true;
+                    cur[k] = if round >= 4 { Itv::top() } else { joined };
+                }
+            }
+            if !changed {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            for (k, v) in vars.iter().enumerate() {
+                if !self.assumed.contains_key(v) {
+                    cur[k] = Itv::top();
+                }
+            }
+        }
+        for (v, it) in vars.iter().zip(cur.iter()) {
+            self.vars.insert(*v, it.clone());
+            self.acc.remove(v);
+        }
+        {
+            let mut j = begin + 1;
+            self.walk(body, &mut j);
+        }
+        // after the loop a variable holds its initial value or a set_var value: the loop hull still bounds it
+        for (v, it) in vars.iter().zip(cur.iter()) {
+            self.vars.insert(*v, it.clone());
+        }
+    }
+
+    /// One straight-line statement (or a structure marker of an if / tile region) at statement index `self.idx`.
+    fn exec_stmt(&mut self, st: &Stmt) {
+        let f = self.f;
+        let i = self.idx;
+        let _ = i;
+        match st {
+            Stmt::Let { dst, op } => {
+                self.check_op(op);
+                let v = self.eval(op);
+                if matches!(op, Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. }) {
+                    self.check_descriptor(&v);
+                }
+                self.env.insert(*dst, v);
+            }
+            Stmt::Assume { target, lo, hi, trusted } => self.assume(target, lo, hi, trusted),
+            Stmt::TileProduce { tile, slot, .. } | Stmt::TileConsume { tile, slot, .. } => {
+                self.tag = f.contract.tiles.iter().position(|t| &t.name == tile).map(|ti| (ti, self.int_of(slot), *slot));
+            }
+            Stmt::TileEnd | Stmt::Barrier | Stmt::EndLoop | Stmt::Else | Stmt::EndIf => self.tag = None,
+            Stmt::StoreU16 { base, byte_off, .. } => {
+                let b = self.av_of(base);
+                self.check_global("store_u16", &b, *byte_off as i128, 2, true)
+            }
+            Stmt::StoreF32 { base, byte_off, .. } | Stmt::StoreF32Wt { base, byte_off, .. } => {
+                let b = self.av_of(base);
+                self.check_global("store_f32", &b, *byte_off as i128, 4, true)
+            }
+            Stmt::StoreF32x2 { base, byte_off, .. } => {
+                let b = self.av_of(base);
+                self.check_global("store_f32x2", &b, *byte_off as i128, 8, true)
+            }
+            Stmt::StoreF32x4 { base, byte_off, .. } | Stmt::StoreF32x4Wt { base, byte_off, .. } => {
+                let b = self.av_of(base);
+                self.check_global("store_f32x4", &b, *byte_off as i128, 16, true)
+            }
+            Stmt::VarLoadB128 { base, byte_off, .. } => {
+                let b = self.av_of(base);
+                self.check_global("var load_b128", &b, *byte_off as i128, 16, false)
+            }
+            Stmt::BufferStore { rsrc, voff, soff, imm, dwords, .. } => {
+                let r = self.av_of(rsrc);
+                self.check_buffer("buffer store", &r, voff, soff, *imm as i128, 4 * *dwords as i128, true);
+            }
+            Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
+                let r = self.av_of(rsrc);
+                self.check_buffer("buffer load ... lds (global side)", &r, voff, soff, *imm as i128, 4 * *dwords as i128, false);
+                let a = self.int_of(lds_addr).add_const(*imm as i128);
+                self.cur_addr = Some((*lds_addr, *imm as i128));
+                self.check_lds("buffer load ... lds (LDS side: M0 + imm + lane*size, 64 lanes)", &a, 64 * 4 * *dwords as i128);
+            }
+            Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => {
+                let b = self.av_of(base);
+                self.check_global("global_load_lds (global side)", &b, *byte_off as i128, 4 * *dwords as i128, false);
+                let a = self.int_of(lds_addr).add_const(*byte_off as i128);
+                self.cur_addr = Some((*lds_addr, *byte_off as i128));
+                let before = self.rep.findings.len();
+                self.check_lds("global_load_lds (LDS side: M0 + imm + lane*size, 64 lanes)", &a, 64 * 4 * *dwords as i128);
+                if self.rep.findings.len() > before {
+                    let sh = self.shape(lds_addr, 5);
+                    if let Some(last) = self.rep.findings.last_mut() {
+                        last.msg.push_str(&format!(" | M0 = {sh} ; imm {byte_off}"));
+                    }
+                }
+            }
+            Stmt::StoreLdsB32 { addr, .. } => self.check_lds_at("ds_write_b32", addr, 4),
+            Stmt::StoreLdsB128 { addr, .. } => self.check_lds_at("ds_write_b128", addr, 16),
+        Stmt::StoreLdsB64 { addr, .. } => self.check_lds_at("ds_write_b64", addr, 8),
+            Stmt::BeginLoop { .. } => unreachable!("loops are walked by `walk_loop`"),
+            Stmt::SetVar { var, value } => {
+                let nv = self.int_of(value);
+                if self.rep.quiet > 0 {
+                    let e = match self.acc.get(var) {
+                        Some(x) => x.join(&nv, &self.cx),
+                        None => nv.clone(),
+                    };
+                    self.acc.insert(*var, e);
+                }
+                if let Some(a) = self.assumed.get(var).cloned() {
+                    if !nv.within(&a, &self.cx) {
+                        if let Some(r) = self.assumed_trusted.get(var).cloned() {
+                            let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {} (TRUSTED: {r})", var.0, nv.show(), a.show());
+                            self.rep.add("GV-ASSUME", Severity::Info, m);
+                        } else {
+                            let m = format!("stmt {i}: set_var var{} = {} is not provably inside the assumed range {}: the assumption is not inductive (a loop-carried assume that the loop itself can violate is a proof hole; weaken it, or use assume_trusted(.., reason) when a guard the analyzer cannot see bounds it)", var.0, nv.show(), a.show());
+                            self.rep.add("GV-ASSUME-VIOLATED", Severity::Error, m);
+                        }
+                    }
+                }
+            }
+            Stmt::EndLoop => {}
+            Stmt::BeginIf { .. } => {
+                self.tag = None;
+                self.if_stack.push((self.env.clone(), None))
+            }
+            Stmt::Else => {
+                if let Some(top) = self.if_stack.last_mut() {
+                    top.1 = Some(self.env.clone());
+                    self.env = top.0.clone();
+                }
+            }
+            Stmt::EndIf => {
+                if let Some((snap, then_env)) = self.if_stack.pop() {
+                    let mut merged = then_env.unwrap_or_default();
+                    for (k, v) in self.env.drain() {
+                        merged.insert(k, v);
+                    }
+                    for (k, v) in snap {
+                        merged.insert(k, v);
+                    }
+                    self.env = merged;
+                }
+            }
+            Stmt::VarAsm { .. } | Stmt::VarAsmN { .. } => self.has_asm = true,
+            _ => {}
+        }
+    }
+}
+
+/// Number of statements of the linearization of `nodes` (structure markers included).
+fn flat_len(nodes: &[Node]) -> usize {
+    nodes
+        .iter()
+        .map(|n| match n {
+            Node::S(_) => 1,
+            Node::Loop { body, .. } | Node::Region { body, .. } => 2 + flat_len(body),
+            Node::If { then, els, .. } => 2 + flat_len(then) + els.as_ref().map_or(0, |e| 1 + flat_len(e)),
+        })
+        .sum()
 }
 
 // --------------------------------------------------------------------------------------------------------------------------------------------
