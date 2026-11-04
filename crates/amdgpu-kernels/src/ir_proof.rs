@@ -454,7 +454,7 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
         },
         BufferRsrcDyn { base, .. } => match cx.opnd(*base) { V::Ptr(r, _) => V::Rsrc(r), _ => V::Unknown },
         ReadFirstLane(x) => cx.opnd(*x),
-        WorkitemId => V::Int(cx.lane),
+        WorkitemId => V::Int(cx.tid),
         WorkgroupIdX | WorkgroupIdY | WorkgroupIdZ => V::Int(0),
         AddI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.wrapping_add(y)), _ => V::Unknown },
         MulI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.wrapping_mul(y)), _ => V::Unknown },
