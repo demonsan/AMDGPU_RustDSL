@@ -404,7 +404,7 @@ Block C（PV+行和，`winc`，−2.5%）与 Block M（整个 M 相，`winm`，�
 | panic 面报告 | `tests/rust_safety.rs::panic_surface_report` | ✅ 每次打印 |
 | safe-asm crate 无 unsafe | `tests/safeasm.rs::safeasm_crate_forbids_unsafe_and_contains_none` | ✅ |
 | 编译期拒绝的 29 个用例 | `crates/amdgpu-safeasm/tests/ui/`（`compile_fail.rs` 驱动，`// error-contains:`） | ✅ 28 fail + 1 pass |
-| 全量测试 | `cargo test` | ✅ **67 个目标 / 314 项** |
+| 全量测试 | `cargo test` | ✅ **68 个目标 / 317 项** |
 
 ## C2. 29 个 ui 用例（编译期拒绝的"负例目录"）
 
@@ -439,7 +439,7 @@ fail_wrong_fragment_width                   pass_sequence（通过对照）
 bash tools/container/cargo.sh test -p amdgpu-compiler --test rust_safety -- --nocapture   # 4 项 + panic 面
 bash tools/container/cargo.sh test -p amdgpu-compiler --test safeasm | grep forbids      # safe-asm 无 unsafe
 bash tools/container/cargo.sh test -p amdgpu-compiler --test compile_fail                # 29 个 ui 用例
-bash tools/container/cargo.sh test                                                       # 67 targets / 314 tests
+bash tools/container/cargo.sh test                                                       # 68 targets / 317 tests
 ```
 
 ---

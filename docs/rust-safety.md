@@ -229,7 +229,7 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
 | panic 面报告 | `tests/rust_safety.rs::panic_surface_report` | ✅ 每次打印数字 |
 | safe-asm crate 无 unsafe + 含 forbid | `tests/safeasm.rs::safeasm_crate_forbids_unsafe_and_contains_none` | ✅ |
 | ui 编译失败用例 | `crates/amdgpu-safeasm/tests/ui/` + `compile_fail.rs` | ✅ 29 个（28 fail + 1 pass） |
-| 全量测试 | `cargo test` | ✅ **67 个目标 / 314 项** |
+| 全量测试 | `cargo test` | ✅ **68 个目标 / 317 项** |
 | 禁用构造静态 grep | 见 §1.3 清单 | 全部 **0** |
 
 复现：
@@ -238,5 +238,5 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
 bash tools/container/cargo.sh test -p amdgpu-compiler --test rust_safety -- --nocapture   # 4 项 + panic 面数字
 bash tools/container/cargo.sh test -p amdgpu-compiler --test safeasm | grep forbids      # safe-asm 无 unsafe
 bash tools/container/cargo.sh test -p amdgpu-compiler --test compile_fail                # 29 个 ui 用例
-bash tools/container/cargo.sh test                                                       # 67 targets / 314 tests
+bash tools/container/cargo.sh test                                                       # 68 targets / 317 tests
 ```
