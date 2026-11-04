@@ -75,6 +75,90 @@ impl Args {
     }
 }
 
+#[derive(Default)]
+pub struct Trace {
+    pub contrib: HashMap<(i64, u32, u8), Vec<i64>>,   // lane, accumulator var, dword -> K generations
+    pub c_count: HashMap<(i64, i64, i64), usize>,    // m, n, kb
+    pub stores: HashSet<i64>,                        // C address (2-byte element index)
+    pub a_tags: HashMap<i64, HashSet<(i64, i64)>>,   // kb -> (m, k)
+    pub b_tags: HashMap<i64, HashSet<(i64, i64)>>,   // kb -> (n, k)
+    pub sa_tags: HashMap<i64, HashSet<(i64, i64)>>,  // kb -> (m, kb)
+    pub sb_tags: HashMap<i64, HashSet<(i64, i64)>>,  // kb -> (block, kb)
+    pub unknown_ops: HashSet<String>,
+    pub buffer_stores: usize,
+    pub buffer_store_no_origin: usize,
+    pub lds_store_origins: usize,
+    pub lds_read_origins: usize,
+    pub sample_store: Option<(String, i64, i64)>,
+    pub sample_store_origin: usize,
+    pub lds_origins_left: usize,
+    pub pass1_origin_left: usize,
+    pub pass1_lds_store_origins: usize,
+    pub pass2_lds_store_origins: usize,
+    pub origin_by_addr: HashMap<i64, (u32, u8)>,
+    pub sample_read: Option<(String, i64, i64, usize)>,
+    pub sample_epi_read: Option<(String, i64, i64, usize)>,
+    pub executed_insts: usize,
+}
+
+struct Ctx<'a> {
+    lane: i64,
+    wave: i64,
+    args: &'a Args,
+    vals: HashMap<ValueId, V>,
+    vars: HashMap<VarId, V>,
+    cur_tile: Option<(String, i64)>,
+    pass_writes: bool,
+    lds: &'a mut HashMap<(String, i64, i64), (Tag, Option<(u32, u8)>)>,
+    trace: &'a mut Trace,
+    unknown_control: usize,
+}
+
+impl<'a> Ctx<'a> {
+    fn opnd(&self, o: Opnd) -> V {
+        match o {
+            Opnd::Val(v) => self.vals.get(&v).cloned().unwrap_or(V::Unknown),
+            Opnd::Var(v) => self.vars.get(&v).cloned().unwrap_or(V::Unknown),
+            Opnd::I32(x) => V::Int(x as i64),
+            Opnd::F32(_) => V::Unknown,
+        }
+    }
+    fn int(&self, o: Opnd) -> Option<i64> {
+        match self.opnd(o) { V::Int(x) => Some(x), V::Ptr(_, x) => Some(x), _ => None }
+    }
+    fn set(&mut self, v: ValueId, val: V) { self.vals.insert(v, val); }
+    fn set_var(&mut self, v: VarId, val: V) { self.vars.insert(v, val); }
+
+    fn tag_for(&self, role: PtrRole, off: i64) -> Tag {
+        let (m, n, k) = (self.args.m, self.args.n, self.args.k);
+        let kb = k / 128;
+        match role {
+            PtrRole::A => {
+                if off >= 0 && off < m * k { Tag::A(off / k, off % k) } else { Tag::U }
+            }
+            PtrRole::B => {
+                // B preshuffled image: (n/16) 16K + (k/16) 256 + (n%16) 16 + k%16
+                if off < 0 || off >= n * k { return Tag::U; }
+                let n0 = off / (16 * k);
+                let rem = off % (16 * k);
+                let k0 = rem / 256;
+                let rem2 = rem % 256;
+                let nn = n0 * 16 + rem2 / 16;
+                let kk = k0 * 16 + rem2 % 16;
+                Tag::B(nn, kk)
+            }
+            PtrRole::Sfa => {
+                if off >= 0 && off < kb * m { Tag::Sa(off % m, off / m) } else { Tag::U }
+            }
+            PtrRole::Sfb => {
+                if off >= 0 && off < (n / 128) * kb { Tag::Sb(off / kb, off % kb) } else { Tag::U }
+            }
+            PtrRole::C => Tag::U,
+        }
+    }
+}
+
+
 fn exec_nodes(nodes: &[Node], cx: &mut Ctx<'_>) -> bool {
     // returns true when a BreakIf fired
     for n in nodes {
