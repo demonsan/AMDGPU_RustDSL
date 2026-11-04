@@ -244,11 +244,10 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
         Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
             if !cx.pass_writes { return false; }
             let role = match cx.opnd(*rsrc) { V::Rsrc(r) => r, _ => return false };
-            let (vo, so, la) = match (cx.int(*soff), cx.int(*lds_addr)) {
+            let (so, la) = match (cx.int(*soff), cx.int(*lds_addr)) {
                 (Some(v), Some(l)) => (v, l),
                 _ => return false,
             };
-            let _ = vo;
             let mut src = so + *imm as i64;
             if let Some(v) = voff { if let Some(x) = cx.int(*v) { src += x; } else { return false; } }
             let nbytes = 4 * *dwords as i64;
@@ -314,7 +313,7 @@ fn word_tags(v: V) -> Vec<Tag> {
 }
 
 fn store_c(cx: &mut Ctx<'_>, base: Opnd, byte_off: u32, value: Opnd, nouts: usize) {
-    let (PtrRole::C, mut off) = (match cx.opnd(base) { V::Ptr(r, o) => (r, o), _ => return }, 0);
+    let mut off = match cx.opnd(base) { V::Ptr(PtrRole::C, o) => o, _ => return };
     off += byte_off as i64;
     let frag = cx.opnd(value);
     let (bytes, origins) = match frag { V::Frag { bytes, origins } => (bytes, origins), _ => return };
@@ -357,12 +356,10 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
         WorkitemId => V::Int(cx.lane),
         WorkgroupIdX | WorkgroupIdY | WorkgroupIdZ => V::Int(0),
         AddI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.wrapping_add(y)), _ => V::Unknown },
-        SubI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.wrapping_sub(y)), _ => V::Unknown },
         MulI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.wrapping_mul(y)), _ => V::Unknown },
         ShlI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.wrapping_shl(y as u32)), _ => V::Unknown },
         LshrI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(((x as u32) >> (y as u32)) as i64), _ => V::Unknown },
         AndI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x & y), _ => V::Unknown },
-        OrI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x | y), _ => V::Unknown },
         XorI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x ^ y), _ => V::Unknown },
         MinI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.min(y)), _ => V::Unknown },
         CmpLtI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int((x < y) as i64), _ => V::Unknown },
