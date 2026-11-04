@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use amdgpu_dsl::{Ext, Function, Op, Opnd, Stmt, ValueId, VarId};
+use amdgpu_sym::{Ctx, Itv, Poly, Sym, Q};
 
 use crate::mir::{is_agpr_phys, MFunction, MOp, RClass, Src, AGPR_TAG};
 use crate::regalloc::Alloc;
@@ -113,499 +114,65 @@ impl Report {
 }
 
 // --------------------------------------------------------------------------------------------------------------------------------------------
-// exact rationals and symbolic polynomials
+// symbolic arithmetic: the shared `amdgpu-sym` crate (rationals, polynomials, constraint context, intervals)
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Q {
-    n: i128,
-    d: i128,
-}
-
-fn gcd(a: i128, b: i128) -> i128 {
-    let (mut a, mut b) = (a.abs(), b.abs());
-    while b != 0 {
-        let t = a % b;
-        a = b;
-        b = t;
-    }
-    a
-}
-
-impl Q {
-    fn new(n: i128, d: i128) -> Q {
-        let g = gcd(n, d).max(1);
-        let s = if d < 0 { -1 } else { 1 };
-        Q { n: s * n / g, d: s * d / g }
-    }
-    fn int(n: i128) -> Q {
-        Q { n, d: 1 }
-    }
-    fn add(self, o: Q) -> Q {
-        Q::new(self.n * o.d + o.n * self.d, self.d * o.d)
-    }
-    fn mul(self, o: Q) -> Q {
-        Q::new(self.n * o.n, self.d * o.d)
-    }
-    fn is_zero(self) -> bool {
-        self.n == 0
-    }
-    fn is_neg(self) -> bool {
-        self.n < 0
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-enum Sym {
-    Ka(u32),
-    Grid(u8),
-    Named(String),
-}
-
-impl Sym {
-    fn name(&self) -> String {
-        match self {
-            Sym::Ka(o) => format!("ka(0x{o:X})"),
-            Sym::Grid(a) => ["grid_x", "grid_y", "grid_z"][(*a as usize).min(2)].to_string(),
-            Sym::Named(n) => n.clone(),
+/// The constraint context of a kernel's contract: `ka_range` / `ka_set` / `sym_range` bounds and constants, `ka_is` / `grid_is` definitions.
+fn contract_ctx(f: &Function) -> Ctx {
+    let mut c = Ctx::new();
+    for (off, lo, hi) in &f.contract.ka_ranges {
+        let s = Sym::Ka(*off);
+        let e = c.lb.entry(s.clone()).or_insert(0);
+        *e = (*e).max(*lo);
+        if *hi < i64::MAX {
+            let u = c.ub.entry(s.clone()).or_insert(*hi);
+            *u = (*u).min(*hi);
+        }
+        if lo == hi {
+            c.konst.insert(s, *lo);
         }
     }
-}
-
-/// A polynomial over the contract symbols with rational coefficients; monomials are sorted multisets of symbols.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-struct Poly(BTreeMap<Vec<Sym>, Q>);
-
-impl Poly {
-    fn konst(q: Q) -> Poly {
-        let mut m = BTreeMap::new();
-        if !q.is_zero() {
-            m.insert(Vec::new(), q);
-        }
-        Poly(m)
-    }
-    fn int(n: i128) -> Poly {
-        Poly::konst(Q::int(n))
-    }
-    fn sym(s: Sym) -> Poly {
-        let mut m = BTreeMap::new();
-        m.insert(vec![s], Q::int(1));
-        Poly(m)
-    }
-    fn add(&self, o: &Poly) -> Poly {
-        let mut m = self.0.clone();
-        for (k, v) in &o.0 {
-            let e = m.entry(k.clone()).or_insert(Q::int(0));
-            *e = e.add(*v);
-        }
-        m.retain(|_, v| !v.is_zero());
-        Poly(m)
-    }
-    fn scale(&self, c: Q) -> Poly {
-        let mut m = BTreeMap::new();
-        for (k, v) in &self.0 {
-            let x = v.mul(c);
-            if !x.is_zero() {
-                m.insert(k.clone(), x);
-            }
-        }
-        Poly(m)
-    }
-    fn sub(&self, o: &Poly) -> Poly {
-        self.add(&o.scale(Q::int(-1)))
-    }
-    fn mul(&self, o: &Poly) -> Option<Poly> {
-        let mut m: BTreeMap<Vec<Sym>, Q> = BTreeMap::new();
-        for (k1, v1) in &self.0 {
-            for (k2, v2) in &o.0 {
-                let mut k = k1.clone();
-                k.extend(k2.iter().cloned());
-                if k.len() > 8 {
-                    return None;
-                }
-                k.sort();
-                let e = m.entry(k).or_insert(Q::int(0));
-                *e = e.add(v1.mul(*v2));
-            }
-        }
-        m.retain(|_, v| !v.is_zero());
-        Some(Poly(m))
-    }
-    /// floor of a constant polynomial (values are integers).
-    fn floor_const(&self) -> Option<i128> {
-        self.as_const().map(|q| q.n.div_euclid(q.d))
-    }
-    fn as_const(&self) -> Option<Q> {
-        if self.0.is_empty() {
-            return Some(Q::int(0));
-        }
-        if self.0.len() == 1 {
-            if let Some(v) = self.0.get(&Vec::new()) {
-                return Some(*v);
-            }
-        }
-        None
-    }
-    fn show(&self) -> String {
-        if self.0.is_empty() {
-            return "0".to_string();
-        }
-        let mut parts = Vec::new();
-        for (k, v) in &self.0 {
-            let c = if v.d == 1 { format!("{}", v.n) } else { format!("{}/{}", v.n, v.d) };
-            if k.is_empty() {
-                parts.push(c);
-            } else {
-                let mono = k.iter().map(|s| s.name()).collect::<Vec<_>>().join("*");
-                parts.push(if c == "1" { mono } else { format!("{c}*{mono}") });
-            }
-        }
-        parts.join(" + ").replace("+ -", "- ")
-    }
-}
-
-/// Symbol bounds and substitutions from the contract.
-struct Ctx {
-    lb: HashMap<Sym, i64>,
-    konst: HashMap<Sym, i64>,
-    subst: HashMap<Sym, Poly>,
-    /// declared upper bounds (`ka_range` / `ka_set` / `sym_range` maxima; absent = unbounded)
-    ub: HashMap<Sym, i64>,
-}
-
-impl Ctx {
-    fn new(f: &Function) -> Ctx {
-        let mut c = Ctx { lb: HashMap::new(), konst: HashMap::new(), subst: HashMap::new(), ub: HashMap::new() };
-        for (off, lo, hi) in &f.contract.ka_ranges {
+    for (off, vals) in &f.contract.ka_sets {
+        if let (Some(lo), Some(hi)) = (vals.iter().min(), vals.iter().max()) {
             let s = Sym::Ka(*off);
             let e = c.lb.entry(s.clone()).or_insert(0);
             *e = (*e).max(*lo);
-            if *hi < i64::MAX {
-                let u = c.ub.entry(s.clone()).or_insert(*hi);
-                *u = (*u).min(*hi);
-            }
+            let u = c.ub.entry(s.clone()).or_insert(*hi);
+            *u = (*u).min(*hi);
             if lo == hi {
                 c.konst.insert(s, *lo);
             }
         }
-        for (off, vals) in &f.contract.ka_sets {
-            if let (Some(lo), Some(hi)) = (vals.iter().min(), vals.iter().max()) {
-                let s = Sym::Ka(*off);
-                let e = c.lb.entry(s.clone()).or_insert(0);
-                *e = (*e).max(*lo);
-                let u = c.ub.entry(s.clone()).or_insert(*hi);
-                *u = (*u).min(*hi);
-                if lo == hi {
-                    c.konst.insert(s, *lo);
-                }
+    }
+    for (n, lo, hi) in &f.contract.sym_ranges {
+        let s = Sym::Named(n.clone());
+        c.lb.insert(s.clone(), *lo);
+        if *hi < i64::MAX {
+            c.ub.insert(s.clone(), *hi);
+        }
+        if lo == hi {
+            c.konst.insert(s, *lo);
+        }
+    }
+    // kernarg definitions: substituted to a fixpoint, so the result does not depend on the declaration order (an acyclic set of n definitions is fully
+    // substituted after n passes; for definitions already in dependency order every pass after the first reproduces the same polynomials)
+    for _ in 0..f.contract.ka_defs.len().max(1) {
+        for (off, e) in &f.contract.ka_defs {
+            if let Some(p) = e.to_poly(&c) {
+                c.subst.insert(Sym::Ka(*off), p);
             }
         }
-        for (n, lo, hi) in &f.contract.sym_ranges {
-            let s = Sym::Named(n.clone());
-            c.lb.insert(s.clone(), *lo);
-            if *hi < i64::MAX {
-                c.ub.insert(s.clone(), *hi);
-            }
-            if lo == hi {
-                c.konst.insert(s, *lo);
-            }
-        }
-        // kernarg definitions: substituted to a fixpoint, so the result does not depend on the declaration order (an acyclic set of n definitions is fully
-        // substituted after n passes; for definitions already in dependency order every pass after the first reproduces the same polynomials)
-        for _ in 0..f.contract.ka_defs.len().max(1) {
-            for (off, e) in &f.contract.ka_defs {
-                if let Some(p) = c.ext_poly(e) {
-                    c.subst.insert(Sym::Ka(*off), p);
-                }
-            }
-        }
-        // grid definitions: substitute (the right-hand side is converted with the substitutions known so far)
-        for (axis, e) in &f.contract.grid_defs {
-            if let Some(p) = c.ext_poly(e) {
-                c.subst.insert(Sym::Grid(*axis), p);
-            }
-        }
-        c
     }
-    fn sym_poly(&self, s: Sym) -> Poly {
-        if let Some(k) = self.konst.get(&s) {
-            return Poly::int(*k as i128);
-        }
-        if let Some(p) = self.subst.get(&s) {
-            return p.clone();
-        }
-        Poly::sym(s)
-    }
-    fn lower_bound(&self, s: &Sym) -> i128 {
-        match self.lb.get(s) {
-            Some(v) => *v as i128,
-            None => match s {
-                Sym::Grid(_) | Sym::Named(_) => 1,
-                Sym::Ka(_) => 0,
-            },
+    // grid definitions: substitute (the right-hand side is converted with the substitutions known so far)
+    for (axis, e) in &f.contract.grid_defs {
+        if let Some(p) = e.to_poly(&c) {
+            c.subst.insert(Sym::Grid(*axis), p);
         }
     }
-    /// Exact symbolic value of an `Ext` (None for division, which is bounded elsewhere).
-    fn ext_poly(&self, e: &Ext) -> Option<Poly> {
-        Some(match e {
-            Ext::Const(c) => Poly::int(*c as i128),
-            Ext::Ka(o) => self.sym_poly(Sym::Ka(*o)),
-            Ext::Grid(a) => self.sym_poly(Sym::Grid(*a)),
-            Ext::Sym(n) => self.sym_poly(Sym::Named(n.clone())),
-            Ext::Add(a, b) => self.ext_poly(a)?.add(&self.ext_poly(b)?),
-            Ext::Sub(a, b) => self.ext_poly(a)?.sub(&self.ext_poly(b)?),
-            Ext::Mul(a, b) => self.ext_poly(a)?.mul(&self.ext_poly(b)?)?,
-            Ext::CeilDiv(..) | Ext::FloorDiv(..) => return None,
-        })
-    }
-    /// Sufficient test for `p >= 0` for all admissible symbol values: shift every symbol s = lb(s) + t (t >= 0) and require non-negative coefficients.
-    fn nonneg(&self, p: &Poly) -> bool {
-        let mut out: BTreeMap<Vec<Sym>, Q> = BTreeMap::new();
-        for (mono, c) in &p.0 {
-            let k = mono.len();
-            if k > 10 {
-                return false;
-            }
-            for mask in 0u32..(1u32 << k) {
-                let mut coef = *c;
-                let mut ts: Vec<Sym> = Vec::new();
-                for (i, s) in mono.iter().enumerate() {
-                    if mask >> i & 1 == 1 {
-                        ts.push(s.clone());
-                    } else {
-                        coef = coef.mul(Q::int(self.lower_bound(s)));
-                    }
-                }
-                ts.sort();
-                let e = out.entry(ts).or_insert(Q::int(0));
-                *e = e.add(coef);
-            }
-        }
-        out.values().all(|v| !v.is_neg()) || self.nonneg_box(p)
-    }
-    /// Second sufficient test: the minimum of every monomial over the box [lb, ub] of its (non-negative) symbols - `c * prod lb` for c >= 0, `c * prod ub`
-    /// for c < 0 (needs every symbol of the monomial bounded above) - sums to >= 0. Uses the declared maxima (`ka_range`, `ka_set`, `sym_range`).
-    fn nonneg_box(&self, p: &Poly) -> bool {
-        let mut sum = Q::int(0);
-        for (mono, c) in &p.0 {
-            let mut m = *c;
-            for s in mono {
-                let b = if c.is_neg() {
-                    match self.ub.get(s) {
-                        Some(u) => *u as i128,
-                        None => return false,
-                    }
-                } else {
-                    self.lower_bound(s)
-                };
-                if b < 0 {
-                    return false;
-                }
-                m = m.mul(Q::int(b));
-            }
-            sum = sum.add(m);
-        }
-        !sum.is_neg()
-    }
-    fn le(&self, a: &Poly, b: &Poly) -> bool {
-        self.nonneg(&b.sub(a))
-    }
-}
-
-// --------------------------------------------------------------------------------------------------------------------------------------------
-// intervals: sets of candidate lower / upper bounds (empty = unbounded)
-
-#[derive(Clone, Debug, Default, PartialEq)]
-struct Itv {
-    lo: Vec<Poly>,
-    hi: Vec<Poly>,
-}
-
-const CAND: usize = 4;
-
-fn cap(mut v: Vec<Poly>) -> Vec<Poly> {
-    let mut out: Vec<Poly> = Vec::new();
-    for p in v.drain(..) {
-        if !out.contains(&p) {
-            out.push(p);
-        }
-        if out.len() >= CAND {
-            break;
-        }
-    }
-    out
-}
-
-impl Itv {
-    fn top() -> Itv {
-        Itv::default()
-    }
-    fn point(p: Poly) -> Itv {
-        Itv { lo: vec![p.clone()], hi: vec![p] }
-    }
-    fn range(lo: Poly, hi: Poly) -> Itv {
-        Itv { lo: vec![lo], hi: vec![hi] }
-    }
-    fn konst(n: i128) -> Itv {
-        Itv::point(Poly::int(n))
-    }
-    fn point_const(&self) -> Option<Q> {
-        if self.lo.len() == 1 && self.hi.len() == 1 && self.lo[0] == self.hi[0] {
-            return self.lo[0].as_const();
-        }
-        None
-    }
-    fn add(&self, o: &Itv) -> Itv {
-        let mut lo = Vec::new();
-        let mut hi = Vec::new();
-        for a in &self.lo {
-            for b in &o.lo {
-                lo.push(a.add(b));
-            }
-        }
-        for a in &self.hi {
-            for b in &o.hi {
-                hi.push(a.add(b));
-            }
-        }
-        Itv { lo: cap(lo), hi: cap(hi) }
-    }
-    fn add_const(&self, c: i128) -> Itv {
-        self.add(&Itv::konst(c))
-    }
-    fn scale(&self, c: Q) -> Itv {
-        if c.is_neg() {
-            Itv { lo: cap(self.hi.iter().map(|p| p.scale(c)).collect()), hi: cap(self.lo.iter().map(|p| p.scale(c)).collect()) }
-        } else {
-            Itv { lo: cap(self.lo.iter().map(|p| p.scale(c)).collect()), hi: cap(self.hi.iter().map(|p| p.scale(c)).collect()) }
-        }
-    }
-    fn nonneg(&self, cx: &Ctx) -> bool {
-        self.lo.iter().any(|p| cx.nonneg(p))
-    }
-    fn mul(&self, o: &Itv, cx: &Ctx) -> Itv {
-        if let Some(c) = self.point_const() {
-            return o.scale(c);
-        }
-        if let Some(c) = o.point_const() {
-            return self.scale(c);
-        }
-        if self.nonneg(cx) && o.nonneg(cx) {
-            let mut lo = Vec::new();
-            let mut hi = Vec::new();
-            for a in &self.lo {
-                for b in &o.lo {
-                    if let Some(p) = a.mul(b) {
-                        lo.push(p);
-                    }
-                }
-            }
-            for a in &self.hi {
-                for b in &o.hi {
-                    if let Some(p) = a.mul(b) {
-                        hi.push(p);
-                    }
-                }
-            }
-            return Itv { lo: cap(lo), hi: cap(hi) };
-        }
-        Itv::top()
-    }
-    /// Union (join) of two intervals: a bound survives only if it bounds both operands.
-    fn join(&self, o: &Itv, cx: &Ctx) -> Itv {
-        let mut hi = Vec::new();
-        for x in &self.hi {
-            if o.hi.iter().any(|y| cx.le(y, x)) {
-                hi.push(x.clone());
-            }
-        }
-        for y in &o.hi {
-            if self.hi.iter().any(|x| cx.le(x, y)) {
-                hi.push(y.clone());
-            }
-        }
-        let mut lo = Vec::new();
-        for x in &self.lo {
-            if o.lo.iter().any(|y| cx.le(x, y)) {
-                lo.push(x.clone());
-            }
-        }
-        for y in &o.lo {
-            if self.lo.iter().any(|x| cx.le(y, x)) {
-                lo.push(y.clone());
-            }
-        }
-        // two operands that are both provably non-negative: 0 bounds the join even when their symbolic lower bounds are incomparable
-        if self.nonneg(cx) && o.nonneg(cx) {
-            lo.push(Poly::int(0));
-        }
-        Itv { lo: cap(lo), hi: cap(hi) }
-    }
-    /// min(a, b): any upper bound of either operand bounds it; a lower bound must bound both.
-    fn min(&self, o: &Itv, cx: &Ctx) -> Itv {
-        let j = self.join(o, cx);
-        let mut hi = self.hi.clone();
-        hi.extend(o.hi.iter().cloned());
-        Itv { lo: j.lo, hi: cap(hi) }
-    }
-    /// Intersection (assume): all bounds of both.
-    fn meet(&self, o: &Itv) -> Itv {
-        let mut lo = o.lo.clone();
-        lo.extend(self.lo.iter().cloned());
-        let mut hi = o.hi.clone();
-        hi.extend(self.hi.iter().cloned());
-        Itv { lo: cap(lo), hi: cap(hi) }
-    }
-    /// self is contained in o (every bound of o is implied).
-    fn within(&self, o: &Itv, cx: &Ctx) -> bool {
-        let lo_ok = o.lo.iter().all(|b| self.lo.iter().any(|a| cx.le(b, a)));
-        let hi_ok = o.hi.iter().all(|b| self.hi.iter().any(|a| cx.le(a, b)));
-        lo_ok && hi_ok
-    }
-    /// Drop dominated candidates (keep only the tightest provable bounds) so that fixpoint iteration compares canonical forms.
-    fn norm(&self, cx: &Ctx) -> Itv {
-        let mut hi: Vec<Poly> = Vec::new();
-        for (i, x) in self.hi.iter().enumerate() {
-            let dominated = self.hi.iter().enumerate().any(|(j, y)| j != i && cx.le(y, x) && (!cx.le(x, y) || j < i));
-            if !dominated {
-                hi.push(x.clone());
-            }
-        }
-        let mut lo: Vec<Poly> = Vec::new();
-        for (i, x) in self.lo.iter().enumerate() {
-            let dominated = self.lo.iter().enumerate().any(|(j, y)| j != i && cx.le(x, y) && (!cx.le(y, x) || j < i));
-            if !dominated {
-                lo.push(x.clone());
-            }
-        }
-        Itv { lo, hi }
-    }
-    fn show(&self) -> String {
-        let l = if self.lo.is_empty() { "-inf".to_string() } else { self.lo.iter().map(|p| p.show()).collect::<Vec<_>>().join(" | ") };
-        let h = if self.hi.is_empty() { "+inf".to_string() } else { self.hi.iter().map(|p| p.show()).collect::<Vec<_>>().join(" | ") };
-        format!("[{l}, {h}]")
-    }
+    c
 }
 
 fn ext_itv(cx: &Ctx, e: &Ext) -> Itv {
-    match e {
-        Ext::Const(_) | Ext::Ka(_) | Ext::Grid(_) | Ext::Sym(_) => match cx.ext_poly(e) {
-            Some(p) => Itv::point(p),
-            None => Itv::top(),
-        },
-        Ext::Add(a, b) => ext_itv(cx, a).add(&ext_itv(cx, b)),
-        Ext::Sub(a, b) => ext_itv(cx, a).add(&ext_itv(cx, b).scale(Q::int(-1))),
-        Ext::Mul(a, b) => ext_itv(cx, a).mul(&ext_itv(cx, b), cx),
-        Ext::CeilDiv(a, k) => {
-            let x = ext_itv(cx, a);
-            let k = (*k).max(1) as i128;
-            Itv { lo: cap(x.lo.iter().map(|p| p.scale(Q::new(1, k))).collect()), hi: cap(x.hi.iter().map(|p| p.add(&Poly::int(k - 1)).scale(Q::new(1, k))).collect()) }
-        }
-        Ext::FloorDiv(a, k) => {
-            let x = ext_itv(cx, a);
-            let k = (*k).max(1) as i128;
-            Itv { lo: cap(x.lo.iter().map(|p| p.add(&Poly::int(-(k - 1))).scale(Q::new(1, k))).collect()), hi: cap(x.hi.iter().map(|p| p.scale(Q::new(1, k))).collect()) }
-        }
-    }
+    e.to_itv(cx)
 }
 // --------------------------------------------------------------------------------------------------------------------------------------------
 // IR analysis: LDS budget, global / buffer bounds
@@ -1744,7 +1311,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: Ctx::new(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));

@@ -422,6 +422,47 @@ impl Op {
     }
 }
 
+/// Contract expressions in the shared symbolic arithmetic (`amdgpu-sym`).
+impl Ext {
+    /// Exact symbolic value (None for division, which is bounded by `to_itv`).
+    pub fn to_poly(&self, cx: &amdgpu_sym::Ctx) -> Option<amdgpu_sym::Poly> {
+        use amdgpu_sym::{Poly, Sym};
+        Some(match self {
+            Ext::Const(c) => Poly::int(*c as i128),
+            Ext::Ka(o) => cx.sym_poly(Sym::Ka(*o)),
+            Ext::Grid(a) => cx.sym_poly(Sym::Grid(*a)),
+            Ext::Sym(n) => cx.sym_poly(Sym::Named(n.clone())),
+            Ext::Add(a, b) => a.to_poly(cx)?.add(&b.to_poly(cx)?),
+            Ext::Sub(a, b) => a.to_poly(cx)?.sub(&b.to_poly(cx)?),
+            Ext::Mul(a, b) => a.to_poly(cx)?.mul(&b.to_poly(cx)?)?,
+            Ext::CeilDiv(..) | Ext::FloorDiv(..) => return None,
+        })
+    }
+    /// Candidate-bound interval (divisions bounded by shifting the dividend's bounds).
+    pub fn to_itv(&self, cx: &amdgpu_sym::Ctx) -> amdgpu_sym::Itv {
+        use amdgpu_sym::{cap, Itv, Poly, Q};
+        match self {
+            Ext::Const(_) | Ext::Ka(_) | Ext::Grid(_) | Ext::Sym(_) => match self.to_poly(cx) {
+                Some(p) => Itv::point(p),
+                None => Itv::top(),
+            },
+            Ext::Add(a, b) => a.to_itv(cx).add(&b.to_itv(cx)),
+            Ext::Sub(a, b) => a.to_itv(cx).add(&b.to_itv(cx).scale(Q::int(-1))),
+            Ext::Mul(a, b) => a.to_itv(cx).mul(&b.to_itv(cx), cx),
+            Ext::CeilDiv(a, k) => {
+                let x = a.to_itv(cx);
+                let k = (*k).max(1) as i128;
+                Itv { lo: cap(x.lo.iter().map(|p| p.scale(Q::new(1, k))).collect()), hi: cap(x.hi.iter().map(|p| p.add(&Poly::int(k - 1)).scale(Q::new(1, k))).collect()) }
+            }
+            Ext::FloorDiv(a, k) => {
+                let x = a.to_itv(cx);
+                let k = (*k).max(1) as i128;
+                Itv { lo: cap(x.lo.iter().map(|p| p.add(&Poly::int(-(k - 1))).scale(Q::new(1, k))).collect()), hi: cap(x.hi.iter().map(|p| p.scale(Q::new(1, k))).collect()) }
+            }
+        }
+    }
+}
+
 /// Symbolic integer expression for the GPU-semantics contract (extents, ranges): constants, 32-bit kernarg scalars (by kernarg byte offset) and the launch grid
 /// dimensions (in workgroups). Non-negative quantities; `Sub` is allowed (the analyzer works with intervals, see docs/gpu-semantics-verifier.md).
 #[derive(Clone, Debug, PartialEq)]
