@@ -1,0 +1,7 @@
+[package]
+name = "amdgpu-sym"
+version = "0.1.0"
+edition = "2021"
+description = "Shared symbolic arithmetic: rationals, polynomials over contract symbols, constraint context, candidate-bound intervals"
+
+[dependencies]
