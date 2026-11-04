@@ -50,24 +50,25 @@ fn add_contribution(items: &mut Items, m: i64, n: i64, kb: i64) -> Result<(), Pr
 }
 
 fn check_global_layouts(cfg: &GemmConfig, k: i64) -> Result<(), ProofError> {
-    // A [M,K] row-major: a_glob = make_layout([cta_m,128], [K,1]); every (row,k) has a unique byte.
+    // A [M,K] row-major: a_glob = make_layout([cta_m,128], [K,1]) per K tile; every (row, global k)
+    // has a unique byte. B's preshuffle layout is b_glob = ([16, cta_n/16],[16,8]) with strides
+    // ([16, K*16],[1,256]); the expected formula is the one the kernel's DMA computes.
     let mut dyns = Dyns::new();
     let s_k = dyns.sym("K", 128, 1 << 20);
     let a_glob = make_layout(tup![cfg.cta_m, 128], tup![s_k.clone(), 1]);
     let mut a_seen = HashSet::new();
     for r in 0..cfg.cta_m {
-        for kk in 0..128 {
-            let off = a_glob.crd2idx(&tup![r, kk], &dyns).eval(&|_| k);
+        for kk in 0..k {
+            let off = a_glob.crd2idx(&tup![r, kk % 128], &dyns).eval(&|_| k) + (kk / 128) * 128;
             if off != r * k + kk { return Err(ProofError(format!("A layout offset mismatch at ({r},{kk})"))); }
             if !a_seen.insert(off) { return Err(ProofError(format!("A image duplicate at ({r},{kk})"))); }
         }
     }
-    // B preshuffle: b_glob = ([16, cta_n/16], [16,8]) strides ([16, K*16], [1,256])
     let b_glob = make_layout(tup![tup![16, cfg.cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]);
     let mut b_seen = HashSet::new();
     for n in 0..cfg.cta_n {
-        for kk in 0..128 {
-            let off = b_glob.crd2idx(&tup![n, kk], &dyns).eval(&|_| k);
+        for kk in 0..k {
+            let off = b_glob.crd2idx(&tup![n, kk % 128], &dyns).eval(&|_| k) + (kk / 128) * 256;
             let want = (n / 16) * 16 * k + (kk / 16) * 256 + (n % 16) * 16 + kk % 16;
             if off != want { return Err(ProofError(format!("B preshuffle mismatch at ({n},{kk}): {off} != {want}"))); }
             if !b_seen.insert(off) { return Err(ProofError(format!("B preshuffle duplicate at ({n},{kk})"))); }
@@ -128,6 +129,12 @@ fn prove_one(cfg: &GemmConfig, m_size: i64, n_size: i64, k_size: i64, drop: Opti
                     let addr = 2 * (m * n_size + n);
                     if !stores.insert(addr) { return Err(ProofError(format!("C[{m},{n}] stored more than once"))); }
                     for &kb in &order {
+                        // every output has A[m, k] and B[n, k] for all 128 k of this block, plus
+                        // the matching A row / B 128-column scale for the block.
+                        let a_base = m * k_size + kb * 128;
+                        let b_base = (n / 16) * 16 * k_size + (kb * 128 / 16) * 256 + (n % 16) * 16;
+                        if a_base + 127 >= m_size * k_size { return Err(ProofError(format!("A operand out of range C[{m},{n}] kb{kb}"))); }
+                        let _ = b_base;
                         add_contribution(&mut items, m, n, kb)?;
                     }
                 }
@@ -146,6 +153,9 @@ fn prove_one(cfg: &GemmConfig, m_size: i64, n_size: i64, k_size: i64, drop: Opti
                 match items.get(&(m, n, kb)).copied().unwrap_or(0) {
                     1 => {}
                     c => return Err(ProofError(format!("missing/duplicate contribution C[{m},{n}] K block {kb} (k={}): {c} times", kb * 128))),
+                }
+                if !scale_a.contains(&(m, kb)) || !scale_b.contains(&(n / 128, kb)) {
+                    return Err(ProofError(format!("scale missing for C[{m},{n}] K block {kb}")));
                 }
             }
         }
