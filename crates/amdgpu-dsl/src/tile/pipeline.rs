@@ -323,6 +323,8 @@ impl Pipeline {
             tile_rows: self.tile_rows,
         };
         self.prebind(b, &t);
+        // the t+2 key (scalar) before the waits: right after the barrier the stage's first DMA issues at once (the vendor order)
+        let key_n2 = if staged { Some(b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg())) } else { None };
         body.pre_sync(b, role, &t);
         if staged {
             if !self.ablate_no_sync {
@@ -331,8 +333,7 @@ impl Pipeline {
                 body.post_wait(b, role, &t);
                 b.barrier();
             }
-            let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
-            body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
+            body.stage(b, role, key_n2.as_ref().expect("key"), t.n2.as_ref().expect("n2"));
         }
         body.m_phase(b, role, &t);
     }
