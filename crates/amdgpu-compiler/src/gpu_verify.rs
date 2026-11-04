@@ -536,18 +536,7 @@ impl<'a> An<'a> {
     /// no bit above h's). Sound for wrap-around: shifts truncate, sums and products that may exceed 32 bits give `u32::MAX`.
     fn bits(&self, o: &Opnd, depth: usize) -> u32 {
         let all = u32::MAX;
-        let from_itv = |i: &Itv| -> u32 {
-            if !i.nonneg(&self.cx) {
-                return all;
-            }
-            match i.hi.iter().filter_map(|p| p.floor_const()).min() {
-                Some(h) if (0..=i32::MAX as i128).contains(&h) => {
-                    let h = h as u64;
-                    ((h + 1).next_power_of_two() - 1) as u32
-                }
-                _ => all,
-            }
-        };
+        let from_itv = |i: &Itv| -> u32 { amdgpu_sym::bits::itv_bits32(i, &self.cx) };
         let itv_m = from_itv(&self.int_of(o));
         let v = match o {
             Opnd::I32(c) => return *c as u32,
@@ -558,7 +547,6 @@ impl<'a> An<'a> {
             return itv_m;
         }
         let Some(op) = self.defs.get(&v) else { return itv_m };
-        let grow = |s: u64| -> u32 { if s > u32::MAX as u64 { all } else { ((s + 1).next_power_of_two() - 1).min(u32::MAX as u64) as u32 } };
         let k = |o: &Opnd| -> Option<u32> {
             match o {
                 Opnd::I32(c) => Some(*c as u32),
@@ -581,15 +569,8 @@ impl<'a> An<'a> {
                 Some(s) if s < 32 => self.bits(a, depth - 1) >> s,
                 _ => all,
             },
-            Op::AddI32(a, b) => {
-                let (ma, mb) = (self.bits(a, depth - 1), self.bits(b, depth - 1));
-                if ma & mb == 0 {
-                    ma | mb
-                } else {
-                    grow(ma as u64 + mb as u64)
-                }
-            }
-            Op::MulI32(a, b) => grow((self.bits(a, depth - 1) as u64).saturating_mul(self.bits(b, depth - 1) as u64)),
+            Op::AddI32(a, b) => amdgpu_sym::bits::add32(self.bits(a, depth - 1), self.bits(b, depth - 1)),
+            Op::MulI32(a, b) => amdgpu_sym::bits::mul32(self.bits(a, depth - 1), self.bits(b, depth - 1)),
             Op::Select { a, b, .. } | Op::MinI32(a, b) => self.bits(a, depth - 1) | self.bits(b, depth - 1),
             _ => all,
         };

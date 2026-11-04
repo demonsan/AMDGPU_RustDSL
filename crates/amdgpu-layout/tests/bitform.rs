@@ -68,3 +68,16 @@ fn not_a_bit_form() {
     let neg = d.sym("n", -4, 4);
     assert!(neg.bitform(&d).is_none(), "a possibly negative symbol");
 }
+
+#[test]
+fn can_prove_through_the_shared_constraint_context() {
+    let mut d = Dyns::new();
+    let lane = d.sym("lane", 0, 63);
+    let k = d.sym("K", 128, 1 << 20);
+    let e = lane.mul_c(4).add_c(12);
+    assert!(e.can_prove_le(&Ix::C(264), &d), "63 * 4 + 12 = 264");
+    assert!(!e.can_prove_le(&Ix::C(263), &d));
+    // symbolic: lane * 4 + 12 <= K + 136 for every K >= 128
+    assert!(e.can_prove_le(&k.add_c(136), &d));
+    assert!(!e.can_prove_le(&k.add_c(135), &d));
+}

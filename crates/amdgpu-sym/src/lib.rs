@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bits;
+
 use std::collections::{BTreeMap, HashMap};
 
 

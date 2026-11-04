@@ -45,12 +45,7 @@ fn bits_upto(hi: i64) -> u64 {
     if hi <= 0 {
         0
     } else {
-        let n = 64 - (hi as u64).leading_zeros();
-        if n >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << n) - 1
-        }
+        amdgpu_sym::bits::upto(hi as u64)
     }
 }
 
@@ -515,6 +510,52 @@ impl fmt::Display for Ix {
             Ix::And(a, m) => write!(f, "({a} & {m})"),
             Ix::Shl(a, s) => write!(f, "({a} << {s})"),
             Ix::Shr(a, s) => write!(f, "({a} >> {s})"),
+        }
+    }
+}
+
+/// The layout's dynamic symbols in the shared symbolic arithmetic (`amdgpu-sym`): symbol `s` is `Sym::Named("ix<s>:<name>")` with its declared range.
+impl Dyns {
+    pub fn sym_of(&self, s: u32) -> amdgpu_sym::Sym {
+        amdgpu_sym::Sym::Named(format!("ix{s}:{}", self.info(s).name))
+    }
+    /// The constraint context of the declared ranges.
+    pub fn ctx(&self) -> amdgpu_sym::Ctx {
+        let mut c = amdgpu_sym::Ctx::new();
+        let mut s = 0u32;
+        while (s as usize) < self.syms.len() {
+            let i = self.info(s);
+            c.lower(self.sym_of(s), i.lo);
+            c.upper(self.sym_of(s), i.hi);
+            s += 1;
+        }
+        c
+    }
+}
+
+impl Ix {
+    /// The exact polynomial of the affine / product part (None when a division, remainder, xor, mask or shift is involved).
+    pub fn to_poly(&self, d: &Dyns) -> Option<amdgpu_sym::Poly> {
+        use amdgpu_sym::Poly;
+        Some(match self {
+            Ix::C(k) => Poly::int(*k as i128),
+            Ix::Sym(s) => Poly::sym(d.sym_of(*s)),
+            Ix::Sum(t, k) => {
+                let mut p = Poly::int(*k as i128);
+                for (x, m) in t {
+                    p = p.add(&x.to_poly(d)?.scale(amdgpu_sym::Q::int(*m as i128)));
+                }
+                p
+            }
+            Ix::Mul(a, b) => a.to_poly(d)?.mul(&b.to_poly(d)?)?,
+            _ => return None,
+        })
+    }
+    /// Sound proof of `self <= o` for every admissible value of the dynamic symbols (shared constraint context; false = not proven).
+    pub fn can_prove_le(&self, o: &Ix, d: &Dyns) -> bool {
+        match (self.to_poly(d), o.to_poly(d)) {
+            (Some(a), Some(b)) => d.ctx().le(&a, &b),
+            _ => self.range(d).1 <= o.range(d).0,
         }
     }
 }
