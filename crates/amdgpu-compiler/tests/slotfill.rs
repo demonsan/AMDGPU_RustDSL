@@ -59,7 +59,11 @@ fn run(insts: Vec<MInst>) -> Vec<String> {
     let mut m = mk(insts);
     let o = Options { verify: true, stats: std::env::var("SF_STATS").is_ok(), ..Options::default() };
     slotfill::run(&mut m, &o).expect("slotfill + verifier");
-    m.blocks[0].insts.iter().map(name).collect()
+    let out: Vec<String> = m.blocks[0].insts.iter().map(name).collect();
+    if std::env::var("SF_STATS").is_ok() {
+        eprintln!("order: {}", out.join(" "));
+    }
+    out
 }
 
 fn mfmas(n: u32) -> Vec<MInst> {
