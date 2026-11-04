@@ -11,6 +11,7 @@ pub mod emit;
 pub mod gpu_protocol;
 pub use gpu_protocol as gpu_tiles;
 pub mod gpu_verify;
+pub mod functional_proofs;
 pub mod hostgen;
 pub mod ir_print;
 pub mod hazards;
