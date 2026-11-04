@@ -100,6 +100,8 @@ pub struct Trace {
     pub sample_read: Option<(String, i64, i64, usize)>,
     pub sample_epi_read: Option<(String, i64, i64, usize)>,
     pub executed_insts: usize,
+    pub mfma_seen: usize,
+    pub mfma_no_tags: usize,
 }
 
 struct Ctx<'a> {
@@ -262,6 +264,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
         }
         Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, .. } => {
             if cx.pass_writes { return false; } // contributions only in pass 2
+            cx.trace.mfma_seen += 1;
             let a_tags = frag_tags(cx.opnd(*a));
             let b_tags = frag_tags(cx.opnd(*b));
             // The K generation comes from the A/B element tags themselves (actual addresses),
@@ -269,7 +272,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             let kb = a_tags.iter().find_map(|t| if let Tag::A(_, k) = t { Some(k / 128) } else { None })
                 .or_else(|| b_tags.iter().find_map(|t| if let Tag::B(_, k) = t { Some(k / 128) } else { None }))
                 .unwrap_or_else(|| cx.cur_tile.as_ref().map(|x| x.1).unwrap_or(-1));
-            if kb < 0 || kb >= cx.args.k / 128 { return false; }
+            if kb < 0 || kb >= cx.args.k / 128 { cx.trace.mfma_no_tags += 1; return false; }
             let sa_tags = word_tags(cx.opnd(*scale_a));
             let sb_tags = word_tags(cx.opnd(*scale_b));
             for t in &a_tags { if let Tag::A(m, k) = t { cx.trace.a_tags.entry(kb).or_default().insert((*m, *k)); } }
