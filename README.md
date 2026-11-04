@@ -17,12 +17,12 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 |---|---|
 | **出厂 FMHA（v3，布局层）** | 默认路径 `fmha_fwd_hd128_mxfp8_auto` 的 4 个 kernel `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-tile/src/fmha.rs`）建在布局层上：每个 LDS/全局地址、DMA、epilogue 存储与 KV-split 转置暂存都由 `amdgpu-layout` 的布局推导，主机合同由张量布局导出。asm md5（`--backend own`）：`68d2832b` / `f5a43b09` / `e4fc18b1` / `24a95a51`。上一版 tile 库集 `fmha_fwd_hd128_mxfp8_dsl_*`（`fmha_fwd_hd128_mxfp8_dsl_auto`）与手写旧集（`fmha_fwd_hd128_mxfp8_legacy_auto`）保留供 A/B |
 | **布局层（路线 B）** | `amdgpu-layout`（`Layout`/`IntTuple`/`Swizzle`/TV 布局/`IssuePlan`/构建期证明）→ `amdgpu-isa`（copy 与 MMA atom 表）→ `amdgpu-tile`（`TiledCopy`/`TiledMma`/`partition_*`）；入门 [`docs/layout-tour.md`](docs/layout-tour.md)，实施记录 [`docs/dsl-layout-refactor-design.md`](docs/dsl-layout-refactor-design.md) §9 |
-| **MXFP8 blockscale GEMM** | `gemm_mxfp8_bs_v4`（`crates/amdgpu-kernels`，4096×4096×8192，对照 aiter PR #6696 4-wave pin-AGPR）：**3130 vs 3275 TF/s = 0.956×**（v5.1 最终门禁；追平尝试已收口，上限证据见 [`docs/mxfp8-gemm-4wave-analysis.md`](docs/mxfp8-gemm-4wave-analysis.md) §12）；`tools/gemm_gate.sh` PASS（strict 0/0、3 形状 GEMM_OK、确定性 3/3）。AGPR（累加寄存器文件）已支持，见 [`docs/agpr.md`](docs/agpr.md) |
+| **MXFP8 blockscale GEMM** | `gemm_mxfp8_bs_v4`（`crates/amdgpu-kernels`，4096×4096×8192，对照 aiter PR #6696 4-wave pin-AGPR）：**3148 vs 3278 TF/s = 0.960×**（v5.2 门禁，同轮交替；8 段 epilogue + BitForm 序言；诊断与上限证据见 [`docs/mxfp8-gemm-4wave-analysis.md`](docs/mxfp8-gemm-4wave-analysis.md) §12–§13）；`tools/gemm_gate.sh` PASS（strict 0/0、3 形状 GEMM_OK、确定性 3/3）。AGPR（累加寄存器文件）已支持，见 [`docs/agpr.md`](docs/agpr.md) |
 | **主机侧生成** | `amdc gen-host <kernel>` / `--shipped`：从 kernel 合同生成 C++ 启动/ABI 头（打包 `Args`、`validate()`）与 JSON 元数据，出厂 `ref_host` 用生成的命名字段；见 [`docs/host-gen.md`](docs/host-gen.md) |
 | **FMHA 性能（最近一次 `port_gate`，v3 vs 同轮旧手写集）** | B1H8S2048 默认路径（KV-split + `combine8h`）**672.7 TF/s**（同轮厂商约 536–539，≈1.25×）；`_vs128` 每 CU 64 blocks **446.4**，8 种代码布局中位数 **449.9 vs 453.7**；B4H8S2048 **1421.3**、B1H8S8192 **1978.6**（铺满网格约 0.84× 厂商）；B2H8S2048 `_t128` **1025.0**，布局中位数 **1022.3 vs 1028.6** |
 | 精度 | mean err **8.3e-4**（厂商 1.5–2.9e-3）；15/15 形状、64 行 bad=0 |
 | 确定性 | 5/5 × N；uneven-tile split 形状重复启动单一 md5 |
-| 测试 | `cargo test` **66 个目标 / 311 项全绿**；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
+| 测试 | `cargo test` **67 个目标 / 314 项全绿**；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
 | GPU 语义验证 | 编译器感知指令语义：LDS/global/buffer 越界、VGPR/SGPR/AGPR 类别与对齐、路径敏感等待、LDS tile 生命周期与同步协议均被证明。严格证书：出厂 4 kernel `--shipped` **24 trusted assumes / 100 host contracts / 0 unproven**；旧手写集 `--legacy` **44 / 216 / 0**；GEMM v3/v4 **3 / 19 / 0**；见 [`docs/gpu-semantics-verifier.md`](docs/gpu-semantics-verifier.md) |
 | Rust 安全 | **八个 crate 全部 `#![forbid(unsafe_code)]`、零第三方依赖、无 FFI/裸指针**；ISA 规则编码进类型系统；见 [`docs/rust-safety.md`](docs/rust-safety.md) |
 
@@ -36,7 +36,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 ```bash
 # 构建与测试（容器脚本会挂载 ROCm 与 pinned LLVM 工具）
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                    # 期望 66 targets / 311 tests 全绿
+bash tools/container/cargo.sh test                    # 期望 67 targets / 314 tests 全绿
 
 # 发射一个 kernel 的汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --out vs128.s
