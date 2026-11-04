@@ -252,10 +252,14 @@ fn fill_region(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, log: &mut
             order.push(mf[s]);
         }
     }
+    if o.stats {
+        let dm: Vec<String> = (0..n).filter(|&i| cls[i] == Some(Class::Dma)).map(|i| format!("{}:{}-{}@{}", orig[i], lo[i], dl[i], sl[i])).collect();
+        log.push(format!("{mm} MFMAs, DMA src:lo-dl@slot = {}", dm.join(" ")));
+        let rd: Vec<String> = (0..n).filter(|&i| cls[i] == Some(Class::DsRead)).map(|i| format!("{}:{}-{}@{}", orig[i], lo[i], dl[i], sl[i])).collect();
+        log.push(format!("ds_read src:lo-dl@slot = {}", rd.join(" ")));
+    }
     if o.verify {
-        RELAX_DMA_LDS_READ.store(true, Ordering::Relaxed);
         let r = verify::check_perm(m, seg, &order, term, true);
-        RELAX_DMA_LDS_READ.store(false, Ordering::Relaxed);
         r.map_err(|e| format!("slotfill verification failed: {e}"))?;
     }
     Ok(Some(order))
@@ -263,6 +267,13 @@ fn fill_region(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, log: &mut
 
 /// Apply `slotfill` to every block with enough MFMAs. Returns the number of instructions that changed position.
 pub fn run(m: &mut MFunction, o: &Options) -> Result<usize, String> {
+    RELAX_DMA_LDS_READ.store(true, Ordering::Relaxed);
+    let r = run_inner(m, o);
+    RELAX_DMA_LDS_READ.store(false, Ordering::Relaxed);
+    r
+}
+
+fn run_inner(m: &mut MFunction, o: &Options) -> Result<usize, String> {
     let mut moved_total = 0;
     for bi in 0..m.blocks.len() {
         let insts = m.blocks[bi].insts.clone();
