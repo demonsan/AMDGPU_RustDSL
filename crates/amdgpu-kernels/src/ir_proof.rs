@@ -118,11 +118,13 @@ pub struct Trace {
     pub mfma_a_addr_none: usize,
     pub mfma_a_bytes_empty: usize,
     pub sample_operand_miss: Option<(i64, usize)>,
+    pub sample_operand_tag: Option<String>,
     pub sample_miss: Option<i64>,
     pub sample_hit: Option<i64>,
 }
 
 struct Ctx<'a> {
+    tid: i64,
     lane: i64,
     wave: i64,
     args: &'a Args,
@@ -318,6 +320,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                     if let V::Frag { bytes, addr, .. } = &av {
                         let n = bytes.iter().filter(|x| **x != Tag::U).count();
                         cx.trace.borrow_mut().sample_operand_miss = Some((addr.unwrap_or(-1), n));
+                        cx.trace.borrow_mut().sample_operand_tag = bytes.iter().find(|x| **x != Tag::U).map(|x| format!("{x:?}"));
                     }
                 }
                 return false;
@@ -328,7 +331,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             for t in &b_tags { if let Tag::B(n, k) = t { cx.trace.borrow_mut().b_tags.entry(kb).or_default().insert((*n, *k)); } }
             for t in &sa_tags { if let Tag::Sa(m, k) = t { cx.trace.borrow_mut().sa_tags.entry(kb).or_default().insert((*m, *k)); } }
             for t in &sb_tags { if let Tag::Sb(blk, k) = t { cx.trace.borrow_mut().sb_tags.entry(kb).or_default().insert((*blk, *k)); } }
-            for idx in 0..4u8 { cx.trace.borrow_mut().contrib.entry((cx.lane, var.0, idx)).or_default().push(kb); }
+            for idx in 0..4u8 { cx.trace.borrow_mut().contrib.entry((cx.tid, var.0, idx)).or_default().push(kb); }
             tag_acc_var(cx, *var);
         }
         Stmt::VarMfmaScale { var, a, b, .. } | Stmt::VarMfmaScaleZ { var, a, b, .. } => {
@@ -336,7 +339,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             let kb = cx.cur_tile.as_ref().map(|x| x.1).unwrap_or(-1);
             for t in frag_tags(cx.opnd(*a)) { if let Tag::A(m, k) = t { cx.trace.borrow_mut().a_tags.entry(kb).or_default().insert((m, k)); } }
             for t in frag_tags(cx.opnd(*b)) { if let Tag::B(n, k) = t { cx.trace.borrow_mut().b_tags.entry(kb).or_default().insert((n, k)); } }
-            for idx in 0..4u8 { cx.trace.borrow_mut().contrib.entry((cx.lane, var.0, idx)).or_default().push(kb); }
+            for idx in 0..4u8 { cx.trace.borrow_mut().contrib.entry((cx.tid, var.0, idx)).or_default().push(kb); }
             tag_acc_var(cx, *var);
         }
         Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => {
@@ -354,7 +357,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                 let dword = q / 2;
                 let from_tag = bytes.get(4 * dword).and_then(|t| if let Tag::Acc(v, i) = t { Some((*v, *i)) } else { None });
                 let Some((var, idx)) = origins.get(dword).and_then(|x| *x).or(from_tag) else { continue };
-                let kbs = cx.trace.borrow_mut().contrib.get(&(cx.lane, var, idx)).cloned().unwrap_or_default();
+                let kbs = cx.trace.borrow_mut().contrib.get(&(cx.tid, var, idx)).cloned().unwrap_or_default();
                 let elem = src / 2 + q as i64;
                 let m = elem / cx.args.n;
                 let n = elem % cx.args.n;
@@ -409,7 +412,7 @@ fn store_c(cx: &mut Ctx<'_>, base: Opnd, byte_off: u32, value: Opnd, nouts: usiz
         let dword = q / 2;
         let origin = origins.get(dword).and_then(|x| *x);
         let Some((var, idx)) = origin else { continue };
-        let kbs = cx.trace.borrow_mut().contrib.get(&(cx.lane, var, idx)).cloned().unwrap_or_default();
+        let kbs = cx.trace.borrow_mut().contrib.get(&(cx.tid, var, idx)).cloned().unwrap_or_default();
         let elem = (off / 2) as i64 + q as i64;
         let m = elem / cx.args.n;
         let n = elem % cx.args.n;
@@ -565,9 +568,10 @@ fn lds_read_word(cx: &mut Ctx<'_>, addr: Opnd) -> V {
 fn run_all(f: &Function, args: &Args) -> (Trace, usize) {
     let lds: Rc<RefCell<HashMap<i64, (Tag, Option<(u32, u8)>)>>> = Rc::new(RefCell::new(HashMap::new()));
     let trace: Rc<RefCell<Trace>> = Rc::new(RefCell::new(Trace::default()));
-    let mut lanes: Vec<Ctx<'_>> = (0..256i64).map(|lane| Ctx {
-        lane,
-        wave: lane / 64,
+    let mut lanes: Vec<Ctx<'_>> = (0..256i64).map(|tid| Ctx {
+        tid,
+        lane: tid % 64,
+        wave: tid / 64,
         args,
         vals: HashMap::new(),
         vars: HashMap::new(),

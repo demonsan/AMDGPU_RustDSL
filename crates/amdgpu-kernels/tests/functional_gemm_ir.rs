@@ -27,7 +27,7 @@ fn actual_v4_ir_proves_every_output_k_block_and_store() {
     for &(_, _, kb) in t.c_count.keys() { kbs.insert(kb); }
     let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     for v in t.contrib.values() { *hist.entry(v.len()).or_insert(0) += 1; }
-    println!("E3 kb keys={kbs:?} contrib_hist={hist:?} mfma={} no_tags={} dma={} lds={} tags={} a={} b={} sa={} sb={} nonu={} afrag={} aunk={} miss={} hit={:?} mi={:?} anone={} bempty={} opmiss={:?}", t.mfma_seen, t.mfma_no_tags, t.dma_writes, t.lds_entries, t.tag_entries, t.tag_a, t.tag_b, t.tag_sa, t.tag_sb, t.read_non_u, t.mfma_a_frag, t.mfma_a_unknown, t.lds_miss, t.sample_hit, t.sample_miss, t.mfma_a_addr_none, t.mfma_a_bytes_empty, t.sample_operand_miss);
+    println!("E3 kb keys={kbs:?} contrib_hist={hist:?} mfma={} no_tags={} dma={} lds={} tags={} a={} b={} sa={} sb={} nonu={} afrag={} aunk={} miss={} hit={:?} mi={:?} anone={} bempty={} opmiss={:?} optag={:?}", t.mfma_seen, t.mfma_no_tags, t.dma_writes, t.lds_entries, t.tag_entries, t.tag_a, t.tag_b, t.tag_sa, t.tag_sb, t.read_non_u, t.mfma_a_frag, t.mfma_a_unknown, t.lds_miss, t.sample_hit, t.sample_miss, t.mfma_a_addr_none, t.mfma_a_bytes_empty, t.sample_operand_miss, t.sample_operand_tag);
     check_trace(&t, &GemmConfig::v4(), 256, 256, 384, None).expect("E3 theorem on actual IR");
 }
 
