@@ -1,0 +1,88 @@
+//! E3: symbolic execution of the BUILT `gemm_mxfp8_bs_v4` Function (actual DSL IR, not a replica).
+use amdgpu_kernels::gemm_mxfp8::{gemm_mxfp8_bs, GemmConfig};
+use amdgpu_kernels::ir_proof::{check_trace, prove_ir};
+
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
+    let _guard = ENV_LOCK.lock().unwrap();
+    if let Some(kb) = drop {
+        std::env::set_var("GEMM_PROOF_DROP_KB", kb.to_string());
+    } else {
+        std::env::remove_var("GEMM_PROOF_DROP_KB");
+    }
+    // v4 with the registered direct-C epilogue (`gemm_mxfp8_bs_v4_directc` config): the LDS
+    // epilogue is a byte-transposition path whose provenance is a separate proof obligation; the
+    // K/DMA/MFMA/scale program below is the real v4 IR. See docs/functional-proofs.md.
+    let cfg = GemmConfig { lds_epilogue: false, ..GemmConfig::v4() };
+    let f = gemm_mxfp8_bs("proof_gemm_v4_directc", cfg);
+    println!("E3 build drop={drop:?} stmts={} ifs={}", f.stmts().len(), f.stmts().iter().filter(|s| matches!(s, amdgpu_dsl::Stmt::BeginIf { .. })).count());
+    let proof_drop_set = std::env::var("GEMM_PROOF_DROP_KB").ok();
+    std::env::remove_var("GEMM_PROOF_DROP_KB");
+    if drop.is_some() { assert_eq!(proof_drop_set.as_deref(), drop.map(|k| k.to_string()).as_deref()); }
+    // one CTA, 3 K tiles (the pipeline's u2 loop is unrolled by the executor)
+    prove_ir(&f, &cfg, 256, 256, 384).expect("IR symbolic execution")
+}
+
+#[test]
+fn actual_v4_ir_proves_every_output_k_block_and_store() {
+    let t = run(None);
+    println!("E3 trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?} bstores={} no_origin={} lds_so={} lds_ro={} store={:?} store_orig={} left={} p1left={} p1so={} p2so={} read={:?} epi_read={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops, t.buffer_stores, t.buffer_store_no_origin, t.lds_store_origins, t.lds_read_origins, t.sample_store, t.sample_store_origin, t.lds_origins_left, t.pass1_origin_left, t.pass1_lds_store_origins, t.pass2_lds_store_origins, t.sample_read, t.sample_epi_read);
+    let mut kbs: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for &(_, _, kb) in t.c_count.keys() { kbs.insert(kb); }
+    let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for v in t.contrib.values() { *hist.entry(v.len()).or_insert(0) += 1; }
+    println!("E3 kb keys={kbs:?} contrib_hist={hist:?} mfma={} no_tags={} dma={} lds={} tags={} a={} b={} sa={} sb={} nonu={} afrag={} aunk={} miss={} hit={:?} mi={:?} anone={} bempty={} opmiss={:?} optag={:?} dup={} dups={:?} sa_mfma={} sb_mfma={} sa_sample={:?} scale_src={:?}", t.mfma_seen, t.mfma_no_tags, t.dma_writes, t.lds_entries, t.tag_entries, t.tag_a, t.tag_b, t.tag_sa, t.tag_sb, t.read_non_u, t.mfma_a_frag, t.mfma_a_unknown, t.lds_miss, t.sample_hit, t.sample_miss, t.mfma_a_addr_none, t.mfma_a_bytes_empty, t.sample_operand_miss, t.sample_operand_tag, t.dup_c, t.dup_c_sample, t.sa_mfma, t.sb_mfma, t.sa_sample, t.scale_src);
+    check_trace(&t, &GemmConfig::v4(), 256, 256, 384, None).expect("E3 theorem on actual IR");
+}
+
+#[test]
+fn actual_kernel_tile1_bug_has_a_concrete_counterexample() {
+    let t = run(Some(1));
+    println!("E3 bug trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?} bstores={} no_origin={} lds_so={} lds_ro={} store={:?} store_orig={} left={} p1left={} p1so={} p2so={} read={:?} epi_read={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops, t.buffer_stores, t.buffer_store_no_origin, t.lds_store_origins, t.lds_read_origins, t.sample_store, t.sample_store_origin, t.lds_origins_left, t.pass1_origin_left, t.pass1_lds_store_origins, t.pass2_lds_store_origins, t.sample_read, t.sample_epi_read);
+    // The proof hook wraps the reg-staged compute; with K=384 one K generation is swallowed.
+    // Report the concrete counterexample: C[0,0] has no contribution for that generation, and
+    // another generation is duplicated by the shifted pipeline.
+    let missing: Vec<i64> = (0..3)
+        .filter(|kb| t.c_count.get(&(0, 0, *kb)).copied().unwrap_or(0) == 0)
+        .collect();
+    assert_eq!(missing.len(), 1, "dropped generation must leave exactly one hole; trace={:?}", t.c_count.get(&(0, 0, 0)));
+    let kb = missing[0];
+    let dup: Vec<i64> = (0..3)
+        .filter(|k| t.c_count.get(&(0, 0, *k)).copied().unwrap_or(0) > 1)
+        .collect();
+    assert!(!dup.is_empty(), "pipeline shift must duplicate a generation");
+    println!("E3 actual-kernel counterexample: missing contribution C[0,0] K block {kb} (k={}): 0 times; duplicated K blocks {dup:?}", kb * 128);
+}
+
+
+#[test]
+fn shipped_v4_lds_epilogue_also_carries_the_theorem() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("GEMM_PROOF_DROP_KB");
+    let cfg = GemmConfig::v4();
+    let f = amdgpu_kernels::gemm_mxfp8::gemm_mxfp8_bs_v4();
+    let t = prove_ir(&f, &cfg, 256, 256, 384).expect("symbolic execution of shipped v4");
+    check_trace(&t, &cfg, 256, 256, 384, None).expect("E3 theorem on shipped v4 LDS epilogue");
+    println!("E3 shipped v4: insts={} stores={} contributions={} (LDS epilogue)", t.executed_insts, t.stores.len(), t.c_count.len());
+}
+
+
+#[test]
+fn shipped_v4_kernel_code_dropped_generation_counterexample() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("GEMM_PROOF_DROP_KB", "1");
+    let f = amdgpu_kernels::gemm_mxfp8::gemm_mxfp8_bs_v4();
+    std::env::remove_var("GEMM_PROOF_DROP_KB");
+    let cfg = GemmConfig::v4();
+    let t = prove_ir(&f, &cfg, 256, 256, 384).expect("symbolic execution of buggy shipped v4");
+    let missing: Vec<i64> = (0..3)
+        .filter(|kb| t.c_count.get(&(0, 0, *kb)).copied().unwrap_or(0) == 0)
+        .collect();
+    assert_eq!(missing.len(), 1, "dropped generation must leave exactly one hole");
+    let dup: Vec<i64> = (0..3)
+        .filter(|k| t.c_count.get(&(0, 0, *k)).copied().unwrap_or(0) > 1)
+        .collect();
+    assert!(!dup.is_empty(), "pipeline shift must duplicate a generation");
+    println!("E3 shipped-v4 kernel-code counterexample: missing C[0,0] K block {}; duplicated {dup:?}", missing[0]);
+}

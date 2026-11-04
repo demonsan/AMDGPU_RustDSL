@@ -80,3 +80,34 @@ This is the first two steps of the SF Tensor direction in `docs/ir-review-tirx-s
 index-level composition proofs (E1) and a real-arithmetic loop invariant (E2), kept as small
 in-tree checkers rather than an SMT stack. `gpu_verify` remains the memory/synchronization proof;
 these layers add functional evidence without changing the shipped kernels or their assembly.
+
+
+## E3: symbolic execution of the built kernel Program (region-IR tree)
+
+`crates/amdgpu-kernels/src/ir_proof.rs` executes the **actual `Function::body()` tree** of the v4
+builder at a small symbolic configuration: one 256x256 CTA, K=384 (three K tiles), 256 threads
+enumerated with concrete lane/wave ids (`WorkitemId` 0..255, lane=`tid&63`, wave=`tid>>6`).
+Global loads/DMA produce element tags `A[m,k]`, `B[k,n]`, `Sa[m,kb]`, `Sb[block,kb]` from the
+emitted address expressions; LDS is a byte-value map (`M0 + imm + lane*size` destination per
+`gpu_verify`'s `BufferLoadLds` semantics); reads and MFMAs execute lockstep over all threads, so
+tile-generation correctness is not assumed. MFMA operands are classified by logical tag kind
+because the atom is built with `swap_ab` (hardware src A carries the logical B fragment and src B
+the logical A fragment; the scale slots are swapped the same way). The epilogue's accumulator
+provenance (`Tag::Acc(var, dword)`) maps each stored C element to its K contributions, for both the
+shipped LDS-transpose epilogue and the direct-C variant.
+
+On the **shipped `gemm_mxfp8_bs_v4()` Function** (LDS epilogue) the trace is:
+
+- 616,960 executed IR statements, 49,152 actual `VarMfmaScale16` statements, 65,536 actual C
+  stores, 196,608 C contributions = exactly 3 per output (K generations 0,1,2);
+- every C[m,n] has exactly one contribution per K generation and is stored exactly once;
+- every K generation's A/B operand tags cover the full 256x128 tile and the scale tags match the
+  output rows/blocks.
+
+The proof-only `GEMM_PROOF_DROP_KB` hook is a real IR `if` in the reg-staged compute path of the
+kernel (`Body::compute_tile`): it drops one tile generation from the emitted Function, not from a
+replica. Setting it to 1 makes the same checker fail with a concrete counterexample on the shipped
+v4 Function: `missing C[0,0] K block 2; duplicated K blocks [1]` (one generation is swallowed and
+the shifted pipeline duplicates another). The theorem and the kernel-code counterexample are
+un-gated tests in `crates/amdgpu-kernels/tests/functional_gemm_ir.rs`; the direct-C v4 variant is
+checked by the same checker as well.
