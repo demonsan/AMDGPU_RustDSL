@@ -184,3 +184,24 @@ fn explicit_partial_waits_make_the_block_untouched() {
     let before: Vec<String> = insts.iter().map(name).collect();
     assert_eq!(run(insts), before);
 }
+
+#[test]
+fn the_pressure_model_counts_live_vector_dwords_of_an_order() {
+    use amdgpu_compiler::sched::slotfill::peak_live;
+    use std::collections::HashSet;
+    // x = mov; y = mov; a = x + x; b = y + y: hoisting both movs ahead of their uses holds two values live at once
+    let insts = vec![
+        MInst::new(MOp::VMovB32).def(44).imm(1),
+        MInst::new(MOp::VMovB32).def(46).imm(2),
+        MInst::new(MOp::VAddF32).def(45).srcreg(44).srcreg(44),
+        MInst::new(MOp::VAddF32).def(47).srcreg(46).srcreg(46),
+    ];
+    let m = mk(insts.clone());
+    let none: HashSet<u32> = HashSet::new();
+    let tight = peak_live(&m, &insts, &[0, 2, 1, 3], &none);
+    let wide = peak_live(&m, &insts, &[0, 1, 2, 3], &none);
+    assert!(wide > tight, "{wide} vs {tight}");
+    // a live-out value stays live at the end
+    let out: HashSet<u32> = [47u32].into_iter().collect();
+    assert!(peak_live(&m, &insts, &[0, 2, 1, 3], &out) >= tight);
+}
