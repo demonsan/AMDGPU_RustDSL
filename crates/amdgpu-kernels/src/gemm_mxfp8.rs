@@ -92,6 +92,8 @@ pub struct GemmConfig {
     pub bitfield_voffsets: bool,
     /// B scales expanded to one dword per K group in the prologue: no per-tile byte shift (static byte select 0)
     pub b_scale_dword: bool,
+    /// `RegStaged`: MMAs of the register tile issued between the top-of-tile waits and the barrier (after `pre_sync_mmas`)
+    pub mid_sync_mmas: usize,
     pub ablate: Ablate,
 }
 
@@ -100,7 +102,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -108,7 +110,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -851,7 +853,30 @@ impl PipeBody for Body {
             self.window(b, role, t);
         }
     }
-    fn pre_sync(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
+    fn post_wait(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
+        if !self.cfg.reg_staged || self.cfg.mid_sync_mmas == 0 {
+            return;
+        }
+        // the next MMAs of the register tile between the waits and the barrier (the vendor issues 3 there): the barrier latency hides behind them
+        let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
+        let nn = bv.len();
+        let half = nn / 2;
+        let (from, to) = (self.npre_done, self.npre_done + self.cfg.mid_sync_mmas);
+        let mut n = 0;
+        'o: for i in 0..av.len() {
+            for j in 0..half {
+                if n >= to {
+                    break 'o;
+                }
+                if n >= from {
+                    let (w, by) = self.sa_sel(i);
+                    mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
+                }
+                n += 1;
+            }
+        }
+        self.npre_done = n;
+    }    fn pre_sync(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
         if !self.cfg.reg_staged {
             return;
         }
@@ -1002,6 +1027,9 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_acc32" => GemmConfig { acc_agpr: 32, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_acc16" => GemmConfig { acc_agpr: 16, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_bdw" => GemmConfig { b_scale_dword: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_vo" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 2, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_vo3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 3, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_mid3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_acc8" => GemmConfig { acc_agpr: 8, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_nodma_nords" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, ..Ablate::default() }, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_mma_nosync" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, no_sync: true, ..Ablate::default() }, ..GemmConfig::v4() },

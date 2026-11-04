@@ -91,6 +91,8 @@ pub trait PipeBody {
     /// `RegStaged`: register-only work of tile t issued BEFORE the iteration's wait + barrier (e.g. the first MMAs, which then run while the wave
     /// waits for the DMA / the other waves); it must not touch the LDS slots.
     fn pre_sync(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
+    /// `RegStaged`: between the top-of-tile waits and the barrier (work that touches no LDS / VMEM, e.g. MMAs of the register tile)
+    fn post_wait(&mut self, _b: &mut FnBuilder, _role: Role, _t: &TileIt) {}
 }
 
 /// The pipeline over `nkv` tiles of `tile_rows` rows (the last one possibly partial: `kv_len` rows in total).
@@ -302,6 +304,7 @@ impl Pipeline {
             if !self.ablate_no_sync {
                 b.wait_vm(self.top_vm);
                 b.wait_lds(0);
+                body.post_wait(b, role, &t);
                 b.barrier();
             }
             let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
@@ -393,6 +396,7 @@ impl Pipeline {
                     if !self.ablate_no_sync {
                         b.wait_vm(self.top_vm);
                         b.wait_lds(0);
+                        body.post_wait(b, role, &t);
                         b.barrier();
                     }
                     let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
