@@ -265,9 +265,7 @@ fn build_ws(name: &str, mode: Mode) -> Function {
         pr.read(b, |b| {
             let a0 = b.bind_i32(ev(wlane) + base);
             let a1 = b.bind_i32(ev(wlane) + base + 32);
-            let lo = b.load_lds_b128(a0);
-            let hi = b.load_lds_b128(a1);
-            b.cat_frag8(lo, hi)
+            b.load_lds_b128x2(a0, a1)
         })
     };
     // row operand (X or H): 4 fragments of 64 k, 16 bytes at 64 kb + 16 h and + 32 of row m
