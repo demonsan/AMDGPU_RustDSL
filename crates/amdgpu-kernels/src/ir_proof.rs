@@ -460,7 +460,7 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
 
 fn word_origin(v: V) -> Option<(u32, u8)> { match v { V::Word { origin, .. } => origin, _ => None } }
 
-fn lds_read(cx: &Ctx<'_>, addr: Opnd, n: usize) -> V {
+fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     let Some(a) = cx.int(addr) else { return V::Unknown };
     let Some((tile, ver)) = &cx.cur_tile else { return V::Unknown };
     let mut bytes = Vec::new();
@@ -474,7 +474,7 @@ fn lds_read(cx: &Ctx<'_>, addr: Opnd, n: usize) -> V {
     if cx.trace.sample_read.is_none() { cx.trace.sample_read = Some((tile.clone(), *ver, a, origins.iter().filter(|x| x.is_some()).count())); }
     V::Frag { bytes, origins }
 }
-fn lds_read_word(cx: &Ctx<'_>, addr: Opnd) -> V {
+fn lds_read_word(cx: &mut Ctx<'_>, addr: Opnd) -> V {
     let v = lds_read(cx, addr, 4);
     match v { V::Frag { bytes, .. } => V::Word { tags: bytes, origin: None }, _ => V::Unknown }
 }
