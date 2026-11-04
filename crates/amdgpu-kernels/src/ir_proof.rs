@@ -50,7 +50,7 @@ enum V {
     /// Four bytes of provenance (one dword), selected from a fragment.
     Word { tags: Vec<Tag>, origin: Option<(u32, u8)> },
     /// A fragment of bytes (tags) with per-dword accumulator origins.
-    Frag { bytes: Vec<Tag>, origins: Vec<Option<(u32, u8)>> },
+    Frag { bytes: Vec<Tag>, origins: Vec<Option<(u32, u8)>>, addr: Option<i64> },
     Unknown,
 }
 
@@ -252,7 +252,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             // (they carry accumulator origins), even though pass 2 does not re-run DMA.
             let epi = cx.cur_tile.as_ref().map(|(t, _)| t == "EPI").unwrap_or(false);
             if !cx.pass_writes && !epi { return false; }
-            if let (Some(a), V::Frag { bytes, origins }) = (cx.int(*addr), cx.opnd(*value)) {
+            if let (Some(a), V::Frag { bytes, origins, .. }) = (cx.int(*addr), cx.opnd(*value)) {
                 cx.trace.lds_store_origins += origins.iter().filter(|x| x.is_some()).count();
                 if let Some((tile, ver)) = &cx.cur_tile {
                     if cx.trace.sample_store.is_none() { cx.trace.sample_store = Some((tile.clone(), *ver, a)); cx.trace.sample_store_origin = origins.iter().filter(|x| x.is_some()).count(); }
@@ -275,8 +275,9 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
         Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, .. } => {
             if cx.pass_writes { return false; } // contributions only in pass 2
             cx.trace.mfma_seen += 1;
-            let a_tags = frag_tags(cx.opnd(*a));
-            let b_tags = frag_tags(cx.opnd(*b));
+            let av = cx.opnd(*a); let bv = cx.opnd(*b);
+            let a_tags = frag_tags_fallback(&av, cx.trace);
+            let b_tags = frag_tags_fallback(&bv, cx.trace);
             // The K generation comes from the A/B element tags themselves (actual addresses),
             // with the tile marker as a fallback for an empty fragment.
             let kb = a_tags.iter().find_map(|t| if let Tag::A(_, k) = t { Some(k / 128) } else { None })
@@ -309,7 +310,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             let mut src = so + *imm as i64;
             if let Some(v) = voff { if let Some(x) = cx.int(*v) { src += x; } else { return false; } }
             let frag = cx.opnd(*value);
-            let (bytes, origins) = match frag { V::Frag { bytes, origins } => (bytes, origins), _ => return false };
+            let (bytes, origins) = match frag { V::Frag { bytes, origins, .. } => (bytes, origins), _ => return false };
             cx.trace.buffer_stores += 1;
             if origins.iter().all(|x| x.is_none()) { cx.trace.buffer_store_no_origin += 1; }
             let nouts = 2 * *dwords as usize;
@@ -341,6 +342,19 @@ fn let_dst_of(_st: &Stmt) -> Option<ValueId> { None }
 fn frag_tags(v: V) -> Vec<Tag> {
     match v { V::Frag { bytes, .. } => bytes, _ => Vec::new() }
 }
+fn frag_tags_fallback(v: &V, trace: &Trace) -> Vec<Tag> {
+    match v {
+        V::Frag { bytes, addr, .. } => {
+            if !bytes.iter().all(|t| *t == Tag::U) { return bytes.clone(); }
+            if let Some(a) = addr {
+                let out: Vec<Tag> = (0..32).map(|i| trace.tag_by_addr.get(&(a + i)).cloned().unwrap_or(Tag::U)).collect();
+                if !out.iter().all(|t| *t == Tag::U) { return out; }
+            }
+            bytes.clone()
+        }
+        _ => Vec::new(),
+    }
+}
 fn word_tags(v: V) -> Vec<Tag> {
     match v { V::Word { tags, .. } => tags, _ => Vec::new() }
 }
@@ -350,7 +364,7 @@ fn store_c(cx: &mut Ctx<'_>, base: Opnd, byte_off: u32, value: Opnd, nouts: usiz
     let mut off = match cx.opnd(base) { V::Ptr(PtrRole::C, o) => o, _ => return };
     off += byte_off as i64;
     let frag = cx.opnd(value);
-    let (bytes, origins) = match frag { V::Frag { bytes, origins } => (bytes, origins), _ => return };
+    let (bytes, origins) = match frag { V::Frag { bytes, origins, .. } => (bytes, origins), _ => return };
     for q in 0..nouts {
         let dword = q / 2;
         let origin = origins.get(dword).and_then(|x| *x);
@@ -409,17 +423,17 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
         CvtPkFp8F32(a, b) => { let mut t = word_tags(cx.opnd(*a)); t.extend(word_tags(cx.opnd(*b))); V::Word { tags: t, origin: None } }
         Frag2(a, b) => {
             let mut bytes = word_tags(cx.opnd(*a)); bytes.extend(word_tags(cx.opnd(*b)));
-            V::Frag { bytes, origins: vec![word_origin(cx.opnd(*a)), word_origin(cx.opnd(*b))] }
+            V::Frag { bytes, origins: vec![word_origin(cx.opnd(*a)), word_origin(cx.opnd(*b))], addr: None }
         }
         Frag4(a, b, c, d) => {
             let mut bytes = Vec::new(); let mut origins = Vec::new();
             for x in [a, b, c, d] { bytes.extend(word_tags(cx.opnd(*x))); origins.push(word_origin(cx.opnd(*x))); }
-            V::Frag { bytes, origins }
+            V::Frag { bytes, origins, .. }
         }
         Frag2Lane { frag, index } => {
             let v = cx.opnd(*frag);
             let var_origin = match frag { Opnd::Var(v) => Some((v.0, *index)), _ => None };
-            match v { V::Frag { bytes, origins } => {
+            match v { V::Frag { bytes, origins, .. } => {
                 let d = (*index as usize).min(origins.len().saturating_sub(1));
                 let tags = bytes.iter().skip(4 * *index as usize).take(4).cloned().collect();
                 V::Word { tags, origin: var_origin.or(origins.get(d).and_then(|x| *x)) }
@@ -428,12 +442,12 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
         Frag4Lane { frag, index } => {
             let v = cx.opnd(*frag);
             let var_origin = match frag { Opnd::Var(v) => Some((v.0, *index)), _ => None };
-            match v { V::Frag { bytes, origins } => {
+            match v { V::Frag { bytes, origins, .. } => {
                 let tags = bytes.iter().skip(4 * *index as usize).take(4).cloned().collect();
                 V::Word { tags, origin: var_origin.or(origins.get(*index as usize).and_then(|x| *x)) }
             }, _ => V::Unknown }
         }
-        FragZero { .. } => V::Frag { bytes: Vec::new(), origins: vec![None; 4] },
+        FragZero { .. } => V::Frag { bytes: Vec::new(), origins: vec![None; 4], addr: None },
         DppQuadPerm { x, .. } | PermB32(x, ..) => {
             let v = cx.opnd(*x);
             match v { V::Word { tags, origin } => V::Word { tags, origin }, _ => V::Unknown }
@@ -443,7 +457,7 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
             let (Some(l), Some(h)) = (cx.int(*lo), cx.int(*hi)) else { return V::Unknown };
             let mut bytes = Vec::new(); let mut origins = Vec::new();
             for a in [l, h] { let v = lds_read(cx, Opnd::I32(a as i32), 16); if let V::Frag { bytes: b, origins: o } = v { bytes.extend(b); origins.extend(o); } }
-            V::Frag { bytes, origins }
+            V::Frag { bytes, origins, .. }
         }
         LoadLdsB64 { addr } => lds_read(cx, *addr, 8),
         LoadLdsB32 { addr } => lds_read_word(cx, *addr),
@@ -460,14 +474,14 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
 }
 
 fn tag_acc_var(cx: &mut Ctx<'_>, var: VarId) {
-    let mut f = match cx.vars.get(&var).cloned() { Some(V::Frag { bytes, origins }) => (bytes, origins), _ => (vec![Tag::U; 16], vec![None; 4]) };
+    let mut f = match cx.vars.get(&var).cloned() { Some(V::Frag { bytes, origins, .. }) => (bytes, origins), _ => (vec![Tag::U; 16], vec![None; 4]) };
     while f.0.len() < 16 { f.0.push(Tag::U); }
     while f.1.len() < 4 { f.1.push(None); }
     for idx in 0..4u8 {
         for b in 0..4 { f.0[4 * idx as usize + b] = Tag::Acc(var.0, idx); }
         f.1[idx as usize] = Some((var.0, idx));
     }
-    cx.vars.insert(var, V::Frag { bytes: f.0, origins: f.1 });
+    cx.vars.insert(var, V::Frag { bytes: f.0, origins: f.1, addr: None });
 }
 
 fn word_origin(v: V) -> Option<(u32, u8)> { match v { V::Word { origin, .. } => origin, _ => None } }
@@ -497,7 +511,7 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     cx.trace.lds_read_origins += n_o;
     if cx.trace.sample_read.is_none() { cx.trace.sample_read = Some((tile.clone(), *ver, a, n_o)); }
     if tile == "EPI" && cx.trace.sample_epi_read.is_none() { cx.trace.sample_epi_read = Some((tile.clone(), *ver, a, n_o)); }
-    V::Frag { bytes, origins }
+    V::Frag { bytes, origins, .. }
 }
 fn lds_read_word(cx: &mut Ctx<'_>, addr: Opnd) -> V {
     let v = lds_read(cx, addr, 4);
