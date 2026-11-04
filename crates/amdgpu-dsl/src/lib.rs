@@ -189,6 +189,9 @@ pub enum Op {
     /// MUBUF load (`buffer_load_dword[x2|x4]`): address = resource base + `voff` (per-lane byte offset, absent = `off` form) + `soff` (wave-uniform byte
     /// offset, SGPR or 0) + `imm` (12-bit). `dwords` = 1 (f32), 2 (frag2), 4 (frag4).
     BufferLoad { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, dwords: u8 },
+    /// Two MUBUF `buffer_load_dwordx4` (same rsrc / voff / soff, immediates `imm_lo` / `imm_hi`) straight into the low / high 4 dwords of ONE
+    /// 8-dword fragment (Frag8, no copy; each half is its own vmcnt entry).
+    BufferLoadB128x2 { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm_lo: u32, imm_hi: u32 },
     /// `global_atomic_add` (device scope, returns the OLD value): every active lane adds `value` at `base + byte_off`.
     AtomicAddU32 { base: Opnd, byte_off: u32, value: Opnd },
     /// Read one dword from workgroup LDS; `addr` is a byte offset.
@@ -301,6 +304,7 @@ impl Op {
             Op::AtomicAddU32 { .. } => DType::U32,
             Op::LoadB128Coherent { .. } => DType::Frag4,
             Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } => DType::Rsrc,
+            Op::BufferLoadB128x2 { .. } => DType::Frag8,
             Op::BufferLoad { dwords, .. } => match dwords {
                 1 => DType::F32,
                 2 => DType::Frag2,
@@ -410,7 +414,7 @@ impl Op {
             Op::LoadLdsB128x2 { lo, hi } => vec![*lo, *hi],
             Op::BufferRsrc { base, .. } => vec![*base],
             Op::BufferRsrcDyn { base, num_records } => vec![*base, *num_records],
-            Op::BufferLoad { rsrc, voff, soff, .. } => {
+            Op::BufferLoad { rsrc, voff, soff, .. } | Op::BufferLoadB128x2 { rsrc, voff, soff, .. } => {
                 let mut v = vec![*rsrc];
                 v.extend(voff.iter().copied());
                 v.push(*soff);
@@ -560,9 +564,37 @@ pub struct Contract {
     pub sym_ranges: Vec<(String, i64, i64)>,
 }
 
+/// One value set crossing a stage boundary (`StageContract`): the IR values (fragment registers), the element table they hold (`[t + threads v]`
+/// -> tensor element, after any K permutation: a layout fingerprint computed by the tile layer) and storage facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageVal {
+    pub name: String,
+    pub values: Vec<ValueId>,
+    pub table: Vec<i64>,
+    pub elem_bits: u32,
+    pub storage: String,
+}
+
+/// The resource contract of a pipeline STAGE (fusion hand-off, docs/fusion-layout-handoff.md §3): what it consumes from earlier stages and
+/// hands to later ones, the LDS tiles it frees / reuses, the barrier phase at its entry (barriers before it in program order) and the wave
+/// roles. Checked by `gpu_verify` at the region edge (GV-STAGE); emits no code and is not a scheduling barrier.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct StageContract {
+    pub live_in: Vec<StageVal>,
+    pub live_out: Vec<StageVal>,
+    pub lds_freed: Vec<String>,
+    pub lds_reused: Vec<String>,
+    pub barrier_phase: u32,
+    pub roles: Vec<String>,
+}
+
 /// Statements: a flat sequence with explicit structured markers.
 #[derive(Clone, Debug)]
 pub enum Stmt {
+    /// Opens a pipeline stage (`Node::Stage`) with its resource contract. Emits no code.
+    StageBegin { name: String, contract: Box<StageContract> },
+    /// Closes the innermost stage.
+    StageEnd,
     /// LDS tile protocol marker (v1.1): from here until the next tile marker / `TileEnd`, the LDS writes and DMA issued by this wave are version `version` of slot
     /// `slot` of tile `tile`. Emits no code.
     TileProduce { tile: String, slot: Opnd, version: Opnd },
@@ -700,6 +732,8 @@ pub enum Node {
     If { cond: Opnd, then: Vec<Node>, els: Option<Vec<Node>> },
     /// tile / buffer protocol region: `tile_produce` / `tile_consume` (and `buf_produce` / `buf_consume`) ... `tile_end`
     Region { kind: RegionKind, tile: String, slot: Opnd, version: Opnd, body: Vec<Node> },
+    /// a pipeline stage with its boundary contract (`stage_begin` ... `stage_end`): checked at the edge, transparent to lowering / scheduling
+    Stage { name: String, contract: Box<StageContract>, body: Vec<Node> },
 }
 
 /// Kind of a protocol region.
@@ -735,6 +769,11 @@ fn flatten_into(nodes: &[Node], out: &mut Vec<Stmt>) {
                 flatten_into(body, out);
                 out.push(Stmt::TileEnd);
             }
+            Node::Stage { name, contract, body } => {
+                out.push(Stmt::StageBegin { name: name.clone(), contract: contract.clone() });
+                flatten_into(body, out);
+                out.push(Stmt::StageEnd);
+            }
         }
     }
 }
@@ -745,6 +784,7 @@ enum Frame {
     Loop { vars: Vec<VarId>, init: Vec<Opnd>, body: Vec<Node> },
     If { cond: Opnd, then: Vec<Node>, els: Option<Vec<Node>> },
     Region { kind: RegionKind, tile: String, slot: Opnd, version: Opnd, body: Vec<Node> },
+    Stage { name: String, contract: Box<StageContract>, body: Vec<Node> },
 }
 
 impl Frame {
@@ -753,11 +793,12 @@ impl Frame {
             Frame::Loop { .. } => "loop",
             Frame::If { .. } => "if",
             Frame::Region { .. } => "tile region",
+            Frame::Stage { .. } => "stage",
         }
     }
     fn nodes(&mut self) -> &mut Vec<Node> {
         match self {
-            Frame::Loop { body, .. } | Frame::Region { body, .. } => body,
+            Frame::Loop { body, .. } | Frame::Region { body, .. } | Frame::Stage { body, .. } => body,
             Frame::If { then, els, .. } => els.as_mut().unwrap_or(then),
         }
     }
@@ -766,6 +807,7 @@ impl Frame {
             Frame::Loop { vars, init, body } => Node::Loop { vars, init, body },
             Frame::If { cond, then, els } => Node::If { cond, then, els },
             Frame::Region { kind, tile, slot, version, body } => Node::Region { kind, tile, slot, version, body },
+            Frame::Stage { name, contract, body } => Node::Stage { name, contract, body },
         }
     }
 }
@@ -812,6 +854,13 @@ impl TreeBuilder {
             Stmt::EndLoop => self.close(|f| matches!(f, Frame::Loop { .. }), "end_loop")?,
             Stmt::EndIf => self.close(|f| matches!(f, Frame::If { .. }), "end_if")?,
             Stmt::TileEnd => self.close(|f| matches!(f, Frame::Region { .. }), "tile_end")?,
+            Stmt::StageBegin { name, contract } => {
+                if self.open.iter().any(|f| matches!(f, Frame::Region { .. })) {
+                    return Err(format!("stage {name} inside an open tile region (close it with tile_end first)"));
+                }
+                self.open.push(Frame::Stage { name, contract, body: Vec::new() })
+            }
+            Stmt::StageEnd => self.close(|f| matches!(f, Frame::Stage { .. }), "stage_end")?,
             other => self.cur().push(Node::S(other)),
         }
         Ok(())
@@ -996,6 +1045,12 @@ impl Function {
                 }
                 Stmt::TileEnd => {
                     let _ = writeln!(s, "{pad}tile_end");
+                }
+                Stmt::StageBegin { name, contract } => {
+                    let _ = writeln!(s, "{pad}stage {name} in={:?} out={:?}", contract.live_in.iter().map(|x| &x.name).collect::<Vec<_>>(), contract.live_out.iter().map(|x| &x.name).collect::<Vec<_>>());
+                }
+                Stmt::StageEnd => {
+                    let _ = writeln!(s, "{pad}stage_end");
                 }
                 Stmt::Barrier => {
                     let _ = writeln!(s, "{pad}barrier");
@@ -1237,6 +1292,27 @@ impl FnBuilder {
     pub fn tile_end(&mut self) {
         self.push_stmt(Stmt::TileEnd);
     }
+    /// Opens a pipeline stage with its boundary contract (see `Stmt::StageBegin`).
+    pub fn stage_begin(&mut self, name: &str, contract: StageContract) {
+        self.push_stmt(Stmt::StageBegin { name: name.to_string(), contract: Box::new(contract) });
+    }
+    pub fn stage_end(&mut self) {
+        self.push_stmt(Stmt::StageEnd);
+    }
+    /// Adds a hand-over set to the innermost open stage's contract (its values are usually computed inside the stage).
+    pub fn stage_live_out(&mut self, v: StageVal) {
+        match self.tree.open.iter_mut().rev().find(|f| matches!(f, Frame::Stage { .. })) {
+            Some(Frame::Stage { contract, .. }) => contract.live_out.push(v),
+            _ => panic!("{}: stage_live_out outside a stage", self.f.name),
+        }
+    }
+    /// Closure form of `stage_begin` / `stage_end`.
+    pub fn stage<R>(&mut self, name: &str, contract: StageContract, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.stage_begin(name, contract);
+        let r = f(self);
+        self.stage_end();
+        r
+    }
     /// Contract fact `lo <= target <= hi` from this point on (see `Stmt::Assume`). Emits no code.
     pub fn assume(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext) {
         self.push_stmt(Stmt::Assume { target: target.into(), lo, hi, trusted: None });
@@ -1292,6 +1368,11 @@ impl FnBuilder {
         self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 4 })
     }
     /// `off` forms (no per-lane vaddr): every lane reads the same address (resource base + soff + imm).
+    /// Two `buffer_load_dwordx4` (offsets `imm_lo` / `imm_hi`) into the two halves of one Frag8 (an MFMA operand), without the copy of `cat_frag8`.
+    pub fn buffer_load_b128x2(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm_lo: u32, imm_hi: u32) -> ValueId {
+        self.let_(Op::BufferLoadB128x2 { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm_lo, imm_hi })
+    }
+
     pub fn buffer_load_b128_off(&mut self, rsrc: ValueId, soff: impl Into<Opnd>, imm: u32) -> ValueId {
         self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: None, soff: soff.into(), imm, dwords: 4 })
     }
@@ -2270,6 +2351,13 @@ pub fn verify(f: &Function) -> Vec<String> {
                             errs.push(here(e));
                         }
                     }
+                    Op::BufferLoadB128x2 { rsrc, voff, soff, imm_lo, imm_hi } => {
+                        for imm in [*imm_lo, *imm_hi] {
+                            for e in check_buffer_access(f, *rsrc, *voff, *soff, imm, 4) {
+                                errs.push(here(e));
+                            }
+                        }
+                    }
                     Op::Frag2(a, b) => {
                         for o in [a, b] {
                             if let Err(e) = expect_int(f, *o, "frag2") {
@@ -2601,7 +2689,14 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd => {}
+            Stmt::StageBegin { name, contract } => {
+                for v in contract.live_in.iter().chain(contract.live_out.iter()).flat_map(|x| x.values.iter()) {
+                    if let Err(e) = opnd_ty(f, Opnd::Val(*v)) {
+                        errs.push(here(format!("stage {name}: contract value v{v}: {e}")));
+                    }
+                }
+            }
             Stmt::Assume { target, .. } => {
                 if let Err(e) = expect_int(f, *target, "assume target") {
                     errs.push(here(e));
@@ -2931,7 +3026,8 @@ pub mod tile;
 pub use expr::{Cond, Ptr, F32, I32};
 
 /// Every `Opnd` a statement reads (loop variables read implicitly by in-place `Var*` statements are not listed).
-fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
+/// The value / variable operands a statement reads (structure and contract markers: none).
+pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
     match st {
         Stmt::Let { op, .. } => op.operands(),
         Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32Wt { base, value, .. } | Stmt::StoreF32x4Wt { base, value, .. } | Stmt::StoreF32x2 { base, value, .. } => vec![*base, *value],

@@ -13,10 +13,13 @@
 
 pub mod bufdma;
 pub mod contract;
+pub mod contract_stage;
 pub mod copy;
 pub mod dma;
 pub mod fmha;
 pub mod global;
+pub mod handoff;
+pub mod orient;
 pub mod mma;
 
 pub use copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_b, make_tiled_copy_bcast, LdsPart, LdsPrivPart, LdsSlotPart, TiledCopy};

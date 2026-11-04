@@ -19,6 +19,16 @@ use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, ValueId,
 use amdgpu_isa::{MmaAtom, DS_READ_B128, DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, DS_WRITE_B32, GLOBAL_LDS_X1, GLOBAL_LDS_X4, GLOBAL_LOAD_X4, GLOBAL_STORE_X2};
 use amdgpu_layout::{make_layout, tup, ComposedLayout, Ix, Layout as LLayout, Swizzle};
 
+/// The derived S -> P orientation (crate::orient::search_attention over the scaled fp8 atoms): the producer / consumer atom, checked to be the one this
+/// file implements (S^T = K Q^T, P = the B operand of O^T = V^T P^T, zero conversion cost).
+pub fn attention_orientation() -> (MmaAtom, crate::orient::Orientation) {
+    let atoms = [MmaAtom::mfma_scale_32x32x64_f8(), MmaAtom::mfma_scale_16x16x128_f8()];
+    let best = crate::orient::search_attention(&atoms).into_iter().next().expect("candidates");
+    assert!(best.s_transposed && best.p_operand == crate::orient::POperand::B && best.cost() == 0 && best.producer == best.consumer, "FMHA: the derived S -> P orientation {best:?} is not the implemented one");
+    let atom = atoms.into_iter().find(|a| a.name == best.producer).expect("atom");
+    (atom, best)
+}
+
 /// The K/V tile in LDS: [key, d] bytes, 128-byte rows, the FMHA swizzle.
 pub fn kv_view() -> ComposedLayout {
     ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![128, 128], tup![128, 1]))
@@ -76,7 +86,11 @@ impl KvRing3 {
         let mut ctx = Ctx::new();
         let l = ctx.sym("lane", 0, 63, lane.lane());
         let w = ctx.sym("wave", 0, 3, ev(roles.wave_in_group));
-        let mma = make_tiled_mma(MmaAtom::mfma_scale_32x32x64_f8(), false);
+        // the S -> P hand-off orientation is DERIVED (crate::orient): the cheapest candidate computes S^T (A = K, B = Q) with the 32x32x64 atom and feeds P
+        // as the B operand of the 32x32x64 PV MMA (O^T = V^T P^T) with a zero-cost conversion (the fp8 packing in accumulator order + the key
+        // permutation of the transposed V reads); this builder implements exactly that orientation
+        let o = attention_orientation();
+        let mma = make_tiled_mma(o.0, false);
         // K: the A operand (32 keys x 64 bytes) at rows 32 s, k-group c
         let kview = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![32, 64], tup![128, 1]));
         let placements: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect();
@@ -453,7 +467,7 @@ pub fn block3(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32) -> FmhaBlock {
     let q_row = b.let_i32(qt.offset(&[I32::c(0), row.clone(), I32::c(0), I32::c(0)]));
     let mut ctx = Ctx::new();
     let l = ctx.sym("lane", 0, 63, lane.lane());
-    let mma = make_tiled_mma(MmaAtom::mfma_scale_32x32x64_f8(), false);
+    let mma = make_tiled_mma(attention_orientation().0, false);
     let qcp = crate::copy::make_tiled_copy_b(GLOBAL_LOAD_X4, &mma);
     // the row is the lane's (clamped) query row, supplied above: the view gives the byte inside it (k), row stride 0
     let qpart = qcp.partition_global(b, &ctx, &l, &make_layout(tup![32, 64], tup![0, 1]), &[0, 64]);
@@ -495,7 +509,7 @@ pub fn store_out3(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C
     let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
     let mut ctx = Ctx::new();
     let l = ctx.sym("lane", 0, 63, blk.lane.lane());
-    let mma = make_tiled_mma(MmaAtom::mfma_scale_32x32x64_f8(), false);
+    let mma = make_tiled_mma(attention_orientation().0, false);
     let st = make_tiled_copy(GLOBAL_STORE_X2, mma.c_tv(), 32 * 32, 16);
     let part = st.partition_global(b, &ctx, &l, &make_layout(tup![32, 32], tup![2, 0]), &[0, 64, 128, 192]);
     b.begin_if(Opnd::Val(live));

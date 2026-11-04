@@ -1487,6 +1487,8 @@ impl Lowerer {
                     self.walk(f, body)?;
                     self.lower_stmt(f, &Stmt::TileEnd)?;
                 }
+                // a stage is transparent to lowering (its contract is checked by gpu_verify)
+                Node::Stage { body, .. } => self.walk(f, body)?,
             }
         }
         Ok(())
@@ -1901,7 +1903,7 @@ impl Lowerer {
                 Stmt::WaitLds { count } => {
                     self.push(MInst::new(MOp::SWaitLgkm).imm(*count as i64));
                 }
-                Stmt::Assume { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd => {} // contract markers for gpu_verify: no code
+                Stmt::Assume { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd | Stmt::StageBegin { .. } | Stmt::StageEnd => {} // contract markers for gpu_verify: no code
                 Stmt::Barrier => {
                     self.push(MInst::new(MOp::SBarrier));
                 }
@@ -2376,6 +2378,18 @@ impl Lowerer {
                 };
                 let d = self.new_vreg(cls);
                 self.push(MInst::new(mop).def(d).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::BufferLoadB128x2 { rsrc, voff, soff, imm_lo, imm_hi } => {
+                let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
+                let d = self.new_vreg(RClass::V8);
+                for (k, imm) in [(0u8, *imm_lo), (4u8, *imm_hi)] {
+                    let part = self.alias_vreg(d, k, RClass::V4);
+                    self.push(MInst::new(MOp::BufferLoadDwordX4).def(part).srcreg(rr).src(vs).src(ss).imm(imm as i64));
+                }
+                // one vmcnt entry per half
+                self.pending_vmem.push(self.mir.canon(d));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
