@@ -133,7 +133,7 @@ struct Ctx<'a> {
     vars: HashMap<VarId, V>,
     cur_tile: Option<(String, i64)>,
     pass_writes: bool,
-    lds: &'a mut HashMap<(String, i64, i64), Tag>,
+    lds: &'a mut HashMap<(String, i64, i64), (Tag, Option<(u32, u8)>)>,
     trace: &'a mut Trace,
     unknown_control: usize,
 }
@@ -255,21 +255,24 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             for b in 0..nbytes {
                 let tag = cx.tag_for(role, src + b);
                 if let Some((tile, ver)) = &cx.cur_tile {
-                    cx.lds.insert((tile.clone(), *ver, dst + b), tag);
+                    cx.lds.insert((tile.clone(), *ver, dst + b), (tag, None));
                 }
             }
         }
         Stmt::StoreLdsB32 { addr, value } => {
             if !cx.pass_writes { return false; }
             if let (Some(a), V::Word { tags, .. }) = (cx.int(*addr), cx.opnd(*value)) {
-                if let Some((tile, ver)) = &cx.cur_tile { for b in 0..4 { cx.lds.insert((tile.clone(), *ver, a + b), tags.get(b as usize).cloned().unwrap_or(Tag::U)); } }
+                if let Some((tile, ver)) = &cx.cur_tile { for b in 0..4 { cx.lds.insert((tile.clone(), *ver, a + b), (tags.get(b as usize).cloned().unwrap_or(Tag::U), None)); } }
             }
         }
         Stmt::StoreLdsB64 { addr, value } | Stmt::StoreLdsB128 { addr, value } => {
             if !cx.pass_writes { return false; }
-            if let (Some(a), V::Frag { bytes, .. }) = (cx.int(*addr), cx.opnd(*value)) {
+            if let (Some(a), V::Frag { bytes, origins }) = (cx.int(*addr), cx.opnd(*value)) {
                 if let Some((tile, ver)) = &cx.cur_tile {
-                    for (b, t) in bytes.iter().enumerate() { cx.lds.insert((tile.clone(), *ver, a + b as i64), t.clone()); }
+                    for (b, t) in bytes.iter().enumerate() {
+                        let o = origins.get(b / 4).and_then(|x| *x);
+                        cx.lds.insert((tile.clone(), *ver, a + b as i64), (t.clone(), o));
+                    }
                 }
             }
         }
@@ -291,6 +294,27 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             for t in frag_tags(cx.opnd(*a)) { if let Tag::A(m, k) = t { cx.trace.a_tags.entry(kb).or_default().insert((m, k)); } }
             for t in frag_tags(cx.opnd(*b)) { if let Tag::B(n, k) = t { cx.trace.b_tags.entry(kb).or_default().insert((n, k)); } }
             for idx in 0..4u8 { cx.trace.contrib.entry((var.0, idx)).or_default().push(kb); }
+        }
+        Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => {
+            if cx.pass_writes { return false; } // output stores are handled in pass 2
+            let role = match cx.opnd(*rsrc) { V::Rsrc(r) => r, _ => return false };
+            if role != PtrRole::C { return false; }
+            let so = cx.int(*soff).unwrap_or(0);
+            let mut src = so + *imm as i64;
+            if let Some(v) = voff { if let Some(x) = cx.int(*v) { src += x; } else { return false; } }
+            let frag = cx.opnd(*value);
+            let (_, origins) = match frag { V::Frag { bytes, origins } => (bytes, origins), _ => return false };
+            let nouts = 2 * *dwords as usize;
+            for q in 0..nouts {
+                let dword = q / 2;
+                let Some((var, idx)) = origins.get(dword).and_then(|x| *x) else { continue };
+                let kbs = cx.trace.contrib.get(&(var, idx)).cloned().unwrap_or_default();
+                let elem = src / 2 + q as i64;
+                let m = elem / cx.args.n;
+                let n = elem % cx.args.n;
+                if !cx.trace.stores.insert(elem) { cx.trace.unknown_ops.insert("duplicate C store".into()); }
+                for kb in kbs { *cx.trace.c_count.entry((m, n, kb)).or_insert(0) += 1; }
+            }
         }
         Stmt::StoreF32x2 { base, byte_off, value } => store_c(cx, *base, *byte_off, *value, 4),
         Stmt::StoreF32x4 { base, byte_off, value } => store_c(cx, *base, *byte_off, *value, 8),
@@ -430,9 +454,13 @@ fn lds_read(cx: &Ctx<'_>, addr: Opnd, n: usize) -> V {
     let Some((tile, ver)) = &cx.cur_tile else { return V::Unknown };
     let mut bytes = Vec::new();
     for i in 0..n {
-        bytes.push(cx.lds.get(&(tile.clone(), *ver, a + i as i64)).cloned().unwrap_or(Tag::U));
+        bytes.push(cx.lds.get(&(tile.clone(), *ver, a + i as i64)).map(|x| x.0.clone()).unwrap_or(Tag::U));
     }
-    V::Frag { bytes, origins: vec![None; n / 4] }
+    let mut origins = vec![None; n / 4];
+    for d in 0..n / 4 {
+        if let Some((_, o)) = cx.lds.get(&(tile.clone(), *ver, a + 4 * d as i64)) { origins[d] = *o; }
+    }
+    V::Frag { bytes, origins }
 }
 fn lds_read_word(cx: &Ctx<'_>, addr: Opnd) -> V {
     let v = lds_read(cx, addr, 4);
@@ -454,7 +482,7 @@ pub fn prove_ir(f: &Function, cfg: &GemmConfig, m: i64, n: i64, k: i64) -> Resul
     // pass 1: all lanes write global tags into LDS, under the tile-protocol (tile, generation) keys
     for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, true, &mut lds, &mut trace); }
     // pass 2: reads, MFMA contributions and epilogue stores
-    for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, false, &mut lds, &mut trace); }
+    for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, true, &mut lds, &mut trace); }
     if !trace.unknown_ops.is_empty() {
         return Err(ProofError(format!("unsupported/unknown IR during symbolic execution: {:?}", trace.unknown_ops)));
     }
