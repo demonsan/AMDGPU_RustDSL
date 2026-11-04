@@ -135,12 +135,14 @@ pub struct Pipeline {
     pub late_tile1_vm: u8,
     /// with `late_tile1`: issue tile 1 after the prologue barrier and the tile-0 reads
     pub tile1_after_barrier: bool,
+    /// compute the t+2 key after the barrier (the old order; A/B only)
+    pub key_late: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -324,7 +326,7 @@ impl Pipeline {
         };
         self.prebind(b, &t);
         // the t+2 key (scalar) before the waits: right after the barrier the stage's first DMA issues at once (the vendor order)
-        let key_n2 = if staged { Some(b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg())) } else { None };
+        let key_n2 = if staged && !self.key_late { Some(b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg())) } else { None };
         body.pre_sync(b, role, &t);
         if staged {
             if !self.ablate_no_sync {
@@ -333,7 +335,8 @@ impl Pipeline {
                 body.post_wait(b, role, &t);
                 b.barrier();
             }
-            body.stage(b, role, key_n2.as_ref().expect("key"), t.n2.as_ref().expect("n2"));
+            let key_n2 = key_n2.unwrap_or_else(|| b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg()));
+            body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
         }
         body.m_phase(b, role, &t);
     }
