@@ -26,7 +26,7 @@ fn actual_v4_ir_proves_every_output_k_block_and_store() {
     for &(_, _, kb) in t.c_count.keys() { kbs.insert(kb); }
     let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     for v in t.contrib.values() { *hist.entry(v.len()).or_insert(0) += 1; }
-    println!("E3 kb keys={kbs:?} contrib_hist={hist:?} mfma={} no_tags={}",");
+    println!("E3 kb keys={kbs:?} contrib_hist={hist:?} mfma={} no_tags={}", t.mfma_seen, t.mfma_no_tags);
     check_trace(&t, &GemmConfig::v4(), 256, 256, 384, None).expect("E3 theorem on actual IR");
 }
 
