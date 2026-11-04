@@ -428,10 +428,12 @@ pub struct Vs128Cfg {
     pub setprio: bool,
     /// the vendor's padded K / V LDS image (1040-byte runs, no swizzle) with its MUBUF DMA
     pub kvpad: bool,
+    /// rollback threshold override in 1/512 units (shipped 120: below the 131 target, so a tile whose max equals the running max rolls back)
+    pub thr512: Option<u32>,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -452,6 +454,9 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
+            if let Some(th) = cfg.thr512 {
+                body.sm.set_thr(b, th as f32 / 512.0);
+            }
             body.setprio = cfg.setprio;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);

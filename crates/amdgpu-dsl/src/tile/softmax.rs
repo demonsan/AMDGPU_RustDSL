@@ -63,6 +63,11 @@ impl OnlineSoftmax {
         let zero4 = b.frag_zero(DType::Frag4);
         OnlineSoftmax { recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, one_f, zero4, bias: None, la: None }
     }
+    /// Overrides the rollback threshold (scaled max units).
+    pub fn set_thr(&mut self, b: &mut FnBuilder, thr: f32) {
+        self.recipe.thr = thr;
+        self.thr = b.c_f32(thr);
+    }
     /// Loop-state initial values: [bias (Frag2), row sums (Frag4)].
     pub fn state(&self) -> Vec<(DType, Opnd)> {
         vec![(DType::Frag2, Opnd::Val(self.bias_init)), (DType::Frag4, Opnd::Val(self.zero4))]
