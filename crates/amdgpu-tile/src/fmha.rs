@@ -294,8 +294,19 @@ impl PipeBody for AttnBody3<'_> {
     }
 }
 
+/// Experiment switches of the `_vs128` builder (the shipped kernel = all off; variants are registered under their own names).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Vs128Cfg {
+    /// vendor-style epilogue: O^T through the wave-private scratch (2 x ds_write_b32 per 4 dims, ds_read_b128 rows) and 8 x 16-byte row stores
+    pub epi_lds: bool,
+}
+
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg::default())
+}
+
+pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
@@ -310,7 +321,11 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
-            store_out3(&io, b, &blk, &body.o.expect("O"), fin);
+            if cfg.epi_lds {
+                store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
+            } else {
+                store_out3(&io, b, &blk, &body.o.expect("O"), fin);
+            }
         });
     });
     fb.finish()
@@ -528,6 +543,61 @@ pub fn store_out3(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C
             vals.push(b.frag2(w0, w1));
         }
         part.store(b, &ptrs, e, &vals);
+    }
+    b.end_if();
+}
+
+/// The bf16 epilogue through the wave-private scratch (the `store_partial3` transpose with bf16 words): per 64-dim half, the C layout is written as
+/// 2 x `ds_write_b32` per 4 dims into a [32 queries x 64 dims] slice (16-byte chunks XOR-swizzled by the query), read back as 16-byte row chunks
+/// (`ds_read_b128`, 8 lanes per row) and stored as 4 x 16-byte segments of the output rows: 8 `global_store_dwordx4` per wave (the vendor count)
+/// instead of 16 `global_store_dwordx2`.
+pub fn store_out3_lds(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, epi: &Shared, wid: ValueId, o: &AccTile<C32x32F32, 4>, fin: ValueId) {
+    b.barrier();
+    let o_tile = io.o.tile(vec![ev(blk.bidx), I32::c(0), ev(blk.hidx), I32::c(0)]).clamp(1, io.s_len.clone(), blk.s_last.clone());
+    let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
+    let lane = blk.lane;
+    let mut ctx = Ctx::new();
+    let l = ctx.sym("lane", 0, 63, lane.lane());
+    let view = ComposedLayout::new(Swizzle::cute(3, 4, 3), make_layout(tup![64, 32], tup![2, 128]));
+    let wtv = make_layout(tup![tup![32, 2], tup![4, 4, 2]], tup![tup![64, 4], tup![1, 8, 32]]);
+    let epi0 = Shared { base: 0, ..epi.clone() };
+    let wpart = make_tiled_copy(DS_WRITE_B32, wtv, 64 * 32, 16).partition_lds(b, &ctx, &l, &epi0, &view, &[0]);
+    let rtv = make_layout(tup![tup![8, 8], tup![8, 4]], tup![tup![8, 64], tup![1, 512]]);
+    let rpart = make_tiled_copy(DS_READ_B128, rtv, 64 * 32, 16).partition_lds(b, &ctx, &l, &epi0, &view, &[0]);
+    b.begin_if(Opnd::Val(live));
+    let me = epi.mine(wid);
+    let wp = wpart.at_private(b, &me);
+    let rp = rpart.at_private(b, &me);
+    let gptr: Vec<ValueId> = (0..4)
+        .map(|i| {
+            // round i: row 8 i + (lane >> 3) of the wave's 32 queries (clamped by the tile), chunk lane & 7 (8 dims = 16 bytes)
+            let r = b.let_i32((&blk.row0 + 8 * i as i32) + lane.lane().lshr(3));
+            let off = b.bind_i32(o_tile.offset(&[I32::c(0), r, I32::c(0), I32::c(0)]) + ((lane.lane() & 7) << 4));
+            b.ptr_add(io.o.ptr, off)
+        })
+        .collect();
+    for pr in 0..2usize {
+        for ec in 0..2usize {
+            let e = 2 * pr + ec;
+            for q in 0..4usize {
+                let mut v4: Vec<ValueId> = Vec::with_capacity(4);
+                for k in 0..4usize {
+                    let lv = b.frag16_lane(Opnd::Var(o.accs[e].var), (4 * q + k) as u8);
+                    let f = b.bitcast_f32(lv);
+                    v4.push(b.mul_f32(f, fin));
+                }
+                let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
+                let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+                let n = 2 * (4 * ec + q);
+                wp.write(b, n, 0, &[w0]);
+                wp.write(b, n + 1, 0, &[w1]);
+            }
+        }
+        b.wait_lds(0);
+        for (i, g) in gptr.iter().enumerate() {
+            let v = rp.read(b, i, 0);
+            b.store_f32x4(*g, (128 * pr) as u32, v);
+        }
     }
     b.end_if();
 }
