@@ -516,7 +516,7 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
             // LDS epilogue aliases the dead ring/panel storage; the same byte may have been
             // written under another (tile, generation) key. Use an existing accumulator
             // provenance at this byte address as the origin fallback.
-            if let Some((_, o)) = cx.lds.iter().find(|((_, _, x), (_, o))| *x == addr && o.is_some()) { origins[d] = *o; }
+            if let Some(o) = cx.lds.iter().find(|((_, _, x), (_, o))| *x == addr && o.is_some()).and_then(|(_, (_, o))| *o) { origins[d] = Some(o); }
         }
     }
     let n_o = origins.iter().filter(|x| x.is_some()).count();
