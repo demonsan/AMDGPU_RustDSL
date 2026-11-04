@@ -1295,6 +1295,13 @@ impl FnBuilder {
     pub fn stage_end(&mut self) {
         self.push_stmt(Stmt::StageEnd);
     }
+    /// Adds a hand-over set to the innermost open stage's contract (its values are usually computed inside the stage).
+    pub fn stage_live_out(&mut self, v: StageVal) {
+        match self.tree.open.iter_mut().rev().find(|f| matches!(f, Frame::Stage { .. })) {
+            Some(Frame::Stage { contract, .. }) => contract.live_out.push(v),
+            _ => panic!("{}: stage_live_out outside a stage", self.f.name),
+        }
+    }
     /// Closure form of `stage_begin` / `stage_end`.
     pub fn stage<R>(&mut self, name: &str, contract: StageContract, f: impl FnOnce(&mut Self) -> R) -> R {
         self.stage_begin(name, contract);
