@@ -510,7 +510,14 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     }
     let mut origins = vec![None; n / 4];
     for d in 0..n / 4 {
-        if let Some((_, o)) = cx.lds.get(&(tile.clone(), *ver, a + 4 * d as i64)) { origins[d] = *o; }
+        let addr = a + 4 * d as i64;
+        if let Some((_, o)) = cx.lds.get(&(tile.clone(), *ver, addr)) { origins[d] = *o; }
+        if origins[d].is_none() {
+            // LDS epilogue aliases the dead ring/panel storage; the same byte may have been
+            // written under another (tile, generation) key. Use an existing accumulator
+            // provenance at this byte address as the origin fallback.
+            if let Some((_, o)) = cx.lds.iter().find(|((_, _, x), (_, o))| *x == addr && o.is_some()) { origins[d] = *o; }
+        }
     }
     let n_o = origins.iter().filter(|x| x.is_some()).count();
     cx.trace.lds_read_origins += n_o;
