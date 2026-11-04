@@ -114,6 +114,9 @@ pub struct Trace {
     pub read_non_u: usize,
     pub mfma_a_frag: usize,
     pub mfma_a_unknown: usize,
+    pub lds_miss: usize,
+    pub sample_miss: Option<i64>,
+    pub sample_hit: Option<i64>,
 }
 
 struct Ctx<'a> {
@@ -513,7 +516,11 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     let mut bytes = Vec::new();
     for i in 0..n {
         let _ = (tile, ver);
-        let mut tag = cx.lds.borrow_mut().get(&(a + i as i64)).map(|x| x.0.clone()).unwrap_or(Tag::U);
+        let exact = cx.lds.borrow().get(&(a + i as i64)).map(|x| x.0.clone());
+        let mut tag = exact.clone().unwrap_or(Tag::U);
+        if exact.is_none() && cx.trace.borrow().lds_miss < 16 { cx.trace.borrow_mut().sample_miss = Some(a + i as i64); }
+        if exact.is_some() && cx.trace.borrow().sample_hit.is_none() { cx.trace.borrow_mut().sample_hit = Some(a + i as i64); }
+        if exact.is_none() { cx.trace.borrow_mut().lds_miss += 1; }
         if tag == Tag::U { if let Some(t) = cx.trace.borrow_mut().tag_by_addr.get(&(a + i as i64)) { tag = t.clone(); } }
         if tag != Tag::U { cx.trace.borrow_mut().read_non_u += 1; }
         bytes.push(tag);
