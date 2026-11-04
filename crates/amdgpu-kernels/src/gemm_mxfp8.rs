@@ -963,6 +963,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_ed" => GemmConfig { early_dma: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_ep2" => GemmConfig { epi_phases: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_ep4" => GemmConfig { epi_phases: 4, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_ep8" => GemmConfig { epi_phases: 8, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_ep4s" => GemmConfig { epi_phases: 4, spread_reloads: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_eddv" => GemmConfig { early_dma: true, derive_voffsets: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_spread2" => GemmConfig { spread_reloads: true, dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_tall" => GemmConfig { raster_tall: true, ..GemmConfig::v4() },
