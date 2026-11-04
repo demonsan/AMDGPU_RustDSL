@@ -853,7 +853,7 @@ fn own_tail_chains_unscaled_mfma_without_nops_but_pads_after_the_zero_form() {
     let mk = |insts: Vec<MInst>| {
         let mut b = Block::new(0);
         b.insts = insts;
-        MFunction { name: "u".into(), args: Vec::new(), kernarg_size: 0, workgroup_size: 64, lds_bytes: 0, blocks: vec![b], vregs: vec![RClass::V8, RClass::V8, RClass::V16], loops: Vec::new(), alias: Default::default(), elide_fallthrough: false, agpr_pin: Default::default() }
+        MFunction { name: "u".into(), args: Vec::new(), kernarg_size: 0, workgroup_size: 64, lds_bytes: 0, blocks: vec![b], vregs: vec![RClass::V8, RClass::V8, RClass::V16], loops: Vec::new(), alias: Default::default(), elide_fallthrough: false, edge_pad: false, agpr_pin: Default::default() }
     };
     let chain = |op| MInst::new(op).def(2).srcreg(0).srcreg(1).srcreg(2);
     // in-place accumulate then accumulate: hardware-interlocked, no s_nop

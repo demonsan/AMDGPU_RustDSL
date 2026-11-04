@@ -15,7 +15,7 @@ fn func(insts: Vec<MInst>, nvregs: usize) -> MFunction {
         vregs: vec![RClass::V1; nvregs],
         loops: Vec::new(),
         alias: Default::default(),
-        elide_fallthrough: false,
+        elide_fallthrough: false, edge_pad: false,
         agpr_pin: Default::default(),
     }
 }

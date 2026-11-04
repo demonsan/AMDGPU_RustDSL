@@ -278,7 +278,7 @@ fn mfunc(blocks: Vec<(Vec<MInst>, Term)>, classes: Vec<RClass>) -> MFunction {
         b.term = term;
         bs.push(b);
     }
-    MFunction { name: "gv".into(), args: Vec::new(), kernarg_size: 0, workgroup_size: 64, lds_bytes: 0, blocks: bs, vregs: classes, loops: Vec::new(), alias: Default::default(), elide_fallthrough: false, agpr_pin: Default::default() }
+    MFunction { name: "gv".into(), args: Vec::new(), kernarg_size: 0, workgroup_size: 64, lds_bytes: 0, blocks: bs, vregs: classes, loops: Vec::new(), alias: Default::default(), elide_fallthrough: false, edge_pad: false, agpr_pin: Default::default() }
 }
 
 fn alloc(phys: Vec<u32>, classes: &[RClass]) -> Alloc {

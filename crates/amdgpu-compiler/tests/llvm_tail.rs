@@ -128,7 +128,7 @@ fn opcode_probe_every_row_assembles() {
             vregs,
             loops: vec![],
             alias: HashMap::new(),
-            elide_fallthrough: false,
+            elide_fallthrough: false, edge_pad: false,
             agpr_pin: Default::default(),
         };
         let a = Alloc { scalar, phys, max_v: vnext, max_s: snext };
