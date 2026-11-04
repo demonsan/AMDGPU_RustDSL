@@ -135,6 +135,7 @@ pub struct Trace {
     pub pass1_origin_left: usize,
     pub pass1_lds_store_origins: usize,
     pub pass2_lds_store_origins: usize,
+    pub origin_by_addr: HashMap<i64, (u32, u8)>,
     pub sample_read: Option<(String, i64, i64, usize)>,
     pub sample_epi_read: Option<(String, i64, i64, usize)>,
     pub executed_insts: usize,
@@ -292,6 +293,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                     for (b, t) in bytes.iter().enumerate() {
                         let key = (tile.clone(), *ver, a + b as i64);
                         let o = origins.get(b / 4).and_then(|x| *x);
+                        if let Some(oo) = o { cx.trace.origin_by_addr.insert(a + b as i64, oo); }
                         // Do not replace a known accumulator origin by an unknown DMA/epilogue
                         // write at the same byte: the reference is what the store will read.
                         match cx.lds.get_mut(&key) {
@@ -516,7 +518,7 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
             // LDS epilogue aliases the dead ring/panel storage; the same byte may have been
             // written under another (tile, generation) key. Use an existing accumulator
             // provenance at this byte address as the origin fallback.
-            if let Some(o) = cx.lds.iter().find(|((_, _, x), (_, o))| *x == addr && o.is_some()).and_then(|(_, (_, o))| *o) { origins[d] = Some(o); }
+            if let Some(o) = cx.trace.origin_by_addr.get(&addr) { origins[d] = Some(*o); }
         }
     }
     let n_o = origins.iter().filter(|x| x.is_some()).count();
