@@ -2432,6 +2432,18 @@ impl Lowerer {
                 }
                 self.val.insert(dst, d);
             }
+            Op::Permlane32Swap { a, b } => {
+                let (ra, rb) = (self.as_v1(*a)?, self.as_v1(*b)?);
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let d = self.new_vreg(RClass::V2);
+                let lo = self.alias_vreg(d, 0, RClass::V1);
+                let hi = self.alias_vreg(d, 1, RClass::V1);
+                self.push(MInst::new(MOp::VMovB32).def(lo).srcreg(ra));
+                self.push(MInst::new(MOp::VMovB32).def(hi).srcreg(rb));
+                // both operands are written: lo = [a 0..31, b 0..31], hi = [a 32..63, b 32..63]
+                self.push(MInst::new(MOp::VPermlane32Swap).def(lo).srcreg(lo).srcreg(hi));
+                self.val.insert(dst, d);
+            }
             Op::Frag2Lane { frag, index } => {
                 let f = self.as_v2(*frag)?;
                 let d = self.alias_vreg(f, *index, RClass::V1);

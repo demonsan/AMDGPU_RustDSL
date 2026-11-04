@@ -215,6 +215,9 @@ pub enum Op {
     Frag2(Opnd, Opnd),
     /// Read dword `index` (0 or 1) of a two-dword fragment.
     Frag2Lane { frag: Opnd, index: u8 },
+    /// `v_permlane32_swap`: exchanges lanes 32..63 of `a` with lanes 0..31 of `b`. Result: a Frag2 whose dword 0 is the new `a` and dword 1
+    /// the new `b` (use `permlane32_swap`, which returns the two values).
+    Permlane32Swap { a: Opnd, b: Opnd },
     /// Build a four-dword fragment from four 32-bit values.
     Frag4(Opnd, Opnd, Opnd, Opnd),
     /// Read dword `index` (0..3) of a four-dword fragment.
@@ -318,6 +321,7 @@ impl Op {
             Op::PtrAdd { .. } | Op::KernargPtr { .. } => DType::Ptr,
             Op::Frag2(..) => DType::Frag2,
             Op::Frag2Lane { .. } | Op::Frag4Lane { .. } => DType::U32,
+            Op::Permlane32Swap { .. } => DType::Frag2,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::MfmaF16Wide { .. } => DType::Frag16,
             Op::MfmaFp8_16x16x32 { .. } => DType::Frag4,
@@ -378,6 +382,7 @@ impl Op {
             Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } => vec![*base],
             Op::Frag2(a, b) => vec![*a, *b],
             Op::Frag2Lane { frag, .. } => vec![*frag],
+            Op::Permlane32Swap { a, b } => vec![*a, *b],
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
@@ -1714,6 +1719,13 @@ impl FnBuilder {
 
     pub fn frag2(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Frag2(a.into(), b.into()))
+    }
+
+    /// `v_permlane32_swap`: `(a', b')` with a' = [a lanes 0..31, b lanes 0..31] and b' = [a lanes 32..63, b lanes 32..63] (lanes 32..63 of `a`
+    /// exchanged with lanes 0..31 of `b`). 32-bit values.
+    pub fn permlane32_swap(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> (ValueId, ValueId) {
+        let p = self.let_(Op::Permlane32Swap { a: a.into(), b: b.into() });
+        (self.frag2_lane(p, 0), self.frag2_lane(p, 1))
     }
 
     pub fn frag2_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
