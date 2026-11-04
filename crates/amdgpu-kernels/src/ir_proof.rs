@@ -136,6 +136,7 @@ pub struct Trace {
     pub pass1_lds_store_origins: usize,
     pub pass2_lds_store_origins: usize,
     pub origin_by_addr: HashMap<i64, (u32, u8)>,
+    pub tag_by_addr: HashMap<i64, Tag>,
     pub sample_read: Option<(String, i64, i64, usize)>,
     pub sample_epi_read: Option<(String, i64, i64, usize)>,
     pub executed_insts: usize,
@@ -271,7 +272,8 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             for b in 0..nbytes {
                 let tag = cx.tag_for(role, src + b);
                 if let Some((tile, ver)) = &cx.cur_tile {
-                    cx.lds.insert((tile.clone(), *ver, dst + b), (tag, None));
+                    cx.lds.insert((tile.clone(), *ver, dst + b), (tag.clone(), None));
+                    if tag != Tag::U { cx.trace.tag_by_addr.insert(dst + b, tag); }
                 }
             }
         }
@@ -294,6 +296,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                         let key = (tile.clone(), *ver, a + b as i64);
                         let o = origins.get(b / 4).and_then(|x| *x);
                         if let Some(oo) = o { cx.trace.origin_by_addr.insert(a + b as i64, oo); }
+                        if *t != Tag::U { cx.trace.tag_by_addr.insert(a + b as i64, t.clone()); }
                         // Do not replace a known accumulator origin by an unknown DMA/epilogue
                         // write at the same byte: the reference is what the store will read.
                         match cx.lds.get_mut(&key) {
@@ -509,7 +512,9 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     let Some((tile, ver)) = &cx.cur_tile else { return V::Unknown };
     let mut bytes = Vec::new();
     for i in 0..n {
-        bytes.push(cx.lds.get(&(tile.clone(), *ver, a + i as i64)).map(|x| x.0.clone()).unwrap_or(Tag::U));
+        let mut tag = cx.lds.get(&(tile.clone(), *ver, a + i as i64)).map(|x| x.0.clone()).unwrap_or(Tag::U);
+        if tag == Tag::U { if let Some(t) = cx.trace.tag_by_addr.get(&(a + i as i64)) { tag = t.clone(); } }
+        bytes.push(tag);
     }
     let mut origins = vec![None; n / 4];
     for d in 0..n / 4 {
