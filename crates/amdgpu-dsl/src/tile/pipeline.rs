@@ -120,12 +120,14 @@ pub struct Pipeline {
     /// `RegStaged`: the vmcnt allowed at the top-of-tile wait (default 0). A body that publishes part of the stage later (its own wait + barrier
     /// before the first read of that part) sets this to the number of DMAs issued after the part needed first.
     pub top_vm: u8,
+    /// `RegStaged`: the DMAs of tile 1 (issued after tile 0) that may still be in flight at the prologue barrier (default 0)
+    pub prologue_vm: u8,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0 }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0 }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -176,7 +178,8 @@ impl Pipeline {
             body.stage_complete(b, role, &s1);
         }
         body.prologue_stores(b, role);
-        b.wait_vm(0);
+        // RegStaged: tile 1 is first read after the loop's top-of-tile wait + barrier, so its DMAs may stay in flight here (`prologue_vm`)
+        b.wait_vm(if self.cadence == Cadence::RegStaged { self.prologue_vm } else { 0 });
         b.wait_lds(0);
         b.barrier();
         if self.cadence == Cadence::TwoPhaseOffset && role == Role::B {
