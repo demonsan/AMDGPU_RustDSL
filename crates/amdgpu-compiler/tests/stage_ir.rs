@@ -36,7 +36,7 @@ fn stage_tree_and_flat() {
     let flat = f.stmts();
     assert_eq!(flat.iter().filter(|s| matches!(s, Stmt::StageBegin { .. })).count(), 2);
     assert_eq!(flat.iter().filter(|s| matches!(s, Stmt::StageEnd)).count(), 2);
-    assert!(Function::parse_flat(&flat).is_ok());
+    assert!(Function::parse_flat(flat.to_vec()).is_ok());
     assert!(stage_errors(&f).is_empty(), "{:?}", stage_errors(&f));
 }
 
