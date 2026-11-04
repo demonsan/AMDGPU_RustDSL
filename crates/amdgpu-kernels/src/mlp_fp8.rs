@@ -41,6 +41,9 @@ pub fn by_name(name: &str) -> Option<Function> {
         "mlp_fp8_fused" => Mode::Fused,
         "mlp_fp8_g1" => Mode::G1,
         "mlp_fp8_g2" => Mode::G2,
+        "mlp_fp8_ws_fused" => return Some(build_ws(name, Mode::Fused)),
+        "mlp_fp8_ws_g1" => return Some(build_ws(name, Mode::G1)),
+        "mlp_fp8_ws_g2" => return Some(build_ws(name, Mode::G2)),
         _ => return None,
     };
     Some(build(name, mode))
@@ -175,5 +178,177 @@ fn build(name: &str, mode: Mode) -> Function {
         }
     }
     let _ = Opnd::I32(0);
+    fb.finish()
+}
+
+/// LDS image row pitch of the weight matrices (256 bytes + 16 bytes of padding: the 16 rows a `ds_read_b128` phase touches fall on 16 distinct
+/// 16-byte bank windows, and every read address is `lane base + immediate`).
+pub const W_PITCH: i64 = 272;
+/// Bytes of one weight image (256 rows).
+pub const W_IMG: i64 = 256 * W_PITCH;
+
+/// Weight-stationary, persistent form of the three MLP kernels (tuned building blocks): the weight images (host-prepared, `W_PITCH`-padded rows;
+/// the fused kernel's W2 key-permuted) are DMA'd once per CTA into LDS, then every CTA loops over 128-row blocks (block c, c + G, ...): X rows by
+/// direct 16-byte loads (the next block's X prefetched during GEMM 2), W fragments by `ds_read_b128` with immediate offsets, accumulators in
+/// registers, the same zero-cost P hand-off as `build`. ABI: in @0, W1 image @8, W2 image @16, out @24, M @32, G (CTAs) @36.
+fn build_ws(name: &str, mode: Mode) -> Function {
+    if mode == Mode::Fused {
+        for jb in 0..N1 / 64 {
+            let (p, c) = p_boundary(jb);
+            let rep = check_boundary(&p, &c).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(rep.frags.iter().all(|f| f.1 <= Movement::Register && f.2 == 0), "{name}: the P hand-off is not free: {:?}", rep.frags);
+        }
+    }
+    use amdgpu_dsl::tile::{LdsPlan, Layout as TLayout, SlotIdx};
+    let mut fb = FnBuilder::new(name, 256);
+    fb.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
+    let b = &mut fb;
+    for (n, o) in [("ptr_in", 0u32), ("ptr_w1", 8), ("ptr_w2", 16), ("ptr_out", 24)] {
+        b.arg(n, DType::Ptr, o, 8);
+    }
+    b.arg("m", DType::I32, 32, 4);
+    b.arg("g", DType::I32, 36, 4);
+    let mt = Ext::sym("MT");
+    let gs = Ext::sym("G");
+    b.sym_range("MT", 1, 4096);
+    b.sym_range("G", 1, 1024);
+    let m = mt.clone() * Ext::c(128);
+    b.ka_is(32, m.clone());
+    b.ka_is(36, gs.clone());
+    b.grid_is(0, gs);
+    b.arg_tensor("ptr_in", m.clone() * Ext::c(K1));
+    b.arg_tensor("ptr_w1", Ext::c(W_IMG));
+    b.arg_tensor("ptr_w2", Ext::c(W_IMG));
+    b.arg_tensor("ptr_out", m.clone() * Ext::c(if mode == Mode::G1 { N1 } else { 2 * N2 }));
+    let p_in = b.let_(Op::KernargPtr { offset: 0 });
+    let p_w1 = b.let_(Op::KernargPtr { offset: 8 });
+    let p_w2 = b.let_(Op::KernargPtr { offset: 16 });
+    let p_out = b.let_(Op::KernargPtr { offset: 24 });
+    let m_v = b.let_(Op::KernargI32 { offset: 32 });
+    let g_v = b.let_(Op::KernargI32 { offset: 36 });
+    let tid = b.let_(Op::WorkitemId);
+    let lane = Lane::from_tid(b, tid);
+    let bx = b.let_(Op::WorkgroupIdX);
+    let mut lds = LdsPlan::new();
+    let need_w1 = mode != Mode::G2;
+    let need_w2 = mode != Mode::G1;
+    let w1s = need_w1.then(|| lds.tile("W1", W_IMG, TLayout::Linear));
+    let w2s = need_w2.then(|| lds.tile("W2", W_IMG, TLayout::Linear));
+    lds.commit(b);
+    let r_in = { let n = b.bind_i32(ev(m_v) * (K1 as i32)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_in, n) };
+    let r_out = { let n = b.bind_i32(ev(m_v) * (if mode == Mode::G1 { N1 } else { 2 * N2 }) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_out, n) };
+    // ---- prologue: the weight images into LDS (1 KB per DMA, wave w issues blocks w, w + 4, ...) ----
+    let l16 = b.bind_i32(lane.lane() << 4);
+    for (sh, p) in [(w1s.as_ref(), p_w1), (w2s.as_ref(), p_w2)] {
+        let Some(sh) = sh else { continue };
+        let r = b.buffer_desc(p, W_IMG as u32);
+        let pr = sh.at(&SlotIdx::new(0, 0));
+        let base = sh.base as i32;
+        pr.write(b, |b| {
+            for i in 0..(W_IMG / 1024 / 4) as i32 {
+                // block q = 4 i + wave: source / destination byte 1024 q (+ 16 lane)
+                let so = { let v = b.bind_i32((lane.wave() + 4 * i) << 10); b.read_first_lane(v) };
+                let m0 = b.bind_i32(ev(so) + base);
+                b.buffer_load_lds_b128(r, l16, so, m0, 0);
+            }
+        });
+    }
+    b.wait_vm(0);
+    b.barrier();
+    let c127 = b.c_i32(127);
+    let h16 = b.bind_i32(lane.half() << 4);
+    // W fragment of 32-row tile t, k block kb (A operand): rows 32 t + j, bytes 64 kb + 16 h and + 32
+    let wlane = b.bind_i32(ev(lane.j) * (W_PITCH as i32) + ev(h16));
+    let wfrag = |b: &mut FnBuilder, sh: &amdgpu_dsl::tile::Shared, t: i64, kb: i64| -> ValueId {
+        let pr = sh.at(&SlotIdx::new(0, 0));
+        let base = sh.base as i32 + (t * 32 * W_PITCH + 64 * kb) as i32;
+        pr.read(b, |b| {
+            let a0 = b.bind_i32(ev(wlane) + base);
+            let a1 = b.bind_i32(ev(wlane) + base + 32);
+            let lo = b.load_lds_b128(a0);
+            let hi = b.load_lds_b128(a1);
+            b.cat_frag8(lo, hi)
+        })
+    };
+    // row operand (X or H): 4 fragments of 64 k, 16 bytes at 64 kb + 16 h and + 32 of row m
+    let nb = b.bind_i32(ev(m_v).lshr(7));
+    let rowfrags = |b: &mut FnBuilder, blk: ValueId| -> Vec<ValueId> {
+        let ro = b.bind_i32((((ev(blk) << 7) + (lane.wave() << 5) + lane.j()) << 8) + ev(h16));
+        (0..K1 / 64).map(|kb| { let lo = b.buffer_load_b128(r_in, ro, 0i32, (64 * kb) as u32); let hi = b.buffer_load_b128(r_in, ro, 0i32, (64 * kb + 32) as u32); b.cat_frag8(lo, hi) }).collect()
+    };
+    let x0 = rowfrags(b, bx);
+    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(bx))];
+    inits.extend(x0.iter().map(|x| (DType::Frag8, Opnd::Val(*x))));
+    let vars = b.begin_loop(&inits);
+    let blk = b.bind_i32(amdgpu_dsl::tile::varx(vars[0]));
+    let xs: Vec<Opnd> = vars[1..].iter().map(|v| Opnd::Var(*v)).collect();
+    let next = b.bind_i32(ev(blk) + ev(g_v));
+    let row = b.bind_i32((ev(blk) << 7) + (lane.wave() << 5) + lane.j());
+    let p_words: Vec<Opnd> = if mode == Mode::G2 {
+        xs.clone()
+    } else {
+        let w1 = w1s.as_ref().expect("W1");
+        let zero = b.frag_zero(DType::Frag16);
+        let mut acc: Vec<ValueId> = vec![zero; (N1 / 32) as usize];
+        for kb in 0..K1 / 64 {
+            for (t, a) in acc.iter_mut().enumerate() {
+                let wf = wfrag(b, w1, t as i64, kb);
+                *a = b.mfma_scale_fp8(wf, xs[kb as usize], *a, c127, c127);
+            }
+        }
+        let alpha = b.c_f32(ALPHA);
+        let zf = b.c_f32(0.0);
+        let words: Vec<Vec<ValueId>> = acc.iter().map(|a| {
+            (0..4u8).map(|q| {
+                let v: Vec<ValueId> = (0..4u8).map(|i| { let u = b.frag16_lane(*a, 4 * q + i); let f = b.bitcast_f32(u); let s = b.mul_f32(f, alpha); b.max_f32(s, zf) }).collect();
+                b.cvt_pk_fp8x4_f32(v[0], v[1], v[2], v[3])
+            }).collect()
+        }).collect();
+        if mode == Mode::G1 {
+            let h4 = b.bind_i32(lane.half() << 2);
+            let vo = b.bind_i32((ev(row) << 8) + ev(h4));
+            for (t, ws) in words.iter().enumerate() {
+                for (q, w) in ws.iter().enumerate() {
+                    let f = b.bitcast_f32(*w);
+                    b.buffer_store_f32(r_out, vo, 0i32, (32 * t + 8 * q) as u32, f);
+                }
+            }
+            Vec::new()
+        } else {
+            (0..N1 / 64).map(|jb| { let w: Vec<ValueId> = words[2 * jb as usize].iter().chain(words[2 * jb as usize + 1].iter()).copied().collect(); Opnd::Val(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])) }).collect()
+        }
+    };
+    // the next block's row operand (clamped: past the end it reloads this block, unused)
+    let nclamp = b.bind_i32(ev(next).lt(ev(nb)).select_i32(ev(next), ev(blk)));
+    let xn = rowfrags(b, nclamp);
+    if mode != Mode::G1 {
+        let w2 = w2s.as_ref().expect("W2");
+        let zero = b.frag_zero(DType::Frag16);
+        let mut acc2: Vec<ValueId> = vec![zero; (N2 / 32) as usize];
+        for (jb, pf) in p_words.iter().enumerate() {
+            for (u, a) in acc2.iter_mut().enumerate() {
+                let wf = wfrag(b, w2, u as i64, jb as i64);
+                *a = b.mfma_scale_fp8(wf, *pf, *a, c127, c127);
+            }
+        }
+        let h8 = b.bind_i32(lane.half() << 3);
+        let vo = b.bind_i32((ev(row) << 9) + ev(h8));
+        for (u, a) in acc2.iter().enumerate() {
+            for q in 0..4u8 {
+                let x: Vec<ValueId> = (0..4u8).map(|i| { let v = b.frag16_lane(*a, 4 * q + i); b.bitcast_f32(v) }).collect();
+                let w0 = b.cvt_pk_bf16_f32(x[0], x[1]);
+                let w1 = b.cvt_pk_bf16_f32(x[2], x[3]);
+                let f2 = b.frag2(w0, w1);
+                b.buffer_store_b64(r_out, vo, 0i32, (64 * u + 16 * q as usize) as u32, f2);
+            }
+        }
+    }
+    b.set_var(vars[0], next);
+    for (v, x) in vars[1..].iter().zip(xn.iter()) {
+        b.set_var(*v, *x);
+    }
+    let done = b.bind_cond(ev(next).ge(ev(nb)));
+    b.break_if(done);
+    b.end_loop();
     fb.finish()
 }
