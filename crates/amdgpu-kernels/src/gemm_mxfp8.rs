@@ -81,6 +81,8 @@ pub struct GemmConfig {
     pub early_dma: bool,
     /// LDS epilogue in this many row phases (conversion/LDS writes of the next phase overlap the stores of this one); 1 = all at once
     pub epi_phases: usize,
+    /// DMA voffsets lowered through the GF(2) bit-form normal form (amdgpu_layout::BitForm, CSE across plans): ~470 fewer prologue instructions
+    pub bitfield_voffsets: bool,
     pub ablate: Ablate,
 }
 
@@ -89,7 +91,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -97,7 +99,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -199,6 +201,8 @@ struct Dma {
 thread_local! {
     /// `GemmConfig::derive_voffsets` for the DMA plans being built
     static DERIVE_VOFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `GemmConfig::bitfield_voffsets` for the DMA plans being built
+    static BITFIELD_VOFF: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bool) -> Dma {
@@ -209,7 +213,7 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bo
     // `GemmConfig::shared_voffsets` (today a v_add + v_readfirstlane per issue costs more than the VGPRs it saves)
     let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-1024 * (q as i64 % 4))).collect();
     // the DMA voffsets (pure thread-index math) through the bit-field normal form: shift groups, shared across all plans by Ctx::bind
-    ctx.set_bitfield(std::env::var("FMHA_ABLATE").map_or(true, |v| !v.contains("nobitfield")));
+    ctx.set_bitfield(BITFIELD_VOFF.with(|x| x.get()));
     let mut voff: Vec<ValueId> = Vec::new();
     let mut base_of: Vec<usize> = Vec::new(); // issue index whose voffset is shared
     let mut issues: Vec<(ValueId, i32)> = Vec::new();
@@ -965,6 +969,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_et0" => GemmConfig { early_tile0: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_dv" => GemmConfig { derive_voffsets: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_ed" => GemmConfig { early_dma: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_nobf" => GemmConfig { bitfield_voffsets: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_ep2" => GemmConfig { epi_phases: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_ep4" => GemmConfig { epi_phases: 4, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_ep8" => GemmConfig { epi_phases: 8, ..GemmConfig::v4() },
@@ -1019,6 +1024,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     declare_abi(b);
     declare_contract(b, cta_m, cta_n);
     DERIVE_VOFF.with(|x| x.set(cfg.derive_voffsets));
+    BITFIELD_VOFF.with(|x| x.set(cfg.bitfield_voffsets));
     let ptr_a = b.let_(Op::KernargPtr { offset: 0 });
     let ptr_b = b.let_(Op::KernargPtr { offset: 8 });
     let ptr_c = b.let_(Op::KernargPtr { offset: 16 });
