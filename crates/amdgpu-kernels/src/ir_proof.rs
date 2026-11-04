@@ -115,6 +115,8 @@ pub struct Trace {
     pub mfma_a_frag: usize,
     pub mfma_a_unknown: usize,
     pub lds_miss: usize,
+    pub mfma_a_addr_none: usize,
+    pub mfma_a_bytes_empty: usize,
     pub sample_miss: Option<i64>,
     pub sample_hit: Option<i64>,
 }
@@ -298,7 +300,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
         Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, .. } => {
             cx.trace.borrow_mut().mfma_seen += 1;
             let av = cx.opnd(*a); let bv = cx.opnd(*b);
-            match &av { V::Frag { .. } => cx.trace.borrow_mut().mfma_a_frag += 1, V::Unknown => cx.trace.borrow_mut().mfma_a_unknown += 1, _ => {} }
+            match &av { V::Frag { bytes, addr, .. } => { cx.trace.borrow_mut().mfma_a_frag += 1; if addr.is_none() { cx.trace.borrow_mut().mfma_a_addr_none += 1; } if bytes.is_empty() { cx.trace.borrow_mut().mfma_a_bytes_empty += 1; } }, V::Unknown => cx.trace.borrow_mut().mfma_a_unknown += 1, _ => {} }
             let lds_snapshot = cx.lds.borrow();
             let tr = cx.trace.borrow();
             let a_tags = frag_tags_fallback(&av, &tr, &lds_snapshot);
