@@ -533,7 +533,8 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
             let mut src = so + *imm as i64;
             if let Some(v) = voff { if let Some(x) = cx.int(*v) { src += x; } else { return V::Unknown; } }
             let tags: Vec<Tag> = (0..4 * *dwords as i64).map(|b| cx.tag_for(role, src + b)).collect();
-            V::Word { tags, origin: None }
+            if *dwords == 1 { V::Word { tags, origin: None } }
+            else { V::Frag { bytes: tags, origins: vec![None; *dwords as usize], addr: None } }
         }
         _ => { cx.trace.borrow_mut().unknown_ops.insert(format!("{op:?}").split('(').next().unwrap_or("op").to_string()); V::Unknown }
     }
