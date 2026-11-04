@@ -533,8 +533,8 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     }
     let n_o = origins.iter().filter(|x| x.is_some()).count();
     cx.trace.borrow_mut().lds_read_origins += n_o;
-    if cx.trace.borrow_mut().sample_read.is_none() { cx.trace.borrow_mut().sample_read = Some((tile.clone(), *ver, a, n_o)); }
-    if tile == "EPI" && cx.trace.borrow_mut().sample_epi_read.is_none() { cx.trace.borrow_mut().sample_epi_read = Some((tile.clone(), *ver, a, n_o)); }
+    if cx.trace.borrow_mut().sample_read.is_none() { cx.trace.borrow_mut().sample_read = Some((tile.clone(), ver, a, n_o)); }
+    if tile == "EPI" && cx.trace.borrow_mut().sample_epi_read.is_none() { cx.trace.borrow_mut().sample_epi_read = Some((tile.clone(), ver, a, n_o)); }
     V::Frag { bytes, origins, addr: Some(a) }
 }
 fn lds_read_word(cx: &mut Ctx<'_>, addr: Opnd) -> V {
