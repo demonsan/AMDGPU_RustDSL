@@ -5,3 +5,4 @@
 
 pub mod gemm_mxfp8;
 pub mod handoff_probe;
+pub mod mlp_fp8;

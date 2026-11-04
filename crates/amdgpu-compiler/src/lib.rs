@@ -379,6 +379,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "gemm_mxfp8_bs_v1" => Some(amdgpu_dsl::gemm_mxfp8::gemm_mxfp8_bs_v1()),
         n if n.starts_with("gemm_mxfp8_bs_v") && amdgpu_kernels::gemm_mxfp8::by_name(n).is_some() => amdgpu_kernels::gemm_mxfp8::by_name(n),
         n if n.starts_with("handoff_probe_") => amdgpu_kernels::handoff_probe::by_name(n),
+        n if n.starts_with("mlp_fp8_") => amdgpu_kernels::mlp_fp8::by_name(n),
         "fmha_fwd_hd128_mxfp8_dsl_vs128" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_vs128()),
         "fmha_fwd_hd128_mxfp8_dsl_t128" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_t128()),
         "fmha_fwd_hd128_mxfp8_dsl_kvsplit" => Some(amdgpu_dsl::fmha_tile::fmha_fwd_hd128_mxfp8_dsl_kvsplit()),
