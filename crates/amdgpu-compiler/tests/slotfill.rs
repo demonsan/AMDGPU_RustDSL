@@ -3,10 +3,9 @@
 mod common;
 
 use amdgpu_compiler::mir::*;
-use amdgpu_compiler::sched::order::RELAX_DMA_LDS_READ;
+use amdgpu_compiler::sched::order::relax_dma_lds_read;
 use amdgpu_compiler::sched::{slotfill, verify, Options};
 use common::func;
-use std::sync::atomic::Ordering;
 
 // registers: 0..16 = accumulators (V4), 16 = A frag (V8), 17 = B frag (V8), 18 = scale (V1), 19 = lds address (V1), 20.. = ds_read destinations (V4) x 24,
 // 44.. = V1 scratch x 8, 52 = rsrc (S4), 53 = soffset (S1), 54 = m0 source (S1), 55 = voffset (V1)
@@ -163,7 +162,7 @@ fn dma_issues_spread_among_ds_reads_only_under_the_contract() {
     assert!(d.windows(2).all(|w| w[0] < w[1]), "DMAs keep their relative order: {out:?}");
     assert!(*d.last().unwrap() > pos(&out, "M10"), "{out:?}");
     // outside the pass the strict rules are back: a DMA and a ds_read may not swap
-    assert!(!RELAX_DMA_LDS_READ.load(Ordering::Relaxed));
+    assert!(!relax_dma_lds_read());
     let strict = mk(vec![dma(0), ds_read(0)]);
     let i = strict.blocks[0].insts.clone();
     assert!(verify::check_perm(&strict, &i, &[1, 0], &Term::Endpgm, true).is_err());

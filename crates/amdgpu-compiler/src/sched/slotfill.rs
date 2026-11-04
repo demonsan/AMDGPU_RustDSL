@@ -20,15 +20,14 @@
 //! themselves but the wait pass recomputes every `lgkmcnt` / `vmcnt` from the final order.
 //!
 //! LEGALITY CONTRACT (opt-in): inside one barrier interval an LDS-DMA never writes bytes that a `ds_read` of the same interval reads (the 2-slot / ring protocol of
-//! `tile::Pipeline`, proven on the IR by the protocol verifier). `order::RELAX_DMA_LDS_READ` drops the DMA <-> `ds_read` ordering edges for the duration of this pass.
+//! `tile::Pipeline`, proven on the IR by the protocol verifier). `order::set_relax_dma_lds_read` (thread-local) drops the DMA <-> `ds_read` ordering edges for the duration of this pass.
 
 use super::depgraph;
 use super::effects::*;
 use super::model;
-use super::order::RELAX_DMA_LDS_READ;
+use super::order::set_relax_dma_lds_read;
 use super::{verify, Options};
 use crate::mir::*;
-use std::sync::atomic::Ordering;
 
 pub const SLOT_CYCLES: u32 = 32;
 pub const SLOT_BUDGET: u32 = 28;
@@ -267,9 +266,9 @@ fn fill_region(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, log: &mut
 
 /// Apply `slotfill` to every block with enough MFMAs. Returns the number of instructions that changed position.
 pub fn run(m: &mut MFunction, o: &Options) -> Result<usize, String> {
-    RELAX_DMA_LDS_READ.store(true, Ordering::Relaxed);
+    set_relax_dma_lds_read(true);
     let r = run_inner(m, o);
-    RELAX_DMA_LDS_READ.store(false, Ordering::Relaxed);
+    set_relax_dma_lds_read(false);
     r
 }
 

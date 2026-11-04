@@ -50,14 +50,25 @@ fn pin_vm_wait() -> bool {
 /// Must `a` (earlier in program order) stay before `b` because of memory / fence semantics?
 /// `slotfill` legality contract (sched/slotfill.rs): inside a barrier interval an LDS-DMA never writes what a `ds_read` of the same interval reads, so the two may swap.
 /// Set only for the duration of that pass (and its verification).
-pub static RELAX_DMA_LDS_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static RELAX_DMA_LDS_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Thread-local (the compiler runs concurrently in tests and in multi-kernel builds): only the thread inside `slotfill::run` sees the relaxed rules.
+pub fn set_relax_dma_lds_read(on: bool) {
+    RELAX_DMA_LDS_READ.with(|c| c.set(on));
+}
+
+pub fn relax_dma_lds_read() -> bool {
+    RELAX_DMA_LDS_READ.with(|c| c.get())
+}
 
 fn dma_vs_lds_read(f: &Effects, x: &Effects) -> bool {
     f.fence == Fence::Barrier && f.mem.is_some() && x.fence == Fence::None && matches!(&x.mem, Some(m) if m.space == Space::Lds && !m.write)
 }
 
 pub fn mem_must_order(a: &Effects, va: Option<usize>, b: &Effects, vb: Option<usize>, alu_across: bool) -> bool {
-    if RELAX_DMA_LDS_READ.load(std::sync::atomic::Ordering::Relaxed) && (dma_vs_lds_read(a, b) || dma_vs_lds_read(b, a)) {
+    if relax_dma_lds_read() && (dma_vs_lds_read(a, b) || dma_vs_lds_read(b, a)) {
         return false;
     }
     match (a.fence != Fence::None, b.fence != Fence::None) {
