@@ -228,20 +228,21 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bo
             Some(r) if !share => {
                 // prologue-only CSE: the voffset is the base issue's plus the (wave-uniform, scalar) delta - exact for every K
                 let d = g.sub(&adj[r]);
-                let v = b.bind_i32(ev(issues[r].0) + ctx.lower(&d));
+                let dd = ctx.bind(b, &d);
+                let v = b.bind_i32(ev(issues[r].0) + dd);
                 issues.push((v, 1024 * q as i32));
                 delta.push(None);
             }
             Some(r) => {
                 let d = g.sub(&adj[r]);
-                let dv = b.bind_i32(ctx.lower(&d));
+                let dv = { let e = ctx.bind(b, &d); b.bind_i32(e) };
                 let ds = b.read_first_lane(dv);
                 issues.push((issues[r].0, 1024 * q as i32));
                 delta.push(Some(ds));
                 let _ = &voff;
             }
             None => {
-                let v = b.bind_i32(ctx.lower(g));
+                let v = { let e = ctx.bind(b, g); b.bind_i32(e) };
                 voff.push(v);
                 base_of.push(q);
                 issues.push((v, 1024 * q as i32));
@@ -1055,6 +1056,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
 
     // ---- layout symbols ----
     let mut ctx = Ctx::new();
+    // lane / thread index math through the bit-field normal form (shift groups) with CSE across all DMA plans
+    ctx.set_bitfield(std::env::var("FMHA_ABLATE").map_or(true, |v| !v.contains("nobitfield")));
     let s_lane = ctx.sym("lane", 0, 63, lane.lane());
     let s_tid = ctx.sym("tid", 0, 255, ev(tid));
     let s_tr_all = if cfg.wave_roles { ctx.sym("tid_role", 0, 127, ev(tid) & 127) } else { s_tid.clone() };
