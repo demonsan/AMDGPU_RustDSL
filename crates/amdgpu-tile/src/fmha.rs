@@ -284,6 +284,8 @@ pub struct AttnBody3<'a> {
     kd_pending: Option<ValueId>,
     /// `Vs128Cfg::setprio`
     pub setprio: bool,
+    /// `Vs128Cfg::thr512` with the seeded lazy rollback
+    pub seed_first: bool,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -291,7 +293,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -380,7 +382,12 @@ impl PipeBody for AttnBody3<'_> {
         }
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
-        let nb = self.sm.decide(b, &s, &o, mask.as_ref());
+        let nb = if self.seed_first {
+            let first = b.bind_cond(amdgpu_dsl::tile::ox(t.it).eq(0));
+            self.sm.decide_seeded(b, &s, &o, mask.as_ref(), first)
+        } else {
+            self.sm.decide(b, &s, &o, mask.as_ref())
+        };
         self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
         self.p.push(nb);
     }
@@ -456,6 +463,7 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
             if let Some(th) = cfg.thr512 {
                 body.sm.set_thr(b, th as f32 / 512.0);
+                body.seed_first = true;
             }
             body.setprio = cfg.setprio;
             pipe.run(b, role, &mut body);

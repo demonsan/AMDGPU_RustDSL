@@ -84,25 +84,35 @@ impl OnlineSoftmax {
     /// The decision of one tile: row max, the new reference word (an SSA value, also written to the bias variable exactly once), and the rollback branch
     /// rescaling `s`, `o` and the row sum. Returns the new bias word (the C input of the next tile's bias MFMAs).
     pub fn decide(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> ValueId {
-        self.decide_opts(b, s, o, mask, true)
+        self.decide_opts(b, s, o, mask, true, None)
+    }
+    /// `decide` with a lazy threshold and a SEED: on the tile where `seed` (a condition value) holds the reference is always rebased to the
+    /// target (the first tile: the initial reference is arbitrary), afterwards only when the max exceeds the threshold (the vendor's lazy
+    /// rollback when the threshold sits above the target).
+    pub fn decide_seeded(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, seed: ValueId) -> ValueId {
+        self.decide_opts(b, s, o, mask, true, Some(seed))
     }
     /// `decide` without writing the bias variable (`write_bias = false`): the caller writes it later with `commit_bias` (`_t128` writes it at the END of
     /// its window; writing it early lengthens the live range of the old word and made the scheduler fall back, 494 -> 410 TFLOP/s).
     pub fn decide_deferred(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> ValueId {
-        self.decide_opts(b, s, o, mask, false)
+        self.decide_opts(b, s, o, mask, false, None)
     }
     /// Writes the new bias word (once per iteration, after every read of the old one).
     pub fn commit_bias(&self, b: &mut FnBuilder, nb: ValueId) {
         b.set_var(self.bias.expect("OnlineSoftmax: state not bound"), nb);
     }
-    fn decide_opts(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, write_bias: bool) -> ValueId {
+    fn decide_opts(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, write_bias: bool, seed: Option<ValueId>) -> ValueId {
         let bias2 = self.bias.expect("OnlineSoftmax: state not bound");
         let mut flat: Vec<ValueId> = Vec::with_capacity(64);
         for i in 0..4usize {
             flat.extend(masked_values(b, s, i, mask, self.neg_big));
         }
         let mt = row_max(b, &flat);
-        let grow = b.cmp_lt_f32(self.thr, mt);
+        let thr = match seed {
+            Some(sd) => b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(sd), a: Opnd::Val(self.neg_big), b: Opnd::Val(self.thr) }),
+            None => self.thr,
+        };
+        let grow = b.cmp_lt_f32(thr, mt);
         // two-word reference: b_old = 4 (hi + lo); b_new = b_old + (b131 - m); quantised again into two f16 words
         let w_old_u = b.frag2_lane(Opnd::Var(bias2), 0);
         let w_old = b.bitcast_i32(w_old_u);
