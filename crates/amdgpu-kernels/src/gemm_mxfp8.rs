@@ -1169,6 +1169,14 @@ impl PipeBody for Body {
         if prio {
             b.set_prio(1);
         }
+        // E3 proof hook: a test-only predicate can drop one K tile from the real kernel. This is a
+        // real IR branch in the emitted Function (not a replica): GEMM_PROOF_DROP_KB=1 removes the
+        // MMAs of tile generation 1, which is the historical "tile 1 swallowed" regression.
+        let proof_drop = std::env::var("GEMM_PROOF_DROP_KB").ok().and_then(|v| v.parse::<i32>().ok());
+        if proof_drop.is_some() {
+            let it = crate::tile::ev(t.it);
+            b.begin_if(it.neq(proof_drop.unwrap()));
+        }
         for i in 0..nm {
             // prefetch the next A fragment while this one feeds 4 MMAs
             let next = if i + 1 < nm { let v = if let Some(z) = zf { z } else { ar.read(b, i + 1) }; Some(mark(b, v)) } else { None };
@@ -1196,6 +1204,7 @@ impl PipeBody for Body {
                 af = n;
             }
         }
+        if proof_drop.is_some() { b.end_if(); }
         // whatever is left of the stage (when gap x issues exceeds the MMAs)
         if let Some((k, s, done, mut cache)) = deferred.take() {
             self.stage_now(b, &k, &s, done..usize::MAX, &mut cache);
