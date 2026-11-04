@@ -425,9 +425,11 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),
-        "fmha_fwd_hd128_mxfp8_v3x_vs128_epilds" => Some(amdgpu_tile::fmha::fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3x_vs128_epilds", amdgpu_tile::fmha::Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: false })),
-        "fmha_fwd_hd128_mxfp8_v3x_vs128_epiperm" => Some(amdgpu_tile::fmha::fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3x_vs128_epiperm", amdgpu_tile::fmha::Vs128Cfg { epi_lds: false, epi_perm: true, bufdma: false })),
-        "fmha_fwd_hd128_mxfp8_v3x_vs128_bufdma" => Some(amdgpu_tile::fmha::fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3x_vs128_bufdma", amdgpu_tile::fmha::Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true })),
+        "fmha_fwd_hd128_mxfp8_v3x_vs128_epilds" => Some(amdgpu_tile::fmha::fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3x_vs128_epilds", amdgpu_tile::fmha::Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: false, setprio: false })),
+        "fmha_fwd_hd128_mxfp8_v3x_vs128_epiperm" => Some(amdgpu_tile::fmha::fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3x_vs128_epiperm", amdgpu_tile::fmha::Vs128Cfg { epi_lds: false, epi_perm: true, bufdma: false, setprio: false })),
+        "fmha_fwd_hd128_mxfp8_v3x_vs128_prio" => Some(amdgpu_tile::fmha::fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3x_vs128_prio", amdgpu_tile::fmha::Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: false, setprio: true })),
+        "fmha_fwd_hd128_mxfp8_v3x_vs128_bufprio" => Some(amdgpu_tile::fmha::fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3x_vs128_bufprio", amdgpu_tile::fmha::Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true })),
+        "fmha_fwd_hd128_mxfp8_v3x_vs128_bufdma" => Some(amdgpu_tile::fmha::fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3x_vs128_bufdma", amdgpu_tile::fmha::Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: false })),
         "fmha_fwd_hd128_mxfp8_v3x_vs128_base" => Some(amdgpu_tile::fmha::fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3x_vs128_base", amdgpu_tile::fmha::Vs128Cfg::default())),
         // A/B aliases of the shipped set (same code; FMHA_OPT_SCOPE=v3s scopes experiment tokens to them)
         n if n.starts_with("fmha_fwd_hd128_mxfp8_v3s_") => kernel_by_name(&n.replace("_v3s_", "_v3_")).map(|mut f| {

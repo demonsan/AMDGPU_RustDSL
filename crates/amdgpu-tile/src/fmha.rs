@@ -184,6 +184,8 @@ pub struct AttnBody3<'a> {
     pub o: Option<AccTile<C32x32F32, 4>>,
     p: Vec<ValueId>,
     kd_pending: Option<ValueId>,
+    /// `Vs128Cfg::setprio`
+    pub setprio: bool,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -191,7 +193,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -275,6 +277,9 @@ impl PipeBody for AttnBody3<'_> {
         self.s = Some(AccTile::from_vars(s));
     }
     fn v_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+        if self.setprio {
+            b.set_prio(0);
+        }
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
         let nb = self.sm.decide(b, &s, &o, mask.as_ref());
@@ -284,6 +289,9 @@ impl PipeBody for AttnBody3<'_> {
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let mut w = std::mem::take(&mut self.p);
         let bias = w.pop().expect("bias word");
+        if self.setprio {
+            b.set_prio(1);
+        }
         self.pv(b, &t.cur, &w);
         if t.staged {
             let s = self.s.expect("S");
@@ -318,10 +326,12 @@ pub struct Vs128Cfg {
     pub epi_perm: bool,
     /// K / V staging in the MUBUF form (SGPR per-tile soffset, loop-invariant voffsets, out-of-range rows read zeros)
     pub bufdma: bool,
+    /// the vendor's priority ping-pong: `s_setprio 1` at the start of the MFMA phase (PV + next QK), `s_setprio 0` at the softmax phase
+    pub setprio: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: false, setprio: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -342,6 +352,7 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
+            body.setprio = cfg.setprio;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             if cfg.epi_perm {
