@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use amdgpu_dsl::{Ext, Function, Op, Opnd, Stmt, ValueId, VarId};
-use amdgpu_sym::{Ctx, Itv, Poly, Sym, Q};
+use amdgpu_sym::{cap, Ctx, Itv, Poly, Sym, Q};
 
 use crate::mir::{is_agpr_phys, MFunction, MOp, RClass, Src, AGPR_TAG};
 use crate::regalloc::Alloc;
