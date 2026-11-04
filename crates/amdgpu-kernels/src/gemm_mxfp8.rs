@@ -1032,6 +1032,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_bdw" => GemmConfig { b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_vo" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 2, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_vo3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 3, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_g2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_mid3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_p4m6" => GemmConfig { pre_sync_mmas: 4, mid_sync_mmas: 6, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_p2m6" => GemmConfig { pre_sync_mmas: 2, mid_sync_mmas: 6, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
