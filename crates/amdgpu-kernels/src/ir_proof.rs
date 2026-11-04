@@ -102,6 +102,9 @@ pub struct Trace {
     pub executed_insts: usize,
     pub mfma_seen: usize,
     pub mfma_no_tags: usize,
+    pub dma_writes: usize,
+    pub lds_entries: usize,
+    pub tag_entries: usize,
 }
 
 struct Ctx<'a> {
@@ -227,6 +230,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                 let tag = cx.tag_for(role, src + b);
                 if let Some((tile, ver)) = &cx.cur_tile {
                     cx.lds.insert((tile.clone(), *ver, dst + b), (tag.clone(), None));
+                    cx.trace.dma_writes += 1;
                     if tag != Tag::U { cx.trace.tag_by_addr.insert(dst + b, tag); }
                 }
             }
@@ -507,6 +511,8 @@ pub fn prove_ir(f: &Function, cfg: &GemmConfig, m: i64, n: i64, k: i64) -> Resul
     // pass 1: all lanes write global tags into LDS, under the tile-protocol (tile, generation) keys
     for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, true, &mut lds, &mut trace); }
     trace.pass1_origin_left = lds.values().filter(|(_, o)| o.is_some()).count();
+    trace.lds_entries = lds.len();
+    trace.tag_entries = trace.tag_by_addr.len();
     trace.pass1_lds_store_origins = trace.lds_store_origins;
     // pass 2: reads, MFMA contributions and epilogue stores (DMA is not re-run)
     for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, false, &mut lds, &mut trace); }
