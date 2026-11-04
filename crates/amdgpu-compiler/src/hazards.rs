@@ -396,7 +396,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 }
                 for (k, &s) in ss.iter().enumerate() {
                     let dist = first_touch(s, 0, hops, remaining, *reg, *from_mfma, &snap, &succs, &canon);
-                    if std::env::var("AMDC_HAZ_DEBUG").is_ok() && remaining > dist {
+                    if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("hazdebug")) && remaining > dist {
                         eprintln!("blockend pad: block {bi} reg {reg} remaining {remaining} succ {s} dist {dist}");
                     }
                     if dist != usize::MAX {
