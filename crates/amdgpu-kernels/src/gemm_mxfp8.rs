@@ -115,7 +115,10 @@ impl GemmConfig {
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
     pub fn v4() -> GemmConfig {
-        GemmConfig { acc_agpr: 24, reg_staged: true, pre_sync_mmas: 4, sched: "rewait,hoistchain", unroll2: true, ..GemmConfig::v3() }
+        GemmConfig {
+            acc_agpr: 24, reg_staged: true, pre_sync_mmas: 5, mid_sync_mmas: 3, spread_reloads: true, b_scale_dword: true, sched: "rewait,hoistchain", unroll2: true,
+            ..GemmConfig::v3()
+        }
     }
 }
 
