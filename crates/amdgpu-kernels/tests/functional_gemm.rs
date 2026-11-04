@@ -68,7 +68,7 @@ fn check_global_layouts(cfg: &GemmConfig, k: i64) -> Result<(), ProofError> {
     let mut b_seen = HashSet::new();
     for n in 0..cfg.cta_n {
         for kk in 0..k {
-            let off = b_glob.crd2idx(&tup![n, kk % 128], &dyns).eval(&|_| k) + (kk / 128) * 256;
+            let off = b_glob.crd2idx(&tup![n, kk % 128], &dyns).eval(&|_| k) + (kk / 128) * 2048;
             let want = (n / 16) * 16 * k + (kk / 16) * 256 + (n % 16) * 16 + kk % 16;
             if off != want { return Err(ProofError(format!("B preshuffle mismatch at ({n},{kk}): {off} != {want}"))); }
             if !b_seen.insert(off) { return Err(ProofError(format!("B preshuffle duplicate at ({n},{kk})"))); }
