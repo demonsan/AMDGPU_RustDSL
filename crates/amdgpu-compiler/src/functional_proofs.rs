@@ -128,8 +128,10 @@ pub fn softmax_invariant_proof() -> Result<(), String> {
     let rhs_o = add(mul(var("S_o"), exp(m.clone())), mul(exp(x.clone()), v));
     let lhs_d = mul(add(mul(d, rescale.clone()), exp(sub(x.clone(), mp.clone()))), exp(mp.clone()));
     let rhs_d = add(mul(var("D"), exp(m.clone())), exp(x.clone()));
-    if norm(lhs_o) != norm(rhs_o) { return Err(format!("online-softmax numerator invariant failed: {} != {}", norm(lhs_o), norm(rhs_o))); }
-    if norm(lhs_d) != norm(rhs_d) { return Err("online-softmax denominator invariant failed".into()); }
+    let (l_o, r_o) = (norm(lhs_o.clone()), norm(rhs_o.clone()));
+    if l_o != r_o { return Err(format!("online-softmax numerator invariant failed: {l_o} != {r_o}")); }
+    let (l_d, r_d) = (norm(lhs_d.clone()), norm(rhs_d.clone()));
+    if l_d != r_d { return Err(format!("online-softmax denominator invariant failed: {l_d} != {r_d}")); }
     // rebase/rollback: changing the frame from a to b and back is the identity
     let a = exp(sub(var("a"), var("b")));
     let b = exp(sub(var("b"), var("a")));

@@ -93,7 +93,9 @@ fn prove_one(cfg: &GemmConfig, m_size: i64, n_size: i64, k_size: i64, drop: Opti
     let tab = proofs::tv_table(&c_tv);
     let kt = tile_count(k_size);
     let order = compute_order(k_size, drop);
-    if order.len() as i64 != kt { return Err(ProofError(format!("K schedule computes {} of {} tiles", order.len(), kt))); }
+    // the schedule must still be a subset of the K tiles; a dropped tile is reported below as a
+    // concrete missing (m,n,k), not as a schedule-length error.
+    if order.len() > kt as usize { return Err(ProofError(format!("K schedule computes {} tiles > {kt}", order.len()))); }
 
     // Slot/generation model: a 2-slot ring (v3 TwoSlot, v4 RegStaged). A generation is the tile
     // counter; stage(t+2) reuses the slot of t only after compute(t) is issued. The schedule above
@@ -130,8 +132,10 @@ fn prove_one(cfg: &GemmConfig, m_size: i64, n_size: i64, k_size: i64, drop: Opti
                     }
                 }
                 // A/B scale row ownership (the panel transposition is proved by verify_sfa_transpose)
-                for r in 0..16 { scale_a.insert((m_atom + r, (m_atom + r) / 128)); }
-                for c in 0..16 { scale_b.insert((n_atom + c, (n_atom + c) / 128)); }
+                for &kb in &order {
+                    for r in 0..16 { scale_a.insert((m_atom + r, kb)); }
+                    for c in 0..16 { scale_b.insert(((n_atom + c) / 128, kb)); }
+                }
             }
         }
     }
@@ -147,7 +151,7 @@ fn prove_one(cfg: &GemmConfig, m_size: i64, n_size: i64, k_size: i64, drop: Opti
         }
     }
     // A-scale row set is the full CTA rows per K block; B-scale rows are the 2 blocks (cta_n=256).
-    if scale_a.len() != (m_size * kt) as usize || scale_b.len() != (n_size / 128 * kt) as usize {
+    if scale_a.len() != (m_size * order.len() as i64) as usize || scale_b.len() != (n_size / 128 * order.len() as i64) as usize {
         return Err(ProofError("scale panel row coverage mismatch".into()));
     }
     Ok(items.len())
