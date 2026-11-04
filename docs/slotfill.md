@@ -40,6 +40,19 @@ Without the knobs the kernel loses 13-14 %; slotfill brings it back and ends 0.4
 
 So slotfill is correct on FMHA v3 but does not help it (those kernels' placement is not MFMA-slot-limited the way the GEMM's is).
 
+## v4 default (this branch)
+
+`GemmConfig::v4()` = the hand-knob-free form (`defer_dma: false`, `spread_reloads: false`, sched "rewait,slotfill"); the previous default is `GemmConfig::v4_hand()` / `gemm_mxfp8_bs_v4_hand`. Every other `gemm_mxfp8_bs_*` variant is defined relative to `v4_hand()` and its asm is byte-identical to before (checked against a Main 1c3c9cf build: v3, v4_gap2, v4_pre0, v4_ed, v4_roles, v3_nodma identical; `v4_hand` = old v4 up to the kernel-name lines).
+
+- Alternating A/B, 9 rounds, GPU 4, GEMM_OK 9/9 each: new v4 **3022.8** vs v4_hand **2999.3** TF/s (+0.8 %).
+- `tools/gemm_gate.sh gemm_mxfp8_bs_v4`: GPU 4 PASS, ours 3290.6 vs vendor 3299.5 = 0.997 (verify strict 0 errors / 0 warnings / 0 unproven, 3 shapes GEMM_OK, DET md5 identical); GPU 5 PASS, ours 3215.5 vs vendor 3245.5 = 0.991.
+- Full `cargo test`: 326 passed, 0 failed.
+
+## Register-pressure model and DMA window
+
+- Pressure: `peak_live` counts live vector dwords (VGPR + AGPR tuples at full width, same rules as `hoist.rs`) of the authored and the new order of a region (region live-out from block liveness). The new order may raise the authored peak by at most `PRESSURE_SLACK` = 8 dwords; when it would, the hoist cap is halved (40, 20, 10, 5, 2, 1, 0 slots) and the region re-planned; if even cap 0 exceeds the budget the region is left alone. On GEMM v4: authored 182 -> 182 dwords (budget 190) at the full 40-slot cap, so the model does not bind there (it is a safety net for other kernels). `AMDC_SF_PRESSURE_SLACK` overrides.
+- DMA window: `DMA_LATENCY_CYCLES / SLOT_CYCLES` slots before the region end. Swept `AMDC_SF_DMA_SLOTS` on v4 (alternating, GEMM_OK all): 8:3020, 16:3022, 24:2997 (7 rounds); 12:3026, 16:3020, 20:3011, 24:3013, hand 3002 (9 rounds); 32:2969. Flat for 12..24, worse at 32; the constant is 512 cycles = 16 slots. It is a swept constant, not derived from a measured DMA latency (the model's DMA latency of 240 cycles is too small and the real one varies with load).
+
 ## Limits / next
 
-Spreading is per class and budget-driven, not hazard-aware beyond the graph (the hazard pass inserts nops afterwards); no occupancy / register-pressure model beyond `HOIST_SLOTS`; DMA latency window `DMA_SLOTS` is a constant. Not enabled by default: set `sched: "rewait,slotfill"` on a GemmConfig to use it (v4_plain_sf is the gated example).
+Spreading is per class and budget-driven, not hazard-aware beyond the graph (the hazard pass inserts nops afterwards); no occupancy / register-pressure model beyond `HOIST_SLOTS`; DMA latency window `DMA_SLOTS` is a constant. Enabled for `gemm_mxfp8_bs_v4` only (FMHA stays off: neutral). Other kernels: `sched: "rewait,slotfill"` or `AMDC_SLOTFILL`.
