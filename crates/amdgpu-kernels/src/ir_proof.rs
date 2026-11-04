@@ -471,10 +471,22 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
         WorkgroupIdX | WorkgroupIdY | WorkgroupIdZ => V::Int(0),
         AddI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.wrapping_add(y)), _ => V::Unknown },
         MulI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.wrapping_mul(y)), _ => V::Unknown },
-        ShlI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.wrapping_shl(y as u32)), _ => V::Unknown },
-        LshrI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(((x as u32) >> (y as u32)) as i64), _ => V::Unknown },
-        AndI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x & y), _ => V::Unknown },
-        XorI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x ^ y), _ => V::Unknown },
+        ShlI32(a, b) => {
+            if let V::Word { tags, origin } = cx.opnd(*a) { return V::Word { tags, origin }; }
+            match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.wrapping_shl(y as u32)), _ => V::Unknown }
+        }
+        LshrI32(a, b) => {
+            if let V::Word { tags, origin } = cx.opnd(*a) { return V::Word { tags, origin }; }
+            match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(((x as u32) >> (y as u32)) as i64), _ => V::Unknown }
+        }
+        AndI32(a, b) => {
+            if let V::Word { tags, origin } = cx.opnd(*a) { return V::Word { tags, origin }; }
+            match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x & y), _ => V::Unknown }
+        }
+        XorI32(a, b) => {
+            if let V::Word { tags, origin } = cx.opnd(*a) { return V::Word { tags, origin }; }
+            match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x ^ y), _ => V::Unknown }
+        }
         MinI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int(x.min(y)), _ => V::Unknown },
         CmpLtI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int((x < y) as i64), _ => V::Unknown },
         CmpGeI32(a, b) => match (i(cx, *a), i(cx, *b)) { (Some(x), Some(y)) => V::Int((x >= y) as i64), _ => V::Unknown },
