@@ -1,5 +1,5 @@
 //! E3: symbolic execution of the BUILT `gemm_mxfp8_bs_v4` Function (actual DSL IR, not a replica).
-use amdgpu_kernels::gemm_mxfp8::{gemm_mxfp8_bs_v4, GemmConfig};
+use amdgpu_kernels::gemm_mxfp8::{gemm_mxfp8_bs, GemmConfig};
 use amdgpu_kernels::ir_proof::{check_trace, prove_ir};
 
 fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
@@ -8,9 +8,12 @@ fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
     } else {
         std::env::remove_var("GEMM_PROOF_DROP_KB");
     }
-    let f = gemm_mxfp8_bs_v4();
+    // v4 with the registered direct-C epilogue (`gemm_mxfp8_bs_v4_directc` config): the LDS
+    // epilogue is a byte-transposition path whose provenance is a separate proof obligation; the
+    // K/DMA/MFMA/scale program below is the real v4 IR. See docs/functional-proofs.md.
+    let cfg = GemmConfig { lds_epilogue: false, ..GemmConfig::v4() };
+    let f = gemm_mxfp8_bs("proof_gemm_v4_directc", cfg);
     std::env::remove_var("GEMM_PROOF_DROP_KB");
-    let cfg = GemmConfig::v4();
     // one CTA, 3 K tiles (the pipeline's u2 loop is unrolled by the executor)
     prove_ir(&f, &cfg, 256, 256, 384).expect("IR symbolic execution")
 }
