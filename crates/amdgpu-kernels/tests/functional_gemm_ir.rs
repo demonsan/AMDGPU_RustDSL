@@ -19,7 +19,6 @@ fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
 }
 
 #[test]
-#[ignore = "E3 prototype: actual-IR execution reaches MFMAs/stores; LDS operand provenance map still incomplete"]
 fn actual_v4_ir_proves_every_output_k_block_and_store() {
     let t = run(None);
     println!("E3 trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?} bstores={} no_origin={} lds_so={} lds_ro={} store={:?} store_orig={} left={} p1left={} p1so={} p2so={} read={:?} epi_read={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops, t.buffer_stores, t.buffer_store_no_origin, t.lds_store_origins, t.lds_read_origins, t.sample_store, t.sample_store_origin, t.lds_origins_left, t.pass1_origin_left, t.pass1_lds_store_origins, t.pass2_lds_store_origins, t.sample_read, t.sample_epi_read);
@@ -32,7 +31,6 @@ fn actual_v4_ir_proves_every_output_k_block_and_store() {
 }
 
 #[test]
-#[ignore = "E3 prototype: see actual_v4_ir_proves..."]
 fn actual_kernel_tile1_bug_has_a_concrete_counterexample() {
     let t = run(Some(1));
     println!("E3 bug trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?} bstores={} no_origin={} lds_so={} lds_ro={} store={:?} store_orig={} left={} p1left={} p1so={} p2so={} read={:?} epi_read={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops, t.buffer_stores, t.buffer_store_no_origin, t.lds_store_origins, t.lds_read_origins, t.sample_store, t.sample_store_origin, t.lds_origins_left, t.pass1_origin_left, t.pass1_lds_store_origins, t.pass2_lds_store_origins, t.sample_read, t.sample_epi_read);
