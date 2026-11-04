@@ -103,8 +103,10 @@ fn build(name: &str, mode: Mode) -> Function {
     let row = b.bind_i32((ev(bx) << 7) + (lane.wave() << 5) + lane.j());
     let h16 = b.bind_i32(lane.half() << 4);
     let c127 = b.c_i32(127);
+    // the 32-row weight tile offsets (8 KB apart) as SGPRs
+    let tile_so: Vec<Opnd> = (0..8i32).map(|t| if t == 0 { Opnd::I32(0) } else { let v = b.c_i32(t * 8192); Opnd::Val(b.read_first_lane(v)) }).collect();
     // operand fragment: 16 bytes at `base + imm` and `+ 32` (the atom's k halves 16 h + 0..15 and 32 + 16 h + 0..15)
-    let frag = |b: &mut FnBuilder, r: ValueId, voff: ValueId, soff: i32, imm: u32| -> ValueId {
+    let frag = |b: &mut FnBuilder, r: ValueId, voff: ValueId, soff: Opnd, imm: u32| -> ValueId {
         let lo = b.buffer_load_b128(r, voff, soff, imm);
         let hi = b.buffer_load_b128(r, voff, soff, imm + 32);
         b.cat_frag8(lo, hi)
@@ -114,16 +116,16 @@ fn build(name: &str, mode: Mode) -> Function {
     let p_words: Vec<Vec<ValueId>> = if mode == Mode::G2 {
         // GEMM 2 operand from H (natural n1 order): 4 blocks of 64
         let ho = b.bind_i32((ev(row) << 8) + ev(h16));
-        (0..N1 / 64).map(|jb| vec![frag(b, r_in, ho, 0, (64 * jb) as u32)]).collect()
+        (0..N1 / 64).map(|jb| vec![frag(b, r_in, ho, Opnd::I32(0), (64 * jb) as u32)]).collect()
     } else {
         // ---- GEMM 1: H^T tiles t (32 n1 x 32 m), A = W1 rows, B = X rows ----
         let xo = b.bind_i32((ev(row) << 8) + ev(h16));
         let zero = b.frag_zero(DType::Frag16);
         let mut acc: Vec<ValueId> = vec![zero; (N1 / 32) as usize];
         for kb in 0..K1 / 64 {
-            let xf = frag(b, r_in, xo, 0, (64 * kb) as u32);
+            let xf = frag(b, r_in, xo, Opnd::I32(0), (64 * kb) as u32);
             for (t, a) in acc.iter_mut().enumerate() {
-                let wf = frag(b, r_w1, wrow, (t as i32) * 32 * 256, (64 * kb) as u32);
+                let wf = frag(b, r_w1, wrow, tile_so[t], (64 * kb) as u32);
                 *a = b.mfma_scale_fp8(wf, xf, *a, c127, c127);
             }
         }
@@ -156,7 +158,7 @@ fn build(name: &str, mode: Mode) -> Function {
     let mut acc2: Vec<ValueId> = vec![zero; (N2 / 32) as usize];
     for (jb, pf) in p_words.iter().enumerate() {
         for (u, a) in acc2.iter_mut().enumerate() {
-            let wf = frag(b, r_w2, wrow, (u as i32) * 32 * 256, (64 * jb) as u32);
+            let wf = frag(b, r_w2, wrow, tile_so[u], (64 * jb) as u32);
             *a = b.mfma_scale_fp8(wf, pf[0], *a, c127, c127);
         }
     }
