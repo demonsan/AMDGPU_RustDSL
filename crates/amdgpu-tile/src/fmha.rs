@@ -456,10 +456,12 @@ pub struct Vs128Cfg {
     pub thr512: Option<u32>,
     /// the rebase of the current scores folded into the fp8 conversion scale (no `S += delta` on the rollback path)
     pub scaleconv: bool,
+    /// fast path: exact aligned rebase above this scaled max (1/512 units; default 0.45 x 512)
+    pub hi512: Option<u32>,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -482,6 +484,9 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
             // the fast reference only in the long-sequence copy (the short copy keeps the LUT-corrected exact recipe)
             body.scaleconv = cfg.scaleconv && !lut;
+            if let Some(h) = cfg.hi512 {
+                body.sm.set_hi_thr(h as f32 / 512.0);
+            }
             if let Some(th) = cfg.thr512 {
                 body.sm.set_thr(b, th as f32 / 512.0);
                 body.seed_first = true;

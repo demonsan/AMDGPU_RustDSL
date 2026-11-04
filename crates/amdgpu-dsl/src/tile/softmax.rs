@@ -20,10 +20,13 @@ pub struct Recipe {
     pub b131: f32,
     /// LUT correction of the fp8 conversion (short sequences)
     pub lut: bool,
+    /// fast reference path (`decide_scaled`): above this scaled max the rebase is exact (S += delta, aligned max); below it whole 1/512 units
+    /// through the conversion scale
+    pub hi_thr: f32,
 }
 impl Recipe {
     pub fn vsx(lut: bool) -> Recipe {
-        Recipe { thr: 120.0 / 512.0, b131: 131.0 / 512.0, lut }
+        Recipe { thr: 120.0 / 512.0, b131: 131.0 / 512.0, lut, hi_thr: 0.45 }
     }
 }
 
@@ -62,6 +65,10 @@ impl OnlineSoftmax {
         let bias_init = b.frag2(wi, wi);
         let zero4 = b.frag_zero(DType::Frag4);
         OnlineSoftmax { recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, one_f, zero4, bias: None, la: None }
+    }
+    /// Sets the exact-rebase threshold of the fast reference path.
+    pub fn set_hi_thr(&mut self, t: f32) {
+        self.recipe.hi_thr = t;
     }
     /// Overrides the rollback threshold (scaled max units).
     pub fn set_thr(&mut self, b: &mut FnBuilder, thr: f32) {
@@ -156,13 +163,17 @@ impl OnlineSoftmax {
         let tt0 = b.sub_f32(self.b131, mt);
         // scaled conversion: the shift is a whole number of 1/512 units (round to nearest via the 1.5 x 2^23 magic), so the factor 2^(512 delta) is
         // an exact power of two - what the conversion's E8M0-style scale applies - and stays equal to the O / l rescale
+        // the exact (aligned) rebase when the max rises past `hi_thr` (rare after the first tile): S += delta, scale 1
+        let hi_thr = b.c_f32(self.recipe.hi_thr);
+        let big = b.cmp_lt_f32(hi_thr, mt);
         let tt = if scaled.is_some() {
             let t512 = b.mul_f32(tt0, self.c512);
             let magic = b.c_f32(12_582_912.0);
             let up = b.add_f32(t512, magic);
             let rn = b.sub_f32(up, magic);
             let inv512 = b.c_f32(1.0 / 512.0);
-            b.mul_f32(rn, inv512)
+            let tr = b.mul_f32(rn, inv512);
+            b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(big), a: Opnd::Val(tt0), b: Opnd::Val(tr) })
         } else {
             tt0
         };
@@ -188,8 +199,6 @@ impl OnlineSoftmax {
             // the factor of this tile (1 when the lane does not roll back: delta = 0)
             let ex = b.mul_f32(delta, self.c512);
             let corr = b.exp2_f32(ex);
-            let big_t = b.c_f32(0.45);
-            let big = b.cmp_lt_f32(big_t, mt);
             // the v_cvt_scalef32 operand DIVIDES (x / scale): the factor 2^(512 delta) is the scale 2^(-512 delta)
             let nex = b.sub_f32(self.zero_f, ex);
             let inv = b.exp2_f32(nex);
