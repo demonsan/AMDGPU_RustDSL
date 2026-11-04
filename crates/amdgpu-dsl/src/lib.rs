@@ -560,9 +560,37 @@ pub struct Contract {
     pub sym_ranges: Vec<(String, i64, i64)>,
 }
 
+/// One value set crossing a stage boundary (`StageContract`): the IR values (fragment registers), the element table they hold (`[t + threads v]`
+/// -> tensor element, after any K permutation: a layout fingerprint computed by the tile layer) and storage facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageVal {
+    pub name: String,
+    pub values: Vec<ValueId>,
+    pub table: Vec<i64>,
+    pub elem_bits: u32,
+    pub storage: String,
+}
+
+/// The resource contract of a pipeline STAGE (fusion hand-off, docs/fusion-layout-handoff.md §3): what it consumes from earlier stages and
+/// hands to later ones, the LDS tiles it frees / reuses, the barrier phase at its entry (barriers before it in program order) and the wave
+/// roles. Checked by `gpu_verify` at the region edge (GV-STAGE); emits no code and is not a scheduling barrier.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct StageContract {
+    pub live_in: Vec<StageVal>,
+    pub live_out: Vec<StageVal>,
+    pub lds_freed: Vec<String>,
+    pub lds_reused: Vec<String>,
+    pub barrier_phase: u32,
+    pub roles: Vec<String>,
+}
+
 /// Statements: a flat sequence with explicit structured markers.
 #[derive(Clone, Debug)]
 pub enum Stmt {
+    /// Opens a pipeline stage (`Node::Stage`) with its resource contract. Emits no code.
+    StageBegin { name: String, contract: Box<StageContract> },
+    /// Closes the innermost stage.
+    StageEnd,
     /// LDS tile protocol marker (v1.1): from here until the next tile marker / `TileEnd`, the LDS writes and DMA issued by this wave are version `version` of slot
     /// `slot` of tile `tile`. Emits no code.
     TileProduce { tile: String, slot: Opnd, version: Opnd },
@@ -700,6 +728,8 @@ pub enum Node {
     If { cond: Opnd, then: Vec<Node>, els: Option<Vec<Node>> },
     /// tile / buffer protocol region: `tile_produce` / `tile_consume` (and `buf_produce` / `buf_consume`) ... `tile_end`
     Region { kind: RegionKind, tile: String, slot: Opnd, version: Opnd, body: Vec<Node> },
+    /// a pipeline stage with its boundary contract (`stage_begin` ... `stage_end`): checked at the edge, transparent to lowering / scheduling
+    Stage { name: String, contract: Box<StageContract>, body: Vec<Node> },
 }
 
 /// Kind of a protocol region.
@@ -735,6 +765,11 @@ fn flatten_into(nodes: &[Node], out: &mut Vec<Stmt>) {
                 flatten_into(body, out);
                 out.push(Stmt::TileEnd);
             }
+            Node::Stage { name, contract, body } => {
+                out.push(Stmt::StageBegin { name: name.clone(), contract: contract.clone() });
+                flatten_into(body, out);
+                out.push(Stmt::StageEnd);
+            }
         }
     }
 }
@@ -745,6 +780,7 @@ enum Frame {
     Loop { vars: Vec<VarId>, init: Vec<Opnd>, body: Vec<Node> },
     If { cond: Opnd, then: Vec<Node>, els: Option<Vec<Node>> },
     Region { kind: RegionKind, tile: String, slot: Opnd, version: Opnd, body: Vec<Node> },
+    Stage { name: String, contract: Box<StageContract>, body: Vec<Node> },
 }
 
 impl Frame {
@@ -753,11 +789,12 @@ impl Frame {
             Frame::Loop { .. } => "loop",
             Frame::If { .. } => "if",
             Frame::Region { .. } => "tile region",
+            Frame::Stage { .. } => "stage",
         }
     }
     fn nodes(&mut self) -> &mut Vec<Node> {
         match self {
-            Frame::Loop { body, .. } | Frame::Region { body, .. } => body,
+            Frame::Loop { body, .. } | Frame::Region { body, .. } | Frame::Stage { body, .. } => body,
             Frame::If { then, els, .. } => els.as_mut().unwrap_or(then),
         }
     }
@@ -766,6 +803,7 @@ impl Frame {
             Frame::Loop { vars, init, body } => Node::Loop { vars, init, body },
             Frame::If { cond, then, els } => Node::If { cond, then, els },
             Frame::Region { kind, tile, slot, version, body } => Node::Region { kind, tile, slot, version, body },
+            Frame::Stage { name, contract, body } => Node::Stage { name, contract, body },
         }
     }
 }
@@ -812,6 +850,13 @@ impl TreeBuilder {
             Stmt::EndLoop => self.close(|f| matches!(f, Frame::Loop { .. }), "end_loop")?,
             Stmt::EndIf => self.close(|f| matches!(f, Frame::If { .. }), "end_if")?,
             Stmt::TileEnd => self.close(|f| matches!(f, Frame::Region { .. }), "tile_end")?,
+            Stmt::StageBegin { name, contract } => {
+                if self.open.iter().any(|f| matches!(f, Frame::Region { .. })) {
+                    return Err(format!("stage {name} inside an open tile region (close it with tile_end first)"));
+                }
+                self.open.push(Frame::Stage { name, contract, body: Vec::new() })
+            }
+            Stmt::StageEnd => self.close(|f| matches!(f, Frame::Stage { .. }), "stage_end")?,
             other => self.cur().push(Node::S(other)),
         }
         Ok(())
@@ -996,6 +1041,12 @@ impl Function {
                 }
                 Stmt::TileEnd => {
                     let _ = writeln!(s, "{pad}tile_end");
+                }
+                Stmt::StageBegin { name, contract } => {
+                    let _ = writeln!(s, "{pad}stage {name} in={:?} out={:?}", contract.live_in.iter().map(|x| &x.name).collect::<Vec<_>>(), contract.live_out.iter().map(|x| &x.name).collect::<Vec<_>>());
+                }
+                Stmt::StageEnd => {
+                    let _ = writeln!(s, "{pad}stage_end");
                 }
                 Stmt::Barrier => {
                     let _ = writeln!(s, "{pad}barrier");
@@ -1236,6 +1287,20 @@ impl FnBuilder {
     }
     pub fn tile_end(&mut self) {
         self.push_stmt(Stmt::TileEnd);
+    }
+    /// Opens a pipeline stage with its boundary contract (see `Stmt::StageBegin`).
+    pub fn stage_begin(&mut self, name: &str, contract: StageContract) {
+        self.push_stmt(Stmt::StageBegin { name: name.to_string(), contract: Box::new(contract) });
+    }
+    pub fn stage_end(&mut self) {
+        self.push_stmt(Stmt::StageEnd);
+    }
+    /// Closure form of `stage_begin` / `stage_end`.
+    pub fn stage<R>(&mut self, name: &str, contract: StageContract, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.stage_begin(name, contract);
+        let r = f(self);
+        self.stage_end();
+        r
     }
     /// Contract fact `lo <= target <= hi` from this point on (see `Stmt::Assume`). Emits no code.
     pub fn assume(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext) {
@@ -2601,7 +2666,14 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Err(e) => errs.push(here(e)),
                 }
             }
-            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } => {}
+            Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd => {}
+            Stmt::StageBegin { name, contract } => {
+                for v in contract.live_in.iter().chain(contract.live_out.iter()).flat_map(|x| x.values.iter()) {
+                    if v.0 as usize >= f.values.len() {
+                        errs.push(here(format!("stage {name}: contract value v{} is not defined", v.0)));
+                    }
+                }
+            }
             Stmt::Assume { target, .. } => {
                 if let Err(e) = expect_int(f, *target, "assume target") {
                     errs.push(here(e));

@@ -1487,6 +1487,8 @@ impl Lowerer {
                     self.walk(f, body)?;
                     self.lower_stmt(f, &Stmt::TileEnd)?;
                 }
+                // a stage is transparent to lowering (its contract is checked by gpu_verify)
+                Node::Stage { body, .. } => self.walk(f, body)?,
             }
         }
         Ok(())
@@ -1901,7 +1903,7 @@ impl Lowerer {
                 Stmt::WaitLds { count } => {
                     self.push(MInst::new(MOp::SWaitLgkm).imm(*count as i64));
                 }
-                Stmt::Assume { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd => {} // contract markers for gpu_verify: no code
+                Stmt::Assume { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd | Stmt::StageBegin { .. } | Stmt::StageEnd => {} // contract markers for gpu_verify: no code
                 Stmt::Barrier => {
                     self.push(MInst::new(MOp::SBarrier));
                 }
