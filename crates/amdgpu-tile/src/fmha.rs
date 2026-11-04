@@ -196,7 +196,10 @@ impl KvRing3 {
         };
         let pad_dma = if pad {
             let wvb = b.bind_i32(wv.clone());
-            Some((PadDma::new(b, &ks, &kt.row_source(b, 1), wvb), PadDma::new(b, &vs, &vt.row_source(b, 1), wvb)))
+            let (kr, vr) = (kt.row_source(b, 1), vt.row_source(b, 1));
+            let kp = PadDma::new(b, &ks, &kr, wvb);
+            let vp = PadDma::new(b, &vs, &vr, wvb);
+            Some((kp, vp))
         } else {
             None
         };
