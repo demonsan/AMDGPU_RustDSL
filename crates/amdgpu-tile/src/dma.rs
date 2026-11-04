@@ -107,7 +107,8 @@ impl DmaPart {
     pub fn buffer_form(&self, b: &mut FnBuilder) -> BufForm {
         assert!(self.atom.bytes == 16, "DmaPart::buffer_form: 16-byte DMA only");
         let n = self.row_c.len();
-        let base = b.ptr_add(self.src.ptr, b_bind(b, &self.src.base));
+        let bo = b_bind(b, &self.src.base);
+        let base = b.ptr_add(self.src.ptr, bo);
         let nrec = match &self.src.clamp {
             Some(c) => b.bind_i32((c.limit.clone() - 1) * &self.src.stride + 128),
             None => b.c_i32(0x7fff_ffff),
