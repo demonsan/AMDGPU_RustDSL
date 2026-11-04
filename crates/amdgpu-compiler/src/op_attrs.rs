@@ -266,7 +266,7 @@ pub fn attrs(op: MOp) -> OpAttrs {
 }
 
 const fn attrs_of(op: MOp) -> OpAttrs {
-    use Base::*;
+    use Base::Src;
     use Dce::*;
     use FenceAttr as F;
     use Grade::*;
@@ -381,14 +381,14 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         GlobalLoadLdsB128S => a("global_load_lds_dwordx4", dma).mem(G, false, Src(1), 16).fence(F::Barrier).m0(2).backend(Backend::OwnOnly),
         GlobalLoadLdsB32S => a("global_load_lds_dword", dma).mem(G, false, Src(1), 16).fence(F::Barrier).m0(2).backend(Backend::OwnOnly),
         // ---- MUBUF: the per-lane address is not an affine function of one base register (unknown base, always may-alias)
-        BufferLoadDwordX1 => a("buffer_load_dword", ld4).mem(G, false, Unknown, 4).agpr(true, 0),
-        BufferLoadDwordX2 => a("buffer_load_dwordx2", ld16).mem(G, false, Unknown, 8).agpr(true, 0),
-        BufferLoadDwordX4 => a("buffer_load_dwordx4", ld16).mem(G, false, Unknown, 16).agpr(true, 0),
-        BufferStoreDwordX1 => a("buffer_store_dword", st).mem(G, true, Unknown, 4).agpr(false, 0b1),
-        BufferStoreDwordX2 => a("buffer_store_dwordx2", st).mem(G, true, Unknown, 8).agpr(false, 0b1),
-        BufferStoreDwordX4 => a("buffer_store_dwordx4", st).mem(G, true, Unknown, 16).wide_store(0).agpr(false, 0b1),
-        BufferLoadDwordX4Lds => a("buffer_load_dwordx4", dma).mem(G, false, Unknown, 16).fence(F::Barrier).m0(3).backend(Backend::OwnOnly),
-        BufferLoadDwordX1Lds => a("buffer_load_dword", dma).mem(G, false, Unknown, 16).fence(F::Barrier).m0(3).backend(Backend::OwnOnly),
+        BufferLoadDwordX1 => a("buffer_load_dword", ld4).mem(G, false, Base::Unknown, 4).agpr(true, 0),
+        BufferLoadDwordX2 => a("buffer_load_dwordx2", ld16).mem(G, false, Base::Unknown, 8).agpr(true, 0),
+        BufferLoadDwordX4 => a("buffer_load_dwordx4", ld16).mem(G, false, Base::Unknown, 16).agpr(true, 0),
+        BufferStoreDwordX1 => a("buffer_store_dword", st).mem(G, true, Base::Unknown, 4).agpr(false, 0b1),
+        BufferStoreDwordX2 => a("buffer_store_dwordx2", st).mem(G, true, Base::Unknown, 8).agpr(false, 0b1),
+        BufferStoreDwordX4 => a("buffer_store_dwordx4", st).mem(G, true, Base::Unknown, 16).wide_store(0).agpr(false, 0b1),
+        BufferLoadDwordX4Lds => a("buffer_load_dwordx4", dma).mem(G, false, Base::Unknown, 16).fence(F::Barrier).m0(3).backend(Backend::OwnOnly),
+        BufferLoadDwordX1Lds => a("buffer_load_dword", dma).mem(G, false, Base::Unknown, 16).fence(F::Barrier).m0(3).backend(Backend::OwnOnly),
         SBufferRsrc => a("s_mov_b32", c(Salu, 4, 4, Unknown)),
         SBufferRsrcDyn => a("s_mov_b32", c(Salu, 4, 4, Unknown)),
         GlobalStoreU16 => a("global_store_short", st).mem(G, true, Src(0), 2).agpr(false, 0b10),
