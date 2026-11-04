@@ -253,7 +253,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             let ver = cx.int(*version).unwrap_or(-1);
             cx.cur_tile = Some((tile.clone(), ver));
         }
-        Stmt::TileEnd => { cx.cur_tile = None; }
+        Stmt::TileEnd => { /* keep the last (tile, version): MFMAs follow the consumes */ }
         Stmt::Barrier | Stmt::WaitLds { .. } | Stmt::WaitVm { .. } | Stmt::SchedGroup { .. }
         | Stmt::SetPrio { .. } | Stmt::Assume { .. } | Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => {}
         Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => {
