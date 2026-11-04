@@ -16,6 +16,7 @@ fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
     // K/DMA/MFMA/scale program below is the real v4 IR. See docs/functional-proofs.md.
     let cfg = GemmConfig { lds_epilogue: false, ..GemmConfig::v4() };
     let f = gemm_mxfp8_bs("proof_gemm_v4_directc", cfg);
+    println!("E3 build drop={drop:?} stmts={} ifs={}", f.stmts().len(), f.stmts().iter().filter(|s| matches!(s, amdgpu_dsl::Stmt::BeginIf { .. })).count());
     let proof_drop_set = std::env::var("GEMM_PROOF_DROP_KB").ok();
     std::env::remove_var("GEMM_PROOF_DROP_KB");
     if drop.is_some() { assert_eq!(proof_drop_set.as_deref(), drop.map(|k| k.to_string()).as_deref()); }
