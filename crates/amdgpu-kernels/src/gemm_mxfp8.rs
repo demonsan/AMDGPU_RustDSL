@@ -208,6 +208,8 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bo
     };
     // `GemmConfig::shared_voffsets` (today a v_add + v_readfirstlane per issue costs more than the VGPRs it saves)
     let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-1024 * (q as i64 % 4))).collect();
+    // the DMA voffsets (pure thread-index math) through the bit-field normal form: shift groups, shared across all plans by Ctx::bind
+    ctx.set_bitfield(std::env::var("FMHA_ABLATE").map_or(true, |v| !v.contains("nobitfield")));
     let mut voff: Vec<ValueId> = Vec::new();
     let mut base_of: Vec<usize> = Vec::new(); // issue index whose voffset is shared
     let mut issues: Vec<(ValueId, i32)> = Vec::new();
@@ -228,20 +230,21 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bo
             Some(r) if !share => {
                 // prologue-only CSE: the voffset is the base issue's plus the (wave-uniform, scalar) delta - exact for every K
                 let d = g.sub(&adj[r]);
-                let v = b.bind_i32(ev(issues[r].0) + ctx.lower(&d));
+                let dd = ctx.bind(b, &d);
+                let v = b.bind_i32(ev(issues[r].0) + dd);
                 issues.push((v, 1024 * q as i32));
                 delta.push(None);
             }
             Some(r) => {
                 let d = g.sub(&adj[r]);
-                let dv = b.bind_i32(ctx.lower(&d));
+                let dv = { let e = ctx.bind(b, &d); b.bind_i32(e) };
                 let ds = b.read_first_lane(dv);
                 issues.push((issues[r].0, 1024 * q as i32));
                 delta.push(Some(ds));
                 let _ = &voff;
             }
             None => {
-                let v = b.bind_i32(ctx.lower(g));
+                let v = { let e = ctx.bind(b, g); b.bind_i32(e) };
                 voff.push(v);
                 base_of.push(q);
                 issues.push((v, 1024 * q as i32));
@@ -249,6 +252,7 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bo
             }
         }
     }
+    ctx.set_bitfield(false);
     Dma { issues, delta }
 }
 

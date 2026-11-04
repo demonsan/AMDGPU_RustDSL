@@ -37,6 +37,8 @@ pub struct Ctx {
     exts: Vec<Option<amdgpu_dsl::Ext>>,
     /// bound subexpressions (CSE across every expression bound through `bind`; valid at the scope of the first bind - the kernel's top level)
     memo: std::cell::RefCell<std::collections::HashMap<Ix, amdgpu_dsl::ValueId>>,
+    /// lower one-symbol bit-field expressions through their normal form (`amdgpu_layout::BitForm`): off by default (keeps the FMHA v3 asm)
+    bitfield: std::cell::Cell<bool>,
 }
 
 impl Ctx {
@@ -84,6 +86,44 @@ impl Ctx {
             other => panic!("Ctx::ext: {other} has no contract form"),
         }
     }
+    /// Lower every expression that is a GF(2)-linear bit map of one symbol (lane / thread index math: pow2 divisions, remainders, masks, XOR
+    /// swizzles, carry-free sums) through its bit-field normal form: XOR over shift groups `(x & M) << d`, when that takes fewer IR operations.
+    pub fn set_bitfield(&self, on: bool) {
+        self.bitfield.set(on);
+    }
+    /// The bit-field rewrite of `x`, when enabled and cheaper.
+    fn bit_rewrite(&self, x: &Ix) -> Option<Ix> {
+        if !self.bitfield.get() || matches!(x, Ix::C(_) | Ix::Sym(_)) {
+            return None;
+        }
+        let bf = x.bitform(&self.dyns)?;
+        let s = bf.sym?;
+        if bf.cost() >= x.op_cost() {
+            return None;
+        }
+        let full = if bf.width >= 32 { u32::MAX } else { (1u32 << bf.width) - 1 };
+        let mut acc: Option<Ix> = None;
+        for g in bf.groups() {
+            let mut t = Ix::Sym(s);
+            if g.mask != full {
+                t = t.and_c(g.mask as i64);
+            }
+            if g.shift > 0 {
+                t = t.shl(g.shift as u32);
+            } else if g.shift < 0 {
+                t = t.shr((-g.shift) as u32);
+            }
+            acc = Some(match acc {
+                None => t,
+                Some(a) => a.xor(&t),
+            });
+        }
+        let mut e = acc.unwrap_or(Ix::C(0));
+        if bf.konst != 0 {
+            e = e.xor(&Ix::C(bf.konst as i64));
+        }
+        Some(e)
+    }
     /// Binds a layout expression, sharing every compound subexpression already bound through this context (one IR value per distinct subterm).
     pub fn bind(&self, b: &mut amdgpu_dsl::FnBuilder, x: &Ix) -> I32 {
         match x {
@@ -92,6 +132,12 @@ impl Ctx {
         }
         if let Some(v) = self.memo.borrow().get(x) {
             return amdgpu_dsl::tile::ev(*v);
+        }
+        if let Some(r) = self.bit_rewrite(x) {
+            let e = self.bind(b, &r);
+            let v = b.bind_i32(e);
+            self.memo.borrow_mut().insert(x.clone(), v);
+            return amdgpu_dsl::tile::ev(v);
         }
         let e = match x {
             Ix::Sum(t, k) => {
@@ -138,6 +184,9 @@ impl Ctx {
     }
     /// The IR expression of a layout expression. Divisions and remainders must be by powers of two (shift / and); other constants multiply.
     pub fn lower(&self, x: &Ix) -> I32 {
+        if let Some(r) = self.bit_rewrite(x) {
+            return self.lower(&r);
+        }
         match x {
             Ix::C(k) => I32::c(*k as i32),
             Ix::Sym(s) => self.vals[*s as usize].clone().unwrap_or_else(|| panic!("Ctx::lower: {} is a contract-only symbol", self.dyns.info(*s).name)),

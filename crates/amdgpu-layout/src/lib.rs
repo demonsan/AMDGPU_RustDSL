@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bitform;
 pub mod ix;
 pub mod layout;
 pub mod proofs;
@@ -21,6 +22,7 @@ pub mod swizzle;
 pub mod tuple;
 pub mod tv;
 
+pub use bitform::{BitForm, Group};
 pub use ix::{DynInfo, Dyns, Ix};
 pub use layout::*;
 pub use swizzle::{ComposedLayout, Swizzle};
