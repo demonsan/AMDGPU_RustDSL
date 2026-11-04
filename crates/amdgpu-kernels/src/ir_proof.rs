@@ -378,6 +378,7 @@ fn word_tags(v: V) -> Vec<Tag> {
 }
 
 fn store_c(cx: &mut Ctx<'_>, base: Opnd, byte_off: u32, value: Opnd, nouts: usize) {
+    if cx.pass_writes { return; } // write the C trace once, in pass 2
     let mut off = match cx.opnd(base) { V::Ptr(PtrRole::C, o) => o, _ => return };
     off += byte_off as i64;
     let frag = cx.opnd(value);
