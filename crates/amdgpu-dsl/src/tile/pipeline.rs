@@ -130,12 +130,15 @@ pub struct Pipeline {
     pub ablate_no_sync: bool,
     /// loop-exit bound through read_first_lane (scalar compare)
     pub scalar_exit: bool,
+    /// `RegStaged`: tile 1 staged after `prologue_stores`; the prologue wait then leaves `late_tile1_vm` (its DMAs) in flight
+    pub late_tile1: bool,
+    pub late_tile1_vm: u8,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0 }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -174,7 +177,7 @@ impl Pipeline {
             b.wait_vm(0);
             body.stage_complete(b, role, &s0);
         }
-        if self.cadence == Cadence::RegStaged && !self.pre_staged {
+        if self.cadence == Cadence::RegStaged && !self.pre_staged && !self.late_tile1 {
             // tile 1 into slot 1 (clamped as below); both complete at the prologue wait
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
             body.stage(b, role, &key1, &SlotIdx::new(1, 1));
@@ -188,8 +191,13 @@ impl Pipeline {
             body.stage_complete(b, role, &s1);
         }
         body.prologue_stores(b, role);
+        if self.cadence == Cadence::RegStaged && !self.pre_staged && self.late_tile1 {
+            // tile 1 after the prologue stores; it lands behind the first tile and is published by the loop's first top barrier
+            let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
+            body.stage(b, role, &key1, &SlotIdx::new(1, 1));
+        }
         // RegStaged: tile 1 is first read after the loop's top-of-tile wait + barrier, so its DMAs may stay in flight here (`prologue_vm`)
-        b.wait_vm(if self.cadence == Cadence::RegStaged { self.prologue_vm } else { 0 });
+        b.wait_vm(if self.cadence == Cadence::RegStaged { if self.late_tile1 { self.late_tile1_vm } else { self.prologue_vm } } else { 0 });
         b.wait_lds(0);
         b.barrier();
         if self.cadence == Cadence::TwoPhaseOffset && role == Role::B {

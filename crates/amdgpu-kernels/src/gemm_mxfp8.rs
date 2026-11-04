@@ -96,6 +96,10 @@ pub struct GemmConfig {
     pub mid_sync_mmas: usize,
     /// A LDS image padded like the vendor's (1056-byte pitch per 8 rows, linear DMA lanes) instead of the FMHA XOR swizzle
     pub a_pad: bool,
+    /// panel transposition packs bytes with v_perm_b32 (3 VALU per dword instead of ~14)
+    pub perm_transpose: bool,
+    /// `RegStaged`: tile 1 DMA issued after the panel transposition (tile 0 first, less TA back-pressure ahead of the prologue gather)
+    pub late_tile1: bool,
     pub ablate: Ablate,
 }
 
@@ -104,7 +108,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -112,7 +116,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -395,6 +399,8 @@ struct TrJob {
     sh_r: ValueId,
     /// B expansion: the source dword address, its byte shift and the destination dword address of this thread (tid % 128 -> [blk][kb])
     b_exp: Option<(ValueId, ValueId, ValueId)>,
+    /// v_perm selectors (byte s = r % 4 of S1 / S0 into bytes 0 / 1; merge bytes 0,1 of S1 and S0)
+    perm: Option<(ValueId, ValueId)>,
 }
 
 struct Body {
@@ -842,7 +848,7 @@ impl PipeBody for Body {
         let sc = self.stamp;
         stamp(b, &sc, 5); // slot 5: every prologue DMA issued
         // the panel DMA was issued before the two tile stages: wait for it only (in-order VMEM returns)
-        let after = 2 * (self.a_dma.issues.len() + self.b_dma.issues.len());
+        let after = (if self.cfg.late_tile1 { 1 } else { 2 }) * (self.a_dma.issues.len() + self.b_dma.issues.len());
         b.wait_vm(after.min(63) as u8);
         stamp(b, &sc, 6); // slot 6: own panel DMA landed
         // publish the panel (the protocol is cross-wave), gather every round, one barrier, write every round (the pipeline prologue barrier
@@ -852,10 +858,22 @@ impl PipeBody for Body {
         let mut packed: Vec<(ValueId, ValueId)> = Vec::new();
         for round in 0..(PANEL_KB / 8) as i32 {
             let words: Vec<ValueId> = pr.read(b, |b| (0..8).map(|i| { let a = b.bind_i32(ev(job.rd0) + (2048 * round + 16 * i)); b.load_lds_b32(a) }).collect());
-            let bs: Vec<ValueId> = words.iter().map(|w| b.bind_i32(ev(*w).lshr(ev(job.sh_r)) & 255)).collect();
-            let d0 = b.bind_i32(ev(bs[0]) | (ev(bs[1]) << 8) | (ev(bs[2]) << 16) | (ev(bs[3]) << 24));
-            let d1 = b.bind_i32(ev(bs[4]) | (ev(bs[5]) << 8) | (ev(bs[6]) << 16) | (ev(bs[7]) << 24));
-            packed.push((d0, d1));
+            if let Some((sel_pair, sel_merge)) = job.perm {
+                // v_perm_b32: byte s of two words into bytes 0/1 (sel_pair), then two pairs into one dword (sel_merge) - 3 VALU per dword
+                let pair = |b: &mut FnBuilder, lo: ValueId, hi: ValueId| b.perm_b32(hi, lo, sel_pair);
+                let p01 = pair(b, words[0], words[1]);
+                let p23 = pair(b, words[2], words[3]);
+                let p45 = pair(b, words[4], words[5]);
+                let p67 = pair(b, words[6], words[7]);
+                let d0 = b.perm_b32(p23, p01, sel_merge);
+                let d1 = b.perm_b32(p67, p45, sel_merge);
+                packed.push((d0, d1));
+            } else {
+                let bs: Vec<ValueId> = words.iter().map(|w| b.bind_i32(ev(*w).lshr(ev(job.sh_r)) & 255)).collect();
+                let d0 = b.bind_i32(ev(bs[0]) | (ev(bs[1]) << 8) | (ev(bs[2]) << 16) | (ev(bs[3]) << 24));
+                let d1 = b.bind_i32(ev(bs[4]) | (ev(bs[5]) << 8) | (ev(bs[6]) << 16) | (ev(bs[7]) << 24));
+                packed.push((d0, d1));
+            }
         }
         let bexp = job.b_exp.map(|(src, shv, dst)| {
             let w = pr.read(b, |b| b.load_lds_b32(src));
@@ -1092,6 +1110,9 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_vo" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 2, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_vo3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 3, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_g2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_perm" => GemmConfig { perm_transpose: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_lt1" => GemmConfig { late_tile1: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_permlt1" => GemmConfig { perm_transpose: true, late_tile1: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_pad" => GemmConfig { a_pad: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_pad_g2" => GemmConfig { a_pad: true, dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_mid3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, ..GemmConfig::v4() },
@@ -1378,7 +1399,16 @@ fn build(name: &str, cfg: Cfg) -> Function {
             let rd0 = b.bind_i32((ev(wmq) << 7) + (ev(r).lshr(2) << 2) + (ev(kq) << 8) + sh.base as i32);
             let wr0 = b.bind_i32((ev(wmq) << 7) + (ev(r) << 3) + (ev(kq) << 8) + sh.base as i32);
             // the rounds run in the pipeline prologue (`prologue_stores`), after the first tiles' DMA is issued
-            let job = TrJob { rd0, wr0, sh_r, b_exp: None };
+            // v_perm_b32 sel bytes: 0..3 pick S1 bytes, 4..7 S0 bytes, 0x0c = 0
+            let perm = if cfg.perm_transpose {
+                let s = b.bind_i32(ev(r) & 3);
+                let sel_pair = b.bind_i32(ev(s) | ((ev(s) + 4) << 8) | I32::c(0x0c0c_0000));
+                let sel_merge = b.c_i32(0x0504_0100);
+                Some((sel_pair, sel_merge))
+            } else {
+                None
+            };
+            let job = TrJob { rd0, wr0, sh_r, b_exp: None, perm };
             Some((b.bind_i32((ev(wm) << 7) + ((lane.lane() & 15) << 3)), job))
         };
         let (tr, job) = match tr { Some((o, j)) => (Some(o), Some(j)), None => (None, None) };
@@ -1412,6 +1442,8 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
     pipe.unroll2 = cfg.unroll2;
     pipe.ablate_no_sync = cfg.ablate.no_sync;
+    pipe.late_tile1 = cfg.late_tile1 && cfg.reg_staged;
+    pipe.late_tile1_vm = (a_dma.issues.len() + b_dma.issues.len()) as u8;
     pipe.scalar_exit = true;
     if cfg.reg_staged && cfg.early_tile0 {
         // the prologue waits for tile 0 only (tile 1's DMAs are the last ones issued; it is published by the loop's first top barrier)
