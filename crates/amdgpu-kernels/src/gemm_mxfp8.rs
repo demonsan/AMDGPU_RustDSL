@@ -75,6 +75,8 @@ pub struct GemmConfig {
     pub spread_reloads: bool,
     /// `RegStaged`: the prologue waits for tile 0 only, tile 1 lands behind the first MMAs
     pub early_tile0: bool,
+    /// DMA voffsets of later issues computed as an earlier issue's plus the uniform delta (fewer prologue VALU; same registers in the loop)
+    pub derive_voffsets: bool,
     pub ablate: Ablate,
 }
 
@@ -83,7 +85,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -91,7 +93,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -190,6 +192,11 @@ struct Dma {
 /// Turns the per-issue source offsets (minus the instruction offset 1024 (q % 4)) into voffsets: an issue whose offset differs from an earlier
 /// issue's by an amount independent of the thread (checked for all 256 threads at two K values) reuses that issue's voffset and adds the delta
 /// to the soffset (SGPR, computed once).
+thread_local! {
+    /// `GemmConfig::derive_voffsets` for the DMA plans being built
+    static DERIVE_VOFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bool) -> Dma {
     let tid_id = match s_tid {
         Ix::Sym(s) => *s,
@@ -202,7 +209,7 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bo
     let mut issues: Vec<(ValueId, i32)> = Vec::new();
     let mut delta: Vec<Option<ValueId>> = Vec::new();
     for (q, g) in adj.iter().enumerate() {
-        let found = if share {
+        let found = if share || DERIVE_VOFF.with(|x| x.get()) {
             base_of.iter().copied().find(|&r| {
                 let d = g.sub(&adj[r]);
                 [4096i64, 8192].iter().all(|&k| {
@@ -214,6 +221,13 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bo
             None
         };
         match found {
+            Some(r) if !share => {
+                // prologue-only CSE: the voffset is the base issue's plus the (wave-uniform, scalar) delta - exact for every K
+                let d = g.sub(&adj[r]);
+                let v = b.bind_i32(ev(issues[r].0) + ctx.lower(&d));
+                issues.push((v, 1024 * q as i32));
+                delta.push(None);
+            }
             Some(r) => {
                 let d = g.sub(&adj[r]);
                 let dv = b.bind_i32(ctx.lower(&d));
@@ -941,6 +955,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_u1" => GemmConfig { unroll2: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_spread" => GemmConfig { spread_reloads: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_et0" => GemmConfig { early_tile0: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_dv" => GemmConfig { derive_voffsets: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_spread2" => GemmConfig { spread_reloads: true, dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_tall" => GemmConfig { raster_tall: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_split" => GemmConfig { split_sync: true, ..GemmConfig::v4() },
@@ -988,6 +1003,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let b = &mut fb;
     declare_abi(b);
     declare_contract(b, cta_m, cta_n);
+    DERIVE_VOFF.with(|x| x.set(cfg.derive_voffsets));
     let ptr_a = b.let_(Op::KernargPtr { offset: 0 });
     let ptr_b = b.let_(Op::KernargPtr { offset: 8 });
     let ptr_c = b.let_(Op::KernargPtr { offset: 16 });
