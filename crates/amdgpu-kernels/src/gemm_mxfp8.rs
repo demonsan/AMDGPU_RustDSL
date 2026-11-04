@@ -71,6 +71,8 @@ pub struct GemmConfig {
     pub wave_roles: bool,
     /// wave roles in the straight-line form (descriptor / soffset / M0 selected, no branch) - UNVERIFIED timing builds only
     pub wave_roles_select: bool,
+    /// `RegStaged`: reloads spread one fragment per MMA row (the vendor's Rx2/M pattern) instead of bursts of B halves
+    pub spread_reloads: bool,
     pub ablate: Ablate,
 }
 
@@ -79,7 +81,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -87,7 +89,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -463,6 +465,8 @@ impl Body {
             b.set_prio(1);
         }
         let half = nn / 2;
+        // spread_reloads: at most one fragment (2 ds_read_b128) per MMA row instead of the B-half bursts (LDS command FIFO)
+        let spread = self.cfg.spread_reloads && nm >= half;
         let gap = self.cfg.dma_gap.max(1);
         let mut nmma = 0usize;
         let _ = per;
@@ -491,19 +495,33 @@ impl Body {
                     nmma += 1;
                     let (w, by) = self.sa_sel(i);
                     mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
+                    if spread && lo == half && i == nm - 1 {
+                        // last row: each B fragment of the second half is reloaded right after its last use
+                        if let Some((_, br, _, _)) = &next {
+                            let v = br.read(b, j);
+                            b.set_var(bv[j], v);
+                        }
+                    }
                 }
                 if lo == half {
-                    if let Some((ar, _, _, _)) = &next {
+                    if let Some((ar, br, _, _)) = &next {
                         // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
                         let v = ar.read(b, i);
                         b.set_var(av[i], v);
+                        // spread: the first-half B fragments (free since the first half) one per row
+                        if spread && i < half {
+                            let v = br.read(b, i);
+                            b.set_var(bv[i], v);
+                        }
                     }
                 }
             }
             if let Some((_, br, _, _)) = &next {
-                for j in lo..hi {
-                    let v = br.read(b, j);
-                    b.set_var(bv[j], v);
+                if !spread {
+                    for j in lo..hi {
+                        let v = br.read(b, j);
+                        b.set_var(bv[j], v);
+                    }
                 }
             }
         }
@@ -919,6 +937,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_late" => GemmConfig { early_scales: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_noxcd" => GemmConfig { xcd_raster: false, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_u1" => GemmConfig { unroll2: false, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_spread" => GemmConfig { spread_reloads: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_tall" => GemmConfig { raster_tall: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_split" => GemmConfig { split_sync: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_split2" => GemmConfig { split_sync: true, dma_gap: 2, ..GemmConfig::v4() },
