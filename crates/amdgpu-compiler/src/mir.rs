@@ -104,6 +104,8 @@ pub enum MOp {
     VPtrAdd,
     VReadPhys,
     VReadFirstLane,
+    /// `v_mov_b32_dpp d, s quad_perm:[..] row_mask:0xf bank_mask:0xf` (imm = the 8-bit quad_perm control)
+    VMovDpp,
     VCvtPknormU16,
     VCvtPkFp8F32,
     VCvtPkBf16F32,

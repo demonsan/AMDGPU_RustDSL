@@ -118,6 +118,8 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
         MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VPermlane32Swap | MOp::VReadPhys | MOp::VReadSub => Some(2),
         // v_accvgpr_read/write/mov are VALU writes of a VGPR/AGPR: VALU write -> MFMA read = 2 wait states (CDNA4 ISA 7.6 table 38; the ISA table does not separate the files)
         MOp::VAccvgprRead | MOp::VAccvgprWrite | MOp::VAccvgprMov => Some(2),
+        // a DPP move is a VALU write like any other
+        MOp::VMovDpp => Some(2),
         _ => None,
     }
 }
@@ -127,7 +129,8 @@ fn reads_valu_hazard_operands(op: MOp) -> bool {
     // v_add d; v_readfirstlane s, d; s_mov m0, s; global_load_lds read a stale lane value)
     // SMFMAC: a VALU write of A, B, SRC2 or the accumulator C needs 2 wait states (8 clocks) before the matrix op (CDNA4 ISA 7.6,
     // docs/vendor-spec.md 4.5.2); C is srcs[3] of the MIR op so it is covered like any other source.
-    is_scaled_mfma(op) || matches!(op, MOp::VCndmaskM | MOp::VSmfmac16x16x128Fp8 | MOp::VReadFirstLane | MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
+    // DPP: a VALU write of a VGPR read by a DPP instruction needs 2 wait states (gfx9 `VALUWriteVGPR -> DPP read`, LLVM checkDPPHazards)
+    is_scaled_mfma(op) || matches!(op, MOp::VCndmaskM | MOp::VSmfmac16x16x128Fp8 | MOp::VReadFirstLane | MOp::VMovDpp | MOp::VPermlane32Swap | MOp::VMfma16x16x16F16 | MOp::VMfma32x32x8F16 | MOp::VMfma32x32x8F16Z | MOp::VMfma16x16x32Fp8 | MOp::VMfma32x32x16Fp8)
 }
 
 /// Instructions the scanner must never look past (waits, barriers, nops).

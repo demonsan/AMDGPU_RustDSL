@@ -776,6 +776,18 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             src1(a, inst.srcs[0]),
             lds_off(inst.imm)
         )],
+        MOp::VMovDpp => {
+            let c = inst.imm as u32;
+            vec![format!(
+                "v_mov_b32_dpp {}, {} quad_perm:[{},{},{},{}] row_mask:0xf bank_mask:0xf",
+                vr(a, inst.dst.expect("dst")),
+                vr(a, reg_of(&inst.srcs[0])),
+                c & 3,
+                c >> 2 & 3,
+                c >> 4 & 3,
+                c >> 6 & 3
+            )]
+        }
         MOp::VReadFirstLane => {
             vec![format!("v_readfirstlane_b32 {}, {}", sr(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]))]
         }

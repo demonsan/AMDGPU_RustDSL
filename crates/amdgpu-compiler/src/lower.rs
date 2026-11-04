@@ -2357,6 +2357,14 @@ impl Lowerer {
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
+            Op::DppQuadPerm { x, perm } => {
+                let r = self.as_v1(*x)?;
+                self.touch(&[Src::Reg(r)]);
+                let d = self.new_vreg(RClass::V1);
+                let ctl = perm[0] as i64 | (perm[1] as i64) << 2 | (perm[2] as i64) << 4 | (perm[3] as i64) << 6;
+                self.push(MInst::new(MOp::VMovDpp).def(d).srcreg(r).imm(ctl));
+                self.val.insert(dst, d);
+            }
             Op::ReadFirstLane(a) => {
                 let r = self.as_v1(*a)?;
                 self.touch(&[Src::Reg(r)]);

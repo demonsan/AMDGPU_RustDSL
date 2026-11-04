@@ -205,6 +205,8 @@ pub enum Op {
     LoadLdsB128x2 { lo: Opnd, hi: Opnd },
     /// Broadcast lane 0 of a vector value into a scalar register.
     ReadFirstLane(Opnd),
+    /// Cross-lane quad permutation (`v_mov_b32_dpp quad_perm`): lane `l` receives lane `4 (l / 4) + perm[l % 4]` of `x` (all rows / banks written).
+    DppQuadPerm { x: Opnd, perm: [u8; 4] },
 
     /// Build a two-dword fragment from two 32-bit values.
     Frag2(Opnd, Opnd),
@@ -339,6 +341,7 @@ impl Op {
             Op::LoadLdsTr4B8 { .. } | Op::LoadLdsB128x2 { .. } => DType::Frag8,
             Op::LoadGlobalB128 { .. } => DType::Frag4,
             Op::ReadFirstLane(..) => DType::U32,
+            Op::DppQuadPerm { .. } => DType::U32,
         }
     }
 
@@ -414,6 +417,7 @@ impl Op {
                 v
             }
             Op::ReadFirstLane(a) => vec![*a],
+            Op::DppQuadPerm { x, .. } => vec![*x],
         }
     }
 }
@@ -1716,6 +1720,13 @@ impl FnBuilder {
     /// Broadcast lane 0 of a vector value into a scalar register.
     pub fn read_first_lane(&mut self, v: impl Into<Opnd>) -> ValueId {
         self.let_(Op::ReadFirstLane(v.into()))
+    }
+
+    /// `v_mov_b32_dpp quad_perm:[p0,p1,p2,p3]`: lane `l` gets lane `4 (l / 4) + perm[l % 4]` of `x` (a 32-bit value; e.g. `[1,0,3,2]` swaps
+    /// neighbours, `[2,3,0,1]` swaps pairs). The result is a U32 bit pattern.
+    pub fn dpp_quad_perm(&mut self, x: impl Into<Opnd>, perm: [u8; 4]) -> ValueId {
+        assert!(perm.iter().all(|p| *p < 4), "dpp_quad_perm: lane selectors are 0..3");
+        self.let_(Op::DppQuadPerm { x: x.into(), perm })
     }
 
     /// `s_waitcnt lgkmcnt(count)`.

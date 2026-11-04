@@ -1269,6 +1269,8 @@ impl<'a> An<'a> {
             }
             Op::MinI32(a, b) => AV::Int(self.int_of(a).min(&self.int_of(b), cx)),
             Op::ReadFirstLane(a) => AV::Int(self.int_of(a)),
+            // another lane's value of the same expression: the per-lane interval (lane-independent bounds) still holds
+            Op::DppQuadPerm { x, .. } => AV::Int(self.int_of(x)),
             // a clock reading: any 32-bit value
             Op::MemTimeLo { .. } => AV::Int(Itv::top()),
             Op::PtrAdd { base, byte_off } => match self.av_of(base) {

@@ -95,6 +95,7 @@ pub fn cost(op: MOp) -> OpCost {
         VMulLoU32 => c(Valu, 16, 16, Unknown),
         VMovFromSPair | VPtrAdd => c(Valu, 8, 8, Experimental),
         VReadFirstLane => c(Valu, 4, 12, Unknown),
+        VMovDpp => c(Valu, 4, 8, Unknown),
         // MFMA issue spacing 64/32/16 (V), same for dependent chains; latency = wait states until the
         // last D register is readable (20/11/7 s_nop slots of 4 cycles; V) -> hazards pass pads the rest.
         VMfmaScale32x32x64Fp8 | VMfmaScale32x32x64Fp8Z | VMfma32x32x64Fp8 | VMfma32x32x64Fp8Z => c(Mfma, 64, 84, Verified),
