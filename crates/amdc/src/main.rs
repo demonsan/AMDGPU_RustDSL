@@ -11,6 +11,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  amdc list");
     eprintln!("  amdc dump <kernel>");
+    eprintln!("  amdc print-ir <kernel> [--stage dsl|mir|mir-ra]");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--llvm-tail-drop-auto-waits] [--sched | --sched=auto | --sched=ld]");
     eprintln!("      --backend llvm-tail runs the pinned llc tail (ROCM_LLVM_BIN overrides the tool dir);");
     eprintln!("      --mir-out writes the exported post-RA MIR only (no llc needed) and exits.");
@@ -309,6 +310,23 @@ fn main() -> ExitCode {
                     eprintln!("compile error:\n{e}");
                     ExitCode::from(1)
                 }
+            }
+        }
+        "print-ir" => {
+            let Some(name) = args.get(1).filter(|s| !s.starts_with("--")) else { usage(); return ExitCode::from(2); };
+            let stage = args.windows(2).find(|w| w[0] == "--stage").map(|w| w[1].as_str()).unwrap_or("dsl");
+            let Some(f) = amdgpu_compiler::kernel_by_name(name) else { eprintln!("unknown kernel: {name}"); return ExitCode::from(2); };
+            match stage {
+                "dsl" => { print!("{}", amdgpu_compiler::ir_print::print_dsl(&f)); ExitCode::SUCCESS }
+                "mir" => match amdgpu_compiler::lower::lower(&f) {
+                    Ok(m) => { print!("{}", amdgpu_compiler::ir_print::print_mir(&m, None)); ExitCode::SUCCESS }
+                    Err(e) => { eprintln!("lower failed: {e}"); ExitCode::from(1) }
+                },
+                "mir-ra" => match amdgpu_compiler::compile_mir_alloc(&f) {
+                    Ok((m, a)) => { print!("{}", amdgpu_compiler::ir_print::print_mir(&m, Some(&a))); ExitCode::SUCCESS }
+                    Err(e) => { eprintln!("compile failed: {e}"); ExitCode::from(1) }
+                },
+                _ => { eprintln!("unknown stage {stage} (dsl|mir|mir-ra)"); ExitCode::from(2) }
             }
         }
         "dump" => {

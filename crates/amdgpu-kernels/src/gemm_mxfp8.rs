@@ -422,6 +422,10 @@ struct SfaJob {
 
 /// Build-time proof of the VGPR scale path: simulates every lane of every pass byte by byte (the global load, both dpp/perm steps) and checks that
 /// the byte written at panel offset 256 kb + 128 wm + 8 r + i is sfa[kb][128 wm + 16 i + r] (the transposed layout `scale_issue` reads).
+/// Public wrapper for the VGPR/DPP scale-panel proof (item E1 calls it explicitly; the v4 builder
+/// calls it build-time through `sfa_transpose_proof`).
+pub fn verify_sfa_transpose() { sfa_transpose_proof() }
+
 fn sfa_transpose_proof() {
     // a byte is identified by (kb, m)
     let perm = |s0: [(i64, i64); 4], s1: [(i64, i64); 4], sel: u32| -> [(i64, i64); 4] {
