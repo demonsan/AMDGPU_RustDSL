@@ -141,7 +141,7 @@ pub fn softmax_invariant_proof() -> Result<(), String> {
 
 /// Concrete update of one prefix; `rescale` false models the broken recipe (no rescale when the max
 /// increases). Returns the accumulated (sum exp(s)v, sum exp(s)).
-fn online(scores: &[f64], vals: &[f64], rescale: bool) -> (f64, f64) {
+pub fn online(scores: &[f64], vals: &[f64], rescale: bool) -> (f64, f64) {
     let mut m = f64::NEG_INFINITY;
     let (mut o, mut d) = (0.0, 0.0);
     for (&x, &v) in scores.iter().zip(vals) {
