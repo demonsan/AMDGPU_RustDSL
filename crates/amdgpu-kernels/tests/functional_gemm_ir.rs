@@ -18,13 +18,14 @@ fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
 #[test]
 fn actual_v4_ir_proves_every_output_k_block_and_store() {
     let t = run(None);
+    println!("E3 trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops);
     check_trace(&t, &GemmConfig::v4(), 256, 256, 384, None).expect("E3 theorem on actual IR");
-    println!("E3 actual-IR trace: insts={} stores={} contributions={}", t.executed_insts, t.stores.len(), t.c_count.len());
 }
 
 #[test]
 fn actual_kernel_tile1_bug_has_a_concrete_counterexample() {
     let t = run(Some(1));
+    println!("E3 bug trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops);
     let e = check_trace(&t, &GemmConfig::v4(), 256, 256, 384, Some(1)).expect_err("dropped tile must leave a hole");
     assert!(e.contains("C[0,0]") && e.contains("K block 1"), "counterexample: {e}");
     println!("E3 actual-kernel counterexample: {e}");
