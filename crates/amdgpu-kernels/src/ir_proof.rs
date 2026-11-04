@@ -126,6 +126,8 @@ pub struct Trace {
     pub buffer_store_no_origin: usize,
     pub lds_store_origins: usize,
     pub lds_read_origins: usize,
+    pub sample_store: Option<(String, i64, i64)>,
+    pub sample_read: Option<(String, i64, i64, usize)>,
     pub executed_insts: usize,
 }
 
@@ -274,6 +276,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             if let (Some(a), V::Frag { bytes, origins }) = (cx.int(*addr), cx.opnd(*value)) {
                 cx.trace.lds_store_origins += origins.iter().filter(|x| x.is_some()).count();
                 if let Some((tile, ver)) = &cx.cur_tile {
+                    if cx.trace.sample_store.is_none() { cx.trace.sample_store = Some((tile.clone(), *ver, a)); }
                     for (b, t) in bytes.iter().enumerate() {
                         let o = origins.get(b / 4).and_then(|x| *x);
                         cx.lds.insert((tile.clone(), *ver, a + b as i64), (t.clone(), o));
@@ -468,7 +471,7 @@ fn lds_read(cx: &Ctx<'_>, addr: Opnd, n: usize) -> V {
     for d in 0..n / 4 {
         if let Some((_, o)) = cx.lds.get(&(tile.clone(), *ver, a + 4 * d as i64)) { origins[d] = *o; }
     }
-    let _ = &origins;
+    if cx.trace.sample_read.is_none() { cx.trace.sample_read = Some((tile.clone(), *ver, a, origins.iter().filter(|x| x.is_some()).count())); }
     V::Frag { bytes, origins }
 }
 fn lds_read_word(cx: &Ctx<'_>, addr: Opnd) -> V {
