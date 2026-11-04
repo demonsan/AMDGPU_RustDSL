@@ -12,7 +12,9 @@
 #   BUILD    emit (+ --backend ${BACKEND:-auto}) and assemble the 4 kernels, build ref_host
 #   VERIFY   amdc gpu-verify <k> --strict for each kernel: 0 errors
 #   ACC16    15-shape gate, auto dispatch, REF_ROWS=16: REF_KERNEL_OK + vendor parity (mean <= 1.10 x vendor)          [= tests/gpu/run_ref.sh]
-#   ACC64    15 shapes x 4 forced paths (auto / _vs128 / _t128 / forced split), REF_ROWS=64: bad=0 (+ parity, SPLIT_ULP informational)
+#   ACC64    15 shapes x 4 forced paths (auto / _vs128 / _t128 / forced split), REF_ROWS=64. Criterion (user decision 2026-11-04, VENDOR PARITY):
+#            per shape and path, same run and inputs, our mean_err <= 1.10 x the vendor's AND our bad <= the vendor's bad -> PASS; the old strict
+#            criterion (our bad = 0) is printed as INFO. ACC_STRICT=1 restores the old gate (bad = 0 -> PASS/FAIL, parity WARN).
 #   DET      5 shapes x 3 launches, auto dispatch: bit-identical md5                                                       [= tests/gpu/determinism.sh]
 #   STRESS   repeated launches of split shapes (forced s=4 B1H2S200 SK1337 gqa2, auto B1H8S2048), every launch REF_KERNEL_OK and
 #            all-output worst diff vs vendor <= STRESS_MAXDIFF; the md5 histogram is printed but bit identity is NOT required
@@ -112,17 +114,22 @@ if ! skip SKIP_ACC; then
     [ $npar = 15 ] && v=PASS || v=FAIL; row ACC16 "vendor parity <= 1.10 (16 rows)" "$npar/15" "15/15" $v
 # ---------------------------------------------------------------- ACC64 (64 rows, every path forced)
     for mode in auto vs t128 split; do
-        nbad=0; nshape=0; npar=0; sumr=0; ulp_ok=0; ulp_n=0
+        nbad=0; nshape=0; npar=0; sumr=0; ulp_ok=0; ulp_n=0; nvp=0
         for CFG in "${SHAPES[@]}"; do set -- $CFG
             m=$mode; if [ $mode = split ]; then s=$(split_for $4); [ $s = 0 ] && continue; m=split$s; fi
             out=$(run_rh "$B/cand" $m $1 $2 $3 $4 $5 REF_ROWS=64 REF_ITERS=0); echo "== ACC64 $m $CFG"$'\n'"$out" >>"$LOG"
             nshape=$((nshape + 1))
             bad=$(echo "$out" | grep '^our kernel' | field bad); [ "${bad:-1}" = 0 ] || { nbad=$((nbad + 1)); echo "  ACC64 $m bad=${bad:-?} B=$1 H=$2 S=$3 SK=$4 gqa=$5" | tee -a "$LOG"; }
             p=$(echo "$out" | parity); [ "${p%% *}" = OK ] && npar=$((npar + 1)) || echo "  ACC64 $m parity $p B=$1 H=$2 S=$3 SK=$4 gqa=$5" | tee -a "$LOG"
-            if echo "$out" | grep -q SPLIT_ULP_; then ulp_n=$((ulp_n + 1)); echo "$out" | grep -q SPLIT_ULP_OK && ulp_ok=$((ulp_ok + 1)); fi
+            vbad=$(echo "$out" | grep  "$out" | grep -q SPLIT_ULP_; then ulp_n=$((ulp_n + 1)); echo "$out" | grep -q SPLIT_ULP_OK && ulp_ok=$((ulp_ok + 1)); fi
         done
-        [ $nbad = 0 ] && v=PASS || v=FAIL; row ACC64 "$mode: shapes with bad>0 (64 rows)" "$nbad/$nshape" "0" $v
-        [ $npar = $nshape ] && v=PASS || v=WARN; row ACC64 "$mode: vendor parity (64 rows)" "$npar/$nshape" "$nshape/$nshape" $v
+        if [ "${ACC_STRICT:-0}" = 1 ]; then
+            [ $nbad = 0 ] && v=PASS || v=FAIL; row ACC64 "$mode: shapes with bad>0 (64 rows, STRICT)" "$nbad/$nshape" "0" $v
+            [ $npar = $nshape ] && v=PASS || v=WARN; row ACC64 "$mode: vendor parity (64 rows)" "$npar/$nshape" "$nshape/$nshape" $v
+        else
+            [ $nvp = $nshape ] && v=PASS || v=FAIL; row ACC64 "$mode: VENDOR PARITY mean<=1.10x & bad<=vendor (64 rows)" "$nvp/$nshape" "$nshape/$nshape" $v
+            row ACC64 "$mode: old strict criterion, shapes with bad>0 (info)" "$nbad/$nshape" "0" INFO
+        fi
         [ $ulp_n -gt 0 ] && row ACC64 "$mode: SPLIT_ULP vs _vs128 (info)" "$ulp_ok/$ulp_n" "-" INFO
     done
 fi

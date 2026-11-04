@@ -161,6 +161,25 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设。
 - mean err **8.3e-4**（厂商 1.5–2.9e-3）；15/15 形状、16/64 行 parity 15/15、bad = 0
 - 确定性 5/5 × N 次；split 形状重复启动单一 md5（`tools/ohat_repro.sh`，`port_gate` 的 STRESS 段）
 
+**Accuracy gate (user decision 2026-11-04, "2+3").** ACC64 is now judged by **vendor parity**: per shape and path, in the same run on the same inputs, our mean_err must be ≤ 1.10× the vendor's AND our bad count must be ≤ the vendor's. The old strict criterion (bad = 0) is still printed as INFO, and `ACC_STRICT=1` restores it (`tools/port_gate.sh`).
+
+**Fast reference path** (`Vs128Cfg::scaleconv` + `hi512`; kernels `_v3x_vs128_fastref`, `_v3x_vs128_fasthiN`). The per-tile `S += delta` (30 `v_pk_add_f32` per tile) is folded into the fp8 conversion scale. That scale only applies whole powers of two (it divides, by its exponent), so the shift is limited to whole 1/512 units. Above `hi` the rebase stays exact. Measured on GPU 5, 64 rows, against CPU (vendor bad / mean_err in brackets):
+
+| variant | B4H8S2048 [2 / 2.86e-3] | B1H8S8192 [4 / 2.76e-3] | B2H8S2048 [8 / 2.84e-3] | B1H8S4096 [1 / 2.83e-3] | perf B4 / S8192 vs default |
+|---|---|---|---|---|---|
+| default (exact, threshold 120) | 0 / 0.93e-3 | 0 / 0.69e-3 | 0 / 1.01e-3 | 0 / 0.86e-3 | — |
+| fastref (hi 0.45) | 20 / 3.25e-3 | 4 / 3.56e-3 | 6 / 3.24e-3 | 0 / 3.25e-3 | +1.4% / +1.1% |
+| fasthi131 | 0 / 1.67e-3 | 0 / 1.35e-3 | 7 / 1.73e-3 | 0 / 1.60e-3 | −2.7% / −3.7% |
+| fasthi133 | 1 / 2.21e-3 | 4 / 2.05e-3 | 7 / 2.16e-3 | 0 / 2.08e-3 | −2.0% / −2.8% |
+| fasthi136 | 3 / 2.73e-3 | 7 / 2.49e-3 | 7 / 2.64e-3 | 0 / 2.51e-3 | — |
+
+None of the fast-path variants is both faster than the default and within vendor parity, so the exact recipe stays the default.
+
+The accuracy mechanism: the per-tile fractional rebase aligns each tile's maximum key to the exact point (f = 0) of the Schraudolph conversion. A wave holds 32 rows, so some row passes any threshold almost every tile, and the wave-uniform branch then pays the aligned `S += delta` anyway.
+
+`_t128` fastref: no gain (1061 vs 1059 TFLOP/s).
+
+The integer-delta and lazy recurrences are checked against the naive sums in `tests/functional_proofs.rs` (`integer_delta_and_lazy_frames_match_naive`).
 ### 4.4 优化里程
 
 292 → 367（每 CU 差 1.41×）→ 505（t128 分块）→ 605（KV-split）→ 622（kddma）→ 674–705 TFLOP/s（第 75 轮，旧手写集）
