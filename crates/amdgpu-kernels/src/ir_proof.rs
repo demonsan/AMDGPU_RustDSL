@@ -110,6 +110,8 @@ pub struct Trace {
     pub tag_sa: usize,
     pub tag_sb: usize,
     pub read_non_u: usize,
+    pub mfma_a_frag: usize,
+    pub mfma_a_unknown: usize,
 }
 
 struct Ctx<'a> {
@@ -276,6 +278,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             if cx.pass_writes { return false; } // contributions only in pass 2
             cx.trace.mfma_seen += 1;
             let av = cx.opnd(*a); let bv = cx.opnd(*b);
+            match &av { V::Frag { .. } => cx.trace.mfma_a_frag += 1, V::Unknown => cx.trace.mfma_a_unknown += 1, _ => {} }
             let a_tags = frag_tags_fallback(&av, cx.trace);
             let b_tags = frag_tags_fallback(&bv, cx.trace);
             // The K generation comes from the A/B element tags themselves (actual addresses),
