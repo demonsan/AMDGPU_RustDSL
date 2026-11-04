@@ -80,3 +80,20 @@ This is the first two steps of the SF Tensor direction in `docs/ir-review-tirx-s
 index-level composition proofs (E1) and a real-arithmetic loop invariant (E2), kept as small
 in-tree checkers rather than an SMT stack. `gpu_verify` remains the memory/synchronization proof;
 these layers add functional evidence without changing the shipped kernels or their assembly.
+
+
+## E3 status (actual-IR symbolic execution, region-IR tree)
+
+The E3 prototype is on branch `ir-proof`:
+
+- `crates/amdgpu-kernels/src/ir_proof.rs` interprets the **actual built `Function::body()` tree**
+  (region IR), enumerates the 4 waves/64 lanes, unrolls the pipeline loop to 3 K tiles, maps
+  actual global DMA/LDS addresses to element tags and executes actual MFMA/store statements.
+- The proof-only `GEMM_PROOF_DROP_KB` hook is in the real GEMM builder (a real IR `if` around the
+  MMAs of one tile generation), so setting it to 1 changes the kernel Function, not a replica.
+- Current observed counts for the v4 direct-C variant: 1,084,416 executed IR statements, 49,152
+  actual MFMA statements, 65,536 actual C stores, K generations {0,1,2}. The E3 theorem is not yet
+  green: operand provenance through the LDS register-staged path remains incomplete (most MFMAs
+  see empty A/B tags in the current tag map; see `mfma_no_tags` diagnostics). The two E3 tests are
+  marked `#[ignore]` with this reason. This is the remaining work for E3; no counterexample is
+  claimed until operand provenance is sound.
