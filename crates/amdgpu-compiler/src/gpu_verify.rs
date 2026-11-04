@@ -1263,6 +1263,8 @@ impl<'a> An<'a> {
             }
             Op::MinI32(a, b) => AV::Int(self.int_of(a).min(&self.int_of(b), cx)),
             Op::ReadFirstLane(a) => AV::Int(self.int_of(a)),
+            // a clock reading: any 32-bit value
+            Op::MemTimeLo { .. } => AV::Int(Itv::top()),
             Op::PtrAdd { base, byte_off } => match self.av_of(base) {
                 AV::Ptr { arg, off } => AV::Ptr { arg, off: off.add(&self.int_of(byte_off)) },
                 AV::Either(arms) => {
