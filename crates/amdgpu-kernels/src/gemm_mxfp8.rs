@@ -208,6 +208,8 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bo
     };
     // `GemmConfig::shared_voffsets` (today a v_add + v_readfirstlane per issue costs more than the VGPRs it saves)
     let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-1024 * (q as i64 % 4))).collect();
+    // the DMA voffsets (pure thread-index math) through the bit-field normal form: shift groups, shared across all plans by Ctx::bind
+    ctx.set_bitfield(std::env::var("FMHA_ABLATE").map_or(true, |v| !v.contains("nobitfield")));
     let mut voff: Vec<ValueId> = Vec::new();
     let mut base_of: Vec<usize> = Vec::new(); // issue index whose voffset is shared
     let mut issues: Vec<(ValueId, i32)> = Vec::new();
@@ -250,6 +252,7 @@ fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bo
             }
         }
     }
+    ctx.set_bitfield(false);
     Dma { issues, delta }
 }
 
@@ -1056,8 +1059,6 @@ fn build(name: &str, cfg: Cfg) -> Function {
 
     // ---- layout symbols ----
     let mut ctx = Ctx::new();
-    // lane / thread index math through the bit-field normal form (shift groups) with CSE across all DMA plans
-    ctx.set_bitfield(std::env::var("FMHA_ABLATE").map_or(true, |v| !v.contains("nobitfield")));
     let s_lane = ctx.sym("lane", 0, 63, lane.lane());
     let s_tid = ctx.sym("tid", 0, 255, ev(tid));
     let s_tr_all = if cfg.wave_roles { ctx.sym("tid_role", 0, 127, ev(tid) & 127) } else { s_tid.clone() };
