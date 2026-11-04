@@ -54,3 +54,15 @@ fn actual_kernel_tile1_bug_has_a_concrete_counterexample() {
     assert!(!dup.is_empty(), "pipeline shift must duplicate a generation");
     println!("E3 actual-kernel counterexample: missing contribution C[0,0] K block {kb} (k={}): 0 times; duplicated K blocks {dup:?}", kb * 128);
 }
+
+
+#[test]
+fn shipped_v4_lds_epilogue_also_carries_the_theorem() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("GEMM_PROOF_DROP_KB");
+    let cfg = GemmConfig::v4();
+    let f = amdgpu_kernels::gemm_mxfp8::gemm_mxfp8_bs_v4();
+    let t = prove_ir(&f, &cfg, 256, 256, 384).expect("symbolic execution of shipped v4");
+    check_trace(&t, &cfg, 256, 256, 384, None).expect("E3 theorem on shipped v4 LDS epilogue");
+    println!("E3 shipped v4: insts={} stores={} contributions={} (LDS epilogue)", t.executed_insts, t.stores.len(), t.c_count.len());
+}
