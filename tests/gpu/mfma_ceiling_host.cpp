@@ -48,6 +48,7 @@ int main(int argc, char** argv) {
             cyc.push_back(c[c.size() / 2]); ns.push_back(n[n.size() / 2]); clk.push_back(g[g.size() / 2]); lo.push_back(c.front()); hi.push_back(c.back());
         }
         if (cyc.empty()) continue;
+        if (std::getenv("HWREG")) { std::vector<unsigned> h2(nwaves * 4); CK(hipMemcpy(h2.data(), out, nwaves * rec, hipMemcpyDeviceToHost)); std::printf("  hwreg29 delta (20-bit, wave 0..3): %u %u %u %u   memtime delta wave0: %u\n", h2[3], h2[7], h2[11], h2[15], h2[0]); }
         std::sort(cyc.begin(), cyc.end()); std::sort(ns.begin(), ns.end()); std::sort(clk.begin(), clk.end());
         std::printf("%-26s %8d %10.2f %9.2f %9.2f %9.3f %10.3f\n", argv[k], blocks, cyc[cyc.size() / 2], *std::min_element(lo.begin(), lo.end()), *std::max_element(hi.begin(), hi.end()), clk[clk.size() / 2], ns[ns.size() / 2]);
     }
