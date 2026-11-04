@@ -106,7 +106,76 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         lw.uvars = v;
     }
     lw.run(f)?;
-    lw.finish()
+    let mut m = lw.finish()?;
+    if opt_on("kabatch") {
+        batch_kernarg_loads(&mut m);
+    }
+    Ok(m)
+}
+
+/// `kabatch`: kernarg loads of the entry block that fall into the same 16-byte-aligned window (inside the kernarg segment) become ONE
+/// `s_load_dwordx4` into an SGPR quad; the original destinations become views of it (`m.alias`). Issued at the first load's position (earlier
+/// is always valid: the kernarg segment is read-only and every use already waits for `lgkmcnt(0)`).
+fn batch_kernarg_loads(m: &mut MFunction) {
+    let Some(b0) = m.blocks.first() else { return };
+    let size = m.kernarg_size as i64;
+    // (inst index, byte offset, dwords, dst)
+    let loads: Vec<(usize, i64, i64, VReg)> = b0
+        .insts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, x)| match (x.op, x.dst) {
+            (MOp::SLoadDword, Some(d)) => Some((i, x.imm, 1, d)),
+            (MOp::SLoadDwordx2, Some(d)) => Some((i, x.imm, 2, d)),
+            _ => None,
+        })
+        .collect();
+    let mut windows: Vec<i64> = loads.iter().map(|l| l.1 / 16).collect();
+    windows.sort();
+    windows.dedup();
+    let mut remove: Vec<usize> = Vec::new();
+    let mut insert: Vec<(usize, MInst)> = Vec::new();
+    for w in windows {
+        let lo = 16 * w;
+        if lo + 16 > size {
+            continue;
+        }
+        let group: Vec<&(usize, i64, i64, VReg)> = loads.iter().filter(|l| l.1 >= lo && l.1 + 4 * l.2 <= lo + 16 && l.1 % 4 == 0).collect();
+        if group.len() < 2 || group.iter().any(|l| l.2 == 2 && (l.1 - lo) % 8 != 0) {
+            continue;
+        }
+        let q = m.vregs.len() as VReg;
+        m.vregs.push(RClass::S4);
+        for l in &group {
+            let off = ((l.1 - lo) / 4) as u8;
+            // views of an original destination follow it into the quad
+            let views: Vec<VReg> = m.alias.iter().filter(|(_, (t, _))| *t == l.3).map(|(a, _)| *a).collect();
+            for v in views {
+                let (_, o) = m.alias[&v];
+                m.alias.insert(v, (q, off + o));
+            }
+            m.alias.insert(l.3, (q, off));
+            remove.push(l.0);
+        }
+        let first = group.iter().map(|l| l.0).min().unwrap();
+        insert.push((first, MInst::new(MOp::SLoadDwordx4).def(q).imm(lo)));
+    }
+    if insert.is_empty() {
+        return;
+    }
+    let old = std::mem::take(&mut m.blocks[0].insts);
+    let mut out = Vec::with_capacity(old.len());
+    for (i, x) in old.into_iter().enumerate() {
+        for (at, ins) in &insert {
+            if *at == i {
+                out.push(ins.clone());
+            }
+        }
+        if !remove.contains(&i) {
+            out.push(x);
+        }
+    }
+    m.blocks[0].insts = out;
 }
 
 struct Lowerer {
@@ -3219,7 +3288,7 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
     fn load_op(op: MOp) -> bool {
         matches!(
             op,
-            MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64 | MOp::LdsReadB64TrB8 | MOp::GlobalLoadU16
+            MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::SLoadDwordx4 | MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64 | MOp::LdsReadB64TrB8 | MOp::GlobalLoadU16
                 | MOp::GlobalLoadF32 | MOp::GlobalLoadB128 | MOp::GlobalLoadB128S | MOp::GlobalLoadF32S
         )
     }

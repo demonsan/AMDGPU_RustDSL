@@ -127,6 +127,14 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         // CompileProfile::Gemm: partial lgkmcnt waits keep the prefetched fragment reads in flight (`lgkmn`)
         // + scalarize / scalarize2 / waveuni: the wave-uniform DMA address chains (tile origins with clamps/selects, slot bases, M0, soffsets) in SALU
         let mut v: Vec<&str> = vec!["dce", "cmpfold", "lgkmn", "zeroinit", "scalarize", "scalarize2", "waveuni", "edgepad"];
+        // + kabatch (kernarg loads batched into s_load_dwordx4) and imm (inline constants / literals as VALU operands instead of v_mov
+        // materialisations); FMHA_ABLATE=nokabatch / noimm for A/B
+        let abl = std::env::var("FMHA_ABLATE").unwrap_or_default();
+        for tok in ["kabatch", "imm"] {
+            if !abl.contains(&format!("no{tok}")) {
+                v.push(tok);
+            }
+        }
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
     } else if pname.starts_with("fmha_fwd_hd128_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
@@ -264,7 +272,7 @@ pub fn export_mir(f: &amdgpu_dsl::Function, tail: &backend::LlvmTail) -> Result<
 /// Does the kernel contain own-backend-only MOps (the LDS-DMA loads)? The LLVM tail cannot express them.
 pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
     match lower::lower_with_extra(f, &[]) {
-        Ok(m) => m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, mir::MOp::GlobalLoadLdsB128 | mir::MOp::GlobalLoadLdsB32 | mir::MOp::GlobalLoadLdsB128S | mir::MOp::GlobalLoadLdsB32S | mir::MOp::BufferLoadDwordX4Lds | mir::MOp::BufferLoadDwordX1Lds | mir::MOp::SMinI32 | mir::MOp::SCselectB32 | mir::MOp::SCselectB64 | mir::MOp::SCselectB128 | mir::MOp::VMovDpp) || (!llvm_tail_has_rows() && matches!(i.op, mir::MOp::BufferWbl2 | mir::MOp::BufferInv | mir::MOp::GlobalAtomicAddRet)))),
+        Ok(m) => m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, mir::MOp::GlobalLoadLdsB128 | mir::MOp::GlobalLoadLdsB32 | mir::MOp::GlobalLoadLdsB128S | mir::MOp::GlobalLoadLdsB32S | mir::MOp::BufferLoadDwordX4Lds | mir::MOp::BufferLoadDwordX1Lds | mir::MOp::SMinI32 | mir::MOp::SCselectB32 | mir::MOp::SCselectB64 | mir::MOp::SCselectB128 | mir::MOp::VMovDpp | mir::MOp::SLoadDwordx4) || (!llvm_tail_has_rows() && matches!(i.op, mir::MOp::BufferWbl2 | mir::MOp::BufferInv | mir::MOp::GlobalAtomicAddRet)))),
         Err(_) => false,
     }
 }

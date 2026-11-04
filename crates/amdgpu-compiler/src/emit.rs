@@ -697,6 +697,10 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SLoadDwordx2 => {
             vec![format!("s_load_dwordx2 {}, s[0:1], {}", spair(a, inst.dst.unwrap()), inst.imm)]
         }
+        MOp::SLoadDwordx4 => {
+            let d = a.phys[inst.dst.unwrap() as usize];
+            vec![format!("s_load_dwordx4 s[{d}:{}], s[0:1], {}", d + 3, inst.imm)]
+        }
         MOp::SMemTime => vec![format!("s_memtime {}", spair(a, inst.dst.unwrap()))],
         MOp::SLoPart => vec![format!("s_mov_b32 {}, s{}", d_s(a, inst), a.phys[reg_of(&inst.srcs[0]) as usize])],
         MOp::SReadPhys => vec![format!("s_mov_b32 {}, s{}", d_s(a, inst), inst.imm)],

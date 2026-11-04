@@ -248,7 +248,7 @@ fn effects_core(m: &MFunction, inst: &MInst) -> Effects {
         MOp::GlobalStoreF32x4 => {
             e.mem = Some(MemAccess { space: Space::Global, write: true, base: base_slot(0), off: inst.imm, size: 16 })
         }
-        MOp::SLoadDword | MOp::SLoadDwordx2 => e.smem = true,
+        MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::SLoadDwordx4 => e.smem = true,
         // a timing stamp: SMEM result, and pinned in program order against every other memory op so it measures what it brackets
         MOp::SMemTime => {
             e.smem = true;
