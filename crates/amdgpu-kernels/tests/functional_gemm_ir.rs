@@ -19,6 +19,9 @@ fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
 fn actual_v4_ir_proves_every_output_k_block_and_store() {
     let t = run(None);
     println!("E3 trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?} bstores={} no_origin={} lds_so={} lds_ro={} store={:?} store_orig={} left={} p1left={} p1so={} p2so={} read={:?} epi_read={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops, t.buffer_stores, t.buffer_store_no_origin, t.lds_store_origins, t.lds_read_origins, t.sample_store, t.sample_store_origin, t.lds_origins_left, t.pass1_origin_left, t.pass1_lds_store_origins, t.pass2_lds_store_origins, t.sample_read, t.sample_epi_read);
+    let mut kbs: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for &(_, _, kb) in t.c_count.keys() { kbs.insert(kb); }
+    println!("E3 kb keys={kbs:?}");
     check_trace(&t, &GemmConfig::v4(), 256, 256, 384, None).expect("E3 theorem on actual IR");
 }
 
