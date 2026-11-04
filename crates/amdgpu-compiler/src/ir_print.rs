@@ -25,14 +25,14 @@ use crate::regalloc::Alloc;
 
 #[derive(Default)]
 struct Canon {
-    vals: HashMap<ValueId, u32>,
+    vals: HashMap<u32, u32>,
     vars: HashMap<VarId, u32>,
     next_v: u32,
     next_r: u32,
 }
 
 impl Canon {
-    fn val(&mut self, v: ValueId) -> String {
+    fn val(&mut self, v: u32) -> String {
         let n = *self.vals.entry(v).or_insert_with(|| { let n = self.next_v; self.next_v += 1; n });
         format!("%v{n}")
     }
@@ -56,7 +56,7 @@ impl Canon {
                             let name = if is_var {
                                 self.var(VarId(n))
                             } else {
-                                self.val(ValueId(n))
+                                self.val(n)
                             };
                             out.push_str(&name);
                             i = start + close + 1;
@@ -180,7 +180,7 @@ fn ty_of_value(f: &Function, v: ValueId) -> &'static str {
 
 fn fmt_opnd_real(o: &Opnd) -> String {
     match o {
-        Opnd::Val(v) => format!("%v{}", v.0),
+        Opnd::Val(v) => format!("%v{v}"),
         Opnd::Var(v) => format!("%r{}", v.0),
         Opnd::I32(x) => x.to_string(),
         Opnd::F32(x) => format!("{x:?}f"),
@@ -248,7 +248,7 @@ fn print_node(n: &Node<'_>, depth: usize, f: &Function, out: &mut String) {
         Node::Leaf(st) => {
             match st {
                 Stmt::Let { dst, op } => {
-                    let _ = writeln!(out, "{pad}%v{}: {} = {}", dst.0, ty_of_value(f, *dst), fmt_op(op));
+                    let _ = writeln!(out, "{pad}%v{}: {} = {}", dst, ty_of_value(f, *dst), fmt_op(op));
                 }
                 Stmt::SetVar { var, value } => {
                     let _ = writeln!(out, "{pad}%r{} <- {}", var.0, fmt_opnd_real(value));
