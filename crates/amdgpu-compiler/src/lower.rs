@@ -1457,35 +1457,35 @@ impl Lowerer {
     /// Lowers the region tree: every node is handed to `lower_stmt` in program order, the structure markers of loops / ifs / tile
     /// regions at their boundaries (the handlers keep the label / snapshot stacks), so the emitted code is that of the linear walk.
     fn run(&mut self, f: &Function) -> Result<(), String> {
-        self.walk(f.body())
+        self.walk(f, f.body())
     }
 
-    fn walk(&mut self, nodes: &[Node]) -> Result<(), String> {
+    fn walk(&mut self, f: &Function, nodes: &[Node]) -> Result<(), String> {
         for n in nodes {
             match n {
-                Node::S(st) => self.lower_stmt(st)?,
+                Node::S(st) => self.lower_stmt(f, st)?,
                 Node::Loop { vars, init, body } => {
-                    self.lower_stmt(&Stmt::BeginLoop { vars: vars.clone(), init: init.clone() })?;
-                    self.walk(body)?;
-                    self.lower_stmt(&Stmt::EndLoop)?;
+                    self.lower_stmt(f, &Stmt::BeginLoop { vars: vars.clone(), init: init.clone() })?;
+                    self.walk(f, body)?;
+                    self.lower_stmt(f, &Stmt::EndLoop)?;
                 }
                 Node::If { cond, then, els } => {
-                    self.lower_stmt(&Stmt::BeginIf { cond: *cond })?;
-                    self.walk(then)?;
+                    self.lower_stmt(f, &Stmt::BeginIf { cond: *cond })?;
+                    self.walk(f, then)?;
                     if let Some(e) = els {
-                        self.lower_stmt(&Stmt::Else)?;
-                        self.walk(e)?;
+                        self.lower_stmt(f, &Stmt::Else)?;
+                        self.walk(f, e)?;
                     }
-                    self.lower_stmt(&Stmt::EndIf)?;
+                    self.lower_stmt(f, &Stmt::EndIf)?;
                 }
                 Node::Region { kind, tile, slot, version, body } => {
                     let open = match kind {
                         RegionKind::Produce => Stmt::TileProduce { tile: tile.clone(), slot: *slot, version: *version },
                         RegionKind::Consume => Stmt::TileConsume { tile: tile.clone(), slot: *slot, version: *version },
                     };
-                    self.lower_stmt(&open)?;
-                    self.walk(body)?;
-                    self.lower_stmt(&Stmt::TileEnd)?;
+                    self.lower_stmt(f, &open)?;
+                    self.walk(f, body)?;
+                    self.lower_stmt(f, &Stmt::TileEnd)?;
                 }
             }
         }
@@ -1493,7 +1493,7 @@ impl Lowerer {
     }
 
     /// One statement (structure markers included: they open / close the CFG regions).
-    fn lower_stmt(&mut self, st: &Stmt) -> Result<(), String> {
+    fn lower_stmt(&mut self, f: &Function, st: &Stmt) -> Result<(), String> {
         {
             match st {
                 Stmt::Let { dst, op } => self.lower_op(*dst, op)?,
