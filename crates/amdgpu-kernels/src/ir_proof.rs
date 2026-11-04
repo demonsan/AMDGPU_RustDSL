@@ -408,17 +408,19 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
         }
         Frag2Lane { frag, index } => {
             let v = cx.opnd(*frag);
+            let var_origin = match frag { Opnd::Var(v) => Some((v.0, *index)), _ => None };
             match v { V::Frag { bytes, origins } => {
-                let d = (*index as usize) .min(origins.len().saturating_sub(1));
+                let d = (*index as usize).min(origins.len().saturating_sub(1));
                 let tags = bytes.iter().skip(4 * *index as usize).take(4).cloned().collect();
-                V::Word { tags, origin: origins.get(d).and_then(|x| *x) }
+                V::Word { tags, origin: var_origin.or(origins.get(d).and_then(|x| *x)) }
             }, _ => V::Unknown }
         }
         Frag4Lane { frag, index } => {
             let v = cx.opnd(*frag);
+            let var_origin = match frag { Opnd::Var(v) => Some((v.0, *index)), _ => None };
             match v { V::Frag { bytes, origins } => {
                 let tags = bytes.iter().skip(4 * *index as usize).take(4).cloned().collect();
-                V::Word { tags, origin: origins.get(*index as usize).and_then(|x| *x) }
+                V::Word { tags, origin: var_origin.or(origins.get(*index as usize).and_then(|x| *x)) }
             }, _ => V::Unknown }
         }
         FragZero { .. } => V::Frag { bytes: Vec::new(), origins: vec![None; 4] },
