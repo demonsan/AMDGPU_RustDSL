@@ -97,6 +97,7 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 |---|---|
 | [`docs/current-status.md`](docs/current-status.md) | **权威当前快照**（架构、DSL、kernel、数字、证书、已关闭方向、复现命令） |
 | [`docs/design.md`](docs/design.md) | Rust DSL 与自研 compiler 设计规格 |
+| [`docs/ir-review-tirx-sftensor.md`](docs/ir-review-tirx-sftensor.md) | **IR 梳理**：对照 TIRx（算子属性表、区域语句、统一符号分析、打印/结构相等、命名轴 layout）与 SF Tensor 形式化正确性，提出属性表 / 区域化 IR / 统一 sym / 功能证明层的改造顺序 |
 | [`docs/layout-tour.md`](docs/layout-tour.md) | **布局层入门**：`Layout` / `Swizzle` / TV 布局 / `IssuePlan` / 证明，用出厂 FMHA 与 GEMM 的真实代码讲 |
 | [`docs/fmha-dsl-tour.md`](docs/fmha-dsl-tour.md) | **FMHA 逐段教程**：每一段的 DSL 特性与 Rust safe 怎么保证 |
 | [`docs/dsl-layout-refactor-design.md`](docs/dsl-layout-refactor-design.md) | 路线 B（布局代数重构）设计与 §9 as-built |
