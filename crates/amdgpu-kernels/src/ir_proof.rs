@@ -122,6 +122,8 @@ pub struct Trace {
     pub sa_tags: HashMap<i64, HashSet<(i64, i64)>>,  // kb -> (m, kb)
     pub sb_tags: HashMap<i64, HashSet<(i64, i64)>>,  // kb -> (block, kb)
     pub unknown_ops: HashSet<String>,
+    pub buffer_stores: usize,
+    pub buffer_store_no_origin: usize,
     pub executed_insts: usize,
 }
 
@@ -303,6 +305,8 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             if let Some(v) = voff { if let Some(x) = cx.int(*v) { src += x; } else { return false; } }
             let frag = cx.opnd(*value);
             let (_, origins) = match frag { V::Frag { bytes, origins } => (bytes, origins), _ => return false };
+            cx.trace.buffer_stores += 1;
+            if origins.iter().all(|x| x.is_none()) { cx.trace.buffer_store_no_origin += 1; }
             let nouts = 2 * *dwords as usize;
             for q in 0..nouts {
                 let dword = q / 2;
