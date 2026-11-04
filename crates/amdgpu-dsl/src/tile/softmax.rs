@@ -147,7 +147,19 @@ impl OnlineSoftmax {
         let c025 = b.c_f32(0.25);
         let sum_o = b.add_f32(hi_o, lo_o);
         let b_old = b.mul_f32(sum_o, c4f);
-        let tt = b.sub_f32(self.b131, mt);
+        let tt0 = b.sub_f32(self.b131, mt);
+        // scaled conversion: the shift is a whole number of 1/512 units (round to nearest via the 1.5 x 2^23 magic), so the factor 2^(512 delta) is
+        // an exact power of two - what the conversion's E8M0-style scale applies - and stays equal to the O / l rescale
+        let tt = if scaled.is_some() {
+            let t512 = b.mul_f32(tt0, self.c512);
+            let magic = b.c_f32(12_582_912.0);
+            let up = b.add_f32(t512, magic);
+            let rn = b.sub_f32(up, magic);
+            let inv512 = b.c_f32(1.0 / 512.0);
+            b.mul_f32(rn, inv512)
+        } else {
+            tt0
+        };
         let b_new = b.add_f32(b_old, tt);
         let q = b.mul_f32(b_new, c025);
         let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q)));
