@@ -238,6 +238,8 @@ fn exec_nodes(nodes: &[Node], lanes: &mut [Ctx<'_>], filter: &[bool]) {
                 exec_nodes(body, lanes, filter);
                 for i in 0..lanes.len() { if filter[i] { lanes[i].cur_tile = old[i].take(); } }
             }
+            // a pipeline stage (fusion-g) is a boundary contract checked elsewhere (GV-STAGE): transparent to the functional execution
+            Node::Stage { body, .. } => exec_nodes(body, lanes, filter),
         }
     }
 }
