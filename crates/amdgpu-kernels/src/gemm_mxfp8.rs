@@ -77,6 +77,8 @@ pub struct GemmConfig {
     pub early_tile0: bool,
     /// DMA voffsets of later issues computed as an earlier issue's plus the uniform delta (fewer prologue VALU; same registers in the loop)
     pub derive_voffsets: bool,
+    /// `RegStaged`: tiles 0 / 1 DMA issued before the read-partition setup (Pipeline::pre_staged)
+    pub early_dma: bool,
     pub ablate: Ablate,
 }
 
@@ -85,7 +87,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -93,7 +95,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -355,8 +357,8 @@ struct Body {
     sa_rd: Vec<ValueId>,
     sa_sh: Vec<ValueId>,
     sa_dw: Vec<ValueId>,
-    a_rd: LdsPart,
-    b_rd: LdsPart,
+    a_rd: Option<LdsPart>,
+    b_rd: Option<LdsPart>,
     zero4: ValueId,
     acc: Vec<VarId>,
     /// deferred stage (key0, slot, units issued) and whether the pipeline loop has started
@@ -458,8 +460,8 @@ impl Body {
         let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
         let (sa, sb) = self.load_scales(b, &t.cur, ox(t.it));
         let mut deferred = self.deferred.take();
-        let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
-        let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
+        let ar = self.a_rd.as_ref().expect("a_rd").at(b, &self.a_s.at(&t.cur));
+        let br = self.b_rd.as_ref().expect("b_rd").at(b, &self.b_s.at(&t.cur));
         let bf: Vec<ValueId> = (0..nn).map(|j| self.frag(b, &br, j)).collect();
         let af: Vec<ValueId> = (0..nm).map(|i| self.frag(b, &ar, i)).collect();
         self.staged = Some((bf, af, sa, sb));
@@ -470,7 +472,7 @@ impl Body {
     fn compute_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
         let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
         let (nm, nn) = (av.len(), bv.len());
-        let next = if t.staged { Some((self.a_rd.at(b, &self.a_s.at(&t.next)), self.b_rd.at(b, &self.b_s.at(&t.next)), (), ())) } else { None };
+        let next = if t.staged { Some((self.a_rd.as_ref().expect("a_rd").at(b, &self.a_s.at(&t.next)), self.b_rd.as_ref().expect("b_rd").at(b, &self.b_s.at(&t.next)), (), ())) } else { None };
         // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and selected at the end (partial lgkm waits)
         let early = if t.staged && self.cfg.early_scales { Some(self.scale_issue(b, &t.next, ox(t.it) + 1)) } else { None };
         let mut deferred = self.deferred.take();
@@ -855,8 +857,8 @@ impl PipeBody for Body {
             self.scale_words(b, &t.cur, kbx.clone())
         };
         let mut deferred = self.deferred.take();
-        let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
-        let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
+        let ar = self.a_rd.as_ref().expect("a_rd").at(b, &self.a_s.at(&t.cur));
+        let br = self.b_rd.as_ref().expect("b_rd").at(b, &self.b_s.at(&t.cur));
         // A0 and B0 first; the other B fragments are issued one ahead of the first row of MMAs (partial lgkm waits)
         let mut af = { let v = if let Some(z) = zf { z } else { ar.read(b, 0) }; mark(b, v) };
         let bpre = self.cfg.b_prefetch.max(1).min(nn);
@@ -956,6 +958,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_spread" => GemmConfig { spread_reloads: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_et0" => GemmConfig { early_tile0: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_dv" => GemmConfig { derive_voffsets: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_ed" => GemmConfig { early_dma: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_spread2" => GemmConfig { spread_reloads: true, dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_tall" => GemmConfig { raster_tall: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_split" => GemmConfig { split_sync: true, ..GemmConfig::v4() },
@@ -1084,17 +1087,23 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let a_view = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![16, 128], tup![128, 1]));
     let a_place: Vec<i64> = (0..wave_m / 16).map(|i| 2048 * i).collect();
     let b_place: Vec<i64> = (0..wave_n / 16).map(|j| 2048 * j).collect();
-    let mut a_rd = copy_a.partition_lds(b, &ctx, &s_lane, &a_s, &a_view, &a_place);
-    let mut b_rd = copy_b.partition_lds(b, &ctx, &s_lane, &b_s, &view, &b_place);
+    // operand read partitions (built after the first DMAs when `early_dma`)
+    let (a_s2, b_s2) = (a_s.clone(), b_s.clone());
+    let (ctx_r, copy_a_r, copy_b_r, s_lane_r, s_wm_r, s_wn_r) = (&ctx, &copy_a, &copy_b, &s_lane, &s_wm, &s_wn);
+    let mk_rd = move |b: &mut FnBuilder| -> (LdsPart, LdsPart) {
+    let (ctx, s_lane, s_wm, s_wn) = (ctx_r, s_lane_r, s_wm_r, s_wn_r);
+    let mut a_rd = copy_a_r.partition_lds(b, ctx, s_lane, &a_s2, &a_view, &a_place);
+    let mut b_rd = copy_b_r.partition_lds(b, ctx, s_lane, &b_s2, &view, &b_place);
     let a_wo = ctx.lower(&s_wm.mul_c(wave_m / 16 * 2048));
     let b_wo = ctx.lower(&s_wn.mul_c(wave_n / 16 * 2048));
     // the view bases lie inside one 16-row block (< 2048 bytes): the mask is a no-op that gives the verifier the bound the XOR swizzle hides
     // (bases include the buffer base; 16-byte reads: the low 4 bits are zero)
-    let (ab, bb) = (a_s.base as i32, b_s.base as i32);
-    let _ = (ab, bb);
+
     a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32(x + &a_wo)).collect();
     b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32(x + &b_wo)).collect();
 
+        (a_rd, b_rd)
+    };
     // ---- DMA (A row-major, B preshuffled), wave parts of M0, CTA origins ----
     let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
     let b_glob = make_layout(tup![tup![16, cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]);
@@ -1208,11 +1217,23 @@ fn build(name: &str, cfg: Cfg) -> Function {
     if cfg.three_slots || cfg.reg_staged {
         pipe.vm_inflight = (a_dma.issues.len() + b_dma.issues.len() + 2) as u8;
     }
+    let (a_rd, b_rd) = if cfg.early_dma { (None, None) } else { let (x, y) = mk_rd(b); (Some(x), Some(y)) };
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
         cfg, kb_v, role_a, role_rsrc, panel, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
         a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false, npre_done: 0,
     };
+    if cfg.early_dma {
+        // tiles 0 and 1 issued as soon as their addresses exist (the read partitions and the rest of the setup follow behind the DMA)
+        assert!(cfg.reg_staged, "early_dma: RegStaged only");
+        body.stage_now(b, &I32::c(0), &SlotIdx::new(0, 0), 0..usize::MAX, &mut StageCache::default());
+        let key1 = b.let_i32(ev(kb_v).gt(1).select_i32(1, ev(kb_v) - 1) << 7);
+        body.stage_now(b, &key1, &SlotIdx::new(1, 1), 0..usize::MAX, &mut StageCache::default());
+        let (x, y) = mk_rd(b);
+        body.a_rd = Some(x);
+        body.b_rd = Some(y);
+        pipe.pre_staged = true;
+    }
     pipe.run(b, Role::All, &mut body);
     for v in body.acc.iter().take(cfg.acc_agpr) {
         b.pin_agpr(*v);

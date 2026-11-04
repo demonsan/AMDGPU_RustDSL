@@ -122,12 +122,14 @@ pub struct Pipeline {
     pub top_vm: u8,
     /// `RegStaged`: the DMAs of tile 1 (issued after tile 0) that may still be in flight at the prologue barrier (default 0)
     pub prologue_vm: u8,
+    /// `RegStaged`: the body issued tiles 0 and 1 itself before `run` (as early as their addresses exist); the prologue skips those stages
+    pub pre_staged: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0 }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -158,13 +160,15 @@ impl Pipeline {
         };
         // ---- prologue ----
         let s0 = SlotIdx::new(0, 0);
-        body.stage(b, role, &I32::c(0), &s0);
+        if !self.pre_staged {
+            body.stage(b, role, &I32::c(0), &s0);
+        }
         if self.cadence != Cadence::RegStaged {
             // (RegStaged bodies do not use stage_complete: tile 0 completes at the prologue wait, overlapped with the stores)
             b.wait_vm(0);
             body.stage_complete(b, role, &s0);
         }
-        if self.cadence == Cadence::RegStaged {
+        if self.cadence == Cadence::RegStaged && !self.pre_staged {
             // tile 1 into slot 1 (clamped as below); both complete at the prologue wait
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
             body.stage(b, role, &key1, &SlotIdx::new(1, 1));
