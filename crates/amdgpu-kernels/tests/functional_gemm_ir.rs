@@ -2,7 +2,10 @@
 use amdgpu_kernels::gemm_mxfp8::{gemm_mxfp8_bs, GemmConfig};
 use amdgpu_kernels::ir_proof::{check_trace, prove_ir};
 
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
+    let _guard = ENV_LOCK.lock().unwrap();
     if let Some(kb) = drop {
         std::env::set_var("GEMM_PROOF_DROP_KB", kb.to_string());
     } else {
@@ -13,7 +16,9 @@ fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
     // K/DMA/MFMA/scale program below is the real v4 IR. See docs/functional-proofs.md.
     let cfg = GemmConfig { lds_epilogue: false, ..GemmConfig::v4() };
     let f = gemm_mxfp8_bs("proof_gemm_v4_directc", cfg);
+    let proof_drop_set = std::env::var("GEMM_PROOF_DROP_KB").ok();
     std::env::remove_var("GEMM_PROOF_DROP_KB");
+    if drop.is_some() { assert_eq!(proof_drop_set.as_deref(), drop.map(|k| k.to_string()).as_deref()); }
     // one CTA, 3 K tiles (the pipeline's u2 loop is unrolled by the executor)
     prove_ir(&f, &cfg, 256, 256, 384).expect("IR symbolic execution")
 }
