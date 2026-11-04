@@ -467,7 +467,7 @@ fn lds_read_word(cx: &Ctx<'_>, addr: Opnd) -> V {
     match v { V::Frag { bytes, .. } => V::Word { tags: bytes, origin: None }, _ => V::Unknown }
 }
 
-fn run_lane(f: &Function, lane: i64, wave: i64, args: &Args, pass_writes: bool, lds: &mut HashMap<(String, i64, i64), Tag>, trace: &mut Trace) {
+fn run_lane(f: &Function, lane: i64, wave: i64, args: &Args, pass_writes: bool, lds: &mut HashMap<(String, i64, i64), (Tag, Option<(u32, u8)>)>, trace: &mut Trace) {
     let mut cx = Ctx { lane, wave, args, vals: HashMap::new(), vars: HashMap::new(), cur_tile: None, pass_writes, lds, trace, unknown_control: 0 };
     let (nodes, _) = parse_seq(&f.stmts, 0, false, false);
     exec_nodes(&nodes, &mut cx);
