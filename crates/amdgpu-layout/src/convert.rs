@@ -58,6 +58,11 @@ pub fn plan_convert(src: &Layout, dst: &Layout, per_reg: usize) -> ConvPlan {
     let (ts, vs, stab) = table(src);
     let (td, vd, dtab) = table(dst);
     assert!(ts == td && vs == vd, "plan_convert: src {ts}x{vs} vs dst {td}x{vd} (threads x values)");
+    plan_convert_tables(&stab, &dtab, ts, vs, per_reg)
+}
+
+/// `plan_convert` on element tables indexed `[t + threads v]` (column-major, as `Layout::at` of a TV layout).
+pub fn plan_convert_tables(stab: &[i64], dtab: &[i64], ts: usize, vs: usize, per_reg: usize) -> ConvPlan {
     assert!(per_reg >= 1 && vs % per_reg == 0, "plan_convert: {vs} values per thread, {per_reg} per register");
     let (nt, nv) = (ts, vs);
     let mut pos = std::collections::HashMap::with_capacity(nt * nv);
