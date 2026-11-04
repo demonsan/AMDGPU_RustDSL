@@ -189,6 +189,9 @@ pub enum Op {
     /// MUBUF load (`buffer_load_dword[x2|x4]`): address = resource base + `voff` (per-lane byte offset, absent = `off` form) + `soff` (wave-uniform byte
     /// offset, SGPR or 0) + `imm` (12-bit). `dwords` = 1 (f32), 2 (frag2), 4 (frag4).
     BufferLoad { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, dwords: u8 },
+    /// Two MUBUF `buffer_load_dwordx4` (same rsrc / voff / soff, immediates `imm_lo` / `imm_hi`) straight into the low / high 4 dwords of ONE
+    /// 8-dword fragment (Frag8, no copy; each half is its own vmcnt entry).
+    BufferLoadB128x2 { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm_lo: u32, imm_hi: u32 },
     /// `global_atomic_add` (device scope, returns the OLD value): every active lane adds `value` at `base + byte_off`.
     AtomicAddU32 { base: Opnd, byte_off: u32, value: Opnd },
     /// Read one dword from workgroup LDS; `addr` is a byte offset.
@@ -301,6 +304,7 @@ impl Op {
             Op::AtomicAddU32 { .. } => DType::U32,
             Op::LoadB128Coherent { .. } => DType::Frag4,
             Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } => DType::Rsrc,
+            Op::BufferLoadB128x2 { .. } => DType::Frag8,
             Op::BufferLoad { dwords, .. } => match dwords {
                 1 => DType::F32,
                 2 => DType::Frag2,
@@ -410,7 +414,7 @@ impl Op {
             Op::LoadLdsB128x2 { lo, hi } => vec![*lo, *hi],
             Op::BufferRsrc { base, .. } => vec![*base],
             Op::BufferRsrcDyn { base, num_records } => vec![*base, *num_records],
-            Op::BufferLoad { rsrc, voff, soff, .. } => {
+            Op::BufferLoad { rsrc, voff, soff, .. } | Op::BufferLoadB128x2 { rsrc, voff, soff, .. } => {
                 let mut v = vec![*rsrc];
                 v.extend(voff.iter().copied());
                 v.push(*soff);
@@ -1364,6 +1368,11 @@ impl FnBuilder {
         self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 4 })
     }
     /// `off` forms (no per-lane vaddr): every lane reads the same address (resource base + soff + imm).
+    /// Two `buffer_load_dwordx4` (offsets `imm_lo` / `imm_hi`) into the two halves of one Frag8 (an MFMA operand), without the copy of `cat_frag8`.
+    pub fn buffer_load_b128x2(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm_lo: u32, imm_hi: u32) -> ValueId {
+        self.let_(Op::BufferLoadB128x2 { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm_lo, imm_hi })
+    }
+
     pub fn buffer_load_b128_off(&mut self, rsrc: ValueId, soff: impl Into<Opnd>, imm: u32) -> ValueId {
         self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: None, soff: soff.into(), imm, dwords: 4 })
     }
@@ -2340,6 +2349,13 @@ pub fn verify(f: &Function) -> Vec<String> {
                     Op::BufferLoad { rsrc, voff, soff, imm, dwords } => {
                         for e in check_buffer_access(f, *rsrc, *voff, *soff, *imm, *dwords) {
                             errs.push(here(e));
+                        }
+                    }
+                    Op::BufferLoadB128x2 { rsrc, voff, soff, imm_lo, imm_hi } => {
+                        for imm in [*imm_lo, *imm_hi] {
+                            for e in check_buffer_access(f, *rsrc, *voff, *soff, imm, 4) {
+                                errs.push(here(e));
+                            }
                         }
                     }
                     Op::Frag2(a, b) => {
