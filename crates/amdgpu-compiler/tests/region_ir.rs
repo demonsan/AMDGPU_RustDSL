@@ -81,7 +81,7 @@ fn demo(closures: bool) -> Function {
                 },
                 |b| b.barrier(),
             );
-            let n = b.bind_i32(ev(i) + 1);
+            let n = b.add_i32(Opnd::Var(i), Opnd::I32(1));
             b.set_var(i, n);
             let d = b.let_(amdgpu_dsl::Op::CmpGeI32(Opnd::Val(n), Opnd::Val(lim)));
             b.break_if(d);
@@ -98,7 +98,7 @@ fn demo(closures: bool) -> Function {
         b.else_();
         b.barrier();
         b.end_if();
-        let n = b.bind_i32(ev(i) + 1);
+        let n = b.add_i32(Opnd::Var(i), Opnd::I32(1));
         b.set_var(i, n);
         let d = b.let_(amdgpu_dsl::Op::CmpGeI32(Opnd::Val(n), Opnd::Val(lim)));
         b.break_if(d);
