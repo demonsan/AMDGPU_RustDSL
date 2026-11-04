@@ -106,6 +106,8 @@ pub struct GemmConfig {
     pub prefill: bool,
     /// A/B only: the t+2 stage key computed after the barrier (pre-v5.3 order)
     pub key_late: bool,
+    /// vendor-style scale path: VGPR loads + in-register 4x4 transposes (dpp quad_perm + v_perm) + ds_write (no panel DMA, no LDS gather)
+    pub sfa_vgpr: bool,
     pub ablate: Ablate,
 }
 
@@ -114,7 +116,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, tile1_after_barrier: false, prefill: false, key_late: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, tile1_after_barrier: false, prefill: false, key_late: false, sfa_vgpr: false, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -122,7 +124,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, tile1_after_barrier: false, prefill: false, key_late: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, tile1_after_barrier: false, prefill: false, key_late: false, sfa_vgpr: false, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -394,6 +396,61 @@ struct Panel {
     job: Option<TrJob>,
     /// B part expanded to dwords [wn][PANEL_KB] (byte 0 = the scale) in the prologue: this wave's dword offset (wn 4 PANEL_KB)
     b_dw: Option<ValueId>,
+    /// vendor-style scale path (`sfa_vgpr`): emitted in `prologue_stores`
+    sfa: Option<SfaJob>,
+}
+
+/// The VGPR scale path: A scales by 4 passes of buffer_load_dwordx4 (lane = 16 M rows of one K group), a 4x4 byte transpose per dword across each
+/// lane quad (dpp quad_perm [1,0,3,2] + v_perm, dpp quad_perm [2,3,0,1] + v_perm) straight into the transposed panel layout, one ds_write per dword;
+/// B scales by one dword load per thread. Layout proof: `sfa_transpose_proof`.
+struct SfaJob {
+    voff: ValueId,
+    pso: Vec<ValueId>,
+    sel1: ValueId,
+    sel2: ValueId,
+    dst: ValueId,
+    bvo: ValueId,
+    bsh: ValueId,
+    bdst: ValueId,
+}
+
+/// Build-time proof of the VGPR scale path: simulates every lane of every pass byte by byte (the global load, both dpp/perm steps) and checks that
+/// the byte written at panel offset 256 kb + 128 wm + 8 r + i is sfa[kb][128 wm + 16 i + r] (the transposed layout `scale_issue` reads).
+fn sfa_transpose_proof() {
+    // a byte is identified by (kb, m)
+    let perm = |s0: [(i64, i64); 4], s1: [(i64, i64); 4], sel: u32| -> [(i64, i64); 4] {
+        let mut o = [(0, 0); 4];
+        for (k, ok) in o.iter_mut().enumerate() {
+            let sb = (sel >> (8 * k)) & 0xff;
+            *ok = if sb < 4 { s1[sb as usize] } else { s0[(sb - 4) as usize] };
+        }
+        o
+    };
+    let mut seen = std::collections::HashMap::new();
+    for p in 0..4i64 {
+        for d in 0..4i64 {
+            // x of every thread (256 threads, one pass): bytes of rows 16 c + 4 d + k of K group g / 16
+            let x: Vec<[(i64, i64); 4]> = (0..256i64).map(|tid| { let g = tid + 256 * p; let (kb, c) = (g / 16, g % 16); [0, 1, 2, 3].map(|k| (kb, 16 * c + 4 * d + k)) }).collect();
+            let qp = |v: &Vec<[(i64, i64); 4]>, pm: [usize; 4]| -> Vec<[(i64, i64); 4]> { (0..256usize).map(|l| v[4 * (l / 4) + pm[l % 4]]).collect() };
+            let y = qp(&x, [1, 0, 3, 2]);
+            let n1: Vec<[(i64, i64); 4]> = (0..256usize).map(|l| perm(y[l], x[l], if l % 2 == 0 { 0x0602_0400 } else { 0x0307_0105 })).collect();
+            let z = qp(&n1, [2, 3, 0, 1]);
+            for tid in 0..256i64 {
+                let l = tid as usize;
+                let out = perm(z[l], n1[l], if l % 4 < 2 { 0x0504_0100 } else { 0x0302_0706 });
+                let g = tid + 256 * p;
+                let (kb, c, j) = (g / 16, g % 16, tid % 4);
+                let addr = 256 * kb + 128 * (c / 8) + 8 * (4 * d + j) + 4 * ((c / 4) % 2);
+                for (k, byte) in out.iter().enumerate() {
+                    let a = addr + k as i64;
+                    let (pk, r, i, wm) = (a / 256, (a % 128) / 8, a % 8, (a % 256) / 128);
+                    assert_eq!(*byte, (pk, 128 * wm + 16 * i + r), "sfa transpose: tid {tid} pass {p} dword {d} byte {k}");
+                    seen.insert(a, ());
+                }
+            }
+        }
+    }
+    assert_eq!(seen.len(), 64 * 256, "sfa transpose: every panel byte written once");
 }
 
 /// The in-place panel transposition: thread (r = tid % 16, wm = tid / 16 % 2, k = tid / 32) gathers the bytes of rows 128 wm + 16 i + r (i < 8) of
@@ -864,6 +921,33 @@ impl PipeBody for Body {
         self.stage_now(b, key0, slot, 0..usize::MAX, &mut StageCache::default());
     }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
+        if let Some(sj) = self.panel.as_ref().and_then(|p| p.sfa.as_ref()) {
+            let p = self.panel.as_ref().unwrap();
+            let pr = p.sh.at(&SlotIdx::new(0, 0));
+            // loads (A: 4 x 16 bytes, B: one dword), then the transposes and the panel writes; published by the pipeline's prologue barrier
+            let fr: Vec<ValueId> = sj.pso.iter().map(|so| b.buffer_load_b128(self.rsrc_sfa, sj.voff, *so, 0)).collect();
+            let bw = b.buffer_load_f32(self.rsrc_sfb, sj.bvo, 0i32, 0);
+            let bwi = b.bitcast_i32(bw);
+            let bval = b.bind_i32(ev(bwi).lshr(ev(sj.bsh)) & 255);
+            pr.write(b, |b| {
+                for (pi, f) in fr.iter().enumerate() {
+                    for d in 0..4u8 {
+                        let xl = b.frag4_lane(Opnd::Val(*f), d);
+                        let x = b.bitcast_i32(xl);
+                        let y = b.dpp_quad_perm(x, [1, 0, 3, 2]);
+                        let y = b.bitcast_i32(y);
+                        let n1 = b.perm_b32(y, x, sj.sel1);
+                        let z = b.dpp_quad_perm(n1, [2, 3, 0, 1]);
+                        let z = b.bitcast_i32(z);
+                        let out = b.perm_b32(z, n1, sj.sel2);
+                        let a = b.bind_i32(ev(sj.dst) + (4096 * pi as i32 + 32 * d as i32));
+                        b.store_lds_b32(a, out);
+                    }
+                }
+                b.store_lds_b32(sj.bdst, bval);
+            });
+            return;
+        }
         let Some(p) = &self.panel else { return };
         let Some(job) = p.job else { return };
         let stamp = |b: &mut FnBuilder, s: &Option<(ValueId, ValueId, bool)>, slot: u32| {
@@ -1152,6 +1236,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_vo3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 3, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_g2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_t1ab" => GemmConfig { tile1_after_barrier: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_sfa" => GemmConfig { sfa_vgpr: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_keylate" => GemmConfig { key_late: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_pf" => GemmConfig { prefill: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_perm" => GemmConfig { perm_transpose: true, ..GemmConfig::v4() },
@@ -1415,7 +1500,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
         // owns K groups 8 round + tid / 32), so the transposition needs no barrier
         let _ = per_wave;
         let m0s: Vec<ValueId> = (0..(PANEL_KB / 8) as i32).map(|r| { let v = b.bind_i32((lane.wave() << 9) + (2048 * r + sh.base as i32)); b.read_first_lane(v) }).collect();
-        pr.write(b, |b| {
+        if !cfg.sfa_vgpr { pr.write(b, |b| {
             for r in 0..(PANEL_KB / 8) as i32 {
                 for h in 0..2i32 {
                     // soffset = row (8 r + 2 w + h) M; voffset = the CTA rows + 4 lane (sa_src); M0 + imm = panel + 256 (8 r + 2 w) + 256 h (the
@@ -1431,7 +1516,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
         let zv = b.bind_i32(lane.lane() << 2);
         let sob = b.read_first_lane(b_src);
         pr.write(b, |b| b.buffer_load_lds_b32(rsrc_sfb, zv, sob, m0b, 0));
-        b.end_if();
+        b.end_if(); }
         let b_off = b.bind_i32((ev(wn) * ev(kb_v)) + ev(b_delta));
         // transpose the A part in place, 8 K groups per round: thread (r = tid % 16, wm = tid / 16 % 2, k = tid / 32) gathers the bytes of rows
         // 128 wm + 16 i + r (i < 8) of K group 8 round + k and writes them as 8 consecutive bytes at 128 wm + 8 r
@@ -1470,7 +1555,33 @@ fn build(name: &str, cfg: Cfg) -> Function {
             }
             j
         });
-        Panel { sh, b_base: PANEL_KB * 256, b_off, tr, job, b_dw }
+        // vendor-style scale path: no panel DMA, no LDS gather - VGPR loads + in-register 4x4 byte transposes (dpp quad_perm + v_perm) + ds_write
+        let (job, b_dw, sfa) = if cfg.sfa_vgpr {
+            assert!(cfg.panel_transposed && cfg.b_scale_dword, "sfa_vgpr writes the transposed A panel and the dword B panel");
+            sfa_transpose_proof();
+            // A: lane g = 64 w + lane (+ 256 p per pass) holds 16 M rows (chunk c = g % 16) of K group g / 16: voffset (K group) M + m_cta + 16 c
+            let g0 = b.bind_i32(lane.tid());
+            let voff = b.bind_i32((ev(g0).lshr(4)) * ev(m_v) + (ev(by) << 8) + ((ev(g0) & 15) << 4));
+            let j = b.bind_i32(ev(g0) & 3);
+            // v_perm selectors (byte k of the result = sel byte k: 0..3 S1, 4..7 S0): step 1 [0,4,2,6] / [5,1,7,3], step 2 [0,1,4,5] / [6,7,2,3]
+            let sel1 = b.bind_i32((ev(j) & 1).eq(0).select_i32(0x0602_0400, 0x0307_0105));
+            let sel2 = b.bind_i32(ev(j).lt(2).select_i32(0x0504_0100, 0x0302_0706));
+            // destination of dword d of pass p: panel + 256 kb + 128 wm + 8 (4 d + j) + 4 a  (wm = c / 8, a = c / 4 % 2) = base + 4096 p + 32 d
+            let c = b.bind_i32(ev(g0) & 15);
+            let dst = b.bind_i32(((ev(g0).lshr(4)) << 8) + ((ev(c).lshr(3)) << 7) + (ev(j) << 3) + (((ev(c).lshr(2)) & 1) << 2) + sh.base as i32);
+            // B: thread tid % 128 -> (blk, kb) = (tid / 64 % 2, tid % 64): the dword holding byte (2 bx + blk) KB + kb, shifted to byte 0
+            let blk = b.bind_i32((ev(tid).lshr(6)) & 1);
+            let kbt = b.bind_i32(ev(tid) & 63);
+            let boff = b.bind_i32(((ev(bx) << 1) + ev(blk)) * ev(kb_v) + ev(kbt));
+            let bvo = b.bind_i32(ev(boff).lshr(2) << 2);
+            let bsh = b.bind_i32((ev(boff) & 3) << 3);
+            let bdst = b.bind_i32(((ev(tid) & 127) << 2) + (sh.base + PANEL_KB * 256) as i32);
+            let pso: Vec<ValueId> = (0..4).map(|p| { let v = b.bind_i32(ev(m_v) * (16 * p)); b.read_first_lane(v) }).collect();
+            (None, Some(b.bind_i32(ev(wn) * (4 * PANEL_KB as i32))), Some(SfaJob { voff, pso, sel1, sel2, dst, bvo, bsh, bdst }))
+        } else {
+            (job, b_dw, None)
+        };
+        Panel { sh, b_base: PANEL_KB * 256, b_off, tr, job, b_dw, sfa }
     });
     let role_rsrc = match role_a {
         Some(wv) if cfg.wave_roles_select => {
