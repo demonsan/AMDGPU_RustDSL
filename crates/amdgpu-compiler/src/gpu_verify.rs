@@ -1767,6 +1767,7 @@ pub fn verify_ir(f: &Function) -> Report {
         rep.add("GV-ASM", Severity::Info, "safe-asm blocks present: their internal memory accesses are NOT bounds-checked by v1 (address inputs come from IR values that are)".to_string());
     }
     barrier_balance(f, &mut rep);
+    verify_stages(f, &mut rep);
     crate::gpu_protocol::verify_tiles(f, &mut rep);
     crate::gpu_protocol::verify_last_arrivers(f, &mut rep);
     rep
@@ -1982,5 +1983,105 @@ pub fn enforce(f: &Function, m: &MFunction, a: &Alloc) -> Result<(), String> {
             }
         }
         _ => Ok(()),
+    }
+}
+
+// --------------------------------------------------------------------------------------------------------------------------------------------
+// Stage boundaries (Node::Stage, docs/fusion-layout-handoff.md §3): the resource contract checked at the region edge
+
+/// GV-STAGE: every stage's contract against the program.
+/// * a consumed set (`live_in`) is handed over by an EARLIER stage's `live_out` with the same values, element table (layout fingerprint) and
+///   element width, and the same wave roles;
+/// * every `live_out` value is defined before the stage ends;
+/// * a value defined inside one stage and read inside another must be declared in the reader's `live_in`;
+/// * `lds_reused` tiles were freed by an earlier stage, and no stage writes a tile an earlier stage freed unless it declares the reuse;
+/// * `barrier_phase` equals the number of barriers before the stage in program order.
+pub fn verify_stages(f: &Function, rep: &mut Report) {
+    use amdgpu_dsl::{stmt_operands, StageContract};
+    let stmts = f.stmts();
+    if !stmts.iter().any(|s| matches!(s, Stmt::StageBegin { .. })) {
+        return;
+    }
+    let mut closed: Vec<(String, StageContract)> = Vec::new();
+    let mut open: Vec<(usize, String, StageContract)> = Vec::new();
+    let mut def_stage: HashMap<u32, usize> = HashMap::new();
+    let mut defined: std::collections::HashSet<u32> = Default::default();
+    let mut barriers = 0u32;
+    let mut sid = 0usize;
+    let mut freed: Vec<String> = Vec::new();
+    let mut ok = 0usize;
+    for (i, st) in stmts.iter().enumerate() {
+        match st {
+            Stmt::StageBegin { name, contract } => {
+                sid += 1;
+                if contract.barrier_phase != barriers {
+                    rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: barrier phase {} declared, {barriers} barriers precede it", contract.barrier_phase));
+                }
+                for want in &contract.live_in {
+                    match closed.iter().rev().find_map(|(pn, c)| c.live_out.iter().find(|x| x.name == want.name).map(|x| (pn, c, x))) {
+                        None => rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: `{}` is not handed over by an earlier stage", want.name)),
+                        Some((pn, pc, have)) => {
+                            if have.values != want.values {
+                                rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: `{}` values differ from stage {pn}'s hand-over", want.name));
+                            } else if have.table != want.table || have.elem_bits != want.elem_bits {
+                                rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: `{}` layout / width differs from stage {pn}'s hand-over (a conversion must be code inside a stage)", want.name));
+                            } else if pc.roles != contract.roles {
+                                rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: roles {:?} vs stage {pn}'s {:?}", contract.roles, pc.roles));
+                            } else {
+                                ok += 1;
+                            }
+                        }
+                    }
+                }
+                for r in &contract.lds_reused {
+                    if !freed.contains(r) {
+                        rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: reuses LDS tile `{r}` that no earlier stage freed"));
+                    }
+                }
+                open.push((sid, name.clone(), (**contract).clone()));
+            }
+            Stmt::StageEnd => {
+                if let Some((_, name, c)) = open.pop() {
+                    for v in c.live_out.iter().flat_map(|x| x.values.iter()) {
+                        if !defined.contains(&(*v as u32)) {
+                            rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: hands over v{v} which is not defined"));
+                        }
+                    }
+                    freed.extend(c.lds_freed.iter().cloned());
+                    closed.push((name, c));
+                }
+            }
+            Stmt::Barrier => barriers += 1,
+            Stmt::TileProduce { tile, .. } => {
+                if freed.contains(tile) && !open.last().is_some_and(|(_, _, c)| c.lds_reused.contains(tile)) {
+                    rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: writes LDS tile `{tile}` freed by an earlier stage without declaring the reuse"));
+                }
+            }
+            _ => {}
+        }
+        if let Stmt::Let { dst, .. } = st {
+            defined.insert(*dst as u32);
+            if let Some((s, _, _)) = open.last() {
+                def_stage.insert(*dst as u32, *s);
+            }
+        }
+        if let Some((s, name, c)) = open.last() {
+            let ops: Vec<Opnd> = match st {
+                Stmt::Let { op, .. } => op.operands(),
+                other => stmt_operands(other),
+            };
+            for o in ops {
+                if let Opnd::Val(v) = o {
+                    if let Some(ds) = def_stage.get(&(v as u32)) {
+                        if ds != s && !c.live_in.iter().any(|x| x.values.contains(&v)) {
+                            rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name} reads v{v} of another stage without declaring it live-in"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for _ in 0..ok {
+        rep.ok("stage-handoff");
     }
 }

@@ -3003,7 +3003,8 @@ pub mod tile;
 pub use expr::{Cond, Ptr, F32, I32};
 
 /// Every `Opnd` a statement reads (loop variables read implicitly by in-place `Var*` statements are not listed).
-fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
+/// The value / variable operands a statement reads (structure and contract markers: none).
+pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
     match st {
         Stmt::Let { op, .. } => op.operands(),
         Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32Wt { base, value, .. } | Stmt::StoreF32x4Wt { base, value, .. } | Stmt::StoreF32x2 { base, value, .. } => vec![*base, *value],

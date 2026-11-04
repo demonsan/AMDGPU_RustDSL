@@ -37,6 +37,7 @@ fn count(nodes: &[Node], c: &mut [usize; 3]) {
                 c[2] += 1;
                 count(body, c);
             }
+            Node::Stage { body, .. } => count(body, c),
         }
     }
 }
