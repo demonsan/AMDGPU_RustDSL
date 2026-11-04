@@ -1,5 +1,5 @@
 //! Item D: readable IR printing + alpha-equivalent structural equality.
-use amdgpu_compiler::ir_print::{canonical_dsl, dsl_structural_eq, dsl_structural_hash, print_dsl, print_mir};
+use amdgpu_compiler::ir_print::{canonical_dsl_body, dsl_body_structural_eq, dsl_body_structural_hash, dsl_structural_eq, dsl_structural_hash, print_dsl, print_mir};
 use amdgpu_compiler::kernel_by_name;
 
 #[test]
@@ -7,16 +7,16 @@ fn expr_layer_twins_are_structurally_equal() {
     for (manual, expr) in [("probe_llvm_ids", "probe_expr_ids"), ("probe_llvm_kernarg", "probe_expr_kernarg")] {
         let a = kernel_by_name(manual).unwrap();
         let b = kernel_by_name(expr).unwrap();
-        if !dsl_structural_eq(&a, &b) {
-            let ca = canonical_dsl(&a); let cb = canonical_dsl(&b);
+        if !dsl_body_structural_eq(&a, &b) {
+            let ca = canonical_dsl_body(&a); let cb = canonical_dsl_body(&b);
             let first = ca.lines().zip(cb.lines()).enumerate().find(|(_, (x, y))| x != y);
-            panic!("{expr} not structurally equal to {manual}; first diff: {first:?}");
+            panic!("{expr} body not structurally equal to {manual}; first diff: {first:?}");
         }
-        assert_eq!(dsl_structural_hash(&a), dsl_structural_hash(&b), "{expr} hash");
+        assert_eq!(dsl_body_structural_hash(&a), dsl_body_structural_hash(&b), "{expr} body hash");
         // the canonical form is alpha-renamed and does not contain the function name
-        let ca = canonical_dsl(&a);
+        let ca = canonical_dsl_body(&a);
         assert!(!ca.contains(manual), "canonical form must not include the kernel name");
-        assert_eq!(ca, canonical_dsl(&b));
+        assert_eq!(ca, canonical_dsl_body(&b));
     }
 }
 

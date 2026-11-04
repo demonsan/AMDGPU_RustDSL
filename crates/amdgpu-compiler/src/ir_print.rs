@@ -74,13 +74,15 @@ impl Canon {
     }
 }
 
-fn canon_function(f: &Function) -> String {
+fn canon_function(f: &Function, include_contract: bool) -> String {
     let mut c = Canon::default();
     let mut s = String::new();
     // Signature/ABI/contract/tiles are structural, but the function *name* is not.
     let _ = writeln!(s, "kernarg={} wg={} lds={}", f.kernarg_size, f.workgroup_size, f.lds_bytes);
     let _ = writeln!(s, "args={:?}", f.args);
-    let _ = writeln!(s, "contract={:?}", f.contract);
+    if include_contract {
+        let _ = writeln!(s, "contract={:?}", f.contract);
+    }
     let _ = writeln!(s, "value_tys={:?}", f.value_tys);
     let _ = writeln!(s, "var_tys={:?}", f.var_tys);
     let _ = writeln!(s, "profile={:?} lower={:?} sched={:?}", f.compile_profile, f.lower_opts, f.sched_opts);
@@ -95,19 +97,38 @@ fn canon_function(f: &Function) -> String {
 
 /// Structural equality over the DSL IR (alpha-equivalent ValueIds/VarIds; function name ignored).
 pub fn dsl_structural_eq(a: &Function, b: &Function) -> bool {
-    canon_function(a) == canon_function(b)
+    canon_function(a, true) == canon_function(b, true)
+}
+
+/// Body/ABI structural equality ignoring the declared contract metadata. Useful when comparing a
+/// builder refactor before the same annotations are added to both versions (e.g. the expr-layer
+/// probes vs their older manual twins).
+pub fn dsl_body_structural_eq(a: &Function, b: &Function) -> bool {
+    canon_function(a, false) == canon_function(b, false)
 }
 
 /// Structural hash consistent with [`dsl_structural_eq`].
 pub fn dsl_structural_hash(f: &Function) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    canon_function(f).hash(&mut h);
+    canon_function(f, true).hash(&mut h);
+    h.finish()
+}
+
+/// Structural hash of the body/ABI without contract metadata.
+pub fn dsl_body_structural_hash(f: &Function) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    canon_function(f, false).hash(&mut h);
     h.finish()
 }
 
 /// Canonical alpha-renamed text form (useful for golden tests / diagnostics).
 pub fn canonical_dsl(f: &Function) -> String {
-    canon_function(f)
+    canon_function(f, true)
+}
+
+/// Canonical form without contract metadata.
+pub fn canonical_dsl_body(f: &Function) -> String {
+    canon_function(f, false)
 }
 
 // ---------------------------------------------------------------------------------------------
