@@ -127,6 +127,8 @@ pub struct Trace {
     pub lds_store_origins: usize,
     pub lds_read_origins: usize,
     pub sample_store: Option<(String, i64, i64)>,
+    pub sample_store_origin: usize,
+    pub lds_origins_left: usize,
     pub sample_read: Option<(String, i64, i64, usize)>,
     pub sample_epi_read: Option<(String, i64, i64, usize)>,
     pub executed_insts: usize,
@@ -277,7 +279,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             if let (Some(a), V::Frag { bytes, origins }) = (cx.int(*addr), cx.opnd(*value)) {
                 cx.trace.lds_store_origins += origins.iter().filter(|x| x.is_some()).count();
                 if let Some((tile, ver)) = &cx.cur_tile {
-                    if cx.trace.sample_store.is_none() { cx.trace.sample_store = Some((tile.clone(), *ver, a)); }
+                    if cx.trace.sample_store.is_none() { cx.trace.sample_store = Some((tile.clone(), *ver, a)); cx.trace.sample_store_origin = origins.iter().filter(|x| x.is_some()).count(); }
                     for (b, t) in bytes.iter().enumerate() {
                         let key = (tile.clone(), *ver, a + b as i64);
                         let o = origins.get(b / 4).and_then(|x| *x);
@@ -506,6 +508,7 @@ pub fn prove_ir(f: &Function, cfg: &GemmConfig, m: i64, n: i64, k: i64) -> Resul
     for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, true, &mut lds, &mut trace); }
     // pass 2: reads, MFMA contributions and epilogue stores
     for lane in 0..256i64 { run_lane(f, lane, lane / 64, &args, true, &mut lds, &mut trace); }
+    trace.lds_origins_left = lds.values().filter(|(_, o)| o.is_some()).count();
     if !trace.unknown_ops.is_empty() {
         return Err(ProofError(format!("unsupported/unknown IR during symbolic execution: {:?}", trace.unknown_ops)));
     }
