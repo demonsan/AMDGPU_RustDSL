@@ -963,7 +963,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_acc8" => GemmConfig { acc_agpr: 8, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_nodma_nords" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, ..Ablate::default() }, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_mma_nosync" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, no_sync: true, ..Ablate::default() }, ..GemmConfig::v4() },
-        "gemm_mxfp8_bs_v4_mma_nosync_nosc" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, no_sync: true, no_scales: true }, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_mma_nosync_nosc" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, no_sync: true, no_scales: true, ..Ablate::default() }, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_pre0" => GemmConfig { pre_sync_mmas: 0, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_pre8" => GemmConfig { pre_sync_mmas: 8, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_gap2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4() },
