@@ -66,3 +66,23 @@ fn shipped_v4_lds_epilogue_also_carries_the_theorem() {
     check_trace(&t, &cfg, 256, 256, 384, None).expect("E3 theorem on shipped v4 LDS epilogue");
     println!("E3 shipped v4: insts={} stores={} contributions={} (LDS epilogue)", t.executed_insts, t.stores.len(), t.c_count.len());
 }
+
+
+#[test]
+fn shipped_v4_kernel_code_dropped_generation_counterexample() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("GEMM_PROOF_DROP_KB", "1");
+    let f = amdgpu_kernels::gemm_mxfp8::gemm_mxfp8_bs_v4();
+    std::env::remove_var("GEMM_PROOF_DROP_KB");
+    let cfg = GemmConfig::v4();
+    let t = prove_ir(&f, &cfg, 256, 256, 384).expect("symbolic execution of buggy shipped v4");
+    let missing: Vec<i64> = (0..3)
+        .filter(|kb| t.c_count.get(&(0, 0, *kb)).copied().unwrap_or(0) == 0)
+        .collect();
+    assert_eq!(missing.len(), 1, "dropped generation must leave exactly one hole");
+    let dup: Vec<i64> = (0..3)
+        .filter(|k| t.c_count.get(&(0, 0, *k)).copied().unwrap_or(0) > 1)
+        .collect();
+    assert!(!dup.is_empty(), "pipeline shift must duplicate a generation");
+    println!("E3 shipped-v4 kernel-code counterexample: missing C[0,0] K block {}; duplicated {dup:?}", missing[0]);
+}
