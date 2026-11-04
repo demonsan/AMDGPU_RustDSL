@@ -100,6 +100,8 @@ impl DmaPart {
 /// read zeros: the keys past the sequence are masked, the V rows multiply zero P).
 pub struct BufForm {
     rsrc: ValueId,
+    /// the tile origin byte offset (SGPR)
+    base: ValueId,
     voffs: Vec<ValueId>,
 }
 
@@ -107,27 +109,28 @@ impl DmaPart {
     pub fn buffer_form(&self, b: &mut FnBuilder) -> BufForm {
         assert!(self.atom.bytes == 16, "DmaPart::buffer_form: 16-byte DMA only");
         let n = self.row_c.len();
+        // the descriptor base must be the kernarg pointer: the tile origin (wave-uniform) goes into the soffset and the record range
         let bo = b_bind(b, &self.src.base);
-        let base = b.ptr_add(self.src.ptr, bo);
+        let bo = b.read_first_lane(bo);
         let nrec = match &self.src.clamp {
-            Some(c) => b.bind_i32((c.limit.clone() - 1) * &self.src.stride + 128),
+            Some(c) => b.bind_i32(ev_(bo) + (c.limit.clone() - 1) * &self.src.stride + 128),
             None => b.c_i32(0x7fff_ffff),
         };
         let nrec = b.read_first_lane(nrec);
-        let rsrc = b.buffer_desc_dyn(base, nrec);
+        let rsrc = b.buffer_desc_dyn(self.src.ptr, nrec);
         let voffs = (0..n)
             .map(|q| {
                 let r = &self.row_dyn + self.row_c[q] as i32;
                 b.bind_i32(add0(r * &self.src.stride, &self.cols[self.col_of[q]]) - (self.step * q as i64) as i32)
             })
             .collect();
-        BufForm { rsrc, voffs }
+        BufForm { rsrc, base: bo, voffs }
     }
     /// The DMA of the tile at `key0` into `slot` through the buffer form.
     pub fn issue_buffer(&self, b: &mut FnBuilder, bf: &BufForm, key0: &I32, slot: &SlotRef) {
         assert_eq!(slot.sh.name, self.sh.name, "DmaPart: slot of another buffer");
         let n = self.row_c.len() as i64;
-        let so = { let v = b.bind_i32(key0.clone() * &self.src.stride); b.read_first_lane(v) };
+        let so = { let v = b.bind_i32(key0.clone() * &self.src.stride + ev_(bf.base)); b.read_first_lane(v) };
         let off = slot.off_v(b);
         let m0 = b.bind_i32(&self.lds_wave + off - (self.step * (n - 1)) as i32);
         slot.write(b, |b| {
@@ -136,6 +139,10 @@ impl DmaPart {
             }
         });
     }
+}
+
+fn ev_(v: ValueId) -> I32 {
+    amdgpu_dsl::tile::ev(v)
 }
 
 fn b_bind(b: &mut FnBuilder, x: &I32) -> ValueId {
