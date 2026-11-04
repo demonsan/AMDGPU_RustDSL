@@ -1966,8 +1966,9 @@ impl Lowerer {
                 let t = self.new_vreg(RClass::S2);
                 self.push(MInst::new(MOp::SMemTime).def(t));
                 self.pending_smem.push(self.mir.canon(t));
+                self.touch(&[Src::Reg(t)]); // the stamp is read right away: this emits the `s_waitcnt lgkmcnt(0)` (SMEM returns out of order, so it is a full drain)
                 let lo = self.new_vreg(RClass::S1);
-                self.push(MInst::new(MOp::SLoPart).def(lo).srcreg(t)); // reads the pair right away: the lowering waits lgkmcnt(0) before it
+                self.push(MInst::new(MOp::SLoPart).def(lo).srcreg(t));
                 self.val.insert(dst, lo);
             }
             Op::KernargPtr { offset } => {
