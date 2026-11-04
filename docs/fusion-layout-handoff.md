@@ -83,6 +83,77 @@ implements. The QK, Q-load and O-store atoms are taken from it.
 zero-cost renaming and that the FMHA's packing is a valid σ. That the transposed V reads realize the same σ is still covered only by the
 FMHA's end-to-end correctness, not by a layout proof.
 
-## 3. Region-boundary resource contracts (pending item B)
+## 3. Stage-boundary resource contracts and the fused MLP example
 
-Not started: waits for backend-llvm-tail's region IR.
+### 3.1 `StageBoundary`
+
+`amdgpu_tile::contract_stage` defines the contract model. Each side of a stage boundary is a `StageBoundary` with these fields:
+
+| field | content |
+|---|---|
+| `live` | the fragments handed over (`LiveFrag`): name, element table over the tensor after any K permutation, element bits, storage (VGPR / AGPR / an LDS region) |
+| `pinned` | register ranges that must survive the boundary untouched |
+| `lds_freed` / `lds_reused` | LDS regions the producer frees and the consumer reuses |
+| `vm` / `lgkm` | outstanding memory counts: the producer's worst case at the boundary, or the consumer's tolerance |
+| `barrier_phase` | how many barriers have been passed (cross-wave stages must agree) |
+| `roles` | the wave roles of each side |
+
+`check_boundary(prod, cons)` proves the producer satisfies the consumer:
+
+- every consumed fragment is handed over with the same shape and element width;
+- the storage is compatible;
+- every reused LDS region was freed, and the pinned ranges are provided;
+- the outstanding counts are within the consumer's tolerance;
+- the barrier phase and the roles are equal.
+
+It returns the `plan_convert` movement and cost of every hand-off. A boundary emits no instruction and is not a scheduling barrier.
+
+**Status before item B.** The checks run as build-time assertions in the kernel builder. When region IR lands, the boundary moves onto
+the Region node and the verifier checks it. Tests: `crates/amdgpu-tile/tests/contract_stage.rs` covers an identity hand-off, a transposed
+expectation reported as cross-lane, and four error cases.
+
+### 3.2 Fused GEMM → elementwise → GEMM (`crates/amdgpu-kernels/src/mlp_fp8.rs`)
+
+The chain is `Y = fp8(relu(0.125 · X W1)) W2`:
+
+| tensor | shape and type |
+|---|---|
+| X | [M][256] fp8 |
+| W1 | [256][256] fp8 |
+| W2 | [256][256] fp8 |
+| Y | [M][256] bf16 |
+
+All MFMAs are the scaled 32x32x64 fp8 atom with unit scales. One CTA is 4 waves × 32 rows.
+
+**Orientation.** The kernel uses the orientation the search derives, the same one as the FMHA S → P hand-off:
+
+- GEMM 1 computes `H^T = W1 X^T` (A = W1 rows, B = X rows), so each lane owns one row m.
+- relu, scaling and fp8 packing happen in accumulator order.
+- The packed words are GEMM 2's B operand (`Y^T = W2 H^T`) as they are, up to the key permutation
+  `sigma(k) = 32 (k/32) + 8 ((k%16)/4) + 4 ((k%32)/16) + k%4` inside every 64-wide n1 block.
+- `sigma` is absorbed by a pre-permuted copy of W2, done once offline like the vendor's weight preshuffle.
+
+The builder constructs the producer and consumer `StageBoundary` of each of the 4 k-blocks and asserts `check_boundary` → `Register`/`Identity`
+with cost 0: the hand-off is free.
+
+**Unfused pair.** `mlp_fp8_g1` (GEMM 1 + elementwise, H written as fp8 to HBM) and `mlp_fp8_g2` (GEMM 2 reading H, natural n1 order) are
+built from the same code.
+
+**Gate (MI355X GPU 5, `tests/gpu/mlp_host.cpp`).**
+
+- **Correctness:** compared against a host reference that recomputes the same fp8 rounding of H, on 131072 sampled outputs: 0 bad, worst
+  relative error 1.6e-3 for both the fused and the unfused path.
+- **Fused vs unfused:** the outputs are bitwise equal for 99.75% of elements. The rest differ because `sigma` reorders the MFMA's
+  k accumulation.
+- **Strict verify:** `amdc gpu-verify --strict` gives 0 findings and 0 unproven for all three kernels.
+
+**Timing** (interleaved, medians of 7 × 50 launches):
+
+| M | fused | unfused pair (2 launches) | speedup |
+|---|---:|---:|---:|
+| 65536 | 43.6 µs (394 TF/s) | 58.8 µs (292 TF/s) | **1.35×** |
+| 16384 | 21.4 µs | 27.3 µs | **1.28×** |
+
+**Scope of the speedup.** All three kernels use direct global-to-register operand loads, with no LDS staging and no software pipelining. The
+speedup is fusion on equal building blocks: H no longer goes through HBM, and there is one launch fewer. It is not a tuned MLP: absolute
+throughput is far below the GEMM v4 kernel.
