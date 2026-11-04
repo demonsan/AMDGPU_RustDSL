@@ -279,8 +279,15 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
                 if let Some((tile, ver)) = &cx.cur_tile {
                     if cx.trace.sample_store.is_none() { cx.trace.sample_store = Some((tile.clone(), *ver, a)); }
                     for (b, t) in bytes.iter().enumerate() {
+                        let key = (tile.clone(), *ver, a + b as i64);
                         let o = origins.get(b / 4).and_then(|x| *x);
-                        cx.lds.insert((tile.clone(), *ver, a + b as i64), (t.clone(), o));
+                        // Do not replace a known accumulator origin by an unknown DMA/epilogue
+                        // write at the same byte: the reference is what the store will read.
+                        match cx.lds.get_mut(&key) {
+                            Some((_, prev)) if prev.is_some() && o.is_none() => {}
+                            Some(slot) => *slot = (t.clone(), o),
+                            None => { cx.lds.insert(key, (t.clone(), o)); }
+                        }
                     }
                 }
             }
