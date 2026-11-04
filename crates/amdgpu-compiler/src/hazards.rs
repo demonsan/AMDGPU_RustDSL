@@ -365,22 +365,33 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 if remaining == 0 {
                     continue;
                 }
-                let mut dist = usize::MAX;
-                for &s in &succs[bi] {
-                    let mut d = 0usize;
-                    let mut found = None;
+                // distance (wait states) to the first touch of `reg` along every path out of this block: the successors are followed through
+                // blocks that do not touch it (a short loop-exit test block no longer forces the padding), min over all paths, up to
+                // MAX_HOPS blocks or until the distance already covers the remaining latency
+                const MAX_HOPS: usize = 4;
+                fn first_touch(
+                    s: usize, d0: usize, hops: usize, need: usize, reg: VReg, from_mfma: bool, snap: &[Vec<MInst>], succs: &[Vec<usize>], canon: &dyn Fn(VReg) -> VReg,
+                ) -> usize {
+                    let mut d = d0;
                     for x in &snap[s] {
-                        let touches = x.uses().iter().any(|u| canon(*u) == *reg) || x.dst.map(|y| canon(y) == *reg).unwrap_or(false);
+                        let touches = x.uses().iter().any(|u| canon(*u) == reg) || x.dst.map(|y| canon(y) == reg).unwrap_or(false);
                         if touches {
-                            let chain = *from_mfma
+                            let chain = from_mfma
                                 && matches!(x.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VMfmaScale16x16x128Fp8)
-                                && matches!(x.srcs.get(2), Some(Src::Reg(c)) if canon(*c) == *reg);
-                            found = Some(if chain { usize::MAX } else { d });
-                            break;
+                                && matches!(x.srcs.get(2), Some(Src::Reg(c)) if canon(*c) == reg);
+                            return if chain { usize::MAX } else { d };
                         }
                         d += if x.op == MOp::SNop { x.imm as usize + 1 } else { 1 };
                     }
-                    dist = dist.min(found.unwrap_or(d));
+                    // the terminator (branch) issues too, but is not counted: conservative
+                    if d >= need || hops == 0 || succs[s].is_empty() {
+                        return d;
+                    }
+                    succs[s].iter().map(|&t| first_touch(t, d, hops - 1, need, reg, from_mfma, snap, succs, canon)).min().unwrap_or(d)
+                }
+                let mut dist = usize::MAX;
+                for &s in &succs[bi] {
+                    dist = dist.min(first_touch(s, 0, MAX_HOPS, remaining, *reg, *from_mfma, &snap, &succs, &canon));
                 }
                 if dist != usize::MAX {
                     missing = missing.max(remaining.saturating_sub(dist));
