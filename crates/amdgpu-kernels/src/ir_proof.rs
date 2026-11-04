@@ -117,6 +117,7 @@ pub struct Trace {
     pub lds_miss: usize,
     pub mfma_a_addr_none: usize,
     pub mfma_a_bytes_empty: usize,
+    pub sample_operand_miss: Option<(i64, usize)>,
     pub sample_miss: Option<i64>,
     pub sample_hit: Option<i64>,
 }
@@ -311,7 +312,16 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             let kb = a_tags.iter().find_map(|t| if let Tag::A(_, k) = t { Some(k / 128) } else { None })
                 .or_else(|| b_tags.iter().find_map(|t| if let Tag::B(_, k) = t { Some(k / 128) } else { None }))
                 .unwrap_or_else(|| cx.cur_tile.as_ref().map(|x| x.1).unwrap_or(-1));
-            if kb < 0 || kb >= cx.args.k / 128 { cx.trace.borrow_mut().mfma_no_tags += 1; return false; }
+            if kb < 0 || kb >= cx.args.k / 128 {
+                cx.trace.borrow_mut().mfma_no_tags += 1;
+                if cx.trace.borrow().sample_operand_miss.is_none() {
+                    if let V::Frag { bytes, addr, .. } = &av {
+                        let n = bytes.iter().filter(|x| **x != Tag::U).count();
+                        cx.trace.borrow_mut().sample_operand_miss = Some((addr.unwrap_or(-1), n));
+                    }
+                }
+                return false;
+            }
             let sa_tags = word_tags(cx.opnd(*scale_a));
             let sb_tags = word_tags(cx.opnd(*scale_b));
             for t in &a_tags { if let Tag::A(m, k) = t { cx.trace.borrow_mut().a_tags.entry(kb).or_default().insert((*m, *k)); } }
