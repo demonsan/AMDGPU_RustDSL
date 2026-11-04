@@ -33,8 +33,47 @@ pub const SLOT_CYCLES: u32 = 32;
 pub const SLOT_BUDGET: u32 = 28;
 /// Register-pressure cap: a floater never moves more than this many slots (MFMAs) above its source position.
 pub const HOIST_SLOTS: usize = 40;
-/// A DMA with no consumer in the region must be issued this many slots before the region end (about the DMA latency).
-pub const DMA_SLOTS: usize = 24;
+/// A DMA with no consumer in the region must be issued this many slots before the region end (about the DMA latency: `DMA_LATENCY_CYCLES` / `SLOT_CYCLES`).
+/// `AMDC_SF_DMA_SLOTS=n` overrides it for sweeps.
+pub const DMA_LATENCY_CYCLES: u32 = 768;
+pub const DMA_SLOTS: usize = (DMA_LATENCY_CYCLES / SLOT_CYCLES) as usize;
+/// Register-pressure budget: the new order may raise the region's peak of live vector dwords (unified VGPR + AGPR) by at most this much over the authored order;
+/// when it would, the hoist cap is halved until it fits (`AMDC_SF_PRESSURE_SLACK=n` overrides).
+pub const PRESSURE_SLACK: i64 = 8;
+
+fn dma_slots() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("AMDC_SF_DMA_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(DMA_SLOTS))
+}
+
+fn pressure_slack() -> i64 {
+    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("AMDC_SF_PRESSURE_SLACK").ok().and_then(|v| v.parse().ok()).unwrap_or(PRESSURE_SLACK))
+}
+
+/// Peak of live vector dwords (VGPR + AGPR tuples counted at full width) while issuing `order` (indices into `insts`), from the region's live-out set.
+pub fn peak_live(m: &MFunction, insts: &[MInst], order: &[usize], live_out: &std::collections::HashSet<VReg>) -> i64 {
+    let width = |r: VReg| -> i64 { if m.vreg_class(r).is_vector() { m.vreg_class(r).dwords() as i64 } else { 0 } };
+    let mut live: std::collections::HashSet<VReg> = live_out.iter().map(|&r| m.canon(r)).collect();
+    let mut cur: i64 = live.iter().map(|&r| width(r)).sum();
+    let mut peak = cur;
+    for &k in order.iter().rev() {
+        let inst = &insts[k];
+        if let Some(d) = inst.dst {
+            if !m.alias.contains_key(&d) && live.remove(&m.canon(d)) {
+                cur -= width(m.canon(d));
+            }
+        }
+        for r in inst.uses() {
+            let c = m.canon(r);
+            if live.insert(c) {
+                cur += width(c);
+            }
+        }
+        peak = peak.max(cur);
+    }
+    peak
+}
 
 fn is_matrix(op: MOp) -> bool {
     crate::agpr::is_mfma(op) || op == MOp::VSmfmac16x16x128Fp8
@@ -72,7 +111,30 @@ fn hard_fence(e: &Effects) -> bool {
 }
 
 /// Re-order one region. `None` = left alone (too few MFMAs, or the result could not be made consistent).
-fn fill_region(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, log: &mut Vec<String>) -> Result<Option<Vec<usize>>, String> {
+fn fill_region(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, live_out: &std::collections::HashSet<VReg>, log: &mut Vec<String>) -> Result<Option<Vec<usize>>, String> {
+    // register-pressure budget: halve the hoist cap until the region's peak of live vector dwords stays within the authored peak + slack
+    let src: Vec<usize> = (0..seg.len()).collect();
+    let budget = peak_live(m, seg, &src, live_out) + pressure_slack();
+    let mut cap = HOIST_SLOTS;
+    loop {
+        let r = fill_region_cap(m, seg, term, o, cap, log)?;
+        match r {
+            None => return Ok(None),
+            Some(order) => {
+                let peak = peak_live(m, seg, &order, live_out);
+                if peak <= budget || cap == 0 {
+                    if o.stats {
+                        log.push(format!("pressure: authored {} -> {peak} (budget {budget}), hoist cap {cap}", budget - pressure_slack()));
+                    }
+                    return Ok(if peak <= budget { Some(order) } else { None });
+                }
+                cap /= 2;
+            }
+        }
+    }
+}
+
+fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist_slots: usize, log: &mut Vec<String>) -> Result<Option<Vec<usize>>, String> {
     let n = seg.len();
     let mf: Vec<usize> = (0..n).filter(|&i| is_matrix(seg[i].op)).collect();
     let mm = mf.len();
@@ -103,7 +165,7 @@ fn fill_region(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, log: &mut
             lo[i] = k;
             continue;
         }
-        let mut l = orig[i].saturating_sub(HOIST_SLOTS);
+        let mut l = orig[i].saturating_sub(hoist_slots);
         for &(p, lat) in &g.preds[i] {
             let c = match mslot[p] {
                 Some(k) => k + 1 + fl(lat),
@@ -121,7 +183,7 @@ fn fill_region(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, log: &mut
         }
         // a consumer outside the region (next iteration / next tile) sees the value at the region end
         let mut d = match cls[i] {
-            Some(Class::Dma) => mm.saturating_sub(DMA_SLOTS),
+            Some(Class::Dma) => mm.saturating_sub(dma_slots()),
             Some(_) => mm.saturating_sub(fl(model::cost(seg[i].op).latency)),
             None => mm,
         };
@@ -291,9 +353,27 @@ fn run_inner(m: &mut MFunction, o: &Options) -> Result<usize, String> {
         let mut out: Vec<MInst> = Vec::with_capacity(insts.len());
         let mut start = 0;
         let mut log: Vec<String> = Vec::new();
+        // live vector registers after every instruction (authored order): the region live-out sets for the pressure model
+        let lv = super::liveness::compute(m);
+        let mut live_after: Vec<std::collections::HashSet<VReg>> = vec![std::collections::HashSet::new(); insts.len() + 1];
+        {
+            let mut live: std::collections::HashSet<VReg> = lv.live_out[bi].iter().map(|&r| m.canon(r)).collect();
+            live_after[insts.len()] = live.clone();
+            for i in (0..insts.len()).rev() {
+                if let Some(d) = insts[i].dst {
+                    if !m.alias.contains_key(&d) {
+                        live.remove(&m.canon(d));
+                    }
+                }
+                for r in insts[i].uses() {
+                    live.insert(m.canon(r));
+                }
+                live_after[i] = live.clone();
+            }
+        }
         let flush = |from: usize, to: usize, out: &mut Vec<MInst>, moved: &mut usize, log: &mut Vec<String>| -> Result<(), String> {
             let seg = &insts[from..to];
-            match fill_region(m, seg, &term, o, log)? {
+            match fill_region(m, seg, &term, o, &live_after[to], log)? {
                 Some(order) => {
                     *moved += order.iter().enumerate().filter(|(k, p)| *k != **p).count();
                     out.extend(order.into_iter().map(|k| seg[k].clone()));
