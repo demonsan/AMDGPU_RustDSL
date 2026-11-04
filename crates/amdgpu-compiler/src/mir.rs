@@ -406,6 +406,8 @@ pub struct MFunction {
     pub alias: HashMap<VReg, (VReg, u8)>,
     /// Emit no s_branch to the immediately following block (set by the scheduler pipeline only).
     pub elide_fallthrough: bool,
+    /// `edgepad` lowering option: block-end MFMA padding follows untouched successors and goes on the edges that need it (hazards.rs)
+    pub edge_pad: bool,
     /// Explicit AGPR placement (mdgpu_pin_agpr): AGPR-class vreg -> first AGPR index. Honoured exactly by the allocator.
     pub agpr_pin: HashMap<VReg, u32>,
 }

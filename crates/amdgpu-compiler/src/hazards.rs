@@ -173,7 +173,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
     let labels: Vec<u32> = m.blocks.iter().map(|b| b.label).collect();
     // `edgepad` (opt-in profile option): follow the successors through blocks that do not touch a register (4 hops) and pad only the edges
     // that need it
-    let edge = crate::lower::opt_on("edgepad");
+    let edge = m.edge_pad;
     let hops = if edge { 4 } else { 0 };
     let mut edge_pads: Vec<(usize, u32, usize)> = Vec::new();
     for (bi, b) in m.blocks.iter_mut().enumerate() {

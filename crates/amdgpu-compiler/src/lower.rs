@@ -168,6 +168,7 @@ impl Lowerer {
             loops: Vec::new(),
             alias: HashMap::new(),
             elide_fallthrough: false,
+            edge_pad: opt_on("edgepad"),
             agpr_pin: Default::default(),
         };
         mir.blocks.push(Block::new(0));

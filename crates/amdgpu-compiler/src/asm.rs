@@ -65,6 +65,7 @@ pub fn block_to_mfunction(b: &AsmBlock, name: &str) -> Result<MFunction, String>
         loops: Vec::new(),
         alias: b.alias().iter().map(|(a, base, off)| (*a, (*base, *off))).collect(),
         elide_fallthrough: false,
+        edge_pad: false,
         agpr_pin: Default::default(),
     })
 }

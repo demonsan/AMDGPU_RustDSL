@@ -14,7 +14,7 @@ fn func(vregs: &[RClass], insts: Vec<MInst>) -> MFunction {
         vregs: vregs.to_vec(),
         loops: vec![],
         alias: HashMap::new(),
-        elide_fallthrough: false,
+        elide_fallthrough: false, edge_pad: false,
         agpr_pin: Default::default(),
     }
 }
@@ -311,7 +311,7 @@ fn counted_loop() -> MFunction {
         vregs,
         loops: vec![(1, 1)],
         alias: HashMap::new(),
-        elide_fallthrough: false,
+        elide_fallthrough: false, edge_pad: false,
         agpr_pin: Default::default(),
     }
 }
