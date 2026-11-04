@@ -25,13 +25,16 @@ fn structural_hash_detects_a_changed_operation() {
     let mut f = kernel_by_name("probe_expr_ids").expect("probe_expr_ids");
     let before = dsl_structural_hash(&f);
     let mut changed = false;
-    for st in &mut f.stmts {
-        if let amdgpu_dsl::Stmt::Let { op: amdgpu_dsl::Op::ConstI32(v), .. } = st {
-            *v = v.wrapping_add(1);
-            changed = true;
-            break;
+    // region-ir: the body is a tree, edited through its linear view (rebuilt, and checked to stay paired)
+    f.edit_stmts(|stmts| {
+        for st in stmts.iter_mut() {
+            if let amdgpu_dsl::Stmt::Let { op: amdgpu_dsl::Op::ConstI32(v), .. } = st {
+                *v = v.wrapping_add(1);
+                changed = true;
+                break;
+            }
         }
-    }
+    });
     assert!(changed, "probe must contain a ConstI32");
     assert_ne!(before, dsl_structural_hash(&f), "hash must change");
     let g = kernel_by_name("probe_expr_ids").unwrap();
