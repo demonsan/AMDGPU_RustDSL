@@ -113,16 +113,16 @@ fn parse_seq(stmts: &[Stmt], mut i: usize, stop_loop: bool, stop_if: bool) -> (V
 }
 
 #[derive(Default)]
-struct Trace {
-    contrib: HashMap<(u32, u8), Vec<i64>>,       // accumulator var, dword -> K generations
-    c_count: HashMap<(i64, i64, i64), usize>,    // m, n, kb
-    stores: HashSet<i64>,                        // C address (2-byte element index)
-    a_tags: HashMap<i64, HashSet<(i64, i64)>>,   // kb -> (m, k)
-    b_tags: HashMap<i64, HashSet<(i64, i64)>>,   // kb -> (n, k)
-    sa_tags: HashMap<i64, HashSet<(i64, i64)>>,  // kb -> (m, kb)
-    sb_tags: HashMap<i64, HashSet<(i64, i64)>>,  // kb -> (block, kb)
-    unknown_ops: HashSet<String>,
-    executed_insts: usize,
+pub struct Trace {
+    pub contrib: HashMap<(u32, u8), Vec<i64>>,       // accumulator var, dword -> K generations
+    pub c_count: HashMap<(i64, i64, i64), usize>,    // m, n, kb
+    pub stores: HashSet<i64>,                        // C address (2-byte element index)
+    pub a_tags: HashMap<i64, HashSet<(i64, i64)>>,   // kb -> (m, k)
+    pub b_tags: HashMap<i64, HashSet<(i64, i64)>>,   // kb -> (n, k)
+    pub sa_tags: HashMap<i64, HashSet<(i64, i64)>>,  // kb -> (m, kb)
+    pub sb_tags: HashMap<i64, HashSet<(i64, i64)>>,  // kb -> (block, kb)
+    pub unknown_ops: HashSet<String>,
+    pub executed_insts: usize,
 }
 
 struct Ctx<'a> {

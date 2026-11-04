@@ -18,7 +18,7 @@ fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
 #[test]
 fn actual_v4_ir_proves_every_output_k_block_and_store() {
     let t = run(None);
-    check_trace(&t, &GemmConfig::v4(), 256, 256, 384).expect("E3 theorem on actual IR");
+    check_trace(&t, &GemmConfig::v4(), 256, 256, 384, None).expect("E3 theorem on actual IR");
     println!("E3 actual-IR trace: insts={} stores={} contributions={}", t.executed_insts, t.stores.len(), t.c_count.len());
 }
 
