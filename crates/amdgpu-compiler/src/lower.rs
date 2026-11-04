@@ -941,6 +941,19 @@ impl Lowerer {
         Ok(())
     }
 
+    /// A scalar source when the operand already is wave-uniform: a literal, an SGPR value or a scalar loop variable (None otherwise; never copies).
+    fn scalar_src(&self, o: Opnd) -> Option<Src> {
+        if let Some(k) = self.const_bits(o) {
+            return Some(Src::Imm(k));
+        }
+        let r = match o {
+            Opnd::Val(v) => *self.val.get(&v)?,
+            Opnd::Var(v) => *self.vars.get(v.0 as usize)?,
+            _ => return None,
+        };
+        (self.mir.vreg_class(r) == RClass::S1).then_some(Src::Reg(r))
+    }
+
     /// `dst = a <op> b` in SALU (both operands uniform).
     fn scalar_bin(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
         let (mut sa, mut sb) = (self.s_operand(a)?, self.s_operand(b)?);
@@ -1890,6 +1903,28 @@ impl Lowerer {
     fn lower_condition(&mut self, cond: Opnd, negate: bool) -> Result<(Pred, Vec<Src>), String> {
         if let Opnd::Val(v) = cond {
             if let Some(op) = self.defs.get(&v).cloned() {
+                // `scalarize2`: a signed compare of two wave-uniform integers (SGPR values / scalar loop variables / literals) branches on SCC:
+                // `s_cmp_lt_i32` + `s_cbranch_scc0/1` - no VGPR copies, no VALU compare, no vcc hazard padding
+                if opt_on("scalarize2") {
+                    if let Op::CmpLtI32(a, b) | Op::CmpGeI32(a, b) = op {
+                        if let (Some(mut sa), Some(sb)) = (self.scalar_src(a), self.scalar_src(b)) {
+                            if !(matches!(sa, Src::Imm(_)) && matches!(sb, Src::Imm(_))) {
+                                if let Src::Imm(k) = sa {
+                                    let r = self.new_vreg(RClass::S1);
+                                    self.push(MInst::new(MOp::SMovB32).def(r).imm(k));
+                                    sa = Src::Reg(r);
+                                }
+                                let regs: Vec<Src> = [sa, sb].into_iter().filter(|s| matches!(s, Src::Reg(_))).collect();
+                                self.touch(&regs);
+                                self.push(MInst::new(MOp::SCmpLtI32).src(sa).src(sb));
+                                // SCC = a < b; Ge branches on its complement
+                                let taken_on_lt = matches!(op, Op::CmpLtI32(..)) != negate;
+                                let on = if taken_on_lt { Pred::Scc1 } else { Pred::Scc0 };
+                                return Ok((on, regs));
+                            }
+                        }
+                    }
+                }
                 match op {
                     Op::CmpLtI32(a, b) => {
                         if let Some(srcs) = self.cmp_lt_scalar_bound(a, b)? {

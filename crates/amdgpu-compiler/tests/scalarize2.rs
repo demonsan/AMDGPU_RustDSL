@@ -69,3 +69,14 @@ fn uniform_clamps_selects_and_readfirstlane_stay_scalar() {
         }
     }
 }
+
+#[test]
+fn uniform_loop_exit_branches_on_scc() {
+    // the demo's loop exit `!(it + 1 < nkv)` compares a scalar loop variable with a kernarg: s_cmp + s_cbranch_scc*, no VALU compare / vcc
+    let ext = asm(&["dce", "cmpfold", "scalarize", "scalarize2"]);
+    assert!(ext.lines().any(|l| l.trim_start().starts_with("s_cbranch_scc")), "{ext}");
+    assert_eq!(count(&ext, "v_cmp_"), 0, "no VALU compare left:\n{ext}");
+    // without scalarize2 the old vcc form stays
+    let base = asm(&["dce", "cmpfold", "scalarize"]);
+    assert!(base.lines().any(|l| l.trim_start().starts_with("s_cbranch_vcc")), "{base}");
+}
