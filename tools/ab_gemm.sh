@@ -17,4 +17,4 @@ for r in $(seq 1 ${ROUNDS:-7}); do
     OURS_CO=build/ab/$K.co OURS_KNAME=$K ./build/gemm_ref_host > build/ab/$K.run.log 2>&1
     echo "$K $r $(grep -E 'timing OURS' build/ab/$K.run.log | sed 's/.*median \([0-9.]*\) TFLOP.*/\1/') $(grep -c GEMM_OK build/ab/$K.run.log)"
   done
-done | awk '{ if ($1 in n) {} ; v[$1]=v[$1] " " $3; ok[$1]+=$4; c[$1]++ } END { for (k in v) { split(v[k], a, " "); n=asort(a); printf "%-34s median %8.1f  min %8.1f  max %8.1f  GEMM_OK %d/%d\n", k, a[int((n+1)/2)], a[1], a[n], ok[k], c[k] } }' | sort
+done | awk '{ v[$1]=v[$1] " " $3; ok[$1]+=$4; c[$1]++ } END { for (k in v) { split(v[k], a, " "); n=asort(a); printf "%-34s median %8.1f  min %8.1f  max %8.1f  GEMM_OK %d/%d\n", k, a[int((n+1)/2)], a[1], a[n], ok[k], c[k] } }' | sort
