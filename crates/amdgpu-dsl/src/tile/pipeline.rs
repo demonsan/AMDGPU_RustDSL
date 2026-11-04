@@ -128,12 +128,14 @@ pub struct Pipeline {
     pub pre_staged: bool,
     /// DIAGNOSTIC (wrong results unless the body has no LDS traffic): no top-of-tile wait + barrier in RegStaged
     pub ablate_no_sync: bool,
+    /// loop-exit bound through read_first_lane (scalar compare)
+    pub scalar_exit: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -222,7 +224,14 @@ impl Pipeline {
             self.nkv_bound.clone(),
             "tile counter (tile::Pipeline): starts at 0 and the loop exits at it >= nkv - 1, so the body only runs with it <= nkv - 2 <= ceil(rows / tile_rows); the guard compares against a derived value the interval engine cannot relate to the bound",
         );
-        let nkv_m1 = b.let_i32(ev(self.nkv) - 1);
+        // wave-uniform: read_first_lane keeps the loop-exit compare scalar (s_cmp + s_cbranch_scc instead of v_cmp -> vcc + hazard nops)
+        let nkv_m1 = if self.scalar_exit {
+            let v = b.bind_i32(ev(self.nkv) - 1);
+            let s = b.read_first_lane(v);
+            b.let_i32(ev(s))
+        } else {
+            b.let_i32(ev(self.nkv) - 1)
+        };
         let stop = b.bind_cond(!varx(it).lt(&nkv_m1));
         b.break_if(stop);
         if self.unroll2 && self.cadence == Cadence::RegStaged {

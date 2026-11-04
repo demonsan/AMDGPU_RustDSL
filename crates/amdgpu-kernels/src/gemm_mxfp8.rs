@@ -1397,6 +1397,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
     pipe.unroll2 = cfg.unroll2;
     pipe.ablate_no_sync = cfg.ablate.no_sync;
+    pipe.scalar_exit = true;
     if cfg.reg_staged && cfg.early_tile0 {
         // the prologue waits for tile 0 only (tile 1's DMAs are the last ones issued; it is published by the loop's first top barrier)
         pipe.prologue_vm = if cfg.wave_roles { a_dma.issues.len() as u8 } else { (a_dma.issues.len() + b_dma.issues.len() + if cfg.scale_panel { 0 } else { 2 }) as u8 };
