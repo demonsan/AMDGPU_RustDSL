@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bitform;
+pub mod convert;
 pub mod ix;
 pub mod layout;
 pub mod proofs;
@@ -23,6 +24,7 @@ pub mod tuple;
 pub mod tv;
 
 pub use bitform::{BitForm, Group};
+pub use convert::{plan_convert, ConvPlan, Movement};
 pub use ix::{DynInfo, Dyns, Ix};
 pub use layout::*;
 pub use swizzle::{ComposedLayout, Swizzle};
