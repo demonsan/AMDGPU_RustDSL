@@ -655,6 +655,14 @@ impl Body {
         let gap = self.cfg.dma_gap.max(1);
         let mut nmma = 0usize;
         let _ = per;
+        // E3 proof hook for the reg-staged (v4) compute path: a real IR branch drops one tile's
+        // MMAs, reproducing the historical "tile 1 swallowed" regression in emitted kernel code.
+        let proof_drop = std::env::var("GEMM_PROOF_DROP_KB").ok().and_then(|v| v.parse::<i32>().ok());
+        if proof_drop.is_some() {
+            let it = ox(t.it);
+            let keep = b.bind_cond(it.ne(proof_drop.unwrap()));
+            b.begin_if(keep);
+        }
         for (lo, hi) in [(0, half), (half, nn)] {
             if lo == half && self.cfg.split_sync && next.is_some() {
                 // the A half of tile t+1 (issued after its B half, one tile ago) is published here, before its first reload; the DMAs of this
@@ -710,6 +718,7 @@ impl Body {
                 }
             }
         }
+        if proof_drop.is_some() { b.end_if(); }
         // whatever is left of the stage (more DMA issues than MMAs after the barrier)
         if let Some((k, s, done, mut cache)) = deferred.take() {
             self.stage_now(b, &k, &s, done..usize::MAX, &mut cache);
