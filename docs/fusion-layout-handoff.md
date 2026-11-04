@@ -157,3 +157,39 @@ built from the same code.
 **Scope of the speedup.** All three kernels use direct global-to-register operand loads, with no LDS staging and no software pipelining. The
 speedup is fusion on equal building blocks: H no longer goes through HBM, and there is one launch fewer. It is not a tuned MLP: absolute
 throughput is far below the GEMM v4 kernel.
+
+### 3.3 Weight-stationary, persistent kernels (`mlp_fp8_ws_{fused,g1,g2}`)
+
+The building blocks of §3.2 are tuned along the structure the shape calls for. The weights are tiny next to the activations (2 × 64 KB
+vs MBs of X / Y) and K = 256, so the GEMM v4 K-loop ring would barely run. Instead:
+
+- **Weights in LDS once per CTA.** Both weight images are DMA'd into LDS (`buffer_load_dwordx4 … lds`, 136 KB) and stay there.
+  - The images are host-prepared with 272-byte rows (256 data + 16 pad), so the 16 rows of a `ds_read_b128` phase hit 16 distinct bank
+    windows.
+  - Every fragment read is a lane base plus an immediate, via `load_lds_b128x2`.
+  - The fused kernel's W2 image is the σ-permuted copy.
+- **Persistent CTAs.** 256 CTAs loop over 128-row blocks (c, c + G, …). Row operands are direct 16-byte loads, and the next block's X is
+  prefetched during GEMM 2.
+- **Same hand-off.** The `StageBoundary` is checked exactly as in §3.2.
+
+**Accuracy.** The same host reference and checks pass: 0 bad, worst relative error 1.6e-3, H checked separately.
+
+**Timing** (MI355X GPU 5, interleaved, medians of 7 × 50 launches):
+
+| M | ws fused | ws unfused pair | fusion speedup | vendor GEMM M×256×256 (one launch) | vendor pair lower bound (2 launches, no activation / requant) |
+|---|---:|---:|---:|---:|---:|
+| 65536 | **22.3 µs** (772 TF/s) | 38.0 µs | **1.71×** | 11.4 µs | 22.8 µs |
+| 262144 | **62.1 µs** (1107 TF/s) | 118.6 µs | **1.91×** | 41.2 µs | 82.4 µs |
+
+**No comparable vendor kernel.** aiter has no fused fp8 MLP with an fp8 intermediate. The closest reference is the aiter/opus blockscale
+GEMM (PR #6696 `.co`) run twice at M×256×256. That is a lower bound for the vendor path: it omits the relu and the fp8 requantisation of H
+(which would need a third kernel or epilogue support). Against that bound:
+
+- the fused kernel matches it at M = 65536 (22.3 vs 22.8 µs);
+- it is 1.33× faster at M = 262144.
+
+Our unfused building blocks are still slower than the vendor GEMM at these shapes (38 vs ≈ 23 µs for the pair).
+
+**Remaining limiter.** The row-operand fragments are built with `cat_frag8(load, load)`, which the lowering materialises with `v_mov`
+right after the loads. Each load pair is therefore followed by `s_waitcnt vmcnt`, which serialises the X prefetch. A copy-free
+`buffer_load_b128x2` has been requested from backend-llvm-tail.
