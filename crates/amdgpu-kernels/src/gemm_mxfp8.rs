@@ -79,6 +79,8 @@ pub struct GemmConfig {
     pub derive_voffsets: bool,
     /// `RegStaged`: tiles 0 / 1 DMA issued before the read-partition setup (Pipeline::pre_staged)
     pub early_dma: bool,
+    /// LDS epilogue in this many row phases (conversion/LDS writes of the next phase overlap the stores of this one); 1 = all at once
+    pub epi_phases: usize,
     pub ablate: Ablate,
 }
 
@@ -87,7 +89,7 @@ impl GemmConfig {
     pub fn v2() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, ablate: Ablate::default(),
         }
     }
     /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
@@ -95,7 +97,7 @@ impl GemmConfig {
     pub fn v3() -> GemmConfig {
         GemmConfig {
             cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, ablate: Ablate::default(),
+            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, ablate: Ablate::default(),
         }
     }
     /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
@@ -959,6 +961,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4_et0" => GemmConfig { early_tile0: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_dv" => GemmConfig { derive_voffsets: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_ed" => GemmConfig { early_dma: true, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_ep2" => GemmConfig { epi_phases: 2, ..GemmConfig::v4() },
+        "gemm_mxfp8_bs_v4_ep4" => GemmConfig { epi_phases: 4, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_eddv" => GemmConfig { early_dma: true, derive_voffsets: true, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_spread2" => GemmConfig { spread_reloads: true, dma_gap: 2, ..GemmConfig::v4() },
         "gemm_mxfp8_bs_v4_tall" => GemmConfig { raster_tall: true, ..GemmConfig::v4() },
@@ -1247,7 +1251,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     }
 
     if let Some(epi) = &epi {
-        lds_epilogue(b, &ctx, &mma, epi, &body.acc, &lane, &s_lane, &s_n, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n);
+        lds_epilogue(b, &ctx, &mma, epi, &body.acc, &lane, &s_lane, &s_n, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, cfg.epi_phases);
         return fb.finish();
     }
     // ---- epilogue: the (swapped) C layout of the atom x C row-major (bf16); 4 consecutive N per lane = one 8-byte store ----
@@ -1288,7 +1292,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
 #[allow(clippy::too_many_arguments)]
 fn lds_epilogue(
     b: &mut FnBuilder, ctx: &Ctx, mma: &TiledMma, epi: &Shared, acc: &[VarId], lane: &Lane, s_lane: &Ix, s_n: &Ix, ptr_c: ValueId, m_v: ValueId,
-    n_v: ValueId, bx: ValueId, by: ValueId, wm: ValueId, wn: ValueId, lg_m: i32, lg_n: i32, wave_m: i64, wave_n: i64,
+    n_v: ValueId, bx: ValueId, by: ValueId, wm: ValueId, wn: ValueId, lg_m: i32, lg_n: i32, wave_m: i64, wave_n: i64, phases: usize,
 ) {
     let d = &ctx.dyns;
     let (nm, nn) = ((wave_m / 16) as usize, (wave_n / 16) as usize);
@@ -1310,22 +1314,6 @@ fn lds_epilogue(
     }
     let wp = layout_to_offsets(&exprs, &Swizzle::none(), ImmRange::DS, d);
     let wbases: Vec<ValueId> = wp.bases.iter().map(|e| b.bind_i32(ev(base) + ctx.lower(e))).collect();
-    me.write(b, 0, |b| {
-        for (n, a) in acc.iter().enumerate() {
-            let v: Vec<ValueId> = (0..4u8).map(|r| {
-                let l = b.frag4_lane(Opnd::Var(*a), r);
-                b.bitcast_f32(l)
-            }).collect();
-            // 4 bf16 = one ds_write_b64
-            let w0 = b.cvt_pk_bf16_f32(v[0], v[1]);
-            let w1 = b.cvt_pk_bf16_f32(v[2], v[3]);
-            let f2 = b.frag2(w0, w1);
-            let (bi, imm) = wp.issues[n];
-            let ad = b.bind_i32(ev(wbases[bi]) + imm as i32);
-            b.store_lds_b64(ad, f2);
-        }
-    });
-    b.wait_lds(0);
     // read / store TV over the wave block element index n + wave_n m: lane -> (chunk = lane % 16: 8 n, row = lane / 16), value -> (8 n, row step 4)
     let rows_per = 64 / (wave_n / 8); // 4
     let issues = wave_m / rows_per; // 32
@@ -1335,12 +1323,6 @@ fn lds_epilogue(
     let rexprs = rp.offsets(&e_blk2, s_lane, &Ix::C(0), d);
     let rpl = layout_to_offsets(&rexprs, &Swizzle::none(), ImmRange::DS, d);
     let rbases: Vec<ValueId> = rpl.bases.iter().map(|e| b.bind_i32(ev(base) + ctx.lower(e))).collect();
-    let vals: Vec<ValueId> = me.read_back(b, 0, |b| {
-        rpl.issues.iter().map(|&(bi, imm)| {
-            let ad = b.bind_i32(ev(rbases[bi]) + imm as i32);
-            b.load_lds_b128(ad)
-        }).collect()
-    });
     // global: C row-major bf16, the wave block at rows m_cta + wave_m wm, cols n_cta + wave_n wn
     let g_blk = make_layout(tup![wave_n, wave_m], tup![2, s_n.mul_c(2)]);
     let gofs = rp.offsets(&g_blk, s_lane, &Ix::C(0), d);
@@ -1351,11 +1333,48 @@ fn lds_epilogue(
         b.buffer_desc_dyn(ptr_c, nr)
     };
     let c_org = { let v = b.bind_i32((((ev(by) << lg_m) * ev(n_v)) + (ev(bx) << lg_n)) << 1); b.read_first_lane(v) };
-    for (q, v) in vals.iter().enumerate() {
-        // the per-issue step is wave-uniform (rows_per rows): checked on the layout expressions
-        let dq = gofs[q].sub(&gofs[0]);
-        let dv = b.bind_i32(ev(c_org) + ctx.lower(&dq));
-        let so = b.read_first_lane(dv);
-        b.buffer_store_b128(rsrc_c, voff, so, 0, *v);
+    // phases of wave_m / phases rows: the conversion + LDS writes of phase p+1 are issued before the stores of phase p (which only wait for
+    // phase p's reads), so conversion, LDS traffic and global stores overlap (the vendor stages quadrant by quadrant)
+    let phases = phases.max(1);
+    let accs_per = acc.len() / phases;
+    let iss_per = issues as usize / phases;
+    let write_phase = |b: &mut FnBuilder, p: usize| {
+        me.write(b, p as i32, |b| {
+            for n in p * accs_per..(p + 1) * accs_per {
+                let a = acc[n];
+                let v: Vec<ValueId> = (0..4u8).map(|r| {
+                    let l = b.frag4_lane(Opnd::Var(a), r);
+                    b.bitcast_f32(l)
+                }).collect();
+                // 4 bf16 = one ds_write_b64
+                let w0 = b.cvt_pk_bf16_f32(v[0], v[1]);
+                let w1 = b.cvt_pk_bf16_f32(v[2], v[3]);
+                let f2 = b.frag2(w0, w1);
+                let (bi, imm) = wp.issues[n];
+                let ad = b.bind_i32(ev(wbases[bi]) + imm as i32);
+                b.store_lds_b64(ad, f2);
+            }
+        });
+    };
+    write_phase(b, 0);
+    for p in 0..phases {
+        b.wait_lds(0);
+        let vals: Vec<ValueId> = me.read_back(b, p as i32, |b| {
+            rpl.issues[p * iss_per..(p + 1) * iss_per].iter().map(|&(bi, imm)| {
+                let ad = b.bind_i32(ev(rbases[bi]) + imm as i32);
+                b.load_lds_b128(ad)
+            }).collect()
+        });
+        if p + 1 < phases {
+            write_phase(b, p + 1);
+        }
+        for (k, v) in vals.iter().enumerate() {
+            let q = p * iss_per + k;
+            // the per-issue step is wave-uniform (rows_per rows): checked on the layout expressions
+            let dq = gofs[q].sub(&gofs[0]);
+            let dv = b.bind_i32(ev(c_org) + ctx.lower(&dq));
+            let so = b.read_first_lane(dv);
+            b.buffer_store_b128(rsrc_c, voff, so, 0, *v);
+        }
     }
 }
