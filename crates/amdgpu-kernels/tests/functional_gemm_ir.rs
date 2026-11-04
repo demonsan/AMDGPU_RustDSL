@@ -18,14 +18,14 @@ fn run(drop: Option<i64>) -> amdgpu_kernels::ir_proof::Trace {
 #[test]
 fn actual_v4_ir_proves_every_output_k_block_and_store() {
     let t = run(None);
-    println!("E3 trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?} bstores={} no_origin={} lds_so={} lds_ro={} store={:?} read={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops, t.buffer_stores, t.buffer_store_no_origin, t.lds_store_origins, t.lds_read_origins, t.sample_store, t.sample_read);
+    println!("E3 trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?} bstores={} no_origin={} lds_so={} lds_ro={} store={:?} read={:?} epi_read={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops, t.buffer_stores, t.buffer_store_no_origin, t.lds_store_origins, t.lds_read_origins, t.sample_store, t.sample_read, t.sample_epi_read);
     check_trace(&t, &GemmConfig::v4(), 256, 256, 384, None).expect("E3 theorem on actual IR");
 }
 
 #[test]
 fn actual_kernel_tile1_bug_has_a_concrete_counterexample() {
     let t = run(Some(1));
-    println!("E3 bug trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?} bstores={} no_origin={} lds_so={} lds_ro={} store={:?} read={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops, t.buffer_stores, t.buffer_store_no_origin, t.lds_store_origins, t.lds_read_origins, t.sample_store, t.sample_read);
+    println!("E3 bug trace: insts={} stores={} c_count={} contrib_vars={} unknown={:?} bstores={} no_origin={} lds_so={} lds_ro={} store={:?} read={:?} epi_read={:?}", t.executed_insts, t.stores.len(), t.c_count.len(), t.contrib.len(), t.unknown_ops, t.buffer_stores, t.buffer_store_no_origin, t.lds_store_origins, t.lds_read_origins, t.sample_store, t.sample_read, t.sample_epi_read);
     let e = check_trace(&t, &GemmConfig::v4(), 256, 256, 384, Some(1)).expect_err("dropped tile must leave a hole");
     assert!(e.contains("C[0,0]") && e.contains("K block 1"), "counterexample: {e}");
     println!("E3 actual-kernel counterexample: {e}");

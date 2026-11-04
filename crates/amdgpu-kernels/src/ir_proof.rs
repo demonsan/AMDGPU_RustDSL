@@ -128,6 +128,7 @@ pub struct Trace {
     pub lds_read_origins: usize,
     pub sample_store: Option<(String, i64, i64)>,
     pub sample_read: Option<(String, i64, i64, usize)>,
+    pub sample_epi_read: Option<(String, i64, i64, usize)>,
     pub executed_insts: usize,
 }
 
@@ -471,7 +472,10 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     for d in 0..n / 4 {
         if let Some((_, o)) = cx.lds.get(&(tile.clone(), *ver, a + 4 * d as i64)) { origins[d] = *o; }
     }
-    if cx.trace.sample_read.is_none() { cx.trace.sample_read = Some((tile.clone(), *ver, a, origins.iter().filter(|x| x.is_some()).count())); }
+    let n_o = origins.iter().filter(|x| x.is_some()).count();
+    cx.trace.lds_read_origins += n_o;
+    if cx.trace.sample_read.is_none() { cx.trace.sample_read = Some((tile.clone(), *ver, a, n_o)); }
+    if tile == "EPI" && cx.trace.sample_epi_read.is_none() { cx.trace.sample_epi_read = Some((tile.clone(), *ver, a, n_o)); }
     V::Frag { bytes, origins }
 }
 fn lds_read_word(cx: &mut Ctx<'_>, addr: Opnd) -> V {
