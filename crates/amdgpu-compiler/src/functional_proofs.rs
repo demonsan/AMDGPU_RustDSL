@@ -102,6 +102,26 @@ fn norm_mul(factors: Vec<E>) -> E {
     match rest.len() { 0 => E::Const(1.0), 1 => rest.pop().unwrap(), _ => E::Mul(rest) }
 }
 
+/// Distribute multiplication over sums: returns a list of product terms.
+fn expand_mul(fs: Vec<E>) -> Vec<E> {
+    if fs.is_empty() { return vec![E::Const(1.0)]; }
+    let mut it = fs.into_iter();
+    let first = it.next().unwrap();
+    let rest: Vec<E> = it.collect();
+    match first {
+        E::Add(xs) => {
+            let mut out = Vec::new();
+            for x in xs {
+                let mut p = vec![x];
+                p.extend(rest.clone());
+                out.extend(expand_mul(p));
+            }
+            out
+        }
+        other => expand_mul(rest).into_iter().map(|p| mul(other.clone(), p)).collect(),
+    }
+}
+
 fn norm(e: E) -> E {
     match e {
         E::Const(_) | E::Var(_) => e,
@@ -111,7 +131,14 @@ fn norm(e: E) -> E {
             y => E::Neg(Box::new(y)),
         },
         E::Add(xs) => norm_add(xs.into_iter().map(norm).collect()),
-        E::Mul(xs) => norm_mul(xs.into_iter().map(norm).collect()),
+        E::Mul(xs) => {
+            let fs: Vec<E> = xs.into_iter().map(norm).collect();
+            if fs.iter().any(|f| matches!(f, E::Add(_))) {
+                norm_add(expand_mul(fs).into_iter().map(norm).collect())
+            } else {
+                norm_mul(fs)
+            }
+        }
         E::Exp(x) => exp(norm(*x)),
     }
 }
