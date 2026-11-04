@@ -1174,7 +1174,7 @@ impl PipeBody for Body {
         // MMAs of tile generation 1, which is the historical "tile 1 swallowed" regression.
         let proof_drop = std::env::var("GEMM_PROOF_DROP_KB").ok().and_then(|v| v.parse::<i32>().ok());
         if proof_drop.is_some() {
-            let it = crate::tile::ev(t.it);
+            let it = amdgpu_dsl::tile::ev(t.it);
             b.begin_if(it.neq(proof_drop.unwrap()));
         }
         for i in 0..nm {
