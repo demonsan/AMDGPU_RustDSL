@@ -833,9 +833,18 @@ impl PipeBody for Body {
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
         let Some(p) = &self.panel else { return };
         let Some(job) = p.job else { return };
+        let stamp = |b: &mut FnBuilder, s: &Option<(ValueId, ValueId, bool)>, slot: u32| {
+            if let Some((buf, rec, _)) = s {
+                let st = b.memtime_lo();
+                b.stamp_store(*buf, *rec, slot, st);
+            }
+        };
+        let sc = self.stamp;
+        stamp(b, &sc, 5); // slot 5: every prologue DMA issued
         // the panel DMA was issued before the two tile stages: wait for it only (in-order VMEM returns)
         let after = 2 * (self.a_dma.issues.len() + self.b_dma.issues.len());
         b.wait_vm(after.min(63) as u8);
+        stamp(b, &sc, 6); // slot 6: own panel DMA landed
         // publish the panel (the protocol is cross-wave), gather every round, one barrier, write every round (the pipeline prologue barrier
         // publishes the result): 2 barriers in all, the tiles' DMA keeps running behind
         b.barrier();
@@ -853,7 +862,9 @@ impl PipeBody for Body {
             (b.bind_i32(ev(w).lshr(ev(shv)) & 255), dst)
         });
         b.wait_lds(0);
+        stamp(b, &sc, 7); // slot 7: gathered (before the mid barrier)
         b.barrier();
+        stamp(b, &sc, 8); // slot 8: mid barrier passed
         pr.write(b, |b| {
             for (round, (d0, d1)) in packed.iter().enumerate() {
                 let a0 = b.bind_i32(ev(job.wr0) + 2048 * round as i32);
@@ -868,6 +879,10 @@ impl PipeBody for Body {
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         self.in_loop = true;
+        if let Some((buf, rec, _)) = self.stamp {
+            let st = b.memtime_lo();
+            b.stamp_store(buf, rec, 9, st); // slot 9: prologue wait + barrier passed (tiles 0/1 + transposed panel visible)
+        }
         if self.cfg.reg_staged {
             self.load_tile(b, t0);
         }
