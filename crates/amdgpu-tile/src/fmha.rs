@@ -299,10 +299,13 @@ impl PipeBody for AttnBody3<'_> {
 pub struct Vs128Cfg {
     /// vendor-style epilogue: O^T through the wave-private scratch (2 x ds_write_b32 per 4 dims, ds_read_b128 rows) and 8 x 16-byte row stores
     pub epi_lds: bool,
+    /// vendor-style epilogue in registers: v_permlane32_swap pairs the 8-byte words of the two lane halves into 16 contiguous bytes per lane, 8 x
+    /// 16-byte row stores per wave, no LDS round trip (takes precedence over `epi_lds`)
+    pub epi_perm: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -321,7 +324,9 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
-            if cfg.epi_lds {
+            if cfg.epi_perm {
+                store_out3_perm(&io, b, &blk, &body.o.expect("O"), fin);
+            } else if cfg.epi_lds {
                 store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
             } else {
                 store_out3(&io, b, &blk, &body.o.expect("O"), fin);
@@ -543,6 +548,32 @@ pub fn store_out3(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C
             vals.push(b.frag2(w0, w1));
         }
         part.store(b, &ptrs, e, &vals);
+    }
+    b.end_if();
+}
+
+/// The bf16 epilogue in registers: lane (j, h) holds dims 32 e + 8 q + 4 h + 0..3 of query j; `permlane32_swap(word(q = 2p), word(q = 2p + 1))`
+/// leaves dims 16 p + 0..7 (h = 0) / 16 p + 8..15 (h = 1) in the lane as (a' dwords, b' dwords): one 16-byte store at dims 32 e + 16 p + 8 h.
+pub fn store_out3_perm(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C32x32F32, 4>, fin: ValueId) {
+    let o_tile = io.o.tile(vec![ev(blk.bidx), I32::c(0), ev(blk.hidx), I32::c(0)]).clamp(1, io.s_len.clone(), blk.s_last.clone());
+    let row = b.let_i32(o_tile.offset(&[I32::c(0), &blk.row0 + blk.lane.j(), I32::c(0), I32::c(0)]));
+    let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
+    b.begin_if(Opnd::Val(live));
+    let off = b.bind_i32(row + (blk.lane.half() << 4));
+    let ptr = b.ptr_add(io.o.ptr, off);
+    for e in 0..4usize {
+        let words: Vec<[ValueId; 2]> = (0..4usize)
+            .map(|q| {
+                let v4: Vec<ValueId> = (0..4usize).map(|k| { let lv = b.frag16_lane(Opnd::Var(o.accs[e].var), (4 * q + k) as u8); let f = b.bitcast_f32(lv); b.mul_f32(f, fin) }).collect();
+                [b.cvt_pk_bf16_f32(v4[0], v4[1]), b.cvt_pk_bf16_f32(v4[2], v4[3])]
+            })
+            .collect();
+        for p in 0..2usize {
+            let (a0, b0) = b.permlane32_swap(words[2 * p][0], words[2 * p + 1][0]);
+            let (a1, b1) = b.permlane32_swap(words[2 * p][1], words[2 * p + 1][1]);
+            let v = b.frag4(a0, a1, b0, b1);
+            b.store_f32x4(ptr, (64 * e + 32 * p) as u32, v);
+        }
     }
     b.end_if();
 }
