@@ -240,6 +240,10 @@ pub enum MOp {
     // scalar ALU / memory
     SLoadDword,
     SLoadDwordx2,
+    /// `s_memtime s[d:d+1]` (64-bit core-clock counter; dst S2). SMEM: its result needs `lgkmcnt(0)`.
+    SMemTime,
+    /// `s_mov_b32 d, lo(src)`: the low dword of an S2 pair (dst S1, src S2).
+    SLoPart,
     SReadPhys,
     SMovB32,
     SAddU32,

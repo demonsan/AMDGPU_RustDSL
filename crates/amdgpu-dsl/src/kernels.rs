@@ -22890,3 +22890,35 @@ pub fn probe_dma_voff_spill() -> Function {
     b.store_f32(row, 0, r);
     b.finish()
 }
+
+/// Stamp probe (`FnBuilder::memtime_lo`): per wave record of 8 u32 in `out`: [t0, t1, t2, t3, x, 0, 0, 0] where t0..t3 are `s_memtime` low words taken around a dependent
+/// VALU chain (t0 -> t1), back to back (t1 -> t2, the stamp cost itself) and around a scalar chain (t2 -> t3); x keeps the chains alive. Grid (n, 1, 1), block 256.
+pub fn probe_stamp() -> Function {
+    let mut b = FnBuilder::new("probe_stamp", 256);
+    b.arg("out", DType::Ptr, 0, 8);
+    let out = b.let_(Op::KernargPtr { offset: 0 });
+    let bx = b.let_(Op::WorkgroupIdX);
+    let tid = b.let_(Op::WorkitemId);
+    let rec = b.stamp_rec_off(bx, 8, 4);
+    let c3 = b.c_i32(3);
+    let t0 = b.memtime_lo();
+    let mut x = tid;
+    for _ in 0..128 {
+        x = b.add_i32(x, c3);
+        x = b.let_(Op::XorI32(Opnd::Val(x), Opnd::Val(tid)));
+    }
+    let t1 = b.memtime_lo();
+    let t2 = b.memtime_lo();
+    let mut y = bx;
+    for _ in 0..64 {
+        y = b.mul_i32(y, c3);
+    }
+    let t3 = b.memtime_lo();
+    b.stamp_store(out, rec, 0, t0);
+    b.stamp_store(out, rec, 1, t1);
+    b.stamp_store(out, rec, 2, t2);
+    b.stamp_store(out, rec, 3, t3);
+    b.stamp_store(out, rec, 4, x);
+    b.stamp_store(out, rec, 5, y);
+    b.finish()
+}

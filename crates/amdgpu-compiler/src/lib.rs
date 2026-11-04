@@ -296,6 +296,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_agpr_reload4_ref" => Some(amdgpu_dsl::kernels::probe_agpr_reload4_ref()),
         "probe_agpr_reload4" => Some(amdgpu_dsl::kernels::probe_agpr_reload4()),
         "probe_dma_voff_spill" => Some(amdgpu_dsl::kernels::probe_dma_voff_spill()),
+        "probe_stamp" => Some(amdgpu_dsl::kernels::probe_stamp()),
         "probe_agpr_ref" => Some(amdgpu_dsl::kernels::probe_agpr_ref()),
         "probe_agpr_acc" => Some(amdgpu_dsl::kernels::probe_agpr_acc()),
         "probe_agpr_full" => Some(amdgpu_dsl::kernels::probe_agpr_full()),

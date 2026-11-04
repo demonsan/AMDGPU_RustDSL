@@ -11,6 +11,7 @@
 //      TILE_M/TILE_N (256), BLOCK (256), SEED
 #include <hip/hip_runtime.h>
 #include "generated_gemm/shipped_abi.h"
+#include "stamp_host.h"
 
 #include <algorithm>
 #include <cmath>
@@ -125,6 +126,21 @@ int main() {
         CK(hipModuleGetFunction(&fn, mod, kn));
         size_t asz = sizeof(ka);
         void* extra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &ka, HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};
+        // OURS_STAMPS: STAMPS=1 launches the OURS kernel through the hand ABI with a debug-stamp buffer as one extra pointer argument at kernarg offset 96
+        // (kernel built with GEMM_STAMP=ends|tiles, crates/amdgpu-kernels gemm_mxfp8.rs); the last launch's per-wave stamps are written to STAMP_DUMP (default stamps.u32).
+        const bool stamps = which[0] == 'O' && envi("STAMPS", 0) != 0;
+        const int stamp_slots = envi("STAMP_SLOTS", 96);
+        StampBuffer* sbp = nullptr;
+        std::vector<char> ka2;
+        if (stamps) {
+            sbp = new StampBuffer((int)(grid.x * grid.y), 4, stamp_slots);
+            ka2.assign(104, 0);
+            std::memcpy(ka2.data(), &ka, 96);
+            void* sp = sbp->ptr();
+            std::memcpy(ka2.data() + 96, &sp, 8);
+            asz = 104;
+            extra[1] = ka2.data();
+        }
         std::function<void()> launch;
         bool generated = false;
         // Route-B P5: for OURS, launch from the generated ABI/validate/launch header. REF/vendor keeps
@@ -140,7 +156,7 @@ int main() {
             a.stride_sfa_batch = M * KB; a.stride_sfb_batch = (N / 128) * KB;
         };
         const dim3 logical_grid(N / tn, M / tm, 1);
-        const bool use_generated = which[0] == 'O' && std::getenv("REF_GEMM_ABI_OFF") == nullptr;
+        const bool use_generated = which[0] == 'O' && std::getenv("REF_GEMM_ABI_OFF") == nullptr && !stamps;
         if (use_generated && kn && std::strstr(kn, "v4")) {
             fill_common(ga4);
             Gen4::BufferSizes sz{};
@@ -200,6 +216,13 @@ int main() {
             std::printf("timing %s: median %.2f TFLOP/s (%.4f ms) over %d reps x %d iters; runs:", which, s[s.size() / 2], flops / (s[s.size() / 2] * 1e12) * 1e3, reps, iters);
             for (double t : tfs) std::printf(" %.1f", t);
             std::printf("  [M=%d N=%d K=%d grid=(%u,%u) block=%d]\n", M, N, K, grid.x, grid.y, BLOCK);
+        }
+        if (sbp) {
+            CK(hipDeviceSynchronize());
+            sbp->read();
+            sbp->summary(stdout);
+            const char* dp = std::getenv("STAMP_DUMP");
+            std::printf("stamps dump %s: %s\n", dp && *dp ? dp : "stamps.u32", sbp->dump(dp && *dp ? dp : "stamps.u32") ? "written" : "FAILED");
         }
         CK(hipModuleUnload(mod));
     }

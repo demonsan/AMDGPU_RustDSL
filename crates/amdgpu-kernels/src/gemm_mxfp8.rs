@@ -13,6 +13,9 @@ use amdgpu_isa::{MmaAtom, DS_READ_B128X2};
 use amdgpu_layout::{composition, layout_to_offsets, make_layout, right_inverse, tup, ComposedLayout, ImmRange, IssuePlan, Ix, Layout, Swizzle};
 use amdgpu_tile::{gemm, make_tiled_copy_a, make_tiled_copy_b, make_tiled_mma, Ctx, LdsPart, TiledMma};
 
+/// Slots per wave record of the optional timing stamps (`GEMM_STAMP`): 0 kernel start, 1 setup done, 2 prologue done, 3 loop done, 4 epilogue stores issued, 16 + tile = the tile matrix phase.
+const STAMP_SLOTS: usize = 96;
+
 /// Diagnostic ablations (wrong results, timing only): remove one stream to measure the others.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Ablate {
@@ -386,6 +389,8 @@ struct Body {
     /// MMAs of the register tile already issued by `pre_sync`
     npre_done: usize,
     in_loop: bool,
+    /// timing stamps (GEMM_STAMP=ends|tiles): debug buffer, this wave's record offset, per-tile stamps
+    stamp: Option<(ValueId, ValueId, bool)>,
     /// register-staged tile (`RegStaged`): initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
     staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, ValueId)>,
     rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, VarId)>,
@@ -817,6 +822,10 @@ impl PipeBody for Body {
         if self.cfg.reg_staged {
             self.load_tile(b, t0);
         }
+        if let Some((buf, rec, _)) = self.stamp {
+            let st = b.memtime_lo();
+            b.stamp_store(buf, rec, 2, st); // slot 2: prologue done (tile 0 fragments requested), about to enter the tile loop
+        }
     }
     fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
         let mut v: Vec<(DType, Opnd)> = (0..(self.cfg.wave_m() / 16) * (self.cfg.wave_n() / 16)).map(|_| (DType::Frag4, Opnd::Val(self.zero4))).collect();
@@ -865,6 +874,14 @@ impl PipeBody for Body {
         self.npre_done = n;
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+        if let Some((buf, rec, true)) = self.stamp {
+            // slot 16 + tile: the wave reached this tile's matrix phase (after the tile's top wait + barrier and its DMA issue)
+            let st = b.memtime_lo();
+            let four = b.c_i32(4);
+            let ti = b.mul_i32(t.it, four);
+            let off = b.add_i32(rec, ti);
+            b.stamp_store(buf, off, 16, st);
+        }
         if self.cfg.reg_staged {
             self.compute_tile(b, t);
         }
@@ -1057,6 +1074,12 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let b = &mut fb;
     declare_abi(b);
     declare_contract(b, cta_m, cta_n);
+    // timing stamps (opt-in debug build, GEMM_STAMP=ends|tiles): one extra pointer argument after the ABI (offset 96); see docs/stamps.md
+    let stamp_mode = std::env::var("GEMM_STAMP").ok().filter(|v| v == "ends" || v == "tiles");
+    if stamp_mode.is_some() {
+        b.arg("dbg_stamps", DType::Ptr, 96, 8);
+        b.arg_tensor("dbg_stamps", Ext::sym("MT") * Ext::sym("NT") * Ext::c((4 * STAMP_SLOTS * 4) as i64));
+    }
     DERIVE_VOFF.with(|x| x.set(cfg.derive_voffsets));
     BITFIELD_VOFF.with(|x| x.set(cfg.bitfield_voffsets));
     let ptr_a = b.let_(Op::KernargPtr { offset: 0 });
@@ -1072,6 +1095,16 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let lane = Lane::from_tid(b, tid);
     let bx0 = b.let_(Op::WorkgroupIdX); // N tile
     let by0 = b.let_(Op::WorkgroupIdY); // M tile
+    let stamp_ctx: Option<(ValueId, ValueId, bool)> = stamp_mode.as_ref().map(|mode| {
+        let buf = b.let_(Op::KernargPtr { offset: 96 });
+        let nt = b.bind_i32(ev(n_v).lshr(cta_n.trailing_zeros() as i32));
+        let lin = b.bind_i32(ev(bx0) + ev(by0) * ev(nt));
+        let rec = b.stamp_rec_off(lin, STAMP_SLOTS as u32, 4);
+        b.assume_trusted(rec, Ext::c(0), Ext::sym("MT") * Ext::sym("NT") * Ext::c((4 * STAMP_SLOTS * 4) as i64) - Ext::c(4 * STAMP_SLOTS as i64), "debug stamps: the record offset (workgroup * 4 + wave) * slots * 4 is inside dbg_stamps by construction (grid = NT x MT, 4 waves)");
+        let t0 = b.memtime_lo();
+        b.stamp_store(buf, rec, 0, t0); // slot 0: kernel start
+        (buf, rec, mode == "tiles")
+    });
     // XCD-aware raster (FMHA_ABLATE=xcd, experiment): workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
     // give every XCD whole 4 x 4 blocks of tiles (4 A + 4 B panels instead of all A panels). Only for a 16 x 16 tile grid here; identity otherwise.
     let (bx, by) = if cfg.xcd_raster {
@@ -1289,7 +1322,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
         cfg, kb_v, role_a, role_rsrc, panel, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false, npre_done: 0,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false, npre_done: 0, stamp: stamp_ctx,
     };
     if cfg.early_dma {
         // tiles 0 and 1 issued as soon as their addresses exist (the read partitions and the rest of the setup follow behind the DMA)
@@ -1302,7 +1335,15 @@ fn build(name: &str, cfg: Cfg) -> Function {
         body.b_rd = Some(y);
         pipe.pre_staged = true;
     }
+    if let Some((buf, rec, _)) = stamp_ctx {
+        let st = b.memtime_lo();
+        b.stamp_store(buf, rec, 1, st); // slot 1: setup done, entering the pipeline (prologue)
+    }
     pipe.run(b, Role::All, &mut body);
+    if let Some((buf, rec, _)) = stamp_ctx {
+        let st = b.memtime_lo();
+        b.stamp_store(buf, rec, 3, st); // slot 3: the tile loop and the peeled last tile are done (epilogue next)
+    }
     for v in body.acc.iter().take(cfg.acc_agpr) {
         b.pin_agpr(*v);
     }
@@ -1314,6 +1355,10 @@ fn build(name: &str, cfg: Cfg) -> Function {
 
     if let Some(epi) = &epi {
         lds_epilogue(b, &ctx, &mma, epi, &body.acc, &lane, &s_lane, &s_n, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, cfg.epi_phases);
+        if let Some((buf, rec, _)) = stamp_ctx {
+            let st = b.memtime_lo();
+            b.stamp_store(buf, rec, 4, st); // slot 4: epilogue stores issued
+        }
         return fb.finish();
     }
     // ---- epilogue: the (swapped) C layout of the atom x C row-major (bf16); 4 consecutive N per lane = one 8-byte store ----
@@ -1343,6 +1388,10 @@ fn build(name: &str, cfg: Cfg) -> Function {
         let f2 = b.frag2(w0, w1);
         let (bi, imm) = plan.issues[n];
         b.store_f32x2(bases[bi], imm as u32, f2);
+    }
+    if let Some((buf, rec, _)) = stamp_ctx {
+        let st = b.memtime_lo();
+        b.stamp_store(buf, rec, 4, st);
     }
     fb.finish()
 }

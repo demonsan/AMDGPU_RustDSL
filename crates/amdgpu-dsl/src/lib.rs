@@ -134,6 +134,9 @@ pub enum Op {
     KernargF32 { offset: u32 },
     KernargPtr { offset: u32 },
 
+    /// Low 32 bits of the wave's `s_memtime` (core-clock counter) taken here, wave-uniform. `id` only keeps two stamps from comparing equal. The lowering pins the
+    /// stamp in program order (it is a fence for the scheduler) and drains `lgkmcnt` right after it (SMEM result): place stamps where the kernel already waits.
+    MemTimeLo { id: u32 },
     WorkitemId,
     WorkgroupIdX,
     WorkgroupIdY,
@@ -286,7 +289,7 @@ pub enum Op {
 impl Op {
     pub fn result_ty(&self) -> DType {
         match self {
-            Op::ConstI32(_) | Op::KernargI32 { .. } | Op::AddI32(..) | Op::MulI32(..) => DType::I32,
+            Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::AddI32(..) | Op::MulI32(..) => DType::I32,
             Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::MinI32(..) | Op::XorI32(..) | Op::LoadU16 { .. } => DType::I32,
             Op::ConstF32(_) | Op::KernargF32 { .. } => DType::F32,
             Op::AddF32(..) | Op::SubF32(..) | Op::MulF32(..) | Op::MaxF32(..) | Op::FmaF32(..) => {
@@ -342,7 +345,7 @@ impl Op {
     pub fn operands(&self) -> Vec<Opnd> {
         match self {
             Op::ConstI32(_) | Op::ConstF32(_) | Op::KernargI32 { .. } | Op::KernargF32 { .. }
-            | Op::KernargPtr { .. } | Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY
+            | Op::KernargPtr { .. } | Op::MemTimeLo { .. } | Op::WorkitemId | Op::WorkgroupIdX | Op::WorkgroupIdY
             | Op::WorkgroupIdZ => vec![],
             Op::AddI32(a, b)
             | Op::MulI32(a, b)
@@ -1752,6 +1755,33 @@ impl FnBuilder {
     }
     pub fn barrier(&mut self) {
         self.f.stmts.push(Stmt::Barrier);
+    }
+    /// Timing stamp: the low 32 bits of this wave's `s_memtime` (core-clock ticks), as a wave-uniform i32 value. Subtract two stamps (wrapping `sub`) for cycles;
+    /// store them through a debug-buffer argument (`store_f32` of the value / bitcast) to read per-wave stamps on the host (`tools/stamp_host.py`, `docs/stamps.md`).
+    /// Opt-in: a kernel without stamps compiles to the same instructions as before. Cost: one `s_memtime` + a full `s_waitcnt lgkmcnt(0)` + one `s_mov_b32`; put
+    /// stamps at points where the kernel already drains (e.g. right after a tile's `vmcnt(0) lgkmcnt(0)` + barrier). Pinned in program order against other memory ops.
+    /// Byte offset of this wave's stamp record in a debug buffer laid out `[workgroup][wave][slot]` of u32: `((wg * waves_per_wg + tid / 64) * slots) * 4`.
+    /// `wg` is the linear workgroup index (for a 2-D grid pass `bx + by * grid_x`).
+    pub fn stamp_rec_off(&mut self, wg: impl Into<Opnd>, slots: u32, waves_per_wg: u32) -> ValueId {
+        let tid = self.let_(Op::WorkitemId);
+        let c6 = self.c_i32(6);
+        let wave = self.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+        let cw = self.c_i32(waves_per_wg as i32);
+        let wgw = self.mul_i32(wg.into(), cw);
+        let idx = self.add_i32(wgw, wave);
+        let cb = self.c_i32((slots * 4) as i32);
+        self.mul_i32(idx, cb)
+    }
+    /// Store a stamp (or any i32) into slot `slot` of the record at `rec_off` (from `stamp_rec_off`) of the debug buffer `buf` (a pointer argument). All 64 lanes
+    /// store the same dword to the same address (one coalesced write).
+    pub fn stamp_store(&mut self, buf: impl Into<Opnd>, rec_off: impl Into<Opnd>, slot: u32, stamp: ValueId) {
+        let p = self.ptr_add(buf, rec_off);
+        let f = self.bitcast_f32(stamp);
+        self.store_f32(p, slot * 4, f);
+    }
+    pub fn memtime_lo(&mut self) -> ValueId {
+        let id = self.f.value_tys.len() as u32;
+        self.let_(Op::MemTimeLo { id })
     }
 }
 

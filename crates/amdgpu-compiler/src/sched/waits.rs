@@ -118,7 +118,8 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
         }
         // Barrier-class instructions (s_barrier, s_setprio, s_nop, the LDS-DMA loads, cache maintenance) are ordering fences for the list scheduler, but the ones that read
         // registers (a DMA's voffset / soffset) still need their operands to have arrived: they fall through to the operand check below.
-        Fence::Barrier | Fence::SetPrio | Fence::Nop if e.reads.is_empty() || skip_fence_operands() => {
+        // (a fenced SMEM op, the timing stamp `s_memtime`, is the exception: its result must still be tracked, so it falls through)
+        Fence::Barrier | Fence::SetPrio | Fence::Nop if (e.reads.is_empty() || skip_fence_operands()) && !e.smem => {
             if let Some(o) = out {
                 o.push(inst.clone());
             }
@@ -151,6 +152,9 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
     }
     if e.fence != Fence::None {
         // (not tracked in the queues: a DMA writes no register, and counting it would only loosen the partial waits of the shipped kernels)
+        if e.smem {
+            st.lg.issue(id, e.writes.clone(), true, LG_MAX); // the s_memtime stamp: an SMEM result that the next reader waits for
+        }
         if let Some(o) = out {
             o.push(inst.clone());
         }

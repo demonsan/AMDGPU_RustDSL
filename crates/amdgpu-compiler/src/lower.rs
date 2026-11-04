@@ -1962,6 +1962,15 @@ impl Lowerer {
                 self.pending_smem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
+            Op::MemTimeLo { .. } => {
+                let t = self.new_vreg(RClass::S2);
+                self.push(MInst::new(MOp::SMemTime).def(t));
+                self.pending_smem.push(self.mir.canon(t));
+                self.touch(&[Src::Reg(t)]); // the stamp is read right away: this emits the `s_waitcnt lgkmcnt(0)` (SMEM returns out of order, so it is a full drain)
+                let lo = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SLoPart).def(lo).srcreg(t));
+                self.val.insert(dst, lo);
+            }
             Op::KernargPtr { offset } => {
                 let d = self.new_vreg(RClass::S2);
                 self.push(MInst::new(MOp::SLoadDwordx2).def(d).imm(*offset as i64));
@@ -3272,7 +3281,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                         cst.insert(*dst, *k as i64);
                     }
                     let uni = match op {
-                        Op::ConstI32(_) | Op::KernargI32 { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
+                        Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::WorkgroupIdX | Op::WorkgroupIdY | Op::WorkgroupIdZ => true,
                         // waveuni: `workitem_id >> k` (k >= 6) is constant within a 64-lane wave (1-D workgroups)
                         Op::LshrI32(Opnd::Val(a), b) if wi.contains(a) && opt_on("waveuni") => match b {
                             Opnd::I32(k) => *k >= 6,
