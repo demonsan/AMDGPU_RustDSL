@@ -2669,8 +2669,8 @@ pub fn verify(f: &Function) -> Vec<String> {
             Stmt::WaitLds { .. } | Stmt::Barrier | Stmt::SetPrio { .. } | Stmt::SchedGroup { .. } | Stmt::WaitVm { .. } | Stmt::StageEnd => {}
             Stmt::StageBegin { name, contract } => {
                 for v in contract.live_in.iter().chain(contract.live_out.iter()).flat_map(|x| x.values.iter()) {
-                    if v.0 as usize >= f.values.len() {
-                        errs.push(here(format!("stage {name}: contract value v{} is not defined", v.0)));
+                    if let Err(e) = opnd_ty(f, Opnd::Val(*v)) {
+                        errs.push(here(format!("stage {name}: contract value v{v}: {e}")));
                     }
                 }
             }
