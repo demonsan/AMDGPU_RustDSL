@@ -54,7 +54,8 @@ pub fn by_name(name: &str) -> Option<Function> {
     for (r, (g, w)) in got.iter().zip(want.iter()).enumerate() {
         let d = b.bind_i32(ev(*g) ^ ev(*w));
         let vo = b.bind_i32((lane.clone() * nv as i32 + r as i32) << 2);
-        b.buffer_store_f32(rsrc, vo, 0i32, 0, d);
+        let df = b.bitcast_f32(d);
+        b.buffer_store_f32(rsrc, vo, 0i32, 0, df);
     }
     Some(b.finish())
 }
