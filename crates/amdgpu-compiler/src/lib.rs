@@ -77,12 +77,20 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     for extra in [&[][..], &["remat1"][..], &["remat2"][..], &["remat3"][..], &["remat4"][..], &["imm", "ldsspill8"][..], &["imm", "ldsspill16"][..], &["imm", "ldsspill24"][..], &["imm", "ldsspill32"][..], &["imm", "ldsspill48"][..], &["imm", "ldsspill64"][..]] {
         match lower_and_allocate_with(f, extra) {
             Ok(r) => {
+                if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("rematdebug")) {
+                    eprintln!("allocation succeeded with extra {extra:?}");
+                }
                 if r.0.lds_bytes > 160 * 1024 {
                     return Err(format!("LDS spill needs {} bytes of LDS (limit 163840)", r.0.lds_bytes));
                 }
                 return Ok(r);
             }
-            Err(e) if e.contains("out of VGPRs") => last = e,
+            Err(e) if e.contains("out of VGPRs") => {
+                if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("rematdebug")) {
+                    eprintln!("allocation failed with extra {extra:?}: {}", e.chars().take(160).collect::<String>());
+                }
+                last = e
+            }
             Err(e) => return Err(e),
         }
     }
