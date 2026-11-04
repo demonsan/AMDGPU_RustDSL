@@ -325,6 +325,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             tag_acc_var(cx, *var);
         }
         Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => {
+            if cx.pass_writes { return false; } // write the C trace once, in pass 2
             let role = match cx.opnd(*rsrc) { V::Rsrc(r) => r, _ => return false };
             if role != PtrRole::C { return false; }
             let so = cx.int(*soff).unwrap_or(0);
