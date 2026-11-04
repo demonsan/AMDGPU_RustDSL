@@ -331,7 +331,7 @@ pub struct Vs128Cfg {
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: false, setprio: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
