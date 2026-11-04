@@ -89,7 +89,7 @@ impl RClass {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Src {
     Reg(VReg),
     Imm(i64),

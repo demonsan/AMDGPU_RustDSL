@@ -135,6 +135,13 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 v.push(tok);
             }
         }
+        // A/B tokens (FMHA_OPT, scoped by FMHA_OPT_SCOPE): `licm` (loop-invariant pure ALU hoisted to the preheader), `scalarize2` / `waveuni` (uniform
+        // integer chains in SALU, as in the GEMM profile)
+        for tok in ["licm", "scalarize2", "waveuni"] {
+            if fmha_opt(f, tok) {
+                v.push(tok);
+            }
+        }
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
     } else if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {

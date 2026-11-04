@@ -356,6 +356,9 @@ impl Lowerer {
         if opt_on("dce") {
             dce_full(&mut self.mir, false);
         }
+        if opt_on("licm") {
+            licm(&mut self.mir);
+        }
         if opt_on("sink") {
             sink_defs(&mut self.mir);
         }
@@ -3337,6 +3340,112 @@ fn dce_cmp_pairs(m: &mut MFunction) {
 /// (the terminator may read it). The lowering emits address / clamp chains whose consumers were dropped by other
 /// options (e.g. the global scale loads replaced by LDS scale reads); this removes them. Same values, same
 /// arithmetic for everything that remains.
+/// `licm`: loop-invariant code motion of pure ALU instructions (constant materialisations, SGPR->VGPR moves, invariant address arithmetic).
+/// The lowering re-materialises constants and conversions per region (a constant must not stay live across a loop just because the body
+/// uses it once); in a steady loop that runs every tile this costs issue slots. An instruction in a loop is hoisted to the loop's preheader
+/// when it is pure (op attribute `dce = Pure`, no implicit vcc / scc), defines a single-definition V1/V2/S1 register that is no sub-register
+/// view, and every source is defined outside the loop; repeated to a fixpoint (chains), innermost loops first. Identical hoisted
+/// instructions of one preheader are merged (later uses renamed). Wave-level control flow has no exec mask, so executing a pure
+/// instruction unconditionally is safe.
+fn licm(m: &mut MFunction) {
+    use crate::op_attrs::{attrs, Dce};
+    let label_idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let loops = m.loops.clone();
+    let views: HashSet<VReg> = m.alias.values().map(|(t, _)| *t).chain(m.alias.keys().copied()).collect();
+    for (header, latch) in loops {
+        let (Some(&h), Some(&l)) = (label_idx.get(&header), label_idx.get(&latch)) else { continue };
+        if h == 0 || h > l || !matches!(m.blocks[h - 1].term, Term::Goto(t) if t == header) {
+            continue;
+        }
+        let pre = h - 1;
+        loop {
+            // definitions per canonical register: total, and inside the loop
+            let mut defs_all: HashMap<VReg, usize> = HashMap::new();
+            let mut defs_in: HashSet<VReg> = HashSet::new();
+            for (bi, b) in m.blocks.iter().enumerate() {
+                for i in &b.insts {
+                    let mut ds: Vec<VReg> = i.dst.into_iter().collect();
+                    if i.op == MOp::VPermlane32Swap {
+                        ds.extend(i.srcs.iter().take(2).filter_map(|s| if let Src::Reg(r) = s { Some(*r) } else { None }));
+                    }
+                    for d in ds {
+                        let c = m.canon(d);
+                        *defs_all.entry(c).or_insert(0) += 1;
+                        if bi >= h && bi <= l {
+                            defs_in.insert(c);
+                        }
+                    }
+                }
+            }
+            let mut moved: Vec<MInst> = Vec::new();
+            for bi in h..=l {
+                let insts = std::mem::take(&mut m.blocks[bi].insts);
+                let mut keep = Vec::with_capacity(insts.len());
+                for i in insts {
+                    let a = attrs(i.op);
+                    let ok = !i.pin
+                        && a.dce == Dce::Pure
+                        && !a.vcc_read
+                        && !a.vcc_write
+                        && !a.scc_read
+                        && !a.scc_write
+                        && i.dst.map_or(false, |d| {
+                            !views.contains(&d) && matches!(m.vreg_class(d), RClass::V1 | RClass::V2 | RClass::S1) && defs_all.get(&m.canon(d)).copied() == Some(1)
+                        })
+                        && i.srcs.iter().all(|s| match s {
+                            Src::Reg(r) => !defs_in.contains(&m.canon(*r)),
+                            _ => true,
+                        });
+                    if ok {
+                        if let Some(d) = i.dst {
+                            defs_in.remove(&m.canon(d));
+                        }
+                        moved.push(i);
+                    } else {
+                        keep.push(i);
+                    }
+                }
+                m.blocks[bi].insts = keep;
+            }
+            if moved.is_empty() {
+                break;
+            }
+            // merge identical hoisted instructions (same op, sources, immediate and class)
+            let mut rename: HashMap<VReg, VReg> = HashMap::new();
+            let mut firsts: Vec<MInst> = Vec::new();
+            for mut i in moved {
+                for s in i.srcs.iter_mut() {
+                    if let Src::Reg(r) = s {
+                        if let Some(n) = rename.get(r) {
+                            *r = *n;
+                        }
+                    }
+                }
+                let d = i.dst.expect("dst");
+                if let Some(f) = firsts.iter().find(|f| f.op == i.op && f.imm == i.imm && f.srcs == i.srcs && m.vreg_class(f.dst.unwrap()) == m.vreg_class(d)) {
+                    rename.insert(d, f.dst.unwrap());
+                } else {
+                    firsts.push(i);
+                }
+            }
+            if !rename.is_empty() {
+                for b in m.blocks.iter_mut() {
+                    for i in b.insts.iter_mut() {
+                        for s in i.srcs.iter_mut() {
+                            if let Src::Reg(r) = s {
+                                if let Some(n) = rename.get(r) {
+                                    *r = *n;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            m.blocks[pre].insts.extend(firsts);
+        }
+    }
+}
+
 fn dce_full(m: &mut MFunction, loads_only: bool) {
     // op_attrs: `dce` (loads are removable in both modes, pure ALU only in the full mode)
     let removable = |op: MOp| -> bool {
