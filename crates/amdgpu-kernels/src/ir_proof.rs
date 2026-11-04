@@ -428,7 +428,7 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
         Frag4(a, b, c, d) => {
             let mut bytes = Vec::new(); let mut origins = Vec::new();
             for x in [a, b, c, d] { bytes.extend(word_tags(cx.opnd(*x))); origins.push(word_origin(cx.opnd(*x))); }
-            V::Frag { bytes, origins, .. }
+            V::Frag { bytes, origins, addr: None }
         }
         Frag2Lane { frag, index } => {
             let v = cx.opnd(*frag);
@@ -456,8 +456,8 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
         LoadLdsB128x2 { lo, hi } => {
             let (Some(l), Some(h)) = (cx.int(*lo), cx.int(*hi)) else { return V::Unknown };
             let mut bytes = Vec::new(); let mut origins = Vec::new();
-            for a in [l, h] { let v = lds_read(cx, Opnd::I32(a as i32), 16); if let V::Frag { bytes: b, origins: o } = v { bytes.extend(b); origins.extend(o); } }
-            V::Frag { bytes, origins, .. }
+            for a in [l, h] { let v = lds_read(cx, Opnd::I32(a as i32), 16); if let V::Frag { bytes: b, origins: o, .. } = v { bytes.extend(b); origins.extend(o); } }
+            V::Frag { bytes, origins, addr: Some(l) }
         }
         LoadLdsB64 { addr } => lds_read(cx, *addr, 8),
         LoadLdsB32 { addr } => lds_read_word(cx, *addr),
@@ -511,7 +511,7 @@ fn lds_read(cx: &mut Ctx<'_>, addr: Opnd, n: usize) -> V {
     cx.trace.lds_read_origins += n_o;
     if cx.trace.sample_read.is_none() { cx.trace.sample_read = Some((tile.clone(), *ver, a, n_o)); }
     if tile == "EPI" && cx.trace.sample_epi_read.is_none() { cx.trace.sample_epi_read = Some((tile.clone(), *ver, a, n_o)); }
-    V::Frag { bytes, origins, .. }
+    V::Frag { bytes, origins, addr: Some(a) }
 }
 fn lds_read_word(cx: &mut Ctx<'_>, addr: Opnd) -> V {
     let v = lds_read(cx, addr, 4);
