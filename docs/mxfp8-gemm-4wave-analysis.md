@@ -455,3 +455,76 @@ TA_DATA_STALLED_BY_TC。所以前端拥塞计数器是请求形态的“症状�
 **最终上限**：gemm_mxfp8_bs_v4 = 0.94–0.95× vendor（门禁交错中位数 3060–3116 vs 3246–3267）。已排除：指令数/VALU、发射顺序、预取距离（单 CU 延迟）、
 寄存器形式（sched 微基准）、L2/HBM 带宽、请求形态与前端拥塞。未解释的剩余项只有 TA 数据路径（TA_DATA_STALLED_BY_TC 2.1×）——即 DMA 返回数据写 LDS 的
 路径——它对 LDS 写入与 ds_read 的仲裁敏感；进一步需要硬件级（SPM/ATT 的 TA/TD/LDS 活动）对齐实验。
+
+---
+
+## 13. rocprof-report 轮（2026-11-04）：计数器 A/B、kernel-wiki 依据、热态时间分辨 ATT、收尾
+
+流程严格按 MI_Kernel_Agent 的 rocprof-report 技能（运行目录 `/shared/amdgpu/home/blyu_qle/sessions/kopt_gemm/rr-20261104`：harness/ reports/
+analysis/ REPORT.md）：T0 kernel-trace（vendor .co 与我们的 kernel 在**同一进程**、同一输入）→ T1 triage（`bottleneck_pmc.py --triage`）→
+memory-bound / pipeline-stalls 两组 T2 → 手写 TA/TD/TCP/LDS pass；`rocprofv3 -L` + `--check-avail` → `capture_check.py` → `analyze_run.py` /
+`make_report.py`。GPU 5，rocprofv3 1.0.0（ROCm 7.0.2），时钟未改。性能数字一律来自交错门禁，计数器 pass 的时长只作诊断。
+
+### 13.1 计数器 A/B（每 dispatch 中位数，同 pass；verdict 来自 kernel-wiki）
+
+| 指标 / 计数器 | vendor | ours | 比 | verdict |
+|---|---:|---:|---:|---|
+| kernel_ns（profiled） | 88,601 | 98,541 | 1.11 | formula-ok |
+| mfma_util | 70.9 % | 62.5 % | 0.88 | formula-ok |
+| mfma_cycles_per_inst | 32 | 32 | 1.00 | formula-ok |
+| valu_non_mfma_per_mfma | 0.233 | 0.557 | 2.39 | formula-ok |
+| cu_util | 85.2 % | 84.6 % | 0.99 | formula-ok |
+| l2_hit | 70.8 % | 79.8 % | 1.13 | formula-ok |
+| l2_fabric_read_bw | 3420 GB/s | 2047 GB/s | 0.60 | reference-only |
+| vl1d_hit_approx / coalescing | 48.5 / 25.0 % | 48.5 / 25.3 % | 1.00 | formula-ok |
+| l1_pending_stall | 31.0 % | 37.9 % | 1.22 | formula-ok |
+| lds_bank_conflict_rate / lds_latency | 1.61 % / 65 cyc | 1.61 % / 62 cyc | 1.00 / 0.95 | formula-ok |
+| lds_fifo_full：SQ_LDS_CMD_FIFO_FULL | 6.5e4 | 6.7e5 | 10.2 | formula-ok（A/B 差值） |
+| SQ_WAIT_INST_LDS | 2.5e5 | 9.9e5 | 3.97 | 计数器 confirmed |
+| SQ_WAIT_INST_ANY / SQ_WAIT_ANY | 1.75e7 / 5.8e6 | 2.14e7 / 5.5e6 | 1.22 / 0.95 | 计数器 confirmed |
+| TA_DATA / TA_ADDR_STALLED_BY_TC | 4.2e5 / 1.2e5 | 8.5e5 / 3.5e5 | 2.05 / 2.89 | 原始计数器（gfx950 计划表中无条目） |
+| TD_TC_STALL / TCP_TCR_TCP_STALL | 1.30e7 / 1.30e6 | 1.77e7 / 2.48e6 | 1.36 / 1.91 | 原始计数器 |
+| TCP→TCC 读请求 / L1 访问 | 8.42e6 / 1.74e7 | 8.55e6 / 1.76e7 | 1.02 | 原始计数器 |
+
+一句话：同样的 MFMA 工作量、同样的请求数、更好的 L2 局部性，但我们的 wave 更多地卡在**发射** LDS 指令（LDS 命令 FIFO 满 10×、等待 3.97×），
+TA/TD/TCP 的返回路径停顿更多。
+
+### 13.2 kernel-wiki 依据（置信度 source-reported）
+
+* `mi350-arch-lds`：直接进 LDS 的加载经独立的 **TD→LDS 128 B 总线**返回（MI350 翻倍），不同于承载 ds 地址与写数据的 64 B SP→LDS 总线；
+  页面明确说明来源没有给出两者之间的仲裁/顺序模型。
+* `mi350-pmc-memory-latency-tlb`：TA_DATA_STALLED_BY_TC = TA 数据总线被 TCP 阻塞（P12 表 9）；TD_TC_STALL = TD 等待 TC 数据（P13 表 10）；
+  返回路径假设应同看 TCP_TCR_RDRET_STALL（两者均为 0）。
+
+### 13.3 热态时间分辨 ATT（`--att-perfcounters`，SQ 计数器，72 周期采样，CU 1 全部 SIMD，`--kernel-iteration-range "[4]"`，中间 70%）
+
+| 每采样 | vendor | ours |
+|---|---:|---:|
+| 被追踪 dispatch 长度（周期） | 149,688 | 168,048 |
+| MFMA 忙（均值，满值 288） | 96 % | 87 % |
+| MFMA 忙 < 50 % 的采样 | 1.1 % | 10.9 % |
+| 其中 LDS 活跃 > 50 % | 4.7 % | 44.2 % |
+| 其中有 VMEM 发射 | 76 % | 17.5 % |
+| LDS 活跃均值 | 26.6 | 24.1 |
+
+LDS 总活动相同，但我们的 MFMA 管线空闲次数是 vendor 的 10 倍，且空闲窗口与 LDS 忙（块首 vmcnt 等待期间 DMA 数据落地 + 重载读）重合；
+vendor 少量的空闲窗口与它的 DMA 发射反压重合。TA_TA_BUSY / TD_TD_BUSY 在 ATT 流中全为 0（gfx950 上只有 SQ 计数器），TD→LDS 总线本身仍不可时间分辨；
+gfx950 上没有可用的 SPM 路径。注意：§12 的 ATT 追踪的是冷的第一次 dispatch（vendor 冷启动慢约 25%），本节的热态追踪更能代表稳态。
+
+### 13.4 方向与结果（交错门禁）
+
+| 方向 | 依据 | 结果 |
+|---|---|---|
+| D1 重载 ds_read 打散（每行 MMA 至多一个片段，vendor 的 Rx2/M） | LDS FIFO 满 10×，等待 4× | FIFO 满 −18%、等待 −26%，门禁 0.949 vs 0.947（噪声）→ 证伪为主因 |
+| **epilogue 8 相**（第 p+1 相的转换 + ds_write 先于第 p 相的 16 B 存储发出） | ATT：epilogue 多 ~1k 周期、存储发射停顿 | **采用**：v4 0.946 → **0.951–0.955**，v3 0.922 → 0.927 |
+| prologue：只等 tile 0 / tile 0–1 的 DMA 提前到读分区之前 / voffset 改为基址 + 均匀增量 | ATT：第一条 tile DMA 在 5.3k 周期（vendor 1.9k）；首个 MFMA 前 1714 vs 923 条指令 | 中性 / 中性 / −0.6%：开销来自布局降级出来的 voffset 表达式本身（交给 backend-llvm-tail 做 tid 仿射化简） |
+| 跨块 MFMA 错位（把块 t 最后 k 个 MFMA 推迟到块 t+1 的 barrier 之后） | — | 不合法：这些 MFMA 读的片段要原地重载，重载被推到 barrier 之后会与别的 wave 写同一槽位的 DMA t+3 竞争，需要每块再加一个 barrier（类似的 split_sync 为 −0.5%） |
+| 合法形式 = barrier 前先发当前寄存器块的 MFMA（pre_sync） | — | 实测 0/4/8/16/32 → 持平/−2%：MFMA 只在矩阵管线接受时才发射（16x16x128 约每 32 周期一条），一个 wave 无法在自己的 s_waitcnt 之前“排队” MFMA；提前 N 条只是把等待后移 N×32 周期，而 t+2 的 DMA 发射绑在那之后的 barrier 上，下一块的 DMA 也同样后移（零和） |
+
+### 13.5 还能做什么：8 wave（每 SIMD 2 个 wave）
+
+单 wave/SIMD 时，块首的 vmcnt 等待无法被同一 SIMD 上的其他工作覆盖——这正是热态 ATT 里 10.9% 的 MFMA 空闲。能覆盖它的是同一 SIMD 上的第二个
+wave（像 FMHA 的 A/B 角色乒乓）：每 SIMD 512 个 VGPR+AGPR 分给两个 wave → 每 wave 128×64 输出块（64 个累加寄存器 + 4 个 A + 4 个 B 片段，
+约 128 个 AGPR）加 scale/地址 VGPR；8 wave 的 barrier 与 DMA 角色分工、LDS 布局（同样 2 级）都要重做。属于独立项目（数天），不是调参。
+
+**本轮结论**：v4 = **0.951×** vendor（门禁 PASS，strict verify 0/0/0-unproven），gemm-rr 分支。摩擦记录 16 条已交给 sched（rocprof-report / kernel-wiki 改进）。
