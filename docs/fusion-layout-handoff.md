@@ -193,3 +193,59 @@ Our unfused building blocks are still slower than the vendor GEMM at these shape
 **Remaining limiter.** The row-operand fragments are built with `cat_frag8(load, load)`, which the lowering materialises with `v_mov`
 right after the loads. Each load pair is therefore followed by `s_waitcnt vmcnt`, which serialises the X prefetch. A copy-free
 `buffer_load_b128x2` has been requested from backend-llvm-tail.
+
+### 3.4 The boundary on the region IR (`Node::Stage`, GV-STAGE)
+
+Rebased on region IR (origin/region-ir 7c53884).
+
+**IR.** The stage is a separate node kind beside `Region { Produce | Consume }`, which keeps its tile protocol meaning.
+- **Node:** `Node::Stage { name, contract: Box<StageContract>, body }`. Flat markers: `Stmt::StageBegin { name, contract }` / `Stmt::StageEnd`.
+- **Nesting:** `TreeBuilder` opens and closes stages like regions. A stage opened inside a tile region is rejected at build time; tile
+  regions may nest inside a stage.
+- **Builder:** `stage_begin` / `stage_end`, the closure `stage(name, contract, |b| ..)`, and `stage_live_out(v)` to add hand-over values
+  computed inside the stage.
+- **`StageContract` (amdgpu-dsl, IR level):** `live_in` / `live_out`: `StageVal` { name, IR values, element-table fingerprint from the tile
+  layer, element bits, storage }, `lds_freed` / `lds_reused`, `barrier_phase`, `roles`.
+
+**Lowering.** The lowering walks into the stage body; the markers emit nothing, so a stage is transparent to lowering and scheduling.
+
+**`gpu_verify::verify_stages` (GV-STAGE, errors).** Checks at the stage edge:
+- every `live_in` is handed over by an earlier stage's `live_out` with the same values, the same table and width, and the same roles;
+- `live_out` values are defined;
+- a value defined in one stage and read in another must be declared `live_in`;
+- an LDS tile is reused only if an earlier stage freed it, and a freed tile is written again only by a stage that declares the reuse;
+- `barrier_phase` equals the number of barriers that precede the stage.
+
+Proven hand-offs are counted under `stage-handoff` in the report.
+
+**In the fused MLP.** The fused kernel's loop body is two stages, `gemm1_act` (live-out P0..P3: producer tables) and `gemm2` (live-in
+P0..P3: consumer tables), with the next block's X prefetch between them.
+- **Verifier:** `gpu-verify --strict` reports `stage-handoff: 4` proven, 0 errors, 0 warnings.
+- **Transparency:** the assembly is byte-identical to the pre-stage build.
+
+**Tests.** `crates/amdgpu-compiler/tests/stage_ir.rs` covers:
+- tree / flat round trip;
+- a layout mismatch, an undeclared cross-stage read and a wrong barrier phase, each reported;
+- a stage inside a tile region panicking.
+
+`region_ir.rs` is extended.
+
+**md5.** All 107 `amdc list` kernels, plus the 4 FMHA v3 kernels and GEMM v3 / v4, emit byte-identical assembly to region-ir 7c53884.
+
+**Tests.** Full `cargo test`: 73 targets, 334 passed.
+
+### 3.5 Copy-free row-operand loads and slotfill
+
+**`buffer_load_b128x2`** (backend-llvm-tail, origin/buf-b128x2) replaces `cat_frag8(load, load)`. The two loads land directly in the halves
+of one 8-dword operand, so there are no `v_mov` copies and no immediate `vmcnt` waits. The X prefetch now overlaps.
+
+**Gate** (GPU 5, interleaved, medians of 7 × 50 launches; 0 bad against the host reference, H checked; strict verify 0 / 0):
+
+| M | ws fused | ws unfused pair | speedup | vendor two-launch lower bound |
+|---|---:|---:|---:|---:|
+| 65536 | **20.2 µs** (852 TF/s) | 33.3 µs | 1.65× | 22.8 µs |
+| 262144 | **54.1 µs** (1270 TF/s) | 96.6 µs | 1.79× | 82.4 µs |
+
+**slotfill** (sched, origin/slotfill, via `AMDC_SLOTFILL=mlp_fp8_ws` on a temporary merge): the assembly of all three ws kernels is
+unchanged, and timing is identical (55.2 vs 55.1 µs fused at M = 262144). The weight-stationary loop body already interleaves its operand
+reads with the MFMAs, and the X prefetch is the only VMEM traffic in the loop. Not adopted.
