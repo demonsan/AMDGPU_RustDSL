@@ -30,6 +30,9 @@ pub enum Tag {
     B(i64, i64),
     Sa(i64, i64),
     Sb(i64, i64),
+    /// Accumulator provenance: (VarId, dword index). Carried through the LDS epilogue so a stored
+    /// C value can be traced to the exact accumulator dword even across lane transposes.
+    Acc(u32, u8),
     U,
 }
 
@@ -311,6 +314,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             for t in &sa_tags { if let Tag::Sa(m, k) = t { cx.trace.sa_tags.entry(kb).or_default().insert((*m, *k)); } }
             for t in &sb_tags { if let Tag::Sb(blk, k) = t { cx.trace.sb_tags.entry(kb).or_default().insert((*blk, *k)); } }
             for idx in 0..4u8 { cx.trace.contrib.entry((var.0, idx)).or_default().push(kb); }
+            tag_acc_var(cx, *var);
         }
         Stmt::VarMfmaScale { var, a, b, .. } | Stmt::VarMfmaScaleZ { var, a, b, .. } => {
             // 32x32 atoms are not used by v3/v4; keep the tag handling generic.
@@ -318,6 +322,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             for t in frag_tags(cx.opnd(*a)) { if let Tag::A(m, k) = t { cx.trace.a_tags.entry(kb).or_default().insert((m, k)); } }
             for t in frag_tags(cx.opnd(*b)) { if let Tag::B(n, k) = t { cx.trace.b_tags.entry(kb).or_default().insert((n, k)); } }
             for idx in 0..4u8 { cx.trace.contrib.entry((var.0, idx)).or_default().push(kb); }
+            tag_acc_var(cx, *var);
         }
         Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => {
             let role = match cx.opnd(*rsrc) { V::Rsrc(r) => r, _ => return false };
@@ -326,13 +331,14 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             let mut src = so + *imm as i64;
             if let Some(v) = voff { if let Some(x) = cx.int(*v) { src += x; } else { return false; } }
             let frag = cx.opnd(*value);
-            let (_, origins) = match frag { V::Frag { bytes, origins } => (bytes, origins), _ => return false };
+            let (bytes, origins) = match frag { V::Frag { bytes, origins } => (bytes, origins), _ => return false };
             cx.trace.buffer_stores += 1;
             if origins.iter().all(|x| x.is_none()) { cx.trace.buffer_store_no_origin += 1; }
             let nouts = 2 * *dwords as usize;
             for q in 0..nouts {
                 let dword = q / 2;
-                let Some((var, idx)) = origins.get(dword).and_then(|x| *x) else { continue };
+                let from_tag = bytes.get(4 * dword).and_then(|t| if let Tag::Acc(v, i) = t { Some((*v, *i)) } else { None });
+                let Some((var, idx)) = origins.get(dword).and_then(|x| *x).or(from_tag) else { continue };
                 let kbs = cx.trace.contrib.get(&(var, idx)).cloned().unwrap_or_default();
                 let elem = src / 2 + q as i64;
                 let m = elem / cx.args.n;
@@ -472,6 +478,17 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
         }
         _ => { cx.trace.unknown_ops.insert(format!("{op:?}").split('(').next().unwrap_or("op").to_string()); V::Unknown }
     }
+}
+
+fn tag_acc_var(cx: &mut Ctx<'_>, var: VarId) {
+    let mut f = match cx.vars.get(&var).cloned() { Some(V::Frag { bytes, origins }) => (bytes, origins), _ => (vec![Tag::U; 16], vec![None; 4]) };
+    while f.0.len() < 16 { f.0.push(Tag::U); }
+    while f.1.len() < 4 { f.1.push(None); }
+    for idx in 0..4u8 {
+        for b in 0..4 { f.0[4 * idx as usize + b] = Tag::Acc(var.0, idx); }
+        f.1[idx as usize] = Some((var.0, idx));
+    }
+    cx.vars.insert(var, V::Frag { bytes: f.0, origins: f.1 });
 }
 
 fn word_origin(v: V) -> Option<(u32, u8)> { match v { V::Word { origin, .. } => origin, _ => None } }
