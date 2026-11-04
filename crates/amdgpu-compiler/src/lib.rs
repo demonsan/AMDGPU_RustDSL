@@ -126,7 +126,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     } else if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
         // CompileProfile::Gemm: partial lgkmcnt waits keep the prefetched fragment reads in flight (`lgkmn`)
         // + scalarize / scalarize2 / waveuni: the wave-uniform DMA address chains (tile origins with clamps/selects, slot bases, M0, soffsets) in SALU
-        let mut v: Vec<&str> = vec!["dce", "cmpfold", "lgkmn", "zeroinit", "scalarize", "scalarize2", "waveuni"];
+        let mut v: Vec<&str> = vec!["dce", "cmpfold", "lgkmn", "zeroinit", "scalarize", "scalarize2", "waveuni", "edgepad"];
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
     } else if pname.starts_with("fmha_fwd_hd128_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {

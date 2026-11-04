@@ -135,6 +135,28 @@ fn is_fence(op: MOp) -> bool {
     matches!(op, MOp::SWaitVm | MOp::SWaitLgkm | MOp::SBarrier | MOp::SNop | MOp::SEndpgm)
 }
 
+/// Wait states from the start of block `s` (plus `d0`) to the first touch of `reg` (usize::MAX: an in-place accumulation of the same MFMA,
+/// which never needs the wait); blocks that do not touch it are followed into their successors (min over paths) for up to `hops` blocks or
+/// until the distance covers `need`. The terminator's own issue slot is not counted (conservative).
+#[allow(clippy::too_many_arguments)]
+fn first_touch(s: usize, d0: usize, hops: usize, need: usize, reg: VReg, from_mfma: bool, snap: &[Vec<MInst>], succs: &[Vec<usize>], canon: &dyn Fn(VReg) -> VReg) -> usize {
+    let mut d = d0;
+    for x in &snap[s] {
+        let touches = x.uses().iter().any(|u| canon(*u) == reg) || x.dst.map(|y| canon(y) == reg).unwrap_or(false);
+        if touches {
+            let chain = from_mfma
+                && matches!(x.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VMfmaScale16x16x128Fp8)
+                && matches!(x.srcs.get(2), Some(Src::Reg(c)) if canon(*c) == reg);
+            return if chain { usize::MAX } else { d };
+        }
+        d += if x.op == MOp::SNop { x.imm as usize + 1 } else { 1 };
+    }
+    if d >= need || hops == 0 || succs[s].is_empty() {
+        return d;
+    }
+    succs[s].iter().map(|&t| first_touch(t, d, hops - 1, need, reg, from_mfma, snap, succs, canon)).min().unwrap_or(d)
+}
+
 pub fn fix_value_hazards(m: &mut MFunction) {
     fix_value_hazards_opts(m, false)
 }
@@ -148,6 +170,12 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
     let canon = |r: VReg| alias.get(&r).map(|a| a.0).unwrap_or(r);
     let succs = crate::sched::liveness::successors(m);
     let snap: Vec<Vec<MInst>> = m.blocks.iter().map(|b| b.insts.clone()).collect();
+    let labels: Vec<u32> = m.blocks.iter().map(|b| b.label).collect();
+    // `edgepad` (opt-in profile option): follow the successors through blocks that do not touch a register (4 hops) and pad only the edges
+    // that need it
+    let edge = crate::lower::opt_on("edgepad");
+    let hops = if edge { 4 } else { 0 };
+    let mut edge_pads: Vec<(usize, u32, usize)> = Vec::new();
     for (bi, b) in m.blocks.iter_mut().enumerate() {
         let mut insts: Vec<MInst> = std::mem::take(&mut b.insts);
         let mut out: Vec<MInst> = Vec::with_capacity(insts.len() + 8);
@@ -358,43 +386,29 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
         }
         if pad_block_end {
             // Only results that a successor reads soon need the padding; the in-place accumulation chain
-            // of one MFMA opcode never does.
-            let mut missing = 0usize;
+            // of one MFMA opcode never does. Per successor: the wait states still missing on that edge.
+            let ss = &succs[bi];
+            let mut miss = vec![0usize; ss.len()];
             for (reg, (rd, from_mfma)) in ready.iter() {
                 let remaining = rd.saturating_sub(cycle);
                 if remaining == 0 {
                     continue;
                 }
-                // distance (wait states) to the first touch of `reg` along every path out of this block: the successors are followed through
-                // blocks that do not touch it (a short loop-exit test block no longer forces the padding), min over all paths, up to
-                // MAX_HOPS blocks or until the distance already covers the remaining latency
-                const MAX_HOPS: usize = 4;
-                fn first_touch(
-                    s: usize, d0: usize, hops: usize, need: usize, reg: VReg, from_mfma: bool, snap: &[Vec<MInst>], succs: &[Vec<usize>], canon: &dyn Fn(VReg) -> VReg,
-                ) -> usize {
-                    let mut d = d0;
-                    for x in &snap[s] {
-                        let touches = x.uses().iter().any(|u| canon(*u) == reg) || x.dst.map(|y| canon(y) == reg).unwrap_or(false);
-                        if touches {
-                            let chain = from_mfma
-                                && matches!(x.op, MOp::VMfmaScale32x32x64Fp8 | MOp::VMfma32x32x64Fp8 | MOp::VMfmaScale16x16x128Fp8)
-                                && matches!(x.srcs.get(2), Some(Src::Reg(c)) if canon(*c) == reg);
-                            return if chain { usize::MAX } else { d };
-                        }
-                        d += if x.op == MOp::SNop { x.imm as usize + 1 } else { 1 };
+                for (k, &s) in ss.iter().enumerate() {
+                    let dist = first_touch(s, 0, hops, remaining, *reg, *from_mfma, &snap, &succs, &canon);
+                    if dist != usize::MAX {
+                        miss[k] = miss[k].max(remaining.saturating_sub(dist));
                     }
-                    // the terminator (branch) issues too, but is not counted: conservative
-                    if d >= need || hops == 0 || succs[s].is_empty() {
-                        return d;
+                }
+            }
+            // `edgepad`: the padding every path needs stays at the block end, the rest goes on the edges that need it (a loop exit pays it once
+            // instead of every iteration); otherwise the block end covers every successor
+            let mut missing = if edge { miss.iter().copied().min().unwrap_or(0) } else { miss.iter().copied().max().unwrap_or(0) };
+            if edge {
+                for (k, &s) in ss.iter().enumerate() {
+                    if miss[k] > missing {
+                        edge_pads.push((bi, labels[s], miss[k] - missing));
                     }
-                    succs[s].iter().map(|&t| first_touch(t, d, hops - 1, need, reg, from_mfma, snap, succs, canon)).min().unwrap_or(d)
-                }
-                let mut dist = usize::MAX;
-                for &s in &succs[bi] {
-                    dist = dist.min(first_touch(s, 0, MAX_HOPS, remaining, *reg, *from_mfma, &snap, &succs, &canon));
-                }
-                if dist != usize::MAX {
-                    missing = missing.max(remaining.saturating_sub(dist));
                 }
             }
             while missing > 0 {
@@ -402,8 +416,44 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 out.push(MInst::new(MOp::SNop).imm(n));
                 missing = missing.saturating_sub(n as usize + 1);
             }
+        }        b.insts = out;
+    }
+    // split the padded edges: a block of `s_nop`s between the branch and its successor (after the source block for the fall-through edge, so it
+    // still falls through; at the end for a taken edge)
+    let mut next_label = m.blocks.iter().map(|b| b.label).max().unwrap_or(0) + 1;
+    for (bi, to, mut n) in edge_pads.into_iter().rev() {
+        let mut insts = Vec::new();
+        while n > 0 {
+            let k = n.min(8);
+            insts.push(MInst::new(MOp::SNop).imm(k as i64 - 1));
+            n -= k;
         }
-        b.insts = out;
+        let l = next_label;
+        next_label += 1;
+        let pad = Block { label: l, insts, term: Term::Goto(to), pred: None };
+        let is_fall = match &mut m.blocks[bi].term {
+            Term::CondGoto { target, fall, .. } => {
+                if *fall == to {
+                    *fall = l;
+                    true
+                } else {
+                    if *target == to {
+                        *target = l;
+                    }
+                    false
+                }
+            }
+            Term::Goto(t) => {
+                *t = l;
+                true
+            }
+            Term::Endpgm => continue,
+        };
+        if is_fall {
+            m.blocks.insert(bi + 1, pad);
+        } else {
+            m.blocks.push(pad);
+        }
     }
 }
 /// Wait slots (issue distance) after a VMEM store of more than 8 bytes before a VALU may overwrite its data registers: 2 wait states on gfx940+ (so the
