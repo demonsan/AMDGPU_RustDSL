@@ -26,6 +26,9 @@ static int sigma(int k) { return 32 * (k / 32) + 8 * ((k % 16) / 4) + 4 * ((k % 
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : "build";
     int M = argc > 2 ? std::atoi(argv[2]) : 65536;
+    bool ws = argc > 3 && std::string(argv[3]) == "ws";  // weight-stationary kernels: padded LDS images (272-byte rows), persistent grid
+    int G = std::min(M / 128, argc > 4 ? std::atoi(argv[4]) : 256);
+    const char* pre = ws ? "mlp_fp8_ws_" : "mlp_fp8_";
     int iters = 50, rounds = 7;
     std::srand(1);
     std::vector<unsigned char> x((size_t)M * K1), w1(N1 * K1), w2n(N2 * N1), w2p(N2 * N1);
@@ -40,19 +43,25 @@ int main(int argc, char** argv) {
         int jb = n1 / 64, k = n1 % 64;
         w2p[n2 * N1 + n1] = w2[(64 * jb + sigma(k)) * N2 + n2];
     }
+    if (ws) {  // images: 272-byte rows (256 data + 16 pad)
+        auto img = [](const std::vector<unsigned char>& w) { std::vector<unsigned char> o(256 * 272, 0); for (int r = 0; r < 256; ++r) std::memcpy(&o[r * 272], &w[r * 256], 256); return o; };
+        w1 = img(w1); w2n = img(w2n); w2p = img(w2p);
+    }
     unsigned char *dx, *dw1, *dw2n, *dw2p, *dh; unsigned short *dyf, *dyu;
     CK(hipMalloc(&dx, x.size())); CK(hipMalloc(&dw1, w1.size())); CK(hipMalloc(&dw2n, w2n.size())); CK(hipMalloc(&dw2p, w2p.size()));
     CK(hipMalloc(&dh, (size_t)M * N1)); CK(hipMalloc(&dyf, (size_t)M * N2 * 2)); CK(hipMalloc(&dyu, (size_t)M * N2 * 2));
     CK(hipMemcpy(dx, x.data(), x.size(), hipMemcpyHostToDevice)); CK(hipMemcpy(dw1, w1.data(), w1.size(), hipMemcpyHostToDevice));
     CK(hipMemcpy(dw2n, w2n.data(), w2n.size(), hipMemcpyHostToDevice)); CK(hipMemcpy(dw2p, w2p.data(), w2p.size(), hipMemcpyHostToDevice));
     hipModule_t mf, m1, m2; hipFunction_t ff, f1, f2;
-    CK(hipModuleLoad(&mf, (dir + "/mlp_fp8_fused.co").c_str())); CK(hipModuleGetFunction(&ff, mf, "mlp_fp8_fused"));
-    CK(hipModuleLoad(&m1, (dir + "/mlp_fp8_g1.co").c_str())); CK(hipModuleGetFunction(&f1, m1, "mlp_fp8_g1"));
-    CK(hipModuleLoad(&m2, (dir + "/mlp_fp8_g2.co").c_str())); CK(hipModuleGetFunction(&f2, m2, "mlp_fp8_g2"));
-    struct A { void *in, *w1, *w2, *out; int m; int pad; };
-    A af{dx, dw1, dw2p, dyf, M, 0}, a1{dx, dw1, dw2n, dh, M, 0}, a2{dh, dw1, dw2n, dyu, M, 0};
+    std::string P = pre;
+    CK(hipModuleLoad(&mf, (dir + "/" + P + "fused.co").c_str())); CK(hipModuleGetFunction(&ff, mf, (P + "fused").c_str()));
+    CK(hipModuleLoad(&m1, (dir + "/" + P + "g1.co").c_str())); CK(hipModuleGetFunction(&f1, m1, (P + "g1").c_str()));
+    CK(hipModuleLoad(&m2, (dir + "/" + P + "g2.co").c_str())); CK(hipModuleGetFunction(&f2, m2, (P + "g2").c_str()));
+    int grid = ws ? G : M / 128;
+    struct A { void *in, *w1, *w2, *out; int m; int g; };
+    A af{dx, dw1, dw2p, dyf, M, grid}, a1{dx, dw1, dw2n, dh, M, grid}, a2{dh, dw1, dw2n, dyu, M, grid};
     size_t sz = sizeof(A);
-    auto launch = [&](hipFunction_t f, A& a) { void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &a, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END}; CK(hipModuleLaunchKernel(f, M / 128, 1, 1, 256, 1, 1, 0, nullptr, nullptr, cfg)); };
+    auto launch = [&](hipFunction_t f, A& a) { void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &a, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END}; CK(hipModuleLaunchKernel(f, grid, 1, 1, 256, 1, 1, 0, nullptr, nullptr, cfg)); };
     launch(ff, af); launch(f1, a1); launch(f2, a2); CK(hipDeviceSynchronize());
     // accuracy on a row sample
     std::vector<unsigned short> yf((size_t)M * N2), yu((size_t)M * N2);
@@ -71,7 +80,7 @@ int main(int argc, char** argv) {
             same += (yf[(size_t)r * N2 + n2] == yu[(size_t)r * N2 + n2]); ++tot;
         }
     }
-    std::printf("M=%d: checked %d, bad %d, worst rel (|err|/sum|p|) fused %.3e unfused %.3e, fused==unfused bitwise %d/%d -> %s\n", M, tot, bad, worst_f, worst_u, same, tot, bad ? "FAIL" : "OK");
+    std::printf("%s M=%d grid=%d: checked", pre, M, grid); std::printf(" M=%d: checked %d, bad %d, worst rel (|err|/sum|p|) fused %.3e unfused %.3e, fused==unfused bitwise %d/%d -> %s\n", M, tot, bad, worst_f, worst_u, same, tot, bad ? "FAIL" : "OK");
     // interleaved timing
     hipEvent_t e0, e1; CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
     std::vector<float> tf, tu;
