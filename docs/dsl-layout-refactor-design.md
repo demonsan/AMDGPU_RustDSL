@@ -483,7 +483,7 @@ SADDR A/B（`FMHA_OPT=saddrlds FMHA_OPT_SCOPE=v3s`，候选 `v3s` / 基线 `v3`�
 | kernel | md5（前 8 位） | 说明 |
 |---|---|---|
 | `fmha_fwd_hd128_mxfp8_v3_vs128` | `68d2832b` | |
-| `fmha_fwd_hd128_mxfp8_v3_t128` | `f5a43b09` | SADDR DMA（之前 `985d7a02`） |
+| `fmha_fwd_hd128_mxfp8_v3_t128` | `e4c7e75d` | SADDR DMA + `edgepad` + `salubr`（之前 `f5a43b09`、`985d7a02`） |
 | `fmha_fwd_hd128_mxfp8_v3_kvsplit` | `e4fc18b1` | |
 | `fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h` | `24a95a51` | 代码与 dsl combine 相同，仅名字不同 |
 | `fmha_fwd_hd128_mxfp8_dsl_vs128` / `_t128` | `438452c1` / `ef706387` | 上一版，保留 A/B，不变 |
@@ -494,3 +494,15 @@ SADDR A/B（`FMHA_OPT=saddrlds FMHA_OPT_SCOPE=v3s`，候选 `v3s` / 基线 `v3`�
 - `scalarize2`：一致的 `min`、对一致比较的 `select`（`s_cmp_lt_i32` + 紧邻的 `s_cselect_b32`，SCC 进依赖图）、`v_readfirstlane` 结果视为一致；GEMM profile 打开 `scalarize,scalarize2,waveuni` 后 2771 → 2867 TF/s，VGPR 408 → 376。FMHA 不受影响（md5 不变）。
 - `Pipeline::vm_inflight` 与计数版 `vmcnt(n)`：协议检查器记录每个 `wait_vm` 的计数，DMA 在"其后至少有 n 条更新的 LDS-direct DMA"时才算完成；读下一 tile 的 FMHA 窗口用 `vm_inflight > 0` 会被拒绝。
 - `gpu_verify` 的可能位（possible-bits）规则：`x ^ y`、`x & m` 在 bit31 可证为 0 时收窄到 `[0, mask]`（`(row << 7) ^ (chunk << 4)` 证明 ≤ 2032）；声明的最大值（`ka_range` / `ka_set` / `sym_range`）参与多项式非负判定（盒子检验）。均附攻击测试（可能为负的操作数、重叠和的进位、真实越界、无界 kernarg）。
+
+### 9.7 `edgepad` / `salubr` A/B（`FMHA_OPT_SCOPE=v3s`，候选 `v3s` / 基线 `v3`，GPU 6）
+
+| 行 | edgepad + salubr | 仅 edgepad | 仅 salubr |
+|---|---|---|---|
+| B1H8S2048 KV-split | 675.1 / 685.7（−1.5%） | 690.2 / 690.1 | 678.9 / 683.6（−0.7%） |
+| 每 CU `_vs128` | 441.4 / 445.1 | 444.7 / 446.6 | 440.7 / 446.1 |
+| `_vs128` 布局中位数 | 442.4 / 447.6（−1.2%） | 445.1 / 449.5（−1.0%） | 442.2 / 448.0（−1.3%） |
+| B4H8S2048 / B1H8S8192 | 1402.6 / 1418.2、1960.2 / 1975.8 | 1411.4 / 1415.8、1963.6 / 1968.3 | 1411.9 / 1426.4、1955.9 / 1965.1 |
+| `_t128` 布局中位数 | **1051.2 / 1017.3（+3.3%）** | 1032.9 / 1026.2（+0.7%） | 1060.1 / 1038.6（+2.1%） |
+
+结论：两项一起只在 v3 `_t128` 默认打开（md5 `e4c7e75d`）；采用后全套门禁（对旧手写集）PASS，`_t128` 布局中位数 1061.95 vs 1023.06。其余 kernel 不变。

@@ -115,11 +115,20 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         // v3 `_t128`: the SADDR DMA form (scalar tensor base + per-lane 32-bit offset: no 64-bit pointer add per DMA) measured +1.8..+2.1% on the
         // B2H8S2048 layout median (two same-run A/Bs, docs/dsl-layout-refactor-design.md); on _vs128 / _kvsplit it is -0.2..-1.4%: not adopted there
-        if fmha_opt(f, "saddrlds") || (pname.ends_with("_t128") && f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_")) {
+        if fmha_opt(f, "saddrlds") || (pname.ends_with("_t128") && (f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_") || f.name.starts_with("fmha_fwd_hd128_mxfp8_v3s_"))) {
             v.push("saddrlds");
         }
         if fmha_opt(f, "pmdead") {
             v.push("pmdead");
+        }
+        // A/B tokens: `edgepad` (MFMA hazard windows carried across blocks, no block-end padding) and `salubr` (wave-uniform branch conditions on SCC)
+        // v3 `_t128`: both by default (same-run A/B, B2H8S2048 layout median +3.3% together, +0.7% / +2.1% alone); on `_vs128` / `_kvsplit` they are
+        // -0.7..-1.5%: opt-in there (docs/dsl-layout-refactor-design.md §9.4)
+        let v3_t128 = pname.ends_with("_t128") && (f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_") || f.name.starts_with("fmha_fwd_hd128_mxfp8_v3s_"));
+        for tok in ["edgepad", "salubr"] {
+            if fmha_opt(f, tok) || v3_t128 {
+                v.push(tok);
+            }
         }
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?

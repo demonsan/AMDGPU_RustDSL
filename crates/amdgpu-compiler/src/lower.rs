@@ -1975,7 +1975,7 @@ impl Lowerer {
             if let Some(op) = self.defs.get(&v).cloned() {
                 // `scalarize2`: a signed compare of two wave-uniform integers (SGPR values / scalar loop variables / literals) branches on SCC:
                 // `s_cmp_lt_i32` + `s_cbranch_scc0/1` - no VGPR copies, no VALU compare, no vcc hazard padding
-                if opt_on("scalarize2") {
+                if opt_on("scalarize2") || opt_on("salubr") {
                     if let Op::CmpLtI32(a, b) | Op::CmpGeI32(a, b) = op {
                         if let (Some(mut sa), Some(sb)) = (self.scalar_src(a), self.scalar_src(b)) {
                             if !(matches!(sa, Src::Imm(_)) && matches!(sb, Src::Imm(_))) {

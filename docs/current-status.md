@@ -16,7 +16,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
   `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-tile/src/fmha.rs`）。K/V/K-scale/Q 的每个地址、
   K/V/K-scale DMA、bf16 epilogue 与 KV-split 转置暂存都由 `amdgpu-layout` 的布局推导，`amdgpu-isa` 的 atom 描述指令，
   `amdgpu-tile` 的 `TiledCopy`/`TiledMma`/`partition_*` 生成 IR；主机合同由张量布局导出。asm md5（`--backend own`）：
-  `_vs128` `68d2832b`、`_t128` `f5a43b09`、`_kvsplit` `e4fc18b1`、`_kvsplit_combine8h` `24a95a51`。
+  `_vs128` `68d2832b`、`_t128` `e4c7e75d`、`_kvsplit` `e4fc18b1`、`_kvsplit_combine8h` `24a95a51`。
   上一版 tile 库集（`dsl_*`，`fmha_fwd_hd128_mxfp8_dsl_auto`）与旧手写集（`fmha_fwd_hd128_mxfp8_legacy_auto`）保留供 A/B，md5 不变。
 - **FMHA 性能**（最近一次 `port_gate`，§4.6）：B1H8S2048 默认路径 **672.7 TF/s**（同轮厂商约 536–539，≈1.25×）；
   `_vs128` 每 CU 64 blocks **446.4**（8 布局中位数 449.9，旧手写 453.7）；铺满网格 B4H8S2048 **1421.3** / B1H8S8192 **1978.6**（≈0.84× 厂商）；
@@ -182,7 +182,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设。
 | B2H8S2048 `_t128`（单一布局 / 8 布局中位数） | 1025.0 / **1022.3** | – / **1028.6** |
 
 BUILD / VERIFY（0 错误）/ ACC16 / ACC64（四条路径 bad=0）/ DET / STRESS 全部 PASS，性能在 `PERF_TOL=0.97` 内：**OVERALL PASS**。
-v3 asm md5：`68d2832b` / `f5a43b09` / `e4fc18b1` / `24a95a51`。`_t128` 默认用 SADDR 形式的 LDS-DMA（两轮 A/B 布局中位数 +1.8% / +2.1%），
+v3 asm md5：`68d2832b` / `e4c7e75d` / `e4fc18b1` / `24a95a51`。`_t128` 另外默认打开 `edgepad`（MFMA 冒险窗口跨块传递，不在块尾补 `s_nop`）与 `salubr`（波内一致的分支条件走 `s_cmp` + `s_cbranch_scc`）：同轮 A/B 布局中位数 +3.3%（单独 +0.7% / +2.1%），采用后门禁对旧手写集 1061.95 vs 1023.06；这两项在 `_vs128`/`_kvsplit` 上为 −0.7..−1.5%，保持 opt-in（`FMHA_OPT=edgepad,salubr`）。`_t128` 默认用 SADDR 形式的 LDS-DMA（两轮 A/B 布局中位数 +1.8% / +2.1%），
 `_vs128`/`_kvsplit` 上为 −0.2..−1.4%，保持 opt-in（`FMHA_OPT=saddrlds`）；A/B 数字见 [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9.4。
 
 ### 4.7 MXFP8 blockscale GEMM
