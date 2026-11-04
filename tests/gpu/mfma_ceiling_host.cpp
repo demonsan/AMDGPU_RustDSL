@@ -13,6 +13,7 @@ int main(int argc, char** argv) {
     const int iters = std::getenv("ITERS") ? std::atoi(std::getenv("ITERS")) : 4096;
     const int reps = std::getenv("REPS") ? std::atoi(std::getenv("REPS")) : 6;
     const int mfma_per_iter = 32;
+    const bool trace = std::getenv("TRACE") != nullptr;   // TRACE=1: one line per launch (clock trajectory under sustained load)
     hipDeviceProp_t prop; CK(hipGetDeviceProperties(&prop, 0));
     const int blocks = std::getenv("BLOCKS") ? std::atoi(std::getenv("BLOCKS")) : prop.multiProcessorCount;
     hipModule_t mod; CK(hipModuleLoad(&mod, argv[1]));
@@ -32,6 +33,7 @@ int main(int argc, char** argv) {
             CK(hipDeviceSynchronize());
             std::vector<unsigned> h(nwaves * 4);
             CK(hipMemcpy(h.data(), out, nwaves * rec, hipMemcpyDeviceToHost));
+            if (trace) { std::vector<double> gg; for (size_t w = 0; w < nwaves; ++w) { double dt = h[w * 4], drt = h[w * 4 + 1]; if (dt > 0 && drt > 0) gg.push_back(dt / (drt * 10.0)); } if (!gg.empty()) { std::sort(gg.begin(), gg.end()); std::printf("  trace %-24s launch %4d clk %.3f GHz (min %.3f max %.3f)\n", argv[k], r, gg[gg.size() / 2], gg.front(), gg.back()); } }
             if (r == 0) continue;   // warm-up launch
             std::vector<double> c, n, g;
             for (size_t w = 0; w < nwaves; ++w) {
