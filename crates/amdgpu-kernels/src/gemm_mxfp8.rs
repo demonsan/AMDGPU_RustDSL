@@ -898,7 +898,8 @@ impl PipeBody for Body {
         });
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
-        self.in_loop = true;
+        // RegStaged: stages issued between here and the first pre_sync (tile 1 with tile1_after_barrier) go out immediately
+        self.in_loop = !self.cfg.reg_staged;
         if let Some((buf, rec, _)) = self.stamp {
             let st = b.memtime_lo();
             b.stamp_store(buf, rec, 9, st); // slot 9: prologue wait + barrier passed (tiles 0/1 + transposed panel visible)
@@ -959,6 +960,7 @@ impl PipeBody for Body {
         }
         self.npre_done = n;
     }    fn pre_sync(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
+        self.in_loop = true;
         if !self.cfg.reg_staged {
             return;
         }
