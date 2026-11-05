@@ -145,21 +145,4 @@ fn gf2_matrix(src_of: &[(usize, usize)], nt: usize, nv: usize) -> Option<Vec<u32
 }
 
 impl ConvPlan {
-    /// "lane bit 3 -> value bit 1"-style description of a bit-permutation map (None if not a permutation of bits).
-    pub fn bit_moves(&self) -> Option<Vec<String>> {
-        let cols = self.gf2.as_ref()?;
-        let tb = self.threads.trailing_zeros() as usize;
-        let name = |i: usize| if i < tb { format!("lane bit {i}") } else { format!("value bit {}", i - tb) };
-        let mut out = Vec::new();
-        for (i, c) in cols.iter().enumerate() {
-            if c.count_ones() != 1 {
-                return None;
-            }
-            let j = c.trailing_zeros() as usize;
-            if j != i {
-                out.push(format!("{} -> {}", name(i), name(j)));
-            }
-        }
-        Some(out)
-    }
 }

@@ -33,11 +33,6 @@ pub struct LiveFrag {
 }
 
 impl LiveFrag {
-    pub fn from_tv(name: &str, tv: &Layout, elem_bits: u32, storage: Storage) -> LiveFrag {
-        let t = tv.get(0).size().st() as usize;
-        let v = tv.get(1).size().st() as usize;
-        LiveFrag { name: name.into(), threads: t, values: v, table: (0..t * v).map(|i| tv.at(i as i64)).collect(), elem_bits, storage }
-    }
     pub fn from_pairs(name: &str, per_lane: &[Vec<i64>], elem_bits: u32, storage: Storage) -> LiveFrag {
         let t = per_lane.len();
         let v = per_lane[0].len();

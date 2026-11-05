@@ -1435,9 +1435,6 @@ impl FnBuilder {
         self.let_(Op::BufferLoadB128x2 { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm_lo, imm_hi })
     }
 
-    pub fn buffer_load_b128_off(&mut self, rsrc: ValueId, soff: impl Into<Opnd>, imm: u32) -> ValueId {
-        self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: None, soff: soff.into(), imm, dwords: 4 })
-    }
     pub fn buffer_store_f32(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 1, value: value.into() });
     }
@@ -1535,11 +1532,6 @@ impl FnBuilder {
         v
     }
 
-    /// As `agpr`, at the exact AGPR index `base`.
-    pub fn agpr_at(&mut self, v: ValueId, base: u32) -> ValueId {
-        self.f.agpr.push(AgprMark { target: AgprTarget::Val(v), pin: Some(base) });
-        v
-    }
     pub fn finish(mut self) -> Function {
         let tree = std::mem::take(&mut self.tree);
         let body = tree.finish().unwrap_or_else(|e| panic!("kernel `{}`: {e}", self.f.name));
@@ -1584,13 +1576,6 @@ impl FnBuilder {
     /// Closure form of `tile_produce` / `tile_end`.
     pub fn produce_region<R>(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>, body: impl FnOnce(&mut Self) -> R) -> R {
         self.tile_produce(tile, slot, version);
-        let r = body(self);
-        self.tile_end();
-        r
-    }
-    /// Closure form of `tile_consume` / `tile_end`.
-    pub fn consume_region<R>(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>, body: impl FnOnce(&mut Self) -> R) -> R {
-        self.tile_consume(tile, slot, version);
         let r = body(self);
         self.tile_end();
         r
@@ -1651,20 +1636,12 @@ impl FnBuilder {
         self.let_(Op::Max3F32(a.into(), b.into(), c.into()))
     }
 
-    pub fn fma_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
-        self.let_(Op::FmaF32(a.into(), b.into(), c.into()))
-    }
-
     pub fn exp_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::ExpF32(a.into()))
     }
 
     pub fn rcp_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::RcpF32(a.into()))
-    }
-
-    pub fn cvt_f16_to_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
-        self.let_(Op::CvtF16ToF32(a.into()))
     }
 
     pub fn cvt_f32_to_f16(&mut self, a: impl Into<Opnd>) -> ValueId {
@@ -1688,10 +1665,6 @@ impl FnBuilder {
         self.let_(Op::LoadF32Coherent { base: base.into(), byte_off })
     }
 
-    pub fn load_b128_coherent(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
-        self.let_(Op::LoadB128Coherent { base: base.into(), byte_off })
-    }
-
     /// `global_atomic_add` returning the OLD value, device scope. Per-lane semantics: every active lane adds ITS `value`; pass `1` in lane 0 and `0`
     /// elsewhere for a one-ticket-per-wave counter, then `read_first_lane` the result.
     pub fn atomic_add_u32(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) -> ValueId {
@@ -1700,10 +1673,6 @@ impl FnBuilder {
 
     pub fn store_f32_wt(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::StoreF32Wt { base: base.into(), byte_off, value: value.into() });
-    }
-
-    pub fn store_f32x4_wt(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
-        self.push_stmt(Stmt::StoreF32x4Wt { base: base.into(), byte_off, value: value.into() });
     }
 
     /// Device-scope release: wait for all earlier loads/stores, write back L2 (`buffer_wbl2 sc1`), wait again.
@@ -1788,46 +1757,11 @@ impl FnBuilder {
         self.let_(Op::MfmaF16Wide { a: a.into(), b: b.into(), c: c.into() })
     }
 
-    pub fn mfma_fp8_16x16x32(
-        &mut self,
-        a: impl Into<Opnd>,
-        b: impl Into<Opnd>,
-        c: impl Into<Opnd>,
-    ) -> ValueId {
-        self.let_(Op::MfmaFp8_16x16x32 { a: a.into(), b: b.into(), c: c.into() })
-    }
-
-    pub fn mfma_fp8_32x32x16(
-        &mut self,
-        a: impl Into<Opnd>,
-        b: impl Into<Opnd>,
-        c: impl Into<Opnd>,
-    ) -> ValueId {
-        self.let_(Op::MfmaFp8_32x32x16 { a: a.into(), b: b.into(), c: c.into() })
-    }
-
     #[allow(clippy::too_many_arguments)]
     /// Concatenate two Frag4 values into a Frag8 (low half first).
     /// Pack two f32 into two unsigned-normalized 16-bit values.
     pub fn cvt_pknorm_u16_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPknormU16(a.into(), b.into()))
-    }
-
-    /// Scale two bf16 and pack into fp8, writing one 16-bit half of old.
-    #[allow(clippy::too_many_arguments)]
-    pub fn cvt_scalef32_pk_fp8_bf16(
-        &mut self,
-        old: impl Into<Opnd>,
-        src: impl Into<Opnd>,
-        scale: impl Into<Opnd>,
-        high: bool,
-    ) -> ValueId {
-        self.let_(Op::CvtScalef32PkFp8Bf16 {
-            old: old.into(),
-            src: src.into(),
-            scale: scale.into(),
-            high,
-        })
     }
 
     /// Pack two f32 into two E4M3 fp8 bytes (upper 16 bits are zero).
@@ -1841,16 +1775,6 @@ impl FnBuilder {
 
     pub fn cvt_pk_bf16_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPkBf16F32(a.into(), b.into()))
-    }
-
-    pub fn cvt_pk_fp8_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
-        self.let_(Op::CvtPkFp8F32(a.into(), b.into()))
-    }
-
-    /// Build a Frag16 from sixteen scalar values (raw dwords).
-    pub fn frag16_build(&mut self, lanes: &[ValueId]) -> ValueId {
-        assert_eq!(lanes.len(), 16);
-        self.let_(Op::Frag16Build(lanes.iter().map(|v| Opnd::Val(*v)).collect()))
     }
 
     pub fn cat_frag8(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
@@ -1976,16 +1900,6 @@ impl FnBuilder {
         self.let_(Op::LoadLdsB128x2 { lo: lo.into(), hi: hi.into() })
     }
 
-    /// Load 16 bytes from global memory directly into a `Frag4` loop variable (the load stays in
-    /// flight across the code that follows; the loop back edge waits for it).
-    pub fn var_load_b128(&mut self, var: VarId, base: impl Into<Opnd>, byte_off: u32) {
-        self.push_stmt(Stmt::VarLoadB128 { var, base: base.into(), byte_off });
-    }
-
-    /// `var *= scalar` on every dword of a `Frag16` loop variable.
-    pub fn frag16_pair(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
-        self.let_(Op::Frag16Pair { frag: frag.into(), index })
-    }
     pub fn partner_max_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PartnerMaxF32(a.into()))
     }
@@ -2020,9 +1934,6 @@ impl FnBuilder {
     /// `var = a x b + c` (unscaled fp8; c a separate Frag16 value).
     pub fn var_mfma_fp8_32x32x64_c(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarMfmaFp8C { var, a: a.into(), b: b.into(), c: c.into() });
-    }
-    pub fn var_mfma_scale_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>) {
-        self.push_stmt(Stmt::VarMfmaScaleZ { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
     }
     pub fn var_scale_lane(&mut self, var: VarId, index: u8, scalar: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarScaleLane { var, index, scalar: scalar.into() });
@@ -2061,9 +1972,6 @@ impl FnBuilder {
     }
     pub fn var_scale_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarScalePk { var, pair: pair.into() });
-    }
-    pub fn var_scale_f32(&mut self, var: VarId, scalar: impl Into<Opnd>) {
-        self.push_stmt(Stmt::VarScaleF32 { var, scalar: scalar.into() });
     }
 
     /// `var = scaled_mfma(a, b, var)` in place.
@@ -2108,11 +2016,6 @@ impl FnBuilder {
     /// Update several loop variables in place: the i-th `Seq::inout` port is bound to `vars[i]`.
     pub fn var_asm_n(&mut self, vars: &[VarId], block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) {
         self.push_stmt(Stmt::VarAsmN { vars: vars.to_vec(), block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
-    }
-
-    /// Update the Frag4 loop variable `var` in place with a safe-asm sequence (its leading in/out port is the variable).
-    pub fn var_asm(&mut self, var: VarId, block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) {
-        self.push_stmt(Stmt::VarAsm { var, block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
     }
 
     pub fn load_lds_tr_b8(&mut self, addr: impl Into<Opnd>) -> ValueId {
