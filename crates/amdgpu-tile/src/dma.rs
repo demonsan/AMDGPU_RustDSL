@@ -27,6 +27,8 @@ pub struct DmaPart {
     /// `M0 = sh.base + wave * slice + step * (n - 1)` without the slot offset (bound)
     lds_wave: I32,
     step: i64,
+    /// bytes of one row of the view (the record-range slack of the buffer form)
+    row_bytes: i64,
 }
 
 /// Partitions a DMA of `issues` instructions per wave: wave `wave` (0..waves) fills bytes `[wave * slice, +slice)` of the slot, `slice = issues * 64 *
@@ -70,7 +72,7 @@ pub fn partition_dma(b: &mut FnBuilder, ctx: &Ctx, atom: CopyAtom, lane: &Ix, wa
     let cols: Vec<I32> = cols.iter().map(|c| ctx.bind(b, c)).collect();
     let top = slice - step;
     let lds_wave = b.let_i32((wave_val * slice as i32 + top as i32) + sh.base as i32);
-    DmaPart { atom, src, sh: sh.clone(), row_dyn, row_c, cols, col_of, lds_wave, step }
+    DmaPart { atom, src, sh: sh.clone(), row_dyn, row_c, cols, col_of, lds_wave, step, row_bytes }
 }
 
 impl DmaPart {
@@ -107,13 +109,13 @@ pub struct BufForm {
 
 impl DmaPart {
     pub fn buffer_form(&self, b: &mut FnBuilder) -> BufForm {
-        assert!(self.atom.bytes == 16, "DmaPart::buffer_form: 16-byte DMA only");
+        assert!(self.atom.bytes == 16 || self.atom.bytes == 4, "DmaPart::buffer_form: 16- or 4-byte DMA only");
         let n = self.row_c.len();
         // the descriptor base must be the kernarg pointer: the tile origin (wave-uniform) goes into the soffset and the record range
         let bo = b_bind(b, &self.src.base);
         let bo = b.read_first_lane(bo);
         let nrec = match &self.src.clamp {
-            Some(c) => b.bind_i32(ev_(bo) + (c.limit.clone() - 1) * &self.src.stride + 128),
+            Some(c) => b.bind_i32(ev_(bo) + (c.limit.clone() - 1) * &self.src.stride + self.row_bytes as i32),
             None => b.c_i32(0x7fff_ffff),
         };
         let nrec = b.read_first_lane(nrec);
@@ -137,7 +139,11 @@ impl DmaPart {
         let m0 = b.read_first_lane(m0);
         slot.write(b, |b| {
             for q in 0..n as usize {
-                b.buffer_load_lds_b128(bf.rsrc, bf.voffs[q], so, m0, (self.step * q as i64) as u32);
+                if self.atom.bytes == 4 {
+                    b.buffer_load_lds_b32(bf.rsrc, bf.voffs[q], so, m0, (self.step * q as i64) as u32);
+                } else {
+                    b.buffer_load_lds_b128(bf.rsrc, bf.voffs[q], so, m0, (self.step * q as i64) as u32);
+                }
             }
         });
     }

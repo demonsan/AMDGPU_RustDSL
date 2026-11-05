@@ -37,8 +37,9 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
         // experiment A/B builds (fmha-align): removed again unless adopted
-        "fmha_fwd_hd128_mxfp8_v3x_vs128_lazy" => Some(crate::fmha::fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3x_vs128_lazy", true, false)),
-        "fmha_fwd_hd128_mxfp8_v3x_vs128_skey" => Some(crate::fmha::fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3x_vs128_skey", true, true)),
+        "fmha_fwd_hd128_mxfp8_v3x_vs128_lazy" => Some(crate::fmha::fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3x_vs128_lazy", true, false, false)),
+        "fmha_fwd_hd128_mxfp8_v3x_vs128_kbuf" => Some(crate::fmha::fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3x_vs128_kbuf", true, false, true)),
+        "fmha_fwd_hd128_mxfp8_v3x_vs128_skey" => Some(crate::fmha::fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3x_vs128_skey", true, true, false)),
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),

@@ -73,6 +73,8 @@ pub struct KvRing3 {
     pub mma: TiledMma,
     /// MUBUF form of the K / V DMA (`_vs128`): SGPR per-tile advance, loop-invariant voffsets
     pub buf: Option<(amdgpu_tile::dma::BufForm, amdgpu_tile::dma::BufForm)>,
+    /// MUBUF form of the K-scale DMA
+    pub kd_buf: Option<amdgpu_tile::dma::BufForm>,
 }
 
 impl KvRing3 {
@@ -115,7 +117,7 @@ impl KvRing3 {
             let rt_row = b.bind_i32(lane.tid().lshr(1));
             KdCopy3::Vgpr(amdgpu_tile::rows::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
         };
-        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None }
+        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None, kd_buf: None }
     }
     /// Switches the K / V staging to the buffer form (the vendor's `buffer_load_dwordx4 ... lds` with an SGPR soffset).
     pub fn enable_buffer_dma(&mut self, b: &mut FnBuilder) {
@@ -123,12 +125,21 @@ impl KvRing3 {
         let v = self.vdma.buffer_form(b);
         self.buf = Some((k, v));
     }
+    /// The K-scale DMA in the buffer form too.
+    pub fn enable_buffer_kd(&mut self, b: &mut FnBuilder) {
+        if let KdCopy3::Dma(kd) = &self.kdc {
+            self.kd_buf = Some(kd.buffer_form(b));
+        }
+    }
 
     /// The copies of the tile at `key0` into `slot` that `role` produces (as `KvRing::stage`).
     pub fn stage(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<ValueId> {
         match (role, &self.kdc) {
             (Role::A, KdCopy3::Dma(kd)) => {
-                kd.issue(b, key0, &self.kd.at(slot));
+                match &self.kd_buf {
+                    Some(kb) => kd.issue_buffer(b, kb, key0, &self.kd.at(slot)),
+                    None => kd.issue(b, key0, &self.kd.at(slot)),
+                }
                 match &self.buf {
                     Some((kb, _)) => self.kdma.issue_buffer(b, kb, key0, &self.ks.at(slot)),
                     None => self.kdma.issue(b, key0, &self.ks.at(slot)),
@@ -299,8 +310,9 @@ impl PipeBody for AttnBody3<'_> {
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
         if self.lazy_bias {
-            let seed = self.seed_first.then(|| b.bind_cond(amdgpu_dsl::ox(t.it).eq(0)));
-            self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref(), seed));
+            // no seed: the initial reference (bias words 0x4800: b = 64) puts the first tile's max far above the threshold, so tile 0 always
+            // rebases (the seed of `decide_seeded` is implied)
+            self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref(), None));
             self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
             return;
         }
@@ -350,11 +362,11 @@ impl PipeBody for AttnBody3<'_> {
 /// two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe in the long-sequence copy (`OnlineSoftmax::set_vendor_ref`;
 /// the short copy keeps the exact LUT-corrected recipe: with < 9 tiles the lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", false, false)
+    fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", false, false, false)
 }
 
 /// `_vs128` under another name with the experiment switches (A/B builds).
-pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool) -> Function {
+pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bool) -> Function {
     let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
@@ -363,10 +375,14 @@ pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool) -> Funct
     let roles = Roles::split(b, &blk.lane, 4);
     let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
     ring.enable_buffer_dma(b);
+    if kbuf {
+        ring.enable_buffer_kd(b);
+    }
     let ring = ring;
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     pipe.scalar_keys = scalar_keys;
     pipe.scalar_exit = scalar_keys;
+    pipe.key_unclamped = kbuf;
     let pipe = pipe;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {

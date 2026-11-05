@@ -153,12 +153,15 @@ pub struct Pipeline {
     /// `TwoPhaseOffset`: the next tile's key from a `read_first_lane` of the tile counter (wave-uniform: SALU instead of VALU for the clamp and
     /// the DMA address math)
     pub scalar_keys: bool,
+    /// `TwoPhaseOffset`: the next tile's key without the clamp to the last tile (inside the loop t + 1 <= nkv - 1 holds; valid only when
+    /// every stage reads through a range-checked buffer descriptor, so the verifier needs no clamp for the bounds)
+    pub key_unclamped: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true, late_stage_b: false, scalar_keys: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true, late_stage_b: false, scalar_keys: false, key_unclamped: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -382,7 +385,7 @@ impl Pipeline {
                 };
                 self.prebind(b, &t);
                 let late = self.late_stage_b && role == Role::B;
-                let key_n = staged.then(|| b.let_i32(nn << self.lg()));
+                let key_n = staged.then(|| if self.key_unclamped { b.let_i32((varx(it) + 1) << self.lg()) } else { b.let_i32(nn << self.lg()) });
                 if staged && !late {
                     body.stage(b, role, key_n.as_ref().expect("key"), &t.next);
                 }
