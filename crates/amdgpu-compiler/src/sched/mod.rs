@@ -17,6 +17,7 @@ pub mod liveness;
 pub mod m0;
 pub mod model;
 pub mod order;
+pub mod ldahead;
 pub mod phase;
 pub mod slotfill;
 pub mod sim;
@@ -51,11 +52,15 @@ pub struct Options {
     pub hoist_dist: usize,
     /// `slotfill`: the slot-filling scheduler (sched/slotfill.rs): MFMAs are the skeleton, the other instructions are spread over their deadline windows
     pub slotfill: bool,
+    /// `ldahead=D` (sched/ldahead.rs): post-pass moving every ds_read up until D MFMAs sit between it and its first consumer (0 = off)
+    pub ldahead: usize,
+    /// `ldslack=S`: extra live VGPR dwords `ldahead` may use above the block's original peak
+    pub ldslack: i64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0 }
     }
 }
 
@@ -100,6 +105,16 @@ impl Options {
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
+                        }
+                        if let Some(v) = t.strip_prefix("ldahead=") {
+                            if let Ok(n) = v.parse() {
+                                o.ldahead = n;
+                            }
+                        }
+                        if let Some(v) = t.strip_prefix("ldslack=") {
+                            if let Ok(n) = v.parse() {
+                                o.ldslack = n;
+                            }
                         }
                         if let Some(v) = t.strip_prefix("hoist=") {
                             if let Ok(n) = v.parse() {
@@ -202,6 +217,12 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         eprintln!("phase: {phased} instructions moved");
     }
     schedule_blocks(m, o, &mut stats)?;
+    if o.ldahead > 0 {
+        let n = ldahead::run(m, o);
+        if o.stats {
+            eprintln!("ldahead: {n} blocks changed");
+        }
+    }
     stats.waits_inserted = waits::insert_waits(m);
     if o.verify {
         waits::verify_waits(m).map_err(|e| format!("wait verification failed: {e}"))?;
