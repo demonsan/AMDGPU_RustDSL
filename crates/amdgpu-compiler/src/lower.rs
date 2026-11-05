@@ -15,7 +15,7 @@ use amdgpu_dsl::{DType, Function, Node, Op, Opnd, RegionKind, Stmt, ValueId};
 use crate::mir::*;
 
 /// Compiler optimisations that reduce dynamic VALU count (accuracy-preserving: same values, same
-/// arithmetic). Selected with `AMDC_LOWER_OPTS=imm,cmpfold` (`all`, `none`); DEFAULT `dce,cmpfold`.
+/// arithmetic). Selected per kernel profile (`lib.rs`, `with_opts`); DEFAULT `dce,cmpfold`.
 ///  * `imm`     - constants become in-line / literal operands (VOP2 src0, shift amounts, cndmask false arm)
 ///                instead of `v_mov` into a register;
 ///  * `sgpr`    - scalar (SGPR) values are used directly as VALU source operands instead of a `v_mov` copy;
