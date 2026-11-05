@@ -58,11 +58,13 @@ pub struct Options {
     pub ldslack: i64,
     /// `ldsink=D` (sched/ldahead.rs): the opposite direction - sink every ds_read down until at most D MFMAs sit between it and its first consumer (0 = off)
     pub ldsink: usize,
+    /// `wsink` (sched/ldahead.rs): sink the kernel's EXPLICIT `s_waitcnt lgkmcnt(n)` down past the compute that does not need them, so the MFMAs in front of a closing `wait_lds(0)` get the counted waits of the scoreboard
+    pub waitsink: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0 }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, waitsink: false }
     }
 }
 
@@ -100,6 +102,7 @@ impl Options {
                     "nocfg" => o.cfg_cleanup = false,
                     "ldshoist" => o.ldshoist = true,
                     "slotfill" => o.slotfill = true,
+                    "wsink" => o.waitsink = true,
                     "hoistchain" => {
                         o.ldshoist = true;
                         o.hoist_chain = true;
@@ -224,6 +227,12 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         eprintln!("phase: {phased} instructions moved");
     }
     schedule_blocks(m, o, &mut stats)?;
+    if o.waitsink {
+        let n = ldahead::sink_explicit_waits(m, o);
+        if o.stats {
+            eprintln!("wsink: {n} explicit waits moved");
+        }
+    }
     if o.ldahead > 0 || o.ldsink > 0 {
         let n = ldahead::run(m, o);
         if o.stats {

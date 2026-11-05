@@ -135,3 +135,59 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
     }
     changed
 }
+
+/// `wsink`: move every EXPLICIT `s_waitcnt lgkmcnt(..)` (the kernel's `wait_lds`, not an auto wait) down past instructions that neither touch memory nor are fences, until the next fence / memory
+/// operation / terminator (the closing `wait_lds(0)` before a barrier then sits after the last MFMAs, whose operand waits become the scoreboard's counted partial waits). A move is legal
+/// when no dependence edge links the wait to the instruction it passes; the result is re-checked with `verify::check_perm`. Returns the number of waits moved.
+pub fn sink_explicit_waits(m: &mut MFunction, o: &Options) -> usize {
+    let mut moved_total = 0;
+    for bi in 0..m.blocks.len() {
+        let insts = m.blocks[bi].insts.clone();
+        let n = insts.len();
+        if n < 4 || super::phase::has_markers(&insts) {
+            continue;
+        }
+        let term = m.blocks[bi].term.clone();
+        let g = depgraph::build(m, &insts, &term, o.alu_across_barrier);
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut pos: Vec<usize> = (0..n).collect();
+        let mut moved = 0usize;
+        for w in 0..n {
+            if !matches!(insts[w].op, MOp::SWaitLgkm) || insts[w].auto {
+                continue;
+            }
+            loop {
+                let p = pos[w];
+                if p + 1 >= n {
+                    break;
+                }
+                let next = order[p + 1];
+                let e = &g.eff[next];
+                if e.fence != super::effects::Fence::None || e.mem.is_some() || e.smem || e.pinned {
+                    break;
+                }
+                if g.succs[w].iter().any(|&(x, _)| x == next) {
+                    break;
+                }
+                order.swap(p, p + 1);
+                pos[order[p]] = p;
+                pos[order[p + 1]] = p + 1;
+                moved += 1;
+            }
+        }
+        if moved == 0 {
+            continue;
+        }
+        if o.verify {
+            if let Err(e) = verify::check_perm(m, &insts, &order, &term, o.alu_across_barrier) {
+                if o.stats {
+                    eprintln!("wsink: block {bi}: {e}: left alone");
+                }
+                continue;
+            }
+        }
+        m.blocks[bi].insts = order.into_iter().map(|k| insts[k].clone()).collect();
+        moved_total += moved;
+    }
+    moved_total
+}
