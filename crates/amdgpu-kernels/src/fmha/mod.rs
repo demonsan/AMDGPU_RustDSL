@@ -429,7 +429,12 @@ pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bo
 
 /// `_kvsplit`: the `_vs128` structure over a key range per split (two-smfmac row sums), the partial-row epilogue + log-sum-exp.
 pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_kvsplit", 512);
+    fmha_kvsplit_named("fmha_fwd_hd128_mxfp8_v3_kvsplit", false)
+}
+
+/// `_kvsplit` under another name; `vref`: the vendor recipe with the lazy reference update from 4 tiles of the whole sequence (A/B builds).
+pub fn fmha_kvsplit_named(name: &str, vref: bool) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::KvSplit);
     let b = &mut fb;
     let io = declare_io(b, 256, true);
@@ -437,13 +442,17 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
     let roles = Roles::split(b, &blk.lane, 4);
     let ring = KvRing3::new(b, &io, &blk, &roles, 2);
     let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
-    let lut = blk.lut_copy(b);
+    let lut = if vref { blk.lut_copy_below(b, 4) } else { blk.lut_copy(b) };
     versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
             let p = amdgpu_tile::rowsum::plan();
             body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
+            if vref && !lut {
+                body.sm.set_vendor_ref(b);
+                body.lazy_bias = true;
+            }
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             let l = body.sm.l_total(b);
@@ -463,7 +472,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h() -> Function {
 
 /// `_t128`: 128-row blocks, one 4-wave group, a 3-slot ring with one window per tile (`Cadence::OneWindow`).
 pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
-    fmha_t128_named("fmha_fwd_hd128_mxfp8_v3_t128", false)
+    fmha_t128_named("fmha_fwd_hd128_mxfp8_v3_t128", true)
 }
 
 /// `_t128` under another name; `vref`: the vendor recipe with the lazy reference update from 4 tiles (A/B builds).
