@@ -26,16 +26,23 @@ pub fn emit(m: &MFunction, a: &Alloc) -> String {
             }
         }
         out.push_str(&format!("BB{}:\n", b.label));
+        let mut lines: Vec<String> = Vec::with_capacity(b.insts.len() + 8);
         for inst in &b.insts {
             for line in inst_lines(a, inst) {
                 // perf experiment only (AMDC_EXP_NO_NOPS=1: results may be wrong): how much do the hazard pads cost?
                 if line.starts_with("s_nop") && std::env::var("AMDC_EXP_NO_NOPS").map_or(false, |v| v == "1") {
                     continue;
                 }
-                out.push_str("    ");
-                out.push_str(&line);
-                out.push('\n');
+                lines.push(line);
             }
+        }
+        if m0_hoist_on(&m.name) {
+            hoist_m0(&mut lines);
+        }
+        for line in lines {
+            out.push_str("    ");
+            out.push_str(&line);
+            out.push('\n');
         }
         match &b.term {
             Term::Goto(t) => {
@@ -855,4 +862,83 @@ fn scale_opsel(imm: i64) -> String {
     } else {
         format!(" op_sel:[{},{},0] op_sel_hi:[{},{},0]", sa_b & 1, sb_b & 1, sa_b >> 1, sb_b >> 1)
     }
+}
+
+/// `m0hoist` (FMHA_OPT token, scoped by FMHA_OPT_SCOPE): an LDS-DMA expands to `s_mov_b32 m0, sN; s_nop 0; <dma>` (the SALU M0 write needs one wait
+/// state before the DMA reads M0). When the instruction X just before the expansion is independent of it, the M0 write moves above X and X provides
+/// the wait state: `s_mov_b32 m0, sN; X; <dma>` (the vendor computes M0 ahead of the DMA). Sound with respect to the hazard pass, which counts the
+/// expansion as one instruction (every distance it relied on is still there).
+fn m0_hoist_on(name: &str) -> bool {
+    let on = std::env::var("FMHA_OPT").map_or(false, |x| x.split(|c: char| c == ',' || c == ' ').any(|t| t == "m0hoist"));
+    on && std::env::var("FMHA_OPT_SCOPE").map_or(true, |s| s.is_empty() || name.contains(s.as_str()))
+}
+
+/// Register names an instruction line mentions (v / s / a registers, ranges expanded; vcc, exec, m0, scc as names).
+fn line_regs(l: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let ops = l.split_once(' ').map_or("", |x| x.1);
+    for tok in ops.split(|c: char| c == ',' || c == ' ' || c == '(' || c == ')') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(|c: char| c == 'v' || c == 's' || c == 'a') {
+            let kind = &t[..1];
+            if let Some(r) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                if let Some((x, y)) = r.split_once(':') {
+                    if let (Ok(x), Ok(y)) = (x.parse::<u32>(), y.parse::<u32>()) {
+                        for k in x..=y {
+                            out.push(format!("{kind}{k}"));
+                        }
+                        continue;
+                    }
+                }
+            } else if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
+                out.push(t.to_string());
+                continue;
+            }
+        }
+        if t.starts_with("vcc") || t.starts_with("exec") || t == "m0" || t == "scc" {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+fn is_lds_dma(l: &str) -> bool {
+    l.starts_with("global_load_lds") || (l.starts_with("buffer_load") && l.ends_with(" lds"))
+}
+
+fn hoist_m0(lines: &mut Vec<String>) {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let is_exp = lines[i].starts_with("s_mov_b32 m0, ") && lines.get(i + 1).map_or(false, |l| l == "s_nop 0") && lines.get(i + 2).map_or(false, |l| is_lds_dma(l));
+        if is_exp {
+            if let Some(x) = out.last() {
+                let ok_kind = !(x.starts_with("s_waitcnt")
+                    || x.starts_with("s_cbranch")
+                    || x.starts_with("s_branch")
+                    || x.starts_with("s_endpgm")
+                    || x.starts_with("s_setpc")
+                    || x.starts_with("s_mov_b32 m0")
+                    || is_lds_dma(x)
+                    || x.contains("m0"));
+                let xr = line_regs(x);
+                let mut used = line_regs(&lines[i]);
+                used.extend(line_regs(&lines[i + 2]));
+                if ok_kind && !xr.iter().any(|r| used.contains(r)) {
+                    let x = out.pop().expect("x");
+                    out.push(lines[i].clone());
+                    out.push(x);
+                    out.push(lines[i + 2].clone());
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(lines[i].clone());
+        i += 1;
+    }
+    *lines = out;
 }
