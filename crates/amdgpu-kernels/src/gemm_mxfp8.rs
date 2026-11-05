@@ -660,6 +660,9 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let rsrc_sfb = { let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) };
     let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
     let b_org = b.bind_i32((ev(bx) << lg_n) * ev(k_v));
+    let _p1 = b.bind_i32(ev(m_v) * 3 + 7);
+    let _p2 = { let v = b.bind_i32(ev(tid) * 5 + 3); b.read_first_lane(v) };
+    let _p3 = b.bind_i32(lane.wave() << 9);
 
     // ---- the scale panel (written in the pipeline prologue, `prologue_stores`) ----
     assert!(cta_m == 256 && cta_n == 256, "scale panel: 256 x 256 CTA");
