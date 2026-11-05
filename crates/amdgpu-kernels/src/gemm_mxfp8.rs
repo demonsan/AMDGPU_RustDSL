@@ -468,7 +468,8 @@ impl PipeBody for Body {
                 }
                 b.store_lds_b32(sj.bdst, bval);
             });
-            return;
+        }
+    }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         if let Some((buf, rec, _)) = self.stamp {
             let st = b.memtime_lo();
