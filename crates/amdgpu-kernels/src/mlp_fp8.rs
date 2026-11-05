@@ -38,15 +38,12 @@ enum Mode {
 
 pub fn by_name(name: &str) -> Option<Function> {
     let mode = match name {
-        "mlp_fp8_fused" => Mode::Fused,
-        "mlp_fp8_g1" => Mode::G1,
-        "mlp_fp8_g2" => Mode::G2,
-        "mlp_fp8_ws_fused" => return Some(build_ws(name, Mode::Fused)),
-        "mlp_fp8_ws_g1" => return Some(build_ws(name, Mode::G1)),
-        "mlp_fp8_ws_g2" => return Some(build_ws(name, Mode::G2)),
+        "mlp_fp8_ws_fused" => Mode::Fused,
+        "mlp_fp8_ws_g1" => Mode::G1,
+        "mlp_fp8_ws_g2" => Mode::G2,
         _ => return None,
     };
-    Some(build(name, mode))
+    Some(build_ws(name, mode))
 }
 
 /// The P hand-off as a stage boundary: producer = the packed words of GEMM 1's accumulators, consumer = GEMM 2's B operand (32 rows m x 64 keys per
@@ -62,123 +59,6 @@ fn p_boundary(jb: i64) -> (StageBoundary, StageBoundary) {
     // the consumer tolerates outstanding loads of its own operands only (none of the producer's)
     let c = StageBoundary { live: vec![LiveFrag::from_pairs(&format!("P{jb}"), &cons, 8, Storage::Vgpr)], vm: 0, lgkm: 0, barrier_phase: 0, roles, ..Default::default() };
     (p, c)
-}
-
-fn build(name: &str, mode: Mode) -> Function {
-    // the boundary contract: zero-cost hand-off for every k block of GEMM 2
-    if mode == Mode::Fused {
-        for jb in 0..N1 / 64 {
-            let (p, c) = p_boundary(jb);
-            let rep = check_boundary(&p, &c).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(rep.frags.iter().all(|f| f.1 <= Movement::Register && f.2 == 0), "{name}: the P hand-off is not free: {:?}", rep.frags);
-        }
-    }
-    let mut fb = FnBuilder::new(name, 256);
-    fb.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
-    let b = &mut fb;
-    // ABI: in (X or H) @0, W1 @8, W2 @16, out (Y or H) @24, M @32
-    for (n, o) in [("ptr_in", 0u32), ("ptr_w1", 8), ("ptr_w2", 16), ("ptr_out", 24)] {
-        b.arg(n, DType::Ptr, o, 8);
-    }
-    b.arg("m", DType::I32, 32, 4);
-    let mt = Ext::sym("MT");
-    b.sym_range("MT", 1, 1024);
-    let m = mt.clone() * Ext::c(128);
-    b.ka_is(32, m.clone());
-    b.grid_is(0, mt);
-    b.arg_tensor("ptr_in", m.clone() * Ext::c(K1));
-    b.arg_tensor("ptr_w1", Ext::c(N1 * K1));
-    b.arg_tensor("ptr_w2", Ext::c(N2 * N1));
-    b.arg_tensor("ptr_out", m.clone() * Ext::c(if mode == Mode::G1 { N1 } else { 2 * N2 }));
-    let p_in = b.let_(Op::KernargPtr { offset: 0 });
-    let p_w1 = b.let_(Op::KernargPtr { offset: 8 });
-    let p_w2 = b.let_(Op::KernargPtr { offset: 16 });
-    let p_out = b.let_(Op::KernargPtr { offset: 24 });
-    let m_v = b.let_(Op::KernargI32 { offset: 32 });
-    let tid = b.let_(Op::WorkitemId);
-    let lane = Lane::from_tid(b, tid);
-    let bx = b.let_(Op::WorkgroupIdX);
-    let r_in = { let n = b.bind_i32(ev(m_v) * (K1 as i32)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_in, n) };
-    let r_w1 = b.buffer_desc(p_w1, (N1 * K1) as u32);
-    let r_w2 = b.buffer_desc(p_w2, (N2 * N1) as u32);
-    let r_out = { let n = b.bind_i32(ev(m_v) * (if mode == Mode::G1 { N1 } else { 2 * N2 }) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_out, n) };
-    // this lane's row m (B operand row / accumulator column) and lane half
-    let row = b.bind_i32((ev(bx) << 7) + (lane.wave() << 5) + lane.j());
-    let h16 = b.bind_i32(lane.half() << 4);
-    let c127 = b.c_i32(127);
-    // the 32-row weight tile offsets (8 KB apart) as SGPRs
-    let tile_so: Vec<Opnd> = (0..8i32).map(|t| if t == 0 { Opnd::I32(0) } else { let v = b.c_i32(t * 8192); Opnd::Val(b.read_first_lane(v)) }).collect();
-    // operand fragment: 16 bytes at `base + imm` and `+ 32` (the atom's k halves 16 h + 0..15 and 32 + 16 h + 0..15)
-    let frag = |b: &mut FnBuilder, r: ValueId, voff: ValueId, soff: Opnd, imm: u32| -> ValueId {
-        let lo = b.buffer_load_b128(r, voff, soff, imm);
-        let hi = b.buffer_load_b128(r, voff, soff, imm + 32);
-        b.cat_frag8(lo, hi)
-    };
-    // weight rows: lane j -> row j of a 32-row tile, 256 bytes per row
-    let wrow = b.bind_i32((lane.j() << 8) + ev(h16));
-    let p_words: Vec<Vec<ValueId>> = if mode == Mode::G2 {
-        // GEMM 2 operand from H (natural n1 order): 4 blocks of 64
-        let ho = b.bind_i32((ev(row) << 8) + ev(h16));
-        (0..N1 / 64).map(|jb| vec![frag(b, r_in, ho, Opnd::I32(0), (64 * jb) as u32)]).collect()
-    } else {
-        // ---- GEMM 1: H^T tiles t (32 n1 x 32 m), A = W1 rows, B = X rows ----
-        let xo = b.bind_i32((ev(row) << 8) + ev(h16));
-        let zero = b.frag_zero(DType::Frag16);
-        let mut acc: Vec<ValueId> = vec![zero; (N1 / 32) as usize];
-        for kb in 0..K1 / 64 {
-            let xf = frag(b, r_in, xo, Opnd::I32(0), (64 * kb) as u32);
-            for (t, a) in acc.iter_mut().enumerate() {
-                let wf = frag(b, r_w1, wrow, tile_so[t], (64 * kb) as u32);
-                *a = b.mfma_scale_fp8(wf, xf, *a, c127, c127);
-            }
-        }
-        // ---- elementwise: relu(alpha x) -> fp8, 4 values per word in accumulator order ----
-        let alpha = b.c_f32(ALPHA);
-        let zf = b.c_f32(0.0);
-        let words: Vec<Vec<ValueId>> = acc.iter().map(|a| {
-            (0..4u8).map(|q| {
-                let xs: Vec<ValueId> = (0..4u8).map(|i| { let u = b.frag16_lane(*a, 4 * q + i); let f = b.bitcast_f32(u); let s = b.mul_f32(f, alpha); b.max_f32(s, zf) }).collect();
-                b.cvt_pk_fp8x4_f32(xs[0], xs[1], xs[2], xs[3])
-            }).collect()
-        }).collect();
-        if mode == Mode::G1 {
-            // H[m][n1]: word (t, q) = n1 32 t + 8 q + 4 h .. + 3 of row m
-            let h4 = b.bind_i32(lane.half() << 2);
-            let vo = b.bind_i32((ev(row) << 8) + ev(h4));
-            for (t, ws) in words.iter().enumerate() {
-                for (q, w) in ws.iter().enumerate() {
-                    let f = b.bitcast_f32(*w);
-                    b.buffer_store_f32(r_out, vo, 0i32, (32 * t + 8 * q) as u32, f);
-                }
-            }
-            return fb.finish();
-        }
-        // the hand-off: block jb = words of tiles 2 jb, 2 jb + 1 (the StageBoundary checked above: a register renaming)
-        (0..N1 / 64).map(|jb| { let w: Vec<ValueId> = words[2 * jb as usize].iter().chain(words[2 * jb as usize + 1].iter()).copied().collect(); vec![b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])] }).collect()
-    };
-    // ---- GEMM 2: Y^T tiles u (32 n2 x 32 m), A = W2 rows (n1 contiguous; key-permuted copy in the fused kernel), B = P ----
-    let zero = b.frag_zero(DType::Frag16);
-    let mut acc2: Vec<ValueId> = vec![zero; (N2 / 32) as usize];
-    for (jb, pf) in p_words.iter().enumerate() {
-        for (u, a) in acc2.iter_mut().enumerate() {
-            let wf = frag(b, r_w2, wrow, tile_so[u], (64 * jb) as u32);
-            *a = b.mfma_scale_fp8(wf, pf[0], *a, c127, c127);
-        }
-    }
-    // ---- epilogue: Y[m][n2] bf16, 4 consecutive n2 per (u, q) ----
-    let h8 = b.bind_i32(lane.half() << 3);
-    let vo = b.bind_i32((ev(row) << 9) + ev(h8));
-    for (u, a) in acc2.iter().enumerate() {
-        for q in 0..4u8 {
-            let x: Vec<ValueId> = (0..4u8).map(|i| { let v = b.frag16_lane(*a, 4 * q + i); b.bitcast_f32(v) }).collect();
-            let w0 = b.cvt_pk_bf16_f32(x[0], x[1]);
-            let w1 = b.cvt_pk_bf16_f32(x[2], x[3]);
-            let f2 = b.frag2(w0, w1);
-            b.buffer_store_b64(r_out, vo, 0i32, (64 * u + 16 * q as usize) as u32, f2);
-        }
-    }
-    let _ = Opnd::I32(0);
-    fb.finish()
 }
 
 /// LDS image row pitch of the weight matrices (256 bytes + 16 bytes of padding: the 16 rows a `ds_read_b128` phase touches fall on 16 distinct
