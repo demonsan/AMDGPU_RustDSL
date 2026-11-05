@@ -221,10 +221,10 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         other => other,
     };
-    // experiment switch: AMDC_SLOTFILL=1 (every kernel) or AMDC_SLOTFILL=<substring of the kernel name> adds the slot-filling scheduler to the kernel's options
+    // experiment switch: AMDC_SLOTFILL=1 (every kernel) or AMDC_SLOTFILL=<substring of the kernel name or of its policy name (the policy name drops e.g. `_v3` of `_vs128`)> adds the slot-filling scheduler to the kernel's options
     // (reorder stays off unless the kernel already had it); unset = no change at all (sched/slotfill.rs)
     let sched_opts = match (std::env::var("AMDC_SLOTFILL").ok().filter(|v| !v.is_empty() && v != "0"), sched_opts) {
-        (Some(v), so) if v == "1" || pname.contains(v.as_str()) => {
+        (Some(v), so) if v == "1" || pname.contains(v.as_str()) || f.name.contains(v.as_str()) => {
             let mut o = so.unwrap_or_else(|| sched::Options { reorder: false, ldshoist: true, ..sched::Options::default() });
             o.slotfill = true;
             Some(o)
@@ -238,7 +238,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 Some((p, b)) => (p.to_string(), b.parse::<f64>().ok()),
                 None => (v.clone(), None),
             };
-            if pat == "1" || pname.contains(pat.as_str()) {
+            if pat == "1" || pname.contains(pat.as_str()) || f.name.contains(pat.as_str()) {
                 let mut o = so.unwrap_or_else(|| sched::Options { reorder: false, ldshoist: true, ..sched::Options::default() });
                 o.mfmapair = true;
                 if let Some(b) = budget {
