@@ -56,11 +56,13 @@ pub struct Options {
     pub ldahead: usize,
     /// `ldslack=S`: extra live VGPR dwords `ldahead` may use above the block's original peak
     pub ldslack: i64,
+    /// `ldsink=D` (sched/ldahead.rs): the opposite direction - sink every ds_read down until at most D MFMAs sit between it and its first consumer (0 = off)
+    pub ldsink: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0 }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0 }
     }
 }
 
@@ -109,6 +111,11 @@ impl Options {
                         if let Some(v) = t.strip_prefix("ldahead=") {
                             if let Ok(n) = v.parse() {
                                 o.ldahead = n;
+                            }
+                        }
+                        if let Some(v) = t.strip_prefix("ldsink=") {
+                            if let Ok(n) = v.parse() {
+                                o.ldsink = n;
                             }
                         }
                         if let Some(v) = t.strip_prefix("ldslack=") {
@@ -217,7 +224,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         eprintln!("phase: {phased} instructions moved");
     }
     schedule_blocks(m, o, &mut stats)?;
-    if o.ldahead > 0 {
+    if o.ldahead > 0 || o.ldsink > 0 {
         let n = ldahead::run(m, o);
         if o.stats {
             eprintln!("ldahead: {n} blocks changed");
