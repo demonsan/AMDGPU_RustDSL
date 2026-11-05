@@ -79,8 +79,6 @@ pub struct MfmaAttr {
 pub enum Movable {
     No,
     Yes,
-    /// only when `vcc` filling is on (`hazards::with_vcc_fill`)
-    VccFill,
 }
 
 /// Dead-code elimination class (`lower::dce_full`).
@@ -418,17 +416,17 @@ const fn attrs_of(op: MOp) -> OpAttrs {
     match op {
         // ---- vector ALU
         VMovB32 => a("v_mov_b32", co(Valu, 4, 2, 4, Verified)).movable(Yes).wdelay(2).dce(Pure),
-        VMovFromS => a("v_mov_b32", valu).movable(VccFill).wdelay(2).dce(Pure),
+        VMovFromS => a("v_mov_b32", valu).wdelay(2).dce(Pure),
         VMovFromSPair => a("v_mov_b32", c(Valu, 8, 8, Experimental)).wdelay(2).dce(Pure),
         VPtrAdd => a("v_add_co_u32", c(Valu, 8, 8, Experimental)).vcc(false, true).wdelay(4).dce(Pure),
         VReadPhys => a("v_mov_b32", valu).wdelay(2).dce(Pure),
         VReadFirstLane => a("v_readfirstlane_b32", c(Valu, 4, 12, Unknown)).hz_reader(),
         VMovDpp => a("v_mov_b32_dpp", c(Valu, 4, 8, Unknown)).wdelay(2).hz_reader().backend(Backend::OwnOnly),
-        VCvtPknormU16 => a("v_cvt_pknorm_u16_f32", valu).movable(VccFill).wdelay(2),
+        VCvtPknormU16 => a("v_cvt_pknorm_u16_f32", valu).wdelay(2),
         VCvtPkFp8F32 => a("v_cvt_pk_fp8_f32", valu8).regfx(RegFx::PartialWrite).half(Half::Lo).movable(Yes).wdelay(2),
         VCvtPkBf16F32 => a("v_cvt_pk_bf16_f32", valu).movable(Yes).wdelay(2),
-        VCvtPkFp8Lo => a("v_cvt_scalef32_pk_fp8_f32", valu8).regfx(RegFx::PartialWrite).half(Half::Lo).movable(VccFill).wdelay(2),
-        VCvtPkFp8Hi => a("v_cvt_scalef32_pk_fp8_f32", valu8).regfx(RegFx::PartialWrite).half(Half::Hi).movable(VccFill).wdelay(2),
+        VCvtPkFp8Lo => a("v_cvt_scalef32_pk_fp8_f32", valu8).regfx(RegFx::PartialWrite).half(Half::Lo).wdelay(2),
+        VCvtPkFp8Hi => a("v_cvt_scalef32_pk_fp8_f32", valu8).regfx(RegFx::PartialWrite).half(Half::Hi).wdelay(2),
         VCvtPkFp8F32Hi => a("v_cvt_pk_fp8_f32", valu8).regfx(RegFx::PartialWrite).half(Half::Hi).movable(Yes).wdelay(2),
         VPkAddF32 => a("v_pk_add_f32", valu).movable(Yes).wdelay(2),
         VPermlane32Swap => a("v_permlane32_swap_b32", valu8).regfx(RegFx::SwapSrc01).wdelay(2).hz_reader(),
@@ -447,8 +445,8 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         VExpF32 => a("v_exp_f32", valu8).trans().dce(Pure),
         VLogF32 => a("v_log_f32", valu8).trans().dce(Pure),
         VRcpF32 => a("v_rcp_f32", valu8).trans().dce(Pure),
-        VCvtF32F16 => a("v_cvt_f32_f16", valu).movable(VccFill).wdelay(2).dce(Pure),
-        VCvtF16F32 => a("v_cvt_f16_f32", valu).movable(VccFill).wdelay(2).dce(Pure),
+        VCvtF32F16 => a("v_cvt_f32_f16", valu).wdelay(2).dce(Pure),
+        VCvtF16F32 => a("v_cvt_f16_f32", valu).wdelay(2).dce(Pure),
         VAndB32 => a("v_and_b32", valu).movable(Yes).wdelay(2).dce(Pure),
         VMinI32 => a("v_min_i32", valu).movable(Yes).wdelay(2).dce(Pure),
         VOrB32 => a("v_or_b32", valu).movable(Yes).wdelay(2).dce(Pure),
