@@ -47,7 +47,7 @@
 2. **tile op 进 IR**：把 `TiledCopy`/`TiledMma` 这类调用做成可分派的 IR 算子（按 scope、layout、atom 选实现），而不是在 Rust 里展开成指令序列。这样 IR 层能看到 tile 粒度，便于分析、证明和融合（例如 `convert_layout` 可以在 IR 层自动插入）。
 3. **命名物理轴的布局记法**：给 `Layout` 加 `lane`/`wave`/`m` 轴标注和显式副本，让打印输出与证明报告更可读。
 4. **IR 解析器与通用 walk/map**：打印→解析往返，让 agent 能直接编辑 IR 文本做实验；通用遍历框架可以减少各 pass 的重复递归代码。
-5. **IKET 式时间线输出**：把 stamps 的结果导出成 Perfetto 时间线。
+5. **IKET 式时间线输出**：把 stamps 的结果导出成 Perfetto 时间线。**暂缓**（2026-11-05 决定）：当前用 rocprofiler 看 trace 即可；做 mono kernel（多 stage 融合）时需要按 stage 打点、出时间线，届时再支持。
 
 ## 4. TIRx 目前没有、我们有的
 
