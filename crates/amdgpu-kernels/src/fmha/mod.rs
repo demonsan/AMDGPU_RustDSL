@@ -350,11 +350,11 @@ impl PipeBody for AttnBody3<'_> {
 /// two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe in the long-sequence copy (`OnlineSoftmax::set_vendor_ref`;
 /// the short copy keeps the exact LUT-corrected recipe: with < 9 tiles the lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", false)
+    fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", false, false)
 }
 
 /// `_vs128` under another name with the experiment switches (A/B builds).
-pub fn fmha_vs128_named(name: &str, lazy_bias: bool) -> Function {
+pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool) -> Function {
     let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
@@ -364,7 +364,10 @@ pub fn fmha_vs128_named(name: &str, lazy_bias: bool) -> Function {
     let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
     ring.enable_buffer_dma(b);
     let ring = ring;
-    let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    pipe.scalar_keys = scalar_keys;
+    pipe.scalar_exit = scalar_keys;
+    let pipe = pipe;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {

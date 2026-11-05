@@ -150,12 +150,15 @@ pub struct Pipeline {
     pub tile1_after_barrier: bool,
     /// compute the t+2 key after the barrier (the old order; A/B only)
     pub key_late: bool,
+    /// `TwoPhaseOffset`: the next tile's key from a `read_first_lane` of the tile counter (wave-uniform: SALU instead of VALU for the clamp and
+    /// the DMA address math)
+    pub scalar_keys: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true, late_stage_b: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true, late_stage_b: false, scalar_keys: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -361,7 +364,12 @@ impl Pipeline {
         match self.cadence {
             Cadence::TwoPhaseOffset => {
                 let i1 = b.bind_i32(varx(idx) ^ 1);
-                let it_p1 = b.let_i32(varx(it) + 1);
+                let it_p1 = if self.scalar_keys {
+                    let su = b.read_first_lane(Opnd::Var(it));
+                    b.let_i32(ev(su) + 1)
+                } else {
+                    b.let_i32(varx(it) + 1)
+                };
                 let nn = it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1);
                 let t = TileIt {
                     it: Opnd::Var(it),
