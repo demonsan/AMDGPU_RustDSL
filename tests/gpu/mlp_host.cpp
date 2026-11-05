@@ -26,7 +26,7 @@ static int sigma(int k) { return 32 * (k / 32) + 8 * ((k % 16) / 4) + 4 * ((k % 
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : "build";
     int M = argc > 2 ? std::atoi(argv[2]) : 65536;
-    bool ws = argc > 3 && std::string(argv[3]) == "ws";  // weight-stationary kernels: padded LDS images (272-byte rows), persistent grid
+    bool ws = true;  // the weight-stationary kernels (the non-ws v1 trio was removed)  // weight-stationary kernels: padded LDS images (272-byte rows), persistent grid
     int G = std::min(M / 128, argc > 4 ? std::atoi(argv[4]) : 256);
     const char* pre = ws ? "mlp_fp8_ws_" : "mlp_fp8_";
     int iters = 50, rounds = 7;

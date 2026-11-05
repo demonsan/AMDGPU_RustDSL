@@ -2,143 +2,47 @@
 //!   C[m, n] (bf16) = sum_k A[m, k] 2^(sa[k/128][m] - 127) * B[n, k] 2^(sb[n/128][k/128] - 127)
 //!   A [M, K] fp8 e4m3 row-major; B [N, K] fp8 preshuffled (aiter shuffle_weight 16x16); sa E8M0 [K/128][M]; sb E8M0 [N/128][K/128].
 //!
-//! v2 (VGPR-only until AGPR support lands): CTA 256 (M) x 128 (N), 4 waves 2x2 of 128 x 64; `v_mfma_scale_f32_16x16x128_f8f6f4` through
-//! `TiledMma(swap_ab)` (hardware srcA = the B fragment: lane % 16 = M row of C, 4 consecutive N per lane); fragments read with `TiledCopy`
-//! (`DS_READ_B128X2`) partitioned over the LDS view; global -> LDS DMA derived from the inverse of the LDS layout; scales staged through LDS by DMA;
-//! `tile::Pipeline` OneWindow (3-slot ring, tile t+2 in flight).
+//!
+//! The shipped kernel (`gemm_mxfp8_bs_v4`): CTA 256 x 256, 4 waves 2 x 2 of 128 x 128, `v_mfma_scale_f32_16x16x128_f8f6f4` through
+//! `TiledMma(swap_ab)`; the vendor's register-staged structure (`Cadence::RegStaged`, u2 unroll): operands in AGPRs reloaded in place from tile t+1,
+//! accumulators partly pinned in AGPRs; A in the padded LDS image (1056-byte blocks), B preshuffled, both by MUBUF LDS-DMA with layout-derived
+//! voffsets; the scales once per CTA into a transposed panel (VGPR loads + in-register byte transposes); the LDS-staged epilogue; the slot-filling
+//! scheduler places the DMA issues.
 
 use amdgpu_dsl::tile::{ev, ox, Cadence, LdsPlan, Lane, PipeBody, Pipeline, Role, Shared, SlotIdx, TileIt};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, Opnd, ValueId, VarId, I32};
 use amdgpu_isa::{MmaAtom, DS_READ_B128X2};
 use amdgpu_layout::{composition, layout_to_offsets, make_layout, right_inverse, tup, ComposedLayout, ImmRange, IssuePlan, Ix, Layout, Swizzle};
-use amdgpu_tile::{gemm, make_tiled_copy_a, make_tiled_copy_b, make_tiled_mma, Ctx, LdsPart, TiledMma};
+use amdgpu_tile::{make_tiled_copy_a, make_tiled_copy_b, make_tiled_mma, Ctx, LdsPart, TiledMma};
 
 /// Slots per wave record of the optional timing stamps (`GEMM_STAMP`): 0 kernel start, 1 setup done, 2 prologue done, 3 loop done, 4 epilogue stores issued, 16 + tile = the tile matrix phase.
 const STAMP_SLOTS: usize = 96;
 
-/// Diagnostic ablations (wrong results, timing only): remove one stream to measure the others.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Ablate {
-    /// no global -> LDS copies
-    pub no_dma: bool,
-    /// no MMAs
-    pub no_mma: bool,
-    /// no operand LDS reads (zero fragments)
-    pub no_lds_reads: bool,
-    /// no top-of-tile wait + barrier (only meaningful together with no_dma + no_lds_reads)
-    pub no_sync: bool,
-    /// no per-tile scale reads / selects (the prologue scales are reused)
-    pub no_scales: bool,
-}
 
-/// Build configuration of the MXFP8 blockscale GEMM (4 waves 2 x 2 in every variant). `GemmConfig::v3()` is the best measured one.
+/// Build configuration of the shipped MXFP8 blockscale GEMM (`GemmConfig::v4`).
 #[derive(Clone, Copy, Debug)]
 pub struct GemmConfig {
     pub cta_m: i64,
     pub cta_n: i64,
-    /// A/B MMA operand fragments in AGPRs (ds_read straight into a[..])
-    pub agpr_ops: bool,
     /// accumulators (16x16 blocks, m-block-major) pinned in AGPRs: the first `acc_agpr`
     pub acc_agpr: usize,
-    /// 3-slot OneWindow ring (prefetch distance 2) or the 2-slot cadence (distance 1, for tiles whose 3 slots do not fit the LDS)
-    pub three_slots: bool,
-    /// 2-slot `RegStaged` cadence: operands are loop-carried registers reloaded in place from tile t+1 (the vendor structure)
-    pub reg_staged: bool,
-    /// spread the DMA of the next tile over the MMAs of the window (instead of issuing it as one burst)
-    pub defer_dma: bool,
-    /// one DMA instruction every `dma_gap` MMAs (with `defer_dma`)
-    pub dma_gap: usize,
-    /// B fragments read ahead of the first row of MMAs (window cadences)
-    pub b_prefetch: usize,
-    /// `s_setprio 1` around the MMAs of the window
-    pub setprio: bool,
-    /// all scales of the CTA in one LDS panel loaded in the prologue (K <= 128 x PANEL_KB), no per-tile scale DMA
-    pub scale_panel: bool,
-    /// panel A part transposed in the prologue: 2 dword reads per tile + MFMA byte selects (window cadences)
-    pub panel_transposed: bool,
-    /// XCD-aware 4 x 4 tile raster (16 x 16 tile grids)
-    pub xcd_raster: bool,
-    /// `RegStaged`: MMAs issued before the wait + barrier of the iteration
+    /// MMAs of the register tile issued before the wait + barrier of the iteration
     pub pre_sync_mmas: usize,
-    /// DMA issues share voffsets, the wave-uniform source deltas go to the soffset (pays off once soffset adds are SALU)
-    pub shared_voffsets: bool,
-    /// epilogue through LDS: bf16 C block transposed in a wave-private staging area, then 16-byte row-contiguous stores (the vendor form)
-    pub lds_epilogue: bool,
-    /// `RegStaged`: the scale reads of t+1 issued before the fragment reloads (otherwise after them: an lgkmcnt(0) drain)
-    pub early_scales: bool,
-    /// extra scheduler tokens for this kernel (Function::sched_opts, on top of the Gemm profile's wait pass), e.g. "hoistchain"
-    pub sched: &'static str,
-    /// `RegStaged`: two tiles per loop pass with static ring slots (Pipeline::unroll2, the vendor u2)
-    pub unroll2: bool,
-    /// XCD raster: each XCD's two 4 x 4 blocks stacked vertically (8 x 4 tiles) instead of side by side
-    pub raster_tall: bool,
-    /// `RegStaged`: B DMAs first; the top-of-tile wait leaves the A DMAs in flight and a mid-tile wait + barrier publishes A before its reloads
-    pub split_sync: bool,
-    /// the vendor request shape: waves 0/1 DMA the whole A tile, waves 2/3 the whole B tile (16 issues each)
-    pub wave_roles: bool,
-    /// wave roles in the straight-line form (descriptor / soffset / M0 selected, no branch) - UNVERIFIED timing builds only
-    pub wave_roles_select: bool,
-    /// `RegStaged`: reloads spread one fragment per MMA row (the vendor's Rx2/M pattern) instead of bursts of B halves
-    pub spread_reloads: bool,
-    /// `RegStaged`: the prologue waits for tile 0 only, tile 1 lands behind the first MMAs
-    pub early_tile0: bool,
-    /// DMA voffsets of later issues computed as an earlier issue's plus the uniform delta (fewer prologue VALU; same registers in the loop)
-    pub derive_voffsets: bool,
-    /// `RegStaged`: tiles 0 / 1 DMA issued before the read-partition setup (Pipeline::pre_staged)
-    pub early_dma: bool,
-    /// LDS epilogue in this many row phases (conversion/LDS writes of the next phase overlap the stores of this one); 1 = all at once
-    pub epi_phases: usize,
-    /// DMA voffsets lowered through the GF(2) bit-form normal form (amdgpu_layout::BitForm, CSE across plans): ~470 fewer prologue instructions
-    pub bitfield_voffsets: bool,
-    /// B scales expanded to one dword per K group in the prologue: no per-tile byte shift (static byte select 0)
-    pub b_scale_dword: bool,
-    /// `RegStaged`: MMAs of the register tile issued between the top-of-tile waits and the barrier (after `pre_sync_mmas`)
+    /// MMAs of the register tile issued between the top-of-tile waits and the barrier (after `pre_sync_mmas`)
     pub mid_sync_mmas: usize,
-    /// A LDS image padded like the vendor's (1056-byte pitch per 8 rows, linear DMA lanes) instead of the FMHA XOR swizzle
-    pub a_pad: bool,
-    /// panel transposition packs bytes with v_perm_b32 (3 VALU per dword instead of ~14)
-    pub perm_transpose: bool,
-    /// `RegStaged`: tile 1 DMA issued after the panel transposition (tile 0 first, less TA back-pressure ahead of the prologue gather)
-    pub late_tile1: bool,
-    /// with `late_tile1`: tile 1 issued after the prologue barrier (behind the tile-0 fragment reads)
-    pub tile1_after_barrier: bool,
-    /// `RegStaged`: the next stage's scalar setup + the t+1 scale reads between the top-of-tile waits and the barrier (`post_wait`)
-    pub prefill: bool,
-    /// A/B only: the t+2 stage key computed after the barrier (pre-v5.3 order)
-    pub key_late: bool,
-    /// vendor-style scale path: VGPR loads + in-register 4x4 transposes (dpp quad_perm + v_perm) + ds_write (no panel DMA, no LDS gather)
-    pub sfa_vgpr: bool,
-    pub ablate: Ablate,
+    /// LDS epilogue in this many row phases (conversion / LDS writes of the next phase overlap the stores of this one)
+    pub epi_phases: usize,
+    /// extra scheduler tokens (Function::sched_opts, on top of the Gemm profile's wait pass)
+    pub sched: &'static str,
+    /// epilogue through LDS (bf16 C block transposed in a wave-private staging area, 16-byte row stores; the shipped form). `false` = the direct-C
+    /// epilogue (8-byte stores from the accumulator layout), used by the E3 IR proof (tests/functional_gemm_ir.rs)
+    pub lds_epilogue: bool,
 }
 
 impl GemmConfig {
-    /// VGPR-only, CTA 256 x 128, 3-slot OneWindow ring.
-    pub fn v2() -> GemmConfig {
-        GemmConfig {
-            cta_m: 256, cta_n: 128, agpr_ops: false, acc_agpr: 0, three_slots: true, reg_staged: false, defer_dma: false, dma_gap: 2, b_prefetch: 2,
-            setprio: false, scale_panel: false, panel_transposed: false, xcd_raster: false, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: false, early_scales: false, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 1, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, tile1_after_barrier: false, prefill: false, key_late: false, sfa_vgpr: false, ablate: Ablate::default(),
-        }
-    }
-    /// The best measured: CTA 256 x 256, AGPR operands + 32 AGPR accumulators, 2-slot ring with one barrier per tile, DMA every 3 MMAs (2 before the SALU address chains), transposed
-    /// scale panel, XCD raster.
-    pub fn v3() -> GemmConfig {
-        GemmConfig {
-            cta_m: 256, cta_n: 256, agpr_ops: true, acc_agpr: 32, three_slots: false, reg_staged: false, defer_dma: true, dma_gap: 3, b_prefetch: 2,
-            setprio: false, scale_panel: true, panel_transposed: true, xcd_raster: true, pre_sync_mmas: 0, shared_voffsets: false, lds_epilogue: true, early_scales: true, sched: "", unroll2: false, raster_tall: false, split_sync: false, wave_roles: false, wave_roles_select: false, spread_reloads: false, early_tile0: false, derive_voffsets: false, early_dma: false, epi_phases: 8, bitfield_voffsets: true, b_scale_dword: false, mid_sync_mmas: 0, a_pad: false, perm_transpose: false, late_tile1: false, tile1_after_barrier: false, prefill: false, key_late: false, sfa_vgpr: false, ablate: Ablate::default(),
-        }
-    }
-    /// The vendor structure: loop-carried AGPR operands reloaded in place (RegStaged), 24 AGPR accumulators.
+    /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        // the hand placement knobs (defer_dma / dma_gap spread DMA, spread_reloads) are OFF: the slot-filling scheduler derives the placement (sched/slotfill.rs,
-        // docs/slotfill.md: same-session A/B +0.4-0.6 % over the hand placement, gate 0.999). `v4_hand()` is the previous default (opt-in `gemm_mxfp8_bs_v4_hand`).
-        GemmConfig { defer_dma: false, spread_reloads: false, sched: "rewait,slotfill", ..GemmConfig::v4_hand() }
-    }
-    /// The hand-tuned v4 (DMA spread over the MMAs by `dma_gap`, one reload per MMA row, hoistchain): the pre-slotfill default.
-    pub fn v4_hand() -> GemmConfig {
-        GemmConfig {
-            acc_agpr: 24, reg_staged: true, pre_sync_mmas: 5, mid_sync_mmas: 3, spread_reloads: true, b_scale_dword: true, a_pad: true, perm_transpose: true, late_tile1: true, sfa_vgpr: true, sched: "rewait,hoistchain", unroll2: true,
-            ..GemmConfig::v3()
-        }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true }
     }
 }
 
@@ -221,12 +125,9 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64) {
     b.arg_tensor("ptr_sfb", nt * Ext::c(cta_n / 128) * kt);
 }
 
-/// One DMA stage of a [rows x 128 B] tile: per issue the global offset (relative to the tile origin) and the M0 offset inside the slot.
+/// One DMA stage of a [rows x 128 B] tile: per issue the lane's voffset (bound once, loop invariant) and the LDS offset of its 1 KB block.
 struct Dma {
-    /// per issue: the lane's voffset (bound once, loop invariant, shared by the issues whose sources differ by a wave-uniform amount), that
-    /// wave-uniform source delta (an SGPR added to the soffset, like the vendor's one `s_add` per DMA) and the LDS offset of its 1 KB block
     issues: Vec<(ValueId, i32)>,
-    delta: Vec<Option<ValueId>>,
     /// LDS bytes per 1 KB issue block (1024, or 1056 for the padded A image); the issue LDS offsets above are in 1 KB units (`act`)
     pitch: i32,
 }
@@ -238,78 +139,18 @@ impl Dma {
     }
 }
 
-/// Turns the per-issue source offsets (minus the instruction offset 1024 (q % 4)) into voffsets: an issue whose offset differs from an earlier
-/// issue's by an amount independent of the thread (checked for all 256 threads at two K values) reuses that issue's voffset and adds the delta
-/// to the soffset (SGPR, computed once).
-thread_local! {
-    /// `GemmConfig::derive_voffsets` for the DMA plans being built
-    static DERIVE_VOFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// `GemmConfig::bitfield_voffsets` for the DMA plans being built
-    static BITFIELD_VOFF: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-
-fn finish_dma(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bool) -> Dma {
-    finish_dma_p(b, ctx, s_tid, gofs, share, 1024)
-}
-
-fn finish_dma_p(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, gofs: Vec<Ix>, share: bool, pitch: i32) -> Dma {
-    let tid_id = match s_tid {
-        Ix::Sym(s) => *s,
-        _ => unreachable!(),
-    };
-    // `GemmConfig::shared_voffsets` (today a v_add + v_readfirstlane per issue costs more than the VGPRs it saves)
+/// Turns the per-issue source offsets (minus the instruction offset `pitch (q % 4)`) into voffsets, lowered through the GF(2) bit-form normal form
+/// (amdgpu_layout::BitForm: shift groups, CSE across plans by Ctx::bind).
+fn finish_dma_p(b: &mut FnBuilder, ctx: &Ctx, gofs: Vec<Ix>, pitch: i32) -> Dma {
     let adj: Vec<Ix> = gofs.iter().enumerate().map(|(q, g)| g.add_c(-(pitch as i64) * (q as i64 % 4))).collect();
-    // the DMA voffsets (pure thread-index math) through the bit-field normal form: shift groups, shared across all plans by Ctx::bind
-    ctx.set_bitfield(BITFIELD_VOFF.with(|x| x.get()));
-    let mut voff: Vec<ValueId> = Vec::new();
-    let mut base_of: Vec<usize> = Vec::new(); // issue index whose voffset is shared
-    let mut issues: Vec<(ValueId, i32)> = Vec::new();
-    let mut delta: Vec<Option<ValueId>> = Vec::new();
-    for (q, g) in adj.iter().enumerate() {
-        let found = if share || DERIVE_VOFF.with(|x| x.get()) {
-            base_of.iter().copied().find(|&r| {
-                let d = g.sub(&adj[r]);
-                [4096i64, 8192].iter().all(|&k| {
-                    let v0 = d.eval(&|s| if s == tid_id { 0 } else { k });
-                    (0..256).all(|th| d.eval(&|s| if s == tid_id { th } else { k }) == v0)
-                })
-            })
-        } else {
-            None
-        };
-        match found {
-            Some(r) if !share => {
-                // prologue-only CSE: the voffset is the base issue's plus the (wave-uniform, scalar) delta - exact for every K
-                let d = g.sub(&adj[r]);
-                let dd = ctx.bind(b, &d);
-                let v = b.bind_i32(ev(issues[r].0) + dd);
-                issues.push((v, 1024 * q as i32));
-                delta.push(None);
-            }
-            Some(r) => {
-                let d = g.sub(&adj[r]);
-                let dv = { let e = ctx.bind(b, &d); b.bind_i32(e) };
-                let ds = b.read_first_lane(dv);
-                issues.push((issues[r].0, 1024 * q as i32));
-                delta.push(Some(ds));
-                let _ = &voff;
-            }
-            None => {
-                let v = { let e = ctx.bind(b, g); b.bind_i32(e) };
-                voff.push(v);
-                base_of.push(q);
-                issues.push((v, 1024 * q as i32));
-                delta.push(None);
-            }
-        }
-    }
+    ctx.set_bitfield(true);
+    let issues = adj.iter().enumerate().map(|(q, g)| { let e = ctx.bind(b, g); (b.bind_i32(e), 1024 * q as i32) }).collect();
     ctx.set_bitfield(false);
-    Dma { issues, delta, pitch }
+    Dma { issues, pitch }
 }
-
 /// LDS byte `d = 1024 (issues (tid / 64) + q) + 16 (tid % 64)` holds tile element `smem^-1(d)`, so the source offset is `glob o right_inverse(smem)`;
 /// proved here for sampled threads against a direct search of the LDS layout.
-fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, share: bool, waves: i64) -> Dma {
+fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, waves: i64) -> Dma {
     let issues = rows * 128 / 1024 / waves;
     let sm = smem_tile(rows);
     let tv = make_layout(tup![tup![64, waves], tup![16, issues]], tup![tup![16, 1024 * issues], tup![1, 1024]]);
@@ -329,35 +170,7 @@ fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, 
         }
     }
     // MUBUF form: voffset (loop invariant) + soffset + the instruction offset 1024 (q % 4) = the global offset; M0 = the group's first 1 KB block
-    finish_dma(b, ctx, s_tid, gofs, share)
-}
-
-/// A-tile DMA for the row-major LDS image with the FMHA 128-byte-row swizzle (`swz o (r, k) -> 128 r + k`): one instruction moves 8 whole
-/// 128-byte rows (coalesced 128-byte segments, like the vendor), the swizzle is applied on the source side (the LDS landing is linear in the lane).
-/// LDS byte d -> element (r, k) = swz(d) (the swizzle is an involution) -> global offset `glob(r, k)`; proved for sampled threads.
-fn dma_plan_rows_swz(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, proof_k: i64, share: bool, waves: i64) -> Dma {
-    let issues = rows * 128 / 1024 / waves;
-    let swz = Swizzle::fmha128();
-    let d = &ctx.dyns;
-    let tid_id = match s_tid {
-        Ix::Sym(s) => *s,
-        _ => unreachable!(),
-    };
-    let mut out = Vec::new();
-    for q in 0..issues {
-        let lds = s_tid.mod_c(64, d).mul_c(16).add(&s_tid.div_c(64, d).mul_c(1024 * issues)).add_c(1024 * q);
-        let e = swz.apply_ix(&lds, d);
-        let g = glob.crd2idx(&tup![e.div_c(128, d), e.mod_c(128, d)], d);
-        for th in [0i64, 1, 7, 8, 63, 64, 100, 127, 255].into_iter().filter(|t| *t < 64 * waves) {
-            let env = |s: u32| if s == tid_id { th } else { proof_k };
-            let lb = 1024 * (issues * (th / 64) + q) + 16 * (th % 64);
-            let lin = swz.apply(lb);
-            let want = glob.crd2idx(&tup![lin / 128, lin % 128], d).eval(&env);
-            assert_eq!(g.eval(&env), want, "A DMA thread {th} issue {q}");
-        }
-        out.push(g);
-    }
-    finish_dma(b, ctx, s_tid, out, share)
+    finish_dma_p(b, ctx, gofs, 1024)
 }
 
 /// A-tile DMA for the PADDED row-major LDS image (the vendor form): 1 KB blocks of 8 whole 128-byte rows at a pitch of 1056 bytes (32 bytes of
@@ -386,24 +199,20 @@ fn dma_plan_rows_pad(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: 
         }
         out.push(g);
     }
-    finish_dma_p(b, ctx, s_tid, out, false, 1056)
+    finish_dma_p(b, ctx, out, 1056)
 }
 
-/// The scale panel: every K group's scales of the CTA, loaded once in the prologue (`Cfg::scale_panel`).
+/// The scale panel: every K group's scales of the CTA in LDS, written once in the prologue (`prologue_stores`).
 struct Panel {
     sh: Shared,
     /// LDS offset of the B part inside the panel
     b_base: i64,
-    /// byte offset of this wave's B scales inside the B part (wave column block x KB + the source alignment delta)
-    b_off: ValueId,
-    /// A part transposed in the prologue: [kb][wm][lane % 16][m block i] (8 bytes per lane: 2 dwords, MFMA byte selects instead of shifts)
-    tr: Option<ValueId>,
-    /// the transposition still to emit (prologue_stores)
-    job: Option<TrJob>,
-    /// B part expanded to dwords [wn][PANEL_KB] (byte 0 = the scale) in the prologue: this wave's dword offset (wn 4 PANEL_KB)
-    b_dw: Option<ValueId>,
-    /// vendor-style scale path (`sfa_vgpr`): emitted in `prologue_stores`
-    sfa: Option<SfaJob>,
+    /// A part transposed: [kb][wm][lane % 16][m block i] (8 bytes per lane: 2 dwords, MFMA byte selects); this lane's offset
+    tr: ValueId,
+    /// B part expanded to dwords [wn][PANEL_KB] (byte 0 = the scale): this wave's dword offset (wn 4 PANEL_KB)
+    b_dw: ValueId,
+    /// the VGPR scale path emitted in `prologue_stores`
+    sfa: SfaJob,
 }
 
 /// The VGPR scale path: A scales by 4 passes of buffer_load_dwordx4 (lane = 16 M rows of one K group), a 4x4 byte transpose per dword across each
@@ -463,172 +272,69 @@ fn sfa_transpose_proof() {
     assert_eq!(seen.len(), 64 * 256, "sfa transpose: every panel byte written once");
 }
 
-/// The in-place panel transposition: thread (r = tid % 16, wm = tid / 16 % 2, k = tid / 32) gathers the bytes of rows 128 wm + 16 i + r (i < 8) of
-/// K group 8 round + k (one of the rows its own wave loaded) and writes them as 8 consecutive bytes at 128 wm + 8 r.
-#[derive(Clone, Copy)]
-struct TrJob {
-    rd0: ValueId,
-    wr0: ValueId,
-    sh_r: ValueId,
-    /// B expansion: the source dword address, its byte shift and the destination dword address of this thread (tid % 128 -> [blk][kb])
-    b_exp: Option<(ValueId, ValueId, ValueId)>,
-    /// v_perm selectors (byte s = r % 4 of S1 / S0 into bytes 0 / 1; merge bytes 0,1 of S1 and S0)
-    perm: Option<(ValueId, ValueId)>,
-}
-
 struct Body {
     cfg: Cfg,
-    /// wave roles: the (SGPR) wave id; waves 0/1 move A, 2/3 move B
-    role_a: Option<ValueId>,
-    /// wave roles, straight-line form: the role's descriptor (s_cselect) and per-issue voffsets (selected once)
-    role_rsrc: Option<(ValueId, Vec<ValueId>)>,
     /// K / 128 (kernarg)
     kb_v: ValueId,
-    panel: Option<Panel>,
+    panel: Panel,
     mma: TiledMma,
     a_s: Shared,
     b_s: Shared,
-    sc_s: Shared,
     a_dma: Dma,
     b_dma: Dma,
     a_org: ValueId,
     b_org: ValueId,
     a_wave: ValueId,
     b_wave: ValueId,
-    sc_wave: ValueId,
     rsrc_a: ValueId,
     rsrc_b: ValueId,
     rsrc_sfa: ValueId,
     rsrc_sfb: ValueId,
-    ptr_sfa: ValueId,
-    ptr_sfb: ValueId,
-    m_v: ValueId,
-    sa_src: ValueId,
-    sb_src: ValueId,
-    sa_rd: Vec<ValueId>,
-    sa_sh: Vec<ValueId>,
-    sa_dw: Vec<ValueId>,
-    a_rd: Option<LdsPart>,
-    b_rd: Option<LdsPart>,
+    a_rd: LdsPart,
+    b_rd: LdsPart,
     zero4: ValueId,
     acc: Vec<VarId>,
-    /// deferred stage (key0, slot, units issued) and whether the pipeline loop has started
-    deferred: Option<(I32, SlotIdx, usize, StageCache)>,
-    /// MMAs of the register tile already issued by `pre_sync`
+    /// MMAs of the register tile already issued by `pre_sync` / `post_wait`
     npre_done: usize,
-    /// `prefill`: the next stage's scalar setup and the t+1 scale reads, done between the waits and the barrier
-    pre_cache: Option<StageCache>,
-    pre_scales: Option<(Vec<ValueId>, ValueId, Option<I32>, bool)>,
-    in_loop: bool,
     /// timing stamps (GEMM_STAMP=ends|tiles): debug buffer, this wave's record offset, per-tile stamps
     stamp: Option<(ValueId, ValueId, bool)>,
-    /// register-staged tile (`RegStaged`): initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
+    /// register-staged tile: initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
     staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, ValueId)>,
     rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, VarId)>,
 }
 
 impl Body {
-    /// Loads of tile `t`'s operands from `slot`: scale words (one round trip) + byte selects, then the fragments in the order of `order`
-    /// (`(is_b, index)`), each handed to `sink` right after its load (in place of the dead fragment).
-    #[allow(clippy::type_complexity)]
-    /// The scale words of tile `kb` (one LDS round trip; ring slot or the panel) and the B byte shift: `(A words, B word, B shift)`.
-    fn scale_words(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId, I32) {
-        let nm = (self.cfg.wave_m() / 16) as usize;
-        if let Some(p) = &self.panel {
-            // scale panel (loaded once): A rows [kb][256], B bytes [wn][KB] (+ the alignment delta of the B source)
-            let pr = p.sh.at(&SlotIdx::new(0, 0));
-            let sab = b.bind_i32((kb.clone() << 8) + (p.sh.base as i32) + ev(self.sa_dw[0]));
-            let bo = b.bind_i32(ev(p.b_off) + kb);
-            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (p.sh.base as i32 + p.b_base as i32));
-            let (wa, wb) = pr.read(b, |b| {
-                let wa: Vec<ValueId> = (0..nm).map(|i| {
-                    let a = b.bind_i32(ev(sab) + 16 * i as i32);
-                    b.load_lds_b32(a)
-                }).collect();
-                (wa, b.load_lds_b32(sbb))
-            });
-            return (wa, wb, (ev(bo) & 3) << 3);
-        }
-        let scr = self.sc_s.at(slot);
-        let so = scr.off_v(b);
-        let scb = b.bind_i32(so + self.sc_s.base as i32 + ev(self.sc_wave));
-        let sab = b.bind_i32(ev(scb) + ev(self.sa_dw[0]));
-        let (wa, wb) = scr.read(b, |b| {
-            let wa: Vec<ValueId> = (0..nm).map(|i| {
-                // rows 16 i apart: the same lane dword + 16 i (an immediate)
-                let a = b.bind_i32(ev(sab) + 16 * i as i32);
-                b.load_lds_b32(a)
-            }).collect();
-            let a = b.bind_i32(ev(scb) + 256);
-            (wa, b.load_lds_b32(a))
-        });
-        (wa, wb, ((ev(self.sb_src) + kb) & 3) << 3)
-    }
-    /// Scale words + byte selects (shifted to byte 0).
-    /// The scale reads of tile `kb` (issue only): the A words (transposed panel: final, 2 words; otherwise to be shifted), the B word and its shift.
-    fn scale_issue(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId, Option<I32>, bool) {
+    /// The scale words of tile `kb` from the transposed panel: the 8 A-scale bytes of this lane (one ds_read_b64; the MMA selects byte i % 4 of
+    /// word i / 4: `sa_sel`) and the B scale (the dword-expanded panel: byte 0, no shift).
+    fn load_scales(&self, b: &mut FnBuilder, kb: I32) -> (Vec<ValueId>, ValueId) {
         // K group of a real tile (t + 1 is read only when it exists): the clamp is a no-op that bounds it for the verifier's loop-exit-blind intervals
         let kb = b.bind_i32(kb.lt(ev(self.kb_v)).select_i32(kb.clone(), ev(self.kb_v) - 1));
         let kb = ev(kb);
-        if let Some((base, b_base, b_off, lo, pr)) = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0))))) {
-            let sab = b.bind_i32((kb.clone() << 8) + (base as i32) + ev(lo));
-            // B: the dword-expanded panel (byte 0 of dword [wn][kb]) needs no shift; else the byte position kb + offset is dynamic
-            let b_dw = self.panel.as_ref().and_then(|p| p.b_dw);
-            let (sbb, sh) = match b_dw {
-                Some(bd) => (b.bind_i32((kb.clone() << 2) + ev(bd) + (base + b_base) as i32), None),
-                None => {
-                    let bo = b.bind_i32(ev(b_off) + kb);
-                    (b.bind_i32((ev(bo).lshr(2) << 2) + (base + b_base) as i32), Some((ev(bo) & 3) << 3))
-                }
-            };
-            let (wa, wb) = pr.read(b, |b| {
-                // the 8 A-scale bytes of this lane: one ds_read_b64
-                let w2 = b.load_lds_b64(sab);
-                let wa = vec![b.frag2_lane(w2, 0), b.frag2_lane(w2, 1)];
-                (wa, b.load_lds_b32(sbb))
-            });
-            return (wa, wb, sh, true);
-        }
-        let (wa, wb, sh) = self.scale_words(b, slot, kb);
-        (wa, wb, Some(sh), false)
+        let p = &self.panel;
+        let (base, pr) = (p.sh.base, p.sh.at(&SlotIdx::new(0, 0)));
+        let sab = b.bind_i32((kb.clone() << 8) + (base as i32) + ev(p.tr));
+        let sbb = b.bind_i32((kb << 2) + ev(p.b_dw) + (base + p.b_base) as i32);
+        pr.read(b, |b| {
+            let w2 = b.load_lds_b64(sab);
+            let wa = vec![b.frag2_lane(w2, 0), b.frag2_lane(w2, 1)];
+            (wa, b.load_lds_b32(sbb))
+        })
     }
-    /// The byte selects of `scale_issue`'s words (shifts to byte 0 where the MMA cannot select).
-    fn scale_finish(&self, b: &mut FnBuilder, w: (Vec<ValueId>, ValueId, Option<I32>, bool)) -> (Vec<ValueId>, ValueId) {
-        let (wa, wb, sh, fin) = w;
-        let sa = if fin { wa } else { wa.iter().map(|x| b.bind_i32(ev(*x).lshr(ev(self.sa_sh[0])))).collect() };
-        let sb = match sh {
-            Some(sh) => b.bind_i32(ev(wb).lshr(sh)),
-            None => wb,
-        };
-        (sa, sb)
-    }
-    /// With the transposed panel the A words are NOT shifted (2 words, the MMA selects byte i % 4 of word i / 4: `sa_sel`).
-    fn load_scales(&self, b: &mut FnBuilder, slot: &SlotIdx, kb: I32) -> (Vec<ValueId>, ValueId) {
-        let w = self.scale_issue(b, slot, kb);
-        self.scale_finish(b, w)
-    }    /// The (word, byte) of the A scale of m block i in the `load_scales` words.
+    /// The (word, byte) of the A scale of m block i in the `load_scales` words.
     fn sa_sel(&self, i: usize) -> (usize, u8) {
-        if self.panel.as_ref().map_or(false, |p| p.tr.is_some()) {
-            (i / 4, (i % 4) as u8)
-        } else {
-            (i, 0)
-        }
+        (i / 4, (i % 4) as u8)
     }
+    /// An operand fragment read into AGPRs.
     fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
         let v = part.read(b, o);
-        if self.cfg.agpr_ops {
-            b.agpr(v)
-        } else {
-            v
-        }
+        b.agpr(v)
     }
     /// The whole tile `t` into registers (prologue: tile 0).
     fn load_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
         let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
-        let (sa, sb) = self.load_scales(b, &t.cur, ox(t.it));
-        let mut deferred = self.deferred.take();
-        let ar = self.a_rd.as_ref().expect("a_rd").at(b, &self.a_s.at(&t.cur));
-        let br = self.b_rd.as_ref().expect("b_rd").at(b, &self.b_s.at(&t.cur));
+        let (sa, sb) = self.load_scales(b, ox(t.it));
+        let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
+        let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
         let bf: Vec<ValueId> = (0..nn).map(|j| self.frag(b, &br, j)).collect();
         let af: Vec<ValueId> = (0..nm).map(|i| self.frag(b, &ar, i)).collect();
         self.staged = Some((bf, af, sa, sb));
@@ -639,309 +345,110 @@ impl Body {
     fn compute_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
         let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
         let (nm, nn) = (av.len(), bv.len());
-        let next = if t.staged { Some((self.a_rd.as_ref().expect("a_rd").at(b, &self.a_s.at(&t.next)), self.b_rd.as_ref().expect("b_rd").at(b, &self.b_s.at(&t.next)), (), ())) } else { None };
-        // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and selected at the end (partial lgkm waits)
-        let early = if let Some(w) = self.pre_scales.take() { Some(w) } else if t.staged && self.cfg.early_scales && !self.cfg.ablate.no_scales { Some(self.scale_issue(b, &t.next, ox(t.it) + 1)) } else { None };
-        let mut deferred = self.deferred.take();
-        let total = if self.role_a.is_some() { self.a_dma.issues.len() } else { self.a_dma.issues.len() + self.b_dma.issues.len() + 1 };
-        let per = (total + 2 * nm - 1) / (2 * nm);
-        let prio = self.cfg.setprio;
-        if prio {
-            b.set_prio(1);
-        }
+        let next = if t.staged { Some((self.a_rd.at(b, &self.a_s.at(&t.next)), self.b_rd.at(b, &self.b_s.at(&t.next)))) } else { None };
+        // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and installed at the end (partial lgkm waits)
+        let early = if t.staged { Some(self.load_scales(b, ox(t.it) + 1)) } else { None };
         let half = nn / 2;
-        // spread_reloads: at most one fragment (2 ds_read_b128) per MMA row instead of the B-half bursts (LDS command FIFO)
-        let spread = self.cfg.spread_reloads && nm >= half;
-        let gap = self.cfg.dma_gap.max(1);
-        let mut nmma = 0usize;
-        let _ = per;
-        // E3 proof hook for the reg-staged (v4) compute path: a real IR branch drops one tile's
-        // MMAs, reproducing the historical "tile 1 swallowed" regression in emitted kernel code.
+        // E3 proof hook for the reg-staged compute path: a real IR branch drops one tile's MMAs, reproducing the historical "tile 1 swallowed"
+        // regression in emitted kernel code (tests/functional_gemm_ir.rs).
         let proof_drop = std::env::var("GEMM_PROOF_DROP_KB").ok().and_then(|v| v.parse::<i32>().ok());
-        if proof_drop.is_some() {
-            let it = ox(t.it);
-            let keep = b.bind_cond(it.ne(proof_drop.unwrap()));
+        if let Some(kb) = proof_drop {
+            let keep = b.bind_cond(ox(t.it).ne(kb));
             b.begin_if(keep);
         }
         for (lo, hi) in [(0, half), (half, nn)] {
-            if lo == half && self.cfg.split_sync && next.is_some() {
-                // the A half of tile t+1 (issued after its B half, one tile ago) is published here, before its first reload; the DMAs of this
-                // tile's stage issued so far stay in flight
-                let issued = deferred.as_ref().map_or(self.a_dma.issues.len() + self.b_dma.issues.len(), |d| d.2.min(self.a_dma.issues.len() + self.b_dma.issues.len()));
-                b.wait_vm(issued.min(63) as u8);
-                b.barrier();
-            }
             for i in 0..nm {
                 for j in lo..hi {
                     if lo == 0 && i * half + j < self.npre_done {
-                        continue; // issued before the barrier (pre_sync)
+                        continue; // issued before the barrier (pre_sync / post_wait)
                     }
-                    // the stage of t+2: one DMA every `gap` MMAs
-                    if nmma % gap == 0 {
-                        if let Some((k, s, done, mut cache)) = deferred.take() {
-                            self.stage_now(b, &k, &s, done..done + 1, &mut cache);
-                            if done + 1 < total {
-                                deferred = Some((k, s, done + 1, cache));
-                            }
-                        }
-                    }
-                    nmma += 1;
                     let (w, by) = self.sa_sel(i);
                     mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
-                    if spread && lo == half && i == nm - 1 {
-                        // last row: each B fragment of the second half is reloaded right after its last use
-                        if let Some((_, br, _, _)) = &next {
-                            let v = br.read(b, j);
-                            b.set_var(bv[j], v);
-                        }
-                    }
                 }
                 if lo == half {
-                    if let Some((ar, br, _, _)) = &next {
+                    if let Some((ar, _)) = &next {
                         // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
                         let v = ar.read(b, i);
                         b.set_var(av[i], v);
-                        // spread: the first-half B fragments (free since the first half) one per row
-                        if spread && i < half {
-                            let v = br.read(b, i);
-                            b.set_var(bv[i], v);
-                        }
                     }
                 }
             }
-            if let Some((_, br, _, _)) = &next {
-                if !spread {
-                    for j in lo..hi {
-                        let v = br.read(b, j);
-                        b.set_var(bv[j], v);
-                    }
+            if let Some((_, br)) = &next {
+                for j in lo..hi {
+                    let v = br.read(b, j);
+                    b.set_var(bv[j], v);
                 }
             }
         }
-        if proof_drop.is_some() { b.end_if(); }
-        // whatever is left of the stage (more DMA issues than MMAs after the barrier)
-        if let Some((k, s, done, mut cache)) = deferred.take() {
-            self.stage_now(b, &k, &s, done..usize::MAX, &mut cache);
+        if proof_drop.is_some() {
+            b.end_if();
         }
-        if prio {
-            b.set_prio(0);
-        }
-        if t.staged && !self.cfg.ablate.no_scales {
-            // the scales of t+1 (read early, or here)
-            let (sa, sb) = match early {
-                Some(w) => self.scale_finish(b, w),
-                None => self.load_scales(b, &t.next, ox(t.it) + 1),
-            };
+        if let Some((sa, sb)) = early {
             for (i, v) in sa.iter().enumerate() {
                 b.set_var(sav[i], *v);
             }
             b.set_var(sbv, sb);
         }
     }
-}
-impl Body {
-    /// The DMA of one tile (A issues, B issues, the 2 scale loads); `range` selects which of them to issue now (the deferred form spreads them
-    /// over the MMA rows).
-    fn stage_now(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, range: std::ops::Range<usize>, cache: &mut StageCache) {
-        // `split_sync`: the B issues go first (single-step ranges are remapped: step k < nb -> B unit k, then the A units)
-        let (na, nb) = (self.a_dma.issues.len(), self.b_dma.issues.len());
-        let range = if self.cfg.split_sync && range.len() == 1 && range.start < na + nb {
-            let k = range.start;
-            let u = if k < nb { na + k } else { k - nb };
-            u..u + 1
-        } else {
-            range
-        };
-        // diagnostic ablations (wrong results): FMHA_ABLATE=gemm_nodma skips the copies
-        if self.cfg.ablate.no_dma {
-            return;
-        }
-        // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0
-        // the tile origins are wave uniform: SGPR soffsets
-        // computed once per stage (the deferred form issues the stage in chunks)
-        let (ka, kb) = *cache.org.get_or_insert_with(|| {
-            let ka = { let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v) };
-            let kb = { let v = b.bind_i32((key0.clone() << 4) + ev(self.b_org)); b.read_first_lane(v) };
-            (ka, kb)
-        });
+    /// The DMA of one tile (A issues, then B issues): soffset = the wave-uniform tile origin, M0 = the first 1 KB block of each group of 4 issues.
+    fn stage_now(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx) {
+        // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0; the tile origins are wave uniform: SGPR soffsets
+        let ka = { let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v) };
+        let kb = { let v = b.bind_i32((key0.clone() << 4) + ev(self.b_org)); b.read_first_lane(v) };
         let bufs = [(&self.a_s, &self.a_dma, ka, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, kb, self.rsrc_b, self.b_wave)];
-        if let Some(wv) = self.role_a {
-            // wave roles: every wave has `issues` units of ITS buffer; the stage's scalar setup (both buffers) outside the role branch
-            for (bi, (sh, dma, _, _, wave)) in bufs.iter().enumerate() {
-                if cache.sbase[bi].is_none() {
-                    let o = sh.at(slot).off_v(b);
-                    let sb = b.bind_i32(o + sh.base as i32 + ev(*wave));
-                    cache.sbase[bi] = Some(sb);
-                    for (_, lds) in dma.issues.iter() {
-                        let grp = *lds - *lds % 4096;
-                        if !cache.m0.iter().any(|x| x.0 == (bi, grp)) {
-                            let v = b.bind_i32(ev(sb) + dma.act(*lds).0);
-                            let v = b.read_first_lane(v);
-                            cache.m0.push(((bi, grp), v));
-                        }
-                    }
-                }
-            }
-            let n = self.a_dma.issues.len();
-            if !(0..n).any(|q| range.contains(&q)) && self.role_rsrc.is_none() {
-                return;
-            }
-            if let Some((rr, vo)) = &self.role_rsrc {
-                // straight-line: soffset / M0 selected per stage (s_cselect), descriptor and voffsets selected once in the prologue
-                // (UNVERIFIED timing build: the LDS write marker names the A ring only)
-                let isa = ev(wv).lt(2);
-                // (u32 operands: select through an i32 0/1 factor)
-                if cache.role.is_none() {
-                    // once per stage: soffset and every M0 of the role
-                    let s = b.bind_i32(isa.clone().select_i32(1, 0));
-                    let org = { let v = b.bind_i32(ev(kb) + ev(s) * (ev(ka) - ev(kb))); b.read_first_lane(v) };
-                    let mut m = Vec::new();
-                    for (_, lds) in self.a_dma.issues.iter() {
-                        let grp = *lds - *lds % 4096;
-                        if m.iter().any(|x: &(i32, ValueId)| x.0 == grp) {
-                            continue;
-                        }
-                        let ma = cache.m0.iter().find(|x| x.0 == (0, grp)).unwrap().1;
-                        let mb = cache.m0.iter().find(|x| x.0 == (1, grp)).unwrap().1;
-                        let v = b.bind_i32(ev(mb) + ev(s) * (ev(ma) - ev(mb)));
-                        m.push((grp, b.read_first_lane(v)));
-                    }
-                    cache.role = Some((org, m));
-                }
-                let (org, rm) = cache.role.clone().unwrap();
-                let r = self.a_s.at(slot);
-                let issues: Vec<(usize, i32)> = self.a_dma.issues.iter().enumerate().filter(|(q, _)| range.contains(q)).map(|(q, x)| (q, x.1)).collect();
-                let m0s: Vec<ValueId> = issues.iter().map(|(_, lds)| rm.iter().find(|x| x.0 == *lds - *lds % 4096).unwrap().1).collect();
-                r.write(b, |b| {
-                    for ((q, lds), m0) in issues.iter().zip(m0s.iter()) {
-                        b.load_buffer_lds(*rr, vo[*q], org, *m0, self.a_dma.act(*lds).1, 4);
-                    }
-                });
-                return;
-            }
-            let isa = b.bind_cond(ev(wv).lt(2));
-            b.begin_if(isa);
-            for (bi, (sh, dma, org, rsrc, _)) in bufs.iter().enumerate() {
-                if bi == 1 {
-                    b.else_();
-                }
-                let r = sh.at(slot);
-                let issues: Vec<(ValueId, i32)> = dma.issues.iter().enumerate().filter(|(q, _)| range.contains(q)).map(|(_, x)| *x).collect();
-                let m0s: Vec<ValueId> = issues.iter().map(|(_, lds)| cache.m0.iter().find(|x| x.0 == (bi, *lds - *lds % 4096)).unwrap().1).collect();
-                r.write(b, |b| {
-                    for ((g, lds), m0) in issues.iter().zip(m0s.iter()) {
-                        b.load_buffer_lds(*rsrc, *g, *org, *m0, dma.act(*lds).1, 4);
-                    }
-                });
-            }
-            b.end_if();
-            return;
-        }
-        let mut unit = 0usize;
-        for (bi, (sh, dma, org, rsrc, wave)) in bufs.into_iter().enumerate() {
-            let mine: Vec<(ValueId, i32, Option<ValueId>)> =
-                dma.issues.iter().zip(dma.delta.iter()).enumerate().filter(|(q, _)| range.contains(&(unit + q))).map(|(_, (x, d))| (x.0, x.1, *d)).collect();
-            unit += dma.issues.len();
+        for (sh, dma, org, rsrc, wave) in bufs {
             let r = sh.at(slot);
-            if range.is_empty() {
-                // prefill (empty range): the stage's base and every M0 now, outside the MMA stream
-                if cache.sbase[bi].is_none() {
-                    let o = r.off_v(b);
-                    cache.sbase[bi] = Some(b.bind_i32(o + sh.base as i32 + ev(wave)));
-                }
-                let sbase = cache.sbase[bi].unwrap();
-                for (_, lds) in dma.issues.iter() {
-                    let key = (bi, *lds - *lds % 4096);
-                    if !cache.m0.iter().any(|x| x.0 == key) {
-                        let v = b.bind_i32(ev(sbase) + dma.act(*lds).0);
-                        let v = b.read_first_lane(v);
-                        cache.m0.push((key, v));
-                    }
-                }
-                continue;
-            }
-            if mine.is_empty() {
-                continue;
-            }
-            if cache.sbase[bi].is_none() {
-                let o = r.off_v(b);
-                cache.sbase[bi] = Some(b.bind_i32(o + sh.base as i32 + ev(wave)));
-            }
-            let sbase = cache.sbase[bi].unwrap();
+            let o = r.off_v(b);
+            let sbase = b.bind_i32(o + sh.base as i32 + ev(wave));
             let mut m0s: Vec<(i32, ValueId)> = Vec::new();
-            for (_, lds, _) in mine.iter() {
+            let mut mine: Vec<(ValueId, i32, ValueId)> = Vec::new();
+            for (g, lds) in dma.issues.iter() {
                 let grp = *lds - *lds % 4096;
-                let key = (bi, grp);
-                if !cache.m0.iter().any(|x| x.0 == key) {
+                if !m0s.iter().any(|x| x.0 == grp) {
                     let v = b.bind_i32(ev(sbase) + dma.act(*lds).0);
                     let v = b.read_first_lane(v);
-                    cache.m0.push((key, v));
+                    m0s.push((grp, v));
                 }
-                m0s.push((grp, cache.m0.iter().find(|x| x.0 == key).unwrap().1));
+                mine.push((*g, *lds, m0s.iter().find(|x| x.0 == grp).unwrap().1));
             }
             r.write(b, |b| {
                 // buffer_load_dwordx4 ... lds: voffset = the lane's loop-invariant offset, soffset = the tile origin (wave uniform), M0 = the first 1 KB
-                // block of each group of 4 issues (SGPR, once per stage), instruction offset 1024 (q % 4) moves both the LDS and the global address
-                for ((g, lds, d), (_, m0)) in mine.iter().zip(m0s.iter()) {
-                    // shared voffset: the issue's wave-uniform source delta goes into the soffset (one scalar add)
-                    let so = match d {
-                        Some(d) => {
-                            let v = b.bind_i32(ev(org) + ev(*d));
-                            b.read_first_lane(v)
-                        }
-                        None => org,
-                    };
-                    b.load_buffer_lds(rsrc, *g, so, *m0, dma.act(*lds).1, 4);
+                // block of each group of 4 issues, instruction offset 1024 (q % 4) moves both the LDS and the global address
+                for (g, lds, m0) in mine.iter() {
+                    b.load_buffer_lds(rsrc, *g, org, *m0, dma.act(*lds).1, 4);
                 }
             });
         }
-        if self.panel.is_some() {
-            return; // the scales come from the panel
-        }
-        // scales of tile kb: the CTA's 256 A-scale bytes (contiguous in [K/128][M]) and the dword holding the B-scale byte, into the wave's 512 bytes
-        if !range.contains(&unit) {
-            return;
-        }
-        let kbi = b.bind_i32(key0.clone().lshr(7));
-        let r = self.sc_s.at(slot);
-        let o = r.off_v(b);
-        let sbase = b.bind_i32(o + self.sc_s.base as i32 + ev(self.sc_wave));
-        // MUBUF: A scales voffset = the lane's 4 bytes of the CTA rows, soffset = kb M; B scale: every lane the same dword, soffset = its offset
-        let soa = { let v = b.bind_i32(ev(kbi) * ev(self.m_v)); b.read_first_lane(v) };
-        let sob = { let v = b.bind_i32((ev(self.sb_src) + ev(kbi)) & -4); b.read_first_lane(v) };
-        let m0a = b.read_first_lane(sbase);
-        let m0b = { let v = b.bind_i32(ev(sbase) + 256); b.read_first_lane(v) };
-        let z = b.c_i32(0);
-        r.write(b, |b| {
-            b.buffer_load_lds_b32(self.rsrc_sfa, self.sa_src, soa, m0a, 0);
-            b.buffer_load_lds_b32(self.rsrc_sfb, z, sob, m0b, 0);
-        });
     }
-}
-
-/// Per-stage values shared by the chunks of a deferred stage: SGPR tile origins, slot bases, M0 per (buffer, 4 KB group).
-#[derive(Default, Clone)]
-struct StageCache {
-    /// wave roles: the role's soffset and M0 per 4 KB group
-    role: Option<(ValueId, Vec<(i32, ValueId)>)>,
-    org: Option<(ValueId, ValueId)>,
-    sbase: [Option<ValueId>; 2],
-    m0: Vec<((usize, i32), ValueId)>,
+    /// MMAs `from..to` (in row-major order over the first half of the B fragments) of the register tile.
+    fn early_mmas(&mut self, b: &mut FnBuilder, from: usize, to: usize) {
+        let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
+        let nn = bv.len();
+        let half = nn / 2;
+        let mut n = 0;
+        'o: for i in 0..av.len() {
+            for j in 0..half {
+                if n >= to {
+                    break 'o;
+                }
+                if n >= from {
+                    let (w, by) = self.sa_sel(i);
+                    mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
+                }
+                n += 1;
+            }
+        }
+        self.npre_done = n;
+    }
 }
 
 impl PipeBody for Body {
     fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
-        if self.cfg.defer_dma && self.in_loop {
-            // issued inside the window, spread over the MMA rows
-            let cache = self.pre_cache.take().unwrap_or_default();
-            self.deferred = Some((key0.clone(), slot.clone(), 0, cache));
-            return;
-        }
-        self.stage_now(b, key0, slot, 0..usize::MAX, &mut StageCache::default());
+        self.stage_now(b, key0, slot);
     }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
-        if let Some(sj) = self.panel.as_ref().and_then(|p| p.sfa.as_ref()) {
-            let p = self.panel.as_ref().unwrap();
+        {
+            let (p, sj) = (&self.panel, &self.panel.sfa);
             let pr = p.sh.at(&SlotIdx::new(0, 0));
             // loads (A: 4 x 16 bytes, B: one dword), then the transposes and the panel writes; published by the pipeline's prologue barrier
             let fr: Vec<ValueId> = sj.pso.iter().map(|so| b.buffer_load_b128(self.rsrc_sfa, sj.voff, *so, 0)).collect();
@@ -965,76 +472,14 @@ impl PipeBody for Body {
                 }
                 b.store_lds_b32(sj.bdst, bval);
             });
-            return;
         }
-        let Some(p) = &self.panel else { return };
-        let Some(job) = p.job else { return };
-        let stamp = |b: &mut FnBuilder, s: &Option<(ValueId, ValueId, bool)>, slot: u32| {
-            if let Some((buf, rec, _)) = s {
-                let st = b.memtime_lo();
-                b.stamp_store(*buf, *rec, slot, st);
-            }
-        };
-        let sc = self.stamp;
-        stamp(b, &sc, 5); // slot 5: every prologue DMA issued
-        // the panel DMA was issued before the two tile stages: wait for it only (in-order VMEM returns)
-        let after = (if self.cfg.late_tile1 { 1 } else { 2 }) * (self.a_dma.issues.len() + self.b_dma.issues.len());
-        b.wait_vm(after.min(63) as u8);
-        stamp(b, &sc, 6); // slot 6: own panel DMA landed
-        // publish the panel (the protocol is cross-wave), gather every round, one barrier, write every round (the pipeline prologue barrier
-        // publishes the result): 2 barriers in all, the tiles' DMA keeps running behind
-        b.barrier();
-        let pr = p.sh.at(&SlotIdx::new(0, 0));
-        let mut packed: Vec<(ValueId, ValueId)> = Vec::new();
-        for round in 0..(PANEL_KB / 8) as i32 {
-            let words: Vec<ValueId> = pr.read(b, |b| (0..8).map(|i| { let a = b.bind_i32(ev(job.rd0) + (2048 * round + 16 * i)); b.load_lds_b32(a) }).collect());
-            if let Some((sel_pair, sel_merge)) = job.perm {
-                // v_perm_b32: byte s of two words into bytes 0/1 (sel_pair), then two pairs into one dword (sel_merge) - 3 VALU per dword
-                let pair = |b: &mut FnBuilder, lo: ValueId, hi: ValueId| b.perm_b32(hi, lo, sel_pair);
-                let p01 = pair(b, words[0], words[1]);
-                let p23 = pair(b, words[2], words[3]);
-                let p45 = pair(b, words[4], words[5]);
-                let p67 = pair(b, words[6], words[7]);
-                let d0 = b.perm_b32(p23, p01, sel_merge);
-                let d1 = b.perm_b32(p67, p45, sel_merge);
-                packed.push((d0, d1));
-            } else {
-                let bs: Vec<ValueId> = words.iter().map(|w| b.bind_i32(ev(*w).lshr(ev(job.sh_r)) & 255)).collect();
-                let d0 = b.bind_i32(ev(bs[0]) | (ev(bs[1]) << 8) | (ev(bs[2]) << 16) | (ev(bs[3]) << 24));
-                let d1 = b.bind_i32(ev(bs[4]) | (ev(bs[5]) << 8) | (ev(bs[6]) << 16) | (ev(bs[7]) << 24));
-                packed.push((d0, d1));
-            }
-        }
-        let bexp = job.b_exp.map(|(src, shv, dst)| {
-            let w = pr.read(b, |b| b.load_lds_b32(src));
-            (b.bind_i32(ev(w).lshr(ev(shv)) & 255), dst)
-        });
-        b.wait_lds(0);
-        stamp(b, &sc, 7); // slot 7: gathered (before the mid barrier)
-        b.barrier();
-        stamp(b, &sc, 8); // slot 8: mid barrier passed
-        pr.write(b, |b| {
-            for (round, (d0, d1)) in packed.iter().enumerate() {
-                let a0 = b.bind_i32(ev(job.wr0) + 2048 * round as i32);
-                let a1 = b.bind_i32(ev(job.wr0) + 2048 * round as i32 + 4);
-                b.store_lds_b32(a0, *d0);
-                b.store_lds_b32(a1, *d1);
-            }
-            if let Some((v, dst)) = bexp {
-                b.store_lds_b32(dst, v);
-            }
-        });
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
-        // RegStaged: stages issued between here and the first pre_sync (tile 1 with tile1_after_barrier) go out immediately
-        self.in_loop = !self.cfg.reg_staged;
         if let Some((buf, rec, _)) = self.stamp {
             let st = b.memtime_lo();
             b.stamp_store(buf, rec, 9, st); // slot 9: prologue wait + barrier passed (tiles 0/1 + transposed panel visible)
         }
-        if self.cfg.reg_staged {
-            self.load_tile(b, t0);
-        }
+        self.load_tile(b, t0);
         if let Some((buf, rec, _)) = self.stamp {
             let st = b.memtime_lo();
             b.stamp_store(buf, rec, 2, st); // slot 2: prologue done (tile 0 fragments requested), about to enter the tile loop
@@ -1058,69 +503,17 @@ impl PipeBody for Body {
             self.rv = Some((r[..nb].to_vec(), r[nb..nb + nf].to_vec(), r[nb + nf..nb + nf + ns].to_vec(), r[nb + nf + ns]));
         }
     }
-    fn v_phase(&mut self, b: &mut FnBuilder, role: Role, t: &TileIt) {
-        if !self.cfg.reg_staged {
-            // 2-slot TwoPhaseOffset: the whole tile is computed between the stage of t+1 and its wait (the matrix phase stays empty)
-            self.window(b, role, t);
+    /// The next MMAs of the register tile between the waits and the barrier (the vendor issues 3 there): the barrier latency hides behind them.
+    fn post_wait(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
+        if self.cfg.mid_sync_mmas > 0 {
+            let from = self.npre_done;
+            self.early_mmas(b, from, from + self.cfg.mid_sync_mmas);
         }
     }
-    fn post_wait(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
-        if self.cfg.reg_staged && self.cfg.prefill && t.staged {
-            // scalar setup of the t+2 stage (the pipeline's key: it + 2 clamped) and the t+1 scale reads (static panel): before the barrier, so the
-            // first DMA and MMAs follow the barrier immediately
-            let it2 = ox(t.it) + 2;
-            let key = b.let_i32(it2.lt(ev(self.kb_v)).select_i32(it2.clone(), ev(self.kb_v) - 1) << 7);
-            let mut cache = StageCache::default();
-            self.stage_now(b, &key, t.n2.as_ref().expect("n2"), 0..0, &mut cache);
-            self.pre_cache = Some(cache);
-            if self.cfg.early_scales && !self.cfg.ablate.no_scales {
-                self.pre_scales = Some(self.scale_issue(b, &t.next, ox(t.it) + 1));
-            }
-        }
-        if !self.cfg.reg_staged || self.cfg.mid_sync_mmas == 0 {
-            return;
-        }
-        // the next MMAs of the register tile between the waits and the barrier (the vendor issues 3 there): the barrier latency hides behind them
-        let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
-        let nn = bv.len();
-        let half = nn / 2;
-        let (from, to) = (self.npre_done, self.npre_done + self.cfg.mid_sync_mmas);
-        let mut n = 0;
-        'o: for i in 0..av.len() {
-            for j in 0..half {
-                if n >= to {
-                    break 'o;
-                }
-                if n >= from {
-                    let (w, by) = self.sa_sel(i);
-                    mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
-                }
-                n += 1;
-            }
-        }
-        self.npre_done = n;
-    }    fn pre_sync(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
-        self.in_loop = true;
-        if !self.cfg.reg_staged {
-            return;
-        }
-        // the first MMAs of the register tile run while the wave waits for the DMA and the barrier (the vendor issues 4 there)
+    /// The first MMAs of the register tile run while the wave waits for the DMA and the barrier (the vendor issues 4 there).
+    fn pre_sync(&mut self, b: &mut FnBuilder, _role: Role, _t: &TileIt) {
         let npre = self.cfg.pre_sync_mmas;
-        let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
-        let nn = bv.len();
-        let half = nn / 2;
-        let mut n = 0;
-        'o: for i in 0..av.len() {
-            for j in 0..half {
-                if n == npre {
-                    break 'o;
-                }
-                let (w, by) = self.sa_sel(i);
-                mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
-                n += 1;
-            }
-        }
-        self.npre_done = n;
+        self.early_mmas(b, 0, npre);
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         if let Some((buf, rec, true)) = self.stamp {
@@ -1131,214 +524,20 @@ impl PipeBody for Body {
             let off = b.add_i32(rec, ti);
             b.stamp_store(buf, off, 16, st);
         }
-        if self.cfg.reg_staged {
-            self.compute_tile(b, t);
-        }
-    }
-    fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
-        let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
-        let agpr = self.cfg.agpr_ops;
-        let nords = self.cfg.ablate.no_lds_reads;
-        let zf = if nords { let z = b.frag_zero(DType::Frag4); Some(b.cat_frag8(z, z)) } else { None };
-        let zfb = if nords { let z = b.frag_zero(DType::Frag4); let o = b.frag_zero(DType::Frag4); Some(b.cat_frag8(o, z)) } else { None };
-        let mark = |b: &mut FnBuilder, v: ValueId| if agpr { b.agpr(v) } else { v };
-        let kbx = ox(t.it);
-        // scale words (one LDS round trip), then the byte selects (shifted to byte 0) after the first fragment reads
-        let tr = self.panel.as_ref().and_then(|p| p.tr.map(|o| (p.sh.base, p.b_base, p.b_off, o, p.sh.at(&SlotIdx::new(0, 0)))));
-        let (wa, wb, sbsh) = if let Some((base, b_base, b_off, lo, ref pr)) = tr {
-            // transposed panel: 2 dwords hold the 8 A-scale bytes of this lane; the B byte as before
-            let sab = b.bind_i32((kbx.clone() << 8) + (base as i32) + ev(lo));
-            let bo = b.bind_i32(ev(b_off) + kbx.clone());
-            let sbb = b.bind_i32((ev(bo).lshr(2) << 2) + (base + b_base) as i32);
-            let (wa, wb) = pr.read(b, |b| {
-                // the 8 A-scale bytes of this lane: one ds_read_b64
-                let w2 = b.load_lds_b64(sab);
-                let wa = vec![b.frag2_lane(w2, 0), b.frag2_lane(w2, 1)];
-                (wa, b.load_lds_b32(sbb))
-            });
-            (wa, wb, (ev(bo) & 3) << 3)
-        } else {
-            self.scale_words(b, &t.cur, kbx.clone())
-        };
-        let mut deferred = self.deferred.take();
-        let ar = self.a_rd.as_ref().expect("a_rd").at(b, &self.a_s.at(&t.cur));
-        let br = self.b_rd.as_ref().expect("b_rd").at(b, &self.b_s.at(&t.cur));
-        // A0 and B0 first; the other B fragments are issued one ahead of the first row of MMAs (partial lgkm waits)
-        let mut af = { let v = if let Some(z) = zf { z } else { ar.read(b, 0) }; mark(b, v) };
-        let bpre = self.cfg.b_prefetch.max(1).min(nn);
-        let mut bf: Vec<ValueId> = (0..bpre).map(|j| { let v = if let Some(z) = zfb { z } else { br.read(b, j) }; mark(b, v) }).collect();
-        // A scale of m block i: (word, byte select)
-        let sa: Vec<(ValueId, u8)> = if tr.is_some() {
-            (0..nm).map(|i| (wa[i / 4], (i % 4) as u8)).collect()
-        } else {
-            (0..nm).map(|i| (b.bind_i32(ev(wa[i]).lshr(ev(self.sa_sh[0]))), 0u8)).collect()
-        };
-        let sb = b.bind_i32(ev(wb).lshr(sbsh));
-        let prio = self.cfg.setprio;
-        if prio {
-            b.set_prio(1);
-        }
-        // E3 proof hook: a test-only predicate can drop one K tile from the real kernel. This is a
-        // real IR branch in the emitted Function (not a replica): GEMM_PROOF_DROP_KB=1 removes the
-        // MMAs of tile generation 1, which is the historical "tile 1 swallowed" regression.
-        let proof_drop = std::env::var("GEMM_PROOF_DROP_KB").ok().and_then(|v| v.parse::<i32>().ok());
-        if proof_drop.is_some() {
-            let it = amdgpu_dsl::tile::ox(t.it);
-            let keep = b.bind_cond(it.ne(proof_drop.unwrap()));
-            b.begin_if(keep);
-        }
-        for i in 0..nm {
-            // prefetch the next A fragment while this one feeds 4 MMAs
-            let next = if i + 1 < nm { let v = if let Some(z) = zf { z } else { ar.read(b, i + 1) }; Some(mark(b, v)) } else { None };
-            for j in 0..nn {
-                // the next tile's DMA: one issue every `gap` MMAs (FMHA_ABLATE=dmagapN), from the first row on
-                let gap = self.cfg.dma_gap.max(1);
-                if (nn * i + j) % gap == 0 {
-                    if let Some((k, s, done, mut cache)) = deferred.take() {
-                        let total = if self.role_a.is_some() { self.a_dma.issues.len() } else { self.a_dma.issues.len() + self.b_dma.issues.len() + 1 };
-                        self.stage_now(b, &k, &s, done..done + 1, &mut cache);
-                        if done + 1 < total {
-                            deferred = Some((k, s, done + 1, cache));
-                        }
-                    }
-                }
-                if i == 0 && j + bpre < nn {
-                    let v = if let Some(z) = zfb { z } else { br.read(b, j + bpre) };
-                    bf.push(mark(b, v));
-                }
-                if !self.cfg.ablate.no_mma {
-                    gemm(b, &self.mma, self.acc[nn * i + j], af, bf[j], sa[i].0, sb, sa[i].1, 0);
-                }
-            }
-            if let Some(n) = next {
-                af = n;
-            }
-        }
-        if proof_drop.is_some() { b.end_if(); }
-        // whatever is left of the stage (when gap x issues exceeds the MMAs)
-        if let Some((k, s, done, mut cache)) = deferred.take() {
-            self.stage_now(b, &k, &s, done..usize::MAX, &mut cache);
-        }
-        if prio {
-            b.set_prio(0);
-        }
-        // scheduler-side interleave (CompileProfile::Gemm): FMHA_ABLATE=phase[mN][rM][dK]: N MFMAs, then K ds_reads, every M-th step one DMA issue
-        if let Some(spec) = std::env::var("FMHA_ABLATE").ok().and_then(|v| v.split(',').find(|t| t.starts_with("phase")).map(|t| t.to_string())) {
-            let num = |c: char, d: u32| spec.split(c).nth(1).and_then(|s| s.chars().take_while(|x| x.is_ascii_digit()).collect::<String>().parse::<u32>().ok()).unwrap_or(d);
-            let (nmf, every, nds) = (num('m', 2), num('r', 2), num('d', 1));
-            let steps = (nm * nn) as u32 / nmf;
-            for s in 0..steps {
-                b.sched_group_barrier(amdgpu_dsl::SCHED_MFMA, nmf, 0);
-                b.sched_group_barrier(amdgpu_dsl::SCHED_DS_READ, nds, 0);
-                if s % every == 0 {
-                    b.sched_group_barrier(amdgpu_dsl::SCHED_VMEM_READ, 1, 0);
-                }
-            }
-        }
+        self.compute_tile(b, t);
     }
 }
 
-pub fn gemm_mxfp8_bs_v2() -> Function {
-    gemm_mxfp8_bs("gemm_mxfp8_bs_v2", GemmConfig::v2())
-}
-pub fn gemm_mxfp8_bs_v3() -> Function {
-    gemm_mxfp8_bs("gemm_mxfp8_bs_v3", GemmConfig::v3())
-}
+/// The shipped MXFP8 blockscale GEMM.
 pub fn gemm_mxfp8_bs_v4() -> Function {
     gemm_mxfp8_bs("gemm_mxfp8_bs_v4", GemmConfig::v4())
 }
 
-/// The registered names: the variants and the v3 ablations (`_nodma`, `_nomma`, `_nords`, `_nodma_nords`: timing diagnostics, wrong results).
 pub fn by_name(name: &str) -> Option<Function> {
-    let abl = |a: Ablate| GemmConfig { ablate: a, ..GemmConfig::v3() };
-    let cfg = match name {
-        "gemm_mxfp8_bs_v2" => GemmConfig::v2(),
-        "gemm_mxfp8_bs_v3" => GemmConfig::v3(),
-        "gemm_mxfp8_bs_v4" => GemmConfig::v4(),
-        "gemm_mxfp8_bs_v4_hand" => GemmConfig::v4_hand(),
-        // experiments
-        "gemm_mxfp8_bs_v3_vshare" => GemmConfig { shared_voffsets: true, ..GemmConfig::v3() },
-        // slot-filling scheduler experiments (sched/slotfill.rs): the hand placement knobs (DMA spread, spread reloads) neutralised = plain program order
-        "gemm_mxfp8_bs_v4_plain" => GemmConfig { defer_dma: false, spread_reloads: false, sched: "rewait", ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_plain_sf" => GemmConfig::v4(),
-        "gemm_mxfp8_bs_v4_plain_hc" => GemmConfig { defer_dma: false, spread_reloads: false, sched: "rewait,hoistchain", ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_sf" => GemmConfig { sched: "rewait,slotfill", ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_vshare" => GemmConfig { shared_voffsets: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_acc32" => GemmConfig { acc_agpr: 32, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_acc16" => GemmConfig { acc_agpr: 16, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_bdw" => GemmConfig { b_scale_dword: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_vo" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 2, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_vo3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, dma_gap: 3, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_g2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_t1ab" => GemmConfig { tile1_after_barrier: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_sfa" => GemmConfig { sfa_vgpr: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_keylate" => GemmConfig { key_late: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_pf" => GemmConfig { prefill: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_perm" => GemmConfig { perm_transpose: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_lt1" => GemmConfig { late_tile1: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_permlt1" => GemmConfig { perm_transpose: true, late_tile1: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_pad" => GemmConfig { a_pad: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_pad_g2" => GemmConfig { a_pad: true, dma_gap: 2, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_mid3" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 3, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_p4m6" => GemmConfig { pre_sync_mmas: 4, mid_sync_mmas: 6, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_p2m6" => GemmConfig { pre_sync_mmas: 2, mid_sync_mmas: 6, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_p5m8" => GemmConfig { pre_sync_mmas: 5, mid_sync_mmas: 8, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_p0m8" => GemmConfig { pre_sync_mmas: 0, mid_sync_mmas: 8, spread_reloads: true, b_scale_dword: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_acc8" => GemmConfig { acc_agpr: 8, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_nodma_nords" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, ..Ablate::default() }, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_mma_nosync" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, no_sync: true, ..Ablate::default() }, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_mma_nosync_nosc" => GemmConfig { ablate: Ablate { no_dma: true, no_lds_reads: true, no_sync: true, no_scales: true, ..Ablate::default() }, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_pre0" => GemmConfig { pre_sync_mmas: 0, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_pre8" => GemmConfig { pre_sync_mmas: 8, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_gap2" => GemmConfig { dma_gap: 2, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_gap1" => GemmConfig { dma_gap: 1, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_pre16" => GemmConfig { pre_sync_mmas: 16, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_pre32g2" => GemmConfig { pre_sync_mmas: 32, dma_gap: 2, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_pre32g1" => GemmConfig { pre_sync_mmas: 32, dma_gap: 1, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_late" => GemmConfig { early_scales: false, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_noxcd" => GemmConfig { xcd_raster: false, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_u1" => GemmConfig { unroll2: false, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_spread" => GemmConfig { spread_reloads: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_et0" => GemmConfig { early_tile0: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_dv" => GemmConfig { derive_voffsets: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_ed" => GemmConfig { early_dma: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_nobf" => GemmConfig { bitfield_voffsets: false, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_ep2" => GemmConfig { epi_phases: 2, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_ep4" => GemmConfig { epi_phases: 4, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_ep8" => GemmConfig { epi_phases: 8, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_ep8s" => GemmConfig { epi_phases: 8, spread_reloads: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_ep4s" => GemmConfig { epi_phases: 4, spread_reloads: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_eddv" => GemmConfig { early_dma: true, derive_voffsets: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_spread2" => GemmConfig { spread_reloads: true, dma_gap: 2, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_tall" => GemmConfig { raster_tall: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_split" => GemmConfig { split_sync: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_split2" => GemmConfig { split_sync: true, dma_gap: 2, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_roles" => GemmConfig { wave_roles: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_roles2" => GemmConfig { wave_roles: true, dma_gap: 2, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_rs" => GemmConfig { wave_roles: true, wave_roles_select: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_rs2" => GemmConfig { wave_roles: true, wave_roles_select: true, dma_gap: 2, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_rs1" => GemmConfig { wave_roles: true, wave_roles_select: true, dma_gap: 1, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_prio" => GemmConfig { setprio: true, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_gap4" => GemmConfig { dma_gap: 4, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_acc32h" => GemmConfig { acc_agpr: 32, sched: "rewait,hoistchain", ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_pre0h" => GemmConfig { pre_sync_mmas: 0, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v4_pre8h" => GemmConfig { pre_sync_mmas: 8, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v3_bpre4" => GemmConfig { b_prefetch: 4, ..GemmConfig::v3() },
-        "gemm_mxfp8_bs_v3_bpre6" => GemmConfig { b_prefetch: 6, ..GemmConfig::v3() },
-        "gemm_mxfp8_bs_v3_prio" => GemmConfig { setprio: true, ..GemmConfig::v3() },
-        "gemm_mxfp8_bs_v3_gap3" => GemmConfig { dma_gap: 3, ..GemmConfig::v3() },
-        "gemm_mxfp8_bs_v3_directc" => GemmConfig { lds_epilogue: false, ..GemmConfig::v3() },
-        "gemm_mxfp8_bs_v4_directc" => GemmConfig { lds_epilogue: false, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v3_gap4" => GemmConfig { dma_gap: 4, ..GemmConfig::v3() },
-        "gemm_mxfp8_bs_v3_gap3_bpre4" => GemmConfig { dma_gap: 3, b_prefetch: 4, ..GemmConfig::v3() },
-        "gemm_mxfp8_bs_v4_gap3" => GemmConfig { dma_gap: 3, ..GemmConfig::v4_hand() },
-        "gemm_mxfp8_bs_v3_nodma" => abl(Ablate { no_dma: true, ..Ablate::default() }),
-        "gemm_mxfp8_bs_v3_nomma" => abl(Ablate { no_mma: true, ..Ablate::default() }),
-        "gemm_mxfp8_bs_v3_nords" => abl(Ablate { no_lds_reads: true, ..Ablate::default() }),
-        "gemm_mxfp8_bs_v3_nodma_nords" => abl(Ablate { no_dma: true, no_lds_reads: true, ..Ablate::default() }),
-        _ => return None,
-    };
-    Some(gemm_mxfp8_bs(name, cfg))
+    match name {
+        "gemm_mxfp8_bs_v4" => Some(gemm_mxfp8_bs_v4()),
+        _ => None,
+    }
 }
 
 /// Builds the GEMM for `cfg` under `name`.
@@ -1362,8 +561,6 @@ fn build(name: &str, cfg: Cfg) -> Function {
         b.arg("dbg_stamps", DType::Ptr, 96, 8);
         b.arg_tensor("dbg_stamps", Ext::sym("MT") * Ext::sym("NT") * Ext::c((4 * STAMP_SLOTS * 4) as i64));
     }
-    DERIVE_VOFF.with(|x| x.set(cfg.derive_voffsets));
-    BITFIELD_VOFF.with(|x| x.set(cfg.bitfield_voffsets));
     let ptr_a = b.let_(Op::KernargPtr { offset: 0 });
     let ptr_b = b.let_(Op::KernargPtr { offset: 8 });
     let ptr_c = b.let_(Op::KernargPtr { offset: 16 });
@@ -1389,14 +586,13 @@ fn build(name: &str, cfg: Cfg) -> Function {
     });
     // XCD-aware raster (FMHA_ABLATE=xcd, experiment): workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
     // give every XCD whole 4 x 4 blocks of tiles (4 A + 4 B panels instead of all A panels). Only for a 16 x 16 tile grid here; identity otherwise.
-    let (bx, by) = if cfg.xcd_raster {
+    let (bx, by) = {
         let okv = b.bind_i32((ev(n_v) ^ (16 * cfg.cta_n) as i32) | (ev(m_v) ^ (16 * cfg.cta_m) as i32));
         let id = b.bind_i32(ev(bx0) + (ev(by0) << 4));
         let loc = b.bind_i32(ev(id).lshr(3));
         // block (of 16) = 2 (id % 8) + loc / 16 -> (row, col) = (block / 4, block % 4); inside the block: loc % 16 -> (n4, m4)
         let blk = b.bind_i32(((ev(id) & 7) << 1) + ev(loc).lshr(4));
-        // raster_tall: an XCD's two blocks stacked (8 x 4 tiles) instead of side by side (4 x 8)
-        let (bc, br) = if cfg.raster_tall { (ev(blk).lshr(2), ev(blk) & 3) } else { (ev(blk) & 3, ev(blk).lshr(2)) };
+        let (bc, br) = (ev(blk) & 3, ev(blk).lshr(2));
         let nx = b.bind_i32((bc << 2) + (ev(loc) & 3));
         let ny = b.bind_i32((br << 2) + (ev(loc).lshr(2) & 3));
         let s = b.bind_i32(ev(okv).eq(0).select_i32(1, 0));
@@ -1405,8 +601,6 @@ fn build(name: &str, cfg: Cfg) -> Function {
         b.assume_trusted(px, Ext::c(0), Ext::sym("NT") - Ext::c(1), "XCD raster: (px, py) is a permutation of the 16 x 16 tile grid when the select applies (N = 16 cta_n, M = 16 cta_m: 4 x 4 blocks, 2 per XCD), the identity (workgroup ids) otherwise");
         b.assume_trusted(py, Ext::c(0), Ext::sym("MT") - Ext::c(1), "XCD raster: see px");
         (px, py)
-    } else {
-        (bx0, by0)
     };
     let (lg_m, lg_n) = (cta_m.trailing_zeros() as i32, cta_n.trailing_zeros() as i32);
     let wm = b.bind_i32(lane.wave() & 1);
@@ -1416,7 +610,6 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let mut ctx = Ctx::new();
     let s_lane = ctx.sym("lane", 0, 63, lane.lane());
     let s_tid = ctx.sym("tid", 0, 255, ev(tid));
-    let s_tr_all = if cfg.wave_roles { ctx.sym("tid_role", 0, 127, ev(tid) & 127) } else { s_tid.clone() };
     let s_k = ctx.sym("K", 128, 1 << 20, ev(k_v));
     let s_n = ctx.sym("N", 128, 1 << 20, ev(n_v));
     let s_wm = ctx.sym("wm", 0, 1, ev(wm));
@@ -1427,21 +620,18 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let copy_a = make_tiled_copy_a(DS_READ_B128X2, &mma);
     let copy_b = make_tiled_copy_b(DS_READ_B128X2, &mma);
 
-    // ---- LDS ring: 3 slots of A 32 KB + B 16 KB + scales 2 KB ----
+    // ---- LDS ring: 2 slots of the padded A image + B 32 KB (+ an unused per-tile scale ring kept for the shipped LDS layout) ----
     let mut lds = LdsPlan::new();
-    let slots = if cfg.three_slots { 3 } else { 2 };
-    let a_bytes = if cfg.a_pad { cta_m / 8 * 1056 } else { cta_m * 128 };
+    let slots = 2;
+    let a_bytes = cta_m / 8 * 1056;
     let a_s = lds.ring("A", a_bytes, slots, amdgpu_dsl::tile::Layout::Linear);
     let b_s = lds.ring("B", cta_n * 128, slots, amdgpu_dsl::tile::Layout::Linear);
     let sc_s = lds.ring("SC", 4 * 512, slots, amdgpu_dsl::tile::Layout::Linear);
     // scale panel: A [PANEL_KB][256 rows] + B [2 blocks][PANEL_KB] (+ 4 bytes of source alignment slack, padded to 256 for the dword DMA)
-    let panel_sh = if cfg.scale_panel { Some(lds.tile("SCP", PANEL_KB * 256 + 512, amdgpu_dsl::tile::Layout::Linear)) } else { None };
+    let panel_sh = lds.tile("SCP", PANEL_KB * 256 + 512, amdgpu_dsl::tile::Layout::Linear);
     // epilogue staging (wave-private, reusing the dead ring / panel storage): the wave's C block, bf16 rows of EPI_PITCH bytes
     let epi = if cfg.lds_epilogue {
-        let mut ov: Vec<&Shared> = vec![&a_s, &b_s, &sc_s];
-        if let Some(p) = &panel_sh {
-            ov.push(p);
-        }
+        let ov: Vec<&Shared> = vec![&a_s, &b_s, &sc_s, &panel_sh];
         let per_wave = wave_m * EPI_PITCH;
         assert!(4 * per_wave <= 160 * 1024 - 16, "epilogue staging does not fit the LDS");
         Some(lds.private("EPI", per_wave, 4, &ov))
@@ -1450,55 +640,19 @@ fn build(name: &str, cfg: Cfg) -> Function {
     };
     lds.commit(b);
 
-    // ---- operand reads: the 16-row blocks of the wave (placements (row block) 2048), the wave offset added to the bases ----
+    // ---- operand reads: the 16-row blocks of the wave (padded A: a 16-row block = two 1056-byte blocks of 8 rows; B 2048 bytes) ----
     let view = ComposedLayout::new(Swizzle::none(), smem_block());
-    // A: 128-byte rows with the FMHA swizzle (a 16-row block = 2048 bytes; the swizzle only depends on row bits 0..3)
-    let a_view = if cfg.a_pad {
-        // padded image: a 16-row block = two 1056-byte blocks of 8 rows
-        ComposedLayout::new(Swizzle::none(), make_layout(tup![tup![8, 2], 128], tup![tup![128, 1056], 1]))
-    } else {
-        ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![16, 128], tup![128, 1]))
-    };
-    let a_blk = if cfg.a_pad { 2112 } else { 2048 };
+    let a_view = ComposedLayout::new(Swizzle::none(), make_layout(tup![tup![8, 2], 128], tup![tup![128, 1056], 1]));
+    let a_blk = 2112;
     let a_place: Vec<i64> = (0..wave_m / 16).map(|i| a_blk * i).collect();
     let b_place: Vec<i64> = (0..wave_n / 16).map(|j| 2048 * j).collect();
-    // operand read partitions (built after the first DMAs when `early_dma`)
-    let (a_s2, b_s2) = (a_s.clone(), b_s.clone());
-    let (ctx_r, copy_a_r, copy_b_r, s_lane_r, s_wm_r, s_wn_r) = (&ctx, &copy_a, &copy_b, &s_lane, &s_wm, &s_wn);
-    let mk_rd = move |b: &mut FnBuilder| -> (LdsPart, LdsPart) {
-    let (ctx, s_lane, s_wm, s_wn) = (ctx_r, s_lane_r, s_wm_r, s_wn_r);
-    let mut a_rd = copy_a_r.partition_lds(b, ctx, s_lane, &a_s2, &a_view, &a_place);
-    let mut b_rd = copy_b_r.partition_lds(b, ctx, s_lane, &b_s2, &view, &b_place);
-    let a_wo = ctx.lower(&s_wm.mul_c(wave_m / 16 * a_blk));
-    let b_wo = ctx.lower(&s_wn.mul_c(wave_n / 16 * 2048));
-    // the view bases lie inside one 16-row block (< 2048 bytes): the mask is a no-op that gives the verifier the bound the XOR swizzle hides
-    // (bases include the buffer base; 16-byte reads: the low 4 bits are zero)
-
-    a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32(x + &a_wo)).collect();
-    b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32(x + &b_wo)).collect();
-
-        (a_rd, b_rd)
-    };
-    // ---- DMA (A row-major, B preshuffled), wave parts of M0, CTA origins ----
+    // ---- DMA (A row-major into the padded image, B preshuffled), wave parts of M0, CTA origins ----
     let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
     let b_glob = make_layout(tup![tup![16, cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]);
-    // wave roles (the vendor request shape): waves 0/1 move the whole A tile, waves 2/3 the whole B tile, each with the role-local thread id
-    let (a_dma, b_dma, a_wave, b_wave, role_a) = if cfg.wave_roles {
-        let s_tr = s_tr_all.clone();
-        let a = dma_plan_rows_swz(b, &ctx, &s_tr, cta_m, &a_glob, 8192, false, 2);
-        let bb = dma_plan(b, &ctx, &s_tr, cta_n, &b_glob, 8192, false, 2);
-        let aw = b.bind_i32((lane.wave() & 1) * (cta_m * 128 / 2) as i32);
-        let bw = b.bind_i32((lane.wave() & 1) * (cta_n * 128 / 2) as i32);
-        let wv = b.bind_i32(lane.wave());
-        let wv = b.read_first_lane(wv);
-        (a, bb, aw, bw, Some(wv))
-    } else {
-        let a = if cfg.a_pad { dma_plan_rows_pad(b, &ctx, &s_tid, cta_m, &a_glob, 8192, 4) } else { dma_plan_rows_swz(b, &ctx, &s_tid, cta_m, &a_glob, 8192, cfg.shared_voffsets, 4) };
-        let bb = dma_plan(b, &ctx, &s_tid, cta_n, &b_glob, 8192, cfg.shared_voffsets, 4);
-        let aw = b.bind_i32(lane.wave() * (a_bytes / 4) as i32);
-        let bw = b.bind_i32(lane.wave() * (cta_n * 128 / 4) as i32);
-        (a, bb, aw, bw, None)
-    };
+    let a_dma = dma_plan_rows_pad(b, &ctx, &s_tid, cta_m, &a_glob, 8192, 4);
+    let b_dma = dma_plan(b, &ctx, &s_tid, cta_n, &b_glob, 8192, 4);
+    let a_wave = b.bind_i32(lane.wave() * (a_bytes / 4) as i32);
+    let b_wave = b.bind_i32(lane.wave() * (cta_n * 128 / 4) as i32);
     // buffer descriptors over A (M K bytes) and the preshuffled B (N K bytes)
     let rsrc_a = { let n = b.bind_i32(ev(m_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_a, n) };
     let rsrc_b = { let n = b.bind_i32(ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) };
@@ -1507,163 +661,52 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
     let b_org = b.bind_i32((ev(bx) << lg_n) * ev(k_v));
 
-    // ---- scales: A row of this lane in m-block i = 128 wm + 16 i + lane % 16; B-scale row bx (CTA_N = 128 = one block) ----
-    let sc_wave = b.bind_i32(lane.wave() << 9);
-    // the A-scale DMA covers 256 rows (64 lanes x 4 bytes): the CTA has at most 256
-    assert!(cta_m <= 256);
-    let sa_src = b.bind_i32((ev(by) << lg_m) + (lane.lane() << 2));
-    let sa_rd: Vec<ValueId> = (0..wave_m / 16).map(|i| b.bind_i32(ctx.lower(&s_wm.mul_c(wave_m).add_c(16 * i).add(&s_lane.mod_c(16, &ctx.dyns))))).collect();
-    // B-scale row of this wave's 128-column block (wave_n <= 128): (n_cta + wn wave_n) / 128
-    assert!(wave_n <= 128 && 128 % wave_n == 0);
-    let sb_row = b.bind_i32(((ev(bx) << lg_n) + (ev(wn) * wave_n as i32)).lshr(7));
-    let sb_src = b.bind_i32(ev(sb_row) * ev(kb_v));
-    // loop-invariant byte-select shifts of the A scales and the dword offsets of their rows
-    let sa_sh: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32((ev(*r) & 3) << 3)).collect();
-    let sa_dw: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32(ev(*r).lshr(2) << 2)).collect();
+    // ---- the scale panel (written in the pipeline prologue, `prologue_stores`) ----
+    assert!(cta_m == 256 && cta_n == 256, "scale panel: 256 x 256 CTA");
+    let sh = panel_sh;
+    // this lane's A offset in the transposed panel: 128 wm + 8 (lane % 16)
+    let tr = b.bind_i32((ev(wm) << 7) + ((lane.lane() & 15) << 3));
+    // the VGPR scale path: A by 4 passes of buffer_load_dwordx4 + in-register 4x4 byte transposes (dpp quad_perm + v_perm) + ds_write, B one dword
+    sfa_transpose_proof();
+    // A: lane g = 64 w + lane (+ 256 p per pass) holds 16 M rows (chunk c = g % 16) of K group g / 16: voffset (K group) M + m_cta + 16 c
+    let g0 = b.bind_i32(lane.tid());
+    let voff = b.bind_i32((ev(g0).lshr(4)) * ev(m_v) + (ev(by) << 8) + ((ev(g0) & 15) << 4));
+    let j = b.bind_i32(ev(g0) & 3);
+    // v_perm selectors (byte k of the result = sel byte k: 0..3 S1, 4..7 S0): step 1 [0,4,2,6] / [5,1,7,3], step 2 [0,1,4,5] / [6,7,2,3]
+    let sel1 = b.bind_i32((ev(j) & 1).eq(0).select_i32(0x0602_0400, 0x0307_0105));
+    let sel2 = b.bind_i32(ev(j).lt(2).select_i32(0x0504_0100, 0x0302_0706));
+    // destination of dword d of pass p: panel + 256 kb + 128 wm + 8 (4 d + j) + 4 a  (wm = c / 8, a = c / 4 % 2) = base + 4096 p + 32 d
+    let c = b.bind_i32(ev(g0) & 15);
+    let dst = b.bind_i32(((ev(g0).lshr(4)) << 8) + ((ev(c).lshr(3)) << 7) + (ev(j) << 3) + (((ev(c).lshr(2)) & 1) << 2) + sh.base as i32);
+    // B: thread tid % 128 -> (blk, kb) = (tid / 64 % 2, tid % 64): the dword holding byte (2 bx + blk) KB + kb, shifted to byte 0
+    let blk = b.bind_i32((ev(tid).lshr(6)) & 1);
+    let kbt = b.bind_i32(ev(tid) & 63);
+    let boff = b.bind_i32(((ev(bx) << 1) + ev(blk)) * ev(kb_v) + ev(kbt));
+    let bvo = b.bind_i32(ev(boff).lshr(2) << 2);
+    let bsh = b.bind_i32((ev(boff) & 3) << 3);
+    let bdst = b.bind_i32(((ev(tid) & 127) << 2) + (sh.base + PANEL_KB * 256) as i32);
+    let pso: Vec<ValueId> = (0..4).map(|p| { let v = b.bind_i32(ev(m_v) * (16 * p)); b.read_first_lane(v) }).collect();
+    let b_dw = b.bind_i32(ev(wn) * (4 * PANEL_KB as i32));
+    let panel = Panel { sh, b_base: PANEL_KB * 256, tr, b_dw, sfa: SfaJob { voff, pso, sel1, sel2, dst, bvo, bsh, bdst } };
 
-    let cadence = if cfg.reg_staged { Cadence::RegStaged } else if cfg.three_slots { Cadence::OneWindow } else { Cadence::TwoSlot };
-    // the panel DMA (before the pipeline prologue, whose wait_vm(0) + barrier publish it): wave w loads K groups 16 w .. 16 w + 15 (zeros past KB:
-    // the descriptor bound), and wave 0 the CTA's B-scale rows (2 x KB bytes from the dword-aligned start)
-    let panel = panel_sh.map(|sh| {
-        assert!(cta_m == 256 && cta_n == 256, "scale panel: 256 x 256 CTA");
-        let per_wave = PANEL_KB / 4;
-        let pr = sh.at(&SlotIdx::new(0, 0));
-
-        let b_src = b.bind_i32(((ev(bx) << 1) * ev(kb_v)) & -4);
-        let b_delta = b.bind_i32(((ev(bx) << 1) * ev(kb_v)) & 3);
-        // wave w loads the K groups 8 r + 2 w + h (r < 8, h < 2): exactly the rows its own threads transpose below (thread group tid / 32 = 2 w + h
-        // owns K groups 8 round + tid / 32), so the transposition needs no barrier
-        let _ = per_wave;
-        let m0s: Vec<ValueId> = (0..(PANEL_KB / 8) as i32).map(|r| { let v = b.bind_i32((lane.wave() << 9) + (2048 * r + sh.base as i32)); b.read_first_lane(v) }).collect();
-        if !cfg.sfa_vgpr { pr.write(b, |b| {
-            for r in 0..(PANEL_KB / 8) as i32 {
-                for h in 0..2i32 {
-                    // soffset = row (8 r + 2 w + h) M; voffset = the CTA rows + 4 lane (sa_src); M0 + imm = panel + 256 (8 r + 2 w) + 256 h (the
-                    // instruction offset also moves the source: compensated in soffset)
-                    let so = { let v = b.bind_i32(((lane.wave() << 1) + (8 * r + h)) * ev(m_v) - 256 * h); b.read_first_lane(v) };
-                    b.buffer_load_lds_b32(rsrc_sfa, sa_src, so, m0s[r as usize], (256 * h) as u32);
-                }
-            }
-        });
-        let w0 = b.bind_cond(lane.wave().eq(0));
-        b.begin_if(w0);
-        let m0b = b.c_i32((sh.base + PANEL_KB * 256) as i32);
-        let zv = b.bind_i32(lane.lane() << 2);
-        let sob = b.read_first_lane(b_src);
-        pr.write(b, |b| b.buffer_load_lds_b32(rsrc_sfb, zv, sob, m0b, 0));
-        b.end_if(); }
-        let b_off = b.bind_i32((ev(wn) * ev(kb_v)) + ev(b_delta));
-        // transpose the A part in place, 8 K groups per round: thread (r = tid % 16, wm = tid / 16 % 2, k = tid / 32) gathers the bytes of rows
-        // 128 wm + 16 i + r (i < 8) of K group 8 round + k and writes them as 8 consecutive bytes at 128 wm + 8 r
-        let tr = if !cfg.panel_transposed { None } else {
-            let r = b.bind_i32(ev(tid) & 15);
-            let wmq = b.bind_i32((ev(tid).lshr(4)) & 1);
-            let kq = b.bind_i32(ev(tid).lshr(5));
-            let sh_r = b.bind_i32((ev(r) & 3) << 3);
-            let rd0 = b.bind_i32((ev(wmq) << 7) + (ev(r).lshr(2) << 2) + (ev(kq) << 8) + sh.base as i32);
-            let wr0 = b.bind_i32((ev(wmq) << 7) + (ev(r) << 3) + (ev(kq) << 8) + sh.base as i32);
-            // the rounds run in the pipeline prologue (`prologue_stores`), after the first tiles' DMA is issued
-            // v_perm_b32 sel bytes: 0..3 pick S1 bytes, 4..7 S0 bytes, 0x0c = 0
-            let perm = if cfg.perm_transpose {
-                let s = b.bind_i32(ev(r) & 3);
-                let sel_pair = b.bind_i32(ev(s) | ((ev(s) + 4) << 8) | I32::c(0x0c0c_0000));
-                let sel_merge = b.c_i32(0x0504_0100);
-                Some((sel_pair, sel_merge))
-            } else {
-                None
-            };
-            let job = TrJob { rd0, wr0, sh_r, b_exp: None, perm };
-            Some((b.bind_i32((ev(wm) << 7) + ((lane.lane() & 15) << 3)), job))
-        };
-        let (tr, job) = match tr { Some((o, j)) => (Some(o), Some(j)), None => (None, None) };
-        let b_dw = if cfg.b_scale_dword && job.is_some() { Some(b.bind_i32(ev(wn) * (4 * PANEL_KB as i32))) } else { None };
-        let job = job.map(|mut j| {
-            if b_dw.is_some() {
-                // thread tid % 128 -> (blk, kb) = (tid / 64 % 2, tid % 64): its source byte sits at blk KB + delta + kb of the B part
-                let blk = b.bind_i32((ev(tid).lshr(6)) & 1);
-                let kbt = b.bind_i32(ev(tid) & 63);
-                let off = b.bind_i32(ev(blk) * ev(kb_v) + ev(b_delta) + ev(kbt));
-                let src = b.bind_i32((ev(off).lshr(2) << 2) + (sh.base + PANEL_KB * 256) as i32);
-                let shv = b.bind_i32((ev(off) & 3) << 3);
-                let dst = b.bind_i32(((ev(tid) & 127) << 2) + (sh.base + PANEL_KB * 256) as i32);
-                j.b_exp = Some((src, shv, dst));
-            }
-            j
-        });
-        // vendor-style scale path: no panel DMA, no LDS gather - VGPR loads + in-register 4x4 byte transposes (dpp quad_perm + v_perm) + ds_write
-        let (job, b_dw, sfa) = if cfg.sfa_vgpr {
-            assert!(cfg.panel_transposed && cfg.b_scale_dword, "sfa_vgpr writes the transposed A panel and the dword B panel");
-            sfa_transpose_proof();
-            // A: lane g = 64 w + lane (+ 256 p per pass) holds 16 M rows (chunk c = g % 16) of K group g / 16: voffset (K group) M + m_cta + 16 c
-            let g0 = b.bind_i32(lane.tid());
-            let voff = b.bind_i32((ev(g0).lshr(4)) * ev(m_v) + (ev(by) << 8) + ((ev(g0) & 15) << 4));
-            let j = b.bind_i32(ev(g0) & 3);
-            // v_perm selectors (byte k of the result = sel byte k: 0..3 S1, 4..7 S0): step 1 [0,4,2,6] / [5,1,7,3], step 2 [0,1,4,5] / [6,7,2,3]
-            let sel1 = b.bind_i32((ev(j) & 1).eq(0).select_i32(0x0602_0400, 0x0307_0105));
-            let sel2 = b.bind_i32(ev(j).lt(2).select_i32(0x0504_0100, 0x0302_0706));
-            // destination of dword d of pass p: panel + 256 kb + 128 wm + 8 (4 d + j) + 4 a  (wm = c / 8, a = c / 4 % 2) = base + 4096 p + 32 d
-            let c = b.bind_i32(ev(g0) & 15);
-            let dst = b.bind_i32(((ev(g0).lshr(4)) << 8) + ((ev(c).lshr(3)) << 7) + (ev(j) << 3) + (((ev(c).lshr(2)) & 1) << 2) + sh.base as i32);
-            // B: thread tid % 128 -> (blk, kb) = (tid / 64 % 2, tid % 64): the dword holding byte (2 bx + blk) KB + kb, shifted to byte 0
-            let blk = b.bind_i32((ev(tid).lshr(6)) & 1);
-            let kbt = b.bind_i32(ev(tid) & 63);
-            let boff = b.bind_i32(((ev(bx) << 1) + ev(blk)) * ev(kb_v) + ev(kbt));
-            let bvo = b.bind_i32(ev(boff).lshr(2) << 2);
-            let bsh = b.bind_i32((ev(boff) & 3) << 3);
-            let bdst = b.bind_i32(((ev(tid) & 127) << 2) + (sh.base + PANEL_KB * 256) as i32);
-            let pso: Vec<ValueId> = (0..4).map(|p| { let v = b.bind_i32(ev(m_v) * (16 * p)); b.read_first_lane(v) }).collect();
-            (None, Some(b.bind_i32(ev(wn) * (4 * PANEL_KB as i32))), Some(SfaJob { voff, pso, sel1, sel2, dst, bvo, bsh, bdst }))
-        } else {
-            (job, b_dw, None)
-        };
-        Panel { sh, b_base: PANEL_KB * 256, b_off, tr, job, b_dw, sfa }
-    });
-    let role_rsrc = match role_a {
-        Some(wv) if cfg.wave_roles_select => {
-            assert!(a_dma.issues.iter().zip(b_dma.issues.iter()).all(|(x, y)| x.1 == y.1), "role DMA: A and B issue the same LDS pattern");
-            let c = b.bind_cond(ev(wv).lt(2));
-            let rr = b.select_uniform_rsrc(c, rsrc_a, rsrc_b);
-            let s = b.bind_i32(ev(wv).lt(2).select_i32(1, 0));
-            let vo: Vec<ValueId> = a_dma.issues.iter().zip(b_dma.issues.iter()).map(|(x, y)| b.bind_i32(ev(y.0) + ev(s) * (ev(x.0) - ev(y.0)))).collect();
-            Some((rr, vo))
-        }
-        _ => None,
-    };
-    let mut pipe = Pipeline::new(cadence, kb_v, k_v, 128, Ext::ka(84));
-    pipe.unroll2 = cfg.unroll2;
-    pipe.ablate_no_sync = cfg.ablate.no_sync;
-    pipe.late_tile1 = cfg.late_tile1 && cfg.reg_staged;
+    let mut pipe = Pipeline::new(Cadence::RegStaged, kb_v, k_v, 128, Ext::ka(84));
+    pipe.unroll2 = true;
+    pipe.late_tile1 = true;
     pipe.late_tile1_vm = (a_dma.issues.len() + b_dma.issues.len()) as u8;
-    pipe.tile1_after_barrier = cfg.tile1_after_barrier;
-    pipe.key_late = cfg.key_late;
     pipe.scalar_exit = true;
-    if cfg.reg_staged && cfg.early_tile0 {
-        // the prologue waits for tile 0 only (tile 1's DMAs are the last ones issued; it is published by the loop's first top barrier)
-        pipe.prologue_vm = if cfg.wave_roles { a_dma.issues.len() as u8 } else { (a_dma.issues.len() + b_dma.issues.len() + if cfg.scale_panel { 0 } else { 2 }) as u8 };
-    }
-    if cfg.split_sync {
-        pipe.top_vm = a_dma.issues.len() as u8;
-    }
-    if cfg.three_slots || cfg.reg_staged {
-        pipe.vm_inflight = (a_dma.issues.len() + b_dma.issues.len() + 2) as u8;
-    }
-    let (a_rd, b_rd) = if cfg.early_dma { (None, None) } else { let (x, y) = mk_rd(b); (Some(x), Some(y)) };
+    pipe.vm_inflight = (a_dma.issues.len() + b_dma.issues.len() + 2) as u8;
+    // operand read partitions (the wave offset added to the bases)
+    let mut a_rd = copy_a.partition_lds(b, &ctx, &s_lane, &a_s, &a_view, &a_place);
+    let mut b_rd = copy_b.partition_lds(b, &ctx, &s_lane, &b_s, &view, &b_place);
+    let a_wo = ctx.lower(&s_wm.mul_c(wave_m / 16 * a_blk));
+    let b_wo = ctx.lower(&s_wn.mul_c(wave_n / 16 * 2048));
+    a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32(x + &a_wo)).collect();
+    b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32(x + &b_wo)).collect();
     let zero4 = b.frag_zero(DType::Frag4);
     let mut body = Body {
-        cfg, kb_v, role_a, role_rsrc, panel, mma: mma.clone(), a_s, b_s, sc_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, sc_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb, ptr_sfa, ptr_sfb, m_v, sa_src, sb_src, sa_rd, sa_sh, sa_dw,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, deferred: None, in_loop: false, npre_done: 0, pre_cache: None, pre_scales: None, stamp: stamp_ctx,
+        cfg, kb_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx,
     };
-    if cfg.early_dma {
-        // tiles 0 and 1 issued as soon as their addresses exist (the read partitions and the rest of the setup follow behind the DMA)
-        assert!(cfg.reg_staged, "early_dma: RegStaged only");
-        body.stage_now(b, &I32::c(0), &SlotIdx::new(0, 0), 0..usize::MAX, &mut StageCache::default());
-        let key1 = b.let_i32(ev(kb_v).gt(1).select_i32(1, ev(kb_v) - 1) << 7);
-        body.stage_now(b, &key1, &SlotIdx::new(1, 1), 0..usize::MAX, &mut StageCache::default());
-        let (x, y) = mk_rd(b);
-        body.a_rd = Some(x);
-        body.b_rd = Some(y);
-        pipe.pre_staged = true;
-    }
     if let Some((buf, rec, _)) = stamp_ctx {
         let st = b.memtime_lo();
         b.stamp_store(buf, rec, 1, st); // slot 1: setup done, entering the pipeline (prologue)
@@ -1676,12 +719,11 @@ fn build(name: &str, cfg: Cfg) -> Function {
     for v in body.acc.iter().take(cfg.acc_agpr) {
         b.pin_agpr(*v);
     }
-    if let (Some((bv, av, _, _)), true) = (&body.rv, cfg.agpr_ops) {
+    if let Some((bv, av, _, _)) = &body.rv {
         for v in bv.iter().chain(av.iter()) {
             b.pin_agpr(*v);
         }
     }
-
     if let Some(epi) = &epi {
         lds_epilogue(b, &ctx, &mma, epi, &body.acc, &lane, &s_lane, &s_n, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, cfg.epi_phases);
         if let Some((buf, rec, _)) = stamp_ctx {

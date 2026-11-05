@@ -28,47 +28,7 @@ fn rollback_rebase_factor_is_one_for_arbitrary_lengths() {
     }
 }
 
-/// The fast-reference recipes (`Vs128Cfg::scaleconv`, lazy threshold): the frame moves by a WHOLE number of 1/512 units through the
-/// conversion scale (or only when the max passes a threshold above the target), the accumulators are rescaled by the same 2^(512 delta) and the
-/// tile's P are multiplied by it. The symbolic proof covers arbitrary frames m' (the induction step holds for any m'); this checks the concrete
-/// recurrence of the kernel (base-2, 1/512 units, rounded / lazy frame moves) against the naive sums.
-#[test]
-fn integer_delta_and_lazy_frames_match_naive() {
-    let naive2 = |s: &[f64], v: &[f64]| -> (f64, f64) {
-        let o: f64 = s.iter().zip(v).map(|(x, y)| (512.0 * x).exp2() * y).sum();
-        let d: f64 = s.iter().map(|x| (512.0 * x).exp2()).sum();
-        (o, d)
-    };
-    for (tiles, lazy) in [(16usize, None), (16, Some(4.0 / 512.0)), (64, None), (64, Some(11.0 / 512.0))] {
-        let s: Vec<f64> = (0..tiles * 128).map(|i| ((i as f64 * 0.731).sin() * 0.03) + (i / 128) as f64 * 0.0007).collect();
-        let v: Vec<f64> = (0..tiles * 128).map(|i| ((i * 13 % 17) as f64) - 8.0).collect();
-        let target = 131.0 / 512.0;
-        let (mut b, mut o, mut d) = (0.0f64, 0.0f64, 0.0f64); // reference b: scores are carried as s + b
-        for t in 0..tiles {
-            let tile = &s[t * 128..(t + 1) * 128];
-            let m = tile.iter().cloned().fold(f64::MIN, f64::max) + b;
-            let rebase = t == 0 || match lazy { None => true, Some(h) => m > target + h };
-            let delta = if rebase { ((target - m) * 512.0).round() / 512.0 } else { 0.0 };
-            let f = (512.0 * delta).exp2();
-            o *= f;
-            d *= f;
-            b += delta;
-            for (x, y) in tile.iter().zip(&v[t * 128..(t + 1) * 128]) {
-                // P = 2^(512 (s + b_old)) x 2^(512 delta): the conversion scale applies the whole-unit factor
-                let p = (512.0 * (x + b - delta)).exp2() * f;
-                o += p * y;
-                d += p;
-            }
-        }
-        let (no, nd) = naive2(&s, &v);
-        let r = (o / d - no / nd).abs() / (no / nd).abs().max(1e-12);
-        assert!(r < 1e-9, "tiles {tiles} lazy {lazy:?}: online {} vs naive {} (rel {r})", o / d, no / nd);
-        // the final frame relation: d x 2^(-512 b) is the naive denominator
-        assert!(((d * (-512.0 * b).exp2()) - nd).abs() / nd < 1e-9);
-    }
-}
-
-/// The vendor's reference recipe (vendor-spec 4.7, `Vs128Cfg::vref`): scores carried as x = s + b (base 2, 512 units), the reference b moves ONLY
+/// The vendor's reference recipe (vendor-spec 4.7, the `_vs128` long-sequence copy): scores carried as x = s + b (base 2, 512 units), the reference b moves ONLY
 /// when a row max passes the threshold s92 (lazily, seeded on the first tile), by the exact (unrounded) f32 delta that puts the max at the target
 /// s91; O and l are rescaled by 2^(512 delta) and the tile's P are computed from the shifted scores. The symbolic proof covers arbitrary frames;
 /// this checks the concrete recurrence (with the vendor's constants and conversion scale) against the naive sums, including tiles whose max never

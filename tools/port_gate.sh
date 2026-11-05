@@ -5,8 +5,8 @@
 #   The candidate set is ${prefix}_vs128, ${prefix}_t128, ${prefix}_kvsplit, ${prefix}_kvsplit_combine8h; any of them can be overridden
 #   (e.g. while only _vs128 is ported): KN_VS128=... KN_T128=... KN_KVSPLIT=... KN_COMBINE=... (the combine name must contain "combine8":
 #   ref_host derives the elements/thread from the name).
-#   The reference set is the LEGACY hand-written set (fmha_fwd_hd128_mxfp8_{vs128,t128,kvsplit,kvsplit_combine8h}), measured in the same run.
-#   Shipped default (layout-layer kernels): bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3 (SHIP_REF=fmha_fwd_hd128_mxfp8_dsl: against the previous tile-library set);  legacy self-baseline: bash tools/port_gate.sh fmha_fwd_hd128_mxfp8
+#   Shipped set: bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3. There is no reference kernel set: performance is judged against the vendor
+#   kernel measured in the same run (ratio vs the recorded shipped ratio), plus the recorded shipped TF/s for information.
 #
 # Sections (each prints PASS/FAIL; SKIP_<SECTION>=1 skips one):
 #   BUILD    emit (+ --backend ${BACKEND:-auto}) and assemble the 4 kernels, build ref_host
@@ -18,16 +18,15 @@
 #   DET      5 shapes x 3 launches, auto dispatch: bit-identical md5                                                       [= tests/gpu/determinism.sh]
 #   STRESS   repeated launches of split shapes (forced s=4 B1H2S200 SK1337 gqa2, auto B1H8S2048), every launch REF_KERNEL_OK and
 #            all-output worst diff vs vendor <= STRESS_MAXDIFF; the md5 histogram is printed but bit identity is NOT required
-#   PERF     warm protocol (REF_WARMUP=150 REF_ITERS=100), PERF_REPS (5) interleaved repetitions, median; candidate and (unless the
-#            candidate IS the shipped set) the shipped set in the same run, same-run vendor:
+#   PERF     warm protocol (REF_WARMUP=150 REF_ITERS=100), PERF_REPS (5) repetitions, median of the candidate and of the same-run vendor:
 #              B1H8S2048 auto (KV-split), per-CU 64 blocks (_vs128 forced, B1H8S2048), B4H8S2048 and B1H8S8192 (filled, _vs128), B2H8S2048 (_t128, info)
-#            PASS when candidate median >= PERF_TOL (0.97) x shipped median (same run) - or, for the baseline run, >= 0.97 x the recorded numbers.
+#            PASS when (candidate / vendor) >= PERF_TOL (0.97) x the recorded shipped ratio (REC_RATIO); the recorded shipped TF/s are printed.
+#            Code-layout rows (per-CU _vs128, B2H8S2048 _t128): the same over LAYOUT_PADS code shifts, medians of the per-pad ratios.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 P="${1:?usage: tools/port_gate.sh <kernel_prefix> [tag]}"
 TAG="${2:-$(echo "$P" | tr -c 'A-Za-z0-9_\n' '_')}"
-SHIP="${SHIP_REF:-fmha_fwd_hd128_mxfp8}"   # reference set (default: the legacy hand-written kernels)
 ROC="${ROCM_PATH:-/shared/apps/ubuntu/opt/rocm-7.0.2}"
 CL="${ASM_ROC:-/shared/apps/ubuntu/opt/rocm-10.1.0}/llvm/bin/clang"
 REF_CO="${REF_CO:-/shared/amdgpu/home/blyu_qle/sessions/ref_mxfp8.co}"
@@ -56,10 +55,6 @@ bash tools/container/cargo.sh build -q --bin amdc >>"$LOG" 2>&1 || { row BUILD c
 if build_set "$B/cand" "$KN_VS128" "$KN_T128" "$KN_KVSPLIT" "$KN_COMBINE"; then row BUILD candidate "4 kernels emitted+assembled" "-" PASS
 else row BUILD candidate "emit/assemble failed (see $LOG)" "-" FAIL; echo "abort: candidate build failed"; tail -30 "$LOG"; exit 1; fi
 for k in "$KN_VS128" "$KN_T128" "$KN_KVSPLIT"; do grep -cE '^\s*v_' "$B/$k.s" | xargs -I{} echo "  $k: {} VALU/VOP lines, $(grep -cE '^\s*v_mfma' "$B/$k.s") mfma" | tee -a "$LOG"; done
-SAME_AS_SHIP=0; [ "$KN_VS128 $KN_T128 $KN_KVSPLIT $KN_COMBINE" = "${SHIP}_vs128 ${SHIP}_t128 ${SHIP}_kvsplit ${SHIP}_kvsplit_combine8h" ] && SAME_AS_SHIP=1
-if [ $SAME_AS_SHIP = 0 ] && ! skip SKIP_PERF; then
-    build_set "$B/ship" "${SHIP}_vs128" "${SHIP}_t128" "${SHIP}_kvsplit" "${SHIP}_kvsplit_combine8h" || { echo "abort: shipped build failed"; exit 1; }
-fi
 g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/ref_host.cpp -o "$B/ref_host" -I"$ROC/include" -L"$ROC/lib" -lamdhip64 -Wl,-rpath,"$ROC/lib" >>"$LOG" 2>&1 \
     || { row BUILD ref_host "g++ failed" "-" FAIL; exit 1; }
 RH="$B/ref_host"
@@ -82,8 +77,7 @@ SHAPES=("1 1 256 256 1" "1 2 512 512 1" "2 4 1024 1024 1" "1 8 2048 2048 1" "1 2
 run_rh() {
     local d="$1" mode="$2" b="$3" h="$4" s="$5" sk="$6" g="$7"; shift 7
     local -a e=(REF_B=$b REF_H=$h REF_S=$s REF_SK=$sk REF_HK=$((h / g)) REF_COMBINE_ELEMS=4)
-    local kv kt ks kc; if [ "$d" = "$B/ship" ]; then kv=${SHIP}_vs128; kt=${SHIP}_t128; ks=${SHIP}_kvsplit; kc=${SHIP}_kvsplit_combine8h
-    else kv=$KN_VS128; kt=$KN_T128; ks=$KN_KVSPLIT; kc=$KN_COMBINE; fi
+    local kv=$KN_VS128 kt=$KN_T128 ks=$KN_KVSPLIT kc=$KN_COMBINE
     case "$mode" in
         auto)  e+=(REF_CO2=$d/vs.co REF_KNAME2=$kv REF_CO2_SMALL=$d/t128.co REF_KNAME2_SMALL=$kt REF_CO2_SPLIT=$d/split.co REF_KNAME2_SPLIT=$ks
                    REF_CO2_COMBINE=$d/comb.co REF_KNAME2_COMBINE=$kc REF_SPLIT=0) ;;
@@ -163,56 +157,51 @@ if ! skip SKIP_STRESS; then
     done
 fi
 
-# ---------------------------------------------------------------- PERF (same run, interleaved, median)
-# recorded shipped numbers (docs/current-status.md, Main 8fec359; used only when the candidate IS the shipped set)
-declare -A REC=([b1h8s2048]=674 [percu64]=446 [b4h8s2048]=1443 [b1h8s8192]=1999 [b2h8s2048]=1057)
+# ---------------------------------------------------------------- PERF (same run vs the vendor, median)
+# recorded shipped numbers (Main f2759cd / 0668c54 gate, GPU 5): TF/s and the ratio to the same-run vendor
+declare -A REC=([b1h8s2048]=672 [percu64]=489 [b4h8s2048]=1538 [b1h8s8192]=2142 [b2h8s2048]=1038 [lp_vs128]=490 [lp_t128]=1051)
+declare -A REC_RATIO=([b1h8s2048]=1.25 [percu64]=0.911 [b4h8s2048]=0.915 [b1h8s8192]=0.911 [b2h8s2048]=1.03 [lp_vs128]=0.911 [lp_t128]=1.03)
 median() { sort -g | awk '{a[NR]=$1} END {if (NR == 0) print "nan"; else if (NR % 2) print a[(NR + 1) / 2]; else print (a[NR / 2] + a[NR / 2 + 1]) / 2}'; }
+ratio_verdict() { awk -v c="$1" -v v="$2" -v r="$3" -v t="$PERF_TOL" 'BEGIN{q = (v > 0) ? c / v : 0; print (q >= t * r) ? "PASS" : "FAIL"}'; }
 if ! skip SKIP_PERF; then
     PERF=("b1h8s2048|1 8 2048 2048 1|auto" "percu64|1 8 2048 2048 1|vs" "b4h8s2048|4 8 2048 2048 1|auto" "b1h8s8192|1 8 8192 8192 1|auto" "b2h8s2048|2 8 2048 2048 1|auto")
-    SETS=("$B/cand"); [ $SAME_AS_SHIP = 0 ] && SETS+=("$B/ship")
     for spec in "${PERF[@]}"; do
         IFS='|' read -r key cfg mode <<<"$spec"; set -- $cfg
-        : > "$B/pf_cand"; : > "$B/pf_ship"; : > "$B/pf_vend"; path=""
+        : > "$B/pf_cand"; : > "$B/pf_vend"; path=""
         for rep in $(seq 1 $PERF_REPS); do
-            for d in "${SETS[@]}"; do
-                out=$(run_rh "$d" $mode $1 $2 $3 $4 $5 REF_ROWS=1 REF_WARMUP=150 REF_ITERS=100 REF_SPLIT_ULP=0); echo "== PERF $key $d rep$rep"$'\n'"$out" >>"$LOG"
-                tf=$(echo "$out" | awk '/^timing ours total:/ {for (i = 1; i <= NF; i++) if ($i == "TFLOP/s") print $(i-1)} /^timing ours +:/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}' | tail -1)
-                vt=$(echo "$out" | awk '/^timing vendor/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}' | head -1)
-                [ "$d" = "$B/cand" ] && { echo "${tf:-0}" >> "$B/pf_cand"; path=$(echo "$out" | sed -nE 's/^\[grid\].*ours \(([^)]*)\).*\[([^;]*);.*/\1 [\2]/p' | head -1); } || echo "${tf:-0}" >> "$B/pf_ship"
-                echo "${vt:-0}" >> "$B/pf_vend"
-            done
+            out=$(run_rh "$B/cand" $mode $1 $2 $3 $4 $5 REF_ROWS=1 REF_WARMUP=150 REF_ITERS=100 REF_SPLIT_ULP=0); echo "== PERF $key rep$rep"$'\n'"$out" >>"$LOG"
+            tf=$(echo "$out" | awk '/^timing ours total:/ {for (i = 1; i <= NF; i++) if ($i == "TFLOP/s") print $(i-1)} /^timing ours +:/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}' | tail -1)
+            vt=$(echo "$out" | awk '/^timing vendor/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}' | head -1)
+            echo "${tf:-0}" >> "$B/pf_cand"; echo "${vt:-0}" >> "$B/pf_vend"
+            path=$(echo "$out" | sed -nE 's/^\[grid\].*ours \(([^)]*)\).*\[([^;]*);.*/\1 [\2]/p' | head -1)
         done
         mc=$(median < "$B/pf_cand"); mv=$(median < "$B/pf_vend")
-        if [ $SAME_AS_SHIP = 0 ]; then ms=$(median < "$B/pf_ship"); refs="legacy $ms (same run)"; base=$ms
-        else base=${REC[$key]}; refs="recorded $base"; fi
-        v=$(awk -v c="$mc" -v r="$base" -v t="$PERF_TOL" 'BEGIN{print (c >= t * r) ? "PASS" : "FAIL"}'); [ "$key" = b2h8s2048 ] && v="INFO($v)"
-        row PERF "$key $mode -> $path" "$(printf '%s TF/s (%.3fx vendor %s; runs: %s)' "$mc" "$(awk -v a=$mc -v b=$mv 'BEGIN{print (b > 0) ? a / b : 0}')" "$mv" "$(tr '\n' ' ' < $B/pf_cand)")" "$refs, tol $PERF_TOL" "$v"
+        v=$(ratio_verdict "$mc" "$mv" "${REC_RATIO[$key]}"); [ "$key" = b2h8s2048 ] && v="INFO($v)"
+        row PERF "$key $mode -> $path" "$(printf '%s TF/s (%.3fx vendor %s; runs: %s)' "$mc" "$(awk -v a=$mc -v b=$mv 'BEGIN{print (b > 0) ? a / b : 0}')" "$mv" "$(tr '\n' ' ' < $B/pf_cand)")" "recorded ${REC[$key]} TF/s ${REC_RATIO[$key]}x, tol $PERF_TOL" "$v"
     done
-    # Code-layout sensitivity (measured 2026-11-02: shifting the SAME kernel by 0..14 leading s_nop moves per-CU _vs128 by 444..456 TF/s, shipped AND
-    # ported alike): the per-CU comparison is repeated over LAYOUT_PADS code shifts (leading s_nop in the entry block) and the medians are compared.
-    # lp_row <label> <cand kernel> <legacy kernel> <rows/block> <B H S SK>: per-layout interleaved cand/legacy timings, medians compared
+    # Code-layout sensitivity (shifting the SAME kernel by 0..14 leading s_nop moves per-CU _vs128 by ~3 %): the per-CU / _t128 measurements are
+    # repeated over LAYOUT_PADS code shifts (leading s_nop in the entry block); the median of the per-pad (ours / vendor) ratios is compared.
+    # lp_row <key> <label> <kernel> <rows/block> <B H S SK>
     lp_row() {
-        local label=$1 kc=$2 kl=$3 rpb=$4; shift 4
-        : > "$B/lp_cand"; : > "$B/lp_ship"
+        local key=$1 label=$2 kc=$3 rpb=$4; shift 4
+        : > "$B/lp_cand"; : > "$B/lp_ratio"
         for pad in ${LAYOUT_PADS-0 1 2 3 4 5 6 7}; do
-            for side in cand ship; do
-                local k=$([ $side = cand ] && echo "$kc" || echo "$kl")
-                awk -v p=$pad 'BEGIN{d=0} {print} /^BB0:$/ && !d {for (i = 0; i < p; i++) print "    s_nop 0"; d=1}' "$B/$k.s" > "$B/lp.s"
-                "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "$B/lp_$side.co" "$B/lp.s"
-                local tf=$(env REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_ROWS=1 REF_WARMUP=150 REF_ITERS=100 REF_CO2="$B/lp_$side.co" REF_KNAME2="$k" REF_ROWS_PER_BLOCK=$rpb "$RH" "$REF_CO" 2>&1 | awk '/^timing ours +:/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}')
-                echo "${tf:-0}" >> "$B/lp_$side"
-            done
+            awk -v p=$pad 'BEGIN{d=0} {print} /^BB0:$/ && !d {for (i = 0; i < p; i++) print "    s_nop 0"; d=1}' "$B/$kc.s" > "$B/lp.s"
+            "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "$B/lp_cand.co" "$B/lp.s"
+            local out=$(env REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_ROWS=1 REF_WARMUP=150 REF_ITERS=100 REF_CO2="$B/lp_cand.co" REF_KNAME2="$kc" REF_ROWS_PER_BLOCK=$rpb "$RH" "$REF_CO" 2>&1)
+            local tf=$(echo "$out" | awk '/^timing ours +:/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}')
+            local vt=$(echo "$out" | awk '/^timing vendor/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}' | head -1)
+            echo "${tf:-0}" >> "$B/lp_cand"; awk -v a="${tf:-0}" -v b="${vt:-0}" 'BEGIN{print (b > 0) ? a / b : 0}' >> "$B/lp_ratio"
         done
-        local mc=$(median < "$B/lp_cand") ms=$(median < "$B/lp_ship")
-        local v=$(awk -v c="$mc" -v r="$ms" -v t="$PERF_TOL" 'BEGIN{print (c >= t * r) ? "PASS" : "FAIL"}')
-        row PERF "$label layout-median (pads: ${LAYOUT_PADS-0..7})" "$mc TF/s (cand: $(tr '\n' ' ' < $B/lp_cand))" "legacy $ms ($(tr '\n' ' ' < $B/lp_ship))" "$v"
+        local mc=$(median < "$B/lp_cand") mr=$(median < "$B/lp_ratio")
+        local v=$(awk -v q="$mr" -v r="${REC_RATIO[$key]}" -v t="$PERF_TOL" 'BEGIN{print (q >= t * r) ? "PASS" : "FAIL"}')
+        row PERF "$label layout-median (pads: ${LAYOUT_PADS-0..7})" "$mc TF/s, ${mr}x vendor (cand: $(tr '\n' ' ' < $B/lp_cand))" "recorded ${REC[$key]} TF/s ${REC_RATIO[$key]}x, tol $PERF_TOL" "$v"
     }
-    if [ $SAME_AS_SHIP = 0 ] && [ -n "${LAYOUT_PADS-0 1 2 3 4 5 6 7}" ]; then
-        lp_row "percu64 _vs128" "$KN_VS128" "${SHIP}_vs128" 256 1 8 2048 2048
-        lp_row "B2H8S2048 _t128" "$KN_T128" "${SHIP}_t128" 128 2 8 2048 2048
+    if [ -n "${LAYOUT_PADS-0 1 2 3 4 5 6 7}" ]; then
+        lp_row lp_vs128 "percu64 _vs128" "$KN_VS128" 256 1 8 2048 2048
+        lp_row lp_t128 "B2H8S2048 _t128" "$KN_T128" 128 2 8 2048 2048
     fi
 fi
-
 # ---------------------------------------------------------------- table
 echo; echo "================ PORT GATE: $P ($TAG) git=$(git rev-parse --short HEAD 2>/dev/null) GPU=$GPU ================"
 printf '%-7s | %-48s | %-70s | %-34s | %s\n' SECTION ITEM VALUE REFERENCE VERDICT

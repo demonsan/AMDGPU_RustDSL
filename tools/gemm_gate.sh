@@ -5,10 +5,10 @@
 #   ACC      GEMM_OK (CPU double reference on sampled rows, every column) on 3 shapes, ours and the vendor's
 #   DET      3 launches (separate processes, same inputs): identical output md5
 #   PERF     same-run median of 5 (x100 launches) ours vs vendor on 4096 x 4096 x 8192
-# Usage: HIP_VISIBLE_DEVICES=5 bash tools/gemm_gate.sh [kernel=gemm_mxfp8_bs_v3]
+# Usage: HIP_VISIBLE_DEVICES=5 bash tools/gemm_gate.sh [kernel=gemm_mxfp8_bs_v4]
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"; mkdir -p build/gate
-K="${1:-gemm_mxfp8_bs_v3}"; export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-5}"
+K="${1:-gemm_mxfp8_bs_v4}"; export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-5}"
 FAIL=0; note() { echo "$*"; }; bad() { echo "FAIL: $*"; FAIL=1; }
 echo "==== BUILD"
 out=$(bash tools/container/cargo.sh test -q -p amdgpu-compiler --test gemm_mxfp8 2>&1); echo "$out" | grep -E 'test result' || bad "cargo test"; echo "$out" | grep -q 'test result: ok' || bad "gemm tests"

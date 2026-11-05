@@ -174,7 +174,7 @@ fn prove(cfg: &GemmConfig, drop: Option<i64>) -> Result<usize, ProofError> {
 
 #[test]
 fn gemm_v3_and_v4_every_output_k_block_is_covered_once() {
-    for cfg in [GemmConfig::v3(), GemmConfig::v4()] {
+    for cfg in [GemmConfig::v4()] {
         let n = prove(&cfg, None).expect("GEMM index proof");
         assert_eq!(n, (cfg.cta_m * cfg.cta_n * 2) as usize, "one item per (m,n,kb)");
     }
@@ -182,7 +182,7 @@ fn gemm_v3_and_v4_every_output_k_block_is_covered_once() {
 
 #[test]
 fn swallowed_tile_one_is_rejected_with_a_concrete_counterexample() {
-    let e = prove(&GemmConfig::v3(), Some(1)).expect_err("the swallowed-tile bug must fail");
+    let e = prove(&GemmConfig::v4(), Some(1)).expect_err("the swallowed-tile bug must fail");
     let msg = format!("{e:?}");
     assert!(msg.contains("K block 1") && msg.contains("C[0,0]"), "counterexample: {msg}");
     println!("E1 counterexample: {msg}");
