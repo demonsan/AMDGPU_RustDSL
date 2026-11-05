@@ -36,6 +36,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("mlp_fp8_") => crate::mlp::by_name(n),
         // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
+        n if n.starts_with("fmha_fwd_hd128_mxfp8_v3x_vs128_x") => n["fmha_fwd_hd128_mxfp8_v3x_vs128_x".len()..].parse::<u32>().ok().map(|x| crate::fmha::vs128_exp(n, x)),
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),

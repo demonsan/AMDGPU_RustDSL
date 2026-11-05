@@ -204,6 +204,9 @@ pub struct AttnBody3<'a> {
     /// the reference update entirely inside the rollback branch (`OnlineSoftmax::decide_lazy`)
     pub lazy_bias: bool,
     bias_next: Option<Opnd>,
+    /// EXPERIMENT: one f16 bias MFMA per tile as the C input of the four S tiles' first QK MFMA
+    pub biasonce: bool,
+    bias_tile: std::cell::Cell<Option<ValueId>>,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -211,7 +214,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None) }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -219,7 +222,9 @@ impl<'a> AttnBody3<'a> {
         let blk = self.blk;
         let start = match out {
             QkOut::Vars(t) => {
-                b.var_mfma_f16_z(t.accs[s].var, self.sm.ones_f16, bias);
+                if self.bias_tile.get().is_none() {
+                    b.var_mfma_f16_z(t.accs[s].var, self.sm.ones_f16, bias);
+                }
                 None
             }
             QkOut::Values(z) => Some(b.mfma_f16_wide(self.sm.ones_f16, bias, *z)),
@@ -231,7 +236,11 @@ impl<'a> AttnBody3<'a> {
         if let (true, QkOut::Vars(t)) = (self.kscale_sel, out) {
             // the vendor form: ONE shift by 8 x lane half, then the scaled MFMA picks byte 0 (k chunk 0) / byte 2 (k chunk 1) with op_sel
             let w = b.bind_i32(ev(kw).lshr(ev(blk.sel.g8)));
-            gemm(b, &self.ring.mma, t.accs[s].var, k0, q[0].v, w, blk.sq[0], 0, 0);
+            if let Some(bt) = self.bias_tile.get() {
+                b.var_mfma_scale_c(t.accs[s].var, k0, q[0].v, bt, w, blk.sq[0]);
+            } else {
+                gemm(b, &self.ring.mma, t.accs[s].var, k0, q[0].v, w, blk.sq[0], 0, 0);
+            }
             gemm(b, &self.ring.mma, t.accs[s].var, k1, q[1].v, w, blk.sq[1], 2, 0);
             return None;
         }
@@ -252,7 +261,12 @@ impl<'a> AttnBody3<'a> {
         let r = self.ring;
         let k = r.kpart.at(b, &r.ks.at(slot));
         let kd = r.kdpart.at(b, &r.kd.at(slot));
-        (0..4).filter_map(|s| self.qk_block(b, &out, bias, &k, &kd, s)).collect()
+        if self.biasonce && self.kscale_sel && matches!(out, QkOut::Vars(_)) {
+            self.bias_tile.set(Some(b.mfma_f16_wide(self.sm.ones_f16, bias, self.zero16)));
+        }
+        let res = (0..4).filter_map(|s| self.qk_block(b, &out, bias, &k, &kd, s)).collect();
+        self.bias_tile.set(None);
+        res
     }
     /// PV with the row sums first: per half hh and dim group e, the transposed V fragment then the scaled MFMA (fixed scales).
     fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
@@ -364,7 +378,12 @@ impl PipeBody for AttnBody3<'_> {
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
+    vs128_exp("fmha_fwd_hd128_mxfp8_v3_vs128", 0)
+}
+
+/// EXPERIMENT builds (bit 0: biasonce)
+pub fn vs128_exp(name: &str, x: u32) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
@@ -391,6 +410,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
                 body.lazy_bias = true;
             }
             body.setprio = true;
+            body.biasonce = x & 1 != 0;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
