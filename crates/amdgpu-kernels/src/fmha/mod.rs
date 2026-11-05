@@ -207,11 +207,6 @@ pub struct AttnBody3<'a> {
     /// one f16 bias MFMA per tile (the vendor's single helper): its result is the C input of the four S tiles' first QK MFMA (`_vs128`)
     pub biasonce: bool,
     bias_tile: std::cell::Cell<Option<ValueId>>,
-    /// the vendor's V read-ahead: the first `v_ahead` transposed V fragments of tile t (4 `ds_read_b64_tr_b8` each, in PV order) are issued at
-    /// the end of the V phase, BEFORE the mid barrier, and stay in flight across it (the protocol checks that no writer touches the slot until
-    /// their retiring `wait_lds(0)`); 0 = off
-    pub v_ahead: usize,
-    v_pre: std::cell::RefCell<Vec<ValueId>>,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -219,7 +214,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), v_ahead: 0, v_pre: std::cell::RefCell::new(Vec::new()) }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None) }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -280,11 +275,9 @@ impl<'a> AttnBody3<'a> {
         let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])];
         self.sm.row_sum(b, p[0].v, p[1].v);
         let o = self.o.expect("O");
-        let pre = std::mem::take(&mut *self.v_pre.borrow_mut());
         for (hh, pf) in p.iter().enumerate() {
             for e in 0..4usize {
-                let k = 4 * hh + e;
-                let vf = if k < pre.len() { pre[k] } else { v.read(b, hh + 2 * e) };
+                let vf = v.read(b, hh + 2 * e);
                 gemm(b, &r.mma, o.accs[e].var, vf, pf.v, self.c127, self.c123, 0, 0);
             }
         }
@@ -333,17 +326,11 @@ impl PipeBody for AttnBody3<'_> {
             // always rebases
             self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref()));
             self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
-        } else {
-            let nb = self.sm.decide(b, &s, &o, mask.as_ref());
-            self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
-            self.p.push(nb);
+            return;
         }
-        if self.v_ahead > 0 {
-            let r = self.ring;
-            let v = r.vpart.at(b, &r.vs.at(&t.cur));
-            let pre: Vec<ValueId> = (0..self.v_ahead.min(8)).map(|k| v.read(b, (k / 4) + 2 * (k % 4))).collect();
-            *self.v_pre.borrow_mut() = pre;
-        }
+        let nb = self.sm.decide(b, &s, &o, mask.as_ref());
+        self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
+        self.p.push(nb);
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let mut w = std::mem::take(&mut self.p);
@@ -391,17 +378,7 @@ impl PipeBody for AttnBody3<'_> {
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    vs128_with("fmha_fwd_hd128_mxfp8_v3_vs128", 0)
-}
-
-/// `_vs128` with the vendor's V read-ahead of `v_ahead` fragments across the mid barrier (`AttnBody3::v_ahead`; A/B variant
-/// `fmha_fwd_hd128_mxfp8_v3_vs128_vra<N>`, same compile profile and ABI as `_vs128`).
-pub fn fmha_vs128_v_ahead(name: &str, v_ahead: usize) -> Function {
-    vs128_with(name, v_ahead)
-}
-
-fn vs128_with(name: &str, v_ahead: usize) -> Function {
-    let mut fb = FnBuilder::new(name, 512);
+    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
@@ -414,10 +391,6 @@ fn vs128_with(name: &str, v_ahead: usize) -> Function {
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
     pipe.key_unclamped = true;
-    // the read-ahead stays in flight across the mid barrier (no wait_lds(0) drain before it)
-    if v_ahead > 0 {
-        pipe.mid_lds_drain = false;
-    }
     let pipe = pipe;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
@@ -433,7 +406,6 @@ fn vs128_with(name: &str, v_ahead: usize) -> Function {
             }
             body.setprio = true;
             body.biasonce = true;
-            body.v_ahead = v_ahead;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
