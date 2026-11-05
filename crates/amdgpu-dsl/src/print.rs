@@ -110,11 +110,6 @@ pub fn dsl_body_structural_hash(f: &Function) -> u64 {
     h.finish()
 }
 
-/// Canonical alpha-renamed text form (useful for golden tests / diagnostics).
-pub fn canonical_dsl(f: &Function) -> String {
-    canon_function(f, true)
-}
-
 /// Canonical form without contract metadata.
 pub fn canonical_dsl_body(f: &Function) -> String {
     canon_function(f, false)

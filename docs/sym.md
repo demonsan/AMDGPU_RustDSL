@@ -30,7 +30,7 @@
 
 - **合同**：`Ext::to_poly(&Ctx)` / `Ext::to_itv(&Ctx)`（`amdgpu-dsl`）。
 - **布局**：`Ix::bits` 用 `bits::upto`；`BitForm` 从布局 crate 移入 `amdgpu_sym::bits`（布局 crate 重新导出，`Ix::bitform` 仍在布局侧构造它）；
-  `Ix::to_poly(&Dyns)` + `Dyns::ctx()`（声明的范围作为事实）+ `Ix::can_prove_le` 在同一个约束上下文上做可靠判定。
+  `Ix::to_poly(&Dyns)` + `Dyns::ctx()`（声明的范围作为事实）把布局表达式放进同一个约束上下文。
   `Ix` 的规范化与 `range` 规则本身不变（它们决定发射的指令，改动会改变 md5）。
 - **验证器**：私有算术全部删除；`contract_ctx(f)` 用合同（`ka_range`、`ka_set`、`sym_range`、`ka_is`、`grid_is`）填事实；
   可能置位位用 `bits::{itv_bits32, add32, mul32}`。
@@ -49,7 +49,7 @@
 
 | 检查 | 结果 |
 |---|---|
-| `cargo test` | 全绿（新增：`gv_bits`、布局 `can_prove_le`、`sym_branch`：一致条件给出界、`n < 65` 不足以证明、逐 lane 条件不被采信） |
+| `cargo test` | 全绿（新增：`gv_bits`、`sym_branch`：一致条件给出界、`n < 65` 不足以证明、逐 lane 条件不被采信） |
 | 严格证书（`--shipped` / 当时的 `--legacy` 与 GEMM v3（均已删除）/ GEMM v4）与每个 kernel 的 proven 计数 | 与 Main `41a32e5` 逐行相同（32 行） |
 | `gpu-verify --all`（101 个 kernel 的错误数与 proven 计数） | 与 Main 逐行相同：分支事实没有削弱任何证明；现有 kernel 没有依赖它的证明，因此也没有新增 |
 | 全部 kernel 的汇编 md5 | 与 Main 逐字节相同 |
@@ -57,4 +57,4 @@
 ## 5. 范围说明
 
 - `gpu_protocol` 的协议模拟器仍按线性化下标切片工作（它的语义按"发布事件之间的语句区间"定义），递归化是后续工作；
-- `Ix` 的除法 / 取余 / xor 不进入 `Poly`（`to_poly` 返回 `None` 时 `can_prove_le` 退回区间比较）。
+- `Ix` 的除法 / 取余 / xor 不进入 `Poly`（`to_poly` 返回 `None`）。

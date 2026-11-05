@@ -59,11 +59,6 @@ pub fn make_ordered_layout(shape: impl Into<IntTuple>, order: &[usize]) -> Layou
     Layout { shape: IntTuple::T(m), stride: IntTuple::T(strides) }
 }
 
-/// The identity layout of a shape (index -> the same index): compact column-major.
-pub fn make_identity_layout(shape: impl Into<IntTuple>) -> Layout {
-    make_layout_shape(shape)
-}
-
 /// `idx2crd(idx, shape)`: colexicographic coordinate (every mode but the last is taken modulo its size; static shapes there).
 pub fn idx2crd(idx: &Ix, shape: &IntTuple, d: &Dyns) -> IntTuple {
     match shape {
@@ -354,24 +349,6 @@ pub fn zipped_divide_bymode(a: &Layout, tiles: &[Layout], d: &Dyns) -> Layout {
     let ms = ld.modes();
     Layout::tuple(vec![Layout::tuple(ms.iter().map(|m| m.get(0)).collect()), Layout::tuple(ms.iter().map(|m| m.get(1)).collect())])
 }
-/// `((tile modes...), rest_0, rest_1, ...)`.
-pub fn tiled_divide_bymode(a: &Layout, tiles: &[Layout], d: &Dyns) -> Layout {
-    let z = zipped_divide_bymode(a, tiles, d);
-    let mut ms = vec![z.get(0)];
-    ms.extend(z.get(1).modes());
-    Layout::tuple(ms)
-}
-/// `(tile_0, tile_1, ..., rest_0, rest_1, ...)`.
-pub fn flat_divide_bymode(a: &Layout, tiles: &[Layout], d: &Dyns) -> Layout {
-    let z = zipped_divide_bymode(a, tiles, d);
-    let mut ms = z.get(0).modes();
-    ms.extend(z.get(1).modes());
-    Layout::tuple(ms)
-}
-/// For a single layout tiler: zipped = logical (mode 0 = tile, mode 1 = rest).
-pub fn zipped_divide(a: &Layout, b: &Layout) -> Layout {
-    logical_divide(a, b)
-}
 
 /// Contiguous tiler of a tile shape: `t_i : 1` per mode.
 pub fn tiler(shape: &[i64]) -> Vec<Layout> {
@@ -418,21 +395,6 @@ fn product_halves(a: &Layout, b: &Layout) -> (Vec<Layout>, Vec<Layout>) {
     let (ap, bp) = (a.append_to_rank(r), b.append_to_rank(r));
     let p = logical_product(&ap, &bp);
     (p.get(0).modes(), p.get(1).modes())
-}
-pub fn zipped_product(a: &Layout, b: &Layout) -> Layout {
-    let (x, y) = product_halves(a, b);
-    Layout::tuple(vec![Layout::tuple(x), Layout::tuple(y)])
-}
-pub fn tiled_product(a: &Layout, b: &Layout) -> Layout {
-    let (x, y) = product_halves(a, b);
-    let mut ms = vec![Layout::tuple(x)];
-    ms.extend(y);
-    Layout::tuple(ms)
-}
-pub fn flat_product(a: &Layout, b: &Layout) -> Layout {
-    let (mut x, y) = product_halves(a, b);
-    x.extend(y);
-    Layout::tuple(x)
 }
 /// `blocked_product`: mode i = (A_i, B_i'): each B element is a contiguous block of A.
 pub fn blocked_product(a: &Layout, b: &Layout) -> Layout {

@@ -34,12 +34,10 @@ fn quad_half_cross() {
     let sw = make_layout(tup![tup![2, 2, 16], 4], tup![tup![2, 1, 4], 64]);
     let p = plan_convert(&a, &sw, 1);
     assert_eq!(p.movement, Movement::Quad);
-    assert_eq!(p.bit_moves().unwrap(), vec!["lane bit 0 -> lane bit 1".to_string(), "lane bit 1 -> lane bit 0".to_string()]);
     // lane bit 5 <-> value bit 0: every lane reads itself or lane ^ 32 (v_permlane32_swap)
     let x = make_layout(tup![tup![32, 2], tup![2, 2]], tup![tup![1, 64], tup![32, 128]]);
     let p = plan_convert(&a, &x, 1);
     assert_eq!(p.movement, Movement::Half);
-    assert!(p.bit_moves().unwrap().contains(&"lane bit 5 -> value bit 0".to_string()));
     // lane bit 4 <-> lane bit 0: across a row of 16, not a quad: cross-lane
     let y = make_layout(tup![tup![2, 2, 2, 2, 2, 2], 4], tup![tup![16, 2, 4, 8, 1, 32], 64]);
     assert_eq!(plan_convert(&a, &y, 1).movement, Movement::CrossLane);

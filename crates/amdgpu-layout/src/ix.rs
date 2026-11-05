@@ -58,15 +58,6 @@ impl Dyns {
         self.syms.push(DynInfo { name: name.to_string(), lo, hi, bits: if lo >= 0 { bits_upto(hi) } else { u64::MAX } });
         Ix::Sym((self.syms.len() - 1) as u32)
     }
-    /// A symbol known to be a multiple of `align` in `[lo, hi]` (e.g. a slot offset): its low bits are zero.
-    pub fn sym_aligned(&mut self, name: &str, lo: i64, hi: i64, align: i64) -> Ix {
-        assert!(align > 0 && (align & (align - 1)) == 0, "alignment must be a power of two");
-        let s = self.sym(name, lo, hi);
-        if let Ix::Sym(i) = s {
-            self.syms[i as usize].bits &= !((align as u64) - 1);
-        }
-        s
-    }
     pub fn info(&self, id: u32) -> &DynInfo {
         &self.syms[id as usize]
     }
@@ -550,12 +541,5 @@ impl Ix {
             Ix::Mul(a, b) => a.to_poly(d)?.mul(&b.to_poly(d)?)?,
             _ => return None,
         })
-    }
-    /// Sound proof of `self <= o` for every admissible value of the dynamic symbols (shared constraint context; false = not proven).
-    pub fn can_prove_le(&self, o: &Ix, d: &Dyns) -> bool {
-        match (self.to_poly(d), o.to_poly(d)) {
-            (Some(a), Some(b)) => d.ctx().le(&a, &b),
-            _ => self.range(d).1 <= o.range(d).0,
-        }
     }
 }

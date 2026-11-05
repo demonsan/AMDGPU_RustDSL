@@ -228,9 +228,7 @@ pub enum MOp {
     /// Device-scope (`sc1`) coherent loads / write-through stores, the returning device-scope atomic add (`sc0` = return) and the L2 fences
     /// of the last-arriver pattern (`buffer_wbl2 sc1` / `buffer_inv sc1`).
     GlobalLoadF32Sc1,
-    GlobalLoadB128Sc1,
     GlobalStoreF32Sc1,
-    GlobalStoreF32x4Sc1,
     GlobalAtomicAddRet,
     BufferWbl2,
     BufferInv,

@@ -67,7 +67,7 @@ optional parser was not needed).
   (ids are renamed by first occurrence). The function **name is not part** of the identity.
 - `dsl_body_structural_eq/hash` and `canonical_dsl_body`: the same without contract metadata,
   for comparing a builder before/after annotations are added.
-- `canonical_dsl`: the alpha-canonical text form (useful as a golden/diff artifact).
+- `canonical_dsl_body`: the alpha-canonical text form of the body (useful as a golden/diff artifact).
 
 Canonicalisation is exhaustive over all `Op`/`Stmt` variants because it starts from their `Debug`
 spelling and rewrites `ValueId(n)`/`VarId(n)`; adding a new op does not require a new match arm.

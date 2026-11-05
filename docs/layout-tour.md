@@ -113,7 +113,7 @@ assert_eq!(e.split_const().0.bits(&d), (31 << 7) | 16);             // 动态部
 | `logical_product(A, B)` | 把 A 重复 B 次 | `(2,2):(4,1) × 6:1 = ((2,2),(2,3)):((4,1),(2,8))` |
 | `right_inverse(L)` | `L ∘ R = id` | `right_inverse((4,8):(8,1)) = (8,4):(4,1)` |
 | `coalesce` / `filter` | 合并可合并的维 / 去掉步长 0 | `(2,(1,6)):(1,(6,2)) → 12:1` |
-| `zipped/tiled/flat_divide_bymode` | 按维切 tile，外层可以是动态的 | `local_tile` 用它取第 t 个 tile 的布局与偏移 |
+| `zipped_divide_bymode` | 按维切 tile，外层可以是动态的 | `local_tile` 用它取第 t 个 tile 的布局与偏移 |
 | `recast_layout` | 换元素位宽（fp16 → 字节、字节 → dword） | `(4,8):(1,4)` 的 16 位 → 8 位 = `64:1` |
 | `make_layout_tv` | 由线程排布与值排布构造 TV 布局 | 覆盖与单射由 `check_tv` 证明 |
 

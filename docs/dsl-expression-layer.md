@@ -21,7 +21,7 @@
 
 ## 2. 现在能做什么
 
-**表达式是纯数据**：`I32`、`F32`、`Cond`、`Ptr` 只持有 `Rc` 表达式树，**不持有 `&mut FnBuilder`**——这正是 `a * 4 + b` 在 Rust 里合法的原因（运算符只拼树，不碰 builder）。通过 `FnBuilder::bind_i32/bind_f32/bind_cond/bind_ptr`（或返回叶子的 `let_i32/let_f32/let_ptr`）才降低成 IR：
+**表达式是纯数据**：`I32`、`F32`、`Cond`、`Ptr` 只持有 `Rc` 表达式树，**不持有 `&mut FnBuilder`**——这正是 `a * 4 + b` 在 Rust 里合法的原因（运算符只拼树，不碰 builder）。通过 `FnBuilder::bind_i32/bind_f32/bind_cond/bind_ptr`（或返回叶子的 `let_i32`）才降低成 IR：
 
 * **后序、确定性**：先左操作数、再右操作数、再运算；同一次 `bind` 里共享的子树（同一个 `Rc`）只降低一次。
 * **1:1 映射到现有 `Op`，不引入新 Op**：
@@ -84,7 +84,7 @@ let vf  = b.bind_f32(b.i32v(val).bitcast_f32());
 | `probe_llvm_ids` → `probe_expr_ids` | 33 | 18 | 其中算术/地址部分 22 行 → 4 行；另有 4 行合同 + 1 行 `hoist` 是新增的（不产生代码） |
 | `probe_llvm_kernarg` → `probe_expr_kernarg` | 31 | 31 | 算术部分 9 行 → 5 行；新增 3 行 `arg_tensor` 与元组绑定，净持平——这个 kernel 本来就几乎没有地址算术 |
 
-叶子：已绑定的值用 `b.i32v(v)`/`f32v`/`condv`/`ptrv` 变成表达式；`let_i32` 绑定并返回叶子，便于后续表达式复用而不重复降低。
+叶子：已绑定的值用 `b.i32v(v)`/`f32v`/`ptrv` 变成表达式；`let_i32` 绑定并返回叶子，便于后续表达式复用而不重复降低。
 
 ## 5. 采用路线
 

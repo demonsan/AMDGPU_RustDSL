@@ -625,9 +625,6 @@ impl FnBuilder {
     pub fn f32v(&self, v: ValueId) -> F32 {
         F32(n(Node::Val(v)))
     }
-    pub fn condv(&self, v: ValueId) -> Cond {
-        Cond(n(Node::Val(v)))
-    }
     pub fn ptrv(&self, v: ValueId) -> Ptr {
         Ptr(n(Node::Val(v)))
     }
@@ -645,9 +642,6 @@ impl FnBuilder {
     /// A loop variable (i32) as an expression leaf: lowered to an `Opnd::Var` operand of its user (exactly what manual code passes).
     pub fn i32var(&self, v: VarId) -> I32 {
         I32(n(Node::Var(v)))
-    }
-    pub fn f32var(&self, v: VarId) -> F32 {
-        F32(n(Node::Var(v)))
     }
     /// Lowers the tree post-order to the same `Op`s the manual API emits and returns the value of its root.
     pub fn bind_i32(&mut self, e: impl Into<I32>) -> ValueId {
@@ -668,14 +662,6 @@ impl FnBuilder {
     pub fn let_i32(&mut self, e: impl Into<I32>) -> I32 {
         let v = self.bind_i32(e);
         self.i32v(v)
-    }
-    pub fn let_f32(&mut self, e: impl Into<F32>) -> F32 {
-        let v = self.bind_f32(e);
-        self.f32v(v)
-    }
-    pub fn let_ptr(&mut self, e: Ptr) -> Ptr {
-        let v = self.bind_ptr(e);
-        self.ptrv(v)
     }
     /// `select(cond, a, b)` on i32 expressions.
     pub fn select_i32(&self, cond: &Cond, a: impl Into<I32>, b: impl Into<I32>) -> I32 {

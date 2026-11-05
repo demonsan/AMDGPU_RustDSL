@@ -180,7 +180,6 @@ pub enum Op {
     LoadGlobalB128 { base: Opnd, byte_off: u32 },
     /// Device-scope coherent loads (`sc1`): bypass the non-coherent cache levels, see the other XCDs' write-through stores.
     LoadF32Coherent { base: Opnd, byte_off: u32 },
-    LoadB128Coherent { base: Opnd, byte_off: u32 },
     /// Buffer resource descriptor over the scalar (kernarg) pointer `base`: 4 SGPRs = [base lo, base hi (bits 47:32), num_records, flags]. Bounds checking
     /// is off with `num_records = 0xFFFF_FFFF`; the descriptor is allocated and reused by the compiler like any other SGPR value.
     BufferRsrc { base: Opnd, num_records: u32 },
@@ -229,21 +228,12 @@ pub enum Op {
     MfmaF16 { a: Opnd, b: Opnd, c: Opnd },
     /// `v_mfma_f32_32x32x8_f16` with an existing accumulator.
     MfmaF16Wide { a: Opnd, b: Opnd, c: Opnd },
-    /// `v_mfma_f32_16x16x32_fp8_fp8`: fp8 A/B, f32 accumulator.
-    MfmaFp8_16x16x32 { a: Opnd, b: Opnd, c: Opnd },
-    /// `v_mfma_f32_32x32x16_fp8_fp8`: fp8 A/B, 16-dword accumulator.
-    MfmaFp8_32x32x16 { a: Opnd, b: Opnd, c: Opnd },
     /// Build an eight-dword fragment from eight 32-bit values.
     Frag8(Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd),
     /// Concatenate two four-dword fragments into an eight-dword fragment.
     CatFrag8(Opnd, Opnd),
-    /// Build a sixteen-dword fragment from sixteen scalar dwords.
-    Frag16Build(Vec<Opnd>),
     /// Pack two f32 values into two unsigned-normalized 16-bit values (low = a).
     CvtPknormU16(Opnd, Opnd),
-    /// Scale two bf16 values and pack them into two fp8 values, replacing one
-    /// 16-bit half of old (high selects the upper half).
-    CvtScalef32PkFp8Bf16 { old: Opnd, src: Opnd, scale: Opnd, high: bool },
     /// `v_mfma_scale_f32_32x32x64_f8f6f4`: block-scaled fp8 MFMA. The two scale
     /// operands are E8M0 exponents in scalar registers.
     MfmaScaleFp8_32x32x64 { a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
@@ -264,16 +254,12 @@ pub enum Op {
     BitcastF32(Opnd),
     /// Register reinterpretation to i32 (no instruction).
     BitcastI32(Opnd),
-    /// Pack two f32 into two E4M3 fp8 bytes (low 16 bits of the result).
-    CvtPkFp8F32(Opnd, Opnd),
     /// Two f32 -> two bf16 (round to nearest even) packed into one dword (_cvt_pk_bf16_f32).
     CvtPkBf16F32(Opnd, Opnd),
     /// Base-2 exponential: the hardware primitive (_exp_f32), no log2(e) scaling.
     Exp2F32(Opnd),
     /// Base-2 logarithm: the hardware primitive (v_log_f32).
     Log2F32(Opnd),
-    /// Dwords `index` and `index + 1` (`index` even) of a fragment as a `Frag2` (register alias, no instruction).
-    Frag16Pair { frag: Opnd, index: u8 },
     /// A `Frag2` with both dwords set to one 32-bit value.
     Frag2Dup(Opnd),
     /// `v_pk_add_f32` on two `Frag2` operands.
@@ -308,7 +294,6 @@ impl Op {
             }
             Op::ExpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } | Op::LoadF32Coherent { .. } => DType::F32,
             Op::AtomicAddU32 { .. } => DType::U32,
-            Op::LoadB128Coherent { .. } => DType::Frag4,
             Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } => DType::Rsrc,
             Op::BufferLoadB128x2 { .. } => DType::Frag8,
             Op::BufferLoad { dwords, .. } => match dwords {
@@ -328,18 +313,15 @@ impl Op {
             Op::Permlane32Swap { .. } => DType::Frag2,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::MfmaF16Wide { .. } => DType::Frag16,
-            Op::MfmaFp8_16x16x32 { .. } => DType::Frag4,
-            Op::MfmaFp8_32x32x16 { .. } => DType::Frag16,
             Op::Frag8(..) => DType::Frag8,
             Op::CatFrag8(..) => DType::Frag8,
-            Op::Frag16Build(..) => DType::Frag16,
-            Op::CvtPknormU16(..) | Op::CvtScalef32PkFp8Bf16 { .. } | Op::CvtPkFp8F32(..) | Op::CvtPkBf16F32(..) => DType::U32,
+            Op::CvtPknormU16(..) | Op::CvtPkBf16F32(..) => DType::U32,
             Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. } => DType::Frag16,
             Op::SmfmacFp8_16x16x128 { .. } => DType::Frag4,
             Op::Asm { block, .. } => asm_out_ty(block),
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
-            Op::Frag16Pair { .. } | Op::Frag2Dup(..) | Op::PkAddF32(..) | Op::PkMulF32(..) => DType::Frag2,
+            Op::Frag2Dup(..) | Op::PkAddF32(..) | Op::PkMulF32(..) => DType::Frag2,
             Op::CvtPkFp8x4F32(..) => DType::U32,
             Op::PartnerMaxF32(..) => DType::F32,
             Op::CvtPknormP8x4(..) => DType::U32,
@@ -392,20 +374,16 @@ impl Op {
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
             Op::MfmaF16Wide { a, b, c } => vec![*a, *b, *c],
-            Op::MfmaFp8_16x16x32 { a, b, c } => vec![*a, *b, *c],
-            Op::MfmaFp8_32x32x16 { a, b, c } => vec![*a, *b, *c],
             Op::Frag8(a, b, c, d, e, f, g, h) => vec![*a, *b, *c, *d, *e, *f, *g, *h],
             Op::CatFrag8(a, b) => vec![*a, *b],
-            Op::Frag16Build(v) => v.clone(),
-            Op::CvtPknormU16(a, b) | Op::CvtPkFp8F32(a, b) | Op::CvtPkBf16F32(a, b) => vec![*a, *b],
-            Op::CvtScalef32PkFp8Bf16 { old, src, scale, .. } => vec![*old, *src, *scale],
+            Op::CvtPknormU16(a, b) | Op::CvtPkBf16F32(a, b) => vec![*a, *b],
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 vec![*a, *b, *c, *scale_a, *scale_b]
             }
             Op::MfmaFp8_32x32x64 { a, b, c } => vec![*a, *b, *c],
             Op::SmfmacFp8_16x16x128 { a, b, idx, c } => vec![*a, *b, *idx, *c],
             Op::Asm { inputs, .. } => inputs.clone(),
-            Op::Frag16Lane { frag, .. } | Op::Frag16Pair { frag, .. } => vec![*frag],
+            Op::Frag16Lane { frag, .. } => vec![*frag],
             Op::Frag2Dup(a) | Op::PartnerMaxF32(a) => vec![*a],
             Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => vec![*a, *b],
             Op::CvtPkFp8x4F32(a, b, c, d) => vec![*a, *b, *c, *d],
@@ -419,7 +397,7 @@ impl Op {
             Op::LoadLdsB64 { addr } => vec![*addr],
             Op::LoadLdsTrB8 { addr } => vec![*addr],
             Op::LoadLdsTr4B8 { addrs } => addrs.to_vec(),
-            Op::LoadGlobalB128 { base, .. } | Op::LoadF32Coherent { base, .. } | Op::LoadB128Coherent { base, .. } => vec![*base],
+            Op::LoadGlobalB128 { base, .. } | Op::LoadF32Coherent { base, .. } => vec![*base],
         Op::AtomicAddU32 { base, value, .. } => vec![*base, *value],
             Op::LoadLdsB128x2 { lo, hi } => vec![*lo, *hi],
             Op::BufferRsrc { base, .. } => vec![*base],
@@ -670,7 +648,6 @@ pub enum Stmt {
     BufferLoadLds { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, lds_addr: Opnd, imm: u32, dwords: u8 },
     /// Device-scope write-through stores (`sc1`): visible to coherent loads / atomics of other workgroups on other XCDs.
     StoreF32Wt { base: Opnd, byte_off: u32, value: Opnd },
-    StoreF32x4Wt { base: Opnd, byte_off: u32, value: Opnd },
     /// Release fence at device scope: `s_waitcnt vmcnt(0) lgkmcnt(0)` [+ `buffer_wbl2 sc1` + `s_waitcnt vmcnt(0)` when `wb`].
     FenceRelease { wb: bool },
     /// Acquire fence at device scope: `s_waitcnt vmcnt(0)` [+ `buffer_inv sc1` when `inv`]; later loads cannot move above it.
@@ -708,13 +685,9 @@ pub enum Stmt {
     /// `var.lane[index] = value` (a 32-bit value into one dword of a fragment variable; the lowering writes the producer straight into that
     /// dword when the value has no other use).
     VarSetLane { var: VarId, index: u8, value: Opnd },
-    /// 16-byte global load written straight into a `Frag4` loop variable.
-    VarLoadB128 { var: VarId, base: Opnd, byte_off: u32 },
     /// `var = scaled_mfma_32x32x64_fp8(a, b, var)`: accumulate into a loop variable in place.
     /// `opsel`: E8M0 byte select of the scale dwords (bits 0..1 = byte of `scale_a`, bits 4..5 = byte of `scale_b`; 0 = byte 0), as `VarMfmaScale16`.
     VarMfmaScale { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd, opsel: u8 },
-    /// `var = scaled_mfma_32x32x64_fp8(a, b)` with a zero accumulator (overwrites the variable).
-    VarMfmaScaleZ { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
     /// `var = a x b + c` (c a Frag16 VALUE, not the variable itself: the accumulator input and the destination are different registers)
     VarMfmaScaleC { var: VarId, a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
     /// UNSCALED fp8 MFMA (`v_mfma_f32_32x32x64_f8f6f4`) into a loop variable: in place `var += a x b`
@@ -1068,9 +1041,6 @@ impl Function {
                 Stmt::StoreF32Wt { base, byte_off, value } => {
                     let _ = writeln!(s, "{pad}store.wt f32 [{base:?}+{byte_off}] <- {value:?}");
                 }
-                Stmt::StoreF32x4Wt { base, byte_off, value } => {
-                    let _ = writeln!(s, "{pad}store.wt f32x4 [{base:?}+{byte_off}] <- {value:?}");
-                }
                 Stmt::FenceRelease { wb } => {
                     let _ = writeln!(s, "{pad}fence.release(wb={wb})");
                 }
@@ -1142,12 +1112,6 @@ impl Function {
                 }
                 Stmt::VarScalePk { var, pair } => {
                     let _ = writeln!(s, "{pad}var{} *=pk {pair:?}", var.0);
-                }
-                Stmt::VarLoadB128 { var, base, byte_off } => {
-                    let _ = writeln!(s, "{pad}var{} <- load128 [{base:?}+{byte_off}]", var.0);
-                }
-                Stmt::VarMfmaScaleZ { var, a, b, scale_a, scale_b } => {
-                    let _ = writeln!(s, "{pad}var{} = mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
                 }
                 Stmt::VarMfmaFp8 { var, a, b } => {
                     let _ = writeln!(s, "{pad}var{} += mfma_fp8({a:?}, {b:?})", var.0);
@@ -1435,9 +1399,6 @@ impl FnBuilder {
         self.let_(Op::BufferLoadB128x2 { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm_lo, imm_hi })
     }
 
-    pub fn buffer_load_b128_off(&mut self, rsrc: ValueId, soff: impl Into<Opnd>, imm: u32) -> ValueId {
-        self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: None, soff: soff.into(), imm, dwords: 4 })
-    }
     pub fn buffer_store_f32(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 1, value: value.into() });
     }
@@ -1535,11 +1496,6 @@ impl FnBuilder {
         v
     }
 
-    /// As `agpr`, at the exact AGPR index `base`.
-    pub fn agpr_at(&mut self, v: ValueId, base: u32) -> ValueId {
-        self.f.agpr.push(AgprMark { target: AgprTarget::Val(v), pin: Some(base) });
-        v
-    }
     pub fn finish(mut self) -> Function {
         let tree = std::mem::take(&mut self.tree);
         let body = tree.finish().unwrap_or_else(|e| panic!("kernel `{}`: {e}", self.f.name));
@@ -1584,13 +1540,6 @@ impl FnBuilder {
     /// Closure form of `tile_produce` / `tile_end`.
     pub fn produce_region<R>(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>, body: impl FnOnce(&mut Self) -> R) -> R {
         self.tile_produce(tile, slot, version);
-        let r = body(self);
-        self.tile_end();
-        r
-    }
-    /// Closure form of `tile_consume` / `tile_end`.
-    pub fn consume_region<R>(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>, body: impl FnOnce(&mut Self) -> R) -> R {
-        self.tile_consume(tile, slot, version);
         let r = body(self);
         self.tile_end();
         r
@@ -1651,20 +1600,12 @@ impl FnBuilder {
         self.let_(Op::Max3F32(a.into(), b.into(), c.into()))
     }
 
-    pub fn fma_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
-        self.let_(Op::FmaF32(a.into(), b.into(), c.into()))
-    }
-
     pub fn exp_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::ExpF32(a.into()))
     }
 
     pub fn rcp_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::RcpF32(a.into()))
-    }
-
-    pub fn cvt_f16_to_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
-        self.let_(Op::CvtF16ToF32(a.into()))
     }
 
     pub fn cvt_f32_to_f16(&mut self, a: impl Into<Opnd>) -> ValueId {
@@ -1688,10 +1629,6 @@ impl FnBuilder {
         self.let_(Op::LoadF32Coherent { base: base.into(), byte_off })
     }
 
-    pub fn load_b128_coherent(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
-        self.let_(Op::LoadB128Coherent { base: base.into(), byte_off })
-    }
-
     /// `global_atomic_add` returning the OLD value, device scope. Per-lane semantics: every active lane adds ITS `value`; pass `1` in lane 0 and `0`
     /// elsewhere for a one-ticket-per-wave counter, then `read_first_lane` the result.
     pub fn atomic_add_u32(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) -> ValueId {
@@ -1700,10 +1637,6 @@ impl FnBuilder {
 
     pub fn store_f32_wt(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::StoreF32Wt { base: base.into(), byte_off, value: value.into() });
-    }
-
-    pub fn store_f32x4_wt(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
-        self.push_stmt(Stmt::StoreF32x4Wt { base: base.into(), byte_off, value: value.into() });
     }
 
     /// Device-scope release: wait for all earlier loads/stores, write back L2 (`buffer_wbl2 sc1`), wait again.
@@ -1788,46 +1721,11 @@ impl FnBuilder {
         self.let_(Op::MfmaF16Wide { a: a.into(), b: b.into(), c: c.into() })
     }
 
-    pub fn mfma_fp8_16x16x32(
-        &mut self,
-        a: impl Into<Opnd>,
-        b: impl Into<Opnd>,
-        c: impl Into<Opnd>,
-    ) -> ValueId {
-        self.let_(Op::MfmaFp8_16x16x32 { a: a.into(), b: b.into(), c: c.into() })
-    }
-
-    pub fn mfma_fp8_32x32x16(
-        &mut self,
-        a: impl Into<Opnd>,
-        b: impl Into<Opnd>,
-        c: impl Into<Opnd>,
-    ) -> ValueId {
-        self.let_(Op::MfmaFp8_32x32x16 { a: a.into(), b: b.into(), c: c.into() })
-    }
-
     #[allow(clippy::too_many_arguments)]
     /// Concatenate two Frag4 values into a Frag8 (low half first).
     /// Pack two f32 into two unsigned-normalized 16-bit values.
     pub fn cvt_pknorm_u16_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPknormU16(a.into(), b.into()))
-    }
-
-    /// Scale two bf16 and pack into fp8, writing one 16-bit half of old.
-    #[allow(clippy::too_many_arguments)]
-    pub fn cvt_scalef32_pk_fp8_bf16(
-        &mut self,
-        old: impl Into<Opnd>,
-        src: impl Into<Opnd>,
-        scale: impl Into<Opnd>,
-        high: bool,
-    ) -> ValueId {
-        self.let_(Op::CvtScalef32PkFp8Bf16 {
-            old: old.into(),
-            src: src.into(),
-            scale: scale.into(),
-            high,
-        })
     }
 
     /// Pack two f32 into two E4M3 fp8 bytes (upper 16 bits are zero).
@@ -1841,16 +1739,6 @@ impl FnBuilder {
 
     pub fn cvt_pk_bf16_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPkBf16F32(a.into(), b.into()))
-    }
-
-    pub fn cvt_pk_fp8_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
-        self.let_(Op::CvtPkFp8F32(a.into(), b.into()))
-    }
-
-    /// Build a Frag16 from sixteen scalar values (raw dwords).
-    pub fn frag16_build(&mut self, lanes: &[ValueId]) -> ValueId {
-        assert_eq!(lanes.len(), 16);
-        self.let_(Op::Frag16Build(lanes.iter().map(|v| Opnd::Val(*v)).collect()))
     }
 
     pub fn cat_frag8(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
@@ -1976,16 +1864,6 @@ impl FnBuilder {
         self.let_(Op::LoadLdsB128x2 { lo: lo.into(), hi: hi.into() })
     }
 
-    /// Load 16 bytes from global memory directly into a `Frag4` loop variable (the load stays in
-    /// flight across the code that follows; the loop back edge waits for it).
-    pub fn var_load_b128(&mut self, var: VarId, base: impl Into<Opnd>, byte_off: u32) {
-        self.push_stmt(Stmt::VarLoadB128 { var, base: base.into(), byte_off });
-    }
-
-    /// `var *= scalar` on every dword of a `Frag16` loop variable.
-    pub fn frag16_pair(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
-        self.let_(Op::Frag16Pair { frag: frag.into(), index })
-    }
     pub fn partner_max_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PartnerMaxF32(a.into()))
     }
@@ -2020,9 +1898,6 @@ impl FnBuilder {
     /// `var = a x b + c` (unscaled fp8; c a separate Frag16 value).
     pub fn var_mfma_fp8_32x32x64_c(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarMfmaFp8C { var, a: a.into(), b: b.into(), c: c.into() });
-    }
-    pub fn var_mfma_scale_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>) {
-        self.push_stmt(Stmt::VarMfmaScaleZ { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
     }
     pub fn var_scale_lane(&mut self, var: VarId, index: u8, scalar: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarScaleLane { var, index, scalar: scalar.into() });
@@ -2061,9 +1936,6 @@ impl FnBuilder {
     }
     pub fn var_scale_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarScalePk { var, pair: pair.into() });
-    }
-    pub fn var_scale_f32(&mut self, var: VarId, scalar: impl Into<Opnd>) {
-        self.push_stmt(Stmt::VarScaleF32 { var, scalar: scalar.into() });
     }
 
     /// `var = scaled_mfma(a, b, var)` in place.
@@ -2108,11 +1980,6 @@ impl FnBuilder {
     /// Update several loop variables in place: the i-th `Seq::inout` port is bound to `vars[i]`.
     pub fn var_asm_n(&mut self, vars: &[VarId], block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) {
         self.push_stmt(Stmt::VarAsmN { vars: vars.to_vec(), block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
-    }
-
-    /// Update the Frag4 loop variable `var` in place with a safe-asm sequence (its leading in/out port is the variable).
-    pub fn var_asm(&mut self, var: VarId, block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) {
-        self.push_stmt(Stmt::VarAsm { var, block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
     }
 
     pub fn load_lds_tr_b8(&mut self, addr: impl Into<Opnd>) -> ValueId {
@@ -2418,7 +2285,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                             errs.push(here(e));
                         }
                     }
-                    Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } | Op::LoadF32Coherent { base, .. } | Op::LoadB128Coherent { base, .. } => {
+                    Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } | Op::LoadF32Coherent { base, .. } => {
                         if let Err(e) = expect_ptr(f, *base, "load") {
                             errs.push(here(e));
                         }
@@ -2542,29 +2409,6 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
-                    Op::CvtPkFp8F32(a, b) => {
-                        for o in [a, b] {
-                            if let Err(e) = expect_float(f, *o, "cvt_pk_fp8") {
-                                errs.push(here(e));
-                            }
-                        }
-                    }
-                    Op::CvtScalef32PkFp8Bf16 { old, src, scale, .. } => {
-                        if let Err(e) = expect_int(f, *old, "pack fp8 destination") {
-                            errs.push(here(e));
-                        }
-                        if let Err(e) = expect_int(f, *src, "pack fp8 source") {
-                            errs.push(here(e));
-                        }
-                        if let Err(e) = expect_float(f, *scale, "pack fp8 scale") {
-                            errs.push(here(e));
-                        }
-                    }
-                    Op::Frag16Build(v) => {
-                        if v.len() != 16 {
-                            errs.push(here("frag16 needs sixteen lanes".to_string()));
-                        }
-                    }
                     Op::CatFrag8(a, b) => {
                         for o in [a, b] {
                             match opnd_ty(f, *o) {
@@ -2615,40 +2459,6 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
-                    Op::MfmaFp8_16x16x32 { a, b, c } => {
-                        for (o, want, what) in [
-                            (*a, DType::Frag2, "a"),
-                            (*b, DType::Frag2, "b"),
-                            (*c, DType::Frag4, "c"),
-                        ] {
-                            if let Ok(t) = opnd_ty(f, o) {
-                                if t != want {
-                                    errs.push(here(format!(
-                                        "fp8 mfma: operand {what} is {}, expected {}",
-                                        t.name(),
-                                        want.name()
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                    Op::MfmaFp8_32x32x16 { a, b, c } => {
-                        for (o, want, what) in [
-                            (*a, DType::Frag2, "a"),
-                            (*b, DType::Frag2, "b"),
-                            (*c, DType::Frag16, "c"),
-                        ] {
-                            if let Ok(t) = opnd_ty(f, o) {
-                                if t != want {
-                                    errs.push(here(format!(
-                                        "wide fp8 mfma: operand {what} is {}, expected {}",
-                                        t.name(),
-                                        want.name()
-                                    )));
-                                }
-                            }
-                        }
-                    }
                     Op::LoadLdsTrB8 { addr } => {
                         if let Err(e) = expect_int(f, *addr, "lds tr_b8 load address") {
                             errs.push(here(e));
@@ -2692,7 +2502,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::StoreF32x4 { base, .. } | Stmt::StoreF32x4Wt { base, .. } | Stmt::StoreF32x2 { base, .. } => {
+            Stmt::StoreF32x4 { base, .. } | Stmt::StoreF32x2 { base, .. } => {
                 if let Err(e) = expect_ptr(f, *base, "store") {
                     errs.push(here(e));
                 }
@@ -2832,20 +2642,6 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::VarLoadB128 { var, base, .. } => {
-                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
-                if !ok {
-                    errs.push(here(format!("var{var} loaded outside its loop")));
-                }
-                if f.var_ty(*var) != Some(DType::Frag4) {
-                    errs.push(here(format!("var{var} must be a frag4 to take a 16-byte load")));
-                }
-                if let Opnd::Val(v) = base {
-                    if !visible(&scopes, *v) {
-                        errs.push(here(format!("operand v{v} is not visible here")));
-                    }
-                }
-            }
             Stmt::VarScaleF32 { var, scalar } => {
                 let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
@@ -2899,7 +2695,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } => {
+            Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } => {
                 if f.var_ty(*var) != Some(DType::Frag16) {
                     errs.push(here(format!("var{var} must be a frag16 accumulator")));
                 }
@@ -3135,7 +2931,7 @@ pub use expr::{Cond, Ptr, F32, I32};
 pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
     match st {
         Stmt::Let { op, .. } => op.operands(),
-        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32Wt { base, value, .. } | Stmt::StoreF32x4Wt { base, value, .. } | Stmt::StoreF32x2 { base, value, .. } => vec![*base, *value],
+        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32Wt { base, value, .. } | Stmt::StoreF32x2 { base, value, .. } => vec![*base, *value],
         Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => vec![],
         Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } | Stmt::StoreLdsB64 { addr, value } => vec![*addr, *value],
         Stmt::LoadGlobalLds { base, lds_addr, .. } => vec![*base, *lds_addr],
@@ -3158,8 +2954,7 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::VarSetLane { var, value, .. } => vec![Opnd::Var(*var), *value],
         Stmt::VarScalePk { pair, .. } | Stmt::VarAddPk { pair, .. } => vec![*pair],
         Stmt::VarMfmaF16Z { a, b, .. } => vec![*a, *b],
-        Stmt::VarLoadB128 { base, .. } => vec![*base],
-        Stmt::VarMfmaScale { a, b, scale_a, scale_b, .. } | Stmt::VarMfmaScaleZ { a, b, scale_a, scale_b, .. } => {
+        Stmt::VarMfmaScale { a, b, scale_a, scale_b, .. } => {
             vec![*a, *b, *scale_a, *scale_b]
         }
         Stmt::VarMfmaScaleC { a, b, c, scale_a, scale_b, .. } => vec![*a, *b, *c, *scale_a, *scale_b],
@@ -3254,10 +3049,8 @@ pub fn stmt_var_writes(st: &Stmt) -> Vec<VarId> {
         | Stmt::VarMfmaF16Z { var, .. }
         | Stmt::VarScaleLane { var, .. }
         | Stmt::VarSetLane { var, .. }
-        | Stmt::VarLoadB128 { var, .. }
         | Stmt::VarMfmaScale { var, .. }
         | Stmt::VarMfmaScale16 { var, .. }
-        | Stmt::VarMfmaScaleZ { var, .. }
         | Stmt::VarMfmaScaleC { var, .. }
         | Stmt::VarMfmaFp8 { var, .. }
         | Stmt::VarMfmaFp8Z { var, .. }

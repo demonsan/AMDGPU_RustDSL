@@ -30,8 +30,7 @@ pub enum Node {
 b.loop_(&[(DType::I32, init)], |b, vars| { ...; b.break_if(done); });
 b.if_(cond, |b| { ... });
 b.if_else(cond, |b| { ... }, |b| { ... });
-b.produce_region("K", slot, gen, |b| { ...stores... });
-b.consume_region("K", slot, gen, |b| { ...reads... });
+b.produce_region("K", slot, gen, |b| { ...stores... });   // consumers: tile_consume .. tile_end
 ```
 
 ## 3. 线性视图
