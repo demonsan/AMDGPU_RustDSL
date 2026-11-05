@@ -82,3 +82,19 @@ by these prototypes. The `vmcnt` part of the gap remains; the levers left are (1
 grouping of the 5 copies of group A), (2) more VALU-phase time for the copy to land (move work from the M phase into the VALU phase),
 and (3) finding out why our M phase is more sensitive to concurrent LDS writes than the vendor's (per-phase LDS counters, ours vs
 vendor).
+
+## 6. Copy-path investigation (closed; all measured negative, same-run 7×, normal data, base = Main at the time)
+
+| experiment | what changed | B4H8S2048 | B1H8S8192 | per-CU | note |
+|---|---|---:|---:|---:|---|
+| LDS counters (rocprofv3) | — | | | | loop: no bank / address conflicts for us or the vendor; our 393 216 conflicts are all in the LDS-staged epilogue (direct epilogue: 0, but −3..−9 % slower) |
+| epilogue scratch `Swizzle<3,4,4>` | chunk XOR from query bits 1..3 | −0.1 % | −0.4 % | +0.3 % | conflict count unchanged (b32 column writes cannot be conflict-free without dword padding) |
+| extra 16 KiB copy per group/tile (timing only) | issued at the VALU phase start / M phase start | −6.2 / −6.6 % | −8.7 / −10.3 % | −13.3 / −14.2 % | copy traffic itself is expensive; landing phase matters little |
+| copies spread over the VALU phase | one copy per softmax quarter | −11.4 % | −11.6 % | −22.4 % | later issue → longer exposed copy latency |
+| vendor K formation (`khalf`) | half-row runs, 2 voffsets × imm 0/64, swizzle by row&3 | −5.4 % | −7.5 % | −12.1 % | K issue stall drops to the vendor's level, but the vmcnt wait doubles (10.7 k → 22.0 k cycles) |
+
+| row sums at the end of the VALU phase (rebalancing) | 2 smfmacs moved before the mid barrier | −10.4 % | −11.8 % | −20.3 % | matrix work in the VALU phase collides with the other group's M phase and lengthens the critical path |
+
+Conclusion: in the two-group structure the per-tile copy latency is the floor of the VALU phase + barrier; issue backpressure
+(our 7–23 cycles per copy vs the vendor's 4) is not the cost, and none of the vendor's copy-side choices transfer. Experiment code:
+branches `fmha-ring3`, `fmha-episwz`, `fmha-dmaform`, `fmha-khalf` (not for merge).
