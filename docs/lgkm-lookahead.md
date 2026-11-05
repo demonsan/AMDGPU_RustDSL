@@ -63,4 +63,4 @@ layout 中位数（leading `s_nop` 位移 0..7 × 3 轮，`REF_DATA=normal`，�
 同一轮交替（`REF_DATA=normal`，9 轮；基线 `_vs128` 643.5 / 1737.9 / 2460.0 TF/s = per-CU B1S2048 / B4S2048 / B1S8192）：`wsink` +0.6 / +0.2 / +0.3 %；
 **`wsink,ldahead32=1` +1.0 / +1.8 / +1.1 %**（649.7 / 1768.6 / 2486.4）；`ldahead32=1` 单用 +0.2 / +1.0 / +0.4 %；`wsink,ldahead32=2` −1.4 / +0.1 / −0.6 %。layout 中位数（位移 0..7 × 3 轮）：+0.6 / +0.3 / +0.5 %（648.3 vs 644.4，1741.7 vs 1736.2，2478.1 vs 2465.5）。
 `_t128`（预设用 `xbar,limit=248` 补回）：`wsink,ldahead32=1` +0.7 / +0.5 / +0.4 %（B1S2048 / B2S2048 / B1S4096）。
-无环境变量的 A/B 内核：`fmha_fwd_hd128_mxfp8_v3x_vs128_wsink`（同码，`sched_opts = "ldsink=1,wsink,ldahead32=1"`）。
+**已设为出厂**（kernel-opt 同一轮 7 次，`REF_DATA=normal`，对比 `ldsink=1`）：`_vs128` −0.1 / +1.2 / +1.3 %（B4H8S2048 / B1H8S8192 / per-CU），`_kvsplit` +1.8 / +1.1 / +1.2 %（B1H8S2048 s4 / B1H4S4096 s4 / B1H4S8192 s2），`_t128` +0.8 / −0.2 / +1.5 %（B2H8S2048 / B1H8S4096 / B4H8S512）；三个 builder 的 `sched_opts = "ldsink=1,wsink,ldahead32=1"`，A/B 别名已删除。
