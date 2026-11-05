@@ -180,6 +180,55 @@ The accuracy mechanism: the per-tile fractional rebase aligns each tile's maximu
 `_t128` fastref: no gain (1061 vs 1059 TFLOP/s).
 
 The integer-delta and lazy recurrences are checked against the naive sums in `tests/functional_proofs.rs` (`integer_delta_and_lazy_frames_match_naive`).
+**Decision (user, 2026-11-05: "accept vendor accuracy") — the vendor's reference recipe ships in `_vs128`.** `Vs128Cfg::vref`, `OnlineSoftmax::set_vendor_ref`.
+
+What `vref` changes, using the vendor's exact scalars from vendor-spec 4.7:
+
+- **Target:** the rebase target is s91 = 0.24799132.
+- **Lazy rollback:** the threshold is s92 = 0.26135647, 6.84/512 above the target. The reference moves only when a row max passes the threshold, and the first tile is seeded.
+- **No per-tile fractional rebase:** the rescale branch is rarely taken.
+- **Conversion:** the scale is 0.25, with no LUT correction.
+- **Unchanged:** the carried reference keeps its exact two-word form.
+
+Scope:
+
+- **Long copy only:** `vref` is used in the long-sequence copy (≥ 9 tiles).
+- **Short copy (< 9 tiles):** keeps the exact recipe with the LUT correction. With the vendor recipe its error does not average out over so few tiles: 1.25–1.5× the vendor's mean at S = 100–200, which fails parity.
+- **`_t128`:** not adopted, because it measured within noise (B2H8S2048 −0.8%, B1H8S4096 +1.1%).
+- **`_kvsplit`:** unaffected, because the shipped splits (512 keys) run the short copy.
+
+Accuracy (64 rows vs CPU, bad / mean_err, same run):
+
+| shape | ours old (exact) | ours new (vref) | vendor |
+|---|---|---|---|
+| B4H8S2048 | 0 / 9.27e-4 | 2 / 2.848e-3 | 2 / 2.859e-3 |
+| B1H8S8192 | 0 / 6.87e-4 | 4 / 2.763e-3 | 4 / 2.764e-3 |
+| B2H8S2048 | 0 / 1.009e-3 | 8 / 2.855e-3 | 8 / 2.844e-3 |
+| B1H8S4096 | 0 / 8.58e-4 | 1 / 2.815e-3 | 1 / 2.828e-3 |
+| S ≤ 1152 (short copy) | unchanged | unchanged | — |
+
+The vendor's own algorithm lands on the vendor's error statistics.
+
+**Speed.** Same-run A/B, 7 runs, against the previous default:
+
+| shape | change |
+|---|---|
+| B4H8S2048 | +0.7% |
+| B1H8S8192 | +5.5% |
+| B2H8S2048 | +0.8% |
+| B1H8S4096 | +0.9% |
+
+**Gate.** Full `port_gate` (vendor parity):
+
+| item | result |
+|---|---|
+| ACC64 | 15/15 ×3, 13/13 split |
+| DET / STRESS | PASS |
+| b4h8s2048 | **1538.2 TF/s (0.915× vendor)** |
+| b1h8s8192 | **2141.7 TF/s (0.911×)** |
+| per-CU | **488.8 TF/s (0.911×)**, layout median 489.8 |
+
+**E2.** The recurrence is checked against the naive sums in `tests/functional_proofs.rs::vendor_lazy_reference_recipe_matches_naive`.
 ### 4.4 优化里程
 
 292 → 367（每 CU 差 1.41×）→ 505（t128 分块）→ 605（KV-split）→ 622（kddma）→ 674–705 TFLOP/s（第 75 轮，旧手写集）
