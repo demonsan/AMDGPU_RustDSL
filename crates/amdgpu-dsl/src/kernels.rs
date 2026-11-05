@@ -22922,3 +22922,98 @@ pub fn probe_stamp() -> Function {
     b.stamp_store(out, rec, 5, y);
     b.finish()
 }
+
+/// Generic one-hot probe of `v_smfmac_f32_16x16x128_fp8_fp8` (docs/isa-probes-smfmac-tr.md): probe `bx` (one 64-lane wave per block) loads lane `l`'s A (4 dwords at
+/// `a_in[(64 bx + l) * 16]`), B (8 dwords at `b_in[(64 bx + l) * 32]`) and SRC2 index dword (`i_in[(64 bx + l) * 4]`) straight from global memory, issues ONE
+/// smfmac with a zero accumulator and stores D (4 dwords per lane) to `d_out[(64 bx + l) * 16]`. The host chooses every register bit.
+pub fn probe_smfmac_gen() -> Function {
+    let mut b = FnBuilder::new("probe_smfmac_gen", 64);
+    b.arg("a_in", DType::Ptr, 0, 8);
+    b.arg("b_in", DType::Ptr, 8, 8);
+    b.arg("i_in", DType::Ptr, 16, 8);
+    b.arg("d_out", DType::Ptr, 24, 8);
+    let a_in = b.let_(Op::KernargPtr { offset: 0 });
+    let b_in = b.let_(Op::KernargPtr { offset: 8 });
+    let i_in = b.let_(Op::KernargPtr { offset: 16 });
+    let d_out = b.let_(Op::KernargPtr { offset: 24 });
+    let bx = b.let_(Op::WorkgroupIdX);
+    let tid = b.let_(Op::WorkitemId);
+    let c64 = b.c_i32(64);
+    let base = b.mul_i32(bx, c64);
+    let g = b.add_i32(base, tid);
+    let c4 = b.c_i32(4);
+    let c16 = b.c_i32(16);
+    let c32 = b.c_i32(32);
+    let ao = b.mul_i32(g, c16);
+    let bo = b.mul_i32(g, c32);
+    let io = b.mul_i32(g, c4);
+    let ap = b.ptr_add(a_in, ao);
+    let bp = b.ptr_add(b_in, bo);
+    let ip = b.ptr_add(i_in, io);
+    let dp = b.ptr_add(d_out, ao);
+    let mut aw = Vec::new();
+    for i in 0..4u32 {
+        let f = b.load_f32(ap, 4 * i);
+        aw.push(b.bitcast_i32(f));
+    }
+    let mut bw = Vec::new();
+    for i in 0..8u32 {
+        let f = b.load_f32(bp, 4 * i);
+        bw.push(b.bitcast_i32(f));
+    }
+    let fi = b.load_f32(ip, 0);
+    let idx = b.bitcast_i32(fi);
+    let a = b.frag4(aw[0], aw[1], aw[2], aw[3]);
+    let bb = b.frag8(bw[0], bw[1], bw[2], bw[3], bw[4], bw[5], bw[6], bw[7]);
+    let c0 = b.frag_zero(DType::Frag4);
+    let d = b.smfmac_fp8_16x16x128(a, bb, idx, c0);
+    b.store_f32x4(dp, 0, d);
+    b.finish()
+}
+
+/// Generic probe of `ds_read_b64_tr_b8`: lane `l` of probe `bx` reads LDS byte address `addr_in[64 bx + l]` (the LDS holds the 4096 bytes of `src`, copied in by the
+/// kernel) and stores the two result dwords to `d_out[(64 bx + l) * 8]`.
+pub fn probe_lds_tr_b8_gen() -> Function {
+    let mut b = FnBuilder::new("probe_lds_tr_b8_gen", 64);
+    b.lds(4096);
+    b.arg("src", DType::Ptr, 0, 8);
+    b.arg("addr_in", DType::Ptr, 8, 8);
+    b.arg("d_out", DType::Ptr, 16, 8);
+    let src = b.let_(Op::KernargPtr { offset: 0 });
+    let addr_in = b.let_(Op::KernargPtr { offset: 8 });
+    let d_out = b.let_(Op::KernargPtr { offset: 16 });
+    let bx = b.let_(Op::WorkgroupIdX);
+    let tid = b.let_(Op::WorkitemId);
+    let c2 = b.c_i32(2);
+    let c3 = b.c_i32(3);
+    let c64 = b.c_i32(64);
+    // copy the 4096 source bytes into LDS: lane l writes dwords l + 64 k, k = 0..15
+    for k in 0..16i32 {
+        let ck = b.c_i32(64 * k);
+        let dw = b.add_i32(tid, ck);
+        let off = b.shl_i32(dw, c2);
+        let p = b.ptr_add(src, off);
+        let f = b.load_f32(p, 0);
+        let w = b.bitcast_i32(f);
+        b.store_lds_b32(Opnd::Val(off), Opnd::Val(w));
+    }
+    b.wait_lds(0);
+    b.barrier();
+    b.wait_lds(0);
+    let base = b.mul_i32(bx, c64);
+    let g = b.add_i32(base, tid);
+    let ao = b.shl_i32(g, c2);
+    let ap = b.ptr_add(addr_in, ao);
+    let fa = b.load_f32(ap, 0);
+    let addr = b.bitcast_i32(fa);
+    let r = b.load_lds_tr_b8(Opnd::Val(addr));
+    b.wait_lds(0);
+    let oo = b.shl_i32(g, c3);
+    let dp = b.ptr_add(d_out, oo);
+    for i in 0..2u8 {
+        let lane = b.frag16_lane(r, i);
+        let v = b.bitcast_f32(lane);
+        b.store_f32(dp, 4 * i as u32, v);
+    }
+    b.finish()
+}
