@@ -206,6 +206,10 @@ pub struct AttnBody3<'a> {
     bias_next: Option<Opnd>,
     /// one f16 bias MFMA per tile (the vendor's single helper): its result is the C input of the four S tiles' first QK MFMA (`_vs128`)
     pub biasonce: bool,
+    /// EXPERIMENT (timing only): an extra 16 KiB LDS-direct copy per group and tile into a spare LDS region: 1 = issued at the start of the
+    /// VALU phase, 2 = at the start of the M phase (lands during it); (source pointer, spare LDS base)
+    pub dummy: u8,
+    pub dummy_src: Option<(ValueId, i32)>,
     bias_tile: std::cell::Cell<Option<Opnd>>,
 }
 
@@ -214,7 +218,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None) }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, dummy: 0, dummy_src: None, bias_tile: std::cell::Cell::new(None) }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -285,6 +289,16 @@ impl<'a> AttnBody3<'a> {
             }
         }
     }
+    fn dummy_dma(&self, b: &mut FnBuilder) {
+        let (src, spare) = self.dummy_src.expect("dummy src");
+        let lane = self.blk.lane.lane();
+        for q in 0..4i32 {
+            let off = b.bind_i32((lane << 4) + 1024 * q + (amdgpu_dsl::ev(self.wid) << 12));
+            let p = b.ptr_add(src, off);
+            let m0 = b.bind_i32((amdgpu_dsl::ev(self.wid) << 12) + (spare + 1024 * q));
+            b.load_global_lds(p, m0, 0, 4);
+        }
+    }
     pub fn out_scale(&self, b: &mut FnBuilder) -> ValueId {
         let l = self.sm.l_total(b);
         self.blk.out_scale(b, l)
@@ -322,6 +336,9 @@ impl PipeBody for AttnBody3<'_> {
         if self.setprio {
             b.set_prio(0);
         }
+        if self.dummy == 1 {
+            self.dummy_dma(b);
+        }
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
         if self.lazy_bias {
@@ -343,6 +360,9 @@ impl PipeBody for AttnBody3<'_> {
         };
         if self.setprio {
             b.set_prio(1);
+        }
+        if self.dummy == 2 {
+            self.dummy_dma(b);
         }
         self.pv(b, &t.cur, &w);
         if t.staged {
@@ -384,7 +404,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
     vs128_exp("fmha_fwd_hd128_mxfp8_v3_vs128", 0)
 }
 
-/// EXPERIMENT builds (bit 0: epilogue scratch swizzle from query bits 1..3)
+/// EXPERIMENT builds (bit 0: epilogue scratch swizzle from query bits 1..3; bits 1-2: dummy LDS-direct copy, see AttnBody3::dummy)
 pub fn vs128_exp(name: &str, x: u32) -> Function {
     let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
@@ -414,11 +434,16 @@ pub fn vs128_exp(name: &str, x: u32) -> Function {
             }
             body.setprio = true;
             body.biasonce = true;
+            body.dummy = ((x >> 1) & 3) as u8;
+            body.dummy_src = Some((io.k.ptr, 102400));
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             store_out3_lds_s(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin, if x & 1 != 0 { 4 } else { 3 });
         });
     });
+    if x & 6 != 0 {
+        fb.lds(102400 + 16384);
+    }
     let mut f = fb.finish();
     // scheduler: sink every ds_read to at most one MFMA before its first use (one fragment group in flight, the vendor's lgkmcnt(4);
     // sched/ldahead.rs, docs/lgkm-lookahead.md): +0.6 % B1H8S8192, +1.3 % per-CU on realistic data, VGPR 256 -> 248
