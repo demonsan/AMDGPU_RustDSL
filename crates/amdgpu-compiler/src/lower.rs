@@ -385,6 +385,11 @@ impl Lowerer {
         Ok(self.mir)
     }
 
+    /// Is the operand a provably all-zero fragment (`frag_zero`)? An MFMA value form with such a C uses the inline-0 src2 encoding.
+    fn is_zero_frag(&self, o: &Opnd) -> bool {
+        matches!(o, Opnd::Val(v) if matches!(self.defs.get(v), Some(Op::FragZero { .. })))
+    }
+
     fn fresh_label(&mut self) -> u32 {
         let l = self.next_label;
         self.next_label += 1;
@@ -2459,6 +2464,13 @@ impl Lowerer {
             Op::MfmaF16Wide { a, b, c } => {
                 let ra = self.as_v2(*a)?;
                 let rb = self.as_v2(*b)?;
+                if self.is_zero_frag(c) {
+                    // D = A x B: the accumulator is the inline constant 0 (no zero fragment, no copy)
+                    let d = self.new_vreg(RClass::V16);
+                    self.push(MInst::new(MOp::VMfma32x32x8F16Z).def(d).srcreg(ra).srcreg(rb));
+                    self.val.insert(dst, d);
+                    return Ok(());
+                }
                 let rc = self.as_v16(*c)?;
                 let d = self.new_vreg(RClass::V16);
                 self.copy_reg(d, rc)?;
@@ -2542,8 +2554,7 @@ impl Lowerer {
             Op::MfmaFp8_32x32x64 { a, b, c } => {
                 let ra = self.as_v8(*a)?;
                 let rb = self.as_v8(*b)?;
-                let c_is_zero = matches!(c, Opnd::Val(cv) if matches!(self.defs.get(cv), Some(Op::FragZero { ty: DType::Frag16 })));
-                if c_is_zero {
+                if self.is_zero_frag(c) {
                     let d = self.new_vreg(RClass::V16);
                     self.push(MInst::new(MOp::VMfma32x32x64Fp8Z).def(d).srcreg(ra).srcreg(rb));
                     self.val.insert(dst, d);
@@ -2568,10 +2579,7 @@ impl Lowerer {
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 let ra = self.as_v8(*a)?;
                 let rb = self.as_v8(*b)?;
-                let c_is_zero = matches!(
-                    c,
-                    Opnd::Val(cv) if matches!(self.defs.get(cv), Some(Op::FragZero { ty: DType::Frag16 }))
-                );
+                let c_is_zero = self.is_zero_frag(c);
                 let sa = self.as_v1(*scale_a)?;
                 let sb = self.as_v1(*scale_b)?;
                 if c_is_zero {
