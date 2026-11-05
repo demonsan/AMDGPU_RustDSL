@@ -463,6 +463,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
     });
     fb.finish()
 }
+
 /// The 656-byte FMHA kernarg ABI (+ the KV-split extension) with the host contract DERIVED from the tensors' layouts (`contract::compact_tensor` /
 /// `same_strides`: allocation = cosize, compactness relations); the kernarg loads and the runtime tensors are those of `FmhaIo::declare`.
 pub fn declare_io(b: &mut FnBuilder, rows_per_block: i64, kvsplit: bool) -> FmhaIo {
