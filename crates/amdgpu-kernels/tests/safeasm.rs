@@ -413,12 +413,12 @@ fn writing_an_input_port_is_refused() {
 }
 // ---- coverage: which MOps have typed templates ---------------------------------------------------------------------------------------------
 
-/// Prints the coverage matrix used in docs/safe-asm-design.md (`cargo test -p amdgpu-compiler --test safeasm coverage -- --nocapture`) and checks
+/// Prints the coverage matrix used in docs/safe-asm-design.md (`cargo test -p amdgpu-kernels --test safeasm coverage -- --nocapture`) and checks
 /// that every typed template names an op the backend table knows.
 #[test]
 fn coverage_matrix() {
     use amdgpu_safeasm::{HAND_WRITTEN_OPS, TYPED_OPS};
-    let tbl = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/backend/llvm24.tbl")).unwrap();
+    let tbl = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../amdgpu-compiler/src/backend/llvm24.tbl")).unwrap();
     let keys: Vec<String> = tbl
         .lines()
         .filter(|l| !l.starts_with('#') && l.contains('|'))
