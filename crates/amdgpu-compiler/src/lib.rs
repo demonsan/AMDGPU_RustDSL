@@ -176,6 +176,21 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         other => other,
     };
+    // experiment switch (applied ON TOP of the kernel's own scheduler options, i.e. the shipped preset): AMDC_SCHED_ADD=<kernel name substring>:<tokens> (e.g.
+    // `fmha_fwd_hd128_mxfp8_v3_vs128:ldahead=4,ldslack=8`; several entries separated by `;`) appends scheduler tokens to the options the kernel would use anyway
+    let sched_opts = match (std::env::var("AMDC_SCHED_ADD").ok().filter(|v| !v.is_empty()), sched_opts) {
+        (Some(spec), Some(mut o)) => {
+            for ent in spec.split(';') {
+                if let Some((pat, toks)) = ent.split_once(':') {
+                    if pat == "*" || pname.contains(pat) || f.name.contains(pat) {
+                        o.apply_tokens(toks);
+                    }
+                }
+            }
+            Some(o)
+        }
+        (_, so) => so,
+    };
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
         // (pressure cut, hoist distance cap): first shrink the LDS-read hoisting (it lengthens live ranges and fragments
