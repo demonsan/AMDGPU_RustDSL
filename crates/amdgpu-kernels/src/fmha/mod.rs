@@ -73,6 +73,8 @@ pub struct KvRing3 {
     pub mma: TiledMma,
     /// MUBUF form of the K / V DMA (`_vs128`): SGPR per-tile advance, loop-invariant voffsets
     pub buf: Option<(amdgpu_tile::dma::BufForm, amdgpu_tile::dma::BufForm)>,
+    /// MUBUF form of the K-scale DMA
+    pub kd_buf: Option<amdgpu_tile::dma::BufForm>,
 }
 
 impl KvRing3 {
@@ -115,7 +117,7 @@ impl KvRing3 {
             let rt_row = b.bind_i32(lane.tid().lshr(1));
             KdCopy3::Vgpr(amdgpu_tile::rows::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
         };
-        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None }
+        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None, kd_buf: None }
     }
     /// Switches the K / V staging to the buffer form (the vendor's `buffer_load_dwordx4 ... lds` with an SGPR soffset).
     pub fn enable_buffer_dma(&mut self, b: &mut FnBuilder) {
@@ -123,12 +125,21 @@ impl KvRing3 {
         let v = self.vdma.buffer_form(b);
         self.buf = Some((k, v));
     }
+    /// The K-scale DMA in the buffer form too.
+    pub fn enable_buffer_kd(&mut self, b: &mut FnBuilder) {
+        if let KdCopy3::Dma(kd) = &self.kdc {
+            self.kd_buf = Some(kd.buffer_form(b));
+        }
+    }
 
     /// The copies of the tile at `key0` into `slot` that `role` produces (as `KvRing::stage`).
     pub fn stage(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<ValueId> {
         match (role, &self.kdc) {
             (Role::A, KdCopy3::Dma(kd)) => {
-                kd.issue(b, key0, &self.kd.at(slot));
+                match &self.kd_buf {
+                    Some(kb) => kd.issue_buffer(b, kb, key0, &self.kd.at(slot)),
+                    None => kd.issue(b, key0, &self.kd.at(slot)),
+                }
                 match &self.buf {
                     Some((kb, _)) => self.kdma.issue_buffer(b, kb, key0, &self.ks.at(slot)),
                     None => self.kdma.issue(b, key0, &self.ks.at(slot)),
@@ -188,10 +199,11 @@ pub struct AttnBody3<'a> {
     kd_pending: Option<ValueId>,
     /// the vendor's priority ping-pong (`_vs128`): `s_setprio 1` at the start of the MFMA phase, `s_setprio 0` at the softmax phase
     pub setprio: bool,
-    /// the first tile always rebases the reference (the vendor recipe's seed, `OnlineSoftmax::set_vendor_ref`)
-    pub seed_first: bool,
     /// K scales: one shift per scale word + op_sel byte select on the scaled QK MFMA (`_vs128`)
     pub kscale_sel: bool,
+    /// the reference update entirely inside the rollback branch (`OnlineSoftmax::decide_lazy`)
+    pub lazy_bias: bool,
+    bias_next: Option<Opnd>,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -199,11 +211,11 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, kscale_sel: false }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
-    fn qk_block(&self, b: &mut FnBuilder, out: &QkOut, bias: ValueId, k: &LdsSlotPart, kd: &LdsSlotPart, s: usize) -> Option<ValueId> {
+    fn qk_block(&self, b: &mut FnBuilder, out: &QkOut, bias: Opnd, k: &LdsSlotPart, kd: &LdsSlotPart, s: usize) -> Option<ValueId> {
         let blk = self.blk;
         let start = match out {
             QkOut::Vars(t) => {
@@ -236,7 +248,7 @@ impl<'a> AttnBody3<'a> {
             }
         }
     }
-    fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, out: QkOut, bias: ValueId) -> Vec<ValueId> {
+    fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, out: QkOut, bias: Opnd) -> Vec<ValueId> {
         let r = self.ring;
         let k = r.kpart.at(b, &r.ks.at(slot));
         let kd = r.kdpart.at(b, &r.kd.at(slot));
@@ -273,7 +285,7 @@ impl PipeBody for AttnBody3<'_> {
         self.ring.store_constants(b, self.wid, &self.blk.lane, &self.blk.q);
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
-        self.s_init = self.qk(b, &t0.cur, QkOut::Values(self.zero16), self.sm.bias_init);
+        self.s_init = self.qk(b, &t0.cur, QkOut::Values(self.zero16), Opnd::Val(self.sm.bias_init));
     }
     fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
         let [bias, la]: [(DType, Opnd); 2] = self.sm.state().try_into().expect("softmax state");
@@ -295,18 +307,23 @@ impl PipeBody for AttnBody3<'_> {
         }
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
-        let nb = if self.seed_first {
-            let first = b.bind_cond(amdgpu_dsl::ox(t.it).eq(0));
-            self.sm.decide_seeded(b, &s, &o, mask.as_ref(), first)
-        } else {
-            self.sm.decide(b, &s, &o, mask.as_ref())
-        };
+        if self.lazy_bias {
+            // no seed needed: the initial reference (bias words 0x4800: b = 64) puts the first tile's max far above the threshold, so tile 0
+            // always rebases
+            self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref()));
+            self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
+            return;
+        }
+        let nb = self.sm.decide(b, &s, &o, mask.as_ref());
         self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
         self.p.push(nb);
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let mut w = std::mem::take(&mut self.p);
-        let bias = w.pop().expect("bias word");
+        let bias = match self.bias_next.take() {
+            Some(op) => op,
+            None => Opnd::Val(w.pop().expect("bias word")),
+        };
         if self.setprio {
             b.set_prio(1);
         }
@@ -320,7 +337,11 @@ impl PipeBody for AttnBody3<'_> {
         let r = self.ring;
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
-        let nb = self.sm.decide_deferred(b, &s, &o, mask.as_ref());
+        let (nb, lazy) = if self.lazy_bias {
+            (self.sm.decide_lazy(b, &s, &o, mask.as_ref()), true)
+        } else {
+            (Opnd::Val(self.sm.decide_deferred(b, &s, &o, mask.as_ref())), false)
+        };
         let next = t.staged.then(|| (r.kpart.at(b, &r.ks.at(&t.next)), r.kdpart.at(b, &r.kd.at(&t.next))));
         let mut w = Vec::with_capacity(16);
         for i in 0..4usize {
@@ -329,14 +350,19 @@ impl PipeBody for AttnBody3<'_> {
                 self.qk_block(b, &QkOut::Vars(&s), nb, k, kd, i);
             }
         }
-        self.sm.commit_bias(b, nb);
+        if !lazy {
+            if let Opnd::Val(v) = nb {
+                self.sm.commit_bias(b, v);
+            }
+        }
         self.pv(b, &t.cur, &w);
     }
 }
 
-/// `_vs128`: 256-row blocks, two 4-wave groups offset by one phase (`Cadence::TwoPhaseOffset`), MUBUF K / V staging, the vendor's priority ping-pong,
-/// two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe in the long-sequence copy (`OnlineSoftmax::set_vendor_ref`;
-/// the short copy keeps the exact LUT-corrected recipe: with < 9 tiles the lazy recipe's error does not average out) and the LDS-staged epilogue.
+/// `_vs128`: 256-row blocks, two 4-wave groups offset by one phase (`Cadence::TwoPhaseOffset`), MUBUF K / V / K-scale staging, the vendor's
+/// priority ping-pong, two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe with the lazy reference
+/// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
+/// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
     fb.compile_profile(CompileProfile::Vs128);
@@ -346,8 +372,12 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
     let roles = Roles::split(b, &blk.lane, 4);
     let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
     ring.enable_buffer_dma(b);
+    ring.enable_buffer_kd(b);
     let ring = ring;
-    let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
+    pipe.key_unclamped = true;
+    let pipe = pipe;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {
@@ -358,7 +388,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
             body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
             if !lut {
                 body.sm.set_vendor_ref(b);
-                body.seed_first = true;
+                body.lazy_bias = true;
             }
             body.setprio = true;
             pipe.run(b, role, &mut body);
@@ -369,7 +399,8 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
     fb.finish()
 }
 
-/// `_kvsplit`: the `_vs128` structure over a key range per split (two-smfmac row sums), the partial-row epilogue + log-sum-exp.
+/// `_kvsplit`: the `_vs128` structure over a key range per split (two-smfmac row sums, the vendor recipe with the lazy update from 4 tiles of the
+/// whole sequence), the partial-row epilogue + log-sum-exp.
 pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_kvsplit", 512);
     fb.compile_profile(CompileProfile::KvSplit);
@@ -386,6 +417,10 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
             let p = amdgpu_tile::rowsum::plan();
             body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
+            if !lut {
+                body.sm.set_vendor_ref(b);
+                body.lazy_bias = true;
+            }
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             let l = body.sm.l_total(b);
@@ -403,7 +438,8 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h() -> Function {
     fb.finish()
 }
 
-/// `_t128`: 128-row blocks, one 4-wave group, a 3-slot ring with one window per tile (`Cadence::OneWindow`).
+/// `_t128`: 128-row blocks, one 4-wave group, a 3-slot ring with one window per tile (`Cadence::OneWindow`); the vendor recipe with the lazy
+/// update from 4 tiles.
 pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
     let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_t128", 256);
     fb.compile_profile(CompileProfile::T128);
@@ -417,6 +453,10 @@ pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         let mut body = AttnBody3::new(b, &ring, &blk, blk.lane.wave, lut);
+        if !lut {
+            body.sm.set_vendor_ref(b);
+            body.lazy_bias = true;
+        }
         pipe.run(b, Role::All, &mut body);
         let fin = body.out_scale(b);
         store_out3(&io, b, &blk, &body.o.expect("O"), fin);

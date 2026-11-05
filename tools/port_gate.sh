@@ -18,7 +18,9 @@
 #   DET      5 shapes x 3 launches, auto dispatch: bit-identical md5                                                       [= tests/gpu/determinism.sh]
 #   STRESS   repeated launches of split shapes (forced s=4 B1H2S200 SK1337 gqa2, auto B1H8S2048), every launch REF_KERNEL_OK and
 #            all-output worst diff vs vendor <= STRESS_MAXDIFF; the md5 histogram is printed but bit identity is NOT required
-#   PERF     warm protocol (REF_WARMUP=150 REF_ITERS=100), PERF_REPS (5) repetitions, median of the candidate and of the same-run vendor:
+#   PERF     warm protocol (REF_WARMUP=150 REF_ITERS=100), PERF_REPS (5) repetitions, median of the candidate and of the same-run vendor, on
+#            realistic inputs (PERF_DATA, default normal: ref_host REF_DATA=normal - N(0,1) Q/K/V quantised to MXFP8; the harness palette data
+#            (lcg) makes both kernels take the softmax rollback on almost every tile and hides the fast-path cost) - the lcg rows are printed as INFO:
 #              B1H8S2048 auto (KV-split), per-CU 64 blocks (_vs128 forced, B1H8S2048), B4H8S2048 and B1H8S8192 (filled, _vs128), B2H8S2048 (_t128, info)
 #            PASS when (candidate / vendor) >= PERF_TOL (0.97) x the recorded shipped ratio (REC_RATIO); the recorded shipped TF/s are printed.
 #            Code-layout rows (per-CU _vs128, B2H8S2048 _t128): the same over LAYOUT_PADS code shifts, medians of the per-pad ratios.
@@ -159,25 +161,27 @@ fi
 
 # ---------------------------------------------------------------- PERF (same run vs the vendor, median)
 # recorded shipped numbers (Main f2759cd / 0668c54 gate, GPU 5): TF/s and the ratio to the same-run vendor
-declare -A REC=([b1h8s2048]=672 [percu64]=489 [b4h8s2048]=1538 [b1h8s8192]=2142 [b2h8s2048]=1038 [lp_vs128]=490 [lp_t128]=1051)
-declare -A REC_RATIO=([b1h8s2048]=1.25 [percu64]=0.911 [b4h8s2048]=0.915 [b1h8s8192]=0.911 [b2h8s2048]=1.03 [lp_vs128]=0.911 [lp_t128]=1.03)
+PERF_DATA="${PERF_DATA:-normal}"
+# recorded shipped numbers on PERF_DATA=normal (fmha-align gate, GPU 5): TF/s and the ratio to the same-run vendor
+declare -A REC=([b1h8s2048]=691 [percu64]=598 [b4h8s2048]=1648 [b1h8s8192]=2299 [b2h8s2048]=1077 [lp_vs128]=599 [lp_t128]=1072)
+declare -A REC_RATIO=([b1h8s2048]=0.955 [percu64]=0.827 [b4h8s2048]=0.872 [b1h8s8192]=0.939 [b2h8s2048]=0.832 [lp_vs128]=0.828 [lp_t128]=0.824)
 median() { sort -g | awk '{a[NR]=$1} END {if (NR == 0) print "nan"; else if (NR % 2) print a[(NR + 1) / 2]; else print (a[NR / 2] + a[NR / 2 + 1]) / 2}'; }
 ratio_verdict() { awk -v c="$1" -v v="$2" -v r="$3" -v t="$PERF_TOL" 'BEGIN{q = (v > 0) ? c / v : 0; print (q >= t * r) ? "PASS" : "FAIL"}'; }
 if ! skip SKIP_PERF; then
     PERF=("b1h8s2048|1 8 2048 2048 1|auto" "percu64|1 8 2048 2048 1|vs" "b4h8s2048|4 8 2048 2048 1|auto" "b1h8s8192|1 8 8192 8192 1|auto" "b2h8s2048|2 8 2048 2048 1|auto")
-    for spec in "${PERF[@]}"; do
-        IFS='|' read -r key cfg mode <<<"$spec"; set -- $cfg
+    for spec in "${PERF[@]}" "${PERF[@]/%/|lcg}"; do
+        IFS='|' read -r key cfg mode data <<<"$spec"; set -- $cfg; data="${data:-$PERF_DATA}"
         : > "$B/pf_cand"; : > "$B/pf_vend"; path=""
         for rep in $(seq 1 $PERF_REPS); do
-            out=$(run_rh "$B/cand" $mode $1 $2 $3 $4 $5 REF_ROWS=1 REF_WARMUP=150 REF_ITERS=100 REF_SPLIT_ULP=0); echo "== PERF $key rep$rep"$'\n'"$out" >>"$LOG"
+            out=$(run_rh "$B/cand" $mode $1 $2 $3 $4 $5 REF_DATA=$data REF_ROWS=1 REF_WARMUP=150 REF_ITERS=100 REF_SPLIT_ULP=0); echo "== PERF $key $data rep$rep"$'\n'"$out" >>"$LOG"
             tf=$(echo "$out" | awk '/^timing ours total:/ {for (i = 1; i <= NF; i++) if ($i == "TFLOP/s") print $(i-1)} /^timing ours +:/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}' | tail -1)
             vt=$(echo "$out" | awk '/^timing vendor/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}' | head -1)
             echo "${tf:-0}" >> "$B/pf_cand"; echo "${vt:-0}" >> "$B/pf_vend"
             path=$(echo "$out" | sed -nE 's/^\[grid\].*ours \(([^)]*)\).*\[([^;]*);.*/\1 [\2]/p' | head -1)
         done
         mc=$(median < "$B/pf_cand"); mv=$(median < "$B/pf_vend")
-        v=$(ratio_verdict "$mc" "$mv" "${REC_RATIO[$key]}"); [ "$key" = b2h8s2048 ] && v="INFO($v)"
-        row PERF "$key $mode -> $path" "$(printf '%s TF/s (%.3fx vendor %s; runs: %s)' "$mc" "$(awk -v a=$mc -v b=$mv 'BEGIN{print (b > 0) ? a / b : 0}')" "$mv" "$(tr '\n' ' ' < $B/pf_cand)")" "recorded ${REC[$key]} TF/s ${REC_RATIO[$key]}x, tol $PERF_TOL" "$v"
+        v=$(ratio_verdict "$mc" "$mv" "${REC_RATIO[$key]}"); { [ "$key" = b2h8s2048 ] || [ "$data" != "$PERF_DATA" ]; } && v="INFO"
+        row PERF "$key $mode $data -> $path" "$(printf '%s TF/s (%.3fx vendor %s; runs: %s)' "$mc" "$(awk -v a=$mc -v b=$mv 'BEGIN{print (b > 0) ? a / b : 0}')" "$mv" "$(tr '\n' ' ' < $B/pf_cand)")" "recorded ${REC[$key]} TF/s ${REC_RATIO[$key]}x, tol $PERF_TOL" "$v"
     done
     # Code-layout sensitivity (shifting the SAME kernel by 0..14 leading s_nop moves per-CU _vs128 by ~3 %): the per-CU / _t128 measurements are
     # repeated over LAYOUT_PADS code shifts (leading s_nop in the entry block); the median of the per-pad (ours / vendor) ratios is compared.
@@ -188,7 +192,7 @@ if ! skip SKIP_PERF; then
         for pad in ${LAYOUT_PADS-0 1 2 3 4 5 6 7}; do
             awk -v p=$pad 'BEGIN{d=0} {print} /^BB0:$/ && !d {for (i = 0; i < p; i++) print "    s_nop 0"; d=1}' "$B/$kc.s" > "$B/lp.s"
             "$CL" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "$B/lp_cand.co" "$B/lp.s"
-            local out=$(env REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_ROWS=1 REF_WARMUP=150 REF_ITERS=100 REF_CO2="$B/lp_cand.co" REF_KNAME2="$kc" REF_ROWS_PER_BLOCK=$rpb "$RH" "$REF_CO" 2>&1)
+            local out=$(env REF_DATA=$PERF_DATA REF_B=$1 REF_H=$2 REF_S=$3 REF_SK=$4 REF_ROWS=1 REF_WARMUP=150 REF_ITERS=100 REF_CO2="$B/lp_cand.co" REF_KNAME2="$kc" REF_ROWS_PER_BLOCK=$rpb "$RH" "$REF_CO" 2>&1)
             local tf=$(echo "$out" | awk '/^timing ours +:/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}')
             local vt=$(echo "$out" | awk '/^timing vendor/ {for (i = 1; i <= NF; i++) if ($i ~ /^TFLOP\/s/) print $(i-1)}' | head -1)
             echo "${tf:-0}" >> "$B/lp_cand"; awk -v a="${tf:-0}" -v b="${vt:-0}" 'BEGIN{print (b > 0) ? a / b : 0}' >> "$B/lp_ratio"

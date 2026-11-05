@@ -71,7 +71,7 @@ impl OnlineSoftmax {
     /// Overrides the rollback threshold (scaled max units).
     /// The vendor's reference recipe (vendor-spec 4.7, the live scalars of `ref_mxfp8.co`): exp bias / rebase target s91 = 0.24799132
     /// (`0x3e7df17e`), lazy-rollback threshold s92 = 0.26135647 (`0x3e85d086`, 6.84/512 above the target: the reference only moves when a row max
-    /// passes it), conversion scale s89 = 0.25, no LUT correction. The caller seeds the first tile (`decide_seeded`).
+    /// passes it), conversion scale s89 = 0.25, no LUT correction. Use with `decide_lazy` (the initial reference makes the first tile rebase).
     pub fn set_vendor_ref(&mut self, b: &mut FnBuilder) {
         self.set_vendor_ref_lut(b, false)
     }
@@ -103,12 +103,6 @@ impl OnlineSoftmax {
     /// rescaling `s`, `o` and the row sum. Returns the new bias word (the C input of the next tile's bias MFMAs).
     pub fn decide(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> ValueId {
         self.decide_opts(b, s, o, mask, true, None)
-    }
-    /// `decide` with a lazy threshold and a SEED: on the tile where `seed` (a condition value) holds the reference is always rebased to the
-    /// target (the first tile: the initial reference is arbitrary), afterwards only when the max exceeds the threshold (the vendor's lazy
-    /// rollback when the threshold sits above the target).
-    pub fn decide_seeded(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, seed: ValueId) -> ValueId {
-        self.decide_opts(b, s, o, mask, true, Some(seed))
     }
     /// `decide` without writing the bias variable (`write_bias = false`): the caller writes it later with `commit_bias` (`_t128` writes it at the END of
     /// its window; writing it early lengthens the live range of the old word and made the scheduler fall back, 494 -> 410 TFLOP/s).
@@ -234,6 +228,62 @@ impl OnlineSoftmax {
         }
         b.end_if();
         nb
+    }
+
+    /// `decide` with the whole reference update inside the rollback branch (the vendor's fast path): the new two-word reference, the
+    /// shift and the rescale are computed only when some lane's max passes the threshold; otherwise the tile costs the row max, one compare and the
+    /// branch. Returns the bias operand of the next tile (the loop variable, read after the branch).
+    pub fn decide_lazy(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> Opnd {
+        let bias2 = self.bias.expect("OnlineSoftmax: state not bound");
+        let mut flat: Vec<ValueId> = Vec::with_capacity(64);
+        for i in 0..4usize {
+            flat.extend(masked_values(b, s, i, mask, self.neg_big));
+        }
+        let mt = row_max(b, &flat);
+        let grow = b.cmp_lt_f32(self.thr, mt);
+        b.begin_if(Opnd::Val(grow));
+        {
+            let w_old_u = b.frag2_lane(Opnd::Var(bias2), 0);
+            let w_old = b.bitcast_i32(w_old_u);
+            let hi_o = b.let_(Op::CvtF16ToF32(Opnd::Val(w_old)));
+            let lo_s = b.let_(Op::LshrI32(Opnd::Val(w_old), Opnd::Val(self.c16)));
+            let lo_o = b.let_(Op::CvtF16ToF32(Opnd::Val(lo_s)));
+            let c4f = b.c_f32(4.0);
+            let c025 = b.c_f32(0.25);
+            let sum_o = b.add_f32(hi_o, lo_o);
+            let b_old = b.mul_f32(sum_o, c4f);
+            let tt = b.sub_f32(self.b131, mt);
+            let b_new = b.add_f32(b_old, tt);
+            let q = b.mul_f32(b_new, c025);
+            let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q)));
+            let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h_raw)));
+            let r = b.sub_f32(q, hq);
+            let l_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(r)));
+            let lq = b.let_(Op::CvtF16ToF32(Opnd::Val(l_raw)));
+            let sum_q = b.add_f32(hq, lq);
+            let b_q = b.mul_f32(sum_q, c4f);
+            let d_full = b.sub_f32(b_q, b_old);
+            // the branch has no exec mask: lanes whose max did not pass the threshold keep their reference (delta = 0)
+            let delta = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(d_full), b: Opnd::Val(self.zero_f) });
+            let l_sh = b.shl_i32(l_raw, self.c16);
+            let w_q = b.let_(Op::AddI32(Opnd::Val(h_raw), Opnd::Val(l_sh)));
+            let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
+            let nb = b.frag2(w_new, w_new);
+            b.set_var(bias2, nb);
+            let dupd = b.frag2_dup(delta);
+            for a in &s.accs {
+                b.var_add_pk(a.var, dupd);
+            }
+            let ex = b.mul_f32(delta, self.c512);
+            let corr = b.exp2_f32(ex);
+            let cd = b.frag2_dup(corr);
+            for a in &o.accs {
+                b.var_scale_pk(a.var, cd);
+            }
+            self.scale_l(b, corr);
+        }
+        b.end_if();
+        Opnd::Var(bias2)
     }
 
     /// P words of S accumulators `t0..t1` (4 words each; invalid keys contribute 0).

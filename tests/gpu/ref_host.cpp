@@ -203,12 +203,67 @@ int main(int argc, char** argv) {
         for (int s = 0; s < SK; ++s)
             for (int h = 0; h < HK; ++h)
                 for (int blk = 0; blk < 4; ++blk) ks_at(b, s, h, blk) = (unsigned char)(126 + rnd() % 3);
+    // REF_DATA: the input distribution. lcg (default): the 11-value palette above + E8M0 126..128. uniform: every NaN-free e4m3 byte equally
+    // likely (|x| up to 448), E8M0 126..128. normal: N(0,1) Q/K/V as a model would produce them, Q pre-multiplied by log2(e)/sqrt(128) (the
+    // softmax scale; the kernel computes exp2), quantised to MXFP8 per 32-element block (E8M0 = the OCP choice floor(log2 amax) - 8, elements
+    // e4m3 round-to-nearest-even), V per tensor (e4m3 of v / s_v with the f32 V descale s_v = amax / 448).
+    const char* data_mode = std::getenv("REF_DATA") ? std::getenv("REF_DATA") : "lcg";
+    float vdescale = 1.0f;
+    if (std::string(data_mode) != "lcg") {
+        std::vector<float> e4m3_pos;   // the 127 finite non-negative e4m3 values, increasing (byte = index)
+        for (int b8 = 0; b8 < 127; ++b8) e4m3_pos.push_back((float)fp8_e4m3((unsigned char)b8));
+        auto to_e4m3 = [&](float x) -> unsigned char {   // round to nearest, ties to the even byte; saturating
+            const unsigned char sgn = x < 0 ? 0x80 : 0;
+            float a = std::fabs(x);
+            if (!(a < 448.0f)) return sgn | 126;
+            int lo = (int)(std::upper_bound(e4m3_pos.begin(), e4m3_pos.end(), a) - e4m3_pos.begin()) - 1;
+            if (lo < 0) lo = 0;
+            int hi = lo + 1 < 127 ? lo + 1 : lo;
+            const float dl = a - e4m3_pos[lo], dh = e4m3_pos[hi] - a;
+            const int pick = dh < dl ? hi : dl < dh ? lo : (lo % 2 == 0 ? lo : hi);
+            return sgn | (unsigned char)pick;
+        };
+        uint64_t st = 0x9E3779B97F4A7C15ull;
+        auto u64 = [&]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+        auto unif = [&]() { return (double)(u64() >> 11) * (1.0 / 9007199254740992.0); };
+        auto gauss = [&]() { double u1 = unif(), u2 = unif(); if (u1 < 1e-300) u1 = 1e-300; return std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2); };
+        if (std::string(data_mode) == "uniform") {
+            auto rb = [&]() { unsigned char x; do { x = (unsigned char)(u64() >> 56); } while ((x & 0x7F) == 0x7F); return x; };
+            for (auto& x : q) x = rb();
+            for (auto& x : k) x = rb();
+            for (auto& x : v) x = rb();
+        } else if (std::string(data_mode) == "normal") {
+            const double qmul = 1.4426950408889634 / std::sqrt((double)D);
+            auto quant_rows = [&](std::vector<unsigned char>& dst, auto&& scale_at, long nrows, int heads, double mul) {
+                std::vector<double> blk(32);
+                for (long r = 0; r < nrows; ++r)
+                    for (int h = 0; h < heads; ++h)
+                        for (int bk = 0; bk < 4; ++bk) {
+                            double amax = 0;
+                            for (int i = 0; i < 32; ++i) { blk[i] = gauss() * mul; amax = std::max(amax, std::fabs(blk[i])); }
+                            const int e = amax > 0 ? (int)std::floor(std::log2(amax)) - 8 : -127;
+                            const int eb = std::max(0, std::min(254, e + 127));
+                            scale_at(r, h, bk) = (unsigned char)eb;
+                            const double inv = std::ldexp(1.0, -(eb - 127));
+                            for (int i = 0; i < 32; ++i) dst[((size_t)r * heads + h) * D + 32 * bk + i] = to_e4m3((float)(blk[i] * inv));
+                        }
+            };
+            quant_rows(q, [&](long r, int h, int bk) -> unsigned char& { return qs_at((int)(r / S), (int)(r % S), h, bk); }, (long)B * S, H, qmul);
+            quant_rows(k, [&](long r, int h, int bk) -> unsigned char& { return ks_at((int)(r / SK), (int)(r % SK), h, bk); }, (long)B * SK, HK, 1.0);
+            std::vector<double> vv(nk);
+            double vmax = 0;
+            for (auto& x : vv) { x = gauss(); vmax = std::max(vmax, std::fabs(x)); }
+            vdescale = (float)(vmax / 448.0);
+            for (size_t i = 0; i < nk; ++i) v[i] = to_e4m3((float)(vv[i] / vdescale));
+        } else {
+            std::fprintf(stderr, "REF_DATA=%s: expected lcg | uniform | normal\n", data_mode); return 2;
+        }
+    }
     if (std::getenv("REF_SC1")) {
         const int ev = std::atoi(std::getenv("REF_SC1"));
         std::fill(qs.begin(), qs.end(), (unsigned char)(ev > 1 ? ev : 127));
         std::fill(ks.begin(), ks.end(), (unsigned char)(ev > 1 ? ev : 127));
     }
-    float vdescale = 1.0f;
     const size_t no = (size_t)B * S * H * D;
     std::vector<uint16_t> out(no, 0);
 
@@ -346,6 +401,8 @@ int main(int argc, char** argv) {
     const double flops = 4.0 * B * H * (double)S * SK * D;
     auto time_kernel = [&](hipFunction_t f, const char* label, void* outp, int rows, int gx, unsigned block, const char* kname = nullptr) {
         if (iters <= 0) return;
+        // REF_TIME_ONLY=vendor|ours: time only that kernel (e.g. to sample the clock / power of one kernel over a long window)
+        if (const char* only = std::getenv("REF_TIME_ONLY")) { if (std::string(only) != label) return; }
         const bool gen_timed = gen_abi && kname && (gen_name(kname, "v3_vs128") || gen_name(kname, "v3_t128"));
         if (!gen_timed) set_launch(outp, rows);
         hipEvent_t e0, e1;
@@ -525,7 +582,7 @@ int main(int argc, char** argv) {
             launch_split(); launch_comb(); CK(hipDeviceSynchronize());
             CK(hipMemcpy(out2.data(), dout2, no * 2, hipMemcpyDeviceToHost));
             bad2 = check(out2, "our kernel   vs CPU");
-            if (iters > 0) {
+            if (iters > 0 && !(std::getenv("REF_TIME_ONLY") && std::string(std::getenv("REF_TIME_ONLY")) != "ours")) {
                 const double ms_main = timed([&]{ launch_split(); }, iters);
                 launch_split(); launch_comb(); CK(hipDeviceSynchronize());
                 const double ms_comb = timed([&]{ launch_comb(); }, iters);
