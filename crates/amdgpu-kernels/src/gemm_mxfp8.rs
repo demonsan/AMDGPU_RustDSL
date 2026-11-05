@@ -661,11 +661,46 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
     let b_org = b.bind_i32((ev(bx) << lg_n) * ev(k_v));
 
+    // RETAINED SCALAR VALUES: the shipped v4 binary still computes these (the per-tile scale DMA, the panel-DMA / LDS-gather scale path and the
+    // non-dword B scales, all replaced by the VGPR scale path below) - scalar code the lowering does not dead-code-eliminate. They are kept so the
+    // shipped binary stays byte-identical in this cleanup; dropping them is a separate change (md5 change + gemm_gate).
+    let _sc_wave = b.bind_i32(lane.wave() << 9);
+    let _sa_src = b.bind_i32((ev(by) << lg_m) + (lane.lane() << 2));
+    let sa_rd: Vec<ValueId> = (0..wave_m / 16).map(|i| b.bind_i32(ctx.lower(&s_wm.mul_c(wave_m).add_c(16 * i).add(&s_lane.mod_c(16, &ctx.dyns))))).collect();
+    let sb_row = b.bind_i32(((ev(bx) << lg_n) + (ev(wn) * wave_n as i32)).lshr(7));
+    let _sb_src = b.bind_i32(ev(sb_row) * ev(kb_v));
+    let _sa_sh: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32((ev(*r) & 3) << 3)).collect();
+    let _sa_dw: Vec<ValueId> = sa_rd.iter().map(|r| b.bind_i32(ev(*r).lshr(2) << 2)).collect();
+
     // ---- the scale panel (written in the pipeline prologue, `prologue_stores`) ----
     assert!(cta_m == 256 && cta_n == 256, "scale panel: 256 x 256 CTA");
     let sh = panel_sh;
+    let _b_src = b.bind_i32(((ev(bx) << 1) * ev(kb_v)) & -4);
+    let b_delta = b.bind_i32(((ev(bx) << 1) * ev(kb_v)) & 3);
+    let _m0s: Vec<ValueId> = (0..(PANEL_KB / 8) as i32).map(|r| { let v = b.bind_i32((lane.wave() << 9) + (2048 * r + sh.base as i32)); b.read_first_lane(v) }).collect();
+    let _b_off = b.bind_i32((ev(wn) * ev(kb_v)) + ev(b_delta));
+    {
+        let r = b.bind_i32(ev(tid) & 15);
+        let wmq = b.bind_i32((ev(tid).lshr(4)) & 1);
+        let kq = b.bind_i32(ev(tid).lshr(5));
+        let _sh_r = b.bind_i32((ev(r) & 3) << 3);
+        let _rd0 = b.bind_i32((ev(wmq) << 7) + (ev(r).lshr(2) << 2) + (ev(kq) << 8) + sh.base as i32);
+        let _wr0 = b.bind_i32((ev(wmq) << 7) + (ev(r) << 3) + (ev(kq) << 8) + sh.base as i32);
+        let s = b.bind_i32(ev(r) & 3);
+        let _sel_pair = b.bind_i32(ev(s) | ((ev(s) + 4) << 8) | I32::c(0x0c0c_0000));
+        let _sel_merge = b.c_i32(0x0504_0100);
+    }
     // this lane's A offset in the transposed panel: 128 wm + 8 (lane % 16)
     let tr = b.bind_i32((ev(wm) << 7) + ((lane.lane() & 15) << 3));
+    {
+        let _b_dw = b.bind_i32(ev(wn) * (4 * PANEL_KB as i32));
+        let blk = b.bind_i32((ev(tid).lshr(6)) & 1);
+        let kbt = b.bind_i32(ev(tid) & 63);
+        let off = b.bind_i32(ev(blk) * ev(kb_v) + ev(b_delta) + ev(kbt));
+        let _src = b.bind_i32((ev(off).lshr(2) << 2) + (sh.base + PANEL_KB * 256) as i32);
+        let _shv = b.bind_i32((ev(off) & 3) << 3);
+        let _dst = b.bind_i32(((ev(tid) & 127) << 2) + (sh.base + PANEL_KB * 256) as i32);
+    }
     // the VGPR scale path: A by 4 passes of buffer_load_dwordx4 + in-register 4x4 byte transposes (dpp quad_perm + v_perm) + ds_write, B one dword
     sfa_transpose_proof();
     // A: lane g = 64 w + lane (+ 256 p per pass) holds 16 M rows (chunk c = g % 16) of K group g / 16: voffset (K group) M + m_cta + 16 c
