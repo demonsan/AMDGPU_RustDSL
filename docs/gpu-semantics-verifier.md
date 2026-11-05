@@ -92,7 +92,7 @@ v1 只证明“不越界”。v1.1 证明**错误生命周期使用**：读到�
 **协议模拟**：对 kernel 的控制骨架按**波角色**（工作项 id 相关的 `if` 的 then/else 两侧）分别**具体执行**，每个循环展开 1..=4 次（`BreakIf` 条件已知为真则提前退出），以**动态 barrier 序号**（phase）给每个事件编号；slot/version 表达式按循环变量的具体值求值。
 
 * **发布**：一次 `tile_produce` 在其写**完成**（DMA 须 `wait_vm(0)`，DS 写须 `wait_lds(0)`；部分计数不视为完成）之后的**第一个 barrier** 处对其他 wave 发布（可见相位 = 该 barrier 序号 + 1）；同一 wave 自己读则只需完成。
-* **读**（`tile_consume`）必须：(1) 看到**已发布的**最新版本，且版本号 **恰为期望值**（否则 `GV-TILE-STALE`，消息给出看到的版本、生产者角色/语句、发布相位）；(2) 同版本的所有协作生产者（多 wave 各写一部分）都已发布；(3) 其读在下一个 barrier 前**完成**（`wait_lds(0)`），否则 barrier 不能把它与下一个写者隔开（`GV-TILE-PENDING`，Warn）；(4) 其他 wave 对同一槽写**别的版本**的窗口 `[发出相位, 发布相位)` 不得与读窗口 `[读相位, 完成相位]` 重叠（否则 `GV-TILE-RACE`：例如单缓冲被下一轮覆盖、读旧版本时下一版本已落地）。
+* **读**（`tile_consume`）必须：(1) 看到**已发布的**最新版本，且版本号 **恰为期望值**（否则 `GV-TILE-STALE`，消息给出看到的版本、生产者角色/语句、发布相位）；(2) 同版本的所有协作生产者（多 wave 各写一部分）都已发布；(3) 读必须有**收尾等待**（之后第一个 `wait_lds(0)`；带计数的 `wait_lds(n>0)` 不算，因为调度器可重排独立的 DS 读）。读可以**跨 barrier 在途**（厂商的 V 预读：mid barrier 前发出、之后才收尾），其生命周期是 `[发出相位, 收尾等待所在相位]`；只有根本没有收尾等待、后面又有 barrier 时才报 `GV-TILE-PENDING`（Warn）；(4) 其他 wave（含本角色）对同一槽写**别的版本**的窗口 `[发出相位, 发布相位)` 不得与读的生命周期 `[读相位, 收尾相位]` 重叠——在 barrier 之后、收尾等待之前写同一槽即 `GV-TILE-RACE`（攻击测试 `crates/amdgpu-compiler/tests/gpu_tile_inflight.rs`）（否则 `GV-TILE-RACE`：例如单缓冲被下一轮覆盖、读旧版本时下一版本已落地）。
 * **写写**：不同 wave 并发写同一槽**不同版本** → `GV-TILE-RACE`；同一版本（协作填充）允许。
 * **每条 producer→consumer 边在所有角色上都跨 barrier**：由“发布相位 ≤ 读相位”与两侧动态 barrier 计数相等（v1 的 `GV-BAR`）共同保证。
 
@@ -248,7 +248,7 @@ LDS 是块内 8 个 wave 共享的地址空间，硬件**不做任何边界或�
   * `GV-TILE-STALE`：读到未发布/版本不匹配的数据（生产者必须在 barrier 后才算发布；DMA 要 `wait_vm(0)`，
     DS 写要 `wait_lds(0)`）；
   * `GV-TILE-RACE`：读窗口内另一个 wave 写了不同版本（单缓冲被下一轮覆盖 = 典型竞态）；
-  * `GV-TILE-PENDING`：读未完成就进入下一个 barrier；
+  * `GV-TILE-PENDING`：读没有任何收尾的 `wait_lds(0)` 却跨过了下一个 barrier（有收尾等待的跨 barrier 读按生命周期做竞争检查）；
   * `GV-TILE-OVERLAP` / `GV-TILE-ESCAPE` / `GV-TILE-INDEX` / `GV-TILE-UNROLL-LIMIT`；
   * **私有区**（`lds_private`）：每 wave 一段，读只能读自己那段（`GV-TILE-PRIVATE-ESCAPE` 拒绝读别人/非线性地址），
     生命周期按"自己 produce + 自己 wait"判定，不需要别的 wave 发布；
