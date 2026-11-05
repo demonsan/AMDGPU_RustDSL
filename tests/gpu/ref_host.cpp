@@ -222,6 +222,11 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(dqs, qs.data(), qs.size(), hipMemcpyHostToDevice));
     CK(hipMemcpy(dks, ks.data(), ks.size(), hipMemcpyHostToDevice));
     CK(hipMemcpy(dvs, &vdescale, 4, hipMemcpyHostToDevice));
+    // REF_INPUT_DUMP=<prefix>: the device inputs as raw bytes (<prefix>.q / .k / .v / .qs / .ks, descales with their slack) - replayed by the Python JIT test
+    if (const char* ip = std::getenv("REF_INPUT_DUMP")) {
+        auto dump = [&](const char* ext, const std::vector<unsigned char>& x) { FILE* fp = std::fopen((std::string(ip) + ext).c_str(), "wb"); if (fp) { std::fwrite(x.data(), 1, x.size(), fp); std::fclose(fp); } };
+        dump(".q", q); dump(".k", k); dump(".v", v); dump(".qs", qs); dump(".ks", ks);
+    }
     CK(hipMemset(dout, 0, no * 2));
 
     alignas(8) unsigned char args[720];   // 656-byte base ABI + KV-split fields at 0x270/0x278/0x280

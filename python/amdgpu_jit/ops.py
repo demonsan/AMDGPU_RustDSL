@@ -1,0 +1,152 @@
+"""High-level ops: the MXFP8 blockscale GEMM and the MXFP8 FMHA forward (head dim 128), with the shipped path selection.
+
+Both ops take device tensors (torch tensors, ``__dlpack__`` objects, ``DeviceBuffer`` or ``RawPtr``), validate shapes / element sizes /
+alignment, specialize the kernel for the call's shape by default (``specialize=False``: the generic kernel), check the launch against the
+kernel's verified host contract and launch on the given stream (default: torch's current stream when torch tensors are passed, else 0).
+"""
+import math
+
+from . import _hip
+from ._compile import get_kernel
+from ._tensor import as_ref, current_stream, expect
+
+GEMM_KERNEL = "gemm_mxfp8_bs_v4"
+FMHA_VS128 = "fmha_fwd_hd128_mxfp8_v3_vs128"
+FMHA_T128 = "fmha_fwd_hd128_mxfp8_v3_t128"
+FMHA_KVSPLIT = "fmha_fwd_hd128_mxfp8_v3_kvsplit"
+FMHA_COMBINE = "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h"
+D = 128
+
+
+# ----------------------------------------------------------------------------------------------------------------------------- GEMM
+def gemm_mxfp8_blockscale(a, b, sa, sb, out, *, specialize=True, stream=None, check=True):
+    """``out[m, n] (bf16) = sum_k a[m, k] 2^(sa[k/128][m] - 127) * b[n, k] 2^(sb[n/128][k/128] - 127)``.
+
+    a   [M, K]           fp8 e4m3 (1-byte elements), row-major
+    b   [N, K]           fp8 e4m3, preshuffled with aiter ``shuffle_weight(layout=(16, 16))``
+    sa  [K/128, M]       E8M0 bytes (the column-major view of the 1x128 activation scales)
+    sb  [N/128, K/128]   E8M0 bytes
+    out [M, N]           bf16 (2-byte elements)
+    M, N multiples of 256, K a multiple of 128, K <= 8192. Returns the kernel used.
+    """
+    ra, rb, rsa, rsb, ro = (as_ref(x) for x in (a, b, sa, sb, out))
+    M, K = ra.shape
+    N = rb.shape[0]
+    if M % 256 or N % 256 or K % 128:
+        raise ValueError(f"gemm_mxfp8_blockscale: M, N must be multiples of 256 and K of 128 (got {M}x{N}x{K})")
+    KB = K // 128
+    expect(ra, "a", (M, K), 1)
+    expect(rb, "b", (N, K), 1)
+    expect(rsa, "sa", (KB, M), 1, align=4)
+    expect(rsb, "sb", (N // 128, KB), 1, align=4)
+    expect(ro, "out", (M, N), 2)
+    spec = {"m": M, "n": N, "k": K} if specialize else None
+    kern = get_kernel(GEMM_KERNEL, spec)
+    vals = {"ptr_a": ra.ptr, "ptr_b": rb.ptr, "ptr_c": ro.ptr, "m": M, "n": N, "k": K, "batch": 1, "stride_a": K, "stride_b": K, "stride_c": N,
+            "stride_a_batch": M * K, "stride_b_batch": N * K, "stride_c_batch": M * N, "ptr_sfa": rsa.ptr, "ptr_sfb": rsb.ptr, "stride_sfa": M,
+            "stride_sfb": KB, "stride_sfa_batch": M * KB, "stride_sfb_batch": (N // 128) * KB}
+    grid = (N // 256, M // 256, 1)
+    syms = {"MT": M // 256, "NT": N // 256, "KT": KB}
+    sizes = {"ptr_a": ra.cap, "ptr_b": rb.cap, "ptr_c": ro.cap, "ptr_sfa": rsa.cap, "ptr_sfb": rsb.cap}
+    kern.launch(_present(kern, vals), grid, syms, sizes, current_stream([ra, rb, rsa, rsb, ro], stream), check)
+    return kern
+
+
+def _present(kern, vals):
+    """Drops values of arguments the kernel does not declare (none for the shipped kernels; keeps ops robust to ABI-tail differences)."""
+    return {k: v for k, v in vals.items() if k in kern.info.by_name}
+
+
+# ----------------------------------------------------------------------------------------------------------------------------- FMHA
+def select_path(B, H, S, SK, *, cus=256, partial_bytes=2):
+    """The shipped dispatch (tests/gpu/ref_host.cpp): the best KV split s in {2, 4} that passes the guard (N256 <= 128, N256 s <= 256, every split
+    owns a tile, modelled T_kv < 0.95 T_current), else ``t128`` when 2 ceil(S/256) H B <= 256, else ``vs128``. Returns (path, splits)."""
+    blocks256 = math.ceil(S / 256) * H * B
+    F = 4.0 * B * H * S * SK * D
+    rows_total = B * S * H
+    t_cur = F / (5.96e12 * min(cus, 2.0 * blocks256 if blocks256 <= 128 else blocks256)) + 7.48e-6
+    best, best_t = 0, 1e9
+    ntiles = (SK + 127) // 128
+    for s in (2, 4):
+        part_b = s * rows_total * D * partial_bytes + s * rows_total * 4
+        comb_b = part_b + rows_total * D * 2
+        t_kv = F / (7.38e12 * min(cus, blocks256 * s)) + 6.80e-6 + part_b / 4.0e12 + max(3.0e-6, comb_b / 4.2e12) + 1.0e-6
+        tps = (ntiles + s - 1) // s
+        tiles_ok = tps >= 1 and (s - 1) * tps < ntiles
+        guard = blocks256 <= 128 and blocks256 * s <= cus and tiles_ok and t_kv < 0.95 * t_cur
+        if guard and t_kv < best_t:
+            best, best_t = s, t_kv
+    if best:
+        return "kvsplit", best
+    return ("t128" if blocks256 <= 128 else "vs128"), 0
+
+
+_workspace = {}
+
+
+def _ws(key, nbytes):
+    """Persistent device workspace (KV-split partials), grown on demand."""
+    buf = _workspace.get(key)
+    if buf is None or buf[1] < nbytes:
+        if buf is not None:
+            _hip.free(buf[0])
+        buf = _workspace[key] = (_hip.malloc(nbytes), nbytes)
+    return buf[0]
+
+
+def fmha_fwd_mxfp8(q, k, v, q_scale, k_scale, v_scale, out, *, path="auto", splits=None, specialize=True, stream=None, check=True):
+    """MXFP8 attention forward, head dim 128 (``out = softmax(q k^T) v`` in base 2 with the E8M0 1x32 scales; the vendor kernel ABI).
+
+    q        [B, S, H, 128]   fp8 e4m3          k, v [B, SK, HK, 128] fp8 e4m3 (H = gqa HK, gqa a power of two <= 16)
+    q_scale  [B, S, H, 4]     E8M0 bytes        k_scale [B, SK, HK, 4] E8M0 bytes; both need the zeroed slack tail the kernel contract
+                                                 states (512 H 4 / 640 H 4 bytes behind the tensor: allocate it and pass a view)
+    v_scale  f32 V descale (a buffer of at least 4096 bytes)
+    out      [B, S, H, 128]   bf16
+    path: "auto" (the shipped dispatch, ``select_path``) | "vs128" | "t128" | "kvsplit" (``splits`` in {2, 4, 8}). Returns (path, splits).
+    """
+    rq, rk, rv, rqs, rks, rvs, ro = (as_ref(x) for x in (q, k, v, q_scale, k_scale, v_scale, out))
+    B, S, H, d = rq.shape
+    _, SK, HK, _ = rk.shape
+    if d != D or rk.shape[3] != D or H % HK or (H // HK) & (H // HK - 1) or H // HK > 16:
+        raise ValueError(f"fmha_fwd_mxfp8: head dim must be 128 and H a power-of-two multiple (<= 16) of HK (q {rq.shape}, k {rk.shape})")
+    gqa = H // HK
+    expect(rq, "q", (B, S, H, D), 1)
+    expect(rk, "k", (B, SK, HK, D), 1)
+    expect(rv, "v", (B, SK, HK, D), 1)
+    expect(rqs, "q_scale", (B, S, H, 4), 1, align=4)
+    expect(rks, "k_scale", (B, SK, HK, 4), 1, align=4)
+    expect(ro, "out", (B, S, H, D), 2)
+    if rvs.cap < 4:
+        raise ValueError("v_scale: needs at least one f32")
+    if path == "auto":
+        path, splits = select_path(B, H, S, SK)
+    elif path == "kvsplit":
+        splits = splits or 4
+    st = current_stream([rq, rk, rv, rqs, rks, rvs, ro], stream)
+    base = {"ptr_o": ro.ptr, "ptr_q": rq.ptr, "ptr_k": rk.ptr, "ptr_v": rv.ptr, "s_seq_len": S, "s_Seqs": H * D, "s_Hs": D, "s_Bs": S * H * D,
+            "s_gqa": gqa, "s_k_Seqs": HK * D, "s_k_Hs": D, "s_k_Bs": SK * HK * D, "s_kv_seq_len": SK, "s_q_head_num": H, "s_v_Seqs": HK * D,
+            "s_v_Hs": D, "s_v_Bs": SK * HK * D, "s_o_Seqs": H * D * 2, "s_o_Hs": D * 2, "s_o_Bs": S * H * D * 2, "ptr_q_descale": rqs.ptr,
+            "ptr_k_descale": rks.ptr, "ptr_v_descale": rvs.ptr, "s_descale_q_Bs": S * H * 4, "s_descale_q_Hs": 4, "s_descale_k_Bs": SK * HK * 4,
+            "s_descale_k_Hs": 4}
+    sizes = {"ptr_o": ro.cap, "ptr_q": rq.cap, "ptr_k": rk.cap, "ptr_v": rv.cap, "ptr_q_descale": rqs.cap, "ptr_k_descale": rks.cap, "ptr_v_descale": rvs.cap}
+    syms = {"HK": HK, "B": B}
+    shape_spec = {"s_seq_len": S, "s_kv_seq_len": SK, "s_q_head_num": H, "s_gqa": gqa}
+    if path in ("vs128", "t128"):
+        rows = 256 if path == "vs128" else 128
+        kern = get_kernel(FMHA_VS128 if path == "vs128" else FMHA_T128, shape_spec if specialize else None)
+        kern.launch(_present(kern, base), (math.ceil(S / rows), H, B), syms, sizes, st, check)
+        return path, 0
+    if path != "kvsplit" or splits not in (2, 4, 8):
+        raise ValueError(f"fmha_fwd_mxfp8: unknown path {path!r} / splits {splits}")
+    rows_total = B * S * H
+    ohat = _ws(("ohat", st), splits * rows_total * D * 4)
+    lse = _ws(("lse", st), splits * rows_total * 4)
+    kern = get_kernel(FMHA_KVSPLIT, dict(shape_spec, kvs_splits=splits) if specialize else None)
+    vals = dict(base, ptr_ohat=ohat, ptr_lse=lse, kvs_splits=splits, kvs_rows_total=rows_total)
+    sizes2 = dict(sizes, ptr_ohat=splits * rows_total * D * 4, ptr_lse=splits * rows_total * 4)
+    kern.launch(_present(kern, vals), (math.ceil(S / 256), H, B * splits), syms, sizes2, st, check)
+    comb = get_kernel(FMHA_COMBINE, {"rows_total": rows_total, "splits": splits} if specialize else None)
+    cvals = {"ptr_ohat": ohat, "ptr_lse": lse, "ptr_out": ro.ptr, "rows_total": rows_total, "d": D, "splits": splits}
+    cgrid = max(1, math.ceil(rows_total * D / (256 * 8)))
+    comb.launch(_present(comb, cvals), (cgrid, 1, 1), {}, {"ptr_ohat": sizes2["ptr_ohat"], "ptr_lse": sizes2["ptr_lse"], "ptr_out": ro.cap}, st, check)
+    return path, splits

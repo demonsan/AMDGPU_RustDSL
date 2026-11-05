@@ -85,6 +85,11 @@ int main() {
     CK(hipMemcpy(dB, Bsh.data(), Bsh.size(), hipMemcpyHostToDevice));
     CK(hipMemcpy(dSa, sa.data(), sa.size(), hipMemcpyHostToDevice));
     CK(hipMemcpy(dSb, sb.data(), sb.size(), hipMemcpyHostToDevice));
+    // INPUT_DUMP=<prefix>: the device inputs as raw bytes (<prefix>.a / .b (preshuffled) / .sa / .sb) - the Python JIT test replays them
+    if (const char* ip = std::getenv("INPUT_DUMP")) {
+        auto dump = [&](const char* ext, const std::vector<unsigned char>& v) { FILE* fp = std::fopen((std::string(ip) + ext).c_str(), "wb"); if (fp) { std::fwrite(v.data(), 1, v.size(), fp); std::fclose(fp); } };
+        dump(".a", A); dump(".b", Bsh); dump(".sa", sa); dump(".sb", sb);
+    }
     Kargs ka{};
     ka.ptr_a = dA; ka.ptr_b = dB; ka.ptr_c = dC; ka.m = M; ka.n = N; ka.k = K; ka.batch = 1;
     ka.stride_a = K; ka.stride_b = K; ka.stride_c = N;

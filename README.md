@@ -66,6 +66,10 @@ HIP_VISIBLE_DEVICES=4 bash tools/perf_matrix.sh                         # FMHA 2
 
 # 文档链接检查
 python tools/check_doc_links.py
+
+# Python JIT（纯标准库，subprocess 调 amdc + ROCm clang，磁盘缓存，默认按形状特化；docs/python-jit.md）
+python3 -c "import sys; sys.path.insert(0, 'python'); import amdgpu_jit as aj; help(aj.gemm_mxfp8_blockscale)"
+HIP_VISIBLE_DEVICES=5 AMDGPU_JIT_AMDC=target/release/amdc python3 python/tests/node_check.py   # 与 C++ harness 逐位一致、缓存、开销、特化 vs 通用
 ```
 
 **LLVM pin**：ROCm 10.1.0（AMD LLVM 24.0.0git，方言 `llvm24`）。ROCm 10 不自带 `llc`，用
@@ -87,6 +91,7 @@ crates/amdgpu-compiler  编译器 + 验证器：MIR（算子属性表）、lower
 crates/amdgpu-safeasm   手写热点窗口用的 safe Rust asm DSL（typed 寄存器 + 所有权 token + 验证器 + pin）
 crates/amdc             CLI（emit / check / list / dump / backend / simmodel / probe / gpu-verify / gen-host / print-ir）+ hostgen 库
 tests/gpu/              端到端：ref_host（我们 vs 厂商 vs CPU）、run_ref、determinism、split 压力、gemm_ref_host、mlp_host、探针 host、生成的主机 ABI（generated/）
+python/amdgpu_jit/       Python JIT 入口（ctypes + libamdhip64；gemm_mxfp8_blockscale / fmha_fwd_mxfp8；磁盘缓存；kernarg 打包 + 主机合同校验）
 tools/                  门禁（port_gate / gemm_gate）、性能矩阵、A/B、ATT/计数器/时间戳分析、asm 对比、探针、LLVM 构建、容器 cargo、文档链接检查
 docs/                   当前状态、设计、教程、验证器、厂商 spec；历史文档在 docs/archive/
 ```
@@ -95,6 +100,7 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 
 | 文档 | 内容 |
 |---|---|
+| [`docs/python-jit.md`](docs/python-jit.md) | **Python JIT 入口**：amdc 子进程编译 + 磁盘缓存 + 形状特化（默认开）、kernarg 打包与主机合同校验、GEMM / FMHA 高层算子（含出厂路径选择） |
 | [`docs/current-status.md`](docs/current-status.md) | **权威当前快照**（架构、DSL、kernel、数字、证书、已关闭方向、复现命令） |
 | [`docs/design.md`](docs/design.md) | Rust DSL 与自研 compiler 设计规格 |
 | [`docs/op-attributes.md`](docs/op-attributes.md) | **算子属性表**：每个 MOp 的效果/hazard/调度代价/AGPR/后端等属性单一来源（穷尽 match），各 pass 查表而非枚举算子 |
