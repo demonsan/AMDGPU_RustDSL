@@ -72,6 +72,13 @@ hurting the M phase") does not hold for our M phase as it is today.**
   order (QK block order); with the copy landing concurrently, the order matters. Test: prototype 3 + the vendor's QK read order.
 * Q in VGPRs (vendor) vs LDS (ours) does not matter in the loop (Q is read once).
 
-If the padded-slot prototype makes "K at the end of / inside the M phase" non-negative, the full vendor stream (K 2 slots distance 2,
-V 3 slots distance 2, both inside the QK window) is the build; if not, the vmcnt part of the gap stays and the next lever is a
-shorter DMA latency (fewer, larger copies) rather than an earlier issue.
+**Result of the padded-slot test** (vendor pitch 0x4100 for our K / V slots, same run 7×, normal): padding alone is neutral
+(B4 1722 → 1715, S8192 2390 → 2391, per-CU 636.5 → 636.1) and does not rescue the vendor K schedule (padded + K at the end of the M
+phase: 1682 / 2327 / 625, −2.4 / −2.6 / −1.7 %). Bank aliasing between the copy and the M-phase reads is therefore not the cause.
+
+**Conclusion.** On our M phase, every schedule that lets a copy land during an M phase loses more than it gains, including the
+vendor's exact K schedule. Building the full vendor stream (per-buffer rings, V 3 slots, copies inside the QK window) is not justified
+by these prototypes. The `vmcnt` part of the gap remains; the levers left are (1) a shorter copy latency per tile (issue order /
+grouping of the 5 copies of group A), (2) more VALU-phase time for the copy to land (move work from the M phase into the VALU phase),
+and (3) finding out why our M phase is more sensitive to concurrent LDS writes than the vendor's (per-phase LDS counters, ours vs
+vendor).
