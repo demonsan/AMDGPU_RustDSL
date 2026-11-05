@@ -15,9 +15,12 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - **出厂 FMHA = v3 布局层 kernel**：默认路径 `fmha_fwd_hd128_mxfp8_auto`（主机侧按形状选择）由
   `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}` 组成（`crates/amdgpu-kernels/src/fmha/`）。每个地址、DMA、epilogue 与
   KV-split 暂存都由 `amdgpu-layout` 的布局推导，`amdgpu-isa` 的 atom 描述指令，`amdgpu-tile` 的组件生成 IR；主机合同由张量布局导出。
-  asm md5（`--backend own`）：`_vs128` `763142f9`、`_t128` `91b26e5d`、`_kvsplit` `e1fe92a4`、`_kvsplit_combine8h` `24a95a51`。
-- **FMHA 性能**（v7.0 `port_gate`，§4.6）：B1H8S2048 默认路径（KV-split）**685.9 TF/s（1.27× 厂商）**；`_t128` B2H8S2048 **1067.4（1.05×）**；
-  铺满网格 B4H8S2048 **1543.9（0.918×）** / B1H8S8192 **2206.4（0.921×）**；`_vs128` 每 CU 64 blocks **493.1（0.917×）**。
+  asm md5（`--backend own`）：`_vs128` `8938adfa`、`_t128` `d7e02b0f`、`_kvsplit` `41f151fc`、`_kvsplit_combine8h` `24a95a51`（Main `c4d59df8`）。
+- **FMHA 性能（真实数据，`REF_DATA=normal`，2026-11-06，GPU 5）**：`port_gate`：B1H8S2048 默认路径（KV-split）**742 TF/s（1.03× 厂商）**；
+  铺满网格 B4H8S2048 **1723（0.904×）** / B1H8S8192 **2414（0.988×）**；`_vs128` 每 CU 64 blocks **648（0.894×）**；`_t128` B2H8S2048 layout 中位数 **1110（0.862×）**。
+  25 形状矩阵（[`perf-matrix.md`](perf-matrix.md)）：0.897–1.100×，几何平均 **0.980**。调色板数据（`REF_DATA=lcg`，旧口径）下 softmax 几乎每 tile 回滚、掩盖了
+  快速路径成本，旧的 0.92× 口径偏乐观；这一轮的改进（懒更新、≥ 4 tile 用厂商配方、真实数据分派、bias 单次 MFMA 且无零片段拷贝、`ldsink` / `wsink`）
+  与否定结果（copy 路径、3 槽环、厂商 copy 形态、重平衡）见 [`fmha-vendor-stream-design.md`](fmha-vendor-stream-design.md) 与 [`lgkm-lookahead.md`](lgkm-lookahead.md)。
 - **MXFP8 blockscale GEMM**：`gemm_mxfp8_bs_v4`（`crates/amdgpu-kernels/src/gemm/`）对照 aiter PR #6696 4-wave pin-AGPR，4096×4096×8192：
   **0.988–0.994×** 厂商（`tools/gemm_gate.sh` PASS，§4.7）；asm md5 `14df28e4`。
 - **融合 MLP**：`mlp_fp8_ws_{fused,g1,g2}`（`crates/amdgpu-kernels/src/mlp/`），布局层 P 交接证明见 [`fusion-layout-handoff.md`](fusion-layout-handoff.md)。
