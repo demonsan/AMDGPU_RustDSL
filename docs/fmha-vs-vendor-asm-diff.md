@@ -199,8 +199,8 @@ barrier 后 wait(vmcnt0, lgkm0) → MFMA×3–5 → 16×DMA 均匀穿插在 MFMA
 | 3 | 地址 / 常量 VALU：`v_mov` 24 vs 1、`v_add_u32` 21 vs 3、cmp / cndmask 等 | 约 45 条/tile，ATT 约 250 周期 | LICM（backend）**已关，负**（−3…−8%，保持活跃的代价更大）；MUBUF DMA 和每 tile 一次 readfirstlane **已做**；ring 地址全部移到 SALU（厂商 99 SGPR 的做法）**未做** |
 | 4 | LDS 读等待：每 tile 等到 0 的次数 6 vs 1，PV 读没有领先一组 | ATT `s_waitcnt` 171 vs 95 周期 | `pvpipe` / `qkfirst`（第 52 轮）**已关，负**（−0.5…−5%）；按厂商形状（V 读跨 barrier 提前、PV 领先一组）**未在当前结构上重测** |
 | 5 | DMA 位置：集中在 softmax 相位开头 vs 分散在 QK MFMA 之间 | 未单独测 | **未做**；slotfill（sched）在 vs128 上无改动 |
-| 6 | `s_nop` 等待状态 31 vs 2 | ATT 94 vs 38 周期 | edgepad（−0.7…−1.5%，vs128）**已关**；M0 冒险由 SALU 计算 M0 来规避（厂商做法）**未做** |
-| 7 | K scale 抽字：每 S tile 用 VALU 抽字（12 VGPR）vs `op_sel` 选字节（6 VGPR） | 约 4 VALU/tile + 6 VGPR | **未做**（需要 DSL 支持 scaled MFMA 的 `op_sel` 字节选择；GEMM 已用 `b_scale_dword`） |
+| 6 | `s_nop` 等待状态 31 vs 2 | ATT 94 vs 38 周期 | 归因（`tools/nop_attrib.py`，`_vs128` 稳态循环 31 态）：循环尾 15（MFMA 结果跨回边，需调度把 MFMA 前移）、MFMA→`ds_read_b128` 11（寄存器复用：ds_read 写入仍在飞的 MFMA 正在读的物理寄存器，`pad_physical_war`）、M0 写→LDS-DMA 5。新增 `FMHA_OPT=m0reuse`（GEMM 的 M0 复用）+ `m0hoist`（M0 写上移到独立指令之前，免 `s_nop 0`）：`_vs128` 31→28、`_t128` 10→2 态；port_gate 全过但性能中性（layout-median −0.1% / −0.2%，KV-split +2.8%）→ **保持 opt-in** |
+| 7 | K scale 抽字：每 S tile 用 VALU 抽字（12 VGPR）vs `op_sel` 选字节（6 VGPR） | 约 4 VALU/tile + 6 VGPR | **编译器已支持**：`var_mfma_scale_sel(var, a, b, sa, sb, byte_a, byte_b)` / tile `gemm(.., byte_a, byte_b)` 对 32x32x64 生成 `op_sel/op_sel_hi`（own + LLVM 两个尾端；硬件探针 `tools/mfma_opsel_probe.sh` 两个尾端均 64/256/16/1024 精确）；内核侧改用待 kernel-opt |
 | 8 | P 寄存器复用 S（厂商）vs P 单独 16 VGPR（我们） | 16 VGPR | **未做**（寄存器压力并非当前瓶颈：252 vs 246） |
 | 9 | LDS 102400 vs 84224 B | 每 CU 只驻留 1 个 block，不影响占用 | 信息 |
 | 10 | 尾声 | 已对齐（8 × 16 B 行存储） | **已做**（+3.9%） |

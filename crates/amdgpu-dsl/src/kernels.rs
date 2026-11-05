@@ -22923,6 +22923,7 @@ pub fn probe_stamp() -> Function {
     b.finish()
 }
 
+<<<<<<< HEAD
 /// Generic one-hot probe of `v_smfmac_f32_16x16x128_fp8_fp8` (docs/isa-probes-smfmac-tr.md): probe `bx` (one 64-lane wave per block) loads lane `l`'s A (4 dwords at
 /// `a_in[(64 bx + l) * 16]`), B (8 dwords at `b_in[(64 bx + l) * 32]`) and SRC2 index dword (`i_in[(64 bx + l) * 4]`) straight from global memory, issues ONE
 /// smfmac with a zero accumulator and stores D (4 dwords per lane) to `d_out[(64 bx + l) * 16]`. The host chooses every register bit.
@@ -23014,6 +23015,36 @@ pub fn probe_lds_tr_b8_gen() -> Function {
         let lane = b.frag16_lane(r, i);
         let v = b.bitcast_f32(lane);
         b.store_f32(dp, 4 * i as u32, v);
+=======
+/// Scale byte select of `v_mfma_scale_f32_32x32x64_f8f6f4` (op_sel / op_sel_hi, see tools/mfma_opsel_probe.sh): A = B = ones (fp8 1.0), scale words with four
+/// different E8M0 bytes, one in-place MFMA per (byte_a, byte_b): out[64 k + tid] = 64 * 2^(ea - 127) * 2^(eb - 127) for the selected bytes.
+pub fn probe_mfma_scale_opsel() -> Function {
+    let mut b = FnBuilder::new("probe_mfma_scale_opsel", 64);
+    b.arg("outp", DType::Ptr, 0, 8);
+    let outp = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let c4 = b.c_i32(4);
+    let zero = b.c_i32(0);
+    let one = b.c_i32(1);
+    let ones = b.c_i32(0x3838_3838);
+    let a8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let b8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    // scale A bytes [127, 128, 129, 126], scale B bytes [127, 126, 128, 129]
+    let sa = b.c_i32(0x7E81_807Fu32 as i32);
+    let sb = b.c_i32(0x8180_7E7Fu32 as i32);
+    let off = b.mul_i32(tid, c4);
+    for (k, (ba, bb)) in [(0u8, 0u8), (1, 2), (3, 1), (2, 3)].into_iter().enumerate() {
+        let z = b.frag_zero(DType::Frag16);
+        let vars = b.begin_loop(&[(DType::Frag16, Opnd::Val(z))]);
+        b.var_mfma_scale_sel(vars[0], a8, b8, sa, sb, ba, bb);
+        let stop = b.cmp_lt_i32(zero, one);
+        b.break_if(Opnd::Val(stop));
+        b.end_loop();
+        let r = b.frag16_lane(Opnd::Var(vars[0]), 0);
+        let fr = b.bitcast_f32(r);
+        let po = b.ptr_add(outp, off);
+        b.store_f32(po, 256 * k as u32, fr);
+>>>>>>> origin/fmha-cg2
     }
     b.finish()
 }

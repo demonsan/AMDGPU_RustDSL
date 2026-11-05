@@ -1654,6 +1654,45 @@ impl Lowerer {
                         self.push(MInst::new(MOp::VMulF32).def(a).srcreg(a).srcreg(s));
                     }
                 }
+                Stmt::VarSetLane { var, index, value } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let a = self.sub_alias(v, *index, RClass::V1);
+                    // the producer writes the variable's dword directly when the value has no other use and was computed in this block
+                    let mut done = false;
+                    if let Opnd::Val(x) = value {
+                        let is_const = matches!(self.defs.get(x), Some(Op::ConstI32(_) | Op::ConstF32(_)));
+                        if let (false, Some(1), Some(&r)) = (is_const, self.use_counts.get(x).copied(), self.val.get(x)) {
+                            let cur = self.cur;
+                            let plain = self.mir.vreg_class(r) == RClass::V1 && !self.mir.alias.contains_key(&r) && !self.mir.alias.values().any(|(t, _)| *t == r);
+                            let def_here = self.mir.blocks[cur].insts.iter().any(|i| i.dst == Some(r))
+                                && self.mir.blocks[cur].insts.iter().filter(|i| i.dst == Some(r)).all(|i| { let at = crate::op_attrs::attrs(i.op); at.mem.is_none() && !at.smem })
+                                && !self.consts.values().any(|q| *q == r)
+                                && !self.converted.values().any(|q| *q == r);
+                            let elsewhere = self.mir.blocks.iter().enumerate().any(|(bi, b)| bi != cur && b.insts.iter().any(|i| i.dst == Some(r) || i.srcs.iter().any(|s| matches!(s, Src::Reg(q) if *q == r))));
+                            if plain && def_here && !elsewhere {
+                                for i in self.mir.blocks[cur].insts.iter_mut() {
+                                    if i.dst == Some(r) {
+                                        i.dst = Some(a);
+                                    }
+                                    for s in i.srcs.iter_mut() {
+                                        if let Src::Reg(q) = s {
+                                            if *q == r {
+                                                *q = a;
+                                            }
+                                        }
+                                    }
+                                }
+                                self.touch(&[Src::Reg(v)]);
+                                done = true;
+                            }
+                        }
+                    }
+                    if !done {
+                        let s = self.as_v1(*value)?;
+                        self.touch(&[Src::Reg(v), Src::Reg(s)]);
+                        self.push(MInst::new(MOp::VMovB32).def(a).srcreg(s));
+                    }
+                }
                 Stmt::VarScaleLane { var, index, scalar } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let s = self.as_v1(*scalar)?;
@@ -1721,7 +1760,7 @@ impl Lowerer {
                     let sb = self.as_v1(*scale_b)?;
                     self.push(MInst::new(MOp::VMfmaScale32x32x64Fp8).def(v).srcreg(ra).srcreg(rb).srcreg(rc).srcreg(sa).srcreg(sb));
                 }
-                Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
+                Stmt::VarMfmaScale { var, a, b, scale_a, scale_b, opsel } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let ra = self.as_v8(*a)?;
                     let rb = self.as_v8(*b)?;
@@ -1734,7 +1773,8 @@ impl Lowerer {
                             .srcreg(rb)
                             .srcreg(v)
                             .srcreg(sa)
-                            .srcreg(sb),
+                            .srcreg(sb)
+                            .imm(*opsel as i64),
                     );
                 }
                 Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, opsel } => {
@@ -2442,6 +2482,12 @@ impl Lowerer {
                 self.push(MInst::new(MOp::VMovB32).def(hi).srcreg(rb));
                 // both operands are written: lo = [a 0..31, b 0..31], hi = [a 32..63, b 32..63]
                 self.push(MInst::new(MOp::VPermlane32Swap).def(lo).srcreg(lo).srcreg(hi));
+                self.val.insert(dst, d);
+            }
+            Op::VarSlice8 { var, half } => {
+                let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                self.touch(&[Src::Reg(v)]);
+                let d = self.sub_alias(v, 8 * *half, RClass::V8);
                 self.val.insert(dst, d);
             }
             Op::Frag2Lane { frag, index } => {

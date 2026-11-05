@@ -99,7 +99,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
 
 /// M0 reuse for LDS-DMA loads is part of the GEMM profile (AMDC_M0_REUSE=0 turns it off for A/B runs); the FMHA kernels keep their shipped output.
 fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
-    f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_M0_REUSE").map_or(true, |v| v != "0")
+    (f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_M0_REUSE").map_or(true, |v| v != "0")) || fmha_opt(f, "m0reuse")
 }
 
 /// An `FMHA_OPT` token for this kernel: `FMHA_OPT_SCOPE=<substring>` restricts the tokens to kernels whose name contains it (same-run A/B of a token
@@ -473,6 +473,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_llvm_k1" => Some(amdgpu_dsl::kernels::probe_llvm_k1()),
         "probe_llvm_k2" => Some(amdgpu_dsl::kernels::probe_llvm_k2()),
         "probe_mfma_unscaled" => Some(amdgpu_dsl::kernels::probe_mfma_unscaled()),
+        "probe_mfma_scale_opsel" => Some(amdgpu_dsl::kernels::probe_mfma_scale_opsel()),
         "probe_buffer_rw" => Some(amdgpu_dsl::kernels::probe_buffer_rw()),
         "probe_buffer_dyn" => Some(amdgpu_dsl::kernels::probe_buffer_dyn()),
         "probe_buffer_lds" => Some(amdgpu_dsl::kernels::probe_buffer_lds()),

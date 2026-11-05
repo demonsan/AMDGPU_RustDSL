@@ -215,6 +215,9 @@ pub enum Op {
     Frag2(Opnd, Opnd),
     /// Read dword `index` (0 or 1) of a two-dword fragment.
     Frag2Lane { frag: Opnd, index: u8 },
+    /// Dwords 8 half .. 8 half + 7 of the Frag16 variable `var` as a Frag8 value WITHOUT a copy (a view of the variable's registers): valid only while
+    /// the variable is not written (checked by `verify`: no in-place write of `var` between the slice and any use of it).
+    VarSlice8 { var: VarId, half: u8 },
     /// `v_permlane32_swap`: exchanges lanes 32..63 of `a` with lanes 0..31 of `b`. Result: a Frag2 whose dword 0 is the new `a` and dword 1
     /// the new `b` (use `permlane32_swap`, which returns the two values).
     Permlane32Swap { a: Opnd, b: Opnd },
@@ -321,6 +324,7 @@ impl Op {
             Op::PtrAdd { .. } | Op::KernargPtr { .. } => DType::Ptr,
             Op::Frag2(..) => DType::Frag2,
             Op::Frag2Lane { .. } | Op::Frag4Lane { .. } => DType::U32,
+            Op::VarSlice8 { .. } => DType::Frag8,
             Op::Permlane32Swap { .. } => DType::Frag2,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::MfmaF16Wide { .. } => DType::Frag16,
@@ -382,6 +386,7 @@ impl Op {
             Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } => vec![*base],
             Op::Frag2(a, b) => vec![*a, *b],
             Op::Frag2Lane { frag, .. } => vec![*frag],
+            Op::VarSlice8 { var, .. } => vec![Opnd::Var(*var)],
             Op::Permlane32Swap { a, b } => vec![*a, *b],
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
@@ -700,10 +705,14 @@ pub enum Stmt {
     VarMfmaF16Z { var: VarId, a: Opnd, b: Opnd },
     /// Multiply one dword of a `Frag16` loop variable by an f32 scalar, in place.
     VarScaleLane { var: VarId, index: u8, scalar: Opnd },
+    /// `var.lane[index] = value` (a 32-bit value into one dword of a fragment variable; the lowering writes the producer straight into that
+    /// dword when the value has no other use).
+    VarSetLane { var: VarId, index: u8, value: Opnd },
     /// 16-byte global load written straight into a `Frag4` loop variable.
     VarLoadB128 { var: VarId, base: Opnd, byte_off: u32 },
     /// `var = scaled_mfma_32x32x64_fp8(a, b, var)`: accumulate into a loop variable in place.
-    VarMfmaScale { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
+    /// `opsel`: E8M0 byte select of the scale dwords (bits 0..1 = byte of `scale_a`, bits 4..5 = byte of `scale_b`; 0 = byte 0), as `VarMfmaScale16`.
+    VarMfmaScale { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd, opsel: u8 },
     /// `var = scaled_mfma_32x32x64_fp8(a, b)` with a zero accumulator (overwrites the variable).
     VarMfmaScaleZ { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
     /// `var = a x b + c` (c a Frag16 VALUE, not the variable itself: the accumulator input and the destination are different registers)
@@ -1119,6 +1128,9 @@ impl Function {
                 Stmt::VarScaleF32 { var, scalar } => {
                     let _ = writeln!(s, "{pad}var{} *= {scalar:?}", var.0);
                 }
+                Stmt::VarSetLane { var, index, value } => {
+                    let _ = writeln!(s, "{pad}var{}.lane[{index}] = {value:?}", var.0);
+                }
                 Stmt::VarScaleLane { var, index, scalar } => {
                     let _ = writeln!(s, "{pad}var{}[{index}] *= {scalar:?}", var.0);
                 }
@@ -1149,8 +1161,12 @@ impl Function {
                 Stmt::VarMfmaScaleC { var, a, b, c, scale_a, scale_b } => {
                     let _ = writeln!(s, "{pad}var{} = mfma_scale({a:?}, {b:?}, c={c:?}; {scale_a:?}, {scale_b:?})", var.0);
                 }
-                Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
-                    let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
+                Stmt::VarMfmaScale { var, a, b, scale_a, scale_b, opsel } => {
+                    if *opsel == 0 {
+                        let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
+                    } else {
+                        let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?}; opsel 0x{opsel:02x})", var.0);
+                    }
                 }
                 Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, opsel } => {
                     let _ = writeln!(s, "{pad}var{} += mfma_scale16({a:?}, {b:?}; {scale_a:?}, {scale_b:?}; opsel 0x{opsel:02x})", var.0);
@@ -2011,6 +2027,17 @@ impl FnBuilder {
     pub fn var_scale_lane(&mut self, var: VarId, index: u8, scalar: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarScaleLane { var, index, scalar: scalar.into() });
     }
+
+    /// `var.lane[index] = value` (32-bit value into one dword of a fragment variable).
+    pub fn var_set_lane(&mut self, var: VarId, index: u8, value: impl Into<Opnd>) {
+        self.push_stmt(Stmt::VarSetLane { var, index, value: value.into() });
+    }
+
+    /// Dwords 8 half .. 8 half + 7 of the Frag16 variable `var` as a Frag8 operand without a copy (see `Op::VarSlice8`).
+    pub fn var_slice8(&mut self, var: VarId, half: u8) -> ValueId {
+        assert!(half < 2, "var_slice8: half is 0 or 1");
+        self.let_(Op::VarSlice8 { var, half })
+    }
     pub fn perm_b32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, sel: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PermB32(a.into(), b.into(), sel.into()))
     }
@@ -2054,7 +2081,16 @@ impl FnBuilder {
             b: b.into(),
             scale_a: scale_a.into(),
             scale_b: scale_b.into(),
+            opsel: 0,
         });
+    }
+
+    /// `var += v_mfma_scale_f32_32x32x64_f8f6f4(a, b; scale_a.byte[byte_a], scale_b.byte[byte_b])` in place: the scale operands are whole dwords and
+    /// the instruction's op_sel / op_sel_hi pick the E8M0 byte (no VALU byte extraction; the vendor's form).
+    #[allow(clippy::too_many_arguments)]
+    pub fn var_mfma_scale_sel(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>, byte_a: u8, byte_b: u8) {
+        assert!(byte_a < 4 && byte_b < 4, "scale byte select is 0..3");
+        self.push_stmt(Stmt::VarMfmaScale { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into(), opsel: byte_a | (byte_b << 4) });
     }
 
     /// `var += smfmac_16x16x128_fp8_fp8(a, b, idx)`: accumulate into a `Frag4` loop variable in place.
@@ -2237,6 +2273,7 @@ fn expect_ptr(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
 /// Structural, scope and type validation. Returns every problem found.
 pub fn verify(f: &Function) -> Vec<String> {
     let mut errs = Vec::new();
+    check_var_slices(f, &mut errs);
 
     // Region stack: values visible in the current scope.
     let mut scopes: Vec<HashSet<ValueId>> = vec![HashSet::new()];
@@ -2821,6 +2858,23 @@ pub fn verify(f: &Function) -> Vec<String> {
                     errs.push(here(e));
                 }
             }
+            Stmt::VarSetLane { var, index, value } => {
+                let lanes = match f.var_ty(*var) {
+                    Some(DType::Frag16) => 16,
+                    Some(DType::Frag8) => 8,
+                    Some(DType::Frag4) => 4,
+                    Some(DType::Frag2) => 2,
+                    _ => 0,
+                };
+                if *index as usize >= lanes {
+                    errs.push(here(format!("var{var}.lane[{index}]: not a lane of a fragment variable")));
+                }
+                match opnd_ty(f, *value) {
+                    Ok(DType::I32 | DType::U32 | DType::F32) => {}
+                    Ok(t) => errs.push(here(format!("var set lane: expected a 32-bit value, found {}", t.name()))),
+                    Err(e) => errs.push(here(e)),
+                }
+            }
             Stmt::VarScaleLane { var, .. } => {
                 if !matches!(f.var_ty(*var), Some(DType::Frag16) | Some(DType::Frag4)) {
                     errs.push(here(format!("var{var} must be a frag16 or frag4")));
@@ -2865,7 +2919,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
+            Stmt::VarMfmaScale { var, a, b, scale_a, scale_b, .. } => {
                 let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
                     errs.push(here(format!("var{var} accumulated outside its loop")));
@@ -3103,6 +3157,7 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         }
         Stmt::SetVar { value, .. } => vec![*value],
         Stmt::VarScaleF32 { scalar, .. } | Stmt::VarScaleLane { scalar, .. } => vec![*scalar],
+        Stmt::VarSetLane { var, value, .. } => vec![Opnd::Var(*var), *value],
         Stmt::VarScalePk { pair, .. } | Stmt::VarAddPk { pair, .. } => vec![*pair],
         Stmt::VarMfmaF16Z { a, b, .. } => vec![*a, *b],
         Stmt::VarLoadB128 { base, .. } => vec![*base],
@@ -3188,5 +3243,60 @@ pub fn asm_port_accepts(c: amdgpu_safeasm::AClass, ty: DType) -> bool {
         AClass::V8 => ty == DType::Frag8,
         AClass::V16 => ty == DType::Frag16,
         AClass::S1 | AClass::S2 => false,
+    }
+}
+
+/// The variables a statement writes in place.
+pub fn stmt_var_writes(st: &Stmt) -> Vec<VarId> {
+    match st {
+        Stmt::SetVar { var, .. }
+        | Stmt::VarScaleF32 { var, .. }
+        | Stmt::VarScalePk { var, .. }
+        | Stmt::VarAddPk { var, .. }
+        | Stmt::VarMfmaF16Z { var, .. }
+        | Stmt::VarScaleLane { var, .. }
+        | Stmt::VarSetLane { var, .. }
+        | Stmt::VarLoadB128 { var, .. }
+        | Stmt::VarMfmaScale { var, .. }
+        | Stmt::VarMfmaScale16 { var, .. }
+        | Stmt::VarMfmaScaleZ { var, .. }
+        | Stmt::VarMfmaScaleC { var, .. }
+        | Stmt::VarMfmaFp8 { var, .. }
+        | Stmt::VarMfmaFp8Z { var, .. }
+        | Stmt::VarMfmaFp8C { var, .. }
+        | Stmt::VarSmfmac { var, .. }
+        | Stmt::VarAsm { var, .. } => vec![*var],
+        Stmt::VarAsmN { vars, .. } | Stmt::BeginLoop { vars, .. } => vars.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// `VarSlice8` views: a slice of `var` must not be used after an in-place write of `var` (it would read the new registers). Over the linear
+/// statement order (a write inside a loop body that precedes the slice's definition in the next iteration is a new slice value).
+fn check_var_slices(f: &Function, errs: &mut Vec<String>) {
+    let mut live: std::collections::HashMap<ValueId, (VarId, bool)> = std::collections::HashMap::new();
+    for (idx, st) in f.stmts().iter().enumerate() {
+        for o in stmt_operands(st) {
+            if let Opnd::Val(v) = o {
+                if let Some((var, stale)) = live.get(&v) {
+                    if *stale {
+                        errs.push(format!("stmt {idx}: v{v} (a slice of var{var}) is used after var{var} was written"));
+                    }
+                }
+            }
+        }
+        if let Stmt::Let { dst, op: Op::VarSlice8 { var, half } } = st {
+            if f.var_ty(*var) != Some(DType::Frag16) || *half > 1 {
+                errs.push(format!("stmt {idx}: var_slice8 needs a frag16 variable and half 0 / 1"));
+            }
+            live.insert(*dst, (*var, false));
+        }
+        for w in stmt_var_writes(st) {
+            for (_, (var, stale)) in live.iter_mut() {
+                if *var == w {
+                    *stale = true;
+                }
+            }
+        }
     }
 }
