@@ -31,7 +31,16 @@ fn every_kernel_compiles() {
 #[test]
 fn natural_exp_is_lowered_through_exp2() {
     // The hardware instruction computes 2^x, so `exp` must be scaled first.
-    let f = kernel_by_name("probe_math").unwrap();
+    use amdgpu_dsl::{DType, FnBuilder, Op};
+    // exp of a runtime value whose result is consumed immediately by a dependent multiply
+    let mut fb = FnBuilder::new("exp_hazard", 64);
+    fb.arg("o", DType::Ptr, 0, 8);
+    let o = fb.let_(Op::KernargPtr { offset: 0 });
+    let x = fb.load_f32(o, 0);
+    let e = fb.exp_f32(x);
+    let y = fb.mul_f32(e, e);
+    fb.store_f32(o, 4, y);
+    let f = fb.finish();
     let compiled = compile(&f).unwrap();
     assert!(compiled.asm.contains("v_exp_f32_e32"), "exp2 instruction missing");
     assert!(
