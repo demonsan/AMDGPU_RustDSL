@@ -499,7 +499,6 @@ fn eval_op(op: &Op, cx: &mut Ctx<'_>) -> V {
             t.extend(word_tags(cx.opnd(*b)));
             V::Word { tags: t, origin: word_origin(cx.opnd(*a)).or(word_origin(cx.opnd(*b))) }
         }
-        CvtPkFp8F32(a, b) => { let mut t = word_tags(cx.opnd(*a)); t.extend(word_tags(cx.opnd(*b))); V::Word { tags: t, origin: None } }
         Frag2(a, b) => {
             let mut bytes = word_tags(cx.opnd(*a)); bytes.extend(word_tags(cx.opnd(*b)));
             V::Frag { bytes, origins: vec![word_origin(cx.opnd(*a)), word_origin(cx.opnd(*b))], addr: None }
