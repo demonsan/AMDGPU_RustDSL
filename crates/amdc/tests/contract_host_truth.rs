@@ -213,7 +213,7 @@ fn generated_host_abi_matches_the_hand_offsets_and_sizes() {
     ];
     for (name, fields) in hand {
         let f = amdgpu_kernels::kernel_by_name(name).expect(name);
-        let g = amdgpu_compiler::hostgen::generate(&f).expect("generate");
+        let g = amdc::hostgen::generate(&f).expect("generate");
         assert!(g.header.contains(&format!("static_assert(sizeof(Args) == {}, \"kernarg size\");", f.kernarg_size)), "{name}: generated sizeof mismatch");
         for (field, off, sz) in *fields {
             let a = f.args.iter().find(|a| a.name == *field).unwrap_or_else(|| panic!("{name}: no hand arg {field}"));

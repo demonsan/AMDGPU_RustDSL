@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-mod hostgen;
+use amdc::hostgen;
 
 use amdgpu_compiler::backend::{self, probe, LlvmTail, LlvmTools, TailBackend};
 use std::env;
