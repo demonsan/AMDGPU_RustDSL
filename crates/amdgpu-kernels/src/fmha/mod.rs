@@ -381,7 +381,12 @@ impl PipeBody for AttnBody3<'_> {
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
+    vs128_exp("fmha_fwd_hd128_mxfp8_v3_vs128", 0)
+}
+
+/// EXPERIMENT builds (bit 0: direct epilogue)
+pub fn vs128_exp(name: &str, x: u32) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
@@ -411,7 +416,11 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
             body.biasonce = true;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
-            store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
+            if x & 1 != 0 {
+                store_out3(&io, b, &blk, &body.o.expect("O"), fin);
+            } else {
+                store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
+            }
         });
     });
     let mut f = fb.finish();
