@@ -81,12 +81,15 @@ impl KvRing3 {
     pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
         Self::new_with(b, io, blk, roles, slots, slots == 2)
     }
-    /// `kd_dma`: the K scales through an LDS-direct DMA of group A (the two-group kernels), else through VGPRs (`_t128`).
     pub fn new_with(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, kd_dma: bool) -> KvRing3 {
+        Self::new_padded(b, io, blk, roles, slots, kd_dma, 16384)
+    }
+    /// `kd_dma`: the K scales through an LDS-direct DMA of group A (the two-group kernels), else through VGPRs (`_t128`).
+    pub fn new_padded(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, kd_dma: bool, pitch: i64) -> KvRing3 {
         let mut lds = LdsPlan::new();
-        let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
+        let [ks, vs] = lds.ring_group(slots, [("K", pitch, Layout::FMHA_SWZ), ("V", pitch, Layout::FMHA_SWZ)]);
         let kd = lds.ring("KD", 512, slots, Layout::Linear);
-        lds.at(32768 * slots as i64 + 2048);
+        lds.at(2 * pitch * slots as i64 + 2048);
         let ones = lds.tile("ones", 2048, Layout::Linear);
         let q1 = lds.tile("Q1", 16384, Layout::Linear);
         let q0 = lds.tile("Q0", 16384, Layout::Linear);
@@ -404,7 +407,7 @@ pub fn vs128_exp(name: &str, x: u32) -> Function {
     let io = declare_io(b, 256, false);
     let blk = block3(&io, b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
-    let mut ring = KvRing3::new_with(b, &io, &blk, &roles, if x & 1 != 0 { 3 } else { 2 }, true);
+    let mut ring = KvRing3::new_padded(b, &io, &blk, &roles, if x & 1 != 0 { 3 } else { 2 }, true, if x & 4 != 0 { 16640 } else { 16384 });
     ring.enable_buffer_dma(b);
     ring.enable_buffer_kd(b);
     let ring = ring;
