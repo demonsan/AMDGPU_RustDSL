@@ -193,6 +193,24 @@ def time_calls(fn, iters=50, warm=20):
     return e0.elapsed_ms(e1) / iters
 
 
+def perf_parity_with_harness():
+    """The same kernel on the same inputs through the JIT and through gemm_ref_host: the timings must agree (the launch path adds no GPU time)."""
+    exe = harness("tests/gpu/gemm_ref_host.cpp", "gemm_ref_host")
+    M, N, K = 4096, 4096, 8192
+    generic = aj.get_kernel("gemm_mxfp8_bs_v4", None)
+    pre = os.path.join(BUILD, "parity")
+    env = dict(os.environ, GEMM_M=str(M), GEMM_N=str(N), GEMM_K=str(K), OURS_CO=os.path.join(generic.path, "kernel.co"), OURS_KNAME=generic.info.symbol,
+               OURS_TILE_M="256", OURS_TILE_N="256", REF_ROWS="1", REF_REPS="3", REF_ITERS="100", REF_WARMUP="300", INPUT_DUMP=pre)
+    env.pop("REF_CO", None)
+    r = subprocess.run([exe], env=env, capture_output=True, text=True, cwd=REPO)
+    line = next((ln for ln in r.stdout.splitlines() if ln.startswith("timing OURS")), "")
+    h = float(line.split("median")[1].split()[0]) if line else 0.0
+    a, b, sa, sb = (read(pre + e) for e in (".a", ".b", ".sa", ".sb"))
+    g = (dev(a, (M, K)), dev(b, (N, K)), dev(sa, (K // 128, M)), dev(sb, (N // 128, K // 128)), aj.DeviceBuffer((M, N), "bfloat16", itemsize=2))
+    p = statistics.median(2.0 * M * N * K / (time_calls(lambda: aj.gemm_mxfp8_blockscale(*g, specialize=False), 100, 300) * 1e-3) / 1e12 for _ in range(3))
+    result("gemm 4096x4096x8192 JIT vs gemm_ref_host timing (same kernel, same inputs)", h > 0 and abs(p / h - 1) < 0.03, f"JIT {p:.1f} vs harness {h:.1f} TFLOP/s")
+
+
 def perf_spec_vs_generic(quick):
     rounds = 3 if quick else 7
     M, N, K = 4096, 4096, 8192
@@ -240,6 +258,7 @@ def main():
     cache_behaviour()
     launch_overhead()
     if not args.skip_perf:
+        perf_parity_with_harness()
         perf_spec_vs_generic(args.quick)
     fails = [r for r in RESULTS if not r[1]]
     log(f"\nnode_check: {len(RESULTS) - len(fails)}/{len(RESULTS)} PASS")
