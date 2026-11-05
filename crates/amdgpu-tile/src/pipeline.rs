@@ -290,10 +290,12 @@ impl Pipeline {
             let it_t = b.bind_i32(varx(it) + varx(idx));
             let is_tail = b.bind_cond(ev(self.kv_len).lt((ev(it_t) << self.lg()) + self.tile_rows));
             let last_barrier = role != Role::B;
+            // the last tile's slot is its parity (tile k sits in slot k & 1): an affine function of the counters for the protocol model
+            let slot_t = b.bind_opnd(&(ev(it_t) & 1));
             b.begin_if(is_tail);
-            self.iter_tpo(b, role, body, Opnd::Val(it_t), Opnd::Var(idx), true, false, last_barrier);
+            self.iter_tpo(b, role, body, Opnd::Val(it_t), slot_t, true, false, last_barrier);
             b.else_();
-            self.iter_tpo(b, role, body, Opnd::Val(it_t), Opnd::Var(idx), false, false, last_barrier);
+            self.iter_tpo(b, role, body, Opnd::Val(it_t), slot_t, false, false, last_barrier);
             b.end_if();
             return;
         }
