@@ -43,6 +43,8 @@ pub struct OnlineSoftmax {
     c16: ValueId,
     c512: ValueId,
     one_f: ValueId,
+    /// the scale operand of the fp8 conversion (`v_cvt_scalef32_pk_fp8_bf16`): 1.0, or the vendor's 0.25 (`set_vendor_ref`)
+    conv_s: ValueId,
     zero4: ValueId,
     /// loop variables: the two-word bias (Frag2) and the smfmac row-sum accumulator (Frag4)
     pub bias: Option<VarId>,
@@ -64,13 +66,26 @@ impl OnlineSoftmax {
         let wi = b.c_i32(0x4800_4800);
         let bias_init = b.frag2(wi, wi);
         let zero4 = b.frag_zero(DType::Frag4);
-        OnlineSoftmax { recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, one_f, zero4, bias: None, la: None }
+        OnlineSoftmax { recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, one_f, conv_s: one_f, zero4, bias: None, la: None }
     }
     /// Sets the exact-rebase threshold of the fast reference path.
     pub fn set_hi_thr(&mut self, t: f32) {
         self.recipe.hi_thr = t;
     }
     /// Overrides the rollback threshold (scaled max units).
+    /// The vendor's reference recipe (vendor-spec 4.7, the live scalars of `ref_mxfp8.co`): exp bias / rebase target s91 = 0.24799132
+    /// (`0x3e7df17e`), lazy-rollback threshold s92 = 0.26135647 (`0x3e85d086`, 6.84/512 above the target: the reference only moves when a row max
+    /// passes it), conversion scale s89 = 0.25, no LUT correction. The caller seeds the first tile (`decide_seeded`).
+    pub fn set_vendor_ref(&mut self, b: &mut FnBuilder) {
+        let s91 = f32::from_bits(0x3e7d_f17e);
+        let s92 = f32::from_bits(0x3e85_d086);
+        self.recipe.b131 = s91;
+        self.b131 = b.c_f32(s91);
+        self.recipe.thr = s92;
+        self.thr = b.c_f32(s92);
+        self.recipe.lut = false;
+        self.conv_s = b.c_f32(0.25);
+    }
     pub fn set_thr(&mut self, b: &mut FnBuilder, thr: f32) {
         self.recipe.thr = thr;
         self.thr = b.c_f32(thr);
@@ -249,7 +264,7 @@ impl OnlineSoftmax {
         let mut words = Vec::with_capacity(4 * (t1 - t0));
         for i in t0..t1 {
             let xs = masked_values(b, s, i, mask, self.zero_f);
-            words.extend(to_p8(b, &xs, self.one_f, conv, lut.as_ref()));
+            words.extend(to_p8(b, &xs, self.conv_s, conv, lut.as_ref()));
         }
         words
     }

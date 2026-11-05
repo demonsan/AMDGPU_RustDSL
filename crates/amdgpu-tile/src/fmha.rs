@@ -571,10 +571,12 @@ pub struct Vs128Cfg {
     pub kscale_sel: bool,
     /// P written into the converted S tile 0's registers (`var_set_lane`), PV reads `var_slice8` views (the vendor's register reuse)
     pub p_in_s: bool,
+    /// the vendor's reference recipe (`OnlineSoftmax::set_vendor_ref`): lazy rollback above the target, conversion scale 0.25, no LUT, seeded
+    pub vref: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: true, kscale_sel: true, p_in_s: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: true, kscale_sel: true, p_in_s: false, vref: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -613,6 +615,10 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
             }
             if let Some(th) = cfg.thr512 {
                 body.sm.set_thr(b, th as f32 / 512.0);
+                body.seed_first = true;
+            }
+            if cfg.vref {
+                body.sm.set_vendor_ref(b);
                 body.seed_first = true;
             }
             body.setprio = cfg.setprio;
