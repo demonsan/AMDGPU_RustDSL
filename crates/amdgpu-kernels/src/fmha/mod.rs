@@ -293,7 +293,7 @@ impl<'a> AttnBody3<'a> {
         let (src, spare) = self.dummy_src.expect("dummy src");
         let lane = self.blk.lane.lane();
         for q in 0..4i32 {
-            let off = b.bind_i32((lane << 4) + 1024 * q + (amdgpu_dsl::ev(self.wid) << 12));
+            let off = b.bind_i32((lane.clone() << 4) + 1024 * q + (amdgpu_dsl::ev(self.wid) << 12));
             let p = b.ptr_add(src, off);
             let m0 = b.bind_i32((amdgpu_dsl::ev(self.wid) << 12) + (spare + 1024 * q));
             b.load_global_lds(p, m0, 0, 4);
