@@ -206,6 +206,23 @@ fn cint(o: &Opnd, consts: &HashMap<ValueId, i64>) -> Option<i64> {
     }
 }
 
+/// The constant value of an integer op whose operands are constants (32-bit wrap-around like the hardware).
+fn fold_int(op: &Op, consts: &HashMap<ValueId, i64>) -> Option<i64> {
+    let w = |x: i64| (x as i32) as i64;
+    let k = |o: &Opnd| cint(o, consts);
+    Some(match op {
+        Op::ConstI32(c) => *c as i64,
+        Op::AddI32(a, b) => w(k(a)? + k(b)?),
+        Op::MulI32(a, b) => w(k(a)?.wrapping_mul(k(b)?)),
+        Op::ShlI32(a, b) => ((k(a)? as u32).wrapping_shl(k(b)? as u32)) as i32 as i64,
+        Op::LshrI32(a, b) => ((k(a)? as u32).wrapping_shr(k(b)? as u32)) as i32 as i64,
+        Op::AndI32(a, b) => w(k(a)? & k(b)?),
+        Op::XorI32(a, b) => w(k(a)? ^ k(b)?),
+        Op::MinI32(a, b) => k(a)?.min(k(b)?),
+        _ => return None,
+    })
+}
+
 fn ccond(o: &Opnd, conds: &HashMap<ValueId, bool>) -> Option<bool> {
     match o {
         Opnd::Val(v) => conds.get(v).copied(),
@@ -220,23 +237,12 @@ fn fold(nodes: &mut Vec<Node>, consts: &mut HashMap<ValueId, i64>, conds: &mut H
     for mut n in std::mem::take(nodes) {
         match &mut n {
             Node::S(Stmt::Let { dst, op }) => {
-                let w = |x: i64| (x as i32) as i64;
-                let k = |o: &Opnd| cint(o, consts);
-                let folded: Option<i64> = match op {
-                    Op::ConstI32(c) => Some(*c as i64),
-                    Op::AddI32(a, b) => Some(w(k(a)? + k(b)?)),
-                    Op::MulI32(a, b) => Some(w(k(a)?.wrapping_mul(k(b)?))),
-                    Op::ShlI32(a, b) => Some(w(((k(a)? as u32).wrapping_shl(k(b)? as u32)) as i32 as i64)),
-                    Op::LshrI32(a, b) => Some(((k(a)? as u32).wrapping_shr(k(b)? as u32)) as i32 as i64),
-                    Op::AndI32(a, b) => Some(w(k(a)? & k(b)?)),
-                    Op::XorI32(a, b) => Some(w(k(a)? ^ k(b)?)),
-                    Op::MinI32(a, b) => Some(k(a)?.min(k(b)?)),
-                    _ => None,
-                };
+                let folded = fold_int(op, consts);
                 if let Some(v) = folded {
                     consts.insert(*dst, v);
                     *op = Op::ConstI32(v as i32);
                 } else {
+                    let k = |o: &Opnd| cint(o, consts);
                     let c = match op {
                         Op::CmpLtI32(a, b) => k(a).zip(k(b)).map(|(x, y)| x < y),
                         Op::CmpGeI32(a, b) => k(a).zip(k(b)).map(|(x, y)| x >= y),
