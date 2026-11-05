@@ -74,6 +74,11 @@ pub trait PipeBody {
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx);
     /// Called right after the pipeline's `wait_vm(0)` that completes the stage of `slot` (e.g. the VGPR path of the K scales: `ds_write` them now).
     fn stage_complete(&mut self, _b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {}
+    /// `Pipeline::late_stage_b`: the stage of tile t+1 handed to the M phase of tile t (issued after the mid barrier, completed before the end
+    /// barrier); the default issues it at once.
+    fn defer_stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
+        self.stage(b, role, key0, slot)
+    }
     /// Constant LDS data written once before the first barrier (Q staging, ones block).
     fn prologue_stores(&mut self, _b: &mut FnBuilder, _role: Role) {}
     /// Work on tile 0 before the loop (e.g. QK(0)); its results usually become loop-state initial values.
@@ -120,6 +125,10 @@ pub struct Pipeline {
     /// read-ahead `ds_read`s for the M phase (the vendor keeps them in flight across the barrier; the V phase writes no LDS, its DMA is
     /// completed by the `wait_vm(0)`).
     pub mid_lds_drain: bool,
+    /// `TwoPhaseOffset`: group B stages tile t+1 inside its M phase of tile t (`PipeBody::defer_stage`) instead of before the V phase: the slot it
+    /// writes (tile t-1's) is free after the end barrier of t-1, and the stage completes (`wait_vm(0)`) before the end barrier of t, i.e. before
+    /// group A, one phase ahead, reads it in its M phase of t+1.
+    pub late_stage_b: bool,
     /// `RegStaged`: two tiles per loop pass with STATIC ring slots (0 then 1: the tile counter is even at the top), so the slot offsets are
     /// constants (the vendor `u2`); the loop may exit between the two halves.
     pub unroll2: bool,
@@ -146,7 +155,7 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true, late_stage_b: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -364,12 +373,13 @@ impl Pipeline {
                     tile_rows: self.tile_rows,
                 };
                 self.prebind(b, &t);
-                if staged {
-                    let key_n = b.let_i32(nn << self.lg());
-                    body.stage(b, role, &key_n, &t.next);
+                let late = self.late_stage_b && role == Role::B;
+                let key_n = staged.then(|| b.let_i32(nn << self.lg()));
+                if staged && !late {
+                    body.stage(b, role, key_n.as_ref().expect("key"), &t.next);
                 }
                 body.v_phase(b, role, &t);
-                if staged {
+                if staged && !late {
                     b.wait_vm(0);
                     body.stage_complete(b, role, &t.next);
                 }
@@ -377,7 +387,14 @@ impl Pipeline {
                     b.wait_lds(0);
                 }
                 b.barrier();
+                if staged && late {
+                    body.defer_stage(b, role, key_n.as_ref().expect("key"), &t.next);
+                }
                 body.m_phase(b, role, &t);
+                if staged && late {
+                    b.wait_vm(0);
+                    body.stage_complete(b, role, &t.next);
+                }
                 b.wait_lds(0);
                 if last_barrier {
                     b.barrier();

@@ -294,6 +294,8 @@ pub struct AttnBody3<'a> {
     /// `Vs128Cfg::pvlead`: the PV V reads kept one fragment ahead of their MFMA
     pub pvlead: bool,
     vpre_vals: Vec<ValueId>,
+    /// `Vs128Cfg::vlate`: the deferred V stage (key0, slot), issued between the QK blocks of the M phase
+    late: Option<(I32, SlotIdx)>,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -301,7 +303,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, scaleconv: false, vpre: false, pvlead: false, vpre_vals: Vec::new() }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, scaleconv: false, vpre: false, pvlead: false, vpre_vals: Vec::new(), late: None }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -335,7 +337,34 @@ impl<'a> AttnBody3<'a> {
         let r = self.ring;
         let k = r.kpart.at(b, &r.ks.at(slot));
         let kd = r.kdpart.at(b, &r.kd.at(slot));
-        (0..4).filter_map(|s| self.qk_block(b, &out, bias, &k, &kd, s)).collect()
+        let late = self.late.take();
+        let mut res = Vec::new();
+        for s in 0..4usize {
+            if let Some(v) = self.qk_block(b, &out, bias, &k, &kd, s) {
+                res.push(v);
+            }
+            // the deferred V stage: one DMA after each QK block (the vendor spreads its DMAs between the QK MFMAs)
+            if let Some((key0, slot)) = &late {
+                let r = self.ring;
+                match &r.buf {
+                    Some((_, vb)) => {
+                        let n = r.vdma.issues();
+                        let per = n.div_ceil(4);
+                        let q0 = (s * per).min(n);
+                        let q1 = ((s + 1) * per).min(n);
+                        if q0 < q1 {
+                            r.vdma.issue_buffer_part(b, vb, key0, &r.vs.at(slot), q0..q1);
+                        }
+                    }
+                    None => {
+                        if s == 0 {
+                            r.vdma.issue(b, key0, &r.vs.at(slot));
+                        }
+                    }
+                }
+            }
+        }
+        res
     }
     /// PV with the row sums first: per half hh and dim group e, the transposed V fragment then the scaled MFMA (fixed scales).
     fn pv(&mut self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
@@ -392,6 +421,14 @@ impl PipeBody for AttnBody3<'_> {
     }
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, slot: &SlotIdx) {
         self.ring.stage_complete(b, self.kd_pending.take(), slot);
+    }
+    fn defer_stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
+        // only the V stage of group B is spread over the QK blocks; anything else is issued now
+        if role == Role::B && self.ring.pad_dma.is_none() {
+            self.late = Some((key0.clone(), slot.clone()));
+        } else {
+            self.kd_pending = self.ring.stage(b, role, key0, slot);
+        }
     }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
         self.ring.store_constants(b, self.wid, &self.blk.lane, &self.blk.q);
@@ -498,6 +535,8 @@ pub struct Vs128Cfg {
     pub vpre: bool,
     /// PV V reads one fragment ahead of their MFMA
     pub pvlead: bool,
+    /// group B stages V(t+1) inside its M phase, one DMA after each QK block (`Pipeline::late_stage_b`)
+    pub vlate: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
@@ -519,6 +558,7 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     // the V-phase read-ahead stays in flight across the mid barrier
     pipe.mid_lds_drain = !cfg.vpre;
+    pipe.late_stage_b = cfg.vlate;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {
