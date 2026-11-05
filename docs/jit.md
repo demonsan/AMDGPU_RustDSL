@@ -55,6 +55,18 @@ Expression tree E — exactly the operators of `Ext`:
 
 The Python side evaluates these to validate a launch (grid, kernarg relations, tensor sizes) before calling the kernel.
 
-## 3. Measurements (GPU 6, same run)
+## 3. Measurements (GPU 6, same run, `tools/ab_layout.sh`: median over 8 code layouts)
 
-See the report in [`current-status.md`](current-status.md) §4 (instruction counts and A/B of the specialized vs generic kernels).
+Specializations: GEMM `m=4096,n=4096,k=8192`; FMHA `s_seq_len=2048,s_kv_seq_len=2048,s_q_head_num=8,s_gqa=1` (batch stays dynamic).
+
+| kernel | static instructions generic → specialized | steady-state loop (insts / VALU) | TF/s generic → specialized (layout median) |
+|---|---|---|---|
+| `gemm_mxfp8_bs_v4` 4096×4096×8192 | 1799 → 1740 | 328 / 12 → 318 / 14 | 2991.1 → 2997.5 (+0.2%, noise) |
+| `fmha_..._v3_vs128` B4H8S2048 | 9733 → 4644 (the short-sequence loop copy is dead) | 502 / 375 → 386 / 255 | 1550.7 → 1535.8 (−1.0%) |
+| `fmha_..._v3_t128` B2H8S2048 | 4985 → 2404 | 571 / 441 → 448 / 310 | 1066.3 → 1052.1 (−1.3%) |
+
+Accuracy is identical (same `bad` / `mean_err` against the CPU reference as the generic kernel), and every specialized kernel verifies strictly
+(`specialized … certificate: …, 0 unproven`). The FMHA loops lose a third of their VALU (key-mask / tail arithmetic folds away) and still do not
+get faster: they are MFMA / LDS bound and the generic schedule was tuned with that VALU as filler; constants that were scalar kernarg values
+now appear as VGPR immediates inside the loop (`v_mov` of constants 6 → 12 per iteration on `_vs128`). Specialization is therefore a
+correctness-preserving code-size / compile-time tool today, not a speed-up; tuning the scheduler for the specialized loops is open.

@@ -219,6 +219,9 @@ pub fn close(f: &Function, vals: &[(String, u32, SpecValue)]) -> Result<Closed, 
 
 /// The specialized kernel (same name / ABI).
 pub fn specialize(f: &Function, binds: &[(String, String)]) -> Result<Function, String> {
+    if binds.is_empty() {
+        return Ok(f.clone());
+    }
     let vals = check(f, binds)?;
     let cl = close(f, &vals)?;
     let mut g = f.clone();
