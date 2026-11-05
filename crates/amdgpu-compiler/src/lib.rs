@@ -231,6 +231,26 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         (_, so) => so,
     };
+    // experiment switch: AMDC_MFMAPAIR=1 (every kernel) or =<kernel name substring> (optionally `=name:1.5` = shadow budget factor) adds the MFMA-pair scheduler
+    let sched_opts = match (std::env::var("AMDC_MFMAPAIR").ok().filter(|v| !v.is_empty() && v != "0"), sched_opts) {
+        (Some(v), so) => {
+            let (pat, budget) = match v.split_once(':') {
+                Some((p, b)) => (p.to_string(), b.parse::<f64>().ok()),
+                None => (v.clone(), None),
+            };
+            if pat == "1" || pname.contains(pat.as_str()) {
+                let mut o = so.unwrap_or_else(|| sched::Options { reorder: false, ldshoist: true, ..sched::Options::default() });
+                o.mfmapair = true;
+                if let Some(b) = budget {
+                    o.mfmapair_budget = b;
+                }
+                Some(o)
+            } else {
+                so
+            }
+        }
+        (None, so) => so,
+    };
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
         // (pressure cut, hoist distance cap): first shrink the LDS-read hoisting (it lengthens live ranges and fragments

@@ -17,6 +17,7 @@ pub mod liveness;
 pub mod m0;
 pub mod model;
 pub mod order;
+pub mod mfmapair;
 pub mod phase;
 pub mod slotfill;
 pub mod sim;
@@ -63,6 +64,10 @@ pub struct Options {
     pub hoist_dist: usize,
     /// `slotfill`: the slot-filling scheduler (sched/slotfill.rs): MFMAs are the skeleton, the other instructions are spread over their deadline windows
     pub slotfill: bool,
+    /// `mfmapair` (sched/mfmapair.rs): dependent same-accumulator MFMA pairs adjacent, non-MFMA work only after the second MFMA of a pair
+    pub mfmapair: bool,
+    /// shadow budget of a pair in units of the second MFMA's pipe occupancy (`mfmapair=1.5`); default 1.0
+    pub mfmapair_budget: f64,
     /// Restrict block scheduling to blocks whose label is in the set or above the floor (blocks created
     /// by swp / taildup). Used by uto_plan.
     pub sched_labels: Option<(std::collections::HashSet<u32>, u32)>,
@@ -70,7 +75,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, auto: false, trust_model: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, sched_labels: None }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, swp: false, fast: false, taildup: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, auto: false, trust_model: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, mfmapair: false, mfmapair_budget: 1.0, sched_labels: None }
     }
 }
 
@@ -111,6 +116,7 @@ impl Options {
                     "trustmodel" => o.trust_model = true,
                     "ldshoist" => o.ldshoist = true,
                     "slotfill" => o.slotfill = true,
+                    "mfmapair" => o.mfmapair = true,
                     "hoistchain" => {
                         o.ldshoist = true;
                         o.hoist_chain = true;
@@ -118,6 +124,12 @@ impl Options {
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
+                        }
+                        if let Some(v) = t.strip_prefix("mfmapair=") {
+                            if let Ok(b) = v.parse() {
+                                o.mfmapair = true;
+                                o.mfmapair_budget = b;
+                            }
                         }
                         if let Some(v) = t.strip_prefix("hoist=") {
                             if let Ok(n) = v.parse() {
@@ -244,6 +256,12 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         eprintln!("phase: {phased} instructions moved");
     }
     schedule_blocks(m, o, &mut stats)?;
+    if o.mfmapair {
+        let n = mfmapair::run(m, o)?;
+        if o.stats {
+            eprintln!("mfmapair: {n} pairs made adjacent");
+        }
+    }
     stats.waits_inserted = waits::insert_waits(m);
     if o.verify {
         waits::verify_waits(m).map_err(|e| format!("wait verification failed: {e}"))?;

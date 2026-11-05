@@ -27,6 +27,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e CARGO_TARGET_DIR=/target \
     -e FMHA_ABLATE="${FMHA_ABLATE:-}" \
     -e AMDC_SLOTFILL="${AMDC_SLOTFILL:-}" \
+    -e AMDC_MFMAPAIR="${AMDC_MFMAPAIR:-}" \
     -e FMHA_PITCH="${FMHA_PITCH:-}" \
     -e FMHA_OPT="${FMHA_OPT:-}" \
     -e FMHA_OPT_SCOPE="${FMHA_OPT_SCOPE:-}" \
