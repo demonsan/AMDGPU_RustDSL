@@ -1661,6 +1661,9 @@ impl Lowerer {
                     let mut done = false;
                     if let Opnd::Val(x) = value {
                         let is_const = matches!(self.defs.get(x), Some(Op::ConstI32(_) | Op::ConstF32(_)));
+                        if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("setlanedebug")) {
+                            eprintln!("set_lane v{x}: const {is_const} uses {:?} lowered {:?}", self.use_counts.get(x), self.val.get(x));
+                        }
                         if let (false, Some(1), Some(&r)) = (is_const, self.use_counts.get(x).copied(), self.val.get(x)) {
                             let cur = self.cur;
                             let plain = self.mir.vreg_class(r) == RClass::V1 && !self.mir.alias.contains_key(&r) && !self.mir.alias.values().any(|(t, _)| *t == r);
@@ -1669,6 +1672,9 @@ impl Lowerer {
                                 && !self.consts.values().any(|q| *q == r)
                                 && !self.converted.values().any(|q| *q == r);
                             let elsewhere = self.mir.blocks.iter().enumerate().any(|(bi, b)| bi != cur && b.insts.iter().any(|i| i.dst == Some(r) || i.srcs.iter().any(|s| matches!(s, Src::Reg(q) if *q == r))));
+                            if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("setlanedebug")) {
+                                eprintln!("set_lane v{x}: plain {plain} def_here {def_here} elsewhere {elsewhere}");
+                            }
                             if plain && def_here && !elsewhere {
                                 for i in self.mir.blocks[cur].insts.iter_mut() {
                                     if i.dst == Some(r) {
