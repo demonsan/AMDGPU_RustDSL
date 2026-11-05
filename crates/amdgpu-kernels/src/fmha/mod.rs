@@ -429,7 +429,7 @@ pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bo
 
 /// `_kvsplit`: the `_vs128` structure over a key range per split (two-smfmac row sums), the partial-row epilogue + log-sum-exp.
 pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
-    fmha_kvsplit_named("fmha_fwd_hd128_mxfp8_v3_kvsplit", false)
+    fmha_kvsplit_named("fmha_fwd_hd128_mxfp8_v3_kvsplit", true)
 }
 
 /// `_kvsplit` under another name; `vref`: the vendor recipe with the lazy reference update from 4 tiles of the whole sequence (A/B builds).
