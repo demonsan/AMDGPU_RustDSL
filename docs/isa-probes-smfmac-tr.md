@@ -40,7 +40,7 @@ B element's `32 (lane / 16) + 4 register + byte` (the 16 B elements matched to o
   ```
 
   So a pair (2 q, 2 q + 1) contracts with **one B dword** (lane group h, register r) and the two index fields pick which BYTES of that dword they multiply; the
-  hardware accepts any two fields (all six (p0, p1) pairs measured, fields in any order within the pair's nibble were not needed: nibble = p0 | p1 << 2).
+  hardware accepts any two fields (all six ascending (p0, p1) pairs were measured; nibble = p0 | p1 << 2; descending or equal pairs were not probed).
   The A lane group g selects the register half and the K half: g = 0: B groups {0, 1}, registers 0..3; g = 1: groups {2, 3}, registers 0..3; g = 2: groups {0, 1},
   registers 4..7; g = 3: groups {2, 3}, registers 4..7.
 * **Two accumulated smfmacs cover all of K.** `0x44444444` keeps bytes (0, 1) of every B dword, `0xeeeeeeee` bytes (2, 3): with both, every one of the 128 k of every

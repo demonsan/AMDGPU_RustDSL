@@ -65,8 +65,6 @@ fn smfmac_index_semantics_reproduce_every_measured_pattern() {
             continue;
         }
         let w = u32::from_str_radix(t[2], 16).unwrap();
-        let ka = ints(SMF, "KA").len();
-        let _ = ka;
         let name = t[1];
         let kline = SMF.lines().find(|x| x.starts_with(&format!("KA {name} "))).unwrap();
         let k: Vec<i64> = kline.split_whitespace().skip(2).map(|x| x.parse().unwrap()).collect();
