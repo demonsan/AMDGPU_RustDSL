@@ -30,3 +30,24 @@ per-CU（B1H8S2048，`ROWS_PER_BLOCK=256` 强制 `_vs128`，11 轮）：基线 6
 
 **结论**：更深的读领先量只会变差（寄存器已在 256，且 lgkmcnt 4 位上限）；方向反过来 —— 读再贴近消费者、与厂商一样只留一组在飞（`ldsink=1`）—— 有小而稳定的收益（+0.2 … +0.8 %，并释放 8 个 VGPR），
 作为 `fmha_fwd_hd128_mxfp8_v3x_vs128_ldsink1` 提供给 A/B + `port_gate`，**尚未设为默认**。
+
+## preset 丢失，以及成对 / slotfill 的干净重测（2026-11-06）
+
+**`_t128` 丢了调度预设（已修）。** 出厂 `_t128` 带 `sched_opts = "ldsink=1"` 之后，编译路径里"显式 `Function::sched_opts`"这一支从**默认选项**起步，绕过了 FMHA 预设：`_t128` 的 ALU 跨栅栏（`alu_across_barrier`）与压力上限 248
+被悄悄丢掉。修法：`scheduler_options`（`crates/amdgpu-compiler/src/lib.rs`）先取 profile 预设（GEMM profile / FMHA 各家族），**再**把内核自己的 token 叠在预设上；回归测试 `crates/amdgpu-compiler/tests/sched_preset.rs`。
+`_vs128` / `_kvsplit` / GEMM 的预设就是默认选项（+ 各自的 token），汇编逐字节不变；只有 `_t128` 变（md5 `df6c6ef2f5d9` → `e057befe3452`，证书 4 / 29 / 0 不变）。
+
+layout 中位数（leading `s_nop` 位移 0..7 × 3 轮，`REF_DATA=normal`，同一轮交替，TF/s）：
+
+| 形状 | 出厂（丢了预设） | 预设恢复 | 变化 |
+|---|--:|--:|--:|
+| B1H8S2048（per-CU） | 640.95 | 659.64 | +2.9 % |
+| B2H8S2048 | 1104.80 | 1129.42 | +2.2 % |
+| B1H8S4096 | 1336.03 | 1370.81 | +2.6 % |
+| B2H8S1024 | 496.33 | 509.00 | +2.6 % |
+
+这也说明此前报告的"`_t128` ship `ldsink=1` +0.4…+0.8 %"里藏着约 −2.4 % 的预设损失（`ldsink=1` 叠在预设上约 +3 %）。
+
+**成对（`mfmapair`）与 slotfill 的干净重测。** 此前的实验开关在内核预设之前构造新选项，变体与基线调度底座不同，结果被混淆（见 `docs/archive/mfmapair.md` 开头的更正）。改成"token 叠在预设上"之后（`_vs128` 强制，
+`REF_DATA=normal`，同一轮交替 7 轮；基线 626.4 / 1696.8 / 2374.7 TF/s = per-CU B1S2048 / B4S2048 / B1S8192）：`mfmapair` 预算 0.25 / 0.5 / 1 / 2 / 无限 全部 ≤ 基线（−0.3…−1.9 %），带对内间隙（`mpgap` 2 / 5 / 10）−0.4…−2.9 %，`slotfill` −1.5…−3.9 %。
+`_t128` 在预设恢复后成对无额外收益（+0.1 / −0.3 / +0.2 / −0.3 %）；它在旧底座上的 +3…+4.5 % 与恢复预设 / `ldsink` 是同一个效应。结论：**都不采用**。

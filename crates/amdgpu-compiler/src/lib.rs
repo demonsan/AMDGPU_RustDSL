@@ -138,44 +138,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         agpr::assign(&mut b)?;
         b
     };
-    let sched_opts = sched::Options::from_env();
-    // The FMHA kernels default to the wait-recomputing pass (partial vmcnt/lgkmcnt waits, ALU across barriers, ds_read hoisting): +9% on the
-    // transposed kernel, bit-identical results (measured, docs/archive/status.md round 44). AMDC_SCHED=0 turns it off.
-    let sched_opts = match sched_opts {
-        // GEMM profile / explicit Function::sched_opts: the scoreboard wait pass (+ ds_read hoisting, no reordering) with the kernel's own tokens on top
-        None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0") && (f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) || f.sched_opts.is_some()) => {
-            let mut o = sched::Options::default();
-            if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) {
-                o.reorder = false;
-                o.ldshoist = true;
-            }
-            if let Some(s) = &f.sched_opts {
-                o.apply_tokens(s);
-            }
-            Some(o)
-        }
-        None if std::env::var("AMDC_SCHED").ok().as_deref() != Some("0")
-            && (pname.starts_with("fmha_fwd_hd128_mxfp8_t") || pname.starts_with("fmha_fwd_hd128_mxfp8_sv") || pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))) =>
-        {
-            // "ld" preset: scoreboard (partial) waits + ds_read hoisting, no instruction reordering. Measured best on the
-            // merged tree (docs/archive/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
-            let mut o = sched::Options::default();
-            // `_t128`: ALU may cross the single barrier per tile and the pressure limit 248 lets the list scheduler take a schedule at vgpr 256
-            // (measured 489 -> 505 TFLOP/s on B1H8S2048; limit 246/248 only, 244/250 give the old schedule: a heuristic knob, re-measure on changes)
-            if pname.ends_with("_t128") {
-                o.alu_across_barrier = true;
-                o.max_vgprs = 248;
-            }
-            // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/archive/status.md round 49)
-            if !pname.ends_with("_vs128") && !pname.ends_with("_vs5") && !pname.ends_with("_vs6") && !pname.ends_with("_vs9") && !pname.ends_with("_kvsplit") && !pname.ends_with("_vsm") && !pname.ends_with("_t128") && !(pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o")) {
-                o.reorder = false;
-                o.alu_across_barrier = true;
-                o.ldshoist = true; // hoist ds_read above independent work (docs/scheduling.md); AMDC_SCHED=0 / 1 / auto / OPTS override
-            }
-            Some(o)
-        }
-        other => other,
-    };
+    let sched_opts = scheduler_options(f, pname);
     // experiment switch (applied ON TOP of the kernel's own scheduler options, i.e. the shipped preset): AMDC_SCHED_ADD=<kernel name substring>:<tokens> (e.g.
     // `fmha_fwd_hd128_mxfp8_v3_vs128:ldahead=4,ldslack=8`; several entries separated by `;`) appends scheduler tokens to the options the kernel would use anyway
     let sched_opts = match (std::env::var("AMDC_SCHED_ADD").ok().filter(|v| !v.is_empty()), sched_opts) {
@@ -276,6 +239,61 @@ pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
             })
         }),
         Err(_) => false,
+    }
+}
+
+/// The scheduler options a kernel compiles with. `AMDC_SCHED` (1 / ld) overrides everything; `AMDC_SCHED=0` turns the scheduler off. Otherwise the kernel's PROFILE PRESET
+/// applies - the GEMM profile (scoreboard waits + ds_read hoisting, no reordering) or the FMHA families (the wait-recomputing pass, +9% on the transposed kernel, bit-identical
+/// results, docs/archive/status.md round 44; `_t128`: ALU across its barrier and the pressure limit 248) - and the kernel's own `Function::sched_opts` tokens are applied ON TOP of
+/// that preset (never instead of it: a kernel that adds a token keeps its profile's options). A kernel without a preset that sets tokens gets the default options plus them.
+pub fn scheduler_options(f: &amdgpu_dsl::Function, pname: &str) -> Option<sched::Options> {
+    if let Some(o) = sched::Options::from_env() {
+        return Some(o);
+    }
+    if std::env::var("AMDC_SCHED").ok().as_deref() == Some("0") {
+        return None;
+    }
+    let preset = if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) {
+        let mut o = sched::Options::default();
+        o.reorder = false;
+        o.ldshoist = true;
+        Some(o)
+    } else if pname.starts_with("fmha_fwd_hd128_mxfp8_t")
+        || pname.starts_with("fmha_fwd_hd128_mxfp8_sv")
+        || pname.starts_with("fmha_fwd_hd128_mxfp8_vs")
+        || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))
+    {
+        // "ld" preset: scoreboard (partial) waits + ds_read hoisting, no instruction reordering. Measured best on the
+        // merged tree (docs/archive/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
+        let mut o = sched::Options::default();
+        // `_t128`: ALU may cross the single barrier per tile and the pressure limit 248 lets the list scheduler take a schedule at vgpr 256
+        // (measured 489 -> 505 TFLOP/s on B1H8S2048; limit 246/248 only, 244/250 give the old schedule: a heuristic knob, re-measure on changes)
+        if pname.ends_with("_t128") {
+            o.alu_across_barrier = true;
+            o.max_vgprs = 248;
+        }
+        // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/archive/status.md round 49)
+        if !pname.ends_with("_vs128") && !pname.ends_with("_vs5") && !pname.ends_with("_vs6") && !pname.ends_with("_vs9") && !pname.ends_with("_kvsplit") && !pname.ends_with("_vsm") && !pname.ends_with("_t128") && !(pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o")) {
+            o.reorder = false;
+            o.alu_across_barrier = true;
+            o.ldshoist = true; // hoist ds_read above independent work (docs/scheduling.md); AMDC_SCHED=0 / 1 / auto / OPTS override
+        }
+        Some(o)
+    } else {
+        None
+    };
+    match (preset, &f.sched_opts) {
+        (Some(mut o), Some(s)) => {
+            o.apply_tokens(s);
+            Some(o)
+        }
+        (Some(o), None) => Some(o),
+        (None, Some(s)) => {
+            let mut o = sched::Options::default();
+            o.apply_tokens(s);
+            Some(o)
+        }
+        (None, None) => None,
     }
 }
 
