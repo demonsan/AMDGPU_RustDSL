@@ -381,7 +381,12 @@ impl PipeBody for AttnBody3<'_> {
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
+    vs128_exp("fmha_fwd_hd128_mxfp8_v3_vs128", 0)
+}
+
+/// EXPERIMENT builds (bit 0: epilogue scratch swizzle from query bits 1..3)
+pub fn vs128_exp(name: &str, x: u32) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
@@ -411,7 +416,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
             body.biasonce = true;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
-            store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
+            store_out3_lds_s(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin, if x & 1 != 0 { 4 } else { 3 });
         });
     });
     let mut f = fb.finish();
@@ -666,13 +671,19 @@ pub fn store_out3(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C
 /// (`ds_read_b128`, 8 lanes per row) and stored as 4 x 16-byte segments of the output rows: 8 `global_store_dwordx4` per wave (the vendor count)
 /// instead of 16 `global_store_dwordx2`.
 pub fn store_out3_lds(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, epi: &Shared, wid: ValueId, o: &AccTile<C32x32F32, 4>, fin: ValueId) {
+    store_out3_lds_s(io, b, blk, epi, wid, o, fin, 3)
+}
+
+/// `store_out3_lds` with the scratch swizzle `Swizzle<3,4,s>` (EXPERIMENT: s = 4 takes the chunk XOR from query bits 1..3)
+#[allow(clippy::too_many_arguments)]
+pub fn store_out3_lds_s(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, epi: &Shared, wid: ValueId, o: &AccTile<C32x32F32, 4>, fin: ValueId, swz_s: u32) {
     b.barrier();
     let o_tile = io.o.tile(vec![ev(blk.bidx), I32::c(0), ev(blk.hidx), I32::c(0)]).clamp(1, io.s_len.clone(), blk.s_last.clone());
     let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
     let lane = blk.lane;
     let mut ctx = Ctx::new();
     let l = ctx.sym("lane", 0, 63, lane.lane());
-    let view = ComposedLayout::new(Swizzle::cute(3, 4, 3), make_layout(tup![64, 32], tup![2, 128]));
+    let view = ComposedLayout::new(Swizzle::cute(3, 4, swz_s), make_layout(tup![64, 32], tup![2, 128]));
     let wtv = make_layout(tup![tup![32, 2], tup![4, 4, 2]], tup![tup![64, 4], tup![1, 8, 32]]);
     let epi0 = Shared { base: 0, ..epi.clone() };
     let wpart = make_tiled_copy(DS_WRITE_B32, wtv, 64 * 32, 16).partition_lds(b, &ctx, &l, &epi0, &view, &[0]);
