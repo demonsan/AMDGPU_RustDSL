@@ -17,8 +17,8 @@
 | 内核 | 相邻 MFMA 对：C=D(prev) 比例 基线 → mfmapair | 说明 |
 |---|---|---|
 | `fmha_fwd_hd128_mxfp8_v3_vs128` | 6.5 % → **48.8 %**（91 + 14 / 215） | 厂商 51 %（184 对） |
-| `fmha_fwd_hd128_mxfp8_v3_t128` | 16 % → 31 %（27 + 9 / 119） | 预算跳过了一部分对 |
-| `fmha_fwd_hd128_mxfp8_v3_kvsplit` | 6.5 % → 51.6 % | |
+| `fmha_fwd_hd128_mxfp8_v3_t128` | 16 % → 30 %（27 + 9 / 119） | 预算跳过了一部分对 |
+| `fmha_fwd_hd128_mxfp8_v3_kvsplit` | → 51.6 %（97 + 14 / 215；基线未单独记录） | |
 
 ## 硬件结果（GPU 4；`tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3`，`AMDC_MFMAPAIR=fmha_fwd_hd128_mxfp8_v3`，同一轮里先 mfmapair 后基线）
 
