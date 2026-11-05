@@ -573,10 +573,12 @@ pub struct Vs128Cfg {
     pub p_in_s: bool,
     /// the vendor's reference recipe (`OnlineSoftmax::set_vendor_ref`): lazy rollback above the target, conversion scale 0.25, no LUT, seeded
     pub vref: bool,
+    /// with `vref`: the short-sequence copy keeps its LUT-corrected conversion
+    pub vref_lut: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: true, kscale_sel: true, p_in_s: false, vref: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: true, kscale_sel: true, p_in_s: false, vref: false, vref_lut: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -618,7 +620,7 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
                 body.seed_first = true;
             }
             if cfg.vref {
-                body.sm.set_vendor_ref(b);
+                body.sm.set_vendor_ref_lut(b, cfg.vref_lut);
                 body.seed_first = true;
             }
             body.setprio = cfg.setprio;

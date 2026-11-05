@@ -77,13 +77,17 @@ impl OnlineSoftmax {
     /// (`0x3e7df17e`), lazy-rollback threshold s92 = 0.26135647 (`0x3e85d086`, 6.84/512 above the target: the reference only moves when a row max
     /// passes it), conversion scale s89 = 0.25, no LUT correction. The caller seeds the first tile (`decide_seeded`).
     pub fn set_vendor_ref(&mut self, b: &mut FnBuilder) {
+        self.set_vendor_ref_lut(b, false)
+    }
+    /// `set_vendor_ref`, optionally keeping the LUT correction of the conversion (the short-sequence copy).
+    pub fn set_vendor_ref_lut(&mut self, b: &mut FnBuilder, keep_lut: bool) {
         let s91 = f32::from_bits(0x3e7d_f17e);
         let s92 = f32::from_bits(0x3e85_d086);
         self.recipe.b131 = s91;
         self.b131 = b.c_f32(s91);
         self.recipe.thr = s92;
         self.thr = b.c_f32(s92);
-        self.recipe.lut = false;
+        self.recipe.lut = self.recipe.lut && keep_lut;
         self.conv_s = b.c_f32(0.25);
     }
     pub fn set_thr(&mut self, b: &mut FnBuilder, thr: f32) {
