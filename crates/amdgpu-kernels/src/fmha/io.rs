@@ -1,7 +1,7 @@
-//! L6c: the FMHA kernel-family components - the 656-byte vendor FMHA kernarg ABI as tensors (+ the KV-split extension) with the host contract they imply
-//! (`FmhaIo`), the per-block setup every FMHA kernel starts with (`FmhaBlock`: block/lane ids, clamped query row, resident Q fragments and scales, GQA KV
-//! head, KV-split key range) and the K/V/K-scale LDS ring with its copies and fragment readers (`KvRing`: the `_vs128`/`_kvsplit` 2-slot plan or the
-//! `_t128` 3-slot plan). Kernels (`amdgpu_dsl::fmha_tile`) compose these with a `PipeBody`.
+//! FMHA kernel-family components: the 656-byte vendor FMHA kernarg ABI as tensors (+ the KV-split extension) with the host contract they imply
+//! (`FmhaIo`), the per-block state every FMHA kernel starts with (`FmhaBlock`: block/lane ids, clamped query row, resident Q fragments and scales, GQA KV
+//! head, KV-split key range, the recipe-copy condition and the output scale) and the KV-split combine kernel body (`combine_kernel`). The kernels in
+//! `mod.rs` build these through `declare_io` / `block3` and compose them with a `PipeBody` (`AttnBody3`).
 
 use amdgpu_tile::components;
 use amdgpu_tile::frag::*;

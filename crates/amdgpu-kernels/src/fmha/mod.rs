@@ -1,10 +1,10 @@
-//! The four shipped FMHA forward kernels on the layout layer (P3 of docs/dsl-layout-refactor-design.md): `fmha_fwd_hd128_mxfp8_v3_{vs128, kvsplit,
-//! kvsplit_combine8h, t128}`. Same algorithm and protocol as `amdgpu_dsl::fmha_tile` (the dsl set), but every LDS address of the K/V ring is DERIVED:
+//! The four shipped FMHA forward kernels `fmha_fwd_hd128_mxfp8_v3_{vs128, kvsplit, kvsplit_combine8h, t128}` (docs/fmha-dsl-tour.md). Every LDS
+//! / global address is DERIVED from layouts (amdgpu-layout) and instruction atoms (amdgpu-isa) through the amdgpu-tile abstractions:
 //! * the K fragment reads = `make_tiled_copy_a(ds_read_b128 x2, mma)` over the swizzled [key, d] view (placements `4096 s + 64 c`);
 //! * the transposed V reads = the `ds_read_b64_tr_b8 x4` source layout over the same view;
-//! * the K / V staging = `partition_dma` (destination-side derivation: the swizzle on the source, M0 at the top of the wave slice);
-//! * QK / PV = `gemm` of the scaled 32x32x64 atom.
-//! The FMHA ABI, block setup, K-scale staging/reader, softmax, epilogues and the pipeline cadence are the (layout-free) components of `amdgpu_dsl::tile`.
+//! * the K / V staging = `partition_dma` (destination-side derivation: the swizzle on the source, M0 at the top of the wave slice), MUBUF form in `_vs128`;
+//! * QK / PV = `gemm` of the scaled 32x32x64 atom; the online softmax, row sums, pipeline cadence and epilogues come from amdgpu-tile.
+//! The ABI types, per-block state and the KV-split combine body live in `io.rs`.
 
 use amdgpu_tile::copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_bcast, LdsPart, LdsSlotPart};
 use amdgpu_tile::dma::{issue_rows_shared, partition_dma, DmaPart};
