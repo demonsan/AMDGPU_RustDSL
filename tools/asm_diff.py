@@ -153,10 +153,20 @@ def main():
         ins, labels = parse(p)
         ls = loops(ins, labels)
         best = None
-        for (j, k) in ls:
+        if '--list' in opts:
+            for i, (j, k) in enumerate(ls):
+                body = [t for _, t in ins[j:k + 1]]
+                print('%s loop %d: [%x..%x] %d instr, mfma %d, scaled %d, perm %d, barrier %d' % (name, i, ins[j][0], ins[k][0], k - j + 1,
+                      sum(1 for t in body if cls(t).startswith('mfma')), sum(1 for t in body if cls(t) == 'mfma.scaled'),
+                      sum(1 for t in body if t.startswith('v_perm_b32')), sum(1 for t in body if cls(t) == 'barrier')))
+        sel = opts.get('--loop-' + name)
+        for i, (j, k) in enumerate(ls):
             body = [t for _, t in ins[j:k + 1]]
             nm = sum(1 for t in body if cls(t).startswith('mfma'))
-            if best is None or nm > best[0]:
+            if sel is not None:
+                if i == int(sel):
+                    best = (nm, j, k, body)
+            elif best is None or nm > best[0]:
                 best = (nm, j, k, body)
         units = float(opts.get('--units-' + name, 0)) or None
         body = best[3]
