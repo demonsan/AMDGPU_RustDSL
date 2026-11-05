@@ -107,6 +107,16 @@ pub struct BufForm {
     voffs: Vec<ValueId>,
 }
 
+impl BufForm {
+    pub fn rsrc(&self) -> ValueId {
+        self.rsrc
+    }
+    /// the tile origin byte offset (SGPR)
+    pub fn base(&self) -> ValueId {
+        self.base
+    }
+}
+
 impl DmaPart {
     pub fn buffer_form(&self, b: &mut FnBuilder) -> BufForm {
         assert!(self.atom.bytes == 16 || self.atom.bytes == 4, "DmaPart::buffer_form: 16- or 4-byte DMA only");

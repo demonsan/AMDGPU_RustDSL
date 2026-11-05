@@ -75,10 +75,18 @@ pub struct KvRing3 {
     pub buf: Option<(amdgpu_tile::dma::BufForm, amdgpu_tile::dma::BufForm)>,
     /// MUBUF form of the K-scale DMA
     pub kd_buf: Option<amdgpu_tile::dma::BufForm>,
+    /// EXPERIMENT half-row K copies: (voffset a, voffset b, wave LDS offset, row stride)
+    pub khalf: Option<(ValueId, ValueId, ValueId, I32)>,
 }
 
 impl KvRing3 {
     pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
+        Self::new_opts(b, io, blk, roles, slots, false)
+    }
+    /// `khalf` (EXPERIMENT): K in LDS as half-row runs (the vendor's copy formation): run (rb, h) = rows 16 rb .. 16 rb + 15, bytes 64 h ..
+    /// 64 h + 63 at 2048 rb + 1024 h, 64-byte half rows, the 16-byte chunk XOR-swizzled by (row & 3); group A copies it with two voffsets per
+    /// wave and the instruction immediate 0 / 64 for the two halves (`KHalf`).
+    pub fn new_opts(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, khalf: bool) -> KvRing3 {
         let mut lds = LdsPlan::new();
         let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
         let kd = lds.ring("KD", 512, slots, Layout::Linear);
@@ -98,13 +106,29 @@ impl KvRing3 {
         let o = attention_orientation();
         let mma = make_tiled_mma(o.0, false);
         // K: the A operand (32 keys x 64 bytes) at rows 32 s, k-group c
-        let kview = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![32, 64], tup![128, 1]));
-        let placements: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect();
+        let (kview, placements): (ComposedLayout, Vec<i64>) = if khalf {
+            (
+                ComposedLayout::new(Swizzle::cute(2, 4, 2), make_layout(tup![tup![16, 2], 64], tup![tup![64, 2048], 1])),
+                (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 1024 * c)).collect(),
+            )
+        } else {
+            (ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![32, 64], tup![128, 1])), (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect())
+        };
         let kpart = make_tiled_copy_a(DS_READ_B128X2, &mma).partition_lds(b, &ctx, &l, &ks, &kview, &placements);
         let vpart = make_tiled_copy(DS_READ_TR_B8X4, vt_tr_source(), 128 * 128, 8).partition_lds(b, &ctx, &l, &vs, &kv_view(), &[0]);
         let kdpart = make_tiled_copy_bcast(DS_READ_B32, kd_read_tv(), 128, 32).partition_lds(b, &ctx, &l, &kd, &ComposedLayout::plain(make_layout(128, 4)), &[0]);
         let (kt, vt, kdt) = (blk.kv_tile(b, &io.k), blk.kv_tile(b, &io.v), blk.kv_tile(b, &io.ksc));
         let (ksrc, vsrc, kdsrc) = (kt.row_source(b, 1), vt.row_source(b, 1), kdt.row_source(b, 1));
+        let khalf_v = khalf.then(|| {
+            // lane l of wave w: row 32 w + (l >> 2) (+16 for the second voffset), logical chunk (l & 3) ^ ((l >> 2) & 3)
+            let l = lane.lane();
+            let r = (l.clone() >> 2) + (ev(roles.wave_in_group) << 5);
+            let ch = ((l.clone() & 3) ^ ((l.clone() >> 2) & 3)) << 4;
+            let va = b.bind_i32(r.clone() * &ksrc.stride + ch.clone());
+            let vb = b.bind_i32((r + 16) * &ksrc.stride + ch);
+            let lw = b.bind_i32(ev(roles.wave_in_group) << 12);
+            (va, vb, lw, ksrc.stride.clone())
+        });
         let wv = ev(roles.wave_in_group);
         let kdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, ksrc, &ks, &kv_view());
         let vdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, vsrc, &vs, &kv_view());
@@ -117,7 +141,7 @@ impl KvRing3 {
             let rt_row = b.bind_i32(lane.tid().lshr(1));
             KdCopy3::Vgpr(amdgpu_tile::rows::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
         };
-        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None, kd_buf: None }
+        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None, kd_buf: None, khalf: khalf_v }
     }
     /// Switches the K / V staging to the buffer form (the vendor's `buffer_load_dwordx4 ... lds` with an SGPR soffset).
     pub fn enable_buffer_dma(&mut self, b: &mut FnBuilder) {
@@ -140,9 +164,25 @@ impl KvRing3 {
                     Some(kb) => kd.issue_buffer(b, kb, key0, &self.kd.at(slot)),
                     None => kd.issue(b, key0, &self.kd.at(slot)),
                 }
-                match &self.buf {
-                    Some((kb, _)) => self.kdma.issue_buffer(b, kb, key0, &self.ks.at(slot)),
-                    None => self.kdma.issue(b, key0, &self.ks.at(slot)),
+                match (&self.buf, &self.khalf) {
+                    (Some((kb, _)), Some((va, vb, lw, stride))) => {
+                        let so = b.bind_i32(key0.clone() * stride + ev(kb.base()));
+                        let so = b.read_first_lane(so);
+                        let sl = self.ks.at(slot);
+                        let off = sl.off_v(b);
+                        let rsrc = kb.rsrc();
+                        let (va, vb, lw) = (*va, *vb, *lw);
+                        sl.write(b, |b| {
+                            for q in 0..4i32 {
+                                let (h, rb) = (q & 1, q >> 1);
+                                let m0 = b.bind_i32(ev(lw) + off.clone() + (2048 * rb + 1024 * h - 64 * h));
+                                let m0 = b.read_first_lane(m0);
+                                b.buffer_load_lds_b128(rsrc, if rb == 0 { va } else { vb }, so, m0, (64 * h) as u32);
+                            }
+                        });
+                    }
+                    (Some((kb, _)), None) => self.kdma.issue_buffer(b, kb, key0, &self.ks.at(slot)),
+                    _ => self.kdma.issue(b, key0, &self.ks.at(slot)),
                 }
                 None
             }
@@ -381,13 +421,18 @@ impl PipeBody for AttnBody3<'_> {
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
+    vs128_exp("fmha_fwd_hd128_mxfp8_v3_vs128", 0)
+}
+
+/// EXPERIMENT builds (bit 0: half-row K copies, `KvRing3::new_opts`)
+pub fn vs128_exp(name: &str, x: u32) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
     let blk = block3(&io, b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
-    let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
+    let mut ring = KvRing3::new_opts(b, &io, &blk, &roles, 2, x & 1 != 0);
     ring.enable_buffer_dma(b);
     ring.enable_buffer_kd(b);
     let ring = ring;
