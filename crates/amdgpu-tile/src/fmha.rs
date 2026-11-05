@@ -516,7 +516,9 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
         ring.enable_buffer_dma(b);
     }
     let ring = ring;
-    let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
+    // the V-phase read-ahead stays in flight across the mid barrier
+    pipe.mid_lds_drain = !cfg.vpre;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {

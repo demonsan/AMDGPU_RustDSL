@@ -116,6 +116,10 @@ pub struct Pipeline {
     /// loading across the next window. Only valid when the body issues no other VMEM in the window and does not use `stage_complete` (the
     /// verifier checks the completion with the counted-vmcnt rule).
     pub vm_inflight: u8,
+    /// `TwoPhaseOffset`: drain this wave's LDS reads (`s_waitcnt lgkmcnt(0)`) before the mid-tile barrier (default). Off when the V phase issues
+    /// read-ahead `ds_read`s for the M phase (the vendor keeps them in flight across the barrier; the V phase writes no LDS, its DMA is
+    /// completed by the `wait_vm(0)`).
+    pub mid_lds_drain: bool,
     /// `RegStaged`: two tiles per loop pass with STATIC ring slots (0 then 1: the tile counter is even at the top), so the slot offsets are
     /// constants (the vendor `u2`); the loop may exit between the two halves.
     pub unroll2: bool,
@@ -142,7 +146,7 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -369,7 +373,9 @@ impl Pipeline {
                     b.wait_vm(0);
                     body.stage_complete(b, role, &t.next);
                 }
-                b.wait_lds(0);
+                if self.mid_lds_drain {
+                    b.wait_lds(0);
+                }
                 b.barrier();
                 body.m_phase(b, role, &t);
                 b.wait_lds(0);
