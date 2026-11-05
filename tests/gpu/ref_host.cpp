@@ -58,7 +58,8 @@ int main(int argc, char** argv) {
     // Ours: two tilings share the ABI - 256 rows/512 threads (_vs128) and 128 rows/256 threads (_t128).
     //   REF_CO2 / REF_KNAME2             = the 256-row kernel (or a single kernel)
     //   REF_CO2_SMALL / REF_KNAME2_SMALL = the 128-row kernel; when present, dispatch is automatic:
-    //       t128 iff 2*ceil(S/256)*H*B <= 256 (its own grid fits the 256 CUs in one wave), else _vs128.
+    //       t128 iff ceil(S/256)*H*B <= 64 (a quarter of the CUs), else _vs128 (measured on realistic data, REF_DATA=normal: _vs128 is
+    //       ahead from N256 = 128 on, e.g. B1H32S1024 +13 %, B4H8S1024 +10 %; _t128 ahead at N256 <= 64, e.g. B4H8S512 +6 %).
     //   Overrides: REF_ROWS_PER_BLOCK=128|256, REF_GRID128=1, REF_OURS_BLOCK_THREADS.
     const char* kname_env = std::getenv("REF_KNAME2");
     const char* co_small = std::getenv("REF_CO2_SMALL");
@@ -121,18 +122,19 @@ int main(int argc, char** argv) {
     };
     bool use_split = false; const char* split_why = "split not requested";
     if (co_split && co_comb && splits <= 1 && envi("REF_NO_AUTO_SPLIT", 0) == 0) {
-        // default auto dispatch: best guard-passing split among {2, 4}
-        int best = 0; double best_t = 1e9;
-        const bool fused_req = envi("REF_FUSED", 0) != 0 && std::getenv("REF_CO2_FUSED");   // the fused kernel is built for 4 splits
-        for (int s : {2, 4}) {
-            if (fused_req && s != 4) continue;
-            const SplitEval r = eval_split(s);
-            std::printf("[split] auto candidate s=%d: blocks256=%ld ntiles=%d tps=%d tiles_ok=%d model T_current=%.2f us T_kvsplit=%.2f us guard=%d\n",
-                        s, blocks256, (SK + 127) / 128, r.tps, (int)r.tiles_ok, r.t_cur * 1e6, r.t_kv * 1e6, (int)r.guard);
-            if (r.guard && r.t_kv < best_t) { best = s; best_t = r.t_kv; }
-        }
-        if (best > 0) { splits = best; use_split = true; split_why = "auto dispatch: guard N256<=128 && N256*s<=256 && tiles && T_kv < 0.95 T_current"; }
-        else split_why = "auto dispatch: no split passes the guard (fallback to t128/_vs128)";
+        // default auto dispatch, fitted on realistic data (REF_DATA=normal, GPU 5, 24 shapes; kernel-opt fmha-dispatch): split when the
+        // sequence is long enough for the split to pay its combine - ntiles >= 16 and N256 <= 64 (s = 4), or ntiles >= 32 and N256 <= 128
+        // (s = 2, so N256 s <= 256); e.g. B1H8S2048 split4 +11 % over _t128, B1H4S8192 split2 +16 % over _vs128, B1H8S1024 (8 tiles) and
+        // B2H8S2048 (N256 = 128, 16 tiles) stay unsplit. (The cost model above was fitted on the palette data, where the softmax rolls back
+        // on almost every tile; it is kept for REF_SPLIT requests and the printout.)
+        const int ntiles = (SK + 127) / 128;
+        int best = 0;
+        if (ntiles >= 16 && blocks256 <= 64) best = 4;
+        else if (ntiles >= 32 && blocks256 <= 128) best = 2;
+        if (best > 0 && !eval_split(best).tiles_ok) best = 0;
+        std::printf("[split] auto: blocks256=%ld ntiles=%d -> %s%d\n", blocks256, ntiles, best ? "split " : "no split", best);
+        if (best > 0) { splits = best; use_split = true; split_why = "auto dispatch: ntiles>=16 && N256<=64 (s=4) | ntiles>=32 && N256<=128 (s=2)"; }
+        else split_why = "auto dispatch: no split (fallback to t128/_vs128)";
     } else if (splits > 1 && co_split) {
         const SplitEval r = eval_split(splits);
         if (force_split) { use_split = true; split_why = "REF_SPLIT_FORCE"; }
@@ -149,7 +151,7 @@ int main(int argc, char** argv) {
     if (use_split) { rows_pb = s_rows_pb; why = "KV-split (main+combine)"; }
     else if (forced_rows == 128 || forced_rows == 256) { rows_pb = forced_rows; why = "REF_ROWS_PER_BLOCK override"; }
     else if (envi("REF_GRID128", 0) != 0) { rows_pb = 128; why = "REF_GRID128=1"; }
-    else if (co_small) { rows_pb = blocks256 <= 128 ? 128 : 256; why = blocks256 <= 128 ? "auto: 2*ceil(S/256)*H*B <= 256 CUs" : "auto: 2*ceil(S/256)*H*B > 256 CUs"; }
+    else if (co_small) { rows_pb = blocks256 <= 64 ? 128 : 256; why = blocks256 <= 64 ? "auto: ceil(S/256)*H*B <= 64" : "auto: ceil(S/256)*H*B > 64"; }
     else { rows_pb = k_t128 ? 128 : 256; why = "kernel name"; }
     const char* use_co = use_split ? co_split : ((rows_pb == 128 && co_small) ? co_small : std::getenv("REF_CO2"));
     const char* use_kn = use_split ? kname_split : ((rows_pb == 128 && co_small) ? kname_small : (kname_env ? kname_env : "fmha_fwd_hd128_mxfp8_v3_vs128"));

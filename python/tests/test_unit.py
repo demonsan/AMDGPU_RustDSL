@@ -80,7 +80,10 @@ class T(unittest.TestCase):
     def test_select_path(self):
         self.assertEqual(select_path(4, 8, 2048, 2048), ("vs128", 0))
         self.assertEqual(select_path(1, 8, 8192, 8192)[0], "vs128")
-        self.assertEqual(select_path(2, 8, 2048, 2048), ("t128", 0))
+        self.assertEqual(select_path(2, 8, 2048, 2048), ("vs128", 0))
+        self.assertEqual(select_path(4, 8, 512, 512), ("t128", 0))
+        self.assertEqual(select_path(1, 8, 1024, 1024), ("t128", 0))
+        self.assertEqual(select_path(1, 4, 8192, 8192), ("kvsplit", 2))
         self.assertEqual(select_path(1, 8, 2048, 2048), ("kvsplit", 4))
 
 

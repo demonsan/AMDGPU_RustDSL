@@ -59,27 +59,17 @@ def _present(kern, vals):
 
 # ----------------------------------------------------------------------------------------------------------------------------- FMHA
 def select_path(B, H, S, SK, *, cus=256, partial_bytes=2):
-    """The shipped dispatch (tests/gpu/ref_host.cpp): the best KV split s in {2, 4} that passes the guard (N256 <= 128, N256 s <= 256, every split
-    owns a tile, modelled T_kv < 0.95 T_current), else ``t128`` when 2 ceil(S/256) H B <= 256, else ``vs128``. Returns (path, splits)."""
+    """The shipped dispatch (tests/gpu/ref_host.cpp, fitted on realistic data): KV split when ntiles >= 16 and N256 <= 64 (4 splits) or
+    ntiles >= 32 and N256 <= 128 (2 splits), with N256 = ceil(S/256) H B and ntiles = ceil(SK/128); otherwise ``t128`` when N256 <= 64, else
+    ``vs128``. Returns (path, splits)."""
     blocks256 = math.ceil(S / 256) * H * B
-    F = 4.0 * B * H * S * SK * D
-    rows_total = B * S * H
-    t_cur = F / (5.96e12 * min(cus, 2.0 * blocks256 if blocks256 <= 128 else blocks256)) + 7.48e-6
-    best, best_t = 0, 1e9
     ntiles = (SK + 127) // 128
-    for s in (2, 4):
-        part_b = s * rows_total * D * partial_bytes + s * rows_total * 4
-        comb_b = part_b + rows_total * D * 2
-        t_kv = F / (7.38e12 * min(cus, blocks256 * s)) + 6.80e-6 + part_b / 4.0e12 + max(3.0e-6, comb_b / 4.2e12) + 1.0e-6
+    s = 4 if (ntiles >= 16 and blocks256 <= 64) else 2 if (ntiles >= 32 and blocks256 <= 128) else 0
+    if s:
         tps = (ntiles + s - 1) // s
-        tiles_ok = tps >= 1 and (s - 1) * tps < ntiles
-        guard = blocks256 <= 128 and blocks256 * s <= cus and tiles_ok and t_kv < 0.95 * t_cur
-        if guard and t_kv < best_t:
-            best, best_t = s, t_kv
-    if best:
-        return "kvsplit", best
-    return ("t128" if blocks256 <= 128 else "vs128"), 0
-
+        if (s - 1) * tps < ntiles:
+            return "kvsplit", s
+    return ("t128" if blocks256 <= 64 else "vs128"), 0
 
 _workspace = {}
 
