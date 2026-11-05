@@ -30,3 +30,5 @@ Thumbs.db
 
 # Local toolchain scratch (Rust is installed inside the container)
 _tools/
+__pycache__/
+*.pyc
