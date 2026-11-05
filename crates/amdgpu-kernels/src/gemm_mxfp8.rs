@@ -1409,6 +1409,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
         (bx0, by0)
     };
     let (lg_m, lg_n) = (cta_m.trailing_zeros() as i32, cta_n.trailing_zeros() as i32);
+    let _dce_probe = b.bind_i32(ev(tid) * 7 + 12345);
     let wm = b.bind_i32(lane.wave() & 1);
     let wn = b.bind_i32(lane.wave().lshr(1));
 
