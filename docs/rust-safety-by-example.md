@@ -47,7 +47,7 @@
 **规则**：kernel 不是字符串拼接、也不是内联汇编，而是用**类型化 builder** 描述数据流；所有值都是 `ValueId`，
 所有操作都是 `Op` 枚举的一个变体。
 
-**真实写法**（`crates/amdgpu-kernels/src/probes.rs`，`probe_llvm_kernarg` 节选）：
+**真实写法**（`crates/amdgpu-kernels/src/probes/mod.rs`，`probe_llvm_kernarg` 节选）：
 
 ```rust
 let mut b = FnBuilder::new("probe_llvm_kernarg", 64);

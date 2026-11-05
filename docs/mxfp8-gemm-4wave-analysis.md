@@ -315,7 +315,7 @@ hipModuleLaunchKernel(fn, N/256, M/256, 1, 256, 1, 1, 0, stream, nullptr, cfg);
 
 ## 11. 结果：tile 库实现的 MXFP8 blockscale GEMM（P4 收尾，2026-11-03）
 
-代码：`crates/amdgpu-kernels/src/gemm_mxfp8.rs`（只用 route-B 层：amdgpu-layout 推导全部地址、amdgpu-isa atom、amdgpu-tile `TiledMma`(16x16x128, swap_ab) /
+代码：`crates/amdgpu-kernels/src/gemm/mod.rs`（只用 route-B 层：amdgpu-layout 推导全部地址、amdgpu-isa atom、amdgpu-tile `TiledMma`(16x16x128, swap_ab) /
 `TiledCopy`(`partition_lds`)、`tile::Pipeline`）；配置 `GemmConfig::{v2,v3,v4}`，最佳 = **v4**（vendor 结构：操作数作为 AGPR 循环变量、在最后一次使用后原地重载
 下一块，`Cadence::RegStaged` + `Pipeline::unroll2`）。门禁 `tools/gemm_gate.sh <kernel>`（cargo test、`gpu-verify --strict`、3 个形状 GEMM_OK、3 次启动确定性、
 与 vendor 交错 7 进程 × 3 次的中位数）。

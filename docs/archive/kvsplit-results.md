@@ -2,7 +2,7 @@
 
 > Status: results + shipped: KV-split is in the default `_auto` dispatch (B1H8S2048 674-705 TFLOP/s = 1.25-1.31x vendor); the fused last-arriver combine closed negative (round 62) and the epilogue corruption root cause (VMEM wide-store data WAR) is fixed (round 69); see docs/current-status.md.
 
-Kernels (all in `crates/amdgpu-kernels/src/probes.rs`, registered by name only):
+Kernels (all in `crates/amdgpu-kernels/src/probes/mod.rs`, registered by name only):
 - `fmha_fwd_hd128_mxfp8_kvsplit` - phase 1: the `_vs128` block shape (256 rows, 512 threads, LDS 102400, vgpr 231) over one 128-key-tile-aligned key range per block (`tps = ceil(ceil(SK/128)/splits)`, split s owns tiles [s*tps, min(ntiles,(s+1)*tps))); grid `(ceil(S/256), H, B*splits)`, `split = z % splits`, `b = z / splits`; kernarg = 656-byte base + `Ohat`@0x270, `lse`@0x278, `splits`@0x280, `rows_total`@0x284. The K/V/K-scale base offsets are shifted by the first key, every key index inside the kernel is relative to it. Epilogue: `Ohat = O * Vdescale / l` (fp32, 16-byte `global_store_dwordx4` stores, new `Stmt::StoreF32x4`) and `lse = log2(l) - 512 b_final` (new `Op::Log2F32` = `v_log_f32`; the kernel's P is 2^(x + 512 b - 127) so the additive constant is split-independent and cancels in the combine weights). The recipe copy (LUT correction below 9 tiles) is chosen by the TOTAL tile count of the sequence, exactly as `_vs128`.
 - `fmha_fwd_hd128_mxfp8_kvsplit_combine` - the contract version (one thread per element, 256 threads, grid rows*128/256).
 - `fmha_fwd_hd128_mxfp8_kvsplit_combine4` - vectorised: 4 elements per thread (16-byte loads, 8-byte store): launch with `REF_COMBINE_GRID = ceil(rows_total*128/4/256)` (2048 for B1H8S2048).

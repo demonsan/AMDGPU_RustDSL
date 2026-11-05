@@ -127,7 +127,7 @@ MFMA 的 A TV 布局是 §1 那个；复合起来（`tests/fmha_vs128.rs:20` 用
 读法：lane 的低 5 位走 128 字节（行），第 6 位走 16 字节（另一半 k），值的低 4 位逐字节，第 5 位跳 32 字节。这就是"每个 lane 读哪些字节"，
 不再需要手推。
 
-**right_inverse 的用法**（GEMM 的 DMA，`crates/amdgpu-kernels/src/gemm_mxfp8.rs` 的 `dma_plan`）：LDS-direct DMA 的**目的地固定**为
+**right_inverse 的用法**（GEMM 的 DMA，`crates/amdgpu-kernels/src/gemm/mod.rs` 的 `dma_plan`）：LDS-direct DMA 的**目的地固定**为
 `M0 + 16·lane`，问题是"LDS 第 d 字节放的是 tile 的哪个元素"——这是 LDS 布局的逆。于是源地址 = `glob ∘ right_inverse(smem)`：
 
 ```rust
@@ -276,7 +276,7 @@ let kdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, ksrc, &ks, &kv_
 `crates/amdgpu-tile/tests/address_equality.rs` 和 `dma_equality.rs` 用一个小解释器跑发射出的 IR，证明这些地址与旧手写 reader / copy 对每个 lane、
 每条指令逐字相等。
 
-### GEMM（MXFP8 blockscale，`crates/amdgpu-kernels/src/gemm_mxfp8.rs`）
+### GEMM（MXFP8 blockscale，`crates/amdgpu-kernels/src/gemm/mod.rs`）
 
 LDS 图像是 16 行 × 16 字节交错（和厂商 B 预洗牌一致，一个 16 lane 组正好扫完 256 个连续字节，所有 bank 各一次）：
 

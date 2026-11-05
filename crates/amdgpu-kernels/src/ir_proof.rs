@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::gemm_mxfp8::GemmConfig;
+use crate::gemm::GemmConfig;
 
 #[derive(Debug)]
 pub struct ProofError(pub String);

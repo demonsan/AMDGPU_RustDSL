@@ -5,7 +5,7 @@
 > （与 `tools/port_gate.sh` 的 `PERF_TOL=0.97` 一致）。本文列出库**必须**复现的每一个模式：指令级形状、代码位置、
 > 实测影响、分类、库需要暴露/保证的抽象。
 >
-> 缩写：`K` = [`crates/amdgpu-kernels/src/probes.rs`](../crates/amdgpu-kernels/src/probes.rs)（22.5k 行），
+> 缩写：`K` = [`crates/amdgpu-kernels/src/probes/mod.rs`](../crates/amdgpu-kernels/src/probes/mod.rs)（22.5k 行），
 > `C` = [`crates/amdgpu-compiler/src/lib.rs`](../crates/amdgpu-compiler/src/lib.rs)，
 > `H` = [`crates/amdgpu-compiler/src/hazards.rs`](../crates/amdgpu-compiler/src/hazards.rs)，
 > `S.rN` = [`docs/archive/status.md`](archive/status.md) 第 N 轮，`CS` = [`docs/current-status.md`](current-status.md)，

@@ -5,7 +5,7 @@
 Status: **spec + scaffolding** (kernel-opt, 2026-10-30). Target kernel `fmha_fwd_hd128_mxfp8_vs5` (registered, builds, asm and output bit-identical to `_vs128`:
 `diff` of the emitted `.s` = 0 lines, md5 faadf00c / c8b7a893 / d17778b0 on 1 8 2048 2048, 4 8 2048 2048, 3 3 768 1280). Everything below was extracted from the
 emitted asm of `_vs128` (own backend, long/no-LUT recipe copy, `loop 2` = group A, `loop 3` = group B) and the DSL role `emit_fmha_vs128_role`
-(`crates/amdgpu-kernels/src/probes.rs`).
+(`crates/amdgpu-kernels/src/probes/mod.rs`).
 
 ## 1. What a tile looks like today (per wave, measured from the asm)
 One loop iteration = one 128-key tile per wave = two phases separated by two `s_barrier`s; the two wave groups (A = waves 0-3 staging K + K scales, B = waves 4-7

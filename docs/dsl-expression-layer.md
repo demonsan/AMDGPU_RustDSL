@@ -3,7 +3,7 @@
 > 起因（用户评论）：“kernel 近乎手写 asm，地址计算和数学计算不能直接用 Rust 运算符描述吗？IR 为什么不能处理？”
 > 结论：**能，而且已经做了**——在**不改 IR、不改 MIR、不改任何 shipped kernel** 的前提下，加一层纯数据的运算符表达式（`crates/amdgpu-dsl/src/expr.rs`）。但它**只**覆盖“地址/整数/朴素浮点”这一类逐点标量表达式；下面第 3 节解释为什么“只靠 IR”不够、哪些东西必须保持显式。
 
-## 1. 数据：现状（`crates/amdgpu-kernels/src/probes.rs`，22,000+ 行）
+## 1. 数据：现状（`crates/amdgpu-kernels/src/probes/mod.rs`，22,000+ 行）
 
 | builder 调用 | 出现次数 |
 |---|---|

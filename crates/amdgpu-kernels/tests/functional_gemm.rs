@@ -18,7 +18,7 @@ use amdgpu_layout::{make_layout, proofs, tup, Dyns};
 use amdgpu_tile::make_tiled_mma;
 use std::collections::{HashMap, HashSet};
 
-use amdgpu_kernels::gemm_mxfp8::GemmConfig;
+use amdgpu_kernels::gemm::GemmConfig;
 
 #[derive(Debug)]
 struct ProofError(String);
@@ -190,5 +190,5 @@ fn swallowed_tile_one_is_rejected_with_a_concrete_counterexample() {
 
 #[test]
 fn v4_dpp_scale_panel_transposition_is_proved() {
-    amdgpu_kernels::gemm_mxfp8::verify_sfa_transpose();
+    amdgpu_kernels::gemm::verify_sfa_transpose();
 }

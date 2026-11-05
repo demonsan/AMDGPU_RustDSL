@@ -112,7 +112,7 @@ It returns the `plan_convert` movement and cost of every hand-off. A boundary em
 the Region node and the verifier checks it. Tests: `crates/amdgpu-tile/tests/contract_stage.rs` covers an identity hand-off, a transposed
 expectation reported as cross-lane, and four error cases.
 
-### 3.2 Fused GEMM → elementwise → GEMM (`crates/amdgpu-kernels/src/mlp_fp8.rs`)
+### 3.2 Fused GEMM → elementwise → GEMM (`crates/amdgpu-kernels/src/mlp/mod.rs`)
 
 The chain is `Y = fp8(relu(0.125 · X W1)) W2`:
 

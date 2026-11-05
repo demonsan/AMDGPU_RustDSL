@@ -4,11 +4,11 @@
 #![forbid(unsafe_code)]
 
 pub mod fmha;
-pub mod gemm_mxfp8;
-pub mod handoff_probe;
+pub mod gemm;
+pub mod mlp;
 pub mod ir_proof;
-pub mod mlp_fp8;
 pub mod probes;
+pub mod verifier_cases;
 pub mod registry;
 
 pub use registry::{kernel_by_name, kernel_names};

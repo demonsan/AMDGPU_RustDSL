@@ -1,5 +1,5 @@
 //! E3: symbolic execution of the BUILT `gemm_mxfp8_bs_v4` Function (actual DSL IR, not a replica).
-use amdgpu_kernels::gemm_mxfp8::{gemm_mxfp8_bs, GemmConfig};
+use amdgpu_kernels::gemm::{gemm_mxfp8_bs, GemmConfig};
 use amdgpu_kernels::ir_proof::{check_trace, prove_ir};
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -61,7 +61,7 @@ fn shipped_v4_lds_epilogue_also_carries_the_theorem() {
     let _guard = ENV_LOCK.lock().unwrap();
     std::env::remove_var("GEMM_PROOF_DROP_KB");
     let cfg = GemmConfig::v4();
-    let f = amdgpu_kernels::gemm_mxfp8::gemm_mxfp8_bs_v4();
+    let f = amdgpu_kernels::gemm::gemm_mxfp8_bs_v4();
     let t = prove_ir(&f, &cfg, 256, 256, 384).expect("symbolic execution of shipped v4");
     check_trace(&t, &cfg, 256, 256, 384, None).expect("E3 theorem on shipped v4 LDS epilogue");
     println!("E3 shipped v4: insts={} stores={} contributions={} (LDS epilogue)", t.executed_insts, t.stores.len(), t.c_count.len());
@@ -72,7 +72,7 @@ fn shipped_v4_lds_epilogue_also_carries_the_theorem() {
 fn shipped_v4_kernel_code_dropped_generation_counterexample() {
     let _guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("GEMM_PROOF_DROP_KB", "1");
-    let f = amdgpu_kernels::gemm_mxfp8::gemm_mxfp8_bs_v4();
+    let f = amdgpu_kernels::gemm::gemm_mxfp8_bs_v4();
     std::env::remove_var("GEMM_PROOF_DROP_KB");
     let cfg = GemmConfig::v4();
     let t = prove_ir(&f, &cfg, 256, 256, 384).expect("symbolic execution of buggy shipped v4");

@@ -151,7 +151,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设。
 | `fmha_fwd_hd128_mxfp8_auto` | **默认**（guard 选择）：`v3_vs128` / `v3_t128` / `v3_kvsplit` + `v3_kvsplit_combine8h`（`crates/amdgpu-kernels/src/fmha/mod.rs`） |
 | `fmha_fwd_hd128_mxfp8_dsl_auto` | 上一版 tile 库集 `dsl_*`（crates/amdgpu-dsl/src/fmha_tile.rs（已在 2026-11 清理中删除）），A/B 对照用 |
 | `fmha_fwd_hd128_mxfp8_v3s_*` | v3 的别名（同代码），配合 `FMHA_OPT_SCOPE=v3s` 对实验 token 做同轮 A/B |
-| `fmha_fwd_hd128_mxfp8_legacy_auto` | 旧手写集（`_vs128` / `_t128` / `_kvsplit` / `combine8h`，`crates/amdgpu-kernels/src/probes.rs`），A/B 对照用 |
+| `fmha_fwd_hd128_mxfp8_legacy_auto` | 旧手写集（`_vs128` / `_t128` / `_kvsplit` / `combine8h`，`crates/amdgpu-kernels/src/probes/mod.rs`），A/B 对照用 |
 | `gemm_mxfp8_bs_v4` / `_v3` | MXFP8 blockscale GEMM（`crates/amdgpu-kernels`）；v4 = 厂商结构（寄存器暂存、AGPR 原地重载），v3 = 不做原地重载的变体 |
 | `_t`、`_g2/_g3/_g3o/_pp/_sv/_vs5/_vs6/_vs9/_vsm` | 历史/实验变体，仅按名（负结果，见 [`archive/`](archive/README.md)） |
 

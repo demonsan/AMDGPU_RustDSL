@@ -145,7 +145,7 @@ per 128 keys either way (32 cycles).
 
 The rewrite wants to replace the two row-sum scaled MFMAs with `v_smfmac_f32_16x16x128_fp8_fp8`.
 `tests/gpu/smfmac_host.cpp` + `tools/vendor_smfmac_probe.sh` run a 14-experiment probe
-(`probe_smfmac_ones` in `crates/amdgpu-kernels/src/probes.rs`, own backend) that dumps the 4-dword D of
+(`probe_smfmac_ones` in `crates/amdgpu-kernels/src/probes/mod.rs`, own backend) that dumps the 4-dword D of
 every lane for each experiment. The probe is built on the new additive DSL/MIR support
 `b.smfmac_fp8_16x16x128(a_frag4, b_frag8, idx_v1, c_frag4)` (MOp `VSmfmac16x16x128Fp8`), so the
 rewrite can use it directly.
