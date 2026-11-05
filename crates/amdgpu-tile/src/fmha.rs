@@ -295,7 +295,7 @@ pub struct AttnBody3<'a> {
     pub pvlead: bool,
     vpre_vals: Vec<ValueId>,
     /// `Vs128Cfg::vlate`: the deferred V stage (key0, slot), issued between the QK blocks of the M phase
-    late: Option<(I32, SlotIdx)>,
+    late: std::cell::RefCell<Option<(I32, SlotIdx)>>,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -303,7 +303,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, scaleconv: false, vpre: false, pvlead: false, vpre_vals: Vec::new(), late: None }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, scaleconv: false, vpre: false, pvlead: false, vpre_vals: Vec::new(), late: std::cell::RefCell::new(None) }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -337,7 +337,7 @@ impl<'a> AttnBody3<'a> {
         let r = self.ring;
         let k = r.kpart.at(b, &r.ks.at(slot));
         let kd = r.kdpart.at(b, &r.kd.at(slot));
-        let late = self.late.take();
+        let late = self.late.borrow_mut().take();
         let mut res = Vec::new();
         for s in 0..4usize {
             if let Some(v) = self.qk_block(b, &out, bias, &k, &kd, s) {
@@ -425,7 +425,7 @@ impl PipeBody for AttnBody3<'_> {
     fn defer_stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
         // only the V stage of group B is spread over the QK blocks; anything else is issued now
         if role == Role::B && self.ring.pad_dma.is_none() {
-            self.late = Some((key0.clone(), slot.clone()));
+            *self.late.borrow_mut() = Some((key0.clone(), slot.clone()));
         } else {
             self.kd_pending = self.ring.stage(b, role, key0, slot);
         }
