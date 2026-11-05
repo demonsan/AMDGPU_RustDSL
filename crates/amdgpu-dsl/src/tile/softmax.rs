@@ -209,7 +209,7 @@ impl OnlineSoftmax {
                 for a in &o.accs {
                     b.var_scale_pk(a.var, cd);
                 }
-                b.var_scale_lane(self.l_acc(), 2, corr);
+                self.scale_l(b, corr);
             }
             b.end_if();
             // the branch has no exec mask: lanes that are not `big` (scaled path) must add 0
@@ -236,7 +236,7 @@ impl OnlineSoftmax {
             for a in &o.accs {
                 b.var_scale_pk(a.var, cd);
             }
-            b.var_scale_lane(self.l_acc(), 2, corr);
+            self.scale_l(b, corr);
         }
         b.end_if();
         nb
@@ -259,8 +259,29 @@ impl OnlineSoftmax {
         self.smf.row_sum(b, self.l_acc(), pa, pb);
     }
 
+    /// Switches the row sums to the two-smfmac form (`SmfmacOnes::new_rows2`).
+    pub fn use_rows2(&mut self, b: &mut FnBuilder, lane: &Lane, dwords: [u8; 2], idx: [u32; 2]) {
+        self.smf = SmfmacOnes::new_rows2(b, lane, dwords, idx);
+    }
+    /// `l *= corr` on the dwords that hold the row sum.
+    fn scale_l(&self, b: &mut FnBuilder, corr: ValueId) {
+        match self.smf.rows2 {
+            Some([d0, d1]) => {
+                b.var_scale_lane(self.l_acc(), d0, corr);
+                b.var_scale_lane(self.l_acc(), d1, corr);
+            }
+            None => b.var_scale_lane(self.l_acc(), 2, corr),
+        }
+    }
     /// The final row sum `l` (after the loop): dword 2 of the smfmac accumulator / 16.
     pub fn l_total(&self, b: &mut FnBuilder) -> ValueId {
+        if let Some([d0, d1]) = self.smf.rows2 {
+            let x0 = b.frag4_lane(Opnd::Var(self.l_acc()), d0);
+            let x1 = b.frag4_lane(Opnd::Var(self.l_acc()), d1);
+            let f0 = b.bitcast_f32(x0);
+            let f1 = b.bitcast_f32(x1);
+            return b.add_f32(f0, f1);
+        }
         let d2 = b.frag4_lane(Opnd::Var(self.l_acc()), 2);
         let lf = b.bitcast_f32(d2);
         let c = b.c_f32(0.0625);

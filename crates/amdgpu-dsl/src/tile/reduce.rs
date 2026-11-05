@@ -117,6 +117,8 @@ pub struct SmfmacOnes {
     pub a: ValueId,
     pub idx01: ValueId,
     pub idx23: ValueId,
+    /// two-smfmac form (`new_rows2`): the row sum is in D dwords `rows2[0]` + `rows2[1]`; `idx01` is the per-lane index word
+    pub rows2: Option<[u8; 2]>,
 }
 impl SmfmacOnes {
     pub fn new(b: &mut FnBuilder, lane: &Lane) -> SmfmacOnes {
@@ -132,10 +134,37 @@ impl SmfmacOnes {
         let a = b.frag4(a23, a23, a01, a01);
         let idx01 = b.c_i32(0x4444_4444_u32 as i32);
         let idx23 = b.c_i32(0xeeee_eeee_u32 as i32);
-        SmfmacOnes { a, idx01, idx23 }
+        SmfmacOnes { a, idx01, idx23, rows2: None }
+    }
+    /// The two-smfmac row sums (amdgpu-tile `rowsum::RowSum2`, proven on the probe-measured smfmac maps): A lane of row m = lane % 16 is active iff
+    /// `m % 4` is one of `dwords`; its ones sit in stored values 0..7 (dwords 0, 1: the even B k groups = query n) when `(m / 4)` is even, else in 8..15
+    /// (odd k groups = query n + 16); its index word is `idx[1]` on the row `4 G + dwords[1]`, else `idx[0]`.
+    pub fn new_rows2(b: &mut FnBuilder, lane: &Lane, dwords: [u8; 2], idx: [u32; 2]) -> SmfmacOnes {
+        let ones = b.c_i32(0x3838_3838);
+        let z = b.c_i32(0);
+        let r = b.let_i32(lane.lane() & 3);
+        let even = b.bind_cond((lane.lane() & 4).lt(1));
+        let c0 = b.bind_cond(r.eq(dwords[0] as i32));
+        let c1 = b.bind_cond(r.eq(dwords[1] as i32));
+        let lo_e = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(even), a: Opnd::Val(ones), b: Opnd::Val(z) });
+        let hi_e = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(even), a: Opnd::Val(z), b: Opnd::Val(ones) });
+        let lo1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c1), a: Opnd::Val(lo_e), b: Opnd::Val(z) });
+        let lo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c0), a: Opnd::Val(lo_e), b: Opnd::Val(lo1) });
+        let hi1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c1), a: Opnd::Val(hi_e), b: Opnd::Val(z) });
+        let hi = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c0), a: Opnd::Val(hi_e), b: Opnd::Val(hi1) });
+        let a = b.frag4(lo, lo, hi, hi);
+        let i0 = b.c_i32(idx[0] as i32);
+        let i1 = b.c_i32(idx[1] as i32);
+        let iw = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c1), a: Opnd::Val(i1), b: Opnd::Val(i0) });
+        SmfmacOnes { a, idx01: iw, idx23: iw, rows2: Some(dwords) }
     }
     /// `la += rowsum(P)`: four in-place `v_smfmac_f32_16x16x128_fp8_fp8` over the two P fragments (dword 2 of `la` = 16 x the row sum).
     pub fn row_sum(&self, b: &mut FnBuilder, la: VarId, pa: ValueId, pb: ValueId) {
+        if self.rows2.is_some() {
+            b.var_smfmac_fp8(la, self.a, pa, self.idx01);
+            b.var_smfmac_fp8(la, self.a, pb, self.idx01);
+            return;
+        }
         b.var_smfmac_fp8(la, self.a, pa, self.idx01);
         b.var_smfmac_fp8(la, self.a, pb, self.idx01);
         b.var_smfmac_fp8(la, self.a, pa, self.idx23);

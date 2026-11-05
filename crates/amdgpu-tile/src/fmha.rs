@@ -537,10 +537,12 @@ pub struct Vs128Cfg {
     pub pvlead: bool,
     /// group B stages V(t+1) inside its M phase, one DMA after each QK block (`Pipeline::late_stage_b`)
     pub vlate: bool,
+    /// row sums with two smfmacs per 128 keys (`crate::rowsum`, proven on the probe-measured smfmac maps)
+    pub rows2: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -567,6 +569,10 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
             // the fast reference only in the long-sequence copy (the short copy keeps the LUT-corrected exact recipe)
             body.scaleconv = cfg.scaleconv && !lut;
             body.vpre = cfg.vpre;
+            if cfg.rows2 {
+                let p = crate::rowsum::plan();
+                body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
+            }
             body.pvlead = cfg.pvlead;
             if let Some(h) = cfg.hi512 {
                 body.sm.set_hi_thr(h as f32 / 512.0);
