@@ -29,6 +29,8 @@ enum Item {
     Barrier { ord: u32 },
     /// `s_waitcnt vmcnt(count)`: completes the VMEM operations of this wave except the `count` most recent ones (loads return in issue order)
     WaitVm { ord: u32, count: u8 },
+    /// `s_waitcnt lgkmcnt(0)`: completes every LDS operation this wave issued before it. (A counted `wait_lds(n > 0)` is not a completion
+    /// point for the protocol: the scheduler may reorder independent DS reads, so "n later operations" is not stable through compilation.)
     WaitLds { ord: u32 },
     Open { ev: usize },
     Access { dma: bool },
@@ -500,6 +502,9 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
         Item::WaitVm { ord, .. } | Item::WaitLds { ord } | Item::Release { ord } | Item::Acquire { ord, .. } | Item::Barrier { ord } => *ord,
         _ => dflt,
     };
+    // the event's DS accesses are complete at the first wait_lds(0) after its last access. Barriers in between do not matter for completion (the access
+    // window then spans them; the race check uses it). The scheduler never moves an LDS access below a later lgkmcnt wait (sched/order.rs).
+    let ds_done = || -> Option<usize> { find(&|it| matches!(it, Item::WaitLds { .. })) };
     if ev.produce {
         let done = if ev.global {
             // COMPLETION of global writes: wait_vm(0) or a fence_release (which waits vmcnt(0) itself)
@@ -524,7 +529,7 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
             } else {
                 None
             };
-            let ds = if ev.ds { find(&|it| matches!(it, Item::WaitLds { .. })) } else { None };
+            let ds = if ev.ds { ds_done() } else { None };
             match (ev.dma, ev.ds) {
                 (true, true) => match (vm, ds) {
                     (Some(a), Some(b)) => Some(a.max(b)),
@@ -545,17 +550,12 @@ fn analyse_trace(items: &[Item], ev: &Ev) -> TraceInfo {
             None => TraceInfo { done: None, publish: None, done_ord: ev.ord, released: false },
         }
     } else {
-        // consumer: its reads are complete at the first wait after the last read (wait_lds(0) for LDS; wait_vm(0) / a fence for global reads)
-        let is_wait = |it: &Item| if ev.global { matches!(it, Item::WaitVm { count: 0, .. } | Item::Release { .. } | Item::Acquire { .. }) } else { matches!(it, Item::WaitLds { .. }) };
-        match find(&|it| is_wait(it)) {
-            Some(d) => {
-                let barrier_first = items.iter().enumerate().skip(after).find(|(_, it)| matches!(it, Item::Barrier { .. })).map(|(k, _)| k);
-                if barrier_first.map_or(false, |bk| bk < d) {
-                    TraceInfo { done: None, publish: None, done_ord: match items[barrier_first.unwrap()] { Item::Barrier { ord } => ord + 1, _ => ev.ord }, released: true }
-                } else {
-                    TraceInfo { done: Some(d), publish: None, done_ord: ord_of(&items[d], ev.ord), released: true }
-                }
-            }
+        // consumer: its reads are complete at the retiring wait (wait_lds(0) for LDS; wait_vm(0) / a fence for global reads). The read's
+        // lifetime is [issue phase, phase of the retiring wait]: reads may stay in flight ACROSS barriers (the vendor's V read-ahead) - the race check
+        // then requires that no producer writes the slot in any phase of that window.
+        let d = if ev.global { find(&|it| matches!(it, Item::WaitVm { count: 0, .. } | Item::Release { .. } | Item::Acquire { .. })) } else { ds_done() };
+        match d {
+            Some(d) => TraceInfo { done: Some(d), publish: None, done_ord: ord_of(&items[d], ev.ord), released: true },
             None => {
                 let b = items.iter().skip(after).find_map(|it| if let Item::Barrier { ord } = it { Some(ord + 1) } else { None });
                 TraceInfo { done: None, publish: None, done_ord: b.unwrap_or(ev.ord), released: true }
