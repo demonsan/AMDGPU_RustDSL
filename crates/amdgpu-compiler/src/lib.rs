@@ -149,6 +149,12 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 o.reorder = false;
                 o.ldshoist = true;
             }
+            // the kernel's own tokens go ON TOP of its shipped preset: `_t128` keeps ALU across its barrier and the 248 pressure limit (the preset arm below is not reached
+            // when `Function::sched_opts` is set; losing it cost -1.5..-2.4 % on `_t128`, measured with `xbar,limit=248` added back)
+            if pname.ends_with("_t128") {
+                o.alu_across_barrier = true;
+                o.max_vgprs = 248;
+            }
             if let Some(s) = &f.sched_opts {
                 o.apply_tokens(s);
             }
