@@ -74,3 +74,38 @@ fn reads_keep_their_relative_order_and_each_reaches_its_distance() {
     let m_between = |a: &str, b: &str| out.split(' ').enumerate().filter(|(i, x)| *i > p(a) && *i < p(b) && x.starts_with('M')).count();
     assert!(m_between("R0", "u0") >= 2 && m_between("R1", "u1") >= 2, "{out}");
 }
+
+#[test]
+fn ldahead32_moves_only_the_32_bit_scale_reads() {
+    let b32 = |d: u32| MInst::new(MOp::LdsReadB32).def(28 + d).srcreg(19).imm((d * 4) as i64);
+    let user32 = |d: u32| MInst::new(MOp::VMovB32).def(36 + d).srcreg(28 + d);
+    let src = vec![mfma(0), mfma(1), mfma(2), mfma(3), b32(0), user32(0), read(0), user(0)];
+    let mut m = mk(src);
+    let o = Options { verify: true, ldahead32: 2, ..Options::default() };
+    ldahead::run(&mut m, &o);
+    let names: Vec<String> = m.blocks[0].insts.iter().map(|i| match i.op {
+        MOp::LdsReadB32 => "B".into(),
+        MOp::LdsReadB128 => "R".into(),
+        MOp::VMfmaScale16x16x128Fp8 => "M".into(),
+        _ => "u".into(),
+    }).collect();
+    // the b32 read hops up over two MFMAs, the b128 read (distance 0 requested) stays
+    assert_eq!(names.join(" "), "M M B M M u R u");
+}
+
+#[test]
+fn wsink_moves_an_explicit_wait_past_compute_but_not_past_memory_or_barriers() {
+    use amdgpu_compiler::sched::ldahead::sink_explicit_waits;
+    let wait = MInst::new(MOp::SWaitLgkm).imm(0);
+    let src = vec![mfma(0), wait, mfma(1), mfma(2), MInst::new(MOp::SBarrier)];
+    let mut m = mk(src);
+    let o = Options { verify: true, ..Options::default() };
+    let n = sink_explicit_waits(&mut m, &o);
+    let names: Vec<String> = m.blocks[0].insts.iter().map(|i| match i.op {
+        MOp::SWaitLgkm => "W".into(),
+        MOp::SBarrier => "|".into(),
+        _ => "M".into(),
+    }).collect();
+    assert!(n > 0, "the wait must move");
+    assert_eq!(names.join(" "), "M M M W |");
+}
