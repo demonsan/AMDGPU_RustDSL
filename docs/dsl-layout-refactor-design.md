@@ -27,7 +27,7 @@
 | `cuda-device` / `cuda-intrinsics` | 设备内建（thread、warp、barrier、TMA…） | `amdgpu-dsl`（IR `Op`/`Stmt` + `FnBuilder` + `expr.rs`） | **前端不变**：我们不做 rustc 后端，内建即 IR 操作 |
 | `ctm-rs` | 类型化指令层 + ABI + launch contract + typestate（mbarrier、TmemGuard） | `amdgpu-isa`（由 `amdgpu-safeasm` 扩展） | atom 描述（指令 + 操作数 TV 布局 + 立即数范围）、寄存器 token、等待/DMA/MFMA typestate |
 | `cute-layout` | 布局代数 + 编译期证明 | **`amdgpu-layout`（新）** | 纯 Rust，零依赖，主机单测；证明在"kernel 构建期"执行 |
-| `cute-rs` | Tensor、zipped_divide、slice、local_tile、cooperative/tiled copy、生产者/消费者流水、tiled MMA | **`amdgpu-tile`（由 `amdgpu-dsl/src/tile/` 拆出）** | FlyDSL 命名的 TiledCopy/TiledMma + 我们的 LdsPlan/Pipeline 协议 |
+| `cute-rs` | Tensor、zipped_divide、slice、local_tile、cooperative/tiled copy、生产者/消费者流水、tiled MMA | **`amdgpu-tile`（由 `amdgpu-tile/src/` 拆出）** | FlyDSL 命名的 TiledCopy/TiledMma + 我们的 LdsPlan/Pipeline 协议 |
 | 闭世界导入器 + 全模块验证器 | rustc MIR → 方言；whole-module verifier | `amdgpu-compiler`（lower / sched / regalloc / hazards / `gpu_verify` / emit） | 不变；`gpu_verify` 本来就是全函数验证器 |
 | `cuda-host` / `cuda-core` / `cuda-bindings` | 类型化启动、RAII、FFI | `amdgpu-host`（+ 可选 `amdgpu-host-sys`） | 见 §5，需用户决策 |
 
@@ -425,22 +425,22 @@ fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, p: &Fragment /* P 的 B 布局�
 |---|---|---|
 | P1 | `crates/amdgpu-layout`：`Ix`（静态常量 / 带范围与位支撑的动态符号）、`IntTuple`、`Layout`、FlyDSL 对齐的代数（composition、complement、coalesce、left/right inverse、logical/zipped/tiled/flat/blocked/raked product 与 divide、按 mode 的动态外层 divide、`local_tile`、`slice`、`recast_layout`、`make_layout_tv`）、GF(2) `Swizzle`（含 CuTe `Swizzle<B,M,S>` 与 FMHA 128 字节行 swizzle）、`IssuePlan` + `layout_to_offsets`、构建期证明（覆盖/单射/广播、连续性与向量宽度、`tr_b8` 源地址、MFMA 操作数匹配含 K 置换、swizzle 双射、LDS bank 冲突） | 完成。19 个单元测试：CuTe/FlyDSL 文档例子逐个复现；`_vs128` 的 K 片段读（`kfx`）和转置 V 读（`trx`）**逐 lane、逐指令与手写公式一致**，基址寄存器数同为 4 |
 | P2 | `crates/amdgpu-isa`（copy / MMA atom 表，带 provenance 与 `const` 断言）、`crates/amdgpu-tile`（`Ctx`、`TiledCopy`、`partition_lds`、`partition_dma`、`partition_buffer_dma`、`partition_global`、`TiledMma`/`gemm`）；IR 新增 `VarMfmaScale16`（`v_mfma_scale_f32_16x16x128_f8f6f4`，op_sel 选 E8M0 字节）、`LoadLdsB64`/`StoreLdsB64` | 完成。在**发射出的 IR** 上用小解释器逐 lane 比对：TiledCopy 的 K 读 = `RowsReader`，转置 V 读 = `TrReader`，`partition_dma` = `RowsCopy`（全局地址、立即数、LDS 目的地，含尾块钳位），全部逐字相等 |
-| P3 | `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-tile/src/fmha.rs`），**已成为出厂集** | 完成。全套 `port_gate` 对 legacy 与对 dsl 均 PASS（见 §9.4）；证书与 dsl/legacy 相同（6/29、4/29、12/36、2/6） |
+| P3 | `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-kernels/src/fmha/mod.rs`），**已成为出厂集** | 完成。全套 `port_gate` 对 legacy 与对 dsl 均 PASS（见 §9.4）；证书与 dsl/legacy 相同（6/29、4/29、12/36、2/6） |
 | P4 | MXFP8 blockscale GEMM（aiter PR #6696 4-wave pin-AGPR 结构）：kernel-opt 用同一套 atom / TiledCopy / TiledMma 写成；编译器侧 AGPR（sched）、SALU 地址链 `scalarize2`、`ds_read_b64`/`ds_write_b64`、验证器位/区间规则 | 完成（截至 `v5.0-route-b`）：`gemm_mxfp8_bs_v4`（`crates/amdgpu-kernels`）4096×4096×8192 **3116 vs 3267 TF/s = 0.954×** 厂商，`tools/gemm_gate.sh` PASS，strict 3 / 19 / 0；差距仍在优化（[`current-status.md`](current-status.md) §4.7） |
 | P5 | 主机侧 (b)+(c)：`amdc gen-host` 从 kernel 合同生成 C++ 启动/ABI 头与 JSON 元数据，零 unsafe | 完成，见 [`host-gen.md`](host-gen.md)、[`hostgen-json-schema.md`](hostgen-json-schema.md) |
 
 ### 9.2 东西搬到了哪里
 
-| 以前（`amdgpu_dsl::tile` / `fmha_tile.rs`） | 现在 |
+| 以前（`amdgpu_tile` / `fmha_tile.rs`） | 现在 |
 |---|---|
-| `RowsReader`（K 片段，手写 `kfx` 公式） | `make_tiled_copy_a(DS_READ_B128X2, mma).partition_lds(..)`，`crates/amdgpu-tile/src/fmha.rs:83` |
+| `RowsReader`（K 片段，手写 `kfx` 公式） | `make_tiled_copy_a(DS_READ_B128X2, mma).partition_lds(..)`，`crates/amdgpu-kernels/src/fmha/mod.rs:83` |
 | `TrReader`（转置 V，手写 `trx`） | `make_tiled_copy(DS_READ_TR_B8X4, vt_tr_source(), ..)`，`fmha.rs:30`、`fmha.rs:84` |
 | `RowScaleReader`（K-scale 字） | 广播 TV 的 `make_tiled_copy_bcast(DS_READ_B32, kd_read_tv(), ..)`，`fmha.rs:41`、`fmha.rs:85` |
 | `RowsCopy` / `DwordRowsCopy`（K/V/K-scale DMA） | `partition_dma`（从目的地侧推导：swizzle 放到源地址，M0 顶置 + 负立即数补偿），`fmha.rs:89` |
 | `RowFrags::load`（Q 片段） | `partition_global`（G2R），`fmha.rs:459` |
 | `store_bf16` / KV-split 私有转置暂存 | `partition_global`（R2G）`fmha.rs:500`；R2S/S2R + `Swizzle<3,4,3>` `fmha.rs:538` |
 | `TensorDecl` 自动合同 | `contract::compact_tensor` / `same_strides`：合同从 `Layout` 推出（分配 = cosize，紧致关系 = 内层外延乘积），`fmha.rs:397` |
-| 不涉及布局的部分 | 仍复用 `amdgpu_dsl::tile`：`LdsPlan`/标记、`Pipeline`/`Roles`、softmax、combine、`_t128` 的 VGPR K-scale 暂存、ones/Q 常量写入 |
+| 不涉及布局的部分 | 仍复用 `amdgpu_tile`：`LdsPlan`/标记、`Pipeline`/`Roles`、softmax、combine、`_t128` 的 VGPR K-scale 暂存、ones/Q 常量写入 |
 
 crate 依赖：`amdgpu-layout`（零依赖）← `amdgpu-isa` ← `amdgpu-tile`（再依赖 `amdgpu-dsl`）← `amdgpu-compiler`（注册 kernel）。全部 `#![forbid(unsafe_code)]`，`rust_safety` 测试覆盖。
 

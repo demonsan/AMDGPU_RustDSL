@@ -74,7 +74,7 @@ spelling and rewrites `ValueId(n)`/`VarId(n)`; adding a new op does not require 
 
 ### Tests
 
-`crates/amdgpu-compiler/tests/ir_print.rs`:
+`crates/amdgpu-kernels/tests/ir_print.rs`:
 
 1. `probe_llvm_ids` vs `probe_expr_ids` and `probe_llvm_kernarg` vs `probe_expr_kernarg` are
    structurally equal (body form), hash equal, and canonical text equal; the canonical text does

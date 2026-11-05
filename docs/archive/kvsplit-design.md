@@ -295,7 +295,7 @@ path is untouched, so the downside is bounded to the prototype effort.
 - **No split=8** beyond a diagnostic run.
 
 **Prototype size.**
-- Kernel (`crates/amdgpu-dsl/src/kernels.rs`): new `fmha_fwd_hd128_mxfp8_kvsplit` entry reusing
+- Kernel (`crates/amdgpu-kernels/src/probes.rs`): new `fmha_fwd_hd128_mxfp8_kvsplit` entry reusing
   `emit_fmha_vs128_role` with two new parameters: (i) key range `[split*SK/s, (split+1)*SK/s)` in the key loop and
   the `nkv` bound, (ii) a "partial epilogue" mode that writes `Ohat = O/l` fp32 + `lse = m + log2(l)` instead of
   the bf16 output. Plus the 3 new kernarg fields and the grid-z decode. ~200-400 LOC, no ISA/scheduler work.

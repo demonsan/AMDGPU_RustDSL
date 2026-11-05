@@ -152,7 +152,7 @@ Default `fmha_fwd_hd128_mxfp8_t` now includes `kdlds,dbuf` (K scales staged thro
 
 ## 我们的实现状态（历史快照：第 75 轮，Main `8fec359`，tag `v2.2-round75-final`）
 
-> **当前状态**：出厂集已换成布局层 kernel `fmha_fwd_hd128_mxfp8_v3_*`（`crates/amdgpu-tile/src/fmha.rs`），旧手写集保留为
+> **当前状态**：出厂集已换成布局层 kernel `fmha_fwd_hd128_mxfp8_v3_*`（`crates/amdgpu-kernels/src/fmha/mod.rs`），旧手写集保留为
 > `fmha_fwd_hd128_mxfp8_legacy_auto`。最新数字见 [`current-status.md`](current-status.md) §4。下面的表格是第 75 轮旧手写集的认证快照。
 
 上面的内容是厂商 kernel 的已核实事实与 1:1 验收标准（保留不变）；本节记录第 75 轮时我们的实现做到了什么。完整数据在 `docs/archive/final-report.md`、`docs/current-status.md` 与 `docs/archive/status.md`。

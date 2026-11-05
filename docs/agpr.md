@@ -43,7 +43,7 @@ AGPR physical slots in the exporter's liveness, scaled-MFMA byte selects (`op_se
 hazard oracle include the new rows.
 
 ## Tests / hardware
-`crates/amdgpu-compiler/tests/agpr.rs` (11 tests), `register_accounting.rs` (AGPR index space), `tools/agpr_probe.sh`: probes `probe_agpr_{ref,acc,full,pinned}` (32x32x64 scaled MFMA, accumulator and
+`crates/amdgpu-kernels/tests/agpr.rs` (11 tests), `register_accounting.rs` (AGPR index space), `tools/agpr_probe.sh`: probes `probe_agpr_{ref,acc,full,pinned}` (32x32x64 scaled MFMA, accumulator and
 fragments in AGPRs, exact pin a[64:79]), `probe_agpr_m16_{ref,mix}` (four 16x16x128 accumulators, two acc_cd + two vgpr form, fragments `ds_read`-ed into `a[0:15]`), `probe_agpr_reload{,_ref}` (in-place
 reload of loop-carried fragments): outputs bit-identical to the all-VGPR versions on GPU 6 for trip counts 1,2,3,7,8,9. All 91 pre-existing kernels emit byte-identical assembly (`tools/md5_kernels.sh`).
 

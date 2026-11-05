@@ -13,7 +13,7 @@
 > 对照阅读 v3 `_vs128`：
 >
 > ```rust
-> // crates/amdgpu-tile/src/fmha.rs:79-90（KvRing3::new，节选）
+> // crates/amdgpu-kernels/src/fmha/mod.rs:79-90（KvRing3::new，节选）
 > let mma = make_tiled_mma(MmaAtom::mfma_scale_32x32x64_f8(), false);
 > // K: the A operand (32 keys x 64 bytes) at rows 32 s, k-group c
 > let kview = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![32, 64], tup![128, 1]));
@@ -25,7 +25,7 @@
 > ```
 >
 > ```rust
-> // crates/amdgpu-tile/src/fmha.rs:179-187（qk_block：两条 K 片段读、K-scale 字、两次带缩放 MFMA）
+> // crates/amdgpu-kernels/src/fmha/mod.rs:179-187（qk_block：两条 K 片段读、K-scale 字、两次带缩放 MFMA）
 > let k0 = k.read(b, 2 * s);
 > let k1 = k.read(b, 2 * s + 1);
 > let kw = kd.read(b, s);
@@ -87,7 +87,7 @@
 先看一个最小的真实 kernel：每个 lane 计算 `c[tid] = a[tid] + b[tid] + s`。
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:19135-19165（probe_llvm_kernarg，节选）
+// crates/amdgpu-kernels/src/probes.rs:19135-19165（probe_llvm_kernarg，节选）
 pub fn probe_llvm_kernarg() -> Function {
     let mut b = FnBuilder::new("probe_llvm_kernarg", 64);   // ①
     b.arg("a", DType::Ptr, 0, 8);                             // ②
@@ -162,7 +162,7 @@ pub fn let_(&mut self, op: Op) -> ValueId {
 本文拆解单 kernel 快路径 **`_vs128`**：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:20824-20829
+// crates/amdgpu-kernels/src/probes.rs:20824-20829
 pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
     VS_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     let f = fmha_t_build("fmha_fwd_hd128_mxfp8_vs128", false, true);
@@ -185,7 +185,7 @@ pub fn fmha_fwd_hd128_mxfp8_vs128() -> Function {
 ### (a) 前奏：656 字节参数区 + 主机合同
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:20951-21010（fmha_t_build，节选）
+// crates/amdgpu-kernels/src/probes.rs:20951-21010（fmha_t_build，节选）
 let mut b = FnBuilder::new(name, if name.ends_with("_t128") { 256 } else { 512 });
 …
 b.arg("ptr_o", DType::Ptr, 0x000, 8);
@@ -204,7 +204,7 @@ fmha_abi_contract(&mut b, is_kvs, if name.ends_with("_t128") { 128 } else { 256 
 `arg` 只描述布局；**合同**才告诉编译器"这些数之间有什么关系"：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:20880-20937（fmha_abi_contract，节选）
+// crates/amdgpu-kernels/src/probes.rs:20880-20937（fmha_abi_contract，节选）
 let hk = Ext::sym("HK");
 b.ka_range(0x0B0, 1, 16);                               // gqa ∈ [1, 16]
 b.ka_is(0x140, hk.clone() * Ext::ka(0x0B0));            // H = HK * gqa
@@ -225,13 +225,13 @@ b.arg_tensor_slack("ptr_q_descale", qs.clone(), qs + Ext::c(512 * 4) * h.clone()
 前奏里还有两处**显式信任**（`assume_trusted`）和一处**夹紧（clamp）**：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:21112-21120 —— 超出序列末尾的行，改用最后一个合法行（不越界，算出相同结果）
+// crates/amdgpu-kernels/src/probes.rs:21112-21120 —— 超出序列末尾的行，改用最后一个合法行（不越界，算出相同结果）
 let s_last = b.add_i32(s_len, cm1);
 let row_ok = b.cmp_lt_i32(row_raw, s_len);
 …
     b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_ok), a: Opnd::Val(row_raw), b: Opnd::Val(s_last) })
 
-// crates/amdgpu-dsl/src/kernels.rs:21184-21186 —— GQA：kv_head = head >> log2(gqa)
+// crates/amdgpu-kernels/src/probes.rs:21184-21186 —— GQA：kv_head = head >> log2(gqa)
 let kvh = if ablate_pre.contains("nogqa") { hidx } else { b.let_(Op::LshrI32(Opnd::Val(hidx), Opnd::Val(gshift))) };
 b.assume_trusted(kvh, Ext::c(0), Ext::sym("HK") - Ext::c(1), "kv head = head >> log2(gqa) with head < H = HK * gqa (gqa a power of two <= 16): variable shift, no interval rule");
 ```
@@ -249,16 +249,16 @@ b.assume_trusted(kvh, Ext::c(0), Ext::sym("HK") - Ext::c(1), "kv head = head >> 
 **如果写错了会怎样**：
 - 某个指针没写 `arg_tensor` → `GV-GLB-NOEXT`："kernarg pointer \`p\` has no declared extent"（`gpu_verify.rs:854-857`）。
 - 少一条形状关系（比如删掉 `ka_is(0x0A0, …)`）→ `GV-GLB-OOB`，并**打印符号残差**告诉你差在哪
-  （测试 `global_access_without_the_shape_bound_is_unprovable_and_prints_the_expression`，`crates/amdgpu-compiler/tests/gpu_semantics.rs:101-107`）。
+  （测试 `global_access_without_the_shape_bound_is_unprovable_and_prints_the_expression`，`crates/amdgpu-kernels/tests/gpu_semantics.rs:101-107`）。
 - 合同本身写错（声明了比主机真实分配更大的尺寸）→ 验证器**查不出**（这是假设 A1，`gpu-semantics-verifier.md` §1）；
-  因此有 `crates/amdgpu-compiler/tests/contract_host_truth.rs` 拿合同和 host 公式对账。
+  因此有 `crates/amdc/tests/contract_host_truth.rs` 拿合同和 host 公式对账。
 
 ---
 
 ### (b) LDS 布局：tile / ring / 私有区 / 别名
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:20861-20878（fmha_vs_tiles）
+// crates/amdgpu-kernels/src/probes.rs:20861-20878（fmha_vs_tiles）
 fn fmha_vs_tiles(b: &mut FnBuilder) {
     b.lds_ring("K", 0, 32768, 2);          // 两槽环：槽 k = [32768k, +32768)，K 在前 16 KB
     b.lds_ring("V", 16384, 32768, 2);      //            V 在后 16 KB
@@ -304,7 +304,7 @@ fn fmha_vs_tiles(b: &mut FnBuilder) {
 每个 wave 负责搬 tile 的 32 行，一条 DMA 指令搬 8 行 = 64 lane × 16 字节 = 1 KB，共 4 条：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:9807-9833（emit_fmha_vs128_role 内的 dma_issue_global，节选）
+// crates/amdgpu-kernels/src/probes.rs:9807-9833（emit_fmha_vs128_role 内的 dma_issue_global，节选）
 let dma_issue_global = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId| {
     let rb = b.add_i32(key0, rowb);
     let lbase = b.add_i32(lds_tile, buf_off);
@@ -328,7 +328,7 @@ let dma_issue_global = |b: &mut FnBuilder, key0: ValueId, buf_off: ValueId| {
 DMA 必须"包"在 tile 标注里，并在之后等待完成：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:9913-9943（stage_start / stage_end，节选）
+// crates/amdgpu-kernels/src/probes.rs:9913-9943（stage_start / stage_end，节选）
 let stage_start = |b: &mut FnBuilder, key0: ValueId, slot_off: ValueId| -> Option<ValueId> {
     …
     let (tslot, tver) = stage_tag.get();
@@ -355,7 +355,7 @@ let stage_end = |b: &mut FnBuilder, kd: Option<ValueId>, kd_slot: ValueId| {
 默认关闭，`kernels.rs:9774-9790`、`:9852-9881`）：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:9781-9790 与 :9869-9873（节选）
+// crates/amdgpu-kernels/src/probes.rs:9781-9790 与 :9869-9873（节选）
 let rsrc: Option<ValueId> = if mubufd {
     let kvb = b.mul_i32(cx.kv_len, seqs);
     let nrec0 = b.add_i32(kvb, base_off);
@@ -396,7 +396,7 @@ b.end_if();
 ### (d) QK 矩阵乘：带缩放的 fp8 MFMA
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:10255-10310（qk 闭包，节选）
+// crates/amdgpu-kernels/src/probes.rs:10255-10310（qk 闭包，节选）
 for s in 0..4usize {                                    // 128 个 key = 4 个 32-key 的 S 块
     if biasf_once.is_none() && !fmha_t_opt("biasv") && bacc.is_none() {
         b.var_mfma_f16_z(s_vars[s], ones_f16, Opnd::Val(bias_v));   // S 先放入参考偏移（f16 MFMA）
@@ -449,13 +449,13 @@ for s in 0..4usize {                                    // 128 个 key = 4 个 3
 只有当新的行最大值**明显**超过参考时才"回滚"（rebase），把累计结果按 `2^(512·delta)` 缩放。
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:10368-10378（valu 闭包：一次求 64 个分数的最大值）
+// crates/amdgpu-kernels/src/probes.rs:10368-10378（valu 闭包：一次求 64 个分数的最大值）
 let mut mloc = b.max3_f32(flat[0], flat[1], flat[2]);
 …
 let mt = b.partner_max_f32(mloc);          // 和搭档 lane（l ^ 32）交换取 max
 let grow = b.cmp_lt_f32(c_thr, mt);        // 超过阈值才需要回滚
 
-// crates/amdgpu-dsl/src/kernels.rs:10448-10495（回滚分支，节选）
+// crates/amdgpu-kernels/src/probes.rs:10448-10495（回滚分支，节选）
 let nb = b.frag2(w_new, w_new);
 b.set_var(bias2, nb);
 b.begin_if(Opnd::Val(grow));
@@ -501,7 +501,7 @@ b.end_if();
 ### (f) PV 矩阵乘与行和（smfmac）
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:10610-10627（load_v：转置读 V，标注消费 V 环）
+// crates/amdgpu-kernels/src/probes.rs:10610-10627（load_v：转置读 V，标注消费 V 环）
 let load_v = |b: &mut FnBuilder, hh: usize, e: usize| -> ValueId {
     …
         let (pv_slot, pv_ver) = pv_tag.get();
@@ -511,7 +511,7 @@ let load_v = |b: &mut FnBuilder, hh: usize, e: usize| -> ValueId {
         vv
 };
 
-// crates/amdgpu-dsl/src/kernels.rs:10650-10669（PV 主体，节选）
+// crates/amdgpu-kernels/src/probes.rs:10650-10669（PV 主体，节选）
 for hh in 0..2usize {
     let p8 = match &p_pre { Some(ps) => ps[hh], None => b.frag8(w[o], …) };
     …
@@ -521,7 +521,7 @@ for hh in 0..2usize {
     }
 }
 
-// crates/amdgpu-dsl/src/kernels.rs:10561-10567（行和：4 条稀疏 MFMA 原地累加）
+// crates/amdgpu-kernels/src/probes.rs:10561-10567（行和：4 条稀疏 MFMA 原地累加）
 if smfv {
     b.var_smfmac_fp8(la, a_rs, pa, idx01);
     b.var_smfmac_fp8(la, a_rs, pb, idx01);
@@ -551,7 +551,7 @@ if smfv {
 `_vs128` 单 kernel 路径：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:11259-11291（节选）
+// crates/amdgpu-kernels/src/probes.rs:11259-11291（节选）
 let o_ptr0 = b.ptr_add(cx.ptr_o, ob4);
 let wave_live = b.cmp_lt_i32(cx.row0, cx.s_len);
 b.begin_if(Opnd::Val(wave_live));                     // 整个 wave 都在序列外就不写
@@ -575,7 +575,7 @@ b.end_if();
 同一个角色函数在 `_kvsplit` 下走另一条 epilogue：每个 wave 先把结果写进**自己私有的 4 KB LDS 草稿纸**、转置后再合并写出：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:10947-10951 与 :11024-11041（节选）
+// crates/amdgpu-kernels/src/probes.rs:10947-10951 与 :11024-11041（节选）
 let wid_e = if role_a { cx.wave4 } else { b.add_i32(cx.wave4, c4) };
 let c4096e = b.c_i32(4096);
 let wb0 = b.mul_i32(wid_e, c4096e);
@@ -599,7 +599,7 @@ for i in 0..4usize {
 而在进入这段之前，有一个专门修过真实 bug 的 barrier：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:10858-10864（节选）
+// crates/amdgpu-kernels/src/probes.rs:10858-10864（节选）
 // … a wave that finishes first could overwrite a partner wave's still-live Q staging during its last QK/PV …
 if !no_bar && cx.kvs.is_some() {
     b.barrier();
@@ -627,7 +627,7 @@ if !no_bar && cx.kvs.is_some() {
 角色的分裂发生在 `fmha_t_build`：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:21280 与 :21528-21542（节选）
+// crates/amdgpu-kernels/src/probes.rs:21280 与 :21528-21542（节选）
 _ => b.cmp_lt_i32(wave, c4),              // is_a：wave 0-3 是角色 A
 …
 for pass in 0..2u8 {
@@ -650,7 +650,7 @@ b.end_if();
 每轮迭代的"节拍"写在 `iter` 闭包里：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:10675-10832（iter，节选）
+// crates/amdgpu-kernels/src/probes.rs:10675-10832（iter，节选）
 let iter = |b: &mut FnBuilder, masked: bool, stage: bool, last_barrier: bool| {
     let (tag_i1, slot_cur, slot_nxt, slot_n2, kds_nxt, key_n2, _kds_cur, tag_it_p1) = ring(b);
     stage_tag.set((Opnd::Val(tag_i1), Opnd::Val(tag_it_p1)));   // 下一 tile：槽 idx^1，第 it+1 代
@@ -703,7 +703,7 @@ DSL 也能嵌入一段"手写汇编"，但手写部分同样是**安全 Rust**�
 行和那 4 条 smfmac 可以换成 safe-asm 写的等价块（`FMHA_OPT=safeasm`，非默认）：
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:10555-10560
+// crates/amdgpu-kernels/src/probes.rs:10555-10560
 if smfv && fmha_t_opt("safeasm") {
     // the same four in-place SMFMACs, authored in safe Rust (crates/amdgpu-safeasm) and embedded through Stmt::VarAsm
     use amdgpu_safeasm::examples::rowsum_var_block;
@@ -844,7 +844,7 @@ let _i = Imm::<100>::new();
 ### 4.5 LDS 写出声明段 → `GV-LDS-OOB`
 
 ```rust
-// crates/amdgpu-compiler/tests/gpu_semantics.rs:23-48（节选）
+// crates/amdgpu-kernels/tests/gpu_semantics.rs:23-48（节选）
 fn lds_kernel(lds_bytes: u32, offset: i32) -> Function {
     let mut b = FnBuilder::new("lds_probe", 64);
     b.lds(lds_bytes);
@@ -886,7 +886,7 @@ let _ = b.load_lds_b32(Opnd::I32(0));
 ### 4.7 全局访问证不出来 → `GV-GLB-OOB`，并打印符号残差
 
 ```rust
-// crates/amdgpu-compiler/tests/gpu_semantics.rs:61-107（节选）
+// crates/amdgpu-kernels/tests/gpu_semantics.rs:61-107（节选）
 b.arg("p", DType::Ptr, 0, 8);
 b.arg("n", DType::I32, 8, 4);
 b.arg_tensor("p", Ext::ka(8) * Ext::c(4));       // p 有 n*4 字节
@@ -903,7 +903,7 @@ let v = b.load_f32(q, 0);
 ### 4.8 `assume` 骗不过去 → `GV-ASSUME-VIOLATED`
 
 ```rust
-// crates/amdgpu-dsl/src/kernels.rs:22355-22378（gv_attack_assume_loop，节选）
+// crates/amdgpu-kernels/src/probes.rs:22355-22378（gv_attack_assume_loop，节选）
 let vars = b.begin_loop(&[(DType::I32, Opnd::Val(c0))]);
 let i = vars[0];
 b.assume(Opnd::Var(i), Ext::c(0), Ext::c(0));    // 声称 i 永远是 0……
@@ -961,7 +961,7 @@ MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 => {
 也就是说一次 `b.load_global_lds(sp, lbase, -(1024 * (3 - q)), 4)` 会变成三行：先把 LDS 目的基址（wave 一致，所以在 SGPR）放进 `m0`，
 一个 `s_nop`，然后 `global_load_lds_dwordx4 <地址>, off offset:<负偏移>`；`b.wait_vm(0)` 变成 `s_waitcnt vmcnt(0)`；
 `b.barrier()` 变成 `s_barrier`（`emit.rs:736`）；(g) 的 `store_f32x2` 变成 `global_store_dwordx2`（`emit.rs:649-654`）；
-(d) 的 `var_mfma_scale` 变成 `v_mfma_scale_f32_32x32x64_f8f6f4 v[..], v[..], v[..], v[..], vX, vY`（`crates/amdgpu-compiler/tests/backend.rs:116-126` 检查此助记符）。
+(d) 的 `var_mfma_scale` 变成 `v_mfma_scale_f32_32x32x64_f8f6f4 v[..], v[..], v[..], v[..], vX, vY`（`crates/amdgpu-kernels/tests/backend.rs:116-126` 检查此助记符）。
 **具体寄存器号由我们自己的寄存器分配决定**，想看真实片段就运行第 1 步再 `grep global_load_lds_dwordx4 vs128.s`。
 
 ---

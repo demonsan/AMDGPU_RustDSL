@@ -100,7 +100,7 @@ Host harness:
 
 ## Regression tests
 
-`crates/amdgpu-compiler/tests/backend.rs` (no GPU needed):
+`crates/amdgpu-kernels/tests/backend.rs` (no GPU needed):
 
 * every registered kernel compiles and has descriptor + metadata;
 * the descriptor covers every physical register the instruction stream touches;
@@ -852,7 +852,7 @@ Remaining options (not done): cheaper per-lane scalar chain (f16 round trips of 
 **Open items.** `fmha_fwd_hd128_mxfp8_vs128` (128-key units, one rollback, two barriers) needs ~20 more VGPRs; the vendor's smfmac row-sum A/index construction (per-lane `v_cndmask`) is not reproduced (constant-ones A mixes queries q/q+16: D = 24 x (l_q + l_q+16)); gfx950 has no fp8 `v_dot4`; cheaper rollback remains the largest measured cost (5-15%); `_vs` is own-backend only (DMA).
 
 ### Round 48 addendum (kernel-opt): LDS layouts of the vendor-structure kernels and the spill base
-`amdgpu_dsl::kernels::{VS_LDS_BYTES, VS128_LDS_BYTES, VS_SPILL_BASE}` (bytes). `_vs` declares 99840 = 3-slot ring (3 x 32768: K 16384 + V 16384 per slot, dense swizzled) + K-scale ring (3 x 512 at 98304); `_vs128` declares 102400 = 2-slot ring (0..65536) + K-scale ring (65536.., 2 x 512 in a 2048-byte block) + ones block (67584, 2048) + per-wave Q fragment b1 (69632, 16384) and b0 (86016, 16384). `VS_SPILL_BASE` = 102400 is the first LDS byte the compiler may use to spill lane-invariant values of `_vs128` (2048 bytes per dword = 8 waves x 64 lanes x 4 B; 61440 bytes = 30 dwords up to the 163840-byte limit). Both sides must use the constant, not the number. `_t` keeps its 69632-byte layout. The 3-slot -> 2-slot ring change of `_vs128` is unmeasured (it never builds); on `_vs` the 2-slot design measured the same speed as 3-slot (`novmwait` 262.6 vs 261.9).
+`amdgpu_kernels::probes::{VS_LDS_BYTES, VS128_LDS_BYTES, VS_SPILL_BASE}` (bytes). `_vs` declares 99840 = 3-slot ring (3 x 32768: K 16384 + V 16384 per slot, dense swizzled) + K-scale ring (3 x 512 at 98304); `_vs128` declares 102400 = 2-slot ring (0..65536) + K-scale ring (65536.., 2 x 512 in a 2048-byte block) + ones block (67584, 2048) + per-wave Q fragment b1 (69632, 16384) and b0 (86016, 16384). `VS_SPILL_BASE` = 102400 is the first LDS byte the compiler may use to spill lane-invariant values of `_vs128` (2048 bytes per dword = 8 waves x 64 lanes x 4 B; 61440 bytes = 30 dwords up to the 163840-byte limit). Both sides must use the constant, not the number. `_t` keeps its 69632-byte layout. The 3-slot -> 2-slot ring change of `_vs128` is unmeasured (it never builds); on `_vs` the 2-slot design measured the same speed as 3-slot (`novmwait` 262.6 vs 261.9).
 `_vs128` register pressure at the allocation failure (own backend, `AMDC_SCHED=0`): `dce,cmpfold,scalarize` 90 live vregs / 227 dwords (V1 79, V16 9); `+sgpr,addrfold,imm` 119 / 255 (V1 109, V16 9). The count does not change with the P-conversion recipe (svcorr on/off), i.e. the pressure is the 9 live V16 (4 O, 4 S, row sum = 144 dwords) plus 79-109 live V1 (loop-invariant addresses, tables and constants), not the V-phase temporaries.
 
 ## Round 49 (kernel-opt): `fmha_fwd_hd128_mxfp8_vs128` - 128-key units, one rollback, two barriers: 299.3 TFLOP/s, accurate recipe, parity OK

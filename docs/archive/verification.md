@@ -32,7 +32,7 @@ allocates exactly such mid-function scalar temporaries, which is why only that b
 
 ## 3. Register-accounting audit (Verified)
 
-`crates/amdgpu-compiler/tests/register_accounting.rs` (GPU-free, runs in `cargo test`; this is the canonical test
+`crates/amdgpu-kernels/tests/register_accounting.rs` (GPU-free, runs in `cargo test`; this is the canonical test
 and **supersedes the duplicate `tests/reg_declaration.rs`**, which is deleted on this branch). It parses the final
 assembly text of every kernel in `kernel_names()` on the own backend and re-derives the requirements:
 
@@ -152,7 +152,7 @@ bash tools/container/cargo.sh test --test register_accounting
 AMDC_TEST_LLVM=1 bash tools/container/cargo.sh test --test register_accounting   # + LLVM-tail assembly
 # independent reproduction on the pre-fix compiler (parent of 794c978):
 git worktree add /tmp/amd-pre 1350053
-cp crates/amdgpu-compiler/tests/register_accounting.rs /tmp/amd-pre/crates/amdgpu-compiler/tests/register_accounting.rs
+cp crates/amdgpu-kernels/tests/register_accounting.rs /tmp/amd-pre/crates/amdgpu-kernels/tests/register_accounting.rs
 (cd /tmp/amd-pre && mkdir -p build && AMD_CARGO_TARGET=/tmp/amd-target-pre bash tools/container/cargo.sh test \
     --test register_accounting -- every_kernel_register_accounting_own_backend)     # 46 violations
 # hardware bit-exactness own vs LLVM tail (GPU 5):

@@ -2,7 +2,7 @@
 
 Prerequisite for the FMHA row-sum restructure (two accumulated smfmacs). Everything here is **measured** on MI355X (GPU 4) with one-hot inputs;
 the recorded maps are committed and replayed by a unit test. Code: kernels `probe_smfmac_gen` / `probe_lds_tr_b8_gen`
-(`crates/amdgpu-dsl/src/kernels.rs`), host checker `tests/gpu/isa_probe_host.cpp`, re-record with `tools/isa_probes.sh [--update]`, recorded maps
+(`crates/amdgpu-kernels/src/probes.rs`), host checker `tests/gpu/isa_probe_host.cpp`, re-record with `tools/isa_probes.sh [--update]`, recorded maps
 `crates/amdgpu-isa/data/{smfmac_16x16x128_fp8,lds_tr_b8}.map`, layouts / semantics in `crates/amdgpu-isa/src/lib.rs`
 (`MmaAtom::smfmac_16x16x128_fp8`, `smfmac`, `tr_b8`; provenance `Probe`), replay test `crates/amdgpu-isa/tests/probe_maps.rs`.
 

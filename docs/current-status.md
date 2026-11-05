@@ -13,7 +13,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 在 gfx950 上运行厂商 ABI 兼容的 MXFP8 FMHA 与 MXFP8 blockscale GEMM：
 
 - **出厂 FMHA = v3 布局层 kernel**：默认路径 `fmha_fwd_hd128_mxfp8_auto` 的 4 个 kernel 是
-  `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-tile/src/fmha.rs`）。K/V/K-scale/Q 的每个地址、
+  `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-kernels/src/fmha/mod.rs`）。K/V/K-scale/Q 的每个地址、
   K/V/K-scale DMA、bf16 epilogue 与 KV-split 转置暂存都由 `amdgpu-layout` 的布局推导，`amdgpu-isa` 的 atom 描述指令，
   `amdgpu-tile` 的 `TiledCopy`/`TiledMma`/`partition_*` 生成 IR；主机合同由张量布局导出。asm md5（`--backend own`）：
   `_vs128` `68d2832b`、`_t128` `e4c7e75d`、`_kvsplit` `e4fc18b1`、`_kvsplit_combine8h` `24a95a51`。
@@ -75,7 +75,7 @@ amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]   # 报告 proven/发�
 |---|---|---|
 | **LDS** | 每次 DS 访存/DMA（含 64 lane）在声明段内；环形/双缓冲槽位由不动点证明；无下溢/回绕 | 600 / 336 / 760 / – |
 | **LDS tile 生命周期** | tile 分区/别名、produce/consume/version（发布于 barrier）、跨角色 stale/race/pending；周期门；计数版 `vmcnt(n)` 完成规则 | 73,600 / 36,800 / 299,520 次读 |
-| **全局/buffer** | 访问落在声明 extent 内（`arg_tensor` + `ka_is/grid_is/ka_one_of`）；描述符不得高估 `num_records` | 106 / 92 / 78 / 3；`crates/amdgpu-compiler/tests/contract_host_truth.rs` 校验合同与 host 公式一致 |
+| **全局/buffer** | 访问落在声明 extent 内（`arg_tensor` + `ka_is/grid_is/ka_one_of`）；描述符不得高估 `num_records` | 106 / 92 / 78 / 3；`crates/amdc/tests/contract_host_truth.rs` 校验合同与 host 公式一致 |
 | **VGPR/SGPR/AGPR** | 保留寄存器、元组对齐、上限；MFMA A/B 与 D 不重叠；AGPR 统一预算（arch VGPR + AGPR ≤ 512） | 全部 kernel 默认强制 |
 | **寄存器生命周期** | 路径敏感 use-before-wait（任一路径、含循环携带在途值） | 默认强制 |
 | **barrier 协议** | 波分歧 if/else 两侧动态 barrier 数相等 | 18 / 8 / 18 |
@@ -108,7 +108,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设。
 | 内存-LDS | `ds_read/write_b32/b64/b128`、`ds_read_b64_tr_b8` 转置读、ring / 双缓冲 / 私有区 |
 | 控制流 | `begin_loop`/`end_loop`、`begin_if`（wave 级）、`versioned` 双代码副本、`Stmt::VarAsm(N)` 桥接手写 asm |
 | 布局层（路线 B） | `amdgpu-layout`（`Ix`、`IntTuple`、`Layout` 代数、GF(2) `Swizzle`、TV 布局、`IssuePlan`/`layout_to_offsets`、证明）；`amdgpu-isa`（atom 表）；`amdgpu-tile`（`TiledCopy`/`TiledMma`/`partition_{lds,dma,buffer_dma,global}`、布局导出的合同）。入门 [`layout-tour.md`](layout-tour.md)，实施记录 [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9 |
-| tile 库（上一版） | `amdgpu_dsl::tile` L1–L6（[`dsl-tile-abstractions.md`](dsl-tile-abstractions.md)）；LdsPlan/标记、Pipeline、softmax、combine 仍被 v3 复用 |
+| tile 库（上一版） | `amdgpu_tile` L1–L6（[`dsl-tile-abstractions.md`](dsl-tile-abstractions.md)）；LdsPlan/标记、Pipeline、softmax、combine 仍被 v3 复用 |
 | 实验面 | `FMHA_OPT` 实验 token（全部 opt-in）；`FMHA_OPT_SCOPE` 把 token 限定到别名 kernel（如 `fmha_fwd_hd128_mxfp8_v3s_*`）做同轮 A/B |
 | ABI | 与厂商**逐字节兼容的 656 字节 kernarg + 网格/数据布局**；`_auto` 按形状 guard 调度；主机侧头由 `amdc gen-host` 生成 |
 
@@ -148,10 +148,10 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设。
 
 | Kernel | 状态 |
 |---|---|
-| `fmha_fwd_hd128_mxfp8_auto` | **默认**（guard 选择）：`v3_vs128` / `v3_t128` / `v3_kvsplit` + `v3_kvsplit_combine8h`（`crates/amdgpu-tile/src/fmha.rs`） |
+| `fmha_fwd_hd128_mxfp8_auto` | **默认**（guard 选择）：`v3_vs128` / `v3_t128` / `v3_kvsplit` + `v3_kvsplit_combine8h`（`crates/amdgpu-kernels/src/fmha/mod.rs`） |
 | `fmha_fwd_hd128_mxfp8_dsl_auto` | 上一版 tile 库集 `dsl_*`（crates/amdgpu-dsl/src/fmha_tile.rs（已在 2026-11 清理中删除）），A/B 对照用 |
 | `fmha_fwd_hd128_mxfp8_v3s_*` | v3 的别名（同代码），配合 `FMHA_OPT_SCOPE=v3s` 对实验 token 做同轮 A/B |
-| `fmha_fwd_hd128_mxfp8_legacy_auto` | 旧手写集（`_vs128` / `_t128` / `_kvsplit` / `combine8h`，`crates/amdgpu-dsl/src/kernels.rs`），A/B 对照用 |
+| `fmha_fwd_hd128_mxfp8_legacy_auto` | 旧手写集（`_vs128` / `_t128` / `_kvsplit` / `combine8h`，`crates/amdgpu-kernels/src/probes.rs`），A/B 对照用 |
 | `gemm_mxfp8_bs_v4` / `_v3` | MXFP8 blockscale GEMM（`crates/amdgpu-kernels`）；v4 = 厂商结构（寄存器暂存、AGPR 原地重载），v3 = 不做原地重载的变体 |
 | `_t`、`_g2/_g3/_g3o/_pp/_sv/_vs5/_vs6/_vs9/_vsm` | 历史/实验变体，仅按名（负结果，见 [`archive/`](archive/README.md)） |
 

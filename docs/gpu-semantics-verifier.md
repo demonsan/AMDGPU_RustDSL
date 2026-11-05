@@ -1,6 +1,6 @@
 # GPU 语义验证器（gpu_verify v1）：全局内存 / LDS / VGPR / SGPR 的越界与生命周期证明
 
-> 实现：`crates/amdgpu-compiler/src/gpu_verify.rs`；DSL 合同 API：`crates/amdgpu-dsl/src/lib.rs`（`Ext`、`arg_tensor`、`arg_tensor_slack`、`ka_range`、`ka_is`、`grid_is`、`sym_range`、`assume`）；测试：`crates/amdgpu-compiler/tests/gpu_semantics.rs`；命令行：`amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]`。
+> 实现：`crates/amdgpu-compiler/src/gpu_verify.rs`；DSL 合同 API：`crates/amdgpu-dsl/src/lib.rs`（`Ext`、`arg_tensor`、`arg_tensor_slack`、`ka_range`、`ka_is`、`grid_is`、`sym_range`、`assume`）；测试：`crates/amdgpu-kernels/tests/gpu_semantics.rs`；命令行：`amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]`。
 > 本文是**语义模型与边界**。它说明 v1 证明了什么、依赖什么假设、哪些**没有**被证明（第 8 节），避免“编译器保证安全”被过度解读。
 
 ## 0. 一句话

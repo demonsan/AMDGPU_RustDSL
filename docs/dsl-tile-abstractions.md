@@ -1,23 +1,23 @@
-# DSL tile 抽象层设计（`amdgpu_dsl::tile`）
+# DSL tile 抽象层设计（`amdgpu_tile`）
 
-> 状态：**已实现**（`crates/amdgpu-dsl/src/tile/`；用它写成的 `fmha_fwd_hd128_mxfp8_dsl_*` 曾是出厂集，现保留为 `fmha_fwd_hd128_mxfp8_dsl_auto` 供 A/B）。本文是 Phase 1 设计稿 + 实现路线（分支 `dsl-tile`）。作者：backend-llvm-tail（DSL 架构 + 库实现）。
+> 状态：**已实现**（`crates/amdgpu-tile/src/`；用它写成的 `fmha_fwd_hd128_mxfp8_dsl_*` 曾是出厂集，现保留为 `fmha_fwd_hd128_mxfp8_dsl_auto` 供 A/B）。本文是 Phase 1 设计稿 + 实现路线（分支 `dsl-tile`）。作者：backend-llvm-tail（DSL 架构 + 库实现）。
 > 目标（用户原话）："我专门开 dsl 出来，就是为了让你增加一些抽象来简化上层 kernel 的编写负担。不是把 asm 包一层隐藏起来。"
 > 验收（用户批准）：四条出厂 FMHA fwd 路径（`_vs128`、`_t128`、`_kvsplit`、`_kvsplit_combine8h`）全部在新抽象上重写；性能与当前手写 kernel 相差 ≤ ~3%；
 > 数值过现有门禁（15 形状、64 行 bad=0、确定性、split 形状重复启动压力）；不要求 bit-identical；`amdc gpu-verify --shipped --strict` 0 错误；`cargo test` 绿；
 > 主 kernel 从 ~1600 行降到 ~100–200 行。
 
-> **后续（路线 B，已出厂）**：本文描述的 tile 库（L1–L6，`amdgpu_dsl::tile`）是上一版出厂集 `dsl_*` 的基础。之后按
+> **后续（路线 B，已出厂）**：本文描述的 tile 库（L1–L6，`amdgpu_tile`）是上一版出厂集 `dsl_*` 的基础。之后按
 > [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) 把其中**与布局有关的层**换成了布局代数：
 >
 > | 本文的层 | 路线 B 中的替代 |
 > |---|---|
-> | L1 张量 `TensorDecl` 自动合同 | 合同从 `amdgpu_layout::Layout` 推出：`amdgpu_tile::contract::compact_tensor` / `same_strides`（`crates/amdgpu-tile/src/fmha.rs:358-430` 的 `declare_io`） |
+> | L1 张量 `TensorDecl` 自动合同 | 合同从 `amdgpu_layout::Layout` 推出：`amdgpu_tile::contract::compact_tensor` / `same_strides`（`crates/amdgpu-kernels/src/fmha/mod.rs:358-430` 的 `declare_io`） |
 > | L3 copy（`RowsCopy`、`DwordRowsCopy`、`RowFrags::load`） | `partition_dma`、`partition_buffer_dma`、`partition_global`（`crates/amdgpu-tile/src/{dma,bufdma,global}.rs`） |
 > | L4 片段读（`RowsReader`、`TrReader`、`RowScaleReader`） | `make_tiled_copy_a/_b/_bcast` + `partition_lds`（`crates/amdgpu-tile/src/copy.rs`），atom 来自 `amdgpu-isa` |
 > | L4 MMA（`qk_tile`/`pv_tile` 中的 MFMA） | `TiledMma` + `gemm`（`crates/amdgpu-tile/src/mma.rs`；支持 `swap_ab`） |
 > | L2 `LdsPlan`/标记、L5 `Pipeline`、L6 softmax / epilogue 语义 / combine | **保留**，v3 直接复用 |
 >
-> 新的出厂 kernel：`crates/amdgpu-tile/src/fmha.rs`（`fmha_fwd_hd128_mxfp8_v3_vs128` 在 `:283`，K/V 环在 `KvRing3::new` `:64-101`）。
+> 新的出厂 kernel：`crates/amdgpu-kernels/src/fmha/mod.rs`（`fmha_fwd_hd128_mxfp8_v3_vs128` 在 `:283`，K/V 环在 `KvRing3::new` `:64-101`）。
 > 地址等价性由测试保证：`crates/amdgpu-tile/tests/address_equality.rs`（TiledCopy == RowsReader / TrReader，逐 lane）、
 > `crates/amdgpu-tile/tests/dma_equality.rs`（partition_dma == RowsCopy）。入门教程：[`layout-tour.md`](layout-tour.md)。
 
@@ -64,7 +64,7 @@ kernels.rs 全文约 4,800 处地址算术 builder 调用。抽象缺失的具�
  L0 现有 IR     FnBuilder + expr.rs (I32/F32/Cond/Ptr)
 ```
 
-模块树：`crates/amdgpu-dsl/src/tile/{mod.rs, lane.rs, tensor.rs, shared.rs, copy.rs, pipeline.rs, frag.rs, reduce.rs, softmax.rs, epilogue.rs}`；
+模块树：`crates/amdgpu-tile/src/{mod.rs, lane.rs, tensor.rs, shared.rs, copy.rs, pipeline.rs, frag.rs, reduce.rs, softmax.rs, epilogue.rs}`；
 测试：`crates/amdgpu-compiler/tests/tile_*.rs`。
 
 ---

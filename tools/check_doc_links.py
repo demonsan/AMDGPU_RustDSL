@@ -6,7 +6,7 @@ Checks every tracked Markdown file of the repository (README.md, docs/**.md, cra
 1. relative Markdown links ``[text](path)`` / ``[text](path#anchor)`` and reference definitions ``[id]: path``
    must point to an existing file or directory (http(s)/mailto links and pure ``#anchor`` links are skipped);
 2. in LIVE documents (everything outside ``docs/archive/``), back-quoted repository paths such as
-   ``crates/amdgpu-tile/src/fmha.rs:83`` or ``docs/host-gen.md`` must exist, and a ``:line`` / ``:a-b`` suffix must not
+   ``crates/amdgpu-kernels/src/fmha/mod.rs:83`` or ``docs/host-gen.md`` must exist, and a ``:line`` / ``:a-b`` suffix must not
    exceed the file's line count. Archived documents are historical records: their path mentions are not checked.
 3. every ``docs/<name>.md`` mentioned in a tracked source file (``.rs``, ``.sh``, ``.py``, ``.cpp``, ``.h``, ``.toml``) must exist;
 4. no encoding damage: neither ``???`` nor U+FFFD may appear outside code blocks, and no file may start with a UTF-8 BOM.

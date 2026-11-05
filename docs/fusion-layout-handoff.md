@@ -67,7 +67,7 @@ The winner is the shipped FMHA design: S^T = K Q^T, then O^T = V^T P^T. The test
 l comes from S accumulator j / 16, value j % 16, which is key `32 (j / 16) + 8 (r / 4) + 4 (l / 32) + r % 4`. That packing is one of the
 zero-cost permutations: every lane's (query, key) multiset is exactly its S multiset.
 
-**In the FMHA.** `amdgpu_tile::fmha::attention_orientation()` runs the search and asserts that the winner is the orientation the builder
+**In the FMHA.** `amdgpu_kernels::fmha::attention_orientation()` runs the search and asserts that the winner is the orientation the builder
 implements. The QK, Q-load and O-store atoms are taken from it.
 
 **Acceptance check.** `amdc emit` of the four v3 FMHA kernels gives assembly byte-identical to Main 1c3c9cf:

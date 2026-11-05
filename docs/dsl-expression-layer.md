@@ -3,7 +3,7 @@
 > 起因（用户评论）：“kernel 近乎手写 asm，地址计算和数学计算不能直接用 Rust 运算符描述吗？IR 为什么不能处理？”
 > 结论：**能，而且已经做了**——在**不改 IR、不改 MIR、不改任何 shipped kernel** 的前提下，加一层纯数据的运算符表达式（`crates/amdgpu-dsl/src/expr.rs`）。但它**只**覆盖“地址/整数/朴素浮点”这一类逐点标量表达式；下面第 3 节解释为什么“只靠 IR”不够、哪些东西必须保持显式。
 
-## 1. 数据：现状（`crates/amdgpu-dsl/src/kernels.rs`，22,000+ 行）
+## 1. 数据：现状（`crates/amdgpu-kernels/src/probes.rs`，22,000+ 行）
 
 | builder 调用 | 出现次数 |
 |---|---|
@@ -39,7 +39,7 @@
 * **IR 里没有单个 Op 的运算符，定义为固定组合**（文档化，模 2^32 / IEEE 符号处理正确，`tests/expr_layer.rs` 用主机求值在 13×13 个边界样本上逐一验证）：`a - b` = `a + b * -1`（字面量右值为 `a + (-k)`）、`-a` = `a * -1`、`!a`（按位）= `a ^ -1`、`a | b` = `(a ^ b) + (a & b)`、`max(a,b)`（I32）= `select(a < b, b, a)`、`a > b` = `b < a`、`a <= b` = `b >= a`、`ne` = `min(d, -d) < 0`（`d = a - b`）、`eq` = `!ne`、`-x`（F32）= `x * -1.0`。
 * **操作数顺序按书写顺序保留**（`4 * x` 与 `x * 4` 是不同的树）。
 * **常量**：字面量在**首次使用处**物化为 `ConstI32/ConstF32`，之后在同一或内层作用域复用（`if`/`else`/循环作用域关闭时清空）；`b.hoist_i32(&[2, 3, 4, …])` 把常量按给定顺序提前物化——手写 kernel 习惯把常量集中写在最前面，**物化顺序决定寄存器分配**，所以要逐字节一致就用 `hoist_*` 对齐。
-* **验收（已通过）**：`probe_expr_ids`（`probe_llvm_ids` 的运算符改写）与 `probe_expr_kernarg`（`probe_llvm_kernarg` 的改写）编译出的 `.s`（仅归一化 kernel 符号名）**逐字节相同**，post-RA MIR 与寄存器分配也相同，且 `amdc gpu-verify <k> --strict` 干净；见 `crates/amdgpu-compiler/tests/expr_layer.rs`。
+* **验收（已通过）**：`probe_expr_ids`（`probe_llvm_ids` 的运算符改写）与 `probe_expr_kernarg`（`probe_llvm_kernarg` 的改写）编译出的 `.s`（仅归一化 kernel 符号名）**逐字节相同**，post-RA MIR 与寄存器分配也相同，且 `amdc gpu-verify <k> --strict` 干净；见 `crates/amdgpu-kernels/tests/expr_layer.rs`。
 
 ## 3. 不能做什么，以及为什么“只靠 IR”不够
 

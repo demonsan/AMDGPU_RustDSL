@@ -1,7 +1,7 @@
 # Region IR（结构化 kernel 体）
 
 > 代码：`crates/amdgpu-dsl/src/lib.rs`（`Node`、`RegionKind`、`Function::{body, stmts, set_body, parse_flat, set_stmts, edit_stmts}`、
-> `FnBuilder` 的区域栈与闭包形式）；测试：`crates/amdgpu-compiler/tests/region_ir.rs`。设计依据：[`ir-review-tirx-sftensor.md`](ir-review-tirx-sftensor.md) B 项。
+> `FnBuilder` 的区域栈与闭包形式）；测试：`crates/amdgpu-kernels/tests/region_ir.rs`。设计依据：[`ir-review-tirx-sftensor.md`](ir-review-tirx-sftensor.md) B 项。
 
 ## 1. 表示
 

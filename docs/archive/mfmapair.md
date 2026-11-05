@@ -1,7 +1,7 @@
 # `mfmapair`：同累加器 MFMA 成对相邻（opt-in 调度器模式）
 
-`crates/amdgpu-compiler/src/sched/mfmapair.rs`，开关：sched token `mfmapair` / `mfmapair=<预算系数>`（`Function::sched_opts`），或实验开关
-`AMDC_MFMAPAIR=1`（所有内核）/ `AMDC_MFMAPAIR=<内核名或策略名子串>[:预算系数]`（`cargo.sh` 已转发）。默认关闭；关闭时汇编逐字节不变。测试：`crates/amdgpu-compiler/tests/mfmapair.rs`（7 项）。
+（已在 2026-11 的仓库整理中删除：sched/mfmapair.rs），开关：sched token `mfmapair` / `mfmapair=<预算系数>`（`Function::sched_opts`），或实验开关
+`AMDC_MFMAPAIR=1`（所有内核）/ `AMDC_MFMAPAIR=<内核名或策略名子串>[:预算系数]`（`cargo.sh` 已转发）。默认关闭；关闭时汇编逐字节不变。测试：tests/mfmapair.rs（已删除）（7 项）。
 
 ## 做什么
 

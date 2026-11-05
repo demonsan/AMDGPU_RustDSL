@@ -13,7 +13,7 @@
 | [`implementation-plan.md`](implementation-plan.md) | 最初实施计划逐项对照到第 75 轮状态 | 第 75 轮 | 计划已完成或关闭 | [`../design.md`](../design.md)、[`../current-status.md`](../current-status.md) |
 | [`kernel-gen2-design.md`](kernel-gen2-design.md) | gen2：单 wave 内 VALU/MFMA 重叠（`_g2`） | 第 57 轮 | 关闭（正确但不更快） | — |
 | [`gen3-design.md`](gen3-design.md) | gen3：每 tile 合并单窗口 + 偏移 barrier（`_g3`） | 第 57–58 轮 | 关闭（更慢） | — |
-| [`gen4-tiling-design.md`](gen4-tiling-design.md) | gen4：128 行 block 分块 | 第 59 轮 | **采纳**：出厂为 `_t128`（今天的 v3 `_t128` 沿用该分块） | v3 `_t128`（`crates/amdgpu-tile/src/fmha.rs`） |
+| [`gen4-tiling-design.md`](gen4-tiling-design.md) | gen4：128 行 block 分块 | 第 59 轮 | **采纳**：出厂为 `_t128`（今天的 v3 `_t128` 沿用该分块） | v3 `_t128`（`crates/amdgpu-kernels/src/fmha/mod.rs`） |
 | [`gen5-window-spec.md`](gen5-window-spec.md) | gen5：手写（safe-asm）内层 tile 窗口 `_vs5` | 第 63 轮 | 关闭（Block C −2.5%，M 中立） | — |
 | [`gen6-rebalance.md`](gen6-rebalance.md) | gen6 输入：厂商 V/M 划分与 VALU 再平衡 | 第 64 轮 | 关闭（见 gen6-results） | — |
 | [`gen6-results.md`](gen6-results.md) | gen6：K-ahead ring + 合并窗口 + 再平衡（`_vs6`） | 第 64 轮 | 关闭（−10.5% / −12..−17%） | — |
