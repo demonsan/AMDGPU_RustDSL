@@ -210,13 +210,10 @@ impl FmhaIo {
 }
 
 impl FmhaBlock {
-    /// The recipe copy: sequences of fewer than 9 tiles of 128 keys (the WHOLE sequence, also for a KV split) keep the LUT-corrected P conversion.
+    /// The recipe copy: sequences of fewer than 4 tiles of 128 keys (the WHOLE sequence, also for a KV split) keep the exact LUT-corrected recipe
+    /// (from 2 tiles on, the vendor recipe missed parity at S=300 SK=129: 1.31x the vendor's mean error).
     pub fn lut_copy(&self, b: &mut FnBuilder) -> ValueId {
-        self.lut_copy_below(b, 9)
-    }
-    /// `lut_copy` with another tile-count threshold.
-    pub fn lut_copy_below(&self, b: &mut FnBuilder, tiles: i32) -> ValueId {
-        b.bind_cond(ev(self.ntiles_total).lt(tiles))
+        b.bind_cond(ev(self.ntiles_total).lt(4))
     }
     /// The output scale `V descale / l`.
     pub fn out_scale(&self, b: &mut FnBuilder, l: ValueId) -> ValueId {

@@ -130,7 +130,7 @@ pub struct Pipeline {
     /// group A, one phase ahead, reads it in its M phase of t+1.
     pub late_stage_b: bool,
     /// `RegStaged`: two tiles per loop pass with STATIC ring slots (0 then 1: the tile counter is even at the top), so the slot offsets are
-    /// constants (the vendor `u2`); the loop may exit between the two halves.
+    /// constants (the vendor `u2`); the loop may exit between the two halves. (Measured on `TwoPhaseOffset` `_vs128`: -6..-11 %, not offered.)
     pub unroll2: bool,
     /// `RegStaged`: the vmcnt allowed at the top-of-tile wait (default 0). A body that publishes part of the stage later (its own wait + barrier
     /// before the first read of that part) sets this to the number of DMAs issued after the part needed first.
@@ -150,9 +150,6 @@ pub struct Pipeline {
     pub tile1_after_barrier: bool,
     /// compute the t+2 key after the barrier (the old order; A/B only)
     pub key_late: bool,
-    /// `TwoPhaseOffset`: the next tile's key from a `read_first_lane` of the tile counter (wave-uniform: SALU instead of VALU for the clamp and
-    /// the DMA address math)
-    pub scalar_keys: bool,
     /// `TwoPhaseOffset`: the next tile's key without the clamp to the last tile (inside the loop t + 1 <= nkv - 1 holds; valid only when
     /// every stage reads through a range-checked buffer descriptor, so the verifier needs no clamp for the bounds)
     pub key_unclamped: bool,
@@ -161,7 +158,7 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true, late_stage_b: false, scalar_keys: false, key_unclamped: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true, late_stage_b: false, key_unclamped: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -270,34 +267,6 @@ impl Pipeline {
         };
         let stop = b.bind_cond(!varx(it).lt(&nkv_m1));
         b.break_if(stop);
-        if self.unroll2 && self.cadence == Cadence::TwoPhaseOffset {
-            // two tiles per pass with STATIC ring slots (0 then 1; the counter is even at the top): every slot offset is a constant
-            self.iter_tpo(b, role, body, Opnd::Var(it), Opnd::I32(0), false, true, true);
-            // idx (0 at the top of every pass) toggles with `^ 1`: a periodic counter for the protocol model
-            let i1 = b.bind_i32(varx(idx) ^ 1);
-            b.set_var(idx, i1);
-            let mid = b.bind_i32(varx(it) + 1);
-            let stop1 = b.bind_cond(!ev(mid).lt(&nkv_m1));
-            b.break_if(stop1);
-            self.iter_tpo(b, role, body, Opnd::Val(mid), Opnd::I32(1), false, true, true);
-            let i0 = b.bind_i32(varx(idx) ^ 1);
-            b.set_var(idx, i0);
-            let it2 = b.bind_i32(varx(it) + 2);
-            b.set_var(it, it2);
-            let stop2 = b.bind_cond(!ev(it2).lt(&nkv_m1));
-            b.break_if(stop2);
-            b.end_loop();
-            let it_t = b.bind_i32(varx(it) + varx(idx));
-            let is_tail = b.bind_cond(ev(self.kv_len).lt((ev(it_t) << self.lg()) + self.tile_rows));
-            let last_barrier = role != Role::B;
-            let slot_t = Opnd::Var(idx);
-            b.begin_if(is_tail);
-            self.iter_tpo(b, role, body, Opnd::Val(it_t), slot_t, true, false, last_barrier);
-            b.else_();
-            self.iter_tpo(b, role, body, Opnd::Val(it_t), slot_t, false, false, last_barrier);
-            b.end_if();
-            return;
-        }
         if self.unroll2 && self.cadence == Cadence::RegStaged {
             // `it` steps by 2 per pass (an affine counter for the protocol model); `idx` = which half the loop left from (0: after the pass, 1:
             // between the halves) - the last tile is it + idx, in slot idx
@@ -388,44 +357,6 @@ impl Pipeline {
         body.m_phase(b, role, &t);
     }
 
-    /// One `TwoPhaseOffset` iteration of tile `it` (a value or the loop variable) in ring slot `slot` (a constant in the unrolled loop).
-    #[allow(clippy::too_many_arguments)]
-    fn iter_tpo(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: Opnd, masked: bool, staged: bool, last_barrier: bool) -> Opnd {
-        let other = match slot {
-            Opnd::I32(k) => Opnd::I32(1 - k),
-            o => b.bind_opnd(&(amdgpu_dsl::ox(o) ^ 1)),
-        };
-        let it_p1 = b.let_i32(amdgpu_dsl::ox(it) + 1);
-        let t = TileIt { it, cur: SlotIdx::new(slot, it), next: SlotIdx::new(other, b.bind_opnd(&it_p1)), n2: None, masked, staged, tile_rows: self.tile_rows };
-        self.prebind(b, &t);
-        let key_n = staged.then(|| {
-            if self.key_unclamped {
-                b.let_i32(&it_p1 << self.lg())
-            } else {
-                let nkv = ev(self.nkv);
-                b.let_i32(it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1) << self.lg())
-            }
-        });
-        if let Some(k) = &key_n {
-            body.stage(b, role, k, &t.next);
-        }
-        body.v_phase(b, role, &t);
-        if staged {
-            b.wait_vm(0);
-            body.stage_complete(b, role, &t.next);
-        }
-        if self.mid_lds_drain {
-            b.wait_lds(0);
-        }
-        b.barrier();
-        body.m_phase(b, role, &t);
-        b.wait_lds(0);
-        if last_barrier {
-            b.barrier();
-        }
-        other
-    }
-
     /// One iteration; returns the next ring index.
     #[allow(clippy::too_many_arguments)]
     fn iter(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: VarId, idx: VarId, masked: bool, staged: bool, last_barrier: bool) -> ValueId {
@@ -433,12 +364,7 @@ impl Pipeline {
         match self.cadence {
             Cadence::TwoPhaseOffset => {
                 let i1 = b.bind_i32(varx(idx) ^ 1);
-                let it_p1 = if self.scalar_keys {
-                    let su = b.read_first_lane(Opnd::Var(it));
-                    b.let_i32(ev(su) + 1)
-                } else {
-                    b.let_i32(varx(it) + 1)
-                };
+                let it_p1 = b.let_i32(varx(it) + 1);
                 let nn = it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1);
                 let t = TileIt {
                     it: Opnd::Var(it),

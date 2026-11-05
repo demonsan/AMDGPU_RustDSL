@@ -199,8 +199,6 @@ pub struct AttnBody3<'a> {
     kd_pending: Option<ValueId>,
     /// the vendor's priority ping-pong (`_vs128`): `s_setprio 1` at the start of the MFMA phase, `s_setprio 0` at the softmax phase
     pub setprio: bool,
-    /// the first tile always rebases the reference (the vendor recipe's seed, `OnlineSoftmax::set_vendor_ref`)
-    pub seed_first: bool,
     /// K scales: one shift per scale word + op_sel byte select on the scaled QK MFMA (`_vs128`)
     pub kscale_sel: bool,
     /// the reference update entirely inside the rollback branch (`OnlineSoftmax::decide_lazy`)
@@ -213,7 +211,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, kscale_sel: false, lazy_bias: false, bias_next: None }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -310,18 +308,13 @@ impl PipeBody for AttnBody3<'_> {
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
         if self.lazy_bias {
-            // no seed: the initial reference (bias words 0x4800: b = 64) puts the first tile's max far above the threshold, so tile 0 always
-            // rebases (the seed of `decide_seeded` is implied)
-            self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref(), None));
+            // no seed needed: the initial reference (bias words 0x4800: b = 64) puts the first tile's max far above the threshold, so tile 0
+            // always rebases
+            self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref()));
             self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
             return;
         }
-        let nb = if self.seed_first {
-            let first = b.bind_cond(amdgpu_dsl::ox(t.it).eq(0));
-            self.sm.decide_seeded(b, &s, &o, mask.as_ref(), first)
-        } else {
-            self.sm.decide(b, &s, &o, mask.as_ref())
-        };
+        let nb = self.sm.decide(b, &s, &o, mask.as_ref());
         self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
         self.p.push(nb);
     }
@@ -345,7 +338,7 @@ impl PipeBody for AttnBody3<'_> {
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
         let (nb, lazy) = if self.lazy_bias {
-            (self.sm.decide_lazy(b, &s, &o, mask.as_ref(), None), true)
+            (self.sm.decide_lazy(b, &s, &o, mask.as_ref()), true)
         } else {
             (Opnd::Val(self.sm.decide_deferred(b, &s, &o, mask.as_ref())), false)
         };
@@ -366,28 +359,12 @@ impl PipeBody for AttnBody3<'_> {
     }
 }
 
-/// `_vs128`: 256-row blocks, two 4-wave groups offset by one phase (`Cadence::TwoPhaseOffset`), MUBUF K / V staging, the vendor's priority ping-pong,
-/// two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe in the long-sequence copy (`OnlineSoftmax::set_vendor_ref`;
-/// the short copy keeps the exact LUT-corrected recipe: with < 9 tiles the lazy recipe's error does not average out) and the LDS-staged epilogue.
+/// `_vs128`: 256-row blocks, two 4-wave groups offset by one phase (`Cadence::TwoPhaseOffset`), MUBUF K / V / K-scale staging, the vendor's
+/// priority ping-pong, two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe with the lazy reference
+/// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
+/// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_lut("fmha_fwd_hd128_mxfp8_v3_vs128", 4)
-}
-
-/// `_vs128` with the short-copy (exact LUT recipe) threshold at `lut_tiles` tiles instead of 9 (A/B builds).
-pub fn fmha_vs128_lut(name: &str, lut_tiles: i32) -> Function {
-    LUT_TILES.with(|x| x.set(lut_tiles));
-    let f = fmha_vs128_named(name, true, false, true, false);
-    LUT_TILES.with(|x| x.set(9));
-    f
-}
-
-thread_local! {
-    static LUT_TILES: std::cell::Cell<i32> = const { std::cell::Cell::new(9) };
-}
-
-/// `_vs128` under another name with the experiment switches (A/B builds).
-pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bool, unroll2: bool) -> Function {
-    let mut fb = FnBuilder::new(name, 512);
+    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
@@ -395,17 +372,13 @@ pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bo
     let roles = Roles::split(b, &blk.lane, 4);
     let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
     ring.enable_buffer_dma(b);
-    if kbuf {
-        ring.enable_buffer_kd(b);
-    }
+    ring.enable_buffer_kd(b);
     let ring = ring;
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
-    pipe.scalar_keys = scalar_keys;
-    pipe.scalar_exit = scalar_keys;
-    pipe.key_unclamped = kbuf;
-    pipe.unroll2 = unroll2;
+    // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
+    pipe.key_unclamped = true;
     let pipe = pipe;
-    let lut = blk.lut_copy_below(b, LUT_TILES.with(|x| x.get()));
+    let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
@@ -415,10 +388,9 @@ pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bo
             body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
             if !lut {
                 body.sm.set_vendor_ref(b);
-                body.seed_first = true;
+                body.lazy_bias = true;
             }
             body.setprio = true;
-            body.lazy_bias = lazy_bias && !lut;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
@@ -427,14 +399,10 @@ pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bo
     fb.finish()
 }
 
-/// `_kvsplit`: the `_vs128` structure over a key range per split (two-smfmac row sums), the partial-row epilogue + log-sum-exp.
+/// `_kvsplit`: the `_vs128` structure over a key range per split (two-smfmac row sums, the vendor recipe with the lazy update from 4 tiles of the
+/// whole sequence), the partial-row epilogue + log-sum-exp.
 pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
-    fmha_kvsplit_named("fmha_fwd_hd128_mxfp8_v3_kvsplit", true)
-}
-
-/// `_kvsplit` under another name; `vref`: the vendor recipe with the lazy reference update from 4 tiles of the whole sequence (A/B builds).
-pub fn fmha_kvsplit_named(name: &str, vref: bool) -> Function {
-    let mut fb = FnBuilder::new(name, 512);
+    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_kvsplit", 512);
     fb.compile_profile(CompileProfile::KvSplit);
     let b = &mut fb;
     let io = declare_io(b, 256, true);
@@ -442,14 +410,14 @@ pub fn fmha_kvsplit_named(name: &str, vref: bool) -> Function {
     let roles = Roles::split(b, &blk.lane, 4);
     let ring = KvRing3::new(b, &io, &blk, &roles, 2);
     let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
-    let lut = if vref { blk.lut_copy_below(b, 4) } else { blk.lut_copy(b) };
+    let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
             let p = amdgpu_tile::rowsum::plan();
             body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
-            if vref && !lut {
+            if !lut {
                 body.sm.set_vendor_ref(b);
                 body.lazy_bias = true;
             }
@@ -470,14 +438,10 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h() -> Function {
     fb.finish()
 }
 
-/// `_t128`: 128-row blocks, one 4-wave group, a 3-slot ring with one window per tile (`Cadence::OneWindow`).
+/// `_t128`: 128-row blocks, one 4-wave group, a 3-slot ring with one window per tile (`Cadence::OneWindow`); the vendor recipe with the lazy
+/// update from 4 tiles.
 pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
-    fmha_t128_named("fmha_fwd_hd128_mxfp8_v3_t128", true)
-}
-
-/// `_t128` under another name; `vref`: the vendor recipe with the lazy reference update from 4 tiles (A/B builds).
-pub fn fmha_t128_named(name: &str, vref: bool) -> Function {
-    let mut fb = FnBuilder::new(name, 256);
+    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_t128", 256);
     fb.compile_profile(CompileProfile::T128);
     let b = &mut fb;
     let io = declare_io(b, 128, false);
@@ -486,10 +450,10 @@ pub fn fmha_t128_named(name: &str, vref: bool) -> Function {
     let ring = KvRing3::new(b, &io, &blk, &roles, 3);
     let mut pipe = Pipeline::new(Cadence::OneWindow, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     pipe.prebind = vec![32768, 512];
-    let lut = if vref { blk.lut_copy_below(b, 4) } else { blk.lut_copy(b) };
+    let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         let mut body = AttnBody3::new(b, &ring, &blk, blk.lane.wave, lut);
-        if vref && !lut {
+        if !lut {
             body.sm.set_vendor_ref(b);
             body.lazy_bias = true;
         }
@@ -499,7 +463,6 @@ pub fn fmha_t128_named(name: &str, vref: bool) -> Function {
     });
     fb.finish()
 }
-
 /// The 656-byte FMHA kernarg ABI (+ the KV-split extension) with the host contract DERIVED from the tensors' layouts (`contract::compact_tensor` /
 /// `same_strides`: allocation = cosize, compactness relations); the kernarg loads and the runtime tensors are those of `FmhaIo::declare`.
 pub fn declare_io(b: &mut FnBuilder, rows_per_block: i64, kvsplit: bool) -> FmhaIo {
