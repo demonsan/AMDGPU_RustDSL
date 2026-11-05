@@ -15,6 +15,13 @@ def parse(path):
     """-> list of (addr_or_index, label_or_None, text) for instructions; labels map name -> index."""
     ins, labels = [], {}
     for line in open(path, errors='replace'):
+        # llvm-objdump (ROCm 7) form: "<tab>insn ops   // 000000001930: BF840004 <sym+0x144>" -> keep the address and the branch target
+        cm = re.search(r'//\s*([0-9A-Fa-f]{8,}):\s+(?:[0-9A-Fa-f]{8}\s*)+(<[^>]+>)?', line)
+        if cm and not re.match(r'^\s*[0-9a-f]+ <', line):
+            body = line.split('//')[0].strip()
+            if body and re.match(r'^[a-z_]', body):
+                ins.append((int(cm.group(1), 16), body + (' ' + cm.group(2) if cm.group(2) and 'branch' in body else '')))
+            continue
         s = line.split('//')[0].split(';')[0].rstrip()
         if not s.strip():
             continue
