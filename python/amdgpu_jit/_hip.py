@@ -136,15 +136,19 @@ class Module:
         return f
 
 
+_ExtraArr = ctypes.c_void_p * 5
+
+
 def launch(func, grid, block, kernarg: bytes, stream=None):
-    """``hipModuleLaunchKernel`` with the kernarg segment passed as one buffer (HIP_LAUNCH_PARAM_BUFFER_POINTER)."""
-    buf = ctypes.create_string_buffer(kernarg, len(kernarg))
-    size = ctypes.c_size_t(len(kernarg))
-    extra = (ctypes.c_void_p * 5)(HIP_LAUNCH_PARAM_BUFFER_POINTER, ctypes.cast(buf, ctypes.c_void_p), HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                                  ctypes.cast(ctypes.pointer(size), ctypes.c_void_p), HIP_LAUNCH_PARAM_END)
-    gx, gy, gz = (tuple(grid) + (1, 1, 1))[:3]
-    bx, by, bz = (tuple(block) + (1, 1, 1))[:3]
-    check(lib().hipModuleLaunchKernel(ctypes.c_void_p(func), gx, gy, gz, bx, by, bz, 0, ctypes.c_void_p(stream or 0), None, extra), "hipModuleLaunchKernel")
+    """``hipModuleLaunchKernel`` with the kernarg segment passed as one buffer (HIP_LAUNCH_PARAM_BUFFER_POINTER; HIP copies it at launch)."""
+    n = len(kernarg)
+    size = ctypes.c_size_t(n)
+    extra = _ExtraArr(1, ctypes.cast(ctypes.c_char_p(kernarg), ctypes.c_void_p).value, 2, ctypes.addressof(size), 3)
+    g = (tuple(grid) + (1, 1, 1))[:3]
+    bl = (tuple(block) + (1, 1, 1))[:3]
+    rc = (_lib or lib()).hipModuleLaunchKernel(func, g[0], g[1], g[2], bl[0], bl[1], bl[2], 0, stream or None, None, extra)
+    if rc:
+        check(rc, "hipModuleLaunchKernel")
 
 
 class Event:

@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from amdgpu_jit._kernarg import ContractError, KernelInfo, eval_ext, fmt_ext, pack, validate  # noqa: E402
+from amdgpu_jit._kernarg import ContractError, KernelInfo, eval_ext, fmt_ext, pack, pack_fast, scalars_to_ka, validate, validate_memo  # noqa: E402
 from amdgpu_jit.ops import select_path  # noqa: E402
 
 
@@ -50,6 +50,22 @@ class T(unittest.TestCase):
             validate(i, ka, (2, 1, 1), {"KT": 2}, {"ptr_a": 100})  # tensor size
         with self.assertRaises(ContractError):
             validate(i, ka, (2, 1, 1), {"KT": 99}, {"ptr_a": 1 << 40})  # symbol range (and ka_is)
+
+    def test_pack_fast_matches_pack(self):
+        i = info()
+        v = {"ptr_a": 0x1000, "m": 512, "k": 256, "alpha": 0.5}
+        b1, ka = pack(i, v)
+        b2, sc = pack_fast(i, v)
+        self.assertEqual(b1, b2)
+        self.assertEqual(scalars_to_ka(i, sc), ka)
+        validate_memo(i, sc, (2, 1, 1), {"KT": 2}, {"ptr_a": 512 * 256})
+        validate_memo(i, sc, (2, 1, 1), {"KT": 2}, {"ptr_a": 512 * 256})  # memo hit
+        with self.assertRaises(ContractError):
+            validate_memo(i, sc, (3, 1, 1), {"KT": 2}, {"ptr_a": 512 * 256})
+        with self.assertRaises(ContractError):
+            pack_fast(i, {"ptr_a": 1, "m": 1, "k": -1, "alpha": 1.0})
+        with self.assertRaises(ContractError):
+            pack_fast(info({"m": 512}), {"ptr_a": 1, "m": 256, "k": 1, "alpha": 1.0})
 
     def test_pack_errors(self):
         with self.assertRaises(ContractError):

@@ -90,9 +90,70 @@ class KernelInfo:
             end = a["offset"] + a["size"]
         if end > self.kernarg_size:
             raise ValueError(f"{self.kernel}: arguments end at {end} > kernarg_size {self.kernarg_size}")
+        # one struct for the whole segment (fast path of `pack`): fields in offset order, padding as pad bytes
+        fmt, pos, names, kinds = "<", 0, [], []
+        for a in self.args:
+            if a["offset"] > pos:
+                fmt += f"{a['offset'] - pos}x"
+            if a["kind"] == "pad":
+                fmt += f"{a['size']}x"
+            else:
+                code = {"ptr": "Q", "i32": "i", "u32": "I", "f32": "f"}.get(a["kind"])
+                if code is None:
+                    raise ValueError(f"{self.kernel}: argument {a['name']} of unsupported kind {a['kind']}")
+                nat = 8 if code == "Q" else 4
+                fmt += code + (f"{a['size'] - nat}x" if a["size"] > nat else "")
+                names.append(a["name"])
+                kinds.append(a["kind"])
+            pos = a["offset"] + a["size"]
+        if self.kernarg_size > pos:
+            fmt += f"{self.kernarg_size - pos}x"
+        self._struct = struct.Struct(fmt)
+        self._names = names
+        self._scalar_idx = [(i, a["offset"], a["kind"]) for i, a in enumerate(a2 for a2 in self.args if a2["kind"] != "pad") if a["kind"] != "ptr"]
+        self._spec = [(n, a["specialized"]) for n, a in ((a["name"], a) for a in self.args) if a.get("specialized") is not None]
+        self._validated = set()
 
     def tensor_args(self):
         return [a["name"] for a in self.args if a["kind"] == "ptr"]
+
+
+def pack_fast(info: KernelInfo, values: dict):
+    """`pack` through the precompiled segment struct: returns (bytes, scalars) where scalars = the tuple of non-pointer argument values (the
+    key of the validation memo). Raises ContractError on a missing / unknown / out-of-range / mismatching-specialization argument."""
+    try:
+        vals = [values[n] for n in info._names]
+    except KeyError as e:
+        raise ContractError(f"{info.kernel}: missing argument {e.args[0]}") from None
+    if len(values) != len(vals):
+        raise ContractError(f"{info.kernel}: unknown argument(s) {sorted(set(values) - set(info._names))}")
+    for n, sv in info._spec:
+        if values[n] != sv:
+            raise ContractError(f"{info.kernel}: argument {n} = {values[n]}, but the kernel is specialized for {sv}")
+    try:
+        buf = info._struct.pack(*vals)
+    except struct.error as e:
+        pack(info, values)  # names the offending argument
+        raise ContractError(f"{info.kernel}: {e}") from None
+    return buf, tuple(vals[i] for i, _, _ in info._scalar_idx)
+
+
+def scalars_to_ka(info: KernelInfo, scalars):
+    ka = {}
+    for (i, off, kind), v in zip(info._scalar_idx, scalars):
+        ka[off] = struct.unpack("<I", struct.pack("<f", v))[0] if kind == "f32" else int(v) & 0xFFFFFFFF
+    return ka
+
+
+def validate_memo(info: KernelInfo, scalars, grid, syms: dict, sizes: dict):
+    """`validate` with a per-kernel memo of the launches already proven inside the contract (pointers do not enter the contract; sizes do)."""
+    key = (scalars, tuple(grid), tuple(sorted(syms.items())), tuple(sorted(sizes.items())))
+    if key in info._validated:
+        return
+    validate(info, scalars_to_ka(info, scalars), grid, syms, sizes)
+    if len(info._validated) > 4096:
+        info._validated.clear()
+    info._validated.add(key)
 
 
 def pack(info: KernelInfo, values: dict):

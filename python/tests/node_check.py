@@ -148,12 +148,18 @@ def cache_behaviour():
 
 
 # ------------------------------------------------------------------------------------------------------------------------------- overhead / perf
-def gemm_buffers(M, N, K):
-    import random
+# random fp8 bytes (no NaN encodings): os.urandom mapped through a palette (the harnesses' value ranges)
+_FP8 = bytes((((x & 1) << 7) | ((4 + (x >> 1) % 6) << 3) | ((x >> 4) & 7)) for x in range(256))
+_PAL = bytes((0x00, 0x20, 0x28, 0x30, 0x38, 0x3C, 0x40, 0xA0, 0xA8, 0xB0, 0xB8)[x % 11] for x in range(256))
 
-    rnd = random.Random(1)
-    a = dev(bytes(rnd.choice((0x38, 0x30, 0xB8, 0x40)) for _ in range(M * K)), (M, K))
-    b = dev(bytes(rnd.choice((0x38, 0x30, 0xB8, 0x40)) for _ in range(N * K)), (N, K))
+
+def rand_fp8(n, table=_FP8):
+    return os.urandom(n).translate(table)
+
+
+def gemm_buffers(M, N, K):
+    a = dev(rand_fp8(M * K), (M, K))
+    b = dev(rand_fp8(N * K), (N, K))
     sa, sb = dev(bytes([127]) * (K // 128 * M), (K // 128, M)), dev(bytes([127]) * (N // 128 * K // 128), (N // 128, K // 128))
     out = aj.DeviceBuffer((M, N), "bfloat16", itemsize=2)
     return a, b, sa, sb, out
@@ -200,9 +206,9 @@ def perf_spec_vs_generic(quick):
     result(f"gemm {M}x{N}x{K} specialized vs generic", True, f"{s:.1f} vs {gn:.1f} TFLOP/s ({(s / gn - 1) * 100:+.1f}%), median of {rounds}")
     for (B, H, S) in ((4, 8, 2048), (1, 8, 8192), (1, 8, 2048)):
         HK, SK = H, S
-        q = dev(bytes([0x38]) * (B * S * H * 128), (B, S, H, 128))
-        k = dev(bytes([0x30]) * (B * SK * HK * 128), (B, SK, HK, 128))
-        v = dev(bytes([0x38]) * (B * SK * HK * 128), (B, SK, HK, 128))
+        q = dev(rand_fp8(B * S * H * 128, _PAL), (B, S, H, 128))
+        k = dev(rand_fp8(B * SK * HK * 128, _PAL), (B, SK, HK, 128))
+        v = dev(rand_fp8(B * SK * HK * 128, _PAL), (B, SK, HK, 128))
         qs = aj.DeviceBuffer((B, S, H, 4), nbytes=B * S * H * 4 + 512 * H * 4)
         qs.fill(127)
         ks = aj.DeviceBuffer((B, SK, HK, 4), nbytes=B * SK * HK * 4 + 640 * H * 4)

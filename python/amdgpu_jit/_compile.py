@@ -20,12 +20,13 @@ import threading
 import time
 
 from . import _hip
-from ._kernarg import KernelInfo, pack, validate
+from ._kernarg import KernelInfo, pack_fast, validate_memo
 
 CACHE_FORMAT = 1
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _lock = threading.Lock()
 _modules = {}  # key -> Kernel
+_fast = {}  # (kernel, spec items, backend, arch, cache flag) -> Kernel: the per-call lookup (no stat / hashing once loaded)
 _file_hash = {}  # (path, size, mtime) -> sha256
 stats = {"memory_hits": 0, "disk_hits": 0, "compiles": 0, "compile_seconds": 0.0}
 
@@ -121,9 +122,9 @@ class Kernel:
         self.func = self.module.function(info.symbol)
 
     def kernarg(self, values, grid, syms, sizes, check=True):
-        buf, ka = pack(self.info, values)
+        buf, scalars = pack_fast(self.info, values)
         if check:
-            validate(self.info, ka, grid, syms, sizes)
+            validate_memo(self.info, scalars, grid, syms, sizes)
         return buf
 
     def launch(self, values, grid, syms=None, sizes=None, stream=None, check=True):
@@ -163,6 +164,17 @@ def _compile_into(d, kernel, spec, amdc, clang):
 def get_kernel(kernel, specialize=None):
     """The loaded kernel `kernel` specialized for `specialize` (dict arg name -> value), compiling on a cache miss."""
     spec = {k: v for k, v in (specialize or {}).items()}
+    fk = (kernel, tuple(sorted(spec.items())), os.environ.get("AMDGPU_JIT_BACKEND"), os.environ.get("AMDGPU_JIT_ARCH"), os.environ.get("AMDGPU_JIT_AMDC"))
+    k = _fast.get(fk)
+    if k is not None:
+        stats["memory_hits"] += 1
+        return k
+    k = _get_kernel(kernel, spec)
+    _fast[fk] = k
+    return k
+
+
+def _get_kernel(kernel, spec):
     amdc, clang = amdc_path(), clang_path()
     key, meta = cache_key(kernel, spec, amdc, clang)
     with _lock:
@@ -210,3 +222,4 @@ def get_kernel(kernel, specialize=None):
 def clear_memory_cache():
     with _lock:
         _modules.clear()
+        _fast.clear()
