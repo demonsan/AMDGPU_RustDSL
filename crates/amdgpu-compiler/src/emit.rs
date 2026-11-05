@@ -915,7 +915,12 @@ fn hoist_m0(lines: &mut Vec<String>) {
     while i < lines.len() {
         let is_exp = lines[i].starts_with("s_mov_b32 m0, ") && lines.get(i + 1).map_or(false, |l| l == "s_nop 0") && lines.get(i + 2).map_or(false, |l| is_lds_dma(l));
         if is_exp {
-            if let Some(x) = out.last() {
+            let mut used = line_regs(&lines[i]);
+            used.extend(line_regs(&lines[i + 2]));
+            // walk up over independent instructions (at most 16): the M0 write goes right after the nearest conflicting one
+            let mut j = out.len();
+            while j > 0 && out.len() - j < 16 {
+                let x = &out[j - 1];
                 let ok_kind = !(x.starts_with("s_waitcnt")
                     || x.starts_with("s_cbranch")
                     || x.starts_with("s_branch")
@@ -924,17 +929,16 @@ fn hoist_m0(lines: &mut Vec<String>) {
                     || x.starts_with("s_mov_b32 m0")
                     || is_lds_dma(x)
                     || x.contains("m0"));
-                let xr = line_regs(x);
-                let mut used = line_regs(&lines[i]);
-                used.extend(line_regs(&lines[i + 2]));
-                if ok_kind && !xr.iter().any(|r| used.contains(r)) {
-                    let x = out.pop().expect("x");
-                    out.push(lines[i].clone());
-                    out.push(x);
-                    out.push(lines[i + 2].clone());
-                    i += 3;
-                    continue;
+                if !ok_kind || line_regs(x).iter().any(|r| used.contains(r)) {
+                    break;
                 }
+                j -= 1;
+            }
+            if j < out.len() {
+                out.insert(j, lines[i].clone());
+                out.push(lines[i + 2].clone());
+                i += 3;
+                continue;
             }
         }
         out.push(lines[i].clone());

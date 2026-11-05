@@ -99,7 +99,7 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
 
 /// M0 reuse for LDS-DMA loads is part of the GEMM profile (AMDC_M0_REUSE=0 turns it off for A/B runs); the FMHA kernels keep their shipped output.
 fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
-    f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_M0_REUSE").map_or(true, |v| v != "0")
+    (f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_M0_REUSE").map_or(true, |v| v != "0")) || fmha_opt(f, "m0reuse")
 }
 
 /// An `FMHA_OPT` token for this kernel: `FMHA_OPT_SCOPE=<substring>` restricts the tokens to kernels whose name contains it (same-run A/B of a token
