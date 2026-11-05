@@ -298,6 +298,8 @@ pub struct AttnBody3<'a> {
     late: std::cell::RefCell<Option<(I32, SlotIdx)>>,
     /// `Vs128Cfg::kscale_sel`
     pub kscale_sel: bool,
+    /// `Vs128Cfg::p_in_s`: P written into the registers of the converted S tile 0 (the PV / row-sum operands are slices of that variable)
+    pub p_in_s: bool,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -305,7 +307,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, scaleconv: false, vpre: false, pvlead: false, vpre_vals: Vec::new(), late: std::cell::RefCell::new(None), kscale_sel: false }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, scaleconv: false, vpre: false, pvlead: false, vpre_vals: Vec::new(), late: std::cell::RefCell::new(None), kscale_sel: false, p_in_s: false }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -379,7 +381,13 @@ impl<'a> AttnBody3<'a> {
     fn pv(&mut self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
         let r = self.ring;
         let v = r.vpart.at(b, &r.vs.at(slot));
-        let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])];
+        let p = if self.p_in_s {
+            // the P words were written into S tile 0 by `place_p`: the operands are views of that variable
+            let s0 = self.s.expect("S").accs[0].var;
+            [Frag::<B32x32x64Fp8>::wrap(b.var_slice8(s0, 0)), Frag::<B32x32x64Fp8>::wrap(b.var_slice8(s0, 1))]
+        } else {
+            [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])]
+        };
         self.sm.row_sum(b, p[0].v, p[1].v);
         let o = self.o.expect("O");
         // the PV order (hh, e) and its V fragment index hh + 2 e
@@ -407,6 +415,15 @@ impl<'a> AttnBody3<'a> {
             for e in 0..4usize {
                 let vf = v.read(b, hh + 2 * e);
                 gemm(b, &r.mma, o.accs[e].var, vf, pf.v, self.c127, self.c123, 0, 0);
+            }
+        }
+    }
+    /// `p_in_s`: the 16 P words into the dwords of S tile 0 (after the last read of S by the conversion).
+    fn place_p(&mut self, b: &mut FnBuilder) {
+        if self.p_in_s {
+            let s0 = self.s.expect("S").accs[0].var;
+            for i in 0..16usize {
+                b.var_set_lane(s0, i as u8, self.p[i]);
             }
         }
     }
@@ -468,6 +485,7 @@ impl PipeBody for AttnBody3<'_> {
         if self.scaleconv {
             let (nb, sc) = self.sm.decide_scaled(b, &s, &o, mask.as_ref());
             self.p = self.sm.convert_scaled(b, &s, mask.as_ref(), 0, 4, sc);
+            self.place_p(b);
             self.p.push(nb);
             self.vpre_reads(b, t);
             return;
@@ -479,6 +497,7 @@ impl PipeBody for AttnBody3<'_> {
             self.sm.decide(b, &s, &o, mask.as_ref())
         };
         self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
+        self.place_p(b);
         self.p.push(nb);
         self.vpre_reads(b, t);
     }
@@ -550,10 +569,12 @@ pub struct Vs128Cfg {
     pub rows2: bool,
     /// K scales: one shift per scale word + op_sel byte select on the scaled QK MFMA (instead of two extracted words)
     pub kscale_sel: bool,
+    /// P written into the converted S tile 0's registers (`var_set_lane`), PV reads `var_slice8` views (the vendor's register reuse)
+    pub p_in_s: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: true, kscale_sel: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: true, kscale_sel: true, p_in_s: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -581,6 +602,7 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
             body.scaleconv = cfg.scaleconv && !lut;
             body.vpre = cfg.vpre;
             body.kscale_sel = cfg.kscale_sel;
+            body.p_in_s = cfg.p_in_s;
             if cfg.rows2 {
                 let p = crate::rowsum::plan();
                 body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
