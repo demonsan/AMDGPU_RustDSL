@@ -1,153 +1,154 @@
-FMHA 1 8 512 512 1 rep1 ours=92.27 vendor=84.73 path=t128
-FMHA 1 8 1024 1024 1 rep1 ours=219.27 vendor=225.27 path=kvsplit
-FMHA 1 8 2048 2048 1 rep1 ours=699.73 vendor=534.17 path=kvsplit
-FMHA 1 8 4096 4096 1 rep1 ours=1235.33 vendor=1190.10 path=t128
-FMHA 1 8 8192 8192 1 rep1 ours=2198.76 vendor=2377.26 path=vs128
-FMHA 2 8 512 512 1 rep1 ours=180.63 vendor=167.54 path=t128
-FMHA 2 8 1024 1024 1 rep1 ours=437.68 vendor=438.09 path=t128
-FMHA 2 8 2048 2048 1 rep1 ours=1062.35 vendor=1016.47 path=t128
-FMHA 2 8 4096 4096 1 rep1 ours=1851.59 vendor=2026.84 path=vs128
-FMHA 2 8 8192 8192 1 rep1 ours=2349.49 vendor=2535.14 path=vs128
-FMHA 4 8 512 512 1 rep1 ours=343.58 vendor=324.19 path=t128
-FMHA 4 8 1024 1024 1 rep1 ours=734.60 vendor=820.30 path=t128
-FMHA 4 8 2048 2048 1 rep1 ours=1550.22 vendor=1703.46 path=vs128
-FMHA 4 8 4096 4096 1 rep1 ours=2064.17 vendor=2219.05 path=vs128
-FMHA 4 8 8192 8192 1 rep1 ours=2378.44 vendor=2576.34 path=vs128
-FMHA 8 8 512 512 1 rep1 ours=547.49 vendor=605.65 path=t128
-FMHA 8 8 1024 1024 1 rep1 ours=1098.46 vendor=1346.02 path=vs128
-FMHA 8 8 2048 2048 1 rep1 ours=1735.39 vendor=1871.52 path=vs128
-FMHA 8 8 4096 4096 1 rep1 ours=2182.72 vendor=2369.89 path=vs128
-FMHA 8 8 8192 8192 1 rep1 ours=2311.09 vendor=2630.75 path=vs128
-FMHA 1 8 2048 2048 2 rep1 ours=626.01 vendor=534.23 path=kvsplit
-FMHA 1 8 2048 2048 4 rep1 ours=615.32 vendor=535.81 path=kvsplit
-FMHA 1 8 1000 1000 1 rep1 ours=202.38 vendor=202.05 path=kvsplit
-FMHA 1 8 2048 1337 1 rep1 ours=504.54 vendor=439.06 path=t128
-FMHA 1 8 1000 1337 1 rep1 ours=270.43 vendor=220.46 path=kvsplit
-FMHA 1 8 512 512 1 rep2 ours=92.31 vendor=84.80 path=t128
-FMHA 1 8 1024 1024 1 rep2 ours=221.75 vendor=223.68 path=kvsplit
-FMHA 1 8 2048 2048 1 rep2 ours=698.64 vendor=535.14 path=kvsplit
-FMHA 1 8 4096 4096 1 rep2 ours=1243.74 vendor=1181.66 path=t128
-FMHA 1 8 8192 8192 1 rep2 ours=2205.35 vendor=2420.36 path=vs128
-FMHA 2 8 512 512 1 rep2 ours=180.30 vendor=167.44 path=t128
-FMHA 2 8 1024 1024 1 rep2 ours=436.65 vendor=434.38 path=t128
-FMHA 2 8 2048 2048 1 rep2 ours=1062.05 vendor=1021.03 path=t128
-FMHA 2 8 4096 4096 1 rep2 ours=1860.55 vendor=2033.65 path=vs128
-FMHA 2 8 8192 8192 1 rep2 ours=2139.29 vendor=2536.31 path=vs128
-FMHA 4 8 512 512 1 rep2 ours=344.35 vendor=324.67 path=t128
-FMHA 4 8 1024 1024 1 rep2 ours=734.70 vendor=815.66 path=t128
-FMHA 4 8 2048 2048 1 rep2 ours=1582.14 vendor=1695.03 path=vs128
-FMHA 4 8 4096 4096 1 rep2 ours=2080.62 vendor=2248.60 path=vs128
-FMHA 4 8 8192 8192 1 rep2 ours=2367.77 vendor=2578.23 path=vs128
-FMHA 8 8 512 512 1 rep2 ours=558.83 vendor=606.89 path=t128
-FMHA 8 8 1024 1024 1 rep2 ours=1094.56 vendor=1353.76 path=vs128
-FMHA 8 8 2048 2048 1 rep2 ours=1719.83 vendor=1877.09 path=vs128
-FMHA 8 8 4096 4096 1 rep2 ours=2165.86 vendor=2371.65 path=vs128
-FMHA 8 8 8192 8192 1 rep2 ours=2306.42 vendor=2630.12 path=vs128
-FMHA 1 8 2048 2048 2 rep2 ours=626.52 vendor=536.93 path=kvsplit
-FMHA 1 8 2048 2048 4 rep2 ours=608.16 vendor=533.37 path=kvsplit
-FMHA 1 8 1000 1000 1 rep2 ours=201.34 vendor=201.49 path=kvsplit
-FMHA 1 8 2048 1337 1 rep2 ours=504.06 vendor=440.76 path=t128
-FMHA 1 8 1000 1337 1 rep2 ours=269.62 vendor=220.17 path=kvsplit
-FMHA 1 8 512 512 1 rep3 ours=91.85 vendor=84.39 path=t128
-FMHA 1 8 1024 1024 1 rep3 ours=217.65 vendor=222.49 path=kvsplit
-FMHA 1 8 2048 2048 1 rep3 ours=690.78 vendor=530.82 path=kvsplit
-FMHA 1 8 4096 4096 1 rep3 ours=1232.39 vendor=1170.29 path=t128
-FMHA 1 8 8192 8192 1 rep3 ours=2197.96 vendor=2402.15 path=vs128
-FMHA 2 8 512 512 1 rep3 ours=179.74 vendor=167.27 path=t128
-FMHA 2 8 1024 1024 1 rep3 ours=437.95 vendor=434.83 path=t128
-FMHA 2 8 2048 2048 1 rep3 ours=1057.33 vendor=1010.80 path=t128
-FMHA 2 8 4096 4096 1 rep3 ours=1867.41 vendor=2050.92 path=vs128
-FMHA 2 8 8192 8192 1 rep3 ours=2349.73 vendor=2534.10 path=vs128
-FMHA 4 8 512 512 1 rep3 ours=346.33 vendor=324.85 path=t128
-FMHA 4 8 1024 1024 1 rep3 ours=752.80 vendor=819.60 path=t128
-FMHA 4 8 2048 2048 1 rep3 ours=1555.30 vendor=1689.12 path=vs128
-FMHA 4 8 4096 4096 1 rep3 ours=2088.93 vendor=2256.18 path=vs128
-FMHA 4 8 8192 8192 1 rep3 ours=2366.75 vendor=2579.29 path=vs128
-FMHA 8 8 512 512 1 rep3 ours=559.69 vendor=607.50 path=t128
-FMHA 8 8 1024 1024 1 rep3 ours=1097.97 vendor=1348.87 path=vs128
-FMHA 8 8 2048 2048 1 rep3 ours=1724.00 vendor=1903.12 path=vs128
-FMHA 8 8 4096 4096 1 rep3 ours=2170.33 vendor=2373.72 path=vs128
-FMHA 8 8 8192 8192 1 rep3 ours=2297.48 vendor=2630.64 path=vs128
-FMHA 1 8 2048 2048 2 rep3 ours=625.30 vendor=536.04 path=kvsplit
-FMHA 1 8 2048 2048 4 rep3 ours=612.79 vendor=539.41 path=kvsplit
-FMHA 1 8 1000 1000 1 rep3 ours=201.93 vendor=195.80 path=kvsplit
-FMHA 1 8 2048 1337 1 rep3 ours=504.63 vendor=444.40 path=t128
-FMHA 1 8 1000 1337 1 rep3 ours=269.46 vendor=221.06 path=kvsplit
-FMHA 1 8 512 512 1 rep4 ours=92.34 vendor=84.84 path=t128
-FMHA 1 8 1024 1024 1 rep4 ours=219.29 vendor=223.85 path=kvsplit
-FMHA 1 8 2048 2048 1 rep4 ours=695.58 vendor=534.96 path=kvsplit
-FMHA 1 8 4096 4096 1 rep4 ours=1241.55 vendor=1186.45 path=t128
-FMHA 1 8 8192 8192 1 rep4 ours=2168.94 vendor=2386.16 path=vs128
-FMHA 2 8 512 512 1 rep4 ours=180.96 vendor=167.43 path=t128
-FMHA 2 8 1024 1024 1 rep4 ours=434.73 vendor=433.29 path=t128
-FMHA 2 8 2048 2048 1 rep4 ours=1053.92 vendor=1013.05 path=t128
-FMHA 2 8 4096 4096 1 rep4 ours=1838.54 vendor=2027.29 path=vs128
-FMHA 2 8 8192 8192 1 rep4 ours=2349.84 vendor=2534.40 path=vs128
-FMHA 4 8 512 512 1 rep4 ours=345.51 vendor=324.97 path=t128
-FMHA 4 8 1024 1024 1 rep4 ours=725.13 vendor=813.62 path=t128
-FMHA 4 8 2048 2048 1 rep4 ours=1556.01 vendor=1701.35 path=vs128
-FMHA 4 8 4096 4096 1 rep4 ours=2100.03 vendor=2241.87 path=vs128
-FMHA 4 8 8192 8192 1 rep4 ours=2376.67 vendor=2576.87 path=vs128
-FMHA 8 8 512 512 1 rep4 ours=561.33 vendor=607.40 path=t128
-FMHA 8 8 1024 1024 1 rep4 ours=1105.63 vendor=1342.31 path=vs128
-FMHA 8 8 2048 2048 1 rep4 ours=1746.30 vendor=1852.26 path=vs128
-FMHA 8 8 4096 4096 1 rep4 ours=2172.27 vendor=2375.45 path=vs128
-FMHA 8 8 8192 8192 1 rep4 ours=2299.51 vendor=2631.10 path=vs128
-FMHA 1 8 2048 2048 2 rep4 ours=621.38 vendor=534.76 path=kvsplit
-FMHA 1 8 2048 2048 4 rep4 ours=613.44 vendor=537.36 path=kvsplit
-FMHA 1 8 1000 1000 1 rep4 ours=202.71 vendor=201.31 path=kvsplit
-FMHA 1 8 2048 1337 1 rep4 ours=506.67 vendor=438.54 path=t128
-FMHA 1 8 1000 1337 1 rep4 ours=269.82 vendor=220.19 path=kvsplit
-FMHA 1 8 512 512 1 rep5 ours=92.42 vendor=85.00 path=t128
-FMHA 1 8 1024 1024 1 rep5 ours=221.22 vendor=223.11 path=kvsplit
-FMHA 1 8 2048 2048 1 rep5 ours=674.19 vendor=538.39 path=kvsplit
-FMHA 1 8 4096 4096 1 rep5 ours=1241.36 vendor=1186.72 path=t128
-FMHA 1 8 8192 8192 1 rep5 ours=2204.78 vendor=2411.35 path=vs128
-FMHA 2 8 512 512 1 rep5 ours=181.84 vendor=167.76 path=t128
-FMHA 2 8 1024 1024 1 rep5 ours=435.03 vendor=434.60 path=t128
-FMHA 2 8 2048 2048 1 rep5 ours=1058.58 vendor=1016.79 path=t128
-FMHA 2 8 4096 4096 1 rep5 ours=1852.18 vendor=2017.95 path=vs128
-FMHA 2 8 8192 8192 1 rep5 ours=2347.50 vendor=2539.45 path=vs128
-FMHA 4 8 512 512 1 rep5 ours=344.73 vendor=324.34 path=t128
-FMHA 4 8 1024 1024 1 rep5 ours=749.34 vendor=819.52 path=t128
-FMHA 4 8 2048 2048 1 rep5 ours=1568.31 vendor=1708.59 path=vs128
-FMHA 4 8 4096 4096 1 rep5 ours=2076.94 vendor=2263.09 path=vs128
-FMHA 4 8 8192 8192 1 rep5 ours=2384.15 vendor=2579.23 path=vs128
-FMHA 8 8 512 512 1 rep5 ours=549.38 vendor=605.18 path=t128
-FMHA 8 8 1024 1024 1 rep5 ours=1096.34 vendor=1341.79 path=vs128
-FMHA 8 8 2048 2048 1 rep5 ours=1711.72 vendor=1849.59 path=vs128
-FMHA 8 8 4096 4096 1 rep5 ours=2185.99 vendor=2374.40 path=vs128
-FMHA 8 8 8192 8192 1 rep5 ours=2307.84 vendor=2633.74 path=vs128
-FMHA 1 8 2048 2048 2 rep5 ours=625.65 vendor=535.39 path=kvsplit
-FMHA 1 8 2048 2048 4 rep5 ours=616.20 vendor=536.46 path=kvsplit
-FMHA 1 8 1000 1000 1 rep5 ours=202.47 vendor=202.31 path=kvsplit
-FMHA 1 8 2048 1337 1 rep5 ours=505.11 vendor=439.28 path=t128
-FMHA 1 8 1000 1337 1 rep5 ours=270.13 vendor=220.63 path=kvsplit
-ACC 1 8 512 512 1 ours: bad=0 worst=4.5562e-02 mean=1.0571e-03 vendor: bad=0 worst=5.3236e-02 mean=2.3660e-03 REF_KERNEL_OK
-ACC 1 8 1024 1024 1 ours: bad=0 worst=3.7759e-02 mean=8.6297e-04 vendor: bad=1 worst=7.1698e-02 mean=2.3787e-03 REF_KERNEL_FAIL
-ACC 1 8 2048 2048 1 ours: bad=0 worst=2.7913e-02 mean=8.4086e-04 vendor: bad=0 worst=5.5878e-02 mean=2.5695e-03 REF_KERNEL_OK
-ACC 1 8 4096 4096 1 ours: bad=0 worst=5.2344e-02 mean=8.5817e-04 vendor: bad=1 worst=7.2374e-02 mean=2.8280e-03 REF_KERNEL_FAIL
-ACC 1 8 8192 8192 1 ours: bad=4 worst=6.5629e-02 mean=2.7632e-03 vendor: bad=4 worst=6.5629e-02 mean=2.7639e-03 REF_KERNEL_FAIL
-ACC 2 8 512 512 1 ours: bad=0 worst=3.8139e-02 mean=1.0172e-03 vendor: bad=3 worst=7.7178e-02 mean=2.5435e-03 REF_KERNEL_FAIL
-ACC 2 8 1024 1024 1 ours: bad=0 worst=3.6665e-02 mean=8.4565e-04 vendor: bad=0 worst=6.3565e-02 mean=2.6873e-03 REF_KERNEL_OK
-ACC 2 8 2048 2048 1 ours: bad=0 worst=5.7259e-02 mean=1.0090e-03 vendor: bad=8 worst=9.1799e-02 mean=2.8435e-03 REF_KERNEL_FAIL
-ACC 2 8 4096 4096 1 ours: bad=3 worst=6.7307e-02 mean=3.0065e-03 vendor: bad=3 worst=6.7307e-02 mean=2.9991e-03 REF_KERNEL_FAIL
-ACC 2 8 8192 8192 1 ours: bad=0 worst=4.3545e-02 mean=5.8598e-04 vendor: bad=0 worst=4.3545e-02 mean=5.8790e-04 REF_KERNEL_OK
-ACC 4 8 512 512 1 ours: bad=0 worst=4.1289e-02 mean=1.0515e-03 vendor: bad=0 worst=5.9117e-02 mean=2.6155e-03 REF_KERNEL_OK
-ACC 4 8 1024 1024 1 ours: bad=0 worst=2.8764e-02 mean=8.6620e-04 vendor: bad=1 worst=6.7584e-02 mean=2.6939e-03 REF_KERNEL_FAIL
-ACC 4 8 2048 2048 1 ours: bad=2 worst=6.9604e-02 mean=2.8484e-03 vendor: bad=2 worst=6.9604e-02 mean=2.8592e-03 REF_KERNEL_FAIL
-ACC 4 8 4096 4096 1 ours: bad=0 worst=4.7514e-02 mean=5.8434e-04 vendor: bad=0 worst=4.7514e-02 mean=5.8599e-04 REF_KERNEL_OK
-ACC 4 8 8192 8192 1 ours: bad=0 worst=5.2035e-02 mean=6.9805e-04 vendor: bad=0 worst=5.2035e-02 mean=6.9891e-04 REF_KERNEL_OK
-ACC 8 8 512 512 1 ours: bad=0 worst=4.2608e-02 mean=1.0594e-03 vendor: bad=8 worst=8.0072e-02 mean=2.5746e-03 REF_KERNEL_FAIL
-ACC 8 8 1024 1024 1 ours: bad=0 worst=3.9345e-02 mean=8.3103e-04 vendor: bad=6 worst=8.1465e-02 mean=2.6476e-03 REF_KERNEL_FAIL
-ACC 8 8 2048 2048 1 ours: bad=3 worst=6.8335e-02 mean=5.2803e-04 vendor: bad=3 worst=6.8335e-02 mean=5.2603e-04 REF_KERNEL_FAIL
-ACC 8 8 4096 4096 1 ours: bad=0 worst=6.0308e-02 mean=6.1338e-04 vendor: bad=0 worst=6.0308e-02 mean=6.1586e-04 REF_KERNEL_OK
-ACC 8 8 8192 8192 1 ours: bad=3 worst=7.0914e-02 mean=7.7304e-04 vendor: bad=3 worst=7.0914e-02 mean=7.7720e-04 REF_KERNEL_FAIL
-ACC 1 8 2048 2048 2 ours: bad=0 worst=4.5003e-02 mean=9.4543e-04 vendor: bad=3 worst=6.9510e-02 mean=2.9359e-03 REF_KERNEL_FAIL
-ACC 1 8 2048 2048 4 ours: bad=0 worst=3.6467e-02 mean=8.1166e-04 vendor: bad=0 worst=5.9002e-02 mean=2.5531e-03 REF_KERNEL_OK
-ACC 1 8 1000 1000 1 ours: bad=0 worst=2.9874e-02 mean=8.3984e-04 vendor: bad=1 worst=6.9967e-02 mean=2.5187e-03 REF_KERNEL_FAIL
-ACC 1 8 2048 1337 1 ours: bad=0 worst=5.3767e-02 mean=9.5512e-04 vendor: bad=0 worst=5.6517e-02 mean=2.5984e-03 REF_KERNEL_OK
-ACC 1 8 1000 1337 1 ours: bad=2 worst=6.6736e-02 mean=1.0605e-03 vendor: bad=0 worst=5.5289e-02 mean=2.6103e-03 REF_KERNEL_FAIL
+# FMHA: REF_DATA=normal, Main c4d59df8, GPU 5, 2026-11-06
+FMHA 1 8 512 512 1 rep1 ours=108.42 vendor=98.76 path=t128
+FMHA 1 8 1024 1024 1 rep1 ours=289.17 vendor=285.27 path=t128
+FMHA 1 8 2048 2048 1 rep1 ours=745.66 vendor=724.61 path=kvsplit
+FMHA 1 8 4096 4096 1 rep1 ours=1461.49 vendor=1547.28 path=kvsplit
+FMHA 1 8 8192 8192 1 rep1 ours=2409.90 vendor=2445.13 path=vs128
+FMHA 2 8 512 512 1 rep1 ours=212.41 vendor=193.65 path=t128
+FMHA 2 8 1024 1024 1 rep1 ours=517.99 vendor=545.60 path=t128
+FMHA 2 8 2048 2048 1 rep1 ours=1166.56 vendor=1296.92 path=vs128
+FMHA 2 8 4096 4096 1 rep1 ours=2139.56 vendor=2260.33 path=vs128
+FMHA 2 8 8192 8192 1 rep1 ours=2448.62 vendor=2496.49 path=vs128
+FMHA 4 8 512 512 1 rep1 ours=401.55 vendor=373.19 path=t128
+FMHA 4 8 1024 1024 1 rep1 ours=913.52 vendor=990.51 path=vs128
+FMHA 4 8 2048 2048 1 rep1 ours=1710.39 vendor=1785.00 path=vs128
+FMHA 4 8 4096 4096 1 rep1 ours=2303.77 vendor=2348.64 path=vs128
+FMHA 4 8 8192 8192 1 rep1 ours=2467.10 vendor=2532.67 path=vs128
+FMHA 8 8 512 512 1 rep1 ours=688.27 vendor=680.07 path=vs128
+FMHA 8 8 1024 1024 1 rep1 ours=1299.62 vendor=1455.86 path=vs128
+FMHA 8 8 2048 2048 1 rep1 ours=1883.91 vendor=2057.49 path=vs128
+FMHA 8 8 4096 4096 1 rep1 ours=2361.41 vendor=2415.98 path=vs128
+FMHA 8 8 8192 8192 1 rep1 ours=2432.74 vendor=2560.99 path=vs128
+FMHA 1 8 2048 2048 2 rep1 ours=678.07 vendor=729.72 path=kvsplit
+FMHA 1 8 2048 2048 4 rep1 ours=666.81 vendor=728.45 path=kvsplit
+FMHA 1 8 1000 1000 1 rep1 ours=263.33 vendor=247.01 path=t128
+FMHA 1 8 2048 1337 1 rep1 ours=561.66 vendor=553.59 path=t128
+FMHA 1 8 1000 1337 1 rep1 ours=288.00 vendor=281.06 path=t128
+FMHA 1 8 512 512 1 rep2 ours=108.81 vendor=98.56 path=t128
+FMHA 1 8 1024 1024 1 rep2 ours=291.13 vendor=285.10 path=t128
+FMHA 1 8 2048 2048 1 rep2 ours=735.71 vendor=726.43 path=kvsplit
+FMHA 1 8 4096 4096 1 rep2 ours=1451.25 vendor=1543.81 path=kvsplit
+FMHA 1 8 8192 8192 1 rep2 ours=2419.72 vendor=2439.41 path=vs128
+FMHA 2 8 512 512 1 rep2 ours=212.92 vendor=193.33 path=t128
+FMHA 2 8 1024 1024 1 rep2 ours=515.52 vendor=543.35 path=t128
+FMHA 2 8 2048 2048 1 rep2 ours=1173.08 vendor=1307.20 path=vs128
+FMHA 2 8 4096 4096 1 rep2 ours=2142.84 vendor=2244.73 path=vs128
+FMHA 2 8 8192 8192 1 rep2 ours=2446.27 vendor=2499.92 path=vs128
+FMHA 4 8 512 512 1 rep2 ours=402.49 vendor=372.64 path=t128
+FMHA 4 8 1024 1024 1 rep2 ours=928.53 vendor=995.76 path=vs128
+FMHA 4 8 2048 2048 1 rep2 ours=1707.28 vendor=1867.12 path=vs128
+FMHA 4 8 4096 4096 1 rep2 ours=2288.93 vendor=2349.01 path=vs128
+FMHA 4 8 8192 8192 1 rep2 ours=2469.16 vendor=2534.45 path=vs128
+FMHA 8 8 512 512 1 rep2 ours=688.44 vendor=679.19 path=vs128
+FMHA 8 8 1024 1024 1 rep2 ours=1302.18 vendor=1453.42 path=vs128
+FMHA 8 8 2048 2048 1 rep2 ours=1876.32 vendor=2035.41 path=vs128
+FMHA 8 8 4096 4096 1 rep2 ours=2356.62 vendor=2413.43 path=vs128
+FMHA 8 8 8192 8192 1 rep2 ours=2437.52 vendor=2563.39 path=vs128
+FMHA 1 8 2048 2048 2 rep2 ours=670.50 vendor=723.71 path=kvsplit
+FMHA 1 8 2048 2048 4 rep2 ours=667.84 vendor=724.15 path=kvsplit
+FMHA 1 8 1000 1000 1 rep2 ours=262.30 vendor=247.00 path=t128
+FMHA 1 8 2048 1337 1 rep2 ours=561.55 vendor=549.22 path=t128
+FMHA 1 8 1000 1337 1 rep2 ours=289.55 vendor=281.41 path=t128
+FMHA 1 8 512 512 1 rep3 ours=108.77 vendor=98.42 path=t128
+FMHA 1 8 1024 1024 1 rep3 ours=287.84 vendor=284.95 path=t128
+FMHA 1 8 2048 2048 1 rep3 ours=751.41 vendor=719.36 path=kvsplit
+FMHA 1 8 4096 4096 1 rep3 ours=1463.32 vendor=1529.85 path=kvsplit
+FMHA 1 8 8192 8192 1 rep3 ours=2426.73 vendor=2444.73 path=vs128
+FMHA 2 8 512 512 1 rep3 ours=212.67 vendor=193.65 path=t128
+FMHA 2 8 1024 1024 1 rep3 ours=518.41 vendor=542.32 path=t128
+FMHA 2 8 2048 2048 1 rep3 ours=1169.79 vendor=1293.07 path=vs128
+FMHA 2 8 4096 4096 1 rep3 ours=2160.55 vendor=2257.89 path=vs128
+FMHA 2 8 8192 8192 1 rep3 ours=2446.95 vendor=2502.11 path=vs128
+FMHA 4 8 512 512 1 rep3 ours=402.96 vendor=374.16 path=t128
+FMHA 4 8 1024 1024 1 rep3 ours=907.08 vendor=996.50 path=vs128
+FMHA 4 8 2048 2048 1 rep3 ours=1711.35 vendor=1773.74 path=vs128
+FMHA 4 8 4096 4096 1 rep3 ours=2299.50 vendor=2351.43 path=vs128
+FMHA 4 8 8192 8192 1 rep3 ours=2471.41 vendor=2536.01 path=vs128
+FMHA 8 8 512 512 1 rep3 ours=685.63 vendor=682.32 path=vs128
+FMHA 8 8 1024 1024 1 rep3 ours=1320.87 vendor=1403.25 path=vs128
+FMHA 8 8 2048 2048 1 rep3 ours=1958.51 vendor=2054.50 path=vs128
+FMHA 8 8 4096 4096 1 rep3 ours=2371.27 vendor=2416.59 path=vs128
+FMHA 8 8 8192 8192 1 rep3 ours=2440.64 vendor=2561.58 path=vs128
+FMHA 1 8 2048 2048 2 rep3 ours=680.45 vendor=721.31 path=kvsplit
+FMHA 1 8 2048 2048 4 rep3 ours=671.53 vendor=726.23 path=kvsplit
+FMHA 1 8 1000 1000 1 rep3 ours=262.60 vendor=247.06 path=t128
+FMHA 1 8 2048 1337 1 rep3 ours=561.18 vendor=551.70 path=t128
+FMHA 1 8 1000 1337 1 rep3 ours=286.99 vendor=282.82 path=t128
+FMHA 1 8 512 512 1 rep4 ours=108.47 vendor=98.57 path=t128
+FMHA 1 8 1024 1024 1 rep4 ours=291.02 vendor=285.89 path=t128
+FMHA 1 8 2048 2048 1 rep4 ours=754.75 vendor=718.41 path=kvsplit
+FMHA 1 8 4096 4096 1 rep4 ours=1449.59 vendor=1524.93 path=kvsplit
+FMHA 1 8 8192 8192 1 rep4 ours=2415.04 vendor=2451.08 path=vs128
+FMHA 2 8 512 512 1 rep4 ours=213.26 vendor=193.88 path=t128
+FMHA 2 8 1024 1024 1 rep4 ours=516.73 vendor=544.99 path=t128
+FMHA 2 8 2048 2048 1 rep4 ours=1170.25 vendor=1298.60 path=vs128
+FMHA 2 8 4096 4096 1 rep4 ours=2145.59 vendor=2257.63 path=vs128
+FMHA 2 8 8192 8192 1 rep4 ours=2444.51 vendor=2501.05 path=vs128
+FMHA 4 8 512 512 1 rep4 ours=401.82 vendor=372.32 path=t128
+FMHA 4 8 1024 1024 1 rep4 ours=924.91 vendor=998.29 path=vs128
+FMHA 4 8 2048 2048 1 rep4 ours=1703.10 vendor=1875.38 path=vs128
+FMHA 4 8 4096 4096 1 rep4 ours=2295.65 vendor=2355.73 path=vs128
+FMHA 4 8 8192 8192 1 rep4 ours=2465.65 vendor=2537.40 path=vs128
+FMHA 8 8 512 512 1 rep4 ours=690.59 vendor=677.82 path=vs128
+FMHA 8 8 1024 1024 1 rep4 ours=1304.12 vendor=1402.82 path=vs128
+FMHA 8 8 2048 2048 1 rep4 ours=1889.27 vendor=2046.52 path=vs128
+FMHA 8 8 4096 4096 1 rep4 ours=2362.63 vendor=2412.43 path=vs128
+FMHA 8 8 8192 8192 1 rep4 ours=2444.68 vendor=2567.38 path=vs128
+FMHA 1 8 2048 2048 2 rep4 ours=675.25 vendor=725.62 path=kvsplit
+FMHA 1 8 2048 2048 4 rep4 ours=674.34 vendor=722.58 path=kvsplit
+FMHA 1 8 1000 1000 1 rep4 ours=260.67 vendor=246.53 path=t128
+FMHA 1 8 2048 1337 1 rep4 ours=566.41 vendor=550.42 path=t128
+FMHA 1 8 1000 1337 1 rep4 ours=286.57 vendor=281.22 path=t128
+FMHA 1 8 512 512 1 rep5 ours=108.46 vendor=98.65 path=t128
+FMHA 1 8 1024 1024 1 rep5 ours=288.49 vendor=286.16 path=t128
+FMHA 1 8 2048 2048 1 rep5 ours=745.89 vendor=723.77 path=kvsplit
+FMHA 1 8 4096 4096 1 rep5 ours=1443.87 vendor=1541.35 path=kvsplit
+FMHA 1 8 8192 8192 1 rep5 ours=2424.47 vendor=2451.92 path=vs128
+FMHA 2 8 512 512 1 rep5 ours=212.75 vendor=193.88 path=t128
+FMHA 2 8 1024 1024 1 rep5 ours=515.54 vendor=545.13 path=t128
+FMHA 2 8 2048 2048 1 rep5 ours=1168.23 vendor=1301.36 path=vs128
+FMHA 2 8 4096 4096 1 rep5 ours=2159.00 vendor=2232.95 path=vs128
+FMHA 2 8 8192 8192 1 rep5 ours=2448.39 vendor=2503.72 path=vs128
+FMHA 4 8 512 512 1 rep5 ours=400.39 vendor=373.52 path=t128
+FMHA 4 8 1024 1024 1 rep5 ours=919.41 vendor=990.60 path=vs128
+FMHA 4 8 2048 2048 1 rep5 ours=1694.23 vendor=1894.28 path=vs128
+FMHA 4 8 4096 4096 1 rep5 ours=2301.38 vendor=2358.02 path=vs128
+FMHA 4 8 8192 8192 1 rep5 ours=2467.12 vendor=2538.88 path=vs128
+FMHA 8 8 512 512 1 rep5 ours=690.13 vendor=682.34 path=vs128
+FMHA 8 8 1024 1024 1 rep5 ours=1338.50 vendor=1482.57 path=vs128
+FMHA 8 8 2048 2048 1 rep5 ours=1889.48 vendor=2046.85 path=vs128
+FMHA 8 8 4096 4096 1 rep5 ours=2374.94 vendor=2418.23 path=vs128
+FMHA 8 8 8192 8192 1 rep5 ours=2438.98 vendor=2563.68 path=vs128
+FMHA 1 8 2048 2048 2 rep5 ours=682.22 vendor=725.22 path=kvsplit
+FMHA 1 8 2048 2048 4 rep5 ours=664.88 vendor=724.66 path=kvsplit
+FMHA 1 8 1000 1000 1 rep5 ours=263.10 vendor=245.92 path=t128
+FMHA 1 8 2048 1337 1 rep5 ours=564.01 vendor=552.30 path=t128
+FMHA 1 8 1000 1337 1 rep5 ours=289.92 vendor=280.31 path=t128
+ACC 1 8 512 512 1 ours: bad=0 worst=1.5446e-02 mean=1.7372e-03 vendor: bad=0 worst=1.5486e-02 mean=1.7388e-03 REF_KERNEL_OK
+ACC 1 8 1024 1024 1 ours: bad=0 worst=8.5976e-03 mean=1.2532e-03 vendor: bad=0 worst=8.5976e-03 mean=1.2522e-03 REF_KERNEL_OK
+ACC 1 8 2048 2048 1 ours: bad=0 worst=1.1930e-02 mean=8.8597e-04 vendor: bad=0 worst=5.3970e-03 mean=8.9822e-04 REF_KERNEL_OK
+ACC 1 8 4096 4096 1 ours: bad=0 worst=3.5136e-03 mean=6.4130e-04 vendor: bad=0 worst=3.8749e-03 mean=6.4498e-04 REF_KERNEL_OK
+ACC 1 8 8192 8192 1 ours: bad=0 worst=3.0750e-03 mean=4.5835e-04 vendor: bad=0 worst=2.8309e-03 mean=4.5784e-04 REF_KERNEL_OK
+ACC 2 8 512 512 1 ours: bad=0 worst=3.0075e-02 mean=1.7394e-03 vendor: bad=0 worst=3.0075e-02 mean=1.7375e-03 REF_KERNEL_OK
+ACC 2 8 1024 1024 1 ours: bad=0 worst=9.3290e-03 mean=1.2607e-03 vendor: bad=0 worst=9.3290e-03 mean=1.2576e-03 REF_KERNEL_OK
+ACC 2 8 2048 2048 1 ours: bad=0 worst=7.3622e-03 mean=9.0663e-04 vendor: bad=0 worst=7.9863e-03 mean=9.0798e-04 REF_KERNEL_OK
+ACC 2 8 4096 4096 1 ours: bad=0 worst=3.9059e-03 mean=6.4262e-04 vendor: bad=0 worst=3.9398e-03 mean=6.4157e-04 REF_KERNEL_OK
+ACC 2 8 8192 8192 1 ours: bad=0 worst=2.5245e-03 mean=4.5710e-04 vendor: bad=0 worst=2.5170e-03 mean=4.5809e-04 REF_KERNEL_OK
+ACC 4 8 512 512 1 ours: bad=0 worst=1.5414e-02 mean=1.7301e-03 vendor: bad=0 worst=1.5414e-02 mean=1.7287e-03 REF_KERNEL_OK
+ACC 4 8 1024 1024 1 ours: bad=0 worst=1.1768e-02 mean=1.2633e-03 vendor: bad=0 worst=1.2580e-02 mean=1.2638e-03 REF_KERNEL_OK
+ACC 4 8 2048 2048 1 ours: bad=0 worst=7.5856e-03 mean=9.0573e-04 vendor: bad=0 worst=7.3415e-03 mean=9.0671e-04 REF_KERNEL_OK
+ACC 4 8 4096 4096 1 ours: bad=0 worst=3.9942e-03 mean=6.4324e-04 vendor: bad=0 worst=4.1773e-03 mean=6.4486e-04 REF_KERNEL_OK
+ACC 4 8 8192 8192 1 ours: bad=0 worst=3.5904e-03 mean=4.5871e-04 vendor: bad=0 worst=3.5218e-03 mean=4.5836e-04 REF_KERNEL_OK
+ACC 8 8 512 512 1 ours: bad=0 worst=1.8414e-02 mean=1.7440e-03 vendor: bad=0 worst=2.2324e-02 mean=1.7426e-03 REF_KERNEL_OK
+ACC 8 8 1024 1024 1 ours: bad=0 worst=1.1852e-02 mean=1.2565e-03 vendor: bad=0 worst=1.0875e-02 mean=1.2577e-03 REF_KERNEL_OK
+ACC 8 8 2048 2048 1 ours: bad=0 worst=6.4034e-03 mean=9.0246e-04 vendor: bad=0 worst=7.1023e-03 mean=9.0419e-04 REF_KERNEL_OK
+ACC 8 8 4096 4096 1 ours: bad=0 worst=4.8400e-03 mean=6.4645e-04 vendor: bad=0 worst=5.5412e-03 mean=6.4595e-04 REF_KERNEL_OK
+ACC 8 8 8192 8192 1 ours: bad=0 worst=3.2745e-03 mean=4.5865e-04 vendor: bad=0 worst=4.5562e-03 mean=4.5903e-04 REF_KERNEL_OK
+ACC 1 8 2048 2048 2 ours: bad=0 worst=8.9998e-03 mean=8.9156e-04 vendor: bad=0 worst=6.1620e-03 mean=9.0653e-04 REF_KERNEL_OK
+ACC 1 8 2048 2048 4 ours: bad=0 worst=5.5895e-03 mean=8.8464e-04 vendor: bad=0 worst=9.1652e-03 mean=9.0440e-04 REF_KERNEL_OK
+ACC 1 8 1000 1000 1 ours: bad=0 worst=8.7975e-03 mean=1.2765e-03 vendor: bad=0 worst=8.7975e-03 mean=1.2567e-03 REF_KERNEL_OK
+ACC 1 8 2048 1337 1 ours: bad=0 worst=9.1711e-03 mean=1.1003e-03 vendor: bad=0 worst=8.7261e-03 mean=1.0943e-03 REF_KERNEL_OK
+ACC 1 8 1000 1337 1 ours: bad=0 worst=6.5299e-03 mean=1.0991e-03 vendor: bad=0 worst=6.4449e-03 mean=1.0993e-03 REF_KERNEL_OK
 GEMM 4096 4096 8192 rep1 ours=3316.87 vendor=3293.42 ours_check=GEMM_OK bad=0 worst_rel=3.895e-03 vendor_check=GEMM_OK
 GEMM 8192 7168 7168 rep1 ours=2902.95 vendor=3011.77 ours_check=GEMM_OK bad=0 worst_rel=3.896e-03 vendor_check=GEMM_OK
 GEMM 1280 6144 7168 rep1 ours=1785.32 vendor=1792.29 ours_check=GEMM_OK bad=0 worst_rel=3.897e-03 vendor_check=GEMM_OK
