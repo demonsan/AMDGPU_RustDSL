@@ -414,6 +414,10 @@ fn vs128_with(name: &str, v_ahead: usize) -> Function {
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
     pipe.key_unclamped = true;
+    // the read-ahead stays in flight across the mid barrier (no wait_lds(0) drain before it)
+    if v_ahead > 0 {
+        pipe.mid_lds_drain = false;
+    }
     let pipe = pipe;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
