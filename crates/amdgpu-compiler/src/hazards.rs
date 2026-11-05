@@ -21,19 +21,6 @@ const TRANS_LATENCY: usize = 5;
 /// How many instructions after the stalled consumer are examined as fill candidates.
 const FILL_WINDOW: usize = 48;
 
-thread_local! {
-    static VCC_FILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Run `f` with stall filling for `vcc` consumers enabled: the movable candidates never read or write `vcc`, so an independent
-/// instruction may be placed between a `v_cmp` and its `v_cndmask` to cover the 2 wait states instead of an `s_nop`.
-pub fn with_vcc_fill<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    let old = VCC_FILL.with(|c| c.replace(on));
-    let r = f();
-    VCC_FILL.with(|c| c.set(old));
-    r
-}
-
 fn is_transcendental(op: MOp) -> bool {
     crate::op_attrs::attrs(op).transcendental
 }
@@ -55,11 +42,6 @@ fn is_scaled_mfma(op: MOp) -> bool {
 /// Plain ALU instructions that may be moved ahead of a stalled consumer (`movable`).
 fn movable(op: MOp) -> bool {
     crate::op_attrs::attrs(op).movable == crate::op_attrs::Movable::Yes
-}
-
-/// Extra fill candidates when `vcc` filling is on.
-fn movable_wide(op: MOp) -> bool {
-    crate::op_attrs::attrs(op).movable == crate::op_attrs::Movable::VccFill
 }
 
 /// VALU instructions whose VGPR result feeding an MFMA operand, a permlane, readfirstlane or DPP needs wait states first
@@ -207,7 +189,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             let mut earliest = earliest_of(&insts[i], &ready, &vw, &pkw, &aw, cycle);
 
             // Fill the stall with independent ALU work from further down the block.
-            if earliest > cycle && (!insts[i].op.consumes_vcc() || VCC_FILL.with(|c| c.get())) {
+            if earliest > cycle && !insts[i].op.consumes_vcc() {
                 let mut j = i + 1;
                 let limit = (i + 1 + FILL_WINDOW).min(insts.len());
                 while earliest > cycle && j < limit.min(insts.len()) {
@@ -218,7 +200,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     // pinned (hand-authored) instructions are never moved, and nothing is moved across them
                     let mut ok = !cand.pin
                         && !insts[i..j].iter().any(|x| x.pin)
-                        && (movable(cand.op) || (VCC_FILL.with(|c| c.get()) && movable_wide(cand.op)))
+                        && movable(cand.op)
                         && cand.dst.is_some()
                         && earliest_of(cand, &ready, &vw, &pkw, &aw, cycle) <= cycle;
                     if ok {
@@ -338,9 +320,6 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 }
                 for (k, &s) in ss.iter().enumerate() {
                     let dist = first_touch(s, 0, hops, remaining, *reg, *from_mfma, &snap, &succs, &canon);
-                    if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("hazdebug")) && remaining > dist {
-                        eprintln!("blockend pad: block {bi} reg {reg} remaining {remaining} succ {s} dist {dist}");
-                    }
                     if dist != usize::MAX {
                         miss[k] = miss[k].max(remaining.saturating_sub(dist));
                     }
@@ -449,10 +428,6 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
     let overlaps = |x: (u32, u32), y: (u32, u32)| x.0 < y.1 && y.0 < x.1;
     // MFMA DESTINATIONS still being written when the block is left (per block: canonical vreg, physical range, remaining wait states). A register reuse
     // by a different value in the successor must wait too. Computed from the unpadded block (padding only shortens what remains).
-    // AMDC_NO_PHYS_WAW=1 disables the MFMA-destination padding (A/B audit of the shipped kernels only)
-    // AMDC_NO_PHYS_STORE=1 disables the wide-store data padding (A/B audit of the shipped kernels only)
-    let store_haz_on = std::env::var("AMDC_NO_PHYS_STORE").map(|v| v.is_empty() || v == "0").unwrap_or(true);
-    let waw_on = std::env::var("AMDC_NO_PHYS_WAW").map(|v| v.is_empty() || v == "0").unwrap_or(true);
     let succs = crate::sched::liveness::successors(m);
     let exit_dst: Vec<Vec<(VReg, (u32, u32), usize)>> = m
         .blocks
@@ -461,7 +436,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
             let mut cycle = 0usize;
             let mut live: Vec<(usize, usize, VReg, (u32, u32))> = Vec::new();
             for inst in &b.insts {
-                if let (true, Some(l), Some(d)) = (waw_on, mfma_latency(inst.op), inst.dst) {
+                if let (Some(l), Some(d)) = (mfma_latency(inst.op), inst.dst) {
                     live.push((cycle, mfma_dst_wait(l), m.canon(d), rng(m, d)));
                 }
                 if matches!(inst.op, MOp::SNop) {
@@ -522,7 +497,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                     if let Some((need, srcs)) = war_of(m, inst) {
                         w.push((cycle, need, inst.op, srcs));
                     }
-                    if let (true, Some(l), Some(d)) = (waw_on, mfma_latency(inst.op), inst.dst) {
+                    if let (Some(l), Some(d)) = (mfma_latency(inst.op), inst.dst) {
                         dd.push((cycle, mfma_dst_wait(l), m.canon(d), rng(m, d)));
                     }
                     if matches!(inst.op, MOp::SNop) {
@@ -687,14 +662,14 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                 }
                 inflight.push((cycle, need, inst.op, srcs));
             }
-            if store_haz_on && is_wide_vmem_store(inst.op) {
+            if is_wide_vmem_store(inst.op) {
                 if let Some(Src::Reg(d)) = inst.srcs.get(wide_store_data_idx(inst.op)) {
                     if m.vreg_class(*d).is_vector() {
                         store_data_inflight.push((cycle, STORE_DATA_WAIT, vec![rng(m, *d)]));
                     }
                 }
             }
-            if let (true, Some(l), Some(d)) = (waw_on, mfma_latency(inst.op), inst.dst) {
+            if let (Some(l), Some(d)) = (mfma_latency(inst.op), inst.dst) {
                 dst_inflight.push((cycle, mfma_dst_wait(l), m.canon(d), rng(m, d)));
             }
             if matches!(inst.op, MOp::SNop) {

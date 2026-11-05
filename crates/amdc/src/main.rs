@@ -12,7 +12,7 @@ fn usage() {
     eprintln!("  amdc list");
     eprintln!("  amdc dump <kernel>");
     eprintln!("  amdc print-ir <kernel> [--stage dsl|mir|mir-ra]");
-    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--llvm-tail-drop-auto-waits] [--sched | --sched=auto | --sched=ld]");
+    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld]");
     eprintln!("      --backend llvm-tail runs the pinned llc tail (ROCM_LLVM_BIN overrides the tool dir);");
     eprintln!("      --mir-out writes the exported post-RA MIR only (no llc needed) and exits.");
     eprintln!("  amdc gen-host <kernel>|--shipped [--out <dir>]   generate C++ ABI/validate/launch header + JSON metadata");
@@ -293,9 +293,7 @@ fn main() -> ExitCode {
                 eprintln!("unknown kernel: {name}");
                 return ExitCode::from(2);
             };
-            if args.iter().any(|a| a == "--sched=auto") {
-                env::set_var("AMDC_SCHED", "auto");
-            } else if args.iter().any(|a| a == "--sched") {
+            if args.iter().any(|a| a == "--sched") {
                 env::set_var("AMDC_SCHED", "1");
             }
             match amdgpu_compiler::compile_mir(&f) {
@@ -371,21 +369,11 @@ fn main() -> ExitCode {
                 } else if let Some(b) = args[i].strip_prefix("--backend=") {
                     backend_name = b.to_string();
                     i += 1;
-                } else if args[i] == "--scalarize" {
-                    let cur = env::var("AMDC_LOWER_OPTS").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "dce,cmpfold".to_string());
-                    env::set_var("AMDC_LOWER_OPTS", format!("{cur},scalarize"));
-                    i += 1;
                 } else if args[i] == "--sched=ld" {
                     env::set_var("AMDC_SCHED", "ld");
                     i += 1;
-                } else if args[i] == "--sched=auto" {
-                    env::set_var("AMDC_SCHED", "auto");
-                    i += 1;
                 } else if args[i] == "--sched" {
                     env::set_var("AMDC_SCHED", "1");
-                    i += 1;
-                } else if args[i] == "--llvm-tail-drop-auto-waits" {
-                    env::set_var("AMDC_DROP_AUTO_WAITS", "1");
                     i += 1;
                 } else if args[i] == "--backend" {
                     backend_name = args.get(i + 1).cloned().unwrap_or_default();

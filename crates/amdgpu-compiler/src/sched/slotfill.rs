@@ -34,23 +34,15 @@ pub const SLOT_BUDGET: u32 = 28;
 /// Register-pressure cap: a floater never moves more than this many slots (MFMAs) above its source position.
 pub const HOIST_SLOTS: usize = 40;
 /// A DMA with no consumer in the region must be issued this many slots before the region end (about the DMA latency: `DMA_LATENCY_CYCLES` / `SLOT_CYCLES`).
-/// `AMDC_SF_DMA_SLOTS=n` overrides it for sweeps.
+///
 /// 512 cycles: swept 8..32 slots on GEMM v4 (9 alternating rounds, docs/slotfill.md): flat for 12..24 (3011..3026 TF/s vs hand 3002), 2969 at 32.
 pub const DMA_LATENCY_CYCLES: u32 = 512;
 pub const DMA_SLOTS: usize = (DMA_LATENCY_CYCLES / SLOT_CYCLES) as usize;
 /// Register-pressure budget: the new order may raise the region's peak of live vector dwords (unified VGPR + AGPR) by at most this much over the authored order;
-/// when it would, the hoist cap is halved until it fits (`AMDC_SF_PRESSURE_SLACK=n` overrides).
+/// when it would, the hoist cap is halved until it fits.
 pub const PRESSURE_SLACK: i64 = 8;
 
-fn dma_slots() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("AMDC_SF_DMA_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(DMA_SLOTS))
-}
 
-fn pressure_slack() -> i64 {
-    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("AMDC_SF_PRESSURE_SLACK").ok().and_then(|v| v.parse().ok()).unwrap_or(PRESSURE_SLACK))
-}
 
 /// Peak of live vector dwords (VGPR + AGPR tuples counted at full width) while issuing `order` (indices into `insts`), from the region's live-out set.
 pub fn peak_live(m: &MFunction, insts: &[MInst], order: &[usize], live_out: &std::collections::HashSet<VReg>) -> i64 {
@@ -115,7 +107,7 @@ fn hard_fence(e: &Effects) -> bool {
 fn fill_region(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, live_out: &std::collections::HashSet<VReg>, log: &mut Vec<String>) -> Result<Option<Vec<usize>>, String> {
     // register-pressure budget: halve the hoist cap until the region's peak of live vector dwords stays within the authored peak + slack
     let src: Vec<usize> = (0..seg.len()).collect();
-    let budget = peak_live(m, seg, &src, live_out) + pressure_slack();
+    let budget = peak_live(m, seg, &src, live_out) + PRESSURE_SLACK;
     let mut cap = HOIST_SLOTS;
     loop {
         let r = fill_region_cap(m, seg, term, o, cap, log)?;
@@ -125,7 +117,7 @@ fn fill_region(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, live_out:
                 let peak = peak_live(m, seg, &order, live_out);
                 if peak <= budget || cap == 0 {
                     if o.stats {
-                        log.push(format!("pressure: authored {} -> {peak} (budget {budget}), hoist cap {cap}", budget - pressure_slack()));
+                        log.push(format!("pressure: authored {} -> {peak} (budget {budget}), hoist cap {cap}", budget - PRESSURE_SLACK));
                     }
                     return Ok(if peak <= budget { Some(order) } else { None });
                 }
@@ -171,7 +163,7 @@ fn fill_region_cap(m: &MFunction, seg: &[MInst], term: &Term, o: &Options, hoist
         }
         // a consumer outside the region (next iteration / next tile) sees the value at the region end
         let mut d = match cls[i] {
-            Some(Class::Dma) => mm.saturating_sub(dma_slots()),
+            Some(Class::Dma) => mm.saturating_sub(DMA_SLOTS),
             Some(_) => mm.saturating_sub(fl(model::cost(seg[i].op).latency)),
             None => mm,
         };

@@ -46,10 +46,7 @@ pub fn current_opts() -> Vec<String> {
     if let Some(v) = OVERRIDE.with(|o| o.borrow().clone()) {
         return v;
     }
-    match std::env::var("AMDC_LOWER_OPTS") {
-        Ok(s) if !s.is_empty() => s.split(',').map(|x| x.trim().to_string()).collect(),
-        _ => vec!["dce".to_string(), "cmpfold".to_string()],
-    }
+    vec!["dce".to_string(), "cmpfold".to_string()]
 }
 
 /// `lower` with extra options on top of the current ones (used by the register-pressure retries).
@@ -62,16 +59,10 @@ pub fn lower_with_extra(f: &Function, extra: &[&str]) -> Result<MFunction, Strin
 
 pub fn opt_on(name: &str) -> bool {
     if let Some(v) = OVERRIDE.with(|o| o.borrow().clone()) {
-        return v.iter().any(|x| x == name || x == "all");
+        return v.iter().any(|x| x == name);
     }
-    static OPTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let v = OPTS.get_or_init(|| match std::env::var("AMDC_LOWER_OPTS") {
-        Ok(s) if !s.is_empty() => s.split(',').map(|x| x.trim().to_string()).collect(),
-        Ok(_) => vec!["dce".to_string(), "cmpfold".to_string()], // cargo.sh forwards an empty value when unset
-        // default: the optimisations measured to help (value-preserving, bit-exact on all shapes); `none` disables all
-        Err(_) => vec!["dce".to_string(), "cmpfold".to_string()],
-    });
-    v.iter().any(|x| x == name || x == "all")
+    // default: the optimisations measured to help (value-preserving, bit-exact on all shapes)
+    name == "dce" || name == "cmpfold"
 }
 
 /// Is `bits` an in-line constant of the ISA (integers -16..64 and the f32 constants 0, +-0.5, +-1, +-2, +-4, 1/(2pi))?
@@ -369,23 +360,9 @@ impl Lowerer {
         if opt_on("dce") {
             dce_full(&mut self.mir, false);
         }
-        if opt_on("licm") {
-            licm(&mut self.mir);
-        }
-        if opt_on("sink") {
-            sink_defs(&mut self.mir);
-        }
-        for (name, stride) in [("maskreg", 1usize), ("maskreg2", 2), ("maskreg3", 3), ("maskreg4", 4)] {
-            if opt_on(name) {
-                mask_regs(&mut self.mir, stride);
-                break;
-            }
-        }
         // rematerialise loop-invariant constants next to their loop uses (register pressure; `remat1/2/3` = at most 1/2/any
         // number of loop blocks using the constant)
-        let spill_n: usize = std::env::var("AMDC_RA_LDS_SPILL").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0).unwrap_or_else(|| {
-            ["ldsspill8", "ldsspill16", "ldsspill24", "ldsspill32", "ldsspill48", "ldsspill64"].iter().find(|n| opt_on(n)).map(|n| n.trim_start_matches("ldsspill").parse().unwrap()).unwrap_or(0)
-        });
+        let spill_n: usize = ["ldsspill8", "ldsspill16", "ldsspill24", "ldsspill32", "ldsspill48", "ldsspill64"].iter().find(|n| opt_on(n)).map(|n| n.trim_start_matches("ldsspill").parse().unwrap()).unwrap_or(0);
         if opt_on("remat4") {
             remat_exprs(&mut self.mir);
         } else {
@@ -661,59 +638,6 @@ impl Lowerer {
         true
     }
 
-    /// If `ops` are lanes 0..3 (in order) of one V4 value that is only used through these four lane reads and whose last
-    /// writer in the current block is a 128-bit load, retarget that load into dwords `base..base+4` of the fragment `v`.
-    fn fold_lane_group(&mut self, v: VReg, base: u8, ops: &[Opnd]) -> bool {
-        let mut x: Option<ValueId> = None;
-        for (k, o) in ops.iter().enumerate() {
-            let Opnd::Val(ov) = o else { return false };
-            if self.use_counts.get(ov).copied() != Some(1) {
-                return false;
-            }
-            match self.defs.get(ov) {
-                Some(Op::Frag16Lane { frag: Opnd::Val(fx), index }) if *index as usize == k => {
-                    if x.map_or(false, |p| p != *fx) {
-                        return false;
-                    }
-                    x = Some(*fx);
-                }
-                _ => return false,
-            }
-        }
-        let Some(x) = x else { return false };
-        if self.use_counts.get(&x).copied() != Some(4) {
-            return false;
-        }
-        let Some(&t) = self.val.get(&x) else { return false };
-        if self.mir.vreg_class(t) != RClass::V4 || self.mir.alias.contains_key(&t) {
-            return false;
-        }
-        let insts = &self.mir.blocks[self.cur].insts;
-        let mut at = None;
-        for (k, inst) in insts.iter().enumerate().rev() {
-            if inst.dst == Some(t) {
-                if !matches!(inst.op, MOp::LdsReadB128) {
-                    return false;
-                }
-                at = Some(k);
-                break;
-            }
-            if inst.uses().contains(&t) {
-                return false;
-            }
-        }
-        let Some(at) = at else { return false };
-        let part = self.alias_vreg(v, base, RClass::V4);
-        self.mir.blocks[self.cur].insts[at].dst = Some(part);
-        let (old, new) = (self.mir.canon(t), self.mir.canon(v));
-        for p in self.pending_lds.iter_mut().chain(self.pending_vmem.iter_mut()) {
-            if *p == old {
-                *p = new;
-            }
-        }
-        true
-    }
-
     /// Lower a safe-asm block (`amdgpu-safeasm`) into ordinary MIR: ports bind to DSL values, constants join the region's constant cache,
     /// everything else becomes fresh virtual registers; the instructions then go through the normal scheduling / allocation / hazard pipeline.
     fn lower_asm(&mut self, dst: Option<ValueId>, block: &amdgpu_safeasm::AsmBlock, inputs: &[Opnd], inouts: &[VReg]) -> Result<(), String> {
@@ -848,12 +772,6 @@ impl Lowerer {
 
     /// Bit pattern of a constant operand (integer or f32), for in-line operands.    /// `base` = `PtrAdd{ scalar kernarg pointer, vector byte offset }`: (scalar pair, 32-bit vector offset) for the SADDR form.
     fn saddr_parts_force(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
-        self.saddr_parts_impl(base)
-    }
-    fn saddr_parts(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
-        if !opt_on("saddr") {
-            return Ok(None);
-        }
         self.saddr_parts_impl(base)
     }
     fn saddr_parts_impl(&mut self, base: Opnd) -> Result<Option<(VReg, VReg)>, String> {
@@ -1650,12 +1568,8 @@ impl Lowerer {
                 }
                 Stmt::VarLoadB128 { var, base, byte_off } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
-                    if let Some((sr, off)) = self.saddr_parts(*base)? {
-                        self.push(MInst::new(MOp::GlobalLoadB128S).def(v).srcreg(sr).srcreg(off).imm(*byte_off as i64));
-                    } else {
-                        let rb = self.as_v2(*base)?;
-                        self.push(MInst::new(MOp::GlobalLoadB128).def(v).srcreg(rb).imm(*byte_off as i64));
-                    }
+                    let rb = self.as_v2(*base)?;
+                    self.push(MInst::new(MOp::GlobalLoadB128).def(v).srcreg(rb).imm(*byte_off as i64));
                     self.pending_vmem.push(self.mir.canon(v));
                 }
                 Stmt::VarScaleF32 { var, scalar } => {
@@ -1674,9 +1588,6 @@ impl Lowerer {
                     let mut done = false;
                     if let Opnd::Val(x) = value {
                         let is_const = matches!(self.defs.get(x), Some(Op::ConstI32(_) | Op::ConstF32(_)));
-                        if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("setlanedebug")) {
-                            eprintln!("set_lane v{x}: const {is_const} uses {:?} lowered {:?}", self.exact_uses.get(x), self.val.get(x));
-                        }
                         if let (false, Some(1), Some(&r)) = (is_const, self.exact_uses.get(x).copied(), self.val.get(x)) {
                             let cur = self.cur;
                             let plain = self.mir.vreg_class(r) == RClass::V1 && !self.mir.alias.contains_key(&r) && !self.mir.alias.values().any(|(t, _)| *t == r);
@@ -1685,9 +1596,6 @@ impl Lowerer {
                                 && !self.consts.values().any(|q| *q == r)
                                 && !self.converted.values().any(|q| *q == r);
                             let elsewhere = self.mir.blocks.iter().enumerate().any(|(bi, b)| bi != cur && b.insts.iter().any(|i| i.dst == Some(r) || i.srcs.iter().any(|s| matches!(s, Src::Reg(q) if *q == r))));
-                            if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("setlanedebug")) {
-                                eprintln!("set_lane v{x}: plain {plain} def_here {def_here} elsewhere {elsewhere}");
-                            }
                             if plain && def_here && !elsewhere {
                                 for i in self.mir.blocks[cur].insts.iter_mut() {
                                     if i.dst == Some(r) {
@@ -2100,10 +2008,6 @@ impl Lowerer {
                 }
                 match op {
                     Op::CmpLtI32(a, b) => {
-                        if let Some(srcs) = self.cmp_lt_scalar_bound(a, b)? {
-                            let on = if negate { Pred::Vccz } else { Pred::Vccnz };
-                            return Ok((on, srcs));
-                        }
                         // src0 of the e32 compare may be an SGPR (sgpr option); src1 must be a VGPR
                         let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
                         let ra = match sa {
@@ -2387,12 +2291,8 @@ impl Lowerer {
             }
             Op::LoadF32 { base, byte_off } => {
                 let d = self.new_vreg(RClass::V1);
-                if let Some((sr, off)) = self.saddr_parts(*base)? {
-                    self.push(MInst::new(MOp::GlobalLoadF32S).def(d).srcreg(sr).srcreg(off).imm(*byte_off as i64));
-                } else {
-                    let rb = self.as_v2(*base)?;
-                    self.push(MInst::new(MOp::GlobalLoadF32).def(d).srcreg(rb).imm(*byte_off as i64));
-                }
+                let rb = self.as_v2(*base)?;
+                self.push(MInst::new(MOp::GlobalLoadF32).def(d).srcreg(rb).imm(*byte_off as i64));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
@@ -2473,12 +2373,8 @@ impl Lowerer {
             }
             Op::LoadGlobalB128 { base, byte_off } => {
                 let d = self.new_vreg(RClass::V4);
-                if let Some((sr, off)) = self.saddr_parts(*base)? {
-                    self.push(MInst::new(MOp::GlobalLoadB128S).def(d).srcreg(sr).srcreg(off).imm(*byte_off as i64));
-                } else {
-                    let rb = self.as_v2(*base)?;
-                    self.push(MInst::new(MOp::GlobalLoadB128).def(d).srcreg(rb).imm(*byte_off as i64));
-                }
+                let rb = self.as_v2(*base)?;
+                self.push(MInst::new(MOp::GlobalLoadB128).def(d).srcreg(rb).imm(*byte_off as i64));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
@@ -2769,22 +2665,7 @@ impl Lowerer {
             }            Op::Frag8(a, b, c, d, e, f, g, h) => {
                 let v = self.new_vreg(RClass::V8);
                 let ops8 = [*a, *b, *c, *d, *e, *f, *g, *h];
-                // `foldq`: four consecutive lanes that are exactly the four lanes of one just-loaded V4 are not copied; the load
-                // writes the half of the fragment directly
-                let mut folded = [false; 8];
-                if opt_on("foldq") {
-                    for half in 0..2usize {
-                        if self.fold_lane_group(v, (half * 4) as u8, &ops8[half * 4..half * 4 + 4]) {
-                            for k in 0..4 {
-                                folded[half * 4 + k] = true;
-                            }
-                        }
-                    }
-                }
                 for (i, o) in ops8.into_iter().enumerate() {
-                    if folded[i] {
-                        continue;
-                    }
                     let al = self.alias_vreg(v, i as u8, RClass::V1);
                     let retargeted = match o {
                         Opnd::Val(ov) => self.retarget_producer(ov, al),
@@ -2985,13 +2866,9 @@ impl Lowerer {
             Op::PartnerMaxF32(a) => {
                 let ra = self.as_v1(*a)?;
                 self.touch(&[Src::Reg(ra)]);
-                // pmdead: the operand is a max computed just for this lane exchange (single use): swap it in place, one copy less
-                let dead = opt_on("pmdead") && matches!(*a, Opnd::Val(v) if self.use_counts.get(&v).copied() == Some(1) && matches!(self.defs.get(&v), Some(Op::Max3F32(..)) | Some(Op::MaxF32(..))));
-                let d1 = if dead { ra } else { self.new_vreg(RClass::V1) };
+                let d1 = self.new_vreg(RClass::V1);
                 let d2 = self.new_vreg(RClass::V1);
-                if !dead {
-                    self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
-                }
+                self.push(MInst::new(MOp::VMovB32).def(d1).srcreg(ra));
                 self.push(MInst::new(MOp::VMovB32).def(d2).srcreg(ra));
                 // afterwards d1 = [lo, lo], d2 = [hi, hi]
                 self.push(MInst::new(MOp::VPermlane32Swap).def(d1).srcreg(d1).srcreg(d2));
@@ -3082,58 +2959,7 @@ impl Lowerer {
         (self.mir.vreg_class(r) == RClass::S1).then_some(r)
     }
 
-    /// `x + k < bound` with a wave-uniform bound: `bound - k > x` with the (uniform) adjusted bound in an SGPR (src0 of
-    /// `v_cmp_gt_i32`): no per-lane add of the constant, no v_mov of the bound. Returns the compare's sources.
-    fn cmp_lt_scalar_bound(&mut self, a: Opnd, b: Opnd) -> Result<Option<Vec<Src>>, String> {
-        if !opt_on("sbound") || self.const_bits(a).is_some() {
-            return Ok(None);
-        }
-        // the bound may already have a VGPR copy (`converted`): the scalar original is still the value to use
-        let sb = match b {
-            Opnd::Val(v) => self.val.get(&v).copied().filter(|r| self.mir.vreg_class(*r) == RClass::S1),
-            o => self.sgpr_src(o),
-        };
-        let Some(sb) = sb else { return Ok(None) };
-        let (core, k) = self.split_const(a);
-        if k.abs() >= (1 << 20) {
-            return Ok(None);
-        }
-        // the compare may be re-issued later by `cmpfold`: its sources must be immutable registers (not loop variables)
-        if matches!(core, Opnd::Var(_)) {
-            return Ok(None);
-        }
-        let rx = self.as_v1(core)?;
-        if self.var_backed(rx) {
-            return Ok(None);
-        }
-        self.touch(&[Src::Reg(sb), Src::Reg(rx)]);
-        // a loop variable is a mutable register and `cmpfold` may re-issue this compare later: take a copy in that case
-        let bound = if k == 0 && matches!(b, Opnd::Val(_)) {
-            sb
-        } else {
-            let d = self.new_vreg(RClass::S1);
-            self.push(MInst::new(MOp::SAddU32).def(d).srcreg(sb).src(Src::Imm(-k)));
-            d
-        };
-        self.push(MInst::new(MOp::VCmpGtI32).srcreg(bound).srcreg(rx));
-        Ok(Some(vec![Src::Reg(bound), Src::Reg(rx)]))
-    }
-
     fn bin_v1(&mut self, dst: ValueId, op: MOp, a: Opnd, b: Opnd) -> Result<(), String> {
-        if opt_on("shl") && op == MOp::VMulLoU32 {
-            for (c, other) in [(b, a), (a, b)] {
-                if let Some(k) = self.const_bits(c) {
-                    if k > 0 && (k & (k - 1)) == 0 && k < (1 << 31) && self.const_bits(other).is_none() {
-                        let r = self.as_v1(other)?;
-                        self.touch(&[Src::Reg(r)]);
-                        let d = self.new_vreg(RClass::V1);
-                        self.push(MInst::new(MOp::VLshlB32).def(d).src(Src::Imm(k.trailing_zeros() as i64)).srcreg(r));
-                        self.val.insert(dst, d);
-                        return Ok(());
-                    }
-                }
-            }
-        }
         if opt_on("sgpr") {
             let vop3 = op == MOp::VMulLoU32;
             let commutative = op != MOp::VSubF32;
@@ -3206,8 +3032,6 @@ impl Lowerer {
                 return Ok(());
             }
         }
-        let scalar_bound = if op == MOp::VCmpLtI32 { self.cmp_lt_scalar_bound(a, b)? } else { None };
-        if scalar_bound.is_none() {
         let sa = if opt_on("sgpr") { self.sgpr_src(a) } else { None };
         let ra = match sa {
             Some(s) => s,
@@ -3216,7 +3040,6 @@ impl Lowerer {
         let rb = self.as_v1(b)?;
         self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
         self.push(MInst::new(op).srcreg(ra).srcreg(rb));
-        }
         let one = self.const_vreg(1);
         let d = self.new_vreg(RClass::V1);
         self.push(MInst::new(MOp::VCndmask).def(d).src(Src::Imm(0)).srcreg(one));
@@ -3410,126 +3233,6 @@ fn dce_cmp_pairs(m: &mut MFunction) {
             k += 1;
             !dead[k - 1]
         });
-    }
-}
-/// Dead-code elimination that understands `vcc`: a pure instruction whose result is never read is removed, and a
-/// compare / carry producer is removed when no later instruction of the block reads the `vcc` it writes
-/// (the terminator may read it). The lowering emits address / clamp chains whose consumers were dropped by other
-/// options (e.g. the global scale loads replaced by LDS scale reads); this removes them. Same values, same
-/// arithmetic for everything that remains.
-/// `licm`: loop-invariant code motion of pure ALU instructions (constant materialisations, SGPR->VGPR moves, invariant address arithmetic).
-/// The lowering re-materialises constants and conversions per region (a constant must not stay live across a loop just because the body
-/// uses it once); in a steady loop that runs every tile this costs issue slots. An instruction in a loop is hoisted to the loop's preheader
-/// when it is pure (op attribute `dce = Pure`, no implicit vcc / scc), defines a single-definition V1/V2/S1 register that is no sub-register
-/// view, and every source is defined outside the loop; repeated to a fixpoint (chains), innermost loops first. Identical hoisted
-/// instructions of one preheader are merged (later uses renamed). Wave-level control flow has no exec mask, so executing a pure
-/// instruction unconditionally is safe.
-fn licm(m: &mut MFunction) {
-    use crate::op_attrs::{attrs, Dce};
-    let label_idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
-    let loops = m.loops.clone();
-    let views: HashSet<VReg> = m.alias.values().map(|(t, _)| *t).chain(m.alias.keys().copied()).collect();
-    for (header, latch) in loops {
-        let (Some(&h), Some(&l)) = (label_idx.get(&header), label_idx.get(&latch)) else { continue };
-        if h == 0 || h > l || !matches!(m.blocks[h - 1].term, Term::Goto(t) if t == header) {
-            if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("licmdebug")) {
-                eprintln!("licm: loop {header}..{latch}: no preheader (h {h}, l {l})");
-            }
-            continue;
-        }
-        let pre = h - 1;
-        let dbg = std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("licmdebug"));
-        if dbg {
-            eprintln!("licm: loop {header}..{latch} blocks {h}..{l} preheader {pre}");
-        }
-        loop {
-            // definitions per canonical register: total, and inside the loop
-            let mut defs_all: HashMap<VReg, usize> = HashMap::new();
-            let mut defs_in: HashSet<VReg> = HashSet::new();
-            for (bi, b) in m.blocks.iter().enumerate() {
-                for i in &b.insts {
-                    let mut ds: Vec<VReg> = i.dst.into_iter().collect();
-                    if i.op == MOp::VPermlane32Swap {
-                        ds.extend(i.srcs.iter().take(2).filter_map(|s| if let Src::Reg(r) = s { Some(*r) } else { None }));
-                    }
-                    for d in ds {
-                        let c = m.canon(d);
-                        *defs_all.entry(c).or_insert(0) += 1;
-                        if bi >= h && bi <= l {
-                            defs_in.insert(c);
-                        }
-                    }
-                }
-            }
-            let mut moved: Vec<MInst> = Vec::new();
-            for bi in h..=l {
-                let insts = std::mem::take(&mut m.blocks[bi].insts);
-                let mut keep = Vec::with_capacity(insts.len());
-                for i in insts {
-                    let a = attrs(i.op);
-                    let ok = !i.pin
-                        && a.dce == Dce::Pure
-                        && !a.vcc_read
-                        && !a.vcc_write
-                        && !a.scc_read
-                        && !a.scc_write
-                        && i.dst.map_or(false, |d| {
-                            !views.contains(&d) && matches!(m.vreg_class(d), RClass::V1 | RClass::V2 | RClass::S1) && defs_all.get(&m.canon(d)).copied() == Some(1)
-                        })
-                        && i.srcs.iter().all(|s| match s {
-                            Src::Reg(r) => !defs_in.contains(&m.canon(*r)),
-                            _ => true,
-                        });
-                    if ok {
-                        if let Some(d) = i.dst {
-                            defs_in.remove(&m.canon(d));
-                        }
-                        moved.push(i);
-                    } else {
-                        keep.push(i);
-                    }
-                }
-                m.blocks[bi].insts = keep;
-            }
-            if moved.is_empty() {
-                break;
-            }
-            // merge identical hoisted instructions (same op, sources, immediate and class)
-            let mut rename: HashMap<VReg, VReg> = HashMap::new();
-            let mut firsts: Vec<MInst> = Vec::new();
-            for mut i in moved {
-                for s in i.srcs.iter_mut() {
-                    if let Src::Reg(r) = s {
-                        if let Some(n) = rename.get(r) {
-                            *r = *n;
-                        }
-                    }
-                }
-                let d = i.dst.expect("dst");
-                if let Some(f) = firsts.iter().find(|f| f.op == i.op && f.imm == i.imm && f.srcs == i.srcs && m.vreg_class(f.dst.unwrap()) == m.vreg_class(d)) {
-                    rename.insert(d, f.dst.unwrap());
-                } else {
-                    firsts.push(i);
-                }
-            }
-            if !rename.is_empty() {
-                for b in m.blocks.iter_mut() {
-                    for i in b.insts.iter_mut() {
-                        for s in i.srcs.iter_mut() {
-                            if let Src::Reg(r) = s {
-                                if let Some(n) = rename.get(r) {
-                                    *r = *n;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if dbg {
-                eprintln!("licm:   hoisted {} ({} merged): {:?}", firsts.len(), rename.len(), firsts.iter().map(|i| (i.op, i.imm)).collect::<Vec<_>>());
-            }
-            m.blocks[pre].insts.extend(firsts);
-        }
     }
 }
 
@@ -3770,117 +3473,6 @@ fn remat_consts(m: &mut MFunction, max_blocks: usize) {
         }
     }
 }
-/// Sink definitions of pure single-definition V1 values down to their first use (same block) or, along a chain of
-/// unconditional single-predecessor edges, into the last block of the chain that still dominates every use (never into a
-/// loop). Shortens live ranges across the prologue peak: values computed early but only needed after it stop occupying a
-/// VGPR in between. Sources are single-definition registers, so moving the definition later cannot change its value.
-fn sink_defs(m: &mut MFunction) {
-    fn pure(op: MOp) -> bool {
-        matches!(
-            op,
-            MOp::VMovB32 | MOp::VMovFromS | MOp::VAddU32 | MOp::VMulLoU32 | MOp::VAndB32 | MOp::VOrB32 | MOp::VXorB32 | MOp::VLshrB32 | MOp::VLshlB32
-        )
-    }
-    let nb = m.blocks.len();
-    let succs = crate::sched::liveness::successors(m);
-    let mut preds = vec![0usize; nb];
-    for s in &succs {
-        for &x in s {
-            preds[x] += 1;
-        }
-    }
-    let idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
-    // definitions and uses
-    let mut ndefs: HashMap<VReg, u32> = HashMap::new();
-    let mut use_blocks: HashMap<VReg, Vec<usize>> = HashMap::new();
-    for (bi, b) in m.blocks.iter().enumerate() {
-        for inst in &b.insts {
-            if let Some(d) = inst.dst {
-                *ndefs.entry(d).or_insert(0) += 1;
-            }
-            for r in inst.uses() {
-                let e = use_blocks.entry(r).or_default();
-                if e.last() != Some(&bi) {
-                    e.push(bi);
-                }
-            }
-        }
-    }
-    let alias = m.alias.clone();
-    let single = |r: &VReg| ndefs.get(r).copied().unwrap_or(0) == 1 && !alias.contains_key(r);
-    for bi in 0..nb {
-        // the unconditional chain starting at bi
-        let mut chain = vec![bi];
-        loop {
-            let last = *chain.last().unwrap();
-            match &m.blocks[last].term {
-                Term::Goto(t) => match idx.get(t) {
-                    Some(&n) if preds[n] == 1 && !chain.contains(&n) => chain.push(n),
-                    _ => break,
-                },
-                _ => break,
-            }
-        }
-        let mut i = m.blocks[bi].insts.len();
-        while i > 0 {
-            i -= 1;
-            let inst = m.blocks[bi].insts[i].clone();
-            let Some(d) = inst.dst else { continue };
-            if inst.pin || !pure(inst.op) || m.vreg_class(d) != RClass::V1 || !single(&d) {
-                continue;
-            }
-            if !inst.srcs.iter().all(|s| match s {
-                Src::Imm(_) => true,
-                Src::Reg(r) => single(r),
-            }) {
-                continue;
-            }
-            let ubs = match use_blocks.get(&d) {
-                Some(u) if !u.is_empty() => u.clone(),
-                _ => continue,
-            };
-            // all uses in this block: sink to just before the first use
-            if ubs.iter().all(|&u| u == bi) {
-                let first = (i + 1..m.blocks[bi].insts.len()).find(|&k| m.blocks[bi].insts[k].uses().contains(&d));
-                if let Some(k) = first {
-                    if k > i + 1 {
-                        let x = m.blocks[bi].insts.remove(i);
-                        m.blocks[bi].insts.insert(k - 1, x);
-                    }
-                }
-                continue;
-            }
-            if ubs.contains(&bi) {
-                continue;
-            }
-            // furthest chain block such that every use is in it or beyond the chain
-            let mut target = 0usize;
-            for (ci, &cb) in chain.iter().enumerate().skip(1) {
-                // uses inside chain blocks before cb would not be dominated by the new position
-                if ubs.iter().any(|u| chain[..ci].contains(u)) {
-                    break;
-                }
-                target = ci;
-                let _ = cb;
-            }
-            if target == 0 {
-                continue;
-            }
-            let tb = chain[target];
-            // never into a loop block
-            if m.loops.iter().any(|(h, l)| {
-                let (hi, li) = (idx.get(h).copied().unwrap_or(usize::MAX), idx.get(l).copied().unwrap_or(0));
-                tb >= hi.min(li) && tb <= hi.max(li)
-            }) {
-                continue;
-            }
-            let x = m.blocks[bi].insts.remove(i);
-            // before the first use if the use is in tb, else at the end of tb (before nothing: terminators are not instructions)
-            let pos = m.blocks[tb].insts.iter().position(|y| y.uses().contains(&d)).unwrap_or(m.blocks[tb].insts.len());
-            m.blocks[tb].insts.insert(pos, x);
-        }
-    }
-}
 /// Rematerialise whole expressions: a pure single-definition V1 value defined outside a loop whose expression tree
 /// (add/mul/shift/and/or/xor/mov, depth <= 6) has only constants, single-definition SGPRs and the workitem id as leaves is
 /// recomputed in every loop block that uses it, right before the first use, instead of staying in a VGPR across the loop.
@@ -4023,7 +3615,7 @@ fn remat_exprs(m: &mut MFunction) {
 /// iteration and `256 * values * waves` bytes of LDS (appended after the kernel's own LDS). Returns (#values, total bytes).
 fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
     // stop when the true peak is this low (alignment / reserved registers need slack); AMDC_RA_LDS_SPILL_TARGET lowers it for the regression probe
-    let target: u32 = std::env::var("AMDC_RA_LDS_SPILL_TARGET").ok().and_then(|v| v.parse().ok()).unwrap_or(236);
+    let target: u32 = 236;
     let nwaves = (m.workgroup_size / 64).max(1);
     let base = (m.lds_bytes + 15) / 16 * 16;
     let newv = |m: &mut MFunction| -> VReg {
@@ -4160,90 +3752,5 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
     let total = area * nwaves;
     m.lds_bytes = base + total;
     (spilled, total)
-}
-/// ``maskreg``: turn ``v_cmp (vcc) ; ... ; v_cndmask`` pairs into compares that write an SGPR pair and a ``v_cndmask_b32_e64`` reading
-/// it, so the scheduler (and the hazard filler) can have several masks in flight instead of one serialised ``vcc``. Only pairs
-/// where nothing between the two touches ``vcc`` and ``vcc`` is not read again afterwards (a branch terminator counts as a read when
-/// the compare is the block's last ``vcc`` writer).
-fn mask_regs(m: &mut MFunction, stride: usize) {
-    let mut seen = 0usize;
-    for bi in 0..m.blocks.len() {
-        let n = m.blocks[bi].insts.len();
-        let mut conv: Vec<(usize, usize, MOp)> = Vec::new();
-        let mut j = 0;
-        while j < n {
-            let cmp_op = match m.blocks[bi].insts[j].op {
-                MOp::VCmpLtI32 => Some(MOp::VCmpMaskLtI32),
-                MOp::VCmpGeI32 => Some(MOp::VCmpMaskGeI32),
-                MOp::VCmpGtI32 => Some(MOp::VCmpMaskGtI32),
-                MOp::VCmpLtF32 => Some(MOp::VCmpMaskLtF32),
-                _ => None,
-            };
-            let Some(mop) = cmp_op else {
-                j += 1;
-                continue;
-            };
-            if m.blocks[bi].insts[j].dst.is_some() {
-                j += 1;
-                continue;
-            }
-            // VOP3 has no literal operand on gfx9: only inline integer constants (and none at all for the f32 compare)
-            let bad_imm = m.blocks[bi].insts[j].srcs.iter().any(|s| match s {
-                Src::Imm(k) => mop == MOp::VCmpMaskLtF32 || !(-16..=64).contains(k),
-                _ => false,
-            });
-            if bad_imm {
-                j += 1;
-                continue;
-            }
-            // next vcc touching instruction
-            let mut k = j + 1;
-            let mut found = None;
-            while k < n {
-                let x = &m.blocks[bi].insts[k];
-                if x.op == MOp::VCndmask && x.dst.is_some() && x.srcs.len() == 2 {
-                    found = Some(k);
-                    break;
-                }
-                if x.op.consumes_vcc() || x.op.defines_vcc() || matches!(x.op, MOp::VPtrAdd | MOp::VCmpNeI32 | MOp::SWaitVm | MOp::SWaitLgkm | MOp::SBarrier) || x.dst.is_none() && !matches!(x.op, MOp::SNop) {
-                    break;
-                }
-                k += 1;
-            }
-            let Some(ci) = found else {
-                j += 1;
-                continue;
-            };
-            // vcc must be dead after the cndmask: the next vcc touching instruction must be a writer, and the block must not end first
-            let mut dead = false;
-            for x in &m.blocks[bi].insts[ci + 1..] {
-                if x.op.consumes_vcc() {
-                    break;
-                }
-                if x.op.defines_vcc() || matches!(x.op, MOp::VPtrAdd | MOp::VCmpNeI32) {
-                    dead = true;
-                    break;
-                }
-            }
-            if dead {
-                // stride > 1: only every `stride`-th pair uses a mask register (bounds the SGPRs in flight)
-                if seen % stride == 0 {
-                    conv.push((j, ci, mop));
-                }
-                seen += 1;
-            }
-            j = ci + 1;
-        }
-        for (cj, ci, mop) in conv {
-            let mask = m.vregs.len() as VReg;
-            m.vregs.push(RClass::S2);
-            let c = &mut m.blocks[bi].insts[cj];
-            c.op = mop;
-            c.dst = Some(mask);
-            let x = &mut m.blocks[bi].insts[ci];
-            x.op = MOp::VCndmaskM;
-            x.srcs.push(Src::Reg(mask));
-        }
-    }
 }
 use crate::asm::mop_by_name;

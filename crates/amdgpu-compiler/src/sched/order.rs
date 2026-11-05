@@ -32,19 +32,9 @@ fn then_fence(x: &Effects, f: Fence, alu_across: bool) -> bool {
         Fence::SetPrio => true,
         Fence::Barrier | Fence::Nop => !alu_across || x.mem.is_some(),
         Fence::WaitLgkm(_) => x.smem || matches!(&x.mem, Some(m) if m.space == Space::Lds),
-        // AMDC_PIN_VMWAIT=1: an explicit `s_waitcnt vmcnt` also stays after everything that precedes it in program order (the list scheduler would
-        // otherwise hoist it above the independent MFMA work and re-serialise a deliberately deferred DMA wait)
-        Fence::WaitVm(_) => pin_vm_wait() || matches!(&x.mem, Some(m) if m.space == Space::Global),
+        Fence::WaitVm(_) => matches!(&x.mem, Some(m) if m.space == Space::Global),
         Fence::None => false,
     }
-}
-
-/// Per-kernel switch (set by `compile_mir` for `_vs6`) or the env var `AMDC_PIN_VMWAIT=1`.
-pub static PIN_VMWAIT_KERNEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn pin_vm_wait() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    PIN_VMWAIT_KERNEL.load(std::sync::atomic::Ordering::Relaxed) || *V.get_or_init(|| std::env::var("AMDC_PIN_VMWAIT").map_or(false, |v| v == "1"))
 }
 
 /// Must `a` (earlier in program order) stay before `b` because of memory / fence semantics?

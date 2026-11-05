@@ -260,7 +260,7 @@ impl OpAttrs {
     }
 }
 
-/// Every `MOp` variant in declaration order (`op_attrs_equiv::every_variant_is_listed` checks it against the enum).
+/// Every `MOp` variant in declaration order (`tests::every_variant_is_listed` checks it against the enum).
 pub const ALL: &[MOp] = &[
     MOp::VMovB32,
     MOp::VMovFromS,
@@ -305,9 +305,6 @@ pub const ALL: &[MOp] = &[
     MOp::VCmpGeI32,
     MOp::VCmpGtI32,
     MOp::VCmpMaskLtI32,
-    MOp::VCmpMaskGeI32,
-    MOp::VCmpMaskGtI32,
-    MOp::VCmpMaskLtF32,
     MOp::VCndmaskM,
     MOp::VCmpNeI32,
     MOp::VCmpLtF32,
@@ -341,8 +338,6 @@ pub const ALL: &[MOp] = &[
     MOp::GlobalLoadU16,
     MOp::GlobalLoadF32,
     MOp::GlobalLoadB128,
-    MOp::GlobalLoadB128S,
-    MOp::GlobalLoadF32S,
     MOp::GlobalLoadLdsB128,
     MOp::GlobalLoadLdsB32,
     MOp::GlobalLoadLdsB128S,
@@ -465,9 +460,6 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         VCmpGeI32 => a("v_cmp_ge_i32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpGtI32 => a("v_cmp_gt_i32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpMaskLtI32 => a("v_cmp_lt_i32_e64", valu).wdelay(2).backend(Backend::NoRow),
-        VCmpMaskGeI32 => a("v_cmp_ge_i32_e64", valu).wdelay(2).backend(Backend::NoRow),
-        VCmpMaskGtI32 => a("v_cmp_gt_i32_e64", valu).wdelay(2).backend(Backend::NoRow),
-        VCmpMaskLtF32 => a("v_cmp_lt_f32_e64", valu).wdelay(2).backend(Backend::NoRow),
         VCndmaskM => a("v_cndmask_b32_e64", valu).hz_reader().backend(Backend::NoRow),
         VCmpNeI32 => a("v_cmp_ne_u32", valu).vcc(false, true).def_vcc().dce(Pure),
         VCmpLtF32 => a("v_cmp_lt_f32", valu).vcc(false, true).def_vcc().dce(Pure),
@@ -506,8 +498,6 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         GlobalLoadU16 => a("global_load_ushort", ld4).mem(G, false, Src(0), 2).agpr(true, 0).dce(Load),
         GlobalLoadF32 => a("global_load_dword", ld4).mem(G, false, Src(0), 4).agpr(true, 0).dce(Load),
         GlobalLoadB128 => a("global_load_dwordx4", ld16).mem(G, false, Src(0), 16).agpr(true, 0).dce(Load),
-        GlobalLoadB128S => a("global_load_dwordx4", ld16).mem(G, false, Src(1), 16).agpr(true, 0).dce(Load),
-        GlobalLoadF32S => a("global_load_dword", ld4).mem(G, false, Src(1), 4).agpr(true, 0).dce(Load),
         // global -> LDS DMA: a global read with a fence-like LDS write through M0
         GlobalLoadLdsB128 => a("global_load_lds_dwordx4", dma).mem(G, false, Src(0), 16).fence(F::Barrier).m0(1).backend(Backend::OwnOnly),
         GlobalLoadLdsB32 => a("global_load_lds_dword", dma).mem(G, false, Src(0), 16).fence(F::Barrier).m0(1).backend(Backend::OwnOnly),
@@ -563,5 +553,34 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         SWaitVm => a("s_waitcnt", ctrl).fence_only(F::WaitVm),
         SWaitLgkm => a("s_waitcnt", ctrl).fence_only(F::WaitLgkm),
         SEndpgm => a("s_endpgm", ctrl).fence_only(F::Nop),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_variant_is_listed() {
+        // ALL must list every variant of the enum (the attribute match is exhaustive at compile time)
+        let src = include_str!("mir.rs");
+        let body = &src[src.find("pub enum MOp {").unwrap()..];
+        let body = &body[..body.find("\n}").unwrap()];
+        let names: Vec<&str> = body.lines().map(|l| l.trim()).filter(|l| l.ends_with(',') && l.chars().next().map_or(false, |c| c.is_ascii_uppercase())).map(|l| l.trim_end_matches(',')).collect();
+        let listed: Vec<String> = ALL.iter().map(|o| format!("{o:?}")).collect();
+        for n in &names {
+            assert!(listed.iter().any(|l| l == n), "MOp::{n} is missing from op_attrs::ALL");
+        }
+        assert_eq!(names.len(), listed.len(), "op_attrs::ALL has duplicates or unknown entries");
+    }
+
+    #[test]
+    fn llvm_coverage_list_matches_the_backend_attribute() {
+        // backend::ALL_MOPS (the LLVM-tail table coverage list) = the ops whose backend attribute says they have rows
+        let mut rows: Vec<String> = ALL.iter().filter(|o| matches!(attrs(**o).backend, Backend::Llvm | Backend::OwnOnlyIfNoRows)).map(|o| format!("{o:?}")).collect();
+        let mut tail: Vec<String> = crate::backend::ALL_MOPS.iter().map(|o| format!("{o:?}")).collect();
+        tail.sort();
+        rows.sort();
+        assert_eq!(tail, rows, "backend::ALL_MOPS must be exactly the ops with LLVM rows (backend attribute)");
     }
 }

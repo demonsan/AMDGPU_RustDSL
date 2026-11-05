@@ -255,7 +255,7 @@ pub fn export_opts(m: &MFunction, a: &Alloc, markers: bool, drop_auto_waits: boo
     }
 
     // 2b. kill / dead flags from the same liveness (lets LLVM's peepholes and the verifier see exact liveness).
-    if std::env::var("AMDC_MIR_FLAGS").map(|v| v != "0").unwrap_or(true) {
+    {
         for bi in 0..nblocks {
             let mut live: BTreeSet<Slot> = BTreeSet::new();
             for &s in &succs[bi] {
@@ -279,11 +279,7 @@ pub fn export_opts(m: &MFunction, a: &Alloc, markers: bool, drop_auto_waits: boo
         mir.push('\n');
     }
     for bi in 0..nblocks {
-        let align = loop_align().filter(|_| m.loops.iter().any(|l| l.0 == m.blocks[bi].label));
-        match align {
-            Some(a) => mir.push_str(&format!("  bb.{bi} (align {a}):\n")),
-            None => mir.push_str(&format!("  bb.{bi}:\n")),
-        }
+        mir.push_str(&format!("  bb.{bi}:\n"));
         if !succs[bi].is_empty() {
             let s: Vec<String> = succs[bi].iter().map(|x| format!("%bb.{x}")).collect();
             mir.push_str(&format!("    successors: {}\n", s.join(", ")));
@@ -301,11 +297,6 @@ pub fn export_opts(m: &MFunction, a: &Alloc, markers: bool, drop_auto_waits: boo
     }
     mir.push_str("...\n");
     Ok(Exported { mir })
-}
-
-/// `AMDC_LOOP_ALIGN=32`: align loop headers to this many bytes (power of two).
-pub fn loop_align() -> Option<u32> {
-    std::env::var("AMDC_LOOP_ALIGN").ok().and_then(|v| v.parse().ok()).filter(|v: &u32| v.is_power_of_two())
 }
 
 /// Register slots named by an operand text (`$vgpr4_vgpr5`, `$vgpr1(tied-def 0)`, `$vcc`).

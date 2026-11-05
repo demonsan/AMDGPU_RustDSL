@@ -87,8 +87,7 @@ pub struct LlvmTail {
 impl LlvmTail {
     pub fn new() -> LlvmTail {
         let keep = std::env::var("AMDC_KEEP_MIR").ok().map(PathBuf::from);
-        let drop = std::env::var("AMDC_DROP_AUTO_WAITS").map(|v| v == "1").unwrap_or(false);
-        LlvmTail { tools: LlvmTools::locate(), keep_mir: keep, skip_lock: false, drop_auto_waits: drop, extra_args: Vec::new() }
+        LlvmTail { tools: LlvmTools::locate(), keep_mir: keep, skip_lock: false, drop_auto_waits: false, extra_args: Vec::new() }
     }
 
     pub fn export_mir(&self, m: &MFunction, a: &Alloc) -> Result<String, String> {
@@ -237,8 +236,6 @@ pub const ALL_MOPS: &[crate::mir::MOp] = &[
     MOp::GlobalLoadU16,
     MOp::GlobalLoadF32,
     MOp::GlobalLoadB128,
-    MOp::GlobalLoadB128S,
-    MOp::GlobalLoadF32S,
     MOp::GlobalStoreU16,
     MOp::GlobalStoreF32,
     MOp::GlobalLoadF32Sc1,
