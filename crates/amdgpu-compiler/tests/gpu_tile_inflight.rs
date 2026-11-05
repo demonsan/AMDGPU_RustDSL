@@ -29,7 +29,7 @@ fn kernel(next: Next) -> Function {
     let c64 = b.c_i32(64);
     let is_p = b.cmp_lt_i32(tid, c64);
     let c4 = b.c_i32(4);
-    let l = b.and_i32(Opnd::Val(tid), Opnd::I32(63));
+    let l = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(63)));
     let addr = b.mul_i32(Opnd::Val(l), Opnd::Val(c4));
     let one = b.c_i32(1);
     // phase 0: produce version 0, publish at barrier 0
