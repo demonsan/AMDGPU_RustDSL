@@ -1,6 +1,6 @@
 # Slot-filling scheduler (`slotfill`, sched/slotfill.rs)
 
-"Issue one, subtract one" with per-MFMA budgets derived by the compiler instead of authored knobs (`dma_gap`, `spread_reloads`, ...). Opt-in sched token `slotfill` (Function::sched_opts, e.g. GemmConfig.sched = "rewait,slotfill"; or the experiment switch `AMDC_SLOTFILL=1` / `AMDC_SLOTFILL=<kernel name substring>`). Off = no change at all (all 101 `amdc list` kernels have identical asm md5 against Main 1c3c9cf; full `cargo test` 325 passed, 8 of them new in tests/slotfill.rs).
+"Issue one, subtract one" with per-MFMA budgets derived by the compiler instead of authored knobs (`dma_gap`, `spread_reloads`, ...). Opt-in sched token `slotfill` (Function::sched_opts, e.g. GemmConfig.sched = "rewait,slotfill"; the experiment switch `AMDC_SLOTFILL` used for the A/Bs below was removed in the 2026-11 cleanup). Off = no change at all (all 101 `amdc list` kernels have identical asm md5 against Main 1c3c9cf; full `cargo test` 325 passed, 8 of them new in tests/slotfill.rs).
 
 ## Algorithm
 
@@ -27,7 +27,7 @@ LEGALITY CONTRACT (opt-in): inside one barrier interval an LDS-DMA never writes 
 
 Without the knobs the kernel loses 13-14 %; slotfill brings it back and ends 0.4-0.6 % above the hand placement (also when it runs on top of the hand placement). `tools/gemm_gate.sh gemm_mxfp8_bs_v4_plain_sf`: BUILD / VERIFY strict (0 errors, 0 warnings, 0 unproven) / ACC 3 shapes / DET 3 identical md5 / PERF 7 interleaved processes: ours 3296 vs vendor 3298 TF/s = 0.999, GATE PASS. What the pass did in the loop: the 16-DMA burst became one DMA every 2-3 MFMAs over slots 1..31 (the derived equivalent of dma_gap) and the reloads stayed at their window starts (in-place reload after the last reader).
 
-## Experiment 2: FMHA v3 (port_gate, `AMDC_SLOTFILL=fmha_fwd_hd128_mxfp8_v3`)
+## Experiment 2: FMHA v3 (port_gate, then via `AMDC_SLOTFILL=fmha_fwd_hd128_mxfp8_v3`; historical)
 
 `_vs128`: asm unchanged (no region qualifies); `_t128` (vgpr 255 -> 245) and `_kvsplit` change. `tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3` PASS in both runs (BUILD, VERIFY strict, ACC16, ACC64 x 4 paths, DET, STRESS), PERF neutral within the run-to-run noise:
 
@@ -55,4 +55,4 @@ So slotfill is correct on FMHA v3 but does not help it (those kernels' placement
 
 ## Limits / next
 
-Spreading is per class and budget-driven, not hazard-aware beyond the graph (the hazard pass inserts nops afterwards); no occupancy / register-pressure model beyond `HOIST_SLOTS`; DMA latency window `DMA_SLOTS` is a constant. Enabled for `gemm_mxfp8_bs_v4` only (FMHA stays off: neutral). Other kernels: `sched: "rewait,slotfill"` or `AMDC_SLOTFILL`.
+Spreading is per class and budget-driven, not hazard-aware beyond the graph (the hazard pass inserts nops afterwards); no occupancy / register-pressure model beyond `HOIST_SLOTS`; DMA latency window `DMA_SLOTS` is a constant. Enabled for `gemm_mxfp8_bs_v4` only (FMHA stays off: neutral). Other kernels: `sched: "rewait,slotfill"` (`Function::sched_opts`).

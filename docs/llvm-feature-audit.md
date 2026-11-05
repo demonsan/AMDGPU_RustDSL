@@ -218,7 +218,7 @@ JSON 每条记录的字段：`path, ext, dir, kind(s), globalisel, n_run, mcpus,
 
 ### 8.1 Opcode 发射-汇编 sweep（`tools/llvm_opcode_sweep.sh`）
 
-- 覆盖：`kernel_by_name` 全部 kernel（含 10 个新增 `probe_llvm_*`）+ 28 组 `FMHA_OPT` / `AMDC_LOWER_OPTS` 组合 = **141 次运行**，
+- 覆盖：`kernel_by_name` 全部 kernel（含 10 个新增 `probe_llvm_*`）+ 28 组 `FMHA_OPT` / `AMDC_LOWER_OPTS` 组合（审计当时；这两个开关已在 2026-11 整理中删除）= **141 次运行**，
   **141/141 经 own 后端发射并由 clang 汇编为 gfx950 `.co`**。
 - MOp 变体：`mir.rs` 中 **108/114** 个变体出现在至少一次成功发射+汇编的最终 MIR 中；`llvm24.tbl` 行键覆盖 **97/112**。
 - 产出的 **90 个不同汇编助记符全部汇编通过**（含 MFMA/smfmac/scaled、buffer/lds/global、waitcnt 等）。

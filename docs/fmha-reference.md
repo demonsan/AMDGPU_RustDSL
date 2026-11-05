@@ -153,7 +153,7 @@ Default `fmha_fwd_hd128_mxfp8_t` now includes `kdlds,dbuf` (K scales staged thro
 ## 我们的实现状态（历史快照：第 75 轮，Main `8fec359`，tag `v2.2-round75-final`）
 
 > **当前状态**：出厂集已换成布局层 kernel `fmha_fwd_hd128_mxfp8_v3_*`（`crates/amdgpu-kernels/src/fmha/mod.rs`），旧手写集保留为
-> `fmha_fwd_hd128_mxfp8_legacy_auto`。最新数字见 [`current-status.md`](current-status.md) §4。下面的表格是第 75 轮旧手写集的认证快照。
+> `fmha_fwd_hd128_mxfp8_legacy_auto`（2026-11 整理中已删除）。最新数字见 [`current-status.md`](current-status.md) §4。下面的表格是第 75 轮旧手写集的认证快照。
 
 上面的内容是厂商 kernel 的已核实事实与 1:1 验收标准（保留不变）；本节记录第 75 轮时我们的实现做到了什么。完整数据在 `docs/archive/final-report.md`、`docs/current-status.md` 与 `docs/archive/status.md`。
 
@@ -179,7 +179,7 @@ Default `fmha_fwd_hd128_mxfp8_t` now includes `kdlds,dbuf` (K scales staged thro
 | `fmha_fwd_hd128_mxfp8_kvsplit` + `_kvsplit_combine8h`（另有 `combine` / `combine4` / `combine4h` / `combine16h`） | 序列并行 + 精确合并 | fp16 partial、LDS 转置 16 字节存储；`combine8h` 为默认合并 kernel（`docs/archive/kvsplit-design.md`、`docs/archive/kvsplit-results.md`） |
 | `fmha_fwd_hd128_mxfp8_t` | **冻结的精确参考实现** | 精确 recipe，输出 md5 作为不变量（`38e3200f…`）；`llvm-tail` 默认后端 |
 
-实验 kernel（`_vs5`、`_vs6`、`_vs9`、`_g2`、`_g3`、`_vsm` 等）与所有 `FMHA_OPT` 实验令牌（`biasacc`、`vpre2`、`p4`、`mubuf` / `mubufd`、`cut1`、`saddrlds`、`pmdead`、`eplds` / `epw` / `epdirect` 等）都是 opt-in；默认路径不受影响。已关闭路线及其一句归因见 `docs/archive/final-report.md` §6。
+实验 kernel（`_vs5`、`_vs6`、`_vs9`、`_g2`、`_g3`、`_vsm` 等）与所有 `FMHA_OPT` 实验令牌（`biasacc`、`vpre2`、`p4`、`mubuf` / `mubufd`、`cut1`、`pmdead`、`eplds` / `epw` / `epdirect` 等）已在 2026-11 整理中删除（`saddrlds` 成为 v3 `_t128` 的固定配置）。已关闭路线及其一句归因见 `docs/archive/final-report.md` §6。
 
 ### 与本文 §7.3 验收条目的关系
 

@@ -70,7 +70,6 @@ only the layout packing.
 ```bash
 # pack a GEMM kernarg buffer from the generated JSON
 python3 tests/hostgen/json_kernarg.py \
-    tests/gpu/generated_gemm/gemm_mxfp8_bs_v3_abi.json \
     --out /tmp/gemm_v3.karg \
     --set ptr_a=0x1000 --set ptr_b=0x2000 --set ptr_c=0x3000 \
     --set ptr_sfa=0x4000 --set ptr_sfb=0x5000 \

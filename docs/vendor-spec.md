@@ -5,6 +5,10 @@ Purpose: characterise the vendor (aiter) `fmha_fwd_hd128_mxfp8` gfx950 kernel pr
 Everything here is derived in this session from the code object and hardware counters on MI355X
 (gfx950), GPU 5, node 53. Branch `kernel-occ`, base `origin/Main`.
 
+> **Historical record.** The kernel names (`fmha_fwd_hd128_mxfp8_vs128`, `_t`, ...), `FMHA_OPT` tokens and asm md5s quoted below are those of
+> the measurement time; those kernels and switches were removed in the 2026-11 cleanup. The vendor facts themselves are unchanged. Current
+> kernels and numbers: [`current-status.md`](current-status.md).
+
 Evidence grades used below:
 
 * **Verified** - read directly from the disassembly / descriptor / counters (reproducible with the

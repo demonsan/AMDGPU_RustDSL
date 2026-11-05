@@ -103,7 +103,7 @@ switch and are still bit-identical to the hand path (same md5 table as above).
 The generator is kernel-agnostic; run it on the GEMM worktree after merging `origin/gemm-p4` locally:
 
 ```bash
-amdc gen-host gemm_mxfp8_bs_v3 gemm_mxfp8_bs_v4 --out tests/gpu/generated_gemm
+amdc gen-host gemm_mxfp8_bs_v4 --out tests/gpu/generated_gemm
 ```
 
 This emits a 96-byte `Args` matching the aiter `opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950`
@@ -116,7 +116,7 @@ Evidence on GPU 7, `GEMM_M=1280 GEMM_N=6144 GEMM_K=7168`, both kernels:
 
 | kernel | generated | hand | md5 generated == hand |
 |---|---|---|---|
-| `gemm_mxfp8_bs_v3` | `GEMM_OK` bad=0 | `GEMM_OK` bad=0 | `9ad0527dc3c39627520e6b36f0559677` |
+| `gemm_mxfp8_bs_v3`（已删除，历史） | `GEMM_OK` bad=0 | `GEMM_OK` bad=0 | `9ad0527dc3c39627520e6b36f0559677` |
 | `gemm_mxfp8_bs_v4` | `GEMM_OK` bad=0 | `GEMM_OK` bad=0 | `9ad0527dc3c39627520e6b36f0559677` |
 
 ## JSON schema + Python example

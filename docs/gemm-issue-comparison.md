@@ -1,4 +1,4 @@
-# GEMM issue-level comparison: vendor (aiter PR #6696 4-wave pin-AGPR) vs gemm_mxfp8_bs_v3/v4
+# GEMM issue-level comparison: vendor (aiter PR #6696 4-wave pin-AGPR) vs gemm_mxfp8_bs_v3/v4 (v3 removed in the 2026-11 cleanup; v4 is current)
 
 Setup: GPU 4 (MI355X), M=N=4096, K=8192, CTA 256x256, same process / same inputs (`tools/gemm_ref.sh` host). Tools: `tools/prof_gemm.sh` (rocprofv3 SQ counters, 3 passes, per-wave
 normalised, GEMM dispatches only) and `rocprofv3 --att` (thread trace of one wave: CU 1, SIMD 0, decoder `rocprof-trace-decoder 0.1.6`) aggregated with `tools/att_classes.py`.

@@ -1,5 +1,8 @@
 # LLVM tail integration ("our middle end + LLVM tail")
 
+> Sections 7-9 are a log of the integration work: the kernels (`fmha_fwd_hd128_mxfp8_t`, ...) and switches (`FMHA_OPT`, `AMDC_LOWER_OPTS`,
+> `AMDC_NO_PHYS_WAR`) they mention were removed in the 2026-11 cleanup; current state in [`current-status.md`](current-status.md).
+
 > **Current status (final).** Pinned LLVM: ROCm 10.1.0 / AMD LLVM 24.0.0git (dialect `llvm24`, default; `llc` built by `tools/llvm_build_llc.sh`); the `llvm20` dialect (ROCm 7.0.2) is also supported.
 > `tail_invariance` guarantees that the llvm-tail and own backends emit the same instruction streams modulo nops / waits / `delay_alu`. `cargo test`: 306 tests / 65 targets green
 > (numbers as in `docs/current-status.md`). 117 of the 123 MOps have rows in both `llvm20.tbl` and `llvm24.tbl`; the DMA, LDS-direct and `buffer_load ... lds` forms are own-only (kernels using them auto-select the own backend).

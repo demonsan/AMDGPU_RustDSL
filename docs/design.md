@@ -53,7 +53,7 @@ DSL(Rust) ─► typed IR（Op 84 种 / Stmt 47 种）─► IR 验证器 + gpu_
 - **控制流**：`begin_loop … end_loop` 是 do-while，循环变量以 `begin_loop(&[(DType, init)])` 声明、`set_var` 更新（`var_lint` 检查单赋值与作用域）；`begin_if` 是 **wave 级**分支（对 `vcc` 的 any 判断，**没有 exec 掩码**），因此体内整 wave 执行。
 - **Uniformity**：lowering 的 `uniform_analysis` 判定波内一致的整数值与循环变量，落入 SGPR（`scalarize`；`scalarize2` 另把一致的 `min`、一致比较上的 `select`（`s_cmp` + `s_cselect`）与 `readfirstlane` 结果留在 SGPR；`waveuni` 把 `tid >> 6` 视为一致），其余走 VGPR。`s_operand` 对非一致值报错而不是静默降级。
 - **指令族**：MFMA（scaled 32x32x64 f8f6f4 的累加 / zero-C / **C 操作数** 三形式；scaled **16x16x128** f8f6f4（op_sel 选 E8M0 字节）；AGPR（acc_cd）形式；**unscaled** 同三形式；f16/bf16；`v_smfmac`）、VALU（int/fp、`pk_add/mul/sub`、`perm`、`permlane32_swap`、`pknorm`、`scalef32`/`cvt_pk_fp8` 半写、`exp/rcp/log`、`max3`、`readfirstlane`）、内存（见 §9）、同步（`barrier`、`wait_vm/lds`、`fence_release/acquire` 与 coherent/write-through 访问）。
-- **实验面**：`FMHA_OPT` token 做 A/B（`FMHA_OPT_SCOPE` 把 token 限定到别名 kernel 做同轮对照）；每个优化与负结果都可复现。
+- **实验面**：A/B 在独立分支上用临时开关做，结论（含负结果）写进文档；采用的优化成为 kernel profile 的固定配置，未采用的开关不留在主线（2026-11 整理）。
 
 ### 3.1 库分层（路线 B 之后）
 

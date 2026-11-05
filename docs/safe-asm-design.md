@@ -178,7 +178,7 @@ tests, 18 compile-fail cases, `pv_phase`).
 
 ### First real use: the `_vs128` row-sum chain
 
-`FMHA_OPT=<default recipe>,safeasm` routes the four in-place SMFMACs of the per-tile row sum (`smfv`) through `examples::rowsum_var_block()` and `Stmt::VarAsm` (12 statements replace 48 `VarSmfmac`). Result: the emitted assembly is BYTE-IDENTICAL to the DSL path (md5 equal), 15 shapes pass 3 times (REF_OK 15/15; at 64 rows the same 12/3 as the normal path), 358.2 TFLOP/s. Default behaviour is unchanged (the flag is opt-in).
+(Historical: the `FMHA_OPT` switch and the legacy kernel were removed in the 2026-11 cleanup; the bridge itself remains.) `FMHA_OPT=<default recipe>,safeasm` routed the four in-place SMFMACs of the per-tile row sum (`smfv`) through `examples::rowsum_var_block()` and `Stmt::VarAsm` (12 statements replace 48 `VarSmfmac`). Result: the emitted assembly is BYTE-IDENTICAL to the DSL path (md5 equal), 15 shapes pass 3 times (REF_OK 15/15; at 64 rows the same 12/3 as the normal path), 358.2 TFLOP/s. Default behaviour is unchanged (the flag is opt-in).
 
 
 ## Generated opcode templates and coverage (round 3)

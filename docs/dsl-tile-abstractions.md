@@ -1,6 +1,6 @@
 # DSL tile 抽象层设计（`amdgpu_tile`）
 
-> 状态：**已实现**（`crates/amdgpu-tile/src/`；用它写成的 `fmha_fwd_hd128_mxfp8_dsl_*` 曾是出厂集，现保留为 `fmha_fwd_hd128_mxfp8_dsl_auto` 供 A/B）。本文是 Phase 1 设计稿 + 实现路线（分支 `dsl-tile`）。作者：backend-llvm-tail（DSL 架构 + 库实现）。
+> 状态：**已实现**（`crates/amdgpu-tile/src/`；用它写成的 `fmha_fwd_hd128_mxfp8_dsl_*` 曾是出厂集，2026-11 整理中删除；v3 出厂集仍复用其 LdsPlan / Pipeline / softmax / combine 组件）。本文是 Phase 1 设计稿 + 实现路线（分支 `dsl-tile`）。作者：backend-llvm-tail（DSL 架构 + 库实现）。
 > 目标（用户原话）："我专门开 dsl 出来，就是为了让你增加一些抽象来简化上层 kernel 的编写负担。不是把 asm 包一层隐藏起来。"
 > 验收（用户批准）：四条出厂 FMHA fwd 路径（`_vs128`、`_t128`、`_kvsplit`、`_kvsplit_combine8h`）全部在新抽象上重写；性能与当前手写 kernel 相差 ≤ ~3%；
 > 数值过现有门禁（15 形状、64 行 bad=0、确定性、split 形状重复启动压力）；不要求 bit-identical；`amdc gpu-verify --shipped --strict` 0 错误；`cargo test` 绿；
@@ -32,7 +32,7 @@
 | `fmha_t_build`（kernels.rs:21004） | 656 B kernarg 的 30 个 `arg`、Q 片段载入、lane 地址（`kfx`/`trx`/`swzw`）、GQA、KV-split 区间、角色分裂、短/长序列两份代码 | ~640 行 | 全部是手写地址算术（`and/lshr/xor/shl/mul/add`） |
 | `fmha_abi_contract`（:20933） | `ka_range/ka_is/grid_is/arg_tensor` | 57 行 | **形状声明被手工展开**成 30 条合同 |
 | `fmha_vs_tiles`（:20914） | `lds_ring/lds_tile/lds_private/lds_alias` | 17 行 | **LDS 布局被手工编号**（69632、86016 这类魔数在 role 里又重复出现） |
-| `emit_fmha_vs128_role`（:9602–11292） | DMA、ring、QK、softmax/回滚、P 转换、PV、行和、三种 epilogue | ~1690 行 | 每个 lane 地址、每条 MFMA、每个 barrier、每个 `tile_produce/consume` 都手写；80% 是 `FMHA_OPT` 实验分支 |
+| `emit_fmha_vs128_role`（:9602–11292） | DMA、ring、QK、softmax/回滚、P 转换、PV、行和、三种 epilogue | ~1690 行 | 每个 lane 地址、每条 MFMA、每个 barrier、每个 `tile_produce/consume` 都手写；80% 是当时的 `FMHA_OPT` 实验分支（历史） |
 | `emit_fmha_t128_role`（:16117–17060） | 同一算法的单组/3 槽/单 barrier 版本 | ~940 行 | 与 vs128 大段重复（`swz_s` 函数在文件里被复制了 6 次） |
 | `..._kvsplit_combine8h`（:20708） | split 合并 | 80 行 | 在线 max/rescale 手写 |
 
@@ -425,7 +425,7 @@ impl Vs128Body<'_> {
 
 * **D1 编译策略按名字选择**：`amdgpu-compiler/src/lib.rs:74-127` 用名字前缀/后缀决定 lowering 选项（scalarize/retarget2/imm/sgpr/addrfold）与调度器预设（reorder / alu_across_barrier / max_vgprs 248）。新 kernel 若叫 `..._vs128_tile` 会落到错误的预设（`ends_with("_vs128")` 失败 → `reorder=false`）。建议：在 `Function` 上加一个可选字段 `compile_profile: Option<&'static str>`（`"vs128" | "t128" | "kvsplit" | "combine"`），编译器优先用它，名字匹配作为回退；或新 kernel 名用 `fmha_fwd_hd128_mxfp8_vs_<x>_vs128` 这种同时满足前缀/后缀的形式（不推荐）。需要 lead 拍板（改 Function 结构属于共享代码）。
 * **D2 `_t128` 目前没有 tile 标记**（不在 `fmha_vs_tiles` 列表里），库会自动加标记——验证器对 3 槽 select 索引的环可能需要 `tile_trust_periodic`（进账本，+1 trusted）。这是安全**增强**，但证书计数会变。
-* **D3 `FMHA_OPT` 实验分支不移植**：新 kernel 只实现出厂默认配方（`kddma`、`smfv`、`q0reg/q1reg`、vsx 双副本、`dwordx2` 输出、fp16 partial）。实验开关如需保留，作为库组件的配置参数而不是 kernel 里的 `if`。
+* **D3 实验分支不移植**（当时的 `FMHA_OPT` 开关已全部删除）：新 kernel 只实现出厂默认配方（`kddma`、`smfv`、`q0reg/q1reg`、vsx 双副本、`dwordx2` 输出、fp16 partial）。实验开关如需保留，作为库组件的配置参数而不是 kernel 里的 `if`。
 * **D4 命名**：新 kernel 暂定 `fmha_fwd_hd128_mxfp8_{vs128,t128,kvsplit,kvsplit_combine8h}` 的 `_dsl` 变体并行存在，过门禁后切换出厂映射（md5 不变量在切换前不动）。
 
 ## 12. 实现路线（分支 `dsl-tile`）

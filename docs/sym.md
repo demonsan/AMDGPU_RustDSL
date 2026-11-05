@@ -50,7 +50,7 @@
 | 检查 | 结果 |
 |---|---|
 | `cargo test` | 全绿（新增：`gv_bits`、布局 `can_prove_le`、`sym_branch`：一致条件给出界、`n < 65` 不足以证明、逐 lane 条件不被采信） |
-| 严格证书（`--shipped` / `--legacy`（已移除） / GEMM v3 / v4）与每个 kernel 的 proven 计数 | 与 Main `41a32e5` 逐行相同（32 行） |
+| 严格证书（`--shipped` / 当时的 `--legacy` 与 GEMM v3（均已删除）/ GEMM v4）与每个 kernel 的 proven 计数 | 与 Main `41a32e5` 逐行相同（32 行） |
 | `gpu-verify --all`（101 个 kernel 的错误数与 proven 计数） | 与 Main 逐行相同：分支事实没有削弱任何证明；现有 kernel 没有依赖它的证明，因此也没有新增 |
 | 全部 kernel 的汇编 md5 | 与 Main 逐字节相同 |
 

@@ -351,8 +351,7 @@ let stage_end = |b: &mut FnBuilder, kd: Option<ValueId>, kd_slot: ValueId| {
 };
 ```
 
-**MUBUF 形式**（`buffer_load … lds`，带硬件范围检查的描述符）也写在同一个函数里，但是**可选实验**（`FMHA_OPT=mubuf/mubufd`，
-默认关闭，`kernels.rs:9774-9790`、`:9852-9881`）：
+**MUBUF 形式**（`buffer_load … lds`，带硬件范围检查的描述符）当时作为**可选实验**写在同一个函数里（`FMHA_OPT=mubuf/mubufd`，默认关闭；该实验与开关已在 2026-11 整理中删除，下面的片段是历史记录）：
 
 ```rust
 // crates/amdgpu-kernels/src/probes/mod.rs:9781-9790 与 :9869-9873（节选）
@@ -385,7 +384,7 @@ b.end_if();
 
 **如果写错了会怎样**：
 - DMA 目的地超出声明段 → `GV-LDS-OOB`；超出所标 tile → `GV-TILE-ESCAPE`。
-- 去掉夹紧（例如前奏里诊断开关 `FMHA_ABLATE=noclamp` 去掉的 Q 行夹紧，`kernels.rs:21116-21117`）→ 行号上界变成 `256·grid_x − 1`，可能超过 `S − 1`，地址证不出上界 → `GV-GLB-OOB`。
+- 去掉夹紧（例如去掉 Q 行夹紧）→ 行号上界变成 `256·grid_x − 1`，可能超过 `S − 1`，地址证不出上界 → `GV-GLB-OOB`。
 - 描述符 `num_records` 夸大 → `GV-BUF-OVER`（`gpu_verify.rs:1193-1212`；攻击样例 `gv_attack_desc_over`，`kernels.rs:22395-22408`）。
 - 忘了 `wait_vm(0)` 就靠 barrier 发布 → `GV-TILE-STALE|GV-PROTO-NO-COMPLETION`（§4 有完整对照）。
 - 诚实说明：opt-in 的 `mubuf/mubufd` 变体**目前未认证**（会报 `GV-BUF-OVER`/`GV-GLB-OOB`），它们不在出厂路径上
@@ -700,7 +699,7 @@ O1 完成先于发布、O2 发布先于读、O3 读完先于覆写、O4 代际�
 ### (i) 可选：safe-asm 窗口桥（`Op::Asm` / `Stmt::VarAsm`）
 
 DSL 也能嵌入一段"手写汇编"，但手写部分同样是**安全 Rust**（`crates/amdgpu-safeasm`，同样 `#![forbid(unsafe_code)]`）。
-行和那 4 条 smfmac 可以换成 safe-asm 写的等价块（`FMHA_OPT=safeasm`，非默认）：
+行和那 4 条 smfmac 可以换成 safe-asm 写的等价块（当时由 `FMHA_OPT=safeasm` 打开，非默认；该开关已删除，桥本身 `Op::Asm` / `Stmt::VarAsm` 仍在）：
 
 ```rust
 // crates/amdgpu-kernels/src/probes/mod.rs:10555-10560
@@ -728,7 +727,7 @@ pub fn rowsum_var_block() -> AsmBlock {
 }
 ```
 
-（更大的窗口 `pv_window_block` / `pv_qk_window_block` 只在 `_vs5` 加 `FMHA_OPT=winc/winm` 时接入，`kernels.rs:10594-10601`、`:20646-20654`。）
+（更大的窗口 `pv_window_block` / `pv_qk_window_block` 曾在已删除的 `_vs5` 实验变体中接入，历史记录。）
 
 **用到的特性**：`Seq`（安全的指令序列构造器）、`Vgpr<N>`（宽度是类型参数）、`Ready<'a, N>`（"这个寄存器现在可被矩阵指令读"的**借用证明**）、
 `Mfma/Smfmac<'a, OP>`（在途矩阵运算的 token）、`Pending<T>`（在途加载的 token）。
@@ -789,8 +788,8 @@ pub fn rowsum_var_block() -> AsmBlock {
 certificate: N trusted assumes (a assume_trusted, p tile_trust_periodic, r region_trust), M trusted contracts, K unproven
 ```
 
-出厂 v3 四个 kernel `--shipped --strict` 的合计：**24 trusted assumes / 100 trusted contracts / 0 unproven**；旧手写集 8 个 kernel `--legacy --strict`：44 / 216 / 0（`current-status.md` §2.1）。
-"认证" = **K = 0，且评审接受这 44 + 216 条**。评审只需要读这些行（例如上文 `kvh` 的那条 `assume_trusted` 及其理由）。
+出厂 v3 四个 kernel `--shipped --strict` 的合计：**24 trusted assumes / 100 trusted contracts / 0 unproven**（`current-status.md` §2.1）。
+"认证" = **K = 0，且评审接受这 24 + 100 条**。评审只需要读这些行（例如上文 `kvh` 的那条 `assume_trusted` 及其理由）。
 
 ---
 
@@ -934,10 +933,10 @@ bash tools/container/cargo.sh run --bin amdc -- emit fmha_fwd_hd128_mxfp8_vs128 
 # 2) 用官方汇编器校验编码并生成 code object
 clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o vs128.co vs128.s
 
-# 3) 严格的 GPU 语义证书（出厂 4 个 kernel；任一 Error → 退出码 1；--legacy 查旧手写集）
+# 3) 严格的 GPU 语义证书（出厂 4 个 kernel；任一 Error → 退出码 1）
 bash tools/container/cargo.sh run --bin amdc -- gpu-verify --shipped --strict
 #    单个 kernel、连 Info（含每条 TRUSTED）一起看：
-bash tools/container/cargo.sh run --bin amdc -- gpu-verify fmha_fwd_hd128_mxfp8_vs128 -v
+bash tools/container/cargo.sh run --bin amdc -- gpu-verify fmha_fwd_hd128_mxfp8_v3_vs128 -v
 ```
 
 `gpu-verify` 的输出形状（`amdc/src/main.rs:181-207`）：每个 kernel 一行

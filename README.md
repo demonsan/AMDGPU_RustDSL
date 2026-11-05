@@ -132,7 +132,7 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 - `llvm20` 方言的表行是 `llvm24` 的拷贝，仅 pinned `llvm24` 的 `llc` 做过机器验证。
 - DMA / LDS 直达 / `buffer_load … lds` 等为 own-only；使用它们的 kernel 自动选 own 后端。
 - `_t` kernel 有 14 条 loop-var lint 警告（wave 级分支的潜伏风险，已冻结并记录，不是活跃 bug）。
-- `FMHA_OPT` 实验 token 都是 opt-in（`FMHA_OPT_SCOPE` 可把它们限定到别名 kernel 做同轮 A/B）；默认路径不含任何 opt-in 负结果项。
+- 编译策略按 kernel profile 固定（`crates/amdgpu-compiler/src/lib.rs`）；实验开关、别名 kernel 与负结果变体已在 2026-11 整理中删除（结论在 `docs/archive/`）。
 
 ## 许可
 

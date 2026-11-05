@@ -40,7 +40,7 @@ amdgpu-isa     (atom 描述、typestate；依赖 layout)        amdgpu-dsl (IR +
      ↑                                                        ↑
      └──────────────── amdgpu-tile (依赖 layout + isa + dsl) ──┘
                               ↑
-              amdgpu-kernels (kernels.rs 旧 builder + fmha_tile.rs + 新 kernel)
+              amdgpu-kernels (fmha/ gemm/ mlp/ probes/ verifier_cases/ + 注册表)
                               ↑
               amdgpu-compiler (lower/RA/sched/gpu_verify/emit)   amdgpu-host (合同 → 主机)
                               ↑
@@ -61,7 +61,7 @@ amdgpu-isa     (atom 描述、typestate；依赖 layout)        amdgpu-dsl (IR +
 | `tile/pipeline.rs`、`tile/lane.rs` | `amdgpu-tile::pipeline`、`::lane` | 不变（这是我们相对 FlyDSL/OPUS 的增值：节拍 + 协议标记自动化） |
 | `tile/reduce.rs`、`softmax.rs`、`epilogue.rs`、`components.rs`、`fmha.rs` | `amdgpu-tile::{reduce,softmax,epilogue,components,fmha}` | 改为基于"带布局的 fragment"：KeyMask 由 `layout_C_tv.idx2crd` 推出；epilogue 用 `make_tiled_copy_C` |
 | `amdgpu-safeasm`（Seq、Vgpr<N>、Ready、Pending、Mfma token、Pw） | `amdgpu-isa`（重命名或作为其子模块） | 新增 atom 描述表、等待队列/DMA typestate（§4） |
-| `kernels.rs`、`fmha_tile.rs` | `amdgpu-kernels`（新 crate，可选） | 降低 `amdgpu-dsl` 的编译负担；旧 builder 保留为对照 |
+| `kernels.rs`、`fmha_tile.rs` | `amdgpu-kernels` | 已完成（2026-11 整理）：探针在 `probes/`，`fmha_tile.rs` 与旧 builder 已删除；实际 crate 布局见 [`current-status.md`](current-status.md) §3 |
 
 ---
 
@@ -318,7 +318,7 @@ OPUS 的 `load_if/store_if` 对发射空间加谓词；FlyDSL `copy(..., pred=)`
 
 ## 7. 对照示例：dsl_vs128 的 QK/PV 与 K/V 暂存
 
-### 7.1 今天（`fmha_tile.rs` + `tile::fmha::KvRing` + `tile::frag`，节选）
+### 7.1 当时（已删除的 `fmha_tile.rs` + `tile::fmha::KvRing` + `tile::frag`，节选，历史）
 
 ```rust
 // KvRing::new —— LDS 计划 + 读取器 + 拷贝，每个读取器/拷贝内部是手推的 lane 公式
@@ -459,7 +459,7 @@ crate 依赖：`amdgpu-layout`（零依赖）← `amdgpu-isa` ← `amdgpu-tile`�
 
 - swizzle 基址按"高位 + ((低位 ^ s ^ 静态异或) << dst_lo)"生成（与手写 `kfx`/`trx` 同形），区间分析紧致；纯 XOR 形式会让私有暂存区的证明失败。
 - `Ctx::bind` 对一个 kernel 内所有 lane 表达式做 CSE：v3 的 lane 初始化比手写公式少 60 余条指令。
-- `_t128` 默认采用 SADDR 形式的 LDS-DMA（标量张量基址 + 每 lane 32 位偏移），两轮同轮 A/B 布局中位数 +1.8% / +2.1%；`_vs128` / `_kvsplit` 上为 −0.2..−1.4%，保持 opt-in（`FMHA_OPT=saddrlds`，可用 `FMHA_OPT_SCOPE` 限定到别名 `fmha_fwd_hd128_mxfp8_v3s_*` 做同轮 A/B）。
+- `_t128` 默认采用 SADDR 形式的 LDS-DMA（标量张量基址 + 每 lane 32 位偏移），两轮同轮 A/B 布局中位数 +1.8% / +2.1%；`_vs128` / `_kvsplit` 上为 −0.2..−1.4%，不使用（历史记录：所述开关 / 别名 / 旧 kernel 已在 2026-11 仓库整理中删除，当前状态见 [`current-status.md`](current-status.md)）。
 
 ### 9.4 门禁（GPU 6，`tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3`）
 
@@ -467,7 +467,7 @@ crate 依赖：`amdgpu-layout`（零依赖）← `amdgpu-isa` ← `amdgpu-tile`�
 
 对 dsl（`SHIP_REF=fmha_fwd_hd128_mxfp8_dsl`，同轮 PERF）：679.0 vs 687.2、446.4 vs 445.1、布局中位数 449.0 vs 447.3、1408.0 vs 1413.8、1970.9 vs 1967.8、`_t128` 布局中位数 1002.4 vs 997.9（SADDR 之前）→ PASS。
 
-SADDR A/B（`FMHA_OPT=saddrlds FMHA_OPT_SCOPE=v3s`，候选 `v3s` / 基线 `v3`，两轮）：
+SADDR A/B（当时的 `FMHA_OPT=saddrlds FMHA_OPT_SCOPE=v3s`，候选 `v3s` / 基线 `v3`，两轮）（历史记录：所述开关 / 别名 / 旧 kernel 已在 2026-11 仓库整理中删除，当前状态见 [`current-status.md`](current-status.md)）：
 
 | 行 | 第 1 轮 | 第 2 轮 |
 |---|---|---|
@@ -482,12 +482,12 @@ SADDR A/B（`FMHA_OPT=saddrlds FMHA_OPT_SCOPE=v3s`，候选 `v3s` / 基线 `v3`�
 
 | kernel | md5（前 8 位） | 说明 |
 |---|---|---|
-| `fmha_fwd_hd128_mxfp8_v3_vs128` | `68d2832b` | |
-| `fmha_fwd_hd128_mxfp8_v3_t128` | `e4c7e75d` | SADDR DMA + `edgepad` + `salubr`（之前 `f5a43b09`、`985d7a02`） |
-| `fmha_fwd_hd128_mxfp8_v3_kvsplit` | `e4fc18b1` | |
-| `fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h` | `24a95a51` | 代码与 dsl combine 相同，仅名字不同 |
-| `fmha_fwd_hd128_mxfp8_dsl_vs128` / `_t128` | `438452c1` / `ef706387` | 上一版，保留 A/B，不变 |
-| `fmha_fwd_hd128_mxfp8_vs128` / `_t128`（legacy） | `00d34086` / `f83c02ce` | 手写旧集，保留 A/B，不变 |
+| `fmha_fwd_hd128_mxfp8_v3_vs128` | `763142f9` | v7.0（标量死值消除后；此前 `68d2832b`、`df33f835`） |
+| `fmha_fwd_hd128_mxfp8_v3_t128` | `91b26e5d` | SADDR DMA + `edgepad` + `salubr`；v7.0（此前 `e4c7e75d`、`f5a43b09`、`985d7a02`） |
+| `fmha_fwd_hd128_mxfp8_v3_kvsplit` | `e1fe92a4` | v7.0（此前 `e4fc18b1`、`f6709cd2`） |
+| `fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h` | `24a95a51` | |
+
+上一版 `dsl_*` 集与旧手写集（当时作 A/B 对照）已在 2026-11 整理中删除。
 
 ### 9.6 编译器与验证器的配套改动（为 P3/P4 服务）
 
@@ -495,7 +495,7 @@ SADDR A/B（`FMHA_OPT=saddrlds FMHA_OPT_SCOPE=v3s`，候选 `v3s` / 基线 `v3`�
 - `Pipeline::vm_inflight` 与计数版 `vmcnt(n)`：协议检查器记录每个 `wait_vm` 的计数，DMA 在"其后至少有 n 条更新的 LDS-direct DMA"时才算完成；读下一 tile 的 FMHA 窗口用 `vm_inflight > 0` 会被拒绝。
 - `gpu_verify` 的可能位（possible-bits）规则：`x ^ y`、`x & m` 在 bit31 可证为 0 时收窄到 `[0, mask]`（`(row << 7) ^ (chunk << 4)` 证明 ≤ 2032）；声明的最大值（`ka_range` / `ka_set` / `sym_range`）参与多项式非负判定（盒子检验）。均附攻击测试（可能为负的操作数、重叠和的进位、真实越界、无界 kernarg）。
 
-### 9.7 `edgepad` / `salubr` A/B（`FMHA_OPT_SCOPE=v3s`，候选 `v3s` / 基线 `v3`，GPU 6）
+### 9.7 `edgepad` / `salubr` A/B（当时的 `FMHA_OPT_SCOPE=v3s`，候选 `v3s` / 基线 `v3`，GPU 6；历史记录）
 
 | 行 | edgepad + salubr | 仅 edgepad | 仅 salubr |
 |---|---|---|---|
@@ -505,4 +505,4 @@ SADDR A/B（`FMHA_OPT=saddrlds FMHA_OPT_SCOPE=v3s`，候选 `v3s` / 基线 `v3`�
 | B4H8S2048 / B1H8S8192 | 1402.6 / 1418.2、1960.2 / 1975.8 | 1411.4 / 1415.8、1963.6 / 1968.3 | 1411.9 / 1426.4、1955.9 / 1965.1 |
 | `_t128` 布局中位数 | **1051.2 / 1017.3（+3.3%）** | 1032.9 / 1026.2（+0.7%） | 1060.1 / 1038.6（+2.1%） |
 
-结论：两项一起只在 v3 `_t128` 默认打开（md5 `e4c7e75d`）；采用后全套门禁（对旧手写集）PASS，`_t128` 布局中位数 1061.95 vs 1023.06。其余 kernel 不变。
+结论：两项一起只在 v3 `_t128` 默认打开（当时 md5 `e4c7e75d`）；采用后全套门禁（对当时的旧手写集）PASS，`_t128` 布局中位数 1061.95 vs 1023.06。其余 kernel 不变。

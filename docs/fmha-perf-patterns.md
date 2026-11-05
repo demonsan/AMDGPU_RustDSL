@@ -251,8 +251,8 @@
 
 ### P31 硬件 hazard（正确性必需）
 - **VMEM 宽存储数据 WAR**：`global_store_dwordx4`/`buffer_store_dwordx4` 发射后 2 个等待态内 VALU 改写其数据 VGPR 会写坏未读数据（LLVM `has12DWordStoreHazard`）。`STORE_DATA_WAIT=3` slot（H:375-382，H:496-506、H:573-579）。
-  出厂效果：只有 `_kvsplit` +4 `s_nop`（180 vs 176），其余 byte-identical；不修时 ~5% 启动（`epw` 下 97%）损坏 fp16 Ohat 首 dword（VS §7.11、S.r69）。回归：tools/ohat_repro.sh（已在 2026-11 清理中删除） 300 次 + `FMHA_OPT=eplds,epw` 100 次干净。A/B：`AMDC_NO_PHYS_STORE=1`。
-- **物理 WAW**：结果已死的 MFMA 的目的寄存器被 RA 分给新值，MFMA 19/21 个等待态后落笔覆盖（H:398-406、H:507-534，跨基本块传播 H:420-455）。现象：`biasacc,vpre` 6 次 6 个 md5（S.r66）。A/B：`AMDC_NO_PHYS_WAW=1`。出厂 kernel 上的单独代价未测。
+  出厂效果：只有 `_kvsplit` +4 `s_nop`（180 vs 176），其余 byte-identical；不修时 ~5% 启动（`epw` 下 97%）损坏 fp16 Ohat 首 dword（VS §7.11、S.r69）。回归：tools/ohat_repro.sh（已在 2026-11 清理中删除） 300 次 + `FMHA_OPT=eplds,epw` 100 次干净。（当时可用 `AMDC_NO_PHYS_STORE=1` A/B；该开关已在 2026-11 整理中删除，padding 恒开。）
+- **物理 WAW**：结果已死的 MFMA 的目的寄存器被 RA 分给新值，MFMA 19/21 个等待态后落笔覆盖（H:398-406、H:507-534，跨基本块传播 H:420-455）。现象：`biasacc,vpre` 6 次 6 个 md5（S.r66）。（当时可用 `AMDC_NO_PHYS_WAW=1` A/B；开关已删除。）出厂 kernel 上的单独代价未测。
 - **MFMA SrcC WAR**：在途 MFMA 的累加器源（scaled 21 / 其他 12 等待态；SMFMAC 读 A/B/idx 多拍）不得被改写（H:548-572）。
 - 其他已知正确性约束：SMFMAC 后 17 态 padding（S.r72）、VALU→MFMA 2 态、MFMA 结果 20 态（safe-asm 规则）。
 - **库要求**：所有代码经编译器正常流水线（不得绕过 `pad_physical_war`）；若库引入新的宽存储/新的 MFMA 目的复用模式，必须跑 `phys_waw`/`hazard_*` 测试与 ohat 压力。
@@ -339,7 +339,7 @@
 - `ref_host` 从名字里的 `combine8` 推断每线程元素数（`port_gate.sh` 注释）。
 - builder 内的 `VS_MODE` 全局 atomic 与 `VS_CORR_FORCE`（K:19568-19587）是**构建期**状态切换（决定 dma/dbuf/kdlds 与 LUT 副本），库若复用旧 builder 片段必须保持同样的 set/reset 顺序。
 
-### 5.2 `FMHA_OPT` 语义
+### 5.2 `FMHA_OPT` 语义（历史：旧手写 builder 的开关，已随旧 kernel 在 2026-11 整理中删除）
 - 默认串 `cvt4,pksub,lazy,msum,permlane,kdlds,dbuf,lacc1,psh2,svpk,svcorr,swz`（K:19547）；**设置 FMHA_OPT 会整串替换默认**（S.r65/67 的 `qdw` 陷阱）。
   `_vs128` 实际依赖的默认开项是由 `!no*` 形式给出的：`kddma`、`smfv`、`q0reg/q1reg`、`rbtrim`、`vsx`、`p16`，以及 VS_MODE 强制的 `dma/dbuf/kdlds`；`cvt4,pksub,lazy,msum,permlane,lacc1,psh2,svpk` 不被 `_vs128/_t128` 读取（只服务 `_t/_sv`）。
 - 库的 parity 目标 = **无 FMHA_OPT 环境变量**时的构建。
@@ -353,7 +353,7 @@
 ## 6. 未确认 / 未测项（诚实清单）
 
 - XOR swizzle 在 `_vs128` 上的单独性能贡献：未测（只有 `_t` 的「冲突 -98%、速度不变」）。
-- 物理 WAW padding 对出厂 kernel 的指令/性能影响：文档未单列（`AMDC_NO_PHYS_WAW=1` 可 A/B），未测。
+- 物理 WAW padding 对出厂 kernel 的指令/性能影响：文档未单列，未测（A/B 开关已删除）。
 - 早期 `nobar1/nobar2` 的符号：S.r50（带 setprio）为 +3%，S.r61 addendum 称「-9% each earlier」，原始数据未找到；以 `nobar` 的 -3.5..-7% 为准。
 - ones 块 / Q0/Q1 LDS 写在默认配方下不被读取：删掉它们的影响未测（预计中性，但会改变 prologue 调度，需重测）。
 - KV-split 前置全体 barrier（`1d9baea`，2026-10-31）的性能影响：未单独测量。

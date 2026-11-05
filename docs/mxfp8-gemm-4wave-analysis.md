@@ -325,7 +325,7 @@ hipModuleLaunchKernel(fn, N/256, M/256, 1, 256, 1, 1, 0, stream, nullptr, cfg);
 | kernel | strict verify | 正确性 | 确定性 | 4096×4096×8192 TFLOP/s（交错中位数） |
 |---|---|---|---|---|
 | gemm_mxfp8_bs_v4 | 0 错误 0 警告，3 trusted assumes，19 contracts，0 unproven | GEMM_OK ×3 形状（vendor 同样） | 3/3 md5 一致 | **3064 vs vendor 3237 = 0.947** |
-| gemm_mxfp8_bs_v3 | 同上 | GEMM_OK ×3 | 3/3 | 2984 vs 3236 = 0.922 |
+| gemm_mxfp8_bs_v3（已删除） | 同上 | GEMM_OK ×3 | 3/3 | 2984 vs 3236 = 0.922 |
 
 trust ledger：pipeline 的 tile 计数器（`assume_trusted`）+ XCD raster 置换的两个上下界（`assume_trusted`，理由写在代码里）。无 tile/region trust。
 

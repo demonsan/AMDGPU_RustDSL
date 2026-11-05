@@ -70,7 +70,7 @@ zero-cost permutations: every lane's (query, key) multiset is exactly its S mult
 **In the FMHA.** `amdgpu_kernels::fmha::attention_orientation()` runs the search and asserts that the winner is the orientation the builder
 implements. The QK, Q-load and O-store atoms are taken from it.
 
-**Acceptance check.** `amdc emit` of the four v3 FMHA kernels gives assembly byte-identical to Main 1c3c9cf:
+**Acceptance check (at the time).** `amdc emit` of the four v3 FMHA kernels gave assembly byte-identical to Main 1c3c9cf (historical md5s; the v7.0 values are in [`current-status.md`](current-status.md)):
 
 | kernel | md5 (both builds) |
 |---|---|
@@ -246,6 +246,6 @@ of one 8-dword operand, so there are no `v_mov` copies and no immediate `vmcnt` 
 | 65536 | **20.2 µs** (852 TF/s) | 33.3 µs | 1.65× | 22.8 µs |
 | 262144 | **54.1 µs** (1270 TF/s) | 96.6 µs | 1.79× | 82.4 µs |
 
-**slotfill** (sched, origin/slotfill, via `AMDC_SLOTFILL=mlp_fp8_ws` on a temporary merge): the assembly of all three ws kernels is
+**slotfill** (sched, origin/slotfill, via the then-existing `AMDC_SLOTFILL=mlp_fp8_ws` switch on a temporary merge; the switch was removed in the 2026-11 cleanup, `slotfill` is now a sched token): the assembly of all three ws kernels is
 unchanged, and timing is identical (55.2 vs 55.1 µs fused at M = 262144). The weight-stationary loop body already interleaves its operand
 reads with the MFMAs, and the X prefetch is the only VMEM traffic in the loop. Not adopted.
