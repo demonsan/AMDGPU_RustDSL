@@ -69,90 +69,16 @@ pub struct KvRing3 {
     /// the K-scale words: lane (j, h) reads word j + 32 s (both lane halves read the same word: a broadcast TV layout)
     pub kdpart: LdsPart,
     pub mma: TiledMma,
-    /// MUBUF form of the K / V DMA (`Vs128Cfg::bufdma`): SGPR per-tile advance, loop-invariant voffsets
+    /// MUBUF form of the K / V DMA (`_vs128`): SGPR per-tile advance, loop-invariant voffsets
     pub buf: Option<(crate::dma::BufForm, crate::dma::BufForm)>,
-    /// the padded vendor image's K / V DMA (`KvRing3::new_cfg(.., pad = true)`)
-    pub pad_dma: Option<(PadDma, PadDma)>,
-}
-
-/// Bytes of one padded K / V tile: 16 runs of 1040 bytes.
-pub const PAD_TILE: i64 = 16 * 1040;
-
-/// The padded vendor image of a [128 keys x 128 bytes] tile: key r, byte d -> 1040 (r / 8) + 512 (d / 64) + 64 (r % 8) + d % 64.
-pub fn kv_view_pad() -> ComposedLayout {
-    ComposedLayout::plain(make_layout(tup![tup![8, 16], tup![64, 2]], tup![tup![64, 1040], tup![1, 512]]))
-}
-
-/// The padded image's DMA (MUBUF, the vendor form): wave w of the 4-wave producer group writes runs 4 w + q (q < 4); lane i of run n fetches key
-/// 8 n + (i % 32) / 4, bytes 64 (i / 32) + 16 (i % 4) - which lands at 1040 n + 16 i, i.e. lane-contiguous, no swizzle; voffset = the lane's
-/// source offset minus the instruction immediate 1040 q, soffset = origin + key0 x stride, M0 = slot + 4160 w.
-pub struct PadDma {
-    sh: Shared,
-    rsrc: ValueId,
-    base: ValueId,
-    stride: I32,
-    voffs: Vec<ValueId>,
-    m0w: ValueId,
-}
-
-impl PadDma {
-    pub fn new(b: &mut FnBuilder, sh: &Shared, src: &copy::RowSource, wave: ValueId) -> PadDma {
-        // build-time proof: every (wave, run, lane) lands at the view offset of its element and the 64 lanes of a run are contiguous
-        let v = kv_view_pad();
-        for w in 0..4i64 {
-            for q in 0..4i64 {
-                let n = 4 * w + q;
-                for i in 0..64i64 {
-                    let (r, d) = (8 * n + (i % 32) / 4, 64 * (i / 32) + 16 * (i % 4));
-                    assert_eq!(v.inner.at(r + 128 * d), 1040 * n + 16 * i, "PadDma: run {n} lane {i}");
-                }
-            }
-        }
-        let bo = b.bind_i32(src.base.clone());
-        let bo = b.read_first_lane(bo);
-        let nrec = match &src.clamp {
-            Some(c) => b.bind_i32(ev(bo) + (c.limit.clone() - 1) * &src.stride + 128),
-            None => b.c_i32(0x7fff_ffff),
-        };
-        let nrec = b.read_first_lane(nrec);
-        let rsrc = b.buffer_desc_dyn(src.ptr, nrec);
-        let tid = b.let_(amdgpu_dsl::Op::WorkitemId);
-        let i = b.bind_i32(ev(tid) & 63);
-        let voffs = (0..4i32)
-            .map(|q| {
-                let row = (ev(wave) * 32) + (8 * q) + ((ev(i) & 31).lshr(2));
-                b.bind_i32(row * &src.stride + ((ev(i).lshr(5)) << 6) + ((ev(i) & 3) << 4) - 1040 * q)
-            })
-            .collect();
-        let m0w = b.bind_i32(ev(wave) * 4160 + sh.base as i32);
-        PadDma { sh: sh.clone(), rsrc, base: bo, stride: src.stride.clone(), voffs, m0w }
-    }
-    pub fn issue(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotRef) {
-        assert_eq!(slot.sh.name, self.sh.name, "PadDma: slot of another buffer");
-        let so = { let v = b.bind_i32(key0.clone() * &self.stride + ev(self.base)); b.read_first_lane(v) };
-        let off = slot.off_v(b);
-        let m0 = b.bind_i32(ev(self.m0w) + off);
-        let m0 = b.read_first_lane(m0);
-        slot.write(b, |b| {
-            for (q, vo) in self.voffs.iter().enumerate() {
-                b.buffer_load_lds_b128(self.rsrc, *vo, so, m0, (1040 * q) as u32);
-            }
-        });
-    }
 }
 
 impl KvRing3 {
     pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
-        Self::new_cfg(b, io, blk, roles, slots, false)
-    }
-    /// `pad`: the vendor's K / V LDS image (1040-byte runs of 8 keys x [2 x 64-byte halves], no swizzle; staged by `PadDma`).
-    pub fn new_cfg(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, pad: bool) -> KvRing3 {
         let mut lds = LdsPlan::new();
-        let tile_bytes = if pad { PAD_TILE } else { 16384 };
-        let tl = if pad { Layout::Linear } else { Layout::FMHA_SWZ };
-        let [ks, vs] = lds.ring_group(slots, [("K", tile_bytes, tl), ("V", tile_bytes, tl)]);
+        let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
         let kd = lds.ring("KD", 512, slots, Layout::Linear);
-        lds.at(2 * tile_bytes * slots as i64 + 2048);
+        lds.at(32768 * slots as i64 + 2048);
         let ones = lds.tile("ones", 2048, Layout::Linear);
         let q1 = lds.tile("Q1", 16384, Layout::Linear);
         let q0 = lds.tile("Q0", 16384, Layout::Linear);
@@ -168,18 +94,10 @@ impl KvRing3 {
         let o = attention_orientation();
         let mma = make_tiled_mma(o.0, false);
         // K: the A operand (32 keys x 64 bytes) at rows 32 s, k-group c
-        let (kview, placements, vview) = if pad {
-            // 32 keys x 64 bytes of run-pairs: key r -> 1040 (r / 8) + 64 (r % 8), block (s, c) at 4160 s + 512 c
-            let kv = ComposedLayout::plain(make_layout(tup![tup![8, 4], 64], tup![tup![64, 1040], 1]));
-            let pl: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4160 * s + 512 * c)).collect();
-            (kv, pl, kv_view_pad())
-        } else {
-            let kv = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![32, 64], tup![128, 1]));
-            let pl: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect();
-            (kv, pl, kv_view())
-        };
+        let kview = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![32, 64], tup![128, 1]));
+        let placements: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect();
         let kpart = make_tiled_copy_a(DS_READ_B128X2, &mma).partition_lds(b, &ctx, &l, &ks, &kview, &placements);
-        let vpart = make_tiled_copy(DS_READ_TR_B8X4, vt_tr_source(), 128 * 128, 8).partition_lds(b, &ctx, &l, &vs, &vview, &[0]);
+        let vpart = make_tiled_copy(DS_READ_TR_B8X4, vt_tr_source(), 128 * 128, 8).partition_lds(b, &ctx, &l, &vs, &kv_view(), &[0]);
         let kdpart = make_tiled_copy_bcast(DS_READ_B32, kd_read_tv(), 128, 32).partition_lds(b, &ctx, &l, &kd, &ComposedLayout::plain(make_layout(128, 4)), &[0]);
         let (kt, vt, kdt) = (blk.kv_tile(b, &io.k), blk.kv_tile(b, &io.v), blk.kv_tile(b, &io.ksc));
         let (ksrc, vsrc, kdsrc) = (kt.row_source(b, 1), vt.row_source(b, 1), kdt.row_source(b, 1));
@@ -195,16 +113,7 @@ impl KvRing3 {
             let rt_row = b.bind_i32(lane.tid().lshr(1));
             KdCopy3::Vgpr(copy::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
         };
-        let pad_dma = if pad {
-            let wvb = b.bind_i32(wv.clone());
-            let (kr, vr) = (kt.row_source(b, 1), vt.row_source(b, 1));
-            let kp = PadDma::new(b, &ks, &kr, wvb);
-            let vp = PadDma::new(b, &vs, &vr, wvb);
-            Some((kp, vp))
-        } else {
-            None
-        };
-        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None, pad_dma }
+        KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None }
     }
     /// Switches the K / V staging to the buffer form (the vendor's `buffer_load_dwordx4 ... lds` with an SGPR soffset).
     pub fn enable_buffer_dma(&mut self, b: &mut FnBuilder) {
@@ -218,10 +127,6 @@ impl KvRing3 {
         match (role, &self.kdc) {
             (Role::A, KdCopy3::Dma(kd)) => {
                 kd.issue(b, key0, &self.kd.at(slot));
-                if let Some((kp, _)) = &self.pad_dma {
-                    kp.issue(b, key0, &self.ks.at(slot));
-                    return None;
-                }
                 match &self.buf {
                     Some((kb, _)) => self.kdma.issue_buffer(b, kb, key0, &self.ks.at(slot)),
                     None => self.kdma.issue(b, key0, &self.ks.at(slot)),
@@ -229,10 +134,6 @@ impl KvRing3 {
                 None
             }
             (Role::B, _) => {
-                if let Some((_, vp)) = &self.pad_dma {
-                    vp.issue(b, key0, &self.vs.at(slot));
-                    return None;
-                }
                 match &self.buf {
                     Some((_, vb)) => self.vdma.issue_buffer(b, vb, key0, &self.vs.at(slot)),
                     None => self.vdma.issue(b, key0, &self.vs.at(slot)),
@@ -283,23 +184,12 @@ pub struct AttnBody3<'a> {
     pub o: Option<AccTile<C32x32F32, 4>>,
     p: Vec<ValueId>,
     kd_pending: Option<ValueId>,
-    /// `Vs128Cfg::setprio`
+    /// the vendor's priority ping-pong (`_vs128`): `s_setprio 1` at the start of the MFMA phase, `s_setprio 0` at the softmax phase
     pub setprio: bool,
-    /// `Vs128Cfg::thr512` with the seeded lazy rollback
+    /// the first tile always rebases the reference (the vendor recipe's seed, `OnlineSoftmax::set_vendor_ref`)
     pub seed_first: bool,
-    /// `Vs128Cfg::scaleconv`
-    pub scaleconv: bool,
-    /// `Vs128Cfg::vpre`: the first two V fragments of the PV group read at the end of the softmax phase (before the barrier)
-    pub vpre: bool,
-    /// `Vs128Cfg::pvlead`: the PV V reads kept one fragment ahead of their MFMA
-    pub pvlead: bool,
-    vpre_vals: Vec<ValueId>,
-    /// `Vs128Cfg::vlate`: the deferred V stage (key0, slot), issued between the QK blocks of the M phase
-    late: std::cell::RefCell<Option<(I32, SlotIdx)>>,
-    /// `Vs128Cfg::kscale_sel`
+    /// K scales: one shift per scale word + op_sel byte select on the scaled QK MFMA (`_vs128`)
     pub kscale_sel: bool,
-    /// `Vs128Cfg::p_in_s`: P written into the registers of the converted S tile 0 (the PV / row-sum operands are slices of that variable)
-    pub p_in_s: bool,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -307,7 +197,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, scaleconv: false, vpre: false, pvlead: false, vpre_vals: Vec::new(), late: std::cell::RefCell::new(None), kscale_sel: false, p_in_s: false }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, kscale_sel: false }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -348,91 +238,20 @@ impl<'a> AttnBody3<'a> {
         let r = self.ring;
         let k = r.kpart.at(b, &r.ks.at(slot));
         let kd = r.kdpart.at(b, &r.kd.at(slot));
-        let late = self.late.borrow_mut().take();
-        let mut res = Vec::new();
-        for s in 0..4usize {
-            if let Some(v) = self.qk_block(b, &out, bias, &k, &kd, s) {
-                res.push(v);
-            }
-            // the deferred V stage: one DMA after each QK block (the vendor spreads its DMAs between the QK MFMAs)
-            if let Some((key0, slot)) = &late {
-                let r = self.ring;
-                match &r.buf {
-                    Some((_, vb)) => {
-                        let n = r.vdma.issues();
-                        let per = n.div_ceil(4);
-                        let q0 = (s * per).min(n);
-                        let q1 = ((s + 1) * per).min(n);
-                        if q0 < q1 {
-                            r.vdma.issue_buffer_part(b, vb, key0, &r.vs.at(slot), q0..q1);
-                        }
-                    }
-                    None => {
-                        if s == 0 {
-                            r.vdma.issue(b, key0, &r.vs.at(slot));
-                        }
-                    }
-                }
-            }
-        }
-        res
+        (0..4).filter_map(|s| self.qk_block(b, &out, bias, &k, &kd, s)).collect()
     }
     /// PV with the row sums first: per half hh and dim group e, the transposed V fragment then the scaled MFMA (fixed scales).
-    fn pv(&mut self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
+    fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
         let r = self.ring;
         let v = r.vpart.at(b, &r.vs.at(slot));
-        let p = if self.p_in_s {
-            // the P words were written into S tile 0 by `place_p`: the operands are views of that variable
-            let s0 = self.s.expect("S").accs[0].var;
-            [Frag::<B32x32x64Fp8>::wrap(b.var_slice8(s0, 0)), Frag::<B32x32x64Fp8>::wrap(b.var_slice8(s0, 1))]
-        } else {
-            [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])]
-        };
+        let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])];
         self.sm.row_sum(b, p[0].v, p[1].v);
         let o = self.o.expect("O");
-        // the PV order (hh, e) and its V fragment index hh + 2 e
-        let order: Vec<(usize, usize)> = (0..2).flat_map(|hh| (0..4).map(move |e| (hh, e))).collect();
-        let pre = std::mem::take(&mut self.vpre_vals);
-        if self.pvlead || !pre.is_empty() {
-            let mut frags: Vec<Option<ValueId>> = vec![None; order.len()];
-            for (i, v0) in pre.iter().enumerate() {
-                frags[i] = Some(*v0);
-            }
-            let lead = if self.pvlead { 1 } else { 0 };
-            let mut next = pre.len();
-            for i in 0..order.len() {
-                while next < order.len() && next <= i + lead {
-                    let (hh, e) = order[next];
-                    frags[next] = Some(v.read(b, hh + 2 * e));
-                    next += 1;
-                }
-                let (hh, e) = order[i];
-                gemm(b, &r.mma, o.accs[e].var, frags[i].expect("V fragment"), p[hh].v, self.c127, self.c123, 0, 0);
-            }
-            return;
-        }
         for (hh, pf) in p.iter().enumerate() {
             for e in 0..4usize {
                 let vf = v.read(b, hh + 2 * e);
                 gemm(b, &r.mma, o.accs[e].var, vf, pf.v, self.c127, self.c123, 0, 0);
             }
-        }
-    }
-    /// `p_in_s`: the 16 P words into the dwords of S tile 0 (after the last read of S by the conversion).
-    fn place_p(&mut self, b: &mut FnBuilder) {
-        if self.p_in_s {
-            let s0 = self.s.expect("S").accs[0].var;
-            for i in 0..16usize {
-                b.var_set_lane(s0, i as u8, self.p[i]);
-            }
-        }
-    }
-    /// `vpre`: read the first two PV V fragments of tile `t` now (end of the softmax phase).
-    fn vpre_reads(&mut self, b: &mut FnBuilder, t: &TileIt) {
-        if self.vpre {
-            let r = self.ring;
-            let v = r.vpart.at(b, &r.vs.at(&t.cur));
-            self.vpre_vals = vec![v.read(b, 0), v.read(b, 2)];
         }
     }
     pub fn out_scale(&self, b: &mut FnBuilder) -> ValueId {
@@ -447,14 +266,6 @@ impl PipeBody for AttnBody3<'_> {
     }
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, slot: &SlotIdx) {
         self.ring.stage_complete(b, self.kd_pending.take(), slot);
-    }
-    fn defer_stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
-        // only the V stage of group B is spread over the QK blocks; anything else is issued now
-        if role == Role::B && self.ring.pad_dma.is_none() {
-            *self.late.borrow_mut() = Some((key0.clone(), slot.clone()));
-        } else {
-            self.kd_pending = self.ring.stage(b, role, key0, slot);
-        }
     }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
         self.ring.store_constants(b, self.wid, &self.blk.lane, &self.blk.q);
@@ -482,14 +293,6 @@ impl PipeBody for AttnBody3<'_> {
         }
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
-        if self.scaleconv {
-            let (nb, sc) = self.sm.decide_scaled(b, &s, &o, mask.as_ref());
-            self.p = self.sm.convert_scaled(b, &s, mask.as_ref(), 0, 4, sc);
-            self.place_p(b);
-            self.p.push(nb);
-            self.vpre_reads(b, t);
-            return;
-        }
         let nb = if self.seed_first {
             let first = b.bind_cond(amdgpu_dsl::tile::ox(t.it).eq(0));
             self.sm.decide_seeded(b, &s, &o, mask.as_ref(), first)
@@ -497,9 +300,7 @@ impl PipeBody for AttnBody3<'_> {
             self.sm.decide(b, &s, &o, mask.as_ref())
         };
         self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
-        self.place_p(b);
         self.p.push(nb);
-        self.vpre_reads(b, t);
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let mut w = std::mem::take(&mut self.p);
@@ -517,19 +318,11 @@ impl PipeBody for AttnBody3<'_> {
         let r = self.ring;
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
-        let (nb, sc) = if self.scaleconv {
-            let (nb, sc) = self.sm.decide_deferred_scaled(b, &s, &o, mask.as_ref());
-            (nb, Some(sc))
-        } else {
-            (self.sm.decide_deferred(b, &s, &o, mask.as_ref()), None)
-        };
+        let nb = self.sm.decide_deferred(b, &s, &o, mask.as_ref());
         let next = t.staged.then(|| (r.kpart.at(b, &r.ks.at(&t.next)), r.kdpart.at(b, &r.kd.at(&t.next))));
         let mut w = Vec::with_capacity(16);
         for i in 0..4usize {
-            match sc {
-                Some(sc) => w.extend(self.sm.convert_scaled(b, &s, mask.as_ref(), i, i + 1, sc)),
-                None => w.extend(self.sm.convert(b, &s, mask.as_ref(), i, i + 1)),
-            }
+            w.extend(self.sm.convert(b, &s, mask.as_ref(), i, i + 1));
             if let Some((k, kd)) = &next {
                 self.qk_block(b, &QkOut::Vars(&s), nb, k, kd, i);
             }
@@ -539,114 +332,44 @@ impl PipeBody for AttnBody3<'_> {
     }
 }
 
-/// Experiment switches of the `_vs128` builder (the shipped kernel = all off; variants are registered under their own names).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Vs128Cfg {
-    /// vendor-style epilogue: O^T through the wave-private scratch (2 x ds_write_b32 per 4 dims, ds_read_b128 rows) and 8 x 16-byte row stores
-    pub epi_lds: bool,
-    /// vendor-style epilogue in registers: v_permlane32_swap pairs the 8-byte words of the two lane halves into 16 contiguous bytes per lane, 8 x
-    /// 16-byte row stores per wave, no LDS round trip (takes precedence over `epi_lds`)
-    pub epi_perm: bool,
-    /// K / V staging in the MUBUF form (SGPR per-tile soffset, loop-invariant voffsets, out-of-range rows read zeros)
-    pub bufdma: bool,
-    /// the vendor's priority ping-pong: `s_setprio 1` at the start of the MFMA phase (PV + next QK), `s_setprio 0` at the softmax phase
-    pub setprio: bool,
-    /// the vendor's padded K / V LDS image (1040-byte runs, no swizzle) with its MUBUF DMA
-    pub kvpad: bool,
-    /// rollback threshold override in 1/512 units (shipped 120: below the 131 target, so a tile whose max equals the running max rolls back)
-    pub thr512: Option<u32>,
-    /// the rebase of the current scores folded into the fp8 conversion scale (no `S += delta` on the rollback path)
-    pub scaleconv: bool,
-    /// fast path: exact aligned rebase above this scaled max (1/512 units; default 0.45 x 512)
-    pub hi512: Option<u32>,
-    /// vendor-shaped LDS read-ahead: the first two PV V fragments read before the barrier
-    pub vpre: bool,
-    /// PV V reads one fragment ahead of their MFMA
-    pub pvlead: bool,
-    /// group B stages V(t+1) inside its M phase, one DMA after each QK block (`Pipeline::late_stage_b`)
-    pub vlate: bool,
-    /// row sums with two smfmacs per 128 keys (`crate::rowsum`, proven on the probe-measured smfmac maps)
-    pub rows2: bool,
-    /// K scales: one shift per scale word + op_sel byte select on the scaled QK MFMA (instead of two extracted words)
-    pub kscale_sel: bool,
-    /// P written into the converted S tile 0's registers (`var_set_lane`), PV reads `var_slice8` views (the vendor's register reuse)
-    pub p_in_s: bool,
-    /// the vendor's reference recipe (`OnlineSoftmax::set_vendor_ref`): lazy rollback above the target, conversion scale 0.25, no LUT, seeded
-    pub vref: bool,
-    /// with `vref`: the short-sequence copy keeps its LUT-corrected conversion
-    pub vref_lut: bool,
-}
-
+/// `_vs128`: 256-row blocks, two 4-wave groups offset by one phase (`Cadence::TwoPhaseOffset`), MUBUF K / V staging, the vendor's priority ping-pong,
+/// two-smfmac row sums (`crate::rowsum`), K-scale byte select, the vendor's reference recipe in the long-sequence copy (`OnlineSoftmax::set_vendor_ref`;
+/// the short copy keeps the exact LUT-corrected recipe: with < 9 tiles the lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: true, kscale_sel: true, p_in_s: false, vref: true, vref_lut: false })
-}
-
-pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
-    let mut fb = FnBuilder::new(name, 512);
+    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
     let blk = block3(&io, b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
-    let mut ring = KvRing3::new_cfg(b, &io, &blk, &roles, 2, cfg.kvpad);
-    if cfg.bufdma {
-        ring.enable_buffer_dma(b);
-    }
+    let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
+    ring.enable_buffer_dma(b);
     let ring = ring;
-    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
-    // the V-phase read-ahead stays in flight across the mid barrier
-    pipe.mid_lds_drain = !cfg.vpre;
-    pipe.late_stage_b = cfg.vlate;
+    let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
-            // the fast reference only in the long-sequence copy (the short copy keeps the LUT-corrected exact recipe)
-            body.scaleconv = cfg.scaleconv && !lut;
-            body.vpre = cfg.vpre;
-            body.kscale_sel = cfg.kscale_sel;
-            body.p_in_s = cfg.p_in_s;
-            if cfg.rows2 {
-                let p = crate::rowsum::plan();
-                body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
-            }
-            body.pvlead = cfg.pvlead;
-            if let Some(h) = cfg.hi512 {
-                body.sm.set_hi_thr(h as f32 / 512.0);
-            }
-            if let Some(th) = cfg.thr512 {
-                body.sm.set_thr(b, th as f32 / 512.0);
+            body.kscale_sel = true;
+            let p = crate::rowsum::plan();
+            body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
+            if !lut {
+                body.sm.set_vendor_ref(b);
                 body.seed_first = true;
             }
-            // the vendor recipe in the long-sequence copy only (>= 9 tiles); the short copy keeps the exact LUT-corrected recipe: with < 9 tiles the
-            // lazy recipe's error does not average out (S = 100..200: 1.25-1.5x the vendor's mean)
-            if cfg.vref && (!lut || cfg.vref_lut) {
-                body.sm.set_vendor_ref_lut(b, cfg.vref_lut);
-                body.seed_first = true;
-            }
-            body.setprio = cfg.setprio;
+            body.setprio = true;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
-            if cfg.epi_perm {
-                store_out3_perm(&io, b, &blk, &body.o.expect("O"), fin);
-            } else if cfg.epi_lds {
-                store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
-            } else {
-                store_out3(&io, b, &blk, &body.o.expect("O"), fin);
-            }
+            store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
         });
     });
     fb.finish()
 }
 
+/// `_kvsplit`: the `_vs128` structure over a key range per split (two-smfmac row sums), the partial-row epilogue + log-sum-exp.
 pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
-    fmha_kvsplit_cfg("fmha_fwd_hd128_mxfp8_v3_kvsplit", false, true)
-}
-
-/// `scaleconv`: the fast reference path (`Vs128Cfg::scaleconv`) in the long-sequence copy; `rows2`: the two-smfmac row sums.
-pub fn fmha_kvsplit_cfg(name: &str, scaleconv: bool, rows2: bool) -> Function {
-    let mut fb = FnBuilder::new(name, 512);
+    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_kvsplit", 512);
     fb.compile_profile(CompileProfile::KvSplit);
     let b = &mut fb;
     let io = declare_io(b, 256, true);
@@ -659,11 +382,8 @@ pub fn fmha_kvsplit_cfg(name: &str, scaleconv: bool, rows2: bool) -> Function {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
-            body.scaleconv = scaleconv && !lut;
-            if rows2 {
-                let p = crate::rowsum::plan();
-                body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
-            }
+            let p = crate::rowsum::plan();
+            body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             let l = body.sm.l_total(b);
@@ -681,18 +401,9 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h() -> Function {
     fb.finish()
 }
 
+/// `_t128`: 128-row blocks, one 4-wave group, a 3-slot ring with one window per tile (`Cadence::OneWindow`).
 pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
-    fmha_t128_cfg_v("fmha_fwd_hd128_mxfp8_v3_t128", false, false, false)
-}
-
-/// `fmha_t128_cfg` without the vendor reference recipe.
-pub fn fmha_t128_cfg(name: &str, scaleconv: bool, rows2: bool) -> Function {
-    fmha_t128_cfg_v(name, scaleconv, rows2, false)
-}
-
-/// `scaleconv`: the fast reference path in the long-sequence copy; `rows2`: the two-smfmac row sums.
-pub fn fmha_t128_cfg_v(name: &str, scaleconv: bool, rows2: bool, vref: bool) -> Function {
-    let mut fb = FnBuilder::new(name, 256);
+    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_t128", 256);
     fb.compile_profile(CompileProfile::T128);
     let b = &mut fb;
     let io = declare_io(b, 128, false);
@@ -704,15 +415,6 @@ pub fn fmha_t128_cfg_v(name: &str, scaleconv: bool, rows2: bool, vref: bool) -> 
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
         let mut body = AttnBody3::new(b, &ring, &blk, blk.lane.wave, lut);
-        body.scaleconv = scaleconv && !lut;
-        if rows2 {
-            let p = crate::rowsum::plan();
-            body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
-        }
-        if vref && !lut {
-            body.sm.set_vendor_ref(b);
-            body.seed_first = true;
-        }
         pipe.run(b, Role::All, &mut body);
         let fin = body.out_scale(b);
         store_out3(&io, b, &blk, &body.o.expect("O"), fin);
@@ -881,32 +583,6 @@ pub fn store_out3(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C
             vals.push(b.frag2(w0, w1));
         }
         part.store(b, &ptrs, e, &vals);
-    }
-    b.end_if();
-}
-
-/// The bf16 epilogue in registers: lane (j, h) holds dims 32 e + 8 q + 4 h + 0..3 of query j; `permlane32_swap(word(q = 2p), word(q = 2p + 1))`
-/// leaves dims 16 p + 0..7 (h = 0) / 16 p + 8..15 (h = 1) in the lane as (a' dwords, b' dwords): one 16-byte store at dims 32 e + 16 p + 8 h.
-pub fn store_out3_perm(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C32x32F32, 4>, fin: ValueId) {
-    let o_tile = io.o.tile(vec![ev(blk.bidx), I32::c(0), ev(blk.hidx), I32::c(0)]).clamp(1, io.s_len.clone(), blk.s_last.clone());
-    let row = b.let_i32(o_tile.offset(&[I32::c(0), &blk.row0 + blk.lane.j(), I32::c(0), I32::c(0)]));
-    let live = b.bind_cond(blk.row0.lt(io.s_len.clone()));
-    b.begin_if(Opnd::Val(live));
-    let off = b.bind_i32(row + (blk.lane.half() << 4));
-    let ptr = b.ptr_add(io.o.ptr, off);
-    for e in 0..4usize {
-        let words: Vec<[ValueId; 2]> = (0..4usize)
-            .map(|q| {
-                let v4: Vec<ValueId> = (0..4usize).map(|k| { let lv = b.frag16_lane(Opnd::Var(o.accs[e].var), (4 * q + k) as u8); let f = b.bitcast_f32(lv); b.mul_f32(f, fin) }).collect();
-                [b.cvt_pk_bf16_f32(v4[0], v4[1]), b.cvt_pk_bf16_f32(v4[2], v4[3])]
-            })
-            .collect();
-        for p in 0..2usize {
-            let (a0, b0) = b.permlane32_swap(words[2 * p][0], words[2 * p + 1][0]);
-            let (a1, b1) = b.permlane32_swap(words[2 * p][1], words[2 * p + 1][1]);
-            let v = b.frag4(a0, a1, b0, b1);
-            b.store_f32x4(ptr, (64 * e + 32 * p) as u32, v);
-        }
     }
     b.end_if();
 }
