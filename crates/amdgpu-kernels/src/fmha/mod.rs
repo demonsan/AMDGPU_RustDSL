@@ -10,7 +10,9 @@ use amdgpu_tile::copy::{make_tiled_copy, make_tiled_copy_a, make_tiled_copy_bcas
 use amdgpu_tile::dma::{issue_rows_shared, partition_dma, DmaPart};
 use amdgpu_tile::mma::{gemm, make_tiled_mma, TiledMma};
 use amdgpu_tile::{contract, Ctx};
-use crate::fmha::io::{combine_kernel, FmhaBlock, FmhaIo};
+pub mod io;
+
+use io::{combine_kernel, FmhaBlock, FmhaIo};
 use amdgpu_tile::frag::{AccTile, Frag, QkOut, B32x32x64Fp8, C32x32F32};
 use amdgpu_tile::reduce::KeyMask;
 use amdgpu_tile::softmax::{OnlineSoftmax, Recipe};
@@ -44,7 +46,7 @@ pub fn vt_tr_source() -> LLayout {
 /// K-scale staging: a layout-derived DMA (one dword per row, waves 2 and 3 repeat waves 0 and 1) or the `_t128` VGPR path.
 pub enum KdCopy3 {
     Dma(DmaPart),
-    Vgpr(copy::DwordRowsVgpr),
+    Vgpr(amdgpu_tile::rows::DwordRowsVgpr),
 }
 
 /// The K-scale reader TV: thread (j = lane % 32, h = lane / 32 broadcast) x value (row group s) -> row `j + 32 s` of the 128-word tile.
@@ -111,7 +113,7 @@ impl KvRing3 {
             KdCopy3::Dma(partition_dma(b, &ctx, GLOBAL_LDS_X1, &l, &w2, &wv2, 1, kdsrc, &kd, &ComposedLayout::plain(make_layout(tup![128, 4], tup![4, 1]))))
         } else {
             let rt_row = b.bind_i32(lane.tid().lshr(1));
-            KdCopy3::Vgpr(copy::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
+            KdCopy3::Vgpr(amdgpu_tile::rows::DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
         };
         KvRing3 { ks, vs, kd, ones, q1, q0, epi, kdma, vdma, kdc, kpart, vpart, kdpart, mma, buf: None }
     }
@@ -488,7 +490,7 @@ pub fn declare_io(b: &mut FnBuilder, rows_per_block: i64, kvsplit: bool) -> Fmha
         let lse = ka.ptr(b, "ptr_lse", 0x278);
         b.arg_tensor("ptr_ohat", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(128 * 4));
         b.arg_tensor("ptr_lse", Ext::ka(0x280) * Ext::ka(0x284) * Ext::c(4));
-        Some(crate::fmha::io::KvsArgs { ohat, lse, splits: b.bind_i32(splits), rows_total: b.bind_i32(rows_total) })
+        Some(io::KvsArgs { ohat, lse, splits: b.bind_i32(splits), rows_total: b.bind_i32(rows_total) })
     } else {
         ka.arg(b, "abi_tail", DType::I32, 0x280, 16);
         None
