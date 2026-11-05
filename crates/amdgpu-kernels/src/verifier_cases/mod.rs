@@ -29,7 +29,6 @@ pub fn gv_attack_assume_loop() -> Function {
     b.arg_tensor("o", Ext::c(64));
     let q = b.let_(Op::KernargPtr { offset: 0 });
     let o = b.let_(Op::KernargPtr { offset: 8 });
-    b.allow_var_rereads();
     let c0 = b.c_i32(0);
     let c1 = b.c_i32(1);
     let c4 = b.c_i32(4);

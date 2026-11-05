@@ -75,7 +75,6 @@ fn canon_function(f: &Function, include_contract: bool) -> String {
     let _ = writeln!(s, "value_tys={:?}", f.value_tys);
     let _ = writeln!(s, "var_tys={:?}", f.var_tys);
     let _ = writeln!(s, "profile={:?} lower={:?} sched={:?}", f.compile_profile, f.lower_opts, f.sched_opts);
-    let _ = writeln!(s, "allow_var_rereads={}", f.allow_var_rereads);
     let _ = writeln!(s, "agpr={}", c.canon_text(&format!("{:?}", f.agpr)));
     for st in f.stmts().iter() {
         let line = c.canon_text(&format!("{st:?}"));

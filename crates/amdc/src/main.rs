@@ -475,9 +475,6 @@ fn main() -> ExitCode {
                     return c;
                 }
             }
-            for w in amdgpu_dsl::lint(&f) {
-                eprintln!("warning: {name}: {w}");
-            }
             let mut out_path: Option<String> = None;
             let mut mir_out: Option<String> = None;
             let mut backend_name = env::var("AMDC_BACKEND").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "auto".to_string());

@@ -10,7 +10,7 @@
 | 层 | 负责 | 不负责 |
 |---|---|---|
 | Rust 类型系统（DSL、safe-asm） | 构图期非法描述（move-after-use、Pending 当 Ready、写只读端口、跨 token 混用）；`#![forbid(unsafe_code)]` | GPU 异步 hazard 的最终判定、数值正确性 |
-| IR verifier（`amdgpu-dsl`） | 类型/uniformity/循环变量单赋值（`var_lint`）/立即数范围/描述符类型 | 物理寄存器、指令顺序 |
+| IR verifier（`amdgpu-dsl`） | 类型/uniformity/循环变量作用域/立即数范围/描述符类型 | 物理寄存器、指令顺序 |
 | MIR 层（`amdgpu-compiler`） | 效应模型、调度、RA、hazard/wait 插入、`pin_check`、`mir::verify` | 指令选择之外的 LLVM 级优化 |
 | 后端（`llvm-tail` / `own`） | post-RA 的 hazard、waitcnt、descriptor、编码；两者指令流逐条一致（`tail_invariance`） | 寄存器与顺序决策 |
 | Runtime / 测试 harness | 模块加载、ABI、同轮厂商对照、确定性压力 | 编译期正确性 |
@@ -50,7 +50,7 @@ DSL(Rust) ─► typed IR（Op 84 种 / Stmt 47 种）─► IR 验证器 + gpu_
 
 - **入口**：`FnBuilder`（约 160 个公开方法）→ `Function`（kernarg ABI；与厂商 kernel 逐字节兼容的 656 字节布局由 kernel 层负责）。
 - **值模型**：`ValueId`（单次定义）、`VarId`（循环变量）、`Opnd`、`DType`（`F16/F32/I32/U32/I1/Ptr/Frag2/4/8/16/Rsrc`）。`Rsrc` 只存在于 SGPR 四元组。
-- **控制流**：`begin_loop … end_loop` 是 do-while，循环变量以 `begin_loop(&[(DType, init)])` 声明、`set_var` 更新（`var_lint` 检查单赋值与作用域）；`begin_if` 是 **wave 级**分支（对 `vcc` 的 any 判断，**没有 exec 掩码**），因此体内整 wave 执行。
+- **控制流**：`begin_loop … end_loop` 是 do-while，循环变量以 `begin_loop(&[(DType, init)])` 声明、`set_var` 更新（顺序语义：读到本迭代路径上最后一次 `set_var`，见 [`region-ir.md`](region-ir.md)）；`begin_if` 是 **wave 级**分支（对 `vcc` 的 any 判断，**没有 exec 掩码**），因此体内整 wave 执行。
 - **Uniformity**：lowering 的 `uniform_analysis` 判定波内一致的整数值与循环变量，落入 SGPR（`scalarize`；`scalarize2` 另把一致的 `min`、一致比较上的 `select`（`s_cmp` + `s_cselect`）与 `readfirstlane` 结果留在 SGPR；`waveuni` 把 `tid >> 6` 视为一致），其余走 VGPR。`s_operand` 对非一致值报错而不是静默降级。
 - **指令族**：MFMA（scaled 32x32x64 f8f6f4 的累加 / zero-C / **C 操作数** 三形式；scaled **16x16x128** f8f6f4（op_sel 选 E8M0 字节）；AGPR（acc_cd）形式；**unscaled** 同三形式；f16/bf16；`v_smfmac`）、VALU（int/fp、`pk_add/mul/sub`、`perm`、`permlane32_swap`、`pknorm`、`scalef32`/`cvt_pk_fp8` 半写、`exp/rcp/log`、`max3`、`readfirstlane`）、内存（见 §9）、同步（`barrier`、`wait_vm/lds`、`fence_release/acquire` 与 coherent/write-through 访问）。
 - **实验面**：A/B 在独立分支上用临时开关做，结论（含负结果）写进文档；采用的优化成为 kernel profile 的固定配置，未采用的开关不留在主线（2026-11 整理）。

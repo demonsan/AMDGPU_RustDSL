@@ -52,3 +52,18 @@ b.produce_region("K", slot, gen, |b| { ...stores... });   // consumers: tile_con
 - `amdc list` 的 101 个 kernel（own 后端）与 v3 / dsl / 旧手写 / GEMM v3 / v4 的汇编 md5 与 Main `1c3c9cf` 逐字节相同；
 - 严格证书不变（`--shipped` 24 / 100 / 0；当时还有旧手写集 `--legacy` 44 / 216 / 0，该集已删除）；
 - `cargo test` 69 个目标 / 325 项全绿（新增 `region_ir`：所有 kernel 的线性视图往返一致、闭包形式与 begin/end 生成相同的树、不配对在构建期 panic、不配对的线性编辑被拒绝）。
+
+## Loop variables
+
+A loop variable (`begin_loop` / `loop_`, `set_var`, read as `Opnd::Var`) is mutable loop-carried state with ordinary sequential semantics:
+a read sees the value of the **last `set_var` executed on the path in the current iteration** — after an `if` / `if_else` that set it, the
+value at the merge (the new value when the branch ran, else the earlier one) — and, before any `set_var` in the iteration, the value the
+previous iteration left (the initial value in the first). Branches are wave-uniform (`begin_if` is a wave-level branch), so "the path" is the
+same for every lane; per-lane choices are made with `select` before the `set_var`.
+
+The lowering guarantees this: a variable has ONE register for the whole loop, `set_var` writes it (a copy, or the producer / `ds_read`
+retargeted into it, which is refused when anything reads the variable between the producer and the `set_var`), every read reads it, and
+instructions that the lowering re-issues later (`cmpfold`) never take a loop variable's register as a source; the scheduler and the wait
+pass track the register like any other. `crates/amdgpu-compiler/tests/var_semantics.rs` pins the read-after-`if` case on the allocated MIR
+under the FMHA and GEMM profiles. (Until 2026-11 such reads were reported by a conservative lint as "not defined by the contract"; the
+lowering paths that could return the iteration-start value — software pipelining and tail duplication — are gone.)

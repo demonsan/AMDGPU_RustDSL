@@ -129,7 +129,7 @@ DS 偏移是 const generic（`ds_read_b128::<OFF>`），构建期断言：
 ### 2.6 DSL IR 层的类型化
 
 - 纯值 SSA（`ValueId`）+ 显式循环变量（`VarId`），作用域检查（loop/if 内定义的值不能外泄）。
-- 循环变量**单赋值**约束（`var_lint` 诊断；`_t` 的 14 条 wave 级分支警告是已知潜伏项，见 `status.md`）。
+- 循环变量的**顺序语义**（读到本迭代路径上最后一次 `set_var`；由 lowering 的单寄存器实现保证，`crates/amdgpu-compiler/tests/var_semantics.rs` 固定）。
 - 内存/MTBUF/MFMA 等算子都带 dtype/宽度/描述符类型，lowering 与 MIR verifier 双重检查。
 
 ### 2.7 证据：29 个 ui 编译失败用例

@@ -926,8 +926,6 @@ pub struct Function {
     flat: Vec<Stmt>,
     pub var_tys: Vec<DType>,
     pub value_tys: Vec<DType>,
-    /// Opt-out of the loop-variable re-read lint (see [`lint`]).
-    pub allow_var_rereads: bool,
     /// AGPR placement requests (empty for every existing kernel).
     pub agpr: Vec<AgprMark>,
     /// Explicit compile policy (lowering options + scheduler preset). `None` = the compiler derives it from the kernel name (the historical behaviour,
@@ -1195,7 +1193,6 @@ impl FnBuilder {
                 flat: Vec::new(),
                 var_tys: Vec::new(),
                 value_tys: Vec::new(),
-                allow_var_rereads: false,
             agpr: Vec::new(),
                 compile_profile: None,
             lower_opts: Vec::new(),
@@ -1204,11 +1201,6 @@ impl FnBuilder {
             expr_consts: Default::default(),
             tree: TreeBuilder::default(),
         }
-    }
-
-    /// Declares that this kernel intentionally re-reads loop variables after `set_var` in the same iteration.
-    pub fn allow_var_rereads(&mut self) {
-        self.f.allow_var_rereads = true;
     }
 
     /// Sets the explicit compile policy (see [`CompileProfile`]); without it the compiler keeps deriving the policy from the kernel name.
@@ -2970,51 +2962,6 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
     }
 }
 
-/// Semantics of loop variables: a read of a loop variable (`Opnd::Var`) **after a `set_var` of the same variable in
-/// the same iteration** is easy to get wrong - the author usually expects the value just written, but the variable is
-/// loop-carried state whose value after a `set_var` is not guaranteed by the contract (docs/archive/verification.md); use a
-/// plain SSA value (the operand you passed to `set_var`) for intra-iteration producer/consumer pairs.
-/// This lint reports such reads conservatively (a `set_var` inside an `if` counts). Cross-iteration reads (read before
-/// the `set_var`, the common case), reads of the loop condition value held in an SSA value, and reads after the loop are
-/// not reported. Kernels that really intend this can call `FnBuilder::allow_var_rereads()`.
-pub fn lint(f: &Function) -> Vec<String> {
-    if f.allow_var_rereads {
-        return Vec::new();
-    }
-    struct L {
-        vars: HashSet<VarId>,
-        set_so_far: HashSet<VarId>,
-    }
-    let mut stack: Vec<L> = Vec::new();
-    let mut out = Vec::new();
-    for (idx, st) in f.stmts().iter().enumerate() {
-        for o in stmt_operands(st) {
-            if let Opnd::Var(v) = o {
-                if let Some(l) = stack.iter().rev().find(|l| l.vars.contains(&v)) {
-                    if l.set_so_far.contains(&v) {
-                        out.push(format!(
-                            "stmt {idx}: loop variable var{} is read after set_var(var{}) in the same iteration; the value of such a read is not defined by the DSL contract (the lowering usually returns the value just written, other paths can return the iteration-start value) - use the SSA value passed to set_var",
-                            v.0, v.0
-                        ));
-                    }
-                }
-            }
-        }
-        match st {
-            Stmt::BeginLoop { vars, .. } => stack.push(L { vars: vars.iter().copied().collect(), set_so_far: HashSet::new() }),
-            Stmt::EndLoop => {
-                stack.pop();
-            }
-            Stmt::SetVar { var, .. } => {
-                if let Some(l) = stack.iter_mut().rev().find(|l| l.vars.contains(var)) {
-                    l.set_so_far.insert(*var);
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
 /// Value type of a safe-asm block's single output port (`I32` for one dword: callers bitcast as needed).
 pub fn asm_out_ty(b: &amdgpu_safeasm::AsmBlock) -> DType {
     use amdgpu_safeasm::AClass;
