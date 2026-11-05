@@ -578,7 +578,7 @@ pub struct Vs128Cfg {
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: true, kscale_sel: true, p_in_s: false, vref: false, vref_lut: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: true, kscale_sel: true, p_in_s: false, vref: true, vref_lut: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -619,7 +619,9 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
                 body.sm.set_thr(b, th as f32 / 512.0);
                 body.seed_first = true;
             }
-            if cfg.vref {
+            // the vendor recipe in the long-sequence copy only (>= 9 tiles); the short copy keeps the exact LUT-corrected recipe: with < 9 tiles the
+            // lazy recipe's error does not average out (S = 100..200: 1.25-1.5x the vendor's mean)
+            if cfg.vref && (!lut || cfg.vref_lut) {
                 body.sm.set_vendor_ref_lut(b, cfg.vref_lut);
                 body.seed_first = true;
             }
@@ -680,11 +682,16 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h() -> Function {
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
-    fmha_t128_cfg("fmha_fwd_hd128_mxfp8_v3_t128", false, false)
+    fmha_t128_cfg_v("fmha_fwd_hd128_mxfp8_v3_t128", false, false, false)
+}
+
+/// `fmha_t128_cfg` without the vendor reference recipe.
+pub fn fmha_t128_cfg(name: &str, scaleconv: bool, rows2: bool) -> Function {
+    fmha_t128_cfg_v(name, scaleconv, rows2, false)
 }
 
 /// `scaleconv`: the fast reference path in the long-sequence copy; `rows2`: the two-smfmac row sums.
-pub fn fmha_t128_cfg(name: &str, scaleconv: bool, rows2: bool) -> Function {
+pub fn fmha_t128_cfg_v(name: &str, scaleconv: bool, rows2: bool, vref: bool) -> Function {
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::T128);
     let b = &mut fb;
@@ -701,6 +708,10 @@ pub fn fmha_t128_cfg(name: &str, scaleconv: bool, rows2: bool) -> Function {
         if rows2 {
             let p = crate::rowsum::plan();
             body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
+        }
+        if vref && !lut {
+            body.sm.set_vendor_ref(b);
+            body.seed_first = true;
         }
         pipe.run(b, Role::All, &mut body);
         let fin = body.out_scale(b);
