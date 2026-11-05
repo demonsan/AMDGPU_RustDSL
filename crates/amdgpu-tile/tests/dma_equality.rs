@@ -3,8 +3,8 @@
 //! partial tile, M0 at the top of the wave slice and the compensated negative immediates.
 use std::collections::HashMap;
 
-use amdgpu_dsl::tile::copy::RowsCopy;
-use amdgpu_dsl::tile::{ev, Dim, KArgs, Lane, LdsPlan, Layout as DslLayout, Roles, SlotIdx, Stride};
+use amdgpu_tile::rows::RowsCopy;
+use amdgpu_tile::{ev, Dim, KArgs, Lane, LdsPlan, Layout as DslLayout, Roles, SlotIdx, Stride};
 use amdgpu_dsl::{FnBuilder, Function, Op, Opnd, Stmt, I32};
 use amdgpu_isa::GLOBAL_LDS_X4;
 use amdgpu_layout::*;
@@ -74,7 +74,7 @@ fn dmas(f: &Function) -> Vec<Vec<(i64, i32, i64)>> {
 }
 
 /// Common kernel prologue: the K tensor [SK rows x 128 B], the ring, lanes and the clamped row source.
-fn setup(b: &mut FnBuilder) -> (amdgpu_dsl::tile::Shared, Lane, Roles, amdgpu_dsl::tile::copy::RowSource) {
+fn setup(b: &mut FnBuilder) -> (amdgpu_tile::Shared, Lane, Roles, amdgpu_tile::rows::RowSource) {
     let mut ka = KArgs::new();
     let skv = ka.dim(b, "kv_len", 0x10, 1, i64::MAX);
     let kv_len = ka.i32(b, "kv_len", 0x10);

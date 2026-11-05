@@ -1,6 +1,6 @@
 //! `scalarize2`: wave-uniform address chains with clamps (compare + select), minimum and v_readfirstlane results stay in SGPRs - the GEMM's per-tile
 //! DMA soffsets (`key0 = (it + 1 < nkv ? it + 1 : nkv - 1) << 7`, `min`, a `read_first_lane` feeding further adds) become SALU, no VALU + readfirstlane.
-use amdgpu_dsl::tile::ev;
+use amdgpu_dsl::ev;
 use amdgpu_dsl::{DType, FnBuilder, Function, Op, Opnd};
 
 fn demo() -> Function {

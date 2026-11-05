@@ -3,7 +3,7 @@
 //! stride and an LDS image of 8-row slots of 1056 bytes (32-byte pad).
 use std::collections::HashMap;
 
-use amdgpu_dsl::tile::{ev, Lane, LdsPlan, Layout as DslLayout, SlotIdx};
+use amdgpu_tile::{ev, Lane, LdsPlan, Layout as DslLayout, SlotIdx};
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd, Stmt, I32};
 use amdgpu_isa::BUFFER_LDS_X4;
 use amdgpu_layout::*;

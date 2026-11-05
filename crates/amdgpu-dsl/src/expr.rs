@@ -65,16 +65,16 @@ pub enum Node {
 
 /// An i32 expression.
 #[derive(Clone, Debug)]
-pub struct I32(pub(crate) N);
+pub struct I32(pub N);
 /// An f32 expression.
 #[derive(Clone, Debug)]
-pub struct F32(pub(crate) N);
+pub struct F32(pub N);
 /// A boolean (i1) expression.
 #[derive(Clone, Debug)]
-pub struct Cond(pub(crate) N);
+pub struct Cond(pub N);
 /// A global pointer expression (base pointer + byte offsets).
 #[derive(Clone, Debug)]
-pub struct Ptr(pub(crate) N);
+pub struct Ptr(pub N);
 
 fn n(x: Node) -> N {
     Rc::new(x)
@@ -685,3 +685,24 @@ impl FnBuilder {
         cond.select_f32(a, b)
     }
 }
+
+// ---- expression leaves (values / loop variables / operands as i32 expressions)
+
+/// An already-bound i32 value as an expression leaf.
+pub fn ev(v: ValueId) -> I32 {
+    I32(std::rc::Rc::new(Node::Val(v)))
+}
+/// A loop variable as an i32 expression leaf (lowered to an `Opnd::Var` operand).
+pub fn varx(v: VarId) -> I32 {
+    I32(std::rc::Rc::new(Node::Var(v)))
+}
+/// An operand (value, variable or i32 immediate) as an i32 expression.
+pub fn ox(o: Opnd) -> I32 {
+    match o {
+        Opnd::Val(v) => ev(v),
+        Opnd::Var(v) => varx(v),
+        Opnd::I32(c) => I32::c(c),
+        Opnd::F32(_) => panic!("tile::ox: an f32 immediate is not an i32 expression"),
+    }
+}
+

@@ -8,3 +8,5 @@ description = "Command line driver for the AMDGPU Rust DSL compiler"
 [dependencies]
 amdgpu-dsl = { path = "../amdgpu-dsl" }
 amdgpu-compiler = { path = "../amdgpu-compiler" }
+amdgpu-kernels = { path = "../amdgpu-kernels" }
+amdgpu-tile = { path = "../amdgpu-tile" }

@@ -2,7 +2,7 @@
 //! of the source TV layout, converts, and stores `got XOR expected` for every destination register (expected = the destination TV layout's element
 //! ids); the host (tests/gpu/handoff_host.cpp) requires all zeros.
 
-use amdgpu_dsl::tile::{ev, Lane, LdsPlan};
+use amdgpu_tile::{ev, Lane, LdsPlan};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, ValueId};
 use amdgpu_layout::{make_layout, plan_convert, tup, IntTuple, Ix, Layout};
 use amdgpu_tile::handoff::{convert_layout, ConvStats};

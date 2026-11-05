@@ -3126,8 +3126,7 @@ pub fn verify(f: &Function) -> Vec<String> {
 }
 /// Kernel definitions built with this DSL.
 pub mod expr;
-pub mod kernels;
-pub mod tile;
+pub use expr::{ev, ox, varx};
 pub use expr::{Cond, Ptr, F32, I32};
 
 /// Every `Opnd` a statement reads (loop variables read implicitly by in-place `Var*` statements are not listed).

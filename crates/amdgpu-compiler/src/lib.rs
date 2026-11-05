@@ -12,7 +12,6 @@ pub mod gpu_protocol;
 pub use gpu_protocol as gpu_tiles;
 pub mod gpu_verify;
 pub mod functional_proofs;
-pub mod hostgen;
 pub mod ir_print;
 pub mod hazards;
 pub mod lower;
@@ -278,88 +277,6 @@ pub fn resolve_backend(name: &str, f: &amdgpu_dsl::Function) -> (String, Option<
     }
 }
 
-/// All kernel definitions currently shipped with the DSL.
-pub fn kernel_names() -> &'static [&'static str] {
-    &["probe_agpr_ref", "probe_agpr_acc", "probe_agpr_full", "probe_agpr_pinned", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_scale", "probe_lds_self2", "probe_roles_loop", "probe_lds_tr_b8", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg"]
-}
-
-pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
-    match name {
-        "probe_dma_voff_spill" => Some(amdgpu_dsl::kernels::probe_dma_voff_spill()),
-        "probe_stamp" => Some(amdgpu_dsl::kernels::probe_stamp()),
-        "probe_agpr_ref" => Some(amdgpu_dsl::kernels::probe_agpr_ref()),
-        "probe_agpr_acc" => Some(amdgpu_dsl::kernels::probe_agpr_acc()),
-        "probe_agpr_full" => Some(amdgpu_dsl::kernels::probe_agpr_full()),
-        "probe_agpr_pinned" => Some(amdgpu_dsl::kernels::probe_agpr_pinned()),
-        "probe_store" => Some(amdgpu_dsl::kernels::probe_store()),
-        "probe_math" => Some(amdgpu_dsl::kernels::probe_math()),
-        "probe_mfma" => Some(amdgpu_dsl::kernels::probe_mfma()),
-        "probe_lds" => Some(amdgpu_dsl::kernels::probe_lds()),
-        "gv_audit_region_trust" => Some(amdgpu_dsl::kernels::gv_audit_region_trust()),
-        "probe_lds_oob" => Some(amdgpu_dsl::kernels::probe_lds_oob()),
-        "gv_attack_false_contract" => Some(amdgpu_dsl::kernels::gv_attack_false_contract()),
-        "gv_attack_assume_loop" => Some(amdgpu_dsl::kernels::gv_attack_assume_loop()),
-        "gv_attack_assume_trusted" => Some(amdgpu_dsl::kernels::gv_attack_assume_trusted()),
-        "gv_attack_lds_const" => Some(amdgpu_dsl::kernels::gv_attack_lds_const()),
-        "gv_attack_desc_over" => Some(amdgpu_dsl::kernels::gv_attack_desc_over()),
-        "gv_attack_clamp_path" => Some(amdgpu_dsl::kernels::gv_attack_clamp_path()),
-        "probe_expr_ids" => Some(amdgpu_dsl::kernels::probe_expr_ids()),
-        "probe_expr_kernarg" => Some(amdgpu_dsl::kernels::probe_expr_kernarg()),
-        "probe_mfma_scale" => Some(amdgpu_dsl::kernels::probe_mfma_scale()),
-        "probe_lds_self2" => Some(amdgpu_dsl::kernels::probe_lds_self2()),
-        "probe_roles_loop" => Some(amdgpu_dsl::kernels::probe_roles_loop()),
-        "probe_lds_tr_b8" => Some(amdgpu_dsl::kernels::probe_lds_tr_b8()),
-        n if n.starts_with("gemm_mxfp8_bs_v") && amdgpu_kernels::gemm_mxfp8::by_name(n).is_some() => amdgpu_kernels::gemm_mxfp8::by_name(n),
-        n if n.starts_with("handoff_probe_") => amdgpu_kernels::handoff_probe::by_name(n),
-        n if n.starts_with("mlp_fp8_") => amdgpu_kernels::mlp_fp8::by_name(n),
-        // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
-        "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
-        "fmha_fwd_hd128_mxfp8_v3_t128" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
-        "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
-        "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(amdgpu_tile::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),
-        "probe_dma" => Some(amdgpu_dsl::kernels::probe_dma()),
-        "probe_safeasm_e2e" => Some(amdgpu_dsl::kernels::probe_safeasm_e2e()),
-        "probe_log_store4" => Some(amdgpu_dsl::kernels::probe_log_store4()),
-        "probe_llvm_kernarg" => Some(amdgpu_dsl::kernels::probe_llvm_kernarg()),
-        "probe_llvm_ids" => Some(amdgpu_dsl::kernels::probe_llvm_ids()),
-        "probe_llvm_roles" => Some(amdgpu_dsl::kernels::probe_llvm_roles()),
-        "probe_llvm_lds" => Some(amdgpu_dsl::kernels::probe_llvm_lds()),
-        "probe_llvm_branch" => Some(amdgpu_dsl::kernels::probe_llvm_branch()),
-        "probe_llvm_loop" => Some(amdgpu_dsl::kernels::probe_llvm_loop()),
-        "probe_llvm_atomic" => Some(amdgpu_dsl::kernels::probe_llvm_atomic()),
-        "probe_llvm_maskge" => Some(amdgpu_dsl::kernels::probe_llvm_maskge()),
-        "probe_llvm_k1" => Some(amdgpu_dsl::kernels::probe_llvm_k1()),
-        "probe_llvm_k2" => Some(amdgpu_dsl::kernels::probe_llvm_k2()),
-        "probe_mfma_unscaled" => Some(amdgpu_dsl::kernels::probe_mfma_unscaled()),
-        "probe_mfma_scale_opsel" => Some(amdgpu_dsl::kernels::probe_mfma_scale_opsel()),
-        "probe_buffer_rw" => Some(amdgpu_dsl::kernels::probe_buffer_rw()),
-        "probe_buffer_dyn" => Some(amdgpu_dsl::kernels::probe_buffer_dyn()),
-        "probe_buffer_lds" => Some(amdgpu_dsl::kernels::probe_buffer_lds()),
-        "probe_mfma_cform" => Some(amdgpu_dsl::kernels::probe_mfma_cform()),
-        "probe_store_x2" => Some(amdgpu_dsl::kernels::probe_store_x2()),
-        "probe_cvtchain_dsl" => Some(amdgpu_dsl::kernels::probe_cvtchain_dsl()),
-        "probe_cvtchain_asm" => Some(amdgpu_dsl::kernels::probe_cvtchain_asm()),
-        "probe_la8" => Some(amdgpu_dsl::kernels::probe_la8()),
-        "probe_la8_lite" => Some(amdgpu_dsl::kernels::probe_la8_lite()),
-        "probe_la8_plain_fenced" => Some(amdgpu_dsl::kernels::probe_la8_plain_fenced()),
-        "probe_la8_plain" => Some(amdgpu_dsl::kernels::probe_la8_plain()),
-        "probe_la8_nodrain" => Some(amdgpu_dsl::kernels::probe_la8_nodrain()),
-        "probe_la_verify" => Some(amdgpu_dsl::kernels::probe_la_verify()),
-        "probe_last_arriver" => Some(amdgpu_dsl::kernels::probe_last_arriver()),
-        "probe_last_arriver_lite" => Some(amdgpu_dsl::kernels::probe_last_arriver_lite()),
-        "probe_last_arriver_plain" => Some(amdgpu_dsl::kernels::probe_last_arriver_plain()),
-        "probe_last_arriver_plain_fenced" => Some(amdgpu_dsl::kernels::probe_last_arriver_plain_fenced()),
-        "probe_last_arriver_nofence" => Some(amdgpu_dsl::kernels::probe_last_arriver_nofence()),
-        "probe_dma_tile" => Some(amdgpu_dsl::kernels::probe_dma_tile()),
-        "probe_dma_seq" => Some(amdgpu_dsl::kernels::probe_dma_seq()),
-        "probe_dma_kread" => Some(amdgpu_dsl::kernels::probe_dma_kread()),
-        "probe_dma_map" => Some(amdgpu_dsl::kernels::probe_dma_map()),
-        "probe_smfmac_ones" => Some(amdgpu_dsl::kernels::probe_smfmac_ones()),
-        "probe_smfmac_gen" => Some(amdgpu_dsl::kernels::probe_smfmac_gen()),
-        "probe_lds_tr_b8_gen" => Some(amdgpu_dsl::kernels::probe_lds_tr_b8_gen()),
-        _ => None,
-    }
-}
 /// The atomic/fence ops of the last-arriver pattern have rows in the LLVM tables only when `llvm_tail_has_rows` says so (set by the table probe).
 fn llvm_tail_has_rows() -> bool {
     true

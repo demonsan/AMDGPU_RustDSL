@@ -1,6 +1,6 @@
 //! Scoped branch facts of the region-tree walk (gpu_verify): inside `if n < k` a WAVE-UNIFORM `n` is known to be below `k`; a per-lane
 //! condition proves nothing about the other lanes of the wave (`begin_if` is wave-level) and is not used.
-use amdgpu_dsl::tile::ev;
+use amdgpu_dsl::ev;
 use amdgpu_dsl::{DType, FnBuilder, Function, Op};
 
 fn lds_oob(f: &Function) -> usize {

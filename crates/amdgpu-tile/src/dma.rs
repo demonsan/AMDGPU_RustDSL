@@ -8,8 +8,8 @@
 //! zero-extended: a negative one would wrap) - the instruction stream of the hand `RowsCopy`.
 
 use crate::Ctx;
-use amdgpu_dsl::tile::copy::RowSource;
-use amdgpu_dsl::tile::shared::{Shared, SlotRef};
+use crate::rows::RowSource;
+use crate::shared::{Shared, SlotRef};
 use amdgpu_dsl::{FnBuilder, ValueId, I32};
 use amdgpu_isa::CopyAtom;
 use amdgpu_layout::{ComposedLayout, Ix};
@@ -144,7 +144,7 @@ impl DmaPart {
 }
 
 fn ev_(v: ValueId) -> I32 {
-    amdgpu_dsl::tile::ev(v)
+    amdgpu_dsl::ev(v)
 }
 
 fn b_bind(b: &mut FnBuilder, x: &I32) -> ValueId {

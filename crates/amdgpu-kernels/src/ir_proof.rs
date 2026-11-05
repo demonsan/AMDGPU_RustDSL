@@ -15,7 +15,7 @@
 //! The proof-only `GEMM_PROOF_DROP_KB` hook in the kernel adds a real `if` around the MMAs of one
 //! tile generation; setting it to 1 reproduces the "tile 1 swallowed" bug in the KERNEL CODE.
 
-use amdgpu_dsl::tile::ev;
+use amdgpu_dsl::ev;
 use amdgpu_dsl::{Function, Node, Op, Opnd, RegionKind, Stmt, VarId, ValueId};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};

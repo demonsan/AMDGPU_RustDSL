@@ -1,5 +1,5 @@
 //! `buffer_load_b128x2`: two `buffer_load_dwordx4` straight into the halves of one 8-dword fragment (no v_mov copies, two vmcnt entries).
-use amdgpu_dsl::tile::ev;
+use amdgpu_dsl::ev;
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op};
 
 fn kernel(x2: bool) -> Function {

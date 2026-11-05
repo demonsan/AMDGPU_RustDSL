@@ -1,9 +1,9 @@
 //! TiledCopy over the FMHA K/V ring reproduces, lane by lane and instruction by instruction, the LDS addresses of the hand-derived readers of
-//! `amdgpu_dsl::tile::frag` (`RowsReader` = the K fragments, `TrReader` = the transposed V fragments), evaluated on the emitted IR.
+//! `amdgpu_tile::frag` (`RowsReader` = the K fragments, `TrReader` = the transposed V fragments), evaluated on the emitted IR.
 use std::collections::HashMap;
 
-use amdgpu_dsl::tile::frag::{RowsReader, TrReader};
-use amdgpu_dsl::tile::{Lane, LdsPlan, Layout as DslLayout, SlotIdx};
+use amdgpu_tile::frag::{RowsReader, TrReader};
+use amdgpu_tile::{Lane, LdsPlan, Layout as DslLayout, SlotIdx};
 use amdgpu_dsl::{FnBuilder, Function, Op, Opnd, Stmt};
 use amdgpu_isa::{MmaAtom, DS_READ_B128X2, DS_READ_TR_B8X4};
 use amdgpu_layout::*;
@@ -61,7 +61,7 @@ fn lds_addresses(f: &Function) -> Vec<Vec<i64>> {
         .collect()
 }
 
-fn ring(b: &mut FnBuilder) -> (amdgpu_dsl::tile::Shared, amdgpu_dsl::tile::Shared) {
+fn ring(b: &mut FnBuilder) -> (amdgpu_tile::Shared, amdgpu_tile::Shared) {
     let mut lds = LdsPlan::new();
     let [ks, vs] = lds.ring_group(2, [("K", 16384, DslLayout::FMHA_SWZ), ("V", 16384, DslLayout::FMHA_SWZ)]);
     lds.commit(b);

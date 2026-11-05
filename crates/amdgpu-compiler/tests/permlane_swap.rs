@@ -1,6 +1,6 @@
 //! `permlane32_swap(a, b) -> (a', b')`: one `v_permlane32_swap_b32` on copies of the operands (both are written), with the VALU-write ->
 //! permlane hazard padded.
-use amdgpu_dsl::tile::ev;
+use amdgpu_dsl::ev;
 use amdgpu_dsl::{DType, Ext, FnBuilder, Op};
 
 #[test]

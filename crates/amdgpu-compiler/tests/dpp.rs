@@ -1,5 +1,5 @@
 //! `dpp_quad_perm`: `v_mov_b32_dpp quad_perm` (lane l <- lane 4 (l / 4) + perm[l % 4]), with the VALU-write -> DPP-read hazard (2 wait states).
-use amdgpu_dsl::tile::ev;
+use amdgpu_dsl::ev;
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op};
 
 fn kernel(perm: [u8; 4]) -> Function {

@@ -1,6 +1,6 @@
 //! `var_set_lane` + `var_slice8`: values written straight into the dwords of a Frag16 loop variable and its two halves used as Frag8 MFMA
 //! operands without copies (the vendor keeps P in the registers of the dead S tile); `verify` rejects a slice used after the variable is written.
-use amdgpu_dsl::tile::ev;
+use amdgpu_dsl::ev;
 use amdgpu_dsl::{DType, FnBuilder, Function, Op, Opnd};
 
 fn kernel(bad: bool) -> Function {

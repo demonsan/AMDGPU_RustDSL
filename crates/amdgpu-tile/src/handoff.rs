@@ -6,7 +6,7 @@
 //!   `4 (64 v + t)`, then reads destination register `r'` from the address of its source slot, an XOR of lane-bit groups (the GF(2) matrix).
 //! Every lowering is checked at build time by simulating the emitted moves on element ids (`simulate_*`): the result must equal the plan's map.
 
-use amdgpu_dsl::tile::{ev, PrivRef};
+use crate::{ev, PrivRef};
 use amdgpu_dsl::{FnBuilder, ValueId, I32};
 use amdgpu_layout::{ConvPlan, Movement};
 

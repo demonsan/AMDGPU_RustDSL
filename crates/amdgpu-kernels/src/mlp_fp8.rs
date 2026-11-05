@@ -10,7 +10,7 @@
 //! (`Y^T = W2 H^T`) up to the key permutation `sigma` - absorbed by the pre-permuted W2 - so the hand-off costs no instruction. The boundary is a
 //! `StageBoundary` checked at build time (`check_boundary`).
 
-use amdgpu_dsl::tile::{ev, Lane};
+use amdgpu_tile::{ev, Lane};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
 use amdgpu_isa::MmaAtom;
 use amdgpu_tile::contract_stage::{check_boundary, LiveFrag, StageBoundary, Storage};
@@ -86,7 +86,7 @@ fn build_ws(name: &str, mode: Mode) -> Function {
             assert!(rep.frags.iter().all(|f| f.1 <= Movement::Register && f.2 == 0), "{name}: the P hand-off is not free: {:?}", rep.frags);
         }
     }
-    use amdgpu_dsl::tile::{LdsPlan, Layout as TLayout, SlotIdx};
+    use amdgpu_tile::{LdsPlan, Layout as TLayout, SlotIdx};
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
     let b = &mut fb;
@@ -146,7 +146,7 @@ fn build_ws(name: &str, mode: Mode) -> Function {
     let h16 = b.bind_i32(lane.half() << 4);
     // W fragment of 32-row tile t, k block kb (A operand): rows 32 t + j, bytes 64 kb + 16 h and + 32
     let wlane = b.bind_i32(ev(lane.j) * (W_PITCH as i32) + ev(h16));
-    let wfrag = |b: &mut FnBuilder, sh: &amdgpu_dsl::tile::Shared, t: i64, kb: i64| -> ValueId {
+    let wfrag = |b: &mut FnBuilder, sh: &amdgpu_tile::Shared, t: i64, kb: i64| -> ValueId {
         let pr = sh.at(&SlotIdx::new(0, 0));
         let base = sh.base as i32 + (t * 32 * W_PITCH + 64 * kb) as i32;
         pr.read(b, |b| {
@@ -165,7 +165,7 @@ fn build_ws(name: &str, mode: Mode) -> Function {
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(bx))];
     inits.extend(x0.iter().map(|x| (DType::Frag8, Opnd::Val(*x))));
     let vars = b.begin_loop(&inits);
-    let blk = amdgpu_dsl::tile::varx(vars[0]);
+    let blk = amdgpu_dsl::varx(vars[0]);
     let xs: Vec<Opnd> = vars[1..].iter().map(|v| Opnd::Var(*v)).collect();
     let next = b.bind_i32(blk.clone() + ev(g_v));
     let row = b.bind_i32((blk.clone() << 7) + (lane.wave() << 5) + lane.j());

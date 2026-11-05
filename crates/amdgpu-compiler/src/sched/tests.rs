@@ -189,24 +189,4 @@ fn random_blocks_schedule_legally() {
     }
 }
 
-#[test]
-fn every_kernel_schedules_and_verifies() {
-    for name in crate::kernel_names() {
-        let f = crate::kernel_by_name(name).unwrap();
-        let Ok(mut m) = crate::lower::lower(&f) else { continue };
-        for xbar in [false, true] {
-            let mut mm = m.clone();
-            let mut o = opts();
-            o.alu_across_barrier = xbar;
-            run(&mut mm, &o).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(crate::mir::verify(&mm).is_empty(), "{name}");
-        }
-        let mut mm = m.clone();
-        let mut o = opts();
-        o.reorder = false;
-        run(&mut mm, &o).unwrap_or_else(|e| panic!("{name} rewait: {e}"));
-        let _ = &mut m;
-    }
-}
 
-// ---- software pipelining: GPU-free semantic check with a tiny MIR interpreter (V1 integer subset) ----

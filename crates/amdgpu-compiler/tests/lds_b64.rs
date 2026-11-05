@@ -1,6 +1,6 @@
 //! `ds_read_b64` / `ds_write_b64`: IR forms (Frag2), lowered with folded immediates, emitted, assembled by asm_assembles-style check, and proven by the
 //! GPU-semantics verifier (LDS bounds with 8-byte accesses, tile protocol).
-use amdgpu_dsl::tile::ev;
+use amdgpu_dsl::ev;
 use amdgpu_dsl::{DType, FnBuilder, Function, Op, Opnd};
 
 pub fn lds64_demo() -> Function {

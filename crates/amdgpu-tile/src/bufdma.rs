@@ -8,7 +8,7 @@
 //! offset), `M0_q` = the destination of lane 0 minus `imm_q` (wave-uniform).
 
 use crate::Ctx;
-use amdgpu_dsl::tile::shared::{Shared, SlotRef};
+use crate::shared::{Shared, SlotRef};
 use amdgpu_dsl::{FnBuilder, Opnd, ValueId, I32};
 use amdgpu_isa::CopyAtom;
 use amdgpu_layout::{composition, ComposedLayout, IntTuple, Ix, Layout};

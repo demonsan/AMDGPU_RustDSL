@@ -1,6 +1,6 @@
 //! Wave-uniform select of buffer descriptors / pointers (`select_uniform_rsrc`, `select_uniform_ptr`): lowered to `s_cmp` + `s_cselect_b64` (x2 for the
 //! 128-bit descriptor) without a branch or a VGPR round trip, and proven by the GPU-semantics verifier against BOTH arms (a lying arm is rejected).
-use amdgpu_dsl::tile::ev;
+use amdgpu_dsl::ev;
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, Opnd};
 
 /// Kernarg layout: 0x00 ptr A, 0x08 ptr B, 0x10 ptr O, 0x18 i32 n (1..4), 0x1C i32 unused.

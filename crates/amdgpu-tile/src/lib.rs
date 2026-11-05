@@ -7,16 +7,25 @@
 //!   (`Swizzle o Layout`), `at` adds the slot offset once per tile, `read` emits the atom's instructions under the slot's read marker;
 //! * [`TiledMma`] / [`gemm`]: an MMA atom (optionally with swapped A/B) and the in-place accumulate.
 //!
-//! The FMHA readers of `amdgpu_dsl::tile::frag` (`RowsReader`, `TrReader`) are reproduced address for address by `TiledCopy` (tests/address_equality.rs).
+//! The FMHA readers of `crate::frag` (`RowsReader`, `TrReader`) are reproduced address for address by `TiledCopy` (tests/address_equality.rs).
 
 #![forbid(unsafe_code)]
 
+pub mod components;
+pub mod epilogue;
+pub mod frag;
+pub mod lane;
+pub mod pipeline;
+pub mod reduce;
+pub mod rows;
+pub mod shared;
+pub mod softmax;
+pub mod tensor;
 pub mod bufdma;
 pub mod contract;
 pub mod contract_stage;
 pub mod copy;
 pub mod dma;
-pub mod fmha;
 pub mod global;
 pub mod handoff;
 pub mod orient;
@@ -135,13 +144,13 @@ impl Ctx {
             _ => {}
         }
         if let Some(v) = self.memo.borrow().get(x) {
-            return amdgpu_dsl::tile::ev(*v);
+            return amdgpu_dsl::ev(*v);
         }
         if let Some(r) = self.bit_rewrite(x) {
             let e = self.bind(b, &r);
             let v = b.bind_i32(e);
             self.memo.borrow_mut().insert(x.clone(), v);
-            return amdgpu_dsl::tile::ev(v);
+            return amdgpu_dsl::ev(v);
         }
         let e = match x {
             Ix::Sum(t, k) => {
@@ -184,7 +193,7 @@ impl Ctx {
         };
         let v = b.bind_i32(e);
         self.memo.borrow_mut().insert(x.clone(), v);
-        amdgpu_dsl::tile::ev(v)
+        amdgpu_dsl::ev(v)
     }
     /// The IR expression of a layout expression. Divisions and remainders must be by powers of two (shift / and); other constants multiply.
     pub fn lower(&self, x: &Ix) -> I32 {
@@ -232,4 +241,21 @@ impl Ctx {
             Ix::Shr(a, s) => self.lower(a).lshr(*s as i32),
         }
     }
+}
+
+// the tile components formerly in `amdgpu_dsl::tile`
+
+pub use amdgpu_dsl::{ev, ox, varx};
+
+/// Is the expression the literal 0?
+pub fn is_zero(e: &I32) -> bool {
+    matches!(&*e.0, amdgpu_dsl::expr::Node::CI(0))
+}
+/// `a + b`, or `a` when `b` is the literal 0 (no `add` emitted).
+pub fn add0(a: I32, b: &I32) -> I32 {
+    if is_zero(b) {
+        a
+    } else {
+        a + b
+    }
 }

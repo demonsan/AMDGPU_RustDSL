@@ -2,7 +2,7 @@
 
 use crate::mma::TiledMma;
 use crate::Ctx;
-use amdgpu_dsl::tile::shared::{PrivRef, Shared, SlotRef};
+use crate::shared::{PrivRef, Shared, SlotRef};
 use amdgpu_dsl::{FnBuilder, Opnd, ValueId, I32};
 use amdgpu_isa::{CopyAtom, Space};
 use amdgpu_layout::{layout_to_offsets, proofs, ComposedLayout, IssuePlan, Ix, Layout};

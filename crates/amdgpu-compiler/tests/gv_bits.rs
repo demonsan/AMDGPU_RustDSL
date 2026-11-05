@@ -1,6 +1,6 @@
 //! gpu_verify possible-bits rules for XOR / AND: bounded swizzled addresses `row ^ chunk` and `x & -16` masks are proven inside the LDS segment, and
 //! the attacks (possibly negative operands, carries of overlapping sums) are still rejected.
-use amdgpu_dsl::tile::ev;
+use amdgpu_dsl::ev;
 use amdgpu_dsl::{FnBuilder, Function, Op, I32};
 
 /// One `ds_read_b128` at the address built by `addr` from the workitem id, in an `lds`-byte segment.

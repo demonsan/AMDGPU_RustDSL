@@ -9,7 +9,7 @@
 //! voffsets; the scales once per CTA into a transposed panel (VGPR loads + in-register byte transposes); the LDS-staged epilogue; the slot-filling
 //! scheduler places the DMA issues.
 
-use amdgpu_dsl::tile::{ev, ox, Cadence, LdsPlan, Lane, PipeBody, Pipeline, Role, Shared, SlotIdx, TileIt};
+use amdgpu_tile::{ev, ox, Cadence, LdsPlan, Lane, PipeBody, Pipeline, Role, Shared, SlotIdx, TileIt};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Function, Op, Opnd, ValueId, VarId, I32};
 use amdgpu_isa::{MmaAtom, DS_READ_B128X2};
 use amdgpu_layout::{composition, layout_to_offsets, make_layout, right_inverse, tup, ComposedLayout, ImmRange, IssuePlan, Ix, Layout, Swizzle};
@@ -624,11 +624,11 @@ fn build(name: &str, cfg: Cfg) -> Function {
     let mut lds = LdsPlan::new();
     let slots = 2;
     let a_bytes = cta_m / 8 * 1056;
-    let a_s = lds.ring("A", a_bytes, slots, amdgpu_dsl::tile::Layout::Linear);
-    let b_s = lds.ring("B", cta_n * 128, slots, amdgpu_dsl::tile::Layout::Linear);
-    let sc_s = lds.ring("SC", 4 * 512, slots, amdgpu_dsl::tile::Layout::Linear);
+    let a_s = lds.ring("A", a_bytes, slots, amdgpu_tile::Layout::Linear);
+    let b_s = lds.ring("B", cta_n * 128, slots, amdgpu_tile::Layout::Linear);
+    let sc_s = lds.ring("SC", 4 * 512, slots, amdgpu_tile::Layout::Linear);
     // scale panel: A [PANEL_KB][256 rows] + B [2 blocks][PANEL_KB] (+ 4 bytes of source alignment slack, padded to 256 for the dword DMA)
-    let panel_sh = lds.tile("SCP", PANEL_KB * 256 + 512, amdgpu_dsl::tile::Layout::Linear);
+    let panel_sh = lds.tile("SCP", PANEL_KB * 256 + 512, amdgpu_tile::Layout::Linear);
     // epilogue staging (wave-private, reusing the dead ring / panel storage): the wave's C block, bf16 rows of EPI_PITCH bytes
     let epi = if cfg.lds_epilogue {
         let ov: Vec<&Shared> = vec![&a_s, &b_s, &sc_s, &panel_sh];
