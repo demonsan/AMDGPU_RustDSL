@@ -18,7 +18,7 @@ fn is_matrix(op: MOp) -> bool {
 
 /// Number of blocks changed.
 pub fn run(m: &mut MFunction, o: &Options) -> usize {
-    if o.ldahead == 0 {
+    if o.ldahead == 0 && o.ldsink == 0 {
         return 0;
     }
     let lv = liveness::compute(m);
@@ -36,8 +36,46 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
         let mut pos: Vec<usize> = (0..n).collect();
         let limit = slotfill::peak_live(m, &insts, &order, live_out) + o.ldslack;
         let mut moved = 0usize;
+        // `ldsink`: sink reads (last first) while more than D MFMAs separate them from their first consumer
+        if o.ldsink > 0 {
+            for r in (0..n).rev() {
+                if !is_lds_read(insts[r].op) {
+                    continue;
+                }
+                let Some(d) = insts[r].dst.map(|d| m.canon(d)) else { continue };
+                loop {
+                    let p = pos[r];
+                    if p + 1 >= n {
+                        break;
+                    }
+                    let mut mf = 0usize;
+                    let mut found = false;
+                    for q in p + 1..n {
+                        let x = &insts[order[q]];
+                        if x.uses().iter().any(|u| m.canon(*u) == d) {
+                            found = true;
+                            break;
+                        }
+                        if is_matrix(x.op) {
+                            mf += 1;
+                        }
+                    }
+                    if !found || mf <= o.ldsink {
+                        break;
+                    }
+                    let next = order[p + 1];
+                    if g.succs[r].iter().any(|&(x, _)| x == next) {
+                        break;
+                    }
+                    order.swap(p, p + 1);
+                    pos[order[p]] = p;
+                    pos[order[p + 1]] = p + 1;
+                    moved += 1;
+                }
+            }
+        }
         for r in 0..n {
-            if !is_lds_read(insts[r].op) {
+            if o.ldahead == 0 || !is_lds_read(insts[r].op) {
                 continue;
             }
             let Some(d) = insts[r].dst.map(|d| m.canon(d)) else { continue };
