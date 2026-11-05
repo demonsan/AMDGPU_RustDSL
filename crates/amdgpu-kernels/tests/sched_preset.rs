@@ -1,7 +1,8 @@
 //! `scheduler_options`: a kernel's explicit `Function::sched_opts` tokens are applied ON TOP of its profile preset, never instead of it
 //! (regression: `_t128` shipped with `sched_opts = "ldsink=1"` and silently lost its preset - ALU across the barrier + the 248 pressure limit - for -1.5..-2.9% on realistic data).
 
-use amdgpu_compiler::{kernel_by_name, policy_name, scheduler_options};
+use amdgpu_compiler::{policy_name, scheduler_options};
+use amdgpu_kernels::kernel_by_name;
 
 fn opts(name: &str, tokens: Option<&str>) -> amdgpu_compiler::sched::Options {
     let mut f = kernel_by_name(name).unwrap_or_else(|| panic!("{name}"));
