@@ -63,15 +63,18 @@ fn transpose_tv(tv: &Layout, r: i64) -> Layout {
 }
 
 /// `acc += A * B` with the atom of `mma` (operands as the TiledMma presents them; the exchange of `swap_ab` is applied here). `byte_a` / `byte_b` select
-/// the E8M0 byte of the scale dwords (16x16x128 only; 0 otherwise).
+/// the E8M0 byte of the scale dwords (op_sel / op_sel_hi of both scaled atoms).
 #[allow(clippy::too_many_arguments)]
 pub fn gemm(b: &mut FnBuilder, mma: &TiledMma, acc: VarId, a: ValueId, bf: ValueId, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>, byte_a: u8, byte_b: u8) {
     let (sa, sb): (Opnd, Opnd) = (scale_a.into(), scale_b.into());
     let (x, y, sx, sy, bx, by) = if mma.swap_ab { (bf, a, sb, sa, byte_b, byte_a) } else { (a, bf, sa, sb, byte_a, byte_b) };
     match mma.atom.name {
         "MfmaScale32x32x64F8" => {
-            assert!(bx == 0 && by == 0, "the 32x32x64 scaled MFMA reads scale byte 0");
-            b.var_mfma_scale(acc, x, y, sx, sy);
+            if bx == 0 && by == 0 {
+                b.var_mfma_scale(acc, x, y, sx, sy);
+            } else {
+                b.var_mfma_scale_sel(acc, x, y, sx, sy, bx, by);
+            }
         }
         "MfmaScale16x16x128F8" => b.var_mfma_scale16(acc, x, y, sx, sy, bx, by),
         other => panic!("gemm: no IR accumulate form for the atom {other}"),

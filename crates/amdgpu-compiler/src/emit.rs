@@ -469,12 +469,13 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             let sa = reg_of(&inst.srcs[2]);
             let sb = reg_of(&inst.srcs[3]);
             vec![format!(
-                "v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, 0, {}, {}",
+                "v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, 0, {}, {}{}",
                 tuple(a, inst.dst.expect("dst"), 16),
                 tuple(a, a_reg, 8),
                 tuple(a, b_reg, 8),
                 vr(a, sa),
-                vr(a, sb)
+                vr(a, sb),
+                scale_opsel(inst.imm)
             )]
         }
         MOp::VMfmaScale32x32x64Fp8 => {
@@ -484,13 +485,14 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             let sa = reg_of(&inst.srcs[3]);
             let sb = reg_of(&inst.srcs[4]);
             vec![format!(
-                "v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}",
+                "v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}",
                 tuple(a, inst.dst.expect("dst"), 16),
                 tuple(a, a_reg, 8),
                 tuple(a, b_reg, 8),
                 tuple(a, c_reg, 16),
                 vr(a, sa),
-                vr(a, sb)
+                vr(a, sb),
+                scale_opsel(inst.imm)
             )]
         }
         MOp::VMfmaScale16x16x128Fp8 => {
@@ -841,5 +843,16 @@ fn lds_off(imm: i64) -> String {
         String::new()
     } else {
         format!(" offset:{imm}")
+    }
+}
+
+/// Scale byte select of the scaled MFMAs (`imm` bits 0..1 = byte of scale A, bits 4..5 = byte of scale B): op_sel holds bit 0, op_sel_hi bit 1
+/// (hardware-checked: tools/mfma_opsel_probe.sh); byte 0 / 0 prints nothing.
+fn scale_opsel(imm: i64) -> String {
+    let (sa_b, sb_b) = (imm & 3, (imm >> 4) & 3);
+    if sa_b == 0 && sb_b == 0 {
+        String::new()
+    } else {
+        format!(" op_sel:[{},{},0] op_sel_hi:[{},{},0]", sa_b & 1, sb_b & 1, sa_b >> 1, sb_b >> 1)
     }
 }

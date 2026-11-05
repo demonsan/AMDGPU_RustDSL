@@ -466,6 +466,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_llvm_k1" => Some(amdgpu_dsl::kernels::probe_llvm_k1()),
         "probe_llvm_k2" => Some(amdgpu_dsl::kernels::probe_llvm_k2()),
         "probe_mfma_unscaled" => Some(amdgpu_dsl::kernels::probe_mfma_unscaled()),
+        "probe_mfma_scale_opsel" => Some(amdgpu_dsl::kernels::probe_mfma_scale_opsel()),
         "probe_buffer_rw" => Some(amdgpu_dsl::kernels::probe_buffer_rw()),
         "probe_buffer_dyn" => Some(amdgpu_dsl::kernels::probe_buffer_dyn()),
         "probe_buffer_lds" => Some(amdgpu_dsl::kernels::probe_buffer_lds()),

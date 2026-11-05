@@ -703,7 +703,8 @@ pub enum Stmt {
     /// 16-byte global load written straight into a `Frag4` loop variable.
     VarLoadB128 { var: VarId, base: Opnd, byte_off: u32 },
     /// `var = scaled_mfma_32x32x64_fp8(a, b, var)`: accumulate into a loop variable in place.
-    VarMfmaScale { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
+    /// `opsel`: E8M0 byte select of the scale dwords (bits 0..1 = byte of `scale_a`, bits 4..5 = byte of `scale_b`; 0 = byte 0), as `VarMfmaScale16`.
+    VarMfmaScale { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd, opsel: u8 },
     /// `var = scaled_mfma_32x32x64_fp8(a, b)` with a zero accumulator (overwrites the variable).
     VarMfmaScaleZ { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
     /// `var = a x b + c` (c a Frag16 VALUE, not the variable itself: the accumulator input and the destination are different registers)
@@ -1149,8 +1150,12 @@ impl Function {
                 Stmt::VarMfmaScaleC { var, a, b, c, scale_a, scale_b } => {
                     let _ = writeln!(s, "{pad}var{} = mfma_scale({a:?}, {b:?}, c={c:?}; {scale_a:?}, {scale_b:?})", var.0);
                 }
-                Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
-                    let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
+                Stmt::VarMfmaScale { var, a, b, scale_a, scale_b, opsel } => {
+                    if *opsel == 0 {
+                        let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
+                    } else {
+                        let _ = writeln!(s, "{pad}var{} += mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?}; opsel 0x{opsel:02x})", var.0);
+                    }
                 }
                 Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, opsel } => {
                     let _ = writeln!(s, "{pad}var{} += mfma_scale16({a:?}, {b:?}; {scale_a:?}, {scale_b:?}; opsel 0x{opsel:02x})", var.0);
@@ -2054,7 +2059,16 @@ impl FnBuilder {
             b: b.into(),
             scale_a: scale_a.into(),
             scale_b: scale_b.into(),
+            opsel: 0,
         });
+    }
+
+    /// `var += v_mfma_scale_f32_32x32x64_f8f6f4(a, b; scale_a.byte[byte_a], scale_b.byte[byte_b])` in place: the scale operands are whole dwords and
+    /// the instruction's op_sel / op_sel_hi pick the E8M0 byte (no VALU byte extraction; the vendor's form).
+    #[allow(clippy::too_many_arguments)]
+    pub fn var_mfma_scale_sel(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>, byte_a: u8, byte_b: u8) {
+        assert!(byte_a < 4 && byte_b < 4, "scale byte select is 0..3");
+        self.push_stmt(Stmt::VarMfmaScale { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into(), opsel: byte_a | (byte_b << 4) });
     }
 
     /// `var += smfmac_16x16x128_fp8_fp8(a, b, idx)`: accumulate into a `Frag4` loop variable in place.
@@ -2865,7 +2879,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::VarMfmaScale { var, a, b, scale_a, scale_b } => {
+            Stmt::VarMfmaScale { var, a, b, scale_a, scale_b, .. } => {
                 let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
                     errs.push(here(format!("var{var} accumulated outside its loop")));
