@@ -287,7 +287,8 @@ impl Pipeline {
             let stop2 = b.bind_cond(!ev(it2).lt(&nkv_m1));
             b.break_if(stop2);
             b.end_loop();
-            let it_t = b.bind_i32(varx(it) + varx(idx));
+            // the peeled tile is the last one, nkv - 1 (the loop leaves at it >= nkv - 1 after either half)
+            let it_t = b.bind_i32(ev(self.nkv) - 1);
             let is_tail = b.bind_cond(ev(self.kv_len).lt((ev(it_t) << self.lg()) + self.tile_rows));
             let last_barrier = role != Role::B;
             // the last tile's slot is its parity (tile k sits in slot k & 1): an affine function of the counters for the protocol model
