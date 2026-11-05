@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Same-run A/B of FMHA kernel variants (by name) on the filled shapes: emit + assemble each kernel, a 64-row accuracy check per shape
 # (ours vs CPU, vendor vs CPU), then REPS interleaved timing rounds; prints the medians.
-#   HIP_VISIBLE_DEVICES=5 bash tools/ab_fmha.sh <kernel>... [-- "B S" ...]   (defaults: shapes "4 2048" "1 8192"; REPS=7; ROWS_PER_BLOCK=256)
+#   HIP_VISIBLE_DEVICES=5 bash tools/ab_fmha.sh <kernel>[@name=v,..]... [-- "B S" ...]   (defaults: shapes "4 2048" "1 8192"; REPS=7; ROWS_PER_BLOCK=256)
+#   `kernel@spec` emits with `--specialize spec` (docs/jit.md); the variant is labelled `kernel@spec` (only meaningful on a matching shape)
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 R=/shared/apps/ubuntu/opt/rocm-7.0.2; CL=/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang
@@ -12,13 +13,15 @@ while [ $# -gt 0 ]; do [ "$1" = -- ] && { shift; SH=("$@"); break; }; KS+=("$1")
 REPS=${REPS:-7}; RPB=${ROWS_PER_BLOCK:-256}
 mkdir -p build/ab
 [ -x build/ff/ref_host ] || { mkdir -p build/ff; g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/ref_host.cpp -o build/ff/ref_host -I$R/include -L$R/lib -lamdhip64 -Wl,-rpath,$R/lib; }
+kn() { echo "${1%%@*}"; }
+ksp() { case "$1" in *@*) echo "--specialize ${1#*@}";; esac; }
 for k in "${KS[@]}"; do
-  $A emit "$k" --backend=own --out "build/ab/$k.s" >/tmp/ab_e.log 2>&1 || { echo "EMIT FAIL $k"; tail -4 /tmp/ab_e.log; exit 1; }
+  $A emit "$(kn "$k")" --backend=own $(ksp "$k") --out "build/ab/$k.s" >/tmp/ab_e.log 2>&1 || { echo "EMIT FAIL $k"; tail -4 /tmp/ab_e.log; exit 1; }
   $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "build/ab/$k.co" "build/ab/$k.s" || exit 1
-  v=$($A gpu-verify "$k" --strict 2>&1 | grep -E '^== ' | sed -E 's/proven.*//')
+  v=$($A gpu-verify "$(kn "$k")" --strict $(ksp "$k") 2>&1 | grep -E '^== ' | sed -E 's/proven.*//')
   echo "$k: md5 $(md5sum < build/ab/$k.s | cut -c1-12) $(grep -E '\.vgpr_count:' build/ab/$k.s | tr -s ' ') | $v"
 done
-run() { env HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-5} REF_B=$1 REF_H=8 REF_S=$2 REF_SK=$2 REF_HK=8 REF_CO2=build/ab/$3.co REF_KNAME2=$3 REF_ROWS_PER_BLOCK=$RPB "${@:4}" ./build/ff/ref_host $V 2>&1; }
+run() { env HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-5} REF_B=$1 REF_H=8 REF_S=$2 REF_SK=$2 REF_HK=8 REF_CO2=build/ab/$3.co REF_KNAME2=$(kn "$3") REF_ROWS_PER_BLOCK=$RPB "${@:4}" ./build/ff/ref_host $V 2>&1; }
 for s in "${SH[@]}"; do set -- $s
   for k in "${KS[@]}"; do echo "acc B$1 S$2 $k: $(run $1 $2 $k REF_ROWS=64 REF_WARMUP=2 REF_ITERS=2 | grep -E 'kernel +vs CPU: ' | sed -E 's/checked=[0-9]+ //;s/ max\|ref\|=[0-9.]+//;s/ kernel +vs CPU://;s/worst_err=[^ ]+ //' | tr '\n' ' ')"; done
 done
