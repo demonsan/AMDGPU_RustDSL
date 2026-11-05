@@ -140,7 +140,9 @@ def validate(info: KernelInfo, ka: dict, grid, syms: dict, sizes: dict):
     grid = (tuple(grid) + (1, 1, 1))[:3]
     for s in c.get("syms", []):
         if s["name"] not in syms:
-            raise ContractError(f"{info.kernel}: contract symbol {s['name']} not supplied")
+            # kernel-internal names (e.g. KL, the first key of a KV split) are not host inputs; a contract expression that needs an
+            # unsupplied symbol fails in eval_ext
+            continue
         v = syms[s["name"]]
         if v < s["lo"] or (s.get("hi") is not None and v > s["hi"]):
             raise ContractError(f"{info.kernel}: symbol {s['name']} = {v} outside [{s['lo']}, {s.get('hi')}]")
