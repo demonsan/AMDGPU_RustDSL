@@ -180,7 +180,6 @@ pub enum Op {
     LoadGlobalB128 { base: Opnd, byte_off: u32 },
     /// Device-scope coherent loads (`sc1`): bypass the non-coherent cache levels, see the other XCDs' write-through stores.
     LoadF32Coherent { base: Opnd, byte_off: u32 },
-    LoadB128Coherent { base: Opnd, byte_off: u32 },
     /// Buffer resource descriptor over the scalar (kernarg) pointer `base`: 4 SGPRs = [base lo, base hi (bits 47:32), num_records, flags]. Bounds checking
     /// is off with `num_records = 0xFFFF_FFFF`; the descriptor is allocated and reused by the compiler like any other SGPR value.
     BufferRsrc { base: Opnd, num_records: u32 },
@@ -229,21 +228,12 @@ pub enum Op {
     MfmaF16 { a: Opnd, b: Opnd, c: Opnd },
     /// `v_mfma_f32_32x32x8_f16` with an existing accumulator.
     MfmaF16Wide { a: Opnd, b: Opnd, c: Opnd },
-    /// `v_mfma_f32_16x16x32_fp8_fp8`: fp8 A/B, f32 accumulator.
-    MfmaFp8_16x16x32 { a: Opnd, b: Opnd, c: Opnd },
-    /// `v_mfma_f32_32x32x16_fp8_fp8`: fp8 A/B, 16-dword accumulator.
-    MfmaFp8_32x32x16 { a: Opnd, b: Opnd, c: Opnd },
     /// Build an eight-dword fragment from eight 32-bit values.
     Frag8(Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd, Opnd),
     /// Concatenate two four-dword fragments into an eight-dword fragment.
     CatFrag8(Opnd, Opnd),
-    /// Build a sixteen-dword fragment from sixteen scalar dwords.
-    Frag16Build(Vec<Opnd>),
     /// Pack two f32 values into two unsigned-normalized 16-bit values (low = a).
     CvtPknormU16(Opnd, Opnd),
-    /// Scale two bf16 values and pack them into two fp8 values, replacing one
-    /// 16-bit half of old (high selects the upper half).
-    CvtScalef32PkFp8Bf16 { old: Opnd, src: Opnd, scale: Opnd, high: bool },
     /// `v_mfma_scale_f32_32x32x64_f8f6f4`: block-scaled fp8 MFMA. The two scale
     /// operands are E8M0 exponents in scalar registers.
     MfmaScaleFp8_32x32x64 { a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
@@ -264,16 +254,12 @@ pub enum Op {
     BitcastF32(Opnd),
     /// Register reinterpretation to i32 (no instruction).
     BitcastI32(Opnd),
-    /// Pack two f32 into two E4M3 fp8 bytes (low 16 bits of the result).
-    CvtPkFp8F32(Opnd, Opnd),
     /// Two f32 -> two bf16 (round to nearest even) packed into one dword (_cvt_pk_bf16_f32).
     CvtPkBf16F32(Opnd, Opnd),
     /// Base-2 exponential: the hardware primitive (_exp_f32), no log2(e) scaling.
     Exp2F32(Opnd),
     /// Base-2 logarithm: the hardware primitive (v_log_f32).
     Log2F32(Opnd),
-    /// Dwords `index` and `index + 1` (`index` even) of a fragment as a `Frag2` (register alias, no instruction).
-    Frag16Pair { frag: Opnd, index: u8 },
     /// A `Frag2` with both dwords set to one 32-bit value.
     Frag2Dup(Opnd),
     /// `v_pk_add_f32` on two `Frag2` operands.
@@ -662,7 +648,6 @@ pub enum Stmt {
     BufferLoadLds { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, lds_addr: Opnd, imm: u32, dwords: u8 },
     /// Device-scope write-through stores (`sc1`): visible to coherent loads / atomics of other workgroups on other XCDs.
     StoreF32Wt { base: Opnd, byte_off: u32, value: Opnd },
-    StoreF32x4Wt { base: Opnd, byte_off: u32, value: Opnd },
     /// Release fence at device scope: `s_waitcnt vmcnt(0) lgkmcnt(0)` [+ `buffer_wbl2 sc1` + `s_waitcnt vmcnt(0)` when `wb`].
     FenceRelease { wb: bool },
     /// Acquire fence at device scope: `s_waitcnt vmcnt(0)` [+ `buffer_inv sc1` when `inv`]; later loads cannot move above it.
@@ -700,13 +685,9 @@ pub enum Stmt {
     /// `var.lane[index] = value` (a 32-bit value into one dword of a fragment variable; the lowering writes the producer straight into that
     /// dword when the value has no other use).
     VarSetLane { var: VarId, index: u8, value: Opnd },
-    /// 16-byte global load written straight into a `Frag4` loop variable.
-    VarLoadB128 { var: VarId, base: Opnd, byte_off: u32 },
     /// `var = scaled_mfma_32x32x64_fp8(a, b, var)`: accumulate into a loop variable in place.
     /// `opsel`: E8M0 byte select of the scale dwords (bits 0..1 = byte of `scale_a`, bits 4..5 = byte of `scale_b`; 0 = byte 0), as `VarMfmaScale16`.
     VarMfmaScale { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd, opsel: u8 },
-    /// `var = scaled_mfma_32x32x64_fp8(a, b)` with a zero accumulator (overwrites the variable).
-    VarMfmaScaleZ { var: VarId, a: Opnd, b: Opnd, scale_a: Opnd, scale_b: Opnd },
     /// `var = a x b + c` (c a Frag16 VALUE, not the variable itself: the accumulator input and the destination are different registers)
     VarMfmaScaleC { var: VarId, a: Opnd, b: Opnd, c: Opnd, scale_a: Opnd, scale_b: Opnd },
     /// UNSCALED fp8 MFMA (`v_mfma_f32_32x32x64_f8f6f4`) into a loop variable: in place `var += a x b`
