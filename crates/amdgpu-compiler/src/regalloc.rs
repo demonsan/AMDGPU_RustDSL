@@ -29,12 +29,6 @@ const V_RESERVED: usize = 1;
 const S_RESERVED: usize = 8;
 
 pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
-    // AMDC_RA_FORCE_TWOPHASE=1: use the precise-liveness packing first (testing; it is normally the last resort)
-    if std::env::var("AMDC_RA_FORCE_TWOPHASE").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
-        if let Ok(a) = allocate_two_phase(m) {
-            return checked(m, a, "two-phase");
-        }
-    }
     // First try the compact policy. If the kernel runs out of registers only because wide
     // tuples cannot find an aligned hole between scattered singles, retry with the singles
     // packed from the top of the file so the low registers stay available for tuples.

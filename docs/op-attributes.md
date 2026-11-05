@@ -1,6 +1,6 @@
 # 机器指令属性表（`op_attrs`）
 
-> 代码：`crates/amdgpu-compiler/src/op_attrs.rs`；回归测试：`crates/amdgpu-compiler/src/op_attrs_equiv.rs`。
+> 代码：`crates/amdgpu-compiler/src/op_attrs.rs`；测试：`op_attrs.rs` 内的 `tests`（枚举完整性、LLVM 覆盖表）。
 > 设计依据：[`ir-review-tirx-sftensor.md`](ir-review-tirx-sftensor.md) 的 A 项（TIRx 的算子属性：`FInferType`、`TCallEffectKind`、
 > `FLowerIntrinsic`、`FLegalize`——pass 查属性，不枚举算子名）。
 
@@ -28,7 +28,7 @@
 | `m0_src` | LDS-DMA 形式中给出 `M0` 的源操作数 | `sched::m0` |
 | `mfma` | 矩阵指令：结果等待态、同算子原地累加链、scaled 族、零累加器（无 C）、稀疏 `smfmac` | `hazards`、`agpr::is_mfma`、`regalloc` 操作数检查、`gpu_verify`、`phase`、`hoist` |
 | `transcendental` | `v_exp/v_log/v_rcp` 的结果延迟 | `hazards` |
-| `movable` | 冒险填充调度器的候选（`VccFill`：只在 vcc 填充模式下） | `hazards` |
+| `movable` | 冒险填充调度器的候选 | `hazards` |
 | `valu_writer_delay` | VALU 结果被 MFMA / permlane / readfirstlane / DPP 读之前需要的等待态（2，进位加法 4） | `hazards` |
 | `reads_valu_hazard` | 读取受上一行约束的操作数 | `hazards` |
 | `wide_store_data` | 宽（> 8 字节）VMEM 存储的数据操作数下标（发射后 2 个等待态内不得被 VALU 改写） | `hazards::pad_physical_war` |
@@ -41,15 +41,14 @@
 
 - **类别问题查属性**：任何"这是不是一条 MFMA / 一次 LDS 读 / 一个 vcc 写者"的问题都通过 `op_attrs::attrs(op)` 回答，不写算子名清单。
 - **身份判断可以保留**：针对某一条具体指令的判断（`op == MOp::SNop`、`lower.rs` 构造指令、`swp.rs` 识别循环计数模式里的 `v_add`/`v_cmp`）不是类别，留在原地。
-- **新增 `MOp` 的步骤**：在 `mir.rs` 的枚举加变体 → 在 `op_attrs.rs` 加一行（编译器强制）→ 加入 `backend::ALL_MOPS`（`every_variant_is_listed` 测试强制）→ `emit.rs` 写发射文本 →
+- **新增 `MOp` 的步骤**：在 `mir.rs` 的枚举加变体 → 在 `op_attrs.rs` 加一行（编译器强制）→ 加入 `backend::ALL_MOPS`（`op_attrs::tests::every_variant_is_listed` 强制）→ `emit.rs` 写发射文本 →
   若 `backend` 为 `Llvm`，在 `llvm20.tbl`/`llvm24.tbl` 加行。
 
 ## 4. 迁移与验证
 
 迁移是行为保持的重构：
 
-- `op_attrs_equiv.rs` 保存了被替换实现的逐字副本（代价表、`vcc` 判定、8 个冒险分类函数、宽存储、AGPR 合法性 3 个函数、读改写判定、DCE 两份清单、
-  后端选择、整个旧 `effects_core`），对 `ALL_MOPS` 中每个算子断言新旧结果相同（效应部分对每个算子用 4 种操作数形状比较读/写槽、访存、栅栏、smem）。
+- 迁移时（分支 `op-attrs`）曾用被替换实现的逐字副本对每个算子做等价性测试，并确认全部 kernel 的汇编 md5 不变；迁移完成后该临时测试已删除。
 - 全部 kernel（`amdc list`，own 后端）的汇编 md5 在重构前后逐字节相同（`tools/md5_kernels.sh`）。
 
 ## 5. 范围说明

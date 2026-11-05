@@ -21,7 +21,7 @@ fn side_effect_op(op: MOp) -> bool {
     matches!(
         op,
         MOp::LdsWriteB32 | MOp::LdsWriteB128 | MOp::LdsReadB32 | MOp::LdsReadB128 | MOp::LdsReadB64TrB8
-            | MOp::GlobalLoadU16 | MOp::GlobalLoadF32 | MOp::GlobalLoadB128 | MOp::GlobalLoadB128S | MOp::GlobalLoadF32S
+            | MOp::GlobalLoadU16 | MOp::GlobalLoadF32 | MOp::GlobalLoadB128
             | MOp::GlobalStoreU16 | MOp::GlobalStoreF32 | MOp::SLoadDword | MOp::SLoadDwordx2 | MOp::SBarrier
             | MOp::SWaitVm | MOp::SWaitLgkm | MOp::SSetPrio | MOp::SEndpgm
     )

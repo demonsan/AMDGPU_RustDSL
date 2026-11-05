@@ -18,8 +18,6 @@ pub mod hazards;
 pub mod lower;
 pub mod mir;
 pub mod op_attrs;
-#[cfg(test)]
-mod op_attrs_equiv;
 pub mod regalloc;
 pub mod sched;
 
@@ -63,7 +61,6 @@ pub fn compile_mir_alloc(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, re
 
 /// The final (allocated, scheduled, hazard-padded) MIR of a kernel, for model reports.
 pub fn compile_mir(f: &amdgpu_dsl::Function) -> Result<mir::MFunction, String> {
-    sched::order::PIN_VMWAIT_KERNEL.store(policy_name(f).ends_with("_vs6"), std::sync::atomic::Ordering::Relaxed);
     lower_and_allocate(f).map(|(m, _)| m)
 }
 
@@ -77,36 +74,21 @@ fn lower_and_allocate(f: &amdgpu_dsl::Function) -> Result<(mir::MFunction, regal
     for extra in [&[][..], &["remat1"][..], &["remat2"][..], &["remat3"][..], &["remat4"][..], &["imm", "ldsspill8"][..], &["imm", "ldsspill16"][..], &["imm", "ldsspill24"][..], &["imm", "ldsspill32"][..], &["imm", "ldsspill48"][..], &["imm", "ldsspill64"][..]] {
         match lower_and_allocate_with(f, extra) {
             Ok(r) => {
-                if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("rematdebug")) {
-                    eprintln!("allocation succeeded with extra {extra:?}");
-                }
                 if r.0.lds_bytes > 160 * 1024 {
                     return Err(format!("LDS spill needs {} bytes of LDS (limit 163840)", r.0.lds_bytes));
                 }
                 return Ok(r);
             }
-            Err(e) if e.contains("out of VGPRs") => {
-                if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("rematdebug")) {
-                    eprintln!("allocation failed with extra {extra:?}: {}", e.chars().take(160).collect::<String>());
-                }
-                last = e
-            }
+            Err(e) if e.contains("out of VGPRs") => last = e,
             Err(e) => return Err(e),
         }
     }
     Err(last)
 }
 
-/// M0 reuse for LDS-DMA loads is part of the GEMM profile (AMDC_M0_REUSE=0 turns it off for A/B runs); the FMHA kernels keep their shipped output.
+/// M0 reuse for LDS-DMA loads is part of the GEMM profile; the FMHA kernels keep their shipped output.
 fn m0_reuse_on(f: &amdgpu_dsl::Function) -> bool {
-    (f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_M0_REUSE").map_or(true, |v| v != "0")) || fmha_opt(f, "m0reuse")
-}
-
-/// An `FMHA_OPT` token for this kernel: `FMHA_OPT_SCOPE=<substring>` restricts the tokens to kernels whose name contains it (same-run A/B of a token
-/// on an alias of the shipped kernels, e.g. `fmha_fwd_hd128_mxfp8_v3s_*`).
-fn fmha_opt(f: &amdgpu_dsl::Function, tok: &str) -> bool {
-    let on = std::env::var("FMHA_OPT").map_or(false, |x| x.split(|c: char| c == ',' || c == ' ').any(|t| t == tok));
-    on && std::env::var("FMHA_OPT_SCOPE").map_or(true, |s| s.is_empty() || f.name.contains(s.as_str()))
+    f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm)
 }
 
 fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(mir::MFunction, regalloc::Alloc), String> {
@@ -117,7 +99,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     let extra: &[&str] = &extra_all;
     // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
     // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/archive/status.md round 47).
-    let base = if (pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || pname.ends_with("_kvsplit") || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))) && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
+    let base = if (pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || pname.ends_with("_kvsplit") || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))) {
         // measured on vs128 (15/15, 301.9-304.0 vs 280.6 TFLOP/s): retarget2 (cvt results written straight into the MFMA fragment
         // lanes), imm and sgpr cut ~230 copies/VALU and free 12 VGPRs; addrfold and shl are slower and stay off. `imm` also gives
         // the vs128/vsm builds the register slack they need (docs/archive/status.md rounds 49-50).
@@ -128,45 +110,22 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         // v3 `_t128`: the SADDR DMA form (scalar tensor base + per-lane 32-bit offset: no 64-bit pointer add per DMA) measured +1.8..+2.1% on the
         // B2H8S2048 layout median (two same-run A/Bs, docs/dsl-layout-refactor-design.md); on _vs128 / _kvsplit it is -0.2..-1.4%: not adopted there
-        if fmha_opt(f, "saddrlds") || (pname.ends_with("_t128") && (f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_"))) {
-            v.push("saddrlds");
-        }
-        if fmha_opt(f, "pmdead") {
-            v.push("pmdead");
-        }
-        // A/B tokens: `edgepad` (MFMA hazard windows carried across blocks, no block-end padding) and `salubr` (wave-uniform branch conditions on SCC)
-        // v3 `_t128`: both by default (same-run A/B, B2H8S2048 layout median +3.3% together, +0.7% / +2.1% alone); on `_vs128` / `_kvsplit` they are
-        // -0.7..-1.5%: opt-in there (docs/dsl-layout-refactor-design.md §9.4)
-        let v3_t128 = pname.ends_with("_t128") && (f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_"));
-        for tok in ["edgepad", "salubr"] {
-            if fmha_opt(f, tok) || v3_t128 {
-                v.push(tok);
-            }
-        }
-        // A/B tokens (FMHA_OPT, scoped by FMHA_OPT_SCOPE): `licm` (loop-invariant pure ALU hoisted to the preheader), `scalarize2` / `waveuni` (uniform
-        // integer chains in SALU, as in the GEMM profile)
-        for tok in ["licm", "scalarize2", "waveuni"] {
-            if fmha_opt(f, tok) {
-                v.push(tok);
-            }
+        // v3 `_t128`: `edgepad` (MFMA hazard windows carried across blocks, no block-end padding) and `salubr` (wave-uniform branch conditions on SCC):
+        // same-run A/B, B2H8S2048 layout median +3.3% together (on `_vs128` / `_kvsplit` -0.7..-1.5%: not used there, docs/dsl-layout-refactor-design.md
+        // §9.4); `saddrlds` (the SADDR DMA form: +1.8..+2.1%; -0.2..-1.4% on _vs128 / _kvsplit)
+        if pname.ends_with("_t128") && f.name.starts_with("fmha_fwd_hd128_mxfp8_v3_") {
+            v.extend_from_slice(&["saddrlds", "edgepad", "salubr"]);
         }
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
-    } else if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
+    } else if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) {
         // CompileProfile::Gemm: partial lgkmcnt waits keep the prefetched fragment reads in flight (`lgkmn`)
         // + scalarize / scalarize2 / waveuni: the wave-uniform DMA address chains (tile origins with clamps/selects, slot bases, M0, soffsets) in SALU
-        let mut v: Vec<&str> = vec!["dce", "cmpfold", "lgkmn", "zeroinit", "scalarize", "scalarize2", "waveuni", "edgepad"];
-        // + kabatch (kernarg loads batched into s_load_dwordx4) and imm (inline constants / literals as VALU operands instead of v_mov
-        // materialisations); FMHA_ABLATE=nokabatch / noimm for A/B
-        let abl = std::env::var("FMHA_ABLATE").unwrap_or_default();
-        for tok in ["kabatch", "imm"] {
-            if !abl.contains(&format!("no{tok}")) {
-                v.push(tok);
-            }
-        }
+        // + kabatch (kernarg loads batched into s_load_dwordx4) and imm (inline constants / literals as VALU operands instead of v_mov materialisations)
+        let mut v: Vec<&str> = vec!["dce", "cmpfold", "lgkmn", "zeroinit", "scalarize", "scalarize2", "waveuni", "edgepad", "kabatch", "imm"];
         v.extend_from_slice(extra);
         lower::with_opts(&v, || lower::lower(f))?
-    } else if pname.starts_with("fmha_fwd_hd128_mxfp8") && std::env::var("AMDC_LOWER_OPTS").map_or(true, |v| v.is_empty()) {
+    } else if pname.starts_with("fmha_fwd_hd128_mxfp8") {
         // the FMHA kernels zero their accumulators in place (bit-exact on all 15 shapes, -160 v_mov on _t, docs/archive/status.md)
         let mut v: Vec<&str> = vec!["zeroinit"];
         v.extend_from_slice(extra);
@@ -180,10 +139,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         agpr::assign(&mut b)?;
         b
     };
-    let sched_opts = match sched::Options::from_env() {
-        Some(o) if o.auto => sched::auto_plan(&base, &o),
-        other => other,
-    };
+    let sched_opts = sched::Options::from_env();
     // The FMHA kernels default to the wait-recomputing pass (partial vmcnt/lgkmcnt waits, ALU across barriers, ds_read hoisting): +9% on the
     // transposed kernel, bit-identical results (measured, docs/archive/status.md round 44). AMDC_SCHED=0 turns it off.
     let sched_opts = match sched_opts {
@@ -221,36 +177,6 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         other => other,
     };
-    // experiment switch: AMDC_SLOTFILL=1 (every kernel) or AMDC_SLOTFILL=<substring of the kernel name or of its policy name (the policy name drops e.g. `_v3` of `_vs128`)> adds the slot-filling scheduler to the kernel's options
-    // (reorder stays off unless the kernel already had it); unset = no change at all (sched/slotfill.rs)
-    let sched_opts = match (std::env::var("AMDC_SLOTFILL").ok().filter(|v| !v.is_empty() && v != "0"), sched_opts) {
-        (Some(v), so) if v == "1" || pname.contains(v.as_str()) || f.name.contains(v.as_str()) => {
-            let mut o = so.unwrap_or_else(|| sched::Options { reorder: false, ldshoist: true, ..sched::Options::default() });
-            o.slotfill = true;
-            Some(o)
-        }
-        (_, so) => so,
-    };
-    // experiment switch: AMDC_MFMAPAIR=1 (every kernel) or =<kernel name substring> (optionally `=name:1.5` = shadow budget factor) adds the MFMA-pair scheduler
-    let sched_opts = match (std::env::var("AMDC_MFMAPAIR").ok().filter(|v| !v.is_empty() && v != "0"), sched_opts) {
-        (Some(v), so) => {
-            let (pat, budget) = match v.split_once(':') {
-                Some((p, b)) => (p.to_string(), b.parse::<f64>().ok()),
-                None => (v.clone(), None),
-            };
-            if pat == "1" || pname.contains(pat.as_str()) || f.name.contains(pat.as_str()) {
-                let mut o = so.unwrap_or_else(|| sched::Options { reorder: false, ldshoist: true, ..sched::Options::default() });
-                o.mfmapair = true;
-                if let Some(b) = budget {
-                    o.mfmapair_budget = b;
-                }
-                Some(o)
-            } else {
-                so
-            }
-        }
-        (None, so) => so,
-    };
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
         // (pressure cut, hoist distance cap): first shrink the LDS-read hoisting (it lengthens live ranges and fragments
@@ -279,8 +205,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 if !pe.is_empty() {
                     return Err(format!("pinned (safe-asm) blocks fail the final MIR check: {}", pe.join("; ")));
                 }
-                let vcc_fill = pname.starts_with("fmha_fwd_hd128_mxfp8_vs") && std::env::var("AMDC_VCC_FILL").map_or(false, |v| !v.is_empty() && v != "0");
-                hazards::with_vcc_fill(vcc_fill, || hazards::fix_value_hazards_opts(&mut m, true));
+                hazards::fix_value_hazards_opts(&mut m, true);
                 let errs = mir::verify(&m);
                 if !errs.is_empty() {
                     return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
@@ -315,10 +240,8 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     sched::waits::verify_waits(&m).map_err(|e| format!("wait verification failed: {e}"))?;
     let alloc = regalloc::allocate(&m)?;
     // Register reuse (especially the hole-filling packing) can place a new value in a register an in-flight MFMA still reads:
-    // pad the physical write-after-read hazard on every path, not only for scheduled code (AMDC_NO_PHYS_WAR=1 disables, testing).
-    if std::env::var("AMDC_NO_PHYS_WAR").map(|v| v.is_empty() || v == "0").unwrap_or(true) {
-        hazards::pad_physical_war(&mut m, &alloc);
-    }
+    // pad the physical write-after-read hazard on every path, not only for scheduled code.
+    hazards::pad_physical_war(&mut m, &alloc);
     Ok((m, alloc))
 }
 

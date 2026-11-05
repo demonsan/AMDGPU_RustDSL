@@ -147,9 +147,6 @@ pub enum MOp {
     /// Compare into an SGPR PAIR instead of vcc (`v_cmp_*_e64 s[a:b], x, y`): several masks can be in flight, so the 2 wait states
     /// between a compare and its `v_cndmask` can be covered by the next compares (`maskreg`).
     VCmpMaskLtI32,
-    VCmpMaskGeI32,
-    VCmpMaskGtI32,
-    VCmpMaskLtF32,
     /// `v_cndmask_b32_e64 d, a, b, s[mask]`: srcs = [false value, true value, mask pair].
     VCndmaskM,
     VCmpNeI32,
@@ -204,8 +201,6 @@ pub enum MOp {
     GlobalLoadF32,
     GlobalLoadB128,
     /// `global_load_dwordx4 v[d], v_off, s[base]`: scalar base + 32-bit vector offset (no 64-bit address arithmetic).
-    GlobalLoadB128S,
-    GlobalLoadF32S,
     /// Global -> LDS DMA (M0 = LDS base from srcs[1], an S1 register): srcs: ptr (V2), lds base (S1); imm = byte offset.
     GlobalLoadLdsB128,
     GlobalLoadLdsB32,
