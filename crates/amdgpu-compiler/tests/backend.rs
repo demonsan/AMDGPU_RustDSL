@@ -44,7 +44,7 @@ fn natural_exp_is_lowered_through_exp2() {
 fn transcendental_results_get_wait_states() {
     // Regression: consuming a transcendental result immediately returned the
     // stale register value on gfx950.
-    let f = kernel_by_name("fmha_fwd_hd128_mxfp8_v3_t128").unwrap();
+    let f = kernel_by_name("probe_math").unwrap();
     let compiled = compile(&f).unwrap();
     assert!(compiled.asm.contains("s_nop"), "no hazard padding emitted");
     let mut exp_seen = false;

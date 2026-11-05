@@ -197,7 +197,7 @@ fn llvm_tail_assembles_kernels() {
 fn drop_auto_waits_removes_only_auto_waits() {
     let tail = LlvmTail::new();
     let mut total_dropped = 0usize;
-    for k in ["fmha_fwd_hd128_mxfp8_v3_t128", "probe_lds_self2"] {
+    for k in ["probe_lds_self2", "probe_roles_loop", "probe_mfma_scale"] {
         let f = kernel_by_name(k).unwrap();
         let mut m = amdgpu_compiler::lower::lower(&f).unwrap();
         amdgpu_compiler::hazards::fix_value_hazards(&mut m);
