@@ -365,6 +365,18 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
     fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", true, false, true, false)
 }
 
+/// `_vs128` with the short-copy (exact LUT recipe) threshold at `lut_tiles` tiles instead of 9 (A/B builds).
+pub fn fmha_vs128_lut(name: &str, lut_tiles: i32) -> Function {
+    LUT_TILES.with(|x| x.set(lut_tiles));
+    let f = fmha_vs128_named(name, true, false, true, false);
+    LUT_TILES.with(|x| x.set(9));
+    f
+}
+
+thread_local! {
+    static LUT_TILES: std::cell::Cell<i32> = const { std::cell::Cell::new(9) };
+}
+
 /// `_vs128` under another name with the experiment switches (A/B builds).
 pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bool, unroll2: bool) -> Function {
     let mut fb = FnBuilder::new(name, 512);
@@ -385,7 +397,7 @@ pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bo
     pipe.key_unclamped = kbuf;
     pipe.unroll2 = unroll2;
     let pipe = pipe;
-    let lut = blk.lut_copy(b);
+    let lut = blk.lut_copy_below(b, LUT_TILES.with(|x| x.get()));
     versioned(b, lut, |b, lut| {
         roles.each(b, |b, role| {
             let wid = roles.wave_id(b, role);
