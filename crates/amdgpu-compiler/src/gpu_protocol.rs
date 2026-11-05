@@ -435,7 +435,9 @@ impl<'a> Sim<'a> {
                     let (els, endif) = if_span(f, i);
                     let then_range = (i + 1, els.unwrap_or(endif));
                     let else_range = els.map(|e| (e + 1, endif));
-                    let proto = |a: usize, b: usize| f.stmts()[a..b].iter().any(|s| matches!(s, Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. }));
+                    // waits and fences count too: a role-specific completion point (e.g. the retiring wait_lds(0) of reads kept in flight across a barrier) must be
+                    // simulated in that role, not dropped
+                    let proto = |a: usize, b: usize| f.stmts()[a..b].iter().any(|s| matches!(s, Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::WaitLds { .. } | Stmt::WaitVm { .. } | Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. }));
                     let anything = |a: usize, b: usize| f.stmts()[a..b].iter().any(|s| matches!(s, Stmt::Barrier | Stmt::TileProduce { .. } | Stmt::TileConsume { .. }) || is_lds_access(s).is_some());
                     let has_proto = proto(then_range.0, then_range.1) || else_range.map_or(false, |r| proto(r.0, r.1));
                     let has_any = anything(then_range.0, then_range.1) || else_range.map_or(false, |r| anything(r.0, r.1));
