@@ -2,7 +2,7 @@
 //! `amdc` CLI as a subprocess (no FFI). Schema 1:
 //!
 //! ```text
-//! {"schema":1, "kernel", "symbol", "arch":"gfx950", "compiler":{"version","git"}, "compiler_hash", "backend", "specialize":{name:value},
+//! {"schema":1, "kernel", "symbol", "arch":"gfx950", "compiler":{"version","git"}, "compiler_hash", "backend", "specialize":{name:value}, "derived":{name:value},
 //!  "block":[x,1,1], "lds_bytes", "vgpr", "agpr", "sgpr", "scratch_bytes", "kernarg_size", "kernarg_align",
 //!  "args":[{"name","offset","size","kind":"ptr|i32|u32|f32|pad","specializable","specialized":null|value}],
 //!  "contract":{"grid":[{"axis","ext":E}], "ka_is":[{"offset","ext":E}], "ka_range":[{"offset","lo","hi"|null}], "ka_set":[{"offset","values"}],
@@ -99,7 +99,8 @@ pub fn resources(asm: &str) -> Resources {
 }
 
 /// The JSON document. `f` is the (possibly specialized) kernel, `spec` the bound values by argument name.
-pub fn info_json(f: &Function, spec: &[(String, u32, SpecValue)], backend: &str, res: Resources) -> String {
+/// `derived`: kernargs the bindings fix through the contract's `ka_is` relations (also constants in the specialized kernel).
+pub fn info_json(f: &Function, spec: &[(String, u32, SpecValue)], derived: &[(u32, i64)], backend: &str, res: Resources) -> String {
     let mut args: Vec<&amdgpu_dsl::Arg> = f.args.iter().collect();
     args.sort_by_key(|a| a.kernarg_offset);
     let mut ja: Vec<String> = Vec::new();
@@ -109,7 +110,12 @@ pub fn info_json(f: &Function, spec: &[(String, u32, SpecValue)], backend: &str,
         if a.kernarg_offset > pos {
             ja.push(pad(pos, a.kernarg_offset - pos));
         }
-        let sv = spec.iter().find(|(n, _, _)| *n == a.name).map(|(_, _, v)| v.to_json()).unwrap_or_else(|| "null".to_string());
+        let sv = spec
+            .iter()
+            .find(|(n, _, _)| *n == a.name)
+            .map(|(_, _, v)| v.to_json())
+            .or_else(|| derived.iter().find(|(o, _)| *o == a.kernarg_offset).map(|(_, v)| v.to_string()))
+            .unwrap_or_else(|| "null".to_string());
         ja.push(format!(
             "{{\"name\":\"{}\",\"offset\":{},\"size\":{},\"kind\":\"{}\",\"specializable\":{},\"specialized\":{}}}",
             esc(&a.name),
@@ -151,8 +157,10 @@ pub fn info_json(f: &Function, spec: &[(String, u32, SpecValue)], backend: &str,
         })
         .collect();
     let specd: Vec<String> = spec.iter().map(|(n, _, v)| format!("\"{}\":{}", esc(n), v.to_json())).collect();
+    let name_of = |o: u32| f.args.iter().find(|a| a.kernarg_offset == o).map(|a| a.name.clone()).unwrap_or_else(|| format!("ka{o}"));
+    let derd: Vec<String> = derived.iter().map(|(o, v)| format!("\"{}\":{v}", esc(&name_of(*o)))).collect();
     format!(
-        "{{\"schema\":1,\"kernel\":\"{k}\",\"symbol\":\"{k}\",\"arch\":\"gfx950\",\"compiler\":{{\"version\":\"{}\",\"git\":\"{}\"}},\"compiler_hash\":\"{}\",\"backend\":\"{}\",\"specialize\":{{{}}},\
+        "{{\"schema\":1,\"kernel\":\"{k}\",\"symbol\":\"{k}\",\"arch\":\"gfx950\",\"compiler\":{{\"version\":\"{}\",\"git\":\"{}\"}},\"compiler_hash\":\"{}\",\"backend\":\"{}\",\"specialize\":{{{}}},\"derived\":{{{}}},\
 \"block\":[{},1,1],\"lds_bytes\":{},\"vgpr\":{},\"agpr\":{},\"sgpr\":{},\"scratch_bytes\":{},\"kernarg_size\":{},\"kernarg_align\":8,\"args\":[{}],\
 \"contract\":{{\"grid\":[{}],\"ka_is\":[{}],\"ka_range\":[{}],\"ka_set\":[{}],\"tensors\":[{}],\"syms\":[{}]}}}}",
         esc(VERSION),
@@ -160,6 +168,7 @@ pub fn info_json(f: &Function, spec: &[(String, u32, SpecValue)], backend: &str,
         compiler_hash(backend),
         esc(backend),
         specd.join(","),
+        derd.join(","),
         f.workgroup_size,
         res.lds_bytes,
         res.vgpr,

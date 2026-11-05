@@ -122,37 +122,119 @@ pub fn check(f: &Function, binds: &[(String, String)]) -> Result<Vec<(String, u3
         }
         out.push((k.clone(), a.kernarg_offset, val));
     }
-    // kernarg relations that become closed must hold
-    let ka: HashMap<u32, i64> = out.iter().filter_map(|(_, o, v)| if let SpecValue::Int(x) = v { Some((*o, *x)) } else { None }).collect();
-    for (o, e) in &f.contract.ka_defs {
-        let lhs = subst_ext(&Ext::Ka(*o), &ka);
-        let rhs = subst_ext(e, &ka);
-        if let (Some(l), Some(r)) = (eval(&lhs), eval(&rhs)) {
-            if l != r {
-                return Err(format!("--specialize: the contract relation ka(0x{o:x}) == {e:?} is violated ({l} != {r})"));
+    Ok(out)
+}
+
+/// The specialized kernel (same name / ABI).
+/// The facts the bindings determine: the bound kernargs, the kernargs a `ka_is` relation then fixes (derived), and the free symbols a
+/// relation `ka == c * sym` / `ka == sym` then fixes (with the divisibility and range checks of the contract).
+pub struct Closed {
+    pub ka: HashMap<u32, i64>,
+    pub derived: Vec<(u32, i64)>,
+    pub syms: HashMap<String, i64>,
+}
+
+/// `e` with bound kernargs and symbols replaced.
+pub fn subst_all(e: &Ext, ka: &HashMap<u32, i64>, syms: &HashMap<String, i64>) -> Ext {
+    let b = |x: &Ext| Box::new(subst_all(x, ka, syms));
+    match e {
+        Ext::Ka(o) => ka.get(o).map(|v| Ext::Const(*v)).unwrap_or_else(|| e.clone()),
+        Ext::Sym(n) => syms.get(n).map(|v| Ext::Const(*v)).unwrap_or_else(|| e.clone()),
+        Ext::Add(a, c) => Ext::Add(b(a), b(c)),
+        Ext::Sub(a, c) => Ext::Sub(b(a), b(c)),
+        Ext::Mul(a, c) => Ext::Mul(b(a), b(c)),
+        Ext::CeilDiv(a, k) => Ext::CeilDiv(b(a), *k),
+        Ext::FloorDiv(a, k) => Ext::FloorDiv(b(a), *k),
+        other => other.clone(),
+    }
+}
+
+/// `c * sym` / `sym * c` / `sym` -> (sym, c).
+fn linear_sym(e: &Ext) -> Option<(String, i64)> {
+    match e {
+        Ext::Sym(n) => Some((n.clone(), 1)),
+        Ext::Mul(a, b) => match (&**a, &**b) {
+            (Ext::Sym(n), x) | (x, Ext::Sym(n)) => eval(x).map(|c| (n.clone(), c)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Closes the bindings over the contract's relations (to a fixed point). Err on a violated relation, divisibility or range.
+pub fn close(f: &Function, vals: &[(String, u32, SpecValue)]) -> Result<Closed, String> {
+    let c = &f.contract;
+    let mut ka: HashMap<u32, i64> = vals.iter().filter_map(|(_, o, v)| if let SpecValue::Int(x) = v { Some((*o, *x)) } else { None }).collect();
+    let mut derived: Vec<(u32, i64)> = Vec::new();
+    let mut syms: HashMap<String, i64> = HashMap::new();
+    let name_of = |o: u32| f.args.iter().find(|a| a.kernarg_offset == o).map(|a| a.name.clone()).unwrap_or_else(|| format!("ka(0x{o:x})"));
+    loop {
+        let mut changed = false;
+        for (o, e) in &c.ka_defs {
+            let rhs = subst_all(e, &ka, &syms);
+            match (ka.get(o).copied(), eval(&rhs)) {
+                (Some(l), Some(r)) => {
+                    if l != r {
+                        return Err(format!("--specialize: the contract relation {} == {e:?} is violated ({l} != {r})", name_of(*o)));
+                    }
+                }
+                (None, Some(r)) => {
+                    ka.insert(*o, r);
+                    derived.push((*o, r));
+                    changed = true;
+                }
+                (Some(l), None) => {
+                    if let Some((s, k)) = linear_sym(&rhs) {
+                        if k == 0 || l % k != 0 {
+                            return Err(format!("--specialize: {}={l} must be a multiple of {k} (contract: {} == {e:?})", name_of(*o), name_of(*o)));
+                        }
+                        syms.insert(s, l / k);
+                        changed = true;
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (s, v) in &syms {
+        let (lo, hi) = c.sym_ranges.iter().find(|(n, _, _)| n == s).map(|x| (x.1, x.2)).unwrap_or((1, i64::MAX));
+        if *v < lo || *v > hi {
+            return Err(format!("--specialize: the bindings imply {s} = {v}, outside the contract range [{lo}, {}]", if hi == i64::MAX { "inf".to_string() } else { hi.to_string() }));
+        }
+    }
+    for (o, v) in &derived {
+        for (x, lo, hi) in &c.ka_ranges {
+            if x == o && (v < lo || v > hi) {
+                return Err(format!("--specialize: the bindings imply {}={v}, outside the contract range [{lo}, {hi}]", name_of(*o)));
             }
         }
     }
-    Ok(out)
+    derived.sort();
+    Ok(Closed { ka, derived, syms })
 }
 
 /// The specialized kernel (same name / ABI).
 pub fn specialize(f: &Function, binds: &[(String, String)]) -> Result<Function, String> {
     let vals = check(f, binds)?;
+    let cl = close(f, &vals)?;
     let mut g = f.clone();
-    let ka: HashMap<u32, i64> = vals.iter().filter_map(|(_, o, v)| if let SpecValue::Int(x) = v { Some((*o, *x)) } else { None }).collect();
+    let ka = cl.ka;
+    let syms = cl.syms;
     let kf: HashMap<u32, f32> = vals.iter().filter_map(|(_, o, v)| if let SpecValue::F32(x) = v { Some((*o, *x)) } else { None }).collect();
-    // contract
+    // contract: every bound kernarg / fixed symbol becomes its constant, plus the exact facts
     let c: &mut Contract = &mut g.contract;
     for e in c.extents.iter_mut() {
-        e.alloc = subst_ext(&e.alloc, &ka);
-        e.logical = e.logical.as_ref().map(|x| subst_ext(x, &ka));
+        e.alloc = subst_all(&e.alloc, &ka, &syms);
+        e.logical = e.logical.as_ref().map(|x| subst_all(x, &ka, &syms));
     }
     for (_, e) in c.grid_defs.iter_mut() {
-        *e = subst_ext(e, &ka);
+        *e = subst_all(e, &ka, &syms);
     }
     for (_, e) in c.ka_defs.iter_mut() {
-        *e = subst_ext(e, &ka);
+        *e = subst_all(e, &ka, &syms);
     }
     for (o, v) in &ka {
         c.ka_ranges.retain(|(x, _, _)| x != o);
@@ -160,6 +242,11 @@ pub fn specialize(f: &Function, binds: &[(String, String)]) -> Result<Function, 
         c.ka_ranges.push((*o, *v, *v));
     }
     c.ka_ranges.sort_by_key(|x| x.0);
+    for (s, v) in &syms {
+        c.sym_ranges.retain(|(n, _, _)| n != s);
+        c.sym_ranges.push((s.clone(), *v, *v));
+    }
+    c.sym_ranges.sort();
     // body: kernarg loads -> constants, then fold
     let mut body = g.body().to_vec();
     rewrite_loads(&mut body, &ka, &kf);

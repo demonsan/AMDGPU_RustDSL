@@ -43,7 +43,9 @@ fn spec_bindings(args: &[String]) -> Result<Vec<(String, String)>, String> {
 }
 
 /// The kernel `name`, specialized by the command line's bindings (exit code 2 on a bad binding).
-fn kernel_spec(name: &str, args: &[String]) -> Result<(amdgpu_dsl::Function, Vec<(String, u32, amdgpu_dsl::specialize::SpecValue)>), ExitCode> {
+type Spec = (Vec<(String, u32, amdgpu_dsl::specialize::SpecValue)>, Vec<(u32, i64)>);
+
+fn kernel_spec(name: &str, args: &[String]) -> Result<(amdgpu_dsl::Function, Spec), ExitCode> {
     let Some(f) = amdgpu_kernels::kernel_by_name(name) else {
         eprintln!("unknown kernel: {name}");
         return Err(ExitCode::from(2));
@@ -56,7 +58,7 @@ fn kernel_spec(name: &str, args: &[String]) -> Result<(amdgpu_dsl::Function, Vec
         }
     };
     if binds.is_empty() {
-        return Ok((f, Vec::new()));
+        return Ok((f, (Vec::new(), Vec::new())));
     }
     let vals = match amdgpu_dsl::specialize::check(&f, &binds) {
         Ok(v) => v,
@@ -65,8 +67,15 @@ fn kernel_spec(name: &str, args: &[String]) -> Result<(amdgpu_dsl::Function, Vec
             return Err(ExitCode::from(2));
         }
     };
+    let derived = match amdgpu_dsl::specialize::close(&f, &vals) {
+        Ok(c) => c.derived,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(ExitCode::from(2));
+        }
+    };
     match amdgpu_dsl::specialize::specialize(&f, &binds) {
-        Ok(g) => Ok((g, vals)),
+        Ok(g) => Ok((g, (vals, derived))),
         Err(e) => {
             eprintln!("{e}");
             Err(ExitCode::from(2))
@@ -430,7 +439,7 @@ fn main() -> ExitCode {
                 Ok(x) => x,
                 Err(c) => return c,
             };
-            if !spec.is_empty() {
+            if !spec.0.is_empty() {
                 if let Err(c) = certify_specialized(&f) {
                     return c;
                 }
@@ -443,7 +452,7 @@ fn main() -> ExitCode {
             };
             match amdgpu_compiler::compile_with(&f, tail.as_ref()) {
                 Ok(c) => {
-                    println!("{}", amdc::jit::info_json(&f, &spec, tail.name(), amdc::jit::resources(&c.asm)));
+                    println!("{}", amdc::jit::info_json(&f, &spec.0, &spec.1, tail.name(), amdc::jit::resources(&c.asm)));
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -461,7 +470,7 @@ fn main() -> ExitCode {
                 Ok(x) => x,
                 Err(c) => return c,
             };
-            if !spec.is_empty() {
+            if !spec.0.is_empty() {
                 if let Err(c) = certify_specialized(&f) {
                     return c;
                 }
