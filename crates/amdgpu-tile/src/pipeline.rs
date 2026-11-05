@@ -161,7 +161,7 @@ pub struct Pipeline {
     /// `TwoPhaseOffset` over a 3-slot ring: the VALU phase of tile t stages tile t+2 (one phase earlier than the 2-slot form, the vendor's
     /// distance) and its end waits only for tile t+1 (counted `vmcnt(stage_vm)`); the prologue stages tiles 0 and 1.
     pub ahead2: bool,
-    /// `TwoPhaseOffset` (2 slots): the copies of tile t+2 are issued at the END of the matrix phase of tile t (after its LDS reads drained,
+    /// `TwoPhaseOffset` (2 slots), group A only (K / K scales; B keeps staging V at the start of its VALU phase): the copies of tile t+2 are issued at the END of the matrix phase of tile t (after its LDS reads drained,
     /// before the end barrier) into the slot tile t just left, instead of at the start of the VALU phase of tile t+1 - the vendor's issue
     /// point; the prologue stages tiles 0 and 1.
     pub stage_early: bool,
@@ -214,7 +214,7 @@ impl Pipeline {
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
             body.stage(b, role, &key1, &SlotIdx::new(1, 1));
         }
-        if self.cadence == Cadence::TwoPhaseOffset && (self.ahead2 || self.stage_early) {
+        if self.cadence == Cadence::TwoPhaseOffset && (self.ahead2 || (self.stage_early && role == Role::A)) {
             // tile 1 (clamped); it completes at the end of the first VALU phase (the loop's counted wait)
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
             body.stage(b, role, &key1, &SlotIdx::new(1, 1));
@@ -379,7 +379,7 @@ impl Pipeline {
     fn iter(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: VarId, idx: VarId, masked: bool, staged: bool, last_barrier: bool) -> ValueId {
         let nkv = ev(self.nkv);
         match self.cadence {
-            Cadence::TwoPhaseOffset if self.stage_early => {
+            Cadence::TwoPhaseOffset if self.stage_early && role == Role::A => {
                 let i1 = b.bind_i32(varx(idx) ^ 1);
                 let it_p1 = b.let_i32(varx(it) + 1);
                 let it_p2 = b.let_i32(varx(it) + 2);
