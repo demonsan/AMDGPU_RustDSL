@@ -3256,8 +3256,34 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
             }
         }
         let mut changed = false;
+        // SCC read on entry of a block before any SCC write (instructions, then the branch)
+        let scc_term = |t: &Term| matches!(t, Term::CondGoto { on: Pred::Scc0 | Pred::Scc1, .. });
+        let scc_in: Vec<bool> = m
+            .blocks
+            .iter()
+            .map(|b| {
+                for i in &b.insts {
+                    let a = crate::op_attrs::attrs(i.op);
+                    if a.scc_read {
+                        return true;
+                    }
+                    if a.scc_write {
+                        return false;
+                    }
+                }
+                scc_term(&b.term)
+            })
+            .collect();
+        let label_idx: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
         for bi in 0..m.blocks.len() {
             let mut vcc_live = matches!(m.blocks[bi].term, Term::CondGoto { on: Pred::Vccnz | Pred::Vccz, .. });
+            // SCC: a dead SALU result is removable only if no later instruction (or the branch) of the block reads the SCC it writes
+            let succ_scc = match &m.blocks[bi].term {
+                Term::Goto(t) => label_idx.get(t).map_or(true, |&s| scc_in[s]),
+                Term::CondGoto { target, fall, .. } => [target, fall].iter().any(|t| label_idx.get(t).map_or(true, |&s| scc_in[s])),
+                Term::Endpgm => false,
+            };
+            let mut scc_live = scc_term(&m.blocks[bi].term) || succ_scc;
             let n = m.blocks[bi].insts.len();
             let mut dead = vec![false; n];
             for i in (0..n).rev() {
@@ -3269,6 +3295,7 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
                 let rm = removable(inst.op)
                     && dst_unused
                     && (!defines_vcc(inst.op) || !vcc_live)
+                    && (!crate::op_attrs::attrs(inst.op).scc_write || !scc_live)
                     // a v_cndmask/v_addc consumes vcc: removing it is fine only if nothing else depends on its dst (checked above)
                     && !(inst.dst.is_none() && !defines_vcc(inst.op));
                 if rm {
@@ -3281,6 +3308,13 @@ fn dce_full(m: &mut MFunction, loads_only: bool) {
                 }
                 if inst.op.consumes_vcc() {
                     vcc_live = true;
+                }
+                let at = crate::op_attrs::attrs(inst.op);
+                if at.scc_write {
+                    scc_live = false;
+                }
+                if at.scc_read {
+                    scc_live = true;
                 }
             }
             if dead.iter().any(|d| *d) {
