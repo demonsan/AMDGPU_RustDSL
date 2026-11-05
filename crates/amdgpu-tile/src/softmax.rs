@@ -236,6 +236,66 @@ impl OnlineSoftmax {
         nb
     }
 
+    /// `decide_seeded` with the whole reference update inside the rollback branch (the vendor's fast path): the new two-word reference, the
+    /// shift and the rescale are computed only when some lane's max passes the threshold; otherwise the tile costs the row max, one compare and the
+    /// branch. Returns the bias operand of the next tile (the loop variable, read after the branch).
+    pub fn decide_lazy(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, seed: Option<ValueId>) -> Opnd {
+        let bias2 = self.bias.expect("OnlineSoftmax: state not bound");
+        let mut flat: Vec<ValueId> = Vec::with_capacity(64);
+        for i in 0..4usize {
+            flat.extend(masked_values(b, s, i, mask, self.neg_big));
+        }
+        let mt = row_max(b, &flat);
+        let thr = match seed {
+            Some(sd) => b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(sd), a: Opnd::Val(self.neg_big), b: Opnd::Val(self.thr) }),
+            None => self.thr,
+        };
+        let grow = b.cmp_lt_f32(thr, mt);
+        b.begin_if(Opnd::Val(grow));
+        {
+            let w_old_u = b.frag2_lane(Opnd::Var(bias2), 0);
+            let w_old = b.bitcast_i32(w_old_u);
+            let hi_o = b.let_(Op::CvtF16ToF32(Opnd::Val(w_old)));
+            let lo_s = b.let_(Op::LshrI32(Opnd::Val(w_old), Opnd::Val(self.c16)));
+            let lo_o = b.let_(Op::CvtF16ToF32(Opnd::Val(lo_s)));
+            let c4f = b.c_f32(4.0);
+            let c025 = b.c_f32(0.25);
+            let sum_o = b.add_f32(hi_o, lo_o);
+            let b_old = b.mul_f32(sum_o, c4f);
+            let tt = b.sub_f32(self.b131, mt);
+            let b_new = b.add_f32(b_old, tt);
+            let q = b.mul_f32(b_new, c025);
+            let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q)));
+            let hq = b.let_(Op::CvtF16ToF32(Opnd::Val(h_raw)));
+            let r = b.sub_f32(q, hq);
+            let l_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(r)));
+            let lq = b.let_(Op::CvtF16ToF32(Opnd::Val(l_raw)));
+            let sum_q = b.add_f32(hq, lq);
+            let b_q = b.mul_f32(sum_q, c4f);
+            let d_full = b.sub_f32(b_q, b_old);
+            // the branch has no exec mask: lanes whose max did not pass the threshold keep their reference (delta = 0)
+            let delta = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(grow), a: Opnd::Val(d_full), b: Opnd::Val(self.zero_f) });
+            let l_sh = b.shl_i32(l_raw, self.c16);
+            let w_q = b.let_(Op::AddI32(Opnd::Val(h_raw), Opnd::Val(l_sh)));
+            let w_new = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(grow), a: Opnd::Val(w_q), b: Opnd::Val(w_old) });
+            let nb = b.frag2(w_new, w_new);
+            b.set_var(bias2, nb);
+            let dupd = b.frag2_dup(delta);
+            for a in &s.accs {
+                b.var_add_pk(a.var, dupd);
+            }
+            let ex = b.mul_f32(delta, self.c512);
+            let corr = b.exp2_f32(ex);
+            let cd = b.frag2_dup(corr);
+            for a in &o.accs {
+                b.var_scale_pk(a.var, cd);
+            }
+            self.scale_l(b, corr);
+        }
+        b.end_if();
+        Opnd::Var(bias2)
+    }
+
     /// P words of S accumulators `t0..t1` (4 words each; invalid keys contribute 0).
     pub fn convert(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, t0: usize, t1: usize) -> Vec<ValueId> {
         let lut = if self.recipe.lut { Some(LutConsts::new(b)) } else { None };

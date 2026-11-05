@@ -192,6 +192,9 @@ pub struct AttnBody3<'a> {
     pub seed_first: bool,
     /// K scales: one shift per scale word + op_sel byte select on the scaled QK MFMA (`_vs128`)
     pub kscale_sel: bool,
+    /// the reference update entirely inside the rollback branch (`OnlineSoftmax::decide_lazy`)
+    pub lazy_bias: bool,
+    bias_next: Option<Opnd>,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -199,11 +202,11 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, kscale_sel: false }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, kscale_sel: false, lazy_bias: false, bias_next: None }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
-    fn qk_block(&self, b: &mut FnBuilder, out: &QkOut, bias: ValueId, k: &LdsSlotPart, kd: &LdsSlotPart, s: usize) -> Option<ValueId> {
+    fn qk_block(&self, b: &mut FnBuilder, out: &QkOut, bias: Opnd, k: &LdsSlotPart, kd: &LdsSlotPart, s: usize) -> Option<ValueId> {
         let blk = self.blk;
         let start = match out {
             QkOut::Vars(t) => {
@@ -236,7 +239,7 @@ impl<'a> AttnBody3<'a> {
             }
         }
     }
-    fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, out: QkOut, bias: ValueId) -> Vec<ValueId> {
+    fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, out: QkOut, bias: Opnd) -> Vec<ValueId> {
         let r = self.ring;
         let k = r.kpart.at(b, &r.ks.at(slot));
         let kd = r.kdpart.at(b, &r.kd.at(slot));
@@ -273,7 +276,7 @@ impl PipeBody for AttnBody3<'_> {
         self.ring.store_constants(b, self.wid, &self.blk.lane, &self.blk.q);
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
-        self.s_init = self.qk(b, &t0.cur, QkOut::Values(self.zero16), self.sm.bias_init);
+        self.s_init = self.qk(b, &t0.cur, QkOut::Values(self.zero16), Opnd::Val(self.sm.bias_init));
     }
     fn loop_state(&mut self, _b: &mut FnBuilder) -> Vec<(DType, Opnd)> {
         let [bias, la]: [(DType, Opnd); 2] = self.sm.state().try_into().expect("softmax state");
@@ -295,6 +298,12 @@ impl PipeBody for AttnBody3<'_> {
         }
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
+        if self.lazy_bias {
+            let seed = self.seed_first.then(|| b.bind_cond(amdgpu_dsl::ox(t.it).eq(0)));
+            self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref(), seed));
+            self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
+            return;
+        }
         let nb = if self.seed_first {
             let first = b.bind_cond(amdgpu_dsl::ox(t.it).eq(0));
             self.sm.decide_seeded(b, &s, &o, mask.as_ref(), first)
@@ -306,7 +315,10 @@ impl PipeBody for AttnBody3<'_> {
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let mut w = std::mem::take(&mut self.p);
-        let bias = w.pop().expect("bias word");
+        let bias = match self.bias_next.take() {
+            Some(op) => op,
+            None => Opnd::Val(w.pop().expect("bias word")),
+        };
         if self.setprio {
             b.set_prio(1);
         }
@@ -326,7 +338,7 @@ impl PipeBody for AttnBody3<'_> {
         for i in 0..4usize {
             w.extend(self.sm.convert(b, &s, mask.as_ref(), i, i + 1));
             if let Some((k, kd)) = &next {
-                self.qk_block(b, &QkOut::Vars(&s), nb, k, kd, i);
+                self.qk_block(b, &QkOut::Vars(&s), Opnd::Val(nb), k, kd, i);
             }
         }
         self.sm.commit_bias(b, nb);
@@ -338,7 +350,12 @@ impl PipeBody for AttnBody3<'_> {
 /// two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe in the long-sequence copy (`OnlineSoftmax::set_vendor_ref`;
 /// the short copy keeps the exact LUT-corrected recipe: with < 9 tiles the lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
+    fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", false)
+}
+
+/// `_vs128` under another name with the experiment switches (A/B builds).
+pub fn fmha_vs128_named(name: &str, lazy_bias: bool) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
@@ -361,6 +378,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
                 body.seed_first = true;
             }
             body.setprio = true;
+            body.lazy_bias = lazy_bias && !lut;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
