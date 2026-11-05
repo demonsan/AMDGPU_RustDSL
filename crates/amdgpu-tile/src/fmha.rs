@@ -597,7 +597,7 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
-    fmha_kvsplit_cfg("fmha_fwd_hd128_mxfp8_v3_kvsplit", false, false)
+    fmha_kvsplit_cfg("fmha_fwd_hd128_mxfp8_v3_kvsplit", false, true)
 }
 
 /// `scaleconv`: the fast reference path (`Vs128Cfg::scaleconv`) in the long-sequence copy; `rows2`: the two-smfmac row sums.
