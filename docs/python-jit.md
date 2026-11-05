@@ -93,8 +93,8 @@ K a multiple of 128 up to 8192. Grid `(N/256, M/256)`.
 E8M0 bytes, `v_scale` an f32 in a buffer of at least 4096 bytes, `out [B, S, H, 128]` bf16. The descale tensors need the zeroed slack tail the
 contract states (`512·H·4` bytes behind `q_scale`, `640·H·4` behind `k_scale`): allocate the larger buffer and pass a view — the addressable
 size (torch storage, `DeviceBuffer(nbytes=…)`) is what the contract check uses. `path="auto"` is the shipped dispatch of
-`tests/gpu/ref_host.cpp` (`select_path`): the best KV split s ∈ {2, 4} passing the guard and the cost model, else `_t128` when
-`2·ceil(S/256)·H·B ≤ 256`, else `_vs128`; the KV-split partials live in a persistent per-stream workspace. Returns `(path, splits)`.
+`tests/gpu/ref_host.cpp` (`select_path`, fitted on realistic data): a KV split with s = 4 when ntiles ≥ 16 and N256 ≤ 64, s = 2 when ntiles ≥ 32 and
+N256 ≤ 128 (N256 = `ceil(S/256)·H·B`, ntiles = `ceil(SK/128)`), else `_t128` when N256 ≤ 64, else `_vs128`; the KV-split partials live in a persistent per-stream workspace. Returns `(path, splits)`.
 
 Arguments: torch tensors (any 1-byte dtype for fp8 / E8M0, any 2-byte dtype for bf16), objects with `__dlpack__` (GPU device), `DeviceBuffer`,
 or `RawPtr(ptr, shape, itemsize)`. All must be contiguous and 16-byte aligned (scales: 4). Stream: the explicit `stream` (an integer handle or

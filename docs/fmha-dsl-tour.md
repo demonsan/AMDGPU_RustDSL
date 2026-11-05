@@ -74,9 +74,9 @@ kernel 把 key 维切成 128 个 key 一个 tile；每个 workgroup 处理一段
 
 **自动派发在 host 侧**（kernel 本身不选路径）。参考 host `tests/gpu/ref_host.cpp` 的规则：
 
-1. KV-split 候选（`tests/gpu/ref_host.cpp:122-143`）：在 split 数 {2, 4} 中挑通过守卫（`N256 ≤ 128 && N256·s ≤ 256`、每个 split 至少一个 tile）
-   且模型时间 `T_kv < 0.95·T_current` 的最优者；
-2. 否则按 grid 大小（`tests/gpu/ref_host.cpp:56-62`、`tests/gpu/ref_host.cpp:148-155`）：`2·ceil(S/256)·H·B ≤ 256`（一波能放下）用 `_t128`，否则 `_vs128`。
+1. KV-split（`tests/gpu/ref_host.cpp:125-137`）：`ntiles ≥ 16 && N256 ≤ 64` 用 4 个 split，`ntiles ≥ 32 && N256 ≤ 128` 用 2 个 split（N256 = `ceil(S/256)·H·B`，ntiles = `ceil(SK/128)`）；
+2. 否则按 grid 大小（`tests/gpu/ref_host.cpp:56-63`、`tests/gpu/ref_host.cpp:154-157`）：`N256 ≤ 64` 用 `_t128`，否则 `_vs128`。
+这条规则是在真实数据（`REF_DATA=normal`）上测出来的：`_vs128` 从 N256 = 128 起就领先 `_t128`（B1H32S1024 +13%），split 在序列够长时才付得起 combine 的开销（B1H8S2048 split4 +11%，B1H8S1024 不切分）。
 
 三条路径共用同一个 656 字节的厂商 kernarg ABI（KV-split 多 64 字节扩展），所以 host 只换 code object 与 grid。
 
