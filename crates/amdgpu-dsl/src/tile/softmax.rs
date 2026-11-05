@@ -280,7 +280,10 @@ impl OnlineSoftmax {
             let x1 = b.frag4_lane(Opnd::Var(self.l_acc()), d1);
             let f0 = b.bitcast_f32(x0);
             let f1 = b.bitcast_f32(x1);
-            return b.add_f32(f0, f1);
+            let s = b.add_f32(f0, f1);
+            // the same P scale convention as dword 2 of the four-smfmac form (16 x the row sum)
+            let c = b.c_f32(0.0625);
+            return b.mul_f32(s, c);
         }
         let d2 = b.frag4_lane(Opnd::Var(self.l_acc()), 2);
         let lf = b.bitcast_f32(d2);
