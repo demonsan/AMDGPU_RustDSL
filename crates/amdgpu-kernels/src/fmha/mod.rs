@@ -206,7 +206,7 @@ pub struct AttnBody3<'a> {
     bias_next: Option<Opnd>,
     /// one f16 bias MFMA per tile (the vendor's single helper): its result is the C input of the four S tiles' first QK MFMA (`_vs128`)
     pub biasonce: bool,
-    bias_tile: std::cell::Cell<Option<ValueId>>,
+    bias_tile: std::cell::Cell<Option<Opnd>>,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -236,7 +236,7 @@ impl<'a> AttnBody3<'a> {
         if let (true, QkOut::Vars(t)) = (self.kscale_sel, out) {
             // the vendor form: ONE shift by 8 x lane half, then the scaled MFMA picks byte 0 (k chunk 0) / byte 2 (k chunk 1) with op_sel
             let w = b.bind_i32(ev(kw).lshr(ev(blk.sel.g8)));
-            if let Some(bt) = self.bias_tile.get() {
+            if let (Some(bt), true) = (self.bias_tile.get(), s < 3) {
                 b.var_mfma_scale_c(t.accs[s].var, k0, q[0].v, bt, w, blk.sq[0]);
             } else {
                 gemm(b, &self.ring.mma, t.accs[s].var, k0, q[0].v, w, blk.sq[0], 0, 0);
@@ -261,8 +261,11 @@ impl<'a> AttnBody3<'a> {
         let r = self.ring;
         let k = r.kpart.at(b, &r.ks.at(slot));
         let kd = r.kdpart.at(b, &r.kd.at(slot));
-        if self.biasonce && self.kscale_sel && matches!(out, QkOut::Vars(_)) {
-            self.bias_tile.set(Some(b.mfma_f16_wide(self.sm.ones_f16, bias, self.zero16)));
+        if let (true, true, QkOut::Vars(t)) = (self.biasonce, self.kscale_sel, &out) {
+            // the one bias MFMA writes S tile 3 (zero accumulator: no zero-fragment copies); tiles 0-2 take it as the C input of their first
+            // scaled MFMA, tile 3 accumulates in place last
+            b.var_mfma_f16_z(t.accs[3].var, self.sm.ones_f16, bias);
+            self.bias_tile.set(Some(Opnd::Var(t.accs[3].var)));
         }
         let res = (0..4).filter_map(|s| self.qk_block(b, &out, bias, &k, &kd, s)).collect();
         self.bias_tile.set(None);
