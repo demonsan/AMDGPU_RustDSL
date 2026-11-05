@@ -117,48 +117,53 @@ static void smfmac_part(const std::string& dir, FILE* out) {
     for (int q = 0; q < 6; ++q) { std::array<uint32_t, 8> n; n.fill(NIB[q]); char nm[32]; std::snprintf(nm, sizeof nm, "u%x", NIB[q]); pats.push_back({nm, n}); }
     for (int j = 0; j < 8; ++j) { std::array<uint32_t, 8> n; n.fill(0x4); n[j] = 0xe; char nm[32]; std::snprintf(nm, sizeof nm, "w%d", j); pats.push_back({nm, n}); }
     const int NP = (int)pats.size();
-    std::vector<int> kA((size_t)NP * 1024, -9);      // matched B-element k label per (pattern, A byte); -1 none; -2 inconsistent
-    std::vector<int> bmatch((size_t)NP * 1024 * 16, -1);   // B element index per (pattern, a, column n)
+    // one stage-3 run: index word wl[l] per lane; returns the matched k label per A byte (-1 none, -2 inconsistent) and counts the problems
     int missing = 0, inconsistent = 0;
-    for (int pi = 0; pi < NP; ++pi) {
-        const uint32_t w = word(pats[pi].second);
-        // 12 probes per A element: planes 0..10 and "ones"
+    auto stage3 = [&](const uint32_t* wl, std::vector<int>& kOut) {
         std::vector<SmfProbe> ps(1024 * 12);
         for (int a = 0; a < 1024; ++a) for (int j = 0; j < 12; ++j) {
-            SmfProbe& p = ps[a * 12 + j]; a_one_hot(p, a / 16, a % 16); idx_all(p, w);
+            SmfProbe& p = ps[a * 12 + j]; a_one_hot(p, a / 16, a % 16); for (int l = 0; l < 64; ++l) p.idx[l] = wl[l];
             if (j == 11) b_ones(p); else for (int b = 0; b < 2048; ++b) p.b[b] = ((b >> j) & 1) ? ONE : 0;
         }
         auto D = R.run(ps);
+        kOut.assign(1024, -9);
         for (int a = 0; a < 1024; ++a) {
             const int m = arow[a];
             int kk = -9;
             for (int n = 0; n < 16; ++n) {
-                // the D position of (m, n)
                 int pos = -1; for (int i = 0; i < 256; ++i) if (mrow[i] == m && ncol[i] == n) pos = i;
-                const bool exists = D[(a * 12 + 11) * 256 + pos] > 0.5f;
                 int b = 0; for (int j = 0; j < 11; ++j) if (D[(a * 12 + j) * 256 + pos] > 0.5f) b |= 1 << j;
-                if (!exists) { bmatch[((size_t)pi * 1024 + a) * 16 + n] = -1; ++missing; continue; }
-                bmatch[((size_t)pi * 1024 + a) * 16 + n] = b;
+                if (!(D[(a * 12 + 11) * 256 + pos] > 0.5f)) { ++missing; continue; }   // (B ones: D = 1 whenever the A byte contributes)
                 CHECK(bcol[b] == n, "matched B element %d of column %d lies in column %d", b, n, bcol[b]);
                 const int lane = b / 32, r = (b % 32) / 4, y = b % 4;
-                const int k = 32 * (lane / 16) + 4 * r + y;   // the k LABEL of a B element (hypothesis, validated below by consistency across columns)
+                const int k = 32 * (lane / 16) + 4 * r + y;   // the k LABEL of a B element: lane group, register, byte; every column must give the same label
                 if (kk == -9) kk = k; else if (kk != k) kk = -2;
             }
             if (kk == -2) ++inconsistent;
-            kA[(size_t)pi * 1024 + a] = kk;
+            kOut[a] = kk;
         }
-    }
+    };
+    std::vector<int> kA((size_t)NP * 1024, -9);
+    for (int pi = 0; pi < NP; ++pi) { uint32_t wl[64]; for (int l = 0; l < 64; ++l) wl[l] = word(pats[pi].second); std::vector<int> k; stage3(wl, k); std::copy(k.begin(), k.end(), kA.begin() + (size_t)pi * 1024); }
     std::printf("stage 3: %d patterns x 1024 A bytes x 16 columns: %d unmatched, %d A elements whose 16 matched B elements disagree on k\n", NP, missing, inconsistent);
     CHECK(missing == 0 && inconsistent == 0, "every A element matches one k in every column");
-    // expectation: lane l byte t = stored value s = t; kslice = l/16; group g = 8 kslice + s/2; k = 4 g + p, p = the 2-bit field at bits 2s..2s+1 of the lane's index word
+    // measured: A lane l (lane group g = l/16), stored byte s (pair q = s/2), index word w of the SAME lane:  k = 64 (g&1) + 16 (g>>1) + 32 (q/4) + 4 (q%4) + ((w >> 2 s) & 3)
+    auto kformula = [](int l, int s, uint32_t w) { const int g = l / 16, q = s / 2; return 64 * (g & 1) + 16 * (g >> 1) + 32 * (q / 4) + 4 * (q % 4) + (int)((w >> (2 * s)) & 3); };
     int viol = 0;
-    for (int pi = 0; pi < NP; ++pi) for (int a = 0; a < 1024; ++a) {
-        const int l = a / 16, s = a % 16; const uint32_t w = word(pats[pi].second);
-        const int g = 8 * (l / 16) + s / 2, p = (w >> (2 * s)) & 3;
-        if (kA[(size_t)pi * 1024 + a] != 4 * g + p) ++viol;
-    }
-    std::printf("k(A lane l, stored byte s, index word w) = 4 (8 (l/16) + s/2) + ((w >> 2 s) & 3): %d of %d violate\n", viol, NP * 1024);
+    for (int pi = 0; pi < NP; ++pi) for (int a = 0; a < 1024; ++a) if (kA[(size_t)pi * 1024 + a] != kformula(a / 16, a % 16, word(pats[pi].second))) ++viol;
+    std::printf("k(l, s, w) = 64 (g&1) + 16 (g>>1) + 32 (q/4) + 4 (q%%4) + ((w >> 2 s) & 3), g = l/16, q = s/2: %d of %d violate\n", viol, NP * 1024);
     CHECK(viol == 0, "A compressed-index semantics");
+    // per-lane index words (each lane its own): every A byte follows the index word of ITS OWN lane only
+    int viol_lane = 0;
+    for (int variant = 0; variant < 3; ++variant) {
+        uint32_t wl[64]; std::mt19937 rg(777 + variant);
+        for (int l = 0; l < 64; ++l) { uint32_t w = 0; for (int i = 0; i < 8; ++i) w |= NIB[rg() % 6] << (4 * i); wl[l] = w; }
+        std::vector<int> k; stage3(wl, k);
+        for (int a = 0; a < 1024; ++a) if (k[a] != kformula(a / 16, a % 16, wl[a / 16])) ++viol_lane;
+    }
+    std::printf("per-lane random index words (3 variants x 1024 bytes): %d violate\n", viol_lane);
+    CHECK(viol_lane == 0, "each A byte follows its own lane's index word");
+    viol += viol_lane;
     // B element k labels and the (n, k) map
     std::fprintf(out, "# v_smfmac_f32_16x16x128_fp8_fp8 one-hot probe maps (tests/gpu/isa_probe_host.cpp, kernel probe_smfmac_gen); m, n, k are measured class labels\n");
     std::fprintf(out, "SMFMAC_VIOLATIONS %d\n", viol + g_bad);
@@ -214,9 +219,11 @@ static void tr_part(const std::string& dir, FILE* out) {
     int unmatched = 0; for (int d = 0; d < 64; ++d) for (int j = 0; j < 8; ++j) if (smap[d][j] < 0) ++unmatched;
     std::printf("tr_b8: %d address sets (consecutive, strided, 8x8 column-major, 40 random permutations of 8-byte blocks): %d (lane, byte) results differ from the first set's (source lane, byte offset); %d unmatched\n", NPB, viol, unmatched);
     CHECK(viol == 0 && unmatched == 0, "tr_b8 map is address independent");
-    // hypothesis: dest lane d, byte j gets byte (d % 8) of the qword read by lane 8 (d / 8) + j   (the 8x8-byte transpose inside each group of 8 lanes)
-    int hv = 0; for (int d = 0; d < 64; ++d) for (int j = 0; j < 8; ++j) if (smap[d][j] != 8 * (d / 8) + j || hmap[d][j] != d % 8) ++hv;
-    std::printf("transpose hypothesis (source lane 8 (d/8) + j, byte d%%8): %d of 512 violate\n", hv);
+    // measured: dest lane d, byte j (register j/4, byte j%4) = byte (d % 8) of the qword read by lane 16 (d/16) + 2 j + (d%16)/8
+    //   i.e. inside each 16-lane group the 8 qwords of the even lanes are 8x8-byte transposed into dest lanes 0..7, the odd lanes' into dest lanes 8..15
+    int hv = 0; for (int d = 0; d < 64; ++d) for (int j = 0; j < 8; ++j) if (smap[d][j] != 16 * (d / 16) + 2 * j + (d % 16) / 8 || hmap[d][j] != d % 8) ++hv;
+    std::printf("tr_b8 formula (source lane 16 (d/16) + 2 j + (d%%16)/8, byte d%%8): %d of 512 violate\n", hv);
+    CHECK(hv == 0, "tr_b8 formula");
     std::fprintf(out, "# ds_read_b64_tr_b8 one-hot probe map (tests/gpu/isa_probe_host.cpp, kernel probe_lds_tr_b8_gen): dest lane d, byte j (reg j/4, byte j%%4) = byte h of the qword read by lane s\n");
     std::fprintf(out, "TR_VIOLATIONS %d\n", viol + unmatched);
     std::fprintf(out, "TR_S"); for (int d = 0; d < 64; ++d) for (int j = 0; j < 8; ++j) std::fprintf(out, " %d", smap[d][j]); std::fprintf(out, "\n");
