@@ -344,16 +344,24 @@ impl PipeBody for AttnBody3<'_> {
         let r = self.ring;
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
-        let nb = self.sm.decide_deferred(b, &s, &o, mask.as_ref());
+        let (nb, lazy) = if self.lazy_bias {
+            (self.sm.decide_lazy(b, &s, &o, mask.as_ref(), None), true)
+        } else {
+            (Opnd::Val(self.sm.decide_deferred(b, &s, &o, mask.as_ref())), false)
+        };
         let next = t.staged.then(|| (r.kpart.at(b, &r.ks.at(&t.next)), r.kdpart.at(b, &r.kd.at(&t.next))));
         let mut w = Vec::with_capacity(16);
         for i in 0..4usize {
             w.extend(self.sm.convert(b, &s, mask.as_ref(), i, i + 1));
             if let Some((k, kd)) = &next {
-                self.qk_block(b, &QkOut::Vars(&s), Opnd::Val(nb), k, kd, i);
+                self.qk_block(b, &QkOut::Vars(&s), nb, k, kd, i);
             }
         }
-        self.sm.commit_bias(b, nb);
+        if !lazy {
+            if let Opnd::Val(v) = nb {
+                self.sm.commit_bias(b, v);
+            }
+        }
         self.pv(b, &t.cur, &w);
     }
 }
@@ -455,7 +463,12 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h() -> Function {
 
 /// `_t128`: 128-row blocks, one 4-wave group, a 3-slot ring with one window per tile (`Cadence::OneWindow`).
 pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_t128", 256);
+    fmha_t128_named("fmha_fwd_hd128_mxfp8_v3_t128", false)
+}
+
+/// `_t128` under another name; `vref`: the vendor recipe with the lazy reference update from 4 tiles (A/B builds).
+pub fn fmha_t128_named(name: &str, vref: bool) -> Function {
+    let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::T128);
     let b = &mut fb;
     let io = declare_io(b, 128, false);
@@ -464,9 +477,13 @@ pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
     let ring = KvRing3::new(b, &io, &blk, &roles, 3);
     let mut pipe = Pipeline::new(Cadence::OneWindow, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     pipe.prebind = vec![32768, 512];
-    let lut = blk.lut_copy(b);
+    let lut = if vref { blk.lut_copy_below(b, 4) } else { blk.lut_copy(b) };
     versioned(b, lut, |b, lut| {
         let mut body = AttnBody3::new(b, &ring, &blk, blk.lane.wave, lut);
+        if vref && !lut {
+            body.sm.set_vendor_ref(b);
+            body.lazy_bias = true;
+        }
         pipe.run(b, Role::All, &mut body);
         let fin = body.out_scale(b);
         store_out3(&io, b, &blk, &body.o.expect("O"), fin);
