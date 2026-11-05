@@ -447,7 +447,10 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
             store_partial3(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin, lse);
         });
     });
-    fb.finish()
+    let mut f = fb.finish();
+    // scheduler: sink every ds_read to at most one MFMA before its first use (sched/ldahead.rs, docs/lgkm-lookahead.md): +5.5..+6.8 % on realistic data (B1H8S2048 / B1H4S4096 split 4, B1H4S8192 split 2)
+    f.sched_opts = Some("ldsink=1".to_string());
+    f
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h() -> Function {
@@ -480,7 +483,10 @@ pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
         let fin = body.out_scale(b);
         store_out3(&io, b, &blk, &body.o.expect("O"), fin);
     });
-    fb.finish()
+    let mut f = fb.finish();
+    // scheduler: sink every ds_read to at most one MFMA before its first use (sched/ldahead.rs, docs/lgkm-lookahead.md): +0.4..+0.8 % on realistic data
+    f.sched_opts = Some("ldsink=1".to_string());
+    f
 }
 
 /// The 656-byte FMHA kernarg ABI (+ the KV-split extension) with the host contract DERIVED from the tensors' layouts (`contract::compact_tensor` /
