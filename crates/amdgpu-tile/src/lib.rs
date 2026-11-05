@@ -247,15 +247,26 @@ impl Ctx {
 
 pub use amdgpu_dsl::{ev, ox, varx};
 
-/// Is the expression the literal 0?
-pub fn is_zero(e: &I32) -> bool {
-    matches!(&*e.0, amdgpu_dsl::expr::Node::CI(0))
-}
-/// `a + b`, or `a` when `b` is the literal 0 (no `add` emitted).
-pub fn add0(a: I32, b: &I32) -> I32 {
-    if is_zero(b) {
-        a
-    } else {
-        a + b
-    }
+/// Is the expression the literal 0?
+
+pub fn is_zero(e: &I32) -> bool {
+
+    matches!(&*e.0, amdgpu_dsl::expr::Node::CI(0))
+
+}
+
+/// `a + b`, or `a` when `b` is the literal 0 (no `add` emitted).
+
+pub fn add0(a: I32, b: &I32) -> I32 {
+
+    if is_zero(b) {
+
+        a
+
+    } else {
+
+        a + b
+
+    }
+
 }
