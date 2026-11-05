@@ -31,16 +31,7 @@ fn every_kernel_compiles() {
 #[test]
 fn natural_exp_is_lowered_through_exp2() {
     // The hardware instruction computes 2^x, so `exp` must be scaled first.
-    use amdgpu_dsl::{DType, FnBuilder, Op};
-    // exp of a runtime value whose result is consumed immediately by a dependent multiply
-    let mut fb = FnBuilder::new("exp_hazard", 64);
-    fb.arg("o", DType::Ptr, 0, 8);
-    let o = fb.let_(Op::KernargPtr { offset: 0 });
-    let x = fb.load_f32(o, 0);
-    let e = fb.exp_f32(x);
-    let y = fb.mul_f32(e, e);
-    fb.store_f32(o, 4, y);
-    let f = fb.finish();
+    let f = kernel_by_name("probe_math").unwrap();
     let compiled = compile(&f).unwrap();
     assert!(compiled.asm.contains("v_exp_f32_e32"), "exp2 instruction missing");
     assert!(
@@ -51,26 +42,28 @@ fn natural_exp_is_lowered_through_exp2() {
 
 #[test]
 fn transcendental_results_get_wait_states() {
+    use amdgpu_dsl::{DType, FnBuilder, Op};
     // Regression: consuming a transcendental result immediately returned the
-    // stale register value on gfx950.
-    let f = kernel_by_name("probe_math").unwrap();
+    // stale register value on gfx950. exp of a runtime value consumed at once by a dependent multiply:
+    let mut fb = FnBuilder::new("exp_hazard", 64);
+    fb.arg("o", DType::Ptr, 0, 8);
+    let o = fb.let_(Op::KernargPtr { offset: 0 });
+    let x = fb.load_f32(o, 0);
+    let e = fb.exp_f32(x);
+    let y = fb.mul_f32(e, e);
+    fb.store_f32(o, 4, y);
+    let f = fb.finish();
     let compiled = compile(&f).unwrap();
-    assert!(compiled.asm.contains("s_nop"), "no hazard padding emitted");
+    // the instruction after every v_exp_f32 must not read its result (padding or independent work in between)
+    let ins: Vec<&str> = compiled.asm.lines().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with(['.', ';', '/', '#']) && !l.ends_with(':')).collect();
     let mut exp_seen = false;
-    for (i, line) in compiled.asm.lines().enumerate() {
-        if line.contains("v_exp_f32") {
+    for (i, line) in ins.iter().enumerate() {
+        if line.starts_with("v_exp_f32") {
             exp_seen = true;
-            let window: String = compiled
-                .asm
-                .lines()
-                .skip(i + 1)
-                .take(6)
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                window.contains("s_nop") || window.contains("global_load") || window.contains("v_mul"),
-                "no padding or independent work after exp at line {i}"
-            );
+            let dst = line.split_whitespace().nth(1).unwrap().trim_end_matches(',');
+            let next = ins[i + 1];
+            let reads = next.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == dst);
+            assert!(!reads, "the instruction right after `{line}` reads its result without padding: `{next}`\n{}", compiled.asm);
         }
     }
     assert!(exp_seen, "kernel does not use exp at all");
@@ -97,7 +90,7 @@ fn verifier_rejects_type_errors() {
 fn loop_variables_survive_verification() {
     use amdgpu_dsl::{verify, Op};
 
-    let f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_v3_t128").unwrap();
+    let f = kernel_by_name("fmha_fwd_hd128_mxfp8_v3_t128").unwrap();
     let errors = verify(&f);
     assert!(errors.is_empty(), "attention IR failed verification: {errors:?}");
     // Sanity: the kernel really does carry loop state.
