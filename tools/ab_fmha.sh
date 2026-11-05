@@ -12,7 +12,7 @@ while [ $# -gt 0 ]; do [ "$1" = -- ] && { shift; SH=("$@"); break; }; KS+=("$1")
 [ ${#SH[@]} = 0 ] && SH=("4 2048" "1 8192")
 REPS=${REPS:-7}; RPB=${ROWS_PER_BLOCK:-256}
 mkdir -p build/ab
-[ -x build/ff/ref_host ] || { mkdir -p build/ff; g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/ref_host.cpp -o build/ff/ref_host -I$R/include -L$R/lib -lamdhip64 -Wl,-rpath,$R/lib; }
+{ [ -x build/ff/ref_host ] && [ build/ff/ref_host -nt tests/gpu/ref_host.cpp ]; } || { mkdir -p build/ff; g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/ref_host.cpp -o build/ff/ref_host -I$R/include -Itests/gpu -I. -L$R/lib -lamdhip64 -Wl,-rpath,$R/lib 2>/dev/null; }
 kn() { echo "${1%%@*}"; }
 ksp() { case "$1" in *@*) echo "--specialize ${1#*@}";; esac; }
 for k in "${KS[@]}"; do
