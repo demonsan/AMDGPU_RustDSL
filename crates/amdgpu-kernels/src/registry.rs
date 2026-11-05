@@ -40,15 +40,6 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),
         // scheduler-token A/B variants of the shipped kernels (same code + `Function::sched_opts` tokens on top of the kernel's own preset; no env knobs):
-        // `ldsink=D` sinks every ds_read down to at most D MFMAs before its first consumer (sched/ldahead.rs, docs/lgkm-lookahead.md)
-        n if n.starts_with("fmha_fwd_hd128_mxfp8_v3x_vs128_ldsink") || n.starts_with("fmha_fwd_hd128_mxfp8_v3x_kvsplit_ldsink") => {
-            let (base, d) = n.rsplit_once("_ldsink")?;
-            let d: u32 = d.parse().ok()?;
-            let mut f = kernel_by_name(&base.replace("_v3x_", "_v3_"))?;
-            f.name = n.to_string();
-            f.sched_opts = Some(format!("ldsink={d}"));
-            Some(f)
-        }
         "probe_dma" => Some(crate::probes::probe_dma()),
         "probe_safeasm_e2e" => Some(crate::probes::probe_safeasm_e2e()),
         "probe_log_store4" => Some(crate::probes::probe_log_store4()),

@@ -411,7 +411,11 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
             store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
         });
     });
-    fb.finish()
+    let mut f = fb.finish();
+    // scheduler: sink every ds_read to at most one MFMA before its first use (one fragment group in flight, the vendor's lgkmcnt(4);
+    // sched/ldahead.rs, docs/lgkm-lookahead.md): +0.6 % B1H8S8192, +1.3 % per-CU on realistic data, VGPR 256 -> 248
+    f.sched_opts = Some("ldsink=1".to_string());
+    f
 }
 
 /// `_kvsplit`: the `_vs128` structure over a key range per split (two-smfmac row sums, the vendor recipe with the lazy update from 4 tiles of the
