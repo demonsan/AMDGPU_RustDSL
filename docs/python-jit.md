@@ -111,3 +111,16 @@ HIP_VISIBLE_DEVICES=5 AMDGPU_JIT_AMDC=/path/to/amdc python3 python/tests/node_ch
 `tests/gpu/ref_host.cpp`) and requires the JIT outputs to be bit-identical to the harness outputs (`OURS_DUMP` / `REF_DUMP2`) for the
 specialized and the generic kernels, the FMHA path to match the harness's dispatch, the cache to go miss → disk hit → memory hit, and reports
 the first-call latencies, the host time per launch and specialized-vs-generic performance.
+
+## Measured (MI355X GPU 5, debug `amdc`, `python3 python/tests/node_check.py`, 22/22 PASS)
+
+| check | result |
+|---|---|
+| bit identity vs the C++ harnesses, specialized and generic | GEMM 1024×1024×2048 and 1280×6144×7168; FMHA B4H8S2048 (`_vs128`), B2H8S2048 (`_t128`), B1H8S2048 and B1H2S200SK1337 gqa2 (KV-split 4 + combine), B1H4S77SK1 (`_t128`): all bit-identical, the same path as the harness dispatch |
+| cache | cold first call 1.2–1.4 s (amdc emit + jit-info in parallel + clang); first call in a new process 13.5 ms (disk hit, after the 180 ms HIP runtime initialisation); in-process hit 26–45 µs |
+| host time per op call | GEMM: 20 µs with the contract check (memoised), 19 µs without; `Kernel.launch_raw` (prepacked kernarg) 5.6 µs |
+| launch path adds no GPU time | GEMM 4096×4096×8192, same kernel and inputs: JIT 3207 vs `gemm_ref_host` 3210 TFLOP/s |
+| specialized vs generic | GEMM 4096×4096×8192 +0.2 %; FMHA B4H8S2048 −1.9 %, B1H8S8192 −1.1 %, B1H8S2048 KV-split −4.1 % (specialization does not help these kernels; `specialize=False` keeps one compile per kernel) |
+
+Note on input data: the GEMM runs about 13 % slower on uniformly random fp8 bytes (`os.urandom`) than on the harnesses' LCG data
+(3210 → 2790 TFLOP/s, same kernel, same launch path) - a power / clock effect of the data, not of the launch.
