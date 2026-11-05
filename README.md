@@ -11,15 +11,15 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 
 ---
 
-## 当前状态（MI355X / gfx950 实测；tag `v7.0-reorg`）
+## 当前状态（MI355X / gfx950 实测；tag `v7.4-fmha-normal`）
 
 | 项 | 结果 |
 |---|---|
-| **出厂 FMHA（v3，布局层）** | 默认路径 `fmha_fwd_hd128_mxfp8_auto` 的 4 个 kernel `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-kernels/src/fmha/`）建在布局层上：每个 LDS/全局地址、DMA、epilogue 存储与 KV-split 转置暂存都由 `amdgpu-layout` 的布局推导，主机合同由张量布局导出。asm md5（`--backend own`）：`763142f9` / `91b26e5d` / `e1fe92a4` / `24a95a51`。长序列（≥9 tile）的 `_vs128` 采用厂商参考值路径（精度与厂商一致）；`_t128`/KV-split/短序列保留精确重定基（误差约为厂商 1/3） |
+| **出厂 FMHA（v3，布局层）** | 默认路径 `fmha_fwd_hd128_mxfp8_auto` 的 4 个 kernel `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}`（`crates/amdgpu-kernels/src/fmha/`）建在布局层上：每个 LDS/全局地址、DMA、epilogue 存储与 KV-split 转置暂存都由 `amdgpu-layout` 的布局推导，主机合同由张量布局导出。asm md5（`--backend own`）：`8938adfa` / `d7e02b0f` / `41f151fc` / `24a95a51`。≥4 个 tile 用厂商参考值配方（懒惰回滚，精度与厂商一致），更短的序列保留精确重定基 |
 | **布局层（路线 B）** | `amdgpu-layout`（`Layout`/`IntTuple`/`Swizzle`/TV 布局/`IssuePlan`/构建期证明）→ `amdgpu-isa`（copy 与 MMA atom 表）→ `amdgpu-tile`（`TiledCopy`/`TiledMma`/`partition_*`）；入门 [`docs/layout-tour.md`](docs/layout-tour.md)，实施记录 [`docs/dsl-layout-refactor-design.md`](docs/dsl-layout-refactor-design.md) §9 |
 | **MXFP8 blockscale GEMM** | `gemm_mxfp8_bs_v4`（`crates/amdgpu-kernels/src/gemm/`，对照 aiter PR #6696 4-wave pin-AGPR）：4096×4096×8192 **0.98–1.00×**（v7.0 门禁 3248 vs 3289 TF/s = 0.988×）；6 个形状几何平均 0.982×（[`docs/perf-matrix.md`](docs/perf-matrix.md)）；`tools/gemm_gate.sh` PASS。演进与证据见 [`docs/mxfp8-gemm-4wave-analysis.md`](docs/mxfp8-gemm-4wave-analysis.md) §12–§14；AGPR 见 [`docs/agpr.md`](docs/agpr.md) |
 | **主机侧生成** | `amdc gen-host <kernel>` / `--shipped`：从 kernel 合同生成 C++ 启动/ABI 头（打包 `Args`、`validate()`）与 JSON 元数据，出厂 `ref_host` 用生成的命名字段；见 [`docs/host-gen.md`](docs/host-gen.md) |
-| **FMHA 性能（v7.0 `port_gate`，同轮对照厂商）** | B1H8S2048 KV-split **685.9 TF/s（1.27×）**；B2H8S2048 `_t128` **1067.4（1.05×）**；铺满网格 B4H8S2048 **1543.9（0.918×）**、B1H8S8192 **2206.4（0.921×）**；`_vs128` 每 CU 64 blocks **493.1（0.917×）**。25 个形状的完整对比（几何平均 1.00×）见 [`docs/perf-matrix.md`](docs/perf-matrix.md) |
+| **FMHA 性能（真实分布数据 `REF_DATA=normal`，同轮对照厂商）** | 门禁：KV-split B1H8S2048 **1.03×**、B4H8S2048 **0.904×**、B1H8S8192 **0.988×**、`_vs128` 每 CU **0.894×**、`_t128` **0.862×**；25 形状矩阵 0.897–1.100×，几何平均 **0.980×**（[`docs/perf-matrix.md`](docs/perf-matrix.md)）。旧的 LCG 调色板数据会让双方都几乎每 tile 走回滚分支，高估了我们的相对位置，门禁已改为真实分布 |
 | 精度 | 门禁判据 = 厂商持平（每形状每路径 mean ≤ 1.10× 厂商且 bad ≤ 厂商，同轮同输入）：15/15 ×3 路径 + split 13/13；旧 bad=0 判据作为信息仍为 0 |
 | 确定性 | 5/5 × N；uneven-tile split 形状重复启动单一 md5 |
 | 测试 | `cargo test` **87 个目标 / 366 项全绿**；safe-asm 另有 ui 用例（编译失败对照） |
