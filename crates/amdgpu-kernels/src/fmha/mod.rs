@@ -412,6 +412,7 @@ pub fn vs128_exp(name: &str, x: u32) -> Function {
     // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
     pipe.key_unclamped = true;
     pipe.ahead2 = x & 1 != 0;
+    pipe.stage_early = x & 2 != 0;
     let pipe = pipe;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {

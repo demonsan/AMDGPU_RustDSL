@@ -161,12 +161,16 @@ pub struct Pipeline {
     /// `TwoPhaseOffset` over a 3-slot ring: the VALU phase of tile t stages tile t+2 (one phase earlier than the 2-slot form, the vendor's
     /// distance) and its end waits only for tile t+1 (counted `vmcnt(stage_vm)`); the prologue stages tiles 0 and 1.
     pub ahead2: bool,
+    /// `TwoPhaseOffset` (2 slots): the copies of tile t+2 are issued at the END of the matrix phase of tile t (after its LDS reads drained,
+    /// before the end barrier) into the slot tile t just left, instead of at the start of the VALU phase of tile t+1 - the vendor's issue
+    /// point; the prologue stages tiles 0 and 1.
+    pub stage_early: bool,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true, late_stage_b: false, key_unclamped: false, ahead2: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true, late_stage_b: false, key_unclamped: false, ahead2: false, stage_early: false }
     }
     pub fn slots(&self) -> u32 {
         match self.cadence {
@@ -210,7 +214,7 @@ impl Pipeline {
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
             body.stage(b, role, &key1, &SlotIdx::new(1, 1));
         }
-        if self.cadence == Cadence::TwoPhaseOffset && self.ahead2 {
+        if self.cadence == Cadence::TwoPhaseOffset && (self.ahead2 || self.stage_early) {
             // tile 1 (clamped); it completes at the end of the first VALU phase (the loop's counted wait)
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
             body.stage(b, role, &key1, &SlotIdx::new(1, 1));
@@ -375,6 +379,41 @@ impl Pipeline {
     fn iter(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: VarId, idx: VarId, masked: bool, staged: bool, last_barrier: bool) -> ValueId {
         let nkv = ev(self.nkv);
         match self.cadence {
+            Cadence::TwoPhaseOffset if self.stage_early => {
+                let i1 = b.bind_i32(varx(idx) ^ 1);
+                let it_p1 = b.let_i32(varx(it) + 1);
+                let it_p2 = b.let_i32(varx(it) + 2);
+                let t = TileIt {
+                    it: Opnd::Var(it),
+                    cur: SlotIdx::new(idx, it),
+                    next: SlotIdx::new(i1, b.bind_opnd(&it_p1)),
+                    n2: Some(SlotIdx::new(idx, b.bind_opnd(&it_p2))),
+                    masked,
+                    staged,
+                    tile_rows: self.tile_rows,
+                };
+                self.prebind(b, &t);
+                body.v_phase(b, role, &t);
+                // tile t+1 (issued at the end of the previous matrix phase, or in the prologue)
+                b.wait_vm(0);
+                body.stage_complete(b, role, &t.next);
+                if self.mid_lds_drain {
+                    b.wait_lds(0);
+                }
+                b.barrier();
+                body.m_phase(b, role, &t);
+                b.wait_lds(0);
+                if staged {
+                    // tile t+2 into the slot tile t leaves (its reads drained above; the other group read it one phase earlier)
+                    let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
+                    let n2 = t.n2.clone().expect("n2");
+                    body.stage(b, role, &key_n2, &n2);
+                }
+                if last_barrier {
+                    b.barrier();
+                }
+                i1
+            }
             Cadence::TwoPhaseOffset if self.ahead2 => {
                 let i1 = b.bind_i32(varx(idx).lt(2).select_i32(varx(idx) + 1, 0));
                 let i2 = b.bind_i32(I32::c(0).lt(varx(idx)).select_i32(varx(idx) - 1, 2));
