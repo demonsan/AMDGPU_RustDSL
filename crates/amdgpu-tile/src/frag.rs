@@ -10,7 +10,8 @@
 use std::marker::PhantomData;
 
 use crate::shared::{Layout, Shared, SlotRef, Swz};
-use amdgpu_dsl::{ev, fmha_swz, Lane};
+use amdgpu_dsl::{ev};
+use crate::{fmha_swz, Lane};
 use crate::{add0};
 use amdgpu_dsl::{DType, FnBuilder, Opnd, ValueId, VarId, I32};
 

@@ -2,7 +2,8 @@
 
 use crate::frag::{AccTile, C32x32F32};
 use crate::shared::PrivRef;
-use amdgpu_dsl::{ev, Lane};
+use amdgpu_dsl::{ev};
+use crate::{Lane};
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd, ValueId, I32};
 
 /// `O * fin -> bf16` straight to global memory: per (e, q) the lane's 4 consecutive dims as one 8-byte store (`global_store_dwordx2`, 64 per lane), all

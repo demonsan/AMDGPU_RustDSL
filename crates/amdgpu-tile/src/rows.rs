@@ -4,7 +4,8 @@
 
 use crate::shared::{Layout, Shared, SlotRef, Swz};
 use crate::tensor::{Clamp, TileView};
-use amdgpu_dsl::{ev, fmha_swz, Lane};
+use amdgpu_dsl::{ev};
+use crate::{fmha_swz, Lane};
 use crate::{add0};
 use amdgpu_dsl::{FnBuilder, ValueId, I32};
 

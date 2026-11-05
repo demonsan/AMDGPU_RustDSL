@@ -3,7 +3,8 @@
 
 use crate::frag::{AccTile, C32x32F32};
 use crate::pipeline::TileIt;
-use amdgpu_dsl::{ev, Lane};
+use amdgpu_dsl::{ev};
+use crate::{Lane};
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd, ValueId, VarId};
 
 /// Validity of the keys of an S tile (rows of the C32x32 accumulators) against the number of valid keys: key of value r of accumulator s =

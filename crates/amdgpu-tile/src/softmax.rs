@@ -8,7 +8,7 @@
 
 use crate::frag::{AccTile, C32x32F32, C16x16F32};
 use crate::reduce::{masked_values, row_max, to_p8, KeyMask, LutConsts, P8Conv, SmfmacOnes};
-use amdgpu_dsl::Lane;
+use crate::Lane;
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd, ValueId, VarId};
 
 /// Recipe parameters (the shipped default: `Recipe::vsx(corr)`).
