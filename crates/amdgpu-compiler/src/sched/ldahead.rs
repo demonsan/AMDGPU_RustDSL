@@ -18,7 +18,7 @@ fn is_matrix(op: MOp) -> bool {
 
 /// Number of blocks changed.
 pub fn run(m: &mut MFunction, o: &Options) -> usize {
-    if o.ldahead == 0 && o.ldsink == 0 {
+    if o.ldahead == 0 && o.ldahead32 == 0 && o.ldsink == 0 {
         return 0;
     }
     let lv = liveness::compute(m);
@@ -75,7 +75,8 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
             }
         }
         for r in 0..n {
-            if o.ldahead == 0 || !is_lds_read(insts[r].op) {
+            let dist = if insts[r].op == MOp::LdsReadB32 { o.ldahead.max(o.ldahead32) } else { o.ldahead };
+            if dist == 0 || !is_lds_read(insts[r].op) {
                 continue;
             }
             let Some(d) = insts[r].dst.map(|d| m.canon(d)) else { continue };
@@ -97,7 +98,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
                         mf += 1;
                     }
                 }
-                if !found || mf >= o.ldahead {
+                if !found || mf >= dist {
                     break;
                 }
                 let prev = order[p - 1];
