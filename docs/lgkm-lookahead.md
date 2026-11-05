@@ -34,7 +34,7 @@ per-CU（B1H8S2048，`ROWS_PER_BLOCK=256` 强制 `_vs128`，11 轮）：基线 6
 ## preset 丢失，以及成对 / slotfill 的干净重测（2026-11-06）
 
 **`_t128` 丢了调度预设（已修）。** 出厂 `_t128` 带 `sched_opts = "ldsink=1"` 之后，编译路径里"显式 `Function::sched_opts`"这一支从**默认选项**起步，绕过了 FMHA 预设：`_t128` 的 ALU 跨栅栏（`alu_across_barrier`）与压力上限 248
-被悄悄丢掉。修法：`scheduler_options`（`crates/amdgpu-compiler/src/lib.rs`）先取 profile 预设（GEMM profile / FMHA 各家族），**再**把内核自己的 token 叠在预设上；回归测试 `crates/amdgpu-compiler/tests/sched_preset.rs`。
+被悄悄丢掉。修法：`scheduler_options`（`crates/amdgpu-compiler/src/lib.rs`）先取 profile 预设（GEMM profile / FMHA 各家族），**再**把内核自己的 token 叠在预设上；回归测试 `crates/amdgpu-kernels/tests/sched_preset.rs`。
 `_vs128` / `_kvsplit` / GEMM 的预设就是默认选项（+ 各自的 token），汇编逐字节不变；只有 `_t128` 变（md5 `df6c6ef2f5d9` → `e057befe3452`，证书 4 / 29 / 0 不变）。
 
 layout 中位数（leading `s_nop` 位移 0..7 × 3 轮，`REF_DATA=normal`，同一轮交替，TF/s）：
