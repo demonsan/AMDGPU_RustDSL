@@ -52,7 +52,7 @@ fn a_read_after_an_if_that_set_the_variable_reads_the_variable_register() {
         let (m, a) = compile_mir_alloc(&f).unwrap_or_else(|e| panic!("{p:?}: {e}"));
         let phys = |r| {
             let c = m.canon(r);
-            (a.phys[c.0 as usize], a.scalar[c.0 as usize])
+            (a.phys[c as usize], a.scalar[c as usize])
         };
         // the read: the add with the immediate 1000 (or a materialised 1000 register)
         let mut found = None;
