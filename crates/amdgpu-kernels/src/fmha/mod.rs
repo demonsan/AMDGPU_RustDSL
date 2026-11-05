@@ -206,6 +206,8 @@ pub struct AttnBody3<'a> {
     bias_next: Option<Opnd>,
     /// one f16 bias MFMA per tile (the vendor's single helper): its result is the C input of the four S tiles' first QK MFMA (`_vs128`)
     pub biasonce: bool,
+    /// EXPERIMENT: the row-sum smfmacs at the end of the VALU phase instead of the start of the M phase
+    pub rowsum_early: bool,
     bias_tile: std::cell::Cell<Option<Opnd>>,
 }
 
@@ -214,7 +216,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None) }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, rowsum_early: false, bias_tile: std::cell::Cell::new(None) }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -276,7 +278,9 @@ impl<'a> AttnBody3<'a> {
         let r = self.ring;
         let v = r.vpart.at(b, &r.vs.at(slot));
         let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])];
-        self.sm.row_sum(b, p[0].v, p[1].v);
+        if !self.rowsum_early {
+            self.sm.row_sum(b, p[0].v, p[1].v);
+        }
         let o = self.o.expect("O");
         for (hh, pf) in p.iter().enumerate() {
             for e in 0..4usize {
@@ -329,6 +333,11 @@ impl PipeBody for AttnBody3<'_> {
             // always rebases
             self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref()));
             self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
+            if self.rowsum_early {
+                let p0 = Frag::<B32x32x64Fp8>::from_words(b, &self.p[0..8]);
+                let p1 = Frag::<B32x32x64Fp8>::from_words(b, &self.p[8..16]);
+                self.sm.row_sum(b, p0.v, p1.v);
+            }
             return;
         }
         let nb = self.sm.decide(b, &s, &o, mask.as_ref());
@@ -381,7 +390,12 @@ impl PipeBody for AttnBody3<'_> {
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
+    vs128_exp("fmha_fwd_hd128_mxfp8_v3_vs128", 0)
+}
+
+/// EXPERIMENT builds (bit 0: row sums in the VALU phase)
+pub fn vs128_exp(name: &str, x: u32) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
@@ -409,6 +423,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
             }
             body.setprio = true;
             body.biasonce = true;
+            body.rowsum_early = x & 1 != 0 && !lut;
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);
