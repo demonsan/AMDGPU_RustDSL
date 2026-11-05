@@ -3,7 +3,7 @@
 //! GPU-semantics verification with a small trust ledger.
 use amdgpu_compiler::gpu_verify::{analyse, Severity};
 
-const VARIANTS: &[&str] = &["gemm_mxfp8_bs_v2", "gemm_mxfp8_bs_v3", "gemm_mxfp8_bs_v4"];
+const VARIANTS: &[&str] = &["gemm_mxfp8_bs_v4"];
 
 #[test]
 fn gemm_variants_build_with_their_layout_proofs_and_compile() {

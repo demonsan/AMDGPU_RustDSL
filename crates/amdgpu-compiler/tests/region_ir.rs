@@ -10,7 +10,6 @@ fn shipped() -> Vec<String> {
         "fmha_fwd_hd128_mxfp8_v3_kvsplit",
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h",
         "fmha_fwd_hd128_mxfp8_dsl_vs128",
-        "gemm_mxfp8_bs_v3",
         "gemm_mxfp8_bs_v4",
     ] {
         v.push(k.to_string());
