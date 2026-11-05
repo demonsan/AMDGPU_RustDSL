@@ -36,10 +36,6 @@ use std::rc::Rc;
 pub fn ev(v: ValueId) -> I32 {
     I32(Rc::new(Node::Val(v)))
 }
-/// An already-bound f32 value as an expression leaf.
-pub fn fv(v: ValueId) -> F32 {
-    F32(Rc::new(Node::Val(v)))
-}
 /// A loop variable as an i32 expression leaf (lowered to an `Opnd::Var` operand).
 pub fn varx(v: VarId) -> I32 {
     I32(Rc::new(Node::Var(v)))

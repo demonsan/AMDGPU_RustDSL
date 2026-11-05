@@ -307,11 +307,6 @@ impl TileView {
         self.clamps[dim] = Some(Clamp { limit, last, use_min: false });
         self
     }
-    /// Like `clamp` but emitted as `min(i, last)`.
-    pub fn clamp_min(mut self, dim: usize, last: I32) -> TileView {
-        self.clamps[dim] = Some(Clamp { limit: last.clone() + 1, last, use_min: true });
-        self
-    }
     /// The clamped relative index of `dim`.
     pub fn clamped(&self, dim: usize, rel: I32) -> I32 {
         match &self.clamps[dim] {

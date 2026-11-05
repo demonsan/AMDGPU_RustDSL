@@ -68,10 +68,6 @@ impl OnlineSoftmax {
         let zero4 = b.frag_zero(DType::Frag4);
         OnlineSoftmax { recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, one_f, conv_s: one_f, zero4, bias: None, la: None }
     }
-    /// Sets the exact-rebase threshold of the fast reference path.
-    pub fn set_hi_thr(&mut self, t: f32) {
-        self.recipe.hi_thr = t;
-    }
     /// Overrides the rollback threshold (scaled max units).
     /// The vendor's reference recipe (vendor-spec 4.7, the live scalars of `ref_mxfp8.co`): exp bias / rebase target s91 = 0.24799132
     /// (`0x3e7df17e`), lazy-rollback threshold s92 = 0.26135647 (`0x3e85d086`, 6.84/512 above the target: the reference only moves when a row max
@@ -89,10 +85,6 @@ impl OnlineSoftmax {
         self.thr = b.c_f32(s92);
         self.recipe.lut = self.recipe.lut && keep_lut;
         self.conv_s = b.c_f32(0.25);
-    }
-    pub fn set_thr(&mut self, b: &mut FnBuilder, thr: f32) {
-        self.recipe.thr = thr;
-        self.thr = b.c_f32(thr);
     }
     /// Loop-state initial values: [bias (Frag2), row sums (Frag4)].
     pub fn state(&self) -> Vec<(DType, Opnd)> {
@@ -135,23 +127,6 @@ impl OnlineSoftmax {
         let mut sc = None;
         let nb = self.decide_impl(b, s, o, mask, true, None, Some(&mut sc));
         (nb, sc.expect("scale"))
-    }
-    /// `decide_scaled` without writing the bias variable (see `decide_deferred`).
-    pub fn decide_deferred_scaled(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> (ValueId, ValueId) {
-        let mut sc = None;
-        let nb = self.decide_impl(b, s, o, mask, false, None, Some(&mut sc));
-        (nb, sc.expect("scale"))
-    }
-    /// `convert` with a per-lane conversion scale (`decide_scaled`).
-    pub fn convert_scaled(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, t0: usize, t1: usize, scale: ValueId) -> Vec<ValueId> {
-        let lut = if self.recipe.lut { Some(LutConsts::new(b)) } else { None };
-        let conv = if self.recipe.lut { P8Conv::PkNormLut } else { P8Conv::PkNorm };
-        let mut words = Vec::with_capacity(4 * (t1 - t0));
-        for i in t0..t1 {
-            let xs = masked_values(b, s, i, mask, self.zero_f);
-            words.extend(to_p8(b, &xs, scale, conv, lut.as_ref()));
-        }
-        words
     }
     fn decide_opts(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, write_bias: bool, seed: Option<ValueId>) -> ValueId {
         self.decide_impl(b, s, o, mask, write_bias, seed, None)

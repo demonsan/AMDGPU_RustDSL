@@ -185,11 +185,6 @@ impl FmhaIo {
     }
 }
 impl FmhaIo {
-    /// bf16 epilogue: `O * fin` to the lane's output row (rows past S recompute and store the last valid row; waves without a valid row store nothing).
-    pub fn store_out(&self, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C32x32F32, 4>, fin: ValueId) {
-        let (row_ptr, live) = self.out_row(b, blk);
-        super::epilogue::store_bf16(b, o, fin, row_ptr, live);
-    }
     /// KV-split partial epilogue: `lse` and the fp16 `Ohat = O * fin` of the lane's row at partial row `split * rows_total + (b * S + row) * H + h`, through
     /// the wave's private transpose scratch `epi`. The scratch reuses the Q staging of the neighbouring waves, whose last reads may still be in flight
     /// (the drain's last barrier is role-dependent): every wave meets one barrier first.

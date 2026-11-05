@@ -263,10 +263,6 @@ impl LdsPlan {
         }
         self.push(Shared { name: name.to_string(), base, slot_stride: per_wave, bytes: per_wave, slots: waves, layout: Layout::Linear, private: true })
     }
-    /// Declare that `a` reuses the storage of `b` (time multiplexing) without moving it.
-    pub fn overlay(&mut self, a: &Shared, b: &Shared) {
-        self.overlays.push((a.name.clone(), b.name.clone()));
-    }
     /// Total segment size: the end of the furthest declared extent or allocation.
     pub fn total(&self) -> i64 {
         self.bufs.iter().map(|s| s.declared().1).max().unwrap_or(0).max(self.cursor)
