@@ -7,7 +7,7 @@ AMDC="${AMDC:-$(ls target/debug/amdc 2>/dev/null || echo amdc)}"; R="${ROCM_RT:-
 [ -x build/gemm_ref_host ] || g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/gemm_ref_host.cpp -o build/gemm_ref_host -I"$R/include" -Itests/gpu -I. -L"$R/lib" -lamdhip64 -Wl,-rpath,"$R/lib" || exit 1
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-4}" REF_ITERS="${REF_ITERS:-100}" REF_WARMUP="${REF_WARMUP:-200}" REF_REPS="${REF_REPS:-3}" REF_ROWS=8 STAMPS=1 OURS_TILE_M=256 OURS_TILE_N=256
 printf "%-30s %-5s %9s %9s %10s %9s %9s %10s\n" kernel mode setup prologue loop epilogue total "cyc/tile"
-for K in ${KERNELS:-gemm_mxfp8_bs_v4 gemm_mxfp8_bs_v3}; do
+for K in ${KERNELS:-gemm_mxfp8_bs_v4}; do
   for M in ends tiles; do
     GEMM_STAMP=$M "$AMDC" emit $K --backend=own --out build/stamps/${K}_$M.s > /dev/null 2>&1 || { echo "$K $M: emit failed"; continue; }
     "$C" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/stamps/${K}_$M.co build/stamps/${K}_$M.s 2>&1 | head -2
