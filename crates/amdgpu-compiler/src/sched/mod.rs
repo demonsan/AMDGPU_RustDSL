@@ -18,6 +18,7 @@ pub mod m0;
 pub mod model;
 pub mod order;
 pub mod ldahead;
+pub mod mfmapair;
 pub mod phase;
 pub mod slotfill;
 pub mod sim;
@@ -58,11 +59,16 @@ pub struct Options {
     pub ldslack: i64,
     /// `ldsink=D` (sched/ldahead.rs): the opposite direction - sink every ds_read down until at most D MFMAs sit between it and its first consumer (0 = off)
     pub ldsink: usize,
+    /// `mfmapair=<budget>` (sched/mfmapair.rs): dependent same-accumulator MFMA pairs adjacent, non-MFMA work after the second MFMA; shadow budget factor (0 = off)
+    pub mfmapair: bool,
+    pub mfmapair_budget: f64,
+    /// `mpgap=N`: up to N non-MFMA instructions may stay between the two MFMAs of a pair
+    pub mfmapair_gap: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0 }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, mfmapair: false, mfmapair_budget: 1.0, mfmapair_gap: 0 }
     }
 }
 
@@ -111,6 +117,17 @@ impl Options {
                         if let Some(v) = t.strip_prefix("ldahead=") {
                             if let Ok(n) = v.parse() {
                                 o.ldahead = n;
+                            }
+                        }
+                        if let Some(v) = t.strip_prefix("mfmapair=") {
+                            if let Ok(b) = v.parse() {
+                                o.mfmapair = true;
+                                o.mfmapair_budget = b;
+                            }
+                        }
+                        if let Some(v) = t.strip_prefix("mpgap=") {
+                            if let Ok(n) = v.parse() {
+                                o.mfmapair_gap = n;
                             }
                         }
                         if let Some(v) = t.strip_prefix("ldsink=") {
@@ -228,6 +245,12 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         let n = ldahead::run(m, o);
         if o.stats {
             eprintln!("ldahead: {n} blocks changed");
+        }
+    }
+    if o.mfmapair {
+        let n = mfmapair::run(m, o)?;
+        if o.stats {
+            eprintln!("mfmapair: {n} pairs made adjacent");
         }
     }
     stats.waits_inserted = waits::insert_waits(m);
