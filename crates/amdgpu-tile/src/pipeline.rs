@@ -272,27 +272,25 @@ impl Pipeline {
         b.break_if(stop);
         if self.unroll2 && self.cadence == Cadence::TwoPhaseOffset {
             // two tiles per pass with STATIC ring slots (0 then 1; the counter is even at the top): every slot offset is a constant
-            let i0 = self.iter_tpo(b, role, body, Opnd::Var(it), Opnd::I32(0), false, true, true);
-            let _ = i0;
-            let one = b.c_i32(1);
-            b.set_var(idx, one);
+            self.iter_tpo(b, role, body, Opnd::Var(it), Opnd::I32(0), false, true, true);
+            // idx (0 at the top of every pass) toggles with `^ 1`: a periodic counter for the protocol model
+            let i1 = b.bind_i32(varx(idx) ^ 1);
+            b.set_var(idx, i1);
             let mid = b.bind_i32(varx(it) + 1);
             let stop1 = b.bind_cond(!ev(mid).lt(&nkv_m1));
             b.break_if(stop1);
             self.iter_tpo(b, role, body, Opnd::Val(mid), Opnd::I32(1), false, true, true);
-            let zero = b.c_i32(0);
-            b.set_var(idx, zero);
+            let i0 = b.bind_i32(varx(idx) ^ 1);
+            b.set_var(idx, i0);
             let it2 = b.bind_i32(varx(it) + 2);
             b.set_var(it, it2);
             let stop2 = b.bind_cond(!ev(it2).lt(&nkv_m1));
             b.break_if(stop2);
             b.end_loop();
-            // the peeled tile is the last one, nkv - 1 (the loop leaves at it >= nkv - 1 after either half)
-            let it_t = b.bind_i32(ev(self.nkv) - 1);
+            let it_t = b.bind_i32(varx(it) + varx(idx));
             let is_tail = b.bind_cond(ev(self.kv_len).lt((ev(it_t) << self.lg()) + self.tile_rows));
             let last_barrier = role != Role::B;
-            // the last tile's slot is its parity (tile k sits in slot k & 1): an affine function of the counters for the protocol model
-            let slot_t = b.bind_opnd(&(ev(it_t) & 1));
+            let slot_t = Opnd::Var(idx);
             b.begin_if(is_tail);
             self.iter_tpo(b, role, body, Opnd::Val(it_t), slot_t, true, false, last_barrier);
             b.else_();
