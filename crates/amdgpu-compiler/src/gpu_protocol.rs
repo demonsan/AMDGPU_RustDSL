@@ -183,10 +183,10 @@ fn if_span(f: &Function, begin: usize) -> (Option<usize>, usize) {
 fn is_global_access(st: &Stmt) -> Option<(bool, bool)> {
     match st {
         Stmt::StoreU16 { .. } | Stmt::StoreF32 { .. } | Stmt::StoreF32x2 { .. } | Stmt::StoreF32x4 { .. } => Some((true, false)),
-        Stmt::StoreF32Wt { .. } | Stmt::StoreF32x4Wt { .. } => Some((true, true)),
+        Stmt::StoreF32Wt { .. } => Some((true, true)),
         Stmt::Let { op, .. } => match op {
             Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } => Some((false, false)),
-            Op::LoadF32Coherent { .. } | Op::LoadB128Coherent { .. } => Some((false, true)),
+            Op::LoadF32Coherent { .. } => Some((false, true)),
             _ => None,
         },
         _ => None,

@@ -573,7 +573,6 @@ impl Lowerer {
                 | Some(Op::RcpF32(..))
                 | Some(Op::CvtF16ToF32(..))
                 | Some(Op::CvtF32ToF16(..))
-                | Some(Op::CvtPkFp8F32(..))
                 | Some(Op::CvtPkFp8x4F32(..))
                 | Some(Op::CvtPkBf16F32(..))
                 | Some(Op::CvtPknormU16(..))
@@ -1461,12 +1460,6 @@ impl Lowerer {
                     self.touch(&[Src::Reg(v)]);
                     self.push(MInst::new(MOp::GlobalStoreF32Sc1).srcreg(b).srcreg(v).imm(*byte_off as i64));
                 }
-                Stmt::StoreF32x4Wt { base, byte_off, value } => {
-                    let b = self.as_v2(*base)?;
-                    let v = self.as_v4(*value)?;
-                    self.touch(&[Src::Reg(v)]);
-                    self.push(MInst::new(MOp::GlobalStoreF32x4Sc1).srcreg(b).srcreg(v).imm(*byte_off as i64));
-                }
                 Stmt::FenceRelease { wb } => {
                     // everything issued so far must be complete (stores acknowledged) before the L2 write-back and before the releasing atomic
                     self.push(MInst::new(MOp::SWaitVm).imm(0));
@@ -1566,12 +1559,6 @@ impl Lowerer {
                     self.touch(&[Src::Reg(src)]);
                     self.copy_reg(dst, src)?;
                 }
-                Stmt::VarLoadB128 { var, base, byte_off } => {
-                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
-                    let rb = self.as_v2(*base)?;
-                    self.push(MInst::new(MOp::GlobalLoadB128).def(v).srcreg(rb).imm(*byte_off as i64));
-                    self.pending_vmem.push(self.mir.canon(v));
-                }
                 Stmt::VarScaleF32 { var, scalar } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let s = self.as_v1(*scalar)?;
@@ -1669,14 +1656,6 @@ impl Lowerer {
                     let ra = self.as_v8(*a)?;
                     let rb = self.as_v8(*b)?;
                     self.push(MInst::new(MOp::VMfma32x32x64Fp8).def(v).srcreg(ra).srcreg(rb).srcreg(v));
-                }
-                Stmt::VarMfmaScaleZ { var, a, b, scale_a, scale_b } => {
-                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
-                    let ra = self.as_v8(*a)?;
-                    let rb = self.as_v8(*b)?;
-                    let sa = self.as_v1(*scale_a)?;
-                    let sb = self.as_v1(*scale_b)?;
-                    self.push(MInst::new(MOp::VMfmaScale32x32x64Fp8Z).def(v).srcreg(ra).srcreg(rb).srcreg(sa).srcreg(sb));
                 }
                 Stmt::VarMfmaScaleC { var, a, b, c, scale_a, scale_b } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
@@ -2355,13 +2334,6 @@ impl Lowerer {
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
-            Op::LoadB128Coherent { base, byte_off } => {
-                let d = self.new_vreg(RClass::V4);
-                let rb = self.as_v2(*base)?;
-                self.push(MInst::new(MOp::GlobalLoadB128Sc1).def(d).srcreg(rb).imm(*byte_off as i64));
-                self.pending_vmem.push(self.mir.canon(d));
-                self.val.insert(dst, d);
-            }
             Op::AtomicAddU32 { base, byte_off, value } => {
                 let d = self.new_vreg(RClass::V1);
                 let rb = self.as_v2(*base)?;
@@ -2499,36 +2471,6 @@ impl Lowerer {
                 );
                 self.val.insert(dst, d);
             }
-            Op::MfmaFp8_16x16x32 { a, b, c } => {
-                let ra = self.as_v2(*a)?;
-                let rb = self.as_v2(*b)?;
-                let rc = self.as_v4(*c)?;
-                let d = self.new_vreg(RClass::V4);
-                self.copy_reg(d, rc)?;
-                self.push(
-                    MInst::new(MOp::VMfma16x16x32Fp8)
-                        .def(d)
-                        .srcreg(ra)
-                        .srcreg(rb)
-                        .srcreg(d),
-                );
-                self.val.insert(dst, d);
-            }
-            Op::MfmaFp8_32x32x16 { a, b, c } => {
-                let ra = self.as_v2(*a)?;
-                let rb = self.as_v2(*b)?;
-                let rc = self.as_v16(*c)?;
-                let d = self.new_vreg(RClass::V16);
-                self.copy_reg(d, rc)?;
-                self.push(
-                    MInst::new(MOp::VMfma32x32x16Fp8)
-                        .def(d)
-                        .srcreg(ra)
-                        .srcreg(rb)
-                        .srcreg(d),
-                );
-                self.val.insert(dst, d);
-            }
             Op::CvtPknormU16(a, b) => {
                 let ra = self.as_v1(*a)?;
                 let rb = self.as_v1(*b)?;
@@ -2540,88 +2482,6 @@ impl Lowerer {
                         .srcreg(rb),
                 );
                 self.val.insert(dst, d);
-            }
-            Op::CvtPkFp8F32(a, b) => {
-                let ra = self.as_v1(*a)?;
-                let rb = self.as_v1(*b)?;
-                let d = self.new_vreg(RClass::V1);
-                // The instruction only writes the low 16 bits, so start from 0.
-                let z = self.const_vreg(0);
-                self.push(MInst::new(MOp::VMovB32).def(d).srcreg(z));
-                self.push(
-                    MInst::new(MOp::VCvtPkFp8F32)
-                        .def(d)
-                        .srcreg(ra)
-                        .srcreg(rb),
-                );
-                self.val.insert(dst, d);
-            }
-            Op::CvtScalef32PkFp8Bf16 { old, src, scale, high } => {
-                let ro = self.as_v1(*old)?;
-                let rs = self.as_v1(*src)?;
-                let rsc = self.as_v1(*scale)?;
-                // The instruction writes the 16 bits selected by OPSEL[3]. The
-                // low-half form is verified; the high-half encoding is still
-                // being pinned down, so build it explicitly: pack into the low
-                // half, shift it up, then OR in the preserved low half of old.
-                let packed = self.new_vreg(RClass::V1);
-                self.push(
-                    MInst::new(MOp::VCvtPkFp8Lo)
-                        .def(packed)
-                        .srcreg(rs)
-                        .srcreg(rsc),
-                );
-                let d = self.new_vreg(RClass::V1);
-                if *high {
-                    let c16 = self.const_vreg(16);
-                    let shifted = self.new_vreg(RClass::V1);
-                    self.push(
-                        MInst::new(MOp::VLshlB32)
-                            .def(shifted)
-                            .srcreg(c16)
-                            .srcreg(packed),
-                    );
-                    let low_kept = self.new_vreg(RClass::V1);
-                    let mask = self.const_vreg(0xFFFF);
-                    self.push(
-                        MInst::new(MOp::VAndB32)
-                            .def(low_kept)
-                            .srcreg(ro)
-                            .srcreg(mask),
-                    );
-                    self.push(
-                        MInst::new(MOp::VOrB32)
-                            .def(d)
-                            .srcreg(shifted)
-                            .srcreg(low_kept),
-                    );
-                } else {
-                    // The low-half write preserves the upper 16 bits of the
-                    // destination, so seed it with the previous value.
-                    self.push(MInst::new(MOp::VMovB32).def(d).srcreg(ro));
-                    self.push(
-                        MInst::new(MOp::VCvtPkFp8Lo)
-                            .def(d)
-                            .srcreg(rs)
-                            .srcreg(rsc),
-                    );
-                }
-                self.val.insert(dst, d);
-            }
-            Op::Frag16Build(lanes) => {
-                let v = self.new_vreg(RClass::V16);
-                for (i, o) in lanes.iter().enumerate() {
-                    let a = self.alias_vreg(v, i as u8, RClass::V1);
-                    let retargeted = match o {
-                        Opnd::Val(ov) => self.retarget_producer(*ov, a),
-                        _ => false,
-                    };
-                    if !retargeted {
-                        let r = self.as_v1(*o)?;
-                        self.push(MInst::new(MOp::VMovB32).def(a).srcreg(r));
-                    }
-                }
-                self.val.insert(dst, v);
             }
             Op::CatFrag8(lo, hi) => {
                 let lo_r = self.as_v4(*lo)?;
@@ -2693,7 +2553,7 @@ impl Lowerer {
                 let reusable = matches!(
                     c,
                     Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1)
-                        && matches!(self.defs.get(cv), Some(Op::MfmaScaleFp8_32x32x64 { .. }) | Some(Op::MfmaFp8_32x32x64 { .. }) | Some(Op::Frag16Build(_)))
+                        && matches!(self.defs.get(cv), Some(Op::MfmaScaleFp8_32x32x64 { .. }) | Some(Op::MfmaFp8_32x32x64 { .. }))
                 );
                 let d = if reusable {
                     rc
@@ -2740,7 +2600,7 @@ impl Lowerer {
                             if self.use_counts.get(cv).copied() == Some(1)
                                 && matches!(
                                     self.defs.get(cv),
-                                    Some(Op::MfmaScaleFp8_32x32x64 { .. }) | Some(Op::Frag16Build(_))
+                                    Some(Op::MfmaScaleFp8_32x32x64 { .. })
                                 )
                     );
                     if reusable {
@@ -2825,15 +2685,6 @@ impl Lowerer {
                     other => self.as_v16(*other)?,
                 };
                 let d = self.alias_vreg(f, *index, RClass::V1);
-                self.val.insert(dst, d);
-            }
-            Op::Frag16Pair { frag, index } => {
-                let f = match frag {
-                    Opnd::Val(v) => *self.val.get(v).ok_or_else(|| format!("value v{v} not lowered"))?,
-                    other => self.as_v16(*other)?,
-                };
-                self.touch(&[Src::Reg(f)]);
-                let d = self.sub_alias(f, *index, RClass::V2);
                 self.val.insert(dst, d);
             }
             Op::Frag2Dup(a) => {
@@ -3413,7 +3264,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                 }
                 // any other statement that writes a variable in place makes it non-scalar
                 Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
-                | Stmt::VarScaleLane { var, .. } | Stmt::VarLoadB128 { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScale16 { var, .. } | Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8 { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarAsm { var, .. } => {
+                | Stmt::VarScaleLane { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScale16 { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8 { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarAsm { var, .. } => {
                     if uvars.remove(var) {
                         changed = true;
                     }

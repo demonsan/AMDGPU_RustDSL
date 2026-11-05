@@ -358,7 +358,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
             for idx in 0..4u8 { cx.trace.borrow_mut().contrib.entry((cx.tid, var.0, idx)).or_default().push(kb); }
             tag_acc_var(cx, *var);
         }
-        Stmt::VarMfmaScale { var, a, b, .. } | Stmt::VarMfmaScaleZ { var, a, b, .. } => {
+        Stmt::VarMfmaScale { var, a, b, .. } => {
             // 32x32 atoms are not used by v3/v4; keep the tag handling generic.
             let kb = cx.cur_tile.as_ref().map(|x| x.1).unwrap_or(-1);
             for t in frag_tags(cx.opnd(*a)) { if let Tag::A(m, k) = t { cx.trace.borrow_mut().a_tags.entry(kb).or_default().insert((m, k)); } }

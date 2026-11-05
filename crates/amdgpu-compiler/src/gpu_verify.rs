@@ -863,7 +863,7 @@ impl<'a> An<'a> {
         Some(match op {
             Op::LoadU16 { .. } => 2,
             Op::LoadF32 { .. } | Op::LoadF32Coherent { .. } => 4,
-            Op::LoadGlobalB128 { .. } | Op::LoadB128Coherent { .. } => 16,
+            Op::LoadGlobalB128 { .. } => 16,
             _ => return None,
         })
     }
@@ -871,7 +871,7 @@ impl<'a> An<'a> {
     fn check_op(&mut self, op: &Op) {
         if let Some(sz) = Self::global_load_size(op) {
             let (base, off) = match op {
-                Op::LoadU16 { base, byte_off } | Op::LoadF32 { base, byte_off } | Op::LoadGlobalB128 { base, byte_off } | Op::LoadF32Coherent { base, byte_off } | Op::LoadB128Coherent { base, byte_off } => (base, *byte_off),
+                Op::LoadU16 { base, byte_off } | Op::LoadF32 { base, byte_off } | Op::LoadGlobalB128 { base, byte_off } | Op::LoadF32Coherent { base, byte_off } => (base, *byte_off),
                 _ => return,
             };
             let b = self.av_of(base);
@@ -1260,13 +1260,9 @@ impl<'a> An<'a> {
                 let b = self.av_of(base);
                 self.check_global("store_f32x2", &b, *byte_off as i128, 8, true)
             }
-            Stmt::StoreF32x4 { base, byte_off, .. } | Stmt::StoreF32x4Wt { base, byte_off, .. } => {
+            Stmt::StoreF32x4 { base, byte_off, .. } => {
                 let b = self.av_of(base);
                 self.check_global("store_f32x4", &b, *byte_off as i128, 16, true)
-            }
-            Stmt::VarLoadB128 { base, byte_off, .. } => {
-                let b = self.av_of(base);
-                self.check_global("var load_b128", &b, *byte_off as i128, 16, false)
             }
             Stmt::BufferStore { rsrc, voff, soff, imm, dwords, .. } => {
                 let r = self.av_of(rsrc);

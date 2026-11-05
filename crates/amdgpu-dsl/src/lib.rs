@@ -308,7 +308,6 @@ impl Op {
             }
             Op::ExpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) | Op::RcpF32(..) | Op::CvtF16ToF32(..) | Op::LoadF32 { .. } | Op::LoadF32Coherent { .. } => DType::F32,
             Op::AtomicAddU32 { .. } => DType::U32,
-            Op::LoadB128Coherent { .. } => DType::Frag4,
             Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } => DType::Rsrc,
             Op::BufferLoadB128x2 { .. } => DType::Frag8,
             Op::BufferLoad { dwords, .. } => match dwords {
@@ -328,18 +327,15 @@ impl Op {
             Op::Permlane32Swap { .. } => DType::Frag2,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::MfmaF16Wide { .. } => DType::Frag16,
-            Op::MfmaFp8_16x16x32 { .. } => DType::Frag4,
-            Op::MfmaFp8_32x32x16 { .. } => DType::Frag16,
             Op::Frag8(..) => DType::Frag8,
             Op::CatFrag8(..) => DType::Frag8,
-            Op::Frag16Build(..) => DType::Frag16,
-            Op::CvtPknormU16(..) | Op::CvtScalef32PkFp8Bf16 { .. } | Op::CvtPkFp8F32(..) | Op::CvtPkBf16F32(..) => DType::U32,
+            Op::CvtPknormU16(..) | Op::CvtPkBf16F32(..) => DType::U32,
             Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. } => DType::Frag16,
             Op::SmfmacFp8_16x16x128 { .. } => DType::Frag4,
             Op::Asm { block, .. } => asm_out_ty(block),
             Op::FragZero { ty } => *ty,
             Op::Frag16Lane { .. } => DType::U32,
-            Op::Frag16Pair { .. } | Op::Frag2Dup(..) | Op::PkAddF32(..) | Op::PkMulF32(..) => DType::Frag2,
+            Op::Frag2Dup(..) | Op::PkAddF32(..) | Op::PkMulF32(..) => DType::Frag2,
             Op::CvtPkFp8x4F32(..) => DType::U32,
             Op::PartnerMaxF32(..) => DType::F32,
             Op::CvtPknormP8x4(..) => DType::U32,
@@ -392,20 +388,16 @@ impl Op {
             Op::Frag4Lane { frag, .. } => vec![*frag],
             Op::MfmaF16 { a, b, c } => vec![*a, *b, *c],
             Op::MfmaF16Wide { a, b, c } => vec![*a, *b, *c],
-            Op::MfmaFp8_16x16x32 { a, b, c } => vec![*a, *b, *c],
-            Op::MfmaFp8_32x32x16 { a, b, c } => vec![*a, *b, *c],
             Op::Frag8(a, b, c, d, e, f, g, h) => vec![*a, *b, *c, *d, *e, *f, *g, *h],
             Op::CatFrag8(a, b) => vec![*a, *b],
-            Op::Frag16Build(v) => v.clone(),
-            Op::CvtPknormU16(a, b) | Op::CvtPkFp8F32(a, b) | Op::CvtPkBf16F32(a, b) => vec![*a, *b],
-            Op::CvtScalef32PkFp8Bf16 { old, src, scale, .. } => vec![*old, *src, *scale],
+            Op::CvtPknormU16(a, b) | Op::CvtPkBf16F32(a, b) => vec![*a, *b],
             Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => {
                 vec![*a, *b, *c, *scale_a, *scale_b]
             }
             Op::MfmaFp8_32x32x64 { a, b, c } => vec![*a, *b, *c],
             Op::SmfmacFp8_16x16x128 { a, b, idx, c } => vec![*a, *b, *idx, *c],
             Op::Asm { inputs, .. } => inputs.clone(),
-            Op::Frag16Lane { frag, .. } | Op::Frag16Pair { frag, .. } => vec![*frag],
+            Op::Frag16Lane { frag, .. } => vec![*frag],
             Op::Frag2Dup(a) | Op::PartnerMaxF32(a) => vec![*a],
             Op::PkAddF32(a, b) | Op::PkMulF32(a, b) => vec![*a, *b],
             Op::CvtPkFp8x4F32(a, b, c, d) => vec![*a, *b, *c, *d],
@@ -419,7 +411,7 @@ impl Op {
             Op::LoadLdsB64 { addr } => vec![*addr],
             Op::LoadLdsTrB8 { addr } => vec![*addr],
             Op::LoadLdsTr4B8 { addrs } => addrs.to_vec(),
-            Op::LoadGlobalB128 { base, .. } | Op::LoadF32Coherent { base, .. } | Op::LoadB128Coherent { base, .. } => vec![*base],
+            Op::LoadGlobalB128 { base, .. } | Op::LoadF32Coherent { base, .. } => vec![*base],
         Op::AtomicAddU32 { base, value, .. } => vec![*base, *value],
             Op::LoadLdsB128x2 { lo, hi } => vec![*lo, *hi],
             Op::BufferRsrc { base, .. } => vec![*base],
@@ -1068,9 +1060,6 @@ impl Function {
                 Stmt::StoreF32Wt { base, byte_off, value } => {
                     let _ = writeln!(s, "{pad}store.wt f32 [{base:?}+{byte_off}] <- {value:?}");
                 }
-                Stmt::StoreF32x4Wt { base, byte_off, value } => {
-                    let _ = writeln!(s, "{pad}store.wt f32x4 [{base:?}+{byte_off}] <- {value:?}");
-                }
                 Stmt::FenceRelease { wb } => {
                     let _ = writeln!(s, "{pad}fence.release(wb={wb})");
                 }
@@ -1142,12 +1131,6 @@ impl Function {
                 }
                 Stmt::VarScalePk { var, pair } => {
                     let _ = writeln!(s, "{pad}var{} *=pk {pair:?}", var.0);
-                }
-                Stmt::VarLoadB128 { var, base, byte_off } => {
-                    let _ = writeln!(s, "{pad}var{} <- load128 [{base:?}+{byte_off}]", var.0);
-                }
-                Stmt::VarMfmaScaleZ { var, a, b, scale_a, scale_b } => {
-                    let _ = writeln!(s, "{pad}var{} = mfma_scale({a:?}, {b:?}; {scale_a:?}, {scale_b:?})", var.0);
                 }
                 Stmt::VarMfmaFp8 { var, a, b } => {
                     let _ = writeln!(s, "{pad}var{} += mfma_fp8({a:?}, {b:?})", var.0);
@@ -2321,7 +2304,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                             errs.push(here(e));
                         }
                     }
-                    Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } | Op::LoadF32Coherent { base, .. } | Op::LoadB128Coherent { base, .. } => {
+                    Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } | Op::LoadF32Coherent { base, .. } => {
                         if let Err(e) = expect_ptr(f, *base, "load") {
                             errs.push(here(e));
                         }
@@ -2445,29 +2428,6 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
-                    Op::CvtPkFp8F32(a, b) => {
-                        for o in [a, b] {
-                            if let Err(e) = expect_float(f, *o, "cvt_pk_fp8") {
-                                errs.push(here(e));
-                            }
-                        }
-                    }
-                    Op::CvtScalef32PkFp8Bf16 { old, src, scale, .. } => {
-                        if let Err(e) = expect_int(f, *old, "pack fp8 destination") {
-                            errs.push(here(e));
-                        }
-                        if let Err(e) = expect_int(f, *src, "pack fp8 source") {
-                            errs.push(here(e));
-                        }
-                        if let Err(e) = expect_float(f, *scale, "pack fp8 scale") {
-                            errs.push(here(e));
-                        }
-                    }
-                    Op::Frag16Build(v) => {
-                        if v.len() != 16 {
-                            errs.push(here("frag16 needs sixteen lanes".to_string()));
-                        }
-                    }
                     Op::CatFrag8(a, b) => {
                         for o in [a, b] {
                             match opnd_ty(f, *o) {
@@ -2518,40 +2478,6 @@ pub fn verify(f: &Function) -> Vec<String> {
                             }
                         }
                     }
-                    Op::MfmaFp8_16x16x32 { a, b, c } => {
-                        for (o, want, what) in [
-                            (*a, DType::Frag2, "a"),
-                            (*b, DType::Frag2, "b"),
-                            (*c, DType::Frag4, "c"),
-                        ] {
-                            if let Ok(t) = opnd_ty(f, o) {
-                                if t != want {
-                                    errs.push(here(format!(
-                                        "fp8 mfma: operand {what} is {}, expected {}",
-                                        t.name(),
-                                        want.name()
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                    Op::MfmaFp8_32x32x16 { a, b, c } => {
-                        for (o, want, what) in [
-                            (*a, DType::Frag2, "a"),
-                            (*b, DType::Frag2, "b"),
-                            (*c, DType::Frag16, "c"),
-                        ] {
-                            if let Ok(t) = opnd_ty(f, o) {
-                                if t != want {
-                                    errs.push(here(format!(
-                                        "wide fp8 mfma: operand {what} is {}, expected {}",
-                                        t.name(),
-                                        want.name()
-                                    )));
-                                }
-                            }
-                        }
-                    }
                     Op::LoadLdsTrB8 { addr } => {
                         if let Err(e) = expect_int(f, *addr, "lds tr_b8 load address") {
                             errs.push(here(e));
@@ -2595,7 +2521,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::StoreF32x4 { base, .. } | Stmt::StoreF32x4Wt { base, .. } | Stmt::StoreF32x2 { base, .. } => {
+            Stmt::StoreF32x4 { base, .. } | Stmt::StoreF32x2 { base, .. } => {
                 if let Err(e) = expect_ptr(f, *base, "store") {
                     errs.push(here(e));
                 }
@@ -2735,20 +2661,6 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::VarLoadB128 { var, base, .. } => {
-                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
-                if !ok {
-                    errs.push(here(format!("var{var} loaded outside its loop")));
-                }
-                if f.var_ty(*var) != Some(DType::Frag4) {
-                    errs.push(here(format!("var{var} must be a frag4 to take a 16-byte load")));
-                }
-                if let Opnd::Val(v) = base {
-                    if !visible(&scopes, *v) {
-                        errs.push(here(format!("operand v{v} is not visible here")));
-                    }
-                }
-            }
             Stmt::VarScaleF32 { var, scalar } => {
                 let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
@@ -2802,7 +2714,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
-            Stmt::VarMfmaScaleZ { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } => {
+            Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } => {
                 if f.var_ty(*var) != Some(DType::Frag16) {
                     errs.push(here(format!("var{var} must be a frag16 accumulator")));
                 }
@@ -3038,7 +2950,7 @@ pub use expr::{Cond, Ptr, F32, I32};
 pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
     match st {
         Stmt::Let { op, .. } => op.operands(),
-        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32Wt { base, value, .. } | Stmt::StoreF32x4Wt { base, value, .. } | Stmt::StoreF32x2 { base, value, .. } => vec![*base, *value],
+        Stmt::StoreU16 { base, value, .. } | Stmt::StoreF32 { base, value, .. } | Stmt::StoreF32x4 { base, value, .. } | Stmt::StoreF32Wt { base, value, .. } | Stmt::StoreF32x2 { base, value, .. } => vec![*base, *value],
         Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => vec![],
         Stmt::StoreLdsB32 { addr, value } | Stmt::StoreLdsB128 { addr, value } | Stmt::StoreLdsB64 { addr, value } => vec![*addr, *value],
         Stmt::LoadGlobalLds { base, lds_addr, .. } => vec![*base, *lds_addr],
@@ -3061,8 +2973,7 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::VarSetLane { var, value, .. } => vec![Opnd::Var(*var), *value],
         Stmt::VarScalePk { pair, .. } | Stmt::VarAddPk { pair, .. } => vec![*pair],
         Stmt::VarMfmaF16Z { a, b, .. } => vec![*a, *b],
-        Stmt::VarLoadB128 { base, .. } => vec![*base],
-        Stmt::VarMfmaScale { a, b, scale_a, scale_b, .. } | Stmt::VarMfmaScaleZ { a, b, scale_a, scale_b, .. } => {
+        Stmt::VarMfmaScale { a, b, scale_a, scale_b, .. } => {
             vec![*a, *b, *scale_a, *scale_b]
         }
         Stmt::VarMfmaScaleC { a, b, c, scale_a, scale_b, .. } => vec![*a, *b, *c, *scale_a, *scale_b],
@@ -3157,10 +3068,8 @@ pub fn stmt_var_writes(st: &Stmt) -> Vec<VarId> {
         | Stmt::VarMfmaF16Z { var, .. }
         | Stmt::VarScaleLane { var, .. }
         | Stmt::VarSetLane { var, .. }
-        | Stmt::VarLoadB128 { var, .. }
         | Stmt::VarMfmaScale { var, .. }
         | Stmt::VarMfmaScale16 { var, .. }
-        | Stmt::VarMfmaScaleZ { var, .. }
         | Stmt::VarMfmaScaleC { var, .. }
         | Stmt::VarMfmaFp8 { var, .. }
         | Stmt::VarMfmaFp8Z { var, .. }
