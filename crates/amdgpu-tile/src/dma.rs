@@ -128,6 +128,30 @@ impl DmaPart {
             .collect();
         BufForm { rsrc, base: bo, voffs }
     }
+    /// Number of VMEM instructions of one stage.
+    pub fn issues(&self) -> usize {
+        self.row_c.len()
+    }
+    /// Instructions `qs` of the buffer-form stage (a stage split over several issue points; every part recomputes soffset / M0).
+    pub fn issue_buffer_part(&self, b: &mut FnBuilder, bf: &BufForm, key0: &I32, slot: &SlotRef, qs: std::ops::Range<usize>) {
+        let n = self.row_c.len() as i64;
+        let so = {
+            let v = b.bind_i32(key0.clone() * &self.src.stride + ev_(bf.base));
+            b.read_first_lane(v)
+        };
+        let off = slot.off_v(b);
+        let m0 = b.bind_i32(&self.lds_wave + off - (self.step * (n - 1)) as i32);
+        let m0 = b.read_first_lane(m0);
+        slot.write(b, |b| {
+            for q in qs {
+                if self.atom.bytes == 4 {
+                    b.buffer_load_lds_b32(bf.rsrc, bf.voffs[q], so, m0, (self.step * q as i64) as u32);
+                } else {
+                    b.buffer_load_lds_b128(bf.rsrc, bf.voffs[q], so, m0, (self.step * q as i64) as u32);
+                }
+            }
+        });
+    }
     /// The DMA of the tile at `key0` into `slot` through the buffer form.
     pub fn issue_buffer(&self, b: &mut FnBuilder, bf: &BufForm, key0: &I32, slot: &SlotRef) {
         assert_eq!(slot.sh.name, self.sh.name, "DmaPart: slot of another buffer");

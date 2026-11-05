@@ -206,6 +206,8 @@ pub struct AttnBody3<'a> {
     bias_next: Option<Opnd>,
     /// one f16 bias MFMA per tile (the vendor's single helper): its result is the C input of the four S tiles' first QK MFMA (`_vs128`)
     pub biasonce: bool,
+    /// EXPERIMENT: the stage handed over by `defer_stage`, issued spread over the VALU phase
+    pending: Option<(Role, I32, SlotIdx)>,
     bias_tile: std::cell::Cell<Option<Opnd>>,
 }
 
@@ -214,7 +216,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None) }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, pending: None, bias_tile: std::cell::Cell::new(None) }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -298,6 +300,9 @@ impl PipeBody for AttnBody3<'_> {
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, slot: &SlotIdx) {
         self.ring.stage_complete(b, self.kd_pending.take(), slot);
     }
+    fn defer_stage(&mut self, _b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
+        self.pending = Some((role, key0.clone(), slot.clone()));
+    }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
         self.ring.store_constants(b, self.wid, &self.blk.lane, &self.blk.q);
     }
@@ -325,6 +330,36 @@ impl PipeBody for AttnBody3<'_> {
         let (s, o) = (self.s.expect("S"), self.o.expect("O"));
         let mask = t.masked.then(|| KeyMask::new(b, t, self.blk.g4, self.blk.kv_len));
         if self.lazy_bias {
+            if let Some((role, key0, slot)) = self.pending.take() {
+                // EXPERIMENT: one copy instruction per quarter of the softmax (K scales + K run 0 / V run 0 first)
+                let r = self.ring;
+                let issue = |b: &mut FnBuilder, q: usize| match role {
+                    Role::A => {
+                        if q == 0 {
+                            if let (KdCopy3::Dma(kd), Some(kb)) = (&r.kdc, &r.kd_buf) {
+                                kd.issue_buffer(b, kb, &key0, &r.kd.at(&slot));
+                            }
+                        }
+                        let (kb, _) = r.buf.as_ref().expect("buffer form");
+                        r.kdma.issue_buffer_part(b, kb, &key0, &r.ks.at(&slot), q..q + 1);
+                    }
+                    _ => {
+                        let (_, vb) = r.buf.as_ref().expect("buffer form");
+                        r.vdma.issue_buffer_part(b, vb, &key0, &r.vs.at(&slot), q..q + 1);
+                    }
+                };
+                issue(b, 0);
+                self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref()));
+                let mut p = Vec::new();
+                for i in 0..4usize {
+                    p.extend(self.sm.convert(b, &s, mask.as_ref(), i, i + 1));
+                    if i < 3 {
+                        issue(b, i + 1);
+                    }
+                }
+                self.p = p;
+                return;
+            }
             // no seed needed: the initial reference (bias words 0x4800: b = 64) puts the first tile's max far above the threshold, so tile 0
             // always rebases
             self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref()));
@@ -381,7 +416,12 @@ impl PipeBody for AttnBody3<'_> {
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
+    vs128_exp("fmha_fwd_hd128_mxfp8_v3_vs128", 0)
+}
+
+/// EXPERIMENT builds (bit 0: copies spread over the VALU phase)
+pub fn vs128_exp(name: &str, x: u32) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
@@ -394,6 +434,7 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
     pipe.key_unclamped = true;
+    pipe.stage_spread = x & 1 != 0;
     let pipe = pipe;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
