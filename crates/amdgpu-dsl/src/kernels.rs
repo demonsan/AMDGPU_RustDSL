@@ -22923,7 +22923,6 @@ pub fn probe_stamp() -> Function {
     b.finish()
 }
 
-<<<<<<< HEAD
 /// Generic one-hot probe of `v_smfmac_f32_16x16x128_fp8_fp8` (docs/isa-probes-smfmac-tr.md): probe `bx` (one 64-lane wave per block) loads lane `l`'s A (4 dwords at
 /// `a_in[(64 bx + l) * 16]`), B (8 dwords at `b_in[(64 bx + l) * 32]`) and SRC2 index dword (`i_in[(64 bx + l) * 4]`) straight from global memory, issues ONE
 /// smfmac with a zero accumulator and stores D (4 dwords per lane) to `d_out[(64 bx + l) * 16]`. The host chooses every register bit.
@@ -23015,7 +23014,10 @@ pub fn probe_lds_tr_b8_gen() -> Function {
         let lane = b.frag16_lane(r, i);
         let v = b.bitcast_f32(lane);
         b.store_f32(dp, 4 * i as u32, v);
-=======
+    }
+    b.finish()
+}
+
 /// Scale byte select of `v_mfma_scale_f32_32x32x64_f8f6f4` (op_sel / op_sel_hi, see tools/mfma_opsel_probe.sh): A = B = ones (fp8 1.0), scale words with four
 /// different E8M0 bytes, one in-place MFMA per (byte_a, byte_b): out[64 k + tid] = 64 * 2^(ea - 127) * 2^(eb - 127) for the selected bytes.
 pub fn probe_mfma_scale_opsel() -> Function {
@@ -23044,7 +23046,6 @@ pub fn probe_mfma_scale_opsel() -> Function {
         let fr = b.bitcast_f32(r);
         let po = b.ptr_add(outp, off);
         b.store_f32(po, 256 * k as u32, fr);
->>>>>>> origin/fmha-cg2
     }
     b.finish()
 }
