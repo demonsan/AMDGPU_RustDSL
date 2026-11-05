@@ -493,6 +493,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_dma_kread" => Some(amdgpu_dsl::kernels::probe_dma_kread()),
         "probe_dma_map" => Some(amdgpu_dsl::kernels::probe_dma_map()),
         "probe_smfmac_ones" => Some(amdgpu_dsl::kernels::probe_smfmac_ones()),
+        "probe_smfmac_gen" => Some(amdgpu_dsl::kernels::probe_smfmac_gen()),
+        "probe_lds_tr_b8_gen" => Some(amdgpu_dsl::kernels::probe_lds_tr_b8_gen()),
         "sched_valu_mul" => Some(amdgpu_dsl::kernels::sched_valu_mul()),
         "sched_valu_max3" => Some(amdgpu_dsl::kernels::sched_valu_max3()),
         "sched_valu_exp" => Some(amdgpu_dsl::kernels::sched_valu_exp()),

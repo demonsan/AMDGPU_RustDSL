@@ -225,6 +225,31 @@ impl MmaAtom {
             provenance: Provenance::Shipped("fmha _vs128 ones x bias reference MFMA"),
         }
     }
+    /// `v_smfmac_f32_16x16x128_fp8_fp8` (sparse A, 2:4 compressed; recovered with one-hot hardware probes, `data/smfmac_16x16x128_fp8.map`, docs/isa-probes-smfmac-tr.md).
+    /// Operand tiles in the usual element convention (A `m + 16 c`, B `n + 16 k`, C `m + 16 n`):
+    /// * A is the COMPRESSED tile, 16 rows x 64 stored values: lane l (row m = l % 16, lane group g = l / 16) holds stored values s = 0..15 (register s / 4, byte s % 4) =
+    ///   compressed column c = 16 g + s. Which logical K each stored value multiplies is chosen by the lane's SRC2 index word (see [`smfmac`]).
+    /// * B is the dense 128 x 16 tile: lane l (column n = l % 16, lane group h = l / 16) holds k = 32 h + 4 r + y (register r = 0..7, byte y).
+    /// * C: lane l dword r = (row 4 (l / 16) + r, column l % 16).
+    pub fn smfmac_16x16x128_fp8() -> MmaAtom {
+        MmaAtom {
+            name: "Smfmac16x16x128Fp8",
+            mnemonic: "v_smfmac_f32_16x16x128_fp8_fp8",
+            m: 16,
+            n: 16,
+            k: 128,
+            ab_bits: 8,
+            a_tv: make_layout(tup![tup![16, 4], 16], tup![tup![1, 256], 16]),
+            b_tv: make_layout(tup![tup![16, 4], 32], tup![tup![1, 512], 16]),
+            c_tv: make_layout(tup![tup![16, 4], 4], tup![tup![16, 4], 1]),
+            a_dwords: 4,
+            b_dwords: 8,
+            c_dwords: 4,
+            scaled: false,
+            passes: 8,
+            provenance: Provenance::Probe("tests/gpu/isa_probe_host.cpp (probe_smfmac_gen), crates/amdgpu-isa/data/smfmac_16x16x128_fp8.map"),
+        }
+    }
     /// The atom with its A and B operands exchanged (hardware srcA = the B fragment): computes `C^T`, so the C layout is transposed (row and column swap).
     pub fn swap_ab(&self) -> MmaAtom {
         let mut s = self.clone();
@@ -232,5 +257,50 @@ impl MmaAtom {
         std::mem::swap(&mut s.m, &mut s.n);
         std::mem::swap(&mut s.a_dwords, &mut s.b_dwords);
         s
+    }
+}
+
+/// Index semantics of the sparse matrix instruction `v_smfmac_f32_16x16x128_fp8_fp8`, measured (docs/isa-probes-smfmac-tr.md).
+pub mod smfmac {
+    /// Number of stored A values per lane (register s / 4, byte s % 4).
+    pub const STORED: i64 = 16;
+    /// The 2-bit index field of stored value `s` of a lane: bits `2 s ..= 2 s + 1` of THAT lane's SRC2 dword. The two values of a pair (2 q, 2 q + 1) are the
+    /// two kept entries of one group of 4 (their fields are the low and the high half of nibble q); the hardware accepts any two fields.
+    pub const fn field(idx: u32, s: i64) -> i64 {
+        ((idx >> (2 * s)) & 3) as i64
+    }
+    /// The B operand dword that pair `q` (stored values 2 q, 2 q + 1) of an A lane in lane group `g` contracts with: (B lane group, B register); the group's 4
+    /// candidate k's are the four bytes of that dword and the index field picks the byte.
+    pub const fn b_dword(g: i64, q: i64) -> (i64, i64) {
+        (2 * (g & 1) + q / 4, 4 * (g >> 1) + q % 4)
+    }
+    /// The logical K (in the B tile's `32 h + 4 r + y` numbering) that stored value `s` of A lane `l` multiplies under index word `idx`.
+    pub const fn k_of(l: i64, s: i64, idx: u32) -> i64 {
+        let (h, r) = b_dword(l / 16, s / 2);
+        32 * h + 4 * r + field(idx, s)
+    }
+    /// Index nibble of a pair kept at positions (p0 < p1) of its group of 4: p0 in the low 2 bits, p1 in the high 2 bits.
+    pub const fn nibble(p0: u32, p1: u32) -> u32 {
+        p0 | (p1 << 2)
+    }
+    /// An index word with the same pair of kept positions in all 8 nibbles (`0x44444444` = positions (0, 1), `0xeeeeeeee` = (2, 3): together they cover all 4 bytes of
+    /// every B dword, i.e. two accumulated smfmacs with these words contract all 128 k).
+    pub const fn uniform(p0: u32, p1: u32) -> u32 {
+        nibble(p0, p1) * 0x1111_1111
+    }
+}
+
+/// `ds_read_b64_tr_b8` (one instruction; the shipped atom [`DS_READ_TR_B8X4`] issues four), measured (data/lds_tr_b8.map, docs/isa-probes-smfmac-tr.md).
+pub mod tr_b8 {
+    use super::*;
+    /// Destination lane `d`, byte `j` (register j / 4, byte j % 4) receives byte `d % 8` of the 8-byte word read by lane `16 (d / 16) + 2 j + (d % 16) / 8`
+    /// (independent of the addresses: inside each 16-lane group the eight words of the even lanes are transposed 8 x 8 bytes into dest lanes 0..7 and the eight
+    /// words of the odd lanes into dest lanes 8..15). Returns (source lane, byte offset inside its word).
+    pub const fn source(d: i64, j: i64) -> (i64, i64) {
+        (16 * (d / 16) + 2 * j + (d % 16) / 8, d % 8)
+    }
+    /// The same map as a TV layout: (dest lane, byte j) -> element `8 s' + h` of the source tile "64 lanes x 8 bytes" (s' = source lane, h = byte offset).
+    pub fn dest_tv() -> Layout {
+        make_layout(tup![tup![8, 2, 4], 8], tup![tup![1, 8, 128], 16])
     }
 }
