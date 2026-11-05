@@ -175,61 +175,6 @@ impl FmhaBlock {
 // The attention body: per 128-key tile, QK (S = ones x bias + K Q^T), online softmax, PV + row sums
 // ------------------------------------------------------------------------------------------------------------------------------------------------------
 
-/// K-scale staging: straight into LDS by DMA (`_vs128` / `_kvsplit`: one `global_load_lds_dword` per wave) or through a VGPR and a `ds_write` after the
-/// DMA wait (`_t128`).
-pub enum KdCopy {
-    Dma(DwordRowsCopy),
-    Vgpr(DwordRowsVgpr),
-}
-
-/// LDS buffers + copies + readers of the K/V/K-scale ring: `_vs128` / `_kvsplit` (= `fmha_vs_tiles`: 2 slots, K by group A, V by group B) or `_t128`
-/// (3 slots, one group stages K and V with a shared row clamp).
-pub struct KvRing {
-    pub ks: Shared,
-    pub vs: Shared,
-    pub kd: Shared,
-    pub ones: Shared,
-    pub q1: Shared,
-    pub q0: Shared,
-    pub epi: Shared,
-    pub kcp: RowsCopy,
-    pub vcp: RowsCopy,
-    pub kdc: KdCopy,
-    pub kr: RowsReader,
-    pub vr: TrReader,
-    pub kdr: RowScaleReader,
-}
-
-impl KvRing {
-    pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing {
-        let mut lds = LdsPlan::new();
-        let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
-        let kd = lds.ring("KD", 512, slots, Layout::Linear);
-        lds.at(32768 * slots as i64 + 2048);
-        let ones = lds.tile("ones", 2048, Layout::Linear);
-        let q1 = lds.tile("Q1", 16384, Layout::Linear);
-        let q0 = lds.tile("Q0", 16384, Layout::Linear);
-        let epi = lds.private("epi", 4096, 8, &[&q1, &q0]);
-        lds.commit(b);
-        let lane = &blk.lane;
-        let kr = RowsReader::new(b, &ks, lane);
-        let vr = TrReader::new(b, &vs, lane);
-        let kdr = RowScaleReader::new(b, &kd, lane);
-        let (kt, vt, kdt) = (blk.kv_tile(b, &io.k), blk.kv_tile(b, &io.v), blk.kv_tile(b, &io.ksc));
-        let (ksrc, vsrc, kdsrc) = (kt.row_source(b, 1), vt.row_source(b, 1), kdt.row_source(b, 1));
-        let kcp = RowsCopy::new(b, ksrc, &ks, roles.wave_in_group, lane, 4);
-        let vcp = RowsCopy::new(b, vsrc, &vs, roles.wave_in_group, lane, 4);
-        let kdc = if slots == 2 {
-            KdCopy::Dma(DwordRowsCopy::new(b, kdsrc, &kd, roles.wave_in_group, lane))
-        } else {
-            // one dword per row: thread t covers row t >> 1 (two threads per row)
-            let rt_row = b.bind_i32(lane.tid().lshr(1));
-            KdCopy::Vgpr(DwordRowsVgpr::new(b, kdsrc, &kd, rt_row))
-        };
-        KvRing { ks, vs, kd, ones, q1, q0, epi, kcp, vcp, kdc, kr, vr, kdr }
-    }
-}
-
 impl FmhaIo {
     /// The lane's bf16 output row pointer (the clamped row, INCLUDING the lane-half term `8 (lane >> 5)` bytes) and the wave-live condition.
     pub fn out_row(&self, b: &mut FnBuilder, blk: &FmhaBlock) -> (ValueId, ValueId) {
@@ -278,61 +223,6 @@ impl FmhaBlock {
     pub fn out_scale(&self, b: &mut FnBuilder, l: ValueId) -> ValueId {
         let inv_l = b.rcp_f32(l);
         b.mul_f32(inv_l, self.vd)
-    }
-}
-
-impl KvRing {
-    /// Issues the copies of the tile at `key0` into `slot` that `role` produces; returns the K-scale word in flight for the VGPR staging (pass it to
-    /// `stage_complete` after the DMA wait).
-    pub fn stage(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<ValueId> {
-        match (role, &self.kdc) {
-            (Role::A, KdCopy::Dma(kd)) => {
-                kd.issue(b, key0, &self.kd.at(slot));
-                self.kcp.issue(b, key0, &self.ks.at(slot));
-                None
-            }
-            (Role::B, _) => {
-                self.vcp.issue(b, key0, &self.vs.at(slot));
-                None
-            }
-            (_, KdCopy::Vgpr(kd)) => {
-                let v = kd.issue(b, key0);
-                issue_rows_shared(b, key0, &[(&self.kcp, &self.ks.at(slot)), (&self.vcp, &self.vs.at(slot))]);
-                Some(v)
-            }
-            _ => unreachable!("KvRing::stage: role / K-scale staging combination"),
-        }
-    }
-    /// After the DMA wait of `slot`: the VGPR-staged K-scale word goes to LDS.
-    pub fn stage_complete(&self, b: &mut FnBuilder, pending: Option<ValueId>, slot: &SlotIdx) {
-        if let (KdCopy::Vgpr(kd), Some(v)) = (&self.kdc, pending) {
-            kd.complete(b, v, &self.kd.at(slot));
-        }
-    }
-    /// The constant LDS data the shipped kernels stage before the first barrier: a block of E4M3 ones (64 dwords per wave) and the wave's two Q fragments
-    /// (32 B per lane each, the second 16 B one KB further).
-    pub fn store_constants(&self, b: &mut FnBuilder, wid: ValueId, lane: &Lane, q: &RowFrags) {
-        let s0 = SlotIdx::new(0, 0);
-        let ones_w = b.c_i32(0x38383838);
-        let oa = b.bind_i32((ev(wid) * 64 + lane.lane()) * 4 + self.ones.base as i32);
-        self.ones.at(&s0).write(b, |b| b.store_lds_b32(oa, ones_w));
-        for (sh, w) in [(&self.q0, &q.words[0]), (&self.q1, &q.words[1])] {
-            let a0 = b.bind_i32((ev(wid) * 2048 + sh.base as i32) + (lane.lane() << 4));
-            let a1 = b.bind_i32(ev(a0) + 1024);
-            let (g0, g1) = (b.frag4(w[0], w[1], w[2], w[3]), b.frag4(w[4], w[5], w[6], w[7]));
-            sh.at(&s0).write(b, |b| {
-                b.store_lds_b128(a0, g0);
-                b.store_lds_b128(a1, g1);
-            });
-        }
-    }
-    /// Binds the ring offsets of the iteration's current and next tile at the call site (the hand kernels' `ring()` at the top of the iteration),
-    /// instead of at their first use deeper in the window.
-    pub fn bind_offsets(&self, b: &mut FnBuilder, t: &TileIt) {
-        let _ = self.ks.at(&t.cur).off_v(b);
-        if t.staged {
-            let _ = (self.ks.at(&t.next).off_v(b), self.kd.at(&t.next).off_v(b));
-        }
     }
 }
 
