@@ -51,5 +51,5 @@ b.consume_region("K", slot, gen, |b| { ...reads... });
 ## 5. 验证
 
 - `amdc list` 的 101 个 kernel（own 后端）与 v3 / dsl / 旧手写 / GEMM v3 / v4 的汇编 md5 与 Main `1c3c9cf` 逐字节相同；
-- 严格证书不变（`--shipped` 24 / 100 / 0，`--legacy` 44 / 216 / 0）；
+- 严格证书不变（`--shipped` 24 / 100 / 0，`--legacy`（已移除） 44 / 216 / 0）；
 - `cargo test` 69 个目标 / 325 项全绿（新增 `region_ir`：所有 kernel 的线性视图往返一致、闭包形式与 begin/end 生成相同的树、不配对在构建期 panic、不配对的线性编辑被拒绝）。

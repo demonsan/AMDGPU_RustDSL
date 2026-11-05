@@ -27,7 +27,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - **主机侧生成**：`amdc gen-host` 从 kernel 合同生成 C++ 启动/ABI 头与 JSON（[`host-gen.md`](host-gen.md)）；出厂 `ref_host` 使用生成的命名字段。
 - 精度 **mean 8.3e-4**（厂商 1.5–2.9e-3）；15/15 形状、64 行 bad=0；确定性与 split 压力全过。
 - `cargo test` **82 个测试目标 / 362 项全绿**。
-- 严格 GPU 语义证书：`--shipped` **24 trusted assumes / 100 trusted contracts / 0 unproven**；`--legacy` **44 / 216 / 0**；GEMM v3 / v4 **3 / 19 / 0**。
+- 严格 GPU 语义证书：`--shipped` **24 trusted assumes / 100 trusted contracts / 0 unproven**；`--legacy`（已移除） **44 / 216 / 0**；GEMM v3 / v4 **3 / 19 / 0**。
 
 ---
 
@@ -66,7 +66,7 @@ DMA、LDS 直达、`buffer_load … lds`、16x16x128 scaled MFMA 等为 own-only
 [`gpu-semantic-protocol.md`](gpu-semantic-protocol.md)（四轴协议）；历史审计记录：[`archive/gpu-semantics-audit.md`](archive/gpu-semantics-audit.md)。
 
 ```bash
-amdc gpu-verify <kernel>|--all|--shipped|--legacy [-v] [--strict]   # 报告 proven/发现/trusted 清单/证书
+amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]   # 报告 proven/发现/trusted 清单/证书
 ```
 
 **已证明（出厂 v3，`--strict` 0 错误 0 警告）**：
@@ -83,7 +83,7 @@ amdc gpu-verify <kernel>|--all|--shipped|--legacy [-v] [--strict]   # 报告 pro
 区间分析的位级规则：`x ^ y`、`x & m` 用"可能置位的位"收窄（swizzle 基址 `(row << 7) ^ (chunk << 4)` 可证 ≤ 2032）；
 多项式非负判定使用 `ka_range` / `ka_set` / `sym_range` 的上界（盒子检验）。两条规则都有攻击测试（`crates/amdgpu-compiler/tests/gv_bits.rs`）。
 
-**信任预算（证书逐条列出）**：`--shipped`（v3 四个）24 / 100 / 0；`--legacy`（旧手写 8 个）44 / 216 / 0；`gemm_mxfp8_bs_v3`、`_v4` 各 3 / 19 / 0。
+**信任预算（证书逐条列出）**：`--shipped`（v3 四个）24 / 100 / 0；`--legacy`（已移除）（旧手写 8 个）44 / 216 / 0；`gemm_mxfp8_bs_v3`、`_v4` 各 3 / 19 / 0。
 每次运行打印 `certificate: N trusted assumes, M trusted contracts, K unproven`。
 
 **未证明/范围外（诚实清单）**：跨工作组数据竞争与别名、i32 回绕（A3 假设）、从内存加载的指针/索引、safe-asm 块内部访存、
@@ -149,7 +149,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设。
 | Kernel | 状态 |
 |---|---|
 | `fmha_fwd_hd128_mxfp8_auto` | **默认**（guard 选择）：`v3_vs128` / `v3_t128` / `v3_kvsplit` + `v3_kvsplit_combine8h`（`crates/amdgpu-tile/src/fmha.rs`） |
-| `fmha_fwd_hd128_mxfp8_dsl_auto` | 上一版 tile 库集 `dsl_*`（`crates/amdgpu-dsl/src/fmha_tile.rs`），A/B 对照用 |
+| `fmha_fwd_hd128_mxfp8_dsl_auto` | 上一版 tile 库集 `dsl_*`（crates/amdgpu-dsl/src/fmha_tile.rs（已在 2026-11 清理中删除）），A/B 对照用 |
 | `fmha_fwd_hd128_mxfp8_v3s_*` | v3 的别名（同代码），配合 `FMHA_OPT_SCOPE=v3s` 对实验 token 做同轮 A/B |
 | `fmha_fwd_hd128_mxfp8_legacy_auto` | 旧手写集（`_vs128` / `_t128` / `_kvsplit` / `combine8h`，`crates/amdgpu-dsl/src/kernels.rs`），A/B 对照用 |
 | `gemm_mxfp8_bs_v4` / `_v3` | MXFP8 blockscale GEMM（`crates/amdgpu-kernels`）；v4 = 厂商结构（寄存器暂存、AGPR 原地重载），v3 = 不做原地重载的变体 |
@@ -159,7 +159,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设。
 
 - 参考算法：每 128-key 单元精确参考重基准（阈值 120/512）、长序列无 LUT 校正、短序列第二份代码副本 + `svcorr`
 - mean err **8.3e-4**（厂商 1.5–2.9e-3）；15/15 形状、16/64 行 parity 15/15、bad = 0
-- 确定性 5/5 × N 次；split 形状重复启动单一 md5（`tools/ohat_repro.sh`，`port_gate` 的 STRESS 段）
+- 确定性 5/5 × N 次；split 形状重复启动单一 md5（tools/ohat_repro.sh（已在 2026-11 清理中删除），`port_gate` 的 STRESS 段）
 
 **Accuracy gate (user decision 2026-11-04, "2+3").** ACC64 is now judged by **vendor parity**: per shape and path, in the same run on the same inputs, our mean_err must be ≤ 1.10× the vendor's AND our bad count must be ≤ the vendor's. The old strict criterion (bad = 0) is still printed as INFO, and `ACC_STRICT=1` restores it (`tools/port_gate.sh`).
 
@@ -284,7 +284,7 @@ v3 asm md5：`68d2832b` / `e4c7e75d` / `e4fc18b1` / `24a95a51`。`_t128` 另外�
 |---|---|---|
 | 物理 WAW（MFMA 在途结果寄存器被 RA 复用） | opt-in 组合下非确定输出 | `pad_physical_war` 跟踪在途 MFMA 目标区间；MIR 回归测试 |
 | 两阶段 RA reaching-writer 误报 | 持久循环变量编译失败 | path-aware 检查；`crates/amdgpu-compiler/tests/ra_reaching.rs` |
-| VMEM 宽存储数据 WAR | `global_store_dwordx4` 后数据寄存器被过早覆盖 → split 路径偶发损坏 | `pad_physical_war` 记录宽存储数据区间；`tools/ohat_repro.sh` 压力回归 |
+| VMEM 宽存储数据 WAR | `global_store_dwordx4` 后数据寄存器被过早覆盖 → split 路径偶发损坏 | `pad_physical_war` 记录宽存储数据区间；tools/ohat_repro.sh（已在 2026-11 清理中删除） 压力回归 |
 | LDS-DMA 操作数等待放置（AGPR 工作中发现） | 静默误编译 | 见 [`agpr.md`](agpr.md) "Wait placement" 一节 |
 
 ---
@@ -318,7 +318,6 @@ clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=
 
 # 严格证书
 bash tools/container/cargo.sh run -q --bin amdc -- gpu-verify --shipped --strict   # 24 / 100 / 0
-bash tools/container/cargo.sh run -q --bin amdc -- gpu-verify --legacy --strict    # 44 / 216 / 0
 
 # 主机侧生成
 bash tools/container/cargo.sh run -q --bin amdc -- gen-host --shipped --out tests/gpu/generated

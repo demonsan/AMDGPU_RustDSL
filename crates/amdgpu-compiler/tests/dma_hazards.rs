@@ -1,5 +1,5 @@
 //! Hazard: a VALU instruction writing a VGPR followed by `v_readfirstlane` of that VGPR needs wait states.
-//! Found on hardware with `fmha_fwd_hd128_mxfp8_vs` (the DMA path reads the LDS base with v_readfirstlane into M0):
+//! Found on hardware with a DMA kernel (the DMA path reads the LDS base with v_readfirstlane into M0):
 //! `v_add d, ..; v_readfirstlane s, d; s_mov m0, s; global_load_lds` returned a stale lane value. Same hazard class as
 //! "VALU write VGPR -> MFMA operand / permlane" (2 wait states; 4 after carry-out adds).
 

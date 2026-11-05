@@ -411,19 +411,9 @@ fn a_loop_carried_in_flight_value_needs_a_wait_before_its_use_in_the_next_iterat
 #[test]
 fn shipped_kernels_pass_the_enforced_mir_level_checks() {
     for name in [
-        "attention_fwd",
         "probe_lds",
         "probe_buffer_rw",
         "probe_mfma_unscaled",
-        "fmha_fwd_hd128_mxfp8_t",
-        "fmha_fwd_hd128_mxfp8_t128",
-        "fmha_fwd_hd128_mxfp8_vs128",
-        "fmha_fwd_hd128_mxfp8_kvsplit",
-        "fmha_fwd_hd128_mxfp8_kvsplit_combine8h",
-        "fmha_fwd_hd128_mxfp8_dsl_vs128",
-        "fmha_fwd_hd128_mxfp8_dsl_t128",
-        "fmha_fwd_hd128_mxfp8_dsl_kvsplit",
-        "fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h",
         "fmha_fwd_hd128_mxfp8_v3_vs128",
         "fmha_fwd_hd128_mxfp8_v3_t128",
         "fmha_fwd_hd128_mxfp8_v3_kvsplit",

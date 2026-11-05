@@ -7,11 +7,6 @@ use amdgpu_dsl::{lint, DType, FnBuilder, Op, Opnd};
 /// Kernels that already re-read loop variables after `set_var` (validated on hardware as they are; the lowering updates
 /// the register in place). New kernels must be clean or opt out with `FnBuilder::allow_var_rereads()`.
 const KNOWN_REREADERS: &[&str] = &[
-    "fmha_fwd_hd128_mxfp8",
-    "fmha_fwd_hd128_mxfp8_pp",
-    "fmha_fwd_hd128_mxfp8_sv",
-    "fmha_fwd_hd128_mxfp8_t",
-    "sched_diamond",
 ];
 
 #[test]

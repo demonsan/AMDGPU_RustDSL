@@ -30,15 +30,7 @@ awk -F'|' '!/^[ \t]*#/ && NF>=3 {k=$1; gsub(/[ \t]/,"",k); sub(/:.*/,"",k); prin
   # all names accepted by kernel_by_name
   awk '/pub fn kernel_by_name/{f=1} f' crates/amdgpu-compiler/src/lib.rs | grep -oE '"[a-z0-9_]+"[[:space:]]*=>[[:space:]]*Some' | sed -E 's/"([a-z0-9_]+)".*/\1/' | sort -u | while read -r K; do echo "$K|$K|"; done
   # option combinations that select other instruction forms
-  V=fmha_fwd_hd128_mxfp8_vs128; T=fmha_fwd_hd128_mxfp8_t128; K=fmha_fwd_hd128_mxfp8_kvsplit; TT=fmha_fwd_hd128_mxfp8_t; S9=fmha_fwd_hd128_mxfp8_vs9; S5=fmha_fwd_hd128_mxfp8_vs5
-  echo "vs128+saddrlds|$V|FMHA_OPT=saddrlds,pmdead"
-  echo "vs128+mubuf|$V|FMHA_OPT=mubuf"
-  echo "vs128+mubufd|$V|FMHA_OPT=mubufd"
-  echo "vs128+p4|$V|FMHA_OPT=p4"
-  echo "vs128+biasacc|$V|FMHA_OPT=biasacc"
-  echo "vs128+biasv|$V|FMHA_OPT=biasv"
-  echo "vs128+cut1|$V|FMHA_OPT=cut1"
-  echo "vs128+vpre2|$V|FMHA_OPT=vpre2"
+  V=fmha_fwd_hd128_mxfp8_v3_vs128; T=fmha_fwd_hd128_mxfp8_v3_t128
   echo "vs128+lower-sgpr|$V|AMDC_LOWER_OPTS=dce,cmpfold,scalarize,saddr,sgpr,imm"
   echo "vs128+lower-addrfold|$V|AMDC_LOWER_OPTS=dce,cmpfold,addrfold,shl"
   echo "maskge+maskreg|probe_llvm_maskge|AMDC_LOWER_OPTS=dce,cmpfold,maskreg"
@@ -46,19 +38,7 @@ awk -F'|' '!/^[ \t]*#/ && NF>=3 {k=$1; gsub(/[ \t]/,"",k); sub(/:.*/,"",k); prin
   echo "vs128+maskreg2|$V|AMDC_LOWER_OPTS=dce,cmpfold,maskreg2"
   echo "vs128+sbound|$V|AMDC_LOWER_OPTS=dce,cmpfold,sbound,scalarize,imm"
   echo "t128+maskreg|$T|AMDC_LOWER_OPTS=dce,cmpfold,maskreg,sbound,scalarize,imm"
-  echo "t+maskreg|$TT|AMDC_LOWER_OPTS=dce,cmpfold,maskreg,sbound,scalarize,imm"
-  echo "t+all|$TT|AMDC_LOWER_OPTS=all"
-  echo "vs128+epdirect|$V|FMHA_OPT=epdirect"
-  echo "vs128+smfv-off|$V|FMHA_OPT=nosmfv"
   echo "t128+lower-sgpr|$T|AMDC_LOWER_OPTS=dce,cmpfold,scalarize,saddr,sgpr,imm"
-  echo "t128+saddrlds|$T|FMHA_OPT=saddrlds"
-  echo "t+lower-sgpr|$TT|AMDC_LOWER_OPTS=dce,cmpfold,scalarize,saddr,sgpr,imm"
-  echo "kvsplit+fused|$K|FMHA_OPT=fused"
-  echo "kvsplit+fusedlite|$K|FMHA_OPT=fused,fusedlite"
-  echo "kvsplit+saddrlds|$K|FMHA_OPT=saddrlds"
-  echo "vs9+mhead|$S9|FMHA_OPT=mhead"
-  echo "vs5+winc|$S5|FMHA_OPT=winc"
-  echo "vs5+winm|$S5|FMHA_OPT=winm"
 } > "$OUT/run_list.txt"
 
 : > "$OUT/kernels.tsv"

@@ -198,11 +198,8 @@ fn main() -> ExitCode {
             let strict = args.iter().any(|a| a == "--strict");
             let names: Vec<String> = match args.get(1).map(|s| s.as_str()) {
                 Some("--all") => amdgpu_compiler::kernel_names().iter().map(|s| s.to_string()).collect(),
-                // the shipped default path (`fmha_fwd_hd128_mxfp8_auto`): the four kernels composed from the tile library (crates/amdgpu-dsl/src/fmha_tile.rs)
-                Some("--shipped") => ["fmha_fwd_hd128_mxfp8_v3_vs128", "fmha_fwd_hd128_mxfp8_v3_t128", "fmha_fwd_hd128_mxfp8_v3_kvsplit", "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h"].iter().map(|s| s.to_string()).collect(),
-                // the previous hand-written shipped set (kept registered for A/B: `fmha_fwd_hd128_mxfp8_legacy_auto`) and its frozen/experimental relatives
-                Some("--legacy") => ["fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_t128", "fmha_fwd_hd128_mxfp8_kvsplit", "fmha_fwd_hd128_mxfp8_kvsplit_combine8h", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_vs5", "fmha_fwd_hd128_mxfp8_vs9", "fmha_fwd_hd128_mxfp8_vs"].iter().map(|s| s.to_string()).collect(),
-                Some(n) => vec![n.to_string()],
+                // the shipped default path (`fmha_fwd_hd128_mxfp8_auto`): the four v3 kernels (crates/amdgpu-tile/src/fmha.rs)
+                Some("--shipped") => ["fmha_fwd_hd128_mxfp8_v3_vs128", "fmha_fwd_hd128_mxfp8_v3_t128", "fmha_fwd_hd128_mxfp8_v3_kvsplit", "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h"].iter().map(|s| s.to_string()).collect(),`n                Some(n) => vec![n.to_string()],
                 None => {
                     usage();
                     return ExitCode::from(2);

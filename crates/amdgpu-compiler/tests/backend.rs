@@ -44,7 +44,7 @@ fn natural_exp_is_lowered_through_exp2() {
 fn transcendental_results_get_wait_states() {
     // Regression: consuming a transcendental result immediately returned the
     // stale register value on gfx950.
-    let f = kernel_by_name("attention_fwd").unwrap();
+    let f = kernel_by_name("fmha_fwd_hd128_mxfp8_v3_t128").unwrap();
     let compiled = compile(&f).unwrap();
     assert!(compiled.asm.contains("s_nop"), "no hazard padding emitted");
     let mut exp_seen = false;
@@ -88,7 +88,7 @@ fn verifier_rejects_type_errors() {
 fn loop_variables_survive_verification() {
     use amdgpu_dsl::{verify, Op};
 
-    let f = amdgpu_dsl::kernels::attention_fwd();
+    let f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_v3_t128").unwrap();
     let errors = verify(&f);
     assert!(errors.is_empty(), "attention IR failed verification: {errors:?}");
     // Sanity: the kernel really does carry loop state.

@@ -48,7 +48,7 @@ fn check(asm: &str, kernel: &str, bad: &mut Vec<String>) {
 #[test]
 fn sgpr_operands_obey_the_gfx9_constant_bus_and_encoding_rules() {
     let mut bad = Vec::new();
-    for k in ["fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_sv", "fmha_fwd_hd128_mxfp8_vs", "fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_pp", "attention_fwd"] {
+    for k in ["fmha_fwd_hd128_mxfp8_v3_t128", "fmha_fwd_hd128_mxfp8_v3_vs128"] {
         let Some(f) = kernel_by_name(k) else { continue };
         for opts in [&["dce", "cmpfold", "scalarize", "sgpr", "imm"][..], &["dce", "cmpfold", "scalarize", "sgpr", "imm", "retarget2"][..]] {
             let asm = with_opts(opts, || compile(&f)).map(|c| c.asm);

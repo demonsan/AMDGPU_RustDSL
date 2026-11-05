@@ -23,7 +23,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 | 精度 | mean err **8.3e-4**（厂商 1.5–2.9e-3）；15/15 形状、64 行 bad=0 |
 | 确定性 | 5/5 × N；uneven-tile split 形状重复启动单一 md5 |
 | 测试 | `cargo test` **82 个目标 / 362 项全绿**；safe-asm 另有 29 个 ui 用例（28 编译失败 + 1 通过对照） |
-| GPU 语义验证 | 编译器感知指令语义：LDS/global/buffer 越界、VGPR/SGPR/AGPR 类别与对齐、路径敏感等待、LDS tile 生命周期与同步协议均被证明。严格证书：出厂 4 kernel `--shipped` **24 trusted assumes / 100 host contracts / 0 unproven**；旧手写集 `--legacy` **44 / 216 / 0**；GEMM v3/v4 **3 / 19 / 0**；见 [`docs/gpu-semantics-verifier.md`](docs/gpu-semantics-verifier.md) |
+| GPU 语义验证 | 编译器感知指令语义：LDS/global/buffer 越界、VGPR/SGPR/AGPR 类别与对齐、路径敏感等待、LDS tile 生命周期与同步协议均被证明。严格证书：出厂 4 kernel `--shipped` **24 trusted assumes / 100 host contracts / 0 unproven**；旧手写集 `--legacy`（已移除） **44 / 216 / 0**；GEMM v3/v4 **3 / 19 / 0**；见 [`docs/gpu-semantics-verifier.md`](docs/gpu-semantics-verifier.md) |
 | Rust 安全 | **八个 crate 全部 `#![forbid(unsafe_code)]`、零第三方依赖、无 FFI/裸指针**；ISA 规则编码进类型系统；见 [`docs/rust-safety.md`](docs/rust-safety.md) |
 
 功能（FMHA）：head dim 128，fp8(e4m3) Q/K/V，E8M0 1×32 Q/K 缩放，标量 V 缩放，BF16 输出，在线 softmax，

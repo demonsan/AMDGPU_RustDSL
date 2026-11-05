@@ -435,7 +435,7 @@ Acceptance target after the rewrite: `<= 0.040 ms/launch` (>= 420 TFLOP/s, >= 81
 
 ## 7.5 Acceptance checklist for kernel-opt's rewrite
 
-Measured with the same protocol (`ref_host` hipEvent timings, `tools/vendor_counters.sh` for counters,
+Measured with the same protocol (`ref_host` hipEvent timings, tools/vendor_counters.sh（已在 2026-11 清理中删除） for counters,
 same shape and GPU). Pass = every line at or better than the "target" column; the vendor column is the
 reference. A faster kernel that changes numerics fails the correctness gate regardless.
 
@@ -521,7 +521,7 @@ made to allocate before the next validation round.
 ## 7.7 Full checklist: kernel-opt `fmha_fwd_hd128_mxfp8_vs128` @ Main 3cc73c0 (GPU 5)
 
 Measured 2026-10-29 on GPU 5 with `bash tools/vendor_validate.sh fmha_fwd_hd128_mxfp8_vs128` plus
-`tools/vendor_counters.sh` for the counter rows (same-run wall, B1 H8 S=SK=2048, 20 unprofiled
+tools/vendor_counters.sh（已在 2026-11 清理中删除） for the counter rows (same-run wall, B1 H8 S=SK=2048, 20 unprofiled
 launches; vendor measured in the same process). Commit: Main `3cc73c0` (kernel-opt `34efdeb`
 "vs128: default lowering opts scalarize+imm and the full scheduler" + backend-tail pressure fix).
 
@@ -1349,7 +1349,7 @@ md5sum /tmp/vs128.bin    # -> faadf00c95f4eaffff94ece7d1429b3d
 | LDS bank conflicts | 0 | 0 | 0 |
 
 ### What the window must show (acceptance against this control)
-(a) emitted `.s` actually differs from the base build (flag routed; `tools/safeasm_window_validate.sh`
+(a) emitted `.s` actually differs from the base build (flag routed; tools/safeasm_window_validate.sh（已在 2026-11 清理中删除）
 fails early otherwise); (b) **`REF_DUMP2` md5 = `faadf00c...` bit-identical**, same dump command;
 (c) counter direction: **WAIT_INST_ANY down, XDL busy up, wave cycles down**, not just a wait reshuffle;
 (d) same-run per-CU best/median up and filled B4H8S2048/B1H8S8192 absolute close to 1243.5/1853.9;
@@ -1742,7 +1742,7 @@ a correct wait model makes `epw` clean, not worse.
   previously certified values are unchanged (1427.9/1416.1 and 1975.7/1963.9, best/median).
 - Node load indicator for the run: vendor median 538-540 TFLOP/s, load average ~38 during timing.
 
-**Acceptance protocol addition (permanent).** (1) `tools/ohat_repro.sh` with `RUNS=300` on B1H2S200
+**Acceptance protocol addition (permanent).** (1) tools/ohat_repro.sh（已在 2026-11 清理中删除） with `RUNS=300` on B1H2S200
 SK1337 is part of the split/determinism gate: full output md5 must be one value; include at least two
 other uneven-tile split shapes (`ceil(SK/128) % splits != 0`), e.g. B3H3S768 SK1280 s4, B2H8S700 SK640
 s2, B1H2S1024 SK1088 s2. (2) `FMHA_OPT=eplds,epw` must be clean over 100 launches: it is the

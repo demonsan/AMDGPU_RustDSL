@@ -128,7 +128,7 @@ unscheduled 224.5-225.0 TFLOP/s; in-block scheduler 221.7; `swp,taildup` 221.2 (
 Pipelining of multi-block loop bodies (diamonds, barriers), common-prefix hoisting / speculation, loop-head 32-byte alignment, `v_cndmask_b32_e64` emission, modelling of the +96-cycle taken-branch slow mode, `s_setprio` ping-pong.
 
 ## `--sched=auto` (round 3)
-`AMDC_SCHED=auto` / `--sched=auto`: model-gated scheduling, default scheduler still OFF. Per loop the multi-wave simulator decides (>= 3%); loops with `s_barrier` are not eligible (no cross-wave term in the model; FMHA stays unscheduled, as measured 221.7 scheduled vs 225.0 unscheduled). Hardware results and details: docs/llvm-tail-integration.md section 9, `tools/auto_vs_plain.sh`.
+`AMDC_SCHED=auto` / `--sched=auto`: model-gated scheduling, default scheduler still OFF. Per loop the multi-wave simulator decides (>= 3%); loops with `s_barrier` are not eligible (no cross-wave term in the model; FMHA stays unscheduled, as measured 221.7 scheduled vs 225.0 unscheduled). Hardware results and details: docs/llvm-tail-integration.md section 9, tools/auto_vs_plain.sh（已在 2026-11 清理中删除）.
 
 ## ldshoist / preset ld (round 4)
 

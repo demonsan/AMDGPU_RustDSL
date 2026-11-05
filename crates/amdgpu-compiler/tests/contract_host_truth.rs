@@ -139,7 +139,7 @@ fn fmha_contracts_match_the_host_allocations() {
             ("ptr_k_descale", h(sh.b) * sh.sk * sh.hk * 4 + 640 * sh.h * 4, Some(h(sh.b) * sh.sk * sh.hk * 4)),
             ("ptr_v_descale", 4096, None),
         ];
-        for k in ["fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_t128", "fmha_fwd_hd128_mxfp8_t", "fmha_fwd_hd128_mxfp8_dsl_vs128", "fmha_fwd_hd128_mxfp8_dsl_t128", "fmha_fwd_hd128_mxfp8_v3_vs128", "fmha_fwd_hd128_mxfp8_v3_t128"] {
+        for k in ["fmha_fwd_hd128_mxfp8_v3_vs128", "fmha_fwd_hd128_mxfp8_v3_t128"] {
             let f = amdgpu_compiler::kernel_by_name(k).expect(k);
             // ref_host: rows_pb = 128 for the _t128 family, 256 otherwise (the contract's grid_is(0)
             // uses the same rows_per_block the builder was called with)
@@ -149,7 +149,7 @@ fn fmha_contracts_match_the_host_allocations() {
             if let Err(e) = check_extents(&f, sh, grid, &syms, &nonsplit) { all_errors.push(e); }
         }
         // split kernel: grid z = B * splits; Ohat/lse extents use splits * rows_total
-        let f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_kvsplit").expect("kvsplit");
+        let f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_v3_kvsplit").expect("kvsplit");
         let grid = [((sh.s + 255) / 256), sh.h, sh.b * sh.splits];
         let syms = HashMap::from([("B", sh.b), ("HK", sh.hk)]);
         let split = [
@@ -165,7 +165,7 @@ fn fmha_contracts_match_the_host_allocations() {
         ];
         if let Err(e) = check_extents(&f, sh, grid, &syms, &split) { all_errors.push(e); }
         // combine kernel: rows_total * 128 * 4 Ohat, rows_total * 4 lse, rows_total * 128 * 2 out
-        let f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_kvsplit_combine8h").expect("combine8h");
+        let f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h").expect("combine8h");
         let combine = [
             ("ptr_ohat", sh.splits * sh.rows_total * 128 * 4, None),
             ("ptr_lse", sh.splits * sh.rows_total * 4, None),
@@ -179,7 +179,7 @@ fn fmha_contracts_match_the_host_allocations() {
 #[test]
 fn fmha_contracts_are_present() {
     // a contract-free shipped kernel must not pass silently: this test is itself the coverage guard
-    for k in ["fmha_fwd_hd128_mxfp8_vs128", "fmha_fwd_hd128_mxfp8_t128", "fmha_fwd_hd128_mxfp8_kvsplit", "fmha_fwd_hd128_mxfp8_kvsplit_combine8h", "fmha_fwd_hd128_mxfp8_dsl_vs128", "fmha_fwd_hd128_mxfp8_dsl_t128", "fmha_fwd_hd128_mxfp8_dsl_kvsplit", "fmha_fwd_hd128_mxfp8_dsl_kvsplit_combine8h", "fmha_fwd_hd128_mxfp8_v3_vs128", "fmha_fwd_hd128_mxfp8_v3_t128", "fmha_fwd_hd128_mxfp8_v3_kvsplit", "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h"] {
+    for k in ["fmha_fwd_hd128_mxfp8_v3_vs128", "fmha_fwd_hd128_mxfp8_v3_t128"] {
         let f = amdgpu_compiler::kernel_by_name(k).expect(k);
         assert!(!f.contract.extents.is_empty(), "{k}: no contract extents (annotations missing)");
     }

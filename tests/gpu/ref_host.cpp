@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
     else if (co_small) { rows_pb = blocks256 <= 128 ? 128 : 256; why = blocks256 <= 128 ? "auto: 2*ceil(S/256)*H*B <= 256 CUs" : "auto: 2*ceil(S/256)*H*B > 256 CUs"; }
     else { rows_pb = k_t128 ? 128 : 256; why = "kernel name"; }
     const char* use_co = use_split ? co_split : ((rows_pb == 128 && co_small) ? co_small : std::getenv("REF_CO2"));
-    const char* use_kn = use_split ? kname_split : ((rows_pb == 128 && co_small) ? kname_small : (kname_env ? kname_env : "fmha_fwd_hd128_mxfp8"));
+    const char* use_kn = use_split ? kname_split : ((rows_pb == 128 && co_small) ? kname_small : (kname_env ? kname_env : "fmha_fwd_hd128_mxfp8_v3_vs128"));
     const int ours_rows = use_split ? s_rows_pb : rows_pb;
     const unsigned ours_block = (unsigned)envi("REF_OURS_BLOCK_THREADS", (use_split || rows_pb == 256) ? 512 : 256);
     const int vendor_stride_rows = envi("REF_VENDOR_TILE_STRIDE_ROWS", 256);

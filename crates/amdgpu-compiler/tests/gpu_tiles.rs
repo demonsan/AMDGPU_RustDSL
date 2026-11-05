@@ -392,7 +392,7 @@ fn a_runtime_if_inside_a_loop_with_protocol_events_is_reported_not_skipped() {
 
 #[test]
 fn vs128_runs_the_lifetime_simulation_and_removed_barriers_are_noticed() {
-    let f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_vs128").unwrap();
+    let f = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_v3_vs128").unwrap();
     let r = verify_ir(&f);
     assert!(r.errors().is_empty(), "{}", errors(&r));
     assert!(r.proven.get("tile-reads").copied().unwrap_or(0) > 1000, "{}", r.render());

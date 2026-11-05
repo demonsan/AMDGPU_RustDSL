@@ -208,7 +208,7 @@ fn combine8h_lib() -> Function {
 #[test]
 fn combine8h_rewritten_with_the_library_matches_the_shipped_instruction_mix() {
     let mine = check(&combine8h_lib());
-    let shipped = amdgpu_compiler::compile(&amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_kvsplit_combine8h()).unwrap().asm;
+    let shipped = amdgpu_compiler::compile(&amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h").unwrap()).unwrap().asm;
     for m in ["global_load_dwordx4", "global_load_dword ", "global_store_dwordx4", "v_exp_f32", "v_cvt_f32_f16", "v_cvt_pk_bf16_f32", "v_rcp_f32", "v_max_f32", "s_cbranch"] {
         assert_eq!(n(&mine, m), n(&shipped, m), "{m}\n--- library:\n{mine}\n--- shipped:\n{shipped}");
     }

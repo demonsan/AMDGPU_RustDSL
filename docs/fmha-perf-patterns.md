@@ -251,7 +251,7 @@
 
 ### P31 硬件 hazard（正确性必需）
 - **VMEM 宽存储数据 WAR**：`global_store_dwordx4`/`buffer_store_dwordx4` 发射后 2 个等待态内 VALU 改写其数据 VGPR 会写坏未读数据（LLVM `has12DWordStoreHazard`）。`STORE_DATA_WAIT=3` slot（H:375-382，H:496-506、H:573-579）。
-  出厂效果：只有 `_kvsplit` +4 `s_nop`（180 vs 176），其余 byte-identical；不修时 ~5% 启动（`epw` 下 97%）损坏 fp16 Ohat 首 dword（VS §7.11、S.r69）。回归：`tools/ohat_repro.sh` 300 次 + `FMHA_OPT=eplds,epw` 100 次干净。A/B：`AMDC_NO_PHYS_STORE=1`。
+  出厂效果：只有 `_kvsplit` +4 `s_nop`（180 vs 176），其余 byte-identical；不修时 ~5% 启动（`epw` 下 97%）损坏 fp16 Ohat 首 dword（VS §7.11、S.r69）。回归：tools/ohat_repro.sh（已在 2026-11 清理中删除） 300 次 + `FMHA_OPT=eplds,epw` 100 次干净。A/B：`AMDC_NO_PHYS_STORE=1`。
 - **物理 WAW**：结果已死的 MFMA 的目的寄存器被 RA 分给新值，MFMA 19/21 个等待态后落笔覆盖（H:398-406、H:507-534，跨基本块传播 H:420-455）。现象：`biasacc,vpre` 6 次 6 个 md5（S.r66）。A/B：`AMDC_NO_PHYS_WAW=1`。出厂 kernel 上的单独代价未测。
 - **MFMA SrcC WAR**：在途 MFMA 的累加器源（scaled 21 / 其他 12 等待态；SMFMAC 读 A/B/idx 多拍）不得被改写（H:548-572）。
 - 其他已知正确性约束：SMFMAC 后 17 态 padding（S.r72）、VALU→MFMA 2 态、MFMA 结果 20 态（safe-asm 规则）。
@@ -388,7 +388,7 @@ combine 名字含 `combine8` 供 ref_host 推断每线程元素数）。注意 `
 
 ## 附录 B. 移植状态（M4，2026-11-02，`fmha-port` 基于 `dsl-tile` e42a808）
 
-（历史记录）四个当时的出厂 kernel 已全部用 tile 库重写，位于 `crates/amdgpu-dsl/src/fmha_tile.rs`（共 501 行，含共享 FMHA 胶水）。这一组 `dsl_*` 后来被布局层的 v3 集取代为出厂集（`crates/amdgpu-tile/src/fmha.rs`，见 [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9），本清单的模式同样是 v3 移植的 parity 依据：
+（历史记录）四个当时的出厂 kernel 已全部用 tile 库重写，位于 crates/amdgpu-dsl/src/fmha_tile.rs（已在 2026-11 清理中删除）（共 501 行，含共享 FMHA 胶水）。这一组 `dsl_*` 后来被布局层的 v3 集取代为出厂集（`crates/amdgpu-tile/src/fmha.rs`，见 [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9），本清单的模式同样是 v3 移植的 parity 依据：
 
 | 新 kernel | kernel 函数行数 | 使用的库组件 |
 |---|---|---|

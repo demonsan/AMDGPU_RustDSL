@@ -36,7 +36,7 @@ fn tensor_declarations_generate_the_fmha_contract() {
     let mut ka = KArgs::new();
     let _ = fmha_tensors(&mut b, &mut ka);
     let mine = b.finish().contract;
-    let shipped = amdgpu_dsl::kernels::fmha_fwd_hd128_mxfp8_vs128().contract;
+    let shipped = amdgpu_compiler::kernel_by_name("fmha_fwd_hd128_mxfp8_v3_vs128").unwrap().contract;
     for e in &mine.extents {
         assert!(shipped.extents.iter().any(|s| s.arg == e.arg && s.alloc == e.alloc && s.logical == e.logical), "extent {e:?} is not the shipped one");
     }
