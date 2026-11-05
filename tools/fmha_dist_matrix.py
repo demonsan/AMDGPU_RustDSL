@@ -80,10 +80,16 @@ def run(args_env):
 
 
 def tf_of(out, who):
-    for ln in out.splitlines():
+    lines = out.splitlines()
+    if who == "ours":
+        # a KV-split launch prints the main kernel alone first and then "timing ours total:" (main + combine): take the total
+        tot = [ln for ln in lines if ln.startswith("timing ours total:")]
+        if tot:
+            return float(tot[-1].split("TFLOP/s")[0].split(",")[-1])
+    for ln in lines:
         if who == "vendor" and ln.startswith("timing vendor"):
             return float(ln.split("TFLOP/s")[0].split(",")[-1])
-        if who == "ours" and (ln.startswith("timing ours total:") or ln.startswith("timing ours ")):
+        if who == "ours" and ln.startswith("timing ours "):
             return float(ln.split("TFLOP/s")[0].split(",")[-1])
     return 0.0
 

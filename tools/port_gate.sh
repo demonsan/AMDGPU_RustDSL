@@ -163,8 +163,8 @@ fi
 # recorded shipped numbers (Main f2759cd / 0668c54 gate, GPU 5): TF/s and the ratio to the same-run vendor
 PERF_DATA="${PERF_DATA:-normal}"
 # recorded shipped numbers on PERF_DATA=normal (fmha-align gate, GPU 5): TF/s and the ratio to the same-run vendor
-declare -A REC=([b1h8s2048]=1000 [percu64]=605 [b4h8s2048]=1840 [b1h8s8192]=2330 [b2h8s2048]=1240 [lp_vs128]=605 [lp_t128]=1240)
-declare -A REC_RATIO=([b1h8s2048]=1.30 [percu64]=0.80 [b4h8s2048]=0.88 [b1h8s8192]=0.92 [b2h8s2048]=0.84 [lp_vs128]=0.80 [lp_t128]=0.84)
+declare -A REC=([b1h8s2048]=691 [percu64]=598 [b4h8s2048]=1648 [b1h8s8192]=2299 [b2h8s2048]=1077 [lp_vs128]=599 [lp_t128]=1072)
+declare -A REC_RATIO=([b1h8s2048]=0.955 [percu64]=0.827 [b4h8s2048]=0.872 [b1h8s8192]=0.939 [b2h8s2048]=0.832 [lp_vs128]=0.828 [lp_t128]=0.824)
 median() { sort -g | awk '{a[NR]=$1} END {if (NR == 0) print "nan"; else if (NR % 2) print a[(NR + 1) / 2]; else print (a[NR / 2] + a[NR / 2 + 1]) / 2}'; }
 ratio_verdict() { awk -v c="$1" -v v="$2" -v r="$3" -v t="$PERF_TOL" 'BEGIN{q = (v > 0) ? c / v : 0; print (q >= t * r) ? "PASS" : "FAIL"}'; }
 if ! skip SKIP_PERF; then
