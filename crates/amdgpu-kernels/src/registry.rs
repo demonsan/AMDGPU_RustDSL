@@ -39,6 +39,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // experiment A/B builds (fmha-align): removed again unless adopted
         "fmha_fwd_hd128_mxfp8_v3x_vs128_lazy" => Some(crate::fmha::fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3x_vs128_lazy", true, false, false, false)),
         "fmha_fwd_hd128_mxfp8_v3x_vs128_kbuf" => Some(crate::fmha::fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3x_vs128_kbuf", true, false, true, false)),
+        "fmha_fwd_hd128_mxfp8_v3x_vs128_prev" => Some(crate::fmha::fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3x_vs128_prev", false, false, false, false)),
         "fmha_fwd_hd128_mxfp8_v3x_vs128_u2" => Some(crate::fmha::fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3x_vs128_u2", true, false, true, true)),
         "fmha_fwd_hd128_mxfp8_v3x_vs128_skey" => Some(crate::fmha::fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3x_vs128_skey", true, true, false, false)),
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),

@@ -362,7 +362,7 @@ impl PipeBody for AttnBody3<'_> {
 /// two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe in the long-sequence copy (`OnlineSoftmax::set_vendor_ref`;
 /// the short copy keeps the exact LUT-corrected recipe: with < 9 tiles the lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", false, false, false, false)
+    fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", true, false, true, false)
 }
 
 /// `_vs128` under another name with the experiment switches (A/B builds).
