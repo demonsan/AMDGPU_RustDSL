@@ -417,7 +417,9 @@ pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
     let mut f = fb.finish();
     // scheduler: sink every ds_read to at most one MFMA before its first use (one fragment group in flight, the vendor's lgkmcnt(4);
     // sched/ldahead.rs, docs/lgkm-lookahead.md): +0.6 % B1H8S8192, +1.3 % per-CU on realistic data, VGPR 256 -> 248
-    f.sched_opts = Some("ldsink=1".to_string());
+    // + wsink (explicit lgkm waits sunk past the compute) and ldahead32=1 (the K-scale ds_read_b32 one MFMA ahead): the two M-phase lgkmcnt(0)
+    // become counted waits (sched, docs/lgkm-lookahead.md)
+    f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
     f
 }
 

@@ -40,12 +40,11 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),
         // scheduler-token A/B variants of the shipped kernels (same code + `Function::sched_opts` tokens on top of the kernel's own preset; no env knobs):
-        // scheduler-token A/B variant of the shipped `_vs128` (same code, no env knob): `wsink` sinks the explicit lgkm waits past the compute, `ldahead32=1` issues the scale-word reads
-        // (`ds_read_b32`) one MFMA ahead (sched/ldahead.rs, docs/lgkm-lookahead.md)
-        "fmha_fwd_hd128_mxfp8_v3x_vs128_wsink" => {
-            let mut f = kernel_by_name("fmha_fwd_hd128_mxfp8_v3_vs128")?;
-            f.name = "fmha_fwd_hd128_mxfp8_v3x_vs128_wsink".to_string();
-            f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+        "fmha_fwd_hd128_mxfp8_v3x_vs128_ls1" | "fmha_fwd_hd128_mxfp8_v3_xls_t128" | "fmha_fwd_hd128_mxfp8_v3_xws_t128" | "fmha_fwd_hd128_mxfp8_v3x_kvsplit_ls1" | "fmha_fwd_hd128_mxfp8_v3x_kvsplit_ws" => {
+            let base = if name.contains("vs128") { "fmha_fwd_hd128_mxfp8_v3_vs128" } else if name.contains("t128") { "fmha_fwd_hd128_mxfp8_v3_t128" } else { "fmha_fwd_hd128_mxfp8_v3_kvsplit" };
+            let mut f = kernel_by_name(base)?;
+            f.name = name.to_string();
+            f.sched_opts = Some(if name.contains("ws") { "ldsink=1,wsink,ldahead32=1" } else { "ldsink=1" }.to_string());
             Some(f)
         }
         "probe_dma" => Some(crate::probes::probe_dma()),
