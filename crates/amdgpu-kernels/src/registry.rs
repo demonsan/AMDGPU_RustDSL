@@ -40,13 +40,6 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),
         // scheduler-token A/B variants of the shipped kernels (same code + `Function::sched_opts` tokens on top of the kernel's own preset; no env knobs):
-        "fmha_fwd_hd128_mxfp8_v3x_vs128_ls1" | "fmha_fwd_hd128_mxfp8_v3_xls_t128" | "fmha_fwd_hd128_mxfp8_v3_xws_t128" | "fmha_fwd_hd128_mxfp8_v3x_kvsplit_ls1" | "fmha_fwd_hd128_mxfp8_v3x_kvsplit_ws" => {
-            let base = if name.contains("vs128") { "fmha_fwd_hd128_mxfp8_v3_vs128" } else if name.contains("t128") { "fmha_fwd_hd128_mxfp8_v3_t128" } else { "fmha_fwd_hd128_mxfp8_v3_kvsplit" };
-            let mut f = kernel_by_name(base)?;
-            f.name = name.to_string();
-            f.sched_opts = Some(if name.contains("ws") { "ldsink=1,wsink,ldahead32=1" } else { "ldsink=1" }.to_string());
-            Some(f)
-        }
         "probe_dma" => Some(crate::probes::probe_dma()),
         "probe_safeasm_e2e" => Some(crate::probes::probe_safeasm_e2e()),
         "probe_log_store4" => Some(crate::probes::probe_log_store4()),
