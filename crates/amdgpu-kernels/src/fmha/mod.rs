@@ -79,6 +79,10 @@ pub struct KvRing3 {
 
 impl KvRing3 {
     pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
+        Self::new_with(b, io, blk, roles, slots, slots == 2)
+    }
+    /// `kd_dma`: the K scales through an LDS-direct DMA of group A (the two-group kernels), else through VGPRs (`_t128`).
+    pub fn new_with(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, kd_dma: bool) -> KvRing3 {
         let mut lds = LdsPlan::new();
         let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
         let kd = lds.ring("KD", 512, slots, Layout::Linear);
@@ -108,7 +112,7 @@ impl KvRing3 {
         let wv = ev(roles.wave_in_group);
         let kdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, ksrc, &ks, &kv_view());
         let vdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, vsrc, &vs, &kv_view());
-        let kdc = if slots == 2 {
+        let kdc = if kd_dma {
             // 128 rows x 4 bytes, one dword per lane: waves 0 / 1 stage rows 0..63 / 64..127, waves 2 / 3 repeat them (the wave index taken mod 2)
             let w2 = w.mod_c(2, &ctx.dyns);
             let wv2 = b.let_i32(ev(roles.wave_in_group) & 1);
@@ -298,6 +302,14 @@ impl PipeBody for AttnBody3<'_> {
     fn stage_complete(&mut self, b: &mut FnBuilder, _role: Role, slot: &SlotIdx) {
         self.ring.stage_complete(b, self.kd_pending.take(), slot);
     }
+    fn stage_vm(&self, role: Role) -> Option<u8> {
+        let r = self.ring;
+        match (role, &r.kdc) {
+            (Role::A, KdCopy3::Dma(kd)) => Some((r.kdma.issues() + kd.issues()) as u8),
+            (Role::B, _) => Some(r.vdma.issues() as u8),
+            _ => None,
+        }
+    }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
         self.ring.store_constants(b, self.wid, &self.blk.lane, &self.blk.q);
     }
@@ -381,19 +393,25 @@ impl PipeBody for AttnBody3<'_> {
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
+    vs128_exp("fmha_fwd_hd128_mxfp8_v3_vs128", 0)
+}
+
+/// EXPERIMENT builds (bit 0: 3-slot ring, staging distance 2)
+pub fn vs128_exp(name: &str, x: u32) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
     let blk = block3(&io, b, 8);
     let roles = Roles::split(b, &blk.lane, 4);
-    let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
+    let mut ring = KvRing3::new_with(b, &io, &blk, &roles, if x & 1 != 0 { 3 } else { 2 }, true);
     ring.enable_buffer_dma(b);
     ring.enable_buffer_kd(b);
     let ring = ring;
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
     // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
     pipe.key_unclamped = true;
+    pipe.ahead2 = x & 1 != 0;
     let pipe = pipe;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {

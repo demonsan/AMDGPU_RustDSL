@@ -128,6 +128,10 @@ impl DmaPart {
             .collect();
         BufForm { rsrc, base: bo, voffs }
     }
+    /// Number of VMEM instructions of one stage.
+    pub fn issues(&self) -> usize {
+        self.row_c.len()
+    }
     /// The DMA of the tile at `key0` into `slot` through the buffer form.
     pub fn issue_buffer(&self, b: &mut FnBuilder, bf: &BufForm, key0: &I32, slot: &SlotRef) {
         assert_eq!(slot.sh.name, self.sh.name, "DmaPart: slot of another buffer");
