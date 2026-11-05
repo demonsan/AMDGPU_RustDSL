@@ -437,7 +437,7 @@ fail_wrong_fragment_width                   pass_sequence（通过对照）
 
 ```bash
 bash tools/container/cargo.sh test -p amdgpu-compiler --test rust_safety -- --nocapture   # 4 项 + panic 面
-bash tools/container/cargo.sh test -p amdgpu-compiler --test safeasm | grep forbids      # safe-asm 无 unsafe
+bash tools/container/cargo.sh test -p amdgpu-kernels --test safeasm | grep forbids      # safe-asm 无 unsafe
 bash tools/container/cargo.sh test -p amdgpu-compiler --test compile_fail                # 29 个 ui 用例
 bash tools/container/cargo.sh test                                                       # 82 targets / 362 tests
 ```

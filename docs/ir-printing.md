@@ -84,7 +84,7 @@ spelling and rewrites `ValueId(n)`/`VarId(n)`; adding a new op does not require 
 3. The DSL printer emits header/contract/tiles/body and typed `%vN: <ty> = ...` lines.
 4. MIR printing shows blocks, virtual classes, and physical `vN`/`sN` registers after RA.
 
-Run: `cargo test -p amdgpu-compiler --test ir_print`.
+Run: `cargo test -p amdgpu-kernels --test ir_print`.
 
 ## Limitations
 
