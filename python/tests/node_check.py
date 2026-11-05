@@ -122,9 +122,10 @@ CHILD = r"""
 import sys, time, json, os
 sys.path.insert(0, os.path.join(sys.argv[1], "python"))
 import amdgpu_jit as aj
+th = time.perf_counter(); aj.hip.free(aj.hip.malloc(16)); t_hip = time.perf_counter() - th   # HIP runtime initialisation (not JIT cost)
 t0 = time.perf_counter(); k = aj.get_kernel("gemm_mxfp8_bs_v4", {"m": 1024, "n": 1024, "k": 2048}); t1 = time.perf_counter()
 k2 = aj.get_kernel("gemm_mxfp8_bs_v4", {"m": 1024, "n": 1024, "k": 2048}); t2 = time.perf_counter()
-print(json.dumps({"first": t1 - t0, "second": t2 - t1, "stats": aj.stats}))
+print(json.dumps({"first": t1 - t0, "second": t2 - t1, "hip_init": t_hip, "stats": aj.stats}))
 """
 
 
@@ -140,9 +141,9 @@ def cache_behaviour():
         runs.append(json.loads(r.stdout.strip().splitlines()[-1]))
     cold, warm = runs
     ok = cold["stats"]["compiles"] == 1 and warm["stats"]["compiles"] == 0 and warm["stats"]["disk_hits"] == 1 and cold["stats"]["memory_hits"] == 1
-    entries = [e for e in os.listdir(d) if not e.startswith(".")]
+    entries = [e for e in os.listdir(d) if not e.startswith(".") and os.path.isdir(os.path.join(d, e))]
     result("cache miss -> disk hit -> memory hit", ok and len(entries) == 1,
-           f"cold first call {cold['first']:.2f} s (compile), new process first call {warm['first'] * 1e3:.1f} ms (disk), in-process {cold['second'] * 1e6:.0f} us; "
+           f"cold first call {cold['first']:.2f} s (compile), new process first call {warm['first'] * 1e3:.1f} ms (disk; HIP init {warm['hip_init'] * 1e3:.0f} ms before it), in-process {cold['second'] * 1e6:.0f} us; "
            f"entries {len(entries)}")
     shutil.rmtree(d, ignore_errors=True)
 
