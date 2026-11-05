@@ -44,7 +44,7 @@ GPU 上“数据好了”被混成一句话，实际是四件互相独立的事�
 | `GV-TILE-STALE` | `GV-PROTO-NOT-VISIBLE` | 全局：未 release / 读发生在 acquire 之前 |
 | `GV-TILE-STALE` | `GV-PROTO-STALE-GEN` | 最新已发布版本 ≠ 期望版本 |
 | `GV-TILE-RACE` | `GV-PROTO-RACE` | 读窗口与别代写窗口相交；不同 wave 并发写不同代 |
-| `GV-TILE-PENDING` | `GV-PROTO-NO-COMPLETION` | 读未在下一个 barrier 前完成（Warn） |
+| `GV-TILE-PENDING` | `GV-PROTO-NO-COMPLETION` | 读跨过 barrier 且之后没有收尾的 `wait_lds(0)`（Warn）；有收尾等待时，读的生命周期 `[发出, 收尾]` 参与竞争检查 |
 | `GV-TILE-INDEX` | `GV-PROTO-STALE-GEN` | 槽/代不是循环计数器的编译期函数 |
 | `GV-BAR` | `GV-PROTO-ARRIVAL-MISMATCH` | 到达计数不一致 |
 | `GV-TILE-UNROLL-LIMIT`、`GV-TILE-UNSUPPORTED` | `GV-PROTO-UNROLL-LIMIT` | 周期/展开闸门；循环内运行时 if 等无法建模 |
