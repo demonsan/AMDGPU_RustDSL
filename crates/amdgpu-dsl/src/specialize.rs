@@ -128,6 +128,7 @@ pub fn check(f: &Function, binds: &[(String, String)]) -> Result<Vec<(String, u3
 /// The specialized kernel (same name / ABI).
 /// The facts the bindings determine: the bound kernargs, the kernargs a `ka_is` relation then fixes (derived), and the free symbols a
 /// relation `ka == c * sym` / `ka == sym` then fixes (with the divisibility and range checks of the contract).
+#[derive(Debug)]
 pub struct Closed {
     pub ka: HashMap<u32, i64>,
     pub derived: Vec<(u32, i64)>,
