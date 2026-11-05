@@ -14,11 +14,89 @@ fn usage() {
     eprintln!("  amdc list");
     eprintln!("  amdc dump <kernel>");
     eprintln!("  amdc print-ir <kernel> [--stage dsl|mir|mir-ra]");
-    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld]");
+    eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
+    eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
+    eprintln!("  amdc jit-info <kernel> [--specialize name=value[,..]] [--backend ..]   JSON metadata for the Python JIT (docs/jit.md)");
+    eprintln!("  amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict] [--specialize ..]");
     eprintln!("      --backend llvm-tail runs the pinned llc tail (ROCM_LLVM_BIN overrides the tool dir);");
     eprintln!("      --mir-out writes the exported post-RA MIR only (no llc needed) and exits.");
     eprintln!("  amdc gen-host <kernel>|--shipped [--out <dir>]   generate C++ ABI/validate/launch header + JSON metadata");
     eprintln!("  amdc backend probe|check|write-lock   version probe / verify / rewrite backend.lock");
+}
+
+/// The `--specialize` bindings of the command line (`--specialize a=1,b=2` or `--specialize=a=1`, repeatable).
+fn spec_bindings(args: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut s: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--specialize" {
+            s.push(args.get(i + 1).cloned().ok_or("--specialize needs name=value[,..]")?);
+            i += 2;
+        } else if let Some(v) = args[i].strip_prefix("--specialize=") {
+            s.push(v.to_string());
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    amdgpu_dsl::specialize::parse_bindings(&s.join(","))
+}
+
+/// The kernel `name`, specialized by the command line's bindings (exit code 2 on a bad binding).
+fn kernel_spec(name: &str, args: &[String]) -> Result<(amdgpu_dsl::Function, Vec<(String, u32, amdgpu_dsl::specialize::SpecValue)>), ExitCode> {
+    let Some(f) = amdgpu_kernels::kernel_by_name(name) else {
+        eprintln!("unknown kernel: {name}");
+        return Err(ExitCode::from(2));
+    };
+    let binds = match spec_bindings(args) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(ExitCode::from(2));
+        }
+    };
+    if binds.is_empty() {
+        return Ok((f, Vec::new()));
+    }
+    let vals = match amdgpu_dsl::specialize::check(&f, &binds) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(ExitCode::from(2));
+        }
+    };
+    match amdgpu_dsl::specialize::specialize(&f, &binds) {
+        Ok(g) => Ok((g, vals)),
+        Err(e) => {
+            eprintln!("{e}");
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// The strict certificate of a specialized kernel (stderr); Err when it does not verify.
+fn certify_specialized(f: &amdgpu_dsl::Function) -> Result<(), ExitCode> {
+    match amdgpu_compiler::gpu_verify::analyse(f) {
+        Ok(r) => {
+            let l = r.ledger();
+            let c = &f.contract;
+            let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.sym_ranges.len();
+            let errs = r.errors();
+            eprintln!("specialized {}: certificate: {} trusted assumes, {contracts} trusted contracts, {} unproven", f.name, l.total(), errs.len());
+            if errs.is_empty() {
+                Ok(())
+            } else {
+                for e in errs {
+                    eprintln!("  [{}] {}", e.code, e.msg);
+                }
+                Err(ExitCode::from(1))
+            }
+        }
+        Err(e) => {
+            eprintln!("compile error:\n{e}");
+            Err(ExitCode::from(1))
+        }
+    }
 }
 
 fn backend_cmd(args: &[String]) -> ExitCode {
@@ -211,9 +289,9 @@ fn main() -> ExitCode {
             let mut bad = false;
             let (mut tot_trusted, mut tot_contracts, mut tot_unproven) = (0usize, 0usize, 0usize);
             for name in names {
-                let Some(f) = amdgpu_kernels::kernel_by_name(&name) else {
-                    eprintln!("unknown kernel: {name}");
-                    return ExitCode::from(2);
+                let (f, _) = match kernel_spec(&name, &args) {
+                    Ok(x) => x,
+                    Err(c) => return c,
                 };
                 match amdgpu_compiler::gpu_verify::analyse(&f) {
                     Ok(r) => {
@@ -343,15 +421,51 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "jit-info" => {
+            let Some(name) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let (f, spec) = match kernel_spec(name, &args) {
+                Ok(x) => x,
+                Err(c) => return c,
+            };
+            if !spec.is_empty() {
+                if let Err(c) = certify_specialized(&f) {
+                    return c;
+                }
+            }
+            let req = args.windows(2).find(|w| w[0] == "--backend").map(|w| w[1].clone()).or_else(|| args.iter().find_map(|a| a.strip_prefix("--backend=").map(|s| s.to_string()))).unwrap_or_else(|| "auto".to_string());
+            let (resolved, _) = amdgpu_compiler::resolve_backend(&req, &f);
+            let Some(tail) = backend::backend_by_name(&resolved) else {
+                eprintln!("unknown backend: {resolved} (own | llvm-tail | auto)");
+                return ExitCode::from(2);
+            };
+            match amdgpu_compiler::compile_with(&f, tail.as_ref()) {
+                Ok(c) => {
+                    println!("{}", amdc::jit::info_json(&f, &spec, tail.name(), amdc::jit::resources(&c.asm)));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("compile error:\n{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         "emit" => {
             let Some(name) = args.get(1) else {
                 usage();
                 return ExitCode::from(2);
             };
-            let Some(f) = amdgpu_kernels::kernel_by_name(name) else {
-                eprintln!("unknown kernel: {name}");
-                return ExitCode::from(2);
+            let (f, spec) = match kernel_spec(name, &args) {
+                Ok(x) => x,
+                Err(c) => return c,
             };
+            if !spec.is_empty() {
+                if let Err(c) = certify_specialized(&f) {
+                    return c;
+                }
+            }
             for w in amdgpu_dsl::lint(&f) {
                 eprintln!("warning: {name}: {w}");
             }
@@ -377,6 +491,8 @@ fn main() -> ExitCode {
                     i += 1;
                 } else if args[i] == "--backend" {
                     backend_name = args.get(i + 1).cloned().unwrap_or_default();
+                    i += 2;
+                } else if args[i] == "--specialize" {
                     i += 2;
                 } else {
                     i += 1;

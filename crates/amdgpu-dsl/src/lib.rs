@@ -2923,6 +2923,7 @@ pub fn verify(f: &Function) -> Vec<String> {
 /// Kernel definitions built with this DSL.
 pub mod expr;
 pub mod print;
+pub mod specialize;
 pub use expr::{ev, ox, varx};
 pub use expr::{Cond, Ptr, F32, I32};
 
