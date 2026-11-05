@@ -27,7 +27,6 @@ _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 _lock = threading.Lock()
 _modules = {}  # key -> Kernel
 _fast = {}  # (kernel, spec items, backend, arch, cache flag) -> Kernel: the per-call lookup (no stat / hashing once loaded)
-_file_hash = {}  # (path, size, mtime) -> sha256
 stats = {"memory_hits": 0, "disk_hits": 0, "compiles": 0, "compile_seconds": 0.0}
 
 
@@ -75,27 +74,60 @@ def backend():
     return os.environ.get("AMDGPU_JIT_BACKEND", "own")
 
 
-def _hash_file(path):
+_FP = None
+
+
+def _fingerprints():
+    """Persistent toolchain fingerprints (<cache>/toolchain.json: file hash / clang version keyed by path, size and mtime), so a fresh process
+    does not re-hash the amdc binary or re-run clang --version."""
+    global _FP
+    if _FP is None:
+        try:
+            with open(os.path.join(cache_dir(), "toolchain.json")) as f:
+                _FP = json.load(f)
+        except (OSError, ValueError):
+            _FP = {}
+    return _FP
+
+
+def _fp_store():
+    try:
+        os.makedirs(cache_dir(), exist_ok=True)
+        tmp = os.path.join(cache_dir(), f".toolchain.{os.getpid()}.json")
+        with open(tmp, "w") as f:
+            json.dump(_FP, f, indent=1, sort_keys=True)
+        os.replace(tmp, os.path.join(cache_dir(), "toolchain.json"))
+    except OSError:
+        pass
+
+
+def _fp_key(kind, path):
     st = os.stat(path)
-    k = (path, st.st_size, st.st_mtime_ns)
-    h = _file_hash.get(k)
+    return f"{kind}:{path}:{st.st_size}:{st.st_mtime_ns}"
+
+
+def _hash_file(path):
+    k = _fp_key("sha256", path)
+    fp = _fingerprints()
+    h = fp.get(k)
     if h is None:
         d = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 d.update(chunk)
-        h = _file_hash[k] = d.hexdigest()[:16]
+        h = fp[k] = d.hexdigest()[:16]
+        _fp_store()
     return h
 
 
-_clang_ver = {}
-
-
 def _clang_version(clang):
-    v = _clang_ver.get(clang)
+    k = _fp_key("version", clang)
+    fp = _fingerprints()
+    v = fp.get(k)
     if v is None:
         out = subprocess.run([clang, "--version"], capture_output=True, text=True, check=True).stdout
-        v = _clang_ver[clang] = out.splitlines()[0].strip() if out else "unknown"
+        v = fp[k] = out.splitlines()[0].strip() if out else "unknown"
+        _fp_store()
     return v
 
 
