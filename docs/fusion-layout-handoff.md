@@ -18,8 +18,7 @@ how the MMA orientations are chosen to make it free, and (step 3, pending region
 | Half | lane `t` or `t ^ 32` | today the LDS round trip (`v_permlane32_swap` not exposed by the DSL) | — |
 | CrossLane | anything else | wave-private LDS round trip: write at `4 (64 v + t)`, read at `base(r') XOR lin(lane bits)` | 2 · regs + 1 |
 
-When the thread and value counts are powers of two, `ConvPlan::gf2` holds the GF(2) matrix of the slot-index bits. `bit_moves()` then names
-the moved bits, e.g. `lane bit 5 -> value bit 0`.
+When the thread and value counts are powers of two, `ConvPlan::gf2` holds the GF(2) matrix of the slot-index bits (column i = the destination slot bits of source bit i).
 
 **Build-time proofs.** The quad lowering is simulated on element ids and compared with the plan (`simulate_quad`). For the LDS round trip,
 the XOR-linear read address is derived from the plan and checked for all 64 lanes.

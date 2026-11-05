@@ -77,8 +77,8 @@ DSL 层只是构造数据。
 
 ```rust
 // crates/amdgpu-dsl/src/lib.rs：frag / lane 访问
-let s0 = b.frag16_build(&lanes);            // 16 个 dword 的 fragment
-let lane = b.frag16_lane(s0, 3);            // 常量下标，越界是编译错误
+let s0 = b.mfma_scale_fp8(a, bfr, acc, sa, sb); // 16 个 dword 的 fragment（Frag16）
+let lane = b.frag16_lane(s0, 3);                // 常量下标，越界是编译错误
 // const 检查（crates/amdgpu-safeasm/src/seq.rs:527）
 const OK: () = assert!(I < N, "view index out of range for this register tuple");
 ```
@@ -362,7 +362,7 @@ s.pin();                    // 该序列被调度器视作屏障：不重排、�
 
 ```rust
 // DSL 侧：把 AsmBlock 作为一条 Stmt 嵌入
-b.var_asm(vars, AsmBlock)         // 或 Op::Asm（单值形式）
+b.var_asm_n(&vars, AsmBlock, &inputs)   // 或 Op::Asm（单值形式）
 // 编译器侧：lower_asm → MIR → 既有 verifier + hazard pass + pin_check 全部再跑一遍
 ```
 

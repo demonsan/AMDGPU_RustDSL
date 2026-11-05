@@ -22,7 +22,7 @@ The aiter 4-wave GEMM (244 arch + 212 AGPR, one wave per SIMD) needs it; this pa
   to an AGPR are rejected. `mir::verify` and `gpu_verify` (GV-REG-ALIGN/LIMIT/CLASS/MFMA-FILE, unified budget) enforce the rules on the final MIR.
 
 ## DSL
-`b.pin_agpr(var)`, `b.pin_agpr_at(var, base)` (loop variables), `b.agpr(value)`, `b.agpr_at(value, base)` (loads, MFMA results, fragments). In-place MFMA accumulation on a pinned
+`b.pin_agpr(var)`, `b.pin_agpr_at(var, base)` (loop variables), `b.agpr(value)` (loads, MFMA results, fragments). In-place MFMA accumulation on a pinned
 variable is the acc_cd form. MFMA fragment operands may be loop variables (`Opnd::Var`).
 **In-place reload**: `b.set_var(av, b.load_lds_b128x2(lo, hi))` (and `load_lds_b128`) is coalesced into the variable when the load is the value's only use and nothing reads the variable after the
 first `ds_read` was issued: the `ds_read_b128`s write the variable's own registers (no `v_accvgpr_mov`, no second fragment). Programs must put the reload after the variable's last read.

@@ -706,7 +706,7 @@ DSL 也能嵌入一段"手写汇编"，但手写部分同样是**安全 Rust**�
 if smfv && fmha_t_opt("safeasm") {
     // the same four in-place SMFMACs, authored in safe Rust (crates/amdgpu-safeasm) and embedded through Stmt::VarAsm
     use amdgpu_safeasm::examples::rowsum_var_block;
-    b.var_asm(la, rowsum_var_block(), &[Opnd::Val(a_rs), Opnd::Val(pa), Opnd::Val(pb), Opnd::Val(idx01), Opnd::Val(idx23)]);
+    b.var_asm_n(&[la], rowsum_var_block(), &[Opnd::Val(a_rs), Opnd::Val(pa), Opnd::Val(pb), Opnd::Val(idx01), Opnd::Val(idx23)]);
     return;
 }
 
@@ -736,7 +736,7 @@ pub fn rowsum_var_block() -> AsmBlock {
 - `Ready<'a, N>` 内含 `PhantomData<&'a ()>`（`regs.rs:85-88`），只要在途的 `Mfma<'a, …>` 还活着，操作数的共享借用就在，
   **任何覆盖操作数的 `&mut` 都被借用检查器拒绝**（E0502）。
 - `Pending<T>` **拥有**目的寄存器（`seq.rs:53-63`）：`wait` 之前寄存器已"被移走"，读它就是 E0382；`wait` 消费 token，等两次也是 E0382。
-- 编译器再验一次：`var_asm` 的端口类型由 IR 验证器核对，块内容 lowering 后照常跑 hazard/wait/`pin_check`。
+- 编译器再验一次：`var_asm_n` 的端口类型由 IR 验证器核对，块内容 lowering 后照常跑 hazard/wait/`pin_check`。
 
 **如果写错了会怎样**：见 §4 的 E0382 / E0308 / E0502 / E0080 示例。另外请记住：
 **safe-asm 块内部的访存不在 `gpu_verify` 的越界证明范围内**（报告里会有 `GV-ASM` Info），这是诚实清单里的一项。

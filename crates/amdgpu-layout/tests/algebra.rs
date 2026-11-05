@@ -72,7 +72,7 @@ fn inverses() {
 fn products_and_divides_are_consistent() {
     let a = make_layout(tup![2, 2], tup![1, 2]);
     let b = make_layout(tup![3, 2], tup![1, 3]);
-    for p in [blocked_product(&a, &b), raked_product(&a, &b), flat_product(&a, &b)] {
+    for p in [blocked_product(&a, &b), raked_product(&a, &b)] {
         let n = p.size().st();
         assert_eq!(n, 24);
         let mut seen = vec![false; 24];
@@ -90,10 +90,6 @@ fn products_and_divides_are_consistent() {
     let z = zipped_divide_bymode(&make_layout(tup![8, 6], tup![1, 8]), &tiler(&[4, 3]), &Dyns::new());
     assert_eq!(z.get(0).size(), Ix::C(12));
     assert_eq!(z.get(1).size(), Ix::C(4));
-    let td = tiled_divide_bymode(&make_layout(tup![8, 6], tup![1, 8]), &tiler(&[4, 3]), &Dyns::new());
-    assert_eq!(td.rank(), 3);
-    let fd = flat_divide_bymode(&make_layout(tup![8, 6], tup![1, 8]), &tiler(&[4, 3]), &Dyns::new());
-    assert_eq!(fd.rank(), 4);
 }
 
 #[test]

@@ -3,8 +3,8 @@
 ## DSL surface (all additive; own backend and both LLVM dialects)
 | DSL | MOp | assembly (gfx950) |
 |---|---|---|
-| `b.store_f32_wt(base, off, v)` / `b.store_f32x4_wt(base, off, frag4)` | `GlobalStoreF32Sc1` / `GlobalStoreF32x4Sc1` | `global_store_dword[x4] ... sc1` (device-scope write-through) |
-| `b.load_f32_coherent(base, off)` / `b.load_b128_coherent(base, off)` | `GlobalLoadF32Sc1` / `GlobalLoadB128Sc1` | `global_load_dword[x4] ... sc1` (device scope: bypasses non-coherent levels) |
+| `b.store_f32_wt(base, off, v)` | `GlobalStoreF32Sc1` | `global_store_dword ... sc1` (device-scope write-through) |
+| `b.load_f32_coherent(base, off)` | `GlobalLoadF32Sc1` | `global_load_dword ... sc1` (device scope: bypasses non-coherent levels) |
 | `b.atomic_add_u32(base, off, v) -> u32` | `GlobalAtomicAddRet` | `global_atomic_add vOLD, vaddr, vdata, off sc0` (sc0 = return pre-op value, sc1=0 = device scope) |
 | `b.fence_release()` / `b.fence_release_lite()` | `SWaitVm 0; SWaitLgkm 0; BufferWbl2; SWaitVm 0` / `SWaitVm 0; SWaitLgkm 0` | `s_waitcnt vmcnt(0)`, `s_waitcnt lgkmcnt(0)`, `buffer_wbl2 sc1`, `s_waitcnt vmcnt(0)` |
 | `b.fence_acquire()` / `b.fence_acquire_lite()` | `SWaitVm 0; BufferInv` / `SWaitVm 0` | `s_waitcnt vmcnt(0)`, `buffer_inv sc1` |

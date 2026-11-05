@@ -90,12 +90,12 @@ pub enum IxExpr { C(i64), Sym(DynId), Add(..), Mul(..), Div(..), Mod(..), Xor(..
 
 | 类别 | API | 备注 |
 |---|---|---|
-| 构造 | `make_shape`、`make_stride`、`make_layout(shape, stride)`、`make_ordered_layout(shape, order)`、`make_identity_layout`、`make_coord` | |
+| 构造 | `make_shape`、`make_stride`、`make_layout(shape, stride)`、`make_ordered_layout(shape, order)`、`make_coord` | |
 | 映射 | `crd2idx(crd, L) -> IxExpr`、`idx2crd(idx, L)` | 静态输入 → 常数；动态 → IxExpr |
 | 查询 | `size`、`cosize`、`rank`、`depth`、`get(i)`、`get_shape/get_stride` | `cosize` 生成合同里的分配大小 |
 | 代数 | `composition(A, B)`、`complement(L, n)`、`coalesce`、`right_inverse`、`left_inverse` | `right_inverse` 用于"值 → 线程"反查（谓词、epilogue 写回） |
-| 乘积 | `logical_product`、`zipped_product`、`tiled_product`、`flat_product`、`raked_product`、`blocked_product` | |
-| 除法 | `logical_divide`、`zipped_divide`、`tiled_divide`、`flat_divide`、`local_tile(T, tiler, coord)`、`local_partition` | `local_tile` = `zipped_divide` + 取 rest 坐标（cute-rs 名） |
+| 乘积 | `logical_product`、`raked_product`、`blocked_product` | （`zipped/tiled/flat_product` 无使用者，2026-11 删除） |
+| 除法 | `logical_divide`、`logical_divide_bymode`、`zipped_divide_bymode`、`local_tile(T, tiler, coord)`、`local_partition` | `local_tile` = `zipped_divide_bymode` + 取 rest 坐标（cute-rs 名）；无使用者的 `zipped/tiled/flat_divide` 变体已删除 |
 | 结构 | `select`、`group(b, e)`、`append`、`prepend`、`slice(L, crd)`（`None` 占位 = `_`）、`dice` | |
 | 宽度 | `recast_layout(L, old_bits, new_bits)` | fp8(8) / f16,bf16(16) / f32(32) / dword 打包；MFMA 的 fp8 操作数按字节布局、按 dword 寄存器发射 |
 | IntTuple 算术 | `add/sub/mul/div/ceil_div/product/product_each` | |
