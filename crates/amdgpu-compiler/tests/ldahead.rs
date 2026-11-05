@@ -78,7 +78,7 @@ fn reads_keep_their_relative_order_and_each_reaches_its_distance() {
 #[test]
 fn ldahead32_moves_only_the_32_bit_scale_reads() {
     let b32 = |d: u32| MInst::new(MOp::LdsReadB32).def(28 + d).srcreg(19).imm((d * 4) as i64);
-    let user32 = |d: u32| MInst::new(MOp::VMovB32).def(36 + d).srcreg(28 + d);
+    let user32 = |d: u32| MInst::new(MOp::VMovB32).def(32 + d).srcreg(28 + d);
     let src = vec![mfma(0), mfma(1), mfma(2), mfma(3), b32(0), user32(0), read(0), user(0)];
     let mut m = mk(src);
     let o = Options { verify: true, ldahead32: 2, ..Options::default() };
