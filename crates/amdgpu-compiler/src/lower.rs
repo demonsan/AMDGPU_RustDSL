@@ -202,6 +202,8 @@ struct Lowerer {
     defs: HashMap<ValueId, Op>,
     /// How many times each value is used as an operand anywhere in the function.
     use_counts: HashMap<ValueId, usize>,
+    /// every operand use of every value (`amdgpu_dsl::stmt_operands`: exhaustive), for rewrites that must see all uses (`var_set_lane`)
+    exact_uses: HashMap<ValueId, usize>,
     /// Cache of sub-register views: (tuple, dword offset, class) -> alias vreg.
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
@@ -310,6 +312,17 @@ impl Lowerer {
             next_label: 1,
             defs,
             use_counts,
+            exact_uses: {
+                let mut m: HashMap<ValueId, usize> = HashMap::new();
+                for st in f.stmts() {
+                    for o in amdgpu_dsl::stmt_operands(st) {
+                        if let Opnd::Val(v) = o {
+                            *m.entry(v).or_insert(0) += 1;
+                        }
+                    }
+                }
+                m
+            },
             alias_cache: HashMap::new(),
             else_started: HashSet::new(),
             agpr_marks: f.agpr.clone(),
@@ -1662,9 +1675,9 @@ impl Lowerer {
                     if let Opnd::Val(x) = value {
                         let is_const = matches!(self.defs.get(x), Some(Op::ConstI32(_) | Op::ConstF32(_)));
                         if std::env::var("FMHA_ABLATE").map_or(false, |v| v.contains("setlanedebug")) {
-                            eprintln!("set_lane v{x}: const {is_const} uses {:?} lowered {:?}", self.use_counts.get(x), self.val.get(x));
+                            eprintln!("set_lane v{x}: const {is_const} uses {:?} lowered {:?}", self.exact_uses.get(x), self.val.get(x));
                         }
-                        if let (false, Some(1), Some(&r)) = (is_const, self.use_counts.get(x).copied(), self.val.get(x)) {
+                        if let (false, Some(1), Some(&r)) = (is_const, self.exact_uses.get(x).copied(), self.val.get(x)) {
                             let cur = self.cur;
                             let plain = self.mir.vreg_class(r) == RClass::V1 && !self.mir.alias.contains_key(&r) && !self.mir.alias.values().any(|(t, _)| *t == r);
                             let def_here = self.mir.blocks[cur].insts.iter().any(|i| i.dst == Some(r))
