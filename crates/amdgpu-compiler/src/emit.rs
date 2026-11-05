@@ -635,17 +635,10 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
             if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
         )],
         MOp::GlobalLoadF32Sc1 => vec![format!("global_load_dword {}, {} sc1", d(a), mem_op(a, inst.srcs[0], inst.imm))],
-        MOp::GlobalLoadB128Sc1 => vec![format!("global_load_dwordx4 {}, {} sc1", tuple(a, inst.dst.expect("dst"), 4), mem_op(a, inst.srcs[0], inst.imm))],
         MOp::GlobalStoreF32Sc1 => vec![format!(
             "global_store_dword {}, {}, off{} sc1",
             pair(a, reg_of(&inst.srcs[0])),
             vr(a, reg_of(&inst.srcs[1])),
-            if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
-        )],
-        MOp::GlobalStoreF32x4Sc1 => vec![format!(
-            "global_store_dwordx4 {}, {}, off{} sc1",
-            pair(a, reg_of(&inst.srcs[0])),
-            tuple(a, reg_of(&inst.srcs[1]), 4),
             if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
         )],
         MOp::GlobalAtomicAddRet => vec![format!(

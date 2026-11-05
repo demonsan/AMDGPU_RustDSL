@@ -355,9 +355,7 @@ pub const ALL: &[MOp] = &[
     MOp::GlobalStoreF32x4,
     MOp::GlobalStoreF32x2,
     MOp::GlobalLoadF32Sc1,
-    MOp::GlobalLoadB128Sc1,
     MOp::GlobalStoreF32Sc1,
-    MOp::GlobalStoreF32x4Sc1,
     MOp::GlobalAtomicAddRet,
     MOp::BufferWbl2,
     MOp::BufferInv,
@@ -517,9 +515,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         GlobalStoreF32x4 => a("global_store_dwordx4", st).mem(G, true, Src(0), 16).wide_store(1).agpr(false, 0b10),
         GlobalStoreF32x2 => a("global_store_dwordx2", st).mem(G, true, Src(0), 8).agpr(false, 0b10),
         GlobalLoadF32Sc1 => a("global_load_dword", c(Vmem, 4, 900, Unknown)).mem(G, false, Src(0), 4).agpr(true, 0),
-        GlobalLoadB128Sc1 => a("global_load_dwordx4", c(Vmem, 14, 900, Unknown)).mem(G, false, Src(0), 16).agpr(true, 0),
         GlobalStoreF32Sc1 => a("global_store_dword", st).mem(G, true, Src(0), 4).agpr(false, 0b10),
-        GlobalStoreF32x4Sc1 => a("global_store_dwordx4", st).mem(G, true, Src(0), 16).wide_store(1).agpr(false, 0b10),
         // read-modify-write with a result: a global access (vmcnt queue entry whose destination is the old value)
         GlobalAtomicAddRet => a("global_atomic_add", c(Vmem, 8, 900, Unknown)).mem(G, true, Src(0), 4).backend(Backend::OwnOnlyIfNoRows),
         // cache maintenance: ordered against every memory access, never reordered
