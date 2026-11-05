@@ -22935,6 +22935,7 @@ pub fn probe_mfma_scale_opsel() -> Function {
     let one = b.c_i32(1);
     let ones = b.c_i32(0x3838_3838);
     let a8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
+    let b8 = b.frag8(ones, ones, ones, ones, ones, ones, ones, ones);
     // scale A bytes [127, 128, 129, 126], scale B bytes [127, 126, 128, 129]
     let sa = b.c_i32(0x7E81_807Fu32 as i32);
     let sb = b.c_i32(0x8180_7E7Fu32 as i32);
@@ -22942,7 +22943,7 @@ pub fn probe_mfma_scale_opsel() -> Function {
     for (k, (ba, bb)) in [(0u8, 0u8), (1, 2), (3, 1), (2, 3)].into_iter().enumerate() {
         let z = b.frag_zero(DType::Frag16);
         let vars = b.begin_loop(&[(DType::Frag16, Opnd::Val(z))]);
-        b.var_mfma_scale_sel(vars[0], a8, a8, sa, sb, ba, bb);
+        b.var_mfma_scale_sel(vars[0], a8, b8, sa, sb, ba, bb);
         let stop = b.cmp_lt_i32(zero, one);
         b.break_if(Opnd::Val(stop));
         b.end_loop();
