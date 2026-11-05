@@ -127,7 +127,7 @@ def fmha_fwd_mxfp8(q, k, v, q_scale, k_scale, v_scale, out, *, path="auto", spli
             "s_gqa": gqa, "s_k_Seqs": HK * D, "s_k_Hs": D, "s_k_Bs": SK * HK * D, "s_kv_seq_len": SK, "s_q_head_num": H, "s_v_Seqs": HK * D,
             "s_v_Hs": D, "s_v_Bs": SK * HK * D, "s_o_Seqs": H * D * 2, "s_o_Hs": D * 2, "s_o_Bs": S * H * D * 2, "ptr_q_descale": rqs.ptr,
             "ptr_k_descale": rks.ptr, "ptr_v_descale": rvs.ptr, "s_descale_q_Bs": S * H * 4, "s_descale_q_Hs": 4, "s_descale_k_Bs": SK * HK * 4,
-            "s_descale_k_Hs": 4}
+            "s_descale_k_Hs": 4, "abi_tail": 0}
     sizes = {"ptr_o": ro.cap, "ptr_q": rq.cap, "ptr_k": rk.cap, "ptr_v": rv.cap, "ptr_q_descale": rqs.cap, "ptr_k_descale": rks.cap, "ptr_v_descale": rvs.cap}
     syms = {"HK": HK, "B": B}
     shape_spec = {"s_seq_len": S, "s_kv_seq_len": SK, "s_q_head_num": H, "s_gqa": gqa}
