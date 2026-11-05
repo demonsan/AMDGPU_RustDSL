@@ -542,7 +542,7 @@ pub struct Vs128Cfg {
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: false })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false, vlate: false, rows2: true })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -597,11 +597,11 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
-    fmha_kvsplit_cfg("fmha_fwd_hd128_mxfp8_v3_kvsplit", false)
+    fmha_kvsplit_cfg("fmha_fwd_hd128_mxfp8_v3_kvsplit", false, false)
 }
 
-/// `scaleconv`: the fast reference path (`Vs128Cfg::scaleconv`) in the long-sequence copy.
-pub fn fmha_kvsplit_cfg(name: &str, scaleconv: bool) -> Function {
+/// `scaleconv`: the fast reference path (`Vs128Cfg::scaleconv`) in the long-sequence copy; `rows2`: the two-smfmac row sums.
+pub fn fmha_kvsplit_cfg(name: &str, scaleconv: bool, rows2: bool) -> Function {
     let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::KvSplit);
     let b = &mut fb;
@@ -616,6 +616,10 @@ pub fn fmha_kvsplit_cfg(name: &str, scaleconv: bool) -> Function {
             let wid = roles.wave_id(b, role);
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
             body.scaleconv = scaleconv && !lut;
+            if rows2 {
+                let p = crate::rowsum::plan();
+                body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
+            }
             pipe.run(b, role, &mut body);
             let fin = body.out_scale(b);
             let l = body.sm.l_total(b);
@@ -634,11 +638,11 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h() -> Function {
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
-    fmha_t128_cfg("fmha_fwd_hd128_mxfp8_v3_t128", false)
+    fmha_t128_cfg("fmha_fwd_hd128_mxfp8_v3_t128", false, false)
 }
 
-/// `scaleconv`: the fast reference path in the long-sequence copy.
-pub fn fmha_t128_cfg(name: &str, scaleconv: bool) -> Function {
+/// `scaleconv`: the fast reference path in the long-sequence copy; `rows2`: the two-smfmac row sums.
+pub fn fmha_t128_cfg(name: &str, scaleconv: bool, rows2: bool) -> Function {
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::T128);
     let b = &mut fb;
@@ -652,6 +656,10 @@ pub fn fmha_t128_cfg(name: &str, scaleconv: bool) -> Function {
     versioned(b, lut, |b, lut| {
         let mut body = AttnBody3::new(b, &ring, &blk, blk.lane.wave, lut);
         body.scaleconv = scaleconv && !lut;
+        if rows2 {
+            let p = crate::rowsum::plan();
+            body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);
+        }
         pipe.run(b, Role::All, &mut body);
         let fin = body.out_scale(b);
         store_out3(&io, b, &blk, &body.o.expect("O"), fin);
