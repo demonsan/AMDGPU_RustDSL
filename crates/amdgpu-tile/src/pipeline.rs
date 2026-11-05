@@ -270,6 +270,33 @@ impl Pipeline {
         };
         let stop = b.bind_cond(!varx(it).lt(&nkv_m1));
         b.break_if(stop);
+        if self.unroll2 && self.cadence == Cadence::TwoPhaseOffset {
+            // two tiles per pass with STATIC ring slots (0 then 1; the counter is even at the top): every slot offset is a constant
+            let i0 = self.iter_tpo(b, role, body, Opnd::Var(it), Opnd::I32(0), false, true, true);
+            let _ = i0;
+            let one = b.c_i32(1);
+            b.set_var(idx, one);
+            let mid = b.bind_i32(varx(it) + 1);
+            let stop1 = b.bind_cond(!ev(mid).lt(&nkv_m1));
+            b.break_if(stop1);
+            self.iter_tpo(b, role, body, Opnd::Val(mid), Opnd::I32(1), false, true, true);
+            let zero = b.c_i32(0);
+            b.set_var(idx, zero);
+            let it2 = b.bind_i32(varx(it) + 2);
+            b.set_var(it, it2);
+            let stop2 = b.bind_cond(!ev(it2).lt(&nkv_m1));
+            b.break_if(stop2);
+            b.end_loop();
+            let it_t = b.bind_i32(varx(it) + varx(idx));
+            let is_tail = b.bind_cond(ev(self.kv_len).lt((ev(it_t) << self.lg()) + self.tile_rows));
+            let last_barrier = role != Role::B;
+            b.begin_if(is_tail);
+            self.iter_tpo(b, role, body, Opnd::Val(it_t), Opnd::Var(idx), true, false, last_barrier);
+            b.else_();
+            self.iter_tpo(b, role, body, Opnd::Val(it_t), Opnd::Var(idx), false, false, last_barrier);
+            b.end_if();
+            return;
+        }
         if self.unroll2 && self.cadence == Cadence::RegStaged {
             // `it` steps by 2 per pass (an affine counter for the protocol model); `idx` = which half the loop left from (0: after the pass, 1:
             // between the halves) - the last tile is it + idx, in slot idx
@@ -358,6 +385,44 @@ impl Pipeline {
             body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
         }
         body.m_phase(b, role, &t);
+    }
+
+    /// One `TwoPhaseOffset` iteration of tile `it` (a value or the loop variable) in ring slot `slot` (a constant in the unrolled loop).
+    #[allow(clippy::too_many_arguments)]
+    fn iter_tpo(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: Opnd, masked: bool, staged: bool, last_barrier: bool) -> Opnd {
+        let other = match slot {
+            Opnd::I32(k) => Opnd::I32(1 - k),
+            o => b.bind_opnd(&(amdgpu_dsl::ox(o) ^ 1)),
+        };
+        let it_p1 = b.let_i32(amdgpu_dsl::ox(it) + 1);
+        let t = TileIt { it, cur: SlotIdx::new(slot, it), next: SlotIdx::new(other, b.bind_opnd(&it_p1)), n2: None, masked, staged, tile_rows: self.tile_rows };
+        self.prebind(b, &t);
+        let key_n = staged.then(|| {
+            if self.key_unclamped {
+                b.let_i32(&it_p1 << self.lg())
+            } else {
+                let nkv = ev(self.nkv);
+                b.let_i32(it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1) << self.lg())
+            }
+        });
+        if let Some(k) = &key_n {
+            body.stage(b, role, k, &t.next);
+        }
+        body.v_phase(b, role, &t);
+        if staged {
+            b.wait_vm(0);
+            body.stage_complete(b, role, &t.next);
+        }
+        if self.mid_lds_drain {
+            b.wait_lds(0);
+        }
+        b.barrier();
+        body.m_phase(b, role, &t);
+        b.wait_lds(0);
+        if last_barrier {
+            b.barrier();
+        }
+        other
     }
 
     /// One iteration; returns the next ring index.

@@ -103,7 +103,12 @@ impl LdsPart {
     pub fn at<'a>(&self, b: &mut FnBuilder, slot: &SlotRef<'a>) -> LdsSlotPart<'a> {
         assert_eq!(slot.sh.name, self.sh.name, "LdsPart::at: slot of another buffer");
         let off = slot.off_v(b);
-        let bases = if off.as_const() == Some(0) { self.bases.clone() } else { self.bases.iter().map(|x| b.let_i32(x + &off)).collect() };
+        if let Some(c) = off.as_const() {
+            // a static slot (unrolled ring): the offset goes into the instruction immediates, no per-tile base adds
+            let ops = self.ops.iter().map(|op| op.iter().map(|&(bi, imm)| (bi, imm + c as i64)).collect()).collect();
+            return LdsSlotPart { slot: slot.clone(), atom: self.atom, bases: self.bases.clone(), ops };
+        }
+        let bases = self.bases.iter().map(|x| b.let_i32(x + &off)).collect();
         LdsSlotPart { slot: slot.clone(), atom: self.atom, bases, ops: self.ops.clone() }
     }
     /// The partition in this wave's slice of a private region (`base + wave * size`, the address derived from the region's wave key).

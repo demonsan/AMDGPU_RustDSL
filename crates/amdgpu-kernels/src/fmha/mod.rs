@@ -362,11 +362,11 @@ impl PipeBody for AttnBody3<'_> {
 /// two-smfmac row sums (`amdgpu_tile::rowsum`), K-scale byte select, the vendor's reference recipe in the long-sequence copy (`OnlineSoftmax::set_vendor_ref`;
 /// the short copy keeps the exact LUT-corrected recipe: with < 9 tiles the lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", false, false, false)
+    fmha_vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", false, false, false, false)
 }
 
 /// `_vs128` under another name with the experiment switches (A/B builds).
-pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bool) -> Function {
+pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bool, unroll2: bool) -> Function {
     let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
@@ -383,6 +383,7 @@ pub fn fmha_vs128_named(name: &str, lazy_bias: bool, scalar_keys: bool, kbuf: bo
     pipe.scalar_keys = scalar_keys;
     pipe.scalar_exit = scalar_keys;
     pipe.key_unclamped = kbuf;
+    pipe.unroll2 = unroll2;
     let pipe = pipe;
     let lut = blk.lut_copy(b);
     versioned(b, lut, |b, lut| {
