@@ -18,7 +18,7 @@ for k in "${KS[@]}"; do
   v=$($A gpu-verify "$k" --strict 2>&1 | grep -E '^== ' | sed -E 's/proven.*//')
   echo "$k: md5 $(md5sum < build/ab/$k.s | cut -c1-12) $(grep -E '\.vgpr_count:' build/ab/$k.s | tr -s ' ') | $v"
 done
-run() { HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-5} REF_B=$1 REF_H=8 REF_S=$2 REF_SK=$2 REF_HK=8 REF_CO2=build/ab/$3.co REF_KNAME2=$3 REF_ROWS_PER_BLOCK=$RPB "${@:4}" ./build/ff/ref_host $V 2>&1; }
+run() { env HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-5} REF_B=$1 REF_H=8 REF_S=$2 REF_SK=$2 REF_HK=8 REF_CO2=build/ab/$3.co REF_KNAME2=$3 REF_ROWS_PER_BLOCK=$RPB "${@:4}" ./build/ff/ref_host $V 2>&1; }
 for s in "${SH[@]}"; do set -- $s
   for k in "${KS[@]}"; do echo "acc B$1 S$2 $k: $(run $1 $2 $k REF_ROWS=64 REF_WARMUP=2 REF_ITERS=2 | grep -E 'kernel +vs CPU: ' | sed -E 's/checked=[0-9]+ //;s/ max\|ref\|=[0-9.]+//;s/ kernel +vs CPU://;s/worst_err=[^ ]+ //' | tr '\n' ' ')"; done
 done
