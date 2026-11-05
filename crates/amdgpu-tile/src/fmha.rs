@@ -289,6 +289,11 @@ pub struct AttnBody3<'a> {
     pub seed_first: bool,
     /// `Vs128Cfg::scaleconv`
     pub scaleconv: bool,
+    /// `Vs128Cfg::vpre`: the first two V fragments of the PV group read at the end of the softmax phase (before the barrier)
+    pub vpre: bool,
+    /// `Vs128Cfg::pvlead`: the PV V reads kept one fragment ahead of their MFMA
+    pub pvlead: bool,
+    vpre_vals: Vec<ValueId>,
 }
 
 impl<'a> AttnBody3<'a> {
@@ -296,7 +301,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, scaleconv: false }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, seed_first: false, scaleconv: false, vpre: false, pvlead: false, vpre_vals: Vec::new() }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -333,17 +338,46 @@ impl<'a> AttnBody3<'a> {
         (0..4).filter_map(|s| self.qk_block(b, &out, bias, &k, &kd, s)).collect()
     }
     /// PV with the row sums first: per half hh and dim group e, the transposed V fragment then the scaled MFMA (fixed scales).
-    fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
+    fn pv(&mut self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
         let r = self.ring;
         let v = r.vpart.at(b, &r.vs.at(slot));
         let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])];
         self.sm.row_sum(b, p[0].v, p[1].v);
         let o = self.o.expect("O");
+        // the PV order (hh, e) and its V fragment index hh + 2 e
+        let order: Vec<(usize, usize)> = (0..2).flat_map(|hh| (0..4).map(move |e| (hh, e))).collect();
+        let pre = std::mem::take(&mut self.vpre_vals);
+        if self.pvlead || !pre.is_empty() {
+            let mut frags: Vec<Option<ValueId>> = vec![None; order.len()];
+            for (i, v0) in pre.iter().enumerate() {
+                frags[i] = Some(*v0);
+            }
+            let lead = if self.pvlead { 1 } else { 0 };
+            let mut next = pre.len();
+            for i in 0..order.len() {
+                while next < order.len() && next <= i + lead {
+                    let (hh, e) = order[next];
+                    frags[next] = Some(v.read(b, hh + 2 * e));
+                    next += 1;
+                }
+                let (hh, e) = order[i];
+                gemm(b, &r.mma, o.accs[e].var, frags[i].expect("V fragment"), p[hh].v, self.c127, self.c123, 0, 0);
+            }
+            return;
+        }
         for (hh, pf) in p.iter().enumerate() {
             for e in 0..4usize {
                 let vf = v.read(b, hh + 2 * e);
                 gemm(b, &r.mma, o.accs[e].var, vf, pf.v, self.c127, self.c123, 0, 0);
             }
+        }
+    }
+    /// `vpre`: read the first two PV V fragments of tile `t` now (end of the softmax phase).
+    fn vpre_reads(&mut self, b: &mut FnBuilder, t: &TileIt) {
+        if self.vpre {
+            let r = self.ring;
+            let v = r.vpart.at(b, &r.vs.at(&t.cur));
+            self.vpre_vals = vec![v.read(b, 0), v.read(b, 2)];
         }
     }
     pub fn out_scale(&self, b: &mut FnBuilder) -> ValueId {
@@ -389,6 +423,7 @@ impl PipeBody for AttnBody3<'_> {
             let (nb, sc) = self.sm.decide_scaled(b, &s, &o, mask.as_ref());
             self.p = self.sm.convert_scaled(b, &s, mask.as_ref(), 0, 4, sc);
             self.p.push(nb);
+            self.vpre_reads(b, t);
             return;
         }
         let nb = if self.seed_first {
@@ -399,6 +434,7 @@ impl PipeBody for AttnBody3<'_> {
         };
         self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
         self.p.push(nb);
+        self.vpre_reads(b, t);
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let mut w = std::mem::take(&mut self.p);
@@ -458,10 +494,14 @@ pub struct Vs128Cfg {
     pub scaleconv: bool,
     /// fast path: exact aligned rebase above this scaled max (1/512 units; default 0.45 x 512)
     pub hi512: Option<u32>,
+    /// vendor-shaped LDS read-ahead: the first two PV V fragments read before the barrier
+    pub vpre: bool,
+    /// PV V reads one fragment ahead of their MFMA
+    pub pvlead: bool,
 }
 
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None })
+    fmha_vs128_cfg("fmha_fwd_hd128_mxfp8_v3_vs128", Vs128Cfg { epi_lds: true, epi_perm: false, bufdma: true, setprio: true, kvpad: false, thr512: None, scaleconv: false, hi512: None, vpre: false, pvlead: false })
 }
 
 pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
@@ -484,6 +524,8 @@ pub fn fmha_vs128_cfg(name: &str, cfg: Vs128Cfg) -> Function {
             let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
             // the fast reference only in the long-sequence copy (the short copy keeps the LUT-corrected exact recipe)
             body.scaleconv = cfg.scaleconv && !lut;
+            body.vpre = cfg.vpre;
+            body.pvlead = cfg.pvlead;
             if let Some(h) = cfg.hi512 {
                 body.sm.set_hi_thr(h as f32 / 512.0);
             }
