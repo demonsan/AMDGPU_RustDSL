@@ -78,14 +78,14 @@ fn step(
     o: W4Opts,
     m: &AttnBody3,
     pv_slot: &SlotIdx,
-    pv_words: &[ValueId],
+    pv_p: [ValueId; 2],
     qk: Option<(&SlotIdx, Opnd)>,
     c: &AttnBody3,
     sv: &AccTile<C32x32F32, 4>,
     pvars: &[VarId],
     mask: Option<&KeyMask>,
 ) -> Vec<ValueId> {
-    m.pv(b, pv_slot, pv_words);
+    m.pv_frags(b, pv_slot, pv_p);
     let cs = c.s.expect("S");
     let co = c.o.expect("O");
     // the softmax operand: S itself (VGPR) or its working copy (S in AGPR)
@@ -119,6 +119,12 @@ fn step(
         }
         w
     }
+}
+
+/// The two P fragments straight from 16 word variables (no per-word copies).
+fn var_frags(b: &mut FnBuilder, vs: &[VarId]) -> [ValueId; 2] {
+    let o = |i: usize| Opnd::Var(vs[i]);
+    [b.frag8(o(0), o(1), o(2), o(3), o(4), o(5), o(6), o(7)), b.frag8(o(8), o(9), o(10), o(11), o(12), o(13), o(14), o(15))]
 }
 
 fn read_words(b: &mut FnBuilder, vs: &[VarId]) -> Vec<ValueId> {
@@ -262,15 +268,16 @@ pub fn v4w_named(name: &str) -> Function {
             KeyMask::new(b, &ti, blk0.g4, blk0.kv_len)
         });
         // ---- step 1: g1.PV(t-1) + g1.QK(t) || g0 softmax(t) ----
-        let w1 = read_words(b, &p1v);
-        let w0 = step(b, opts, &g1, &sl_tm1, &w1, Some((&sl_t, bias1)), &g0, &sv0, &p0v, mask.as_ref());
+        let f1 = var_frags(b, &p1v);
+        let w0 = step(b, opts, &g1, &sl_tm1, f1, Some((&sl_t, bias1)), &g0, &sv0, &p0v, mask.as_ref());
         // ---- step 2: g0.PV(t) + g0.QK(t+1) || g1 softmax(t) ----
         let qk0 = (!last).then_some((&sl_t1, bias0));
-        let _ = step(b, opts, &g0, &sl_t, &w0, qk0, &g1, &sv1, &p1v, mask.as_ref());
+        let f0 = [Frag::<B32x32x64Fp8>::from_words(b, &w0[0..8]).v, Frag::<B32x32x64Fp8>::from_words(b, &w0[8..16]).v];
+        let _ = step(b, opts, &g0, &sl_t, f0, qk0, &g1, &sv1, &p1v, mask.as_ref());
         if last {
             // g1.PV(last)
-            let w1 = read_words(b, &p1v);
-            g1.pv(b, &sl_t, &w1);
+            let f1 = var_frags(b, &p1v);
+            g1.pv_frags(b, &sl_t, f1);
         } else {
             b.wait_vm(0);
             b.wait_lds(0);
