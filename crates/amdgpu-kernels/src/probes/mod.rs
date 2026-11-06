@@ -2309,12 +2309,9 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
     let c4a = b.c_i32(4);
     let woa = b.mul_i32(wave, c4a);
     let poa = b.ptr_add(o, woa);
-    let is0a = b.bind_cond(amdgpu_dsl::ev(lane).eq(0));
-    b.begin_if(Opnd::Val(is0a));
     let t0v = b.bind_i32(amdgpu_dsl::ev(t0) + 0);
     let t0f = b.bitcast_f32(t0v);
     b.store_f32(poa, 512, t0f);
-    b.end_if();
     let vars = b.begin_loop(&inits);
     let it = vars[0];
     let accs = &vars[1..5];
@@ -2357,8 +2354,6 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
     let c4 = b.c_i32(4);
     let wo = b.mul_i32(wave, c4);
     let po = b.ptr_add(o, wo);
-    let is0 = b.bind_cond(amdgpu_dsl::ev(lane).eq(0));
-    b.begin_if(Opnd::Val(is0));
     let f = b.bitcast_f32(dt);
     b.store_f32(po, 0, f);
     let mut s = b.frag16_lane(Opnd::Var(accs[0]), 0);
@@ -2374,6 +2369,5 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
         acc = b.add_f32(acc, Opnd::Var(v));
     }
     b.store_f32(po, 256, acc);
-    b.end_if();
     b.finish()
 }
