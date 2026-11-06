@@ -75,8 +75,6 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
         let weights: Vec<usize> = graphs.iter().enumerate().map(|(k, g)| if g.is_some() { orders[k].len() } else { 0 }).collect();
         let wsum: usize = weights.iter().sum();
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (h as u64 + 1));
-        let mut checkpoint = (orders.clone(), cur);
-        let mut accepted_since = 0usize;
         let iters = o.search;
         for it in 0..iters {
             // block by length, instruction uniformly
@@ -120,28 +118,16 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
             apply(&mut orders[k], &mut pos[k]);
             let c = cost(&orders);
             let temp = 0.004 * c0 * (1.0 - it as f64 / iters.max(1) as f64);
-            let ok = c <= cur || (temp > 0.0 && rng.unit() < (-(c - cur) / temp).exp());
+            let mut ok = c <= cur || (temp > 0.0 && rng.unit() < (-(c - cur) / temp).exp());
+            // every accepted move must keep the allocator's pressure within the incoming order's (the model of the scheduler under-counts it, see regalloc::pressure_by_block)
+            if ok && !pressure_ok(m, &orders) {
+                ok = false;
+            }
             if ok {
                 cur = c;
-                accepted_since += 1;
                 if c < best {
-                    if accepted_since >= 64 && !pressure_ok(m, &orders) {
-                        orders = checkpoint.0.clone();
-                        for kk in 0..orders.len() {
-                            for (q, &i) in orders[kk].iter().enumerate() {
-                                pos[kk][i] = q;
-                            }
-                        }
-                        cur = checkpoint.1;
-                        accepted_since = 0;
-                        continue;
-                    }
                     best = c;
                     best_orders = orders.clone();
-                    if accepted_since >= 64 {
-                        checkpoint = (orders.clone(), c);
-                        accepted_since = 0;
-                    }
                 }
             } else {
                 // revert: move x back from np to p
@@ -153,9 +139,9 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
                 }
             }
         }
-        if best >= c0 || !pressure_ok(m, &best_orders) {
+        if best >= c0 {
             if o.stats {
-                eprintln!("search: loop@{h}: no usable improvement ({c0} -> best {best}, pressure ok {})", best < c0);
+                eprintln!("search: loop@{h}: no improvement ({c0} -> best {best})");
             }
             continue;
         }
