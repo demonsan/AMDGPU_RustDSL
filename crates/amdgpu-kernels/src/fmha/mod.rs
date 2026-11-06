@@ -212,6 +212,8 @@ pub struct AttnBody3<'a> {
     bias_next: Option<Opnd>,
     /// one f16 bias MFMA per tile (the vendor's single helper): its result is the C input of the four S tiles' first QK MFMA (`_vs128`)
     pub biasonce: bool,
+    /// the K fragments read into AGPRs (the 4-wave prototype: arch VGPRs hold both groups' S tiles)
+    pub kfrag_agpr: bool,
     bias_tile: std::cell::Cell<Option<Opnd>>,
 }
 
@@ -220,7 +222,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None) }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, kfrag_agpr: false, bias_tile: std::cell::Cell::new(None) }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -235,8 +237,11 @@ impl<'a> AttnBody3<'a> {
             }
             QkOut::Values(z) => Some(b.mfma_f16_wide(self.sm.ones_f16, bias, *z)),
         };
-        let k0 = k.read(b, 2 * s);
-        let k1 = k.read(b, 2 * s + 1);
+        let (mut k0, mut k1) = (k.read(b, 2 * s), k.read(b, 2 * s + 1));
+        if self.kfrag_agpr {
+            k0 = b.agpr(k0);
+            k1 = b.agpr(k1);
+        }
         let kw = kd.read(b, s);
         let q = &blk.q.frags;
         if let (true, QkOut::Vars(t)) = (self.kscale_sel, out) {
