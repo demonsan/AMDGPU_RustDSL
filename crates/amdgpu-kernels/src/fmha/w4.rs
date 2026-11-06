@@ -37,13 +37,19 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
 
 /// QK of `q` (into its S vars), each 32-key block followed by one conversion chunk of `c`'s softmax when `inter`, else QK then all chunks.
 #[allow(clippy::too_many_arguments)]
-fn qk_and_convert(b: &mut FnBuilder, q: &AttnBody3, slot: &SlotIdx, bias: Opnd, c: &AttnBody3, sv: &AccTile<C32x32F32, 4>, inter: bool) -> Vec<ValueId> {
+fn qk_and_convert(b: &mut FnBuilder, q: &AttnBody3, qk: Option<(&SlotIdx, Opnd)>, c: &AttnBody3, sv: &AccTile<C32x32F32, 4>, inter: bool, mask: Option<&KeyMask>) -> Vec<ValueId> {
     let s = q.s.expect("S");
     let mut w = Vec::new();
+    let Some((slot, bias)) = qk else {
+        for i in 0..4usize {
+            w.extend(c.sm.convert(b, sv, mask, i, i + 1));
+        }
+        return w;
+    };
     if !inter {
         q.qk(b, slot, QkOut::Vars(&s), bias);
         for i in 0..4usize {
-            w.extend(c.sm.convert(b, sv, None, i, i + 1));
+            w.extend(c.sm.convert(b, sv, mask, i, i + 1));
         }
         return w;
     }
@@ -56,7 +62,7 @@ fn qk_and_convert(b: &mut FnBuilder, q: &AttnBody3, slot: &SlotIdx, bias: Opnd, 
     }
     for i in 0..4usize {
         q.qk_block(b, &QkOut::Vars(&s), bias, &k, &kd, i);
-        w.extend(c.sm.convert(b, sv, None, i, i + 1));
+        w.extend(c.sm.convert(b, sv, mask, i, i + 1));
     }
     q.bias_tile.set(None);
     w
@@ -71,11 +77,11 @@ fn step(
     m: &AttnBody3,
     pv_slot: &SlotIdx,
     pv_words: &[ValueId],
-    qk_slot: &SlotIdx,
-    qk_bias: Opnd,
+    qk: Option<(&SlotIdx, Opnd)>,
     c: &AttnBody3,
     sv: &AccTile<C32x32F32, 4>,
     pvars: &[VarId],
+    mask: Option<&KeyMask>,
 ) -> Vec<ValueId> {
     m.pv(b, pv_slot, pv_words);
     let cs = c.s.expect("S");
@@ -90,22 +96,22 @@ fn step(
         cs
     };
     if o.late {
-        let (mt, grow) = c.sm.lazy_check(b, &s, None);
-        let w = qk_and_convert(b, m, qk_slot, qk_bias, c, &s, o.inter);
+        let (mt, grow) = c.sm.lazy_check(b, &s, mask);
+        let w = qk_and_convert(b, m, qk, c, &s, o.inter, mask);
         for (v, x) in pvars.iter().zip(&w) {
             b.set_var(*v, *x);
         }
         b.begin_if(Opnd::Val(grow));
         c.sm.lazy_rebase(b, mt, grow, &s, &co);
-        let w2: Vec<ValueId> = (0..4usize).flat_map(|i| c.sm.convert(b, &s, None, i, i + 1)).collect();
+        let w2: Vec<ValueId> = (0..4usize).flat_map(|i| c.sm.convert(b, &s, mask, i, i + 1)).collect();
         for (v, x) in pvars.iter().zip(&w2) {
             b.set_var(*v, *x);
         }
         b.end_if();
         read_words(b, pvars)
     } else {
-        c.sm.decide_lazy(b, &s, &co, None);
-        let w = qk_and_convert(b, m, qk_slot, qk_bias, c, &s, o.inter);
+        c.sm.decide_lazy(b, &s, &co, mask);
+        let w = qk_and_convert(b, m, qk, c, &s, o.inter, mask);
         for (v, x) in pvars.iter().zip(&w) {
             b.set_var(*v, *x);
         }
@@ -217,46 +223,67 @@ pub fn v4w_named(name: &str) -> Function {
         }
     }
     b.assume_trusted(it, Ext::c(0), Ext::ka(0x110).ceil_div(128), "tile counter: 0 <= it <= nkv - 1");
-    // slots: t -> idx, t+1 -> i1, t+2 (= t-1) -> i2
-    let i1 = b.bind_i32(varx(idx).lt(2).select_i32(varx(idx) + 1, 0));
-    let i2 = b.bind_i32(I32::c(0).lt(varx(idx)).select_i32(varx(idx) - 1, 2));
-    let it_p1 = b.bind_i32(varx(it) + 1);
-    let it_p2 = b.bind_i32(varx(it) + 2);
-    let it_m1 = b.bind_i32(varx(it) - 1);
-    let sl_t = SlotIdx::new(idx, it);
-    let sl_t1 = SlotIdx::new(i1, it_p1);
-    let sl_t2 = SlotIdx::new(i2, it_p2);
-    let sl_tm1 = SlotIdx::new(i2, it_m1);
-    // copies: K(t+2) into the slot of K(t-1), V(t+1) into the slot of V(t-2) (= slot of t+1)
-    let kk = key(b, ev(it_p2));
-    ring.stage(b, Role::A, &kk, &sl_t2);
-    let kv = key(b, ev(it_p1));
-    ring.stage(b, Role::B, &kv, &sl_t1);
-    b.set_prio(1);
     // the references: loop variables (updated lazily by the group's softmax; bias_init at tile 0)
     let (bias0, bias1) = (Opnd::Var(vars[2]), Opnd::Var(vars[2 + n0]));
-    // ---- step 1: g1.PV(t-1) + g1.QK(t) || g0 softmax(t) ----
-    let w1 = read_words(b, &p1v);
     let sv0 = if opts.s_agpr { sv } else { g0.s.expect("S") };
-    let w0 = step(b, opts, &g1, &sl_tm1, &w1, &sl_t, bias1, &g0, &sv0, &p0v);
-    // ---- step 2: g0.PV(t) + g0.QK(t+1) || g1 softmax(t) ----
     let sv1 = if opts.s_agpr { sv } else { g1.s.expect("S") };
-    // g1's words must survive into the next tile: in the non-late mode `step` stores them into p1v
-    let _ = step(b, opts, &g0, &sl_t, &w0, &sl_t1, bias0, &g1, &sv1, &p1v);
-    b.wait_vm(0);
-    b.wait_lds(0);
-    b.barrier();
+    // one tile t = `it` in slot `idx`; `last`: the peeled final tile (masked keys, no copies, no QK of t+1, g1.PV(t) appended)
+    let tile = |b: &mut FnBuilder, it: Opnd, idx: Opnd, last: bool| -> (ValueId, ValueId) {
+        let x = |o: &Opnd| -> I32 {
+            match o {
+                Opnd::Var(v) => varx(*v),
+                Opnd::Val(v) => ev(*v),
+                Opnd::I32(c) => I32::c(*c),
+                _ => panic!("tile index"),
+            }
+        };
+        // slots: t -> idx, t+1 -> i1, t+2 (= t-1) -> i2
+        let i1 = b.bind_i32(x(&idx).lt(2).select_i32(x(&idx) + 1, 0));
+        let i2 = b.bind_i32(I32::c(0).lt(x(&idx)).select_i32(x(&idx) - 1, 2));
+        let it_p1 = b.bind_i32(x(&it) + 1);
+        let it_p2 = b.bind_i32(x(&it) + 2);
+        let it_m1 = b.bind_i32(x(&it) - 1);
+        let sl_t = SlotIdx::new(idx.clone(), it.clone());
+        let sl_t1 = SlotIdx::new(i1, it_p1);
+        let sl_t2 = SlotIdx::new(i2, it_p2);
+        let sl_tm1 = SlotIdx::new(i2, it_m1);
+        if !last {
+            // copies: K(t+2) into the slot of K(t-1), V(t+1) into the slot of V(t-2) (= slot of t+1)
+            let kk = key(b, ev(it_p2));
+            ring.stage(b, Role::A, &kk, &sl_t2);
+            let kv = key(b, ev(it_p1));
+            ring.stage(b, Role::B, &kv, &sl_t1);
+        }
+        b.set_prio(1);
+        let mask = last.then(|| {
+            let ti = TileIt { it: it.clone(), cur: sl_t.clone(), next: sl_t1.clone(), n2: None, masked: true, staged: false, tile_rows: 128 };
+            KeyMask::new(b, &ti, blk0.g4, blk0.kv_len)
+        });
+        // ---- step 1: g1.PV(t-1) + g1.QK(t) || g0 softmax(t) ----
+        let w1 = read_words(b, &p1v);
+        let w0 = step(b, opts, &g1, &sl_tm1, &w1, Some((&sl_t, bias1)), &g0, &sv0, &p0v, mask.as_ref());
+        // ---- step 2: g0.PV(t) + g0.QK(t+1) || g1 softmax(t) ----
+        let qk0 = (!last).then_some((&sl_t1, bias0));
+        let _ = step(b, opts, &g0, &sl_t, &w0, qk0, &g1, &sv1, &p1v, mask.as_ref());
+        if last {
+            // g1.PV(last)
+            let w1 = read_words(b, &p1v);
+            g1.pv(b, &sl_t, &w1);
+        } else {
+            b.wait_vm(0);
+            b.wait_lds(0);
+            b.barrier();
+        }
+        (i1, it_p1)
+    };
+    // steady tiles 0 .. nkv-2 (the dispatcher guarantees nkv >= 2), then the peeled last tile
+    let (i1, it_p1) = tile(b, Opnd::Var(it), Opnd::Var(idx), false);
     b.set_var(idx, i1);
     b.set_var(it, it_p1);
-    let stop = b.bind_cond(!ev(it_p1).lt(ev(nkv)));
+    let stop = b.bind_cond(!ev(it_p1).lt(ev(nkv) - 1));
     b.break_if(stop);
     b.end_loop();
-    // ---- tail: g1.PV(last) ----
-    let it_l = b.bind_i32(ev(nkv) - 1);
-    let w1 = read_words(b, &p1v);
-    let idx_l = b.bind_i32(varx(idx).lt(1).select_i32(2, varx(idx) - 1));
-    g1.pv(b, &SlotIdx::new(idx_l, it_l), &w1);
-    for (g, blk) in [(&g0, &blk0), (&g1, &blk1)] {
+    let _ = tile(b, Opnd::Var(it), Opnd::Var(idx), true);    for (g, blk) in [(&g0, &blk0), (&g1, &blk1)] {
         let fin = g.out_scale(b);
         store_out3(&io, b, blk, &g.o.expect("O"), fin);
     }
