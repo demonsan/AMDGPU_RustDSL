@@ -85,6 +85,9 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
         let seed: u64 = std::env::var("AMDC_SEARCH_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (h as u64 + 1) ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
         let iters = o.search;
+        // debugging: AMDC_SEARCH_STOPAT=K stops after the K-th accepted move and applies the CURRENT order (bisecting a bad trajectory)
+        let stop_at: Option<usize> = std::env::var("AMDC_SEARCH_STOPAT").ok().and_then(|v| v.parse().ok());
+        let mut naccepted = 0usize;
         for it in 0..iters {
             // block by length, instruction uniformly
             let mut r = rng.below(wsum);
@@ -152,7 +155,13 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
                     let ii = &m.blocks[path[k]].insts[x];
                     eprintln!("SMOVE block {} inst#{x} {:?} dst {:?} from {p} to {np} cost {c:.0}", path[k], ii.op, ii.dst);
                 }
+                naccepted += 1;
                 cur = c;
+                if stop_at.map_or(false, |k| naccepted >= k) {
+                    best = c;
+                    best_orders = orders.clone();
+                    break;
+                }
                 if c < best {
                     best = c;
                     best_orders = orders.clone();
