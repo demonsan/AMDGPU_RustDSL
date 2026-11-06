@@ -16,8 +16,15 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
-    let blk0 = block3_g(&io, b, 8, Some(0));
-    let blk1 = block3_g(&io, b, 8, Some(1));
+    let mut blk0 = block3_g(&io, b, 8, Some(0));
+    let mut blk1 = block3_g(&io, b, 8, Some(1));
+    // the Q fragments (MFMA B operands, loop-invariant) live in AGPRs: the two groups' S tiles fill the arch VGPRs
+    for blk in [&mut blk0, &mut blk1] {
+        for f in blk.q.frags.iter_mut() {
+            f.v = b.agpr(f.v);
+        }
+    }
+    let (blk0, blk1) = (blk0, blk1);
     let roles = Roles::single(&blk0.lane, 4);
     let mut ring = KvRing3::new_with(b, &io, &blk0, &roles, 3, true);
     ring.enable_buffer_dma(b);
