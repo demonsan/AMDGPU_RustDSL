@@ -67,12 +67,14 @@ pub struct Options {
     /// `pexact`: the list scheduler checks every candidate order of a block against the ALLOCATOR's own pressure (`regalloc::pressure_by_block`) and tightens its model limit until the
     /// block needs no more registers than its authored order did (+ `pslack`), so the scheduled kernel still allocates (0 = off)
     pub pexact: bool,
+    /// `hjoin=K` (sched/ldahead.rs `hoist_join`): hoist up to K instructions that do not depend on the rare branch's body from the join block into the block before the branch (0 = off)
+    pub hjoin: usize,
     pub pslack: i64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, pexact: false, pslack: 0 }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, pexact: false, hjoin: 0, pslack: 0 }
     }
 }
 
@@ -120,6 +122,11 @@ impl Options {
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
+                        }
+                        if let Some(v) = t.strip_prefix("hjoin=") {
+                            if let Ok(n) = v.parse() {
+                                o.hjoin = n;
+                            }
                         }
                         if let Some(v) = t.strip_prefix("pslack=") {
                             if let Ok(n) = v.parse() {
@@ -267,6 +274,12 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
     waits::DRAIN_ONLY.store(o.drain_only, std::sync::atomic::Ordering::Relaxed);
     waits::strip_auto_waits(m);
     cfg::dce_dead_selects(m);
+    if o.hjoin > 0 {
+        let n = ldahead::hoist_join(m, o);
+        if o.stats {
+            eprintln!("hjoin: {n} instructions hoisted over rare branches");
+        }
+    }
     if o.ldshoist {
         let n = hoist::run(m, o);
         if o.stats {
