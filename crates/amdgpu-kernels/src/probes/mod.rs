@@ -2279,16 +2279,18 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
     let pa = b.ptr_add(inp, lo);
     let a0 = b.load_b128(pa, 0);
     let a1 = b.load_b128(pa, 16);
-    let fa = {
+    let mk = |b: &mut FnBuilder, fs: [ValueId; 2]| {
         let mut w = Vec::new();
-        for f in [a0, a1] {
+        for f in fs {
             for k in 0..4u8 {
                 let x = b.frag4_lane(f, k);
                 w.push(b.bitcast_i32(x));
             }
         }
-        amdgpu_tile::frag::Frag::<amdgpu_tile::frag::B32x32x64Fp8>::from_words(&mut b, &w).v
+        amdgpu_tile::frag::Frag::<amdgpu_tile::frag::B32x32x64Fp8>::from_words(b, &w).v
     };
+    let fa = mk(&mut b, [a0, a1]);
+    let fb = mk(&mut b, [a1, a0]);
     let sc = b.c_i32(127);
     let fz = b.frag_zero(DType::Frag16);
     let x0 = b.load_f32(pa, 0);
@@ -2304,6 +2306,15 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
     inits[0].1 = Opnd::Val(z);
     b.wait_vm(0);
     let t0 = b.memtime_lo();
+    let c4a = b.c_i32(4);
+    let woa = b.mul_i32(wave, c4a);
+    let poa = b.ptr_add(o, woa);
+    let is0a = b.bind_cond(amdgpu_dsl::ev(lane).eq(0));
+    b.begin_if(Opnd::Val(is0a));
+    let t0v = b.bind_i32(amdgpu_dsl::ev(t0) + 0);
+    let t0f = b.bitcast_f32(t0v);
+    b.store_f32(poa, 512, t0f);
+    b.end_if();
     let vars = b.begin_loop(&inits);
     let it = vars[0];
     let accs = &vars[1..5];
@@ -2327,7 +2338,7 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
     };
     for m in 0..nm.max(1) {
         if nm > 0 {
-            b.var_mfma_scale(accs[(m % 4) as usize], fa, fa, sc, sc);
+            b.var_mfma_scale(accs[(m % 4) as usize], fa, fb, sc, sc);
         }
         emit_valu(&mut b, if nm > 0 { per } else { nv }, &mut vals, &mut k);
     }
@@ -2342,7 +2353,7 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
     b.break_if(stop);
     b.end_loop();
     let t1 = b.memtime_lo();
-    let dt = b.bind_i32(amdgpu_dsl::ev(t1) - amdgpu_dsl::ev(t0));
+    let dt = b.bind_i32(amdgpu_dsl::ev(t1) + 0);
     let c4 = b.c_i32(4);
     let wo = b.mul_i32(wave, c4);
     let po = b.ptr_add(o, wo);
