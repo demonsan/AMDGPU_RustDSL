@@ -64,11 +64,15 @@ pub struct Options {
     pub waitsink: bool,
     /// `ovl=N` (sched/ldahead.rs `spread_valu`): inside every barrier-free stretch with >= 2 MFMAs, VALU / SALU work that is independent of the MFMAs in between is hoisted up so that it is spread evenly over the stretch's MFMAs (a stretch needs at least N such instructions; 0 = off)
     pub ovl: usize,
+    /// `pexact`: the list scheduler checks every candidate order of a block against the ALLOCATOR's own pressure (`regalloc::pressure_by_block`) and tightens its model limit until the
+    /// block needs no more registers than its authored order did (+ `pslack`), so the scheduled kernel still allocates (0 = off)
+    pub pexact: bool,
+    pub pslack: i64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0 }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, pexact: false, pslack: 0 }
     }
 }
 
@@ -108,6 +112,7 @@ impl Options {
                     "slotfill" => o.slotfill = true,
                     "wsink" => o.waitsink = true,
                     "ovl" => o.ovl = 8,
+                    "pexact" => o.pexact = true,
                     "hoistchain" => {
                         o.ldshoist = true;
                         o.hoist_chain = true;
@@ -115,6 +120,11 @@ impl Options {
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
+                        }
+                        if let Some(v) = t.strip_prefix("pslack=") {
+                            if let Ok(n) = v.parse() {
+                                o.pslack = n;
+                            }
                         }
                         if let Some(v) = t.strip_prefix("ovl=") {
                             if let Ok(n) = v.parse() {
@@ -185,6 +195,7 @@ pub(crate) fn schedule_blocks(m: &mut MFunction, o: &Options, stats: &mut Stats)
         return Ok(());
     }
         let lv = liveness::compute(m);
+        let real0 = if o.pexact { crate::regalloc::pressure_by_block(m) } else { Vec::new() };
         for bi in 0..m.blocks.len() {
             stats.blocks += 1;
             let insts = m.blocks[bi].insts.clone();
@@ -199,7 +210,39 @@ pub(crate) fn schedule_blocks(m: &mut MFunction, o: &Options, stats: &mut Stats)
             let term = m.blocks[bi].term.clone();
             let xb = o.alu_across_barrier || o.xbar_only == Some(bi);
             let g = depgraph::build(m, &insts, &term, xb);
-            let r = list::schedule_best(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], o.max_vgprs as i64, false);
+            let r = if o.pexact {
+                // tighten the model limit until the allocator measure of THIS block does not exceed the authored order's (+ pslack); never accept an order that needs more
+                let target = real0[bi] + o.pslack;
+                let mut lim = o.max_vgprs as i64;
+                let mut chosen: Option<list::ListResult> = None;
+                let mut last: Option<list::ListResult> = None;
+                for _ in 0..8 {
+                    let cand = list::schedule_best(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], lim, false, false);
+                    let mut mm = m.clone();
+                    mm.blocks[bi].insts = apply_perm(&insts, &cand.perm);
+                    let real = crate::regalloc::pressure_by_block(&mm)[bi];
+                    if o.stats {
+                        eprintln!("pexact: block {bi} limit {lim}: allocator measure {real} (target {target}, model peak_after {})", cand.peak_after);
+                    }
+                    if real <= target {
+                        chosen = Some(cand);
+                        break;
+                    }
+                    lim = (lim - (real - target) - 1).min(cand.peak_after - 1);
+                    last = Some(cand);
+                }
+                match chosen {
+                    Some(c) => c,
+                    None => {
+                        // no candidate fits within the authored allocator measure: keep the authored order
+                        let mut c = last.expect("one candidate");
+                        c.perm = (0..insts.len()).collect();
+                        c
+                    }
+                }
+            } else {
+                list::schedule_best(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], o.max_vgprs as i64, false, true)
+            };
             if o.verify {
                 verify::check_perm(m, &insts, &r.perm, &term, xb)
                     .map_err(|e| format!("schedule verification failed in block {bi}: {e}"))?;

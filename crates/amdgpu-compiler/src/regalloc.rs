@@ -876,6 +876,72 @@ pub fn pressure_profile(m: &MFunction) -> (u32, usize, usize) {
     let blk = idx_of.iter().position(|v| v.last().map_or(false, |l| *l >= at) && v.first().map_or(false, |f| *f <= at)).unwrap_or(0);
     (peak as u32, at, blk)
 }
+/// The allocator's own pressure measure (`pressure_profile`: precise dword-level liveness, V_RESERVED included) as a PEAK PER BLOCK: how many live vector dwords the allocator
+/// has to fit at the worst position of each block. The scheduler's per-block model under-counts it (loop-carried values the allocator keeps live across the whole loop range, partial
+/// writes), so `pexact` scheduling checks candidate orders against this number.
+pub fn pressure_by_block(m: &MFunction) -> Vec<i64> {
+    let mut idx_of: Vec<Vec<usize>> = Vec::with_capacity(m.blocks.len());
+    let mut next = 0usize;
+    for b in &m.blocks {
+        let mut v = Vec::with_capacity(b.insts.len());
+        for _ in 0..b.insts.len() {
+            v.push(next);
+            next += 1;
+        }
+        idx_of.push(v);
+    }
+    let label_to_block: std::collections::HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); m.blocks.len()];
+    for (i, b) in m.blocks.iter().enumerate() {
+        match &b.term {
+            Term::Goto(t) => {
+                if let Some(j) = label_to_block.get(t) {
+                    succs[i].push(*j);
+                }
+            }
+            Term::CondGoto { target, fall, .. } => {
+                for t in [target, fall] {
+                    if let Some(j) = label_to_block.get(t) {
+                        succs[i].push(*j);
+                    }
+                }
+            }
+            Term::Endpgm => {}
+        }
+    }
+    let segs = precise_segments(m, &idx_of, &succs);
+    let mut ev: Vec<(usize, i64)> = Vec::new();
+    for (r, sg) in segs.iter().enumerate() {
+        let c = m.vreg_class(r as VReg);
+        if !c.is_vector() || m.alias.contains_key(&(r as VReg)) {
+            continue;
+        }
+        for (a, b) in sg {
+            ev.push((*a, c.dwords() as i64));
+            ev.push((b.saturating_add(1), -(c.dwords() as i64)));
+        }
+    }
+    ev.sort();
+    let mut out = vec![0i64; m.blocks.len()];
+    let mut k = 0usize;
+    let mut cur = V_RESERVED as i64;
+    for (bi, v) in idx_of.iter().enumerate() {
+        let (Some(&s), Some(&e)) = (v.first(), v.last()) else { continue };
+        while k < ev.len() && ev[k].0 <= s {
+            cur += ev[k].1;
+            k += 1;
+        }
+        let mut peak = cur;
+        while k < ev.len() && ev[k].0 <= e {
+            cur += ev[k].1;
+            peak = peak.max(cur);
+            k += 1;
+        }
+        out[bi] = peak;
+    }
+    out
+}
+
 /// The vregs live at linear position `pos` (dword-level liveness), for diagnostics.
 pub fn live_at(m: &MFunction, pos: usize) -> Vec<VReg> {
     let mut idx_of: Vec<Vec<usize>> = Vec::new();
