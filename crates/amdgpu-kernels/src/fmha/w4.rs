@@ -23,13 +23,15 @@ pub struct W4Opts {
     pub late: bool,
     /// steady loop unrolled by the ring depth (3): every slot index is a constant (ds_read / DMA offsets become immediates)
     pub u3: bool,
+    /// g1's carried P words stay in VGPRs (the row-sum smfmac cannot read AGPRs: pinned words cost an accvgpr write + read each)
+    pub pvgpr: bool,
 }
 
 impl W4Opts {
     pub fn from_name(name: &str) -> W4Opts {
         let suf = name.strip_prefix("fmha_fwd_hd128_mxfp8_v4w_proto").unwrap_or("");
         let has = |s: &str| suf.split('_').any(|x| x == s);
-        W4Opts { s_agpr: has("a"), inter: has("i"), late: has("l"), u3: has("u3") }
+        W4Opts { s_agpr: has("a"), inter: has("i"), late: has("l"), u3: has("u3"), pvgpr: has("pv") }
     }
 }
 
@@ -224,7 +226,7 @@ pub fn v4w_named(name: &str) -> Function {
             }
         }
     }
-    if !opts.s_agpr {
+    if !opts.s_agpr && !opts.pvgpr {
         // g1's P words (carried into the next tile's PV, MFMA B operands)
         for v in &p1v {
             b.pin_agpr(*v);
