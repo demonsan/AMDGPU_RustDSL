@@ -299,6 +299,11 @@ pub fn hoist_join(m: &mut MFunction, o: &Options) -> usize {
             Term::Endpgm => {}
         }
     }
+    if o.stats {
+        for (i, b) in m.blocks.iter().enumerate() {
+            eprintln!("hjoin cfg: block {i} label {} insts {} term {:?} preds {}", b.label, b.insts.len(), b.term, npred[i]);
+        }
+    }
     for ai in 0..nb {
         let (cl, bl) = match &m.blocks[ai].term {
             Term::CondGoto { target, fall, .. } => (*target, *fall),
