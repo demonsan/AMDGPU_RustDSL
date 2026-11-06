@@ -192,3 +192,80 @@ pub fn sink_explicit_waits(m: &mut MFunction, o: &Options) -> usize {
     }
     moved_total
 }
+
+/// `ovl=N`: spread independent VALU / SALU work evenly over the MFMAs of a barrier-free stretch (the single-wave-per-SIMD design: one wave must overlap its OWN MFMA stream with
+/// its softmax VALU, docs/fmha-4wave-design.md). A stretch is a maximal run of instructions without `s_barrier`; with `Ms >= 2` MFMAs and `Nb >= N` movable non-MFMA
+/// compute instructions (no memory access, no fence, not pinned, not the terminator's condition writer), the j-th of them (program order) is hoisted to directly behind MFMA
+/// `floor(j Ms / Nb)` of the stretch, as far as the dependence graph (registers, memory, fences) allows; nothing is ever moved down or past an instruction it depends on.
+/// Re-checked with `verify::check_perm`. Returns the number of hoisted instructions.
+pub fn spread_valu(m: &mut MFunction, o: &Options) -> usize {
+    use super::effects::Fence;
+    let mut total = 0;
+    for bi in 0..m.blocks.len() {
+        let insts = m.blocks[bi].insts.clone();
+        let n = insts.len();
+        if n < 16 || super::phase::has_markers(&insts) || insts.iter().filter(|i| is_matrix(i.op)).count() < 2 {
+            continue;
+        }
+        let term = m.blocks[bi].term.clone();
+        let g = depgraph::build(m, &insts, &term, o.alu_across_barrier);
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut pos: Vec<usize> = (0..n).collect();
+        let movable: Vec<bool> = (0..n)
+            .map(|i| {
+                let e = &g.eff[i];
+                e.mem.is_none() && e.fence == Fence::None && !e.smem && !e.pinned && !is_matrix(insts[i].op) && insts[i].op != MOp::SchedGroup && g.term_vcc_writer != Some(i)
+            })
+            .collect();
+        let mut moved = 0usize;
+        // stretches between barriers
+        let mut start = 0usize;
+        let mut stretches: Vec<(usize, usize)> = Vec::new();
+        for p in 0..n {
+            if insts[order[p]].op == MOp::SBarrier {
+                stretches.push((start, p));
+                start = p + 1;
+            }
+        }
+        stretches.push((start, n));
+        for (a, b) in stretches {
+            let mfmas: Vec<usize> = (a..b).filter(|&p| is_matrix(insts[order[p]].op)).map(|p| order[p]).collect();
+            let bulk: Vec<usize> = (a..b).filter(|&p| movable[order[p]]).map(|p| order[p]).collect();
+            if mfmas.len() < 2 || bulk.len() < o.ovl {
+                continue;
+            }
+            for (j, &x) in bulk.iter().enumerate() {
+                let tm = mfmas[j * mfmas.len() / bulk.len()];
+                // hop up until x sits directly behind MFMA tm (or behind an earlier-placed bulk instruction that sits there)
+                loop {
+                    let p = pos[x];
+                    if p == 0 || p <= pos[tm] + 1 {
+                        break;
+                    }
+                    let prev = order[p - 1];
+                    if g.preds[x].iter().any(|&(q, _)| q == prev) {
+                        break;
+                    }
+                    order.swap(p - 1, p);
+                    pos[order[p - 1]] = p - 1;
+                    pos[order[p]] = p;
+                    moved += 1;
+                }
+            }
+        }
+        if moved == 0 {
+            continue;
+        }
+        if o.verify {
+            if let Err(e) = verify::check_perm(m, &insts, &order, &term, o.alu_across_barrier) {
+                if o.stats {
+                    eprintln!("ovl: block {bi}: {e}: left alone");
+                }
+                continue;
+            }
+        }
+        m.blocks[bi].insts = order.into_iter().map(|k| insts[k].clone()).collect();
+        total += moved;
+    }
+    total
+}
