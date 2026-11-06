@@ -277,6 +277,21 @@ pub fn report(m: &MFunction, waves: &[usize]) -> Vec<LoopReport> {
         let path = hot_path(m, hi, li);
         let prog = build_prog(m, &path, hi);
         let insts: usize = path.iter().map(|&b| m.blocks[b].insts.len()).sum();
+        if std::env::var("AMDC_SIM_BOUNDS").is_ok() {
+            // resource bound per pipe of the hot path (one wave per SIMD: the sum of the instructions' `issue` cycles) and the instruction count per pipe
+            let mut busy = [0u32; NPIPES];
+            let mut cnt = [0u32; NPIPES];
+            for &b in &path {
+                for i in &m.blocks[b].insts {
+                    let c = cost(i.op);
+                    busy[c.pipe.index()] += c.issue;
+                    cnt[c.pipe.index()] += 1;
+                }
+            }
+            let names = ["Valu", "Trans", "Mfma", "Lds", "Vmem", "Salu", "Smem", "Ctrl"];
+            let line: Vec<String> = (0..NPIPES).map(|k| format!("{}: {} insts / {} cycles", names[k], cnt[k], busy[k])).collect();
+            eprintln!("BOUNDS loop@{h}: {}", line.join("; "));
+        }
         let cycles = waves.iter().map(|&w| (w, simulate_prog(&prog, w, 24))).collect();
         out.push(LoopReport { header_label: h, blocks: path.len(), insts, cycles_per_iter: cycles });
     }
