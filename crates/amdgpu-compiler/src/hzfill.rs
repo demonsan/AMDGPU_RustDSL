@@ -144,6 +144,41 @@ fn candidates(m: &MFunction, a: &Alloc, bi: usize, i: usize, window: usize) -> V
     out
 }
 
+/// Candidates from ABOVE the nop (nearest first): an instruction in front of the hazard producer that may sink to the nop's position (it
+/// hops over everything between it and the nop, the producer included, with the same dependence rules). The hazard model then confirms
+/// that sinking it did not shorten another window.
+fn candidates_above(m: &MFunction, a: &Alloc, bi: usize, i: usize, window: usize) -> Vec<usize> {
+    let insts = &m.blocks[bi].insts;
+    let lo = i.saturating_sub(window);
+    let fxs: Vec<Fx> = insts[lo..i].iter().map(|x| fx(m, a, x)).collect();
+    let mut out = Vec::new();
+    for j in (lo..i).rev() {
+        let y = &fxs[j - lo];
+        if is_stop(&insts[j], &y.eff) {
+            break;
+        }
+        let hops = &fxs[j - lo + 1..];
+        let blocked = hops.iter().any(|z| conflict(y, z) || (is_mem(&z.eff) && is_mem(&y.eff)) || crate::sched::order::mem_must_order(&y.eff, None, &z.eff, None, false));
+        if !blocked {
+            out.push(j);
+        }
+    }
+    out
+}
+
+/// Sink the instruction at `j` (< nop index `i`) to just before the nop, shrinking the nop by one state.
+fn apply_above(m: &mut MFunction, bi: usize, j: usize, i: usize) {
+    let b = &mut m.blocks[bi].insts;
+    let y = b.remove(j);
+    // the nop moved to i - 1
+    b.insert(i - 1, y);
+    if b[i].imm > 0 {
+        b[i].imm -= 1;
+    } else {
+        b.remove(i);
+    }
+}
+
 fn candidate(m: &MFunction, a: &Alloc, bi: usize, i: usize, window: usize) -> Option<usize> {
     candidates(m, a, bi, i, window).into_iter().next()
 }
@@ -189,13 +224,12 @@ pub fn fill(m: &mut MFunction, a: &Alloc, strict: bool) -> FillStats {
             }
             i += 1;
         }
-        if moves.is_empty() {
-            continue;
-        }
-        if hazard_clean(&trial, a, strict) {
+        let greedy_ok = !moves.is_empty() && hazard_clean(&trial, a, strict);
+        if greedy_ok {
             st.moved += moves.len();
             *m = trial;
-        } else {
+        }
+        {
             // one move at a time, each checked
             let mut i = 0usize;
             while i < m.blocks[bi].insts.len() {
@@ -212,6 +246,23 @@ pub fn fill(m: &mut MFunction, a: &Alloc, strict: bool) -> FillStats {
                             break;
                         }
                         st.rejected += 1;
+                    }
+                    if !done {
+                        for j in candidates_above(m, a, bi, i, WINDOW).into_iter().take(4) {
+                            let mut t = m.clone();
+                            apply_above(&mut t, bi, j, i);
+                            if hazard_clean(&t, a, strict) {
+                                *m = t;
+                                st.moved += 1;
+                                done = true;
+                                break;
+                            }
+                            st.rejected += 1;
+                        }
+                        if done {
+                            // the nop is now at i (or gone): offer it again
+                            continue;
+                        }
                     }
                     if done {
                         i += 1;
