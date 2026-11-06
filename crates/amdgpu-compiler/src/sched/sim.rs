@@ -192,6 +192,8 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
         })
         .collect();
     let mut unit_free = [0i64; NPIPES];
+    // minimum cycles between two instruction issues of ONE wave (ATT, warm 1-wave FMHA: every instruction class issues about every 4-5 cycles; the model used 1)
+    let issue_gap: i64 = std::env::var("AMDC_SIM_GAP").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     loop {
         // earliest feasible issue time per wave
         let mut best: Option<(i64, i64, usize)> = None;
@@ -200,7 +202,7 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
                 continue;
             }
             let ins = &prog[w.pc];
-            let mut t = w.last_issue + 1;
+            let mut t = w.last_issue + issue_gap;
             t = t.max(w.pipe_free[ins.cost.pipe.index()]);
             if ins.cost.occ > 0 {
                 t = t.max(unit_free[ins.cost.pipe.index()]);
