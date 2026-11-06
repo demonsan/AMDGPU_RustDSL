@@ -18,12 +18,7 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
     let io = declare_io(b, 256, false);
     let mut blk0 = block3_g(&io, b, 8, Some(0));
     let mut blk1 = block3_g(&io, b, 8, Some(1));
-    // the Q fragments (MFMA B operands, loop-invariant) live in AGPRs: the two groups' S tiles fill the arch VGPRs
-    for blk in [&mut blk0, &mut blk1] {
-        for f in blk.q.frags.iter_mut() {
-            f.v = b.agpr(f.v);
-        }
-    }
+    let _ = (&mut blk0, &mut blk1);
     let (blk0, blk1) = (blk0, blk1);
     let roles = Roles::single(&blk0.lane, 4);
     let mut ring = KvRing3::new_with(b, &io, &blk0, &roles, 3, true);
@@ -42,7 +37,7 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
         g.sm.set_vendor_ref(b);
         g.lazy_bias = true;
         g.biasonce = true;
-        g.kfrag_agpr = true;
+        g.kfrag_agpr = false;
     }
     let nkv = blk0.nkv;
     let key = |b: &mut FnBuilder, t: I32| -> I32 {
@@ -78,19 +73,26 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
     for _ in 0..16 {
         inits.push((DType::I32, Opnd::Val(zc)));
     }
+    // the softmax working copy of S (VGPR): S of both groups lives in AGPRs (written by the QK MFMAs), copied once per softmax
+    for _ in 0..4 {
+        inits.push((DType::Frag16, Opnd::Val(g0.zero16)));
+    }
     let vars = b.begin_loop(&inits);
     let (it, idx) = (vars[0], vars[1]);
     g0.bind_state(&vars[2..2 + n0]);
     g1.bind_state(&vars[2 + n0..2 + n0 + n1]);
-    let p1v: Vec<VarId> = vars[2 + n0 + n1..].to_vec();
+    let p1v: Vec<VarId> = vars[2 + n0 + n1..2 + n0 + n1 + 16].to_vec();
+    let svv: Vec<VarId> = vars[2 + n0 + n1 + 16..].to_vec();
+    let sv: AccTile<C32x32F32, 4> = AccTile::from_vars(&svv);
     for g in [&g0, &g1] {
         for a in &g.o.expect("O").accs {
             b.pin_agpr(a.var);
         }
     }
-    // g1's P words (carried to the next tile's PV, MFMA B operands) in AGPRs
-    for v in &p1v {
-        b.pin_agpr(*v);
+    for g in [&g0, &g1] {
+        for a in &g.s.expect("S").accs {
+            b.pin_agpr(a.var);
+        }
     }
     b.assume_trusted(it, Ext::c(0), Ext::ka(0x110).ceil_div(128), "tile counter: 0 <= it <= nkv - 1");
     // slots: t -> idx, t+1 -> i1, t+2 (= t-1) -> i2
@@ -113,14 +115,17 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
     b.set_prio(1);
     g1.pv(b, &sl_tm1, &w1);
     {
-        let (s, o) = (g0.s.expect("S"), g0.o.expect("O"));
-        g0.bias_next = Some(g0.sm.decide_lazy(b, &s, &o, None));
+        let o = g0.o.expect("O");
+        for (d, s) in sv.accs.iter().zip(&g0.s.expect("S").accs) {
+            b.set_var(d.var, Opnd::Var(s.var));
+        }
+        g0.bias_next = Some(g0.sm.decide_lazy(b, &sv, &o, None));
     }
     // g1's reference is its loop variable (updated lazily by its softmax in step 2 of the previous tile; bias_init at tile 0)
     let bias1 = Opnd::Var(vars[2 + n0]);
     let s1t = g1.s.expect("S");
     let p0: Vec<ValueId> = {
-        let s = g0.s.expect("S");
+        let s = sv;
         let mut w = Vec::new();
         // QK(t) of g1 issued between the conversion chunks of g0
         g1.qk(b, &sl_t, QkOut::Vars(&s1t), bias1);
@@ -132,13 +137,16 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
     // ---- step 2: g0.PV(t) + g0.QK(t+1) || g1 softmax(t) ----
     g0.pv(b, &sl_t, &p0);
     {
-        let (s, o) = (g1.s.expect("S"), g1.o.expect("O"));
-        g1.bias_next = Some(g1.sm.decide_lazy(b, &s, &o, None));
+        let o = g1.o.expect("O");
+        for (d, s) in sv.accs.iter().zip(&g1.s.expect("S").accs) {
+            b.set_var(d.var, Opnd::Var(s.var));
+        }
+        g1.bias_next = Some(g1.sm.decide_lazy(b, &sv, &o, None));
     }
     let bias0 = g0.bias_next.take().expect("bias g0");
     let s0t = g0.s.expect("S");
     let p1: Vec<ValueId> = {
-        let s = g1.s.expect("S");
+        let s = sv;
         g0.qk(b, &sl_t1, QkOut::Vars(&s0t), bias0);
         let mut w = Vec::new();
         for i in 0..4usize {
