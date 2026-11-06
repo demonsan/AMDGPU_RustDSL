@@ -477,9 +477,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         // sparse fp8 16x16x128: arch table says 32 cycles (MI350X, F8 involved); latency not measured
         VSmfmac16x16x128Fp8 => a("v_smfmac_f32_16x16x128_fp8_fp8", c(Mfma, 32, 32, Experimental)).mfma(20, true, false, false, true),
         VAccvgprRead => a("v_accvgpr_read_b32", c(Valu, 4, 8, Unknown)).wdelay(2).agpr(false, 0b1),
-        // reads a VGPR: a VALU result with a writer delay (the cvt_scalef32 pair, v_accvgpr_read, ...) needs wait states before this read too (found on hardware: a dependent
-        // v_accvgpr_write right behind `v_cvt_scalef32_pk_fp8_bf16 ... op_sel` read a stale value; one s_nop fixes it)
-        VAccvgprWrite => a("v_accvgpr_write_b32", c(Valu, 4, 8, Unknown)).wdelay(2).agpr(true, 0).hz_reader(),
+        VAccvgprWrite => a("v_accvgpr_write_b32", c(Valu, 4, 8, Unknown)).wdelay(2).agpr(true, 0),
         VAccvgprMov => a("v_accvgpr_mov_b32", c(Valu, 4, 8, Unknown)).wdelay(2).agpr(true, 0b1),
         // ---- LDS (E): b128 issue 8, b32 4, tr_b8 ~6, write b128 ~26; latency ~52 (reads) / ~75 (write)
         LdsWriteB32 => a("ds_write_b32", c(Lds, 8, 4, Unknown)).mem(L, true, Src(0), 4).agpr(false, 0b10),
