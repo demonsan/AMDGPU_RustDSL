@@ -204,7 +204,7 @@ pub fn spread_valu(m: &mut MFunction, o: &Options) -> usize {
     for bi in 0..m.blocks.len() {
         let insts = m.blocks[bi].insts.clone();
         let n = insts.len();
-        if n < 16 || super::phase::has_markers(&insts) || insts.iter().filter(|i| is_matrix(i.op)).count() < 2 {
+        if n < 6 || super::phase::has_markers(&insts) || insts.iter().filter(|i| is_matrix(i.op)).count() < 2 {
             continue;
         }
         let term = m.blocks[bi].term.clone();
