@@ -40,6 +40,11 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),
         // scheduler-token A/B variants of the shipped kernels (same code + `Function::sched_opts` tokens on top of the kernel's own preset; no env knobs):
+        // probe_ovl_w<waves>_m<mfma>_v<valu>: single-wave MFMA / VALU overlap (fmha-4w design)
+        n if n.starts_with("probe_ovl_w") => {
+            let p: Vec<u32> = n["probe_ovl_".len()..].split('_').filter_map(|x| x[1..].parse().ok()).collect();
+            (p.len() == 3).then(|| crate::probes::probe_ovl(n, p[0], p[1], p[2], 200))
+        }
         "probe_dma" => Some(crate::probes::probe_dma()),
         "probe_safeasm_e2e" => Some(crate::probes::probe_safeasm_e2e()),
         "probe_log_store4" => Some(crate::probes::probe_log_store4()),
