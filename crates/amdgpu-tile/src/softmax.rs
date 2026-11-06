@@ -234,14 +234,27 @@ impl OnlineSoftmax {
     /// shift and the rescale are computed only when some lane's max passes the threshold; otherwise the tile costs the row max, one compare and the
     /// branch. Returns the bias operand of the next tile (the loop variable, read after the branch).
     pub fn decide_lazy(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> Opnd {
-        let bias2 = self.bias.expect("OnlineSoftmax: state not bound");
+        let (mt, grow) = self.lazy_check(b, s, mask);
+        b.begin_if(Opnd::Val(grow));
+        self.lazy_rebase(b, mt, grow, s, o);
+        b.end_if();
+        Opnd::Var(self.bias.expect("OnlineSoftmax: state not bound"))
+    }
+
+    /// The fast-path half of `decide_lazy`: (row max, "some lane passed the threshold").
+    pub fn lazy_check(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> (ValueId, ValueId) {
         let mut flat: Vec<ValueId> = Vec::with_capacity(64);
         for i in 0..4usize {
             flat.extend(masked_values(b, s, i, mask, self.neg_big));
         }
         let mt = row_max(b, &flat);
         let grow = b.cmp_lt_f32(self.thr, mt);
-        b.begin_if(Opnd::Val(grow));
+        (mt, grow)
+    }
+
+    /// The rollback half of `decide_lazy` (to be emitted under `if grow`): new reference, S shift, O / l rescale.
+    pub fn lazy_rebase(&self, b: &mut FnBuilder, mt: ValueId, grow: ValueId, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>) {
+        let bias2 = self.bias.expect("OnlineSoftmax: state not bound");
         {
             let w_old_u = b.frag2_lane(Opnd::Var(bias2), 0);
             let w_old = b.bitcast_i32(w_old_u);
@@ -282,8 +295,6 @@ impl OnlineSoftmax {
             }
             self.scale_l(b, corr);
         }
-        b.end_if();
-        Opnd::Var(bias2)
     }
 
     /// P words of S accumulators `t0..t1` (4 words each; invalid keys contribute 0).

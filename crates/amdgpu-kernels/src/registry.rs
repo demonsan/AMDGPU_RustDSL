@@ -36,14 +36,16 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("mlp_fp8_") => crate::mlp::by_name(n),
         // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
-        "fmha_fwd_hd128_mxfp8_v4w_proto" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v4w_proto()),
-        "fmha_fwd_hd128_mxfp8_v4w_proto_i" => Some(crate::fmha::w4_inter()),
-        // scheduler-token variants of the 4-wave prototype (the full list scheduler cannot allocate it: sched falls back to the unscheduled code): `rewait` = authored order with
-        // counted waits, `hoist=24` = ds_reads hoisted within the register budget, `ovl` = independent VALU spread over the MFMAs of each barrier-free stretch (docs/lgkm-lookahead.md)
-        "fmha_fwd_hd128_mxfp8_v4w_proto_rw" | "fmha_fwd_hd128_mxfp8_v4w_proto_sched" => {
-            let mut f = crate::fmha::fmha_fwd_hd128_mxfp8_v4w_proto();
-            f.sched_opts = Some(if name.ends_with("_rw") { "rewait" } else { "rewait,hoist=24,ovl" }.to_string());
-            f.name = name.to_string();
+        // the 4-wave prototype (EXPERIMENT, docs/fmha-4wave-design.md): `fmha_fwd_hd128_mxfp8_v4w_proto[_a][_i][_l][_rw|_sched]` — `_a` S in AGPR,
+        // `_i` authored QK / conversion interleave, `_l` late rollback (one straight-line region per step); `_rw` = scheduler token `rewait` (authored order,
+        // counted waits), `_sched` = `rewait,hoist=24,ovl` (docs/lgkm-lookahead.md)
+        n if n.starts_with("fmha_fwd_hd128_mxfp8_v4w_proto") => {
+            let mut f = crate::fmha::w4::v4w_named(n);
+            if n.ends_with("_rw") {
+                f.sched_opts = Some("rewait".to_string());
+            } else if n.ends_with("_sched") {
+                f.sched_opts = Some("rewait,hoist=24,ovl".to_string());
+            }
             Some(f)
         }
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
