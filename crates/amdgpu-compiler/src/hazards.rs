@@ -141,6 +141,17 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     }
                 }
             }
+            // the HIGH-half conversion (`v_cvt_scalef32_pk_fp8_* ... op_sel:[0,0,1]`, a partial-dword write) feeding a v_accvgpr_write needs one wait state (hardware: a dependent adjacent pair read a stale value, one
+            // s_nop fixes it); the map is `pkw`, which holds the conversion results (and, strict, the packed-math ones)
+            if inst.op == MOp::VAccvgprWrite {
+                for s in &inst.srcs {
+                    if let Src::Reg(r) = s {
+                        if let Some(rd) = pkw.get(&canon(*r)) {
+                            earliest = earliest.max(*rd);
+                        }
+                    }
+                }
+            }
             if reads_valu_hazard_operands(inst.op) {
                 for s in &inst.srcs {
                     if let Src::Reg(r) = s {
@@ -228,6 +239,9 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                             if strict && matches!(x.op, MOp::VPkAddF32 | MOp::VPkMulF32) {
                                 pkw.insert(canon(d), cycle + 2);
                             }
+                            if matches!(x.op, MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi) {
+                                pkw.insert(canon(d), cycle + 2);
+                            }
                             ready.remove(&canon(d));
                             vw.remove(&canon(d));
                             if let Some(dly) = valu_writer_delay(x.op) {
@@ -279,6 +293,11 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                     if matches!(inst.op, MOp::VPkAddF32 | MOp::VPkMulF32) {
                         pkw.insert(canon(d), cycle + 2);
                     }
+                }
+            }
+            if matches!(inst.op, MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi) {
+                if let Some(d) = inst.dst {
+                    pkw.insert(canon(d), cycle + 2);
                 }
             }
             if is_transcendental(inst.op) {
