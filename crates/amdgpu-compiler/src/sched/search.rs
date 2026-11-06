@@ -180,6 +180,12 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
             if graphs[k].is_none() || best_orders[k].iter().enumerate().all(|(q, &i)| q == i) {
                 continue;
             }
+            // debugging: AMDC_SEARCH_APPLY=<bitmask over the hot path's blocks> applies the result of those blocks only
+            if let Ok(mask) = std::env::var("AMDC_SEARCH_APPLY") {
+                if mask.parse::<u64>().map_or(false, |mk| mk & (1 << k) == 0) {
+                    continue;
+                }
+            }
             let insts = m.blocks[b].insts.clone();
             if o.verify {
                 if let Err(e) = verify::check_perm(m, &insts, &best_orders[k], &m.blocks[b].term, o.alu_across_barrier) {
