@@ -14,6 +14,7 @@ int main(int argc, char** argv) {
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     for (int r = 0; r < 3; ++r) { CK(hipModuleLaunchKernel(fn, blocks, 1, 1, 64 * waves, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize()); }
     std::vector<unsigned> ho(256); CK(hipMemcpy(ho.data(), dout, 1024, hipMemcpyDeviceToHost));
+    if (std::getenv("OVL_DEBUG")) std::printf("raw t1=%u t0=%u r=%u\n", ho[0], ho[128], ho[64]);
     double s = 0; for (int w = 0; w < waves; ++w) { ho[w] = ho[w] - ho[128 + w]; s += ho[w]; }
     std::printf("%s waves=%d mean_cycles_per_wave=%.0f (w0 %u)\n", kn, waves, s / waves, ho[0]);
 }
