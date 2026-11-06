@@ -80,6 +80,10 @@ pub fn cal() -> bool {
     std::env::var("AMDC_SIM_CAL").is_ok()
 }
 
+fn envi(name: &str, default: i64) -> i64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 /// The simulator program of a hot path split per block, so that a search can re-assemble it for another instruction order of a block without recomputing the effects.
 #[derive(Clone)]
 pub struct ProgParts {
@@ -258,7 +262,7 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
             if waiting == 0 {
                 break;
             }
-            let release = ws.iter().filter_map(|w| w.at_barrier).max().unwrap() + BARRIER_COST as i64 + if cal() { 100 } else { 0 };
+            let release = ws.iter().filter_map(|w| w.at_barrier).max().unwrap() + BARRIER_COST as i64 + if cal() { envi("AMDC_SIM_BAR", 100) } else { 0 };
             for w in ws.iter_mut() {
                 if w.at_barrier.is_some() {
                     w.at_barrier = None;
@@ -297,7 +301,7 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
         if ins.is_lds {
             // in-order return; a ds_read_b128 issued behind >= 6 outstanding LDS ops comes back much later (ATT: 144 -> 460..730)
             let pending = w.lg.iter().filter(|x| **x > t).count();
-            let comp = if cal() && ins.lds_big && pending >= 6 { comp + 350 } else { comp };
+            let comp = if cal() && ins.lds_big && pending as i64 >= envi("AMDC_SIM_QTHR", 6) { comp + envi("AMDC_SIM_QPEN", 350) } else { comp };
             let c = comp.max(w.lg.last().copied().unwrap_or(0));
             w.lg.retain(|x| *x > t);
             w.lg.push(c);
@@ -349,6 +353,20 @@ pub fn report(m: &MFunction, waves: &[usize]) -> Vec<LoopReport> {
             let names = ["Valu", "Trans", "Mfma", "Lds", "Vmem", "Salu", "Smem", "Ctrl"];
             let line: Vec<String> = (0..NPIPES).map(|k| format!("{}: {} insts / {} cycles", names[k], cnt[k], busy[k])).collect();
             eprintln!("BOUNDS loop@{h}: {}", line.join("; "));
+        }
+        if std::env::var("AMDC_SIM_SWEEP").is_ok() {
+            std::env::set_var("AMDC_SIM_CAL", "1");
+            for qpen in [0i64, 100, 200, 350] {
+                for qthr in [4i64, 6, 8] {
+                    for bar in [0i64, 50, 100] {
+                        std::env::set_var("AMDC_SIM_QPEN", qpen.to_string());
+                        std::env::set_var("AMDC_SIM_QTHR", qthr.to_string());
+                        std::env::set_var("AMDC_SIM_BAR", bar.to_string());
+                        let prog2 = build_prog(m, &path, hi);
+                        eprintln!("SWEEP {qpen} {qthr} {bar} {:.0}", simulate_prog(&prog2, 1, 24));
+                    }
+                }
+            }
         }
         let cycles = waves.iter().map(|&w| (w, simulate_prog(&prog, w, 24))).collect();
         out.push(LoopReport { header_label: h, blocks: path.len(), insts, cycles_per_iter: cycles });
