@@ -28,6 +28,9 @@ variable is the acc_cd form. MFMA fragment operands may be loop variables (`Opnd
 first `ds_read` was issued: the `ds_read_b128`s write the variable's own registers (no `v_accvgpr_mov`, no second fragment). Programs must put the reload after the variable's last read.
 
 ## Hazards (own tail)
+
+* A high-half `v_cvt_scalef32_pk_fp8_* ... op_sel:[0,0,1]` (a partial-dword write) followed immediately by a dependent `v_accvgpr_write_b32` reads a STALE value: one wait state is padded (`hazards.rs`, map `pkw`; **H**: found on the 4-wave
+  prototype - a scheduler-reordered adjacent pair gave wrong results, one `s_nop` fixed it; the low half and `v_accvgpr_read` -> `v_accvgpr_write` copies are not affected). Test: `tests/hazard_classes.rs`.
 Evidence: CDNA4 ISA table 38 (does not distinguish VGPR/AGPR) + LLVM oracle (L) + hardware probes (H).
 * MFMA result (A or V) read by `v_accvgpr_read`, a store, or an MFMA: result latency (20/21 slots scaled, 12 others) - same model as VGPR; unit-tested. In-place same-opcode accumulation: 0.
 * `v_accvgpr_read/write/mov` are VALU writes: `VALU write -> MFMA read` = 2 wait states (I).

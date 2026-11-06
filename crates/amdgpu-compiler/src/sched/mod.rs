@@ -77,11 +77,13 @@ pub struct Options {
     /// `hjoin=K` (sched/ldahead.rs `hoist_join`): hoist up to K instructions that do not depend on the rare branch's body from the join block into the block before the branch (0 = off)
     pub hjoin: usize,
     pub pslack: i64,
+    /// `hzfill` (hzfill.rs): post-RA filling of the hazard `s_nop` windows with independent instructions from below
+    pub hzfill: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, ovl_sink: false, pexact: false, search: 0, smask: 15, hjoin: 0, pslack: 0 }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, ovl_sink: false, pexact: false, search: 0, smask: 15, hjoin: 0, pslack: 0, hzfill: false }
     }
 }
 
@@ -126,6 +128,7 @@ impl Options {
                         o.ovl_sink = true;
                     }
                     "pexact" => o.pexact = true,
+                    "hzfill" => o.hzfill = true,
                     "hoistchain" => {
                         o.ldshoist = true;
                         o.hoist_chain = true;

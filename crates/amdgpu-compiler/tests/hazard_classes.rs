@@ -43,3 +43,19 @@ fn scalef32_converts_get_two_wait_states_before_a_matrix_operand_or_readfirstlan
         assert!(gap(&m, writer, MOp::VReadFirstLane) >= 2, "{writer:?}: only {} wait states before v_readfirstlane", gap(&m, writer, MOp::VReadFirstLane));
     }
 }
+
+#[test]
+fn a_high_half_scalef32_convert_gets_one_wait_state_before_a_dependent_accvgpr_write() {
+    // found on hardware (the 4-wave prototype, a search-scheduled order): `v_cvt_scalef32_pk_fp8_bf16 ... op_sel:[0,0,1]` (the high-half partial write) immediately followed by
+    // `v_accvgpr_write_b32` of its result read a stale value; one `s_nop` fixes it. The low half and the accvgpr_read -> accvgpr_write copy pairs of the shipped kernels need nothing.
+    let mk = |writer: MOp| {
+        let w = MInst::new(writer).def(0).srcreg(1).srcreg(2);
+        let aw = MInst::new(MOp::VAccvgprWrite).def(3).srcreg(0);
+        let mut m = func(vec![w, aw], 5);
+        fix_value_hazards_opts(&mut m, false);
+        gap(&m, writer, MOp::VAccvgprWrite)
+    };
+    assert!(mk(MOp::VCvtPkFp8Hi) >= 1, "the high-half convert needs a wait state before the accvgpr_write");
+    assert_eq!(mk(MOp::VCvtPkFp8Lo), 0, "the low half stays unpadded");
+    assert_eq!(mk(MOp::VAccvgprRead), 0, "accvgpr_read -> accvgpr_write copies stay unpadded");
+}
