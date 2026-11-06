@@ -11,6 +11,8 @@ use amdgpu_tile::dma::{issue_rows_shared, partition_dma, DmaPart};
 use amdgpu_tile::mma::{gemm, make_tiled_mma, TiledMma};
 use amdgpu_tile::{contract, Ctx};
 pub mod io;
+mod w4;
+pub use w4::fmha_fwd_hd128_mxfp8_v4w_proto;
 
 use io::{combine_kernel, FmhaBlock, FmhaIo};
 use amdgpu_tile::frag::{AccTile, Frag, QkOut, B32x32x64Fp8, C32x32F32};
@@ -79,6 +81,10 @@ pub struct KvRing3 {
 
 impl KvRing3 {
     pub fn new(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32) -> KvRing3 {
+        Self::new_with(b, io, blk, roles, slots, slots == 2)
+    }
+    /// `kd_dma`: the K scales through an LDS-direct DMA (`Role::A` stages), else through VGPRs (`_t128`).
+    pub fn new_with(b: &mut FnBuilder, io: &FmhaIo, blk: &FmhaBlock, roles: &Roles, slots: u32, kd_dma: bool) -> KvRing3 {
         let mut lds = LdsPlan::new();
         let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
         let kd = lds.ring("KD", 512, slots, Layout::Linear);
@@ -108,7 +114,7 @@ impl KvRing3 {
         let wv = ev(roles.wave_in_group);
         let kdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, ksrc, &ks, &kv_view());
         let vdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, vsrc, &vs, &kv_view());
-        let kdc = if slots == 2 {
+        let kdc = if kd_dma {
             // 128 rows x 4 bytes, one dword per lane: waves 0 / 1 stage rows 0..63 / 64..127, waves 2 / 3 repeat them (the wave index taken mod 2)
             let w2 = w.mod_c(2, &ctx.dyns);
             let wv2 = b.let_i32(ev(roles.wave_in_group) & 1);
@@ -573,6 +579,11 @@ pub fn declare_io(b: &mut FnBuilder, rows_per_block: i64, kvsplit: bool) -> Fmha
 /// `FmhaIo::block` with the Q fragments loaded through a TiledCopy: the B operand of the scaled 32x32x64 atom over the lane's (clamped) query row, two
 /// k-groups of 64 bytes (placements 0 / 64): one pointer (row + 16 (lane >> 5)) and four `global_load_dwordx4` with immediates 0 / 32 / 64 / 96.
 pub fn block3(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32) -> FmhaBlock {
+    block3_g(io, b, rows_lg, None)
+}
+
+/// `block3` for row group `g` (0 / 1) of a wave that owns 64 query rows (the 4-wave layout): rows `32 (2 wave + g) ..`.
+pub fn block3_g(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, g: Option<i32>) -> FmhaBlock {
     let qtile = b.let_(amdgpu_dsl::Op::WorkgroupIdX);
     let hidx = b.let_(amdgpu_dsl::Op::WorkgroupIdY);
     let zz = b.let_(amdgpu_dsl::Op::WorkgroupIdZ);
@@ -587,7 +598,10 @@ pub fn block3(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32) -> FmhaBlock {
             (bi, kv_eff, ev(key_lo), Some(si))
         }
     };
-    let row0 = b.let_i32((ev(qtile) << rows_lg) + (lane.wave() << 5));
+    let row0 = match g {
+        None => b.let_i32((ev(qtile) << rows_lg) + (lane.wave() << 5)),
+        Some(g) => b.let_i32((ev(qtile) << rows_lg) + (((lane.wave() << 1) + g) << 5)),
+    };
     let row = b.let_i32(&row0 + lane.j());
     let s_last = b.let_i32(&io.s_len - 1);
     let row_c = b.let_i32(row.lt(io.s_len.clone()).select_i32(row.clone(), s_last.clone()));
