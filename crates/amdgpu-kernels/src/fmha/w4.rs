@@ -62,7 +62,8 @@ fn qk_and_convert(b: &mut FnBuilder, q: &AttnBody3, slot: &SlotIdx, bias: Opnd, 
     w
 }
 
-/// One step: the other group's PV + QK (MFMA phase of `m`) with the softmax of `c`; the P words of `c` end in `pv` (loop variables).
+/// One step: the other group's PV + QK (MFMA phase of `m`) with the softmax of `c`; returns the P words of `c` (late mode: also / only valid
+/// through `pvars`, which the rollback branch rewrites; `pvars` empty: the values are returned and not stored).
 #[allow(clippy::too_many_arguments)]
 fn step(
     b: &mut FnBuilder,
@@ -75,7 +76,7 @@ fn step(
     c: &AttnBody3,
     sv: &AccTile<C32x32F32, 4>,
     pvars: &[VarId],
-) {
+) -> Vec<ValueId> {
     m.pv(b, pv_slot, pv_words);
     let cs = c.s.expect("S");
     let co = c.o.expect("O");
@@ -101,12 +102,14 @@ fn step(
             b.set_var(*v, *x);
         }
         b.end_if();
+        read_words(b, pvars)
     } else {
         c.sm.decide_lazy(b, &s, &co, None);
         let w = qk_and_convert(b, m, qk_slot, qk_bias, c, &s, o.inter);
         for (v, x) in pvars.iter().zip(&w) {
             b.set_var(*v, *x);
         }
+        w
     }
 }
 
@@ -170,7 +173,8 @@ pub fn v4w_named(name: &str) -> Function {
     let (n0, n1) = (s0.len(), s1.len());
     inits.extend(s0);
     inits.extend(s1);
-    for _ in 0..32 {
+    let np0 = if opts.late { 16 } else { 0 };
+    for _ in 0..16 + np0 {
         inits.push((DType::I32, Opnd::Val(zc)));
     }
     if opts.s_agpr {
@@ -183,9 +187,9 @@ pub fn v4w_named(name: &str) -> Function {
     g0.bind_state(&vars[2..2 + n0]);
     g1.bind_state(&vars[2 + n0..2 + n0 + n1]);
     let base = 2 + n0 + n1;
-    let p0v: Vec<VarId> = vars[base..base + 16].to_vec();
-    let p1v: Vec<VarId> = vars[base + 16..base + 32].to_vec();
-    let sv: AccTile<C32x32F32, 4> = if opts.s_agpr { AccTile::from_vars(&vars[base + 32..base + 36]) } else { g0.s.expect("S") };
+    let p0v: Vec<VarId> = vars[base..base + np0].to_vec();
+    let p1v: Vec<VarId> = vars[base + np0..base + np0 + 16].to_vec();
+    let sv: AccTile<C32x32F32, 4> = if opts.s_agpr { AccTile::from_vars(&vars[base + np0 + 16..base + np0 + 20]) } else { g0.s.expect("S") };
     for g in [&g0, &g1] {
         for a in &g.o.expect("O").accs {
             b.pin_agpr(a.var);
@@ -218,11 +222,11 @@ pub fn v4w_named(name: &str) -> Function {
     // ---- step 1: g1.PV(t-1) + g1.QK(t) || g0 softmax(t) ----
     let w1 = read_words(b, &p1v);
     let sv0 = if opts.s_agpr { sv } else { g0.s.expect("S") };
-    step(b, opts, &g1, &sl_tm1, &w1, &sl_t, bias1, &g0, &sv0, &p0v);
+    let w0 = step(b, opts, &g1, &sl_tm1, &w1, &sl_t, bias1, &g0, &sv0, &p0v);
     // ---- step 2: g0.PV(t) + g0.QK(t+1) || g1 softmax(t) ----
-    let w0 = read_words(b, &p0v);
     let sv1 = if opts.s_agpr { sv } else { g1.s.expect("S") };
-    step(b, opts, &g0, &sl_t, &w0, &sl_t1, bias0, &g1, &sv1, &p1v);
+    // g1's words must survive into the next tile: in the non-late mode `step` stores them into p1v
+    let _ = step(b, opts, &g0, &sl_t, &w0, &sl_t1, bias0, &g1, &sv1, &p1v);
     b.wait_vm(0);
     b.wait_lds(0);
     b.barrier();
