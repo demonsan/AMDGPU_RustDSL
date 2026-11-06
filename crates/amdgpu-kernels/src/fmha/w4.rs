@@ -237,6 +237,18 @@ pub fn v4w_named(name: &str) -> Function {
     let sv1 = if opts.s_agpr { sv } else { g1.s.expect("S") };
     // one tile t = `it` in slot `idx`; `last`: the peeled final tile (masked keys, no copies, no QK of t+1, g1.PV(t) appended)
     let tile = |b: &mut FnBuilder, it: Opnd, idx: Opnd, last: bool| -> (ValueId, ValueId) {
+        // the tile counter and slot index are wave-uniform: one readfirstlane each, so the key / slot / M0 arithmetic is SALU
+        let sc = |b: &mut FnBuilder, o: Opnd| -> Opnd {
+            match o {
+                Opnd::Var(_) => {
+                    let v = b.let_(amdgpu_dsl::Op::AddI32(o, Opnd::I32(0)));
+                    Opnd::Val(b.read_first_lane(v))
+                }
+                o => o,
+            }
+        };
+        let it = sc(b, it);
+        let idx = sc(b, idx);
         let x = |o: &Opnd| -> I32 {
             match o {
                 Opnd::Var(v) => varx(*v),
