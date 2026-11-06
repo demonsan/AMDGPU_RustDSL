@@ -237,18 +237,6 @@ pub fn v4w_named(name: &str) -> Function {
     let sv1 = if opts.s_agpr { sv } else { g1.s.expect("S") };
     // one tile t = `it` in slot `idx`; `last`: the peeled final tile (masked keys, no copies, no QK of t+1, g1.PV(t) appended)
     let tile = |b: &mut FnBuilder, it: Opnd, idx: Opnd, last: bool| -> (ValueId, ValueId) {
-        // the tile counter and slot index are wave-uniform: one readfirstlane each, so the key / slot / M0 arithmetic is SALU
-        let sc = |b: &mut FnBuilder, o: Opnd| -> Opnd {
-            match o {
-                Opnd::Var(_) => {
-                    let v = b.let_(amdgpu_dsl::Op::AddI32(o, Opnd::I32(0)));
-                    Opnd::Val(b.read_first_lane(v))
-                }
-                o => o,
-            }
-        };
-        let it = sc(b, it);
-        let idx = sc(b, idx);
         let x = |o: &Opnd| -> I32 {
             match o {
                 Opnd::Var(v) => varx(*v),
@@ -318,5 +306,10 @@ pub fn v4w_named(name: &str) -> Function {
         let fin = g.out_scale(b);
         store_out3(&io, b, blk, &g.o.expect("O"), fin);
     }
-    fb.finish()
+    let mut f = fb.finish();
+    // the GEMM profile's uniform-integer lowering on top of the FMHA profile (slot / key / M0 math in SALU), and the in-order schedule with counted
+    // waits, ds_read hoisting, VALU spreading behind the MFMAs and post-RA hazard-window filling (backend-llvm-tail / sched)
+    f.lower_opts.extend(["scalarize2".to_string(), "waveuni".to_string()]);
+    f.sched_opts = Some("rewait,hoist=24,ovl,hzfill".to_string());
+    f
 }

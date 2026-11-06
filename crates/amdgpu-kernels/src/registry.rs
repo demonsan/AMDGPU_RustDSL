@@ -41,14 +41,9 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // counted waits), `_sched` = `rewait,hoist=24,ovl` (docs/lgkm-lookahead.md)
         n if n.starts_with("fmha_fwd_hd128_mxfp8_v4w_proto") => {
             let mut f = crate::fmha::w4::v4w_named(n);
-            // _s2: the GEMM profile's uniform-integer lowering (scalarize2 + waveuni) on top of the FMHA profile
-            if n.split('_').any(|x| x == "s2") {
-                f.lower_opts.extend(["scalarize2".to_string(), "waveuni".to_string()]);
-            }
-            if n.ends_with("_rw") {
-                f.sched_opts = Some("rewait".to_string());
-            } else if n.ends_with("_sched") {
-                f.sched_opts = Some("rewait,hoist=24,ovl".to_string());
+            // the builder sets the best settings (scalarize2,waveuni lowering; rewait,hoist=24,ovl,hzfill); `_list` = default list scheduler for comparison
+            if n.ends_with("_list") {
+                f.sched_opts = None;
             }
             Some(f)
         }
