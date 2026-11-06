@@ -251,6 +251,23 @@ pub fn spread_valu(m: &mut MFunction, o: &Options) -> usize {
                     pos[order[p]] = p;
                     moved += 1;
                 }
+                if o.ovl_sink {
+                    // x sits in front of its MFMA: sink it to directly behind it, unless something after it depends on x
+                    loop {
+                        let p = pos[x];
+                        if p >= pos[tm] || p + 1 >= n {
+                            break;
+                        }
+                        let next = order[p + 1];
+                        if g.succs[x].iter().any(|&(q, _)| q == next) {
+                            break;
+                        }
+                        order.swap(p, p + 1);
+                        pos[order[p]] = p;
+                        pos[order[p + 1]] = p + 1;
+                        moved += 1;
+                    }
+                }
             }
         }
         if moved == 0 {
