@@ -86,3 +86,16 @@ REF_DATA=normal，GPU 4，同一轮交替 7 轮；TF/s（per-CU B1H8S2048 / B4H8
 稳态循环里两个 MFMA 之间的 VALU 条数直方图（桶宽 4）：`rewait` `{0: 34, 40+: 3}`（MFMA 成组，VALU 成团） → `rewait,ovl` `{0: 14, 4: 10, 8: 8, 12: 2, 24: 1, 40+: 2}`（已摊开）。
 单靠调度只能到厂商的 0.57× / 0.70× / 0.80×；每个稳态 tile 的指令数（`rewait`）：38 MFMA、498 VALU + 288 `v_accvgpr_*`（AGPR 往返）、64 `ds_read_b64_tr_b8`、40 `ds_read_b128`，VALU / MFMA = 20.7，远高于厂商，
 AGPR 往返是最大的可削项。无环境变量的变体：`fmha_fwd_hd128_mxfp8_v4w_proto_rw` / `fmha_fwd_hd128_mxfp8_v4w_proto_sched`（= `rewait,hoist=24,ovl`）。
+
+## `pexact`、`hjoin`、`ovlsink`（4-wave 原型，2026-11-06）
+
+**压力模型 = 分配器的真实峰值（`pexact`，opt-in）。** 调度器的 per-block 压力模型比分配器低估约 20–50 dword（例：`v4w_proto` block 2 模型 214 / 分配器 247，block 4 240 / 266；分配器把循环携带值按整段循环范围算活跃，
+`limit` 的下限又是原顺序的模型峰值，所以收紧 `limit` 无效），完整 list scheduler 因此总是回退。`regalloc::pressure_by_block` 给出分配器口径的每块峰值；`pexact` 对每个块收紧模型 `limit`，直到该块的分配器口径峰值
+不超过作者顺序的（+ `pslack`），否则保留作者顺序。效果：list scheduler 能分配（VGPR 242 / 245，不再回退），但吞吐低于 `rewait,hoist=24,ovl`：381.9 / 1278.5 / 1848.8 vs 404.7 / 1332.4 / 1927.3 TF/s
+（per-CU / B4 / S8192）；`pexact,ovl` / `pexact,hoist=24` 同量级 —— 对这个内核 list 的代价模型给出的顺序更差。
+
+**跨稀有分支（`hjoin=K`，opt-in）。** 稀有的 rollback `if` 把热路径切成 A →（空块 | 稀有体）→ J，J 的头几条 MFMA 无法和 A 里的 decide VALU 重叠。`hjoin` 把 J 里与稀有体无依赖的、依赖闭合的前缀（≤ K 条）提到 A 的末尾
+（不碰 vcc / scc，分配器压力不超过 A 与 J 的作者最大值）。64 条被提过三处分支，分配成功，但硬件更慢：同一轮交替 7 轮（`rewait,hoist=24,ovl` = 404.7 / 1333.8 / 1921.3）：`hjoin=8` +0.2 / — / +0.2 %，`hjoin=16` −3.5 / — / −2.4 %，
+`hjoin=32` −7.1 / — / −5.2 %，`hjoin=64` −8.7 / −5.5 / −6.8 %，`hjoin=200` −9.5 / −6.0 / −7.4 %；加 `ovlsink`（`ovl` 也允许把 VALU 下沉到目标 MFMA 之后）仍是 −8 / −5.5 / −6.5 %（`hjoin=64`）。
+无 hjoin 时 `ovlsink` 与 `ovl` 持平（+0.4 / −0.3 / +0.4 %）。间隙直方图（两 MFMA 之间的 VALU 数，桶宽 4）：`rewait,hoist=24,ovl` `{0:13, 4:11, 8:8, 12:2, 24:1, 40+:2}` → `+hjoin=64` `{0:27, 4:6, 40+:4}`（更差）。
+结论：没有余量（> +5 % 的门槛未达到），跨迭代 modulo pass 不做；剩余差距来自 VALU 体量（每 tile 498 VALU + 288 `v_accvgpr_*` / 38 MFMA），不是 MFMA 间隙。
