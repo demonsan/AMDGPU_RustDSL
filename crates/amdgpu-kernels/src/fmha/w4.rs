@@ -97,7 +97,7 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
     let kv = key(b, ev(it_p1));
     ring.stage(b, Role::B, &kv, &sl_t1);
     // ---- step 1: g1.PV(t-1) + g1.QK(t) || g0 softmax(t) ----
-    let w1: Vec<ValueId> = p1v.iter().map(|&v| b.bind_i32(varx(v))).collect();
+    let w1: Vec<ValueId> = p1v.iter().map(|&v| b.let_(amdgpu_dsl::Op::AddI32(Opnd::Var(v), Opnd::I32(0)))).collect();
     b.set_prio(1);
     g1.pv(b, &sl_tm1, &w1);
     {
@@ -147,7 +147,7 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
     b.end_loop();
     // ---- tail: g1.PV(last) ----
     let it_l = b.bind_i32(ev(nkv) - 1);
-    let w1: Vec<ValueId> = p1v.iter().map(|&v| b.bind_i32(varx(v))).collect();
+    let w1: Vec<ValueId> = p1v.iter().map(|&v| b.let_(amdgpu_dsl::Op::AddI32(Opnd::Var(v), Opnd::I32(0)))).collect();
     let idx_l = b.bind_i32(varx(idx).lt(1).select_i32(2, varx(idx) - 1));
     g1.pv(b, &SlotIdx::new(idx_l, it_l), &w1);
     for (g, blk) in [(&g0, &blk0), (&g1, &blk1)] {
