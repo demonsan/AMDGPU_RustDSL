@@ -154,6 +154,15 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
                 if std::env::var("AMDC_SEARCH_TRACE").is_ok() {
                     let ii = &m.blocks[path[k]].insts[x];
                     eprintln!("SMOVE block {} inst#{x} {:?} dst {:?} from {p} to {np} cost {c:.0}", path[k], ii.op, ii.dst);
+                    if std::env::var("AMDC_SEARCH_TRACE").as_deref() == Ok("2") {
+                        eprintln!("   mover: {:?}", ii);
+                        // the instructions it passed (in the order BEFORE this move they sat between p and np)
+                        for q in p.min(np)..=p.max(np) {
+                            if orders[k][q] != x {
+                                eprintln!("   passed: {:?}", m.blocks[path[k]].insts[orders[k][q]]);
+                            }
+                        }
+                    }
                 }
                 naccepted += 1;
                 cur = c;
