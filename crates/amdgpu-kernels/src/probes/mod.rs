@@ -2287,7 +2287,7 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
                 w.push(b.bitcast_i32(x));
             }
         }
-        amdgpu_tile::frag::Frag::<amdgpu_isa::B32x32x64Fp8>::from_words(&mut b, &w).v
+        amdgpu_tile::frag::Frag::<amdgpu_tile::frag::B32x32x64Fp8>::from_words(&mut b, &w).v
     };
     let sc = b.c_i32(127);
     let fz = b.frag_zero(DType::Frag16);
@@ -2344,7 +2344,7 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
     b.break_if(stop);
     b.end_loop();
     let t1 = b.memtime_lo();
-    let dt = b.sub_i32(t1, t0);
+    let dt = b.bind_i32(amdgpu_dsl::ev(t1) - amdgpu_dsl::ev(t0));
     let c4 = b.c_i32(4);
     let wo = b.mul_i32(wave, c4);
     let po = b.ptr_add(o, wo);
