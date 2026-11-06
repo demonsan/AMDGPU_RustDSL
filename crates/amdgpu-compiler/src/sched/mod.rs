@@ -62,11 +62,13 @@ pub struct Options {
     pub ldahead32: usize,
     /// `wsink` (sched/ldahead.rs): sink the kernel's EXPLICIT `s_waitcnt lgkmcnt(n)` down past the compute that does not need them, so the MFMAs in front of a closing `wait_lds(0)` get the counted waits of the scoreboard
     pub waitsink: bool,
+    /// `ovl=N` (sched/ldahead.rs `spread_valu`): inside every barrier-free stretch with >= 2 MFMAs, VALU / SALU work that is independent of the MFMAs in between is hoisted up so that it is spread evenly over the stretch's MFMAs (a stretch needs at least N such instructions; 0 = off)
+    pub ovl: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0 }
     }
 }
 
@@ -105,6 +107,7 @@ impl Options {
                     "ldshoist" => o.ldshoist = true,
                     "slotfill" => o.slotfill = true,
                     "wsink" => o.waitsink = true,
+                    "ovl" => o.ovl = 8,
                     "hoistchain" => {
                         o.ldshoist = true;
                         o.hoist_chain = true;
@@ -112,6 +115,11 @@ impl Options {
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
+                        }
+                        if let Some(v) = t.strip_prefix("ovl=") {
+                            if let Ok(n) = v.parse() {
+                                o.ovl = n;
+                            }
                         }
                         if let Some(v) = t.strip_prefix("ldahead32=") {
                             if let Ok(n) = v.parse() {
@@ -234,6 +242,12 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         eprintln!("phase: {phased} instructions moved");
     }
     schedule_blocks(m, o, &mut stats)?;
+    if o.ovl > 0 {
+        let n = ldahead::spread_valu(m, o);
+        if o.stats {
+            eprintln!("ovl: {n} instructions moved");
+        }
+    }
     if o.waitsink {
         let n = ldahead::sink_explicit_waits(m, o);
         if o.stats {
