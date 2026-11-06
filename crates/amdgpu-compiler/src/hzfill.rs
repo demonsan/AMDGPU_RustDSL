@@ -116,22 +116,36 @@ fn hazard_clean(m: &MFunction, a: &Alloc, strict: bool) -> bool {
     same(&c, m)
 }
 
-/// One fill step at nop index `i` of block `bi`: the first legal candidate below it moves up (returns the candidate's old index).
-fn candidate(m: &MFunction, a: &Alloc, bi: usize, i: usize, window: usize) -> Option<usize> {
+/// The fill candidates for the nop at index `i` of block `bi`, nearest first: instructions below it that may move up to it. Besides the
+/// dependence rules above, a candidate must be independent of the HAZARD PAIR: it touches no register written or read by the instructions
+/// in front of the nop (the producer side, up to `window` back) - so it is neither the consumer the nop protects nor a new consumer / WAR
+/// victim of the producer.
+fn candidates(m: &MFunction, a: &Alloc, bi: usize, i: usize, window: usize) -> Vec<usize> {
     let insts = &m.blocks[bi].insts;
+    let pre: Vec<Fx> = insts[i.saturating_sub(window)..i].iter().map(|x| fx(m, a, x)).collect();
     let fxs: Vec<Fx> = insts.iter().skip(i + 1).take(window).map(|x| fx(m, a, x)).collect();
+    let touches = |p: &Fx, y: &Fx| {
+        let any = |u: &[Rng], v: &[Rng]| u.iter().any(|x| v.iter().any(|z| ov(x, z)));
+        any(&p.writes, &y.reads) || any(&p.writes, &y.writes) || any(&p.reads, &y.writes)
+    };
+    let mut out = Vec::new();
     for (k, y) in fxs.iter().enumerate() {
         let j = i + 1 + k;
         if is_stop(&insts[j], &y.eff) {
-            return None;
+            break;
         }
         let hops = &fxs[..k];
-        let blocked = hops.iter().any(|z| conflict(z, y) || (is_mem(&z.eff) && is_mem(&y.eff)) || crate::sched::order::mem_must_order(&z.eff, None, &y.eff, None, false));
+        let blocked = hops.iter().any(|z| conflict(z, y) || (is_mem(&z.eff) && is_mem(&y.eff)) || crate::sched::order::mem_must_order(&z.eff, None, &y.eff, None, false))
+            || pre.iter().any(|p| touches(p, y));
         if !blocked {
-            return Some(j);
+            out.push(j);
         }
     }
-    None
+    out
+}
+
+fn candidate(m: &MFunction, a: &Alloc, bi: usize, i: usize, window: usize) -> Option<usize> {
+    candidates(m, a, bi, i, window).into_iter().next()
 }
 
 fn apply(m: &mut MFunction, bi: usize, i: usize, j: usize) {
@@ -187,16 +201,21 @@ pub fn fill(m: &mut MFunction, a: &Alloc, strict: bool) -> FillStats {
             while i < m.blocks[bi].insts.len() {
                 let x = &m.blocks[bi].insts[i];
                 if x.op == MOp::SNop && !x.pin && !(i > 0 && m.blocks[bi].insts[i - 1].pin) {
-                    if let Some(j) = candidate(m, a, bi, i, WINDOW) {
+                    let mut done = false;
+                    for j in candidates(m, a, bi, i, WINDOW).into_iter().take(4) {
                         let mut t = m.clone();
                         apply(&mut t, bi, i, j);
                         if hazard_clean(&t, a, strict) {
                             *m = t;
                             st.moved += 1;
-                            i += 1;
-                            continue;
+                            done = true;
+                            break;
                         }
                         st.rejected += 1;
+                    }
+                    if done {
+                        i += 1;
+                        continue;
                     }
                 }
                 i += 1;
