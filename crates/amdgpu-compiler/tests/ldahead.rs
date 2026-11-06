@@ -109,3 +109,34 @@ fn wsink_moves_an_explicit_wait_past_compute_but_not_past_memory_or_barriers() {
     assert!(n > 0, "the wait must move");
     assert_eq!(names.join(" "), "M M M W |");
 }
+
+#[test]
+fn ovl_spreads_independent_valu_evenly_over_the_mfmas_of_a_stretch() {
+    use amdgpu_compiler::sched::ldahead::spread_valu;
+    let mv = |d: u32| MInst::new(MOp::VMovB32).def(28 + d).imm(d as i64);
+    let src = vec![mfma(0), mfma(1), mfma(2), mfma(3), mv(0), mv(1), mv(2), mv(3), MInst::new(MOp::SBarrier)];
+    let mut m = mk(src);
+    let o = Options { verify: true, ovl: 1, ..Options::default() };
+    let moved = spread_valu(&mut m, &o);
+    let names: Vec<String> = m.blocks[0].insts.iter().map(|i| match i.op {
+        MOp::VMfmaScale16x16x128Fp8 => "M".into(),
+        MOp::VMovB32 => "v".into(),
+        _ => "|".into(),
+    }).collect();
+    assert!(moved > 0);
+    assert_eq!(names.join(" "), "M v M v M v M v |");
+}
+
+#[test]
+fn ovl_leaves_a_valu_that_depends_on_an_mfma_behind_it() {
+    use amdgpu_compiler::sched::ldahead::spread_valu;
+    // v consumes MFMA 3's accumulator (reg 3): it cannot hop above that MFMA
+    let dep = MInst::new(MOp::VMovB32).def(28).srcreg(3);
+    let src = vec![mfma(0), mfma(1), mfma(2), mfma(3), dep, MInst::new(MOp::VMovB32).def(29).imm(1), MInst::new(MOp::SBarrier)];
+    let mut m = mk(src);
+    let o = Options { verify: true, ovl: 1, ..Options::default() };
+    spread_valu(&mut m, &o);
+    let p_mfma3 = m.blocks[0].insts.iter().position(|i| i.op == MOp::VMfmaScale16x16x128Fp8 && i.dst == Some(3)).unwrap();
+    let p_dep = m.blocks[0].insts.iter().position(|i| i.op == MOp::VMovB32 && i.dst == Some(28)).unwrap();
+    assert!(p_dep > p_mfma3);
+}
