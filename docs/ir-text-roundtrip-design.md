@@ -180,7 +180,7 @@ amdc print-ir --from-ir k.ir --stage mir|mir-ra      # 看手改后的 MIR
 | **P0** | 打印端补齐 G1–G7（版本头、`agpr`、`values:`、循环变量类型、完整 tile、assume 理由、Op 内 `%vN`）；`canon_text` 规范化 Op 内值 id；出厂 md5 不变（只改打印） | ~200 行 |
 | **P1** | 词法 + 通用 Debug 值解析（~300）、`FromIr` 解码（Op/Stmt 宏表 ~350、Ext/Opnd/DType/合同/StageContract/AgprMark ~300）、结构重建 + `Function::from_parts`（~150）、校验（~250）；测试：全 kernel 文本不动点 + `Function` 相等 + 变体覆盖 | ~1 350 行 + 测试 ~300 |
 | **P2** | CLI（`ir-check`、`--from-ir` 于 emit / gpu-verify / jit-info / print-ir，~150）；**验收**：全部已注册 kernel 双后端 md5 相同、严格证书相同；safe-asm 块文本（如需要） | ~250 行 |
-| **P3** | 工具与 JIT 接入（ab 脚本接受 `.ir`、Python 包 `ir_path`、缓存键）；文档 `docs/ir-text.md`（格式参考 + 智能体实验指南） | ~100 行 + 文档 |
+| **P3** | 工具与 JIT 接入（ab 脚本接受 `.ir`、Python 包 `ir_path`、缓存键）；文档 docs/ir-text.md（待 P3 新建）（格式参考 + 智能体实验指南） | ~100 行 + 文档 |
 | P4（可选） | Op/Stmt 声明式宏表（单一事实来源，生成 enum + 打印 + 解析） | 大，另行评估 |
 | P5（以后） | MIR 文本往返 | — |
 
