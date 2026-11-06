@@ -315,3 +315,214 @@ pub fn v4w_named(name: &str) -> Function {
     f.sched_opts = Some("rewait,hoist=24,ovl,hzfill,ldahead32=1".to_string());
     f
 }
+
+// ===================================================================================================================================
+// `_r` (EXPERIMENT): both 32-row groups on the SAME tile, every K / V fragment read once from LDS and used by the MFMAs of both groups
+// (half the LDS read traffic per flop). Per tile t:
+//   stage K(t+2), V(t+1)
+//   X: PV(t-1) of both groups (shared V fragments; P(t-1) carried in AGPRs)  ||  softmax(t) of g0, then of g1 (row sums taken here, on the
+//      fresh VGPR words: the row-sum smfmac cannot read AGPRs)
+//   Y: QK(t+1) of both groups (shared K fragments / K-scale words) into the S tiles the softmax just released
+//   wait copies, barrier
+
+/// QK of both groups from one read of each K fragment / K-scale word (kscale_sel + biasonce form of `AttnBody3::qk`).
+fn qk_pair(b: &mut FnBuilder, gs: [&AttnBody3; 2], slot: &SlotIdx, bias: [Opnd; 2]) {
+    let r = gs[0].ring;
+    let k = r.kpart.at(b, &r.ks.at(slot));
+    let kd = r.kdpart.at(b, &r.kd.at(slot));
+    let ss = [gs[0].s.expect("S"), gs[1].s.expect("S")];
+    for g in 0..2 {
+        b.var_mfma_f16_z(ss[g].accs[3].var, gs[g].sm.ones_f16, bias[g]);
+    }
+    for s in 0..4usize {
+        let (mut k0, mut k1) = (k.read(b, 2 * s), k.read(b, 2 * s + 1));
+        if gs[0].kfrag_agpr {
+            k0 = b.agpr(k0);
+            k1 = b.agpr(k1);
+        }
+        let kw = kd.read(b, s);
+        let w = b.bind_i32(ev(kw).lshr(ev(gs[0].blk.sel.g8)));
+        for g in 0..2 {
+            let blk = gs[g].blk;
+            let q = &blk.q.frags;
+            let acc = ss[g].accs[s].var;
+            if s < 3 {
+                b.var_mfma_scale_c(acc, k0, q[0].v, Opnd::Var(ss[g].accs[3].var), w, blk.sq[0]);
+            } else {
+                gemm(b, &r.mma, acc, k0, q[0].v, w, blk.sq[0], 0, 0);
+            }
+            gemm(b, &r.mma, acc, k1, q[1].v, w, blk.sq[1], 2, 0);
+        }
+    }
+}
+
+/// PV of both groups from one read of each transposed V fragment; `p[g]` = the two P fragments of group g (row sums NOT taken here).
+fn pv_pair(b: &mut FnBuilder, gs: [&AttnBody3; 2], slot: &SlotIdx, p: [[ValueId; 2]; 2]) {
+    let r = gs[0].ring;
+    let v = r.vpart.at(b, &r.vs.at(slot));
+    for hh in 0..2usize {
+        for e in 0..4usize {
+            let vf = v.read(b, hh + 2 * e);
+            for g in 0..2 {
+                let o = gs[g].o.expect("O");
+                gemm(b, &r.mma, o.accs[e].var, vf, p[g][hh], gs[g].c127, gs[g].c123, 0, 0);
+            }
+        }
+    }
+}
+
+/// Softmax of group `g` on its S tile: lazy decision, P words, row sums on the fresh words; the words are stored into `pvars`.
+fn soft_store(b: &mut FnBuilder, g: &AttnBody3, mask: Option<&KeyMask>, pvars: &[VarId]) {
+    let (s, o) = (g.s.expect("S"), g.o.expect("O"));
+    g.sm.decide_lazy(b, &s, &o, mask);
+    let w: Vec<ValueId> = (0..4usize).flat_map(|i| g.sm.convert(b, &s, mask, i, i + 1)).collect();
+    let f0 = Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]).v;
+    let f1 = Frag::<B32x32x64Fp8>::from_words(b, &w[8..16]).v;
+    g.sm.row_sum(b, f0, f1);
+    for (v, x) in pvars.iter().zip(&w) {
+        b.set_var(*v, *x);
+    }
+}
+
+pub fn v4w_reuse(name: &str) -> Function {
+    let mut fb = FnBuilder::new(name, 256);
+    fb.compile_profile(CompileProfile::Vs128);
+    let b = &mut fb;
+    let io = declare_io(b, 256, false);
+    let mut blk0 = block3_g(&io, b, 8, Some(0));
+    let mut blk1 = block3_g(&io, b, 8, Some(1));
+    for blk in [&mut blk0, &mut blk1] {
+        for f in blk.q.frags.iter_mut() {
+            f.v = b.agpr(f.v);
+        }
+    }
+    let (blk0, blk1) = (blk0, blk1);
+    let roles = Roles::single(&blk0.lane, 4);
+    let mut ring = KvRing3::new_with(b, &io, &blk0, &roles, 3, true);
+    ring.enable_buffer_dma(b);
+    ring.enable_buffer_kd(b);
+    let ring = ring;
+    let wave = blk0.lane.wave;
+    let wid0 = b.bind_i32(ev(wave) << 1);
+    let wid1 = b.bind_i32((ev(wave) << 1) + 1);
+    let mut g0 = AttnBody3::new(b, &ring, &blk0, wid0, false);
+    let mut g1 = AttnBody3::new(b, &ring, &blk1, wid1, false);
+    for g in [&mut g0, &mut g1] {
+        g.kscale_sel = true;
+        let p = amdgpu_tile::rowsum::plan();
+        g.sm.use_rows2(b, &g.blk.lane, p.dwords, p.idx);
+        g.sm.set_vendor_ref(b);
+        g.lazy_bias = true;
+        g.biasonce = true;
+        g.kfrag_agpr = true;
+    }
+    let nkv = blk0.nkv;
+    let key = |b: &mut FnBuilder, t: I32| -> I32 {
+        let n = ev(nkv);
+        b.let_i32(t.lt(&n).select_i32(t.clone(), n - 1) << 7)
+    };
+    let k0 = key(b, I32::c(0));
+    ring.stage(b, Role::A, &k0, &SlotIdx::new(0, 0));
+    ring.stage(b, Role::B, &k0, &SlotIdx::new(0, 0));
+    let k1 = key(b, I32::c(1));
+    ring.stage(b, Role::A, &k1, &SlotIdx::new(1, 1));
+    ring.stage(b, Role::B, &k0, &SlotIdx::new(2, -1));
+    b.wait_vm(0);
+    ring.store_constants(b, wid0, &blk0.lane, &blk0.q);
+    ring.store_constants(b, wid1, &blk1.lane, &blk1.q);
+    b.wait_lds(0);
+    b.barrier();
+    // S(0) of both groups (prologue: value form, its own K reads)
+    let t0 = TileIt { it: Opnd::I32(0), cur: SlotIdx::new(0, 0), next: SlotIdx::new(1, 1), n2: None, masked: false, staged: true, tile_rows: 128 };
+    g0.prologue_compute(b, Role::All, &t0);
+    g1.prologue_compute(b, Role::All, &t0);
+    b.wait_lds(0);
+    let zc = b.c_i32(0);
+    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(zc)), (DType::I32, Opnd::Val(zc))];
+    let s0 = g0.loop_state(b);
+    let s1 = g1.loop_state(b);
+    let (n0, n1) = (s0.len(), s1.len());
+    inits.extend(s0);
+    inits.extend(s1);
+    for _ in 0..32 {
+        inits.push((DType::I32, Opnd::Val(zc)));
+    }
+    let vars = b.begin_loop(&inits);
+    let (it, idx) = (vars[0], vars[1]);
+    g0.bind_state(&vars[2..2 + n0]);
+    g1.bind_state(&vars[2 + n0..2 + n0 + n1]);
+    let base = 2 + n0 + n1;
+    let pv0: Vec<VarId> = vars[base..base + 16].to_vec();
+    let pv1: Vec<VarId> = vars[base + 16..base + 32].to_vec();
+    for g in [&g0, &g1] {
+        for a in &g.o.expect("O").accs {
+            b.pin_agpr(a.var);
+        }
+    }
+    for v in pv0.iter().chain(&pv1) {
+        b.pin_agpr(*v);
+    }
+    b.assume_trusted(it, Ext::c(0), Ext::ka(0x110).ceil_div(128), "tile counter: 0 <= it <= nkv - 1");
+    let (bias0, bias1) = (Opnd::Var(vars[2]), Opnd::Var(vars[2 + n0]));
+    let tile = |b: &mut FnBuilder, it: Opnd, idx: Opnd, last: bool| -> (ValueId, ValueId) {
+        let x = |o: &Opnd| -> I32 {
+            match o {
+                Opnd::Var(v) => varx(*v),
+                Opnd::Val(v) => ev(*v),
+                Opnd::I32(c) => I32::c(*c),
+                _ => panic!("tile index"),
+            }
+        };
+        let i1 = b.bind_i32(x(&idx).lt(2).select_i32(x(&idx) + 1, 0));
+        let i2 = b.bind_i32(I32::c(0).lt(x(&idx)).select_i32(x(&idx) - 1, 2));
+        let it_p1 = b.bind_i32(x(&it) + 1);
+        let it_p2 = b.bind_i32(x(&it) + 2);
+        let it_m1 = b.bind_i32(x(&it) - 1);
+        let sl_t = SlotIdx::new(idx.clone(), it.clone());
+        let sl_t1 = SlotIdx::new(i1, it_p1);
+        let sl_t2 = SlotIdx::new(i2, it_p2);
+        let sl_tm1 = SlotIdx::new(i2, it_m1);
+        if !last {
+            let kk = key(b, ev(it_p2));
+            ring.stage(b, Role::A, &kk, &sl_t2);
+            let kv = key(b, ev(it_p1));
+            ring.stage(b, Role::B, &kv, &sl_t1);
+        }
+        b.set_prio(1);
+        let mask = last.then(|| {
+            let ti = TileIt { it: it.clone(), cur: sl_t.clone(), next: sl_t1.clone(), n2: None, masked: true, staged: false, tile_rows: 128 };
+            KeyMask::new(b, &ti, blk0.g4, blk0.kv_len)
+        });
+        // X: PV(t-1) of both groups || softmax(t) of both groups
+        let p = [var_frags(b, &pv0), var_frags(b, &pv1)];
+        pv_pair(b, [&g0, &g1], &sl_tm1, p);
+        soft_store(b, &g0, mask.as_ref(), &pv0);
+        soft_store(b, &g1, mask.as_ref(), &pv1);
+        if last {
+            let p = [var_frags(b, &pv0), var_frags(b, &pv1)];
+            pv_pair(b, [&g0, &g1], &sl_t, p);
+        } else {
+            // Y: QK(t+1) of both groups
+            qk_pair(b, [&g0, &g1], &sl_t1, [bias0.clone(), bias1.clone()]);
+            b.wait_vm(0);
+            b.wait_lds(0);
+            b.barrier();
+        }
+        (i1, it_p1)
+    };
+    let (i1, it_p1) = tile(b, Opnd::Var(it), Opnd::Var(idx), false);
+    b.set_var(idx, i1);
+    b.set_var(it, it_p1);
+    let stop = b.bind_cond(!ev(it_p1).lt(ev(nkv) - 1));
+    b.break_if(stop);
+    b.end_loop();
+    let _ = tile(b, Opnd::Var(it), Opnd::Var(idx), true);
+    for (g, blk) in [(&g0, &blk0), (&g1, &blk1)] {
+        let fin = g.out_scale(b);
+        store_out3(&io, b, blk, &g.o.expect("O"), fin);
+    }
+    let mut f = fb.finish();
+    f.lower_opts.extend(["scalarize2".to_string(), "waveuni".to_string()]);
+    f.sched_opts = Some("rewait,hoist=24,ovl,hzfill,ldahead32=1".to_string());
+    f
+}

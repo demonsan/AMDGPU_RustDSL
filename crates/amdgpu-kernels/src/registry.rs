@@ -39,6 +39,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // the 4-wave prototype (EXPERIMENT, docs/fmha-4wave-design.md): `fmha_fwd_hd128_mxfp8_v4w_proto[_a][_i][_l][_rw|_sched]` — `_a` S in AGPR,
         // `_i` authored QK / conversion interleave, `_l` late rollback (one straight-line region per step); `_rw` = scheduler token `rewait` (authored order,
         // counted waits), `_sched` = `rewait,hoist=24,ovl` (docs/lgkm-lookahead.md)
+        n if n.starts_with("fmha_fwd_hd128_mxfp8_v4w_reuse") => Some(crate::fmha::w4::v4w_reuse(n)),
         n if n.starts_with("fmha_fwd_hd128_mxfp8_v4w_proto") => {
             let mut f = crate::fmha::w4::v4w_named(n);
             // the builder sets the best settings (scalarize2,waveuni lowering; rewait,hoist=24,ovl,hzfill); `_list` = default list scheduler for comparison
