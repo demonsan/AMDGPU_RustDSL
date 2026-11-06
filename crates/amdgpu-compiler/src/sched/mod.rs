@@ -241,7 +241,15 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
     if o.stats && phased > 0 {
         eprintln!("phase: {phased} instructions moved");
     }
+    if o.stats {
+        let (pk, at, blk) = crate::regalloc::pressure_profile(m);
+        eprintln!("pressure (allocator measure, authored order): peak {pk} at position {at} (block {blk})");
+    }
     schedule_blocks(m, o, &mut stats)?;
+    if o.stats {
+        let (pk, at, blk) = crate::regalloc::pressure_profile(m);
+        eprintln!("pressure (allocator measure, scheduled order): peak {pk} at position {at} (block {blk}); model peak_before {} peak_after {}", stats.peak_before, stats.peak_after);
+    }
     if o.ovl > 0 {
         let n = ldahead::spread_valu(m, o);
         if o.stats {
