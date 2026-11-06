@@ -305,16 +305,33 @@ pub fn hoist_join(m: &mut MFunction, o: &Options) -> usize {
         }
     }
     for ai in 0..nb {
-        let (cl, bl) = match &m.blocks[ai].term {
+        let (tl, fl) = match &m.blocks[ai].term {
             Term::CondGoto { target, fall, .. } => (*target, *fall),
             _ => continue,
         };
-        let (Some(&ci), Some(&bi)) = (label_idx.get(&cl), label_idx.get(&bl)) else { continue };
-        // the rare body falls through to the join, and the join has exactly the two predecessors A and B
-        if !matches!(&m.blocks[bi].term, Term::Goto(t) if *t == cl) || npred[ci] != 2 || npred[bi] != 1 || ci == ai || bi == ai {
+        let (Some(&ti), Some(&fi)) = (label_idx.get(&tl), label_idx.get(&fl)) else { continue };
+        let goto_of = |bi: usize| -> Option<u32> {
+            match &m.blocks[bi].term {
+                Term::Goto(t) if npred[bi] == 1 => Some(*t),
+                _ => None,
+            }
+        };
+        // the diamond: A -> {body(s)} -> J, J with exactly two predecessors
+        let (cl, bodies): (u32, Vec<usize>) = if goto_of(ti) == Some(fl) {
+            (fl, vec![ti])
+        } else if goto_of(fi) == Some(tl) {
+            (tl, vec![fi])
+        } else if goto_of(ti).is_some() && goto_of(ti) == goto_of(fi) {
+            (goto_of(ti).unwrap(), vec![ti, fi])
+        } else {
+            continue;
+        };
+        let Some(&ci) = label_idx.get(&cl) else { continue };
+        if npred[ci] != 2 || ci == ai || bodies.contains(&ai) {
             continue;
         }
-        let b_eff: Vec<_> = m.blocks[bi].insts.iter().map(|i| effects(m, i)).collect();
+        let bi = bodies[0];
+        let b_eff: Vec<_> = bodies.iter().flat_map(|&b| m.blocks[b].insts.iter().map(|i| effects(m, i)).collect::<Vec<_>>()).collect();
         let b_reads: std::collections::HashSet<u32> = b_eff.iter().flat_map(|e| e.reads.iter().copied()).collect();
         let b_writes: std::collections::HashSet<u32> = b_eff.iter().flat_map(|e| e.writes.iter().copied()).collect();
         let b_has_mem = b_eff.iter().any(|e| e.mem.is_some() || e.fence != Fence::None);
