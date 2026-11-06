@@ -15,7 +15,7 @@ $AMDC emit "$K" --backend own --out "$O/k.s" >/dev/null 2>&1 && $CL -x assembler
 VK=$(strings "$V" | grep -m1 -E '^_ZN|fmha|fwd' | head -1)
 run() {  # $1 = ours|vendor, $2 = kernel regex
     env REF_DATA=${REF_DATA:-normal} REF_B=$B REF_H=$H REF_S=$S REF_SK=$S REF_HK=$H REF_ROWS=1 REF_WARMUP=4 REF_ITERS=2 REF_TIME_ONLY=$1 \
-        REF_CO2="$O/k.co" REF_KNAME2="$K" REF_ROWS_PER_BLOCK=${ROWS_PER_BLOCK:-256} \
+        REF_CO2="$O/k.co" REF_KNAME2="$K" REF_ROWS_PER_BLOCK=${ROWS_PER_BLOCK:-256} ${OURS_BLOCK_THREADS:+REF_OURS_BLOCK_THREADS=$OURS_BLOCK_THREADS} \
         $R/bin/rocprofv3 --att --att-library-path "$DEC" --att-target-cu 1 --att-simd-select 0x1 --kernel-include-regex "$2" \
         --kernel-iteration-range "[5]" -d "$O/$1" -o run -- ./build/ff/ref_host "$V" >"$O/$1.log" 2>&1
 }
