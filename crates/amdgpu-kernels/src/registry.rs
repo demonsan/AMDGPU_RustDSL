@@ -37,6 +37,14 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
         "fmha_fwd_hd128_mxfp8_v4w_proto" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v4w_proto()),
+        // scheduler-token variants of the 4-wave prototype (the full list scheduler cannot allocate it: sched falls back to the unscheduled code): `rewait` = authored order with
+        // counted waits, `hoist=24` = ds_reads hoisted within the register budget, `ovl` = independent VALU spread over the MFMAs of each barrier-free stretch (docs/lgkm-lookahead.md)
+        "fmha_fwd_hd128_mxfp8_v4w_proto_rw" | "fmha_fwd_hd128_mxfp8_v4w_proto_sched" => {
+            let mut f = crate::fmha::fmha_fwd_hd128_mxfp8_v4w_proto();
+            f.sched_opts = Some(if name.ends_with("_rw") { "rewait" } else { "rewait,hoist=24,ovl" }.to_string());
+            f.name = name.to_string();
+            Some(f)
+        }
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),

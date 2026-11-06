@@ -64,3 +64,25 @@ layout 中位数（leading `s_nop` 位移 0..7 × 3 轮，`REF_DATA=normal`，�
 **`wsink,ldahead32=1` +1.0 / +1.8 / +1.1 %**（649.7 / 1768.6 / 2486.4）；`ldahead32=1` 单用 +0.2 / +1.0 / +0.4 %；`wsink,ldahead32=2` −1.4 / +0.1 / −0.6 %。layout 中位数（位移 0..7 × 3 轮）：+0.6 / +0.3 / +0.5 %（648.3 vs 644.4，1741.7 vs 1736.2，2478.1 vs 2465.5）。
 `_t128`（预设用 `xbar,limit=248` 补回）：`wsink,ldahead32=1` +0.7 / +0.5 / +0.4 %（B1S2048 / B2S2048 / B1S4096）。
 **已设为出厂**（kernel-opt 同一轮 7 次，`REF_DATA=normal`，对比 `ldsink=1`）：`_vs128` −0.1 / +1.2 / +1.3 %（B4H8S2048 / B1H8S8192 / per-CU），`_kvsplit` +1.8 / +1.1 / +1.2 %（B1H8S2048 s4 / B1H4S4096 s4 / B1H4S8192 s2），`_t128` +0.8 / −0.2 / +1.5 %（B2H8S2048 / B1H8S4096 / B4H8S512）；三个 builder 的 `sched_opts = "ldsink=1,wsink,ldahead32=1"`，A/B 别名已删除。
+
+## `ovl`：单 wave 的 MFMA 与 VALU 重叠（4-wave 原型，2026-11-06）
+
+`fmha_fwd_hd128_mxfp8_v4w_proto`（`crates/amdgpu-kernels/src/fmha/w4.rs`）：完整 list scheduler 一直分配失败并回退到未调度代码（`sched: falling back ... out of VGPRs allocating r927 (V16)`；两阶段 packing 也失败，
+实际峰值 244 对模型峰值 218：压力模型低估约 26 dword，且 `limit` 的下限就是原顺序的峰值，所以再收紧 `limit` 无效；`slotfill` 同样回退）。能分配成功的只有"保持作者顺序"的方案：
+`rewait`（记分板重算计数等待）、`hoist=N`（ds_read 上提，受寄存器预算约束）、`ovl`（新：在每个无 barrier 的区段里，把与 MFMA 无依赖的 VALU / SALU 均匀地提到各 MFMA 之后，`sched/ldahead.rs` `spread_valu`）。
+
+REF_DATA=normal，GPU 4，同一轮交替 7 轮；TF/s（per-CU B1H8S2048 / B4H8S2048 / B1H8S8192）；厂商 712 / 1894 / 2405：
+
+| 变体 | per-CU | B4 | S8192 |
+|---|--:|--:|--:|
+| 回退（未调度） | 368.0 | 1250.9 | 1770.9 |
+| `rewait` | 370.8 | 1249.9 | 1788.6 |
+| `rewait,ovl` | 376.8 | 1268.1 | 1822.0 |
+| `rewait,hoist=24` | 371.5 | 1262.4 | 1794.9 |
+| **`rewait,hoist=24,ovl`** | **404.7** | **1321.1** | **1926.7** |
+| `rewait,hoist=64,ovl` | 405.0 | 1330.1 | 1926.8 |
+| `rewait,hoistchain,ovl` | 405.2 | 1327.6 | 1922.9 |
+
+稳态循环里两个 MFMA 之间的 VALU 条数直方图（桶宽 4）：`rewait` `{0: 34, 40+: 3}`（MFMA 成组，VALU 成团） → `rewait,ovl` `{0: 14, 4: 10, 8: 8, 12: 2, 24: 1, 40+: 2}`（已摊开）。
+单靠调度只能到厂商的 0.57× / 0.70× / 0.80×；每个稳态 tile 的指令数（`rewait`）：38 MFMA、498 VALU + 288 `v_accvgpr_*`（AGPR 往返）、64 `ds_read_b64_tr_b8`、40 `ds_read_b128`，VALU / MFMA = 20.7，远高于厂商，
+AGPR 往返是最大的可削项。无环境变量的变体：`fmha_fwd_hd128_mxfp8_v4w_proto_rw` / `fmha_fwd_hd128_mxfp8_v4w_proto_sched`（= `rewait,hoist=24,ovl`）。
