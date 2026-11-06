@@ -123,8 +123,17 @@ pub fn v4w_named(name: &str) -> Function {
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
-    let blk0 = block3_g(&io, b, 8, Some(0));
-    let blk1 = block3_g(&io, b, 8, Some(1));
+    let mut blk0 = block3_g(&io, b, 8, Some(0));
+    let mut blk1 = block3_g(&io, b, 8, Some(1));
+    if !opts.s_agpr {
+        // S of both groups fills the arch VGPRs: the loop-invariant Q fragments (MFMA B operands) live in AGPRs
+        for blk in [&mut blk0, &mut blk1] {
+            for f in blk.q.frags.iter_mut() {
+                f.v = b.agpr(f.v);
+            }
+        }
+    }
+    let (blk0, blk1) = (blk0, blk1);
     let roles = Roles::single(&blk0.lane, 4);
     let mut ring = KvRing3::new_with(b, &io, &blk0, &roles, 3, true);
     ring.enable_buffer_dma(b);
@@ -142,6 +151,7 @@ pub fn v4w_named(name: &str) -> Function {
         g.sm.set_vendor_ref(b);
         g.lazy_bias = true;
         g.biasonce = true;
+        g.kfrag_agpr = !opts.s_agpr;
     }
     let nkv = blk0.nkv;
     let key = |b: &mut FnBuilder, t: I32| -> I32 {
@@ -198,6 +208,12 @@ pub fn v4w_named(name: &str) -> Function {
             for a in &g.s.expect("S").accs {
                 b.pin_agpr(a.var);
             }
+        }
+    }
+    if !opts.s_agpr {
+        // g1's P words (carried into the next tile's PV, MFMA B operands)
+        for v in &p1v {
+            b.pin_agpr(*v);
         }
     }
     b.assume_trusted(it, Ext::c(0), Ext::ka(0x110).ceil_div(128), "tile counter: 0 <= it <= nkv - 1");
