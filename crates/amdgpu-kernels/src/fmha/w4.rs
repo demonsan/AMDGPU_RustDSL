@@ -312,6 +312,6 @@ pub fn v4w_named(name: &str) -> Function {
     // the GEMM profile's uniform-integer lowering on top of the FMHA profile (slot / key / M0 math in SALU), and the in-order schedule with counted
     // waits, ds_read hoisting, VALU spreading behind the MFMAs and post-RA hazard-window filling (backend-llvm-tail / sched)
     f.lower_opts.extend(["scalarize2".to_string(), "waveuni".to_string()]);
-    f.sched_opts = Some("rewait,hoist=24,ovl,hzfill".to_string());
+    f.sched_opts = Some("rewait,hoist=24,ovl,hzfill,ldahead32=1".to_string());
     f
 }
