@@ -72,6 +72,14 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
             let real = crate::regalloc::pressure_by_block(&mm);
             path.iter().all(|&b| real[b] <= real0[b] + o.pslack)
         };
+        // fences (barriers, s_setprio, s_nop hazard fillers, explicit waits) never move and nothing crosses them: they cut a block into regions (their positions are fixed)
+        let fence_pos: Vec<Vec<usize>> = graphs
+            .iter()
+            .map(|g| match g {
+                Some(g) => g.eff.iter().enumerate().filter(|(_, e)| e.fence != Fence::None).map(|(i, _)| i).collect(),
+                None => Vec::new(),
+            })
+            .collect();
         let weights: Vec<usize> = graphs.iter().enumerate().map(|(k, g)| if g.is_some() { orders[k].len() } else { 0 }).collect();
         let wsum: usize = weights.iter().sum();
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (h as u64 + 1));
@@ -106,7 +114,9 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
             }
             let p = pos[k][x];
             let lo = g.preds[x].iter().map(|&(q, _)| pos[k][q] + 1).max().unwrap_or(0);
+            let lo = fence_pos[k].iter().filter(|&&f| f < p).max().map_or(lo, |&f| lo.max(f + 1));
             let hi_ = g.succs[x].iter().map(|&(q, _)| pos[k][q]).min().unwrap_or(n); // exclusive
+            let hi_ = fence_pos[k].iter().filter(|&&f| f > p).min().map_or(hi_, |&f| hi_.min(f));
             if hi_ <= lo + 1 {
                 continue;
             }
