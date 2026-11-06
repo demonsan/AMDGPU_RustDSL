@@ -1,4 +1,4 @@
-> 状态（2026-11-06）：4-wave 原型已搁置。最好成绩 0.57× / 0.70× / 0.80× 厂商（每 CU / B4H8S2048 / B1H8S8192，真实分布数据）；代码只在实验分支 `fmha-4w2` / `w4sched` 上，未合入 Main。详见 §8 与 [lgkm-lookahead.md](lgkm-lookahead.md) 末节。
+> 状态（2026-11-06）：4-wave 原型已搁置。最好成绩约 0.57× / 0.69× / 0.74×（见 §9） 厂商（每 CU / B4H8S2048 / B1H8S8192，真实分布数据）；代码只在实验分支 `fmha-4w2` / `w4sched` 上，未合入 Main。详见 §8 与 [lgkm-lookahead.md](lgkm-lookahead.md) 末节。
 
 # FMHA 4-wave design (one wave per SIMD, AGPR accumulators) — design + first probe
 
@@ -114,3 +114,16 @@ schedulers do not produce that interleave for this loop: the list scheduler cann
 by ~26 dwords) and the authored-order path recovers only +10 %. **Status: not competitive yet (0.57–0.80×); reaching the projected ≈ 3 000
 cycles per tile needs a modulo / software-pipelining scheduler (MFMA skeleton with the softmax VALU, LDS reads and copies filled into its
 slots).**
+
+## 9. 第二轮（2026-11-06 下午）：校准、LDS 与 K/V 复用
+
+| 项 | 结果 |
+|---|---|
+| 均匀运算走 SALU（`scalarize2,waveuni`）+ `hzfill` + `ldahead32=1` | 合计约 +3–5%；最终最好成绩 404 / 1240 / 1793 TF/s（每 CU / B4H8S2048 / B1H8S8192），约厂商的 0.57× / 0.69× / 0.74× |
+| 模拟器引导的指令顺序搜索（`search`） | 模拟器 −20% 周期，硬件仅 +1.8–3.4% |
+| 调度器模拟器校准（5 个变体） | 硬件 ≈ 4200 + 0.20 × 模拟周期：重排只兑现约 20%，常数部分与指令顺序无关 |
+| LDS 计数器（B4H8S2048，我们 vs 厂商） | `SQ_INSTS_LDS` 1.75M vs 1.72M，LDS busy 4.59M vs 4.51M，bank 冲突 0 vs 0，但 `LDS_CMD_FIFO_FULL` 314k vs 39k（8×）：总 LDS 工作量相同、利用率只有厂商一半；问题是单 wave 独自发出整个 tile 的 ds_read，命令队列饱和（≥6 个在途时 b128 延迟 144 → 460–730 周期） |
+| K/V 复用变体（两组同 tile，K/V 片段只读一次供两组 MFMA） | LDS 指令 −15%，FIFO 满 314k → 1.8k，但寄存器不够（VGPR 256 + AGPR 208，调度回退、循环不变量溢出到 LDS），更慢：309 / 1049 / 1432 TF/s |
+| 每 tile 发射计数 | VALU ≈ 177/32 行（低于厂商 ≈ 274），ds_read 与厂商相同；已在算法下限 |
+
+**结论**：4-wave 结构的瓶颈是单 wave 的 LDS 命令队列饱和与串行发射；复用 K/V 能解决前者但超出 512 寄存器预算。现有调度手段（list、slotfill、search、hjoin、ovl、hzfill）都无法把它推到厂商水平，出货继续用 8-wave `_vs128`。
