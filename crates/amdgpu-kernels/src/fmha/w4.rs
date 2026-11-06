@@ -42,6 +42,7 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
         g.sm.set_vendor_ref(b);
         g.lazy_bias = true;
         g.biasonce = true;
+        g.kfrag_agpr = true;
     }
     let nkv = blk0.nkv;
     let key = |b: &mut FnBuilder, t: I32| -> I32 {
@@ -86,6 +87,10 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
         for a in &g.o.expect("O").accs {
             b.pin_agpr(a.var);
         }
+    }
+    // g1's P words (carried to the next tile's PV, MFMA B operands) in AGPRs
+    for v in &p1v {
+        b.pin_agpr(*v);
     }
     b.assume_trusted(it, Ext::c(0), Ext::ka(0x110).ceil_div(128), "tile counter: 0 <= it <= nkv - 1");
     // slots: t -> idx, t+1 -> i1, t+2 (= t-1) -> i2
