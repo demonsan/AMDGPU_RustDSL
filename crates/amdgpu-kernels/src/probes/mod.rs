@@ -2308,8 +2308,6 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
     let it = vars[0];
     let accs = &vars[1..5];
     let fv = &vars[5..21];
-    let mut cur: Vec<ValueId> = fv.iter().map(|&v| { let x = b.frag2_lane(Opnd::Var(v), 0); x }).collect();
-    let _ = &mut cur;
     // interleave: one MFMA, then nv / nm VALU ops
     let per = if nm > 0 { nv / nm } else { nv };
     let mut vals: Vec<Opnd> = fv.iter().map(|&v| Opnd::Var(v)).collect();
@@ -2362,8 +2360,6 @@ pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Functi
     }
     let mut acc = b.bitcast_f32(s);
     for &v in fv {
-        let x = b.frag2_lane(Opnd::Var(v), 0);
-        let _ = x;
         acc = b.add_f32(acc, Opnd::Var(v));
     }
     b.store_f32(po, 256, acc);
