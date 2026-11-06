@@ -284,9 +284,14 @@ impl<'a> AttnBody3<'a> {
     }
     /// PV with the row sums first: per half hh and dim group e, the transposed V fragment then the scaled MFMA (fixed scales).
     fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
+        let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]).v, Frag::<B32x32x64Fp8>::from_words(b, &w[8..16]).v];
+        self.pv_frags(b, slot, p);
+    }
+    /// `pv` with the two P fragments already built.
+    fn pv_frags(&self, b: &mut FnBuilder, slot: &SlotIdx, p: [ValueId; 2]) {
         let r = self.ring;
         let v = r.vpart.at(b, &r.vs.at(slot));
-        let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])];
+        let p = p.map(Frag::<B32x32x64Fp8>::wrap);
         self.sm.row_sum(b, p[0].v, p[1].v);
         let o = self.o.expect("O");
         for (hh, pf) in p.iter().enumerate() {

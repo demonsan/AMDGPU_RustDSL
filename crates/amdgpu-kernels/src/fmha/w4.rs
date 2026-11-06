@@ -21,13 +21,15 @@ pub struct W4Opts {
     pub s_agpr: bool,
     pub inter: bool,
     pub late: bool,
+    /// steady loop unrolled by the ring depth (3): every slot index is a constant (ds_read / DMA offsets become immediates)
+    pub u3: bool,
 }
 
 impl W4Opts {
     pub fn from_name(name: &str) -> W4Opts {
         let suf = name.strip_prefix("fmha_fwd_hd128_mxfp8_v4w_proto").unwrap_or("");
         let has = |s: &str| suf.split('_').any(|x| x == s);
-        W4Opts { s_agpr: has("a"), inter: has("i"), late: has("l") }
+        W4Opts { s_agpr: has("a"), inter: has("i"), late: has("l"), u3: has("u3") }
     }
 }
 
@@ -76,14 +78,14 @@ fn step(
     o: W4Opts,
     m: &AttnBody3,
     pv_slot: &SlotIdx,
-    pv_words: &[ValueId],
+    pv_p: [ValueId; 2],
     qk: Option<(&SlotIdx, Opnd)>,
     c: &AttnBody3,
     sv: &AccTile<C32x32F32, 4>,
     pvars: &[VarId],
     mask: Option<&KeyMask>,
 ) -> Vec<ValueId> {
-    m.pv(b, pv_slot, pv_words);
+    m.pv_frags(b, pv_slot, pv_p);
     let cs = c.s.expect("S");
     let co = c.o.expect("O");
     // the softmax operand: S itself (VGPR) or its working copy (S in AGPR)
@@ -117,6 +119,12 @@ fn step(
         }
         w
     }
+}
+
+/// The two P fragments straight from 16 word variables (no per-word copies).
+fn var_frags(b: &mut FnBuilder, vs: &[VarId]) -> [ValueId; 2] {
+    let o = |i: usize| Opnd::Var(vs[i]);
+    [b.frag8(o(0), o(1), o(2), o(3), o(4), o(5), o(6), o(7)), b.frag8(o(8), o(9), o(10), o(11), o(12), o(13), o(14), o(15))]
 }
 
 fn read_words(b: &mut FnBuilder, vs: &[VarId]) -> Vec<ValueId> {
@@ -260,15 +268,16 @@ pub fn v4w_named(name: &str) -> Function {
             KeyMask::new(b, &ti, blk0.g4, blk0.kv_len)
         });
         // ---- step 1: g1.PV(t-1) + g1.QK(t) || g0 softmax(t) ----
-        let w1 = read_words(b, &p1v);
-        let w0 = step(b, opts, &g1, &sl_tm1, &w1, Some((&sl_t, bias1)), &g0, &sv0, &p0v, mask.as_ref());
+        let f1 = var_frags(b, &p1v);
+        let w0 = step(b, opts, &g1, &sl_tm1, f1, Some((&sl_t, bias1)), &g0, &sv0, &p0v, mask.as_ref());
         // ---- step 2: g0.PV(t) + g0.QK(t+1) || g1 softmax(t) ----
         let qk0 = (!last).then_some((&sl_t1, bias0));
-        let _ = step(b, opts, &g0, &sl_t, &w0, qk0, &g1, &sv1, &p1v, mask.as_ref());
+        let f0 = [Frag::<B32x32x64Fp8>::from_words(b, &w0[0..8]).v, Frag::<B32x32x64Fp8>::from_words(b, &w0[8..16]).v];
+        let _ = step(b, opts, &g0, &sl_t, f0, qk0, &g1, &sv1, &p1v, mask.as_ref());
         if last {
             // g1.PV(last)
-            let w1 = read_words(b, &p1v);
-            g1.pv(b, &sl_t, &w1);
+            let f1 = var_frags(b, &p1v);
+            g1.pv_frags(b, &sl_t, f1);
         } else {
             b.wait_vm(0);
             b.wait_lds(0);
@@ -277,15 +286,30 @@ pub fn v4w_named(name: &str) -> Function {
         (i1, it_p1)
     };
     // steady tiles 0 .. nkv-2 (the dispatcher guarantees nkv >= 2), then the peeled last tile
-    let (i1, it_p1) = tile(b, Opnd::Var(it), Opnd::Var(idx), false);
-    b.set_var(idx, i1);
-    b.set_var(it, it_p1);
-    let stop = b.bind_cond(!ev(it_p1).lt(ev(nkv) - 1));
-    b.break_if(stop);
+    if opts.u3 {
+        for k in 0..3i32 {
+            let (_, it_p1) = tile(b, Opnd::Var(it), Opnd::I32(k), false);
+            b.set_var(idx, Opnd::I32((k + 1) % 3));
+            b.set_var(it, it_p1);
+            let stop = b.bind_cond(!ev(it_p1).lt(ev(nkv) - 1));
+            b.break_if(stop);
+        }
+    } else {
+        let (i1, it_p1) = tile(b, Opnd::Var(it), Opnd::Var(idx), false);
+        b.set_var(idx, i1);
+        b.set_var(it, it_p1);
+        let stop = b.bind_cond(!ev(it_p1).lt(ev(nkv) - 1));
+        b.break_if(stop);
+    }
     b.end_loop();
     let _ = tile(b, Opnd::Var(it), Opnd::Var(idx), true);    for (g, blk) in [(&g0, &blk0), (&g1, &blk1)] {
         let fin = g.out_scale(b);
         store_out3(&io, b, blk, &g.o.expect("O"), fin);
     }
-    fb.finish()
+    let mut f = fb.finish();
+    // the GEMM profile's uniform-integer lowering on top of the FMHA profile (slot / key / M0 math in SALU), and the in-order schedule with counted
+    // waits, ds_read hoisting, VALU spreading behind the MFMAs and post-RA hazard-window filling (backend-llvm-tail / sched)
+    f.lower_opts.extend(["scalarize2".to_string(), "waveuni".to_string()]);
+    f.sched_opts = Some("rewait,hoist=24,ovl,hzfill".to_string());
+    f
 }
