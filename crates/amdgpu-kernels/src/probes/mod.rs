@@ -2259,3 +2259,114 @@ pub fn probe_mfma_scale_opsel() -> Function {
 }
 
 pub mod handoff;
+
+/// Single-wave MFMA / VALU overlap probe (fmha-4w design): `waves` waves per block (one block per CU, 64 * waves threads), each runs `iters`
+/// iterations of `nm` independent in-place scaled 32x32x64 MFMAs (4 accumulators) and `nv` VALU ops on 16 loop-carried f32 chains that never touch
+/// the MFMA registers; lane 0 of each wave stores `s_memtime` cycles of the loop to `o[wave]` (u32) and the reductions to `o[64 + ..]` (keeps them live).
+pub fn probe_ovl(name: &str, waves: u32, nm: u32, nv: u32, iters: i32) -> Function {
+    let mut b = FnBuilder::new(name, 64 * waves);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg("i", DType::Ptr, 8, 8);
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let inp = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c63 = b.c_i32(63);
+    let c6 = b.c_i32(6);
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::Val(c63)));
+    let wave = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::Val(c6)));
+    let c32 = b.c_i32(32);
+    let lo = b.mul_i32(lane, c32);
+    let pa = b.ptr_add(inp, lo);
+    let a0 = b.load_b128(pa, 0);
+    let a1 = b.load_b128(pa, 16);
+    let fa = {
+        let mut w = Vec::new();
+        for f in [a0, a1] {
+            for k in 0..4u8 {
+                let x = b.frag4_lane(f, k);
+                w.push(b.bitcast_i32(x));
+            }
+        }
+        amdgpu_tile::frag::Frag::<amdgpu_isa::B32x32x64Fp8>::from_words(&mut b, &w).v
+    };
+    let sc = b.c_i32(127);
+    let fz = b.frag_zero(DType::Frag16);
+    let x0 = b.load_f32(pa, 0);
+    let one = b.c_f32(1.0001);
+    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0))];
+    for _ in 0..4 {
+        inits.push((DType::Frag16, Opnd::Val(fz)));
+    }
+    for _ in 0..16 {
+        inits.push((DType::F32, Opnd::Val(x0)));
+    }
+    let z = b.c_i32(0);
+    inits[0].1 = Opnd::Val(z);
+    b.wait_vm(0);
+    let t0 = b.memtime_lo();
+    let vars = b.begin_loop(&inits);
+    let it = vars[0];
+    let accs = &vars[1..5];
+    let fv = &vars[5..21];
+    let mut cur: Vec<ValueId> = fv.iter().map(|&v| { let x = b.frag2_lane(Opnd::Var(v), 0); x }).collect();
+    let _ = &mut cur;
+    // interleave: one MFMA, then nv / nm VALU ops
+    let per = if nm > 0 { nv / nm } else { nv };
+    let mut vals: Vec<Opnd> = fv.iter().map(|&v| Opnd::Var(v)).collect();
+    let mut k = 0usize;
+    let mut emit_valu = |b: &mut FnBuilder, n: u32, vals: &mut Vec<Opnd>, k: &mut usize| {
+        for _ in 0..n {
+            let i = *k % 16;
+            let j = (*k + 5) % 16;
+            let r = match *k % 3 {
+                0 => b.mul_f32(vals[i], one),
+                1 => b.max3_f32(vals[i], vals[j], one),
+                _ => b.add_f32(vals[i], one),
+            };
+            vals[i] = Opnd::Val(r);
+            *k += 1;
+        }
+    };
+    for m in 0..nm.max(1) {
+        if nm > 0 {
+            b.var_mfma_scale(accs[(m % 4) as usize], fa, fa, sc, sc);
+        }
+        emit_valu(&mut b, if nm > 0 { per } else { nv }, &mut vals, &mut k);
+    }
+    for (i, &v) in fv.iter().enumerate() {
+        if let Opnd::Val(x) = vals[i] {
+            b.set_var(v, x);
+        }
+    }
+    let it1 = b.bind_i32(amdgpu_dsl::varx(it) + 1);
+    b.set_var(it, it1);
+    let stop = b.bind_cond(!amdgpu_dsl::ev(it1).lt(iters));
+    b.break_if(stop);
+    b.end_loop();
+    let t1 = b.memtime_lo();
+    let dt = b.sub_i32(t1, t0);
+    let c4 = b.c_i32(4);
+    let wo = b.mul_i32(wave, c4);
+    let po = b.ptr_add(o, wo);
+    let is0 = b.bind_cond(amdgpu_dsl::ev(lane).eq(0));
+    b.begin_if(Opnd::Val(is0));
+    let f = b.bitcast_f32(dt);
+    b.store_f32(po, 0, f);
+    let mut s = b.frag16_lane(Opnd::Var(accs[0]), 0);
+    for a in &accs[1..] {
+        let x = b.frag16_lane(Opnd::Var(*a), 0);
+        let xf = b.bitcast_f32(x);
+        let sf = b.bitcast_f32(s);
+        let y = b.add_f32(sf, xf);
+        s = b.bitcast_i32(y);
+    }
+    let mut acc = b.bitcast_f32(s);
+    for &v in fv {
+        let x = b.frag2_lane(Opnd::Var(v), 0);
+        let _ = x;
+        acc = b.add_f32(acc, Opnd::Var(v));
+    }
+    b.store_f32(po, 256, acc);
+    b.end_if();
+    b.finish()
+}
