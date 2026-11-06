@@ -415,3 +415,10 @@ pub fn hoist_join(m: &mut MFunction, o: &Options) -> usize {
     }
     total
 }
+
+pub fn is_matrix_pub(op: MOp) -> bool {
+    is_matrix(op)
+}
+pub fn is_lds_read_pub(op: MOp) -> bool {
+    is_lds_read(op)
+}

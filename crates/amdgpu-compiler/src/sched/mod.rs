@@ -72,6 +72,8 @@ pub struct Options {
     pub pexact: bool,
     /// `search=N`: N moves of the simulator-guided local search over the hot path of every loop (sched/search.rs); 0 = off
     pub search: usize,
+    /// `smask=N`: which instruction classes `search` may move (bit 0 VALU/SALU, 1 MFMA, 2 ds_read, 3 other memory ops; default 15)
+    pub smask: u32,
     /// `hjoin=K` (sched/ldahead.rs `hoist_join`): hoist up to K instructions that do not depend on the rare branch's body from the join block into the block before the branch (0 = off)
     pub hjoin: usize,
     pub pslack: i64,
@@ -79,7 +81,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, ovl_sink: false, pexact: false, search: 0, hjoin: 0, pslack: 0 }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, ovl_sink: false, pexact: false, search: 0, smask: 15, hjoin: 0, pslack: 0 }
     }
 }
 
@@ -131,6 +133,11 @@ impl Options {
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
+                        }
+                        if let Some(v) = t.strip_prefix("smask=") {
+                            if let Ok(n) = v.parse() {
+                                o.smask = n;
+                            }
                         }
                         if let Some(v) = t.strip_prefix("search=") {
                             if let Ok(n) = v.parse() {

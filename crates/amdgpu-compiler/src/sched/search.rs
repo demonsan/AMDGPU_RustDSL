@@ -91,6 +91,19 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
             if e.fence != Fence::None || e.pinned {
                 continue;
             }
+            let op = m.blocks[path[k]].insts[x].op;
+            let class = if super::ldahead::is_matrix_pub(op) {
+                1u32 << 1
+            } else if super::ldahead::is_lds_read_pub(op) {
+                1 << 2
+            } else if e.mem.is_some() || e.smem {
+                1 << 3
+            } else {
+                1
+            };
+            if o.smask & class == 0 {
+                continue;
+            }
             let p = pos[k][x];
             let lo = g.preds[x].iter().map(|&(q, _)| pos[k][q] + 1).max().unwrap_or(0);
             let hi_ = g.succs[x].iter().map(|&(q, _)| pos[k][q]).min().unwrap_or(n); // exclusive
