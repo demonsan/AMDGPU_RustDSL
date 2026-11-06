@@ -64,6 +64,8 @@ pub struct Options {
     pub waitsink: bool,
     /// `ovl=N` (sched/ldahead.rs `spread_valu`): inside every barrier-free stretch with >= 2 MFMAs, VALU / SALU work that is independent of the MFMAs in between is hoisted up so that it is spread evenly over the stretch's MFMAs (a stretch needs at least N such instructions; 0 = off)
     pub ovl: usize,
+    /// `ovlsink`: `ovl` may also SINK a VALU that sits in front of the MFMA it is assigned to (needed when the MFMAs come after the VALU run, e.g. after `hjoin`)
+    pub ovl_sink: bool,
     /// `pexact`: the list scheduler checks every candidate order of a block against the ALLOCATOR's own pressure (`regalloc::pressure_by_block`) and tightens its model limit until the
     /// block needs no more registers than its authored order did (+ `pslack`), so the scheduled kernel still allocates (0 = off)
     pub pexact: bool,
@@ -74,7 +76,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, pexact: false, hjoin: 0, pslack: 0 }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, ovl_sink: false, pexact: false, hjoin: 0, pslack: 0 }
     }
 }
 
@@ -114,6 +116,10 @@ impl Options {
                     "slotfill" => o.slotfill = true,
                     "wsink" => o.waitsink = true,
                     "ovl" => o.ovl = 8,
+                    "ovlsink" => {
+                        o.ovl = 8;
+                        o.ovl_sink = true;
+                    }
                     "pexact" => o.pexact = true,
                     "hoistchain" => {
                         o.ldshoist = true;
