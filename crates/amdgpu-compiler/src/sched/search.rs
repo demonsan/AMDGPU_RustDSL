@@ -137,6 +137,10 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
                 ok = false;
             }
             if ok {
+                if std::env::var("AMDC_SEARCH_TRACE").is_ok() {
+                    let ii = &m.blocks[path[k]].insts[x];
+                    eprintln!("SMOVE block {} inst#{x} {:?} dst {:?} from {p} to {np} cost {c:.0}", path[k], ii.op, ii.dst);
+                }
                 cur = c;
                 if c < best {
                     best = c;
