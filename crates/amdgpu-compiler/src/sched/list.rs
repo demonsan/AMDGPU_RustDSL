@@ -128,6 +128,7 @@ pub fn schedule(
     live_out: &HashSet<VReg>,
     limit: i64,
     window: usize,
+    floor: bool,
 ) -> ListResult {
     let n = g.n;
     let costs: Vec<OpCost> = insts.iter().map(|i| model::cost(i.op)).collect();
@@ -143,7 +144,8 @@ pub fn schedule(
         pr0.commit(&rd[i], &wr[i]);
         peak_before = peak_before.max(pr0.cur);
     }
-    let limit_eff = limit.max(peak_before);
+    // `floor`: never schedule below the original order's own peak (the default); without it (`pexact`) the limit is honoured exactly and the scheduler may be asked for LESS pressure than the original order
+    let limit_eff = if floor { limit.max(peak_before) } else { limit };
 
     // heights
     let mut height = vec![0u32; n];
@@ -243,12 +245,13 @@ pub fn schedule_best(
     live_out: &HashSet<VReg>,
     limit: i64,
     fast: bool,
+    floor: bool,
 ) -> ListResult {
     let mut best: Option<ListResult> = None;
     let mut first: Option<ListResult> = None;
     let windows: &[usize] = if fast { &[usize::MAX, 100] } else { &[usize::MAX, 400, 200, 100, 50, 25] };
     for &w in windows {
-        let r = schedule(m, insts, g, live_in, live_out, limit, w);
+        let r = schedule(m, insts, g, live_in, live_out, limit, w, floor);
         if r.peak_after <= r.limit_eff && best.as_ref().map_or(true, |b| r.est_after < b.est_after) {
             best = Some(ListResult { perm: r.perm.clone(), ..r });
         } else if first.is_none() {
