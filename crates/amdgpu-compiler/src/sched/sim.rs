@@ -23,6 +23,7 @@ pub struct SInst {
     fence: Fence,
     is_vmem: bool,
     is_lds: bool,
+    lds_big: bool,
     extra: i64, // cycles added after issue (branch cost)
     vcc_extra: i64, // extra latency of a vcc read (terminator)
 }
@@ -74,6 +75,11 @@ pub fn hot_path(m: &MFunction, header: usize, latch: usize) -> Vec<usize> {
     path
 }
 
+/// `AMDC_SIM_CAL=1`: the ATT-calibrated profile (issue gap 4, barrier skew, DMA issue 24, nop 3 cycles per state, LDS latencies by class, a long return behind >= 6 outstanding LDS ops)
+pub fn cal() -> bool {
+    std::env::var("AMDC_SIM_CAL").is_ok()
+}
+
 /// The simulator program of a hot path split per block, so that a search can re-assemble it for another instruction order of a block without recomputing the effects.
 #[derive(Clone)]
 pub struct ProgParts {
@@ -94,8 +100,20 @@ pub fn prog_parts(m: &MFunction, path: &[usize], header: usize) -> ProgParts {
             let cost = cost(inst.op);
             let mut c = cost;
             if inst.op == MOp::SNop {
-                c.issue = ((inst.imm + 1) * 4) as u32;
+                c.issue = ((inst.imm + 1) * if cal() { 3 } else { 4 }) as u32;
                 c.occ = 0;
+            }
+            if cal() {
+                // calibrated on the warm ATT of the 4-wave FMHA (kernel-opt, docs/lgkm-lookahead.md): LDS-DMA issue ~24 cycles, the K-scale b32 read ~64 cycles to its consumer
+                match inst.op {
+                    MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds => {
+                        c.issue = 24;
+                    }
+                    MOp::LdsReadB32 => c.latency = 64,
+                    MOp::LdsReadB128 => c.latency = 144,
+                    MOp::LdsReadB64TrB8 => c.latency = 125,
+                    _ => {}
+                }
             }
             v.push(SInst {
                 cost: c,
@@ -104,6 +122,7 @@ pub fn prog_parts(m: &MFunction, path: &[usize], header: usize) -> ProgParts {
                 fence: e.fence,
                 is_vmem: matches!(&e.mem, Some(a) if a.space == Space::Global),
                 is_lds: matches!(&e.mem, Some(a) if a.space == Space::Lds),
+                lds_big: matches!(inst.op, MOp::LdsReadB128),
                 extra: 0,
                 vcc_extra: 0,
             });
@@ -142,6 +161,7 @@ pub fn prog_parts(m: &MFunction, path: &[usize], header: usize) -> ProgParts {
                 fence: Fence::None,
                 is_vmem: false,
                 is_lds: false,
+                lds_big: false,
                 extra: cost_t,
                 vcc_extra: if term_reads(&b.term).contains(&VCC) { VCC_TO_BRANCH as i64 } else { 0 },
             })
@@ -193,7 +213,7 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
         .collect();
     let mut unit_free = [0i64; NPIPES];
     // minimum cycles between two instruction issues of ONE wave (ATT, warm 1-wave FMHA: every instruction class issues about every 4-5 cycles; the model used 1)
-    let issue_gap: i64 = std::env::var("AMDC_SIM_GAP").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let issue_gap: i64 = std::env::var("AMDC_SIM_GAP").ok().and_then(|v| v.parse().ok()).unwrap_or(if cal() { 4 } else { 1 });
     loop {
         // earliest feasible issue time per wave
         let mut best: Option<(i64, i64, usize)> = None;
@@ -238,7 +258,7 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
             if waiting == 0 {
                 break;
             }
-            let release = ws.iter().filter_map(|w| w.at_barrier).max().unwrap() + BARRIER_COST as i64;
+            let release = ws.iter().filter_map(|w| w.at_barrier).max().unwrap() + BARRIER_COST as i64 + if cal() { 100 } else { 0 };
             for w in ws.iter_mut() {
                 if w.at_barrier.is_some() {
                     w.at_barrier = None;
@@ -275,6 +295,9 @@ pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
             w.vm.push(c);
         }
         if ins.is_lds {
+            // in-order return; a ds_read_b128 issued behind >= 6 outstanding LDS ops comes back much later (ATT: 144 -> 460..730)
+            let pending = w.lg.iter().filter(|x| **x > t).count();
+            let comp = if cal() && ins.lds_big && pending >= 6 { comp + 350 } else { comp };
             let c = comp.max(w.lg.last().copied().unwrap_or(0));
             w.lg.retain(|x| *x > t);
             w.lg.push(c);
