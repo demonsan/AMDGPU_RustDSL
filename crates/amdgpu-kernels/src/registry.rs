@@ -40,6 +40,13 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // `_i` authored QK / conversion interleave, `_l` late rollback (one straight-line region per step); `_rw` = scheduler token `rewait` (authored order,
         // counted waits), `_sched` = `rewait,hoist=24,ovl` (docs/lgkm-lookahead.md)
         n if n.starts_with("fmha_fwd_hd128_mxfp8_v4w_reuse") => Some(crate::fmha::w4::v4w_reuse(n)),
+        // EXPERIMENT: `_t128` (4 waves x 32 rows, 128-row block) forced to ONE block per CU (LDS padded past half the CU): one wave per SIMD
+        "fmha_fwd_hd128_mxfp8_v4w_t128occ1" => {
+            let mut f = crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128();
+            f.name = "fmha_fwd_hd128_mxfp8_v4w_t128occ1".to_string();
+            f.lds_bytes = f.lds_bytes.max(81 * 1024);
+            Some(f)
+        }
         n if n.starts_with("fmha_fwd_hd128_mxfp8_v4w_proto") => {
             let mut f = crate::fmha::w4::v4w_named(n);
             // the builder sets the best settings (scalarize2,waveuni lowering; rewait,hoist=24,ovl,hzfill); `_list` = default list scheduler for comparison
