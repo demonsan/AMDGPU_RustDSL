@@ -19,6 +19,7 @@ pub mod model;
 pub mod order;
 pub mod ldahead;
 pub mod phase;
+pub mod search;
 pub mod slotfill;
 pub mod sim;
 pub mod verify;
@@ -69,6 +70,8 @@ pub struct Options {
     /// `pexact`: the list scheduler checks every candidate order of a block against the ALLOCATOR's own pressure (`regalloc::pressure_by_block`) and tightens its model limit until the
     /// block needs no more registers than its authored order did (+ `pslack`), so the scheduled kernel still allocates (0 = off)
     pub pexact: bool,
+    /// `search=N`: N moves of the simulator-guided local search over the hot path of every loop (sched/search.rs); 0 = off
+    pub search: usize,
     /// `hjoin=K` (sched/ldahead.rs `hoist_join`): hoist up to K instructions that do not depend on the rare branch's body from the join block into the block before the branch (0 = off)
     pub hjoin: usize,
     pub pslack: i64,
@@ -76,7 +79,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, ovl_sink: false, pexact: false, hjoin: 0, pslack: 0 }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, ovl: 0, ovl_sink: false, pexact: false, search: 0, hjoin: 0, pslack: 0 }
     }
 }
 
@@ -128,6 +131,11 @@ impl Options {
                     _ => {
                         if let Some(v) = t.strip_prefix("only=") {
                             o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
+                        }
+                        if let Some(v) = t.strip_prefix("search=") {
+                            if let Ok(n) = v.parse() {
+                                o.search = n;
+                            }
                         }
                         if let Some(v) = t.strip_prefix("hjoin=") {
                             if let Ok(n) = v.parse() {
@@ -341,6 +349,12 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         let n = ldahead::spread_valu(m, o);
         if o.stats {
             eprintln!("ovl: {n} instructions moved");
+        }
+    }
+    if o.search > 0 {
+        let n = search::run(m, o);
+        if o.stats {
+            eprintln!("search: {n} instructions moved in total");
         }
     }
     if o.waitsink {

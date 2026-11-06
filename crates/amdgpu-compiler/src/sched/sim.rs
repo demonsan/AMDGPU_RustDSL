@@ -16,7 +16,7 @@ use super::model::*;
 use crate::mir::*;
 
 #[derive(Clone)]
-struct SInst {
+pub struct SInst {
     cost: OpCost,
     reads: Vec<Slot>,
     writes: Vec<Slot>,
@@ -74,11 +74,21 @@ pub fn hot_path(m: &MFunction, header: usize, latch: usize) -> Vec<usize> {
     path
 }
 
-fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
+/// The simulator program of a hot path split per block, so that a search can re-assemble it for another instruction order of a block without recomputing the effects.
+#[derive(Clone)]
+pub struct ProgParts {
+    /// per path block: the simulator form of each instruction in the block's CURRENT order at build time
+    pub insts: Vec<Vec<SInst>>,
+    /// per path block: the terminator's pseudo instruction (branch cost), if any
+    pub terms: Vec<Option<SInst>>,
+}
+
+pub fn prog_parts(m: &MFunction, path: &[usize], header: usize) -> ProgParts {
     let label_to_block: HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
-    let mut prog = Vec::new();
+    let mut parts = ProgParts { insts: Vec::new(), terms: Vec::new() };
     for (pi, &bi) in path.iter().enumerate() {
         let b = &m.blocks[bi];
+        let mut v = Vec::with_capacity(b.insts.len());
         for inst in &b.insts {
             let e = effects(m, inst);
             let cost = cost(inst.op);
@@ -87,7 +97,7 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
                 c.issue = ((inst.imm + 1) * 4) as u32;
                 c.occ = 0;
             }
-            prog.push(SInst {
+            v.push(SInst {
                 cost: c,
                 reads: e.reads.clone(),
                 writes: e.writes.clone(),
@@ -98,6 +108,7 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
                 vcc_extra: 0,
             });
         }
+        parts.insts.push(v);
         // terminator cost
         let next_in_path = path.get(pi + 1).copied().unwrap_or(header);
         let next_layout = bi + 1;
@@ -123,8 +134,8 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
             }
             Term::Endpgm => {}
         }
-        if cost_t > 0 {
-            prog.push(SInst {
+        parts.terms.push(if cost_t > 0 {
+            Some(SInst {
                 cost: OpCost { pipe: Pipe::Ctrl, issue: 1, occ: 0, latency: 0, grade: Grade::Experimental },
                 reads: term_reads(&b.term),
                 writes: vec![],
@@ -133,10 +144,32 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
                 is_lds: false,
                 extra: cost_t,
                 vcc_extra: if term_reads(&b.term).contains(&VCC) { VCC_TO_BRANCH as i64 } else { 0 },
-            });
+            })
+        } else {
+            None
+        });
+    }
+    parts
+}
+
+/// Assemble the program for `orders[k]` = the order (indices into `parts.insts[k]`) of path block k.
+pub fn assemble(parts: &ProgParts, orders: &[Vec<usize>]) -> Vec<SInst> {
+    let mut prog = Vec::new();
+    for (k, v) in parts.insts.iter().enumerate() {
+        for &i in &orders[k] {
+            prog.push(v[i].clone());
+        }
+        if let Some(t) = &parts.terms[k] {
+            prog.push(t.clone());
         }
     }
     prog
+}
+
+fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
+    let parts = prog_parts(m, path, header);
+    let orders: Vec<Vec<usize>> = parts.insts.iter().map(|v| (0..v.len()).collect()).collect();
+    assemble(&parts, &orders)
 }
 
 /// Estimated steady-state cycles per iteration of one loop with `waves` waves on the SIMD.
