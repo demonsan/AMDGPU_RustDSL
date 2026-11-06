@@ -45,17 +45,26 @@ fn scalef32_converts_get_two_wait_states_before_a_matrix_operand_or_readfirstlan
 }
 
 #[test]
-fn a_high_half_scalef32_convert_gets_one_wait_state_before_a_dependent_accvgpr_write() {
-    // found on hardware (the 4-wave prototype, a search-scheduled order): `v_cvt_scalef32_pk_fp8_bf16 ... op_sel:[0,0,1]` (the high-half partial write) immediately followed by
-    // `v_accvgpr_write_b32` of its result read a stale value; one `s_nop` fixes it. The low half and the accvgpr_read -> accvgpr_write copy pairs of the shipped kernels need nothing.
-    let mk = |writer: MOp| {
+fn a_high_half_scalef32_convert_gets_one_wait_state_before_any_consumer_of_its_result() {
+    // found on hardware (the 4-wave prototype, scheduler-reordered orders): `v_cvt_scalef32_pk_fp8_bf16 ... op_sel:[0,0,1]` (the high-half partial-dword write) immediately followed by a
+    // consumer of its result read a stale value - a `v_accvgpr_write_b32` (first seen) and a `v_mov_b32` copy; one `s_nop` fixes it. The low half and the accvgpr_read -> accvgpr_write copy
+    // pairs of the shipped kernels need nothing, and the partner conversion of the other half (which merges into the same dword) is interlocked.
+    let after = |writer: MOp, consumer: MInst| {
         let w = MInst::new(writer).def(0).srcreg(1).srcreg(2);
-        let aw = MInst::new(MOp::VAccvgprWrite).def(3).srcreg(0);
-        let mut m = func(vec![w, aw], 5);
+        let cop = consumer.op;
+        let mut m = func(vec![w, consumer], 6);
         fix_value_hazards_opts(&mut m, false);
-        gap(&m, writer, MOp::VAccvgprWrite)
+        gap(&m, writer, cop)
     };
-    assert!(mk(MOp::VCvtPkFp8Hi) >= 1, "the high-half convert needs a wait state before the accvgpr_write");
-    assert_eq!(mk(MOp::VCvtPkFp8Lo), 0, "the low half stays unpadded");
-    assert_eq!(mk(MOp::VAccvgprRead), 0, "accvgpr_read -> accvgpr_write copies stay unpadded");
+    let accw = || MInst::new(MOp::VAccvgprWrite).def(3).srcreg(0);
+    let mov = || MInst::new(MOp::VMovB32).def(3).srcreg(0);
+    assert!(after(MOp::VCvtPkFp8Hi, accw()) >= 1, "high-half convert -> v_accvgpr_write needs a wait state");
+    assert!(after(MOp::VCvtPkFp8Hi, mov()) >= 1, "high-half convert -> v_mov_b32 needs a wait state");
+    assert!(after(MOp::VCvtPkFp8F32Hi, mov()) >= 1, "the f32 high-half convert too");
+    assert_eq!(after(MOp::VCvtPkFp8Lo, accw()), 0, "the low half stays unpadded");
+    assert_eq!(after(MOp::VCvtPkFp8Lo, mov()), 0, "the low half stays unpadded");
+    assert_eq!(after(MOp::VAccvgprRead, accw()), 0, "accvgpr_read -> accvgpr_write copies stay unpadded");
+    // the partner conversion reads the dword it merges into: interlocked, no padding (the shipped Lo / Hi pairs)
+    let partner = || MInst::new(MOp::VCvtPkFp8Lo).def(0).srcreg(0).srcreg(2);
+    assert_eq!(after(MOp::VCvtPkFp8Hi, partner()), 0, "the partner half-convert is exempt");
 }
