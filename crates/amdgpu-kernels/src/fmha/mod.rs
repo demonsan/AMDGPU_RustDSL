@@ -12,7 +12,7 @@ use amdgpu_tile::mma::{gemm, make_tiled_mma, TiledMma};
 use amdgpu_tile::{contract, Ctx};
 pub mod io;
 mod w4;
-pub use w4::fmha_fwd_hd128_mxfp8_v4w_proto;
+pub use w4::{fmha_fwd_hd128_mxfp8_v4w_proto, w4_inter};
 
 use io::{combine_kernel, FmhaBlock, FmhaIo};
 use amdgpu_tile::frag::{AccTile, Frag, QkOut, B32x32x64Fp8, C32x32F32};

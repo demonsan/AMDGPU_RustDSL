@@ -12,7 +12,31 @@
 use super::*;
 
 pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v4w_proto", 256);
+    v4w_named("fmha_fwd_hd128_mxfp8_v4w_proto", false)
+}
+
+/// QK of `q` (into its S vars) block by block, each block followed by one conversion chunk of `c`'s softmax (the authored interleave).
+fn qk_conv(b: &mut FnBuilder, q: &AttnBody3, slot: &SlotIdx, bias: Opnd, c: &AttnBody3, sv: &AccTile<C32x32F32, 4>) -> Vec<ValueId> {
+    let r = q.ring;
+    let k = r.kpart.at(b, &r.ks.at(slot));
+    let kd = r.kdpart.at(b, &r.kd.at(slot));
+    let s = q.s.expect("S");
+    if q.biasonce {
+        b.var_mfma_f16_z(s.accs[3].var, q.sm.ones_f16, bias);
+        q.bias_tile.set(Some(Opnd::Var(s.accs[3].var)));
+    }
+    let mut w = Vec::new();
+    for i in 0..4usize {
+        q.qk_block(b, &QkOut::Vars(&s), bias, &k, &kd, i);
+        w.extend(c.sm.convert(b, sv, None, i, i + 1));
+    }
+    q.bias_tile.set(None);
+    w
+}
+
+/// `inter`: author the QK-block / conversion-chunk interleave (for the in-order schedulers).
+pub fn v4w_named(name: &str, inter: bool) -> Function {
+    let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
@@ -126,13 +150,16 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
     let s1t = g1.s.expect("S");
     let p0: Vec<ValueId> = {
         let s = sv;
-        let mut w = Vec::new();
-        // QK(t) of g1 issued between the conversion chunks of g0
-        g1.qk(b, &sl_t, QkOut::Vars(&s1t), bias1);
-        for i in 0..4usize {
-            w.extend(g0.sm.convert(b, &s, None, i, i + 1));
+        if inter {
+            qk_conv(b, &g1, &sl_t, bias1, &g0, &s)
+        } else {
+            let mut w = Vec::new();
+            g1.qk(b, &sl_t, QkOut::Vars(&s1t), bias1);
+            for i in 0..4usize {
+                w.extend(g0.sm.convert(b, &s, None, i, i + 1));
+            }
+            w
         }
-        w
     };
     // ---- step 2: g0.PV(t) + g0.QK(t+1) || g1 softmax(t) ----
     g0.pv(b, &sl_t, &p0);
@@ -147,12 +174,16 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
     let s0t = g0.s.expect("S");
     let p1: Vec<ValueId> = {
         let s = sv;
-        g0.qk(b, &sl_t1, QkOut::Vars(&s0t), bias0);
-        let mut w = Vec::new();
-        for i in 0..4usize {
-            w.extend(g1.sm.convert(b, &s, None, i, i + 1));
+        if inter {
+            qk_conv(b, &g0, &sl_t1, bias0, &g1, &s)
+        } else {
+            g0.qk(b, &sl_t1, QkOut::Vars(&s0t), bias0);
+            let mut w = Vec::new();
+            for i in 0..4usize {
+                w.extend(g1.sm.convert(b, &s, None, i, i + 1));
+            }
+            w
         }
-        w
     };
     for (v, x) in p1v.iter().zip(&p1) {
         b.set_var(*v, *x);
@@ -175,4 +206,8 @@ pub fn fmha_fwd_hd128_mxfp8_v4w_proto() -> Function {
         store_out3(&io, b, blk, &g.o.expect("O"), fin);
     }
     fb.finish()
+}
+
+pub fn w4_inter() -> Function {
+    v4w_named("fmha_fwd_hd128_mxfp8_v4w_proto_i", true)
 }
