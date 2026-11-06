@@ -21,13 +21,15 @@ pub struct W4Opts {
     pub s_agpr: bool,
     pub inter: bool,
     pub late: bool,
+    /// steady loop unrolled by the ring depth (3): every slot index is a constant (ds_read / DMA offsets become immediates)
+    pub u3: bool,
 }
 
 impl W4Opts {
     pub fn from_name(name: &str) -> W4Opts {
         let suf = name.strip_prefix("fmha_fwd_hd128_mxfp8_v4w_proto").unwrap_or("");
         let has = |s: &str| suf.split('_').any(|x| x == s);
-        W4Opts { s_agpr: has("a"), inter: has("i"), late: has("l") }
+        W4Opts { s_agpr: has("a"), inter: has("i"), late: has("l"), u3: has("u3") }
     }
 }
 
@@ -277,11 +279,21 @@ pub fn v4w_named(name: &str) -> Function {
         (i1, it_p1)
     };
     // steady tiles 0 .. nkv-2 (the dispatcher guarantees nkv >= 2), then the peeled last tile
-    let (i1, it_p1) = tile(b, Opnd::Var(it), Opnd::Var(idx), false);
-    b.set_var(idx, i1);
-    b.set_var(it, it_p1);
-    let stop = b.bind_cond(!ev(it_p1).lt(ev(nkv) - 1));
-    b.break_if(stop);
+    if opts.u3 {
+        for k in 0..3i32 {
+            let (_, it_p1) = tile(b, Opnd::Var(it), Opnd::I32(k), false);
+            b.set_var(idx, Opnd::I32((k + 1) % 3));
+            b.set_var(it, it_p1);
+            let stop = b.bind_cond(!ev(it_p1).lt(ev(nkv) - 1));
+            b.break_if(stop);
+        }
+    } else {
+        let (i1, it_p1) = tile(b, Opnd::Var(it), Opnd::Var(idx), false);
+        b.set_var(idx, i1);
+        b.set_var(it, it_p1);
+        let stop = b.bind_cond(!ev(it_p1).lt(ev(nkv) - 1));
+        b.break_if(stop);
+    }
     b.end_loop();
     let _ = tile(b, Opnd::Var(it), Opnd::Var(idx), true);    for (g, blk) in [(&g0, &blk0), (&g1, &blk1)] {
         let fin = g.out_scale(b);
