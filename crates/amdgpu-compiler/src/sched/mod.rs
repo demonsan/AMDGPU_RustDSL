@@ -245,6 +245,31 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         let (pk, at, blk) = crate::regalloc::pressure_profile(m);
         eprintln!("pressure (allocator measure, authored order): peak {pk} at position {at} (block {blk})");
     }
+    if o.stats && std::env::var("AMDC_PRESSURE_DEBUG").is_ok() {
+        let (pk, at, blk) = crate::regalloc::pressure_profile(m);
+        let alloc_live: Vec<VReg> = crate::regalloc::live_at(m, at);
+        let lv = liveness::compute(m);
+        let start: usize = m.blocks[..blk].iter().map(|b| b.insts.len()).sum();
+        let upto = at.saturating_sub(start);
+        // model live set at `upto`: live-in plus defs so far, minus values with no later use (backwards from live-out)
+        let insts = &m.blocks[blk].insts;
+        let mut live: std::collections::HashSet<VReg> = lv.live_out[blk].iter().map(|&r| m.canon(r)).collect();
+        for i in (upto..insts.len()).rev() {
+            if let Some(d) = insts[i].dst {
+                if !m.alias.contains_key(&d) {
+                    live.remove(&m.canon(d));
+                }
+            }
+            for r in insts[i].uses() {
+                live.insert(m.canon(r));
+            }
+        }
+        let w = |r: VReg| if m.vreg_class(r).is_vector() { m.vreg_class(r).dwords() as i64 } else { 0 };
+        let model: i64 = live.iter().map(|&r| w(r)).sum();
+        let only_alloc: Vec<String> = alloc_live.iter().filter(|r| !live.contains(&m.canon(**r))).map(|r| format!("r{r}:{:?}", m.vreg_class(*r))).collect();
+        let only_model: Vec<String> = live.iter().filter(|r| !alloc_live.iter().any(|a| m.canon(*a) == **r)).map(|r| format!("r{r}:{:?}", m.vreg_class(*r))).collect();
+        eprintln!("PDBG block {blk} pos {at}: allocator peak {pk}; backward-liveness model dwords {model}; allocator live vregs {}; ONLY allocator: {:?}; ONLY model: {:?}", alloc_live.len(), only_alloc, only_model);
+    }
     schedule_blocks(m, o, &mut stats)?;
     if o.stats {
         let (pk, at, blk) = crate::regalloc::pressure_profile(m);
