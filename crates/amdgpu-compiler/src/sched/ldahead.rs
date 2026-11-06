@@ -269,3 +269,110 @@ pub fn spread_valu(m: &mut MFunction, o: &Options) -> usize {
     }
     total
 }
+
+/// `hjoin=K`: cross-block overlap over the RARE branch. Shape: block A ends `if cond goto C else B`, B (the rare body) falls through to C, C has no other predecessor. The hot path A -> C
+/// is split by the branch, so the list / `ovl` passes cannot overlap C's first MFMAs with A's VALU. This hoists a dependence-closed prefix set S of C (at most K instructions) to the end of A:
+/// every x in S is independent of B (B writes nothing x reads / writes, x writes nothing B reads), of every instruction of C that stays behind, is no fence / memory ordering hazard against a
+/// kept memory op, does not touch vcc / scc and is not pinned. Executing S before B instead of after it is then unobservable. The allocator's pressure of A (`regalloc::pressure_by_block`)
+/// may not exceed the authored maximum of A and C: S is halved until it fits. Returns the number of hoisted instructions.
+pub fn hoist_join(m: &mut MFunction, o: &Options) -> usize {
+    use super::effects::{effects, Fence, SCC, VCC};
+    let mut total = 0;
+    let nb = m.blocks.len();
+    // predecessor counts
+    let label_idx: std::collections::HashMap<u32, usize> = m.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut npred = vec![0usize; nb];
+    for b in &m.blocks {
+        match &b.term {
+            Term::Goto(t) => {
+                if let Some(&j) = label_idx.get(t) {
+                    npred[j] += 1;
+                }
+            }
+            Term::CondGoto { target, fall, .. } => {
+                for t in [target, fall] {
+                    if let Some(&j) = label_idx.get(t) {
+                        npred[j] += 1;
+                    }
+                }
+            }
+            Term::Endpgm => {}
+        }
+    }
+    for ai in 0..nb {
+        let (cl, bl) = match &m.blocks[ai].term {
+            Term::CondGoto { target, fall, .. } => (*target, *fall),
+            _ => continue,
+        };
+        let (Some(&ci), Some(&bi)) = (label_idx.get(&cl), label_idx.get(&bl)) else { continue };
+        // the rare body falls through to the join, and the join has exactly the two predecessors A and B
+        if !matches!(&m.blocks[bi].term, Term::Goto(t) if *t == cl) || npred[ci] != 2 || npred[bi] != 1 || ci == ai || bi == ai {
+            continue;
+        }
+        let b_eff: Vec<_> = m.blocks[bi].insts.iter().map(|i| effects(m, i)).collect();
+        let b_reads: std::collections::HashSet<u32> = b_eff.iter().flat_map(|e| e.reads.iter().copied()).collect();
+        let b_writes: std::collections::HashSet<u32> = b_eff.iter().flat_map(|e| e.writes.iter().copied()).collect();
+        let b_has_mem = b_eff.iter().any(|e| e.mem.is_some() || e.fence != Fence::None);
+        let c_insts = m.blocks[ci].insts.clone();
+        let c_eff: Vec<_> = c_insts.iter().map(|i| effects(m, i)).collect();
+        let mut hoist: Vec<usize> = Vec::new();
+        let mut kept: Vec<usize> = Vec::new();
+        for (x, ex) in c_eff.iter().enumerate() {
+            if hoist.len() >= o.hjoin {
+                break;
+            }
+            if matches!(ex.fence, Fence::Barrier | Fence::SetPrio | Fence::WaitVm(_) | Fence::WaitLgkm(_)) {
+                break; // a hard fence ends the hoistable prefix
+            }
+            let mut ok = ex.fence == Fence::None && !ex.pinned && !ex.smem && !(ex.mem.is_some() && b_has_mem);
+            ok = ok && !ex.reads.iter().any(|s| b_writes.contains(s)) && !ex.writes.iter().any(|s| b_writes.contains(s) || b_reads.contains(s));
+            ok = ok && !ex.writes.iter().any(|&s| s == SCC || s == VCC);
+            if ok {
+                for &y in &kept {
+                    let ey = &c_eff[y];
+                    let dep = ex.reads.iter().any(|s| ey.writes.contains(s))
+                        || ex.writes.iter().any(|s| ey.reads.contains(s) || ey.writes.contains(s))
+                        || (ex.mem.is_some() && ey.mem.is_some() && (ex.mem.as_ref().unwrap().write || ey.mem.as_ref().unwrap().write))
+                        || ey.fence != Fence::None && ey.fence != Fence::Nop && ex.mem.is_some();
+                    if dep {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                hoist.push(x);
+            } else {
+                kept.push(x);
+            }
+        }
+        if hoist.is_empty() {
+            continue;
+        }
+        // shrink S until the allocator's pressure of A does not exceed the authored maximum of A and C
+        let real0 = crate::regalloc::pressure_by_block(m);
+        let limit = real0[ai].max(real0[ci]) + o.pslack;
+        let mut take = hoist.len();
+        loop {
+            let set: std::collections::HashSet<usize> = hoist[..take].iter().copied().collect();
+            let mut mm = m.clone();
+            let moved: Vec<MInst> = hoist[..take].iter().map(|&x| c_insts[x].clone()).collect();
+            mm.blocks[ai].insts.extend(moved);
+            mm.blocks[ci].insts = c_insts.iter().enumerate().filter(|(k, _)| !set.contains(k)).map(|(_, i)| i.clone()).collect();
+            let real = crate::regalloc::pressure_by_block(&mm);
+            if real[ai] <= limit && real[ci] <= limit {
+                *m = mm;
+                total += take;
+                if o.stats {
+                    eprintln!("hjoin: block {ci} -> {ai} (over rare block {bi}): {take} instructions, allocator measure A {} C {} (limit {limit})", real[ai], real[ci]);
+                }
+                break;
+            }
+            if take <= 1 {
+                break;
+            }
+            take /= 2;
+        }
+    }
+    total
+}
