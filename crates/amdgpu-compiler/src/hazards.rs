@@ -143,7 +143,9 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
             }
             // the HIGH-half conversion (`v_cvt_scalef32_pk_fp8_* ... op_sel:[0,0,1]`, a partial-dword write) feeding a v_accvgpr_write needs one wait state (hardware: a dependent adjacent pair read a stale value, one
             // s_nop fixes it); the map is `pkw`, which holds the conversion results (and, strict, the packed-math ones)
-            if inst.op == MOp::VAccvgprWrite || std::env::var("AMDC_HZ_ANYREADER").is_ok() {
+            // any consumer of the result (found: a `v_mov_b32` copy of it, 1 instruction later, read a stale value) - except the partner conversion of the other half, which merges into the
+            // same dword and is interlocked (the Lo / Hi pairs of the shipped kernels run unpadded)
+            if !matches!(inst.op, MOp::VCvtPkFp8Lo | MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32 | MOp::VCvtPkFp8F32Hi) {
                 for s in &inst.srcs {
                     if let Src::Reg(r) = s {
                         if let Some(rd) = pkw.get(&canon(*r)) {
