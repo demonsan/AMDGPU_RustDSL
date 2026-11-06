@@ -72,7 +72,7 @@ def regs(op):
 def split_ops(t):
     p = t.split(None, 1)
     if len(p) < 2:
-        return [], []
+        return []
     ops = [o.strip() for o in re.split(r",(?![^\[]*\])", p[1])]
     return ops
 
