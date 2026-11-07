@@ -34,6 +34,12 @@ enum Mode {
     G1,
     /// GEMM 2 from H
     G2,
+    /// GEMM 1 with the generic epilogue chain (P2): `act(alpha H + bias[n1])`, per-row fp8 quantization, H and the row scales to HBM
+    G1q(amdgpu_tile::prims::Act),
+}
+
+fn g1_like(mode: Mode) -> bool {
+    matches!(mode, Mode::G1 | Mode::G1q(_))
 }
 
 pub fn by_name(name: &str) -> Option<Function> {
@@ -41,6 +47,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "mlp_fp8_ws_fused" => Mode::Fused,
         "mlp_fp8_ws_g1" => Mode::G1,
         "mlp_fp8_ws_g2" => Mode::G2,
+        "mlp_fp8_ws_g1q_relu" => Mode::G1q(amdgpu_tile::prims::Act::Relu),
+        "mlp_fp8_ws_g1q_silu" => Mode::G1q(amdgpu_tile::prims::Act::Silu),
         _ => return None,
     };
     Some(build_ws(name, mode))
@@ -95,6 +103,10 @@ fn build_ws(name: &str, mode: Mode) -> Function {
     }
     b.arg("m", DType::I32, 32, 4);
     b.arg("g", DType::I32, 36, 4);
+    if let Mode::G1q(_) = mode {
+        b.arg("ptr_bias", DType::Ptr, 40, 8);
+        b.arg("ptr_scale", DType::Ptr, 48, 8);
+    }
     let mt = Ext::sym("MT");
     let gs = Ext::sym("G");
     b.sym_range("MT", 1, 4096);
@@ -106,24 +118,40 @@ fn build_ws(name: &str, mode: Mode) -> Function {
     b.arg_tensor("ptr_in", m.clone() * Ext::c(K1));
     b.arg_tensor("ptr_w1", Ext::c(W_IMG));
     b.arg_tensor("ptr_w2", Ext::c(W_IMG));
-    b.arg_tensor("ptr_out", m.clone() * Ext::c(if mode == Mode::G1 { N1 } else { 2 * N2 }));
+    if let Mode::G1q(_) = mode {
+        b.arg_tensor("ptr_bias", Ext::c(4 * N1));
+        b.arg_tensor("ptr_scale", m.clone() * Ext::c(4));
+    }
+    b.arg_tensor("ptr_out", m.clone() * Ext::c(if g1_like(mode) { N1 } else { 2 * N2 }));
     let p_in = b.let_(Op::KernargPtr { offset: 0 });
     let p_w1 = b.let_(Op::KernargPtr { offset: 8 });
     let p_w2 = b.let_(Op::KernargPtr { offset: 16 });
     let p_out = b.let_(Op::KernargPtr { offset: 24 });
     let m_v = b.let_(Op::KernargI32 { offset: 32 });
     let g_v = b.let_(Op::KernargI32 { offset: 36 });
+    let epi = if let Mode::G1q(_) = mode {
+        let p_bias = b.let_(Op::KernargPtr { offset: 40 });
+        let p_scale = b.let_(Op::KernargPtr { offset: 48 });
+        Some((p_bias, p_scale))
+    } else {
+        None
+    };
     let tid = b.let_(Op::WorkitemId);
     let lane = Lane::from_tid(b, tid);
     let bx = b.let_(Op::WorkgroupIdX);
     let mut lds = LdsPlan::new();
     let need_w1 = mode != Mode::G2;
-    let need_w2 = mode != Mode::G1;
+    let need_w2 = !g1_like(mode);
     let w1s = need_w1.then(|| lds.tile("W1", W_IMG, TLayout::Linear));
     let w2s = need_w2.then(|| lds.tile("W2", W_IMG, TLayout::Linear));
     lds.commit(b);
     let r_in = { let n = b.bind_i32(ev(m_v) * (K1 as i32)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_in, n) };
-    let r_out = { let n = b.bind_i32(ev(m_v) * (if mode == Mode::G1 { N1 } else { 2 * N2 }) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_out, n) };
+    let r_out = { let n = b.bind_i32(ev(m_v) * (if g1_like(mode) { N1 } else { 2 * N2 }) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_out, n) };
+    let epi = epi.map(|(pb, ps)| {
+        let rb = b.buffer_desc(pb, (4 * N1) as u32);
+        let rs = { let n = b.bind_i32(ev(m_v) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(ps, n) };
+        (rb, rs)
+    });
     // ---- prologue: the weight images into LDS (1 KB per DMA, wave w issues blocks w, w + 4, ...) ----
     let l16 = b.bind_i32(lane.lane() << 4);
     for (sh, p) in [(w1s.as_ref(), p_w1), (w2s.as_ref(), p_w2)] {
@@ -174,7 +202,7 @@ fn build_ws(name: &str, mode: Mode) -> Function {
     let p_words: Vec<Opnd> = if mode == Mode::G2 {
         xs.clone()
     } else {
-        let st = gemm1_act_stage(GemmCtx { wfrag: &wfrag, c127 }, w1s.as_ref().expect("W1"), &xs, mode, r_out, row, &lane, &roles);
+        let st = gemm1_act_stage(GemmCtx { wfrag: &wfrag, c127 }, w1s.as_ref().expect("W1"), &xs, mode, r_out, row, &lane, &roles, epi);
         let out = st.out.clone();
         st.inst.plain(!fused).emit(b);
         out.get()
@@ -183,7 +211,7 @@ fn build_ws(name: &str, mode: Mode) -> Function {
     // the next block's row operand (clamped: past the end it reloads this block, unused)
     let nclamp = b.bind_i32(ev(next).lt(ev(nb)).select_i32(ev(next), blk.clone()));
     let xn = rowfrags(b, ev(nclamp));
-    if mode != Mode::G1 {
+    if !g1_like(mode) {
         let contract = amdgpu_dsl::StageContract {
             live_in: p_vals.iter().enumerate().map(|(jb, v)| p_stage_val(jb as i64, *v, false)).collect(),
             barrier_phase: 1,
@@ -216,7 +244,7 @@ struct Gemm1<'s> {
 /// Stage `gemm1_act` (keys `mma.rows_x_lds` + `map.relu_pack_fp8`): `H^T = W1 X^T`, `fp8(relu(alpha H))` packed in accumulator order (fused: the
 /// zero-cost B-operand words of GEMM 2; G1: stored to HBM).
 #[allow(clippy::too_many_arguments)]
-fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opnd], mode: Mode, r_out: ValueId, row: ValueId, lane: &'s Lane, roles: &[String]) -> Gemm1<'s> {
+fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opnd], mode: Mode, r_out: ValueId, row: ValueId, lane: &'s Lane, roles: &[String], epi: Option<(ValueId, ValueId)>) -> Gemm1<'s> {
     use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -240,11 +268,69 @@ fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opn
             });
         }
     }
+    let words: Rc<RefCell<Vec<Vec<ValueId>>>> = Rc::new(RefCell::new(Vec::new()));
+    if let (Mode::G1q(act), Some((r_bias, r_scale))) = (mode, epi) {
+        // ---- the generic epilogue chain (map.epilogue_chain): y = act(alpha acc + bias[n1]) (E), row amax (R: lane-local over the lane's 128
+        // values, then the partner half of the row via permlane32_swap), per-row fp8 (Q); words in accumulator order, scale per row ----
+        use amdgpu_tile::prims::{abs_f32, act as act_f, affine, fp8_pack, fp8_scale};
+        let st: Out<(ValueId, ValueId)> = Out::new();
+        let s1 = st.clone();
+        last = u.add("epi.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| {
+            let alpha = b.c_f32(ALPHA);
+            let vb = b.bind_i32(lane.half() << 4);
+            s1.set((alpha, vb));
+        });
+        let ys: Rc<RefCell<Vec<Vec<ValueId>>>> = Rc::new(RefCell::new(Vec::new()));
+        let amax: Rc<RefCell<Option<ValueId>>> = Rc::new(RefCell::new(None));
+        for t in 0..(N1 / 32) as usize {
+            let (a2, s2, y2, m2) = (acc.clone(), st.clone(), ys.clone(), amax.clone());
+            last = u.add(format!("epi.t{t}"), UnitClass::Valu, Hint::Filler, &[last], move |b| {
+                let (alpha, vb) = s2.get();
+                // bias of value r (n1 = 32 t + 8 (r / 4) + 4 h + r % 4): one 16-byte load per q = r / 4
+                let bq: Vec<ValueId> = (0..4u32).map(|q| b.buffer_load_b128(r_bias, vb, 0i32, 128 * t as u32 + 32 * q)).collect();
+                b.wait_vm(0);
+                let a = a2.borrow()[t];
+                let mut y = Vec::with_capacity(16);
+                for r in 0..16u8 {
+                    let v = b.frag16_lane(a, r);
+                    let f = b.bitcast_f32(v);
+                    let bl = b.frag4_lane(Opnd::Val(bq[(r / 4) as usize]), r % 4);
+                    let bias = b.bitcast_f32(bl);
+                    let z = affine(b, f, Some(alpha), Some(bias));
+                    y.push(act_f(b, z, act));
+                }
+                let mut m = m2.borrow_mut();
+                for &v in &y {
+                    let av = abs_f32(b, v);
+                    *m = Some(match *m { None => av, Some(p) => b.max_f32(p, av) });
+                }
+                y2.borrow_mut().push(y);
+            });
+        }
+        let (y3, m3, w5) = (ys.clone(), amax.clone(), words.clone());
+        last = u.add("epi.quant", UnitClass::Valu, Hint::Anchor, &[last], move |b| {
+            let m = m3.borrow().expect("amax");
+            // lanes l and l + 32 hold the two halves of row m: the partner value through permlane32_swap
+            let (pa, pb) = b.permlane32_swap(m, m);
+            let (fa, fb) = (b.bitcast_f32(pa), b.bitcast_f32(pb));
+            let row_max = b.max_f32(fa, fb);
+            let (scale, inv) = fp8_scale(b, row_max);
+            for y in y3.borrow().iter() {
+                w5.borrow_mut().push(fp8_pack(b, y, inv));
+            }
+            let vs = b.bind_i32(ev(row) << 2);
+            b.buffer_store_f32(r_scale, vs, 0i32, 0, scale);
+        });
+    }
     let consts: Out<(ValueId, ValueId)> = Out::new();
     let c1 = consts.clone();
-    last = u.add("act.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| c1.set((b.c_f32(ALPHA), b.c_f32(0.0))));
-    let words: Rc<RefCell<Vec<Vec<ValueId>>>> = Rc::new(RefCell::new(Vec::new()));
+    if !matches!(mode, Mode::G1q(_)) {
+        last = u.add("act.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| c1.set((b.c_f32(ALPHA), b.c_f32(0.0))));
+    }
     for t in 0..(N1 / 32) as usize {
+        if matches!(mode, Mode::G1q(_)) {
+            break;
+        }
         let (a2, c2, w2) = (acc.clone(), consts.clone(), words.clone());
         last = u.add(format!("act.t{t}"), UnitClass::Valu, Hint::Filler, &[last], move |b| {
             let (alpha, zf) = c2.get();
@@ -257,7 +343,7 @@ fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opn
         });
     }
     let out: Out<Vec<Opnd>> = Out::new();
-    if mode == Mode::G1 {
+    if g1_like(mode) {
         let vo: Out<ValueId> = Out::new();
         let v1 = vo.clone();
         last = u.add("store.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| {
@@ -291,7 +377,7 @@ fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opn
         .param("atom", "mfma_scale_32x32x64_f8")
         .param("n", N1)
         .param("k", K1)
-        .param("epilogue", if mode == Mode::G1 { "map.relu_pack_fp8 -> store" } else { "map.relu_pack_fp8" })
+        .param("epilogue", match mode { Mode::G1 => "map.relu_pack_fp8 -> store", Mode::G1q(_) => "map.epilogue_chain(alpha, bias, act, row amax, fp8) -> store", _ => "map.relu_pack_fp8" })
         .handover(move |_b| {
             // the hand-over is recorded on the stage that produced it: the P words of GEMM 2's B operand
             let p = o4.get();
