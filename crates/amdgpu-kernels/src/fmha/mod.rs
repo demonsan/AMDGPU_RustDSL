@@ -150,22 +150,12 @@ impl KvRing3 {
     /// The copies of the tile at `key0` into `slot` that `role` produces (as `KvRing::stage`).
     pub fn stage(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<ValueId> {
         if let Some(u) = self.stage_units(role, key0, slot) {
-            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
+            // the slot offsets are shared with every reader of the slot instance (SlotIdx cache): declared scalar hand-overs
+            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], scalars_in: slot.offset_scalars(), ..Default::default() };
             let sl = slot.clone();
             amdgpu_tile::stage::StageInst::new("move.kv_stage", amdgpu_tile::stage::Prim::M, "kv.stage", c, u)
                 .param("role", format!("{role:?}"))
-                .prebind(move |b| {
-                    // the slot offsets are shared with the readers of the slot (SlotIdx cache): bound outside the region
-                    match role {
-                        Role::A => {
-                            let _ = self.kd.at(&sl).off_v(b);
-                            let _ = self.ks.at(&sl).off_v(b);
-                        }
-                        _ => {
-                            let _ = self.vs.at(&sl).off_v(b);
-                        }
-                    }
-                })
+                .handover(move |_b| (Vec::new(), sl.offset_scalars()))
                 .emit(b);
             return None;
         }
@@ -507,19 +497,22 @@ impl PipeBody for AttnBody3<'_> {
             c.live_in.push(p_val(w.clone()));
             c.scalars_in = bias_scalar(bias);
         }
+        c.scalars_in.extend(t.cur.offset_scalars());
+        if t.staged {
+            c.scalars_in.extend(t.next.offset_scalars());
+        }
         let mut insts = vec![amdgpu_tile::stage::StageInst::new("mma.pv", amdgpu_tile::stage::Prim::A, "pv", Default::default(), self.pv_units(&t.cur, w))];
         if t.staged {
             insts.push(amdgpu_tile::stage::StageInst::new("mma.qk", amdgpu_tile::stage::Prim::A, "qk", Default::default(), self.qk_units(&t.next, s, bias)));
         }
         let (cur, next, staged) = (t.cur.clone(), t.next.clone(), t.staged);
-        let r = self.ring;
         amdgpu_tile::stage::merge("m_phase", c, insts)
-            .prebind(move |b| {
-                let _ = r.vs.at(&cur).off_v(b);
+            .handover(move |_b| {
+                let mut s = cur.offset_scalars();
                 if staged {
-                    let _ = r.ks.at(&next).off_v(b);
-                    let _ = r.kd.at(&next).off_v(b);
+                    s.extend(next.offset_scalars());
                 }
+                (Vec::new(), s)
             })
             .emit(b);
     }
@@ -555,16 +548,14 @@ impl PipeBody for AttnBody3<'_> {
                 }
             }
             // the window = stage `online.softmax` (conversion chunks of tile t) woven with stage `mma.qk` (blocks of tile t + 1), alternating
-            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
+            let mut c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
+            if t.staged {
+                c.scalars_in = t.next.offset_scalars();
+            }
             let (nx, staged) = (t.next.clone(), t.staged);
             amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "window", c, u)
                 .param("with", "mma.qk blocks")
-                .prebind(move |b| {
-                    if staged {
-                        let _ = r.ks.at(&nx).off_v(b);
-                        let _ = r.kd.at(&nx).off_v(b);
-                    }
-                })
+                .handover(move |_b| (Vec::new(), if staged { nx.offset_scalars() } else { Vec::new() }))
                 .emit(b);
         }
         let w: Vec<ValueId> = chunks.iter().flat_map(|c| c.get()).collect();

@@ -120,6 +120,13 @@ impl SlotIdx {
         self.offs.borrow_mut().insert(stride, v);
         ev(v)
     }
+    /// The bound slot offsets of this slot instance as stage scalars (one per stride, owner `wave`): the hand-over of the per-slot bindings that
+    /// every consumer of the slot instance shares (a stage declares the ones bound before it as `scalars_in` and all of them as `scalars_out`).
+    pub fn offset_scalars(&self) -> Vec<amdgpu_dsl::StageScalar> {
+        let mut v: Vec<(i64, ValueId)> = self.offs.borrow().iter().map(|(k, v)| (*k, *v)).collect();
+        v.sort();
+        v.into_iter().map(|(stride, val)| amdgpu_dsl::StageScalar { name: format!("slot_off({:?},{:?})*{stride}", self.slot, self.gen), values: vec![val], owner: "wave".into() }).collect()
+    }
     /// The slot index as an expression.
     pub fn slot(&self) -> I32 {
         ox(self.slot)
