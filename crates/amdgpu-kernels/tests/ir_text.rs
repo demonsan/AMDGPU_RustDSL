@@ -13,6 +13,12 @@ fn all_kernels() -> Vec<String> {
         "mlp_fp8_ws_fused",
         "mlp_fp8_ws_g1",
         "mlp_fp8_ws_g2",
+        // stage library P2 (generic E / R / Q stages)
+        "mlp_fp8_ws_g1q_relu",
+        "mlp_fp8_ws_g1q_silu",
+        "rmsnorm_quant_fp8_n1024",
+        "rmsnorm_quant_fp8_n4096",
+        "rmsnorm_quant_fp8_n8192",
     ] {
         v.push(k.to_string());
     }
