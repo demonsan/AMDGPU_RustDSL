@@ -33,14 +33,8 @@ pub struct Options {
     pub reorder: bool,
     /// Let non-memory instructions cross `s_barrier` (memory ops never do).
     pub alu_across_barrier: bool,
-    /// Debug bisect: ALU may cross barriers only in this block index.
-    pub xbar_only: Option<usize>,
-    /// Debug: full-drain waits only.
-    pub drain_only: bool,
     /// Remove empty latch blocks / elide fall-through branches (default on with the scheduler).
     pub cfg_cleanup: bool,
-    /// Debug bisect: schedule only this block index.
-    pub only_block: Option<Vec<usize>>,
     /// Pressure limit in VGPR dwords (never below the original peak of the block).
     pub max_vgprs: u32,
     /// Run the verifiers (always on in tests).
@@ -48,18 +42,12 @@ pub struct Options {
     pub stats: bool,
     /// `ldshoist`: hoist `ds_read` above independent instructions (`hoist=N`: max distance).
     pub ldshoist: bool,
-    /// `hoistchain`: ldshoist also moves the pure ALU producers of a load's address (and of theirs) up with it, so a load whose address is computed right before it can still be issued early
-    pub hoist_chain: bool,
     pub hoist_dist: usize,
     /// `slotfill`: the slot-filling scheduler (sched/slotfill.rs): MFMAs are the skeleton, the other instructions are spread over their deadline windows
     pub slotfill: bool,
-    /// `ldahead=D` (sched/ldahead.rs): post-pass moving every ds_read up until D MFMAs sit between it and its first consumer (0 = off)
-    pub ldahead: usize,
-    /// `ldslack=S`: extra live VGPR dwords `ldahead` may use above the block's original peak
-    pub ldslack: i64,
     /// `ldsink=D` (sched/ldahead.rs): the opposite direction - sink every ds_read down until at most D MFMAs sit between it and its first consumer (0 = off)
     pub ldsink: usize,
-    /// `ldahead32=D`: like `ldahead`, for the 32-bit scale-word reads (`ds_read_b32`) only
+    /// `ldahead32=D` (sched/ldahead.rs): post-pass moving every 32-bit scale-word read (`ds_read_b32`) up until D MFMAs sit between it and its first consumer (0 = off)
     pub ldahead32: usize,
     /// `wsink` (sched/ldahead.rs): sink the kernel's EXPLICIT `s_waitcnt lgkmcnt(n)` down past the compute that does not need them, so the MFMAs in front of a closing `wait_lds(0)` get the counted waits of the scoreboard
     pub waitsink: bool,
@@ -73,12 +61,12 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, regions: Vec::new(), region_of: Vec::new(), hzfill: false }
+        Options { reorder: true, alu_across_barrier: false, cfg_cleanup: true, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_dist: 64, slotfill: false, ldsink: 0, ldahead32: 0, waitsink: false, regions: Vec::new(), region_of: Vec::new(), hzfill: false }
     }
 }
 
 impl Options {
-    /// Debug / bisect override: `AMDC_SCHED=1` (full scheduler) or `ld` (waits + LDS-read hoisting), `AMDC_SCHED_OPTS=rewait,xbar,noverify,stats,limit=N,only=..`
+    /// Debug / bisect override: `AMDC_SCHED=1` (full scheduler) or `ld` (waits + LDS-read hoisting), `AMDC_SCHED_OPTS=rewait,xbar,noverify,stats,limit=N,..`
     /// tunes it (`AMDC_SCHED=0`: no scheduler).
     pub fn from_env() -> Option<Options> {
         let mode = std::env::var("AMDC_SCHED").ok();
@@ -108,28 +96,15 @@ impl Options {
                     "xbar" => o.alu_across_barrier = true,
                     "noverify" => o.verify = false,
                     "stats" => o.stats = true,
-                    "drain" => o.drain_only = true,
                     "nocfg" => o.cfg_cleanup = false,
                     "ldshoist" => o.ldshoist = true,
                     "slotfill" => o.slotfill = true,
                     "wsink" => o.waitsink = true,
                     "hzfill" => o.hzfill = true,
-                    "hoistchain" => {
-                        o.ldshoist = true;
-                        o.hoist_chain = true;
-                    }
                     _ => {
-                        if let Some(v) = t.strip_prefix("only=") {
-                            o.only_block = Some(v.split('+').filter_map(|x| x.parse().ok()).collect());
-                        }
                         if let Some(v) = t.strip_prefix("ldahead32=") {
                             if let Ok(n) = v.parse() {
                                 o.ldahead32 = n;
-                            }
-                        }
-                        if let Some(v) = t.strip_prefix("ldahead=") {
-                            if let Ok(n) = v.parse() {
-                                o.ldahead = n;
                             }
                         }
                         if let Some(v) = t.strip_prefix("ldsink=") {
@@ -137,19 +112,11 @@ impl Options {
                                 o.ldsink = n;
                             }
                         }
-                        if let Some(v) = t.strip_prefix("ldslack=") {
-                            if let Ok(n) = v.parse() {
-                                o.ldslack = n;
-                            }
-                        }
                         if let Some(v) = t.strip_prefix("hoist=") {
                             if let Ok(n) = v.parse() {
                                 o.hoist_dist = n;
                                 o.ldshoist = true;
                             }
-                        }
-                        if let Some(v) = t.strip_prefix("xbar=") {
-                            o.xbar_only = v.parse().ok();
                         }
                         if let Some(v) = t.strip_prefix("limit=") {
                             if let Ok(n) = v.parse() {
@@ -193,7 +160,7 @@ pub(crate) fn schedule_blocks(m: &mut MFunction, o: &Options, stats: &mut Stats)
             if !o.reorder && !regional {
                 continue;
             }
-            if insts.len() < 2 || o.only_block.as_ref().map_or(false, |x| !x.contains(&bi)) {
+            if insts.len() < 2 {
                 continue;
             }
             if regional {
@@ -206,7 +173,7 @@ pub(crate) fn schedule_blocks(m: &mut MFunction, o: &Options, stats: &mut Stats)
                 continue;
             }
             let term = m.blocks[bi].term.clone();
-            let xb = o.alu_across_barrier || o.xbar_only == Some(bi);
+            let xb = o.alu_across_barrier;
             let g = depgraph::build(m, &insts, &term, xb);
             let r = list::schedule_best(m, &insts, &g, &lv.live_in[bi], &lv.live_out[bi], o.max_vgprs as i64, false);
             if o.verify {
@@ -230,7 +197,7 @@ fn schedule_block_runs(m: &mut MFunction, bi: usize, o: &Options, lv: &liveness:
     let insts = m.blocks[bi].insts.clone();
     let n = insts.len();
     let term = m.blocks[bi].term.clone();
-    let xb = o.alu_across_barrier || o.xbar_only == Some(bi);
+    let xb = o.alu_across_barrier;
     // live sets before each instruction (the same rules as `liveness::compute`: any destination write kills)
     let mut live: std::collections::HashSet<VReg> = lv.live_out[bi].clone();
     let mut before: Vec<std::collections::HashSet<VReg>> = vec![std::collections::HashSet::new(); n + 1];
@@ -281,7 +248,6 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
     if o.cfg_cleanup {
         cfg::cleanup(m);
     }
-    waits::DRAIN_ONLY.store(o.drain_only, std::sync::atomic::Ordering::Relaxed);
     waits::strip_auto_waits(m);
     cfg::dce_dead_selects(m);
     if o.any_region(|r| r.ldshoist) {
@@ -308,7 +274,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
             eprintln!("wsink: {n} explicit waits moved");
         }
     }
-    if o.any_region(|r| r.ldahead > 0 || r.ldahead32 > 0 || r.ldsink > 0) {
+    if o.any_region(|r| r.ldahead32 > 0 || r.ldsink > 0) {
         let n = ldahead::run(m, o);
         if o.stats {
             eprintln!("ldahead: {n} blocks changed");

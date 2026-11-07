@@ -140,7 +140,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         agpr::assign(&mut b)?;
         b
     };
-    let sched_opts = scheduler_options(f, pname).map(|mut o| {
+    let sched_opts = scheduler_options(f).map(|mut o| {
         // weave regions: the strategies declared by name, mapped onto the region ids lowering stamped (one id per scope instance; an undeclared region inherits its parent's strategy)
         if !declared_regions(f).is_empty() {
             o.region_of = region_strategies(f, &base);
@@ -148,7 +148,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         o
     });
     // experiment switch (applied ON TOP of the kernel's own scheduler options, i.e. the shipped preset): AMDC_SCHED_ADD=<kernel name substring>:<tokens> (e.g.
-    // `fmha_fwd_hd128_mxfp8_v3_vs128:ldahead=4,ldslack=8`; several entries separated by `;`) appends scheduler tokens to the options the kernel would use anyway
+    // `fmha_fwd_hd128_mxfp8_v3_vs128:ldsink=2`; several entries separated by `;`) appends scheduler tokens to the options the kernel would use anyway
     let sched_opts = match (std::env::var("AMDC_SCHED_ADD").ok().filter(|v| !v.is_empty()), sched_opts) {
         (Some(spec), Some(mut o)) => {
             for ent in spec.split([';', '|']) {
@@ -267,11 +267,10 @@ pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
 }
 
 /// The scheduler options a kernel compiles with. `AMDC_SCHED` (1 / ld) overrides everything; `AMDC_SCHED=0` turns the scheduler off. Otherwise the kernel's PROFILE PRESET
-/// applies - the GEMM profile (scoreboard waits + ds_read hoisting, no reordering) or the FMHA families (the wait-recomputing pass, +9% on the transposed kernel, bit-identical
-/// results, docs/archive/status.md round 44; `_t128`: ALU across its barrier and the pressure limit 248) - and the kernel's own `Function::sched_opts` tokens are applied ON TOP of
+/// applies - the GEMM profile (scoreboard waits + ds_read hoisting, no reordering) or the `_t128` profile (ALU across its barrier, the pressure limit 248) - and the kernel's own `Function::sched_opts` tokens are applied ON TOP of
 /// that preset (never instead of it: a kernel that adds a token keeps its profile's options). A kernel without a preset that sets tokens gets the default options plus them.
-pub fn scheduler_options(f: &amdgpu_dsl::Function, pname: &str) -> Option<sched::Options> {
-    let mut o = scheduler_options_base(f, pname);
+pub fn scheduler_options(f: &amdgpu_dsl::Function) -> Option<sched::Options> {
+    let mut o = scheduler_options_base(f);
     let decls = declared_regions(f);
     if !decls.is_empty() && !matches!(std::env::var("AMDC_SCHED").ok().as_deref(), Some("0")) {
         // per-region strategies: the scheduler runs for them even on a kernel without a preset (the kernel default then is `rewait`: waits only)
@@ -315,41 +314,31 @@ pub fn region_strategies(f: &amdgpu_dsl::Function, m: &mir::MFunction) -> Vec<u1
     out
 }
 
-fn scheduler_options_base(f: &amdgpu_dsl::Function, pname: &str) -> Option<sched::Options> {
+fn scheduler_options_base(f: &amdgpu_dsl::Function) -> Option<sched::Options> {
+    use amdgpu_dsl::CompileProfile as P;
     if let Some(o) = sched::Options::from_env() {
         return Some(o);
     }
     if std::env::var("AMDC_SCHED").ok().as_deref() == Some("0") {
         return None;
     }
-    let preset = if f.compile_profile == Some(amdgpu_dsl::CompileProfile::Gemm) {
-        let mut o = sched::Options::default();
-        o.reorder = false;
-        o.ldshoist = true;
-        Some(o)
-    } else if pname.starts_with("fmha_fwd_hd128_mxfp8_t")
-        || pname.starts_with("fmha_fwd_hd128_mxfp8_sv")
-        || pname.starts_with("fmha_fwd_hd128_mxfp8_vs")
-        || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))
-    {
-        // "ld" preset: scoreboard (partial) waits + ds_read hoisting, no instruction reordering. Measured best on the
-        // merged tree (docs/archive/status.md round 45): 286.5 TFLOP/s vs 285.1 with rewait,xbar; bit-identical results.
-        let mut o = sched::Options::default();
-        // `_t128`: ALU may cross the single barrier per tile and the pressure limit 248 lets the list scheduler take a schedule at vgpr 256
-        // (measured 489 -> 505 TFLOP/s on B1H8S2048; limit 246/248 only, 244/250 give the old schedule: a heuristic knob, re-measure on changes)
-        if pname.ends_with("_t128") {
+    let preset = match f.compile_profile {
+        // scoreboard (partial) waits + ds_read hoisting, no instruction reordering (docs/scheduling.md; measured best on the GEMM)
+        Some(P::Gemm) => {
+            let mut o = sched::Options::default();
+            o.reorder = false;
+            o.ldshoist = true;
+            Some(o)
+        }
+        // `_t128`: ALU may cross the single barrier per tile and the pressure limit 248 lets the list scheduler take a schedule at vgpr 256 (measured 489 -> 505 TFLOP/s on B1H8S2048;
+        // limit 246 / 248 only, 244 / 250 give the old schedule: a heuristic knob, re-measure on changes)
+        Some(P::T128) => {
+            let mut o = sched::Options::default();
             o.alu_across_barrier = true;
             o.max_vgprs = 248;
+            Some(o)
         }
-        // `_vs128` keeps the full list scheduler (reordering): 299.1 vs 287.9 TFLOP/s with the `ld` preset (docs/archive/status.md round 49)
-        if !pname.ends_with("_vs128") && !pname.ends_with("_vs5") && !pname.ends_with("_vs6") && !pname.ends_with("_vs9") && !pname.ends_with("_kvsplit") && !pname.ends_with("_vsm") && !pname.ends_with("_t128") && !(pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o")) {
-            o.reorder = false;
-            o.alu_across_barrier = true;
-            o.ldshoist = true; // hoist ds_read above independent work (docs/scheduling.md); AMDC_SCHED=0 / 1 / auto / OPTS override
-        }
-        Some(o)
-    } else {
-        None
+        _ => None,
     };
     match (preset, &f.sched_opts) {
         (Some(mut o), Some(s)) => {

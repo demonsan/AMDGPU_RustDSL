@@ -7,17 +7,11 @@
 //! result is proven legal by `verify::check_perm`. No value changes: same instructions, same operands.
 
 use super::depgraph;
-use super::effects::*;
 use super::{liveness, verify, Options};
 use crate::mir::*;
 
 fn is_lds_read(op: MOp) -> bool {
     crate::op_attrs::attrs(op).is_lds_read()
-}
-
-/// Plain ALU / scalar instructions that may travel with a hoisted load: no memory access, no fence, not pinned, not a matrix op.
-fn chain_movable(i: &MInst, e: &Effects) -> bool {
-    e.mem.is_none() && e.fence == Fence::None && !e.smem && !e.pinned && i.op != MOp::SchedGroup && crate::op_attrs::attrs(i.op).mfma.is_none()
 }
 
 pub fn run(m: &mut MFunction, o: &Options) -> usize {
@@ -57,21 +51,8 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
             }
             let p = pos[idx];
             let dst_w = insts[idx].dst.map(|d| width(canon(d))).unwrap_or(0);
-            // `hoistchain`: pure ALU producers of the load's address inside the hoist window move with it
             let floor = p.saturating_sub(o.hoist_dist);
-            let mut members: Vec<usize> = vec![idx];
-            if o.hoist_chain {
-                let mut stack = vec![idx];
-                while let Some(y) = stack.pop() {
-                    for &(x, _) in &g.preds[y] {
-                        if !members.contains(&x) && pos[x] >= floor && chain_movable(&insts[x], &g.eff[x]) {
-                            members.push(x);
-                            stack.push(x);
-                        }
-                    }
-                }
-            }
-            let q_min = members.iter().flat_map(|&y| g.preds[y].iter().filter(|&&(x, _)| !members.contains(&x)).map(|&(x, _)| pos[x] + 1)).max().unwrap_or(0);
+            let q_min = g.preds[idx].iter().map(|&(x, _)| pos[x] + 1).max().unwrap_or(0);
             let mut q = q_min.max(floor);
             // pressure along the span: every position in q..p gains the destination's live range
             while q < p {
@@ -82,28 +63,18 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
                 q += 1;
             }
             if q < p {
-                // movers: the members positioned at or after q, in program order (members before q stay: their moved successors land after them)
-                let mut movers: Vec<usize> = members.iter().copied().filter(|&y| pos[y] >= q).collect();
-                movers.sort_by_key(|&y| pos[y]);
-                if movers.is_empty() {
-                    continue;
-                }
-                let extra: i64 = movers.iter().filter(|&&y| y != idx).map(|&y| insts[y].dst.map(|d| width(canon(d))).unwrap_or(0)).sum();
-                            let first_old = pos[movers[0]];
-                let lo = q.min(first_old);
-                order.retain(|k| !movers.contains(k));
-                for (n, &y) in movers.iter().enumerate() {
-                    order.insert(q + n, y);
-                }
-                for k in lo..=p {
+                order.retain(|k| *k != idx);
+                order.insert(q, idx);
+                for k in q..=p {
                     pos[order[k]] = k;
                 }
-                for k in (q + movers.len())..=p {
-                    live[order[k]] += dst_w + extra;
+                for k in (q + 1)..=p {
+                    live[order[k]] += dst_w;
                 }
                 moved += 1;
             }
-        }        if moved > 0 {
+        }
+        if moved > 0 {
             if o.verify {
                 if let Err(e) = verify::check_perm(m, &insts, &order, &term, false) {
                     eprintln!("ldshoist: block {bi} rejected by verifier: {e}");

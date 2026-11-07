@@ -1,101 +1,51 @@
-# LDS 读领先量实验（`_vs128`，真实数据 `REF_DATA=normal`）：`ldahead` / `ldsink`
+# LDS 读与 lgkm 等待的调度策略（`ldsink` / `ldahead32` / `wsink`）与已淘汰的实验
 
-实现：`crates/amdgpu-compiler/src/sched/ldahead.rs`（调度后处理，作用于每个基本块的最终顺序，之后照常重算等待）。token：`ldahead=D`（每条 `ds_read` 上移，直到它与首个消费者之间有 D 条 MFMA；`ldslack=S`
-允许比原峰值多用 S 个 VGPR dword，默认 0）、`ldsink=D`（反方向：下沉到与消费者之间至多 D 条 MFMA）。依赖 / 冒险 / 栅栏走 `depgraph`，结果用 `verify::check_perm` 复核。
-无环境变量用法：`Function::sched_opts` 的 token；注册了 `fmha_fwd_hd128_mxfp8_v3x_vs128_ldsink{1,2,..}` 与 `..._v3x_kvsplit_ldsink{N}`（与出厂 v3 同码，仅多一个 token）。
-实验开关：`AMDC_SCHED_ADD=<内核名子串>:<tokens>`（叠加在内核自己的出厂调度预设之上；`cargo.sh` 已转发）。工具：`tools/lgab.sh`（`tools/ab_fmha.sh` 加每变体的 emit 环境：`kernel%VAR=val;..`）。
+实现：`crates/amdgpu-compiler/src/sched/ldahead.rs`（调度后处理，作用于每个基本块的最终顺序，之后照常重算等待；依赖 / 冒险 / 栅栏走 `depgraph`，结果用 `verify::check_perm` 复核，区域边界不跨越，见 [`weaver-sched.md`](weaver-sched.md)）。
 
-## 现状（Main `b6b2ca59` 附近）
+| token | 作用 | 状态 |
+|---|---|---|
+| `ldsink=D` | 每条 `ds_read` 下沉，直到它与首个消费者之间至多 D 条 MFMA（厂商的 `lgkmcnt(4)`：只留一组在飞） | **出厂**（FMHA 三个 kernel，`D = 1`） |
+| `ldahead32=D` | 只把 32-bit scale 字的 `ds_read_b32` 上移，直到与消费者之间有 D 条 MFMA | **出厂**（`D = 1`） |
+| `wsink` | 把 kernel 显式的 `s_waitcnt lgkmcnt(n)` 下沉到不碰内存 / 栅栏的计算之后，让前面的 MFMA 拿到记分板的计数等待 | **出厂** |
+| `hoist=N`（`ldshoist`） | 调度前把 `ds_read` 上提到至多 N 条之前（受寄存器预算约束） | GEMM profile 预设 |
 
-`_vs128` 稳态循环的 MFMA 相位（`s` = scaled MFMA，`T` = `ds_read_b64_tr_b8`，`R` = `ds_read_b128`）：`... T×8 W(8) Ms T×4 W(8) Ms T×4 W(8) Ms ... W(4) Ms ... R.. W(5) .. W(3) ..`：PV 段已经是部分等待
-（`lgkmcnt(8)`），整块只剩 2–3 个 `lgkmcnt(0)`。**count-based 的部分等待早已是现状**（scoreboard 按发射顺序算），所以实验 (2) 没有可调的余量；剩下的是发射**顺序**。
-厂商是每条 PV MFMA 之后读"下一组"，等待 `lgkmcnt(4)`（一组在飞）；我们是 `lgkmcnt(8)`（两组在飞，即**更深**）。lgkmcnt 只有 4 位（≤ 15），在飞读超过 15 条时等待只能退化成 `lgkmcnt(0)`。
+用法：`Function::sched_opts` 的 token，或叠在预设上的实验开关 `AMDC_SCHED_ADD=<内核名子串>:<tokens>`；工具 `tools/lgab.sh`（`tools/ab_fmha.sh` 加每变体的 emit 环境：`kernel%VAR=val;..`，同一轮交替）。token 也可以按 weave 区域声明（`AMDC_SCHED_REGION`，见 `weaver-sched.md`）。
 
-## 结果（GPU 4，`REF_DATA=normal`，同一轮交替；TF/s 中位数，7 或 11 轮；全部精度检查 `bad=0`，证书 6 / 29 / 0 不变）
+## 出厂策略的测量（`REF_DATA=normal`，同一轮交替，TF/s 中位数；证书不变，精度 `bad=0`）
+
+`_vs128` 稳态循环的 `lgkmcnt` 不是退化成 `(0)` 的：PV 段早已是部分等待，厂商是每条 PV MFMA 之后读"下一组"并等 `lgkmcnt(4)`（一组在飞），我们是 `lgkmcnt(8)`（两组在飞）；lgkmcnt 只有 4 位（≤ 15），在飞读超过 15 条时只能退化成 `(0)`。
 
 | 变体 | B4H8S2048 | B1H8S8192 | 备注 |
 |---|--:|--:|---|
-| 基线（出厂 `_vs128`） | 1696.3 / 1700.6 / 1704.1 | 2369.7 / 2375.8 / 2373.6 | VGPR 256，`lgkmcnt(0)` 49 个 |
-| `ldshoist` / `hoist=128`（调度前的 ds_read 上提） | 1673.9 / 1679.7 | 2329.4 / 2334.7 | −1.3 … −1.7 %，VGPR 244 |
-| `limit=248`（调度器压力上限） | 1682.5 | 2339.1 | −0.8 … −1.3 % |
-| `ldahead=1 / 2`（更深：上移到 1 / 2 条 MFMA） | 1693.7 / 1694.4 | 2374.6 / 2364.7 | 持平（−0.2 … −0.4 %） |
-| `ldahead=4` | 1667.1 | 2323.0 | −1.7 % |
-| `ldahead=8` | 1609.1 | 2242.2 | −5.1 %（`lgkmcnt(0)` 49 → 202：超过 15 条在飞，等待退化） |
-| `ldahead=4,ldslack=4` | 1668.5 | 2323.7 | 同 `ldahead=4` |
-| **`ldsink=1`（更浅：与厂商同样一组在飞）** | **1706.8 / 1707.4（+0.2…+0.4 %）** | **2388.4 / 2391.5（+0.5…+0.8 %）** | VGPR 256 → 248，**每轮 ≥ 基线** |
-| `ldsink=2` | 1702.0 / 1698.9 | 2381.4 / 2380.1 | 持平 |
-| `ldsink=3` | 1697.6 | 2369.8 | 持平 |
+| 基线 `_vs128` | 1696.3 / 1700.6 / 1704.1 | 2369.7 / 2375.8 / 2373.6 | VGPR 256，`lgkmcnt(0)` 49 个 |
+| `ldsink=1` | 1706.8 / 1707.4（+0.2…+0.4 %） | 2388.4 / 2391.5（+0.5…+0.8 %） | VGPR 256 → 248 |
+| `ldsink=2 / 3` | 持平 | 持平 | |
+| `wsink` | +0.2 % | +0.3 %（per-CU +0.6 %） | |
+| **`wsink,ldahead32=1`** | **+1.8 %** | **+1.1 %**（per-CU +1.0 %） | M 相位中段两处 `lgkmcnt(0)` 变计数等待，VGPR 248 → 240 |
 
-per-CU（B1H8S2048，`ROWS_PER_BLOCK=256` 强制 `_vs128`，11 轮）：基线 628.6，`ldsink=1` **633.3（+0.75 %）**，`ldsink=2` 628.0。
+两处 `lgkmcnt(0)` 的来源：(a) 循环末尾 QK 最后 4 条 MFMA 之前是内核（tile pipeline）显式的收尾 `wait_lds(0)`，它是 depgraph 的栅栏，K 的读全堆在它前面（`wsink` 把它沉到最后一条 MFMA 之后）；(b) 取 K-scale 字的 `ds_read_b32` 刚发出就被消费（`ldahead32=1` 提前一条 MFMA）。
+出厂对比 `ldsink=1`（kernel-opt，7 次）：`_vs128` −0.1 / +1.2 / +1.3 %，`_kvsplit` +1.8 / +1.1 / +1.2 %，`_t128` +0.8 / −0.2 / +1.5 %。
 
-**结论**：更深的读领先量只会变差（寄存器已在 256，且 lgkmcnt 4 位上限）；方向反过来 —— 读再贴近消费者、与厂商一样只留一组在飞（`ldsink=1`）—— 有小而稳定的收益（+0.2 … +0.8 %，并释放 8 个 VGPR），
-作为 `fmha_fwd_hd128_mxfp8_v3x_vs128_ldsink1` 提供给 A/B + `port_gate`，**尚未设为默认**。
+## 预设必须叠加而不是替换
 
-## preset 丢失，以及成对 / slotfill 的干净重测（2026-11-06）
+`scheduler_options`（`crates/amdgpu-compiler/src/lib.rs`）先取 compile profile 的预设（GEMM profile：记分板等待 + `ldshoist`；`T128` profile：ALU 跨栅栏 + 压力上限 248），**再**把 `Function::sched_opts` 的 token 叠在其上。曾经 `_t128` 带 `sched_opts = "ldsink=1"` 后绕过了预设，丢了 +2.2…+2.9 %（layout 中位数）；回归测试 `crates/amdgpu-kernels/tests/sched_preset.rs`。
 
-**`_t128` 丢了调度预设（已修）。** 出厂 `_t128` 带 `sched_opts = "ldsink=1"` 之后，编译路径里"显式 `Function::sched_opts`"这一支从**默认选项**起步，绕过了 FMHA 预设：`_t128` 的 ALU 跨栅栏（`alu_across_barrier`）与压力上限 248
-被悄悄丢掉。修法：`scheduler_options`（`crates/amdgpu-compiler/src/lib.rs`）先取 profile 预设（GEMM profile / FMHA 各家族），**再**把内核自己的 token 叠在预设上；回归测试 `crates/amdgpu-kernels/tests/sched_preset.rs`。
-`_vs128` / `_kvsplit` / GEMM 的预设就是默认选项（+ 各自的 token），汇编逐字节不变；只有 `_t128` 变（md5 `df6c6ef2f5d9` → `e057befe3452`，证书 4 / 29 / 0 不变）。
+## 实验过但已淘汰（代码已删除；实验分支已归档为 `archive/*` tag）
 
-layout 中位数（leading `s_nop` 位移 0..7 × 3 轮，`REF_DATA=normal`，同一轮交替，TF/s）：
+| 策略 | 结果（同一轮交替；`_vs128` 除非注明） | 为什么没用 |
+|---|---|---|
+| `ldahead=D`（所有 `ds_read` 上移 D 条 MFMA，`ldslack` 放宽寄存器） | D=1/2 持平（−0.2…−0.4 %），D=4 −1.7 %，D=8 −5.1 %（`lgkmcnt(0)` 49 → 202） | 寄存器已在 256，且 lgkmcnt 4 位上限；只对 b32 有用，保留为 `ldahead32` |
+| `ldshoist` / `hoist=128` 用在 `_vs128` | −1.3…−1.7 %（VGPR 244） | 完整 list scheduler 之前的上提不如它自己的顺序 |
+| `limit=248` 用在 `_vs128` | −0.8…−1.3 % | 同上（`_t128` 例外，见预设） |
+| `hoistchain`（上提时带上地址的 ALU 生产者） | 4-wave 原型上与 `hoist=24` 持平（405.2 vs 404.7 TF/s） | 无收益 |
+| `mfmapair`（成对发射 MFMA，含对内间隙） | 预算 0.25…∞ 全部 ≤ 基线（−0.3…−1.9 %），带间隙 −0.4…−2.9 % | 无收益 |
+| `slotfill` 用在 `_vs128` | −1.5…−3.9 % | 只在 GEMM v4 出厂（见 [`slotfill.md`](slotfill.md)） |
+| `ovl`（无 barrier 区段里把与 MFMA 无依赖的 VALU/SALU 均匀摊到各 MFMA 之后）+ `ovlsink` | 4-wave 单 wave 原型：`rewait,hoist=24,ovl` 404.7 / 1321.1 / 1926.7（vs `rewait` 376.8 / 1268.1 / 1822.0）；`ovlsink` 持平 | 只在 1-wave 原型有效；该原型的瓶颈是 LDS 读带宽与指令发射，不是调度（见下） |
+| `pexact`（压力模型 = 分配器真实峰值）、`search`（模拟器引导的局部搜索）、`hjoin`（跨稀有分支提 MFMA 前缀） | `pexact` list 方案 381.9 / 1278.5 / 1848.8（低于 `ovl`）；`hjoin=8…200` +0.2 → −9.5 %；`search` 模拟周期 −20 % 而硬件 ≤ +1…+3 % | 模拟器在 ≲3800 周期后不再预测硬件：单 wave 循环受发射数与共享 LDS 读带宽约束（约 4200 周期/tile 的常数项，硬件 ≈ 4200 + 0.2 × 模拟） |
 
-| 形状 | 出厂（丢了预设） | 预设恢复 | 变化 |
-|---|--:|--:|--:|
-| B1H8S2048（per-CU） | 640.95 | 659.64 | +2.9 % |
-| B2H8S2048 | 1104.80 | 1129.42 | +2.2 % |
-| B1H8S4096 | 1336.03 | 1370.81 | +2.6 % |
-| B2H8S1024 | 496.33 | 509.00 | +2.6 % |
+4-wave 原型（`fmha_fwd_hd128_mxfp8_v4w_proto`）的结论：循环的下限由发射数（每 tile 约 425 VALU + 106 `ds_read` + 68 `v_accvgpr_*` + 49 `s_nop`）和 LDS 读带宽决定，重排只能带来 +1…+3 %；要追平厂商需要减少指令数 / LDS 字节，而不是更好的调度。
 
-这也说明此前报告的"`_t128` ship `ldsink=1` +0.4…+0.8 %"里藏着约 −2.4 % 的预设损失（`ldsink=1` 叠在预设上约 +3 %）。
+## 其它
 
-**成对（`mfmapair`）与 slotfill 的干净重测。** 此前的实验开关在内核预设之前构造新选项，变体与基线调度底座不同，结果被混淆（见 `docs/archive/mfmapair.md` 开头的更正）。改成"token 叠在预设上"之后（`_vs128` 强制，
-`REF_DATA=normal`，同一轮交替 7 轮；基线 626.4 / 1696.8 / 2374.7 TF/s = per-CU B1S2048 / B4S2048 / B1S8192）：`mfmapair` 预算 0.25 / 0.5 / 1 / 2 / 无限 全部 ≤ 基线（−0.3…−1.9 %），带对内间隙（`mpgap` 2 / 5 / 10）−0.4…−2.9 %，`slotfill` −1.5…−3.9 %。
-`_t128` 在预设恢复后成对无额外收益（+0.1 / −0.3 / +0.2 / −0.3 %）；它在旧底座上的 +3…+4.5 % 与恢复预设 / `ldsink` 是同一个效应。结论：**都不采用**。
-
-## `wsink` + `ldahead32=1`：`_vs128` M 相位的两处 `lgkmcnt(0)`（2026-11-06）
-
-两处 `lgkmcnt(0)` 的来源：(a) 循环末尾 QK 的最后 4 条 MFMA 之前 —— 它**不是**记分板算出来的，而是内核（tile pipeline）显式的收尾 `wait_lds(0)`：它是 depgraph 的栅栏，K 的 `ds_read_b128` 不能越过它，
-所以 6 条读全堆在它前面，MFMA 被排到它后面；(b) 取 K-scale 字的 `ds_read_b32` 刚发出就被 `v_lshrrev` 消费，只能 `lgkmcnt(0)`。
-对策（调度后处理，`sched/ldahead.rs`）：`wsink` = 把显式 `s_waitcnt lgkmcnt` 下沉到不碰内存 / 栅栏的计算之后（收尾 `wait_lds(0)` 落到最后一条 MFMA 之后、barrier 之前；读于是被 `ldsink=1` 摊到各 MFMA 之间，
-记分板给出 `lgkmcnt(2)` 的计数等待，和厂商一样两条读一组）；`ldahead32=1` = 只把 `ds_read_b32`（scale 字）提前 1 条 MFMA（`ldahead` 对所有读都试过是中性 / 负的，只对 b32 才有用）。
-稳态循环的 lgkm 等待：`(0) (5) (4) (5) (4) (2)(2)(2)(4)(2) (0) (4)(2) (0)` → `(0) (5)(4)(5)(5) (2)(2)(2) (4)(3)(4)(4)(4) (2)(2)(2)(2) (0)(0)`：M 相位中段的两处 `(0)` 变成计数等待，只剩最后一条 MFMA 前的 scale 读和 barrier 前的收尾 `(0)`（后者是语义需要）。VGPR 248 → 240，证书 6 / 29 / 0，精度 `bad=0`。
-
-同一轮交替（`REF_DATA=normal`，9 轮；基线 `_vs128` 643.5 / 1737.9 / 2460.0 TF/s = per-CU B1S2048 / B4S2048 / B1S8192）：`wsink` +0.6 / +0.2 / +0.3 %；
-**`wsink,ldahead32=1` +1.0 / +1.8 / +1.1 %**（649.7 / 1768.6 / 2486.4）；`ldahead32=1` 单用 +0.2 / +1.0 / +0.4 %；`wsink,ldahead32=2` −1.4 / +0.1 / −0.6 %。layout 中位数（位移 0..7 × 3 轮）：+0.6 / +0.3 / +0.5 %（648.3 vs 644.4，1741.7 vs 1736.2，2478.1 vs 2465.5）。
-`_t128`（预设用 `xbar,limit=248` 补回）：`wsink,ldahead32=1` +0.7 / +0.5 / +0.4 %（B1S2048 / B2S2048 / B1S4096）。
-**已设为出厂**（kernel-opt 同一轮 7 次，`REF_DATA=normal`，对比 `ldsink=1`）：`_vs128` −0.1 / +1.2 / +1.3 %（B4H8S2048 / B1H8S8192 / per-CU），`_kvsplit` +1.8 / +1.1 / +1.2 %（B1H8S2048 s4 / B1H4S4096 s4 / B1H4S8192 s2），`_t128` +0.8 / −0.2 / +1.5 %（B2H8S2048 / B1H8S4096 / B4H8S512）；三个 builder 的 `sched_opts = "ldsink=1,wsink,ldahead32=1"`，A/B 别名已删除。
-
-## `ovl`：单 wave 的 MFMA 与 VALU 重叠（4-wave 原型，2026-11-06）
-
-`fmha_fwd_hd128_mxfp8_v4w_proto`（fmha/w4.rs）：完整 list scheduler 一直分配失败并回退到未调度代码（`sched: falling back ... out of VGPRs allocating r927 (V16)`；两阶段 packing 也失败，
-实际峰值 244 对模型峰值 218：压力模型低估约 26 dword，且 `limit` 的下限就是原顺序的峰值，所以再收紧 `limit` 无效；`slotfill` 同样回退）。能分配成功的只有"保持作者顺序"的方案：
-`rewait`（记分板重算计数等待）、`hoist=N`（ds_read 上提，受寄存器预算约束）、`ovl`（新：在每个无 barrier 的区段里，把与 MFMA 无依赖的 VALU / SALU 均匀地提到各 MFMA 之后，`sched/ldahead.rs` `spread_valu`）。
-
-REF_DATA=normal，GPU 4，同一轮交替 7 轮；TF/s（per-CU B1H8S2048 / B4H8S2048 / B1H8S8192）；厂商 712 / 1894 / 2405：
-
-| 变体 | per-CU | B4 | S8192 |
-|---|--:|--:|--:|
-| 回退（未调度） | 368.0 | 1250.9 | 1770.9 |
-| `rewait` | 370.8 | 1249.9 | 1788.6 |
-| `rewait,ovl` | 376.8 | 1268.1 | 1822.0 |
-| `rewait,hoist=24` | 371.5 | 1262.4 | 1794.9 |
-| **`rewait,hoist=24,ovl`** | **404.7** | **1321.1** | **1926.7** |
-| `rewait,hoist=64,ovl` | 405.0 | 1330.1 | 1926.8 |
-| `rewait,hoistchain,ovl` | 405.2 | 1327.6 | 1922.9 |
-
-稳态循环里两个 MFMA 之间的 VALU 条数直方图（桶宽 4）：`rewait` `{0: 34, 40+: 3}`（MFMA 成组，VALU 成团） → `rewait,ovl` `{0: 14, 4: 10, 8: 8, 12: 2, 24: 1, 40+: 2}`（已摊开）。
-单靠调度只能到厂商的 0.57× / 0.70× / 0.80×；每个稳态 tile 的指令数（`rewait`）：38 MFMA、498 VALU + 288 `v_accvgpr_*`（AGPR 往返）、64 `ds_read_b64_tr_b8`、40 `ds_read_b128`，VALU / MFMA = 20.7，远高于厂商，
-AGPR 往返是最大的可削项。无环境变量的变体：`fmha_fwd_hd128_mxfp8_v4w_proto_rw` / `fmha_fwd_hd128_mxfp8_v4w_proto_sched`（= `rewait,hoist=24,ovl`）。
-
-## `pexact`、`hjoin`、`ovlsink`（4-wave 原型，2026-11-06）
-
-**压力模型 = 分配器的真实峰值（`pexact`，opt-in）。** 调度器的 per-block 压力模型比分配器低估约 20–50 dword（例：`v4w_proto` block 2 模型 214 / 分配器 247，block 4 240 / 266；分配器把循环携带值按整段循环范围算活跃，
-`limit` 的下限又是原顺序的模型峰值，所以收紧 `limit` 无效），完整 list scheduler 因此总是回退。`regalloc::pressure_by_block` 给出分配器口径的每块峰值；`pexact` 对每个块收紧模型 `limit`，直到该块的分配器口径峰值
-不超过作者顺序的（+ `pslack`），否则保留作者顺序。效果：list scheduler 能分配（VGPR 242 / 245，不再回退），但吞吐低于 `rewait,hoist=24,ovl`：381.9 / 1278.5 / 1848.8 vs 404.7 / 1332.4 / 1927.3 TF/s
-（per-CU / B4 / S8192）；`pexact,ovl` / `pexact,hoist=24` 同量级 —— 对这个内核 list 的代价模型给出的顺序更差。
-
-**跨稀有分支（`hjoin=K`，opt-in）。** 稀有的 rollback `if` 把热路径切成 A →（空块 | 稀有体）→ J，J 的头几条 MFMA 无法和 A 里的 decide VALU 重叠。`hjoin` 把 J 里与稀有体无依赖的、依赖闭合的前缀（≤ K 条）提到 A 的末尾
-（不碰 vcc / scc，分配器压力不超过 A 与 J 的作者最大值）。64 条被提过三处分支，分配成功，但硬件更慢：同一轮交替 7 轮（`rewait,hoist=24,ovl` = 404.7 / 1333.8 / 1921.3）：`hjoin=8` +0.2 / — / +0.2 %，`hjoin=16` −3.5 / — / −2.4 %，
-`hjoin=32` −7.1 / — / −5.2 %，`hjoin=64` −8.7 / −5.5 / −6.8 %，`hjoin=200` −9.5 / −6.0 / −7.4 %；加 `ovlsink`（`ovl` 也允许把 VALU 下沉到目标 MFMA 之后）仍是 −8 / −5.5 / −6.5 %（`hjoin=64`）。
-无 hjoin 时 `ovlsink` 与 `ovl` 持平（+0.4 / −0.3 / +0.4 %）。间隙直方图（两 MFMA 之间的 VALU 数，桶宽 4）：`rewait,hoist=24,ovl` `{0:13, 4:11, 8:8, 12:2, 24:1, 40+:2}` → `+hjoin=64` `{0:27, 4:6, 40+:4}`（更差）。
-结论：没有余量（> +5 % 的门槛未达到），跨迭代 modulo pass 不做；剩余差距来自 VALU 体量（每 tile 498 VALU + 288 `v_accvgpr_*` / 38 MFMA），不是 MFMA 间隙。
+- `hzfill`（post-RA 的 `s_nop` 窗口填充）保留为 weave 区域选项，见 [`weaver-sched.md`](weaver-sched.md)。
+- 模拟器 `amdc simmodel` 与它的校准（`sched/sim.rs`）见 [`scheduling.md`](scheduling.md)。

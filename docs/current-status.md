@@ -50,7 +50,7 @@ DSL(Rust) ──► typed IR（区域树：Loop / If / Region；Op 89 种 / Stmt
 | DSL / IR / 验证 | 自研 | 类型化、无 unsafe、区域树（[`region-ir.md`](region-ir.md)）、循环变量顺序语义（[`region-ir.md`](region-ir.md)）；布局层在构建期证明覆盖/连续/操作数匹配 |
 | Lowering / MIR | 自研 | 每个 MOp 的属性在一处（[`op-attributes.md`](op-attributes.md)）；一致值进 SGPR；死值消除含 SALU / `readfirstlane`（SCC 活性） |
 | **寄存器分配** | **自研** | 线性扫描、两阶段（path-aware reaching-writer 检查）、LDS spill、S4 描述符类、AGPR 类与统一 512 预算 |
-| **指令调度** | **自研** | 块内 list scheduler、LDS 读提升（`hoistchain`）、`slotfill`（GEMM v4）、依赖图 / 效果模型 / 等待模型（[`scheduling.md`](scheduling.md)） |
+| **指令调度** | **自研** | 块内 list scheduler、LDS 读提升（`ldshoist`）、`slotfill`（GEMM v4）、依赖图 / 效果模型 / 等待模型（[`scheduling.md`](scheduling.md)） |
 | hazard / wait / descriptor | llvm-tail 或 own | 两个后端指令流逐条一致（`tail_invariance` 守护） |
 
 编译策略按 kernel profile 固定（`crates/amdgpu-compiler/src/lib.rs`）：FMHA `_vs128`/`_kvsplit` = `dce,cmpfold,scalarize,retarget2,imm,sgpr,zeroinit`，

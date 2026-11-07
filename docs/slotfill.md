@@ -21,7 +21,7 @@ LEGALITY CONTRACT (opt-in): inside one barrier interval an LDS-DMA never writes 
 |---|---|---|
 | v4 (hand-tuned default) | 3001 | 2996 |
 | v4_plain (no knobs) | 2604 | 2579 |
-| v4_plain_hc (no knobs + hoistchain) | 2601 | - |
+| v4_plain_hc (no knobs + hoistchain, token removed) | 2601 | - |
 | **v4_plain_sf (no knobs + slotfill)** | **3018** | **3007** |
 | v4_sf (hand knobs + slotfill) | 3017 | 3008 |
 
