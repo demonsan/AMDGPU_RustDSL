@@ -114,6 +114,7 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 | [`docs/mfma-ceiling.md`](docs/mfma-ceiling.md) | **MFMA 发射上限微基准**：各操作数形式 32.25 周期/条，真实数据下的时钟与功耗墙 |
 | [`docs/fusion-stage-library-design.md`](docs/fusion-stage-library-design.md) | **融合 stage 组件库设计**：按 aiter 算子分类分解为 9 个基础 stage 原语 + 组合规则、StageContract、边界代价分级、轻量算子图、示例与分期计划（设计稿） |
 | [`docs/weaver-regs.md`](docs/weaver-regs.md) / [`docs/weaver-sched.md`](docs/weaver-sched.md) | **Weaver 后端层**：weave 区域的寄存器规划（pin/share/separate/cap/ring、region_report）与按区域的调度策略（authored/free） |
+| [`docs/opgraph.md`](docs/opgraph.md) | **算子图与骨架生成器（P3）**：图 / 边界类 / 切分的数据模型与 JSON、`amdc opgraph` / `amdc skeleton`、三种骨架形式（顺序 / 流水线 / 分派）、出货 kernel 经由生成骨架构建（md5 不变） |
 | [`docs/fmha-weaver-parity.md`](docs/fmha-weaver-parity.md) | 用 weaver 冲铺满场景的全部实验与结论（均未超过出货编排） |
 | [`docs/ir-text-roundtrip-design.md`](docs/ir-text-roundtrip-design.md) | **DSL IR 文本往返（解析器）设计**：irv1 语法、打印器补全、往返保证与 md5 验收、`--from-ir` 工作流（设计稿） |
 | [`docs/tirx-comparison.md`](docs/tirx-comparison.md) | **与 Apache TVM TIRx 的异同对照**：定位、IR、扩展机制、布局、符号分析、代码生成、同步与验证、剖析、可借鉴项 |
