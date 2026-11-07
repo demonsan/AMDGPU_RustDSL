@@ -24,7 +24,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 | 确定性 | 5/5 × N；uneven-tile split 形状重复启动单一 md5 |
 | **组件化与编织** | 出厂 kernel 由"算子图 → 生成的骨架 → slot 实现 + stage 实例"构建（[`docs/opgraph.md`](docs/opgraph.md)、[`docs/fusion-stage-library-design.md`](docs/fusion-stage-library-design.md)）；编织区域可声明寄存器规划（pin / separate / share / ring / 区域上限，[`docs/weaver-regs.md`](docs/weaver-regs.md)）与按区域调度策略（[`docs/weaver-sched.md`](docs/weaver-sched.md)）；出厂 asm 不变 |
 | **DSL IR 文本** | `amdc print-ir --stage dsl` 输出完整可解析的 `irv1`；手改后 `amdc ir-check` / `emit --from-ir` / `gpu-verify --from-ir`（默认严格验证），A/B 脚本与 Python JIT 接受 `.ir`；全部 kernel 往返后双后端 asm 与证书逐字节相同（[`docs/ir-text.md`](docs/ir-text.md)） |
-| 测试 | `cargo test` **103 个目标 / 432 项全绿**；safe-asm 另有 ui 用例（编译失败对照） |
+| 测试 | `cargo test` **104 个目标 / 431 项全绿**；safe-asm 另有 ui 用例（编译失败对照） |
 | GPU 语义验证 | 编译器感知指令语义：LDS/global/buffer 越界、VGPR/SGPR/AGPR 类别与对齐、路径敏感等待、LDS tile 生命周期与同步协议、融合 stage 边界契约均被证明。严格证书：出厂 4 kernel `--shipped` **24 trusted assumes / 100 host contracts / 0 unproven**；GEMM v4 **3 / 19 / 0**；融合 MLP **0 / 9 / 0**；见 [`docs/gpu-semantics-verifier.md`](docs/gpu-semantics-verifier.md) |
 | Rust 安全 | **九个 crate 全部 `#![forbid(unsafe_code)]`、零第三方依赖、无 FFI/裸指针**；ISA 规则编码进类型系统；见 [`docs/rust-safety.md`](docs/rust-safety.md) |
 
@@ -38,7 +38,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 ```bash
 # 构建与测试（容器脚本会挂载 ROCm 与 pinned LLVM 工具）
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                    # 期望 103 targets / 432 tests 全绿
+bash tools/container/cargo.sh test                    # 期望 104 targets / 431 tests 全绿
 
 # 发射一个 kernel 的汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --out vs128.s

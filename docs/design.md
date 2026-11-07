@@ -175,7 +175,7 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
 
 | 守卫 | 保证 |
 |---|---|
-| `cargo test`（103 个目标 / 432 项） | 全部单元/集成/硬件无关测试（`tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`llvm_tail`、hazard 系列、`ra_reaching`、`pin*`、safe-asm ui compile-fail …） |
+| `cargo test`（104 个目标 / 431 项） | 全部单元/集成/硬件无关测试（`tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`llvm_tail`、hazard 系列、`ra_reaching`、`pin*`、safe-asm ui compile-fail …） |
 | `register_accounting` / `mir_invariants` | 描述符声明了每个用到的寄存器；RA 从不 clobber 活值；已知错误类能被检出 |
 | `ir_text` / `tools/ir_roundtrip_check.sh` | 每个 kernel 经 irv1 文本往返后 `Function` 逐字段相等、双后端 asm 与严格证书逐字节相同 |
 | 硬件探针（`tools/*_probe.sh`） | 新原语的硬件语义（越界、半写、等待态、last-arriver、MUBUF、unscaled MFMA …） |

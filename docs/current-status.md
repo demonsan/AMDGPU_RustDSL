@@ -31,7 +31,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
   [`fusion-stage-library-design.md`](fusion-stage-library-design.md)）；编织区域带寄存器规划（[`weaver-regs.md`](weaver-regs.md)）与按区域调度策略
   （[`weaver-sched.md`](weaver-sched.md)），出厂 asm 不变。
 - **DSL IR 文本**：`amdc print-ir --stage dsl` 输出完整可解析的 `irv1`，`--from-ir` 编译手改文本；全部 kernel 往返后双后端 asm 与证书逐字节相同（[`ir-text.md`](ir-text.md)）。
-- `cargo test` **103 个测试目标 / 432 项全绿**。
+- `cargo test` **104 个测试目标 / 431 项全绿**。
 - 严格 GPU 语义证书：`--shipped` **24 trusted assumes / 100 trusted contracts / 0 unproven**；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**。
 
 ---
@@ -245,7 +245,7 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 
 ## 7. 验证与工具
 
-- **测试**：`cargo test` **103 个测试目标 / 432 项全绿**。编译器：`hazard_*`、`phys_waw`、`ra_reaching`、`pin*`、`gv_bits`、`sym_branch`、`mfma16x16x128`、
+- **测试**：`cargo test` **104 个测试目标 / 431 项全绿**。编译器：`hazard_*`、`phys_waw`、`ra_reaching`、`pin*`、`gv_bits`、`sym_branch`、`mfma16x16x128`、
   `lds_b64`、`scalarize2`、`dpp`、`var_slice`、`var_semantics`、`regplan`、`sched_regions*`、`rust_safety` 等；kernel 相关（`crates/amdgpu-kernels/tests/`）：
   `tail_invariance`、`mir_invariants`、`register_accounting`、`asm_assembles`、`agpr`、`gpu_*`（语义/协议/攻击）、`gemm_mxfp8`、`tile_l*`、`region_ir`、
   `ir_text`（全部 kernel 的 irv1 往返）、`ir_print`、`hzfill`、`sched_kernels`；`amdc` 的 `jit`、`contract_host_truth`；布局层 `crates/amdgpu-layout/tests/`、
@@ -264,7 +264,7 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 ```bash
 # 构建与测试
 bash tools/container/cargo.sh build
-bash tools/container/cargo.sh test                 # 期望 103 个测试目标 / 432 项全绿
+bash tools/container/cargo.sh test                 # 期望 104 个测试目标 / 431 项全绿
 
 # 发射 kernel 并汇编
 bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --backend=own --out vs128.s   # md5 8938adfa…
