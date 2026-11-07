@@ -49,11 +49,14 @@ pub struct StageInst<'a> {
     pub handover: Option<Handover<'a>>,
     /// open a `Node::Stage` region (false: units only, e.g. the unfused forms of a kernel keep their plain program)
     pub region: bool,
+    /// emitted BEFORE the region opens, at the caller's scope: bindings shared with other instances (e.g. the per-slot LDS offsets that
+    /// `SlotIdx` caches for every consumer of a slot) so they are not hand-overs between stages
+    pub prebind: Option<Box<dyn FnOnce(&mut FnBuilder) + 'a>>,
 }
 
 impl<'a> StageInst<'a> {
     pub fn new(key: &'static str, prim: Prim, name: impl Into<String>, contract: StageContract, units: Units<'a>) -> StageInst<'a> {
-        StageInst { key, prim, name: name.into(), params: Vec::new(), contract, units, handover: None, region: true }
+        StageInst { key, prim, name: name.into(), params: Vec::new(), contract, units, handover: None, region: true, prebind: None }
     }
     pub fn param(mut self, k: &str, v: impl ToString) -> StageInst<'a> {
         self.params.push((k.to_string(), v.to_string()));
@@ -61,6 +64,10 @@ impl<'a> StageInst<'a> {
     }
     pub fn handover(mut self, f: impl FnOnce(&mut FnBuilder) -> (Vec<StageVal>, Vec<StageScalar>) + 'a) -> StageInst<'a> {
         self.handover = Some(Box::new(f));
+        self
+    }
+    pub fn prebind(mut self, f: impl FnOnce(&mut FnBuilder) + 'a) -> StageInst<'a> {
+        self.prebind = Some(Box::new(f));
         self
     }
     pub fn plain(mut self, plain: bool) -> StageInst<'a> {
@@ -74,7 +81,10 @@ impl<'a> StageInst<'a> {
     /// Emits the stage with the kernel's orchestration: `weave` receives the stage's weaver (labelled with the stage name) and returns it with an
     /// order / strategy.
     pub fn emit_with(self, b: &mut FnBuilder, weave: impl FnOnce(Weaver<'a>) -> Weaver<'a>) {
-        let StageInst { name, contract, units, handover, region, .. } = self;
+        let StageInst { name, contract, units, handover, region, prebind, .. } = self;
+        if let Some(p) = prebind {
+            p(b);
+        }
         if region {
             b.stage_begin(&name, contract);
         }
@@ -110,6 +120,22 @@ pub fn compose<'a>(phase: &str, insts: Vec<StageInst<'a>>) -> (Weaver<'a>, Vec<(
     (Weaver::new(u).phase(phase.to_string()), info)
 }
 
+/// Several stage instances merged into ONE stage instance (one `Node::Stage` region named `name` with `contract`): their units interleave under
+/// the kernel's weave order. The members' keys and parameters are recorded as parameters of the merged instance.
+pub fn merge<'a>(name: &str, contract: StageContract, insts: Vec<StageInst<'a>>) -> StageInst<'a> {
+    let mut u = Units::new();
+    let mut params = Vec::new();
+    for inst in insts {
+        assert!(inst.handover.is_none() && inst.prebind.is_none(), "merge: stage {} has a hand-over / prebind (attach them to the merged instance)", inst.name);
+        params.push((inst.name.clone(), inst.key.to_string()));
+        params.extend(inst.params.into_iter().map(|(k, v)| (format!("{}.{k}", inst.name), v)));
+        u.append(inst.units, &[]);
+    }
+    let mut m = StageInst::new("merged", Prim::A, name, contract, u);
+    m.params = params;
+    m
+}
+
 /// One stage kind of the registry.
 #[derive(Clone, Copy, Debug)]
 pub struct StageDesc {
@@ -125,7 +151,12 @@ pub fn registry() -> &'static [StageDesc] {
     &REGISTRY
 }
 
-static REGISTRY: [StageDesc; 12] = [
+static REGISTRY: [StageDesc; 17] = [
+    StageDesc { key: "move.row_load", prim: Prim::M, params: &[("n", "row length"), ("dtype", "element type")], doc: "one row per wave into registers (16-byte buffer loads, kept packed)" },
+    StageDesc { key: "reduce.row_sumsq", prim: Prim::R, params: &[("op", "reduction")], doc: "sum of squares over a wave-held row -> rsqrt scalar (RMSNorm)" },
+    StageDesc { key: "quant.fp8_row", prim: Prim::Q, params: &[("format", "fp8 format"), ("granularity", "scale granularity"), ("scale", "scale type"), ("map", "elementwise map before quantization")], doc: "row amax -> scale -> fp8 pack" },
+    StageDesc { key: "move.row_store", prim: Prim::M, params: &[("dtype", "stored types")], doc: "packed row + its scale to global memory" },
+    StageDesc { key: "merged", prim: Prim::A, params: &[], doc: "several instances in one region (stage::merge); members recorded as parameters" },
     StageDesc { key: "move.ab_stage", prim: Prim::M, params: &[("slots", "ring slots")], doc: "GEMM A / B tile copies into an LDS ring slot (one unit per DMA)" },
     StageDesc { key: "mma.blockscale_tile", prim: Prim::A, params: &[("atom", "MMA atom"), ("wave_tile", "rows x cols per wave"), ("staged", "reload the next tile")], doc: "the register tile of a blockscale GEMM with in-place fragment reloads" },
     StageDesc { key: "move.lds_image", prim: Prim::M, params: &[("bytes", "image size"), ("pitch", "row pitch")], doc: "a whole global image into an LDS tile by LDS-direct DMA (weight-stationary prologue)" },

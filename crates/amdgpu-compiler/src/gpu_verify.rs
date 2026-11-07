@@ -1781,7 +1781,7 @@ pub fn verify_stages(f: &Function, rep: &mut Report) {
                         }
                     }
                 }
-                if contract.barrier_phase != barriers {
+                if contract.barrier_phase != StageContract::ANY_PHASE && contract.barrier_phase != barriers {
                     rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: barrier phase {} declared, {barriers} barriers precede it", contract.barrier_phase));
                 }
                 for want in &contract.live_in {

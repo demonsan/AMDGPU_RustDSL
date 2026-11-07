@@ -18,7 +18,7 @@ use amdgpu_tile::reduce::KeyMask;
 use amdgpu_tile::softmax::{OnlineSoftmax, Recipe};
 use amdgpu_tile::*;
 use amdgpu_tile::weave::{Hint, Out, UnitClass, Units, Weaver};
-use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, ValueId, VarId, I32};
+use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, StageContract, ValueId, VarId, I32};
 use amdgpu_isa::{MmaAtom, DS_READ_B128, DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, DS_WRITE_B32, GLOBAL_LDS_X1, GLOBAL_LDS_X4, GLOBAL_LOAD_X4, GLOBAL_STORE_X2};
 use amdgpu_layout::{make_layout, tup, ComposedLayout, Ix, Layout as LLayout, Swizzle};
 
@@ -150,9 +150,23 @@ impl KvRing3 {
     /// The copies of the tile at `key0` into `slot` that `role` produces (as `KvRing::stage`).
     pub fn stage(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<ValueId> {
         if let Some(u) = self.stage_units(role, key0, slot) {
-            let inst = amdgpu_tile::stage::StageInst::new("move.kv_stage", amdgpu_tile::stage::Prim::M, "kv.stage", Default::default(), u).param("role", format!("{role:?}")).plain(true);
-            let (w, _) = amdgpu_tile::stage::compose("kv.stage", vec![inst]);
-            w.seq().emit(b);
+            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
+            let sl = slot.clone();
+            amdgpu_tile::stage::StageInst::new("move.kv_stage", amdgpu_tile::stage::Prim::M, "kv.stage", c, u)
+                .param("role", format!("{role:?}"))
+                .prebind(move |b| {
+                    // the slot offsets are shared with the readers of the slot (SlotIdx cache): bound outside the region
+                    match role {
+                        Role::A => {
+                            let _ = self.kd.at(&sl).off_v(b);
+                            let _ = self.ks.at(&sl).off_v(b);
+                        }
+                        _ => {
+                            let _ = self.vs.at(&sl).off_v(b);
+                        }
+                    }
+                })
+                .emit(b);
             return None;
         }
         match (role, &self.kdc) {
@@ -228,6 +242,22 @@ pub struct AttnBody3<'a> {
     /// one f16 bias MFMA per tile (the vendor's single helper): its result is the C input of the four S tiles' first QK MFMA (`_vs128`)
     pub biasonce: bool,
     bias_tile: std::cell::Cell<Option<Opnd>>,
+    /// the P words in `p` were handed over by a softmax STAGE (declared live-in of the matrix stage)
+    p_staged: bool,
+}
+
+/// The P hand-over of the softmax stage (16 packed fp8 words; element table: word index, the layout fingerprint of the in-place packing).
+fn p_val(words: Vec<ValueId>) -> amdgpu_dsl::StageVal {
+    let n = words.len() as i64;
+    amdgpu_dsl::StageVal { name: "P".into(), values: words, table: (0..n).collect(), elem_bits: 32, storage: "vgpr".into(), layout: String::new() }
+}
+
+/// The reference words of the lazy recipe when they are a value (a loop variable needs no hand-over).
+fn bias_scalar(o: Opnd) -> Vec<amdgpu_dsl::StageScalar> {
+    match o {
+        Opnd::Val(v) => vec![amdgpu_dsl::StageScalar { name: "ref".into(), values: vec![v], owner: "row".into() }],
+        _ => Vec::new(),
+    }
 }
 
 impl<'a> AttnBody3<'a> {
@@ -235,7 +265,7 @@ impl<'a> AttnBody3<'a> {
         let sm = OnlineSoftmax::new(b, &blk.lane, Recipe::vsx(lut));
         let zero16 = b.frag_zero(DType::Frag16);
         let (c127, c123) = (b.c_i32(127), b.c_i32(123));
-        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None) }
+        AttnBody3 { ring, blk, wid, sm, zero16, c127, c123, s_init: Vec::new(), s: None, o: None, p: Vec::new(), kd_pending: None, setprio: false, kscale_sel: false, lazy_bias: false, bias_next: None, biasonce: false, bias_tile: std::cell::Cell::new(None), p_staged: false }
     }
     /// One 32-key block of QK: the f16 bias MFMA, the two K fragments, the K-scale word and its bytes, two scaled MFMAs (the hand order).
     #[allow(clippy::too_many_arguments)]
@@ -443,17 +473,22 @@ impl PipeBody for AttnBody3<'_> {
                 let mut u = Units::new();
                 let d = u.add("softmax.decide", UnitClass::Branch, Hint::Anchor, &[], move |b| nb2.set(me.sm.decide_lazy(b, &s, &o, m1)));
                 u.add("softmax.convert", UnitClass::Valu, Hint::Filler, &[d], move |b| pw2.set(me.sm.convert(b, &s, m2, 0, 4)));
-                let inst = amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "softmax", Default::default(), u).param("recipe", "vendor-lazy").plain(true);
-                let (w, _) = amdgpu_tile::stage::compose("v_phase", vec![inst]);
-                w.seq().emit(b);
+                let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
+                let (nb3, pw3) = (nb.clone(), pw.clone());
+                amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "v_phase", c, u)
+                    .param("recipe", "vendor-lazy")
+                    .handover(move |_b| (vec![p_val(pw3.get())], bias_scalar(nb3.get())))
+                    .emit(b);
             }
             self.bias_next = Some(nb.get());
             self.p = pw.get();
+            self.p_staged = true;
             return;
         }
         let nb = self.sm.decide(b, &s, &o, mask.as_ref());
         self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
         self.p.push(nb);
+        self.p_staged = false;
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let mut w = std::mem::take(&mut self.p);
@@ -465,13 +500,28 @@ impl PipeBody for AttnBody3<'_> {
             b.set_prio(1);
         }
         let s = self.s.expect("S");
-        // the matrix phase = stage `mma.pv` (tile t) then stage `mma.qk` (tile t + 1), woven together in declaration order
-        let mut insts = vec![amdgpu_tile::stage::StageInst::new("mma.pv", amdgpu_tile::stage::Prim::A, "pv", Default::default(), self.pv_units(&t.cur, w)).plain(true)];
-        if t.staged {
-            insts.push(amdgpu_tile::stage::StageInst::new("mma.qk", amdgpu_tile::stage::Prim::A, "qk", Default::default(), self.qk_units(&t.next, s, bias)).plain(true));
+        // the matrix phase = stage `mma.pv` (tile t) then stage `mma.qk` (tile t + 1), merged into one region and woven in declaration order;
+        // it consumes the P words (and the reference words of the lazy recipe) handed over by the softmax stage
+        let mut c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
+        if self.p_staged {
+            c.live_in.push(p_val(w.clone()));
+            c.scalars_in = bias_scalar(bias);
         }
-        let (wv, _) = amdgpu_tile::stage::compose("m_phase", insts);
-        wv.seq().emit(b);
+        let mut insts = vec![amdgpu_tile::stage::StageInst::new("mma.pv", amdgpu_tile::stage::Prim::A, "pv", Default::default(), self.pv_units(&t.cur, w))];
+        if t.staged {
+            insts.push(amdgpu_tile::stage::StageInst::new("mma.qk", amdgpu_tile::stage::Prim::A, "qk", Default::default(), self.qk_units(&t.next, s, bias)));
+        }
+        let (cur, next, staged) = (t.cur.clone(), t.next.clone(), t.staged);
+        let r = self.ring;
+        amdgpu_tile::stage::merge("m_phase", c, insts)
+            .prebind(move |b| {
+                let _ = r.vs.at(&cur).off_v(b);
+                if staged {
+                    let _ = r.ks.at(&next).off_v(b);
+                    let _ = r.kd.at(&next).off_v(b);
+                }
+            })
+            .emit(b);
     }
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let r = self.ring;
@@ -505,9 +555,17 @@ impl PipeBody for AttnBody3<'_> {
                 }
             }
             // the window = stage `online.softmax` (conversion chunks of tile t) woven with stage `mma.qk` (blocks of tile t + 1), alternating
-            let inst = amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "window", Default::default(), u).param("with", "mma.qk blocks").plain(true);
-            let (wv, _) = amdgpu_tile::stage::compose("window", vec![inst]);
-            wv.seq().emit(b);
+            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
+            let (nx, staged) = (t.next.clone(), t.staged);
+            amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "window", c, u)
+                .param("with", "mma.qk blocks")
+                .prebind(move |b| {
+                    if staged {
+                        let _ = r.ks.at(&nx).off_v(b);
+                        let _ = r.kd.at(&nx).off_v(b);
+                    }
+                })
+                .emit(b);
         }
         let w: Vec<ValueId> = chunks.iter().flat_map(|c| c.get()).collect();
         if !lazy {
