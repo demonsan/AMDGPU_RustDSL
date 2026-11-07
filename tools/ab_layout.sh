@@ -5,6 +5,9 @@
 #   FMHA: HIP_VISIBLE_DEVICES=6 B=4 S=2048 RPB=256 bash tools/ab_layout.sh fmha <variant>...
 #   GEMM: HIP_VISIBLE_DEVICES=6 bash tools/ab_layout.sh gemm <variant>...        (gemm_ref_host default shape 4096x4096x8192)
 set -u
+# a kernel `x.ir` (or `x.ir@spec`) is an irv1 DSL IR file (docs/ir-text.md): emitted with `--from-ir`, its symbol is the file's `dsl "name"`
+irname() { case "$1" in *.ir) sed -n 's/^dsl "\(.*\)"$/\1/p' "$1" | head -1;; *) echo "$1";; esac; }
+irsrc() { case "$1" in *.ir) echo "--from-ir $1";; *) echo "$1";; esac; }
 cd "$(cd "$(dirname "$0")/.." && pwd)"; mkdir -p build/abl
 MODE=$1; shift
 R=/shared/apps/ubuntu/opt/rocm-7.0.2; CL=/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang
@@ -14,7 +17,7 @@ PADS=${LAYOUT_PADS-0 1 2 3 4 5 6 7}
 [ -x build/gemm_ref_host ] || g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/gemm_ref_host.cpp -o build/gemm_ref_host -I"$R/include" -Itests/gpu -I. -L"$R/lib" -lamdhip64 -Wl,-rpath,"$R/lib" || exit 1
 i=0; for v in "$@"; do
   k=${v%%@*}; sp=""; case "$v" in *@*) sp="--specialize ${v#*@}";; esac
-  $A emit "$k" --backend=own $sp --out build/abl/v$i.s 2>build/abl/v$i.log || { echo "EMIT FAIL $v"; tail -3 build/abl/v$i.log; exit 1; }
+  $A emit $(irsrc "$k") --backend=own $sp --out build/abl/v$i.s 2>build/abl/v$i.log || { echo "EMIT FAIL $v"; tail -3 build/abl/v$i.log; exit 1; }
   echo "v$i = $v  md5 $(md5sum < build/abl/v$i.s | cut -c1-12) insts $(grep -cE '^\s+(v_|s_|ds_|buffer_|global_)' build/abl/v$i.s)"; : > build/abl/v$i.t; i=$((i+1))
 done
 n=$i
@@ -24,7 +27,7 @@ for p in $PADS; do
     $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o build/abl/v$i.co build/abl/p.s || exit 1
   done
   for i in $(seq 0 $((n-1))); do
-    v=${@:$((i+1)):1}; k=${v%%@*}
+    v=${@:$((i+1)):1}; k=$(irname "${v%%@*}")
     if [ "$MODE" = fmha ]; then
       t=$(env REF_B=${B:-4} REF_H=8 REF_S=${S:-2048} REF_SK=${S:-2048} REF_HK=8 REF_CO2=build/abl/v$i.co REF_KNAME2=$k REF_ROWS_PER_BLOCK=${RPB:-256} REF_ROWS=1 REF_WARMUP=150 REF_ITERS=100 ./build/ff/ref_host $V 2>&1 | awk '/^timing ours/ {for(i=1;i<=NF;i++) if($i ~ /^TFLOP/) print $(i-1)}')
     else

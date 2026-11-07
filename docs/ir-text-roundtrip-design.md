@@ -1,6 +1,6 @@
 # DSL IR 文本往返（print → 编辑 → parse → 编译）设计
 
-> 状态：**设计稿**（未实现）。目标：让智能体（和人）不改 Rust 就能做 kernel 实验——`amdc print-ir --stage dsl` 打出文本，手改，
+> 状态：**已实现 P0–P3**（2026-11，格式参考与用法见 [`ir-text.md`](ir-text.md)；实现与本稿的差异：Op 内的值引用保持 `Val(N)` 拼写，α 规范化改为在结构上改名）。目标：让智能体（和人）不改 Rust 就能做 kernel 实验——`amdc print-ir --stage dsl` 打出文本，手改，
 > `amdc emit --from-ir` 编译；文本与 `Function` 双向无损。零第三方依赖，`#![forbid(unsafe_code)]`。MIR 文本不在本期范围（§7）。
 
 ---

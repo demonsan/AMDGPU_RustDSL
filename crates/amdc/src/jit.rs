@@ -61,6 +61,16 @@ fn syms_of(e: &Ext, out: &mut BTreeSet<String>) {
     }
 }
 
+/// FNV-1a 64 of a text, 16 hex digits.
+pub fn fnv_hex(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 /// FNV-1a 64 over the parts.
 pub fn compiler_hash(backend: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -101,6 +111,11 @@ pub fn resources(asm: &str) -> Resources {
 /// The JSON document. `f` is the (possibly specialized) kernel, `spec` the bound values by argument name.
 /// `derived`: kernargs the bindings fix through the contract's `ka_is` relations (also constants in the specialized kernel).
 pub fn info_json(f: &Function, spec: &[(String, u32, SpecValue)], derived: &[(u32, i64)], backend: &str, res: Resources) -> String {
+    info_json_src(f, spec, derived, backend, res, "registry")
+}
+
+/// As `info_json`, with the kernel's source: `registry` or `ir:<16-hex FNV-1a of the irv1 text>` (part of the JIT cache key).
+pub fn info_json_src(f: &Function, spec: &[(String, u32, SpecValue)], derived: &[(u32, i64)], backend: &str, res: Resources, source: &str) -> String {
     let mut args: Vec<&amdgpu_dsl::Arg> = f.args.iter().collect();
     args.sort_by_key(|a| a.kernarg_offset);
     let mut ja: Vec<String> = Vec::new();
@@ -160,9 +175,10 @@ pub fn info_json(f: &Function, spec: &[(String, u32, SpecValue)], derived: &[(u3
     let name_of = |o: u32| f.args.iter().find(|a| a.kernarg_offset == o).map(|a| a.name.clone()).unwrap_or_else(|| format!("ka{o}"));
     let derd: Vec<String> = derived.iter().map(|(o, v)| format!("\"{}\":{v}", esc(&name_of(*o)))).collect();
     format!(
-        "{{\"schema\":1,\"kernel\":\"{k}\",\"symbol\":\"{k}\",\"arch\":\"gfx950\",\"compiler\":{{\"version\":\"{}\",\"git\":\"{}\"}},\"compiler_hash\":\"{}\",\"backend\":\"{}\",\"specialize\":{{{}}},\"derived\":{{{}}},\
+        "{{\"schema\":1,\"source\":\"{}\",\"kernel\":\"{k}\",\"symbol\":\"{k}\",\"arch\":\"gfx950\",\"compiler\":{{\"version\":\"{}\",\"git\":\"{}\"}},\"compiler_hash\":\"{}\",\"backend\":\"{}\",\"specialize\":{{{}}},\"derived\":{{{}}},\
 \"block\":[{},1,1],\"lds_bytes\":{},\"vgpr\":{},\"agpr\":{},\"sgpr\":{},\"scratch_bytes\":{},\"kernarg_size\":{},\"kernarg_align\":8,\"args\":[{}],\
 \"contract\":{{\"grid\":[{}],\"ka_is\":[{}],\"ka_range\":[{}],\"ka_set\":[{}],\"tensors\":[{}],\"syms\":[{}]}}}}",
+        esc(source),
         esc(VERSION),
         esc(GIT),
         compiler_hash(backend),
