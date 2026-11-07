@@ -577,7 +577,12 @@ impl PipeBody for AttnBody3<'_> {
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut f = skeleton_vs128::build_vs128("fmha_fwd_hd128_mxfp8_v3_vs128", &mut Vs128Slots);
+    vs128_named("fmha_fwd_hd128_mxfp8_v3_vs128", 0)
+}
+
+/// EXPERIMENT: `_vs128` with pipeline ablations (timing bounds only)
+pub fn vs128_named(name: &str, ablate: u8) -> Function {
+    let mut f = skeleton_vs128::build_vs128(name, &mut Vs128Slots(ablate));
     // scheduler: sink every ds_read to at most one MFMA before its first use (one fragment group in flight, the vendor's lgkmcnt(4);
     // sched/ldahead.rs, docs/lgkm-lookahead.md): +0.6 % B1H8S8192, +1.3 % per-CU on realistic data, VGPR 256 -> 248
     // + wsink (explicit lgkm waits sunk past the compute) and ldahead32=1 (the K-scale ds_read_b32 one MFMA ahead): the two M-phase lgkmcnt(0)
@@ -597,7 +602,7 @@ pub(crate) struct FmhaCx {
 }
 
 /// The slots of `_vs128` (`skeleton_vs128.rs`, generated from `graph::graph_vs128()`).
-pub(crate) struct Vs128Slots;
+pub(crate) struct Vs128Slots(u8);
 
 impl skeleton_vs128::Vs128Slots for Vs128Slots {
     type Cx = FmhaCx;
@@ -612,6 +617,7 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
         let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
         // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
         pipe.key_unclamped = true;
+        pipe.ablate = self.0;
         let lut = blk.lut_copy(b);
         FmhaCx { io, blk, roles, ring, pipe: Some(pipe), lut }
     }

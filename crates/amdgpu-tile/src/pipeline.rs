@@ -115,12 +115,14 @@ pub struct Pipeline {
     /// `TwoPhaseOffset`: the next tile's key without the clamp to the last tile (inside the loop t + 1 <= nkv - 1 holds; valid only when
     /// every stage reads through a range-checked buffer descriptor, so the verifier needs no clamp for the bounds)
     pub key_unclamped: bool,
+    /// EXPERIMENT (timing upper bounds, wrong results): bit 1 no mid barrier, 2 no end barrier, 4 no mid vm wait, 8 no copies in the loop
+    pub ablate: u8,
 }
 
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false, ablate: 0 }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -313,19 +315,23 @@ impl Pipeline {
                 };
                 self.prebind(b, &t);
                 let key_n = staged.then(|| if self.key_unclamped { b.let_i32((varx(it) + 1) << self.lg()) } else { b.let_i32(nn << self.lg()) });
-                if let Some(k) = &key_n {
+                if let (Some(k), false) = (&key_n, self.ablate & 8 != 0) {
                     body.stage(b, role, k, &t.next);
                 }
                 body.v_phase(b, role, &t);
                 if staged {
-                    b.wait_vm(0);
+                    if self.ablate & 4 == 0 {
+                        b.wait_vm(0);
+                    }
                     body.stage_complete(b, role, &t.next);
                 }
                 b.wait_lds(0);
-                b.barrier();
+                if self.ablate & 1 == 0 {
+                    b.barrier();
+                }
                 body.m_phase(b, role, &t);
                 b.wait_lds(0);
-                if last_barrier {
+                if last_barrier && self.ablate & 2 == 0 {
                     b.barrier();
                 }
                 i1
