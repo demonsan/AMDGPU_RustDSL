@@ -258,7 +258,6 @@ pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
         Ok(m) => m.blocks.iter().any(|b| {
             b.insts.iter().any(|i| match op_attrs::attrs(i.op).backend {
                 op_attrs::Backend::OwnOnly => true,
-                op_attrs::Backend::OwnOnlyIfNoRows => false, // the LLVM tables carry the last-arriver atomic/fence rows
                 op_attrs::Backend::Llvm | op_attrs::Backend::NoRow => false,
             })
         }),

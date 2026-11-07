@@ -35,7 +35,7 @@
 | `agpr_dst` / `agpr_srcs` | 目的、各源能否是 AGPR | `agpr`（AGPR 修复 pass） |
 | `half` | 16 位半写的高/低半 | `pin_check` |
 | `dce` | Keep / Load（结果未用即可删）/ Pure（纯 ALU） | `lower::dce_full` |
-| `backend` | `Llvm`（两张 `.tbl` 都有行）、`OwnOnly`（使用它的 kernel 走 own 尾端）、`OwnOnlyIfNoRows`、`NoRow`（无 LLVM 行、也未强制 own：已知缺口） | `lib::uses_own_only_ops` |
+| `backend` | `Llvm`（两张 `.tbl` 都有行）、`OwnOnly`（使用它的 kernel 走 own 尾端）、`NoRow`（无 LLVM 行、也未强制 own：已知缺口） | `lib::uses_own_only_ops` |
 
 ## 3. 规则
 

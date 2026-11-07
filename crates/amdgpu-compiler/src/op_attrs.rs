@@ -98,8 +98,6 @@ pub enum Backend {
     Llvm,
     /// the LLVM tail cannot express it: a kernel using it is compiled by the own tail (`uses_own_only_ops`)
     OwnOnly,
-    /// has rows, but is own-only when the tables carry no rows for it (the tables carry them: treated as both-backends)
-    OwnOnlyIfNoRows,
     /// no LLVM rows and not (yet) routed to the own tail: only the own backend can emit it (documented gap)
     NoRow,
 }
@@ -517,10 +515,10 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         GlobalLoadF32Sc1 => a("global_load_dword", c(Vmem, 4, 900, Unknown)).mem(G, false, Src(0), 4).agpr(true, 0),
         GlobalStoreF32Sc1 => a("global_store_dword", st).mem(G, true, Src(0), 4).agpr(false, 0b10),
         // read-modify-write with a result: a global access (vmcnt queue entry whose destination is the old value)
-        GlobalAtomicAddRet => a("global_atomic_add", c(Vmem, 8, 900, Unknown)).mem(G, true, Src(0), 4).backend(Backend::OwnOnlyIfNoRows),
+        GlobalAtomicAddRet => a("global_atomic_add", c(Vmem, 8, 900, Unknown)).mem(G, true, Src(0), 4),
         // cache maintenance: ordered against every memory access, never reordered
-        BufferWbl2 => a("buffer_wbl2", c(Ctrl, 4, 4, Unknown)).fence(F::Barrier).backend(Backend::OwnOnlyIfNoRows),
-        BufferInv => a("buffer_inv", c(Ctrl, 4, 4, Unknown)).fence(F::Barrier).backend(Backend::OwnOnlyIfNoRows),
+        BufferWbl2 => a("buffer_wbl2", c(Ctrl, 4, 4, Unknown)).fence(F::Barrier),
+        BufferInv => a("buffer_inv", c(Ctrl, 4, 4, Unknown)).fence(F::Barrier),
         // ---- scalar ALU / memory
         SLoadDword => a("s_load_dword", smem).smem().dce(Load),
         SLoadDwordx2 => a("s_load_dwordx2", smem).smem().dce(Load),
@@ -571,7 +569,7 @@ mod tests {
     #[test]
     fn llvm_coverage_list_matches_the_backend_attribute() {
         // backend::ALL_MOPS (the LLVM-tail table coverage list) = the ops whose backend attribute says they have rows
-        let mut rows: Vec<String> = ALL.iter().filter(|o| matches!(attrs(**o).backend, Backend::Llvm | Backend::OwnOnlyIfNoRows)).map(|o| format!("{o:?}")).collect();
+        let mut rows: Vec<String> = ALL.iter().filter(|o| matches!(attrs(**o).backend, Backend::Llvm)).map(|o| format!("{o:?}")).collect();
         let mut tail: Vec<String> = crate::backend::ALL_MOPS.iter().map(|o| format!("{o:?}")).collect();
         tail.sort();
         rows.sort();
