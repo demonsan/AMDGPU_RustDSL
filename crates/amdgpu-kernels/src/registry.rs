@@ -38,6 +38,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("rmsnorm_quant_fp8_n") => crate::norm::by_name(n),
         // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
+        "fmha_fwd_hd128_mxfp8_v3x_t128_xcd" => Some(crate::fmha::t128_named("fmha_fwd_hd128_mxfp8_v3x_t128_xcd", true)),
+        "fmha_fwd_hd128_mxfp8_v3x_kvsplit_xcd" => Some(crate::fmha::kvsplit_named("fmha_fwd_hd128_mxfp8_v3x_kvsplit_xcd", true)),
         n if n.starts_with("fmha_fwd_hd128_mxfp8_v3x_vs128_abl") => n["fmha_fwd_hd128_mxfp8_v3x_vs128_abl".len()..].parse::<u8>().ok().map(|a| crate::fmha::vs128_named(n, a)),
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),

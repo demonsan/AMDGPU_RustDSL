@@ -650,7 +650,12 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
 /// `_kvsplit`: the `_vs128` structure over a key range per split (two-smfmac row sums, the vendor recipe with the lazy update from 4 tiles of the
 /// whole sequence), the partial-row epilogue + log-sum-exp.
 pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
-    let mut f = skeleton_kvsplit::build_kvsplit("fmha_fwd_hd128_mxfp8_v3_kvsplit", &mut KvsplitSlots);
+    kvsplit_named("fmha_fwd_hd128_mxfp8_v3_kvsplit", false)
+}
+
+/// EXPERIMENT: `_kvsplit` with the XCD-aware block order
+pub fn kvsplit_named(name: &str, xcd: bool) -> Function {
+    let mut f = skeleton_kvsplit::build_kvsplit(name, &mut KvsplitSlots(xcd));
     // scheduler: sink every ds_read to at most one MFMA before its first use (sched/ldahead.rs, docs/lgkm-lookahead.md): +5.5..+6.8 % on realistic data (B1H8S2048 / B1H4S4096 split 4, B1H4S8192 split
     // + wsink, ldahead32=1 (counted M-phase LDS waits; kvsplit +1.1..+1.8 %, t128 -0.2..+1.5 % on realistic data)
     f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
@@ -658,14 +663,14 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit() -> Function {
 }
 
 /// The slots of `_kvsplit` (`skeleton_kvsplit.rs`, generated from `graph::graph_kvsplit()`).
-pub(crate) struct KvsplitSlots;
+pub(crate) struct KvsplitSlots(bool);
 
 impl skeleton_kvsplit::KvsplitSlots for KvsplitSlots {
     type Cx = FmhaCx;
     fn prelude(&mut self, b: &mut FnBuilder) -> FmhaCx {
         b.compile_profile(CompileProfile::KvSplit);
         let io = declare_io(b, 256, true);
-        let blk = block3(&io, b, 8);
+        let blk = block3_x(&io, b, 8, self.0);
         let roles = Roles::split(b, &blk.lane, 4);
         let ring = KvRing3::new(b, &io, &blk, &roles, 2);
         let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
@@ -707,7 +712,12 @@ pub fn fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h() -> Function {
 /// `_t128`: 128-row blocks, one 4-wave group, a 3-slot ring with one window per tile (`Cadence::OneWindow`); the vendor recipe with the lazy
 /// update from 4 tiles.
 pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
-    let mut f = skeleton_t128::build_t128("fmha_fwd_hd128_mxfp8_v3_t128", &mut T128Slots);
+    t128_named("fmha_fwd_hd128_mxfp8_v3_t128", false)
+}
+
+/// EXPERIMENT: `_t128` with the XCD-aware block order
+pub fn t128_named(name: &str, xcd: bool) -> Function {
+    let mut f = skeleton_t128::build_t128(name, &mut T128Slots(xcd));
     // scheduler: sink every ds_read to at most one MFMA before its first use (sched/ldahead.rs, docs/lgkm-lookahead.md): +0.4..+0.8 % on realistic data
     // + wsink, ldahead32=1 (counted M-phase LDS waits; kvsplit +1.1..+1.8 %, t128 -0.2..+1.5 % on realistic data)
     f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
@@ -715,14 +725,14 @@ pub fn fmha_fwd_hd128_mxfp8_v3_t128() -> Function {
 }
 
 /// The slots of `_t128` (`skeleton_t128.rs`, generated from `graph::graph_t128()`).
-pub(crate) struct T128Slots;
+pub(crate) struct T128Slots(bool);
 
 impl skeleton_t128::T128Slots for T128Slots {
     type Cx = FmhaCx;
     fn prelude(&mut self, b: &mut FnBuilder) -> FmhaCx {
         b.compile_profile(CompileProfile::T128);
         let io = declare_io(b, 128, false);
-        let blk = block3(&io, b, 7);
+        let blk = block3_x(&io, b, 7, self.0);
         let roles = Roles::single(&blk.lane, 4);
         let ring = KvRing3::new(b, &io, &blk, &roles, 3);
         let mut pipe = Pipeline::new(Cadence::OneWindow, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
@@ -862,6 +872,8 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
         let hi = b.bind_i32(ev(ok).eq(1).select_i32(ev(yc), ev(y0)));
         let qt = b.read_first_lane(qt);
         let hi = b.read_first_lane(hi);
+        let qt = b.let_(amdgpu_dsl::Op::AddI32(amdgpu_dsl::Opnd::Val(qt), amdgpu_dsl::Opnd::I32(0)));
+        let hi = b.let_(amdgpu_dsl::Op::AddI32(amdgpu_dsl::Opnd::Val(hi), amdgpu_dsl::Opnd::I32(0)));
         // the logical ids are in range by construction; the clamps (SALU, once) state it for the verifier
         let qt = b.bind_i32(ev(qt).max(0).min(ev(xq) - 1));
         let hi = b.bind_i32(ev(hi).max(0).min(ev(hh) - 1));
