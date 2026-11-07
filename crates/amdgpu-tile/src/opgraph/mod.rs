@@ -7,6 +7,7 @@
 //! * a CUT partitions the nodes into kernels; an edge between two kernels is C4 (HBM); the budgets of a kernel (registers, LDS) and the scope requirements are checked per kernel.
 
 pub mod json;
+pub mod skeleton;
 
 use amdgpu_layout::{plan_convert_tables, Movement};
 use json::Json;
@@ -168,6 +169,32 @@ impl Val {
     }
 }
 
+/// Where a stage runs in the kernel's program: once before the main loop, in the loop body, or once after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Prologue,
+    Loop,
+    Epilogue,
+}
+
+impl Phase {
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Prologue => "prologue",
+            Phase::Loop => "loop",
+            Phase::Epilogue => "epilogue",
+        }
+    }
+    pub fn from_name(s: &str) -> Option<Phase> {
+        Some(match s {
+            "prologue" => Phase::Prologue,
+            "loop" => Phase::Loop,
+            "epilogue" => Phase::Epilogue,
+            _ => return None,
+        })
+    }
+}
+
 /// Upper-bound resource estimate of a stage (agent planning; the register allocator and GV remain the judges).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Resources {
@@ -189,6 +216,8 @@ pub struct Node {
     /// wave roles ("all 4 waves: same program", ...)
     pub roles: Vec<String>,
     pub barrier_phase: u32,
+    /// where in the kernel's program the stage runs (prologue / loop / epilogue)
+    pub phase: Phase,
 }
 
 /// Where the tensor lives while it crosses the edge.
@@ -251,11 +280,15 @@ pub struct Edge {
     pub class_hint: Option<Class>,
     /// kernarg ABI of an external tensor: (byte offset, bytes)
     pub abi: Option<(u32, u32)>,
+    /// loop-carried: the consumer reads the value produced in the PREVIOUS iteration (ignored for the dependence order)
+    pub carried: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Graph {
     pub name: String,
+    /// graph-wide attributes (e.g. `threads`: the workgroup size of the generated kernels)
+    pub attrs: Vec<(String, Val)>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
 }
@@ -279,6 +312,9 @@ pub fn class_of_layouts(p: &FragLayout, c: &FragLayout) -> Result<(Class, Moveme
 }
 
 impl Graph {
+    pub fn attr_int(&self, k: &str) -> Option<i64> {
+        self.attrs.iter().find(|(n, _)| n == k).and_then(|(_, v)| if let Val::Int(i) = v { Some(*i) } else { None })
+    }
     pub fn node(&self, id: &str) -> Option<&Node> {
         self.nodes.iter().find(|n| n.id == id)
     }
@@ -341,6 +377,9 @@ impl Graph {
         let mut indeg = vec![0usize; self.nodes.len()];
         let mut succ: Vec<Vec<usize>> = vec![Vec::new(); self.nodes.len()];
         for e in &self.edges {
+            if e.carried {
+                continue;
+            }
             if let Some(f) = &e.from {
                 for t in &e.to {
                     if let (Some(&a), Some(&b)) = (idx.get(f.as_str()), idx.get(t.as_str())) {
@@ -392,6 +431,7 @@ impl Graph {
                     ),
                     ("roles".into(), Json::Arr(n.roles.iter().map(|r| Json::Str(r.clone())).collect())),
                     ("barrier_phase".into(), Json::Int(n.barrier_phase as i64)),
+                    ("phase".into(), Json::Str(n.phase.name().into())),
                 ])
             })
             .collect();
@@ -422,16 +462,27 @@ impl Graph {
                     ("store".into(), Json::Str(e.store.name())),
                     ("class".into(), e.class_hint.map_or(Json::Null, |c| Json::Str(c.name().into()))),
                     ("abi".into(), e.abi.map_or(Json::Null, |(o, n)| Json::Arr(vec![Json::Int(o as i64), Json::Int(n as i64)]))),
+                    ("carried".into(), Json::Bool(e.carried)),
                 ])
             })
             .collect();
-        Json::Obj(vec![("name".into(), Json::Str(self.name.clone())), ("nodes".into(), Json::Arr(nodes)), ("edges".into(), Json::Arr(edges))])
+        Json::Obj(vec![
+            ("name".into(), Json::Str(self.name.clone())),
+            ("attrs".into(), Json::Obj(self.attrs.iter().map(|(k, v)| (k.clone(), v.to_json())).collect())),
+            ("nodes".into(), Json::Arr(nodes)),
+            ("edges".into(), Json::Arr(edges)),
+        ])
     }
 
     pub fn from_json(j: &Json) -> Result<Graph, String> {
         let s = |j: &Json, k: &str| -> Result<String, String> { j.get(k).and_then(|x| x.str()).map(|x| x.to_string()).ok_or_else(|| format!("missing string field '{k}'")) };
         let i = |j: &Json, k: &str| -> Result<i64, String> { j.get(k).and_then(|x| x.int()).ok_or_else(|| format!("missing integer field '{k}'")) };
         let mut g = Graph { name: s(j, "name")?, ..Default::default() };
+        if let Some(Json::Obj(v)) = j.get("attrs") {
+            for (k, x) in v {
+                g.attrs.push((k.clone(), Val::from_json(x)?));
+            }
+        }
         for n in j.get("nodes").and_then(|x| x.arr()).ok_or("missing 'nodes'")? {
             let params = match n.get("params") {
                 Some(Json::Obj(v)) => v.iter().map(|(k, x)| Ok((k.clone(), Val::from_json(x)?))).collect::<Result<Vec<_>, String>>()?,
@@ -446,6 +497,7 @@ impl Graph {
                 resources: Resources { vgprs: i(r, "vgprs")? as u32, agprs: i(r, "agprs")? as u32, lds_bytes: i(r, "lds_bytes")? as u32, barriers: i(r, "barriers")? as u32 },
                 roles: n.get("roles").and_then(|x| x.arr()).map(|v| v.iter().filter_map(|x| x.str().map(|s| s.to_string())).collect()).unwrap_or_default(),
                 barrier_phase: i(n, "barrier_phase")? as u32,
+                phase: Phase::from_name(&s(n, "phase")?).ok_or("unknown phase")?,
             });
         }
         let frag = |f: Option<&Json>| -> Result<Option<FragLayout>, String> {
@@ -477,6 +529,7 @@ impl Graph {
                     Some(Json::Arr(v)) if v.len() == 2 => Some((v[0].int().unwrap_or(0) as u32, v[1].int().unwrap_or(0) as u32)),
                     _ => None,
                 },
+                carried: e.get("carried").and_then(|x| x.bool()).unwrap_or(false),
             });
         }
         g.validate()?;
@@ -552,7 +605,7 @@ pub struct CutReport {
 
 impl Graph {
     /// Evaluates a cut: every node in exactly one kernel, kernels in dependence order, per-edge classes (a cut edge is C4), scope requirements (a tensor that may not stay on chip must
-    /// be cut) and the resource budget of each kernel (stage estimates add up for VGPR-resident sums only through their max plus the live on-chip edges is NOT modelled: the estimate is
+    /// be cut) and the resource budget of each kernel (stages run one after another: the register estimate of a kernel is the largest footprint of one stage, each estimate including its live-in tensors; the estimate is
     /// the sum over stages of `temps` the author declared, an upper bound).
     pub fn evaluate_cut(&self, cut: &Cut, budget: Budget) -> Result<CutReport, String> {
         self.validate()?;
@@ -581,8 +634,8 @@ impl Graph {
             let mut kr = KernelReport { name: kc.name.clone(), stages: stages.iter().map(|s| s.to_string()).collect(), internal: Vec::new(), inputs: Vec::new(), outputs: Vec::new(), resources: Resources::default() };
             for s in &stages {
                 let r = self.node(s).unwrap().resources;
-                kr.resources.vgprs += r.vgprs;
-                kr.resources.agprs += r.agprs;
+                kr.resources.vgprs = kr.resources.vgprs.max(r.vgprs);
+                kr.resources.agprs = kr.resources.agprs.max(r.agprs);
                 kr.resources.lds_bytes = kr.resources.lds_bytes.max(r.lds_bytes);
                 kr.resources.barriers += r.barriers;
             }
@@ -640,6 +693,19 @@ impl Graph {
             rep.kernels.push(kr);
         }
         Ok(rep)
+    }
+}
+
+impl Graph {
+    /// Evaluates the kernel made of `nodes` (every other node is "the rest": edges between the two are cut edges) and returns that kernel's report.
+    pub fn kernel_report(&self, nodes: &[&str]) -> Result<KernelReport, String> {
+        let rest: Vec<String> = self.nodes.iter().filter(|n| !nodes.contains(&n.id.as_str())).map(|n| n.id.clone()).collect();
+        let mut cut = Cut { kernels: vec![KernelCut { name: "kernel".into(), nodes: nodes.iter().map(|s| s.to_string()).collect() }] };
+        if !rest.is_empty() {
+            cut.kernels.push(KernelCut { name: "rest".into(), nodes: rest });
+        }
+        let mut r = self.evaluate_cut(&cut, Budget::default())?;
+        Ok(r.kernels.remove(0))
     }
 }
 

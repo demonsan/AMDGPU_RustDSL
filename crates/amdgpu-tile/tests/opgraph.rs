@@ -3,7 +3,7 @@ use amdgpu_tile::opgraph::json::Json;
 use amdgpu_tile::opgraph::*;
 
 fn node(id: &str, prim: Prim, stage: &str, vgprs: u32) -> Node {
-    Node { id: id.into(), prim, stage: stage.into(), params: vec![("k".into(), Val::Int(256)), ("act".into(), Val::Str("relu".into()))], resources: Resources { vgprs, agprs: 0, lds_bytes: 1024, barriers: 0 }, roles: vec!["all".into()], barrier_phase: 0 }
+    Node { id: id.into(), prim, stage: stage.into(), params: vec![("k".into(), Val::Int(256)), ("act".into(), Val::Str("relu".into()))], resources: Resources { vgprs, agprs: 0, lds_bytes: 1024, barriers: 0 }, roles: vec!["all".into()], barrier_phase: 0, phase: Phase::Loop }
 }
 
 fn frag(name: &str, table: Vec<i64>) -> FragLayout {
@@ -18,7 +18,7 @@ fn swapped() -> Vec<i64> {
 }
 
 fn edge(name: &str, from: Option<&str>, to: &[&str], hint: Option<Class>) -> Edge {
-    Edge { name: name.into(), from: from.map(|s| s.into()), to: to.iter().map(|s| s.to_string()).collect(), dtype: "f32".into(), shape: vec![32, 64], layout: "row-major".into(), producer: None, consumer: None, scope: Scope::Wave, store: Store::Vgpr, class_hint: hint, abi: None }
+    Edge { name: name.into(), from: from.map(|s| s.into()), to: to.iter().map(|s| s.to_string()).collect(), dtype: "f32".into(), shape: vec![32, 64], layout: "row-major".into(), producer: None, consumer: None, scope: Scope::Wave, store: Store::Vgpr, class_hint: hint, abi: None, carried: false }
 }
 
 /// x -> A -> h -> E -> g -> B -> y
@@ -31,7 +31,7 @@ fn chain() -> Graph {
     x.class_hint = Some(Class::C4);
     let mut y = edge("y", Some("B"), &[], None);
     y.abi = Some((24, 8));
-    Graph { name: "chain".into(), nodes: vec![node("A", Prim::A, "gemm", 100), node("E", Prim::E, "map", 20), node("B", Prim::A, "gemm", 100)], edges: vec![x, e1, edge("g", Some("E"), &["B"], Some(Class::C0)), y] }
+    Graph { name: "chain".into(), attrs: vec![("threads".into(), Val::Int(256))], nodes: vec![node("A", Prim::A, "gemm", 100), node("E", Prim::E, "map", 20), node("B", Prim::A, "gemm", 100)], edges: vec![x, e1, edge("g", Some("E"), &["B"], Some(Class::C0)), y] }
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn a_single_kernel_cut_keeps_every_edge_on_chip() {
     assert_eq!(r.kernels[0].internal.iter().map(|e| (e.tensor.as_str(), e.class)).collect::<Vec<_>>(), vec![("h", Class::C0), ("g", Class::C0)]);
     assert_eq!(r.kernels[0].inputs, vec!["x"]);
     assert_eq!(r.kernels[0].outputs, vec!["y"]);
-    assert_eq!(r.kernels[0].resources.vgprs, 220);
+    assert_eq!(r.kernels[0].resources.vgprs, 100, "the largest stage footprint");
     let text = r.text(&g);
     assert!(text.contains("on-chip h A -> E : C0 (wave)") && text.contains("kernel all"), "{text}");
 }
@@ -103,7 +103,7 @@ fn scope_and_budget_and_coverage_are_checked() {
     assert_eq!(r.kernels[0].internal[1].class, Class::C3);
     g.edges[2].scope = Scope::Wave;
     // budget
-    assert!(g.evaluate_cut(&one, Budget { vgprs: 200, ..Budget::default() }).unwrap_err().contains("exceeds the budget"));
+    assert!(g.evaluate_cut(&one, Budget { vgprs: 50, ..Budget::default() }).unwrap_err().contains("exceeds the budget"));
     // coverage
     let missing = Cut { kernels: vec![KernelCut { name: "k".into(), nodes: vec!["A".into(), "E".into()] }] };
     assert!(g.evaluate_cut(&missing, Budget::default()).unwrap_err().contains("in no kernel"));

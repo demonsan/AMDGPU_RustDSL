@@ -17,6 +17,9 @@ use amdgpu_tile::contract_stage::{check_boundary, LiveFrag, StageBoundary, Stora
 use amdgpu_tile::orient::{consumer_pairs, POperand};
 use amdgpu_layout::Movement;
 
+pub mod graph;
+mod skeleton_fused;
+
 pub const K1: i64 = 256;
 pub const N1: i64 = 256;
 pub const N2: i64 = 256;
@@ -78,56 +81,123 @@ fn p_stage_val(jb: i64, v: ValueId, producer: bool) -> amdgpu_dsl::StageVal {
     amdgpu_dsl::StageVal { name: lf.name.clone(), values: vec![v], table: lf.table.clone(), elem_bits: lf.elem_bits, storage: "vgpr".into(), layout: String::new() }
 }
 
-fn build_ws(name: &str, mode: Mode) -> Function {
-    if mode == Mode::Fused {
-        for jb in 0..N1 / 64 {
-            let (p, c) = p_boundary(jb);
-            let rep = check_boundary(&p, &c).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(rep.frags.iter().all(|f| f.1 <= Movement::Register && f.2 == 0), "{name}: the P hand-off is not free: {:?}", rep.frags);
+/// Values shared between the slots of the MLP kernels (what the generated skeleton's `Cx` carries).
+pub(crate) struct Cx {
+    p_in: ValueId,
+    p_w1: ValueId,
+    p_w2: ValueId,
+    m_v: ValueId,
+    g_v: ValueId,
+    lane: Lane,
+    bx: ValueId,
+    w1s: Option<amdgpu_tile::Shared>,
+    w2s: Option<amdgpu_tile::Shared>,
+    r_in: ValueId,
+    r_out: ValueId,
+    l16: ValueId,
+    // set by `x_first`
+    c127: Option<ValueId>,
+    h16: Option<ValueId>,
+    wlane: Option<ValueId>,
+    nb: Option<ValueId>,
+    x0: Vec<ValueId>,
+    // set by `loop_open`
+    vars: Vec<amdgpu_dsl::VarId>,
+    blk: Option<amdgpu_dsl::I32>,
+    xs: Vec<Opnd>,
+    next: Option<ValueId>,
+    row: Option<ValueId>,
+    roles: Vec<String>,
+    // set by the loop stages
+    p_words: Vec<Opnd>,
+    xn: Vec<ValueId>,
+}
+
+impl Cx {
+    /// W fragment of 32-row tile t, k block kb (A operand): rows 32 t + j, bytes 64 kb + 16 h and + 32
+    fn wfrag(&self, b: &mut FnBuilder, sh: &amdgpu_tile::Shared, t: i64, kb: i64) -> ValueId {
+        use amdgpu_tile::SlotIdx;
+        let wlane = self.wlane.expect("x_first");
+        let pr = sh.at(&SlotIdx::new(0, 0));
+        let base = sh.base as i32 + (t * 32 * W_PITCH + 64 * kb) as i32;
+        pr.read(b, |b| {
+            let a0 = b.bind_i32(ev(wlane) + base);
+            let a1 = b.bind_i32(ev(wlane) + base + 32);
+            b.load_lds_b128x2(a0, a1)
+        })
+    }
+    /// row operand (X or H): 4 fragments of 64 k, 16 bytes at 64 kb + 16 h and + 32 of row m
+    fn rowfrags(&self, b: &mut FnBuilder, blk: amdgpu_dsl::I32) -> Vec<ValueId> {
+        let h16 = self.h16.expect("x_first");
+        let lane = &self.lane;
+        let r_in = self.r_in;
+        let ro = b.bind_i32((((blk << 7) + (lane.wave() << 5) + lane.j()) << 8) + ev(h16));
+        (0..K1 / 64).map(|kb| b.buffer_load_b128x2(r_in, ro, 0i32, (64 * kb) as u32, (64 * kb + 32) as u32)).collect()
+    }
+}
+
+/// The slots of the MLP kernels: the orchestration the op-graph skeleton leaves to the kernel (the three modes share the pieces; `mode` selects what a slot emits).
+pub(crate) struct MlpSlots {
+    mode: Mode,
+}
+
+impl MlpSlots {
+    fn s_prelude(&mut self, name: &str, b: &mut FnBuilder) -> Cx {
+        use amdgpu_tile::{LdsPlan, Layout as TLayout};
+        let mode = self.mode;
+        if mode == Mode::Fused {
+            for jb in 0..N1 / 64 {
+                let (p, c) = p_boundary(jb);
+                let rep = check_boundary(&p, &c).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert!(rep.frags.iter().all(|f| f.1 <= Movement::Register && f.2 == 0), "{name}: the P hand-off is not free: {:?}", rep.frags);
+            }
         }
+        b.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
+        for (n, o) in [("ptr_in", 0u32), ("ptr_w1", 8), ("ptr_w2", 16), ("ptr_out", 24)] {
+            b.arg(n, DType::Ptr, o, 8);
+        }
+        b.arg("m", DType::I32, 32, 4);
+        b.arg("g", DType::I32, 36, 4);
+        let mt = Ext::sym("MT");
+        let gs = Ext::sym("G");
+        b.sym_range("MT", 1, 4096);
+        b.sym_range("G", 1, 1024);
+        let m = mt.clone() * Ext::c(128);
+        b.ka_is(32, m.clone());
+        b.ka_is(36, gs.clone());
+        b.grid_is(0, gs);
+        b.arg_tensor("ptr_in", m.clone() * Ext::c(K1));
+        b.arg_tensor("ptr_w1", Ext::c(W_IMG));
+        b.arg_tensor("ptr_w2", Ext::c(W_IMG));
+        b.arg_tensor("ptr_out", m.clone() * Ext::c(if mode == Mode::G1 { N1 } else { 2 * N2 }));
+        let p_in = b.let_(Op::KernargPtr { offset: 0 });
+        let p_w1 = b.let_(Op::KernargPtr { offset: 8 });
+        let p_w2 = b.let_(Op::KernargPtr { offset: 16 });
+        let p_out = b.let_(Op::KernargPtr { offset: 24 });
+        let m_v = b.let_(Op::KernargI32 { offset: 32 });
+        let g_v = b.let_(Op::KernargI32 { offset: 36 });
+        let tid = b.let_(Op::WorkitemId);
+        let lane = Lane::from_tid(b, tid);
+        let bx = b.let_(Op::WorkgroupIdX);
+        let mut lds = LdsPlan::new();
+        let need_w1 = mode != Mode::G2;
+        let need_w2 = mode != Mode::G1;
+        let w1s = need_w1.then(|| lds.tile("W1", W_IMG, TLayout::Linear));
+        let w2s = need_w2.then(|| lds.tile("W2", W_IMG, TLayout::Linear));
+        lds.commit(b);
+        let r_in = { let n = b.bind_i32(ev(m_v) * (K1 as i32)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_in, n) };
+        let r_out = { let n = b.bind_i32(ev(m_v) * (if mode == Mode::G1 { N1 } else { 2 * N2 }) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_out, n) };
+        // ---- prologue: the weight images into LDS (1 KB per DMA, wave w issues blocks w, w + 4, ...) ----
+        let l16 = b.bind_i32(lane.lane() << 4);
+        Cx { p_in, p_w1, p_w2, m_v, g_v, lane, bx, w1s, w2s, r_in, r_out, l16, c127: None, h16: None, wlane: None, nb: None, x0: Vec::new(), vars: Vec::new(), blk: None, xs: Vec::new(), next: None, row: None, roles: Vec::new(), p_words: Vec::new(), xn: Vec::new() }
     }
-    use amdgpu_tile::{LdsPlan, Layout as TLayout, SlotIdx};
-    let mut fb = FnBuilder::new(name, 256);
-    fb.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
-    let b = &mut fb;
-    for (n, o) in [("ptr_in", 0u32), ("ptr_w1", 8), ("ptr_w2", 16), ("ptr_out", 24)] {
-        b.arg(n, DType::Ptr, o, 8);
-    }
-    b.arg("m", DType::I32, 32, 4);
-    b.arg("g", DType::I32, 36, 4);
-    let mt = Ext::sym("MT");
-    let gs = Ext::sym("G");
-    b.sym_range("MT", 1, 4096);
-    b.sym_range("G", 1, 1024);
-    let m = mt.clone() * Ext::c(128);
-    b.ka_is(32, m.clone());
-    b.ka_is(36, gs.clone());
-    b.grid_is(0, gs);
-    b.arg_tensor("ptr_in", m.clone() * Ext::c(K1));
-    b.arg_tensor("ptr_w1", Ext::c(W_IMG));
-    b.arg_tensor("ptr_w2", Ext::c(W_IMG));
-    b.arg_tensor("ptr_out", m.clone() * Ext::c(if mode == Mode::G1 { N1 } else { 2 * N2 }));
-    let p_in = b.let_(Op::KernargPtr { offset: 0 });
-    let p_w1 = b.let_(Op::KernargPtr { offset: 8 });
-    let p_w2 = b.let_(Op::KernargPtr { offset: 16 });
-    let p_out = b.let_(Op::KernargPtr { offset: 24 });
-    let m_v = b.let_(Op::KernargI32 { offset: 32 });
-    let g_v = b.let_(Op::KernargI32 { offset: 36 });
-    let tid = b.let_(Op::WorkitemId);
-    let lane = Lane::from_tid(b, tid);
-    let bx = b.let_(Op::WorkgroupIdX);
-    let mut lds = LdsPlan::new();
-    let need_w1 = mode != Mode::G2;
-    let need_w2 = mode != Mode::G1;
-    let w1s = need_w1.then(|| lds.tile("W1", W_IMG, TLayout::Linear));
-    let w2s = need_w2.then(|| lds.tile("W2", W_IMG, TLayout::Linear));
-    lds.commit(b);
-    let r_in = { let n = b.bind_i32(ev(m_v) * (K1 as i32)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_in, n) };
-    let r_out = { let n = b.bind_i32(ev(m_v) * (if mode == Mode::G1 { N1 } else { 2 * N2 }) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_out, n) };
-    // ---- prologue: the weight images into LDS (1 KB per DMA, wave w issues blocks w, w + 4, ...) ----
-    let l16 = b.bind_i32(lane.lane() << 4);
-    for (sh, p) in [(w1s.as_ref(), p_w1), (w2s.as_ref(), p_w2)] {
-        let Some(sh) = sh else { continue };
+
+    fn image(&mut self, b: &mut FnBuilder, cx: &Cx, w: usize) {
+        use amdgpu_tile::SlotIdx;
+        let (sh, p) = if w == 1 { (cx.w1s.as_ref(), cx.p_w1) } else { (cx.w2s.as_ref(), cx.p_w2) };
+        let Some(sh) = sh else { return };
+        let lane = cx.lane;
+        let l16 = cx.l16;
         let r = b.buffer_desc(p, W_IMG as u32);
         let pr = sh.at(&SlotIdx::new(0, 0));
         let base = sh.base as i32;
@@ -140,64 +210,143 @@ fn build_ws(name: &str, mode: Mode) -> Function {
             }
         });
     }
-    b.wait_vm(0);
-    b.barrier();
-    let c127 = b.c_i32(127);
-    let h16 = b.bind_i32(lane.half() << 4);
-    // W fragment of 32-row tile t, k block kb (A operand): rows 32 t + j, bytes 64 kb + 16 h and + 32
-    let wlane = b.bind_i32(ev(lane.j) * (W_PITCH as i32) + ev(h16));
-    let wfrag = |b: &mut FnBuilder, sh: &amdgpu_tile::Shared, t: i64, kb: i64| -> ValueId {
-        let pr = sh.at(&SlotIdx::new(0, 0));
-        let base = sh.base as i32 + (t * 32 * W_PITCH + 64 * kb) as i32;
-        pr.read(b, |b| {
-            let a0 = b.bind_i32(ev(wlane) + base);
-            let a1 = b.bind_i32(ev(wlane) + base + 32);
-            b.load_lds_b128x2(a0, a1)
-        })
-    };
-    // row operand (X or H): 4 fragments of 64 k, 16 bytes at 64 kb + 16 h and + 32 of row m
-    let nb = b.bind_i32(ev(m_v).lshr(7));
-    let rowfrags = |b: &mut FnBuilder, blk: amdgpu_dsl::I32| -> Vec<ValueId> {
-        let ro = b.bind_i32((((blk << 7) + (lane.wave() << 5) + lane.j()) << 8) + ev(h16));
-        (0..K1 / 64).map(|kb| b.buffer_load_b128x2(r_in, ro, 0i32, (64 * kb) as u32, (64 * kb + 32) as u32)).collect()
-    };
-    let x0 = rowfrags(b, ev(bx));
-    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(bx))];
-    inits.extend(x0.iter().map(|x| (DType::Frag8, Opnd::Val(*x))));
-    let vars = b.begin_loop(&inits);
-    let blk = amdgpu_dsl::varx(vars[0]);
-    let xs: Vec<Opnd> = vars[1..].iter().map(|v| Opnd::Var(*v)).collect();
-    let next = b.bind_i32(blk.clone() + ev(g_v));
-    let row = b.bind_i32((blk.clone() << 7) + (lane.wave() << 5) + lane.j());
-    let roles = vec!["all 4 waves: same program".to_string()];
-    let fused = mode == Mode::Fused;
-    let p_words: Vec<Opnd> = if mode == Mode::G2 {
-        xs.clone()
-    } else {
-        let st = gemm1_act_stage(GemmCtx { wfrag: &wfrag, c127 }, w1s.as_ref().expect("W1"), &xs, mode, r_out, row, &lane, &roles);
-        let out = st.out.clone();
-        st.inst.plain(!fused).emit(b);
-        out.get()
-    };
-    let p_vals: Vec<ValueId> = p_words.iter().filter_map(|o| if let Opnd::Val(v) = o { Some(*v) } else { None }).collect();
-    // the next block's row operand (clamped: past the end it reloads this block, unused)
-    let nclamp = b.bind_i32(ev(next).lt(ev(nb)).select_i32(ev(next), blk.clone()));
-    let xn = rowfrags(b, ev(nclamp));
-    if mode != Mode::G1 {
+
+    /// after the images: wait for the DMAs, one barrier
+    fn s_images_done(&mut self, b: &mut FnBuilder) {
+        b.wait_vm(0);
+        b.barrier();
+    }
+
+    fn s_x_first(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        let c127 = b.c_i32(127);
+        let h16 = b.bind_i32(cx.lane.half() << 4);
+        let wlane = b.bind_i32(ev(cx.lane.j) * (W_PITCH as i32) + ev(h16));
+        cx.c127 = Some(c127);
+        cx.h16 = Some(h16);
+        cx.wlane = Some(wlane);
+        let nb = b.bind_i32(ev(cx.m_v).lshr(7));
+        cx.nb = Some(nb);
+        cx.x0 = cx.rowfrags(b, ev(cx.bx));
+    }
+
+    fn s_loop_open(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(cx.bx))];
+        inits.extend(cx.x0.iter().map(|x| (DType::Frag8, Opnd::Val(*x))));
+        let vars = b.begin_loop(&inits);
+        let blk = amdgpu_dsl::varx(vars[0]);
+        cx.xs = vars[1..].iter().map(|v| Opnd::Var(*v)).collect();
+        let next = b.bind_i32(blk.clone() + ev(cx.g_v));
+        let row = b.bind_i32((blk.clone() << 7) + (cx.lane.wave() << 5) + cx.lane.j());
+        cx.vars = vars;
+        cx.blk = Some(blk);
+        cx.next = Some(next);
+        cx.row = Some(row);
+        cx.roles = vec!["all 4 waves: same program".to_string()];
+    }
+
+    fn s_gemm1_act(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        let mode = self.mode;
+        let fused = mode == Mode::Fused;
+        let p_words: Vec<Opnd> = if mode == Mode::G2 {
+            cx.xs.clone()
+        } else {
+            let wf = |b: &mut FnBuilder, sh: &amdgpu_tile::Shared, t: i64, kb: i64| -> ValueId { cx.wfrag(b, sh, t, kb) };
+            let st = gemm1_act_stage(GemmCtx { wfrag: &wf, c127: cx.c127.expect("x_first") }, cx.w1s.as_ref().expect("W1"), &cx.xs, mode, cx.r_out, cx.row.expect("loop_open"), &cx.lane, &cx.roles);
+            let out = st.out.clone();
+            st.inst.plain(!fused).emit(b);
+            out.get()
+        };
+        cx.p_words = p_words;
+    }
+
+    fn s_x_next(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        // the next block's row operand (clamped: past the end it reloads this block, unused)
+        let blk = cx.blk.clone().expect("loop_open");
+        let nclamp = b.bind_i32(ev(cx.next.expect("loop_open")).lt(ev(cx.nb.expect("x_first"))).select_i32(ev(cx.next.unwrap()), blk));
+        cx.xn = cx.rowfrags(b, ev(nclamp));
+    }
+
+    fn s_gemm2(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        let fused = self.mode == Mode::Fused;
+        let p_vals: Vec<ValueId> = cx.p_words.iter().filter_map(|o| if let Opnd::Val(v) = o { Some(*v) } else { None }).collect();
         let contract = amdgpu_dsl::StageContract {
             live_in: p_vals.iter().enumerate().map(|(jb, v)| p_stage_val(jb as i64, *v, false)).collect(),
             barrier_phase: 1,
-            roles: roles.clone(),
+            roles: cx.roles.clone(),
             ..Default::default()
         };
-        gemm2_stage(GemmCtx { wfrag: &wfrag, c127 }, w2s.as_ref().expect("W2"), &p_words, r_out, row, &lane, contract).plain(!fused).emit(b);
-    }    b.set_var(vars[0], next);
-    for (v, x) in vars[1..].iter().zip(xn.iter()) {
-        b.set_var(*v, *x);
+        let wf = |b: &mut FnBuilder, sh: &amdgpu_tile::Shared, t: i64, kb: i64| -> ValueId { cx.wfrag(b, sh, t, kb) };
+        gemm2_stage(GemmCtx { wfrag: &wf, c127: cx.c127.expect("x_first") }, cx.w2s.as_ref().expect("W2"), &cx.p_words, cx.r_out, cx.row.expect("loop_open"), &cx.lane, contract).plain(!fused).emit(b);
     }
-    let done = b.bind_cond(ev(next).ge(ev(nb)));
-    b.break_if(done);
-    b.end_loop();
+
+    fn s_loop_close(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        let next = cx.next.expect("loop_open");
+        b.set_var(cx.vars[0], next);
+        for (v, x) in cx.vars[1..].iter().zip(cx.xn.iter()) {
+            b.set_var(*v, *x);
+        }
+        let done = b.bind_cond(ev(next).ge(ev(cx.nb.expect("x_first"))));
+        b.break_if(done);
+        b.end_loop();
+    }
+}
+
+/// The fused kernel through the generated skeleton (`skeleton_fused.rs`, from the op graph `graph::graph()`): the slots call the pieces above in the graph's dependence order.
+impl skeleton_fused::FusedSlots for MlpSlots {
+    type Cx = Cx;
+    fn prelude(&mut self, b: &mut FnBuilder) -> Cx {
+        self.s_prelude("mlp_fp8_ws_fused", b)
+    }
+    fn w1_image(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.image(b, cx, 1);
+    }
+    fn w2_image(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.image(b, cx, 2);
+        self.s_images_done(b);
+    }
+    fn x_first(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_x_first(b, cx);
+    }
+    fn loop_open(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_loop_open(b, cx);
+    }
+    fn gemm1_act(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_gemm1_act(b, cx);
+    }
+    fn x_next(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_x_next(b, cx);
+    }
+    fn gemm2(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_gemm2(b, cx);
+    }
+    fn loop_close(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_loop_close(b, cx);
+    }
+}
+
+fn build_ws(name: &str, mode: Mode) -> Function {
+    let mut slots = MlpSlots { mode };
+    if mode == Mode::Fused {
+        return skeleton_fused::build_fused(name, &mut slots);
+    }
+    // the unfused pair: the same pieces in the order of its own cut of the graph (the cut kernels' skeletons are generated too, see `generated_cuts`)
+    let mut fb = FnBuilder::new(name, 256);
+    let b = &mut fb;
+    let mut cx = slots.s_prelude(name, b);
+    if mode == Mode::G1 {
+        slots.image(b, &cx, 1);
+    } else {
+        slots.image(b, &cx, 2);
+    }
+    slots.s_images_done(b);
+    slots.s_x_first(b, &mut cx);
+    slots.s_loop_open(b, &mut cx);
+    slots.s_gemm1_act(b, &mut cx);
+    slots.s_x_next(b, &mut cx);
+    if mode != Mode::G1 {
+        slots.s_gemm2(b, &mut cx);
+    }
+    slots.s_loop_close(b, &mut cx);
     fb.finish()
 }
 
