@@ -1418,6 +1418,13 @@ impl FnBuilder {
             _ => panic!("{}: stage_live_out outside a stage", self.f.name),
         }
     }
+    /// Adds a scalar hand-over to the innermost open stage's contract (see `StageContract::scalars_out`).
+    pub fn stage_scalar_out(&mut self, s: StageScalar) {
+        match self.tree.open.iter_mut().rev().find(|f| matches!(f, Frame::Stage { .. })) {
+            Some(Frame::Stage { contract, .. }) => contract.scalars_out.push(s),
+            _ => panic!("{}: stage_scalar_out outside a stage", self.f.name),
+        }
+    }
     /// Closure form of `stage_begin` / `stage_end`.
     pub fn stage<R>(&mut self, name: &str, contract: StageContract, f: impl FnOnce(&mut Self) -> R) -> R {
         self.stage_begin(name, contract);
