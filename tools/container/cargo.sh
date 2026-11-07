@@ -74,5 +74,6 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e AMDC_PIN_VMWAIT="${AMDC_PIN_VMWAIT:-}" \
     -e SCHED_WG="${SCHED_WG:-}" \
     -e AMDC_TEST_LLVM="${AMDC_TEST_LLVM:-}" \
+-e UPDATE_SKELETONS="${UPDATE_SKELETONS:-}" \
     -w /work \
     amd-rust-dsl:1 cargo "$@"
