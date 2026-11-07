@@ -1,39 +1,29 @@
 # IR printing and structural equality
 
-`amdc print-ir <kernel> [--stage dsl|mir|mir-ra]` prints the closed IR in a readable, typed form.
+`amdc print-ir <kernel>|--from-ir <file> [--stage dsl|mir|mir-ra] [--out <file>]` prints the IR of a kernel.
 
-## DSL stage (`--stage dsl`, default)
+## DSL stage (`--stage dsl`, default): the `irv1` text
+
+The DSL stage prints the complete, parseable `irv1` text (`amdgpu_dsl::ir_text::print`); it parses back to the same `Function`
+(`ir_text::parse`), so a kernel can be edited and compiled again (`amdc emit --from-ir`). Format, workflow and checks:
+[`ir-text.md`](ir-text.md). Use `--out <file>` for large kernels (a container's stdout pipe can cut long output short).
 
 ```
-dsl @kernel
-  kernarg_size=... workgroup=... lds=...
-  profile=... lower_opts=... sched_opts=...
-  arg ptr_q: ptr @0x0 +8
-  ...
-  contract:
-    tile A base=0 slot=32768 slots=3
-    arg_tensor ptr_q alloc=...
-    grid_defs=[(0, ...), (1, ...)]
-  body:
-    %v0: ptr = KernargPtr { offset: 0 }
-    %v1: u32 = WorkitemId
-    loop BeginLoop { vars: [%r0], init: [...] }
-      %v2: i32 = ConstI32(4)
-      %v3: i32 = MulI32(Val(%v2), Val(%v1))
-      if BeginIf { cond: Val(%v4) }
-        ...
-      else
-        ...
-      end
-    endloop
+irv1
+dsl "probe_expr_kernarg"
+kernarg_size 36  workgroup 64  lds 0  value_count 18
+profile None  lower_opts []  sched_opts None
+var_tys []
+arg Arg { name: "a", ty: Ptr, kernarg_offset: 0, size: 8 }
+contract Contract { .. }
+values { }
+body {
+  %v0: Ptr = KernargPtr { offset: 0 }
+  %v8: I32 = MulI32(Val(6), Val(7))
+  loop vars [VarId(0)] init [I32(0)] { .. }
+  if Val(3) { .. } else { .. }
+}
 ```
-
-The printer reconstructs a small scope tree (`Node::Loop/If/Tile`) from the current flat statement
-list and prints that tree recursively. **When item B replaces the begin/end markers with nested
-regions, only `ir_print::parse_scope` (and the node arms) need to change; the recursive printer,
-the statement formatting and the canonical form stay.** Tile markers are printed as indented tile
-regions. `Let` lines carry the result type; other statements print their operands with `%vN` (SSA
-value) and `%rN` (loop variable), so the text is faithful to the IR rather than assembly.
 
 ## MIR stages
 
@@ -47,50 +37,30 @@ mir @kernel
   b0:
     s8:S2 = SLoadDwordx2
     v6:V1 = VReadPhys
-    v7:V1 = VMovB32 imm=4
     v8:V1 = VMulLoU32 (v6:V1, v7:V1)
     SWaitLgkm [auto]
     ...
     goto b1 / if Scc0 goto b2 else b3 / endpgm
 ```
 
-MOp names are the enum names; waits, `auto` waits and `pin` instructions are tagged, blocks print
-their label/predicate/terminator. The printer is deliberately not a parser/round-trip format (the
-optional parser was not needed).
+MOp names are the enum names; waits, `auto` waits and `pin` instructions are tagged, blocks print their label/predicate/terminator. The MIR
+text is a debugging format (not parsed back).
 
 ## Structural equality / hash
 
-`amdgpu_compiler::ir_print` exposes:
+`amdgpu_dsl::print` (re-exported by `amdgpu_compiler::ir_print`):
 
-- `dsl_structural_eq(a, b)` and `dsl_structural_hash(f)`: full structural identity including
-  args, contract, tiles/LDS plan and tuning fields; alpha-equivalent over `ValueId`/`VarId`
-  (ids are renamed by first occurrence). The function **name is not part** of the identity.
-- `dsl_body_structural_eq/hash` and `canonical_dsl_body`: the same without contract metadata,
-  for comparing a builder before/after annotations are added.
-- `canonical_dsl_body`: the alpha-canonical text form of the body (useful as a golden/diff artifact).
+- `dsl_structural_eq(a, b)` / `dsl_structural_hash(f)`: full structural identity including args, contract, tiles/LDS plan, AGPR marks,
+  register plan, region strategies and tuning fields; alpha-equivalent over `ValueId` / `VarId`. The function **name is not part** of the identity.
+- `dsl_body_structural_eq/hash` and `canonical_dsl_body`: the same without contract metadata, for comparing a builder before/after
+  annotations are added.
 
-Canonicalisation is exhaustive over all `Op`/`Stmt` variants because it starts from their `Debug`
-spelling and rewrites `ValueId(n)`/`VarId(n)`; adding a new op does not require a new match arm.
+Canonicalisation is structural: `ir_text::alpha_canonical` renumbers every ValueId / VarId by first occurrence in program order through the
+generated id visitor (`ir_codec.rs`, `tools/gen_ir_codec.py`) — in statements, op operands and annotations — and permutes the type tables
+accordingly; the canonical text is the `Debug` spelling of the renamed function.
 
 ### Tests
 
-`crates/amdgpu-kernels/tests/ir_print.rs`:
-
-1. `probe_llvm_ids` vs `probe_expr_ids` and `probe_llvm_kernarg` vs `probe_expr_kernarg` are
-   structurally equal (body form), hash equal, and canonical text equal; the canonical text does
-   not contain the kernel names. (The manual twins predate the expression-layer contract lines,
-   hence the body form.)
-2. Mutating one `ConstI32` changes the hash and makes the two functions unequal.
-3. The DSL printer emits header/contract/tiles/body and typed `%vN: <ty> = ...` lines.
-4. MIR printing shows blocks, virtual classes, and physical `vN`/`sN` registers after RA.
-
-Run: `cargo test -p amdgpu-kernels --test ir_print`.
-
-## Limitations
-
-- The text is a debugging/agent format, not a stable serialization format (the canonical form is
-  only for equality/hash within this build).
-- Op-specific pretty-printing is the enum's Debug name; a future attribute table can provide
-  per-op human syntax without touching equality.
-- Scope reconstruction assumes well-formed begin/end markers; malformed lists print markers as
-  leaves instead of panicking.
+`crates/amdgpu-kernels/tests/ir_print.rs` (expression-layer twins structurally equal, a mutated constant changes the hash, printer content,
+MIR printing) and `crates/amdgpu-kernels/tests/ir_text.rs` (every kernel round-trips through the text exactly and compiles to identical
+assembly; edits and located errors; alpha equivalence).

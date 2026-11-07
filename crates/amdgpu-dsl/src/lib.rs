@@ -15,7 +15,6 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 
 pub type ValueId = u32;
 

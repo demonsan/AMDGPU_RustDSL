@@ -32,19 +32,22 @@
 
 | crate | 属性位置 |
 |---|---|
+| `amdgpu-sym` / `amdgpu-layout` / `amdgpu-isa` | `crates/amdgpu-{sym,layout,isa}/src/lib.rs` |
 | `amdgpu-dsl` | `crates/amdgpu-dsl/src/lib.rs` |
+| `amdgpu-tile` / `amdgpu-kernels` | `crates/amdgpu-{tile,kernels}/src/lib.rs` |
 | `amdgpu-compiler` | `crates/amdgpu-compiler/src/lib.rs` |
 | `amdgpu-safeasm` | `crates/amdgpu-safeasm/src/lib.rs` |
-| `amdc` | `crates/amdc/src/main.rs` |
+| `amdc` | `crates/amdc/src/lib.rs` 与 `crates/amdc/src/main.rs` |
 
 `forbid` 是**编译期硬约束**：任何后续出现的 `unsafe {}`、`unsafe fn`、`unsafe impl`、`unsafe trait` 都会直接编译失败，
 而不是靠 code review 拦住。`crates/amdgpu-compiler/tests/rust_safety.rs::every_crate_forbids_unsafe_code`
-会检查各 crate root 都声明了该属性（防止有人删掉）。仓库现有 8 个 crate（`amdgpu-dsl`、`amdgpu-layout`、`amdgpu-isa`、`amdgpu-tile`、`amdgpu-kernels`、`amdgpu-compiler`、`amdgpu-safeasm`、`amdc`），全部在 crate root 写了 `#![forbid(unsafe_code)]`，该测试逐个检查全部 8 个。
+会检查各 crate root 都声明了该属性（防止有人删掉）。仓库现有 9 个 crate（`amdgpu-sym`、`amdgpu-layout`、`amdgpu-isa`、`amdgpu-dsl`、`amdgpu-tile`、`amdgpu-kernels`、`amdgpu-compiler`、`amdgpu-safeasm`、`amdc`），全部在 crate root 写了 `#![forbid(unsafe_code)]`，该测试逐个检查全部 9 个。
 
 ### 1.2 零第三方依赖
 
-所有 crate 的 `[dependencies]` 只有互为 `path` 依赖（`amdgpu-dsl` → `amdgpu-safeasm`；`amdgpu-isa` → layout；`amdgpu-tile` → dsl + layout + isa；`amdgpu-kernels` → dsl + layout + isa + tile；
-`amdgpu-compiler` → dsl + safeasm + tile + kernels；`amdc` → dsl + compiler；`amdgpu-layout` 无依赖）。**没有任何 crates.io 依赖**，因此不存在 "外部 crate 里的 `unsafe` 我们无法审计" 的问题
+所有 crate 的 `[dependencies]` 只有互为 `path` 依赖（`amdgpu-sym`、`amdgpu-safeasm` 无依赖；`amdgpu-layout` → sym；`amdgpu-isa` → layout；`amdgpu-dsl` → sym + safeasm + layout；
+`amdgpu-tile` → dsl + layout + isa；`amdgpu-kernels` → dsl + tile + layout + isa + safeasm；`amdgpu-compiler` → sym + dsl + safeasm（不依赖 kernels / tile）；
+`amdc` → dsl + compiler + kernels + tile）。**没有任何 crates.io 依赖**，因此不存在 "外部 crate 里的 `unsafe` 我们无法审计" 的问题
 （`tests/rust_safety.rs::no_third_party_dependencies` 强制）。
 
 ### 1.3 无 FFI、无裸指针、无危险构造
@@ -149,6 +152,8 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
 |---|---|---|---|
 | safe-asm `verify` | `crates/amdgpu-safeasm/src/verify.rs` | 操作数合法性、2/20/4 等待态规则、DS/VMEM 部分等待计数、WAR/WAW、部分写半边、寄存器所有权、`finish()` 未兑现 | `Result::Err` |
 | `forge_for_tests` | safe-asm（`test-support` feature / `cfg(test)`） | 仅测试可构造"伪造"序列，验证器必须拒绝 | 编译期不可达生产代码 |
+| `AsmBlock::from_parts` | safe-asm（IR 文本解析器专用） | 从 irv1 文本重建块时绕过 `Seq::finish` 的验证；编译器在 lowering 前对每个块照常复核（`pin_check` / hazard pass） | 复核失败 → `Err` |
+| irv1 解析与校验 | `crates/amdgpu-dsl/src/ir_text.rs` | 手改 IR 文本：语法/解码（带行号）、单次定义、`Let` 类型、id 范围、IR 验证器；`--from-ir` 编译默认再跑严格 `gpu_verify` | `Err` |
 | IR verifier | `crates/amdgpu-dsl` / compiler `lower.rs` | 类型/作用域/循环变量/算子合法性 | `Err` |
 | MIR verifier | `crates/amdgpu-compiler/src/mir.rs` | 物理寄存器、指令形式、描述符、部分写 | `Err` |
 | `asm_check::check_lite_contract` | compiler | last-arriver 的 lite 契约（全部访问 sc1、ticket sc0、barrier 前排空） | `Err` |
@@ -202,7 +207,7 @@ safe Rust 只能保证 "程序本身没有 UB"，不能保证 "你描述的指�
    `num_records` 越界零填充、行 clamp）、硬件探针（`buffer_probe.sh` 验证越界读为 0 / 越界写被丢弃）、
    以及真实形状的反复启动门禁。**这属于 L3，不宣称由 Rust 保证。**
 4. **`.s` 文本由外部汇编器验证**：我们不改 LLVM、不直接编码机器码；非法编码会被 `clang` 拒绝（编译期失败，无 UB）。
-5. **未做**：Miri（无 `unsafe` 时代价/收益有限）、fuzzing（编译器输入是内部 DSL，不是外部不可信输入）、
+5. **未做**：Miri（无 `unsafe` 时代价/收益有限）、fuzzing（编译器输入是内部 DSL；手改的 irv1 文本经解析器与验证器拒绝为 `Err`，尚未做模糊测试）、
    并发安全证明（单线程结构上已排除）。
 
 ---

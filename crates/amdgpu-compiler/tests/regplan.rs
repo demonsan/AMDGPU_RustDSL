@@ -115,6 +115,9 @@ fn region_caps_use_the_allocator_footprint() {
     let tight = kernel(0, 8, |b, _, _| b.reg_cap("r", 4));
     let e = err(&tight);
     assert!(e.contains("register cap"), "{e}");
+    // an AGPR cap holds trivially for a region without AGPRs, and an impossible VGPR cap still fails with it present
+    let agpr_ok = kernel(0, 8, |b, _, _| b.reg_cap_agpr("r", 0));
+    assert!(compile_mir_alloc(&agpr_ok).is_ok());
     let unknown = kernel(0, 2, |b, _, _| b.reg_cap("nope", 64));
     assert!(err(&unknown).contains("unknown region"));
 }
