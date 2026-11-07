@@ -259,7 +259,7 @@ pub fn probe_dma() -> Function {
     let c16 = b.c_i32(16);
     let c1024 = b.c_i32(1024);
     let c2048 = b.c_i32(68096); // above 64 KB
-    let c0 = b.c_i32(0);
+    let _c0 = b.c_i32(0);
     let c36864 = b.c_i32(36864);
 
     let off16 = b.mul_i32(tid, c16);
@@ -1914,7 +1914,7 @@ pub fn probe_smfmac_ones() -> Function {
     let c1f = b.c_f32(1.0);
     let mut prev = b.c_f32(0.0);
     let mut s35: Vec<ValueId> = Vec::new();
-    for &(slot, extra) in &[(30usize, 0usize), (31, 1), (32, 2), (33, 4)] {
+    for &(_slot, extra) in &[(30usize, 0usize), (31, 1), (32, 2), (33, 4)] {
         let acc = b.frag4(k1000, k1000, k1000, k1000);
         let mut filler = prev;
         for _ in 0..extra {

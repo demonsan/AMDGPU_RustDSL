@@ -21,7 +21,7 @@ use amdgpu_tile::frag::{AccTile, Frag, QkOut, B32x32x64Fp8, C32x32F32};
 use amdgpu_tile::reduce::KeyMask;
 use amdgpu_tile::softmax::{OnlineSoftmax, Recipe};
 use amdgpu_tile::*;
-use amdgpu_tile::weave::{Hint, Out, UnitClass, Units, Weaver};
+use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, StageContract, ValueId, VarId, I32};
 use amdgpu_isa::{MmaAtom, DS_READ_B128, DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, DS_WRITE_B32, GLOBAL_LDS_X1, GLOBAL_LDS_X4, GLOBAL_LOAD_X4, GLOBAL_STORE_X2};
 use amdgpu_layout::{make_layout, tup, ComposedLayout, Ix, Layout as LLayout, Swizzle};
@@ -777,7 +777,7 @@ pub fn declare_io(b: &mut FnBuilder, rows_per_block: i64, kvsplit: bool) -> Fmha
     let mut ctx = Ctx::new();
     let big = i64::MAX / 4;
     let cb = if kvsplit { ctx.sym_ext("B", 1, big, None, Ext::sym("B")) } else { ctx.sym_ext("grid_z", 1, big, None, Ext::grid_z()) };
-    let mut kas = |ctx: &mut Ctx, name: &str, off: u32| ctx.sym_ext(name, 0, big, None, Ext::ka(off));
+    let kas = |ctx: &mut Ctx, name: &str, off: u32| ctx.sym_ext(name, 0, big, None, Ext::ka(off));
     let (cs, cskv, ch) = (kas(&mut ctx, "S", 0x060), kas(&mut ctx, "SK", 0x110), kas(&mut ctx, "H", 0x140));
     let chk = ctx.sym_ext("HK", 1, big, None, Ext::sym("HK"));
     let lay = |sh: [&Ix; 4], st: [Ix; 4]| amdgpu_layout::make_layout(tup![sh[0].clone(), sh[1].clone(), sh[2].clone(), sh[3].clone()], tup![st[0].clone(), st[1].clone(), st[2].clone(), st[3].clone()]);

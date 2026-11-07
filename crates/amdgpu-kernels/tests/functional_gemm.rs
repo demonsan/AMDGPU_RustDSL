@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use amdgpu_kernels::gemm::GemmConfig;
 
 #[derive(Debug)]
-struct ProofError(String);
+struct ProofError(#[allow(dead_code)] String);
 
 type Items = HashMap<(i64, i64, i64), usize>;
 

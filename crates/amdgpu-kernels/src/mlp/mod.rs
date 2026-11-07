@@ -93,7 +93,6 @@ fn p_stage_val(jb: i64, v: ValueId, producer: bool) -> amdgpu_dsl::StageVal {
 
 /// Values shared between the slots of the MLP kernels (what the generated skeleton's `Cx` carries).
 pub(crate) struct Cx {
-    p_in: ValueId,
     p_w1: ValueId,
     p_w2: ValueId,
     m_v: ValueId,
@@ -220,7 +219,7 @@ impl MlpSlots {
         });
         // ---- prologue: the weight images into LDS (1 KB per DMA, wave w issues blocks w, w + 4, ...) ----
         let l16 = b.bind_i32(lane.lane() << 4);
-        Cx { p_in, p_w1, p_w2, m_v, g_v, lane, bx, w1s, w2s, r_in, r_out, epi, l16, c127: None, h16: None, wlane: None, nb: None, x0: Vec::new(), vars: Vec::new(), blk: None, xs: Vec::new(), next: None, row: None, roles: Vec::new(), p_words: Vec::new(), xn: Vec::new() }
+        Cx { p_w1, p_w2, m_v, g_v, lane, bx, w1s, w2s, r_in, r_out, epi, l16, c127: None, h16: None, wlane: None, nb: None, x0: Vec::new(), vars: Vec::new(), blk: None, xs: Vec::new(), next: None, row: None, roles: Vec::new(), p_words: Vec::new(), xn: Vec::new() }
     }
 
     fn image(&mut self, b: &mut FnBuilder, cx: &Cx, w: usize) {

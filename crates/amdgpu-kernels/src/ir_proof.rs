@@ -15,8 +15,7 @@
 //! The proof-only `GEMM_PROOF_DROP_KB` hook in the kernel adds a real `if` around the MMAs of one
 //! tile generation; setting it to 1 reproduces the "tile 1 swallowed" bug in the KERNEL CODE.
 
-use amdgpu_dsl::ev;
-use amdgpu_dsl::{Function, Node, Op, Opnd, RegionKind, Stmt, VarId, ValueId};
+use amdgpu_dsl::{Function, Node, Op, Opnd, Stmt, VarId, ValueId};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -132,7 +131,6 @@ pub struct Trace {
 struct Ctx<'a> {
     tid: i64,
     lane: i64,
-    wave: i64,
     args: &'a Args,
     vals: HashMap<ValueId, V>,
     vars: HashMap<VarId, V>,
@@ -289,7 +287,7 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
         Stmt::StoreLdsB64 { addr, value } | Stmt::StoreLdsB128 { addr, value } => {
             // DMA writes only in pass 1; the epilogue staging writes are also needed in pass 2
             // (they carry accumulator origins), even though pass 2 does not re-run DMA.
-            let epi = cx.cur_tile.as_ref().map(|(t, _)| t == "EPI").unwrap_or(false);
+            let _epi = cx.cur_tile.as_ref().map(|(t, _)| t == "EPI").unwrap_or(false);
 
             if let (Some(a), V::Frag { bytes, origins, .. }) = (cx.int(*addr), cx.opnd(*value)) {
                 cx.trace.borrow_mut().lds_store_origins += origins.iter().filter(|x| x.is_some()).count();
@@ -606,7 +604,6 @@ fn run_all(f: &Function, args: &Args) -> (Trace, usize) {
     let mut lanes: Vec<Ctx<'_>> = (0..256i64).map(|tid| Ctx {
         tid,
         lane: tid % 64,
-        wave: tid / 64,
         args,
         vals: HashMap::new(),
         vars: HashMap::new(),

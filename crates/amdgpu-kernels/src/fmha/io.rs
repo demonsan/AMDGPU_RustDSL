@@ -54,7 +54,7 @@ impl FmhaIo {
         let (hk, d) = (Dim::sym("HK"), Dim::c(128));
         // the batch: grid z for the single-kernel launch, the symbol B with grid z = B * splits for the KV-split launch
         let bat = if kvsplit { Dim::sym("B") } else { Dim::grid(2) };
-        let bshd = |ka: &mut KArgs, b: &mut FnBuilder, name: &str, off: u32, eb: i64, n: &Dim, hh: &Dim, st: [(&'static str, u32); 3]| {
+        let bshd = |ka: &mut KArgs, _b: &mut FnBuilder, name: &str, off: u32, eb: i64, n: &Dim, hh: &Dim, st: [(&'static str, u32); 3]| {
             ka.tensor(name, off, eb, vec![bat.clone(), n.clone(), hh.clone(), d.clone()], vec![Stride::Ka(st[0].0, st[0].1), Stride::Ka(st[1].0, st[1].1), Stride::Ka(st[2].0, st[2].1), Stride::Unit])
         };
         let q = bshd(ka, b, "ptr_q", 0x010, 1, &s, &h, [("s_Bs", 0x0A0), ("s_Seqs", 0x070), ("s_Hs", 0x090)]).packed().declare(ka, b);

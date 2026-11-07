@@ -6,7 +6,7 @@
 //! `S += delta` (`v_pk_add_f32`), `O *= 2^(512 delta)` (`v_pk_mul_f32`), `l *= 2^(512 delta)`. P = fp8(S') via pknorm (+ LUT correction in the short copy);
 //! the row sum `l` accumulates with four smfmacs (dword 2 = 16 x l).
 
-use crate::frag::{AccTile, C32x32F32, C16x16F32};
+use crate::frag::{AccTile, C32x32F32};
 use crate::reduce::{masked_values, row_max, to_p8, KeyMask, LutConsts, P8Conv, SmfmacOnes};
 use crate::Lane;
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd, ValueId, VarId};
@@ -39,7 +39,6 @@ pub struct OnlineSoftmax {
     b131: ValueId,
     c16: ValueId,
     c512: ValueId,
-    one_f: ValueId,
     /// the scale operand of the fp8 conversion (`v_cvt_scalef32_pk_fp8_bf16`): 1.0, or the vendor's 0.25 (`set_vendor_ref`)
     conv_s: ValueId,
     zero4: ValueId,
@@ -54,7 +53,6 @@ impl OnlineSoftmax {
         let thr = b.c_f32(recipe.thr);
         let b131 = b.c_f32(recipe.b131);
         let c512 = b.c_f32(512.0);
-        let one_f = b.c_f32(1.0);
         let zero_f = b.c_f32(0.0);
         let c16 = b.c_i32(16);
         let smf = SmfmacOnes::new(b, lane);
@@ -63,7 +61,7 @@ impl OnlineSoftmax {
         let wi = b.c_i32(0x4800_4800);
         let bias_init = b.frag2(wi, wi);
         let zero4 = b.frag_zero(DType::Frag4);
-        OnlineSoftmax { recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, one_f, conv_s: one_f, zero4, bias: None, la: None }
+        OnlineSoftmax { recipe, smf, ones_f16, bias_init, neg_big, zero_f, thr, b131, c16, c512, conv_s: one_f, zero4, bias: None, la: None }
     }
     /// Overrides the rollback threshold (scaled max units).
     /// The vendor's reference recipe (vendor-spec 4.7, the live scalars of `ref_mxfp8.co`): exp bias / rebase target s91 = 0.24799132

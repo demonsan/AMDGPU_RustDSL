@@ -394,7 +394,6 @@ impl PipeBody for Demo3v {
 
 #[test]
 fn t128_style_staging_verifies() {
-    let mut f = demo3();
     // rebuild with the t128 staging (same declarations)
     let mut b = FnBuilder::new("tile_demo_ring3v", 256);
     b.compile_profile(CompileProfile::Default);
@@ -423,7 +422,7 @@ fn t128_style_staging_verifies() {
     let pipe = Pipeline::new(Cadence::OneWindow, nkv, kv_len, 128, Ext::ka(0x10).ceil_div(128));
     let mut body = Demo3v { base: Demo3 { ks, vs, kd: kds, kcp, vcp, kdcp, lane, next_reads: true }, kdv, pending: None };
     pipe.run(&mut b, Role::All, &mut body);
-    f = b.finish();
+    let mut f = b.finish();
     let e = errs(&f);
     assert!(e.is_empty(), "{}", e.join("\n"));
     let c = amdgpu_compiler::compile(&f).expect("compile");

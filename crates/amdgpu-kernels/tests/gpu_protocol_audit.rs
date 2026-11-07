@@ -125,7 +125,7 @@ fn region_trust_escape() -> Function {
     let t = b.let_(Op::WorkitemId);
     let c64 = b.c_i32(64);
     let is_p = b.cmp_lt_i32(t, c64);
-    let z = b.c_i32(0);
+    let _z = b.c_i32(0);
     b.begin_if(Opnd::Val(is_p));
     b.buf_produce("r", Opnd::I32(0));
     b.store_f32(p, 0, Opnd::F32(1.0));

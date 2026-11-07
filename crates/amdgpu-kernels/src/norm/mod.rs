@@ -9,7 +9,7 @@
 //! `load` (M: x and gamma rows -> f32) -> `rms` (R sum of squares over the wave + E scale by rsqrt and gamma) -> `quant` (R absolute maximum +
 //! Q per-row fp8) -> `store` (M: q and the row scale).
 
-use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, StageContract, StageScalar, StageVal, ValueId};
+use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, StageContract, StageScalar, StageVal, ValueId};
 use amdgpu_tile::prims::{abs_f32, bf16x8_to_f32, fp8_pack, fp8_scale, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
 use amdgpu_tile::stage::{Prim, StageInst};
 use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};

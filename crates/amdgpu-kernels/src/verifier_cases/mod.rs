@@ -86,9 +86,9 @@ pub fn gv_attack_clamp_path() -> Function {
     let q = b.let_(Op::KernargPtr { offset: 0 });
     let o = b.let_(Op::KernargPtr { offset: 8 });
     let tid = b.let_(Op::WorkitemId);
-    let c0 = b.c_i32(0);
+    let _c0 = b.c_i32(0);
     let c127 = b.c_i32(127);
-    let c4 = b.c_i32(4);
+    let _c4 = b.c_i32(4);
     let c16 = b.c_i32(16);
     let off = b.mul_i32(tid, c16);
     let clamped = b.min_i32(off, c127);
