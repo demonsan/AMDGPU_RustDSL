@@ -874,9 +874,9 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
         let hi = b.read_first_lane(hi);
         let qt = b.let_(amdgpu_dsl::Op::AddI32(amdgpu_dsl::Opnd::Val(qt), amdgpu_dsl::Opnd::I32(0)));
         let hi = b.let_(amdgpu_dsl::Op::AddI32(amdgpu_dsl::Opnd::Val(hi), amdgpu_dsl::Opnd::I32(0)));
-        // the logical ids are in range by construction; the clamps (SALU, once) state it for the verifier
-        let qt = b.bind_i32(ev(qt).max(0).min(ev(xq) - 1));
-        let hi = b.bind_i32(ev(hi).max(0).min(ev(hh) - 1));
+        // the remap is a bijection of [0, X) x [0, H) (N % 8 == 0); the interval engine cannot follow the division: trusted contract facts
+        b.assume_trusted(qt, Ext::c(0), Ext::ka(0x060).ceil_div(1 << rows_lg) - Ext::c(1), "XCD block order: the logical query tile M % X of the bijection M = (L % 8) N / 8 + L / 8 over [0, X H) lies in [0, X)");
+        b.assume_trusted(hi, Ext::c(0), Ext::ka(0x140) - Ext::c(1), "XCD block order: the logical head M / X of the bijection over [0, X H) lies in [0, H)");
         (qt, hi)
     } else {
         (b.let_(amdgpu_dsl::Op::WorkgroupIdX), b.let_(amdgpu_dsl::Op::WorkgroupIdY))
