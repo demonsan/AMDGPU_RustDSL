@@ -58,7 +58,26 @@ impl Json {
             Json::Int(i) => out.push_str(&i.to_string()),
             Json::Str(s) => write_str(out, s),
             Json::Arr(v) => {
-                if v.iter().all(|x| matches!(x, Json::Int(_) | Json::Str(_) | Json::Bool(_) | Json::Null)) && v.len() <= 16 {
+                let scalar = v.iter().all(|x| matches!(x, Json::Int(_) | Json::Str(_) | Json::Bool(_) | Json::Null));
+                if scalar && v.len() > 16 {
+                    // long scalar arrays (element tables): 32 per line
+                    out.push_str("[\n");
+                    for (ci, chunk) in v.chunks(32).enumerate() {
+                        out.push_str(&" ".repeat(ind + 2));
+                        for (i, x) in chunk.iter().enumerate() {
+                            if i > 0 {
+                                out.push_str(", ");
+                            }
+                            x.write(out, ind + 2);
+                        }
+                        if (ci + 1) * 32 < v.len() {
+                            out.push(',');
+                        }
+                        out.push('\n');
+                    }
+                    out.push_str(&" ".repeat(ind));
+                    out.push(']');
+                } else if scalar {
                     out.push('[');
                     for (i, x) in v.iter().enumerate() {
                         if i > 0 {
