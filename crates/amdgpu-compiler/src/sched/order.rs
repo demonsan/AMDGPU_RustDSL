@@ -37,9 +37,8 @@ fn then_fence(x: &Effects, f: Fence, alu_across: bool) -> bool {
     }
 }
 
-/// Must `a` (earlier in program order) stay before `b` because of memory / fence semantics?
-/// `slotfill` legality contract (sched/slotfill.rs): inside a barrier interval an LDS-DMA never writes what a `ds_read` of the same interval reads, so the two may swap.
-/// Set only for the duration of that pass (and its verification).
+// `slotfill` legality contract (sched/slotfill.rs): inside a barrier interval an LDS-DMA never writes what a `ds_read` of the same interval reads, so the two may swap.
+// Set only for the duration of that pass (and its verification).
 thread_local! {
     static RELAX_DMA_LDS_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
