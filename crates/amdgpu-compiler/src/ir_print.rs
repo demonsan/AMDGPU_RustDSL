@@ -4,7 +4,6 @@
 
 pub use amdgpu_dsl::print::*;
 
-use amdgpu_dsl::Function;
 use std::fmt::Write;
 
 use crate::mir::{Block, MFunction, MInst, Src, Term, VReg};

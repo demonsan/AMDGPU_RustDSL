@@ -69,7 +69,7 @@ fn tile_view_offsets_clamp_the_relative_row() {
     let r = b.c_i32(5);
     let _p = qt.ptr(&mut b, &[I32::c(0), ev(r), I32::c(0), I32::c(16)]);
     let f = b.finish();
-    let text = f.dump();
+    let text = amdgpu_dsl::print::print_dsl(&f);
     // clamp = cmp + select, then the offset terms and one ptr_add
     assert!(f.stmts().len() - before >= 6, "{text}");
     assert!(text.to_lowercase().contains("select"), "the row index must be clamped:\n{text}");

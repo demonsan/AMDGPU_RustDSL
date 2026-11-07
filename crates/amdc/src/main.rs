@@ -12,7 +12,6 @@ use std::process::ExitCode;
 fn usage() {
     eprintln!("usage:");
     eprintln!("  amdc list");
-    eprintln!("  amdc dump <kernel>");
     eprintln!("  amdc print-ir <kernel>|--from-ir <file> [--stage dsl|mir|mir-ra] [--out <file>]");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
     eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
@@ -487,22 +486,6 @@ fn main() -> ExitCode {
                 }
             }
             ExitCode::SUCCESS
-        }
-        "dump" => {
-            let Some(name) = args.get(1) else {
-                usage();
-                return ExitCode::from(2);
-            };
-            match amdgpu_kernels::kernel_by_name(name) {
-                Some(f) => {
-                    print!("{}", f.dump());
-                    ExitCode::SUCCESS
-                }
-                None => {
-                    eprintln!("unknown kernel: {name}");
-                    ExitCode::from(2)
-                }
-            }
         }
         "ir-check" => {
             // amdc ir-check <file.ir> [--verify]: parse + check an irv1 file, re-print it (text fixpoint); --verify adds the strict GPU-semantics certificate

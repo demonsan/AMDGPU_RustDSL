@@ -87,7 +87,7 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         return Err(format!(
             "IR verification failed:\n  {}\nIR:\n{}",
             errs.join("\n  "),
-            f.dump()
+            amdgpu_dsl::print::print_dsl(f)
         ));
     }
     let mut lw = Lowerer::new(f);
