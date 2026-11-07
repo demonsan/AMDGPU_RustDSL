@@ -158,7 +158,7 @@ pub fn sink_explicit_waits(m: &mut MFunction, o: &Options) -> usize {
         let mut pos: Vec<usize> = (0..n).collect();
         let mut moved = 0usize;
         for w in 0..n {
-            if !matches!(insts[w].op, MOp::SWaitLgkm) || insts[w].auto || !ro[super::region::region_index(o, insts[w].region)].waitsink {
+            if !matches!(insts[w].op, MOp::SWaitLgkm) || insts[w].auto || (!o.regions.is_empty() && !ro[super::region::region_index(o, insts[w].region)].waitsink) {
                 continue;
             }
             loop {
