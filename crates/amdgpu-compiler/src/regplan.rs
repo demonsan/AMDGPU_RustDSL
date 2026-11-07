@@ -234,7 +234,7 @@ pub fn check(m: &MFunction, a: &Alloc) -> Result<(), String> {
             if let Some(c) = vcap {
                 if p.vgpr_footprint_peak > *c {
                     return Err(format!(
-                        "register cap: region `{region}` needs {} arch VGPRs at block {} inst {} (cap {c}); live there (highest first): {}",
+                        "out of VGPRs (register cap): region `{region}` needs {} arch VGPRs at block {} inst {} (cap {c}); live there (highest first): {}",
                         p.vgpr_footprint_peak,
                         p.at.0,
                         p.at.1,
@@ -244,7 +244,7 @@ pub fn check(m: &MFunction, a: &Alloc) -> Result<(), String> {
             }
             if let Some(c) = acap {
                 if p.agpr_footprint_peak > *c {
-                    return Err(format!("register cap: region `{region}` needs {} AGPRs (cap {c})", p.agpr_footprint_peak));
+                    return Err(format!("out of VGPRs (register cap): region `{region}` needs {} AGPRs (cap {c})", p.agpr_footprint_peak));
                 }
             }
         }
