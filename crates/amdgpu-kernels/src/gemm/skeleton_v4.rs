@@ -87,7 +87,7 @@ pub fn build_v4<S: V4Slots>(name: &str, slots: &mut S) -> Function {
     let mut fb = FnBuilder::new(name, 256);
     let b = &mut fb;
     let mut cx = slots.prelude(b);
-    let mut pipe = slots.pipeline(b, &mut cx);
+    let pipe = slots.pipeline(b, &mut cx);
     {
         let mut body = V4Body { slots: &mut *slots, cx: &mut cx };
         pipe.run(b, Role::All, &mut body);
