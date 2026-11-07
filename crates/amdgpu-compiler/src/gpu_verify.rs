@@ -1845,9 +1845,11 @@ pub fn verify_stages(f: &Function, rep: &mut Report) {
             }
             _ => {}
         }
-        if let Stmt::Let { dst, .. } = st {
+        if let Stmt::Let { dst, op } = st {
             defined.insert(*dst as u32);
-            if let Some((s, _, _)) = open.last() {
+            // constants are not hand-overs (the builder pools them: a constant first used in one stage is reused by later ones)
+            let constant = matches!(op, amdgpu_dsl::Op::ConstI32(_) | amdgpu_dsl::Op::ConstF32(_));
+            if let (Some((s, _, _)), false) = (open.last(), constant) {
                 def_stage.insert(*dst as u32, *s);
             }
         }

@@ -20,6 +20,9 @@ use amdgpu_layout::Movement;
 pub mod graph;
 mod skeleton_fused;
 
+pub mod graph;
+mod skeleton_fused;
+
 pub const K1: i64 = 256;
 pub const N1: i64 = 256;
 pub const N2: i64 = 256;
@@ -37,6 +40,12 @@ enum Mode {
     G1,
     /// GEMM 2 from H
     G2,
+    /// GEMM 1 with the generic epilogue chain (P2): `act(alpha H + bias[n1])`, per-row fp8 quantization, H and the row scales to HBM
+    G1q(amdgpu_tile::prims::Act),
+}
+
+fn g1_like(mode: Mode) -> bool {
+    matches!(mode, Mode::G1 | Mode::G1q(_))
 }
 
 pub fn by_name(name: &str) -> Option<Function> {
@@ -44,6 +53,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "mlp_fp8_ws_fused" => Mode::Fused,
         "mlp_fp8_ws_g1" => Mode::G1,
         "mlp_fp8_ws_g2" => Mode::G2,
+        "mlp_fp8_ws_g1q_relu" => Mode::G1q(amdgpu_tile::prims::Act::Relu),
+        "mlp_fp8_ws_g1q_silu" => Mode::G1q(amdgpu_tile::prims::Act::Silu),
         _ => return None,
     };
     Some(build_ws(name, mode))
@@ -79,6 +90,249 @@ fn p_stage_val(jb: i64, v: ValueId, producer: bool) -> amdgpu_dsl::StageVal {
     let (p, c) = p_boundary(jb);
     let lf = if producer { &p.live[0] } else { &c.live[0] };
     amdgpu_dsl::StageVal { name: lf.name.clone(), values: vec![v], table: lf.table.clone(), elem_bits: lf.elem_bits, storage: "vgpr".into(), layout: String::new() }
+}
+
+/// Values shared between the slots of the MLP kernels (what the generated skeleton's `Cx` carries).
+pub(crate) struct Cx {
+    p_in: ValueId,
+    p_w1: ValueId,
+    p_w2: ValueId,
+    m_v: ValueId,
+    g_v: ValueId,
+    lane: Lane,
+    bx: ValueId,
+    w1s: Option<amdgpu_tile::Shared>,
+    w2s: Option<amdgpu_tile::Shared>,
+    r_in: ValueId,
+    r_out: ValueId,
+    l16: ValueId,
+    // set by `x_first`
+    c127: Option<ValueId>,
+    h16: Option<ValueId>,
+    wlane: Option<ValueId>,
+    nb: Option<ValueId>,
+    x0: Vec<ValueId>,
+    // set by `loop_open`
+    vars: Vec<amdgpu_dsl::VarId>,
+    blk: Option<amdgpu_dsl::I32>,
+    xs: Vec<Opnd>,
+    next: Option<ValueId>,
+    row: Option<ValueId>,
+    roles: Vec<String>,
+    // set by the loop stages
+    p_words: Vec<Opnd>,
+    xn: Vec<ValueId>,
+}
+
+impl Cx {
+    /// W fragment of 32-row tile t, k block kb (A operand): rows 32 t + j, bytes 64 kb + 16 h and + 32
+    fn wfrag(&self, b: &mut FnBuilder, sh: &amdgpu_tile::Shared, t: i64, kb: i64) -> ValueId {
+        use amdgpu_tile::SlotIdx;
+        let wlane = self.wlane.expect("x_first");
+        let pr = sh.at(&SlotIdx::new(0, 0));
+        let base = sh.base as i32 + (t * 32 * W_PITCH + 64 * kb) as i32;
+        pr.read(b, |b| {
+            let a0 = b.bind_i32(ev(wlane) + base);
+            let a1 = b.bind_i32(ev(wlane) + base + 32);
+            b.load_lds_b128x2(a0, a1)
+        })
+    }
+    /// row operand (X or H): 4 fragments of 64 k, 16 bytes at 64 kb + 16 h and + 32 of row m
+    fn rowfrags(&self, b: &mut FnBuilder, blk: amdgpu_dsl::I32) -> Vec<ValueId> {
+        let h16 = self.h16.expect("x_first");
+        let lane = &self.lane;
+        let r_in = self.r_in;
+        let ro = b.bind_i32((((blk << 7) + (lane.wave() << 5) + lane.j()) << 8) + ev(h16));
+        (0..K1 / 64).map(|kb| b.buffer_load_b128x2(r_in, ro, 0i32, (64 * kb) as u32, (64 * kb + 32) as u32)).collect()
+    }
+}
+
+/// The slots of the MLP kernels: the orchestration the op-graph skeleton leaves to the kernel (the three modes share the pieces; `mode` selects what a slot emits).
+pub(crate) struct MlpSlots {
+    mode: Mode,
+}
+
+impl MlpSlots {
+    fn s_prelude(&mut self, name: &str, b: &mut FnBuilder) -> Cx {
+        use amdgpu_tile::{LdsPlan, Layout as TLayout};
+        let mode = self.mode;
+        if mode == Mode::Fused {
+            for jb in 0..N1 / 64 {
+                let (p, c) = p_boundary(jb);
+                let rep = check_boundary(&p, &c).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert!(rep.frags.iter().all(|f| f.1 <= Movement::Register && f.2 == 0), "{name}: the P hand-off is not free: {:?}", rep.frags);
+            }
+        }
+        b.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
+        for (n, o) in [("ptr_in", 0u32), ("ptr_w1", 8), ("ptr_w2", 16), ("ptr_out", 24)] {
+            b.arg(n, DType::Ptr, o, 8);
+        }
+        b.arg("m", DType::I32, 32, 4);
+        b.arg("g", DType::I32, 36, 4);
+        let mt = Ext::sym("MT");
+        let gs = Ext::sym("G");
+        b.sym_range("MT", 1, 4096);
+        b.sym_range("G", 1, 1024);
+        let m = mt.clone() * Ext::c(128);
+        b.ka_is(32, m.clone());
+        b.ka_is(36, gs.clone());
+        b.grid_is(0, gs);
+        b.arg_tensor("ptr_in", m.clone() * Ext::c(K1));
+        b.arg_tensor("ptr_w1", Ext::c(W_IMG));
+        b.arg_tensor("ptr_w2", Ext::c(W_IMG));
+        b.arg_tensor("ptr_out", m.clone() * Ext::c(if mode == Mode::G1 { N1 } else { 2 * N2 }));
+        let p_in = b.let_(Op::KernargPtr { offset: 0 });
+        let p_w1 = b.let_(Op::KernargPtr { offset: 8 });
+        let p_w2 = b.let_(Op::KernargPtr { offset: 16 });
+        let p_out = b.let_(Op::KernargPtr { offset: 24 });
+        let m_v = b.let_(Op::KernargI32 { offset: 32 });
+        let g_v = b.let_(Op::KernargI32 { offset: 36 });
+        let tid = b.let_(Op::WorkitemId);
+        let lane = Lane::from_tid(b, tid);
+        let bx = b.let_(Op::WorkgroupIdX);
+        let mut lds = LdsPlan::new();
+        let need_w1 = mode != Mode::G2;
+        let need_w2 = mode != Mode::G1;
+        let w1s = need_w1.then(|| lds.tile("W1", W_IMG, TLayout::Linear));
+        let w2s = need_w2.then(|| lds.tile("W2", W_IMG, TLayout::Linear));
+        lds.commit(b);
+        let r_in = { let n = b.bind_i32(ev(m_v) * (K1 as i32)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_in, n) };
+        let r_out = { let n = b.bind_i32(ev(m_v) * (if mode == Mode::G1 { N1 } else { 2 * N2 }) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_out, n) };
+        // ---- prologue: the weight images into LDS (1 KB per DMA, wave w issues blocks w, w + 4, ...) ----
+        let l16 = b.bind_i32(lane.lane() << 4);
+        Cx { p_in, p_w1, p_w2, m_v, g_v, lane, bx, w1s, w2s, r_in, r_out, l16, c127: None, h16: None, wlane: None, nb: None, x0: Vec::new(), vars: Vec::new(), blk: None, xs: Vec::new(), next: None, row: None, roles: Vec::new(), p_words: Vec::new(), xn: Vec::new() }
+    }
+
+    fn image(&mut self, b: &mut FnBuilder, cx: &Cx, w: usize) {
+        use amdgpu_tile::SlotIdx;
+        let (sh, p) = if w == 1 { (cx.w1s.as_ref(), cx.p_w1) } else { (cx.w2s.as_ref(), cx.p_w2) };
+        let Some(sh) = sh else { return };
+        let lane = cx.lane;
+        let l16 = cx.l16;
+        let r = b.buffer_desc(p, W_IMG as u32);
+        let pr = sh.at(&SlotIdx::new(0, 0));
+        let base = sh.base as i32;
+        pr.write(b, |b| {
+            for i in 0..(W_IMG / 1024 / 4) as i32 {
+                // block q = 4 i + wave: source / destination byte 1024 q (+ 16 lane)
+                let so = { let v = b.bind_i32((lane.wave() + 4 * i) << 10); b.read_first_lane(v) };
+                let m0 = b.bind_i32(ev(so) + base);
+                b.buffer_load_lds_b128(r, l16, so, m0, 0);
+            }
+        });
+    }
+
+    /// after the images: wait for the DMAs, one barrier
+    fn s_images_done(&mut self, b: &mut FnBuilder) {
+        b.wait_vm(0);
+        b.barrier();
+    }
+
+    fn s_x_first(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        let c127 = b.c_i32(127);
+        let h16 = b.bind_i32(cx.lane.half() << 4);
+        let wlane = b.bind_i32(ev(cx.lane.j) * (W_PITCH as i32) + ev(h16));
+        cx.c127 = Some(c127);
+        cx.h16 = Some(h16);
+        cx.wlane = Some(wlane);
+        let nb = b.bind_i32(ev(cx.m_v).lshr(7));
+        cx.nb = Some(nb);
+        cx.x0 = cx.rowfrags(b, ev(cx.bx));
+    }
+
+    fn s_loop_open(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::Val(cx.bx))];
+        inits.extend(cx.x0.iter().map(|x| (DType::Frag8, Opnd::Val(*x))));
+        let vars = b.begin_loop(&inits);
+        let blk = amdgpu_dsl::varx(vars[0]);
+        cx.xs = vars[1..].iter().map(|v| Opnd::Var(*v)).collect();
+        let next = b.bind_i32(blk.clone() + ev(cx.g_v));
+        let row = b.bind_i32((blk.clone() << 7) + (cx.lane.wave() << 5) + cx.lane.j());
+        cx.vars = vars;
+        cx.blk = Some(blk);
+        cx.next = Some(next);
+        cx.row = Some(row);
+        cx.roles = vec!["all 4 waves: same program".to_string()];
+    }
+
+    fn s_gemm1_act(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        let mode = self.mode;
+        let fused = mode == Mode::Fused;
+        let p_words: Vec<Opnd> = if mode == Mode::G2 {
+            cx.xs.clone()
+        } else {
+            let wf = |b: &mut FnBuilder, sh: &amdgpu_tile::Shared, t: i64, kb: i64| -> ValueId { cx.wfrag(b, sh, t, kb) };
+            let st = gemm1_act_stage(GemmCtx { wfrag: &wf, c127: cx.c127.expect("x_first") }, cx.w1s.as_ref().expect("W1"), &cx.xs, mode, cx.r_out, cx.row.expect("loop_open"), &cx.lane, &cx.roles);
+            let out = st.out.clone();
+            st.inst.plain(!fused).emit(b);
+            out.get()
+        };
+        cx.p_words = p_words;
+    }
+
+    fn s_x_next(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        // the next block's row operand (clamped: past the end it reloads this block, unused)
+        let blk = cx.blk.clone().expect("loop_open");
+        let nclamp = b.bind_i32(ev(cx.next.expect("loop_open")).lt(ev(cx.nb.expect("x_first"))).select_i32(ev(cx.next.unwrap()), blk));
+        cx.xn = cx.rowfrags(b, ev(nclamp));
+    }
+
+    fn s_gemm2(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        let fused = self.mode == Mode::Fused;
+        let p_vals: Vec<ValueId> = cx.p_words.iter().filter_map(|o| if let Opnd::Val(v) = o { Some(*v) } else { None }).collect();
+        let contract = amdgpu_dsl::StageContract {
+            live_in: p_vals.iter().enumerate().map(|(jb, v)| p_stage_val(jb as i64, *v, false)).collect(),
+            barrier_phase: 1,
+            roles: cx.roles.clone(),
+            ..Default::default()
+        };
+        let wf = |b: &mut FnBuilder, sh: &amdgpu_tile::Shared, t: i64, kb: i64| -> ValueId { cx.wfrag(b, sh, t, kb) };
+        gemm2_stage(GemmCtx { wfrag: &wf, c127: cx.c127.expect("x_first") }, cx.w2s.as_ref().expect("W2"), &cx.p_words, cx.r_out, cx.row.expect("loop_open"), &cx.lane, contract).plain(!fused).emit(b);
+    }
+
+    fn s_loop_close(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        let next = cx.next.expect("loop_open");
+        b.set_var(cx.vars[0], next);
+        for (v, x) in cx.vars[1..].iter().zip(cx.xn.iter()) {
+            b.set_var(*v, *x);
+        }
+        let done = b.bind_cond(ev(next).ge(ev(cx.nb.expect("x_first"))));
+        b.break_if(done);
+        b.end_loop();
+    }
+}
+
+/// The fused kernel through the generated skeleton (`skeleton_fused.rs`, from the op graph `graph::graph()`): the slots call the pieces above in the graph's dependence order.
+impl skeleton_fused::FusedSlots for MlpSlots {
+    type Cx = Cx;
+    fn prelude(&mut self, b: &mut FnBuilder) -> Cx {
+        self.s_prelude("mlp_fp8_ws_fused", b)
+    }
+    fn w1_image(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.image(b, cx, 1);
+    }
+    fn w2_image(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.image(b, cx, 2);
+        self.s_images_done(b);
+    }
+    fn x_first(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_x_first(b, cx);
+    }
+    fn loop_open(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_loop_open(b, cx);
+    }
+    fn gemm1_act(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_gemm1_act(b, cx);
+    }
+    fn x_next(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_x_next(b, cx);
+    }
+    fn gemm2(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_gemm2(b, cx);
+    }
+    fn loop_close(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_loop_close(b, cx);
+    }
 }
 
 /// Values shared between the slots of the MLP kernels (what the generated skeleton's `Cx` carries).
@@ -365,7 +619,7 @@ struct Gemm1<'s> {
 /// Stage `gemm1_act` (keys `mma.rows_x_lds` + `map.relu_pack_fp8`): `H^T = W1 X^T`, `fp8(relu(alpha H))` packed in accumulator order (fused: the
 /// zero-cost B-operand words of GEMM 2; G1: stored to HBM).
 #[allow(clippy::too_many_arguments)]
-fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opnd], mode: Mode, r_out: ValueId, row: ValueId, lane: &'s Lane, roles: &[String]) -> Gemm1<'s> {
+fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opnd], mode: Mode, r_out: ValueId, row: ValueId, lane: &'s Lane, roles: &[String], epi: Option<(ValueId, ValueId)>) -> Gemm1<'s> {
     use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -389,11 +643,69 @@ fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opn
             });
         }
     }
+    let words: Rc<RefCell<Vec<Vec<ValueId>>>> = Rc::new(RefCell::new(Vec::new()));
+    if let (Mode::G1q(act), Some((r_bias, r_scale))) = (mode, epi) {
+        // ---- the generic epilogue chain (map.epilogue_chain): y = act(alpha acc + bias[n1]) (E), row amax (R: lane-local over the lane's 128
+        // values, then the partner half of the row via permlane32_swap), per-row fp8 (Q); words in accumulator order, scale per row ----
+        use amdgpu_tile::prims::{abs_f32, act as act_f, affine, fp8_pack, fp8_scale};
+        let st: Out<(ValueId, ValueId)> = Out::new();
+        let s1 = st.clone();
+        last = u.add("epi.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| {
+            let alpha = b.c_f32(ALPHA);
+            let vb = b.bind_i32(lane.half() << 4);
+            s1.set((alpha, vb));
+        });
+        let ys: Rc<RefCell<Vec<Vec<ValueId>>>> = Rc::new(RefCell::new(Vec::new()));
+        let amax: Rc<RefCell<Option<ValueId>>> = Rc::new(RefCell::new(None));
+        for t in 0..(N1 / 32) as usize {
+            let (a2, s2, y2, m2) = (acc.clone(), st.clone(), ys.clone(), amax.clone());
+            last = u.add(format!("epi.t{t}"), UnitClass::Valu, Hint::Filler, &[last], move |b| {
+                let (alpha, vb) = s2.get();
+                // bias of value r (n1 = 32 t + 8 (r / 4) + 4 h + r % 4): one 16-byte load per q = r / 4
+                let bq: Vec<ValueId> = (0..4u32).map(|q| b.buffer_load_b128(r_bias, vb, 0i32, 128 * t as u32 + 32 * q)).collect();
+                b.wait_vm(0);
+                let a = a2.borrow()[t];
+                let mut y = Vec::with_capacity(16);
+                for r in 0..16u8 {
+                    let v = b.frag16_lane(a, r);
+                    let f = b.bitcast_f32(v);
+                    let bl = b.frag4_lane(Opnd::Val(bq[(r / 4) as usize]), r % 4);
+                    let bias = b.bitcast_f32(bl);
+                    let z = affine(b, f, Some(alpha), Some(bias));
+                    y.push(act_f(b, z, act));
+                }
+                let mut m = m2.borrow_mut();
+                for &v in &y {
+                    let av = abs_f32(b, v);
+                    *m = Some(match *m { None => av, Some(p) => b.max_f32(p, av) });
+                }
+                y2.borrow_mut().push(y);
+            });
+        }
+        let (y3, m3, w5) = (ys.clone(), amax.clone(), words.clone());
+        last = u.add("epi.quant", UnitClass::Valu, Hint::Anchor, &[last], move |b| {
+            let m = m3.borrow().expect("amax");
+            // lanes l and l + 32 hold the two halves of row m: the partner value through permlane32_swap
+            let (pa, pb) = b.permlane32_swap(m, m);
+            let (fa, fb) = (b.bitcast_f32(pa), b.bitcast_f32(pb));
+            let row_max = b.max_f32(fa, fb);
+            let (scale, inv) = fp8_scale(b, row_max);
+            for y in y3.borrow().iter() {
+                w5.borrow_mut().push(fp8_pack(b, y, inv));
+            }
+            let vs = b.bind_i32(ev(row) << 2);
+            b.buffer_store_f32(r_scale, vs, 0i32, 0, scale);
+        });
+    }
     let consts: Out<(ValueId, ValueId)> = Out::new();
     let c1 = consts.clone();
-    last = u.add("act.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| c1.set((b.c_f32(ALPHA), b.c_f32(0.0))));
-    let words: Rc<RefCell<Vec<Vec<ValueId>>>> = Rc::new(RefCell::new(Vec::new()));
+    if !matches!(mode, Mode::G1q(_)) {
+        last = u.add("act.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| c1.set((b.c_f32(ALPHA), b.c_f32(0.0))));
+    }
     for t in 0..(N1 / 32) as usize {
+        if matches!(mode, Mode::G1q(_)) {
+            break;
+        }
         let (a2, c2, w2) = (acc.clone(), consts.clone(), words.clone());
         last = u.add(format!("act.t{t}"), UnitClass::Valu, Hint::Filler, &[last], move |b| {
             let (alpha, zf) = c2.get();
@@ -406,7 +718,7 @@ fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opn
         });
     }
     let out: Out<Vec<Opnd>> = Out::new();
-    if mode == Mode::G1 {
+    if g1_like(mode) {
         let vo: Out<ValueId> = Out::new();
         let v1 = vo.clone();
         last = u.add("store.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| {
@@ -440,7 +752,7 @@ fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opn
         .param("atom", "mfma_scale_32x32x64_f8")
         .param("n", N1)
         .param("k", K1)
-        .param("epilogue", if mode == Mode::G1 { "map.relu_pack_fp8 -> store" } else { "map.relu_pack_fp8" })
+        .param("epilogue", match mode { Mode::G1 => "map.relu_pack_fp8 -> store", Mode::G1q(_) => "map.epilogue_chain(alpha, bias, act, row amax, fp8) -> store", _ => "map.relu_pack_fp8" })
         .handover(move |_b| {
             // the hand-over is recorded on the stage that produced it: the P words of GEMM 2's B operand
             let p = o4.get();
