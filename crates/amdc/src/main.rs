@@ -13,10 +13,11 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  amdc list");
     eprintln!("  amdc dump <kernel>");
-    eprintln!("  amdc print-ir <kernel> [--stage dsl|mir|mir-ra]");
+    eprintln!("  amdc print-ir <kernel>|--from-ir <file> [--stage dsl|mir|mir-ra] [--out <file>]");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
     eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
     eprintln!("  amdc regplan <kernel> [--specialize ..]   per weave-region / stage register peaks (allocator truth) + register-plan report");
+    eprintln!("  amdc ir-check <file.ir> [--verify]      parse + check an irv1 DSL IR file (docs/ir-text.md); --from-ir <file> works with emit / gpu-verify / jit-info / print-ir / regplan");
     eprintln!("  amdc jit-info <kernel> [--specialize name=value[,..]] [--backend ..]   JSON metadata for the Python JIT (docs/jit.md)");
     eprintln!("  amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict] [--specialize ..]");
     eprintln!("      --backend llvm-tail runs the pinned llc tail (ROCM_LLVM_BIN overrides the tool dir);");
@@ -48,11 +49,39 @@ fn spec_bindings(args: &[String]) -> Result<Vec<(String, String)>, String> {
 /// The kernel `name`, specialized by the command line's bindings (exit code 2 on a bad binding).
 type Spec = (Vec<(String, u32, amdgpu_dsl::specialize::SpecValue)>, Vec<(u32, i64)>);
 
-fn kernel_spec(name: &str, args: &[String]) -> Result<(amdgpu_dsl::Function, Spec), ExitCode> {
-    let Some(f) = amdgpu_kernels::kernel_by_name(name) else {
+/// `--from-ir <file>` / `--from-ir=<file>`: the kernel comes from an irv1 text file instead of the registry (docs/ir-text.md).
+fn from_ir_path(args: &[String]) -> Option<String> {
+    args.windows(2).find(|w| w[0] == "--from-ir").map(|w| w[1].clone()).or_else(|| args.iter().find_map(|a| a.strip_prefix("--from-ir=").map(|s| s.to_string())))
+}
+
+/// The kernel of the command line: `--from-ir <file>` (parsed and checked) or the registered kernel `name`.
+fn load_kernel(name: &str, args: &[String]) -> Result<amdgpu_dsl::Function, ExitCode> {
+    if let Some(path) = from_ir_path(args) {
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("cannot read {path}: {e}");
+                return Err(ExitCode::from(2));
+            }
+        };
+        return amdgpu_dsl::ir_text::parse(&text).map_err(|e| {
+            eprintln!("{path}: {e}");
+            ExitCode::from(2)
+        });
+    }
+    amdgpu_kernels::kernel_by_name(name).ok_or_else(|| {
         eprintln!("unknown kernel: {name}");
-        return Err(ExitCode::from(2));
-    };
+        ExitCode::from(2)
+    })
+}
+
+/// `--from-ir` kernels and specialized kernels are verified strictly before use (unless `--no-verify`).
+fn must_verify(args: &[String], spec: &Spec) -> bool {
+    (from_ir_path(args).is_some() || !spec.0.is_empty()) && !args.iter().any(|a| a == "--no-verify")
+}
+
+fn kernel_spec(name: &str, args: &[String]) -> Result<(amdgpu_dsl::Function, Spec), ExitCode> {
+    let f = load_kernel(name, args)?;
     let binds = match spec_bindings(args) {
         Ok(b) => b,
         Err(e) => {
@@ -94,7 +123,7 @@ fn certify_specialized(f: &amdgpu_dsl::Function) -> Result<(), ExitCode> {
             let c = &f.contract;
             let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.sym_ranges.len();
             let errs = r.errors();
-            eprintln!("specialized {}: certificate: {} trusted assumes, {contracts} trusted contracts, {} unproven", f.name, l.total(), errs.len());
+            eprintln!("verified {}: certificate: {} trusted assumes, {contracts} trusted contracts, {} unproven", f.name, l.total(), errs.len());
             if errs.is_empty() {
                 Ok(())
             } else {
@@ -337,7 +366,7 @@ fn main() -> ExitCode {
                 match amdgpu_compiler::gpu_verify::analyse(&f) {
                     Ok(r) => {
                         let errs = r.errors().len();
-                        println!("== {name}: {} finding(s), {errs} error(s); proven {:?}", r.findings.len(), r.proven);
+                        println!("== {}: {} finding(s), {errs} error(s); proven {:?}", f.name, r.findings.len(), r.proven);
                         for fd in &r.findings {
                             if args.iter().any(|a| a == "-v") || fd.severity != amdgpu_compiler::gpu_verify::Severity::Info {
                                 println!("  [{}{}] {:?}: {}", fd.code, if fd.alias.is_empty() || fd.alias == fd.code { String::new() } else { format!("|{}", fd.alias) }, fd.severity, fd.msg);
@@ -430,21 +459,38 @@ fn main() -> ExitCode {
             }
         }
         "print-ir" => {
-            let Some(name) = args.get(1).filter(|s| !s.starts_with("--")) else { usage(); return ExitCode::from(2); };
+            let name = args.get(1).cloned().unwrap_or_default();
+            if name.is_empty() || (name.starts_with("--") && from_ir_path(&args).is_none()) { usage(); return ExitCode::from(2); }
             let stage = args.windows(2).find(|w| w[0] == "--stage").map(|w| w[1].as_str()).unwrap_or("dsl");
-            let Some(f) = amdgpu_kernels::kernel_by_name(name) else { eprintln!("unknown kernel: {name}"); return ExitCode::from(2); };
-            match stage {
-                "dsl" => { print!("{}", amdgpu_compiler::ir_print::print_dsl(&f)); ExitCode::SUCCESS }
+            let f = match load_kernel(&name, &args) { Ok(f) => f, Err(c) => return c };
+            let text = match stage {
+                "dsl" => amdgpu_compiler::ir_print::print_dsl(&f),
                 "mir" => match amdgpu_compiler::lower::lower(&f) {
-                    Ok(m) => { print!("{}", amdgpu_compiler::ir_print::print_mir(&m, None)); ExitCode::SUCCESS }
-                    Err(e) => { eprintln!("lower failed: {e}"); ExitCode::from(1) }
+                    Ok(m) => amdgpu_compiler::ir_print::print_mir(&m, None),
+                    Err(e) => { eprintln!("lower failed: {e}"); return ExitCode::from(1) }
                 },
                 "mir-ra" => match amdgpu_compiler::compile_mir_alloc(&f) {
-                    Ok((m, a)) => { print!("{}", amdgpu_compiler::ir_print::print_mir(&m, Some(&a))); ExitCode::SUCCESS }
-                    Err(e) => { eprintln!("compile failed: {e}"); ExitCode::from(1) }
+                    Ok((m, a)) => amdgpu_compiler::ir_print::print_mir(&m, Some(&a)),
+                    Err(e) => { eprintln!("compile failed: {e}"); return ExitCode::from(1) }
                 },
-                _ => { eprintln!("unknown stage {stage} (dsl|mir|mir-ra)"); ExitCode::from(2) }
+                _ => { eprintln!("unknown stage {stage} (dsl|mir|mir-ra)"); return ExitCode::from(2) }
+            };
+            // --out <file>: write the file directly (large kernels through a container's stdout pipe can be cut short)
+            match args.windows(2).find(|w| w[0] == "--out").map(|w| w[1].clone()) {
+                Some(p) => {
+                    if let Err(e) = fs::write(&p, &text) {
+                        eprintln!("cannot write {p}: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+                None => {
+                    use std::io::Write;
+                    let mut o = std::io::stdout().lock();
+                    let _ = o.write_all(text.as_bytes());
+                    let _ = o.flush();
+                }
             }
+            ExitCode::SUCCESS
         }
         "dump" => {
             let Some(name) = args.get(1) else {
@@ -462,6 +508,49 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "ir-check" => {
+            // amdc ir-check <file.ir> [--verify]: parse + check an irv1 file, re-print it (text fixpoint); --verify adds the strict GPU-semantics certificate
+            let Some(path) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let text = match fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("cannot read {path}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let f = match amdgpu_dsl::ir_text::parse(&text) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("{path}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let again = amdgpu_dsl::ir_text::print(&f);
+            let fix = amdgpu_dsl::ir_text::parse(&again).map(|g| format!("{g:?}") == format!("{f:?}")).unwrap_or(false);
+            println!(
+                "{path}: ok - kernel `{}`, {} statements, {} values, {} loop variables, {} args{}{}",
+                f.name,
+                f.stmts().len(),
+                f.value_tys.len(),
+                f.var_tys.len(),
+                f.args.len(),
+                if fix { "; re-print round-trips" } else { "; WARNING: re-print does not round-trip" },
+                if f.compile_profile.is_none() { "; note: profile None - the compile policy is derived from the kernel NAME" } else { "" }
+            );
+            if args.iter().any(|a| a == "--verify") {
+                if let Err(c) = certify_specialized(&f) {
+                    return c;
+                }
+            }
+            if fix {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
         "regplan" => {
             // amdc regplan <kernel> [--specialize ..]: per weave-region / stage register peaks of the allocated kernel + the plan's report
             let Some(name) = args.get(1) else {
@@ -474,7 +563,7 @@ fn main() -> ExitCode {
             };
             match amdgpu_compiler::compile_mir_alloc(&f) {
                 Ok((m, a)) => {
-                    println!("{name}: arch VGPRs {} AGPRs {}", a.max_v, amdgpu_compiler::regalloc::agpr_count(&m, &a));
+                    println!("{}: arch VGPRs {} AGPRs {}", f.name, a.max_v, amdgpu_compiler::regalloc::agpr_count(&m, &a));
                     for p in amdgpu_compiler::regplan::region_report(&m, &a) {
                         println!(
                             "region {:<28} insts {:>5}  vgpr footprint {:>3}  live dwords {:>3}  agpr footprint {:>3}  peak at b{} i{}: {}",
@@ -508,7 +597,7 @@ fn main() -> ExitCode {
                 Ok(x) => x,
                 Err(c) => return c,
             };
-            if !spec.0.is_empty() {
+            if must_verify(&args, &spec) {
                 if let Err(c) = certify_specialized(&f) {
                     return c;
                 }
@@ -521,7 +610,11 @@ fn main() -> ExitCode {
             };
             match amdgpu_compiler::compile_with(&f, tail.as_ref()) {
                 Ok(c) => {
-                    println!("{}", amdc::jit::info_json(&f, &spec.0, &spec.1, tail.name(), amdc::jit::resources(&c.asm)));
+                    let source = match from_ir_path(&args).and_then(|p| fs::read_to_string(p).ok()) {
+                        Some(t) => format!("ir:{}", amdc::jit::fnv_hex(&t)),
+                        None => "registry".to_string(),
+                    };
+                    println!("{}", amdc::jit::info_json_src(&f, &spec.0, &spec.1, tail.name(), amdc::jit::resources(&c.asm), &source));
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -539,7 +632,7 @@ fn main() -> ExitCode {
                 Ok(x) => x,
                 Err(c) => return c,
             };
-            if !spec.0.is_empty() {
+            if must_verify(&args, &spec) {
                 if let Err(c) = certify_specialized(&f) {
                     return c;
                 }
