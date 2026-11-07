@@ -857,8 +857,11 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
         // clamps (no-ops for N % 8 == 0, H <= 32) bound the logical ids for the verifier
         let rc = b.bind_i32(ev(r).max(0).min(ev(xq) - 1));
         let yc = b.bind_i32(ev(y).max(0).min(ev(hh) - 1));
+        // wave-uniform: back to SGPRs like the workgroup ids (otherwise the address math downstream turns vector)
         let qt = b.bind_i32(ev(ok).eq(1).select_i32(ev(rc), ev(x0)));
         let hi = b.bind_i32(ev(ok).eq(1).select_i32(ev(yc), ev(y0)));
+        let qt = b.read_first_lane(qt);
+        let hi = b.read_first_lane(hi);
         (qt, hi)
     } else {
         (b.let_(amdgpu_dsl::Op::WorkgroupIdX), b.let_(amdgpu_dsl::Op::WorkgroupIdY))
