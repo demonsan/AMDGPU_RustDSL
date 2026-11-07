@@ -120,6 +120,22 @@ pub fn compose<'a>(phase: &str, insts: Vec<StageInst<'a>>) -> (Weaver<'a>, Vec<(
     (Weaver::new(u).phase(phase.to_string()), info)
 }
 
+/// Several stage instances merged into ONE stage instance (one `Node::Stage` region named `name` with `contract`): their units interleave under
+/// the kernel's weave order. The members' keys and parameters are recorded as parameters of the merged instance.
+pub fn merge<'a>(name: &str, contract: StageContract, insts: Vec<StageInst<'a>>) -> StageInst<'a> {
+    let mut u = Units::new();
+    let mut params = Vec::new();
+    for inst in insts {
+        assert!(inst.handover.is_none() && inst.prebind.is_none(), "merge: stage {} has a hand-over / prebind (attach them to the merged instance)", inst.name);
+        params.push((inst.name.clone(), inst.key.to_string()));
+        params.extend(inst.params.into_iter().map(|(k, v)| (format!("{}.{k}", inst.name), v)));
+        u.append(inst.units, &[]);
+    }
+    let mut m = StageInst::new("merged", Prim::A, name, contract, u);
+    m.params = params;
+    m
+}
+
 /// One stage kind of the registry.
 #[derive(Clone, Copy, Debug)]
 pub struct StageDesc {
