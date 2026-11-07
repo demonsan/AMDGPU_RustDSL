@@ -11,6 +11,7 @@ use amdgpu_tile::dma::{issue_rows_shared, partition_dma, DmaPart};
 use amdgpu_tile::mma::{gemm, make_tiled_mma, TiledMma};
 use amdgpu_tile::{contract, Ctx};
 pub mod io;
+pub mod graph;
 
 use io::{combine_kernel, FmhaBlock, FmhaIo};
 use amdgpu_tile::frag::{AccTile, Frag, QkOut, B32x32x64Fp8, C32x32F32};
