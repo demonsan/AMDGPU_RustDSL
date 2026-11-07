@@ -13,6 +13,7 @@ pub enum Node {
     Loop { vars, init, body },                                      // begin_loop .. end_loop（do-while；BreakIf 在 body 内）
     If { cond, then, els: Option<Vec<Node>> },                      // begin_if .. [else_ ..] end_if
     Region { kind: Produce | Consume, tile, slot, version, body },   // tile_produce / tile_consume / buf_produce / buf_consume .. tile_end
+    Stage { name, contract, body },                                 // stage(name, StageContract, ..)：融合 stage 边界（GV-STAGE）
 }
 ```
 
@@ -21,6 +22,10 @@ pub enum Node {
 
 迁移前的普查（111 个 kernel：`amdc list` + v3 / dsl / GEMM）：1495 个 tile 标记全部由显式 `tile_end` 关闭，没有一个跨越循环/分支边界，
 所以 `Region` 节点与原来的标记语义一一对应；所有 kernel 共 99 个循环、159 个 if、1111 个区域。
+
+编织区域（`weave_region_begin/end`、`weave_region`）不是树节点，而是一对无代码的 `Stmt::RegionMark` 语句（begin / end 必须在同一结构块内，
+IR 验证器检查）；lowering 用它和 `Stage` 给 MIR 指令打区域标（寄存器规划 [`weaver-regs.md`](weaver-regs.md)、按区域调度 [`weaver-sched.md`](weaver-sched.md)）。
+文本形式（`irv1`，[`ir-text.md`](ir-text.md)）把树写成显式块：`loop vars .. init .. { }`、`if .. { } else { }`、`region .. { }`、`stage .. { }`。
 
 ## 2. 构建 API
 
@@ -43,11 +48,11 @@ b.produce_region("K", slot, gen, |b| { ...stores... });   // consumers: tile_con
 | 消费者 | 读法 |
 |---|---|
 | lowering（`lower.rs`） | **遍历树**：`walk` 递归节点，在区域边界调用同一个 `lower_stmt`（标记处理器维护标签 / 快照栈），输出与线性遍历逐字节相同 |
-| `gpu_verify`、`gpu_protocol`、DSL `verify` / `lint`、表达式层计数 | 读线性视图（语句下标就是证书和诊断里的 `stmt N`；协议模拟器按下标切片） |
+| `gpu_verify`、`gpu_protocol`、DSL `verify`、表达式层计数 | 读线性视图（语句下标就是证书和诊断里的 `stmt N`；协议模拟器按下标切片） |
 
 线性视图与树同源，所以这些消费者看到的也是配对的结构；把它们改成直接递归树是后续工作，不改变语义。
 
-## 5. 验证
+## 5. 验证（合入时的记录）
 
 - `amdc list` 的 101 个 kernel（own 后端）与 v3 / dsl / 旧手写 / GEMM v3 / v4 的汇编 md5 与 Main `1c3c9cf` 逐字节相同；
 - 严格证书不变（`--shipped` 24 / 100 / 0；当时还有旧手写集 `--legacy` 44 / 216 / 0，该集已删除）；
