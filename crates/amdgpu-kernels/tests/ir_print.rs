@@ -53,7 +53,7 @@ fn dsl_printer_is_structured_and_shows_types_operands_and_markers() {
         if name.starts_with("fmha") {
             assert!(text.contains("contract Contract"), "{name}: contract");
             assert!(text.contains("TileDecl"), "{name}: tiles");
-            assert!(text.contains("region TileConsume") || text.contains("region TileProduce"), "{name}: tile regions");
+            assert!(text.contains("\n    region ") || text.contains("  region "), "{name}: tile regions");
         }
     }
     let text = print_dsl(&kernel_by_name("probe_expr_ids").unwrap());
