@@ -95,13 +95,14 @@ pub fn rmsnorm_quant_fp8(name: &str, n: i64) -> Function {
     let me1 = me.clone();
     let lane3 = &lane;
     u.add("rms.reduce", UnitClass::Valu, Hint::Skeleton, &[], move |b| {
-        let mut sq = Vec::with_capacity(nv);
+        // streamed per fragment (8 squares, then a running sum): the unpacked row never lives in registers at once
+        let mut part: Option<ValueId> = None;
         for f in x3.get() {
-            for x in bf16x8_to_f32(b, f) {
-                sq.push(b.mul_f32(x, x));
-            }
+            let sq: Vec<ValueId> = bf16x8_to_f32(b, f).iter().map(|&x| b.mul_f32(x, x)).collect();
+            let s = lane_reduce(b, RedOp::Sum, &sq);
+            part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
         }
-        let part = lane_reduce(b, RedOp::Sum, &sq);
+        let part = part.expect("values");
         let tot = wave_reduce(b, RedOp::Sum, part, &me1, 0, 0, lane3);
         let inv_n = b.c_f32(1.0 / n as f32);
         let mean = b.mul_f32(tot, inv_n);
