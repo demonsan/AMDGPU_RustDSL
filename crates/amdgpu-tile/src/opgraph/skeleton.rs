@@ -267,7 +267,6 @@ pub fn generate(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str) -> Re
 const HOOKS: &[(&str, &str, &str, &str)] = &[
     ("stage", "role: Role, key0: &I32, slot: &SlotIdx", "role, key0, slot", ""),
     ("stage_complete", "role: Role, slot: &SlotIdx", "role, slot", ""),
-    ("defer_stage", "role: Role, key0: &I32, slot: &SlotIdx", "role, key0, slot", ""),
     ("prologue_stores", "role: Role", "role", ""),
     ("prologue_compute", "role: Role, t0: &TileIt", "role, t0", ""),
     ("loop_state", "", "", " -> Vec<(DType, Opnd)>"),

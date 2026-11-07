@@ -20,13 +20,10 @@ pub struct Recipe {
     pub b131: f32,
     /// LUT correction of the fp8 conversion (short sequences)
     pub lut: bool,
-    /// fast reference path (`decide_scaled`): above this scaled max the rebase is exact (S += delta, aligned max); below it whole 1/512 units
-    /// through the conversion scale
-    pub hi_thr: f32,
 }
 impl Recipe {
     pub fn vsx(lut: bool) -> Recipe {
-        Recipe { thr: 120.0 / 512.0, b131: 131.0 / 512.0, lut, hi_thr: 0.45 }
+        Recipe { thr: 120.0 / 512.0, b131: 131.0 / 512.0, lut }
     }
 }
 
@@ -102,42 +99,25 @@ impl OnlineSoftmax {
     /// The decision of one tile: row max, the new reference word (an SSA value, also written to the bias variable exactly once), and the rollback branch
     /// rescaling `s`, `o` and the row sum. Returns the new bias word (the C input of the next tile's bias MFMAs).
     pub fn decide(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> ValueId {
-        self.decide_opts(b, s, o, mask, true, None)
+        self.decide_impl(b, s, o, mask, true)
     }
     /// `decide` without writing the bias variable (`write_bias = false`): the caller writes it later with `commit_bias` (`_t128` writes it at the END of
     /// its window; writing it early lengthens the live range of the old word and made the scheduler fall back, 494 -> 410 TFLOP/s).
     pub fn decide_deferred(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> ValueId {
-        self.decide_opts(b, s, o, mask, false, None)
+        self.decide_impl(b, s, o, mask, false)
     }
     /// Writes the new bias word (once per iteration, after every read of the old one).
     pub fn commit_bias(&self, b: &mut FnBuilder, nb: ValueId) {
         b.set_var(self.bias.expect("OnlineSoftmax: state not bound"), nb);
     }
-    /// `decide` with the rebase of the CURRENT scores folded into the fp8 conversion: instead of `S += delta` (32 `v_pk_add_f32` on the
-    /// rollback path, which runs on most tiles), the conversion scale (the `v_cvt_scalef32` operand) is `2^(512 delta)` - the same factor
-    /// `O` and `l` are rescaled with, so P = fp8(S' + delta) up to the pknorm rounding. A huge jump of the max (x = m > 0.45: the bf16 exponent
-    /// 512 x would leave the finite range) still adds `delta` to S and converts with scale 1. Returns (new bias word, conversion scale).
-    pub fn decide_scaled(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>) -> (ValueId, ValueId) {
-        let mut sc = None;
-        let nb = self.decide_impl(b, s, o, mask, true, None, Some(&mut sc));
-        (nb, sc.expect("scale"))
-    }
-    fn decide_opts(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, write_bias: bool, seed: Option<ValueId>) -> ValueId {
-        self.decide_impl(b, s, o, mask, write_bias, seed, None)
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn decide_impl(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, write_bias: bool, seed: Option<ValueId>, scaled: Option<&mut Option<ValueId>>) -> ValueId {
+    fn decide_impl(&self, b: &mut FnBuilder, s: &AccTile<C32x32F32, 4>, o: &AccTile<C32x32F32, 4>, mask: Option<&KeyMask>, write_bias: bool) -> ValueId {
         let bias2 = self.bias.expect("OnlineSoftmax: state not bound");
         let mut flat: Vec<ValueId> = Vec::with_capacity(64);
         for i in 0..4usize {
             flat.extend(masked_values(b, s, i, mask, self.neg_big));
         }
         let mt = row_max(b, &flat);
-        let thr = match seed {
-            Some(sd) => b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(sd), a: Opnd::Val(self.neg_big), b: Opnd::Val(self.thr) }),
-            None => self.thr,
-        };
-        let grow = b.cmp_lt_f32(thr, mt);
+        let grow = b.cmp_lt_f32(self.thr, mt);
         // two-word reference: b_old = 4 (hi + lo); b_new = b_old + (b131 - m); quantised again into two f16 words
         let w_old_u = b.frag2_lane(Opnd::Var(bias2), 0);
         let w_old = b.bitcast_i32(w_old_u);
@@ -148,23 +128,7 @@ impl OnlineSoftmax {
         let c025 = b.c_f32(0.25);
         let sum_o = b.add_f32(hi_o, lo_o);
         let b_old = b.mul_f32(sum_o, c4f);
-        let tt0 = b.sub_f32(self.b131, mt);
-        // scaled conversion: the shift is a whole number of 1/512 units (round to nearest via the 1.5 x 2^23 magic), so the factor 2^(512 delta) is
-        // an exact power of two - what the conversion's E8M0-style scale applies - and stays equal to the O / l rescale
-        // the exact (aligned) rebase when the max rises past `hi_thr` (rare after the first tile): S += delta, scale 1
-        let hi_thr = b.c_f32(self.recipe.hi_thr);
-        let big = b.cmp_lt_f32(hi_thr, mt);
-        let tt = if scaled.is_some() {
-            let t512 = b.mul_f32(tt0, self.c512);
-            let magic = b.c_f32(12_582_912.0);
-            let up = b.add_f32(t512, magic);
-            let rn = b.sub_f32(up, magic);
-            let inv512 = b.c_f32(1.0 / 512.0);
-            let tr = b.mul_f32(rn, inv512);
-            b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(big), a: Opnd::Val(tt0), b: Opnd::Val(tr) })
-        } else {
-            tt0
-        };
+        let tt = b.sub_f32(self.b131, mt);
         let b_new = b.add_f32(b_old, tt);
         let q = b.mul_f32(b_new, c025);
         let h_raw = b.let_(Op::CvtF32ToF16(Opnd::Val(q)));
@@ -182,35 +146,6 @@ impl OnlineSoftmax {
         let nb = b.frag2(w_new, w_new);
         if write_bias {
             b.set_var(bias2, nb);
-        }
-        if let Some(out) = scaled {
-            // the factor of this tile (1 when the lane does not roll back: delta = 0)
-            let ex = b.mul_f32(delta, self.c512);
-            let corr = b.exp2_f32(ex);
-            // the v_cvt_scalef32 operand DIVIDES (x / scale): the factor 2^(512 delta) is the scale 2^(-512 delta)
-            let nex = b.sub_f32(self.zero_f, ex);
-            let inv = b.exp2_f32(nex);
-            *out = Some(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(big), a: Opnd::Val(self.one_f), b: Opnd::Val(inv) }));
-            b.begin_if(Opnd::Val(grow));
-            {
-                let cd = b.frag2_dup(corr);
-                for a in &o.accs {
-                    b.var_scale_pk(a.var, cd);
-                }
-                self.scale_l(b, corr);
-            }
-            b.end_if();
-            // the branch has no exec mask: lanes that are not `big` (scaled path) must add 0
-            let dbig = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(big), a: Opnd::Val(delta), b: Opnd::Val(self.zero_f) });
-            b.begin_if(Opnd::Val(big));
-            {
-                let dupd = b.frag2_dup(dbig);
-                for a in &s.accs {
-                    b.var_add_pk(a.var, dupd);
-                }
-            }
-            b.end_if();
-            return nb;
         }
         b.begin_if(Opnd::Val(grow));
         {
@@ -352,6 +287,3 @@ impl OnlineSoftmax {
         b.add_f32(lg, nb)
     }
 }
-
-/// Marker type use (keeps the smfmac accumulator layout visible in signatures that take `la`).
-pub type RowSumAcc = crate::frag::Acc<C16x16F32>;

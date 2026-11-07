@@ -696,7 +696,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         b.stamp_store(buf, rec, 0, t0); // slot 0: kernel start
         (buf, rec, mode == "tiles")
     });
-    // XCD-aware raster (FMHA_ABLATE=xcd, experiment): workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
+    // XCD-aware raster: workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
     // give every XCD whole 4 x 4 blocks of tiles (4 A + 4 B panels instead of all A panels). Only for a 16 x 16 tile grid here; identity otherwise.
     let (bx, by) = {
         let okv = b.bind_i32((ev(n_v) ^ (16 * cfg.cta_n) as i32) | (ev(m_v) ^ (16 * cfg.cta_m) as i32));
@@ -802,11 +802,9 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let panel = Panel { sh, b_base: PANEL_KB * 256, tr, b_dw, sfa: SfaJob { voff, pso, sel1, sel2, dst, bvo, bsh, bdst } };
 
     let mut pipe = Pipeline::new(Cadence::RegStaged, kb_v, k_v, 128, Ext::ka(84));
-    pipe.unroll2 = true;
-    pipe.late_tile1 = true;
+    // two tiles per pass, static slots; tile 1 staged after the scale-panel stores with its DMAs in flight at the prologue barrier
     pipe.late_tile1_vm = (a_dma.issues.len() + b_dma.issues.len()) as u8;
     pipe.scalar_exit = true;
-    pipe.vm_inflight = (a_dma.issues.len() + b_dma.issues.len() + 2) as u8;
     // operand read partitions (the wave offset added to the bases)
     let mut a_rd = copy_a.partition_lds(b, &ctx, &s_lane, &a_s, &a_view, &a_place);
     let mut b_rd = copy_b.partition_lds(b, &ctx, &s_lane, &b_s, &view, &b_place);

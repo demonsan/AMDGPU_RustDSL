@@ -26,20 +26,14 @@ pub enum Cadence {
     OneWindow,
     /// 2-slot ring with the operands staged through REGISTERS (the aiter 4-wave GEMM): the body keeps tile t in registers (loop state) and, while
     /// computing it, reloads them in place from the slot of tile t+1; one wait + barrier per tile publishes t+1 and frees the slot of t, which then
-    /// receives tile t+2 (one tile of DMA latency hidden behind the compute, the LDS reads of t+1 behind the MMAs of t):
+    /// receives tile t+2. Two tiles per loop pass with STATIC ring slots (0 then 1: the tile counter is even at the top; the vendor `u2`), the loop
+    /// may exit between the two halves:
     /// ```text
-    /// prologue: stage(0) | stage(1) | stores | wait_vm(0) wait_lds(0) barrier | compute(0) = load tile 0 into registers
-    /// loop t:   wait_vm(0) wait_lds(0) barrier | stage(t+2) -> slot(t) | m_phase(t): MMAs of t + in-place loads of t+1 (`t.next`)
+    /// prologue: stage(0) | stores | stage(1) | wait_vm(tile1_vm) wait_lds(0) barrier | compute(0) = load tile 0 into registers
+    /// loop t:   pre_sync(t) | wait_vm(0) wait_lds(0) post_wait(t) barrier | stage(t+2) -> slot(t) | m_phase(t): MMAs of t + in-place loads of t+1
     /// tail:     m_phase (no loads: `staged` = false)
     /// ```
     RegStaged,
-    /// 2-slot ring, one group, ONE barrier per tile (prefetch distance 1, for tiles whose 3 slots do not fit the LDS):
-    /// ```text
-    /// prologue: stage(0) wait_vm(0) | stores | wait_vm(0) wait_lds(0) barrier | compute(0) wait_lds(0)
-    /// loop t:   stage(t+1) | window(t) | wait_vm(0) wait_lds(0) barrier
-    /// ```
-    /// The barrier both publishes tile t+1 and retires the reads of tile t before stage(t+2) overwrites its slot.
-    TwoSlot,
 }
 
 /// One iteration of the pipeline as the body sees it.
@@ -74,11 +68,6 @@ pub trait PipeBody {
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx);
     /// Called right after the pipeline's `wait_vm(0)` that completes the stage of `slot` (e.g. the VGPR path of the K scales: `ds_write` them now).
     fn stage_complete(&mut self, _b: &mut FnBuilder, _role: Role, _slot: &SlotIdx) {}
-    /// `Pipeline::late_stage_b`: the stage of tile t+1 handed to the M phase of tile t (issued after the mid barrier, completed before the end
-    /// barrier); the default issues it at once.
-    fn defer_stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
-        self.stage(b, role, key0, slot)
-    }
     /// Constant LDS data written once before the first barrier (Q staging, ones block).
     fn prologue_stores(&mut self, _b: &mut FnBuilder, _role: Role) {}
     /// Work on tile 0 before the loop (e.g. QK(0)); its results usually become loop-state initial values.
@@ -110,9 +99,6 @@ pub struct Pipeline {
     pub tile_rows: i32,
     /// contract upper bound of the tile counter (e.g. `ceil(SK / 128)`)
     pub nkv_bound: Ext,
-    /// loop-variable order: [it, state.., idx] (the manual kernels' order; DEFAULT, measured +2.3% per-CU on the _vs128 port vs [it, idx, state..]) or,
-    /// when false, [it, idx, state..]; a register-allocation knob only
-    pub ring_var_last: bool,
     /// ring slot strides whose `slot * stride` offsets (cur, next, n2) are bound at the TOP of every iteration, like the manual `ring()` (otherwise the
     /// first consumer binds them, possibly late in the window: `_t128` measured 4 `v_mul_lo_u32` at the window head). E.g. `vec![32768, 512]`.
     pub prebind: Vec<i64>,
@@ -121,35 +107,11 @@ pub struct Pipeline {
     /// loading across the next window. Only valid when the body issues no other VMEM in the window and does not use `stage_complete` (the
     /// verifier checks the completion with the counted-vmcnt rule).
     pub vm_inflight: u8,
-    /// `TwoPhaseOffset`: drain this wave's LDS reads (`s_waitcnt lgkmcnt(0)`) before the mid-tile barrier (default). Off when the V phase issues
-    /// read-ahead `ds_read`s for the M phase (the vendor keeps them in flight across the barrier; the V phase writes no LDS, its DMA is
-    /// completed by the `wait_vm(0)`).
-    pub mid_lds_drain: bool,
-    /// `TwoPhaseOffset`: group B stages tile t+1 inside its M phase of tile t (`PipeBody::defer_stage`) instead of before the V phase: the slot it
-    /// writes (tile t-1's) is free after the end barrier of t-1, and the stage completes (`wait_vm(0)`) before the end barrier of t, i.e. before
-    /// group A, one phase ahead, reads it in its M phase of t+1.
-    pub late_stage_b: bool,
-    /// `RegStaged`: two tiles per loop pass with STATIC ring slots (0 then 1: the tile counter is even at the top), so the slot offsets are
-    /// constants (the vendor `u2`); the loop may exit between the two halves. (Measured on `TwoPhaseOffset` `_vs128`: -6..-11 %, not offered.)
-    pub unroll2: bool,
-    /// `RegStaged`: the vmcnt allowed at the top-of-tile wait (default 0). A body that publishes part of the stage later (its own wait + barrier
-    /// before the first read of that part) sets this to the number of DMAs issued after the part needed first.
-    pub top_vm: u8,
-    /// `RegStaged`: the DMAs of tile 1 (issued after tile 0) that may still be in flight at the prologue barrier (default 0)
-    pub prologue_vm: u8,
-    /// `RegStaged`: the body issued tiles 0 and 1 itself before `run` (as early as their addresses exist); the prologue skips those stages
-    pub pre_staged: bool,
-    /// DIAGNOSTIC (wrong results unless the body has no LDS traffic): no top-of-tile wait + barrier in RegStaged
-    pub ablate_no_sync: bool,
+    /// `RegStaged`: the DMAs of tile 1 (staged after `prologue_stores`) that may still be in flight at the prologue barrier: tile 1 is first read after
+    /// the loop's first top-of-tile wait + barrier
+    pub late_tile1_vm: u8,
     /// loop-exit bound through read_first_lane (scalar compare)
     pub scalar_exit: bool,
-    /// `RegStaged`: tile 1 staged after `prologue_stores`; the prologue wait then leaves `late_tile1_vm` (its DMAs) in flight
-    pub late_tile1: bool,
-    pub late_tile1_vm: u8,
-    /// with `late_tile1`: issue tile 1 after the prologue barrier and the tile-0 reads
-    pub tile1_after_barrier: bool,
-    /// compute the t+2 key after the barrier (the old order; A/B only)
-    pub key_late: bool,
     /// `TwoPhaseOffset`: the next tile's key without the clamp to the last tile (inside the loop t + 1 <= nkv - 1 holds; valid only when
     /// every stage reads through a range-checked buffer descriptor, so the verifier needs no clamp for the bounds)
     pub key_unclamped: bool,
@@ -158,15 +120,7 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new(cadence: Cadence, nkv: ValueId, kv_len: ValueId, tile_rows: i32, nkv_bound: Ext) -> Pipeline {
         assert!(tile_rows > 0 && (tile_rows as u32).is_power_of_two(), "Pipeline: tile rows must be a power of two");
-        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, ring_var_last: true, prebind: Vec::new(), vm_inflight: 0, unroll2: false, top_vm: 0, prologue_vm: 0, pre_staged: false, ablate_no_sync: false, scalar_exit: false, late_tile1: false, late_tile1_vm: 0, tile1_after_barrier: false, key_late: false, mid_lds_drain: true, late_stage_b: false, key_unclamped: false }
-    }
-    pub fn slots(&self) -> u32 {
-        match self.cadence {
-            Cadence::TwoPhaseOffset => 2,
-            Cadence::OneWindow => 3,
-            Cadence::RegStaged => 2,
-            Cadence::TwoSlot => 2,
-        }
+        Pipeline { cadence, nkv, kv_len, tile_rows, nkv_bound, prebind: Vec::new(), vm_inflight: 0, late_tile1_vm: 0, scalar_exit: false, key_unclamped: false }
     }
     fn lg(&self) -> i32 {
         self.tile_rows.trailing_zeros() as i32
@@ -181,7 +135,7 @@ impl Pipeline {
             n2: match self.cadence {
                 Cadence::OneWindow => Some(SlotIdx::new(2, 2)),
                 Cadence::RegStaged => Some(SlotIdx::new(0, 2)),
-                Cadence::TwoPhaseOffset | Cadence::TwoSlot => None,
+                Cadence::TwoPhaseOffset => None,
             },
             masked: false,
             staged: true,
@@ -189,18 +143,11 @@ impl Pipeline {
         };
         // ---- prologue ----
         let s0 = SlotIdx::new(0, 0);
-        if !self.pre_staged {
-            body.stage(b, role, &I32::c(0), &s0);
-        }
+        body.stage(b, role, &I32::c(0), &s0);
         if self.cadence != Cadence::RegStaged {
             // (RegStaged bodies do not use stage_complete: tile 0 completes at the prologue wait, overlapped with the stores)
             b.wait_vm(0);
             body.stage_complete(b, role, &s0);
-        }
-        if self.cadence == Cadence::RegStaged && !self.pre_staged && !self.late_tile1 {
-            // tile 1 into slot 1 (clamped as below); both complete at the prologue wait
-            let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
-            body.stage(b, role, &key1, &SlotIdx::new(1, 1));
         }
         if self.cadence == Cadence::OneWindow {
             // tile 1 (clamped to the last tile: a one-tile sequence re-stages tile 0 as generation 1)
@@ -211,24 +158,19 @@ impl Pipeline {
             body.stage_complete(b, role, &s1);
         }
         body.prologue_stores(b, role);
-        if self.cadence == Cadence::RegStaged && !self.pre_staged && self.late_tile1 && !self.tile1_after_barrier {
+        if self.cadence == Cadence::RegStaged {
             // tile 1 after the prologue stores; it lands behind the first tile and is published by the loop's first top barrier
             let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
             body.stage(b, role, &key1, &SlotIdx::new(1, 1));
         }
         // RegStaged: tile 1 is first read after the loop's top-of-tile wait + barrier, so its DMAs may stay in flight here (`prologue_vm`)
-        b.wait_vm(if self.cadence == Cadence::RegStaged { if self.late_tile1 { self.late_tile1_vm } else { self.prologue_vm } } else { 0 });
+        b.wait_vm(if self.cadence == Cadence::RegStaged { self.late_tile1_vm } else { 0 });
         b.wait_lds(0);
         b.barrier();
         if self.cadence == Cadence::TwoPhaseOffset && role == Role::B {
             b.barrier(); // group B runs one phase behind group A (A computes tile 0 before this barrier)
         }
         body.prologue_compute(b, role, &t0);
-        if self.cadence == Cadence::RegStaged && !self.pre_staged && self.late_tile1 && self.tile1_after_barrier {
-            // tile 1 behind the tile-0 fragment reads (slot 1 has no reader before the loop's first top barrier)
-            let key1 = b.let_i32(ev(self.nkv).gt(1).select_i32(1, ev(self.nkv) - 1) << self.lg());
-            body.stage(b, role, &key1, &SlotIdx::new(1, 1));
-        }
         b.wait_lds(0);
         if self.cadence == Cadence::TwoPhaseOffset {
             b.barrier();
@@ -241,16 +183,13 @@ impl Pipeline {
         inits[1].1 = Opnd::Val(z);
         let state = body.loop_state(b);
         let ns = state.len();
-        if self.ring_var_last {
-            let idx0 = inits.pop().expect("idx");
-            inits.extend(state);
-            inits.push(idx0);
-        } else {
-            inits.extend(state);
-        }
+        // loop-variable order [it, state.., idx] (the manual kernels' order: measured +2.3 % per-CU on the _vs128 port vs [it, idx, state..])
+        let idx0 = inits.pop().expect("idx");
+        inits.extend(state);
+        inits.push(idx0);
         let vars = b.begin_loop(&inits);
-        let (it, idx) = if self.ring_var_last { (vars[0], vars[1 + ns]) } else { (vars[0], vars[1]) };
-        body.bind_state(if self.ring_var_last { &vars[1..1 + ns] } else { &vars[2..] });
+        let (it, idx) = (vars[0], vars[1 + ns]);
+        body.bind_state(&vars[1..1 + ns]);
         b.assume_trusted(
             it,
             Ext::c(0),
@@ -267,7 +206,7 @@ impl Pipeline {
         };
         let stop = b.bind_cond(!varx(it).lt(&nkv_m1));
         b.break_if(stop);
-        if self.unroll2 && self.cadence == Cadence::RegStaged {
+        if self.cadence == Cadence::RegStaged {
             // `it` steps by 2 per pass (an affine counter for the protocol model); `idx` = which half the loop left from (0: after the pass, 1:
             // between the halves) - the last tile is it + idx, in slot idx
             // first half: tile `it` (even) in slot 0
@@ -322,7 +261,7 @@ impl Pipeline {
         }
     }
 
-    /// One `RegStaged` iteration of tile `it` (a bound value) in the static ring slot `slot` (unroll2).
+    /// One `RegStaged` iteration of tile `it` (a bound value) in the static ring slot `slot`.
     fn iter_rs(&self, b: &mut FnBuilder, role: Role, body: &mut dyn PipeBody, it: Opnd, slot: Opnd, masked: bool, staged: bool) {
         let nkv = ev(self.nkv);
         let it_p1 = b.let_i32(amdgpu_dsl::ox(it) + 1);
@@ -342,16 +281,13 @@ impl Pipeline {
         };
         self.prebind(b, &t);
         // the t+2 key (scalar) before the waits: right after the barrier the stage's first DMA issues at once (the vendor order)
-        let key_n2 = if staged && !self.key_late { Some(b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg())) } else { None };
+        let key_n2 = staged.then(|| b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg()));
         body.pre_sync(b, role, &t);
-        if staged {
-            if !self.ablate_no_sync {
-                b.wait_vm(self.top_vm);
-                b.wait_lds(0);
-                body.post_wait(b, role, &t);
-                b.barrier();
-            }
-            let key_n2 = key_n2.unwrap_or_else(|| b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg()));
+        if let Some(key_n2) = key_n2 {
+            b.wait_vm(0);
+            b.wait_lds(0);
+            body.post_wait(b, role, &t);
+            b.barrier();
             body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
         }
         body.m_phase(b, role, &t);
@@ -376,89 +312,26 @@ impl Pipeline {
                     tile_rows: self.tile_rows,
                 };
                 self.prebind(b, &t);
-                let late = self.late_stage_b && role == Role::B;
                 let key_n = staged.then(|| if self.key_unclamped { b.let_i32((varx(it) + 1) << self.lg()) } else { b.let_i32(nn << self.lg()) });
-                if staged && !late {
-                    body.stage(b, role, key_n.as_ref().expect("key"), &t.next);
+                if let Some(k) = &key_n {
+                    body.stage(b, role, k, &t.next);
                 }
                 body.v_phase(b, role, &t);
-                if staged && !late {
+                if staged {
                     b.wait_vm(0);
                     body.stage_complete(b, role, &t.next);
                 }
-                if self.mid_lds_drain {
-                    b.wait_lds(0);
-                }
+                b.wait_lds(0);
                 b.barrier();
-                if staged && late {
-                    body.defer_stage(b, role, key_n.as_ref().expect("key"), &t.next);
-                }
                 body.m_phase(b, role, &t);
-                if staged && late {
-                    b.wait_vm(0);
-                    body.stage_complete(b, role, &t.next);
-                }
                 b.wait_lds(0);
                 if last_barrier {
                     b.barrier();
                 }
                 i1
             }
-            Cadence::TwoSlot => {
-                let i1 = b.bind_i32(varx(idx) ^ 1);
-                let it_p1 = b.let_i32(varx(it) + 1);
-                let nn = it_p1.lt(&nkv).select_i32(&it_p1, &nkv - 1);
-                let t = TileIt {
-                    it: Opnd::Var(it),
-                    cur: SlotIdx::new(idx, it),
-                    next: SlotIdx::new(i1, b.bind_opnd(&it_p1)),
-                    n2: None,
-                    masked,
-                    staged,
-                    tile_rows: self.tile_rows,
-                };
-                self.prebind(b, &t);
-                if staged {
-                    let key_n = b.let_i32(nn << self.lg());
-                    body.stage(b, role, &key_n, &t.next);
-                }
-                body.window(b, role, &t);
-                if staged {
-                    b.wait_vm(0);
-                    b.wait_lds(0);
-                    b.barrier();
-                }
-                i1
-            }
-            Cadence::RegStaged => {
-                let i1 = b.bind_i32(varx(idx) ^ 1);
-                let it_p1 = b.let_i32(varx(it) + 1);
-                let it_p2 = b.let_i32(varx(it) + 2);
-                let t = TileIt {
-                    it: Opnd::Var(it),
-                    cur: SlotIdx::new(idx, it),
-                    next: SlotIdx::new(i1, b.bind_opnd(&it_p1)),
-                    // tile t+2 reuses the slot of tile t (its registers were loaded in the previous iteration)
-                    n2: Some(SlotIdx::new(idx, b.bind_opnd(&it_p2))),
-                    masked,
-                    staged,
-                    tile_rows: self.tile_rows,
-                };
-                self.prebind(b, &t);
-                body.pre_sync(b, role, &t);
-                if staged {
-                    if !self.ablate_no_sync {
-                        b.wait_vm(self.top_vm);
-                        b.wait_lds(0);
-                        body.post_wait(b, role, &t);
-                        b.barrier();
-                    }
-                    let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
-                    body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
-                }
-                body.m_phase(b, role, &t);
-                i1
-            }
+            // RegStaged runs two tiles per pass with static slots (`iter_rs`)
+            Cadence::RegStaged => unreachable!("Pipeline: RegStaged iterations are emitted by iter_rs"),
             Cadence::OneWindow => {
                 let i1 = b.bind_i32(varx(idx).lt(2).select_i32(varx(idx) + 1, 0));
                 let i2 = b.bind_i32(I32::c(0).lt(varx(idx)).select_i32(varx(idx) - 1, 2));

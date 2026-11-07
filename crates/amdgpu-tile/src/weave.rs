@@ -146,10 +146,6 @@ impl<'a> Units<'a> {
     pub fn unit(&self, id: UnitId) -> &Unit<'a> {
         &self.v[id]
     }
-    /// Ids of the units with hint `h`, in declaration order.
-    pub fn with_hint(&self, h: Hint) -> Vec<UnitId> {
-        (0..self.v.len()).filter(|&i| self.v[i].hint == h).collect()
-    }
     /// Emits every unit in declaration order (the stage's own order: what the stage emitted before it returned units).
     pub fn emit_all(self, b: &mut FnBuilder) {
         Weaver::new(self).seq().emit(b);
@@ -171,9 +167,6 @@ impl<'a> Weaver<'a> {
     pub fn phase(mut self, label: impl Into<String>) -> Weaver<'a> {
         self.label = label.into();
         self
-    }
-    pub fn units(&self) -> &Units<'a> {
-        &self.units
     }
     /// Declaration order.
     pub fn seq(mut self) -> Weaver<'a> {

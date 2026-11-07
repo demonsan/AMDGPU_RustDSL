@@ -29,13 +29,6 @@ pub enum Swz {
 impl Layout {
     /// The FMHA K/V tile layout: 128-byte rows, `Swz::Fmha`.
     pub const FMHA_SWZ: Layout = Layout::Rows { row_bytes: 128, swz: Swz::Fmha };
-    /// Swizzled chunk index of chunk `c` of row `r`.
-    pub fn chunk(&self, b: &mut FnBuilder, r: &I32, c: &I32) -> I32 {
-        match self {
-            Layout::Rows { swz: Swz::Fmha, .. } => c ^ fmha_swz(b, r),
-            _ => c.clone(),
-        }
-    }
 }
 
 /// The FMHA swizzle `s(r)` of a row index (the four bit extractions are bound first, in the order of the manual `swz_s`, then combined).
@@ -221,10 +214,6 @@ impl LdsPlan {
     pub fn at(&mut self, off: i64) -> &mut LdsPlan {
         self.cursor = off;
         self
-    }
-    /// Current allocation cursor.
-    pub fn cursor(&self) -> i64 {
-        self.cursor
     }
     fn push(&mut self, s: Shared) -> Shared {
         assert!(!self.bufs.iter().any(|x| x.name == s.name), "LdsPlan: buffer `{}` declared twice", s.name);

@@ -400,7 +400,6 @@ fn exec_stmt(st: &Stmt, cx: &mut Ctx<'_>) -> bool {
     false
 }
 
-fn let_dst_of(_st: &Stmt) -> Option<ValueId> { None }
 
 fn frag_tags(v: V) -> Vec<Tag> {
     match v { V::Frag { bytes, .. } => bytes, _ => Vec::new() }

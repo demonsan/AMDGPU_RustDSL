@@ -109,9 +109,6 @@ impl<L: FragLayout, const N: usize> AccTile<L, N> {
         assert_eq!(v.len(), N);
         AccTile { accs: std::array::from_fn(|i| Acc::wrap(v[i])) }
     }
-    pub fn vars(&self) -> [VarId; N] {
-        std::array::from_fn(|i| self.accs[i].var)
-    }
 }
 impl<const N: usize> AccTile<C32x32F32, N> {
     /// The 16 f32 values of accumulator `i` of this lane (`frag16_lane` + bitcast).

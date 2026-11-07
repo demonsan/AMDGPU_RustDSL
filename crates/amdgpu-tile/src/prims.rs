@@ -119,26 +119,7 @@ pub fn wave_reduce(b: &mut FnBuilder, op: RedOp, x: ValueId, scratch: &PrivRef, 
 /// Largest finite e4m3 (fp8 OCP) magnitude.
 pub const FP8_E4M3_MAX: f32 = 448.0;
 
-/// Per-row fp8 (e4m3) quantization of the lane's values given the row's absolute maximum: `scale = max(amax, tiny) / 448`, `q = fp8(y / scale)`
-/// packed four per dword in value order. Returns (scale, packed words).
-pub fn quant_fp8_row(b: &mut FnBuilder, ys: &[ValueId], amax: ValueId) -> (ValueId, Vec<ValueId>) {
-    assert!(ys.len() % 4 == 0, "quant_fp8_row: a multiple of 4 values per lane");
-    let tiny = b.c_f32(1e-12);
-    let a = b.max_f32(amax, tiny);
-    let inv_max = b.c_f32(1.0 / FP8_E4M3_MAX);
-    let scale = b.mul_f32(a, inv_max);
-    let inv = b.rcp_f32(scale);
-    let words = ys
-        .chunks(4)
-        .map(|c| {
-            let q: Vec<ValueId> = c.iter().map(|&y| b.mul_f32(y, inv)).collect();
-            b.cvt_pk_fp8x4_f32(q[0], q[1], q[2], q[3])
-        })
-        .collect();
-    (scale, words)
-}
-
-/// The fp8 (e4m3) row scale and its reciprocal from the absolute maximum (`quant_fp8_row` in two steps, for streaming the values).
+/// The fp8 (e4m3) row scale and its reciprocal from the absolute maximum (with `fp8_pack`: the values can be streamed between the two).
 pub fn fp8_scale(b: &mut FnBuilder, amax: ValueId) -> (ValueId, ValueId) {
     let tiny = b.c_f32(1e-12);
     let a = b.max_f32(amax, tiny);

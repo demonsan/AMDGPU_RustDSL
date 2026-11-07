@@ -171,19 +171,7 @@ impl FmhaBlock {
     }
 }
 
-// ------------------------------------------------------------------------------------------------------------------------------------------------------
-// The attention body: per 128-key tile, QK (S = ones x bias + K Q^T), online softmax, PV + row sums
-// ------------------------------------------------------------------------------------------------------------------------------------------------------
 
-impl FmhaIo {
-    /// The lane's bf16 output row pointer (the clamped row, INCLUDING the lane-half term `8 (lane >> 5)` bytes) and the wave-live condition.
-    pub fn out_row(&self, b: &mut FnBuilder, blk: &FmhaBlock) -> (ValueId, ValueId) {
-        let o_tile = self.o.tile(vec![ev(blk.bidx), I32::c(0), ev(blk.hidx), I32::c(0)]).clamp(1, self.s_len.clone(), blk.s_last.clone());
-        let row_ptr = o_tile.ptr(b, &[I32::c(0), &blk.row0 + blk.lane.j(), I32::c(0), blk.lane.half() << 2]);
-        let live = b.bind_cond(blk.row0.lt(self.s_len.clone()));
-        (row_ptr, live)
-    }
-}
 impl FmhaIo {
     /// KV-split partial epilogue: `lse` and the fp16 `Ohat = O * fin` of the lane's row at partial row `split * rows_total + (b * S + row) * H + h`, through
     /// the wave's private transpose scratch `epi`. The scratch reuses the Q staging of the neighbouring waves, whose last reads may still be in flight
