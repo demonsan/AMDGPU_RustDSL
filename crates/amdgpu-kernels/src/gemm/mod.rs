@@ -344,7 +344,8 @@ impl Body {
     /// are read before the MMAs.
     fn compute_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
         let roles = vec!["all".to_string()];
-        let phase = b.barriers_so_far();
+        // pipelined loop: the linear barrier count is not a stable property (StageContract::ANY_PHASE)
+        let phase = amdgpu_dsl::StageContract::ANY_PHASE;
         let me: &Body = self;
         // the slot offsets of t + 1 are bound before the region (they are shared with the staging instance through the SlotIdx cache)
         let tt = t.clone();
@@ -435,7 +436,7 @@ impl Body {
             .param("staged", t.staged)
     }    /// The DMA of one tile (A issues, then B issues): soffset = the wave-uniform tile origin, M0 = the first 1 KB block of each group of 4 issues.
     fn stage_now(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx) {
-        let phase = b.barriers_so_far();
+        let phase = amdgpu_dsl::StageContract::ANY_PHASE;
         let sl = slot.clone();
         self.ab_stage(key0, slot, phase)
             .prebind(move |b| {

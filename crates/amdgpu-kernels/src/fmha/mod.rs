@@ -150,7 +150,7 @@ impl KvRing3 {
     /// The copies of the tile at `key0` into `slot` that `role` produces (as `KvRing::stage`).
     pub fn stage(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<ValueId> {
         if let Some(u) = self.stage_units(role, key0, slot) {
-            let c = StageContract { barrier_phase: b.barriers_so_far(), roles: vec!["group".into()], ..Default::default() };
+            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
             let sl = slot.clone();
             amdgpu_tile::stage::StageInst::new("move.kv_stage", amdgpu_tile::stage::Prim::M, "kv.stage", c, u)
                 .param("role", format!("{role:?}"))
@@ -473,7 +473,7 @@ impl PipeBody for AttnBody3<'_> {
                 let mut u = Units::new();
                 let d = u.add("softmax.decide", UnitClass::Branch, Hint::Anchor, &[], move |b| nb2.set(me.sm.decide_lazy(b, &s, &o, m1)));
                 u.add("softmax.convert", UnitClass::Valu, Hint::Filler, &[d], move |b| pw2.set(me.sm.convert(b, &s, m2, 0, 4)));
-                let c = StageContract { barrier_phase: b.barriers_so_far(), roles: vec!["group".into()], ..Default::default() };
+                let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
                 let (nb3, pw3) = (nb.clone(), pw.clone());
                 amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "v_phase", c, u)
                     .param("recipe", "vendor-lazy")
@@ -502,7 +502,7 @@ impl PipeBody for AttnBody3<'_> {
         let s = self.s.expect("S");
         // the matrix phase = stage `mma.pv` (tile t) then stage `mma.qk` (tile t + 1), merged into one region and woven in declaration order;
         // it consumes the P words (and the reference words of the lazy recipe) handed over by the softmax stage
-        let mut c = StageContract { barrier_phase: b.barriers_so_far(), roles: vec!["group".into()], ..Default::default() };
+        let mut c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
         if self.p_staged {
             c.live_in.push(p_val(w.clone()));
             c.scalars_in = bias_scalar(bias);
@@ -555,7 +555,7 @@ impl PipeBody for AttnBody3<'_> {
                 }
             }
             // the window = stage `online.softmax` (conversion chunks of tile t) woven with stage `mma.qk` (blocks of tile t + 1), alternating
-            let c = StageContract { barrier_phase: b.barriers_so_far(), roles: vec!["group".into()], ..Default::default() };
+            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
             let (nx, staged) = (t.next.clone(), t.staged);
             amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "window", c, u)
                 .param("with", "mma.qk blocks")

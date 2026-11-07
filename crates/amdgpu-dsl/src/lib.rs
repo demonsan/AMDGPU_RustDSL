@@ -655,6 +655,13 @@ pub struct StageContract {
     pub resources: StageResources,
 }
 
+impl StageContract {
+    /// `barrier_phase` value for a stage whose phase is not constrained: stages inside versioned / role branches and pipelined loops, where the
+    /// linear barrier count depends on which alternatives a transformation (e.g. the JIT specializer) keeps; their cross-wave ordering is proven
+    /// by the LDS tile protocol instead.
+    pub const ANY_PHASE: u32 = u32::MAX;
+}
+
 /// Statements: a flat sequence with explicit structured markers.
 #[derive(Clone, Debug)]
 pub enum Stmt {
