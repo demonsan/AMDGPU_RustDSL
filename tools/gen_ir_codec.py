@@ -199,11 +199,11 @@ def gen(defs):
                     w(f"            {name}::{vn} => {{}}")
                 elif vk == "tuple":
                     binds = [f"x{k}" for k in range(len(vd))]
-                    body = " ".join(ids_stmt(f"*{b}", t) for b, t in zip(binds, vd))
+                    body = " ".join(ids_stmt(f"(*{b})", t) for b, t in zip(binds, vd))
                     w(f"            {name}::{vn}(" + ", ".join(binds) + f") => {{ {body} }}")
                 else:
                     binds = [f for f, _ in vd]
-                    body = " ".join(ids_stmt(f"*{f}", t) for f, t in vd)
+                    body = " ".join(ids_stmt(f"(*{f})", t) for f, t in vd)
                     w(f"            {name}::{vn} {{ " + ", ".join(binds) + f" }} => {{ {body} }}")
             w("        }")
         w("    }")

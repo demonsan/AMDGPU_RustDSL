@@ -65,10 +65,10 @@ impl FromIr for Opnd {
 impl IrIds for Opnd {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
-            Opnd::Val(x0) => { fv(&mut *x0); }
-            Opnd::Var(x0) => { fr(&mut *x0); }
-            Opnd::I32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Opnd::F32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
+            Opnd::Val(x0) => { fv(&mut (*x0)); }
+            Opnd::Var(x0) => { fr(&mut (*x0)); }
+            Opnd::I32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Opnd::F32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
         }
     }
 }
@@ -165,88 +165,88 @@ impl FromIr for Op {
 impl IrIds for Op {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
-            Op::ConstI32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::ConstF32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::KernargI32 { offset } => { IrIds::ids(&mut *offset, fv, fr); }
-            Op::KernargF32 { offset } => { IrIds::ids(&mut *offset, fv, fr); }
-            Op::KernargPtr { offset } => { IrIds::ids(&mut *offset, fv, fr); }
-            Op::MemTimeLo { id } => { IrIds::ids(&mut *id, fv, fr); }
+            Op::ConstI32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::ConstF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::KernargI32 { offset } => { IrIds::ids(&mut (*offset), fv, fr); }
+            Op::KernargF32 { offset } => { IrIds::ids(&mut (*offset), fv, fr); }
+            Op::KernargPtr { offset } => { IrIds::ids(&mut (*offset), fv, fr); }
+            Op::MemTimeLo { id } => { IrIds::ids(&mut (*id), fv, fr); }
             Op::WorkitemId => {}
             Op::WorkgroupIdX => {}
             Op::WorkgroupIdY => {}
             Op::WorkgroupIdZ => {}
-            Op::AddI32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::MulI32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::ShlI32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::LshrI32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::AndI32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::MinI32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::XorI32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::AddF32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::SubF32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::MulF32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::MaxF32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::Max3F32(x0, x1, x2) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); IrIds::ids(&mut *x2, fv, fr); }
-            Op::FmaF32(x0, x1, x2) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); IrIds::ids(&mut *x2, fv, fr); }
-            Op::ExpF32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::RcpF32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::CvtF16ToF32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::CvtF32ToF16(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::CmpLtI32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::CmpGeI32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::CmpLtF32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::NotI1(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::Select { ty, cond, a, b } => { IrIds::ids(&mut *ty, fv, fr); IrIds::ids(&mut *cond, fv, fr); IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); }
-            Op::PtrAdd { base, byte_off } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); }
-            Op::LoadU16 { base, byte_off } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); }
-            Op::LoadF32 { base, byte_off } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); }
-            Op::LoadGlobalB128 { base, byte_off } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); }
-            Op::LoadF32Coherent { base, byte_off } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); }
-            Op::BufferRsrc { base, num_records } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *num_records, fv, fr); }
-            Op::BufferRsrcDyn { base, num_records } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *num_records, fv, fr); }
-            Op::BufferLoad { rsrc, voff, soff, imm, dwords } => { IrIds::ids(&mut *rsrc, fv, fr); IrIds::ids(&mut *voff, fv, fr); IrIds::ids(&mut *soff, fv, fr); IrIds::ids(&mut *imm, fv, fr); IrIds::ids(&mut *dwords, fv, fr); }
-            Op::BufferLoadB128x2 { rsrc, voff, soff, imm_lo, imm_hi } => { IrIds::ids(&mut *rsrc, fv, fr); IrIds::ids(&mut *voff, fv, fr); IrIds::ids(&mut *soff, fv, fr); IrIds::ids(&mut *imm_lo, fv, fr); IrIds::ids(&mut *imm_hi, fv, fr); }
-            Op::AtomicAddU32 { base, byte_off, value } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Op::LoadLdsB32 { addr } => { IrIds::ids(&mut *addr, fv, fr); }
-            Op::LoadLdsB128 { addr } => { IrIds::ids(&mut *addr, fv, fr); }
-            Op::LoadLdsB64 { addr } => { IrIds::ids(&mut *addr, fv, fr); }
-            Op::LoadLdsTrB8 { addr } => { IrIds::ids(&mut *addr, fv, fr); }
-            Op::LoadLdsTr4B8 { addrs } => { IrIds::ids(&mut *addrs, fv, fr); }
-            Op::LoadLdsB128x2 { lo, hi } => { IrIds::ids(&mut *lo, fv, fr); IrIds::ids(&mut *hi, fv, fr); }
-            Op::ReadFirstLane(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::DppQuadPerm { x, perm } => { IrIds::ids(&mut *x, fv, fr); IrIds::ids(&mut *perm, fv, fr); }
-            Op::Frag2(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::Frag2Lane { frag, index } => { IrIds::ids(&mut *frag, fv, fr); IrIds::ids(&mut *index, fv, fr); }
-            Op::VarSlice8 { var, half } => { fr(&mut *var); IrIds::ids(&mut *half, fv, fr); }
-            Op::Permlane32Swap { a, b } => { IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); }
-            Op::Frag4(x0, x1, x2, x3) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); IrIds::ids(&mut *x2, fv, fr); IrIds::ids(&mut *x3, fv, fr); }
-            Op::Frag4Lane { frag, index } => { IrIds::ids(&mut *frag, fv, fr); IrIds::ids(&mut *index, fv, fr); }
-            Op::MfmaF16 { a, b, c } => { IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); IrIds::ids(&mut *c, fv, fr); }
-            Op::MfmaF16Wide { a, b, c } => { IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); IrIds::ids(&mut *c, fv, fr); }
-            Op::Frag8(x0, x1, x2, x3, x4, x5, x6, x7) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); IrIds::ids(&mut *x2, fv, fr); IrIds::ids(&mut *x3, fv, fr); IrIds::ids(&mut *x4, fv, fr); IrIds::ids(&mut *x5, fv, fr); IrIds::ids(&mut *x6, fv, fr); IrIds::ids(&mut *x7, fv, fr); }
-            Op::CatFrag8(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::CvtPknormU16(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => { IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); IrIds::ids(&mut *c, fv, fr); IrIds::ids(&mut *scale_a, fv, fr); IrIds::ids(&mut *scale_b, fv, fr); }
-            Op::MfmaFp8_32x32x64 { a, b, c } => { IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); IrIds::ids(&mut *c, fv, fr); }
-            Op::SmfmacFp8_16x16x128 { a, b, idx, c } => { IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); IrIds::ids(&mut *idx, fv, fr); IrIds::ids(&mut *c, fv, fr); }
-            Op::Asm { block, inputs } => { IrIds::ids(&mut *block, fv, fr); IrIds::ids(&mut *inputs, fv, fr); }
-            Op::Frag16Lane { frag, index } => { IrIds::ids(&mut *frag, fv, fr); IrIds::ids(&mut *index, fv, fr); }
-            Op::FragZero { ty } => { IrIds::ids(&mut *ty, fv, fr); }
-            Op::BitcastF32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::BitcastI32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::CvtPkBf16F32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::Exp2F32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::Log2F32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::Frag2Dup(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::PkAddF32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::PkMulF32(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::CvtPkFp8x4F32(x0, x1, x2, x3) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); IrIds::ids(&mut *x2, fv, fr); IrIds::ids(&mut *x3, fv, fr); }
-            Op::PartnerMaxF32(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Op::CvtPknormP8x4(x0, x1, x2, x3, x4) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); IrIds::ids(&mut *x2, fv, fr); IrIds::ids(&mut *x3, fv, fr); IrIds::ids(&mut *x4, fv, fr); }
-            Op::PermB32(x0, x1, x2) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); IrIds::ids(&mut *x2, fv, fr); }
-            Op::PkSubU16(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::CvtPknormPair(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Op::CvtP8x4FromU16(x0, x1, x2) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); IrIds::ids(&mut *x2, fv, fr); }
+            Op::AddI32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::MulI32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::ShlI32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::LshrI32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::AndI32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::MinI32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::XorI32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::AddF32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::SubF32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::MulF32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::MaxF32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::Max3F32(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
+            Op::FmaF32(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
+            Op::ExpF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::RcpF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::CvtF16ToF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::CvtF32ToF16(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::CmpLtI32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::CmpGeI32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::CmpLtF32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::NotI1(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::Select { ty, cond, a, b } => { IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*cond), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Op::PtrAdd { base, byte_off } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); }
+            Op::LoadU16 { base, byte_off } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); }
+            Op::LoadF32 { base, byte_off } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); }
+            Op::LoadGlobalB128 { base, byte_off } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); }
+            Op::LoadF32Coherent { base, byte_off } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); }
+            Op::BufferRsrc { base, num_records } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*num_records), fv, fr); }
+            Op::BufferRsrcDyn { base, num_records } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*num_records), fv, fr); }
+            Op::BufferLoad { rsrc, voff, soff, imm, dwords } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
+            Op::BufferLoadB128x2 { rsrc, voff, soff, imm_lo, imm_hi } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm_lo), fv, fr); IrIds::ids(&mut (*imm_hi), fv, fr); }
+            Op::AtomicAddU32 { base, byte_off, value } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Op::LoadLdsB32 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
+            Op::LoadLdsB128 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
+            Op::LoadLdsB64 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
+            Op::LoadLdsTrB8 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
+            Op::LoadLdsTr4B8 { addrs } => { IrIds::ids(&mut (*addrs), fv, fr); }
+            Op::LoadLdsB128x2 { lo, hi } => { IrIds::ids(&mut (*lo), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Op::ReadFirstLane(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::DppQuadPerm { x, perm } => { IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*perm), fv, fr); }
+            Op::Frag2(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::Frag2Lane { frag, index } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*index), fv, fr); }
+            Op::VarSlice8 { var, half } => { fr(&mut (*var)); IrIds::ids(&mut (*half), fv, fr); }
+            Op::Permlane32Swap { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Op::Frag4(x0, x1, x2, x3) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); }
+            Op::Frag4Lane { frag, index } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*index), fv, fr); }
+            Op::MfmaF16 { a, b, c } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); }
+            Op::MfmaF16Wide { a, b, c } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); }
+            Op::Frag8(x0, x1, x2, x3, x4, x5, x6, x7) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); IrIds::ids(&mut (*x4), fv, fr); IrIds::ids(&mut (*x5), fv, fr); IrIds::ids(&mut (*x6), fv, fr); IrIds::ids(&mut (*x7), fv, fr); }
+            Op::CatFrag8(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::CvtPknormU16(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::MfmaScaleFp8_32x32x64 { a, b, c, scale_a, scale_b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale_a), fv, fr); IrIds::ids(&mut (*scale_b), fv, fr); }
+            Op::MfmaFp8_32x32x64 { a, b, c } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); }
+            Op::SmfmacFp8_16x16x128 { a, b, idx, c } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*idx), fv, fr); IrIds::ids(&mut (*c), fv, fr); }
+            Op::Asm { block, inputs } => { IrIds::ids(&mut (*block), fv, fr); IrIds::ids(&mut (*inputs), fv, fr); }
+            Op::Frag16Lane { frag, index } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*index), fv, fr); }
+            Op::FragZero { ty } => { IrIds::ids(&mut (*ty), fv, fr); }
+            Op::BitcastF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::BitcastI32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::CvtPkBf16F32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::Exp2F32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::Log2F32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::Frag2Dup(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::PkAddF32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::PkMulF32(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::CvtPkFp8x4F32(x0, x1, x2, x3) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); }
+            Op::PartnerMaxF32(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::CvtPknormP8x4(x0, x1, x2, x3, x4) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); IrIds::ids(&mut (*x4), fv, fr); }
+            Op::PermB32(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
+            Op::PkSubU16(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::CvtPknormPair(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::CvtP8x4FromU16(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
         }
     }
 }
@@ -270,15 +270,15 @@ impl FromIr for Ext {
 impl IrIds for Ext {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
-            Ext::Const(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Ext::Ka(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Ext::Grid(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Ext::Sym(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            Ext::Add(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Ext::Sub(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Ext::Mul(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Ext::CeilDiv(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
-            Ext::FloorDiv(x0, x1) => { IrIds::ids(&mut *x0, fv, fr); IrIds::ids(&mut *x1, fv, fr); }
+            Ext::Const(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Ext::Ka(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Ext::Grid(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Ext::Sym(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Ext::Add(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Ext::Sub(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Ext::Mul(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Ext::CeilDiv(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Ext::FloorDiv(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
         }
     }
 }
@@ -503,52 +503,52 @@ impl FromIr for Stmt {
 impl IrIds for Stmt {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
-            Stmt::StageBegin { name, contract } => { IrIds::ids(&mut *name, fv, fr); IrIds::ids(&mut *contract, fv, fr); }
+            Stmt::StageBegin { name, contract } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*contract), fv, fr); }
             Stmt::StageEnd => {}
-            Stmt::RegionMark { name, begin } => { IrIds::ids(&mut *name, fv, fr); IrIds::ids(&mut *begin, fv, fr); }
-            Stmt::TileProduce { tile, slot, version } => { IrIds::ids(&mut *tile, fv, fr); IrIds::ids(&mut *slot, fv, fr); IrIds::ids(&mut *version, fv, fr); }
-            Stmt::TileConsume { tile, slot, version } => { IrIds::ids(&mut *tile, fv, fr); IrIds::ids(&mut *slot, fv, fr); IrIds::ids(&mut *version, fv, fr); }
+            Stmt::RegionMark { name, begin } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*begin), fv, fr); }
+            Stmt::TileProduce { tile, slot, version } => { IrIds::ids(&mut (*tile), fv, fr); IrIds::ids(&mut (*slot), fv, fr); IrIds::ids(&mut (*version), fv, fr); }
+            Stmt::TileConsume { tile, slot, version } => { IrIds::ids(&mut (*tile), fv, fr); IrIds::ids(&mut (*slot), fv, fr); IrIds::ids(&mut (*version), fv, fr); }
             Stmt::TileEnd => {}
-            Stmt::Assume { target, lo, hi, trusted } => { IrIds::ids(&mut *target, fv, fr); IrIds::ids(&mut *lo, fv, fr); IrIds::ids(&mut *hi, fv, fr); IrIds::ids(&mut *trusted, fv, fr); }
-            Stmt::Let { dst, op } => { fv(&mut *dst); IrIds::ids(&mut *op, fv, fr); }
-            Stmt::StoreU16 { base, byte_off, value } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::StoreF32 { base, byte_off, value } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::StoreF32x4 { base, byte_off, value } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::StoreF32x2 { base, byte_off, value } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => { IrIds::ids(&mut *rsrc, fv, fr); IrIds::ids(&mut *voff, fv, fr); IrIds::ids(&mut *soff, fv, fr); IrIds::ids(&mut *imm, fv, fr); IrIds::ids(&mut *dwords, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => { IrIds::ids(&mut *rsrc, fv, fr); IrIds::ids(&mut *voff, fv, fr); IrIds::ids(&mut *soff, fv, fr); IrIds::ids(&mut *lds_addr, fv, fr); IrIds::ids(&mut *imm, fv, fr); IrIds::ids(&mut *dwords, fv, fr); }
-            Stmt::StoreF32Wt { base, byte_off, value } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::FenceRelease { wb } => { IrIds::ids(&mut *wb, fv, fr); }
-            Stmt::FenceAcquire { inv } => { IrIds::ids(&mut *inv, fv, fr); }
-            Stmt::StoreLdsB32 { addr, value } => { IrIds::ids(&mut *addr, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::StoreLdsB128 { addr, value } => { IrIds::ids(&mut *addr, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::StoreLdsB64 { addr, value } => { IrIds::ids(&mut *addr, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::WaitLds { count } => { IrIds::ids(&mut *count, fv, fr); }
+            Stmt::Assume { target, lo, hi, trusted } => { IrIds::ids(&mut (*target), fv, fr); IrIds::ids(&mut (*lo), fv, fr); IrIds::ids(&mut (*hi), fv, fr); IrIds::ids(&mut (*trusted), fv, fr); }
+            Stmt::Let { dst, op } => { fv(&mut (*dst)); IrIds::ids(&mut (*op), fv, fr); }
+            Stmt::StoreU16 { base, byte_off, value } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::StoreF32 { base, byte_off, value } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::StoreF32x4 { base, byte_off, value } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::StoreF32x2 { base, byte_off, value } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::BufferStore { rsrc, voff, soff, imm, dwords, value } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::BufferLoadLds { rsrc, voff, soff, lds_addr, imm, dwords } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*lds_addr), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
+            Stmt::StoreF32Wt { base, byte_off, value } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::FenceRelease { wb } => { IrIds::ids(&mut (*wb), fv, fr); }
+            Stmt::FenceAcquire { inv } => { IrIds::ids(&mut (*inv), fv, fr); }
+            Stmt::StoreLdsB32 { addr, value } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::StoreLdsB128 { addr, value } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::StoreLdsB64 { addr, value } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::WaitLds { count } => { IrIds::ids(&mut (*count), fv, fr); }
             Stmt::Barrier => {}
-            Stmt::SetPrio { prio } => { IrIds::ids(&mut *prio, fv, fr); }
-            Stmt::SchedGroup { mask, size, sync } => { IrIds::ids(&mut *mask, fv, fr); IrIds::ids(&mut *size, fv, fr); IrIds::ids(&mut *sync, fv, fr); }
-            Stmt::WaitVm { count } => { IrIds::ids(&mut *count, fv, fr); }
-            Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => { IrIds::ids(&mut *base, fv, fr); IrIds::ids(&mut *lds_addr, fv, fr); IrIds::ids(&mut *byte_off, fv, fr); IrIds::ids(&mut *dwords, fv, fr); }
-            Stmt::SetVar { var, value } => { fr(&mut *var); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::VarScaleF32 { var, scalar } => { fr(&mut *var); IrIds::ids(&mut *scalar, fv, fr); }
-            Stmt::VarScalePk { var, pair } => { fr(&mut *var); IrIds::ids(&mut *pair, fv, fr); }
-            Stmt::VarAddPk { var, pair } => { fr(&mut *var); IrIds::ids(&mut *pair, fv, fr); }
-            Stmt::VarMfmaF16Z { var, a, b } => { fr(&mut *var); IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); }
-            Stmt::VarScaleLane { var, index, scalar } => { fr(&mut *var); IrIds::ids(&mut *index, fv, fr); IrIds::ids(&mut *scalar, fv, fr); }
-            Stmt::VarSetLane { var, index, value } => { fr(&mut *var); IrIds::ids(&mut *index, fv, fr); IrIds::ids(&mut *value, fv, fr); }
-            Stmt::VarMfmaScale { var, a, b, scale_a, scale_b, opsel } => { fr(&mut *var); IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); IrIds::ids(&mut *scale_a, fv, fr); IrIds::ids(&mut *scale_b, fv, fr); IrIds::ids(&mut *opsel, fv, fr); }
-            Stmt::VarMfmaScaleC { var, a, b, c, scale_a, scale_b } => { fr(&mut *var); IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); IrIds::ids(&mut *c, fv, fr); IrIds::ids(&mut *scale_a, fv, fr); IrIds::ids(&mut *scale_b, fv, fr); }
-            Stmt::VarMfmaFp8 { var, a, b } => { fr(&mut *var); IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); }
-            Stmt::VarMfmaFp8Z { var, a, b } => { fr(&mut *var); IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); }
-            Stmt::VarMfmaFp8C { var, a, b, c } => { fr(&mut *var); IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); IrIds::ids(&mut *c, fv, fr); }
-            Stmt::VarSmfmac { var, a, b, idx } => { fr(&mut *var); IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); IrIds::ids(&mut *idx, fv, fr); }
-            Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, opsel } => { fr(&mut *var); IrIds::ids(&mut *a, fv, fr); IrIds::ids(&mut *b, fv, fr); IrIds::ids(&mut *scale_a, fv, fr); IrIds::ids(&mut *scale_b, fv, fr); IrIds::ids(&mut *opsel, fv, fr); }
-            Stmt::VarAsm { var, block, inputs } => { fr(&mut *var); IrIds::ids(&mut *block, fv, fr); IrIds::ids(&mut *inputs, fv, fr); }
-            Stmt::VarAsmN { vars, block, inputs } => { for x in *vars.iter_mut() { fr(x); } IrIds::ids(&mut *block, fv, fr); IrIds::ids(&mut *inputs, fv, fr); }
-            Stmt::BeginLoop { vars, init } => { for x in *vars.iter_mut() { fr(x); } IrIds::ids(&mut *init, fv, fr); }
-            Stmt::BreakIf { cond } => { IrIds::ids(&mut *cond, fv, fr); }
+            Stmt::SetPrio { prio } => { IrIds::ids(&mut (*prio), fv, fr); }
+            Stmt::SchedGroup { mask, size, sync } => { IrIds::ids(&mut (*mask), fv, fr); IrIds::ids(&mut (*size), fv, fr); IrIds::ids(&mut (*sync), fv, fr); }
+            Stmt::WaitVm { count } => { IrIds::ids(&mut (*count), fv, fr); }
+            Stmt::LoadGlobalLds { base, lds_addr, byte_off, dwords } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*lds_addr), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
+            Stmt::SetVar { var, value } => { fr(&mut (*var)); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::VarScaleF32 { var, scalar } => { fr(&mut (*var)); IrIds::ids(&mut (*scalar), fv, fr); }
+            Stmt::VarScalePk { var, pair } => { fr(&mut (*var)); IrIds::ids(&mut (*pair), fv, fr); }
+            Stmt::VarAddPk { var, pair } => { fr(&mut (*var)); IrIds::ids(&mut (*pair), fv, fr); }
+            Stmt::VarMfmaF16Z { var, a, b } => { fr(&mut (*var)); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Stmt::VarScaleLane { var, index, scalar } => { fr(&mut (*var)); IrIds::ids(&mut (*index), fv, fr); IrIds::ids(&mut (*scalar), fv, fr); }
+            Stmt::VarSetLane { var, index, value } => { fr(&mut (*var)); IrIds::ids(&mut (*index), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::VarMfmaScale { var, a, b, scale_a, scale_b, opsel } => { fr(&mut (*var)); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*scale_a), fv, fr); IrIds::ids(&mut (*scale_b), fv, fr); IrIds::ids(&mut (*opsel), fv, fr); }
+            Stmt::VarMfmaScaleC { var, a, b, c, scale_a, scale_b } => { fr(&mut (*var)); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale_a), fv, fr); IrIds::ids(&mut (*scale_b), fv, fr); }
+            Stmt::VarMfmaFp8 { var, a, b } => { fr(&mut (*var)); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Stmt::VarMfmaFp8Z { var, a, b } => { fr(&mut (*var)); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Stmt::VarMfmaFp8C { var, a, b, c } => { fr(&mut (*var)); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); }
+            Stmt::VarSmfmac { var, a, b, idx } => { fr(&mut (*var)); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*idx), fv, fr); }
+            Stmt::VarMfmaScale16 { var, a, b, scale_a, scale_b, opsel } => { fr(&mut (*var)); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*scale_a), fv, fr); IrIds::ids(&mut (*scale_b), fv, fr); IrIds::ids(&mut (*opsel), fv, fr); }
+            Stmt::VarAsm { var, block, inputs } => { fr(&mut (*var)); IrIds::ids(&mut (*block), fv, fr); IrIds::ids(&mut (*inputs), fv, fr); }
+            Stmt::VarAsmN { vars, block, inputs } => { for x in (*vars).iter_mut() { fr(x); } IrIds::ids(&mut (*block), fv, fr); IrIds::ids(&mut (*inputs), fv, fr); }
+            Stmt::BeginLoop { vars, init } => { for x in (*vars).iter_mut() { fr(x); } IrIds::ids(&mut (*init), fv, fr); }
+            Stmt::BreakIf { cond } => { IrIds::ids(&mut (*cond), fv, fr); }
             Stmt::EndLoop => {}
-            Stmt::BeginIf { cond } => { IrIds::ids(&mut *cond, fv, fr); }
+            Stmt::BeginIf { cond } => { IrIds::ids(&mut (*cond), fv, fr); }
             Stmt::Else => {}
             Stmt::EndIf => {}
         }
@@ -587,8 +587,8 @@ impl FromIr for AgprTarget {
 impl IrIds for AgprTarget {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
-            AgprTarget::Var(x0) => { fr(&mut *x0); }
-            AgprTarget::Val(x0) => { fv(&mut *x0); }
+            AgprTarget::Var(x0) => { fr(&mut (*x0)); }
+            AgprTarget::Val(x0) => { fv(&mut (*x0)); }
         }
     }
 }
@@ -621,8 +621,8 @@ impl FromIr for RegRef {
 impl IrIds for RegRef {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
-            RegRef::Val(x0) => { fv(&mut *x0); }
-            RegRef::Var(x0) => { fr(&mut *x0); }
+            RegRef::Val(x0) => { fv(&mut (*x0)); }
+            RegRef::Var(x0) => { fr(&mut (*x0)); }
         }
     }
 }
@@ -642,11 +642,11 @@ impl FromIr for RegMark {
 impl IrIds for RegMark {
     fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
         match self {
-            RegMark::PinV { r, base } => { IrIds::ids(&mut *r, fv, fr); IrIds::ids(&mut *base, fv, fr); }
-            RegMark::Share(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            RegMark::Separate(x0) => { IrIds::ids(&mut *x0, fv, fr); }
-            RegMark::Cap { region, vgprs, agprs } => { IrIds::ids(&mut *region, fv, fr); IrIds::ids(&mut *vgprs, fv, fr); IrIds::ids(&mut *agprs, fv, fr); }
-            RegMark::Ring { name, bufs } => { IrIds::ids(&mut *name, fv, fr); IrIds::ids(&mut *bufs, fv, fr); }
+            RegMark::PinV { r, base } => { IrIds::ids(&mut (*r), fv, fr); IrIds::ids(&mut (*base), fv, fr); }
+            RegMark::Share(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            RegMark::Separate(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            RegMark::Cap { region, vgprs, agprs } => { IrIds::ids(&mut (*region), fv, fr); IrIds::ids(&mut (*vgprs), fv, fr); IrIds::ids(&mut (*agprs), fv, fr); }
+            RegMark::Ring { name, bufs } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*bufs), fv, fr); }
         }
     }
 }
