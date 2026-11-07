@@ -836,11 +836,16 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
         let hh = b.let_(amdgpu_dsl::Op::KernargI32 { offset: 0x140 });
         let xq = b.bind_i32((io.s_len.clone() + ((1 << rows_lg) - 1)).lshr(rows_lg));
         let n = b.bind_i32(ev(xq) * ev(hh));
-        // ok = (N % 8 == 0) && (H <= 32), as 0 / 1
-        // + X <= 16: with long sequences (X = 32, B8H8S8192) the order measured -6.9 % (all 32 CUs of an XCD on one head in lockstep)
-        let ok = b.bind_i32((ev(n) & 7).eq(0).select_i32(ev(hh).le(32).select_i32(ev(xq).le(16).select_i32(1, 0), 0), 0));
+        // ok = (N % 8 == 0) && (H <= 32) && (X <= 16 || N % 128 == 0), as 0 / 1
+        let ok = b.bind_i32((ev(n) & 7).eq(0).select_i32(ev(hh).le(32).select_i32(ev(xq).le(16).select_i32(1, (ev(n) & 127).eq(0).select_i32(1, 0)), 0), 0));
         let l = b.bind_i32(ev(y0) * ev(xq) + ev(x0));
-        let mut r = b.bind_i32((ev(l) & 7) * ev(n).lshr(3) + ev(l).lshr(3));
+        // X <= 16: the vendor's stride (XCD x owns the logical range [x N / 8, (x + 1) N / 8)). X > 16 (S > 4096): XCD x takes chunks of 16
+        // consecutive logical blocks, cycling - with the vendor's stride all 32 CUs of an XCD streamed one head in lockstep and the L2 tag /
+        // DRAM-credit stalls grew 8x (B8H8S8192 -6.9 %); chunks of 16 keep half a head per XCD (+0.2 ... +3.3 % at S 8192 / 16384)
+        let k = b.bind_i32(ev(l).lshr(3));
+        let r_v = b.bind_i32((ev(l) & 7) * ev(n).lshr(3) + ev(k));
+        let r_c = b.bind_i32((ev(k).lshr(4) << 7) + ((ev(l) & 7) << 4) + (ev(k) & 15));
+        let mut r = b.bind_i32(ev(xq).le(16).select_i32(ev(r_v), ev(r_c)));
         // head = M / X by binary long division (H <= 32: 5 steps)
         let mut y = b.c_i32(0);
         for bit in [16i32, 8, 4, 2, 1] {
