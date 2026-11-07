@@ -218,6 +218,8 @@ pub struct Node {
     pub barrier_phase: u32,
     /// where in the kernel's program the stage runs (prologue / loop / epilogue)
     pub phase: Phase,
+    /// pipelined graphs (`pipeline` attribute): the `PipeBody` hook that runs the stage (`stage`, `m_phase`, `v_phase`, `window`, ...); None for stages outside the pipeline
+    pub hook: Option<String>,
 }
 
 /// Where the tensor lives while it crosses the edge.
@@ -325,6 +327,9 @@ pub fn class_of_layouts(p: &FragLayout, c: &FragLayout) -> Result<(Class, Moveme
 }
 
 impl Graph {
+    pub fn attr_str(&self, k: &str) -> Option<&str> {
+        self.attrs.iter().find(|(n, _)| n == k).and_then(|(_, v)| if let Val::Str(s) = v { Some(s.as_str()) } else { None })
+    }
     pub fn attr_int(&self, k: &str) -> Option<i64> {
         self.attrs.iter().find(|(n, _)| n == k).and_then(|(_, v)| if let Val::Int(i) = v { Some(*i) } else { None })
     }
@@ -461,6 +466,7 @@ impl Graph {
                     ("roles".into(), Json::Arr(n.roles.iter().map(|r| Json::Str(r.clone())).collect())),
                     ("barrier_phase".into(), Json::Int(n.barrier_phase as i64)),
                     ("phase".into(), Json::Str(n.phase.name().into())),
+                    ("hook".into(), n.hook.clone().map_or(Json::Null, Json::Str)),
                 ])
             })
             .collect();
@@ -541,6 +547,7 @@ impl Graph {
                 roles: n.get("roles").and_then(|x| x.arr()).map(|v| v.iter().filter_map(|x| x.str().map(|s| s.to_string())).collect()).unwrap_or_default(),
                 barrier_phase: i(n, "barrier_phase")? as u32,
                 phase: Phase::from_name(&s(n, "phase")?).ok_or("unknown phase")?,
+                hook: n.get("hook").and_then(|x| x.str()).map(|x| x.to_string()),
             });
         }
         let frag = |f: Option<&Json>| -> Result<Option<FragLayout>, String> {

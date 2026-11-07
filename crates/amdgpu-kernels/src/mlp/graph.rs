@@ -5,7 +5,7 @@ use super::{p_boundary, ALPHA, K1, N1, N2, W_IMG, W_PITCH};
 use amdgpu_tile::opgraph::{Class, Edge, FragLayout, Graph, Node, Phase, Prim, Resources, Scope, Store, Val};
 
 fn node(id: &str, prim: Prim, stage: &str, phase: Phase, params: Vec<(&str, Val)>, res: Resources) -> Node {
-    Node { id: id.into(), prim, stage: stage.into(), params: params.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), resources: res, roles: vec!["all 4 waves: same program".into()], barrier_phase: 0, phase }
+    Node { id: id.into(), prim, stage: stage.into(), params: params.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), resources: res, roles: vec!["all 4 waves: same program".into()], barrier_phase: 0, phase, hook: None }
 }
 
 fn edge(name: &str, from: Option<&str>, to: &[&str], dtype: &str, shape: &[i64], layout: &str, scope: Scope, store: Store, hint: Option<Class>) -> Edge {

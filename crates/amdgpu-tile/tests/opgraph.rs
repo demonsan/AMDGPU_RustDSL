@@ -3,7 +3,7 @@ use amdgpu_tile::opgraph::json::Json;
 use amdgpu_tile::opgraph::*;
 
 fn node(id: &str, prim: Prim, stage: &str, vgprs: u32) -> Node {
-    Node { id: id.into(), prim, stage: stage.into(), params: vec![("k".into(), Val::Int(256)), ("act".into(), Val::Str("relu".into()))], resources: Resources { vgprs, agprs: 0, lds_bytes: 1024, barriers: 0 }, roles: vec!["all".into()], barrier_phase: 0, phase: Phase::Loop }
+    Node { id: id.into(), prim, stage: stage.into(), params: vec![("k".into(), Val::Int(256)), ("act".into(), Val::Str("relu".into()))], resources: Resources { vgprs, agprs: 0, lds_bytes: 1024, barriers: 0 }, roles: vec!["all".into()], barrier_phase: 0, phase: Phase::Loop, hook: None }
 }
 
 fn frag(name: &str, table: Vec<i64>) -> FragLayout {
