@@ -284,6 +284,17 @@ pub struct Edge {
     pub carried: bool,
 }
 
+/// A WEAVE GROUP: stage instances whose units ONE weaver interleaves (`weaver(stageA, stageB)`): the skeleton emits one slot for the group (named after it, labelled `label` = the weave phase),
+/// whose default body composes the members in declaration order (`stage::compose`). The nodes stay separate in the graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub name: String,
+    /// the weave phase label (`Weaver::phase`, the region name)
+    pub label: String,
+    /// member node ids in declaration order
+    pub nodes: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Graph {
     pub name: String,
@@ -291,6 +302,8 @@ pub struct Graph {
     pub attrs: Vec<(String, Val)>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    /// weave groups (optional)
+    pub groups: Vec<Group>,
 }
 
 /// The computed cost class of an edge between two fragment layouts.
@@ -366,6 +379,22 @@ impl Graph {
             }
             if e.from.is_some() && e.to.is_empty() && e.abi.is_none() {
                 // a kernel output without an ABI slot is allowed (the skeleton leaves the slot to the kernel), nothing to check
+            }
+        }
+        let mut in_group = std::collections::HashSet::new();
+        for g in &self.groups {
+            if g.nodes.len() < 2 {
+                return Err(format!("weave group '{}' needs at least two member stages", g.name));
+            }
+            let phase = self.node(&g.nodes[0]).map(|n| n.phase);
+            for n in &g.nodes {
+                let node = self.node(n).ok_or_else(|| format!("weave group '{}': unknown node '{n}'", g.name))?;
+                if !in_group.insert(n.clone()) {
+                    return Err(format!("node '{n}' is in two weave groups"));
+                }
+                if Some(node.phase) != phase {
+                    return Err(format!("weave group '{}': members are in different phases", g.name));
+                }
             }
         }
         self.topo_order().map(|_| ())
@@ -466,12 +495,26 @@ impl Graph {
                 ])
             })
             .collect();
-        Json::Obj(vec![
+        let mut j = Json::Obj(vec![
             ("name".into(), Json::Str(self.name.clone())),
             ("attrs".into(), Json::Obj(self.attrs.iter().map(|(k, v)| (k.clone(), v.to_json())).collect())),
             ("nodes".into(), Json::Arr(nodes)),
             ("edges".into(), Json::Arr(edges)),
-        ])
+        ]);
+        if let Json::Obj(v) = &mut j {
+            if !self.groups.is_empty() {
+                v.push((
+                    "groups".into(),
+                    Json::Arr(
+                        self.groups
+                            .iter()
+                            .map(|g| Json::Obj(vec![("name".into(), Json::Str(g.name.clone())), ("label".into(), Json::Str(g.label.clone())), ("nodes".into(), Json::Arr(g.nodes.iter().map(|n| Json::Str(n.clone())).collect()))]))
+                            .collect(),
+                    ),
+                ));
+            }
+        }
+        j
     }
 
     pub fn from_json(j: &Json) -> Result<Graph, String> {
@@ -531,6 +574,11 @@ impl Graph {
                 },
                 carried: e.get("carried").and_then(|x| x.bool()).unwrap_or(false),
             });
+        }
+        if let Some(Json::Arr(gs)) = j.get("groups") {
+            for gj in gs {
+                g.groups.push(Group { name: s(gj, "name")?, label: s(gj, "label")?, nodes: gj.get("nodes").and_then(|x| x.arr()).map(|v| v.iter().filter_map(|x| x.str().map(|s| s.to_string())).collect()).unwrap_or_default() });
+            }
         }
         g.validate()?;
         Ok(g)

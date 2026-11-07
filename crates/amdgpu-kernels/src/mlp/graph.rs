@@ -55,5 +55,5 @@ pub fn graph() -> Graph {
     e_h.consumer = Some(c);
     let mut e_out = edge("out", Some("gemm2"), &[], "bf16", &[-1, N2], "row-major", Scope::None, Store::Global, Some(Class::C4));
     e_out.abi = Some((24, 8));
-    Graph { name: "mlp_fp8".into(), attrs: vec![("threads".into(), Val::Int(256))], nodes, edges: vec![e_in, e_w1, e_w2, e_w1l, e_w2l, e_x0, e_xn, e_h, e_out] }
+    Graph { name: "mlp_fp8".into(), attrs: vec![("threads".into(), Val::Int(256))], nodes, edges: vec![e_in, e_w1, e_w2, e_w1l, e_w2l, e_x0, e_xn, e_h, e_out], groups: Vec::new() }
 }
