@@ -81,9 +81,10 @@ impl<'a> StageInst<'a> {
     /// Emits the stage with the kernel's orchestration: `weave` receives the stage's weaver (labelled with the stage name) and returns it with an
     /// order / strategy.
     pub fn emit_with(self, b: &mut FnBuilder, weave: impl FnOnce(Weaver<'a>) -> Weaver<'a>) {
-        let StageInst { name, contract, units, handover, region, prebind, .. } = self;
+        let StageInst { name, contract, units, handover, mut region, prebind, .. } = self;
+        if std::env::var("KOPT_PLAIN").is_ok() { region = false; }
         if let Some(p) = prebind {
-            p(b);
+            if std::env::var("KOPT_NOPRE").is_err() { p(b); }
         }
         if region {
             b.stage_begin(&name, contract);
