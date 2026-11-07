@@ -17,6 +17,7 @@ use amdgpu_tile::frag::{AccTile, Frag, QkOut, B32x32x64Fp8, C32x32F32};
 use amdgpu_tile::reduce::KeyMask;
 use amdgpu_tile::softmax::{OnlineSoftmax, Recipe};
 use amdgpu_tile::*;
+use amdgpu_tile::weave::{Hint, Out, UnitClass, Units, Weaver};
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, ValueId, VarId, I32};
 use amdgpu_isa::{MmaAtom, DS_READ_B128, DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, DS_WRITE_B32, GLOBAL_LDS_X1, GLOBAL_LDS_X4, GLOBAL_LOAD_X4, GLOBAL_STORE_X2};
 use amdgpu_layout::{make_layout, tup, ComposedLayout, Ix, Layout as LLayout, Swizzle};
@@ -257,7 +258,73 @@ impl<'a> AttnBody3<'a> {
             }
         }
     }
+    /// QK into the S variables as emission units: the setup (slot-bound K / K-scale partitions; the one bias MFMA of the `biasonce` form) and one
+    /// unit per 32-key block (K fragments, K-scale word, the two scaled MFMAs), then an end marker (no IR).
+    fn qk_units<'s>(&'s self, slot: &SlotIdx, s: AccTile<C32x32F32, 4>, bias: Opnd) -> Units<'s> {
+        let r = self.ring;
+        let mut u = Units::new();
+        let parts: Out<(LdsSlotPart<'s>, LdsSlotPart<'s>)> = Out::new();
+        let (p2, sl) = (parts.clone(), slot.clone());
+        let once = self.biasonce && self.kscale_sel;
+        let setup = u.add("qk.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| {
+            let k = r.kpart.at(b, &r.ks.at(&sl));
+            let kd = r.kdpart.at(b, &r.kd.at(&sl));
+            p2.set((k, kd));
+            if once {
+                // the one bias MFMA writes S tile 3 (zero accumulator: no zero-fragment copies); tiles 0-2 take it as the C input of their first
+                // scaled MFMA, tile 3 accumulates in place last
+                b.var_mfma_f16_z(s.accs[3].var, self.sm.ones_f16, bias);
+                self.bias_tile.set(Some(Opnd::Var(s.accs[3].var)));
+            }
+        });
+        let mut last = setup;
+        for blk in 0..4usize {
+            let p3 = parts.clone();
+            last = u.add(format!("qk.block{blk}"), UnitClass::Mfma, Hint::Skeleton, &[setup], move |b| {
+                p3.with(|(k, kd)| {
+                    self.qk_block(b, &QkOut::Vars(&s), bias, k, kd, blk);
+                });
+            });
+        }
+        let _ = last;
+        u.add("qk.end", UnitClass::Setup, Hint::Anchor, &(1..=4).collect::<Vec<_>>(), move |_b| self.bias_tile.set(None));
+        u
+    }
+    /// PV as emission units: the setup (slot-bound V partition, the two P fragments), the row sums, one unit per (half hh, dim group e).
+    fn pv_units<'s>(&'s self, slot: &SlotIdx, w: Vec<ValueId>) -> Units<'s> {
+        let r = self.ring;
+        let mut u = Units::new();
+        let st: Out<(LdsSlotPart<'s>, [ValueId; 2])> = Out::new();
+        let (s2, sl) = (st.clone(), slot.clone());
+        let setup = u.add("pv.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| {
+            let v = r.vpart.at(b, &r.vs.at(&sl));
+            let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]).v, Frag::<B32x32x64Fp8>::from_words(b, &w[8..16]).v];
+            s2.set((v, p));
+        });
+        let s3 = st.clone();
+        u.add("pv.rowsum", UnitClass::Mfma, Hint::Filler, &[setup], move |b| {
+            let p = s3.with(|(_, p)| *p);
+            self.sm.row_sum(b, p[0], p[1]);
+        });
+        let o = self.o.expect("O");
+        for hh in 0..2usize {
+            for e in 0..4usize {
+                let s4 = st.clone();
+                u.add(format!("pv.h{hh}e{e}"), UnitClass::Mfma, Hint::Skeleton, &[setup], move |b| {
+                    s4.with(|(v, p)| {
+                        let vf = v.read(b, hh + 2 * e);
+                        gemm(b, &r.mma, o.accs[e].var, vf, p[hh], self.c127, self.c123, 0, 0);
+                    });
+                });
+            }
+        }
+        u
+    }
     fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, out: QkOut, bias: Opnd) -> Vec<ValueId> {
+        if let QkOut::Vars(t) = &out {
+            self.qk_units(slot, **t, bias).emit_all(b);
+            return Vec::new();
+        }
         let r = self.ring;
         let k = r.kpart.at(b, &r.ks.at(slot));
         let kd = r.kdpart.at(b, &r.kd.at(slot));
@@ -273,17 +340,7 @@ impl<'a> AttnBody3<'a> {
     }
     /// PV with the row sums first: per half hh and dim group e, the transposed V fragment then the scaled MFMA (fixed scales).
     fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
-        let r = self.ring;
-        let v = r.vpart.at(b, &r.vs.at(slot));
-        let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])];
-        self.sm.row_sum(b, p[0].v, p[1].v);
-        let o = self.o.expect("O");
-        for (hh, pf) in p.iter().enumerate() {
-            for e in 0..4usize {
-                let vf = v.read(b, hh + 2 * e);
-                gemm(b, &r.mma, o.accs[e].var, vf, pf.v, self.c127, self.c123, 0, 0);
-            }
-        }
+        self.pv_units(slot, w.to_vec()).emit_all(b);
     }
     pub fn out_scale(&self, b: &mut FnBuilder) -> ValueId {
         let l = self.sm.l_total(b);
