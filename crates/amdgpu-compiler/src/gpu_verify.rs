@@ -1771,6 +1771,8 @@ pub fn verify_stages(f: &Function, rep: &mut Report) {
                 }
                 for want in &contract.scalars_in {
                     match closed.iter().rev().find_map(|(pn, c)| c.scalars_out.iter().find(|x| x.name == want.name).map(|x| (pn, x))) {
+                        // values bound outside every stage (kernel glue) are visible to all stages: no producer needed
+                        None if want.values.iter().all(|v| defined.contains(&(*v as u32)) && !def_stage.contains_key(&(*v as u32))) => ok += 1,
                         None => rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: scalar `{}` is not handed over by an earlier stage", want.name)),
                         Some((pn, have)) => {
                             if have.values != want.values || have.owner != want.owner {
