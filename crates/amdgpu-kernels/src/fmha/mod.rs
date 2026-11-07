@@ -515,11 +515,22 @@ impl PipeBody for AttnBody3<'_> {
 /// update from 4 tiles on (`OnlineSoftmax::set_vendor_ref`, `decide_lazy`; shorter sequences keep the exact LUT-corrected recipe: with < 4 tiles the
 /// lazy recipe's error does not average out) and the LDS-staged epilogue.
 pub fn fmha_fwd_hd128_mxfp8_v3_vs128() -> Function {
-    let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);
+    vs128_exp("fmha_fwd_hd128_mxfp8_v3_vs128", false)
+}
+
+/// EXPERIMENT: `qa` = the Q fragments (QK MFMA B operands, loop-invariant) in AGPRs (frees VGPRs for deeper K / V read-ahead)
+pub fn vs128_exp(name: &str, qa: bool) -> Function {
+    let mut fb = FnBuilder::new(name, 512);
     fb.compile_profile(CompileProfile::Vs128);
     let b = &mut fb;
     let io = declare_io(b, 256, false);
-    let blk = block3(&io, b, 8);
+    let mut blk = block3(&io, b, 8);
+    if qa {
+        for f in blk.q.frags.iter_mut() {
+            f.v = b.agpr(f.v);
+        }
+    }
+    let blk = blk;
     let roles = Roles::split(b, &blk.lane, 4);
     let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
     ring.enable_buffer_dma(b);
