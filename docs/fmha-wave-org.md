@@ -61,7 +61,23 @@ The vendor's fix, `label_xcd_skip` in its disassembly:
 - **Kernels**:
   - used by `_vs128` and `_t128`;
   - NOT by `_kvsplit`: −10.6 % at B1H8S2048, −6.2 % at B1H4S4096.
-- **Extra condition X ≤ 16** (S ≤ 4096 for `_vs128`, S ≤ 2048 for `_t128`). With X = 32 the order was +0.8…+2.3 % on B ≤ 4 but −6.9 % at B8H8S8192, even though the L2 misses dropped to the vendor's there too. Cause not identified; a candidate is all 32 CUs of an XCD streaming one head in lockstep.
+- **X > 16 (S > 4096 for `_vs128`) uses chunks of 16** logical blocks per XCD, cycling: `M = (k / 16)·128 + (L mod 8)·16 + k mod 16`, with k = L / 8. It applies when N ≡ 0 mod 128, else the plain order.
+
+  Why not the vendor's stride: at X = 32 it puts all 32 CUs of an XCD on one head. At B8H8S8192 that measured −6.9 %, although the L2 misses dropped to the vendor's (2.89 M). The cause shows in the counters (B8H8S8192, ours vendor-stride vs vendor): `TCC_TAG_STALL` 2.47 M vs 0.35 M and `TCC_EA0_RDREQ_DRAM_CREDIT_STALL` 2.43 M vs 0.30 M — the 32 CUs ask for the same lines in lockstep.
+
+  Same-run A/B, 9 runs, plain order → chunks of 16:
+
+  | shape | change |
+  |---|--:|
+  | B8H8S8192 | +0.3 % |
+  | B4H8S8192 | +0.5 % |
+  | B2H8S8192 | +1.4 % |
+  | B1H8S8192 | +3.3 % |
+  | B1H8S16384 | +0.2 % |
+
+  Chunks of 8 were neutral.
+
+  `port_gate` with this change (`x32`, GPU 5): OVERALL PASS. md5: `_vs128` `622a6c0d`, `_t128` `dc210951`.
 
 Same-run A/B, normal data, auto path (5 runs, TF/s, base → XCD order, then the ratio to the vendor):
 
