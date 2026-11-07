@@ -67,11 +67,13 @@ pub struct Options {
     pub regions: Vec<region::RegionSpec>,
     /// Lowered region id (`MInst::region`) -> strategy id (`regions[id - 1]`; 0 = the kernel default); filled by the compiler from the region names. Empty: the ids are the strategy ids.
     pub region_of: Vec<u16>,
+    /// `hzfill` (hzfill.rs): post-RA filling of the hazard `s_nop` windows with independent instructions from below
+    pub hzfill: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, regions: Vec::new(), region_of: Vec::new() }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, regions: Vec::new(), region_of: Vec::new(), hzfill: false }
     }
 }
 
@@ -111,6 +113,7 @@ impl Options {
                     "ldshoist" => o.ldshoist = true,
                     "slotfill" => o.slotfill = true,
                     "wsink" => o.waitsink = true,
+                    "hzfill" => o.hzfill = true,
                     "hoistchain" => {
                         o.ldshoist = true;
                         o.hoist_chain = true;

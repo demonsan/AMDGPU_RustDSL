@@ -14,6 +14,7 @@ pub mod gpu_verify;
 pub mod functional_proofs;
 pub mod ir_print;
 pub mod hazards;
+pub mod hzfill;
 pub mod lower;
 pub mod mir;
 pub mod op_attrs;
@@ -161,6 +162,20 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         (_, so) => so,
     };
+    // `hzfill` (hzfill.rs): from the kernel's scheduler options, or AMDC_SCHED_ADD=<kernel substring>:hzfill (also for kernels without a scheduler preset)
+    let hz_opts = sched_opts.clone();
+    let hzfill = sched_opts.as_ref().map_or(false, |o| o.any_region(|r| r.hzfill))
+        || std::env::var("AMDC_SCHED_ADD").ok().map_or(false, |spec| {
+            spec.split(';').filter_map(|e| e.split_once(':')).any(|(pat, toks)| (pat == "*" || pname.contains(pat) || f.name.contains(pat)) && toks.split(',').any(|t| t.trim() == "hzfill"))
+        });
+    let hz = |m: &mut mir::MFunction, a: &regalloc::Alloc, strict: bool| {
+        if hzfill {
+            let s = hzfill::fill_with(m, a, strict, hz_opts.as_ref());
+            if std::env::var("AMDC_SCHED_VERBOSE").is_ok() {
+                eprintln!("hzfill {}: s_nop wait states {} -> {} ({} moves, {} rejected)", f.name, s.states_before, s.states_after, s.moved, s.rejected);
+            }
+        }
+    };
     if let Some(opts) = sched_opts {
         let mut last_err = String::new();
         // (pressure cut, hoist distance cap): first shrink the LDS-read hoisting (it lengthens live ranges and fragments
@@ -196,6 +211,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 }
                 let a = regalloc::allocate(&m)?;
                 hazards::pad_physical_war(&mut m, &a);
+                hz(&mut m, &a, true);
                 Ok(a)
             })();
             match attempt {
@@ -226,6 +242,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // Register reuse (especially the hole-filling packing) can place a new value in a register an in-flight MFMA still reads:
     // pad the physical write-after-read hazard on every path, not only for scheduled code.
     hazards::pad_physical_war(&mut m, &alloc);
+    hz(&mut m, &alloc, false);
     Ok((m, alloc))
 }
 
