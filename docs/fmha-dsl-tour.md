@@ -1,61 +1,67 @@
-# FMHA v3 导读：一个 128-key tile 从 DMA 到输出的完整旅程
+# FMHA v3 导读：从算子图到一个 128-key tile 的完整旅程
 
-> **读者**：想读懂（或修改）出厂 FMHA kernel 的人。要求会 Rust 语法、知道 GPU wave/lane/LDS/MFMA 是什么；不要求读过仓库里别的文档。
-> **范围**：`Main c9c698a2` 上的四个出厂 kernel `fmha_fwd_hd128_mxfp8_v3_{vs128, t128, kvsplit, kvsplit_combine8h}`，
-> 源码在 `crates/amdgpu-kernels/src/fmha/mod.rs` 与 `crates/amdgpu-kernels/src/fmha/io.rs`。
-> **约定**：每个代码引用都写成 `文件:行号`（区间为闭区间），对应 `Main c9c698a2`；如果行号漂移，按引用中的符号名查找。
-> 节选里省略的部分用 `…` 标出。
-> **配套**：布局层从零入门见 [`layout-tour.md`](layout-tour.md)；验证器模型见 [`gpu-semantics-verifier.md`](gpu-semantics-verifier.md)；
-> 与厂商汇编的逐条对照见 [`fmha-vs-vendor-asm-diff.md`](fmha-vs-vendor-asm-diff.md)；当前数字见 [`current-status.md`](current-status.md)。
+> **读者**：想读懂（或修改）出厂 FMHA kernel 的人。要求会 Rust 语法，知道 GPU wave / lane / LDS / MFMA 是什么；不要求读过仓库里别的文档。
+>
+> **范围**：四个出厂 kernel `fmha_fwd_hd128_mxfp8_v3_{vs128, t128, kvsplit, kvsplit_combine8h}`。源码在：
+> - `crates/amdgpu-kernels/src/fmha/`：`mod.rs`、`io.rs`、`graph.rs`、`skeleton_*.rs`；
+> - `crates/amdgpu-tile/src/`：`stage.rs`、`weave.rs`、`pipeline.rs`、`softmax.rs` 等。
+>
+> **约定**：引用写成 `文件` + 符号名（不写行号；用 grep 找符号）。节选里省略的部分用 `…` 标出。
+>
+> **配套文档**：
+> - stage / weaver / 后端三层设计：[`fusion-stage-library-design.md`](fusion-stage-library-design.md) §7–8；
+> - 算子图与骨架生成：[`opgraph.md`](opgraph.md)；
+> - 布局层入门：[`layout-tour.md`](layout-tour.md)；
+> - 验证器：[`gpu-semantics-verifier.md`](gpu-semantics-verifier.md)；
+> - 与厂商汇编的对照：[`fmha-vs-vendor-asm-diff.md`](fmha-vs-vendor-asm-diff.md)；
+> - 当前数字：[`current-status.md`](current-status.md)。
 
 ---
 
 ## 目录
 
-- §0 全景：四层 crate 与一个 tile 的数据流
+- §0 全景：crate 分层与一个 tile 的数据流
 - §1 三条出厂路径与自动派发
 - §2 动手：构建、emit、验证、gate
-- §3 kernel 入口：`_vs128` builder 逐行
-- §4 一个 tile 的完整旅程（a–j 十步）
+- §3 kernel 的形态：算子图 → 骨架 → slot → stage 实例 → 发射单元
+- §4 一个 tile 的完整旅程（a–j）
 - §5 `_t128` 与 `_kvsplit` 哪里不同
-- §6 布局层与 ISA 原子：地址是怎么"推导"出来的
+- §6 布局层与 ISA 原子
 - §7 正确性由什么保证
 - §8 改代码前先看这里
-- 附录：符号索引
 
 ---
 
-## §0 全景：四层 crate 与一个 tile 的数据流
+## §0 全景：crate 分层与一个 tile 的数据流
 
 ```
-amdgpu-isa      指令原子：CopyAtom（ds_read_b128 x2、ds_read_b64_tr_b8 x4、global_load_lds_dwordx4 …）
-                          MmaAtom（v_mfma_scale_f32_32x32x64_f8f6f4、v_smfmac_f32_16x16x128_fp8_fp8 …）的 TV 布局
-amdgpu-layout   Layout / Swizzle / ComposedLayout、TV 布局 → 每个 lane 的 (base, imm) 地址计划、构建期证明
-amdgpu-tile     TiledCopy / TiledMma / partition_*、DMA 分区、流水线（Pipeline + PipeBody）、
-                OnlineSoftmax、两条 smfmac 的行和方案、epilogue、KV-split combine
-amdgpu-kernels  fmha/mod.rs + fmha/io.rs：把上面的部件组装成四个 kernel（本文主角）
-        ↓  amdgpu-dsl 的 Function（结构化 IR）
-amdgpu-compiler 下降、调度、寄存器分配、GPU 语义验证器、gfx950 汇编
+amdgpu-isa      指令原子：CopyAtom（ds_read_b128 x2、ds_read_b64_tr_b8 x4、buffer/global_load … lds）、MmaAtom 的 TV 布局
+amdgpu-layout   Layout / Swizzle / ComposedLayout，TV 布局 → 每个 lane 的 (base, imm) 地址计划，构建期证明
+amdgpu-tile     部件：TiledCopy / TiledMma / partition_*、DMA 分区、OnlineSoftmax、行和、epilogue
+                编排：stage.rs（StageInst、registry、merge）、weave.rs（Units / Weaver）、pipeline.rs（Pipeline + PipeBody）
+                opgraph/：算子图、切分、骨架生成器
+amdgpu-kernels  fmha/：graph.rs（算子图）→ skeleton_*.rs（生成的骨架）→ mod.rs（slot 实现、stage 实例、部件组装）
+        ↓  amdgpu-dsl 的 Function（结构化 IR；Node::Stage 区域 + weave 区域标记，均不产生代码）
+amdgpu-compiler 下降、调度（按区域的策略）、寄存器分配、GPU 语义验证器（含 GV-STAGE）、gfx950 汇编
 ```
 
-FMHA 计算的是 `O = softmax(Q K^T) V`，head dim = 128，Q/K/V 为 MXFP8（E4M3 + 每 32 元素一个 E8M0 缩放），O 为 bf16。
-kernel 把 key 维切成 128 个 key 一个 tile；每个 workgroup 处理一段 query 行（`_vs128` 256 行、`_t128` 128 行），
-每个 wave 负责 32 行 query，依次处理所有 KV tile。一个 tile 的旅程：
+FMHA 计算 `O = softmax(Q K^T) V`：
+- head dim = 128；Q/K/V 为 MXFP8（E4M3，每 32 个元素一个 E8M0 缩放）；O 为 bf16。
+- key 维切成每 128 个 key 一个 tile。
+- 每个 workgroup 处理一段 query 行（`_vs128` 256 行，`_t128` 128 行）；每个 wave 负责 32 行，依次处理所有 KV tile。
 
 ```
  全局内存               LDS（2 或 3 槽环形缓冲）         寄存器（每 wave）
- ─────────               ─────────────────────         ─────────────────
  K[128 keys][128 d] ──DMA──▶ K 槽 ──ds_read_b128 x2──▶ K 片段 ─┐
- K 的 E8M0 scale  ──DMA──▶ KD 槽 ──ds_read_b32────────▶ scale ─┤ QK：S^T = K·Q^T（每 32 key 一个 32x32 累加器 ×4）
+ K 的 E8M0 scale  ──DMA──▶ KD 槽 ──ds_read_b32────────▶ scale ─┤ QK：S^T = K·Q^T（4 个 32x32 累加器）
  Q（常驻寄存器，prologue 读一次）──────────────────────────────┘     ↓
-                                                    online softmax：行最大值、参考点 bias、回滚
-                                                                    ↓
-                                                    P = fp8(2^S')：pknorm + scalef32 打包
-                                                                    ↓
- V[128 keys][128 d] ──DMA──▶ V 槽 ──ds_read_b64_tr_b8 x4──▶ V^T 片段 ─▶ PV：O^T += V^T·P^T（4 个 32x32 累加器）
-                                                    行和 l += rowsum(P)（2 条 smfmac）
-                                                                    ↓（所有 tile 之后）
-                                                    epilogue：O·(V_descale / l) → bf16 → 全局
+                                                     online softmax：行最大值、参考点、懒回滚
+                                                                     ↓
+                                                     P = fp8(2^S')：pknorm + scalef32 打包
+                                                                     ↓
+ V[128 keys][128 d] ──DMA──▶ V 槽 ──ds_read_b64_tr_b8 x4──▶ V^T 片段 ─▶ PV：O^T += V^T·P^T，行和 l（2 条 smfmac）
+                                                                     ↓（所有 tile 之后）
+                                                     epilogue：O·(V_descale / l) → bf16 → 全局
 ```
 
 ---
@@ -64,86 +70,127 @@ kernel 把 key 维切成 128 个 key 一个 tile；每个 workgroup 处理一段
 
 | kernel | 每 block | 结构 | 何时用 |
 |---|---|---|---|
-| `fmha_fwd_hd128_mxfp8_v3_vs128` | 256 行 query、512 线程（8 wave，两组各 4） | `Cadence::TwoPhaseOffset`：A/B 两组 wave 错开一个相位，2 槽环形缓冲；MUBUF K/V DMA；厂商式优先级 ping-pong；两条 smfmac 行和；K-scale op_sel 字节选择；≥ 4 个 tile 用厂商参考配方 + 懒更新；LDS 中转 epilogue | 填满的大 shape（grid 超过一波 CU） |
-| `fmha_fwd_hd128_mxfp8_v3_t128` | 128 行、256 线程（4 wave，一组） | `Cadence::OneWindow`：3 槽环形缓冲，每 tile 一个"窗口"；K-scale 走 VGPR；≥ 4 个 tile 用厂商参考配方 + 懒更新 | 小 shape（grid 在一波内放得下） |
-| `fmha_fwd_hd128_mxfp8_v3_kvsplit` + `…_kvsplit_combine8h` | 256 行、512 线程 + 合并 kernel | `_vs128` 的结构跑在 key 区间上（每个 split 一段 key），写 fp16 部分输出 `Ohat` 与 `lse`，再由 combine kernel 合并 | 长 KV、block 很少的 shape（例如 B1H8S2048） |
+| `…_v3_vs128` | 256 行、512 线程（两组各 4 wave） | `Cadence::TwoPhaseOffset`：两组错开一个相位，2 槽环；MUBUF K/V/K-scale DMA；优先级 ping-pong；两条 smfmac 行和；K-scale 字节选择；≥ 4 个 tile 用厂商参考配方 + 懒更新；LDS 中转 epilogue | 填满的大 shape |
+| `…_v3_t128` | 128 行、256 线程（一组） | `Cadence::OneWindow`：3 槽环，每 tile 一个窗口；K-scale 走 VGPR | 小 shape（grid 一波放得下） |
+| `…_v3_kvsplit` + `…_combine8h` | 256 行、512 线程 + 合并 kernel | `_vs128` 的结构跑在一个 key 区间上，写 fp16 部分输出与 `lse`，再合并 | 长 KV、block 很少（如 B1H8S2048） |
 
-四个 builder：`crates/amdgpu-kernels/src/fmha/mod.rs:366-400`（`fmha_fwd_hd128_mxfp8_v3_vs128`）、
-`crates/amdgpu-kernels/src/fmha/mod.rs:404-432`（`…_kvsplit`）、`crates/amdgpu-kernels/src/fmha/mod.rs:434-439`（`…_kvsplit_combine8h`）、
-`crates/amdgpu-kernels/src/fmha/mod.rs:443-465`（`…_t128`）；注册在 `crates/amdgpu-kernels/src/registry.rs:38-41`。
+**自动派发在 host 侧**（`tests/gpu/ref_host.cpp`），按真实数据测出的规则：
+1. 先看是否用 KV-split：`ntiles ≥ 16 && N256 ≤ 64` 时切 4 份，`ntiles ≥ 32 && N256 ≤ 128` 时切 2 份。
+2. 不切分时按 grid 大小：`N256 ≤ 64` 用 `_t128`，否则用 `_vs128`。
 
-**自动派发在 host 侧**（kernel 本身不选路径）。参考 host `tests/gpu/ref_host.cpp` 的规则：
-
-1. KV-split（`tests/gpu/ref_host.cpp:125-137`）：`ntiles ≥ 16 && N256 ≤ 64` 用 4 个 split，`ntiles ≥ 32 && N256 ≤ 128` 用 2 个 split（N256 = `ceil(S/256)·H·B`，ntiles = `ceil(SK/128)`）；
-2. 否则按 grid 大小（`tests/gpu/ref_host.cpp:56-63`、`tests/gpu/ref_host.cpp:154-157`）：`N256 ≤ 64` 用 `_t128`，否则 `_vs128`。
-这条规则是在真实数据（`REF_DATA=normal`）上测出来的：`_vs128` 从 N256 = 128 起就领先 `_t128`（B1H32S1024 +13%），split 在序列够长时才付得起 combine 的开销（B1H8S2048 split4 +11%，B1H8S1024 不切分）。
-
-三条路径共用同一个 656 字节的厂商 kernarg ABI（KV-split 多 64 字节扩展），所以 host 只换 code object 与 grid。
+三条路径共用同一个 656 字节的厂商 kernarg ABI（KV-split 多 64 字节扩展），host 只换 code object 与 grid。
 
 ---
 
 ## §2 动手：构建、emit、验证、gate
 
 ```bash
-# 列出 / 导出 IR / 编译成汇编（自研后端）
 cargo run --bin amdc -- list
-cargo run --bin amdc -- print-ir fmha_fwd_hd128_mxfp8_v3_vs128 --stage dsl
+cargo run --bin amdc -- print-ir fmha_fwd_hd128_mxfp8_v3_vs128 --out vs128.ir      # IR 文本（可 round-trip，见 docs/ir-text.md）
 cargo run --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --backend own --out vs128.s
-# GPU 语义验证（严格模式：任何 error 退出码 1；打印证书 = 可信假设台账）
-cargo run --bin amdc -- gpu-verify fmha_fwd_hd128_mxfp8_v3_vs128 --strict
-# 单元 / 证明测试
-cargo test -p amdgpu-tile --test rowsum --test orient
-cargo test -p amdgpu-compiler --test functional_proofs
-# GPU 节点：完整验收 gate（构建、严格验证、精度对齐厂商、确定性、压力、性能）
-HIP_VISIBLE_DEVICES=5 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3 mytag
-# GPU 节点：同一次运行内交替 A/B 两个 kernel（按名字）
-HIP_VISIBLE_DEVICES=5 bash tools/ab_fmha.sh fmha_fwd_hd128_mxfp8_v3_vs128 <另一个变体> -- "4 2048" "1 8192"
+cargo run --bin amdc -- gpu-verify fmha_fwd_hd128_mxfp8_v3_vs128 --strict           # 0 error；打印证书
+cargo run --bin amdc -- regplan fmha_fwd_hd128_mxfp8_v3_vs128                       # 每个 weave / stage 区域的真实寄存器峰值
+cargo test -p amdgpu-tile --test weave --test stage_registry --test opgraph
+HIP_VISIBLE_DEVICES=5 bash tools/port_gate.sh fmha_fwd_hd128_mxfp8_v3 mytag          # GPU 验收 gate
+HIP_VISIBLE_DEVICES=5 bash tools/ab_fmha.sh fmha_fwd_hd128_mxfp8_v3_vs128 <变体> -- "4 2048" "1 8192"
 ```
 
-- `amdc` 的子命令见 `crates/amdc/src/main.rs:11-21`（usage）与 `crates/amdc/src/main.rs:198`（`gpu-verify`）。
-- `tools/port_gate.sh` 的判定：精度按"厂商对齐"（同一次运行、同一输入，我们的 mean_err ≤ 1.10×厂商，坏点数 ≤ 厂商）；
-  性能按"与同次运行的厂商之比 ≥ 0.97 × 记录的出厂比值"。各节说明在脚本头部注释。
-- 汇编对照工具：`tools/asm_diff.py`（与厂商 `.co` 逐段对照）、`tools/mfma_reuse.py`（MFMA 操作数复用 / 链分析）。
-- 编译策略（下降选项、调度预设）由 builder 里 `fb.compile_profile(CompileProfile::Vs128)` 声明，
-  枚举在 `crates/amdgpu-dsl/src/lib.rs:971-985`，映射在 `crates/amdgpu-compiler/src/lib.rs:31-41`（`policy_name`）——与 kernel 名字无关。
+- **gate 判定**：
+  - 精度与同一次运行的厂商对齐：mean_err ≤ 1.10 × 厂商，坏点数 ≤ 厂商；
+  - 性能 ≥ 0.97 × 记录的出厂比值；
+  - 用真实数据（`REF_DATA=normal`）。
+- **编译策略**：用 `CompileProfile` 声明，与 kernel 名字无关。调度器 token 写在 `Function::sched_opts`，例如 `_vs128` 的 `ldsink=1,wsink,ldahead32=1`。
 
 ---
 
-## §3 kernel 入口：`_vs128` builder 逐行
+## §3 kernel 的形态：算子图 → 骨架 → slot → stage 实例 → 发射单元
 
-```rust
-// crates/amdgpu-kernels/src/fmha/mod.rs:366-400（fmha_fwd_hd128_mxfp8_v3_vs128，节选）
-let mut fb = FnBuilder::new("fmha_fwd_hd128_mxfp8_v3_vs128", 512);       // 512 线程
-fb.compile_profile(CompileProfile::Vs128);
-let io = declare_io(b, 256, false);              // ABI + 主机合同（§4a）
-let blk = block3(&io, b, 8);                     // 每 block 状态：行号、Q 片段、scale（§4a）
-let roles = Roles::split(b, &blk.lane, 4);       // wave 0..3 = 组 A，4..7 = 组 B
-let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);   // LDS 计划 + 所有拷贝分区（§4b、§4c）
-ring.enable_buffer_dma(b);                       // K/V DMA 改用 MUBUF 形式（§4c）
-ring.enable_buffer_kd(b);                        // K-scale DMA 也用 MUBUF 形式
-pipe.key_unclamped = true;                       // 所有 DMA 都有描述符越界保护：下一 tile 的 key 不必夹取
-let pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, …);   // §4d
-let lut = blk.lut_copy(b);                       // 少于 4 个 tile → 短序列副本
-versioned(b, lut, |b, lut| {                     // 两份代码：短 / 长序列
-    roles.each(b, |b, role| {                    // 两份代码：组 A / 组 B
-        let mut body = AttnBody3::new(b, &ring, &blk, wid, lut);
-        body.kscale_sel = true;                  // §4e
-        let p = amdgpu_tile::rowsum::plan();
-        body.sm.use_rows2(b, &blk.lane, p.dwords, p.idx);     // §4h
-        if !lut { body.sm.set_vendor_ref(b); body.lazy_bias = true; }    // §4f：厂商配方 + 懒更新
-        body.setprio = true;
-        pipe.run(b, role, &mut body);            // 整个 KV 循环
-        let fin = body.out_scale(b);
-        store_out3_lds(&io, b, &blk, &ring.epi, wid, &body.o.expect("O"), fin);   // §4i
-    });
-});
+出厂 kernel 分五层写成。前三层决定"有哪些 stage、谁连谁"；后两层决定"每个 stage 做什么、按什么顺序发射"。
+
+### §3a 算子图（`fmha/graph.rs`）
+
+`graph_vs128()` 描述的内容：
+- **节点**：stage 实例，含 registry key、参数、资源估计、所在相位与 pipeline hook；
+- **边**：张量，含布局、作用域、存储，以及交接代价类 C0–C4；
+- **weave group**：哪些 stage 由同一个 weaver 交织。
+
+```
+kv_stage [M: move.kv_stage] (slots=2)          hook stage
+softmax  [O: online.softmax] (vendor two-word reference, lazy rollback)   hook v_phase
+pv       [A: mma.pv]                             hook m_phase  ┐ weave group m_phase
+qk       [A: mma.qk] (K-scale byte select)       hook m_phase  ┘
+out      [E: map.store_bf16] (wave-private LDS transpose)   epilogue
+on-chip: kv kv_stage→qk,pv C3 (block) | s qk→softmax C0 (loop-carried) | p softmax→pv C0 | o pv→out C2
 ```
 
-两个"代码副本"维度都是 workgroup 一致的条件，用 `versioned` / `Roles::each` 生成 `if/else`
-（`crates/amdgpu-tile/src/lane.rs:103-109`、`crates/amdgpu-tile/src/lane.rs:86-92`）。所以 `_vs128` 里共有 2×2 = 4 份内层循环。
+图同时以 JSON 存在（`fmha/vs128.graph.json`）。测试保证 JSON 与 `graph_vs128()` 一致、切分与代价类一致。
 
-`AttnBody3`（`crates/amdgpu-kernels/src/fmha/mod.rs:187-207`）是这个 kernel 给流水线提供的"每个相位做什么"：
-它实现 `PipeBody` trait（`crates/amdgpu-tile/src/pipeline.rs:72-102`），流水线负责"什么时候做"（§4d）。
+### §3b 骨架（`fmha/skeleton_vs128.rs`，生成文件，勿手改）
+
+由 `amdgpu_tile::opgraph::skeleton` 从图生成，内容包括：
+- trait `Vs128Slots`，三个 slot：`prelude` / `pipeline` / `dispatch`；
+- `build_vs128(name, slots)`：先检查图（节点、代价类），再依次调用三个 slot。
+
+**每个形状的编排全部在 slot 里，图和骨架不规定发射顺序**。
+
+### §3c slot 实现（`fmha/mod.rs`，`impl skeleton_vs128::Vs128Slots for Vs128Slots`）
+
+```rust
+fn prelude(&mut self, b: &mut FnBuilder) -> FmhaCx {
+    b.compile_profile(CompileProfile::Vs128);
+    let io = declare_io(b, 256, false);                  // ABI + 主机合同（§4a）
+    let blk = block3(&io, b, 8);                         // 行号、Q 片段、scale（§4a）
+    let roles = Roles::split(b, &blk.lane, 4);           // wave 0..3 = 组 A，4..7 = 组 B
+    let mut ring = KvRing3::new(b, &io, &blk, &roles, 2); // LDS 计划 + 拷贝分区（§4b、§4c）
+    ring.enable_buffer_dma(b); ring.enable_buffer_kd(b);
+    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, …);
+    pipe.key_unclamped = true;                           // 所有 DMA 经描述符越界保护
+    let lut = blk.lut_copy(b);                           // 少于 4 个 tile → 短序列副本
+    FmhaCx { io, blk, roles, ring, pipe: Some(pipe), lut }
+}
+fn dispatch(&mut self, b: &mut FnBuilder, cx: &mut FmhaCx, pipe: &Pipeline) {
+    versioned(b, lut, |b, lut| roles.each(b, |b, role| {      // 2 (短/长) × 2 (组 A/B) 份代码
+        let mut body = AttnBody3::new(b, ring, blk, wid, lut);
+        body.kscale_sel = true; body.setprio = true; body.biasonce = true;
+        body.sm.use_rows2(b, &blk.lane, …);                   // §4h
+        if !lut { body.sm.set_vendor_ref(b); body.lazy_bias = true; }   // §4f
+        pipe.run(b, role, &mut body);                         // 整个 KV 循环（§4d）
+        store_out3_lds(io, b, blk, &ring.epi, wid, &body.o.expect("O"), body.out_scale(b));   // §4i
+    }));
+}
+```
+
+### §3d stage 实例（`AttnBody3` 的 `PipeBody` 相位）
+
+`Pipeline::run` 决定"什么时候做"：wait、barrier、槽与代、剥离的末 tile。`AttnBody3` 在每个 hook 里构造 stage 实例（`amdgpu_tile::stage::StageInst`），每个实例 = registry key + `StageContract` + 发射单元。
+
+| hook | stage 实例 | contract 里的交接 |
+|---|---|---|
+| `stage` | `kv.stage`（`move.kv_stage`）：组 A 发 K-scale + K，组 B 发 V；每条 DMA 一个单元 | slot 偏移（`SlotIdx::offset_scalars`）作为标量交出 |
+| `v_phase` | `v_phase`（`online.softmax`）：`softmax.decide`（含回滚分支）+ `softmax.convert` | 交出 `P`（16 个字）与参考字 `ref` |
+| `m_phase` | `m_phase` = `stage::merge` 合并 `pv`（`mma.pv`）与 `qk`（`mma.qk`），一个区域 | 声明接收 `P`、`ref` 与 slot 偏移 |
+| `window`（`_t128`） | `window`（`online.softmax` + 下一 tile 的 QK 块） | slot 偏移 |
+
+每个实例发射在 `Node::Stage` 区域里，GV-STAGE 检查以下内容：
+- 跨区域读取的值必须声明为交接；
+- 布局 / 存储 / owner 一致；
+- 在途访存不超过容忍；
+- barrier 数。
+
+`_vs128` / `_kvsplit` 证明了 12 个交接，`_t128` 证明了 4 个。
+
+### §3e 发射单元与 weaver（`amdgpu_tile::weave`）
+
+stage 实例返回发射单元（`Units`），而不是直接发射。`m_phase` 的单元如下：
+
+```
+pv.setup  pv.rowsum  pv.read.h0e0 pv.mma.h0e0 … pv.read.h1e3 pv.mma.h1e3      (mma.pv)
+qk.setup(bias MFMA)  qk.read0 qk.mma0 … qk.read3 qk.mma3  qk.end            (mma.qk)
+```
+
+`StageInst::emit` 用 `Weaver::new(units).phase(name).seq()` 按声明顺序发射，`emit_with(|w| w.order(…))` 可换成显式顺序。每次发射前都会检查拓扑序。
+
+出厂顺序就是声明顺序。改动单元顺序、区域策略或寄存器放置的实验都测成负收益，结果记在 [`fmha-weaver-parity.md`](fmha-weaver-parity.md)。
 
 ---
 
@@ -151,212 +198,117 @@ versioned(b, lut, |b, lut| {                     // 两份代码：短 / 长序�
 
 ### §4a ABI 与每 block 状态
 
-- **ABI**：`declare_io`（`crates/amdgpu-kernels/src/fmha/mod.rs:469-539`）用 `KArgs::tensor` 把 kernarg 声明成 BSHD 张量：
-  Q/K/V 为 fp8、O 为 bf16、Q/K 的 E8M0 descale 为 `[B, S, H, 4]`、V 的 descale 为一个标量。每个张量的形状/步长来自 kernarg 偏移，
-  同时**生成主机合同**（`arg_tensor`、`ka_is`、`grid_is`、`contract::compact_tensor`）——验证器就是拿这些合同去证明每一次访存在界内。
-  KV-split 多出 `0x270 Ohat、0x278 lse、0x280 splits、0x284 rows_total`（`crates/amdgpu-kernels/src/fmha/mod.rs:524-537`）。
-  对应的类型 `FmhaIo` / `KvsArgs` 在 `crates/amdgpu-kernels/src/fmha/io.rs:16-39`。
-- **每 block 状态**：`block3`（`crates/amdgpu-kernels/src/fmha/mod.rs:543-598`）产出 `FmhaBlock`（`crates/amdgpu-kernels/src/fmha/io.rs:141-164`）：
-  - query 行：`row0 = qtile·rows + 32·wave`，`row = row0 + lane % 32`，越界行夹到 `S-1`（只读不写，写回时由 `row0 < S` 守卫）；
-  - KV-split 时由 grid z 解出 (batch, split) 和本 split 的 key 区间（`components::kv_split_decode` / `kv_split_range`，
-    `crates/amdgpu-tile/src/components.rs:20`、`crates/amdgpu-tile/src/components.rs:32`）；GQA 的 KV head 由 `gqa_kv_head` 算出（`crates/amdgpu-tile/src/components.rs:8`）；
-  - **Q 常驻寄存器**：Q 是 QK MFMA 的 B 操作数，用 `make_tiled_copy_b(GLOBAL_LOAD_X4, &mma)` 推导出每个 lane 的 4 条 `global_load_dwordx4`
-    （`crates/amdgpu-kernels/src/fmha/mod.rs:567-585`），整个 kernel 只读一次；
-  - **Q 的 scale**：E8M0 字节按 lane 半区选出（`ScaleSel::pair`，`crates/amdgpu-tile/src/frag.rs:139-152`），再 **减 9**
-    （`crates/amdgpu-kernels/src/fmha/mod.rs:591`）——即 S 以 1/512 为单位，`x = S·2^-9`，后面 softmax 的指数都在这个单位上；
-  - `nkv = ceil(kv_len/128)` 个 tile，最后一个可能不满（masked）。
+- **`declare_io`**：用 `KArgs::tensor` 把 kernarg 声明成 BSHD 张量。
+  - Q/K/V 为 fp8，O 为 bf16，Q/K 的 E8M0 descale 为 `[B, S, H, 4]`，V 的 descale 是一个标量。
+  - 同时生成主机合同（`arg_tensor`、`ka_is`、`grid_is`），验证器用它证明每次访存都在界内。
+  - KV-split 多出 `Ohat`、`lse`、`splits`、`rows_total` 四个参数。
+- **`block3`**：产出 `FmhaBlock`（`io.rs`）。
+  - query 行：`row0 = qtile·rows + 32·wave`，越界行夹到 `S-1`；写回时由 `row0 < S` 守卫。
+  - KV-split 的 (batch, split) 与 key 区间：`components::kv_split_decode` / `kv_split_range`。
+  - GQA：`gqa_kv_head`。
+  - Q 常驻寄存器：它是 QK 的 B 操作数，`make_tiled_copy_b(GLOBAL_LOAD_X4, &mma)` 推导出每 lane 4 条 16 字节读。
+  - Q 的 scale **减 9**：S 以 1/512 为单位，后面 softmax 的指数都在这个单位上。
+  - tile 数 `nkv = ceil(kv_len / 128)`，最后一个可能不满（masked）。
 
-### §4b LDS 计划
-
-```rust
-// crates/amdgpu-kernels/src/fmha/mod.rs:80-88（KvRing3::new 开头）
-let [ks, vs] = lds.ring_group(slots, [("K", 16384, Layout::FMHA_SWZ), ("V", 16384, Layout::FMHA_SWZ)]);
-let kd = lds.ring("KD", 512, slots, Layout::Linear);
-lds.at(32768 * slots as i64 + 2048);
-let ones = lds.tile("ones", 2048, Layout::Linear);
-let q1 = lds.tile("Q1", 16384, Layout::Linear);
-let q0 = lds.tile("Q0", 16384, Layout::Linear);
-let epi = lds.private("epi", 4096, 8, &[&q1, &q0]);
-```
+### §4b LDS 计划（`KvRing3::new`）
 
 | 区域 | 大小 | 用途 |
 |---|---|---|
-| K / V 环 | 每槽 16 KB + 16 KB，`slots` 槽（`_vs128` 2，`_t128` 3） | 128 key × 128 字节，行内 16 字节块做 FMHA swizzle（`Layout::FMHA_SWZ`，`crates/amdgpu-tile/src/shared.rs:31`） |
-| KD 环 | 每槽 512 B | 128 个 key 的 4 字节 E8M0 scale 字 |
-| ones、Q0/Q1 | 2 KB、16 KB×2 | prologue 写一次的常量（`store_constants`，`crates/amdgpu-kernels/src/fmha/mod.rs:170-184`） |
-| epi | 每 wave 4 KB 私有区 | epilogue 转置中转，复用（overlay）Q0/Q1 的空间 |
+| K / V 环 | 每槽 16 KB + 16 KB，`_vs128` 2 槽、`_t128` 3 槽 | 128 key × 128 字节，行内 16 字节块按 `Layout::FMHA_SWZ` 打散 |
+| KD 环 | 每槽 512 B | 128 个 key 的 E8M0 scale 字 |
+| ones、Q0/Q1 | 2 KB、16 KB × 2 | prologue 写一次的常量（`store_constants`） |
+| epi | 每 wave 4 KB 私有区 | epilogue 转置中转，复用 Q0/Q1 的空间 |
 
-`LdsPlan`（`crates/amdgpu-tile/src/shared.rs:199`）是声明式的：`commit` 时把布局写进 Function，验证器据此检查 LDS 访问不越界、
-环形缓冲每个 (槽, 代) 的读写顺序符合协议。
+`LdsPlan::commit` 把布局写进 Function。验证器据此检查越界，以及环形缓冲每个 (槽, 代) 的读写协议。
 
-### §4c K/V DMA：从全局直接写进 LDS
+### §4c K/V DMA（`move.kv_stage`）
 
-gfx950 的 LDS-direct DMA（`global_load_lds_dwordx4` / `buffer_load_dwordx4 … lds`）有个硬约束：**目的地址固定**——第 q 条指令的 lane i 写
-`M0 + imm + 16·i`。所以拷贝要"从目的端反推"：`partition_dma`（`crates/amdgpu-tile/src/dma.rs:37-76`）对每个 lane / 指令算出它落在 LDS 槽内的字节 d，
-用视图的逆映射得到它是 tile 的哪个元素（行 = d / 128，swizzle 只动行内 16 字节块，于是 **swizzle 被搬到了源地址上**），
-再生成源地址。每个 lane 的行号和不同的列偏移只绑定一次，每个 tile 只剩 `key0 + row`、夹取和乘步长。
+LDS-direct DMA 的目的地址是固定的：lane i 写 `M0 + imm + 16·i`。因此 `partition_dma` 从目的端反推：
+- 用视图的逆映射求出每个 lane 写的是哪个元素；
+- swizzle 因此被搬到了源地址上。
 
-```rust
-// crates/amdgpu-kernels/src/fmha/mod.rs:107-108
-let kdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, ksrc, &ks, &kv_view());
-let vdma = partition_dma(b, &ctx, GLOBAL_LDS_X4, &l, &w, &wv, 4, vsrc, &vs, &kv_view());
-```
+`_vs128` 用 MUBUF 形式（`DmaPart::issue_buffer_units`）：
+- 每条指令一个循环不变的 voffset；
+- 每 tile 的推进放进 SGPR soffset，M0 每 tile 一次 `readfirstlane`；
+- 越过序列末尾的行落在描述符的 record range 之外，读回 0，之后被 mask 掉。
 
-- 每个组 4 个 wave，每 wave 4 条 16 字节 DMA，4×4×64×16 B = 16 KB = 一个 K（或 V）tile。
-- **MUBUF 形式**（`_vs128`，`enable_buffer_dma` → `DmaPart::buffer_form` / `issue_buffer`，`crates/amdgpu-tile/src/dma.rs:103-149`）：
-  每条指令一个循环不变的 voffset（VGPR），每 tile 的推进 `key0 × stride` 放进 SGPR soffset，M0 每 tile 一次 `readfirstlane`。
-  越过序列末尾的行不夹取，而是落在 buffer 描述符的 record range 之外——硬件读回 0（这些 key 之后会被 mask 掉，V 行乘以 0 的 P）。
-- **K 的 scale**：`_vs128` / `_kvsplit` 用 `GLOBAL_LDS_X1` 的 DMA（wave 2、3 重复 wave 0、1 的那一半，`crates/amdgpu-kernels/src/fmha/mod.rs:111-115`）；
-  `_t128` 走 VGPR 路径（读进寄存器，`stage_complete` 时再 `ds_write`，`crates/amdgpu-kernels/src/fmha/mod.rs:116-119`）。
-- 谁拷什么：`KvRing3::stage`（`crates/amdgpu-kernels/src/fmha/mod.rs:136-163`）——组 A 拷 K 和 K-scale，组 B 拷 V；`_t128` 一组全拷。
+K 的 scale：`_vs128` / `_kvsplit` 用 DMA；`_t128` 先读进 VGPR，在 `stage_complete` 时再 `ds_write`。
 
-### §4d 流水线：谁在什么时候做什么
-
-`Pipeline::run`（`crates/amdgpu-tile/src/pipeline.rs:176-313`）把节奏写成数据（`Cadence`，`crates/amdgpu-tile/src/pipeline.rs:24-43`）；
-kernel 只提供每个相位的工作。`_vs128` 的 `TwoPhaseOffset`（文档在 `crates/amdgpu-tile/src/pipeline.rs:5-16`，循环体在
-`crates/amdgpu-tile/src/pipeline.rs:365-406`）：
+### §4d 流水线（`Pipeline::run`，`Cadence::TwoPhaseOffset`）
 
 ```
-                 ┌──────── 一个 tile t ────────┐
-组 A:  stage(t+1) | V 相位(t)  | wait vm | barrier | M 相位(t)        | barrier
-组 B:            （比 A 晚一个相位：当 A 在 M 相位时，B 在 V 相位）
-V 相位 = softmax（VALU 为主）：行最大值、回滚、P 转换          （AttnBody3::v_phase，mod.rs:292-306）
-M 相位 = 矩阵（MFMA 为主）：PV(t) + 行和、然后 QK(t+1)         （AttnBody3::m_phase，mod.rs:307-318）
+组 A:  stage(t+1) | V 相位(t) | wait vm | barrier | M 相位(t) | barrier
+组 B:  比 A 晚一个相位：A 在 M 相位时，B 在 V 相位
+V 相位 = v_phase 实例（softmax，VALU 为主）；M 相位 = m_phase 实例（PV(t) + 行和，然后 QK(t+1)）
 ```
 
-- 两组错开一个相位，使得任意时刻总有一组在用 MFMA、另一组在用 VALU（厂商同样的做法）；`setprio` 在 M 相位开头 `s_setprio 1`、V 相位开头 `s_setprio 0`，
-  让矩阵相位优先发射（`crates/amdgpu-kernels/src/fmha/mod.rs:305-307`、`crates/amdgpu-kernels/src/fmha/mod.rs:327-329`）。
-- 注意 QK(t+1) 是在 M 相位末尾算的，所以进入 V 相位(t+1) 时 S 已经就绪。prologue 先算 QK(0)（`prologue_compute`，`crates/amdgpu-kernels/src/fmha/mod.rs:287-289`）。
-- 循环携带的状态（`loop_state` / `bind_state`，`crates/amdgpu-kernels/src/fmha/mod.rs:290-303`）：参考点 bias（Frag2）、4 个 O 累加器、4 个 S 累加器、行和累加器。
-- `TileIt`（`crates/amdgpu-tile/src/pipeline.rs:47-62`）告诉 body 当前 tile 的 (槽, 代)、下一个 tile 的 (槽, 代)、是否最后一个不满 tile（`masked`）。
-  最后一个 tile 被剥离出来（`masked` 与非 masked 两份），所以循环体里没有 mask 开销。
+- **两组错相**：任意时刻总有一组在用 MFMA、另一组在用 VALU。`setprio` 让矩阵相位优先发射。
+- **QK 的时机**：QK(t+1) 在 M 相位末尾计算，所以进入 V 相位 (t+1) 时 S 已就绪；QK(0) 在 `prologue_compute` 里算。
+- **循环携带状态**：参考字、4 个 O 累加器、4 个 S 累加器、行和；循环变量的顺序为 [it, 状态…, idx]。
+- **末 tile 剥离**：masked 与非 masked 各一份，循环体里没有 mask 开销。
 
-### §4e QK：S^T = K·Q^T
+### §4e QK：S^T = K·Q^T（`mma.qk`）
 
-**方向是推导出来的**：`attention_orientation`（`crates/amdgpu-kernels/src/fmha/mod.rs:26-32`）调用 `orient::search_attention`
-（`crates/amdgpu-tile/src/orient.rs:121`）在两个带缩放的 fp8 MFMA 原子上搜索 S→P 的交接方式，断言最优解是"S^T = K·Q^T（A = K，B = Q），
-P 直接作为 PV MFMA（O^T = V^T·P^T）的 B 操作数，转换零代价"。这就是为什么 S 的累加器布局恰好能就地打包成 P。
+方向是推导出来的：`attention_orientation` 调用 `orient::search_attention`，断言最优解为：
+- 计算 S^T = K·Q^T（A = K，B = Q）；
+- P 直接作为 PV（O^T = V^T·P^T）的 B 操作数，交接是零代价的 C0。
 
-```rust
-// crates/amdgpu-kernels/src/fmha/mod.rs:97-103（KvRing3::new）
-let mma = make_tiled_mma(o.0, false);                                       // v_mfma_scale_f32_32x32x64_f8f6f4
-let kview = ComposedLayout::new(Swizzle::fmha128(), make_layout(tup![32, 64], tup![128, 1]));
-let placements: Vec<i64> = (0..4).flat_map(|s| (0..2).map(move |c| 4096 * s + 64 * c)).collect();
-let kpart = make_tiled_copy_a(DS_READ_B128X2, &mma).partition_lds(b, &ctx, &l, &ks, &kview, &placements);
-…
-let kdpart = make_tiled_copy_bcast(DS_READ_B32, kd_read_tv(), 128, 32).partition_lds(…);
-```
+每 32 个 key 一个块（`qk_block` / `qk.read{s}` + `qk.mma{s}`）：
+1. **参考点 bias**：`biasonce` 形式下，一条 f16 32x32x8 MFMA 写 S 块 3（`ones × bias`），块 0–2 把它当作第一条缩放 MFMA 的 C 输入。
+2. **读操作数**：两个 K 片段（`ds_read_b128 x2`）和一个 K-scale 字（`ds_read_b32`）。
+3. **K-scale 字节选择**：每个 lane 按所在半区右移 `8·(lane/32)`，两条缩放 MFMA 用 op_sel 分别取字节 0 和字节 2。
+4. **两条 MFMA**：`v_mfma_scale_f32_32x32x64_f8f6f4`。
 
-- `make_tiled_copy_a(atom, mma)`（`crates/amdgpu-tile/src/copy.rs:54-57`）：用 MMA 原子 A 操作数的 TV 布局当拷贝的 TV 布局——
-  "lane l 的寄存器里应放 A 的哪些元素"由原子决定，拷贝只负责从 LDS 把它们读出来。
-- `partition_lds`（`crates/amdgpu-tile/src/copy.rs:78-98`）在构建期证明每条 `ds_read_b128` 读的 16 字节在 swizzle 后仍连续对齐（`proofs::check_contiguous`），
-  并把每个 lane 的地址拆成"绑定一次的 base 寄存器 + 指令立即数"。8 个 placement = 4 个 32-key 块 × 2 个 64 字节 k 组。
-- 每 32 key 一个块（`qk_block`，`crates/amdgpu-kernels/src/fmha/mod.rs:218-250`）：
-  1. **参考点 bias**：`var_mfma_f16_z(S_s, ones_f16, bias)` 一条 f16 32x32x8 MFMA 把累加器初始化成 `ones × bias`，
-     即每个 query 列加上同一个参考值（§4f 的"减最大值"就这样折叠进了 MFMA，不需要逐元素 VALU）；
-  2. 两个 K 片段（各 `ds_read_b128 x2`）、一个 K-scale 字（`ds_read_b32`）；
-  3. **K-scale 字节选择**（`kscale_sel`）：scale 字里 4 个字节对应 4 个 32 维 k 组；每个 lane 先按自己的半区右移 `8·(lane/32)` 位一次，
-     然后两条带缩放 MFMA 分别用 op_sel 选字节 0 与字节 2（`crates/amdgpu-kernels/src/fmha/mod.rs:231-237`），
-     这是厂商的写法（比"每块提取两个字"少一半移位）；
-  4. 两条 `v_mfma_scale_f32_32x32x64_f8f6f4`，经 `gemm`（`crates/amdgpu-tile/src/mma.rs:68-82`）发出。
-- 4 个块 = 4 个 32x32 S 累加器 = 128 key × 32 query，每个 lane 16 个 f32。
+### §4f online softmax（`online.softmax`，`OnlineSoftmax`）
 
-### §4f online softmax：参考点、回滚、厂商配方
+softmax 不维护运行最大值，而是维护参考点 `b`（两个 f16 字，`b = 4·(hi + lo)`）。S 在 QK 时已经加上了它。
 
-`OnlineSoftmax`（`crates/amdgpu-tile/src/softmax.rs:34-52`）不维护"运行最大值"本身，而是维护一个**参考点** `b`（以两个 f16 字 `b = 4·(hi + lo)`
-存储，精确到约 2^-22），S 在 QK 时就已经加上了它：`x = S + b`。每个 tile 做**一次**决定（`decide_impl`，`crates/amdgpu-tile/src/softmax.rs:129-231`）：
+每个 tile 做一次决定：
+1. **行最大值**：`v_max3` 链，再与伙伴 lane 交换；
+2. **是否越界**：若最大值超过阈值，参考点移动并重新量化，得到 `delta`；
+3. **回滚分支**：`S += delta`，`O`、`l *= 2^(512·delta)`。分支没有 exec mask，不回滚的 lane 拿到的 `delta = 0`。
 
-1. 行最大值 `m`：`v_max3_f32` 链 + 与伙伴 lane（`l ^ 32`，同一 query 的另一半 key）交换（`row_max`，`crates/amdgpu-tile/src/reduce.rs:52-64`）；
-2. 若 `m > thr`：参考点移到 `b_new = b + (target − m)`，重新量化成两个 f16 字，`delta = b_q − b_old`；
-3. 回滚分支（`crates/amdgpu-tile/src/softmax.rs:215-229`）：`S += delta`（`v_pk_add_f32`）、`O *= 2^(512·delta)`、`l *= 2^(512·delta)`。
-   分支没有 exec mask——不回滚的 lane 拿到的 `delta = 0`，所以对它们是恒等。
-4. 新参考字写回循环变量，并作为下一个 tile 的 bias MFMA 的输入。
+两份副本（`versioned`）用不同的配方：
 
-**两套参数**（`versioned` 选出的两份代码各用一套）：
-
-| | 短序列副本（< 4 个 tile，`lut = true`） | 长序列副本（≥ 4 个 tile；三条路径都一样） |
+| | 短序列（< 4 tile） | 长序列（≥ 4 tile） |
 |---|---|---|
-| 配方（`_vs128`） | `Recipe::vsx(true)`（`crates/amdgpu-tile/src/softmax.rs:27-31`） | 厂商参考配方 `set_vendor_ref`（`crates/amdgpu-tile/src/softmax.rs:75-88`） |
-| 目标 / 阈值 | 131/512、阈值 120/512（阈值低于目标：几乎每个 tile 都重新对齐） | `s91 = 0.24799132` / `s92 = 0.26135647`（阈值比目标高 6.84/512：懒回滚，只有行最大值越过阈值才移动参考点） |
-| 第一个 tile | — | 初始参考点 b = 64（bias 字 0x4800）让第一个 tile 的最大值远超阈值，必然对齐 |
-| 快速路径 | 每 tile 计算新参考字 | **懒更新**（`decide_lazy`，`crates/amdgpu-tile/src/softmax.rs:236-287`；`crates/amdgpu-kernels/src/fmha/mod.rs:310-316`）：参考字重新量化与重缩放全部放进回滚分支，不回滚的 tile 只付出行最大值 + 一次比较 + 分支 |
-| P 转换 | pknorm + LUT 修正 | pknorm，无修正，转换 scale = 0.25（厂商的 `s89`） |
-| 误差 | 精确（坏点 0） | 落在厂商的误差统计上（坏点数、均值与厂商一致） |
+| 配方 | `Recipe::vsx(true)`：目标 131/512、阈值 120/512 | 厂商参考配方 `set_vendor_ref`：`s91` / `s92` |
+| 决定 | `decide`（每 tile 计算新参考字） | `decide_lazy`：重新量化与重缩放全部放进回滚分支 |
+| P 转换 | pknorm + LUT 修正 | pknorm，scale 0.25 |
 
-为什么短序列不用厂商配方：tile 太少时懒回滚的误差平均不掉，过不了厂商对齐 gate（从 2 个 tile 起用厂商配方时，S=300 SK=129 是厂商均值的 1.31 倍；从 4 个 tile 起全部通过）。
-懒更新只在真实数据上体现：harness 的调色板数据（`REF_DATA=lcg`）让行最大值几乎每个 tile 都变，两边都几乎每 tile 回滚；正态分布数据（`REF_DATA=normal`）上回滚很少，快速路径决定速度——`tools/port_gate.sh` 的 PERF 因此用 `normal` 数据。
-切换条件 `lut_copy` 在 `crates/amdgpu-kernels/src/fmha/io.rs:213-217`。参数的来龙去脉见 [`vendor-spec.md`](vendor-spec.md) §4.7 与 [`current-status.md`](current-status.md)。
+短序列不用厂商配方的原因：tile 太少时懒回滚的误差平均不掉，过不了厂商对齐 gate。懒更新的收益只在真实数据上体现，所以 gate 的 PERF 用 `REF_DATA=normal`。
 
-最后一个不满的 tile 用 `KeyMask`（`crates/amdgpu-tile/src/reduce.rs:13-32`）把越界 key 换成 `-1e30`（求最大值时）或 0（求 P 时）。
+最后一个不满的 tile 用 `KeyMask`：越界 key 求最大值时取 `-1e30`，求 P 时取 0。
 
-### §4g P 转换：fp8 打包
+### §4g P 转换
 
-```rust
-// crates/amdgpu-tile/src/softmax.rs:240-249（OnlineSoftmax::convert）
-for i in t0..t1 {
-    let xs = masked_values(b, s, i, mask, self.zero_f);
-    words.extend(to_p8(b, &xs, self.conv_s, conv, lut.as_ref()));
-}
-```
+`to_p8` 每 4 个值出一个 fp8 字：
+1. `v_cvt_pknorm_u16_f32` 把 x 量化成 u16；把这个 u16 当作 bf16 看，就近似 `2^(512x − 127)`；
+2. `v_cvt_scalef32_pk_fp8_bf16` 再转成 E4M3。
 
-`to_p8`（`crates/amdgpu-tile/src/reduce.rs:94-113`）每 4 个值出一个 fp8 字：`v_cvt_pknorm_u16_f32` 把 x ∈ [0, 1] 量化成 u16，
-**把 u16 当成 bf16 看就是 `2^(512x − 127)` 的近似**（Schraudolph 式指数），再由 `v_cvt_scalef32_pk_fp8_bf16` 转成两个 E4M3（op_sel 合并高低半）。
-所以 P = exp(S − max) 不需要 `v_exp_f32`——这正是 S 以 1/512 为单位（§4a 的 −9）的原因。
+所以 P 不需要 `v_exp_f32`。
 
-4 个 S 累加器 → 16 个 P 字 = 两个 PV 的 B 片段（`Frag::from_words`，`crates/amdgpu-tile/src/frag.rs:76-81`）。
-因为方向是推导出来的零代价交接（§4e），P 字按累加器顺序打包即可，不需要任何 lane 间重排；key 的排列差异由 V 的转置读取吸收（§4h）。
+4 个 S 累加器产出 16 个 P 字，即两个 PV 的 B 片段。按累加器顺序打包即可；key 的排列差异由 V 的转置读取吸收。
 
-### §4h PV 与行和
+### §4h PV 与行和（`mma.pv`）
 
-```rust
-// crates/amdgpu-kernels/src/fmha/mod.rs:246-258（AttnBody3::pv）
-let v = r.vpart.at(b, &r.vs.at(slot));
-let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]), Frag::<B32x32x64Fp8>::from_words(b, &w[8..16])];
-self.sm.row_sum(b, p[0].v, p[1].v);
-for (hh, pf) in p.iter().enumerate() {
-    for e in 0..4usize {
-        let vf = v.read(b, hh + 2 * e);
-        gemm(b, &r.mma, o.accs[e].var, vf, pf.v, self.c127, self.c123, 0, 0);
-    }
-}
-```
+- **V^T 片段**：`ds_read_b64_tr_b8` 读的同时做 8×8 转置。源布局 `vt_tr_source` 配同一个 swizzle 视图；硬件映射是实测的（`amdgpu_isa::tr_b8`）。
+- **8 条 PV MFMA**：2 个 P 片段 × 4 个 O 累加器。V 的 scale 为 127，P 的 scale 为 123（×2^-4），epilogue 中的 `l` 相应除以 16。
+- **行和**：两条 `v_smfmac_f32_16x16x128_fp8_fp8`（`rowsum.rs` 的 `RowSum2`，构建期 `prove` 证明每个 P 字节恰好被求和一次）。
+  - 每个 lane 的行和 = dword 0 + dword 1，只含它自己那一行 query；
+  - 因此回滚时逐 lane 缩放仍然精确（`scale_l`）。
 
-- **V^T 片段**：PV 计算 `O^T = V^T·P^T`，需要 V 的转置。`ds_read_b64_tr_b8` 在读的同时做 8×8 字节转置；
-  它的源地址布局 `vt_tr_source`（`crates/amdgpu-kernels/src/fmha/mod.rs:42-44`）配上同一个 swizzle 视图 `kv_view`，
-  由 `make_tiled_copy(DS_READ_TR_B8X4, …)` 分区（`crates/amdgpu-kernels/src/fmha/mod.rs:104`）。硬件的转置映射是实测出来的
-  （`amdgpu_isa::tr_b8`，`crates/amdgpu-isa/src/lib.rs:294`；探针记录见 [`isa-probes-smfmac-tr.md`](isa-probes-smfmac-tr.md)）。
-- **8 条 PV MFMA**：2 个 P 片段（各 64 key）× 4 个 O 累加器（各 32 维）。scale 固定：V 用 127（×1），P 用 123（×2^-4）；行和 l 不带这个因子，所以 `l_total` 末尾乘 1/16 与之对应（§4i）。
-- **行和 l：两条 smfmac**（`crates/amdgpu-tile/src/rowsum.rs`）。`v_smfmac_f32_16x16x128_fp8_fp8` 的 A 是 2:4 压缩的稀疏操作数、B 是稠密的 P。
-  P 片段里 lane l 的 32 个字节全属于 query `l % 32`；方案 `RowSum2`（`crates/amdgpu-tile/src/rowsum.rs:20-24`）：
-  - A 的第 m 行只在 `m % 4 ∈ {0, 1}` 时非零，非零的"全 1"放在偶数或奇数 k 组（决定它求和的是 query n 还是 n+16）；
-  - 同一 lane 的两行用互补的索引字 `0x44444444`（每个 B dword 的字节 0、1）与 `0xeeeeeeee`（字节 2、3）；
-  - 两个 P 片段累加进同一个 D：lane l 的行和 = D 的 dword 0 + dword 1，**只含自己的 query**，所以回滚时逐 lane 缩放这两个 dword 仍是精确的
-    （`scale_l`，`crates/amdgpu-tile/src/softmax.rs:311-319`）。
-  - `rowsum::prove`（`crates/amdgpu-tile/src/rowsum.rs:79-92`）在实测的 smfmac 语义（`amdgpu_isa::smfmac::k_of`，`crates/amdgpu-isa/src/lib.rs:264`）上
-    枚举 64 lane × 16 个存储值，证明每个属于 query `l % 32` 的 P 字节恰好被求和一次、没有别的；`rowsum::search`（`crates/amdgpu-tile/src/rowsum.rs:95-112`）
-    枚举所有 dword 对 × 互补索引对，出厂方案 `plan()`（`crates/amdgpu-tile/src/rowsum.rs:115-119`）是其中之一。
-  - 生成 A 操作数与索引字的代码：`SmfmacOnes::new_rows2`（`crates/amdgpu-tile/src/reduce.rs:143-161`）；两条 smfmac：`crates/amdgpu-tile/src/reduce.rs:163-168`。
+### §4i Epilogue
 
-### §4i Epilogue：归一化与写回
+- `out_scale = V_descale / l`。
+- `_vs128`：`store_out3_lds`。按累加器布局 `ds_write_b32` 进每 wave 的私有区（`Swizzle<3,4,3>`），再按行 `ds_read_b128` 读回，最后 8 条 16 字节全局写。
+- `_t128`：`store_out3` 直接按 C 布局写 `global_store_dwordx2`。
 
-所有 tile 结束后：
+### §4j KV-split
 
-- `l_total`（`crates/amdgpu-tile/src/softmax.rs:321-336`）= (dword 0 + dword 1) / 16（与 PV 中 P 的 2^-4 缩放约定一致），
-  `out_scale = V_descale / l`（`crates/amdgpu-kernels/src/fmha/io.rs:219-222`）。
-- `_vs128`：`store_out3_lds`（`crates/amdgpu-kernels/src/fmha/mod.rs:636-685`）。O^T 的累加器布局里一个 lane 持有一个 query 的 4 个连续维度 × 若干组，
-  直接写全局只能是 8 字节的 `global_store_dwordx2`。这里先用 `ds_write_b32` 按累加器布局写进每 wave 私有的 LDS 区（16 字节块按 query 做 `Swizzle<3,4,3>`），
-  再以行连续的方式 `ds_read_b128` 读回，最后 8 条 16 字节 `global_store_dwordx4`（厂商的条数）。写/读两个方向都是 `make_tiled_copy` + 显式 TV 布局。
-- `_t128`：`store_out3`（`crates/amdgpu-kernels/src/fmha/mod.rs:603-630`）直接按 C 布局 `global_store_dwordx2`。
-- 写回整体由 `row0 < S` 守卫；越界的 query 行在 Q 读取时已被夹取，结果不会被写出。
-
-### §4j KV-split：部分结果与合并
-
-- 主 kernel `_kvsplit` 与 `_vs128` 结构相同（同样 `TwoPhaseOffset` + 两条 smfmac 行和），区别是每个 block 只处理自己 split 的 key 区间，
-  且 epilogue 写的是部分结果：`store_partial3`（`crates/amdgpu-kernels/src/fmha/mod.rs:690-756`）把 `Ohat = O·fin` 存成 fp16，
-  同时写 `lse = log2(l) − 512·b`（`OnlineSoftmax::lse`，`crates/amdgpu-tile/src/softmax.rs:339-353`）——与 split 无关的对数和，各 split 可直接比较。
-- 合并 kernel `_kvsplit_combine8h`：`combine_kernel`（`crates/amdgpu-kernels/src/fmha/io.rs:228-249`）→ `combine_splits`（`crates/amdgpu-tile/src/epilogue.rs:93-171`），
-  每个线程负责 8 个输出元素，在 split 上做在线最大值 / 重缩放（`m`、`den = Σ 2^(lse − m)`、`acc = Σ 2^(lse − m)·Ohat`），最后输出 bf16。
-- 短 / 长序列副本按**整个序列**的 tile 数选（`lut_copy` 用 `ntiles_total`），与 split 数无关；长序列副本（≥ 4 个 tile）与 `_vs128` 一样用厂商参考配方 + 懒更新。
+- **主 kernel**：结构同 `_vs128`，只处理自己 split 的 key 区间。`store_partial3` 写 fp16 的 `Ohat` 和 `lse = log2(l) − 512·b`。
+- **合并 kernel**：`combine_kernel` → `combine_splits`，在各 split 上做在线最大值与重缩放。
+- **副本选择**：按整个序列的 tile 数选短 / 长副本，与 split 数无关。
 
 ---
 
@@ -365,102 +317,57 @@ for (hh, pf) in p.iter().enumerate() {
 | | `_vs128` | `_t128` | `_kvsplit` |
 |---|---|---|---|
 | 线程 / 行 | 512 / 256 | 256 / 128 | 512 / 256 |
-| 节奏 | `TwoPhaseOffset`（两组错相） | `OneWindow`（一组，3 槽，每 tile 一个窗口） | `TwoPhaseOffset` |
-| body 入口 | `v_phase` + `m_phase` | `window`（`crates/amdgpu-kernels/src/fmha/mod.rs:336-359`） | `v_phase` + `m_phase` |
-| K/V DMA | MUBUF | global LDS-direct（`issue_rows_shared`） | global LDS-direct |
-| K-scale | MUBUF DMA，op_sel 字节选择 | VGPR 路径，`ScaleSel::pair` 提取 | DMA，`ScaleSel::pair` 提取 |
-| 行和 | 2 条 smfmac | 4 条 smfmac（`SmfmacOnes::new`，`crates/amdgpu-tile/src/reduce.rs:125-139`） | 2 条 smfmac |
-| 长序列副本的配方（≥ 4 tile） | 厂商参考配方 + 懒更新 | 厂商参考配方 + 懒更新 | 厂商参考配方 + 懒更新 |
+| 节奏 | `TwoPhaseOffset` | `OneWindow`（3 槽，每 tile 一个窗口） | `TwoPhaseOffset` |
+| stage 实例 | kv.stage、v_phase、m_phase | window（softmax 转换块与下一 tile 的 QK 块交替），PV 在窗口之后 | 同 `_vs128` |
+| K/V DMA | MUBUF | global LDS-direct | global LDS-direct |
+| K-scale | MUBUF DMA，字节选择 | VGPR 路径 | DMA，`ScaleSel::pair` |
+| 行和 | 2 条 smfmac | 4 条 smfmac | 2 条 smfmac |
 | epilogue | LDS 中转 | 直接 `dwordx2` | 部分结果 + `lse` |
 
-`_t128` 的窗口（`OneWindow` 循环体：`crates/amdgpu-tile/src/pipeline.rs:462-490`）：先发起 tile t+2 的 DMA，再在一个窗口里交错完成
-"softmax 决定 → 每 32 key 转换 P 的同时算下一 tile 的 QK 块 → PV"，最后一次 wait + barrier。它的参考字在窗口**末尾**才写回
-（`decide_deferred` + `commit_bias`，`crates/amdgpu-tile/src/softmax.rs:109-118`），因为提前写会拉长旧字的活跃区间，使调度器退化。
+`_t128` 的窗口参考字在窗口**末尾**才写回（`decide_deferred` + `commit_bias`）：提前写会拉长旧字的活跃区间，使调度器退化。
 
 ---
 
-## §6 布局层与 ISA 原子：地址是怎么"推导"出来的
+## §6 布局层与 ISA 原子
 
-本仓库借用 CuTe 的思路：**布局（Layout）是从坐标到偏移的函数**，形如 `shape : stride`；**TV 布局**是从 (线程, 值) 到 tile 元素的布局。
+**布局层**（借用 CuTe 的思路）：
+- **Layout**：从坐标到偏移的函数（`shape : stride`）。
+- **TV 布局**：从 (线程, 值) 到 tile 元素。
+- **`Swizzle::fmha128()`**：用行号的位打散行内 16 字节块，使 `ds_read_b128` 与 `ds_read_b64_tr_b8` 都没有 bank 冲突。
+- **`ComposedLayout`** = swizzle ∘ layout。
+- **`IssuePlan` / `layout_to_offsets`**：把每条指令的地址拆成"每 lane 一次的 base + 立即数"。
+- **构建期证明**（`amdgpu-layout/src/proofs.rs`）：覆盖性、连续对齐、swizzle 双射。证明失败时 builder 直接 panic。
 
-- `make_layout(shape, stride)`：`crates/amdgpu-layout/src/layout.rs:25`。例如 K/V tile 的 LDS 视图 `[128 key, 128 字节]`、行步长 128：
-  `make_layout(tup![128, 128], tup![128, 1])`（`crates/amdgpu-kernels/src/fmha/mod.rs:35-37`）。
-- `Swizzle`（`crates/amdgpu-layout/src/swizzle.rs:14-23`）：把源位的奇偶 XOR 进目的位。`Swizzle::fmha128()`（`crates/amdgpu-layout/src/swizzle.rs:35-37`）
-  用行号的位打散行内 16 字节块，使 `ds_read_b128` 与 `ds_read_b64_tr_b8` 都无 bank 冲突；`Swizzle::cute(3, 4, 3)` 是 CuTe 的 `Swizzle<3,4,3>`（epilogue 用）。
-- `ComposedLayout`（`crates/amdgpu-layout/src/swizzle.rs:106`）= swizzle ∘ layout，即"带 swizzle 的视图"。
-- 地址计划：`IssuePlan`（`crates/amdgpu-layout/src/tv.rs:41`）把 TV 布局按指令宽度切成指令，`layout_to_offsets`（`crates/amdgpu-layout/src/tv.rs:86`）
-  把每条指令的地址表达式拆成"每 lane 一次的 base + 立即数"，立即数受原子的 `ImmRange` 约束。
-- 构建期证明（`crates/amdgpu-layout/src/proofs.rs`）：`check_tv` 覆盖性（每个元素恰好一次，`crates/amdgpu-layout/src/proofs.rs:22`）、
-  `check_contiguous` 连续对齐（`crates/amdgpu-layout/src/proofs.rs:48`）、`check_swizzle_bijective` swizzle 是双射（`crates/amdgpu-layout/src/proofs.rs:135`）等。
-  证明失败时 builder 直接 panic——错的地址根本生成不出 kernel。
+**ISA 原子**（`amdgpu-isa`）：
 
-ISA 原子（`crates/amdgpu-isa/src/lib.rs`）：
+| 原子 | 用途 |
+|---|---|
+| `GLOBAL_LOAD_X4`、`GLOBAL_LDS_X4` / `X1`、MUBUF 形式 | Q、K/V、K-scale |
+| `DS_READ_B128X2`、`DS_READ_TR_B8X4`、`DS_READ_B32` | K 片段、V^T 片段、K-scale 字 |
+| `MmaAtom::mfma_scale_32x32x64_f8`、`mfma_32x32x8_f16`、`smfmac_16x16x128_fp8` | QK / PV、参考点、行和 |
 
-| 原子 | 定义 | 在 FMHA 里的用途 |
-|---|---|---|
-| `GLOBAL_LOAD_X4` | `crates/amdgpu-isa/src/lib.rs:66` | Q 常驻片段 |
-| `GLOBAL_LDS_X4` / `GLOBAL_LDS_X1` | `crates/amdgpu-isa/src/lib.rs:73-82` | K/V DMA / K-scale DMA |
-| `DS_READ_B128X2` | `crates/amdgpu-isa/src/lib.rs:89` | K 片段 |
-| `DS_READ_TR_B8X4` | `crates/amdgpu-isa/src/lib.rs:92-96` | V^T 片段（转置读，实测映射） |
-| `DS_READ_B32` | `crates/amdgpu-isa/src/lib.rs:91` | K-scale 字（广播 TV 布局） |
-| `DS_WRITE_B32` / `DS_READ_B128` | `crates/amdgpu-isa/src/lib.rs:99`、`crates/amdgpu-isa/src/lib.rs:88` | epilogue 中转 |
-| `GLOBAL_STORE_X2` | `crates/amdgpu-isa/src/lib.rs:70` | `_t128` 输出 |
-| `MmaAtom::mfma_scale_32x32x64_f8` | `crates/amdgpu-isa/src/lib.rs:165-186` | QK、PV（A/B/C 的 TV 布局写在原子里） |
-| `MmaAtom::mfma_32x32x8_f16` | `crates/amdgpu-isa/src/lib.rs:208` | 参考点 bias（ones × bias） |
-| `MmaAtom::smfmac_16x16x128_fp8` + `mod smfmac` | `crates/amdgpu-isa/src/lib.rs:234`、`crates/amdgpu-isa/src/lib.rs:264` | 行和（稀疏 A 的索引语义为实测） |
-
-每个原子带 `provenance`：`Shipped`（出厂 kernel 已验证的用法）或 `Probe`（单热探针实测，`tests/gpu/isa_probe_host.cpp`，记录的映射有回放测试）。
+每个原子带 `provenance`：`Shipped`（出厂已验证）或 `Probe`（探针实测）。
 
 ---
 
 ## §7 正确性由什么保证
 
-| 层次 | 机制 | 位置 |
-|---|---|---|
-| 构建期 | TV 覆盖性、连续对齐、swizzle 双射、S→P 方向搜索断言、行和方案证明 | `crates/amdgpu-layout/src/proofs.rs`、`crates/amdgpu-kernels/src/fmha/mod.rs:26-32`、`crates/amdgpu-tile/src/rowsum.rs:115-119` |
-| 编译期 | GPU 语义验证器：每次访存对着 ABI 合同证明在界内、LDS 环形缓冲的 (槽, 代) 读写协议、wait/barrier 完整性；`--strict` 只允许证书里列出的可信假设 | `crates/amdgpu-compiler/src/gpu_verify.rs:1687`（`analyse`）、[`gpu-semantics-verifier.md`](gpu-semantics-verifier.md) |
-| 单元/证明测试 | 方向重推导、行和方案、厂商配方的递推与朴素和一致（E2） | `crates/amdgpu-tile/tests/orient.rs`、`crates/amdgpu-tile/tests/rowsum.rs`、`crates/amdgpu-compiler/tests/functional_proofs.rs:37` |
-| GPU | 精度与厂商对齐、确定性、压力、性能 | `tools/port_gate.sh`、`tests/gpu/ref_host.cpp` |
-
-可信假设（`assume_trusted`）都写明理由，例如 tile 计数器的上界（`crates/amdgpu-tile/src/pipeline.rs:254-259`）、`nkv` 的界（`crates/amdgpu-kernels/src/fmha/mod.rs:595`）。
-`gpu-verify --strict` 打印的证书统计它们，gate 记录证书，数量变化即需解释。
+| 层次 | 机制 |
+|---|---|
+| 构建期 | TV 覆盖性、连续对齐、swizzle 双射、S→P 方向搜索断言、行和方案证明；算子图检查（`check_kernel`：节点、代价类） |
+| 编译期 | GPU 语义验证器：访存在界内、LDS 环的 (槽, 代) 协议、wait / barrier；GV-STAGE 检查 stage 交接；`--strict` 只允许证书里列出的可信假设（当前全部出厂 kernel 24 / 100 / 0） |
+| 测试 | 方向、行和、厂商配方递推（functional proofs）、weave / stage registry / opgraph、IR 文本 round-trip（全部 kernel round-trip 并发射相同汇编） |
+| GPU | `tools/port_gate.sh`：精度与厂商对齐、确定性、压力、性能 |
 
 ---
 
 ## §8 改代码前先看这里
 
-- **不要按 kernel 名字分支**：编译策略走 `CompileProfile`，kernel 特性走 builder 里的显式字段（`AttnBody3` 的 `setprio` / `kscale_sel` / `lazy_bias`）。
-- **改地址就改布局**：不要手写 lane 地址公式；换视图、TV 布局或 placement，让 `partition_*` 推导，构建期证明会替你兜底。
-- **改节奏就改 `Pipeline`**：body 只描述相位里的工作，wait / barrier / 槽与代由 `Pipeline::run` 统一生成，验证器按同一协议检查。
-- **改 softmax 先看两份副本**：短序列副本与长序列副本的配方不同（§4f）；改一处要分别跑 gate。
-- **验收**：同一次运行内交替 A/B（`tools/ab_fmha.sh`，≥ 7 轮）+ 完整 `tools/port_gate.sh`；出厂 kernel 的 md5 变化需要说明原因。
-- **对照厂商**：`tools/asm_diff.py` 与 [`fmha-vs-vendor-asm-diff.md`](fmha-vs-vendor-asm-diff.md) 列出了与厂商汇编的差异与已试过的改动。
-
----
-
-## 附录：符号索引
-
-| 符号 | 位置 |
-|---|---|
-| `fmha_fwd_hd128_mxfp8_v3_vs128` / `_kvsplit` / `_kvsplit_combine8h` / `_t128` | `crates/amdgpu-kernels/src/fmha/mod.rs:366-465` |
-| `declare_io`、`block3` | `crates/amdgpu-kernels/src/fmha/mod.rs:469-539`、`crates/amdgpu-kernels/src/fmha/mod.rs:543-598` |
-| `FmhaIo`、`KvsArgs`、`FmhaBlock` | `crates/amdgpu-kernels/src/fmha/io.rs:16-39`、`crates/amdgpu-kernels/src/fmha/io.rs:141-164` |
-| `attention_orientation`、`kv_view`、`vt_tr_source`、`kd_read_tv` | `crates/amdgpu-kernels/src/fmha/mod.rs:26-55` |
-| `KvRing3`（`new`、`enable_buffer_dma`、`stage`、`store_constants`） | `crates/amdgpu-kernels/src/fmha/mod.rs:58-185` |
-| `AttnBody3`（`qk_block`、`qk`、`pv`、`out_scale`） | `crates/amdgpu-kernels/src/fmha/mod.rs:187-275` |
-| `impl PipeBody for AttnBody3`（`v_phase`、`m_phase`、`window`） | `crates/amdgpu-kernels/src/fmha/mod.rs:277-360` |
-| `store_out3`、`store_out3_lds`、`store_partial3` | `crates/amdgpu-kernels/src/fmha/mod.rs:603-756` |
-| `combine_kernel`、`lut_copy`、`FmhaBlock::out_scale` | `crates/amdgpu-kernels/src/fmha/io.rs:213-249` |
-| `Pipeline`、`Cadence`、`TileIt`、`PipeBody` | `crates/amdgpu-tile/src/pipeline.rs:24-157` |
-| `OnlineSoftmax`、`Recipe`、`set_vendor_ref`、`decide_impl` | `crates/amdgpu-tile/src/softmax.rs:16-287` |
-| `to_p8`、`row_max`、`KeyMask`、`SmfmacOnes` | `crates/amdgpu-tile/src/reduce.rs:13-173` |
-| `RowSum2`、`prove`、`search`、`plan` | `crates/amdgpu-tile/src/rowsum.rs:20-119` |
-| `partition_dma`、`BufForm`、`issue_buffer` | `crates/amdgpu-tile/src/dma.rs:37-149` |
-| `make_tiled_copy*`、`partition_lds` | `crates/amdgpu-tile/src/copy.rs:31-98` |
-| `make_tiled_mma`、`gemm` | `crates/amdgpu-tile/src/mma.rs:15`、`crates/amdgpu-tile/src/mma.rs:68-82` |
-| `combine_splits` | `crates/amdgpu-tile/src/epilogue.rs:93-171` |
-| `search_attention` | `crates/amdgpu-tile/src/orient.rs:121` |
-| `Swizzle`、`ComposedLayout`、`make_layout` | `crates/amdgpu-layout/src/swizzle.rs:14-37`、`crates/amdgpu-layout/src/swizzle.rs:106`、`crates/amdgpu-layout/src/layout.rs:25` |
-| ISA 原子 | `crates/amdgpu-isa/src/lib.rs:66-99`、`crates/amdgpu-isa/src/lib.rs:165-264` |
-| `CompileProfile`、`policy_name` | `crates/amdgpu-dsl/src/lib.rs:971-985`、`crates/amdgpu-compiler/src/lib.rs:31-41` |
-| host 自动派发 | `tests/gpu/ref_host.cpp:56-62`、`tests/gpu/ref_host.cpp:122-155` |
+- **不要按 kernel 名字分支**：编译策略走 `CompileProfile`；kernel 特性走 `AttnBody3` 的显式字段（`setprio` / `kscale_sel` / `biasonce` / `lazy_bias`）。
+- **改结构就改图**：stage 的增删与连接在 `graph.rs` 里改，然后重新生成骨架（`tools/` 里的 opgraph 生成命令，见 [`opgraph.md`](opgraph.md)）。
+- **改编排就改 slot 或 weave 顺序**：发射顺序在 `StageInst::emit_with` 里，区域策略用 `declare_region`。不要改 stage 本身来换顺序。
+- **改地址就改布局**：不要手写 lane 地址公式。
+- **改节奏就改 `Pipeline`**：wait / barrier / 槽与代都由 `Pipeline::run` 统一生成。
+- **验收**：
+  - 出厂 kernel 的汇编 md5 不变；若变化，跑完整 `tools/port_gate.sh`；
+  - 性能结论用同一次运行内交替 A/B（≥ 7 轮，真实数据）。

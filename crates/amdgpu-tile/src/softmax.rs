@@ -53,6 +53,7 @@ impl OnlineSoftmax {
         let thr = b.c_f32(recipe.thr);
         let b131 = b.c_f32(recipe.b131);
         let c512 = b.c_f32(512.0);
+        let one_f = b.c_f32(1.0);
         let zero_f = b.c_f32(0.0);
         let c16 = b.c_i32(16);
         let smf = SmfmacOnes::new(b, lane);
