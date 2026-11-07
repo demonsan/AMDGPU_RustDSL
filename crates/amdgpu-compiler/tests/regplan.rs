@@ -49,7 +49,7 @@ fn err(f: &Function) -> String {
 
 fn reg(m: &MFunction, a: &Alloc, v: ValueId) -> u32 {
     let name = format!("%v{v}");
-    let r = m.reg_hints.names.iter().find(|(_, n)| **n == name).map(|(r, _)| *r).unwrap_or_else(|| panic!("{name} has no register"));
+    let r = *m.reg_hints.by_name.get(&name).unwrap_or_else(|| panic!("{name} has no register"));
     a.phys[r as usize]
 }
 

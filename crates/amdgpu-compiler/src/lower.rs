@@ -417,13 +417,17 @@ impl Lowerer {
         if plan.is_empty() {
             return;
         }
-        for (v, r) in &self.val {
-            let c = self.mir.canon(*r);
+        let mut vals: Vec<(ValueId, VReg)> = self.val.iter().map(|(v, r)| (*v, *r)).collect();
+        vals.sort_unstable();
+        for (v, r) in vals {
+            let c = self.mir.canon(r);
             self.mir.reg_hints.names.entry(c).or_insert_with(|| format!("%v{v}"));
+            self.mir.reg_hints.by_name.insert(format!("%v{v}"), c);
         }
         for (i, r) in self.vars.iter().enumerate() {
             let c = self.mir.canon(*r);
             self.mir.reg_hints.names.insert(c, format!("%r{i}"));
+            self.mir.reg_hints.by_name.insert(format!("%r{i}"), c);
         }
         let res = |s: &Self, r: &RegRef| -> Option<VReg> {
             match r {

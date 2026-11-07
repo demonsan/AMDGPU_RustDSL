@@ -420,6 +420,8 @@ pub struct RegHints {
     pub unresolved: Vec<String>,
     /// canonical vreg -> the DSL name of the value / variable it holds (`%v12`, `%r3`), for reports
     pub names: HashMap<VReg, String>,
+    /// DSL name (`%v12`, `%r3`) -> the canonical vreg holding it (several names can share one register)
+    pub by_name: HashMap<String, VReg>,
 }
 
 impl RegHints {
