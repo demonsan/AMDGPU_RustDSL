@@ -835,8 +835,10 @@ pub fn block3(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32) -> FmhaBlock {
 /// compare-subtract steps), the plain order otherwise.
 pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> FmhaBlock {
     let (qtile, hidx) = if xcd {
-        let x0 = b.let_(amdgpu_dsl::Op::WorkgroupIdX);
-        let y0 = b.let_(amdgpu_dsl::Op::WorkgroupIdY);
+        let x0u = b.let_(amdgpu_dsl::Op::WorkgroupIdX);
+        let y0u = b.let_(amdgpu_dsl::Op::WorkgroupIdY);
+        let x0 = b.let_(amdgpu_dsl::Op::AddI32(amdgpu_dsl::Opnd::Val(x0u), amdgpu_dsl::Opnd::I32(0)));
+        let y0 = b.let_(amdgpu_dsl::Op::AddI32(amdgpu_dsl::Opnd::Val(y0u), amdgpu_dsl::Opnd::I32(0)));
         let hh = b.let_(amdgpu_dsl::Op::KernargI32 { offset: 0x140 });
         let xq = b.bind_i32((io.s_len.clone() + ((1 << rows_lg) - 1)).lshr(rows_lg));
         let n = b.bind_i32(ev(xq) * ev(hh));
