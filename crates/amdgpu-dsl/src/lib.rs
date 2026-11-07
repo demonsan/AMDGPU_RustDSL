@@ -965,6 +965,19 @@ pub struct Function {
     pub sched_opts: Option<String>,
     /// Register-planning annotations ([`RegMark`]); empty for every kernel that does not plan its registers.
     pub reg_plan: Vec<RegMark>,
+    /// Scheduler strategies of weave regions, keyed by region NAME (the labels of `weave_region_begin` / the Weaver / stage names): `declare_region(name, authored, tokens)`. A region without a
+    /// declaration inherits its enclosing region's strategy (the kernel default at the top). Empty for every kernel that does not ask for per-region strategies (nothing changes then).
+    pub regions: Vec<RegionDecl>,
+}
+
+/// A weave region's scheduler strategy (declared on the function by region name; see `Function::regions`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionDecl {
+    pub name: String,
+    /// The order the weaver emitted is authoritative: `rewait` + the order-preserving post-passes only (no list scheduling / slotfill / ldshoist inside the region).
+    pub authored: bool,
+    /// Scheduler option tokens applied to the region's instructions on top of the kernel's options.
+    pub tokens: String,
 }
 
 /// Compile policy of a kernel (see `amdgpu-compiler/src/lib.rs`): which lowering options and which scheduler preset it gets.
@@ -1230,6 +1243,7 @@ impl FnBuilder {
                 compile_profile: None,
             lower_opts: Vec::new(),
             sched_opts: None,
+            regions: Vec::new(),
             reg_plan: Vec::new(),
             },
             expr_consts: Default::default(),
@@ -1245,6 +1259,14 @@ impl FnBuilder {
     /// Extra lowering option tokens for this kernel (see Function::lower_opts).
     pub fn lower_opts(&mut self, opts: &[&str]) {
         self.f.lower_opts.extend(opts.iter().map(|s| s.to_string()));
+    }
+
+    /// Declares the scheduler strategy of the weave region named `name` (the label of `weave_region_begin` / `Weaver::phase`; a stage name works too): `authored` = the emitted order is
+    /// authoritative (no list scheduling / slotfill / ldshoist inside; waits are recomputed and the order-preserving post-passes still apply), `tokens` = scheduler option tokens (the
+    /// `AMDC_SCHED_OPTS` vocabulary) applied to the region's instructions only. Undeclared regions inherit the strategy of the region they are nested in.
+    pub fn declare_region(&mut self, name: &str, authored: bool, tokens: &str) {
+        self.f.regions.retain(|r| r.name != name);
+        self.f.regions.push(RegionDecl { name: name.to_string(), authored, tokens: tokens.to_string() });
     }
 
     /// Scheduler option tokens for this kernel (see Function::sched_opts).

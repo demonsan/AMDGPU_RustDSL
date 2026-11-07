@@ -18,9 +18,10 @@ fn is_matrix(op: MOp) -> bool {
 
 /// Number of blocks changed.
 pub fn run(m: &mut MFunction, o: &Options) -> usize {
-    if o.ldahead == 0 && o.ldahead32 == 0 && o.ldsink == 0 {
+    if !o.any_region(|r| r.ldahead > 0 || r.ldahead32 > 0 || r.ldsink > 0) {
         return 0;
     }
+    let ro = o.region_options();
     let lv = liveness::compute(m);
     let mut changed = 0;
     for bi in 0..m.blocks.len() {
@@ -36,10 +37,11 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
         let mut pos: Vec<usize> = (0..n).collect();
         let limit = slotfill::peak_live(m, &insts, &order, live_out) + o.ldslack;
         let mut moved = 0usize;
-        // `ldsink`: sink reads (last first) while more than D MFMAs separate them from their first consumer
-        if o.ldsink > 0 {
+        // `ldsink`: sink reads (last first) while more than D MFMAs separate them from their first consumer (per weave region: the read's region options; a region boundary is never crossed)
+        {
             for r in (0..n).rev() {
-                if !is_lds_read(insts[r].op) {
+                let ro_r = &ro[super::region::region_index(o, insts[r].region)];
+                if ro_r.ldsink == 0 || !is_lds_read(insts[r].op) {
                     continue;
                 }
                 let Some(d) = insts[r].dst.map(|d| m.canon(d)) else { continue };
@@ -60,11 +62,11 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
                             mf += 1;
                         }
                     }
-                    if !found || mf <= o.ldsink {
+                    if !found || mf <= ro_r.ldsink {
                         break;
                     }
                     let next = order[p + 1];
-                    if g.succs[r].iter().any(|&(x, _)| x == next) {
+                    if g.succs[r].iter().any(|&(x, _)| x == next) || super::region::strategy_of(o, insts[next].region) != super::region::strategy_of(o, insts[r].region) {
                         break;
                     }
                     order.swap(p, p + 1);
@@ -75,7 +77,8 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
             }
         }
         for r in 0..n {
-            let dist = if insts[r].op == MOp::LdsReadB32 { o.ldahead.max(o.ldahead32) } else { o.ldahead };
+            let ro_r = &ro[super::region::region_index(o, insts[r].region)];
+            let dist = if insts[r].op == MOp::LdsReadB32 { ro_r.ldahead.max(ro_r.ldahead32) } else { ro_r.ldahead };
             if dist == 0 || !is_lds_read(insts[r].op) {
                 continue;
             }
@@ -102,7 +105,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
                     break;
                 }
                 let prev = order[p - 1];
-                if g.preds[r].iter().any(|&(x, _)| x == prev) {
+                if g.preds[r].iter().any(|&(x, _)| x == prev) || super::region::strategy_of(o, insts[prev].region) != super::region::strategy_of(o, insts[r].region) {
                     break;
                 }
                 order.swap(p - 1, p);
@@ -141,6 +144,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
 /// operation / terminator (the closing `wait_lds(0)` before a barrier then sits after the last MFMAs, whose operand waits become the scoreboard's counted partial waits). A move is legal
 /// when no dependence edge links the wait to the instruction it passes; the result is re-checked with `verify::check_perm`. Returns the number of waits moved.
 pub fn sink_explicit_waits(m: &mut MFunction, o: &Options) -> usize {
+    let ro = o.region_options();
     let mut moved_total = 0;
     for bi in 0..m.blocks.len() {
         let insts = m.blocks[bi].insts.clone();
@@ -154,7 +158,7 @@ pub fn sink_explicit_waits(m: &mut MFunction, o: &Options) -> usize {
         let mut pos: Vec<usize> = (0..n).collect();
         let mut moved = 0usize;
         for w in 0..n {
-            if !matches!(insts[w].op, MOp::SWaitLgkm) || insts[w].auto {
+            if !matches!(insts[w].op, MOp::SWaitLgkm) || insts[w].auto || (!o.regions.is_empty() && !ro[super::region::region_index(o, insts[w].region)].waitsink) {
                 continue;
             }
             loop {
@@ -167,7 +171,7 @@ pub fn sink_explicit_waits(m: &mut MFunction, o: &Options) -> usize {
                 if e.fence != super::effects::Fence::None || e.mem.is_some() || e.smem || e.pinned {
                     break;
                 }
-                if g.succs[w].iter().any(|&(x, _)| x == next) {
+                if g.succs[w].iter().any(|&(x, _)| x == next) || super::region::strategy_of(o, insts[next].region) != super::region::strategy_of(o, insts[w].region) {
                     break;
                 }
                 order.swap(p, p + 1);
