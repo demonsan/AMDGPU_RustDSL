@@ -278,7 +278,7 @@ fn rewrite_loads(nodes: &mut [Node], ka: &HashMap<u32, i64>, kf: &HashMap<u32, f
                 _ => {}
             },
             Node::S(_) => {}
-            Node::Loop { body, .. } | Node::Region { body, .. } | Node::Stage { body, .. } => rewrite_loads(body, ka, kf),
+            Node::Loop { body, .. } | Node::Region { body, .. } | Node::Stage { body, .. } | Node::Weave { body, .. } => rewrite_loads(body, ka, kf),
             Node::If { then, els, .. } => {
                 rewrite_loads(then, ka, kf);
                 if let Some(e) = els {
@@ -369,7 +369,7 @@ fn fold(nodes: &mut Vec<Node>, consts: &mut HashMap<ValueId, i64>, conds: &mut H
                     }
                 }
             }
-            Node::Loop { body, .. } | Node::Region { body, .. } | Node::Stage { body, .. } => {
+            Node::Loop { body, .. } | Node::Region { body, .. } | Node::Stage { body, .. } | Node::Weave { body, .. } => {
                 fold(body, consts, conds);
                 out.push(n);
             }
