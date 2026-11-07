@@ -1,0 +1,173 @@
+{
+  "name": "gemm_v4",
+  "attrs": {
+    "threads": 256,
+    "pipeline": "RegStaged",
+    "hooks": ["prologue_stores", "pre_sync", "post_wait"]
+  },
+  "nodes": [
+    {
+      "id": "ab_stage",
+      "prim": "M",
+      "stage": "move.ab_stage",
+      "params": {
+        "slots": 2
+      },
+      "resources": {
+        "vgprs": 16,
+        "agprs": 0,
+        "lds_bytes": 140000,
+        "barriers": 1
+      },
+      "roles": ["4 waves (2 x 2), all the same program"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": "stage"
+    },
+    {
+      "id": "tile",
+      "prim": "A",
+      "stage": "mma.blockscale_tile",
+      "params": {
+        "atom": "mfma_scale_16x16x128_f8",
+        "wave_tile": "128x128",
+        "staged": true
+      },
+      "resources": {
+        "vgprs": 192,
+        "agprs": 256,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["4 waves (2 x 2), all the same program"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": "m_phase"
+    },
+    {
+      "id": "epilogue",
+      "prim": "E",
+      "stage": "map.store_bf16",
+      "params": {
+        "n": 256
+      },
+      "resources": {
+        "vgprs": 64,
+        "agprs": 256,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["4 waves (2 x 2), all the same program"],
+      "barrier_phase": 0,
+      "phase": "epilogue",
+      "hook": null
+    }
+  ],
+  "edges": [
+    {
+      "name": "a",
+      "from": null,
+      "to": ["ab_stage"],
+      "dtype": "fp8",
+      "shape": [-1, -1],
+      "layout": "row-major (padded image in LDS)",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [0, 8],
+      "carried": false
+    },
+    {
+      "name": "b",
+      "from": null,
+      "to": ["ab_stage"],
+      "dtype": "fp8",
+      "shape": [-1, -1],
+      "layout": "preshuffled",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [8, 8],
+      "carried": false
+    },
+    {
+      "name": "sfa",
+      "from": null,
+      "to": ["ab_stage"],
+      "dtype": "e8m0",
+      "shape": [-1, -1],
+      "layout": "per-32 K block scales (transposed in the LDS panel)",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [64, 8],
+      "carried": false
+    },
+    {
+      "name": "sfb",
+      "from": null,
+      "to": ["ab_stage"],
+      "dtype": "e8m0",
+      "shape": [-1, -1],
+      "layout": "per-128 block scales",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [72, 8],
+      "carried": false
+    },
+    {
+      "name": "tiles",
+      "from": "ab_stage",
+      "to": ["tile"],
+      "dtype": "fp8",
+      "shape": [256, 128],
+      "layout": "LDS ring (2 slots), padded A image + preshuffled B",
+      "producer": null,
+      "consumer": null,
+      "scope": "block",
+      "store": "lds:ring",
+      "class": "C3",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "acc",
+      "from": "tile",
+      "to": ["epilogue"],
+      "dtype": "f32",
+      "shape": [256, 256],
+      "layout": "C accumulators",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "agpr",
+      "class": "C0",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "c",
+      "from": "epilogue",
+      "to": [],
+      "dtype": "bf16",
+      "shape": [-1, -1],
+      "layout": "row-major",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [16, 8],
+      "carried": false
+    }
+  ]
+}

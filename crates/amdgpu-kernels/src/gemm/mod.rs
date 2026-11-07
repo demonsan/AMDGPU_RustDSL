@@ -16,6 +16,7 @@ use amdgpu_layout::{composition, layout_to_offsets, make_layout, right_inverse, 
 use amdgpu_tile::{make_tiled_copy_a, make_tiled_copy_b, make_tiled_mma, Ctx, LdsPart, TiledMma};
 
 pub mod graph;
+mod skeleton_v4;
 
 /// Slots per wave record of the optional timing stamps (`GEMM_STAMP`): 0 kernel start, 1 setup done, 2 prologue done, 3 loop done, 4 epilogue stores issued, 16 + tile = the tile matrix phase.
 const STAMP_SLOTS: usize = 96;
@@ -618,14 +619,52 @@ pub fn gemm_mxfp8_bs(name: &str, cfg: GemmConfig) -> Function {
     build(name, cfg)
 }
 fn build(name: &str, cfg: Cfg) -> Function {
+    let mut slots = GemmSlots { cfg };
+    skeleton_v4::build_v4(name, &mut slots)
+}
+
+/// Everything the slots of the GEMM share (the locals of the former monolithic builder).
+pub(crate) struct GemmCx {
+    cfg: Cfg,
+    body: Body,
+    pipe: Option<Pipeline>,
+    ctx: Ctx,
+    mma: TiledMma,
+    epi: Option<Shared>,
+    lane: Lane,
+    s_lane: Ix,
+    s_n: Ix,
+    s_wm: Ix,
+    s_wn: Ix,
+    ptr_c: ValueId,
+    m_v: ValueId,
+    n_v: ValueId,
+    bx: ValueId,
+    by: ValueId,
+    wm: ValueId,
+    wn: ValueId,
+    lg_m: i32,
+    lg_n: i32,
+    wave_m: i64,
+    wave_n: i64,
+    stamp_ctx: Option<(ValueId, ValueId, bool)>,
+}
+
+/// The slots of the GEMM v4 skeleton (`skeleton_v4.rs`, generated from `graph::graph()`): the orchestration the graph leaves to the kernel.
+pub(crate) struct GemmSlots {
+    cfg: Cfg,
+}
+
+impl skeleton_v4::V4Slots for GemmSlots {
+    type Cx = GemmCx;
+    fn prelude(&mut self, b: &mut FnBuilder) -> GemmCx {
+        let cfg = self.cfg;
     let (cta_m, cta_n, wave_m, wave_n) = (cfg.cta_m, cfg.cta_n, cfg.wave_m(), cfg.wave_n());
-    let mut fb = FnBuilder::new(name, 256);
     // compile policy: lowering `lgkmn,zeroinit` + the scoreboard wait pass (partial waits across the loop back edge, ds_read hoisting); nothing name-keyed
-    fb.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
+    b.compile_profile(amdgpu_dsl::CompileProfile::Gemm);
     if !cfg.sched.is_empty() {
-        fb.sched_opts(cfg.sched);
+        b.sched_opts(cfg.sched);
     }
-    let b = &mut fb;
     declare_abi(b);
     declare_contract(b, cta_m, cta_n);
     // timing stamps (opt-in debug build, GEMM_STAMP=ends|tiles): one extra pointer argument after the ABI (offset 96); see docs/stamps.md
@@ -780,11 +819,43 @@ fn build(name: &str, cfg: Cfg) -> Function {
         cfg, kb_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
         a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx,
     };
-    if let Some((buf, rec, _)) = stamp_ctx {
-        let st = b.memtime_lo();
-        b.stamp_store(buf, rec, 1, st); // slot 1: setup done, entering the pipeline (prologue)
+        GemmCx { cfg, body, pipe: Some(pipe), ctx, mma, epi, lane, s_lane, s_n, s_wm, s_wn, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx }
     }
-    pipe.run(b, Role::All, &mut body);
+    fn pipeline(&mut self, b: &mut FnBuilder, cx: &mut GemmCx) -> Pipeline {
+        if let Some((buf, rec, _)) = cx.stamp_ctx {
+            let st = b.memtime_lo();
+            b.stamp_store(buf, rec, 1, st); // slot 1: setup done, entering the pipeline (prologue)
+        }
+        cx.pipe.take().expect("the pipeline is taken once")
+    }
+    fn stage(&mut self, b: &mut FnBuilder, cx: &mut GemmCx, role: Role, key0: &I32, slot: &SlotIdx) {
+        PipeBody::stage(&mut cx.body, b, role, key0, slot)
+    }
+    fn prologue_stores(&mut self, b: &mut FnBuilder, cx: &mut GemmCx, role: Role) {
+        PipeBody::prologue_stores(&mut cx.body, b, role)
+    }
+    fn prologue_compute(&mut self, b: &mut FnBuilder, cx: &mut GemmCx, role: Role, t0: &TileIt) {
+        PipeBody::prologue_compute(&mut cx.body, b, role, t0)
+    }
+    fn loop_state(&mut self, b: &mut FnBuilder, cx: &mut GemmCx) -> Vec<(DType, Opnd)> {
+        PipeBody::loop_state(&mut cx.body, b)
+    }
+    fn bind_state(&mut self, cx: &mut GemmCx, vars: &[VarId]) {
+        PipeBody::bind_state(&mut cx.body, vars)
+    }
+    fn m_phase(&mut self, b: &mut FnBuilder, cx: &mut GemmCx, role: Role, t: &TileIt) {
+        PipeBody::m_phase(&mut cx.body, b, role, t)
+    }
+    fn pre_sync(&mut self, b: &mut FnBuilder, cx: &mut GemmCx, role: Role, t: &TileIt) {
+        PipeBody::pre_sync(&mut cx.body, b, role, t)
+    }
+    fn post_wait(&mut self, b: &mut FnBuilder, cx: &mut GemmCx, role: Role, t: &TileIt) {
+        PipeBody::post_wait(&mut cx.body, b, role, t)
+    }
+    fn epilogue(&mut self, b: &mut FnBuilder, cx: &mut GemmCx) {
+        let GemmCx { cfg, body, ctx, mma, epi, lane, s_lane, s_n, s_wm, s_wn, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx, .. } = cx;
+        let (cfg, lane, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx) = (*cfg, *lane, *ptr_c, *m_v, *n_v, *bx, *by, *wm, *wn, *lg_m, *lg_n, *wave_m, *wave_n, *stamp_ctx);
+        let (ctx, mma, s_lane, s_n, s_wm, s_wn) = (&*ctx, &*mma, &*s_lane, &*s_n, &*s_wm, &*s_wn);
     if let Some((buf, rec, _)) = stamp_ctx {
         let st = b.memtime_lo();
         b.stamp_store(buf, rec, 3, st); // slot 3: the tile loop and the peeled last tile are done (epilogue next)
@@ -803,7 +874,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
             let st = b.memtime_lo();
             b.stamp_store(buf, rec, 4, st); // slot 4: epilogue stores issued
         }
-        return fb.finish();
+        return;
     }
     // ---- epilogue: the (swapped) C layout of the atom x C row-major (bf16); 4 consecutive N per lane = one 8-byte store ----
     let c_blk = make_layout(tup![16, 16], tup![s_n.mul_c(2), 2]); // element m + 16 n
@@ -837,7 +908,7 @@ fn build(name: &str, cfg: Cfg) -> Function {
         let st = b.memtime_lo();
         b.stamp_store(buf, rec, 4, st);
     }
-    fb.finish()
+    }
 }
 
 /// The LDS-staged epilogue: every accumulator (16 x 16, lane = row m, 4 consecutive n) is converted to bf16 and written to the wave's staging
