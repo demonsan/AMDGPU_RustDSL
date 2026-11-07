@@ -9,6 +9,8 @@ Disk cache: ``AMDGPU_JIT_CACHE_DIR`` (default ``~/.cache/amdgpu_jit``), one dire
 ``kernel.s``; the key hashes kernel name, specialization, backend, arch, the amdc binary (content hash), the clang version and the package's
 cache format. Entries are written to a temporary directory and renamed into place (atomic; concurrent compilers of the same key are safe).
 ``AMDGPU_JIT_CACHE=0`` disables the disk cache (the in-process cache stays).
+Kernels from DSL IR text: ``get_kernel(..., ir_path="k.ir")`` compiles an ``irv1`` file (``amdc print-ir --stage dsl``, edited; docs/ir-text.md)
+with ``amdc emit --from-ir`` (strictly verified); the cache key includes the SHA-256 of the file's text.
 """
 import hashlib
 import json
@@ -139,9 +141,16 @@ def spec_string(spec):
     return ",".join(f"{k}={spec[k]}" for k in sorted(spec))
 
 
-def cache_key(kernel, spec, amdc, clang):
+def _ir_sha(ir_path):
+    with open(ir_path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:24]
+
+
+def cache_key(kernel, spec, amdc, clang, ir_path=None):
     d = {"format": CACHE_FORMAT, "kernel": kernel, "specialize": spec_string(spec), "backend": backend(), "arch": arch(),
          "amdc": _hash_file(amdc), "clang": _clang_version(clang)}
+    if ir_path:
+        d["ir_sha"] = _ir_sha(ir_path)
     return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()[:24], d
 
 
@@ -174,9 +183,11 @@ def _run(cmd, what):
     return r.stdout
 
 
-def _compile_into(d, kernel, spec, amdc, clang):
+def _compile_into(d, kernel, spec, amdc, clang, ir_path=None):
     """amdc emit + jit-info (concurrently) and clang into directory d."""
     sp = ["--specialize", spec_string(spec)] if spec else []
+    if ir_path:
+        sp += ["--from-ir", ir_path]
     s_path, co_path = os.path.join(d, "kernel.s"), os.path.join(d, "kernel.co")
     emit = subprocess.Popen([amdc, "emit", kernel, "--backend", backend(), "--out", s_path] + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     info = subprocess.Popen([amdc, "jit-info", kernel, "--backend", backend()] + sp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -193,22 +204,24 @@ def _compile_into(d, kernel, spec, amdc, clang):
     return d_info
 
 
-def get_kernel(kernel, specialize=None):
-    """The loaded kernel `kernel` specialized for `specialize` (dict arg name -> value), compiling on a cache miss."""
+def get_kernel(kernel, specialize=None, ir_path=None):
+    """The loaded kernel `kernel` specialized for `specialize` (dict arg name -> value), compiling on a cache miss. With `ir_path` the kernel
+    is compiled from that irv1 DSL IR file (its `dsl "name"` is the symbol; `kernel` is only a label)."""
     spec = {k: v for k, v in (specialize or {}).items()}
-    fk = (kernel, tuple(sorted(spec.items())), os.environ.get("AMDGPU_JIT_BACKEND"), os.environ.get("AMDGPU_JIT_ARCH"), os.environ.get("AMDGPU_JIT_AMDC"))
+    irk = (os.path.abspath(ir_path), os.stat(ir_path).st_mtime_ns) if ir_path else None
+    fk = (kernel, tuple(sorted(spec.items())), os.environ.get("AMDGPU_JIT_BACKEND"), os.environ.get("AMDGPU_JIT_ARCH"), os.environ.get("AMDGPU_JIT_AMDC"), irk)
     k = _fast.get(fk)
     if k is not None:
         stats["memory_hits"] += 1
         return k
-    k = _get_kernel(kernel, spec)
+    k = _get_kernel(kernel, spec, ir_path)
     _fast[fk] = k
     return k
 
 
-def _get_kernel(kernel, spec):
+def _get_kernel(kernel, spec, ir_path=None):
     amdc, clang = amdc_path(), clang_path()
-    key, meta = cache_key(kernel, spec, amdc, clang)
+    key, meta = cache_key(kernel, spec, amdc, clang, ir_path)
     with _lock:
         k = _modules.get(key)
         if k is not None:
@@ -224,7 +237,7 @@ def _get_kernel(kernel, spec):
             os.makedirs(root, exist_ok=True)
             tmp = tempfile.mkdtemp(prefix=f".{key}.", dir=root)
             try:
-                _compile_into(tmp, kernel, spec, amdc, clang)
+                _compile_into(tmp, kernel, spec, amdc, clang, ir_path)
                 with open(os.path.join(tmp, "key.json"), "w") as f:
                     json.dump(meta, f, indent=1, sort_keys=True)
                 if use_disk:

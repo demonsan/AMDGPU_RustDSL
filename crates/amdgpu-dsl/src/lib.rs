@@ -1008,6 +1008,30 @@ impl Function {
     pub fn stmts(&self) -> &[Stmt] {
         &self.flat
     }
+    /// A function from all of its parts (the IR text parser, `ir_text::parse`); the linear view is derived from `body`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        name: String,
+        args: Vec<Arg>,
+        kernarg_size: u32,
+        workgroup_size: u32,
+        lds_bytes: u32,
+        contract: Contract,
+        body: Vec<Node>,
+        var_tys: Vec<DType>,
+        value_tys: Vec<DType>,
+        agpr: Vec<AgprMark>,
+        compile_profile: Option<CompileProfile>,
+        lower_opts: Vec<String>,
+        sched_opts: Option<String>,
+        reg_plan: Vec<RegMark>,
+        regions: Vec<RegionDecl>,
+    ) -> Function {
+        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, compile_profile, lower_opts, sched_opts, reg_plan, regions };
+        f.set_body(body);
+        f
+    }
+
     /// Replaces the body.
     pub fn set_body(&mut self, body: Vec<Node>) {
         let mut flat = Vec::new();
@@ -3036,6 +3060,8 @@ pub fn verify(f: &Function) -> Vec<String> {
 /// Kernel definitions built with this DSL.
 pub mod expr;
 pub mod print;
+pub mod ir_text;
+mod ir_codec;
 pub mod specialize;
 pub use expr::{ev, ox, varx};
 pub use expr::{Cond, Ptr, F32, I32};

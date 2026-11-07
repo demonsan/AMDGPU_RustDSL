@@ -4,6 +4,9 @@
 #   HIP_VISIBLE_DEVICES=5 bash tools/ab_fmha.sh <kernel>[@name=v,..]... [-- "B S" ...]   (defaults: shapes "4 2048" "1 8192"; REPS=7; ROWS_PER_BLOCK=256)
 #   `kernel@spec` emits with `--specialize spec` (docs/jit.md); the variant is labelled `kernel@spec` (only meaningful on a matching shape)
 set -u
+# a kernel `x.ir` (or `x.ir@spec`) is an irv1 DSL IR file (docs/ir-text.md): emitted with `--from-ir`, its symbol is the file's `dsl "name"`
+irname() { case "$1" in *.ir) sed -n 's/^dsl "\(.*\)"$/\1/p' "$1" | head -1;; *) echo "$1";; esac; }
+irsrc() { case "$1" in *.ir) echo "--from-ir $1";; *) echo "$1";; esac; }
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 R=/shared/apps/ubuntu/opt/rocm-7.0.2; CL=/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang
 A=${AMDC:-/tmp/target-kfmha/debug/amdc}; V=${REF_CO:-/shared/amdgpu/home/blyu_qle/sessions/ref_mxfp8.co}
@@ -13,21 +16,22 @@ while [ $# -gt 0 ]; do [ "$1" = -- ] && { shift; SH=("$@"); break; }; KS+=("$1")
 REPS=${REPS:-7}; RPB=${ROWS_PER_BLOCK:-256}
 mkdir -p build/ab
 { [ -x build/ff/ref_host ] && [ build/ff/ref_host -nt tests/gpu/ref_host.cpp ]; } || { mkdir -p build/ff; g++ -O2 -std=c++17 -D__HIP_PLATFORM_AMD__ tests/gpu/ref_host.cpp -o build/ff/ref_host -I$R/include -Itests/gpu -I. -L$R/lib -lamdhip64 -Wl,-rpath,$R/lib 2>/dev/null; }
-kn() { echo "${1%%@*}"; }
+kn() { irname "${1%%@*}"; }
+lab() { echo "$1" | tr '/' '_'; }
 ksp() { case "$1" in *@*) echo "--specialize ${1#*@}";; esac; }
 for k in "${KS[@]}"; do
-  $A emit "$(kn "$k")" --backend=own $(ksp "$k") --out "build/ab/$k.s" >/tmp/ab_e.log 2>&1 || { echo "EMIT FAIL $k"; tail -4 /tmp/ab_e.log; exit 1; }
-  $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "build/ab/$k.co" "build/ab/$k.s" || exit 1
-  v=$($A gpu-verify "$(kn "$k")" --strict $(ksp "$k") 2>&1 | grep -E '^== ' | sed -E 's/proven.*//')
-  echo "$k: md5 $(md5sum < build/ab/$k.s | cut -c1-12) $(grep -E '\.vgpr_count:' build/ab/$k.s | tr -s ' ') | $v"
+  $A emit $(irsrc "${k%%@*}") --backend=own $(ksp "$k") --out "build/ab/$(lab "$k").s" >/tmp/ab_e.log 2>&1 || { echo "EMIT FAIL $k"; tail -4 /tmp/ab_e.log; exit 1; }
+  $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o "build/ab/$(lab "$k").co" "build/ab/$(lab "$k").s" || exit 1
+  v=$($A gpu-verify $(irsrc "${k%%@*}") --strict $(ksp "$k") 2>&1 | grep -E '^== ' | sed -E 's/proven.*//')
+  echo "$k: md5 $(md5sum < build/ab/$(lab "$k").s | cut -c1-12) $(grep -E '\.vgpr_count:' build/ab/$(lab "$k").s | tr -s ' ') | $v"
 done
-run() { env HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-5} REF_B=$1 REF_H=8 REF_S=$2 REF_SK=$2 REF_HK=8 REF_CO2=build/ab/$3.co REF_KNAME2=$(kn "$3") REF_ROWS_PER_BLOCK=$RPB "${@:4}" ./build/ff/ref_host $V 2>&1; }
+run() { env HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-5} REF_B=$1 REF_H=8 REF_S=$2 REF_SK=$2 REF_HK=8 REF_CO2=build/ab/$(lab "$3").co REF_KNAME2=$(kn "$3") REF_ROWS_PER_BLOCK=$RPB "${@:4}" ./build/ff/ref_host $V 2>&1; }
 for s in "${SH[@]}"; do set -- $s
   for k in "${KS[@]}"; do echo "acc B$1 S$2 $k: $(run $1 $2 $k REF_ROWS=64 REF_WARMUP=2 REF_ITERS=2 | grep -E 'kernel +vs CPU: ' | sed -E 's/checked=[0-9]+ //;s/ max\|ref\|=[0-9.]+//;s/ kernel +vs CPU://;s/worst_err=[^ ]+ //' | tr '\n' ' ')"; done
 done
 for s in "${SH[@]}"; do set -- $s
-  for k in "${KS[@]}"; do : > "/tmp/ab_$k"; done
-  for r in $(seq 1 $REPS); do for k in "${KS[@]}"; do run $1 $2 $k REF_ROWS=1 REF_WARMUP=150 REF_ITERS=200 | awk '/^timing ours/ {for(i=1;i<=NF;i++) if($i ~ /^TFLOP/) print $(i-1)}' >> "/tmp/ab_$k"; done; done
+  for k in "${KS[@]}"; do : > "/tmp/ab_$(lab "$k")"; done
+  for r in $(seq 1 $REPS); do for k in "${KS[@]}"; do run $1 $2 $k REF_ROWS=1 REF_WARMUP=150 REF_ITERS=200 | awk '/^timing ours/ {for(i=1;i<=NF;i++) if($i ~ /^TFLOP/) print $(i-1)}' >> "/tmp/ab_$(lab "$k")"; done; done
   echo "== perf B$1 S$2 (median of $REPS)"
-  for k in "${KS[@]}"; do echo "  $k $(sort -n /tmp/ab_$k | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}')  [$(tr '\n' ' ' < /tmp/ab_$k)]"; done
+  for k in "${KS[@]}"; do echo "  $k $(sort -n /tmp/ab_$(lab "$k") | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}')  [$(tr '\n' ' ' < /tmp/ab_$(lab "$k"))]"; done
 done
