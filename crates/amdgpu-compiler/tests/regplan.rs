@@ -40,6 +40,13 @@ fn kernel(n: usize, wide: usize, plan: impl FnOnce(&mut FnBuilder, &[ValueId], &
     b.finish()
 }
 
+fn err(f: &Function) -> String {
+    match compile_mir_alloc(f) {
+        Ok(_) => panic!("expected a compile error"),
+        Err(e) => e,
+    }
+}
+
 fn reg(m: &MFunction, a: &Alloc, v: ValueId) -> u32 {
     let name = format!("%v{v}");
     let r = m.reg_hints.names.iter().find(|(_, n)| **n == name).map(|(r, _)| *r).unwrap_or_else(|| panic!("{name} has no register"));
@@ -64,7 +71,7 @@ fn pin_is_honoured_and_conflicts_are_errors() {
         b.pin_vgpr_at(RegRef::Val(p[0]), 50);
         b.pin_vgpr_at(RegRef::Val(p[1]), 50);
     });
-    let e = compile_mir_alloc(&g).unwrap_err();
+    let e = err(&g);
     assert!(e.contains("register plan"), "{e}");
 }
 
@@ -106,10 +113,10 @@ fn region_caps_use_the_allocator_footprint() {
     let r = rep.iter().find(|p| p.name == "r").expect("region r");
     assert!(r.insts > 0 && r.vgpr_footprint_peak >= 8 && r.vgpr_live_peak >= 8, "{r:?}");
     let tight = kernel(0, 8, |b, _, _| b.reg_cap("r", 4));
-    let e = compile_mir_alloc(&tight).unwrap_err();
+    let e = err(&tight);
     assert!(e.contains("register cap"), "{e}");
     let unknown = kernel(0, 2, |b, _, _| b.reg_cap("nope", 64));
-    assert!(compile_mir_alloc(&unknown).unwrap_err().contains("unknown region"));
+    assert!(err(&unknown).contains("unknown region"));
 }
 
 #[test]
