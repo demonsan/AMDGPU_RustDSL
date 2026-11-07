@@ -15,6 +15,8 @@ use amdgpu_tile::stage::{Prim, StageInst};
 use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
+pub mod graph;
+
 pub fn by_name(name: &str) -> Option<Function> {
     let n: i64 = name.strip_prefix("rmsnorm_quant_fp8_n")?.parse().ok()?;
     (n % 512 == 0 && (512..=8192).contains(&n)).then(|| rmsnorm_quant_fp8(name, n))
