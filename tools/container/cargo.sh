@@ -69,6 +69,7 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e AMDC_SCHED="${AMDC_SCHED:-}" \
     -e AMDC_SCHED_OPTS="${AMDC_SCHED_OPTS:-}" \
     -e AMDC_SCHED_ADD="${AMDC_SCHED_ADD:-}" \
+    -e AMDC_SCHED_REGION="${AMDC_SCHED_REGION:-}" \
     -e AMDC_SCHED_VERBOSE="${AMDC_SCHED_VERBOSE:-}" \
     -e AMDC_PIN_VMWAIT="${AMDC_PIN_VMWAIT:-}" \
     -e SCHED_WG="${SCHED_WG:-}" \
