@@ -42,6 +42,8 @@ amdc skeleton <graph.json> <kernel> [--nodes n1,n2|all] [--graph-file <path>] [-
 | kernel | 图 | 骨架 | 形式 |
 |---|---|---|---|
 | `mlp_fp8_ws_fused` | `mlp/mlp_fp8.graph.json` | `mlp/skeleton_fused.rs` | 顺序（`h` 为 C0；以 `h` 切开得 g1 / g2，`h` 是 C4） |
+| `mlp_fp8_ws_g1` / `mlp_fp8_ws_g2` | `mlp/mlp_fp8_unfused.graph.json`（一个图、两个 kernel，`h` 是 C4 切边） | `mlp/skeleton_g1.rs` / `mlp/skeleton_g2.rs` | 顺序（切边槽位 `store_h` / `load_h` 在这里是空操作：H 的存取由 stage 自己做） |
+| `rmsnorm_quant_fp8_n<N>` | `norm/rmsnorm.graph.json` | `norm/skeleton_rmsnorm.rs` | 顺序（load → rms → quant → store，5 条片上边全是 C0；同一个骨架服务所有 N） |
 | `gemm_mxfp8_bs_v4` | `gemm/gemm_v4.graph.json` | `gemm/skeleton_v4.rs` | 流水线（`RegStaged`） |
 | `fmha_fwd_hd128_mxfp8_v3_{vs128, kvsplit, t128}` | `fmha/*.graph.json` | `fmha/skeleton_*.rs` | 分派的流水线（S→P 为 C0，O→epilogue 为 C2） |
 
@@ -49,6 +51,6 @@ amdc skeleton <graph.json> <kernel> [--nodes n1,n2|all] [--graph-file <path>] [-
 
 ## 5. 已知限制
 
-- 切开的 `g1` / `g2`（以及 `g1q_*`）仍直接用同一组槽位片段构建，没有走各自生成的骨架（`load_h` 的默认体是 `todo!`）。
+- `mlp_fp8_ws_g1q_*`（带 bias / scale 张量的 GEMM1 + epilogue 链）仍直接用 g1 的槽位片段构建，它自己的图还没有生成。\n- RoPE + KV-cache 写（设计 §4.5）没有骨架：它需要带索引的 `M`（gather / scatter，P4），库里还没有对应的 stage 与 kernel。
 - 流水线 / 分派形式里，weave 组只作文档与 hook 映射，默认的 `compose` 体只在顺序形式里生成。
 - 资源估计是 agent 规划用的上界，寄存器分配与 GV 仍是最终裁判。
