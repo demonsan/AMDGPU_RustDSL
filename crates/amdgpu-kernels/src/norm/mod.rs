@@ -20,11 +20,6 @@ pub fn by_name(name: &str) -> Option<Function> {
     (n % 512 == 0 && (512..=16384).contains(&n)).then(|| rmsnorm_quant_fp8(name, n))
 }
 
-/// The element table of a per-lane value set: value v of lane t holds element 8 (t + 64 (v / 8)) + v % 8 (`[t + 64 v]`).
-fn row_table(nv: usize) -> Vec<i64> {
-    (0..64 * nv).map(|i| { let (t, v) = ((i % 64) as i64, (i / 64) as i64); 8 * (t + 64 * (v / 8)) + v % 8 }).collect()
-}
-
 fn sval(name: &str, values: Vec<ValueId>, bits: u32, table: Vec<i64>) -> StageVal {
     StageVal { name: name.into(), values, table, elem_bits: bits, storage: "vgpr".into(), layout: String::new() }
 }
@@ -67,9 +62,8 @@ pub fn rmsnorm_quant_fp8(name: &str, n: i64) -> Function {
     let wid = b.bind_i32(lane.wave());
     let me = red.mine(wid);
     let roles = vec!["all 4 waves: one row each".to_string()];
-    let tbl = row_table(nv);
 
-    // ---- stage `load` (M): x and gamma rows -> f32 ----
+    // ---- stage `load` (M): the x row and gamma, kept packed (bf16, 8 per 16-byte fragment) ----
     let xs: Out<Vec<ValueId>> = Out::new();
     let gs: Out<Vec<ValueId>> = Out::new();
     let mut u = Units::new();
@@ -81,29 +75,32 @@ pub fn rmsnorm_quant_fp8(name: &str, n: i64) -> Function {
         // the instruction offset reaches 4095 bytes: one voffset per group of 4 loads, imm 1024 (i % 4)
         let gx: Vec<ValueId> = (0..nld.div_ceil(4)).map(|q| if q == 0 { vx } else { b.bind_i32(ev(vx) + 4096 * q as i32) }).collect();
         let gg: Vec<ValueId> = (0..nld.div_ceil(4)).map(|q| if q == 0 { vg } else { b.bind_i32(ev(vg) + 4096 * q as i32) }).collect();
-        let fx: Vec<ValueId> = (0..nld).map(|i| b.buffer_load_b128(r_x, gx[i / 4], 0i32, (1024 * (i % 4)) as u32)).collect();
-        let fg: Vec<ValueId> = (0..nld).map(|i| b.buffer_load_b128(r_g, gg[i / 4], 0i32, (1024 * (i % 4)) as u32)).collect();
+        x1.set((0..nld).map(|i| b.buffer_load_b128(r_x, gx[i / 4], 0i32, (1024 * (i % 4)) as u32)).collect());
+        g1.set((0..nld).map(|i| b.buffer_load_b128(r_g, gg[i / 4], 0i32, (1024 * (i % 4)) as u32)).collect());
         b.wait_vm(0);
-        x1.set(fx.iter().flat_map(|f| bf16x8_to_f32(b, *f)).collect());
-        g1.set(fg.iter().flat_map(|f| bf16x8_to_f32(b, *f)).collect());
     });
-    let (x2, g2) = (xs.clone(), gs.clone());
-    let t1 = tbl.clone();
+    // packed table: fragment i of lane t holds elements 8 (t + 64 i) .. + 7 (recorded by the first element)
+    let ptbl: Vec<i64> = (0..64 * nld).map(|j| 8 * ((j % 64) as i64 + 64 * (j / 64) as i64)).collect();
+    let (x2, g2, pt1) = (xs.clone(), gs.clone(), ptbl.clone());
     StageInst::new("move.row_load", Prim::M, "load", StageContract { roles: roles.clone(), ..Default::default() }, u)
         .param("n", n)
         .param("dtype", "bf16")
-        .handover(move |_b| (vec![sval("x", x2.get(), 32, t1.clone()), sval("gamma", g2.get(), 32, t1)], Vec::new()))
+        .handover(move |_b| (vec![sval("x", x2.get(), 128, pt1.clone()), sval("gamma", g2.get(), 128, pt1)], Vec::new()))
         .emit(b);
 
-    // ---- stage `rms` (R + E): y = x rsqrt(mean(x^2) + eps) gamma ----
-    let ys: Out<Vec<ValueId>> = Out::new();
+    // ---- stage `rms` (R): inv_rms = rsqrt(mean(x^2) + eps) ----
     let inv: Out<ValueId> = Out::new();
     let mut u = Units::new();
-    let (x3, y1, i1) = (xs.clone(), ys.clone(), inv.clone());
+    let (x3, i1) = (xs.clone(), inv.clone());
     let me1 = me.clone();
     let lane3 = &lane;
     u.add("rms.reduce", UnitClass::Valu, Hint::Skeleton, &[], move |b| {
-        let sq: Vec<ValueId> = x3.get().iter().map(|&x| b.mul_f32(x, x)).collect();
+        let mut sq = Vec::with_capacity(nv);
+        for f in x3.get() {
+            for x in bf16x8_to_f32(b, f) {
+                sq.push(b.mul_f32(x, x));
+            }
+        }
         let part = lane_reduce(b, RedOp::Sum, &sq);
         let tot = wave_reduce(b, RedOp::Sum, part, &me1, 0, 0, lane3);
         let inv_n = b.c_f32(1.0 / n as f32);
@@ -111,32 +108,39 @@ pub fn rmsnorm_quant_fp8(name: &str, n: i64) -> Function {
         let me_eps = b.add_f32(mean, eps);
         i1.set(rsqrt_f32(b, me_eps));
     });
-    let (i2, x4, g4) = (inv.clone(), xs.clone(), gs.clone());
-    u.add("rms.scale", UnitClass::Valu, Hint::Filler, &[0], move |b| {
-        let r = i2.get();
-        y1.set(scale_rows(b, &x4.get(), &g4.get(), r));
-    });
-    let (y2, i3) = (ys.clone(), inv.clone());
-    let t2 = tbl.clone();
-    // the consumed sets: the producer has been emitted, its values exist
-    let c_rms = StageContract { live_in: vec![sval("x", xs.get(), 32, tbl.clone()), sval("gamma", gs.get(), 32, tbl.clone())], roles: roles.clone(), ..Default::default() };    StageInst::new("map.rmsnorm", Prim::E, "rms", c_rms, u)
-        .param("reduce", "sum x^2 over the row (wave)")
-        .handover(move |_b| (vec![sval("y", y2.get(), 32, t2)], vec![StageScalar { name: "inv_rms".into(), values: vec![i3.get()], owner: "wave".into() }]))
+    let i3 = inv.clone();
+    let c_rms = StageContract { live_in: vec![sval("x", xs.get(), 128, ptbl.clone())], roles: roles.clone(), ..Default::default() };
+    StageInst::new("reduce.row_sumsq", Prim::R, "rms", c_rms, u)
+        .param("op", "sum x^2 / n")
+        .handover(move |_b| (Vec::new(), vec![StageScalar { name: "inv_rms".into(), values: vec![i3.get()], owner: "wave".into() }]))
         .emit(b);
 
-    // ---- stage `quant` (R + Q): amax over the row, per-row fp8 ----
+    // ---- stage `quant` (E + R + Q): y = x inv_rms gamma (recomputed per pass), amax over the row, per-row fp8 ----
     let qw: Out<Vec<ValueId>> = Out::new();
     let sc: Out<ValueId> = Out::new();
     let mut u = Units::new();
-    let (y3, q1, s1) = (ys.clone(), qw.clone(), sc.clone());
+    let (x4, g4, i4, q1, s1) = (xs.clone(), gs.clone(), inv.clone(), qw.clone(), sc.clone());
     let me2 = me.clone();
     let lane4 = &lane;
     u.add("quant.amax_fp8", UnitClass::Valu, Hint::Skeleton, &[], move |b| {
-        let y = y3.get();
-        let ab: Vec<ValueId> = y.iter().map(|&v| abs_f32(b, v)).collect();
-        let part = lane_reduce(b, RedOp::Max, &ab);
-        let amax = wave_reduce(b, RedOp::Max, part, &me2, 64, 1, lane4);
-        let (s, words) = quant_fp8_row(b, &y, amax);
+        let (xf, gf, r) = (x4.get(), g4.get(), i4.get());
+        let y_of = |b: &mut FnBuilder, i: usize| -> Vec<ValueId> {
+            let (xv, gv) = (bf16x8_to_f32(b, xf[i]), bf16x8_to_f32(b, gf[i]));
+            scale_rows(b, &xv, &gv, r)
+        };
+        let mut amax = None;
+        for i in 0..nld {
+            let y = y_of(b, i);
+            let ab: Vec<ValueId> = y.iter().map(|&v| abs_f32(b, v)).collect();
+            let m = lane_reduce(b, RedOp::Max, &ab);
+            amax = Some(match amax { None => m, Some(a) => b.max_f32(a, m) });
+        }
+        let amax = wave_reduce(b, RedOp::Max, amax.expect("values"), &me2, 64, 1, lane4);
+        let mut ys = Vec::with_capacity(nv);
+        for i in 0..nld {
+            ys.extend(y_of(b, i));
+        }
+        let (s, words) = quant_fp8_row(b, &ys, amax);
         s1.set(s);
         q1.set(words);
     });
@@ -144,13 +148,19 @@ pub fn rmsnorm_quant_fp8(name: &str, n: i64) -> Function {
     // q words: word w of lane t holds elements 8 (t + 64 (w / 2)) + 4 (w % 2) + 0..3 (fp8: 4 per dword) -> table over the first element of each word
     let qt: Vec<i64> = (0..64 * 2 * nld).map(|i| { let (t, w) = ((i % 64) as i64, (i / 64) as i64); 8 * (t + 64 * (w / 2)) + 4 * (w % 2) }).collect();
     let qt2 = qt.clone();
-    StageInst::new("quant.fp8_row", Prim::Q, "quant", StageContract { live_in: vec![sval("y", ys.get(), 32, tbl.clone())], roles: roles.clone(), ..Default::default() }, u)
+    let c_q = StageContract {
+        live_in: vec![sval("x", xs.get(), 128, ptbl.clone()), sval("gamma", gs.get(), 128, ptbl.clone())],
+        scalars_in: vec![StageScalar { name: "inv_rms".into(), values: vec![inv.get()], owner: "wave".into() }],
+        roles: roles.clone(),
+        ..Default::default()
+    };
+    StageInst::new("quant.fp8_row", Prim::Q, "quant", c_q, u)
         .param("format", "e4m3")
         .param("granularity", "per-token")
         .param("scale", "f32")
+        .param("map", "x * inv_rms * gamma")
         .handover(move |_b| (vec![sval("q", q2.get(), 32, qt2)], vec![StageScalar { name: "scale".into(), values: vec![s2.get()], owner: "wave".into() }]))
         .emit(b);
-
     // ---- stage `store` (M): q and the row scale ----
     let mut u = Units::new();
     let (q3, s3) = (qw.clone(), sc.clone());
