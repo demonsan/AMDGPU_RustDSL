@@ -295,17 +295,29 @@ impl<'a> AttnBody3<'a> {
                 self.bias_tile.set(Some(Opnd::Var(s.accs[3].var)));
             }
         });
-        let mut last = setup;
+        let mut ends = Vec::new();
         for blk in 0..4usize {
-            let p3 = parts.clone();
-            last = u.add(format!("qk.block{blk}"), UnitClass::Mfma, Hint::Skeleton, &[setup], move |b| {
+            // read unit: (the per-block bias MFMA when there is no shared bias tile,) the two K fragments and the K-scale word; MMA unit: the shift and
+            // the two scaled MFMAs
+            let (p3, rd) = (parts.clone(), Out::<(ValueId, ValueId, ValueId)>::new());
+            let rd2 = rd.clone();
+            let r_id = u.add(format!("qk.read{blk}"), UnitClass::LdsRead, Hint::LatencySensitive, &[setup], move |b| {
                 p3.with(|(k, kd)| {
-                    self.qk_block(b, &QkOut::Vars(&s), bias, k, kd, blk);
+                    if self.bias_tile.get().is_none() {
+                        b.var_mfma_f16_z(s.accs[blk].var, self.sm.ones_f16, bias);
+                    }
+                    let k0 = k.read(b, 2 * blk);
+                    let k1 = k.read(b, 2 * blk + 1);
+                    let kw = kd.read(b, blk);
+                    rd2.set((k0, k1, kw));
                 });
             });
+            ends.push(u.add(format!("qk.mma{blk}"), UnitClass::Mfma, Hint::Skeleton, &[r_id], move |b| {
+                let (k0, k1, kw) = rd.get();
+                self.qk_block_mma(b, &s, k0, k1, kw, blk);
+            }));
         }
-        let _ = last;
-        u.add("qk.end", UnitClass::Setup, Hint::Anchor, &(1..=4).collect::<Vec<_>>(), move |_b| self.bias_tile.set(None));
+        u.add("qk.end", UnitClass::Setup, Hint::Anchor, &ends, move |_b| self.bias_tile.set(None));
         u
     }
     /// PV as emission units: the setup (slot-bound V partition, the two P fragments), the row sums, one unit per (half hh, dim group e).
@@ -327,16 +339,36 @@ impl<'a> AttnBody3<'a> {
         let o = self.o.expect("O");
         for hh in 0..2usize {
             for e in 0..4usize {
-                let s4 = st.clone();
-                u.add(format!("pv.h{hh}e{e}"), UnitClass::Mfma, Hint::Skeleton, &[setup], move |b| {
-                    s4.with(|(v, p)| {
-                        let vf = v.read(b, hh + 2 * e);
-                        gemm(b, &r.mma, o.accs[e].var, vf, p[hh], self.c127, self.c123, 0, 0);
-                    });
+                let (s4, s5, vf) = (st.clone(), st.clone(), Out::<ValueId>::new());
+                let vf2 = vf.clone();
+                let r_id = u.add(format!("pv.read.h{hh}e{e}"), UnitClass::LdsRead, Hint::LatencySensitive, &[setup], move |b| {
+                    s4.with(|(v, _)| vf2.set(v.read(b, hh + 2 * e)));
+                });
+                u.add(format!("pv.mma.h{hh}e{e}"), UnitClass::Mfma, Hint::Skeleton, &[r_id], move |b| {
+                    let p = s5.with(|(_, p)| *p);
+                    gemm(b, &r.mma, o.accs[e].var, vf.get(), p[hh], self.c127, self.c123, 0, 0);
                 });
             }
         }
         u
+    }
+    /// The MMA half of a QK block into the S variables (the K fragments / scale word already read).
+    fn qk_block_mma(&self, b: &mut FnBuilder, t: &AccTile<C32x32F32, 4>, k0: ValueId, k1: ValueId, kw: ValueId, s: usize) {
+        let blk = self.blk;
+        let q = &blk.q.frags;
+        if self.kscale_sel {
+            let w = b.bind_i32(ev(kw).lshr(ev(blk.sel.g8)));
+            if let (Some(bt), true) = (self.bias_tile.get(), s < 3) {
+                b.var_mfma_scale_c(t.accs[s].var, k0, q[0].v, bt, w, blk.sq[0]);
+            } else {
+                gemm(b, &self.ring.mma, t.accs[s].var, k0, q[0].v, w, blk.sq[0], 0, 0);
+            }
+            gemm(b, &self.ring.mma, t.accs[s].var, k1, q[1].v, w, blk.sq[1], 2, 0);
+            return;
+        }
+        let (sk0, sk1) = blk.sel.pair(b, kw);
+        gemm(b, &self.ring.mma, t.accs[s].var, k0, q[0].v, sk0, blk.sq[0], 0, 0);
+        gemm(b, &self.ring.mma, t.accs[s].var, k1, q[1].v, sk1, blk.sq[1], 0, 0);
     }
     fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, out: QkOut, bias: Opnd) -> Vec<ValueId> {
         if let QkOut::Vars(t) = &out {
