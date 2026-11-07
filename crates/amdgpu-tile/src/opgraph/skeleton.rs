@@ -271,7 +271,6 @@ pub fn generate(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str) -> Re
 const HOOKS: &[(&str, &str, &str, &str)] = &[
     ("stage", "role: Role, key0: &I32, slot: &SlotIdx", "role, key0, slot", ""),
     ("stage_complete", "role: Role, slot: &SlotIdx", "role, slot", ""),
-    ("defer_stage", "role: Role, key0: &I32, slot: &SlotIdx", "role, key0, slot", ""),
     ("prologue_stores", "role: Role", "role", ""),
     ("prologue_compute", "role: Role, t0: &TileIt", "role, t0", ""),
     ("loop_state", "", "", " -> Vec<(DType, Opnd)>"),
@@ -402,7 +401,7 @@ fn generate_pipelined(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str)
     for n in &pre {
         s.push_str(&format!("    slots.{}(b, &mut cx);\n", n.id));
     }
-    s.push_str("    let mut pipe = slots.pipeline(b, &mut cx);\n");
+    s.push_str("    let pipe = slots.pipeline(b, &mut cx);\n");
     s.push_str(&format!("    {{\n        let mut body = {bname} {{ slots: &mut *slots, cx: &mut cx }};\n        pipe.run(b, Role::{role}, &mut body);\n    }}\n"));
     for n in &post {
         s.push_str(&format!("    slots.{}(b, &mut cx);\n", n.id));
