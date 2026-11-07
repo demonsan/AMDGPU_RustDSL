@@ -827,6 +827,9 @@ pub fn block3(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32) -> FmhaBlock {
 /// gives XCD x the contiguous logical range [x N / 8, (x + 1) N / 8) of the (query tile, head) plane of the batch (N = tiles x heads), so the
 /// blocks that share K / V share an L2. Applied when N % 8 == 0 and H <= 32 (the vendor's conditions; the head is recovered by at most 32
 /// compare-subtract steps), the plain order otherwise.
+/// EXPERIMENT: X > 16 handling: 0 = plain order (shipped), 1 = the vendor stride (chunk N / 8), 8 / 16 = chunks of that many logical blocks
+pub static XCD_X32: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> FmhaBlock {
     let (qtile, hidx) = if xcd {
         let x0u = b.let_(amdgpu_dsl::Op::WorkgroupIdX);
@@ -838,9 +841,22 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
         let n = b.bind_i32(ev(xq) * ev(hh));
         // ok = (N % 8 == 0) && (H <= 32), as 0 / 1
         // + X <= 16: with long sequences (X = 32, B8H8S8192) the order measured -6.9 % (all 32 CUs of an XCD on one head in lockstep)
-        let ok = b.bind_i32((ev(n) & 7).eq(0).select_i32(ev(hh).le(32).select_i32(ev(xq).le(16).select_i32(1, 0), 0), 0));
+        let mode = XCD_X32.load(std::sync::atomic::Ordering::Relaxed);
+        let ok = if mode == 0 {
+            b.bind_i32((ev(n) & 7).eq(0).select_i32(ev(hh).le(32).select_i32(ev(xq).le(16).select_i32(1, 0), 0), 0))
+        } else {
+            b.bind_i32((ev(n) & 7).eq(0).select_i32(ev(hh).le(32).select_i32(1, 0), 0))
+        };
         let l = b.bind_i32(ev(y0) * ev(xq) + ev(x0));
         let mut r = b.bind_i32((ev(l) & 7) * ev(n).lshr(3) + ev(l).lshr(3));
+        if mode == 8 || mode == 16 {
+            // X > 16: XCD x takes chunks of `mode` consecutive logical blocks, cycling (N % (8 mode) == 0 for X = 32 and H % 4 == 0)
+            let lc = mode.trailing_zeros() as i32;
+            let k = b.bind_i32(ev(l).lshr(3));
+            let alt = b.bind_i32((ev(k).lshr(lc) << (3 + lc)) + ((ev(l) & 7) << lc) + (ev(k) & (mode - 1)));
+            let fits = b.bind_i32((ev(n) & (8 * mode - 1)).eq(0).select_i32(1, 0));
+            r = b.bind_i32(ev(xq).le(16).select_i32(ev(r), ev(fits).eq(1).select_i32(ev(alt), ev(l))));
+        }
         // head = M / X by binary long division (H <= 32: 5 steps)
         let mut y = b.c_i32(0);
         for bit in [16i32, 8, 4, 2, 1] {
