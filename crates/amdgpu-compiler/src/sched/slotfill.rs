@@ -337,7 +337,7 @@ fn run_inner(m: &mut MFunction, o: &Options) -> Result<usize, String> {
     let mut moved_total = 0;
     for bi in 0..m.blocks.len() {
         let insts = m.blocks[bi].insts.clone();
-        if insts.iter().filter(|i| is_matrix(i.op)).count() < 16 {
+        if insts.iter().filter(|i| is_matrix(i.op)).count() < 16 || !super::region::block_allows(o, &insts, |r| r.slotfill) {
             continue;
         }
         if insts.iter().any(|i| matches!(i.op, MOp::SWaitLgkm | MOp::SWaitVm) && i.imm != 0 && !i.auto) {

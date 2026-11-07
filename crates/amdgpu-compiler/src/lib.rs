@@ -139,12 +139,18 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         agpr::assign(&mut b)?;
         b
     };
-    let sched_opts = scheduler_options(f, pname);
+    let sched_opts = scheduler_options(f, pname).map(|mut o| {
+        // weave regions: the strategies declared by name, mapped onto the region ids lowering stamped (one id per scope instance; an undeclared region inherits its parent's strategy)
+        if !declared_regions(f).is_empty() {
+            o.region_of = region_strategies(f, &base);
+        }
+        o
+    });
     // experiment switch (applied ON TOP of the kernel's own scheduler options, i.e. the shipped preset): AMDC_SCHED_ADD=<kernel name substring>:<tokens> (e.g.
     // `fmha_fwd_hd128_mxfp8_v3_vs128:ldahead=4,ldslack=8`; several entries separated by `;`) appends scheduler tokens to the options the kernel would use anyway
     let sched_opts = match (std::env::var("AMDC_SCHED_ADD").ok().filter(|v| !v.is_empty()), sched_opts) {
         (Some(spec), Some(mut o)) => {
-            for ent in spec.split(';') {
+            for ent in spec.split([';', '|']) {
                 if let Some((pat, toks)) = ent.split_once(':') {
                     if pat == "*" || pname.contains(pat) || f.name.contains(pat) {
                         o.apply_tokens(toks);
@@ -248,6 +254,51 @@ pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
 /// results, docs/archive/status.md round 44; `_t128`: ALU across its barrier and the pressure limit 248) - and the kernel's own `Function::sched_opts` tokens are applied ON TOP of
 /// that preset (never instead of it: a kernel that adds a token keeps its profile's options). A kernel without a preset that sets tokens gets the default options plus them.
 pub fn scheduler_options(f: &amdgpu_dsl::Function, pname: &str) -> Option<sched::Options> {
+    let mut o = scheduler_options_base(f, pname);
+    let decls = declared_regions(f);
+    if !decls.is_empty() && !matches!(std::env::var("AMDC_SCHED").ok().as_deref(), Some("0")) {
+        // per-region strategies: the scheduler runs for them even on a kernel without a preset (the kernel default then is `rewait`: waits only)
+        let base = o.get_or_insert_with(|| {
+            let mut d = sched::Options::default();
+            d.reorder = false;
+            d
+        });
+        base.regions = decls.iter().map(|r| sched::region::RegionSpec { name: r.name.clone(), authored: r.authored, tokens: r.tokens.clone() }).collect();
+    }
+    o
+}
+
+/// The kernel's declared region strategies plus the experiment switch `AMDC_SCHED_REGION=<region name>:<authored|free>[:<tokens>][;...] (`|` also separates entries, for tools that split on `;`)` (appended, a later entry of the same name wins):
+/// per-region A/B tests without editing the kernel builder, e.g. `AMDC_SCHED_REGION=m_phase:authored:ldsink=1;window:free:reorder`.
+fn declared_regions(f: &amdgpu_dsl::Function) -> Vec<amdgpu_dsl::RegionDecl> {
+    let mut out = f.regions.clone();
+    if let Some(spec) = std::env::var("AMDC_SCHED_REGION").ok().filter(|v| !v.is_empty()) {
+        for ent in spec.split([';', '|']) {
+            let mut it = ent.splitn(3, ':');
+            let (Some(name), Some(mode)) = (it.next(), it.next()) else { continue };
+            let d = amdgpu_dsl::RegionDecl { name: name.trim().to_string(), authored: mode.trim() == "authored", tokens: it.next().unwrap_or("").trim().to_string() };
+            out.retain(|r| r.name != d.name);
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// `MInst::region` id (1-based index into `MFunction::reg_hints.regions`, 0 = none) -> strategy id (1-based index into `Function::regions`, 0 = the kernel default): the nearest declared
+/// region on the way up the nesting.
+pub fn region_strategies(f: &amdgpu_dsl::Function, m: &mir::MFunction) -> Vec<u16> {
+    let regs = &m.reg_hints.regions;
+    let decls = declared_regions(f);
+    let mut out = vec![0u16; regs.len() + 1];
+    for (k, (name, parent)) in regs.iter().enumerate() {
+        let own = decls.iter().position(|r| &r.name == name).map(|i| (i + 1) as u16);
+        // parents are lowered before their children: out[parent] is final
+        out[k + 1] = own.unwrap_or(if *parent == 0 { 0 } else { out[*parent as usize] });
+    }
+    out
+}
+
+fn scheduler_options_base(f: &amdgpu_dsl::Function, pname: &str) -> Option<sched::Options> {
     if let Some(o) = sched::Options::from_env() {
         return Some(o);
     }
