@@ -853,7 +853,8 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
         let xq = b.bind_i32((io.s_len.clone() + ((1 << rows_lg) - 1)).lshr(rows_lg));
         let n = b.bind_i32(ev(xq) * ev(hh));
         // ok = (N % 8 == 0) && (H <= 32), as 0 / 1
-        let ok = b.bind_i32((ev(n) & 7).eq(0).select_i32(ev(hh).le(32).select_i32(1, 0), 0));
+        // + X <= 16: with long sequences (X = 32, B8H8S8192) the order measured -6.9 % (all 32 CUs of an XCD on one head in lockstep)
+        let ok = b.bind_i32((ev(n) & 7).eq(0).select_i32(ev(hh).le(32).select_i32(ev(xq).le(16).select_i32(1, 0), 0), 0));
         let l = b.bind_i32(ev(y0) * ev(xq) + ev(x0));
         let mut r = b.bind_i32((ev(l) & 7) * ev(n).lshr(3) + ev(l).lshr(3));
         // head = M / X by binary long division (H <= 32: 5 steps)
