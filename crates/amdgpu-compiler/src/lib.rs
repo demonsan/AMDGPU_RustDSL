@@ -18,6 +18,7 @@ pub mod lower;
 pub mod mir;
 pub mod op_attrs;
 pub mod regalloc;
+pub mod regplan;
 pub mod sched;
 
 pub struct Compiled {
