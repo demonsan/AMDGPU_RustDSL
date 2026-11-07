@@ -16,6 +16,7 @@ fn usage() {
     eprintln!("  amdc print-ir <kernel> [--stage dsl|mir|mir-ra]");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
     eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
+    eprintln!("  amdc regplan <kernel> [--specialize ..]   per weave-region / stage register peaks (allocator truth) + register-plan report");
     eprintln!("  amdc jit-info <kernel> [--specialize name=value[,..]] [--backend ..]   JSON metadata for the Python JIT (docs/jit.md)");
     eprintln!("  amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict] [--specialize ..]");
     eprintln!("      --backend llvm-tail runs the pinned llc tail (ROCM_LLVM_BIN overrides the tool dir);");
@@ -427,6 +428,43 @@ fn main() -> ExitCode {
                 None => {
                     eprintln!("unknown kernel: {name}");
                     ExitCode::from(2)
+                }
+            }
+        }
+        "regplan" => {
+            // amdc regplan <kernel> [--specialize ..]: per weave-region / stage register peaks of the allocated kernel + the plan's report
+            let Some(name) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let (f, _) = match kernel_spec(name, &args) {
+                Ok(x) => x,
+                Err(c) => return c,
+            };
+            match amdgpu_compiler::compile_mir_alloc(&f) {
+                Ok((m, a)) => {
+                    println!("{name}: arch VGPRs {} AGPRs {}", a.max_v, amdgpu_compiler::regalloc::agpr_count(&m, &a));
+                    for p in amdgpu_compiler::regplan::region_report(&m, &a) {
+                        println!(
+                            "region {:<28} insts {:>5}  vgpr footprint {:>3}  live dwords {:>3}  agpr footprint {:>3}  peak at b{} i{}: {}",
+                            p.name,
+                            p.insts,
+                            p.vgpr_footprint_peak,
+                            p.vgpr_live_peak,
+                            p.agpr_footprint_peak,
+                            p.at.0,
+                            p.at.1,
+                            p.live_at_peak.iter().take(12).cloned().collect::<Vec<_>>().join(" ")
+                        );
+                    }
+                    for l in amdgpu_compiler::regplan::report(&m, &a) {
+                        println!("plan: {l}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("compile error:\n{e}");
+                    ExitCode::from(1)
                 }
             }
         }

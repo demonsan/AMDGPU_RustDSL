@@ -16,7 +16,7 @@ fn func(insts: Vec<MInst>, nvregs: usize) -> MFunction {
         loops: Vec::new(),
         alias: Default::default(),
         elide_fallthrough: false, edge_pad: false,
-        agpr_pin: Default::default(),
+        agpr_pin: Default::default(), reg_hints: Default::default(),
     }
 }
 
