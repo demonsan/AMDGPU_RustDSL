@@ -855,8 +855,8 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
             r = b.bind_i32(ev(r) - ev(take) * ev(xb));
         }
         // clamps (no-ops for N % 8 == 0, H <= 32) bound the logical ids for the verifier
-        let rc = b.bind_i32(ev(r).lt(ev(xq)).select_i32(ev(r), ev(xq) - 1));
-        let yc = b.bind_i32(ev(y).lt(ev(hh)).select_i32(ev(y), ev(hh) - 1));
+        let rc = b.bind_i32(ev(r).max(0).min(ev(xq) - 1));
+        let yc = b.bind_i32(ev(y).max(0).min(ev(hh) - 1));
         let qt = b.bind_i32(ev(ok).eq(1).select_i32(ev(rc), ev(x0)));
         let hi = b.bind_i32(ev(ok).eq(1).select_i32(ev(yc), ev(y0)));
         (qt, hi)
