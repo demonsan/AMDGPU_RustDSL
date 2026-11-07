@@ -62,7 +62,7 @@ DSL(Rust) ──► typed IR（区域树：Loop / If / Region / Stage + 编织�
 编译策略按 kernel profile 固定（`crates/amdgpu-compiler/src/lib.rs`）：FMHA `_vs128`/`_kvsplit` = `dce,cmpfold,scalarize,retarget2,imm,sgpr,zeroinit`，
 `_t128` 另加 `addrfold,saddrlds,edgepad,salubr`；GEMM = `dce,cmpfold,lgkmn,zeroinit,scalarize,scalarize2,waveuni,edgepad,kabatch,imm` + M0 复用。
 保留的开关：调度 `AMDC_SCHED`（0 / 1 / ld）、`AMDC_SCHED_OPTS`、`AMDC_SCHED_ADD`（在 kernel 预设上追加调度 token，含 `hzfill`）、`AMDC_SCHED_REGION`
-（按区域策略的 A/B）、`AMDC_SCHED_VERBOSE`；分配器 `AMDC_RA_DEBUG_FILE`；后端 `AMDC_BACKEND`、`AMDC_KEEP_MIR`、`AMDC_DIALECT`、`AMDC_LLC_ARGS`、
+（按区域策略的 A/B）、`AMDC_SCHED_VERBOSE`；分配器 `AMDC_RA_DEBUG_FILE`、`AMDC_RA_LDS_SPILL(_TARGET)`（强制 LDS spill，回归探针用）；后端 `AMDC_BACKEND`、`AMDC_KEEP_MIR`、`AMDC_DIALECT`、`AMDC_LLC_ARGS`、
 `AMDC_BACKEND_LOCK` 与 LLVM 定位变量；验证 `AMDC_GPU_VERIFY`。
 
 **LLVM pin**：ROCm 10.1.0（AMD LLVM 24.0.0git，方言 `llvm24`）。ROCm 10 不自带 `llc`，用
@@ -253,7 +253,7 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 - **门禁**：`tools/port_gate.sh`（FMHA：BUILD / VERIFY / ACC16 / ACC64 / DET / STRESS / PERF）、`tools/gemm_gate.sh`（GEMM）。
 - **md5 守护**：`tools/md5_kernels.sh`（全部 `amdc list`）与 `tools/md5_compare.py`（对基线逐 kernel 比较，列出差异与已删除项）；`tools/ir_roundtrip_check.sh`（每个 kernel 经 irv1 文本往返后双后端 asm 与证书相同）。
 - **工具**（`tools/`）：厂商对照（`vendor_disasm.sh`、`vendor_analyze.py`）、汇编对照（`asm_diff.py`、`asm_regmap.py`、`loop_stats.py`、`nop_attrib.py`）、
-  GEMM（`gemm_ref.sh`、`prof_gemm.sh`、`att_*.py`）、A/B（`ab_fmha.sh`、`ab_gemm.sh`、`ab_layout.sh`、`ab_files.sh`；变体可为 `kernel@spec` 或 `x.ir`）、探针（`*_probe.sh`）、LLVM（`llvm_build_llc.sh`、
+  GEMM（`gemm_ref.sh`、`prof_gemm.sh`、`att_*.py`）、A/B（`ab_fmha.sh`、`ab_gemm.sh`、`ab_layout.sh`；变体可为 `kernel@spec` 或 `x.ir`）、探针（`*_probe.sh`）、LLVM（`llvm_build_llc.sh`、
   `llvm_conformance.sh`、`llvm_feature_audit.py`）、文档链接检查 `check_doc_links.py`。
 - **测量协议**：`.s`/`.co` 溯源、≥7 轮交错 A/B 或 8 布局中位数、同轮厂商、split 形状反复启动；GPU 隔离（每人固定 `HIP_VISIBLE_DEVICES`）。
 

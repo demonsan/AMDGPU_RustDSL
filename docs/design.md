@@ -98,7 +98,7 @@ DSL(Rust) ─► typed IR（Op 82 种 / Stmt 48 种；区域树 + 编织区域�
 | `waits` | scoreboard 等待重算：剥离 `auto` 等待，按 vmcnt/lgkmcnt 队列重新插入 **partial** 等待（SMEM 乱序时退化为 0） |
 | `verify` / `sim` / `liveness` | 独立验证器（顺序置换、等待充分性）、简易模拟、活跃性 |
 
-- **预设按 profile**（`lib.rs`）：出厂 FMHA `_vs128/_t128/_kvsplit` 与 MLP `_g2` 用完整 list scheduler（各自的压力上限 / 跨 barrier 设置），其余 FMHA 形态用 `ld`（只重算 wait + `ds_read` 提升，不重排）；GEMM 用 scoreboard 等待 + 提升 + slotfill；kernel 可经 `Function::sched_opts` 追加 token，编织区域经 `RegionDecl` 选策略。`AMDC_SCHED=0` 关闭。
+- **策略来源**（`lib.rs::scheduler_options(f)`）：profile 预设只有两个——GEMM（scoreboard 等待 + `ds_read` 提升，不重排）与 `_t128`（ALU 跨 barrier、压力上限 248）；其余 kernel 由自己的 `Function::sched_opts` 声明 token（叠加在预设之上，从不替代），编织区域经 `RegionDecl` 选 authored / free 策略。`AMDC_SCHED=1|ld` 覆盖、`AMDC_SCHED=0` 关闭，`AMDC_SCHED_ADD` / `AMDC_SCHED_REGION` 是不改 kernel 的 A/B 开关。
 - **失败回退**：出现 “out of VGPRs” 时依次收缩 hoist 距离、压力上限，最后回到未调度代码。
 - **pinned 屏障语义**：`MInst.pin` 的指令在依赖图中是屏障节点——run 内保持原序，run 之前的所有指令先于 run 的首条，run 的末条先于其后的所有指令；hazard 填充与 `sink_defs/coalesce` 等 lowering pass 也不得移动或跨越 pinned 指令。
 - 调度器对 **ALU 受限** 的假设已被量化证伪（§12）：它保留为可选工具，不是性能杠杆。
