@@ -57,3 +57,32 @@ pub fn graph() -> Graph {
     e_out.abi = Some((24, 8));
     Graph { name: "mlp_fp8".into(), attrs: vec![("threads".into(), Val::Int(256))], nodes, edges: vec![e_in, e_w1, e_w2, e_w1l, e_w2l, e_x0, e_xn, e_h, e_out], groups: Vec::new() }
 }
+
+/// The unfused pair as one graph (`mlp_fp8_ws_g1` = `w1_image`, `x_first`, `gemm1_act`, `x_next`; `mlp_fp8_ws_g2` = `w2_image`, `h_first`, `h_next`, `gemm2`): the same stages as `graph()`, with H going through
+/// HBM (the C4 edge `h`) and the second kernel reading it with the row-fragment loader (`h_first`, `h_next`).
+pub fn graph_unfused() -> Graph {
+    let f = graph();
+    let take = |id: &str| f.nodes.iter().find(|n| n.id == id).unwrap().clone();
+    let mut h_first = take("x_first");
+    h_first.id = "h_first".into();
+    let mut h_next = take("x_next");
+    h_next.id = "h_next".into();
+    let mut w2_image = take("w2_image");
+    w2_image.phase = Phase::Prologue;
+    let nodes = vec![take("w1_image"), take("x_first"), take("gemm1_act"), take("x_next"), w2_image, h_first, h_next, take("gemm2")];
+    let e = |n: &str| f.edges.iter().find(|e| e.name == n).unwrap().clone();
+    let mut e_h = edge("h", Some("gemm1_act"), &["h_first", "h_next"], "fp8", &[-1, N1], "H rows in HBM", Scope::None, Store::Global, Some(Class::C4));
+    e_h.abi = None;
+    let e_h0 = edge("h0", Some("h_first"), &["gemm2"], "fp8", &[32, N1], "B operand fragments (the P words' memory image)", Scope::Wave, Store::Vgpr, Some(Class::C0));
+    let mut e_hn = edge("hn", Some("h_next"), &["gemm2"], "fp8", &[32, N1], "B operand fragments (the P words' memory image)", Scope::Wave, Store::Vgpr, Some(Class::C0));
+    e_hn.carried = true;
+    let mut e_out1 = edge("h_out", Some("gemm1_act"), &[], "fp8", &[-1, N1], "H rows in HBM (written by the kernel)", Scope::None, Store::Global, Some(Class::C4));
+    e_out1.abi = Some((24, 8));
+    let mut in2 = e("in");
+    in2.to = vec!["x_first".into(), "x_next".into()];
+    let edges = vec![in2, e("w1"), e("w2").clone(), e("w1_lds"), e("w2_lds"), e("x0"), e("xn"), e_h, e_h0, e_hn, e_out1, e("out")];
+    let mut edges = edges;
+    // the H stored by kernel 1 is the tensor `h` read by kernel 2 (a cut edge); kernel 1's own output slot is the same tensor, so no separate `h_out` edge
+    edges.retain(|x| x.name != "h_out");
+    Graph { name: "mlp_fp8_unfused".into(), attrs: vec![("threads".into(), Val::Int(256))], nodes, edges, groups: Vec::new() }
+}
