@@ -1,0 +1,328 @@
+{
+  "name": "mlp_fp8_unfused",
+  "attrs": {
+    "threads": 256
+  },
+  "nodes": [
+    {
+      "id": "w1_image",
+      "prim": "M",
+      "stage": "move.lds_image",
+      "params": {
+        "bytes": 69632,
+        "pitch": 272
+      },
+      "resources": {
+        "vgprs": 8,
+        "agprs": 0,
+        "lds_bytes": 69632,
+        "barriers": 1
+      },
+      "roles": ["all 4 waves: same program"],
+      "barrier_phase": 0,
+      "phase": "prologue",
+      "hook": null
+    },
+    {
+      "id": "x_first",
+      "prim": "M",
+      "stage": "move.row_frags",
+      "params": {
+        "k": 256
+      },
+      "resources": {
+        "vgprs": 32,
+        "agprs": 0,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["all 4 waves: same program"],
+      "barrier_phase": 0,
+      "phase": "prologue",
+      "hook": null
+    },
+    {
+      "id": "gemm1_act",
+      "prim": "A",
+      "stage": "mma.rows_x_lds",
+      "params": {
+        "atom": "mfma_scale_32x32x64_f8",
+        "n": 256,
+        "k": 256,
+        "act": "map.relu_pack_fp8",
+        "alpha": "0.125"
+      },
+      "resources": {
+        "vgprs": 192,
+        "agprs": 0,
+        "lds_bytes": 69632,
+        "barriers": 0
+      },
+      "roles": ["all 4 waves: same program"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": null
+    },
+    {
+      "id": "x_next",
+      "prim": "M",
+      "stage": "move.row_frags",
+      "params": {
+        "k": 256
+      },
+      "resources": {
+        "vgprs": 32,
+        "agprs": 0,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["all 4 waves: same program"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": null
+    },
+    {
+      "id": "w2_image",
+      "prim": "M",
+      "stage": "move.lds_image",
+      "params": {
+        "bytes": 69632,
+        "pitch": 272
+      },
+      "resources": {
+        "vgprs": 8,
+        "agprs": 0,
+        "lds_bytes": 69632,
+        "barriers": 1
+      },
+      "roles": ["all 4 waves: same program"],
+      "barrier_phase": 0,
+      "phase": "prologue",
+      "hook": null
+    },
+    {
+      "id": "h_first",
+      "prim": "M",
+      "stage": "move.row_frags",
+      "params": {
+        "k": 256
+      },
+      "resources": {
+        "vgprs": 32,
+        "agprs": 0,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["all 4 waves: same program"],
+      "barrier_phase": 0,
+      "phase": "prologue",
+      "hook": null
+    },
+    {
+      "id": "h_next",
+      "prim": "M",
+      "stage": "move.row_frags",
+      "params": {
+        "k": 256
+      },
+      "resources": {
+        "vgprs": 32,
+        "agprs": 0,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["all 4 waves: same program"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": null
+    },
+    {
+      "id": "gemm2",
+      "prim": "A",
+      "stage": "mma.rows_x_lds",
+      "params": {
+        "atom": "mfma_scale_32x32x64_f8",
+        "n": 256,
+        "k": 256,
+        "epilogue": "map.store_bf16"
+      },
+      "resources": {
+        "vgprs": 160,
+        "agprs": 0,
+        "lds_bytes": 69632,
+        "barriers": 0
+      },
+      "roles": ["all 4 waves: same program"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": null
+    }
+  ],
+  "edges": [
+    {
+      "name": "in",
+      "from": null,
+      "to": ["x_first", "x_next"],
+      "dtype": "fp8",
+      "shape": [-1, 256],
+      "layout": "row-major",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [0, 8],
+      "carried": false
+    },
+    {
+      "name": "w1",
+      "from": null,
+      "to": ["w1_image"],
+      "dtype": "fp8",
+      "shape": [256, 256],
+      "layout": "padded rows (pitch 272)",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [8, 8],
+      "carried": false
+    },
+    {
+      "name": "w2",
+      "from": null,
+      "to": ["w2_image"],
+      "dtype": "fp8",
+      "shape": [256, 256],
+      "layout": "padded rows, key-permuted (sigma)",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [16, 8],
+      "carried": false
+    },
+    {
+      "name": "w1_lds",
+      "from": "w1_image",
+      "to": ["gemm1_act"],
+      "dtype": "fp8",
+      "shape": [256, 256],
+      "layout": "padded rows (pitch 272)",
+      "producer": null,
+      "consumer": null,
+      "scope": "block",
+      "store": "lds:W1",
+      "class": "C3",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "w2_lds",
+      "from": "w2_image",
+      "to": ["gemm2"],
+      "dtype": "fp8",
+      "shape": [256, 256],
+      "layout": "padded rows, key-permuted (sigma)",
+      "producer": null,
+      "consumer": null,
+      "scope": "block",
+      "store": "lds:W2",
+      "class": "C3",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "x0",
+      "from": "x_first",
+      "to": ["gemm1_act"],
+      "dtype": "fp8",
+      "shape": [32, 256],
+      "layout": "B operand fragments",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "xn",
+      "from": "x_next",
+      "to": ["gemm1_act"],
+      "dtype": "fp8",
+      "shape": [32, 256],
+      "layout": "B operand fragments",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": true
+    },
+    {
+      "name": "h",
+      "from": "gemm1_act",
+      "to": ["h_first", "h_next"],
+      "dtype": "fp8",
+      "shape": [-1, 256],
+      "layout": "H rows in HBM",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "h0",
+      "from": "h_first",
+      "to": ["gemm2"],
+      "dtype": "fp8",
+      "shape": [32, 256],
+      "layout": "B operand fragments (the P words' memory image)",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "hn",
+      "from": "h_next",
+      "to": ["gemm2"],
+      "dtype": "fp8",
+      "shape": [32, 256],
+      "layout": "B operand fragments (the P words' memory image)",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": true
+    },
+    {
+      "name": "out",
+      "from": "gemm2",
+      "to": [],
+      "dtype": "bf16",
+      "shape": [-1, 256],
+      "layout": "row-major",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [24, 8],
+      "carried": false
+    }
+  ]
+}

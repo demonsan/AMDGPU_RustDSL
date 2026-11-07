@@ -19,6 +19,8 @@ use amdgpu_layout::Movement;
 
 pub mod graph;
 mod skeleton_fused;
+mod skeleton_g1;
+mod skeleton_g2;
 
 pub const K1: i64 = 256;
 pub const N1: i64 = 256;
@@ -353,12 +355,77 @@ impl skeleton_fused::FusedSlots for MlpSlots {
     }
 }
 
+/// `mlp_fp8_ws_g1` through its generated cut skeleton (`skeleton_g1.rs`, kernel `g1` of `graph::graph_unfused()`): GEMM 1 + the activation, H stored by the stage itself (`store_h` has nothing left to do).
+impl skeleton_g1::G1Slots for MlpSlots {
+    type Cx = Cx;
+    fn prelude(&mut self, b: &mut FnBuilder) -> Cx {
+        self.s_prelude("mlp_fp8_ws_g1", b)
+    }
+    fn w1_image(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.image(b, cx, 1);
+        self.s_images_done(b);
+    }
+    fn x_first(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_x_first(b, cx);
+    }
+    fn loop_open(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_loop_open(b, cx);
+    }
+    fn gemm1_act(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_gemm1_act(b, cx);
+    }
+    fn store_h(&mut self, _b: &mut FnBuilder, _cx: &mut Cx) {
+        // `gemm1_act` in G1 mode stores H itself (its `map.relu_pack_fp8 -> store` epilogue)
+    }
+    fn x_next(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_x_next(b, cx);
+    }
+    fn loop_close(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_loop_close(b, cx);
+    }
+}
+
+/// `mlp_fp8_ws_g2` through its generated cut skeleton (`skeleton_g2.rs`): H rows are the row operand, loaded by the row-fragment pieces (`h_first`, `h_next`); `load_h` has nothing left to do.
+impl skeleton_g2::G2Slots for MlpSlots {
+    type Cx = Cx;
+    fn prelude(&mut self, b: &mut FnBuilder) -> Cx {
+        self.s_prelude("mlp_fp8_ws_g2", b)
+    }
+    fn w2_image(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.image(b, cx, 2);
+        self.s_images_done(b);
+    }
+    fn load_h(&mut self, _b: &mut FnBuilder, _cx: &mut Cx) {
+        // the loads of H are the row-fragment loads of `h_first` / `h_next`
+    }
+    fn h_first(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_x_first(b, cx);
+    }
+    fn loop_open(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_loop_open(b, cx);
+    }
+    fn h_next(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_x_next(b, cx);
+    }
+    fn gemm2(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        // GEMM 2 reads the loaded H rows (the loop-carried fragments) as its B operand
+        cx.p_words = cx.xs.clone();
+        self.s_gemm2(b, cx);
+    }
+    fn loop_close(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
+        self.s_loop_close(b, cx);
+    }
+}
+
 fn build_ws(name: &str, mode: Mode) -> Function {
     let mut slots = MlpSlots { mode };
-    if mode == Mode::Fused {
-        return skeleton_fused::build_fused(name, &mut slots);
+    match mode {
+        Mode::Fused => return skeleton_fused::build_fused(name, &mut slots),
+        Mode::G1 => return skeleton_g1::build_g1(name, &mut slots),
+        Mode::G2 => return skeleton_g2::build_g2(name, &mut slots),
+        _ => {}
     }
-    // the unfused pair: the same pieces in the order of its own cut of the graph (the cut kernels' skeletons are generated too, see `generated_cuts`)
+    // the GEMM-1 + epilogue-chain variants (`g1q_*`): the same pieces in the order of g1's cut (their own graph with the bias / scale tensors is not generated yet)
     let mut fb = FnBuilder::new(name, 256);
     let b = &mut fb;
     let mut cx = slots.s_prelude(name, b);
