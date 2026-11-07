@@ -46,13 +46,14 @@ fn dsl_printer_is_structured_and_shows_types_operands_and_markers() {
     for name in ["probe_expr_ids", "probe_expr_kernarg", "fmha_fwd_hd128_mxfp8_v3_vs128"] {
         let f = kernel_by_name(name).unwrap();
         let text = print_dsl(&f);
-        assert!(text.starts_with(&format!("dsl @{name}")), "{name}: header");
-        assert!(text.contains("kernarg_size="), "{name}: abi");
-        assert!(text.contains("  body:"), "{name}: body");
+        assert!(text.starts_with(&format!("irv1\ndsl \"{name}\"")), "{name}: header");
+        assert!(text.contains("kernarg_size "), "{name}: abi");
+        assert!(text.contains("body {"), "{name}: body");
         assert!(text.contains("%v"), "{name}: value names");
         if name.starts_with("fmha") {
-            assert!(text.contains("contract:"), "{name}: contract");
-            assert!(text.contains("tile "), "{name}: tiles");
+            assert!(text.contains("contract Contract"), "{name}: contract");
+            assert!(text.contains("TileDecl"), "{name}: tiles");
+            assert!(text.contains("region TileConsume") || text.contains("region TileProduce"), "{name}: tile regions");
         }
     }
     let text = print_dsl(&kernel_by_name("probe_expr_ids").unwrap());
