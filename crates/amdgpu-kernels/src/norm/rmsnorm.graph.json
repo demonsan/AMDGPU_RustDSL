@@ -1,0 +1,220 @@
+{
+  "name": "rmsnorm_quant_fp8",
+  "attrs": {
+    "threads": 256
+  },
+  "nodes": [
+    {
+      "id": "load",
+      "prim": "M",
+      "stage": "move.row_load",
+      "params": {
+        "n": 1024,
+        "dtype": "bf16"
+      },
+      "resources": {
+        "vgprs": 64,
+        "agprs": 0,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["all 4 waves: one row each"],
+      "barrier_phase": 0,
+      "phase": "prologue",
+      "hook": null
+    },
+    {
+      "id": "rms",
+      "prim": "R",
+      "stage": "reduce.row_sumsq",
+      "params": {
+        "op": "sum x^2 / n"
+      },
+      "resources": {
+        "vgprs": 80,
+        "agprs": 0,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["all 4 waves: one row each"],
+      "barrier_phase": 0,
+      "phase": "prologue",
+      "hook": null
+    },
+    {
+      "id": "quant",
+      "prim": "Q",
+      "stage": "quant.fp8_row",
+      "params": {
+        "format": "e4m3",
+        "granularity": "per-token",
+        "scale": "f32"
+      },
+      "resources": {
+        "vgprs": 96,
+        "agprs": 0,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["all 4 waves: one row each"],
+      "barrier_phase": 0,
+      "phase": "prologue",
+      "hook": null
+    },
+    {
+      "id": "store",
+      "prim": "M",
+      "stage": "move.row_store",
+      "params": {
+        "dtype": "fp8_e4m3 + f32 scale"
+      },
+      "resources": {
+        "vgprs": 24,
+        "agprs": 0,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["all 4 waves: one row each"],
+      "barrier_phase": 0,
+      "phase": "prologue",
+      "hook": null
+    }
+  ],
+  "edges": [
+    {
+      "name": "x",
+      "from": null,
+      "to": ["load"],
+      "dtype": "bf16",
+      "shape": [-1, 1024],
+      "layout": "row-major",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [0, 8],
+      "carried": false
+    },
+    {
+      "name": "gamma",
+      "from": null,
+      "to": ["load"],
+      "dtype": "bf16",
+      "shape": [1024],
+      "layout": "vector",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [8, 8],
+      "carried": false
+    },
+    {
+      "name": "x_rows",
+      "from": "load",
+      "to": ["rms", "quant"],
+      "dtype": "bf16",
+      "shape": [1, 1024],
+      "layout": "packed bf16, 8 per 16-byte fragment (lane l holds elements 8 (l + 64 i) + k)",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "gamma_rows",
+      "from": "load",
+      "to": ["quant"],
+      "dtype": "bf16",
+      "shape": [1, 1024],
+      "layout": "packed bf16 fragments",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "inv_rms",
+      "from": "rms",
+      "to": ["quant"],
+      "dtype": "f32",
+      "shape": [1],
+      "layout": "per-row scalar (wave)",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "q_rows",
+      "from": "quant",
+      "to": ["store"],
+      "dtype": "fp8",
+      "shape": [1, 1024],
+      "layout": "fp8 words in accumulator-like order (4 per dword)",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "scale_row",
+      "from": "quant",
+      "to": ["store"],
+      "dtype": "f32",
+      "shape": [1],
+      "layout": "per-row scalar (wave)",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "q",
+      "from": "store",
+      "to": [],
+      "dtype": "fp8",
+      "shape": [-1, 1024],
+      "layout": "row-major",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [16, 8],
+      "carried": false
+    },
+    {
+      "name": "scale",
+      "from": "store",
+      "to": [],
+      "dtype": "f32",
+      "shape": [-1],
+      "layout": "vector",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": [24, 8],
+      "carried": false
+    }
+  ]
+}
