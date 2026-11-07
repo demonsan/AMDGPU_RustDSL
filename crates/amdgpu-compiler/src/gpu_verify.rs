@@ -1882,8 +1882,8 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
         Stmt::Let { op, .. } => match op {
             Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::LoadF32Coherent { .. } | Op::BufferLoad { .. } => (1, 0),
             Op::BufferLoadB128x2 { .. } => (2, 0),
-            Op::LoadLdsB32(..) | Op::LoadLdsB128(..) | Op::LoadLdsB64(..) | Op::LoadLdsTrB8(..) => (0, 1),
-            Op::LoadLdsB128x2(..) => (0, 2),
+            Op::LoadLdsB32 { .. } | Op::LoadLdsB128 { .. } | Op::LoadLdsB64 { .. } | Op::LoadLdsTrB8 { .. } => (0, 1),
+            Op::LoadLdsB128x2 { .. } => (0, 2),
             Op::LoadLdsTr4B8 { .. } => (0, 4),
             _ => (0, 0),
         },
