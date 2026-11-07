@@ -78,8 +78,11 @@ pub fn rmsnorm_quant_fp8(name: &str, n: i64) -> Function {
     u.add("load.rows", UnitClass::Dma, Hint::LatencySensitive, &[], move |b| {
         let vx = b.bind_i32(ev(row) * (2 * n) as i32 + (lane2.lane() << 4));
         let vg = b.bind_i32(lane2.lane() << 4);
-        let fx: Vec<ValueId> = (0..nld).map(|i| b.buffer_load_b128(r_x, vx, Opnd::I32(1024 * i as i32), 0)).collect();
-        let fg: Vec<ValueId> = (0..nld).map(|i| b.buffer_load_b128(r_g, vg, Opnd::I32(1024 * i as i32), 0)).collect();
+        // the instruction offset reaches 4095 bytes: one voffset per group of 4 loads, imm 1024 (i % 4)
+        let gx: Vec<ValueId> = (0..nld.div_ceil(4)).map(|q| if q == 0 { vx } else { b.bind_i32(ev(vx) + 4096 * q as i32) }).collect();
+        let gg: Vec<ValueId> = (0..nld.div_ceil(4)).map(|q| if q == 0 { vg } else { b.bind_i32(ev(vg) + 4096 * q as i32) }).collect();
+        let fx: Vec<ValueId> = (0..nld).map(|i| b.buffer_load_b128(r_x, gx[i / 4], 0i32, (1024 * (i % 4)) as u32)).collect();
+        let fg: Vec<ValueId> = (0..nld).map(|i| b.buffer_load_b128(r_g, gg[i / 4], 0i32, (1024 * (i % 4)) as u32)).collect();
         b.wait_vm(0);
         x1.set(fx.iter().flat_map(|f| bf16x8_to_f32(b, *f)).collect());
         g1.set(fg.iter().flat_map(|f| bf16x8_to_f32(b, *f)).collect());
@@ -155,9 +158,10 @@ pub fn rmsnorm_quant_fp8(name: &str, n: i64) -> Function {
     u.add("store.rows", UnitClass::Dma, Hint::Anchor, &[], move |b| {
         let words = q3.get();
         let vq = b.bind_i32(ev(row) * n as i32 + (lane5.lane() << 3));
+        let gq: Vec<ValueId> = (0..nld.div_ceil(8)).map(|q| if q == 0 { vq } else { b.bind_i32(ev(vq) + 4096 * q as i32) }).collect();
         for i in 0..nld {
             let f2 = b.frag2(words[2 * i], words[2 * i + 1]);
-            b.buffer_store_b64(r_q, vq, Opnd::I32(512 * i as i32), 0, f2);
+            b.buffer_store_b64(r_q, gq[i / 8], 0i32, (512 * (i % 8)) as u32, f2);
         }
         let vs = b.bind_i32(ev(row) << 2);
         b.buffer_store_f32(r_s, vs, 0i32, 0, s3.get());
