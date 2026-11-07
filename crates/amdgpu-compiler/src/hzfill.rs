@@ -206,7 +206,8 @@ fn region_ok(o: Option<&crate::sched::Options>, m: &MFunction, bi: usize, i: usi
     let Some(o) = o.filter(|o| !o.regions.is_empty()) else { return true };
     let insts = &m.blocks[bi].insts;
     let strat = |k: usize| crate::sched::region::strategy_of(o, insts[k].region);
-    let Some(w) = (i + 1..insts.len()).find(|&k| insts[k].op != MOp::SNop) else { return true };
+    // a trailing nop (before the terminator) belongs to the last real instruction before it
+    let Some(w) = (i + 1..insts.len()).find(|&k| insts[k].op != MOp::SNop).or_else(|| (0..i).rev().find(|&k| insts[k].op != MOp::SNop)) else { return o.for_region(0).hzfill };
     let want = strat(w);
     if !o.for_region(want).hzfill {
         return false;
