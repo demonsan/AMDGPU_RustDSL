@@ -346,9 +346,16 @@ impl Body {
         let roles = vec!["all".to_string()];
         let phase = b.barriers_so_far();
         let me: &Body = self;
-        // plain (no Node::Stage region): the slot-offset bindings are cached across the staging and compute instances (SlotIdx::off_v), which
-        // GV-STAGE would count as undeclared cross-stage reads; the regions follow once those bindings are hoisted out of the instances
-        me.tile_stage(t, phase, roles).plain(true).emit(b);
+        // the slot offsets of t + 1 are bound before the region (they are shared with the staging instance through the SlotIdx cache)
+        let tt = t.clone();
+        me.tile_stage(t, phase, roles)
+            .prebind(move |b| {
+                if tt.staged {
+                    let _ = me.a_s.at(&tt.next).off_v(b);
+                    let _ = me.b_s.at(&tt.next).off_v(b);
+                }
+            })
+            .emit(b);
     }
     /// Stage `mma.blockscale_tile`: the MMAs of the register tile; when `t.staged`, each fragment is reloaded from tile t+1 right after its last
     /// use (first half of the B fragments with every A fragment, then the B halves are reloaded; second half, after which every A fragment is
@@ -429,7 +436,13 @@ impl Body {
     }    /// The DMA of one tile (A issues, then B issues): soffset = the wave-uniform tile origin, M0 = the first 1 KB block of each group of 4 issues.
     fn stage_now(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx) {
         let phase = b.barriers_so_far();
-        self.ab_stage(key0, slot, phase).plain(true).emit(b);
+        let sl = slot.clone();
+        self.ab_stage(key0, slot, phase)
+            .prebind(move |b| {
+                let _ = self.a_s.at(&sl).off_v(b);
+                let _ = self.b_s.at(&sl).off_v(b);
+            })
+            .emit(b);
     }
     /// Stage `move.ab_stage`: the DMA of one tile (A issues, then B issues); soffset = the wave-uniform tile origin, M0 = the first 1 KB block of
     /// each group of 4 issues; one unit per DMA instruction (each under the slot's write marker).

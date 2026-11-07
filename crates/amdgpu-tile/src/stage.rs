@@ -49,11 +49,14 @@ pub struct StageInst<'a> {
     pub handover: Option<Handover<'a>>,
     /// open a `Node::Stage` region (false: units only, e.g. the unfused forms of a kernel keep their plain program)
     pub region: bool,
+    /// emitted BEFORE the region opens, at the caller's scope: bindings shared with other instances (e.g. the per-slot LDS offsets that
+    /// `SlotIdx` caches for every consumer of a slot) so they are not hand-overs between stages
+    pub prebind: Option<Box<dyn FnOnce(&mut FnBuilder) + 'a>>,
 }
 
 impl<'a> StageInst<'a> {
     pub fn new(key: &'static str, prim: Prim, name: impl Into<String>, contract: StageContract, units: Units<'a>) -> StageInst<'a> {
-        StageInst { key, prim, name: name.into(), params: Vec::new(), contract, units, handover: None, region: true }
+        StageInst { key, prim, name: name.into(), params: Vec::new(), contract, units, handover: None, region: true, prebind: None }
     }
     pub fn param(mut self, k: &str, v: impl ToString) -> StageInst<'a> {
         self.params.push((k.to_string(), v.to_string()));
@@ -61,6 +64,10 @@ impl<'a> StageInst<'a> {
     }
     pub fn handover(mut self, f: impl FnOnce(&mut FnBuilder) -> (Vec<StageVal>, Vec<StageScalar>) + 'a) -> StageInst<'a> {
         self.handover = Some(Box::new(f));
+        self
+    }
+    pub fn prebind(mut self, f: impl FnOnce(&mut FnBuilder) + 'a) -> StageInst<'a> {
+        self.prebind = Some(Box::new(f));
         self
     }
     pub fn plain(mut self, plain: bool) -> StageInst<'a> {
@@ -74,7 +81,10 @@ impl<'a> StageInst<'a> {
     /// Emits the stage with the kernel's orchestration: `weave` receives the stage's weaver (labelled with the stage name) and returns it with an
     /// order / strategy.
     pub fn emit_with(self, b: &mut FnBuilder, weave: impl FnOnce(Weaver<'a>) -> Weaver<'a>) {
-        let StageInst { name, contract, units, handover, region, .. } = self;
+        let StageInst { name, contract, units, handover, region, prebind, .. } = self;
+        if let Some(p) = prebind {
+            p(b);
+        }
         if region {
             b.stage_begin(&name, contract);
         }
