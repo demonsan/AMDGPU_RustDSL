@@ -95,7 +95,8 @@ pub fn wave_reduce(b: &mut FnBuilder, op: RedOp, x: ValueId, scratch: &PrivRef, 
     }
     let base = scratch.base() + off;
     let wa = b.bind_i32(base.clone() + (lane.lane().lshr(2) << 2));
-    scratch.write(b, gen, |b| b.store_lds_b32(wa, v));
+    let vi = b.bitcast_i32(v);
+    scratch.write(b, gen, |b| b.store_lds_b32(wa, vi));
     b.wait_lds(0);
     let parts: Vec<ValueId> = scratch.read_back(b, gen, |b| {
         (0..4i32)
