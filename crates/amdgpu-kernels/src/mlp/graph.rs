@@ -23,7 +23,7 @@ fn h_layouts() -> (FragLayout, FragLayout) {
 }
 
 pub fn graph() -> Graph {
-    let mm = |atom_extra: Vec<(&str, Val)>| -> Vec<(&str, Val)> {
+    let mm = |atom_extra: Vec<(&'static str, Val)>| -> Vec<(&'static str, Val)> {
         let mut p = vec![("atom", Val::Str("mfma_scale_32x32x64_f8".into())), ("n", Val::Int(N1)), ("k", Val::Int(K1))];
         p.extend(atom_extra);
         p
