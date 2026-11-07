@@ -1729,7 +1729,12 @@ pub fn enforce(f: &Function, m: &MFunction, a: &Alloc) -> Result<(), String> {
 /// * every `live_out` value is defined before the stage ends;
 /// * a value defined inside one stage and read inside another must be declared in the reader's `live_in`;
 /// * `lds_reused` tiles were freed by an earlier stage, and no stage writes a tile an earlier stage freed unless it declares the reuse;
-/// * `barrier_phase` equals the number of barriers before the stage in program order.
+/// * `barrier_phase` equals the number of barriers before the stage in program order;
+/// * `layout` / `storage` of a consumed set match the hand-over when both sides record them (VGPR <-> AGPR allowed);
+/// * `scalars_in` are handed over by an earlier stage's `scalars_out` with the same values and owner;
+/// * `outstanding`: the vm / lgkm operations in flight at the stage entry (from earlier code) and at its exit (linear view, explicit waits
+///   applied) do not exceed the declared tolerances;
+/// * `resources.barriers` equals the number of barriers inside the stage.
 pub fn verify_stages(f: &Function, rep: &mut Report) {
     use amdgpu_dsl::{stmt_operands, StageContract};
     let stmts = f.stmts();
@@ -1744,10 +1749,38 @@ pub fn verify_stages(f: &Function, rep: &mut Report) {
     let mut sid = 0usize;
     let mut freed: Vec<String> = Vec::new();
     let mut ok = 0usize;
+    // linear in-flight counters (vm, lgkm) and the barrier count at each open stage's entry
+    let (mut vm, mut lgkm) = (0u32, 0u32);
+    let mut stage_barriers: Vec<u32> = Vec::new();
     for (i, st) in stmts.iter().enumerate() {
+        let (dvm, dlgkm) = mem_counts(st);
+        vm += dvm;
+        lgkm += dlgkm;
+        match st {
+            Stmt::WaitVm { count } => vm = vm.min(*count as u32),
+            Stmt::WaitLds { count } => lgkm = lgkm.min(*count as u32),
+            _ => {}
+        }
         match st {
             Stmt::StageBegin { name, contract } => {
                 sid += 1;
+                stage_barriers.push(barriers);
+                let o = &contract.outstanding;
+                if o.vm_in.is_some_and(|n| vm > n) || o.lgkm_in.is_some_and(|n| lgkm > n) {
+                    rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: {vm} vm / {lgkm} lgkm operations in flight at the entry exceed the tolerance {:?} / {:?}", o.vm_in, o.lgkm_in));
+                }
+                for want in &contract.scalars_in {
+                    match closed.iter().rev().find_map(|(pn, c)| c.scalars_out.iter().find(|x| x.name == want.name).map(|x| (pn, x))) {
+                        None => rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: scalar `{}` is not handed over by an earlier stage", want.name)),
+                        Some((pn, have)) => {
+                            if have.values != want.values || have.owner != want.owner {
+                                rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: scalar `{}` (owner {}) differs from stage {pn}'s hand-over (owner {})", want.name, want.owner, have.owner));
+                            } else {
+                                ok += 1;
+                            }
+                        }
+                    }
+                }
                 if contract.barrier_phase != barriers {
                     rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: barrier phase {} declared, {barriers} barriers precede it", contract.barrier_phase));
                 }
@@ -1757,6 +1790,10 @@ pub fn verify_stages(f: &Function, rep: &mut Report) {
                         Some((pn, pc, have)) => {
                             if have.values != want.values {
                                 rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: `{}` values differ from stage {pn}'s hand-over", want.name));
+                            } else if !have.layout.is_empty() && !want.layout.is_empty() && have.layout != want.layout {
+                                rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: `{}` TV layout {} differs from stage {pn}'s {}", want.name, want.layout, have.layout));
+                            } else if have.storage != want.storage && !matches!((have.storage.as_str(), want.storage.as_str()), ("vgpr", "agpr") | ("agpr", "vgpr")) {
+                                rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: `{}` storage {} vs stage {pn}'s {}", want.name, want.storage, have.storage));
                             } else if have.table != want.table || have.elem_bits != want.elem_bits {
                                 rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: `{}` layout / width differs from stage {pn}'s hand-over (a conversion must be code inside a stage)", want.name));
                             } else if pc.roles != contract.roles {
@@ -1776,6 +1813,21 @@ pub fn verify_stages(f: &Function, rep: &mut Report) {
             }
             Stmt::StageEnd => {
                 if let Some((_, name, c)) = open.pop() {
+                    let b0 = stage_barriers.pop().unwrap_or(0);
+                    if let Some(n) = c.resources.barriers {
+                        if barriers - b0 != n {
+                            rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: {} barriers inside, {n} declared", barriers - b0));
+                        }
+                    }
+                    let o = &c.outstanding;
+                    if o.vm_out.is_some_and(|n| vm > n) || o.lgkm_out.is_some_and(|n| lgkm > n) {
+                        rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: {vm} vm / {lgkm} lgkm operations in flight at the exit exceed the declared {:?} / {:?}", o.vm_out, o.lgkm_out));
+                    }
+                    for v in c.scalars_out.iter().flat_map(|x| x.values.iter()) {
+                        if !defined.contains(&(*v as u32)) {
+                            rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: hands over scalar v{v} which is not defined"));
+                        }
+                    }
                     for v in c.live_out.iter().flat_map(|x| x.values.iter()) {
                         if !defined.contains(&(*v as u32)) {
                             rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name}: hands over v{v} which is not defined"));
@@ -1807,7 +1859,7 @@ pub fn verify_stages(f: &Function, rep: &mut Report) {
             for o in ops {
                 if let Opnd::Val(v) = o {
                     if let Some(ds) = def_stage.get(&(v as u32)) {
-                        if ds != s && !c.live_in.iter().any(|x| x.values.contains(&v)) {
+                        if ds != s && !c.live_in.iter().any(|x| x.values.contains(&v)) && !c.scalars_in.iter().any(|x| x.values.contains(&v)) {
                             rep.add("GV-STAGE", Severity::Error, format!("stmt {i}: stage {name} reads v{v} of another stage without declaring it live-in"));
                         }
                     }
@@ -1817,5 +1869,24 @@ pub fn verify_stages(f: &Function, rep: &mut Report) {
     }
     for _ in 0..ok {
         rep.ok("stage-handoff");
+    }
+}
+
+/// (vm, lgkm) operations a statement issues (the counters `s_waitcnt vmcnt / lgkmcnt` track; linear-view accounting for GV-STAGE).
+fn mem_counts(st: &Stmt) -> (u32, u32) {
+    use amdgpu_dsl::Op;
+    match st {
+        Stmt::StoreU16 { .. } | Stmt::StoreF32 { .. } | Stmt::StoreF32x4 { .. } | Stmt::StoreF32x2 { .. } | Stmt::BufferStore { .. } | Stmt::StoreF32Wt { .. } => (1, 0),
+        Stmt::BufferLoadLds { .. } | Stmt::LoadGlobalLds { .. } => (1, 0),
+        Stmt::StoreLdsB32 { .. } | Stmt::StoreLdsB128 { .. } | Stmt::StoreLdsB64 { .. } => (0, 1),
+        Stmt::Let { op, .. } => match op {
+            Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::LoadF32Coherent { .. } | Op::BufferLoad { .. } => (1, 0),
+            Op::BufferLoadB128x2 { .. } => (2, 0),
+            Op::LoadLdsB32(..) | Op::LoadLdsB128(..) | Op::LoadLdsB64(..) | Op::LoadLdsTrB8(..) => (0, 1),
+            Op::LoadLdsB128x2(..) => (0, 2),
+            Op::LoadLdsTr4B8 { .. } => (0, 4),
+            _ => (0, 0),
+        },
+        _ => (0, 0),
     }
 }

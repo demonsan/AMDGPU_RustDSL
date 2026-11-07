@@ -75,7 +75,7 @@ pub const W_IMG: i64 = 256 * W_PITCH;
 fn p_stage_val(jb: i64, v: ValueId, producer: bool) -> amdgpu_dsl::StageVal {
     let (p, c) = p_boundary(jb);
     let lf = if producer { &p.live[0] } else { &c.live[0] };
-    amdgpu_dsl::StageVal { name: lf.name.clone(), values: vec![v], table: lf.table.clone(), elem_bits: lf.elem_bits, storage: "vgpr".into() }
+    amdgpu_dsl::StageVal { name: lf.name.clone(), values: vec![v], table: lf.table.clone(), elem_bits: lf.elem_bits, storage: "vgpr".into(), layout: String::new() }
 }
 
 fn build_ws(name: &str, mode: Mode) -> Function {
