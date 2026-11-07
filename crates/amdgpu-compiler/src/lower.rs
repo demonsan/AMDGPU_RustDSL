@@ -201,6 +201,9 @@ struct Lowerer {
     else_started: HashSet<u32>,
     /// AGPR requests from the IR (resolved to vregs in inish).
     agpr_marks: Vec<amdgpu_dsl::AgprMark>,
+    /// register plan of the kernel (resolved to vregs in `finish`) and the stack of open weave / stage regions (ids into `mir.reg_hints.regions`)
+    reg_plan: Vec<amdgpu_dsl::RegMark>,
+    region_stack: Vec<u16>,
     /// `scalarize`: DSL values / loop variables that are wave-uniform integers (computed in SGPRs).
     uniform: HashSet<ValueId>,
     uvars: HashSet<amdgpu_dsl::VarId>,
@@ -231,7 +234,7 @@ impl Lowerer {
             alias: HashMap::new(),
             elide_fallthrough: false,
             edge_pad: opt_on("edgepad"),
-            agpr_pin: Default::default(),
+            agpr_pin: Default::default(), reg_hints: Default::default(),
         };
         mir.blocks.push(Block::new(0));
 
@@ -317,6 +320,8 @@ impl Lowerer {
             alias_cache: HashMap::new(),
             else_started: HashSet::new(),
             agpr_marks: f.agpr.clone(),
+            reg_plan: f.reg_plan.clone(),
+            region_stack: Vec::new(),
             uniform: HashSet::new(),
             uvars: HashSet::new(),
             lazy: HashMap::new(),
@@ -350,6 +355,7 @@ impl Lowerer {
                 }
             }
         }
+        self.resolve_reg_plan();
         if opt_on("cmpfold") {
             fold_select_cmp(&mut self.mir);
             dce_cmp_pairs(&mut self.mir);
@@ -380,9 +386,89 @@ impl Lowerer {
                 crate::sched::waits::insert_waits(&mut self.mir);
             }
         }
-        coalesce(&mut self.mir);
+        let renames = coalesce(&mut self.mir);
+        if self.mir.reg_hints.active() {
+            // a planned value whose producer was coalesced into another register (e.g. a loop variable) is planned as that register
+            let rn = |r: VReg| -> VReg {
+                let mut r = r;
+                while let Some((_, d)) = renames.iter().find(|(s, _)| *s == r) {
+                    r = *d;
+                }
+                r
+            };
+            let h = &mut self.mir.reg_hints;
+            for (r, _) in h.pins_v.iter_mut() {
+                *r = rn(*r);
+            }
+            for g in h.share.iter_mut().chain(h.separate.iter_mut()).chain(h.rings.iter_mut().map(|x| &mut x.1)) {
+                for r in g.iter_mut() {
+                    *r = rn(*r);
+                }
+            }
+        }
         dce(&mut self.mir);
         Ok(self.mir)
+    }
+
+    /// The DSL register plan at vreg level (`MFunction::reg_hints`): every RegRef becomes the canonical vreg of the value / variable.
+    fn resolve_reg_plan(&mut self) {
+        use amdgpu_dsl::{RegMark, RegRef};
+        let plan = std::mem::take(&mut self.reg_plan);
+        if plan.is_empty() {
+            return;
+        }
+        let mut vals: Vec<(ValueId, VReg)> = self.val.iter().map(|(v, r)| (*v, *r)).collect();
+        vals.sort_unstable();
+        for (v, r) in vals {
+            let c = self.mir.canon(r);
+            self.mir.reg_hints.names.entry(c).or_insert_with(|| format!("%v{v}"));
+            self.mir.reg_hints.by_name.insert(format!("%v{v}"), c);
+        }
+        for (i, r) in self.vars.iter().enumerate() {
+            let c = self.mir.canon(*r);
+            self.mir.reg_hints.names.insert(c, format!("%r{i}"));
+            self.mir.reg_hints.by_name.insert(format!("%r{i}"), c);
+        }
+        let res = |s: &Self, r: &RegRef| -> Option<VReg> {
+            match r {
+                RegRef::Val(v) => s.val.get(v).map(|x| s.mir.canon(*x)),
+                RegRef::Var(v) => s.vars.get(v.0 as usize).map(|x| s.mir.canon(*x)),
+            }
+        };
+        let mut unresolved = Vec::new();
+        let mut group = |s: &Self, rs: &[RegRef], unresolved: &mut Vec<String>| -> Vec<VReg> {
+            rs.iter()
+                .filter_map(|r| {
+                    let x = res(s, r);
+                    if x.is_none() {
+                        unresolved.push(format!("{r:?}"));
+                    }
+                    x
+                })
+                .collect()
+        };
+        for mk in &plan {
+            match mk {
+                RegMark::PinV { r, base } => match res(self, r) {
+                    Some(x) => self.mir.reg_hints.pins_v.push((x, *base)),
+                    None => unresolved.push(format!("{r:?}")),
+                },
+                RegMark::Share(rs) => {
+                    let g = group(self, rs, &mut unresolved);
+                    self.mir.reg_hints.share.push(g);
+                }
+                RegMark::Separate(rs) => {
+                    let g = group(self, rs, &mut unresolved);
+                    self.mir.reg_hints.separate.push(g);
+                }
+                RegMark::Cap { region, vgprs, agprs } => self.mir.reg_hints.caps.push((region.clone(), *vgprs, *agprs)),
+                RegMark::Ring { name, bufs } => {
+                    let g = group(self, bufs, &mut unresolved);
+                    self.mir.reg_hints.rings.push((name.clone(), g));
+                }
+            }
+        }
+        self.mir.reg_hints.unresolved = unresolved;
     }
 
     /// Is the operand a provably all-zero fragment (`frag_zero`)? An MFMA value form with such a C uses the inline-0 src2 encoding.
@@ -402,7 +488,8 @@ impl Lowerer {
         r
     }
 
-    fn push(&mut self, inst: MInst) {
+    fn push(&mut self, mut inst: MInst) {
+        inst.region = self.region_stack.last().copied().unwrap_or(0);
         self.mir.blocks[self.cur].insts.push(inst);
     }
 
@@ -1857,7 +1944,17 @@ impl Lowerer {
                 Stmt::WaitLds { count } => {
                     self.push(MInst::new(MOp::SWaitLgkm).imm(*count as i64));
                 }
-                Stmt::Assume { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd | Stmt::StageBegin { .. } | Stmt::StageEnd => {} // contract markers for gpu_verify: no code
+                Stmt::Assume { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd => {} // contract markers for gpu_verify: no code
+                // stages and weave regions: no code; the instructions lowered inside are tagged with the region (register planning)
+                Stmt::StageBegin { name, .. } | Stmt::RegionMark { name, begin: true } => {
+                    let parent = self.region_stack.last().copied().unwrap_or(0);
+                    self.mir.reg_hints.regions.push((name.clone(), parent));
+                    let id = self.mir.reg_hints.regions.len() as u16;
+                    self.region_stack.push(id);
+                }
+                Stmt::StageEnd | Stmt::RegionMark { begin: false, .. } => {
+                    self.region_stack.pop();
+                }
                 Stmt::Barrier => {
                     self.push(MInst::new(MOp::SBarrier));
                 }
@@ -2910,7 +3007,8 @@ impl Lowerer {
 /// Copy coalescing: `mov a, b` where `b` is produced by the immediately
 /// preceding instruction and has no other use is folded into the producer.
 /// This keeps loop-carried state from doubling register pressure.
-fn coalesce(m: &mut MFunction) {
+fn coalesce(m: &mut MFunction) -> Vec<(VReg, VReg)> {
+    let mut renames: Vec<(VReg, VReg)> = Vec::new();
     let classes: Vec<RClass> = m.vregs.clone();
     let aliased = m.alias.clone();
     let apin = m.agpr_pin.clone();
@@ -2944,6 +3042,7 @@ fn coalesce(m: &mut MFunction) {
                         if let Some(pd) = b.insts[i - 1].dst.as_mut() {
                             *pd = d;
                         }
+                        renames.push((s, d));
                         b.insts.remove(i);
                         continue;
                     }
@@ -2952,6 +3051,7 @@ fn coalesce(m: &mut MFunction) {
             i += 1;
         }
     }
+    renames
 }
 
 /// Dead-code elimination of pure single-result ALU instructions whose result is never read

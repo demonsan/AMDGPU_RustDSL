@@ -66,7 +66,7 @@ pub fn block_to_mfunction(b: &AsmBlock, name: &str) -> Result<MFunction, String>
         alias: b.alias().iter().map(|(a, base, off)| (*a, (*base, *off))).collect(),
         elide_fallthrough: false,
         edge_pad: false,
-        agpr_pin: Default::default(),
+        agpr_pin: Default::default(), reg_hints: Default::default(),
     })
 }
 
