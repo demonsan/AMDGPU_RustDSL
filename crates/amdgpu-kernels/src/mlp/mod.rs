@@ -75,7 +75,7 @@ pub const W_IMG: i64 = 256 * W_PITCH;
 fn p_stage_val(jb: i64, v: ValueId, producer: bool) -> amdgpu_dsl::StageVal {
     let (p, c) = p_boundary(jb);
     let lf = if producer { &p.live[0] } else { &c.live[0] };
-    amdgpu_dsl::StageVal { name: lf.name.clone(), values: vec![v], table: lf.table.clone(), elem_bits: lf.elem_bits, storage: "vgpr".into() }
+    amdgpu_dsl::StageVal { name: lf.name.clone(), values: vec![v], table: lf.table.clone(), elem_bits: lf.elem_bits, storage: "vgpr".into(), layout: String::new() }
 }
 
 fn build_ws(name: &str, mode: Mode) -> Function {
@@ -170,88 +170,28 @@ fn build_ws(name: &str, mode: Mode) -> Function {
     let next = b.bind_i32(blk.clone() + ev(g_v));
     let row = b.bind_i32((blk.clone() << 7) + (lane.wave() << 5) + lane.j());
     let roles = vec!["all 4 waves: same program".to_string()];
-    if mode == Mode::Fused {
-        b.stage_begin("gemm1_act", amdgpu_dsl::StageContract { barrier_phase: 1, roles: roles.clone(), ..Default::default() });
-    }
+    let fused = mode == Mode::Fused;
     let p_words: Vec<Opnd> = if mode == Mode::G2 {
         xs.clone()
     } else {
-        let w1 = w1s.as_ref().expect("W1");
-        let zero = b.frag_zero(DType::Frag16);
-        let mut acc: Vec<ValueId> = vec![zero; (N1 / 32) as usize];
-        for kb in 0..K1 / 64 {
-            for (t, a) in acc.iter_mut().enumerate() {
-                let wf = wfrag(b, w1, t as i64, kb);
-                *a = b.mfma_scale_fp8(wf, xs[kb as usize], *a, c127, c127);
-            }
-        }
-        let alpha = b.c_f32(ALPHA);
-        let zf = b.c_f32(0.0);
-        let words: Vec<Vec<ValueId>> = acc.iter().map(|a| {
-            (0..4u8).map(|q| {
-                let v: Vec<ValueId> = (0..4u8).map(|i| { let u = b.frag16_lane(*a, 4 * q + i); let f = b.bitcast_f32(u); let s = b.mul_f32(f, alpha); b.max_f32(s, zf) }).collect();
-                b.cvt_pk_fp8x4_f32(v[0], v[1], v[2], v[3])
-            }).collect()
-        }).collect();
-        if mode == Mode::G1 {
-            let h4 = b.bind_i32(lane.half() << 2);
-            let vo = b.bind_i32((ev(row) << 8) + ev(h4));
-            for (t, ws) in words.iter().enumerate() {
-                for (q, w) in ws.iter().enumerate() {
-                    let f = b.bitcast_f32(*w);
-                    b.buffer_store_f32(r_out, vo, 0i32, (32 * t + 8 * q) as u32, f);
-                }
-            }
-            Vec::new()
-        } else {
-            (0..N1 / 64).map(|jb| { let w: Vec<ValueId> = words[2 * jb as usize].iter().chain(words[2 * jb as usize + 1].iter()).copied().collect(); Opnd::Val(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])) }).collect()
-        }
+        let st = gemm1_act_stage(GemmCtx { wfrag: &wfrag, c127 }, w1s.as_ref().expect("W1"), &xs, mode, r_out, row, &lane, &roles);
+        let out = st.out.clone();
+        st.inst.plain(!fused).emit(b);
+        out.get()
     };
     let p_vals: Vec<ValueId> = p_words.iter().filter_map(|o| if let Opnd::Val(v) = o { Some(*v) } else { None }).collect();
-    if mode == Mode::Fused {
-        // the hand-over is recorded on the stage that produced it: close gemm1_act with its live-out set
-        for (jb, v) in p_vals.iter().enumerate() {
-            b.stage_live_out(p_stage_val(jb as i64, *v, true));
-        }
-        b.stage_end();
-    }
     // the next block's row operand (clamped: past the end it reloads this block, unused)
     let nclamp = b.bind_i32(ev(next).lt(ev(nb)).select_i32(ev(next), blk.clone()));
     let xn = rowfrags(b, ev(nclamp));
-    if mode == Mode::Fused {
-        b.stage_begin("gemm2", amdgpu_dsl::StageContract {
+    if mode != Mode::G1 {
+        let contract = amdgpu_dsl::StageContract {
             live_in: p_vals.iter().enumerate().map(|(jb, v)| p_stage_val(jb as i64, *v, false)).collect(),
             barrier_phase: 1,
             roles: roles.clone(),
             ..Default::default()
-        });
-    }
-    if mode != Mode::G1 {
-        let w2 = w2s.as_ref().expect("W2");
-        let zero = b.frag_zero(DType::Frag16);
-        let mut acc2: Vec<ValueId> = vec![zero; (N2 / 32) as usize];
-        for (jb, pf) in p_words.iter().enumerate() {
-            for (u, a) in acc2.iter_mut().enumerate() {
-                let wf = wfrag(b, w2, u as i64, jb as i64);
-                *a = b.mfma_scale_fp8(wf, *pf, *a, c127, c127);
-            }
-        }
-        let h8 = b.bind_i32(lane.half() << 3);
-        let vo = b.bind_i32((ev(row) << 9) + ev(h8));
-        for (u, a) in acc2.iter().enumerate() {
-            for q in 0..4u8 {
-                let x: Vec<ValueId> = (0..4u8).map(|i| { let v = b.frag16_lane(*a, 4 * q + i); b.bitcast_f32(v) }).collect();
-                let w0 = b.cvt_pk_bf16_f32(x[0], x[1]);
-                let w1 = b.cvt_pk_bf16_f32(x[2], x[3]);
-                let f2 = b.frag2(w0, w1);
-                b.buffer_store_b64(r_out, vo, 0i32, (64 * u + 16 * q as usize) as u32, f2);
-            }
-        }
-    }
-    if mode == Mode::Fused {
-        b.stage_end();
-    }
-    b.set_var(vars[0], next);
+        };
+        gemm2_stage(GemmCtx { wfrag: &wfrag, c127 }, w2s.as_ref().expect("W2"), &p_words, r_out, row, &lane, contract).plain(!fused).emit(b);
+    }    b.set_var(vars[0], next);
     for (v, x) in vars[1..].iter().zip(xn.iter()) {
         b.set_var(*v, *x);
     }
@@ -259,4 +199,155 @@ fn build_ws(name: &str, mode: Mode) -> Function {
     b.break_if(done);
     b.end_loop();
     fb.finish()
+}
+
+/// What the GEMM stages share with the kernel (the W fragment reader and the unit E8M0 scale).
+struct GemmCtx<'r> {
+    wfrag: &'r dyn Fn(&mut FnBuilder, &amdgpu_tile::Shared, i64, i64) -> ValueId,
+    c127: ValueId,
+}
+
+struct Gemm1<'s> {
+    inst: amdgpu_tile::stage::StageInst<'s>,
+    /// the P words (fused: one Frag8 per 64-wide n1 block; G1: none, H went to HBM)
+    out: amdgpu_tile::weave::Out<Vec<Opnd>>,
+}
+
+/// Stage `gemm1_act` (keys `mma.rows_x_lds` + `map.relu_pack_fp8`): `H^T = W1 X^T`, `fp8(relu(alpha H))` packed in accumulator order (fused: the
+/// zero-cost B-operand words of GEMM 2; G1: stored to HBM).
+#[allow(clippy::too_many_arguments)]
+fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opnd], mode: Mode, r_out: ValueId, row: ValueId, lane: &'s Lane, roles: &[String]) -> Gemm1<'s> {
+    use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut u = Units::new();
+    let acc: Rc<RefCell<Vec<ValueId>>> = Rc::new(RefCell::new(Vec::new()));
+    let a0 = acc.clone();
+    let setup = u.add("gemm1.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| {
+        let zero = b.frag_zero(DType::Frag16);
+        *a0.borrow_mut() = vec![zero; (N1 / 32) as usize];
+    });
+    let c127 = g.c127;
+    let wfrag = g.wfrag;
+    let mut last = setup;
+    for kb in 0..K1 / 64 {
+        for t in 0..(N1 / 32) as usize {
+            let a1 = acc.clone();
+            last = u.add(format!("gemm1.k{kb}t{t}"), UnitClass::Mfma, Hint::Skeleton, &[last], move |b| {
+                let wf = wfrag(b, w1, t as i64, kb);
+                let mut a = a1.borrow_mut();
+                a[t] = b.mfma_scale_fp8(wf, xs[kb as usize], a[t], c127, c127);
+            });
+        }
+    }
+    let consts: Out<(ValueId, ValueId)> = Out::new();
+    let c1 = consts.clone();
+    last = u.add("act.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| c1.set((b.c_f32(ALPHA), b.c_f32(0.0))));
+    let words: Rc<RefCell<Vec<Vec<ValueId>>>> = Rc::new(RefCell::new(Vec::new()));
+    for t in 0..(N1 / 32) as usize {
+        let (a2, c2, w2) = (acc.clone(), consts.clone(), words.clone());
+        last = u.add(format!("act.t{t}"), UnitClass::Valu, Hint::Filler, &[last], move |b| {
+            let (alpha, zf) = c2.get();
+            let a = a2.borrow()[t];
+            let ws: Vec<ValueId> = (0..4u8).map(|q| {
+                let v: Vec<ValueId> = (0..4u8).map(|i| { let u = b.frag16_lane(a, 4 * q + i); let f = b.bitcast_f32(u); let s = b.mul_f32(f, alpha); b.max_f32(s, zf) }).collect();
+                b.cvt_pk_fp8x4_f32(v[0], v[1], v[2], v[3])
+            }).collect();
+            w2.borrow_mut().push(ws);
+        });
+    }
+    let out: Out<Vec<Opnd>> = Out::new();
+    if mode == Mode::G1 {
+        let vo: Out<ValueId> = Out::new();
+        let v1 = vo.clone();
+        last = u.add("store.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| {
+            let h4 = b.bind_i32(lane.half() << 2);
+            v1.set(b.bind_i32((ev(row) << 8) + ev(h4)));
+        });
+        for t in 0..(N1 / 32) as usize {
+            let (w3, v2) = (words.clone(), vo.clone());
+            last = u.add(format!("store.t{t}"), UnitClass::Dma, Hint::Filler, &[last], move |b| {
+                let ws = w3.borrow()[t].clone();
+                let vo = v2.get();
+                for (q, w) in ws.iter().enumerate() {
+                    let f = b.bitcast_f32(*w);
+                    b.buffer_store_f32(r_out, vo, 0i32, (32 * t + 8 * q) as u32, f);
+                }
+            });
+        }
+        let o2 = out.clone();
+        u.add("gemm1.out", UnitClass::Setup, Hint::Anchor, &[last], move |_b| o2.set(Vec::new()));
+    } else {
+        let (w4, o3) = (words.clone(), out.clone());
+        u.add("pack.p", UnitClass::Valu, Hint::Filler, &[last], move |b| {
+            let words = w4.borrow();
+            let p: Vec<Opnd> = (0..N1 / 64).map(|jb| { let w: Vec<ValueId> = words[2 * jb as usize].iter().chain(words[2 * jb as usize + 1].iter()).copied().collect(); Opnd::Val(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])) }).collect();
+            o3.set(p);
+        });
+    }
+    let contract = amdgpu_dsl::StageContract { barrier_phase: 1, roles: roles.to_vec(), ..Default::default() };
+    let o4 = out.clone();
+    let inst = amdgpu_tile::stage::StageInst::new("mma.rows_x_lds", amdgpu_tile::stage::Prim::A, "gemm1_act", contract, u)
+        .param("atom", "mfma_scale_32x32x64_f8")
+        .param("n", N1)
+        .param("k", K1)
+        .param("epilogue", if mode == Mode::G1 { "map.relu_pack_fp8 -> store" } else { "map.relu_pack_fp8" })
+        .handover(move |_b| {
+            // the hand-over is recorded on the stage that produced it: the P words of GEMM 2's B operand
+            let p = o4.get();
+            let vals = p.iter().enumerate().filter_map(|(jb, o)| if let Opnd::Val(v) = o { Some(p_stage_val(jb as i64, *v, true)) } else { None }).collect();
+            (vals, Vec::new())
+        });
+    Gemm1 { inst, out }
+}
+
+/// Stage `gemm2` (keys `mma.rows_x_lds` + `map.store_bf16`): `Y^T = W2 H^T` from the P words, bf16 stores.
+#[allow(clippy::too_many_arguments)]
+fn gemm2_stage<'s>(g: GemmCtx<'s>, w2: &'s amdgpu_tile::Shared, p_words: &'s [Opnd], r_out: ValueId, row: ValueId, lane: &'s Lane, contract: amdgpu_dsl::StageContract) -> amdgpu_tile::stage::StageInst<'s> {
+    use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut u = Units::new();
+    let acc: Rc<RefCell<Vec<ValueId>>> = Rc::new(RefCell::new(Vec::new()));
+    let a0 = acc.clone();
+    let mut last = u.add("gemm2.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| {
+        let zero = b.frag_zero(DType::Frag16);
+        *a0.borrow_mut() = vec![zero; (N2 / 32) as usize];
+    });
+    let (c127, wfrag) = (g.c127, g.wfrag);
+    for (jb, pf) in p_words.iter().enumerate() {
+        for uu in 0..(N2 / 32) as usize {
+            let a1 = acc.clone();
+            last = u.add(format!("gemm2.j{jb}u{uu}"), UnitClass::Mfma, Hint::Skeleton, &[last], move |b| {
+                let wf = wfrag(b, w2, uu as i64, jb as i64);
+                let mut a = a1.borrow_mut();
+                a[uu] = b.mfma_scale_fp8(wf, *pf, a[uu], c127, c127);
+            });
+        }
+    }
+    let vo: Out<ValueId> = Out::new();
+    let v1 = vo.clone();
+    last = u.add("store.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| {
+        let h8 = b.bind_i32(lane.half() << 3);
+        v1.set(b.bind_i32((ev(row) << 9) + ev(h8)));
+    });
+    for uu in 0..(N2 / 32) as usize {
+        let (a2, v2) = (acc.clone(), vo.clone());
+        last = u.add(format!("store.u{uu}"), UnitClass::Valu, Hint::Filler, &[last], move |b| {
+            let a = a2.borrow()[uu];
+            let vo = v2.get();
+            for q in 0..4u8 {
+                let x: Vec<ValueId> = (0..4u8).map(|i| { let v = b.frag16_lane(a, 4 * q + i); b.bitcast_f32(v) }).collect();
+                let w0 = b.cvt_pk_bf16_f32(x[0], x[1]);
+                let w1 = b.cvt_pk_bf16_f32(x[2], x[3]);
+                let f2 = b.frag2(w0, w1);
+                b.buffer_store_b64(r_out, vo, 0i32, (64 * uu + 16 * q as usize) as u32, f2);
+            }
+        });
+    }
+    amdgpu_tile::stage::StageInst::new("mma.rows_x_lds", amdgpu_tile::stage::Prim::A, "gemm2", contract, u)
+        .param("atom", "mfma_scale_32x32x64_f8")
+        .param("n", N2)
+        .param("k", N1)
+        .param("epilogue", "map.store_bf16")
 }

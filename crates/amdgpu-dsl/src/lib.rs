@@ -595,13 +595,46 @@ pub struct Contract {
 
 /// One value set crossing a stage boundary (`StageContract`): the IR values (fragment registers), the element table they hold (`[t + threads v]`
 /// -> tensor element, after any K permutation: a layout fingerprint computed by the tile layer) and storage facts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct StageVal {
     pub name: String,
     pub values: Vec<ValueId>,
     pub table: Vec<i64>,
     pub elem_bits: u32,
+    /// `vgpr` | `agpr` | `lds:<tile>` | `global` (VGPR <-> AGPR hand-overs are register moves inside the consumer and allowed)
     pub storage: String,
+    /// the thread-value layout of the fragment over its tensor tile (`amdgpu_layout::Layout` text, e.g. `((32,2),(4,4,2)):((64,4),(1,8,32))`);
+    /// empty = not recorded. Must match between producer and consumer when both record it.
+    pub layout: String,
+}
+
+/// A scalar / per-row state crossing a stage boundary (row statistics, scales, counters): its values and which lanes own it
+/// (`lane` = one per lane, `row` = per accumulator row (the lanes holding that row), `wave` = wave-uniform, `block` = workgroup-uniform).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct StageScalar {
+    pub name: String,
+    pub values: Vec<ValueId>,
+    pub owner: String,
+}
+
+/// Memory operations allowed in flight across the stage edges (program order, linear view): at the entry the stage tolerates up to `*_in`
+/// outstanding operations of the earlier code, at the exit it leaves at most `*_out` of its own. `None` = not constrained.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct StageOutstanding {
+    pub vm_in: Option<u32>,
+    pub lgkm_in: Option<u32>,
+    pub vm_out: Option<u32>,
+    pub lgkm_out: Option<u32>,
+}
+
+/// The stage's resource needs (estimates for planning; `barriers` is checked exactly, the register numbers against `amdc regplan`).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct StageResources {
+    pub vgprs: Option<u32>,
+    pub agprs: Option<u32>,
+    pub lds_bytes: Option<u32>,
+    /// barriers inside the stage (linear view, every instance)
+    pub barriers: Option<u32>,
 }
 
 /// The resource contract of a pipeline STAGE (fusion hand-off, docs/fusion-layout-handoff.md §3): what it consumes from earlier stages and
@@ -615,6 +648,11 @@ pub struct StageContract {
     pub lds_reused: Vec<String>,
     pub barrier_phase: u32,
     pub roles: Vec<String>,
+    /// scalar state consumed / handed over (checked like `live_in` / `live_out`, plus the owner)
+    pub scalars_in: Vec<StageScalar>,
+    pub scalars_out: Vec<StageScalar>,
+    pub outstanding: StageOutstanding,
+    pub resources: StageResources,
 }
 
 /// Statements: a flat sequence with explicit structured markers.
@@ -875,6 +913,8 @@ struct TreeBuilder {
     open: Vec<Frame>,
     /// statements of the flat view emitted so far (markers included)
     count: usize,
+    /// `Stmt::Barrier`s emitted so far (program order: a stage's `barrier_phase`)
+    barriers: u32,
 }
 
 impl TreeBuilder {
@@ -887,6 +927,9 @@ impl TreeBuilder {
     /// Appends one flat statement: a marker opens / switches / closes a region, anything else is a leaf.
     fn push(&mut self, st: Stmt) -> Result<(), String> {
         self.count += 1;
+        if matches!(st, Stmt::Barrier) {
+            self.barriers += 1;
+        }
         match st {
             Stmt::BeginLoop { vars, init } => self.open.push(Frame::Loop { vars, init, body: Vec::new() }),
             Stmt::BeginIf { cond } => self.open.push(Frame::If { cond, then: Vec::new(), els: None }),
@@ -1378,6 +1421,17 @@ impl FnBuilder {
         match self.tree.open.iter_mut().rev().find(|f| matches!(f, Frame::Stage { .. })) {
             Some(Frame::Stage { contract, .. }) => contract.live_out.push(v),
             _ => panic!("{}: stage_live_out outside a stage", self.f.name),
+        }
+    }
+    /// Barriers emitted so far in program order (the `barrier_phase` of a stage opened now).
+    pub fn barriers_so_far(&self) -> u32 {
+        self.tree.barriers
+    }
+    /// Adds a scalar hand-over to the innermost open stage's contract (see `StageContract::scalars_out`).
+    pub fn stage_scalar_out(&mut self, s: StageScalar) {
+        match self.tree.open.iter_mut().rev().find(|f| matches!(f, Frame::Stage { .. })) {
+            Some(Frame::Stage { contract, .. }) => contract.scalars_out.push(s),
+            _ => panic!("{}: stage_scalar_out outside a stage", self.f.name),
         }
     }
     /// Closure form of `stage_begin` / `stage_end`.
