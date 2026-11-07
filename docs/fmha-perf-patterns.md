@@ -406,4 +406,4 @@ combine 名字含 `combine8` 供 ref_host 推断每线程元素数）。注意 `
 
 **测量注意**：per-CU `_vs128` 对代码布局敏感 ±1.5%（同一 kernel 前置 0..14 条 `s_nop`：444–456 TF/s，出厂与移植版相同）；单一布局的比较不可信，门禁用 8 种布局的中位数。
 
-**移植中发现并修复（库/验证器）**：`ka_is` 代入依赖声明顺序（改为不动点）；读取器每次重算 slot 偏移乘法（改为每 slot 缓存）；循环变量顺序（`ring_var_last`，-2.4% → 0）；OneWindow 尾部的 GV-TILE-PENDING 误报。
+**移植中发现并修复（库/验证器）**：`ka_is` 代入依赖声明顺序（改为不动点）；读取器每次重算 slot 偏移乘法（改为每 slot 缓存）；循环变量顺序（[it, 状态…, idx]，现固定在 `Pipeline::run` 中，-2.4% → 0）；OneWindow 尾部的 GV-TILE-PENDING 误报。

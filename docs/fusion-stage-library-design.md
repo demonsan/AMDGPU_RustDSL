@@ -304,10 +304,21 @@ Weaver::new(units)            // 一个或多个 stage 的单元（Units::append
 
 ---
 
-## 8. 实现状态（P0–P2，分支 `stages`）
+## 8. 实现状态（已在 Main）
 
 | 阶段 | 内容 | 验证 |
 |---|---|---|
-| P0 | `StageContract` 扩展：`StageVal.layout`（TV 布局文本）+ `storage` 检查；`scalars_in/out`（含 owner）；`outstanding`（vm/lgkm 入口/出口容忍）；`resources`（barriers 精确检查，寄存器/LDS 为估计）；`ANY_PHASE`（版本化/角色分支与流水循环内的 stage）；池化常量不算跨 stage 读 | `tests/stage_ir.rs`；全部出厂 kernel md5 不变 |
-| P1 | `amdgpu-tile/src/stage.rs`：`Prim`、`StageInst`（units + contract + handover + prebind）、`merge` / `compose`、registry；MLP（gemm1_act / gemm2）、GEMM v4（`move.ab_stage` / `mma.blockscale_tile`）、FMHA（`move.kv_stage` / `v_phase` = `online.softmax`，交出 P 与参考字 / `m_phase` = `mma.pv` + `mma.qk` 合并 / `window`）均在 `Node::Stage` 区域内，按 slot 的 LDS 偏移在区域外预绑定 | 汇编逐字节相同（含 `gemm_mxfp8_bs_v4`）；证书 24/100/0；strict 0 错误（vs128 / kvsplit stage-handoff 6） |
-| P2 | `amdgpu-tile/src/prims.rs`：E（act / affine / bf16 解包）、R（lane + wave 归约）、Q（fp8 scale / pack）；新 kernel `rmsnorm_quant_fp8_n<N>`（4 个 stage）；GEMM epilogue 链 `mlp_fp8_ws_g1q_{relu,silu}` | 对 CPU 参考 bad=0；RMSNorm+quant N4096 M16384 5.14 TB/s（同机 hipMemcpy D2D 5.03 TB/s）；epilogue 链相对无链 g1 为 0.80×（relu）/ 0.66×（silu），尚未与 MMA 交错 |
+| P0 | `StageContract` 扩展：<br>• `StageVal.layout`（TV 布局文本）+ `storage` 检查；<br>• `scalars_in/out`（含 owner）；<br>• `outstanding`（vm/lgkm 入口/出口容忍）；<br>• `resources`（barriers 精确检查，寄存器/LDS 为估计）；<br>• `ANY_PHASE`（版本化/角色分支与流水循环内的 stage）。<br>GV-STAGE：池化常量不算跨 stage 读；在任何 stage 之外绑定的值无需生产者。IR 文本 codec 覆盖新字段 | `crates/amdgpu-compiler/tests/stage_ir.rs`、`crates/amdgpu-kernels/tests/ir_text.rs` |
+| P1 | `amdgpu-tile/src/stage.rs`：`Prim`、`StageInst`（units + contract + handover + prebind）、`merge` / `compose`、registry（17 个 key，`tests/stage_registry.rs`）。<br>出厂 kernel 均由 stage 实例构成，并位于 `Node::Stage` 区域内：<br>• MLP：`gemm1_act` / `gemm2`；<br>• GEMM v4：`gemm.ab_stage` / `gemm.tile`；<br>• FMHA：`kv.stage` / `v_phase` / `m_phase`（`mma.pv` + `mma.qk` 合并）/ `window`。<br>交接方式：<br>• FMHA 的共享 slot 偏移以 `SlotIdx::offset_scalars` 声明为标量交接，不预绑定（预绑定会改变 IR 顺序与汇编）；<br>• GEMM 用 `prebind`。 | 汇编逐字节相同；证书 24/100/0；strict 0 错误（`_vs128` / `_kvsplit` stage-handoff 12，`_t128` 4） |
+| P2 | `amdgpu-tile/src/prims.rs`：E（act / affine / bf16 解包）、R（lane + wave 归约）、Q（`fp8_scale` / `fp8_pack`）。<br>新 kernel：<br>• `rmsnorm_quant_fp8_n<N>`（4 个 stage）；<br>• GEMM epilogue 链 `mlp_fp8_ws_g1q_{relu,silu}`。 | 对 CPU 参考 bad=0；数字见 [`current-status.md`](current-status.md) §4.8 |
+| P3 | 算子图、切分、骨架生成（sched，`amdgpu-tile/src/opgraph/`，[`opgraph.md`](opgraph.md)）：出厂 FMHA / GEMM / MLP / RMSNorm 都从图生成骨架，slot 里只放编排 | 骨架 + 原编排 → 汇编逐字节相同 |
+
+**清理**（2026-11-07）：删除了重构后不再使用的代码。
+
+| 位置 | 删除的内容 |
+|---|---|
+| `Pipeline` 开关 | `TwoSlot`、`ring_var_last`、`mid_lds_drain`、`late_stage_b` / `PipeBody::defer_stage`、`top_vm`、`prologue_vm`、`pre_staged`、`ablate_no_sync`、`tile1_after_barrier`、`key_late`；`RegStaged` 现在固定为"两 tile 一轮、tile 1 晚发" |
+| softmax | `decide_scaled` 与其种子路径 |
+| 其他未用的 pub 项 | `quant_fp8_row`、`with_hint` 等 |
+
+被删的实验记录保留在 git tag `archive/*` 中。

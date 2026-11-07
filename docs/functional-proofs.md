@@ -14,7 +14,7 @@ The proof composes the layouts the MXFP8 GEMM actually builds:
 | B preshuffle | `b_glob = ([16,cta_n/16],[16,8]) : ([16,16K],[1,256])`; checked against the kernel formula `(n/16)·16K + (k/16)·256 + (n%16)·16 + k%16`, including the per-K-block advance `2048` |
 | MFMA atom | `v_mfma_scale_f32_16x16x128_f8`, kernel orientation `swap_ab`; `MmaAtom` A/B/C TV layouts checked injectively by `proofs::check_tv` |
 | accumulator | the transposed C TV layout `e = n' + 16 m'`; 8x8 atom blocks per wave cover each 256x256 CTA exactly once |
-| K schedule | v3 `Cadence::TwoSlot`, v4 `Cadence::RegStaged`; the compute sequence contains every K tile exactly once, and 2-slot reuse is `generation(t+2)` after `generation(t)` |
+| K schedule | v4 `Cadence::RegStaged` (the v3 `TwoSlot` cadence was removed with the v3 GEMM); the compute sequence contains every K tile exactly once, and 2-slot reuse is `generation(t+2)` after `generation(t)` |
 | scales | A row `(m,kb)` and B 128-column `(n/128,kb)` ownership; the v4 DPP/permute panel transposition is checked by `verify_sfa_transpose()` (the same proof the v4 builder runs at build time) |
 | epilogue | every `(m,n)` maps to one C address `2·(m·N+n)`; duplicate stores are rejected |
 

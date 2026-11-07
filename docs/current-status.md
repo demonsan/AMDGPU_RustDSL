@@ -111,7 +111,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 | 内存 | FLAT `global_load/store`、`global_load_lds`（含 SADDR）；MUBUF 描述符、`buffer_load/store x1/x2/x4`、`buffer_load … lds`；LDS `ds_read/write_b32/b64/b128`、`ds_read_b64_tr_b8` |
 | 控制流 | `begin_loop`/`end_loop`、`begin_if`（wave 级）及闭包形式 `loop_`/`if_`/`if_else`/`produce_region`/`stage`、`Stmt::VarAsm(N)` 桥接 safe-asm |
 | 布局层 | `amdgpu-layout`（`Ix`、`IntTuple`、`Layout` 代数、GF(2) `Swizzle`、TV 布局、证明）；入门 [`layout-tour.md`](layout-tour.md) |
-| tile 层 | `amdgpu-tile`：`TiledCopy`/`TiledMma`/`partition_*`、LdsPlan/标记、Pipeline、softmax、行 DMA（`rows`）、合同（[`dsl-tile-abstractions.md`](dsl-tile-abstractions.md)） |
+| tile 层 | `amdgpu-tile`：`TiledCopy`/`TiledMma`/`partition_*`、LdsPlan/标记、Pipeline、softmax、行 DMA（`rows`）、合同（[`dsl-tile-abstractions.md`](dsl-tile-abstractions.md)）；stage 库（`stage.rs`：`StageInst` + registry + `merge`；`prims.rs`：通用 E/R/Q）、发射单元与 weaver（`weave.rs`）、算子图与骨架生成（`opgraph/`）——[`fusion-stage-library-design.md`](fusion-stage-library-design.md)、[`opgraph.md`](opgraph.md) |
 | ABI | 与厂商**逐字节兼容的 656 字节 kernarg + 网格/数据布局**；主机侧头由 `amdc gen-host` 生成 |
 
 **crate 地图**（全部 `#![forbid(unsafe_code)]`、零第三方依赖）：
@@ -123,8 +123,8 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 | `amdgpu-isa` | gfx950 copy / MMA atom | layout |
 | `amdgpu-safeasm` | safe-asm 窗口（[`safe-asm-design.md`](safe-asm-design.md)） | – |
 | `amdgpu-dsl` | IR（区域树）、`FnBuilder`、表达式层、DSL IR 打印与结构相等（`print.rs`） | sym、safeasm、layout |
-| `amdgpu-tile` | 全部 tile 抽象（TiledCopy/TiledMma/partition、LdsPlan、Pipeline、softmax、frag、行 DMA、合同、handoff） | dsl、layout、isa |
-| `amdgpu-kernels` | 全部 kernel：`fmha/`（v3 + FMHA I/O）、`gemm/`、`mlp/`、`probes/`、`verifier_cases/`、`ir_proof.rs`、注册表 `registry.rs` | dsl、tile、layout、isa、safeasm |
+| `amdgpu-tile` | 全部 tile 抽象（TiledCopy/TiledMma/partition、LdsPlan、Pipeline、softmax、frag、行 DMA、合同、handoff）、stage 库与通用原语、weaver、算子图 / 骨架生成 | dsl、layout、isa |
+| `amdgpu-kernels` | 全部 kernel：`fmha/`（v3 + FMHA I/O）、`gemm/`、`mlp/`、`norm/`，每个都是"算子图（`graph.rs` + `*.graph.json`）→ 生成的骨架（`skeleton_*.rs`）→ slot 实现 + stage 实例"；`probes/`、`verifier_cases/`、`ir_proof.rs`、注册表 `registry.rs` | dsl、tile、layout、isa、safeasm |
 | `amdgpu-compiler` | lowering、调度、RA、hazard/wait、emit、LLVM MIR 桥、`gpu_verify`/`gpu_protocol`/函数证明、MIR 打印（不依赖 kernels/tile） | sym、dsl、safeasm |
 | `amdc` | CLI（emit / check / list / print-ir / backend / simmodel / gpu-verify / gen-host）+ 库 `amdc::hostgen` | dsl、compiler、kernels、tile |
 
@@ -147,9 +147,11 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 
 | Kernel | 状态 |
 |---|---|
-| `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}` | **出厂**（`crates/amdgpu-kernels/src/fmha/mod.rs`，I/O 与 combine 在 `fmha/io.rs`） |
-| `gemm_mxfp8_bs_v4` | MXFP8 blockscale GEMM（`crates/amdgpu-kernels/src/gemm/`）：厂商结构（寄存器暂存、AGPR 原地重载、slotfill） |
-| `mlp_fp8_ws_{fused,g1,g2}` | 融合 MLP 与两段对照（`crates/amdgpu-kernels/src/mlp/`） |
+| `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}` | **出厂**（`crates/amdgpu-kernels/src/fmha/`：算子图 + 骨架 + stage 实例 `kv.stage` / `v_phase` / `m_phase` / `window`；导读 [`fmha-dsl-tour.md`](fmha-dsl-tour.md)） |
+| `gemm_mxfp8_bs_v4` | MXFP8 blockscale GEMM（`crates/amdgpu-kernels/src/gemm/`）：厂商结构（寄存器暂存、AGPR 原地重载、slotfill）；stage 实例 `gemm.ab_stage` / `gemm.tile` |
+| `mlp_fp8_ws_{fused,g1,g2}` | 融合 MLP 与两段对照（`crates/amdgpu-kernels/src/mlp/`；stage 实例 `gemm1_act` / `gemm2`） |
+| `mlp_fp8_ws_g1q_{relu,silu}` | GEMM + 通用 epilogue 链（alpha、bias、激活、行 amax、逐行 fp8 + scale）；见 §4.8 |
+| `rmsnorm_quant_fp8_n<N>`（N = 512…8192） | RMSNorm + 逐 token fp8 量化，4 个 stage（load → rms → quant → store）；见 §4.8 |
 | `probe_*` | 硬件/ISA 探针（`crates/amdgpu-kernels/src/probes/`），各自配 `tools/*_probe.sh` |
 | `gv_attack_*`、`gv_audit_*`、`probe_lds_oob` | 验证器必须拒绝 / 必须列入信任清单的用例（`crates/amdgpu-kernels/src/verifier_cases/`） |
 
@@ -187,7 +189,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 | B2H8S2048 `_t128` | **1067.4** | 1.05× |
 
 BUILD / VERIFY（0 错误）/ ACC16 / ACC64（厂商对齐，四条路径）/ DET / STRESS 全部 PASS：**OVERALL PASS**。
-v3 asm md5：`763142f9` / `91b26e5d` / `e1fe92a4` / `24a95a51`。`_t128` 默认打开 `edgepad` 与 `salubr`（同轮 A/B 布局中位数 +3.3%）及 SADDR 形式的
+（v7.0 门禁时的 asm md5 为 `763142f9` / `91b26e5d` / `e1fe92a4` / `24a95a51`；当前出厂 `_vs128` / `_t128` / `_kvsplit` / `combine8h` 为 `8938adfa` / `d7e02b0f` / `41f151fc` / `24a95a51`，stage / weaver / 骨架重写前后逐字节相同。）`_t128` 默认打开 `edgepad` 与 `salubr`（同轮 A/B 布局中位数 +3.3%）及 SADDR 形式的
 LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（A/B 记录见 [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9.4）。
 
 ### 4.7 MXFP8 blockscale GEMM
@@ -198,6 +200,15 @@ LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（
 | 性能 vs 厂商（同轮） | **0.988–0.994×**（交替 7 进程中位数）；分析见 [`mxfp8-gemm-4wave-analysis.md`](mxfp8-gemm-4wave-analysis.md)、[`gemm-issue-comparison.md`](gemm-issue-comparison.md) |
 | 门禁 | `tools/gemm_gate.sh`：BUILD / VERIFY（strict 0 错误，3 trusted assumes / 19 contracts / 0 unproven）/ ACC（4096²×8192、8192×7168×7168、1280×6144×7168 GEMM_OK）/ DET 3/3 / PERF —— **PASS** |
 | 编译器配套 | AGPR 寄存器类与 acc_cd MFMA（[`agpr.md`](agpr.md)）、SALU 地址链 `scalarize2`、kernarg 批量加载、M0 复用、`slotfill`、DPP |
+
+### 4.8 stage 库新 kernel（P2，GPU 5，同机 hipMemcpy D2D = 5.03 TB/s 作带宽基线；节点上没有 aiter / torch）
+
+| kernel | 正确性（对 CPU fp32 参考） | 性能 |
+|---|---|---|
+| `rmsnorm_quant_fp8_n4096`，M = 16384 | bad = 0（反量化误差 ≤ 半个 e4m3 ulp；scale 相对误差 ≤ 3.5e-7），N 1024 / 4096 / 8192 × M 7 / 4096 / 16384 | 5.14 TB/s（1.02× D2D 拷贝）；N8192 4.69 TB/s，N1024 4.23 TB/s |
+| `mlp_fp8_ws_g1q_relu` / `_silu`，M = 65536 | bad = 0 | 412 / 339 TF/s，为无 epilogue 链的 `mlp_fp8_ws_g1`（514 TF/s）的 0.80× / 0.66×：链在 MMA 之后串行发射，尚未交织 |
+
+主机测试：`tests/gpu/rmsnorm_quant_host.cpp`、`tests/gpu/gemm_epi_host.cpp`；严格验证 0 错误。
 
 ---
 

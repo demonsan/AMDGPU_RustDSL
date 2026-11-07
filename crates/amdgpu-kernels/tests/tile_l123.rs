@@ -422,7 +422,7 @@ fn t128_style_staging_verifies() {
     let pipe = Pipeline::new(Cadence::OneWindow, nkv, kv_len, 128, Ext::ka(0x10).ceil_div(128));
     let mut body = Demo3v { base: Demo3 { ks, vs, kd: kds, kcp, vcp, kdcp, lane, next_reads: true }, kdv, pending: None };
     pipe.run(&mut b, Role::All, &mut body);
-    let mut f = b.finish();
+    let f = b.finish();
     let e = errs(&f);
     assert!(e.is_empty(), "{}", e.join("\n"));
     let c = amdgpu_compiler::compile(&f).expect("compile");

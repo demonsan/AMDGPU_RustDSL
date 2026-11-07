@@ -317,7 +317,7 @@ hipModuleLaunchKernel(fn, N/256, M/256, 1, 256, 1, 1, 0, stream, nullptr, cfg);
 
 代码：`crates/amdgpu-kernels/src/gemm/mod.rs`（只用 route-B 层：amdgpu-layout 推导全部地址、amdgpu-isa atom、amdgpu-tile `TiledMma`(16x16x128, swap_ab) /
 `TiledCopy`(`partition_lds`)、`tile::Pipeline`）；配置 `GemmConfig::{v2,v3,v4}`，最佳 = **v4**（vendor 结构：操作数作为 AGPR 循环变量、在最后一次使用后原地重载
-下一块，`Cadence::RegStaged` + `Pipeline::unroll2`）。门禁 `tools/gemm_gate.sh <kernel>`（cargo test、`gpu-verify --strict`、3 个形状 GEMM_OK、3 次启动确定性、
+下一块，`Cadence::RegStaged`，两 tile 一轮的静态环槽现已是它的唯一形式）。门禁 `tools/gemm_gate.sh <kernel>`（cargo test、`gpu-verify --strict`、3 个形状 GEMM_OK、3 次启动确定性、
 与 vendor 交错 7 进程 × 3 次的中位数）。
 
 **最终门禁（GPU 5，分支 gemm-final = Main 30a035f + gemm-p4）**：
@@ -401,7 +401,7 @@ scalarize/imm/sgpr 降级选项（中性）。
 4. 因此剩余 ~5.7% 属于全卡数据供给效率（请求形态/时序对 L2 与 fabric 的影响），用单 CU 的指令顺序、预取距离、寄存器形式都无法再改善；要继续需要
    全卡级的实验（per-XCD L2 命中/带宽计数、请求形态复刻：wave 角色分工 A/B、或 8 wave），超出本轮预算。
 
-保留的选项（默认关）：`GemmConfig::split_sync` + `Pipeline::top_vm`（经 strict verify，可作为后续全卡实验的起点）。
+（历史）曾保留的默认关闭选项 `GemmConfig::split_sync` + `Pipeline::top_vm` 已在清理中删除（未被任何出厂 kernel 使用；需要时从 tag `archive/*` 取回）。
 
 ### 12.1 全卡计数器（同进程、同输入，rocprofv3 `_sum`，vendor vs v4，中位数/每次 dispatch）
 
