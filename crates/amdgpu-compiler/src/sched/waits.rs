@@ -20,8 +20,6 @@ use super::effects::*;
 use super::liveness::successors;
 use crate::mir::*;
 
-/// Debug: only emit full drains (mcnt(0) / lgkmcnt(0)), never partial waits.
-pub static DRAIN_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const VM_MAX: u32 = 63;
 const LG_MAX: u32 = 15;
@@ -127,7 +125,7 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
         }
     }
     if let Some(n) = st.vm.need(&touched) {
-        let n = if DRAIN_ONLY.load(std::sync::atomic::Ordering::Relaxed) { 0 } else { n };
+        
         if let Some(o) = out {
             o.push(MInst::new(MOp::SWaitVm).imm(n as i64).auto());
         }
@@ -136,7 +134,7 @@ fn step(st: &mut State, e: &Effects, inst: &MInst, id: u64, out: &mut Option<&mu
     }
     if let Some(n) = st.lg.need(&touched) {
         let any_smem = st.lg.e.values().any(|v| v.smem);
-        let n = if any_smem || DRAIN_ONLY.load(std::sync::atomic::Ordering::Relaxed) { 0 } else { n };
+        let n = if any_smem { 0 } else { n };
         if let Some(o) = out {
             o.push(MInst::new(MOp::SWaitLgkm).imm(n as i64).auto());
         }

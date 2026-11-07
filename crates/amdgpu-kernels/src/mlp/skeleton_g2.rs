@@ -30,7 +30,7 @@ pub trait G2Slots {
     fn w2_image(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx);
     /// slot `load_h`: tensor h : fp8 [-1, 256] H rows in HBM arrives through HBM (cut edge from gemm1_act, class C4); issue its loads before `h_first`.
     ///   suggested stage: `move.row_frags`
-    fn load_h(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx) {
+    fn load_h(&mut self, _b: &mut FnBuilder, _cx: &mut Self::Cx) {
         todo!("slot load_h: fill with a `move.row_frags` stage (or override)")
     }
     /// slot `h_first`: stage `move.row_frags` [M] (k=256). Construct the stage instance and emit it with the kernel's orchestration (`emit` / `emit_with`, `declare_region`).

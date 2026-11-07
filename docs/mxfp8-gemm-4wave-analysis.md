@@ -347,7 +347,7 @@ trust ledger：pipeline 的 tile 计数器（`assume_trusted`）+ XCD raster 置
 | scale panel（vendor sp64：所有 scale 一次进 LDS）+ 预转置（2 dword/块 + MFMA op_sel 选字节）+ XCD raster | 2786 | |
 | SALU 地址链（backend-llvm-tail：scalarize2/waveuni）+ DMA 间隔 3 | 2894 | |
 | LDS 转置 16 字节 epilogue（ds_write → ds_read_b128 → buffer_store_dwordx4） | 2963 | VGPR 200→168 |
-| v4：原地重载 + t+1 scale 读提前（sched ATT 发现）+ `rewait,hoistchain` | 3007 | |
+| v4：原地重载 + t+1 scale 读提前（sched ATT 发现）+ `rewait,hoistchain`（该 token 已删除，等价于 `rewait,hoist`） | 3007 | |
 | `Pipeline::unroll2`（静态环槽） | 3030 | |
 | prologue：panel 转置放进 pipeline prologue、在 tile DMA 后面跑（17 → 2 个 barrier） | 3067 | 多 wave ATT 发现 prologue 多 9.4k 周期 |
 | 门禁（交错中位数，gemm-final） | **3064（0.947）** | |

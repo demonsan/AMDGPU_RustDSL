@@ -1,6 +1,6 @@
 # 按编织区域（weave region）选择调度策略
 
-状态：已实现并通过测试（分支 `weaver-sched2`，基于 weaver2 = Main + weaver + weaver-regs）。**没有声明区域时一切不变**（50 个 kernel 的 asm md5 逐个相同）。
+状态：已实现并在 Main 上（`crates/amdgpu-compiler/src/sched/region.rs`）。**没有声明区域时一切不变**（所有 kernel 的 asm md5 逐个相同）。
 
 ## 区域从哪来
 
@@ -13,7 +13,7 @@ lowering 给区域内生成的每条 MIR 指令打上区域号 `MInst::region`�
 b.declare_region("m_phase", /*authored*/ true, /*tokens*/ "ldsink=1");
 ```
 
-- `authored = true`：编织出来的顺序是权威。区域内**不做** list 调度、`slotfill`、`ldshoist`（token 也不能把它们打开）；仍然重算计数等待（`rewait`），并允许保序的后处理（`ldsink`、`wsink`、`ldahead`、`ldahead32`）。
+- `authored = true`：编织出来的顺序是权威。区域内**不做** list 调度、`slotfill`、`ldshoist`（token 也不能把它们打开）；仍然重算计数等待（`rewait`），并允许保序的后处理（`ldsink`、`wsink`、`ldahead32`）。
 - `authored = false`：区域的 token（`AMDC_SCHED_OPTS` 词汇，新增 `reorder` = 打开 list 调度）叠加在 kernel 的选项之上，只作用于该区域的指令。
 - 没有声明的区域继承它所嵌套的区域的策略（最外层 = kernel 默认）。
 
@@ -22,7 +22,7 @@ b.declare_region("m_phase", /*authored*/ true, /*tokens*/ "ldsink=1");
 ## 调度器怎么用
 
 - list 调度器：一个基本块里按**策略**切成 run（同一声明的相邻实例是一个 run），每个 run 单独调度（块的活跃集合给出 run 两端的活跃值，压力模型仍然精确）；authored / `rewait` 的 run 保持顺序。
-- 后处理（`ldsink` / `ldahead` / `ldahead32` / `wsink`）：按指令所属策略的选项生效，**遇到策略变化就停**，不跨区域边界移动。
+- 后处理（`ldsink` / `ldahead32` / `wsink`，以及 post-RA 的 `hzfill`）：按指令所属策略的选项生效，**遇到策略变化就停**，不跨区域边界移动；`hzfill` 的 `s_nop` 属于它让其等待的那条指令（行尾的 nop 属于上一条），搬动的指令和它越过的指令必须同属该策略且该策略开启了 `hzfill`。
 - `ldshoist` / `slotfill`（整块 pass）：只处理其中所有指令的策略都开启它们的块。
 - 区域可以包含控制流（回滚 `if`）：区域覆盖其子树 lower 出来的各个块，每个块有自己的 run。
 
@@ -41,6 +41,6 @@ b.declare_region("m_phase", /*authored*/ true, /*tokens*/ "ldsink=1");
 | `m_phase:authored` + `v_phase:authored` | 671.4 (+2.9 %) | 1759.5 (+0.8 %) | 2434.7 (-1.2 %) |
 
 也就是说：Weaver 的声明顺序做 m_phase 时比 list 调度器差 3–10 %（list 调度器在该区域里确实有用），`v_phase`（decide + convert）authored 对 per-CU 有 +3 % 但对大形状略负。
-`pexact` / `search` / `ovl` 只在 1-wave kernel 上有收益，尚未移植到 Main（`w4sched2`）；`hzfill` 还在 `fmha-4w2`，有了之后按区域选择它同样是区域选项。
+`pexact` / `search` / `ovl` 等只在 1-wave 原型上有微弱收益，已淘汰且代码已删除（结果见 [`lgkm-lookahead.md`](lgkm-lookahead.md)）。区域可用的策略 token：`rewait`、`reorder`、`ldshoist` / `hoist=N`、`slotfill`、`ldsink=D`、`ldahead32=D`、`wsink`、`hzfill`（authored 区域里 `reorder` / `slotfill` / `ldshoist` 不会生效）。
 
-测试：`crates/amdgpu-compiler/tests/sched_regions.rs`（run 划分、authored / free、token 只在区域内生效、后处理不跨边界、authored 不能被 token 解锁、策略号映射）、`tests/sched_regions_lower.rs`（按名字声明、嵌套继承、两个实例同一策略）。
+测试：`crates/amdgpu-compiler/tests/sched_regions.rs`（run 划分、authored / free、token 只在区域内生效、后处理不跨边界、authored 不能被 token 解锁、策略号映射）、`tests/sched_regions_lower.rs`（按名字声明、嵌套继承、两个实例同一策略）、`crates/amdgpu-kernels/tests/hzfill.rs`（`hzfill` 作为区域选项）。

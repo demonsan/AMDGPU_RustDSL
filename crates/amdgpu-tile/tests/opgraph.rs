@@ -172,7 +172,7 @@ fn cut_edges_become_store_and_load_slots() {
     let g = two_stage_graph();
     // kernel a = sm (p leaves, the carried s arrives), kernel b = the m_phase group (p arrives, s leaves)
     let a = generate(&g, "a", &["sm"], "attn.graph.json").unwrap();
-    assert!(a.contains("fn store_p(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx) {") && a.contains("cut out: p to pv") && a.contains("cut in : s from qk"), "{a}");
+    assert!(a.contains("fn store_p(&mut self, _b: &mut FnBuilder, _cx: &mut Self::Cx) {") && a.contains("cut out: p to pv") && a.contains("cut in : s from qk"), "{a}");
     assert!(a.find("slots.load_s(b, &mut cx);").unwrap() < a.find("slots.sm(b, &mut cx);").unwrap(), "the load precedes its first consumer");
     assert!(a.find("slots.sm(b, &mut cx);").unwrap() < a.find("slots.store_p(b, &mut cx);").unwrap(), "the store follows its producer");
     assert!(a.contains("todo!(\"slot load_s") && a.contains("a `move.row_frags` stage"), "the default body names the registry stage: {a}");

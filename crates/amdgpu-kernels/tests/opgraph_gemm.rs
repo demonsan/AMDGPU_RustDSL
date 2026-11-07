@@ -9,7 +9,7 @@ fn file(rel: &str) -> String {
 
 fn up_to_date(rel: &str, actual: &str) {
     let path = file(rel);
-    if std::env::var("UPDATE_SKELETONS").is_ok() {
+    if std::env::var("UPDATE_SKELETONS").map_or(false, |v| !v.is_empty()) {
         std::fs::write(&path, actual).unwrap();
         return;
     }

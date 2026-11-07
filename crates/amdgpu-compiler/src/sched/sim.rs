@@ -140,7 +140,7 @@ fn build_prog(m: &MFunction, path: &[usize], header: usize) -> Vec<SInst> {
 }
 
 /// Estimated steady-state cycles per iteration of one loop with `waves` waves on the SIMD.
-pub fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
+fn simulate_prog(prog: &[SInst], waves: usize, iters: usize) -> f64 {
     if prog.is_empty() || waves == 0 {
         return 0.0;
     }

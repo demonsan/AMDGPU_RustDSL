@@ -220,7 +220,11 @@ pub fn generate(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str) -> Re
         }
         match &sl.body {
             None => s.push_str(&format!("    fn {}(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx);\n", sl.name)),
-            Some(body) => s.push_str(&format!("    fn {}(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx) {{\n        {body}\n    }}\n", sl.name)),
+            Some(body) => {
+                // a `todo!` default uses neither parameter
+                let (bn, cn) = if body.starts_with("todo!") { ("_b", "_cx") } else { ("b", "cx") };
+                s.push_str(&format!("    fn {}(&mut self, {bn}: &mut FnBuilder, {cn}: &mut Self::Cx) {{\n        {body}\n    }}\n", sl.name))
+            }
         }
         for x in &sl.extra {
             s.push_str(x);
@@ -397,7 +401,7 @@ fn generate_pipelined(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str)
     for n in &pre {
         s.push_str(&format!("    slots.{}(b, &mut cx);\n", n.id));
     }
-    s.push_str("    let mut pipe = slots.pipeline(b, &mut cx);\n");
+    s.push_str("    let pipe = slots.pipeline(b, &mut cx);\n");
     s.push_str(&format!("    {{\n        let mut body = {bname} {{ slots: &mut *slots, cx: &mut cx }};\n        pipe.run(b, Role::{role}, &mut body);\n    }}\n"));
     for n in &post {
         s.push_str(&format!("    slots.{}(b, &mut cx);\n", n.id));

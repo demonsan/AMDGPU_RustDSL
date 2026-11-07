@@ -3,7 +3,7 @@
 ## Status (final; merged into Main, numbers as in `docs/current-status.md`)
 
 * **Switches.** The scheduler is OFF by default for arbitrary kernels: `AMDC_SCHED` unset = the old pipeline. Enable with `amdc emit --sched` or
-  `AMDC_SCHED=1|ld|auto` (`AMDC_SCHED_OPTS=rewait,xbar,noverify,stats,drain,limit=N,xbar=B,only=B1+B2,hoist=N,swp,taildup`). `AMDC_SCHED=0` forces it
+  `AMDC_SCHED=1|ld|auto` (`AMDC_SCHED_OPTS=rewait,reorder,xbar,noverify,stats,nocfg,limit=N,hoist=N,ldshoist,slotfill,ldsink=D,ldahead32=D,wsink,hzfill`). `AMDC_SCHED=0` forces it
   off for the FMHA kernels, which otherwise get a per-kernel preset chosen in `lib.rs` (`lower_and_allocate_with`) from the kernel's policy name
   (the hand-written kernels by name; the shipped v3 set and the `dsl_*` set through their `CompileProfile` (`Vs128` / `T128` / `KvSplit` / `Combine`), which maps to the
   same policy names; the GEMM uses `CompileProfile::Gemm`):
@@ -87,7 +87,7 @@ Why (Experimental reading of the microbenchmarks): per iteration and wave the un
 
 ## Update 2: model validation, stage 2, stage 3 (branch `sched-xblock`)
 
-Options: `AMDC_SCHED_OPTS=swp` (software pipelining), `taildup` (stage 2), `xbar`, `stats`, `nocfg`, `only=B1+B2`, `drain`, `rewait`, `limit=N`.
+Options: `AMDC_SCHED_OPTS` tokens `rewait`, `reorder`, `xbar`, `stats`, `noverify`, `nocfg`, `limit=N`, `hoist=N` / `ldshoist`, `slotfill`, `ldsink=D`, `ldahead32=D`, `wsink`, `hzfill` (the strategy tokens also per weave region: `weaver-sched.md`).
 Pipeline: `cfg::cleanup` (remove the empty latch the lowering creates for each `break_if`, elide fall-through `s_branch`: a loop costs one taken branch instead of two; flag `MFunction::elide_fallthrough`, set only by the scheduler pipeline) -> strip auto waits -> dead `v_cndmask`/`v_cmp` exit scaffolding removal -> [taildup] -> [swp] -> per-block list scheduler (verified) -> waits -> strict hazards -> RA -> post-RA SrcC pad.
 
 ### (a) Why the model said -25% and the hardware 0 (FMHA)

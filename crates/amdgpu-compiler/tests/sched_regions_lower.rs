@@ -1,6 +1,6 @@
 //! Per-region scheduler strategies keyed by region NAME: the kernel declares them (`declare_region`), lowering stamps the backend's region ids (`weave_region_begin` / `weave_region_end`),
 //! `region_strategies` maps every lowered region id to its strategy (the nearest declared region on the way up the nesting, 0 = the kernel default).
-use amdgpu_compiler::{lower, policy_name, region_strategies, scheduler_options};
+use amdgpu_compiler::{lower, region_strategies, scheduler_options};
 use amdgpu_dsl::{FnBuilder, Function};
 
 fn build(declare: bool) -> Function {
@@ -39,13 +39,13 @@ fn declared_regions_map_to_strategies_by_name_with_inheritance() {
 fn without_declarations_every_instruction_keeps_the_default() {
     let f = build(false);
     assert!(strategies(&f).iter().all(|&x| x == 0));
-    assert!(scheduler_options(&f, policy_name(&f)).map_or(true, |o| o.regions.is_empty()), "no declarations: the scheduler options carry no region table");
+    assert!(scheduler_options(&f).map_or(true, |o| o.regions.is_empty()), "no declarations: the scheduler options carry no region table");
 }
 
 #[test]
 fn the_declared_regions_reach_the_scheduler_options() {
     let f = build(true);
-    let o = scheduler_options(&f, policy_name(&f)).expect("regions turn the scheduler on");
+    let o = scheduler_options(&f).expect("regions turn the scheduler on");
     assert_eq!(o.regions.len(), 2);
     assert!(o.regions[0].authored && o.regions[0].name == "hot" && o.regions[0].tokens == "ldsink=1");
     assert!(!o.regions[1].authored && o.regions[1].name == "other");

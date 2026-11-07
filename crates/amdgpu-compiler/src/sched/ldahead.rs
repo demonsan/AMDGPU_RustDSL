@@ -1,10 +1,8 @@
-//! `ldahead`: deeper LDS-read look-ahead as a post-pass on the final order of each block (docs/lgkm-lookahead.md).
-//!
-//! The vendor's FMHA loop keeps its `ds_read`s one fragment group AHEAD of the MFMAs that consume them (it waits `lgkmcnt(4)` / `(2)`); the list scheduler issues a read
-//! only about one latency before its consumer. This pass walks every `ds_read*` of the block in program order and moves it up, one instruction at a time, until `D` MFMAs
-//! sit between the read and its first consumer (`ldahead=D`), a true dependence / fence stops it, or the live VGPR dwords would exceed the block's original peak plus `ldslack`
-//! (`ldslack=S`, default 0: the register budget is never raised unless asked). Waits are re-derived from the final order afterwards (count-based, partial `lgkmcnt(n)`).
-//! The result is re-checked with `verify::check_perm`; the block is left alone when that fails.
+//! LDS-read placement as a post-pass on the final order of each block (docs/lgkm-lookahead.md): `ldsink=D` sinks every `ds_read` down until at most `D` MFMAs sit between it and its first
+//! consumer (the vendor keeps one fragment group in flight), `ldahead32=D` moves every 32-bit scale-word read (`ds_read_b32`) up until `D` MFMAs sit between it and its first consumer, and
+//! `wsink` sinks the kernel's explicit `lgkmcnt` waits past the compute that does not need them. A read moves one instruction at a time until a true dependence / a fence / a weave-region
+//! boundary stops it, or (looking ahead) the live VGPR dwords would exceed the block's original peak. Waits are re-derived from the final order afterwards (count-based, partial
+//! `lgkmcnt(n)`). Every result is re-checked with `verify::check_perm`; the block is left alone when that fails.
 
 use super::{depgraph, liveness, slotfill, verify, Options};
 use crate::mir::*;
@@ -18,7 +16,7 @@ fn is_matrix(op: MOp) -> bool {
 
 /// Number of blocks changed.
 pub fn run(m: &mut MFunction, o: &Options) -> usize {
-    if !o.any_region(|r| r.ldahead > 0 || r.ldahead32 > 0 || r.ldsink > 0) {
+    if !o.any_region(|r| r.ldahead32 > 0 || r.ldsink > 0) {
         return 0;
     }
     let ro = o.region_options();
@@ -35,7 +33,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
         let live_out = &lv.live_out[bi];
         let mut order: Vec<usize> = (0..n).collect();
         let mut pos: Vec<usize> = (0..n).collect();
-        let limit = slotfill::peak_live(m, &insts, &order, live_out) + o.ldslack;
+        let limit = slotfill::peak_live(m, &insts, &order, live_out);
         let mut moved = 0usize;
         // `ldsink`: sink reads (last first) while more than D MFMAs separate them from their first consumer (per weave region: the read's region options; a region boundary is never crossed)
         {
@@ -78,7 +76,7 @@ pub fn run(m: &mut MFunction, o: &Options) -> usize {
         }
         for r in 0..n {
             let ro_r = &ro[super::region::region_index(o, insts[r].region)];
-            let dist = if insts[r].op == MOp::LdsReadB32 { ro_r.ldahead.max(ro_r.ldahead32) } else { ro_r.ldahead };
+            let dist = if insts[r].op == MOp::LdsReadB32 { ro_r.ldahead32 } else { 0 };
             if dist == 0 || !is_lds_read(insts[r].op) {
                 continue;
             }

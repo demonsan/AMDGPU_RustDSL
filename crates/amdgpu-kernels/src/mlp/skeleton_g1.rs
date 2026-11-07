@@ -42,7 +42,7 @@ pub trait G1Slots {
     fn gemm1_act(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx);
     /// slot `store_h`: tensor h : fp8 [-1, 256] H rows in HBM leaves the kernel through HBM (cut edge to h_first,h_next, class C4).
     ///   suggested stage: `map.epilogue_chain`
-    fn store_h(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx) {
+    fn store_h(&mut self, _b: &mut FnBuilder, _cx: &mut Self::Cx) {
         todo!("slot store_h: fill with a `map.epilogue_chain` stage (or override)")
     }
     /// slot `x_next`: stage `move.row_frags` [M] (k=256). Construct the stage instance and emit it with the kernel's orchestration (`emit` / `emit_with`, `declare_region`).

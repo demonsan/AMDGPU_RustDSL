@@ -20,7 +20,8 @@
       },
       "roles": ["all 4 waves: same program"],
       "barrier_phase": 0,
-      "phase": "prologue"
+      "phase": "prologue",
+      "hook": null
     },
     {
       "id": "w2_image",
@@ -38,7 +39,8 @@
       },
       "roles": ["all 4 waves: same program"],
       "barrier_phase": 0,
-      "phase": "prologue"
+      "phase": "prologue",
+      "hook": null
     },
     {
       "id": "x_first",
@@ -55,7 +57,8 @@
       },
       "roles": ["all 4 waves: same program"],
       "barrier_phase": 0,
-      "phase": "prologue"
+      "phase": "prologue",
+      "hook": null
     },
     {
       "id": "gemm1_act",
@@ -76,7 +79,8 @@
       },
       "roles": ["all 4 waves: same program"],
       "barrier_phase": 0,
-      "phase": "loop"
+      "phase": "loop",
+      "hook": null
     },
     {
       "id": "x_next",
@@ -93,7 +97,8 @@
       },
       "roles": ["all 4 waves: same program"],
       "barrier_phase": 0,
-      "phase": "loop"
+      "phase": "loop",
+      "hook": null
     },
     {
       "id": "gemm2",
@@ -113,7 +118,8 @@
       },
       "roles": ["all 4 waves: same program"],
       "barrier_phase": 0,
-      "phase": "loop"
+      "phase": "loop",
+      "hook": null
     }
   ],
   "edges": [
