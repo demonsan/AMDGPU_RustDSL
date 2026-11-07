@@ -96,6 +96,20 @@ impl<'a> StageInst<'a> {
     }
 }
 
+/// Several stage instances woven together into ONE phase (their units interleave under the kernel's order): the instances are emitted plain (a
+/// `Node::Stage` region cannot interleave with another); returns the phase's weaver (label `phase`) and the instances' (key, name, params) for
+/// reports. Unit ids are the instances' ids shifted by the units of the instances before them (declaration order = instance order).
+pub fn compose<'a>(phase: &str, insts: Vec<StageInst<'a>>) -> (Weaver<'a>, Vec<(&'static str, String, Vec<(String, String)>)>) {
+    let mut u = Units::new();
+    let mut info = Vec::new();
+    for inst in insts {
+        assert!(inst.handover.is_none(), "compose: stage {} has a hand-over (emit it on its own)", inst.name);
+        info.push((inst.key, inst.name, inst.params));
+        u.append(inst.units, &[]);
+    }
+    (Weaver::new(u).phase(phase.to_string()), info)
+}
+
 /// One stage kind of the registry.
 #[derive(Clone, Copy, Debug)]
 pub struct StageDesc {
@@ -111,7 +125,9 @@ pub fn registry() -> &'static [StageDesc] {
     &REGISTRY
 }
 
-static REGISTRY: [StageDesc; 10] = [
+static REGISTRY: [StageDesc; 12] = [
+    StageDesc { key: "move.ab_stage", prim: Prim::M, params: &[("slots", "ring slots")], doc: "GEMM A / B tile copies into an LDS ring slot (one unit per DMA)" },
+    StageDesc { key: "mma.blockscale_tile", prim: Prim::A, params: &[("atom", "MMA atom"), ("wave_tile", "rows x cols per wave"), ("staged", "reload the next tile")], doc: "the register tile of a blockscale GEMM with in-place fragment reloads" },
     StageDesc { key: "move.lds_image", prim: Prim::M, params: &[("bytes", "image size"), ("pitch", "row pitch")], doc: "a whole global image into an LDS tile by LDS-direct DMA (weight-stationary prologue)" },
     StageDesc { key: "move.row_frags", prim: Prim::M, params: &[("k", "row length (bytes)")], doc: "row-operand MMA fragments straight from global memory (buffer loads)" },
     StageDesc { key: "mma.rows_x_lds", prim: Prim::A, params: &[("atom", "MMA atom"), ("n", "output columns"), ("k", "reduction length")], doc: "C^T += W (LDS) x rows^T (registers), accumulators in registers" },
