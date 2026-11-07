@@ -76,3 +76,34 @@ fn alpha_equivalence_ignores_id_allocation() {
     g.name = "other".into();
     assert!(amdgpu_dsl::print::dsl_structural_eq(&f, &g), "the name is not structural");
 }
+
+#[test]
+fn weaver_annotations_stages_and_safe_asm_round_trip() {
+    use amdgpu_dsl::{DType, FnBuilder, Op, Opnd, RegRef, StageContract};
+    let mut b = FnBuilder::new("weave_probe", 64);
+    b.arg("out", DType::Ptr, 0, 8);
+    let out = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    b.declare_region("w", true, "rewait");
+    let v = b.stage("s", StageContract::default(), |b| {
+        b.weave_region("w", |b| {
+            let c = b.c_i32(3);
+            b.add_i32(Opnd::Val(tid), Opnd::Val(c))
+        })
+    });
+    b.pin_vgpr_at(RegRef::Val(v), 8);
+    b.reg_separate(&[RegRef::Val(v), RegRef::Val(tid)]);
+    b.reg_cap("w", 64);
+    let f32v = b.let_(Op::BitcastF32(Opnd::Val(v)));
+    b.store_f32(Opnd::Val(out), 0, Opnd::Val(f32v));
+    let f = b.finish();
+    let t = amdgpu_dsl::ir_text::print(&f);
+    assert!(t.contains("region_decl RegionDecl") && t.contains("reg_plan PinV") && t.contains("RegionMark") && t.contains("stage \"s\""), "{t}");
+    let g = amdgpu_dsl::ir_text::parse(&t).unwrap_or_else(|e| panic!("{e}\n{t}"));
+    assert_eq!(format!("{g:?}"), format!("{f:?}"));
+    // safe-asm blocks decode from their Debug spelling
+    for blk in [amdgpu_safeasm::examples::rowsum_var_block(), amdgpu_safeasm::examples::cvt_chain_block(), amdgpu_safeasm::examples::global_probe_block()] {
+        let back: amdgpu_safeasm::AsmBlock = amdgpu_dsl::ir_text::parse_value(&format!("{blk:#?}")).unwrap();
+        assert_eq!(back, blk);
+    }
+}

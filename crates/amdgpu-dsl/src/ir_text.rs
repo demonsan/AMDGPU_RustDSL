@@ -577,6 +577,16 @@ impl Lexer {
     }
 }
 
+/// Decode one `Debug`-spelled value of type `T` (e.g. an `Op`, a `Contract`, a safe-asm `AsmBlock`).
+pub fn parse_value<T: FromIr>(src: &str) -> Result<T, IrErr> {
+    let mut lx = Lexer { toks: lex(src)?, pos: 0 };
+    let v: T = lx.typed()?;
+    if lx.peek().is_some() {
+        return Err(lx.e("trailing text after the value"));
+    }
+    Ok(v)
+}
+
 // ---------------------------------------------------------------------------------------------
 // printer
 // ---------------------------------------------------------------------------------------------

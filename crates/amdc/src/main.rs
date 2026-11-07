@@ -563,7 +563,11 @@ fn main() -> ExitCode {
             };
             match amdgpu_compiler::compile_with(&f, tail.as_ref()) {
                 Ok(c) => {
-                    println!("{}", amdc::jit::info_json(&f, &spec.0, &spec.1, tail.name(), amdc::jit::resources(&c.asm)));
+                    let source = match from_ir_path(&args).and_then(|p| fs::read_to_string(p).ok()) {
+                        Some(t) => format!("ir:{}", amdc::jit::fnv_hex(&t)),
+                        None => "registry".to_string(),
+                    };
+                    println!("{}", amdc::jit::info_json_src(&f, &spec.0, &spec.1, tail.name(), amdc::jit::resources(&c.asm), &source));
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
