@@ -205,7 +205,6 @@ struct An<'a> {
     /// values constrained by `assume`: their interval is a contract fact, so `recompute` (select-arm refinement) must not re-derive them from their operands
     assumed_vals: std::collections::HashSet<ValueId>,
     ovr: Option<(Opnd, Itv)>,
-    if_stack: Vec<(HashMap<ValueId, AV>, Option<HashMap<ValueId, AV>>)>,
     rep: Report,
     idx: usize,
     has_asm: bool,
@@ -970,23 +969,6 @@ impl<'a> An<'a> {
         }
     }
 
-    fn matching_end(&self, begin: usize) -> usize {
-        let mut depth = 0usize;
-        for (k, s) in self.f.stmts().iter().enumerate().skip(begin) {
-            match s {
-                Stmt::BeginLoop { .. } => depth += 1,
-                Stmt::EndLoop => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return k;
-                    }
-                }
-                _ => {}
-            }
-        }
-        self.f.stmts().len()
-    }
-
     fn run(&mut self) {
         let f = self.f;
         let mut idx = 0usize;
@@ -1314,29 +1296,7 @@ impl<'a> An<'a> {
                     }
                 }
             }
-            Stmt::EndLoop => {}
-            Stmt::BeginIf { .. } => {
-                self.tag = None;
-                self.if_stack.push((self.env.clone(), None))
-            }
-            Stmt::Else => {
-                if let Some(top) = self.if_stack.last_mut() {
-                    top.1 = Some(self.env.clone());
-                    self.env = top.0.clone();
-                }
-            }
-            Stmt::EndIf => {
-                if let Some((snap, then_env)) = self.if_stack.pop() {
-                    let mut merged = then_env.unwrap_or_default();
-                    for (k, v) in self.env.drain() {
-                        merged.insert(k, v);
-                    }
-                    for (k, v) in snap {
-                        merged.insert(k, v);
-                    }
-                    self.env = merged;
-                }
-            }
+            Stmt::BeginIf { .. } => self.tag = None,
             Stmt::VarAsm { .. } | Stmt::VarAsmN { .. } => self.has_asm = true,
             _ => {}
         }
@@ -1478,7 +1438,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), if_stack: Vec::new(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));

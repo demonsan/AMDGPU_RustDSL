@@ -7,7 +7,7 @@ use amdgpu_safeasm::{Imm, Seq};
 /// above the ALU work when nothing pins it.
 fn block(pin_middle: bool) -> MFunction {
     let mut vregs = vec![RClass::V2];
-    let mut v1 = |c: &mut Vec<RClass>| {
+    let v1 = |c: &mut Vec<RClass>| {
         c.push(RClass::V1);
         (c.len() - 1) as VReg
     };

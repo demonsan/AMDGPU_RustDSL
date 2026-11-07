@@ -8,9 +8,6 @@ use crate::mir::*;
 use crate::regalloc::Alloc;
 
 pub const NAME: &str = "llvm20";
-/// `llc --version` first line this dialect was written and validated against.
-pub const LLC_VERSION_PREFIX: &str = "AMD LLVM version 20.";
-pub const TABLE_SRC: &str = include_str!("llvm20.tbl");
 
 /// One LLVM version's data: selected by the probed llc --version (or AMDC_DIALECT).
 #[derive(Debug)]
@@ -43,7 +40,6 @@ pub fn current() -> &'static Dialect {
         &DIALECTS[DIALECTS.len() - 1]
     })
 }
-pub const HEADER_SRC: &str = include_str!("llvm20_header.txt");
 /// Pass the tail starts at; first one that exists in the pipeline is used.
 pub const START_PASS_PREFERENCE: &[&str] = &["gcn-create-vopd", "si-memory-legalizer"];
 pub const LLC_ARGS: &[&str] = &["-mtriple=amdgcn-amd-amdhsa", "-mcpu=gfx950", "-O2"];

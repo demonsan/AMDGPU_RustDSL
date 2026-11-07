@@ -110,9 +110,6 @@ impl AsmBlock {
     pub fn is_pinned(&self) -> bool {
         self.pinned
     }
-    pub fn is_loop_body(&self) -> bool {
-        self.loop_body
-    }
     pub fn exit_in_flight(&self) -> &[(u32, u32)] {
         &self.exit_in_flight
     }

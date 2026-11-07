@@ -372,10 +372,6 @@ fn main() -> ExitCode {
                                 println!("  [{}{}] {:?}: {}", fd.code, if fd.alias.is_empty() || fd.alias == fd.code { String::new() } else { format!("|{}", fd.alias) }, fd.severity, fd.msg);
                             }
                         }
-                        // the trust budget at a glance: explicit trusted assumptions, declared host contracts, unproven properties
-                        let trusted = r.findings.iter().filter(|x| x.code == "GV-ASSUME" && x.msg.contains("TRUSTED") && !x.msg.contains("set_var")).count();
-                        let c = &f.contract;
-                        let contracts = c.extents.len() + c.ka_ranges.len() + c.grid_defs.len() + c.ka_defs.len() + c.ka_sets.len() + c.sym_ranges.len();
                         // the trust LEDGER: every escape is counted by kind
                         let l = r.ledger();
                         let trusted = l.total();

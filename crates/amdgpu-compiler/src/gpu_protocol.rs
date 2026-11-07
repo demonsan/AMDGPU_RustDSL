@@ -32,7 +32,8 @@ enum Item {
     /// `s_waitcnt lgkmcnt(0)`: completes every LDS operation this wave issued before it. (A counted `wait_lds(n > 0)` is not a completion
     /// point for the protocol: the scheduler may reorder independent DS reads, so "n later operations" is not stable through compilation.)
     WaitLds { ord: u32 },
-    Open { ev: usize },
+    /// a tile marker opened an event here (the event's `start`)
+    Open,
     Access { dma: bool },
     /// `fence_release`: waits vmcnt(0)/lgkmcnt(0) (completion) and, with `wb`, writes L2 back (device-scope visibility of plain stores)
     Release { ord: u32 },
@@ -48,7 +49,6 @@ struct Ev {
     ver: i64,
     ord: u32,
     stmt: usize,
-    role: usize,
     start: usize,
     last: usize,
     dma: bool,
@@ -312,10 +312,10 @@ impl<'a> Sim<'a> {
                     self.open = None;
                     return;
                 }
-                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, role: self.role, start: self.items.len(), last: self.items.len(), dma: false, ds: false, n_acc: 0, global, coherent: true };
+                let ev = Ev { produce, tile: ti, slot: s, ver: v, ord: self.ord, stmt: i, start: self.items.len(), last: self.items.len(), dma: false, ds: false, n_acc: 0, global, coherent: true };
                 self.evs.push(ev);
                 let idx = self.evs.len() - 1;
-                self.items.push(Item::Open { ev: idx });
+                self.items.push(Item::Open);
                 self.open = Some(idx);
             }
             _ => {
@@ -1085,7 +1085,6 @@ pub(crate) fn verify_tiles(f: &Function, rep: &mut Report) {
     let base_h = 10usize.max(2 * max_slots + 4);
     let (m, mul_log2) = period_bits(f);
     let pbound = 1usize << m.min(20);
-    let need = base_h.max(2 * pbound + 2);
     const HORIZON_CAP: usize = 70;
     let nmax;
     let mut period_claim: Option<usize> = None;

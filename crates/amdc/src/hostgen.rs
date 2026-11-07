@@ -5,7 +5,7 @@
 //! `amdc gen-host <kernel>|--shipped [--out dir]` writes `<kernel>_abi.h` / `<kernel>_abi.json`.
 //! Contracts are the same `Ext` algebra the verifier uses, so host and device cannot drift by hand.
 
-use amdgpu_dsl::{Arg, Contract, DType, Ext, Function};
+use amdgpu_dsl::{Arg, DType, Ext, Function};
 
 #[derive(Clone, Debug)]
 pub struct Generated {

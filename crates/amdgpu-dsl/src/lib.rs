@@ -1454,10 +1454,6 @@ impl FnBuilder {
             _ => panic!("{}: stage_live_out outside a stage", self.f.name),
         }
     }
-    /// Barriers emitted so far in program order (the `barrier_phase` of a stage opened now).
-    pub fn barriers_so_far(&self) -> u32 {
-        self.tree.barriers
-    }
     /// Adds a scalar hand-over to the innermost open stage's contract (see `StageContract::scalars_out`).
     pub fn stage_scalar_out(&mut self, s: StageScalar) {
         match self.tree.open.iter_mut().rev().find(|f| matches!(f, Frame::Stage { .. })) {

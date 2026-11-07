@@ -18,13 +18,6 @@ pub struct Pw<L, H> {
     _p: PhantomData<(L, H)>,
 }
 
-impl<L, H> Pw<L, H> {
-    /// Read access for operations that only need the register id (crate-internal).
-    pub(crate) fn id(&self) -> u32 {
-        self.reg.id
-    }
-}
-
 impl Pw<Set, Set> {
     /// Both halves are written: the register is an ordinary one-dword register again.
     pub fn done(self) -> Vgpr<1> {
@@ -40,16 +33,6 @@ impl<A: Operand, B: Operand> Bus1<A, B> {
 impl Seq {
     /// Start writing a fresh (undefined) dword half by half.
     pub fn partial(&mut self, r: Vgpr<1>) -> Pw<Unset, Unset> {
-        Pw { reg: r, _p: PhantomData }
-    }
-
-    /// The dword is fully defined already; only its HIGH half will be replaced (`Pw<Set, Unset>`).
-    pub fn partial_hi_only(&mut self, r: Vgpr<1>) -> Pw<Set, Unset> {
-        Pw { reg: r, _p: PhantomData }
-    }
-
-    /// The dword is fully defined already; only its LOW half will be replaced.
-    pub fn partial_lo_only(&mut self, r: Vgpr<1>) -> Pw<Unset, Set> {
         Pw { reg: r, _p: PhantomData }
     }
 

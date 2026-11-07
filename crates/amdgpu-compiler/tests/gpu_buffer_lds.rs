@@ -19,10 +19,6 @@ fn errors(rep: &Report) -> String {
     rep.errors().iter().map(|e| format!("[{}] {}", e.code, e.msg)).collect::<Vec<_>>().join("\n")
 }
 
-fn lane(b: &mut FnBuilder) -> amdgpu_dsl::ValueId {
-    b.let_(Op::WorkitemId)
-}
-
 /// `buffer_load_dwordx4 … lds` with `64 lanes × 16 B` written at `lds_base + lane*16`.
 /// `desc_bytes`: descriptor `num_records`; `extent`: declared allocation; `lds_bytes`: declared LDS segment.
 fn dma_kernel(desc_bytes: u32, extent: Option<Ext>, lds_bytes: u32) -> Function {

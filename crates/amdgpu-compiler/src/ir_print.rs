@@ -68,8 +68,3 @@ pub fn print_mir(m: &MFunction, alloc: Option<&Alloc>) -> String {
     out
 }
 
-/// Convenience: lower + allocate and print the post-RA MIR.
-pub fn print_mir_ra(f: &Function) -> Result<String, String> {
-    let (m, a) = crate::compile_mir_alloc(f)?;
-    Ok(print_mir(&m, Some(&a)))
-}

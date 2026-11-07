@@ -100,7 +100,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     let extra: &[&str] = &extra_all;
     // The vendor-structure kernels need the register savings of `scalarize` (wave-uniform integer chains in SGPRs) to fit
     // (svscale / the 3-slot swizzled ring); `sgpr` and `addrfold` miscompile them (wrong results, see docs/archive/status.md round 47).
-    let base = if (pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || pname.ends_with("_kvsplit") || (pname.ends_with("_g2") || pname.ends_with("_g3") || pname.ends_with("_g3o") || pname.ends_with("_t128"))) {
+    let base = if pname.starts_with("fmha_fwd_hd128_mxfp8_vs") || pname.ends_with("_kvsplit") || pname.ends_with("_g2") || pname.ends_with("_t128") {
         // measured on vs128 (15/15, 301.9-304.0 vs 280.6 TFLOP/s): retarget2 (cvt results written straight into the MFMA fragment
         // lanes), imm and sgpr cut ~230 copies/VALU and free 12 VGPRs; addrfold and shl are slower and stay off. `imm` also gives
         // the vs128/vsm builds the register slack they need (docs/archive/status.md rounds 49-50).
@@ -258,7 +258,7 @@ pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
         Ok(m) => m.blocks.iter().any(|b| {
             b.insts.iter().any(|i| match op_attrs::attrs(i.op).backend {
                 op_attrs::Backend::OwnOnly => true,
-                op_attrs::Backend::OwnOnlyIfNoRows => !llvm_tail_has_rows(),
+                op_attrs::Backend::OwnOnlyIfNoRows => false, // the LLVM tables carry the last-arriver atomic/fence rows
                 op_attrs::Backend::Llvm | op_attrs::Backend::NoRow => false,
             })
         }),
@@ -368,7 +368,3 @@ pub fn resolve_backend(name: &str, f: &amdgpu_dsl::Function) -> (String, Option<
     }
 }
 
-/// The atomic/fence ops of the last-arriver pattern have rows in the LLVM tables only when `llvm_tail_has_rows` says so (set by the table probe).
-fn llvm_tail_has_rows() -> bool {
-    true
-}

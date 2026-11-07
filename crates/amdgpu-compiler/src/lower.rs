@@ -14,21 +14,21 @@ use std::collections::{HashMap, HashSet};
 use amdgpu_dsl::{DType, Function, Node, Op, Opnd, RegionKind, Stmt, ValueId};
 use crate::mir::*;
 
-/// Compiler optimisations that reduce dynamic VALU count (accuracy-preserving: same values, same
-/// arithmetic). Selected per kernel profile (`lib.rs`, `with_opts`); DEFAULT `dce,cmpfold`.
-///  * `imm`     - constants become in-line / literal operands (VOP2 src0, shift amounts, cndmask false arm)
-///                instead of `v_mov` into a register;
-///  * `sgpr`    - scalar (SGPR) values are used directly as VALU source operands instead of a `v_mov` copy;
-///  * `shl`     - multiplication by a power-of-two constant becomes a shift;
-///  * `scalarize` - wave-uniform integer arithmetic (workgroup ids, kernarg values, constants and loop counters /
-///                 toggles derived from them with add/mul/shl/lshr/and/xor) is computed with SALU instructions in SGPRs;
-///                 a value needed by a VALU instruction is copied with one `v_mov` (cached per region);
-///  * `addrfold` - an address `(base + k1) + (y + k2)` used once is formed as `base + y` with `k1+k2` in the DS
-///                 offset field, so the `base + k` variants no longer stay live in VGPRs;
-///  * `saddr`   - global loads whose address is `kernarg_ptr + vector offset` use the scalar-base form (no 64-bit add);
-///  * `dce`     - dead address / clamp chains (`v_add_co`/`v_addc`, `v_cmp`+`v_cndmask`, pointer adds) are removed;
-///  * `cmpfold` - `select(cmp(x,y), ..)` re-issues the compare instead of the 0/1 materialisation +
-///                `v_cmp_ne`, and the dead materialisation is removed.
+// Compiler optimisations that reduce dynamic VALU count (accuracy-preserving: same values, same
+// arithmetic). Selected per kernel profile (`lib.rs`, `with_opts`); DEFAULT `dce,cmpfold`.
+//  * `imm`     - constants become in-line / literal operands (VOP2 src0, shift amounts, cndmask false arm)
+//                instead of `v_mov` into a register;
+//  * `sgpr`    - scalar (SGPR) values are used directly as VALU source operands instead of a `v_mov` copy;
+//  * `shl`     - multiplication by a power-of-two constant becomes a shift;
+//  * `scalarize` - wave-uniform integer arithmetic (workgroup ids, kernarg values, constants and loop counters /
+//                 toggles derived from them with add/mul/shl/lshr/and/xor) is computed with SALU instructions in SGPRs;
+//                 a value needed by a VALU instruction is copied with one `v_mov` (cached per region);
+//  * `addrfold` - an address `(base + k1) + (y + k2)` used once is formed as `base + y` with `k1+k2` in the DS
+//                 offset field, so the `base + k` variants no longer stay live in VGPRs;
+//  * `saddr`   - global loads whose address is `kernarg_ptr + vector offset` use the scalar-base form (no 64-bit add);
+//  * `dce`     - dead address / clamp chains (`v_add_co`/`v_addc`, `v_cmp`+`v_cndmask`, pointer adds) are removed;
+//  * `cmpfold` - `select(cmp(x,y), ..)` re-issues the compare instead of the 0/1 materialisation +
+//                `v_cmp_ne`, and the dead materialisation is removed.
 thread_local! {
     static OVERRIDE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
@@ -436,7 +436,7 @@ impl Lowerer {
             }
         };
         let mut unresolved = Vec::new();
-        let mut group = |s: &Self, rs: &[RegRef], unresolved: &mut Vec<String>| -> Vec<VReg> {
+        let group = |s: &Self, rs: &[RegRef], unresolved: &mut Vec<String>| -> Vec<VReg> {
             rs.iter()
                 .filter_map(|r| {
                     let x = res(s, r);
@@ -1009,7 +1009,7 @@ impl Lowerer {
         };
         let (t, f) = if neg { (b, a) } else { (a, b) };
         let cls = if ty == DType::Rsrc { RClass::S4 } else { RClass::S2 };
-        let mut arm = |o: Opnd| -> Result<VReg, String> {
+        let arm = |o: Opnd| -> Result<VReg, String> {
             let r = match o {
                 Opnd::Val(v) => *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?,
                 _ => return Err("uniform select: an arm is not a value".into()),
@@ -1373,26 +1373,6 @@ impl Lowerer {
                 }
             }
             _ => Err("eight-dword fragment operand must be an SSA value or a loop variable".to_string()),
-        }
-    }
-
-    /// Scalar operand for instructions that take SGPRs (e.g. MFMA scales).
-    fn as_s1(&mut self, o: Opnd) -> Result<VReg, String> {
-        match o {
-            Opnd::Val(v) => {
-                let r = *self.val.get(&v).ok_or_else(|| format!("value v{v} not lowered"))?;
-                if self.mir.vreg_class(r) == RClass::S1 {
-                    Ok(r)
-                } else {
-                    Err(format!("value v{v} is not a scalar register"))
-                }
-            }
-            Opnd::I32(i) => {
-                let d = self.new_vreg(RClass::S1);
-                self.push(MInst::new(MOp::SMovB32).def(d).imm(i as i64));
-                Ok(d)
-            }
-            _ => Err("scalar operand must be a value or immediate".to_string()),
         }
     }
 
@@ -3683,7 +3663,6 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
             if blocks.contains(&pblk) {
                 // the reload temporary lives from the first to the last use in the peak block: it only helps if that range
                 // does not contain the peak position
-                let us: Vec<usize> = m.blocks[pblk].insts.iter().enumerate().filter(|(_, i)| i.uses().contains(&r)).map(|(k, _)| k).collect();
                 // (straddling values are reloaded before each use instead: per_use below; costs one DS read per use)
             }
             if matches!(m.blocks[db].insts[di].op, MOp::VReadPhys) {

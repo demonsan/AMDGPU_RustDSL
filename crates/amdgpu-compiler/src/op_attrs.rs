@@ -98,7 +98,7 @@ pub enum Backend {
     Llvm,
     /// the LLVM tail cannot express it: a kernel using it is compiled by the own tail (`uses_own_only_ops`)
     OwnOnly,
-    /// has rows, but is own-only when the tables carry no rows for it (`llvm_tail_has_rows`)
+    /// has rows, but is own-only when the tables carry no rows for it (the tables carry them: treated as both-backends)
     OwnOnlyIfNoRows,
     /// no LLVM rows and not (yet) routed to the own tail: only the own backend can emit it (documented gap)
     NoRow,

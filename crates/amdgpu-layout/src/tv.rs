@@ -29,8 +29,6 @@ impl ImmRange {
     pub const GLOBAL: ImmRange = ImmRange { lo: -4096, hi: 4095, align: 1 };
     /// `buffer_load/store*` (MUBUF): unsigned 12-bit.
     pub const BUFFER: ImmRange = ImmRange { lo: 0, hi: 4095, align: 1 };
-    /// No immediate field: everything stays in the base.
-    pub const NONE: ImmRange = ImmRange { lo: 0, hi: 0, align: 1 };
     pub fn fits(&self, k: i64) -> bool {
         k >= self.lo && k <= self.hi && k % self.align == 0
     }

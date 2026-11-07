@@ -179,10 +179,6 @@ fn apply_above(m: &mut MFunction, bi: usize, j: usize, i: usize) {
     }
 }
 
-fn candidate(m: &MFunction, a: &Alloc, bi: usize, i: usize, window: usize) -> Option<usize> {
-    candidates(m, a, bi, i, window).into_iter().next()
-}
-
 fn apply(m: &mut MFunction, bi: usize, i: usize, j: usize) {
     let b = &mut m.blocks[bi].insts;
     let y = b.remove(j);

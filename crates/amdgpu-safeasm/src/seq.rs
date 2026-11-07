@@ -354,12 +354,6 @@ impl Seq {
         Ready { id, _p: PhantomData }
     }
 
-    /// Same for a view.
-    pub fn ready_sub<'a, const M: usize>(&mut self, r: Sub<'a, M>) -> Ready<'a, M> {
-        self.make_ready(r.id);
-        Ready { id: r.id, _p: PhantomData }
-    }
-
     pub(crate) fn make_ready_pub(&mut self, id: VReg) {
         self.make_ready(id)
     }

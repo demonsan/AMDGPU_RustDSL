@@ -441,13 +441,6 @@ impl MFunction {
         self.vregs[r as usize]
     }
 
-    pub fn linear_index(&self, block: usize, inst: usize) -> usize {
-        let mut n = 0usize;
-        for b in 0..block {
-            n += self.blocks[b].insts.len();
-        }
-        n + inst
-    }
 }
 
 /// Light static checks that do not need physical registers.
