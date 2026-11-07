@@ -13,13 +13,14 @@ fn build(t_out: Vec<i64>, t_in: Vec<i64>, declare_in: bool, phase2: u32, extra_u
     b.stage_begin("s1", StageContract { roles: vec!["all".into()], ..Default::default() });
     let c4 = b.c_i32(4);
     let x = b.add_i32(c3, c4);
+    let w = b.add_i32(x, c4); // not handed over
     b.stage_live_out(sv("X", x, t_out));
     b.stage_end();
     let live_in = if declare_in { vec![sv("X", x, t_in)] } else { vec![] };
     b.stage("s2", StageContract { live_in, barrier_phase: phase2, roles: vec!["all".into()], ..Default::default() }, |b| {
         let y = b.add_i32(x, c3);
         if extra_use {
-            let _ = b.add_i32(y, c4); // c4 belongs to s1 and is not handed over
+            let _ = b.add_i32(y, w); // w belongs to s1 and is not handed over (pooled constants such as c4 are exempt)
         }
     });
     b.finish()
