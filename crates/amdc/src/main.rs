@@ -22,6 +22,8 @@ fn usage() {
     eprintln!("      --backend llvm-tail runs the pinned llc tail (ROCM_LLVM_BIN overrides the tool dir);");
     eprintln!("      --mir-out writes the exported post-RA MIR only (no llc needed) and exits.");
     eprintln!("  amdc gen-host <kernel>|--shipped [--out <dir>]   generate C++ ABI/validate/launch header + JSON metadata");
+    eprintln!("  amdc opgraph <graph.json> [--cut k1=n1+n2,k2=n3]   review text of an op graph and its cut (kernels, stages, on-chip edges with classes, HBM tensors, estimates)");
+    eprintln!("  amdc skeleton <graph.json> <kernel> [--nodes n1,n2|all] [--graph-file <path>] [--out <file.rs>]   generate the Rust skeleton (orchestration slots) of one kernel of the graph");
     eprintln!("  amdc backend probe|check|write-lock   version probe / verify / rewrite backend.lock");
 }
 
@@ -276,6 +278,35 @@ fn main() -> ExitCode {
             if let Err(e) = fs::write(&sj, &aggregate).and_then(|_| fs::write(&sh, &includes)) { eprintln!("{e}"); return ExitCode::from(1); }
             println!("wrote {sh} and {sj}");
             ExitCode::SUCCESS
+        }
+        "opgraph" | "skeleton" => {
+            use amdgpu_tile::opgraph::{skeleton, Budget, Cut, Graph, KernelCut};
+            let Some(path) = args.get(1) else { usage(); return ExitCode::from(2); };
+            let text = match fs::read_to_string(path) { Ok(t) => t, Err(e) => { eprintln!("{path}: {e}"); return ExitCode::from(1); } };
+            let g = match Graph::from_json_str(&text) { Ok(g) => g, Err(e) => { eprintln!("{path}: {e}"); return ExitCode::from(1); } };
+            let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+            let all: Vec<String> = g.nodes.iter().map(|n| n.id.clone()).collect();
+            if args[0] == "opgraph" {
+                let cut = match flag("--cut") {
+                    None => Cut { kernels: vec![KernelCut { name: "all".into(), nodes: all }] },
+                    Some(spec) => Cut { kernels: spec.split(',').filter_map(|k| k.split_once('=')).map(|(n, ns)| KernelCut { name: n.to_string(), nodes: ns.split('+').map(|s| s.to_string()).collect() }).collect() },
+                };
+                return match g.evaluate_cut(&cut, Budget::default()) {
+                    Ok(r) => { print!("{}", r.text(&g)); ExitCode::SUCCESS }
+                    Err(e) => { eprintln!("cut: {e}"); ExitCode::from(1) }
+                };
+            }
+            let Some(kernel) = args.get(2) else { usage(); return ExitCode::from(2); };
+            let nodes: Vec<String> = match flag("--nodes").as_deref() { None | Some("all") => all, Some(l) => l.split(',').map(|s| s.to_string()).collect() };
+            let refs: Vec<&str> = nodes.iter().map(|s| s.as_str()).collect();
+            let gf = flag("--graph-file").unwrap_or_else(|| format!("{}.graph.json", g.name));
+            match skeleton::generate(&g, kernel, &refs, &gf) {
+                Ok(src) => match flag("--out") {
+                    Some(o) => match fs::write(&o, &src) { Ok(_) => { println!("wrote {o}"); ExitCode::SUCCESS } Err(e) => { eprintln!("{o}: {e}"); ExitCode::from(1) } },
+                    None => { print!("{src}"); ExitCode::SUCCESS }
+                },
+                Err(e) => { eprintln!("skeleton: {e}"); ExitCode::from(1) }
+            }
         }
         "list" => {
             for k in amdgpu_kernels::kernel_names() {
