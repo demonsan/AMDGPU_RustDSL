@@ -408,6 +408,7 @@ impl FromIr for StageVal {
             table: FromIr::from_ir(v.field("table")?)?,
             elem_bits: FromIr::from_ir(v.field("elem_bits")?)?,
             storage: FromIr::from_ir(v.field("storage")?)?,
+            layout: FromIr::from_ir(v.field("layout")?)?,
         })
     }
 }
@@ -418,6 +419,65 @@ impl IrIds for StageVal {
         IrIds::ids(&mut self.table, fv, fr);
         IrIds::ids(&mut self.elem_bits, fv, fr);
         IrIds::ids(&mut self.storage, fv, fr);
+        IrIds::ids(&mut self.layout, fv, fr);
+    }
+}
+
+impl FromIr for StageScalar {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("StageScalar")?;
+        Ok(StageScalar {
+            name: FromIr::from_ir(v.field("name")?)?,
+            values: FromIr::from_ir(v.field("values")?)?,
+            owner: FromIr::from_ir(v.field("owner")?)?,
+        })
+    }
+}
+impl IrIds for StageScalar {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.name, fv, fr);
+        for x in self.values.iter_mut() { fv(x); }
+        IrIds::ids(&mut self.owner, fv, fr);
+    }
+}
+
+impl FromIr for StageOutstanding {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("StageOutstanding")?;
+        Ok(StageOutstanding {
+            vm_in: FromIr::from_ir(v.field("vm_in")?)?,
+            lgkm_in: FromIr::from_ir(v.field("lgkm_in")?)?,
+            vm_out: FromIr::from_ir(v.field("vm_out")?)?,
+            lgkm_out: FromIr::from_ir(v.field("lgkm_out")?)?,
+        })
+    }
+}
+impl IrIds for StageOutstanding {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.vm_in, fv, fr);
+        IrIds::ids(&mut self.lgkm_in, fv, fr);
+        IrIds::ids(&mut self.vm_out, fv, fr);
+        IrIds::ids(&mut self.lgkm_out, fv, fr);
+    }
+}
+
+impl FromIr for StageResources {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("StageResources")?;
+        Ok(StageResources {
+            vgprs: FromIr::from_ir(v.field("vgprs")?)?,
+            agprs: FromIr::from_ir(v.field("agprs")?)?,
+            lds_bytes: FromIr::from_ir(v.field("lds_bytes")?)?,
+            barriers: FromIr::from_ir(v.field("barriers")?)?,
+        })
+    }
+}
+impl IrIds for StageResources {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.vgprs, fv, fr);
+        IrIds::ids(&mut self.agprs, fv, fr);
+        IrIds::ids(&mut self.lds_bytes, fv, fr);
+        IrIds::ids(&mut self.barriers, fv, fr);
     }
 }
 
@@ -431,6 +491,10 @@ impl FromIr for StageContract {
             lds_reused: FromIr::from_ir(v.field("lds_reused")?)?,
             barrier_phase: FromIr::from_ir(v.field("barrier_phase")?)?,
             roles: FromIr::from_ir(v.field("roles")?)?,
+            scalars_in: FromIr::from_ir(v.field("scalars_in")?)?,
+            scalars_out: FromIr::from_ir(v.field("scalars_out")?)?,
+            outstanding: FromIr::from_ir(v.field("outstanding")?)?,
+            resources: FromIr::from_ir(v.field("resources")?)?,
         })
     }
 }
@@ -442,6 +506,10 @@ impl IrIds for StageContract {
         IrIds::ids(&mut self.lds_reused, fv, fr);
         IrIds::ids(&mut self.barrier_phase, fv, fr);
         IrIds::ids(&mut self.roles, fv, fr);
+        IrIds::ids(&mut self.scalars_in, fv, fr);
+        IrIds::ids(&mut self.scalars_out, fv, fr);
+        IrIds::ids(&mut self.outstanding, fv, fr);
+        IrIds::ids(&mut self.resources, fv, fr);
     }
 }
 
