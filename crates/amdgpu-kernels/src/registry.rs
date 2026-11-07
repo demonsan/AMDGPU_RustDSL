@@ -36,6 +36,18 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("mlp_fp8_") => crate::mlp::by_name(n),
         // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
+        // EXPERIMENT: hand m_phase orders (ids: pv 0 setup, 1 rowsum, 2+2k read / 3+2k mma for k = 4 hh + e; qk 18 setup, 19+2b read / 20+2b mma, 27 end)
+        n if n.starts_with("fmha_fwd_hd128_mxfp8_v3x_vs128_h") => {
+            let ord: Vec<usize> = match &n["fmha_fwd_hd128_mxfp8_v3x_vs128_h".len()..] {
+                "1" => vec![0, 18, 2, 4, 1, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 17, 19, 21, 20, 23, 22, 25, 24, 26, 27],
+                "2" => vec![0, 18, 2, 4, 1, 3, 6, 19, 5, 8, 21, 7, 10, 23, 9, 12, 25, 11, 14, 13, 16, 15, 17, 20, 22, 24, 26, 27],
+                "3" => vec![0, 18, 2, 4, 19, 1, 3, 6, 21, 5, 8, 20, 7, 10, 23, 9, 12, 22, 11, 14, 25, 13, 16, 24, 15, 17, 26, 27],
+                _ => return None,
+            };
+            let mut f = crate::fmha::vs128_exp(n, Some(ord));
+            f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
+            Some(f)
+        }
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),
