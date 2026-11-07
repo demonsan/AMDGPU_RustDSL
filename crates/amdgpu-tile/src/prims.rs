@@ -138,6 +138,27 @@ pub fn quant_fp8_row(b: &mut FnBuilder, ys: &[ValueId], amax: ValueId) -> (Value
     (scale, words)
 }
 
+/// The fp8 (e4m3) row scale and its reciprocal from the absolute maximum (`quant_fp8_row` in two steps, for streaming the values).
+pub fn fp8_scale(b: &mut FnBuilder, amax: ValueId) -> (ValueId, ValueId) {
+    let tiny = b.c_f32(1e-12);
+    let a = b.max_f32(amax, tiny);
+    let inv_max = b.c_f32(1.0 / FP8_E4M3_MAX);
+    let scale = b.mul_f32(a, inv_max);
+    let inv = b.rcp_f32(scale);
+    (scale, inv)
+}
+
+/// `fp8(y * inv)` packed four per dword in value order.
+pub fn fp8_pack(b: &mut FnBuilder, ys: &[ValueId], inv: ValueId) -> Vec<ValueId> {
+    assert!(ys.len() % 4 == 0, "fp8_pack: a multiple of 4 values");
+    ys.chunks(4)
+        .map(|c| {
+            let q: Vec<ValueId> = c.iter().map(|&y| b.mul_f32(y, inv)).collect();
+            b.cvt_pk_fp8x4_f32(q[0], q[1], q[2], q[3])
+        })
+        .collect()
+}
+
 /// |x| for f32 (max(x, -x)).
 pub fn abs_f32(b: &mut FnBuilder, x: ValueId) -> ValueId {
     let z = b.c_f32(0.0);

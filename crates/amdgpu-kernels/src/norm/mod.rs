@@ -10,14 +10,14 @@
 //! Q per-row fp8) -> `store` (M: q and the row scale).
 
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, StageContract, StageScalar, StageVal, ValueId};
-use amdgpu_tile::prims::{abs_f32, bf16x8_to_f32, lane_reduce, quant_fp8_row, rsqrt_f32, wave_reduce, RedOp};
+use amdgpu_tile::prims::{abs_f32, bf16x8_to_f32, fp8_pack, fp8_scale, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
 use amdgpu_tile::stage::{Prim, StageInst};
 use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
 pub fn by_name(name: &str) -> Option<Function> {
     let n: i64 = name.strip_prefix("rmsnorm_quant_fp8_n")?.parse().ok()?;
-    (n % 512 == 0 && (512..=16384).contains(&n)).then(|| rmsnorm_quant_fp8(name, n))
+    (n % 512 == 0 && (512..=8192).contains(&n)).then(|| rmsnorm_quant_fp8(name, n))
 }
 
 fn sval(name: &str, values: Vec<ValueId>, bits: u32, table: Vec<i64>) -> StageVal {
@@ -136,11 +136,12 @@ pub fn rmsnorm_quant_fp8(name: &str, n: i64) -> Function {
             amax = Some(match amax { None => m, Some(a) => b.max_f32(a, m) });
         }
         let amax = wave_reduce(b, RedOp::Max, amax.expect("values"), &me2, 64, 1, lane4);
-        let mut ys = Vec::with_capacity(nv);
+        let (s, inv_s) = fp8_scale(b, amax);
+        let mut words = Vec::with_capacity(nv / 4);
         for i in 0..nld {
-            ys.extend(y_of(b, i));
+            let y = y_of(b, i);
+            words.extend(fp8_pack(b, &y, inv_s));
         }
-        let (s, words) = quant_fp8_row(b, &ys, amax);
         s1.set(s);
         q1.set(words);
     });
