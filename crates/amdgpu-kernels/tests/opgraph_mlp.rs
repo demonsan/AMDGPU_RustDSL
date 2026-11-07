@@ -53,7 +53,7 @@ fn cutting_h_gives_the_unfused_pair() {
     assert_eq!(r.cut_edges.len(), 1);
     assert_eq!((r.cut_edges[0].tensor.as_str(), r.cut_edges[0].class), ("h", Class::C4));
     assert_eq!(r.kernels[0].outputs, vec!["h"]);
-    assert_eq!(r.kernels[1].inputs, vec!["w2", "h"].into_iter().map(String::from).collect::<Vec<_>>().iter().filter(|s| r.kernels[1].inputs.contains(s)).cloned().collect::<Vec<_>>());
+    assert!(r.kernels[1].inputs.contains(&"h".to_string()) && r.kernels[1].inputs.contains(&"w2".to_string()), "{:?}", r.kernels[1].inputs);
     let text = r.text(&g);
     assert!(text.contains("cut h gemm1_act -> gemm2 : C4"), "{text}");
 }
