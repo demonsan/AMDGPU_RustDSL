@@ -171,6 +171,10 @@ fn batch_kernarg_loads(m: &mut MFunction) {
 
 struct Lowerer {
     mir: MFunction,
+    /// The weave region (`Function::regions` id) of the scope being lowered; stamped on every instruction `push` emits (0 = the kernel default).
+    region: u16,
+    /// The enclosing regions of the open weave scopes (restored at the scope end).
+    region_stack: Vec<u16>,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
     converted: HashMap<ValueId, VReg>,
@@ -287,6 +291,8 @@ impl Lowerer {
 
         Lowerer {
             mir,
+            region: 0,
+            region_stack: Vec::new(),
             val: HashMap::new(),
             converted: HashMap::new(),
             vars: Vec::new(),
@@ -403,6 +409,8 @@ impl Lowerer {
     }
 
     fn push(&mut self, inst: MInst) {
+        let mut inst = inst;
+        inst.region = self.region;
         self.mir.blocks[self.cur].insts.push(inst);
     }
 
@@ -1427,6 +1435,15 @@ impl Lowerer {
                 }
                 // a stage is transparent to lowering (its contract is checked by gpu_verify)
                 Node::Stage { body, .. } => self.walk(f, body)?,
+                // a weave region scope: the declared region's id is stamped on everything lowered inside (an undeclared name is transparent)
+                Node::Weave { name, body } => {
+                    self.region_stack.push(self.region);
+                    if let Some(k) = f.regions.iter().position(|r| &r.name == name) {
+                        self.region = (k + 1) as u16;
+                    }
+                    self.walk(f, body)?;
+                    self.region = self.region_stack.pop().unwrap_or(0);
+                }
             }
         }
         Ok(())
@@ -1857,7 +1874,7 @@ impl Lowerer {
                 Stmt::WaitLds { count } => {
                     self.push(MInst::new(MOp::SWaitLgkm).imm(*count as i64));
                 }
-                Stmt::Assume { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd | Stmt::StageBegin { .. } | Stmt::StageEnd => {} // contract markers for gpu_verify: no code
+                Stmt::Assume { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::TileEnd | Stmt::StageBegin { .. } | Stmt::StageEnd | Stmt::WeaveBegin { .. } | Stmt::WeaveEnd => {} // contract markers for gpu_verify: no code
                 Stmt::Barrier => {
                     self.push(MInst::new(MOp::SBarrier));
                 }

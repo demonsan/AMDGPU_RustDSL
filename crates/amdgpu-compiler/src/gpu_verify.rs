@@ -1045,7 +1045,7 @@ impl<'a> An<'a> {
                 }
                 // a pipeline stage (fusion-g): StageBegin + body + StageEnd in the linearization; the markers do not change the analysis state
                 // (GV-STAGE, `verify_stages`, checks the contracts on the linear view)
-                Node::Stage { body, .. } => {
+                Node::Stage { body, .. } | Node::Weave { body, .. } => {
                     *idx += 1;
                     self.walk(body, idx);
                     *idx += 1;
@@ -1349,7 +1349,7 @@ fn flat_len(nodes: &[Node]) -> usize {
         .iter()
         .map(|n| match n {
             Node::S(_) => 1,
-            Node::Loop { body, .. } | Node::Region { body, .. } | Node::Stage { body, .. } => 2 + flat_len(body),
+            Node::Loop { body, .. } | Node::Region { body, .. } | Node::Stage { body, .. } | Node::Weave { body, .. } => 2 + flat_len(body),
             Node::If { then, els, .. } => 2 + flat_len(then) + els.as_ref().map_or(0, |e| 1 + flat_len(e)),
         })
         .sum()

@@ -624,6 +624,11 @@ pub enum Stmt {
     StageBegin { name: String, contract: Box<StageContract> },
     /// Closes the innermost stage.
     StageEnd,
+    /// Opens a weave region scope (`Node::Weave`, `Function::regions` by NAME): the instructions lowered from the scope carry the region's id (`MInst::region`), so the scheduler applies
+    /// the region's strategy to them only. Emits no code; an undeclared name is transparent (the enclosing region stays), a declared inner scope overrides the outer one.
+    WeaveBegin { name: String },
+    /// Closes the innermost weave scope.
+    WeaveEnd,
     /// LDS tile protocol marker (v1.1): from here until the next tile marker / `TileEnd`, the LDS writes and DMA issued by this wave are version `version` of slot
     /// `slot` of tile `tile`. Emits no code.
     TileProduce { tile: String, slot: Opnd, version: Opnd },
@@ -762,6 +767,7 @@ pub enum Node {
     Region { kind: RegionKind, tile: String, slot: Opnd, version: Opnd, body: Vec<Node> },
     /// a pipeline stage with its boundary contract (`stage_begin` ... `stage_end`): checked at the edge, transparent to lowering / scheduling
     Stage { name: String, contract: Box<StageContract>, body: Vec<Node> },
+    Weave { name: String, body: Vec<Node> },
 }
 
 /// Kind of a protocol region.
@@ -802,6 +808,11 @@ fn flatten_into(nodes: &[Node], out: &mut Vec<Stmt>) {
                 flatten_into(body, out);
                 out.push(Stmt::StageEnd);
             }
+            Node::Weave { name, body } => {
+                out.push(Stmt::WeaveBegin { name: name.clone() });
+                flatten_into(body, out);
+                out.push(Stmt::WeaveEnd);
+            }
         }
     }
 }
@@ -813,6 +824,7 @@ enum Frame {
     If { cond: Opnd, then: Vec<Node>, els: Option<Vec<Node>> },
     Region { kind: RegionKind, tile: String, slot: Opnd, version: Opnd, body: Vec<Node> },
     Stage { name: String, contract: Box<StageContract>, body: Vec<Node> },
+    Weave { name: String, body: Vec<Node> },
 }
 
 impl Frame {
@@ -822,11 +834,12 @@ impl Frame {
             Frame::If { .. } => "if",
             Frame::Region { .. } => "tile region",
             Frame::Stage { .. } => "stage",
+            Frame::Weave { .. } => "weave region",
         }
     }
     fn nodes(&mut self) -> &mut Vec<Node> {
         match self {
-            Frame::Loop { body, .. } | Frame::Region { body, .. } | Frame::Stage { body, .. } => body,
+            Frame::Loop { body, .. } | Frame::Region { body, .. } | Frame::Stage { body, .. } | Frame::Weave { body, .. } => body,
             Frame::If { then, els, .. } => els.as_mut().unwrap_or(then),
         }
     }
@@ -836,6 +849,7 @@ impl Frame {
             Frame::If { cond, then, els } => Node::If { cond, then, els },
             Frame::Region { kind, tile, slot, version, body } => Node::Region { kind, tile, slot, version, body },
             Frame::Stage { name, contract, body } => Node::Stage { name, contract, body },
+            Frame::Weave { name, body } => Node::Weave { name, body },
         }
     }
 }
@@ -889,6 +903,8 @@ impl TreeBuilder {
                 self.open.push(Frame::Stage { name, contract, body: Vec::new() })
             }
             Stmt::StageEnd => self.close(|f| matches!(f, Frame::Stage { .. }), "stage_end")?,
+            Stmt::WeaveBegin { name } => self.open.push(Frame::Weave { name, body: Vec::new() }),
+            Stmt::WeaveEnd => self.close(|f| matches!(f, Frame::Weave { .. }), "weave_end")?,
             other => self.cur().push(Node::S(other)),
         }
         Ok(())
@@ -1087,6 +1103,12 @@ impl Function {
                 }
                 Stmt::StageEnd => {
                     let _ = writeln!(s, "{pad}stage_end");
+                }
+                Stmt::WeaveBegin { name } => {
+                    let _ = writeln!(s, "{pad}weave {name}");
+                }
+                Stmt::WeaveEnd => {
+                    let _ = writeln!(s, "{pad}weave_end");
                 }
                 Stmt::Barrier => {
                     let _ = writeln!(s, "{pad}barrier");
@@ -1336,6 +1358,20 @@ impl FnBuilder {
     }
     pub fn stage_end(&mut self) {
         self.push_stmt(Stmt::StageEnd);
+    }
+    /// Opens a weave region scope named `name` (see `Stmt::WeaveBegin`; the strategy comes from `declare_region`). Emits no code.
+    pub fn weave_begin(&mut self, name: &str) {
+        self.push_stmt(Stmt::WeaveBegin { name: name.to_string() });
+    }
+    pub fn weave_end(&mut self) {
+        self.push_stmt(Stmt::WeaveEnd);
+    }
+    /// `weave_begin` / `weave_end` around a closure.
+    pub fn weave<R>(&mut self, name: &str, body: impl FnOnce(&mut Self) -> R) -> R {
+        self.weave_begin(name);
+        let r = body(self);
+        self.weave_end();
+        r
     }
     /// Adds a hand-over set to the innermost open stage's contract (its values are usually computed inside the stage).
     pub fn stage_live_out(&mut self, v: StageVal) {
