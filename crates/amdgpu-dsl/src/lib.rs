@@ -913,6 +913,8 @@ struct TreeBuilder {
     open: Vec<Frame>,
     /// statements of the flat view emitted so far (markers included)
     count: usize,
+    /// `Stmt::Barrier`s emitted so far (program order: a stage's `barrier_phase`)
+    barriers: u32,
 }
 
 impl TreeBuilder {
@@ -925,6 +927,9 @@ impl TreeBuilder {
     /// Appends one flat statement: a marker opens / switches / closes a region, anything else is a leaf.
     fn push(&mut self, st: Stmt) -> Result<(), String> {
         self.count += 1;
+        if matches!(st, Stmt::Barrier) {
+            self.barriers += 1;
+        }
         match st {
             Stmt::BeginLoop { vars, init } => self.open.push(Frame::Loop { vars, init, body: Vec::new() }),
             Stmt::BeginIf { cond } => self.open.push(Frame::If { cond, then: Vec::new(), els: None }),
@@ -1417,6 +1422,10 @@ impl FnBuilder {
             Some(Frame::Stage { contract, .. }) => contract.live_out.push(v),
             _ => panic!("{}: stage_live_out outside a stage", self.f.name),
         }
+    }
+    /// Barriers emitted so far in program order (the `barrier_phase` of a stage opened now).
+    pub fn barriers_so_far(&self) -> u32 {
+        self.tree.barriers
     }
     /// Adds a scalar hand-over to the innermost open stage's contract (see `StageContract::scalars_out`).
     pub fn stage_scalar_out(&mut self, s: StageScalar) {
