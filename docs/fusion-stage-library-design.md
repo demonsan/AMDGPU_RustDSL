@@ -301,3 +301,13 @@ Weaver::new(units)            // 一个或多个 stage 的单元（Units::append
 | stage：`kdma.issue_buffer(...)`、`vdma.issue_buffer(...)` | `issue_buffer_units(...)`：setup + 每条 DMA 一个单元，可被 weave 进 QK 的 MFMA 之间（例如以前试过的 vlate），而不用改 stage 代码 |
 
 验收：`.seq()` 的 weave 与旧代码**汇编逐字节相同**（全部出厂 kernel 的 md5 对照）。之后，同一份单元可以用别的顺序 weave 出实验变体，而 stage 代码不变。
+
+---
+
+## 8. 实现状态（P0–P2，分支 `stages`）
+
+| 阶段 | 内容 | 验证 |
+|---|---|---|
+| P0 | `StageContract` 扩展：`StageVal.layout`（TV 布局文本）+ `storage` 检查；`scalars_in/out`（含 owner）；`outstanding`（vm/lgkm 入口/出口容忍）；`resources`（barriers 精确检查，寄存器/LDS 为估计）；`ANY_PHASE`（版本化/角色分支与流水循环内的 stage）；池化常量不算跨 stage 读 | `tests/stage_ir.rs`；全部出厂 kernel md5 不变 |
+| P1 | `amdgpu-tile/src/stage.rs`：`Prim`、`StageInst`（units + contract + handover + prebind）、`merge` / `compose`、registry；MLP（gemm1_act / gemm2）、GEMM v4（`move.ab_stage` / `mma.blockscale_tile`）、FMHA（`move.kv_stage` / `v_phase` = `online.softmax`，交出 P 与参考字 / `m_phase` = `mma.pv` + `mma.qk` 合并 / `window`）均在 `Node::Stage` 区域内，按 slot 的 LDS 偏移在区域外预绑定 | 汇编逐字节相同（含 `gemm_mxfp8_bs_v4`）；证书 24/100/0；strict 0 错误（vs128 / kvsplit stage-handoff 6） |
+| P2 | `amdgpu-tile/src/prims.rs`：E（act / affine / bf16 解包）、R（lane + wave 归约）、Q（fp8 scale / pack）；新 kernel `rmsnorm_quant_fp8_n<N>`（4 个 stage）；GEMM epilogue 链 `mlp_fp8_ws_g1q_{relu,silu}` | 对 CPU 参考 bad=0；RMSNorm+quant N4096 M16384 5.14 TB/s（同机 hipMemcpy D2D 5.03 TB/s）；epilogue 链相对无链 g1 为 0.80×（relu）/ 0.66×（silu），尚未与 MMA 交错 |
