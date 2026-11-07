@@ -9,7 +9,7 @@ KS=("$@")
 [ ${#KS[@]} = 0 ] && KS=($("${A[@]}" list 2>/dev/null) fmha_fwd_hd128_mxfp8_v3_vs128 fmha_fwd_hd128_mxfp8_v3_t128 fmha_fwd_hd128_mxfp8_v3_kvsplit fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h gemm_mxfp8_bs_v4 mlp_fp8_ws_fused mlp_fp8_ws_g1 mlp_fp8_ws_g2)
 ok=0; bad=0
 for k in "${KS[@]}"; do
-  "${A[@]}" print-ir "$k" --stage dsl > "build/irrt/$k.ir" 2>/dev/null || { echo "FAIL $k: print-ir"; bad=$((bad+1)); continue; }
+  "${A[@]}" print-ir "$k" --stage dsl --out "/work/build/irrt/$k.ir" >/dev/null 2>&1 || { echo "FAIL $k: print-ir"; bad=$((bad+1)); continue; }
   line="$k"
   fail=0
   for be in own llvm-tail; do

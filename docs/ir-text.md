@@ -7,7 +7,7 @@
 ## 1. 工作流
 
 ```bash
-amdc print-ir fmha_fwd_hd128_mxfp8_v3_t128 --stage dsl > t128.ir     # 完整、可解析
+amdc print-ir fmha_fwd_hd128_mxfp8_v3_t128 --stage dsl --out t128.ir   # 完整、可解析（大 kernel 用 --out，不经容器管道）
 # 编辑 t128.ir（改一个常量 / 换一个 op / 改 sched_opts / 加 reg_plan …）
 amdc ir-check t128.ir [--verify]                                     # 解析 + 校验 + 重打印不动点；--verify 加严格证书
 amdc emit --from-ir t128.ir --out t128.s [--backend own|llvm-tail] [--specialize ..]

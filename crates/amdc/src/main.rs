@@ -13,7 +13,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  amdc list");
     eprintln!("  amdc dump <kernel>");
-    eprintln!("  amdc print-ir <kernel> [--stage dsl|mir|mir-ra]");
+    eprintln!("  amdc print-ir <kernel>|--from-ir <file> [--stage dsl|mir|mir-ra] [--out <file>]");
     eprintln!("  amdc emit <kernel> [--out <file.s>] [--backend llvm-tail|own] [--mir-out <file.mir>] [--sched | --sched=ld] [--specialize name=value[,..]]");
     eprintln!("      --specialize binds scalar kernargs to constants (shape specialization; docs/jit.md); the specialized kernel must verify strictly");
     eprintln!("  amdc regplan <kernel> [--specialize ..]   per weave-region / stage register peaks (allocator truth) + register-plan report");
@@ -432,18 +432,34 @@ fn main() -> ExitCode {
             if name.is_empty() || (name.starts_with("--") && from_ir_path(&args).is_none()) { usage(); return ExitCode::from(2); }
             let stage = args.windows(2).find(|w| w[0] == "--stage").map(|w| w[1].as_str()).unwrap_or("dsl");
             let f = match load_kernel(&name, &args) { Ok(f) => f, Err(c) => return c };
-            match stage {
-                "dsl" => { print!("{}", amdgpu_compiler::ir_print::print_dsl(&f)); ExitCode::SUCCESS }
+            let text = match stage {
+                "dsl" => amdgpu_compiler::ir_print::print_dsl(&f),
                 "mir" => match amdgpu_compiler::lower::lower(&f) {
-                    Ok(m) => { print!("{}", amdgpu_compiler::ir_print::print_mir(&m, None)); ExitCode::SUCCESS }
-                    Err(e) => { eprintln!("lower failed: {e}"); ExitCode::from(1) }
+                    Ok(m) => amdgpu_compiler::ir_print::print_mir(&m, None),
+                    Err(e) => { eprintln!("lower failed: {e}"); return ExitCode::from(1) }
                 },
                 "mir-ra" => match amdgpu_compiler::compile_mir_alloc(&f) {
-                    Ok((m, a)) => { print!("{}", amdgpu_compiler::ir_print::print_mir(&m, Some(&a))); ExitCode::SUCCESS }
-                    Err(e) => { eprintln!("compile failed: {e}"); ExitCode::from(1) }
+                    Ok((m, a)) => amdgpu_compiler::ir_print::print_mir(&m, Some(&a)),
+                    Err(e) => { eprintln!("compile failed: {e}"); return ExitCode::from(1) }
                 },
-                _ => { eprintln!("unknown stage {stage} (dsl|mir|mir-ra)"); ExitCode::from(2) }
+                _ => { eprintln!("unknown stage {stage} (dsl|mir|mir-ra)"); return ExitCode::from(2) }
+            };
+            // --out <file>: write the file directly (large kernels through a container's stdout pipe can be cut short)
+            match args.windows(2).find(|w| w[0] == "--out").map(|w| w[1].clone()) {
+                Some(p) => {
+                    if let Err(e) = fs::write(&p, &text) {
+                        eprintln!("cannot write {p}: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+                None => {
+                    use std::io::Write;
+                    let mut o = std::io::stdout().lock();
+                    let _ = o.write_all(text.as_bytes());
+                    let _ = o.flush();
+                }
             }
+            ExitCode::SUCCESS
         }
         "dump" => {
             let Some(name) = args.get(1) else {
