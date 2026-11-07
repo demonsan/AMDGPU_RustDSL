@@ -150,7 +150,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // `fmha_fwd_hd128_mxfp8_v3_vs128:ldahead=4,ldslack=8`; several entries separated by `;`) appends scheduler tokens to the options the kernel would use anyway
     let sched_opts = match (std::env::var("AMDC_SCHED_ADD").ok().filter(|v| !v.is_empty()), sched_opts) {
         (Some(spec), Some(mut o)) => {
-            for ent in spec.split(';') {
+            for ent in spec.split([';', '|']) {
                 if let Some((pat, toks)) = ent.split_once(':') {
                     if pat == "*" || pname.contains(pat) || f.name.contains(pat) {
                         o.apply_tokens(toks);
@@ -268,12 +268,12 @@ pub fn scheduler_options(f: &amdgpu_dsl::Function, pname: &str) -> Option<sched:
     o
 }
 
-/// The kernel's declared region strategies plus the experiment switch `AMDC_SCHED_REGION=<region name>:<authored|free>[:<tokens>][;...]` (appended, a later entry of the same name wins):
+/// The kernel's declared region strategies plus the experiment switch `AMDC_SCHED_REGION=<region name>:<authored|free>[:<tokens>][;...] (`|` also separates entries, for tools that split on `;`)` (appended, a later entry of the same name wins):
 /// per-region A/B tests without editing the kernel builder, e.g. `AMDC_SCHED_REGION=m_phase:authored:ldsink=1;window:free:reorder`.
 fn declared_regions(f: &amdgpu_dsl::Function) -> Vec<amdgpu_dsl::RegionDecl> {
     let mut out = f.regions.clone();
     if let Some(spec) = std::env::var("AMDC_SCHED_REGION").ok().filter(|v| !v.is_empty()) {
-        for ent in spec.split(';') {
+        for ent in spec.split([';', '|']) {
             let mut it = ent.splitn(3, ':');
             let (Some(name), Some(mode)) = (it.next(), it.next()) else { continue };
             let d = amdgpu_dsl::RegionDecl { name: name.trim().to_string(), authored: mode.trim() == "authored", tokens: it.next().unwrap_or("").trim().to_string() };
