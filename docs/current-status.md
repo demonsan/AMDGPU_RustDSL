@@ -15,10 +15,10 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
 - **出厂 FMHA = v3 布局层 kernel**：默认路径 `fmha_fwd_hd128_mxfp8_auto`（主机侧按形状选择）由
   `fmha_fwd_hd128_mxfp8_v3_{vs128,t128,kvsplit,kvsplit_combine8h}` 组成（`crates/amdgpu-kernels/src/fmha/`）。每个地址、DMA、epilogue 与
   KV-split 暂存都由 `amdgpu-layout` 的布局推导，`amdgpu-isa` 的 atom 描述指令，`amdgpu-tile` 的组件生成 IR；主机合同由张量布局导出。
-  asm md5（`--backend own`）：`_vs128` `8938adfa`、`_t128` `d7e02b0f`、`_kvsplit` `41f151fc`、`_kvsplit_combine8h` `24a95a51`（Main `1626084b`，整理后不变）。
-- **FMHA 性能（真实数据，`REF_DATA=normal`，2026-11-06，GPU 5）**：`port_gate`：B1H8S2048 默认路径（KV-split）**742 TF/s（1.03× 厂商）**；
-  铺满网格 B4H8S2048 **1723（0.904×）** / B1H8S8192 **2414（0.988×）**；`_vs128` 每 CU 64 blocks **648（0.894×）**；`_t128` B2H8S2048 layout 中位数 **1110（0.862×）**。
-  25 形状矩阵（[`perf-matrix.md`](perf-matrix.md)）：0.897–1.100×，几何平均 **0.980**。调色板数据（`REF_DATA=lcg`，旧口径）下 softmax 几乎每 tile 回滚、掩盖了
+  asm md5（`--backend own`）：`_vs128` `3cebb2cc`、`_t128` `8a57bee5`、`_kvsplit` `41f151fc`、`_kvsplit_combine8h` `24a95a51`（Main `bf08b7b0`：`_vs128` / `_t128` 加了 XCD 感知的 block 顺序）。
+- **FMHA 性能（真实数据，`REF_DATA=normal`，2026-11-08，GPU 5）**：`port_gate`：B1H8S2048 默认路径（KV-split）**740 TF/s（1.025× 厂商）**；
+  铺满网格 B4H8S2048 **1804（0.976×）** / B1H8S8192 **2416（0.988×）** / B2H8S2048 **1279（0.978×）**；`_vs128` 每 CU 64 blocks **694（0.959×）**；`_t128` B2H8S2048 layout 中位数 **1173（0.901×）**。
+  25 形状矩阵（[`perf-matrix.md`](perf-matrix.md)）：0.929–1.063×，几何平均 **0.992**（之前 0.980）。最近一步是厂商的 XCD 感知 block 顺序（K/V 的 L2 命中率 20 % → 77 %，[`fmha-wave-org.md`](fmha-wave-org.md)）。调色板数据（`REF_DATA=lcg`，旧口径）下 softmax 几乎每 tile 回滚、掩盖了
   快速路径成本，旧的 0.92× 口径偏乐观；这一轮的改进（懒更新、≥ 4 tile 用厂商配方、真实数据分派、bias 单次 MFMA 且无零片段拷贝、`ldsink` / `wsink`）
   与否定结果（copy 路径、3 槽环、厂商 copy 形态、重平衡）见 [`fmha-vendor-stream-design.md`](fmha-vendor-stream-design.md) 与 [`lgkm-lookahead.md`](lgkm-lookahead.md)。
 - **MXFP8 blockscale GEMM**：`gemm_mxfp8_bs_v4`（`crates/amdgpu-kernels/src/gemm/`）对照 aiter PR #6696 4-wave pin-AGPR，4096×4096×8192：
@@ -32,7 +32,7 @@ Rust 类型化 kernel DSL + 自研编译器（**寄存器分配与指令调度�
   （[`weaver-sched.md`](weaver-sched.md)），出厂 asm 不变。
 - **DSL IR 文本**：`amdc print-ir --stage dsl` 输出完整可解析的 `irv1`，`--from-ir` 编译手改文本；全部 kernel 往返后双后端 asm 与证书逐字节相同（[`ir-text.md`](ir-text.md)）。
 - `cargo test` **104 个测试目标 / 431 项全绿**。
-- 严格 GPU 语义证书：`--shipped` **24 trusted assumes / 100 trusted contracts / 0 unproven**；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**。
+- 严格 GPU 语义证书：`--shipped` **26 trusted assumes / 100 trusted contracts / 0 unproven**（+2：XCD 顺序重映射后的 tile / head 范围事实）；GEMM v4 **3 / 19 / 0**；`mlp_fp8_ws_fused` **0 / 9 / 0**。
 
 ---
 
@@ -95,7 +95,7 @@ amdc gpu-verify <kernel>|--all|--shipped [-v] [--strict]   # 报告 proven/发�
 
 区间分析的位级规则（`x ^ y`、`x & m` 的可能置位位）与盒子检验都有攻击测试（`crates/amdgpu-compiler/tests/gv_bits.rs`、`sym_branch.rs`）。
 
-**信任预算（证书逐条列出）**：`--shipped`（v3 四个）24 / 100 / 0；`gemm_mxfp8_bs_v4` 3 / 19 / 0；`mlp_fp8_ws_fused` 0 / 9 / 0。
+**信任预算（证书逐条列出）**：`--shipped`（v3 四个）26 / 100 / 0；`gemm_mxfp8_bs_v4` 3 / 19 / 0；`mlp_fp8_ws_fused` 0 / 9 / 0。
 每次运行打印 `certificate: N trusted assumes, M trusted contracts, K unproven`。
 
 **未证明/范围外（诚实清单）**：跨工作组数据竞争与别名、i32 回绕（A3 假设）、从内存加载的指针/索引、safe-asm 块内部访存、
@@ -196,7 +196,7 @@ tile 内字节级重叠、角色数 2 / 迭代数相等假设；`gpu_protocol` �
 | B2H8S2048 `_t128` | **1067.4** | 1.05× |
 
 BUILD / VERIFY（0 错误）/ ACC16 / ACC64（厂商对齐，四条路径）/ DET / STRESS 全部 PASS：**OVERALL PASS**。
-（v7.0 门禁时的 asm md5 为 `763142f9` / `91b26e5d` / `e1fe92a4` / `24a95a51`；当前出厂 `_vs128` / `_t128` / `_kvsplit` / `combine8h` 为 `8938adfa` / `d7e02b0f` / `41f151fc` / `24a95a51`，stage / weaver / 骨架重写前后逐字节相同。）`_t128` 默认打开 `edgepad` 与 `salubr`（同轮 A/B 布局中位数 +3.3%）及 SADDR 形式的
+（v7.0 门禁时的 asm md5 为 `763142f9` / `91b26e5d` / `e1fe92a4` / `24a95a51`；当前出厂 `_vs128` / `_t128` / `_kvsplit` / `combine8h` 为 `3cebb2cc` / `8a57bee5` / `41f151fc` / `24a95a51`（stage / weaver / 骨架重写前后逐字节相同；之后 `_vs128` / `_t128` 加入 XCD 顺序，见 [`fmha-wave-org.md`](fmha-wave-org.md)）。）`_t128` 默认打开 `edgepad` 与 `salubr`（同轮 A/B 布局中位数 +3.3%）及 SADDR 形式的
 LDS-DMA（+1.8..2.1%）；它们在 `_vs128`/`_kvsplit` 上为负，不使用（A/B 记录见 [`dsl-layout-refactor-design.md`](dsl-layout-refactor-design.md) §9.4）。
 
 ### 4.7 MXFP8 blockscale GEMM
@@ -267,11 +267,11 @@ bash tools/container/cargo.sh build
 bash tools/container/cargo.sh test                 # 期望 104 个测试目标 / 431 项全绿
 
 # 发射 kernel 并汇编
-bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --backend=own --out vs128.s   # md5 8938adfa…
+bash tools/container/cargo.sh run -q --bin amdc -- emit fmha_fwd_hd128_mxfp8_v3_vs128 --backend=own --out vs128.s   # md5 3cebb2cc…
 clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o vs128.co vs128.s
 
 # 严格证书
-bash tools/container/cargo.sh run -q --bin amdc -- gpu-verify --shipped --strict   # 24 / 100 / 0
+bash tools/container/cargo.sh run -q --bin amdc -- gpu-verify --shipped --strict   # 26 / 100 / 0
 
 # DSL IR 文本：打印 → 编辑 → 检查 → 编译（docs/ir-text.md）
 bash tools/container/cargo.sh run -q --bin amdc -- print-ir fmha_fwd_hd128_mxfp8_v3_t128 --stage dsl --out t128.ir
