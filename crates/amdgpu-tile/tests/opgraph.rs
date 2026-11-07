@@ -129,12 +129,12 @@ fn structural_errors() {
 use amdgpu_tile::opgraph::skeleton::generate;
 
 fn two_stage_graph() -> Graph {
-    // x -> qk -> s -> sm -> p -> pv -> o   with qk + pv woven in one group (the FMHA m_phase shape); phases: loop
+    // the FMHA shape: v_phase = softmax (sm), m_phase = pv + qk woven by one weaver; qk produces the S of the NEXT iteration (loop-carried edge s)
     let mut g = chain();
-    g.nodes = vec![node("qk", Prim::A, "mma.qk", 100), node("pv", Prim::A, "mma.pv", 100), node("sm", Prim::O, "online.softmax", 40)];
+    g.nodes = vec![node("sm", Prim::O, "online.softmax", 40), node("pv", Prim::A, "mma.pv", 100), node("qk", Prim::A, "mma.qk", 100)];
     g.edges = vec![
         { let mut e = edge("x", None, &["qk"], Some(Class::C4)); e.abi = Some((0, 8)); e },
-        edge("s", Some("qk"), &["sm"], Some(Class::C0)),
+        { let mut e = edge("s", Some("qk"), &["sm"], Some(Class::C0)); e.carried = true; e },
         edge("p", Some("sm"), &["pv"], Some(Class::C0)),
         { let mut e = edge("o", Some("pv"), &[], Some(Class::C4)); e.abi = Some((8, 8)); e },
     ];
@@ -145,18 +145,21 @@ fn two_stage_graph() -> Graph {
 #[test]
 fn a_weave_group_is_one_slot_with_a_default_composition_and_member_constructors() {
     let mut g = two_stage_graph();
-    // qk is consumed before sm, pv after sm: the group's members are not adjacent in dependence order, which the generator accepts (one slot, at the first member)
     g.validate().unwrap();
-    let text = generate(&g, "attn", &["qk", "sm", "pv"], "attn.graph.json").unwrap();
+    let text = generate(&g, "attn", &["sm", "pv", "qk"], "attn.graph.json").unwrap();
     assert!(text.contains("fn m_phase(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx) {"), "{text}");
     assert!(text.contains("amdgpu_tile::stage::compose(\"m_phase\", vec![self.pv_stage(&*cx), self.qk_stage(&*cx)])"), "{text}");
     assert!(text.contains("fn qk_stage<'a>(&'a self, cx: &'a Self::Cx) -> amdgpu_tile::stage::StageInst<'a>;"), "{text}");
     assert!(!text.contains("fn qk(&mut self") && !text.contains("fn pv(&mut self"), "grouped nodes have no slots of their own");
-    assert!(text.contains("fn sm(&mut self"), "{text}");
-    // determinism
-    assert_eq!(text, generate(&g, "attn", &["qk", "sm", "pv"], "attn.graph.json").unwrap());
-    // groups survive the JSON round trip
-    assert_eq!(Graph::from_json_str(&g.to_json_string()).unwrap(), g);
+    assert!(text.find("slots.sm(b, &mut cx);").unwrap() < text.find("slots.m_phase(b, &mut cx);").unwrap(), "{text}");
+    assert_eq!(text, generate(&g, "attn", &["sm", "pv", "qk"], "attn.graph.json").unwrap(), "deterministic");
+    assert_eq!(Graph::from_json_str(&g.to_json_string()).unwrap(), g, "groups survive the JSON round trip");
+    // the members must be consecutive in the dependence order
+    let mut far = g.clone();
+    far.nodes.push(node("post", Prim::E, "map.epilogue_chain", 10));
+    far.edges.push(edge("q", Some("pv"), &["post"], Some(Class::C0)));
+    far.edges.push(edge("r", Some("post"), &["qk"], Some(Class::C0)));
+    assert!(generate(&far, "attn", &["sm", "pv", "qk", "post"], "attn.graph.json").unwrap_err().contains("not consecutive"));
     // structural errors
     g.groups[0].nodes = vec!["pv".into()];
     assert!(g.validate().unwrap_err().contains("at least two"));
@@ -167,16 +170,16 @@ fn a_weave_group_is_one_slot_with_a_default_composition_and_member_constructors(
 #[test]
 fn cut_edges_become_store_and_load_slots() {
     let g = two_stage_graph();
-    // kernel 1 = qk, sm (s stays on chip, p is cut); kernel 2 = pv (p arrives through HBM)
-    let k1 = generate(&g, "first", &["qk", "sm"], "attn.graph.json").unwrap();
-    assert!(k1.contains("fn store_p(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx) {") && k1.contains("cut out: p to pv"), "{k1}");
-    assert!(k1.find("slots.sm(b, &mut cx);").unwrap() < k1.find("slots.store_p(b, &mut cx);").unwrap(), "the store follows its producer");
-    let k2 = generate(&g, "second", &["pv"], "attn.graph.json").unwrap_err();
-    assert!(k2.contains("split by the cut"), "a weave group may not be split by a cut: {k2}");
-    let mut g2 = g.clone();
-    g2.groups.clear();
-    let k2 = generate(&g2, "second", &["pv"], "attn.graph.json").unwrap();
-    assert!(k2.contains("fn load_p(&mut self") && k2.contains("cut in : p from sm"), "{k2}");
-    assert!(k2.find("slots.load_p(b, &mut cx);").unwrap() < k2.find("slots.pv(b, &mut cx);").unwrap(), "the load precedes its first consumer");
-    assert!(k2.contains("todo!(\"slot load_p"), "default body names the move stage to use: {k2}");
+    // kernel a = sm (p leaves, the carried s arrives), kernel b = the m_phase group (p arrives, s leaves)
+    let a = generate(&g, "a", &["sm"], "attn.graph.json").unwrap();
+    assert!(a.contains("fn store_p(&mut self, b: &mut FnBuilder, cx: &mut Self::Cx) {") && a.contains("cut out: p to pv") && a.contains("cut in : s from qk"), "{a}");
+    assert!(a.find("slots.load_s(b, &mut cx);").unwrap() < a.find("slots.sm(b, &mut cx);").unwrap(), "the load precedes its first consumer");
+    assert!(a.find("slots.sm(b, &mut cx);").unwrap() < a.find("slots.store_p(b, &mut cx);").unwrap(), "the store follows its producer");
+    assert!(a.contains("todo!(\"slot load_s") && a.contains("a `move.row_frags` stage"), "the default body names the registry stage: {a}");
+    let b = generate(&g, "b", &["pv", "qk"], "attn.graph.json").unwrap();
+    assert!(b.contains("fn load_p(") && b.contains("fn store_s(") && b.contains("fn m_phase("), "{b}");
+    assert!(b.find("slots.load_p(b, &mut cx);").unwrap() < b.find("slots.m_phase(b, &mut cx);").unwrap());
+    assert!(b.find("slots.m_phase(b, &mut cx);").unwrap() < b.find("slots.store_s(b, &mut cx);").unwrap());
+    // a group split by the cut is an error
+    assert!(generate(&g, "c", &["sm", "pv"], "attn.graph.json").unwrap_err().contains("split by the cut"));
 }

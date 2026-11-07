@@ -95,6 +95,13 @@ pub fn generate(g: &Graph, kernel: &str, nodes: &[&str], graph_file: &str) -> Re
         if !ident_ok(&gr.name) {
             return Err(format!("weave group name '{}' is not a lower-case identifier", gr.name));
         }
+        if inside != 0 {
+            // one weaver interleaves the members: they must follow each other in the dependence order (nothing that depends on a member may sit between them)
+            let pos: Vec<usize> = stages.iter().enumerate().filter(|(_, n)| gr.nodes.iter().any(|m| m == &n.id)).map(|(i, _)| i).collect();
+            if pos.last().unwrap() - pos[0] + 1 != pos.len() {
+                return Err(format!("weave group '{}': its members are not consecutive in the dependence order of the kernel", gr.name));
+            }
+        }
     }
     let in_k = |id: &str| nodes.contains(&id);
     // edges cut away from this kernel
