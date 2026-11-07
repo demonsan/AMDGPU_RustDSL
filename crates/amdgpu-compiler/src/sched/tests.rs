@@ -15,7 +15,7 @@ fn func(vregs: &[RClass], insts: Vec<MInst>) -> MFunction {
         loops: vec![],
         alias: HashMap::new(),
         elide_fallthrough: false, edge_pad: false,
-        agpr_pin: Default::default(),
+        agpr_pin: Default::default(), reg_hints: Default::default(),
     }
 }
 

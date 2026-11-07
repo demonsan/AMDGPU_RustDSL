@@ -295,11 +295,13 @@ pub struct MInst {
     /// LDS-DMA load whose M0 already holds its LDS base (the previous DMA of the block used the same source register): emit neither the s_mov_b32 m0 nor the
     /// s_nop 0 that must follow an M0 write (set by sched::m0::reuse).
     pub skip_m0: bool,
+    /// The weave / stage region the instruction was lowered in (`MFunction::reg_hints.regions`, 1-based; 0 = none). No codegen effect.
+    pub region: u16,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0 }
     }
 
     pub fn def(mut self, r: VReg) -> Self {
@@ -398,6 +400,33 @@ pub struct MFunction {
     pub edge_pad: bool,
     /// Explicit AGPR placement (mdgpu_pin_agpr): AGPR-class vreg -> first AGPR index. Honoured exactly by the allocator.
     pub agpr_pin: HashMap<VReg, u32>,
+    /// Register planning (DSL `RegMark`s resolved to vregs) and the weave / stage regions instructions are tagged with (`MInst::region`).
+    pub reg_hints: RegHints,
+}
+
+/// The kernel's register plan at vreg level (regalloc.rs honours and checks it). Empty for kernels without a plan.
+#[derive(Clone, Debug, Default)]
+pub struct RegHints {
+    /// regions: (name, parent region id; 0 = none); `MInst::region` = 1-based index into this list
+    pub regions: Vec<(String, u16)>,
+    /// exact arch-VGPR placements (canonical vreg, base)
+    pub pins_v: Vec<(VReg, u32)>,
+    pub share: Vec<Vec<VReg>>,
+    pub separate: Vec<Vec<VReg>>,
+    /// (region name, arch VGPR cap, AGPR cap)
+    pub caps: Vec<(String, Option<u32>, Option<u32>)>,
+    pub rings: Vec<(String, Vec<VReg>)>,
+    /// annotations whose target has no register (unused / folded value): kept for the report
+    pub unresolved: Vec<String>,
+    /// canonical vreg -> the DSL name of the value / variable it holds (`%v12`, `%r3`), for reports
+    pub names: HashMap<VReg, String>,
+}
+
+impl RegHints {
+    /// Does the plan constrain the allocator at all?
+    pub fn active(&self) -> bool {
+        !(self.pins_v.is_empty() && self.share.is_empty() && self.separate.is_empty() && self.caps.is_empty() && self.rings.is_empty())
+    }
 }
 
 impl MFunction {

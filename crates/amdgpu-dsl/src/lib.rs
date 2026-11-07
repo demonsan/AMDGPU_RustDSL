@@ -624,6 +624,10 @@ pub enum Stmt {
     StageBegin { name: String, contract: Box<StageContract> },
     /// Closes the innermost stage.
     StageEnd,
+    /// Register-planning region marker (`FnBuilder::weave_region_begin/end`): the instructions lowered between a begin and its end belong to the
+    /// named region (per-region pressure caps and reports, `RegMark::Cap`). Regions nest; a begin and its end sit in the same structural block.
+    /// Emits no code.
+    RegionMark { name: String, begin: bool },
     /// LDS tile protocol marker (v1.1): from here until the next tile marker / `TileEnd`, the LDS writes and DMA issued by this wave are version `version` of slot
     /// `slot` of tile `tile`. Emits no code.
     TileProduce { tile: String, slot: Opnd, version: Opnd },
@@ -746,6 +750,30 @@ pub enum AgprTarget {
 pub struct AgprMark {
     pub target: AgprTarget,
     pub pin: Option<u32>,
+}
+
+/// A value or a loop variable, as the target of a register-planning annotation (`RegMark`). Tuples are planned as a whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RegRef {
+    Val(ValueId),
+    Var(VarId),
+}
+
+/// Register-planning annotations (the weaver's step 3, docs/weaver-regs.md): emitted by the kernel / weaver, honoured by the register allocator
+/// and checked after allocation. An empty plan changes nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegMark {
+    /// HARD: the tuple of `r` sits at arch VGPR `base` (aligned to its width).
+    PinV { r: RegRef, base: u32 },
+    /// HINT: place the later-defined members in the registers of an earlier one when their lifetimes are disjoint (reported when not honoured).
+    Share(Vec<RegRef>),
+    /// HARD: the members never use the same physical registers, even with disjoint lifetimes.
+    Separate(Vec<RegRef>),
+    /// HARD: at every instruction of region `region` (a weave region or a stage, nested regions included) the allocated arch-VGPR footprint
+    /// (highest live physical VGPR + 1) is at most `vgprs`, and the AGPR footprint at most `agprs` when given.
+    Cap { region: String, vgprs: Option<u32>, agprs: Option<u32> },
+    /// The `bufs.len()` register buffers of one fragment (double / triple buffering): pairwise separate, placement reported.
+    Ring { name: String, bufs: Vec<RegRef> },
 }
 
 /// A node of the structured kernel body (region IR): straight-line statements and nested regions. Loops, ifs and tile / buffer
@@ -935,6 +963,8 @@ pub struct Function {
     pub lower_opts: Vec<String>,
     /// Scheduler option tokens (the AMDC_SCHED_OPTS vocabulary: rewait,ldshoist,xbar,hoist=N,limit=N,...); Some turns the scheduler on for this kernel (unless AMDC_SCHED=0).
     pub sched_opts: Option<String>,
+    /// Register-planning annotations ([`RegMark`]); empty for every kernel that does not plan its registers.
+    pub reg_plan: Vec<RegMark>,
 }
 
 /// Compile policy of a kernel (see `amdgpu-compiler/src/lib.rs`): which lowering options and which scheduler preset it gets.
@@ -1197,6 +1227,7 @@ impl FnBuilder {
                 compile_profile: None,
             lower_opts: Vec::new(),
             sched_opts: None,
+            reg_plan: Vec::new(),
             },
             expr_consts: Default::default(),
             tree: TreeBuilder::default(),
@@ -1486,6 +1517,48 @@ impl FnBuilder {
     pub fn agpr(&mut self, v: ValueId) -> ValueId {
         self.f.agpr.push(AgprMark { target: AgprTarget::Val(v), pin: None });
         v
+    }
+
+    // ---- register planning (RegMark; docs/weaver-regs.md) ----
+
+    /// HARD: keep `r` (its whole tuple) at arch VGPR `base`.
+    pub fn pin_vgpr_at(&mut self, r: RegRef, base: u32) {
+        self.f.reg_plan.push(RegMark::PinV { r, base });
+    }
+    /// HINT: let the members share registers when their lifetimes are disjoint.
+    pub fn reg_share(&mut self, rs: &[RegRef]) {
+        self.f.reg_plan.push(RegMark::Share(rs.to_vec()));
+    }
+    /// HARD: the members never share physical registers.
+    pub fn reg_separate(&mut self, rs: &[RegRef]) {
+        self.f.reg_plan.push(RegMark::Separate(rs.to_vec()));
+    }
+    /// HARD: arch-VGPR footprint cap of region `region` (a weave region or a stage name).
+    pub fn reg_cap(&mut self, region: &str, vgprs: u32) {
+        self.f.reg_plan.push(RegMark::Cap { region: region.to_string(), vgprs: Some(vgprs), agprs: None });
+    }
+    /// HARD: AGPR footprint cap of region `region`.
+    pub fn reg_cap_agpr(&mut self, region: &str, agprs: u32) {
+        self.f.reg_plan.push(RegMark::Cap { region: region.to_string(), vgprs: None, agprs: Some(agprs) });
+    }
+    /// The register buffers of one fragment (pairwise separate, placement reported).
+    pub fn reg_ring(&mut self, name: &str, bufs: &[RegRef]) {
+        self.f.reg_plan.push(RegMark::Ring { name: name.to_string(), bufs: bufs.to_vec() });
+    }
+    /// Opens a register-planning region (no code). Must be closed by `weave_region_end` in the same structural block.
+    pub fn weave_region_begin(&mut self, name: &str) {
+        self.push_stmt(Stmt::RegionMark { name: name.to_string(), begin: true });
+    }
+    /// Closes the innermost register-planning region.
+    pub fn weave_region_end(&mut self) {
+        self.push_stmt(Stmt::RegionMark { name: String::new(), begin: false });
+    }
+    /// `weave_region_begin(name)`, `f`, `weave_region_end()`.
+    pub fn weave_region<R>(&mut self, name: &str, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.weave_region_begin(name);
+        let r = f(self);
+        self.weave_region_end();
+        r
     }
 
     pub fn finish(mut self) -> Function {
@@ -2130,9 +2203,32 @@ fn expect_ptr(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
 }
 
 /// Structural, scope and type validation. Returns every problem found.
+/// Register-planning regions (`Stmt::RegionMark`): every begin has its end in the same structural block (loop / if arm / tile / stage).
+fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
+    let mut depth = 0i64;
+    let mut stack: Vec<(String, i64, usize)> = Vec::new();
+    for (idx, st) in f.stmts().iter().enumerate() {
+        match st {
+            Stmt::BeginLoop { .. } | Stmt::BeginIf { .. } | Stmt::TileProduce { .. } | Stmt::TileConsume { .. } | Stmt::StageBegin { .. } => depth += 1,
+            Stmt::EndLoop | Stmt::EndIf | Stmt::TileEnd | Stmt::StageEnd => depth -= 1,
+            Stmt::RegionMark { name, begin: true } => stack.push((name.clone(), depth, idx)),
+            Stmt::RegionMark { begin: false, .. } => match stack.pop() {
+                Some((n, d, at)) if d != depth => errs.push(format!("stmt {idx}: region `{n}` (opened at stmt {at}) is closed in another structural block")),
+                Some(_) => {}
+                None => errs.push(format!("stmt {idx}: weave_region_end without an open region")),
+            },
+            _ => {}
+        }
+    }
+    for (n, _, at) in stack {
+        errs.push(format!("stmt {at}: region `{n}` is never closed"));
+    }
+}
+
 pub fn verify(f: &Function) -> Vec<String> {
     let mut errs = Vec::new();
     check_var_slices(f, &mut errs);
+    check_region_marks(f, &mut errs);
 
     // Region stack: values visible in the current scope.
     let mut scopes: Vec<HashSet<ValueId>> = vec![HashSet::new()];

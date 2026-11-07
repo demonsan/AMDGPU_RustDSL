@@ -5,7 +5,7 @@
 //! are reserved. Spilling is not implemented on purpose: a kernel that does not
 //! fit is a compile error rather than a silent performance cliff.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::mir::*;
 
@@ -29,6 +29,14 @@ const V_RESERVED: usize = 1;
 const S_RESERVED: usize = 8;
 
 pub fn allocate(m: &MFunction) -> Result<Alloc, String> {
+    let a = allocate_any(m)?;
+    if m.reg_hints.active() {
+        crate::regplan::check(m, &a)?;
+    }
+    Ok(a)
+}
+
+fn allocate_any(m: &MFunction) -> Result<Alloc, String> {
     // First try the compact policy. If the kernel runs out of registers only because wide
     // tuples cannot find an aligned hole between scattered singles, retry with the singles
     // packed from the top of the file so the low registers stay available for tuples.
@@ -222,6 +230,8 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
     // tracked per register DWORD (the scheduler's effects model: lane writes, partial writers, in-place operands), so a
     // fragment built lane by lane stays live between its lane writes.
     let segs: Vec<Vec<(usize, usize)>> = if matches!(policy, Policy::TwoPhase) { precise_segments(m, &idx_of, &succs) } else { vec![Vec::new(); n] };
+    // --- register plan (MFunction::reg_hints; regplan.rs) ----------------
+    let plan = Plan::new(m);
     // --- linear scan -------------------------------------------------
     let mut phys = vec![u32::MAX; n];
     let mut used_v = vec![false; VGPR_COUNT];
@@ -262,14 +272,21 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
             let my: Vec<(usize, usize)> = if segs[r as usize].is_empty() { vec![(s, e)] } else { segs[r as usize].clone() };
             let width = c.dwords() as usize;
             let lo = if width == 1 { V_RESERVED } else { width };
+            let forbid = plan.forbidden(r, s, e, &start, &end, &phys, m);
             let mut found = None;
             let mut i = lo;
             while i + width <= VGPR_COUNT {
-                if i % width == 0 && (0..width).all(|k| occ[i + k].iter().all(|(os, oe)| my.iter().all(|(ms, me)| *oe < *ms || *me < *os))) {
+                let pin_ok = plan.pin(r).map_or(true, |b| b as usize == i);
+                if pin_ok && i % width == 0 && (0..width).all(|k| !forbid[i + k] && occ[i + k].iter().all(|(os, oe)| my.iter().all(|(ms, me)| *oe < *ms || *me < *os))) {
                     found = Some(i);
                     break;
                 }
                 i += 1;
+            }
+            if found.is_none() {
+                if let Some(b) = plan.pin(r) {
+                    return Err(format!("register plan: pin of {} at v{b} cannot be honoured (another value is live there, or a separate partner sits there)", plan.name(r)));
+                }
             }
             let slot = found.ok_or_else(|| {
                 // numeric lower bound: the largest number of dwords live at one position
@@ -318,7 +335,12 @@ fn allocate_policy(m: &MFunction, policy: Policy) -> Result<Alloc, String> {
                 true
             }
         });
-        let slot = find_slot(&used_v, c, singles_from_top).ok_or_else(|| {
+        let slot = if plan.active {
+            plan.slot(r, c, s, e, &used_v, &start, &end, &phys, m, singles_from_top)?
+        } else {
+            find_slot(&used_v, c, singles_from_top)
+        };
+        let slot = slot.ok_or_else(|| {
             let mut dwords = 0usize;
             let mut by_class = [0usize; 5];
             for (_, ar, ac) in &active {
@@ -1034,4 +1056,109 @@ pub fn check_reaching(m: &MFunction, a: &Alloc) -> Vec<String> {
         let _ = std::fs::write(path, report.join("\n"));
     }
     report
+}
+
+/// The register plan as the allocator consumes it (regplan.rs checks the result).
+struct Plan {
+    active: bool,
+    pins: HashMap<VReg, u32>,
+    /// vreg -> the vregs it must never share registers with (separate groups and rings)
+    sep: HashMap<VReg, Vec<VReg>>,
+    /// vreg -> the vregs it should share registers with (hint)
+    share: HashMap<VReg, Vec<VReg>>,
+    names: HashMap<VReg, String>,
+}
+
+impl Plan {
+    fn new(m: &MFunction) -> Plan {
+        let h = &m.reg_hints;
+        let mut p = Plan { active: h.active(), pins: HashMap::new(), sep: HashMap::new(), share: HashMap::new(), names: h.names.clone() };
+        if !p.active {
+            return p;
+        }
+        for (r, b) in &h.pins_v {
+            p.pins.insert(m.canon(*r), *b);
+        }
+        for g in h.separate.iter().chain(h.rings.iter().map(|x| &x.1)) {
+            for a in g {
+                for b in g {
+                    if m.canon(*a) != m.canon(*b) {
+                        p.sep.entry(m.canon(*a)).or_default().push(m.canon(*b));
+                    }
+                }
+            }
+        }
+        for g in &h.share {
+            for a in g {
+                for b in g {
+                    if m.canon(*a) != m.canon(*b) {
+                        p.share.entry(m.canon(*a)).or_default().push(m.canon(*b));
+                    }
+                }
+            }
+        }
+        p
+    }
+    fn pin(&self, r: VReg) -> Option<u32> {
+        if self.active {
+            self.pins.get(&r).copied()
+        } else {
+            None
+        }
+    }
+    fn name(&self, r: VReg) -> String {
+        self.names.get(&r).cloned().unwrap_or_else(|| format!("r{r}"))
+    }
+    /// VGPR slots `r` (live [s, e]) may not use: other pins live at the same time, assigned separate partners.
+    #[allow(clippy::too_many_arguments)]
+    fn forbidden(&self, r: VReg, s: usize, e: usize, start: &[usize], end: &[usize], phys: &[u32], m: &MFunction) -> Vec<bool> {
+        let mut f = vec![false; VGPR_COUNT];
+        if !self.active {
+            return f;
+        }
+        let mut block = |base: u32, w: u32| {
+            for k in base..(base + w).min(VGPR_COUNT as u32) {
+                f[k as usize] = true;
+            }
+        };
+        for (&p, &b) in &self.pins {
+            if p != r && start[p as usize] != usize::MAX && start[p as usize] <= e && s <= end[p as usize] && m.vreg_class(p).is_vector() {
+                block(b, m.vreg_class(p).dwords());
+            }
+        }
+        if let Some(ps) = self.sep.get(&r) {
+            for &q in ps {
+                let pq = phys[q as usize];
+                if pq != u32::MAX && m.vreg_class(q).is_vector() {
+                    block(pq, m.vreg_class(q).dwords());
+                }
+            }
+        }
+        f
+    }
+    /// Linear-scan slot for `r` under the plan: the exact pin, else a free share partner's registers, else the first free slot avoiding the
+    /// forbidden ranges. Err for a pin that cannot be honoured.
+    #[allow(clippy::too_many_arguments)]
+    fn slot(&self, r: VReg, c: RClass, s: usize, e: usize, used: &[bool], start: &[usize], end: &[usize], phys: &[u32], m: &MFunction, from_top: bool) -> Result<Option<usize>, String> {
+        let forbid = self.forbidden(r, s, e, start, end, phys, m);
+        let mask: Vec<bool> = used.iter().zip(&forbid).map(|(a, b)| *a || *b).collect();
+        let w = c.dwords() as usize;
+        let free = |i: usize| i % w == 0 && i + w <= VGPR_COUNT && (i..i + w).all(|k| !mask[k]);
+        if let Some(b) = self.pins.get(&r) {
+            let b = *b as usize;
+            if free(b) {
+                return Ok(Some(b));
+            }
+            return Err(format!("register plan: pin of {} ({c:?}) at v{b} cannot be honoured: the registers are taken by a value live at the same time or by a separate partner", self.name(r)));
+        }
+        if let Some(ps) = self.share.get(&r) {
+            for &q in ps {
+                let pq = phys[q as usize];
+                if pq != u32::MAX && m.vreg_class(q) == c && free(pq as usize) {
+                    return Ok(Some(pq as usize));
+                }
+            }
+        }
+        Ok(find_slot(&mask, c, from_top))
+    }
 }
