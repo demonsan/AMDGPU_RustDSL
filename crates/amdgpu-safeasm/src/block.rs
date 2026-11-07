@@ -69,6 +69,23 @@ pub struct AsmBlock {
 }
 
 impl AsmBlock {
+    /// A block from its parts - for the DSL IR text parser only (`amdgpu_dsl::ir_text`). It bypasses `Seq::finish`'s hazard verifier; the
+    /// compiler re-verifies every block before lowering (pin_check / hazard passes), so a hand-edited block cannot reach the hardware unchecked.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        name: String,
+        regs: Vec<AClass>,
+        alias: Vec<(u32, u32, u8)>,
+        insts: Vec<AInst>,
+        inputs: Vec<AsmPort>,
+        outputs: Vec<AsmPort>,
+        exit_in_flight: Vec<(u32, u32)>,
+        loop_body: bool,
+        pinned: bool,
+    ) -> AsmBlock {
+        AsmBlock { name, regs, alias, insts, inputs, outputs, exit_in_flight, loop_body, pinned }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
