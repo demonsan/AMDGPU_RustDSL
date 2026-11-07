@@ -862,6 +862,9 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
         let hi = b.bind_i32(ev(ok).eq(1).select_i32(ev(yc), ev(y0)));
         let qt = b.read_first_lane(qt);
         let hi = b.read_first_lane(hi);
+        // the logical ids are in range by construction; the clamps (SALU, once) state it for the verifier
+        let qt = b.bind_i32(ev(qt).max(0).min(ev(xq) - 1));
+        let hi = b.bind_i32(ev(hi).max(0).min(ev(hh) - 1));
         (qt, hi)
     } else {
         (b.let_(amdgpu_dsl::Op::WorkgroupIdX), b.let_(amdgpu_dsl::Op::WorkgroupIdY))
