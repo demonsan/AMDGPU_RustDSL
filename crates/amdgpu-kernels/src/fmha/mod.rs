@@ -133,8 +133,26 @@ impl KvRing3 {
         }
     }
 
+    /// The copies of the tile at `key0` into `slot` that `role` produces, as emission units (buffer form: one unit per DMA instruction). `None` for
+    /// the VGPR K-scale staging (`_t128`), which keeps the direct form.
+    pub fn stage_units<'s>(&'s self, role: Role, key0: &I32, slot: &SlotIdx) -> Option<Units<'s>> {
+        match (role, &self.kdc, &self.buf) {
+            (Role::A, KdCopy3::Dma(kd), Some((kb, _))) => {
+                let kdb = self.kd_buf.as_ref()?;
+                let mut u = kd.issue_buffer_units(kdb, key0, &self.kd.at(slot));
+                u.append(self.kdma.issue_buffer_units(kb, key0, &self.ks.at(slot)), &[]);
+                Some(u)
+            }
+            (Role::B, _, Some((_, vb))) => Some(self.vdma.issue_buffer_units(vb, key0, &self.vs.at(slot))),
+            _ => None,
+        }
+    }
     /// The copies of the tile at `key0` into `slot` that `role` produces (as `KvRing::stage`).
     pub fn stage(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<ValueId> {
+        if let Some(u) = self.stage_units(role, key0, slot) {
+            Weaver::new(u).phase("kv.stage").seq().emit(b);
+            return None;
+        }
         match (role, &self.kdc) {
             (Role::A, KdCopy3::Dma(kd)) => {
                 match &self.kd_buf {
@@ -384,8 +402,17 @@ impl PipeBody for AttnBody3<'_> {
         if self.lazy_bias {
             // no seed needed: the initial reference (bias words 0x4800: b = 64) puts the first tile's max far above the threshold, so tile 0
             // always rebases
-            self.bias_next = Some(self.sm.decide_lazy(b, &s, &o, mask.as_ref()));
-            self.p = self.sm.convert(b, &s, mask.as_ref(), 0, 4);
+            let (nb, pw): (Out<Opnd>, Out<Vec<ValueId>>) = (Out::new(), Out::new());
+            {
+                let me: &Self = self;
+                let (nb2, pw2, m1, m2) = (nb.clone(), pw.clone(), mask.as_ref(), mask.as_ref());
+                let mut u = Units::new();
+                let d = u.add("softmax.decide", UnitClass::Branch, Hint::Anchor, &[], move |b| nb2.set(me.sm.decide_lazy(b, &s, &o, m1)));
+                u.add("softmax.convert", UnitClass::Valu, Hint::Filler, &[d], move |b| pw2.set(me.sm.convert(b, &s, m2, 0, 4)));
+                Weaver::new(u).phase("v_phase").seq().emit(b);
+            }
+            self.bias_next = Some(nb.get());
+            self.p = pw.get();
             return;
         }
         let nb = self.sm.decide(b, &s, &o, mask.as_ref());
@@ -401,11 +428,12 @@ impl PipeBody for AttnBody3<'_> {
         if self.setprio {
             b.set_prio(1);
         }
-        self.pv(b, &t.cur, &w);
+        let s = self.s.expect("S");
+        let mut u = self.pv_units(&t.cur, w);
         if t.staged {
-            let s = self.s.expect("S");
-            self.qk(b, &t.next, QkOut::Vars(&s), bias);
+            u.append(self.qk_units(&t.next, s, bias), &[]);
         }
+        Weaver::new(u).phase("m_phase").seq().emit(b);
     }
     fn window(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         let r = self.ring;
@@ -416,14 +444,31 @@ impl PipeBody for AttnBody3<'_> {
         } else {
             (Opnd::Val(self.sm.decide_deferred(b, &s, &o, mask.as_ref())), false)
         };
-        let next = t.staged.then(|| (r.kpart.at(b, &r.ks.at(&t.next)), r.kdpart.at(b, &r.kd.at(&t.next))));
-        let mut w = Vec::with_capacity(16);
-        for i in 0..4usize {
-            w.extend(self.sm.convert(b, &s, mask.as_ref(), i, i + 1));
-            if let Some((k, kd)) = &next {
-                self.qk_block(b, &QkOut::Vars(&s), nb, k, kd, i);
+        // the window: conversion chunk i, then QK block i of the next tile (units, woven in this explicit order)
+        let mut u = Units::new();
+        let parts: Out<(LdsSlotPart, LdsSlotPart)> = Out::new();
+        let setup = t.staged.then(|| {
+            let (p2, nx) = (parts.clone(), t.next.clone());
+            u.add("window.qk.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| p2.set((r.kpart.at(b, &r.ks.at(&nx)), r.kdpart.at(b, &r.kd.at(&nx)))))
+        });
+        let chunks: Vec<Out<Vec<ValueId>>> = (0..4).map(|_| Out::new()).collect();
+        {
+            let me: &Self = self;
+            for i in 0..4usize {
+                let (c, m) = (chunks[i].clone(), mask.as_ref());
+                u.add(format!("window.convert{i}"), UnitClass::Valu, Hint::Filler, &[], move |b| c.set(me.sm.convert(b, &s, m, i, i + 1)));
+                if let Some(st) = setup {
+                    let p3 = parts.clone();
+                    u.add(format!("window.qk.block{i}"), UnitClass::Mfma, Hint::Skeleton, &[st], move |b| {
+                        p3.with(|(k, kd)| {
+                            me.qk_block(b, &QkOut::Vars(&s), nb, k, kd, i);
+                        });
+                    });
+                }
             }
+            Weaver::new(u).phase("window").seq().emit(b);
         }
+        let w: Vec<ValueId> = chunks.iter().flat_map(|c| c.get()).collect();
         if !lazy {
             if let Opnd::Val(v) = nb {
                 self.sm.commit_bias(b, v);

@@ -235,3 +235,69 @@ M{scatter: slot_mapping → 页表位置, 布局 = cache 布局}
 3. **组合靠 boundary 代价类 C0–C4 与 orient 搜索**。片上交接优先找 C0：寄存器改名，K 置换由另一个操作数吸收。
 4. **算子图是骨架生成器的输入，不是新 IR**。agent 在图上选切分，拿到可直接 strict verify 的骨架，再手工编排。
 5. **先 md5 不变地重写现有 kernel，再扩展**。融合 MLP → GEMM → FMHA 依次 stage 化，作为接口设计的验收。
+
+---
+
+## 7. 三层结构：Stage / Weaver / 后端（已批准，实施中）
+
+第 2.2 节说"编排留在 kernel"。这一节把它落成接口：stage 不再直接发射指令，而是返回**发射单元**；kernel 用 **weaver** 写编排；后端（寄存器规划、调度 pass）作为 weave 区域上的可选策略。
+
+### 7.1 第一层：stage = 编译期按形状实例化 → 发射单元
+
+stage 的参数（形状、dtype、slot、tile 号等）在调用点给定。实例化后得到一组 `Unit`（`crates/amdgpu-tile/src/weave.rs`），每个单元带：
+
+| 字段 | 含义 |
+|---|---|
+| `emit` | 一个闭包：发射一小段自洽的 IR（一个 QK 块、一个 PV 块、一条 DMA 指令……） |
+| `deps` | 必须先发射的单元（同一组内的索引）；跨单元传值用 `Out<T>`（生产者发射时写入，消费者发射时读取） |
+| `class` | 资源类：`Mfma` / `Valu` / `LdsRead` / `Dma` / `Salu` / `Branch` / `Setup` |
+| `latency` | 名义的发射→结果延迟（周期） |
+| `regs` | 寄存器画像：live-in / live-out / temps（dword，估计值），结果能否放 AGPR |
+| `hint` | 交错提示：`Skeleton`（骨架，如 MFMA）/ `Filler`（可填缝的独立工作）/ `LatencySensitive`（宜早发：读、拷贝）/ `Anchor`（相对阶段边界固定：setup、分支） |
+
+现已改成单元形式的件（P1 第一步，按声明顺序发射，与原代码逐字节相同）：
+
+| 件 | 单元 |
+|---|---|
+| QK（写入 S 变量） | `qk.setup`（slot 绑定的 K / K-scale 分区；`biasonce` 的那一条 bias MFMA）、`qk.block{0..3}`（K 片段 + scale 字 + 两条缩放 MFMA）、`qk.end`（无 IR） |
+| PV | `pv.setup`（V 分区、两个 P 片段）、`pv.rowsum`（两条 smfmac 行和）、`pv.h{hh}e{e}`（一个 tr 读 + 一条 MFMA，8 个） |
+| buffer 形式的 K / V / K-scale DMA | `dma.<buf>.setup`（soffset、M0 的 readfirstlane）、`dma.<buf>.{q}`（每条 DMA 指令一个，各自在 slot 的写标记下） |
+| softmax | `decide`（含惰性回滚分支，整体一个 `Branch` 单元）、`convert`（P 字） |
+
+### 7.2 第二层：weaver
+
+```rust
+Weaver::new(units)            // 一个或多个 stage 的单元（Units::append 合并，可加跨组依赖）
+    .phase("vs128.m_phase")   // 标签：报告 / 错误 / 后端的区域名
+    .order(ids)               // 显式顺序：权威
+    // 或 .seq()               // 声明顺序
+    // 或 .spread(skel, fillers, per)  // 可选的自动策略：骨架单元之间均匀插入填充单元
+    .emit(b);                 // 先检查：每个单元恰好一次、依赖在前（拓扑序），再发射
+```
+
+- **显式顺序是权威的**。自动策略（`spread`，以后的调度器策略）只是生成一个顺序，同样要通过拓扑检查。
+- **每个形状的参数留在调用点**：选哪个顺序、哪个策略、每个骨架后插几个填充，库不做决定。
+- **输出是普通的 region IR**：与今天一样走 gpu_verify（含 GV-STAGE）、lowering、调度、寄存器分配。weave 只决定 IR 中语句的先后。
+- **phase / role**：weave 发生在 `Pipeline` 的阶段回调里（`m_phase` / `v_phase` / `window`），role 仍由 `Roles::each` 给出。weaver 不跨阶段边界（barrier）移动单元。
+
+### 7.3 第三层：后端
+
+- 寄存器规划（backend-llvm-tail，分支 `weaver-regs`）：
+  - pin（`pin_vgpr_at` / `pin_agpr*`）；
+  - 复用提示 `reg_share` 与硬分离 `reg_separate`；
+  - 区域上限 `reg_cap(region, vgprs)`，按 weave 区域 / stage 名，按分配后的真实占用检查；
+  - 寄存器环 `reg_ring`；
+  - `region_report` 给出每区域的真实峰值。
+
+  单元的 `regs` 估计与它对照。
+- 调度 pass（sched）：现有的 `ldsink` / `wsink` / `hzfill` / `ovl` / search 改造成 weave 区域上的可选策略。kernel 显式顺序给出的区域保持不变，或只做后处理。
+
+### 7.4 `_vs128` 新旧对照
+
+| 旧（直接发射） | 新（单元 + weaver） |
+|---|---|
+| `m_phase`：`set_prio(1)`；`self.pv(b, cur, &w)`；`if staged { self.qk(b, next, Vars(&s), bias) }` | `set_prio(1)`；`let mut u = self.pv_units(cur, w); if staged { u.append(self.qk_units(next, s, bias), &[]) }`；`Weaver::new(u).phase("vs128.m_phase").seq().emit(b)` |
+| `v_phase`：`set_prio(0)`；`decide_lazy`；`convert(0..4)` | `set_prio(0)`；单元 `decide`、`convert`；`Weaver::new(..).phase("vs128.v_phase").seq().emit(b)` |
+| stage：`kdma.issue_buffer(...)`、`vdma.issue_buffer(...)` | `issue_buffer_units(...)`：setup + 每条 DMA 一个单元，可被 weave 进 QK 的 MFMA 之间（例如以前试过的 vlate），而不用改 stage 代码 |
+
+验收：`.seq()` 的 weave 与旧代码**汇编逐字节相同**（全部出厂 kernel 的 md5 对照）。之后，同一份单元可以用别的顺序 weave 出实验变体，而 stage 代码不变。
