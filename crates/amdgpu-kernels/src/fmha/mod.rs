@@ -609,7 +609,7 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
     fn prelude(&mut self, b: &mut FnBuilder) -> FmhaCx {
         b.compile_profile(CompileProfile::Vs128);
         let io = declare_io(b, 256, false);
-        let blk = block3(&io, b, 8);
+        let blk = block3_x(&io, b, 8, self.0 & 64 != 0);
         let roles = Roles::split(b, &blk.lane, 4);
         let mut ring = KvRing3::new(b, &io, &blk, &roles, 2);
         ring.enable_buffer_dma(b);
@@ -617,7 +617,7 @@ impl skeleton_vs128::Vs128Slots for Vs128Slots {
         let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, blk.nkv, blk.kv_len, 128, Ext::ka(0x110).ceil_div(128));
         // every stage reads through a range-checked buffer descriptor: no clamp of the next tile's key
         pipe.key_unclamped = true;
-        pipe.ablate = self.0;
+        pipe.ablate = self.0 & 63;
         let lut = blk.lut_copy(b);
         FmhaCx { io, blk, roles, ring, pipe: Some(pipe), lut }
     }
@@ -825,8 +825,39 @@ pub fn declare_io(b: &mut FnBuilder, rows_per_block: i64, kvsplit: bool) -> Fmha
 /// `FmhaIo::block` with the Q fragments loaded through a TiledCopy: the B operand of the scaled 32x32x64 atom over the lane's (clamped) query row, two
 /// k-groups of 64 bytes (placements 0 / 64): one pointer (row + 16 (lane >> 5)) and four `global_load_dwordx4` with immediates 0 / 32 / 64 / 96.
 pub fn block3(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32) -> FmhaBlock {
-    let qtile = b.let_(amdgpu_dsl::Op::WorkgroupIdX);
-    let hidx = b.let_(amdgpu_dsl::Op::WorkgroupIdY);
+    block3_x(io, b, rows_lg, false)
+}
+
+/// `xcd`: the vendor's XCD-aware block order. Workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
+/// with the plain order the 8 query tiles of one head land on 8 different XCDs and every XCD streams the same K / V from memory. The remap
+/// gives XCD x the contiguous logical range [x N / 8, (x + 1) N / 8) of the (query tile, head) plane of the batch (N = tiles x heads), so the
+/// blocks that share K / V share an L2. Applied when N % 8 == 0 and H <= 32 (the vendor's conditions; the head is recovered by at most 32
+/// compare-subtract steps), the plain order otherwise.
+pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> FmhaBlock {
+    let (qtile, hidx) = if xcd {
+        let x0 = b.let_(amdgpu_dsl::Op::WorkgroupIdX);
+        let y0 = b.let_(amdgpu_dsl::Op::WorkgroupIdY);
+        let hh = b.let_(amdgpu_dsl::Op::KernargI32 { offset: 0x140 });
+        let xq = b.bind_i32((io.s_len.clone() + ((1 << rows_lg) - 1)).lshr(rows_lg));
+        let n = b.bind_i32(ev(xq) * ev(hh));
+        let ok = b.bind_cond((ev(n) & 7).eq(0) & ev(hh).le(32));
+        let l = b.bind_i32(ev(y0) * ev(xq) + ev(x0));
+        let mut r = b.bind_i32((ev(l) & 7) * ev(n).lshr(3) + ev(l).lshr(3));
+        let mut y = b.c_i32(0);
+        for _ in 0..32 {
+            let ge = b.bind_cond(ev(r).ge(ev(xq)));
+            r = b.bind_i32(ev(ge).select_i32(ev(r) - ev(xq), ev(r)));
+            y = b.bind_i32(ev(ge).select_i32(ev(y) + 1, ev(y)));
+        }
+        // clamps (no-ops for N % 8 == 0, H <= 32) bound the logical ids for the verifier
+        let rc = b.bind_i32(ev(r).lt(ev(xq)).select_i32(ev(r), ev(xq) - 1));
+        let yc = b.bind_i32(ev(y).lt(ev(hh)).select_i32(ev(y), ev(hh) - 1));
+        let qt = b.bind_i32(ev(ok).select_i32(ev(rc), ev(x0)));
+        let hi = b.bind_i32(ev(ok).select_i32(ev(yc), ev(y0)));
+        (qt, hi)
+    } else {
+        (b.let_(amdgpu_dsl::Op::WorkgroupIdX), b.let_(amdgpu_dsl::Op::WorkgroupIdY))
+    };
     let zz = b.let_(amdgpu_dsl::Op::WorkgroupIdZ);
     let lane = Lane::new(b);
     let kv_all = b.bind_i32(io.kv_len.clone());
