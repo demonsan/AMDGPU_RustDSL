@@ -12,15 +12,13 @@ fn build(declare: bool) -> Function {
     if declare {
         b.declare_region("hot", true, "ldsink=1");
     }
-    let c3 = b.c_i32(3);
-    let c4 = b.c_i32(4);
-    let x = b.add_i32(c3, c4); // region 0
-    let y = b.weave("hot", |b| {
-        let t = b.add_i32(x, c3);
+    b.barrier(); // region 0
+    b.weave("hot", |b| {
+        b.barrier();
         // an undeclared scope is transparent: its instructions stay in the enclosing region
-        b.weave("plain", |b| b.add_i32(t, c4))
+        b.weave("plain", |b| b.barrier());
     });
-    let _z = b.add_i32(y, c3); // region 0 again
+    b.barrier(); // region 0 again
     b.finish()
 }
 
@@ -29,7 +27,7 @@ fn the_declared_region_is_stamped_on_its_scope_and_restored_after_it() {
     let f = build(true);
     assert!(f.body().iter().any(|n| matches!(n, Node::Weave { name, .. } if name == "hot")));
     let r = regions_of(&f);
-    assert!(r.iter().any(|&x| x == 1), "something is lowered inside the scope: {r:?}");
+    assert_eq!(r.iter().filter(|&&x| x == 1).count(), 2, "both barriers of the scope (the nested undeclared one included) carry the region: {r:?}");
     assert!(r.iter().any(|&x| x == 0), "and something outside");
     // 0..0 1..1 0..0: one contiguous run of the region
     let first = r.iter().position(|&x| x == 1).unwrap();

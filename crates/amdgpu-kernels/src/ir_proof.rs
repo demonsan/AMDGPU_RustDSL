@@ -240,6 +240,8 @@ fn exec_nodes(nodes: &[Node], lanes: &mut [Ctx<'_>], filter: &[bool]) {
             }
             // a pipeline stage (fusion-g) is a boundary contract checked elsewhere (GV-STAGE): transparent to the functional execution
             Node::Stage { body, .. } => exec_nodes(body, lanes, filter),
+            // a weave region scope only steers the scheduler: transparent to the functional execution
+            Node::Weave { body, .. } => exec_nodes(body, lanes, filter),
         }
     }
 }
