@@ -151,7 +151,12 @@ pub fn registry() -> &'static [StageDesc] {
     &REGISTRY
 }
 
-static REGISTRY: [StageDesc; 12] = [
+static REGISTRY: [StageDesc; 17] = [
+    StageDesc { key: "move.row_load", prim: Prim::M, params: &[("n", "row length"), ("dtype", "element type")], doc: "one row per wave into registers (16-byte buffer loads, kept packed)" },
+    StageDesc { key: "reduce.row_sumsq", prim: Prim::R, params: &[("op", "reduction")], doc: "sum of squares over a wave-held row -> rsqrt scalar (RMSNorm)" },
+    StageDesc { key: "quant.fp8_row", prim: Prim::Q, params: &[("format", "fp8 format"), ("granularity", "scale granularity"), ("scale", "scale type"), ("map", "elementwise map before quantization")], doc: "row amax -> scale -> fp8 pack" },
+    StageDesc { key: "move.row_store", prim: Prim::M, params: &[("dtype", "stored types")], doc: "packed row + its scale to global memory" },
+    StageDesc { key: "merged", prim: Prim::A, params: &[], doc: "several instances in one region (stage::merge); members recorded as parameters" },
     StageDesc { key: "move.ab_stage", prim: Prim::M, params: &[("slots", "ring slots")], doc: "GEMM A / B tile copies into an LDS ring slot (one unit per DMA)" },
     StageDesc { key: "mma.blockscale_tile", prim: Prim::A, params: &[("atom", "MMA atom"), ("wave_tile", "rows x cols per wave"), ("staged", "reload the next tile")], doc: "the register tile of a blockscale GEMM with in-place fragment reloads" },
     StageDesc { key: "move.lds_image", prim: Prim::M, params: &[("bytes", "image size"), ("pitch", "row pitch")], doc: "a whole global image into an LDS tile by LDS-direct DMA (weight-stationary prologue)" },
