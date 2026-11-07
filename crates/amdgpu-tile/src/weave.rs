@@ -215,12 +215,21 @@ impl<'a> Weaver<'a> {
         ord
     }
     /// Checks the order (a permutation of the units and a topological order of their dependencies) and emits.
+    /// A labelled weave is wrapped in a weave region of that name (no code): the backend's register caps / reports and the scheduler's per-region
+    /// strategies key on it (docs/weaver-regs.md). Units with internal control flow (class `Branch`) stay inside the region.
     pub fn emit(self, b: &mut FnBuilder) {
         let ord = self.plan();
+        let label = self.label.clone();
         let mut slots: Vec<Option<Unit<'a>>> = self.units.v.into_iter().map(Some).collect();
+        if !label.is_empty() {
+            b.weave_region_begin(&label);
+        }
         for i in ord {
             let u = slots[i].take().expect("weave: unit emitted twice");
             (u.emit)(b);
+        }
+        if !label.is_empty() {
+            b.weave_region_end();
         }
     }
 }
