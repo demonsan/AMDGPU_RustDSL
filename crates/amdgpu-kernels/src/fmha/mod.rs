@@ -846,11 +846,13 @@ pub fn block3_x(io: &FmhaIo, b: &mut FnBuilder, rows_lg: i32, xcd: bool) -> Fmha
         let ok = b.bind_i32((ev(n) & 7).eq(0).select_i32(ev(hh).le(32).select_i32(1, 0), 0));
         let l = b.bind_i32(ev(y0) * ev(xq) + ev(x0));
         let mut r = b.bind_i32((ev(l) & 7) * ev(n).lshr(3) + ev(l).lshr(3));
+        // head = M / X by binary long division (H <= 32: 5 steps)
         let mut y = b.c_i32(0);
-        for _ in 0..32 {
-            let y2 = b.bind_i32(ev(r).ge(ev(xq)).select_i32(ev(y) + 1, ev(y)));
-            r = b.bind_i32(ev(r).ge(ev(xq)).select_i32(ev(r) - ev(xq), ev(r)));
-            y = y2;
+        for bit in [16i32, 8, 4, 2, 1] {
+            let xb = b.bind_i32(ev(xq) * bit);
+            let take = b.bind_i32(ev(r).ge(ev(xb)).select_i32(1, 0));
+            y = b.bind_i32(ev(y) + ev(take) * bit);
+            r = b.bind_i32(ev(r) - ev(take) * ev(xb));
         }
         // clamps (no-ops for N % 8 == 0, H <= 32) bound the logical ids for the verifier
         let rc = b.bind_i32(ev(r).lt(ev(xq)).select_i32(ev(r), ev(xq) - 1));
