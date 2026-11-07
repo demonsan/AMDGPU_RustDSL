@@ -115,7 +115,8 @@ pub struct Pipeline {
     /// `TwoPhaseOffset`: the next tile's key without the clamp to the last tile (inside the loop t + 1 <= nkv - 1 holds; valid only when
     /// every stage reads through a range-checked buffer descriptor, so the verifier needs no clamp for the bounds)
     pub key_unclamped: bool,
-    /// EXPERIMENT (timing upper bounds, wrong results): bit 1 no mid barrier, 2 no end barrier, 4 no mid vm wait, 8 no copies in the loop
+    /// EXPERIMENT (timing upper bounds, wrong results): bit 1 no mid barrier, 2 no end barrier, 4 no mid vm wait, 8 no copies in the loop,
+    /// 16 no group-A copies (K, K-scale), 32 no group-B copies (V)
     pub ablate: u8,
 }
 
@@ -315,7 +316,8 @@ impl Pipeline {
                 };
                 self.prebind(b, &t);
                 let key_n = staged.then(|| if self.key_unclamped { b.let_i32((varx(it) + 1) << self.lg()) } else { b.let_i32(nn << self.lg()) });
-                if let (Some(k), false) = (&key_n, self.ablate & 8 != 0) {
+                let skip = self.ablate & 8 != 0 || (self.ablate & 16 != 0 && role == Role::A) || (self.ablate & 32 != 0 && role == Role::B);
+                if let (Some(k), false) = (&key_n, skip) {
                     body.stage(b, role, k, &t.next);
                 }
                 body.v_phase(b, role, &t);
