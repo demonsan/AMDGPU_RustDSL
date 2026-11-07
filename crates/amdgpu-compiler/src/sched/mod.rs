@@ -19,6 +19,7 @@ pub mod model;
 pub mod order;
 pub mod ldahead;
 pub mod phase;
+pub mod region;
 pub mod slotfill;
 pub mod sim;
 pub mod verify;
@@ -62,11 +63,13 @@ pub struct Options {
     pub ldahead32: usize,
     /// `wsink` (sched/ldahead.rs): sink the kernel's EXPLICIT `s_waitcnt lgkmcnt(n)` down past the compute that does not need them, so the MFMAs in front of a closing `wait_lds(0)` get the counted waits of the scoreboard
     pub waitsink: bool,
+    /// Weave regions (`regions[id - 1]`, `MInst::region` = id): per-region strategies, see `sched::region`. Empty = the scheduler is byte-identical to the region-less one.
+    pub regions: Vec<region::RegionSpec>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false }
+        Options { reorder: true, alu_across_barrier: false, xbar_only: None, drain_only: false, cfg_cleanup: true, only_block: None, max_vgprs: 240, verify: true, stats: false, ldshoist: false, hoist_chain: false, hoist_dist: 64, slotfill: false, ldahead: 0, ldslack: 0, ldsink: 0, ldahead32: 0, waitsink: false, regions: Vec::new() }
     }
 }
 
@@ -97,6 +100,7 @@ impl Options {
                 let t = t.trim();
                 match t {
                     "rewait" => o.reorder = false,
+                    "reorder" => o.reorder = true,
                     "xbar" => o.alu_across_barrier = true,
                     "noverify" => o.verify = false,
                     "stats" => o.stats = true,
@@ -173,14 +177,22 @@ fn apply_perm(insts: &[MInst], perm: &[usize]) -> Vec<MInst> {
 
 /// Reorder every basic block with the list scheduler (verified).
 pub(crate) fn schedule_blocks(m: &mut MFunction, o: &Options, stats: &mut Stats) -> Result<(), String> {
-    if !o.reorder {
+    if !o.reorder && !o.any_region(|r| r.reorder) {
         return Ok(());
     }
         let lv = liveness::compute(m);
         for bi in 0..m.blocks.len() {
             stats.blocks += 1;
             let insts = m.blocks[bi].insts.clone();
+            let regional = region::has_regions(o, &insts);
+            if !o.reorder && !regional {
+                continue;
+            }
             if insts.len() < 2 || o.only_block.as_ref().map_or(false, |x| !x.contains(&bi)) {
+                continue;
+            }
+            if regional {
+                schedule_block_runs(m, bi, o, &lv, stats)?;
                 continue;
             }
             // Explicit partial waits count outstanding operations by program order: do not touch.
@@ -207,6 +219,57 @@ pub(crate) fn schedule_blocks(m: &mut MFunction, o: &Options, stats: &mut Stats)
     Ok(())
 }
 
+/// A block with weave regions: every maximal run of one region is scheduled by itself with the region's options (an authored / `rewait` run keeps its order); the live sets at the ends of
+/// a run come from the block's liveness, so the register-pressure model stays exact. Nothing moves across a region boundary.
+fn schedule_block_runs(m: &mut MFunction, bi: usize, o: &Options, lv: &liveness::Liveness, stats: &mut Stats) -> Result<(), String> {
+    let insts = m.blocks[bi].insts.clone();
+    let n = insts.len();
+    let term = m.blocks[bi].term.clone();
+    let xb = o.alu_across_barrier || o.xbar_only == Some(bi);
+    // live sets before each instruction (the same rules as `liveness::compute`: any destination write kills)
+    let mut live: std::collections::HashSet<VReg> = lv.live_out[bi].clone();
+    let mut before: Vec<std::collections::HashSet<VReg>> = vec![std::collections::HashSet::new(); n + 1];
+    before[n] = live.clone();
+    for i in (0..n).rev() {
+        if let Some(d) = insts[i].dst {
+            live.remove(&m.canon(d));
+        }
+        for r in insts[i].uses() {
+            live.insert(m.canon(r));
+        }
+        before[i] = live.clone();
+    }
+    let ro = o.region_options();
+    let mut out: Vec<MInst> = Vec::with_capacity(n);
+    for (lo, hi, rid) in region::runs(&insts) {
+        let opt = &ro[region::region_index(o, rid)];
+        let run: Vec<MInst> = insts[lo..hi].to_vec();
+        // explicit partial waits count outstanding operations by program order; markers belong to the phase pass
+        if !opt.reorder || run.len() < 2 || run.iter().any(|i| matches!(i.op, MOp::SWaitLgkm | MOp::SWaitVm) && i.imm != 0) || phase::has_markers(&run) {
+            if opt.reorder {
+                stats.skipped += 1;
+            }
+            out.extend(run);
+            continue;
+        }
+        let t_run = if hi == n { term.clone() } else { Term::Endpgm };
+        let g = depgraph::build(m, &run, &t_run, xb);
+        let r = list::schedule_best(m, &run, &g, &before[lo], &before[hi], opt.max_vgprs as i64, false);
+        if o.verify {
+            verify::check_perm(m, &run, &r.perm, &t_run, xb).map_err(|e| format!("schedule verification failed in block {bi} (region {rid}): {e}"))?;
+        }
+        stats.scheduled += 1;
+        stats.moved += r.perm.iter().enumerate().filter(|(k, p)| *k != **p).count();
+        stats.est_before += r.est_before as u64;
+        stats.est_after += r.est_after as u64;
+        stats.peak_before = stats.peak_before.max(r.peak_before);
+        stats.peak_after = stats.peak_after.max(r.peak_after);
+        out.extend(apply_perm(&run, &r.perm));
+    }
+    m.blocks[bi].insts = out;
+    Ok(())
+}
+
 /// Run the scheduling pass over the whole function.
 pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
     let mut stats = Stats::default();
@@ -216,13 +279,13 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
     waits::DRAIN_ONLY.store(o.drain_only, std::sync::atomic::Ordering::Relaxed);
     waits::strip_auto_waits(m);
     cfg::dce_dead_selects(m);
-    if o.ldshoist {
+    if o.any_region(|r| r.ldshoist) {
         let n = hoist::run(m, o);
         if o.stats {
             eprintln!("ldshoist: {n} loads hoisted");
         }
     }
-    if o.slotfill {
+    if o.any_region(|r| r.slotfill) {
         let n = slotfill::run(m, o)?;
         if o.stats {
             eprintln!("slotfill: {n} instructions moved");
@@ -234,13 +297,13 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
         eprintln!("phase: {phased} instructions moved");
     }
     schedule_blocks(m, o, &mut stats)?;
-    if o.waitsink {
+    if o.any_region(|r| r.waitsink) {
         let n = ldahead::sink_explicit_waits(m, o);
         if o.stats {
             eprintln!("wsink: {n} explicit waits moved");
         }
     }
-    if o.ldahead > 0 || o.ldahead32 > 0 || o.ldsink > 0 {
+    if o.any_region(|r| r.ldahead > 0 || r.ldahead32 > 0 || r.ldsink > 0) {
         let n = ldahead::run(m, o);
         if o.stats {
             eprintln!("ldahead: {n} blocks changed");

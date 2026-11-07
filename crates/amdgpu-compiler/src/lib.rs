@@ -247,6 +247,20 @@ pub fn uses_own_only_ops(f: &amdgpu_dsl::Function) -> bool {
 /// results, docs/archive/status.md round 44; `_t128`: ALU across its barrier and the pressure limit 248) - and the kernel's own `Function::sched_opts` tokens are applied ON TOP of
 /// that preset (never instead of it: a kernel that adds a token keeps its profile's options). A kernel without a preset that sets tokens gets the default options plus them.
 pub fn scheduler_options(f: &amdgpu_dsl::Function, pname: &str) -> Option<sched::Options> {
+    let mut o = scheduler_options_base(f, pname);
+    if !f.regions.is_empty() && !matches!(std::env::var("AMDC_SCHED").ok().as_deref(), Some("0")) {
+        // weave regions: the scheduler runs for them even on a kernel without a preset (the kernel default then is `rewait`: waits only)
+        let base = o.get_or_insert_with(|| {
+            let mut d = sched::Options::default();
+            d.reorder = false;
+            d
+        });
+        base.regions = f.regions.iter().map(|r| sched::region::RegionSpec { name: r.name.clone(), authored: r.authored, tokens: r.tokens.clone() }).collect();
+    }
+    o
+}
+
+fn scheduler_options_base(f: &amdgpu_dsl::Function, pname: &str) -> Option<sched::Options> {
     if let Some(o) = sched::Options::from_env() {
         return Some(o);
     }

@@ -935,6 +935,19 @@ pub struct Function {
     pub lower_opts: Vec<String>,
     /// Scheduler option tokens (the AMDC_SCHED_OPTS vocabulary: rewait,ldshoist,xbar,hoist=N,limit=N,...); Some turns the scheduler on for this kernel (unless AMDC_SCHED=0).
     pub sched_opts: Option<String>,
+    /// Weave regions of the kernel (`regions[id - 1]`; an instruction lowered from region `id` carries `MInst::region = id`): per-region scheduler strategies, see
+    /// `amdgpu-compiler/src/sched/region.rs`. Empty for every kernel that does not use the Weaver (nothing changes then).
+    pub regions: Vec<RegionDecl>,
+}
+
+/// A weave region's scheduler strategy (declared on the function, referenced by id from the region IR nodes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionDecl {
+    pub name: String,
+    /// The order the weaver emitted is authoritative: `rewait` + the order-preserving post-passes only (no list scheduling / slotfill / ldshoist inside the region).
+    pub authored: bool,
+    /// Scheduler option tokens applied to the region's instructions on top of the kernel's options.
+    pub tokens: String,
 }
 
 /// Compile policy of a kernel (see `amdgpu-compiler/src/lib.rs`): which lowering options and which scheduler preset it gets.
@@ -1197,6 +1210,7 @@ impl FnBuilder {
                 compile_profile: None,
             lower_opts: Vec::new(),
             sched_opts: None,
+            regions: Vec::new(),
             },
             expr_consts: Default::default(),
             tree: TreeBuilder::default(),
@@ -1211,6 +1225,12 @@ impl FnBuilder {
     /// Extra lowering option tokens for this kernel (see Function::lower_opts).
     pub fn lower_opts(&mut self, opts: &[&str]) {
         self.f.lower_opts.extend(opts.iter().map(|s| s.to_string()));
+    }
+
+    /// Declares a weave region and returns its id (1-based; 0 is the kernel default). The id is what the region IR node carries.
+    pub fn declare_region(&mut self, name: &str, authored: bool, tokens: &str) -> u16 {
+        self.f.regions.push(RegionDecl { name: name.to_string(), authored, tokens: tokens.to_string() });
+        self.f.regions.len() as u16
     }
 
     /// Scheduler option tokens for this kernel (see Function::sched_opts).

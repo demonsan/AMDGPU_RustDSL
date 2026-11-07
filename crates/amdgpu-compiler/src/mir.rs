@@ -295,11 +295,13 @@ pub struct MInst {
     /// LDS-DMA load whose M0 already holds its LDS base (the previous DMA of the block used the same source register): emit neither the s_mov_b32 m0 nor the
     /// s_nop 0 that must follow an M0 write (set by sched::m0::reuse).
     pub skip_m0: bool,
+    /// Weave region the instruction was lowered from (0 = the kernel default; `sched::region`): the scheduler applies the region's strategy only to its own instructions.
+    pub region: u16,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0 }
     }
 
     pub fn def(mut self, r: VReg) -> Self {
