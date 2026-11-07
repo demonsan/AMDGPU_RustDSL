@@ -1,0 +1,214 @@
+{
+  "name": "fmha_t128",
+  "attrs": {
+    "threads": 256,
+    "pipeline": "OneWindow",
+    "dispatch": "versions"
+  },
+  "nodes": [
+    {
+      "id": "kv_stage",
+      "prim": "M",
+      "stage": "move.kv_stage",
+      "params": {
+        "slots": 3
+      },
+      "resources": {
+        "vgprs": 24,
+        "agprs": 0,
+        "lds_bytes": 98304,
+        "barriers": 1
+      },
+      "roles": ["producer waves"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": "stage"
+    },
+    {
+      "id": "softmax",
+      "prim": "O",
+      "stage": "online.softmax",
+      "params": {
+        "recipe": "vendor two-word reference, lazy rollback"
+      },
+      "resources": {
+        "vgprs": 96,
+        "agprs": 0,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["one group of 4 waves"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": "window"
+    },
+    {
+      "id": "qk",
+      "prim": "A",
+      "stage": "mma.qk",
+      "params": {
+        "atom": "mfma_scale_32x32x64_f8"
+      },
+      "resources": {
+        "vgprs": 64,
+        "agprs": 128,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["one group of 4 waves"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": "window"
+    },
+    {
+      "id": "pv",
+      "prim": "A",
+      "stage": "mma.pv",
+      "params": {
+        "atom": "mfma_scale_32x32x64_f8"
+      },
+      "resources": {
+        "vgprs": 64,
+        "agprs": 128,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["one group of 4 waves"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": "window"
+    },
+    {
+      "id": "out",
+      "prim": "E",
+      "stage": "map.store_bf16",
+      "params": {
+        "n": 128
+      },
+      "resources": {
+        "vgprs": 64,
+        "agprs": 128,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["one group of 4 waves"],
+      "barrier_phase": 0,
+      "phase": "epilogue",
+      "hook": null
+    }
+  ],
+  "edges": [
+    {
+      "name": "q",
+      "from": null,
+      "to": ["qk"],
+      "dtype": "fp8",
+      "shape": [-1, 128],
+      "layout": "row-major (Q rows in registers)",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "kv_in",
+      "from": null,
+      "to": ["kv_stage"],
+      "dtype": "fp8",
+      "shape": [-1, 128],
+      "layout": "K / K-scale / V rows (range-checked buffer descriptors)",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "kv",
+      "from": "kv_stage",
+      "to": ["qk", "pv"],
+      "dtype": "fp8",
+      "shape": [128, 128],
+      "layout": "LDS ring (3 slots), swizzled [key, d]; V read transposed",
+      "producer": null,
+      "consumer": null,
+      "scope": "block",
+      "store": "lds:ring",
+      "class": "C3",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "s",
+      "from": "qk",
+      "to": ["softmax"],
+      "dtype": "f32",
+      "shape": [128, 128],
+      "layout": "S^T accumulators (the next tile's, produced one phase ahead)",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "agpr",
+      "class": "C0",
+      "abi": null,
+      "carried": true
+    },
+    {
+      "name": "p",
+      "from": "softmax",
+      "to": ["pv"],
+      "dtype": "fp8",
+      "shape": [128, 128],
+      "layout": "P words (pknorm + scalef32), the B operand of PV; K permutation absorbed by the V transposed read",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "o",
+      "from": "pv",
+      "to": ["out"],
+      "dtype": "f32",
+      "shape": [128, 128],
+      "layout": "O accumulators",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "agpr",
+      "class": "C2",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "out",
+      "from": "out",
+      "to": [],
+      "dtype": "bf16",
+      "shape": [-1, 128],
+      "layout": "row-major",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": null,
+      "carried": false
+    }
+  ],
+  "groups": [
+    {
+      "name": "window_weave",
+      "label": "window",
+      "nodes": ["softmax", "qk"]
+    }
+  ]
+}

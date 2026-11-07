@@ -1,0 +1,229 @@
+{
+  "name": "fmha_kvsplit",
+  "attrs": {
+    "threads": 512,
+    "pipeline": "TwoPhaseOffset",
+    "dispatch": "roles + versions"
+  },
+  "nodes": [
+    {
+      "id": "kv_stage",
+      "prim": "M",
+      "stage": "move.kv_stage",
+      "params": {
+        "slots": 2
+      },
+      "resources": {
+        "vgprs": 24,
+        "agprs": 0,
+        "lds_bytes": 98304,
+        "barriers": 1
+      },
+      "roles": ["producer waves"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": "stage"
+    },
+    {
+      "id": "softmax",
+      "prim": "O",
+      "stage": "online.softmax",
+      "params": {
+        "recipe": "vendor two-word reference, lazy rollback"
+      },
+      "resources": {
+        "vgprs": 96,
+        "agprs": 0,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["two groups of 4 waves, offset by one phase"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": "v_phase"
+    },
+    {
+      "id": "pv",
+      "prim": "A",
+      "stage": "mma.pv",
+      "params": {
+        "atom": "mfma_scale_32x32x64_f8"
+      },
+      "resources": {
+        "vgprs": 64,
+        "agprs": 128,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["two groups of 4 waves, offset by one phase"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": "m_phase"
+    },
+    {
+      "id": "qk",
+      "prim": "A",
+      "stage": "mma.qk",
+      "params": {
+        "atom": "mfma_scale_32x32x64_f8"
+      },
+      "resources": {
+        "vgprs": 64,
+        "agprs": 128,
+        "lds_bytes": 0,
+        "barriers": 0
+      },
+      "roles": ["two groups of 4 waves, offset by one phase"],
+      "barrier_phase": 0,
+      "phase": "loop",
+      "hook": "m_phase"
+    },
+    {
+      "id": "partial",
+      "prim": "E",
+      "stage": "map.epilogue_chain",
+      "params": {
+        "ops": "partial O + log-sum-exp"
+      },
+      "resources": {
+        "vgprs": 64,
+        "agprs": 128,
+        "lds_bytes": 32768,
+        "barriers": 0
+      },
+      "roles": ["two groups of 4 waves, offset by one phase"],
+      "barrier_phase": 0,
+      "phase": "epilogue",
+      "hook": null
+    }
+  ],
+  "edges": [
+    {
+      "name": "q",
+      "from": null,
+      "to": ["qk"],
+      "dtype": "fp8",
+      "shape": [-1, 128],
+      "layout": "row-major (Q rows in registers)",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "kv_in",
+      "from": null,
+      "to": ["kv_stage"],
+      "dtype": "fp8",
+      "shape": [-1, 128],
+      "layout": "K / K-scale / V rows (range-checked buffer descriptors)",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "kv",
+      "from": "kv_stage",
+      "to": ["qk", "pv"],
+      "dtype": "fp8",
+      "shape": [128, 128],
+      "layout": "LDS ring (2 slots), swizzled [key, d]; V read transposed",
+      "producer": null,
+      "consumer": null,
+      "scope": "block",
+      "store": "lds:ring",
+      "class": "C3",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "s",
+      "from": "qk",
+      "to": ["softmax"],
+      "dtype": "f32",
+      "shape": [128, 128],
+      "layout": "S^T accumulators (the next tile's, produced one phase ahead)",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "agpr",
+      "class": "C0",
+      "abi": null,
+      "carried": true
+    },
+    {
+      "name": "p",
+      "from": "softmax",
+      "to": ["pv"],
+      "dtype": "fp8",
+      "shape": [128, 128],
+      "layout": "P words (pknorm + scalef32), the B operand of PV; K permutation absorbed by the V transposed read",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "vgpr",
+      "class": "C0",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "o",
+      "from": "pv",
+      "to": ["partial"],
+      "dtype": "f32",
+      "shape": [128, 128],
+      "layout": "O accumulators",
+      "producer": null,
+      "consumer": null,
+      "scope": "wave",
+      "store": "agpr",
+      "class": "C2",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "o_part",
+      "from": "partial",
+      "to": [],
+      "dtype": "f32",
+      "shape": [-1, 128],
+      "layout": "partial O rows",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": null,
+      "carried": false
+    },
+    {
+      "name": "lse",
+      "from": "partial",
+      "to": [],
+      "dtype": "f32",
+      "shape": [-1],
+      "layout": "log-sum-exp per row",
+      "producer": null,
+      "consumer": null,
+      "scope": "none",
+      "store": "global",
+      "class": "C4",
+      "abi": null,
+      "carried": false
+    }
+  ],
+  "groups": [
+    {
+      "name": "m_phase",
+      "label": "m_phase",
+      "nodes": ["pv", "qk"]
+    }
+  ]
+}
