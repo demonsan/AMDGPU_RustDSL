@@ -51,6 +51,34 @@ fn amax_of(b: &mut FnBuilder, xs: &[ValueId]) -> ValueId {
     m
 }
 
+/// One MXFP4 group of 32 f32 values: the E8M0 scale byte (`e`, an i32 in 0..=254) and the 16 packed fp4 bytes (a Frag4). Scale rule = aiter's `dynamic_mxfp4_quant`: amax rounded at mantissa bit 21
+/// (+0x200000, truncate), e8m0 = exponent - 2 (fp4 max 6 = 1.5 2^2), clamp [0, 254]; q = fp4(x / 2^(e8m0 - 127)) (hardware RNE, saturating). Shared with the fused `rows/mxnorm.rs`.
+pub(crate) fn mxfp4_group(b: &mut FnBuilder, xs: &[ValueId]) -> (ValueId, ValueId) {
+    assert_eq!(xs.len(), 32);
+    let amax = amax_of(b, xs);
+    // aiter: (bits + 0x200000) & 0xff800000, exponent - 2
+    let ab = b.bitcast_i32(amax);
+    let rnd = b.bind_i32((ev(ab) + 0x20_0000) & (0xff80_0000u32 as i32));
+    let e = b.bind_i32((ev(rnd).lshr(23) & 0xff) - 2);
+    let e = b.bind_i32(ev(e).max(0).min(254));
+    // the scale as an f32 with that exponent (e = 0: the smallest normal, 2^-126, for the division only)
+    let sbits = b.bind_i32(ev(e).max(1) << 23);
+    let sf = b.bitcast_f32(sbits);
+    // 32 values -> 16 bytes: v_cvt_scalef32_pk_fp4_f32 packs two values per byte (sel = byte)
+    let mut words: Vec<ValueId> = Vec::with_capacity(4);
+    for w in 0..4usize {
+        // v_cvt_scalef32_pk_fp4_f32 writes byte `sel` of the previous word (chained)
+        let mut acc = b.c_i32(0);
+        for byte in 0..4usize {
+            let i = 8 * w + 2 * byte;
+            acc = b.cvt(CvtOp::ScalePkFp4F32, &[Opnd::Val(xs[i]), Opnd::Val(xs[i + 1]), Opnd::Val(sf), Opnd::Val(acc)], byte as u8);
+        }
+        words.push(acc);
+    }
+    let f4 = b.frag4(words[0], words[1], words[2], words[3]);
+    (e, f4)
+}
+
 fn mxfp4(name: &str, k: i64) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
@@ -84,28 +112,8 @@ fn mxfp4(name: &str, k: i64) -> Function {
             let f = b.buffer_load_b128(r_x, xo, c0, 16 * c);
             xs.extend(bf16x8_to_f32(&mut b, f));
         }
-        let amax = amax_of(&mut b, &xs);
-        // aiter: (bits + 0x200000) & 0xff800000, exponent - 2
-        let ab = b.bitcast_i32(amax);
-        let rnd = b.bind_i32((ev(ab) + 0x20_0000) & (0xff80_0000u32 as i32));
-        let e = b.bind_i32((ev(rnd).lshr(23) & 0xff) - 2);
-        let e = b.bind_i32(ev(e).max(0).min(254));
+        let (e, f4) = mxfp4_group(&mut b, &xs);
         sbytes.push(e);
-        // the scale as an f32 with that exponent (e = 0: the smallest normal, 2^-126, for the division only)
-        let sbits = b.bind_i32(ev(e).max(1) << 23);
-        let sf = b.bitcast_f32(sbits);
-        // 32 values -> 16 bytes: v_cvt_scalef32_pk_fp4_f32 packs two values per byte (sel = byte)
-        let mut words: Vec<ValueId> = Vec::with_capacity(4);
-        for w in 0..4usize {
-            // v_cvt_scalef32_pk_fp4_f32 writes byte `sel` of the previous word (chained)
-            let mut acc = b.c_i32(0);
-            for byte in 0..4usize {
-                let i = 8 * w + 2 * byte;
-                acc = b.cvt(CvtOp::ScalePkFp4F32, &[Opnd::Val(xs[i]), Opnd::Val(xs[i + 1]), Opnd::Val(sf), Opnd::Val(acc)], byte as u8);
-            }
-            words.push(acc);
-        }
-        let f4 = b.frag4(words[0], words[1], words[2], words[3]);
         let qo = b.bind_i32(ev(row) * (k as i32 / 2) + (ev(grp_i) << 4));
         b.buffer_store_b128(r_q, qo, c0, 0, f4);
     }
