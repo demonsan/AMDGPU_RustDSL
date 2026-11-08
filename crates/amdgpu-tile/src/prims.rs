@@ -3,7 +3,7 @@
 //! lane's values.
 
 use crate::shared::PrivRef;
-use amdgpu_dsl::{ev, FnBuilder, Opnd, ValueId};
+use amdgpu_dsl::{ev, DType, FnBuilder, Op, Opnd, ValueId};
 
 /// Activation of an elementwise map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +14,8 @@ pub enum Act {
     Silu,
     /// 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))), tanh(u) = 1 - 2 / (1 + 2^(2 u log2 e))
     GeluTanh,
+    /// the exact GELU, 0.5 x (1 + erf(x / sqrt 2)), erf by the Abramowitz-Stegun 7.1.26 polynomial (|error| < 1.5e-7)
+    Gelu,
 }
 
 /// `act(x)` for one f32 value.
@@ -32,6 +34,43 @@ pub fn act(b: &mut FnBuilder, x: ValueId, a: Act) -> ValueId {
             let d = b.add_f32(p, one);
             let r = b.rcp_f32(d);
             b.mul_f32(x, r)
+        }
+        Act::Gelu => {
+            let z = {
+                let c = b.c_f32(std::f32::consts::FRAC_1_SQRT_2);
+                b.mul_f32(x, c)
+            };
+            let az = abs_f32(b, z);
+            let one = b.c_f32(1.0);
+            let pc = b.c_f32(0.327_591_1);
+            let den = {
+                let t = b.mul_f32(az, pc);
+                b.add_f32(t, one)
+            };
+            let t = b.rcp_f32(den);
+            // poly = ((((a5 t + a4) t + a3) t + a2) t + a1) t
+            let coef = [1.061_405_4f32, -1.453_152_f32, 1.421_413_7f32, -0.284_496_73f32, 0.254_829_6f32];
+            let mut acc = b.c_f32(coef[0]);
+            for &cf in &coef[1..] {
+                let m = b.mul_f32(acc, t);
+                let cc = b.c_f32(cf);
+                acc = b.add_f32(m, cc);
+            }
+            let poly = b.mul_f32(acc, t);
+            let z2 = b.mul_f32(az, az);
+            let k = b.c_f32(-std::f32::consts::LOG2_E);
+            let ez = b.mul_f32(z2, k);
+            let e = b.exp2_f32(ez);
+            let pe = b.mul_f32(poly, e);
+            let erf_abs = b.sub_f32(one, pe);
+            let zero = b.c_f32(0.0);
+            let neg = b.cmp(amdgpu_dsl::CmpPred::Lt, amdgpu_dsl::CmpTy::F32, z, zero);
+            let nerf = b.sub_f32(zero, erf_abs);
+            let erf = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(neg), a: Opnd::Val(nerf), b: Opnd::Val(erf_abs) });
+            let half = b.c_f32(0.5);
+            let hx = b.mul_f32(x, half);
+            let one_p = b.add_f32(one, erf);
+            b.mul_f32(hx, one_p)
         }
         Act::GeluTanh => {
             // y = x * sigmoid(2 u), u = sqrt(2/pi) x (1 + 0.044715 x^2): x / (1 + 2^(-2 u log2 e)) (no cancellation for large negative x)
