@@ -18,7 +18,6 @@ pub mod bwd;
 pub mod decode;
 pub mod decode16;
 pub mod mla;
-pub mod mla16;
 mod skeleton_kvsplit;
 mod skeleton_t128;
 mod skeleton_vs128;

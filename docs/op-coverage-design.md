@@ -616,7 +616,7 @@
     | 64 / 64 / 8 / 2048 | 32 key，S=1 | 4182 GB/s | 5392 | 0.78× |
     | 4 / 32 / 4 / 8192 | 64 key，S=8 | 1352 GB/s | 1303 | 1.04× |
   - block-table 查表批量化：0.37× → 0.51×。
-- **MLA decode `mla16_decode_bf16_p<P>`**，见 [`fmha/mla16.rs`](../crates/amdgpu-kernels/src/fmha/mla16.rs)：
+- **MLA decode**：`mla_decode_bf16_p<P>` 已换成 16x16 版本，见 [`fmha/mla.rs`](../crates/amdgpu-kernels/src/fmha/mla.rs)。旧的 32 行版本保留为 tag `archive/mla-decode-v1`。combine 的部分数为 NS = 4·S。
   - 结构：
     - 每 CTA 负责 16 个 head，作为 16x16x32 MFMA 的 16 列；
     - 每个 wave 处理自己的 key 段，没有跨 wave 的 S 归约和 barrier；

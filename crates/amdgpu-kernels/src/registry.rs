@@ -87,7 +87,6 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_bf16_v3_ks" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3_x("fmha_fwd_hd128_bf16_v3_ks", false, true)),
         "fmha_fwd_hd128_bf16_v3_causal_ks" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3_x("fmha_fwd_hd128_bf16_v3_causal_ks", true, true)),
         "attn_combine_bf16_hd128_q" => Some(crate::fmha::bf16v3::attn_combine_bf16_hd128_q("attn_combine_bf16_hd128_q")),
-        n if n.starts_with("mla16_decode_bf16_p") => n["mla16_decode_bf16_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::mla16::mla16_decode_bf16(n, p)),
         "attn_combine_bf16_hd128" => Some(crate::fmha::decode::attn_combine_bf16_hd128("attn_combine_bf16_hd128")),
         "attn_combine_bf16_hd512" => Some(crate::fmha::decode::attn_combine_bf16("attn_combine_bf16_hd512", 512)),
         "attn_combine_bf16_hd512_sm" => Some(crate::fmha::decode::attn_combine_bf16_x("attn_combine_bf16_hd512_sm", 512, true)),
