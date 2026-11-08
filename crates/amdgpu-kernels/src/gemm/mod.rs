@@ -81,11 +81,6 @@ struct ConvRt {
     zero: ValueId,
 }
 
-/// `div_rt` for other kernels.
-pub(crate) fn div_rt_pub(b: &mut FnBuilder, n: ValueId, d: ValueId) -> ValueId {
-    div_rt(b, n, d)
-}
-
 /// q = n / d (both >= 0, n < 2^22) by a float reciprocal and one integer correction step.
 fn div_rt(b: &mut FnBuilder, n: ValueId, d: ValueId) -> ValueId {
     // (v_cvt_f32_i32 = CvtF32I32: int -> float; v_cvt_i32_f32 = CvtI32F32: float -> int)
@@ -112,9 +107,6 @@ pub enum MoeStage {
     /// down: A = the stage-1 output [M topk, k] gathered by (token, slot), B = W2 [E, n_out, k]; C = fp32 [M, topk, n_out] x the routing
     /// weight (summed over topk by `reduce::moe_sum_bf16`)
     Down,
-    /// `Down` accumulating straight into bf16 out [M, n_out] (row = token; `buffer_atomic_pk_add_bf16`, the topk routes of a token add up; the
-    /// output must be zeroed first): no fp32 intermediate, no sum kernel
-    DownAdd,
     /// `Down` with a bf16 per-route intermediate [M, topk, n_out] (half the bytes; summed in fp32 by `moe_sum_bf16h_k<K>`)
     DownH,
 }
@@ -476,10 +468,7 @@ fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scale
     b.arg_tensor("ptr_a", m.clone() * k.clone());
     b.arg_tensor("ptr_b", ee.clone() * n.clone() * k);
     let out_rows = Ext::ka(140) * Ext::ka(128);
-    match st {
-        MoeStage::DownAdd => b.arg_tensor("ptr_c", Ext::ka(140) * n_out * Ext::c(2)),
-        _ => b.arg_tensor("ptr_c", out_rows * n_out * Ext::c(if matches!(st, MoeStage::Up { .. } | MoeStage::DownH) { 2 } else { 4 })),
-    }
+    b.arg_tensor("ptr_c", out_rows * n_out * Ext::c(if matches!(st, MoeStage::Up { .. } | MoeStage::DownH) { 2 } else { 4 }));
     b.arg_tensor("ptr_sorted_ids", mt.clone() * Ext::c(4 * cta_m));
     b.arg_tensor("ptr_sorted_weights", mt.clone() * Ext::c(4 * cta_m));
     b.arg_tensor("ptr_sorted_expert_ids", mt * Ext::c(4));
@@ -1151,8 +1140,6 @@ pub fn by_name(name: &str) -> Option<Function> {
             let (elem, scales) = if n.contains("_fp8bs") { (Elem::Fp8Bs, Scales::Block128) } else if n.contains("_fp8") { (Elem::Fp8, Scales::RowCol) } else { (Elem::Bf16, Scales::None) };
             let st = if n.starts_with("gemm_moe1") {
                 MoeStage::Up { gelu: n.contains("_gelu"), doweight: n.ends_with("_dw") }
-            } else if n.ends_with("_add") {
-                MoeStage::DownAdd
             } else if n.ends_with("_h") {
                 MoeStage::DownH
             } else {
@@ -1408,7 +1395,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
                 let tok = b.bind_i32(ev(sid) & 0xff_ffff);
                 match mc.st {
                     MoeStage::Up { .. } => b.bind_i32(ev(tok).min(ev(mc.mtok) - 1)),
-                    MoeStage::Down | MoeStage::DownAdd | MoeStage::DownH => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
+                    MoeStage::Down | MoeStage::DownH => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
                 }
             })
         }
@@ -1546,7 +1533,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
                     let tok = b.bind_i32(ev(sid) & 0xff_ffff);
                     let row = match mc.st {
                         MoeStage::Up { .. } => b.bind_i32(ev(tok).min(ev(mc.mtok) - 1)),
-                        MoeStage::Down | MoeStage::DownAdd | MoeStage::DownH => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
+                        MoeStage::Down | MoeStage::DownH => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
                     };
                     b.bind_i32(ev(row) * ev(rowb))
                 })
@@ -1730,11 +1717,9 @@ fn moe_epilogue(
     let o = b.bind_i32(ctx.lower(&idx[0]));
     let (rl, cl) = (b.bind_i32(ev(o).lshr(10)), b.bind_i32(ev(o) & 1023));
     let up = matches!(mc.st, MoeStage::Up { .. });
-    let add = mc.st == MoeStage::DownAdd;
     let half_out = mc.st == MoeStage::DownH;
-    let esz = if up || add || half_out { 2 } else { 4 };
-    let rows_c = if add { b.c_i32(1) } else { mc.topk };
-    let rsrc_c = { let n = b.bind_i32(ev(mc.mtok) * ev(rows_c) * ev(mc.nout) * esz); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_c, n) };
+    let esz = if up || half_out { 2 } else { 4 };
+    let rsrc_c = { let n = b.bind_i32(ev(mc.mtok) * ev(mc.topk) * ev(mc.nout) * esz); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_c, n) };
     let so = { let v = b.bind_i32(ev(mc.row0) << 2); b.read_first_lane(v) };
     let big = b.c_i32(0x7fff_fff0);
     let c0 = b.c_i32(0);
@@ -1827,10 +1812,7 @@ fn moe_epilogue(
                 b.buffer_store_b64(rsrc_c, vrow, c0, (32 * p) as u32, f2);
             }
         } else {
-            // DownAdd: the token's row of out [M, n_out] bf16 (pairs added with buffer_atomic_pk_add_bf16)
-            let vr0 = if add {
-                b.bind_i32((ev(tok) * ev(mc.nout) + ev(col0)) << 1)
-            } else if half_out {
+            let vr0 = if half_out {
                 b.bind_i32((ev(orow) * ev(mc.nout) + ev(col0)) << 1)
             } else {
                 b.bind_i32((ev(orow) * ev(mc.nout) + ev(col0)) << 2)
@@ -1846,20 +1828,13 @@ fn moe_epilogue(
                         v[k] = b.mul_f32(v[k], s);
                     }
                     let y = b.mul_f32(v[k], sw);
-                    v[k] = if add || half_out { y } else { b.bitcast_i32(y) };
+                    v[k] = if half_out { y } else { b.bitcast_i32(y) };
                 }
                 if half_out {
                     let w0 = b.cvt_pk_bf16_f32(v[0], v[1]);
                     let w1 = b.cvt_pk_bf16_f32(v[2], v[3]);
                     let f2 = b.frag2(w0, w1);
                     b.buffer_store_b64(rsrc_c, vrow, c0, (32 * j) as u32, f2);
-                    continue;
-                }
-                if add {
-                    for hpair in 0..2usize {
-                        let w = b.cvt_pk_bf16_f32(v[2 * hpair], v[2 * hpair + 1]);
-                        b.buffer_atomic(amdgpu_dsl::AtomicOp::PkAddBf16, rsrc_c, Some(Opnd::Val(vrow)), c0, (32 * j + 4 * hpair) as u32, w);
-                    }
                     continue;
                 }
                 let f4 = b.frag4(v[0], v[1], v[2], v[3]);

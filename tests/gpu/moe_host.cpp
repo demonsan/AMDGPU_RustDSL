@@ -138,8 +138,7 @@ int main(int argc, char** argv) {
     // ---- kernels ----
     std::string dt = bs ? "fp8bs" : fp8 ? "fp8" : "bf16";
     auto load = [&](const std::string& name) { hipModule_t m; hipFunction_t f; HC(hipModuleLoad(&m, (dir + "/" + name + ".co").c_str())); HC(hipModuleGetFunction(&f, m, name.c_str())); return f; };
-    // ADD=1: stage 2 accumulates into the zeroed bf16 output with pk_add_bf16 atomics (no fp32 intermediate, no sum kernel)
-    const bool addm = envi("ADD", 0) != 0;
+    const bool addm = false;
     // HALF=1: bf16 per-route intermediate (gemm_moe2_<dt>_h + moe_sum_bf16h_k<K>)
     const bool hm = envi("HALF", 0) != 0;
     hipFunction_t f1 = load("gemm_moe1_" + dt + "_" + act), f2 = load("gemm_moe2_" + dt + (addm ? "_add" : hm ? "_h" : "")),
