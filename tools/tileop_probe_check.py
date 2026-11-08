@@ -232,8 +232,97 @@ def check_valu_p1(planes, out):
     print(f"probe_valu_p1: {k} ops x {LANES} lanes, {total - bad} / {total} values match")
     return bad == 0
 
+
+# ---------------------------------------------------------------- probe_mem_p1
+
+MEM_PLANES = 64
+
+def gen_mem_p1():
+    data = bytes(((i * 37 + 11) ^ (i >> 5)) & 255 for i in range(4096))
+    return [list(struct.unpack("<1024I", data))]
+
+def mem_ref(inb):
+    """expected planes (64 x 64 dwords) and the two 64 x 32-byte store regions"""
+    def rd(addr, n):
+        return int.from_bytes(inb[addr:addr + n], "little")
+    def sx(v, bits):
+        return (v - (1 << bits)) & 0xFFFFFFFF if v & (1 << (bits - 1)) else v
+    merge = 0xAAAA5555
+    def d16(v, bits, signed, hi):
+        h = (sx(v, bits) if signed else v) & 0xFFFF
+        return ((merge & 0xFFFF) | (h << 16)) if hi else ((merge & 0xFFFF0000) | h)
+    planes = [[0] * LANES for _ in range(MEM_PLANES)]
+    lds = bytearray(4096)
+    for l in range(LANES):
+        lds[16 * l:16 * l + 16] = inb[16 * l:16 * l + 16]
+    for l in range(LANES):
+        b = 16 * l
+        vals = [rd(b + 1, 1), sx(rd(b + 3, 1), 8), rd(b + 2, 2), sx(rd(b + 6, 2), 16), rd(b + 4, 4)]
+        vals += [rd(b + 8, 4), rd(b + 12, 4)]
+        vals += [rd(b, 4), rd(b + 4, 4), rd(b + 8, 4)]
+        vals += [rd(b + 4 * i, 4) for i in range(4)]
+        vals += [d16(rd(b + 1, 1), 8, False, False), d16(rd(b + 1, 1), 8, False, True), d16(rd(b + 3, 1), 8, True, False), d16(rd(b + 3, 1), 8, True, True),
+                 d16(rd(b + 2, 2), 16, False, False), d16(rd(b + 2, 2), 16, False, True)]
+        # buffer: same bytes
+        vals += [rd(b + 1, 1), sx(rd(b + 3, 1), 8), rd(b + 2, 2), sx(rd(b + 6, 2), 16), rd(b, 4), rd(b + 4, 4), rd(b + 8, 4)]
+        # LDS loads (region 0 holds the input)
+        L = lambda a, n: int.from_bytes(lds[a:a + n], "little")
+        vals += [L(b + 1, 1), sx(L(b + 3, 1), 8), L(b + 2, 2), sx(L(b + 6, 2), 16), L(b, 4), L(b + 4, 4), L(b + 8, 4)]
+        vals += [d16(L(b + 1, 1), 8, False, False), d16(L(b + 1, 1), 8, False, True), d16(L(b + 3, 1), 8, True, False), d16(L(b + 3, 1), 8, True, True),
+                 d16(L(b + 2, 2), 16, False, False), d16(L(b + 2, 2), 16, False, True)]
+        vals += [L(b + 4, 4), L(b + 12, 4)]
+        vals += [L(b, 4), L(b + 4, 4), L(b + 8, 4), L(b + 12, 4)]
+        vals += [L(4 * l, 4), L(4 * l + 256, 4)]
+        vals += [L(8 * l, 4), L(8 * l + 4, 4), L(8 * l + 512, 4), L(8 * l + 516, 4)]
+        x, y = rd(b, 4), rd(b + 4, 4)
+        r1 = bytearray(16); r1[0] = x & 255; r1[1] = (x >> 16) & 255; r1[2:4] = (y & 0xFFFF).to_bytes(2, "little"); r1[4:6] = (y >> 16).to_bytes(2, "little")
+        r2 = bytearray(inb[b:b + 12]) + bytearray(4)
+        r3 = bytearray(16); r3[0:4] = x.to_bytes(4, "little"); r3[8:12] = y.to_bytes(4, "little")
+        for r in (r1, r2, r3):
+            vals += list(struct.unpack("<4I", bytes(r)))
+        assert len(vals) == MEM_PLANES, len(vals)
+        for k, v in enumerate(vals):
+            planes[k][l] = v & 0xFFFFFFFF
+    region = bytearray()
+    for l in range(LANES):
+        b = 16 * l
+        x, y = rd(b, 4), rd(b + 4, 4)
+        r = bytearray([0xA5] * 32)
+        r[0] = x & 255; r[1] = (x >> 16) & 255; r[2:4] = (y & 0xFFFF).to_bytes(2, "little"); r[4:6] = (y >> 16).to_bytes(2, "little")
+        r[16:28] = inb[b:b + 12]
+        region += r
+    return planes, bytes(region)
+
+def check_mem_p1(planes_in, out):
+    inb = struct.pack("<1024I", *planes_in[0])
+    planes, region = mem_ref(inb)
+    names = (["gU8", "gI8", "gU16", "gI16", "gB32", "gB64.0", "gB64.1", "gB96.0", "gB96.1", "gB96.2", "gB128.0", "gB128.1", "gB128.2", "gB128.3",
+              "gD16U8", "gD16U8Hi", "gD16I8", "gD16I8Hi", "gD16B16", "gD16B16Hi", "bU8", "bI8", "bU16", "bI16", "bB96.0", "bB96.1", "bB96.2",
+              "lU8", "lI8", "lU16", "lI16", "lB96.0", "lB96.1", "lB96.2", "lD16U8", "lD16U8Hi", "lD16I8", "lD16I8Hi", "lD16B16", "lD16B16Hi",
+              "lRead2B32.0", "lRead2B32.1", "lRead2B64.0", "lRead2B64.1", "lRead2B64.2", "lRead2B64.3", "lRead2St64B32.0", "lRead2St64B32.1",
+              "lRead2St64B64.0", "lRead2St64B64.1", "lRead2St64B64.2", "lRead2St64B64.3"]
+             + [f"ldsStores.r{r}.{i}" for r in range(1, 4) for i in range(4)])
+    bad = 0
+    for k in range(MEM_PLANES):
+        fails = [l for l in range(LANES) if out[k * LANES + l] != planes[k][l]]
+        if fails:
+            bad += len(fails)
+            l = fails[0]
+            print(f"FAIL {names[k]}: {len(fails)} lanes, e.g. lane {l} want {planes[k][l]:#x} got {out[k * LANES + l]:#x}")
+    ob = struct.pack(f"<{len(out)}I", *out)
+    base = MEM_PLANES * LANES * 4
+    for name, off in (("global stores", base), ("buffer stores", base + LANES * 32)):
+        got = ob[off:off + LANES * 32]
+        if got != region:
+            i = next(i for i in range(len(region)) if got[i] != region[i])
+            bad += 1
+            print(f"FAIL {name}: first difference at lane {i // 32} byte {i % 32}: want {region[i]:#x} got {got[i]:#x}")
+    print(f"probe_mem_p1: {MEM_PLANES} planes x {LANES} lanes + 2 store regions, {'all match' if bad == 0 else f'{bad} mismatches'}")
+    return bad == 0
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
+    "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
 }
 
 def main():
