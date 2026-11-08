@@ -11,7 +11,7 @@
 //! E a multiple of 8, 32..=512; K in 1..=16. 4 waves per block, grid = ceil(T / (4 RPW)). ABI: gating @0 (bf16 [T][E]), weights @8 (f32 [T][K]), indices @16 (i32 [T][K]), T @24 (i32).
 
 use amdgpu_dsl::{CachePolicy, CmpPred, CmpTy, CompileProfile, MemTy, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{bf16x8_to_f32, lane_reduce, RedOp};
+use amdgpu_tile::prims::{bf16x8_to_f32, dpp_reduce, group_reduce_dpp, lane_reduce, RedOp};
 use amdgpu_tile::shared::PrivRef;
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
@@ -38,6 +38,9 @@ fn sel_i32(b: &mut FnBuilder, cond: ValueId, x: ValueId, y: ValueId) -> ValueId 
 
 /// Reduction over the `l` lanes of each aligned group of a wave (l a power of two in 4..=64); every lane of a group gets the group's result.
 fn group_reduce(b: &mut FnBuilder, op: RedOp, x: ValueId, scratch: &PrivRef, off: i32, gen: i32, lane: &Lane, l: i64) -> ValueId {
+    if dpp_reduce() {
+        return group_reduce_dpp(b, op, x, l);
+    }
     let comb = |b: &mut FnBuilder, p: ValueId, q: ValueId| match op {
         RedOp::Sum => b.add_f32(p, q),
         RedOp::Max => b.max_f32(p, q),

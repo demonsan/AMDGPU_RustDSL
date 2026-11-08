@@ -8,7 +8,7 @@
 //! V a multiple of 8, 8..=131072. A block reduction = DPP quads + the wave's LDS exchange, then one slot per wave and a barrier (a fresh slot per reduction, so no barrier is needed to reuse them).
 
 use amdgpu_dsl::{CachePolicy, CmpPred, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{bf16x8_to_f32, lane_reduce, RedOp};
+use amdgpu_tile::prims::{bf16x8_to_f32, dpp_reduce, lane_reduce, wave_reduce_dpp, RedOp};
 use amdgpu_tile::ev;
 
 const T: i32 = 1024;
@@ -36,29 +36,33 @@ fn block_reduce(b: &mut FnBuilder, op: RedOp, x: ValueId, wave: ValueId, lane: V
         RedOp::Sum => b.add_f32(p, q),
         RedOp::Max => b.max_f32(p, q),
     };
-    let mut v = x;
-    for perm in [[1u8, 0, 3, 2], [2, 3, 0, 1]] {
-        let y = b.dpp_quad_perm(v, perm);
-        let y = b.bitcast_f32(y);
-        v = comb(b, v, y);
-    }
-    // wave exchange: the 16 quad values of the wave
-    let wa = b.bind_i32(ev(wave) * 64 + (ev(lane).lshr(2) << 2) + ws + tid_wave_base);
-    let vi = b.bitcast_i32(v);
-    b.store_lds(wa, vi, MemTy::B32, false);
-    b.wait_lds(0);
-    let ra = b.bind_i32(ev(wave) * 64 + ws + tid_wave_base);
-    let mut vals = Vec::new();
-    for q in 0..4i32 {
-        let a = b.bind_i32(ev(ra) + 16 * q);
-        let f = b.load_lds(a, MemTy::B128);
-        for d in 0..4u8 {
-            let w = b.frag4_lane(Opnd::Val(f), d);
-            vals.push(b.bitcast_f32(w));
+    let wr = if dpp_reduce() {
+        wave_reduce_dpp(b, op, x)
+    } else {
+        let mut v = x;
+        for perm in [[1u8, 0, 3, 2], [2, 3, 0, 1]] {
+            let y = b.dpp_quad_perm(v, perm);
+            let y = b.bitcast_f32(y);
+            v = comb(b, v, y);
         }
-    }
-    b.wait_lds(0);
-    let wr = lane_reduce(b, op, &vals);
+        // wave exchange: the 16 quad values of the wave
+        let wa = b.bind_i32(ev(wave) * 64 + (ev(lane).lshr(2) << 2) + ws + tid_wave_base);
+        let vi = b.bitcast_i32(v);
+        b.store_lds(wa, vi, MemTy::B32, false);
+        b.wait_lds(0);
+        let ra = b.bind_i32(ev(wave) * 64 + ws + tid_wave_base);
+        let mut vals = Vec::new();
+        for q in 0..4i32 {
+            let a = b.bind_i32(ev(ra) + 16 * q);
+            let f = b.load_lds(a, MemTy::B128);
+            for d in 0..4u8 {
+                let w = b.frag4_lane(Opnd::Val(f), d);
+                vals.push(b.bitcast_f32(w));
+            }
+        }
+        b.wait_lds(0);
+        lane_reduce(b, op, &vals)
+    };
     // one slot per wave, then every thread reduces the 16 slots
     let sa = b.bind_i32(ev(wave) * 4 + blk + 64 * round);
     let wri = b.bitcast_i32(wr);
