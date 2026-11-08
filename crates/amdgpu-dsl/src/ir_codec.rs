@@ -170,6 +170,7 @@ impl FromIr for Op {
             "LoadLdsD16" => { v.expect_struct("LoadLdsD16")?; Ok(Op::LoadLdsD16 { addr: FromIr::from_ir(v.field("addr")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
             "LoadLds2" => { v.expect_struct("LoadLds2")?; Ok(Op::LoadLds2 { addr: FromIr::from_ir(v.field("addr")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
             "LoadLdsTrB16" => { v.expect_struct("LoadLdsTrB16")?; Ok(Op::LoadLdsTrB16 { addr: FromIr::from_ir(v.field("addr")?)? }) }
+            "Cvt" => { v.expect_struct("Cvt")?; Ok(Op::Cvt { op: FromIr::from_ir(v.field("op")?)?, srcs: FromIr::from_ir(v.field("srcs")?)?, sel: FromIr::from_ir(v.field("sel")?)? }) }
             "Mfma" => { v.expect_struct("Mfma")?; Ok(Op::Mfma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
             other => Err(v.err(format!("unknown Op variant `{other}`"))),
         }
@@ -272,6 +273,7 @@ impl IrIds for Op {
             Op::LoadLdsD16 { addr, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
             Op::LoadLds2 { addr, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
             Op::LoadLdsTrB16 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
+            Op::Cvt { op, srcs, sel } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*srcs), fv, fr); IrIds::ids(&mut (*sel), fv, fr); }
             Op::Mfma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }
         }
     }
@@ -1162,6 +1164,60 @@ impl IrIds for CachePolicy {
         IrIds::ids(&mut self.sc0, fv, fr);
         IrIds::ids(&mut self.sc1, fv, fr);
         IrIds::ids(&mut self.nt, fv, fr);
+    }
+}
+
+impl FromIr for CvtOp {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "PkF32Fp8" => { v.expect_unit("PkF32Fp8")?; Ok(CvtOp::PkF32Fp8) }
+            "PkF32Bf8" => { v.expect_unit("PkF32Bf8")?; Ok(CvtOp::PkF32Bf8) }
+            "F32Fp8" => { v.expect_unit("F32Fp8")?; Ok(CvtOp::F32Fp8) }
+            "F32Bf8" => { v.expect_unit("F32Bf8")?; Ok(CvtOp::F32Bf8) }
+            "PkBf8F32" => { v.expect_unit("PkBf8F32")?; Ok(CvtOp::PkBf8F32) }
+            "ScalePkBf16Fp8" => { v.expect_unit("ScalePkBf16Fp8")?; Ok(CvtOp::ScalePkBf16Fp8) }
+            "ScalePkF16Fp8" => { v.expect_unit("ScalePkF16Fp8")?; Ok(CvtOp::ScalePkF16Fp8) }
+            "ScalePkBf16Bf8" => { v.expect_unit("ScalePkBf16Bf8")?; Ok(CvtOp::ScalePkBf16Bf8) }
+            "ScalePkF16Bf8" => { v.expect_unit("ScalePkF16Bf8")?; Ok(CvtOp::ScalePkF16Bf8) }
+            "ScalePkF32Fp8" => { v.expect_unit("ScalePkF32Fp8")?; Ok(CvtOp::ScalePkF32Fp8) }
+            "ScalePkF32Bf8" => { v.expect_unit("ScalePkF32Bf8")?; Ok(CvtOp::ScalePkF32Bf8) }
+            "ScalePkF32Fp4" => { v.expect_unit("ScalePkF32Fp4")?; Ok(CvtOp::ScalePkF32Fp4) }
+            "ScalePkBf16Fp4" => { v.expect_unit("ScalePkBf16Fp4")?; Ok(CvtOp::ScalePkBf16Fp4) }
+            "ScalePkF16Fp4" => { v.expect_unit("ScalePkF16Fp4")?; Ok(CvtOp::ScalePkF16Fp4) }
+            "ScalePkFp8F32" => { v.expect_unit("ScalePkFp8F32")?; Ok(CvtOp::ScalePkFp8F32) }
+            "ScalePkBf8F32" => { v.expect_unit("ScalePkBf8F32")?; Ok(CvtOp::ScalePkBf8F32) }
+            "ScalePkFp4F32" => { v.expect_unit("ScalePkFp4F32")?; Ok(CvtOp::ScalePkFp4F32) }
+            "PkU8F32" => { v.expect_unit("PkU8F32")?; Ok(CvtOp::PkU8F32) }
+            "PkI16I32" => { v.expect_unit("PkI16I32")?; Ok(CvtOp::PkI16I32) }
+            "PkU16U32" => { v.expect_unit("PkU16U32")?; Ok(CvtOp::PkU16U32) }
+            other => Err(v.err(format!("unknown CvtOp variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for CvtOp {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            CvtOp::PkF32Fp8 => {}
+            CvtOp::PkF32Bf8 => {}
+            CvtOp::F32Fp8 => {}
+            CvtOp::F32Bf8 => {}
+            CvtOp::PkBf8F32 => {}
+            CvtOp::ScalePkBf16Fp8 => {}
+            CvtOp::ScalePkF16Fp8 => {}
+            CvtOp::ScalePkBf16Bf8 => {}
+            CvtOp::ScalePkF16Bf8 => {}
+            CvtOp::ScalePkF32Fp8 => {}
+            CvtOp::ScalePkF32Bf8 => {}
+            CvtOp::ScalePkF32Fp4 => {}
+            CvtOp::ScalePkBf16Fp4 => {}
+            CvtOp::ScalePkF16Fp4 => {}
+            CvtOp::ScalePkFp8F32 => {}
+            CvtOp::ScalePkBf8F32 => {}
+            CvtOp::ScalePkFp4F32 => {}
+            CvtOp::PkU8F32 => {}
+            CvtOp::PkI16I32 => {}
+            CvtOp::PkU16U32 => {}
+        }
     }
 }
 
