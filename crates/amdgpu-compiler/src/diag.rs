@@ -208,7 +208,7 @@ pub fn summary_json(f: &Function) -> Result<String, String> {
     let (m, a) = crate::compile_mir_alloc(f)?;
     let agpr = crate::regalloc::agpr_count(&m, &a);
     let mut per_region: std::collections::BTreeMap<String, [usize; 7]> = Default::default();
-    let name_of = |id: u16| -> String { m.regions.iter().find(|(_, i)| *i == id).map(|(n, _)| n.clone()).unwrap_or_else(|| if id == 0 { "(kernel)".into() } else { format!("region{id}") }) };
+    let name_of = |id: u16| -> String { m.reg_hints.regions.iter().find(|(_, i)| *i == id).map(|(n, _)| n.clone()).unwrap_or_else(|| if id == 0 { "(kernel)".into() } else { format!("region{id}") }) };
     let (mut waits, mut nops, mut nop_states) = (0usize, 0usize, 0usize);
     for b in &m.blocks {
         for i in &b.insts {
