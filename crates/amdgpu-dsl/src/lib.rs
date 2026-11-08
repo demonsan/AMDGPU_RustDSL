@@ -304,7 +304,7 @@ impl CvtOp {
 /// DPP lane control (gfx9). Rows are 16 lanes. `QuadPerm(p)`: lane i reads lane 4 (i / 4) + p[i % 4]; `RowShl(n)` / `RowShr(n)` / `RowRor(n)`
 /// (1..=15): within the row, read lane + n / lane - n / (lane - n) mod 16; `WaveShl1` / `WaveShr1` / `WaveRol1` / `WaveRor1`: whole-wave shift /
 /// rotate by one; `RowMirror` (15 - i), `RowHalfMirror` (7 - i within 8); `RowBcast15` (lane 15 of the previous row), `RowBcast31` (lane 31, for
-/// lanes 32..63). Out-of-range sources are INVALID: with `bound_zero` they read 0, else the lane keeps `old`.
+/// lanes 32..63; the rows a broadcast does not target read their own lane — measured). Out-of-range sources are INVALID: with `bound_zero` they\n/// read 0, else the lane keeps `old`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DppCtrl {
     QuadPerm([u8; 4]),

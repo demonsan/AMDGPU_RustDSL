@@ -655,8 +655,9 @@ def dpp_src(ctrl, i):
     if k == "wror": return (i - 1) % 64
     if k == "mirror": return r + 15 - j
     if k == "hmirror": return i // 8 * 8 + 7 - i % 8
-    if k == "bc15": return r - 1 if r >= 16 else None
-    if k == "bc31": return 31 if i >= 32 else None
+    # broadcasts: the rows they do not target read their own lane (measured), not an invalid source
+    if k == "bc15": return r - 1 if r >= 16 else i
+    if k == "bc31": return 31 if i >= 32 else i
     raise ValueError(k)
 
 def check_dpp_p1(planes, out):
