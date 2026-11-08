@@ -266,8 +266,8 @@ int main(int argc, char** argv) {
                 if (kind == "i8" || kind == "rowcol_fp8") { ref *= (double)sa_row[m] * sb_col[n]; mag *= (double)sa_row[m] * sb_col[n]; }
             }
             double got = bf16_to_f(out[(size_t)m * N + n]);
-            // bf16 output (2^-8 relative) + fp32 accumulation over K terms of magnitude sum `mag` (cancellation): 1e-4 mag
-            double err = std::fabs(got - ref), tol = 1e-2 * std::fabs(ref) + 1e-4 * mag + 1e-6;
+            // bf16 output (2^-8 relative) + the worst-case fp32 summation error over K terms of magnitude sum `mag`: K 2^-24 mag (x2)
+            double err = std::fabs(got - ref), tol = 1e-2 * std::fabs(ref) + 2.0 * K * std::ldexp(1.0, -24) * mag + 1e-6;
             if (err > tol) {
                 if (bad < envi("SHOW_BAD", 0)) printf("  bad m=%d n=%d got=%.6g ref=%.6g mag=%.6g\n", m, n, got, ref, mag);
                 bad++;
