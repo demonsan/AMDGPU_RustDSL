@@ -283,3 +283,60 @@ pub fn probe_mem_p1() -> Function {
     b.finish()
 }
 
+
+/// MFMA kinds of `probe_mfma_p1`, in input / output order.
+pub fn mfma_p1_kinds() -> Vec<amdgpu_dsl::MmaKind> {
+    use amdgpu_dsl::{MmaKind, MmaShape as S, MmaTy as T};
+    vec![
+        MmaKind::new(S::M16N16K32, T::Bf16),
+        MmaKind::new(S::M32N32K16, T::Bf16),
+        MmaKind::new(S::M16N16K32, T::F16),
+        MmaKind::new(S::M32N32K16, T::F16),
+        MmaKind::new(S::M16N16K64, T::I8),
+        MmaKind::new(S::M32N32K32, T::I8),
+    ]
+}
+
+/// `probe_mfma_p1(in, out)`: for every kind, A and B fragments (16 bytes per lane each, lane-major) from `in`; `out` gets per kind
+/// D = A x B (zero-C form), D2 = A x B + D (C form) and D3 (loop-variable form: var = A x B, then var += A x B), each lane-major.
+pub fn probe_mfma_p1() -> Function {
+    let kinds = mfma_p1_kinds();
+    let mut b = FnBuilder::new("probe_mfma_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    let out_bytes: u32 = kinds.iter().map(|k| 3 * 64 * 4 * k.acc_dwords()).sum();
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const((kinds.len() * 2048) as i64));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(out_bytes as i64));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let c16 = b.c_i32(16);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::Val(c16)));
+    let mut obase = 0u32;
+    for (i, k) in kinds.iter().enumerate() {
+        let pa = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::I32((i * 2048) as i32) });
+        let pa = b.let_(Op::PtrAdd { base: Opnd::Val(pa), byte_off: Opnd::Val(off16) });
+        let fa = b.load_global(pa, 0, amdgpu_dsl::MemTy::B128);
+        let fb = b.load_global(pa, 1024, amdgpu_dsl::MemTy::B128);
+        let d1 = b.mfma(*k, fa, fb, None);
+        let d2 = b.mfma(*k, fa, fb, Some(Opnd::Val(d1)));
+        let vars = b.begin_loop(&[(k.acc_ty(), Opnd::Val(d1))]);
+        b.var_mfma(vars[0], *k, fa, fb, true);
+        b.var_mfma(vars[0], *k, fa, fb, false);
+        let always = b.cmp(CmpPred::Ge, CmpTy::I32, tid, 0);
+        b.break_if(always);
+        b.end_loop();
+        let n = k.acc_dwords();
+        let lane_off = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32((4 * n) as i32)));
+        for (j, v) in [Opnd::Val(d1), Opnd::Val(d2), Opnd::Var(vars[0])].into_iter().enumerate() {
+            let p = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::I32((obase + j as u32 * 64 * 4 * n) as i32) });
+            let p = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(lane_off) });
+            for e in 0..n as u8 {
+                let x = if n == 4 { b.frag4_lane(v, e) } else { b.frag16_lane(v, e) };
+                b.store_global(p, 4 * e as u32, x, amdgpu_dsl::MemTy::B32, false);
+            }
+        }
+        obase += 3 * 64 * 4 * n;
+    }
+    b.finish()
+}

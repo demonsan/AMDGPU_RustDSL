@@ -320,9 +320,91 @@ def check_mem_p1(planes_in, out):
     print(f"probe_mem_p1: {MEM_PLANES} planes x {LANES} lanes + 2 store regions, {'all match' if bad == 0 else f'{bad} mismatches'}")
     return bad == 0
 
+# ---------------------------------------------------------------- probe_mfma_p1
+# kinds: (name, M, K, element type, acc dwords); layouts (gfx950, hypothesis checked by the probe):
+#   A: lane l holds row l % M and k = (16 bytes / elem) * (l / M) + 0..; B: column l % M, same k; D (16x16): lane l column l % 16,
+#   rows 4 (l / 16) + 0..3; D (32x32): lane l column l % 32, value r: row 8 (r / 4) + 4 (l / 32) + r % 4.
+MFMA_KINDS = [("bf16_16x16x32", 16, 32, "bf16", 4), ("bf16_32x32x16", 32, 16, "bf16", 16), ("f16_16x16x32", 16, 32, "f16", 4),
+              ("f16_32x32x16", 32, 16, "f16", 16), ("i8_16x16x64", 16, 64, "i8", 4), ("i8_32x32x32", 32, 32, "i8", 16)]
+
+def enc(ty, v):
+    if ty == "bf16": return struct.unpack("<I", struct.pack("<f", float(v)))[0] >> 16
+    if ty == "f16": return struct.unpack("<H", struct.pack("<e", float(v)))[0]
+    return v & 0xFF
+
+def gen_mfma_p1():
+    rnd = random.Random(77)
+    words = []
+    for name, M, K, ty, n in MFMA_KINDS:
+        per = 8 if ty != "i8" else 16
+        bits = 16 if ty != "i8" else 8
+        for _ in range(2):  # A then B: 64 lanes x 16 bytes
+            for l in range(LANES):
+                vals = [rnd.randint(-4, 4) for _ in range(per)]
+                x = 0
+                for i, v in enumerate(vals):
+                    x |= enc(ty, v) << (bits * i)
+                words += [(x >> (32 * j)) & 0xFFFFFFFF for j in range(4)]
+    return [words]
+
+def dec_frag(ty, words4):
+    x = sum(w << (32 * j) for j, w in enumerate(words4))
+    if ty == "i8":
+        return [s8 if (s8 := (x >> (8 * i)) & 255) < 128 else s8 - 256 for i in range(16)]
+    out = []
+    for i in range(8):
+        h = (x >> (16 * i)) & 0xFFFF
+        out.append(struct.unpack("<f", struct.pack("<I", h << 16))[0] if ty == "bf16" else h2f(h))
+    return out
+
+def check_mfma_p1(planes, out):
+    words = planes[0]
+    pos = 0
+    obase = 0
+    ok = True
+    for name, M, K, ty, n in MFMA_KINDS:
+        per = 8 if ty != "i8" else 16
+        A = [[0] * K for _ in range(M)]
+        B = [[0] * M for _ in range(K)]
+        for which in range(2):
+            for l in range(LANES):
+                vals = dec_frag(ty, words[pos + 4 * l: pos + 4 * l + 4])
+                for i, v in enumerate(vals):
+                    kk = per * (l // M) + i
+                    if which == 0:
+                        A[l % M][kk] = v
+                    else:
+                        B[kk][l % M] = v
+            pos += 4 * LANES
+        D = [[sum(A[r][k] * B[k][c] for k in range(K)) for c in range(M)] for r in range(M)]
+        def at(l, r):
+            if n == 4:
+                return D[4 * (l // 16) + r][l % 16]
+            return D[8 * (r // 4) + 4 * (l // 32) + r % 4][l % 32]
+        for j, mult in enumerate((1, 2, 2)):
+            bad = 0
+            first = None
+            for l in range(LANES):
+                for r in range(n):
+                    got = out[obase + (j * LANES + l) * n + r]
+                    want = at(l, r) * mult
+                    gv = s32(got) if ty == "i8" else f32(got)
+                    if gv != want:
+                        bad += 1
+                        first = first or (l, r, want, gv)
+            form = ["zero-C", "C", "var"][j]
+            if bad:
+                ok = False
+                print(f"FAIL {name} {form}: {bad} values, e.g. lane {first[0]} value {first[1]} want {first[2]} got {first[3]}")
+            else:
+                print(f"ok   {name} {form}")
+        obase += 3 * LANES * n
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
+    "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS)),
 }
 
 def main():
