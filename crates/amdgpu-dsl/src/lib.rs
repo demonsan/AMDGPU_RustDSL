@@ -127,12 +127,12 @@ impl From<f32> for Opnd {
 
 /// Unary VALU ops (P1, docs/op-coverage-tileops.md). `SinF32` / `CosF32` take the angle in REVOLUTIONS (sin(2 pi x)), as the hardware does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum UnOp { FloorF32, CeilF32, TruncF32, RndneF32, FractF32, RsqF32, SqrtF32, SinF32, CosF32, CvtI32F32, CvtU32F32, CvtF32I32, CvtF32U32, CvtF32Ubyte0, CvtF32Ubyte1, CvtF32Ubyte2, CvtF32Ubyte3 }
+pub enum UnOp { FloorF32, CeilF32, TruncF32, RndneF32, FractF32, RsqF32, SqrtF32, SinF32, CosF32, CvtI32F32, CvtU32F32, CvtF32I32, CvtF32U32, CvtF32Ubyte0, CvtF32Ubyte1, CvtF32Ubyte2, CvtF32Ubyte3, Ffbl, Ffbh }
 
 /// Binary VALU ops. `AshrI32(a, b)` = a >> b (arithmetic); `MulHi*` = high 32 bits of the 64-bit product; `MulU32U24` = low 24 bits x low 24 bits;
 /// `Pk*F16` operate on two f16 halves of a dword (a `U32` container).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BinOp { MinF32, MaxI32, MaxU32, MinU32, SubU32, MulU32U24, AshrI32, MulHiU32, MulHiI32, OrB32, PkAddF16, PkMulF16, PkMaxF16, PkMinF16 }
+pub enum BinOp { MinF32, MaxI32, MaxU32, MinU32, SubU32, MulU32U24, AshrI32, MulHiU32, MulHiI32, OrB32, PkAddF16, PkMulF16, PkMaxF16, PkMinF16, MbcntLo, MbcntHi, BcntAdd }
 
 /// Ternary VALU ops. `MadU32U24(a, b, c)` = a[23:0] * b[23:0] + c; `LshlAddU32(a, s, c)` = (a << s) + c; `Add3U32` = a + b + c;
 /// `BfeU32 / BfeI32(x, off, width)` = bit-field extract; `BfiB32(mask, a, b)` = (mask & a) | (!mask & b); `PkFmaF16` on f16 pairs.
@@ -261,14 +261,18 @@ impl CachePolicy {
     }
 }
 
-/// Conversions (P1 A2; `Op::Cvt { op, srcs, sel }`). Operands per op (unused slots: anything, conventionally `Opnd::I32(0)`):
+/// Conversions (P1 A2; `Op::Cvt { op, srcs, sel }`). Operands per op (unused slots: anything, conventionally `Opnd::I32(0)`).
+///
+/// SCALE operands (`ScalePk*`) are f32 values of which the hardware uses ONLY THE EXPONENT (E8M0 semantics, measured: a scale of 1.63 acts as
+/// 1.0, 3.0 as 2.0): the effective scale is 2^floor(log2 |scale|). Pass powers of two (e.g. an E8M0 byte shifted into an f32 exponent); a
+/// constant scale that is not a power of two is rejected by the IR verifier.
 /// * `PkF32Fp8` / `PkF32Bf8`: srcs[0] packed bytes, `sel` = word (0 / 1) -> the two values as a Frag2 of f32.
 /// * `F32Fp8` / `F32Bf8`: srcs[0], `sel` = byte (0..3) -> F32.
 /// * `PkBf8F32`: srcs[0], srcs[1] f32, srcs[2] old dword; the two bf8 bytes replace word `sel` of the old dword -> I32.
-/// * `ScalePk{Bf16,F16}{Fp8,Bf8}`: srcs[0] packed bytes, srcs[1] f32 scale; word `sel` -> two 16-bit values in a U32.
+/// * `ScalePk{Bf16,F16}{Fp8,Bf8}`: srcs[0] packed bytes, srcs[1] f32 scale (exponent only); word `sel` -> two 16-bit values in a U32 (value · 2^e).
 /// * `ScalePkF32{Fp8,Bf8}`: as above -> Frag2 of f32.
 /// * `ScalePk{F32,Bf16,F16}Fp4`: srcs[0] packed fp4, srcs[1] scale; byte `sel` (two fp4 values) -> Frag2 f32 / U32.
-/// * `ScalePk{Fp8,Bf8}F32`: srcs[0], srcs[1] f32, srcs[2] scale, srcs[3] old; word `sel` replaced -> I32 (value / scale, saturated).
+/// * `ScalePk{Fp8,Bf8}F32`: srcs[0], srcs[1] f32, srcs[2] scale (exponent only), srcs[3] old; word `sel` replaced -> I32 (value / 2^e).
 /// * `ScalePkFp4F32`: srcs[0], srcs[1] f32, srcs[2] scale, srcs[3] old; byte `sel` replaced by the two fp4 values -> I32.
 /// * `PkU8F32`: srcs[0] f32, srcs[1] old; byte `sel` replaced by the value rounded and clamped to u8 -> I32.
 /// * `PkI16I32` / `PkU16U32`: srcs[0], srcs[1] -> two saturated 16-bit values -> U32.
@@ -365,6 +369,16 @@ impl Dpp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DppAluOp { AddF32, SubF32, MulF32, MaxF32, MinF32, AddU32, MaxI32, MinI32, MaxU32, MinU32, AndB32, OrB32, XorB32 }
 
+/// Atomic read-modify-write operations (B3). `IncU32`: old >= value ? 0 : old + 1 (a wrapping counter).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AtomicOp { AddU32, MaxU32, MinU32, MaxI32, MinI32, IncU32, AddF32 }
+
+impl AtomicOp {
+    pub fn value_ty(self) -> DType {
+        if self == AtomicOp::AddF32 { DType::F32 } else { DType::U32 }
+    }
+}
+
 impl MemTy {
     pub fn bytes(self) -> u32 {
         match self {
@@ -392,12 +406,13 @@ impl D16Ty {
 
 impl UnOp {
     pub fn float_in(self) -> bool {
-        !matches!(self, UnOp::CvtF32I32 | UnOp::CvtF32U32 | UnOp::CvtF32Ubyte0 | UnOp::CvtF32Ubyte1 | UnOp::CvtF32Ubyte2 | UnOp::CvtF32Ubyte3)
+        !matches!(self, UnOp::CvtF32I32 | UnOp::CvtF32U32 | UnOp::CvtF32Ubyte0 | UnOp::CvtF32Ubyte1 | UnOp::CvtF32Ubyte2 | UnOp::CvtF32Ubyte3 | UnOp::Ffbl | UnOp::Ffbh)
     }
     pub fn result_ty(self) -> DType {
         match self {
             UnOp::CvtI32F32 => DType::I32,
             UnOp::CvtU32F32 => DType::U32,
+            UnOp::Ffbl | UnOp::Ffbh => DType::I32,
             _ => DType::F32,
         }
     }
@@ -608,6 +623,22 @@ pub enum Op {
     LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
     LoadLdsTrB16 { addr: Opnd },
+    /// LDS atomic returning the old value (`ds_<op>_rtn_*`)
+    AtomicLds { op: AtomicOp, addr: Opnd, value: Opnd },
+    /// global atomic returning the old value (`global_atomic_<op> ... sc0`)
+    AtomicGlobal { op: AtomicOp, base: Opnd, byte_off: u32, value: Opnd },
+    /// `v_readlane_b32`: lane `lane`'s value of `x` (wave-uniform result)
+    ReadLane { x: Opnd, lane: u8 },
+    /// `v_writelane_b32`: `old` with lane `lane` replaced by the (uniform) `x` (a non-uniform `x` is read from the first active lane)
+    WriteLane { x: Opnd, lane: u8, old: Opnd },
+    /// the 32-bit half (`hi`) of the wave mask of lanes where `cond` (I1) holds (`v_cmp_ne_u32_e64` into an SGPR pair); wave-uniform
+    Ballot { cond: Opnd, hi: bool },
+    /// `ds_bpermute_b32`: lane k gets `x` of lane (addr[k] + offset) / 4 % 64 (a pull; no LDS memory is touched)
+    Bpermute { addr: Opnd, x: Opnd, offset: u16 },
+    /// `ds_permute_b32`: lane k sends its `x` to lane (addr[k] + offset) / 4 % 64 (a push; lanes nobody writes get 0)
+    Permute { addr: Opnd, x: Opnd, offset: u16 },
+    /// `ds_swizzle_b32 offset:pattern` (bit 15: quad-perm mode, else bit-mask mode and_mask / or_mask / xor_mask within 32 lanes)
+    Swizzle { x: Opnd, pattern: u16 },
     /// `v_mov_b32_dpp`: lane i gets `x` of the lane `dpp.ctrl` names (lanes not written keep `old`)
     Dpp { dpp: Dpp, x: Opnd, old: Opnd },
     /// `v_<op>_dpp`: dpp(a) op b, lanes not written keep `old`
@@ -634,6 +665,8 @@ impl Op {
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
+            Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => DType::I32,
+            Op::AtomicLds { op, .. } | Op::AtomicGlobal { op, .. } => op.value_ty(),
             Op::DppAlu { op, .. } => match op {
                 DppAluOp::AddF32 | DppAluOp::SubF32 | DppAluOp::MulF32 | DppAluOp::MaxF32 | DppAluOp::MinF32 => DType::F32,
                 _ => DType::I32,
@@ -728,6 +761,12 @@ impl Op {
             Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } | Op::LoadLdsD16 { addr, .. } => vec![*addr],
             Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
             Op::Dpp { x, old, .. } => vec![*x, *old],
+            Op::ReadLane { x, .. } | Op::Swizzle { x, .. } => vec![*x],
+            Op::WriteLane { x, old, .. } => vec![*x, *old],
+            Op::Ballot { cond, .. } => vec![*cond],
+            Op::Bpermute { addr, x, .. } | Op::Permute { addr, x, .. } => vec![*addr, *x],
+            Op::AtomicLds { addr, value, .. } => vec![*addr, *value],
+            Op::AtomicGlobal { base, value, .. } => vec![*base, *value],
             Op::DppAlu { a, b, old, .. } => vec![*a, *b, *old],
             Op::Permlane16Swap { a, b } => vec![*a, *b],
             Op::Mfma { a, b, c, scale, .. } => {
@@ -1054,6 +1093,10 @@ pub enum Stmt {
     BufferStoreN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd, ty: MemTy, hi: bool, cache: CachePolicy },
     /// LDS store of any width (same `hi` rule)
     StoreLdsN { addr: Opnd, value: Opnd, ty: MemTy, hi: bool },
+    /// LDS atomic without return
+    AtomicLdsNoRet { op: AtomicOp, addr: Opnd, value: Opnd },
+    /// global atomic without return
+    AtomicGlobalNoRet { op: AtomicOp, base: Opnd, byte_off: u32, value: Opnd },
     /// `ds_write2[st64]_b32 / _b64`: `v0` at `addr + off0 * s`, `v1` at `addr + off1 * s`
     StoreLds2 { addr: Opnd, v0: Opnd, v1: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// In-place MFMA accumulate into a loop variable: var = A x B + var (`zero`: var = A x B)
@@ -1997,6 +2040,56 @@ impl FnBuilder {
         self.let_(Op::LoadLdsTrB16 { addr: addr.into() })
     }
 
+    /// LDS atomic: returns the old value (`ret`) or `None` (no-return form, cheaper).
+    pub fn atomic_lds(&mut self, op: AtomicOp, addr: impl Into<Opnd>, value: impl Into<Opnd>, ret: bool) -> Option<ValueId> {
+        let (addr, value) = (addr.into(), value.into());
+        if ret {
+            Some(self.let_(Op::AtomicLds { op, addr, value }))
+        } else {
+            self.push_stmt(Stmt::AtomicLdsNoRet { op, addr, value });
+            None
+        }
+    }
+    /// Global atomic: returns the old value (`ret`) or `None`.
+    pub fn atomic_global(&mut self, op: AtomicOp, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ret: bool) -> Option<ValueId> {
+        let (base, value) = (base.into(), value.into());
+        if ret {
+            Some(self.let_(Op::AtomicGlobal { op, base, byte_off, value }))
+        } else {
+            self.push_stmt(Stmt::AtomicGlobalNoRet { op, base, byte_off, value });
+            None
+        }
+    }
+    /// `v_readlane_b32`: lane `lane`'s `x` (uniform).
+    pub fn read_lane(&mut self, x: impl Into<Opnd>, lane: u8) -> ValueId {
+        self.let_(Op::ReadLane { x: x.into(), lane })
+    }
+    /// `v_writelane_b32`: `old` with lane `lane` set to `x`.
+    pub fn write_lane(&mut self, x: impl Into<Opnd>, lane: u8, old: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::WriteLane { x: x.into(), lane, old: old.into() })
+    }
+    /// (low, high) halves of the wave mask of lanes where `cond` holds.
+    pub fn ballot(&mut self, cond: impl Into<Opnd>) -> (ValueId, ValueId) {
+        let c = cond.into();
+        (self.let_(Op::Ballot { cond: c, hi: false }), self.let_(Op::Ballot { cond: c, hi: true }))
+    }
+    /// The lane's index among the lanes set in (`lo`, `hi`) below it (`v_mbcnt_lo` + `v_mbcnt_hi`); with -1 / -1: the lane id.
+    pub fn mbcnt(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
+        let l = self.let_(Op::Bin(BinOp::MbcntLo, lo.into(), Opnd::I32(0)));
+        self.let_(Op::Bin(BinOp::MbcntHi, hi.into(), Opnd::Val(l)))
+    }
+    /// `ds_bpermute_b32`: lane k gets `x` of lane addr[k] / 4.
+    pub fn bpermute(&mut self, addr: impl Into<Opnd>, x: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Bpermute { addr: addr.into(), x: x.into(), offset: 0 })
+    }
+    /// `ds_permute_b32`: lane k sends `x` to lane addr[k] / 4.
+    pub fn permute(&mut self, addr: impl Into<Opnd>, x: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Permute { addr: addr.into(), x: x.into(), offset: 0 })
+    }
+    /// `ds_swizzle_b32` with the raw 16-bit pattern.
+    pub fn swizzle(&mut self, x: impl Into<Opnd>, pattern: u16) -> ValueId {
+        self.let_(Op::Swizzle { x: x.into(), pattern })
+    }
     /// `v_mov_b32_dpp` with a full DPP control; lanes not written keep `old`.
     pub fn dpp(&mut self, dpp: Dpp, x: impl Into<Opnd>, old: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Dpp { dpp, x: x.into(), old: old.into() })
@@ -2744,6 +2837,25 @@ fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
             }
             data(&mut e, *value, *ty, *hi);
         }
+        Stmt::AtomicLdsNoRet { addr, value, .. } => {
+            if let Err(x) = expect_int(f, *addr, "lds atomic address") {
+                e.push(x);
+            }
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
+        Stmt::AtomicGlobalNoRet { base, value, byte_off, .. } => {
+            if !matches!(opnd_ty(f, *base), Ok(DType::Ptr)) {
+                e.push("global atomic: base must be a pointer".into());
+            }
+            if *byte_off > 4095 {
+                e.push(format!("global atomic: byte offset {byte_off} exceeds 4095"));
+            }
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
         Stmt::StoreLds2 { addr, v0, v1, b64, .. } => {
             if let Err(x) = expect_int(f, *addr, "lds store address") {
                 e.push(x);
@@ -2798,6 +2910,25 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
         }
         Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
         Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
+        Op::AtomicLds { addr, value, .. } => {
+            if let Err(x) = expect_int(f, *addr, "lds atomic address") {
+                e.push(x);
+            }
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
+        Op::AtomicGlobal { base, value, byte_off, .. } => {
+            if !matches!(opnd_ty(f, *base), Ok(DType::Ptr)) {
+                e.push("global atomic: base must be a pointer".into());
+            }
+            if *byte_off > 4095 {
+                e.push(format!("global atomic: byte offset {byte_off} exceeds 4095"));
+            }
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
         Op::Dpp { x, old, dpp } | Op::DppAlu { a: x, old, dpp, .. } => {
             for s in [*x, *old] {
                 if let Err(e2) = expect_dword(f, s, "dpp operand") {
@@ -2821,6 +2952,32 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
             for s in &srcs[..n] {
                 if let Err(x) = expect_dword(f, *s, "cvt operand") {
                     e.push(x);
+                }
+            }
+            // the scale operand: only its exponent is used (E8M0) - a constant that is not a power of two is certainly a mistake
+            let scale_slot = match op {
+                CvtOp::ScalePkBf16Fp8 | CvtOp::ScalePkF16Fp8 | CvtOp::ScalePkBf16Bf8 | CvtOp::ScalePkF16Bf8 | CvtOp::ScalePkF32Fp8 | CvtOp::ScalePkF32Bf8
+                | CvtOp::ScalePkF32Fp4 | CvtOp::ScalePkBf16Fp4 | CvtOp::ScalePkF16Fp4 => Some(1),
+                CvtOp::ScalePkFp8F32 | CvtOp::ScalePkBf8F32 | CvtOp::ScalePkFp4F32 => Some(2),
+                _ => None,
+            };
+            if let Some(k) = scale_slot {
+                let c = match srcs[k] {
+                    Opnd::F32(x) => Some(x),
+                    Opnd::Val(v) => match f.stmts().iter().find_map(|s| match s {
+                        Stmt::Let { dst, op: Op::ConstF32(x) } if *dst == v => Some(*x),
+                        _ => None,
+                    }) {
+                        Some(x) => Some(x),
+                        None => None,
+                    },
+                    _ => None,
+                };
+                if let Some(x) = c {
+                    let m = x.abs().to_bits() & 0x7f_ffff;
+                    if m != 0 || x == 0.0 || !x.is_finite() {
+                        e.push(format!("cvt {op:?}: scale {x} is not a power of two; the hardware uses only its exponent (E8M0): it would act as {}", if x.is_finite() && x != 0.0 { f32::from_bits(x.abs().to_bits() & 0x7f80_0000).to_string() } else { "garbage".to_string() }));
+                    }
                 }
             }
         }
@@ -3382,7 +3539,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
                 errs.extend(check_mfma(f, *kind, *a, *b, None, scale.as_ref()).into_iter().map(here));
             }
-            Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => {
+            Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::AtomicLdsNoRet { .. } | Stmt::AtomicGlobalNoRet { .. } => {
                 for o in stmt_operands(st) {
                     if let Opnd::Val(v) = o {
                         if !visible(&scopes, v) {
@@ -3803,6 +3960,8 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         }
         Stmt::StoreLdsN { addr, value, .. } => vec![*addr, *value],
         Stmt::StoreLds2 { addr, v0, v1, .. } => vec![*addr, *v0, *v1],
+        Stmt::AtomicLdsNoRet { addr, value, .. } => vec![*addr, *value],
+        Stmt::AtomicGlobalNoRet { base, value, .. } => vec![*base, *value],
         Stmt::VarMfma { a, b, scale, .. } => {
             let mut v = vec![*a, *b];
             if let Some(s) = scale {

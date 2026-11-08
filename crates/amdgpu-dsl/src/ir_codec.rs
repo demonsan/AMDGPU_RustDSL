@@ -170,6 +170,14 @@ impl FromIr for Op {
             "LoadLdsD16" => { v.expect_struct("LoadLdsD16")?; Ok(Op::LoadLdsD16 { addr: FromIr::from_ir(v.field("addr")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
             "LoadLds2" => { v.expect_struct("LoadLds2")?; Ok(Op::LoadLds2 { addr: FromIr::from_ir(v.field("addr")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
             "LoadLdsTrB16" => { v.expect_struct("LoadLdsTrB16")?; Ok(Op::LoadLdsTrB16 { addr: FromIr::from_ir(v.field("addr")?)? }) }
+            "AtomicLds" => { v.expect_struct("AtomicLds")?; Ok(Op::AtomicLds { op: FromIr::from_ir(v.field("op")?)?, addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
+            "AtomicGlobal" => { v.expect_struct("AtomicGlobal")?; Ok(Op::AtomicGlobal { op: FromIr::from_ir(v.field("op")?)?, base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
+            "ReadLane" => { v.expect_struct("ReadLane")?; Ok(Op::ReadLane { x: FromIr::from_ir(v.field("x")?)?, lane: FromIr::from_ir(v.field("lane")?)? }) }
+            "WriteLane" => { v.expect_struct("WriteLane")?; Ok(Op::WriteLane { x: FromIr::from_ir(v.field("x")?)?, lane: FromIr::from_ir(v.field("lane")?)?, old: FromIr::from_ir(v.field("old")?)? }) }
+            "Ballot" => { v.expect_struct("Ballot")?; Ok(Op::Ballot { cond: FromIr::from_ir(v.field("cond")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
+            "Bpermute" => { v.expect_struct("Bpermute")?; Ok(Op::Bpermute { addr: FromIr::from_ir(v.field("addr")?)?, x: FromIr::from_ir(v.field("x")?)?, offset: FromIr::from_ir(v.field("offset")?)? }) }
+            "Permute" => { v.expect_struct("Permute")?; Ok(Op::Permute { addr: FromIr::from_ir(v.field("addr")?)?, x: FromIr::from_ir(v.field("x")?)?, offset: FromIr::from_ir(v.field("offset")?)? }) }
+            "Swizzle" => { v.expect_struct("Swizzle")?; Ok(Op::Swizzle { x: FromIr::from_ir(v.field("x")?)?, pattern: FromIr::from_ir(v.field("pattern")?)? }) }
             "Dpp" => { v.expect_struct("Dpp")?; Ok(Op::Dpp { dpp: FromIr::from_ir(v.field("dpp")?)?, x: FromIr::from_ir(v.field("x")?)?, old: FromIr::from_ir(v.field("old")?)? }) }
             "DppAlu" => { v.expect_struct("DppAlu")?; Ok(Op::DppAlu { op: FromIr::from_ir(v.field("op")?)?, dpp: FromIr::from_ir(v.field("dpp")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, old: FromIr::from_ir(v.field("old")?)? }) }
             "Permlane16Swap" => { v.expect_struct("Permlane16Swap")?; Ok(Op::Permlane16Swap { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
@@ -276,6 +284,14 @@ impl IrIds for Op {
             Op::LoadLdsD16 { addr, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
             Op::LoadLds2 { addr, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
             Op::LoadLdsTrB16 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
+            Op::AtomicLds { op, addr, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Op::AtomicGlobal { op, base, byte_off, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Op::ReadLane { x, lane } => { IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*lane), fv, fr); }
+            Op::WriteLane { x, lane, old } => { IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*lane), fv, fr); IrIds::ids(&mut (*old), fv, fr); }
+            Op::Ballot { cond, hi } => { IrIds::ids(&mut (*cond), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Op::Bpermute { addr, x, offset } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*offset), fv, fr); }
+            Op::Permute { addr, x, offset } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*offset), fv, fr); }
+            Op::Swizzle { x, pattern } => { IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*pattern), fv, fr); }
             Op::Dpp { dpp, x, old } => { IrIds::ids(&mut (*dpp), fv, fr); IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*old), fv, fr); }
             Op::DppAlu { op, dpp, a, b, old } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*dpp), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*old), fv, fr); }
             Op::Permlane16Swap { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
@@ -555,6 +571,8 @@ impl FromIr for Stmt {
             "StoreGlobalN" => { v.expect_struct("StoreGlobalN")?; Ok(Stmt::StoreGlobalN { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)?, cache: FromIr::from_ir(v.field("cache")?)? }) }
             "BufferStoreN" => { v.expect_struct("BufferStoreN")?; Ok(Stmt::BufferStoreN { rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)?, cache: FromIr::from_ir(v.field("cache")?)? }) }
             "StoreLdsN" => { v.expect_struct("StoreLdsN")?; Ok(Stmt::StoreLdsN { addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
+            "AtomicLdsNoRet" => { v.expect_struct("AtomicLdsNoRet")?; Ok(Stmt::AtomicLdsNoRet { op: FromIr::from_ir(v.field("op")?)?, addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
+            "AtomicGlobalNoRet" => { v.expect_struct("AtomicGlobalNoRet")?; Ok(Stmt::AtomicGlobalNoRet { op: FromIr::from_ir(v.field("op")?)?, base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
             "StoreLds2" => { v.expect_struct("StoreLds2")?; Ok(Stmt::StoreLds2 { addr: FromIr::from_ir(v.field("addr")?)?, v0: FromIr::from_ir(v.field("v0")?)?, v1: FromIr::from_ir(v.field("v1")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
             "VarMfma" => { v.expect_struct("VarMfma")?; Ok(Stmt::VarMfma { var: FromIr::from_ir(v.field("var")?)?, kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, scale: FromIr::from_ir(v.field("scale")?)?, zero: FromIr::from_ir(v.field("zero")?)? }) }
             "RegionMark" => { v.expect_struct("RegionMark")?; Ok(Stmt::RegionMark { name: FromIr::from_ir(v.field("name")?)?, begin: FromIr::from_ir(v.field("begin")?)? }) }
@@ -615,6 +633,8 @@ impl IrIds for Stmt {
             Stmt::StoreGlobalN { base, byte_off, value, ty, hi, cache } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); IrIds::ids(&mut (*cache), fv, fr); }
             Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi, cache } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); IrIds::ids(&mut (*cache), fv, fr); }
             Stmt::StoreLdsN { addr, value, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Stmt::AtomicLdsNoRet { op, addr, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::AtomicGlobalNoRet { op, base, byte_off, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
             Stmt::StoreLds2 { addr, v0, v1, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*v0), fv, fr); IrIds::ids(&mut (*v1), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
             Stmt::VarMfma { var, kind, a, b, scale, zero } => { fr(&mut (*var)); IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*scale), fv, fr); IrIds::ids(&mut (*zero), fv, fr); }
             Stmt::RegionMark { name, begin } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*begin), fv, fr); }
@@ -845,6 +865,8 @@ impl FromIr for UnOp {
             "CvtF32Ubyte1" => { v.expect_unit("CvtF32Ubyte1")?; Ok(UnOp::CvtF32Ubyte1) }
             "CvtF32Ubyte2" => { v.expect_unit("CvtF32Ubyte2")?; Ok(UnOp::CvtF32Ubyte2) }
             "CvtF32Ubyte3" => { v.expect_unit("CvtF32Ubyte3")?; Ok(UnOp::CvtF32Ubyte3) }
+            "Ffbl" => { v.expect_unit("Ffbl")?; Ok(UnOp::Ffbl) }
+            "Ffbh" => { v.expect_unit("Ffbh")?; Ok(UnOp::Ffbh) }
             other => Err(v.err(format!("unknown UnOp variant `{other}`"))),
         }
     }
@@ -869,6 +891,8 @@ impl IrIds for UnOp {
             UnOp::CvtF32Ubyte1 => {}
             UnOp::CvtF32Ubyte2 => {}
             UnOp::CvtF32Ubyte3 => {}
+            UnOp::Ffbl => {}
+            UnOp::Ffbh => {}
         }
     }
 }
@@ -890,6 +914,9 @@ impl FromIr for BinOp {
             "PkMulF16" => { v.expect_unit("PkMulF16")?; Ok(BinOp::PkMulF16) }
             "PkMaxF16" => { v.expect_unit("PkMaxF16")?; Ok(BinOp::PkMaxF16) }
             "PkMinF16" => { v.expect_unit("PkMinF16")?; Ok(BinOp::PkMinF16) }
+            "MbcntLo" => { v.expect_unit("MbcntLo")?; Ok(BinOp::MbcntLo) }
+            "MbcntHi" => { v.expect_unit("MbcntHi")?; Ok(BinOp::MbcntHi) }
+            "BcntAdd" => { v.expect_unit("BcntAdd")?; Ok(BinOp::BcntAdd) }
             other => Err(v.err(format!("unknown BinOp variant `{other}`"))),
         }
     }
@@ -911,6 +938,9 @@ impl IrIds for BinOp {
             BinOp::PkMulF16 => {}
             BinOp::PkMaxF16 => {}
             BinOp::PkMinF16 => {}
+            BinOp::MbcntLo => {}
+            BinOp::MbcntHi => {}
+            BinOp::BcntAdd => {}
         }
     }
 }
@@ -1321,6 +1351,34 @@ impl IrIds for DppAluOp {
             DppAluOp::AndB32 => {}
             DppAluOp::OrB32 => {}
             DppAluOp::XorB32 => {}
+        }
+    }
+}
+
+impl FromIr for AtomicOp {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "AddU32" => { v.expect_unit("AddU32")?; Ok(AtomicOp::AddU32) }
+            "MaxU32" => { v.expect_unit("MaxU32")?; Ok(AtomicOp::MaxU32) }
+            "MinU32" => { v.expect_unit("MinU32")?; Ok(AtomicOp::MinU32) }
+            "MaxI32" => { v.expect_unit("MaxI32")?; Ok(AtomicOp::MaxI32) }
+            "MinI32" => { v.expect_unit("MinI32")?; Ok(AtomicOp::MinI32) }
+            "IncU32" => { v.expect_unit("IncU32")?; Ok(AtomicOp::IncU32) }
+            "AddF32" => { v.expect_unit("AddF32")?; Ok(AtomicOp::AddF32) }
+            other => Err(v.err(format!("unknown AtomicOp variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for AtomicOp {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            AtomicOp::AddU32 => {}
+            AtomicOp::MaxU32 => {}
+            AtomicOp::MinU32 => {}
+            AtomicOp::MaxI32 => {}
+            AtomicOp::MinI32 => {}
+            AtomicOp::IncU32 => {}
+            AtomicOp::AddF32 => {}
         }
     }
 }

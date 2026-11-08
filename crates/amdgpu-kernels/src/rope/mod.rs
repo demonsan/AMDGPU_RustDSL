@@ -24,9 +24,18 @@ pub fn by_name(name: &str) -> Option<Function> {
     } else {
         return None;
     };
-    let (h, d) = rest.split_once("_d")?;
+    let (h, rest) = rest.split_once("_d")?;
+    // `_r<R>`: partial rotation, only the first R elements of a head rotate (default: all D)
+    let (d, r) = match rest.split_once("_r") {
+        Some((d, r)) => (d, Some(r)),
+        None => (rest, None),
+    };
     let (h, d): (i64, i64) = (h.parse().ok()?, d.parse().ok()?);
-    ((1..=256).contains(&h) && [64, 128, 256].contains(&d)).then(|| rope_kernel(name, h, d, style))
+    let r: i64 = match r {
+        Some(r) => r.parse().ok()?,
+        None => d,
+    };
+    ((1..=256).contains(&h) && [64, 128, 256].contains(&d) && r % 16 == 0 && (16..=d).contains(&r) && (r == d || r < d)).then(|| rope_kernel(name, h, d, style, r))
 }
 
 fn bf16x4_to_f32(b: &mut FnBuilder, frag2: ValueId) -> [ValueId; 4] {
@@ -47,7 +56,7 @@ fn pack8(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
     b.frag4(w[0], w[1], w[2], w[3])
 }
 
-pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle) -> Function {
+pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Function {
     let l = if style == RopeStyle::Neox { d / 16 } else { d / 8 }; // lanes per head row
     let rows_per_wave = 64 / l;
     // waves per block: only as many as the heads need (a block of idle waves would waste occupancy), at most 4
@@ -73,7 +82,7 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle) -> Function {
     b.arg_tensor("x", tt.clone() * Ext::c(2 * h * d));
     b.arg_tensor("out", tt.clone() * Ext::c(2 * h * d));
     b.arg_tensor("pos", tt * Ext::c(4));
-    b.arg_tensor("cos_sin", pp * Ext::c(2 * d));
+    b.arg_tensor("cos_sin", pp * Ext::c(2 * r));
     let (p_x, p_o, p_pos, p_cs) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 8 }), b.let_(Op::KernargPtr { offset: 16 }), b.let_(Op::KernargPtr { offset: 24 }));
     let t_v = b.let_(Op::KernargI32 { offset: 32 });
     let p_v = b.let_(Op::KernargI32 { offset: 36 });
@@ -82,20 +91,20 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle) -> Function {
     let r_x = { let v = b.bind_i32(ev(t_v) * (2 * h * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_x, v) };
     let r_o = { let v = b.bind_i32(ev(t_v) * (2 * h * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_o, v) };
     let r_pos = { let v = b.bind_i32(ev(t_v) << 2); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_pos, v) };
-    let r_cs = { let v = b.bind_i32(ev(p_v) * (2 * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_cs, v) };
+    let r_cs = { let v = b.bind_i32(ev(p_v) * (2 * r) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_cs, v) };
     // this token's position (uniform): positions[token], then the cos / sin row of the table
     let voff_pos = b.bind_i32(ev(tok) << 2);
     let posf = b.buffer_load_f32(r_pos, voff_pos, 0i32, 0);
     let posi = b.bitcast_i32(posf);
     let pos = b.read_first_lane(posi);
-    let cs_row = b.bind_i32(ev(pos) * (2 * d) as i32);
+    let cs_row = b.bind_i32(ev(pos) * (2 * r) as i32);
     let wave = b.bind_i32(ev(tid).lshr(6));
     let lane = b.bind_i32(ev(tid) & 63);
     let lr = b.bind_i32(ev(lane) & (l - 1) as i32);       // lane within the head row (l is a power of two)
     let row_in_wave = b.bind_i32(ev(lane).lshr(l.trailing_zeros() as i32));
     // cos / sin: lane `lr`'s part of the row, shared by every head
     let cs_lane = b.bind_i32(ev(cs_row) + if style == RopeStyle::Neox { ev(lr) << 4 } else { ev(lr) << 3 });
-    let cs_sin = b.bind_i32(ev(cs_lane) + d as i32);
+    let cs_sin = b.bind_i32(ev(cs_lane) + r as i32);
     let (cos, sin): (Vec<ValueId>, Vec<ValueId>) = if style == RopeStyle::Neox {
         let c = b.buffer_load_b128(r_cs, cs_lane, 0i32, 0);
         let s = b.buffer_load_b128(r_cs, cs_sin, 0i32, 0);
@@ -105,22 +114,56 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle) -> Function {
         let s = b.buffer_load_b64(r_cs, cs_sin, 0i32, 0);
         (bf16x4_to_f32(b, c).to_vec(), bf16x4_to_f32(b, s).to_vec())
     };
+    let partial = r < d;
+    let rot = if partial {
+        let lim = if style == RopeStyle::Neox { r / 16 } else { r / 8 };
+        Some(b.let_(Op::CmpLtI32(Opnd::Val(lr), Opnd::I32(lim as i32))))
+    } else {
+        None
+    };
+    let (cos, sin) = if let Some(rot) = rot {
+        let one = b.c_f32(1.0);
+        let zero = b.c_f32(0.0);
+        let sel = |b: &mut FnBuilder, v: &[ValueId], fill: ValueId| -> Vec<ValueId> {
+            v.iter().map(|&x| b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(rot), a: Opnd::Val(x), b: Opnd::Val(fill) })).collect()
+        };
+        (sel(b, &cos, one), sel(b, &sin, zero))
+    } else {
+        (cos, sin)
+    };
     // all the passes' loads first
-    struct Pass { head_ok: ValueId, off: ValueId, lo: ValueId, hi: Option<ValueId> }
+    struct Pass { head_ok: ValueId, off: ValueId, offh: Option<ValueId>, lo: ValueId, hi: Option<ValueId> }
     let mut ps: Vec<Pass> = Vec::new();
     for ps_i in 0..passes {
         let head = b.bind_i32(ev(wave) * rows_per_wave as i32 + ev(row_in_wave) + (ps_i * heads_per_pass) as i32);
         let head_ok = b.let_(Op::CmpLtI32(Opnd::Val(head), Opnd::I32(h as i32)));
         let row_off = b.bind_i32(ev(tok) * (2 * h * d) as i32 + ev(head) * (2 * d) as i32);
-        let off = b.bind_i32(ev(row_off) + if style == RopeStyle::Neox { ev(lr) << 4 } else { ev(lr) << 4 });
+        // the lane's chunk: lanes that rotate take elements 8 lr.. (and, NeoX, the partner R / 2 further); the pass-through lanes of a partial rotation take a pair of adjacent chunks past R (identity cos / sin)
+        let off = if let (true, Some(rotc), true) = (partial, rot, style == RopeStyle::Neox) {
+            let pass_off = b.bind_i32(ev(lr) * 32);   // 2R + 32 (lr - R/16) bytes = 32 lr
+            let rot_off = b.bind_i32(ev(lr) << 4);
+            let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(rotc), a: Opnd::Val(rot_off), b: Opnd::Val(pass_off) });
+            b.bind_i32(ev(row_off) + ev(o))
+        } else {
+            b.bind_i32(ev(row_off) + (ev(lr) << 4))
+        };
         let lo = b.buffer_load_c(r_x, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+        let mut offh_v: Option<ValueId> = None;
         let hi = if style == RopeStyle::Neox {
-            let offh = b.bind_i32(ev(off) + d as i32);
+            let delta = if let Some(rotc) = rot {
+                let rd = b.c_i32(r as i32);
+                let pd = b.c_i32(16);
+                b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(rotc), a: Opnd::Val(rd), b: Opnd::Val(pd) })
+            } else {
+                b.c_i32(d as i32)
+            };
+            let offh = b.bind_i32(ev(off) + ev(delta));
+            offh_v = Some(offh);
             Some(b.buffer_load_c(r_x, Some(Opnd::Val(offh)), 0i32, 0, MemTy::B128, CachePolicy::NT))
         } else {
             None
         };
-        ps.push(Pass { head_ok, off, lo, hi });
+        ps.push(Pass { head_ok, off, offh: offh_v, lo, hi });
     }
     for p in &ps {
         let xl = bf16x8_to_f32(b, p.lo);
@@ -158,8 +201,7 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle) -> Function {
         let f = pack8(b, &yl);
         b.buffer_store_c(r_o, Some(Opnd::Val(o_lo)), 0i32, 0, f, MemTy::B128, false, CachePolicy::NT);
         if let Some(yh) = yh {
-            let offh = b.bind_i32(ev(p.off) + d as i32);
-            let o_hi = masked(b, offh);
+            let o_hi = masked(b, p.offh.unwrap());
             let f = pack8(b, &yh);
             b.buffer_store_c(r_o, Some(Opnd::Val(o_hi)), 0i32, 0, f, MemTy::B128, false, CachePolicy::NT);
         }

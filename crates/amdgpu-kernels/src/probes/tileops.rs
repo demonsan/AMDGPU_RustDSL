@@ -456,7 +456,7 @@ pub fn probe_cpol_p1() -> Function {
 }
 
 /// Conversions of `probe_cvt_p1`: (op, input planes of the used operands, sel). Input planes (64 lanes each): 0 fp8 / bf8 bytes, 1 fp4 nibbles,
-/// 2 f32 a, 3 f32 b, 4 f32 c (u8 range), 5 i32 i, 6 i32 j, 7 scale (2.0), 8 old (0x5A5A5A5A).
+/// 2 f32 a, 3 f32 b, 4 f32 c (u8 range), 5 i32 i, 6 i32 j, 7 scale (2.0), 8 old (0x5A5A5A5A), 9 scale 1.63, 10 scale 3.0.
 pub fn cvt_p1_cases() -> Vec<(amdgpu_dsl::CvtOp, Vec<usize>, u8)> {
     use amdgpu_dsl::CvtOp as C;
     vec![
@@ -479,6 +479,10 @@ pub fn cvt_p1_cases() -> Vec<(amdgpu_dsl::CvtOp, Vec<usize>, u8)> {
         (C::ScalePkFp8F32, vec![2, 3, 7, 8], 1),
         (C::ScalePkBf8F32, vec![2, 3, 7, 8], 0),
         (C::ScalePkFp4F32, vec![2, 3, 7, 8], 2),
+        // non-power-of-two scales (plane 9: 1.63, plane 10: 3.0): only the exponent counts (E8M0)
+        (C::ScalePkF32Fp8, vec![0, 9], 0),
+        (C::ScalePkBf16Fp4, vec![1, 10], 1),
+        (C::ScalePkFp8F32, vec![2, 3, 10, 8], 0),
         (C::PkU8F32, vec![4, 8], 2),
         (C::PkI16I32, vec![5, 6], 0),
         (C::PkU16U32, vec![5, 6], 0),
@@ -492,7 +496,7 @@ pub fn probe_cvt_p1() -> Function {
     let mut b = FnBuilder::new("probe_cvt_p1", 64);
     b.arg("in", DType::Ptr, 0, 8);
     b.arg("out", DType::Ptr, 8, 8);
-    b.arg_tensor("in", amdgpu_dsl::Ext::Const(9 * 256));
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(11 * 256));
     b.arg_tensor("out", amdgpu_dsl::Ext::Const((planes * 256) as i64));
     let inp = b.let_(Op::KernargPtr { offset: 0 });
     let out = b.let_(Op::KernargPtr { offset: 8 });
@@ -500,7 +504,7 @@ pub fn probe_cvt_p1() -> Function {
     let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
     let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
     let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
-    let ins: Vec<ValueId> = (0..9u32).map(|k| b.load_global(pin, 256 * k, amdgpu_dsl::MemTy::B32)).collect();
+    let ins: Vec<ValueId> = (0..11u32).map(|k| b.load_global(pin, 256 * k, amdgpu_dsl::MemTy::B32)).collect();
     let mut k = 0u32;
     let mut put = |b: &mut FnBuilder, v: ValueId| {
         let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((256 * (k / 8 * 8)) as i32) });
@@ -667,5 +671,125 @@ pub fn probe_tr_b16_mfma() -> Function {
     let d = b.mfma(MmaKind::new(MmaShape::M16N16K32, MmaTy::Bf16), fa, fb, None);
     let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off16) });
     b.store_global(pout, 0, d, MemTy::B128, false);
+    b.finish()
+}
+
+/// `probe_atomic_p1(in, out)`: LDS and global atomics from all 64 lanes. in: plane 0 u32 x, plane 1 f32 y (small integers). Counters (dword index
+/// c): add c = l % 4 (+1, returning) at 0..3, add c = 4 + l % 4 (+lane, no return), max_u32 c = 8 + l % 2 (x), min_i32 c = 10 + l % 2 (x,
+/// returning, init 0x7fffffff), inc c = 12 (limit 15, returning), add_f32 c = 13 (y). out: planes 0..2 LDS returns (add, min, inc), plane 3 the
+/// final LDS counters (lane l reads dword l), planes 4..5 global returns (add, inc), then 64 global counter dwords (same layout).
+pub fn probe_atomic_p1() -> Function {
+    use amdgpu_dsl::{AtomicOp as A, MemTy};
+    let mut b = FnBuilder::new("probe_atomic_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(512));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(7 * 256));
+    b.lds(256);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    let x = b.load_global(pin, 0, MemTy::B32);
+    let y = { let t = b.load_global(pin, 256, MemTy::B32); b.let_(Op::BitcastF32(Opnd::Val(t))) };
+    // init: dwords 10, 11 = 0x7fffffff, all others 0 (LDS and the global counter block)
+    let half = b_shr1(&mut b, tid);
+    let is_min = b.cmp(CmpPred::Eq, CmpTy::I32, half, 5);
+    let init = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is_min), a: Opnd::I32(0x7fffffff), b: Opnd::I32(0) });
+    b.store_lds(off4, init, MemTy::B32, false);
+    let gctr = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::I32(6 * 256) });
+    let gl = b.let_(Op::PtrAdd { base: Opnd::Val(gctr), byte_off: Opnd::Val(off4) });
+    b.store_global(gl, 0, init, MemTy::B32, false);
+    b.wait_lds(0);
+    b.wait_vm(0);
+    b.barrier();
+    let l4 = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(3)));
+    let l2 = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(1)));
+    let a_add = b.let_(Op::MulI32(Opnd::Val(l4), Opnd::I32(4)));
+    let a_add2 = b.add_i32(a_add, 16);
+    let a2 = b.let_(Op::MulI32(Opnd::Val(l2), Opnd::I32(4)));
+    let a_max = b.add_i32(a2, 32);
+    let a_min = b.add_i32(a2, 40);
+    let one = b.c_i32(1);
+    let r_add = b.atomic_lds(A::AddU32, a_add, one, true).unwrap();
+    b.atomic_lds(A::AddU32, a_add2, tid, false);
+    b.atomic_lds(A::MaxU32, a_max, x, false);
+    let r_min = b.atomic_lds(A::MinI32, a_min, x, true).unwrap();
+    let r_inc = b.atomic_lds(A::IncU32, 48, 15, true).unwrap();
+    b.atomic_lds(A::AddF32, 52, y, false);
+    // global: the same counters in the block at out + 6 * 256
+    let g = |b: &mut FnBuilder, a: ValueId| b.let_(Op::PtrAdd { base: Opnd::Val(gctr), byte_off: Opnd::Val(a) });
+    let (ga, ga2, gmx, gmn) = (g(&mut b, a_add), g(&mut b, a_add2), g(&mut b, a_max), g(&mut b, a_min));
+    let rg_add = b.atomic_global(A::AddU32, ga, 0, one, true).unwrap();
+    b.atomic_global(A::AddU32, ga2, 0, tid, false);
+    b.atomic_global(A::MaxU32, gmx, 0, x, false);
+    b.atomic_global(A::MinI32, gmn, 0, x, false);
+    let rg_inc = b.atomic_global(A::IncU32, gctr, 48, 15, true).unwrap();
+    b.atomic_global(A::AddF32, gctr, 52, y, false);
+    b.wait_lds(0);
+    b.barrier();
+    let fin = b.load_lds(off4, MemTy::B32);
+    let mut k = 0u32;
+    for v in [r_add, r_min, r_inc, fin, rg_add, rg_inc] {
+        let v = if b.f.value_tys[v as usize] == DType::F32 { b.let_(Op::BitcastI32(Opnd::Val(v))) } else { v };
+        let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((256 * k) as i32) });
+        b.store_global(base, 0, v, MemTy::B32, false);
+        k += 1;
+    }
+    b.finish()
+}
+
+fn b_shr1(b: &mut FnBuilder, x: ValueId) -> ValueId {
+    b.let_(Op::LshrI32(Opnd::Val(x), Opnd::I32(1)))
+}
+
+/// `probe_lane_p1(in, out)`: cross-lane / wave-mask ops on x (plane 0 of `in`); out planes: 0 read_lane(x, 5), 1 read_lane(x, 63), 2 write_lane(read_lane(x, 7),
+/// 3, old = lane), 3 / 4 ballot(x & 1) lo / hi, 5 mbcnt(-1, -1), 6 mbcnt(ballot), 7 popcount(x), 8 ffbl(x), 9 ffbh(x), 10 bpermute from lane 7 l % 64,
+/// 11 permute to lane l + 5, 12 swizzle bit-mask xor 1, 13 swizzle quad_perm [3,2,1,0].
+pub fn probe_lane_p1() -> Function {
+    use amdgpu_dsl::{BinOp, MemTy, UnOp};
+    let mut b = FnBuilder::new("probe_lane_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(256));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(14 * 256));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    let x = b.load_global(pin, 0, MemTy::B32);
+    let mut vals = Vec::new();
+    vals.push(b.read_lane(x, 5));
+    vals.push(b.read_lane(x, 63));
+    let x7 = b.read_lane(x, 7);
+    vals.push(b.write_lane(x7, 3, tid));
+    let bit = b.let_(Op::AndI32(Opnd::Val(x), Opnd::I32(1)));
+    let cond = b.cmp(CmpPred::Ne, CmpTy::I32, bit, 0);
+    let (lo, hi) = b.ballot(cond);
+    vals.push(lo);
+    vals.push(hi);
+    vals.push(b.mbcnt(-1, -1));
+    vals.push(b.mbcnt(lo, hi));
+    vals.push(b.bin(BinOp::BcntAdd, x, 0));
+    vals.push(b.un(UnOp::Ffbl, x));
+    vals.push(b.un(UnOp::Ffbh, x));
+    let src = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(7)));
+    let src = b.let_(Op::AndI32(Opnd::Val(src), Opnd::I32(63)));
+    let a1 = b.let_(Op::MulI32(Opnd::Val(src), Opnd::I32(4)));
+    vals.push(b.bpermute(a1, x));
+    let dstl = b.add_i32(tid, 5);
+    let dstl = b.let_(Op::AndI32(Opnd::Val(dstl), Opnd::I32(63)));
+    let a2 = b.let_(Op::MulI32(Opnd::Val(dstl), Opnd::I32(4)));
+    vals.push(b.permute(a2, x));
+    vals.push(b.swizzle(x, 0x1f | (1 << 10)));
+    vals.push(b.swizzle(x, 0x8000 | 0x1b));
+    for (k, v) in vals.into_iter().enumerate() {
+        let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((256 * (k / 8 * 8)) as i32) });
+        b.store_global(base, 256 * (k as u32 % 8), v, MemTy::B32, false);
+    }
     b.finish()
 }

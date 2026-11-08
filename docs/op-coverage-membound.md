@@ -64,7 +64,7 @@
 | `rope_neox_bf16_h<H>_d<D>` | rotate-half，每 lane 两个 b128 | D / 16 | 44 | H = 32, D = 128：6118；H = 8, D = 128：6495（T = 262144，部分落在 Infinity Cache）；**H = 1, D = 64：1300** | 100 % / 100 %+ / **22 %** |
 | `rope_gptj_bf16_h<H>_d<D>` | 交错对 (2i, 2i+1)，每 lane 一个 b128 | D / 8 | 32 | H = 32, D = 128：5997 | 100 % |
 
-D ∈ {64, 128, 256}（全旋转维），H ∈ 1…256；正确性：T ∈ {9 … 37}，H ∈ {1, 8, 32, 40}（H = 40 的最后一个 pass 部分 head 越界）。**限制**：H · L < 64 的内核（如 MQA 的 H = 1）一个 wave 里只有一部分 lane 有 head，带宽低（H = 1, D = 64 只有 22 %）→ 需要"一个 wave 处理多个 token"的变体（待做）；部分旋转（rotary_dim < D）还没有。
+D ∈ {64, 128, 256}（全旋转维），H ∈ 1…256；正确性：T ∈ {9 … 37}，H ∈ {1, 8, 32, 40}（H = 40 的最后一个 pass 部分 head 越界）。**限制**：H · L < 64 的内核（如 MQA 的 H = 1）一个 wave 里只有一部分 lane 有 head，带宽低（H = 1, D = 64 只有 22 %）→ 需要"一个 wave 处理多个 token"的变体（待做）；部分旋转见下。
 
 ## KV-cache 写（模板 T7）
 
@@ -142,3 +142,65 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 | `quant_token_bf16_int8_n<N>` | per-token int8：`scale = max|x| / 127`，`q = clamp(rne(x / scale), −127, 127)` | — | N = 4096：6305；N = 1000：5366 |
 
 **一个会踩的坑（已告知 backend）**：`v_cvt_scalef32_pk_{bf16,f16,f32}_fp8` 的 scale 操作数只用到指数（E8M0 风格的 2 的幂）：给 1.63 的效果是 1.0（我们的参考对拍直接发现：输出等于未缩放的 fp8 值）。所以任意 f32 scale 的反量化 = 普通的 fp8 → f32 转换（`PkF32Fp8`）后再乘 scale、再打包成 bf16；`ScalePk…` 转换适用于 mx 格式（E8M0 的 2 的幂 scale）。dequant 内核因此多一次乘法，仍是带宽受限。
+
+## 行内族：行保持打包（寄存器压力）
+
+行内 kernel（rmsnorm / add_rmsnorm / layernorm / softmax）的行在各遍之间保持 bf16 打包（每个 chunk 4 个 dword），在用到的地方再展开成 f32（每对元素两条移位 / 掩码），而不是把 f32 常驻寄存器。VGPR：rmsnorm N = 4096：124 → 92，add_rmsnorm：156 → 120，layernorm N = 4096：160 → 128，softmax N = 8192：160 → 156。带宽变化（`nt` 之后的前后，GB/s）：rmsnorm N = 4096：5915 → 6010，N = 1000：5716 → 5900；add_rmsnorm：5900 → 5804；layernorm N = 4096 / 776：5348 / 4760 → 5333 / 4552；softmax N = 4096 / 1000 / 8192：5893 / 5658 / 5483 → 5952 / 5647 / 5498。结论：占用不是这几个 kernel 的主要限制（变化在 ±4 % 内，有升有降）；剩下的差距来自每行 2 次分组归约的串行延迟链和 VALU，下一步是 DPP 行操作（backend 的 A4）与 packed f32 数学，而不是寄存器。
+
+## KV-cache 写：vLLM / aiter 分块布局
+
+`cache/mod.rs`：`reshape_cache_blocked_bf16_h<Hk>_d<D>_b<BS>`：`k, v [T][Hk][D]` 写入 `key_cache [NB][Hk][D/8][BS][8]` 和 `value_cache [NB][Hk][D][BS]`（`block = slot / BS`，`off = slot % BS`；负 slot = padding token）。key 一侧每 lane 搬一个 16 B chunk（8 个元素，b128 存）；value 一侧是转置的（token 下标是最快维），每个元素一次 16 位存。D ∈ {64, 128, 256}，BS ∈ {8 … 128}（2 的幂），cache < 4 GiB。主机测试 `tests/gpu/cache_blocked_host.cpp`（逐字节对拍，未写字节保持哨兵值；`CONTIG=1` 为 prefill 型的连续槽位）。
+
+| 形状 | 槽位 | 带宽（GB/s，有效读写字节） |
+|---|---|--:|
+| Hk = 8, D = 128, BS = 16，T = 131072 | 连续（prefill） | 1456 |
+| 同上 | 随机置换 | 927 |
+
+这个布局的 value 写本身就是 2 字节散写，不可能接近流式带宽；已有的 aiter `reshape_and_cache` 同布局，同样的问题（不能在节点上独立编译做同轮对比）。**关键一点：这种部分行的 2 字节存不能带 `nt`**——全部带 `nt` 时是 186 GB/s（连续槽位），改成 regular 策略后 1456 GB/s（8 倍；`nt` 绕开了 L2 的写合并）；key 一侧的完整 16 B 存仍然用 `nt`（随机槽位下 `nt` 927 → regular 640）。更好的写法（待做）：同一个 block 的 BS 个连续 token 在 LDS 里转置后整行写。
+
+## MoE 对齐 / 排序：`moe_sorting`（模板 T5 + T7，单 block）
+
+`moe/mod.rs`：`moe_sorting_e<E>_k<K>_b<BM>`（E = 8 … 512 个专家，K = 1 … 16，BM ∈ {16, 32, 64, 128}；M 运行时给，M · K ≤ 2²²）。格式与 kernel-opt 商定，沿用 aiter `moe_sorting` 约定（FlyDSL `moe_sorting_kernel.py` 的头注释）：
+
+| 输出 | 内容 |
+|---|---|
+| `sorted_token_ids` u32 `[max_padded]` | `(topk_slot << 24) \| token_id`，按专家升序分组，每组补齐到 BM 的倍数，补齐值为哨兵 `(K << 24) \| M`；`max_padded = M·K + E·BM − K` |
+| `sorted_weights` f32 `[max_padded]` | 对应的 top-k 权重，补齐处为 0 |
+| `sorted_expert_ids` i32 `[max_padded / BM]` | 每个 M tile 的专家号，已用部分之后为 E |
+| `num_valid_ids` i32 `[2]` | `[padded_total, M]` |
+| `tile_start` i32 `[E + 1]` | 每个专家的第一个 tile（`tile_start[E]` = padded_total / BM），持久化 grouped GEMM 不必再扫 `sorted_expert_ids` |
+
+范围 0 … E 之外的专家号（EP 里的 −1、E）被忽略。专家组内顺序 = 原子到达顺序（多重集，GEMM 行相互独立，结果不变）；确定性的 token 顺序版要等 ballot / mbcnt（已在 B2 里）。
+
+实现（一个 1024 线程的 block，LDS 16 KB）：`ds_add_u32` 做直方图 → 每个线程一个专家的 padded 数 → LDS 里的 Hillis–Steele 前缀扫描（9 步，每步一个 barrier）→ 补齐位置 / `tile_start` / `num_valid_ids` / `sorted_expert_ids`（二分查找扫描结果，每个 tile 一次，`E` 填充）→ 散写：位置 = 该专家游标的 `ds_add_rtn_u32`，`token = i / K` 用 `mul_hi` 魔数（K = 1 用恒等）。**踩到的坑**：DSL 的循环必须是 wave 一致的（分支条件是 VCC 的"任一 lane"），所以每个线程不同的 trip count（补齐项、专家的 tile 数）要改写成统一的上界 + 谓词存储（越界偏移 `0x7fffff00`）。`gpu_verify --strict` 0 错误（LDS 原子地址靠 `min` / `max` 钳位证明）。
+
+主机测试 `tests/gpu/moe_sorting_host.cpp`：与 CPU 参考逐项比较（`num_valid_ids`、`tile_start`、每个 tile 的专家号、每个专家组的 (packed id, 权重) 多重集、补齐值和尾部哨兵、输出末尾之外不被写），含倾斜分布（一半的对去专家 0）与无效专家号（−1、E），`bad = 0`。延迟（单次启动，含启动开销）：
+
+| 形状 | 路由对数 | 延迟 |
+|---|--:|--:|
+| E = 128, K = 8, BM = 32，M = 37 | 296 | 12.2 µs |
+| E = 128, K = 8, BM = 32，M = 1001（倾斜 + 无效号） | 8008 | 14.8 µs |
+| E = 64, K = 2, BM = 16，M = 513 | 1026 | 10.5 µs |
+| E = 385, K = 6, BM = 32，M = 777 | 4662 | 17.9 µs |
+| E = 256, K = 8, BM = 128，M = 4096 | 32768 | 52.2 µs |
+
+限制：只有一个 block，路由对越多越慢（每 1 K 对约 +1.3 µs）；大 M（≳ 16 K 对）需要多 block 版本（全局原子直方图 + 分阶段，aiter 的 multiphase 同样如此）——待做。没有与 aiter 的同轮对比：aiter 的 `moe_sorting` 在本机树里是 CK / FlyDSL 路径，不能脱离 torch 单独编译。
+
+## 部分 RoPE（rotary_dim < D）
+
+`rope_{neox,gptj}_bf16_h<H>_d<D>_r<R>`（R 是 16 的倍数，16 ≤ R < D；表是 `[P][R]`，前半 cos、后半 sin）：每个 head 只有前 R 个元素旋转，其余原样拷贝。实现不另加数据通路：不旋转的 lane 用同一套公式，cos = 1、sin = 0（恒等旋转）——NeoX 里 R 之后的元素成对分给 `D/16 − R/16` 个 lane（每 lane 两个相邻 chunk），GPT-J 里 `lr ≥ R/8` 的 lane 直接是恒等；lane 总数仍是 `D/16`（NeoX）/ `D/8`（GPT-J），所以占用与全旋转版相同。主机测试 `rope_host`（`ROPE_R=<R>`）：D = 128 / R = 64（neox、gptj）、D = 256 / R = 32，`bad = 0`，R 之后的元素逐位等于输入；D = 128 / R = 64 的 neox：5062 GB/s（流量按 R 宽的表计）。R = D 的名字不变，行为不变。
+
+## 采样：`argmax` 与温度采样（模板 T5 / T6，一个 block 一行）
+
+`sampling/mod.rs`：`argmax_bf16_v<V>`（贪心，并列取最小下标）和 `sample_bf16_v<V>`（`p = softmax(logits / T)`，返回累计概率首次达到 `u[b] · 总和` 的最小下标，即带调用方给的均匀随机数 `u ∈ [0, 1)` 的逆 CDF / 多项式采样）。V 为 8 的倍数、8 … 131072；一个 1024 线程的 block 处理一行（grid = B）。ABI：`argmax`：logits @0（bf16 `[B][V]`）、out @8（i32 `[B]`）、B @16；`sample`：logits @0、u @8（f32 `[B]`）、out @16、inv_temperature @24（f32）、B @28。主机测试 `tests/gpu/sampling_host.cpp`（CPU 双精度参考：argmax 逐行对拍，含峰值与每三行一个并列；sample 的下标与参考相同或在累计概率相差 < 2e-4 的边界上相邻）：V ∈ {8, 1000, 32000, 128256}，`bad = 0`。
+
+实现：每个线程拥有 `C = ⌈V / 8192⌉`（向上取 4 的倍数）个连续 16 B chunk；各遍是运行时循环（每次迭代 4 个 chunk 的加载先于计算）：第 1 遍（合并访问）每线程取最大值（严格大于才更新，所以线程内取最小下标）→ block 归约（DPP quad + wave 的 LDS 交换 + 每 wave 一个槽位 + barrier，每次归约一个新槽位，不需要再 barrier）取全局最大，再用"负下标取 Max"取最小下标；`sample` 再加第 2 遍（连续拥有，线程内 `exp` 之和）→ LDS 里的 Hillis–Steele 前缀扫描 → 第 3 遍（连续拥有）找第一个累计值 ≥ 目标的元素（每个线程取负下标的 Max，block 归约取最小下标；舍入导致没有命中时回退到 argmax）。**为什么不把一行留在寄存器里**：128 K 词表需要 160+ VGPR，而 1024 线程的 block 每线程至多 128（超出会 `HSA_STATUS_ERROR_INVALID_ISA` 启动失败）；展开的遍里调度器还会把后几遍的加载全部提到最前。
+
+| 形状 | VGPR | 耗时 | 有效读带宽 |
+|---|--:|--:|--:|
+| `argmax_bf16_v128256`，B = 4096 | 52 | 246 µs | 4278 GB/s |
+| `argmax_bf16_v32000`，B = 16384 | 52 | 275 µs | 3817 GB/s |
+| `sample_bf16_v128256`，B = 4096 | 60 | 1460 µs | 720 GB/s |
+| `sample_bf16_v32000`，B = 16384 | 60 | 834 µs | 1258 GB/s |
+
+结论：argmax 约为流式上限的 60–65 %（每行只有一个 block 的 16 个 wave，归约与 barrier 的延迟没有被其他行遮盖）；采样是三遍 + 扫描 + `exp`，VALU 与延迟受限，只有 argmax 的 1/3–1/6。没有与 aiter 的同轮对比（`sample_kernels.cu` 的入口依赖 torch 的随机数 / 张量约定）。待做：top-k / top-p 过滤（按阈值二分，不排序）、每个 block 处理多行或把行拆给多个 block 来遮盖归约延迟、DPP 行操作（A4）。

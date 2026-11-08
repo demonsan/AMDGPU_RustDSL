@@ -15,11 +15,11 @@ static uint16_t f32_to_bf16(float f) { uint32_t u; std::memcpy(&u, &f, 4); u += 
 int main(int argc, char** argv) {
     if (argc < 7) { std::fprintf(stderr, "usage: %s <co> <kernel> <neox|gptj> <T> <H> <D> [iters]\n", argv[0]); return 2; }
     const char* co = argv[1]; const char* kn = argv[2]; std::string mode = argv[3]; long T = std::atol(argv[4]), H = std::atol(argv[5]), D = std::atol(argv[6]); int iters = argc > 7 ? std::atoi(argv[7]) : 50;
-    const bool neox = mode == "neox"; const long P = 4096;
+    const bool neox = mode == "neox"; const long P = 4096; const long R = std::getenv("ROPE_R") ? std::atol(std::getenv("ROPE_R")) : D;   // ROPE_R: partial rotation (first R elements); the table is [P][R]
     std::mt19937 rng(13); std::normal_distribution<float> nd(0.f, 2.f); std::uniform_int_distribution<int> pd(0, P - 1);
-    std::vector<uint16_t> hx((size_t)T * H * D), hcs((size_t)P * D); std::vector<int32_t> hpos(T);
+    std::vector<uint16_t> hx((size_t)T * H * D), hcs((size_t)P * R); std::vector<int32_t> hpos(T);
     for (auto& v : hx) v = f32_to_bf16(nd(rng));
-    for (long p = 0; p < P; ++p) for (long i = 0; i < D / 2; ++i) { double ang = p * std::pow(10000.0, -2.0 * i / D); hcs[(size_t)p * D + i] = f32_to_bf16((float)std::cos(ang)); hcs[(size_t)p * D + D / 2 + i] = f32_to_bf16((float)std::sin(ang)); }
+    for (long p = 0; p < P; ++p) for (long i = 0; i < R / 2; ++i) { double ang = p * std::pow(10000.0, -2.0 * i / R); hcs[(size_t)p * R + i] = f32_to_bf16((float)std::cos(ang)); hcs[(size_t)p * R + R / 2 + i] = f32_to_bf16((float)std::sin(ang)); }
     for (auto& p : hpos) p = pd(rng);
     if (T > 2) hpos[T - 1] = (int32_t)P + 5;   // out of the table: cos = sin = 0, the output row is 0
     void *dx, *dout, *dpos, *dcs;
@@ -34,10 +34,11 @@ int main(int argc, char** argv) {
     long bad = 0, cnt = 0;
     for (long t = 0; t < T; ++t) for (long h = 0; h < H; ++h) for (long i = 0; i < D; ++i) {
         size_t base = ((size_t)t * H + h) * D; int p = hpos[t]; bool oob = p >= P;
-        auto C = [&](long j) { return oob ? 0.0 : (double)bf16_to_f32(hcs[(size_t)p * D + j]); };
-        auto S = [&](long j) { return oob ? 0.0 : (double)bf16_to_f32(hcs[(size_t)p * D + D / 2 + j]); };
+        auto C = [&](long j) { return oob ? 0.0 : (double)bf16_to_f32(hcs[(size_t)p * R + j]); };
+        auto S = [&](long j) { return oob ? 0.0 : (double)bf16_to_f32(hcs[(size_t)p * R + R / 2 + j]); };
         double ref;
-        if (neox) { long j = i % (D / 2); double a = bf16_to_f32(hx[base + j]), c = bf16_to_f32(hx[base + D / 2 + j]); ref = i < D / 2 ? a * C(j) - c * S(j) : c * C(j) + a * S(j); }
+        if (i >= R) ref = bf16_to_f32(hx[base + i]);   // past the rotary part: copied (the out-of-table check applies to the rotary part only)
+        else if (neox) { long j = i % (R / 2); double a = bf16_to_f32(hx[base + j]), c = bf16_to_f32(hx[base + R / 2 + j]); ref = i < R / 2 ? a * C(j) - c * S(j) : c * C(j) + a * S(j); }
         else { long j = i / 2; double a = bf16_to_f32(hx[base + 2 * j]), c = bf16_to_f32(hx[base + 2 * j + 1]); ref = (i % 2 == 0) ? a * C(j) - c * S(j) : c * C(j) + a * S(j); }
         double got = bf16_to_f32(ho[base + i]), err = std::fabs(got - ref), tol = std::fabs(ref) * (1.0 / 128.0) * 1.05 + 2e-3;   // the products and the bf16 output: <= 1 ulp of the larger term
         if (!(err <= tol)) { if (bad < 5) std::fprintf(stderr, "bad (t%ld,h%ld,i%ld): got %g ref %g\n", t, h, i, got, ref); ++bad; }
@@ -49,7 +50,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 20; ++i) CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg));
     CK(hipEventRecord(a)); for (int i = 0; i < iters; ++i) CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg));
     CK(hipEventRecord(b)); CK(hipEventSynchronize(b)); float ms; CK(hipEventElapsedTime(&ms, a, b)); ms /= iters;
-    double bytes = (double)T * H * D * 2 * 2 + (double)T * (4 + D * 2);
+    double bytes = (double)T * H * D * 2 * 2 + (double)T * (4 + R * 2);
     std::printf("timing: %.4f ms/iter, %.1f GB/s (traffic %.1f MB)\n", ms, bytes / ms / 1e6, bytes / 1e6);
     return 0;
 }

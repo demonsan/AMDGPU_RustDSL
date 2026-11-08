@@ -2,7 +2,7 @@
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
-    &["probe_agpr_ref", "probe_agpr_acc", "probe_agpr_full", "probe_agpr_pinned", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_scale", "probe_lds_self2", "probe_roles_loop", "probe_lds_tr_b8", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg", "probe_valu_p1", "probe_mem_p1", "probe_mfma_p1", "probe_f8f6f4_p1", "probe_cpol_p1", "probe_cvt_p1", "probe_tr_b16_p1", "probe_tr_b16_mfma"]
+    &["probe_agpr_ref", "probe_agpr_acc", "probe_agpr_full", "probe_agpr_pinned", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_scale", "probe_lds_self2", "probe_roles_loop", "probe_lds_tr_b8", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg", "probe_valu_p1", "probe_mem_p1", "probe_mfma_p1", "probe_f8f6f4_p1", "probe_cpol_p1", "probe_cvt_p1", "probe_tr_b16_p1", "probe_tr_b16_mfma", "probe_atomic_p1", "probe_lane_p1"]
 }
 
 pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
@@ -17,6 +17,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_cvt_p1" => Some(crate::probes::tileops::probe_cvt_p1()),
         "probe_tr_b16_p1" => Some(crate::probes::tileops::probe_tr_b16_p1()),
         "probe_tr_b16_mfma" => Some(crate::probes::tileops::probe_tr_b16_mfma()),
+        "probe_atomic_p1" => Some(crate::probes::tileops::probe_atomic_p1()),
+        "probe_lane_p1" => Some(crate::probes::tileops::probe_lane_p1()),
         "probe_dpp_p1" => Some(crate::probes::tileops::probe_dpp_p1()),
         "probe_agpr_ref" => Some(crate::probes::probe_agpr_ref()),
         "probe_agpr_acc" => Some(crate::probes::probe_agpr_acc()),
@@ -47,12 +49,15 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("mlp_fp8_") => crate::mlp::by_name(n),
         // P2 (stage library): RMSNorm + per-token fp8 quantization from the generic E / R / Q stages; N in the name (multiple of 512)
         n if n.starts_with("rmsnorm_quant_fp8_n") => crate::norm::by_name(n),
-        // batch 2: dequantization, expert routing, RoPE, KV-cache write
+        // batch 2: sampling,
+        n if n.starts_with("argmax_bf16_v") || n.starts_with("sample_bf16_v") => crate::sampling::by_name(n),
+        // (batch 2 cont.) MoE sorting, dequantization, expert routing, RoPE, KV-cache write
+        n if n.starts_with("moe_sorting_e") => crate::moe::by_name(n),
         n if n.starts_with("dequant_fp8_bf16_") => crate::dequant::by_name(n),
         // (batch 2 cont.)
         n if n.starts_with("topk_softmax_bf16_e") || n.starts_with("topk_softmax_renorm_bf16_e") => crate::topk::by_name(n),
         n if n.starts_with("rope_neox_bf16_h") || n.starts_with("rope_gptj_bf16_h") => crate::rope::by_name(n),
-        n if n.starts_with("reshape_cache_flash_bf16_h") => crate::cache::by_name(n),
+        n if n.starts_with("reshape_cache_flash_bf16_h") || n.starts_with("reshape_cache_blocked_bf16_h") => crate::cache::by_name(n),
         // batch 2 (docs/op-coverage-memtemplates.md): row kernels, streaming elementwise
         n if n.starts_with("quant_token_bf16_fp8_n") || n.starts_with("quant_token_bf16_int8_n") || n.starts_with("quant_group128_bf16_fp8_n") || n.starts_with("silu_mul_quant_fp8_d") => crate::rows::quant::by_name(n),
         n if n.starts_with("rmsnorm_bf16_n") || n.starts_with("add_rmsnorm_bf16_n") || n.starts_with("layernorm_bf16_n") || n.starts_with("softmax_bf16_n") => crate::rows::by_name(n),

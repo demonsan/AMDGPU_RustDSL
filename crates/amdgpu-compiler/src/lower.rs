@@ -280,7 +280,7 @@ impl Lowerer {
                     count(lds_addr);
                 }
                 Stmt::SetVar { value, .. } => count(value),
-                Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::VarMfma { .. } => {
+                Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::VarMfma { .. } | Stmt::AtomicLdsNoRet { .. } | Stmt::AtomicGlobalNoRet { .. } => {
                     for o in amdgpu_dsl::stmt_operands(st) {
                         count(&o);
                     }
@@ -1957,6 +1957,18 @@ impl Lowerer {
                         self.push(MInst::new(mop).def(v).srcreg(ra).srcreg(rb).srcreg(v));
                     }
                 }
+                Stmt::AtomicLdsNoRet { op, addr, value } => {
+                    let (a, off) = self.lds_addr(*addr)?;
+                    let v = self.as_v1(*value)?;
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(MInst::new(lds_atomic_mop(*op, false)).srcreg(a).srcreg(v).imm(off));
+                }
+                Stmt::AtomicGlobalNoRet { op, base, byte_off, value } => {
+                    let rb = self.as_v2(*base)?;
+                    let v = self.as_v1(*value)?;
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(MInst::new(global_atomic_mop(*op, false)).srcreg(rb).srcreg(v).imm(*byte_off as i64));
+                }
                 Stmt::StoreGlobalN { base, byte_off, value, ty, hi, cache } => {
                     let b = self.as_v2(*base)?;
                     let (v, mop) = self.store_value(*value, *ty, *hi, global_store_mop)?;
@@ -2280,6 +2292,83 @@ impl Lowerer {
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
+            Op::AtomicLds { op, addr, value } => {
+                let (a, off) = self.lds_addr(*addr)?;
+                let v = self.as_v1(*value)?;
+                self.touch(&[Src::Reg(v)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(lds_atomic_mop(*op, true)).def(d).srcreg(a).srcreg(v).imm(off));
+                self.pending_lds.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::AtomicGlobal { op, base, byte_off, value } => {
+                let rb = self.as_v2(*base)?;
+                let v = self.as_v1(*value)?;
+                self.touch(&[Src::Reg(v)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(global_atomic_mop(*op, true)).def(d).srcreg(rb).srcreg(v).imm(*byte_off as i64));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::ReadLane { x, lane } => {
+                let r = self.as_v1(*x)?;
+                self.touch(&[Src::Reg(r)]);
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::VReadLane).def(d).srcreg(r).imm(*lane as i64));
+                self.val.insert(dst, d);
+            }
+            Op::WriteLane { x, lane, old } => {
+                let s = match x {
+                    Opnd::Val(v) if self.val.get(v).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S1) => self.val[v],
+                    Opnd::I32(_) | Opnd::F32(_) => {
+                        let s = self.new_vreg(RClass::S1);
+                        let k = self.const_bits(*x).unwrap_or(0);
+                        self.push(MInst::new(MOp::SMovB32).def(s).src(Src::Imm(k)));
+                        s
+                    }
+                    _ => {
+                        let r = self.as_v1(*x)?;
+                        self.touch(&[Src::Reg(r)]);
+                        let s = self.new_vreg(RClass::S1);
+                        self.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(r));
+                        s
+                    }
+                };
+                let o = self.as_v1(*old)?;
+                self.touch(&[Src::Reg(s), Src::Reg(o)]);
+                let d = self.new_vreg(RClass::V1);
+                self.copy_reg(d, o)?;
+                self.push(MInst::new(MOp::VWriteLane).def(d).srcreg(s).srcreg(d).imm(*lane as i64));
+                self.val.insert(dst, d);
+            }
+            Op::Ballot { cond, hi } => {
+                let c = self.as_v1(*cond)?;
+                let z = self.const_vreg(0);
+                self.touch(&[Src::Reg(c)]);
+                let m = self.new_vreg(RClass::S2);
+                self.push(MInst::new(MOp::VCmpMaskNeU32).def(m).srcreg(c).srcreg(z));
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(if *hi { MOp::SMaskHi } else { MOp::SMaskLo }).def(d).srcreg(m));
+                self.val.insert(dst, d);
+            }
+            Op::Bpermute { addr, x, offset } | Op::Permute { addr, x, offset } => {
+                let ra = self.as_v1(*addr)?;
+                let rx = self.as_v1(*x)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rx)]);
+                let d = self.new_vreg(RClass::V1);
+                let mop = if matches!(op, Op::Bpermute { .. }) { MOp::LdsBpermute } else { MOp::LdsPermute };
+                self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rx).imm(*offset as i64));
+                self.pending_lds.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::Swizzle { x, pattern } => {
+                let rx = self.as_v1(*x)?;
+                self.touch(&[Src::Reg(rx)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::LdsSwizzle).def(d).srcreg(rx).imm(*pattern as i64));
+                self.pending_lds.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
             Op::Dpp { dpp, x, old } => {
                 let r = self.as_v1(*x)?;
                 let o = self.as_v1(*old)?;
@@ -4064,6 +4153,8 @@ fn un_mop(o: amdgpu_dsl::UnOp) -> MOp {
         U::CvtF32Ubyte1 => MOp::VCvtF32Ubyte1,
         U::CvtF32Ubyte2 => MOp::VCvtF32Ubyte2,
         U::CvtF32Ubyte3 => MOp::VCvtF32Ubyte3,
+        U::Ffbl => MOp::VFfblB32,
+        U::Ffbh => MOp::VFfbhU32,
     }
 }
 
@@ -4084,6 +4175,9 @@ fn bin_mop(o: amdgpu_dsl::BinOp) -> MOp {
         B::PkMulF16 => MOp::VPkMulF16,
         B::PkMaxF16 => MOp::VPkMaxF16,
         B::PkMinF16 => MOp::VPkMinF16,
+        B::MbcntLo => MOp::VMbcntLo,
+        B::MbcntHi => MOp::VMbcntHi,
+        B::BcntAdd => MOp::VBcntU32,
     }
 }
 
@@ -4340,5 +4434,45 @@ fn dpp_alu_mop(o: amdgpu_dsl::DppAluOp) -> MOp {
         D::AndB32 => MOp::VAndB32Dpp,
         D::OrB32 => MOp::VOrB32Dpp,
         D::XorB32 => MOp::VXorB32Dpp,
+    }
+}
+
+fn lds_atomic_mop(o: amdgpu_dsl::AtomicOp, rtn: bool) -> MOp {
+    use amdgpu_dsl::AtomicOp as A;
+    match (o, rtn) {
+        (A::AddU32, false) => MOp::LdsAtomicAddU32,
+        (A::AddU32, true) => MOp::LdsAtomicAddU32Rtn,
+        (A::MaxU32, false) => MOp::LdsAtomicMaxU32,
+        (A::MaxU32, true) => MOp::LdsAtomicMaxU32Rtn,
+        (A::MinU32, false) => MOp::LdsAtomicMinU32,
+        (A::MinU32, true) => MOp::LdsAtomicMinU32Rtn,
+        (A::MaxI32, false) => MOp::LdsAtomicMaxI32,
+        (A::MaxI32, true) => MOp::LdsAtomicMaxI32Rtn,
+        (A::MinI32, false) => MOp::LdsAtomicMinI32,
+        (A::MinI32, true) => MOp::LdsAtomicMinI32Rtn,
+        (A::IncU32, false) => MOp::LdsAtomicIncU32,
+        (A::IncU32, true) => MOp::LdsAtomicIncU32Rtn,
+        (A::AddF32, false) => MOp::LdsAtomicAddF32,
+        (A::AddF32, true) => MOp::LdsAtomicAddF32Rtn,
+    }
+}
+
+fn global_atomic_mop(o: amdgpu_dsl::AtomicOp, rtn: bool) -> MOp {
+    use amdgpu_dsl::AtomicOp as A;
+    match (o, rtn) {
+        (A::AddU32, false) => MOp::GlobalAtomicAddU32,
+        (A::AddU32, true) => MOp::GlobalAtomicAddU32Rtn,
+        (A::MaxU32, false) => MOp::GlobalAtomicMaxU32,
+        (A::MaxU32, true) => MOp::GlobalAtomicMaxU32Rtn,
+        (A::MinU32, false) => MOp::GlobalAtomicMinU32,
+        (A::MinU32, true) => MOp::GlobalAtomicMinU32Rtn,
+        (A::MaxI32, false) => MOp::GlobalAtomicMaxI32,
+        (A::MaxI32, true) => MOp::GlobalAtomicMaxI32Rtn,
+        (A::MinI32, false) => MOp::GlobalAtomicMinI32,
+        (A::MinI32, true) => MOp::GlobalAtomicMinI32Rtn,
+        (A::IncU32, false) => MOp::GlobalAtomicIncU32,
+        (A::IncU32, true) => MOp::GlobalAtomicIncU32Rtn,
+        (A::AddF32, false) => MOp::GlobalAtomicAddF32,
+        (A::AddF32, true) => MOp::GlobalAtomicAddF32Rtn,
     }
 }
