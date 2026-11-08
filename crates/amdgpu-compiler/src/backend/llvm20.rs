@@ -204,6 +204,7 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
         "cpol" => format!("{}", inst.cpol),
         // conversion selects (A2): SDWA word sel, VOP3 op_sel bits carried in the source modifiers
         "sdwaword" => format!("{}", 4 + (inst.imm & 1)),
+        "byte" => format!("{}", inst.imm & 3),
         "m4" => format!("{}", 4 * (inst.imm & 1)),
         "m8" => format!("{}", 8 * (inst.imm & 1)),
         "b0m4" => format!("{}", 4 * (inst.imm & 1)),
