@@ -12,7 +12,7 @@
 //!   the transposed A operand of PV (`ds_read_u16_d16[_hi]`; to be replaced by `ds_read_b64_tr_b16`);
 //! * P = exp2(S c - m) packed to bf16 straight from the S^T accumulator: the PV k order per lane half h is keys {4h + 0..3, 8 + 4h + 0..3} of
 //!   each 16-key step, and the V^T reads use the same key order.
-use amdgpu_dsl::{CompileProfile, D16Ty, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
+use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
 use amdgpu_tile::components::gqa_kv_head;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
@@ -409,9 +409,9 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, mask
     // ---- S^T = K Q^T: 2 blocks of 32 keys, D / 16 MFMAs each ----
     // (into the S^T variables: the mask below updates them in place under a branch that holds no LDS access)
     kscope(b, &mut |b| {
-        for sb in 0..2 {
+        for sb in 0..2usize {
             for c in 0..(D / 16) as usize {
-                let a = b.bind_i32(ev(tm.kr[c]) + kbase.clone() + sb * 32 * ROW);
+                let a = b.bind_i32(ev(tm.kr[c]) + kbase.clone() + sb as i32 * 32 * ROW);
                 let kf = b.load_lds_b128(a);
                 b.var_mfma(sv_vars[sb], kind, kf, tm.qf[c], c == 0);
             }
