@@ -564,6 +564,12 @@
 - `gemm_a16w16_bf16` 的 md5 因此变为 8ab7cd9e。
 - 调整 pre/mid sync 的 MMA 数量：差别在噪声内，未改。
 
+**A8W4（覆盖补齐）**：`gemm_a8w4_mxfp_128`，即 `Elem::Fp8W4`，A 为 MXFP8，B 为 MXFP4，两者都用重排的 1×32 scale。
+- 一个 K tile = 256 元素：B tile 128 字节；A 分成 lo / hi 两半，作为同一 ring slot 中的两份 A 镜像（DMA 多一轮，A 前进 2·key0 字节）。
+- 每个 m 块有两个 A 寄存器片段；每个块做两次 fp8×fp4 的 scaled `16x16x128` MFMA，scale 字节取 h。
+- 测试用 host 的 `ours_v4_f8f4`。结果 bad=0：1024³ 301 TF/s，4096³ 1501，8192³ 1856，256×7168×2048 675 TF/s。
+- 128×128 CTA 版本的寄存器有余量；256 版本加上第二组 A 片段会超出 512 个寄存器。
+
 **MX 量化（覆盖补齐）**：见 [`rows/mxquant.rs`](../crates/amdgpu-kernels/src/rows/mxquant.rs)，CPU 校验用 [`mxquant_host.cpp`](../tests/gpu/mxquant_host.cpp)。
 - `quant_mxfp4_bf16_k<K>`：bf16 → fp4（e2m1）加 1×32 的 E8M0 scale，scale 直接写成 `gemm_a4w4_mxfp4` 的重排布局。
   - scale 规则与 aiter `dynamic_mxfp4_quant` 相同：amax 加 0x200000 后截断，取指数再减 2。
