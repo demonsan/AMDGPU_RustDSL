@@ -89,3 +89,44 @@ fn a_kernel_over_the_launch_register_budget_is_rejected() {
         }
     }
 }
+
+/// The scheduler plans against the launch budget: a 1024-thread block (4 waves per SIMD) leaves 128 registers per wave (minus 8 headroom).
+#[test]
+fn the_scheduler_budget_follows_the_workgroup_size() {
+    use amdgpu_compiler::sched::launch_vgpr_budget;
+    assert_eq!(launch_vgpr_budget(1024), 120);
+    assert_eq!(launch_vgpr_budget(768), 162);
+    assert_eq!(launch_vgpr_budget(512), 240);
+    assert_eq!(launch_vgpr_budget(256), 240);
+    assert_eq!(launch_vgpr_budget(64), 240);
+}
+
+/// A > 4 GiB tensor (up to 8192 blocks of 1 MiB): the block's descriptor base is moved with `ptr_mad` (64-bit) and the verifier proves the
+/// moved descriptor stays inside the allocation; an overstated descriptor (2 MiB per block) is rejected.
+fn kv_block_store(per_block: u32) -> amdgpu_dsl::Function {
+    let mut b = FnBuilder::new("kv_block_store", 64);
+    b.arg("kv", DType::Ptr, 0, 8);
+    b.arg("nblocks", DType::I32, 8, 4);
+    b.ka_range(8, 1, 8192);
+    b.arg_tensor("kv", amdgpu_dsl::Ext::ka(8) * amdgpu_dsl::Ext::Const(1 << 20));
+    let kv = b.let_(Op::KernargPtr { offset: 0 });
+    let nb = b.let_(Op::KernargI32 { offset: 8 });
+    let last = b.add_i32(nb, -1);
+    let wg = b.let_(Op::WorkgroupIdX);
+    let blk = b.let_(Op::MinI32(Opnd::Val(wg), Opnd::Val(last)));
+    let moved = b.ptr_mad(kv, blk, 1 << 20);
+    let r = b.buffer_desc(moved, per_block);
+    let tid = b.let_(Op::WorkitemId);
+    let off = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    b.buffer_store_n(r, Some(Opnd::Val(off)), 0, 0, tid, MemTy::B32, false);
+    b.finish()
+}
+
+#[test]
+fn a_moved_descriptor_over_a_large_tensor_is_proven_in_bounds() {
+    let errs = |f: &amdgpu_dsl::Function| -> Vec<String> {
+        amdgpu_compiler::gpu_verify::analyse(f).unwrap().errors().iter().map(|e| e.code.to_string()).collect()
+    };
+    assert!(errs(&kv_block_store(1 << 20)).is_empty(), "{:?}", errs(&kv_block_store(1 << 20)));
+    assert!(errs(&kv_block_store(2 << 20)).iter().any(|c| c == "GV-BUF-OVER"), "{:?}", errs(&kv_block_store(2 << 20)));
+}

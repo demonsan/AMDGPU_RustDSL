@@ -852,6 +852,74 @@ def check_tileop_p1(planes, out):
 
 PLAIN_KINDS = [(16, "fp4", "fp4"), (16, "fp8", "fp4"), (16, "fp8", "fp8"), (16, "fp6", "bf8"), (32, "fp4", "fp4"), (32, "bf8", "fp8")]
 
+# ---------------------------------------------------------------- probe_atomic2_p1
+def gen_atomic2_p1():
+    rnd = random.Random(61)
+    y = [u32(float(rnd.randint(-20, 20))) for _ in range(LANES)]
+    p = [(u32(float(rnd.randint(-2, 2))) >> 16) | ((u32(float(rnd.randint(-2, 2))) >> 16) << 16) for _ in range(LANES)]
+    h = [f2h(float(rnd.randint(-2, 2))) | (f2h(float(rnd.randint(-2, 2))) << 16) for _ in range(LANES)]
+    return [y, p, h]
+
+def check_atomic2_p1(planes, out):
+    y, p, h = planes
+    bf = lambda v: struct.unpack("<f", struct.pack("<I", (v & 0xFFFF) << 16))[0]
+    ok = True
+    def rep(name, cond):
+        nonlocal ok
+        ok &= cond
+        print(("ok   " if cond else "FAIL ") + name)
+    for c in range(4):
+        ls = [l for l in range(64) if l % 4 == c]
+        rep(f"buffer add_f32 c{c}", f32(out[c]) == sum(f32(y[l]) for l in ls))
+        s0, s1 = sum(bf(p[l]) for l in ls), sum(bf(p[l] >> 16) for l in ls)
+        rep(f"buffer pk_add_bf16 c{c}", (bf(out[4 + c]), bf(out[4 + c] >> 16)) == (s0, s1))
+        t0, t1 = sum(h2f(h[l]) for l in ls), sum(h2f(h[l] >> 16) for l in ls)
+        rep(f"buffer pk_add_f16 c{c}", (h2f(out[8 + c]), h2f(out[8 + c] >> 16)) == (t0, t1))
+        rep(f"buffer add_u32 c{c}", out[12 + c] == sum(ls))
+        rep(f"global pk_add_bf16 c{c}", (bf(out[16 + c]), bf(out[16 + c] >> 16)) == (s0, s1))
+        rep(f"global pk_add_f16 (returning) c{c}", (h2f(out[20 + c]), h2f(out[20 + c] >> 16)) == (t0, t1))
+    return ok
+
+# ---------------------------------------------------------------- probe_ptr64_p1
+def gen_ptr64_p1():
+    rnd = random.Random(71)
+    x = [rnd.getrandbits(32) for _ in range(LANES)]
+    y = [rnd.getrandbits(32) for _ in range(LANES)]
+    x[0], y[0] = 0xFFFFFFFF, 0xFFFFFFFF
+    return [x, y]
+
+def check_ptr64_p1(planes, out):
+    x, y = planes
+    P = lambda k: out[k * LANES:(k + 1) * LANES]
+    ptr = lambda k, l: P(k)[l] | (P(k + 1)[l] << 32)
+    M = (1 << 64) - 1
+    ok = True
+    def rep(name, cond):
+        nonlocal ok
+        ok &= cond
+        print(("ok   " if cond else "FAIL ") + name)
+    base = ptr(0, 0)
+    rep("out pointer uniform", all(ptr(0, l) == base for l in range(64)))
+    rep("scalar ptr_mad(out, 0x12345678, 0x9abc)", all(ptr(2, l) == (base + 0x12345678 * 0x9abc) & M for l in range(64)))
+    rep("vector ptr_mad(out, x, y) (u32 x u32 -> u64)", all(ptr(4, l) == (base + x[l] * y[l]) & M for l in range(64)))
+    rep("scalar ptr_mad(out, rfl(x), rfl(y)) (0xffffffff^2)", all(ptr(6, l) == (base + x[0] * y[0]) & M for l in range(64)))
+    rep("store through a moved descriptor base (out + 2048)", list(P(8)) == [l + 1 for l in range(64)])
+    return ok
+
+# ---------------------------------------------------------------- probe_anylane
+def check_anylane(planes, out):
+    want = [1, 0, 1, 1, 1, 0, 1, 1, 1]
+    names = ["any_lane(!(tid != 0)) [one lane] taken", "any_lane(!(tid >= 0)) [no lane] not taken", "any_lane(tid == 5) [one lane] taken",
+             "uniform !(1 < 0) taken", "any_lane(tid >= 0) [all] taken", "any_lane(tid < 0) [none] not taken",
+             "any_lane(!(tid >= 64)) [all] taken", "any_lane(CmpLtI32(tid, 3)) [3 lanes] taken", "any_lane(!CmpLtI32(tid, 3)) [61 lanes] taken"]
+    ok = True
+    for k in range(9):
+        got = out[k * LANES:(k + 1) * LANES]
+        good = all(v == want[k] for v in got)
+        ok &= good
+        print(("ok   " if good else "FAIL ") + names[k] + ("" if good else f": got {got[0]}"))
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -864,6 +932,10 @@ PROBES = {
     "probe_lane_p1": (gen_lane_p1, check_lane_p1, 14 * LANES * 4),
     "probe_tileop_p1": (gen_tileop_p1, check_tileop_p1, 64 * 60),
     "probe_f8f6f4_plain": (lambda: gen_f8f6f4_p1(PLAIN_KINDS), lambda p, o: check_f8f6f4_p1(p, o, PLAIN_KINDS), sum(2 * LANES * 4 * (4 if k[0] == 16 else 16) for k in PLAIN_KINDS)),
+    "probe_atomic2_p1": (gen_atomic2_p1, check_atomic2_p1, 512),
+    "probe_tr_b16_mfma2": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
+    "probe_ptr64_p1": (gen_ptr64_p1, check_ptr64_p1, 9 * LANES * 4),
+    "probe_anylane": (lambda: [[0] * LANES], check_anylane, 9 * LANES * 4),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }

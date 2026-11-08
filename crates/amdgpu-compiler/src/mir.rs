@@ -135,6 +135,9 @@ pub enum MOp {
     VCvtF16F32,
     VAndB32,
     VMinI32,
+    // B1 64-bit address arithmetic
+    SMulHiU32,
+    VMadU64U32,
     // B2 cross-lane / wave-mask ops (readlane / writelane: imm = lane; ds_* lane permutes: imm = offset / swizzle pattern)
     VReadLane,
     VWriteLane,
@@ -481,6 +484,15 @@ pub enum MOp {
     GlobalLoadF32Sc1,
     GlobalStoreF32Sc1,
     GlobalAtomicAddRet,
+    // buffer atomics (srcs: data, rsrc, voffset, soffset; imm offset) and packed 16-bit global atomics
+    BufferAtomicAddU32,
+    BufferAtomicAddF32,
+    BufferAtomicPkAddBf16,
+    BufferAtomicPkAddF16,
+    GlobalAtomicPkAddBf16,
+    GlobalAtomicPkAddBf16Rtn,
+    GlobalAtomicPkAddF16,
+    GlobalAtomicPkAddF16Rtn,
     // B3 atomics (LDS: srcs addr, data, imm = offset; global: srcs ptr, data, imm = offset; `Rtn`: returns the old value)
     LdsAtomicAddU32,
     LdsAtomicAddU32Rtn,

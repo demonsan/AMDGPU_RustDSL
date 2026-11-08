@@ -211,7 +211,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::Un(o, _) if o.trans() => ResClass::Trans,
         Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
         Op::Mfma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
-        Op::AnyLane(_) | Op::FragSlice { .. } | Op::FragCat { .. } | Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } | Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } => ResClass::Valu,
+        Op::PtrMadU32 { .. } | Op::AnyLane(_) | Op::FragSlice { .. } | Op::FragCat { .. } | Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } | Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } => ResClass::Valu,
         // lane permutes through the LDS crossbar: lgkm-counted, no LDS memory
         Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => ResClass::LdsRead,
         Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => {
@@ -297,7 +297,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.lds_write = true;
             (ResClass::LdsWrite, vec![], false)
         }
-        Stmt::AtomicGlobalNoRet { .. } => {
+        Stmt::AtomicGlobalNoRet { .. } | Stmt::BufferAtomicNoRet { .. } => {
             e.global_read = true;
             e.global_write = true;
             (ResClass::VmemStore, vec![], false)

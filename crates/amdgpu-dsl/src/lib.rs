@@ -378,7 +378,7 @@ pub enum DppAluOp { AddF32, SubF32, MulF32, MaxF32, MinF32, AddU32, MaxI32, MinI
 
 /// Atomic read-modify-write operations (B3). `IncU32`: old >= value ? 0 : old + 1 (a wrapping counter).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AtomicOp { AddU32, MaxU32, MinU32, MaxI32, MinI32, IncU32, AddF32 }
+pub enum AtomicOp { AddU32, MaxU32, MinU32, MaxI32, MinI32, IncU32, AddF32, PkAddBf16, PkAddF16 }
 
 impl AtomicOp {
     pub fn value_ty(self) -> DType {
@@ -630,6 +630,9 @@ pub enum Op {
     LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
     LoadLdsTrB16 { addr: Opnd },
+    /// 64-bit address arithmetic: `base + (u64) a * (u64) b` with `a`, `b` read as UNSIGNED 32-bit (> 4 GiB offsets; a wave-uniform result
+    /// stays scalar, so it can be the base of a buffer descriptor)
+    PtrMadU32 { base: Opnd, a: Opnd, b: Opnd },
     /// "Any lane": the wave-level reading of a per-lane condition (true for the whole wave when any lane's `cond` holds) — the explicit marker
     /// for branching on a per-lane condition (`if` / `break_if` are wave-level). No code: the branch itself has this semantics.
     AnyLane(Opnd),
@@ -680,6 +683,7 @@ impl Op {
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
             Op::AnyLane(_) => DType::I1,
+            Op::PtrMadU32 { .. } => DType::Ptr,
             Op::FragSlice { n, .. } => match n {
                 1 => DType::I32,
                 2 => DType::Frag2,
@@ -789,6 +793,7 @@ impl Op {
             Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
             Op::Dpp { x, old, .. } => vec![*x, *old],
             Op::AnyLane(c) => vec![*c],
+            Op::PtrMadU32 { base, a, b } => vec![*base, *a, *b],
             Op::FragSlice { frag, .. } => vec![*frag],
             Op::FragCat { parts, .. } => parts.clone(),
             Op::ReadLane { x, .. } | Op::Swizzle { x, .. } => vec![*x],
@@ -1125,6 +1130,8 @@ pub enum Stmt {
     StoreLdsN { addr: Opnd, value: Opnd, ty: MemTy, hi: bool },
     /// LDS atomic without return
     AtomicLdsNoRet { op: AtomicOp, addr: Opnd, value: Opnd },
+    /// MUBUF atomic without return (`buffer_atomic_<op>`; AddU32, AddF32, PkAddBf16, PkAddF16): range-checked against the descriptor like a store
+    BufferAtomicNoRet { op: AtomicOp, rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd },
     /// global atomic without return
     AtomicGlobalNoRet { op: AtomicOp, base: Opnd, byte_off: u32, value: Opnd },
     /// `ds_write2[st64]_b32 / _b64`: `v0` at `addr + off0 * s`, `v1` at `addr + off1 * s`
@@ -2090,6 +2097,11 @@ impl FnBuilder {
             None
         }
     }
+    /// `base + (u64) a * (u64) b` (unsigned 32-bit factors, 64-bit product): addresses beyond 4 GiB (`index * stride`). Wave-uniform operands
+    /// give a scalar pointer (usable as a buffer-descriptor base: move the descriptor to the row / block, keep per-lane offsets small).
+    pub fn ptr_mad(&mut self, base: impl Into<Opnd>, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::PtrMadU32 { base: base.into(), a: a.into(), b: b.into() })
+    }
     /// Mark a per-lane condition for a wave-level branch: the wave takes the branch when ANY lane's `cond` holds (`if` / `break_if` conditions must
     /// be wave-uniform; this is the explicit way to branch on a per-lane one).
     pub fn any_lane(&mut self, cond: impl Into<Opnd>) -> ValueId {
@@ -2099,6 +2111,23 @@ impl FnBuilder {
     pub fn frag_slice(&mut self, frag: impl Into<Opnd>, start: u8, n: u8) -> ValueId {
         assert!(matches!(n, 1 | 2 | 4 | 8), "frag_slice: n is 1, 2, 4 or 8");
         self.let_(Op::FragSlice { frag: frag.into(), start, n })
+    }
+    /// `lo ++ hi` as one Frag4 (e.g. two `ds_read_b64_tr_b16` results = a bf16 MFMA operand). Fresh single-use parts are written IN PLACE (the
+    /// defining instruction targets its half of the result: no copies, no early wait).
+    pub fn cat_frag4(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
+        let (lo, hi) = (lo.into(), hi.into());
+        self.frag_cat(&[lo, hi])
+    }
+    /// Two `ds_read_b64_tr_b16` (at `addr0`, `addr1`) as one Frag4, each read writing its half directly.
+    pub fn load_lds_tr_b16x2(&mut self, addr0: impl Into<Opnd>, addr1: impl Into<Opnd>) -> ValueId {
+        let r0 = self.load_lds_tr_b16(addr0);
+        let r1 = self.load_lds_tr_b16(addr1);
+        self.cat_frag4(r0, r1)
+    }
+    /// Four dwords as a Frag4 with fresh single-use parts written in place (`frag4` copies; this does not).
+    pub fn pack4(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>) -> ValueId {
+        let p = [a.into(), b.into(), c.into(), d.into()];
+        self.frag_cat(&p)
     }
     /// Concatenate one-dword values / fragments into a fragment (total 2, 4, 8 or 16 dwords).
     pub fn frag_cat(&mut self, parts: &[Opnd]) -> ValueId {
@@ -2154,6 +2183,11 @@ impl FnBuilder {
     /// `ds_swizzle_b32` with the raw 16-bit pattern.
     pub fn swizzle(&mut self, x: impl Into<Opnd>, pattern: u16) -> ValueId {
         self.let_(Op::Swizzle { x: x.into(), pattern })
+    }
+    /// MUBUF atomic without return (`AddU32`, `AddF32`, `PkAddBf16`, `PkAddF16`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn buffer_atomic(&mut self, op: AtomicOp, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
+        self.push_stmt(Stmt::BufferAtomicNoRet { op, rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into() });
     }
     /// `v_mov_b32_dpp` with a full DPP control; lanes not written keep `old`.
     pub fn dpp(&mut self, dpp: Dpp, x: impl Into<Opnd>, old: impl Into<Opnd>) -> ValueId {
@@ -2902,7 +2936,19 @@ fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
             }
             data(&mut e, *value, *ty, *hi);
         }
-        Stmt::AtomicLdsNoRet { addr, value, .. } => {
+        Stmt::BufferAtomicNoRet { op, rsrc, voff, soff, imm, value } => {
+            if !matches!(op, AtomicOp::AddU32 | AtomicOp::AddF32 | AtomicOp::PkAddBf16 | AtomicOp::PkAddF16) {
+                e.push(format!("buffer atomic {op:?}: only AddU32 / AddF32 / PkAddBf16 / PkAddF16"));
+            }
+            e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1));
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
+        Stmt::AtomicLdsNoRet { addr, value, op } => {
+            if matches!(op, AtomicOp::PkAddBf16 | AtomicOp::PkAddF16) {
+                e.push(format!("lds atomic {op:?}: packed 16-bit atomics are global / buffer only"));
+            }
             if let Err(x) = expect_int(f, *addr, "lds atomic address") {
                 e.push(x);
             }
@@ -2975,7 +3021,10 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
         }
         Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
         Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
-        Op::AtomicLds { addr, value, .. } => {
+        Op::AtomicLds { addr, value, op } => {
+            if matches!(op, AtomicOp::PkAddBf16 | AtomicOp::PkAddF16) {
+                e.push(format!("lds atomic {op:?}: packed 16-bit atomics are global / buffer only"));
+            }
             if let Err(x) = expect_int(f, *addr, "lds atomic address") {
                 e.push(x);
             }
@@ -3605,7 +3654,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
                 errs.extend(check_mfma(f, *kind, *a, *b, None, scale.as_ref()).into_iter().map(here));
             }
-            Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::AtomicLdsNoRet { .. } | Stmt::AtomicGlobalNoRet { .. } => {
+            Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::AtomicLdsNoRet { .. } | Stmt::AtomicGlobalNoRet { .. } | Stmt::BufferAtomicNoRet { .. } => {
                 for o in stmt_operands(st) {
                     if let Opnd::Val(v) = o {
                         if !visible(&scopes, v) {
@@ -4028,6 +4077,13 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::StoreLds2 { addr, v0, v1, .. } => vec![*addr, *v0, *v1],
         Stmt::AtomicLdsNoRet { addr, value, .. } => vec![*addr, *value],
         Stmt::AtomicGlobalNoRet { base, value, .. } => vec![*base, *value],
+        Stmt::BufferAtomicNoRet { rsrc, voff, soff, value, .. } => {
+            let mut v = vec![*rsrc];
+            v.extend(voff.iter().copied());
+            v.push(*soff);
+            v.push(*value);
+            v
+        }
         Stmt::VarMfma { a, b, scale, .. } => {
             let mut v = vec![*a, *b];
             if let Some(s) = scale {
