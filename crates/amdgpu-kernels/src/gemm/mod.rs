@@ -818,13 +818,14 @@ impl Body {
         }
     }
     /// `reg_b`: the B fragment of n block j of K tile `it` straight from global memory (two 16-byte loads), into AGPRs.
-    fn b_global(&self, b: &mut FnBuilder, it: I32, j: usize) -> ValueId {
+    fn b_global(&self, b: &mut FnBuilder, it: I32, j: usize, into_agpr: bool) -> ValueId {
         let (vo, k16) = self.regb.as_ref().expect("reg_b");
         let so = { let v = b.bind_i32((it << 11) + ev(self.b_org) + ev(*k16) * j as i32); b.read_first_lane(v) };
         let lo = b.buffer_load_b128(self.rsrc_b, vo[0], so, 0);
         let hi = b.buffer_load_b128(self.rsrc_b, vo[1], so, 0);
-        let v = b.cat_frag8(lo, hi);
-        b.agpr(v)
+        // frag_cat: the two loads write the halves of the result (set_var: the loop variable's own registers, no wait at the definition)
+        let v = b.frag_cat(&[lo.into(), hi.into()]);
+        if into_agpr { b.agpr(v) } else { v }
     }
     /// An operand fragment read into AGPRs.
     fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
@@ -839,7 +840,7 @@ impl Body {
         let sb: Vec<ValueId> = sb.into_iter().map(|v| self.scale_word(b, v)).collect();
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
-        let bf: Vec<ValueId> = if self.regb.is_some() { (0..nn).map(|j| self.b_global(b, ox(t.it), j)).collect() } else { (0..nn).map(|j| self.frag(b, &br, j)).collect() };
+        let bf: Vec<ValueId> = if self.regb.is_some() { (0..nn).map(|j| self.b_global(b, ox(t.it), j, true)).collect() } else { (0..nn).map(|j| self.frag(b, &br, j)).collect() };
         let af: Vec<ValueId> = (0..nm).map(|i| self.frag(b, &ar, i)).collect();
         self.staged = Some((bf, af, sa, sb));
     }
@@ -902,7 +903,7 @@ impl Body {
                 if let Some((_, br)) = &next {
                     for j in lo..hi {
                         u.capture(b, format!("reload.b{j}"), |b| {
-                            let v = if self.regb.is_some() { self.b_global(b, ox(t.it) + 1, j) } else { br.read(b, j) };
+                            let v = if self.regb.is_some() { self.b_global(b, ox(t.it) + 1, j, false) } else { br.read(b, j) };
                             b.set_var(bv[j], v);
                         });
                     }
