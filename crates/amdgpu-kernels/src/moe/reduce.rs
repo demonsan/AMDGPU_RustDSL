@@ -3,7 +3,8 @@
 //! * `moe_reduce_bf16_k<K>_d<D>`  `out[t][d] = bf16(sum_k w[t][k] * x[t][k][d])`.  ABI x @0 (bf16 [T][K][D]), w @8 (f32 [T][K]), out @16 (bf16 [T][D]), T @24 (i32)
 //! * `moe_combine_bf16_k<K>_d<D>`     `out[t][d] = bf16(sum_k x[t][k][d])`.            ABI x @0, out @8, T @16
 //!
-//! K 1..=16, D a multiple of 8 in 8..=65536; grid x = the column tiles (`pick_threads(D / 8)` threads, one b128 per lane and route), grid y = tokens (T <= 65535 and T * K * D * 2 < 2 GiB: 32-bit offsets).
+//! K 1..=16, D a multiple of 8 in 8..=65536; grid x = the column tiles (`pick_threads(D / 8)` threads, one b128 per lane and route), grid y = tokens (T <= 65535). The buffer descriptors are moved to the token's row
+//! (64-bit `ptr_mad`, num_records = one token), so x may exceed 4 GiB.
 //! All K loads of a lane are in flight before the sum; accumulation in f32, one round to bf16 (RNE); streaming (`nt`) accesses.
 
 use amdgpu_dsl::{CachePolicy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
@@ -59,7 +60,8 @@ pub fn moe_reduce(name: &str, k: i64, d: i64, weighted: bool) -> Function {
         (8, 16)
     };
     b.arg("t", DType::I32, t_off, 4);
-    let tmax = (65535i64).min(((1i64 << 31) - 1) / (2 * k * d));
+    // the descriptors are moved to the token's row with a 64-bit `ptr_mad` (num_records = one token), so the tensors may exceed 4 GiB; T is bounded by the grid (y <= 65535)
+    let tmax = 65535i64;
     let tt = Ext::sym("T");
     b.sym_range("T", 1, tmax);
     b.ka_is(t_off, tt.clone());
@@ -77,13 +79,17 @@ pub fn moe_reduce(name: &str, k: i64, d: i64, weighted: bool) -> Function {
     let tid = b.let_(Op::WorkitemId);
     let tile = b.let_(Op::WorkgroupIdX);
     let row = b.let_(Op::WorkgroupIdY);
-    let r_x = { let v = b.bind_i32(ev(t_v) * (2 * k * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_x, v) };
-    let r_w = p_w.map(|p| { let v = b.bind_i32(ev(t_v) * (4 * k) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p, v) });
-    let r_o = { let v = b.bind_i32(ev(t_v) * (2 * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_o, v) };
+    let rowc = b.let_(Op::AddI32(Opnd::Val(row), Opnd::I32(0)));
+    let (cx, cw, co) = (b.c_i32((2 * k * d) as i32), b.c_i32((4 * k) as i32), b.c_i32((2 * d) as i32));
+    let px = b.ptr_mad(p_x, rowc, cx);
+    let r_x = b.buffer_desc(px, (2 * k * d) as u32);
+    let r_w = p_w.map(|p| { let pw = b.ptr_mad(p, rowc, cw); b.buffer_desc(pw, (4 * k) as u32) });
+    let po = b.ptr_mad(p_o, rowc, co);
+    let r_o = b.buffer_desc(po, (2 * d) as u32);
     let col8 = b.bind_i32(ev(tile) * threads as i32 + ev(tid));
     let valid = b.let_(Op::CmpLtI32(Opnd::Val(col8), Opnd::I32(d8 as i32)));
     // the K routes of this token: all loads first
-    let base = b.bind_i32(ev(row) * (2 * k * d) as i32 + (ev(col8) << 4));
+    let base = b.bind_i32(ev(col8) << 4);
     let mut xs = Vec::new();
     for r in 0..k {
         let off = if r == 0 { base } else { b.bind_i32(ev(base) + (2 * d * r) as i32) };
@@ -92,7 +98,7 @@ pub fn moe_reduce(name: &str, k: i64, d: i64, weighted: bool) -> Function {
     let ws: Vec<ValueId> = match r_w {
         Some(rw) => (0..k)
             .map(|r| {
-                let wo = b.bind_i32(ev(row) * (4 * k) as i32 + (4 * r) as i32);
+                let wo = b.c_i32((4 * r) as i32);
                 b.buffer_load_f32(rw, wo, 0i32, 0)
             })
             .collect(),
@@ -117,7 +123,7 @@ pub fn moe_reduce(name: &str, k: i64, d: i64, weighted: bool) -> Function {
         });
     }
     let o = pack8(b, &acc.unwrap());
-    let offo = b.bind_i32(ev(row) * (2 * d) as i32 + (ev(col8) << 4));
+    let offo = b.bind_i32(ev(col8) << 4);
     let offo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(valid), a: Opnd::Val(offo), b: Opnd::I32(-16) });
     b.buffer_store_c(r_o, Some(Opnd::Val(offo)), 0i32, 0, o, MemTy::B128, false, CachePolicy::NT);
     fb.finish()
