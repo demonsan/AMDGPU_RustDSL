@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     const int T = atoi(argv[a++]), R = atoi(argv[a++]), S = atoi(argv[a++]), st = atoi(argv[a++]), pad = atoi(argv[a++]), dil = atoi(argv[a++]);
     const int cta = argc > a ? atoi(argv[a]) : 256;
     // SPLITK=S (the _c128_sk kernel): fp32 partials [S][MP][K] + gemm_splitk_reduce_s<S> (REDUCE_CO)
-    const int SPK = envi("SPLITK", 1);
+    const int S = envi("SPLITK", 1);
     const int sd = T == 1 ? 1 : st, pd = T == 1 ? 0 : pad;
     const int OD = (DI + 2 * pd - dil * (T - 1) - 1) / sd + 1, OH = (H + 2 * pad - dil * (R - 1) - 1) / st + 1, OW = (W + 2 * pad - dil * (S - 1) - 1) / st + 1;
     const long M = (long)NB * OD * OH * OW;
@@ -64,26 +64,26 @@ int main(int argc, char** argv) {
     auto U = [&](int o, int v) { memcpy(&ab[o], &v, 4); };
     const long MP = (M + cta - 1) / cta * cta;
     float* dws = nullptr;
-    if (SPK > 1) HC(hipMalloc(&dws, (size_t)SPK * MP * K * 4 + 256));
-    P(0, dx); P(8, dw); P(16, SPK > 1 ? (void*)dws : (void*)dy); U(24, (int)M); U(28, K); U(32, KR); U(36, SPK); U(40, KR); U(44, KR); U(48, K); U(80, (int)M);
-    U(84, KR * 2 / 128); U(88, KR * 2 / 128 / SPK); U(92, (int)MP);
+    if (S > 1) HC(hipMalloc(&dws, (size_t)S * MP * K * 4 + 256));
+    P(0, dx); P(8, dw); P(16, S > 1 ? (void*)dws : (void*)dy); U(24, (int)M); U(28, K); U(32, KR); U(36, S); U(40, KR); U(44, KR); U(48, K); U(80, (int)M);
+    U(84, KR * 2 / 128); U(88, KR * 2 / 128 / S); U(92, (int)MP);
     U(96, NB); U(100, DI); U(104, H); U(108, W); U(112, C); U(116, OD); U(120, OH); U(124, OW);
     size_t asz = ab.size();
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ab.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};
     hipFunction_t rfn = nullptr;
     std::vector<uint8_t> ra(48, 0);
-    if (SPK > 1) {
+    if (S > 1) {
         hipModule_t rm;
         HC(hipModuleLoad(&rm, getenv("REDUCE_CO")));
-        std::string rk = "gemm_splitk_reduce_s" + std::to_string(SPK) + "_n256";
+        std::string rk = "gemm_splitk_reduce_s" + std::to_string(S) + "_n256";
         HC(hipModuleGetFunction(&rfn, rm, rk.c_str()));
         int mi = (int)M, mpi = (int)MP;
-        memcpy(&ra[0], &dws, 8); memcpy(&ra[8], &dy, 8); memcpy(&ra[32], &mi, 4); memcpy(&ra[36], &K, 4); memcpy(&ra[40], &SPK, 4); memcpy(&ra[44], &mpi, 4);
+        memcpy(&ra[0], &dws, 8); memcpy(&ra[8], &dy, 8); memcpy(&ra[32], &mi, 4); memcpy(&ra[36], &K, 4); memcpy(&ra[40], &S, 4); memcpy(&ra[44], &mpi, 4);
     }
     size_t rsz = ra.size();
     void* rcfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ra.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &rsz, HIP_LAUNCH_PARAM_END};
     auto launch = [&]() {
-        HC(hipModuleLaunchKernel(fn, K / cta, (int)((M + cta - 1) / cta), SPK, 256, 1, 1, 0, nullptr, nullptr, cfg));
+        HC(hipModuleLaunchKernel(fn, K / cta, (int)((M + cta - 1) / cta), S, 256, 1, 1, 0, nullptr, nullptr, cfg));
         if (rfn) HC(hipModuleLaunchKernel(rfn, K / 256, (int)M, 1, 64, 1, 1, 0, nullptr, nullptr, rcfg));
     };
     launch();
