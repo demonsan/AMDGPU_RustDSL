@@ -50,23 +50,44 @@ int main(int argc, char** argv) {
     HC(hipMalloc(&dout, (size_t)B * H * DV * 2));
     HC(hipMalloc(&dpo, (size_t)B * H * NS * DV * 4)); HC(hipMalloc(&dpl, (size_t)B * H * NS * 4));
     void *dq = dev(q), *dkv = dev(kv), *dbt = dev(bt), *dcl = dev(cl);
+    // VENDOR=<co>: aiter mla_dec_stage1_bf16_a16w16_subQ16_mqa16 (H = 16) with our split-major combine (argv[2] = attn_combine_bf16_hd512_sm)
+    const char* vco = getenv("VENDOR");
     hipModule_t m1, m2;
     hipFunction_t fn, cfn;
-    HC(hipModuleLoad(&m1, argv[1]));
-    std::string kn = "mla_decode_bf16_p" + std::to_string(P);
+    HC(hipModuleLoad(&m1, vco ? vco : argv[1]));
+    std::string kn = vco ? "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E" : "mla_decode_bf16_p" + std::to_string(P);
     HC(hipModuleGetFunction(&fn, m1, kn.c_str()));
     HC(hipModuleLoad(&m2, argv[2]));
-    HC(hipModuleGetFunction(&cfn, m2, "attn_combine_bf16_hd512"));
-    std::vector<uint8_t> a(16 * 11, 0), ca(16 * 5, 0);
+    HC(hipModuleGetFunction(&cfn, m2, vco ? "attn_combine_bf16_hd512_sm" : "attn_combine_bf16_hd512"));
+    std::vector<uint8_t> a(vco ? 368 : 16 * 11, 0), ca(16 * 5, 0);
     auto Pp = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
     auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
-    Pp(0, dpo); Pp(1, dq); Pp(2, dkv); Pp(3, dbt); Pp(4, dcl); memcpy(&a[80], &scale, 4); U(6, H); U(7, maxp); U(8, npages); U(9, S); Pp(10, dpl);
+    int gx = (H + 31) / 32;
+    if (!vco) {
+        Pp(0, dpo); Pp(1, dq); Pp(2, dkv); Pp(3, dbt); Pp(4, dcl); memcpy(&a[80], &scale, 4); U(6, H); U(7, maxp); U(8, npages); U(9, S); Pp(10, dpl);
+    } else {
+        // kv_indptr (pages), page indices, last page lens, qo_indptr, num_kv_splits_indptr, unit scales
+        std::vector<int> indptr(B + 1, 0), idx, lastl(B), qo(B + 1), sp(B + 1);
+        for (int b = 0; b < B; b++) {
+            int np_ = (cl[b] + P - 1) / P;
+            for (int p = 0; p < np_; p++) idx.push_back(bt[(size_t)b * maxp + p]);
+            indptr[b + 1] = indptr[b] + np_;
+            lastl[b] = cl[b] - (np_ - 1) * P;
+        }
+        for (int b = 0; b <= B; b++) { qo[b] = b; sp[b] = b * S; }
+        std::vector<float> one(4, 1.0f);
+        void *dind = dev(indptr), *didx = dev(idx), *dlast = dev(lastl), *dqo = dev(qo), *dsp = dev(sp), *done = dev(one);
+        Pp(0, dpo); Pp(1, dpl); Pp(2, dq); Pp(3, dkv); Pp(4, dind); Pp(5, didx); Pp(6, dlast); memcpy(&a[112], &scale, 4);
+        U(8, 16); U(9, S); U(10, H * DK * 2); U(11, P * DK * 2); int lg = 0; while ((1 << lg) < P) lg++; U(12, lg);
+        Pp(13, dqo); Pp(14, dsp); Pp(15, nullptr); Pp(16, done); Pp(17, done); U(18, S == 1 ? 1 : 0); Pp(19, nullptr); Pp(20, nullptr); U(21, 1); U(22, 0);
+        gx = 1;
+    }
     memcpy(&ca[0], &dout, 8); memcpy(&ca[16], &dpo, 8); memcpy(&ca[32], &dpl, 8); memcpy(&ca[48], &H, 4); memcpy(&ca[64], &NS, 4);
     size_t asz = a.size(), csz = ca.size();
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, a.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};
     void* ccfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ca.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &csz, HIP_LAUNCH_PARAM_END};
     auto launch = [&]() {
-        HC(hipModuleLaunchKernel(fn, (H + 31) / 32, B, S, 256, 1, 1, 0, nullptr, nullptr, cfg));
+        HC(hipModuleLaunchKernel(fn, gx, B, S, 256, 1, 1, 0, nullptr, nullptr, cfg));
         HC(hipModuleLaunchKernel(cfn, H, B, 1, 512, 1, 1, 0, nullptr, nullptr, ccfg));
     };
     launch();
@@ -112,7 +133,7 @@ int main(int argc, char** argv) {
     float ms; HC(hipEventElapsedTime(&ms, e0, e1));
     double us = 1e3 * ms / iters, bytes = 0;
     for (int c : cl) bytes += (double)c * DK * 2;
-    printf("ours %s B=%d H=%d CTX=%d P=%d S=%d: %.2f us %.0f GB/s (KV) bad=%ld maxerr=%.3e %s\n", kn.c_str(), B, H, CTX, P, S, us, bytes / (us * 1e-6) / 1e9, bad, maxe,
+    printf("%s %s B=%d H=%d CTX=%d P=%d S=%d: %.2f us %.0f GB/s (KV) bad=%ld maxerr=%.3e %s\n", vco ? "vendor" : "ours", kn.c_str(), B, H, CTX, P, S, us, bytes / (us * 1e-6) / 1e9, bad, maxe,
            bad ? "MLA_FAIL" : "MLA_OK");
     return bad ? 3 : 0;
 }
