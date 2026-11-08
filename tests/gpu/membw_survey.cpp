@@ -7,8 +7,10 @@
 #define CK(x) do { hipError_t e_=(x); if(e_!=hipSuccess){ printf("%s: %s\n", #x, hipGetErrorString(e_)); exit(1);} } while(0)
 template<int W> struct V;                 // W dwords per thread per access
 template<> struct V<1> { typedef unsigned t; };
-template<> struct V<2> { typedef uint2 t; };
-template<> struct V<4> { typedef uint4 t; };
+typedef unsigned v2u __attribute__((ext_vector_type(2)));
+typedef unsigned v4u __attribute__((ext_vector_type(4)));
+template<> struct V<2> { typedef v2u t; };
+template<> struct V<4> { typedef v4u t; };
 template<typename T> __device__ __forceinline__ T ld(const T* p, bool nt) { return nt ? __builtin_nontemporal_load(p) : *p; }
 template<typename T> __device__ __forceinline__ void st(T* p, T v, bool nt) { if (nt) __builtin_nontemporal_store(v, p); else *p = v; }
 // copy: each block handles U vectors per thread per step; grid-stride when gs
