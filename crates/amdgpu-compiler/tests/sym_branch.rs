@@ -25,7 +25,6 @@ fn uniform(negate: bool, limit: i32) -> Function {
             let _ = b.load_lds_b128(a);
         });
     } else {
-        let c = b.any_lane(c); // a wave-level branch on a per-lane condition
         b.if_(c, |b| {
             let a = b.bind_i32(ev(n) * 16);
             let _ = b.load_lds_b128(a);
