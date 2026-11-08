@@ -38,6 +38,7 @@ fn all_kernels() -> Vec<String> {
         "rope_gptj_bf16_h8_d256",
         "reshape_cache_flash_bf16_h8_d128",
         "topk_softmax_bf16_e128_k8",
+        "causal_conv1d_fwd_split_bf16_w4_silu_sched",
         "concat_cache_mla_seg_fp8_r512_p64_b64_i64",
         "gelu_mul_bias_bf16_d2048",
         "rmsnorm_quant_mxfp4_bf16_k4096",

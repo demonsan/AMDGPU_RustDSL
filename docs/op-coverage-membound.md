@@ -363,7 +363,7 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 
 `causal_conv1d_fwd_bf16_w<W>[_silu]` 与 `causal_conv1d_fwd_split_bf16_w<W>[_silu]`：`out[t][f] = bias[f] + Σ_{i < W} weight[f][i] · x[t − (W − 1) + i][f]`，序列起点之前的输入取该序列的初始状态（`has_initial` 为真）或 0，可选 silu；序列结束后 `conv_states[cache_idx][f][0 .. W−1)` 写成该序列最后 W − 1 个输入（序列短于 W − 1 时保留更早的初始状态值）。x 是 channel-last 的 `[T][dim]`（SGLang prefill 的布局），`cu_seqlens [B + 1]` 给出序列边界，`cache_indices [B]` 给出状态槽（负 = 跳过整个序列）；状态布局 `[slots][dim][W − 1]`，与 decode 的 `causal_conv1d_update_*_s<W−1>` 完全一致，所以 prefill 写的状态 decode 可以直接接着用。split 版本把特征 `[0, k)`、`[k, 2k)`、`[2k, dim)` 分别写进 q、k、v 三个张量（行距 k、k、dim − 2k；k % 8 = 0）。
 
-布局：一个 lane 负责 8 个连续特征（b128 访问），一个块 256 lane = 2048 个特征，grid = (⌈dim / 2048⌉, B, ⌈max_len / 8⌉)：每个块顺序处理 8 个 token，前 W − 1 个输入留在寄存器里（块内第一个块从初始状态读，其余块从 x 读前几个 token）；8 次加载在第一个输出前全部发出；超出序列末尾的块不碰内存。限制：`T · dim · 2 < 2 GiB`（32 位偏移；更大要逐序列的 `ptr_mad` 描述符）、dim % 8 = 0。验证（`tests/gpu/conv1d_fwd_host.cpp`）：长度 1、2、W、随机的混合序列，一部分有初始状态、一部分没有、一部分状态槽为负（输出与状态都必须不被写），dim = 776 / 1000 / 1536 / 2048 / 4104 / 8192，W = 2 / 3 / 4，silu 开 / 关，split；输出（≤ 1 bf16 ulp）与最终状态（逐位）都与 CPU 参考一致，`gpu_verify --strict` 0 错误。性能：B = 128、每序列 512 token、dim = 8192：2.8 TB/s（计 x 读 + out 写）；序列长度很不均匀时（最长是平均的 4 倍，网格按最长序列铺）约 1 TB/s，因为 74 % 的块在序列末尾之外空转——要避免就需要 aiter 那样的（序列, 块）调度表，留作后续。VGPR 120 – 176。
+布局：一个 lane 负责 8 个连续特征（b128 访问），一个块 256 lane = 2048 个特征，grid = (⌈dim / 2048⌉, B, ⌈max_len / 8⌉)：每个块顺序处理 8 个 token，前 W − 1 个输入留在寄存器里（块内第一个块从初始状态读，其余块从 x 读前几个 token）；8 次加载在第一个输出前全部发出；超出序列末尾的块不碰内存。限制：`T · dim · 2 < 2 GiB`（32 位偏移；更大要逐序列的 `ptr_mad` 描述符）、dim % 8 = 0。验证（`tests/gpu/conv1d_fwd_host.cpp`）：长度 1、2、W、随机的混合序列，一部分有初始状态、一部分没有、一部分状态槽为负（输出与状态都必须不被写），dim = 776 / 1000 / 1536 / 2048 / 4104 / 8192，W = 2 / 3 / 4，silu 开 / 关，split；输出（≤ 1 bf16 ulp）与最终状态（逐位）都与 CPU 参考一致，`gpu_verify --strict` 0 错误。性能：B = 128、每序列 512 token、dim = 8192：2.8 TB/s（计 x 读 + out 写）；序列长度很不均匀时（最长是平均的 4 倍，网格按最长序列铺）约 1 TB/s，因为 74 % 的块在序列末尾之外空转——要避免就用 `_sched` 变体（见下）。VGPR 120 – 176。
 
 
 ## fp8 分块 cache（per-token scale）与 int64 slot_mapping
@@ -408,3 +408,8 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 ## topk_per_row 的两个负结果（未采用）
 
 `topk_per_row_*` 一行一个块，R = 256 行 × 64K 约 94 µs（5 遍读 + 4 次直方图扫描）。试了两个看起来该有用的改动，都没有收益，已撤销：（1）后三遍直方图里，只有前缀相等的元素（约 1 / 256）才计数，所以让没有任何匹配元素的 wave 跳过 LDS 原子（`any_lane` + 一致的 `if`），发射遍同样跳过没有写入的 wave：94 → 105 µs（更慢，分支与 exec 保存 / 恢复的开销大于省下的原子）；（2）每次迭代在途的加载从 4 个提到 16 个（VGPR 48 → 72）：94 → 93 µs，短行反而 15 → 20 µs（迭代粒度变粗）。所以这个 kernel 不是被加载延迟或 LDS 原子的数量卡住，而是被每遍固定的"清零 → 直方图 → barrier → 扫描（DPP + 两次 barrier）"链和 1024 线程上的 VALU 卡住（8 K 的行 15 µs 里大部分是这条固定链，约 2.5 µs / 遍）。想要明显更快需要换结构：11 位的数字（3 遍，2048 个桶）或者把一行拆到多个块上（需要跨块的全局原子 + 多次启动或块间同步，只在行数少于 CU 数时有意义，上界约 1.7 倍），都没有做。
+
+
+### 变长序列的调度表（`_sched`）
+
+`causal_conv1d_fwd_bf16_w<W>[_silu]_sched` / `causal_conv1d_fwd_split_bf16_w<W>[_silu]_sched`：和 aiter 一样，由调用方给出每个非空块的 (序列, 块序号) 表，网格是 `(⌈dim / 2048⌉, NC, 1)`，没有块在序列末尾之外空转。ABI 在原有基础上加：`sched_seq` @(slots + 8)、`sched_chunk` @(slots + 16)（i32 `[NC]`）、`nc` @(slots + 24)、`nseq` @(slots + 28)（= B，用来给 per-sequence 数组的描述符定尺寸，这样范围可证明）。B = 256、长度从 1 到 1024 的随机混合（T = 67932、dim = 8192、silu）：网格版 0.99 TB/s，`_sched` 版 **2.66 TB/s**（2.7 倍）；输出与最终状态与 CPU 参考一致，`gpu_verify --strict` 0 错误。
