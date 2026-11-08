@@ -176,7 +176,7 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     let keep = |b: &mut FnBuilder, off: i32| b.bind_cond((ev(key0) + off).lt(ev(k_hi)));
     let kbase = mbase.clone();
     let vbase = mbase.clone() + KT * ROW;
-    tile_math(&mut b, &tm, kbase, vbase, &keep, m_v, l_v, &ov, &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)), &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)));
+    tile_math(&mut b, &tm, kbase, vbase, Some(&keep), m_v, l_v, &ov, &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)), &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)));
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
     let done = b.bind_cond(ev(it1).ge(ev(ntile)));
