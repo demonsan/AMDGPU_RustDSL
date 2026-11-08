@@ -111,10 +111,20 @@ int main(int argc, char** argv) {
     fill(xf, xb, 1.0f, &xs, D);
     fill(w1f, w1b, 0.05f, &w1s, D);
     fill(w2f, w2b, 0.05f, &w2s, I);
-    auto w1sh = shuffle_b(w1b, (long)E * 2 * I, D, es);
+    // ours: gate / up rows interleaved in 16-row blocks (row 32 q + r = gate 16 q + r, 32 q + 16 + r = up 16 q + r); the vendor: stacked
+    std::vector<uint8_t> w1i(w1b.size());
+    std::vector<float> w1si(w1s.size());
+    for (int e = 0; e < E; e++)
+        for (int r = 0; r < 2 * I; r++) {
+            int q = r / 32, rr = r % 32, src = rr < 16 ? 16 * q + rr : I + 16 * q + rr - 16;
+            memcpy(&w1i[(((size_t)e * 2 * I) + r) * D * es], &w1b[(((size_t)e * 2 * I) + src) * D * es], (size_t)D * es);
+            w1si[(size_t)e * 2 * I + r] = w1s[(size_t)e * 2 * I + src];
+        }
+    auto w1sh = shuffle_b(w1i, (long)E * 2 * I, D, es);
+    auto w1sh_v = shuffle_b(w1b, (long)E * 2 * I, D, es);
     auto w2sh = shuffle_b(w2b, (long)E * D, I, es);
     void *dX = dev(xb), *dW1 = dev(w1sh), *dW2 = dev(w2sh), *dsid = dev(sid), *dseid = dev(seid), *dnv = dev(nv), *dsw = dev(sw);
-    void *dxs = dev(xs), *dw1s = dev(w1s), *dw2s = dev(w2s);
+    void *dxs = dev(xs), *dw1s = dev(w1si), *dw2s = dev(w2s), *dW1v = dev(w1sh_v), *dw1sv = dev(w1s);
     void *dY1, *dY1q, *dy1s, *dT, *dO;
     HC(hipMalloc(&dY1, (size_t)M * TK * I * 2)); HC(hipMalloc(&dY1q, (size_t)M * TK * I)); HC(hipMalloc(&dy1s, (size_t)M * TK * 4));
     HC(hipMalloc(&dT, (size_t)M * TK * D * 4)); HC(hipMalloc(&dO, (size_t)M * D * 2));
@@ -243,7 +253,7 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> va(368, 0);
         auto P = [&](int o, const void* p) { memcpy(&va[o], &p, 8); };
         auto U = [&](int o, int v) { memcpy(&va[o], &v, 4); };
-        P(0, dV); P(16, dX); P(32, dW1); P(48, dnv); P(64, dxs); P(80, dw1s); P(96, nullptr); P(112, dsid); P(128, dseid);
+        P(0, dV); P(16, dX); P(32, dW1v); P(48, dnv); P(64, dxs); P(80, dw1sv); P(96, nullptr); P(112, dsid); P(128, dseid);
         U(144, D); U(160, I); U(176, M); U(192, E); U(208, D); U(224, D); U(240, TK * I * 2); U(256, D * 2 * I); U(272, 2 * I * 4); U(288, I * 4);
         U(304, TK); U(320, 0); U(336, gelu ? 1 : 0); P(352, nullptr);
         int tn = envi("VENDOR1_TN", 128);

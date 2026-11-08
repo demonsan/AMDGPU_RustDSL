@@ -58,8 +58,8 @@ pub struct GemmConfig {
 /// 104 ptr_sorted_expert_ids, 112 ptr_num_valid_ids, 120 ptr_sorted_weights, 128 topk, 132 E, 136 n_out, 140 M (tokens).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeStage {
-    /// gate / up: A = X [M, k] gathered by token, B = W1 [E, 2 n_out, k] (gate rows then up rows, aiter shuffle_weight(16, 16)); the CTA's
-    /// 256 B rows interleave 16-row blocks of gate and up (block 2 p gate, 2 p + 1 up) so a lane holds both for the same output columns;
+    /// gate / up: A = X [M, k] gathered by token, B = W1 [E, 2 n_out, k] with the gate and up rows INTERLEAVED in 16-row blocks (block 2 p =
+    /// gate rows 16 p.., block 2 p + 1 = up rows 16 p..; then aiter shuffle_weight(16, 16)) so a lane holds both for the same output columns;
     /// C = act(gate) up (x the routing weight with `doweight`) bf16 [M, topk, n_out] at row token topk + slot
     Up { gelu: bool, doweight: bool },
     /// down: A = the stage-1 output [M topk, k] gathered by (token, slot), B = W2 [E, n_out, k]; C = fp32 [M, topk, n_out] x the routing
@@ -1168,13 +1168,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let b_place: Vec<i64> = (0..wave_n / 16).map(|j| 2048 * j).collect();
     // ---- DMA (A row-major into the padded image, B preshuffled), wave parts of M0, CTA origins ----
     let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
-    // MoE stage 1: the 16-row blocks alternate gate (rows n0 + 16 p) and up (rows n_out + n0 + 16 p): (16, 2, cta_n / 32) blocks
-    let s_up = ctx.sym("UPOFF", 0, 1 << 30, ev(b.let_(Op::KernargI32 { offset: 136 })) * ev(k_v));
-    let b_glob = if matches!(cfg.moe, Some(MoeStage::Up { .. })) {
-        make_layout(tup![tup![16, 2, cta_n / 32], tup![16, 8]], tup![tup![16, s_up.clone(), s_k.mul_c(16)], tup![1, 256]])
-    } else {
-        make_layout(tup![tup![16, cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]])
-    };
+    let b_glob = make_layout(tup![tup![16, cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]);
     // MoE: the tile's rows, its expert, the live test (tiles past num_valid_ids[0] do nothing)
     let moe_cx = cfg.moe.map(|st| {
         let kp = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargPtr { offset: o });
@@ -1257,8 +1251,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         // MoE: rows are gathered (A origin 0); B = the tile's expert (stage 1: the CTA's gate rows bx 128, up rows + n_out)
         None if moe_cx.is_some() => {
             let mc = moe_cx.as_ref().unwrap();
-            let nb = if matches!(mc.st, MoeStage::Up { .. }) { lg_n - 1 } else { lg_n };
-            (b.c_i32(0), b.bind_i32((ev(mc.e) * ev(n_v) + (ev(bx) << nb)) * ev(k_v)))
+            (b.c_i32(0), b.bind_i32((ev(mc.e) * ev(n_v) + (ev(bx) << lg_n)) * ev(k_v)))
         }
         None => (b.bind_i32((ev(by) << lg_m) * ev(k_v)), b.bind_i32((ev(bx) << lg_n) * ev(k_v))),
         Some(zb) => (b.bind_i32((ev(by) << lg_m) * ev(k_v) + (ev(zb) << 7)), b.bind_i32((ev(bx) << lg_n) * ev(k_v) + (ev(zb) << 11))),
@@ -1526,8 +1519,10 @@ fn moe_epilogue(
                 let mut g = vals(b, nn * i + 2 * p);
                 let mut u = vals(b, nn * i + 2 * p + 1);
                 if let Some(xs) = xs {
-                    let ug = b.bind_i32(ev(col) + ev(mc.nout));
-                    let (wg, wu) = (wsc(b, col), wsc(b, ug));
+                    // the weight scales follow the interleaved row order: output column c = 16 q + r -> gate row 32 q + r, up row 32 q + 16 + r
+                    let grow = b.bind_i32(((ev(col).lshr(4)) << 5) + (ev(col) & 15));
+                    let urow = b.bind_i32(ev(grow) + 16);
+                    let (wg, wu) = (wsc(b, grow), wsc(b, urow));
                     for k in 0..4 {
                         let sg = b.mul_f32(xs, wg[k]);
                         g[k] = b.mul_f32(g[k], sg);
