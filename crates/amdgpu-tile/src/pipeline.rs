@@ -17,6 +17,17 @@
 
 use crate::lane::Role;
 use crate::shared::SlotIdx;
+use crate::weave::{rotate, Part, RotStage};
+
+/// The `TwoPhaseOffset` iteration as rotated parts: stage(t+1) | V phase(t) | complete(t+1) | wait + barrier | M phase(t) | wait (+ barrier).
+const TWO_PHASE_PARTS: [Part; 6] = [
+    Part { name: "stage", iter: 1, anchor: false },
+    Part { name: "v_phase", iter: 0, anchor: false },
+    Part { name: "complete", iter: 1, anchor: true },
+    Part { name: "mid_sync", iter: 0, anchor: true },
+    Part { name: "m_phase", iter: 0, anchor: false },
+    Part { name: "end_sync", iter: 0, anchor: true },
+];
 use amdgpu_dsl::{ev, varx};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Opnd, ValueId, VarId, I32};
 
@@ -312,22 +323,33 @@ impl Pipeline {
                     tile_rows: self.tile_rows,
                 };
                 self.prebind(b, &t);
-                let key_n = staged.then(|| if self.key_unclamped { b.let_i32((varx(it) + 1) << self.lg()) } else { b.let_i32(nn << self.lg()) });
-                if let Some(k) = &key_n {
-                    body.stage(b, role, k, &t.next);
-                }
-                body.v_phase(b, role, &t);
-                if staged {
-                    b.wait_vm(0);
-                    body.stage_complete(b, role, &t.next);
-                }
-                b.wait_lds(0);
-                b.barrier();
-                body.m_phase(b, role, &t);
-                b.wait_lds(0);
-                if last_barrier {
-                    b.barrier();
-                }
+                // the iteration as a rotated weave: the staging of tile t+1 (and its completion) runs one iteration ahead (`iter` +1), so the
+                // peeled last iteration (`staged` = false) is the epilogue of the rotation; waits and barriers are anchors
+                let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };
+                let (lg, unclamped) = (self.lg(), self.key_unclamped);
+                rotate(b, &TWO_PHASE_PARTS, stage_sel, None, &mut |b, i| match i {
+                    0 => {
+                        let k = if unclamped { b.let_i32((varx(it) + 1) << lg) } else { b.let_i32(nn.clone() << lg) };
+                        body.stage(b, role, &k, &t.next);
+                    }
+                    1 => body.v_phase(b, role, &t),
+                    2 => {
+                        b.wait_vm(0);
+                        body.stage_complete(b, role, &t.next);
+                    }
+                    3 => {
+                        b.wait_lds(0);
+                        b.barrier();
+                    }
+                    4 => body.m_phase(b, role, &t),
+                    5 => {
+                        b.wait_lds(0);
+                        if last_barrier {
+                            b.barrier();
+                        }
+                    }
+                    _ => unreachable!(),
+                });
                 i1
             }
             // RegStaged runs two tiles per pass with static slots (`iter_rs`)
