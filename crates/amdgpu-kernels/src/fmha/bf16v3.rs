@@ -318,8 +318,8 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     let (qt0, h0, bat0) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
     // XCD order: workgroups are dispatched round robin over the 8 XCDs (linear id % 8); give each XCD a contiguous range of the
     // (q tile, head, batch) space (q tile fastest) so the CTAs sharing a head's K / V sit behind one L2. Identity unless the count is a
-    // multiple of 8.
-    let (qt, h, bat) = if std::env::var("EXP_NOXCD").is_ok() { (qt0, h0, bat0) } else {
+    // multiple of 8. Measured no gain (same-run, 3 shapes): off by default.
+    let (qt, h, bat) = if std::env::var("EXP_XCD").is_err() { (qt0, h0, bat0) } else {
         let nx = { let v = b.bind_i32((ev(s_q) + (QR - 1)).lshr(8)); b.read_first_lane(v) };
         let hq = b.let_(Op::KernargI32 { offset: 320 });
         let nxh = b.bind_i32(ev(nx) * ev(hq));
