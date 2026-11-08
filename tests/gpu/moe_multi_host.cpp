@@ -52,6 +52,7 @@ int main(int argc, char** argv) {
     long guard = 0; for (long p = maxp; p < maxp + 16; ++p) if (sid[p] != 0x55555555u) ++guard; for (long j = ntile; j < ntile + 16; ++j) if (eid[j] != 0x55555555) ++guard; for (long e = E + 1; e < E + 17; ++e) if (ts[e] != 0x55555555) ++guard;
     std::printf("check: moe_multi G=%ld M=%ld E=%ld K=%ld BM=%ld%s bad=%ld past_end_bad=%ld %s\n", G, M, E, K, BM, skew ? " skew" : "", bad, guard, (bad == 0 && guard == 0) ? "MOE_OK" : "MOE_FAIL");
     for (int i = 0; i < 10; ++i) run();
+    hipEvent_t a, b; CK(hipEventCreate(&a)); CK(hipEventCreate(&b));
     CK(hipEventRecord(a)); for (int i = 0; i < iters; ++i) run();
     CK(hipEventRecord(b)); CK(hipEventSynchronize(b)); float ms; CK(hipEventElapsedTime(&ms, a, b)); ms /= iters;
     std::printf("timing: %.4f ms/iter (%.2f us) for %ld routed pairs\n", ms, ms * 1e3, N);
