@@ -29,6 +29,10 @@ int main(int argc, char** argv) {
     const int B = atoi(argv[a0]), H = atoi(argv[a0 + 1]), HK = atoi(argv[a0 + 2]), CTX = atoi(argv[a0 + 3]);
     const int P = ours ? atoi(argv[a0 + 4]) : 16, S = ours ? atoi(argv[a0 + 5]) : 1;
     const int D = 128, iters = envi("ITERS", 50), warm = envi("WARMUP", 10);
+    // QLEN=q (ours, pa_decode16_bf16_hd128_p<P>_mtp): q new query tokens per sequence (Q / out [B][q][H][D], causal among them);
+    // SINK=1: attention sinks (attn_combine_bf16_sink_hd128, per-head logit sink[h])
+    const int QL = envi("QLEN", 1);
+    const bool sinks = envi("SINK", 0) != 0;
     std::mt19937 rng(envi("SEED", 1));
     std::normal_distribution<float> N(0.0f, 1.0f);
     std::vector<int> cl(B);
@@ -46,7 +50,7 @@ int main(int argc, char** argv) {
     for (int b = 0; b < B; b++)
         for (int p = 0; p < (cl[b] + P - 1) / P; p++) bt[(size_t)b * maxp + p] = perm[nxt++];
     // NHD pages
-    std::vector<uint16_t> kc((size_t)npages * P * HK * D), vc(kc.size()), q((size_t)B * H * D);
+    std::vector<uint16_t> kc((size_t)npages * P * HK * D), vc(kc.size()), q((size_t)B * QL * H * D);
     for (auto& x : kc) x = tobf(N(rng));
     for (auto& x : vc) x = tobf(N(rng));
     for (auto& x : q) x = tobf(N(rng));
@@ -85,7 +89,9 @@ int main(int argc, char** argv) {
     }
     auto kidx = [&](int b, int key, int hk, int d) { return (((size_t)bt[(size_t)b * maxp + key / P] * P + key % P) * HK + hk) * D + d; };
     const float scale = 1.0f / std::sqrt((float)D);
-    std::vector<uint16_t> out((size_t)B * H * D);
+    std::vector<uint16_t> out((size_t)B * QL * H * D);
+    std::vector<float> sink(H);
+    for (auto& s : sink) s = N(rng) * 2.0f;
     uint16_t* dout;
     HC(hipMalloc(&dout, out.size() * 2));
     std::vector<uint8_t> a, ca;
@@ -103,16 +109,18 @@ int main(int argc, char** argv) {
     if (ours) {
         hipModule_t cm;
         HC(hipModuleLoad(&cm, argv[3]));
-        HC(hipModuleGetFunction(&cfn, cm, "attn_combine_bf16_hd128"));
+        HC(hipModuleGetFunction(&cfn, cm, sinks ? "attn_combine_bf16_sink_hd128" : "attn_combine_bf16_hd128"));
         void *dk = fp8kv ? (void*)dev(kq) : (void*)dev(kc), *dv = fp8kv ? (void*)dev(vq) : (void*)dev(vc), *dpo, *dpl;
-        HC(hipMalloc(&dpo, (size_t)B * H * NS * D * 4)); HC(hipMalloc(&dpl, (size_t)B * H * NS * 4));
-        a.assign(16 * (fp8kv ? 15 : 13), 0);
+        HC(hipMalloc(&dpo, (size_t)B * QL * H * NS * D * 4)); HC(hipMalloc(&dpl, (size_t)B * QL * H * NS * 4));
+        a.assign(16 * (QL > 1 ? 16 : fp8kv ? 15 : 13), 0);
+        if (QL > 1) memcpy(&a[240], &QL, 4);
         if (fp8mode == 2) { void *dks = dev(kss), *dvs = dev(vss); memcpy(&a[208], &dks, 8); memcpy(&a[224], &dvs, 8); }
         else if (fp8kv) { memcpy(&a[208], &ksc, 4); memcpy(&a[224], &vsc, 4); }
         auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
         auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
         P_(0, dpo); P_(1, dq); P_(2, dk); P_(3, dv); P_(4, dbt); P_(5, dcl); memcpy(&a[96], &scale, 4); U(7, H); U(8, HK); U(9, maxp); U(10, npages); U(11, S); P_(12, dpl);
-        ca.assign(16 * 5, 0);
+        ca.assign(16 * 6, 0);
+        if (sinks) { void* ds = dev(sink); memcpy(&ca[80], &ds, 8); }
         memcpy(&ca[0], &dout, 8); memcpy(&ca[16], &dpo, 8); memcpy(&ca[32], &dpl, 8); memcpy(&ca[48], &H, 4); memcpy(&ca[64], &NS, 4);
         gx = HK; gy = B; gz = S; blk = 256;
     } else {
@@ -141,7 +149,7 @@ int main(int argc, char** argv) {
     void* ccfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ca.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &csz, HIP_LAUNCH_PARAM_END};
     auto launch = [&]() {
         HC(hipModuleLaunchKernel(fn, gx, gy, gz, blk, 1, 1, 0, nullptr, nullptr, cfg));
-        if (cfn) HC(hipModuleLaunchKernel(cfn, H, B, 1, 128, 1, 1, 0, nullptr, nullptr, ccfg));
+        if (cfn) HC(hipModuleLaunchKernel(cfn, H, B * QL, 1, 128, 1, 1, 0, nullptr, nullptr, ccfg));
     };
     launch();
     HC(hipDeviceSynchronize());
@@ -149,25 +157,28 @@ int main(int argc, char** argv) {
     long bad = 0;
     double maxe = 0;
     for (int b = 0; b < B; b++)
+      for (int qp = 0; qp < QL; qp++)
         for (int h = 0; h < H; h++) {
             int hk = h / (H / HK);
-            std::vector<double> s(cl[b]);
-            double m = -1e300;
-            for (int k = 0; k < cl[b]; k++) {
+            const int kl = std::max(0, cl[b] - QL + 1 + qp);  // the keys query position qp sees
+            const size_t qr = (size_t)b * QL + qp;
+            std::vector<double> s(kl);
+            double m = sinks ? (double)sink[h] : -1e300;
+            for (int k = 0; k < kl; k++) {
                 double acc = 0;
-                for (int d = 0; d < D; d++) acc += (double)bf(q[((size_t)b * H + h) * D + d]) * bf(kc[kidx(b, k, hk, d)]);
+                for (int d = 0; d < D; d++) acc += (double)bf(q[(qr * H + h) * D + d]) * bf(kc[kidx(b, k, hk, d)]);
                 s[k] = acc * scale;
                 m = std::max(m, s[k]);
             }
-            double l = 0;
+            double l = sinks ? std::exp(sink[h] - m) : 0;
             std::vector<double> o(D, 0.0);
-            for (int k = 0; k < cl[b]; k++) {
+            for (int k = 0; k < kl; k++) {
                 double p = std::exp(s[k] - m);
                 l += p;
                 for (int d = 0; d < D; d++) o[d] += p * bf(vc[kidx(b, k, hk, d)]);
             }
             for (int d = 0; d < D; d++) {
-                double ref = cl[b] ? o[d] / l : 0, got = bf(out[((size_t)b * H + h) * D + d]);
+                double ref = kl ? o[d] / l : 0, got = bf(out[(qr * H + h) * D + d]);
                 double e = std::fabs(got - ref);
                 maxe = std::max(maxe, e);
                 if (e > 1e-2 * std::fabs(ref) + 2e-2) {
