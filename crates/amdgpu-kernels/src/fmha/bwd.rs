@@ -404,8 +404,7 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     } else {
         b.c_i32(0)
     };
-    let ntile = { let v = b.bind_i32((ev(a.sq) + (KT - 1)).lshr(6) - ev(qt0)); b.read_first_lane(v) };
-    let npair = { let v = b.bind_i32((ev(ntile).max(0) + 1).lshr(1)); b.read_first_lane(v) };
+    let npair = { let v = b.bind_i32((((ev(a.sq) + (KT - 1)).lshr(6) - ev(qt0)).max(0) + 1).lshr(1)); b.read_first_lane(v) };
     let qoff = b.bind_i32(ev(a.sk) - ev(a.sq));
     let kind = MmaKind::new(MmaShape::M32N32K16, MmaTy::Bf16);
     let zero16 = b.frag_zero(DType::Frag16);
