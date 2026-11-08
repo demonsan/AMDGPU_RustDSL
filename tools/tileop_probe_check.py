@@ -766,6 +766,37 @@ def check_tr_b16_mfma(planes, out):
     print("tr_b16 -> v_mfma_f32_16x16x32_bf16 A operand (T^T): " + ("exact" if not bad else f"{bad} wrong values"))
     return bad == 0
 
+# ---------------------------------------------------------------- probe_atomic_p1
+def gen_atomic_p1():
+    rnd = random.Random(31)
+    return [[rnd.getrandbits(32) for _ in range(LANES)], [u32(float(rnd.randint(-20, 20))) for _ in range(LANES)]]
+
+def check_atomic_p1(planes, out):
+    x, y = planes
+    P = lambda k: out[k * LANES:(k + 1) * LANES]
+    ctr = [0] * 64
+    for l in range(LANES):
+        ctr[l % 4] += 1
+        ctr[4 + l % 4] += l
+    ctr[8] = max(x[l] for l in range(0, 64, 2)); ctr[9] = max(x[l] for l in range(1, 64, 2))
+    ctr[10] = min(s32(x[l]) for l in range(0, 64, 2)) & 0xFFFFFFFF; ctr[11] = min(s32(x[l]) for l in range(1, 64, 2)) & 0xFFFFFFFF
+    ctr[12] = 64 % 16
+    ctr[13] = u32(float(sum(f32(v) for v in y)))
+    ok = True
+    def report(name, cond):
+        nonlocal ok
+        ok &= cond
+        print(("ok   " if cond else "FAIL ") + name)
+    for space, ret_add, ret_inc, fin in (("lds", P(0), P(2), P(3)), ("global", P(4), P(5), out[6 * LANES:7 * LANES])):
+        report(f"{space} final counters (add, add no-ret, max_u32, min_i32, inc, add_f32)", list(fin) == ctr)
+        if list(fin) != ctr:
+            print("   got ", [hex(v) for v in fin[:14]]); print("   want", [hex(v) for v in ctr[:14]])
+        report(f"{space} add returns: each counter returns 0..15 once", all(sorted(ret_add[l] for l in range(64) if l % 4 == c) == list(range(16)) for c in range(4)))
+        report(f"{space} inc returns (limit 15): every 0..15 four times", sorted(ret_inc) == sorted(list(range(16)) * 4))
+    mins = P(1)
+    report("lds min_i32 returns: old values (<= 0x7fffffff, final the min)", all(s32(v) >= s32(ctr[10 + l % 2]) for l, v in enumerate(mins)))
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -774,6 +805,7 @@ PROBES = {
     "probe_dpp_p1": (gen_dpp_p1, check_dpp_p1, (len(DPP_CASES) + 2) * LANES * 4),
     "probe_tr_b16_p1": (gen_tr_b16_p1, check_tr_b16_p1, 1024),
     "probe_tr_b16_mfma": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
+    "probe_atomic_p1": (gen_atomic_p1, check_atomic_p1, 7 * LANES * 4),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
