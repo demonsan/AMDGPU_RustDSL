@@ -193,7 +193,7 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
         b.wait_vm(if blk == 0 { 18 } else { 0 });
         let kb = b.bind_i32(mbases[blk].clone());
         mes[blk].read_back(&mut b, Opnd::Var(it), |b| {
-            for c in 0..QC {
+            for c in 0..if std::env::var("EXP_NOQK").is_ok() { 1 } else { QC } {
                 let a = b.bind_i32(ev(kr[c]) + ev(kb));
                 let kf = b.load_lds_b128(a);
                 b.var_mfma(sv_[blk], kind, kf, qf[c], c == 0);
@@ -260,7 +260,7 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     let vb0: Vec<ValueId> = vr.iter().map(|v| b.bind_i32(mbases[0].clone() + ev(*v))).collect();
     let vb1: Vec<ValueId> = vr.iter().map(|v| b.bind_i32(mbases[1].clone() + ev(*v))).collect();
     // the two halves are read inside one region each: the 32 MFMAs need both, so the reads are split per half (A halves cat'ed)
-    for db in 0..DB as i32 {
+    for db in 0..if std::env::var("EXP_NOPV").is_ok() { 1 } else { DB as i32 } {
         let q = (db % 4) as usize;
         let hi = ((2 * db) & !7) << 4;
         let x0 = mes[0].read_back(&mut b, Opnd::Var(it), |b| { let a = b.bind_i32(ev(vb0[q]) + hi); b.load_lds_tr_b16(a) });
