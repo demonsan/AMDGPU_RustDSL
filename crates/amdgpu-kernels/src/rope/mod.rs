@@ -62,7 +62,7 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Func
     // waves per block: only as many as the heads need (a block of idle waves would waste occupancy), at most 4
     // a token with few lanes (H * L < 64, a power of two) leaves most of a wave idle: pack `tpw` tokens into every wave (H = 1, D = 64: 16 tokens per wave)
     let hl = h * l;
-    let packed = hl <= 32 && hl.is_power_of_two();
+    let packed = hl <= 32 && (hl & (hl - 1)) == 0;
     let tpw = if packed { 64 / hl } else { 1 };
     let nwaves = if packed { 4 } else { ((h + rows_per_wave - 1) / rows_per_wave).min(4) };
     let heads_per_pass = if packed { h } else { nwaves * rows_per_wave };
