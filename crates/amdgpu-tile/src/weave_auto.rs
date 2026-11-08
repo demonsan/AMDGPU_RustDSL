@@ -518,7 +518,14 @@ pub fn items_from_nodes(f: &Function, cap: &Captured) -> (Vec<Item>, Vec<std::op
 /// The cost-based order of the top-level nodes of a capture (a permutation of `0..cap.nodes.len()`; every legal reorder by `facts::must_order`, mark-pair groups kept contiguous).
 pub fn auto_order_nodes(f: &Function, cap: &Captured, m: &Model) -> Vec<usize> {
     let (items, groups) = items_from_nodes(f, cap);
-    let order = plan_items(&items, m);
+    let mut order = plan_items(&items, m);
+    // bisect aids: `AMDC_WEAVE_AUTO_PREFIX=N` keeps the first N planned items, the rest in declaration order (`0` = the identity)
+    if let Some(n) = std::env::var("AMDC_WEAVE_AUTO_PREFIX").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let head: Vec<usize> = order.iter().copied().take(n).collect();
+        let mut rest: Vec<usize> = (0..items.len()).filter(|i| !head.contains(i)).collect();
+        rest.sort_unstable();
+        order = head.into_iter().chain(rest).collect();
+    }
     if std::env::var("AMDC_WEAVE_AUTO_VERBOSE").map_or(false, |v| !v.is_empty()) {
         let fs = cap.facts(f);
         let (c0, p0) = simulate_items(&items, &(0..items.len()).collect::<Vec<_>>(), m);
