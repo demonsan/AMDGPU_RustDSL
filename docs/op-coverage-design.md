@@ -564,6 +564,18 @@
 - `gemm_a16w16_bf16` 的 md5 因此变为 8ab7cd9e。
 - 调整 pre/mid sync 的 MMA 数量：差别在噪声内，未改。
 
+**attention sinks 与 MTP decode**：
+- **sinks**：`attn_combine_bf16_sink_hd{128,64}`，ptr_sink 在 @80，为每个 head 一个 f32。
+  - sink logit 只进入 softmax 的分母：M = max(maxₛ lseₛ, sink)，den += e^(sink−M)。
+  - 因此任何 split-K decode（decode16 / fp8 / MTP）都能直接带上 sinks。
+- **MTP**：`pa_decode16_bf16_hd128_p<P>_mtp`，qlen 在 @240，范围 1..16，要求 G·qlen ≤ 16。
+  - 16 个 MFMA 列是（查询位置，head）对；查询位置 qpos 只看到 key < ctx − qlen + 1 + qpos，即新 token 之间是因果的。
+  - partial 和输出按行 b·qlen + qpos 组织；combine 的网格为 (H, B·qlen)。
+  - 非 MTP 的代码保持不变（md5 d032e715）。
+- 测试用 `pa_host` 的 `QLEN=q` / `SINK=1`：qlen 为 1、2、3、4，以及 qlen 3 加 sinks，全部 bad=0。
+- 性能：B64 ctx2048 HK16 时，qlen 1 / 2 / 4 分别为 179 / 190 / 207 µs，KV 只读一次。
+- 与 aiter `pa_bf16_noquant_gqa8_*_mtp_msk*` 的对照尚待完成。
+
 **fp8 KV 的 paged decode（per-tensor）**：`pa_decode16_fp8_hd128_p<P>`，即 `pa_decode16_x(.., fp8 = true)`。
 - cache 为 fp8 e4m3 [pages, P, HK, 128]，即 `reshape_cache_flash_fp8` 的布局；k_scale 在 @208，v_scale 在 @224。
 - K tile 为 fp8 行（chunk 按 key % 8 做 XOR）。QK 的每个操作数读 8 字节，用 `ScalePkBf16Fp8` 转成 8 个 bf16（精确）。
