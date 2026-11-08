@@ -512,6 +512,47 @@ pub fn items_from_nodes(f: &Function, cap: &Captured) -> (Vec<Item>, Vec<std::op
         let uses: Vec<u32> = fa.uses.iter().map(|&v| v as u32).collect();
         items.push(Item { name: format!("n{}", r.start), cost, deps, tdeps, fixed: fa.eff.anchor() || fa.eff.branch, drain, defs, uses, delta: 0, temps: 0 });
     }
+    // A lane / sub-fragment extracted from a loop variable (`Frag16Lane { frag: Var(v), .. }`) is a register VIEW of the variable, not a copy: every transitive user of the extracted value must stay
+    // before the next write of the variable (the statement facts record the read of `v` at the extraction only).
+    let n = items.len();
+    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (j, it) in items.iter().enumerate() {
+        for &d in &it.tdeps {
+            consumers[d].push(j);
+        }
+    }
+    for a in 0..n {
+        let fa = &gf[a];
+        if fa.defs.is_empty() || fa.var_reads.is_empty() {
+            continue;
+        }
+        let views: Vec<_> = fa.var_reads.iter().filter(|v| !fa.var_writes.contains(v)).collect();
+        if views.is_empty() {
+            continue;
+        }
+        // transitive data users of `a`
+        let mut seen = vec![false; n];
+        let mut stack = vec![a];
+        seen[a] = true;
+        while let Some(x) = stack.pop() {
+            for &c in &consumers[x] {
+                if !seen[c] {
+                    seen[c] = true;
+                    stack.push(c);
+                }
+            }
+        }
+        for w in a + 1..n {
+            if seen[w] || !gf[w].var_writes.iter().any(|v| views.contains(&v)) {
+                continue;
+            }
+            for u in a + 1..w {
+                if seen[u] && !items[w].deps.contains(&u) {
+                    items[w].deps.push(u);
+                }
+            }
+        }
+    }
     (items, groups)
 }
 
