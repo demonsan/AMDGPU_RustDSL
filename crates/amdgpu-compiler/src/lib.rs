@@ -13,6 +13,7 @@ pub use gpu_protocol as gpu_tiles;
 pub mod gpu_verify;
 pub mod functional_proofs;
 pub mod ir_print;
+pub mod diag;
 pub mod hazards;
 pub mod hzfill;
 pub mod lower;
