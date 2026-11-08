@@ -906,7 +906,8 @@ impl Body {
             let so = { let v = b.bind_i32(ev(kb) << 3); b.read_first_lane(v) };
             let sa = (0..mx.voff_a.len()).map(|_| b.c_i32(0)).collect();
             // the lane's word: groups 4 (g / 2) .. 4 (g / 2) + 3 = dword g / 2 of the 8 bytes (two entries per block, the second unused)
-            let hi_half = b.bind_cond(lane_g2(b).gt(0));
+            let gg = lane_g2(b);
+            let hi_half = b.bind_cond(ev(gg).gt(0));
             let mut sb = Vec::new();
             for v in &mx.voff_b {
                 let f = b.buffer_load_b64(self.rsrc_sfb, *v, so, 0);
