@@ -101,3 +101,18 @@ D ∈ {64, 128, 256}（全旋转维），H ∈ 1…256；正确性：T ∈ {9 �
 - **落后 4–6 %**：大 N 的 fp8 输出族（quant_token / group128 / static / silu_mul_quant / 已有 rmsnorm_quant）和 D = 1024 的 silu_mul。共同点：fp8 输出我们每 lane 每 chunk 只写 8 B（b64），aiter 一次写更宽（每 lane 16 B）；D = 1024 的 silu_mul 我们每块只有 128 线程。待做：fp8 族每 lane 处理两个 chunk 后合并成 b128 存、D ≤ 2048 的 silu_mul 每块多行。
 - **add_rmsnorm（aiter 6.86 TB/s）高于测得的流式上限（≈ 6.0–6.4 TB/s）**：不能当作有效对比，可能是 aiter 的 `add_rmsnorm` 对 `residual_out` / 输出的语义与我们的不同导致实际流量更小（没有逐元素对拍），待查；在查清之前，这一行只保留数据，不用于结论。
 - 没有 aiter 对应的内核：layernorm（aiter 的 layernorm 是 torch 扩展）、row softmax、RoPE / KV cache（`pos_encoding_kernels.cu` 与 `cache_kernels.cu` 的入口依赖 torch 的 int64 positions 等约定，`cache_kernels.cu` 在 gfx950 上不能独立编译：`dtype_float16.cuh` 里的旧 asm 约束），这些仍只和 roofline 比。
+
+## 专家路由：`topk_softmax`（模板 T6，wave 级）
+
+`topk/mod.rs`：对一行的专家 logits 做 softmax 再取 top-k（概率 + 专家 id；并列时取最小 id；`renorm` 版把选中的 K 个概率重新归一）。输入 bf16 `[T][E]`，输出 f32 `[T][K]` 和 i32 `[T][K]`。E 为 8 的倍数、32 … 512，K = 1 … 16。主机测试 `tests/gpu/topk_host.cpp`（CPU 双精度参考：id 逐位对拍，概率相对误差 ≤ 2e-5，输出末尾之外不能被写；bf16 输入里有大量并列值，所以并列规则被覆盖）。
+
+设计：每个 wave 同时处理 `64 / L` 行（`L` = E / 8 向上取 2 的幂：E = 128 → 4 行，E = 256 → 2 行），一个 lane 持有 8 个相邻专家（一个 b128）；**每一轮选择只做一次分组归约**——把每个元素变成保序 key（高 16 位 = bf16 值，低 16 位 = 专家 id，负值与正值的 id 编码方向相反，使得"更大的 float = 更大的值，值相同时 id 更小"），组内最大 key 即赢家，把赢家屏蔽后进入下一轮；softmax 分母再一次归约，K 个概率 = `exp(v_r − v_0) / sum`。分组归约 = 2 步 DPP quad + 每个 quad 值经 wave 私有 LDS 交换（同一次写 / 读服务所有 `64 / L` 行，延迟被摊薄）。第一版（每轮两次整 wave 归约、一行一 wave）每行要 18 次 LDS 往返，比 aiter 慢 6–8 倍；packed key + 多行 / wave 后与 aiter 持平。
+
+| kernel | VGPR | T = 4096 | T = 65536 | T = 524288 | aiter（同轮，`aiter::topk_softmax`，K = 8） |
+|---|--:|--:|--:|--:|--:|
+| `topk_softmax_bf16_e128_k8` | 44 | 4.1 µs | 21.2 µs | 141 µs | 7.3 / 20.9 / 127.5 µs |
+| `topk_softmax_renorm_bf16_e256_k8` | 44 | 4.9 µs | 41.0 µs | 288.7 µs | 7.7 / 37.8 / 252.5 µs |
+
+即：小 T（延迟主导）我们快 1.6–1.8 倍，大 T（吞吐主导）为 aiter 的 0.87–0.92 倍。这个内核不是带宽受限（524288 token × E = 128 只有 168 MB 流量，~1.2 TB/s）：瓶颈是每轮的 LDS 往返和 VALU，下一步是 DPP 行操作（`row_shr` / `row_bcast`，backend 的 A4）把 LDS 往返换掉。
+
+注意（踩过的坑）：越界 store 用的"超出所有描述符的偏移"不能是 `-16`——buffer store 的 `imm` 是加在 voffset 上的，`-16 + 4 r` 在 r = 4 时落回 0，覆盖了第 0 行的结果；现在用 `0x7fffff00`（imm 之后依然越界）。其他内核的越界 store 都用 imm = 0，不受影响。
