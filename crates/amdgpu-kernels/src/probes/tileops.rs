@@ -1249,3 +1249,42 @@ pub fn probe_fp4_chain() -> Function {
     b.store_global(pout, 0, w, MemTy::B32, false);
     b.finish()
 }
+
+/// `probe_pkfma(in, out)`: `pk_fma_f32` and the in-place `var_pk_fma`. in planes 0..4: f32 a, b, c, d, s (small integers). out planes:
+/// 0 / 1 = pk_fma((a, b), (s, s), (c, d)); 2..5 = a Frag4 loop variable (c, d, a, b) after two iterations of `var_pk_fma(acc, 0, (a, b, c, d), (s, s))`.
+pub fn probe_pkfma() -> Function {
+    use amdgpu_dsl::MemTy;
+    let mut b = FnBuilder::new("probe_pkfma", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(5 * 256));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(6 * 256));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    let v: Vec<ValueId> = (0..5u32).map(|k| b.load_global(pin, 256 * k, MemTy::B32)).collect();
+    let ab = b.frag2(v[0], v[1]);
+    let cd = b.frag2(v[2], v[3]);
+    let ss = b.frag2_dup(v[4]);
+    let r = b.pk_fma_f32(ab, ss, cd);
+    let t = b.frag4(v[0], v[1], v[2], v[3]);
+    let init = b.frag4(v[2], v[3], v[0], v[1]);
+    let vars = b.begin_loop(&[(DType::Frag4, Opnd::Val(init)), (DType::I32, Opnd::I32(0))]);
+    b.var_pk_fma(vars[0], 0, t, ss);
+    let i2 = b.add_i32(Opnd::Var(vars[1]), 1);
+    b.set_var(vars[1], i2);
+    let done = b.cmp(CmpPred::Ge, CmpTy::I32, i2, 2);
+    b.break_if(done);
+    b.end_loop();
+    let mut outs = vec![b.frag2_lane(r, 0), b.frag2_lane(r, 1)];
+    for i in 0..4u8 {
+        outs.push(b.frag4_lane(Opnd::Var(vars[0]), i));
+    }
+    for (k, o) in outs.into_iter().enumerate() {
+        b.store_global(pout, 256 * k as u32, o, MemTy::B32, false);
+    }
+    b.finish()
+}

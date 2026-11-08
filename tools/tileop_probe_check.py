@@ -983,6 +983,21 @@ def check_fp4_chain(planes, out):
     print(("ok   " if bad == 0 else "FAIL ") + f"four chained fp4 packs (sel 0..3) into one word: {64 - bad}/64 lanes")
     return bad == 0
 
+# ---------------------------------------------------------------- probe_pkfma
+def gen_pkfma():
+    rnd = random.Random(111)
+    return [[u32(float(rnd.randint(-8, 8))) for _ in range(LANES)] for _ in range(5)]
+
+def check_pkfma(planes, out):
+    a, b, c, d, s = [[f32(x) for x in p] for p in planes]
+    P = lambda k: [f32(x) for x in out[k * LANES:(k + 1) * LANES]]
+    ok1 = P(0) == [a[l] * s[l] + c[l] for l in range(64)] and P(1) == [b[l] * s[l] + d[l] for l in range(64)]
+    t = [a, b, c, d]; init = [c, d, a, b]
+    ok2 = all(P(2 + i) == [init[i][l] + 2 * t[i][l] * s[l] for l in range(64)] for i in range(4))
+    print(("ok   " if ok1 else "FAIL ") + "pk_fma_f32 (value)")
+    print(("ok   " if ok2 else "FAIL ") + "var_pk_fma in place over 2 loop iterations")
+    return ok1 and ok2
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -1003,6 +1018,7 @@ PROBES = {
     "probe_lds_high": (gen_lds_high, check_lds_high, 5 * 64 * 20),
     "probe_ifelse": (lambda: [[0] * 256], check_ifelse, 128 * 4),
     "probe_fp4_chain": (gen_fp4_chain, check_fp4_chain, 256),
+    "probe_pkfma": (gen_pkfma, check_pkfma, 6 * LANES * 4),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
