@@ -815,6 +815,48 @@ impl<'a> An<'a> {
                 }
             }
             Op::MinI32(a, b) => AV::Int(self.int_of(a).min(&self.int_of(b), cx)),
+            // P1 integer ops (docs/op-coverage-tileops.md): the address-relevant ones get interval rules (no wrap-around: assumption A3)
+            Op::Bin(o, a, b) => {
+                use amdgpu_dsl::BinOp as B;
+                let (x, y) = (self.int_of(a), self.int_of(b));
+                let hi_const = |i: &Itv| i.hi.iter().filter_map(|p| p.floor_const()).min();
+                match o {
+                    B::MinU32 if x.nonneg(cx) && y.nonneg(cx) => AV::Int(x.min(&y, cx)),
+                    B::MaxI32 | B::MaxU32 if !matches!(o, B::MaxU32) || (x.nonneg(cx) && y.nonneg(cx)) => {
+                        let mut lo = x.lo.clone();
+                        lo.extend(y.lo.iter().cloned());
+                        let hi = match (hi_const(&x), hi_const(&y)) {
+                            (Some(p), Some(q)) => vec![Poly::int(p.max(q))],
+                            _ => vec![],
+                        };
+                        AV::Int(Itv { lo: cap(lo), hi })
+                    }
+                    B::SubU32 => AV::Int(x.add(&y.scale(Q::int(-1)))),
+                    B::MulU32U24 if x.nonneg(cx) && y.nonneg(cx) && hi_const(&x).map_or(false, |h| h < 1 << 24) && hi_const(&y).map_or(false, |h| h < 1 << 24) => AV::Int(x.mul(&y, cx)),
+                    _ => AV::Int(Itv::top()),
+                }
+            }
+            Op::Tri(o, a, b, c) => {
+                use amdgpu_dsl::TriOp as T;
+                let (x, y, z) = (self.int_of(a), self.int_of(b), self.int_of(c));
+                let hi_const = |i: &Itv| i.hi.iter().filter_map(|p| p.floor_const()).min();
+                let small = |i: &Itv| i.nonneg(cx) && hi_const(i).map_or(false, |h| h < 1 << 24);
+                match o {
+                    T::Add3U32 => AV::Int(x.add(&y).add(&z)),
+                    T::LshlAddU32 => match y.point_const() {
+                        Some(k) if k.d == 1 && (0..31).contains(&k.n) => AV::Int(x.scale(Q::int(1i128 << k.n)).add(&z)),
+                        _ => AV::Int(Itv::top()),
+                    },
+                    T::MadU32U24 if small(&x) && small(&y) => AV::Int(x.mul(&y, cx).add(&z)),
+                    T::Min3I32 => AV::Int(x.min(&y, cx).min(&z, cx)),
+                    T::Min3U32 if x.nonneg(cx) && y.nonneg(cx) && z.nonneg(cx) => AV::Int(x.min(&y, cx).min(&z, cx)),
+                    T::BfeU32 => match z.point_const() {
+                        Some(w) if w.d == 1 && (1..32).contains(&w.n) => AV::Int(Itv::range(Poly::int(0), Poly::int((1i128 << w.n) - 1))),
+                        _ => AV::Int(Itv::top()),
+                    },
+                    _ => AV::Int(Itv::top()),
+                }
+            }
             Op::ReadFirstLane(a) => AV::Int(self.int_of(a)),
             // another lane's value of the same expression: the per-lane interval (lane-independent bounds) still holds
             Op::DppQuadPerm { x, .. } => AV::Int(self.int_of(x)),

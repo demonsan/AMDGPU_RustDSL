@@ -103,6 +103,7 @@ def un_ref(op, a, ia):
         return ("rel", 1 / math.sqrt(a), 2 ** -21)
     if op == "SqrtF32":
         if math.isnan(a) or a < 0: return ("f", math.nan)
+        if a == math.inf: return ("f", a)
         return ("rel", math.sqrt(a), 2 ** -21)
     if op in ("SinF32", "CosF32"):
         if not math.isfinite(a) or abs(a) > 256: return ("any",)
