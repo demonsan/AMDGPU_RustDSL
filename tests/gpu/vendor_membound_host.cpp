@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
     } else if (c == "topk_softmax") {   // M tokens, N experts, topk from env TOPK (default 8): gating bf16 [M][N]
         int K = std::getenv("TOPK") ? std::atoi(std::getenv("TOPK")) : 8;
         AiterTensor g = bf16_rand({M, N}, MN, 2.f, 1), w = AiterTensor::empty({M, (int64_t)K}, AITER_DTYPE_fp32, 0), id = AiterTensor::empty({M, (int64_t)K}, AITER_DTYPE_i32, 0), tid = AiterTensor::empty({M, (int64_t)K}, AITER_DTYPE_i32, 0), ws = AiterTensor::empty({M * N}, AITER_DTYPE_fp32, 0);
-        ms = bench([&] { ::topk_softmax(w, id, tid, g, ws, false, 0, "", std::nullopt); }, iters); bytes = (double)MN * 2 + (double)M * K * 8;
+        ms = bench([&] { aiter::topk_softmax(w, id, tid, g, ws, false, 0, "", std::nullopt); }, iters); bytes = (double)MN * 2 + (double)M * K * 8;
     } else { std::fprintf(stderr, "unknown case %s\n", c.c_str()); return 2; }
     std::printf("vendor %-15s M=%ld N=%ld: %.4f ms/iter, %.1f GB/s\n", c.c_str(), (long)M, (long)N, ms, bytes / ms / 1e6);
     return 0;
