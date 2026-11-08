@@ -138,7 +138,9 @@ int main(int argc, char** argv) {
     // ---- kernels ----
     std::string dt = bs ? "fp8bs" : fp8 ? "fp8" : "bf16";
     auto load = [&](const std::string& name) { hipModule_t m; hipFunction_t f; HC(hipModuleLoad(&m, (dir + "/" + name + ".co").c_str())); HC(hipModuleGetFunction(&f, m, name.c_str())); return f; };
-    hipFunction_t f1 = load("gemm_moe1_" + dt + "_" + act), f2 = load("gemm_moe2_" + dt), fs = load("moe_sum_bf16_k" + std::to_string(TK));
+    // ADD=1: stage 2 accumulates into the zeroed bf16 output with pk_add_bf16 atomics (no fp32 intermediate, no sum kernel)
+    const bool addm = envi("ADD", 0) != 0;
+    hipFunction_t f1 = load("gemm_moe1_" + dt + "_" + act), f2 = load("gemm_moe2_" + dt + (addm ? "_add" : "")), fs = addm ? nullptr : load("moe_sum_bf16_k" + std::to_string(TK));
     // fp8: the stage-1 output re-quantized on the GPU between the stages (dynamic per token / per 128-group): rows::quant (co_dir)
     hipFunction_t fq = nullptr;
     if (fp8) fq = load((bs ? "quant_group128_bf16_fp8_n" : "quant_token_bf16_fp8_n") + std::to_string(I));
@@ -155,7 +157,7 @@ int main(int argc, char** argv) {
         return a;
     };
     auto a1 = gemm_args(dX, dW1, dY1, M, 2 * I, D, dxs, dw1s, I);
-    auto a2 = gemm_args(fp8 ? dY1q : dY1, dW2, dT, M * TK, D, I, dy1s, dw2s, D);
+    auto a2 = gemm_args(fp8 ? dY1q : dY1, dW2, addm ? dO : dT, M * TK, D, I, dy1s, dw2s, D);
     std::vector<uint8_t> as(24, 0);
     memcpy(&as[0], &dT, 8); memcpy(&as[8], &dO, 8); memcpy(&as[16], &M, 4); memcpy(&as[20], &D, 4);
     auto launch = [&](hipFunction_t f, std::vector<uint8_t>& a, int gx, int gy) {
@@ -185,8 +187,9 @@ int main(int argc, char** argv) {
         if (envi("S1ONLY", 0)) return;
         if (fp8 && host_q && envi("HOSTQ", 0)) { HC(hipDeviceSynchronize()); requant(); }
         else if (fp8) launch(fq, aq, (M * TK + 3) / 4, 1);
+        if (addm) HC(hipMemsetAsync(dO, 0, (size_t)M * D * 2));
         launch(f2, a2, D / 128, nblk);
-        launch(fs, as, D / 1024, M);
+        if (!addm) launch(fs, as, D / 1024, M);
     };
     if (envi("DOWNFIRST", 0) && TK == 1) {
         // the Down kernel FIRST (cold) on the stage-1 operands, then again (warm): compare both with the reference
@@ -376,7 +379,7 @@ int main(int argc, char** argv) {
     HC(hipEventRecord(e0));
     for (int i = 0; i < iters; i++) launch(f1, a1, I / envi("UP_N", 128), nblk);
     HC(hipEventRecord(e1));
-    for (int i = 0; i < iters; i++) { if (fp8) launch(fq, aq, (M * TK + 3) / 4, 1); launch(f2, a2, D / 128, nblk); launch(fs, as, D / 1024, M); }
+    for (int i = 0; i < iters; i++) { if (fp8) launch(fq, aq, (M * TK + 3) / 4, 1); if (addm) HC(hipMemsetAsync(dO, 0, (size_t)M * D * 2)); launch(f2, a2, D / 128, nblk); if (!addm) launch(fs, as, D / 1024, M); }
     HC(hipEventRecord(e2));
     HC(hipEventSynchronize(e2));
     float t1, t2;
