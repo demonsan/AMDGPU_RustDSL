@@ -220,6 +220,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                 let a = regalloc::allocate(&m)?;
                 // over the workgroup's launch budget: like running out of VGPRs (try the next, tighter attempt)
                 regalloc::check_workgroup_budget(&m, &a).map_err(|e| format!("out of VGPRs for the launch: {e}"))?;
+                hazards::pad_inflight_waw(&mut m, &a);
                 hazards::pad_physical_war(&mut m, &a);
                 hz(&mut m, &a, true);
                 Ok(a)
@@ -249,6 +250,10 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     // the unscheduled path trusted its lowering-time waits; passes after lowering (LDS spill, ...) can invalidate them: re-check on every path
     sched::waits::verify_waits(&m).map_err(|e| format!("wait verification failed: {e}"))?;
     let alloc = regalloc::allocate(&m)?;
+    // a register handed to another value while a load into it is still in flight (a path where the load's result is not used)
+    if std::env::var("AMDC_NO_INFLIGHT_WAW").is_err() {
+        hazards::pad_inflight_waw(&mut m, &alloc);
+    }
     // Register reuse (especially the hole-filling packing) can place a new value in a register an in-flight MFMA still reads:
     // pad the physical write-after-read hazard on every path, not only for scheduled code.
     hazards::pad_physical_war(&mut m, &alloc);

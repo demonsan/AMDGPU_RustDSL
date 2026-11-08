@@ -715,3 +715,153 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
     }
     m.blocks = out_blocks;
 }
+
+/// One in-flight memory load at the PHYSICAL register level: its counter (vmcnt / lgkmcnt), how many same-counter operations were issued
+/// after it (min over paths), whether it is a scalar load (returns out of order), and its destination registers (file-tagged).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Flight {
+    vm: bool,
+    after: u32,
+    smem: bool,
+    regs: (u64, u64),
+}
+
+/// Post-RA guard: an instruction that WRITES a physical register still targeted by an in-flight load of a DIFFERENT instruction gets a
+/// wait first. The pre-RA wait accounting is per value, so it cannot see the allocator handing a load's registers to another value on a
+/// path where the load's result is not used (found in the MLA decode: Q-fragment loads issued before an if / else were in flight into the
+/// else arm, whose temporaries reused those registers; the late loads clobbered the else arm's store offsets). Same for loads whose result
+/// is never read. Returns the number of waits inserted.
+pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize {
+    let key = |m: &MFunction, r: VReg| -> (u64, u64) {
+        let b = a.phys[r as usize] as u64 + if a.scalar.get(r as usize).copied().unwrap_or(false) { 1 << 32 } else { 0 };
+        (b, b + m.vreg_class(r).dwords() as u64)
+    };
+    let overl = |x: (u64, u64), y: (u64, u64)| x.0 < y.1 && y.0 < x.1;
+    let succs = crate::sched::liveness::successors(m);
+    let n = m.blocks.len();
+    let merge = |into: &mut Vec<Flight>, from: &[Flight]| -> bool {
+        let mut ch = false;
+        for f in from {
+            match into.iter_mut().find(|g| g.vm == f.vm && g.regs == f.regs && g.smem == f.smem) {
+                Some(g) => {
+                    if f.after < g.after {
+                        g.after = f.after;
+                        ch = true;
+                    }
+                }
+                None => {
+                    into.push(f.clone());
+                    ch = true;
+                }
+            }
+        }
+        ch
+    };
+    // simulate one block from `st`; with `emit`, return the rewritten instruction list
+    let run = |m: &MFunction, bi: usize, mut st: Vec<Flight>, emit: bool| -> (Vec<Flight>, Vec<MInst>, usize) {
+        let mut out = Vec::new();
+        let mut added = 0usize;
+        for inst in &m.blocks[bi].insts {
+            let at = crate::op_attrs::attrs(inst.op);
+            match inst.op {
+                MOp::SWaitVm => st.retain(|f| !(f.vm && !f.smem && f.after >= inst.imm as u32)),
+                MOp::SWaitLgkm => {
+                    let k = inst.imm as u32;
+                    st.retain(|f| !(!f.vm && (if f.smem { k != 0 } else { f.after < k })));
+                }
+                _ => {}
+            }
+            // registers this instruction writes
+            let mut writes: Vec<(u64, u64)> = inst.dst.iter().map(|d| key(m, *d)).collect();
+            if matches!(inst.op, MOp::VPermlane32Swap | MOp::VPermlane16Swap) {
+                for s in inst.srcs.iter().take(2) {
+                    if let Src::Reg(r) = s {
+                        writes.push(key(m, *r));
+                    }
+                }
+            }
+            let is_mem = at.mem.is_some() || at.smem;
+            let my_vm = at.mem.map_or(false, |mm| matches!(mm.space, crate::sched::effects::Space::Global));
+            let mut need_vm: Option<u32> = None;
+            let mut need_lg: Option<u32> = None;
+            for w in &writes {
+                for f in &st {
+                    if !overl(*w, f.regs) {
+                        continue;
+                    }
+                    // a load overwriting the destination of an older load of the same in-order counter is ordered by the hardware
+                    if is_mem && at.mem.map_or(false, |mm| !mm.write) && f.vm == my_vm && !f.smem && !at.smem {
+                        continue;
+                    }
+                    if f.vm {
+                        need_vm = Some(need_vm.map_or(f.after, |x: u32| x.min(f.after)));
+                    } else {
+                        let k = if f.smem || st.iter().any(|g| !g.vm && g.smem) { 0 } else { f.after };
+                        need_lg = Some(need_lg.map_or(k, |x: u32| x.min(k)));
+                    }
+                }
+            }
+            if let Some(k) = need_vm {
+                if emit {
+                    out.push(MInst::new(MOp::SWaitVm).imm(k as i64));
+                }
+                added += 1;
+                st.retain(|f| !(f.vm && f.after >= k));
+            }
+            if let Some(k) = need_lg {
+                if emit {
+                    out.push(MInst::new(MOp::SWaitLgkm).imm(k as i64));
+                }
+                added += 1;
+                st.retain(|f| !(!f.vm && (if f.smem { k != 0 } else { f.after < k })));
+            }
+            if is_mem {
+                let vm = my_vm;
+                for f in st.iter_mut() {
+                    if f.vm == vm {
+                        f.after += 1;
+                    }
+                }
+                let lim = if vm { 63 } else { 15 };
+                st.retain(|f| f.smem || f.after < lim);
+                if at.mem.map_or(true, |mm| !mm.write) || at.smem {
+                    for w in &writes {
+                        st.push(Flight { vm, after: 0, smem: at.smem, regs: *w });
+                    }
+                }
+            }
+            if emit {
+                out.push(inst.clone());
+            }
+        }
+        (st, out, added)
+    };
+    let mut entry: Vec<Vec<Flight>> = vec![Vec::new(); n];
+    let mut changed = true;
+    let mut guard = 0;
+    while changed && guard < 64 {
+        changed = false;
+        guard += 1;
+        for bi in 0..n {
+            let (exit, _, _) = run(m, bi, entry[bi].clone(), false);
+            for &s in &succs[bi] {
+                if s < n {
+                    let mut e = entry[s].clone();
+                    if merge(&mut e, &exit) {
+                        entry[s] = e;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut total = 0;
+    for bi in 0..n {
+        let (_, out, added) = run(m, bi, entry[bi].clone(), true);
+        if added > 0 {
+            m.blocks[bi].insts = out;
+            total += added;
+        }
+    }
+    total
+}
