@@ -169,9 +169,10 @@ pub fn topk_per_row(name: &str, k: i64, prefill: bool) -> Function {
                 let vit = vv[0];
                 let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::Val(iters)));
                 b.break_if(done);
+                let vit_v = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
                 let mut loaded = Vec::new();
                 for u in 0..4i32 {
-                    let idx = b.bind_i32((ev(vit) << 12) + (u * 1024) as i32 + ev(tid));
+                    let idx = b.bind_i32((ev(vit_v) << 12) + (u * 1024) as i32 + ev(tid));
                     let off = b.bind_i32(ev(rowb) + (ev(idx) << 2));
                     let x = b.buffer_load_f32(r_l, off, 0i32, 0);
                     let ok = b.cmp(CmpPred::Lt, CmpTy::I32, idx, len);
@@ -287,9 +288,10 @@ pub fn topk_per_row(name: &str, k: i64, prefill: bool) -> Function {
             let vit = vv[0];
             let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::Val(iters)));
             b.break_if(done);
+            let vit_v = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
             let mut loaded = Vec::new();
             for u in 0..4i32 {
-                let idx = b.bind_i32((ev(vit) << 12) + (u * 1024) as i32 + ev(tid));
+                let idx = b.bind_i32((ev(vit_v) << 12) + (u * 1024) as i32 + ev(tid));
                 let off = b.bind_i32(ev(rowb) + (ev(idx) << 2));
                 let x = b.buffer_load_f32(r_l, off, 0i32, 0);
                 let ok = b.cmp(CmpPred::Lt, CmpTy::I32, idx, len);
