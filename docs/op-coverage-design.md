@@ -564,6 +564,18 @@
 - `gemm_a16w16_bf16` 的 md5 因此变为 8ab7cd9e。
 - 调整 pre/mid sync 的 MMA 数量：差别在噪声内，未改。
 
+**A16W4（覆盖补齐，忠实语义）**：`gemm_a16w4_mxfp4`，即 `Elem::Bf16W4`，64×128 CTA。
+- A 为 bf16，精确保留；B 为 MXFP4，在主循环中反量化为 bf16，再走 bf16 MFMA。
+- 一个 K tile = 256 元素：每个 slot 放 4 份 128 字节的 A 镜像（K 64）。
+- B 的 lane 片段第 d 个 dword 先移位，再用 `v_cvt_scalef32_pk_f32_fp4` 转 f32，乘组 scale 2^(e−127) 后打包成 bf16。
+- host 在每个 256-K tile 内对 B 做 K 置换：物理位置 p 对应逻辑 K`(p) = 128(p/128) + 16((p/64)%2) + 8((p/32)%2) + 32((p/8)%4) + p%8`，B scale 为不重排的 [N][K/32]。
+  - 片段第 d 个 dword 对应 tile 的第 d 个 K 组。
+  - 置换和分组都用 host 的 `W4DBG=3` / `W4DBG=6` 探针实测得到。
+- 结果 bad=0，max_rel 3.9e-3，等于 bf16 输出的舍入。
+- 性能：1024³ 192 TF/s，4096³ 495，8192³ 532（反量化的 VALU 是瓶颈；bf16 GEMM 为 1250）。256×7168×2048 为 362 TF/s，而同形状 bf16 GEMM 只有 197 TF/s。
+- aiter 中没有 a16w4 的 .co，无法做厂商对照。
+- 另一条较快的路线是 mxquant 量化 A 再走 a8w4。它的语义不同、精度更低，精度差尚未测量。
+
 **A8W4（覆盖补齐）**：`gemm_a8w4_mxfp_128`，即 `Elem::Fp8W4`，A 为 MXFP8，B 为 MXFP4，两者都用重排的 1×32 scale。
 - 一个 K tile = 256 元素：B tile 128 字节；A 分成 lo / hi 两半，作为同一 ring slot 中的两份 A 镜像（DMA 多一轮，A 前进 2·key0 字节）。
 - 每个 m 块有两个 A 寄存器片段；每个块做两次 fp8×fp4 的 scaled `16x16x128` MFMA，scale 字节取 h。
