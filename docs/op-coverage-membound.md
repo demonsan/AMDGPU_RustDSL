@@ -333,7 +333,8 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | fp8 cache 写 + per-token scale（`pertoken_quant`）、分块布局的 fp8 版本 | 缺 | per-token scale 需要先做一遍行 amax（复用 `quant_token`），分块布局的 fp8 版同理；待做 |
 | | MLA cache（`concat_and_cache_mla`） | 缺 | 两段拼接写（kv_c + k_pe）：和 flash 版同构，缺的只是名字 / 布局约定 |
 | 采样 / top-k | argmax、sample（温度）、top-k + top-p、topk_softmax | 有 | 见前文 |
-| | moe_fused_gate（DeepSeek 分组 topk，sigmoid + bias + 组选择）、topk_gating | 缺 | 比 `topk_softmax` 多一层组内 top-2 求和与组 top-k；待做 |
+| | **moe_fused_gate**（DeepSeek-V3 分组 topk：sigmoid + bias → 组内 top-2 之和 → 丢掉 G − TG 个最低的组 → 余下专家里取 top-K → 权重 = s / Σs） | 有（新） | `moe_fused_gate_bf16_e<E>_g<G>_tg<TG>_k<K>`（G ∈ {4, 8, 16, 32, 64}，E / G ∈ {8, 16, 24, 32}，K ≤ 32）：一个 lane 持有一个 (行, 组) 的 E / G 个专家，所有规约是 G 个 lane 上的 DPP 全规约；并列取低下标（组选择同样）；NaN → 0。E = 256, G = 8, TG = 4, K = 8：M ≤ 4096 约 10 µs，M = 131072 118 µs（VALU 受限，0.9 µs / 千行）。不含 shared-expert 融合与 pad 行 |
+| | topk_gating | 缺 | 与 `topk_softmax` 的 renorm 变体等价的一个子集，未单列 |
 | | topk_per_row（prefill / decode 的 indexer topk）、topk_plain | 缺 | 需要大 K 的行内 top-k（K ≤ 2048）：基数选择（见"采样"一节）可直接复用，是下一批 |
 | MoE 辅助 | moe_sorting（单 block / 多 block / 稳定序）、**moe_reduce / moe_combine** | 有 | `moe_sorting_*`、`moe_{count,scan,scatter,scatter_ord}_*`、`moe_reduce_bf16_k<K>_d<D>`、`moe_combine_bf16_k<K>_d<D>` |
 | 其他 | **causal_conv1d_update**（decode，W = 2 – 4，状态窗口移位，可选 silu 与连续批处理的 state_indices，pad = 负） | 有（新） | `causal_conv1d_update_bf16_w<W>_s<SL>[_idx][_silu]`：输出与新状态均与 CPU 参考逐位一致；B = 2048 dim = 8192 3.1 TB/s（2 字节访问，没有向量化） |
