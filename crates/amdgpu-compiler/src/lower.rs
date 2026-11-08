@@ -2299,6 +2299,8 @@ impl Lowerer {
                     // folding the negation into the branch polarity is only valid for a WAVE-UNIFORM condition: for a per-lane one (an `any_lane`
                     // branch) "some lane has !c" is not "no lane has c" - materialise !c and branch on it instead
                     Op::NotI1(inner) if self.opnd_uniform(inner) => return self.lower_condition(inner, !negate),
+                    // any_lane(c): the wave-level branch on c itself (negated: "no lane has c" = !any_lane(c), exact)
+                    Op::AnyLane(inner) => return self.lower_condition(inner, negate),
                     _ => {}
                 }
             }
@@ -4849,7 +4851,6 @@ fn subst_stmt(s: &Stmt, map: &HashMap<ValueId, Opnd>) -> Stmt {
         Stmt::BeginIf { cond } => Stmt::BeginIf { cond: sub(cond) },
         Stmt::BreakIf { cond } => Stmt::BreakIf { cond: sub(cond) },
         Stmt::Let { dst, op: Op::Select { ty, cond, a, b } } => Stmt::Let { dst: *dst, op: Op::Select { ty: *ty, cond: sub(cond), a: sub(a), b: sub(b) } },
-        Stmt::Let { dst, op: Op::NotI1(a) } => Stmt::Let { dst: *dst, op: Op::NotI1(sub(a)) },
         other => other.clone(),
     }
 }
