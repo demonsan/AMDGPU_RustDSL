@@ -434,10 +434,10 @@ def mf_encode(fmt, v):
             return code
     raise ValueError((fmt, v))
 
-def gen_f8f6f4_p1():
+def gen_f8f6f4_p1(kinds=None):
     rnd = random.Random(99)
     words = []
-    for M, fa, fb in F8F6F4_KINDS:
+    for M, fa, fb in (kinds or F8F6F4_KINDS):
         for fmt in (fa, fb):
             bits = FMT[fmt][0]
             for l in range(LANES):
@@ -451,11 +451,11 @@ def gen_f8f6f4_p1():
 def kmap(c, G, g, v):
     return c * g + (v % c) + (v // c) * c * G
 
-def check_f8f6f4_p1(planes, out):
+def check_f8f6f4_p1(planes, out, kinds=None):
     words = planes[0]
     pos = obase = 0
     ok = True
-    for M, fa, fb in F8F6F4_KINDS:
+    for M, fa, fb in (kinds or F8F6F4_KINDS):
         K = 128 if M == 16 else 64
         G = 64 // M
         elems = []
@@ -828,6 +828,30 @@ def check_lane_p1(planes, out):
         print(("ok   " if good else "FAIL ") + n + ("" if good else f": lanes 0..3 got {[hex(v) for v in got[:4]]} want {[hex(v & 0xFFFFFFFF) for v in w[:4]]}"))
     return ok
 
+# ---------------------------------------------------------------- probe_tileop_p1
+def gen_tileop_p1():
+    rnd = random.Random(51)
+    return [[u32(float(rnd.randint(-30, 30))) for _ in range(256)], [u32(float(rnd.randint(-30, 30))) for _ in range(256)]]
+
+def check_tileop_p1(planes, out):
+    x = [[f32(planes[0][4 * l + i]) for i in range(4)] for l in range(LANES)]
+    y = [[f32(planes[1][4 * l + i]) for i in range(4)] for l in range(LANES)]
+    ok = True
+    def rep(name, cond):
+        nonlocal ok
+        ok &= cond
+        print(("ok   " if cond else "FAIL ") + name)
+    O = lambda l, k: out[15 * l + k]
+    rep("ewise 2x + y", all(f32(O(l, i)) == 2 * x[l][i] + y[l][i] for l in range(64) for i in range(4)))
+    rep("apply2 AddF32 (v_pk_add_f32)", all(f32(O(l, 4 + i)) == x[l][i] + y[l][i] for l in range(64) for i in range(4)))
+    rep("apply2 MaxF32", all(f32(O(l, 8 + i)) == max(x[l][i], y[l][i]) for l in range(64) for i in range(4)))
+    rep("row_allreduce16 AddF32", all(f32(O(l, 12)) == sum(x[16 * (l // 16) + j][0] for j in range(16)) for l in range(64)))
+    rep("wave_allreduce MaxF32", all(f32(O(l, 13)) == max(x[j][1] for j in range(64)) for l in range(64)))
+    rep("wave_allreduce AddU32 (lane ids)", all(O(l, 14) == sum(range(64)) for l in range(64)))
+    return ok
+
+PLAIN_KINDS = [(16, "fp4", "fp4"), (16, "fp8", "fp4"), (16, "fp8", "fp8"), (16, "fp6", "bf8"), (32, "fp4", "fp4"), (32, "bf8", "fp8")]
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -838,6 +862,8 @@ PROBES = {
     "probe_tr_b16_mfma": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
     "probe_atomic_p1": (gen_atomic_p1, check_atomic_p1, 7 * LANES * 4),
     "probe_lane_p1": (gen_lane_p1, check_lane_p1, 14 * LANES * 4),
+    "probe_tileop_p1": (gen_tileop_p1, check_tileop_p1, 64 * 60),
+    "probe_f8f6f4_plain": (lambda: gen_f8f6f4_p1(PLAIN_KINDS), lambda p, o: check_f8f6f4_p1(p, o, PLAIN_KINDS), sum(2 * LANES * 4 * (4 if k[0] == 16 else 16) for k in PLAIN_KINDS)),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }

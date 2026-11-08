@@ -1712,6 +1712,9 @@ pub fn verify_mir(f: &Function, m: &MFunction, a: &Alloc) -> Report {
     if a.max_v > VGPR_LIMIT {
         rep.add("GV-REG-LIMIT", Severity::Error, format!("kernel uses {} VGPRs (limit {VGPR_LIMIT})", a.max_v));
     }
+    if let Err(e) = crate::regalloc::check_workgroup_budget(m, a) {
+        rep.add("GV-REG-OCCUPANCY", Severity::Error, e);
+    }
     if a.max_s > SGPR_LIMIT {
         rep.add("GV-REG-LIMIT", Severity::Error, format!("kernel uses {} SGPRs (limit {SGPR_LIMIT})", a.max_s));
     }
