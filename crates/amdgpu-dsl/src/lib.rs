@@ -2918,7 +2918,10 @@ fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
                 e.push(x);
             }
         }
-        Stmt::AtomicLdsNoRet { addr, value, .. } => {
+        Stmt::AtomicLdsNoRet { addr, value, op } => {
+            if matches!(op, AtomicOp::PkAddBf16 | AtomicOp::PkAddF16) {
+                e.push(format!("lds atomic {op:?}: packed 16-bit atomics are global / buffer only"));
+            }
             if let Err(x) = expect_int(f, *addr, "lds atomic address") {
                 e.push(x);
             }
@@ -2991,7 +2994,10 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
         }
         Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
         Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
-        Op::AtomicLds { addr, value, .. } => {
+        Op::AtomicLds { addr, value, op } => {
+            if matches!(op, AtomicOp::PkAddBf16 | AtomicOp::PkAddF16) {
+                e.push(format!("lds atomic {op:?}: packed 16-bit atomics are global / buffer only"));
+            }
             if let Err(x) = expect_int(f, *addr, "lds atomic address") {
                 e.push(x);
             }
