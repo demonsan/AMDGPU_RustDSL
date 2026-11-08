@@ -12,6 +12,7 @@ pub mod dequant;
 pub mod eltwise;
 pub mod norm;
 pub mod rope;
+pub mod sampling;
 pub mod topk;
 pub mod rows;
 pub mod ir_proof;

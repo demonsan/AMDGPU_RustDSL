@@ -49,7 +49,9 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("mlp_fp8_") => crate::mlp::by_name(n),
         // P2 (stage library): RMSNorm + per-token fp8 quantization from the generic E / R / Q stages; N in the name (multiple of 512)
         n if n.starts_with("rmsnorm_quant_fp8_n") => crate::norm::by_name(n),
-        // batch 2: MoE sorting, dequantization, expert routing, RoPE, KV-cache write
+        // batch 2: sampling,
+        n if n.starts_with("argmax_bf16_v") || n.starts_with("sample_bf16_v") => crate::sampling::by_name(n),
+        // (batch 2 cont.) MoE sorting, dequantization, expert routing, RoPE, KV-cache write
         n if n.starts_with("moe_sorting_e") => crate::moe::by_name(n),
         n if n.starts_with("dequant_fp8_bf16_") => crate::dequant::by_name(n),
         // (batch 2 cont.)
