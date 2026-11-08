@@ -77,7 +77,7 @@ impl Body<'_> {
         let kb = self.kbase(b, slot);
         let (kind, qf, kr) = (self.kind, self.qf, self.kr);
         let bases: Vec<ValueId> = kr.iter().map(|r| b.bind_i32(ev(*r) + kb.clone())).collect();
-        self.ring.ks.at(slot).read(b, |b| {
+        let acc = self.ring.ks.at(slot).read(b, |b| {
             let rd = |b: &mut FnBuilder, c: usize| -> Vec<ValueId> {
                 (0..4).map(|blk| { let a = b.bind_i32(ev(bases[c]) + blk * 32 * ROW); b.load_lds_b128(a) }).collect()
             };
