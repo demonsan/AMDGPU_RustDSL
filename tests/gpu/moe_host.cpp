@@ -45,7 +45,9 @@ static std::vector<uint8_t> shuffle_b(const std::vector<uint8_t>& src, long rows
 
 int main(int argc, char** argv) {
     if (argc < 9) { fprintf(stderr, "usage: %s bf16|fp8 co_dir M D I E TOPK [silu|gelu]\n", argv[0]); return 1; }
-    const bool fp8 = std::string(argv[1]) == "fp8";
+    // fp8: per-token / per-row scales; fp8bs: 128 x 128 block scales (X [M][D / 128], W [E][rows / 128][K / 128], stage-2 A [M topk][I / 128])
+    const bool bs = std::string(argv[1]) == "fp8bs";
+    const bool fp8 = std::string(argv[1]) == "fp8" || bs;
     const std::string dir = argv[2];
     const int M = atoi(argv[3]), D = atoi(argv[4]), I = atoi(argv[5]), E = atoi(argv[6]), TK = atoi(argv[7]);
     const std::string act = argc > 8 ? argv[8] : "silu";
@@ -85,14 +87,19 @@ int main(int argc, char** argv) {
     nv[0] = pos; nv[1] = M;
     // ---- data ----
     const int es = fp8 ? 1 : 2;
-    std::vector<float> xf((size_t)M * D), w1f((size_t)E * 2 * I * D), w2f((size_t)E * D * I), xs(M, 1.0f), w1s((size_t)E * 2 * I, 1.0f), w2s((size_t)E * D, 1.0f);
+    // per-row scales (fp8) or block scales (fp8bs): scale of element (row r, col c) = s[(r / gr) * (cols / gc) + c / gc]
+    const int gr = bs ? 128 : 1;
+    std::vector<float> xf((size_t)M * D), w1f((size_t)E * 2 * I * D), w2f((size_t)E * D * I);
+    std::vector<float> xs(bs ? (size_t)M * (D / 128) : M, 1.0f), w1s(bs ? (size_t)E * 2 * I / 128 * (D / 128) : (size_t)E * 2 * I, 1.0f),
+        w2s(bs ? (size_t)E * D / 128 * (I / 128) : (size_t)E * D, 1.0f);
     std::vector<uint8_t> xb((size_t)M * D * es), w1b(w1f.size() * es), w2b(w2f.size() * es);
-    auto fill = [&](std::vector<float>& f, std::vector<uint8_t>& raw, float sc, std::vector<float>* rs, int rowlen) {
+    auto fill = [&](std::vector<float>& f, std::vector<uint8_t>& raw, float sc, std::vector<float>* rs, int rowlen, int rgrp) {
         for (size_t i = 0; i < f.size(); i++) {
             float v = N(rng) * sc;
             if (fp8) {
-                // per-row scales: values quantized as code * rs[row]
-                float s = (*rs)[i / rowlen];
+                // values quantized as code * scale (per row, or per rgrp x 128 block)
+                size_t r = i / rowlen, c = i % rowlen;
+                float s = bs ? (*rs)[(r / rgrp) * (rowlen / 128) + c / 128] : (*rs)[r];
                 uint8_t c = f_to_e4m3(v / s);
                 raw[i] = c;
                 f[i] = e4m3_to_f(c) * s;
@@ -108,17 +115,17 @@ int main(int argc, char** argv) {
         for (auto& s : w1s) s = 0.005f + (rng() % 100) / 20000.0f;
         for (auto& s : w2s) s = 0.005f + (rng() % 100) / 20000.0f;
     }
-    fill(xf, xb, 1.0f, &xs, D);
-    fill(w1f, w1b, 0.05f, &w1s, D);
-    fill(w2f, w2b, 0.05f, &w2s, I);
+    fill(xf, xb, 1.0f, &xs, D, 1);
+    fill(w1f, w1b, 0.05f, &w1s, D, gr);
+    fill(w2f, w2b, 0.05f, &w2s, I, gr);
     // ours: gate / up rows interleaved in 16-row blocks (row 32 q + r = gate 16 q + r, 32 q + 16 + r = up 16 q + r); the vendor: stacked
     std::vector<uint8_t> w1i(w1b.size());
-    std::vector<float> w1si(w1s.size());
+    std::vector<float> w1si(w1s);
     for (int e = 0; e < E; e++)
         for (int r = 0; r < 2 * I; r++) {
             int q = r / 32, rr = r % 32, src = rr < 16 ? 16 * q + rr : I + 16 * q + rr - 16;
             memcpy(&w1i[(((size_t)e * 2 * I) + r) * D * es], &w1b[(((size_t)e * 2 * I) + src) * D * es], (size_t)D * es);
-            w1si[(size_t)e * 2 * I + r] = w1s[(size_t)e * 2 * I + src];
+            if (!bs) w1si[(size_t)e * 2 * I + r] = w1s[(size_t)e * 2 * I + src];
         }
     auto w1sh = shuffle_b(w1i, (long)E * 2 * I, D, es);
     auto w1sh_v = shuffle_b(w1b, (long)E * 2 * I, D, es);
@@ -126,10 +133,10 @@ int main(int argc, char** argv) {
     void *dX = dev(xb), *dW1 = dev(w1sh), *dW2 = dev(w2sh), *dsid = dev(sid), *dseid = dev(seid), *dnv = dev(nv), *dsw = dev(sw);
     void *dxs = dev(xs), *dw1s = dev(w1si), *dw2s = dev(w2s), *dW1v = dev(w1sh_v), *dw1sv = dev(w1s);
     void *dY1, *dY1q, *dy1s, *dT, *dO;
-    HC(hipMalloc(&dY1, (size_t)M * TK * I * 2)); HC(hipMalloc(&dY1q, (size_t)M * TK * I)); HC(hipMalloc(&dy1s, (size_t)M * TK * 4));
+    HC(hipMalloc(&dY1, (size_t)M * TK * I * 2)); HC(hipMalloc(&dY1q, (size_t)M * TK * I)); HC(hipMalloc(&dy1s, (size_t)M * TK * (I / 128) * 4 + 256));
     HC(hipMalloc(&dT, (size_t)M * TK * D * 4)); HC(hipMalloc(&dO, (size_t)M * D * 2));
     // ---- kernels ----
-    std::string dt = fp8 ? "fp8" : "bf16";
+    std::string dt = bs ? "fp8bs" : fp8 ? "fp8" : "bf16";
     auto load = [&](const std::string& name) { hipModule_t m; hipFunction_t f; HC(hipModuleLoad(&m, (dir + "/" + name + ".co").c_str())); HC(hipModuleGetFunction(&f, m, name.c_str())); return f; };
     hipFunction_t f1 = load("gemm_moe1_" + dt + "_" + act), f2 = load("gemm_moe2_" + dt), fs = load("moe_sum_bf16_k" + std::to_string(TK));
     // 96-byte GEMM ABI + MoE extension (144 bytes)
@@ -156,13 +163,15 @@ int main(int argc, char** argv) {
         std::vector<uint16_t> y((size_t)M * TK * I);
         HC(hipMemcpy(y.data(), dY1, y.size() * 2, hipMemcpyDeviceToHost));
         std::vector<uint8_t> q(y.size());
-        std::vector<float> s(M * TK);
-        for (int r = 0; r < M * TK; r++) {
-            float amax = 1e-12f;
-            for (int c = 0; c < I; c++) amax = std::max(amax, std::fabs(bf(y[(size_t)r * I + c])));
-            s[r] = amax / 448.0f;
-            for (int c = 0; c < I; c++) q[(size_t)r * I + c] = f_to_e4m3(bf(y[(size_t)r * I + c]) / s[r]);
-        }
+        const int G = bs ? 128 : I, NG = I / G;
+        std::vector<float> s((size_t)M * TK * NG);
+        for (int r = 0; r < M * TK; r++)
+            for (int g = 0; g < NG; g++) {
+                float amax = 1e-12f;
+                for (int c = g * G; c < (g + 1) * G; c++) amax = std::max(amax, std::fabs(bf(y[(size_t)r * I + c])));
+                s[(size_t)r * NG + g] = amax / 448.0f;
+                for (int c = g * G; c < (g + 1) * G; c++) q[(size_t)r * I + c] = f_to_e4m3(bf(y[(size_t)r * I + c]) / s[(size_t)r * NG + g]);
+            }
         HC(hipMemcpy(dY1q, q.data(), q.size(), hipMemcpyHostToDevice));
         HC(hipMemcpy(dy1s, s.data(), s.size() * 4, hipMemcpyHostToDevice));
     };
@@ -302,10 +311,13 @@ int main(int argc, char** argv) {
             // stage 2 from the GPU y1 (quantized as the GPU consumed it for fp8)
             std::vector<double> yin(I);
             if (fp8) {
-                float amax = 1e-12f;
-                for (int i = 0; i < I; i++) amax = std::max(amax, std::fabs(bf(y1[((size_t)t * TK + k) * I + i])));
-                float s = amax / 448.0f;
-                for (int i = 0; i < I; i++) yin[i] = e4m3_to_f(f_to_e4m3(bf(y1[((size_t)t * TK + k) * I + i]) / s)) * s;
+                const int G = bs ? 128 : I;
+                for (int g0 = 0; g0 < I; g0 += G) {
+                    float amax = 1e-12f;
+                    for (int i = g0; i < g0 + G; i++) amax = std::max(amax, std::fabs(bf(y1[((size_t)t * TK + k) * I + i])));
+                    float s = amax / 448.0f;
+                    for (int i = g0; i < g0 + G; i++) yin[i] = e4m3_to_f(f_to_e4m3(bf(y1[((size_t)t * TK + k) * I + i]) / s)) * s;
+                }
             } else {
                 for (int i = 0; i < I; i++) yin[i] = bf(y1[((size_t)t * TK + k) * I + i]);
             }
