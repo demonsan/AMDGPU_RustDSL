@@ -32,7 +32,6 @@ podman --root "$ROOT" --runroot "$ROOT-run" run --rm --network=host "${EXTRA[@]}
     -e AMDC_RA_DEBUG_FILE="${AMDC_RA_DEBUG_FILE:-}" \
     -e AMDC_COALESCE_DEBUG="${AMDC_COALESCE_DEBUG:-}" \
     -e AMDC_WAW_DEBUG="${AMDC_WAW_DEBUG:-}" \
-    -e AMDC_NO_INFLIGHT_WAW="${AMDC_NO_INFLIGHT_WAW:-}" \
     -e AMDC_NO_PHYS_STORE="${AMDC_NO_PHYS_STORE:-}" \
     -e AMDC_NO_PHYS_WAW="${AMDC_NO_PHYS_WAW:-}" \
     -e AMDC_RA_DEBUG_BLOCKS="${AMDC_RA_DEBUG_BLOCKS:-}" \

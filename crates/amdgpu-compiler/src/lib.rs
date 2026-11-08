@@ -251,9 +251,7 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
     sched::waits::verify_waits(&m).map_err(|e| format!("wait verification failed: {e}"))?;
     let alloc = regalloc::allocate(&m)?;
     // a register handed to another value while a load into it is still in flight (a path where the load's result is not used)
-    if std::env::var("AMDC_NO_INFLIGHT_WAW").is_err() {
-        hazards::pad_inflight_waw(&mut m, &alloc);
-    }
+    hazards::pad_inflight_waw(&mut m, &alloc);
     // Register reuse (especially the hole-filling packing) can place a new value in a register an in-flight MFMA still reads:
     // pad the physical write-after-read hazard on every path, not only for scheduled code.
     hazards::pad_physical_war(&mut m, &alloc);
