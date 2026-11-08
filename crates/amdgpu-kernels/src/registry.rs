@@ -49,12 +49,15 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("mlp_fp8_") => crate::mlp::by_name(n),
         // P2 (stage library): RMSNorm + per-token fp8 quantization from the generic E / R / Q stages; N in the name (multiple of 512)
         n if n.starts_with("rmsnorm_quant_fp8_n") => crate::norm::by_name(n),
-        // batch 2: dequantization, expert routing, RoPE, KV-cache write
+        // batch 2: sampling,
+        n if n.starts_with("argmax_bf16_v") || n.starts_with("sample_bf16_v") => crate::sampling::by_name(n),
+        // (batch 2 cont.) MoE sorting, dequantization, expert routing, RoPE, KV-cache write
+        n if n.starts_with("moe_sorting_e") => crate::moe::by_name(n),
         n if n.starts_with("dequant_fp8_bf16_") => crate::dequant::by_name(n),
         // (batch 2 cont.)
         n if n.starts_with("topk_softmax_bf16_e") || n.starts_with("topk_softmax_renorm_bf16_e") => crate::topk::by_name(n),
         n if n.starts_with("rope_neox_bf16_h") || n.starts_with("rope_gptj_bf16_h") => crate::rope::by_name(n),
-        n if n.starts_with("reshape_cache_flash_bf16_h") => crate::cache::by_name(n),
+        n if n.starts_with("reshape_cache_flash_bf16_h") || n.starts_with("reshape_cache_blocked_bf16_h") => crate::cache::by_name(n),
         // batch 2 (docs/op-coverage-memtemplates.md): row kernels, streaming elementwise
         n if n.starts_with("quant_token_bf16_fp8_n") || n.starts_with("quant_token_bf16_int8_n") || n.starts_with("quant_group128_bf16_fp8_n") || n.starts_with("silu_mul_quant_fp8_d") => crate::rows::quant::by_name(n),
         n if n.starts_with("rmsnorm_bf16_n") || n.starts_with("add_rmsnorm_bf16_n") || n.starts_with("layernorm_bf16_n") || n.starts_with("softmax_bf16_n") => crate::rows::by_name(n),
