@@ -630,6 +630,9 @@ pub enum Op {
     LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
     LoadLdsTrB16 { addr: Opnd },
+    /// "Any lane": the wave-level reading of a per-lane condition (true for the whole wave when any lane's `cond` holds) — the explicit marker
+    /// for branching on a per-lane condition (`if` / `break_if` are wave-level). No code: the branch itself has this semantics.
+    AnyLane(Opnd),
     /// Dwords `start .. start + n` of a fragment value as a value of its own WITHOUT a copy (a register view; n = 1 -> I32, 2 / 4 / 8 -> FragN)
     FragSlice { frag: Opnd, start: u8, n: u8 },
     /// The concatenation of one-dword values and fragments into one fragment of the total width (2, 4, 8 or 16 dwords; copies)
@@ -676,6 +679,7 @@ impl Op {
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
+            Op::AnyLane(_) => DType::I1,
             Op::FragSlice { n, .. } => match n {
                 1 => DType::I32,
                 2 => DType::Frag2,
@@ -784,6 +788,7 @@ impl Op {
             Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } | Op::LoadLdsD16 { addr, .. } => vec![*addr],
             Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
             Op::Dpp { x, old, .. } => vec![*x, *old],
+            Op::AnyLane(c) => vec![*c],
             Op::FragSlice { frag, .. } => vec![*frag],
             Op::FragCat { parts, .. } => parts.clone(),
             Op::ReadLane { x, .. } | Op::Swizzle { x, .. } => vec![*x],
@@ -2085,6 +2090,11 @@ impl FnBuilder {
             None
         }
     }
+    /// Mark a per-lane condition for a wave-level branch: the wave takes the branch when ANY lane's `cond` holds (`if` / `break_if` conditions must
+    /// be wave-uniform; this is the explicit way to branch on a per-lane one).
+    pub fn any_lane(&mut self, cond: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::AnyLane(cond.into()))
+    }
     /// Dwords `start .. start + n` of fragment `frag` as a view (no instruction).
     pub fn frag_slice(&mut self, frag: impl Into<Opnd>, start: u8, n: u8) -> ValueId {
         assert!(matches!(n, 1 | 2 | 4 | 8), "frag_slice: n is 1, 2, 4 or 8");
@@ -3123,6 +3133,7 @@ fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
 pub fn verify(f: &Function) -> Vec<String> {
     let mut errs = Vec::new();
     check_var_slices(f, &mut errs);
+    check_uniform_branches(f, &mut errs);
     check_region_marks(f, &mut errs);
 
     // Region stack: values visible in the current scope.
@@ -4130,6 +4141,107 @@ fn check_var_slices(f: &Function, errs: &mut Vec<String>) {
                     *stale = true;
                 }
             }
+        }
+    }
+}
+
+/// Wave-uniform values (a conservative forward analysis): constants, kernel arguments, workgroup ids, `workitem_id >> k` (k >= 6: one value
+/// per 64-lane wave of a 1-D workgroup), `readfirstlane` / `readlane` / `ballot`, and pure ops / loads whose operands are all uniform (a load
+/// from a uniform address returns the same value in every lane); loop variables whose initial value and every write are uniform.
+pub fn uniform_values(f: &Function) -> (std::collections::HashSet<ValueId>, std::collections::HashSet<VarId>) {
+    use std::collections::HashSet;
+    let stmts = f.stmts();
+    let mut uvars: HashSet<VarId> = (0..f.var_tys.len() as u32).map(VarId).collect();
+    loop {
+        let mut u: HashSet<ValueId> = HashSet::new();
+        let mut wid: HashSet<ValueId> = HashSet::new();
+        let mut consts: std::collections::HashMap<ValueId, i32> = std::collections::HashMap::new();
+        let is_u = |o: &Opnd, u: &HashSet<ValueId>, uv: &HashSet<VarId>| match o {
+            Opnd::I32(_) | Opnd::F32(_) => true,
+            Opnd::Val(v) => u.contains(v),
+            Opnd::Var(v) => uv.contains(v),
+        };
+        let mut changed = false;
+        for st in stmts {
+            match st {
+                Stmt::Let { dst, op } => {
+                    if let Op::ConstI32(k) = op {
+                        consts.insert(*dst, *k);
+                    }
+                    let uni = match op {
+                        Op::WorkitemId => {
+                            wid.insert(*dst);
+                            false
+                        }
+                        Op::LshrI32(Opnd::Val(a), b) if wid.contains(a) => match b {
+                            Opnd::I32(k) => *k >= 6,
+                            Opnd::Val(v) => consts.get(v).map_or(false, |k| *k >= 6),
+                            _ => false,
+                        },
+                        Op::ReadFirstLane(_) | Op::ReadLane { .. } | Op::Ballot { .. } | Op::AnyLane(_) => true,
+                        // per-lane by construction (lane permutes, matrix results, atomics' per-lane old values, asm)
+                        Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::Permlane16Swap { .. }
+                        | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } | Op::WriteLane { .. } | Op::PartnerMaxF32(..)
+                        | Op::MfmaF16 { .. } | Op::MfmaF16Wide { .. } | Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. }
+                        | Op::SmfmacFp8_16x16x128 { .. } | Op::Mfma { .. } | Op::AtomicLds { .. } | Op::AtomicGlobal { .. } | Op::AtomicAddU32 { .. }
+                        | Op::Asm { .. } | Op::LoadLdsTrB8 { .. } | Op::LoadLdsTr4B8 { .. } | Op::LoadLdsTrB16 { .. } => false,
+                        _ => op.operands().iter().all(|o| is_u(o, &u, &uvars)),
+                    };
+                    if uni {
+                        u.insert(*dst);
+                    }
+                }
+                Stmt::BeginLoop { vars, init } => {
+                    for (v, i) in vars.iter().zip(init.iter()) {
+                        if uvars.contains(v) && !is_u(i, &u, &uvars) {
+                            uvars.remove(v);
+                            changed = true;
+                        }
+                    }
+                }
+                Stmt::SetVar { var, value } => {
+                    if uvars.contains(var) && !is_u(value, &u, &uvars) {
+                        uvars.remove(var);
+                        changed = true;
+                    }
+                }
+                _ => {
+                    for w in stmt_var_writes(st) {
+                        if uvars.remove(&w) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            return (u, uvars);
+        }
+    }
+}
+
+/// `break_if` and `begin_if` branch on the WAVE (`s_cbranch_vccnz` / scalar compare): a per-lane condition would exit / skip for the whole wave
+/// when ANY lane's condition holds, silently running the wrong trip count. Every branch condition must be wave-uniform.
+fn check_uniform_branches(f: &Function, errs: &mut Vec<String>) {
+    let (u, uv) = uniform_values(f);
+    for (idx, st) in f.stmts().iter().enumerate() {
+        let (cond, what) = match st {
+            Stmt::BreakIf { cond } => (cond, "break_if"),
+            Stmt::BeginIf { cond } => (cond, "if"),
+            _ => continue,
+        };
+        let ok = match cond {
+            Opnd::I32(_) | Opnd::F32(_) => true,
+            Opnd::Val(v) => u.contains(v),
+            Opnd::Var(v) => uv.contains(v),
+        };
+        if !ok {
+            errs.push(format!(
+                "stmt {idx}: {what} condition {cond:?} is not provably wave-uniform (wrap it in `any_lane(..)` if the wave-level 'any lane' reading is intended): DSL branches are wave-level (the whole wave branches when ANY \
+                 lane's condition holds), so a per-lane condition silently runs the wrong trip count / skips lanes that should run. Use wave-uniform \
+                 bounds (kernel arguments, workgroup ids, readfirstlane / readlane / ballot results) and predicate the per-lane work instead (select, \
+                 masked buffer offsets)"
+            ));
         }
     }
 }

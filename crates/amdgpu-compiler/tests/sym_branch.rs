@@ -48,6 +48,7 @@ fn a_per_lane_condition_is_not_a_fact() {
     let tid = b.let_(Op::WorkitemId);
     let k = b.c_i32(16);
     let c = b.cmp_lt_i32(tid, k);
+    let c = b.any_lane(c); // a wave-level branch on a per-lane condition
     b.if_(c, |b| {
         let a = b.bind_i32(ev(tid) * 64);
         let _ = b.load_lds_b128(a);

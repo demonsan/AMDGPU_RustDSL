@@ -90,6 +90,15 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
             amdgpu_dsl::print::print_dsl(f)
         ));
     }
+    // `any_lane` markers carry no code (the wave-level branch is the semantics): lower the function with them substituted away, so marking a
+    // condition never changes the generated code
+    let stripped;
+    let f = if f.stmts().iter().any(|s| matches!(s, Stmt::Let { op: Op::AnyLane(_), .. })) {
+        stripped = strip_any_lane(f);
+        &stripped
+    } else {
+        f
+    };
     let mut lw = Lowerer::new(f);
     if opt_on("scalarize") {
         let (u, v) = uniform_analysis(f);
@@ -199,6 +208,8 @@ struct Lowerer {
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
     /// root register views of loop variables that must be copied at their definition (a use would otherwise see a later write of the variable: `facts::stale_view_roots`)
     view_copy: std::collections::HashSet<ValueId>,
+    /// every value some statement reads (precise: through the generated id visitor)
+    read_values: std::collections::HashSet<ValueId>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
     /// AGPR requests from the IR (resolved to vregs in inish).
@@ -326,6 +337,7 @@ impl Lowerer {
             },
             alias_cache: HashMap::new(),
             view_copy: amdgpu_dsl::facts::stale_view_roots(f),
+            read_values: f.stmts().iter().flat_map(amdgpu_dsl::facts::stmt_value_uses).collect(),
             else_started: HashSet::new(),
             agpr_marks: f.agpr.clone(),
             reg_plan: f.reg_plan.clone(),
@@ -2216,6 +2228,18 @@ impl Lowerer {
     }
 
     fn lower_op(&mut self, dst: ValueId, op: &Op) -> Result<(), String> {
+        // A load whose result is never used is not emitted: its destination register would be handed to another value while the load is still
+        // in flight, and the load's late write would clobber that value (a physical WAW the in-order wait accounting cannot see).
+        let pure_load = matches!(
+            op,
+            Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::BufferLoad { .. } | Op::BufferLoadB128x2 { .. }
+                | Op::LoadLdsB32 { .. } | Op::LoadLdsB64 { .. } | Op::LoadLdsB128 { .. } | Op::LoadLdsB128x2 { .. } | Op::LoadLdsTrB8 { .. }
+                | Op::LoadLdsTr4B8 { .. } | Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } | Op::LoadLdsN { .. }
+                | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. }
+        );
+        if pure_load && !self.read_values.contains(&dst) {
+            return Ok(());
+        }
         match op {
             Op::ConstI32(v) => {
                 let r = self.const_vreg(*v as i64);
@@ -2299,6 +2323,20 @@ impl Lowerer {
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
+            // a returning atomic whose result is unused: the no-return form (a dead destination would be reused by the allocator while the
+            // atomic is still in flight, and its late write would clobber the new value)
+            Op::AtomicLds { op, addr, value } if !self.read_values.contains(&dst) => {
+                let (a, off) = self.lds_addr(*addr)?;
+                let v = self.as_v1(*value)?;
+                self.touch(&[Src::Reg(v)]);
+                self.push(MInst::new(lds_atomic_mop(*op, false)).srcreg(a).srcreg(v).imm(off));
+            }
+            Op::AtomicGlobal { op, base, byte_off, value } if !self.read_values.contains(&dst) => {
+                let rb = self.as_v2(*base)?;
+                let v = self.as_v1(*value)?;
+                self.touch(&[Src::Reg(v)]);
+                self.push(MInst::new(global_atomic_mop(*op, false)).srcreg(rb).srcreg(v).imm(*byte_off as i64));
+            }
             Op::AtomicLds { op, addr, value } => {
                 let (a, off) = self.lds_addr(*addr)?;
                 let v = self.as_v1(*value)?;
@@ -2316,6 +2354,10 @@ impl Lowerer {
                 self.push(MInst::new(global_atomic_mop(*op, true)).def(d).srcreg(rb).srcreg(v).imm(*byte_off as i64));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
+            }
+            Op::AnyLane(c) => {
+                let r = self.as_v1(*c)?;
+                self.val.insert(dst, r);
             }
             Op::FragSlice { frag, start, n } => {
                 let f = match frag {
@@ -4578,5 +4620,55 @@ fn plain_f8f6f4_mop(k: amdgpu_dsl::MmaKind) -> Option<(MOp, MOp, i64)> {
         (S::M32N32K64, 8, 6) => m(MOp::VMfmaPlain32x32x64A8B6, MOp::VMfmaPlain32x32x64A8B6Z),
         (S::M32N32K64, 8, 8) => m(MOp::VMfmaPlain32x32x64A8B8, MOp::VMfmaPlain32x32x64A8B8Z),
         _ => None,
+    }
+}
+
+/// `f` with every branch / select / not operand that is an `AnyLane(c)` value replaced by `c`.
+fn strip_any_lane(f: &Function) -> Function {
+    use amdgpu_dsl::ir_text::IrIds;
+    let mut map: HashMap<ValueId, Opnd> = HashMap::new();
+    for s in f.stmts() {
+        if let Stmt::Let { dst, op: Op::AnyLane(c) } = s {
+            let c = match c {
+                Opnd::Val(v) => map.get(v).copied().unwrap_or(*c),
+                o => *o,
+            };
+            map.insert(*dst, c);
+        }
+    }
+    let mut g = f.clone();
+    g.edit_stmts(|stmts| {
+        // the marker statements stay (lowered as an alias of their condition, no code) for any other use
+        for s in stmts.iter_mut() {
+            // substitute operands: only Val ids that are markers (their replacement may itself be a Val)
+            let mut todo: Vec<(ValueId, Opnd)> = Vec::new();
+            s.ids(&mut |v| {
+                if let Some(r) = map.get(v) {
+                    todo.push((*v, *r));
+                }
+            }, &mut |_| {});
+            if todo.is_empty() {
+                continue;
+            }
+            *s = subst_stmt(s, &map);
+        }
+    });
+    g
+}
+
+/// Replace `Opnd::Val(v)` operands of a statement by `map[v]` (markers only).
+fn subst_stmt(s: &Stmt, map: &HashMap<ValueId, Opnd>) -> Stmt {
+    let sub = |o: &Opnd| -> Opnd {
+        match o {
+            Opnd::Val(v) => map.get(v).copied().unwrap_or(*o),
+            _ => *o,
+        }
+    };
+    match s {
+        Stmt::BeginIf { cond } => Stmt::BeginIf { cond: sub(cond) },
+        Stmt::BreakIf { cond } => Stmt::BreakIf { cond: sub(cond) },
+        Stmt::Let { dst, op: Op::Select { ty, cond, a, b } } => Stmt::Let { dst: *dst, op: Op::Select { ty: *ty, cond: sub(cond), a: sub(a), b: sub(b) } },
+        Stmt::Let { dst, op: Op::NotI1(a) } => Stmt::Let { dst: *dst, op: Op::NotI1(sub(a)) },
+        other => other.clone(),
     }
 }

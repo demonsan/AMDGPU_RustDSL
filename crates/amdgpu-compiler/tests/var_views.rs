@@ -13,7 +13,8 @@ fn kernel(after_write: bool, in_loop_use: bool) -> Function {
     let c4 = b.c_i32(4);
     let off = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::Val(c4)));
     let base = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off) });
-    let vars = b.begin_loop(&[(DType::I32, Opnd::Val(tid))]);
+    let vars = b.begin_loop(&[(DType::I32, Opnd::I32(3))]); // a uniform loop (branches are wave-level)
+    let _ = tid;
     let view = b.let_(Op::BitcastF32(Opnd::Var(vars[0])));
     if in_loop_use {
         // the view is defined in the loop and used in a NESTED loop after the write: the next inner iteration must not see the write

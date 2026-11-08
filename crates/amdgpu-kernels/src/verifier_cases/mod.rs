@@ -94,6 +94,7 @@ pub fn gv_attack_clamp_path() -> Function {
     let clamped = b.min_i32(off, c127);
     let c32 = b.c_i32(32);
     let pick = b.cmp_lt_i32(tid, c32);
+    let pick = b.any_lane(pick); // a wave-level branch on a per-lane condition
     b.begin_if(Opnd::Val(pick));
     let p1 = b.ptr_add(q, clamped);
     let v1 = b.load_f32(p1, 0);
@@ -143,7 +144,11 @@ pub fn gv_audit_region_trust() -> Function {
     let t = b.let_(Op::WorkitemId);
     let c64 = b.c_i32(64);
     let is_p = b.cmp_lt_i32(t, c64);
-    b.begin_if(Opnd::Val(is_p));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(is_p);
+        b.begin_if(Opnd::Val(any));
+    }
     b.buf_produce("r", Opnd::I32(0));
     b.store_f32(p, 0, Opnd::F32(1.0));
     b.tile_end();

@@ -324,7 +324,7 @@ pub fn probe_mfma_p1() -> Function {
         b.pin_agpr(vars[0]); // the var form accumulates in AGPRs (acc_cd)
         b.var_mfma(vars[0], *k, fa, fb, true);
         b.var_mfma(vars[0], *k, fa, fb, false);
-        let always = b.cmp(CmpPred::Ge, CmpTy::I32, tid, 0);
+        let always = b.cmp(CmpPred::Ge, CmpTy::I32, 0, 0); // a uniform (constant) exit: one trip
         b.break_if(always);
         b.end_loop();
         let n = k.acc_dwords();
@@ -345,7 +345,7 @@ pub fn probe_mfma_p1() -> Function {
             let s0 = b.var_slice4(vs[0], 0);
             let s1 = b.var_slice4(vs[0], 1);
             let d4 = b.mfma(*k, s0, s1, None);
-            let always = b.cmp(CmpPred::Ge, CmpTy::I32, tid, 0);
+            let always = b.cmp(CmpPred::Ge, CmpTy::I32, 0, 0); // a uniform (constant) exit: one trip
             b.break_if(always);
             b.end_loop();
             let p = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::I32(out_bytes as i32 - 64 * 16) });

@@ -735,7 +735,11 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     let total = b.mul_i32(nb, c64);
     let last_ticket = b.add_i32(total, cm1);
     let is_last = b.let_(Op::CmpGeI32(Opnd::Val(old), Opnd::Val(last_ticket)));
-    b.begin_if(Opnd::Val(is_last));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(is_last);
+        b.begin_if(Opnd::Val(any));
+    }
     match mode {
         0 | 4 => b.fence_acquire(),
         1 => b.fence_acquire_lite(),
@@ -758,7 +762,11 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     b.set_var(i, Opnd::Val(i2));
     let more = b.cmp_lt_i32(i2, total);
     let stop = b.let_(Op::NotI1(Opnd::Val(more)));
-    b.break_if(Opnd::Val(stop));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(stop);
+        b.break_if(Opnd::Val(any));
+    }
     b.end_loop();
     let sf = b.bitcast_f32(Opnd::Var(s));
     b.store_f32_wt(result, 0, Opnd::Val(sf));
@@ -826,7 +834,11 @@ fn probe_la8_mode(name: &str, mode: u8) -> Function {
     b.set_var(dv[0], Opnd::Val(dn));
     let dmore = b.cmp_lt_i32(dn, iters);
     let dstop = b.let_(Op::NotI1(Opnd::Val(dmore)));
-    b.break_if(Opnd::Val(dstop));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(dstop);
+        b.break_if(Opnd::Val(any));
+    }
     b.end_loop();
     // partial store: element idx = bid*512 + tid
     let row = b.mul_i32(bid, c512);
@@ -859,7 +871,11 @@ fn probe_la8_mode(name: &str, mode: u8) -> Function {
     let cm1 = b.c_i32(-1);
     let nbm1 = b.add_i32(nb, cm1);
     let is_last = b.let_(Op::CmpGeI32(Opnd::Val(ticket), Opnd::Val(nbm1)));
-    b.begin_if(Opnd::Val(is_last));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(is_last);
+        b.begin_if(Opnd::Val(any));
+    }
     match mode {
         0 | 2 => b.fence_acquire(),
         1 | 4 => b.fence_acquire_lite(),
@@ -881,7 +897,11 @@ fn probe_la8_mode(name: &str, mode: u8) -> Function {
     b.set_var(i, Opnd::Val(i2));
     let more = b.cmp_lt_i32(i2, total);
     let stop = b.let_(Op::NotI1(Opnd::Val(more)));
-    b.break_if(Opnd::Val(stop));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(stop);
+        b.break_if(Opnd::Val(any));
+    }
     b.end_loop();
     b.end_if();
     b.finish()
@@ -924,7 +944,11 @@ pub fn probe_la_verify() -> Function {
     let row = b.mul_i32(bid, c256);
     let i = b.add_i32(row, tid);
     let inb = b.cmp_lt_i32(i, total);
-    b.begin_if(Opnd::Val(inb));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(inb);
+        b.begin_if(Opnd::Val(any));
+    }
     let off = b.mul_i32(i, c4);
     let p = b.ptr_add(out, off);
     let x = b.load_f32(p, 0);
@@ -1430,7 +1454,11 @@ pub fn probe_llvm_roles() -> Function {
     let c2000 = b.c_i32(2000);
     let off = b.mul_i32(tid, c4);
     let role_a = b.cmp_lt_i32(tid, c256);
-    b.begin_if(Opnd::Val(role_a));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(role_a);
+        b.begin_if(Opnd::Val(any));
+    }
     let va = b.add_i32(tid, c1000);
     b.store_lds_b32(Opnd::Val(off), Opnd::Val(va));
     b.else_();
@@ -1524,27 +1552,55 @@ pub fn probe_llvm_branch() -> Function {
     let _ = c0;
     let off = b.mul_i32(wg, c4);
     let q = b.ptr_add(o, off);
-    b.begin_if(Opnd::Val(is_even));
-    b.begin_if(Opnd::Val(low));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(is_even);
+        b.begin_if(Opnd::Val(any));
+    }
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(low);
+        b.begin_if(Opnd::Val(any));
+    }
     let v11 = b.bitcast_f32(c11);
-    b.begin_if(Opnd::Val(lane0));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(lane0);
+        b.begin_if(Opnd::Val(any));
+    }
     b.store_f32(q, 0, v11);
     b.end_if();
     b.else_();
     let v12 = b.bitcast_f32(c12);
-    b.begin_if(Opnd::Val(lane0));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(lane0);
+        b.begin_if(Opnd::Val(any));
+    }
     b.store_f32(q, 0, v12);
     b.end_if();
     b.end_if();
     b.else_();
-    b.begin_if(Opnd::Val(low));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(low);
+        b.begin_if(Opnd::Val(any));
+    }
     let v21 = b.bitcast_f32(c21);
-    b.begin_if(Opnd::Val(lane0));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(lane0);
+        b.begin_if(Opnd::Val(any));
+    }
     b.store_f32(q, 0, v21);
     b.end_if();
     b.else_();
     let v22 = b.bitcast_f32(c22);
-    b.begin_if(Opnd::Val(lane0));
+    {
+        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+        let any = b.any_lane(lane0);
+        b.begin_if(Opnd::Val(any));
+    }
     b.store_f32(q, 0, v22);
     b.end_if();
     b.end_if();
