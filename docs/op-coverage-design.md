@@ -778,6 +778,15 @@ blockscale 128×128（`fp8bs`）的规则：
 
 小形状 tile 数少，所以 TF/s 低。
 
+**小形状改进**：网格不足 CU 数一半时改用 `_c128`，即 128×128 CTA，规则见 [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `conv_cta`。
+- 1×1 NB2：49 → 94 TF/s；
+- 3×3 s2：44 → 89 TF/s；
+- 3×3 NB2 56²：69 → 135 TF/s；
+- NB8 56²：255 → 408 TF/s；
+- NB16 28²：345 → 567 TF/s。
+
+conv 的 split-K 也试过：K tile 数需要能被 S 整除，而且实测更慢，所以未保留。
+
 **待办**：
 - 小 M 时用 split-K / 128 CTA；
 - 抽头判断目前每 tile 每 issue 一次 VALU，可以裁掉无越界的 tile；

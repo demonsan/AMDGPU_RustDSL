@@ -79,9 +79,28 @@ pub fn bf16_prefill_kernel(b: u64, h: u64, sq: u64, sk: u64, causal: bool, cus: 
     (name, s)
 }
 
+/// Implicit-GEMM conv (`conv{2,3}d_bf16_*`): the CTA (256, or `_c128`). M = NB OD OH OW rows, N = output channels. 256 x 256 CTAs when there
+/// are at least CUs / 2 of them, else 128 x 128 (measured: 3x3 C64 K256 NB8 56^2 408 vs 255 TF/s, NB16 28^2 C256 K512 567 vs 345, small
+/// shapes ~2x; NB32 28^2 C256 K512 639 (256) vs 595). (Split-K over the conv K was tried: slower and needs K tiles % S == 0 - not kept.)
+pub fn conv_cta(m: u64, n: u64, cus: u64) -> u32 {
+    if m.div_ceil(256) * n.div_ceil(256) >= cus / 2 {
+        256
+    } else {
+        128
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conv_rule() {
+        assert_eq!(conv_cta(25088, 512, 256), 256);
+        assert_eq!(conv_cta(12544, 512, 256), 128);
+        assert_eq!(conv_cta(25088, 256, 256), 128);
+        assert_eq!(conv_cta(6272, 256, 256), 128);
+    }
 
     #[test]
     fn prefill_kernel_rule() {
