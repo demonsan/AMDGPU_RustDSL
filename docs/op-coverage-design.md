@@ -517,6 +517,19 @@
 - i8；
 - 与厂商同条件的 split-K 对比。
 
+**blockscale 中等 M 的分发规则**（2026-11-08，同次运行，对照 aiter 的 BpreShuffle_128x128）：
+- 规则：CTA 数 M·N/128² ≤ 约 2×CU 数时，改用 `gemm_a8w8_blockscale_splitk`，取 S = 2，再加 `gemm_splitk_reduce_s2`。规则写在 [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `blockscale_split_k` 中。
+- 实测：
+
+  | 形状 | 不切分 | S = 2 | 厂商 | 比（S = 2） |
+  |---|--:|--:|--:|--:|
+  | 1024×4096×8192 | 864 | 975 | 1133 | 0.86 |
+  | 256×7168×4096 | 384 | 516 | 574 | 0.90 |
+  | 512×7168×7168 | 761 | 840 | 997 | 0.84 |
+  | 4096³ | 1159 | 不切分 | 1131 | 1.02 |
+
+- S = 4 在所有形状上都没有赢过。
+- 块缩放的 FMA 已经推迟一级（`bs_fma`）。余下的差距在每 CU 只有 1 个 CTA 时的单 tile 效率。
 ### 7.5 批次 3（attention）状态：覆盖完成，性能待优化
 
 **prefill**：`fmha_fwd_hd<64|128|256>_bf16[_causal][_swa][_group]`，见 [`fmha/bf16.rs`](../crates/amdgpu-kernels/src/fmha/bf16.rs)。
