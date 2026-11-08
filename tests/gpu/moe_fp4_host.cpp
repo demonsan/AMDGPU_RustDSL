@@ -101,9 +101,16 @@ int main(int argc, char** argv) {
     HC(hipMalloc(&dT, (size_t)M * TK * D * 4)); HC(hipMalloc(&dO, (size_t)M * D * 2));
     auto load = [&](const std::string& name) { hipModule_t m; hipFunction_t f; HC(hipModuleLoad(&m, (dir + "/" + name + ".co").c_str())); HC(hipModuleGetFunction(&f, m, name.c_str())); return f; };
     const std::string bms = BM == 64 ? "_bm64" : "";
-    hipFunction_t f1 = load("gemm_moe1_fp4_silu" + bms), f2 = load("gemm_moe2_fp4" + bms), fs = load("moe_sum_bf16_k" + std::to_string(TK));
+    // OSS=1: the gpt-oss form (_oss): per-expert fp32 biases b1 [E][2I] (gate then up), b2 [E][D]; clamped swiglu
+    const bool oss = envi("OSS", 0) != 0;
+    std::vector<float> b1((size_t)E * 2 * I), b2((size_t)E * D);
+    for (auto& v : b1) v = ((int)(rng() % 64) - 32) / 8.0f;
+    for (auto& v : b2) v = ((int)(rng() % 64) - 32) / 8.0f;
+    void *db1 = dev(b1), *db2 = dev(b2);
+    hipFunction_t f1 = load(oss ? "gemm_moe1_fp4_oss" + bms : "gemm_moe1_fp4_silu" + bms), f2 = load((oss ? "gemm_moe2_fp4_oss" : "gemm_moe2_fp4") + bms),
+                  fs = load("moe_sum_bf16_k" + std::to_string(TK));
     auto gemm_args = [&](void* A, void* B, void* C, int m, int n, int k, void* sa, void* sb, int nout) {
-        std::vector<uint8_t> a(144, 0);
+        std::vector<uint8_t> a(oss ? 152 : 144, 0);
         auto P = [&](int o, const void* p) { memcpy(&a[o], &p, 8); };
         auto U = [&](int o, int v) { memcpy(&a[o], &v, 4); };
         P(0, A); P(8, B); P(16, C); U(24, m); U(28, n); U(32, k); U(36, 1); U(40, k); U(44, k); U(48, nout);
@@ -113,6 +120,7 @@ int main(int argc, char** argv) {
     };
     auto a1 = gemm_args(dX, dW1, dY1, M, 2 * I, D, dXs, dW1s, I);
     auto a2 = gemm_args(dY1q, dW2, dT, M * TK, D, I, dY1s, dW2s, D);
+    if (oss) { memcpy(&a1[144], &db1, 8); memcpy(&a2[144], &db2, 8); }
     std::vector<uint8_t> as(24, 0);
     memcpy(&as[0], &dT, 8); memcpy(&as[8], &dO, 8); memcpy(&as[16], &M, 4); memcpy(&as[20], &D, 4);
     auto launch = [&](hipFunction_t f, std::vector<uint8_t>& a, int gx, int gy) {
@@ -132,7 +140,8 @@ int main(int argc, char** argv) {
             for (int c = 0; c < I; c++) {
                 double g = 0, u = 0;
                 for (int d = 0; d < D; d++) { double x = X.v(t, d); g += x * W1.v((size_t)e * 2 * I + c, d); u += x * W1.v((size_t)e * 2 * I + I + c, d); }
-                double ref = g / (1 + std::exp(-g)) * u, got = bf(y1[((size_t)t * TK + k) * I + c]);
+                if (oss) { g += b1[(size_t)e * 2 * I + c]; u += b1[(size_t)e * 2 * I + I + c]; g = std::min(g, 7.0); u = std::max(std::min(u, 7.0), -7.0); }
+                double ref = oss ? (u + 1) * g / (1 + std::exp(-1.702 * g)) : g / (1 + std::exp(-g)) * u, got = bf(y1[((size_t)t * TK + k) * I + c]);
                 double err = std::fabs(got - ref);
                 me1 = std::max(me1, err / (std::fabs(ref) + 1e-3));
                 if (err > 2e-2 * std::fabs(ref) + 2e-2) { if (bad1 < envi("SHOW_BAD", 0)) printf("  s1 t=%d k=%d c=%d got %g ref %g\n", t, k, c, got, ref); bad1++; }
@@ -163,6 +172,7 @@ int main(int argc, char** argv) {
                 int e = ids[t * TK + k];
                 double acc = 0;
                 for (int i = 0; i < I; i++) acc += YQ.v((size_t)t * TK + k, i) * W2.v((size_t)e * D + d, i);
+                if (oss) acc += b2[(size_t)e * D + d];
                 ref += tw[t * TK + k] * acc;
             }
             double got = bf(out[(size_t)t * D + d]), err = std::fabs(got - ref);

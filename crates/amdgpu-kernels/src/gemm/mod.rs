@@ -2158,10 +2158,16 @@ fn moe_epilogue(
                             // gpt-oss clamped swiglu: gate = min(g, 7), up = clamp(u, -7, 7), (up + 1) gate sigmoid(1.702 gate)
                             let lim = b.c_f32(7.0);
                             let nlim = b.c_f32(-7.0);
-                            let gc = b.min_f32(g[k], lim);
-                            let uc = b.min_f32(u[k], lim);
-                            let uc = b.max_f32(uc, nlim);
+                            // min(x, 7) = -max(-x, -7)
                             let zf = b.c_f32(0.0);
+                            let ngk = b.sub_f32(zf, g[k]);
+                            let gm = b.max_f32(ngk, nlim);
+                            let gc = b.sub_f32(zf, gm);
+                            let nuk = b.sub_f32(zf, u[k]);
+                            let um = b.max_f32(nuk, nlim);
+                            let uc = b.sub_f32(zf, um);
+                            let uc = b.max_f32(uc, nlim);
+                            let _ = lim;
                             let ng = b.sub_f32(zf, gc);
                             let alpha_l2e = b.c_f32(1.702 * std::f32::consts::LOG2_E);
                             let x = b.mul_f32(ng, alpha_l2e);
