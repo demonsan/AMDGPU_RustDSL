@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
     char args[64]; size_t sz = 0; auto put = [&](const void* p, size_t k) { std::memcpy(args + sz, p, k); sz += k; };
     int32_t n32 = (int32_t)n; put(&din, 8); put(&dout, 8); if (mode == "quant_static") put(&scale, 4); put(&n32, 4);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
-    int grid = (int)((n + 2047) / 2048);
+    int per = (std::string(kn).find("_x16") != std::string::npos) ? 4096 : 2048; int grid = (int)((n + per - 1) / per);
     CK(hipModuleLaunchKernel(fn, grid, 1, 1, 256, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize());
     std::vector<uint8_t> ho(n * out_b + 64); CK(hipMemcpy(ho.data(), dout, ho.size(), hipMemcpyDeviceToHost));
     long bad = 0;
