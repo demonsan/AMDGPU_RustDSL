@@ -93,6 +93,15 @@ int main(int argc, char** argv) {
         HC(hipModuleLaunchKernel(cfn, H, B, 1, 512, 1, 1, 0, nullptr, nullptr, ccfg));
     };
     launch();
+    if (envi("DUMP", 0)) {
+        HC(hipDeviceSynchronize());
+        std::vector<float> pl((size_t)B * H * NS), po((size_t)B * H * NS * DV);
+        HC(hipMemcpy(pl.data(), dpl, pl.size() * 4, hipMemcpyDeviceToHost));
+        HC(hipMemcpy(po.data(), dpo, po.size() * 4, hipMemcpyDeviceToHost));
+        printf("DUMP ctx[0]=%d\n", cl[0]);
+        for (int h = 0; h < 2; h++)
+            for (int s = 0; s < NS; s++) printf("  h%d part %d lse %g o[0..3] %g %g %g %g o[511] %g\n", h, s, pl[(size_t)h * NS + s], po[((size_t)h * NS + s) * DV], po[((size_t)h * NS + s) * DV + 1], po[((size_t)h * NS + s) * DV + 2], po[((size_t)h * NS + s) * DV + 3], po[((size_t)h * NS + s) * DV + 511]);
+    }
     HC(hipDeviceSynchronize());
     std::vector<uint16_t> out((size_t)B * H * DV);
     HC(hipMemcpy(out.data(), dout, out.size() * 2, hipMemcpyDeviceToHost));
