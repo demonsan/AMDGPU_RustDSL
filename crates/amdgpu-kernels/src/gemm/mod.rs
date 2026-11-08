@@ -56,6 +56,8 @@ pub struct GemmConfig {
     /// fragment of 16 rows x 128 bytes is one contiguous 2 KB block of the preshuffled B: the lane's two 16-byte reads at the same offsets
     /// as in the LDS image); the in-place reloads of tile t + 1 are global loads
     pub reg_b: bool,
+    /// `Scales::Mx32` with the shuffled scale layout [rows / 16][KT / 2][64 lanes][4 bytes] (one coalesced dword per lane, block and tile pair)
+    pub scale_shuf: bool,
 }
 
 /// Implicit-GEMM convolution, NDHWC input [NB, DI, H, W, C] bf16 (2d: DI = 1, kernel depth 1), weights [K][C / 64][T][R][S][64] (the 128-byte
@@ -162,7 +164,7 @@ pub enum Scales {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, reg_b: false }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, reg_b: false, scale_shuf: false }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -200,7 +202,11 @@ impl GemmConfig {
     /// MXFP4 A4W4 with a 128 x 128 CTA.
     /// MXFP4 with the register-staged B (`reg_b`)
     pub fn a4w4_rb() -> GemmConfig {
-        GemmConfig { reg_b: true, ..GemmConfig::a4w4() }
+        GemmConfig { reg_b: true, scale_shuf: true, ..GemmConfig::a4w4() }
+    }
+    /// MXFP4 with the shuffled scales only (B through LDS)
+    pub fn a4w4_ss() -> GemmConfig {
+        GemmConfig { scale_shuf: true, ..GemmConfig::a4w4() }
     }
     pub fn a4w4_128() -> GemmConfig {
         GemmConfig { cta_m: 128, cta_n: 128, ..GemmConfig::a4w4() }
@@ -887,7 +893,7 @@ impl Body {
         let (_, (next, early)) = u.capture(b, "tile.setup", |b| {
             let next = t.staged.then(|| (self.a_rd.at(b, &self.a_s.at(&t.next)), self.b_rd.at(b, &self.b_s.at(&t.next))));
             // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and installed at the end (partial lgkm waits)
-            let early = (t.staged && !(self.regb.is_some() && std::env::var("EXP_NOSC").is_ok())).then(|| self.load_scales(b, ox(t.it) + 1));
+            let early = t.staged.then(|| self.load_scales(b, ox(t.it) + 1));
             (next, early)
         });
         // MMAs of the register tile with the in-place reloads of t+1 (into `u`)
@@ -911,15 +917,12 @@ impl Body {
                     if let (true, Some((ar, _))) = (lo == half, &next) {
                         // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
                         u.capture(b, format!("reload.a{i}"), |b| {
-                            if self.regb.is_some() && std::env::var("EXP_NOA").is_ok() {
-                                return;
-                            }
                             let v = ar.read(b, i);
                             b.set_var(av[i], v);
                         });
                     }
                 }
-                if let (Some((_, br)), false) = (&next, self.regb.is_some() && std::env::var("EXP_NOB").is_ok()) {
+                if let Some((_, br)) = &next {
                     for j in lo..hi {
                         u.capture(b, format!("reload.b{j}"), |b| {
                             let v = if self.regb.is_some() { self.b_global(b, ox(t.it) + 1, j, false) } else { br.read(b, j) };
@@ -949,7 +952,7 @@ impl Body {
         if !pend.is_empty() {
             u.capture(b, "bs.fma", |b| bs_fma(b, &pend));
         }
-        if let (Some((sa, sb)), false) = (early, self.regb.is_some() && std::env::var("EXP_NOINST").is_ok()) {
+        if let Some((sa, sb)) = early {
             u.capture(b, "scales.install", |b| {
                 for (i, v) in sa.iter().enumerate() {
                     let w = self.scale_word(b, *v);
@@ -1195,6 +1198,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         }
         "gemm_a4w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4", GemmConfig::a4w4())),
         "gemm_a4w4_mxfp4_rb" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_rb", GemmConfig::a4w4_rb())),
+        "gemm_a4w4_mxfp4_ss" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_ss", GemmConfig::a4w4_ss())),
         "gemm_a4w4_mxfp4_128" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_128", GemmConfig::a4w4_128())),
         _ => None,
     }
@@ -1623,7 +1627,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let rowb = b.bind_i32(ev(kb_v) << 3);
         let a0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * (wave_m as i32) + ev(r16));
         let b0 = b.bind_i32((ev(bx) << lg_n) + ev(wn) * (wave_n as i32) + ev(r16));
-        let (voff_a, voff_b) = if cfg.reg_b {
+        let (voff_a, voff_b) = if cfg.scale_shuf {
             // shuffled: block (row / 16) of [rows / 16][KT / 2][64][4]: (row / 16) KT 128 + 4 lane (KT even)
             let blk = b.bind_i32(ev(kb_v) << 7);
             let l4 = b.bind_i32(lane.lane() << 2);
@@ -1642,7 +1646,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         // v_perm selector: byte 0 = byte g of the low word (S1 bytes 0..3), byte 1 = byte g of the high word (S0 bytes 4..7), bytes 2, 3 = 0
         let gg = b.bind_i32(lane.lane().lshr(4));
         let shift = b.bind_i32(ev(gg) + ((ev(gg) + 4) << 8) + 0x0C0C_0000);
-        Mx32 { voff_a, voff_b, shift, shuf: cfg.reg_b.then(|| std::cell::RefCell::new(None)) }
+        Mx32 { voff_a, voff_b, shift, shuf: cfg.scale_shuf.then(|| std::cell::RefCell::new(None)) }
     });
     let body = Body {
         cfg, kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
