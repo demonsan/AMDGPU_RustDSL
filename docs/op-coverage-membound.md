@@ -15,13 +15,13 @@
 | 行内 | add_rmsnorm / layernorm / softmax | 5.8 / 5.35 / 5.5–6.0 TB/s | layernorm、softmax 受两遍规约 + VALU 限制（短行更低：N = 200 为 3.9 / 4.3） |
 | 量化 | per-token / group128 fp8、int8、静态 fp8、silu_mul_quant | 5.7–6.4 TB/s | 与 aiter 同轮：fp8 per-token 1.08×（N = 1000 为 1.45×）、group128 1.10×、silu_mul_quant 1.11×、int8 1.04–1.26×；静态 fp8 0.97× |
 | 反量化 | dequant fp8 → bf16（static / token / group128） | 6.0–6.4 TB/s（N = 1000：5.3） | scalef32 转换只吃 2 的幂 scale，一般 scale 用显式乘法 |
-| RoPE / cache | RoPE neox / gptj（含部分旋转） | 6.3–6.8 TB/s | H = 1 的情形仍只有 22 % |
+| RoPE / cache | RoPE neox / gptj（含部分旋转） | 6.3–6.8 TB/s；H = 1, D = 64 / 128：7.1 / 9.2（按含 cos / sin 表的流量） | 小 H 一个 wave 装多个 token（见下） |
 | RoPE / cache | KV-cache 写（flash / vLLM 分块） | 5.8 / 0.9–1.5 TB/s | 分块布局的 value 是 2 字节散写，regular 策略，不是流式 |
 | MoE | topk_softmax（含 renorm） | E = 128, K = 8：T = 65536 为 21 µs（DPP 归约后 +9–19 %） | 小 T 比 aiter 快 1.6–1.8×，大 T 0.87–0.92× |
 | MoE | moe_sorting（单 block / 多 block 原子 / 多 block 稳定顺序） | 10–18 µs（≤ 几千对）/ 31 µs（26 万对）/ 105 µs（稳定，26 万对） | 格式与 aiter `moe_sorting` 一致，附 `tile_start` |
 | 采样 | argmax / 温度采样 / top-k + top-p | 4.3 TB/s / 0.7–1.3 TB/s 等效 / 130–240 µs 每行 | 覆盖版本；top-k / top-p 用阈值二分，不排序 |
 
-未做 / 已知差距：H = 1 RoPE（一个 wave 多个 token）；layernorm / softmax 的短行与 N = 400–511 的行布局；采样的性能版本（直方图 top-k / top-p，一行多 block）；> 4 GiB 的 cache / 张量（要 64 位寻址，B1）；vLLM 分块 cache 的整行转置写；aiter 同轮对比没有覆盖 layernorm、row softmax、RoPE、cache、moe_sorting、采样（无法脱离 torch 独立编译）。
+未做 / 已知差距：layernorm / softmax 的短行与 N = 400–511 的行布局；采样的性能版本（直方图 top-k / top-p，一行多 block）；> 4 GiB 的 cache / 张量（要 64 位寻址，B1）；vLLM 分块 cache 的整行转置写；aiter 同轮对比没有覆盖 layernorm、row softmax、RoPE、cache、moe_sorting、采样（无法脱离 torch 独立编译）。
 ## 流式逐元素（模板 T1）
 
 | kernel | 语义 | 配置 | VGPR | 带宽（GB/s，≈1 GB 流量） | 占 roofline（6.0 TB/s） |
@@ -264,3 +264,7 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 | layernorm N = 200 | — | 3854 |
 
 softmax 与 layernorm 的短行仍然只有 rmsnorm 的 60–80 %（两遍规约 + 更多 VALU，加载的字节更少）；N = 400 – 511 的行仍是一个 wave 的 64 lane 里用 50 个，下一步是为它们加一个"两行占三个 wave"的布局或把 chunk 数不是 2 的幂的行放进 `g = 64` 组里并排两行。
+
+## RoPE：小 H 时一个 wave 装多个 token
+
+一个 token 只用 `H · L` 个 lane（L = 每个 head 的 lane 数：NeoX 为 D / 16、GPT-J 为 D / 8），`H · L < 64` 时大半个 wave 空闲（H = 1, D = 64 只有 4 个 lane：此前 1300 GB/s，22 %）。当 `H · L ≤ 32` 且是 2 的幂时，一个 wave 装 `64 / (H · L)` 个 token（H = 1, D = 64：16 个），一个 block 4 个 wave，grid = ⌈T / (4 · tpw)⌉；位置和 cos / sin 表行因此是向量值（每个 lane 组自己的 token），越界 token 的 store 被屏蔽。名字与 ABI 不变。主机测试 `rope_host`（T = 29 … 41 的奇数 token 数，H ∈ {1, 2, 4, 8}，D ∈ {64, 128}，neox / gptj）`bad = 0`。带宽（GB/s，流量把每个 token 的 cos / sin 行也算上，它们在 L2 里，所以高于真实 HBM 流量）：H = 1, D = 64（neox）7062；H = 1, D = 128：9250；H = 2, D = 64：6193；H = 4, D = 128：7174；H = 1, D = 64（gptj）7419。

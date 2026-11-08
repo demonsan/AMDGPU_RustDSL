@@ -13,6 +13,7 @@ const KERNELS: &[&str] = &[
     "argmax_bf16_v32000", "argmax_bf16_v128256", "argmax_bf16_v8", "sample_bf16_v32000", "sample_bf16_v128256", "sample_bf16_v1000",
     "moe_count_e128_k8", "moe_scan_e128_k8_b32", "moe_scatter_e128_k8_b32", "moe_scatter_ord_e128_k8_b32", "moe_count_e256_k8", "moe_scan_e256_k8_b128", "moe_scatter_ord_e256_k8_b128",
     "sample_topkp_bf16_v32000", "sample_topkp_bf16_v128256", "sample_topkp_bf16_v1000",
+    "rope_neox_bf16_h1_d64", "rope_neox_bf16_h2_d128", "rope_gptj_bf16_h1_d64", "rope_neox_bf16_h4_d64_r32",
     "topk_softmax_bf16_e128_k8", "topk_softmax_renorm_bf16_e256_k8", "topk_softmax_bf16_e64_k2", "topk_softmax_bf16_e512_k4", "topk_softmax_bf16_e32_k1",
 ];
 
