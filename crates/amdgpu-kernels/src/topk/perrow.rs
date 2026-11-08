@@ -41,6 +41,9 @@ const RES: i32 = 1408;
 const CNT: i32 = 1424;
 const SINK: i32 = 1440;
 const LDS: u32 = 1440 + 4096;
+/// loads per thread in flight per iteration (the passes are latency-bound: 4 per iteration left a row of 64 K at about 1 us per 4 K elements and pass)
+const UN: i32 = 16;
+const UN_SHIFT: i32 = 14;   // log2(UN * 1024)
 
 pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Function {
     let mut fb = FnBuilder::new(name, 1024);
@@ -152,7 +155,7 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
     let tcl4 = b.bind_i32(ev(tcl) << 2);
     let sink_bin = b.bind_i32(256 + (ev(tid) & 63));
     let sink_e = b.bind_i32((ev(tid) << 2) + SINK);
-    let iters = b.bind_i32((ev(len) + 4095) >> 12);
+    let iters = b.bind_i32((ev(len) + (UN * 1024 - 1) as i32) >> UN_SHIFT);
     let oob = b.c_i32(0x7fff_ff00);
     let kc = b.c_i32(k as i32);
     let long_row = b.cmp(CmpPred::Gt, CmpTy::I32, len, kc);
@@ -190,8 +193,8 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
                 b.break_if(done);
                 let vit_v = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
                 let mut loaded = Vec::new();
-                for u in 0..4i32 {
-                    let idx = b.bind_i32((ev(vit_v) << 12) + (u * 1024) as i32 + ev(tid));
+                for u in 0..UN {
+                    let idx = b.bind_i32((ev(vit_v) << UN_SHIFT) + (u * 1024) as i32 + ev(tid));
                     let off = b.bind_i32(ev(rowb) + (ev(idx) << 2));
                     let x = b.buffer_load_f32(r_l, off, 0i32, 0);
                     let ok = b.cmp(CmpPred::Lt, CmpTy::I32, idx, len);
@@ -309,8 +312,8 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
             b.break_if(done);
             let vit_v = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
             let mut loaded = Vec::new();
-            for u in 0..4i32 {
-                let idx = b.bind_i32((ev(vit_v) << 12) + (u * 1024) as i32 + ev(tid));
+            for u in 0..UN {
+                let idx = b.bind_i32((ev(vit_v) << UN_SHIFT) + (u * 1024) as i32 + ev(tid));
                 let off = b.bind_i32(ev(rowb) + (ev(idx) << 2));
                 let x = b.buffer_load_f32(r_l, off, 0i32, 0);
                 let ok = b.cmp(CmpPred::Lt, CmpTy::I32, idx, len);
