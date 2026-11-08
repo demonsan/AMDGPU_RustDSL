@@ -84,6 +84,24 @@ int main(int argc, char** argv) {
     nv[0] = pos; nv[1] = M;
     // ---- data ----
     Mx X = rand_mx(rng, M, D, 125), W1 = rand_mx(rng, E * 2 * I, D, 122), W2 = rand_mx(rng, E * D, I, 122);
+    // A16=1 (gemm_moe*_bf16w4*_bm64): bf16 activations X (exact values k / 8), the fp4 weights K-permuted inside every 256-K tile (the
+    // A16W4 GEMM layout, L(p) below), stage 2 takes the bf16 stage-1 output as is
+    const bool a16 = envi("A16", 0) != 0;
+    std::vector<uint16_t> xb16((size_t)M * D);
+    std::vector<float> xf((size_t)M * D);
+    for (size_t i = 0; i < xb16.size(); i++) { float v = ((int)(rng() % 33) - 16) / 8.0f; uint32_t u; memcpy(&u, &v, 4); xb16[i] = (uint16_t)(u >> 16); xf[i] = v; }
+    auto xval = [&](size_t t, int d) -> double { return a16 ? xf[t * D + d] : X.v(t, d); };
+    auto kperm = [&](std::vector<uint8_t>& q, long rows, int K) {
+        std::vector<uint8_t> o(q.size(), 0);
+        for (long r = 0; r < rows; r++)
+            for (int k = 0; k < K; k++) {
+                int T = k / 256, p = k % 256;
+                int L = 128 * (p / 128) + 16 * ((p / 64) % 2) + 8 * ((p / 32) % 2) + 32 * ((p / 8) % 4) + p % 8;
+                size_t src = (size_t)r * K + 256 * T + L, dst = (size_t)r * K + k;
+                o[dst / 2] |= ((q[src / 2] >> (4 * (src & 1))) & 15) << (4 * (dst & 1));
+            }
+        q.swap(o);
+    };
     // ours: W1 gate / up rows interleaved in 16-row blocks (row 32 q + r = gate 16 q + r, 32 q + 16 + r = up 16 q + r), scales the same order
     std::vector<uint8_t> w1q(W1.q.size()), w1s(W1.s.size());
     for (int e = 0; e < E; e++)
@@ -93,8 +111,10 @@ int main(int argc, char** argv) {
             memcpy(&w1q[d0 * D / 2], &W1.q[s0 * D / 2], D / 2);
             memcpy(&w1s[d0 * D / 32], &W1.s[s0 * D / 32], D / 32);
         }
-    auto w1sh = shuffle_b(w1q, (long)E * 2 * I, D / 2), w2sh = shuffle_b(W2.q, (long)E * D, I / 2);
-    void *dX = dev(X.q), *dXs = dev(X.s), *dW1 = dev(w1sh), *dW1s = dev(w1s), *dW2 = dev(w2sh), *dW2s = dev(W2.s);
+    std::vector<uint8_t> w2q = W2.q;
+    if (a16) { kperm(w1q, (long)E * 2 * I, D); kperm(w2q, (long)E * D, I); }
+    auto w1sh = shuffle_b(w1q, (long)E * 2 * I, D / 2), w2sh = shuffle_b(w2q, (long)E * D, I / 2);
+    void *dX = a16 ? (void*)dev(xb16) : (void*)dev(X.q), *dXs = dev(X.s), *dW1 = dev(w1sh), *dW1s = dev(w1s), *dW2 = dev(w2sh), *dW2s = dev(W2.s);
     void *dsid = dev(sid), *dseid = dev(seid), *dnv = dev(nv), *dsw = dev(sw);
     void *dY1, *dY1q, *dY1s, *dT, *dO;
     HC(hipMalloc(&dY1, (size_t)M * TK * I * 2)); HC(hipMalloc(&dY1q, (size_t)M * TK * I / 2 + 256)); HC(hipMalloc(&dY1s, (size_t)M * TK * I / 32 + 256));
@@ -107,7 +127,8 @@ int main(int argc, char** argv) {
     for (auto& v : b1) v = ((int)(rng() % 64) - 32) / 8.0f;
     for (auto& v : b2) v = ((int)(rng() % 64) - 32) / 8.0f;
     void *db1 = dev(b1), *db2 = dev(b2);
-    hipFunction_t f1 = load(oss ? "gemm_moe1_fp4_oss" + bms : "gemm_moe1_fp4_silu" + bms), f2 = load((oss ? "gemm_moe2_fp4_oss" : "gemm_moe2_fp4") + bms),
+    const std::string dt = a16 ? "bf16w4" : "fp4";
+    hipFunction_t f1 = load("gemm_moe1_" + dt + (oss ? "_oss" : "_silu") + bms), f2 = load("gemm_moe2_" + dt + (oss ? "_oss" : "") + bms),
                   fs = load("moe_sum_bf16_k" + std::to_string(TK));
     auto gemm_args = [&](void* A, void* B, void* C, int m, int n, int k, void* sa, void* sb, int nout) {
         std::vector<uint8_t> a(oss ? 152 : 144, 0);
@@ -119,7 +140,7 @@ int main(int argc, char** argv) {
         return a;
     };
     auto a1 = gemm_args(dX, dW1, dY1, M, 2 * I, D, dXs, dW1s, I);
-    auto a2 = gemm_args(dY1q, dW2, dT, M * TK, D, I, dY1s, dW2s, D);
+    auto a2 = gemm_args(a16 ? dY1 : dY1q, dW2, dT, M * TK, D, I, dY1s, dW2s, D);
     if (oss) { memcpy(&a1[144], &db1, 8); memcpy(&a2[144], &db2, 8); }
     std::vector<uint8_t> as(24, 0);
     memcpy(&as[0], &dT, 8); memcpy(&as[8], &dO, 8); memcpy(&as[16], &M, 4); memcpy(&as[20], &D, 4);
@@ -139,7 +160,7 @@ int main(int argc, char** argv) {
             int e = ids[t * TK + k];
             for (int c = 0; c < I; c++) {
                 double g = 0, u = 0;
-                for (int d = 0; d < D; d++) { double x = X.v(t, d); g += x * W1.v((size_t)e * 2 * I + c, d); u += x * W1.v((size_t)e * 2 * I + I + c, d); }
+                for (int d = 0; d < D; d++) { double x = xval(t, d); g += x * W1.v((size_t)e * 2 * I + c, d); u += x * W1.v((size_t)e * 2 * I + I + c, d); }
                 if (oss) { g += b1[(size_t)e * 2 * I + c]; u += b1[(size_t)e * 2 * I + I + c]; g = std::min(g, 7.0); u = std::max(std::min(u, 7.0), -7.0); }
                 double ref = oss ? (u + 1) * g / (1 + std::exp(-1.702 * g)) : g / (1 + std::exp(-g)) * u, got = bf(y1[((size_t)t * TK + k) * I + c]);
                 double err = std::fabs(got - ref);
@@ -158,6 +179,7 @@ int main(int argc, char** argv) {
         }
     HC(hipMemcpy(dY1q, yq.data(), yq.size(), hipMemcpyHostToDevice)); HC(hipMemcpy(dY1s, ys.data(), ys.size(), hipMemcpyHostToDevice));
     Mx YQ{yq, ys, M * TK, I};
+    auto yval = [&](size_t r, int i) -> double { return a16 ? (double)bf(y1[r * I + i]) : YQ.v(r, i); };
     // ---- stage 2 + sum + check ----
     launch(f2, a2, D / 128, nblk);
     launch(fs, as, D / 1024, M);
@@ -171,7 +193,7 @@ int main(int argc, char** argv) {
             for (int k = 0; k < TK; k++) {
                 int e = ids[t * TK + k];
                 double acc = 0;
-                for (int i = 0; i < I; i++) acc += YQ.v((size_t)t * TK + k, i) * W2.v((size_t)e * D + d, i);
+                for (int i = 0; i < I; i++) acc += yval((size_t)t * TK + k, i) * W2.v((size_t)e * D + d, i);
                 if (oss) acc += b2[(size_t)e * D + d];
                 ref += tw[t * TK + k] * acc;
             }

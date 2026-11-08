@@ -446,7 +446,7 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, p
         return declare_contract_conv(b, cta_m, cta_n, cc);
     }
     if let Some(st) = moe {
-        return declare_contract_moe(b, cta_m, cta_n, scales, per_tile, st, moe_bias);
+        return declare_contract_moe(b, cta_m, cta_n, scales, per_tile, st, moe_bias, a8w4);
     }
     let (mt, nt) = (Ext::sym("MT"), Ext::sym("NT"));
     // int32 offsets: M K, N K and 2 M N stay below 2^31 (16384 x 65536 tiles of bytes at most)
@@ -559,7 +559,7 @@ fn declare_contract_conv(b: &mut FnBuilder, cta_m: i64, cta_n: i64, cc: ConvCfg)
 
 /// The MoE contract: MT = max M tiles (grid y), NT = output N tiles (grid x), A rows m (tokens or tokens x topk), B rows per expert n, E
 /// experts, KT 128-byte K tiles.
-fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, st: MoeStage, moe_bias: bool) {
+fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, st: MoeStage, moe_bias: bool, a_images: usize) {
     if moe_bias {
         b.arg("ptr_bias", DType::Ptr, 144, 8);
     }
@@ -597,7 +597,8 @@ fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scale
     b.ka_is(136, n_out.clone());
     b.grid_is(0, nt);
     b.grid_is(1, mt.clone());
-    b.arg_tensor("ptr_a", m.clone() * k.clone());
+    // (mixed precision: a_images A images of 128 bytes per 128-byte B tile)
+    b.arg_tensor("ptr_a", m.clone() * k.clone() * Ext::c(a_images as i64));
     b.arg_tensor("ptr_b", ee.clone() * n.clone() * k);
     if moe_bias {
         b.arg_tensor("ptr_bias", ee.clone() * n.clone() * Ext::c(4));
@@ -1374,6 +1375,9 @@ pub fn by_name(name: &str) -> Option<Function> {
                 (Elem::Fp8Bs, Scales::Block128)
             } else if n.contains("_fp8") {
                 (Elem::Fp8, Scales::RowCol)
+            } else if n.contains("_bf16w4") {
+                // A16W4: bf16 A (exact) x MXFP4 B dequantized in the mainloop (K-permuted B, unshuffled [rows][K / 32] scales); 64-row tiles
+                (Elem::Bf16W4, Scales::Mx32)
             } else if n.contains("_fp4") {
                 // MXFP4 A x MXFP4 B (1 x 32 E8M0, unshuffled [rows][K / 32])
                 (Elem::Fp4, Scales::Mx32)
@@ -1393,6 +1397,13 @@ pub fn by_name(name: &str) -> Option<Function> {
             };
             let cfg = GemmConfig::moe(elem, scales, st);
             let cfg = GemmConfig { moe_bias: oss, ..cfg };
+            // A16W4: every MMA in the tile body, block_m 64 (four bf16 A images per slot)
+            let cfg = if elem == Elem::Bf16W4 {
+                assert!(bm64, "a16w4 MoE: block_m 64 (`_bm64`)");
+                GemmConfig { pre_sync_mmas: 0, mid_sync_mmas: 0, scale_shuf: false, ..cfg }
+            } else {
+                cfg
+            };
             Some(gemm_mxfp8_bs(n, if bm64 { GemmConfig { cta_m: 64, ..cfg } } else { cfg }))
         }
         n if n.starts_with("gemm_splitk_reduce_s") => {
@@ -1676,7 +1687,8 @@ impl skeleton_v4::V4Slots for GemmSlots {
         None => dma_plan_rows_pad(b, &ctx, &s_tid, cta_m, &a_glob, 8192, 4),
         Some(mc) => {
             let mc = mc.clone();
-            dma_plan_gather(b, &lane, cta_m, 4, k_v, &|b, r| {
+            // (mixed precision: the A row stride is the A element's K bytes)
+            dma_plan_gather(b, &lane, cta_m, 4, ka_v, &|b, r| {
                 // source row of sorted row row0 + r: the token (stage 1) or token topk + slot (stage 2), clamped inside A
                 let vo = b.bind_i32(r << 2);
                 let so = { let v = b.bind_i32(ev(mc.row0) << 2); b.read_first_lane(v) };

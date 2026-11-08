@@ -24,6 +24,15 @@ fn group4(b: &mut FnBuilder, x: ValueId, max: bool) -> ValueId {
 /// `kt` keys per tile and wave: 32 (a 16 KB private K / V region: two CTAs of 4 waves per CU; large batches) or 64 (32 KB, one CTA per CU;
 /// small grids: more keys per wave). `crate::dispatch::decode16_config` picks it with the split count.
 pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
+    pa_decode16_x(name, page, kt, false)
+}
+
+/// `fp8` (`pa_decode16_fp8_hd128_p<P>`): an fp8 e4m3 KV cache with per-tensor scales (`reshape_cache_flash_fp8_h<Hk>_d128`: [pages, P, HK,
+/// 128] bytes; k_scale @208, v_scale @224 f32). K: an fp8 tile (rows of 128 bytes, chunk ^ key % 8), each QK operand 8 bytes -> 8 bf16
+/// (exact); V: the fp8 rows staged, then converted into the bf16 V tile the transposed reads use. k_scale folds into the softmax scale,
+/// v_scale into the output.
+pub fn pa_decode16_x(name: &str, page: i32, kt: i32, fp8: bool) -> Function {
+    assert!(!fp8 || kt == 32, "decode16 fp8: 32-key tiles");
     assert!(kt == 32 || kt == 64, "decode16: 32- or 64-key tiles");
     #[allow(non_snake_case)]
     let KT = kt;
@@ -39,6 +48,12 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
     for (n, i) in [("H", 7u32), ("HK", 8), ("max_pages", 9), ("num_pages", 10), ("S", 11)] {
         b.arg(n, DType::I32, 16 * i, 4);
     }
+    if fp8 {
+        b.arg("k_scale", DType::F32, 208, 4);
+        b.arg("v_scale", DType::F32, 224, 4);
+    }
+    // KV cache bytes per (token, head) row
+    let krow: i32 = if fp8 { D } else { ROW };
     // ---- contract ----
     let (hh, hk, mp, np, ss) = (Ext::ka(112), Ext::ka(128), Ext::ka(144), Ext::ka(160), Ext::ka(176));
     b.sym_range("G", 1, 16);
@@ -53,7 +68,7 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
     b.grid_is(2, ss.clone());
     let bb = Ext::sym("B");
     b.arg_tensor("ptr_q", bb.clone() * hh.clone() * Ext::c(ROW as i64));
-    let cache = np * Ext::c(page as i64) * hk * Ext::c(ROW as i64);
+    let cache = np * Ext::c(page as i64) * hk * Ext::c(krow as i64);
     b.arg_tensor("ptr_k", cache.clone());
     b.arg_tensor("ptr_v", cache);
     b.arg_tensor("ptr_bt", bb.clone() * mp * Ext::c(4));
@@ -118,7 +133,7 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
 
     // ---- descriptors ----
     let r_q = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_q, n) };
-    let page_bytes = page * ROW;
+    let page_bytes = page * krow;
     let r_k = { let n = b.bind_i32(ev(npages) * ev(hkv_n) * page_bytes); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_k, n) };
     let r_v = { let n = b.bind_i32(ev(npages) * ev(hkv_n) * page_bytes); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_v, n) };
     let r_bt = { let n = b.bind_i32((ev(bat) + 1) * ev(maxp) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_bt, n) };
@@ -134,11 +149,14 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
     // ---- private LDS: per wave K (16 KB) + V (16 KB), as decode.rs ----
     let mut lds = LdsPlan::new();
     // K and V in separate private regions (their DMAs complete separately: QK waits for K only)
-    let kreg = lds.private("K", (KT * ROW) as i64, 4, &[]);
+    let kreg = lds.private("K", (KT * krow) as i64, 4, &[]);
     let vreg = lds.private("V", (KT * ROW) as i64, 4, &[]);
+    // fp8: the staged fp8 V rows (converted into the bf16 V tile)
+    let vsreg = fp8.then(|| lds.private("VS", (KT * D) as i64, 4, &[]));
     lds.commit(&mut b);
     let me = kreg.mine(wv);
     let mev = vreg.mine(wv);
+    let mvs = vsreg.as_ref().map(|r| r.mine(wv));
     let mbase = me.base();
     let vbase0 = mev.base();
     let l16 = b.bind_i32(lane.lane() & 15);
@@ -149,6 +167,14 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
     let vr = b.bind_i32((ev(grp) * 4 + ev(l16).lshr(2)) * ROW + ((ev(l16) & 3) << 3));
     let c_l2e = b.c_f32(std::f32::consts::LOG2_E);
     let csc = b.mul_f32(scale, c_l2e);
+    // fp8: the K scale folds into the softmax scale, the V scale into the output
+    let (csc, vsc) = if fp8 {
+        let ks = b.let_(Op::KernargF32 { offset: 208 });
+        let vs = b.let_(Op::KernargF32 { offset: 224 });
+        (b.mul_f32(csc, ks), Some(vs))
+    } else {
+        (csc, None)
+    };
     let neg_inf = b.c_f32(f32::NEG_INFINITY);
     let kind = MmaKind::new(MmaShape::M16N16K32, MmaTy::Bf16);
     let zero4 = b.frag_zero(DType::Frag4);
@@ -166,9 +192,10 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
     let itx = amdgpu_dsl::varx(it);
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << LKT)); b.read_first_lane(v) };
     b.wait_lds(0);
-    let lookups: Vec<(ValueId, ValueId)> = (0..KT / 4)
+    let lookups: Vec<(ValueId, ValueId)> = (0..if fp8 { KT / 8 } else { KT / 4 })
         .map(|i| {
-            let key = b.bind_i32(ev(key_t) + kk_of(i));
+            // (fp8 rows of 128 bytes: 8 lanes per key, keys 8 i + l / 8)
+            let key = if fp8 { b.bind_i32(ev(key_t) + (lane.lane().lshr(3)) + 8 * i) } else { b.bind_i32(ev(key_t) + kk_of(i)) };
             let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
             let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
             (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
@@ -181,31 +208,61 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
         .map(|&(kc, pv)| {
             let pg = b.bitcast_i32(pv);
             let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
-            (kc, b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW))
+            (kc, b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * krow))
         })
         .collect();
+    let l8 = b.bind_i32(lane.lane() & 7);
     me.write(&mut b, Opnd::Var(it), |b| {
         for (i, &(kc, rowoff)) in rows.iter().enumerate() {
-            let kvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4));
+            // (fp8: chunk ^ key % 8 within the 8-chunk row)
+            let kvo = if fp8 { b.bind_i32(ev(rowoff) + ((ev(l8) ^ (ev(kc) & 7)) << 4)) } else { b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4)) };
             let m0k = b.bind_i32(mbase.clone() + ((i as i32) << 10));
             b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
         }
     });
-    mev.write(&mut b, Opnd::Var(it), |b| {
-        for (i, &(_, rowoff)) in rows.iter().enumerate() {
-            let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
-            let m0v = b.bind_i32(vbase0.clone() + ((i as i32) << 10));
-            b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
+    match &mvs {
+        Some(ms) => {
+            let sb = ms.base();
+            ms.write(&mut b, Opnd::Var(it), |b| {
+                for (i, &(_, rowoff)) in rows.iter().enumerate() {
+                    let vvo = b.bind_i32(ev(rowoff) + (ev(l8) << 4));
+                    let m0v = b.bind_i32(sb.clone() + ((i as i32) << 10));
+                    b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
+                }
+            });
         }
-    });
+        None => mev.write(&mut b, Opnd::Var(it), |b| {
+            for (i, &(_, rowoff)) in rows.iter().enumerate() {
+                let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
+                let m0v = b.bind_i32(vbase0.clone() + ((i as i32) << 10));
+                b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
+            }
+        }),
+    }
     b.wait_vm(nv);
     // ---- S^T: 4 blocks of 16 keys x 4 d chunks (block inner: independent chains) ----
     let kb = b.bind_i32(mbase.clone());
     me.read_back(&mut b, Opnd::Var(it), |b| {
         for c in 0..4usize {
             for blk in 0..NKB as i32 {
-                let a = b.bind_i32(ev(kr[c]) + ev(kb) + blk * 16 * ROW);
-                let kf = b.load_lds_b128(a);
+                let kf = if fp8 {
+                    // 8 fp8 (d 32 c + 8 g ..) -> 8 bf16: chunk (2 c + g / 2) ^ (key % 8), half g % 2
+                    let ch = b.bind_i32(ev(grp).lshr(1) + 2 * c as i32);
+                    let a = b.bind_i32(ev(kb) + (16 * blk + ev(l16)) * krow + (((ev(ch) ^ (ev(l16) & 7))) << 4) + ((ev(grp) & 1) << 3));
+                    let w2 = b.load_lds_b64(a);
+                    let one = b.c_f32(1.0);
+                    let ws: Vec<ValueId> = (0..2u8)
+                        .flat_map(|dw| [(dw, 0u8), (dw, 1u8)])
+                        .map(|(dw, sel)| {
+                            let x = b.frag2_lane(w2, dw);
+                            b.cvt(amdgpu_dsl::CvtOp::ScalePkBf16Fp8, &[Opnd::Val(x), Opnd::Val(one)], sel)
+                        })
+                        .collect();
+                    b.pack4(ws[0], ws[1], ws[2], ws[3])
+                } else {
+                    let a = b.bind_i32(ev(kr[c]) + ev(kb) + blk * 16 * ROW);
+                    b.load_lds_b128(a)
+                };
                 b.var_mfma(sv_[blk as usize], kind, kf, qf[c], c == 0);
             }
         }
@@ -265,6 +322,32 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
     let l_new = b.add_f32(Opnd::Var(l_v), ps);
     b.set_var(l_v, l_new);
     b.wait_vm(0);
+    if let Some(ms) = &mvs {
+        // fp8: the staged V rows -> the bf16 V tile (lane: key l / 2, d half l % 2: 64 fp8 -> 64 bf16)
+        let sb = ms.base();
+        let key = b.bind_i32(lane.lane().lshr(1));
+        let hf = b.bind_i32(lane.lane() & 1);
+        let src = b.bind_i32(sb.clone() + ev(key) * D + (ev(hf) << 6));
+        let raw: Vec<ValueId> = ms.read_back(&mut b, Opnd::Var(it), |b| (0..4i32).map(|q| { let a = b.bind_i32(ev(src) + 16 * q); b.load_lds_b128(a) }).collect());
+        let one = b.c_f32(1.0);
+        let dst = b.bind_i32(vbase0.clone() + ev(key) * ROW + (ev(hf) << 7));
+        mev.write(&mut b, Opnd::Var(it), |b| {
+            for (q, f) in raw.iter().enumerate() {
+                let ws: Vec<ValueId> = (0..4u8)
+                    .flat_map(|dw| [(dw, 0u8), (dw, 1u8)])
+                    .map(|(dw, sel)| {
+                        let x = b.frag4_lane(*f, dw);
+                        b.cvt(amdgpu_dsl::CvtOp::ScalePkBf16Fp8, &[Opnd::Val(x), Opnd::Val(one)], sel)
+                    })
+                    .collect();
+                for w in 0..2usize {
+                    let v4 = b.pack4(ws[4 * w], ws[4 * w + 1], ws[4 * w + 2], ws[4 * w + 3]);
+                    let a = b.bind_i32(ev(dst) + (32 * q + 16 * w) as i32);
+                    b.store_lds_b128(a, v4);
+                }
+            }
+        });
+    }
     // ---- O^T += V^T P^T: 2 steps of 32 keys x 8 blocks of 16 d ----
     let vb = b.bind_i32(vbase0.clone() + ev(vr));
     mev.read_back(&mut b, Opnd::Var(it), |b| {
@@ -291,6 +374,7 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
     let pos = b.bind_cond(ev(lbits).gt(0));
     let inv0 = b.rcp_f32(l_tot);
     let inv = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(pos), a: Opnd::Val(inv0), b: Opnd::Val(zf) });
+    let inv = match vsc { Some(vs) => b.mul_f32(inv, vs), None => inv };
     let row_po = b.bind_i32(((ev(bat) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) * (4 * D));
     let big = b.c_i32(0x7fff_fff0);
     let po_vo_r = b.bind_i32(ev(row_po) + (ev(grp) << 4));

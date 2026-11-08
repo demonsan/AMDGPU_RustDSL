@@ -751,6 +751,13 @@ blockscale 128×128（`fp8bs`）的规则：
   - 例如 M2048 D2048 I1024 E8 topk2：stage 1 39 µs，874 TF/s。
   - gpt-oss 形式 `_oss`：每个 expert 带 fp32 bias（stage 1 为 [E][2I]，先 gate 后 up；stage 2 为 [E][D]）。stage 1 的激活为截断的 swiglu：gate = min(g+bg, 7)，up = clamp(u+bu, −7, 7)，y = (up+1)·gate·σ(1.702·gate)。用 host 的 `OSS=1` 测试，全部 bad=0。
   - aiter 没有 fp4 MoE 的 ASM，因此没有厂商对照。
+- **a16w4 MoE（gpt-oss 路径）**：`gemm_moe{1,2}_bf16w4[_oss]_bm64`。
+  - A 为 bf16，精确保留；expert 权重为 MXFP4，在主循环中反量化，与 A16W4 GEMM 相同（权重带 K 置换，scale 不重排）。
+  - 每个 slot 放 4 份 A 镜像，在 gather 的 A 路径上（按 bf16 行字节）；只支持 block_m 64，以容纳 LDS。
+  - 测试用 `moe_fp4_host` 的 `A16=1`，stage 2 直接吃 bf16 中间结果。全部 bad=0。
+  - 性能：M512 D=I=3072 E32 topk4（gpt-oss 尺寸，K 填充到 256 的倍数）+ `_oss`：a16w4 的 stage 1 为 286 µs，a4w4 为 128 µs；M4096 时分别为 1293 µs 与 409 µs。差距来自反量化的 VALU。
+  - 限制：K（即 D 与 I）必须是 256 的倍数，gpt-oss 的 2880 要填充到 3072。
+  - a8w4 MoE 理论上用同一套机制即可得到（`Elem::Fp8W4` 加不重排的 Mx32），但还没有 host 测试，暂未注册。
 - **block_m 64（已完成）**：`gemm_moe{1,2}_*_bm64` 是 64 行 tile。[`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `moe_block_m` 在每专家平均行数 M·topk/E < 128 时选用它。
   - M256 D7168 I2048 E64 topk8，stage 1：fp8 从 420 µs 降到 381 µs（aiter 392，1.03×）；fp8bs 从 530 µs 降到 417 µs（aiter 418，1.0×）。
   - 同一形状的 stage 2 + sum：fp8 251 → 222 µs，fp8bs 262 → 213 µs。
