@@ -283,6 +283,10 @@ impl CachePolicy {
 /// * `ScalePkFp4F32`: srcs[0], srcs[1] f32, srcs[2] scale, srcs[3] old; byte `sel` replaced by the two fp4 values -> I32.
 /// * `PkU8F32`: srcs[0] f32, srcs[1] old; byte `sel` replaced by the value rounded and clamped to u8 -> I32.
 /// * `PkI16I32` / `PkU16U32`: srcs[0], srcs[1] -> two saturated 16-bit values -> U32.
+/// * `Scale2xPk16{Fp6,Bf6}F32`: srcs[0], srcs[1] Frag16 of f32 (elements 0..15, 16..31), srcs[2] scale -> Frag8 whose dwords 0..5 hold the
+///   32 6-bit codes (element i at bits [6 i, 6 i + 6) of the 192 bits; dwords 6, 7 unspecified). fp6 = e2m3, bf6 = e3m2 (OCP MX).
+/// * `ScalePk32{Fp6,Bf6}{F16,Bf16}`: srcs[0] Frag16 of 32 16-bit values (element i = half i % 2 of dword i / 2), srcs[1] scale -> as above.
+/// * `ScalePk32{F16,Bf16}{Fp6,Bf6}`: srcs[0] a Frag8 holding 32 codes in dwords 0..5, srcs[1] scale -> Frag16 of 32 16-bit values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CvtOp {
     PkF32Fp8, PkF32Bf8, F32Fp8, F32Bf8, PkBf8F32,
@@ -290,6 +294,7 @@ pub enum CvtOp {
     ScalePkF32Fp4, ScalePkBf16Fp4, ScalePkF16Fp4,
     ScalePkFp8F32, ScalePkBf8F32, ScalePkFp4F32,
     PkU8F32, PkI16I32, PkU16U32,
+    Scale2xPk16Fp6F32, Scale2xPk16Bf6F32, ScalePk32Fp6F16, ScalePk32Fp6Bf16, ScalePk32Bf6F16, ScalePk32Bf6Bf16, ScalePk32F16Fp6, ScalePk32Bf16Fp6, ScalePk32F16Bf6, ScalePk32Bf16Bf6,
 }
 
 impl CvtOp {
@@ -308,6 +313,9 @@ impl CvtOp {
             ScalePkFp4F32 => (4, DType::I32, 3),
             PkU8F32 => (2, DType::I32, 3),
             PkI16I32 | PkU16U32 => (2, DType::U32, 0),
+            Scale2xPk16Fp6F32 | Scale2xPk16Bf6F32 => (3, DType::Frag8, 0),
+            ScalePk32Fp6F16 | ScalePk32Fp6Bf16 | ScalePk32Bf6F16 | ScalePk32Bf6Bf16 => (2, DType::Frag8, 0),
+            ScalePk32F16Fp6 | ScalePk32Bf16Fp6 | ScalePk32F16Bf6 | ScalePk32Bf16Bf6 => (2, DType::Frag16, 0),
         }
     }
 }
@@ -3383,16 +3391,37 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
             if *sel > max_sel {
                 e.push(format!("cvt {op:?}: select {sel} out of range (0..={max_sel})"));
             }
-            for s in &srcs[..n] {
-                if let Err(x) = expect_dword(f, *s, "cvt operand") {
-                    e.push(x);
+            // the fp6 / bf6 packs take whole fragments (Frag16 / Frag8) except their last (scale) operand
+            let frag = |o: CvtOp, k: usize| -> Option<DType> {
+                use CvtOp::*;
+                match o {
+                    Scale2xPk16Fp6F32 | Scale2xPk16Bf6F32 if k < 2 => Some(DType::Frag16),
+                    ScalePk32Fp6F16 | ScalePk32Fp6Bf16 | ScalePk32Bf6F16 | ScalePk32Bf6Bf16 if k == 0 => Some(DType::Frag16),
+                    ScalePk32F16Fp6 | ScalePk32Bf16Fp6 | ScalePk32F16Bf6 | ScalePk32Bf16Bf6 if k == 0 => Some(DType::Frag8),
+                    _ => None,
+                }
+            };
+            for (k, s) in srcs[..n].iter().enumerate() {
+                match frag(*op, k) {
+                    Some(want) => {
+                        if !matches!(opnd_ty(f, *s), Ok(t) if t == want) {
+                            e.push(format!("cvt {op:?}: operand {k} must be a {want:?}"));
+                        }
+                    }
+                    None => {
+                        if let Err(x) = expect_dword(f, *s, "cvt operand") {
+                            e.push(x);
+                        }
+                    }
                 }
             }
             // the scale operand: only its exponent is used (E8M0) - a constant that is not a power of two is certainly a mistake
             let scale_slot = match op {
                 CvtOp::ScalePkBf16Fp8 | CvtOp::ScalePkF16Fp8 | CvtOp::ScalePkBf16Bf8 | CvtOp::ScalePkF16Bf8 | CvtOp::ScalePkF32Fp8 | CvtOp::ScalePkF32Bf8
                 | CvtOp::ScalePkF32Fp4 | CvtOp::ScalePkBf16Fp4 | CvtOp::ScalePkF16Fp4 => Some(1),
-                CvtOp::ScalePkFp8F32 | CvtOp::ScalePkBf8F32 | CvtOp::ScalePkFp4F32 => Some(2),
+                CvtOp::ScalePkFp8F32 | CvtOp::ScalePkBf8F32 | CvtOp::ScalePkFp4F32 | CvtOp::Scale2xPk16Fp6F32 | CvtOp::Scale2xPk16Bf6F32 => Some(2),
+                CvtOp::ScalePk32Fp6F16 | CvtOp::ScalePk32Fp6Bf16 | CvtOp::ScalePk32Bf6F16 | CvtOp::ScalePk32Bf6Bf16 | CvtOp::ScalePk32F16Fp6 | CvtOp::ScalePk32Bf16Fp6
+                | CvtOp::ScalePk32F16Bf6 | CvtOp::ScalePk32Bf16Bf6 => Some(1),
                 _ => None,
             };
             if let Some(k) = scale_slot {
