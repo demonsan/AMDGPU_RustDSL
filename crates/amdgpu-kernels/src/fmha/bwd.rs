@@ -562,21 +562,21 @@ pub fn fmha_bwd_dkdv_x(name: &str, causal: bool, fused: bool) -> Function {
             b.barrier();
             // dQ block (32 queries x 2 x 32 d) over the 128 keys: 8 steps x 2 MFMAs
             let mut acc: Vec<Option<ValueId>> = vec![None, None];
-            dsh.at(&SlotIdx::new(0, Opnd::Val(gen))).read(&mut b, |b| {
-                ksh.at(&SlotIdx::new(0, 0)).read(b, |b| {
-                    for st in 0..8i32 {
-                        let a0 = b.bind_i32(ev(*a_off) + (16 * st) * 128);
-                        let a1 = b.bind_i32(ev(*a_off) + (16 * st + 4) * 128);
-                        let af = b.load_lds_tr_b16x2(a0, a1);
-                        for dd in 0..2usize {
-                            let b0 = b.bind_i32(ev(b_off[dd][0]) + ksh.base as i32 + 16 * st * ROW);
-                            let b1 = b.bind_i32(ev(b_off[dd][1]) + ksh.base as i32 + 16 * st * ROW);
-                            let bfr = b.load_lds_tr_b16x2(b0, b1);
-                            acc[dd] = Some(b.mfma(kind, af, bfr, acc[dd].map(Opnd::Val)));
-                        }
+            for st in 0..8i32 {
+                let af = dsh.at(&SlotIdx::new(0, Opnd::Val(gen))).read(&mut b, |b| {
+                    let a0 = b.bind_i32(ev(*a_off) + dsh.base as i32 + (16 * st) * 128);
+                    let a1 = b.bind_i32(ev(*a_off) + dsh.base as i32 + (16 * st + 4) * 128);
+                    b.load_lds_tr_b16x2(a0, a1)
+                });
+                ksh.at(&SlotIdx::new(0, 0)).read(&mut b, |b| {
+                    for dd in 0..2usize {
+                        let b0 = b.bind_i32(ev(b_off[dd][0]) + ksh.base as i32 + 16 * st * ROW);
+                        let b1 = b.bind_i32(ev(b_off[dd][1]) + ksh.base as i32 + 16 * st * ROW);
+                        let bfr = b.load_lds_tr_b16x2(b0, b1);
+                        acc[dd] = Some(b.mfma(kind, af, bfr, acc[dd].map(Opnd::Val)));
                     }
-                })
-            });
+                });
+            }
             // scale dQ added into the fp32 accumulator: C lane = d column 32 db + l % 32, values = queries 32 qb + 8 (r / 4) + 4 h + r % 4
             let qrow0 = b.bind_i32(ev(tile) * KT + (ev(*qb) << 5) + (ev(half) << 2));
             for dd in 0..2usize {
