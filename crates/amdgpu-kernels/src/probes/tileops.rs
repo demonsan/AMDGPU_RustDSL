@@ -971,3 +971,51 @@ pub fn probe_ptr64_p1() -> Function {
     b.buffer_store_n(rs, Some(Opnd::Val(off4)), 0, 0, one, MemTy::B32, false);
     b.finish()
 }
+
+/// The byte offsets of `probe_big_addr`'s windows (just below / above 4 GiB and 8 GiB) as (offset >> 8, offset & 255).
+/// Window k covers A = [w, w + 256) and B = [w + 256, w + 512): windows 0 / 2 put B across the 4 GiB / 8 GiB line, windows 1 / 3 sit just above it.
+pub const BIG_ADDR_WINDOWS: [(u32, u32); 4] = [(0x00ff_fffe, 0x80), (0x0100_0001, 0x00), (0x01ff_fffe, 0x80), (0x0200_0001, 0x00)];
+
+/// `probe_big_addr(big, res)` (host tests/gpu/big_addr_host.cpp, a 9 GiB `big` buffer): for every window k, lane l writes pattern A
+/// (0xA000_0000 | k << 16 | l) at `window + 4 l` through a descriptor whose base was moved with a SCALAR `ptr_mad`, and pattern B
+/// (0xB000_0000 | k << 16 | l) at `window + 256 + 4 l` through a VECTOR `ptr_mad` pointer; after a wait each lane reads A back through the
+/// vector pointer and B through the descriptor. res[k][dir][l] = 1 when the read matches (512 passes expected).
+pub fn probe_big_addr() -> Function {
+    use amdgpu_dsl::MemTy;
+    let mut b = FnBuilder::new("probe_big_addr", 64);
+    b.arg("big", DType::Ptr, 0, 8);
+    b.arg("res", DType::Ptr, 8, 8);
+    b.arg_tensor("big", amdgpu_dsl::Ext::Const(9i64 << 30));
+    b.arg_tensor("res", amdgpu_dsl::Ext::Const(8 * 256));
+    let big = b.let_(Op::KernargPtr { offset: 0 });
+    let res = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let zero_v = b.let_(Op::MinI32(Opnd::Val(tid), Opnd::I32(0))); // 0, but per-lane: forces the vector path
+    let mut views = Vec::new();
+    for (k, (hi8, rem)) in BIG_ADDR_WINDOWS.iter().enumerate() {
+        let m = b.ptr_mad(big, *hi8 as i32, 256);
+        let r = b.buffer_desc(m, 1024);
+        let va = b.add_i32(tid, (0xA000_0000u32 | (k as u32) << 16) as i32);
+        b.buffer_store_n(r, Some(Opnd::Val(off4)), 0, *rem, va, MemTy::B32, false);
+        let hv = b.add_i32(zero_v, *hi8 as i32);
+        let p = b.ptr_mad(big, hv, 256);
+        let pl = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off4) });
+        let vb = b.add_i32(tid, (0xB000_0000u32 | (k as u32) << 16) as i32);
+        b.store_global(pl, rem + 256, vb, MemTy::B32, false);
+        views.push((r, pl, va, vb, *rem));
+    }
+    b.wait_vm(0);
+    let pres = b.let_(Op::PtrAdd { base: Opnd::Val(res), byte_off: Opnd::Val(off4) });
+    for (k, (r, pl, va, vb, rem)) in views.into_iter().enumerate() {
+        let ga = b.load_global(pl, rem, MemTy::B32);
+        let gb = b.buffer_load_n(r, Some(Opnd::Val(off4)), 0, rem + 256, MemTy::B32);
+        for (dir, (got, want)) in [(ga, va), (gb, vb)].into_iter().enumerate() {
+            let eq = b.cmp(CmpPred::Eq, CmpTy::I32, got, want);
+            let f = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq), a: Opnd::I32(1), b: Opnd::I32(0) });
+            let base = b.let_(Op::PtrAdd { base: Opnd::Val(pres), byte_off: Opnd::I32((256 * (2 * k + dir)) as i32) });
+            b.store_global(base, 0, f, MemTy::B32, false);
+        }
+    }
+    b.finish()
+}
