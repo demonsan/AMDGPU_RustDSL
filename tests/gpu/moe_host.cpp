@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
                     g += (double)xf[(size_t)t * D + d] * w1f[((size_t)e * 2 * I + i) * D + d];
                     u += (double)xf[(size_t)t * D + d] * w1f[((size_t)e * 2 * I + I + i) * D + d];
                 }
-                double a = gelu ? 0.5 * g * (1 + std::tanh(0.7978845608 * (g + 0.044715 * g * g * g))) : g / (1 + std::exp(-g));
+                double a = envi("NOACT", 0) ? g : gelu ? 0.5 * g * (1 + std::tanh(0.7978845608 * (g + 0.044715 * g * g * g))) : g / (1 + std::exp(-g));
                 ycpu[i] = a * u;
                 double got = bf(y1[((size_t)t * TK + k) * I + i]);
                 double err = std::fabs(got - ycpu[i]);

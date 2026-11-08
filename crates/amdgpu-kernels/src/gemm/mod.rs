@@ -1532,7 +1532,7 @@ fn moe_epilogue(
                 }
                 let y: Vec<ValueId> = (0..4)
                     .map(|k| {
-                        let a = if gelu {
+                        let a = if std::env::var("EXP_NOACT").is_ok() { g[k] } else if gelu {
                             // gelu (tanh form): g (1 - 1 / (exp(2 t) + 1)), t = 0.7978845608 (g + 0.044715 g^3)
                             let g2 = b.mul_f32(g[k], g[k]);
                             let c1 = b.c_f32(0.044715);
