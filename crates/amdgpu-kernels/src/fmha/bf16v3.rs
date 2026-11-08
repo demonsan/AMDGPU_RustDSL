@@ -62,54 +62,73 @@ impl Body<'_> {
         let o = self.ring.vs.at(slot).off_v(b);
         o + self.ring.vs.base as i32
     }
-    /// S^T of the tile in `slot`: 4 blocks of 32 keys x 8 MFMAs; into the S variables, or as values (the prologue)
+    /// S^T of the tile in `slot`: 8 k-chunks x 4 blocks of 32 keys; the 4 K fragments of chunk c + 1 are read before the 4 MFMAs of chunk c
+    /// (one group of reads in flight behind the MFMAs; 4 independent accumulator chains); the lane bases are bound once per phase
     fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, into: Option<&[VarId]>) -> Vec<ValueId> {
         let kb = self.kbase(b, slot);
         let (kind, qf, kr) = (self.kind, self.qf, self.kr);
+        let bases: Vec<ValueId> = kr.iter().map(|r| b.bind_i32(ev(*r) + kb.clone())).collect();
         self.ring.ks.at(slot).read(b, |b| {
-            // c outer, block inner: 4 independent accumulator chains back to back (no MFMA -> MFMA dependency stalls)
+            let rd = |b: &mut FnBuilder, c: usize| -> Vec<ValueId> {
+                (0..4).map(|blk| { let a = b.bind_i32(ev(bases[c]) + blk * 32 * ROW); b.load_lds_b128(a) }).collect()
+            };
             let mut acc: Vec<Option<ValueId>> = vec![None; 4];
+            let mut cur = rd(b, 0);
             for c in 0..8usize {
+                let nxt = (c + 1 < 8).then(|| rd(b, c + 1));
                 for blk in 0..4usize {
-                    let a = b.bind_i32(ev(kr[c]) + kb.clone() + blk as i32 * 32 * ROW);
-                    let kf = b.load_lds_b128(a);
                     match into {
-                        Some(v) => b.var_mfma(v[blk], kind, kf, qf[c], c == 0),
-                        None => acc[blk] = Some(b.mfma(kind, kf, qf[c], acc[blk].map(Opnd::Val))),
+                        Some(v) => b.var_mfma(v[blk], kind, cur[blk], qf[c], c == 0),
+                        None => acc[blk] = Some(b.mfma(kind, cur[blk], qf[c], acc[blk].map(Opnd::Val))),
                     }
+                }
+                if let Some(n) = nxt {
+                    cur = n;
                 }
             }
             acc.into_iter().flatten().collect()
         })
     }
-    /// O^T += V^T P^T over the 128 keys of the tile in `slot`: 8 steps of 16 keys x 4 blocks of 32 d
+    /// O^T += V^T P^T over the 128 keys of the tile in `slot`: 8 steps of 16 keys x 4 blocks of 32 d; the 8 transposed reads of step t + 1 are
+    /// issued before the 4 MFMAs of step t
     fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx) {
         let vb = self.vbase(b, slot);
         let (kind, vr) = (self.kind, self.vr);
+        let base = b.bind_i32(ev(vr) + vb);
         let p = self.p.clone();
         let o = self.o.clone();
         self.ring.vs.at(slot).read(b, |b| {
-            for t in 0..8usize {
-                let pf = b.frag4(p[4 * t], p[4 * t + 1], p[4 * t + 2], p[4 * t + 3]);
+            let rd = |b: &mut FnBuilder, t: usize| -> Vec<ValueId> {
                 let (sb, tt) = (t / 2, t % 2);
-                for e in 0..4i32 {
-                    let mut words: Vec<ValueId> = Vec::with_capacity(4);
-                    for r in 0..2i32 {
-                        let a = b.bind_i32(ev(vr) + vb.clone() + (32 * sb as i32 + 16 * tt as i32 + 8 * r) * ROW + 64 * e);
-                        let x = b.load_lds_tr_b16(a);
-                        let w0 = b.frag2_lane(x, 0);
-                        let w1 = b.frag2_lane(x, 1);
-                        words.push(b.bitcast_i32(w0));
-                        words.push(b.bitcast_i32(w1));
-                    }
-                    let vf = b.frag4(words[0], words[1], words[2], words[3]);
-                    b.var_mfma(o[e as usize], kind, vf, pf, false);
+                (0..4i32)
+                    .map(|e| {
+                        let mut words: Vec<ValueId> = Vec::with_capacity(4);
+                        for r in 0..2i32 {
+                            let a = b.bind_i32(ev(base) + (32 * sb as i32 + 16 * tt as i32 + 8 * r) * ROW + 64 * e);
+                            let x = b.load_lds_tr_b16(a);
+                            let w0 = b.frag2_lane(x, 0);
+                            let w1 = b.frag2_lane(x, 1);
+                            words.push(b.bitcast_i32(w0));
+                            words.push(b.bitcast_i32(w1));
+                        }
+                        b.frag4(words[0], words[1], words[2], words[3])
+                    })
+                    .collect()
+            };
+            let mut cur = rd(b, 0);
+            for t in 0..8usize {
+                let nxt = (t + 1 < 8).then(|| rd(b, t + 1));
+                let pf = b.frag4(p[4 * t], p[4 * t + 1], p[4 * t + 2], p[4 * t + 3]);
+                for e in 0..4usize {
+                    b.var_mfma(o[e], kind, cur[e], pf, false);
+                }
+                if let Some(n) = nxt {
+                    cur = n;
                 }
             }
         });
     }
 }
-
 impl PipeBody for Body<'_> {
     fn stage(&mut self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) {
         // group A stages K, group B stages V (each the whole 32 KB tile: 8 issues of 1 KB per wave)
