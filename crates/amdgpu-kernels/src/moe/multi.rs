@@ -528,7 +528,9 @@ pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
             let c0 = b.bin(BinOp::BcntAdd, eq_hi, 0i32);
             let cnt = b.bin(BinOp::BcntAdd, eq_lo, c0);
             // the lanes of the group write the wave's count of this expert (every lane of the group the same value); the others write a dummy slot
-            let wa0 = b.bind_i32(((ev(wave) << 10) + ev(e0)) * 4 + wc);
+            let e0a = b.let_(Op::MinI32(Opnd::Val(e0), Opnd::I32(1023)));
+            let e0c = b.bin(BinOp::MaxI32, e0a, 0i32);
+            let wa0 = b.bind_i32(((ev(wave) << 10) + ev(e0c)) * 4 + wc);
             let dm = b.c_i32(dummy);
             let wa = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq), a: Opnd::Val(wa0), b: Opnd::Val(dm) });
             b.store_lds(wa, cnt, MemTy::B32, false);

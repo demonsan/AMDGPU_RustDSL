@@ -45,7 +45,8 @@ int main(int argc, char** argv) {
         std::multiset<std::pair<uint32_t, uint32_t>> got, ref;   // (packed id, weight bits)
         for (long p = off[e]; p < off[e] + cnt[e]; ++p) { uint32_t wb; std::memcpy(&wb, &sw[p], 4); got.insert({sid[p], wb}); }
         for (long i = 0; i < N; ++i) if (ids[i] == e) { uint32_t wb; std::memcpy(&wb, &w[i], 4); ref.insert({(uint32_t)(((i % K) << 24) | (i / K)), wb}); }
-        if (got != ref) { if (bad < 5) std::fprintf(stderr, "expert %ld: group differs\n", e); ++bad; }\n        if (std::getenv("ORDERED")) { long p = off[e]; for (long i = 0; i < N; ++i) if (ids[i] == e) { uint32_t want = (uint32_t)(((i % K) << 24) | (i / K)); if (sid[p] != want) { if (bad < 5) std::fprintf(stderr, "expert %ld: position %ld holds %08x, stable order wants %08x\n", e, p - off[e], sid[p], want); ++bad; break; } ++p; } }
+        if (got != ref) { if (bad < 5) std::fprintf(stderr, "expert %ld: group differs\n", e); ++bad; }
+        if (std::getenv("ORDERED")) { long p = off[e]; for (long i = 0; i < N; ++i) if (ids[i] == e) { uint32_t want = (uint32_t)(((i % K) << 24) | (i / K)); if (sid[p] != want) { if (bad < 5) std::fprintf(stderr, "expert %ld: position %ld holds %08x, stable order wants %08x\n", e, p - off[e], sid[p], want); ++bad; break; } ++p; } }
         for (long p = off[e] + cnt[e]; p < off[e + 1]; ++p) if (sid[p] != sentinel || sw[p] != 0.f) { if (bad < 5) std::fprintf(stderr, "pad at %ld wrong: %08x\n", p, sid[p]); ++bad; }
     }
     for (long p = total; p < maxp; ++p) if (sid[p] != sentinel || sw[p] != 0.f) { if (bad < 5) std::fprintf(stderr, "tail at %ld wrong: %08x\n", p, sid[p]); ++bad; }
