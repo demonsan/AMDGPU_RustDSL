@@ -11,7 +11,7 @@ pub mod quant;
 pub mod mxquant;
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{bf16x8_to_f32, group_reduce_dpp, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
+use amdgpu_tile::prims::{abs_f32, act, bf16x8_to_f32, fp8_pack, fp8_scale, group_reduce_dpp, lane_reduce, rsqrt_f32, wave_reduce, Act, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,10 +20,22 @@ pub enum RowOp {
     AddRmsNorm,
     LayerNorm,
     Softmax,
+    /// `rmsnorm(x) * gamma * silu(z)` (Mamba2 / gated delta net output norm), bf16 out
+    GatedRmsNorm,
+    /// the same, then per-row dynamic fp8 of the result: `scale[row] = max|y| / 448` (a row = one head when N = head_dim = 128: aiter `gated_rmsnorm_fp8_group_quant`)
+    GatedRmsNormQuant,
+    /// `res_out = bf16(x + res)`, then rmsnorm of it and per-row dynamic fp8 (aiter `add_rmsnorm_quant`): out fp8, scale f32 [M], res_out bf16
+    AddRmsNormQuant,
 }
 
 pub fn by_name(name: &str) -> Option<Function> {
-    let (rest, op) = if let Some(r) = name.strip_prefix("add_rmsnorm_bf16_n") {
+    let (rest, op) = if let Some(r) = name.strip_prefix("add_rmsnorm_fp8_n") {
+        (r, RowOp::AddRmsNormQuant)
+    } else if let Some(r) = name.strip_prefix("gated_rmsnorm_fp8_n") {
+        (r, RowOp::GatedRmsNormQuant)
+    } else if let Some(r) = name.strip_prefix("gated_rmsnorm_bf16_n") {
+        (r, RowOp::GatedRmsNorm)
+    } else if let Some(r) = name.strip_prefix("add_rmsnorm_bf16_n") {
         (r, RowOp::AddRmsNorm)
     } else if let Some(r) = name.strip_prefix("rmsnorm_bf16_n") {
         (r, RowOp::RmsNorm)
@@ -87,7 +99,13 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
         RowOp::AddRmsNorm => &["x", "res", "gamma", "out", "res_out"],
         RowOp::LayerNorm => &["x", "gamma", "beta", "out"],
         RowOp::Softmax => &["x", "out"],
+        RowOp::GatedRmsNorm => &["x", "z", "gamma", "out"],
+        RowOp::GatedRmsNormQuant => &["x", "z", "gamma", "out", "scale"],
+        RowOp::AddRmsNormQuant => &["x", "res", "gamma", "out", "res_out", "scale"],
     };
+    let quant = matches!(op, RowOp::GatedRmsNormQuant | RowOp::AddRmsNormQuant);
+    let add = matches!(op, RowOp::AddRmsNorm | RowOp::AddRmsNormQuant);
+    let gated = matches!(op, RowOp::GatedRmsNorm | RowOp::GatedRmsNormQuant);
     let has_eps = op != RowOp::Softmax;
     for (i, p) in ptrs.iter().enumerate() {
         b.arg(p, DType::Ptr, 8 * i as u32, 8);
@@ -103,7 +121,9 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     b.grid_is(0, mt.clone());
     for p in ptrs {
         let vec = matches!(*p, "gamma" | "beta");
-        b.arg_tensor(p, if vec { Ext::c(2 * n) } else { mt.clone() * Ext::c(4 * rows_per_wave(n) * 2 * n) });
+        // the fp8 output has n bytes per row, its scales 4
+        let per_row = if quant && *p == "out" { n } else if quant && *p == "scale" { 4 } else { 2 * n };
+        b.arg_tensor(p, if vec { Ext::c(2 * n) } else { mt.clone() * Ext::c(4 * rows_per_wave(n) * per_row) });
     }
     let pv: Vec<ValueId> = (0..ptrs.len()).map(|i| b.let_(Op::KernargPtr { offset: 8 * i as u32 })).collect();
     let m_v = b.let_(Op::KernargI32 { offset: m_off });
@@ -117,15 +137,18 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     let idx = |nm: &str| ptrs.iter().position(|p| *p == nm).unwrap();
     // descriptors: out-of-range rows read zeros and their stores are dropped (num_records = the tensor bytes)
     let mut dyn_desc = |b: &mut FnBuilder, nm: &str| -> ValueId {
-        let v = b.bind_i32(ev(m_v) * (2 * n) as i32);
+        let per_row = if quant && nm == "out" { n } else if quant && nm == "scale" { 4 } else { 2 * n };
+        let v = b.bind_i32(ev(m_v) * per_row as i32);
         let v = b.read_first_lane(v);
         b.buffer_desc_dyn(pv[idx(nm)], v)
     };
     let r_x = dyn_desc(b, "x");
-    let r_res = if op == RowOp::AddRmsNorm { Some(dyn_desc(b, "res")) } else { None };
+    let r_res = if add { Some(dyn_desc(b, "res")) } else { None };
     let r_out = dyn_desc(b, "out");
-    let r_rout = if op == RowOp::AddRmsNorm { Some(dyn_desc(b, "res_out")) } else { None };
-    let r_g = if matches!(op, RowOp::RmsNorm | RowOp::AddRmsNorm | RowOp::LayerNorm) { Some(b.buffer_desc(pv[idx("gamma")], (2 * n) as u32)) } else { None };
+    let r_rout = if add { Some(dyn_desc(b, "res_out")) } else { None };
+    let r_z = if gated { Some(dyn_desc(b, "z")) } else { None };
+    let r_scale = if quant { Some(dyn_desc(b, "scale")) } else { None };
+    let r_g = if matches!(op, RowOp::RmsNorm | RowOp::AddRmsNorm | RowOp::AddRmsNormQuant | RowOp::LayerNorm | RowOp::GatedRmsNorm | RowOp::GatedRmsNormQuant) { Some(b.buffer_desc(pv[idx("gamma")], (2 * n) as u32)) } else { None };
     let r_be = if op == RowOp::LayerNorm { Some(b.buffer_desc(pv[idx("beta")], (2 * n) as u32)) } else { None };
     let rpw = rows_per_wave(n) as usize;                // rows per wave in total
     let steps = rpw / par as usize;                      // sequential steps of `par` rows
@@ -168,6 +191,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     // every row's loads are issued before any compute: rpw * (row bytes) in flight per wave
     let xs_all: Vec<Vec<ValueId>> = gxs.iter().map(|g| load(b, r_x, g, CachePolicy::NT)).collect();
     let rs_all: Option<Vec<Vec<ValueId>>> = r_res.map(|r| gxs.iter().map(|g| load(b, r, g, CachePolicy::NT)).collect());
+    let zs_all: Option<Vec<Vec<ValueId>>> = r_z.map(|r| gxs.iter().map(|g| load(b, r, g, CachePolicy::NT)).collect());
     // gamma / beta: with one step per wave they are loaded after the statistics (they would otherwise sit in 32 - 64 VGPRs across the reductions; the L2 hit overlaps with other waves);
     // short rows (several steps) load them up front
     let late_gb = steps == 1;
@@ -201,6 +225,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     };
     for r in 0..steps {
         let (xs, rs) = (&xs_all[r], rs_all.as_ref().map(|a| &a[r]));
+        let zs = zs_all.as_ref().map(|a| &a[r]);
         let (gen0, gen1) = (2 * r as i32, 2 * r as i32 + 1);
         // the row stays PACKED (bf16, 4 dwords per chunk) between the passes and is unpacked where it is used: fewer live VGPRs (occupancy) for a few extra shifts
         let mut packed: Vec<ValueId> = Vec::with_capacity(nld);
@@ -222,7 +247,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
         let rout_words: Vec<ValueId> = if rs.is_some() { packed.clone() } else { Vec::new() };
         let mut out: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
         match op {
-            RowOp::RmsNorm | RowOp::AddRmsNorm => {
+            RowOp::RmsNorm | RowOp::AddRmsNorm | RowOp::AddRmsNormQuant | RowOp::GatedRmsNorm | RowOp::GatedRmsNormQuant => {
                 let mut part: Option<ValueId> = None;
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
@@ -243,6 +268,14 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     for k in 0..8 {
                         let t = b.mul_f32(xi[k], inv);
                         y[k] = b.mul_f32(t, g[k]);
+                    }
+                    if let Some(zs) = zs {
+                        // the gate: y * silu(z)
+                        let zf = bf16x8_to_f32(b, zs[i]);
+                        for k in 0..8 {
+                            let sz = act(b, zf[k], Act::Silu);
+                            y[k] = b.mul_f32(y[k], sz);
+                        }
                     }
                     out.push(y);
                 }
@@ -325,6 +358,43 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     out.push(y);
                 }
             }
+        }
+        if quant {
+            // per-row dynamic fp8: amax over the row's lanes, scale = amax / 448, q = fp8(y / scale); one scale per row (lane 0 of the row's group stores it)
+            let mut part: Option<ValueId> = None;
+            for i in 0..nld {
+                let ab: Vec<ValueId> = out[i].iter().map(|&y| abs_f32(b, y)).collect();
+                let abm = masked(b, &[ab[0], ab[1], ab[2], ab[3], ab[4], ab[5], ab[6], ab[7]], i, zero);
+                let m = lane_reduce(b, RedOp::Max, &abm);
+                part = Some(match part { None => m, Some(p) => b.max_f32(p, m) });
+            }
+            let amax = red(b, RedOp::Max, part.unwrap(), 0, 2 * steps as i32 + r as i32, &lane);
+            let (sc, inv) = fp8_scale(b, amax);
+            let row_idx = b.bind_i32(ev(row0) + ev(grp) + (r as i64 * par) as i32);
+            for i in 0..nld {
+                let words = fp8_pack(b, &out[i], inv);
+                let f2 = b.frag2(words[0], words[1]);
+                let base = b.bind_i32(ev(row_idx) * n as i32 + ((ev(lr) + (g as i32 * i as i32)) << 3));
+                let voff = match valid[i] {
+                    None => base,
+                    Some(c) => b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(base), b: Opnd::I32(-16) }),
+                };
+                b.buffer_store_c(r_out, Some(Opnd::Val(voff)), 0i32, 0, f2, MemTy::B64, false, CachePolicy::NT);
+                if let Some(ro) = r_rout {
+                    // res_out (bf16 x + res) in the input layout
+                    let bb = b.bind_i32(ev(gxs[r][i / 4]) + (cstride as usize * (i % 4)) as i32);
+                    let rv = match valid[i] {
+                        None => bb,
+                        Some(c) => b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(bb), b: Opnd::I32(-16) }),
+                    };
+                    b.buffer_store_c(ro, Some(Opnd::Val(rv)), 0i32, 0, rout_words[i], MemTy::B128, false, CachePolicy::NT);
+                }
+            }
+            let lead = b.let_(Op::CmpLtI32(Opnd::Val(lr), Opnd::I32(1)));
+            let so = b.bind_i32(ev(row_idx) << 2);
+            let so = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lead), a: Opnd::Val(so), b: Opnd::I32(-16) });
+            b.buffer_store_f32(r_scale.unwrap(), so, 0i32, 0, sc);
+            continue;
         }
         // stores: lanes past the row end store to an offset outside every descriptor (dropped by the hardware)
         for i in 0..nld {

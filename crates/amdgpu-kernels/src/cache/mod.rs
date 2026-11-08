@@ -5,6 +5,7 @@
 //!   (up to 2^31 slots): the cache descriptors are moved to the token's slot row with a 64-bit `ptr_mad` (num_records = one row).
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd};
+use amdgpu_tile::prims::{bf16x8_to_f32, fp8_pack};
 use amdgpu_tile::ev;
 
 pub fn by_name(name: &str) -> Option<Function> {
@@ -15,15 +16,20 @@ pub fn by_name(name: &str) -> Option<Function> {
         let (h, d, bs): (i64, i64, i64) = (h.parse().ok()?, d.parse().ok()?, bs.parse().ok()?);
         return ((1..=256).contains(&h) && [64, 128, 256].contains(&d) && [8, 16, 32, 64, 128].contains(&bs) && 2 * h * d <= 65536).then(|| reshape_cache_blocked(name, h, d, bs));
     }
-    let rest = name.strip_prefix("reshape_cache_flash_bf16_h")?;
+    // `reshape_cache_flash_fp8_h<Hk>_d<D>`: the cache is fp8 (e4m3), the new K / V values are divided by the per-tensor scales k_scale / v_scale (kernargs) on the way in
+    let (rest, fp8) = match name.strip_prefix("reshape_cache_flash_fp8_h") {
+        Some(r) => (r, true),
+        None => (name.strip_prefix("reshape_cache_flash_bf16_h")?, false),
+    };
     let (h, d) = rest.split_once("_d")?;
     let (h, d): (i64, i64) = (h.parse().ok()?, d.parse().ok()?);
     let row = 2 * h * d;
-    ((1..=256).contains(&h) && d % 8 == 0 && (8..=512).contains(&d) && row % 16 == 0 && row <= 65536).then(|| reshape_cache_flash(name, h, d))
+    ((1..=256).contains(&h) && d % 8 == 0 && (8..=512).contains(&d) && row % 16 == 0 && row <= 65536).then(|| reshape_cache_flash(name, h, d, fp8))
 }
 
-pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
-    let row = 2 * h * d;                    // bytes per token row
+pub fn reshape_cache_flash(name: &str, h: i64, d: i64, fp8: bool) -> Function {
+    let row = 2 * h * d;                    // bytes per token row (bf16 input)
+    let orow = if fp8 { row / 2 } else { row };   // bytes per cache row
     let nv = row / 16;                      // b128 vectors per row
     let lt = (((nv + 63) / 64).min(4) * 64) as u32;      // lanes per token
     let tpb = if lt <= 128 { (256 / lt) as i64 } else { 1 };   // tokens per block (lt is 64 / 128 / 256 / 192: 4 / 2 / 1 / 1)
@@ -39,6 +45,10 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     b.arg("slot_mapping", DType::Ptr, 32, 8);
     b.arg("t", DType::I32, 40, 4);
     b.arg("s", DType::I32, 44, 4);
+    if fp8 {
+        b.arg("k_scale", DType::F32, 48, 4);
+        b.arg("v_scale", DType::F32, 52, 4);
+    }
     let tt = Ext::sym("T");
     let ss = Ext::sym("S");
     b.sym_range("T", 1, 1 << 24);
@@ -48,8 +58,8 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     b.grid_is(0, tt.clone().ceil_div(tpb));
     b.arg_tensor("k", tt.clone() * Ext::c(row));
     b.arg_tensor("v", tt.clone() * Ext::c(row));
-    b.arg_tensor("key_cache", ss.clone() * Ext::c(row));
-    b.arg_tensor("value_cache", ss * Ext::c(row));
+    b.arg_tensor("key_cache", ss.clone() * Ext::c(orow));
+    b.arg_tensor("value_cache", ss * Ext::c(orow));
     b.arg_tensor("slot_mapping", tt * Ext::c(4));
     let ptrs: Vec<_> = (0..5).map(|i| b.let_(Op::KernargPtr { offset: 8 * i })).collect();
     let t_v = b.let_(Op::KernargI32 { offset: 40 });
@@ -88,19 +98,35 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     let slot = b.let_(Op::AddI32(Opnd::Val(slot), Opnd::I32(0))); // signed (read_first_lane yields u32)
     let ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
     let sl = { let v = b.bind_i32(ev(slot).max(0).min(ev(s_v) - 1)); b.read_first_lane(v) };
-    let rowc = b.c_i32(row as i32);
+    let rowc = b.c_i32(orow as i32);
     let pkc = b.ptr_mad(ptrs[2], sl, rowc);
     let pvc = b.ptr_mad(ptrs[3], sl, rowc);
-    let r_kc = b.buffer_desc(pkc, row as u32);
-    let r_vc = b.buffer_desc(pvc, row as u32);
-    let dst = b.let_(Op::MulI32(Opnd::Val(lane), Opnd::I32(16))); // the lane's chunk inside the slot row (I32)
+    let r_kc = b.buffer_desc(pkc, orow as u32);
+    let r_vc = b.buffer_desc(pvc, orow as u32);
+    let ob = if fp8 { 8 } else { 16 };      // output bytes per lane and vector
+    let dst = b.let_(Op::MulI32(Opnd::Val(lane), Opnd::I32(ob))); // the lane's chunk inside the slot row (I32)
+    let (inv_k, inv_v) = if fp8 {
+        let (ks, vs) = (b.let_(Op::KernargF32 { offset: 48 }), b.let_(Op::KernargF32 { offset: 52 }));
+        (Some(b.rcp_f32(ks)), Some(b.rcp_f32(vs)))
+    } else {
+        (None, None)
+    };
     for (it, kv, vv, lane_ok) in loaded {
-        let dof = b.bind_i32(ev(dst) + (it * lt as i64 * 16) as i32);
+        let dof = b.bind_i32(ev(dst) + (it * lt as i64 * ob as i64) as i32);
         let o1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(dof), b: Opnd::I32(-16) });
         let o2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lane_ok), a: Opnd::Val(o1), b: Opnd::I32(-16) });
         let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(tok_ok), a: Opnd::Val(o2), b: Opnd::I32(-16) });
-        b.buffer_store_c(r_kc, Some(Opnd::Val(o)), 0i32, 0, kv, MemTy::B128, false, CachePolicy::NT);
-        b.buffer_store_c(r_vc, Some(Opnd::Val(o)), 0i32, 0, vv, MemTy::B128, false, CachePolicy::NT);
+        if fp8 {
+            for (src, inv, rc) in [(kv, inv_k.unwrap(), r_kc), (vv, inv_v.unwrap(), r_vc)] {
+                let f = bf16x8_to_f32(b, src);
+                let words = fp8_pack(b, &f, inv);
+                let f2 = b.frag2(words[0], words[1]);
+                b.buffer_store_c(rc, Some(Opnd::Val(o)), 0i32, 0, f2, MemTy::B64, false, CachePolicy::NT);
+            }
+        } else {
+            b.buffer_store_c(r_kc, Some(Opnd::Val(o)), 0i32, 0, kv, MemTy::B128, false, CachePolicy::NT);
+            b.buffer_store_c(r_vc, Some(Opnd::Val(o)), 0i32, 0, vv, MemTy::B128, false, CachePolicy::NT);
+        }
     }
     fb.finish()
 }

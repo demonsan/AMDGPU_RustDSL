@@ -7,7 +7,7 @@
 //! D in {64, 128, 256} (full rotary dimension), H in 1..=256. ABI: x @0, out @8, positions @16, cos_sin @24, T @32 (i32), P @36 (i32).
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
-use amdgpu_tile::prims::bf16x8_to_f32;
+use amdgpu_tile::prims::{bf16x8_to_f32, group_reduce_dpp, lane_reduce, rsqrt_f32, RedOp};
 use amdgpu_tile::ev;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,9 +17,14 @@ pub enum RopeStyle {
 }
 
 pub fn by_name(name: &str) -> Option<Function> {
-    let (rest, style) = if let Some(r) = name.strip_prefix("rope_neox_bf16_h") {
+    // `qknorm_rope_*`: a per-head RMSNorm (weight gamma [D], eps) of every head row, then the rotation (docs: fused_qk_norm_rope of aiter, Qwen3-style); ABI adds gamma @40 (bf16 [D]) and eps @48 (f32)
+    let (name_s, norm) = match name.strip_prefix("qknorm_") {
+        Some(n) => (n, true),
+        None => (name, false),
+    };
+    let (rest, style) = if let Some(r) = name_s.strip_prefix("rope_neox_bf16_h") {
         (r, RopeStyle::Neox)
-    } else if let Some(r) = name.strip_prefix("rope_gptj_bf16_h") {
+    } else if let Some(r) = name_s.strip_prefix("rope_gptj_bf16_h") {
         (r, RopeStyle::Gptj)
     } else {
         return None;
@@ -35,7 +40,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         Some(r) => r.parse().ok()?,
         None => d,
     };
-    ((1..=256).contains(&h) && [64, 128, 256].contains(&d) && r % 16 == 0 && (16..=d).contains(&r) && (r == d || r < d)).then(|| rope_kernel(name, h, d, style, r))
+    ((1..=256).contains(&h) && [64, 128, 256].contains(&d) && r % 16 == 0 && (16..=d).contains(&r) && (r == d || r < d) && !(norm && r != d)).then(|| rope_kernel(name, h, d, style, r, norm))
 }
 
 fn bf16x4_to_f32(b: &mut FnBuilder, frag2: ValueId) -> [ValueId; 4] {
@@ -56,7 +61,7 @@ fn pack8(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
     b.frag4(w[0], w[1], w[2], w[3])
 }
 
-pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Function {
+pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64, norm: bool) -> Function {
     let l = if style == RopeStyle::Neox { d / 16 } else { d / 8 }; // lanes per head row
     let rows_per_wave = 64 / l;
     // waves per block: only as many as the heads need (a block of idle waves would waste occupancy), at most 4
@@ -76,6 +81,11 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Func
     b.arg("cos_sin", DType::Ptr, 24, 8);
     b.arg("t", DType::I32, 32, 4);
     b.arg("p", DType::I32, 36, 4);
+    if norm {
+        b.arg("gamma", DType::Ptr, 40, 8);
+        b.arg("eps", DType::F32, 48, 4);
+        b.arg_tensor("gamma", Ext::c(2 * d));
+    }
     let tt = Ext::sym("T");
     let pp = Ext::sym("P");
     b.sym_range("T", 1, 1 << 24);
@@ -120,6 +130,26 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Func
         let s = b.buffer_load_b64(r_cs, cs_sin, 0i32, 0);
         (bf16x4_to_f32(b, c).to_vec(), bf16x4_to_f32(b, s).to_vec())
     };
+    // the per-head RMSNorm weights (this lane's chunks) and constants
+    let (gl, gh, eps_v) = if norm {
+        let p_g = b.let_(Op::KernargPtr { offset: 40 });
+        let r_g = b.buffer_desc(p_g, (2 * d) as u32);
+        let go = b.bind_i32(ev(lr) << 4);
+        let gl_raw = b.buffer_load_c(r_g, Some(Opnd::Val(go)), 0i32, 0, MemTy::B128, CachePolicy::NONE);
+        let gh_raw = if style == RopeStyle::Neox {
+            let goh = b.bind_i32(ev(go) + d as i32);
+            Some(b.buffer_load_c(r_g, Some(Opnd::Val(goh)), 0i32, 0, MemTy::B128, CachePolicy::NONE))
+        } else {
+            None
+        };
+        let gl = bf16x8_to_f32(b, gl_raw);
+        let gh = gh_raw.map(|g| bf16x8_to_f32(b, g));
+        let eps = b.let_(Op::KernargF32 { offset: 48 });
+        (Some(gl), gh, Some(eps))
+    } else {
+        (None, None, None)
+    };
+    let inv_d = b.c_f32(1.0 / d as f32);
     let partial = r < d;
     let rot = if partial {
         let lim = if style == RopeStyle::Neox { r / 16 } else { r / 8 };
@@ -177,10 +207,34 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Func
         ps.push(Pass { head_ok, off, offh: offh_v, lo, hi });
     }
     for p in &ps {
-        let xl = bf16x8_to_f32(b, p.lo);
+        let mut xl = bf16x8_to_f32(b, p.lo);
+        let mut xh_n: Option<[ValueId; 8]> = p.hi.map(|h| bf16x8_to_f32(b, h));
+        if norm {
+            // sum of squares of the head row (this lane's 8 or 16 elements, then the L lanes of the head), mean + eps, rsqrt, times gamma
+            let mut sq: Vec<ValueId> = xl.iter().map(|&x| b.mul_f32(x, x)).collect();
+            if let Some(xh) = &xh_n {
+                sq.extend(xh.iter().map(|&x| b.mul_f32(x, x)));
+            }
+            let part = lane_reduce(b, RedOp::Sum, &sq);
+            let tot = group_reduce_dpp(b, RedOp::Sum, part, l);
+            let mean = b.mul_f32(tot, inv_d);
+            let me = b.add_f32(mean, eps_v.unwrap());
+            let inv = rsqrt_f32(b, me);
+            let gl = gl.unwrap();
+            for k in 0..8 {
+                let t = b.mul_f32(xl[k], inv);
+                xl[k] = b.mul_f32(t, gl[k]);
+            }
+            if let (Some(xh), Some(gh)) = (xh_n.as_mut(), gh.as_ref()) {
+                for k in 0..8 {
+                    let t = b.mul_f32(xh[k], inv);
+                    xh[k] = b.mul_f32(t, gh[k]);
+                }
+            }
+        }
         let (yl, yh);
         if style == RopeStyle::Neox {
-            let xh = bf16x8_to_f32(b, p.hi.unwrap());
+            let xh = xh_n.unwrap();
             let mut a = [0; 8];
             let mut c = [0; 8];
             for k in 0..8 {

@@ -291,3 +291,55 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 `reshape_cache_flash_bf16_h<Hk>_d<D>` 和 `reshape_cache_blocked_bf16_h<Hk>_d<D>_b<BS>` 现在支持任意大小的 cache（slot 到 2³¹ 个，每个 slot 行至多 64 KiB，即单个张量到 ≈ 128 GiB）：缓存描述符被一个 64 位 `ptr_mad` 移到当前 token 的 slot 行 / 块上（`num_records` = 一行 / 一块，所以 32 位偏移不再限制 cache 大小），非法 slot（< 0 或 ≥ S）的存储被屏蔽（backend 补丁，`origin/batch2-ptr64`）。新增主机测试 `tests/gpu/cache_big_host.cpp`：整个 cache 上散布的 slot（含 4 GiB / 8 GiB 之后的，以及首尾 slot、负的和 ≥ S 的非法 slot），每个被写的 slot / 块与 CPU 参考逐字节对比，抽样的未触碰行保持哨兵值；flash 12.2 / 30.5 GiB（h8, d128）和 14.3 GiB（h5, d64）、blocked 12.2 GiB，`bad = 0`。`moe_reduce` / `moe_combine` 同样改成每 token 一个描述符（`T · K · D · 2` 不再有 2 GiB 的限制）：T = 65535, K = 8, D = 7168（x = 7.5 GB）的抽样检查 `bad = 0`，5.73 TB/s；<4 GiB 的带宽与之前持平（6.0 / 5.9 / 5.9 TB/s，在噪声内）。
 
 带宽：< 4 GiB 时没有可测的退步——同一次运行里，新的 64 位版本与旧的 32 位实现（commit 297c4c53 的代码）在 flash h8, d128 上是 4988 vs 4926 GB/s（噪声内），blocked 随机 slot 870 / 连续 1433 GB/s 与之前持平。（此前几轮测得的 5.8 TB/s 是另一个时间点的机器状态：同一份旧代码现在也只有 4.9 TB/s；backend 交替运行新旧时看到的 5 % 差别也在这个噪声之内。）让数据加载紧跟在 slot 加载之后发出（已采用，无害）和把边界检查换成一次无符号比较（通不过 provenance 校验，已撤销）都没有带来可测的变化，所以不需要单独的 < 4 GiB 变体。
+
+
+## 短行的 layernorm / softmax：VALU 受限（结论）
+
+把短行每个 wave 同时在途的行数从 8 加到 16 没有可测的变化（rmsnorm N = 200：5284 → 5384，layernorm N = 200 3846、softmax N = 200 4363 都不动），所以短行不是延迟 / 在途字节受限，已撤销；它们是 VALU 受限：layernorm N = 200 每 wave 步约 150 条 VALU 处理 2 行（g = 32），softmax 还有每元素一次 `v_exp`（四分之一速率）。N = 400 / 256 的 layernorm（4224 / 4937）和 N = 400 的 softmax（4572）同理；N = 400 – 511 的行用 `g = 64`，一个 wave 里 50 – 63 个 lane 有数据，不是瓶颈。继续优化需要减少每元素的 VALU：用 `v_pk_add_f32` / `v_pk_mul_f32`（DSL 里有 `PkAddF32` / `PkMulF32`，tileop 的 `apply2` 会自动打包）重写 layernorm 的减均值 / 平方 / 缩放，理论上可去掉约三分之一的 VALU；暂未做。
+
+
+## aiter 内存受限算子覆盖表（have / missing / why）
+
+按 aiter 的分类逐项对照（`csrc/kernels` 与 `aiter/ops`）；"有" = 已有 Rust 实现且过 CPU 参考 + `gpu_verify --strict` + `ir_text` 往返 + `tools/b2_matrix.sh`。按 aiter 派发里的使用频率排序。
+
+| 类别 | aiter 算子 | 状态 | 我们的 kernel / 说明 |
+|---|---|---|---|
+| 归一化 | rmsnorm | 有 | `rmsnorm_bf16_n<N>`（N = 8 … 16384，短行组内 DPP） |
+| | add + rmsnorm（残差） | 有 | `add_rmsnorm_bf16_n<N>` |
+| | layernorm | 有 | `layernorm_bf16_n<N>`（N ≥ 512 时 5.5 TB/s；短行 VALU 受限，见上） |
+| | rmsnorm + fp8 量化（per token） | 有 | `rmsnorm_quant_*`（已有，shipped kernel）；本批新增行内版本见下行 |
+| | **fused add + rmsnorm + per-token fp8 量化**（`add_rmsnorm_quant`） | 有（新） | `add_rmsnorm_fp8_n<N>`：res_out bf16 + out fp8 + scale f32 [M]；N = 4096 4.3 TB/s（计流量），VGPR 128 – 204 |
+| | **gated rmsnorm**（`norm(x) * w * silu(z)`，Mamba2 / GDN 输出归一化） | 有（新） | `gated_rmsnorm_bf16_n<N>`：N = 128 6.2 TB/s，N = 4096 6.1 TB/s |
+| | **gated rmsnorm + fp8 group 量化**（`gated_rmsnorm_fp8_group_quant`：head_dim = group = 128） | 有（新） | `gated_rmsnorm_fp8_n<N>`：每行一个 scale（N = 128 时一行就是一个 head = 一个 group）；N = 128 5.6，N = 4096 5.2 TB/s（流量更小） |
+| | fused qk rmsnorm（`fused_qk_rmsnorm`：q、k 各自整行归一化，一次启动） | 有（两次 rmsnorm 启动） | 只省一次启动，不新增 kernel；N = 1536 / 512 用 `rmsnorm_bf16_n<N>` |
+| | groupnorm（`groupnorm.cu`，视觉模型） | 缺 | 非推理热路径（LLM 推理里用不到），按需再做 |
+| 量化 | per-token / per-group128 / static fp8，int8 per-token，dequant | 有 | 见前文 |
+| | mxfp4 / mxfp6 量化（`quant_mxfp4.cu`，E8M0 缩放） | 缺 | 需要 e2m1 打包与 32 元素块的 E8M0 scale；`ScalePk*` cvt 已在 DSL 里，是下一批 |
+| | 融合进 norm 的 mxfp 量化 | 缺 | 依赖上一行 |
+| 融合激活 | silu_mul / gelu_tanh_mul（`[M][2D]`） | 有 | `silu_mul_bf16_d<D>`、`gelu_tanh_mul_bf16_d<D>`（6.5 TB/s） |
+| | silu_mul + fp8 量化 | 有 | `silu_mul_quant_fp8_d<D>` |
+| | **silu_and_mul 带 limit**（`x = min(x, limit)`, `y` 夹到 ±limit） | 有（新） | `silu_mul_limit_bf16_d<D>`，limit 是 kernarg（≤ 0 = 不限）；6.55 TB/s |
+| | **swiglu_and_mul**（gpt-oss：限幅 7、alpha = 1.702、`(lin + 1)`） | 有（新） | `swiglu_oai_mul_bf16_d<D>`；6.58 TB/s |
+| | **一元激活**（gelu_fast = tanh 形式、relu2、silu、sigmoid） | 有（新） | `gelu_fast_bf16` / `gelu_tanh_bf16` / `relu2_bf16` / `silu_bf16` / `sigmoid_bf16`（6.2 – 6.4 TB/s） |
+| | gelu（erf 精确形式）、gelu_and_mul_bias、swiglu_and_mul_bias（MoE 逐专家 bias）、situv2 | 缺 | erf 需要多项式近似；带 bias 的两个需要 expert id 的 gather；使用频率低 |
+| | scaled_silu_and_mul（输出 fp8，静态 scale） | 有（组合） | `silu_mul_quant_fp8_d<D>` 的静态 scale 变体可由 `quant_bf16_fp8_static` 接在后面；融合版缺 |
+| 位置编码 | rope neox / gptj，部分旋转（`_r<R>`），token 打包 | 有 | `rope_{neox,gptj}_bf16_h<H>_d<D>[_r<R>]` |
+| | **fused qk-norm + rope**（`fused_qk_norm_rope`，Qwen3 风格逐 head 归一化后旋转） | 有（新） | `qknorm_rope_{neox,gptj}_bf16_h<H>_d<D>`（全旋转）；q、k 各启动一次；H = 8 D = 128 5.7 TB/s |
+| | fused qk-norm + rope + KV cache 写 + fp8 量化（`fused_qk_norm_rope_cache_quant`） | 缺 | 把上一行与 cache 写核拼起来；k 路径已具备全部部件，v 无需旋转；待做 |
+| | mrope（3D 位置）、yarn / 缩放表 | 缺（表由调用方预计算） | 表是 `cos_sin [P][D]` 输入，yarn 只是换表，无需新 kernel；mrope 的按段选位置需要一个小的位置 gather |
+| KV cache | reshape_and_cache flash 布局 / vLLM 分块布局（任意大小 cache） | 有 | `reshape_cache_flash_bf16_h<Hk>_d<D>`、`reshape_cache_blocked_bf16_h<Hk>_d<D>_b<BS>` |
+| | **fp8 KV cache 写（静态 per-tensor scale）** | 有（新） | `reshape_cache_flash_fp8_h<Hk>_d<D>`：k_scale / v_scale kernarg；5.9 TB/s |
+| | fp8 cache 写 + per-token scale（`pertoken_quant`）、分块布局的 fp8 版本 | 缺 | per-token scale 需要先做一遍行 amax（复用 `quant_token`），分块布局的 fp8 版同理；待做 |
+| | MLA cache（`concat_and_cache_mla`） | 缺 | 两段拼接写（kv_c + k_pe）：和 flash 版同构，缺的只是名字 / 布局约定 |
+| 采样 / top-k | argmax、sample（温度）、top-k + top-p、topk_softmax | 有 | 见前文 |
+| | moe_fused_gate（DeepSeek 分组 topk，sigmoid + bias + 组选择）、topk_gating | 缺 | 比 `topk_softmax` 多一层组内 top-2 求和与组 top-k；待做 |
+| | topk_per_row（prefill / decode 的 indexer topk）、topk_plain | 缺 | 需要大 K 的行内 top-k（K ≤ 2048）：基数选择（见"采样"一节）可直接复用，是下一批 |
+| MoE 辅助 | moe_sorting（单 block / 多 block / 稳定序）、**moe_reduce / moe_combine** | 有 | `moe_sorting_*`、`moe_{count,scan,scatter,scatter_ord}_*`、`moe_reduce_bf16_k<K>_d<D>`、`moe_combine_bf16_k<K>_d<D>` |
+| 其他 | **causal_conv1d_update**（decode，W = 2 – 4，状态窗口移位，可选 silu 与连续批处理的 state_indices，pad = 负） | 有（新） | `causal_conv1d_update_bf16_w<W>_s<SL>[_idx][_silu]`：输出与新状态均与 CPU 参考逐位一致；B = 2048 dim = 8192 3.1 TB/s（2 字节访问，没有向量化） |
+| | causal_conv1d fwd（prefill / split_qkv） | 缺 | 沿 L 的滑动窗口卷积：每个 lane 一个 channel、沿序列滑动，权重常驻寄存器；split_qkv 只是不同的输出切分；待做 |
+| | gated delta rule（`chunk_gated_delta_rule_fwd_h`、`gdr_decode_packed`、`fused_split_gdr_update`） | 缺 | 带小矩阵递推的状态更新（不是纯带宽），属于 GEMM 类；不在内存受限计划内 |
+| | custom_all_reduce / quick_all_reduce / reduce_scatter | 缺 | 多卡通信，本机单卡无法验证 |
+| | mhc / mega_mhc / mha_v4_quant / dsv4_*（DeepSeek-V4 专用融合） | 缺 | 模型专用的大融合，使用面窄 |
+| | binary / unary 算子（add、mul、tanh、sigmoid…） | 部分 | `add_bf16`、`sigmoid_bf16`、`silu_bf16` 等；其余是同一模板的换函数 |
+
+**精度判据**：bf16 输出 ≤ 1 ulp（+ 小绝对量），fp8 输出按 e4m3 的半步长（相对 1/16）加 scale · 2⁻⁹（次正规），scale 相对 1e-3；cache / state 类的输出按字节逐位比较。
