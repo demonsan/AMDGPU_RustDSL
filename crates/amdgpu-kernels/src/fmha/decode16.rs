@@ -162,8 +162,10 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
             (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
         })
         .collect();
+    let nodma = std::env::var("EXP_NODMA").is_ok();
     me.write(&mut b, Opnd::Var(it), |b| {
         for (i, &(kc, pv)) in lookups.iter().enumerate() {
+            if nodma && i > 0 { break; }
             let i = i as i32;
             let pg = b.bitcast_i32(pv);
             let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
@@ -244,7 +246,8 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
     b.set_var(l_v, l_new);
     // ---- O^T += V^T P^T: 2 steps of 32 keys x 8 blocks of 16 d ----
     let vb = b.bind_i32(mbase.clone() + KT * ROW + ev(vr));
-    me.read_back(&mut b, Opnd::Var(it), |b| {
+    let nopv = std::env::var("EXP_NOPV").is_ok();
+    if !nopv { me.read_back(&mut b, Opnd::Var(it), |b| {
         for t in 0..2usize {
             let w: Vec<ValueId> = [(2 * t, 0usize), (2 * t, 2), (2 * t + 1, 0), (2 * t + 1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
             let pf = b.pack4(w[0], w[1], w[2], w[3]);
@@ -255,7 +258,7 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
                 b.var_mfma(ov[db as usize], kind, vf, pf, false);
             }
         }
-    });
+    }); }
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
     let done = b.bind_cond(ev(it1).ge(ev(ntile)));
