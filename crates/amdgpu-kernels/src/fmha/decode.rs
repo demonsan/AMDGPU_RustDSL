@@ -142,12 +142,13 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     let m_init = b.c_f32(-1.0e30);
     let l_init = b.c_f32(0.0);
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(m_init)), (DType::F32, Opnd::Val(l_init))];
-    inits.extend((0..4).map(|_| (DType::Frag16, Opnd::Val(zero16))));
+    inits.extend((0..6).map(|_| (DType::Frag16, Opnd::Val(zero16))));
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
     let vars = b.begin_loop(&inits);
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..7].to_vec();
+    let s_vars: Vec<VarId> = vars[7..9].to_vec();
     let itx = amdgpu_dsl::varx(it);
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << 6)); b.read_first_lane(v) };
     // ---- DMA the tile's K and V rows through the block table ----
@@ -176,7 +177,7 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     let keep = |b: &mut FnBuilder, off: i32| b.bind_cond((ev(key0) + off).lt(ev(k_hi)));
     let kbase = mbase.clone();
     let vbase = mbase.clone() + KT * ROW;
-    tile_math(&mut b, &tm, kbase, vbase, Some(&keep), m_v, l_v, &ov, &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)), &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)));
+    tile_math(&mut b, &tm, kbase, vbase, Some((None, &keep)), m_v, l_v, &s_vars, &ov, &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)), &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)));
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
     let done = b.bind_cond(ev(it1).ge(ev(ntile)));
