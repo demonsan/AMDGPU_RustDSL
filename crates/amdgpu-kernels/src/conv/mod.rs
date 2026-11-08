@@ -148,7 +148,7 @@ pub fn conv1d_update(name: &str, w: i64, sl: i64, idx: bool, silu: bool) -> Func
 // ABI: x @0 (bf16 [T][dim]), weight @8 (bf16 [dim][W]), bias @16 (bf16 [dim]), cu_seqlens @24 (i32 [B + 1]), cache_indices @32 (i32 [B], negative = skip the sequence), has_initial @40 (u8 [B]),
 //   conv_states @48 (bf16 [slots][dim][W - 1]), then out @56 (or q @56, k @64, v @72), then dim (i32), [k_dim (i32)], ntok (i32), slots (i32).
 // `_sched` suffix: grid (ceil(dim / 2048), NC, 1) and two more args (sched_seq @(slots + 8), sched_chunk @(slots + 16): i32 [NC] tables with the sequence and the chunk index of every non-empty chunk, built
-// by the caller; nc @(slots + 24)): no block idles past a sequence end when the lengths are uneven. Without it:
+// by the caller; nc @(slots + 24), nseq @(slots + 28) = B): no block idles past a sequence end when the lengths are uneven. Without it:
 // Grid: x = ceil(dim / 2048) feature tiles (a lane owns 8 consecutive features, dim a multiple of 8), y = B, z = ceil(max_seqlen / 8) token chunks (blocks past a sequence's end exit); a block runs 8
 // tokens sequentially with the W-1 previous inputs in registers. All 8 loads of a block are issued before the first output (kept packed: a 16-token chunk needed more than 256 VGPRs).
 
@@ -198,6 +198,7 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> F
         b.arg("sched_seq", DType::Ptr, n_off + 8, 8);
         b.arg("sched_chunk", DType::Ptr, n_off + 16, 8);
         b.arg("nc", DType::I32, n_off + 24, 4);
+        b.arg("nseq", DType::I32, n_off + 28, 4);
     }
     let dim = Ext::sym("DIM");
     let ntok = Ext::sym("NTOK");
@@ -218,6 +219,7 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> F
         let ncs = Ext::sym("NC");
         b.sym_range("NC", 1, 1 << 24);
         b.ka_is(n_off + 24, ncs.clone());
+        b.ka_is(n_off + 28, nb.clone());
         b.grid_is(1, ncs.clone());
         b.grid_is(2, Ext::c(1));
         b.arg_tensor("sched_seq", ncs.clone() * Ext::c(4));
@@ -274,17 +276,19 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> F
         let v = b.read_first_lane(v);
         b.let_(Op::AddI32(Opnd::Val(v), Opnd::I32(0)))
     };
-    let nbytes_cu = b.bind_i32((ev(seq) + 2) << 2);
+    // per-sequence arrays: sized by the number of sequences (sched mode: a kernarg, so the extents are provable; otherwise by the grid's y)
+    let nseq_v = if sched { Some(b.let_(Op::KernargI32 { offset: n_off + 28 })) } else { None };
+    let nbytes_cu = if let Some(nv) = nseq_v { b.bind_i32((ev(nv) + 1) << 2) } else { b.bind_i32((ev(seq) + 2) << 2) };
     let nbytes_cu = b.read_first_lane(nbytes_cu);
     let o_seq = b.bind_i32(ev(seq) << 2);
     let seq_start = one_scalar(b, ptr[3], nbytes_cu, o_seq, MemTy::B32);
     let o_seq1 = b.bind_i32((ev(seq) + 1) << 2);
     let seq_end = one_scalar(b, ptr[3], nbytes_cu, o_seq1, MemTy::B32);
     let seqlen = b.bind_i32(ev(seq_end) - ev(seq_start));
-    let nbytes_ci = b.bind_i32((ev(seq) + 1) << 2);
+    let nbytes_ci = if let Some(nv) = nseq_v { b.bind_i32(ev(nv) << 2) } else { b.bind_i32((ev(seq) + 1) << 2) };
     let nbytes_ci = b.read_first_lane(nbytes_ci);
     let cache_idx = one_scalar(b, ptr[4], nbytes_ci, o_seq, MemTy::B32);
-    let nbytes_hi = b.bind_i32(ev(seq) + 1);
+    let nbytes_hi = if let Some(nv) = nseq_v { b.bind_i32(ev(nv) + 0) } else { b.bind_i32(ev(seq) + 1) };
     let nbytes_hi = b.read_first_lane(nbytes_hi);
     let o_hi = b.bind_i32(ev(seq) + 0);
     let has_init = one_scalar(b, ptr[5], nbytes_hi, o_hi, MemTy::U8);

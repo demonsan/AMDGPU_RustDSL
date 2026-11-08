@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
     put(&dx, 8); put(&dw, 8); put(&db, 8); put(&dcu, 8); put(&dci, 8); put(&dhi, 8); put(&ds, 8); for (int i = 0; i < nout; ++i) put(&dout[i], 8);
     int32_t d32 = (int32_t)dim, k32 = (int32_t)KD, t32 = (int32_t)T, s32 = (int32_t)SLOTS; put(&d32, 4); if (split) put(&k32, 4); put(&t32, 4); put(&s32, 4);
     std::vector<int32_t> sq, ck; for (long b = 0; b < B; ++b) { long len = cu[b + 1] - cu[b]; for (long c = 0; c * 8 < len; ++c) { sq.push_back((int32_t)b); ck.push_back((int32_t)c); } } void *dsq = nullptr, *dck = nullptr; int32_t nc32 = (int32_t)sq.size();
-    if (sched) { CK(hipMalloc(&dsq, sq.size() * 4 + 4)); CK(hipMalloc(&dck, ck.size() * 4 + 4)); CK(hipMemcpy(dsq, sq.data(), sq.size() * 4, hipMemcpyHostToDevice)); CK(hipMemcpy(dck, ck.data(), ck.size() * 4, hipMemcpyHostToDevice)); put(&dsq, 8); put(&dck, 8); put(&nc32, 4); }
+    if (sched) { CK(hipMalloc(&dsq, sq.size() * 4 + 4)); CK(hipMalloc(&dck, ck.size() * 4 + 4)); CK(hipMemcpy(dsq, sq.data(), sq.size() * 4, hipMemcpyHostToDevice)); CK(hipMemcpy(dck, ck.data(), ck.size() * 4, hipMemcpyHostToDevice)); put(&dsq, 8); put(&dck, 8); put(&nc32, 4); int32_t nseq32 = (int32_t)B; put(&nseq32, 4); }
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     long maxl = 0; for (long b = 0; b < B; ++b) maxl = std::max<long>(maxl, cu[b + 1] - cu[b]);
     unsigned gx = (unsigned)((dim + 2047) / 2048), gz = (unsigned)((maxl + 7) / 8);
