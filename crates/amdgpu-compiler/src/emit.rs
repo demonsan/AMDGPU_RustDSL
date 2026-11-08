@@ -245,7 +245,7 @@ fn cpol_suffix(c: u8) -> String {
     s
 }
 
-fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
+pub(crate) fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
     let mut v = inst_lines_core(a, inst);
     if inst.cpol != 0 {
         if let Some(last) = v.last_mut() {

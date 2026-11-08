@@ -182,6 +182,8 @@ fn batch_kernarg_loads(m: &mut MFunction) {
 }
 
 struct Lowerer {
+    /// diagnostics: the value being lowered (MInst::origin)
+    cur_origin: u32,
     mir: MFunction,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
@@ -315,6 +317,7 @@ impl Lowerer {
         }
 
         Lowerer {
+            cur_origin: u32::MAX,
             mir,
             val: HashMap::new(),
             converted: HashMap::new(),
@@ -580,6 +583,9 @@ impl Lowerer {
 
     fn push(&mut self, mut inst: MInst) {
         inst.region = self.region_stack.last().copied().unwrap_or(0);
+        if inst.origin == u32::MAX {
+            inst.origin = self.cur_origin;
+        }
         self.mir.blocks[self.cur].insts.push(inst);
     }
 
@@ -1670,6 +1676,7 @@ impl Lowerer {
         {
             match st {
                 Stmt::Let { dst, op } => {
+                    self.cur_origin = *dst;
                     self.lower_op(*dst, op)?;
                     if self.view_copy.contains(dst) {
                         // SSA semantics for a view of a loop variable used after the variable is written: snapshot it now
