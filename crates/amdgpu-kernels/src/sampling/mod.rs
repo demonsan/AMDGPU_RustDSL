@@ -346,10 +346,6 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                     let g12 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g2), a: Opnd::Val(g12), b: Opnd::I32(0) });
                     (b.cmp(CmpPred::Ne, CmpTy::I32, g12, 0), ex)
                 };
-                let owner = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in256), a: Opnd::I32(1), b: Opnd::I32(0) });
-                let own_ok = b.cmp(CmpPred::Ne, CmpTy::I32, owner, 0);
-                let w_ok = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(hit), a: Opnd::Val(own_ok), b: Opnd::I32(0) });
-                let _ = w_ok;
                 let go = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(hit), a: Opnd::I32(1), b: Opnd::I32(0) });
                 let go = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in256), a: Opnd::Val(go), b: Opnd::I32(0) });
                 let wr = b.cmp(CmpPred::Ne, CmpTy::I32, go, 0);
