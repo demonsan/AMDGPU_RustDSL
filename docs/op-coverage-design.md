@@ -656,7 +656,15 @@ blockscale 128×128（`fp8bs`）的规则：
 | B1 H8 2048²，非 causal | 387.9 µs | 141.0 µs | 0.36 |
 | B1 H8 HK2 2048²，causal | 416.0 µs | 162.9 µs | 0.39 |
 
+**性能进展**（同次运行）：
+- S / dP 两条累加链交错；LSE / Dot 改为按 4 对齐整读，去掉逐值选择；操作数改用 `tr_b16x2` / `pack4`。
+- 效果：B1H8 2048²：391 → 237 µs（0.60×）；causal GQA：416 → 263 µs（0.62×）；小 causal：0.91×。
+- 试过但未采纳：
+  - 单 kernel 版本：dS^T 经 LDS，K tile 只暂存一次，dQ 用 `buffer_atomic_add_f32` 累加，另加 dq_convert。结果正确，但 246 vs 237 µs、causal 274 vs 263，更慢。代码已从树中移除，保留为 tag `archive/bwd-fused`。
+  - dkdv 的 causal key tile 配对：128 个 CTA 在 256 个 CU 上被减半后反而更慢。
+
 **原因与方向**：
+- 余下的差距在 dkdv 的单 tile 效率（单独 139 µs，约等于厂商的总时间）。下一步给 dkdv 做 v3 式处理：读取提前、8 wave ping-pong。
 - 两个 kernel 各自重算 S / P，dP 也算了两遍。厂商是单 kernel，dQ 走 fp32 原子累加。
 - causal 时 dkdv 只裁掉了前部的 q tile。
 - 方向：合并为一个 kernel，dQ 用原子累加（需要后端提供 `buffer_atomic_add_f32`）；加入延迟 rescale 一类的 VALU 优化。

@@ -42,7 +42,6 @@ struct Body<'a> {
     neg_inf: ValueId,
     zero16: ValueId,
     half: ValueId,
-    row: ValueId,
     /// keys visible to the lane's query: k <= lim; the CTA-uniform smallest limit (tiles ending at or below it need no mask)
     lim: ValueId,
     lim_min: ValueId,
@@ -398,7 +397,7 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     b.begin_if(Opnd::Val(any));
     roles.each(&mut b, |b, role| {
         let mut body = Body {
-            ring: &ring, kind, qf: &qf, kr: &kr, vr: vr.clone(), csc, neg_inf, zero16, half, row, lim, lim_min,
+            ring: &ring, kind, qf: &qf, kr: &kr, vr: vr.clone(), csc, neg_inf, zero16, half, lim, lim_min,
             s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true,
         };
         pipe.run(b, role, &mut body);
