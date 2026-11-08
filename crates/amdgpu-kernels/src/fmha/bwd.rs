@@ -455,10 +455,13 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         }
         // P = exp2(csc S - lse2[q]) (masked 0), dS = P (dP - Dot[q]); the per-query LSE / Dot: 4 consecutive queries per load
         let q0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
-        let mut p: Vec<ValueId> = Vec::with_capacity(32);
-        let mut dsv: Vec<ValueId> = Vec::with_capacity(32);
+        // P / dS packed to bf16 pairs as soon as a group of 4 values is done (word 8 sb + 2 g + u / 2): fewer live registers
+        let mut p: Vec<ValueId> = Vec::with_capacity(16);
+        let mut dsv: Vec<ValueId> = Vec::with_capacity(16);
         for sb in 0..2usize {
             for g in 0..4usize {
+                let mut pg: Vec<ValueId> = Vec::with_capacity(4);
+                let mut dg: Vec<ValueId> = Vec::with_capacity(4);
                 let qq = b.bind_i32(ev(q0) + (32 * sb + 8 * g) as i32);
                 // the 4 consecutive queries of this value group (4-aligned): one 16-byte load each; queries past SQ read 0 (masked anyway)
                 let qa = b.bind_i32(ev(qq) << 2);
@@ -484,8 +487,12 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
                     let dp = b.frag16_lane(Opnd::Var(dp_vars[sb]), r);
                     let dp = b.bitcast_f32(dp);
                     let y = b.sub_f32(dp, dot);
-                    p.push(pv);
-                    dsv.push(b.mul_f32(pv, y));
+                    pg.push(pv);
+                    dg.push(b.mul_f32(pv, y));
+                }
+                for k in 0..2usize {
+                    p.push(b.cvt_pk_bf16_f32(pg[2 * k], pg[2 * k + 1]));
+                    dsv.push(b.cvt_pk_bf16_f32(dg[2 * k], dg[2 * k + 1]));
                 }
             }
         }
@@ -494,9 +501,8 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
             sl.read(&mut b, |b| {
                 for t in 0..4usize {
                     let (sb, tt) = (t / 2, t % 2);
-                    let i0 = 16 * sb + 8 * tt;
-                    let w: Vec<ValueId> = (0..4).map(|j| b.cvt_pk_bf16_f32(src[i0 + 2 * j], src[i0 + 2 * j + 1])).collect();
-                    let bf = b.pack4(w[0], w[1], w[2], w[3]);
+                    let w0 = 8 * sb + 4 * tt;
+                    let bf = b.frag4(src[w0], src[w0 + 1], src[w0 + 2], src[w0 + 3]);
                     for e in 0..4usize {
                         let a0 = b.bind_i32(ev(tr[e][0]) + base + (32 * sb as i32 + 16 * tt as i32) * ROW);
                         let a1 = b.bind_i32(ev(tr[e][1]) + base + (32 * sb as i32 + 16 * tt as i32) * ROW);
