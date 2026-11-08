@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
     std::mt19937 rng(envi("SEED", 1));
     std::uniform_real_distribution<float> U(-1, 1);
     const bool ours = fam.rfind("ours_", 0) == 0;
-    const bool pre = ours ? envi("PRESHUF", 0) != 0 : true;
+    const bool pre = ours && fam.rfind("ours_v4_", 0) != 0 ? envi("PRESHUF", 0) != 0 : true;
 
     hipModule_t mod; hipFunction_t fn;
     HC(hipModuleLoad(&mod, co));
@@ -87,17 +87,23 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> ha, hb;  // raw device bytes (A row-major [M, K], B [N, K] before any shuffle)
     std::vector<uint8_t> sa8, sb8;  // e8m0 scales (f4)
     int es = 2;
-    std::string kind = fam.substr(fam.find('_') + 1);
+    std::string kind = fam.rfind("ours_v4_", 0) == 0 ? fam.substr(8) : fam.substr(fam.find('_') + 1);
     if (kind == "bf16" || kind == "bf16_pre" || kind == "a16w16") {
         es = 2;
         ha.resize((size_t)M * K * 2); hb.resize((size_t)N * K * 2);
         for (size_t i = 0; i < af.size(); i++) { uint16_t h = f_to_bf16(U(rng)); memcpy(&ha[2 * i], &h, 2); af[i] = bf16_to_f(h); }
         for (size_t i = 0; i < bf.size(); i++) { uint16_t h = f_to_bf16(U(rng)); memcpy(&hb[2 * i], &h, 2); bf[i] = bf16_to_f(h); }
-    } else if (kind == "i8") {
+    } else if (kind == "i8" || kind == "rowcol_fp8") {
         es = 1;
         ha.resize((size_t)M * K); hb.resize((size_t)N * K);
-        for (size_t i = 0; i < af.size(); i++) { int8_t v = (int8_t)(rng() % 255 - 127); ha[i] = (uint8_t)v; af[i] = v; }
-        for (size_t i = 0; i < bf.size(); i++) { int8_t v = (int8_t)(rng() % 255 - 127); hb[i] = (uint8_t)v; bf[i] = v; }
+        if (kind == "i8") {
+            for (size_t i = 0; i < af.size(); i++) { int8_t v = (int8_t)(rng() % 255 - 127); ha[i] = (uint8_t)v; af[i] = v; }
+            for (size_t i = 0; i < bf.size(); i++) { int8_t v = (int8_t)(rng() % 255 - 127); hb[i] = (uint8_t)v; bf[i] = v; }
+        } else {  // fp8 e4m3 codes (|x| in [2^-4, 2^4])
+            auto code = [&]() { uint8_t e = 3 + rng() % 9, m = rng() % 8, s = rng() % 2; return (uint8_t)((s << 7) | (e << 3) | m); };
+            for (size_t i = 0; i < af.size(); i++) { ha[i] = code(); af[i] = e4m3_to_f(ha[i]); }
+            for (size_t i = 0; i < bf.size(); i++) { hb[i] = code(); bf[i] = e4m3_to_f(hb[i]); }
+        }
         sa_row.resize(M); sb_col.resize(N);
         for (auto& s : sa_row) s = 1e-3f * (1 + (rng() % 100) / 100.0f);
         for (auto& s : sb_col) s = 1e-3f * (1 + (rng() % 100) / 100.0f);
@@ -163,6 +169,13 @@ int main(int argc, char** argv) {
         a.ptr(0, dC); a.ptr(16, nullptr); a.ptr(32, dA); a.ptr(48, dB); a.f32(64, 1.0f); a.f32(80, 0.0f);
         a.u32(96, N); a.u32(128, N); a.u32(160, K); a.u32(192, K); a.u32(224, M); a.u32(240, N); a.u32(256, K);
         a.ptr(272, dSA); a.ptr(288, dSB); a.u32(304, sn); a.u32(336, sn2); a.u32(368, 0); a.b.resize(372);
+    } else if (fam == "ours_v4_rowcol_fp8") {
+        // our v4 structure, 96-byte ABI: A, B (preshuffled), C, M N K batch, strides, sfa = row scales f32 [M], sfb = column scales f32 [N], KT
+        dSA = dev(sa_row); dSB = dev(sb_col);
+        a.ptr(0, dA); a.ptr(8, dB); a.ptr(16, dC);
+        int iv[10] = {M, N, K, 1, K, K, N, 0, 0, 0};
+        for (int i = 0; i < 10; i++) a.u32(24 + 4 * i, iv[i]);
+        a.ptr(64, dSA); a.ptr(72, dSB); a.u32(80, M); a.u32(84, K / 128); a.u32(88, 0); a.u32(92, 0); a.b.resize(96);
     } else if (ours) {
         // ours: A, B, C, then scales (i8: row, col; fp8bs: A [M, K/128] row-major, B [N/128, K/128]; f4: A, B e8m0 [rows, K/32]), then M N K
         size_t o = 0;
@@ -206,7 +219,7 @@ int main(int argc, char** argv) {
                 }
             } else {
                 for (int k = 0; k < K; k++) { double t = (double)af[(size_t)m * K + k] * bf[(size_t)n * K + k]; ref += t; mag += std::fabs(t); }
-                if (kind == "i8") { ref *= (double)sa_row[m] * sb_col[n]; mag *= (double)sa_row[m] * sb_col[n]; }
+                if (kind == "i8" || kind == "rowcol_fp8") { ref *= (double)sa_row[m] * sb_col[n]; mag *= (double)sa_row[m] * sb_col[n]; }
             }
             double got = bf16_to_f(out[(size_t)m * N + n]);
             // bf16 output (2^-8 relative) + fp32 accumulation over K terms of magnitude sum `mag` (cancellation): 1e-4 mag
