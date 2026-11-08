@@ -478,6 +478,26 @@ impl PipeBody for Body {
     fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
         self.stage_now(b, key0, slot);
     }
+    /// MMAs `from..to` (in row-major order over the first half of the B fragments) of the register tile.
+    fn early_mmas(&mut self, b: &mut FnBuilder, from: usize, to: usize) {
+        let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
+        let nn = bv.len();
+        let half = nn / 2;
+        let mut n = 0;
+        'o: for i in 0..av.len() {
+            for j in 0..half {
+                if n >= to {
+                    break 'o;
+                }
+                if n >= from {
+                    let (w, by) = self.sa_sel(i);
+                    mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
+                }
+                n += 1;
+            }
+        }
+        self.npre_done = n;
+    }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
         {
             let (p, sj) = (&self.panel, &self.panel.sfa);
