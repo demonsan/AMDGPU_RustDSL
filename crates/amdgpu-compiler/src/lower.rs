@@ -214,6 +214,7 @@ struct Lowerer {
     read_counts: HashMap<ValueId, usize>,
     /// wave-uniform values (amdgpu_dsl::uniform_values)
     dsl_uniform: std::collections::HashSet<ValueId>,
+    dsl_uniform_vars: std::collections::HashSet<amdgpu_dsl::VarId>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
     /// AGPR requests from the IR (resolved to vregs in inish).
@@ -343,6 +344,7 @@ impl Lowerer {
             view_copy: amdgpu_dsl::facts::stale_view_roots(f),
             read_values: f.stmts().iter().flat_map(amdgpu_dsl::facts::stmt_value_uses).collect(),
             dsl_uniform: amdgpu_dsl::uniform_values(f).0,
+            dsl_uniform_vars: amdgpu_dsl::uniform_values(f).1,
             read_counts: {
                 let mut c: HashMap<ValueId, usize> = HashMap::new();
                 for s in f.stmts() {
@@ -2294,7 +2296,11 @@ impl Lowerer {
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
                     }
-                    Op::NotI1(inner) => return self.lower_condition(inner, !negate),
+                    // folding the negation into the branch polarity is only valid for a WAVE-UNIFORM condition: for a per-lane one (an `any_lane`
+                    // branch) "some lane has !c" is not "no lane has c" - materialise !c and branch on it instead
+                    Op::NotI1(inner) if self.opnd_uniform(inner) => return self.lower_condition(inner, !negate),
+                    // any_lane(c): the wave-level branch on c itself (negated: "no lane has c" = !any_lane(c), exact)
+                    Op::AnyLane(inner) => return self.lower_condition(inner, negate),
                     _ => {}
                 }
             }
@@ -2304,6 +2310,14 @@ impl Lowerer {
         self.push(MInst::new(MOp::VCmpNeI32).srcreg(r).srcreg(zero));
         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
         Ok((on, vec![Src::Reg(r), Src::Reg(zero)]))
+    }
+
+    fn opnd_uniform(&self, o: Opnd) -> bool {
+        match o {
+            Opnd::I32(_) | Opnd::F32(_) => true,
+            Opnd::Val(v) => self.dsl_uniform.contains(&v),
+            Opnd::Var(v) => self.dsl_uniform_vars.contains(&v),
+        }
     }
 
     fn lower_op(&mut self, dst: ValueId, op: &Op) -> Result<(), String> {
@@ -4837,7 +4851,6 @@ fn subst_stmt(s: &Stmt, map: &HashMap<ValueId, Opnd>) -> Stmt {
         Stmt::BeginIf { cond } => Stmt::BeginIf { cond: sub(cond) },
         Stmt::BreakIf { cond } => Stmt::BreakIf { cond: sub(cond) },
         Stmt::Let { dst, op: Op::Select { ty, cond, a, b } } => Stmt::Let { dst: *dst, op: Op::Select { ty: *ty, cond: sub(cond), a: sub(a), b: sub(b) } },
-        Stmt::Let { dst, op: Op::NotI1(a) } => Stmt::Let { dst: *dst, op: Op::NotI1(sub(a)) },
         other => other.clone(),
     }
 }

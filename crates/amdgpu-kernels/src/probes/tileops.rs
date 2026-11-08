@@ -1019,3 +1019,49 @@ pub fn probe_big_addr() -> Function {
     }
     b.finish()
 }
+
+/// `probe_anylane(in, out)`: wave-level branches on negated per-lane conditions (`any_lane(!c)` must be taken when SOME lane has !c). out plane
+/// k (64 dwords) = 1 in every lane when branch k was entered, else 0: 0 any_lane(!(tid != 0)) -> taken (lane 0); 1 any_lane(!(tid >= 0)) -> not
+/// taken; 2 any_lane(tid == 5) (a == compare) -> taken; 3 a uniform !(1 < 0) -> taken; 4 any_lane(tid >= 0) (all lanes) -> taken; 5
+/// any_lane(tid < 0) (no lane) -> not taken; 6 any_lane(!(tid >= 64)) (all) -> taken; 7 any_lane(CmpLtI32(tid, 3)) (3 lanes, the folded
+/// v_cmp path) -> taken; 8 any_lane(!CmpLtI32(tid, 3)) (61 lanes) -> taken.
+pub fn probe_anylane() -> Function {
+    use amdgpu_dsl::MemTy;
+    let mut b = FnBuilder::new("probe_anylane", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(256));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(9 * 256));
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    for k in 0..9u32 {
+        b.store_global(pout, 256 * k, 0, MemTy::B32, false);
+    }
+    b.wait_vm(0);
+    let ne0 = b.cmp(CmpPred::Ne, CmpTy::I32, tid, 0);
+    let ge0 = b.cmp(CmpPred::Ge, CmpTy::I32, tid, 0);
+    let eq5 = b.cmp(CmpPred::Eq, CmpTy::I32, tid, 5);
+    let ulit = b.cmp(CmpPred::Lt, CmpTy::I32, 1, 0);
+    let lt0 = b.cmp(CmpPred::Lt, CmpTy::I32, tid, 0);
+    let ge64 = b.cmp(CmpPred::Ge, CmpTy::I32, tid, 64);
+    let ltl = b.let_(Op::CmpLtI32(Opnd::Val(tid), Opnd::I32(3)));
+    let conds = [
+        { let n = b.let_(Op::NotI1(Opnd::Val(ne0))); b.any_lane(n) },
+        { let n = b.let_(Op::NotI1(Opnd::Val(ge0))); b.any_lane(n) },
+        b.any_lane(eq5),
+        b.let_(Op::NotI1(Opnd::Val(ulit))),
+        b.any_lane(ge0),
+        b.any_lane(lt0),
+        { let n = b.let_(Op::NotI1(Opnd::Val(ge64))); b.any_lane(n) },
+        b.any_lane(ltl),
+        { let n = b.let_(Op::NotI1(Opnd::Val(ltl))); b.any_lane(n) },
+    ];
+    for (k, c) in conds.into_iter().enumerate() {
+        b.begin_if(Opnd::Val(c));
+        b.store_global(pout, 256 * k as u32, 1, MemTy::B32, false);
+        b.end_if();
+    }
+    b.finish()
+}
