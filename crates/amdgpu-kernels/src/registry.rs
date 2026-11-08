@@ -96,8 +96,9 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("pa_decode16_bf16_hd128_p") => {
             // pa_decode16_bf16_hd128_p<P>[_k64]
             let rest = &n["pa_decode16_bf16_hd128_p".len()..];
+            let (rest, kreg) = match rest.strip_suffix("_kr") { Some(p) => (p, true), None => (rest, false) };
             let (p, kt) = match rest.strip_suffix("_k64") { Some(p) => (p, 64), None => (rest, 32) };
-            p.parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::decode16::pa_decode16_bf16_hd128(n, p, kt))
+            p.parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::decode16::pa_decode16_bf16_hd128_x(n, p, kt, kreg))
         }
         n if n.starts_with("pa_decode_bf16_hd128_p") => n["pa_decode_bf16_hd128_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::decode::pa_decode_bf16_hd128(n, p)),
         n if n.starts_with("fmha_fwd_hd") && n.contains("_bf16") => {
