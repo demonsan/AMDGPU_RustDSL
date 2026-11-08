@@ -112,8 +112,8 @@ int main(int argc, char** argv) {
         HC(hipModuleGetFunction(&cfn, cm, sinks ? "attn_combine_bf16_sink_hd128" : "attn_combine_bf16_hd128"));
         void *dk = fp8kv ? (void*)dev(kq) : (void*)dev(kc), *dv = fp8kv ? (void*)dev(vq) : (void*)dev(vc), *dpo, *dpl;
         HC(hipMalloc(&dpo, (size_t)B * QL * H * NS * D * 4)); HC(hipMalloc(&dpl, (size_t)B * QL * H * NS * 4));
-        a.assign(16 * (QL > 1 ? 16 : fp8kv ? 15 : 13), 0);
-        if (QL > 1) memcpy(&a[240], &QL, 4);
+        a.assign(16 * 16, 0);
+        memcpy(&a[240], &QL, 4);  // (qlen: read by the _mtp kernels only)
         if (fp8mode == 2) { void *dks = dev(kss), *dvs = dev(vss); memcpy(&a[208], &dks, 8); memcpy(&a[224], &dvs, 8); }
         else if (fp8kv) { memcpy(&a[208], &ksc, 4); memcpy(&a[224], &vsc, 4); }
         auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
