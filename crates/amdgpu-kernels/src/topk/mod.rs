@@ -10,6 +10,9 @@
 //!
 //! E a multiple of 8, 32..=512; K in 1..=16. 4 waves per block, grid = ceil(T / (4 RPW)). ABI: gating @0 (bf16 [T][E]), weights @8 (f32 [T][K]), indices @16 (i32 [T][K]), T @24 (i32).
 
+pub mod gate;
+pub mod perrow;
+
 use amdgpu_dsl::{CachePolicy, CmpPred, CmpTy, CompileProfile, MemTy, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
 use amdgpu_tile::prims::{bf16x8_to_f32, group_reduce_dpp, lane_reduce, RedOp};
 use amdgpu_tile::shared::PrivRef;
