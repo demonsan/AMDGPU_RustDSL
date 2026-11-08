@@ -432,34 +432,10 @@ impl Captured {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
-    /// Facts of every top-level node. A node that uses a register VIEW of a loop variable (`view_source`: lane extracts, `var_slice8`,
-    /// bitcasts of a variable or of a view) also READS that variable: the view has no register of its own, so its value is the variable's
-    /// register at each use (lowering copies the view at its definition only when a use would otherwise see a later write: `stale_view_roots`).
-    /// Ordering such uses before the variable's next write keeps the zero-copy alias.
+    /// Facts of every top-level node (`FnBuilder::facts` adds the variables read through register views; lowering keeps views SSA-correct
+    /// regardless: `stale_view_roots`).
     pub fn facts(&self, f: &Function) -> Vec<Facts> {
-        let mut all: Vec<Stmt> = f.stmts().to_vec();
-        flatten_into(&self.nodes, &mut all);
-        let views = var_views(all.iter());
-        self.nodes
-            .iter()
-            .map(|n| {
-                let mut x = node_facts(n, &f.value_tys);
-                let mut inner = Vec::new();
-                flatten_into(std::slice::from_ref(n), &mut inner);
-                for st in &inner {
-                    for u in stmt_value_uses(st) {
-                        if let Some((v, _)) = views.get(&u) {
-                            // a view-producing Let only forwards the view: its own uses are counted where the derived value is used
-                            let forwards = matches!(st, Stmt::Let { op, .. } if view_source(op).is_some());
-                            if !forwards {
-                                push_unique(&mut x.var_reads, *v);
-                            }
-                        }
-                    }
-                }
-                x
-            })
-            .collect()
+        self.nodes.iter().map(|n| node_facts(n, &f.value_tys)).collect()
     }
     /// Facts of the whole capture as one unit (defs / uses / variables / effects / footprint of all its nodes).
     pub fn summary(&self, f: &Function) -> Facts {
