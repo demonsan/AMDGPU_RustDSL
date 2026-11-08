@@ -291,7 +291,7 @@ impl Lowerer {
                     count(lds_addr);
                 }
                 Stmt::SetVar { value, .. } => count(value),
-                Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::VarMfma { .. } | Stmt::AtomicLdsNoRet { .. } | Stmt::AtomicGlobalNoRet { .. } => {
+                Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::VarMfma { .. } | Stmt::AtomicLdsNoRet { .. } | Stmt::AtomicGlobalNoRet { .. } | Stmt::BufferAtomicNoRet { .. } => {
                     for o in amdgpu_dsl::stmt_operands(st) {
                         count(&o);
                     }
@@ -1981,6 +1981,20 @@ impl Lowerer {
                     let v = self.as_v1(*value)?;
                     self.touch(&[Src::Reg(v)]);
                     self.push(MInst::new(lds_atomic_mop(*op, false)).srcreg(a).srcreg(v).imm(off));
+                }
+                Stmt::BufferAtomicNoRet { op, rsrc, voff, soff, imm, value } => {
+                    use amdgpu_dsl::AtomicOp as A;
+                    let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
+                    let v = self.as_v1(*value)?;
+                    self.touch(&[Src::Reg(v)]);
+                    let mop = match op {
+                        A::AddU32 => MOp::BufferAtomicAddU32,
+                        A::AddF32 => MOp::BufferAtomicAddF32,
+                        A::PkAddBf16 => MOp::BufferAtomicPkAddBf16,
+                        A::PkAddF16 => MOp::BufferAtomicPkAddF16,
+                        o => return Err(format!("buffer atomic {o:?} is not supported")),
+                    };
+                    self.push(MInst::new(mop).srcreg(v).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
                 }
                 Stmt::AtomicGlobalNoRet { op, base, byte_off, value } => {
                     let rb = self.as_v2(*base)?;
@@ -4568,6 +4582,7 @@ fn lds_atomic_mop(o: amdgpu_dsl::AtomicOp, rtn: bool) -> MOp {
         (A::IncU32, true) => MOp::LdsAtomicIncU32Rtn,
         (A::AddF32, false) => MOp::LdsAtomicAddF32,
         (A::AddF32, true) => MOp::LdsAtomicAddF32Rtn,
+        (A::PkAddBf16 | A::PkAddF16, _) => MOp::LdsAtomicAddF32Rtn, // rejected by the verifier (no LDS packed 16-bit atomics here)
     }
 }
 
@@ -4588,6 +4603,10 @@ fn global_atomic_mop(o: amdgpu_dsl::AtomicOp, rtn: bool) -> MOp {
         (A::IncU32, true) => MOp::GlobalAtomicIncU32Rtn,
         (A::AddF32, false) => MOp::GlobalAtomicAddF32,
         (A::AddF32, true) => MOp::GlobalAtomicAddF32Rtn,
+        (A::PkAddBf16, false) => MOp::GlobalAtomicPkAddBf16,
+        (A::PkAddBf16, true) => MOp::GlobalAtomicPkAddBf16Rtn,
+        (A::PkAddF16, false) => MOp::GlobalAtomicPkAddF16,
+        (A::PkAddF16, true) => MOp::GlobalAtomicPkAddF16Rtn,
     }
 }
 

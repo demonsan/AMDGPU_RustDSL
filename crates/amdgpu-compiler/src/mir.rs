@@ -481,6 +481,15 @@ pub enum MOp {
     GlobalLoadF32Sc1,
     GlobalStoreF32Sc1,
     GlobalAtomicAddRet,
+    // buffer atomics (srcs: data, rsrc, voffset, soffset; imm offset) and packed 16-bit global atomics
+    BufferAtomicAddU32,
+    BufferAtomicAddF32,
+    BufferAtomicPkAddBf16,
+    BufferAtomicPkAddF16,
+    GlobalAtomicPkAddBf16,
+    GlobalAtomicPkAddBf16Rtn,
+    GlobalAtomicPkAddF16,
+    GlobalAtomicPkAddF16Rtn,
     // B3 atomics (LDS: srcs addr, data, imm = offset; global: srcs ptr, data, imm = offset; `Rtn`: returns the old value)
     LdsAtomicAddU32,
     LdsAtomicAddU32Rtn,

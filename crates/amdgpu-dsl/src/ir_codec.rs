@@ -578,6 +578,7 @@ impl FromIr for Stmt {
             "BufferStoreN" => { v.expect_struct("BufferStoreN")?; Ok(Stmt::BufferStoreN { rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)?, cache: FromIr::from_ir(v.field("cache")?)? }) }
             "StoreLdsN" => { v.expect_struct("StoreLdsN")?; Ok(Stmt::StoreLdsN { addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
             "AtomicLdsNoRet" => { v.expect_struct("AtomicLdsNoRet")?; Ok(Stmt::AtomicLdsNoRet { op: FromIr::from_ir(v.field("op")?)?, addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
+            "BufferAtomicNoRet" => { v.expect_struct("BufferAtomicNoRet")?; Ok(Stmt::BufferAtomicNoRet { op: FromIr::from_ir(v.field("op")?)?, rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
             "AtomicGlobalNoRet" => { v.expect_struct("AtomicGlobalNoRet")?; Ok(Stmt::AtomicGlobalNoRet { op: FromIr::from_ir(v.field("op")?)?, base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
             "StoreLds2" => { v.expect_struct("StoreLds2")?; Ok(Stmt::StoreLds2 { addr: FromIr::from_ir(v.field("addr")?)?, v0: FromIr::from_ir(v.field("v0")?)?, v1: FromIr::from_ir(v.field("v1")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
             "VarMfma" => { v.expect_struct("VarMfma")?; Ok(Stmt::VarMfma { var: FromIr::from_ir(v.field("var")?)?, kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, scale: FromIr::from_ir(v.field("scale")?)?, zero: FromIr::from_ir(v.field("zero")?)? }) }
@@ -640,6 +641,7 @@ impl IrIds for Stmt {
             Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi, cache } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); IrIds::ids(&mut (*cache), fv, fr); }
             Stmt::StoreLdsN { addr, value, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
             Stmt::AtomicLdsNoRet { op, addr, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
+            Stmt::BufferAtomicNoRet { op, rsrc, voff, soff, imm, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
             Stmt::AtomicGlobalNoRet { op, base, byte_off, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
             Stmt::StoreLds2 { addr, v0, v1, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*v0), fv, fr); IrIds::ids(&mut (*v1), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
             Stmt::VarMfma { var, kind, a, b, scale, zero } => { fr(&mut (*var)); IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*scale), fv, fr); IrIds::ids(&mut (*zero), fv, fr); }
@@ -1371,6 +1373,8 @@ impl FromIr for AtomicOp {
             "MinI32" => { v.expect_unit("MinI32")?; Ok(AtomicOp::MinI32) }
             "IncU32" => { v.expect_unit("IncU32")?; Ok(AtomicOp::IncU32) }
             "AddF32" => { v.expect_unit("AddF32")?; Ok(AtomicOp::AddF32) }
+            "PkAddBf16" => { v.expect_unit("PkAddBf16")?; Ok(AtomicOp::PkAddBf16) }
+            "PkAddF16" => { v.expect_unit("PkAddF16")?; Ok(AtomicOp::PkAddF16) }
             other => Err(v.err(format!("unknown AtomicOp variant `{other}`"))),
         }
     }
@@ -1385,6 +1389,8 @@ impl IrIds for AtomicOp {
             AtomicOp::MinI32 => {}
             AtomicOp::IncU32 => {}
             AtomicOp::AddF32 => {}
+            AtomicOp::PkAddBf16 => {}
+            AtomicOp::PkAddF16 => {}
         }
     }
 }
