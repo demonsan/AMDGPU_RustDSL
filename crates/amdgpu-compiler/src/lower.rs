@@ -208,6 +208,8 @@ struct Lowerer {
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
     /// root register views of loop variables that must be copied at their definition (a use would otherwise see a later write of the variable: `facts::stale_view_roots`)
     view_copy: std::collections::HashSet<ValueId>,
+    /// every value some statement reads (precise: through the generated id visitor)
+    read_values: std::collections::HashSet<ValueId>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
     /// AGPR requests from the IR (resolved to vregs in inish).
@@ -335,6 +337,7 @@ impl Lowerer {
             },
             alias_cache: HashMap::new(),
             view_copy: amdgpu_dsl::facts::stale_view_roots(f),
+            read_values: f.stmts().iter().flat_map(amdgpu_dsl::facts::stmt_value_uses).collect(),
             else_started: HashSet::new(),
             agpr_marks: f.agpr.clone(),
             reg_plan: f.reg_plan.clone(),
@@ -2234,7 +2237,7 @@ impl Lowerer {
                 | Op::LoadLdsTr4B8 { .. } | Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } | Op::LoadLdsN { .. }
                 | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. }
         );
-        if pure_load && self.use_counts.get(&dst).copied().unwrap_or(0) == 0 {
+        if pure_load && !self.read_values.contains(&dst) {
             return Ok(());
         }
         match op {
@@ -2322,13 +2325,13 @@ impl Lowerer {
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
             // a returning atomic whose result is unused: the no-return form (a dead destination would be reused by the allocator while the
             // atomic is still in flight, and its late write would clobber the new value)
-            Op::AtomicLds { op, addr, value } if self.use_counts.get(&dst).copied().unwrap_or(0) == 0 => {
+            Op::AtomicLds { op, addr, value } if !self.read_values.contains(&dst) => {
                 let (a, off) = self.lds_addr(*addr)?;
                 let v = self.as_v1(*value)?;
                 self.touch(&[Src::Reg(v)]);
                 self.push(MInst::new(lds_atomic_mop(*op, false)).srcreg(a).srcreg(v).imm(off));
             }
-            Op::AtomicGlobal { op, base, byte_off, value } if self.use_counts.get(&dst).copied().unwrap_or(0) == 0 => {
+            Op::AtomicGlobal { op, base, byte_off, value } if !self.read_values.contains(&dst) => {
                 let rb = self.as_v2(*base)?;
                 let v = self.as_v1(*value)?;
                 self.touch(&[Src::Reg(v)]);
