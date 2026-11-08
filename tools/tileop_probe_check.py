@@ -715,6 +715,17 @@ def tr_b16_formula(l, e, extra):
     return None
 
 def check_tr_b16_p1(planes, out):
+    ok = True
+    for j in range(2):
+        for l in range(LANES):
+            w = out[j * 128 + 2 * l: j * 128 + 2 * l + 2]
+            vals = [(w[0] & 0xFFFF), w[0] >> 16, w[1] & 0xFFFF, w[1] >> 16]
+            want = [256 * j + 4 * (16 * (l // 16) + (l % 16) // 4 + 4 * e) + l % 4 for e in range(4)]
+            if vals != want:
+                ok = False
+    print("tr_b16 map " + ("matches lane d <- element d % 4 of lanes 16 (d / 16) + (d % 16) / 4 + 4 e" if ok else "MISMATCH"))
+    if ok and "-v" not in sys.argv:
+        return True
     for j in range(2):
         print(f"read {j}: lane: [values / 4 (source lane), values % 4 (element)]")
         for l in range(LANES):
@@ -722,7 +733,7 @@ def check_tr_b16_p1(planes, out):
             vals = [(w[0] & 0xFFFF), w[0] >> 16, w[1] & 0xFFFF, w[1] >> 16]
             base = 256 * j
             print(f"  {l:2d}: {[(v - base) // 4 for v in vals]} {[(v - base) % 4 for v in vals]}")
-    return True
+    return ok
 
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
