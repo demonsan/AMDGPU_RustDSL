@@ -45,7 +45,8 @@ one "rope_neox h8 d128" $RP $O/rope_neox_bf16_h8_d128.co rope_neox_bf16_h8_d128 
 one "rope_neox h40 d64 corr" $RP $O/rope_neox_bf16_h40_d64.co rope_neox_bf16_h40_d64 neox 17 40 64 5
 one "cache h8 d128" $CA $O/reshape_cache_flash_bf16_h8_d128.co reshape_cache_flash_bf16_h8_d128 131072 8 128 150000 50
 one "cache h5 d64 corr" $CA $O/reshape_cache_flash_bf16_h5_d64.co reshape_cache_flash_bf16_h5_d64 77 5 64 200 5
-one "cache_blocked h8 d128 b16" $CB $O/reshape_cache_blocked_bf16_h8_d128_b16.co reshape_cache_blocked_bf16_h8_d128_b16 131072 8 128 16 9400 50
+one "cache_blocked h8 d128 b16 random slots" $CB $O/reshape_cache_blocked_bf16_h8_d128_b16.co reshape_cache_blocked_bf16_h8_d128_b16 131072 8 128 16 9400 50
+CONTIG=1 one "cache_blocked h8 d128 b16 contiguous slots" $CB $O/reshape_cache_blocked_bf16_h8_d128_b16.co reshape_cache_blocked_bf16_h8_d128_b16 131072 8 128 16 9400 50
 one "cache_blocked h8 d64 b64 corr" $CB $O/reshape_cache_blocked_bf16_h8_d64_b64.co reshape_cache_blocked_bf16_h8_d64_b64 131 8 64 64 6 5
 one "topk e128 k8 T=65536" $TK $O/topk_softmax_bf16_e128_k8.co topk_softmax_bf16_e128_k8 65536 128 8 plain 100
 one "topk renorm e256 k8 T=65536" $TK $O/topk_softmax_renorm_bf16_e256_k8.co topk_softmax_renorm_bf16_e256_k8 65536 256 8 renorm 100
