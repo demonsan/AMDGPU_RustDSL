@@ -131,6 +131,10 @@ pub enum Elem {
     /// fp4 e2m1 (two per byte, low nibble first): two scaled `v_mfma_scale_f32_16x16x128_f8f6f4` (fp4 x fp4) per block and 128-byte K tile
     /// (= 256 elements), one per 16-byte half (32 K-contiguous elements per lane)
     Fp4,
+    /// A8W4 (`gemm_a8w4_mxfp_128`): A fp8 e4m3 (MXFP8), B fp4 e2m1 (MXFP4), 1 x 32 E8M0 scales on both. A K tile is 256 elements: the B tile
+    /// is 128 bytes, the A tile two 128-byte halves (lo / hi images of the ring slot, two A register fragments per m block); per block two
+    /// scaled `16x16x128` fp8 x fp4 MFMAs (A half h with the 16-byte B half h, scale byte h)
+    Fp8W4,
 }
 
 impl Elem {
@@ -139,7 +143,7 @@ impl Elem {
         match self {
             Elem::Fp8 | Elem::Fp8Bs => 128,
             Elem::Bf16 => 64,
-            Elem::Fp4 => 256,
+            Elem::Fp4 | Elem::Fp8W4 => 256,
         }
     }
 }
@@ -201,6 +205,10 @@ impl GemmConfig {
         GemmConfig { scales: Scales::Mx32, elem: Elem::Fp4, scale_shuf: true, ..GemmConfig::v4() }
     }
     /// MXFP4 A4W4 with a 128 x 128 CTA.
+    /// A8W4 (MXFP8 activations x MXFP4 weights, both shuffled 1 x 32 scales), 128 x 128 CTA.
+    pub fn a8w4_128() -> GemmConfig {
+        GemmConfig { elem: Elem::Fp8W4, ..GemmConfig::a4w4_128() }
+    }
     pub fn a4w4_128() -> GemmConfig {
         GemmConfig { cta_m: 128, cta_n: 128, ..GemmConfig::a4w4() }
     }
@@ -238,15 +246,34 @@ fn smem_block() -> Layout {
 /// `gemm` on loop variables (the operands of the register-staged tile are loop-carried): same operand / scale exchange as `amdgpu_tile::gemm`.
 #[allow(clippy::too_many_arguments)]
 fn mma_var(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueId>, acc: VarId, a: VarId, bf: VarId, sa: VarId, sb: VarId, byte_a: u8) {
-    let p = mma_blocks(b, mma, elem, unit, &[(acc, a, bf, sa, sb, byte_a)]);
+    let p = mma_blocks(b, mma, elem, unit, &[(acc, a, bf, sa, sb, byte_a)], 0);
     assert!(p.is_empty(), "mma_var: block-scaled MMAs go through mma_blocks");
 }
 
 /// The MMAs of several 16 x 16 blocks of the K tile (acc, A frag, B frag, A scale, B scale, A scale byte). fp8: one scaled MFMA per block.
 /// bf16: the 32-byte fragments are two 16-byte bf16 operands (8 elements each, the same K permutation for A and B); the first halves of every
 /// block, then the second halves, so the two MFMAs into one accumulator are not back to back.
-fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueId>, blocks: &[(VarId, VarId, VarId, VarId, VarId, u8)]) -> Vec<(VarId, ValueId, VarId, VarId)> {
+/// `a_hi_off` (A8W4): the hi A fragment of the A variable v is VarId(v + a_hi_off) (the loop state lays the hi fragments right after the lo ones).
+fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueId>, blocks: &[(VarId, VarId, VarId, VarId, VarId, u8)], a_hi_off: u32) -> Vec<(VarId, ValueId, VarId, VarId)> {
     assert_eq!(mma.atom().name, "MfmaScale16x16x128F8");
+    if elem == Elem::Fp8W4 {
+        // per block, half h: A fragment (lo / hi, 32 bytes = 128 fp8), B 16-byte half h (128 fp4), scale byte h of both scale words
+        for h in 0..2u8 {
+            for &(acc, a, bf, sa, sb, byte_a) in blocks {
+                let ah = if h == 0 { a } else { VarId(a.0 + a_hi_off) };
+                let ys = b.var_slice4(bf, h);
+                let _ = byte_a;
+                if mma.swap_ab {
+                    let k = amdgpu_dsl::MmaKind::scaled_f8f6f4(amdgpu_dsl::MmaShape::M16N16K128, amdgpu_dsl::MmaTy::Fp4, amdgpu_dsl::MmaTy::Fp8);
+                    b.var_mfma_scaled(acc, k, ys, Opnd::Var(ah), amdgpu_dsl::MmaScale { sa: Opnd::Var(sb), sb: Opnd::Var(sa), opsel: h | (h << 4) }, false);
+                } else {
+                    let k = amdgpu_dsl::MmaKind::scaled_f8f6f4(amdgpu_dsl::MmaShape::M16N16K128, amdgpu_dsl::MmaTy::Fp8, amdgpu_dsl::MmaTy::Fp4);
+                    b.var_mfma_scaled(acc, k, Opnd::Var(ah), ys, amdgpu_dsl::MmaScale { sa: Opnd::Var(sa), sb: Opnd::Var(sb), opsel: h | (h << 4) }, false);
+                }
+            }
+        }
+        return Vec::new();
+    }
     let ops = |&(acc, a, bf, sa, sb, byte_a): &(VarId, VarId, VarId, VarId, VarId, u8)| {
         if mma.swap_ab { (acc, bf, a, sb, sa, 0, byte_a) } else { (acc, a, bf, sa, sb, byte_a, 0) }
     };
@@ -332,7 +359,7 @@ fn declare_abi(b: &mut FnBuilder) {
 /// The host contract of the ABI for a `cta_m x cta_n` CTA (what `gpu-verify` proves the accesses against): M = MT cta_m, N = NT cta_n, K = KT 128
 /// (the kernel has no partial tiles), the grid (NT, MT), dense strides (stride_a = stride_b = K, stride_c = N, stride_sfa = M, stride_sfb = K / 128),
 /// batch 1, and the tensor extents A M K, B N K (preshuffled, same size), C 2 M N, sa (K / 128) M, sb (N / 128) (K / 128) bytes.
-fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool, moe: Option<MoeStage>, conv: Option<ConvCfg>, batched: bool, per_tensor: bool) {
+fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool, moe: Option<MoeStage>, conv: Option<ConvCfg>, batched: bool, per_tensor: bool, a8w4: bool) {
     if let Some(cc) = conv {
         return declare_contract_conv(b, cta_m, cta_n, cc);
     }
@@ -381,7 +408,8 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, p
     b.ka_is(84, kt.clone());
     b.grid_is(0, nt.clone());
     b.grid_is(1, mt.clone());
-    b.arg_tensor("ptr_a", bt.clone() * m.clone() * k.clone());
+    // (A8W4: A is fp8, two bytes per B byte of K)
+    b.arg_tensor("ptr_a", bt.clone() * m.clone() * k.clone() * Ext::c(if a8w4 { 2 } else { 1 }));
     b.arg_tensor("ptr_b", bt.clone() * n.clone() * k.clone());
     if split {
         b.arg_tensor("ptr_c", bt.clone() * Ext::c(4) * Ext::sym("S") * m.clone() * n.clone());
@@ -694,6 +722,9 @@ struct Body {
     rsrc_sfb: ValueId,
     a_rd: LdsPart,
     b_rd: LdsPart,
+    /// A8W4: the hi A image (the lo partition moved by `a_hi`) and its LDS offset in the slot
+    a_rd_hi: Option<LdsPart>,
+    a_hi: i32,
     zero4: ValueId,
     acc: Vec<VarId>,
     /// MMAs of the register tile already issued by `pre_sync` / `post_wait`
@@ -737,7 +768,8 @@ impl Body {
         let half = nn / 2;
         let mut n = 0;
         let mut blocks = Vec::new();
-        'o: for i in 0..av.len() {
+        let nma = self.n_a();
+        'o: for i in 0..nma {
             for j in 0..half {
                 if n >= to {
                     break 'o;
@@ -749,7 +781,7 @@ impl Body {
                 n += 1;
             }
         }
-        let p = mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks);
+        let p = mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks, nma as u32);
         self.pending.borrow_mut().extend(p);
         self.npre_done = n;
     }
@@ -843,6 +875,10 @@ impl Body {
         }
     }
     /// An operand fragment read into AGPRs.
+    /// A fragments (m blocks) of the wave (A8W4 keeps lo + hi fragments: the A variables are twice as many)
+    fn n_a(&self) -> usize {
+        (self.cfg.wave_m() / 16) as usize
+    }
     fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
         let v = part.read(b, o);
         b.agpr(v)
@@ -856,7 +892,13 @@ impl Body {
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
         let bf: Vec<ValueId> = (0..nn).map(|j| self.frag(b, &br, j)).collect();
-        let af: Vec<ValueId> = (0..nm).map(|i| self.frag(b, &ar, i)).collect();
+        let mut af: Vec<ValueId> = (0..nm).map(|i| self.frag(b, &ar, i)).collect();
+        if self.cfg.elem == Elem::Fp8W4 {
+            // A8W4: the hi A fragments right after the lo ones (mma_blocks finds hi = lo + nm)
+            let arh = self.a_rd_hi.as_ref().expect("a8w4: hi part").at(b, &self.a_s.at(&t.cur));
+            let hi: Vec<ValueId> = (0..nm).map(|i| self.frag(b, &arh, i)).collect();
+            af.extend(hi);
+        }
         self.staged = Some((bf, af, sa, sb));
     }
     /// The MMAs of the register tile; when `t.staged`, each fragment is reloaded from tile t+1 right after its last use: first half of the B
@@ -880,15 +922,18 @@ impl Body {
     fn tile_stage(&self, b: &mut FnBuilder, t: &TileIt, phase: u32, roles: Vec<String>) -> amdgpu_tile::stage::StageInst<'static> {
         use amdgpu_tile::weave::Units;
         let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
-        let (nm, nn) = (av.len(), bv.len());
+        let (nm, nn) = (self.n_a(), bv.len());
         let half = nn / 2;
         let mut u = Units::new();
         let (_, (next, early)) = u.capture(b, "tile.setup", |b| {
             let next = t.staged.then(|| (self.a_rd.at(b, &self.a_s.at(&t.next)), self.b_rd.at(b, &self.b_s.at(&t.next))));
+            // A8W4: the hi A image of t + 1
+            let next_hi = (t.staged && self.cfg.elem == Elem::Fp8W4).then(|| self.a_rd_hi.as_ref().expect("a8w4: hi part").at(b, &self.a_s.at(&t.next)));
             // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and installed at the end (partial lgkm waits)
             let early = t.staged.then(|| self.load_scales(b, ox(t.it) + 1));
-            (next, early)
+            ((next, next_hi), early)
         });
+        let (next, next_hi) = next;
         // MMAs of the register tile with the in-place reloads of t+1 (into `u`)
         let body = |b: &mut FnBuilder, u: &mut Units| {
             // bf16 (two dependent K-half MFMAs per block): the blocks of a PAIR of rows form one unit (first halves of all, then second
@@ -911,7 +956,7 @@ impl Body {
                     }
                     if !blocks.is_empty() {
                         u.capture(b, format!("mma.i{i0}+{}h{lo}", rows_per_unit), |b| {
-                            let p = mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks);
+                            let p = mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks, nm as u32);
                             self.pending.borrow_mut().extend(p);
                         });
                     }
@@ -922,6 +967,12 @@ impl Body {
                                 let v = ar.read(b, i);
                                 b.set_var(av[i], v);
                             });
+                            if let Some(ah) = &next_hi {
+                                u.capture(b, format!("reload.ah{i}"), |b| {
+                                    let v = ah.read(b, i);
+                                    b.set_var(av[nm + i], v);
+                                });
+                            }
                         }
                     }
                 }
@@ -986,9 +1037,15 @@ impl Body {
         let mut u = amdgpu_tile::weave::Units::new();
         let (_, orgs) = u.capture(b, "ab.setup", |b| {
             // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0; the tile origins are wave uniform: SGPR soffsets
-            let ka = { let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v) };
+            // A8W4: A advances 2 key0 bytes (256 fp8 per 128-byte fp4 B tile)
+            let ka = if self.cfg.elem == Elem::Fp8W4 {
+                let v = b.bind_i32((key0.clone() << 1) + ev(self.a_org)); b.read_first_lane(v)
+            } else {
+                let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v)
+            };
             let kb = { let v = b.bind_i32((key0.clone() << 4) + ev(self.b_org)); b.read_first_lane(v) };
-            [ka, kb]
+            let kah = { let v = b.bind_i32(ev(ka) + 128); b.read_first_lane(v) };
+            [ka, kb, kah]
         });
         // implicit-GEMM conv: this tile's channel block and tap (wave uniform), then per A issue the input pixel's voffset (or out of range)
         let conv_vo: Option<Vec<ValueId>> = self.conv.as_ref().map(|cv| {
@@ -1029,10 +1086,15 @@ impl Body {
             });
             vo
         });
-        for (bi, (sh, dma, rsrc, wave)) in [(&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, self.rsrc_b, self.b_wave)].into_iter().enumerate() {
-            let (_, mine) = u.capture(b, format!("ab.{}.setup", sh.name), |b| {
+        // (A8W4: a third pass, the hi A image: LDS + a_hi, global + 128 bytes)
+        let mut passes = vec![(&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave, 0usize, 0i32), (&self.b_s, &self.b_dma, self.rsrc_b, self.b_wave, 1, 0)];
+        if self.cfg.elem == Elem::Fp8W4 {
+            passes.push((&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave, 2, self.a_hi));
+        }
+        for (bi, (sh, dma, rsrc, wave, oi, lds_off)) in passes.into_iter().enumerate() {
+            let (_, mine) = u.capture(b, format!("ab.{}.{bi}.setup", sh.name), |b| {
                 let o = sh.at(slot).off_v(b);
-                let sbase = b.bind_i32(o + sh.base as i32 + ev(wave));
+                let sbase = b.bind_i32(o + (sh.base as i32 + lds_off) + ev(wave));
                 let mut m0s: Vec<(i32, ValueId)> = Vec::new();
                 let mut mine: Vec<(ValueId, i32, ValueId)> = Vec::new();
                 for (g, lds) in dma.issues.iter() {
@@ -1051,9 +1113,9 @@ impl Body {
                 // block of each group of 4 issues, instruction offset 1024 (q % 4) moves both the LDS and the global address
                 let (g, so) = match (&conv_vo, bi) {
                     (Some(vo), 0) => (vo[q], self.conv.as_ref().map(|c| c.zero).unwrap()),
-                    _ => (g, orgs[bi]),
+                    _ => (g, orgs[oi]),
                 };
-                u.capture(b, format!("ab.{}.{q}", sh.name), |b| sh.at(slot).write(b, |b| b.load_buffer_lds(rsrc, g, so, m0, dma.act(lds).1, 4)));
+                u.capture(b, format!("ab.{}.{bi}.{q}", sh.name), |b| sh.at(slot).write(b, |b| b.load_buffer_lds(rsrc, g, so, m0, dma.act(lds).1, 4)));
             }
         }
         let contract = amdgpu_dsl::StageContract { barrier_phase: phase, roles: vec!["all".to_string()], ..Default::default() };
@@ -1120,6 +1182,11 @@ impl PipeBody for Body {
             let (nb, nf, ns, nsb) = (bf.len(), af.len(), sa.len(), sb.len());
             let r = &vars[na..];
             self.rv = Some((r[..nb].to_vec(), r[nb..nb + nf].to_vec(), r[nb + nf..nb + nf + ns].to_vec(), r[nb + nf + ns..nb + nf + ns + nsb].to_vec()));
+            if self.cfg.elem == Elem::Fp8W4 {
+                let av = &r[nb..nb + nf];
+                let nm = nf / 2;
+                assert!((0..nm).all(|i| av[nm + i].0 == av[i].0 + nm as u32), "a8w4: the hi A variables follow the lo ones");
+            }
         }
     }
     /// The next MMAs of the register tile between the waits and the barrier (the vendor issues 3 there): the barrier latency hides behind them.
@@ -1209,6 +1276,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_pertensor_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_pertensor_fp8_128", GemmConfig { per_tensor: true, ..GemmConfig::a8w8_rowcol_128() })),
         "gemm_a8w8_rowcol_fp8_bmm" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_bmm", GemmConfig { batched: true, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a4w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4", GemmConfig::a4w4())),
+        "gemm_a8w4_mxfp_128" => Some(gemm_mxfp8_bs("gemm_a8w4_mxfp_128", GemmConfig::a8w4_128())),
         "gemm_a4w4_mxfp4_128" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_128", GemmConfig::a4w4_128())),
         _ => None,
     }
@@ -1282,7 +1350,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         b.sched_opts(cfg.sched);
     }
     declare_abi(b);
-    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k, cfg.moe, cfg.conv, cfg.batched, cfg.per_tensor);
+    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k, cfg.moe, cfg.conv, cfg.batched, cfg.per_tensor, cfg.elem == Elem::Fp8W4);
     // timing stamps (opt-in debug build, GEMM_STAMP=ends|tiles): one extra pointer argument after the ABI (offset 96); see docs/stamps.md
     let stamp_mode = std::env::var("GEMM_STAMP").ok().filter(|v| v == "ends" || v == "tiles");
     if stamp_mode.is_some() {
@@ -1369,6 +1437,9 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let s_lane = ctx.sym("lane", 0, 63, lane.lane());
     let s_tid = ctx.sym("tid", 0, 255, ev(tid));
     let s_k = ctx.sym("K", 128, 1 << 20, ev(k_v));
+    // A row bytes: K bytes of B's element (A8W4: A is fp8, K elements = 2 B bytes)
+    let ka_v = if cfg.elem == Elem::Fp8W4 { k_el } else { k_v };
+    let s_ka = if cfg.elem == Elem::Fp8W4 { ctx.sym("KA", 256, 1 << 21, ev(ka_v)) } else { s_k.clone() };
     let s_n = ctx.sym("N", 128, 1 << 20, ev(n_v));
     let s_wm = ctx.sym("wm", 0, 1, ev(wm));
     let s_wn = ctx.sym("wn", 0, 1, ev(wn));
@@ -1382,7 +1453,9 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let mut lds = LdsPlan::new();
     let slots = 2;
     let a_bytes = cta_m / 8 * 1056;
-    let a_s = lds.ring("A", a_bytes, slots, amdgpu_tile::Layout::Linear);
+    // A8W4: two padded A images per slot (lo / hi 128-byte halves of the 256-element K tile)
+    let a8w4 = cfg.elem == Elem::Fp8W4;
+    let a_s = lds.ring("A", if a8w4 { 2 * a_bytes } else { a_bytes }, slots, amdgpu_tile::Layout::Linear);
     let b_s = lds.ring("B", cta_n * 128, slots, amdgpu_tile::Layout::Linear);
     let sc_s = lds.ring("SC", 4 * 512, slots, amdgpu_tile::Layout::Linear);
     // scale panel: A [PANEL_KB][256 rows] + B [2 blocks][PANEL_KB] (+ 4 bytes of source alignment slack, padded to 256 for the dword DMA)
@@ -1406,7 +1479,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let a_place: Vec<i64> = (0..wave_m / 16).map(|i| a_blk * i).collect();
     let b_place: Vec<i64> = (0..wave_n / 16).map(|j| 2048 * j).collect();
     // ---- DMA (A row-major into the padded image, B preshuffled), wave parts of M0, CTA origins ----
-    let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
+    let a_glob = make_layout(tup![cta_m, 128], tup![s_ka.clone(), 1]);
     let b_glob = make_layout(tup![tup![16, cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]);
     // MoE: the tile's rows, its expert, the live test (tiles past num_valid_ids[0] do nothing)
     let moe_cx = cfg.moe.map(|st| {
@@ -1492,7 +1565,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
             let n = b.read_first_lane(n);
             b.buffer_desc_dyn(ptr_a, n)
         }
-        None => { let n = b.bind_i32(ev(m_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_a, n) }
+        None => { let n = b.bind_i32(ev(m_v) * ev(ka_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_a, n) }
     };
     let rsrc_b = match &moe_cx {
         None => { let n = b.bind_i32(ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) }
@@ -1563,7 +1636,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
             (b.c_i32(0), b.bind_i32((ev(bx) << lg_n) * ev(k_v)))
         }
         None if cfg.conv.is_some() => (b.c_i32(0), b.bind_i32((ev(bx) << lg_n) * ev(k_v))),
-        None => (b.bind_i32((ev(by) << lg_m) * ev(k_v)), b.bind_i32((ev(bx) << lg_n) * ev(k_v))),
+        None => (b.bind_i32((ev(by) << lg_m) * ev(ka_v)), b.bind_i32((ev(bx) << lg_n) * ev(k_v))),
         Some(zb) => (b.bind_i32((ev(by) << lg_m) * ev(k_v) + (ev(zb) << 7)), b.bind_i32((ev(bx) << lg_n) * ev(k_v) + (ev(zb) << 11))),
     };
 
@@ -1678,6 +1751,8 @@ impl skeleton_v4::V4Slots for GemmSlots {
     });
     let body = Body {
         cfg, kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
+        a_rd_hi: a8w4.then(|| { let mut h = a_rd.clone(); h.bases = h.bases.iter().map(|x| b.let_i32(x.clone() + (a_bytes as i32))).collect(); h }),
+        a_hi: a_bytes as i32,
         a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb,
     };
         // MoE: everything after this runs only for tiles below num_valid_ids[0] (closed at the end of the epilogue)
