@@ -12,7 +12,7 @@
 //!   the transposed A operand of PV (`ds_read_u16_d16[_hi]`; to be replaced by `ds_read_b64_tr_b16`);
 //! * P = exp2(S c - m) packed to bf16 straight from the S^T accumulator: the PV k order per lane half h is keys {4h + 0..3, 8 + 4h + 0..3} of
 //!   each 16-key step, and the V^T reads use the same key order.
-use amdgpu_dsl::{CompileProfile, D16Ty, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
+use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
 use amdgpu_tile::components::gqa_kv_head;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
@@ -256,6 +256,16 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
     let lim = b.bind_i32(match &right { Some(r) => ev(row) + ev(qoff) + r.clone(), None => ev(s_kv) - 1 });
     let lim = b.bind_i32(ev(lim).min(ev(s_kv) - 1));
     let low = wins.map(|(l, _)| b.bind_i32(ev(row) + ev(qoff) - ev(l)));
+    // CTA-uniform bounds for the mask-free test: the smallest row limit (first row of the CTA) and the largest low bound (last row)
+    let lim_min = {
+        let r0 = b.bind_i32(ev(qt) << 7);
+        let v = b.bind_i32(match &right { Some(r) => (ev(r0) + ev(qoff) + r.clone()).min(ev(s_kv) - 1), None => ev(s_kv) - 1 });
+        b.read_first_lane(v)
+    };
+    let low_max = wins.map(|(l, _)| {
+        let v = b.bind_i32(((ev(qt) << 7) + 127).min(ev(s_q) - 1) + ev(qoff) - ev(l));
+        b.read_first_lane(v)
+    });
     // softmax constants: c = scale log2(e)
     let c_l2e = b.c_f32(std::f32::consts::LOG2_E);
     let csc = b.mul_f32(scale, c_l2e);
@@ -271,10 +281,11 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
     // loop vars: pair index, m, l, O^T x 4
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(m_init)), (DType::F32, Opnd::Val(l_init))];
     let nblk = (D / 32) as usize;
-    inits.extend((0..nblk).map(|_| (DType::Frag16, Opnd::Val(zero16))));
+    inits.extend((0..nblk + 2).map(|_| (DType::Frag16, Opnd::Val(zero16))));
     let vars = b.begin_loop(&inits);
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..3 + nblk].to_vec();
+    let s_vars: Vec<VarId> = vars[3 + nblk..5 + nblk].to_vec();
     if D == 256 {
         // 128 accumulator dwords: in AGPRs (the register file holds Q^T, S and P in VGPRs)
         for v in &ov {
@@ -302,7 +313,15 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
             None => b.bind_cond((ev(key0) + off).le(ev(lim))),
         };
         let (kslot, vslot) = (ks.at(&SlotIdx::new(slot, Opnd::Var(it))), vs.at(&SlotIdx::new(slot, Opnd::Var(it))));
-        tile_math(&mut b, &tm, kbase, vbase, &keep, m_v, l_v, &ov, &|b, f| kslot.read(b, |b| f(b)), &|b, f| vslot.read(b, |b| f(b)));
+        // tiles entirely inside every row's visible range skip the mask (uniform branch): last key <= the smallest row limit and first key >=
+        // the largest row low bound
+        let t_lo = b.bind_i32(ev(tile) * KT);
+        let full_c = match low_max {
+            Some(lm) => (ev(t_lo) + (KT - 1)).le(ev(lim_min)).select_i32(1, 0) & ev(t_lo).ge(ev(lm)).select_i32(1, 0),
+            None => (ev(t_lo) + (KT - 1)).le(ev(lim_min)).select_i32(1, 0),
+        };
+        let partial = b.bind_cond(full_c.eq(0));
+        tile_math(&mut b, &tm, kbase, vbase, Some((Some(partial), &keep)), m_v, l_v, &s_vars, &ov, &|b, f| kslot.read(b, |b| f(b)), &|b, f| vslot.read(b, |b| f(b)));
     }    let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
     let done = b.bind_cond(ev(it1).ge(ev(npair)));
@@ -380,32 +399,48 @@ pub(crate) type ReadScope<'a> = &'a dyn Fn(&mut FnBuilder, &mut dyn FnMut(&mut F
 /// One 64-key tile: S^T = K Q^T from the K tile at `kbase`, the online softmax update (`keep(off)`: key key0 + off of this lane is visible;
 /// m / l / O^T loop variables), O^T += V^T P^T from the V tile at `vbase` (V^T by 16-bit reads in the key order of the P packing).
 #[allow(non_snake_case, clippy::too_many_arguments)]
-pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, keep: &dyn Fn(&mut FnBuilder, i32) -> ValueId, m_v: VarId, l_v: VarId, ov: &[VarId], kscope: ReadScope, vscope: ReadScope) {
+/// The key mask of a tile: `keep(off)` per value, applied in place on the S^T variables, under the uniform branch `when` (None: always).
+pub(crate) type Mask<'a> = (Option<ValueId>, &'a dyn Fn(&mut FnBuilder, i32) -> ValueId);
+
+pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, mask: Option<Mask>, m_v: VarId, l_v: VarId, sv_vars: &[VarId], ov: &[VarId], kscope: ReadScope, vscope: ReadScope) {
     let (D, kind, csc, neg_inf) = (tm.d, tm.kind, tm.csc, tm.neg_inf);
     let ROW = 2 * D;
     let nblk = ov.len();
     // ---- S^T = K Q^T: 2 blocks of 32 keys, D / 16 MFMAs each ----
-    let mut s: Vec<ValueId> = Vec::new();
+    // (into the S^T variables: the mask below updates them in place under a branch that holds no LDS access)
     kscope(b, &mut |b| {
-        for sb in 0..2 {
-            let mut acc: Option<ValueId> = None;
+        for sb in 0..2usize {
             for c in 0..(D / 16) as usize {
-                let a = b.bind_i32(ev(tm.kr[c]) + kbase.clone() + sb * 32 * ROW);
+                let a = b.bind_i32(ev(tm.kr[c]) + kbase.clone() + sb as i32 * 32 * ROW);
                 let kf = b.load_lds_b128(a);
-                acc = Some(b.mfma(kind, kf, tm.qf[c], acc.map(Opnd::Val)));
+                b.var_mfma(sv_vars[sb], kind, kf, tm.qf[c], c == 0);
             }
-            s.push(acc.expect("MFMAs"));
         }
     });
+    if let Some((when, keep)) = mask {
+        if let Some(c) = when {
+            b.begin_if(Opnd::Val(c));
+        }
+        for sb in 0..2usize {
+            for r in 0..16u8 {
+                let off = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
+                let x = b.frag16_lane(Opnd::Var(sv_vars[sb]), r);
+                let x = b.bitcast_f32(x);
+                let k = keep(b, off);
+                let y = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(k), a: Opnd::Val(x), b: Opnd::Val(neg_inf) });
+                b.var_set_lane(sv_vars[sb], r, y);
+            }
+        }
+        if when.is_some() {
+            b.end_if();
+        }
+    }
     // ---- online softmax over the 64 keys (lane: one query, values = keys 32 sb + 8 (r / 4) + 4 h + r % 4) ----
     let mut sv: Vec<ValueId> = Vec::with_capacity(32);
     for sb in 0..2usize {
         for r in 0..16u8 {
-            let x = b.frag16_lane(s[sb], r);
-            let x = b.bitcast_f32(x);
-            let off = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
-            let k = keep(b, off);
-            sv.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(k), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
+            let x = b.frag16_lane(Opnd::Var(sv_vars[sb]), r);
+            sv.push(b.bitcast_f32(x));
         }
     }
     let mut mx = sv[0];
@@ -416,11 +451,26 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, keep
     let (pa, pb) = (b.bitcast_f32(pa), b.bitcast_f32(pb));
     let mt = b.max_f32(pa, pb);
     let mt = b.mul_f32(mt, csc);
-    let m_new = b.max_f32(Opnd::Var(m_v), mt);
-    let dm = b.sub_f32(Opnd::Var(m_v), m_new);
-    let alpha = b.exp2_f32(dm);
+    // lazy rescale: the reference m moves only when the tile max passes it by more than 8 (log2 units: P <= 2^8, exact in fp32 / bf16);
+    // the rescale of O^T and l runs under that (divergent, usually empty) branch
+    let thr = b.c_f32(8.0);
+    let mlim = b.add_f32(Opnd::Var(m_v), thr);
+    let grow = b.cmp_lt_f32(mlim, mt);
+    b.begin_if(Opnd::Val(grow));
+    {
+        let dm = b.sub_f32(Opnd::Var(m_v), mt);
+        let alpha = b.exp2_f32(dm);
+        let ad = b.frag2_dup(alpha);
+        for v in ov {
+            b.var_scale_pk(*v, ad);
+        }
+        let l2 = b.mul_f32(Opnd::Var(l_v), alpha);
+        b.set_var(l_v, l2);
+        b.set_var(m_v, mt);
+    }
+    b.end_if();
     let zf = b.c_f32(0.0);
-    let nm = b.sub_f32(zf, m_new);
+    let nm = b.sub_f32(zf, Opnd::Var(m_v));
     let p: Vec<ValueId> = sv
         .iter()
         .map(|x| {
@@ -432,18 +482,8 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, keep
     for x in &p[1..] {
         ps = b.add_f32(ps, *x);
     }
-    let l_new = b.let_(Op::FmaF32(Opnd::Var(l_v), Opnd::Val(alpha), Opnd::Val(ps)));
-    b.set_var(m_v, m_new);
+    let l_new = b.add_f32(Opnd::Var(l_v), ps);
     b.set_var(l_v, l_new);
-    // O^T *= alpha (one query per lane: a scalar)
-    for e in 0..nblk {
-        for r in 0..16u8 {
-            let x = b.frag16_lane(Opnd::Var(ov[e]), r);
-            let x = b.bitcast_f32(x);
-            let y = b.mul_f32(x, alpha);
-            b.var_set_lane(ov[e], r, y);
-        }
-    }
     // ---- O^T += V^T P^T: 4 steps of 16 keys x D / 32 blocks of 32 d ----
     vscope(b, &mut |b| {
         for t in 0..4usize {
