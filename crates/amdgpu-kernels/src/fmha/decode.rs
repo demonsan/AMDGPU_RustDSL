@@ -236,7 +236,14 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
 /// Merges NS = 4 S splits: O[b, h, d] = sum_s exp(lse_s - M) po_s[d] / sum_s exp(lse_s - M) (bf16), M = max_s lse_s; 0 when every split is
 /// empty. Grid (H, B), 128 threads (one per d). ABI: 0 ptr_o (bf16 [B, H, D]), 1 ptr_po, 2 ptr_plse, 3 H, 4 NS.
 pub fn attn_combine_bf16_hd128(name: &str) -> Function {
-    let mut b = FnBuilder::new(name, 128);
+    attn_combine_bf16(name, D)
+}
+
+/// `attn_combine_bf16_hd128` for head dim `dd` (dd threads, <= 1024).
+#[allow(non_snake_case)]
+pub fn attn_combine_bf16(name: &str, dd: i32) -> Function {
+    let (D, ROW) = (dd, 2 * dd);
+    let mut b = FnBuilder::new(name, dd as u32);
     b.compile_profile(CompileProfile::Gemm);
     for (n, i) in [("ptr_o", 0u32), ("ptr_po", 1), ("ptr_plse", 2)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
