@@ -20,17 +20,45 @@ pub fn by_name(full: &str) -> Option<Function> {
         "cvt_f32_bf16" => return Some(cvt_f32_bf16(name)),
         "cvt_bf16_f32" => return Some(cvt_bf16_f32(name)),
         "quant_bf16_fp8_static" => return Some(quant_bf16_fp8_static(full, cache)),
+        // flat unary activations (aiter `unary_operator` / `activation_kernels`: gelu_fast = the tanh form, relu2 = relu(x)^2)
+        "silu_bf16" => return Some(unary_bf16(full, UnaryOp::Act(Act::Silu), cache)),
+        "gelu_tanh_bf16" | "gelu_fast_bf16" => return Some(unary_bf16(full, UnaryOp::Act(Act::GeluTanh), cache)),
+        "relu2_bf16" => return Some(unary_bf16(full, UnaryOp::Relu2, cache)),
+        "sigmoid_bf16" => return Some(unary_bf16(full, UnaryOp::Sigmoid, cache)),
         _ => {}
     }
-    let (rest, a) = if let Some(r) = name.strip_prefix("silu_mul_bf16_d") {
-        (r, Act::Silu)
+    let (rest, a, mode) = if let Some(r) = name.strip_prefix("silu_mul_bf16_d") {
+        (r, Act::Silu, MulMode::Plain)
     } else if let Some(r) = name.strip_prefix("gelu_tanh_mul_bf16_d") {
-        (r, Act::GeluTanh)
+        (r, Act::GeluTanh, MulMode::Plain)
+    } else if let Some(r) = name.strip_prefix("silu_mul_limit_bf16_d") {
+        (r, Act::Silu, MulMode::Limit)
+    } else if let Some(r) = name.strip_prefix("swiglu_oai_mul_bf16_d") {
+        (r, Act::Silu, MulMode::SwigluOai)
     } else {
         return None;
     };
     let d: i64 = rest.parse().ok()?;
-    (d % 8 == 0 && (8..=65536).contains(&d)).then(|| act_mul_bf16(full, d, a, cache))
+    (d % 8 == 0 && (8..=65536).contains(&d)).then(|| act_mul_bf16(full, d, a, mode, cache))
+}
+
+/// How the two halves are combined in `act_mul_bf16`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MulMode {
+    /// `act(x) * y`
+    Plain,
+    /// aiter `silu_and_mul(limit)`: `x = min(x, limit)`, `y = clamp(y, -limit, limit)`, then `silu(x) * y`; the limit is a kernarg (f32 @20), `limit <= 0` = no limit.
+    Limit,
+    /// aiter `swiglu_and_mul` (gpt-oss): `g = min(x, 7)`, `l = clamp(y, -7, 7)`, `g * sigmoid(1.702 g) * (l + 1)`.
+    SwigluOai,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnaryOp {
+    Act(Act),
+    /// `relu(x)^2`
+    Relu2,
+    Sigmoid,
 }
 
 /// Eight f32 values -> 4 packed-bf16 dwords as one Frag4.
@@ -40,7 +68,7 @@ fn pack_bf16x8(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
 }
 
 /// `out[m][d] = act(x[m][d]) * x[m][D + d]` for bf16 `x [M][2D]`, `out [M][D]`; grid x = the column tiles of `threads * 8` elements (fastest: consecutive blocks read consecutive memory), grid y = the rows (M <= 65535).
-pub fn act_mul_bf16(name: &str, d: i64, a: Act, cache: CachePolicy) -> Function {
+pub fn act_mul_bf16(name: &str, d: i64, a: Act, mode: MulMode, cache: CachePolicy) -> Function {
     let d8 = d / 8;
     let threads = (((d8 + 63) / 64).min(4) * 64) as u32;
     let tiles = (d8 + threads as i64 - 1) / threads as i64;
@@ -50,6 +78,9 @@ pub fn act_mul_bf16(name: &str, d: i64, a: Act, cache: CachePolicy) -> Function 
     b.arg("x", DType::Ptr, 0, 8);
     b.arg("out", DType::Ptr, 8, 8);
     b.arg("m", DType::I32, 16, 4);
+    if mode == MulMode::Limit {
+        b.arg("limit", DType::F32, 20, 4);
+    }
     let mt = Ext::sym("MT");
     b.sym_range("MT", 1, 65535);
     b.ka_is(16, mt.clone());
@@ -76,12 +107,95 @@ pub fn act_mul_bf16(name: &str, d: i64, a: Act, cache: CachePolicy) -> Function 
     let x2 = b.buffer_load_c(r_x, Some(Opnd::Val(off2)), 0i32, 0, MemTy::B128, cache);
     let (f1, f2) = (bf16x8_to_f32(b, x1), bf16x8_to_f32(b, x2));
     let mut r = [0; 8];
-    for i in 0..8 {
-        let y = act(b, f1[i], a);
-        r[i] = b.mul_f32(y, f2[i]);
+    match mode {
+        MulMode::Plain => {
+            for i in 0..8 {
+                let y = act(b, f1[i], a);
+                r[i] = b.mul_f32(y, f2[i]);
+            }
+        }
+        MulMode::Limit => {
+            let lim0 = b.let_(Op::KernargF32 { offset: 20 });
+            let zero = b.c_f32(0.0);
+            let big = b.c_f32(3.0e38);
+            let on = b.cmp(amdgpu_dsl::CmpPred::Gt, amdgpu_dsl::CmpTy::F32, lim0, zero);
+            let lim = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(on), a: Opnd::Val(lim0), b: Opnd::Val(big) });
+            let nlim = b.sub_f32(zero, lim);
+            for i in 0..8 {
+                let x = b.bin(amdgpu_dsl::BinOp::MinF32, f1[i], lim);
+                let y = b.tri(TriOp::Med3F32, f2[i], nlim, lim);
+                let ax = act(b, x, a);
+                r[i] = b.mul_f32(ax, y);
+            }
+        }
+        MulMode::SwigluOai => {
+            let seven = b.c_f32(7.0);
+            let nseven = b.c_f32(-7.0);
+            let one = b.c_f32(1.0);
+            let k = b.c_f32(-1.702 * std::f32::consts::LOG2_E);
+            for i in 0..8 {
+                let g = b.bin(amdgpu_dsl::BinOp::MinF32, f1[i], seven);
+                let l = b.tri(TriOp::Med3F32, f2[i], nseven, seven);
+                let e = b.mul_f32(g, k);
+                let p = b.exp2_f32(e);
+                let dn = b.add_f32(p, one);
+                let sg = b.rcp_f32(dn);
+                let gs = b.mul_f32(g, sg);
+                let l1 = b.add_f32(l, one);
+                r[i] = b.mul_f32(gs, l1);
+            }
+        }
     }
     let o = pack_bf16x8(b, &r);
     b.buffer_store_c(r_o, Some(Opnd::Val(offo)), 0i32, 0, o, MemTy::B128, false, cache);
+    fb.finish()
+}
+
+/// `out[i] = op(x[i])` for bf16 `x` (n a multiple of 8): 256 threads, one b128 per lane. ABI x @0, out @8, n @16 (i32, elements).
+pub fn unary_bf16(name: &str, op: UnaryOp, cache: CachePolicy) -> Function {
+    let mut fb = FnBuilder::new(name, 256);
+    fb.compile_profile(CompileProfile::Default);
+    let b = &mut fb;
+    b.arg("x", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg("n", DType::I32, 16, 4);
+    let n = Ext::sym("N");
+    b.sym_range("N", 8, 1 << 30);
+    b.ka_is(16, n.clone());
+    b.grid_is(0, n.clone().ceil_div(2048));
+    b.arg_tensor("x", n.clone() * Ext::c(2));
+    b.arg_tensor("out", n * Ext::c(2));
+    let (p_x, p_o) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 8 }));
+    let n_v = b.let_(Op::KernargI32 { offset: 16 });
+    let tid = b.let_(Op::WorkitemId);
+    let bx = b.let_(Op::WorkgroupIdX);
+    let nb = b.bind_i32(ev(n_v) << 1);
+    let nb = b.read_first_lane(nb);
+    let (r_x, r_o) = (b.buffer_desc_dyn(p_x, nb), b.buffer_desc_dyn(p_o, nb));
+    let off = b.bind_i32((ev(bx) << 12) + (ev(tid) << 4));
+    let xv = b.buffer_load_c(r_x, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, cache);
+    let f = bf16x8_to_f32(b, xv);
+    let mut r = [0; 8];
+    for i in 0..8 {
+        r[i] = match op {
+            UnaryOp::Act(a) => act(b, f[i], a),
+            UnaryOp::Relu2 => {
+                let z = b.c_f32(0.0);
+                let p = b.max_f32(f[i], z);
+                b.mul_f32(p, p)
+            }
+            UnaryOp::Sigmoid => {
+                let k = b.c_f32(-std::f32::consts::LOG2_E);
+                let one = b.c_f32(1.0);
+                let e = b.mul_f32(f[i], k);
+                let p = b.exp2_f32(e);
+                let dn = b.add_f32(p, one);
+                b.rcp_f32(dn)
+            }
+        };
+    }
+    let o = pack_bf16x8(b, &r);
+    b.buffer_store_c(r_o, Some(Opnd::Val(off)), 0i32, 0, o, MemTy::B128, false, cache);
     fb.finish()
 }
 
