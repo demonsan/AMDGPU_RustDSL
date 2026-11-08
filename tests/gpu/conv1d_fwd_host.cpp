@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
     int32_t d32 = (int32_t)dim, k32 = (int32_t)KD, t32 = (int32_t)T, s32 = (int32_t)SLOTS; put(&d32, 4); if (split) put(&k32, 4); put(&t32, 4); put(&s32, 4);
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     long maxl = 0; for (long b = 0; b < B; ++b) maxl = std::max<long>(maxl, cu[b + 1] - cu[b]);
-    unsigned gx = (unsigned)((dim + 2047) / 2048), gz = (unsigned)((maxl + 15) / 16);
+    unsigned gx = (unsigned)((dim + 2047) / 2048), gz = (unsigned)((maxl + 7) / 8);
     auto launch = [&]() { CK(hipModuleLaunchKernel(fn, gx, (unsigned)B, gz, 256, 1, 1, 0, nullptr, nullptr, cfg)); };
     launch(); CK(hipDeviceSynchronize());
     std::vector<std::vector<uint8_t>> ho(nout); for (int i = 0; i < nout; ++i) { ho[i].resize(osz[i] + 64); CK(hipMemcpy(ho[i].data(), dout[i], osz[i] + 64, hipMemcpyDeviceToHost)); }

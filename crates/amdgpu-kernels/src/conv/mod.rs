@@ -147,10 +147,10 @@ pub fn conv1d_update(name: &str, w: i64, sl: i64, idx: bool, silu: bool) -> Func
 //   and after the sequence the state `conv_states[cache_idx][f][0 .. W-1)` = its last W-1 inputs (older initial-state values when the sequence is shorter than W-1).
 // ABI: x @0 (bf16 [T][dim]), weight @8 (bf16 [dim][W]), bias @16 (bf16 [dim]), cu_seqlens @24 (i32 [B + 1]), cache_indices @32 (i32 [B], negative = skip the sequence), has_initial @40 (u8 [B]),
 //   conv_states @48 (bf16 [slots][dim][W - 1]), then out @56 (or q @56, k @64, v @72), then dim (i32), [k_dim (i32)], ntok (i32), slots (i32).
-// Grid: x = ceil(dim / 2048) feature tiles (a lane owns 8 consecutive features, dim a multiple of 8), y = B, z = ceil(max_seqlen / 16) token chunks (blocks past a sequence's end exit); a block runs 16
-// tokens sequentially with the W-1 previous inputs in registers. All 16 loads of a block are issued before the first output.
+// Grid: x = ceil(dim / 2048) feature tiles (a lane owns 8 consecutive features, dim a multiple of 8), y = B, z = ceil(max_seqlen / 8) token chunks (blocks past a sequence's end exit); a block runs 8
+// tokens sequentially with the W-1 previous inputs in registers. All 8 loads of a block are issued before the first output (kept packed: a 16-token chunk needed more than 256 VGPRs).
 
-const TM: i64 = 16;
+const TM: i64 = 8;
 
 pub fn fwd_by_name(name: &str) -> Option<Function> {
     let (rest, split) = if let Some(r) = name.strip_prefix("causal_conv1d_fwd_split_bf16_w") {
@@ -316,7 +316,7 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
         prev.push(a);
     }
     let _ = lane_on;
-    let mut newx: Vec<(ValueId, [ValueId; 8])> = Vec::new();   // (token valid, x[f])
+    let mut newx: Vec<(ValueId, ValueId)> = Vec::new();   // (token valid, the packed bf16x8 input)
     for t in 0..TM {
         let tl = b.bind_i32(ev(c0) + t as i32);
         let valid = b.cmp(CmpPred::Lt, CmpTy::I32, tl, seqlen);
@@ -326,7 +326,7 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
         let on_c = b.cmp(CmpPred::Ne, CmpTy::I32, on, 0);
         let o = xoff(b, tk, on_c);
         let fr = b.buffer_load_c(r_x, Some(Opnd::Val(o)), 0i32, 0, MemTy::B128, CachePolicy::NT);
-        newx.push((valid, bf16x8_to_f32(b, fr)));
+        newx.push((valid, fr));
     }
     // outputs
     let q_ok = {
@@ -336,7 +336,8 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
     let _ = q_ok;
     let mut win = prev;
     for t in 0..TM as usize {
-        let (valid, xn) = (newx[t].0, newx[t].1);
+        let (valid, xfr) = (newx[t].0, newx[t].1);
+        let xn = bf16x8_to_f32(b, xfr);
         let mut y = [0; 8];
         for f in 0..8usize {
             let mut acc = bias[f];
