@@ -262,7 +262,7 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
                 let x = b.bitcast_f32(x);
                 let off = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
                 let keep = match low {
-                    Some(lo) => b.bind_cond((ev(key0) + off).le(ev(lim)).and((ev(key0) + off).ge(ev(lo)))),
+                    Some(lo) => b.bind_cond(((ev(key0) + off).le(ev(lim)).select_i32(1, 0) & (ev(key0) + off).ge(ev(lo)).select_i32(1, 0)).eq(1)),
                     None => b.bind_cond((ev(key0) + off).le(ev(lim))),
                 };
                 sv.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
