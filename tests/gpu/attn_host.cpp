@@ -49,7 +49,9 @@ int main(int argc, char** argv) {
     HC(hipModuleLoad(&mod, co));
     HC(hipModuleGetFunction(&fn, mod, kn));
     // fmha_fwd_v3_args: field i at 16 i
-    std::vector<uint8_t> a(656, 0);
+    // our ABI extension: sliding window (WL / WR env, >= 0) at 656 / 672
+    const int WL = envi("WL", -1), WR = envi("WR", -1);
+    std::vector<uint8_t> a(WL >= 0 ? 688 : 656, 0);
     auto P = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
     auto U = [&](int i, uint32_t v) { memcpy(&a[16 * i], &v, 4); };
     auto F = [&](int i, float v) { memcpy(&a[16 * i], &v, 4); };
@@ -62,6 +64,7 @@ int main(int argc, char** argv) {
     U(21, ks); U(22, D * 2); U(23, SK * ks);
     U(24, qs); U(25, D * 2); U(26, SQ * qs);
     U(29, SQ * 4);
+    if (WL >= 0) { U(41, WL); U(42, WR); }
     int tiles = (SQ + rows - 1) / rows;
     int gx = ours ? tiles : (tiles + (causal ? 1 : 0)) / (causal ? 2 : 1);
     size_t asz = a.size();
@@ -83,8 +86,13 @@ int main(int argc, char** argv) {
         int q = c == 0 ? 0 : c == 1 ? SQ - 1 : (int)(rng() % SQ);
         int hk_ = h / (H / HK);
         int kmax = causal ? std::min(SK - 1, q + SK - SQ) : SK - 1;
+        int kmin = 0;
+        if (WL >= 0) {
+            kmin = std::max(0, q + SK - SQ - WL);
+            kmax = std::min(kmax, q + SK - SQ + WR);
+        }
         double m = -1e300;
-        for (int k = 0; k <= kmax; k++) {
+        for (int k = kmin; k <= kmax; k++) {
             double acc = 0;
             for (int d = 0; d < D; d++)
                 acc += (double)bf(hq[(((size_t)b * SQ + q) * H + h) * D + d]) * bf(hk[(((size_t)b * SK + k) * HK + hk_) * D + d]);
@@ -93,14 +101,14 @@ int main(int argc, char** argv) {
         }
         double l = 0;
         std::fill(o.begin(), o.end(), 0.0);
-        for (int k = 0; k <= kmax; k++) {
+        for (int k = kmin; k <= kmax; k++) {
             double p = std::exp(s[k] - m);
             l += p;
             for (int d = 0; d < D; d++) o[d] += p * bf(hv[(((size_t)b * SK + k) * HK + hk_) * D + d]);
         }
-        if (kmax < 0) l = 1;  // fully masked row: O = 0
+        if (kmax < kmin) l = 1;  // fully masked row: O = 0
         for (int d = 0; d < D; d++) {
-            double ref = kmax < 0 ? 0 : o[d] / l;
+            double ref = kmax < kmin ? 0 : o[d] / l;
             double got = bf(ho[(((size_t)b * SQ + q) * H + h) * D + d]);
             double e = std::fabs(got - ref);
             maxe = std::max(maxe, e);
@@ -110,7 +118,7 @@ int main(int argc, char** argv) {
                 bad++;
             }
         }
-        if (want_lse && kmax >= 0) {
+        if (want_lse && kmax >= kmin) {
             double lr = m + std::log(l), lg = hl[((size_t)b * H + h) * SQ + q];
             if (std::fabs(lg - lr) > 1e-2 + 1e-3 * std::fabs(lr)) badl++;
         }

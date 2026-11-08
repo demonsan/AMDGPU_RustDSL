@@ -12,18 +12,39 @@
 //!   the transposed A operand of PV (`ds_read_u16_d16[_hi]`; to be replaced by `ds_read_b64_tr_b16`);
 //! * P = exp2(S c - m) packed to bf16 straight from the S^T accumulator: the PV k order per lane half h is keys {4h + 0..3, 8 + 4h + 0..3} of
 //!   each 16-key step, and the V^T reads use the same key order.
-use amdgpu_dsl::{CompileProfile, D16Ty, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId};
+use amdgpu_dsl::{CompileProfile, D16Ty, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId, I32};
 use amdgpu_tile::components::gqa_kv_head;
 use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, SlotIdx};
 
-const D: i32 = 128;
 /// keys per tile
 const KT: i32 = 64;
-/// bytes of one K / V row (D bf16)
-const ROW: i32 = 2 * D;
 
-/// `causal`: bottom-right aligned causal mask.
+/// Build options.
+#[derive(Clone, Copy, Debug)]
+pub struct AttnCfg {
+    /// head dim (Q / K / V): 64, 128, 256
+    pub d: i32,
+    /// bottom-right aligned causal mask
+    pub causal: bool,
+    /// sliding window: keys in [q' - left, q' + right] with q' = q + SK - SQ (our ABI extension: left / right at kernarg 656 / 672, int32);
+    /// combined with `causal` the right edge is min(right, 0)
+    pub swa: bool,
+}
+
+/// `fmha_fwd_hd128_bf16[_causal]` (the shipped coverage names).
 pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
+    fmha_fwd_bf16(name, AttnCfg { d: 128, causal, swa: false })
+}
+
+/// The kernel for `cfg`.
+#[allow(non_snake_case)]
+pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
+    let (D, causal) = (cfg.d, cfg.causal);
+    assert!(matches!(D, 64 | 128 | 256), "head dim 64 / 128 / 256");
+    // bytes of one K / V row (D bf16), 16-byte chunks per row, the K swizzle mask (chunk ^ key % 16, or % 8 for 8-chunk rows)
+    let ROW: i32 = 2 * D;
+    let cpr = D / 8;
+    let swz = cpr.min(16) - 1;
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
     // ---- ABI: field i at 16 i ----
@@ -36,6 +57,12 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
         ("s_k_Bs", 14), ("s_opt", 15), ("s_lse", 16), ("s_kv_seq_len", 17), ("s_qk_head_dim", 18), ("s_v_head_dim", 19), ("s_q_head_num", 20),
         ("s_v_Seqs", 21), ("s_v_Hs", 22), ("s_v_Bs", 23), ("s_o_Seqs", 24), ("s_o_Hs", 25), ("s_o_Bs", 26), ("s_lse_Hs", 29),
     ];
+    if cfg.swa {
+        b.arg("window_left", DType::I32, 656, 4);
+        b.arg("window_right", DType::I32, 672, 4);
+        b.ka_range(656, 0, 1 << 20);
+        b.ka_range(672, 0, 1 << 20);
+    }
     for (n, i) in i32_names {
         b.arg(n, if n == "scalar" { DType::F32 } else { DType::I32 }, 16 * i, 4);
     }
@@ -47,8 +74,8 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
     b.sym_range("HK", 1, 64);
     b.ka_is(320, Ext::sym("HK") * gq.clone());
     let hk = Ext::sym("HK");
-    b.ka_is(288, Ext::c(128));
-    b.ka_is(304, Ext::c(128));
+    b.ka_is(288, Ext::c(D as i64));
+    b.ka_is(304, Ext::c(D as i64));
     b.ka_is(112, hh.clone() * Ext::c(ROW as i64));
     b.ka_is(144, Ext::c(ROW as i64));
     b.ka_is(160, sq.clone() * hh.clone() * Ext::c(ROW as i64));
@@ -100,28 +127,30 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
     // ---- Q^T fragments: B operand of 32x32x16 bf16, lane (column = query row, k = d 16 c + 8 half + 0..7): 16 bytes at d 16 c + 8 h ----
     let q_so = { let v = b.bind_i32(ev(bat) * ev(q_bs) + ev(h) * ev(q_hs)); b.read_first_lane(v) };
     let q_vo = b.bind_i32(ev(row_c) * ev(q_seqs) + (ev(half) << 4));
-    let qf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_q, q_vo, q_so, (32 * c) as u32)).collect();
+    let qf: Vec<ValueId> = (0..D / 16).map(|c| b.buffer_load_b128(r_q, q_vo, q_so, (32 * c) as u32)).collect();
 
     // ---- LDS: K / V rings (2 slots x 16 KB) ----
     let mut lds = LdsPlan::new();
     let ks = lds.ring("K", (KT * ROW) as i64, 2, TLayout::Linear);
     let vs = lds.ring("V", (KT * ROW) as i64, 2, TLayout::Linear);
     lds.commit(&mut b);
-    // DMA: per tile 16 KB = 16 x 1 KB blocks; wave w issues blocks 4 i + w (i < 4): keys 4 (4 i + w) + lane / 16, 16-byte chunk lane % 16. K: the
-    // source chunk is the LDS position XOR (key % 16) (the reader's swizzle); V: plain.
+    // DMA: per tile 128 D bytes = D / 8 blocks of 1 KB; wave w issues blocks 4 i + w (i < D / 32): keys kpb (4 i + w) + lane / cpr (kpb = 1 KB / row
+    // bytes), 16-byte chunk lane % cpr. K: the source chunk is the LDS position XOR (key & swz) (the reader's swizzle); V: plain.
+    let (kpb, n_iss) = (512 / D, D / 32);
     let kv_so0 = |b: &mut FnBuilder, bs: ValueId, hs: ValueId| { let v = b.bind_i32(ev(bat) * ev(bs) + ev(hkv) * ev(hs)); b.read_first_lane(v) };
     let (k_so0, v_so0) = (kv_so0(&mut b, k_bs, k_hs), kv_so0(&mut b, v_bs, v_hs));
-    let l16 = b.bind_i32(lane.lane() & 15);
-    let k_vo: Vec<ValueId> = (0..4)
+    let lc = b.bind_i32(lane.lane() & (cpr - 1));
+    let key_of = |b: &mut FnBuilder, i: i32| b.bind_i32((lane.wave() + 4 * i) * kpb + lane.lane().lshr(cpr.trailing_zeros() as i32));
+    let k_vo: Vec<ValueId> = (0..n_iss)
         .map(|i| {
-            let key = b.bind_i32(((lane.wave() + 4 * i) << 2) + lane.lane().lshr(4));
-            b.bind_i32(ev(key) * ev(k_seqs) + ((ev(l16) ^ (ev(key) & 15)) << 4))
+            let key = key_of(&mut b, i);
+            b.bind_i32(ev(key) * ev(k_seqs) + ((ev(lc) ^ (ev(key) & swz)) << 4))
         })
         .collect();
-    let v_vo: Vec<ValueId> = (0..4)
+    let v_vo: Vec<ValueId> = (0..n_iss)
         .map(|i| {
-            let key = b.bind_i32(((lane.wave() + 4 * i) << 2) + lane.lane().lshr(4));
-            b.bind_i32(ev(key) * ev(v_seqs) + (ev(l16) << 4))
+            let key = key_of(&mut b, i);
+            b.bind_i32(ev(key) * ev(v_seqs) + (ev(lc) << 4))
         })
         .collect();
     let stage = |b: &mut FnBuilder, tile: ValueId, slot: i32, gen: Opnd| {
@@ -139,28 +168,45 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
 
     // ---- per-lane LDS read offsets ----
     // K (A of S^T, lane: key l % 32 of the 32-key block, k = d 16 c + 8 h): 16 bytes at key row, chunk (2 c + h) ^ (key % 16)
-    let kr: Vec<ValueId> = (0..8)
-        .map(|c| b.bind_i32((lane.j() << 8) + (((ev(half) + 2 * c) ^ (lane.lane() & 15)) << 4)))
+    let kr: Vec<ValueId> = (0..D / 16)
+        .map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & swz)) << 4)))
         .collect();
     // V^T (A of O^T, lane: d = 32 e + l % 32, k slot kk -> key 4 h + kk (kk < 4) or 8 + 4 h + kk - 4): bf16 at key row, column d
     let vr: Vec<ValueId> = (0..8)
         .map(|kk| {
             let krow = if kk < 4 { kk } else { 8 + kk - 4 };
-            b.bind_i32(((ev(half) * 4 + krow) << 8) + (lane.j() << 1))
+            b.bind_i32((ev(half) * 4 + krow) * ROW + (lane.j() << 1))
         })
         .collect();
 
     // ---- the key range: causal keys k <= q + SK - SQ; tiles rounded up to an even count ----
-    let kv_end = if causal {
-        let last_q = b.bind_i32(((ev(qt) + 1) << 7) - 1);
-        b.bind_i32((ev(last_q) + ev(s_kv) - ev(s_q) + 1).min(ev(s_kv)).max(0))
-    } else {
-        s_kv
+    // the visible keys of query q: [q' - left, q' + right] (q' = q + SK - SQ), right = 0 for causal, unbounded without a window
+    let wins = cfg.swa.then(|| (b.let_(Op::KernargI32 { offset: 656 }), b.let_(Op::KernargI32 { offset: 672 })));
+    let right: Option<amdgpu_dsl::I32> = match (causal, wins) {
+        (true, Some((_, r))) => Some(I32::c(0).min(ev(r))),
+        (true, None) => Some(I32::c(0)),
+        (false, Some((_, r))) => Some(ev(r)),
+        (false, None) => None,
     };
-    let npair = b.bind_i32((ev(kv_end) + (2 * KT - 1)).lshr(7));
+    let qoff = b.bind_i32(ev(s_kv) - ev(s_q));
+    let kv_end = match &right {
+        Some(r) => {
+            let last_q = b.bind_i32(((ev(qt) + 1) << 7) - 1);
+            b.bind_i32((ev(last_q) + ev(qoff) + r.clone() + 1).min(ev(s_kv)).max(0))
+        }
+        None => s_kv,
+    };
+    // first tile: (first query of the CTA)' - left, rounded down to a tile
+    let kt0 = match wins {
+        Some((l, _)) => { let v = b.bind_i32(((ev(qt) << 7) + ev(qoff) - ev(l)).max(0).lshr(6)); b.read_first_lane(v) }
+        None => b.c_i32(0),
+    };
+    let ntile = b.bind_i32((ev(kv_end) + (KT - 1)).lshr(6) - ev(kt0));
+    let npair = b.bind_i32((ev(ntile).max(1) + 1).lshr(1));
     let npair = b.read_first_lane(npair);
-    let lim = b.bind_i32(if causal { ev(row) + ev(s_kv) - ev(s_q) } else { ev(s_kv) - 1 });
+    let lim = b.bind_i32(match &right { Some(r) => ev(row) + ev(qoff) + r.clone(), None => ev(s_kv) - 1 });
     let lim = b.bind_i32(ev(lim).min(ev(s_kv) - 1));
+    let low = wins.map(|(l, _)| b.bind_i32(ev(row) + ev(qoff) - ev(l)));
     // softmax constants: c = scale log2(e)
     let c_l2e = b.c_f32(std::f32::consts::LOG2_E);
     let csc = b.mul_f32(scale, c_l2e);
@@ -171,24 +217,24 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
     let l_init = b.c_f32(0.0);
 
     // prologue: tile 0 into slot 0
-    let t0 = b.c_i32(0);
-    stage(&mut b, t0, 0, Opnd::I32(0));
+    stage(&mut b, kt0, 0, Opnd::I32(0));
     // loop vars: pair index, m, l, O^T x 4
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(m_init)), (DType::F32, Opnd::Val(l_init))];
-    inits.extend((0..4).map(|_| (DType::Frag16, Opnd::Val(zero16))));
+    let nblk = (D / 32) as usize;
+    inits.extend((0..nblk).map(|_| (DType::Frag16, Opnd::Val(zero16))));
     let vars = b.begin_loop(&inits);
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
-    let ov: Vec<VarId> = vars[3..7].to_vec();
+    let ov: Vec<VarId> = vars[3..3 + nblk].to_vec();
     let itx = amdgpu_dsl::varx(it);
     for slot in 0..2i32 {
-        let tile = b.bind_i32((itx.clone() << 1) + slot);
+        let tile = b.bind_i32((itx.clone() << 1) + slot + ev(kt0));
         // top of tile: this tile's DMA done and visible; the other slot free (every wave is past tile - 1)
         b.wait_vm(0);
         b.wait_lds(0);
         b.barrier();
         // the next tile into the other slot (the last pass stages a tile past the end: rows past the sequence, masked; clamped to the pair count)
         let nxt = b.bind_i32(ev(tile) + 1);
-        let last = b.bind_i32((ev(npair) << 1) - 1);
+        let last = b.bind_i32((ev(npair) << 1) - 1 + ev(kt0));
         let nxt = b.bind_i32(ev(nxt).min(ev(last)));
         let gen_n = if slot == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
         stage(&mut b, nxt, 1 - slot, gen_n);
@@ -198,7 +244,7 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
             (0..2)
                 .map(|sb| {
                     let mut acc: Option<ValueId> = None;
-                    for c in 0..8usize {
+                    for c in 0..(D / 16) as usize {
                         let a = b.bind_i32(ev(kr[c]) + kbase + sb * 32 * ROW);
                         let kf = b.load_lds_b128(a);
                         acc = Some(b.mfma(kind, kf, qf[c], acc.map(Opnd::Val)));
@@ -215,7 +261,10 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
                 let x = b.frag16_lane(s[sb], r);
                 let x = b.bitcast_f32(x);
                 let off = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
-                let keep = b.bind_cond((ev(key0) + off).le(ev(lim)));
+                let keep = match low {
+                    Some(lo) => b.bind_cond((ev(key0) + off).le(ev(lim)).and((ev(key0) + off).ge(ev(lo)))),
+                    None => b.bind_cond((ev(key0) + off).le(ev(lim))),
+                };
                 sv.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
             }
         }
@@ -247,7 +296,7 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
         b.set_var(m_v, m_new);
         b.set_var(l_v, l_new);
         // O^T *= alpha (one query per lane: a scalar)
-        for e in 0..4usize {
+        for e in 0..nblk {
             for r in 0..16u8 {
                 let x = b.frag16_lane(Opnd::Var(ov[e]), r);
                 let x = b.bitcast_f32(x);
@@ -264,7 +313,7 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
                 let i0 = 16 * sb + 8 * tt;
                 let w: Vec<ValueId> = (0..4).map(|j| b.cvt_pk_bf16_f32(p[i0 + 2 * j], p[i0 + 2 * j + 1])).collect();
                 let pf = b.frag4(w[0], w[1], w[2], w[3]);
-                for e in 0..4i32 {
+                for e in 0..nblk as i32 {
                     let words: Vec<ValueId> = (0..4)
                         .map(|j| {
                             let ld = |b: &mut FnBuilder, kk: usize| {
@@ -300,7 +349,7 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
     let o_vo_r = b.bind_i32(ev(row) * ev(o_seqs) + (ev(half) << 3));
     let big = b.c_i32(0x7fff_fff0);
     let o_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(o_vo_r), b: Opnd::Val(big) });
-    for e in 0..4usize {
+    for e in 0..nblk {
         for u in 0..4u8 {
             let v: Vec<ValueId> = (0..4u8)
                 .map(|k| {
