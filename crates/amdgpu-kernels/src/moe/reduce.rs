@@ -1,7 +1,7 @@
 //! MoE combine (docs/op-coverage-memtemplates.md T3): the top-K per-route expert outputs of a token are summed into one row.
 //!
 //! * `moe_reduce_bf16_k<K>_d<D>`  `out[t][d] = bf16(sum_k w[t][k] * x[t][k][d])`.  ABI x @0 (bf16 [T][K][D]), w @8 (f32 [T][K]), out @16 (bf16 [T][D]), T @24 (i32)
-//! * `moe_sum_bf16_k<K>_d<D>`     `out[t][d] = bf16(sum_k x[t][k][d])`.            ABI x @0, out @8, T @16
+//! * `moe_combine_bf16_k<K>_d<D>`     `out[t][d] = bf16(sum_k x[t][k][d])`.            ABI x @0, out @8, T @16
 //!
 //! K 1..=16, D a multiple of 8 in 8..=65536; grid x = the column tiles (`pick_threads(D / 8)` threads, one b128 per lane and route), grid y = tokens (T <= 65535 and T * K * D * 2 < 2 GiB: 32-bit offsets).
 //! All K loads of a lane are in flight before the sum; accumulation in f32, one round to bf16 (RNE); streaming (`nt`) accesses.
@@ -13,7 +13,7 @@ use amdgpu_tile::ev;
 pub fn by_name(name: &str) -> Option<Function> {
     let (rest, weighted) = if let Some(r) = name.strip_prefix("moe_reduce_bf16_k") {
         (r, true)
-    } else if let Some(r) = name.strip_prefix("moe_sum_bf16_k") {
+    } else if let Some(r) = name.strip_prefix("moe_combine_bf16_k") {
         (r, false)
     } else {
         return None;

@@ -271,11 +271,17 @@ softmax 与 layernorm 的短行仍然只有 rmsnorm 的 60–80 %（两遍规约
 
 一个 token 只用 `H · L` 个 lane（L = 每个 head 的 lane 数：NeoX 为 D / 16、GPT-J 为 D / 8），`H · L < 64` 时大半个 wave 空闲（H = 1, D = 64 只有 4 个 lane：此前 1300 GB/s，22 %）。当 `H · L ≤ 32` 且是 2 的幂时，一个 wave 装 `64 / (H · L)` 个 token（H = 1, D = 64：16 个），一个 block 4 个 wave，grid = ⌈T / (4 · tpw)⌉；位置和 cos / sin 表行因此是向量值（每个 lane 组自己的 token），越界 token 的 store 被屏蔽。名字与 ABI 不变。主机测试 `rope_host`（T = 29 … 41 的奇数 token 数，H ∈ {1, 2, 4, 8}，D ∈ {64, 128}，neox / gptj）`bad = 0`。带宽（GB/s，流量把每个 token 的 cos / sin 行也算上，它们在 L2 里，所以高于真实 HBM 流量）：H = 1, D = 64（neox）7062；H = 1, D = 128：9250；H = 2, D = 64：6193；H = 4, D = 128：7174；H = 1, D = 64（gptj）7419。
 
-## MoE 合并：`moe_reduce` / `moe_sum`（模板 T3）
+## MoE 合并：`moe_reduce` / `moe_combine`（模板 T3）
 
-kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel 合并：`moe_reduce_bf16_k<K>_d<D>`：`out[t][d] = bf16(Σ_k w[t][k] · x[t][k][d])`（x bf16 `[T][K][D]`，w f32 `[T][K]`，out bf16 `[T][D]`）；`moe_sum_bf16_k<K>_d<D>` 是不带权重的和（`moe_buf` / 共享专家的合并）。K ∈ 1 … 16，D 是 8 的倍数（8 … 65536）；grid = (列 tile, T)，每个 lane 一个 b128 / 路由，所有 K 次加载先发出，f32 累加，一次 RNE 到 bf16，流式（`nt`）访问；块的线程数在 64 / 128 / 192 / 256 里选最后一个列 tile 空闲 lane 最少的（D = 7168 → 128）。限制：T ≤ 65535 且 T · K · D · 2 < 2 GiB（32 位偏移；更大要 B1）。主机测试 `tests/gpu/moe_reduce_host.cpp`（CPU 双精度参考；误差判据 = 1 个 bf16 ulp + 1e-6 · Σ|项| 的累加误差）：K ∈ {1, 2, 6, 8, 16}，D ∈ {24, 512, 1000, 2048, 4096, 7168}，T ∈ {17 … 41}（奇数），`bad = 0`，输出末尾之外 0 字节被写，`gpu_verify --strict` 0 错误，VGPR 20 … 100。带宽：见 `tools/b2_matrix.sh` 的 moe_reduce 行（T = 16384 … 65535、K = 6 … 8、D = 2048 … 7168：5.4–6.4 TB/s，D = 7168 的块大小修正前是 5.44）。
+kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel 合并：`moe_reduce_bf16_k<K>_d<D>`：`out[t][d] = bf16(Σ_k w[t][k] · x[t][k][d])`（x bf16 `[T][K][D]`，w f32 `[T][K]`，out bf16 `[T][D]`）；`moe_combine_bf16_k<K>_d<D>` 是不带权重的和（`moe_buf` / 共享专家的合并；名字区别于 kernel-opt 的 `moe_sum_bf16_k<K>`：那个的输入是 fp32 的每路由中间结果、D 在 kernarg 里）。K ∈ 1 … 16，D 是 8 的倍数（8 … 65536）；grid = (列 tile, T)，每个 lane 一个 b128 / 路由，所有 K 次加载先发出，f32 累加，一次 RNE 到 bf16，流式（`nt`）访问；块的线程数在 64 / 128 / 192 / 256 里选最后一个列 tile 空闲 lane 最少的（D = 7168 → 128）。限制：T ≤ 65535 且 T · K · D · 2 < 2 GiB（32 位偏移；更大要 B1）。主机测试 `tests/gpu/moe_reduce_host.cpp`（CPU 双精度参考；误差判据 = 1 个 bf16 ulp + 1e-6 · Σ|项| 的累加误差）：K ∈ {1, 2, 6, 8, 16}，D ∈ {24, 512, 1000, 2048, 4096, 7168}，T ∈ {17 … 41}（奇数），`bad = 0`，输出末尾之外 0 字节被写，`gpu_verify --strict` 0 错误，VGPR 20 … 100。带宽：见 `tools/b2_matrix.sh` 的 moe_reduce 行（T = 16384 … 65535、K = 6 … 8、D = 2048 … 7168：5.4–6.4 TB/s，D = 7168 的块大小修正前是 5.44）。
 
 
 ## 行内族：γ / β 延后加载；softmax 重算 exp 的实验
 
 单步（N ≥ 512）的行在统计量算完之后才加载 γ / β（此前和 x 一起在最前面加载，在两次归约期间白占 32–64 个 VGPR；它们命中 L2，延迟被其他 wave 遮住）；短行（多步）仍在最前面加载。带宽（GB/s，N = 4096）：add_rmsnorm 5803 → **6468**，layernorm 5349 → 5602，rmsnorm 6304 → 6375；VGPR 只少了几个（layernorm 128 → 120，add_rmsnorm 120 → 116），收益主要来自 γ / β 的加载不再卡在每个 wave 的关键路径之前。softmax 在输出遍里重算 exp、不保存 64 个 f32：N = 4096 反而慢（5836 vs 6007），N = 8192 只快 0.7 %（VGPR 156 → 144），所以只是 opt-in（`AMDC_SOFTMAX_RECOMPUTE_EXP=1`）。周期模型：layernorm N = 4096 约 1005 条 VALU / 行（每条 wave64 指令 2 个周期，4 个 SIMD）≈ 500 个 CU 周期，而一行的 HBM 时间 ≈ 1550 个 CU 周期，所以 VALU 约占三分之一，不是瓶颈；剩下的差距在加载 / 存储与计算的重叠。
+
+## 去掉的实验开关（结果留在这里，代码在归档 tag）
+
+仓库约定 kernel 里不留非默认的环境变量开关，所以每个 kernel 的选择已固定：
+- **DPP 全规约 vs LDS 交换**（`AMDC_DPP_REDUCE`，归档 tag `archive/dpp-reduce-env`）：`topk_softmax` 用 DPP（+19 % E = 128 / +9 % E = 256，延迟受限）；行内族（rmsnorm / add_rmsnorm / layernorm / softmax）、量化族、`argmax` / `sample` 的块归约用 LDS 交换（带宽受限，DPP 与 LDS 持平 ±2 %）；N < 512 的短行布局本来就必须用组内 DPP。
+- **softmax 重算 exp**（`AMDC_SOFTMAX_RECOMPUTE_EXP`，归档 tag `archive/softmax-recompute-exp`）：N = 4096 5836 vs 6007 GB/s（更慢），N = 8192 只快 0.7 %，VGPR 156 → 144；不采用。

@@ -54,7 +54,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // batch 2: sampling,
         n if n.starts_with("argmax_bf16_v") || n.starts_with("sample_bf16_v") || n.starts_with("sample_topkp_bf16_v") => crate::sampling::by_name(n),
         // (batch 2 cont.) MoE sorting, dequantization, expert routing, RoPE, KV-cache write
-        n if n.starts_with("moe_reduce_bf16_k") || n.starts_with("moe_sum_bf16_k") => crate::moe::reduce::by_name(n),
+        n if n.starts_with("moe_reduce_bf16_k") || n.starts_with("moe_combine_bf16_k") => crate::moe::reduce::by_name(n),
         n if n.starts_with("moe_sorting_e") => crate::moe::by_name(n),
         n if n.starts_with("moe_count_e") || n.starts_with("moe_scan_e") || n.starts_with("moe_scatter_e") || n.starts_with("moe_scatter_ord_e") => crate::moe::multi::by_name(n),
         n if n.starts_with("dequant_fp8_bf16_") => crate::dequant::by_name(n),

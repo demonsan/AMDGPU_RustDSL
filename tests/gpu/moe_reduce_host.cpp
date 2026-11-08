@@ -1,4 +1,4 @@
-// MoE combine (batch 2): moe_reduce_bf16_k<K>_d<D> (weighted) and moe_sum_bf16_k<K>_d<D>: CPU reference and bandwidth.
+// MoE combine (batch 2): moe_reduce_bf16_k<K>_d<D> (weighted) and moe_combine_bf16_k<K>_d<D>: CPU reference and bandwidth.
 // usage: moe_reduce_host <co> <kernel> <reduce|sum> <T> <K> <D> [iters]
 #include <hip/hip_runtime.h>
 #include <algorithm>

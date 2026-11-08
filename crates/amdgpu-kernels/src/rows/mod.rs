@@ -10,7 +10,7 @@
 pub mod quant;
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{bf16x8_to_f32, dpp_reduce, group_reduce_dpp, lane_reduce, rsqrt_f32, wave_reduce, wave_reduce_dpp, RedOp};
+use amdgpu_tile::prims::{bf16x8_to_f32, group_reduce_dpp, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,13 +37,9 @@ pub fn by_name(name: &str) -> Option<Function> {
     (n % 8 == 0 && (8..=8192).contains(&n)).then(|| row_kernel(name, n, op))
 }
 
-/// Wave-wide reduction: the LDS exchange (`wave_reduce`) or, with `AMDC_DPP_REDUCE=1`, the DPP + lane-swap all-reduce.
+/// Wave-wide reduction (the LDS exchange: measured equal to the DPP all-reduce on these bandwidth-bound kernels, so the simpler path stays).
 fn wr(b: &mut FnBuilder, op: RedOp, x: ValueId, scratch: &amdgpu_tile::shared::PrivRef, off: i32, gen: i32, lane: &Lane) -> ValueId {
-    if dpp_reduce() {
-        wave_reduce_dpp(b, op, x)
-    } else {
-        wave_reduce(b, op, x, scratch, off, gen, lane)
-    }
+    wave_reduce(b, op, x, scratch, off, gen, lane)
 }
 
 fn sel(b: &mut FnBuilder, cond: ValueId, x: ValueId, y: ValueId) -> ValueId {
@@ -294,8 +290,6 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
             }
             RowOp::Softmax => {
                 let neg = b.c_f32(-3.0e38);
-                // opt-in (AMDC_SOFTMAX_RECOMPUTE_EXP=1): measured 5836 vs 6007 GB/s at N = 4096 and +0.7 % at N = 8192, so the exponentials are kept by default
-                let recompute_exp = std::env::var("AMDC_SOFTMAX_RECOMPUTE_EXP").is_ok();
                 let mut part: Option<ValueId> = None;
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
@@ -318,27 +312,14 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let e = masked(b, &e, i, zero);
                     let s = lane_reduce(b, RedOp::Sum, &e);
                     part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
-                    if !recompute_exp {
-                        ex.push(e);
-                    }
+                    ex.push(e);
                 }
                 let tot = red(b, RedOp::Sum, part2.unwrap(), 64, gen1, &lane);
                 let inv = b.rcp_f32(tot);
                 for i in 0..nld {
                     let mut y = [0; 8];
-                    if recompute_exp {
-                        // the exponentials are not kept across the second reduction (64+ VGPRs for a long row): recomputed from the packed row
-                        let xi = bf16x8_to_f32(b, packed[i]);
-                        for k in 0..8 {
-                            let t = b.sub_f32(xi[k], mx);
-                            let u = b.mul_f32(t, l2e);
-                            let e = b.exp2_f32(u);
-                            y[k] = b.mul_f32(e, inv);
-                        }
-                    } else {
-                        for k in 0..8 {
-                            y[k] = b.mul_f32(ex[i][k], inv);
-                        }
+                    for k in 0..8 {
+                        y[k] = b.mul_f32(ex[i][k], inv);
                     }
                     out.push(y);
                 }
