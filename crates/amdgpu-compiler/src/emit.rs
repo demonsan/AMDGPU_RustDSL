@@ -235,11 +235,12 @@ fn cpol_suffix(c: u8) -> String {
     if c & 1 != 0 {
         s += " sc0";
     }
-    if c & 16 != 0 {
-        s += " sc1";
-    }
+    // LLVM's order: sc0 nt sc1
     if c & 2 != 0 {
         s += " nt";
+    }
+    if c & 16 != 0 {
+        s += " sc1";
     }
     s
 }
