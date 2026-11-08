@@ -908,10 +908,12 @@ def check_ptr64_p1(planes, out):
 
 # ---------------------------------------------------------------- probe_anylane
 def check_anylane(planes, out):
-    want = [1, 0, 1, 1]
-    names = ["any_lane(!(tid != 0)) taken", "any_lane(!(tid >= 0)) not taken", "any_lane(tid == 5) taken", "uniform !(1 < 0) taken"]
+    want = [1, 0, 1, 1, 1, 0, 1, 1, 1]
+    names = ["any_lane(!(tid != 0)) [one lane] taken", "any_lane(!(tid >= 0)) [no lane] not taken", "any_lane(tid == 5) [one lane] taken",
+             "uniform !(1 < 0) taken", "any_lane(tid >= 0) [all] taken", "any_lane(tid < 0) [none] not taken",
+             "any_lane(!(tid >= 64)) [all] taken", "any_lane(CmpLtI32(tid, 3)) [3 lanes] taken", "any_lane(!CmpLtI32(tid, 3)) [61 lanes] taken"]
     ok = True
-    for k in range(4):
+    for k in range(9):
         got = out[k * LANES:(k + 1) * LANES]
         good = all(v == want[k] for v in got)
         ok &= good
@@ -933,7 +935,7 @@ PROBES = {
     "probe_atomic2_p1": (gen_atomic2_p1, check_atomic2_p1, 512),
     "probe_tr_b16_mfma2": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
     "probe_ptr64_p1": (gen_ptr64_p1, check_ptr64_p1, 9 * LANES * 4),
-    "probe_anylane": (lambda: [[0] * LANES], check_anylane, 4 * LANES * 4),
+    "probe_anylane": (lambda: [[0] * LANES], check_anylane, 9 * LANES * 4),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
