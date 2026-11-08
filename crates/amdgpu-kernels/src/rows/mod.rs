@@ -291,7 +291,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 }
                 let tot = red(b, RedOp::Sum, part.unwrap(), 0, gen0, &lane);
                 let mean = b.mul_f32(tot, inv_n);
-                let neg_mean = b.neg_f32(mean);
+                let neg_mean = b.sub_f32(zero, mean);
                 let mut part2: Option<ValueId> = None;
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
