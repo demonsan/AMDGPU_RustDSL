@@ -291,9 +291,10 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                 let ops: Vec<(VarId, ValueId)> = bsets
                     .iter()
                     .map(|&(bf, sb)| {
-                        // the lane's scale word holds groups 4 (g / 2) + 0..3 (bytes 0..3); dword d of the fragment is in group 4 (g / 2) + d % 4
+                        // dword d of the fragment holds K group d of the tile (measured with the host's W4DBG=6 probe): scale byte d % 4 of
+                        // word d / 4 (the block's two scale words)
                         let d0 = 2 * k + h as u32;
-                        let sw = b.bitcast_i32(Opnd::Var(sb));
+                        let sw = b.bitcast_i32(Opnd::Var(VarId(sb.0 + d0 / 4)));
                         let e = b.bind_i32((ev(sw).lshr(8 * (d0 % 4) as i32)) & 0xff);
                         let sbits = b.bind_i32(ev(e) << 23);
                         let sf = b.bitcast_f32(sbits);
@@ -401,12 +402,6 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
         }
     }
     Vec::new()
-}
-
-/// The lane's g / 2 (g = lane / 16): 0 for lanes 0..31, 1 for 32..63.
-fn lane_g2(b: &mut FnBuilder) -> ValueId {
-    let l = Lane::new(b);
-    b.bind_i32(l.lane().lshr(5))
 }
 
 /// The deferred block-scale updates: acc += t (sa sb) lane by lane.
@@ -905,18 +900,12 @@ impl Body {
             // A16W4: no A scales (zeros, unused); B [N][K / 32]: the 8 group bytes of the tile per n block, as two dwords (words 2 j, 2 j + 1)
             let so = { let v = b.bind_i32(ev(kb) << 3); b.read_first_lane(v) };
             let sa = (0..mx.voff_a.len()).map(|_| b.c_i32(0)).collect();
-            // the lane's word: groups 4 (g / 2) .. 4 (g / 2) + 3 = dword g / 2 of the 8 bytes (two entries per block, the second unused)
-            let gg = lane_g2(b);
-            let hi_half = b.bind_cond(ev(gg).gt(0));
+            // the tile's 8 group bytes of the block's row as two words (groups 0..3, 4..7)
             let mut sb = Vec::new();
             for v in &mx.voff_b {
                 let f = b.buffer_load_b64(self.rsrc_sfb, *v, so, 0);
-                let lo = b.frag2_lane(f, 0);
-                let hi = b.frag2_lane(f, 1);
-                let (lo, hi) = (b.bitcast_i32(lo), b.bitcast_i32(hi));
-                let w = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(hi_half), a: Opnd::Val(hi), b: Opnd::Val(lo) });
-                sb.push(w);
-                sb.push(w);
+                sb.push(b.frag2_lane(f, 0));
+                sb.push(b.frag2_lane(f, 1));
             }
             return (sa, sb);
         }
