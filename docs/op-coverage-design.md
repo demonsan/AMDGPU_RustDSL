@@ -571,7 +571,14 @@
 - k_scale 并入 softmax scale，v_scale 并入输出。
 - 测试用 [`pa_host`](../tests/gpu/pa_host.cpp) 的 `FP8KV=1`：B4、B16、B64、P256 全部 bad=0。
 - 性能：B64 ctx2048 S1 为 71.6 µs（bf16 为 96 µs，快 1.34×）；B16 ctx4096 最佳 S4 为 49 µs（bf16 46 µs）。小 batch 时转换和延迟是瓶颈。
-- 待办：per-token scale（`reshape_cache_blocked_fp8` 的分块布局），以及与 aiter `pa_bf16_pertokenFp8_*` 的对照。
+- **per-token scale（分块布局）**：`pa_decode16_fp8tok_hd128_b<BS>`，读的是 `reshape_cache_blocked_fp8` 写出的布局。
+  - 布局：K 为 [NB][HK][D/16][BS][16]，V 为 [NB][HK][D][BS]，scale 为 [HK][S] 的 f32 指针，k_scales 在 @208，v_scales 在 @224。
+  - K 行按块 gather，进入与 flash 形式相同的 fp8 K tile。
+  - V 以 d-major 方式到达（即 V^T），转换成 bf16 V^T tile 后用普通 8 字节读。
+  - 每个 key 的 scale：k 乘在 S 上，v 乘在 P 上（在行和之后）。key 的 slot 由一次块表读取加 ds_bpermute 得到。
+  - 测试用 `FP8KV=2`，BS=16 和 BS=64 全部 bad=0。
+  - 性能：B64 ctx2048 为 88 µs，B16 ctx4096 S4 为 59 µs。
+  - 与 aiter `pa_bf16_pertokenFp8_*` 的对照尚待完成：需要它的 kernarg 和 KV 布局。
 
 **A16W4（覆盖补齐，忠实语义）**：`gemm_a16w4_mxfp4`，即 `Elem::Bf16W4`，64×128 CTA。
 - A 为 bf16，精确保留；B 为 MXFP4，在主循环中反量化为 bf16，再走 bf16 MFMA。
