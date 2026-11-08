@@ -86,6 +86,12 @@ pub fn group_lanes(n: i64) -> i64 {
     }
 }
 
+/// lane `i` of a Frag2 as an f32 (the lane accessor returns the raw u32)
+fn fl2(b: &mut FnBuilder, f: ValueId, i: u8) -> ValueId {
+    let v = b.frag2_lane(f, i);
+    b.bitcast_f32(v)
+}
+
 /// a Frag2 of two f32 values (the constructor takes the raw 32-bit patterns)
 fn pf2(b: &mut FnBuilder, x: ValueId, y: ValueId) -> ValueId {
     let (xi, yi) = (b.bitcast_i32(x), b.bitcast_i32(y));
@@ -308,8 +314,8 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                         let x2 = pf2(b, xi[2 * q], xi[2 * q + 1]);
                         let d2 = b.pk_add_f32(x2, nm2);
                         // masked lanes: the deviation of a masked-out chunk must not count
-                        let d0 = b.frag2_lane(d2, 0);
-                        let d1 = b.frag2_lane(d2, 1);
+                        let d0 = fl2(b, d2, 0);
+                        let d1 = fl2(b, d2, 1);
                         let dm = masked(b, &[d0, d1, zero, zero, zero, zero, zero, zero], i, zero);
                         let dm2 = pf2(b, dm[0], dm[1]);
                         sqp.push(b.pk_mul_f32(dm2, dm2));
@@ -317,7 +323,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let a01 = b.pk_add_f32(sqp[0], sqp[1]);
                     let a23 = b.pk_add_f32(sqp[2], sqp[3]);
                     let a = b.pk_add_f32(a01, a23);
-                    let (l0, l1) = (b.frag2_lane(a, 0), b.frag2_lane(a, 1));
+                    let (l0, l1) = (fl2(b, a, 0), fl2(b, a, 1));
                     let sq = vec![l0, l1];
                     let s = lane_reduce(b, RedOp::Sum, &sq);
                     part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
@@ -343,8 +349,8 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                         let t2 = b.pk_mul_f32(d2, inv2);
                         let u2 = b.pk_mul_f32(t2, g2);
                         let y2 = b.pk_add_f32(u2, b2);
-                        y[2 * q] = b.frag2_lane(y2, 0);
-                        y[2 * q + 1] = b.frag2_lane(y2, 1);
+                        y[2 * q] = fl2(b, y2, 0);
+                        y[2 * q + 1] = fl2(b, y2, 1);
                     }
                     out.push(y);
                 }
