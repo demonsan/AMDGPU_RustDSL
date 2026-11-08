@@ -335,7 +335,8 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | 采样 / top-k | argmax、sample（温度）、top-k + top-p、topk_softmax | 有 | 见前文 |
 | | **moe_fused_gate**（DeepSeek-V3 分组 topk：sigmoid + bias → 组内 top-2 之和 → 丢掉 G − TG 个最低的组 → 余下专家里取 top-K → 权重 = s / Σs） | 有（新） | `moe_fused_gate_bf16_e<E>_g<G>_tg<TG>_k<K>`（G ∈ {4, 8, 16, 32, 64}，E / G ∈ {8, 16, 24, 32}，K ≤ 32）：一个 lane 持有一个 (行, 组) 的 E / G 个专家，所有规约是 G 个 lane 上的 DPP 全规约；并列取低下标（组选择同样）；NaN → 0。E = 256, G = 8, TG = 4, K = 8：M ≤ 4096 约 10 µs，M = 131072 118 µs（VALU 受限，0.9 µs / 千行）。不含 shared-expert 融合与 pad 行 |
 | | topk_gating | 缺 | 与 `topk_softmax` 的 renorm 变体等价的一个子集，未单列 |
-| | topk_per_row（prefill / decode 的 indexer topk）、topk_plain | 缺 | 需要大 K 的行内 top-k（K ≤ 2048）：基数选择（见"采样"一节）可直接复用，是下一批 |
+| | **topk_per_row**（decode：`seq_lens` + `next_n` 给出每行长度；prefill：逐行 `[start, end)`；稀疏注意力的 indexer topk，K ≤ 2048，f32 logits） | 有（新） | `topk_per_row_decode_f32_k<K>` / `topk_per_row_prefill_f32_k<K>`：四遍 8 位基数选择（f32 的保序 32 位键）+ 一遍发射；输出为被选列的绝对下标（无序；第 K 大值上的并列任取），行长 ≤ K 时原序返回整行，之后补 −1；一行一个 1024 线程的块（行不拆到多个 CU）。R = 256 行 × 64K 94 µs，R = 4096 行（1/4 为短行）× 32K 0.54 ms；不含 `values` 输出与 `stable`（升序）模式 |
+| | topk_plain（无行范围的版本） | 缺 | 同一 kernel 的 `start = 0, end = stride` 特例；按需再加名字 |
 | MoE 辅助 | moe_sorting（单 block / 多 block / 稳定序）、**moe_reduce / moe_combine** | 有 | `moe_sorting_*`、`moe_{count,scan,scatter,scatter_ord}_*`、`moe_reduce_bf16_k<K>_d<D>`、`moe_combine_bf16_k<K>_d<D>` |
 | 其他 | **causal_conv1d_update**（decode，W = 2 – 4，状态窗口移位，可选 silu 与连续批处理的 state_indices，pad = 负） | 有（新） | `causal_conv1d_update_bf16_w<W>_s<SL>[_idx][_silu]`：输出与新状态均与 CPU 参考逐位一致；B = 2048 dim = 8192 3.1 TB/s（2 字节访问，没有向量化） |
 | | causal_conv1d fwd（prefill / split_qkv） | 缺 | 沿 L 的滑动窗口卷积：每个 lane 一个 channel、沿序列滑动，权重常驻寄存器；split_qkv 只是不同的输出切分；待做 |
@@ -345,3 +346,10 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | binary / unary 算子（add、mul、tanh、sigmoid…） | 部分 | `add_bf16`、`sigmoid_bf16`、`silu_bf16` 等；其余是同一模板的换函数 |
 
 **精度判据**：bf16 输出 ≤ 1 ulp（+ 小绝对量），fp8 输出按 e4m3 的半步长（相对 1/16）加 scale · 2⁻⁹（次正规），scale 相对 1e-3；cache / state 类的输出按字节逐位比较。
+
+
+## 每行 top-K（`topk_per_row_*`）
+
+`topk_per_row_{decode,prefill}_f32_k<K>`（K = 1 … 2048）：对 f32 logits 的每一行取最大的 K 个，输出列下标。decode 版的行 `b · next_n + j` 有 `L = seq_lens[b] − next_n + j + 1` 个有效列（grid = (B, next_n)）；prefill 版逐行 `[row_starts, row_ends)`，输出绝对列下标。选择方法与"采样"一节的 top-k 相同，只是键是 f32 的 32 位保序键，所以是四遍 8 位的基数选择（每遍一次 LDS 直方图 + 256 桶的降序扫描）求出第 K 大的键 `T` 与还需要的与 `T` 相等的元素个数 `rem`，最后一遍发射所有 `> T` 的元素（LDS 计数器分配位置）和前 `rem` 个 `== T` 的元素；不参与计数的元素写到每个 lane 各自的垃圾槽。每行读 5 遍（第 1 遍来自 HBM，其余多半来自 L2）。
+
+验证（`tests/gpu/topk_per_row_host.cpp`）：列必须互不相同、在行内、且所选值的多重集合恰好是该行最大的 K 个值（并列任取）；行长 ≤ K 的行必须按列序返回整行再补 −1。覆盖 decode（next_n = 1 / 2 / 3，长度不一，含短于 K 的行）、prefill（行首非零、行长 < K / = K / > K），K = 1、64、100、128、2048，带大量并列值的数据；`bad_rows = 0`，`gpu_verify --strict` 0 错误，48 VGPR。性能（一行一个块，不拆到多个 CU）：256 行 × 64K：94 µs；256 行 × 32K：46 µs；4096 行（1/4 短行）× 32K：0.54 ms。长行拆到多个 CU（aiter 的 multi-block 路径）是后续工作，只对行数少于 CU 数时有意义。
