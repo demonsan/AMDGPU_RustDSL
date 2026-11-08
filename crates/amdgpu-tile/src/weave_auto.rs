@@ -1,21 +1,18 @@
-//! `weave_auto`: a COST-BASED automatic weave strategy (docs/weaver-auto.md). Given the units of a phase it computes an order - a topological order of their dependencies - that minimises
-//! the cycles of an in-order, single-wave issue model (one instruction per `issue_gap` cycles whatever the pipe, the MFMA pipe busy `mfma_cycles` per scaled 32x32x64, in-order LDS returns with a
-//! queue-depth penalty, result latencies of MFMA / LDS / VALU), under a register-pressure guard. The author's explicit order stays authoritative: this is an optional strategy
-//! (`Weaver::order(auto_order(..))`, or the experiment switch `AMDC_WEAVE_AUTO=<phase label>[,..]` for an A/B without editing the kernel).
+//! `weave_auto`: a COST-BASED automatic weave strategy (docs/weaver-auto.md). Given the units of a phase (every unit is a captured piece of IR with statement facts, `Unit::stmts` /
+//! `Unit::summary`, and dependences derived from `facts::must_order`) it computes an order - a topological order of the dependences - that minimises the cycles of an in-order, single-wave issue
+//! model (one instruction per `issue_gap` cycles whatever the pipe, the MFMA pipe busy 4 x passes, in-order LDS returns with a queue-depth penalty, result latencies of MFMA / LDS / VALU), under a
+//! register-pressure guard. The author's explicit order stays authoritative: this is an optional strategy (`Weaver::order(auto_order(..))`, or the experiment switches `AMDC_WEAVE_AUTO=<phase label>[,..]`
+//! (unit granularity) and `AMDC_WEAVE_AUTO_STMT=<label>[,..]` (statement granularity: `Weaver::fine()` first) for an A/B without editing the kernel).
 //!
 //! The model is the one calibrated on the warm ATT of the 4-wave FMHA (docs/lgkm-lookahead.md): issue gap 4, MFMA result 84 cycles after issue, `ds_read` about 125-145 cycles to its consumer and much
 //! later behind a deep queue, LDS-DMA issue 24. It is NOT a performance oracle below ~3800 simulated cycles per iteration (the hardware is LDS-bandwidth bound there); the strategy is
 //! therefore reported with measured numbers, not adopted by default.
-//!
-//! Instruction counts per unit come from `Unit::cost` (set by the stage with `Units::cost`, or captured); units without one get `estimate`, an interim name / class based guess for the shipped FMHA and
-//! GEMM units.
 
-use crate::weave::{Hint, Unit, UnitClass, UnitId, Units};
-use amdgpu_dsl::facts::{self, Facts, ResClass};
-use amdgpu_dsl::{Captured, Function, Node};
+use crate::weave::{Hint, Units};
+use amdgpu_dsl::facts::{Facts, ResClass};
 use std::collections::HashMap;
 
-/// What a unit issues (counts per instruction kind) - the input of the issue model.
+/// What an item issues (counts per instruction kind) - the input of the issue model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UnitCost {
     pub ds_b128: u32,
@@ -32,12 +29,12 @@ pub struct UnitCost {
     pub mfma16: u32,
     /// LDS-DMA issues
     pub dma: u32,
-    /// generic ds_read (width unknown: statement facts)
+    /// generic `ds_read` (statement facts do not know the width)
     pub lds: u32,
     /// generic matrix instructions (statement facts): count and busy cycles each
     pub xdl: u32,
     pub xdl_busy: u32,
-    /// the unit waits for everything outstanding first (barrier / counted wait / a branch with its own control flow)
+    /// the item waits for everything outstanding first (barrier / counted wait / a branch with its own control flow)
     pub fence: bool,
 }
 
@@ -72,83 +69,6 @@ impl Model {
         Model { issue_gap: 4, mfma_cycles: 64, mfma16_cycles: 32, mfma_latency: 84, mfma16_latency: 48, valu_latency: 8, ds_b128_latency: 144, ds_tr_latency: 125, ds_b32_latency: 64, lds_queue_depth: 8, lds_queue_penalty: 200, dma_issue: 24, branch_cost: 24, reg_slack: 16, passes: 24, window: 40 }
     }
 }
-
-/// Interim cost guess for a unit that has none (the shipped FMHA / GEMM units by name, otherwise by class and latency).
-pub fn estimate(u: &Unit<'_>) -> UnitCost {
-    if let Some(c) = u.cost {
-        return c;
-    }
-    let n = u.name.as_str();
-    let mut c = UnitCost::default();
-    if n == "qk.setup" || n == "window.qk.setup" {
-        c.salu = 4;
-        c.valu = 2;
-        c.mfma16 = 1;
-    } else if n.starts_with("qk.read") {
-        c.ds_b128 = 4;
-        c.ds_b32 = 1;
-    } else if n.starts_with("qk.mma") || n.starts_with("window.qk.block") {
-        c.valu = 1;
-        c.mfma = 2;
-    } else if n == "pv.setup" {
-        c.valu = 4;
-    } else if n == "pv.rowsum" {
-        c.mfma16 = 2;
-    } else if n.starts_with("pv.read") {
-        c.ds_tr = 4;
-    } else if n.starts_with("pv.mma") {
-        c.mfma = 1;
-    } else if n == "softmax.decide" {
-        c.valu = 24;
-        c.fence = true;
-    } else if n == "softmax.convert" {
-        c.valu = 40;
-        c.valu8 = 32;
-    } else if n.starts_with("window.convert") {
-        c.valu = 10;
-        c.valu8 = 8;
-    } else if n.starts_with("mma.i") {
-        c.mfma16 = 1;
-    } else if n.starts_with("reload.") {
-        c.ds_b128 = 4;
-    } else if n.starts_with("ab.") && u.class == UnitClass::Dma {
-        c.dma = 1;
-        c.salu = 2;
-    } else {
-        match u.class {
-            UnitClass::Mfma => c.mfma = 1,
-            UnitClass::LdsRead => c.ds_b128 = 2,
-            UnitClass::Valu => c.valu = (u.latency / 4).max(4),
-            UnitClass::Dma => c.dma = 1,
-            UnitClass::Salu | UnitClass::Setup => c.salu = 2,
-            UnitClass::Branch => {
-                c.valu = 8;
-                c.fence = true;
-            }
-        }
-    }
-    c
-}
-
-/// Live dwords a unit adds (its outputs are consumed by later units) and its own peak temporaries: (live_out - live_in, temps). Interim guess for units without a `RegProfile`.
-fn reg_facts(u: &Unit<'_>) -> (i64, i64) {
-    if u.regs != Default::default() {
-        return (u.regs.live_out as i64 - u.regs.live_in as i64, u.regs.temps as i64);
-    }
-    let n = u.name.as_str();
-    if n.starts_with("qk.read") {
-        (17, 0)
-    } else if n.starts_with("pv.read") {
-        (8, 0)
-    } else if n.starts_with("qk.mma") || n.starts_with("window.qk.block") {
-        (-17, 4)
-    } else if n.starts_with("pv.mma") {
-        (-8, 2)
-    } else {
-        (0, 0)
-    }
-}
-
 /// One schedulable item of the planner: a weave unit or a captured statement (or a group of statements that must not be split).
 #[derive(Clone, Debug, Default)]
 pub struct Item {
@@ -404,40 +324,6 @@ pub fn plan_items(items: &[Item], m: &Model) -> Vec<usize> {
     order
 }
 
-// ---------------------------------------------------------------- weave units
-
-fn items_from_units(units: &Units<'_>) -> Vec<Item> {
-    let n = units.len();
-    let is_fence = |i: usize| estimate(units.unit(i)).fence;
-    (0..n)
-        .map(|i| {
-            let u = units.unit(i);
-            // effective ordering dependences: the real ones plus the fences' - a fence unit follows every unit declared before it and precedes every unit declared after it
-            let mut d = u.deps.clone();
-            if is_fence(i) {
-                d.extend(0..i);
-            }
-            d.extend((0..i).filter(|&f| is_fence(f)));
-            d.sort_unstable();
-            d.dedup();
-            let (delta, temps) = reg_facts(u);
-            Item { name: u.name.clone(), cost: estimate(u), deps: d, tdeps: u.deps.clone(), fixed: u.hint == Hint::Anchor, drain: false, delta, temps, ..Default::default() }
-        })
-        .collect()
-}
-
-/// The modelled cycles of the units in `order` and the peak extra live dwords.
-pub fn simulate(units: &Units<'_>, order: &[UnitId], m: &Model) -> (i64, i64) {
-    simulate_items(&items_from_units(units), order, m)
-}
-
-/// A topological order of the units of a phase minimising the modelled cycles (see [`plan_items`]); `Anchor` units stay where the greedy pass put them and nothing crosses a `fence` unit.
-pub fn auto_order(units: &Units<'_>, m: &Model) -> Vec<UnitId> {
-    plan_items(&items_from_units(units), m)
-}
-
-// ---------------------------------------------------------------- captured statements
-
 fn class_cost(c: ResClass) -> UnitCost {
     let mut k = UnitCost::default();
     match c {
@@ -472,117 +358,54 @@ fn add_cost(a: &mut UnitCost, b: &UnitCost) {
     a.xdl_busy = a.xdl_busy.max(b.xdl_busy);
 }
 
-fn is_view_extract(n: &Node) -> bool {
-    matches!(n, Node::S(amdgpu_dsl::Stmt::Let { op: amdgpu_dsl::Op::Frag16Lane { frag: amdgpu_dsl::Opnd::Var(_), .. }, .. }))
-}
-
-/// `b` is a bitcast of exactly the value `a` defines.
-fn uses_only_value_of(b: &Node, a: &Node) -> bool {
-    match (a, b) {
-        (Node::S(amdgpu_dsl::Stmt::Let { dst, .. }), Node::S(amdgpu_dsl::Stmt::Let { op: amdgpu_dsl::Op::BitcastF32(amdgpu_dsl::Opnd::Val(v)), .. })) => v == dst,
-        _ => false,
-    }
-}
-
 fn data_dep(a: &Facts, b: &Facts) -> bool {
     let hits = |x: &[amdgpu_dsl::VarId], y: &[amdgpu_dsl::VarId]| x.iter().any(|v| y.contains(v));
     b.uses.iter().any(|u| a.defs.contains(u)) || hits(&a.var_writes, &b.var_reads) || hits(&a.var_reads, &b.var_writes) || hits(&a.var_writes, &b.var_writes)
 }
 
-/// Items of a capture: the top-level nodes (weave-region mark pairs stay together as one item), their dependences from `facts::must_order`, their costs from the resource classes, the register model at value
-/// level. Returns the items and, per item, the node range it stands for.
-pub fn items_from_nodes(f: &Function, cap: &Captured) -> (Vec<Item>, Vec<std::ops::Range<usize>>) {
-    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
-    for r in cap.groups() {
-        // a lane extracted from a loop variable is a register view (lowering: `alias_vreg`): keep it adjacent to the bitcast that consumes it
-        if let (Some(last), 1) = (groups.last_mut(), r.len()) {
-            if last.len() == 1 && is_view_extract(&cap.nodes[last.start]) && uses_only_value_of(&cap.nodes[r.start], &cap.nodes[last.start]) {
-                last.end = r.end;
-                continue;
+// ---------------------------------------------------------------- weave units
+
+/// The planner items of a phase's units: costs from the statement classes, ordering dependences = the units' derived `deps`, timing dependences = their data dependences, the register model at value level
+/// (a unit's defs share its footprint).
+pub fn items_from_units(units: &Units) -> Vec<Item> {
+    (0..units.len())
+        .map(|i| {
+            let u = units.unit(i);
+            let mut cost = UnitCost::default();
+            for st in &u.stmts {
+                add_cost(&mut cost, &class_cost(st.class));
             }
-        }
-        groups.push(r);
-    }
-    let node_facts: Vec<Facts> = cap.facts(f);
-    let facts_of = |r: &std::ops::Range<usize>| -> Facts {
-        if r.len() == 1 {
-            node_facts[r.start].clone()
-        } else {
-            Captured { nodes: cap.nodes[r.clone()].to_vec() }.summary(f)
-        }
-    };
-    let gf: Vec<Facts> = groups.iter().map(facts_of).collect();
-    let mut items = Vec::with_capacity(groups.len());
-    for (gi, r) in groups.iter().enumerate() {
-        let fa = &gf[gi];
-        let mut cost = UnitCost::default();
-        for k in r.clone() {
-            add_cost(&mut cost, &class_cost(node_facts[k].class));
-        }
-        let mut deps = Vec::new();
-        let mut tdeps = Vec::new();
-        for gj in 0..gi {
-            if facts::must_order(&gf[gj], fa) {
-                deps.push(gj);
-                if data_dep(&gf[gj], fa) {
-                    tdeps.push(gj);
-                }
+            let e = &u.summary.eff;
+            let tdeps: Vec<usize> = u.deps.iter().copied().filter(|&d| data_dep(&units.unit(d).summary, &u.summary)).collect();
+            let per = if u.summary.defs.is_empty() { 0 } else { (u.summary.footprint as i64 / u.summary.defs.len() as i64).max(if u.summary.footprint > 0 { 1 } else { 0 }) };
+            let defs: Vec<(u32, i64)> = u.summary.defs.iter().map(|&v| (v as u32, per)).filter(|&(_, d)| d > 0).collect();
+            let uses: Vec<u32> = u.summary.uses.iter().map(|&v| v as u32).collect();
+            Item {
+                name: u.name.clone(),
+                cost,
+                deps: u.deps.clone(),
+                tdeps,
+                fixed: u.hint == Hint::Anchor || e.anchor() || e.branch,
+                drain: e.barrier || e.wait_lds.is_some() || e.wait_vm.is_some() || e.branch || e.asm,
+                defs,
+                uses,
+                delta: 0,
+                temps: 0,
             }
-        }
-        let drain = fa.eff.barrier || fa.eff.wait_lds.is_some() || fa.eff.wait_vm.is_some() || fa.eff.branch || fa.eff.asm;
-        let defs: Vec<(u32, i64)> = fa.defs.iter().map(|&v| (v as u32, facts::dwords(f.value_tys[v as usize]) as i64)).filter(|&(_, d)| d > 0).collect();
-        let uses: Vec<u32> = fa.uses.iter().map(|&v| v as u32).collect();
-        items.push(Item { name: format!("n{}", r.start), cost, deps, tdeps, fixed: fa.eff.anchor() || fa.eff.branch, drain, defs, uses, delta: 0, temps: 0 });
-    }
-    // A lane / sub-fragment extracted from a loop variable (`Frag16Lane { frag: Var(v), .. }`) is a register VIEW of the variable, not a copy: every transitive user of the extracted value must stay
-    // before the next write of the variable (the statement facts record the read of `v` at the extraction only).
-    let n = items.len();
-    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (j, it) in items.iter().enumerate() {
-        for &d in &it.tdeps {
-            consumers[d].push(j);
-        }
-    }
-    for a in 0..n {
-        let fa = &gf[a];
-        if fa.defs.is_empty() || fa.var_reads.is_empty() {
-            continue;
-        }
-        let views: Vec<_> = fa.var_reads.iter().filter(|v| !fa.var_writes.contains(v)).collect();
-        if views.is_empty() {
-            continue;
-        }
-        // transitive data users of `a`
-        let mut seen = vec![false; n];
-        let mut stack = vec![a];
-        seen[a] = true;
-        while let Some(x) = stack.pop() {
-            for &c in &consumers[x] {
-                if !seen[c] {
-                    seen[c] = true;
-                    stack.push(c);
-                }
-            }
-        }
-        for w in a + 1..n {
-            if seen[w] || !gf[w].var_writes.iter().any(|v| views.contains(&v)) {
-                continue;
-            }
-            for u in a + 1..w {
-                if seen[u] && !items[w].deps.contains(&u) {
-                    items[w].deps.push(u);
-                }
-            }
-        }
-    }
-    (items, groups)
+        })
+        .collect()
 }
 
-/// The cost-based order of the top-level nodes of a capture (a permutation of `0..cap.nodes.len()`; every legal reorder by `facts::must_order`, mark-pair groups kept contiguous).
-pub fn auto_order_nodes(f: &Function, cap: &Captured, m: &Model) -> Vec<usize> {
-    let (items, groups) = items_from_nodes(f, cap);
+/// The modelled cycles of the units in `order` and the peak live dwords.
+pub fn simulate(units: &Units, order: &[usize], m: &Model) -> (i64, i64) {
+    simulate_items(&items_from_units(units), order, m)
+}
+
+/// A topological order of the units of a phase (or, after `Weaver::fine()`, of its statement groups) minimising the modelled cycles (see [`plan_items`]); anchors and branches stay where the greedy pass put
+/// them. Debug aids: `AMDC_WEAVE_AUTO_VERBOSE=1` prints the plan, `AMDC_WEAVE_AUTO_PREFIX=N` keeps only the first N planned items (the rest in declaration order; `0` = the identity).
+pub fn auto_order(units: &Units, m: &Model) -> Vec<usize> {
+    let items = items_from_units(units);
     let mut order = plan_items(&items, m);
-    // bisect aids: `AMDC_WEAVE_AUTO_PREFIX=N` keeps the first N planned items, the rest in declaration order (`0` = the identity)
     if let Some(n) = std::env::var("AMDC_WEAVE_AUTO_PREFIX").ok().and_then(|v| v.parse::<usize>().ok()) {
         let head: Vec<usize> = order.iter().copied().take(n).collect();
         let mut rest: Vec<usize> = (0..items.len()).filter(|i| !head.contains(i)).collect();
@@ -590,34 +413,15 @@ pub fn auto_order_nodes(f: &Function, cap: &Captured, m: &Model) -> Vec<usize> {
         order = head.into_iter().chain(rest).collect();
     }
     if std::env::var("AMDC_WEAVE_AUTO_VERBOSE").map_or(false, |v| !v.is_empty()) {
-        let fs = cap.facts(f);
         let (c0, p0) = simulate_items(&items, &(0..items.len()).collect::<Vec<_>>(), m);
         let (c1, p1) = simulate_items(&items, &order, m);
         eprintln!("weave_auto: {} items; modelled cycles {c0} -> {c1}, peak live {p0} -> {p1}", items.len());
         for (pos, &g) in order.iter().enumerate() {
-            let k = groups[g].start;
-            let e = &fs[k].eff;
-            let flags = format!("{}{}{}{}{}{}", if e.lds_read { "Lr " } else { "" }, if e.lds_write { "Lw " } else { "" }, if e.global_read || e.global_write { "G " } else { "" }, if e.anchor() { "ANCHOR " } else { "" }, if e.branch { "BRANCH " } else { "" }, if !fs[k].defs.is_empty() { "def" } else { "" });
-            let mut det = format!("{:?}", cap.nodes[k]);
-            det.truncate(170);
-            eprintln!("  {pos:3} <- {g:3} {:?} {flags} defs={:?} uses={:?} vr={:?} vw={:?} | {det}", fs[k].class, fs[k].defs, fs[k].uses, fs[k].var_reads, fs[k].var_writes);
+            let u = units.unit(g);
+            eprintln!("  {pos:3} <- {g:3} {} {:?} {:?}", u.name, u.class, u.hint);
         }
     }
-    order.into_iter().flat_map(|g| groups[g].clone()).collect()
-}
-
-/// The modelled cycles / peak live dwords of the capture's nodes in the order `order` (node indices).
-pub fn simulate_nodes(f: &Function, cap: &Captured, order: &[usize], m: &Model) -> (i64, i64) {
-    let (items, groups) = items_from_nodes(f, cap);
-    let gorder: Vec<usize> = order.iter().filter_map(|&k| groups.iter().position(|g| g.start == k)).collect();
-    simulate_items(&items, &gorder, m)
-}
-
-/// Reorders the nodes of `cap` (by `auto_order_nodes`) ready to be spliced.
-pub fn reorder(f: &Function, cap: Captured, m: &Model) -> Vec<Node> {
-    let ord = auto_order_nodes(f, &cap, m);
-    let mut slots: Vec<Option<Node>> = cap.nodes.into_iter().map(Some).collect();
-    ord.into_iter().map(|k| slots[k].take().expect("a permutation")).collect()
+    order
 }
 
 /// `AMDC_WEAVE_AUTO=<label>[,<label>..]` (or `*`): the phase labels whose weave uses `auto_order` instead of the declaration order (an A/B switch; an explicit `Weaver::order` is never overridden).
@@ -625,7 +429,7 @@ pub fn env_enabled(label: &str) -> bool {
     env_label("AMDC_WEAVE_AUTO", label)
 }
 
-/// `AMDC_WEAVE_AUTO_STMT=<label>[,..]`: the same at STATEMENT granularity - the weave's units are captured and their statements reordered by `auto_order_nodes` (legality from the statement facts).
+/// `AMDC_WEAVE_AUTO_STMT=<label>[,..]`: the same at STATEMENT granularity - the weave is split with `Weaver::fine()` and its statement groups ordered by `auto_order` (legality from the derived dependences).
 pub fn env_stmt_enabled(label: &str) -> bool {
     env_label("AMDC_WEAVE_AUTO_STMT", label)
 }

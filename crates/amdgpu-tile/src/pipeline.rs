@@ -17,6 +17,33 @@
 
 use crate::lane::Role;
 use crate::shared::SlotIdx;
+use crate::weave::{rotate, Part, RotStage};
+
+/// The `OneWindow` iteration: stage(t+2) | window(t) | complete(t+2) + wait + barrier.
+const ONE_WINDOW_PARTS: [Part; 3] = [
+    Part { name: "stage", iter: 2, anchor: false },
+    Part { name: "window", iter: 0, anchor: false },
+    Part { name: "complete_sync", iter: 2, anchor: true },
+];
+
+/// The `RegStaged` iteration: key(t+2) | pre_sync(t) | waits + post_wait(t) + barrier | stage(t+2) | M phase(t).
+const REG_STAGED_PARTS: [Part; 5] = [
+    Part { name: "key", iter: 2, anchor: false },
+    Part { name: "pre_sync", iter: 0, anchor: false },
+    Part { name: "sync", iter: 2, anchor: true },
+    Part { name: "stage", iter: 2, anchor: false },
+    Part { name: "m_phase", iter: 0, anchor: false },
+];
+
+/// The `TwoPhaseOffset` iteration as rotated parts: stage(t+1) | V phase(t) | complete(t+1) | wait + barrier | M phase(t) | wait (+ barrier).
+const TWO_PHASE_PARTS: [Part; 6] = [
+    Part { name: "stage", iter: 1, anchor: false },
+    Part { name: "v_phase", iter: 0, anchor: false },
+    Part { name: "complete", iter: 1, anchor: true },
+    Part { name: "mid_sync", iter: 0, anchor: true },
+    Part { name: "m_phase", iter: 0, anchor: false },
+    Part { name: "end_sync", iter: 0, anchor: true },
+];
 use amdgpu_dsl::{ev, varx};
 use amdgpu_dsl::{DType, Ext, FnBuilder, Opnd, ValueId, VarId, I32};
 
@@ -280,17 +307,24 @@ impl Pipeline {
             tile_rows: self.tile_rows,
         };
         self.prebind(b, &t);
-        // the t+2 key (scalar) before the waits: right after the barrier the stage's first DMA issues at once (the vendor order)
-        let key_n2 = staged.then(|| b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg()));
-        body.pre_sync(b, role, &t);
-        if let Some(key_n2) = key_n2 {
-            b.wait_vm(0);
-            b.wait_lds(0);
-            body.post_wait(b, role, &t);
-            b.barrier();
-            body.stage(b, role, &key_n2, t.n2.as_ref().expect("n2"));
-        }
-        body.m_phase(b, role, &t);
+        // rotated weave: the t+2 key (scalar, before the waits: right after the barrier the stage's first DMA issues at once, the vendor order),
+        // the sync with the work issued after the waits, and the staging of t+2 run two iterations ahead (`iter` +2)
+        let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };
+        let lg = self.lg();
+        let mut key_n2: Option<I32> = None;
+        rotate(b, &REG_STAGED_PARTS, stage_sel, None, &mut |b, i| match i {
+            0 => key_n2 = Some(b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << lg)),
+            1 => body.pre_sync(b, role, &t),
+            2 => {
+                b.wait_vm(0);
+                b.wait_lds(0);
+                body.post_wait(b, role, &t);
+                b.barrier();
+            }
+            3 => body.stage(b, role, key_n2.as_ref().expect("key"), t.n2.as_ref().expect("n2")),
+            4 => body.m_phase(b, role, &t),
+            _ => unreachable!(),
+        });
     }
 
     /// One iteration; returns the next ring index.
@@ -312,22 +346,33 @@ impl Pipeline {
                     tile_rows: self.tile_rows,
                 };
                 self.prebind(b, &t);
-                let key_n = staged.then(|| if self.key_unclamped { b.let_i32((varx(it) + 1) << self.lg()) } else { b.let_i32(nn << self.lg()) });
-                if let Some(k) = &key_n {
-                    body.stage(b, role, k, &t.next);
-                }
-                body.v_phase(b, role, &t);
-                if staged {
-                    b.wait_vm(0);
-                    body.stage_complete(b, role, &t.next);
-                }
-                b.wait_lds(0);
-                b.barrier();
-                body.m_phase(b, role, &t);
-                b.wait_lds(0);
-                if last_barrier {
-                    b.barrier();
-                }
+                // the iteration as a rotated weave: the staging of tile t+1 (and its completion) runs one iteration ahead (`iter` +1), so the
+                // peeled last iteration (`staged` = false) is the epilogue of the rotation; waits and barriers are anchors
+                let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };
+                let (lg, unclamped) = (self.lg(), self.key_unclamped);
+                rotate(b, &TWO_PHASE_PARTS, stage_sel, None, &mut |b, i| match i {
+                    0 => {
+                        let k = if unclamped { b.let_i32((varx(it) + 1) << lg) } else { b.let_i32(nn.clone() << lg) };
+                        body.stage(b, role, &k, &t.next);
+                    }
+                    1 => body.v_phase(b, role, &t),
+                    2 => {
+                        b.wait_vm(0);
+                        body.stage_complete(b, role, &t.next);
+                    }
+                    3 => {
+                        b.wait_lds(0);
+                        b.barrier();
+                    }
+                    4 => body.m_phase(b, role, &t),
+                    5 => {
+                        b.wait_lds(0);
+                        if last_barrier {
+                            b.barrier();
+                        }
+                    }
+                    _ => unreachable!(),
+                });
                 i1
             }
             // RegStaged runs two tiles per pass with static slots (`iter_rs`)
@@ -348,17 +393,23 @@ impl Pipeline {
                 };
                 self.prebind(b, &t);
                 let n2 = t.n2.clone().expect("n2");
-                if staged {
-                    let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << self.lg());
-                    body.stage(b, role, &key_n2, &n2);
-                }
-                body.window(b, role, &t);
-                if staged {
-                    b.wait_vm(self.vm_inflight);
-                    body.stage_complete(b, role, &n2);
-                    b.wait_lds(0);
-                    b.barrier();
-                }
+                // rotated weave: the staging of tile t+2 and its completion run two iterations ahead (`iter` +2)
+                let stage_sel = if staged { RotStage::Steady } else { RotStage::Epilogue };
+                let (lg, vm) = (self.lg(), self.vm_inflight);
+                rotate(b, &ONE_WINDOW_PARTS, stage_sel, None, &mut |b, i| match i {
+                    0 => {
+                        let key_n2 = b.let_i32(it_p2.lt(&nkv).select_i32(&it_p2, &nkv - 1) << lg);
+                        body.stage(b, role, &key_n2, &n2);
+                    }
+                    1 => body.window(b, role, &t),
+                    2 => {
+                        b.wait_vm(vm);
+                        body.stage_complete(b, role, &n2);
+                        b.wait_lds(0);
+                        b.barrier();
+                    }
+                    _ => unreachable!(),
+                });
                 i1
             }
         }

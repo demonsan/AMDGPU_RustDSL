@@ -249,7 +249,7 @@ stage 的参数（形状、dtype、slot、tile 号等）在调用点给定。实
 | 字段 | 含义 |
 |---|---|
 | `emit` | 一个闭包：发射一小段自洽的 IR（一个 QK 块、一个 PV 块、一条 DMA 指令……） |
-| `deps` | 必须先发射的单元（同一组内的索引）；跨单元传值用 `Out<T>`（生产者发射时写入，消费者发射时读取） |
+| `deps` | 必须先发射的单元（同一组内的索引），由捕获语句的事实自动推导（`facts::must_order`）；单元在构造时就捕获，值直接从闭包返回（[`weave-capture.md`](weave-capture.md)） |
 | `class` | 资源类：`Mfma` / `Valu` / `LdsRead` / `Dma` / `Salu` / `Branch` / `Setup` |
 | `latency` | 名义的发射→结果延迟（周期） |
 | `regs` | 寄存器画像：live-in / live-out / temps（dword，估计值），结果能否放 AGPR |

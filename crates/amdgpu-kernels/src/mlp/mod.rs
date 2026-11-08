@@ -281,10 +281,9 @@ impl MlpSlots {
             cx.xs.clone()
         } else {
             let wf = |b: &mut FnBuilder, sh: &amdgpu_tile::Shared, t: i64, kb: i64| -> ValueId { cx.wfrag(b, sh, t, kb) };
-            let st = gemm1_act_stage(GemmCtx { wfrag: &wf, c127: cx.c127.expect("x_first") }, cx.w1s.as_ref().expect("W1"), &cx.xs, mode, cx.r_out, cx.row.expect("loop_open"), &cx.lane, &cx.roles, cx.epi);
-            let out = st.out.clone();
-            st.inst.plain(!fused).emit(b);
-            out.get()
+            let (inst, out) = gemm1_act_stage(b, GemmCtx { wfrag: &wf, c127: cx.c127.expect("x_first") }, cx.w1s.as_ref().expect("W1"), &cx.xs, mode, cx.r_out, cx.row.expect("loop_open"), &cx.lane, &cx.roles, cx.epi);
+            inst.plain(!fused).emit(b);
+            out
         };
         cx.p_words = p_words;
     }
@@ -306,7 +305,7 @@ impl MlpSlots {
             ..Default::default()
         };
         let wf = |b: &mut FnBuilder, sh: &amdgpu_tile::Shared, t: i64, kb: i64| -> ValueId { cx.wfrag(b, sh, t, kb) };
-        gemm2_stage(GemmCtx { wfrag: &wf, c127: cx.c127.expect("x_first") }, cx.w2s.as_ref().expect("W2"), &cx.p_words, cx.r_out, cx.row.expect("loop_open"), &cx.lane, contract).plain(!fused).emit(b);
+        gemm2_stage(b, GemmCtx { wfrag: &wf, c127: cx.c127.expect("x_first") }, cx.w2s.as_ref().expect("W2"), &cx.p_words, cx.r_out, cx.row.expect("loop_open"), &cx.lane, contract).plain(!fused).emit(b);
     }
 
     fn s_loop_close(&mut self, b: &mut FnBuilder, cx: &mut Cx) {
@@ -451,144 +450,97 @@ struct GemmCtx<'r> {
     c127: ValueId,
 }
 
-struct Gemm1<'s> {
-    inst: amdgpu_tile::stage::StageInst<'s>,
-    /// the P words (fused: one Frag8 per 64-wide n1 block; G1: none, H went to HBM)
-    out: amdgpu_tile::weave::Out<Vec<Opnd>>,
-}
-
 /// Stage `gemm1_act` (keys `mma.rows_x_lds` + `map.relu_pack_fp8`): `H^T = W1 X^T`, `fp8(relu(alpha H))` packed in accumulator order (fused: the
-/// zero-cost B-operand words of GEMM 2; G1: stored to HBM).
+/// zero-cost B-operand words of GEMM 2; G1: stored to HBM; G1q: the generic epilogue chain). Captured units; returns the stage and the P words.
 #[allow(clippy::too_many_arguments)]
-fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opnd], mode: Mode, r_out: ValueId, row: ValueId, lane: &'s Lane, roles: &[String], epi: Option<(ValueId, ValueId)>) -> Gemm1<'s> {
-    use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    let mut u = Units::new();
-    let acc: Rc<RefCell<Vec<ValueId>>> = Rc::new(RefCell::new(Vec::new()));
-    let a0 = acc.clone();
-    let setup = u.add("gemm1.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| {
-        let zero = b.frag_zero(DType::Frag16);
-        *a0.borrow_mut() = vec![zero; (N1 / 32) as usize];
-    });
-    let c127 = g.c127;
-    let wfrag = g.wfrag;
-    let mut last = setup;
+fn gemm1_act_stage(b: &mut FnBuilder, g: GemmCtx, w1: &amdgpu_tile::Shared, xs: &[Opnd], mode: Mode, r_out: ValueId, row: ValueId, lane: &Lane, roles: &[String], epi: Option<(ValueId, ValueId)>) -> (amdgpu_tile::stage::StageInst<'static>, Vec<Opnd>) {
+    let mut u = amdgpu_tile::weave::Units::new();
+    let (_, zero) = u.capture(b, "gemm1.setup", |b| b.frag_zero(DType::Frag16));
+    let mut acc = vec![zero; (N1 / 32) as usize];
     for kb in 0..K1 / 64 {
         for t in 0..(N1 / 32) as usize {
-            let a1 = acc.clone();
-            last = u.add(format!("gemm1.k{kb}t{t}"), UnitClass::Mfma, Hint::Skeleton, &[last], move |b| {
-                let wf = wfrag(b, w1, t as i64, kb);
-                let mut a = a1.borrow_mut();
-                a[t] = b.mfma_scale_fp8(wf, xs[kb as usize], a[t], c127, c127);
-            });
+            acc[t] = u.capture(b, format!("gemm1.k{kb}t{t}"), |b| {
+                let wf = (g.wfrag)(b, w1, t as i64, kb);
+                b.mfma_scale_fp8(wf, xs[kb as usize], acc[t], g.c127, g.c127)
+            }).1;
         }
     }
-    let words: Rc<RefCell<Vec<Vec<ValueId>>>> = Rc::new(RefCell::new(Vec::new()));
+    let mut words: Vec<Vec<ValueId>> = Vec::new();
     if let (Mode::G1q(act), Some((r_bias, r_scale))) = (mode, epi) {
         // ---- the generic epilogue chain (map.epilogue_chain): y = act(alpha acc + bias[n1]) (E), row amax (R: lane-local over the lane's 128
         // values, then the partner half of the row via permlane32_swap), per-row fp8 (Q); words in accumulator order, scale per row ----
         use amdgpu_tile::prims::{abs_f32, act as act_f, affine, fp8_pack, fp8_scale};
-        let st: Out<(ValueId, ValueId)> = Out::new();
-        let s1 = st.clone();
-        last = u.add("epi.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| {
-            let alpha = b.c_f32(ALPHA);
-            let vb = b.bind_i32(lane.half() << 4);
-            s1.set((alpha, vb));
-        });
-        let ys: Rc<RefCell<Vec<Vec<ValueId>>>> = Rc::new(RefCell::new(Vec::new()));
-        let amax: Rc<RefCell<Option<ValueId>>> = Rc::new(RefCell::new(None));
-        for t in 0..(N1 / 32) as usize {
-            let (a2, s2, y2, m2) = (acc.clone(), st.clone(), ys.clone(), amax.clone());
-            last = u.add(format!("epi.t{t}"), UnitClass::Valu, Hint::Filler, &[last], move |b| {
-                let (alpha, vb) = s2.get();
+        let (_, (alpha, vb)) = u.capture(b, "epi.setup", |b| (b.c_f32(ALPHA), b.bind_i32(lane.half() << 4)));
+        let mut ys: Vec<Vec<ValueId>> = Vec::new();
+        let mut amax: Option<ValueId> = None;
+        for (t, &a) in acc.iter().enumerate() {
+            let (_, y) = u.capture(b, format!("epi.t{t}"), |b| {
                 // bias of value r (n1 = 32 t + 8 (r / 4) + 4 h + r % 4): one 16-byte load per q = r / 4
                 let bq: Vec<ValueId> = (0..4u32).map(|q| b.buffer_load_b128(r_bias, vb, 0i32, 128 * t as u32 + 32 * q)).collect();
                 b.wait_vm(0);
-                let a = a2.borrow()[t];
-                let mut y = Vec::with_capacity(16);
-                for r in 0..16u8 {
-                    let v = b.frag16_lane(a, r);
-                    let f = b.bitcast_f32(v);
-                    let bl = b.frag4_lane(Opnd::Val(bq[(r / 4) as usize]), r % 4);
-                    let bias = b.bitcast_f32(bl);
-                    let z = affine(b, f, Some(alpha), Some(bias));
-                    y.push(act_f(b, z, act));
-                }
-                let mut m = m2.borrow_mut();
+                let y: Vec<ValueId> = (0..16u8)
+                    .map(|r| {
+                        let v = b.frag16_lane(a, r);
+                        let f = b.bitcast_f32(v);
+                        let bl = b.frag4_lane(Opnd::Val(bq[(r / 4) as usize]), r % 4);
+                        let bias = b.bitcast_f32(bl);
+                        let z = affine(b, f, Some(alpha), Some(bias));
+                        act_f(b, z, act)
+                    })
+                    .collect();
                 for &v in &y {
                     let av = abs_f32(b, v);
-                    *m = Some(match *m { None => av, Some(p) => b.max_f32(p, av) });
+                    amax = Some(match amax { None => av, Some(p) => b.max_f32(p, av) });
                 }
-                y2.borrow_mut().push(y);
+                y
             });
+            ys.push(y);
         }
-        let (y3, m3, w5) = (ys.clone(), amax.clone(), words.clone());
-        last = u.add("epi.quant", UnitClass::Valu, Hint::Anchor, &[last], move |b| {
-            let m = m3.borrow().expect("amax");
+        u.capture(b, "epi.quant", |b| {
+            let m = amax.expect("amax");
             // lanes l and l + 32 hold the two halves of row m: the partner value through permlane32_swap
             let (pa, pb) = b.permlane32_swap(m, m);
             let (fa, fb) = (b.bitcast_f32(pa), b.bitcast_f32(pb));
             let row_max = b.max_f32(fa, fb);
             let (scale, inv) = fp8_scale(b, row_max);
-            for y in y3.borrow().iter() {
-                w5.borrow_mut().push(fp8_pack(b, y, inv));
+            for y in &ys {
+                words.push(fp8_pack(b, y, inv));
             }
             let vs = b.bind_i32(ev(row) << 2);
             b.buffer_store_f32(r_scale, vs, 0i32, 0, scale);
         });
-    }
-    let consts: Out<(ValueId, ValueId)> = Out::new();
-    let c1 = consts.clone();
-    if !matches!(mode, Mode::G1q(_)) {
-        last = u.add("act.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| c1.set((b.c_f32(ALPHA), b.c_f32(0.0))));
-    }
-    for t in 0..(N1 / 32) as usize {
-        if matches!(mode, Mode::G1q(_)) {
-            break;
+    } else {
+        let (_, (alpha, zf)) = u.capture(b, "act.setup", |b| (b.c_f32(ALPHA), b.c_f32(0.0)));
+        for (t, &a) in acc.iter().enumerate() {
+            words.push(u.capture(b, format!("act.t{t}"), |b| {
+                (0..4u8)
+                    .map(|q| {
+                        let v: Vec<ValueId> = (0..4u8).map(|i| { let u = b.frag16_lane(a, 4 * q + i); let f = b.bitcast_f32(u); let s = b.mul_f32(f, alpha); b.max_f32(s, zf) }).collect();
+                        b.cvt_pk_fp8x4_f32(v[0], v[1], v[2], v[3])
+                    })
+                    .collect()
+            }).1);
         }
-        let (a2, c2, w2) = (acc.clone(), consts.clone(), words.clone());
-        last = u.add(format!("act.t{t}"), UnitClass::Valu, Hint::Filler, &[last], move |b| {
-            let (alpha, zf) = c2.get();
-            let a = a2.borrow()[t];
-            let ws: Vec<ValueId> = (0..4u8).map(|q| {
-                let v: Vec<ValueId> = (0..4u8).map(|i| { let u = b.frag16_lane(a, 4 * q + i); let f = b.bitcast_f32(u); let s = b.mul_f32(f, alpha); b.max_f32(s, zf) }).collect();
-                b.cvt_pk_fp8x4_f32(v[0], v[1], v[2], v[3])
-            }).collect();
-            w2.borrow_mut().push(ws);
-        });
     }
-    let out: Out<Vec<Opnd>> = Out::new();
-    if g1_like(mode) {
-        let vo: Out<ValueId> = Out::new();
-        let v1 = vo.clone();
-        last = u.add("store.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| {
+    let out: Vec<Opnd> = if g1_like(mode) {
+        let (_, vo) = u.capture(b, "store.setup", |b| {
             let h4 = b.bind_i32(lane.half() << 2);
-            v1.set(b.bind_i32((ev(row) << 8) + ev(h4)));
+            b.bind_i32((ev(row) << 8) + ev(h4))
         });
-        for t in 0..(N1 / 32) as usize {
-            let (w3, v2) = (words.clone(), vo.clone());
-            last = u.add(format!("store.t{t}"), UnitClass::Dma, Hint::Filler, &[last], move |b| {
-                let ws = w3.borrow()[t].clone();
-                let vo = v2.get();
+        for (t, ws) in words.iter().enumerate() {
+            u.capture(b, format!("store.t{t}"), |b| {
                 for (q, w) in ws.iter().enumerate() {
                     let f = b.bitcast_f32(*w);
                     b.buffer_store_f32(r_out, vo, 0i32, (32 * t + 8 * q) as u32, f);
                 }
             });
         }
-        let o2 = out.clone();
-        u.add("gemm1.out", UnitClass::Setup, Hint::Anchor, &[last], move |_b| o2.set(Vec::new()));
+        Vec::new()
     } else {
-        let (w4, o3) = (words.clone(), out.clone());
-        u.add("pack.p", UnitClass::Valu, Hint::Filler, &[last], move |b| {
-            let words = w4.borrow();
-            let p: Vec<Opnd> = (0..N1 / 64).map(|jb| { let w: Vec<ValueId> = words[2 * jb as usize].iter().chain(words[2 * jb as usize + 1].iter()).copied().collect(); Opnd::Val(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])) }).collect();
-            o3.set(p);
-        });
-    }
+        u.capture(b, "pack.p", |b| (0..N1 / 64).map(|jb| { let w: Vec<ValueId> = words[2 * jb as usize].iter().chain(words[2 * jb as usize + 1].iter()).copied().collect(); Opnd::Val(b.frag8(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7])) }).collect()).1
+    };
     let contract = amdgpu_dsl::StageContract { barrier_phase: 1, roles: roles.to_vec(), ..Default::default() };
-    let o4 = out.clone();
+    let p = out.clone();
     let inst = amdgpu_tile::stage::StageInst::new("mma.rows_x_lds", amdgpu_tile::stage::Prim::A, "gemm1_act", contract, u)
         .param("atom", "mfma_scale_32x32x64_f8")
         .param("n", N1)
@@ -596,48 +548,32 @@ fn gemm1_act_stage<'s>(g: GemmCtx<'s>, w1: &'s amdgpu_tile::Shared, xs: &'s [Opn
         .param("epilogue", match mode { Mode::G1 => "map.relu_pack_fp8 -> store", Mode::G1q(_) => "map.epilogue_chain(alpha, bias, act, row amax, fp8) -> store", _ => "map.relu_pack_fp8" })
         .handover(move |_b| {
             // the hand-over is recorded on the stage that produced it: the P words of GEMM 2's B operand
-            let p = o4.get();
             let vals = p.iter().enumerate().filter_map(|(jb, o)| if let Opnd::Val(v) = o { Some(p_stage_val(jb as i64, *v, true)) } else { None }).collect();
             (vals, Vec::new())
         });
-    Gemm1 { inst, out }
+    (inst, out)
 }
 
-/// Stage `gemm2` (keys `mma.rows_x_lds` + `map.store_bf16`): `Y^T = W2 H^T` from the P words, bf16 stores.
+/// Stage `gemm2` (keys `mma.rows_x_lds` + `map.store_bf16`): `Y^T = W2 H^T` from the P words, bf16 stores. Captured units.
 #[allow(clippy::too_many_arguments)]
-fn gemm2_stage<'s>(g: GemmCtx<'s>, w2: &'s amdgpu_tile::Shared, p_words: &'s [Opnd], r_out: ValueId, row: ValueId, lane: &'s Lane, contract: amdgpu_dsl::StageContract) -> amdgpu_tile::stage::StageInst<'s> {
-    use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    let mut u = Units::new();
-    let acc: Rc<RefCell<Vec<ValueId>>> = Rc::new(RefCell::new(Vec::new()));
-    let a0 = acc.clone();
-    let mut last = u.add("gemm2.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| {
-        let zero = b.frag_zero(DType::Frag16);
-        *a0.borrow_mut() = vec![zero; (N2 / 32) as usize];
-    });
-    let (c127, wfrag) = (g.c127, g.wfrag);
+fn gemm2_stage(b: &mut FnBuilder, g: GemmCtx, w2: &amdgpu_tile::Shared, p_words: &[Opnd], r_out: ValueId, row: ValueId, lane: &Lane, contract: amdgpu_dsl::StageContract) -> amdgpu_tile::stage::StageInst<'static> {
+    let mut u = amdgpu_tile::weave::Units::new();
+    let (_, zero) = u.capture(b, "gemm2.setup", |b| b.frag_zero(DType::Frag16));
+    let mut acc = vec![zero; (N2 / 32) as usize];
     for (jb, pf) in p_words.iter().enumerate() {
         for uu in 0..(N2 / 32) as usize {
-            let a1 = acc.clone();
-            last = u.add(format!("gemm2.j{jb}u{uu}"), UnitClass::Mfma, Hint::Skeleton, &[last], move |b| {
-                let wf = wfrag(b, w2, uu as i64, jb as i64);
-                let mut a = a1.borrow_mut();
-                a[uu] = b.mfma_scale_fp8(wf, *pf, a[uu], c127, c127);
-            });
+            acc[uu] = u.capture(b, format!("gemm2.j{jb}u{uu}"), |b| {
+                let wf = (g.wfrag)(b, w2, uu as i64, jb as i64);
+                b.mfma_scale_fp8(wf, *pf, acc[uu], g.c127, g.c127)
+            }).1;
         }
     }
-    let vo: Out<ValueId> = Out::new();
-    let v1 = vo.clone();
-    last = u.add("store.setup", UnitClass::Setup, Hint::Anchor, &[last], move |b| {
+    let (_, vo) = u.capture(b, "store.setup", |b| {
         let h8 = b.bind_i32(lane.half() << 3);
-        v1.set(b.bind_i32((ev(row) << 9) + ev(h8)));
+        b.bind_i32((ev(row) << 9) + ev(h8))
     });
-    for uu in 0..(N2 / 32) as usize {
-        let (a2, v2) = (acc.clone(), vo.clone());
-        last = u.add(format!("store.u{uu}"), UnitClass::Valu, Hint::Filler, &[last], move |b| {
-            let a = a2.borrow()[uu];
-            let vo = v2.get();
+    for (uu, &a) in acc.iter().enumerate() {
+        u.capture(b, format!("store.u{uu}"), |b| {
             for q in 0..4u8 {
                 let x: Vec<ValueId> = (0..4u8).map(|i| { let v = b.frag16_lane(a, 4 * q + i); b.bitcast_f32(v) }).collect();
                 let w0 = b.cvt_pk_bf16_f32(x[0], x[1]);

@@ -50,3 +50,40 @@ cannot be silently missed.
 
 Anything not ordered by these rules may be interleaved; the result still goes through the IR verifier, lowering, the scheduler and
 `gpu_verify --strict` like any other kernel.
+
+## The tile layer on top (`amdgpu_tile::weave`, weave2)
+
+| API | What it does |
+|---|---|
+| `Units::capture(b, name, \|b\| …) -> (UnitId, R)` | The closure runs **now** into a capture buffer and returns its values directly (no `Out<T>` cells, no deferred closures). The statements are spliced where the weave places the unit. |
+| `Units::anchor(b, name, …)` | `capture` with hint `Anchor` (waits, barriers). |
+| `Units::split()` / `Weaver::fine()` | Statement granularity: every captured unit is split into its unsplittable node groups (`<unit>#k`), and dependencies are re-derived across all groups. |
+| `RotStage` / `Part` / `weave::rotate(b, parts, stage, order, build)` | Loop rotation by iteration offset: the prologue keeps offset ≥ 1, the steady body keeps everything, the epilogue keeps offset ≤ 0. Parts that are not kept are never built. |
+
+What `capture` fills in from the facts:
+- **Dependencies** on earlier units, via `must_order`.
+- **Class, hint, latency and footprint.** The per-node facts are kept in `Unit.stmts` and their union in `Unit.summary`, for the cost-model strategy (`weave_auto`).
+
+The earlier closure API (`Units::add` with `Out<T>` cells) has been removed: every unit is captured.
+
+**Rotation in `Pipeline`.** Every cadence's iteration is a rotated weave, and the peeled last iteration is the rotation's epilogue:
+
+| cadence | parts |
+|---|---|
+| `TwoPhaseOffset` | `stage` (+1) \| `v_phase` \| `complete` (+1, anchor) \| `mid_sync` (anchor) \| `m_phase` \| `end_sync` (anchor) |
+| `OneWindow` | `stage` (+2) \| `window` \| `complete_sync` (+2, anchor) |
+| `RegStaged` | `key` (+2) \| `pre_sync` \| `sync` (+2, anchor: waits, `post_wait`, barrier) \| `stage` (+2) \| `m_phase` |
+
+**Migrated stages.** The stages of FMHA, GEMM v4, MLP and RMSNorm, and `DmaPart::issue_buffer_units`, are written with `capture`. Every kernel's assembly is byte-identical to the closure form.
+
+| file | lines (closure form → capture form) |
+|---|---|
+| `fmha/mod.rs` | 1052 → 1002 |
+| `gemm/mod.rs` | 968 → 946 |
+| `mlp/mod.rs` | 625 → 562 |
+| `norm/mod.rs` | 235 → 219 |
+| `dma.rs` | 206 → 201 |
+
+No `Out<T>` is left in the kernels.
+
+**Rule when moving a stage to `capture`.** Take the stage's scalar inputs, such as `SlotIdx::offset_scalars()`, **before** capturing its units. Capturing binds the offsets that the stage itself creates, and those would otherwise be declared as inputs. GV-STAGE reports this as "not handed over by an earlier stage".

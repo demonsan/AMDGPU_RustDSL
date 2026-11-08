@@ -21,7 +21,7 @@ use amdgpu_tile::frag::{AccTile, Frag, QkOut, B32x32x64Fp8, C32x32F32};
 use amdgpu_tile::reduce::KeyMask;
 use amdgpu_tile::softmax::{OnlineSoftmax, Recipe};
 use amdgpu_tile::*;
-use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
+use amdgpu_tile::weave::Units;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Opnd, StageContract, ValueId, VarId, I32};
 use amdgpu_isa::{MmaAtom, DS_READ_B128, DS_READ_B128X2, DS_READ_B32, DS_READ_TR_B8X4, DS_WRITE_B32, GLOBAL_LDS_X1, GLOBAL_LDS_X4, GLOBAL_LOAD_X4, GLOBAL_STORE_X2};
 use amdgpu_layout::{make_layout, tup, ComposedLayout, Ix, Layout as LLayout, Swizzle};
@@ -139,23 +139,24 @@ impl KvRing3 {
 
     /// The copies of the tile at `key0` into `slot` that `role` produces, as emission units (buffer form: one unit per DMA instruction). `None` for
     /// the VGPR K-scale staging (`_t128`), which keeps the direct form.
-    pub fn stage_units<'s>(&'s self, role: Role, key0: &I32, slot: &SlotIdx) -> Option<Units<'s>> {
-        match (role, &self.kdc, &self.buf) {
-            (Role::A, KdCopy3::Dma(kd), Some((kb, _))) => {
-                let kdb = self.kd_buf.as_ref()?;
-                let mut u = kd.issue_buffer_units(kdb, key0, &self.kd.at(slot));
-                u.append(self.kdma.issue_buffer_units(kb, key0, &self.ks.at(slot)), &[]);
+    pub fn stage_units(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<Units> {
+        match (role, &self.kdc, &self.buf, &self.kd_buf) {
+            (Role::A, KdCopy3::Dma(kd), Some((kb, _)), Some(kdb)) => {
+                let mut u = kd.issue_buffer_units(b, kdb, key0, &self.kd.at(slot));
+                u.append(self.kdma.issue_buffer_units(b, kb, key0, &self.ks.at(slot)), &[]);
                 Some(u)
             }
-            (Role::B, _, Some((_, vb))) => Some(self.vdma.issue_buffer_units(vb, key0, &self.vs.at(slot))),
+            (Role::B, _, Some((_, vb)), _) => Some(self.vdma.issue_buffer_units(b, vb, key0, &self.vs.at(slot))),
             _ => None,
         }
     }
     /// The copies of the tile at `key0` into `slot` that `role` produces (as `KvRing::stage`).
     pub fn stage(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<ValueId> {
-        if let Some(u) = self.stage_units(role, key0, slot) {
+        // the slot offsets bound before this stage are its scalar inputs (taken before the units are captured: capturing binds new ones)
+        let bound = slot.offset_scalars();
+        if let Some(u) = self.stage_units(b, role, key0, slot) {
             // the slot offsets are shared with every reader of the slot instance (SlotIdx cache): declared scalar hand-overs
-            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], scalars_in: slot.offset_scalars(), ..Default::default() };
+            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], scalars_in: bound, ..Default::default() };
             let sl = slot.clone();
             amdgpu_tile::stage::StageInst::new("move.kv_stage", amdgpu_tile::stage::Prim::M, "kv.stage", c, u)
                 .param("role", format!("{role:?}"))
@@ -302,78 +303,48 @@ impl<'a> AttnBody3<'a> {
             }
         }
     }
-    /// QK into the S variables as emission units: the setup (slot-bound K / K-scale partitions; the one bias MFMA of the `biasonce` form) and one
-    /// unit per 32-key block (K fragments, K-scale word, the two scaled MFMAs), then an end marker (no IR).
-    fn qk_units<'s>(&'s self, slot: &SlotIdx, s: AccTile<C32x32F32, 4>, bias: Opnd) -> Units<'s> {
+    /// QK into the S variables as captured units: the setup (slot-bound K / K-scale partitions; the one bias MFMA of the `biasonce` form) and per
+    /// 32-key block a read unit (K fragments, K-scale word) and an MMA unit (the shift and the two scaled MFMAs).
+    fn qk_units(&self, b: &mut FnBuilder, slot: &SlotIdx, s: AccTile<C32x32F32, 4>, bias: Opnd) -> Units {
         let r = self.ring;
         let mut u = Units::new();
-        let parts: Out<(LdsSlotPart<'s>, LdsSlotPart<'s>)> = Out::new();
-        let (p2, sl) = (parts.clone(), slot.clone());
         let once = self.biasonce && self.kscale_sel;
-        let setup = u.add("qk.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| {
-            let k = r.kpart.at(b, &r.ks.at(&sl));
-            let kd = r.kdpart.at(b, &r.kd.at(&sl));
-            p2.set((k, kd));
+        let (_, (k, kd)) = u.capture(b, "qk.setup", |b| {
+            let parts = (r.kpart.at(b, &r.ks.at(slot)), r.kdpart.at(b, &r.kd.at(slot)));
             if once {
                 // the one bias MFMA writes S tile 3 (zero accumulator: no zero-fragment copies); tiles 0-2 take it as the C input of their first
                 // scaled MFMA, tile 3 accumulates in place last
                 b.var_mfma_f16_z(s.accs[3].var, self.sm.ones_f16, bias);
                 self.bias_tile.set(Some(Opnd::Var(s.accs[3].var)));
             }
+            parts
         });
-        let mut ends = Vec::new();
         for blk in 0..4usize {
-            // read unit: (the per-block bias MFMA when there is no shared bias tile,) the two K fragments and the K-scale word; MMA unit: the shift and
-            // the two scaled MFMAs
-            let (p3, rd) = (parts.clone(), Out::<(ValueId, ValueId, ValueId)>::new());
-            let rd2 = rd.clone();
-            let r_id = u.add(format!("qk.read{blk}"), UnitClass::LdsRead, Hint::LatencySensitive, &[setup], move |b| {
-                p3.with(|(k, kd)| {
-                    if self.bias_tile.get().is_none() {
-                        b.var_mfma_f16_z(s.accs[blk].var, self.sm.ones_f16, bias);
-                    }
-                    let k0 = k.read(b, 2 * blk);
-                    let k1 = k.read(b, 2 * blk + 1);
-                    let kw = kd.read(b, blk);
-                    rd2.set((k0, k1, kw));
-                });
+            let (_, (k0, k1, kw)) = u.capture(b, format!("qk.read{blk}"), |b| {
+                if self.bias_tile.get().is_none() {
+                    b.var_mfma_f16_z(s.accs[blk].var, self.sm.ones_f16, bias);
+                }
+                (k.read(b, 2 * blk), k.read(b, 2 * blk + 1), kd.read(b, blk))
             });
-            ends.push(u.add(format!("qk.mma{blk}"), UnitClass::Mfma, Hint::Skeleton, &[r_id], move |b| {
-                let (k0, k1, kw) = rd.get();
-                self.qk_block_mma(b, &s, k0, k1, kw, blk);
-            }));
+            u.capture(b, format!("qk.mma{blk}"), |b| self.qk_block_mma(b, &s, k0, k1, kw, blk));
         }
-        u.add("qk.end", UnitClass::Setup, Hint::Anchor, &ends, move |_b| self.bias_tile.set(None));
+        self.bias_tile.set(None);
         u
     }
-    /// PV as emission units: the setup (slot-bound V partition, the two P fragments), the row sums, one unit per (half hh, dim group e).
-    fn pv_units<'s>(&'s self, slot: &SlotIdx, w: Vec<ValueId>) -> Units<'s> {
+    /// PV as captured units: the setup (slot-bound V partition, the two P fragments), the row sums, per (half hh, dim group e) a read unit and an
+    /// MMA unit.
+    fn pv_units(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) -> Units {
         let r = self.ring;
         let mut u = Units::new();
-        let st: Out<(LdsSlotPart<'s>, [ValueId; 2])> = Out::new();
-        let (s2, sl) = (st.clone(), slot.clone());
-        let setup = u.add("pv.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| {
-            let v = r.vpart.at(b, &r.vs.at(&sl));
-            let p = [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]).v, Frag::<B32x32x64Fp8>::from_words(b, &w[8..16]).v];
-            s2.set((v, p));
+        let (_, (v, p)) = u.capture(b, "pv.setup", |b| {
+            (r.vpart.at(b, &r.vs.at(slot)), [Frag::<B32x32x64Fp8>::from_words(b, &w[0..8]).v, Frag::<B32x32x64Fp8>::from_words(b, &w[8..16]).v])
         });
-        let s3 = st.clone();
-        u.add("pv.rowsum", UnitClass::Mfma, Hint::Filler, &[setup], move |b| {
-            let p = s3.with(|(_, p)| *p);
-            self.sm.row_sum(b, p[0], p[1]);
-        });
+        u.capture(b, "pv.rowsum", |b| self.sm.row_sum(b, p[0], p[1]));
         let o = self.o.expect("O");
         for hh in 0..2usize {
             for e in 0..4usize {
-                let (s4, s5, vf) = (st.clone(), st.clone(), Out::<ValueId>::new());
-                let vf2 = vf.clone();
-                let r_id = u.add(format!("pv.read.h{hh}e{e}"), UnitClass::LdsRead, Hint::LatencySensitive, &[setup], move |b| {
-                    s4.with(|(v, _)| vf2.set(v.read(b, hh + 2 * e)));
-                });
-                u.add(format!("pv.mma.h{hh}e{e}"), UnitClass::Mfma, Hint::Skeleton, &[r_id], move |b| {
-                    let p = s5.with(|(_, p)| *p);
-                    gemm(b, &r.mma, o.accs[e].var, vf.get(), p[hh], self.c127, self.c123, 0, 0);
-                });
+                let (_, vf) = u.capture(b, format!("pv.read.h{hh}e{e}"), |b| v.read(b, hh + 2 * e));
+                u.capture(b, format!("pv.mma.h{hh}e{e}"), |b| gemm(b, &r.mma, o.accs[e].var, vf, p[hh], self.c127, self.c123, 0, 0));
             }
         }
         u
@@ -398,7 +369,7 @@ impl<'a> AttnBody3<'a> {
     }
     fn qk(&self, b: &mut FnBuilder, slot: &SlotIdx, out: QkOut, bias: Opnd) -> Vec<ValueId> {
         if let QkOut::Vars(t) = &out {
-            self.qk_units(slot, **t, bias).emit_all(b);
+            self.qk_units(b, slot, **t, bias).emit_all(b);
             return Vec::new();
         }
         let r = self.ring;
@@ -416,7 +387,7 @@ impl<'a> AttnBody3<'a> {
     }
     /// PV with the row sums first: per half hh and dim group e, the transposed V fragment then the scaled MFMA (fixed scales).
     fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) {
-        self.pv_units(slot, w.to_vec()).emit_all(b);
+        self.pv_units(b, slot, w).emit_all(b);
     }
     pub fn out_scale(&self, b: &mut FnBuilder) -> ValueId {
         let l = self.sm.l_total(b);
@@ -460,22 +431,17 @@ impl PipeBody for AttnBody3<'_> {
         if self.lazy_bias {
             // no seed needed: the initial reference (bias words 0x4800: b = 64) puts the first tile's max far above the threshold, so tile 0
             // always rebases
-            let (nb, pw): (Out<Opnd>, Out<Vec<ValueId>>) = (Out::new(), Out::new());
-            {
-                let me: &Self = self;
-                let (nb2, pw2, m1, m2) = (nb.clone(), pw.clone(), mask.as_ref(), mask.as_ref());
-                let mut u = Units::new();
-                let d = u.add("softmax.decide", UnitClass::Branch, Hint::Anchor, &[], move |b| nb2.set(me.sm.decide_lazy(b, &s, &o, m1)));
-                u.add("softmax.convert", UnitClass::Valu, Hint::Filler, &[d], move |b| pw2.set(me.sm.convert(b, &s, m2, 0, 4)));
-                let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
-                let (nb3, pw3) = (nb.clone(), pw.clone());
-                amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "v_phase", c, u)
-                    .param("recipe", "vendor-lazy")
-                    .handover(move |_b| (vec![p_val(pw3.get())], bias_scalar(nb3.get())))
-                    .emit(b);
-            }
-            self.bias_next = Some(nb.get());
-            self.p = pw.get();
+            let mut u = Units::new();
+            let (_, nb) = u.capture(b, "softmax.decide", |b| self.sm.decide_lazy(b, &s, &o, mask.as_ref()));
+            let (_, pw) = u.capture(b, "softmax.convert", |b| self.sm.convert(b, &s, mask.as_ref(), 0, 4));
+            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
+            let pw2 = pw.clone();
+            amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "v_phase", c, u)
+                .param("recipe", "vendor-lazy")
+                .handover(move |_b| (vec![p_val(pw2)], bias_scalar(nb)))
+                .emit(b);
+            self.bias_next = Some(nb);
+            self.p = pw;
             self.p_staged = true;
             return;
         }
@@ -505,9 +471,9 @@ impl PipeBody for AttnBody3<'_> {
         if t.staged {
             c.scalars_in.extend(t.next.offset_scalars());
         }
-        let mut insts = vec![amdgpu_tile::stage::StageInst::new("mma.pv", amdgpu_tile::stage::Prim::A, "pv", Default::default(), self.pv_units(&t.cur, w))];
+        let mut insts = vec![amdgpu_tile::stage::StageInst::new("mma.pv", amdgpu_tile::stage::Prim::A, "pv", Default::default(), self.pv_units(b, &t.cur, &w))];
         if t.staged {
-            insts.push(amdgpu_tile::stage::StageInst::new("mma.qk", amdgpu_tile::stage::Prim::A, "qk", Default::default(), self.qk_units(&t.next, s, bias)));
+            insts.push(amdgpu_tile::stage::StageInst::new("mma.qk", amdgpu_tile::stage::Prim::A, "qk", Default::default(), self.qk_units(b, &t.next, s, bias)));
         }
         let (cur, next, staged) = (t.cur.clone(), t.next.clone(), t.staged);
         amdgpu_tile::stage::merge("m_phase", c, insts)
@@ -529,40 +495,24 @@ impl PipeBody for AttnBody3<'_> {
         } else {
             (Opnd::Val(self.sm.decide_deferred(b, &s, &o, mask.as_ref())), false)
         };
-        // the window: conversion chunk i, then QK block i of the next tile (units, woven in this explicit order)
+        // the window: conversion chunk i, then QK block i of the next tile (captured units, woven in this order)
+        let bound = if t.staged { t.next.offset_scalars() } else { Vec::new() };
         let mut u = Units::new();
-        let parts: Out<(LdsSlotPart, LdsSlotPart)> = Out::new();
-        let setup = t.staged.then(|| {
-            let (p2, nx) = (parts.clone(), t.next.clone());
-            u.add("window.qk.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| p2.set((r.kpart.at(b, &r.ks.at(&nx)), r.kdpart.at(b, &r.kd.at(&nx)))))
-        });
-        let chunks: Vec<Out<Vec<ValueId>>> = (0..4).map(|_| Out::new()).collect();
-        {
-            let me: &Self = self;
-            for i in 0..4usize {
-                let (c, m) = (chunks[i].clone(), mask.as_ref());
-                u.add(format!("window.convert{i}"), UnitClass::Valu, Hint::Filler, &[], move |b| c.set(me.sm.convert(b, &s, m, i, i + 1)));
-                if let Some(st) = setup {
-                    let p3 = parts.clone();
-                    u.add(format!("window.qk.block{i}"), UnitClass::Mfma, Hint::Skeleton, &[st], move |b| {
-                        p3.with(|(k, kd)| {
-                            me.qk_block(b, &QkOut::Vars(&s), nb, k, kd, i);
-                        });
-                    });
-                }
+        let parts = t.staged.then(|| u.capture(b, "window.qk.setup", |b| (r.kpart.at(b, &r.ks.at(&t.next)), r.kdpart.at(b, &r.kd.at(&t.next)))).1);
+        let mut w: Vec<ValueId> = Vec::with_capacity(16);
+        for i in 0..4usize {
+            w.extend(u.capture(b, format!("window.convert{i}"), |b| self.sm.convert(b, &s, mask.as_ref(), i, i + 1)).1);
+            if let Some((k, kd)) = &parts {
+                u.capture(b, format!("window.qk.block{i}"), |b| self.qk_block(b, &QkOut::Vars(&s), nb, k, kd, i));
             }
-            // the window = stage `online.softmax` (conversion chunks of tile t) woven with stage `mma.qk` (blocks of tile t + 1), alternating
-            let mut c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
-            if t.staged {
-                c.scalars_in = t.next.offset_scalars();
-            }
-            let (nx, staged) = (t.next.clone(), t.staged);
-            amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "window", c, u)
-                .param("with", "mma.qk blocks")
-                .handover(move |_b| (Vec::new(), if staged { nx.offset_scalars() } else { Vec::new() }))
-                .emit(b);
         }
-        let w: Vec<ValueId> = chunks.iter().flat_map(|c| c.get()).collect();
+        // the window = stage `online.softmax` (conversion chunks of tile t) woven with stage `mma.qk` (blocks of tile t + 1), alternating
+        let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], scalars_in: bound, ..Default::default() };
+        let (nx, staged) = (t.next.clone(), t.staged);
+        amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "window", c, u)
+            .param("with", "mma.qk blocks")
+            .handover(move |_b| (Vec::new(), if staged { nx.offset_scalars() } else { Vec::new() }))
+            .emit(b);
         if !lazy {
             if let Opnd::Val(v) = nb {
                 self.sm.commit_bias(b, v);

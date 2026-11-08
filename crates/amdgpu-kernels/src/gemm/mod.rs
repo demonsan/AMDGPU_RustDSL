@@ -307,6 +307,26 @@ struct Body {
 }
 
 impl Body {
+    /// MMAs `from..to` (in row-major order over the first half of the B fragments) of the register tile.
+    fn early_mmas(&mut self, b: &mut FnBuilder, from: usize, to: usize) {
+        let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
+        let nn = bv.len();
+        let half = nn / 2;
+        let mut n = 0;
+        'o: for i in 0..av.len() {
+            for j in 0..half {
+                if n >= to {
+                    break 'o;
+                }
+                if n >= from {
+                    let (w, by) = self.sa_sel(i);
+                    mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
+                }
+                n += 1;
+            }
+        }
+        self.npre_done = n;
+    }
     /// The scale words of tile `kb` from the transposed panel: the 8 A-scale bytes of this lane (one ds_read_b64; the MMA selects byte i % 4 of
     /// word i / 4: `sa_sel`) and the B scale (the dword-expanded panel: byte 0, no shift).
     fn load_scales(&self, b: &mut FnBuilder, kb: I32) -> (Vec<ValueId>, ValueId) {
@@ -351,87 +371,79 @@ impl Body {
         let phase = amdgpu_dsl::StageContract::ANY_PHASE;
         let me: &Body = self;
         // the slot offsets of t + 1 are bound before the region (they are shared with the staging instance through the SlotIdx cache)
-        let tt = t.clone();
-        me.tile_stage(t, phase, roles)
-            .prebind(move |b| {
-                if tt.staged {
-                    let _ = me.a_s.at(&tt.next).off_v(b);
-                    let _ = me.b_s.at(&tt.next).off_v(b);
-                }
-            })
-            .emit(b);
+        if t.staged {
+            let _ = me.a_s.at(&t.next).off_v(b);
+            let _ = me.b_s.at(&t.next).off_v(b);
+        }
+        me.tile_stage(b, t, phase, roles).emit(b);
     }
     /// Stage `mma.blockscale_tile`: the MMAs of the register tile; when `t.staged`, each fragment is reloaded from tile t+1 right after its last
     /// use (first half of the B fragments with every A fragment, then the B halves are reloaded; second half, after which every A fragment is
-    /// reloaded); the scales of t+1 are read before the MMAs and installed at the end (partial lgkm waits).
-    fn tile_stage<'s>(&'s self, t: &TileIt, phase: u32, roles: Vec<String>) -> amdgpu_tile::stage::StageInst<'s> {
-        use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
+    /// reloaded); the scales of t+1 are read before the MMAs and installed at the end (partial lgkm waits). Captured units.
+    fn tile_stage(&self, b: &mut FnBuilder, t: &TileIt, phase: u32, roles: Vec<String>) -> amdgpu_tile::stage::StageInst<'static> {
+        use amdgpu_tile::weave::Units;
         let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
         let (nm, nn) = (av.len(), bv.len());
         let half = nn / 2;
         let mut u = Units::new();
-        let next: Out<Option<(amdgpu_tile::LdsSlotPart<'s>, amdgpu_tile::LdsSlotPart<'s>)>> = Out::new();
-        let early: Out<Option<(Vec<ValueId>, ValueId)>> = Out::new();
-        // E3 proof hook for the reg-staged compute path: a real IR branch drops one tile's MMAs, reproducing the historical "tile 1 swallowed"
-        // regression in emitted kernel code (tests/functional_gemm_ir.rs).
-        let proof_drop = std::env::var("GEMM_PROOF_DROP_KB").ok().and_then(|v| v.parse::<i32>().ok());
-        let (n1, e1, tt) = (next.clone(), early.clone(), t.clone());
-        let mut last = u.add("tile.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| {
-            n1.set(if tt.staged { Some((self.a_rd.at(b, &self.a_s.at(&tt.next)), self.b_rd.at(b, &self.b_s.at(&tt.next)))) } else { None });
+        let (_, (next, early)) = u.capture(b, "tile.setup", |b| {
+            let next = t.staged.then(|| (self.a_rd.at(b, &self.a_s.at(&t.next)), self.b_rd.at(b, &self.b_s.at(&t.next))));
             // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and installed at the end (partial lgkm waits)
-            e1.set(if tt.staged { Some(self.load_scales(b, ox(tt.it) + 1)) } else { None });
-            if let Some(kb) = proof_drop {
-                let keep = b.bind_cond(ox(tt.it).ne(kb));
-                b.begin_if(keep);
-            }
+            let early = t.staged.then(|| self.load_scales(b, ox(t.it) + 1));
+            (next, early)
         });
-        for (lo, hi) in [(0, half), (half, nn)] {
-            for i in 0..nm {
-                for j in lo..hi {
-                    if lo == 0 && i * half + j < self.npre_done {
-                        continue; // issued before the barrier (pre_sync / post_wait)
+        // MMAs of the register tile with the in-place reloads of t+1 (into `u`)
+        let body = |b: &mut FnBuilder, u: &mut Units| {
+            for (lo, hi) in [(0, half), (half, nn)] {
+                for i in 0..nm {
+                    for j in lo..hi {
+                        if lo == 0 && i * half + j < self.npre_done {
+                            continue; // issued before the barrier (pre_sync / post_wait)
+                        }
+                        let (w, by) = self.sa_sel(i);
+                        u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by));
                     }
-                    let (w, by) = self.sa_sel(i);
-                    let (acc, a, bb, s, sb) = (self.acc[nn * i + j], av[i], bv[j], sav[w], sbv);
-                    last = u.add(format!("mma.i{i}j{j}"), UnitClass::Mfma, Hint::Skeleton, &[last], move |b| mma_var(b, &self.mma, acc, a, bb, s, sb, by));
+                    if let (true, Some((ar, _))) = (lo == half, &next) {
+                        // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
+                        u.capture(b, format!("reload.a{i}"), |b| {
+                            let v = ar.read(b, i);
+                            b.set_var(av[i], v);
+                        });
+                    }
                 }
-                if lo == half {
-                    let (n2, a) = (next.clone(), av[i]);
-                    last = u.add(format!("reload.a{i}"), UnitClass::LdsRead, Hint::LatencySensitive, &[last], move |b| {
-                        n2.with(|nx| {
-                            if let Some((ar, _)) = nx {
-                                // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
-                                let v = ar.read(b, i);
-                                b.set_var(a, v);
-                            }
-                        })
-                    });
+                if let Some((_, br)) = &next {
+                    for j in lo..hi {
+                        u.capture(b, format!("reload.b{j}"), |b| {
+                            let v = br.read(b, j);
+                            b.set_var(bv[j], v);
+                        });
+                    }
                 }
             }
-            for j in lo..hi {
-                let (n3, bj) = (next.clone(), bv[j]);
-                last = u.add(format!("reload.b{j}"), UnitClass::LdsRead, Hint::LatencySensitive, &[last], move |b| {
-                    n3.with(|nx| {
-                        if let Some((_, br)) = nx {
-                            let v = br.read(b, j);
-                            b.set_var(bj, v);
-                        }
-                    })
+        };
+        // E3 proof hook for the reg-staged compute path: a real IR branch drops one tile's MMAs, reproducing the historical "tile 1 swallowed"
+        // regression in emitted kernel code (tests/functional_gemm_ir.rs); the branch region is one captured unit
+        match std::env::var("GEMM_PROOF_DROP_KB").ok().and_then(|v| v.parse::<i32>().ok()) {
+            Some(kb) => {
+                u.capture(b, "tile.proof_drop", |b| {
+                    let keep = b.bind_cond(ox(t.it).ne(kb));
+                    b.begin_if(keep);
+                    let mut inner = Units::new();
+                    body(b, &mut inner);
+                    inner.emit_all(b);
+                    b.end_if();
                 });
             }
+            None => body(b, &mut u),
         }
-        let (e2, sav2) = (early.clone(), sav.clone());
-        u.add("scales.install", UnitClass::Valu, Hint::Anchor, &[last], move |b| {
-            if proof_drop.is_some() {
-                b.end_if();
-            }
-            if let Some((sa, sb)) = e2.get() {
+        if let Some((sa, sb)) = early {
+            u.capture(b, "scales.install", |b| {
                 for (i, v) in sa.iter().enumerate() {
-                    b.set_var(sav2[i], *v);
+                    b.set_var(sav[i], *v);
                 }
                 b.set_var(sbv, sb);
-            }
-        });
+            });
+        }
         let contract = amdgpu_dsl::StageContract { barrier_phase: phase, roles, ..Default::default() };
         amdgpu_tile::stage::StageInst::new("mma.blockscale_tile", amdgpu_tile::stage::Prim::A, "gemm.tile", contract, u)
             .param("atom", "mfma_scale_16x16x128_f8")
@@ -440,33 +452,24 @@ impl Body {
     }    /// The DMA of one tile (A issues, then B issues): soffset = the wave-uniform tile origin, M0 = the first 1 KB block of each group of 4 issues.
     fn stage_now(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx) {
         let phase = amdgpu_dsl::StageContract::ANY_PHASE;
-        let sl = slot.clone();
-        self.ab_stage(key0, slot, phase)
-            .prebind(move |b| {
-                let _ = self.a_s.at(&sl).off_v(b);
-                let _ = self.b_s.at(&sl).off_v(b);
-            })
-            .emit(b);
+        // the slot offsets are bound before the region (shared with the readers through the SlotIdx cache)
+        let _ = self.a_s.at(slot).off_v(b);
+        let _ = self.b_s.at(slot).off_v(b);
+        self.ab_stage(b, key0, slot, phase).emit(b);
     }
     /// Stage `move.ab_stage`: the DMA of one tile (A issues, then B issues); soffset = the wave-uniform tile origin, M0 = the first 1 KB block of
-    /// each group of 4 issues; one unit per DMA instruction (each under the slot's write marker).
-    fn ab_stage<'s>(&'s self, key0: &I32, slot: &SlotIdx, phase: u32) -> amdgpu_tile::stage::StageInst<'s> {
-        use amdgpu_tile::weave::{Hint, Out, UnitClass, Units};
-        let mut u = Units::new();
-        let orgs: Out<(ValueId, ValueId)> = Out::new();
-        let (o1, k0) = (orgs.clone(), key0.clone());
-        let mut last = u.add("ab.setup", UnitClass::Setup, Hint::Anchor, &[], move |b| {
+    /// each group of 4 issues; one captured unit per DMA instruction (each under the slot's write marker).
+    fn ab_stage(&self, b: &mut FnBuilder, key0: &I32, slot: &SlotIdx, phase: u32) -> amdgpu_tile::stage::StageInst<'static> {
+        let mut u = amdgpu_tile::weave::Units::new();
+        let (_, orgs) = u.capture(b, "ab.setup", |b| {
             // A advances by key0 bytes, the preshuffled B by (key0 / 16) 256 = 16 key0; the tile origins are wave uniform: SGPR soffsets
-            let ka = { let v = b.bind_i32(k0.clone() + ev(self.a_org)); b.read_first_lane(v) };
-            let kb = { let v = b.bind_i32((k0 << 4) + ev(self.b_org)); b.read_first_lane(v) };
-            o1.set((ka, kb));
+            let ka = { let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v) };
+            let kb = { let v = b.bind_i32((key0.clone() << 4) + ev(self.b_org)); b.read_first_lane(v) };
+            [ka, kb]
         });
         for (bi, (sh, dma, rsrc, wave)) in [(&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, self.rsrc_b, self.b_wave)].into_iter().enumerate() {
-            let mine: Out<Vec<(ValueId, i32, ValueId)>> = Out::new();
-            let (m1, sl) = (mine.clone(), slot.clone());
-            last = u.add(format!("ab.{}.setup", sh.name), UnitClass::Setup, Hint::Anchor, &[last], move |b| {
-                let r = sh.at(&sl);
-                let o = r.off_v(b);
+            let (_, mine) = u.capture(b, format!("ab.{}.setup", sh.name), |b| {
+                let o = sh.at(slot).off_v(b);
                 let sbase = b.bind_i32(o + sh.base as i32 + ev(wave));
                 let mut m0s: Vec<(i32, ValueId)> = Vec::new();
                 let mut mine: Vec<(ValueId, i32, ValueId)> = Vec::new();
@@ -479,42 +482,17 @@ impl Body {
                     }
                     mine.push((*g, *lds, m0s.iter().find(|x| x.0 == grp).unwrap().1));
                 }
-                m1.set(mine);
+                mine
             });
-            for q in 0..dma.issues.len() {
-                let (m2, o2, sl2) = (mine.clone(), orgs.clone(), slot.clone());
-                last = u.add(format!("ab.{}.{q}", sh.name), UnitClass::Dma, Hint::LatencySensitive, &[last], move |b| {
-                    let (g, lds, m0) = m2.with(|m| m[q]);
-                    let org = if bi == 0 { o2.get().0 } else { o2.get().1 };
-                    // buffer_load_dwordx4 ... lds: voffset = the lane's loop-invariant offset, soffset = the tile origin (wave uniform), M0 = the first 1 KB
-                    // block of each group of 4 issues, instruction offset 1024 (q % 4) moves both the LDS and the global address
-                    sh.at(&sl2).write(b, |b| b.load_buffer_lds(rsrc, g, org, m0, dma.act(lds).1, 4));
-                });
+            for (q, &(g, lds, m0)) in mine.iter().enumerate() {
+                // buffer_load_dwordx4 ... lds: voffset = the lane's loop-invariant offset, soffset = the tile origin (wave uniform), M0 = the first 1 KB
+                // block of each group of 4 issues, instruction offset 1024 (q % 4) moves both the LDS and the global address
+                u.capture(b, format!("ab.{}.{q}", sh.name), |b| sh.at(slot).write(b, |b| b.load_buffer_lds(rsrc, g, orgs[bi], m0, dma.act(lds).1, 4)));
             }
         }
         let contract = amdgpu_dsl::StageContract { barrier_phase: phase, roles: vec!["all".to_string()], ..Default::default() };
         amdgpu_tile::stage::StageInst::new("move.ab_stage", amdgpu_tile::stage::Prim::M, "gemm.ab_stage", contract, u).param("slots", 2)
-    }    /// MMAs `from..to` (in row-major order over the first half of the B fragments) of the register tile.
-    fn early_mmas(&mut self, b: &mut FnBuilder, from: usize, to: usize) {
-        let (bv, av, sav, sbv) = self.rv.clone().expect("state bound");
-        let nn = bv.len();
-        let half = nn / 2;
-        let mut n = 0;
-        'o: for i in 0..av.len() {
-            for j in 0..half {
-                if n >= to {
-                    break 'o;
-                }
-                if n >= from {
-                    let (w, by) = self.sa_sel(i);
-                    mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
-                }
-                n += 1;
-            }
-        }
-        self.npre_done = n;
-    }
-}
+    }}
 
 impl PipeBody for Body {
     fn stage(&mut self, b: &mut FnBuilder, _role: Role, key0: &I32, slot: &SlotIdx) {
