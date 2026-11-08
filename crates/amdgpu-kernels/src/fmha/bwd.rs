@@ -230,20 +230,22 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
         let vbase = vs.base as i32 + slot * KT * ROW;
         let (kslot, vslot) = (ks.at(&SlotIdx::new(slot, Opnd::Var(it))), vs.at(&SlotIdx::new(slot, Opnd::Var(it))));
         // S^T = K Q^T, dP^T = V dO^T (2 blocks of 32 keys)
-        kslot.read(&mut b, |b| {
-            vslot.read(b, |b| {
-                for c in 0..8usize {
-                    for sb in 0..2usize {
-                        let ad = b.bind_i32(ev(kr[c]) + kbase + sb as i32 * 32 * ROW);
-                        let kf = b.load_lds_b128(ad);
-                        b.var_mfma(sv_vars[sb], kind, kf, qf[c], c == 0);
-                        let ad = b.bind_i32(ev(kr[c]) + vbase + sb as i32 * 32 * ROW);
-                        let vf = b.load_lds_b128(ad);
-                        b.var_mfma(dp_vars[sb], kind, vf, dof[c], c == 0);
-                    }
+        for c in 0..8usize {
+            kslot.read(&mut b, |b| {
+                for sb in 0..2usize {
+                    let ad = b.bind_i32(ev(kr[c]) + kbase + sb as i32 * 32 * ROW);
+                    let kf = b.load_lds_b128(ad);
+                    b.var_mfma(sv_vars[sb], kind, kf, qf[c], c == 0);
                 }
-            })
-        });
+            });
+            vslot.read(&mut b, |b| {
+                for sb in 0..2usize {
+                    let ad = b.bind_i32(ev(kr[c]) + vbase + sb as i32 * 32 * ROW);
+                    let vf = b.load_lds_b128(ad);
+                    b.var_mfma(dp_vars[sb], kind, vf, dof[c], c == 0);
+                }
+            });
+        }
         // P^T = exp2(csc S - lse2) (masked keys 0), dS^T = P^T (dP^T - Dot)
         let key0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
         let mut ds: Vec<ValueId> = Vec::with_capacity(32);
@@ -435,20 +437,22 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         let (qsl, dsl) = (qs.at(&SlotIdx::new(slot, Opnd::Var(it))), ds_.at(&SlotIdx::new(slot, Opnd::Var(it))));
         // S = Q K^T, dP = dO V^T (2 blocks of 32 queries; C lane = key, values = queries 32 sb + 8 (r / 4) + 4 h + r % 4)
         // S and dP interleaved: 4 independent accumulator chains (c outer)
-        qsl.read(&mut b, |b| {
-            dsl.read(b, |b| {
-                for c in 0..8usize {
-                    for sb in 0..2usize {
-                        let ad = b.bind_i32(ev(rr[c]) + qbase + sb as i32 * 32 * ROW);
-                        let x = b.load_lds_b128(ad);
-                        b.var_mfma(s_vars[sb], kind, x, kf[c], c == 0);
-                        let ad = b.bind_i32(ev(rr[c]) + dbase + sb as i32 * 32 * ROW);
-                        let x = b.load_lds_b128(ad);
-                        b.var_mfma(dp_vars[sb], kind, x, vf[c], c == 0);
-                    }
+        for c in 0..8usize {
+            qsl.read(&mut b, |b| {
+                for sb in 0..2usize {
+                    let ad = b.bind_i32(ev(rr[c]) + qbase + sb as i32 * 32 * ROW);
+                    let x = b.load_lds_b128(ad);
+                    b.var_mfma(s_vars[sb], kind, x, kf[c], c == 0);
                 }
-            })
-        });
+            });
+            dsl.read(&mut b, |b| {
+                for sb in 0..2usize {
+                    let ad = b.bind_i32(ev(rr[c]) + dbase + sb as i32 * 32 * ROW);
+                    let x = b.load_lds_b128(ad);
+                    b.var_mfma(dp_vars[sb], kind, x, vf[c], c == 0);
+                }
+            });
+        }
         // P = exp2(csc S - lse2[q]) (masked 0), dS = P (dP - Dot[q]); the per-query LSE / Dot: 4 consecutive queries per load
         let q0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
         let mut p: Vec<ValueId> = Vec::with_capacity(32);
