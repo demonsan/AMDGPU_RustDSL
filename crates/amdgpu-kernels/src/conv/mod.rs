@@ -147,6 +147,8 @@ pub fn conv1d_update(name: &str, w: i64, sl: i64, idx: bool, silu: bool) -> Func
 //   and after the sequence the state `conv_states[cache_idx][f][0 .. W-1)` = its last W-1 inputs (older initial-state values when the sequence is shorter than W-1).
 // ABI: x @0 (bf16 [T][dim]), weight @8 (bf16 [dim][W]), bias @16 (bf16 [dim]), cu_seqlens @24 (i32 [B + 1]), cache_indices @32 (i32 [B], negative = skip the sequence), has_initial @40 (u8 [B]),
 //   conv_states @48 (bf16 [slots][dim][W - 1]), then out @56 (or q @56, k @64, v @72), then dim (i32), [k_dim (i32)], ntok (i32), slots (i32).
+// `_sched` suffix: grid (ceil(dim / 2048), NC, 1) and two more args (sched_seq @(slots + 8), sched_chunk @(slots + 16): i32 [NC] tables with the sequence and the chunk index of every non-empty chunk, built
+// by the caller; nc @(slots + 24)): no block idles past a sequence end when the lengths are uneven. Without it:
 // Grid: x = ceil(dim / 2048) feature tiles (a lane owns 8 consecutive features, dim a multiple of 8), y = B, z = ceil(max_seqlen / 8) token chunks (blocks past a sequence's end exit); a block runs 8
 // tokens sequentially with the W-1 previous inputs in registers. All 8 loads of a block are issued before the first output (kept packed: a 16-token chunk needed more than 256 VGPRs).
 
@@ -158,15 +160,20 @@ pub fn fwd_by_name(name: &str) -> Option<Function> {
     } else {
         (name.strip_prefix("causal_conv1d_fwd_bf16_w")?, false)
     };
+    // `_sched`: a (sequence, chunk) schedule table instead of the (B, max_chunks) grid
+    let (rest, sched) = match rest.strip_suffix("_sched") {
+        Some(r) => (r, true),
+        None => (rest, false),
+    };
     let (rest, silu) = match rest.strip_suffix("_silu") {
         Some(r) => (r, true),
         None => (rest, false),
     };
     let w: i64 = rest.parse().ok()?;
-    (2..=4).contains(&w).then(|| conv1d_fwd(name, w, split, silu))
+    (2..=4).contains(&w).then(|| conv1d_fwd(name, w, split, silu, sched))
 }
 
-pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
+pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool, sched: bool) -> Function {
     let sl = w - 1;
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::Default);
@@ -187,6 +194,11 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
     }
     b.arg("ntok", DType::I32, n_off, 4);
     b.arg("slots", DType::I32, n_off + 4, 4);
+    if sched {
+        b.arg("sched_seq", DType::Ptr, n_off + 8, 8);
+        b.arg("sched_chunk", DType::Ptr, n_off + 16, 8);
+        b.arg("nc", DType::I32, n_off + 24, 4);
+    }
     let dim = Ext::sym("DIM");
     let ntok = Ext::sym("NTOK");
     let slots = Ext::sym("SLOTS");
@@ -201,8 +213,19 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
     b.ka_is(n_off, ntok.clone());
     b.ka_is(n_off + 4, slots.clone());
     b.grid_is(0, dim.clone().ceil_div(2048));
-    b.grid_is(1, nb.clone());
-    b.grid_is(2, nz);
+    if sched {
+        // one grid y per scheduled (sequence, chunk): the sequence / chunk of every entry come from the two tables
+        let ncs = Ext::sym("NC");
+        b.sym_range("NC", 1, 1 << 24);
+        b.ka_is(n_off + 24, ncs.clone());
+        b.grid_is(1, ncs.clone());
+        b.grid_is(2, Ext::c(1));
+        b.arg_tensor("sched_seq", ncs.clone() * Ext::c(4));
+        b.arg_tensor("sched_chunk", ncs * Ext::c(4));
+    } else {
+        b.grid_is(1, nb.clone());
+        b.grid_is(2, nz);
+    }
     b.arg_tensor("x", ntok.clone() * dim.clone() * Ext::c(2));
     b.arg_tensor("weight", dim.clone() * Ext::c(2 * w));
     b.arg_tensor("bias", dim.clone() * Ext::c(2));
@@ -224,8 +247,22 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
     let slots_v = b.let_(Op::KernargI32 { offset: n_off + 4 });
     let tid = b.let_(Op::WorkitemId);
     let tile = b.let_(Op::WorkgroupIdX);
-    let seq = b.let_(Op::WorkgroupIdY);
-    let chunk = b.let_(Op::WorkgroupIdZ);
+    let (seq, chunk) = if sched {
+        let flat = b.let_(Op::WorkgroupIdY);
+        let (p_sq, p_ck) = (b.let_(Op::KernargPtr { offset: n_off + 8 }), b.let_(Op::KernargPtr { offset: n_off + 16 }));
+        let nc_v = b.let_(Op::KernargI32 { offset: n_off + 24 });
+        let nbs = b.bind_i32(ev(nc_v) << 2);
+        let nbs = b.read_first_lane(nbs);
+        let (r_sq, r_ck) = (b.buffer_desc_dyn(p_sq, nbs), b.buffer_desc_dyn(p_ck, nbs));
+        let fo = b.bind_i32(ev(flat) << 2);
+        let sf = b.buffer_load_f32(r_sq, fo, 0i32, 0);
+        let cf = b.buffer_load_f32(r_ck, fo, 0i32, 0);
+        let (s0, c0v) = (b.bitcast_i32(sf), b.bitcast_i32(cf));
+        let (s1, c1) = (b.read_first_lane(s0), b.read_first_lane(c0v));
+        (b.let_(Op::AddI32(Opnd::Val(s1), Opnd::I32(0))), b.let_(Op::AddI32(Opnd::Val(c1), Opnd::I32(0))))
+    } else {
+        (b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ))
+    };
     let feat = b.bind_i32((ev(tile) * 256 + ev(tid)) << 3);               // first feature of this lane
     let feat_ok = b.let_(Op::CmpLtI32(Opnd::Val(feat), Opnd::Val(dim_v)));
     let fok0 = feat_ok_i(b, feat_ok);
