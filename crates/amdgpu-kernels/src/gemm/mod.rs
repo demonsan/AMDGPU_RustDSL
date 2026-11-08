@@ -1045,7 +1045,8 @@ impl Body {
                 let v = b.bind_i32(key0.clone() + ev(self.a_org)); b.read_first_lane(v)
             };
             let kb = { let v = b.bind_i32((key0.clone() << 4) + ev(self.b_org)); b.read_first_lane(v) };
-            let kah = { let v = b.bind_i32(ev(ka) + 128); b.read_first_lane(v) };
+            // (A8W4 only: the hi half's origin; other kernels keep their exact code)
+            let kah = if self.cfg.elem == Elem::Fp8W4 { let v = b.bind_i32(ev(ka) + 128); b.read_first_lane(v) } else { ka };
             [ka, kb, kah]
         });
         // implicit-GEMM conv: this tile's channel block and tap (wave uniform), then per A issue the input pixel's voffset (or out of range)
@@ -1093,9 +1094,10 @@ impl Body {
             passes.push((&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave, 2, self.a_hi));
         }
         for (bi, (sh, dma, rsrc, wave, oi, lds_off)) in passes.into_iter().enumerate() {
-            let (_, mine) = u.capture(b, format!("ab.{}.{bi}.setup", sh.name), |b| {
+            let uname = if bi < 2 { sh.name.to_string() } else { format!("{}h", sh.name) };
+            let (_, mine) = u.capture(b, format!("ab.{uname}.setup"), |b| {
                 let o = sh.at(slot).off_v(b);
-                let sbase = b.bind_i32(o + (sh.base as i32 + lds_off) + ev(wave));
+                let sbase = if lds_off == 0 { b.bind_i32(o + sh.base as i32 + ev(wave)) } else { b.bind_i32(o + (sh.base as i32 + lds_off) + ev(wave)) };
                 let mut m0s: Vec<(i32, ValueId)> = Vec::new();
                 let mut mine: Vec<(ValueId, i32, ValueId)> = Vec::new();
                 for (g, lds) in dma.issues.iter() {
@@ -1116,7 +1118,7 @@ impl Body {
                     (Some(vo), 0) => (vo[q], self.conv.as_ref().map(|c| c.zero).unwrap()),
                     _ => (g, orgs[oi]),
                 };
-                u.capture(b, format!("ab.{}.{bi}.{q}", sh.name), |b| sh.at(slot).write(b, |b| b.load_buffer_lds(rsrc, g, so, m0, dma.act(lds).1, 4)));
+                u.capture(b, format!("ab.{uname}.{q}"), |b| sh.at(slot).write(b, |b| b.load_buffer_lds(rsrc, g, so, m0, dma.act(lds).1, 4)));
             }
         }
         let contract = amdgpu_dsl::StageContract { barrier_phase: phase, roles: vec!["all".to_string()], ..Default::default() };
