@@ -97,13 +97,11 @@ fn mxfp4(name: &str, k: i64) -> Function {
         // 32 values -> 16 bytes: v_cvt_scalef32_pk_fp4_f32 packs two values per byte (sel = byte)
         let mut words: Vec<ValueId> = Vec::with_capacity(4);
         for w in 0..4usize {
-            // each pair converted into byte 0 of a fresh word, then shifted into place
-            let z = b.c_i32(0);
+            // v_cvt_scalef32_pk_fp4_f32 writes byte `sel` of the previous word (chained)
             let mut acc = b.c_i32(0);
             for byte in 0..4usize {
                 let i = 8 * w + 2 * byte;
-                let pk = b.cvt(CvtOp::ScalePkFp4F32, &[Opnd::Val(xs[i]), Opnd::Val(xs[i + 1]), Opnd::Val(sf), Opnd::Val(z)], 0);
-                acc = b.bind_i32(ev(acc) | ((ev(pk) & 0xff) << (8 * byte as i32)));
+                acc = b.cvt(CvtOp::ScalePkFp4F32, &[Opnd::Val(xs[i]), Opnd::Val(xs[i + 1]), Opnd::Val(sf), Opnd::Val(acc)], byte as u8);
             }
             words.push(acc);
         }

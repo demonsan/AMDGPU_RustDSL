@@ -264,9 +264,9 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     let mut b = FnBuilder::new(name, 512);
     // the `_vs128` policy (full reordering list scheduler) + ldsink / wsink / ldahead32: measured +6.6 % / +7.7 % / +6.7 % (8192², 2048², 1024²)
     // over the Gemm profile
-    // (causal: the Gemm profile measured 4 % faster (955 vs 915 TF/s at 8192²); the key-split form keeps the Gemm profile: under Vs128 its
-    // causal S = 4 build faulted on HW - reported)
-    let vs_policy = !split && !causal;
+    // (causal, also the causal key-split form: the Gemm profile measured faster (955 vs 915 TF/s at 8192², 350 vs 328 _ks S=2 at 4096²);
+    // the non-causal _ks form gains on Vs128: 660 vs 618 TF/s at 4096² S=1 - its earlier HW fault was the in-flight WAW backend bug, fixed)
+    let vs_policy = !causal;
     b.compile_profile(if vs_policy { CompileProfile::Vs128 } else { CompileProfile::Gemm });
     // ---- ABI (the vendor's v3, as bf16.rs) ----
     for (n, i) in [("ptr_o", 0u32), ("ptr_q", 1), ("ptr_k", 2), ("ptr_v", 3), ("ptr_lse", 4)] {
@@ -574,7 +574,7 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     }
     let mut f = b.finish();
     // the scheduler tokens also on the causal Gemm-profile build (+2 % at 8192², +1 % at 2048²)
-    if !split {
+    if !split || vs_policy {
         f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
     }
     f
