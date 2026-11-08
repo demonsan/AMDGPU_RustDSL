@@ -706,7 +706,11 @@ blockscale 128×128（`fp8bs`）的规则：
 **待办**：
 - **stage 2**：现在走 fp32 中间结果再求和，例如 4096×7168×topk8 要写 940 MB，所以只有 362 TF/s。改为 bf16 原子累加或在 CTA 内按 token 归并。aiter 没有 ASM stage 2（它用 CK），需要另找对照。
 - **blockscale stage 1**：0.8–0.87×。需要与批次 1 的 blockscale 中等 M 问题一起处理，方向是块乘积延后一个 tile。
-- **小 block_m（32 / 64）**：稀疏专家时需要。
+- **block_m 64（已完成）**：`gemm_moe{1,2}_*_bm64` 是 64 行 tile。[`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `moe_block_m` 在每专家平均行数 M·topk/E < 128 时选用它。
+  - M256 D7168 I2048 E64 topk8，stage 1：fp8 从 420 µs 降到 381 µs（aiter 392，1.03×）；fp8bs 从 530 µs 降到 417 µs（aiter 418，1.0×）。
+  - 同一形状的 stage 2 + sum：fp8 251 → 222 µs，fp8bs 262 → 213 µs。
+  - M128 E8 topk2 fp8bs：53.8 → 38.0 µs。
+- **blockscale 块乘积改用 `v_pk_fma_f32`**：试过，结果持平到略慢（GEMM 4096³：1152 对 1173 TF/s），未采用。
 - **stage 1 → stage 2 的再量化**：已在 GPU 上完成，fp8 用 `quant_token_bf16_fp8_n<I>`，blockscale 用 `quant_group128_bf16_fp8_n<I>`（均为 sched 的 rows::quant）。host 测试计入这一步的时间，参考实现读回 GPU 量化后的码值和 scale。
 
 **后端问题（已报告）**：一个结果未被使用的 load，其目标 VGPR 在 load 仍在途时被重新分配，load 晚到后覆盖新值（WAW）。表现为冷启动时错、热运行时对。已用"不发出死 load"绕开。

@@ -90,9 +90,28 @@ pub fn conv_cta(m: u64, n: u64, cus: u64) -> u32 {
     }
 }
 
+/// Fused MoE: block_m (the routing sort's block and the `gemm_moe{1,2}_*` tile rows): 64 (`_bm64` kernels) when the average rows per
+/// expert M topk / E is below 128, else 128. Measured (stage 1, silu): M256 D7168 I2048 E64 topk8 fp8 420 -> 381 us (aiter 392), fp8bs 530
+/// -> 417 us (aiter 418); M128 D4096 I1024 E8 topk2 fp8bs 53.8 -> 38.0 us; stage 2 + sum also faster (251 -> 222, 262 -> 213 us).
+pub fn moe_block_m(m: u64, topk: u64, experts: u64) -> u32 {
+    if m * topk < 128 * experts {
+        64
+    } else {
+        128
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moe_rule() {
+        assert_eq!(moe_block_m(256, 8, 64), 64);
+        assert_eq!(moe_block_m(128, 2, 8), 64);
+        assert_eq!(moe_block_m(1024, 2, 8), 128);
+        assert_eq!(moe_block_m(4096, 8, 32), 128);
+    }
 
     #[test]
     fn conv_rule() {
