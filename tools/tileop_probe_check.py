@@ -1019,6 +1019,65 @@ def check_pkpair(planes, out):
     print(("ok   " if ok else "FAIL ") + "bf16x8 -> f32 pairs -> v_pk_mul_f32 / v_pk_add_f32")
     return ok
 
+# ---------------------------------------------------------------- probe_fp6 (OCP MX fp6 = e2m3, bf6 = e3m2)
+FP6_VALS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, 0.25, -0.25, 0.75]
+
+def enc6(fmt, x):
+    """exact 6-bit code of a representable x (e2m3: bias 1, 3 mantissa bits; e3m2: bias 3, 2 mantissa bits)"""
+    eb, mb, bias = (2, 3, 1) if fmt == "fp6" else (3, 2, 3)
+    s = 1 if x < 0 or (x == 0 and math.copysign(1, x) < 0) else 0
+    a = abs(x)
+    for code in range(1 << (eb + mb)):
+        e, m = code >> mb, code & ((1 << mb) - 1)
+        v = (m / (1 << mb)) * 2.0 ** (1 - bias) if e == 0 else (1 + m / (1 << mb)) * 2.0 ** (e - bias)
+        if v == a:
+            return (s << (eb + mb)) | code
+    raise ValueError(x)
+
+def h16(x):
+    return struct.unpack("<H", struct.pack("<e", x))[0]
+
+def gen_fp6():
+    rnd = random.Random(131)
+    xs = [[rnd.choice(FP6_VALS) * 2 for _ in range(LANES)] for _ in range(32)]
+    planes = [[u32(v) for v in p] for p in xs]
+    planes += [[h16(xs[2 * k][l]) | (h16(xs[2 * k + 1][l]) << 16) for l in range(LANES)] for k in range(16)]
+    planes += [[(u32(xs[2 * k][l]) >> 16) | (u32(xs[2 * k + 1][l]) & 0xFFFF0000) for l in range(LANES)] for k in range(16)]
+    planes += [[u32(2.0)] * LANES]
+    return planes
+
+def check_fp6(planes, out):
+    O = lambda k, l: out[k * LANES + l]
+    ok_all = True
+    for name, base, fmt in [("2xpk16 fp6 <- f32", 0, "fp6"), ("2xpk16 bf6 <- f32", 6, "bf6"), ("pk32 fp6 <- f16", 12, "fp6"), ("pk32 bf6 <- f16", 18, "bf6"),
+                            ("pk32 fp6 <- bf16", 24, "fp6"), ("pk32 bf6 <- bf16", 30, "bf6")]:
+        bad = 0
+        for l in range(LANES):
+            want = 0
+            for i in range(32):
+                want |= enc6(fmt, f32(planes[i][l]) / 2) << (6 * i)
+            got = sum(O(base + k, l) << (32 * k) for k in range(6))
+            if got != want:
+                bad += 1
+                if bad == 1:
+                    print(f"  {name} lane {l}: got {got:048x}\n  {' ' * len(name)}       want {want:048x}")
+        print(("ok   " if bad == 0 else "FAIL ") + f"{name}: {64 - bad}/64 lanes")
+        ok_all &= bad == 0
+    for name, base, half in [("pk32 f16 <- fp6", 36, "f16"), ("pk32 bf16 <- fp6", 52, "bf16"), ("pk32 f16 <- bf6", 68, "f16"), ("pk32 bf16 <- bf6", 84, "bf16")]:
+        bad = 0
+        for l in range(LANES):
+            for i in range(32):
+                w = O(base + i // 2, l) >> (16 * (i % 2)) & 0xFFFF
+                got = struct.unpack("<e", struct.pack("<H", w))[0] if half == "f16" else f32(w << 16)
+                if got != f32(planes[i][l]):
+                    bad += 1
+                    if bad == 1:
+                        print(f"  {name} lane {l} elem {i}: got {got} want {f32(planes[i][l])}")
+                    break
+        print(("ok   " if bad == 0 else "FAIL ") + f"{name}: {64 - bad}/64 lanes")
+        ok_all &= bad == 0
+    return ok_all
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -1041,6 +1100,7 @@ PROBES = {
     "probe_fp4_chain": (gen_fp4_chain, check_fp4_chain, 256),
     "probe_pkfma": (gen_pkfma, check_pkfma, 6 * LANES * 4),
     "probe_pkpair": (gen_pkpair, check_pkpair, 4 * LANES * 4),
+    "probe_fp6": (gen_fp6, check_fp6, 100 * LANES * 4),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }

@@ -1319,3 +1319,57 @@ pub fn probe_pkpair() -> Function {
     }
     b.finish()
 }
+
+/// `probe_fp6(in, out)`: the fp6 / bf6 packs. in planes 0..31: 32 f32 values x_i, 32..47: the same as f16 pairs, 48..63: as bf16 pairs,
+/// 64: the scale. out: dwords 0..5 of 2xpk16 fp6 / bf6 (f32), pk32 fp6 / bf6 from f16, from bf16 (6 x 6 planes), then the four dequants of the
+/// fp6 (f32 source) and bf6 (f32 source) codes to f16 / bf16 (4 x 16 planes).
+pub fn probe_fp6() -> Function {
+    use amdgpu_dsl::{CvtOp as C, MemTy};
+    let mut b = FnBuilder::new("probe_fp6", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(65 * 256));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(100 * 256));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    let pl: Vec<ValueId> = (0..65u32).map(|k| b.load_global(pin, 256 * k, MemTy::B32)).collect();
+    let frag16 = |b: &mut FnBuilder, from: usize| -> ValueId {
+        let parts: Vec<Opnd> = (0..16).map(|k| Opnd::Val(pl[from + k])).collect();
+        b.frag_cat(&parts)
+    };
+    let a = frag16(&mut b, 0);
+    let bb = frag16(&mut b, 16);
+    let h = frag16(&mut b, 32);
+    let hb = frag16(&mut b, 48);
+    let s = pl[64];
+    let r1 = b.cvt(C::Scale2xPk16Fp6F32, &[Opnd::Val(a), Opnd::Val(bb), Opnd::Val(s)], 0);
+    let r2 = b.cvt(C::Scale2xPk16Bf6F32, &[Opnd::Val(a), Opnd::Val(bb), Opnd::Val(s)], 0);
+    let r3 = b.cvt(C::ScalePk32Fp6F16, &[Opnd::Val(h), Opnd::Val(s)], 0);
+    let r4 = b.cvt(C::ScalePk32Bf6F16, &[Opnd::Val(h), Opnd::Val(s)], 0);
+    let r5 = b.cvt(C::ScalePk32Fp6Bf16, &[Opnd::Val(hb), Opnd::Val(s)], 0);
+    let r6 = b.cvt(C::ScalePk32Bf6Bf16, &[Opnd::Val(hb), Opnd::Val(s)], 0);
+    let d1 = b.cvt(C::ScalePk32F16Fp6, &[Opnd::Val(r1), Opnd::Val(s)], 0);
+    let d2 = b.cvt(C::ScalePk32Bf16Fp6, &[Opnd::Val(r1), Opnd::Val(s)], 0);
+    let d3 = b.cvt(C::ScalePk32F16Bf6, &[Opnd::Val(r2), Opnd::Val(s)], 0);
+    let d4 = b.cvt(C::ScalePk32Bf16Bf6, &[Opnd::Val(r2), Opnd::Val(s)], 0);
+    let mut k = 0u32;
+    for r in [r1, r2, r3, r4, r5, r6] {
+        for i in 0..6usize {
+            let v = b.let_(Op::Frag16Lane { frag: Opnd::Val(r), index: i as u8 });
+            b.store_global(pout, 256 * k, v, MemTy::B32, false);
+            k += 1;
+        }
+    }
+    for d in [d1, d2, d3, d4] {
+        for i in 0..16usize {
+            let v = b.let_(Op::Frag16Lane { frag: Opnd::Val(d), index: i as u8 });
+            b.store_global(pout, 256 * k, v, MemTy::B32, false);
+            k += 1;
+        }
+    }
+    b.finish()
+}
