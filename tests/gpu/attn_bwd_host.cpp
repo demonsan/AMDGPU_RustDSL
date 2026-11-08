@@ -138,26 +138,8 @@ int main(int argc, char** argv) {
         auto U = [&](int i, int x) { memcpy(&a[16 * i], &x, 4); };
         P_(0, dq_); P_(1, dk_); P_(2, dv_); P_(3, ddo); P_(4, dlse); P_(5, ddot); P_(6, ddq); P_(7, ddk); P_(8, ddv); P_(14, dO_);
         memcpy(&a[144], &scale, 4); U(10, SQ); U(11, SK); U(12, H); U(13, HK);
-        // FUSED=1: dot + fmha_bwd_dkdvq (dQ by fp32 atomics into a zeroed accumulator) + fmha_bwd_dq_convert
-        const bool fused = envi("FUSED", 0) != 0;
-        void* dacc = nullptr;
-        std::vector<uint8_t> af, ac;
-        hipFunction_t fkq = nullptr, fcv = nullptr;
-        if (fused) {
-            HC(hipMalloc(&dacc, (size_t)B * H * SQ * D * 4));
-            fkq = load(dir + "/fmha_bwd_dkdvq_hd128_bf16" + cs + ".co", "fmha_bwd_dkdvq_hd128_bf16" + cs);
-            fcv = load(dir + "/fmha_bwd_dq_convert_hd128_bf16.co", "fmha_bwd_dq_convert_hd128_bf16");
-            af = a; memcpy(&af[16 * 6], &dacc, 8);
-            ac = a; memcpy(&ac[16 * 6], &dacc, 8); memcpy(&ac[0], &ddq, 8);
-        }
         auto run = [&]() {
             launch(fd, a, (SQ + 255) / 256, H, B);
-            if (fused) {
-                HC(hipMemsetAsync(dacc, 0, (size_t)B * H * SQ * D * 4));
-                launch(fkq, af, (SK + 127) / 128, H, B);
-                launch(fcv, ac, (SQ + 63) / 64, H, B);
-                return;
-            }
             launch(fq, a, (SQ + 127) / 128, H, B);
             launch(fk, a, (SK + 127) / 128, H, B);
         };
@@ -171,13 +153,12 @@ int main(int argc, char** argv) {
         double us = 1e3 * ms / iters;
         printf("ours bwd B=%d H=%d HK=%d SQ=%d SK=%d causal=%d: %.1f us %.1f TF/s\n", B, H, HK, SQ, SK, causal, us, flops / (us * 1e-6) / 1e12);
         // per-kernel split
-        if (fused) { fq = fcv; fk = fkq; }
         hipFunction_t fs[3] = {fd, fq, fk};
         int gxs[3] = {(SQ + 255) / 256, (SQ + 127) / 128, (SK + 127) / 128};
         const char* nm[3] = {"dot", "dq", "dkdv"};
         for (int kk = 0; kk < 3; kk++) {
             HC(hipEventRecord(e0));
-            for (int i = 0; i < iters; i++) launch(fs[kk], fused && kk == 1 ? ac : fused && kk == 2 ? af : a, fused && kk == 1 ? (SQ + 63) / 64 : gxs[kk], H, B);
+            for (int i = 0; i < iters; i++) launch(fs[kk], a, gxs[kk], H, B);
             HC(hipEventRecord(e1)); HC(hipEventSynchronize(e1));
             float m2; HC(hipEventElapsedTime(&m2, e0, e1));
             printf("   %s: %.1f us\n", nm[kk], 1e3 * m2 / iters);
