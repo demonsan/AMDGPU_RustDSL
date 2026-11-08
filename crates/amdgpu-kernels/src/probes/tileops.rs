@@ -1336,7 +1336,13 @@ pub fn probe_fp6() -> Function {
     let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
     let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
     let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
-    let pl: Vec<ValueId> = (0..65u32).map(|k| b.load_global(pin, 256 * k, MemTy::B32)).collect();
+    // planes of 256 bytes, addressed through a base every 16 planes (the global immediate is 13-bit signed)
+    let pl: Vec<ValueId> = (0..65u32)
+        .map(|k| {
+            let base = b.let_(Op::PtrAdd { base: Opnd::Val(pin), byte_off: Opnd::I32((4096 * (k / 16)) as i32) });
+            b.load_global(base, 256 * (k % 16), MemTy::B32)
+        })
+        .collect();
     let frag16 = |b: &mut FnBuilder, from: usize| -> ValueId {
         let parts: Vec<Opnd> = (0..16).map(|k| Opnd::Val(pl[from + k])).collect();
         b.frag_cat(&parts)
@@ -1360,14 +1366,16 @@ pub fn probe_fp6() -> Function {
     for r in [r1, r2, r3, r4, r5, r6] {
         for i in 0..6usize {
             let v = b.let_(Op::Frag16Lane { frag: Opnd::Val(r), index: i as u8 });
-            b.store_global(pout, 256 * k, v, MemTy::B32, false);
+            let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((4096 * (k / 16)) as i32) });
+            b.store_global(base, 256 * (k % 16), v, MemTy::B32, false);
             k += 1;
         }
     }
     for d in [d1, d2, d3, d4] {
         for i in 0..16usize {
             let v = b.let_(Op::Frag16Lane { frag: Opnd::Val(d), index: i as u8 });
-            b.store_global(pout, 256 * k, v, MemTy::B32, false);
+            let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((4096 * (k / 16)) as i32) });
+            b.store_global(base, 256 * (k % 16), v, MemTy::B32, false);
             k += 1;
         }
     }
