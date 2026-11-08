@@ -270,3 +270,7 @@ softmax 与 layernorm 的短行仍然只有 rmsnorm 的 60–80 %（两遍规约
 ## RoPE：小 H 时一个 wave 装多个 token
 
 一个 token 只用 `H · L` 个 lane（L = 每个 head 的 lane 数：NeoX 为 D / 16、GPT-J 为 D / 8），`H · L < 64` 时大半个 wave 空闲（H = 1, D = 64 只有 4 个 lane：此前 1300 GB/s，22 %）。当 `H · L ≤ 32` 且是 2 的幂时，一个 wave 装 `64 / (H · L)` 个 token（H = 1, D = 64：16 个），一个 block 4 个 wave，grid = ⌈T / (4 · tpw)⌉；位置和 cos / sin 表行因此是向量值（每个 lane 组自己的 token），越界 token 的 store 被屏蔽。名字与 ABI 不变。主机测试 `rope_host`（T = 29 … 41 的奇数 token 数，H ∈ {1, 2, 4, 8}，D ∈ {64, 128}，neox / gptj）`bad = 0`。带宽（GB/s，流量把每个 token 的 cos / sin 行也算上，它们在 L2 里，所以高于真实 HBM 流量）：H = 1, D = 64（neox）7062；H = 1, D = 128：9250；H = 2, D = 64：6193；H = 4, D = 128：7174；H = 1, D = 64（gptj）7419。
+
+## MoE 合并：`moe_reduce` / `moe_sum`（模板 T3）
+
+kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel 合并：`moe_reduce_bf16_k<K>_d<D>`：`out[t][d] = bf16(Σ_k w[t][k] · x[t][k][d])`（x bf16 `[T][K][D]`，w f32 `[T][K]`，out bf16 `[T][D]`）；`moe_sum_bf16_k<K>_d<D>` 是不带权重的和（`moe_buf` / 共享专家的合并）。K ∈ 1 … 16，D 是 8 的倍数（8 … 65536）；grid = (列 tile, T)，每个 lane 一个 b128 / 路由，所有 K 次加载先发出，f32 累加，一次 RNE 到 bf16，流式（`nt`）访问；块的线程数在 64 / 128 / 192 / 256 里选最后一个列 tile 空闲 lane 最少的（D = 7168 → 128）。限制：T ≤ 65535 且 T · K · D · 2 < 2 GiB（32 位偏移；更大要 B1）。主机测试 `tests/gpu/moe_reduce_host.cpp`（CPU 双精度参考；误差判据 = 1 个 bf16 ulp + 1e-6 · Σ|项| 的累加误差）：K ∈ {1, 2, 6, 8, 16}，D ∈ {24, 512, 1000, 2048, 4096, 7168}，T ∈ {17 … 41}（奇数），`bad = 0`，输出末尾之外 0 字节被写，`gpu_verify --strict` 0 错误，VGPR 20 … 100。带宽：见 `tools/b2_matrix.sh` 的 moe_reduce 行（T = 16384 … 65535、K = 6 … 8、D = 2048 … 7168：5.4–6.4 TB/s，D = 7168 的块大小修正前是 5.44）。

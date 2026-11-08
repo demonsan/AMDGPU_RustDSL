@@ -25,7 +25,8 @@ int main(int argc, char** argv) {
     char args[40]; size_t sz = 0; auto put = [&](const void* p, size_t k) { std::memcpy(args + sz, p, k); sz += k; };
     int32_t t32 = (int32_t)T; if (weighted) { put(&dx, 8); put(&dw, 8); put(&dout, 8); put(&t32, 4); } else { put(&dx, 8); put(&dout, 8); put(&t32, 4); }
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
-    long d8 = D / 8; int blockx = (int)(std::min<long>(4, (d8 + 63) / 64) * 64); int gx = (int)((d8 + blockx - 1) / blockx);
+    long d8 = D / 8; long maxw = std::min<long>(4, (d8 + 63) / 64); long bestw = INT32_MAX; int blockx = 64; for (long w = 1; w <= maxw; ++w) { long th = 64 * w, waste = ((d8 + th - 1) / th) * th - d8; if (waste <= bestw) { bestw = waste; blockx = (int)th; } }   // pick_threads in moe/reduce.rs
+    int gx = (int)((d8 + blockx - 1) / blockx);
     CK(hipModuleLaunchKernel(fn, gx, (int)T, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize());
     std::vector<uint16_t> ho((size_t)T * D + 32); CK(hipMemcpy(ho.data(), dout, ho.size() * 2, hipMemcpyDeviceToHost));
     long bad = 0;

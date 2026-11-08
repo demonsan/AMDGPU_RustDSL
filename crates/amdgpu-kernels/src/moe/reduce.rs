@@ -3,7 +3,7 @@
 //! * `moe_reduce_bf16_k<K>_d<D>`  `out[t][d] = bf16(sum_k w[t][k] * x[t][k][d])`.  ABI x @0 (bf16 [T][K][D]), w @8 (f32 [T][K]), out @16 (bf16 [T][D]), T @24 (i32)
 //! * `moe_sum_bf16_k<K>_d<D>`     `out[t][d] = bf16(sum_k x[t][k][d])`.            ABI x @0, out @8, T @16
 //!
-//! K 1..=16, D a multiple of 8 in 8..=65536; grid x = the column tiles (`min(4, ceil(D / 512))` waves, one b128 per lane and route), grid y = tokens (T <= 65535 and T * K * D * 2 < 2 GiB: 32-bit offsets).
+//! K 1..=16, D a multiple of 8 in 8..=65536; grid x = the column tiles (`pick_threads(D / 8)` threads, one b128 per lane and route), grid y = tokens (T <= 65535 and T * K * D * 2 < 2 GiB: 32-bit offsets).
 //! All K loads of a lane are in flight before the sum; accumulation in f32, one round to bf16 (RNE); streaming (`nt`) accesses.
 
 use amdgpu_dsl::{CachePolicy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
@@ -28,9 +28,23 @@ fn pack8(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
     b.frag4(w[0], w[1], w[2], w[3])
 }
 
+/// Threads per block (64, 128, 192 or 256, at most as many waves as the row needs): the one that leaves the fewest idle lanes in the last column tile (ties: the larger block).
+pub fn pick_threads(d8: i64) -> u32 {
+    let max_waves = ((d8 + 63) / 64).min(4);
+    let mut best = (i64::MAX, 64u32);
+    for w in 1..=max_waves {
+        let t = 64 * w;
+        let waste = ((d8 + t - 1) / t) * t - d8;
+        if waste <= best.0 {
+            best = (waste, t as u32);
+        }
+    }
+    best.1
+}
+
 pub fn moe_reduce(name: &str, k: i64, d: i64, weighted: bool) -> Function {
     let d8 = d / 8;
-    let threads = (((d8 + 63) / 64).min(4) * 64) as u32;
+    let threads = pick_threads(d8);
     let tiles = (d8 + threads as i64 - 1) / threads as i64;
     let mut fb = FnBuilder::new(name, threads);
     fb.compile_profile(CompileProfile::Default);
