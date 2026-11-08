@@ -189,7 +189,7 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
             for hi in [false, true] {
                 // the sentinel is past every descriptor; the element offsets (imm <= 7 * BS * 2 < 4096) are added to it
                 let imm = (2 * m as i64 + hi as i64) * bs * 2;
-                b.buffer_store_c(r_vc, Some(Opnd::Val(vbase)), 0i32, imm as u32, w, MemTy::U16, hi, CachePolicy::NT);
+                b.buffer_store_c(r_vc, Some(Opnd::Val(vbase)), 0i32, imm as u32, w, MemTy::U16, hi, CachePolicy::NONE);
             }
         }
     }
