@@ -42,7 +42,6 @@ struct Body<'a> {
     neg_inf: ValueId,
     zero16: ValueId,
     half: ValueId,
-    row: ValueId,
     /// keys visible to the lane's query: k <= lim; the CTA-uniform smallest limit (tiles ending at or below it need no mask)
     lim: ValueId,
     lim_min: ValueId,
@@ -225,7 +224,7 @@ impl PipeBody for Body<'_> {
             .iter()
             .map(|x| {
                 let t = b.let_(Op::FmaF32(Opnd::Val(*x), Opnd::Val(self.csc), Opnd::Val(nm)));
-                if std::env::var("EXP_NOEXP").is_ok() { t } else { b.exp2_f32(t) }
+                b.exp2_f32(t)
             })
             .collect();
         let mut ps = p[0];
@@ -247,9 +246,7 @@ impl PipeBody for Body<'_> {
         if self.prio {
             b.set_prio(1);
         }
-        if std::env::var("EXP_NOPV").is_err() {
-            self.pv(b, &t.cur);
-        }
+        self.pv(b, &t.cur);
         if t.staged {
             let s = self.s.clone();
             self.qk(b, &t.next, Some(&s));
@@ -258,6 +255,12 @@ impl PipeBody for Body<'_> {
 }
 
 pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
+    fmha_fwd_hd128_bf16_v3_x(name, causal, false)
+}
+
+/// `split` (`..._ks`, for small grids): the key range of every q tile is cut into S = 2^lg_s parts (grid z = B S; our ABI extension: lg_s
+/// at kernarg 656, S = 2^lg_s at 660, fp32 partial O / l [B, H, SQ, S, 128] at 672, partial LSE [B, H, SQ, S] at 688); `attn_combine_bf16_hd128_q` merges them.
+pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Function {
     let mut b = FnBuilder::new(name, 512);
     b.compile_profile(CompileProfile::Gemm);
     // ---- ABI (the vendor's v3, as bf16.rs) ----
@@ -296,6 +299,21 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     b.ka_is(464, sq.clone() * Ext::c(4));
     b.grid_is(0, if causal { sq.clone().ceil_div(QR as i64).ceil_div(2) } else { sq.clone().ceil_div(QR as i64) });
     b.grid_is(1, hh.clone());
+    if split {
+        b.arg("lg_s", DType::I32, 656, 4);
+        b.arg("S", DType::I32, 660, 4);
+        b.ka_is(660, Ext::sym("SPL"));
+        b.arg("ptr_po", DType::Ptr, 672, 8);
+        b.arg("ptr_plse", DType::Ptr, 688, 8);
+        b.sym_range("LS", 0, 4);
+        b.ka_is(656, Ext::sym("LS"));
+        b.sym_range("SPL", 1, 16);
+        b.sym_range("BB", 1, 1 << 12);
+        b.grid_is(2, Ext::sym("BB") * Ext::sym("SPL"));
+        b.arg_tensor("ptr_po", Ext::sym("BB") * hh.clone() * sq.clone() * Ext::sym("SPL") * Ext::c(4 * D as i64));
+        b.arg_tensor("ptr_plse", Ext::sym("BB") * hh.clone() * sq.clone() * Ext::sym("SPL") * Ext::c(4));
+    }
+    let bb = if split { Ext::sym("BB") } else { bb };
     b.arg_tensor("ptr_q", bb.clone() * sq.clone() * hh.clone() * rowb.clone());
     b.arg_tensor("ptr_o", bb.clone() * sq.clone() * hh.clone() * rowb.clone());
     b.arg_tensor("ptr_k", bb.clone() * sk.clone() * hk.clone() * rowb.clone());
@@ -309,29 +327,21 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     let (s_q, q_seqs, q_hs, q_bs, gqa) = (ki(&mut b, 6), ki(&mut b, 7), ki(&mut b, 9), ki(&mut b, 10), ki(&mut b, 11));
     let (k_seqs, k_hs, k_bs, lse_on, s_kv) = (ki(&mut b, 12), ki(&mut b, 13), ki(&mut b, 14), ki(&mut b, 16), ki(&mut b, 17));
     let (v_seqs, v_hs, v_bs, o_seqs, o_hs, o_bs, lse_hs) = (ki(&mut b, 21), ki(&mut b, 22), ki(&mut b, 23), ki(&mut b, 24), ki(&mut b, 25), ki(&mut b, 26), ki(&mut b, 29));
-    let (qt0, h0, bat0) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
-    // XCD order: workgroups are dispatched round robin over the 8 XCDs (linear id % 8); give each XCD a contiguous range of the
-    // (q tile, head, batch) space (q tile fastest) so the CTAs sharing a head's K / V sit behind one L2. Identity unless the count is a
-    // multiple of 8. Measured no gain (same-run, 3 shapes): off by default.
-    let (qt, h, bat) = if std::env::var("EXP_XCD").is_err() { (qt0, h0, bat0) } else {
-        let nx = { let v = b.bind_i32((ev(s_q) + (QR - 1)).lshr(8)); b.read_first_lane(v) };
-        let hq = b.let_(Op::KernargI32 { offset: 320 });
-        let nxh = b.bind_i32(ev(nx) * ev(hq));
-        // within a batch (the batch count is not in the ABI): with nx H a multiple of 8 the linear id % 8 (the XCD) is (qt + nx h) % 8
-        let lin = b.bind_i32(ev(qt0) + ev(nx) * ev(h0));
-        let ok = b.bind_cond((ev(nxh) & 7).eq(0));
-        let per = b.bind_i32(ev(nxh).lshr(3));
-        let nl = b.bind_i32((ev(lin) & 7) * ev(per) + ev(lin).lshr(3));
-        let nl = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(nl), b: Opnd::Val(lin) });
-        let nl = b.read_first_lane(nl);
-        let hy = crate::gemm::div_rt_pub(&mut b, nl, nx);
-        let qx = b.bind_i32(ev(nl) - ev(hy) * ev(nx));
-        let (qx, hy) = (b.read_first_lane(qx), b.read_first_lane(hy));
-        b.assume_trusted(qx, Ext::c(0), Ext::ka(96).ceil_div(QR as i64) - Ext::c(1), "XCD order: a permutation of the (q tile, head) grid");
-        b.assume_trusted(hy, Ext::c(0), Ext::ka(320) - Ext::c(1), "XCD order: a permutation of the (q tile, head) grid");
-        let bz = bat0;
-        (qx, hy, bz)
+    let (qt0, h0, z0) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
+    // split: z = batch S + part
+    let lg_s = split.then(|| b.let_(Op::KernargI32 { offset: 656 }));
+    let (bat0, part) = match lg_s {
+        Some(l) => {
+            let bt = { let v = b.bind_i32(ev(z0).lshr(ev(l))); b.read_first_lane(v) };
+            let pt = { let v = b.bind_i32(ev(z0) - (ev(bt) << ev(l))); b.read_first_lane(v) };
+            b.assume_trusted(bt, Ext::c(0), Ext::sym("BB") - Ext::c(1), "split: z = batch 2^lg_s + part (grid z = B S, S = 2^lg_s)");
+            b.assume_trusted(pt, Ext::c(0), Ext::sym("SPL") - Ext::c(1), "split: the part index < S");
+            (bt, Some(pt))
+        }
+        None => (z0, None),
     };
+    // (XCD order of the (q tile, head) grid measured no gain: not used)
+    let (qt, h, bat) = (qt0, h0, bat0);
     let lane = Lane::new(&mut b);
     let roles = Roles::split(&mut b, &lane, 4);
     let hkv = gqa_kv_head(&mut b, h, gqa, "HK");
@@ -359,7 +369,7 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     let k_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(k_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
     // V swizzled like K (the transposed reads of 4 rows x 4 columns per 16-lane group then hit distinct banks)
     let v_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(v_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
-    let ring = Ring { ks, vs, k_vo, v_vo, r_k, r_v, k_so0, v_so0, seqs: k_seqs, wig };
+    let (ks, vs) = (&ks, &vs);
     // read offsets (as bf16.rs)
     let kr: Vec<ValueId> = (0..8).map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & 15)) << 4))).collect();
     // V^T tr_b16 reads, swizzled: per (dim block e, read r) the lane's row 8 r + 4 h + s / 4 (s = lane % 16; the step rows are multiples of 16:
@@ -379,6 +389,7 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     let zero16 = b.frag_zero(DType::Frag16);
     let kind = MmaKind::new(MmaShape::M32N32K16, MmaTy::Bf16);
     let big = b.c_i32(0x7fff_fff0);
+    let c0z = { let z = b.c_i32(0); b.read_first_lane(z) };
     let qoff = b.bind_i32(ev(s_kv) - ev(s_q));
     // causal: the vendor's pairing - CTA x takes q tiles x and nt - 1 - x (equal work per CTA; the grid is halved)
     let nt = { let v = b.bind_i32((ev(s_q) + (QR - 1)).lshr(8)); b.read_first_lane(v) };
@@ -407,21 +418,45 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     } else {
         s_kv
     };
-    let nkv = { let v = b.bind_i32((ev(kv_end) + (KT - 1)).lshr(7)); b.read_first_lane(v) };
+    let ntk = { let v = b.bind_i32((ev(kv_end) + (KT - 1)).lshr(7)); b.read_first_lane(v) };
+    // split: this part's tiles [t_lo, t_hi) of ceil(ntk / S) each; keys relative to k_lo = 128 t_lo (the K / V origins move, the limits shift)
+    let (nkv, kv_len, k_lo) = match (lg_s, part) {
+        (Some(l), Some(pt)) => {
+            let per = { let v = b.bind_i32((ev(ntk) + (1 << 0) * ((I32::c(1) << ev(l)) - 1)).lshr(ev(l))); b.read_first_lane(v) };
+            let t_lo = { let v = b.bind_i32((ev(pt) * ev(per)).min(ev(ntk))); b.read_first_lane(v) };
+            let t_hi = { let v = b.bind_i32((ev(t_lo) + ev(per)).min(ev(ntk))); b.read_first_lane(v) };
+            let n = { let v = b.bind_i32(ev(t_hi) - ev(t_lo)); b.read_first_lane(v) };
+            let klo = { let v = b.bind_i32(ev(t_lo) << 7); b.read_first_lane(v) };
+            let len = { let v = b.bind_i32((ev(kv_end) - ev(klo)).max(0)); b.read_first_lane(v) };
+            (n, len, Some(klo))
+        }
+        _ => (ntk, kv_end, None),
+    };
     let lim = b.bind_i32(if causal { (ev(row) + ev(qoff)).min(ev(s_kv) - 1) } else { ev(s_kv) - 1 });
     let lim_min = {
         let v = b.bind_i32(if causal { ((ev(qt) << 8) + ev(qoff)).min(ev(s_kv) - 1) } else { ev(s_kv) - 1 });
         b.read_first_lane(v)
     };
-    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, nkv, kv_end, KT, Ext::ka(272).ceil_div(KT as i64));
+    let (lim, lim_min, k_so, v_so) = match k_lo {
+        Some(kl) => {
+            let lr = b.bind_i32(ev(lim) - ev(kl));
+            let lmr = { let v = b.bind_i32(ev(lim_min) - ev(kl)); b.read_first_lane(v) };
+            let ko = { let v = b.bind_i32(ev(k_so0) + ev(kl) * ev(k_seqs)); b.read_first_lane(v) };
+            let vo = { let v = b.bind_i32(ev(v_so0) + ev(kl) * ev(v_seqs)); b.read_first_lane(v) };
+            (lr, lmr, ko, vo)
+        }
+        None => (lim, lim_min, k_so0, v_so0),
+    };
+    let ring = Ring { ks: ks.clone(), vs: vs.clone(), k_vo: k_vo.clone(), v_vo: v_vo.clone(), r_k, r_v, k_so0: k_so, v_so0: v_so, seqs: k_seqs, wig };
+    let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, nkv, kv_len, KT, Ext::ka(272).ceil_div(KT as i64));
     pipe.key_unclamped = true;
 
     let any = b.bind_cond(ev(nkv).gt(0));
     b.begin_if(Opnd::Val(any));
     roles.each(&mut b, |b, role| {
         let mut body = Body {
-            ring: &ring, kind, qf: &qf, kr: &kr, vr: vr.clone(), csc, neg_inf, zero16, half, row, lim, lim_min,
-            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: std::env::var("EXP_NOPRIO").is_err(),
+            ring: &ring, kind, qf: &qf, kr: &kr, vr: vr.clone(), csc, neg_inf, zero16, half, lim, lim_min,
+            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true,
         };
         pipe.run(b, role, &mut body);
         // ---- epilogue: O = O^T / l (bf16, 8-byte stores), LSE ----
@@ -430,8 +465,43 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
         let (la, lb) = (b.bitcast_f32(la), b.bitcast_f32(lb));
         let l_tot = b.add_f32(la, lb);
         let inv = b.rcp_f32(l_tot);
-        let o_so = { let v = b.bind_i32(ev(bat) * ev(o_bs) + ev(h) * ev(o_hs)); b.read_first_lane(v) };
         let live = b.bind_cond(ev(row).lt(ev(s_q)));
+        if let (Some(_), Some(pt)) = (lg_s, part) {
+            // partial O / l (fp32) and LSE (ln) of this part: row (b, h, q) x S + part
+            let hq = b.let_(Op::KernargI32 { offset: 320 });
+            let (p_po, p_pl) = (b.let_(Op::KernargPtr { offset: 672 }), b.let_(Op::KernargPtr { offset: 688 }));
+            let s_cnt = b.let_(Op::KernargI32 { offset: 660 });
+            let nrow = { let v = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(s_q) * ev(s_cnt)); b.read_first_lane(v) };
+            let npo = { let v = b.bind_i32(ev(nrow) * (4 * D)); b.read_first_lane(v) };
+            let npl = { let v = b.bind_i32(ev(nrow) << 2); b.read_first_lane(v) };
+            let (r_po, r_pl) = (b.buffer_desc_dyn(p_po, npo), b.buffer_desc_dyn(p_pl, npl));
+            let prow = b.bind_i32((((ev(bat) * ev(hq) + ev(h)) * ev(s_q) + ev(row)) * ev(s_cnt)) + ev(pt));
+            let pvo = b.bind_i32(ev(prow) * (4 * D) + (ev(half) << 4));
+            let pvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(pvo), b: Opnd::Val(big) });
+            for e in 0..4usize {
+                for u in 0..4u8 {
+                    let v: Vec<ValueId> = (0..4u8)
+                        .map(|k| {
+                            let x = b.frag16_lane(Opnd::Var(body.o[e]), 4 * u + k);
+                            let x = b.bitcast_f32(x);
+                            let y = b.mul_f32(x, inv);
+                            b.bitcast_i32(y)
+                        })
+                        .collect();
+                    let f4 = b.frag4(v[0], v[1], v[2], v[3]);
+                    b.buffer_store_b128(r_po, pvo, c0z, ((32 * e as u32) + 8 * u as u32) * 4, f4);
+                }
+            }
+            let lg = b.log2_f32(l_tot);
+            let x = b.add_f32(Opnd::Var(m_v), lg);
+            let ln2 = b.c_f32(std::f32::consts::LN_2);
+            let lse = b.mul_f32(x, ln2);
+            let lvo = b.bind_i32(ev(prow) << 2);
+            let lvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(lvo), b: Opnd::Val(big) });
+            b.buffer_store_f32(r_pl, lvo, c0z, 0, lse);
+            return;
+        }
+        let o_so = { let v = b.bind_i32(ev(bat) * ev(o_bs) + ev(h) * ev(o_hs)); b.read_first_lane(v) };
         let o_vo = b.bind_i32(ev(row) * ev(o_seqs) + (ev(half) << 3));
         let o_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(o_vo), b: Opnd::Val(big) });
         for e in 0..4usize {
@@ -467,14 +537,140 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
         }
         b.end_if();
     });
+    if let (Some(_), Some(pt)) = (lg_s, part) {
+        // an empty part (no tile): O = 0, LSE = -inf (the combine weights it 0)
+        b.else_();
+        let hq = b.let_(Op::KernargI32 { offset: 320 });
+        let (p_po, p_pl) = (b.let_(Op::KernargPtr { offset: 672 }), b.let_(Op::KernargPtr { offset: 688 }));
+        let s_cnt = b.let_(Op::KernargI32 { offset: 660 });
+        let nrow = { let v = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(s_q) * ev(s_cnt)); b.read_first_lane(v) };
+        let npo = { let v = b.bind_i32(ev(nrow) * (4 * D)); b.read_first_lane(v) };
+        let npl = { let v = b.bind_i32(ev(nrow) << 2); b.read_first_lane(v) };
+        let (r_po, r_pl) = (b.buffer_desc_dyn(p_po, npo), b.buffer_desc_dyn(p_pl, npl));
+        let live = b.bind_cond(ev(row).lt(ev(s_q)));
+        let prow = b.bind_i32((((ev(bat) * ev(hq) + ev(h)) * ev(s_q) + ev(row)) * ev(s_cnt)) + ev(pt));
+        let pvo = b.bind_i32(ev(prow) * (4 * D) + (ev(half) << 4));
+        let pvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(pvo), b: Opnd::Val(big) });
+        let z = b.c_i32(0);
+        let f4 = b.frag4(z, z, z, z);
+        for e in 0..4u32 {
+            for u in 0..4u32 {
+                b.buffer_store_b128(r_po, pvo, c0z, (32 * e + 8 * u) * 4, f4);
+            }
+        }
+        let lvo = b.bind_i32(ev(prow) << 2);
+        let lvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(lvo), b: Opnd::Val(big) });
+        b.buffer_store_f32(r_pl, lvo, c0z, 0, neg_inf);
+    }
     b.end_if();
     if guard.is_some() {
         b.end_if();
     }
     }
-    let mut f = b.finish();
-    if let Ok(o) = std::env::var("EXP_SCHED") {
-        f.sched_opts = Some(o);
+    b.finish()
+}
+
+/// Merges the S = 2^lg_s key parts of `fmha_fwd_hd128_bf16_v3_ks`: O[b, q, h, :] (bf16, BSHD) = sum_s w_s po_s / sum_s w_s with w_s =
+/// exp(lse_s - M); optional LSE [B, H, SQ] = M + ln(sum w). Grid (SQ, H, B), 128 threads (one per d). ABI: 0 ptr_o, 8 ptr_po, 16 ptr_plse,
+/// 24 ptr_lse, 32 H, 36 SQ, 40 S, 44 lse_on.
+pub fn attn_combine_bf16_hd128_q(name: &str) -> Function {
+    let mut b = FnBuilder::new(name, 128);
+    b.compile_profile(CompileProfile::Gemm);
+    for (n, o) in [("ptr_o", 0u32), ("ptr_po", 8), ("ptr_plse", 16), ("ptr_lse", 24)] {
+        b.arg(n, DType::Ptr, o, 8);
     }
-    f
+    for (n, o) in [("H", 32u32), ("SQ", 36), ("S", 40), ("lse_on", 44)] {
+        b.arg(n, DType::I32, o, 4);
+    }
+    let (hh, sq) = (Ext::ka(32), Ext::ka(36));
+    b.ka_range(32, 1, 256);
+    b.ka_range(36, 1, 1 << 20);
+    b.sym_range("SPL", 1, 16);
+    b.ka_is(40, Ext::sym("SPL"));
+    b.sym_range("B", 1, 1 << 12);
+    b.grid_is(0, sq.clone());
+    b.grid_is(1, hh.clone());
+    b.grid_is(2, Ext::sym("B"));
+    let rows = Ext::sym("B") * hh * sq;
+    b.arg_tensor("ptr_o", rows.clone() * Ext::c(ROW as i64));
+    b.arg_tensor("ptr_po", rows.clone() * Ext::sym("SPL") * Ext::c(4 * D as i64));
+    b.arg_tensor("ptr_plse", rows.clone() * Ext::sym("SPL") * Ext::c(4));
+    b.arg_tensor("ptr_lse", rows * Ext::c(4));
+    let kp = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargPtr { offset: o });
+    let ki = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargI32 { offset: o });
+    let (p_o, p_po, p_pl, p_l) = (kp(&mut b, 0), kp(&mut b, 8), kp(&mut b, 16), kp(&mut b, 24));
+    let (hq, s_q, lg, lse_on) = (ki(&mut b, 32), ki(&mut b, 36), ki(&mut b, 40), ki(&mut b, 44));
+    let (q, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
+    let tid = b.let_(Op::WorkitemId);
+    let row = { let v = b.bind_i32((ev(bat) * ev(hq) + ev(h)) * ev(s_q) + ev(q)); b.read_first_lane(v) };
+    let ns = lg;
+    let nrow = { let v = b.bind_i32((ev(row) + 1) * ev(ns)); b.read_first_lane(v) };
+    let r_pl = { let n = b.bind_i32(ev(nrow) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_pl, n) };
+    let r_po = { let n = b.bind_i32(ev(nrow) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
+    let base = { let v = b.bind_i32(ev(row) * ev(ns)); b.read_first_lane(v) };
+    let lso = { let v = b.bind_i32(ev(base) << 2); b.read_first_lane(v) };
+    let c0 = b.c_i32(0);
+    let neg_inf = b.c_f32(f32::NEG_INFINITY);
+    let zf = b.c_f32(0.0);
+    // M
+    let v1 = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(neg_inf))]);
+    let s1 = amdgpu_dsl::varx(v1[0]);
+    let off = b.bind_i32(s1.clone() << 2);
+    let x = b.buffer_load_f32(r_pl, off, lso, 0);
+    let mx = b.max_f32(Opnd::Var(v1[1]), x);
+    b.set_var(v1[1], mx);
+    let n1 = b.bind_i32(s1 + 1);
+    b.set_var(v1[0], n1);
+    let d1 = b.bind_cond(ev(n1).ge(ev(ns)));
+    b.break_if(d1);
+    b.end_loop();
+    let mbits = b.bitcast_i32(Opnd::Var(v1[1]));
+    let fin = b.bind_cond(ev(mbits).ne(0xff80_0000u32 as i32));
+    let mm = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(fin), a: Opnd::Var(v1[1]), b: Opnd::Val(zf) });
+    // sums
+    let v2 = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(zf)), (DType::F32, Opnd::Val(zf))]);
+    let s2 = amdgpu_dsl::varx(v2[0]);
+    let off = b.bind_i32(s2.clone() << 2);
+    let x = b.buffer_load_f32(r_pl, off, lso, 0);
+    let dx = b.sub_f32(x, mm);
+    let l2e = b.c_f32(std::f32::consts::LOG2_E);
+    let t = b.mul_f32(dx, l2e);
+    let w = b.exp2_f32(t);
+    let po = b.bind_i32(((ev(base) + s2.clone()) * D + ev(tid)) << 2);
+    let o = b.buffer_load_f32(r_po, po, c0, 0);
+    let acc = b.let_(Op::FmaF32(Opnd::Val(w), Opnd::Val(o), Opnd::Var(v2[1])));
+    b.set_var(v2[1], acc);
+    let sw = b.add_f32(Opnd::Var(v2[2]), w);
+    b.set_var(v2[2], sw);
+    let n2 = b.bind_i32(s2 + 1);
+    b.set_var(v2[0], n2);
+    let d2 = b.bind_cond(ev(n2).ge(ev(ns)));
+    b.break_if(d2);
+    b.end_loop();
+    let tiny = b.c_f32(1e-30);
+    let den = b.max_f32(Opnd::Var(v2[2]), tiny);
+    let inv = b.rcp_f32(den);
+    let y = b.mul_f32(Opnd::Var(v2[1]), inv);
+    let yb = b.cvt_pk_bf16_f32(y, y);
+    let nob = { let v = b.bind_i32(((ev(bat) + 1) * ev(s_q) * ev(hq)) * ROW); b.read_first_lane(v) };
+    let r_o = b.buffer_desc_dyn(p_o, nob);
+    let o_vo = b.bind_i32(((ev(bat) * ev(s_q) + ev(q)) * ev(hq) + ev(h)) * ROW + (ev(tid) << 1));
+    b.buffer_store_n(r_o, Some(Opnd::Val(o_vo)), c0, 0, yb, amdgpu_dsl::MemTy::U16, false);
+    let lc = b.bind_cond((ev(lse_on).ne(0).select_i32(1, 0) & ev(tid).eq(0).select_i32(1, 0)).eq(1));
+    let lc_any = b.any_lane(lc);
+    b.begin_if(Opnd::Val(lc_any));
+    {
+        let lg2 = b.log2_f32(den);
+        let ln2 = b.c_f32(std::f32::consts::LN_2);
+        let lnl = b.mul_f32(lg2, ln2);
+        let lse = b.add_f32(mm, lnl);
+        let nl = { let v = b.bind_i32((ev(row) + 1) << 2); b.read_first_lane(v) };
+        let r_l = b.buffer_desc_dyn(p_l, nl);
+        let big = b.c_i32(0x7fff_fff0);
+        let lvo = b.bind_i32(ev(row) << 2);
+        let lvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lc), a: Opnd::Val(lvo), b: Opnd::Val(big) });
+        b.buffer_store_f32(r_l, lvo, c0, 0, lse);
+    }
+    b.end_if();
+    b.finish()
 }

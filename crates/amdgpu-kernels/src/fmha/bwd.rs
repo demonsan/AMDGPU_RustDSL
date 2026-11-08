@@ -230,24 +230,22 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
         let vbase = vs.base as i32 + slot * KT * ROW;
         let (kslot, vslot) = (ks.at(&SlotIdx::new(slot, Opnd::Var(it))), vs.at(&SlotIdx::new(slot, Opnd::Var(it))));
         // S^T = K Q^T, dP^T = V dO^T (2 blocks of 32 keys)
-        kslot.read(&mut b, |b| {
-            for sb in 0..2usize {
-                for c in 0..8usize {
+        for c in 0..8usize {
+            kslot.read(&mut b, |b| {
+                for sb in 0..2usize {
                     let ad = b.bind_i32(ev(kr[c]) + kbase + sb as i32 * 32 * ROW);
                     let kf = b.load_lds_b128(ad);
                     b.var_mfma(sv_vars[sb], kind, kf, qf[c], c == 0);
                 }
-            }
-        });
-        vslot.read(&mut b, |b| {
-            for sb in 0..2usize {
-                for c in 0..8usize {
+            });
+            vslot.read(&mut b, |b| {
+                for sb in 0..2usize {
                     let ad = b.bind_i32(ev(kr[c]) + vbase + sb as i32 * 32 * ROW);
                     let vf = b.load_lds_b128(ad);
                     b.var_mfma(dp_vars[sb], kind, vf, dof[c], c == 0);
                 }
-            }
-        });
+            });
+        }
         // P^T = exp2(csc S - lse2) (masked keys 0), dS^T = P^T (dP^T - Dot)
         let key0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
         let mut ds: Vec<ValueId> = Vec::with_capacity(32);
@@ -272,18 +270,11 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
                 let (sb, tt) = (t / 2, t % 2);
                 let i0 = 16 * sb + 8 * tt;
                 let w: Vec<ValueId> = (0..4).map(|j| b.cvt_pk_bf16_f32(ds[i0 + 2 * j], ds[i0 + 2 * j + 1])).collect();
-                let pf = b.frag4(w[0], w[1], w[2], w[3]);
+                let pf = b.pack4(w[0], w[1], w[2], w[3]);
                 for e in 0..4usize {
-                    let mut words: Vec<ValueId> = Vec::with_capacity(4);
-                    for r in 0..2usize {
-                        let ad = b.bind_i32(ev(ktr[e][r]) + kbase + (32 * sb as i32 + 16 * tt as i32) * ROW);
-                        let x = b.load_lds_tr_b16(ad);
-                        let w0 = b.frag2_lane(x, 0);
-                        let w1 = b.frag2_lane(x, 1);
-                        words.push(b.bitcast_i32(w0));
-                        words.push(b.bitcast_i32(w1));
-                    }
-                    let kf = b.frag4(words[0], words[1], words[2], words[3]);
+                    let a0 = b.bind_i32(ev(ktr[e][0]) + kbase + (32 * sb as i32 + 16 * tt as i32) * ROW);
+                    let a1 = b.bind_i32(ev(ktr[e][1]) + kbase + (32 * sb as i32 + 16 * tt as i32) * ROW);
+                    let kf = b.load_lds_tr_b16x2(a0, a1);
                     b.var_mfma(dqv[e], kind, kf, pf, false);
                 }
             }
@@ -445,24 +436,23 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         let dbase = ds_.base as i32 + slot * KT * ROW;
         let (qsl, dsl) = (qs.at(&SlotIdx::new(slot, Opnd::Var(it))), ds_.at(&SlotIdx::new(slot, Opnd::Var(it))));
         // S = Q K^T, dP = dO V^T (2 blocks of 32 queries; C lane = key, values = queries 32 sb + 8 (r / 4) + 4 h + r % 4)
-        qsl.read(&mut b, |b| {
-            for sb in 0..2usize {
-                for c in 0..8usize {
+        // S and dP interleaved: 4 independent accumulator chains (c outer)
+        for c in 0..8usize {
+            qsl.read(&mut b, |b| {
+                for sb in 0..2usize {
                     let ad = b.bind_i32(ev(rr[c]) + qbase + sb as i32 * 32 * ROW);
                     let x = b.load_lds_b128(ad);
                     b.var_mfma(s_vars[sb], kind, x, kf[c], c == 0);
                 }
-            }
-        });
-        dsl.read(&mut b, |b| {
-            for sb in 0..2usize {
-                for c in 0..8usize {
+            });
+            dsl.read(&mut b, |b| {
+                for sb in 0..2usize {
                     let ad = b.bind_i32(ev(rr[c]) + dbase + sb as i32 * 32 * ROW);
                     let x = b.load_lds_b128(ad);
                     b.var_mfma(dp_vars[sb], kind, x, vf[c], c == 0);
                 }
-            }
-        });
+            });
+        }
         // P = exp2(csc S - lse2[q]) (masked 0), dS = P (dP - Dot[q]); the per-query LSE / Dot: 4 consecutive queries per load
         let q0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
         let mut p: Vec<ValueId> = Vec::with_capacity(32);
@@ -470,25 +460,15 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         for sb in 0..2usize {
             for g in 0..4usize {
                 let qq = b.bind_i32(ev(q0) + (32 * sb + 8 * g) as i32);
-                let qa = b.bind_i32(ev(qq).min(ev(a.sq) - 4).max(0) << 2);
+                // the 4 consecutive queries of this value group (4-aligned): one 16-byte load each; queries past SQ read 0 (masked anyway)
+                let qa = b.bind_i32(ev(qq) << 2);
                 let lv = b.buffer_load_b128(r_l, qa, l_so, 0);
                 let dv = b.buffer_load_b128(r_d, qa, l_so, 0);
                 for u in 0..4usize {
                     let r = (4 * g + u) as u8;
                     let qv = b.bind_i32(ev(qq) + u as i32);
-                    // the clamped load window: lane value u of the window starting at min(qq, SQ - 4)
-                    let shift = b.bind_i32(ev(qv) - ev(qq).min(ev(a.sq) - 4).max(0));
-                    let pick = |b: &mut FnBuilder, f: ValueId| -> ValueId {
-                        let w: Vec<ValueId> = (0..4u8).map(|k| { let x = b.frag4_lane(f, k); b.bitcast_f32(x) }).collect();
-                        let s1 = b.bind_cond(ev(shift).eq(1));
-                        let s2 = b.bind_cond(ev(shift).eq(2));
-                        let s3 = b.bind_cond(ev(shift).ge(3));
-                        let a1 = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(s1), a: Opnd::Val(w[1]), b: Opnd::Val(w[0]) });
-                        let a2 = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(s2), a: Opnd::Val(w[2]), b: Opnd::Val(a1) });
-                        b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(s3), a: Opnd::Val(w[3]), b: Opnd::Val(a2) })
-                    };
-                    let lse = pick(&mut b, lv);
-                    let dot = pick(&mut b, dv);
+                    let lse = { let x = b.frag4_lane(lv, u as u8); b.bitcast_f32(x) };
+                    let dot = { let x = b.frag4_lane(dv, u as u8); b.bitcast_f32(x) };
                     let s = b.frag16_lane(Opnd::Var(s_vars[sb]), r);
                     let s = b.bitcast_f32(s);
                     let x = b.mul_f32(s, csc);
@@ -516,18 +496,11 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
                     let (sb, tt) = (t / 2, t % 2);
                     let i0 = 16 * sb + 8 * tt;
                     let w: Vec<ValueId> = (0..4).map(|j| b.cvt_pk_bf16_f32(src[i0 + 2 * j], src[i0 + 2 * j + 1])).collect();
-                    let bf = b.frag4(w[0], w[1], w[2], w[3]);
+                    let bf = b.pack4(w[0], w[1], w[2], w[3]);
                     for e in 0..4usize {
-                        let mut words: Vec<ValueId> = Vec::with_capacity(4);
-                        for r in 0..2usize {
-                            let ad = b.bind_i32(ev(tr[e][r]) + base + (32 * sb as i32 + 16 * tt as i32) * ROW);
-                            let x = b.load_lds_tr_b16(ad);
-                            let w0 = b.frag2_lane(x, 0);
-                            let w1 = b.frag2_lane(x, 1);
-                            words.push(b.bitcast_i32(w0));
-                            words.push(b.bitcast_i32(w1));
-                        }
-                        let af = b.frag4(words[0], words[1], words[2], words[3]);
+                        let a0 = b.bind_i32(ev(tr[e][0]) + base + (32 * sb as i32 + 16 * tt as i32) * ROW);
+                        let a1 = b.bind_i32(ev(tr[e][1]) + base + (32 * sb as i32 + 16 * tt as i32) * ROW);
+                        let af = b.load_lds_tr_b16x2(a0, a1);
                         b.var_mfma(acc[e], kind, af, bf, false);
                     }
                 }
