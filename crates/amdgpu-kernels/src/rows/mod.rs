@@ -44,7 +44,18 @@ fn pack(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
     b.frag4(w[0], w[1], w[2], w[3])
 }
 
-/// Rows one wave processes at once: short rows (< 2 KB) need several in flight per wave for the 64 KB / CU of loads that saturate HBM (docs/op-coverage-memtemplates.md 5.1); the rows of a wave are consecutive.\npub fn rows_per_wave(n: i64) -> i64 {\n    if n < 512 {\n        4\n    } else if n < 1024 {\n        2\n    } else {\n        1\n    }\n}\n\npub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
+/// Rows one wave processes at once: short rows (< 2 KB) need several in flight per wave for the 64 KB / CU of loads that saturate HBM (docs/op-coverage-memtemplates.md 5.1); the rows of a wave are consecutive.
+pub fn rows_per_wave(n: i64) -> i64 {
+    if n < 512 {
+        4
+    } else if n < 1024 {
+        2
+    } else {
+        1
+    }
+}
+
+pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     let nld = ((n + 511) / 512) as usize;
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::Default);
