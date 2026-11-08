@@ -4,7 +4,7 @@
 //! * `reshape_cache_flash_bf16_h<Hk>_d<D>`: ABI k @0, v @8, key_cache @16, value_cache @24, slot_mapping @32, T @40 (i32), S @44 (i32, slots of the cache). Caches of any size
 //!   (up to 2^31 slots): the cache descriptors are moved to the token's slot row with a 64-bit `ptr_mad` (num_records = one row).
 
-use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd};
+use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
 use amdgpu_tile::prims::{abs_f32, bf16x8_to_f32, fp8_pack, fp8_scale, group_reduce_dpp, lane_reduce, RedOp};
 use amdgpu_tile::ev;
 
