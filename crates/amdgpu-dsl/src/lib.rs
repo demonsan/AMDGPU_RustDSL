@@ -912,6 +912,16 @@ impl Frame {
     }
 }
 
+/// Does the node contain a tile region?
+fn contains_region(n: &Node) -> bool {
+    match n {
+        Node::S(_) => false,
+        Node::Region { .. } => true,
+        Node::Loop { body, .. } | Node::Stage { body, .. } => body.iter().any(contains_region),
+        Node::If { then, els, .. } => then.iter().any(contains_region) || els.iter().flatten().any(contains_region),
+    }
+}
+
 /// Region-tree construction shared by the builder and `Function::parse_flat`.
 #[derive(Clone, Debug, Default)]
 struct TreeBuilder {
@@ -1125,7 +1135,14 @@ pub struct FnBuilder {
     tree: TreeBuilder,
     /// constants materialised by the expression layer (`expr.rs`), keyed by (is_float, bits): reused by later `bind`s in the same or an inner scope, cleared when a scope closes
     pub(crate) expr_consts: std::collections::HashMap<(bool, u32), ValueId>,
+    /// capture mode (`capture_begin`): the region trees the open captures replaced (innermost last)
+    captures: Vec<TreeBuilder>,
 }
+
+/// Handle of an open capture (`FnBuilder::capture_begin`); closed by `capture_end` in LIFO order.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub struct CaptureId(usize);
 
 impl FnBuilder {
     pub fn new(name: &str, workgroup_size: u32) -> Self {
@@ -1149,6 +1166,7 @@ impl FnBuilder {
             reg_plan: Vec::new(),
             },
             expr_consts: Default::default(),
+            captures: Vec::new(),
             tree: TreeBuilder::default(),
         }
     }
@@ -1496,10 +1514,63 @@ impl FnBuilder {
     }
 
     pub fn finish(mut self) -> Function {
+        assert!(self.captures.is_empty(), "kernel `{}`: {} capture(s) still open at finish()", self.f.name, self.captures.len());
         let tree = std::mem::take(&mut self.tree);
         let body = tree.finish().unwrap_or_else(|e| panic!("kernel `{}`: {e}", self.f.name));
         self.f.set_body(body);
         self.f
+    }
+
+    // ---- capture mode (docs/weave-capture.md) ----
+
+    /// Starts capturing: the statements emitted from now on (and the regions opened AND closed meanwhile) go into a detached buffer instead
+    /// of the current block. Ids are allocated as usual, so values defined inside are usable by later code once the capture is spliced
+    /// before it (the weaver orders by the dependency facts, `facts::must_order`). Captures nest (LIFO).
+    pub fn capture_begin(&mut self) -> CaptureId {
+        let inner = TreeBuilder { count: self.tree.count, barriers: self.tree.barriers, ..Default::default() };
+        let outer = std::mem::replace(&mut self.tree, inner);
+        self.captures.push(outer);
+        CaptureId(self.captures.len())
+    }
+
+    /// Ends the capture `id` (the innermost open one) and returns its statements; the regions opened inside must be closed.
+    pub fn capture_end(&mut self, id: CaptureId) -> Captured {
+        assert_eq!(id.0, self.captures.len(), "kernel `{}`: capture_end out of order (captures nest LIFO)", self.f.name);
+        let outer = self.captures.pop().expect("capture_end without capture_begin");
+        let inner = std::mem::replace(&mut self.tree, outer);
+        self.tree.count = inner.count;
+        self.tree.barriers = inner.barriers;
+        let nodes = inner.finish().unwrap_or_else(|e| panic!("kernel `{}`: capture: {e}", self.f.name));
+        Captured { nodes }
+    }
+
+    /// Closure form: `(captured statements, closure result)`.
+    pub fn capture<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> (Captured, R) {
+        let id = self.capture_begin();
+        let r = f(self);
+        (self.capture_end(id), r)
+    }
+
+    /// Appends captured statements to the current block (in their captured order). Splicing every capture once, in capture order, gives
+    /// exactly the function a direct build gives.
+    pub fn splice(&mut self, c: Captured) {
+        self.splice_nodes(c.nodes);
+    }
+
+    /// Appends nodes (of one or more captures, in a chosen order) to the current block. A tile region may not be spliced into an open tile region.
+    pub fn splice_nodes(&mut self, nodes: impl IntoIterator<Item = Node>) {
+        let in_region = self.tree.open.iter().any(|f| matches!(f, Frame::Region { .. }));
+        for n in nodes {
+            if in_region && contains_region(&n) {
+                panic!("kernel `{}`: splicing a tile region into an open tile region", self.f.name);
+            }
+            self.tree.cur().push(n);
+        }
+    }
+
+    /// Dependency facts of captured statements in this function (value types known).
+    pub fn facts(&self, c: &Captured) -> Vec<facts::Facts> {
+        c.facts(&self.f)
     }
 
     /// Statements of the flat view emitted so far (markers included).
@@ -2945,6 +3016,8 @@ pub fn verify(f: &Function) -> Vec<String> {
 /// Kernel definitions built with this DSL.
 pub mod expr;
 pub mod print;
+pub mod facts;
+pub use facts::Captured;
 pub mod ir_text;
 mod ir_codec;
 pub mod specialize;
