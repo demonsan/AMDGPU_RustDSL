@@ -1137,6 +1137,9 @@ pub struct FnBuilder {
     pub(crate) expr_consts: std::collections::HashMap<(bool, u32), ValueId>,
     /// capture mode (`capture_begin`): the region trees the open captures replaced (innermost last)
     captures: Vec<TreeBuilder>,
+    /// register views of loop variables: a value defined by a lane / slice / bitcast of a variable (transitively) lowers to an alias of the
+    /// variable's registers (no instruction), so every user of the value reads the variable at the user's position (`facts`)
+    views: std::collections::HashMap<ValueId, Vec<VarId>>,
 }
 
 /// Handle of an open capture (`FnBuilder::capture_begin`); closed by `capture_end` in LIFO order.
@@ -1167,6 +1170,7 @@ impl FnBuilder {
             },
             expr_consts: Default::default(),
             captures: Vec::new(),
+            views: Default::default(),
             tree: TreeBuilder::default(),
         }
     }
@@ -1337,6 +1341,20 @@ impl FnBuilder {
     pub fn let_(&mut self, op: Op) -> ValueId {
         let ty = op.result_ty();
         let dst = self.f.value_tys.len() as ValueId;
+        let of = |o: &Opnd, views: &std::collections::HashMap<ValueId, Vec<VarId>>| match o {
+            Opnd::Var(v) => vec![*v],
+            Opnd::Val(x) => views.get(x).cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let vv = match &op {
+            Op::Frag2Lane { frag, .. } | Op::Frag4Lane { frag, .. } | Op::Frag16Lane { frag, .. } => of(frag, &self.views),
+            Op::BitcastF32(a) | Op::BitcastI32(a) => of(a, &self.views),
+            Op::VarSlice8 { var, .. } => vec![*var],
+            _ => Vec::new(),
+        };
+        if !vv.is_empty() {
+            self.views.insert(dst, vv);
+        }
         self.f.value_tys.push(ty);
         self.push_stmt(Stmt::Let { dst, op });
         dst
@@ -1568,9 +1586,26 @@ impl FnBuilder {
         }
     }
 
-    /// Dependency facts of captured statements in this function (value types known).
+    /// Dependency facts of captured statements in this function (value types known). A use of a register view of a loop variable (a lane /
+    /// slice / bitcast of it, no instruction of its own) is also a READ of the variable: the user reads the registers at its own position.
     pub fn facts(&self, c: &Captured) -> Vec<facts::Facts> {
-        c.facts(&self.f)
+        let mut fs = c.facts(&self.f);
+        for f in fs.iter_mut() {
+            for u in f.uses.clone() {
+                if let Some(vs) = self.views.get(&u) {
+                    for v in vs {
+                        if !f.var_reads.contains(v) {
+                            f.var_reads.push(*v);
+                        }
+                    }
+                }
+            }
+        }
+        fs
+    }
+    /// The loop variables a value is a register view of (empty when it is a value of its own).
+    pub fn view_vars(&self, v: ValueId) -> &[VarId] {
+        self.views.get(&v).map_or(&[], |x| x.as_slice())
     }
 
     /// Statements of the flat view emitted so far (markers included).
