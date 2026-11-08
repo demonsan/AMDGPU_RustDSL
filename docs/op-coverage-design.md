@@ -606,6 +606,15 @@
 - **paged decode `pa_decode16_bf16_hd128_p<P>`**，见 [`fmha/decode16.rs`](../crates/amdgpu-kernels/src/fmha/decode16.rs)。
   - 用于 G ≤ 16：每个 wave 改用 16x16x32 MFMA，消除 32 行形式下 3/4 的空算。
   - 速度从 0.51× 提到 0.62×。
+  - 敏感性实验：去掉 PV 只快 6%；去掉 DMA 后时间减半。瓶颈是访存延迟没有被隐藏：每 CU 只有 4 个 wave，且每个 wave 内 DMA 与计算串行。
+  - 于是加入 32 key 的 tile（每个 wave 的私有区 16 KB，每 CU 可驻留 2 个 CTA），与 64 key 版（`_k64`）并存，由 [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `decode16_config` 按 B·HK 选择 tile 大小和切分数 S。
+  - 实测：
+
+    | 形状（B / H / HK / ctx） | 配置 | ours | 厂商 | 比 |
+    |---|---|--:|--:|--:|
+    | 16 / 64 / 8 / 4096 | 32 key，S=4 | 4056 GB/s | 6018 | 0.67× |
+    | 64 / 64 / 8 / 2048 | 32 key，S=1 | 4182 GB/s | 5392 | 0.78× |
+    | 4 / 32 / 4 / 8192 | 64 key，S=8 | 1352 GB/s | 1303 | 1.04× |
   - block-table 查表批量化：0.37× → 0.51×。
 - **MoE stage 2**：
   - bf16 原子累加：更慢（1528 vs 672 µs），且精度更差，未采纳。
