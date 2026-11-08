@@ -48,7 +48,8 @@ fn a_lane_of_a_slice_view_keeps_the_slice_offset() {
     b.arg("p", DType::Ptr, 0, 8);
     b.arg_tensor("p", amdgpu_dsl::Ext::Const(4096));
     let p = b.let_(Op::KernargPtr { offset: 0 });
-    let z = b.frag_zero(DType::Frag8);
+    let z4 = b.frag_zero(DType::Frag4);
+    let z = b.cat_frag8(z4, z4);
     let vars = b.begin_loop(&[(DType::Frag8, Opnd::Val(z)), (DType::I32, Opnd::I32(0))]);
     let sl = b.var_slice4(vars[0], 1);
     let x = b.frag4_lane(sl, 2);
