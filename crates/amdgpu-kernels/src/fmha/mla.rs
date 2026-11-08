@@ -149,18 +149,34 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     // no branch around the loop: an empty part runs one fully masked tile (P = 0, l = 0) and the epilogue writes O = 0, LSE = -inf (the
     // previous if / else form hit a backend bug: a constant register materialised only on the then path was read on the else path)
     let nloop = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(5).max(1)); b.read_first_lane(v) };
+    // the block-table entry of key l % 32 of tile t (the lane's page), loaded one tile ahead (loop-carried; the load of tile t + 1 is issued
+    // at the start of tile t and lands during it)
+    let bt_load = |b: &mut FnBuilder, tile: ValueId| -> (ValueId, ValueId) {
+        let key_t = b.bind_i32(ev(k_lo) + (ev(tile) << 5));
+        let kl = b.bind_i32((ev(key_t) + (lane.lane() & 31)).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
+        let bvo = b.bind_i32(ev(kl).lshr(page.trailing_zeros() as i32) << 2);
+        (kl, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
+    };
+    let t0 = b.c_i32(0);
+    let (_, pg0) = bt_load(&mut b, t0);
+    inits.push((DType::F32, Opnd::Val(pg0)));
     let vars = b.begin_loop(&inits);
+    let pg_v = vars[5 + DB];
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..3 + DB].to_vec();
     let sv_: Vec<VarId> = vars[3 + DB..5 + DB].to_vec();
     let itx = amdgpu_dsl::varx(it);
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << 5)); b.read_first_lane(v) };
     b.wait_lds(0);
-    // the row base of key l % 32 of the tile (one block-table load per lane), shared by ds_bpermute
+    // the row base of key l % 32 of the tile (its page was loaded during the previous tile), shared by ds_bpermute
     let kl = b.bind_i32((ev(key_t) + (lane.lane() & 31)).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
-    let bvo = b.bind_i32(ev(kl).lshr(page.trailing_zeros() as i32) << 2);
-    let pv = b.buffer_load_f32(r_bt, bvo, bt_so, 0);
-    let pg = b.bitcast_i32(pv);
+    let pg = b.bitcast_i32(Opnd::Var(pg_v));
+    {
+        let itn = b.bind_i32((itx.clone() + 1).min(ev(nloop) - 1));
+        let (_, pn) = bt_load(&mut b, itn);
+        let pn = b.inplace(pn);
+        b.set_var(pg_v, pn);
+    }
     let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
     let rowb = b.bind_i32((ev(pg) * page + (ev(kl) & (page - 1))) * ROW);
     // per half: 18 issues of 1 KB (chunk c = 72 key + position, key < 16), row bases by ds_bpermute from lane 16 h + key
