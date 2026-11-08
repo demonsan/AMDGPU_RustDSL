@@ -18,7 +18,7 @@ use amdgpu_tile::{ev, LdsPlan, Lane};
 
 const D: i32 = 128;
 const ROW: i32 = 2 * D;
-const KT: i32 = 32;
+const KT: i32 = 64;
 
 pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     assert!(page.count_ones() == 1, "page size: a power of two");
@@ -101,12 +101,11 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
         let v = b.bind_i32(sv.gt(8).select_i32(4, s3) + 2);
         b.read_first_lane(v)
     };
-    let ntt = b.bind_i32((ev(ctx) + (KT - 1)).lshr(5));
-    let per = b.bind_i32(((ev(ntt) + ev(nsplit) - 1).lshr(ev(lg))) << 5);
+    let ntt = b.bind_i32((ev(ctx) + (KT - 1)).lshr(6));
+    let per = b.bind_i32(((ev(ntt) + ev(nsplit) - 1).lshr(ev(lg))) << 6);
     let k_lo = { let v = b.bind_i32(ev(ns) * ev(per)); b.read_first_lane(v) };
     let k_hi = { let v = b.bind_i32((ev(k_lo) + ev(per)).min(ev(ctx))); b.read_first_lane(v) };
-    let ntile = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(5)); b.read_first_lane(v) };
-    let npair = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (2 * KT - 1)).max(0).lshr(6)); b.read_first_lane(v) };
+    let ntile = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(6)); b.read_first_lane(v) };
 
     // ---- descriptors ----
     let r_q = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_q, n) };
@@ -122,13 +121,12 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     let c0 = b.c_i32(0);
     let qf: Vec<ValueId> = (0..D / 16).map(|c| b.buffer_load_b128(r_q, q_vo, c0, (32 * c) as u32)).collect();
 
-    // ---- private LDS: per wave a 2-slot ring of 32-key tiles, slot = K (8 KB) + V (8 KB) ----
+    // ---- private LDS: per wave K (16 KB) + V (16 KB) ----
     let mut lds = LdsPlan::new();
-    let kv0 = lds.private("KV0", 2 * (KT * ROW) as i64, 4, &[]);
-    let kv1 = lds.private("KV1", 2 * (KT * ROW) as i64, 4, &[]);
+    let kv = lds.private("KV", 2 * (KT * ROW) as i64, 4, &[]);
     lds.commit(&mut b);
-    let mes = [kv0.mine(wv), kv1.mine(wv)];
-    let mbases = [mes[0].base(), mes[1].base()];
+    let me = kv.mine(wv);
+    let mbase = me.base();
     // DMA of the wave's tile: 16 KB per tensor = 16 issues of 1 KB, issue i: keys 4 i + lane / 16, chunk lane % 16 (K source chunk XOR key % 16)
     let l16 = b.bind_i32(lane.lane() & 15);
     let kk_of = |i: i32| (lane.lane().lshr(4)) + 4 * i;
@@ -139,7 +137,7 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     let csc = b.mul_f32(scale, c_l2e);
     let neg_inf = b.c_f32(f32::NEG_INFINITY);
     let kind = MmaKind::new(MmaShape::M32N32K16, MmaTy::Bf16);
-    let tm = Tm { d: D, kind, csc, neg_inf, kr, vr, qf, nsb: 1 };
+    let tm = Tm { d: D, kind, csc, neg_inf, kr, vr, qf, nsb: 2 };
     let zero16 = b.frag_zero(DType::Frag16);
     let m_init = b.c_f32(-1.0e30);
     let l_init = b.c_f32(0.0);
@@ -147,62 +145,51 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     inits.extend((0..6).map(|_| (DType::Frag16, Opnd::Val(zero16))));
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
-    // DMA of a 32-key tile into slot `slot`: the 8 block-table lookups first (one round trip), then 16 DMAs
-    let stage = |b: &mut FnBuilder, tile: ValueId, slot: usize, gen: Opnd| {
-        let key_t = { let v = b.bind_i32(ev(k_lo) + (ev(tile) << 5)); b.read_first_lane(v) };
-        let lookups: Vec<(ValueId, ValueId)> = (0..8)
-            .map(|i| {
-                let key = b.bind_i32(ev(key_t) + kk_of(i));
-                // the page of the (clamped) key: rows past the context read a valid page, masked
-                let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
-                let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
-                (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
-            })
-            .collect();
-        let mb = mbases[slot].clone();
-        mes[slot].write(b, gen, |b| {
-            for (i, &(kc, pv)) in lookups.iter().enumerate() {
-                let i = i as i32;
-                let pg = b.bitcast_i32(pv);
-                let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
-                let rowoff = b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW);
-                let kvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4));
-                let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
-                let m0k = b.bind_i32(mb.clone() + (i << 10));
-                let m0v = b.bind_i32(mb.clone() + (KT * ROW + (i << 10)));
-                b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
-                b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
-            }
-        });
-    };
-    let t0 = b.c_i32(0);
-    stage(&mut b, t0, 0, Opnd::I32(0));
     let vars = b.begin_loop(&inits);
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..7].to_vec();
     let s_vars: Vec<VarId> = vars[7..9].to_vec();
     let itx = amdgpu_dsl::varx(it);
-    for slot in 0..2usize {
-        let tile = b.bind_i32((itx.clone() << 1) + slot as i32);
-        // this tile landed (and this wave's reads of the other slot are complete), then the next tile into the other slot overlaps the math
-        b.wait_vm(0);
-        b.wait_lds(0);
-        let last = b.bind_i32((ev(npair) << 1) - 1);
-        let nxt = b.bind_i32((ev(tile) + 1).min(ev(last)));
-        let gen_n = if slot == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
-        stage(&mut b, nxt, 1 - slot, gen_n);
-        let key0 = b.bind_i32(ev(k_lo) + (ev(tile) << 5) + (ev(half) << 2));
-        let keep = |b: &mut FnBuilder, off: i32| b.bind_cond((ev(key0) + off).lt(ev(k_hi)));
-        let kbase = mbases[slot].clone();
-        let vbase = mbases[slot].clone() + KT * ROW;
-        let me = &mes[slot];
-        tile_math(&mut b, &tm, kbase, vbase, Some((None, &keep)), m_v, l_v, &s_vars, &ov, &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)), &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)));
-    }
+    let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << 6)); b.read_first_lane(v) };
+    // ---- DMA the tile's K and V rows through the block table ----
+    b.wait_lds(0);
+    // the 16 block-table lookups first (one round trip), then the 32 DMAs
+    let lookups: Vec<(ValueId, ValueId)> = (0..16)
+        .map(|i| {
+            let key = b.bind_i32(ev(key_t) + kk_of(i));
+            // the page of the (clamped) key: rows past the context read a valid page, masked
+            let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
+            let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
+            (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
+        })
+        .collect();
+    me.write(&mut b, Opnd::Var(it), |b| {
+        for (i, &(kc, pv)) in lookups.iter().enumerate() {
+            let i = i as i32;
+            let pg = b.bitcast_i32(pv);
+            let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
+            let rowoff = b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW);
+            let kvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4));
+            let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
+            // M0: the wave's private slice (wave-uniform: the slice key is the readfirstlane'd wave index)
+            let m0k = b.bind_i32(mbase.clone() + (i << 10));
+            let m0v = b.bind_i32(mbase.clone() + (KT * ROW + (i << 10)));
+            b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
+            b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
+        }
+    });
+    b.wait_vm(0);
+    let key0 = b.bind_i32(ev(key_t) + (ev(half) << 2));
+    let keep = |b: &mut FnBuilder, off: i32| b.bind_cond((ev(key0) + off).lt(ev(k_hi)));
+    let kbase = mbase.clone();
+    let vbase = mbase.clone() + KT * ROW;
+    tile_math(&mut b, &tm, kbase, vbase, Some((None, &keep)), m_v, l_v, &s_vars, &ov, &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)), &|b, f| me.read_back(b, Opnd::Var(it), |b| f(b)));
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
-    let done = b.bind_cond(ev(it1).ge(ev(npair)));
+    let done = b.bind_cond(ev(it1).ge(ev(ntile)));
     b.break_if(done);
-    b.end_loop();    // ---- the split's partial: O / l (fp32) and LSE (ln); l = 0 (no visible key) -> O = 0, LSE = -inf ----
+    b.end_loop();
+    // ---- the split's partial: O / l (fp32) and LSE (ln); l = 0 (no visible key) -> O = 0, LSE = -inf ----
     let (la, lb) = b.permlane32_swap(Opnd::Var(l_v), Opnd::Var(l_v));
     let (la, lb) = (b.bitcast_f32(la), b.bitcast_f32(lb));
     let l_tot = b.add_f32(la, lb);
