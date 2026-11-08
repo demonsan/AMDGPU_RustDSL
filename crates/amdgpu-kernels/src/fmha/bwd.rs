@@ -315,7 +315,7 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
     abi(&mut b);
-    b.grid_is(0, Ext::ka(176).ceil_div(128));
+    b.grid_is(0, if causal { Ext::ka(176).ceil_div(128).ceil_div(2) } else { Ext::ka(176).ceil_div(128) });
     b.grid_is(1, Ext::ka(192));
     b.grid_is(2, Ext::sym("B"));
     let a = args(&mut b);
@@ -332,8 +332,6 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     let hkv = gqa_kv_head(&mut b, h, gqa, "HK");
     let hkv = b.read_first_lane(hkv);
     let half = b.bind_i32(lane.half());
-    let key = b.bind_i32((ev(kt) << 7) + (lane.wave() << 5) + lane.j());
-    let key_c = b.bind_i32(ev(key).min(ev(a.sk) - 1));
     let c0 = b.c_i32(0);
     let qbytes = { let v = b.bind_i32((ev(bat) + 1) * ev(a.sq) * ev(a.hq) * ROW); b.read_first_lane(v) };
     let kbytes = { let v = b.bind_i32((ev(bat) + 1) * ev(a.sk) * ev(a.hkn) * ROW); b.read_first_lane(v) };
@@ -341,10 +339,6 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     let (r_q, r_do) = (b.buffer_desc_dyn(a.p[0], qbytes), b.buffer_desc_dyn(a.p[3], qbytes));
     let (r_k, r_v) = (b.buffer_desc_dyn(a.p[1], kbytes), b.buffer_desc_dyn(a.p[2], kbytes));
     let (r_dk, r_dv) = (b.buffer_desc_dyn(a.p[7], dkbytes), b.buffer_desc_dyn(a.p[8], dkbytes));
-    // K / V fragments (B operands: lane = key, k = d 16 c + 8 h)
-    let k_vo = b.bind_i32(((ev(bat) * ev(a.sk) + ev(key_c)) * ev(a.hkn) + ev(hkv)) * ROW + (ev(half) << 4));
-    let kf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_k, k_vo, c0, (32 * c) as u32)).collect();
-    let vf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_v, k_vo, c0, (32 * c) as u32)).collect();
     let nl = { let v = b.bind_i32((ev(bat) + 1) * ev(a.hq) * ev(a.sq) << 2); b.read_first_lane(v) };
     let (r_l, r_d) = (b.buffer_desc_dyn(a.p[4], nl), b.buffer_desc_dyn(a.p[5], nl));
     let l_so = { let v = b.bind_i32((ev(bat) * ev(a.hq) + ev(h)) * ev(a.sq) << 2); b.read_first_lane(v) };
@@ -391,6 +385,27 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
                 .collect()
         })
         .collect();
+    // causal: the vendor's pairing - CTA x takes key tiles x and nk - 1 - x (equal work; the grid is halved)
+    let nk = { let v = b.bind_i32((ev(a.sk) + 127).lshr(7)); b.read_first_lane(v) };
+    let passes: Vec<(ValueId, Option<ValueId>)> = if causal {
+        let kb2 = { let v = b.bind_i32(ev(nk) - 1 - ev(kt)); b.read_first_lane(v) };
+        let second = b.bind_cond(ev(kb2).gt(ev(kt)));
+        vec![(kt, None), (kb2, Some(second))]
+    } else {
+        vec![(kt, None)]
+    };
+    for (kt, guard) in passes {
+    if let Some(g) = guard {
+        b.wait_lds(0);
+        b.barrier();
+        b.begin_if(Opnd::Val(g));
+    }
+    let key = b.bind_i32((ev(kt) << 7) + (lane.wave() << 5) + lane.j());
+    let key_c = b.bind_i32(ev(key).min(ev(a.sk) - 1));
+    // K / V fragments (B operands: lane = key, k = d 16 c + 8 h)
+    let k_vo = b.bind_i32(((ev(bat) * ev(a.sk) + ev(key_c)) * ev(a.hkn) + ev(hkv)) * ROW + (ev(half) << 4));
+    let kf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_k, k_vo, c0, (32 * c) as u32)).collect();
+    let vf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_v, k_vo, c0, (32 * c) as u32)).collect();
     // query range: causal queries q >= key - (SK - SQ) for the first key of the CTA
     let qt0 = if causal {
         let v = b.bind_i32(((ev(kt) << 7) - ev(a.sk) + ev(a.sq)).max(0).lshr(6));
@@ -544,5 +559,9 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         }
     }
     b.end_if();
+    if guard.is_some() {
+        b.end_if();
+    }
+    }
     b.finish()
 }
