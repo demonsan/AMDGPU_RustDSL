@@ -169,7 +169,7 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
     let ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
     let sl = { let v = b.bind_i32(ev(slot).max(0).min(ev(s_v) - 1)); b.read_first_lane(v) };
     // the block, clamped to the last whole block (S = NB BS by the ABI: a no-op for valid slots; it lets the verifier prove the block descriptor in bounds)
-    let blk = { let v = b.bind_i32(ev(sl).lshr(bsh).min(ev(s_v).lshr(bsh) - 1)); b.read_first_lane(v) };
+    let blk = { let v = b.bind_i32(ev(sl).lshr(bsh).min(ev(s_v).lshr(bsh) - 1).max(0)); b.read_first_lane(v) };
     let off = b.bind_i32(ev(sl) & (bs as i32 - 1));
     let blk_bytes = (bs * row) as u32;
     let bb = b.c_i32(blk_bytes as i32);
