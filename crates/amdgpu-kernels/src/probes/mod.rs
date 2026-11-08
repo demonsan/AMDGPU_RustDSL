@@ -2259,3 +2259,4 @@ pub fn probe_mfma_scale_opsel() -> Function {
 }
 
 pub mod handoff;
+pub mod tileops;

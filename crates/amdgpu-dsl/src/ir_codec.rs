@@ -158,6 +158,10 @@ impl FromIr for Op {
             "PkSubU16" => { v.expect_tuple("PkSubU16", 2)?; Ok(Op::PkSubU16(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?)) }
             "CvtPknormPair" => { v.expect_tuple("CvtPknormPair", 2)?; Ok(Op::CvtPknormPair(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?)) }
             "CvtP8x4FromU16" => { v.expect_tuple("CvtP8x4FromU16", 3)?; Ok(Op::CvtP8x4FromU16(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?)) }
+            "Un" => { v.expect_tuple("Un", 2)?; Ok(Op::Un(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?)) }
+            "Bin" => { v.expect_tuple("Bin", 3)?; Ok(Op::Bin(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?)) }
+            "Tri" => { v.expect_tuple("Tri", 4)?; Ok(Op::Tri(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?, FromIr::from_ir(v.item(3)?)?)) }
+            "Cmp" => { v.expect_struct("Cmp")?; Ok(Op::Cmp { pred: FromIr::from_ir(v.field("pred")?)?, ty: FromIr::from_ir(v.field("ty")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             other => Err(v.err(format!("unknown Op variant `{other}`"))),
         }
     }
@@ -247,6 +251,10 @@ impl IrIds for Op {
             Op::PkSubU16(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
             Op::CvtPknormPair(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
             Op::CvtP8x4FromU16(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
+            Op::Un(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
+            Op::Bin(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
+            Op::Tri(x0, x1, x2, x3) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); }
+            Op::Cmp { pred, ty, a, b } => { IrIds::ids(&mut (*pred), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
         }
     }
 }
@@ -777,6 +785,192 @@ impl IrIds for CompileProfile {
             CompileProfile::Combine => {}
             CompileProfile::Gemm => {}
             CompileProfile::Default => {}
+        }
+    }
+}
+
+impl FromIr for UnOp {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "FloorF32" => { v.expect_unit("FloorF32")?; Ok(UnOp::FloorF32) }
+            "CeilF32" => { v.expect_unit("CeilF32")?; Ok(UnOp::CeilF32) }
+            "TruncF32" => { v.expect_unit("TruncF32")?; Ok(UnOp::TruncF32) }
+            "RndneF32" => { v.expect_unit("RndneF32")?; Ok(UnOp::RndneF32) }
+            "FractF32" => { v.expect_unit("FractF32")?; Ok(UnOp::FractF32) }
+            "RsqF32" => { v.expect_unit("RsqF32")?; Ok(UnOp::RsqF32) }
+            "SqrtF32" => { v.expect_unit("SqrtF32")?; Ok(UnOp::SqrtF32) }
+            "SinF32" => { v.expect_unit("SinF32")?; Ok(UnOp::SinF32) }
+            "CosF32" => { v.expect_unit("CosF32")?; Ok(UnOp::CosF32) }
+            "CvtI32F32" => { v.expect_unit("CvtI32F32")?; Ok(UnOp::CvtI32F32) }
+            "CvtU32F32" => { v.expect_unit("CvtU32F32")?; Ok(UnOp::CvtU32F32) }
+            "CvtF32I32" => { v.expect_unit("CvtF32I32")?; Ok(UnOp::CvtF32I32) }
+            "CvtF32U32" => { v.expect_unit("CvtF32U32")?; Ok(UnOp::CvtF32U32) }
+            "CvtF32Ubyte0" => { v.expect_unit("CvtF32Ubyte0")?; Ok(UnOp::CvtF32Ubyte0) }
+            "CvtF32Ubyte1" => { v.expect_unit("CvtF32Ubyte1")?; Ok(UnOp::CvtF32Ubyte1) }
+            "CvtF32Ubyte2" => { v.expect_unit("CvtF32Ubyte2")?; Ok(UnOp::CvtF32Ubyte2) }
+            "CvtF32Ubyte3" => { v.expect_unit("CvtF32Ubyte3")?; Ok(UnOp::CvtF32Ubyte3) }
+            other => Err(v.err(format!("unknown UnOp variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for UnOp {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            UnOp::FloorF32 => {}
+            UnOp::CeilF32 => {}
+            UnOp::TruncF32 => {}
+            UnOp::RndneF32 => {}
+            UnOp::FractF32 => {}
+            UnOp::RsqF32 => {}
+            UnOp::SqrtF32 => {}
+            UnOp::SinF32 => {}
+            UnOp::CosF32 => {}
+            UnOp::CvtI32F32 => {}
+            UnOp::CvtU32F32 => {}
+            UnOp::CvtF32I32 => {}
+            UnOp::CvtF32U32 => {}
+            UnOp::CvtF32Ubyte0 => {}
+            UnOp::CvtF32Ubyte1 => {}
+            UnOp::CvtF32Ubyte2 => {}
+            UnOp::CvtF32Ubyte3 => {}
+        }
+    }
+}
+
+impl FromIr for BinOp {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "MinF32" => { v.expect_unit("MinF32")?; Ok(BinOp::MinF32) }
+            "MaxI32" => { v.expect_unit("MaxI32")?; Ok(BinOp::MaxI32) }
+            "MaxU32" => { v.expect_unit("MaxU32")?; Ok(BinOp::MaxU32) }
+            "MinU32" => { v.expect_unit("MinU32")?; Ok(BinOp::MinU32) }
+            "SubU32" => { v.expect_unit("SubU32")?; Ok(BinOp::SubU32) }
+            "MulU32U24" => { v.expect_unit("MulU32U24")?; Ok(BinOp::MulU32U24) }
+            "AshrI32" => { v.expect_unit("AshrI32")?; Ok(BinOp::AshrI32) }
+            "MulHiU32" => { v.expect_unit("MulHiU32")?; Ok(BinOp::MulHiU32) }
+            "MulHiI32" => { v.expect_unit("MulHiI32")?; Ok(BinOp::MulHiI32) }
+            "OrB32" => { v.expect_unit("OrB32")?; Ok(BinOp::OrB32) }
+            "PkAddF16" => { v.expect_unit("PkAddF16")?; Ok(BinOp::PkAddF16) }
+            "PkMulF16" => { v.expect_unit("PkMulF16")?; Ok(BinOp::PkMulF16) }
+            "PkMaxF16" => { v.expect_unit("PkMaxF16")?; Ok(BinOp::PkMaxF16) }
+            "PkMinF16" => { v.expect_unit("PkMinF16")?; Ok(BinOp::PkMinF16) }
+            other => Err(v.err(format!("unknown BinOp variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for BinOp {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            BinOp::MinF32 => {}
+            BinOp::MaxI32 => {}
+            BinOp::MaxU32 => {}
+            BinOp::MinU32 => {}
+            BinOp::SubU32 => {}
+            BinOp::MulU32U24 => {}
+            BinOp::AshrI32 => {}
+            BinOp::MulHiU32 => {}
+            BinOp::MulHiI32 => {}
+            BinOp::OrB32 => {}
+            BinOp::PkAddF16 => {}
+            BinOp::PkMulF16 => {}
+            BinOp::PkMaxF16 => {}
+            BinOp::PkMinF16 => {}
+        }
+    }
+}
+
+impl FromIr for TriOp {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "Min3F32" => { v.expect_unit("Min3F32")?; Ok(TriOp::Min3F32) }
+            "Med3F32" => { v.expect_unit("Med3F32")?; Ok(TriOp::Med3F32) }
+            "Min3I32" => { v.expect_unit("Min3I32")?; Ok(TriOp::Min3I32) }
+            "Max3I32" => { v.expect_unit("Max3I32")?; Ok(TriOp::Max3I32) }
+            "Med3I32" => { v.expect_unit("Med3I32")?; Ok(TriOp::Med3I32) }
+            "Min3U32" => { v.expect_unit("Min3U32")?; Ok(TriOp::Min3U32) }
+            "Max3U32" => { v.expect_unit("Max3U32")?; Ok(TriOp::Max3U32) }
+            "Med3U32" => { v.expect_unit("Med3U32")?; Ok(TriOp::Med3U32) }
+            "MadU32U24" => { v.expect_unit("MadU32U24")?; Ok(TriOp::MadU32U24) }
+            "LshlAddU32" => { v.expect_unit("LshlAddU32")?; Ok(TriOp::LshlAddU32) }
+            "Add3U32" => { v.expect_unit("Add3U32")?; Ok(TriOp::Add3U32) }
+            "BfeU32" => { v.expect_unit("BfeU32")?; Ok(TriOp::BfeU32) }
+            "BfeI32" => { v.expect_unit("BfeI32")?; Ok(TriOp::BfeI32) }
+            "BfiB32" => { v.expect_unit("BfiB32")?; Ok(TriOp::BfiB32) }
+            "PkFmaF16" => { v.expect_unit("PkFmaF16")?; Ok(TriOp::PkFmaF16) }
+            other => Err(v.err(format!("unknown TriOp variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for TriOp {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            TriOp::Min3F32 => {}
+            TriOp::Med3F32 => {}
+            TriOp::Min3I32 => {}
+            TriOp::Max3I32 => {}
+            TriOp::Med3I32 => {}
+            TriOp::Min3U32 => {}
+            TriOp::Max3U32 => {}
+            TriOp::Med3U32 => {}
+            TriOp::MadU32U24 => {}
+            TriOp::LshlAddU32 => {}
+            TriOp::Add3U32 => {}
+            TriOp::BfeU32 => {}
+            TriOp::BfeI32 => {}
+            TriOp::BfiB32 => {}
+            TriOp::PkFmaF16 => {}
+        }
+    }
+}
+
+impl FromIr for CmpPred {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "Lt" => { v.expect_unit("Lt")?; Ok(CmpPred::Lt) }
+            "Le" => { v.expect_unit("Le")?; Ok(CmpPred::Le) }
+            "Gt" => { v.expect_unit("Gt")?; Ok(CmpPred::Gt) }
+            "Ge" => { v.expect_unit("Ge")?; Ok(CmpPred::Ge) }
+            "Eq" => { v.expect_unit("Eq")?; Ok(CmpPred::Eq) }
+            "Ne" => { v.expect_unit("Ne")?; Ok(CmpPred::Ne) }
+            "Lg" => { v.expect_unit("Lg")?; Ok(CmpPred::Lg) }
+            "Uno" => { v.expect_unit("Uno")?; Ok(CmpPred::Uno) }
+            "Ord" => { v.expect_unit("Ord")?; Ok(CmpPred::Ord) }
+            other => Err(v.err(format!("unknown CmpPred variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for CmpPred {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            CmpPred::Lt => {}
+            CmpPred::Le => {}
+            CmpPred::Gt => {}
+            CmpPred::Ge => {}
+            CmpPred::Eq => {}
+            CmpPred::Ne => {}
+            CmpPred::Lg => {}
+            CmpPred::Uno => {}
+            CmpPred::Ord => {}
+        }
+    }
+}
+
+impl FromIr for CmpTy {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "F32" => { v.expect_unit("F32")?; Ok(CmpTy::F32) }
+            "I32" => { v.expect_unit("I32")?; Ok(CmpTy::I32) }
+            "U32" => { v.expect_unit("U32")?; Ok(CmpTy::U32) }
+            other => Err(v.err(format!("unknown CmpTy variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for CmpTy {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            CmpTy::F32 => {}
+            CmpTy::I32 => {}
+            CmpTy::U32 => {}
         }
     }
 }
