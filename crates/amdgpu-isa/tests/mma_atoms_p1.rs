@@ -45,3 +45,22 @@ fn fp4_atoms_are_contiguous_in_k_and_the_fp8_atom_is_split() {
         }
     }
 }
+
+/// The measured `ds_read_b64_tr_b16` map (probe_tr_b16_p1 printout: lane d gets element d % 4 of lanes 16 (d / 16) + (d % 16) / 4 + 4 e).
+#[test]
+fn tr_b16_formula_and_tv_agree() {
+    let tv = amdgpu_isa::tr_b16::dest_tv();
+    let mut seen = vec![false; 256];
+    for d in 0..64i64 {
+        for e in 0..4i64 {
+            let (s, h) = amdgpu_isa::tr_b16::source(d, e);
+            assert_eq!(tv.at(d + 64 * e), 4 * s + h, "lane {d} element {e}");
+            seen[(4 * s + h) as usize] = true;
+        }
+    }
+    assert!(seen.iter().all(|x| *x), "a permutation of the 256 source elements");
+    // spot values straight from the probe printout (dest lane: source lanes, element)
+    assert_eq!((0..4).map(|e| amdgpu_isa::tr_b16::source(5, e).0).collect::<Vec<_>>(), vec![1, 5, 9, 13]);
+    assert_eq!(amdgpu_isa::tr_b16::source(5, 0).1, 1);
+    assert_eq!((0..4).map(|e| amdgpu_isa::tr_b16::source(46, e).0).collect::<Vec<_>>(), vec![35, 39, 43, 47]);
+}

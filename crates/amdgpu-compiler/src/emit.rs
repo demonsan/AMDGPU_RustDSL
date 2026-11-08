@@ -229,7 +229,33 @@ fn mem_op(a: &Alloc, base: Src, off: i64) -> String {
     }
 }
 
+/// ` sc0 sc1 nt` cache-policy modifiers of a global / buffer access (`MInst::cpol`, LLVM CPol bits).
+fn cpol_suffix(c: u8) -> String {
+    let mut s = String::new();
+    if c & 1 != 0 {
+        s += " sc0";
+    }
+    // LLVM's order: sc0 nt sc1
+    if c & 2 != 0 {
+        s += " nt";
+    }
+    if c & 16 != 0 {
+        s += " sc1";
+    }
+    s
+}
+
 fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
+    let mut v = inst_lines_core(a, inst);
+    if inst.cpol != 0 {
+        if let Some(last) = v.last_mut() {
+            last.push_str(&cpol_suffix(inst.cpol));
+        }
+    }
+    v
+}
+
+fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
     let d = |a: &Alloc| vr(a, inst.dst.expect("dst"));
     match inst.op {
         MOp::VAccvgprRead => vec![format!("v_accvgpr_read_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
@@ -369,6 +395,41 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VCvtF16F32 => un(a, inst, "v_cvt_f16_f32_e32"),
         MOp::VAndB32 => bin(a, inst, "v_and_b32_e32"),
         MOp::VMinI32 => bin(a, inst, "v_min_i32_e32"),
+        MOp::VMovDppX => vec![format!("v_mov_b32_dpp {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), dpp_mods(inst.imm))],
+        MOp::VAddF32Dpp => vec![format!("v_add_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VSubF32Dpp => vec![format!("v_sub_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMulF32Dpp => vec![format!("v_mul_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMaxF32Dpp => vec![format!("v_max_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMinF32Dpp => vec![format!("v_min_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VAddU32Dpp => vec![format!("v_add_u32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMaxI32Dpp => vec![format!("v_max_i32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMinI32Dpp => vec![format!("v_min_i32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMaxU32Dpp => vec![format!("v_max_u32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMinU32Dpp => vec![format!("v_min_u32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VAndB32Dpp => vec![format!("v_and_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VOrB32Dpp => vec![format!("v_or_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VXorB32Dpp => vec![format!("v_xor_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VPermlane16Swap => vec![format!("v_permlane16_swap_b32_e32 {}, {}", vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])))],
+        MOp::VCvtPkF32Fp8 => vec![format!("v_cvt_pk_f32_fp8_sdwa {}, {} src0_sel:WORD_{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), inst.imm & 1)],
+        MOp::VCvtF32Fp8 => vec![format!("v_cvt_f32_fp8_sdwa {}, {} src0_sel:BYTE_{}", d(a), src1(a, inst.srcs[0]), inst.imm & 3)],
+        MOp::VCvtPkF32Bf8 => vec![format!("v_cvt_pk_f32_bf8_sdwa {}, {} src0_sel:WORD_{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), inst.imm & 1)],
+        MOp::VCvtF32Bf8 => vec![format!("v_cvt_f32_bf8_sdwa {}, {} src0_sel:BYTE_{}", d(a), src1(a, inst.srcs[0]), inst.imm & 3)],
+        MOp::VCvtPkBf8F32 => vec![format!("v_cvt_pk_bf8_f32 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 1 != 0 { " op_sel:[0,0,1]" } else { "" })],
+        MOp::VCvtScalePkBf16Fp8 => vec![format!("v_cvt_scalef32_pk_bf16_fp8 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 1 != 0 { " op_sel:[1,0,0]" } else { "" })],
+        MOp::VCvtScalePkF16Fp8 => vec![format!("v_cvt_scalef32_pk_f16_fp8 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 1 != 0 { " op_sel:[1,0,0]" } else { "" })],
+        MOp::VCvtScalePkBf16Bf8 => vec![format!("v_cvt_scalef32_pk_bf16_bf8 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 1 != 0 { " op_sel:[1,0,0]" } else { "" })],
+        MOp::VCvtScalePkF16Bf8 => vec![format!("v_cvt_scalef32_pk_f16_bf8 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 1 != 0 { " op_sel:[1,0,0]" } else { "" })],
+        MOp::VCvtScalePkF32Fp8 => vec![format!("v_cvt_scalef32_pk_f32_fp8 {}, {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 1 != 0 { " op_sel:[1,0,0]" } else { "" })],
+        MOp::VCvtScalePkF32Bf8 => vec![format!("v_cvt_scalef32_pk_f32_bf8 {}, {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 1 != 0 { " op_sel:[1,0,0]" } else { "" })],
+        MOp::VCvtScalePkF32Fp4 => vec![format!("v_cvt_scalef32_pk_f32_fp4 {}, {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 3 != 0 { format!(" op_sel:[{},{},0]", inst.imm & 1, (inst.imm >> 1) & 1) } else { String::new() })],
+        MOp::VCvtScalePkBf16Fp4 => vec![format!("v_cvt_scalef32_pk_bf16_fp4 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 3 != 0 { format!(" op_sel:[{},{},0]", inst.imm & 1, (inst.imm >> 1) & 1) } else { String::new() })],
+        MOp::VCvtScalePkF16Fp4 => vec![format!("v_cvt_scalef32_pk_f16_fp4 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 3 != 0 { format!(" op_sel:[{},{},0]", inst.imm & 1, (inst.imm >> 1) & 1) } else { String::new() })],
+        MOp::VCvtScalePkFp8F32 => vec![format!("v_cvt_scalef32_pk_fp8_f32 {}, {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), src1(a, inst.srcs[2]), if inst.imm & 1 != 0 { " op_sel:[0,0,0,1]" } else { "" })],
+        MOp::VCvtScalePkBf8F32 => vec![format!("v_cvt_scalef32_pk_bf8_f32 {}, {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), src1(a, inst.srcs[2]), if inst.imm & 1 != 0 { " op_sel:[0,0,0,1]" } else { "" })],
+        MOp::VCvtScalePkFp4F32 => vec![format!("v_cvt_scalef32_pk_fp4_f32 {}, {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), src1(a, inst.srcs[2]), if inst.imm & 3 != 0 { format!(" op_sel:[0,0,{},{}]", inst.imm & 1, (inst.imm >> 1) & 1) } else { String::new() })],
+        MOp::VCvtPkU8F32 => vec![format!("v_cvt_pk_u8_f32 {}, {}, {}, {}", d(a), src1(a, inst.srcs[0]), inst.imm & 3, src1(a, inst.srcs[1]))],
+        MOp::VCvtPkI16I32 => bin(a, inst, "v_cvt_pk_i16_i32"),
+        MOp::VCvtPkU16U32 => bin(a, inst, "v_cvt_pk_u16_u32"),
         MOp::VFloorF32 => un(a, inst, "v_floor_f32_e32"),
         MOp::VCeilF32 => un(a, inst, "v_ceil_f32_e32"),
         MOp::VTruncF32 => un(a, inst, "v_trunc_f32_e32"),
@@ -1010,4 +1071,28 @@ fn f8f6f4_fmt(imm: i64) -> String {
         s += &format!(" blgp:{b}");
     }
     s
+}
+
+/// DPP modifiers of a full control word (`MInst::imm` of the `*Dpp` ops: dpp_ctrl | (row_mask ^ 0xf) << 12 | (bank_mask ^ 0xf) << 16 | bound_zero << 20).
+fn dpp_mods(imm: i64) -> String {
+    let c = (imm & 0x1ff) as u32;
+    let ctrl = match c {
+        0..=0xff => format!("quad_perm:[{},{},{},{}]", c & 3, c >> 2 & 3, c >> 4 & 3, c >> 6 & 3),
+        0x101..=0x10f => format!("row_shl:{}", c - 0x100),
+        0x111..=0x11f => format!("row_shr:{}", c - 0x110),
+        0x121..=0x12f => format!("row_ror:{}", c - 0x120),
+        0x130 => "wave_shl:1".to_string(),
+        0x134 => "wave_rol:1".to_string(),
+        0x138 => "wave_shr:1".to_string(),
+        0x13c => "wave_ror:1".to_string(),
+        0x140 => "row_mirror".to_string(),
+        0x141 => "row_half_mirror".to_string(),
+        0x142 => "row_bcast:15".to_string(),
+        0x143 => "row_bcast:31".to_string(),
+        _ => format!("quad_perm:[0,1,2,3] /* bad dpp_ctrl {c:#x} */"),
+    };
+    let row = ((imm >> 12) & 0xf) ^ 0xf;
+    let bank = ((imm >> 16) & 0xf) ^ 0xf;
+    let bz = if (imm >> 20) & 1 != 0 { " bound_ctrl:1" } else { "" };
+    format!(" {ctrl} row_mask:{row:#x} bank_mask:{bank:#x}{bz}")
 }

@@ -135,6 +135,44 @@ pub enum MOp {
     VCvtF16F32,
     VAndB32,
     VMinI32,
+    // P1 A4: DPP with a full control word (imm: dpp_ctrl | row_mask^0xf << 12 | bank_mask^0xf << 16 | bound_zero << 20; srcs end with the old value),
+    // permlane16_swap
+    VMovDppX,
+    VAddF32Dpp,
+    VSubF32Dpp,
+    VMulF32Dpp,
+    VMaxF32Dpp,
+    VMinF32Dpp,
+    VAddU32Dpp,
+    VMaxI32Dpp,
+    VMinI32Dpp,
+    VMaxU32Dpp,
+    VMinU32Dpp,
+    VAndB32Dpp,
+    VOrB32Dpp,
+    VXorB32Dpp,
+    VPermlane16Swap,
+    // P1 A2 conversions (imm: word / byte select; partial writes keep the destination's other bits: srcs end with the old value)
+    VCvtPkF32Fp8,
+    VCvtF32Fp8,
+    VCvtPkF32Bf8,
+    VCvtF32Bf8,
+    VCvtPkBf8F32,
+    VCvtScalePkBf16Fp8,
+    VCvtScalePkF16Fp8,
+    VCvtScalePkBf16Bf8,
+    VCvtScalePkF16Bf8,
+    VCvtScalePkF32Fp8,
+    VCvtScalePkF32Bf8,
+    VCvtScalePkF32Fp4,
+    VCvtScalePkBf16Fp4,
+    VCvtScalePkF16Fp4,
+    VCvtScalePkFp8F32,
+    VCvtScalePkBf8F32,
+    VCvtScalePkFp4F32,
+    VCvtPkU8F32,
+    VCvtPkI16I32,
+    VCvtPkU16U32,
     // P1 A1 VALU (docs/op-coverage-tileops.md)
     VFloorF32,
     VCeilF32,
@@ -459,11 +497,13 @@ pub struct MInst {
     pub skip_m0: bool,
     /// The weave / stage region the instruction was lowered in (`MFunction::reg_hints.regions`, 1-based; 0 = none). No codegen effect.
     pub region: u16,
+    /// Cache policy of a global / buffer access, LLVM CPol bits on gfx950: 1 = sc0, 2 = nt, 16 = sc1 (0 = default).
+    pub cpol: u8,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0 }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, cpol: 0 }
     }
 
     pub fn def(mut self, r: VReg) -> Self {
@@ -486,6 +526,10 @@ impl MInst {
         self
     }
 
+    pub fn cpol(mut self, c: u8) -> Self {
+        self.cpol = c;
+        self
+    }
     pub fn imm(mut self, v: i64) -> Self {
         self.imm = v;
         self
