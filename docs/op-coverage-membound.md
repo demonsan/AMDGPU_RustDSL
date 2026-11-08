@@ -314,8 +314,9 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | fused qk rmsnorm（`fused_qk_rmsnorm`：q、k 各自整行归一化，一次启动） | 有（两次 rmsnorm 启动） | 只省一次启动，不新增 kernel；N = 1536 / 512 用 `rmsnorm_bf16_n<N>` |
 | | groupnorm（`groupnorm.cu`，视觉模型） | 缺 | 非推理热路径（LLM 推理里用不到），按需再做 |
 | 量化 | per-token / per-group128 / static fp8，int8 per-token，dequant | 有 | 见前文 |
-| | mxfp4 / mxfp6 量化（`quant_mxfp4.cu`，E8M0 缩放） | 缺 | 需要 e2m1 打包与 32 元素块的 E8M0 scale；`ScalePk*` cvt 已在 DSL 里，是下一批 |
-| | 融合进 norm 的 mxfp 量化 | 缺 | 依赖上一行 |
+| | mxfp4 / mxfp8 量化（`quant_mxfp4.cu`，E8M0 缩放，32 元素块） | 有（Main，kernel-opt） | `quant_mxfp4_bf16_k<K>`、`quant_mxfp8_bf16_k<K>`（`rows/mxquant.rs`，不在本分支，合入 Main 后可用） |
+| | mxfp6 量化 | 缺 | 与 mxfp4 同构（e2m3 / e3m2 打包），使用面窄 |
+| | 融合进 norm 的 mxfp4 量化 | 缺 | 复用 kernel-opt 的 `mxquant` 打包 / E8M0 scale 逻辑，在行内族的输出阶段接上，不另写实现；待 Main 合并后做 |
 | 融合激活 | silu_mul / gelu_tanh_mul（`[M][2D]`） | 有 | `silu_mul_bf16_d<D>`、`gelu_tanh_mul_bf16_d<D>`（6.5 TB/s） |
 | | silu_mul + fp8 量化 | 有 | `silu_mul_quant_fp8_d<D>` |
 | | **silu_and_mul 带 limit**（`x = min(x, limit)`, `y` 夹到 ±limit） | 有（新） | `silu_mul_limit_bf16_d<D>`，limit 是 kernarg（≤ 0 = 不限）；6.55 TB/s |
