@@ -216,6 +216,16 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
             e.global_read = true;
             ResClass::VmemLoad
         }
+        Op::AtomicLds { .. } => {
+            e.lds_read = true;
+            e.lds_write = true;
+            ResClass::LdsRead
+        }
+        Op::AtomicGlobal { .. } => {
+            e.global_read = true;
+            e.global_write = true;
+            ResClass::VmemLoad
+        }
         Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } => {
             e.lds_read = true;
             ResClass::LdsRead
@@ -280,6 +290,16 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             (ResClass::VmemStore, vec![], false)
         }
         Stmt::VarMfma { var, kind, zero, .. } => (ResClass::Mfma { passes: kind.passes() }, vec![*var], !*zero),
+        Stmt::AtomicLdsNoRet { .. } => {
+            e.lds_read = true;
+            e.lds_write = true;
+            (ResClass::LdsWrite, vec![], false)
+        }
+        Stmt::AtomicGlobalNoRet { .. } => {
+            e.global_read = true;
+            e.global_write = true;
+            (ResClass::VmemStore, vec![], false)
+        }
         Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => {
             e.lds_write = true;
             (ResClass::LdsWrite, vec![], false)

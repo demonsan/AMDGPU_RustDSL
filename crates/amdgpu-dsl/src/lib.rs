@@ -369,6 +369,16 @@ impl Dpp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DppAluOp { AddF32, SubF32, MulF32, MaxF32, MinF32, AddU32, MaxI32, MinI32, MaxU32, MinU32, AndB32, OrB32, XorB32 }
 
+/// Atomic read-modify-write operations (B3). `IncU32`: old >= value ? 0 : old + 1 (a wrapping counter).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AtomicOp { AddU32, MaxU32, MinU32, MaxI32, MinI32, IncU32, AddF32 }
+
+impl AtomicOp {
+    pub fn value_ty(self) -> DType {
+        if self == AtomicOp::AddF32 { DType::F32 } else { DType::U32 }
+    }
+}
+
 impl MemTy {
     pub fn bytes(self) -> u32 {
         match self {
@@ -612,6 +622,10 @@ pub enum Op {
     LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
     LoadLdsTrB16 { addr: Opnd },
+    /// LDS atomic returning the old value (`ds_<op>_rtn_*`)
+    AtomicLds { op: AtomicOp, addr: Opnd, value: Opnd },
+    /// global atomic returning the old value (`global_atomic_<op> ... sc0`)
+    AtomicGlobal { op: AtomicOp, base: Opnd, byte_off: u32, value: Opnd },
     /// `v_mov_b32_dpp`: lane i gets `x` of the lane `dpp.ctrl` names (lanes not written keep `old`)
     Dpp { dpp: Dpp, x: Opnd, old: Opnd },
     /// `v_<op>_dpp`: dpp(a) op b, lanes not written keep `old`
@@ -638,6 +652,7 @@ impl Op {
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
+            Op::AtomicLds { op, .. } | Op::AtomicGlobal { op, .. } => op.value_ty(),
             Op::DppAlu { op, .. } => match op {
                 DppAluOp::AddF32 | DppAluOp::SubF32 | DppAluOp::MulF32 | DppAluOp::MaxF32 | DppAluOp::MinF32 => DType::F32,
                 _ => DType::I32,
@@ -732,6 +747,8 @@ impl Op {
             Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } | Op::LoadLdsD16 { addr, .. } => vec![*addr],
             Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
             Op::Dpp { x, old, .. } => vec![*x, *old],
+            Op::AtomicLds { addr, value, .. } => vec![*addr, *value],
+            Op::AtomicGlobal { base, value, .. } => vec![*base, *value],
             Op::DppAlu { a, b, old, .. } => vec![*a, *b, *old],
             Op::Permlane16Swap { a, b } => vec![*a, *b],
             Op::Mfma { a, b, c, scale, .. } => {
@@ -1058,6 +1075,10 @@ pub enum Stmt {
     BufferStoreN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd, ty: MemTy, hi: bool, cache: CachePolicy },
     /// LDS store of any width (same `hi` rule)
     StoreLdsN { addr: Opnd, value: Opnd, ty: MemTy, hi: bool },
+    /// LDS atomic without return
+    AtomicLdsNoRet { op: AtomicOp, addr: Opnd, value: Opnd },
+    /// global atomic without return
+    AtomicGlobalNoRet { op: AtomicOp, base: Opnd, byte_off: u32, value: Opnd },
     /// `ds_write2[st64]_b32 / _b64`: `v0` at `addr + off0 * s`, `v1` at `addr + off1 * s`
     StoreLds2 { addr: Opnd, v0: Opnd, v1: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// In-place MFMA accumulate into a loop variable: var = A x B + var (`zero`: var = A x B)
@@ -2001,6 +2022,26 @@ impl FnBuilder {
         self.let_(Op::LoadLdsTrB16 { addr: addr.into() })
     }
 
+    /// LDS atomic: returns the old value (`ret`) or `None` (no-return form, cheaper).
+    pub fn atomic_lds(&mut self, op: AtomicOp, addr: impl Into<Opnd>, value: impl Into<Opnd>, ret: bool) -> Option<ValueId> {
+        let (addr, value) = (addr.into(), value.into());
+        if ret {
+            Some(self.let_(Op::AtomicLds { op, addr, value }))
+        } else {
+            self.push_stmt(Stmt::AtomicLdsNoRet { op, addr, value });
+            None
+        }
+    }
+    /// Global atomic: returns the old value (`ret`) or `None`.
+    pub fn atomic_global(&mut self, op: AtomicOp, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ret: bool) -> Option<ValueId> {
+        let (base, value) = (base.into(), value.into());
+        if ret {
+            Some(self.let_(Op::AtomicGlobal { op, base, byte_off, value }))
+        } else {
+            self.push_stmt(Stmt::AtomicGlobalNoRet { op, base, byte_off, value });
+            None
+        }
+    }
     /// `v_mov_b32_dpp` with a full DPP control; lanes not written keep `old`.
     pub fn dpp(&mut self, dpp: Dpp, x: impl Into<Opnd>, old: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Dpp { dpp, x: x.into(), old: old.into() })
@@ -3412,7 +3453,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
                 errs.extend(check_mfma(f, *kind, *a, *b, None, scale.as_ref()).into_iter().map(here));
             }
-            Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => {
+            Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::AtomicLdsNoRet { .. } | Stmt::AtomicGlobalNoRet { .. } => {
                 for o in stmt_operands(st) {
                     if let Opnd::Val(v) = o {
                         if !visible(&scopes, v) {
@@ -3833,6 +3874,8 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         }
         Stmt::StoreLdsN { addr, value, .. } => vec![*addr, *value],
         Stmt::StoreLds2 { addr, v0, v1, .. } => vec![*addr, *v0, *v1],
+        Stmt::AtomicLdsNoRet { addr, value, .. } => vec![*addr, *value],
+        Stmt::AtomicGlobalNoRet { base, value, .. } => vec![*base, *value],
         Stmt::VarMfma { a, b, scale, .. } => {
             let mut v = vec![*a, *b];
             if let Some(s) = scale {

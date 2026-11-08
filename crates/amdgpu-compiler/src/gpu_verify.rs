@@ -1003,6 +1003,11 @@ impl<'a> An<'a> {
             Op::LoadLdsN { addr, ty } => self.check_lds_at("ds_read", addr, ty.bytes() as i128),
             Op::LoadLdsD16 { addr, ty, .. } => self.check_lds_at("ds_read d16", addr, ty.bytes() as i128),
             Op::LoadLdsTrB16 { addr } => self.check_lds_at("ds_read_b64_tr_b16", addr, 8),
+            Op::AtomicLds { addr, .. } => self.check_lds_at("ds atomic (returning)", addr, 4),
+            Op::AtomicGlobal { base, byte_off, .. } => {
+                let b = self.av_of(base);
+                self.check_global("global atomic (returning)", &b, *byte_off as i128, 4, true);
+            }
             Op::LoadLds2 { addr, off0, off1, b64, st64 } => self.check_lds2("ds_read2", addr, *off0, *off1, *b64, *st64),
             _ => {}
         }
@@ -1410,6 +1415,11 @@ impl<'a> An<'a> {
                 self.check_buffer("buffer store", &r, voff, soff, *imm as i128, ty.bytes() as i128, true);
             }
             Stmt::StoreLdsN { addr, ty, .. } => self.check_lds_at("ds_write", addr, ty.bytes() as i128),
+            Stmt::AtomicLdsNoRet { addr, .. } => self.check_lds_at("ds atomic", addr, 4),
+            Stmt::AtomicGlobalNoRet { base, byte_off, .. } => {
+                let b = self.av_of(base);
+                self.check_global("global atomic", &b, *byte_off as i128, 4, true)
+            }
             Stmt::StoreLds2 { addr, off0, off1, b64, st64, .. } => self.check_lds2("ds_write2", addr, *off0, *off1, *b64, *st64),
             Stmt::BeginLoop { .. } => unreachable!("loops are walked by `walk_loop`"),
             Stmt::SetVar { var, value } => {
@@ -1981,7 +1991,8 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
         Stmt::BufferLoadLds { .. } | Stmt::LoadGlobalLds { .. } => (1, 0),
         Stmt::StoreLdsB32 { .. } | Stmt::StoreLdsB128 { .. } | Stmt::StoreLdsB64 { .. } => (0, 1),
         Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } => (1, 0),
-        Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => (0, 1),
+        Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::AtomicLdsNoRet { .. } => (0, 1),
+        Stmt::AtomicGlobalNoRet { .. } => (1, 0),
         Stmt::Let { op, .. } => match op {
             Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::LoadF32Coherent { .. } | Op::BufferLoad { .. } => (1, 0),
             Op::BufferLoadB128x2 { .. } => (2, 0),
@@ -1989,7 +2000,8 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
             Op::LoadLdsB128x2 { .. } => (0, 2),
             Op::LoadLdsTr4B8 { .. } => (0, 4),
             Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => (1, 0),
-            Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } => (0, 1),
+            Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } | Op::AtomicLds { .. } => (0, 1),
+            Op::AtomicGlobal { .. } => (1, 0),
             _ => (0, 0),
         },
         _ => (0, 0),
