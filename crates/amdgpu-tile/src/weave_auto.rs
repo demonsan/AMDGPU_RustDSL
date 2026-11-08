@@ -518,7 +518,20 @@ pub fn items_from_nodes(f: &Function, cap: &Captured) -> (Vec<Item>, Vec<std::op
 /// The cost-based order of the top-level nodes of a capture (a permutation of `0..cap.nodes.len()`; every legal reorder by `facts::must_order`, mark-pair groups kept contiguous).
 pub fn auto_order_nodes(f: &Function, cap: &Captured, m: &Model) -> Vec<usize> {
     let (items, groups) = items_from_nodes(f, cap);
-    plan_items(&items, m).into_iter().flat_map(|g| groups[g].clone()).collect()
+    let order = plan_items(&items, m);
+    if std::env::var("AMDC_WEAVE_AUTO_VERBOSE").map_or(false, |v| !v.is_empty()) {
+        let fs = cap.facts(f);
+        let (c0, p0) = simulate_items(&items, &(0..items.len()).collect::<Vec<_>>(), m);
+        let (c1, p1) = simulate_items(&items, &order, m);
+        eprintln!("weave_auto: {} items; modelled cycles {c0} -> {c1}, peak live {p0} -> {p1}", items.len());
+        for (pos, &g) in order.iter().enumerate() {
+            let k = groups[g].start;
+            let e = &fs[k].eff;
+            let flags = format!("{}{}{}{}{}{}", if e.lds_read { "Lr " } else { "" }, if e.lds_write { "Lw " } else { "" }, if e.global_read || e.global_write { "G " } else { "" }, if e.anchor() { "ANCHOR " } else { "" }, if e.branch { "BRANCH " } else { "" }, if !fs[k].defs.is_empty() { "def" } else { "" });
+            eprintln!("  {pos:3} <- {g:3} {:?} {flags}", fs[k].class);
+        }
+    }
+    order.into_iter().flat_map(|g| groups[g].clone()).collect()
 }
 
 /// The modelled cycles / peak live dwords of the capture's nodes in the order `order` (node indices).
