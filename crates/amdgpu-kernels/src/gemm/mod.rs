@@ -1016,7 +1016,7 @@ impl Body {
         let body = |b: &mut FnBuilder, u: &mut Units| {
             // bf16 (two dependent K-half MFMAs per block): the blocks of a PAIR of rows form one unit (first halves of all, then second
             // halves), so a block's second MFMA issues 8 MFMAs after its first (4 per row left 120 s_nops of MFMA dependency stalls)
-            let rows_per_unit = if self.cfg.elem == Elem::Bf16 && nm % 2 == 0 { 2 } else if self.cfg.elem == Elem::Bf16W4 { nm } else { 1 };
+            let rows_per_unit = if self.cfg.elem == Elem::Bf16 && nm % 2 == 0 { 2 } else if self.cfg.elem == Elem::Bf16W4 { std::env::var("EXP_W4ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(nm) } else { 1 };
             for (lo, hi) in [(0, half), (half, nn)] {
                 for i0 in (0..nm).step_by(rows_per_unit) {
                     let rows = i0..i0 + rows_per_unit;
