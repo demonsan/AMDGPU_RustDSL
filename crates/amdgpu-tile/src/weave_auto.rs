@@ -11,6 +11,9 @@
 //! GEMM units.
 
 use crate::weave::{Hint, Unit, UnitClass, UnitId, Units};
+use amdgpu_dsl::facts::{self, Facts, ResClass};
+use amdgpu_dsl::{Captured, Function, Node};
+use std::collections::HashMap;
 
 /// What a unit issues (counts per instruction kind) - the input of the issue model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -29,6 +32,11 @@ pub struct UnitCost {
     pub mfma16: u32,
     /// LDS-DMA issues
     pub dma: u32,
+    /// generic ds_read (width unknown: statement facts)
+    pub lds: u32,
+    /// generic matrix instructions (statement facts): count and busy cycles each
+    pub xdl: u32,
+    pub xdl_busy: u32,
     /// the unit waits for everything outstanding first (barrier / counted wait / a branch with its own control flow)
     pub fence: bool,
 }
@@ -55,11 +63,13 @@ pub struct Model {
     pub reg_slack: i64,
     /// improvement passes of the local search
     pub passes: usize,
+    /// how far (positions) the local search moves an item
+    pub window: usize,
 }
 
 impl Model {
     pub fn gfx950() -> Model {
-        Model { issue_gap: 4, mfma_cycles: 64, mfma16_cycles: 32, mfma_latency: 84, mfma16_latency: 48, valu_latency: 8, ds_b128_latency: 144, ds_tr_latency: 125, ds_b32_latency: 64, lds_queue_depth: 8, lds_queue_penalty: 200, dma_issue: 24, branch_cost: 24, reg_slack: 16, passes: 24 }
+        Model { issue_gap: 4, mfma_cycles: 64, mfma16_cycles: 32, mfma_latency: 84, mfma16_latency: 48, valu_latency: 8, ds_b128_latency: 144, ds_tr_latency: 125, ds_b32_latency: 64, lds_queue_depth: 8, lds_queue_penalty: 200, dma_issue: 24, branch_cost: 24, reg_slack: 16, passes: 24, window: 40 }
     }
 }
 
@@ -139,6 +149,26 @@ fn reg_facts(u: &Unit<'_>) -> (i64, i64) {
     }
 }
 
+/// One schedulable item of the planner: a weave unit or a captured statement (or a group of statements that must not be split).
+#[derive(Clone, Debug, Default)]
+pub struct Item {
+    pub name: String,
+    pub cost: UnitCost,
+    /// items that must precede this one (ordering: data, memory, anchors, fences)
+    pub deps: Vec<usize>,
+    /// the subset of `deps` whose RESULT this item waits for (data dependences; the timing gate)
+    pub tdeps: Vec<usize>,
+    /// anchors and branches: the local search does not move them
+    pub fixed: bool,
+    /// waits for everything outstanding before it issues (barrier, counted wait, branch)
+    pub drain: bool,
+    /// value-level register model: (value, dwords) defined / values read; both empty = the `delta` / `temps` model
+    pub defs: Vec<(u32, i64)>,
+    pub uses: Vec<u32>,
+    pub delta: i64,
+    pub temps: i64,
+}
+
 #[derive(Clone)]
 struct State {
     t: i64,
@@ -156,174 +186,197 @@ impl State {
         State { t: 0, mfma_free: 0, lds: Vec::new(), last_lds: 0, all_ready: 0, ready: vec![0; n] }
     }
 
-    /// Issues unit `i` (its ops in the order: LDS, DMA, SALU, VALU, MFMA) and records when its result is readable.
-    fn step(&mut self, i: usize, u: &Unit<'_>, c: &UnitCost, m: &Model) {
-        let mut gate = u.deps.iter().map(|&d| self.ready[d]).max().unwrap_or(0);
-        if c.fence {
+    fn lds_op(&mut self, t: i64, lat: i64, m: &Model) -> i64 {
+        self.lds.retain(|&x| x > t);
+        let pen = if self.lds.len() >= m.lds_queue_depth { m.lds_queue_penalty } else { 0 };
+        let comp = (t + lat + pen).max(self.last_lds);
+        self.last_lds = comp;
+        self.lds.push(comp);
+        comp
+    }
+
+    /// Issues item `i` (its ops in the order: LDS, DMA, SALU, VALU, MFMA) and records when its result is readable.
+    fn step(&mut self, i: usize, it: &Item, m: &Model) {
+        let c = &it.cost;
+        let mut gate = it.tdeps.iter().map(|&d| self.ready[d]).max().unwrap_or(0);
+        if it.drain || c.fence {
             gate = gate.max(self.all_ready).max(self.last_lds).max(self.mfma_free);
         }
         let mut t = self.t.max(gate);
-        let mut last_kind = 0; // 0 = other, 1 = valu, 2 = lds, 3 = mfma, 4 = mfma16
         let mut result = t;
-        macro_rules! issue {
-            ($gap:expr) => {{
-                t += $gap;
-                t
-            }};
-        }
-        let mut lds_op = |this: &mut State, t: i64, lat: i64| -> i64 {
-            this.lds.retain(|&x| x > t);
-            let pen = if this.lds.len() >= m.lds_queue_depth { m.lds_queue_penalty } else { 0 };
-            let comp = (t + lat + pen).max(this.last_lds);
-            this.last_lds = comp;
-            this.lds.push(comp);
-            comp
-        };
         for _ in 0..c.ds_b128 {
-            let ti = issue!(m.issue_gap);
-            result = lds_op(self, ti, m.ds_b128_latency);
-            last_kind = 2;
+            t += m.issue_gap;
+            result = self.lds_op(t, m.ds_b128_latency, m);
+        }
+        for _ in 0..c.lds {
+            t += m.issue_gap;
+            result = self.lds_op(t, m.ds_b128_latency, m);
         }
         for _ in 0..c.ds_tr {
-            let ti = issue!(m.issue_gap);
-            result = lds_op(self, ti, m.ds_tr_latency);
-            last_kind = 2;
+            t += m.issue_gap;
+            result = self.lds_op(t, m.ds_tr_latency, m);
         }
         for _ in 0..c.ds_b32 {
-            let ti = issue!(m.issue_gap);
-            result = lds_op(self, ti, m.ds_b32_latency);
-            last_kind = 2;
+            t += m.issue_gap;
+            result = self.lds_op(t, m.ds_b32_latency, m);
         }
         for _ in 0..c.dma {
-            let ti = issue!(m.dma_issue);
-            self.lds.retain(|&x| x > ti);
-            result = ti;
-            last_kind = 0;
+            t += m.dma_issue;
+            self.lds.retain(|&x| x > t);
+            result = t;
         }
         for _ in 0..c.salu {
-            result = issue!(m.issue_gap);
-            last_kind = 0;
+            t += m.issue_gap;
+            result = t;
         }
         for _ in 0..c.valu {
-            result = issue!(m.issue_gap) + m.valu_latency;
-            last_kind = 1;
+            t += m.issue_gap;
+            result = t + m.valu_latency;
         }
         for _ in 0..c.valu8 {
-            result = issue!(2 * m.issue_gap) + m.valu_latency;
-            last_kind = 1;
+            t += 2 * m.issue_gap;
+            result = t + m.valu_latency;
         }
         for _ in 0..c.mfma {
             t = (t + m.issue_gap).max(self.mfma_free);
             self.mfma_free = t + m.mfma_cycles;
             result = t + m.mfma_latency;
-            last_kind = 3;
         }
         for _ in 0..c.mfma16 {
             t = (t + m.issue_gap).max(self.mfma_free);
             self.mfma_free = t + m.mfma16_cycles;
             result = t + m.mfma16_latency;
-            last_kind = 4;
         }
-        if c.fence {
+        for _ in 0..c.xdl {
+            t = (t + m.issue_gap).max(self.mfma_free);
+            self.mfma_free = t + c.xdl_busy as i64;
+            result = t + c.xdl_busy as i64 + (m.mfma_latency - m.mfma_cycles);
+        }
+        if it.drain || c.fence {
             t += m.branch_cost;
             result = result.max(t);
         }
-        let _ = last_kind;
         self.t = t;
         self.ready[i] = result.max(t);
         self.all_ready = self.all_ready.max(self.ready[i]);
     }
 }
 
-/// The modelled cycles of the units in `order` (from phase entry until every result is readable) and the peak extra live dwords.
-pub fn simulate(units: &Units<'_>, order: &[UnitId], m: &Model) -> (i64, i64) {
-    let mut s = State::new(units.len());
+/// The modelled cycles of `items` issued in `order` (from phase entry until every result is readable) and the peak live dwords the order adds.
+pub fn simulate_items(items: &[Item], order: &[usize], m: &Model) -> (i64, i64) {
+    let mut s = State::new(items.len());
+    let value_level = items.iter().any(|it| !it.defs.is_empty() || !it.uses.is_empty());
     let (mut live, mut peak) = (0i64, 0i64);
+    let mut dw: HashMap<u32, i64> = HashMap::new();
+    let mut remaining: HashMap<u32, u32> = HashMap::new();
+    if value_level {
+        for it in items {
+            for &(v, d) in &it.defs {
+                dw.insert(v, d);
+            }
+        }
+        for it in items {
+            for &u in &it.uses {
+                if dw.contains_key(&u) {
+                    *remaining.entry(u).or_insert(0) += 1;
+                }
+            }
+        }
+    }
     for &i in order {
-        let u = units.unit(i);
-        s.step(i, u, &estimate(u), m);
-        let (d, t) = reg_facts(u);
-        peak = peak.max(live + d.max(0) + t);
-        live += d;
-        peak = peak.max(live);
+        let it = &items[i];
+        s.step(i, it, m);
+        if value_level {
+            for &(_, d) in &it.defs {
+                live += d;
+            }
+            peak = peak.max(live + it.temps);
+            for u in &it.uses {
+                if let Some(r) = remaining.get_mut(u) {
+                    *r -= 1;
+                    if *r == 0 {
+                        live -= dw[u];
+                    }
+                }
+            }
+        } else {
+            peak = peak.max(live + it.delta.max(0) + it.temps);
+            live += it.delta;
+            peak = peak.max(live);
+        }
     }
     (s.all_ready.max(s.t), peak)
 }
 
-fn objective(units: &Units<'_>, order: &[UnitId], m: &Model, peak_cap: i64) -> i64 {
-    let (cyc, peak) = simulate(units, order, m);
+fn objective(items: &[Item], order: &[usize], m: &Model, peak_cap: i64) -> i64 {
+    let (cyc, peak) = simulate_items(items, order, m);
     cyc * 16 + (peak - peak_cap).max(0) * 4096
 }
 
-/// A topological order of `units` minimising the modelled cycles: a greedy list schedule (the ready unit that finishes issuing earliest), then a local search that moves single units to other legal positions
-/// while the objective improves. `Anchor` units stay where the greedy pass put them and nothing crosses a `fence` unit; the declaration order is the fallback and the register guard's reference.
-pub fn auto_order(units: &Units<'_>, m: &Model) -> Vec<UnitId> {
-    let n = units.len();
+/// A topological order of `items` minimising the modelled cycles: a greedy list schedule (the ready item that finishes issuing earliest), then a local search that moves single items to other legal
+/// positions (within `m.window`) while the objective improves. `fixed` items stay where the greedy pass put them; the declaration order is the fallback and the register guard's reference.
+pub fn plan_items(items: &[Item], m: &Model) -> Vec<usize> {
+    let n = items.len();
     if n < 3 {
         return (0..n).collect();
     }
-    let decl: Vec<UnitId> = (0..n).collect();
-    // effective dependences: the real ones plus the fences' - a fence unit follows every unit declared before it and precedes every unit declared after it
-    let is_fence = |i: usize| estimate(units.unit(i)).fence;
-    let ed: Vec<Vec<usize>> = (0..n)
-        .map(|i| {
-            let mut d = units.unit(i).deps.clone();
-            if is_fence(i) {
-                d.extend(0..i);
-            }
-            d.extend((0..i).filter(|&f| is_fence(f)));
-            d.sort_unstable();
-            d.dedup();
-            d
-        })
-        .collect();
-    let (_, decl_peak) = simulate(units, &decl, m);
+    let decl: Vec<usize> = (0..n).collect();
+    let (_, decl_peak) = simulate_items(items, &decl, m);
     let cap = decl_peak + m.reg_slack;
-    // greedy list schedule
     let mut done = vec![false; n];
     let mut st = State::new(n);
-    let mut order: Vec<UnitId> = Vec::with_capacity(n);
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut first_fixed = 0usize;
     while order.len() < n {
+        while first_fixed < n && (done[first_fixed] || !items[first_fixed].fixed) {
+            first_fixed += 1;
+        }
         let mut best: Option<(i64, usize)> = None;
         for i in 0..n {
-            if done[i] || ed[i].iter().any(|&d| !done[d]) {
+            if done[i] || items[i].deps.iter().any(|&d| !done[d]) {
                 continue;
             }
-            // anchors keep their declaration position relative to other anchors: only pick an anchor when it is the first unfinished anchor
-            if units.unit(i).hint == Hint::Anchor && (0..i).any(|j| !done[j] && units.unit(j).hint == Hint::Anchor) {
+            // fixed items keep their declaration order among themselves
+            if items[i].fixed && i != first_fixed {
                 continue;
             }
-            let u = units.unit(i);
             let mut t = st.clone();
-            t.step(i, u, &estimate(u), m);
+            t.step(i, &items[i], m);
             let key = t.t * 4096 + t.ready[i].min(4095);
             if best.map_or(true, |(k, _)| key < k) {
                 best = Some((key, i));
             }
         }
-        let (_, i) = best.expect("a ready unit (the dependences are acyclic by construction)");
-        let u = units.unit(i);
-        st.step(i, u, &estimate(u), m);
+        let (_, i) = best.expect("a ready item (the dependences are acyclic by construction)");
+        st.step(i, &items[i], m);
         done[i] = true;
         order.push(i);
     }
-    let mut best_cost = objective(units, &order, m, cap);
-    // the declaration order may already be better than the greedy one
-    let decl_cost = objective(units, &decl, m, cap);
+    let mut best_cost = objective(items, &order, m, cap);
+    let decl_cost = objective(items, &decl, m, cap);
     if decl_cost <= best_cost {
         order = decl;
         best_cost = decl_cost;
     }
+    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (j, it) in items.iter().enumerate() {
+        for &d in &it.deps {
+            consumers[d].push(j);
+        }
+    }
     for _ in 0..m.passes {
         let mut improved = false;
+        let mut pos = vec![0usize; n];
         for i in 0..n {
-            if units.unit(i).hint == Hint::Anchor {
+            for (q, &x) in order.iter().enumerate() {
+                pos[x] = q;
+            }
+            if items[i].fixed {
                 continue;
             }
-            let p = order.iter().position(|&x| x == i).unwrap();
-            // legal window: after the last dependency, before the first consumer, not across a fence unit
-            let lo = ed[i].iter().map(|&d| order.iter().position(|&x| x == d).unwrap() + 1).max().unwrap_or(0);
-            let hi = (0..n).filter(|&j| ed[j].contains(&i)).map(|j| order.iter().position(|&x| x == j).unwrap()).min().unwrap_or(n);
+            let p = pos[i];
+            let lo = items[i].deps.iter().map(|&d| pos[d] + 1).max().unwrap_or(0).max(p.saturating_sub(m.window));
+            let hi = consumers[i].iter().map(|&j| pos[j]).min().unwrap_or(n).min(p + m.window + 1);
             for q in lo..hi {
                 if q == p {
                     continue;
@@ -332,11 +385,14 @@ pub fn auto_order(units: &Units<'_>, m: &Model) -> Vec<UnitId> {
                 cand.remove(p);
                 let ins = if q > p { q - 1 } else { q };
                 cand.insert(ins.min(cand.len()), i);
-                let c = objective(units, &cand, m, cap);
+                let c = objective(items, &cand, m, cap);
                 if c < best_cost {
                     best_cost = c;
                     order = cand;
                     improved = true;
+                    for (q2, &x) in order.iter().enumerate() {
+                        pos[x] = q2;
+                    }
                     break;
                 }
             }
@@ -348,9 +404,149 @@ pub fn auto_order(units: &Units<'_>, m: &Model) -> Vec<UnitId> {
     order
 }
 
+// ---------------------------------------------------------------- weave units
+
+fn items_from_units(units: &Units<'_>) -> Vec<Item> {
+    let n = units.len();
+    let is_fence = |i: usize| estimate(units.unit(i)).fence;
+    (0..n)
+        .map(|i| {
+            let u = units.unit(i);
+            // effective ordering dependences: the real ones plus the fences' - a fence unit follows every unit declared before it and precedes every unit declared after it
+            let mut d = u.deps.clone();
+            if is_fence(i) {
+                d.extend(0..i);
+            }
+            d.extend((0..i).filter(|&f| is_fence(f)));
+            d.sort_unstable();
+            d.dedup();
+            let (delta, temps) = reg_facts(u);
+            Item { name: u.name.clone(), cost: estimate(u), deps: d, tdeps: u.deps.clone(), fixed: u.hint == Hint::Anchor, drain: false, delta, temps, ..Default::default() }
+        })
+        .collect()
+}
+
+/// The modelled cycles of the units in `order` and the peak extra live dwords.
+pub fn simulate(units: &Units<'_>, order: &[UnitId], m: &Model) -> (i64, i64) {
+    simulate_items(&items_from_units(units), order, m)
+}
+
+/// A topological order of the units of a phase minimising the modelled cycles (see [`plan_items`]); `Anchor` units stay where the greedy pass put them and nothing crosses a `fence` unit.
+pub fn auto_order(units: &Units<'_>, m: &Model) -> Vec<UnitId> {
+    plan_items(&items_from_units(units), m)
+}
+
+// ---------------------------------------------------------------- captured statements
+
+fn class_cost(c: ResClass) -> UnitCost {
+    let mut k = UnitCost::default();
+    match c {
+        ResClass::Mfma { passes } => {
+            k.xdl = 1;
+            k.xdl_busy = 4 * passes as u32;
+        }
+        ResClass::Valu => k.valu = 1,
+        ResClass::Trans => k.valu8 = 1,
+        ResClass::Salu | ResClass::LdsWrite | ResClass::VmemStore => k.salu = 1,
+        ResClass::LdsRead => k.lds = 1,
+        ResClass::VmemLoad | ResClass::Dma => k.dma = 1,
+        ResClass::Sync | ResClass::Asm => k.salu = 1,
+        ResClass::Marker => {}
+        ResClass::Region => k.valu = 8,
+    }
+    k
+}
+
+fn add_cost(a: &mut UnitCost, b: &UnitCost) {
+    a.ds_b128 += b.ds_b128;
+    a.ds_tr += b.ds_tr;
+    a.ds_b32 += b.ds_b32;
+    a.valu += b.valu;
+    a.valu8 += b.valu8;
+    a.salu += b.salu;
+    a.mfma += b.mfma;
+    a.mfma16 += b.mfma16;
+    a.dma += b.dma;
+    a.lds += b.lds;
+    a.xdl += b.xdl;
+    a.xdl_busy = a.xdl_busy.max(b.xdl_busy);
+}
+
+fn data_dep(a: &Facts, b: &Facts) -> bool {
+    let hits = |x: &[amdgpu_dsl::VarId], y: &[amdgpu_dsl::VarId]| x.iter().any(|v| y.contains(v));
+    b.uses.iter().any(|u| a.defs.contains(u)) || hits(&a.var_writes, &b.var_reads) || hits(&a.var_reads, &b.var_writes) || hits(&a.var_writes, &b.var_writes)
+}
+
+/// Items of a capture: the top-level nodes (weave-region mark pairs stay together as one item), their dependences from `facts::must_order`, their costs from the resource classes, the register model at value
+/// level. Returns the items and, per item, the node range it stands for.
+pub fn items_from_nodes(f: &Function, cap: &Captured) -> (Vec<Item>, Vec<std::ops::Range<usize>>) {
+    let groups = cap.groups();
+    let node_facts: Vec<Facts> = cap.facts(f);
+    let facts_of = |r: &std::ops::Range<usize>| -> Facts {
+        if r.len() == 1 {
+            node_facts[r.start].clone()
+        } else {
+            Captured { nodes: cap.nodes[r.clone()].to_vec() }.summary(f)
+        }
+    };
+    let gf: Vec<Facts> = groups.iter().map(facts_of).collect();
+    let mut items = Vec::with_capacity(groups.len());
+    for (gi, r) in groups.iter().enumerate() {
+        let fa = &gf[gi];
+        let mut cost = UnitCost::default();
+        for k in r.clone() {
+            add_cost(&mut cost, &class_cost(node_facts[k].class));
+        }
+        let mut deps = Vec::new();
+        let mut tdeps = Vec::new();
+        for gj in 0..gi {
+            if facts::must_order(&gf[gj], fa) {
+                deps.push(gj);
+                if data_dep(&gf[gj], fa) {
+                    tdeps.push(gj);
+                }
+            }
+        }
+        let drain = fa.eff.barrier || fa.eff.wait_lds.is_some() || fa.eff.wait_vm.is_some() || fa.eff.branch || fa.eff.asm;
+        let defs: Vec<(u32, i64)> = fa.defs.iter().map(|&v| (v as u32, facts::dwords(f.value_tys[v as usize]) as i64)).filter(|&(_, d)| d > 0).collect();
+        let uses: Vec<u32> = fa.uses.iter().map(|&v| v as u32).collect();
+        items.push(Item { name: format!("n{}", r.start), cost, deps, tdeps, fixed: fa.eff.anchor() || fa.eff.branch, drain, defs, uses, delta: 0, temps: 0 });
+    }
+    (items, groups)
+}
+
+/// The cost-based order of the top-level nodes of a capture (a permutation of `0..cap.nodes.len()`; every legal reorder by `facts::must_order`, mark-pair groups kept contiguous).
+pub fn auto_order_nodes(f: &Function, cap: &Captured, m: &Model) -> Vec<usize> {
+    let (items, groups) = items_from_nodes(f, cap);
+    plan_items(&items, m).into_iter().flat_map(|g| groups[g].clone()).collect()
+}
+
+/// The modelled cycles / peak live dwords of the capture's nodes in the order `order` (node indices).
+pub fn simulate_nodes(f: &Function, cap: &Captured, order: &[usize], m: &Model) -> (i64, i64) {
+    let (items, groups) = items_from_nodes(f, cap);
+    let gorder: Vec<usize> = order.iter().filter_map(|&k| groups.iter().position(|g| g.start == k)).collect();
+    simulate_items(&items, &gorder, m)
+}
+
+/// Reorders the nodes of `cap` (by `auto_order_nodes`) ready to be spliced.
+pub fn reorder(f: &Function, cap: Captured, m: &Model) -> Vec<Node> {
+    let ord = auto_order_nodes(f, &cap, m);
+    let mut slots: Vec<Option<Node>> = cap.nodes.into_iter().map(Some).collect();
+    ord.into_iter().map(|k| slots[k].take().expect("a permutation")).collect()
+}
+
 /// `AMDC_WEAVE_AUTO=<label>[,<label>..]` (or `*`): the phase labels whose weave uses `auto_order` instead of the declaration order (an A/B switch; an explicit `Weaver::order` is never overridden).
 pub fn env_enabled(label: &str) -> bool {
-    match std::env::var("AMDC_WEAVE_AUTO") {
+    env_label("AMDC_WEAVE_AUTO", label)
+}
+
+/// `AMDC_WEAVE_AUTO_STMT=<label>[,..]`: the same at STATEMENT granularity - the weave's units are captured and their statements reordered by `auto_order_nodes` (legality from the statement facts).
+pub fn env_stmt_enabled(label: &str) -> bool {
+    env_label("AMDC_WEAVE_AUTO_STMT", label)
+}
+
+fn env_label(var: &str, label: &str) -> bool {
+    match std::env::var(var) {
         Ok(v) if !v.is_empty() => v.split(',').any(|x| x.trim() == "*" || x.trim() == label),
         _ => false,
     }

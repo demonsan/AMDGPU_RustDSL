@@ -231,9 +231,17 @@ impl<'a> Weaver<'a> {
         if !label.is_empty() {
             b.weave_region_begin(&label);
         }
+        // experiment switch (statement granularity): capture the units' statements, reorder them by the cost model under the derived legality (`facts::must_order`), splice
+        let stmt = !self.explicit && !label.is_empty() && crate::weave_auto::env_stmt_enabled(&label);
+        let cap_id = if stmt { Some(b.capture_begin()) } else { None };
         for i in ord {
             let u = slots[i].take().expect("weave: unit emitted twice");
             (u.emit)(b);
+        }
+        if let Some(id) = cap_id {
+            let cap = b.capture_end(id);
+            let nodes = crate::weave_auto::reorder(&b.f, cap, &crate::weave_auto::Model::gfx950());
+            b.splice_nodes(nodes);
         }
         if !label.is_empty() {
             b.weave_region_end();
