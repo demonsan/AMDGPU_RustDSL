@@ -27,12 +27,13 @@ pub fn by_name(name: &str) -> Option<Function> {
 }
 
 // LDS: histogram 320 slots (256 bins + a per-lane sink 256 + lane), wave totals, result slots, two counters, the emit sink (one slot per thread)
-const HIST: i32 = 0;
-const WT: i32 = 1280;
-const RES: i32 = 1344;
-const CNT: i32 = 1360;
-const SINK: i32 = 1376;
-const LDS: u32 = 1376 + 4096;
+// (the histogram starts at 64: threads >= 256 read "bin -1" in the scan, which stays inside the segment; their value is masked)
+const HIST: i32 = 64;
+const WT: i32 = 1344;
+const RES: i32 = 1408;
+const CNT: i32 = 1424;
+const SINK: i32 = 1440;
+const LDS: u32 = 1440 + 4096;
 
 pub fn topk_per_row(name: &str, k: i64, prefill: bool) -> Function {
     let mut fb = FnBuilder::new(name, 1024);
