@@ -3206,7 +3206,7 @@ impl Lowerer {
             }
             Op::Frag2Lane { frag, index } => {
                 let f = self.as_v2(*frag)?;
-                let d = self.alias_vreg(f, *index, RClass::V1);
+                let d = self.sub_alias(f, *index, RClass::V1); // `f` may itself be a view (var_slice4 / frag_slice): keep its offset
                 self.val.insert(dst, d);
             }
             Op::Frag4(a, b, c, e) => {
@@ -3220,7 +3220,7 @@ impl Lowerer {
             }
             Op::Frag4Lane { frag, index } => {
                 let f = self.as_v4(*frag)?;
-                let d = self.alias_vreg(f, *index, RClass::V1);
+                let d = self.sub_alias(f, *index, RClass::V1); // `f` may itself be a view (var_slice4 / frag_slice): keep its offset
                 self.val.insert(dst, d);
             }
             Op::MfmaF16 { a, b, c } => {
@@ -3514,7 +3514,7 @@ impl Lowerer {
                     }
                     other => self.as_v16(*other)?,
                 };
-                let d = self.alias_vreg(f, *index, RClass::V1);
+                let d = self.sub_alias(f, *index, RClass::V1); // `f` may itself be a view (var_slice4 / frag_slice): keep its offset
                 self.val.insert(dst, d);
             }
             Op::Frag2Dup(a) => {
