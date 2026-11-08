@@ -65,7 +65,8 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
     let tid4 = b.bind_i32(ev(tid) << 2);
     let zero = b.c_i32(0);
     // 0. zero the counts (and the dummy slot)
-    b.store_lds(b.bind_i32(ev(tid4) + offa), zero, MemTy::B32, false);
+    let a_cnt = b.bind_i32(ev(tid4) + offa);
+    b.store_lds(a_cnt, zero, MemTy::B32, false);
     b.wait_lds(0);
     b.barrier();
     // 1. count the routed pairs per expert
@@ -105,58 +106,70 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
     b.wait_lds(0);
     b.barrier();
     // 2. padded counts and their inclusive prefix scan (Hillis-Steele in LDS)
-    let cnt = b.load_lds(b.bind_i32(ev(tid4) + offa), MemTy::B32);
+    let a_cnt2 = b.bind_i32(ev(tid4) + offa);
+    let cnt = b.load_lds(a_cnt2, MemTy::B32);
     b.wait_lds(0);
     let in_e = b.cmp(CmpPred::Lt, CmpTy::I32, tid, e as i32);
     let padded0 = b.bind_i32(((ev(cnt) + (bm - 1) as i32) >> (bm.trailing_zeros() as i32)) << (bm.trailing_zeros() as i32));
     let padded = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_e), a: Opnd::Val(padded0), b: Opnd::I32(0) });
-    b.store_lds(b.bind_i32(ev(tid4) + offs0), padded, MemTy::B32, false);
+    let a_s0 = b.bind_i32(ev(tid4) + offs0);
+    b.store_lds(a_s0, padded, MemTy::B32, false);
     b.wait_lds(0);
     b.barrier();
     let mut cur = offs0;
     let mut s = 1i32;
     while s < 512 {
         let nxt = if cur == offs0 { offs1 } else { offs0 };
-        let own = b.load_lds(b.bind_i32(ev(tid4) + cur), MemTy::B32);
+        let a_own = b.bind_i32(ev(tid4) + cur);
+        let own = b.load_lds(a_own, MemTy::B32);
         let prev_i = b.bind_i32(ev(tid) - s);
         let ok = b.cmp(CmpPred::Ge, CmpTy::I32, prev_i, 0);
         let pi = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(prev_i), b: Opnd::I32(0) });
-        let pv = b.load_lds(b.bind_i32((ev(pi) << 2) + cur), MemTy::B32);
+        let a_pv = b.bind_i32((ev(pi) << 2) + cur);
+        let pv = b.load_lds(a_pv, MemTy::B32);
         b.wait_lds(0);
         let add = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(pv), b: Opnd::I32(0) });
         let sum = b.add_i32(own, add);
-        b.store_lds(b.bind_i32(ev(tid4) + nxt), sum, MemTy::B32, false);
+        let a_nx = b.bind_i32(ev(tid4) + nxt);
+        b.store_lds(a_nx, sum, MemTy::B32, false);
         b.wait_lds(0);
         b.barrier();
         cur = nxt;
         s *= 2;
     }
-    let incl = b.load_lds(b.bind_i32(ev(tid4) + cur), MemTy::B32);
-    let total = b.load_lds(b.bind_i32(zero_plus(b, cur + 4 * (e as i32 - 1))), MemTy::B32);
+    let a_incl = b.bind_i32(ev(tid4) + cur);
+    let incl = b.load_lds(a_incl, MemTy::B32);
+    let a_tot = b.c_i32(cur + 4 * (e as i32 - 1));
+    let total = b.load_lds(a_tot, MemTy::B32);
     b.wait_lds(0);
-    let off_e = b.sub_i32(incl, padded);                                     // this expert's first padded position
-    b.store_lds(b.bind_i32(ev(tid4) + offc), off_e, MemTy::B32, false);
+    let off_e = b.bind_i32(ev(incl) - ev(padded));                                     // this expert's first padded position
+    let a_c = b.bind_i32(ev(tid4) + offc);
+    b.store_lds(a_c, off_e, MemTy::B32, false);
     // outputs that need only the scan: tile_start, num_valid_ids
     let tile0 = b.bind_i32(ev(off_e).lshr(bm.trailing_zeros() as i32));
     let ts_off = b.bind_i32(ev(tid4));
     let ts_ok = b.cmp(CmpPred::Lt, CmpTy::I32, tid, e as i32);
     let ts_o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ts_ok), a: Opnd::Val(ts_off), b: Opnd::Val(oob) });
-    b.buffer_store_f32(r_ts, ts_o, 0i32, 0, b.bitcast_f32(tile0));
+    let tile0_f = b.bitcast_f32(tile0);
+    b.buffer_store_f32(r_ts, ts_o, 0i32, 0, tile0_f);
     let is_e = b.cmp(CmpPred::Eq, CmpTy::I32, tid, e as i32);
     let tot_tiles = b.bind_i32(ev(total).lshr(bm.trailing_zeros() as i32));
     let te_o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is_e), a: Opnd::I32(4 * e as i32), b: Opnd::Val(oob) });
-    b.buffer_store_f32(r_ts, te_o, 0i32, 0, b.bitcast_f32(tot_tiles));
+    let tt_f = b.bitcast_f32(tot_tiles);
+    b.buffer_store_f32(r_ts, te_o, 0i32, 0, tt_f);
     let is0 = b.cmp(CmpPred::Eq, CmpTy::I32, tid, 0);
     let nv_o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::I32(0), b: Opnd::Val(oob) });
-    b.buffer_store_f32(r_nv, nv_o, 0i32, 0, b.bitcast_f32(total));
-    b.buffer_store_f32(r_nv, nv_o, 0i32, 4, b.bitcast_f32(m_v));
+    let total_f = b.bitcast_f32(total);
+    let m_f = b.bitcast_f32(m_v);
+    b.buffer_store_f32(r_nv, nv_o, 0i32, 0, total_f);
+    b.buffer_store_f32(r_nv, nv_o, 0i32, 4, m_f);
     // padding entries of this expert's group: positions off_e + cnt .. off_e + padded (< BM of them), and the tail past the used part
     let sent = b.bind_i32(((k as i32) << 24) + ev(m_v));
     let fzero = b.c_f32(0.0);
     let sent_f = b.bitcast_f32(sent);
-    let pad_n = b.sub_i32(padded, cnt);                                      // padded - cnt (0 for experts >= E since padded = 0 and cnt = dummy count: clamp)
+    let pad_n = b.bind_i32(ev(padded) - ev(cnt));                                      // padded - cnt (0 for experts >= E since padded = 0 and cnt = dummy count: clamp)
     let pad_n = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_e), a: Opnd::Val(pad_n), b: Opnd::I32(0) });
-    let start = b.add_i32(off_e, cnt);
+    let start = b.bind_i32(ev(off_e) + ev(cnt));
     b.loop_(&[(DType::I32, Opnd::I32(0))], |b, vars| {
         let r = vars[0];
         let done = b.let_(Op::CmpGeI32(Opnd::Var(r), Opnd::Val(pad_n)));
@@ -171,7 +184,8 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
     // tail: positions total .. max_padded, strided over the threads
     b.loop_(&[(DType::I32, Opnd::I32(0))], |b, vars| {
         let r = vars[0];
-        let p = b.bind_i32(ev(total) + ev(tid) + ev(r));
+        let r0 = b.let_(Op::AddI32(Opnd::Var(r), Opnd::Val(tid)));
+        let p = b.bind_i32(ev(total) + ev(r0));
         let done = b.let_(Op::CmpGeI32(Opnd::Val(p), Opnd::Val(maxp_v)));
         b.break_if(done);
         let o = b.bind_i32(ev(p) << 2);
@@ -197,7 +211,8 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
     let e_f = b.bitcast_f32(e_const);
     b.loop_(&[(DType::I32, Opnd::I32(0))], |b, vars| {
         let r = vars[0];
-        let j = b.bind_i32(ev(tot_tiles) + ev(tid) + ev(r));
+        let r0 = b.let_(Op::AddI32(Opnd::Var(r), Opnd::Val(tid)));
+        let j = b.bind_i32(ev(tot_tiles) + ev(r0));
         let done = b.let_(Op::CmpGeI32(Opnd::Val(j), Opnd::Val(ntiles_max)));
         b.break_if(done);
         let o = b.bind_i32(ev(j) << 2);
@@ -226,7 +241,12 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
         b.wait_lds(0);
         for (i, eid, inb, wf, pos) in items {
             // token = i / K, slot = i - token * K
-            let q = if k == 1 { i } else { b.bin(amdgpu_dsl::BinOp::MulHiU32, i, b.c_i32(magic as u32 as i32)) };
+            let q = if k == 1 {
+                i
+            } else {
+                let mg = b.c_i32(magic as u32 as i32);
+                b.bin(amdgpu_dsl::BinOp::MulHiU32, i, mg)
+            };
             let slot = b.bind_i32(ev(i) - ev(q) * k as i32);
             let packed = b.bind_i32((ev(slot) << 24) + ev(q));
             let valid = b.cmp(CmpPred::Ne, CmpTy::I32, eid, 1023);
