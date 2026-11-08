@@ -19,7 +19,7 @@
 | RoPE / cache | KV-cache 写（flash / vLLM 分块） | 5.8 / 0.9–1.5 TB/s | 分块布局的 value 是 2 字节散写，regular 策略，不是流式 |
 | MoE | topk_softmax（含 renorm） | E = 128, K = 8：T = 65536 为 21 µs（DPP 归约后 +9–19 %） | 小 T 比 aiter 快 1.6–1.8×，大 T 0.87–0.92× |
 | MoE | moe_sorting（单 block / 多 block 原子 / 多 block 稳定顺序） | 10–18 µs（≤ 几千对）/ 31 µs（26 万对）/ 105 µs（稳定，26 万对） | 格式与 aiter `moe_sorting` 一致，附 `tile_start` |
-| 采样 | argmax / 温度采样 / top-k + top-p | 4.3 TB/s / 0.7–1.3 TB/s 等效 / 130–240 µs 每行 | 覆盖版本；top-k / top-p 用阈值二分，不排序 |
+| 采样 | argmax / 温度采样 / top-k + top-p | 4.3 TB/s / 0.7–1.3 TB/s 等效 / 36–124 µs 每行（V = 32000） | top-k / top-p 用 bf16 序键的两遍基数选择，不排序 |
 
 未做 / 已知差距：layernorm / softmax 的短行与 N = 400–511 的行布局；采样的性能版本（直方图 top-k / top-p，一行多 block）；> 4 GiB 的 cache / 张量（要 64 位寻址，B1）；vLLM 分块 cache 的整行转置写；aiter 同轮对比没有覆盖 layernorm、row softmax、RoPE、cache、moe_sorting、采样（无法脱离 torch 独立编译）。
 ## 流式逐元素（模板 T1）
