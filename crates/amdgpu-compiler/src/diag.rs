@@ -185,7 +185,7 @@ pub fn from_compile_error(f: &Function, e: &str) -> Vec<Diag> {
         }
         return out;
     }
-    let (code, fix) = if e.contains("register budget") {
+    let (code, fix) = if e.contains("register budget") || e.contains("for the launch") || e.contains("launch budget") {
         ("COMPILE-REG-BUDGET", Some("use fewer threads per workgroup or fewer live registers (see the live values listed)".to_string()))
     } else if e.contains("out of VGPRs") || e.contains("out of AGPRs") || e.contains("out of SGPRs") {
         ("RA-OUT-OF-REGISTERS", Some("shorten the live ranges of the listed values (reload / recompute instead of keeping them), or split the kernel".to_string()))
