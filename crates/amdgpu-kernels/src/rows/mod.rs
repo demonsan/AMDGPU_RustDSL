@@ -44,7 +44,7 @@ fn pack(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
     b.frag4(w[0], w[1], w[2], w[3])
 }
 
-pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
+/// Rows one wave processes at once: short rows (< 2 KB) need several in flight per wave for the 64 KB / CU of loads that saturate HBM (docs/op-coverage-memtemplates.md 5.1); the rows of a wave are consecutive.\npub fn rows_per_wave(n: i64) -> i64 {\n    if n < 512 {\n        4\n    } else if n < 1024 {\n        2\n    } else {\n        1\n    }\n}\n\npub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     let nld = ((n + 511) / 512) as usize;
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::Default);
@@ -67,11 +67,11 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     }
     let mt = Ext::sym("MT");
     b.sym_range("MT", 1, 1 << 20);
-    b.ka_is(m_off, mt.clone() * Ext::c(4));
+    b.ka_is(m_off, mt.clone() * Ext::c(4 * rows_per_wave(n)));
     b.grid_is(0, mt.clone());
     for p in ptrs {
         let vec = matches!(*p, "gamma" | "beta");
-        b.arg_tensor(p, if vec { Ext::c(2 * n) } else { mt.clone() * Ext::c(4 * 2 * n) });
+        b.arg_tensor(p, if vec { Ext::c(2 * n) } else { mt.clone() * Ext::c(4 * rows_per_wave(n) * 2 * n) });
     }
     let pv: Vec<ValueId> = (0..ptrs.len()).map(|i| b.let_(Op::KernargPtr { offset: 8 * i as u32 })).collect();
     let m_v = b.let_(Op::KernargI32 { offset: m_off });
@@ -95,17 +95,24 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     let r_rout = if op == RowOp::AddRmsNorm { Some(dyn_desc(b, "res_out")) } else { None };
     let r_g = if matches!(op, RowOp::RmsNorm | RowOp::AddRmsNorm | RowOp::LayerNorm) { Some(b.buffer_desc(pv[idx("gamma")], (2 * n) as u32)) } else { None };
     let r_be = if op == RowOp::LayerNorm { Some(b.buffer_desc(pv[idx("beta")], (2 * n) as u32)) } else { None };
-    let row = b.bind_i32((ev(bx) << 2) + lane.wave());
+    let rpw = rows_per_wave(n) as usize;
     let wid = b.bind_i32(lane.wave());
     let me = red.mine(wid);
     let ngrp = nld.div_ceil(4);
-    let vx = b.bind_i32(ev(row) * (2 * n) as i32 + (lane.lane() << 4));
+    let row0 = b.bind_i32(((ev(bx) << 2) + lane.wave()) * rpw as i32);
+    let vx0 = b.bind_i32(ev(row0) * (2 * n) as i32 + (lane.lane() << 4));
     let vg = b.bind_i32(lane.lane() << 4);
-    let gx: Vec<ValueId> = (0..ngrp).map(|q| if q == 0 { vx } else { b.bind_i32(ev(vx) + 4096 * q as i32) }).collect();
+    // per row r: the group base offsets (one voffset per 4 loads, imm 1024 (i % 4))
+    let gx_of = |b: &mut FnBuilder, r: usize| -> Vec<ValueId> {
+        let vr = if r == 0 { vx0 } else { b.bind_i32(ev(vx0) + (r as i64 * 2 * n) as i32) };
+        (0..ngrp).map(|q| if q == 0 { vr } else { b.bind_i32(ev(vr) + 4096 * q as i32) }).collect()
+    };
     let gg: Vec<ValueId> = (0..ngrp).map(|q| if q == 0 { vg } else { b.bind_i32(ev(vg) + 4096 * q as i32) }).collect();
     let load = |b: &mut FnBuilder, rs: ValueId, g: &[ValueId]| -> Vec<ValueId> { (0..nld).map(|i| b.buffer_load_b128(rs, g[i / 4], 0i32, (1024 * (i % 4)) as u32)).collect() };
-    let xs = load(b, r_x, &gx);
-    let rs = r_res.map(|r| load(b, r, &gx));
+    let gxs: Vec<Vec<ValueId>> = (0..rpw).map(|r| gx_of(b, r)).collect();
+    // every row's loads are issued before any compute: rpw * (row bytes) in flight per wave
+    let xs_all: Vec<Vec<ValueId>> = gxs.iter().map(|g| load(b, r_x, g)).collect();
+    let rs_all: Option<Vec<Vec<ValueId>>> = r_res.map(|r| gxs.iter().map(|g| load(b, r, g)).collect());
     let gs = r_g.map(|r| load(b, r, &gg));
     let bs = r_be.map(|r| load(b, r, &gg));
     b.wait_vm(0);
@@ -120,27 +127,8 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
             }
         })
         .collect();
-    // the values per lane (f32), 8 per chunk
-    let mut xf: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
-    let mut rout_words: Vec<ValueId> = Vec::new();
-    for i in 0..nld {
-        let a = bf16x8_to_f32(b, xs[i]);
-        let v = if let Some(rv) = &rs {
-            let c = bf16x8_to_f32(b, rv[i]);
-            let mut s = [0; 8];
-            for k in 0..8 {
-                s[k] = b.add_f32(a[k], c[k]);
-            }
-            // res_out = bf16(x + res); the normalised value is that rounded sum
-            let f4 = pack(b, &s);
-            rout_words.push(f4);
-            bf16x8_to_f32(b, f4)
-        } else {
-            a
-        };
-        xf.push(v);
-    }
     let zero = b.c_f32(0.0);
+    let inv_n = b.c_f32(1.0 / n as f32);
     let masked = |b: &mut FnBuilder, v: &[ValueId; 8], i: usize, fill: ValueId| -> [ValueId; 8] {
         match valid[i] {
             None => *v,
@@ -153,115 +141,138 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
             }
         }
     };
-    let inv_n = b.c_f32(1.0 / n as f32);
-    let mut out: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
-    match op {
-        RowOp::RmsNorm | RowOp::AddRmsNorm => {
-            let mut part: Option<ValueId> = None;
-            for i in 0..nld {
-                let v = masked(b, &xf[i], i, zero);
-                let sq: Vec<ValueId> = v.iter().map(|&x| b.mul_f32(x, x)).collect();
-                let s = lane_reduce(b, RedOp::Sum, &sq);
-                part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
-            }
-            let tot = wave_reduce(b, RedOp::Sum, part.unwrap(), &me, 0, 0, &lane);
-            let mean = b.mul_f32(tot, inv_n);
-            let me_eps = b.add_f32(mean, eps.unwrap());
-            let inv = rsqrt_f32(b, me_eps);
-            for i in 0..nld {
-                let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
-                let mut y = [0; 8];
+    for r in 0..rpw {
+        let (xs, rs) = (&xs_all[r], rs_all.as_ref().map(|a| &a[r]));
+        let (gen0, gen1) = (2 * r as i32, 2 * r as i32 + 1);
+        // the values per lane (f32), 8 per chunk
+        let mut xf: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
+        let mut rout_words: Vec<ValueId> = Vec::new();
+        for i in 0..nld {
+            let a = bf16x8_to_f32(b, xs[i]);
+            let v = if let Some(rv) = rs {
+                let c = bf16x8_to_f32(b, rv[i]);
+                let mut s = [0; 8];
                 for k in 0..8 {
-                    let t = b.mul_f32(xf[i][k], inv);
-                    y[k] = b.mul_f32(t, g[k]);
+                    s[k] = b.add_f32(a[k], c[k]);
                 }
-                out.push(y);
+                // res_out = bf16(x + res); the normalised value is that rounded sum
+                let f4 = pack(b, &s);
+                rout_words.push(f4);
+                bf16x8_to_f32(b, f4)
+            } else {
+                a
+            };
+            xf.push(v);
+        }
+        let mut out: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
+        match op {
+            RowOp::RmsNorm | RowOp::AddRmsNorm => {
+                let mut part: Option<ValueId> = None;
+                for i in 0..nld {
+                    let v = masked(b, &xf[i], i, zero);
+                    let sq: Vec<ValueId> = v.iter().map(|&x| b.mul_f32(x, x)).collect();
+                    let s = lane_reduce(b, RedOp::Sum, &sq);
+                    part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
+                }
+                let tot = wave_reduce(b, RedOp::Sum, part.unwrap(), &me, 0, gen0, &lane);
+                let mean = b.mul_f32(tot, inv_n);
+                let me_eps = b.add_f32(mean, eps.unwrap());
+                let inv = rsqrt_f32(b, me_eps);
+                for i in 0..nld {
+                    let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
+                    let mut y = [0; 8];
+                    for k in 0..8 {
+                        let t = b.mul_f32(xf[i][k], inv);
+                        y[k] = b.mul_f32(t, g[k]);
+                    }
+                    out.push(y);
+                }
+            }
+            RowOp::LayerNorm => {
+                let mut part: Option<ValueId> = None;
+                for i in 0..nld {
+                    let v = masked(b, &xf[i], i, zero);
+                    let s = lane_reduce(b, RedOp::Sum, &v);
+                    part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
+                }
+                let tot = wave_reduce(b, RedOp::Sum, part.unwrap(), &me, 0, gen0, &lane);
+                let mean = b.mul_f32(tot, inv_n);
+                let mut part2: Option<ValueId> = None;
+                for i in 0..nld {
+                    let mut dv = [0; 8];
+                    for k in 0..8 {
+                        dv[k] = b.sub_f32(xf[i][k], mean);
+                    }
+                    let dv = masked(b, &dv, i, zero);
+                    let sq: Vec<ValueId> = dv.iter().map(|&x| b.mul_f32(x, x)).collect();
+                    let s = lane_reduce(b, RedOp::Sum, &sq);
+                    part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
+                }
+                let tot2 = wave_reduce(b, RedOp::Sum, part2.unwrap(), &me, 64, gen1, &lane);
+                let var = b.mul_f32(tot2, inv_n);
+                let ve = b.add_f32(var, eps.unwrap());
+                let inv = rsqrt_f32(b, ve);
+                for i in 0..nld {
+                    let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
+                    let be = bf16x8_to_f32(b, bs.as_ref().unwrap()[i]);
+                    let mut y = [0; 8];
+                    for k in 0..8 {
+                        // (x - mean) is recomputed here: the deviations are not kept across the second reduction (register pressure)
+                        let d = b.sub_f32(xf[i][k], mean);
+                        let t = b.mul_f32(d, inv);
+                        let u = b.mul_f32(t, g[k]);
+                        y[k] = b.add_f32(u, be[k]);
+                    }
+                    out.push(y);
+                }
+            }
+            RowOp::Softmax => {
+                let neg = b.c_f32(-3.0e38);
+                let mut part: Option<ValueId> = None;
+                for i in 0..nld {
+                    let v = masked(b, &xf[i], i, neg);
+                    let s = lane_reduce(b, RedOp::Max, &v);
+                    part = Some(match part { None => s, Some(p) => b.max_f32(p, s) });
+                }
+                let mx = wave_reduce(b, RedOp::Max, part.unwrap(), &me, 0, gen0, &lane);
+                let l2e = b.c_f32(std::f32::consts::LOG2_E);
+                let mut ex: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
+                let mut part2: Option<ValueId> = None;
+                for i in 0..nld {
+                    let mut e = [0; 8];
+                    for k in 0..8 {
+                        let t = b.sub_f32(xf[i][k], mx);
+                        let u = b.mul_f32(t, l2e);
+                        e[k] = b.exp2_f32(u);
+                    }
+                    let e = masked(b, &e, i, zero);
+                    let s = lane_reduce(b, RedOp::Sum, &e);
+                    part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
+                    ex.push(e);
+                }
+                let tot = wave_reduce(b, RedOp::Sum, part2.unwrap(), &me, 64, gen1, &lane);
+                let inv = b.rcp_f32(tot);
+                for i in 0..nld {
+                    let mut y = [0; 8];
+                    for k in 0..8 {
+                        y[k] = b.mul_f32(ex[i][k], inv);
+                    }
+                    out.push(y);
+                }
             }
         }
-        RowOp::LayerNorm => {
-            let mut part: Option<ValueId> = None;
-            for i in 0..nld {
-                let v = masked(b, &xf[i], i, zero);
-                let s = lane_reduce(b, RedOp::Sum, &v);
-                part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
+        // stores: lanes past the row end store to an offset outside every descriptor (dropped by the hardware)
+        for i in 0..nld {
+            let f4 = pack(b, &out[i]);
+            let base = b.bind_i32(ev(gxs[r][i / 4]) + (1024 * (i % 4)) as i32);
+            let voff = match valid[i] {
+                None => base,
+                Some(c) => b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(base), b: Opnd::I32(-16) }),
+            };
+            b.buffer_store_b128(r_out, voff, 0i32, 0, f4);
+            if let Some(ro) = r_rout {
+                b.buffer_store_b128(ro, voff, 0i32, 0, rout_words[i]);
             }
-            let tot = wave_reduce(b, RedOp::Sum, part.unwrap(), &me, 0, 0, &lane);
-            let mean = b.mul_f32(tot, inv_n);
-            let mut d: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
-            let mut part2: Option<ValueId> = None;
-            for i in 0..nld {
-                let mut dv = [0; 8];
-                for k in 0..8 {
-                    dv[k] = b.sub_f32(xf[i][k], mean);
-                }
-                let dv = masked(b, &dv, i, zero);
-                let sq: Vec<ValueId> = dv.iter().map(|&x| b.mul_f32(x, x)).collect();
-                let s = lane_reduce(b, RedOp::Sum, &sq);
-                part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
-                d.push(dv);
-            }
-            let tot2 = wave_reduce(b, RedOp::Sum, part2.unwrap(), &me, 64, 1, &lane);
-            let var = b.mul_f32(tot2, inv_n);
-            let ve = b.add_f32(var, eps.unwrap());
-            let inv = rsqrt_f32(b, ve);
-            for i in 0..nld {
-                let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
-                let be = bf16x8_to_f32(b, bs.as_ref().unwrap()[i]);
-                let mut y = [0; 8];
-                for k in 0..8 {
-                    let t = b.mul_f32(d[i][k], inv);
-                    let u = b.mul_f32(t, g[k]);
-                    y[k] = b.add_f32(u, be[k]);
-                }
-                out.push(y);
-            }
-        }
-        RowOp::Softmax => {
-            let neg = b.c_f32(-3.0e38);
-            let mut part: Option<ValueId> = None;
-            for i in 0..nld {
-                let v = masked(b, &xf[i], i, neg);
-                let s = lane_reduce(b, RedOp::Max, &v);
-                part = Some(match part { None => s, Some(p) => b.max_f32(p, s) });
-            }
-            let mx = wave_reduce(b, RedOp::Max, part.unwrap(), &me, 0, 0, &lane);
-            let l2e = b.c_f32(std::f32::consts::LOG2_E);
-            let mut ex: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
-            let mut part2: Option<ValueId> = None;
-            for i in 0..nld {
-                let mut e = [0; 8];
-                for k in 0..8 {
-                    let t = b.sub_f32(xf[i][k], mx);
-                    let u = b.mul_f32(t, l2e);
-                    e[k] = b.exp2_f32(u);
-                }
-                let e = masked(b, &e, i, zero);
-                let s = lane_reduce(b, RedOp::Sum, &e);
-                part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
-                ex.push(e);
-            }
-            let tot = wave_reduce(b, RedOp::Sum, part2.unwrap(), &me, 64, 1, &lane);
-            let inv = b.rcp_f32(tot);
-            for i in 0..nld {
-                let mut y = [0; 8];
-                for k in 0..8 {
-                    y[k] = b.mul_f32(ex[i][k], inv);
-                }
-                out.push(y);
-            }
-        }
-    }
-    // stores: lanes past the row end store to an offset outside every descriptor (dropped by the hardware)
-    for i in 0..nld {
-        let f4 = pack(b, &out[i]);
-        let base = b.bind_i32(ev(gx[i / 4]) + (1024 * (i % 4)) as i32);
-        let voff = match valid[i] {
-            None => base,
-            Some(c) => b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(base), b: Opnd::I32(-16) }),
-        };
-        b.buffer_store_b128(r_out, voff, 0i32, 0, f4);
-        if let Some(ro) = r_rout {
-            b.buffer_store_b128(ro, voff, 0i32, 0, rout_words[i]);
         }
     }
     fb.finish()
