@@ -48,6 +48,19 @@ pub fn decode16_config(b: u64, hk: u64) -> (u32, u32) {
     (32, s as u32)
 }
 
+/// MLA decode: (head-parallel form `mla_decode_bf16_hp_p<P>`?, S). H >= 64 runs the head-parallel form (64 heads per CTA share the KV
+/// tiles: H128 B64 ctx 4096 P16 232 us vs 348 us for the per-wave form); smaller H the per-wave form (`mla_decode_bf16_p<P>`, 16 heads per CTA,
+/// 4 key parts per CTA). S = the smallest power of two giving >= 256 CTAs (<= 16): H16 B64 -> 4 (76 us), H128 B64 -> 2.
+pub fn mla_config(b: u64, h: u64) -> (bool, u32) {
+    let hp = h >= 64;
+    let ctas = b * if hp { h.div_ceil(64) } else { h.div_ceil(16) };
+    let mut s = 1u64;
+    while s < 16 && ctas * s < 256 {
+        s *= 2;
+    }
+    (hp, s as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,6 +71,12 @@ mod tests {
         assert_eq!(blockscale_split_k(256, 7168, 4096, 256), 2);
         assert_eq!(blockscale_split_k(512, 7168, 7168, 256), 2);
         assert_eq!(blockscale_split_k(4096, 4096, 4096, 256), 1);
+    }
+
+    #[test]
+    fn mla_rule() {
+        assert_eq!(mla_config(64, 16), (false, 4));
+        assert_eq!(mla_config(64, 128), (true, 2));
     }
 
     #[test]

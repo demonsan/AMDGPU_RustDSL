@@ -625,6 +625,10 @@
     - 空的 key 段跑一个全掩码 tile。
   - 对照 aiter `mla_dec_stage1` a16w16（H16、P1、B64、ctx ≤ 4096）：旧版 178 µs，新版 80 µs，厂商 47.7 µs。比值从 0.27× 提到 0.60×。
   - H128、P16：646 → 360 µs。
+  - 后续改动：
+    - 把 tile 拆成两个 16 key 的半块，第 0 半块的 QK 与第 1 半块的 DMA 重叠：H16 从 79 降到 76 µs，约为厂商的 0.63×。
+    - H ≥ 64 时改用 head 并行形式 `mla_decode_bf16_hp_p<P>`：每 CTA 的 4 个 wave 是 4 组各 16 个 head，共享 2 槽的 36 KB KV 环，每 64 个 head 只读一次 KV。H128 B64 ctx 4096 P16：348 → 232 µs（S=2）。
+    - [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `mla_config` 负责选择形式和切分数 S。
   - 期间发现两个后端 bug：
     - `ds_bpermute` 之后缺少 lgkm 等待，tileops f841f0a2 已修复；
     - if / else 中，else 路径读取了只在 then 路径上物化的寄存器，已报告后端。新版通过去掉该分支绕开。- **MoE stage 2**：
