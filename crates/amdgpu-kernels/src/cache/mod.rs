@@ -83,7 +83,7 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     let r_kc = b.buffer_desc(pkc, row as u32);
     let r_vc = b.buffer_desc(pvc, row as u32);
     let src = b.bind_i32(ev(tok) * row as i32 + (ev(lane) << 4));
-    let dst = b.bind_i32(ev(lane) << 4);
+    let dst = b.let_(Op::MulI32(Opnd::Val(lane), Opnd::I32(16))); // the lane's chunk inside the slot row (I32)
     // loads first (K and V of every iteration), then the stores; lanes past the row (and padding tokens) store out of range
     let mut loaded = Vec::new();
     for it in 0..iters {
