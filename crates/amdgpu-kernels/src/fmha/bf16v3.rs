@@ -264,8 +264,10 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     let mut b = FnBuilder::new(name, 512);
     // the `_vs128` policy (full reordering list scheduler) + ldsink / wsink / ldahead32: measured +6.6 % / +7.7 % / +6.7 % (8192², 2048², 1024²)
     // over the Gemm profile
-    // (the key-split form keeps the Gemm profile: under Vs128 its causal S = 4 build faulted on HW - reported)
-    b.compile_profile(if split { CompileProfile::Gemm } else { CompileProfile::Vs128 });
+    // (causal: the Gemm profile measured 4 % faster (955 vs 915 TF/s at 8192²); the key-split form keeps the Gemm profile: under Vs128 its
+    // causal S = 4 build faulted on HW - reported)
+    let vs = !split && !causal;
+    b.compile_profile(if vs { CompileProfile::Vs128 } else { CompileProfile::Gemm });
     // ---- ABI (the vendor's v3, as bf16.rs) ----
     for (n, i) in [("ptr_o", 0u32), ("ptr_q", 1), ("ptr_k", 2), ("ptr_v", 3), ("ptr_lse", 4)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
@@ -571,7 +573,7 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     }
     }
     let mut f = b.finish();
-    if !split {
+    if vs {
         f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
     }
     f
