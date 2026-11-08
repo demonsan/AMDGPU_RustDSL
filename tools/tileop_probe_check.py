@@ -828,6 +828,28 @@ def check_lane_p1(planes, out):
         print(("ok   " if good else "FAIL ") + n + ("" if good else f": lanes 0..3 got {[hex(v) for v in got[:4]]} want {[hex(v & 0xFFFFFFFF) for v in w[:4]]}"))
     return ok
 
+# ---------------------------------------------------------------- probe_tileop_p1
+def gen_tileop_p1():
+    rnd = random.Random(51)
+    return [[u32(float(rnd.randint(-30, 30))) for _ in range(256)], [u32(float(rnd.randint(-30, 30))) for _ in range(256)]]
+
+def check_tileop_p1(planes, out):
+    x = [[f32(planes[0][4 * l + i]) for i in range(4)] for l in range(LANES)]
+    y = [[f32(planes[1][4 * l + i]) for i in range(4)] for l in range(LANES)]
+    ok = True
+    def rep(name, cond):
+        nonlocal ok
+        ok &= cond
+        print(("ok   " if cond else "FAIL ") + name)
+    O = lambda l, k: out[15 * l + k]
+    rep("ewise 2x + y", all(f32(O(l, i)) == 2 * x[l][i] + y[l][i] for l in range(64) for i in range(4)))
+    rep("apply2 AddF32 (v_pk_add_f32)", all(f32(O(l, 4 + i)) == x[l][i] + y[l][i] for l in range(64) for i in range(4)))
+    rep("apply2 MaxF32", all(f32(O(l, 8 + i)) == max(x[l][i], y[l][i]) for l in range(64) for i in range(4)))
+    rep("row_allreduce16 AddF32", all(f32(O(l, 12)) == sum(x[16 * (l // 16) + j][0] for j in range(16)) for l in range(64)))
+    rep("wave_allreduce MaxF32", all(f32(O(l, 13)) == max(x[j][1] for j in range(64)) for l in range(64)))
+    rep("wave_allreduce AddU32 (lane ids)", all(O(l, 14) == sum(range(64)) for l in range(64)))
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -838,6 +860,7 @@ PROBES = {
     "probe_tr_b16_mfma": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
     "probe_atomic_p1": (gen_atomic_p1, check_atomic_p1, 7 * LANES * 4),
     "probe_lane_p1": (gen_lane_p1, check_lane_p1, 14 * LANES * 4),
+    "probe_tileop_p1": (gen_tileop_p1, check_tileop_p1, 64 * 60),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }

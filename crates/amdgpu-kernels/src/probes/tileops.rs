@@ -793,3 +793,43 @@ pub fn probe_lane_p1() -> Function {
     }
     b.finish()
 }
+
+/// `probe_tileop_p1(in, out)` (own backend: DPP): the tileop builders on x, y = 4 f32 per lane (planes 0..3 / 4..7 of `in`). out per lane (15
+/// dwords, lane-major): ewise(x, y: 2 x + y) [4], apply2 AddF32 (packed) [4], apply2 MaxF32 [4], row_allreduce16 AddF32 (x0) [1],
+/// wave_allreduce MaxF32 (x1) [1], wave_allreduce AddU32 (lane id) [1].
+pub fn probe_tileop_p1() -> Function {
+    use amdgpu_dsl::{DppAluOp, MemTy};
+    use amdgpu_tile::tileop::{apply2, ewise, row_allreduce16, wave_allreduce, Ew2, RegTile};
+    let mut b = FnBuilder::new("probe_tileop_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(2048));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(64 * 60));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(16)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off16) });
+    let fx = b.load_global(pin, 0, MemTy::B128);
+    let fy = b.load_global(pin, 1024, MemTy::B128);
+    let x = RegTile::new(fx, 4, DType::F32);
+    let y = RegTile::new(fy, 4, DType::F32);
+    let e = ewise(&mut b, &[&x, &y], DType::F32, |b, v| b.let_(Op::FmaF32(Opnd::F32(2.0), Opnd::Val(v[0]), Opnd::Val(v[1]))));
+    let s = apply2(&mut b, Ew2::AddF32, &x, &y);
+    let m = apply2(&mut b, Ew2::MaxF32, &x, &y);
+    let x0 = x.elem(&mut b, 0);
+    let x1 = x.elem(&mut b, 1);
+    let r = row_allreduce16(&mut b, DppAluOp::AddF32, x0);
+    let w = wave_allreduce(&mut b, DppAluOp::MaxF32, x1);
+    let c = wave_allreduce(&mut b, DppAluOp::AddU32, tid);
+    let off60 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(60)));
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off60) });
+    for (k, t) in [e, s, m].iter().enumerate() {
+        b.store_global(pout, 16 * k as u32, t.frag, MemTy::B128, false);
+    }
+    for (k, v) in [r, w, c].into_iter().enumerate() {
+        let v = if b.f.value_tys[v as usize] == DType::F32 { b.let_(Op::BitcastI32(Opnd::Val(v))) } else { v };
+        b.store_global(pout, 48 + 4 * k as u32, v, MemTy::B32, false);
+    }
+    b.finish()
+}
