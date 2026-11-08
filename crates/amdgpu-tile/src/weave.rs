@@ -98,6 +98,8 @@ pub struct Unit<'a> {
     /// units that must be emitted before this one (indices in the owning [`Units`])
     pub deps: Vec<UnitId>,
     pub regs: RegProfile,
+    /// what the unit issues (instruction counts) for the cost-based strategy (`weave_auto`); None: an interim estimate
+    pub cost: Option<crate::weave_auto::UnitCost>,
     emit: Box<dyn FnOnce(&mut FnBuilder) + 'a>,
 }
 
@@ -122,8 +124,12 @@ impl<'a> Units<'a> {
         for &d in deps {
             assert!(d < self.v.len(), "Units::add: dependency {d} of `{}` is not an earlier unit", self.v.len());
         }
-        self.v.push(Unit { name: name.into(), class, hint, latency: 0, deps: deps.to_vec(), regs: RegProfile::default(), emit: Box::new(emit) });
+        self.v.push(Unit { name: name.into(), class, hint, latency: 0, deps: deps.to_vec(), regs: RegProfile::default(), cost: None, emit: Box::new(emit) });
         self.v.len() - 1
+    }
+    /// Sets what unit `id` issues (instruction counts; the cost-based strategy `weave_auto` reads it).
+    pub fn cost(&mut self, id: UnitId, c: crate::weave_auto::UnitCost) {
+        self.v[id].cost = Some(c);
     }
     /// Sets the nominal latency and register profile of unit `id`.
     pub fn facts(&mut self, id: UnitId, latency: u32, regs: RegProfile) {
@@ -157,11 +163,13 @@ pub struct Weaver<'a> {
     units: Units<'a>,
     order: Option<Vec<UnitId>>,
     label: String,
+    /// the kernel gave the order (`order` / `spread`): never overridden by the experiment switch
+    explicit: bool,
 }
 
 impl<'a> Weaver<'a> {
     pub fn new(units: Units<'a>) -> Weaver<'a> {
-        Weaver { units, order: None, label: String::new() }
+        Weaver { units, order: None, label: String::new(), explicit: false }
     }
     /// A label for reports / errors (the phase name).
     pub fn phase(mut self, label: impl Into<String>) -> Weaver<'a> {
@@ -175,6 +183,7 @@ impl<'a> Weaver<'a> {
     }
     /// The explicit order (authoritative): every unit exactly once.
     pub fn order(mut self, ids: Vec<UnitId>) -> Weaver<'a> {
+        self.explicit = true;
         self.order = Some(ids);
         self
     }
@@ -198,12 +207,17 @@ impl<'a> Weaver<'a> {
             }
         }
         ord.extend(fi);
+        self.explicit = true;
         self.order = Some(ord);
         self
     }
     /// The order that `emit` would use (after the checks).
     pub fn plan(&self) -> Vec<UnitId> {
-        let ord = self.order.clone().unwrap_or_else(|| (0..self.units.len()).collect());
+        let mut ord = self.order.clone().unwrap_or_else(|| (0..self.units.len()).collect());
+        // experiment switch (A/B without editing the kernel): `AMDC_WEAVE_AUTO=<label>` replaces a declaration-order weave by the cost-based order
+        if !self.explicit && !self.label.is_empty() && crate::weave_auto::env_enabled(&self.label) {
+            ord = crate::weave_auto::auto_order(&self.units, &crate::weave_auto::Model::gfx950());
+        }
         check_order(&self.units, &ord, &self.label);
         ord
     }
