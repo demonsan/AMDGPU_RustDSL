@@ -682,7 +682,7 @@ impl Lowerer {
             Some(Op::LoadLdsB128 { .. }) => (RClass::V4, 1usize),
             Some(Op::LoadLdsB128x2 { .. }) => (RClass::V8, 2usize),
             // global / buffer loads, and in-place concatenations of loads (`frag_cat` / `cat_frag4`: the loads already write the halves)
-            Some(Op::FragCat { .. }) | Some(Op::LoadGlobalB128 { .. }) | Some(Op::BufferLoadN { .. }) | Some(Op::LoadGlobalN { .. }) | Some(Op::BufferLoad { .. }) | Some(Op::BufferLoadB128x2 { .. }) => {
+            Some(Op::FragCat { .. }) | Some(Op::LoadGlobalB128 { .. }) | Some(Op::BufferLoadN { .. }) | Some(Op::LoadGlobalN { .. }) => {
                 return self.try_coalesce_load_reload(v, dst);
             }
             _ => return false,
