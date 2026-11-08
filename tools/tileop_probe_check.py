@@ -1054,8 +1054,10 @@ def check_fp6(planes, out):
         bad = 0
         for l in range(LANES):
             want = 0
-            for i in range(32):
-                want |= enc6(fmt, f32(planes[i][l]) / 2) << (6 * i)
+            for j in range(32):
+                # 2xpk16 interleaves its sources (measured): slot 2 k = src0[k], slot 2 k + 1 = src1[k]; pk32 is in element order
+                i = (j // 2 + 16 * (j % 2)) if "2xpk16" in name else j
+                want |= enc6(fmt, f32(planes[i][l]) / 2) << (6 * j)
             got = sum(O(base + k, l) << (32 * k) for k in range(6))
             if got != want:
                 bad += 1
@@ -1076,10 +1078,11 @@ def check_fp6(planes, out):
             for i in range(32):
                 w = O(base + i // 2, l) >> (16 * (i % 2)) & 0xFFFF
                 got = struct.unpack("<e", struct.pack("<H", w))[0] if half == "f16" else f32(w << 16)
-                if got != f32(planes[i][l]):
+                src = i // 2 + 16 * (i % 2)  # the codes come from the 2xpk16 packs (interleaved)
+                if got != f32(planes[src][l]):
                     bad += 1
                     if bad == 1:
-                        print(f"  {name} lane {l} elem {i}: got {got} want {f32(planes[i][l])}")
+                        print(f"  {name} lane {l} elem {i}: got {got} want {f32(planes[src][l])}")
                     break
         print(("ok   " if bad == 0 else "FAIL ") + f"{name}: {64 - bad}/64 lanes")
         ok_all &= bad == 0

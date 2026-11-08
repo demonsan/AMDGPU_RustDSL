@@ -283,8 +283,9 @@ impl CachePolicy {
 /// * `ScalePkFp4F32`: srcs[0], srcs[1] f32, srcs[2] scale, srcs[3] old; byte `sel` replaced by the two fp4 values -> I32.
 /// * `PkU8F32`: srcs[0] f32, srcs[1] old; byte `sel` replaced by the value rounded and clamped to u8 -> I32.
 /// * `PkI16I32` / `PkU16U32`: srcs[0], srcs[1] -> two saturated 16-bit values -> U32.
-/// * `Scale2xPk16{Fp6,Bf6}F32`: srcs[0], srcs[1] Frag16 of f32 (elements 0..15, 16..31), srcs[2] scale -> Frag8 whose dwords 0..5 hold the
-///   32 6-bit codes (element i at bits [6 i, 6 i + 6) of the 192 bits; dwords 6, 7 unspecified). fp6 = e2m3, bf6 = e3m2 (OCP MX).
+/// * `Scale2xPk16{Fp6,Bf6}F32`: srcs[0], srcs[1] Frag16 of f32, srcs[2] scale -> Frag8 whose dwords 0..5 hold 32 6-bit codes, code j at
+///   bits [6 j, 6 j + 6) of the 192 bits; the sources INTERLEAVE (measured, probe_fp6): code 2 k = srcs[0][k], code 2 k + 1 = srcs[1][k].
+///   Dwords 6, 7 unspecified. fp6 = e2m3, bf6 = e3m2 (OCP MX); the value stored is x / 2^e (scale exponent e).
 /// * `ScalePk32{Fp6,Bf6}{F16,Bf16}`: srcs[0] Frag16 of 32 16-bit values (element i = half i % 2 of dword i / 2), srcs[1] scale -> as above.
 /// * `ScalePk32{F16,Bf16}{Fp6,Bf6}`: srcs[0] a Frag8 holding 32 codes in dwords 0..5, srcs[1] scale -> Frag16 of 32 16-bit values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
