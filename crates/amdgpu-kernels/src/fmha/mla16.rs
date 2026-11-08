@@ -92,11 +92,29 @@ pub fn mla16_decode_bf16(name: &str, page: i32) -> Function {
     };
     let nsplit = b.bind_i32(ev(s_n) << 2);
     let ns = { let v = b.bind_i32((ev(z) << 2) + ev(wv)); b.read_first_lane(v) };
+    let w3 = std::env::var("EXP_W3").is_ok();
     let ntt = b.bind_i32((ev(ctx) + (KT - 1)).lshr(5));
     let per = b.bind_i32(((ev(ntt) + ev(nsplit) - 1).lshr(ev(lg))) << 5);
-    let k_lo = { let v = b.bind_i32(ev(ns) * ev(per)); b.read_first_lane(v) };
+    let (per, kidx) = if w3 {
+        // 3 S parts: per = ceil(ntt / 3 S) tiles (S 1: / 3 by multiply-shift exact for < 2^16), part = 3 z + w
+        let n3 = b.bind_i32(ev(s_n) * 3);
+        let pf = b.un(amdgpu_dsl::UnOp::CvtF32I32, ntt);
+        let df = b.un(amdgpu_dsl::UnOp::CvtF32I32, n3);
+        let r = b.rcp_f32(df);
+        let q = b.mul_f32(pf, r);
+        let q = b.un(amdgpu_dsl::UnOp::CeilF32, q);
+        let q = b.un(amdgpu_dsl::UnOp::CvtI32F32, q);
+        let q = b.bind_i32((ev(q) + 1) << 5);
+        let kx = b.bind_i32(ev(z) * 3 + ev(wv));
+        (q, kx)
+    } else {
+        (per, ns)
+    };
+    let k_lo = { let v = b.bind_i32(ev(kidx) * ev(per)); b.read_first_lane(v) };
     let k_hi = { let v = b.bind_i32((ev(k_lo) + ev(per)).min(ev(ctx))); b.read_first_lane(v) };
     let ntile = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(5)); b.read_first_lane(v) };
+    // EXP_W3 (test): wave 3 idle; the key range is split over 3 parts of 4 (parts 3 of each CTA empty), 3 x 36 KB of LDS
+    let ntile = if w3 { let v = b.bind_i32(ev(wv).lt(3).select_i32(ev(ntile), 0)); b.read_first_lane(v) } else { ntile };
 
     // ---- descriptors ----
     let r_q = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_q, n) };
@@ -111,9 +129,10 @@ pub fn mla16_decode_bf16(name: &str, page: i32) -> Function {
 
     // ---- private LDS: per wave one 32-key tile (36 KB) ----
     let mut lds = LdsPlan::new();
-    let kv = lds.private("KV", (KT * ROW) as i64, 4, &[]);
+    let kv = lds.private("KV", (KT * ROW) as i64, if w3 { 3 } else { 4 }, &[]);
     lds.commit(&mut b);
-    let me = kv.mine(wv);
+    let wvm = if w3 { let v = b.bind_i32(ev(wv).min(2)); b.read_first_lane(v) } else { wv };
+    let me = kv.mine(wvm);
     let mbase = me.base();
     for c in 0..2304i64 {
         assert_eq!((c * 1821) >> 17, c / 72, "c / 72 multiply-shift");
