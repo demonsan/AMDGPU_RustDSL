@@ -61,9 +61,35 @@ pub fn mla_config(b: u64, h: u64) -> (bool, u32) {
     (hp, s as u32)
 }
 
+/// hd128 bf16 prefill: the kernel and key splits. Non-causal: `fmha_fwd_hd128_bf16_v3` (S = 1) or its `_ks` form (small grids,
+/// `bf16_prefill_key_splits`). Causal: the paired v3 (`_causal`, `_causal_ks` for small grids), except tiny grids (< 64 paired CTAs), where
+/// the 128-row v1 `fmha_fwd_hd128_bf16_causal` measured faster (B2 H8 HK2 1000 x 1300: 123 vs 94 TF/s). (hd64 / hd256, sliding window and
+/// varlen stay on the v1 family.)
+pub fn bf16_prefill_kernel(b: u64, h: u64, sq: u64, sk: u64, causal: bool, cus: u64) -> (&'static str, u32) {
+    if causal && b * h * sq.div_ceil(256).div_ceil(2) < 64 {
+        return ("fmha_fwd_hd128_bf16_causal", 1);
+    }
+    let s = bf16_prefill_key_splits(b, h, sq, sk, causal, cus);
+    let name = match (causal, s > 1) {
+        (false, false) => "fmha_fwd_hd128_bf16_v3",
+        (false, true) => "fmha_fwd_hd128_bf16_v3_ks",
+        (true, false) => "fmha_fwd_hd128_bf16_v3_causal",
+        (true, true) => "fmha_fwd_hd128_bf16_v3_causal_ks",
+    };
+    (name, s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_kernel_rule() {
+        assert_eq!(bf16_prefill_kernel(2, 8, 1000, 1300, true, 256).0, "fmha_fwd_hd128_bf16_causal");
+        assert_eq!(bf16_prefill_kernel(2, 32, 8192, 8192, true, 256), ("fmha_fwd_hd128_bf16_v3_causal", 1));
+        assert_eq!(bf16_prefill_kernel(2, 32, 8192, 8192, false, 256), ("fmha_fwd_hd128_bf16_v3", 1));
+        assert_eq!(bf16_prefill_kernel(1, 8, 4096, 4096, false, 256), ("fmha_fwd_hd128_bf16_v3_ks", 2));
+    }
 
     #[test]
     fn blockscale_rule() {
