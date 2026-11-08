@@ -109,6 +109,8 @@ int main(int argc, char** argv) {
         sa_row.resize(M); sb_col.resize(N);
         for (auto& s : sa_row) s = 1e-3f * (1 + (rng() % 100) / 100.0f);
         for (auto& s : sb_col) s = 1e-3f * (1 + (rng() % 100) / 100.0f);
+        // PERTENSOR=1 (gemm_a8w8_pertensor_fp8): one scale per tensor (the device gets 1-element arrays; the reference sees them broadcast)
+        if (envi("PERTENSOR", 0)) { for (auto& s : sa_row) s = sa_row[0]; for (auto& s : sb_col) s = sb_col[0]; }
     } else if (kind == "fp8bs") {
         es = 1;
         ha.resize((size_t)M * K); hb.resize((size_t)N * K);
