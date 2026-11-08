@@ -706,12 +706,31 @@ def check_dpp_p1(planes, out):
             print(f"ok   permlane16_swap {'ab'[j]}")
     return ok
 
+# ---------------------------------------------------------------- probe_tr_b16_p1 (layout discovery: prints the map; checked against TR_B16_MAP)
+def gen_tr_b16_p1():
+    return [[(2 * i) | ((2 * i + 1) << 16) for i in range(1024)]]
+
+def tr_b16_formula(l, e, extra):
+    """(source lane whose address is used, element) of value e of lane l: see check output; None until established"""
+    return None
+
+def check_tr_b16_p1(planes, out):
+    for j in range(2):
+        print(f"read {j}: lane: [values / 4 (source lane), values % 4 (element)]")
+        for l in range(LANES):
+            w = out[j * 128 + 2 * l: j * 128 + 2 * l + 2]
+            vals = [(w[0] & 0xFFFF), w[0] >> 16, w[1] & 0xFFFF, w[1] >> 16]
+            base = 256 * j
+            print(f"  {l:2d}: {[(v - base) // 4 for v in vals]} {[(v - base) % 4 for v in vals]}")
+    return True
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
     "probe_f8f6f4_p1": (gen_f8f6f4_p1, check_f8f6f4_p1, sum(2 * LANES * 4 * (4 if k[0] == 16 else 16) for k in F8F6F4_KINDS)),
     "probe_cvt_p1": (gen_cvt_p1, check_cvt_p1, sum(2 if c[0] in TWO else 1 for c in CVT_CASES) * LANES * 4),
     "probe_dpp_p1": (gen_dpp_p1, check_dpp_p1, (len(DPP_CASES) + 2) * LANES * 4),
+    "probe_tr_b16_p1": (gen_tr_b16_p1, check_tr_b16_p1, 1024),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }

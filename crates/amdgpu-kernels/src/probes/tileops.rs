@@ -599,3 +599,34 @@ pub fn probe_dpp_p1() -> Function {
     }
     b.finish()
 }
+
+/// `probe_tr_b16_p1(in, out)`: LDS holds u16 i at byte 2 i (i < 2048, from `in`); lane l reads `ds_read_b64_tr_b16` at byte 8 l (+ 512 for the
+/// second read); out = the 4 returned 16-bit values per lane and read (2 dwords each), so value v names (source lane v / 4, element v % 4).
+pub fn probe_tr_b16_p1() -> Function {
+    let mut b = FnBuilder::new("probe_tr_b16_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(4096));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(1024));
+    b.lds(4096);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(16)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off16) });
+    for k in 0..4u32 {
+        let v = b.load_global(pin, 1024 * k, amdgpu_dsl::MemTy::B128);
+        let a = b.add_i32(off16, (1024 * k) as i32);
+        b.store_lds_b128(a, v);
+    }
+    b.wait_lds(0);
+    b.barrier();
+    let off8 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(8)));
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off8) });
+    for (j, extra) in [0i32, 512].into_iter().enumerate() {
+        let a = b.add_i32(off8, extra);
+        let r = b.load_lds_tr_b16(a);
+        b.store_global(pout, 512 * j as u32, r, amdgpu_dsl::MemTy::B64, false);
+    }
+    b.finish()
+}
