@@ -1189,9 +1189,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let c0 = b.c_i32(0);
         let nv = { let v = b.buffer_load_f32(rsrc_nv, c0, 0i32, 0); let v = b.bitcast_i32(v); b.read_first_lane(v) };
         let eo = { let v = b.bind_i32(ev(by) << 2); b.read_first_lane(v) };
-        let e = { let v = b.buffer_load_f32(rsrc_e, c0, eo, 0); let v = b.bitcast_i32(v); b.read_first_lane(v) };
-        let e = b.bind_i32(ev(e).max(0).min(ev(ne) - 1));
-        let e = b.read_first_lane(e);
+        let e = { let v = b.buffer_load_f32(rsrc_e, c0, eo, 0); let v = b.bitcast_i32(v); let v = b.bind_i32(ev(v).max(0).min(ev(ne) - 1)); b.read_first_lane(v) };
         let row0 = { let v = b.bind_i32(ev(by) << lg_m); b.read_first_lane(v) };
         let live = b.bind_cond(ev(row0).lt(ev(nv)));
         MoeCx { st, rsrc_sid, rsrc_sw, topk, mtok, nout, e, live, row0 }
