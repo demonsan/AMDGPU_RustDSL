@@ -127,8 +127,16 @@ int main(int argc, char** argv) {
     } else if (fp8mode == 2) {
         // vendor pertokenFp8 (pa_bf16_pertokenFp8_*, P = 16): K [blk][hk][d / 16][16][16] and V [blk][hk][d][16] fp8 = the blocked layout
         // built above; KQ / VQ f32 [HK][NB 16] per-token scales (kernarg names O Q K V BT CL KQ VQ sclg mblk batch Qs Bs KVs mtp GQA [QTP])
-        void *dk = dev(kq), *dv = dev(vq), *dks = dev(kss), *dvs = dev(vss);
-        a.assign(envi("VARGS", 256), 0);
+        // (aiter asm PA: K_QScale / V_QScale [NB][HK][BS] f32 - pa_ps_fwd's stride_scale_page / stride_scale_blk)
+        std::vector<float> kv1(kss.size()), vv1(vss.size());
+        const size_t S_ = (size_t)npages * P;
+        for (int hk = 0; hk < HK; hk++)
+            for (size_t sl = 0; sl < S_; sl++) {
+                size_t d_ = ((sl / P) * HK + hk) * P + sl % P;
+                kv1[d_] = kss[hk * S_ + sl]; vv1[d_] = vss[hk * S_ + sl];
+            }
+        void *dk = dev(kq), *dv = dev(vq), *dks = dev(kv1), *dvs = dev(vv1);
+        a.assign(envi("VARGS", 272), 0);
         auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
         auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
         P_(0, dout); P_(1, dq); P_(2, dk); P_(3, dv); P_(4, dbt); P_(5, dcl); P_(6, dks); P_(7, dvs);
