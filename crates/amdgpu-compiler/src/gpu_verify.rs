@@ -518,27 +518,30 @@ impl<'a> An<'a> {
         };
         if num.is_some() {
             // hardware range check against num_records (loads read 0, stores are dropped): accepted; overstatement is checked at the descriptor.
-            // The check sees the EFFECTIVE offset voffset + soffset + imm in 32 bits: an "out-of-range" sentinel offset (e.g. -16) plus a positive
-            // instruction immediate wraps back to a small in-range offset (-16 + 16 = 0) and the access lands inside the buffer instead of being
-            // dropped. Reject (stores) / warn (loads) whenever the register offset may lie in [-imm, -1].
-            let v = match voff {
-                Some(o) => self.int_of(o),
-                None => Itv::konst(0),
-            };
-            let reg = v.add(&self.int_of(soff));
+            // The range check sees the EFFECTIVE offset voffset + soffset + imm in 32 bits: a masking SENTINEL voffset (a negative constant chosen
+            // by a select, e.g. -16 for "this lane is out of range") plus a positive instruction offset wraps back to a small in-range offset
+            // (-16 + 16 = 0) and the access lands inside the buffer instead of being dropped. Reject (stores) / warn (loads) such sentinels.
+            // (A register offset that is merely negative with a folded immediate - a legitimate address - is not a sentinel and is not flagged.)
             if imm > 0 {
-                let lo = reg.lo.iter().filter_map(|p| p.floor_const()).max();
-                let hi = reg.hi.iter().filter_map(|p| p.floor_const()).min();
-                let may_neg = lo.map_or(true, |l| l <= -1);
-                let reaches = hi.map_or(true, |h| h >= -imm);
-                if may_neg && reaches {
+                let soff_k = match soff {
+                    Opnd::I32(c) => Some(*c as i128),
+                    o => self.int_of(o).point_const().filter(|q| q.d == 1).map(|q| q.n),
+                };
+                let mut wraps = Vec::new();
+                if let (Some(o), Some(sk)) = (voff, soff_k) {
+                    for c in self.select_consts(o, 6) {
+                        let e = c + sk + imm;
+                        if c + sk < 0 && e >= 0 {
+                            wraps.push((c, e));
+                        }
+                    }
+                }
+                if let Some((c, e)) = wraps.first() {
                     let m = format!(
-                        "stmt {}: {what}: the register offset (voffset + soffset, interval [{}, {}]) may be a negative sentinel in [-{imm}, -1]; with the \
-                         instruction offset {imm} the 32-bit effective offset wraps into [0, {imm}) and the access lands INSIDE the buffer instead of \
-                         being dropped by the range check (use a sentinel >= num_records, e.g. 0x7fffff00, or fold the immediate into the register offset)",
-                        self.idx,
-                        lo.map_or("-inf".to_string(), |x| x.to_string()),
-                        hi.map_or("+inf".to_string(), |x| x.to_string())
+                        "stmt {}: {what}: the masking sentinel voffset {c} plus the instruction offset {imm} is the 32-bit effective offset {e}: the \
+                         masked lanes access the buffer at {e} instead of being dropped by the range check (use a sentinel that stays >= num_records after \
+                         the immediate, e.g. 0x7fffff00, or fold the immediate into the register offset)",
+                        self.idx
                     );
                     self.rep.add("GV-BUF-WRAP", if store { Severity::Error } else { Severity::Warn }, m);
                     return;
@@ -1013,6 +1016,23 @@ impl<'a> An<'a> {
             self.cur_addr = Some((*addr, o as i128 * stride));
             let a = self.int_of(addr).add_const(o as i128 * stride);
             self.check_lds(what, &a, eb);
+        }
+    }
+
+    /// The constants an operand may take through selects (the arms of `Select`s, recursively, and constants): masking sentinels.
+    fn select_consts(&self, o: &Opnd, depth: usize) -> Vec<i128> {
+        match o {
+            Opnd::I32(c) => vec![*c as i128],
+            Opnd::Val(v) if depth > 0 => match self.defs.get(v) {
+                Some(Op::ConstI32(c)) => vec![*c as i128],
+                Some(Op::Select { a, b, .. }) => {
+                    let mut r = self.select_consts(a, depth - 1);
+                    r.extend(self.select_consts(b, depth - 1));
+                    r
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
         }
     }
 
