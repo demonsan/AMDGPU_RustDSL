@@ -236,7 +236,19 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
 /// Merges NS = 4 S splits: O[b, h, d] = sum_s exp(lse_s - M) po_s[d] / sum_s exp(lse_s - M) (bf16), M = max_s lse_s; 0 when every split is
 /// empty. Grid (H, B), 128 threads (one per d). ABI: 0 ptr_o (bf16 [B, H, D]), 1 ptr_po, 2 ptr_plse, 3 H, 4 NS.
 pub fn attn_combine_bf16_hd128(name: &str) -> Function {
-    let mut b = FnBuilder::new(name, 128);
+    attn_combine_bf16(name, D)
+}
+
+/// `attn_combine_bf16_hd128` for head dim `dd` (dd threads, <= 1024).
+#[allow(non_snake_case)]
+pub fn attn_combine_bf16(name: &str, dd: i32) -> Function {
+    attn_combine_bf16_x(name, dd, false)
+}
+
+/// `split_major`: partials indexed [B][NS][H] (aiter's MLA stage-1 splitData / splitLse) instead of [B][H][NS].
+pub fn attn_combine_bf16_x(name: &str, dd: i32, split_major: bool) -> Function {
+    let (dv, rowb) = (dd, 2 * dd);
+    let mut b = FnBuilder::new(name, dd as u32);
     b.compile_profile(CompileProfile::Gemm);
     for (n, i) in [("ptr_o", 0u32), ("ptr_po", 1), ("ptr_plse", 2)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
@@ -249,8 +261,8 @@ pub fn attn_combine_bf16_hd128(name: &str) -> Function {
     b.ka_range(64, 1, 256);
     b.grid_is(0, hh.clone());
     b.grid_is(1, Ext::sym("B"));
-    b.arg_tensor("ptr_o", Ext::sym("B") * hh.clone() * Ext::c(ROW as i64));
-    b.arg_tensor("ptr_po", Ext::sym("B") * hh.clone() * ns.clone() * Ext::c(4 * D as i64));
+    b.arg_tensor("ptr_o", Ext::sym("B") * hh.clone() * Ext::c(rowb as i64));
+    b.arg_tensor("ptr_po", Ext::sym("B") * hh.clone() * ns.clone() * Ext::c(4 * dv as i64));
     b.arg_tensor("ptr_plse", Ext::sym("B") * hh * ns * Ext::c(4));
     let (p_o, p_po, p_l) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 16 }), b.let_(Op::KernargPtr { offset: 32 }));
     let hq = b.let_(Op::KernargI32 { offset: 48 });
@@ -259,16 +271,23 @@ pub fn attn_combine_bf16_hd128(name: &str) -> Function {
     let bat = b.let_(Op::WorkgroupIdY);
     let tid = b.let_(Op::WorkitemId);
     let row = { let v = b.bind_i32(ev(bat) * ev(hq) + ev(h)); b.read_first_lane(v) };
-    let r_l = { let n = b.bind_i32((ev(row) + 1) * ev(nsv) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_l, n) };
-    let r_po = { let n = b.bind_i32((ev(row) + 1) * ev(nsv) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
-    let r_o = { let n = b.bind_i32((ev(row) + 1) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_o, n) };
-    let l_so = { let v = b.bind_i32(ev(row) * ev(nsv) << 2); b.read_first_lane(v) };
+    // partial (split s) of this (b, h): index base + s step
+    let (pbase, pstep) = if split_major {
+        (b.bind_i32(ev(bat) * ev(nsv) * ev(hq) + ev(h)), b.bind_i32(ev(hq)))
+    } else {
+        (b.bind_i32(ev(row) * ev(nsv)), b.c_i32(1))
+    };
+    let (pbase, pstep) = (b.read_first_lane(pbase), b.read_first_lane(pstep));
+    let r_l = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsv) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_l, n) };
+    let r_po = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsv) * (4 * dv)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
+    let r_o = { let n = b.bind_i32((ev(row) + 1) * rowb); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_o, n) };
+    let l_so = { let v = b.bind_i32(ev(pbase) << 2); b.read_first_lane(v) };
     let c0 = b.c_i32(0);
     let neg_inf = b.c_f32(f32::NEG_INFINITY);
     // pass 1: M
     let v1 = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(neg_inf))]);
     let s1 = amdgpu_dsl::varx(v1[0]);
-    let off = b.bind_i32(s1.clone() << 2);
+    let off = b.bind_i32((s1.clone() * ev(pstep)) << 2);
     let x = b.buffer_load_f32(r_l, off, l_so, 0);
     let mx = b.max_f32(Opnd::Var(v1[1]), x);
     b.set_var(v1[1], mx);
@@ -286,13 +305,13 @@ pub fn attn_combine_bf16_hd128(name: &str) -> Function {
     // pass 2: sums
     let v2 = b.begin_loop(&[(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(zf)), (DType::F32, Opnd::Val(zf))]);
     let s2 = amdgpu_dsl::varx(v2[0]);
-    let off = b.bind_i32(s2.clone() << 2);
+    let off = b.bind_i32((s2.clone() * ev(pstep)) << 2);
     let x = b.buffer_load_f32(r_l, off, l_so, 0);
     let dx = b.sub_f32(x, mm);
     let l2e = b.c_f32(std::f32::consts::LOG2_E);
     let t = b.mul_f32(dx, l2e);
     let w = b.exp2_f32(t);
-    let po_vo = b.bind_i32(((ev(row) * ev(nsv) + s2.clone()) * D + ev(tid)) << 2);
+    let po_vo = b.bind_i32(((ev(pbase) + s2.clone() * ev(pstep)) * dv + ev(tid)) << 2);
     let o = b.buffer_load_f32(r_po, po_vo, c0, 0);
     let acc = b.let_(Op::FmaF32(Opnd::Val(w), Opnd::Val(o), Opnd::Var(v2[1])));
     b.set_var(v2[1], acc);
@@ -308,7 +327,7 @@ pub fn attn_combine_bf16_hd128(name: &str) -> Function {
     let inv = b.rcp_f32(den);
     let y = b.mul_f32(Opnd::Var(v2[1]), inv);
     let yb = b.cvt_pk_bf16_f32(y, y);
-    let o_vo = b.bind_i32((ev(row) * D + ev(tid)) << 1);
+    let o_vo = b.bind_i32((ev(row) * dv + ev(tid)) << 1);
     b.buffer_store_n(r_o, Some(Opnd::Val(o_vo)), c0, 0, yb, amdgpu_dsl::MemTy::U16, false);
     b.finish()
 }

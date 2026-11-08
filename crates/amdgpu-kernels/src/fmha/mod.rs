@@ -14,6 +14,7 @@ pub mod io;
 pub mod graph;
 pub mod bf16;
 pub mod decode;
+pub mod mla;
 mod skeleton_kvsplit;
 mod skeleton_t128;
 mod skeleton_vs128;
