@@ -75,7 +75,7 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     let slot = b.read_first_lane(slot);
     // a valid slot is in [0, S); the cache descriptors cover just this slot's row, their bases moved by a 64-bit ptr_mad (caches > 4 GiB).
     // Invalid slots (padding < 0, or >= S) write nothing: their stores are masked, the descriptor uses the clamped slot.
-    let ok = b.bind_cond(ev(slot).ge(0) & ev(slot).lt(ev(s_v)));
+    let ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
     let sl = { let v = b.bind_i32(ev(slot).max(0).min(ev(s_v) - 1)); b.read_first_lane(v) };
     let rowc = b.c_i32(row as i32);
     let pkc = b.ptr_mad(ptrs[2], sl, rowc);
@@ -164,7 +164,7 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
     let slot = b.read_first_lane(slot);
     // a valid slot is in [0, S); the cache descriptors cover just the slot's block (BS rows), their bases moved by a 64-bit ptr_mad (caches
     // > 4 GiB). Invalid slots write nothing (masked stores); the descriptor uses the clamped slot.
-    let ok = b.bind_cond(ev(slot).ge(0) & ev(slot).lt(ev(s_v)));
+    let ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
     let sl = { let v = b.bind_i32(ev(slot).max(0).min(ev(s_v) - 1)); b.read_first_lane(v) };
     let blk = { let v = b.bind_i32(ev(sl).lshr(bsh)); b.read_first_lane(v) };
     let off = b.bind_i32(ev(sl) & (bs as i32 - 1));
