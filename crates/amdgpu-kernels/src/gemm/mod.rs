@@ -54,6 +54,11 @@ pub struct GemmConfig {
     pub conv: Option<ConvCfg>,
     /// `Scales::Mx32` with the shuffled scale layout [rows / 16][KT / 2][64 lanes][4 bytes] (one coalesced dword per lane, block and tile pair)
     pub scale_shuf: bool,
+    /// batched GEMM (`_bmm`): grid z = batch (kernarg 36); A, B, C and the scales of batch z are dense blocks of the per-batch sizes, each
+    /// operand's base moved by a 64-bit `ptr_mad`
+    pub batched: bool,
+    /// with `Scales::RowCol`: per-TENSOR scales (`_pt`): `ptr_sfa` / `ptr_sfb` each one fp32 (A and B scale), applied in the epilogue
+    pub per_tensor: bool,
 }
 
 /// Implicit-GEMM convolution, NDHWC input [NB, DI, H, W, C] bf16 (2d: DI = 1, kernel depth 1), weights [K][C / 64][T][R][S][64] (the 128-byte
@@ -160,7 +165,7 @@ pub enum Scales {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -327,7 +332,7 @@ fn declare_abi(b: &mut FnBuilder) {
 /// The host contract of the ABI for a `cta_m x cta_n` CTA (what `gpu-verify` proves the accesses against): M = MT cta_m, N = NT cta_n, K = KT 128
 /// (the kernel has no partial tiles), the grid (NT, MT), dense strides (stride_a = stride_b = K, stride_c = N, stride_sfa = M, stride_sfb = K / 128),
 /// batch 1, and the tensor extents A M K, B N K (preshuffled, same size), C 2 M N, sa (K / 128) M, sb (N / 128) (K / 128) bytes.
-fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool, moe: Option<MoeStage>, conv: Option<ConvCfg>) {
+fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool, moe: Option<MoeStage>, conv: Option<ConvCfg>, batched: bool, per_tensor: bool) {
     if let Some(cc) = conv {
         return declare_contract_conv(b, cta_m, cta_n, cc);
     }
@@ -349,13 +354,21 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, p
     };
     let m = mt.clone() * Ext::c(cta_m);
     let n = nt.clone() * Ext::c(cta_n);
+    // batched: BT batches, grid z = BT, every tensor BT times its per-batch extent (the per-batch base checks are ptr_mad's)
+    let bt = if batched {
+        b.sym_range("BT", 1, 4096);
+        b.grid_is(2, Ext::sym("BT"));
+        Ext::sym("BT")
+    } else {
+        Ext::c(1)
+    };
     // K in elements (kernarg) and in bytes (extents): KT tiles of 128 bytes
     let k = kt.clone() * Ext::c(128);
     let k_el = kt.clone() * Ext::c(per_tile);
     b.ka_is(24, m.clone());
     b.ka_is(28, n.clone());
     b.ka_is(32, k_el.clone());
-    b.ka_is(36, if split { Ext::sym("S") } else { Ext::c(1) });
+    b.ka_is(36, if split { Ext::sym("S") } else if batched { Ext::sym("BT") } else { Ext::c(1) });
     if split {
         b.ka_is(88, Ext::sym("KS"));
         b.ka_is(92, m.clone());
@@ -368,30 +381,34 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, p
     b.ka_is(84, kt.clone());
     b.grid_is(0, nt.clone());
     b.grid_is(1, mt.clone());
-    b.arg_tensor("ptr_a", m.clone() * k.clone());
-    b.arg_tensor("ptr_b", n.clone() * k.clone());
+    b.arg_tensor("ptr_a", bt.clone() * m.clone() * k.clone());
+    b.arg_tensor("ptr_b", bt.clone() * n.clone() * k.clone());
     if split {
-        b.arg_tensor("ptr_c", Ext::c(4) * Ext::sym("S") * m.clone() * n.clone());
+        b.arg_tensor("ptr_c", bt.clone() * Ext::c(4) * Ext::sym("S") * m.clone() * n.clone());
     } else {
-        b.arg_tensor("ptr_c", Ext::c(2) * m.clone() * n.clone());
+        b.arg_tensor("ptr_c", bt.clone() * Ext::c(2) * m.clone() * n.clone());
     }
     match scales {
         Scales::Mx128 => {
-            b.arg_tensor("ptr_sfa", kt.clone() * m);
-            b.arg_tensor("ptr_sfb", nt * Ext::c(cta_n / 128) * kt);
+            b.arg_tensor("ptr_sfa", bt.clone() * kt.clone() * m);
+            b.arg_tensor("ptr_sfb", bt.clone() * nt * Ext::c(cta_n / 128) * kt);
+        }
+        Scales::RowCol if per_tensor => {
+            b.arg_tensor("ptr_sfa", bt.clone() * Ext::c(4));
+            b.arg_tensor("ptr_sfb", bt.clone() * Ext::c(4));
         }
         Scales::RowCol => {
-            b.arg_tensor("ptr_sfa", Ext::c(4) * m);
-            b.arg_tensor("ptr_sfb", Ext::c(4) * n);
+            b.arg_tensor("ptr_sfa", bt.clone() * Ext::c(4) * m);
+            b.arg_tensor("ptr_sfb", bt.clone() * Ext::c(4) * n);
         }
         Scales::None => {}
         Scales::Mx32 => {
-            b.arg_tensor("ptr_sfa", m * kt.clone() * Ext::c(8));
-            b.arg_tensor("ptr_sfb", n * kt * Ext::c(8));
+            b.arg_tensor("ptr_sfa", bt.clone() * m * kt.clone() * Ext::c(8));
+            b.arg_tensor("ptr_sfb", bt.clone() * n * kt * Ext::c(8));
         }
         Scales::Block128 => {
-            b.arg_tensor("ptr_sfa", m * kt.clone() * Ext::c(4));
-            b.arg_tensor("ptr_sfb", nt * Ext::c(cta_n / 128) * kt * Ext::c(4));
+            b.arg_tensor("ptr_sfa", bt.clone() * m * kt.clone() * Ext::c(4));
+            b.arg_tensor("ptr_sfb", bt.clone() * nt * Ext::c(cta_n / 128) * kt * Ext::c(4));
         }
     }
 }
@@ -1174,6 +1191,13 @@ pub fn by_name(name: &str) -> Option<Function> {
             let (s, rc) = match rest.strip_suffix("_rc") { Some(s) => (s, true), None => (rest, false) };
             s.parse::<i64>().ok().filter(|s| (1..=16).contains(s)).map(|s| reduce::gemm_splitk_reduce(n, s, rc))
         }
+        // batched forms (`_bmm`: grid z = batch)
+        "gemm_a16w16_bf16_bmm" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_bmm", GemmConfig { batched: true, ..GemmConfig::a16w16() })),
+        "gemm_mxfp8_bs_v4_bmm" => Some(gemm_mxfp8_bs("gemm_mxfp8_bs_v4_bmm", GemmConfig { batched: true, ..GemmConfig::v4() })),
+        // per-tensor fp8 (one fp32 scale for A and one for B)
+        "gemm_a8w8_pertensor_fp8" => Some(gemm_mxfp8_bs("gemm_a8w8_pertensor_fp8", GemmConfig { per_tensor: true, ..GemmConfig::a8w8_rowcol() })),
+        "gemm_a8w8_pertensor_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_pertensor_fp8_128", GemmConfig { per_tensor: true, ..GemmConfig::a8w8_rowcol_128() })),
+        "gemm_a8w8_rowcol_fp8_bmm" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_bmm", GemmConfig { batched: true, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a4w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4", GemmConfig::a4w4())),
         "gemm_a4w4_mxfp4_128" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_128", GemmConfig::a4w4_128())),
         _ => None,
@@ -1248,7 +1272,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         b.sched_opts(cfg.sched);
     }
     declare_abi(b);
-    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k, cfg.moe, cfg.conv);
+    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k, cfg.moe, cfg.conv, cfg.batched, cfg.per_tensor);
     // timing stamps (opt-in debug build, GEMM_STAMP=ends|tiles): one extra pointer argument after the ABI (offset 96); see docs/stamps.md
     let stamp_mode = std::env::var("GEMM_STAMP").ok().filter(|v| v == "ends" || v == "tiles");
     if stamp_mode.is_some() {
@@ -1260,6 +1284,30 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let ptr_c = b.let_(Op::KernargPtr { offset: 16 });
     let ptr_sfa = b.let_(Op::KernargPtr { offset: 64 });
     let ptr_sfb = b.let_(Op::KernargPtr { offset: 72 });
+    // batched: batch z's operands (dense per-batch blocks: A M KB, B N KB bytes (KB = 128 KT), C 2 M N, the scales by kind)
+    let (ptr_a, ptr_b, ptr_c, ptr_sfa, ptr_sfb) = if cfg.batched {
+        assert!(!cfg.split_k && cfg.moe.is_none() && cfg.conv.is_none(), "batched: plain GEMMs only");
+        let z = b.let_(Op::WorkgroupIdZ);
+        let m0 = b.let_(Op::KernargI32 { offset: 24 });
+        let n0 = b.let_(Op::KernargI32 { offset: 28 });
+        let kel = b.let_(Op::KernargI32 { offset: 32 });
+        let kt0 = b.let_(Op::KernargI32 { offset: 84 });
+        let sz = |b: &mut FnBuilder, e: amdgpu_dsl::I32| { let v = b.bind_i32(e); b.read_first_lane(v) };
+        let a_sz = sz(b, ev(m0) * ev(kt0) * 128);
+        let b_sz = sz(b, ev(n0) * ev(kt0) * 128);
+        let c_sz = sz(b, ev(m0) * ev(n0) * 2);
+        let (sa_sz, sb_sz) = match cfg.scales {
+            Scales::None => (sz(b, amdgpu_dsl::I32::c(0)), sz(b, amdgpu_dsl::I32::c(0))),
+            Scales::RowCol if cfg.per_tensor => (sz(b, amdgpu_dsl::I32::c(4)), sz(b, amdgpu_dsl::I32::c(4))),
+            Scales::RowCol => (sz(b, ev(m0) * 4), sz(b, ev(n0) * 4)),
+            Scales::Mx128 => (sz(b, ev(kel).lshr(7) * ev(m0)), sz(b, ev(n0).lshr(7) * ev(kel).lshr(7))),
+            Scales::Block128 => (sz(b, ev(kel).lshr(7) * ev(m0) * 4), sz(b, ev(n0).lshr(7) * ev(kel).lshr(7) * 4)),
+            Scales::Mx32 => (sz(b, ev(m0) * ev(kel).lshr(5)), sz(b, ev(n0) * ev(kel).lshr(5))),
+        };
+        (b.ptr_mad(ptr_a, z, a_sz), b.ptr_mad(ptr_b, z, b_sz), b.ptr_mad(ptr_c, z, c_sz), b.ptr_mad(ptr_sfa, z, sa_sz), b.ptr_mad(ptr_sfb, z, sb_sz))
+    } else {
+        (ptr_a, ptr_b, ptr_c, ptr_sfa, ptr_sfb)
+    };
     let m_v = b.let_(Op::KernargI32 { offset: 24 });
     let n_v = b.let_(Op::KernargI32 { offset: 28 });
     let k_el = b.let_(Op::KernargI32 { offset: 32 });
@@ -1451,6 +1499,11 @@ impl skeleton_v4::V4Slots for GemmSlots {
             { let n = b.bind_i32(ev(m_v) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
             { let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
         ),
+        Scales::RowCol if cfg.per_tensor => {
+            let n = b.c_i32(4);
+            let n = b.read_first_lane(n);
+            (b.buffer_desc_dyn(ptr_sfa, n), b.buffer_desc_dyn(ptr_sfb, n))
+        }
         Scales::RowCol => (
             { let n = b.bind_i32(ev(m_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
             // MoE: the weight scales of every expert [E, n]
@@ -1707,7 +1760,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     }
     if let Some(epi) = &epi {
         let rowcol = (cfg.scales == Scales::RowCol).then_some((body.rsrc_sfa, body.rsrc_sfb));
-        lds_epilogue(b, &ctx, &mma, epi, &body.acc, &lane, &s_lane, &s_n, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, cfg.epi_phases, rowcol);
+        lds_epilogue(b, &ctx, &mma, epi, &body.acc, &lane, &s_lane, &s_n, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, cfg.epi_phases, rowcol, cfg.per_tensor);
         if let Some((buf, rec, _)) = stamp_ctx {
             let st = b.memtime_lo();
             b.stamp_store(buf, rec, 4, st); // slot 4: epilogue stores issued
@@ -1899,6 +1952,7 @@ fn lds_epilogue(
     b: &mut FnBuilder, ctx: &Ctx, mma: &TiledMma, epi: &Shared, acc: &[VarId], lane: &Lane, s_lane: &Ix, s_n: &Ix, ptr_c: ValueId, m_v: ValueId,
     n_v: ValueId, bx: ValueId, by: ValueId, wm: ValueId, wn: ValueId, lg_m: i32, lg_n: i32, wave_m: i64, wave_n: i64, phases: usize,
     rowcol: Option<(ValueId, ValueId)>,
+    per_tensor: bool,
 ) {
     let d = &ctx.dyns;
     let (nm, nn) = ((wave_m / 16) as usize, (wave_n / 16) as usize);
@@ -1906,6 +1960,15 @@ fn lds_epilogue(
     // per-token x per-channel scales: the lane's row of every m block (one f32) and its 4 consecutive columns of every n block (one 16-byte
     // load), from the C TV layout of the atom over a (row 1024 + col) index; loaded before the staging barrier
     let scl: Option<(Vec<ValueId>, Vec<ValueId>)> = rowcol.map(|(rs_a, rs_b)| {
+        if per_tensor {
+            // one A and one B scale (the whole tensor): the same value for every row / column
+            let z = b.c_i32(0);
+            let sa = b.buffer_load_f32(rs_a, z, 0i32, 0);
+            let sbv = b.buffer_load_f32(rs_b, z, 0i32, 0);
+            let sbi = b.bitcast_i32(sbv);
+            let sb4 = b.frag4(sbi, sbi, sbi, sbi);
+            return ((0..nm).map(|_| sa).collect(), (0..nn).map(|_| sb4).collect());
+        }
         let idx = IssuePlan::new(mma.c_tv(), 4).offsets(&make_layout(tup![16, 16], tup![1024, 1]), s_lane, &Ix::C(0), d);
         let o = b.bind_i32(ctx.lower(&idx[0]));
         let row = b.bind_i32((ev(by) << lg_m) + ev(wm) * (wave_m as i32) + ev(o).lshr(10));
