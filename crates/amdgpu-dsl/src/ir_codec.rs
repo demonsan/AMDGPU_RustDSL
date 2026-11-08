@@ -170,6 +170,9 @@ impl FromIr for Op {
             "LoadLdsD16" => { v.expect_struct("LoadLdsD16")?; Ok(Op::LoadLdsD16 { addr: FromIr::from_ir(v.field("addr")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
             "LoadLds2" => { v.expect_struct("LoadLds2")?; Ok(Op::LoadLds2 { addr: FromIr::from_ir(v.field("addr")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
             "LoadLdsTrB16" => { v.expect_struct("LoadLdsTrB16")?; Ok(Op::LoadLdsTrB16 { addr: FromIr::from_ir(v.field("addr")?)? }) }
+            "Dpp" => { v.expect_struct("Dpp")?; Ok(Op::Dpp { dpp: FromIr::from_ir(v.field("dpp")?)?, x: FromIr::from_ir(v.field("x")?)?, old: FromIr::from_ir(v.field("old")?)? }) }
+            "DppAlu" => { v.expect_struct("DppAlu")?; Ok(Op::DppAlu { op: FromIr::from_ir(v.field("op")?)?, dpp: FromIr::from_ir(v.field("dpp")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, old: FromIr::from_ir(v.field("old")?)? }) }
+            "Permlane16Swap" => { v.expect_struct("Permlane16Swap")?; Ok(Op::Permlane16Swap { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Cvt" => { v.expect_struct("Cvt")?; Ok(Op::Cvt { op: FromIr::from_ir(v.field("op")?)?, srcs: FromIr::from_ir(v.field("srcs")?)?, sel: FromIr::from_ir(v.field("sel")?)? }) }
             "Mfma" => { v.expect_struct("Mfma")?; Ok(Op::Mfma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
             other => Err(v.err(format!("unknown Op variant `{other}`"))),
@@ -273,6 +276,9 @@ impl IrIds for Op {
             Op::LoadLdsD16 { addr, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
             Op::LoadLds2 { addr, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
             Op::LoadLdsTrB16 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
+            Op::Dpp { dpp, x, old } => { IrIds::ids(&mut (*dpp), fv, fr); IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*old), fv, fr); }
+            Op::DppAlu { op, dpp, a, b, old } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*dpp), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*old), fv, fr); }
+            Op::Permlane16Swap { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Cvt { op, srcs, sel } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*srcs), fv, fr); IrIds::ids(&mut (*sel), fv, fr); }
             Op::Mfma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }
         }
@@ -1217,6 +1223,104 @@ impl IrIds for CvtOp {
             CvtOp::PkU8F32 => {}
             CvtOp::PkI16I32 => {}
             CvtOp::PkU16U32 => {}
+        }
+    }
+}
+
+impl FromIr for DppCtrl {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "QuadPerm" => { v.expect_tuple("QuadPerm", 1)?; Ok(DppCtrl::QuadPerm(FromIr::from_ir(v.item(0)?)?)) }
+            "RowShl" => { v.expect_tuple("RowShl", 1)?; Ok(DppCtrl::RowShl(FromIr::from_ir(v.item(0)?)?)) }
+            "RowShr" => { v.expect_tuple("RowShr", 1)?; Ok(DppCtrl::RowShr(FromIr::from_ir(v.item(0)?)?)) }
+            "RowRor" => { v.expect_tuple("RowRor", 1)?; Ok(DppCtrl::RowRor(FromIr::from_ir(v.item(0)?)?)) }
+            "WaveShl1" => { v.expect_unit("WaveShl1")?; Ok(DppCtrl::WaveShl1) }
+            "WaveRol1" => { v.expect_unit("WaveRol1")?; Ok(DppCtrl::WaveRol1) }
+            "WaveShr1" => { v.expect_unit("WaveShr1")?; Ok(DppCtrl::WaveShr1) }
+            "WaveRor1" => { v.expect_unit("WaveRor1")?; Ok(DppCtrl::WaveRor1) }
+            "RowMirror" => { v.expect_unit("RowMirror")?; Ok(DppCtrl::RowMirror) }
+            "RowHalfMirror" => { v.expect_unit("RowHalfMirror")?; Ok(DppCtrl::RowHalfMirror) }
+            "RowBcast15" => { v.expect_unit("RowBcast15")?; Ok(DppCtrl::RowBcast15) }
+            "RowBcast31" => { v.expect_unit("RowBcast31")?; Ok(DppCtrl::RowBcast31) }
+            other => Err(v.err(format!("unknown DppCtrl variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for DppCtrl {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            DppCtrl::QuadPerm(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            DppCtrl::RowShl(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            DppCtrl::RowShr(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            DppCtrl::RowRor(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            DppCtrl::WaveShl1 => {}
+            DppCtrl::WaveRol1 => {}
+            DppCtrl::WaveShr1 => {}
+            DppCtrl::WaveRor1 => {}
+            DppCtrl::RowMirror => {}
+            DppCtrl::RowHalfMirror => {}
+            DppCtrl::RowBcast15 => {}
+            DppCtrl::RowBcast31 => {}
+        }
+    }
+}
+
+impl FromIr for Dpp {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("Dpp")?;
+        Ok(Dpp {
+            ctrl: FromIr::from_ir(v.field("ctrl")?)?,
+            row_mask: FromIr::from_ir(v.field("row_mask")?)?,
+            bank_mask: FromIr::from_ir(v.field("bank_mask")?)?,
+            bound_zero: FromIr::from_ir(v.field("bound_zero")?)?,
+        })
+    }
+}
+impl IrIds for Dpp {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.ctrl, fv, fr);
+        IrIds::ids(&mut self.row_mask, fv, fr);
+        IrIds::ids(&mut self.bank_mask, fv, fr);
+        IrIds::ids(&mut self.bound_zero, fv, fr);
+    }
+}
+
+impl FromIr for DppAluOp {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "AddF32" => { v.expect_unit("AddF32")?; Ok(DppAluOp::AddF32) }
+            "SubF32" => { v.expect_unit("SubF32")?; Ok(DppAluOp::SubF32) }
+            "MulF32" => { v.expect_unit("MulF32")?; Ok(DppAluOp::MulF32) }
+            "MaxF32" => { v.expect_unit("MaxF32")?; Ok(DppAluOp::MaxF32) }
+            "MinF32" => { v.expect_unit("MinF32")?; Ok(DppAluOp::MinF32) }
+            "AddU32" => { v.expect_unit("AddU32")?; Ok(DppAluOp::AddU32) }
+            "MaxI32" => { v.expect_unit("MaxI32")?; Ok(DppAluOp::MaxI32) }
+            "MinI32" => { v.expect_unit("MinI32")?; Ok(DppAluOp::MinI32) }
+            "MaxU32" => { v.expect_unit("MaxU32")?; Ok(DppAluOp::MaxU32) }
+            "MinU32" => { v.expect_unit("MinU32")?; Ok(DppAluOp::MinU32) }
+            "AndB32" => { v.expect_unit("AndB32")?; Ok(DppAluOp::AndB32) }
+            "OrB32" => { v.expect_unit("OrB32")?; Ok(DppAluOp::OrB32) }
+            "XorB32" => { v.expect_unit("XorB32")?; Ok(DppAluOp::XorB32) }
+            other => Err(v.err(format!("unknown DppAluOp variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for DppAluOp {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            DppAluOp::AddF32 => {}
+            DppAluOp::SubF32 => {}
+            DppAluOp::MulF32 => {}
+            DppAluOp::MaxF32 => {}
+            DppAluOp::MinF32 => {}
+            DppAluOp::AddU32 => {}
+            DppAluOp::MaxI32 => {}
+            DppAluOp::MinI32 => {}
+            DppAluOp::MaxU32 => {}
+            DppAluOp::MinU32 => {}
+            DppAluOp::AndB32 => {}
+            DppAluOp::OrB32 => {}
+            DppAluOp::XorB32 => {}
         }
     }
 }

@@ -2280,6 +2280,36 @@ impl Lowerer {
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
+            Op::Dpp { dpp, x, old } => {
+                let r = self.as_v1(*x)?;
+                let o = self.as_v1(*old)?;
+                self.touch(&[Src::Reg(r), Src::Reg(o)]);
+                let d = self.new_vreg(RClass::V1);
+                self.copy_reg(d, o)?;
+                self.push(MInst::new(MOp::VMovDppX).def(d).srcreg(r).srcreg(d).imm(dpp.imm()));
+                self.val.insert(dst, d);
+            }
+            Op::DppAlu { op, dpp, a, b, old } => {
+                let ra = self.as_v1(*a)?;
+                let rb = self.as_v1(*b)?;
+                let o = self.as_v1(*old)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rb), Src::Reg(o)]);
+                let d = self.new_vreg(RClass::V1);
+                self.copy_reg(d, o)?;
+                self.push(MInst::new(dpp_alu_mop(*op)).def(d).srcreg(ra).srcreg(rb).srcreg(d).imm(dpp.imm()));
+                self.val.insert(dst, d);
+            }
+            Op::Permlane16Swap { a, b } => {
+                let (ra, rb) = (self.as_v1(*a)?, self.as_v1(*b)?);
+                self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
+                let d = self.new_vreg(RClass::V2);
+                let lo = self.alias_vreg(d, 0, RClass::V1);
+                let hi = self.alias_vreg(d, 1, RClass::V1);
+                self.push(MInst::new(MOp::VMovB32).def(lo).srcreg(ra));
+                self.push(MInst::new(MOp::VMovB32).def(hi).srcreg(rb));
+                self.push(MInst::new(MOp::VPermlane16Swap).def(lo).srcreg(lo).srcreg(hi));
+                self.val.insert(dst, d);
+            }
             Op::Cvt { op, srcs, sel } => {
                 let (n, ty, _) = op.sig();
                 let (mop, partial) = cvt_mop(*op);
@@ -4291,5 +4321,24 @@ fn cvt_mop(o: amdgpu_dsl::CvtOp) -> (MOp, bool) {
         C::PkU8F32 => (MOp::VCvtPkU8F32, false),
         C::PkI16I32 => (MOp::VCvtPkI16I32, false),
         C::PkU16U32 => (MOp::VCvtPkU16U32, false),
+    }
+}
+
+fn dpp_alu_mop(o: amdgpu_dsl::DppAluOp) -> MOp {
+    use amdgpu_dsl::DppAluOp as D;
+    match o {
+        D::AddF32 => MOp::VAddF32Dpp,
+        D::SubF32 => MOp::VSubF32Dpp,
+        D::MulF32 => MOp::VMulF32Dpp,
+        D::MaxF32 => MOp::VMaxF32Dpp,
+        D::MinF32 => MOp::VMinF32Dpp,
+        D::AddU32 => MOp::VAddU32Dpp,
+        D::MaxI32 => MOp::VMaxI32Dpp,
+        D::MinI32 => MOp::VMinI32Dpp,
+        D::MaxU32 => MOp::VMaxU32Dpp,
+        D::MinU32 => MOp::VMinU32Dpp,
+        D::AndB32 => MOp::VAndB32Dpp,
+        D::OrB32 => MOp::VOrB32Dpp,
+        D::XorB32 => MOp::VXorB32Dpp,
     }
 }
