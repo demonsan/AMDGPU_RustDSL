@@ -16,7 +16,7 @@ const KERNELS: &[&str] = &[
     "rope_neox_bf16_h1_d64", "rope_neox_bf16_h2_d128", "rope_gptj_bf16_h1_d64", "rope_neox_bf16_h4_d64_r32",
     "moe_reduce_bf16_k8_d7168", "moe_reduce_bf16_k6_d2048", "moe_combine_bf16_k8_d4096", "moe_combine_bf16_k2_d24",
     "silu_mul_limit_bf16_d4096", "swiglu_oai_mul_bf16_d4096", "silu_mul_limit_bf16_d24", "silu_bf16", "gelu_tanh_bf16", "gelu_fast_bf16", "relu2_bf16", "sigmoid_bf16",
-    "gated_rmsnorm_bf16_n128", "gated_rmsnorm_fp8_n128", "gated_rmsnorm_bf16_n1000", "gated_rmsnorm_fp8_n4096", "reshape_cache_flash_fp8_h8_d128", "reshape_cache_flash_fp8_h5_d64",
+    "gated_rmsnorm_bf16_n128", "gated_rmsnorm_fp8_n128", "gated_rmsnorm_bf16_n1000", "gated_rmsnorm_fp8_n2048", "reshape_cache_flash_fp8_h8_d128", "reshape_cache_flash_fp8_h5_d64",
     "topk_softmax_bf16_e128_k8", "topk_softmax_renorm_bf16_e256_k8", "topk_softmax_bf16_e64_k2", "topk_softmax_bf16_e512_k4", "topk_softmax_bf16_e32_k1",
 ];
 
