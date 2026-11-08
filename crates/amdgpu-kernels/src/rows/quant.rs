@@ -8,7 +8,7 @@
 //! N (D) a multiple of 8, 8..=8192; chunks past the row end are masked in the statistics and their stores dropped by the buffer descriptor.
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, TriOp, UnOp, ValueId};
-use amdgpu_tile::prims::{act, abs_f32, bf16x8_to_f32, fp8_pack, fp8_scale, lane_reduce, wave_reduce, Act, RedOp};
+use amdgpu_tile::prims::{act, abs_f32, bf16x8_to_f32, dpp_reduce, fp8_pack, fp8_scale, group_reduce_dpp, lane_reduce, wave_reduce, wave_reduce_dpp, Act, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,7 +183,7 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
                 let m = lane_reduce(b, RedOp::Max, &a);
                 part = Some(match part { None => m, Some(p) => b.max_f32(p, m) });
             }
-            let amax = wave_reduce(b, RedOp::Max, part.unwrap(), &me, 0, 0, &lane);
+            let amax = if dpp_reduce() { wave_reduce_dpp(b, RedOp::Max, part.unwrap()) } else { wave_reduce(b, RedOp::Max, part.unwrap(), &me, 0, 0, &lane) };
             let (s, inv) = if kind == QuantKind::TokenInt8 { int8_scale(b, amax) } else { fp8_scale(b, amax) };
             for i in 0..nld {
                 store_q(b, i, inv, &ys[i]);
@@ -195,7 +195,7 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
             for i in 0..nld {
                 let a = abs8(b, &ys[i]);
                 let m = lane_reduce(b, RedOp::Max, &a);
-                let gmax = group16_max(b, m, &me, i as i32, &lane);
+                let gmax = if dpp_reduce() { group_reduce_dpp(b, RedOp::Max, m, 16) } else { group16_max(b, m, &me, i as i32, &lane) };
                 let (s, inv) = fp8_scale(b, gmax);
                 store_q(b, i, inv, &ys[i]);
                 // one scale per group: [row][4 i + lane / 16] (all 16 lanes of a group store the same value; tail groups are dropped)

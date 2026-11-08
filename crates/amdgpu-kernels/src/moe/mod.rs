@@ -8,6 +8,8 @@
 //! Outputs: `sorted_token_ids[p] = (slot << 24) | token` grouped by expert (ascending), each group padded with `(K << 24) | M`; `sorted_weights[p]` the weight (0 on padding); `sorted_expert_ids[j]` the expert of tile
 //! j (E past the used tiles); `num_valid_ids = [padded_total, M]`; `tile_start[e]` = first tile of expert e, `tile_start[E]` = padded_total / BM. Order inside an expert's group = atomic arrival order (a multiset).
 
+pub mod multi;
+
 use amdgpu_dsl::{AtomicOp, CmpPred, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 use amdgpu_tile::ev;
 
