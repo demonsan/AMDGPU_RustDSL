@@ -182,6 +182,8 @@ fn batch_kernarg_loads(m: &mut MFunction) {
 }
 
 struct Lowerer {
+    /// diagnostics: the value being lowered (MInst::origin)
+    cur_origin: u32,
     mir: MFunction,
     val: HashMap<ValueId, VReg>,
     /// Values that were converted from a scalar register into a vector one.
@@ -315,6 +317,7 @@ impl Lowerer {
         }
 
         Lowerer {
+            cur_origin: u32::MAX,
             mir,
             val: HashMap::new(),
             converted: HashMap::new(),
@@ -580,6 +583,9 @@ impl Lowerer {
 
     fn push(&mut self, mut inst: MInst) {
         inst.region = self.region_stack.last().copied().unwrap_or(0);
+        if inst.origin == u32::MAX {
+            inst.origin = self.cur_origin;
+        }
         self.mir.blocks[self.cur].insts.push(inst);
     }
 
@@ -1670,6 +1676,7 @@ impl Lowerer {
         {
             match st {
                 Stmt::Let { dst, op } => {
+                    self.cur_origin = *dst;
                     self.lower_op(*dst, op)?;
                     if self.view_copy.contains(dst) {
                         // SSA semantics for a view of a loop variable used after the variable is written: snapshot it now
@@ -2793,12 +2800,28 @@ impl Lowerer {
                 let (n, ty, _) = op.sig();
                 let (mop, partial) = cvt_mop(*op);
                 let mut rs = Vec::with_capacity(n);
-                for s in &srcs[..n] {
-                    rs.push(self.as_v1(*s)?);
+                for (k, s) in srcs[..n].iter().enumerate() {
+                    use amdgpu_dsl::CvtOp as C6;
+                    let wide = match op {
+                        C6::Scale2xPk16Fp6F32 | C6::Scale2xPk16Bf6F32 if k < 2 => Some(RClass::V16),
+                        C6::ScalePk32Fp6F16 | C6::ScalePk32Fp6Bf16 | C6::ScalePk32Bf6F16 | C6::ScalePk32Bf6Bf16 if k == 0 => Some(RClass::V16),
+                        C6::ScalePk32F16Fp6 | C6::ScalePk32Bf16Fp6 | C6::ScalePk32F16Bf6 | C6::ScalePk32Bf16Bf6 if k == 0 => Some(RClass::V8),
+                        _ => None,
+                    };
+                    rs.push(match wide {
+                        Some(RClass::V16) => self.as_v16(*s)?,
+                        Some(_) => self.as_v8(*s)?,
+                        None => self.as_v1(*s)?,
+                    });
                 }
                 let touched: Vec<Src> = rs.iter().map(|r| Src::Reg(*r)).collect();
                 self.touch(&touched);
-                let d = self.new_vreg(if ty == DType::Frag2 { RClass::V2 } else { RClass::V1 });
+                let d = self.new_vreg(match ty {
+                    DType::Frag2 => RClass::V2,
+                    DType::Frag8 => RClass::V8,
+                    DType::Frag16 => RClass::V16,
+                    _ => RClass::V1,
+                });
                 let mut inst = MInst::new(mop).def(d).imm(*sel as i64);
                 if partial {
                     // the instruction keeps the destination's other bits: start from the old value, tie it as the last source
@@ -4803,6 +4826,16 @@ fn cvt_mop(o: amdgpu_dsl::CvtOp) -> (MOp, bool) {
         C::ScalePkF32Fp8 => (MOp::VCvtScalePkF32Fp8, false),
         C::ScalePkF32Bf8 => (MOp::VCvtScalePkF32Bf8, false),
         C::ScalePkF32Fp4 => (MOp::VCvtScalePkF32Fp4, false),
+        C::Scale2xPk16Fp6F32 => (MOp::VCvtScale2xPk16Fp6F32, false),
+        C::Scale2xPk16Bf6F32 => (MOp::VCvtScale2xPk16Bf6F32, false),
+        C::ScalePk32Fp6F16 => (MOp::VCvtScalePk32Fp6F16, false),
+        C::ScalePk32Fp6Bf16 => (MOp::VCvtScalePk32Fp6Bf16, false),
+        C::ScalePk32Bf6F16 => (MOp::VCvtScalePk32Bf6F16, false),
+        C::ScalePk32Bf6Bf16 => (MOp::VCvtScalePk32Bf6Bf16, false),
+        C::ScalePk32F16Fp6 => (MOp::VCvtScalePk32F16Fp6, false),
+        C::ScalePk32Bf16Fp6 => (MOp::VCvtScalePk32Bf16Fp6, false),
+        C::ScalePk32F16Bf6 => (MOp::VCvtScalePk32F16Bf6, false),
+        C::ScalePk32Bf16Bf6 => (MOp::VCvtScalePk32Bf16Bf6, false),
         C::ScalePkBf16Fp4 => (MOp::VCvtScalePkBf16Fp4, false),
         C::ScalePkF16Fp4 => (MOp::VCvtScalePkF16Fp4, false),
         C::ScalePkFp8F32 => (MOp::VCvtScalePkFp8F32, true),

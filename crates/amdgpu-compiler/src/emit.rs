@@ -245,7 +245,7 @@ fn cpol_suffix(c: u8) -> String {
     s
 }
 
-fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
+pub(crate) fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
     let mut v = inst_lines_core(a, inst);
     if inst.cpol != 0 {
         if let Some(last) = v.last_mut() {
@@ -438,6 +438,16 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VCvtScalePkF32Fp8 => vec![format!("v_cvt_scalef32_pk_f32_fp8 {}, {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 1 != 0 { " op_sel:[1,0,0]" } else { "" })],
         MOp::VCvtScalePkF32Bf8 => vec![format!("v_cvt_scalef32_pk_f32_bf8 {}, {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 1 != 0 { " op_sel:[1,0,0]" } else { "" })],
         MOp::VCvtScalePkF32Fp4 => vec![format!("v_cvt_scalef32_pk_f32_fp4 {}, {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 3 != 0 { format!(" op_sel:[{},{},0]", inst.imm & 1, (inst.imm >> 1) & 1) } else { String::new() })],
+        MOp::VCvtScale2xPk16Fp6F32 => vec![format!("v_cvt_scalef32_2xpk16_fp6_f32 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 6), tuple(a, reg_of(&inst.srcs[0]), 16), tuple(a, reg_of(&inst.srcs[1]), 16), src1(a, inst.srcs[2]))],
+        MOp::VCvtScale2xPk16Bf6F32 => vec![format!("v_cvt_scalef32_2xpk16_bf6_f32 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 6), tuple(a, reg_of(&inst.srcs[0]), 16), tuple(a, reg_of(&inst.srcs[1]), 16), src1(a, inst.srcs[2]))],
+        MOp::VCvtScalePk32Fp6F16 => vec![format!("v_cvt_scalef32_pk32_fp6_f16 {}, {}, {}", tuple(a, inst.dst.expect("dst"), 6), tuple(a, reg_of(&inst.srcs[0]), 16), src1(a, inst.srcs[1]))],
+        MOp::VCvtScalePk32Fp6Bf16 => vec![format!("v_cvt_scalef32_pk32_fp6_bf16 {}, {}, {}", tuple(a, inst.dst.expect("dst"), 6), tuple(a, reg_of(&inst.srcs[0]), 16), src1(a, inst.srcs[1]))],
+        MOp::VCvtScalePk32Bf6F16 => vec![format!("v_cvt_scalef32_pk32_bf6_f16 {}, {}, {}", tuple(a, inst.dst.expect("dst"), 6), tuple(a, reg_of(&inst.srcs[0]), 16), src1(a, inst.srcs[1]))],
+        MOp::VCvtScalePk32Bf6Bf16 => vec![format!("v_cvt_scalef32_pk32_bf6_bf16 {}, {}, {}", tuple(a, inst.dst.expect("dst"), 6), tuple(a, reg_of(&inst.srcs[0]), 16), src1(a, inst.srcs[1]))],
+        MOp::VCvtScalePk32F16Fp6 => vec![format!("v_cvt_scalef32_pk32_f16_fp6 {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 6), src1(a, inst.srcs[1]))],
+        MOp::VCvtScalePk32Bf16Fp6 => vec![format!("v_cvt_scalef32_pk32_bf16_fp6 {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 6), src1(a, inst.srcs[1]))],
+        MOp::VCvtScalePk32F16Bf6 => vec![format!("v_cvt_scalef32_pk32_f16_bf6 {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 6), src1(a, inst.srcs[1]))],
+        MOp::VCvtScalePk32Bf16Bf6 => vec![format!("v_cvt_scalef32_pk32_bf16_bf6 {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 6), src1(a, inst.srcs[1]))],
         MOp::VCvtScalePkBf16Fp4 => vec![format!("v_cvt_scalef32_pk_bf16_fp4 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 3 != 0 { format!(" op_sel:[{},{},0]", inst.imm & 1, (inst.imm >> 1) & 1) } else { String::new() })],
         MOp::VCvtScalePkF16Fp4 => vec![format!("v_cvt_scalef32_pk_f16_fp4 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), if inst.imm & 3 != 0 { format!(" op_sel:[{},{},0]", inst.imm & 1, (inst.imm >> 1) & 1) } else { String::new() })],
         MOp::VCvtScalePkFp8F32 => vec![format!("v_cvt_scalef32_pk_fp8_f32 {}, {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), src1(a, inst.srcs[2]), if inst.imm & 1 != 0 { " op_sel:[0,0,0,1]" } else { "" })],

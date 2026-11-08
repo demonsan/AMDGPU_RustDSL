@@ -417,6 +417,28 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        "srcmap" => {
+            // amdc srcmap <kernel> [--line N]: own-backend asm lines -> IR value -> Rust builder call (JSON; docs/diagnostics.md)
+            let Some(name) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let (f, _) = match kernel_spec(name, &args) {
+                Ok(x) => x,
+                Err(c) => return c,
+            };
+            let only = args.windows(2).find(|w| w[0] == "--line").and_then(|w| w[1].parse::<usize>().ok());
+            match amdgpu_compiler::diag::asm_map_json(&f, only) {
+                Ok(j) => {
+                    println!("{j}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    println!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&amdgpu_compiler::diag::from_compile_error(&f, &e)));
+                    ExitCode::from(1)
+                }
+            }
+        }
         "summary" => {
             // amdc summary <kernel> [--json]: resources, per-region instruction mix, waits / nops, certificate counts (docs/diagnostics.md)
             let Some(name) = args.get(1) else {

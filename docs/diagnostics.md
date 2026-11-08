@@ -11,6 +11,7 @@ Agents (and humans) read compiler results as JSON instead of parsing asm or pros
 | `amdc gpu-verify <kernel or --all or --shipped> --json [--strict]` | `[{"kernel","diagnostics":[...]}...]`: every GPU-semantics finding; with `--strict`, exit 1 on an error |
 | `amdc ir-check <file.ir> --json [--verify]` | `{"file","kernel","ok","statements","values","diagnostics"}`: IR-verifier findings (and the certificate's with `--verify`); a parse error is `IR-PARSE` |
 | `amdc regplan <kernel> --json` | `{"kernel","vgpr","agpr","regions":[{"name","insts","vgpr_footprint_peak","vgpr_live_peak","agpr_footprint_peak","peak_at","live_at_peak"}]}` |
+| `amdc srcmap <kernel> [--line N]` | `[{"line","block","inst","region","value","src","asm"}]`: every own-backend asm line mapped to the IR value whose lowering emitted it and that value's Rust builder call (waits / nops / copies added after lowering have `value: null`) |
 | `amdc summary <kernel> [--json]` | `{"kernel","workgroup_size","vgpr","agpr","sgpr","lds_bytes","blocks","instructions","waits","nops","nop_wait_states","regions":[{"name","mfma","vmem","lds","smem","sync","salu","valu"}],"certificate":{"errors","warnings","trusted_assumes","trusted_contracts"}}` |
 
 ## A diagnostic
@@ -45,3 +46,10 @@ compiles a kernel with and without the table, and the shipped kernels' md5s are 
 * Running out of registers: the allocator's message names virtual registers (`rN`). They are mapped back to the values they were lowered
   from (`lower::last_vreg_origins`), so `values` lists the live values at the failing point with their builder calls.
 * The launch register budget (`COMPILE-REG-BUDGET`) and other errors come through with the message and, where present, the statement.
+
+## Asm source map
+
+Every machine instruction carries `MInst::origin`: the IR value whose lowering emitted it (for a store or a branch, the last value-defining
+statement before it). It has no codegen effect. `diag::asm_map` matches the emitted lines in order against the instructions, so an asm
+line (from a profiler, a hazard or a wait report, or a disassembly) maps to an IR value and its builder call. Weave-region names come from
+the same table (`summary` and `srcmap` use the real names, not `regionN`).
