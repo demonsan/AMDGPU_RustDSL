@@ -168,6 +168,8 @@ pub fn mla16_decode_bf16(name: &str, page: i32) -> Function {
             let src = b.bind_i32((ev(pos).lshr(3) << 3) + ((ev(pos) ^ ev(key)) & 7));
             let addr = b.bind_i32(ev(key) << 2);
             let rb = b.bpermute(addr, rowb);
+            // (explicit: the own backend emitted no lgkmcnt wait between ds_bpermute and its use; reported)
+            b.wait_lds(0);
             let rb = b.bitcast_i32(rb);
             let vo = b.bind_i32(ev(rb) + (ev(src) << 4));
             let m0 = b.bind_i32(mbase.clone() + (i << 10));
