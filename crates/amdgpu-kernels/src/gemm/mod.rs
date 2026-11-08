@@ -1214,7 +1214,9 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let z = b.let_(Op::WorkgroupIdZ);
         let c_blk = make_layout(tup![16, 16], tup![s_n.mul_c(4), 4]);
         let c_plan = IssuePlan::new(mma.c_tv(), 4);
-        let c_org = b.bind_i32(((((ev(by) << lg_m) * ev(n_v)) + (ev(bx) << lg_n)) << 2) + ((ev(z) * ev(m_v) * ev(n_v)) << 2));
+        // slices of ceil(M / cta_m) cta_m rows (a partial last row tile writes its padding rows inside its own slice)
+        let mp = b.bind_i32(((ev(m_v) + ((1 << lg_m) - 1)).lshr(lg_m)) << lg_m);
+        let c_org = b.bind_i32(((((ev(by) << lg_m) * ev(n_v)) + (ev(bx) << lg_n)) << 2) + ((ev(z) * ev(mp) * ev(n_v)) << 2));
         let cb = b.ptr_add(ptr_c, c_org);
         let mut exprs = Vec::new();
         for i in 0..wave_m / 16 {

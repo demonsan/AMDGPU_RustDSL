@@ -1,7 +1,8 @@
 //! Split-K reduction of the GEMM's fp32 partials (`GemmConfig::split_k`): C[m][n] (bf16) = (sum_s W[s][m][n]) (sa[m] sb[n] with row / column
 //! scales). One block per row and 1024 columns (256 threads x 4 consecutive columns: one 16-byte load per split, one 8-byte bf16 store).
 //!
-//! ABI: 0 ptr_ws (fp32 [S][M][N]), 8 ptr_c (bf16 [M][N]), 16 ptr_sa (fp32 [M]), 24 ptr_sb (fp32 [N]), 32 M, 36 N, 40 S; grid (N / 1024, M).
+//! ABI: 0 ptr_ws (fp32 [S][MP][N], MP = the slice rows: M rounded up to the GEMM CTA), 8 ptr_c (bf16 [M][N]), 16 ptr_sa (fp32 [M]),
+//! 24 ptr_sb (fp32 [N]), 32 M, 36 N, 40 S, 44 MP; grid (N / 1024, M).
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
 use amdgpu_tile::ev;
 
@@ -12,7 +13,7 @@ pub fn gemm_splitk_reduce(name: &str, splits: i64, rowcol: bool) -> Function {
     for (n, o) in [("ptr_ws", 0u32), ("ptr_c", 8), ("ptr_sa", 16), ("ptr_sb", 24)] {
         b.arg(n, DType::Ptr, o, 8);
     }
-    for (n, o) in [("m", 32u32), ("n", 36), ("s", 40)] {
+    for (n, o) in [("m", 32u32), ("n", 36), ("s", 40), ("mp", 44)] {
         b.arg(n, DType::I32, o, 4);
     }
     let (mm, nb) = (Ext::sym("M"), Ext::sym("NB"));
@@ -22,6 +23,7 @@ pub fn gemm_splitk_reduce(name: &str, splits: i64, rowcol: bool) -> Function {
     b.ka_is(32, mm.clone());
     b.ka_is(36, n_ext.clone());
     b.ka_is(40, Ext::c(splits));
+    b.ka_is(44, mm.clone());
     b.grid_is(0, nb);
     b.grid_is(1, mm.clone());
     b.arg_tensor("ptr_ws", Ext::c(4 * splits) * mm.clone() * n_ext.clone());
@@ -36,14 +38,16 @@ pub fn gemm_splitk_reduce(name: &str, splits: i64, rowcol: bool) -> Function {
     let tid = b.let_(Op::WorkitemId);
     let bx = b.let_(Op::WorkgroupIdX);
     let row = b.let_(Op::WorkgroupIdY);
+    let mp_v = b.let_(Op::KernargI32 { offset: 44 });
     let mn = { let v = b.bind_i32(ev(m_v) * ev(n_v)); b.read_first_lane(v) };
-    let r_ws = { let v = b.bind_i32(ev(mn) * (4 * splits as i32)); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_ws, v) };
+    let mpn = { let v = b.bind_i32(ev(mp_v) * ev(n_v)); b.read_first_lane(v) };
+    let r_ws = { let v = b.bind_i32(ev(mpn) * (4 * splits as i32)); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_ws, v) };
     let r_c = { let v = b.bind_i32(ev(mn) << 1); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_c, v) };
     // the lane's 4 columns: n = 1024 bx + 4 tid of row `row`
     let col = b.bind_i32((ev(bx) << 10) + (ev(tid) << 2));
     let e0 = b.bind_i32(ev(row) * ev(n_v) + ev(col));
     let v_ws = b.bind_i32(ev(e0) << 2);
-    let mn4 = { let v = b.bind_i32(ev(mn) << 2); b.read_first_lane(v) };
+    let mn4 = { let v = b.bind_i32(ev(mpn) << 2); b.read_first_lane(v) };
     let parts: Vec<ValueId> = (0..splits)
         .map(|s| {
             let so = if s == 0 { Opnd::I32(0) } else { Opnd::Val({ let v = b.bind_i32(ev(mn4) * (s as i32)); b.read_first_lane(v) }) };
