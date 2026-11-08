@@ -326,7 +326,7 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | scaled_silu_and_mul（输出 fp8，静态 scale） | 有（组合） | `silu_mul_quant_fp8_d<D>` 的静态 scale 变体可由 `quant_bf16_fp8_static` 接在后面；融合版缺 |
 | 位置编码 | rope neox / gptj，部分旋转（`_r<R>`），token 打包 | 有 | `rope_{neox,gptj}_bf16_h<H>_d<D>[_r<R>]` |
 | | **fused qk-norm + rope**（`fused_qk_norm_rope`，Qwen3 风格逐 head 归一化后旋转） | 有（新） | `qknorm_rope_{neox,gptj}_bf16_h<H>_d<D>`（全旋转）；q、k 各启动一次；H = 8 D = 128 5.7 TB/s |
-| | fused qk-norm + rope + KV cache 写 + fp8 量化（`fused_qk_norm_rope_cache_quant`） | 缺 | 把上一行与 cache 写核拼起来；k 路径已具备全部部件，v 无需旋转；待做 |
+| | **fused qk-norm + rope + KV cache 写（+ fp8 量化）**（`fused_qk_norm_rope_cache_quant` 的 K / V 部分） | 有（新） | `qknorm_rope_kvcache_{neox,gptj}_{bf16,fp8}_h<H>_d<D>[_i64]`：K 逐 head 归一化后旋转、V 原样（bf16）或按静态 `v_scale` 量化（fp8），都直接写进 flash 布局的 cache（`slot_mapping`，int32 / int64）；Q 用 `qknorm_rope_*` 单独一次启动。H = 8，D = 128：bf16 cache 5.9 TB/s，fp8 cache（i64）4.9 TB/s（计流量）。cache < 2 GiB |
 | | mrope（3D 位置）、yarn / 缩放表 | 缺（表由调用方预计算） | 表是 `cos_sin [P][D]` 输入，yarn 只是换表，无需新 kernel；mrope 的按段选位置需要一个小的位置 gather |
 | KV cache | reshape_and_cache flash 布局 / vLLM 分块布局（任意大小 cache） | 有 | `reshape_cache_flash_bf16_h<Hk>_d<D>`、`reshape_cache_blocked_bf16_h<Hk>_d<D>_b<BS>` |
 | | **fp8 KV cache 写（静态 per-tensor scale）** | 有（新） | `reshape_cache_flash_fp8_h<Hk>_d<D>`：k_scale / v_scale kernarg；5.9 TB/s |
@@ -369,3 +369,10 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 `reshape_cache_blocked_fp8_h<Hk>_d<D>_b<BS>[_i64]`（D ∈ {64, 128, 256}，BS ∈ {16, 32, 64, 128}）：每个 (token, head) 取 D 个元素的 amax（一个 head 的 D / 8 个 lane 上的 DPP 全规约），`scale = max(amax, floor) / 448`，`q = fp8(x / scale)`；key 写成 `[NB][Hk][D/16][BS][16]`（每个 lane 一次 8 字节存储），value 写成转置的 `[NB][Hk][D][BS]`（每个元素 1 字节存储），scale 写到 `k_scales / v_scales [Hk][S]`（下标 `head · S + slot`，head 的第一个 lane 存）；`S = NB · BS`，`Hk · S · 4 < 2 GiB`。缓存描述符按块移动（64 位 `ptr_mad`），所以 cache 本身可以任意大。主机测试 `tests/gpu/cache_blocked_fp8_host.cpp`：每个写入的 (token, head) 的字节按 e4m3 的半步长对 x / scale 校验、scale 对 amax / 448 校验（相对 1e-3）、未写的 slot 的 scale 与 cache 字节保持哨兵值、末尾之后 0 字节被写；Hk = 1 / 4 / 8，D = 64 / 128 / 256，BS = 16 / 32 / 64，含 padding slot；`bad = 0`；`gpu_verify --strict` 0 错误，44 VGPR。
 
 **int64 slot_mapping**：vLLM 与 SGLang 的 slot_mapping 是 int64 张量，所以 `reshape_cache_flash_{bf16,fp8}_h<Hk>_d<D>`、`reshape_cache_blocked_{bf16,fp8}_h<Hk>_d<D>_b<BS>` 都有 `_i64` 后缀的变体（名字最后加 `_i64`，其余 ABI 不变，slot_mapping 每项 8 字节）：只读每项的低 32 位，要求 slot < 2³¹（−1 = 0xffffffff 仍是 padding）。flash bf16 / fp8 和 blocked bf16 的 `_i64` 版本用 `cache_big_host` / `cache_fp8_host`（新增的 `i64` 参数）在 12 GiB 的 cache 上验证过，`bad = 0`。
+
+
+## 融合的 qk-norm + RoPE + KV cache 写
+
+`qknorm_rope_kvcache_{neox,gptj}_{bf16,fp8}_h<Hk>_d<D>[_i64]`：把 `qknorm_rope_*` 的输出阶段换成 KV cache 写。输入 K、V 为 `[T][Hk][D]` bf16；K 逐 head 做 RMSNorm（gamma、eps）后旋转，结果写到 `key_cache[slot_mapping[t]]`；V 写到 `value_cache[slot]`，bf16 cache 原样拷贝、fp8 cache 用静态 `v_scale` 量化（K 用 `k_scale`，e4m3，写入的是 `x / scale`）；flash 布局 `[S][Hk][D]`；`slot_mapping` 负数或 ≥ S 的 token 什么都不写。ABI 在 `qknorm_rope_*` 的基础上加 v @56、key_cache @64、value_cache @72、slot_mapping @80、S @88（i32）、k_scale @92 / v_scale @96（仅 fp8）；`out` 参数保留但不使用。Q 的 norm + rope 仍然是 `qknorm_rope_*` 的一次启动，所以完整的 aiter 融合 = 两次启动（Q、KV）。限制：cache < 2 GiB（逐 lane 的 slot 地址是 32 位偏移）、全旋转（无 `_r<R>`）。
+
+主机测试 `tests/gpu/qknorm_rope_kv_host.cpp`：CPU 参考（范数 → 旋转 → 写 / 量化）逐元素比较 K（bf16 ≤ 1 ulp、fp8 按 e4m3 半步长）和 V（bf16 逐位、fp8 同上），未写的 cache 行保持哨兵、末尾之后 0 字节被写；覆盖 neox / gptj，H = 1（打包 token 模式）/ 2 / 4 / 8，D = 64 / 128 / 256，bf16 与 fp8 cache，int32 与 int64 slot，含负 slot、≥ S 的 slot 和超出 cos / sin 表的位置；`bad = 0`；`gpu_verify --strict` 0 错误，52 – 92 VGPR。

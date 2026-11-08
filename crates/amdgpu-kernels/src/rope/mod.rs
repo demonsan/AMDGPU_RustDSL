@@ -7,7 +7,7 @@
 //! D in {64, 128, 256} (full rotary dimension), H in 1..=256. ABI: x @0, out @8, positions @16, cos_sin @24, T @32 (i32), P @36 (i32).
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{bf16x8_to_f32, group_reduce_dpp, lane_reduce, rsqrt_f32, RedOp};
+use amdgpu_tile::prims::{bf16x8_to_f32, fp8_pack, group_reduce_dpp, lane_reduce, rsqrt_f32, RedOp};
 use amdgpu_tile::ev;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,7 +16,30 @@ pub enum RopeStyle {
     Gptj,
 }
 
-pub fn by_name(name: &str) -> Option<Function> {
+/// How a fused kernel writes the KV cache (flash layout, `[S][H][D]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvCache {
+    /// fp8 (e4m3) cache with the static per-tensor scales `k_scale` / `v_scale` (kernargs) instead of bf16
+    pub fp8: bool,
+    /// slot_mapping is int64 (the low dword of each entry is read)
+    pub slot64: bool,
+}
+
+pub fn by_name(full: &str) -> Option<Function> {
+    // `qknorm_rope_kvcache_{neox,gptj}_{bf16,fp8}_h<H>_d<D>[_i64]`: the rotated, normalised K rows and the V rows are written straight into the KV cache at `slot_mapping[t]` (flash layout, any
+    // cache < 2 GiB), instead of an output tensor; see `rope_kernel`. ABI after the `qknorm_rope_*` one: v @56, key_cache @64, value_cache @72, slot_mapping @80, S @88 (i32), [k_scale @92, v_scale @96 (f32, fp8 only)]
+    let (name, slot64) = match full.strip_suffix("_i64") {
+        Some(n) => (n, true),
+        None => (full, false),
+    };
+    if let Some(rest) = name.strip_prefix("qknorm_rope_kvcache_") {
+        let (style, rest) = if let Some(r) = rest.strip_prefix("neox_") { (RopeStyle::Neox, r) } else if let Some(r) = rest.strip_prefix("gptj_") { (RopeStyle::Gptj, r) } else { return None };
+        let (fp8, rest) = if let Some(r) = rest.strip_prefix("fp8_h") { (true, r) } else if let Some(r) = rest.strip_prefix("bf16_h") { (false, r) } else { return None };
+        let (h, d) = rest.split_once("_d")?;
+        let (h, d): (i64, i64) = (h.parse().ok()?, d.parse().ok()?);
+        return ((1..=256).contains(&h) && [64, 128, 256].contains(&d) && 2 * h * d <= 65536).then(|| rope_kernel(full, h, d, style, d, true, Some(KvCache { fp8, slot64 })));
+    }
+    let name = full;
     // `qknorm_rope_*`: a per-head RMSNorm (weight gamma [D], eps) of every head row, then the rotation (docs: fused_qk_norm_rope of aiter, Qwen3-style); ABI adds gamma @40 (bf16 [D]) and eps @48 (f32)
     let (name_s, norm) = match name.strip_prefix("qknorm_") {
         Some(n) => (n, true),
@@ -40,7 +63,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         Some(r) => r.parse().ok()?,
         None => d,
     };
-    ((1..=256).contains(&h) && [64, 128, 256].contains(&d) && r % 16 == 0 && (16..=d).contains(&r) && (r == d || r < d) && !(norm && r != d)).then(|| rope_kernel(name, h, d, style, r, norm))
+    ((1..=256).contains(&h) && [64, 128, 256].contains(&d) && r % 16 == 0 && (16..=d).contains(&r) && (r == d || r < d) && !(norm && r != d)).then(|| rope_kernel(name, h, d, style, r, norm, None))
 }
 
 fn bf16x4_to_f32(b: &mut FnBuilder, frag2: ValueId) -> [ValueId; 4] {
@@ -61,7 +84,7 @@ fn pack8(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
     b.frag4(w[0], w[1], w[2], w[3])
 }
 
-pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64, norm: bool) -> Function {
+pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64, norm: bool, kv: Option<KvCache>) -> Function {
     let l = if style == RopeStyle::Neox { d / 16 } else { d / 8 }; // lanes per head row
     let rows_per_wave = 64 / l;
     // waves per block: only as many as the heads need (a block of idle waves would waste occupancy), at most 4
@@ -86,6 +109,17 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64, norm: b
         b.arg("eps", DType::F32, 48, 4);
         b.arg_tensor("gamma", Ext::c(2 * d));
     }
+    if let Some(kvc) = kv {
+        b.arg("v", DType::Ptr, 56, 8);
+        b.arg("key_cache", DType::Ptr, 64, 8);
+        b.arg("value_cache", DType::Ptr, 72, 8);
+        b.arg("slot_mapping", DType::Ptr, 80, 8);
+        b.arg("s", DType::I32, 88, 4);
+        if kvc.fp8 {
+            b.arg("k_scale", DType::F32, 92, 4);
+            b.arg("v_scale", DType::F32, 96, 4);
+        }
+    }
     let tt = Ext::sym("T");
     let pp = Ext::sym("P");
     b.sym_range("T", 1, 1 << 24);
@@ -94,7 +128,18 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64, norm: b
     b.ka_is(36, pp.clone());
     b.grid_is(0, if packed { tt.clone().ceil_div(4 * tpw) } else { tt.clone() });
     b.arg_tensor("x", tt.clone() * Ext::c(2 * h * d));
-    b.arg_tensor("out", tt.clone() * Ext::c(2 * h * d));
+    if let Some(kvc) = kv {
+        let crow = if kvc.fp8 { h * d } else { 2 * h * d };
+        let ss = Ext::sym("S");
+        b.sym_range("S", 1, (i32::MAX as i64) / (2 * h * d));
+        b.ka_is(88, ss.clone());
+        b.arg_tensor("v", tt.clone() * Ext::c(2 * h * d));
+        b.arg_tensor("key_cache", ss.clone() * Ext::c(crow));
+        b.arg_tensor("value_cache", ss * Ext::c(crow));
+        b.arg_tensor("slot_mapping", tt.clone() * Ext::c(if kvc.slot64 { 8 } else { 4 }));
+    } else {
+        b.arg_tensor("out", tt.clone() * Ext::c(2 * h * d));
+    }
     b.arg_tensor("pos", tt * Ext::c(4));
     b.arg_tensor("cos_sin", pp * Ext::c(2 * r));
     let (p_x, p_o, p_pos, p_cs) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 8 }), b.let_(Op::KernargPtr { offset: 16 }), b.let_(Op::KernargPtr { offset: 24 }));
@@ -107,7 +152,7 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64, norm: b
     // the token of this lane: the block id (uniform), or, packed, `tpw` tokens per wave, 4 waves per block (a vector value: every lane group has its own position / table row)
     let tok = if packed { b.bind_i32(ev(bx) * (4 * tpw) as i32 + ev(wave) * tpw as i32 + ev(lane).lshr(hl.trailing_zeros() as i32)) } else { bx };
     let r_x = { let v = b.bind_i32(ev(t_v) * (2 * h * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_x, v) };
-    let r_o = { let v = b.bind_i32(ev(t_v) * (2 * h * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_o, v) };
+    let r_o = if kv.is_none() { Some({ let v = b.bind_i32(ev(t_v) * (2 * h * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_o, v) }) } else { None };
     let r_pos = { let v = b.bind_i32(ev(t_v) << 2); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_pos, v) };
     let r_cs = { let v = b.bind_i32(ev(p_v) * (2 * r) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_cs, v) };
     // this token's position (uniform): positions[token], then the cos / sin row of the table
@@ -116,6 +161,33 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64, norm: b
     let posi = b.bitcast_i32(posf);
     let pos = if packed { posi } else { b.read_first_lane(posi) };
     let cs_row = b.bind_i32(ev(pos) * (2 * r) as i32);
+    // the KV-cache sink: descriptors, this token's slot (vector in packed mode), validity, the fp8 inverse scales
+    struct Kv { r_v: ValueId, r_kc: ValueId, r_vc: ValueId, slot: ValueId, slot_ok: ValueId, inv_k: Option<ValueId>, inv_v: Option<ValueId>, fp8: bool }
+    let kvs: Option<Kv> = if let Some(kvc) = kv {
+        let s_v = b.let_(Op::KernargI32 { offset: 88 });
+        let (p_v2, p_kc, p_vc, p_sl) = (b.let_(Op::KernargPtr { offset: 56 }), b.let_(Op::KernargPtr { offset: 64 }), b.let_(Op::KernargPtr { offset: 72 }), b.let_(Op::KernargPtr { offset: 80 }));
+        let crow = if kvc.fp8 { h * d } else { 2 * h * d };
+        let sw: i32 = if kvc.slot64 { 8 } else { 4 };
+        let r_v = { let n = b.bind_i32(ev(t_v) * (2 * h * d) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_v2, n) };
+        let r_kc = { let n = b.bind_i32(ev(s_v) * crow as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_kc, n) };
+        let r_vc = { let n = b.bind_i32(ev(s_v) * crow as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_vc, n) };
+        let r_sl = { let n = b.bind_i32(ev(t_v) * sw); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_sl, n) };
+        let so = b.bind_i32(ev(tok) * sw);
+        let sf = b.buffer_load_f32(r_sl, so, 0i32, 0);
+        let sl0 = b.bitcast_i32(sf);
+        let sl1 = if packed { sl0 } else { b.read_first_lane(sl0) };
+        let slot = b.let_(Op::AddI32(Opnd::Val(sl1), Opnd::I32(0)));      // signed
+        let slot_ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
+        let (inv_k, inv_v) = if kvc.fp8 {
+            let (ks, vs) = (b.let_(Op::KernargF32 { offset: 92 }), b.let_(Op::KernargF32 { offset: 96 }));
+            (Some(b.rcp_f32(ks)), Some(b.rcp_f32(vs)))
+        } else {
+            (None, None)
+        };
+        Some(Kv { r_v, r_kc, r_vc, slot, slot_ok, inv_k, inv_v, fp8: kvc.fp8 })
+    } else {
+        None
+    };
     let lr = b.bind_i32(ev(lane) & (l - 1) as i32);       // lane within the head row (l is a power of two)
     let row_in_wave = b.bind_i32(ev(lane).lshr(l.trailing_zeros() as i32));
     // cos / sin: lane `lr`'s part of the row, shared by every head
@@ -168,7 +240,7 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64, norm: b
         (cos, sin)
     };
     // all the passes' loads first
-    struct Pass { head_ok: ValueId, off: ValueId, offh: Option<ValueId>, lo: ValueId, hi: Option<ValueId> }
+    struct Pass { head_ok: ValueId, head: ValueId, row_off: ValueId, off: ValueId, offh: Option<ValueId>, lo: ValueId, hi: Option<ValueId>, vlo: Option<ValueId>, vhi: Option<ValueId> }
     let mut ps: Vec<Pass> = Vec::new();
     for ps_i in 0..passes {
         let head = if packed {
@@ -204,7 +276,14 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64, norm: b
         } else {
             None
         };
-        ps.push(Pass { head_ok, off, offh: offh_v, lo, hi });
+        let (vlo, vhi) = if let Some(kvs) = &kvs {
+            let vlo = b.buffer_load_c(kvs.r_v, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+            let vhi = offh_v.map(|oh| b.buffer_load_c(kvs.r_v, Some(Opnd::Val(oh)), 0i32, 0, MemTy::B128, CachePolicy::NT));
+            (Some(vlo), vhi)
+        } else {
+            (None, None)
+        };
+        ps.push(Pass { head_ok, head, row_off, off, offh: offh_v, lo, hi, vlo, vhi });
     }
     for p in &ps {
         let mut xl = bf16x8_to_f32(b, p.lo);
@@ -262,13 +341,60 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64, norm: b
             yh = None;
         }
         let masked = |b: &mut FnBuilder, o: ValueId| b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(p.head_ok), a: Opnd::Val(o), b: Opnd::I32(-16) });
-        let o_lo = masked(b, p.off);
-        let f = pack8(b, &yl);
-        b.buffer_store_c(r_o, Some(Opnd::Val(o_lo)), 0i32, 0, f, MemTy::B128, false, CachePolicy::NT);
-        if let Some(yh) = yh {
-            let o_hi = masked(b, p.offh.unwrap());
-            let f = pack8(b, &yh);
-            b.buffer_store_c(r_o, Some(Opnd::Val(o_hi)), 0i32, 0, f, MemTy::B128, false, CachePolicy::NT);
+        if let Some(kvs) = &kvs {
+            // the cache row of this token's slot: bf16 [S][H][D] (2 H D bytes per slot) or fp8 (H D bytes): + head * D + the lane's chunk; invalid slots write nothing
+            let lane_lo = b.bind_i32(ev(p.off) - ev(p.row_off));
+            let lane_hi = p.offh.map(|oh| b.bind_i32(ev(oh) - ev(p.row_off)));
+            let sh = if kvs.fp8 { 1 } else { 0 };
+            let base = if kvs.fp8 { b.bind_i32(ev(kvs.slot) * (h * d) as i32 + ev(p.head) * d as i32) } else { b.bind_i32(ev(kvs.slot) * (2 * h * d) as i32 + ev(p.head) * (2 * d) as i32) };
+            let msk = |b: &mut FnBuilder, o: ValueId| -> ValueId {
+                let o = masked(b, o);
+                b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(kvs.slot_ok), a: Opnd::Val(o), b: Opnd::I32(-16) })
+            };
+            let co_lo = { let li = b.bind_i32(ev(lane_lo).lshr(sh)); let o = b.bind_i32(ev(base) + ev(li)); msk(b, o) };
+            let co_hi = lane_hi.map(|lh| { let li = b.bind_i32(ev(lh).lshr(sh)); let o = b.bind_i32(ev(base) + ev(li)); msk(b, o) });
+            let halves: Vec<(ValueId, Option<ValueId>, [ValueId; 8], Option<[ValueId; 8]>)> = vec![(co_lo, co_hi, yl, yh)];
+            let _ = halves;
+            // K: the rotated, normalised row
+            let store_k = |b: &mut FnBuilder, o: ValueId, y: &[ValueId; 8]| {
+                if kvs.fp8 {
+                    let words = fp8_pack(b, y, kvs.inv_k.unwrap());
+                    let f2 = b.frag2(words[0], words[1]);
+                    b.buffer_store_c(kvs.r_kc, Some(Opnd::Val(o)), 0i32, 0, f2, MemTy::B64, false, CachePolicy::NT);
+                } else {
+                    let f = pack8(b, y);
+                    b.buffer_store_c(kvs.r_kc, Some(Opnd::Val(o)), 0i32, 0, f, MemTy::B128, false, CachePolicy::NT);
+                }
+            };
+            store_k(b, co_lo, &yl);
+            if let (Some(o), Some(yh)) = (co_hi, yh) {
+                store_k(b, o, &yh);
+            }
+            // V: copied (bf16) or quantised with the static scale (fp8)
+            let store_v = |b: &mut FnBuilder, o: ValueId, fr: ValueId| {
+                if kvs.fp8 {
+                    let x = bf16x8_to_f32(b, fr);
+                    let words = fp8_pack(b, &x, kvs.inv_v.unwrap());
+                    let f2 = b.frag2(words[0], words[1]);
+                    b.buffer_store_c(kvs.r_vc, Some(Opnd::Val(o)), 0i32, 0, f2, MemTy::B64, false, CachePolicy::NT);
+                } else {
+                    b.buffer_store_c(kvs.r_vc, Some(Opnd::Val(o)), 0i32, 0, fr, MemTy::B128, false, CachePolicy::NT);
+                }
+            };
+            store_v(b, co_lo, p.vlo.unwrap());
+            if let (Some(o), Some(vh)) = (co_hi, p.vhi) {
+                store_v(b, o, vh);
+            }
+        } else {
+            let r_o = r_o.unwrap();
+            let o_lo = masked(b, p.off);
+            let f = pack8(b, &yl);
+            b.buffer_store_c(r_o, Some(Opnd::Val(o_lo)), 0i32, 0, f, MemTy::B128, false, CachePolicy::NT);
+            if let Some(yh) = yh {
+                let o_hi = masked(b, p.offh.unwrap());
+                let f = pack8(b, &yh);
+                b.buffer_store_c(r_o, Some(Opnd::Val(o_hi)), 0i32, 0, f, MemTy::B128, false, CachePolicy::NT);
+            }
         }
     }
     fb.finish()
