@@ -129,3 +129,16 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 - **add_rmsnorm（aiter 6.86 TB/s）高于测得的流式上限，不能当作有效对比**：可能是 aiter 的 `add_rmsnorm` 对 `residual_out` / 输出的语义不同导致实际流量更小（没有逐元素对拍），待查；在查清之前这一行只保留数据，不用于结论。
 - **topk_softmax 不是带宽受限**（524288 × 128 个专家只有 168 MB 流量，~1.2 TB/s）：小 T 我们快（延迟低），大 T 慢 8–13 %（每轮 LDS 往返）；下一步用 DPP 行操作（backend 的 A4）去掉 LDS。
 - 没有 aiter 对应的内核：layernorm（aiter 的 layernorm 是 torch 扩展）、row softmax、RoPE / KV cache（`pos_encoding_kernels.cu` 与 `cache_kernels.cu` 的入口依赖 torch 的 int64 positions 等约定，`cache_kernels.cu` 在 gfx950 上不能独立编译：`dtype_float16.cuh` 里的旧 asm 约束），这些仍只和 roofline 比。
+
+## fp8 → bf16 反量化与 int8 量化（backend 的 A2 转换）
+
+`dequant/mod.rs`、`rows/quant.rs`；主机测试 `tests/gpu/dequant_host.cpp`（CPU 参考：随机 fp8 字节，不含 NaN 码，乘 f32 scale，bf16 误差 ≤ 1 ulp）与 `tests/gpu/quant_host.cpp` 的 `token_int8` 模式（反量化值与参考的误差 ≤ 半个 int8 台阶，scale 相对误差 < 1e-4）。
+
+| kernel | 语义 | VGPR | 带宽（GB/s） |
+|---|---|--:|--:|
+| `dequant_fp8_bf16_static` | `bf16(q · scale)`，一个 f32 scale；每 lane 8 个元素（b64 读、b128 写） | — | 6396 |
+| `dequant_fp8_bf16_token_n<N>` | 每行一个 scale `[M]` | — | N = 4096：6064；N = 1000：5321 |
+| `dequant_fp8_bf16_group128_n<N>` | 每 128 元素一个 scale `[M][N/128]` | — | N = 4096：6005 |
+| `quant_token_bf16_int8_n<N>` | per-token int8：`scale = max|x| / 127`，`q = clamp(rne(x / scale), −127, 127)` | — | N = 4096：6305；N = 1000：5366 |
+
+**一个会踩的坑（已告知 backend）**：`v_cvt_scalef32_pk_{bf16,f16,f32}_fp8` 的 scale 操作数只用到指数（E8M0 风格的 2 的幂）：给 1.63 的效果是 1.0（我们的参考对拍直接发现：输出等于未缩放的 fp8 值）。所以任意 f32 scale 的反量化 = 普通的 fp8 → f32 转换（`PkF32Fp8`）后再乘 scale、再打包成 bf16；`ScalePk…` 转换适用于 mx 格式（E8M0 的 2 的幂 scale）。dequant 内核因此多一次乘法，仍是带宽受限。
