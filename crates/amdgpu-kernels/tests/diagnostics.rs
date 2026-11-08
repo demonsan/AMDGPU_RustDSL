@@ -14,7 +14,7 @@ fn a_verifier_finding_points_at_the_kernel_source() {
     assert!(d.values.iter().any(|(_, l)| l.as_deref().unwrap_or("").contains("verifier_cases")), "{:?}", d.values);
     assert!(d.fix.is_some());
     let j = diag::to_json(&ds);
-    assert!(j.starts_with("[{\\"code\\":\\"GV-BUF-WRAP\\"") || j.contains("\\"code\\":\\"GV-BUF-WRAP\\""), "{j}");
+    assert!(j.starts_with("[{\"code\":\"GV-BUF-WRAP\"") || j.contains("\"code\":\"GV-BUF-WRAP\""), "{j}");
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn running_out_of_registers_names_the_live_values_and_their_builder_calls() {
 fn the_summary_is_compact_json() {
     let f = amdgpu_kernels::kernel_by_name("probe_pkpair").unwrap();
     let j = diag::summary_json(&f).unwrap();
-    for k in ["\\"vgpr\\":", "\\"agpr\\":", "\\"sgpr\\":", "\\"lds_bytes\\":", "\\"waits\\":", "\\"nops\\":", "\\"regions\\":[", "\\"certificate\\":{"] {
+    for k in ["\"vgpr\":", "\"agpr\":", "\"sgpr\":", "\"lds_bytes\":", "\"waits\":", "\"nops\":", "\"regions\":[", "\"certificate\":{"] {
         assert!(j.contains(k), "{k} in {j}");
     }
 }
