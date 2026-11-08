@@ -166,6 +166,13 @@ int main(int argc, char** argv) {
                 size_t dst = (size_t)n * K + k;
                 hp[dst / 2] |= code << (4 * (dst & 1));
             }
+        // W4DBG=3: probe the pairing - A[m][k] = k (exact), B device row n = only physical fp4 position P = KK (env) set to 1.0
+        if (dbg == 3) {
+            for (size_t i = 0; i < (size_t)M * K; i++) { uint16_t bb = f_to_bf16((float)(i % K)); memcpy(&ha[2 * i], &bb, 2); }
+            std::fill(hp.begin(), hp.end(), 0);
+            const int P = envi("KK", 0);
+            for (int n = 0; n < N; n++) { size_t dst = (size_t)n * K + P; hp[dst / 2] |= 2 << (4 * (dst & 1)); }
+        }
         hb_w4perm = hp;
     } else { fprintf(stderr, "unknown family %s\n", fam.c_str()); return 1; }
 
@@ -322,6 +329,7 @@ int main(int argc, char** argv) {
     // ---- check against the CPU reference on CHECK_ROWS rows ----
     std::vector<uint16_t> out((size_t)M * N);
     HC(hipMemcpy(out.data(), dCcheck, out.size() * 2, hipMemcpyDeviceToHost));
+    if (kind == "bf16w4" && envi("W4DBG", 0) == 3) { printf("PROBE P=%d got=%g %g\n", envi("KK", 0), bf16_to_f(out[0]), bf16_to_f(out[17 * N + 5])); return 0; }
     double max_rel = 0; long bad = 0, checked = 0;
     for (int ri = 0; ri < crow && ri < M; ri++) {
         int m = crow >= M ? ri : (int)((long)ri * (M - 1) / (crow - 1 > 0 ? crow - 1 : 1));
