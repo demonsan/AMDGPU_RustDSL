@@ -12,6 +12,8 @@ use amdgpu_tile::{ev, LdsPlan, Lane, Layout as TLayout, Role, Roles, Shared, Slo
 
 const D: i32 = 128;
 const ROW: i32 = 2 * D;
+/// keys per tile
+const KT: i32 = 128;
 /// query rows per CTA
 const QR: i32 = 256;
 
@@ -51,8 +53,6 @@ struct Body<'a> {
     p: Vec<ValueId>,
     /// the vendor's priority ping-pong: s_setprio 1 in the matrix phase, 0 in the softmax phase
     prio: bool,
-    /// 32-key blocks per tile (4: 128-key tiles; 2: `_k64`)
-    nb: usize,
 }
 
 impl Body<'_> {
@@ -70,16 +70,15 @@ impl Body<'_> {
         let kb = self.kbase(b, slot);
         let (kind, qf, kr) = (self.kind, self.qf, self.kr);
         let bases: Vec<ValueId> = kr.iter().map(|r| b.bind_i32(ev(*r) + kb.clone())).collect();
-        let nb = self.nb;
         self.ring.ks.at(slot).read(b, |b| {
             let rd = |b: &mut FnBuilder, c: usize| -> Vec<ValueId> {
-                (0..nb as i32).map(|blk| { let a = b.bind_i32(ev(bases[c]) + blk * 32 * ROW); b.load_lds_b128(a) }).collect()
+                (0..4).map(|blk| { let a = b.bind_i32(ev(bases[c]) + blk * 32 * ROW); b.load_lds_b128(a) }).collect()
             };
-            let mut acc: Vec<Option<ValueId>> = vec![None; nb];
+            let mut acc: Vec<Option<ValueId>> = vec![None; 4];
             let mut cur = rd(b, 0);
             for c in 0..8usize {
                 let nxt = (c + 1 < 8).then(|| rd(b, c + 1));
-                for blk in 0..nb {
+                for blk in 0..4usize {
                     match into {
                         Some(v) => b.var_mfma(v[blk], kind, cur[blk], qf[c], c == 0),
                         None => acc[blk] = Some(b.mfma(kind, cur[blk], qf[c], acc[blk].map(Opnd::Val))),
@@ -100,7 +99,6 @@ impl Body<'_> {
         let bases: Vec<ValueId> = self.vr.iter().map(|v| b.bind_i32(ev(*v) + vb.clone())).collect();
         let p = self.p.clone();
         let o = self.o.clone();
-        let steps = 2 * self.nb;
         self.ring.vs.at(slot).read(b, |b| {
             let rd = |b: &mut FnBuilder, t: usize| -> Vec<ValueId> {
                 let (sb, tt) = (t / 2, t % 2);
@@ -114,8 +112,8 @@ impl Body<'_> {
                     .collect()
             };
             let mut cur = rd(b, 0);
-            for t in 0..steps {
-                let nxt = (t + 1 < steps).then(|| rd(b, t + 1));
+            for t in 0..8usize {
+                let nxt = (t + 1 < 8).then(|| rd(b, t + 1));
                 let pf = b.pack4(p[4 * t], p[4 * t + 1], p[4 * t + 2], p[4 * t + 3]);
                 for e in 0..4usize {
                     b.var_mfma(o[e], kind, cur[e], pf, false);
@@ -159,7 +157,7 @@ impl PipeBody for Body<'_> {
         self.m = Some(vars[0]);
         self.l = Some(vars[1]);
         self.o = vars[2..6].to_vec();
-        self.s = vars[6..6 + self.nb].to_vec();
+        self.s = vars[6..10].to_vec();
     }
     fn v_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
         if self.prio {
@@ -169,11 +167,11 @@ impl PipeBody for Body<'_> {
         let s = self.s.clone();
         // the key mask on tiles past the smallest limit of the CTA (uniform branch, VALU only): masked lanes' S = -inf in place
         let key_t = b.bind_i32(t.key0());
-        let partial = b.bind_cond((ev(key_t) + (32 * self.nb as i32 - 1)).gt(ev(self.lim_min)));
+        let partial = b.bind_cond((ev(key_t) + (KT - 1)).gt(ev(self.lim_min)));
         b.begin_if(Opnd::Val(partial));
         {
             let key0 = b.bind_i32(ev(key_t) + (ev(self.half) << 2));
-            for blk in 0..self.nb {
+            for blk in 0..4usize {
                 for r in 0..16u8 {
                     let off = 32 * blk as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
                     let x = b.frag16_lane(Opnd::Var(s[blk]), r);
@@ -186,7 +184,7 @@ impl PipeBody for Body<'_> {
         }
         b.end_if();
         let mut sv: Vec<ValueId> = Vec::with_capacity(64);
-        for blk in 0..self.nb {
+        for blk in 0..4usize {
             for r in 0..16u8 {
                 let x = b.frag16_lane(Opnd::Var(s[blk]), r);
                 sv.push(b.bitcast_f32(x));
@@ -236,7 +234,7 @@ impl PipeBody for Body<'_> {
         let l_new = b.add_f32(Opnd::Var(l_v), ps);
         b.set_var(l_v, l_new);
         // P words in the PV order: step t (16 keys) = block t / 2, values 8 (t % 2) + 0..7
-        self.p = (0..2 * self.nb)
+        self.p = (0..8usize)
             .flat_map(|t| {
                 let i0 = 16 * (t / 2) + 8 * (t % 2);
                 (0..4).map(move |j| (i0 + 2 * j, i0 + 2 * j + 1)).collect::<Vec<_>>()
@@ -263,15 +261,6 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
 /// `split` (`..._ks`, for small grids): the key range of every q tile is cut into S = 2^lg_s parts (grid z = B S; our ABI extension: lg_s
 /// at kernarg 656, S = 2^lg_s at 660, fp32 partial O / l [B, H, SQ, S, 128] at 672, partial LSE [B, H, SQ, S] at 688); `attn_combine_bf16_hd128_q` merges them.
 pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Function {
-    fmha_fwd_hd128_bf16_v3_t(name, causal, split, 128)
-}
-
-/// `kt` keys per tile: 128, or 64 (`_k64`: 2 x 32 KB rings -> two CTAs per CU; short sequences / small grids).
-pub fn fmha_fwd_hd128_bf16_v3_t(name: &str, causal: bool, split: bool, kt: i32) -> Function {
-    assert!(kt == 128 || kt == 64, "bf16v3: 128- or 64-key tiles");
-    #[allow(non_snake_case)]
-    let KT = kt;
-    let lkt = kt.trailing_zeros() as i32;
     let mut b = FnBuilder::new(name, 512);
     // the `_vs128` policy (full reordering list scheduler) + ldsink / wsink / ldahead32: measured +6.6 % / +7.7 % / +6.7 % (8192², 2048², 1024²)
     // over the Gemm profile
@@ -381,7 +370,7 @@ pub fn fmha_fwd_hd128_bf16_v3_t(name: &str, causal: bool, split: bool, kt: i32) 
     let l16 = b.bind_i32(lane.lane() & 15);
     let k_so0 = { let v = b.bind_i32(ev(bat) * ev(k_bs) + ev(hkv) * ev(k_hs)); b.read_first_lane(v) };
     let v_so0 = { let v = b.bind_i32(ev(bat) * ev(v_bs) + ev(hkv) * ev(v_hs)); b.read_first_lane(v) };
-    let keys: Vec<ValueId> = (0..KT / 16).map(|i| b.bind_i32(((ev(wig) + 4 * i) << 2) + lane.lane().lshr(4))).collect();
+    let keys: Vec<ValueId> = (0..8).map(|i| b.bind_i32(((ev(wig) + 4 * i) << 2) + lane.lane().lshr(4))).collect();
     let k_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(k_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
     // V swizzled like K (the transposed reads of 4 rows x 4 columns per 16-lane group then hit distinct banks)
     let v_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(v_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
@@ -434,7 +423,7 @@ pub fn fmha_fwd_hd128_bf16_v3_t(name: &str, causal: bool, split: bool, kt: i32) 
     } else {
         s_kv
     };
-    let ntk = { let v = b.bind_i32((ev(kv_end) + (KT - 1)).lshr(lkt)); b.read_first_lane(v) };
+    let ntk = { let v = b.bind_i32((ev(kv_end) + (KT - 1)).lshr(7)); b.read_first_lane(v) };
     // split: this part's tiles [t_lo, t_hi) of ceil(ntk / S) each; keys relative to k_lo = 128 t_lo (the K / V origins move, the limits shift)
     let (nkv, kv_len, k_lo) = match (lg_s, part) {
         (Some(l), Some(pt)) => {
@@ -442,7 +431,7 @@ pub fn fmha_fwd_hd128_bf16_v3_t(name: &str, causal: bool, split: bool, kt: i32) 
             let t_lo = { let v = b.bind_i32((ev(pt) * ev(per)).min(ev(ntk))); b.read_first_lane(v) };
             let t_hi = { let v = b.bind_i32((ev(t_lo) + ev(per)).min(ev(ntk))); b.read_first_lane(v) };
             let n = { let v = b.bind_i32(ev(t_hi) - ev(t_lo)); b.read_first_lane(v) };
-            let klo = { let v = b.bind_i32(ev(t_lo) << lkt); b.read_first_lane(v) };
+            let klo = { let v = b.bind_i32(ev(t_lo) << 7); b.read_first_lane(v) };
             let len = { let v = b.bind_i32((ev(kv_end) - ev(klo)).max(0)); b.read_first_lane(v) };
             (n, len, Some(klo))
         }
@@ -472,7 +461,7 @@ pub fn fmha_fwd_hd128_bf16_v3_t(name: &str, causal: bool, split: bool, kt: i32) 
     roles.each(&mut b, |b, role| {
         let mut body = Body {
             ring: &ring, kind, qf: &qf, kr: &kr, vr: vr.clone(), csc, neg_inf, zero16, half, lim, lim_min,
-            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true, nb: (KT / 32) as usize,
+            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true,
         };
         pipe.run(b, role, &mut body);
         // ---- epilogue: O = O^T / l (bf16, 8-byte stores), LSE ----
