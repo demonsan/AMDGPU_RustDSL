@@ -64,7 +64,7 @@
 | `rope_neox_bf16_h<H>_d<D>` | rotate-half，每 lane 两个 b128 | D / 16 | 44 | H = 32, D = 128：6118；H = 8, D = 128：6495（T = 262144，部分落在 Infinity Cache）；**H = 1, D = 64：1300** | 100 % / 100 %+ / **22 %** |
 | `rope_gptj_bf16_h<H>_d<D>` | 交错对 (2i, 2i+1)，每 lane 一个 b128 | D / 8 | 32 | H = 32, D = 128：5997 | 100 % |
 
-D ∈ {64, 128, 256}（全旋转维），H ∈ 1…256；正确性：T ∈ {9 … 37}，H ∈ {1, 8, 32, 40}（H = 40 的最后一个 pass 部分 head 越界）。**限制**：H · L < 64 的内核（如 MQA 的 H = 1）一个 wave 里只有一部分 lane 有 head，带宽低（H = 1, D = 64 只有 22 %）→ 需要"一个 wave 处理多个 token"的变体（待做）；部分旋转（rotary_dim < D）还没有。
+D ∈ {64, 128, 256}（全旋转维），H ∈ 1…256；正确性：T ∈ {9 … 37}，H ∈ {1, 8, 32, 40}（H = 40 的最后一个 pass 部分 head 越界）。**限制**：H · L < 64 的内核（如 MQA 的 H = 1）一个 wave 里只有一部分 lane 有 head，带宽低（H = 1, D = 64 只有 22 %）→ 需要"一个 wave 处理多个 token"的变体（待做）；部分旋转见下。
 
 ## KV-cache 写（模板 T7）
 
@@ -185,3 +185,7 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 | E = 256, K = 8, BM = 128，M = 4096 | 32768 | 52.2 µs |
 
 限制：只有一个 block，路由对越多越慢（每 1 K 对约 +1.3 µs）；大 M（≳ 16 K 对）需要多 block 版本（全局原子直方图 + 分阶段，aiter 的 multiphase 同样如此）——待做。没有与 aiter 的同轮对比：aiter 的 `moe_sorting` 在本机树里是 CK / FlyDSL 路径，不能脱离 torch 单独编译。
+
+## 部分 RoPE（rotary_dim < D）
+
+`rope_{neox,gptj}_bf16_h<H>_d<D>_r<R>`（R 是 16 的倍数，16 ≤ R < D；表是 `[P][R]`，前半 cos、后半 sin）：每个 head 只有前 R 个元素旋转，其余原样拷贝。实现不另加数据通路：不旋转的 lane 用同一套公式，cos = 1、sin = 0（恒等旋转）——NeoX 里 R 之后的元素成对分给 `D/16 − R/16` 个 lane（每 lane 两个相邻 chunk），GPT-J 里 `lr ≥ R/8` 的 lane 直接是恒等；lane 总数仍是 `D/16`（NeoX）/ `D/8`（GPT-J），所以占用与全旋转版相同。主机测试 `rope_host`（`ROPE_R=<R>`）：D = 128 / R = 64（neox、gptj）、D = 256 / R = 32，`bad = 0`，R 之后的元素逐位等于输入；D = 128 / R = 64 的 neox：5062 GB/s（流量按 R 宽的表计）。R = D 的名字不变，行为不变。
