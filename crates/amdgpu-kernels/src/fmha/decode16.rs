@@ -214,9 +214,13 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
         let mn = b.max_f32(Opnd::Var(m_v), mt);
         let dm = b.sub_f32(Opnd::Var(m_v), mn);
         let alpha = b.exp2_f32(dm);
-        let ad = b.frag2_dup(alpha);
         for v in &ov {
-            b.var_scale_pk(*v, ad);
+            for r in 0..4u8 {
+                let x = b.frag4_lane(Opnd::Var(*v), r);
+                let x = b.bitcast_f32(x);
+                let y = b.mul_f32(x, alpha);
+                b.var_set_lane(*v, r, y);
+            }
         }
         let l2 = b.mul_f32(Opnd::Var(l_v), alpha);
         b.set_var(l_v, l2);
