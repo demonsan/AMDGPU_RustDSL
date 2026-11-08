@@ -46,14 +46,22 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(res.data(), dres, 8 * 256, hipMemcpyDeviceToHost));
     int pass = 0;
     for (uint32_t f : res) pass += f == 1;
+    for (int g = 0; g < 8; ++g) {
+        int c = 0;
+        for (int l = 0; l < 64; ++l) c += res[g * 64 + l] == 1;
+        std::printf("  window %d %s: %d / 64\n", g / 2, g % 2 ? "B (vector write, descriptor read)" : "A (descriptor write, vector read)", c);
+    }
     int host_ok = 0;
     for (int k = 0; k < 4; ++k) {
         std::vector<uint32_t> w(128);
         CK(hipMemcpy(w.data(), (char*)dbig + win[k], 512, hipMemcpyDeviceToHost));
+        int a = 0, bb = 0;
         for (int l = 0; l < 64; ++l) {
-            host_ok += w[l] == (0xA0000000u | (uint32_t)k << 16 | (uint32_t)l);
-            host_ok += w[64 + l] == (0xB0000000u | (uint32_t)k << 16 | (uint32_t)l);
+            a += w[l] == (0xA0000000u | (uint32_t)k << 16 | (uint32_t)l);
+            bb += w[64 + l] == (0xB0000000u | (uint32_t)k << 16 | (uint32_t)l);
         }
+        host_ok += a + bb;
+        std::printf("  host window %d: A %d / 64, B %d / 64 (first words %08x %08x)\n", k, a, bb, w[0], w[64]);
     }
     std::printf("probe_big_addr: on-GPU read-back passes %d / 512, host window check %d / 512 (windows at 4 GiB - 128, 4 GiB + 128, 8 GiB - 128, 8 GiB + 128)\n", pass, host_ok);
     return pass == 512 && host_ok == 512 ? 0 : 1;
