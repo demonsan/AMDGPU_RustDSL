@@ -28,6 +28,26 @@ pub fn bf16_prefill_key_splits(b: u64, h: u64, sq: u64, sk: u64, causal: bool, c
     s as u32
 }
 
+/// Paged decode with 16x16 MFMAs (`pa_decode16_bf16_hd128_p<P>[_k64]`, GQA G <= 16): (keys per tile, splits per wave group S). n = B HK
+/// work groups before the split: large n runs 32-key tiles (two CTAs per CU) with the smallest S giving n S >= 512; small grids (n < 64) run
+/// 64-key tiles with S up to 8. Measured (B, HK, ctx): (16, 8, 4096) 32-key S4 4035 GB/s vs 64-key best 3739; (64, 8, 2048) 32-key S1 4182 vs
+/// 3483; (4, 4, 8192) 64-key S8 1398 vs 32-key 1233.
+pub fn decode16_config(b: u64, hk: u64) -> (u32, u32) {
+    let n = b * hk;
+    if n < 64 {
+        let mut s = 1u64;
+        while s < 8 && n * s * 4 < 1024 {
+            s *= 2;
+        }
+        return (64, s as u32);
+    }
+    let mut s = 1u64;
+    while s < 16 && n * s < 512 {
+        s *= 2;
+    }
+    (32, s as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,6 +58,13 @@ mod tests {
         assert_eq!(blockscale_split_k(256, 7168, 4096, 256), 2);
         assert_eq!(blockscale_split_k(512, 7168, 7168, 256), 2);
         assert_eq!(blockscale_split_k(4096, 4096, 4096, 256), 1);
+    }
+
+    #[test]
+    fn decode16_rule() {
+        assert_eq!(decode16_config(16, 8), (32, 4));
+        assert_eq!(decode16_config(64, 8), (32, 1));
+        assert_eq!(decode16_config(4, 4), (64, 8));
     }
 
     #[test]
