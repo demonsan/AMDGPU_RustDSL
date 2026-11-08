@@ -191,20 +191,32 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
             acc.expect("9 MFMAs")
         });
         // ---- the 4 partials summed through LDS: wave w writes its 16 floats (lane-major), barrier, every wave reads all 4 ----
-        let wa = b.bind_i32(lane.lane() * 64 + rbase + ev(wv) * 4096);
-        red.at(&SlotIdx::new(Opnd::Val(wv), Opnd::Var(it))).write(&mut b, |b| {
-            for q in 0..4u8 {
+        // version of this tile's reduction slots: 2 it + slot
+        let ver = b.bind_i32((itx.clone() << 1) + slot);
+        let wa0 = b.bind_i32(lane.lane() * 64 + rbase);
+        let words: Vec<ValueId> = (0..4u8)
+            .map(|q| {
                 let w: Vec<ValueId> = (0..4u8).map(|k| b.frag16_lane(sp, 4 * q + k)).collect();
-                let f = b.frag4(w[0], w[1], w[2], w[3]);
-                let a = b.bind_i32(ev(wa) + 16 * q as i32);
-                b.store_lds_b128(a, f);
-            }
-        });
+                b.frag4(w[0], w[1], w[2], w[3])
+            })
+            .collect();
+        // wave w writes slot w (a static slot per wave-uniform branch)
+        for w in 0..4i32 {
+            let me_w = b.bind_cond(ev(wv).eq(w));
+            b.begin_if(Opnd::Val(me_w));
+            red.at(&SlotIdx::new(w, Opnd::Val(ver))).write(&mut b, |b| {
+                for (q, f) in words.iter().enumerate() {
+                    let a = b.bind_i32(ev(wa0) + (w * 4096 + 16 * q as i32));
+                    b.store_lds_b128(a, *f);
+                }
+            });
+            b.end_if();
+        }
         b.wait_lds(0);
         b.barrier();
         let mut sum: Vec<ValueId> = Vec::new();
         for w in 0..4i32 {
-            let part = red.at(&SlotIdx::new(w, Opnd::Var(it)));
+            let part = red.at(&SlotIdx::new(w, Opnd::Val(ver)));
             let vals: Vec<ValueId> = part.read(&mut b, |b| {
                 (0..4)
                     .flat_map(|q| {
