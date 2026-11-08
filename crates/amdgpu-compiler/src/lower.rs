@@ -1932,6 +1932,20 @@ impl Lowerer {
                     let v = self.as_v4(*value)?;
                     self.push(MInst::new(MOp::LdsWriteB128).srcreg(a).srcreg(v).imm(off));
                 }
+                Stmt::VarMfma { var, kind, a, b, scale: Some(s), zero } if kind.scaled => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let (mop, zmop, imm) = scaled_mfma_mop(*kind, s.opsel)?;
+                    let ra = self.mma_operand(*kind, kind.a, *a)?;
+                    let rb = self.mma_operand(*kind, kind.b, *b)?;
+                    let sa = self.as_v1(s.sa)?;
+                    let sb = self.as_v1(s.sb)?;
+                    self.touch(&[Src::Reg(sa), Src::Reg(sb)]);
+                    if *zero {
+                        self.push(MInst::new(zmop).def(v).srcreg(ra).srcreg(rb).srcreg(sa).srcreg(sb).imm(imm));
+                    } else {
+                        self.push(MInst::new(mop).def(v).srcreg(ra).srcreg(rb).srcreg(v).srcreg(sa).srcreg(sb).imm(imm));
+                    }
+                }
                 Stmt::VarMfma { var, kind, a, b, scale: _, zero } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let (mop, zmop) = mfma_mop(*kind)?;
@@ -2319,6 +2333,36 @@ impl Lowerer {
                 self.push(MInst::new(mop).def(d).srcreg(a).imm(imm));
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
+            }
+            Op::Mfma { kind, a, b, c, scale: Some(s) } if kind.scaled => {
+                let (mop, zmop, imm) = scaled_mfma_mop(*kind, s.opsel)?;
+                let ra = self.mma_operand(*kind, kind.a, *a)?;
+                let rb = self.mma_operand(*kind, kind.b, *b)?;
+                let sa = self.as_v1(s.sa)?;
+                let sb = self.as_v1(s.sb)?;
+                self.touch(&[Src::Reg(sa), Src::Reg(sb)]);
+                let n = kind.acc_dwords();
+                let cls = if n == 4 { RClass::V4 } else { RClass::V16 };
+                match c {
+                    Some(c) if !self.is_zero_frag(c) => {
+                        let rc = if n == 4 { self.as_v4(*c)? } else { self.as_v16(*c)? };
+                        let reusable = matches!(c, Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1) && matches!(self.defs.get(cv), Some(Op::Mfma { .. })));
+                        let d = if reusable {
+                            rc
+                        } else {
+                            let d = self.new_vreg(cls);
+                            self.copy_reg(d, rc)?;
+                            d
+                        };
+                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(d).srcreg(sa).srcreg(sb).imm(imm));
+                        self.val.insert(dst, d);
+                    }
+                    _ => {
+                        let d = self.new_vreg(cls);
+                        self.push(MInst::new(zmop).def(d).srcreg(ra).srcreg(rb).srcreg(sa).srcreg(sb).imm(imm));
+                        self.val.insert(dst, d);
+                    }
+                }
             }
             Op::Mfma { kind, a, b, c, scale: _ } => {
                 let (mop, zmop) = mfma_mop(*kind)?;
@@ -3106,6 +3150,11 @@ impl Lowerer {
         self.push(MInst::new(op).def(d).srcreg(ra).srcreg(rb));
         self.val.insert(dst, d);
         Ok(())
+    }
+
+    /// The register of an MFMA A / B operand of element type `t` (fp4 / 16-bit / i8: 4 dwords; fp6 / bf6: 6 dwords held in a Frag8; fp8 / bf8: 8).
+    fn mma_operand(&mut self, k: amdgpu_dsl::MmaKind, t: amdgpu_dsl::MmaTy, o: Opnd) -> Result<VReg, String> {
+        if k.operand_dwords(t) == 4 { self.as_v4(o) } else { self.as_v8(o) }
     }
 
     /// The data register of a store of `ty` (`hi`: the `_d16_hi` forms of 8 / 16-bit stores) and its MOp.
@@ -4157,4 +4206,36 @@ fn mfma_mop(k: amdgpu_dsl::MmaKind) -> Result<(MOp, MOp), String> {
         (S::M32N32K32, T::I8) => (MOp::VMfma32x32x32I8, MOp::VMfma32x32x32I8Z),
         _ => return Err(format!("mfma {k:?}: not supported yet")),
     })
+}
+
+/// (C form, zero-C form, imm) of a block-scaled f8f6f4 MFMA with A / B format select (imm = opsel | cbsz << 8 | blgp << 12).
+fn scaled_mfma_mop(k: amdgpu_dsl::MmaKind, opsel: u8) -> Result<(MOp, MOp, i64), String> {
+    use amdgpu_dsl::{MmaKind, MmaShape as S};
+    let (Some(ca), Some(cb)) = (MmaKind::f8f6f4_code(k.a), MmaKind::f8f6f4_code(k.b)) else {
+        return Err(format!("mfma {k:?}: scaled MFMA needs f8f6f4 operand types"));
+    };
+    let size = |t| k.operand_dwords(t);
+    let imm = (opsel as i64 & 0x33) | ((ca as i64) << 8) | ((cb as i64) << 12);
+    let m = |c: MOp, z: MOp| Ok((c, z, imm));
+    match (k.shape, size(k.a), size(k.b)) {
+        (S::M16N16K128, 4, 4) => m(MOp::VMfmaScale16x16x128A4B4, MOp::VMfmaScale16x16x128A4B4Z),
+        (S::M16N16K128, 4, 6) => m(MOp::VMfmaScale16x16x128A4B6, MOp::VMfmaScale16x16x128A4B6Z),
+        (S::M16N16K128, 4, 8) => m(MOp::VMfmaScale16x16x128A4B8, MOp::VMfmaScale16x16x128A4B8Z),
+        (S::M16N16K128, 6, 4) => m(MOp::VMfmaScale16x16x128A6B4, MOp::VMfmaScale16x16x128A6B4Z),
+        (S::M16N16K128, 6, 6) => m(MOp::VMfmaScale16x16x128A6B6, MOp::VMfmaScale16x16x128A6B6Z),
+        (S::M16N16K128, 6, 8) => m(MOp::VMfmaScale16x16x128A6B8, MOp::VMfmaScale16x16x128A6B8Z),
+        (S::M16N16K128, 8, 4) => m(MOp::VMfmaScale16x16x128A8B4, MOp::VMfmaScale16x16x128A8B4Z),
+        (S::M16N16K128, 8, 6) => m(MOp::VMfmaScale16x16x128A8B6, MOp::VMfmaScale16x16x128A8B6Z),
+        (S::M16N16K128, 8, 8) => m(MOp::VMfmaScale16x16x128A8B8, MOp::VMfmaScale16x16x128A8B8Z),
+        (S::M32N32K64, 4, 4) => m(MOp::VMfmaScale32x32x64A4B4, MOp::VMfmaScale32x32x64A4B4Z),
+        (S::M32N32K64, 4, 6) => m(MOp::VMfmaScale32x32x64A4B6, MOp::VMfmaScale32x32x64A4B6Z),
+        (S::M32N32K64, 4, 8) => m(MOp::VMfmaScale32x32x64A4B8, MOp::VMfmaScale32x32x64A4B8Z),
+        (S::M32N32K64, 6, 4) => m(MOp::VMfmaScale32x32x64A6B4, MOp::VMfmaScale32x32x64A6B4Z),
+        (S::M32N32K64, 6, 6) => m(MOp::VMfmaScale32x32x64A6B6, MOp::VMfmaScale32x32x64A6B6Z),
+        (S::M32N32K64, 6, 8) => m(MOp::VMfmaScale32x32x64A6B8, MOp::VMfmaScale32x32x64A6B8Z),
+        (S::M32N32K64, 8, 4) => m(MOp::VMfmaScale32x32x64A8B4, MOp::VMfmaScale32x32x64A8B4Z),
+        (S::M32N32K64, 8, 6) => m(MOp::VMfmaScale32x32x64A8B6, MOp::VMfmaScale32x32x64A8B6Z),
+        (S::M32N32K64, 8, 8) => m(MOp::VMfmaScale32x32x64A8B8, MOp::VMfmaScale32x32x64A8B8Z),
+        _ => Err(format!("mfma {k:?}: not a scaled f8f6f4 shape")),
+    }
 }

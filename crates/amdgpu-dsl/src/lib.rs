@@ -187,6 +187,10 @@ impl MmaKind {
     pub const fn new(shape: MmaShape, ty: MmaTy) -> MmaKind {
         MmaKind { shape, a: ty, b: ty, scaled: false }
     }
+    /// A block-scaled f8f6f4 kind (`M16N16K128` / `M32N32K64`) with A / B formats `a` / `b` (fp8, bf8, fp6, bf6, fp4; may differ).
+    pub const fn scaled_f8f6f4(shape: MmaShape, a: MmaTy, b: MmaTy) -> MmaKind {
+        MmaKind { shape, a, b, scaled: true }
+    }
     /// Accumulator / result dwords per lane (16x16: 4, 32x32: 16).
     pub fn acc_dwords(self) -> u32 {
         match self.shape {
@@ -215,7 +219,23 @@ impl MmaKind {
     pub fn lowerable(self) -> bool {
         use MmaShape as S;
         use MmaTy as T;
-        !self.scaled && self.a == self.b && matches!((self.shape, self.a), (S::M16N16K32 | S::M32N32K16, T::Bf16 | T::F16) | (S::M16N16K64 | S::M32N32K32, T::I8))
+        let f8f6f4 = |t: MmaTy| matches!(t, T::Fp8 | T::Bf8 | T::Fp6 | T::Bf6 | T::Fp4);
+        if self.scaled {
+            // block-scaled f8f6f4 with A / B format select (mixed formats allowed)
+            return matches!(self.shape, S::M16N16K128 | S::M32N32K64) && f8f6f4(self.a) && f8f6f4(self.b);
+        }
+        self.a == self.b && matches!((self.shape, self.a), (S::M16N16K32 | S::M32N32K16, T::Bf16 | T::F16) | (S::M16N16K64 | S::M32N32K32, T::I8))
+    }
+    /// The f8f6f4 format code (`cbsz` for A, `blgp` for B): fp8 0, bf8 1, fp6 2, bf6 3, fp4 4.
+    pub fn f8f6f4_code(t: MmaTy) -> Option<u8> {
+        Some(match t {
+            MmaTy::Fp8 => 0,
+            MmaTy::Bf8 => 1,
+            MmaTy::Fp6 => 2,
+            MmaTy::Bf6 => 3,
+            MmaTy::Fp4 => 4,
+            _ => return None,
+        })
     }
     /// XDL passes (cost model; issue cycles = 4 x passes).
     pub fn passes(self) -> u8 {
@@ -1823,6 +1843,14 @@ impl FnBuilder {
     /// D = A x B + C (`c: None`: zero accumulator).
     pub fn mfma(&mut self, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>) -> ValueId {
         self.let_(Op::Mfma { kind, a: a.into(), b: b.into(), c, scale: None })
+    }
+    /// Block-scaled D = A x B + C of a scaled f8f6f4 kind (`MmaKind::scaled_f8f6f4`), E8M0 scales `s`.
+    pub fn mfma_scaled(&mut self, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>, s: MmaScale) -> ValueId {
+        self.let_(Op::Mfma { kind, a: a.into(), b: b.into(), c, scale: Some(s) })
+    }
+    /// Block-scaled var = A x B + var (`zero`: var = A x B).
+    pub fn var_mfma_scaled(&mut self, var: VarId, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, s: MmaScale, zero: bool) {
+        self.push_stmt(Stmt::VarMfma { var, kind, a: a.into(), b: b.into(), scale: Some(s), zero });
     }
     /// var = A x B + var (`zero`: var = A x B).
     pub fn var_mfma(&mut self, var: VarId, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, zero: bool) {

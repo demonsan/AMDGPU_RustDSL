@@ -355,3 +355,64 @@ pub fn probe_mfma_p1() -> Function {
     }
     b.finish()
 }
+
+/// (shape, A type, B type) combinations of `probe_f8f6f4_p1`, in input / output order.
+pub fn f8f6f4_p1_kinds() -> Vec<amdgpu_dsl::MmaKind> {
+    use amdgpu_dsl::{MmaKind, MmaShape as S, MmaTy as T};
+    let mut v = Vec::new();
+    for (a, b) in [(T::Fp4, T::Fp4), (T::Fp8, T::Fp4), (T::Fp4, T::Fp8), (T::Fp8, T::Fp8), (T::Bf8, T::Bf8), (T::Fp6, T::Fp6), (T::Bf6, T::Bf6), (T::Bf8, T::Fp6)] {
+        v.push(MmaKind::scaled_f8f6f4(S::M16N16K128, a, b));
+    }
+    for (a, b) in [(T::Fp4, T::Fp4), (T::Fp8, T::Fp4), (T::Fp6, T::Bf8)] {
+        v.push(MmaKind::scaled_f8f6f4(S::M32N32K64, a, b));
+    }
+    v
+}
+
+/// `probe_f8f6f4_p1(in, out)`: per kind, A and B (32 bytes per lane each, lane-major; fp4 uses the first 16, fp6 the first 24) with unit
+/// E8M0 scales (0x7F); `out` gets D = A x B (zero-C) and D2 = A x B + D, lane-major.
+pub fn probe_f8f6f4_p1() -> Function {
+    let kinds = f8f6f4_p1_kinds();
+    let mut b = FnBuilder::new("probe_f8f6f4_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    let out_bytes: u32 = kinds.iter().map(|k| 2 * 64 * 4 * k.acc_dwords()).sum();
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const((kinds.len() * 4096) as i64));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(out_bytes as i64));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off32 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(32)));
+    let one = b.c_i32(0x7F7F7F7F);
+    let s = amdgpu_dsl::MmaScale { sa: Opnd::Val(one), sb: Opnd::Val(one), opsel: 0 };
+    let mut obase = 0u32;
+    for (i, k) in kinds.iter().enumerate() {
+        let p = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::I32((i * 4096) as i32) });
+        let p = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off32) });
+        let mut opnd = |b: &mut FnBuilder, off: u32, t: amdgpu_dsl::MmaTy| {
+            let lo = b.load_global(p, off, amdgpu_dsl::MemTy::B128);
+            if k.operand_dwords(t) == 4 {
+                lo
+            } else {
+                let hi = b.load_global(p, off + 16, amdgpu_dsl::MemTy::B128);
+                b.cat_frag8(lo, hi)
+            }
+        };
+        let fa = opnd(&mut b, 0, k.a);
+        let fb = opnd(&mut b, 2048, k.b);
+        let d1 = b.mfma_scaled(*k, fa, fb, None, s);
+        let d2 = b.mfma_scaled(*k, fa, fb, Some(Opnd::Val(d1)), s);
+        let n = k.acc_dwords();
+        let lane_off = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32((4 * n) as i32)));
+        for (j, v) in [d1, d2].into_iter().enumerate() {
+            let q = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::I32((obase + j as u32 * 64 * 4 * n) as i32) });
+            let q = b.let_(Op::PtrAdd { base: Opnd::Val(q), byte_off: Opnd::Val(lane_off) });
+            for e in 0..n as u8 {
+                let x = if n == 4 { b.frag4_lane(v, e) } else { b.frag16_lane(v, e) };
+                b.store_global(q, 4 * e as u32, x, amdgpu_dsl::MemTy::B32, false);
+            }
+        }
+        obase += 2 * 64 * 4 * n;
+    }
+    b.finish()
+}

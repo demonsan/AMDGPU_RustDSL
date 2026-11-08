@@ -409,9 +409,99 @@ def check_mfma_p1(planes, out):
         print("FAIL var_slice4 views")
     return ok
 
+# ---------------------------------------------------------------- probe_f8f6f4_p1
+# formats: (bits, exponent bits, mantissa bits, bias); 32 elements per lane packed contiguously (element v at bit v * bits).
+FMT = {"fp8": (8, 4, 3, 7), "bf8": (8, 5, 2, 15), "fp6": (6, 2, 3, 1), "bf6": (6, 3, 2, 3), "fp4": (4, 2, 1, 1)}
+F8F6F4_KINDS = [(16, a, b) for a, b in [("fp4", "fp4"), ("fp8", "fp4"), ("fp4", "fp8"), ("fp8", "fp8"), ("bf8", "bf8"), ("fp6", "fp6"), ("bf6", "bf6"), ("bf8", "fp6")]] + \
+               [(32, a, b) for a, b in [("fp4", "fp4"), ("fp8", "fp4"), ("fp6", "bf8")]]
+VALS = [0.0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 6.0, -6.0]
+
+def mf_decode(fmt, code):
+    bits, eb, mb, bias = FMT[fmt]
+    s = -1.0 if code >> (bits - 1) & 1 else 1.0
+    e = (code >> mb) & ((1 << eb) - 1)
+    m = code & ((1 << mb) - 1)
+    if e == 0:
+        return s * m * 2.0 ** (1 - bias - mb)
+    return s * (1 + m / (1 << mb)) * 2.0 ** (e - bias)
+
+def mf_encode(fmt, v):
+    bits = FMT[fmt][0]
+    for code in range(1 << bits):
+        if fmt == "fp8" and code & 0x7F == 0x7F:
+            continue
+        if mf_decode(fmt, code) == v and not (v == 0 and code):
+            return code
+    raise ValueError((fmt, v))
+
+def gen_f8f6f4_p1():
+    rnd = random.Random(99)
+    words = []
+    for M, fa, fb in F8F6F4_KINDS:
+        for fmt in (fa, fb):
+            bits = FMT[fmt][0]
+            for l in range(LANES):
+                x = 0
+                for v in range(32):
+                    x |= mf_encode(fmt, rnd.choice(VALS)) << (bits * v)
+                words += [(x >> (32 * j)) & 0xFFFFFFFF for j in range(8)]
+            words += [0] * (512 - 8 * LANES)  # pad each operand block to 2048 bytes
+    return [words]
+
+def kmap(c, G, g, v):
+    return c * g + (v % c) + (v // c) * c * G
+
+def check_f8f6f4_p1(planes, out):
+    words = planes[0]
+    pos = obase = 0
+    ok = True
+    for M, fa, fb in F8F6F4_KINDS:
+        K = 128 if M == 16 else 64
+        G = 64 // M
+        elems = []
+        for fmt in (fa, fb):
+            bits = FMT[fmt][0]
+            per_lane = []
+            for l in range(LANES):
+                x = sum(w << (32 * j) for j, w in enumerate(words[pos + 8 * l: pos + 8 * l + 8]))
+                per_lane.append([mf_decode(fmt, (x >> (bits * v)) & ((1 << bits) - 1)) for v in range(32)])
+            elems.append(per_lane)
+            pos += 512
+        n = 4 if M == 16 else 16
+        def at(D, l, r):
+            if n == 4:
+                return D[4 * (l // 16) + r][l % 16]
+            return D[8 * (r // 4) + 4 * (l // 32) + r % 4][l % 32]
+        found = None
+        for ca in (4, 8, 16, 32):
+            for cb in (4, 8, 16, 32):
+                A = [[0.0] * K for _ in range(M)]
+                B = [[0.0] * M for _ in range(K)]
+                for l in range(LANES):
+                    for v in range(32):
+                        A[l % M][kmap(ca, G, l // M, v)] = elems[0][l][v]
+                        B[kmap(cb, G, l // M, v)][l % M] = elems[1][l][v]
+                D = [[sum(A[r][k] * B[k][c] for k in range(K)) for c in range(M)] for r in range(M)]
+                good = all(f32(out[obase + l * n + r]) == at(D, l, r) and f32(out[obase + (LANES + l) * n + r]) == 2 * at(D, l, r)
+                           for l in range(LANES) for r in range(n))
+                if good:
+                    found = (ca, cb)
+                    break
+            if found:
+                break
+        name = f"{M}x{M}x{K} {fa} x {fb}"
+        if found:
+            print(f"ok   {name}: A k-chunk {found[0]}, B k-chunk {found[1]} (k = c (l / {M}) + v % c + (v / c) c {G})")
+        else:
+            ok = False
+            print(f"FAIL {name}: no layout hypothesis matches (got lane 0: {[f32(out[obase + r]) for r in range(min(n, 4))]})")
+        obase += 2 * LANES * n
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
+    "probe_f8f6f4_p1": (gen_f8f6f4_p1, check_f8f6f4_p1, sum(2 * LANES * 4 * (4 if k[0] == 16 else 16) for k in F8F6F4_KINDS)),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
 
