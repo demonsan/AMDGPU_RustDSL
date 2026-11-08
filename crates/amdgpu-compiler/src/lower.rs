@@ -2310,6 +2310,64 @@ impl Lowerer {
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
+            Op::FragSlice { frag, start, n } => {
+                let f = match frag {
+                    Opnd::Val(v) => {
+                        let r = *self.val.get(v).ok_or_else(|| format!("value v{v} not lowered"))?;
+                        self.touch(&[Src::Reg(r)]);
+                        r
+                    }
+                    Opnd::Var(v) => {
+                        let r = *self.vars.get(v.0 as usize).ok_or("var not lowered")?;
+                        self.touch(&[Src::Reg(r)]);
+                        r
+                    }
+                    _ => return Err("frag_slice of a constant".into()),
+                };
+                let cls = match n {
+                    1 => RClass::V1,
+                    2 => RClass::V2,
+                    4 => RClass::V4,
+                    _ => RClass::V8,
+                };
+                let d = self.sub_alias(f, *start, cls);
+                self.val.insert(dst, d);
+            }
+            Op::FragCat { parts, .. } => {
+                let mut regs = Vec::new();
+                let mut total = 0u8;
+                for p in parts {
+                    let r = match p {
+                        Opnd::Val(v) if self.val.get(v).map_or(false, |r| self.mir.vreg_class(*r).dwords() > 1) => self.val[v],
+                        Opnd::Var(v) if self.vars.get(v.0 as usize).map_or(false, |r| self.mir.vreg_class(*r).dwords() > 1) => self.vars[v.0 as usize],
+                        o => self.as_v1(*o)?,
+                    };
+                    self.touch(&[Src::Reg(r)]);
+                    let w = self.mir.vreg_class(r).dwords() as u8;
+                    regs.push((r, total, w));
+                    total += w;
+                }
+                let cls = match total {
+                    2 => RClass::V2,
+                    4 => RClass::V4,
+                    8 => RClass::V8,
+                    16 => RClass::V16,
+                    n => return Err(format!("frag_cat of {n} dwords")),
+                };
+                let d = self.new_vreg(cls);
+                for (r, off, w) in regs {
+                    let c = match w {
+                        1 => RClass::V1,
+                        2 => RClass::V2,
+                        4 => RClass::V4,
+                        8 => RClass::V8,
+                        _ => RClass::V16,
+                    };
+                    let part = self.alias_vreg(d, off, c);
+                    self.copy_reg(part, r)?;
+                }
+                self.val.insert(dst, d);
+            }
             Op::ReadLane { x, lane } => {
                 let r = self.as_v1(*x)?;
                 self.touch(&[Src::Reg(r)]);
