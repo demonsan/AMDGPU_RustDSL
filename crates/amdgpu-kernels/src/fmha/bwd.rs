@@ -182,7 +182,7 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
                 .map(|r| {
                     let krow = b.bind_i32(8 * r + ev(half) * 4 + (lane.lane() & 15).lshr(2));
                     let dim = b.bind_i32(32 * e + ((lane.lane() & 31).lshr(4) << 4) + ((lane.lane() & 3) << 2));
-                    b.bind_i32(ev(krow) * ROW + (((ev(dim).lshr(3)) ^ (ev(krow) & 15)) << 4) + ((ev(dim) & 7) << 1))
+                    b.bind_i32(ev(krow) * ROW + (((ev(dim).lshr(3) ^ ev(krow)) & 15) << 4) + ((ev(dim) & 7) << 1))
                 })
                 .collect()
         })
