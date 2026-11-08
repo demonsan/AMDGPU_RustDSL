@@ -859,3 +859,41 @@ pub fn probe_tileop_p1() -> Function {
     }
     b.finish()
 }
+
+/// `probe_atomic2_p1(in, out)`: buffer atomics (no return) and packed 16-bit global atomics from 64 lanes. in: plane 0 f32 y, plane 1 packed bf16
+/// pair p, plane 2 packed f16 pair h (small integers). out dwords (counter c = l % 4): 0..3 buffer add_f32 (y), 4..7 buffer pk_add_bf16 (p),
+/// 8..11 buffer pk_add_f16 (h), 12..15 buffer add_u32 (lane), 16..19 global pk_add_bf16 (p, no return), 20..23 global pk_add_f16 (h,
+/// returning; the returns go to plane 1 of out: dwords 64..127).
+pub fn probe_atomic2_p1() -> Function {
+    use amdgpu_dsl::{AtomicOp as A, MemTy};
+    let mut b = FnBuilder::new("probe_atomic2_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(768));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(512));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let y = { let t = b.load_global(pin, 0, MemTy::B32); b.let_(Op::BitcastF32(Opnd::Val(t))) };
+    let p = b.load_global(pin, 256, MemTy::B32);
+    let h = b.load_global(pin, 512, MemTy::B32);
+    // zero the 24 counters (lanes 0..23) and wait
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    b.store_global(pout, 0, 0, MemTy::B32, false);
+    b.wait_vm(0);
+    b.barrier();
+    let c4 = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(3)));
+    let co = b.let_(Op::MulI32(Opnd::Val(c4), Opnd::I32(4)));
+    let r = b.buffer_desc(out, 512);
+    b.buffer_atomic(A::AddF32, r, Some(Opnd::Val(co)), 0, 0, y);
+    b.buffer_atomic(A::PkAddBf16, r, Some(Opnd::Val(co)), 0, 16, p);
+    b.buffer_atomic(A::PkAddF16, r, Some(Opnd::Val(co)), 0, 32, h);
+    b.buffer_atomic(A::AddU32, r, Some(Opnd::Val(co)), 0, 48, tid);
+    let g = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(co) });
+    b.atomic_global(A::PkAddBf16, g, 64, p, false);
+    let ret = b.atomic_global(A::PkAddF16, g, 80, h, true).unwrap();
+    b.store_global(pout, 256, ret, MemTy::B32, false);
+    b.finish()
+}
