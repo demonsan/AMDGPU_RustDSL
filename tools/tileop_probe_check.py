@@ -498,10 +498,142 @@ def check_f8f6f4_p1(planes, out):
         obase += 2 * LANES * n
     return ok
 
+# ---------------------------------------------------------------- probe_cpol_p1: out == in (4 copy paths with cache-policy modifiers)
+def gen_cpol_p1():
+    return [[(i * 2654435761 + 12345) & 0xFFFFFFFF for i in range(1024)]]
+
+def check_cpol_p1(planes, out):
+    bad = [i for i in range(1024) if out[i] != planes[0][i]]
+    for path in range(4):
+        n = len([i for i in bad if path * 256 <= i < (path + 1) * 256])
+        print(("FAIL" if n else "ok  ") + f" copy path {path}: {256 - n} / 256 dwords")
+    return not bad
+
+# ---------------------------------------------------------------- probe_cvt_p1
+CVT_CASES = [("PkF32Fp8", [0], 0), ("PkF32Fp8", [0], 1), ("PkF32Bf8", [0], 1), ("F32Fp8", [0], 2), ("F32Bf8", [0], 3), ("PkBf8F32", [2, 3, 8], 0),
+             ("PkBf8F32", [2, 3, 8], 1), ("ScalePkBf16Fp8", [0, 7], 1), ("ScalePkF16Fp8", [0, 7], 0), ("ScalePkBf16Bf8", [0, 7], 1),
+             ("ScalePkF16Bf8", [0, 7], 0), ("ScalePkF32Fp8", [0, 7], 1), ("ScalePkF32Bf8", [0, 7], 0), ("ScalePkF32Fp4", [1, 7], 2),
+             ("ScalePkBf16Fp4", [1, 7], 3), ("ScalePkF16Fp4", [1, 7], 1), ("ScalePkFp8F32", [2, 3, 7, 8], 1), ("ScalePkBf8F32", [2, 3, 7, 8], 0),
+             ("ScalePkFp4F32", [2, 3, 7, 8], 2), ("PkU8F32", [4, 8], 2), ("PkI16I32", [5, 6], 0), ("PkU16U32", [5, 6], 0)]
+TWO = {"PkF32Fp8", "PkF32Bf8", "ScalePkF32Fp8", "ScalePkF32Bf8", "ScalePkF32Fp4"}
+
+def gen_cvt_p1():
+    rnd = random.Random(5)
+    ok_byte = [b for b in range(256) if (b & 0x7F) != 0x7F and ((b >> 2) & 31) <= 25]
+    S2 = [2 * v for v in VALS]
+    planes = [[], [], [], [], [], [], [], [], []]
+    for l in range(LANES):
+        planes[0].append(sum(rnd.choice(ok_byte) << (8 * i) for i in range(4)))
+        planes[1].append(rnd.getrandbits(32))
+        planes[2].append(u32(rnd.choice(S2)))
+        planes[3].append(u32(rnd.choice(S2)))
+        c = [-10.0, -0.5, 0.0, 0.5, 1.5, 2.5, 127.5, 254.5, 255.0, 255.6, 300.0, 3.49][l % 12] if l < 24 else rnd.uniform(-5, 260)
+        planes[4].append(u32(to_f32(c)))
+        planes[5].append(rnd.choice([0, 1, 0xFFFFFFFF, 0x7FFF, 0x8000, 0xFFFF7FFF, 0x10000, 0x7FFFFFFF, 0x80000000]) if l < 32 else rnd.getrandbits(32) >> rnd.randrange(32))
+        planes[6].append(rnd.getrandbits(32) >> rnd.randrange(32))
+        planes[7].append(u32(2.0))
+        planes[8].append(0x5A5A5A5A)
+    return planes
+
+def enc_rne(fmt, v):
+    """nearest representable (ties to even code), saturating to the largest finite"""
+    bits = FMT[fmt][0]
+    best = None
+    for code in range(1 << bits):
+        if fmt == "fp8" and code & 0x7F == 0x7F:
+            continue
+        if fmt == "bf8" and (code >> 2) & 31 == 31:
+            continue
+        d = mf_decode(fmt, code)
+        key = (abs(d - v), code & 1)
+        if best is None or key < best[0]:
+            best = (key, code)
+    return best[1]
+
+def bf16(v):
+    return u32(v) >> 16
+
+def h16(v):
+    return f2h(v)
+
+def cvt_ref(op, sel, x, hyp):
+    """expected dword(s); hyp: 'div' (quant: value / scale, dequant: value * scale) or 'mul' (quant: value * scale)"""
+    if op in ("PkF32Fp8", "PkF32Bf8", "F32Fp8", "F32Bf8"):
+        fmt = "fp8" if "Fp8" in op else "bf8"
+        src = x[0]
+        if op.startswith("Pk"):
+            return [u32(mf_decode(fmt, (src >> (16 * sel + 8 * i)) & 255)) for i in range(2)]
+        return [u32(mf_decode(fmt, (src >> (8 * sel)) & 255))]
+    if op == "PkBf8F32":
+        w = enc_rne("bf8", f32(x[0])) | (enc_rne("bf8", f32(x[1])) << 8)
+        return [(x[2] & ~(0xFFFF << (16 * sel)) & 0xFFFFFFFF) | (w << (16 * sel))]
+    if op.startswith("ScalePk") and op.endswith(("Fp8", "Bf8", "Fp4")) and not op.endswith("F32"):
+        src_fmt = op[-3:].lower()
+        out = op[7:-3]
+        s = f32(x[1])
+        if src_fmt == "fp4":
+            vals = [mf_decode("fp4", (x[0] >> (8 * sel + 4 * i)) & 15) * s for i in range(2)]
+        else:
+            vals = [mf_decode(src_fmt, (x[0] >> (16 * sel + 8 * i)) & 255) * s for i in range(2)]
+        if out == "F32":
+            return [u32(v) for v in vals]
+        f = bf16 if out == "Bf16" else h16
+        return [f(vals[0]) | (f(vals[1]) << 16)]
+    if op in ("ScalePkFp8F32", "ScalePkBf8F32", "ScalePkFp4F32"):
+        s = f32(x[2])
+        q = (lambda v: v / s) if hyp == "div" else (lambda v: v * s)
+        a, b = q(f32(x[0])), q(f32(x[1]))
+        if op == "ScalePkFp4F32":
+            byte = enc_rne("fp4", a) | (enc_rne("fp4", b) << 4)
+            return [(x[3] & ~(0xFF << (8 * sel)) & 0xFFFFFFFF) | (byte << (8 * sel))]
+        fmt = "fp8" if "Fp8" in op else "bf8"
+        w = enc_rne(fmt, a) | (enc_rne(fmt, b) << 8)
+        return [(x[3] & ~(0xFFFF << (16 * sel)) & 0xFFFFFFFF) | (w << (16 * sel))]
+    if op == "PkU8F32":
+        v = f32(x[0])
+        r = round(v) if hyp == "div" else math.floor(v + 0.5)
+        r = max(0, min(255, int(r)))
+        return [(x[1] & ~(0xFF << (8 * sel)) & 0xFFFFFFFF) | (r << (8 * sel))]
+    if op == "PkI16I32":
+        c = lambda v: max(-32768, min(32767, s32(v))) & 0xFFFF
+        return [c(x[0]) | (c(x[1]) << 16)]
+    if op == "PkU16U32":
+        c = lambda v: min(65535, v)
+        return [c(x[0]) | (c(x[1]) << 16)]
+    raise ValueError(op)
+
+def check_cvt_p1(planes, out):
+    k = 0
+    ok = True
+    for op, srcs, sel in CVT_CASES:
+        n = 2 if op in TWO else 1
+        res = {}
+        for hyp in ("div", "mul"):
+            bad = []
+            for l in range(LANES):
+                want = cvt_ref(op, sel, [planes[p][l] for p in srcs], hyp)
+                got = [out[(k + i) * LANES + l] for i in range(n)]
+                same = all((math.isnan(f32(w)) and math.isnan(f32(g))) or w == g for w, g in zip(want, got))
+                if not same:
+                    bad.append((l, [hex(w) for w in want], [hex(g) for g in got]))
+            res[hyp] = bad
+        best = min(res, key=lambda h: len(res[h]))
+        bad = res[best]
+        tag = f"{op} sel {sel}" + (f" ({'value / scale' if best == 'div' else 'value * scale'})" if op in ("ScalePkFp8F32", "ScalePkBf8F32", "ScalePkFp4F32") else "") + (f" ({'round-half-even' if best == 'div' else 'round-half-up'})" if op == "PkU8F32" else "")
+        if bad:
+            ok = False
+            print(f"FAIL {tag}: {len(bad)} lanes, e.g. lane {bad[0][0]} want {bad[0][1]} got {bad[0][2]}")
+        else:
+            print(f"ok   {tag}")
+        k += n
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
     "probe_f8f6f4_p1": (gen_f8f6f4_p1, check_f8f6f4_p1, sum(2 * LANES * 4 * (4 if k[0] == 16 else 16) for k in F8F6F4_KINDS)),
+    "probe_cvt_p1": (gen_cvt_p1, check_cvt_p1, sum(2 if c[0] in TWO else 1 for c in CVT_CASES) * LANES * 4),
+    "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
 

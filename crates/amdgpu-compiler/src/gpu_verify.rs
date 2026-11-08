@@ -959,7 +959,7 @@ impl<'a> An<'a> {
             }
             Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } => {}
             // P1 memory loads
-            Op::LoadGlobalN { base, byte_off, ty } => {
+            Op::LoadGlobalN { base, byte_off, ty, .. } => {
                 let b = self.av_of(base);
                 self.check_global("global load", &b, *byte_off as i128, ty.bytes() as i128, false);
             }
@@ -967,7 +967,7 @@ impl<'a> An<'a> {
                 let b = self.av_of(base);
                 self.check_global("global load d16", &b, *byte_off as i128, ty.bytes() as i128, false);
             }
-            Op::BufferLoadN { rsrc, voff, soff, imm, ty } => {
+            Op::BufferLoadN { rsrc, voff, soff, imm, ty, .. } => {
                 let r = self.av_of(rsrc);
                 self.check_buffer("buffer load", &r, voff, soff, *imm as i128, ty.bytes() as i128, false);
             }

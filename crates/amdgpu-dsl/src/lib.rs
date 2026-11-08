@@ -243,6 +243,64 @@ impl MmaKind {
     }
 }
 
+/// Cache policy of a global / buffer access (gfx950 `sc0`, `sc1`, `nt` modifiers). Default: none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct CachePolicy {
+    pub sc0: bool,
+    pub sc1: bool,
+    pub nt: bool,
+}
+
+impl CachePolicy {
+    pub const NONE: CachePolicy = CachePolicy { sc0: false, sc1: false, nt: false };
+    /// Non-temporal (streaming) access.
+    pub const NT: CachePolicy = CachePolicy { sc0: false, sc1: false, nt: true };
+    /// LLVM CPol bits (1 = sc0, 2 = nt, 16 = sc1).
+    pub fn bits(self) -> u8 {
+        (self.sc0 as u8) | ((self.nt as u8) << 1) | ((self.sc1 as u8) << 4)
+    }
+}
+
+/// Conversions (P1 A2; `Op::Cvt { op, srcs, sel }`). Operands per op (unused slots: anything, conventionally `Opnd::I32(0)`):
+/// * `PkF32Fp8` / `PkF32Bf8`: srcs[0] packed bytes, `sel` = word (0 / 1) -> the two values as a Frag2 of f32.
+/// * `F32Fp8` / `F32Bf8`: srcs[0], `sel` = byte (0..3) -> F32.
+/// * `PkBf8F32`: srcs[0], srcs[1] f32, srcs[2] old dword; the two bf8 bytes replace word `sel` of the old dword -> I32.
+/// * `ScalePk{Bf16,F16}{Fp8,Bf8}`: srcs[0] packed bytes, srcs[1] f32 scale; word `sel` -> two 16-bit values in a U32.
+/// * `ScalePkF32{Fp8,Bf8}`: as above -> Frag2 of f32.
+/// * `ScalePk{F32,Bf16,F16}Fp4`: srcs[0] packed fp4, srcs[1] scale; byte `sel` (two fp4 values) -> Frag2 f32 / U32.
+/// * `ScalePk{Fp8,Bf8}F32`: srcs[0], srcs[1] f32, srcs[2] scale, srcs[3] old; word `sel` replaced -> I32 (value / scale, saturated).
+/// * `ScalePkFp4F32`: srcs[0], srcs[1] f32, srcs[2] scale, srcs[3] old; byte `sel` replaced by the two fp4 values -> I32.
+/// * `PkU8F32`: srcs[0] f32, srcs[1] old; byte `sel` replaced by the value rounded and clamped to u8 -> I32.
+/// * `PkI16I32` / `PkU16U32`: srcs[0], srcs[1] -> two saturated 16-bit values -> U32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CvtOp {
+    PkF32Fp8, PkF32Bf8, F32Fp8, F32Bf8, PkBf8F32,
+    ScalePkBf16Fp8, ScalePkF16Fp8, ScalePkBf16Bf8, ScalePkF16Bf8, ScalePkF32Fp8, ScalePkF32Bf8,
+    ScalePkF32Fp4, ScalePkBf16Fp4, ScalePkF16Fp4,
+    ScalePkFp8F32, ScalePkBf8F32, ScalePkFp4F32,
+    PkU8F32, PkI16I32, PkU16U32,
+}
+
+impl CvtOp {
+    /// (number of operands used, result type, largest `sel`)
+    pub fn sig(self) -> (usize, DType, u8) {
+        use CvtOp::*;
+        match self {
+            PkF32Fp8 | PkF32Bf8 => (1, DType::Frag2, 1),
+            F32Fp8 | F32Bf8 => (1, DType::F32, 3),
+            PkBf8F32 => (3, DType::I32, 1),
+            ScalePkBf16Fp8 | ScalePkF16Fp8 | ScalePkBf16Bf8 | ScalePkF16Bf8 => (2, DType::U32, 1),
+            ScalePkF32Fp8 | ScalePkF32Bf8 => (2, DType::Frag2, 1),
+            ScalePkF32Fp4 => (2, DType::Frag2, 3),
+            ScalePkBf16Fp4 | ScalePkF16Fp4 => (2, DType::U32, 3),
+            ScalePkFp8F32 | ScalePkBf8F32 => (4, DType::I32, 1),
+            ScalePkFp4F32 => (4, DType::I32, 3),
+            PkU8F32 => (2, DType::I32, 3),
+            PkI16I32 | PkU16U32 => (2, DType::U32, 0),
+        }
+    }
+}
+
 impl MemTy {
     pub fn bytes(self) -> u32 {
         match self {
@@ -473,11 +531,11 @@ pub enum Op {
     /// comparison -> I1
     Cmp { pred: CmpPred, ty: CmpTy, a: Opnd, b: Opnd },
     /// global load of any width (`MemTy`); result type `ty.value_ty()`
-    LoadGlobalN { base: Opnd, byte_off: u32, ty: MemTy },
+    LoadGlobalN { base: Opnd, byte_off: u32, ty: MemTy, cache: CachePolicy },
     /// `global_load_*_d16[_hi]`: the loaded 8 / 16 bits in one half of a dword, the other half zero
-    LoadGlobalD16 { base: Opnd, byte_off: u32, ty: D16Ty, hi: bool },
+    LoadGlobalD16 { base: Opnd, byte_off: u32, ty: D16Ty, hi: bool, cache: CachePolicy },
     /// MUBUF load of any width
-    BufferLoadN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, ty: MemTy },
+    BufferLoadN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, ty: MemTy, cache: CachePolicy },
     /// LDS load of any width
     LoadLdsN { addr: Opnd, ty: MemTy },
     /// `ds_read_*_d16[_hi]`
@@ -486,6 +544,8 @@ pub enum Op {
     LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
     LoadLdsTrB16 { addr: Opnd },
+    /// conversion (`CvtOp`; operands and `sel` per op)
+    Cvt { op: CvtOp, srcs: [Opnd; 4], sel: u8 },
     /// D = A x B + C (`c: None`: zero accumulator) of the MFMA `kind`; result `kind.acc_ty()`
     Mfma { kind: MmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<MmaScale> },
 }
@@ -502,6 +562,7 @@ impl Op {
             Op::LoadLds2 { b64, .. } => if *b64 { DType::Frag4 } else { DType::Frag2 },
             Op::LoadLdsTrB16 { .. } => DType::Frag2,
             Op::Mfma { kind, .. } => kind.acc_ty(),
+            Op::Cvt { op, .. } => op.sig().1,
             Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::AddI32(..) | Op::MulI32(..) => DType::I32,
             Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::MinI32(..) | Op::XorI32(..) | Op::LoadU16 { .. } => DType::I32,
             Op::ConstF32(_) | Op::KernargF32 { .. } => DType::F32,
@@ -589,6 +650,7 @@ impl Op {
                 v
             }
             Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } | Op::LoadLdsD16 { addr, .. } => vec![*addr],
+            Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
             Op::Mfma { a, b, c, scale, .. } => {
                 let mut v = vec![*a, *b];
                 v.extend(c.iter().copied());
@@ -908,9 +970,9 @@ pub enum Stmt {
     /// Closes the innermost stage.
     StageEnd,
     /// global store of any width (`U8` / `U16` store the low bits; `hi` with `U8` / `U16`: the `_d16_hi` forms store bits 16..)
-    StoreGlobalN { base: Opnd, byte_off: u32, value: Opnd, ty: MemTy, hi: bool },
+    StoreGlobalN { base: Opnd, byte_off: u32, value: Opnd, ty: MemTy, hi: bool, cache: CachePolicy },
     /// MUBUF store of any width (same `hi` rule)
-    BufferStoreN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd, ty: MemTy, hi: bool },
+    BufferStoreN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd, ty: MemTy, hi: bool, cache: CachePolicy },
     /// LDS store of any width (same `hi` rule)
     StoreLdsN { addr: Opnd, value: Opnd, ty: MemTy, hi: bool },
     /// `ds_write2[st64]_b32 / _b64`: `v0` at `addr + off0 * s`, `v1` at `addr + off1 * s`
@@ -1804,20 +1866,37 @@ impl FnBuilder {
 
     // ---- P1 A3 memory ----
     pub fn load_global(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: MemTy) -> ValueId {
-        self.let_(Op::LoadGlobalN { base: base.into(), byte_off, ty })
+        self.load_global_c(base, byte_off, ty, CachePolicy::NONE)
+    }
+    /// `load_global` with a cache policy (`sc0` / `sc1` / `nt`).
+    pub fn load_global_c(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: MemTy, cache: CachePolicy) -> ValueId {
+        self.let_(Op::LoadGlobalN { base: base.into(), byte_off, ty, cache })
     }
     pub fn load_global_d16(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: D16Ty, hi: bool) -> ValueId {
-        self.let_(Op::LoadGlobalD16 { base: base.into(), byte_off, ty, hi })
+        self.let_(Op::LoadGlobalD16 { base: base.into(), byte_off, ty, hi, cache: CachePolicy::NONE })
     }
     pub fn store_global(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
-        self.push_stmt(Stmt::StoreGlobalN { base: base.into(), byte_off, value: value.into(), ty, hi });
+        self.store_global_c(base, byte_off, value, ty, hi, CachePolicy::NONE)
+    }
+    /// `store_global` with a cache policy.
+    pub fn store_global_c(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool, cache: CachePolicy) {
+        self.push_stmt(Stmt::StoreGlobalN { base: base.into(), byte_off, value: value.into(), ty, hi, cache });
     }
     pub fn buffer_load_n(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, ty: MemTy) -> ValueId {
-        self.let_(Op::BufferLoadN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, ty })
+        self.buffer_load_c(rsrc, voff, soff, imm, ty, CachePolicy::NONE)
+    }
+    /// `buffer_load_n` with a cache policy.
+    pub fn buffer_load_c(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, ty: MemTy, cache: CachePolicy) -> ValueId {
+        self.let_(Op::BufferLoadN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, ty, cache })
     }
     #[allow(clippy::too_many_arguments)]
     pub fn buffer_store_n(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
-        self.push_stmt(Stmt::BufferStoreN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into(), ty, hi });
+        self.buffer_store_c(rsrc, voff, soff, imm, value, ty, hi, CachePolicy::NONE)
+    }
+    /// `buffer_store_n` with a cache policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn buffer_store_c(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool, cache: CachePolicy) {
+        self.push_stmt(Stmt::BufferStoreN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into(), ty, hi, cache });
     }
     pub fn load_lds(&mut self, addr: impl Into<Opnd>, ty: MemTy) -> ValueId {
         self.let_(Op::LoadLdsN { addr: addr.into(), ty })
@@ -1837,6 +1916,14 @@ impl FnBuilder {
     }
     pub fn load_lds_tr_b16(&mut self, addr: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsTrB16 { addr: addr.into() })
+    }
+
+    /// A conversion (`CvtOp`); pass the used operands in order.
+    pub fn cvt(&mut self, op: CvtOp, srcs: &[Opnd], sel: u8) -> ValueId {
+        let mut s = [Opnd::I32(0); 4];
+        assert_eq!(srcs.len(), op.sig().0, "cvt {op:?}: operand count");
+        s[..srcs.len()].copy_from_slice(srcs);
+        self.let_(Op::Cvt { op, srcs: s, sel })
     }
 
     // ---- P1-d MFMA ----
@@ -2547,7 +2634,7 @@ fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
         }
     };
     match st {
-        Stmt::StoreGlobalN { base, byte_off, value, ty, hi } => {
+        Stmt::StoreGlobalN { base, byte_off, value, ty, hi, .. } => {
             if !matches!(opnd_ty(f, *base), Ok(DType::Ptr)) {
                 e.push("global store: base must be a pointer".into());
             }
@@ -2556,7 +2643,7 @@ fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
             }
             data(&mut e, *value, *ty, *hi);
         }
-        Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi } => {
+        Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi, .. } => {
             e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1));
             data(&mut e, *value, *ty, *hi);
         }
@@ -2620,6 +2707,17 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
         }
         Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
         Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
+        Op::Cvt { op, srcs, sel } => {
+            let (n, _, max_sel) = op.sig();
+            if *sel > max_sel {
+                e.push(format!("cvt {op:?}: select {sel} out of range (0..={max_sel})"));
+            }
+            for s in &srcs[..n] {
+                if let Err(x) = expect_dword(f, *s, "cvt operand") {
+                    e.push(x);
+                }
+            }
+        }
         Op::LoadLdsN { addr, .. } | Op::LoadLdsD16 { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } => {
             if let Err(x) = expect_int(f, *addr, "lds load address") {
                 e.push(x);

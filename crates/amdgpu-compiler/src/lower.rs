@@ -1957,17 +1957,17 @@ impl Lowerer {
                         self.push(MInst::new(mop).def(v).srcreg(ra).srcreg(rb).srcreg(v));
                     }
                 }
-                Stmt::StoreGlobalN { base, byte_off, value, ty, hi } => {
+                Stmt::StoreGlobalN { base, byte_off, value, ty, hi, cache } => {
                     let b = self.as_v2(*base)?;
                     let (v, mop) = self.store_value(*value, *ty, *hi, global_store_mop)?;
                     self.touch(&[Src::Reg(v)]);
-                    self.push(MInst::new(mop).srcreg(b).srcreg(v).imm(*byte_off as i64));
+                    self.push(MInst::new(mop).srcreg(b).srcreg(v).imm(*byte_off as i64).cpol(cache.bits()));
                 }
-                Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi } => {
+                Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi, cache } => {
                     let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
                     let (v, mop) = self.store_value(*value, *ty, *hi, buffer_store_mop)?;
                     self.touch(&[Src::Reg(v)]);
-                    self.push(MInst::new(mop).srcreg(v).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
+                    self.push(MInst::new(mop).srcreg(v).srcreg(rr).src(vs).src(ss).imm(*imm as i64).cpol(cache.bits()));
                 }
                 Stmt::StoreLdsN { addr, value, ty, hi } => {
                     let (a, off) = self.lds_addr(*addr)?;
@@ -2280,28 +2280,55 @@ impl Lowerer {
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
-            Op::LoadGlobalN { base, byte_off, ty } => {
+            Op::Cvt { op, srcs, sel } => {
+                let (n, ty, _) = op.sig();
+                let (mop, partial) = cvt_mop(*op);
+                let mut rs = Vec::with_capacity(n);
+                for s in &srcs[..n] {
+                    rs.push(self.as_v1(*s)?);
+                }
+                let touched: Vec<Src> = rs.iter().map(|r| Src::Reg(*r)).collect();
+                self.touch(&touched);
+                let d = self.new_vreg(if ty == DType::Frag2 { RClass::V2 } else { RClass::V1 });
+                let mut inst = MInst::new(mop).def(d).imm(*sel as i64);
+                if partial {
+                    // the instruction keeps the destination's other bits: start from the old value, tie it as the last source
+                    let old = rs.pop().expect("partial-write conversion has an old operand");
+                    self.copy_reg(d, old)?;
+                    for r in rs {
+                        inst = inst.srcreg(r);
+                    }
+                    inst = inst.srcreg(d);
+                } else {
+                    for r in rs {
+                        inst = inst.srcreg(r);
+                    }
+                }
+                self.push(inst);
+                self.val.insert(dst, d);
+            }
+            Op::LoadGlobalN { base, byte_off, ty, cache } => {
                 let (cls, mop) = global_load_mop(*ty);
                 let d = self.new_vreg(cls);
                 let rb = self.as_v2(*base)?;
-                self.push(MInst::new(mop).def(d).srcreg(rb).imm(*byte_off as i64));
+                self.push(MInst::new(mop).def(d).srcreg(rb).imm(*byte_off as i64).cpol(cache.bits()));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
-            Op::LoadGlobalD16 { base, byte_off, ty, hi } => {
+            Op::LoadGlobalD16 { base, byte_off, ty, hi, cache } => {
                 // the d16 forms are partial writes in the ISA; gfx950 zeroes the other half anyway: start from 0 so both readings agree
                 let rb = self.as_v2(*base)?;
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VMovB32).def(d).src(Src::Imm(0)));
-                self.push(MInst::new(global_d16_mop(*ty, *hi)).def(d).srcreg(rb).srcreg(d).imm(*byte_off as i64));
+                self.push(MInst::new(global_d16_mop(*ty, *hi)).def(d).srcreg(rb).srcreg(d).imm(*byte_off as i64).cpol(cache.bits()));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
-            Op::BufferLoadN { rsrc, voff, soff, imm, ty } => {
+            Op::BufferLoadN { rsrc, voff, soff, imm, ty, cache } => {
                 let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
                 let (cls, mop) = buffer_load_mop(*ty);
                 let d = self.new_vreg(cls);
-                self.push(MInst::new(mop).def(d).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
+                self.push(MInst::new(mop).def(d).srcreg(rr).src(vs).src(ss).imm(*imm as i64).cpol(cache.bits()));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
@@ -4237,5 +4264,32 @@ fn scaled_mfma_mop(k: amdgpu_dsl::MmaKind, opsel: u8) -> Result<(MOp, MOp, i64),
         (S::M32N32K64, 8, 6) => m(MOp::VMfmaScale32x32x64A8B6, MOp::VMfmaScale32x32x64A8B6Z),
         (S::M32N32K64, 8, 8) => m(MOp::VMfmaScale32x32x64A8B8, MOp::VMfmaScale32x32x64A8B8Z),
         _ => Err(format!("mfma {k:?}: not a scaled f8f6f4 shape")),
+    }
+}
+
+/// (MOp, partial write with the old value as the last operand) of a conversion.
+fn cvt_mop(o: amdgpu_dsl::CvtOp) -> (MOp, bool) {
+    use amdgpu_dsl::CvtOp as C;
+    match o {
+        C::PkF32Fp8 => (MOp::VCvtPkF32Fp8, false),
+        C::PkF32Bf8 => (MOp::VCvtPkF32Bf8, false),
+        C::F32Fp8 => (MOp::VCvtF32Fp8, false),
+        C::F32Bf8 => (MOp::VCvtF32Bf8, false),
+        C::PkBf8F32 => (MOp::VCvtPkBf8F32, true),
+        C::ScalePkBf16Fp8 => (MOp::VCvtScalePkBf16Fp8, false),
+        C::ScalePkF16Fp8 => (MOp::VCvtScalePkF16Fp8, false),
+        C::ScalePkBf16Bf8 => (MOp::VCvtScalePkBf16Bf8, false),
+        C::ScalePkF16Bf8 => (MOp::VCvtScalePkF16Bf8, false),
+        C::ScalePkF32Fp8 => (MOp::VCvtScalePkF32Fp8, false),
+        C::ScalePkF32Bf8 => (MOp::VCvtScalePkF32Bf8, false),
+        C::ScalePkF32Fp4 => (MOp::VCvtScalePkF32Fp4, false),
+        C::ScalePkBf16Fp4 => (MOp::VCvtScalePkBf16Fp4, false),
+        C::ScalePkF16Fp4 => (MOp::VCvtScalePkF16Fp4, false),
+        C::ScalePkFp8F32 => (MOp::VCvtScalePkFp8F32, true),
+        C::ScalePkBf8F32 => (MOp::VCvtScalePkBf8F32, true),
+        C::ScalePkFp4F32 => (MOp::VCvtScalePkFp4F32, true),
+        C::PkU8F32 => (MOp::VCvtPkU8F32, false),
+        C::PkI16I32 => (MOp::VCvtPkI16I32, false),
+        C::PkU16U32 => (MOp::VCvtPkU16U32, false),
     }
 }

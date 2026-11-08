@@ -16,7 +16,7 @@ SRCS = {
 OUT = os.path.join(ROOT, "crates/amdgpu-dsl/src/ir_codec.rs")
 # the IR types (data reachable from Function); FnBuilder / expr types are not data of a Function
 TYPES = ["VarId", "DType", "Opnd", "Op", "Ext", "ArgExtent", "TileDecl", "BufRegion", "LastArriver", "Contract", "StageVal", "StageScalar", "StageOutstanding", "StageResources", "StageContract",
-         "Stmt", "Arg", "AgprTarget", "AgprMark", "RegRef", "RegMark", "RegionKind", "RegionDecl", "CompileProfile", "UnOp", "BinOp", "TriOp", "CmpPred", "CmpTy", "MemTy", "D16Ty", "MmaShape", "MmaTy", "MmaKind", "MmaScale"]
+         "Stmt", "Arg", "AgprTarget", "AgprMark", "RegRef", "RegMark", "RegionKind", "RegionDecl", "CompileProfile", "UnOp", "BinOp", "TriOp", "CmpPred", "CmpTy", "MemTy", "D16Ty", "MmaShape", "MmaTy", "MmaKind", "MmaScale", "CachePolicy", "CvtOp"]
 
 
 def strip_comments(s):

@@ -416,3 +416,108 @@ pub fn probe_f8f6f4_p1() -> Function {
     }
     b.finish()
 }
+
+/// `probe_cpol_p1(in, out)`: cache-policy modifiers on global / buffer loads and stores (sc0, sc1, nt): out = in through four
+/// differently-flagged copy paths, lane l copying 16 bytes per path.
+pub fn probe_cpol_p1() -> Function {
+    use amdgpu_dsl::{CachePolicy as C, MemTy};
+    let mut b = FnBuilder::new("probe_cpol_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(4096));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(4096));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(16)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off16) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off16) });
+    let all = C { sc0: true, sc1: true, nt: true };
+    let sc0 = C { sc0: true, ..C::NONE };
+    let sc1 = C { sc1: true, ..C::NONE };
+    // path 0: global nt load -> global sc0 sc1 nt store
+    let v = b.load_global_c(pin, 0, MemTy::B128, C::NT);
+    b.store_global_c(pout, 0, v, MemTy::B128, false, all);
+    // path 1: global sc1 dword loads -> global sc0 stores (bytes 1024..)
+    for k in 0..4u32 {
+        let x = b.load_global_c(pin, 1024 + 4 * k, MemTy::B32, sc1);
+        b.store_global_c(pout, 1024 + 4 * k, x, MemTy::B32, false, sc0);
+    }
+    // paths 2, 3: buffer loads / stores with policies (bytes 2048.., 3072..)
+    let rin = b.buffer_desc(inp, 4096);
+    let rout = b.buffer_desc(out, 4096);
+    let v = b.buffer_load_c(rin, Some(Opnd::Val(off16)), 0, 2048, MemTy::B128, sc0);
+    b.buffer_store_c(rout, Some(Opnd::Val(off16)), 0, 2048, v, MemTy::B128, false, C::NT);
+    let v = b.buffer_load_c(rin, Some(Opnd::Val(off16)), 0, 3072, MemTy::B96, all);
+    b.buffer_store_c(rout, Some(Opnd::Val(off16)), 0, 3072, v, MemTy::B96, false, sc1);
+    let w = b.buffer_load_c(rin, Some(Opnd::Val(off16)), 0, 3084, MemTy::B32, C::NT);
+    b.buffer_store_c(rout, Some(Opnd::Val(off16)), 0, 3084, w, MemTy::B32, false, all);
+    b.finish()
+}
+
+/// Conversions of `probe_cvt_p1`: (op, input planes of the used operands, sel). Input planes (64 lanes each): 0 fp8 / bf8 bytes, 1 fp4 nibbles,
+/// 2 f32 a, 3 f32 b, 4 f32 c (u8 range), 5 i32 i, 6 i32 j, 7 scale (2.0), 8 old (0x5A5A5A5A).
+pub fn cvt_p1_cases() -> Vec<(amdgpu_dsl::CvtOp, Vec<usize>, u8)> {
+    use amdgpu_dsl::CvtOp as C;
+    vec![
+        (C::PkF32Fp8, vec![0], 0),
+        (C::PkF32Fp8, vec![0], 1),
+        (C::PkF32Bf8, vec![0], 1),
+        (C::F32Fp8, vec![0], 2),
+        (C::F32Bf8, vec![0], 3),
+        (C::PkBf8F32, vec![2, 3, 8], 0),
+        (C::PkBf8F32, vec![2, 3, 8], 1),
+        (C::ScalePkBf16Fp8, vec![0, 7], 1),
+        (C::ScalePkF16Fp8, vec![0, 7], 0),
+        (C::ScalePkBf16Bf8, vec![0, 7], 1),
+        (C::ScalePkF16Bf8, vec![0, 7], 0),
+        (C::ScalePkF32Fp8, vec![0, 7], 1),
+        (C::ScalePkF32Bf8, vec![0, 7], 0),
+        (C::ScalePkF32Fp4, vec![1, 7], 2),
+        (C::ScalePkBf16Fp4, vec![1, 7], 3),
+        (C::ScalePkF16Fp4, vec![1, 7], 1),
+        (C::ScalePkFp8F32, vec![2, 3, 7, 8], 1),
+        (C::ScalePkBf8F32, vec![2, 3, 7, 8], 0),
+        (C::ScalePkFp4F32, vec![2, 3, 7, 8], 2),
+        (C::PkU8F32, vec![4, 8], 2),
+        (C::PkI16I32, vec![5, 6], 0),
+        (C::PkU16U32, vec![5, 6], 0),
+    ]
+}
+
+/// `probe_cvt_p1(in, out)`: every case of `cvt_p1_cases` per lane; results (1 or 2 dwords) go to consecutive 64-lane output planes.
+pub fn probe_cvt_p1() -> Function {
+    let cases = cvt_p1_cases();
+    let planes: u32 = cases.iter().map(|(op, _, _)| if op.sig().1 == DType::Frag2 { 2 } else { 1 }).sum();
+    let mut b = FnBuilder::new("probe_cvt_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(9 * 256));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const((planes * 256) as i64));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    let ins: Vec<ValueId> = (0..9u32).map(|k| b.load_global(pin, 256 * k, amdgpu_dsl::MemTy::B32)).collect();
+    let mut k = 0u32;
+    let mut put = |b: &mut FnBuilder, v: ValueId| {
+        let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((256 * (k / 8 * 8)) as i32) });
+        b.store_global(base, 256 * (k % 8), v, amdgpu_dsl::MemTy::B32, false);
+        k += 1;
+    };
+    for (op, srcs, sel) in cases {
+        let ops: Vec<Opnd> = srcs.iter().map(|p| Opnd::Val(ins[*p])).collect();
+        let r = b.cvt(op, &ops, sel);
+        if op.sig().1 == DType::Frag2 {
+            for i in 0..2 {
+                let x = b.let_(Op::Frag2Lane { frag: Opnd::Val(r), index: i });
+                put(&mut b, x);
+            }
+        } else {
+            put(&mut b, r);
+        }
+    }
+    b.finish()
+}
