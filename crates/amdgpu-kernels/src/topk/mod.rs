@@ -140,7 +140,7 @@ pub fn topk_softmax(name: &str, e: i64, k: i64, renorm: bool) -> Function {
     let lv = b.bind_i32(lane.lane());
     let l0 = b.let_(Op::CmpLtI32(Opnd::Val(lv), Opnd::I32(1)));
     let wbase = b.bind_i32(ev(row) * (4 * k) as i32);
-    let ok = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(l0), a: Opnd::Val(wbase), b: Opnd::I32(-16) });
+    let ok = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(l0), a: Opnd::Val(wbase), b: Opnd::I32(0x7fff_ff00) }); // past every descriptor even with the immediate added (-16 + imm would land inside the buffer)
     for r in 0..k as usize {
         let w = if let Some(s) = scale { b.mul_f32(ws[r], s) } else { ws[r] };
         b.buffer_store_f32(r_w, ok, 0i32, 4 * r as u32, w);
