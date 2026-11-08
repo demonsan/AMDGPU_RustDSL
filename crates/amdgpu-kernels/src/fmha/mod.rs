@@ -152,9 +152,11 @@ impl KvRing3 {
     }
     /// The copies of the tile at `key0` into `slot` that `role` produces (as `KvRing::stage`).
     pub fn stage(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<ValueId> {
+        // the slot offsets bound before this stage are its scalar inputs (taken before the units are captured: capturing binds new ones)
+        let bound = slot.offset_scalars();
         if let Some(u) = self.stage_units(b, role, key0, slot) {
             // the slot offsets are shared with every reader of the slot instance (SlotIdx cache): declared scalar hand-overs
-            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], scalars_in: slot.offset_scalars(), ..Default::default() };
+            let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], scalars_in: bound, ..Default::default() };
             let sl = slot.clone();
             amdgpu_tile::stage::StageInst::new("move.kv_stage", amdgpu_tile::stage::Prim::M, "kv.stage", c, u)
                 .param("role", format!("{role:?}"))
@@ -494,6 +496,7 @@ impl PipeBody for AttnBody3<'_> {
             (Opnd::Val(self.sm.decide_deferred(b, &s, &o, mask.as_ref())), false)
         };
         // the window: conversion chunk i, then QK block i of the next tile (captured units, woven in this order)
+        let bound = if t.staged { t.next.offset_scalars() } else { Vec::new() };
         let mut u = Units::new();
         let parts = t.staged.then(|| u.capture(b, "window.qk.setup", |b| (r.kpart.at(b, &r.ks.at(&t.next)), r.kdpart.at(b, &r.kd.at(&t.next)))).1);
         let mut w: Vec<ValueId> = Vec::with_capacity(16);
@@ -504,10 +507,7 @@ impl PipeBody for AttnBody3<'_> {
             }
         }
         // the window = stage `online.softmax` (conversion chunks of tile t) woven with stage `mma.qk` (blocks of tile t + 1), alternating
-        let mut c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], ..Default::default() };
-        if t.staged {
-            c.scalars_in = t.next.offset_scalars();
-        }
+        let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], scalars_in: bound, ..Default::default() };
         let (nx, staged) = (t.next.clone(), t.staged);
         amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "window", c, u)
             .param("with", "mma.qk blocks")
