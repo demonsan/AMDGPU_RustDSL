@@ -312,6 +312,7 @@ pub fn topk_per_row(name: &str, k: i64, prefill: bool) -> Function {
                 let ae = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq_c), a: Opnd::Val(ceq), b: Opnd::Val(sink_e) });
                 let sg = b.atomic_lds(AtomicOp::AddU32, ag, 1i32, true).unwrap();
                 let se = b.atomic_lds(AtomicOp::AddU32, ae, 1i32, true).unwrap();
+                let (sg, se) = (b.bitcast_i32(sg), b.bitcast_i32(se));
                 let eq_take = b.cmp(CmpPred::Lt, CmpTy::I32, se, rem);
                 let eq_take_i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq_take), a: Opnd::I32(1), b: Opnd::I32(0) });
                 let eq_w = b.bind_i32(ev(eq_ok) & ev(eq_take_i));
