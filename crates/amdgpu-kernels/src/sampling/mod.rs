@@ -15,15 +15,17 @@ const T: i32 = 1024;
 const NEG: f32 = -3.0e38;
 
 pub fn by_name(name: &str) -> Option<Function> {
-    let (rest, sample) = if let Some(r) = name.strip_prefix("sample_bf16_v") {
-        (r, true)
+    let (rest, sample, filtered) = if let Some(r) = name.strip_prefix("sample_topkp_bf16_v") {
+        (r, true, true)
+    } else if let Some(r) = name.strip_prefix("sample_bf16_v") {
+        (r, true, false)
     } else if let Some(r) = name.strip_prefix("argmax_bf16_v") {
-        (r, false)
+        (r, false, false)
     } else {
         return None;
     };
     let v: i64 = rest.parse().ok()?;
-    (v % 8 == 0 && (8..=131072).contains(&v)).then(|| sampling(name, v, sample))
+    (v % 8 == 0 && (8..=131072).contains(&v)).then(|| sampling(name, v, sample, filtered))
 }
 
 fn sel_f32(b: &mut FnBuilder, cond: ValueId, x: ValueId, y: ValueId) -> ValueId {
@@ -82,7 +84,7 @@ fn block_reduce(b: &mut FnBuilder, op: RedOp, x: ValueId, wave: ValueId, lane: V
     lane_reduce(b, op, &vals2)
 }
 
-pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
+pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
     let nchunk = v / 8;
     let c = ((((nchunk + (T as i64) - 1) / T as i64) as i32 + 3) / 4) * 4;   // chunks per thread (a multiple of 4: the passes take 4 chunks per iteration)
     let mut fb = FnBuilder::new(name, T as u32);
@@ -93,7 +95,13 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
         b.arg("u", DType::Ptr, 8, 8);
         b.arg("out", DType::Ptr, 16, 8);
         b.arg("inv_t", DType::F32, 24, 4);
-        (16, 28)
+        if filtered {
+            b.arg("top_p", DType::F32, 28, 4);
+            b.arg("top_k", DType::I32, 32, 4);
+            (16, 36)
+        } else {
+            (16, 28)
+        }
     } else {
         b.arg("out", DType::Ptr, 8, 8);
         (8, 16)
@@ -109,8 +117,8 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
     }
     b.arg_tensor("out", bb * Ext::c(4));
     // LDS: wave exchange 1024 B, 4 reduction slots (256 B), scan ping-pong 2 x 4096 B
-    let (ws, blk, sc0, sc1) = (0i32, 1024i32, 1280i32, 5376i32);
-    b.lds(9472);
+    let (ws, blk, sc0, sc1) = (0i32, 1024i32, 1536i32, 5632i32);
+    b.lds(9728);
     let p_l = b.let_(Op::KernargPtr { offset: 0 });
     let p_out = b.let_(Op::KernargPtr { offset: out_off });
     let p_u = if sample { Some(b.let_(Op::KernargPtr { offset: 8 })) } else { None };
@@ -187,6 +195,120 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
         argmax
     } else {
         let l2e = b.c_f32(std::f32::consts::LOG2_E);
+        // ---- top-k / top-p: the threshold in logit space (keep x >= thr), by bisection (no sort); each probe is one pass over the row + two block reductions
+        let thr: Option<ValueId> = if filtered {
+            let top_p = b.let_(Op::KernargF32 { offset: 28 });
+            let top_k = b.let_(Op::KernargI32 { offset: 32 });
+            let kf = b.un(amdgpu_dsl::UnOp::CvtF32I32, top_k);
+            const ITERS: i32 = 26;
+            let k_on = b.let_(Op::CmpLtI32(Opnd::I32(0), Opnd::Val(top_k)));
+            let iters_k = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(k_on), a: Opnd::I32(ITERS), b: Opnd::I32(0) });
+            let one_c = b.c_f32(1.0);
+            let p_on = b.cmp(CmpPred::Lt, CmpTy::F32, top_p, one_c);
+            let iters_p = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(p_on), a: Opnd::I32(ITERS), b: Opnd::I32(0) });
+            // (count, sum of exp(x - m)) over the elements with x >= thr, block-wide; rounds 3 / 4 (a barrier at the end of every probe lets the slots be reused)
+            let stats = |b: &mut FnBuilder, thr: ValueId| -> (ValueId, ValueId) {
+                let r = b.loop_(&[(DType::F32, Opnd::F32(0.0)), (DType::F32, Opnd::F32(0.0)), (DType::I32, Opnd::I32(0))], |b, v3| {
+                    let (vc, vs, vit) = (v3[0], v3[1], v3[2]);
+                    let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::I32(c4)));
+                    b.break_if(done);
+                    let mut cn = b.let_(Op::AddF32(Opnd::Var(vc), Opnd::F32(0.0)));
+                    let mut sm = b.let_(Op::AddF32(Opnd::Var(vs), Opnd::F32(0.0)));
+                    let mut loaded = Vec::new();
+                    for u in 0..4i32 {
+                        let ci = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
+                        let ci = b.bind_i32(ev(ci) * 4 + u);
+                        let (ch, ok) = chunk_of(b, ci, true);
+                        let off = b.bind_i32(ev(rowb) + (ev(ch) << 4));
+                        let frag = b.buffer_load_c(r_l, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+                        loaded.push((ok, frag));
+                    }
+                    let one = b.c_f32(1.0);
+                    for (ok, frag) in loaded {
+                        let mut x = bf16x8_to_f32(b, frag);
+                        for k in 0..8usize {
+                            if let Some(it) = inv_t {
+                                x[k] = b.mul_f32(x[k], it);
+                            }
+                            let keep = b.cmp(CmpPred::Ge, CmpTy::F32, x[k], thr);
+                            let t = b.sub_f32(x[k], m);
+                            let u = b.mul_f32(t, l2e);
+                            let pe = b.exp2_f32(u);
+                            let p1 = sel_f32(b, keep, pe, zero);
+                            let pm = sel_f32(b, ok, p1, zero);
+                            let c1 = sel_f32(b, keep, one, zero);
+                            let cm = sel_f32(b, ok, c1, zero);
+                            sm = b.add_f32(sm, pm);
+                            cn = b.add_f32(cn, cm);
+                        }
+                    }
+                    b.set_var(vc, cn);
+                    b.set_var(vs, sm);
+                    let nx = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(1)));
+                    b.set_var(vit, nx);
+                    (vc, vs)
+                });
+                let c = b.let_(Op::AddF32(Opnd::Var(r.0), Opnd::F32(0.0)));
+                let sm = b.let_(Op::AddF32(Opnd::Var(r.1), Opnd::F32(0.0)));
+                let cc = block_reduce(b, RedOp::Sum, c, wave, lane, 0, ws, blk, 3);
+                let ss = block_reduce(b, RedOp::Sum, sm, wave, lane, 0, ws, blk, 4);
+                b.barrier();
+                (cc, ss)
+            };
+            let span = b.c_f32(80.0);
+            let m_lo = b.sub_f32(m, span);
+            let m_hi = b.add_f32(m, one_c);
+            // top-k: the largest thr with count(x >= thr) >= k
+            let bis_k = b.loop_(&[(DType::F32, Opnd::Val(m_lo)), (DType::F32, Opnd::Val(m_hi)), (DType::I32, Opnd::I32(0))], |b, v4| {
+                let (vlo, vhi, vi) = (v4[0], v4[1], v4[2]);
+                let done = b.let_(Op::CmpGeI32(Opnd::Var(vi), Opnd::Val(iters_k)));
+                b.break_if(done);
+                let lo = b.let_(Op::AddF32(Opnd::Var(vlo), Opnd::F32(0.0)));
+                let hi = b.let_(Op::AddF32(Opnd::Var(vhi), Opnd::F32(0.0)));
+                let sum_lh = b.add_f32(lo, hi);
+                let half = b.c_f32(0.5);
+                let mid = b.mul_f32(sum_lh, half);
+                let (c, _s) = stats(b, mid);
+                let ge = b.cmp(CmpPred::Ge, CmpTy::F32, c, kf);
+                let nlo = sel_f32(b, ge, mid, lo);
+                let nhi = sel_f32(b, ge, hi, mid);
+                b.set_var(vlo, nlo);
+                b.set_var(vhi, nhi);
+                let nx = b.let_(Op::AddI32(Opnd::Var(vi), Opnd::I32(1)));
+                b.set_var(vi, nx);
+                vlo
+            });
+            let thr_k0 = b.let_(Op::AddF32(Opnd::Var(bis_k), Opnd::F32(0.0)));
+            let neg_inf = b.c_f32(NEG);
+            let thr_k = sel_f32(b, k_on, thr_k0, neg_inf);
+            // top-p over what top-k kept: the largest thr with sum(exp | x >= max(thr, thr_k)) >= p * Sk
+            let (_ck, sk) = stats(b, thr_k);
+            let target_p = b.mul_f32(top_p, sk);
+            let bis_p = b.loop_(&[(DType::F32, Opnd::Val(m_lo)), (DType::F32, Opnd::Val(m_hi)), (DType::I32, Opnd::I32(0))], |b, v4| {
+                let (vlo, vhi, vi) = (v4[0], v4[1], v4[2]);
+                let done = b.let_(Op::CmpGeI32(Opnd::Var(vi), Opnd::Val(iters_p)));
+                b.break_if(done);
+                let lo = b.let_(Op::AddF32(Opnd::Var(vlo), Opnd::F32(0.0)));
+                let hi = b.let_(Op::AddF32(Opnd::Var(vhi), Opnd::F32(0.0)));
+                let sum_lh = b.add_f32(lo, hi);
+                let half = b.c_f32(0.5);
+                let mid = b.mul_f32(sum_lh, half);
+                let eff = b.max_f32(mid, thr_k);
+                let (_c, sm) = stats(b, eff);
+                let ge = b.cmp(CmpPred::Ge, CmpTy::F32, sm, target_p);
+                let nlo = sel_f32(b, ge, mid, lo);
+                let nhi = sel_f32(b, ge, hi, mid);
+                b.set_var(vlo, nlo);
+                b.set_var(vhi, nhi);
+                let nx = b.let_(Op::AddI32(Opnd::Var(vi), Opnd::I32(1)));
+                b.set_var(vi, nx);
+                vlo
+            });
+            let thr_p0 = b.let_(Op::AddF32(Opnd::Var(bis_p), Opnd::F32(0.0)));
+            Some(b.max_f32(thr_k, thr_p0))
+        } else {
+            None
+        };
         // ---- pass 2 (contiguous): the thread sum of exp(x - m)
         let st_v = b.loop_(&[(DType::F32, Opnd::F32(0.0)), (DType::I32, Opnd::I32(0))], |b, vars| {
             let (vs, vit) = (vars[0], vars[1]);
@@ -211,7 +333,11 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
                     let t = b.sub_f32(x[k], m);
                     let u = b.mul_f32(t, l2e);
                     let p = b.exp2_f32(u);
-                    let pm = sel_f32(b, ok, p, zero);
+                    let mut pm = sel_f32(b, ok, p, zero);
+                    if let Some(th) = thr {
+                        let keep = b.cmp(CmpPred::Ge, CmpTy::F32, x[k], th);
+                        pm = sel_f32(b, keep, pm, zero);
+                    }
                     acc = b.add_f32(acc, pm);
                 }
             }
@@ -293,12 +419,19 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
                     let t = b.sub_f32(x[k], m);
                     let u = b.mul_f32(t, l2e);
                     let p = b.exp2_f32(u);
-                    let pm = sel_f32(b, ok, p, zero);
+                    let mut pm = sel_f32(b, ok, p, zero);
+                    let mut keep_c = None;
+                    if let Some(th) = thr {
+                        let keep = b.cmp(CmpPred::Ge, CmpTy::F32, x[k], th);
+                        pm = sel_f32(b, keep, pm, zero);
+                        keep_c = Some(keep);
+                    }
                     acc = b.add_f32(acc, pm);
                     let ge = b.cmp(CmpPred::Ge, CmpTy::F32, acc, target);
                     let idx_i = b.bind_i32(ev(ch) * (-8) - k as i32);
                     let nf = b.un(amdgpu_dsl::UnOp::CvtF32I32, idx_i);
                     let c1 = sel_f32(b, ge, nf, big);
+                    let c1 = if let Some(kc) = keep_c { sel_f32(b, kc, c1, big) } else { c1 };
                     let cand_k = sel_f32(b, ok, c1, big);
                     found = b.max_f32(found, cand_k);
                 }
