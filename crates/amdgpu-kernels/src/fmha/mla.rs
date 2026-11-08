@@ -160,22 +160,25 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
         let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
         let rowb = b.bind_i32((ev(pg) * page + (ev(kl) & (page - 1))) * ROW);
         let mb = mbases[slot].clone();
-        let parts: Vec<(ValueId, ValueId)> = (0..18i32)
-            .map(|i| {
-                let c = b.bind_i32((i << 6) + lane.lane());
-                let key = b.bind_i32((ev(c) * 1821).lshr(17));
-                let pos = b.bind_i32(ev(c) - ev(key) * CHUNKS);
-                let src = b.bind_i32((ev(pos).lshr(3) << 3) + ((ev(pos) ^ ev(key)) & 7));
-                let addr = b.bind_i32(ev(key) << 2);
-                (b.bpermute(addr, rowb), src)
-            })
-            .collect();
         mes[slot].write(b, gen, |b| {
-            for (i, (rb, src)) in parts.into_iter().enumerate() {
-                let rb = b.bitcast_i32(rb);
-                let vo = b.bind_i32(ev(rb) + (ev(src) << 4));
-                let m0 = b.bind_i32(mb.clone() + ((i as i32) << 10));
-                b.buffer_load_lds_b128(r_kv, vo, c0, m0, 0);
+            // groups of 6 issues (row bases by ds_bpermute, then the DMAs): bounded register pressure
+            for g0 in (0..18i32).step_by(6) {
+                let parts: Vec<(ValueId, ValueId)> = (g0..g0 + 6)
+                    .map(|i| {
+                        let c = b.bind_i32((i << 6) + lane.lane());
+                        let key = b.bind_i32((ev(c) * 1821).lshr(17));
+                        let pos = b.bind_i32(ev(c) - ev(key) * CHUNKS);
+                        let src = b.bind_i32((ev(pos).lshr(3) << 3) + ((ev(pos) ^ ev(key)) & 7));
+                        let addr = b.bind_i32(ev(key) << 2);
+                        (b.bpermute(addr, rowb), src)
+                    })
+                    .collect();
+                for (k, (rb, src)) in parts.into_iter().enumerate() {
+                    let rb = b.bitcast_i32(rb);
+                    let vo = b.bind_i32(ev(rb) + (ev(src) << 4));
+                    let m0 = b.bind_i32(mb.clone() + ((g0 + k as i32) << 10));
+                    b.buffer_load_lds_b128(r_kv, vo, c0, m0, 0);
+                }
             }
         });
     };
