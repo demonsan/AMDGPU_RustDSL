@@ -630,3 +630,42 @@ pub fn probe_tr_b16_p1() -> Function {
     }
     b.finish()
 }
+
+/// `probe_tr_b16_mfma(in, out)`: the bf16 16x16x32 A operand built from `ds_read_b64_tr_b16` of a row-major LDS tile T[k][m] (32 x 16 bf16,
+/// bytes 0..1024 of `in`), B lane-major fragments from bytes 1024..2048 (lane l: column l % 16, k = 8 (l / 16) + 0..7); out = D (lane-major, 4 dwords).
+pub fn probe_tr_b16_mfma() -> Function {
+    use amdgpu_dsl::{MemTy, MmaKind, MmaShape, MmaTy};
+    let mut b = FnBuilder::new("probe_tr_b16_mfma", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(2048));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(1024));
+    b.lds(1024);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(16)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off16) });
+    let t = b.load_global(pin, 0, MemTy::B128);
+    b.store_lds_b128(off16, t);
+    let fb = b.load_global(pin, 1024, MemTy::B128);
+    b.wait_lds(0);
+    b.barrier();
+    // lane l = 16 G + s reads &T[8 G + 4 r + s / 4][4 (s % 4)]  (row = 16 elements = 32 bytes)
+    let s = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(15)));
+    let g = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(4)));
+    let q = b.let_(Op::LshrI32(Opnd::Val(s), Opnd::I32(2)));
+    let c = b.let_(Op::AndI32(Opnd::Val(s), Opnd::I32(3)));
+    let row = b.tri(amdgpu_dsl::TriOp::LshlAddU32, g, 3, q); // 8 G + q
+    let rb = b.let_(Op::MulI32(Opnd::Val(row), Opnd::I32(32)));
+    let addr = b.tri(amdgpu_dsl::TriOp::LshlAddU32, c, 3, rb); // + 8 c bytes
+    let r0 = b.load_lds_tr_b16(addr);
+    let a1 = b.add_i32(addr, 128); // + 4 rows
+    let r1 = b.load_lds_tr_b16(a1);
+    let parts: Vec<ValueId> = [(r0, 0u8), (r0, 1), (r1, 0), (r1, 1)].iter().map(|(v, i)| b.let_(Op::Frag2Lane { frag: Opnd::Val(*v), index: *i })).collect();
+    let fa = b.frag4(parts[0], parts[1], parts[2], parts[3]);
+    let d = b.mfma(MmaKind::new(MmaShape::M16N16K32, MmaTy::Bf16), fa, fb, None);
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off16) });
+    b.store_global(pout, 0, d, MemTy::B128, false);
+    b.finish()
+}
