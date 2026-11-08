@@ -128,7 +128,7 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
     b.arg_tensor("out", bb * Ext::c(4));
     // LDS: wave exchange 1024 B, 4 reduction slots (256 B), scan ping-pong 2 x 4096 B
     let (ws, blk, sc0, sc1) = (0i32, 1024i32, 1536i32, 5632i32);
-    b.lds(12864);
+    b.lds(12880);
     let p_l = b.let_(Op::KernargPtr { offset: 0 });
     let p_out = b.let_(Op::KernargPtr { offset: out_off });
     let p_u = if sample { Some(b.let_(Op::KernargPtr { offset: 8 })) } else { None };
@@ -386,14 +386,27 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                 b.bin(amdgpu_dsl::BinOp::MaxI32, t, kmin)
             };
             let k_on = b.let_(Op::CmpLtI32(Opnd::I32(0), Opnd::Val(top_k)));
-            // top-k (counts): the largest key whose count(key >= T) >= k; off: key 0 keeps everything
-            let k_tgt = b.bin(amdgpu_dsl::BinOp::MaxI32, top_k, 1i32);
-            let tk_sel = select(b, k_tgt, false, zero_i);
-            let thr_k = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(k_on), a: Opnd::Val(tk_sel), b: Opnd::I32(0) });
+            let (res_k, res_p) = (resl + 12, resl + 16);
+            let ak = b.c_i32(res_k);
+            let ap = b.c_i32(res_p);
+            b.store_lds(ak, zero_i, MemTy::B32, false);
+            b.wait_lds(0);
+            // top-k (counts): the largest key whose count(key >= T) >= k; off: key 0 keeps everything (a uniform `if`: nothing runs when the filter is off)
+            b.if_(k_on, |b| {
+                let k_tgt = b.bin(amdgpu_dsl::BinOp::MaxI32, top_k, 1i32);
+                let tk = select(b, k_tgt, false, zero_i);
+                b.store_lds(ak, tk, MemTy::B32, false);
+                b.wait_lds(0);
+            });
+            b.barrier();
+            let thr_k = b.load_lds(ak, MemTy::B32);
+            b.wait_lds(0);
+            b.store_lds(ap, thr_k, MemTy::B32, false);
+            b.wait_lds(0);
             // top-p (mass): over what top-k kept
-            let one_c = b.c_f32(1.0);
-            let _ = one_c;
-            let sk = {
+            let one_c2 = b.c_f32(1.0);
+            let p_on = b.cmp(CmpPred::Lt, CmpTy::F32, top_p, one_c2);
+            b.if_(p_on, |b| {
                 let r = b.loop_(&[(DType::F32, Opnd::F32(0.0)), (DType::I32, Opnd::I32(0))], |b, v3| {
                     let (vs, vit) = (v3[0], v3[1]);
                     let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::I32(c4)));
@@ -428,15 +441,17 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                     vs
                 });
                 let st = b.let_(Op::AddF32(Opnd::Var(r), Opnd::F32(0.0)));
-                let tot = block_reduce(b, RedOp::Sum, st, wave, lane, 0, ws, blk, 3);
+                let sk = block_reduce(b, RedOp::Sum, st, wave, lane, 0, ws, blk, 3);
                 b.barrier();
-                tot
-            };
-            let target_p = b.mul_f32(top_p, sk);
-            let one_c2 = b.c_f32(1.0);
-            let p_on = b.cmp(CmpPred::Lt, CmpTy::F32, top_p, one_c2);
-            let tp_sel = select(b, target_p, true, thr_k);
-            Some(b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(p_on), a: Opnd::Val(tp_sel), b: Opnd::Val(thr_k) }))
+                let target_p = b.mul_f32(top_p, sk);
+                let tp = select(b, target_p, true, thr_k);
+                b.store_lds(ap, tp, MemTy::B32, false);
+                b.wait_lds(0);
+            });
+            b.barrier();
+            let thr_f = b.load_lds(ap, MemTy::B32);
+            b.wait_lds(0);
+            Some(thr_f)
         } else {
             None
         };
