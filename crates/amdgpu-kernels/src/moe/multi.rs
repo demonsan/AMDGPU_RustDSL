@@ -6,6 +6,9 @@
 //! 2. `moe_scan_e<E>_k<K>_b<BM>`   grid 1, 1024 threads: per expert the sum over the blocks, the padded prefix scan over experts, then `ws[e][g] = first position of expert e's pairs of block g`
 //!    (padded offset of e + the pairs of the earlier blocks), plus `tile_start`, `num_valid_ids`, `sorted_expert_ids` and the padding / tail sentinels of `sorted_token_ids` / `sorted_weights`.
 //!    ABI: ws @0, sorted_token_ids @8, sorted_weights @16, sorted_expert_ids @24, num_valid_ids @32, tile_start @40, M @48 (i32), G @52 (i32).
+//! 3b. `moe_scatter_ord_e<E>_k<K>_b<BM>` (same ABI): the DETERMINISTIC variant: every expert's pairs end up in ascending pair index (token, slot) order -- a stable counting sort. Chunks of 1024 consecutive pairs are processed
+//!    in order; inside a chunk a wave matches equal experts with `ballot` / `mbcnt` (rank among the earlier lanes with the same expert + the wave's count per expert), the per-expert counts of the 16 waves are
+//!    prefix-summed in LDS (one thread per expert), and the expert's cursor advances by the chunk total.
 //! 3. `moe_scatter_e<E>_k<K>_b<BM>` grid G, 1024 threads: block g places its pairs: position = `ws[e][g]` advanced by an LDS cursor (`ds_add_rtn_u32`), so the layout is deterministic across blocks;
 //!    inside a block the order of one expert's pairs is the arrival order. ABI: topk_ids @0, topk_weights @8, sorted_token_ids @16, sorted_weights @24, ws @32, M @40 (i32), P @44 (i32).
 
@@ -16,7 +19,9 @@ const T: i32 = 1024;
 const WS_ROW: i32 = 256; // bytes per expert row of the workspace (64 slots)
 
 pub fn by_name(name: &str) -> Option<Function> {
-    let (rest, kind) = if let Some(r) = name.strip_prefix("moe_count_e") {
+    let (rest, kind) = if let Some(r) = name.strip_prefix("moe_scatter_ord_e") {
+        (r, 4)
+    } else if let Some(r) = name.strip_prefix("moe_count_e") {
         (r, 1)
     } else if let Some(r) = name.strip_prefix("moe_scan_e") {
         (r, 2)
@@ -36,9 +41,9 @@ pub fn by_name(name: &str) -> Option<Function> {
     }
     match kind {
         1 if bm.is_none() => Some(moe_count(name, e, k)),
-        3 => {
+        3 | 4 => {
             let bm: i64 = bm?.parse().ok()?;
-            [16, 32, 64, 128].contains(&bm).then(|| moe_scatter(name, e, k, bm))
+            [16, 32, 64, 128].contains(&bm).then(|| if kind == 3 { moe_scatter(name, e, k, bm) } else { moe_scatter_ordered(name, e, k, bm) })
         }
         2 => {
             let bm: i64 = bm?.parse().ok()?;
@@ -421,6 +426,169 @@ pub fn moe_scatter(name: &str, e: i64, k: i64, bm: i64) -> Function {
         }
         let nx = b.let_(Op::AddI32(Opnd::Var(it), Opnd::I32(1)));
         b.set_var(it, nx);
+    });
+    fb.finish()
+}
+
+/// The stable (token-order) scatter, see the module comment.
+pub fn moe_scatter_ordered(name: &str, e: i64, k: i64, bm: i64) -> Function {
+    let mut fb = FnBuilder::new(name, T as u32);
+    fb.compile_profile(CompileProfile::Default);
+    let b = &mut fb;
+    for (i, nm) in ["topk_ids", "topk_weights", "sorted_token_ids", "sorted_weights", "ws"].iter().enumerate() {
+        b.arg(nm, DType::Ptr, 8 * i as u32, 8);
+    }
+    b.arg("m", DType::I32, 40, 4);
+    b.arg("per", DType::I32, 44, 4);
+    let mm = Ext::sym("M");
+    b.sym_range("M", 1, 1 << 22);
+    b.ka_is(40, mm.clone());
+    let maxp = mm.clone() * Ext::c(k) + Ext::c(e * bm - k);
+    b.arg_tensor("topk_ids", mm.clone() * Ext::c(4 * k));
+    b.arg_tensor("topk_weights", mm.clone() * Ext::c(4 * k));
+    b.arg_tensor("sorted_token_ids", maxp.clone() * Ext::c(4));
+    b.arg_tensor("sorted_weights", maxp * Ext::c(4));
+    b.arg_tensor("ws", Ext::c(e * WS_ROW as i64));
+    // LDS: WC[16 waves][1024] (per-wave expert counts, then their exclusive prefix over the waves), CURSOR[1024], BASE[1024], one dummy dword
+    let (wc, cursor, base_a, dummy) = (0i32, 65536i32, 69632i32, 73728i32);
+    b.lds(73736);
+    let ptr: Vec<ValueId> = (0..5).map(|i| b.let_(Op::KernargPtr { offset: 8 * i })).collect();
+    let m_v = b.let_(Op::KernargI32 { offset: 40 });
+    let per = b.let_(Op::KernargI32 { offset: 44 });
+    let tid = b.let_(Op::WorkitemId);
+    let bx = b.let_(Op::WorkgroupIdX);
+    let wave = b.bind_i32(ev(tid).lshr(6));
+    let lane = b.bind_i32(ev(tid) & 63);
+    let n_el = b.bind_i32(ev(m_v) * k as i32);
+    let sz_ids = b.bind_i32(ev(n_el) << 2);
+    let r_ids = { let v = b.read_first_lane(sz_ids); b.buffer_desc_dyn(ptr[0], v) };
+    let r_w = { let v = b.read_first_lane(sz_ids); b.buffer_desc_dyn(ptr[1], v) };
+    let maxp_v = b.bind_i32(ev(n_el) + (e * bm - k) as i32);
+    let sz_maxp = b.bind_i32(ev(maxp_v) << 2);
+    let r_sid = { let v = b.read_first_lane(sz_maxp); b.buffer_desc_dyn(ptr[2], v) };
+    let r_sw = { let v = b.read_first_lane(sz_maxp); b.buffer_desc_dyn(ptr[3], v) };
+    let r_ws = b.buffer_desc(ptr[4], (e * WS_ROW as i64) as u32);
+    let oob = b.c_i32(0x7fff_ff00);
+    let tid4 = b.bind_i32(ev(tid) << 2);
+    let in_e = b.cmp(CmpPred::Lt, CmpTy::I32, tid, e as i32);
+    // the block's first position of every expert -> CURSOR
+    let o0 = b.bind_i32(ev(tid) * WS_ROW + (ev(bx) << 2));
+    let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_e), a: Opnd::Val(o0), b: Opnd::Val(oob) });
+    let base_f = b.buffer_load_f32(r_ws, o, 0i32, 0);
+    let base_i = b.bitcast_i32(base_f);
+    let a_cur = b.bind_i32(ev(tid4) + cursor);
+    b.store_lds(a_cur, base_i, MemTy::B32, false);
+    b.wait_lds(0);
+    b.barrier();
+    let magic = ((1u64 << 32) + k as u64 - 1) / k as u64;
+    let base = b.bind_i32(ev(bx) * ev(per));
+    let end0 = b.bind_i32(ev(base) + ev(per));
+    let end = b.let_(Op::MinI32(Opnd::Val(end0), Opnd::Val(n_el)));
+    let nchunks = b.bind_i32((ev(per) + (T - 1)).lshr(10));      // chunks of 1024 pairs in this block's slice
+    let wc_col = b.bind_i32(ev(tid4) + wc);                      // thread e's column start: WC[0][e]; WC[w][e] = + 4096 w
+    b.loop_(&[(DType::I32, Opnd::I32(0))], |b, vars| {
+        let ch = vars[0];
+        let done = b.let_(Op::CmpGeI32(Opnd::Var(ch), Opnd::Val(nchunks)));
+        b.break_if(done);
+        let i = b.let_(Op::MulI32(Opnd::Var(ch), Opnd::I32(T)));
+        let i = b.bind_i32(ev(base) + ev(i) + ev(tid));
+        let ins = b.let_(Op::CmpLtI32(Opnd::Val(i), Opnd::Val(end)));
+        let eid = pair_expert(b, r_ids, i, ins, e);
+        let wo = b.bind_i32(ev(i) << 2);
+        let wf = b.buffer_load_f32(r_w, wo, 0i32, 0);
+        // [A] zero this thread's column of WC (all 16 waves' counts of expert `tid`)
+        let zero = b.c_i32(0);
+        for w in 0..16i32 {
+            let a = b.bind_i32(ev(wc_col) + 4096 * w);
+            b.store_lds(a, zero, MemTy::B32, false);
+        }
+        b.wait_lds(0);
+        b.barrier();
+        // [B] the wave's match loop: rank among the earlier lanes with the same expert, count per expert
+        let tr = b.cmp(CmpPred::Ge, CmpTy::I32, tid, 0);             // always true: the full lane mask
+        let (full_lo, full_hi) = b.ballot(tr);
+        let res = b.loop_(&[(DType::I32, Opnd::Val(full_lo)), (DType::I32, Opnd::Val(full_hi)), (DType::I32, Opnd::I32(0))], |b, v2| {
+            let (rl, rh, rk) = (v2[0], v2[1], v2[2]);
+            let any = b.let_(Op::Bin(BinOp::OrB32, Opnd::Var(rl), Opnd::Var(rh)));
+            let fin = b.cmp(CmpPred::Eq, CmpTy::I32, any, 0);
+            b.break_if(fin);
+            let rlv = b.let_(Op::AddI32(Opnd::Var(rl), Opnd::I32(0)));
+            let rhv = b.let_(Op::AddI32(Opnd::Var(rh), Opnd::I32(0)));
+            let lo_ne = b.cmp(CmpPred::Ne, CmpTy::I32, rlv, 0);
+            let f_lo = b.un(amdgpu_dsl::UnOp::Ffbl, rlv);
+            let f_hi = b.un(amdgpu_dsl::UnOp::Ffbl, rhv);
+            let f_hi32 = b.add_i32(f_hi, 32);
+            let l0 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lo_ne), a: Opnd::Val(f_lo), b: Opnd::Val(f_hi32) });
+            let l0b = b.bind_i32(ev(l0) << 2);
+            let e0 = b.bpermute(l0b, eid);
+            let eq = b.cmp(CmpPred::Eq, CmpTy::I32, eid, e0);
+            let (eq_lo, eq_hi) = b.ballot(eq);
+            let mb = b.mbcnt(eq_lo, eq_hi);
+            let ranked = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq), a: Opnd::Val(mb), b: Opnd::Var(rk) });
+            let c0 = b.bin(BinOp::BcntAdd, eq_hi, 0i32);
+            let cnt = b.bin(BinOp::BcntAdd, eq_lo, c0);
+            // the lanes of the group write the wave's count of this expert (every lane of the group the same value); the others write a dummy slot
+            let wa0 = b.bind_i32(((ev(wave) << 10) + ev(e0)) * 4 + wc);
+            let dm = b.c_i32(dummy);
+            let wa = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq), a: Opnd::Val(wa0), b: Opnd::Val(dm) });
+            b.store_lds(wa, cnt, MemTy::B32, false);
+            let neq_lo = b.let_(Op::XorI32(Opnd::Val(eq_lo), Opnd::I32(-1)));
+            let neq_hi = b.let_(Op::XorI32(Opnd::Val(eq_hi), Opnd::I32(-1)));
+            let nl = b.let_(Op::AndI32(Opnd::Var(rl), Opnd::Val(neq_lo)));
+            let nh = b.let_(Op::AndI32(Opnd::Var(rh), Opnd::Val(neq_hi)));
+            b.set_var(rl, nl);
+            b.set_var(rh, nh);
+            b.set_var(rk, ranked);
+            rk
+        });
+        let rank = b.let_(Op::AddI32(Opnd::Var(res), Opnd::I32(0)));
+        b.wait_lds(0);
+        b.barrier();
+        // [C] one thread per expert: exclusive prefix of the wave counts over the 16 waves (in place), the expert's chunk base and the advanced cursor
+        let mut cs = Vec::new();
+        for w in 0..16i32 {
+            let a = b.bind_i32(ev(wc_col) + 4096 * w);
+            cs.push(b.load_lds(a, MemTy::B32));
+        }
+        let ca = b.bind_i32(ev(tid4) + cursor);
+        let curv = b.load_lds(ca, MemTy::B32);
+        b.wait_lds(0);
+        let mut run = b.c_i32(0);
+        for w in 0..16i32 {
+            let a = b.bind_i32(ev(wc_col) + 4096 * w);
+            b.store_lds(a, run, MemTy::B32, false);
+            run = b.add_i32(run, cs[w as usize]);
+        }
+        let ba = b.bind_i32(ev(tid4) + base_a);
+        b.store_lds(ba, curv, MemTy::B32, false);
+        let adv = b.add_i32(curv, run);
+        b.store_lds(ca, adv, MemTy::B32, false);
+        b.wait_lds(0);
+        b.barrier();
+        // [D] position = the expert's chunk base + the wave's exclusive prefix + the rank in the wave
+        let a_b = b.bind_i32((ev(eid) << 2) + base_a);
+        let a_w = b.bind_i32(((ev(wave) << 10) + ev(eid)) * 4 + wc);
+        let bse = b.load_lds(a_b, MemTy::B32);
+        let wpre = b.load_lds(a_w, MemTy::B32);
+        b.wait_lds(0);
+        let pos = b.bind_i32(ev(bse) + ev(wpre) + ev(rank));
+        let q = if k == 1 {
+            i
+        } else {
+            let mg = b.c_i32(magic as u32 as i32);
+            b.bin(BinOp::MulHiU32, i, mg)
+        };
+        let slot = b.bind_i32(ev(i) - ev(q) * k as i32);
+        let packed = b.bind_i32((ev(slot) << 24) + ev(q));
+        let valid = b.cmp(CmpPred::Ne, CmpTy::I32, eid, 1023);
+        let o0 = b.bind_i32(ev(pos) << 2);
+        let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(valid), a: Opnd::Val(o0), b: Opnd::Val(oob) });
+        let pf = b.bitcast_f32(packed);
+        b.buffer_store_f32(r_sid, o, 0i32, 0, pf);
+        b.buffer_store_f32(r_sw, o, 0i32, 0, wf);
+        b.barrier();
+        let nx = b.let_(Op::AddI32(Opnd::Var(ch), Opnd::I32(1)));
+        b.set_var(ch, nx);
     });
     fb.finish()
 }

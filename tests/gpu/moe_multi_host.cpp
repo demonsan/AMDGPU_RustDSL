@@ -20,7 +20,7 @@ int main(int argc, char** argv) {
     void *did, *dw, *dsid, *dsw, *deid, *dnv, *dts; CK(hipMalloc(&did, N * 4)); CK(hipMalloc(&dw, N * 4)); CK(hipMalloc(&dsid, maxp * 4 + 64)); CK(hipMalloc(&dsw, maxp * 4 + 64)); CK(hipMalloc(&deid, ntile * 4 + 64)); CK(hipMalloc(&dnv, 64)); CK(hipMalloc(&dts, (E + 1) * 4 + 64));
     CK(hipMemcpy(did, ids.data(), N * 4, hipMemcpyHostToDevice)); CK(hipMemcpy(dw, w.data(), N * 4, hipMemcpyHostToDevice));
     CK(hipMemset(dsid, 0x55, maxp * 4 + 64)); CK(hipMemset(dsw, 0x55, maxp * 4 + 64)); CK(hipMemset(deid, 0x55, ntile * 4 + 64)); CK(hipMemset(dnv, 0x55, 64)); CK(hipMemset(dts, 0x55, (E + 1) * 4 + 64));
-    char kc[64], ks[64], kt[64]; std::snprintf(kc, 64, "moe_count_e%ld_k%ld", E, K); std::snprintf(ks, 64, "moe_scan_e%ld_k%ld_b%ld", E, K, BM); std::snprintf(kt, 64, "moe_scatter_e%ld_k%ld_b%ld", E, K, BM);
+    char kc[64], ks[64], kt[64]; std::snprintf(kc, 64, "moe_count_e%ld_k%ld", E, K); std::snprintf(ks, 64, "moe_scan_e%ld_k%ld_b%ld", E, K, BM); const bool ord = std::getenv("ORDERED") != nullptr; std::snprintf(kt, 64, ord ? "moe_scatter_ord_e%ld_k%ld_b%ld" : "moe_scatter_e%ld_k%ld_b%ld", E, K, BM);
     hipModule_t m1, m2, m3; hipFunction_t f1, f2, f3; CK(hipModuleLoad(&m1, argv[1])); CK(hipModuleGetFunction(&f1, m1, kc)); CK(hipModuleLoad(&m2, argv[2])); CK(hipModuleGetFunction(&f2, m2, ks)); CK(hipModuleLoad(&m3, argv[3])); CK(hipModuleGetFunction(&f3, m3, kt));
     long G = std::min<long>(64, (N + 4095) / 4096); if (G < 1) G = 1; long P = (N + G - 1) / G;
     void* dws; CK(hipMalloc(&dws, E * 256 + 64));
@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
         std::multiset<std::pair<uint32_t, uint32_t>> got, ref;   // (packed id, weight bits)
         for (long p = off[e]; p < off[e] + cnt[e]; ++p) { uint32_t wb; std::memcpy(&wb, &sw[p], 4); got.insert({sid[p], wb}); }
         for (long i = 0; i < N; ++i) if (ids[i] == e) { uint32_t wb; std::memcpy(&wb, &w[i], 4); ref.insert({(uint32_t)(((i % K) << 24) | (i / K)), wb}); }
-        if (got != ref) { if (bad < 5) std::fprintf(stderr, "expert %ld: group differs\n", e); ++bad; }
+        if (got != ref) { if (bad < 5) std::fprintf(stderr, "expert %ld: group differs\n", e); ++bad; }\n        if (std::getenv("ORDERED")) { long p = off[e]; for (long i = 0; i < N; ++i) if (ids[i] == e) { uint32_t want = (uint32_t)(((i % K) << 24) | (i / K)); if (sid[p] != want) { if (bad < 5) std::fprintf(stderr, "expert %ld: position %ld holds %08x, stable order wants %08x\n", e, p - off[e], sid[p], want); ++bad; break; } ++p; } }
         for (long p = off[e] + cnt[e]; p < off[e + 1]; ++p) if (sid[p] != sentinel || sw[p] != 0.f) { if (bad < 5) std::fprintf(stderr, "pad at %ld wrong: %08x\n", p, sid[p]); ++bad; }
     }
     for (long p = total; p < maxp; ++p) if (sid[p] != sentinel || sw[p] != 0.f) { if (bad < 5) std::fprintf(stderr, "tail at %ld wrong: %08x\n", p, sid[p]); ++bad; }
