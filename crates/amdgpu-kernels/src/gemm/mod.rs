@@ -173,7 +173,11 @@ impl GemmConfig {
     }
     /// bf16 A16W16 (`gemm_a16w16_bf16`): the v4 structure with bf16 MFMAs, no scales.
     pub fn a16w16() -> GemmConfig {
-        GemmConfig { scales: Scales::None, elem: Elem::Bf16, ..GemmConfig::v4() }
+        let c = GemmConfig { scales: Scales::None, elem: Elem::Bf16, ..GemmConfig::v4() };
+        match std::env::var("EXP_SYNC").ok().and_then(|v| v.split_once(",").map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))) {
+            Some((p, m)) => GemmConfig { pre_sync_mmas: p, mid_sync_mmas: m, ..c },
+            None => c,
+        }
     }
     /// bf16 A16W16 with a 128 x 128 CTA.
     pub fn a16w16_128() -> GemmConfig {
