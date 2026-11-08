@@ -8,6 +8,7 @@ pub mod gemm;
 pub mod mlp;
 pub mod eltwise;
 pub mod norm;
+pub mod rows;
 pub mod ir_proof;
 pub mod probes;
 pub mod verifier_cases;
