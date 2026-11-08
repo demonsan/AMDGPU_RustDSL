@@ -871,7 +871,7 @@ impl Body {
         let (_, (next, early)) = u.capture(b, "tile.setup", |b| {
             let next = t.staged.then(|| (self.a_rd.at(b, &self.a_s.at(&t.next)), self.b_rd.at(b, &self.b_s.at(&t.next))));
             // the scales of t+1 are read FIRST (before the fragment reloads queue up behind them) and installed at the end (partial lgkm waits)
-            let early = t.staged.then(|| self.load_scales(b, ox(t.it) + 1));
+            let early = (t.staged && !(self.regb.is_some() && std::env::var("EXP_NOSC").is_ok())).then(|| self.load_scales(b, ox(t.it) + 1));
             (next, early)
         });
         // MMAs of the register tile with the in-place reloads of t+1 (into `u`)
@@ -895,12 +895,15 @@ impl Body {
                     if let (true, Some((ar, _))) = (lo == half, &next) {
                         // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
                         u.capture(b, format!("reload.a{i}"), |b| {
+                            if self.regb.is_some() && std::env::var("EXP_NOA").is_ok() {
+                                return;
+                            }
                             let v = ar.read(b, i);
                             b.set_var(av[i], v);
                         });
                     }
                 }
-                if let Some((_, br)) = &next {
+                if let (Some((_, br)), false) = (&next, self.regb.is_some() && std::env::var("EXP_NOB").is_ok()) {
                     for j in lo..hi {
                         u.capture(b, format!("reload.b{j}"), |b| {
                             let v = if self.regb.is_some() { self.b_global(b, ox(t.it) + 1, j, false) } else { br.read(b, j) };
