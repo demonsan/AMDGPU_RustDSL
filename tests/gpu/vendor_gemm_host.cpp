@@ -179,9 +179,9 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 10; i++) a.u32(24 + 4 * i, iv[i]);
         a.ptr(64, dSA); a.ptr(72, dSB); a.u32(80, M); a.u32(84, K / 128); a.u32(88, 0); a.u32(92, 0); a.b.resize(96);
     } else if (fam == "ours_v4_f4") {
-        // our v4 structure, MXFP4: A [M][K/2] bytes, B preshuffled bytes, scales e8m0 [rows][K/32] (natural), KT = 128-byte K tiles = K / 256
-        // SCSHUF=1 (gemm_a4w4_mxfp4_rb): scales [rows/16][KT/2][64 lanes][4] - lane 16 g + r: groups g, 4+g of tile 2p, then of tile 2p+1
-        if (envi("SCSHUF", 0)) {
+        // our v4 structure, MXFP4: A [M][K/2] bytes, B preshuffled bytes, KT = 128-byte K tiles = K / 256; e8m0 scales SHUFFLED
+        // (gemm_a4w4_mxfp4 scale_shuf): [rows/16][KT/2][64 lanes][4] - lane 16 g + r: groups g, 4+g of tile 2p, then of tile 2p+1 (K % 512 == 0)
+        {
             auto shuf = [&](const std::vector<uint8_t>& s, int rows) {
                 const int KG = K / 32, KT = K / 256;
                 std::vector<uint8_t> o(s.size());
@@ -199,8 +199,6 @@ int main(int argc, char** argv) {
                 return o;
             };
             dSA = dev(shuf(sa8, M)); dSB = dev(shuf(sb8, N));
-        } else {
-        dSA = dev(sa8); dSB = dev(sb8);
         }
         a.ptr(0, dA); a.ptr(8, dB); a.ptr(16, dC);
         int iv[10] = {M, N, K, 1, K, K, N, 0, 0, 0};

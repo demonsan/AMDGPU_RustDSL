@@ -499,7 +499,7 @@
 | blockscale split-K S=4 | 128×4096×8192 / 64×8192² | 317 / 317 | 203 / 202 | 1.56 / 1.57 |
 | rowcol split-K S=4 | 128×4096×8192 / 64×8192² | 458 / 398 | i8：245 / 246 | 1.87 / 1.62 |
 | bf16 split-K S=4 | 128×4096×8192 / 64×8192² | 293 / 265 | bf16gemm 256：74 / 74 | 3.9 / 3.6 |
-| `gemm_a4w4_mxfp4`（**实验**） | 4096³ / 8192³ | 2302 / 2807 | f4gemm 256 bpreshuffle：3522 / 4708 | 0.65 / 0.60 |
+| `gemm_a4w4_mxfp4`（scale 重排版，2026-11-08） | 4096³ / 8192³ / 16384³ | 3020 / 3876 / 4384 | f4gemm 256 bpreshuffle：3675 / 4720 / — | 0.82 / 0.83 / — |
 
 **说明与待办**：
 - **split-K 的取值**：
@@ -530,6 +530,19 @@
 
 - S = 4 在所有形状上都没有赢过。
 - 块缩放的 FMA 已经推迟一级（`bs_fma`）。余下的差距在每 CU 只有 1 个 CTA 时的单 tile 效率。
+**MXFP4 的 scale 重排**（2026-11-08）：
+- 敏感性实验：去掉逐 tile 的 1×32 E8M0 scale 读取，8192³ 从 389 µs 降到 269 µs，占 31%。原因是每个 wave 每个 tile 要发 16 条非合并的 8 字节读，各行相距 256 字节。相比之下，B 的重载占 41 µs，A 的重载占 5 µs。
+- **ABI 变化**：
+  - `gemm_a4w4_mxfp4`（含 `_128`）的 A / B scale 布局改为 `[rows/16][KT/2][64 lane][4 字节]`。
+  - lane 16g+r 依次存放偶数 tile 的 K 组 g、4+g，再存放奇数 tile 的同两组；要求 K 是 512 的倍数。
+  - host 端重排参考 [`vendor_gemm_host.cpp`](../tests/gpu/vendor_gemm_host.cpp) 中 `ours_v4_f4` 的 `shuf`。
+  - 这样每个 lane 对每个块、每对 tile 只做一次合并的 dword 读，安装 scale 只需一次移位。
+- **效果**：
+  - 8192³：390 → 284 µs（2819 → 3876 TF/s）；
+  - 4096³：59 → 45.5 µs；
+  - 16384³：3188 → 2006 µs。
+  - 对 aiter f4gemm 从 0.60 / 0.63× 提到 0.83 / 0.82×。
+- **试过但未采纳**：寄存器 B，即 B 从 global 原地重载进 AGPR，依赖后端的 in-place reload。它只带来 +1% / 0，已从树中移除，保留为 tag `archive/mxfp4-regb`。将来若做 256 字节的 A tile，可从这个 tag 起步，因为它腾出了 B 的 ring。
 ### 7.5 批次 3（attention）状态：覆盖完成，性能待优化
 
 **prefill**：`fmha_fwd_hd<64|128|256>_bf16[_causal][_swa][_group]`，见 [`fmha/bf16.rs`](../crates/amdgpu-kernels/src/fmha/bf16.rs)。

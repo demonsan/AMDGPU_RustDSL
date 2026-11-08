@@ -52,10 +52,6 @@ pub struct GemmConfig {
     pub moe: Option<MoeStage>,
     /// implicit-GEMM convolution (`ConvCfg`)
     pub conv: Option<ConvCfg>,
-    /// B (preshuffled) loaded straight from global memory into the register tile (the vendor f4gemm form): no B DMA through LDS (the
-    /// fragment of 16 rows x 128 bytes is one contiguous 2 KB block of the preshuffled B: the lane's two 16-byte reads at the same offsets
-    /// as in the LDS image); the in-place reloads of tile t + 1 are global loads
-    pub reg_b: bool,
     /// `Scales::Mx32` with the shuffled scale layout [rows / 16][KT / 2][64 lanes][4 bytes] (one coalesced dword per lane, block and tile pair)
     pub scale_shuf: bool,
 }
@@ -164,7 +160,7 @@ pub enum Scales {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, reg_b: false, scale_shuf: false }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -197,17 +193,9 @@ impl GemmConfig {
     }
     /// MXFP4 A4W4 (`gemm_a4w4_mxfp4`): fp4 operands, 1 x 32 E8M0 scales in the scaled MFMAs.
     pub fn a4w4() -> GemmConfig {
-        GemmConfig { scales: Scales::Mx32, elem: Elem::Fp4, ..GemmConfig::v4() }
+        GemmConfig { scales: Scales::Mx32, elem: Elem::Fp4, scale_shuf: true, ..GemmConfig::v4() }
     }
     /// MXFP4 A4W4 with a 128 x 128 CTA.
-    /// MXFP4 with the register-staged B (`reg_b`)
-    pub fn a4w4_rb() -> GemmConfig {
-        GemmConfig { reg_b: true, scale_shuf: true, ..GemmConfig::a4w4() }
-    }
-    /// MXFP4 with the shuffled scales only (B through LDS)
-    pub fn a4w4_ss() -> GemmConfig {
-        GemmConfig { scale_shuf: true, ..GemmConfig::a4w4() }
-    }
     pub fn a4w4_128() -> GemmConfig {
         GemmConfig { cta_m: 128, cta_n: 128, ..GemmConfig::a4w4() }
     }
@@ -711,8 +699,6 @@ struct Body {
     /// register-staged tile: initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
     staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, Vec<ValueId>)>,
     rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, Vec<VarId>)>,
-    /// `reg_b`: per instruction of a B fragment the lane's voffset (block row offset + in-block bytes), 16 K (the 16-row block stride, SGPR)
-    regb: Option<(Vec<ValueId>, ValueId)>,
 }
 
 /// The 1 x 32 E8M0 scale loads of `Scales::Mx32`: per m block (n block) the lane's loop-invariant voffset of its row's 8 groups of the tile,
@@ -721,7 +707,7 @@ struct Mx32 {
     voff_a: Vec<ValueId>,
     voff_b: Vec<ValueId>,
     shift: ValueId,
-    /// `reg_b` (shuffled scales): [rows / 16][KT / 2][lane][4 bytes] with lane 16 g + r holding the bytes of K groups g, 4 + g of the even
+    /// `scale_shuf`: [rows / 16][KT / 2][lane][4 bytes] with lane 16 g + r holding the bytes of K groups g, 4 + g of the even
     /// tile, then of the odd tile (one coalesced dword per lane, block and tile pair); the bit shift of the last `load_scales` (0 / 16)
     shuf: Option<std::cell::RefCell<Option<ValueId>>>,
 }
@@ -839,16 +825,6 @@ impl Body {
             0
         }
     }
-    /// `reg_b`: the B fragment of n block j of K tile `it` straight from global memory (two 16-byte loads), into AGPRs.
-    fn b_global(&self, b: &mut FnBuilder, it: I32, j: usize, into_agpr: bool) -> ValueId {
-        let (vo, k16) = self.regb.as_ref().expect("reg_b");
-        let so = { let v = b.bind_i32((it << 11) + ev(self.b_org) + ev(*k16) * j as i32); b.read_first_lane(v) };
-        let lo = b.buffer_load_b128(self.rsrc_b, vo[0], so, 0);
-        let hi = b.buffer_load_b128(self.rsrc_b, vo[1], so, 0);
-        // frag_cat: the two loads write the halves of the result (set_var: the loop variable's own registers, no wait at the definition)
-        let v = b.frag_cat(&[lo.into(), hi.into()]);
-        if into_agpr { b.agpr(v) } else { v }
-    }
     /// An operand fragment read into AGPRs.
     fn frag(&self, b: &mut FnBuilder, part: &amdgpu_tile::LdsSlotPart, o: usize) -> ValueId {
         let v = part.read(b, o);
@@ -862,7 +838,7 @@ impl Body {
         let sb: Vec<ValueId> = sb.into_iter().map(|v| self.scale_word(b, v)).collect();
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
-        let bf: Vec<ValueId> = if self.regb.is_some() { (0..nn).map(|j| self.b_global(b, ox(t.it), j, true)).collect() } else { (0..nn).map(|j| self.frag(b, &br, j)).collect() };
+        let bf: Vec<ValueId> = (0..nn).map(|j| self.frag(b, &br, j)).collect();
         let af: Vec<ValueId> = (0..nm).map(|i| self.frag(b, &ar, i)).collect();
         self.staged = Some((bf, af, sa, sb));
     }
@@ -925,7 +901,7 @@ impl Body {
                 if let Some((_, br)) = &next {
                     for j in lo..hi {
                         u.capture(b, format!("reload.b{j}"), |b| {
-                            let v = if self.regb.is_some() { self.b_global(b, ox(t.it) + 1, j, false) } else { br.read(b, j) };
+                            let v = br.read(b, j);
                             b.set_var(bv[j], v);
                         });
                     }
@@ -1026,8 +1002,7 @@ impl Body {
             });
             vo
         });
-        let nab = if self.regb.is_some() { 1 } else { 2 };
-        for (bi, (sh, dma, rsrc, wave)) in [(&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, self.rsrc_b, self.b_wave)].into_iter().take(nab).enumerate() {
+        for (bi, (sh, dma, rsrc, wave)) in [(&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, self.rsrc_b, self.b_wave)].into_iter().enumerate() {
             let (_, mine) = u.capture(b, format!("ab.{}.setup", sh.name), |b| {
                 let o = sh.at(slot).off_v(b);
                 let sbase = b.bind_i32(o + sh.base as i32 + ev(wave));
@@ -1197,8 +1172,6 @@ pub fn by_name(name: &str) -> Option<Function> {
             s.parse::<i64>().ok().filter(|s| (1..=16).contains(s)).map(|s| reduce::gemm_splitk_reduce(n, s, rc))
         }
         "gemm_a4w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4", GemmConfig::a4w4())),
-        "gemm_a4w4_mxfp4_rb" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_rb", GemmConfig::a4w4_rb())),
-        "gemm_a4w4_mxfp4_ss" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_ss", GemmConfig::a4w4_ss())),
         "gemm_a4w4_mxfp4_128" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_128", GemmConfig::a4w4_128())),
         _ => None,
     }
@@ -1549,7 +1522,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
 
     let mut pipe = Pipeline::new(Cadence::RegStaged, ks_v, k_v, 128, if cfg.split_k { Ext::ka(88) } else { Ext::ka(84) });
     // two tiles per pass, static slots; tile 1 staged after the scale-panel stores with its DMAs in flight at the prologue barrier
-    pipe.late_tile1_vm = (a_dma.issues.len() + if cfg.reg_b { 0 } else { b_dma.issues.len() }) as u8;
+    pipe.late_tile1_vm = (a_dma.issues.len() + b_dma.issues.len()) as u8;
     pipe.scalar_exit = true;
     // operand read partitions (the wave offset added to the bases)
     let mut a_rd = copy_a.partition_lds(b, &ctx, &s_lane, &a_s, &a_view, &a_place);
@@ -1558,28 +1531,6 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let b_wo = ctx.lower(&s_wn.mul_c(wave_n / 16 * 2048));
     a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32(x + &a_wo)).collect();
     b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32(x + &b_wo)).collect();
-    // reg_b: the LDS B image is the CTA's 2 KB blocks back to back, so a read at slot offset o is global block o / 2048 of the CTA (stride
-    // 16 K) at byte o % 2048; the wave's fragment j differs by 2048 j in the image (asserted) = 16 K j globally (the SGPR part)
-    let regb = cfg.reg_b.then(|| {
-        assert!(cfg.moe.is_none() && cfg.conv.is_none(), "reg_b: plain GEMMs only");
-        let ops = &b_rd.ops;
-        assert!(ops[0].len() == 2, "reg_b: a B fragment is two 16-byte reads");
-        for (j, op) in ops.iter().enumerate() {
-            for k in 0..2 {
-                assert_eq!(op[k].0, ops[0][k].0, "reg_b: fragment {j} uses another base register");
-                assert_eq!(op[k].1 - ops[0][k].1, 2048 * j as i64, "reg_b: fragment {j} is not 2048 j past fragment 0");
-            }
-        }
-        let k16 = { let v = b.bind_i32(ev(k_v) << 4); b.read_first_lane(v) };
-        let vo: Vec<ValueId> = (0..2)
-            .map(|k| {
-                // (the partition bases include the ring's LDS base)
-                let o = b.let_i32(&b_rd.bases[ops[0][k].0] + (ops[0][k].1 - b_s.base) as i32);
-                b.bind_i32((o.clone().lshr(11)) * ev(k16) + (o & 2047))
-            })
-            .collect();
-        (vo, k16)
-    });
     let zero4 = b.frag_zero(DType::Frag4);
     let unit = matches!(cfg.scales, Scales::RowCol | Scales::None | Scales::Block128).then(|| (b.bind_i32(lane.lane().lshr(6) + 0x7F7F_7F7F), b.bind_i32(lane.lane().lshr(6) + 0x7F)));
     // 1 x 32 scales: per m block i the row (CTA + wave + 16 i + lane % 16) of [rows][8 KT] bytes, the dword of K groups 4 (g / 2).. (g = lane / 16)
@@ -1650,7 +1601,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     });
     let body = Body {
         cfg, kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, regb, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb,
     };
         // MoE: everything after this runs only for tiles below num_valid_ids[0] (closed at the end of the epilogue)
     if let Some(mc) = &moe_cx {
