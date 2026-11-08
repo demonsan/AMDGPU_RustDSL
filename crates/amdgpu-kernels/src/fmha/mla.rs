@@ -309,11 +309,9 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     b.finish()
 }
 
-/// `mla_decode_bf16_w8_p<P>`: the per-wave form with 8 waves per CTA (16-key tiles in an 18 KB private region each, NS = 8 S parts):
-/// twice the waves per CU to hide the per-wave DMA latency.
-pub fn mla_decode_bf16_w8(name: &str, page: i32) -> Function {
+pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     assert!(page.count_ones() == 1, "page size: a power of two");
-    let mut b = FnBuilder::new(name, 512);
+    let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
     for (n, i) in [("ptr_po", 0u32), ("ptr_q", 1), ("ptr_kv", 2), ("ptr_bt", 3), ("ptr_cl", 4), ("ptr_plse", 10)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
@@ -336,8 +334,8 @@ pub fn mla_decode_bf16_w8(name: &str, page: i32) -> Function {
     b.arg_tensor("ptr_kv", np * Ext::c((page * ROW) as i64));
     b.arg_tensor("ptr_bt", bb.clone() * mp * Ext::c(4));
     b.arg_tensor("ptr_cl", bb.clone() * Ext::c(4));
-    b.arg_tensor("ptr_po", bb.clone() * hh.clone() * ss.clone() * Ext::c(8 * 4 * DV as i64));
-    b.arg_tensor("ptr_plse", bb * hh * ss * Ext::c(32));
+    b.arg_tensor("ptr_po", bb.clone() * hh.clone() * ss.clone() * Ext::c(4 * 4 * DV as i64));
+    b.arg_tensor("ptr_plse", bb * hh * ss * Ext::c(16));
 
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 16 * i });
     let ki = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargI32 { offset: 16 * i });
@@ -367,11 +365,11 @@ pub fn mla_decode_bf16_w8(name: &str, page: i32) -> Function {
         for (thr, val) in [(1, 1), (2, 2), (4, 3), (8, 4), (16, 5), (32, 6)] {
             acc = sv.clone().gt(thr).select_i32(val, acc);
         }
-        let v = b.bind_i32(acc + 3);
+        let v = b.bind_i32(acc + 2);
         b.read_first_lane(v)
     };
-    let nsplit = b.bind_i32(ev(s_n) << 3);
-    let ns = { let v = b.bind_i32((ev(z) << 3) + ev(wv)); b.read_first_lane(v) };
+    let nsplit = b.bind_i32(ev(s_n) << 2);
+    let ns = { let v = b.bind_i32((ev(z) << 2) + ev(wv)); b.read_first_lane(v) };
     let ntt = b.bind_i32((ev(ctx) + (KT - 1)).lshr(5));
     let per = b.bind_i32(((ev(ntt) + ev(nsplit) - 1).lshr(ev(lg))) << 5);
     let k_lo = { let v = b.bind_i32(ev(ns) * ev(per)); b.read_first_lane(v) };
