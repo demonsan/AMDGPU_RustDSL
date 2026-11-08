@@ -60,6 +60,7 @@ int main(int argc, char** argv) {
         std::vector<int> e(E);
         for (int i = 0; i < E; i++) e[i] = i;
         std::shuffle(e.begin(), e.end(), rng);
+        if (envi("SKIP_E0", 0)) for (int k = 0; k < TK; k++) if (e[k] == 0) std::swap(e[k], e[E - 1]);
         float s = 0;
         for (int k = 0; k < TK; k++) { ids[t * TK + k] = e[k]; tw[t * TK + k] = 0.1f + (rng() % 1000) / 1000.0f; s += tw[t * TK + k]; }
         for (int k = 0; k < TK; k++) tw[t * TK + k] /= s;
