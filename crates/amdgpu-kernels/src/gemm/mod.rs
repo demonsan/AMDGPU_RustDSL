@@ -293,19 +293,13 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
     Vec::new()
 }
 
-/// The deferred block-scale updates: acc += t (sa sb) lane by lane.
+/// The deferred block-scale updates: acc += t (sa sb), two v_pk_fma_f32 per 16x16 block (in place on the accumulator).
 fn bs_fma(b: &mut FnBuilder, pending: &[(VarId, ValueId, VarId, VarId)]) {
     for &(acc, t, sa, sb) in pending {
         let (fa, fb) = (b.bitcast_f32(Opnd::Var(sa)), b.bitcast_f32(Opnd::Var(sb)));
         let s = b.mul_f32(fa, fb);
-        for r in 0..4u8 {
-            let tl = b.frag4_lane(t, r);
-            let tl = b.bitcast_f32(tl);
-            let al = b.frag4_lane(Opnd::Var(acc), r);
-            let al = b.bitcast_f32(al);
-            let f = b.let_(Op::FmaF32(Opnd::Val(tl), Opnd::Val(s), Opnd::Val(al)));
-            b.var_set_lane(acc, r, f);
-        }
+        let s2 = b.frag2_dup(s);
+        b.var_pk_fma(acc, 0, t, s2);
     }
 }
 
