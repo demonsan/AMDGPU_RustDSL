@@ -52,6 +52,8 @@ pub struct GemmConfig {
     pub moe: Option<MoeStage>,
     /// implicit-GEMM convolution (`ConvCfg`)
     pub conv: Option<ConvCfg>,
+    /// `Scales::Mx32` with the shuffled scale layout [rows / 16][KT / 2][64 lanes][4 bytes] (one coalesced dword per lane, block and tile pair)
+    pub scale_shuf: bool,
 }
 
 /// Implicit-GEMM convolution, NDHWC input [NB, DI, H, W, C] bf16 (2d: DI = 1, kernel depth 1), weights [K][C / 64][T][R][S][64] (the 128-byte
@@ -158,7 +160,7 @@ pub enum Scales {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -191,7 +193,7 @@ impl GemmConfig {
     }
     /// MXFP4 A4W4 (`gemm_a4w4_mxfp4`): fp4 operands, 1 x 32 E8M0 scales in the scaled MFMAs.
     pub fn a4w4() -> GemmConfig {
-        GemmConfig { scales: Scales::Mx32, elem: Elem::Fp4, ..GemmConfig::v4() }
+        GemmConfig { scales: Scales::Mx32, elem: Elem::Fp4, scale_shuf: true, ..GemmConfig::v4() }
     }
     /// MXFP4 A4W4 with a 128 x 128 CTA.
     pub fn a4w4_128() -> GemmConfig {
@@ -705,6 +707,9 @@ struct Mx32 {
     voff_a: Vec<ValueId>,
     voff_b: Vec<ValueId>,
     shift: ValueId,
+    /// `scale_shuf`: [rows / 16][KT / 2][lane][4 bytes] with lane 16 g + r holding the bytes of K groups g, 4 + g of the even
+    /// tile, then of the odd tile (one coalesced dword per lane, block and tile pair); the bit shift of the last `load_scales` (0 / 16)
+    shuf: Option<std::cell::RefCell<Option<ValueId>>>,
 }
 
 impl Body {
@@ -753,6 +758,14 @@ impl Body {
             let sb = bs.voff_b.iter().map(|v| b.buffer_load_f32(self.rsrc_sfb, *v, so, 0)).collect();
             return (sa, sb);
         }
+        if let (Some(mx), Some(sh)) = (&self.mx32, self.mx32.as_ref().and_then(|m| m.shuf.as_ref())) {
+            // shuffled: the tile pair kb / 2 (256 bytes per block), the tile's half selected by a shift at the install
+            let so = { let v = b.bind_i32(ev(kb).lshr(1) << 8); b.read_first_lane(v) };
+            let s = b.bind_i32((ev(kb) & 1) << 4);
+            *sh.borrow_mut() = Some(s);
+            let ld = |b: &mut FnBuilder, rs: ValueId, vo: &[ValueId]| -> Vec<ValueId> { vo.iter().map(|v| b.buffer_load_f32(rs, *v, so, 0)).collect() };
+            return (ld(b, self.rsrc_sfa, &mx.voff_a), ld(b, self.rsrc_sfb, &mx.voff_b));
+        }
         if let Some(mx) = &self.mx32 {
             // 1 x 32 E8M0 [rows][K / 32] bytes: the 8 groups of the tile (one 8-byte load per m / n block); the lane group g = lane / 16 of
             // MFMA h (fragment bytes 64 h + 16 g ..) covers K group 4 h + g: v_perm puts byte g of the low word in byte 0 and byte g of the high
@@ -779,6 +792,11 @@ impl Body {
     /// The scale word of a `load_scales` value: `Scales::Mx32` selects the lane's two group bytes of the 8-byte load (v_perm); identity otherwise.
     fn scale_word(&self, b: &mut FnBuilder, v: ValueId) -> ValueId {
         match &self.mx32 {
+            Some(mx) if mx.shuf.is_some() => {
+                let s = mx.shuf.as_ref().unwrap().borrow().expect("shift of the last scale load");
+                let w = b.bitcast_i32(v);
+                b.bind_i32(ev(w).lshr(ev(s)))
+            }
             Some(mx) => {
                 let lo = b.frag2_lane(v, 0);
                 let hi = b.frag2_lane(v, 1);
@@ -1547,25 +1565,39 @@ impl skeleton_v4::V4Slots for GemmSlots {
                 let nb = b.bind_i32(((ev(bx) << lg_n) + ev(wn) * (wave_n as i32)).lshr(7));
                 vec![b.bind_i32((ev(nbe) + ev(nb)) * ev(rowb))]
             };
-            return Mx32 { voff_a, voff_b, shift: r16 };
+            return Mx32 { voff_a, voff_b, shift: r16 , shuf: None };
         }
         let a0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * (wave_m as i32) + ev(r16));
         let voff_a = (0..wave_m / 16).map(|i| b.bind_i32((ev(a0) + (16 * i) as i32) * ev(rowb))).collect();
         let nb = b.bind_i32(((ev(bx) << lg_n) + ev(wn) * (wave_n as i32)).lshr(7));
         let voff_b = vec![b.bind_i32(ev(nb) * ev(rowb))];
-        Mx32 { voff_a, voff_b, shift: r16 }
+        Mx32 { voff_a, voff_b, shift: r16 , shuf: None }
     });
     let mx32 = (cfg.scales == Scales::Mx32).then(|| {
         let r16 = b.bind_i32(lane.lane() & 15);
         let rowb = b.bind_i32(ev(kb_v) << 3);
         let a0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * (wave_m as i32) + ev(r16));
         let b0 = b.bind_i32((ev(bx) << lg_n) + ev(wn) * (wave_n as i32) + ev(r16));
-        let voff_a = (0..wave_m / 16).map(|i| b.bind_i32((ev(a0) + (16 * i) as i32) * ev(rowb))).collect();
-        let voff_b = (0..wave_n / 16).map(|j| b.bind_i32((ev(b0) + (16 * j) as i32) * ev(rowb))).collect();
+        let (voff_a, voff_b) = if cfg.scale_shuf {
+            // shuffled: block (row / 16) of [rows / 16][KT / 2][64][4]: (row / 16) KT 128 + 4 lane (KT even)
+            let blk = b.bind_i32(ev(kb_v) << 7);
+            let l4 = b.bind_i32(lane.lane() << 2);
+            let ra = b.bind_i32(((ev(by) << lg_m) + ev(wm) * (wave_m as i32)).lshr(4));
+            let rb = b.bind_i32(((ev(bx) << lg_n) + ev(wn) * (wave_n as i32)).lshr(4));
+            (
+                (0..wave_m / 16).map(|i| b.bind_i32((ev(ra) + i as i32) * ev(blk) + ev(l4))).collect::<Vec<_>>(),
+                (0..wave_n / 16).map(|j| b.bind_i32((ev(rb) + j as i32) * ev(blk) + ev(l4))).collect::<Vec<_>>(),
+            )
+        } else {
+            (
+                (0..wave_m / 16).map(|i| b.bind_i32((ev(a0) + (16 * i) as i32) * ev(rowb))).collect(),
+                (0..wave_n / 16).map(|j| b.bind_i32((ev(b0) + (16 * j) as i32) * ev(rowb))).collect(),
+            )
+        };
         // v_perm selector: byte 0 = byte g of the low word (S1 bytes 0..3), byte 1 = byte g of the high word (S0 bytes 4..7), bytes 2, 3 = 0
         let gg = b.bind_i32(lane.lane().lshr(4));
         let shift = b.bind_i32(ev(gg) + ((ev(gg) + 4) << 8) + 0x0C0C_0000);
-        Mx32 { voff_a, voff_b, shift }
+        Mx32 { voff_a, voff_b, shift, shuf: cfg.scale_shuf.then(|| std::cell::RefCell::new(None)) }
     });
     let body = Body {
         cfg, kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
