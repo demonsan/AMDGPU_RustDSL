@@ -735,6 +735,30 @@ def check_tr_b16_p1(planes, out):
             print(f"  {l:2d}: {[(v - base) // 4 for v in vals]} {[(v - base) % 4 for v in vals]}")
     return ok
 
+# ---------------------------------------------------------------- probe_tr_b16_mfma: D = T^T x B with A from ds_read_b64_tr_b16
+def tr_mfma_data():
+    rnd = random.Random(21)
+    T = [[rnd.randint(-4, 4) for m in range(16)] for k in range(32)]
+    B = [[rnd.randint(-4, 4) for n in range(16)] for k in range(32)]
+    return T, B
+
+def gen_tr_b16_mfma():
+    T, B = tr_mfma_data()
+    words = []
+    flat = [enc("bf16", T[k][m]) for k in range(32) for m in range(16)]
+    words += [flat[2 * i] | (flat[2 * i + 1] << 16) for i in range(256)]
+    for l in range(LANES):
+        vals = [enc("bf16", B[8 * (l // 16) + v][l % 16]) for v in range(8)]
+        words += [vals[2 * i] | (vals[2 * i + 1] << 16) for i in range(4)]
+    return [words]
+
+def check_tr_b16_mfma(planes, out):
+    T, B = tr_mfma_data()
+    D = [[sum(T[k][m] * B[k][n] for k in range(32)) for n in range(16)] for m in range(16)]
+    bad = sum(1 for l in range(LANES) for r in range(4) if f32(out[4 * l + r]) != D[4 * (l // 16) + r][l % 16])
+    print("tr_b16 -> v_mfma_f32_16x16x32_bf16 A operand (T^T): " + ("exact" if not bad else f"{bad} wrong values"))
+    return bad == 0
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -742,6 +766,7 @@ PROBES = {
     "probe_cvt_p1": (gen_cvt_p1, check_cvt_p1, sum(2 if c[0] in TWO else 1 for c in CVT_CASES) * LANES * 4),
     "probe_dpp_p1": (gen_dpp_p1, check_dpp_p1, (len(DPP_CASES) + 2) * LANES * 4),
     "probe_tr_b16_p1": (gen_tr_b16_p1, check_tr_b16_p1, 1024),
+    "probe_tr_b16_mfma": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
