@@ -1550,7 +1550,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let vo: Vec<ValueId> = (0..2)
             .map(|k| {
                 let o = b.let_i32(&b_rd.bases[ops[0][k].0] + ops[0][k].1 as i32);
-                b.bind_i32((ev(o).lshr(11)) * ev(k16) + (ev(o) & 2047))
+                b.bind_i32((o.clone().lshr(11)) * ev(k16) + (o & 2047))
             })
             .collect();
         (vo, k16)
