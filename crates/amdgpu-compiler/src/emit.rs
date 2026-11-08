@@ -395,6 +395,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VCvtF16F32 => un(a, inst, "v_cvt_f16_f32_e32"),
         MOp::VAndB32 => bin(a, inst, "v_and_b32_e32"),
         MOp::VMinI32 => bin(a, inst, "v_min_i32_e32"),
+        MOp::VPkFmaF32 => vec![format!("v_pk_fma_f32 {}, {}, {}, {}", pair(a, inst.dst.unwrap()), pair(a, reg_of(&inst.srcs[0])), pair(a, reg_of(&inst.srcs[1])), pair(a, reg_of(&inst.srcs[2])))],
         MOp::SMulHiU32 => vec![format!("s_mul_hi_u32 {}, {}, {}", d_s(a, inst), src1_s(a, inst.srcs[0]), src1_s(a, inst.srcs[1]))],
         MOp::VMadU64U32 => vec![format!("v_mad_u64_u32 {}, vcc, {}, {}, {}", pair(a, inst.dst.expect("dst")), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), pair(a, reg_of(&inst.srcs[2])))],
         MOp::VReadLane => vec![format!("v_readlane_b32 {}, {}, {}", sr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), inst.imm & 63)],

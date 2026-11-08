@@ -633,6 +633,8 @@ pub enum Op {
     /// 64-bit address arithmetic: `base + (u64) a * (u64) b` with `a`, `b` read as UNSIGNED 32-bit (> 4 GiB offsets; a wave-uniform result
     /// stays scalar, so it can be the base of a buffer descriptor)
     PtrMadU32 { base: Opnd, a: Opnd, b: Opnd },
+    /// `v_pk_fma_f32`: a * b + c on two f32 lanes (Frag2 each)
+    PkFmaF32(Opnd, Opnd, Opnd),
     /// "Any lane": the wave-level reading of a per-lane condition (true for the whole wave when any lane's `cond` holds) — the explicit marker
     /// for branching on a per-lane condition (`if` / `break_if` are wave-level). No code: the branch itself has this semantics.
     AnyLane(Opnd),
@@ -683,6 +685,7 @@ impl Op {
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
             Op::AnyLane(_) => DType::I1,
+            Op::PkFmaF32(..) => DType::Frag2,
             Op::PtrMadU32 { .. } => DType::Ptr,
             Op::FragSlice { n, .. } => match n {
                 1 => DType::I32,
@@ -793,6 +796,7 @@ impl Op {
             Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
             Op::Dpp { x, old, .. } => vec![*x, *old],
             Op::AnyLane(c) => vec![*c],
+            Op::PkFmaF32(a, b, c) => vec![*a, *b, *c],
             Op::PtrMadU32 { base, a, b } => vec![*base, *a, *b],
             Op::FragSlice { frag, .. } => vec![*frag],
             Op::FragCat { parts, .. } => parts.clone(),
@@ -1128,6 +1132,9 @@ pub enum Stmt {
     BufferStoreN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd, ty: MemTy, hi: bool, cache: CachePolicy },
     /// LDS store of any width (same `hi` rule)
     StoreLdsN { addr: Opnd, value: Opnd, ty: MemTy, hi: bool },
+    /// In place: `var[start + 2 i .. + 2] = t[2 i .. + 2] * s + var[...]` for every dword pair of `t` (`v_pk_fma_f32`; `s` a Frag2, e.g. a
+    /// `frag2_dup` scale)
+    VarPkFma { var: VarId, start: u8, t: Opnd, s: Opnd },
     /// LDS atomic without return
     AtomicLdsNoRet { op: AtomicOp, addr: Opnd, value: Opnd },
     /// MUBUF atomic without return (`buffer_atomic_<op>`; AddU32, AddF32, PkAddBf16, PkAddF16): range-checked against the descriptor like a store
@@ -2101,6 +2108,15 @@ impl FnBuilder {
     /// give a scalar pointer (usable as a buffer-descriptor base: move the descriptor to the row / block, keep per-lane offsets small).
     pub fn ptr_mad(&mut self, base: impl Into<Opnd>, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PtrMadU32 { base: base.into(), a: a.into(), b: b.into() })
+    }
+    /// `v_pk_fma_f32`: a * b + c, two f32 lanes per instruction (Frag2 operands).
+    pub fn pk_fma_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::PkFmaF32(a.into(), b.into(), c.into()))
+    }
+    /// In-place block update `var[start + k] += t[k] * s` (k over the dwords of `t`, two per `v_pk_fma_f32`; `s` a Frag2 such as
+    /// `frag2_dup(scale)`), e.g. the per-tile block-scale accumulation `acc += t * (sa sb)` of the blockscale GEMMs.
+    pub fn var_pk_fma(&mut self, var: VarId, start: u8, t: impl Into<Opnd>, s: impl Into<Opnd>) {
+        self.push_stmt(Stmt::VarPkFma { var, start, t: t.into(), s: s.into() });
     }
     /// Mark a per-lane condition for a wave-level branch: the wave takes the branch when ANY lane's `cond` holds (`if` / `break_if` conditions must
     /// be wave-uniform; this is the explicit way to branch on a per-lane one).
@@ -3797,6 +3813,32 @@ pub fn verify(f: &Function) -> Vec<String> {
                     errs.push(here(format!("var{var} must be a frag16")));
                 }
             }
+            Stmt::VarPkFma { var, start, t: tt, s } => {
+                let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
+                if !ok {
+                    errs.push(here(format!("var{var} updated outside its loop")));
+                }
+                let vw = match f.var_ty(*var) {
+                    Some(DType::Frag2) => 2,
+                    Some(DType::Frag4) => 4,
+                    Some(DType::Frag8) => 8,
+                    Some(DType::Frag16) => 16,
+                    _ => 0,
+                };
+                let tw = match opnd_ty(f, *tt) {
+                    Ok(DType::Frag2) => 2,
+                    Ok(DType::Frag4) => 4,
+                    Ok(DType::Frag8) => 8,
+                    Ok(DType::Frag16) => 16,
+                    _ => 0,
+                };
+                if vw == 0 || tw == 0 || *start % 2 != 0 || *start as u32 + tw > vw {
+                    errs.push(here(format!("var_pk_fma: var{var} ({vw} dwords) start {start} t ({tw} dwords): t must be a fragment inside the variable at an even offset")));
+                }
+                if !matches!(opnd_ty(f, *s), Ok(DType::Frag2)) {
+                    errs.push(here("var_pk_fma: the scale must be a Frag2 (e.g. frag2_dup(s))".to_string()));
+                }
+            }
             Stmt::VarScalePk { var, pair } => {
                 let ok = loop_vars.iter().rev().any(|vs| vs.contains(var)) || done_vars.contains(var);
                 if !ok {
@@ -4081,6 +4123,7 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         }
         Stmt::StoreLdsN { addr, value, .. } => vec![*addr, *value],
         Stmt::StoreLds2 { addr, v0, v1, .. } => vec![*addr, *v0, *v1],
+        Stmt::VarPkFma { t, s, .. } => vec![*t, *s],
         Stmt::AtomicLdsNoRet { addr, value, .. } => vec![*addr, *value],
         Stmt::AtomicGlobalNoRet { base, value, .. } => vec![*base, *value],
         Stmt::BufferAtomicNoRet { rsrc, voff, soff, value, .. } => {
@@ -4148,6 +4191,7 @@ pub fn stmt_var_writes(st: &Stmt) -> Vec<VarId> {
         Stmt::SetVar { var, .. }
         | Stmt::VarScaleF32 { var, .. }
         | Stmt::VarScalePk { var, .. }
+        | Stmt::VarPkFma { var, .. }
         | Stmt::VarAddPk { var, .. }
         | Stmt::VarMfmaF16Z { var, .. }
         | Stmt::VarScaleLane { var, .. }
