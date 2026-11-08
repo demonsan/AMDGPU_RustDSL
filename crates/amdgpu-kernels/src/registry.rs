@@ -87,6 +87,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_fwd_hd128_bf16_v3_causal" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3("fmha_fwd_hd128_bf16_v3_causal", true)),
         "fmha_fwd_hd128_bf16_v3_ks" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3_x("fmha_fwd_hd128_bf16_v3_ks", false, true)),
         "fmha_fwd_hd128_bf16_v3_causal_ks" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3_x("fmha_fwd_hd128_bf16_v3_causal_ks", true, true)),
+        n if n.starts_with("quant_mxfp4_bf16_k") || n.starts_with("quant_mxfp8_bf16_k") => crate::rows::mxquant::by_name(n),
         "attn_combine_bf16_hd128_q" => Some(crate::fmha::bf16v3::attn_combine_bf16_hd128_q("attn_combine_bf16_hd128_q")),
         "attn_combine_bf16_hd128" => Some(crate::fmha::decode::attn_combine_bf16_hd128("attn_combine_bf16_hd128")),
         "attn_combine_bf16_hd512" => Some(crate::fmha::decode::attn_combine_bf16("attn_combine_bf16_hd512", 512)),
