@@ -161,19 +161,27 @@ pub fn mla16_decode_bf16(name: &str, page: i32) -> Function {
     let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
     let rowb = b.bind_i32((ev(pg) * page + (ev(kl) & (page - 1))) * ROW);
     me.write(&mut b, Opnd::Var(it), |b| {
-        for i in 0..36i32 {
-            let c = b.bind_i32((i << 6) + lane.lane());
-            let key = b.bind_i32((ev(c) * 1821).lshr(17));
-            let pos = b.bind_i32(ev(c) - ev(key) * CHUNKS);
-            let src = b.bind_i32((ev(pos).lshr(3) << 3) + ((ev(pos) ^ ev(key)) & 7));
-            let addr = b.bind_i32(ev(key) << 2);
-            let rb = b.bpermute(addr, rowb);
-            // (explicit: the own backend emitted no lgkmcnt wait between ds_bpermute and its use; reported)
+        // groups of 12 issues: the row bases by ds_bpermute, one lgkm wait (explicit: the own backend emitted no wait between ds_bpermute
+        // and its use; reported), then the DMAs
+        for g0 in (0..36i32).step_by(12) {
+            let parts: Vec<(ValueId, ValueId)> = (g0..g0 + 12)
+                .map(|i| {
+                    let c = b.bind_i32((i << 6) + lane.lane());
+                    let key = b.bind_i32((ev(c) * 1821).lshr(17));
+                    let pos = b.bind_i32(ev(c) - ev(key) * CHUNKS);
+                    let src = b.bind_i32((ev(pos).lshr(3) << 3) + ((ev(pos) ^ ev(key)) & 7));
+                    let addr = b.bind_i32(ev(key) << 2);
+                    (b.bpermute(addr, rowb), src)
+                })
+                .collect();
             b.wait_lds(0);
-            let rb = b.bitcast_i32(rb);
-            let vo = b.bind_i32(ev(rb) + (ev(src) << 4));
-            let m0 = b.bind_i32(mbase.clone() + (i << 10));
-            b.buffer_load_lds_b128(r_kv, vo, c0, m0, 0);
+            for (k, (rb, src)) in parts.into_iter().enumerate() {
+                let i = g0 + k as i32;
+                let rb = b.bitcast_i32(rb);
+                let vo = b.bind_i32(ev(rb) + (ev(src) << 4));
+                let m0 = b.bind_i32(mbase.clone() + (i << 10));
+                b.buffer_load_lds_b128(r_kv, vo, c0, m0, 0);
+            }
         }
     });
     b.wait_vm(0);
