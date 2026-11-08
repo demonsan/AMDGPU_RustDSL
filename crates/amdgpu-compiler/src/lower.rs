@@ -2500,10 +2500,14 @@ impl Lowerer {
                     }
                     _ => return Err("frag_slice of a constant".into()),
                 };
-                let cls = match n {
-                    1 => RClass::V1,
-                    2 => RClass::V2,
-                    4 => RClass::V4,
+                // a scalar tuple (a uniform pointer) slices into SGPRs
+                let scalar = !self.mir.vreg_class(f).is_vector();
+                let cls = match (n, scalar) {
+                    (1, true) => RClass::S1,
+                    (2, true) => RClass::S2,
+                    (1, false) => RClass::V1,
+                    (2, false) => RClass::V2,
+                    (4, _) => RClass::V4,
                     _ => RClass::V8,
                 };
                 let d = self.sub_alias(f, *start, cls);
