@@ -67,22 +67,19 @@ impl Body<'_> {
         let kb = self.kbase(b, slot);
         let (kind, qf, kr) = (self.kind, self.qf, self.kr);
         self.ring.ks.at(slot).read(b, |b| {
-            let mut out = Vec::new();
-            for blk in 0..4usize {
-                let mut acc: Option<ValueId> = None;
-                for c in 0..8usize {
+            // c outer, block inner: 4 independent accumulator chains back to back (no MFMA -> MFMA dependency stalls)
+            let mut acc: Vec<Option<ValueId>> = vec![None; 4];
+            for c in 0..8usize {
+                for blk in 0..4usize {
                     let a = b.bind_i32(ev(kr[c]) + kb.clone() + blk as i32 * 32 * ROW);
                     let kf = b.load_lds_b128(a);
                     match into {
                         Some(v) => b.var_mfma(v[blk], kind, kf, qf[c], c == 0),
-                        None => acc = Some(b.mfma(kind, kf, qf[c], acc.map(Opnd::Val))),
+                        None => acc[blk] = Some(b.mfma(kind, kf, qf[c], acc[blk].map(Opnd::Val))),
                     }
                 }
-                if let Some(a) = acc {
-                    out.push(a);
-                }
             }
-            out
+            acc.into_iter().flatten().collect()
         })
     }
     /// O^T += V^T P^T over the 128 keys of the tile in `slot`: 8 steps of 16 keys x 4 blocks of 32 d
@@ -400,5 +397,9 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
         b.end_if();
     });
     b.end_if();
-    b.finish()
+    let mut f = b.finish();
+    if let Ok(o) = std::env::var("EXP_SCHED") {
+        f.sched_opts = Some(o);
+    }
+    f
 }
