@@ -1224,3 +1224,28 @@ pub fn probe_ifelse() -> Function {
     b.end_if();
     b.finish()
 }
+
+/// `probe_fp4_chain(in, out)` (kernel-opt's mxquant pattern): one word built from four chained `ScalePkFp4F32` conversions, sel 0..3, each
+/// with the previous result as `old`. in planes 0..7: f32 pairs (x_s, y_s) for byte s (values representable after / 2), plane 8: scale 2.0.
+pub fn probe_fp4_chain() -> Function {
+    use amdgpu_dsl::{CvtOp, MemTy};
+    let mut b = FnBuilder::new("probe_fp4_chain", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(9 * 256));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(256));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pl: Vec<ValueId> = (0..9u32).map(|k| b.load_global(pin, 256 * k, MemTy::B32)).collect();
+    let mut w = b.c_i32(0);
+    for s in 0..4u8 {
+        let (x, y) = (pl[2 * s as usize], pl[2 * s as usize + 1]);
+        w = b.cvt(CvtOp::ScalePkFp4F32, &[Opnd::Val(x), Opnd::Val(y), Opnd::Val(pl[8]), Opnd::Val(w)], s);
+    }
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    b.store_global(pout, 0, w, MemTy::B32, false);
+    b.finish()
+}
