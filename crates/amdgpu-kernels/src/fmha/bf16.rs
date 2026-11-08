@@ -184,6 +184,7 @@ pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
         let tile = b.bind_i32((itx.clone() << 1) + slot);
         // top of tile: this tile's DMA done and visible; the other slot free (every wave is past tile - 1)
         b.wait_vm(0);
+        b.wait_lds(0);
         b.barrier();
         // the next tile into the other slot (the last pass stages a tile past the end: rows past the sequence, masked; clamped to the pair count)
         let nxt = b.bind_i32(ev(tile) + 1);
