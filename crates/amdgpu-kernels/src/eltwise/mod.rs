@@ -10,10 +10,10 @@ use amdgpu_tile::prims::{act, bf16x8_to_f32, Act};
 use amdgpu_tile::ev;
 
 pub fn by_name(full: &str) -> Option<Function> {
-    // a `_nt` suffix selects the non-temporal cache policy on the streaming loads / stores (experiment: aiter uses GROUP_NT)
-    let (name, cache) = match full.strip_suffix("_nt") {
-        Some(n) => (n, CachePolicy::NT),
-        None => (full, CachePolicy::NONE),
+    // streaming loads / stores are non-temporal by default (+10 % on silu_mul, docs/op-coverage-membound.md); a `_rt` suffix selects the default (regular) policy, for A/B runs
+    let (name, cache) = match full.strip_suffix("_rt") {
+        Some(n) => (n, CachePolicy::NONE),
+        None => (full, CachePolicy::NT),
     };
     match name {
         "add_bf16" => return Some(add_bf16(name)),
@@ -109,15 +109,15 @@ pub fn add_bf16(name: &str) -> Function {
     let nb = b.read_first_lane(nb);
     let (r_a, r_b, r_o) = (b.buffer_desc_dyn(p_a, nb), b.buffer_desc_dyn(p_b, nb), b.buffer_desc_dyn(p_o, nb));
     let off = b.bind_i32((ev(bx) << 12) + (ev(tid) << 4));
-    let xa = b.buffer_load_b128(r_a, off, 0i32, 0);
-    let xb = b.buffer_load_b128(r_b, off, 0i32, 0);
+    let xa = b.buffer_load_c(r_a, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+    let xb = b.buffer_load_c(r_b, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
     let (fa, fbv) = (bf16x8_to_f32(b, xa), bf16x8_to_f32(b, xb));
     let mut r = [0; 8];
     for i in 0..8 {
         r[i] = b.add_f32(fa[i], fbv[i]);
     }
     let o = pack_bf16x8(b, &r);
-    b.buffer_store_b128(r_o, off, 0i32, 0, o);
+    b.buffer_store_c(r_o, Some(Opnd::Val(off)), 0i32, 0, o, MemTy::B128, false, CachePolicy::NT);
     fb.finish()
 }
 
@@ -144,7 +144,7 @@ pub fn cvt_f32_bf16(name: &str) -> Function {
     let v0 = b.bind_i32((ev(bx) << 9) + ev(tid));          // vector index (4 elements)
     let o0 = b.bind_i32(ev(v0) << 4);
     let o1 = b.bind_i32(ev(o0) + 4096);
-    let (x0, x1) = (b.buffer_load_b128(r_x, o0, 0i32, 0), b.buffer_load_b128(r_x, o1, 0i32, 0));
+    let (x0, x1) = (b.buffer_load_c(r_x, Some(Opnd::Val(o0)), 0i32, 0, MemTy::B128, CachePolicy::NT), b.buffer_load_c(r_x, Some(Opnd::Val(o1)), 0i32, 0, MemTy::B128, CachePolicy::NT));
     for (k, x) in [(0i32, x0), (1, x1)] {
         let w: Vec<ValueId> = (0..2u8).map(|j| {
             let a = b.frag4_lane(Opnd::Val(x), 2 * j);
@@ -155,7 +155,7 @@ pub fn cvt_f32_bf16(name: &str) -> Function {
         }).collect();
         let f = b.frag2(w[0], w[1]);
         let off = b.bind_i32((ev(v0) << 3) + 2048 * k);
-        b.buffer_store_b64(r_o, off, 0i32, 0, f);
+        b.buffer_store_c(r_o, Some(Opnd::Val(off)), 0i32, 0, f, MemTy::B64, false, CachePolicy::NT);
     }
     fb.finish()
 }
@@ -183,7 +183,7 @@ pub fn cvt_bf16_f32(name: &str) -> Function {
     let v0 = b.bind_i32((ev(bx) << 9) + ev(tid));
     let o0 = b.bind_i32(ev(v0) << 3);
     let o1 = b.bind_i32(ev(o0) + 2048);
-    let (x0, x1) = (b.buffer_load_b64(r_x, o0, 0i32, 0), b.buffer_load_b64(r_x, o1, 0i32, 0));
+    let (x0, x1) = (b.buffer_load_c(r_x, Some(Opnd::Val(o0)), 0i32, 0, MemTy::B64, CachePolicy::NT), b.buffer_load_c(r_x, Some(Opnd::Val(o1)), 0i32, 0, MemTy::B64, CachePolicy::NT));
     for (k, x) in [(0i32, x0), (1, x1)] {
         let mut f = [0; 4];
         for d in 0..2u8 {
@@ -195,7 +195,7 @@ pub fn cvt_bf16_f32(name: &str) -> Function {
         }
         let out = b.frag4(f[0], f[1], f[2], f[3]);
         let off = b.bind_i32((ev(v0) << 4) + 4096 * k);
-        b.buffer_store_b128(r_o, off, 0i32, 0, out);
+        b.buffer_store_c(r_o, Some(Opnd::Val(off)), 0i32, 0, out, MemTy::B128, false, CachePolicy::NT);
     }
     fb.finish()
 }

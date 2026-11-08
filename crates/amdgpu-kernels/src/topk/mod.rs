@@ -123,7 +123,7 @@ pub fn topk_softmax(name: &str, e: i64, k: i64, renorm: bool) -> Function {
     let lr = b.bind_i32(lane.lane() & (l - 1) as i32);       // lane within the row group
     let row = b.bind_i32((ev(bx) * 4 + lane.wave()) * rpw as i32 + ev(row_in_wave));
     let voff = b.bind_i32(ev(row) * (2 * e) as i32 + (ev(lr) << 4));
-    let g = b.buffer_load_b128(r_g, voff, 0i32, 0);
+    let g = b.buffer_load_c(r_g, Some(Opnd::Val(voff)), 0i32, 0, MemTy::B128, CachePolicy::NT);
     b.wait_vm(0);
     let neg = b.c_f32(-3.0e38);
     let zero = b.c_f32(0.0);
