@@ -130,38 +130,33 @@ impl DmaPart {
     }
     /// The DMA of the tile at `key0` into `slot` through the buffer form.
     pub fn issue_buffer(&self, b: &mut FnBuilder, bf: &BufForm, key0: &I32, slot: &SlotRef) {
-        self.issue_buffer_units(bf, key0, slot).emit_all(b);
+        self.issue_buffer_units(b, bf, key0, slot).emit_all(b);
     }
-    /// `issue_buffer` as emission units: the per-tile setup (soffset, M0) and one unit per DMA instruction (each under the slot's write marker).
-    pub fn issue_buffer_units<'s>(&'s self, bf: &'s BufForm, key0: &I32, slot: &SlotRef<'s>) -> crate::weave::Units<'s> {
-        use crate::weave::{Hint, Out, UnitClass, Units};
+    /// `issue_buffer` as captured emission units: the per-tile setup (soffset, M0) and one unit per DMA instruction (each under the slot's write
+    /// marker).
+    pub fn issue_buffer_units(&self, b: &mut FnBuilder, bf: &BufForm, key0: &I32, slot: &SlotRef) -> crate::weave::Units<'static> {
         assert_eq!(slot.sh.name, self.sh.name, "DmaPart: slot of another buffer");
         let n = self.row_c.len() as i64;
-        let mut u = Units::new();
-        let regs: Out<(ValueId, ValueId)> = Out::new();
-        let (k0, sl, r2) = (key0.clone(), slot.clone(), regs.clone());
-        let setup = u.add(format!("dma.{}.setup", self.sh.name), UnitClass::Setup, Hint::Anchor, &[], move |b| {
+        let mut u = crate::weave::Units::new();
+        let (_, (so, m0)) = u.capture(b, format!("dma.{}.setup", self.sh.name), |b| {
             let so = {
-                let v = b.bind_i32(k0 * &self.src.stride + ev_(bf.base));
+                let v = b.bind_i32(key0.clone() * &self.src.stride + ev_(bf.base));
                 b.read_first_lane(v)
             };
-            let off = sl.off_v(b);
+            let off = slot.off_v(b);
             let m0 = b.bind_i32(&self.lds_wave + off - (self.step * (n - 1)) as i32);
             // wave-uniform: ONE readfirstlane per tile (the DMA's M0 / soffset are SGPRs; a VGPR value is re-read before every issue)
-            let m0 = b.read_first_lane(m0);
-            r2.set((so, m0));
+            (so, b.read_first_lane(m0))
         });
         for q in 0..n as usize {
-            let (sl, r3) = (slot.clone(), regs.clone());
-            u.add(format!("dma.{}.{q}", self.sh.name), UnitClass::Dma, Hint::LatencySensitive, &[setup], move |b| {
-                let (so, m0) = r3.get();
-                sl.write(b, |b| {
+            u.capture(b, format!("dma.{}.{q}", self.sh.name), |b| {
+                slot.write(b, |b| {
                     if self.atom.bytes == 4 {
                         b.buffer_load_lds_b32(bf.rsrc, bf.voffs[q], so, m0, (self.step * q as i64) as u32);
                     } else {
                         b.buffer_load_lds_b128(bf.rsrc, bf.voffs[q], so, m0, (self.step * q as i64) as u32);
                     }
-                });
+                })
             });
         }
         u
