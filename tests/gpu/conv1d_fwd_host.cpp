@@ -15,11 +15,11 @@ static float bf16_to_f32(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; 
 static uint16_t f32_to_bf16(float f) { uint32_t u; std::memcpy(&u, &f, 4); u += 0x7fff + ((u >> 16) & 1); return (uint16_t)(u >> 16); }
 int main(int argc, char** argv) {
     if (argc < 10) { std::fprintf(stderr, "usage: %s <co> <kernel> <plain|split> <B> <dim> <W> <k_dim> <silu> <maxlen> [iters]\n", argv[0]); return 2; }
-    const char* co = argv[1]; const char* kn = argv[2]; bool split = std::string(argv[3]) == "split"; long B = std::atol(argv[4]), dim = std::atol(argv[5]), W = std::atol(argv[6]), KD = std::atol(argv[7]); bool silu = std::atoi(argv[8]); long maxlen = std::atol(argv[9]); int iters = argc > 10 ? std::atoi(argv[10]) : 10;
+    const char* co = argv[1]; const char* kn = argv[2]; bool split = std::string(argv[3]) == "split"; long B = std::atol(argv[4]), dim = std::atol(argv[5]), W = std::atol(argv[6]), KD = std::atol(argv[7]); bool silu = std::atoi(argv[8]); long maxlen = std::atol(argv[9]); int iters = argc > 10 ? std::atoi(argv[10]) : 10; bool uniform = argc > 11 && std::atoi(argv[11]);   // uniform: every sequence has `maxlen` tokens
     const long SL = W - 1, SLOTS = B + B / 2 + 3, VD = dim - 2 * KD;
     std::mt19937 rng(23); std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<int32_t> cu(B + 1, 0), cidx(B); std::vector<uint8_t> hinit(B); std::vector<int32_t> perm(SLOTS); std::iota(perm.begin(), perm.end(), 0); std::shuffle(perm.begin(), perm.end(), rng);
-    for (long b = 0; b < B; ++b) { long len = (b % 6 == 1) ? 1 : (b % 6 == 3 ? 2 : (b % 6 == 5 ? SL + 1 : 1 + (long)(rng() % (uint64_t)maxlen))); cu[b + 1] = cu[b] + (int32_t)len; cidx[b] = (b % 7 == 4) ? -1 : perm[b]; hinit[b] = (b % 3 != 0); }
+    for (long b = 0; b < B; ++b) { long len = uniform ? maxlen : (b % 6 == 1) ? 1 : (b % 6 == 3 ? 2 : (b % 6 == 5 ? SL + 1 : 1 + (long)(rng() % (uint64_t)maxlen))); cu[b + 1] = cu[b] + (int32_t)len; cidx[b] = (b % 7 == 4) ? -1 : perm[b]; hinit[b] = (b % 3 != 0); }
     const long T = cu[B];
     std::vector<uint16_t> hx((size_t)T * dim), hw((size_t)dim * W), hb(dim), hs((size_t)SLOTS * dim * SL); for (auto& v : hx) v = f32_to_bf16(nd(rng)); for (auto& v : hw) v = f32_to_bf16(nd(rng) * 0.5f); for (auto& v : hb) v = f32_to_bf16(nd(rng)); for (auto& v : hs) v = f32_to_bf16(nd(rng));
     void *dx, *dw, *db, *dcu, *dci, *dhi, *ds; CK(hipMalloc(&dx, hx.size() * 2)); CK(hipMalloc(&dw, hw.size() * 2)); CK(hipMalloc(&db, dim * 2)); CK(hipMalloc(&dcu, (B + 1) * 4)); CK(hipMalloc(&dci, B * 4)); CK(hipMalloc(&dhi, B + 4)); CK(hipMalloc(&ds, hs.size() * 2 + 64));

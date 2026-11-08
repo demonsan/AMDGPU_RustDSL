@@ -228,7 +228,8 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
     let chunk = b.let_(Op::WorkgroupIdZ);
     let feat = b.bind_i32((ev(tile) * 256 + ev(tid)) << 3);               // first feature of this lane
     let feat_ok = b.let_(Op::CmpLtI32(Opnd::Val(feat), Opnd::Val(dim_v)));
-    let fok = feat_ok_i(b, feat_ok);
+    let fok0 = feat_ok_i(b, feat_ok);
+    let fok = fok0;
     // the sequence: start, length, state slot, has-initial (uniform)
     let one_scalar = |b: &mut FnBuilder, p: ValueId, n_bytes: ValueId, off: ValueId, ty: MemTy| -> ValueId {
         let r = b.buffer_desc_dyn(p, n_bytes);
@@ -253,6 +254,8 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
     let c0 = b.bind_i32(ev(chunk) * TM as i32);                        // first token of this chunk, relative to the sequence start
     let active = b.cmp(CmpPred::Lt, CmpTy::I32, c0, seqlen);
     let seq_ok = b.cmp(CmpPred::Ge, CmpTy::I32, cache_idx, 0);
+    let act_i = sel_i(b, active);
+    let fok = b.bind_i32(ev(fok0) & ev(act_i));                      // blocks past the end of their sequence touch no memory
     let oob = b.c_i32(0x7fff_ff00);
     let bytes_x = b.bind_i32(ev(ntok_v) * ev(dim_v) * 2);
     let bytes_x = b.read_first_lane(bytes_x);
@@ -268,19 +271,25 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
     let sbytes = b.read_first_lane(sbytes);
     let r_s = b.buffer_desc_dyn(ptr[6], sbytes);
     // weights (8 features x W) and bias
-    let wbase = b.bind_i32(ev(feat) * (2 * w) as i32);
+    let wbase0 = b.bind_i32(ev(feat) * (2 * w) as i32);
+    let fon = b.cmp(CmpPred::Ne, CmpTy::I32, fok, 0);
+    let wbase = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(fon), a: Opnd::Val(wbase0), b: Opnd::Val(oob) });
     let mut wv: Vec<ValueId> = Vec::new();                               // wv[f * W + i]
     for c in 0..(8 * w * 2 / 16) {
         let o = b.bind_i32(ev(wbase) + 16 * c as i32);
         let fr = b.buffer_load_c(r_w, Some(Opnd::Val(o)), 0i32, 0, MemTy::B128, CachePolicy::NONE);
         wv.extend_from_slice(&bf16x8_to_f32(b, fr));
     }
-    let bo = b.bind_i32(ev(feat) << 1);
+    let bo0 = b.bind_i32(ev(feat) << 1);
+    let bo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(fon), a: Opnd::Val(bo0), b: Opnd::Val(oob) });
     let bias_fr = b.buffer_load_c(r_b, Some(Opnd::Val(bo)), 0i32, 0, MemTy::B128, CachePolicy::NONE);
     let bias = bf16x8_to_f32(b, bias_fr);
     // the initial state of the 8 features: [f][j] = element f * (W - 1) + j (zero when the sequence has none)
     let st_base = b.bind_i32((ev(cache_idx) * ev(dim_v) + ev(feat)) * (2 * sl) as i32);
-    let st_off = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(seq_ok), a: Opnd::Val(st_base), b: Opnd::Val(oob) });
+    let sk_i = sel_i(b, seq_ok);
+    let st_on = b.bind_i32(ev(sk_i) & ev(fok));
+    let st_on_c = b.cmp(CmpPred::Ne, CmpTy::I32, st_on, 0);
+    let st_off = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(st_on_c), a: Opnd::Val(st_base), b: Opnd::Val(oob) });
     let zero = b.c_f32(0.0);
     let hi_c = b.cmp(CmpPred::Ne, CmpTy::I32, has_init, 0);
     let mut st: Vec<ValueId> = Vec::new();
