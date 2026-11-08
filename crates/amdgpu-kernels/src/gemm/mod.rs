@@ -115,6 +115,8 @@ pub enum MoeStage {
     /// `Down` accumulating straight into bf16 out [M, n_out] (row = token; `buffer_atomic_pk_add_bf16`, the topk routes of a token add up; the
     /// output must be zeroed first): no fp32 intermediate, no sum kernel
     DownAdd,
+    /// `Down` with a bf16 per-route intermediate [M, topk, n_out] (half the bytes; summed in fp32 by `moe_sum_bf16h_k<K>`)
+    DownH,
 }
 
 /// Operand element type of the GEMM.
@@ -476,7 +478,7 @@ fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scale
     let out_rows = Ext::ka(140) * Ext::ka(128);
     match st {
         MoeStage::DownAdd => b.arg_tensor("ptr_c", Ext::ka(140) * n_out * Ext::c(2)),
-        _ => b.arg_tensor("ptr_c", out_rows * n_out * Ext::c(if matches!(st, MoeStage::Up { .. }) { 2 } else { 4 })),
+        _ => b.arg_tensor("ptr_c", out_rows * n_out * Ext::c(if matches!(st, MoeStage::Up { .. } | MoeStage::DownH) { 2 } else { 4 })),
     }
     b.arg_tensor("ptr_sorted_ids", mt.clone() * Ext::c(4 * cta_m));
     b.arg_tensor("ptr_sorted_weights", mt.clone() * Ext::c(4 * cta_m));
@@ -1127,6 +1129,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_blockscale_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_splitk", GemmConfig::a8w8_blockscale().splitk())),
         "gemm_a8w8_rowcol_fp8_128_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128_splitk", GemmConfig::a8w8_rowcol_128().splitk())),
         "gemm_a16w16_bf16_128_splitk" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128_splitk", GemmConfig::a16w16_128().splitk())),
+        n if n.starts_with("moe_sum_bf16h_k") => n["moe_sum_bf16h_k".len()..].parse::<i64>().ok().filter(|k| (1..=16).contains(k)).map(|k| reduce::moe_sum_bf16_x(n, k, true)),
         n if n.starts_with("moe_sum_bf16_k") => n["moe_sum_bf16_k".len()..].parse::<i64>().ok().filter(|k| (1..=16).contains(k)).map(|k| reduce::moe_sum_bf16(n, k)),
         n if n.starts_with("conv2d_bf16_") || n.starts_with("conv3d_bf16_") => {
             // conv{2,3}d_bf16_[t<T>]r<R>s<S>_st<st>_p<pad>_d<dil>[_c128]
@@ -1150,6 +1153,8 @@ pub fn by_name(name: &str) -> Option<Function> {
                 MoeStage::Up { gelu: n.contains("_gelu"), doweight: n.ends_with("_dw") }
             } else if n.ends_with("_add") {
                 MoeStage::DownAdd
+            } else if n.ends_with("_h") {
+                MoeStage::DownH
             } else {
                 MoeStage::Down
             };
@@ -1403,7 +1408,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
                 let tok = b.bind_i32(ev(sid) & 0xff_ffff);
                 match mc.st {
                     MoeStage::Up { .. } => b.bind_i32(ev(tok).min(ev(mc.mtok) - 1)),
-                    MoeStage::Down | MoeStage::DownAdd => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
+                    MoeStage::Down | MoeStage::DownAdd | MoeStage::DownH => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
                 }
             })
         }
@@ -1541,7 +1546,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
                     let tok = b.bind_i32(ev(sid) & 0xff_ffff);
                     let row = match mc.st {
                         MoeStage::Up { .. } => b.bind_i32(ev(tok).min(ev(mc.mtok) - 1)),
-                        MoeStage::Down | MoeStage::DownAdd => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
+                        MoeStage::Down | MoeStage::DownAdd | MoeStage::DownH => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
                     };
                     b.bind_i32(ev(row) * ev(rowb))
                 })
@@ -1726,7 +1731,8 @@ fn moe_epilogue(
     let (rl, cl) = (b.bind_i32(ev(o).lshr(10)), b.bind_i32(ev(o) & 1023));
     let up = matches!(mc.st, MoeStage::Up { .. });
     let add = mc.st == MoeStage::DownAdd;
-    let esz = if up || add { 2 } else { 4 };
+    let half_out = mc.st == MoeStage::DownH;
+    let esz = if up || add || half_out { 2 } else { 4 };
     let rows_c = if add { b.c_i32(1) } else { mc.topk };
     let rsrc_c = { let n = b.bind_i32(ev(mc.mtok) * ev(rows_c) * ev(mc.nout) * esz); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_c, n) };
     let so = { let v = b.bind_i32(ev(mc.row0) << 2); b.read_first_lane(v) };
@@ -1822,7 +1828,13 @@ fn moe_epilogue(
             }
         } else {
             // DownAdd: the token's row of out [M, n_out] bf16 (pairs added with buffer_atomic_pk_add_bf16)
-            let vr0 = if add { b.bind_i32((ev(tok) * ev(mc.nout) + ev(col0)) << 1) } else { b.bind_i32((ev(orow) * ev(mc.nout) + ev(col0)) << 2) };
+            let vr0 = if add {
+                b.bind_i32((ev(tok) * ev(mc.nout) + ev(col0)) << 1)
+            } else if half_out {
+                b.bind_i32((ev(orow) * ev(mc.nout) + ev(col0)) << 1)
+            } else {
+                b.bind_i32((ev(orow) * ev(mc.nout) + ev(col0)) << 2)
+            };
             let vrow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(vr0), b: Opnd::Val(big) });
             for j in 0..nn {
                 let col = b.bind_i32(ev(col0) + 16 * j as i32);
@@ -1834,7 +1846,14 @@ fn moe_epilogue(
                         v[k] = b.mul_f32(v[k], s);
                     }
                     let y = b.mul_f32(v[k], sw);
-                    v[k] = if add { y } else { b.bitcast_i32(y) };
+                    v[k] = if add || half_out { y } else { b.bitcast_i32(y) };
+                }
+                if half_out {
+                    let w0 = b.cvt_pk_bf16_f32(v[0], v[1]);
+                    let w1 = b.cvt_pk_bf16_f32(v[2], v[3]);
+                    let f2 = b.frag2(w0, w1);
+                    b.buffer_store_b64(rsrc_c, vrow, c0, (32 * j) as u32, f2);
+                    continue;
                 }
                 if add {
                     for hpair in 0..2usize {

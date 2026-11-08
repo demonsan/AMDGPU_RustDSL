@@ -140,7 +140,10 @@ int main(int argc, char** argv) {
     auto load = [&](const std::string& name) { hipModule_t m; hipFunction_t f; HC(hipModuleLoad(&m, (dir + "/" + name + ".co").c_str())); HC(hipModuleGetFunction(&f, m, name.c_str())); return f; };
     // ADD=1: stage 2 accumulates into the zeroed bf16 output with pk_add_bf16 atomics (no fp32 intermediate, no sum kernel)
     const bool addm = envi("ADD", 0) != 0;
-    hipFunction_t f1 = load("gemm_moe1_" + dt + "_" + act), f2 = load("gemm_moe2_" + dt + (addm ? "_add" : "")), fs = addm ? nullptr : load("moe_sum_bf16_k" + std::to_string(TK));
+    // HALF=1: bf16 per-route intermediate (gemm_moe2_<dt>_h + moe_sum_bf16h_k<K>)
+    const bool hm = envi("HALF", 0) != 0;
+    hipFunction_t f1 = load("gemm_moe1_" + dt + "_" + act), f2 = load("gemm_moe2_" + dt + (addm ? "_add" : hm ? "_h" : "")),
+                  fs = addm ? nullptr : load((hm ? "moe_sum_bf16h_k" : "moe_sum_bf16_k") + std::to_string(TK));
     // fp8: the stage-1 output re-quantized on the GPU between the stages (dynamic per token / per 128-group): rows::quant (co_dir)
     hipFunction_t fq = nullptr;
     if (fp8) fq = load((bs ? "quant_group128_bf16_fp8_n" : "quant_token_bf16_fp8_n") + std::to_string(I));
