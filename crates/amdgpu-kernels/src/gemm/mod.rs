@@ -81,6 +81,11 @@ struct ConvRt {
     zero: ValueId,
 }
 
+/// `div_rt` for other kernels.
+pub(crate) fn div_rt_pub(b: &mut FnBuilder, n: ValueId, d: ValueId) -> ValueId {
+    div_rt(b, n, d)
+}
+
 /// q = n / d (both >= 0, n < 2^22) by a float reciprocal and one integer correction step.
 fn div_rt(b: &mut FnBuilder, n: ValueId, d: ValueId) -> ValueId {
     // (v_cvt_f32_i32 = CvtF32I32: int -> float; v_cvt_i32_f32 = CvtI32F32: float -> int)

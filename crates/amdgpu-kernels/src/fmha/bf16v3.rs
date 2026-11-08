@@ -315,9 +315,29 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     let (s_q, q_seqs, q_hs, q_bs, gqa) = (ki(&mut b, 6), ki(&mut b, 7), ki(&mut b, 9), ki(&mut b, 10), ki(&mut b, 11));
     let (k_seqs, k_hs, k_bs, lse_on, s_kv) = (ki(&mut b, 12), ki(&mut b, 13), ki(&mut b, 14), ki(&mut b, 16), ki(&mut b, 17));
     let (v_seqs, v_hs, v_bs, o_seqs, o_hs, o_bs, lse_hs) = (ki(&mut b, 21), ki(&mut b, 22), ki(&mut b, 23), ki(&mut b, 24), ki(&mut b, 25), ki(&mut b, 26), ki(&mut b, 29));
-    let qt = b.let_(Op::WorkgroupIdX);
-    let h = b.let_(Op::WorkgroupIdY);
-    let bat = b.let_(Op::WorkgroupIdZ);
+    let (qt0, h0, bat0) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
+    // XCD order: workgroups are dispatched round robin over the 8 XCDs (linear id % 8); give each XCD a contiguous range of the
+    // (q tile, head, batch) space (q tile fastest) so the CTAs sharing a head's K / V sit behind one L2. Identity unless the count is a
+    // multiple of 8.
+    let (qt, h, bat) = if std::env::var("EXP_NOXCD").is_ok() { (qt0, h0, bat0) } else {
+        let nx = { let v = b.bind_i32((ev(s_q) + (QR - 1)).lshr(8)); b.read_first_lane(v) };
+        let hq = b.let_(Op::KernargI32 { offset: 320 });
+        let nxh = b.bind_i32(ev(nx) * ev(hq));
+        // within a batch (the batch count is not in the ABI): with nx H a multiple of 8 the linear id % 8 (the XCD) is (qt + nx h) % 8
+        let lin = b.bind_i32(ev(qt0) + ev(nx) * ev(h0));
+        let ok = b.bind_cond((ev(nxh) & 7).eq(0));
+        let per = b.bind_i32(ev(nxh).lshr(3));
+        let nl = b.bind_i32((ev(lin) & 7) * ev(per) + ev(lin).lshr(3));
+        let nl = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(nl), b: Opnd::Val(lin) });
+        let nl = b.read_first_lane(nl);
+        let hy = crate::gemm::div_rt_pub(&mut b, nl, nx);
+        let qx = b.bind_i32(ev(nl) - ev(hy) * ev(nx));
+        let (qx, hy) = (b.read_first_lane(qx), b.read_first_lane(hy));
+        b.assume_trusted(qx, Ext::c(0), Ext::ka(96).ceil_div(QR as i64) - Ext::c(1), "XCD order: a permutation of the (q tile, head) grid");
+        b.assume_trusted(hy, Ext::c(0), Ext::ka(320) - Ext::c(1), "XCD order: a permutation of the (q tile, head) grid");
+        let bz = bat0;
+        (qx, hy, bz)
+    };
     let lane = Lane::new(&mut b);
     let roles = Roles::split(&mut b, &lane, 4);
     let hkv = gqa_kv_head(&mut b, h, gqa, "HK");
