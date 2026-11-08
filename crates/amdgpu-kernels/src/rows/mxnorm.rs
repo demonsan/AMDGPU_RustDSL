@@ -1,5 +1,5 @@
 //! Fused RMSNorm + MXFP4 quantisation (aiter `fused_rms_mxfp4_quant`): `rmsnorm_quant_mxfp4_bf16_k<K>` = `quant_mxfp4_bf16_k<K>` (kernel-opt's rule, layouts and conversion, `rows/mxquant.rs`) applied to
-//! `y = x * rsqrt(mean(x^2) + eps) * gamma` without the bf16 round trip of the normalised row.
+//! `y = x * rsqrt(mean(x^2) + eps) * gamma` without the bf16 round trip of the normalised row. The group step (amax rule, E8M0, fp4 conversion) is `mxquant::mxfp4_group`, shared, not copied.
 //!
 //! One block (256 threads = 4 waves) per 16-row block and the WHOLE row (the wave's lane `16 g + r` owns row `16 rb + r` and the groups `{16 p + g + 4 j}` of every tile pair `p = wave + 4 i`, as in
 //! `quant_mxfp4_bf16_k`): pass A sums the squares of the lane's groups (a runtime loop, 32 elements per step), the four lanes of a row (`l ^ 16`, `l ^ 32`) combine through two lane swaps, the four
@@ -7,8 +7,9 @@
 //! `v_cvt_scalef32_pk_fp4_f32`, the SHUFFLED a4w4 scale layout). K % 512 == 0, 512 <= K <= 16384, M % 16 == 0.
 //! ABI: x @0 (bf16 [M][K]), gamma @8 (bf16 [K]), q @16 (fp4 [M][K / 2]), scale @24 (e8m0, shuffled [M / 16][K / 512][64][4]), M @32 (i32), eps @36 (f32). Grid M / 16.
 
-use amdgpu_dsl::{CompileProfile, CmpPred, CmpTy, CvtOp, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{abs_f32, bf16x8_to_f32, rsqrt_f32};
+use super::mxquant::mxfp4_group;
+use amdgpu_dsl::{CompileProfile, CmpPred, CmpTy, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
+use amdgpu_tile::prims::{bf16x8_to_f32, rsqrt_f32};
 use amdgpu_tile::{ev, Lane};
 
 pub fn by_name(name: &str) -> Option<Function> {
@@ -150,28 +151,8 @@ fn rmsnorm_mxfp4(name: &str, k: i64) -> Function {
                     ys.push(b.mul_f32(t, gv[q]));
                 }
             }
-            let mut amax = abs_f32(b, ys[0]);
-            for y in &ys[1..] {
-                let a = abs_f32(b, *y);
-                amax = b.max_f32(amax, a);
-            }
-            let ab = b.bitcast_i32(amax);
-            let rnd = b.bind_i32((ev(ab) + 0x20_0000) & (0xff80_0000u32 as i32));
-            let e = b.bind_i32((ev(rnd).lshr(23) & 0xff) - 2);
-            let e = b.bind_i32(ev(e).max(0).min(254));
+            let (e, f4) = mxfp4_group(b, &ys);
             sbytes.push(e);
-            let sbits = b.bind_i32(ev(e).max(1) << 23);
-            let sf = b.bitcast_f32(sbits);
-            let mut words: Vec<ValueId> = Vec::with_capacity(4);
-            for w in 0..4usize {
-                let mut acc = b.c_i32(0);
-                for byte in 0..4usize {
-                    let n = 8 * w + 2 * byte;
-                    acc = b.cvt(CvtOp::ScalePkFp4F32, &[Opnd::Val(ys[n]), Opnd::Val(ys[n + 1]), Opnd::Val(sf), Opnd::Val(acc)], byte as u8);
-                }
-                words.push(acc);
-            }
-            let f4 = b.frag4(words[0], words[1], words[2], words[3]);
             let qo = b.bind_i32(ev(row) * (k as i32 / 2) + (ev(grp) << 4));
             b.buffer_store_b128(r_q, qo, c0, 0, f4);
         }
