@@ -573,7 +573,8 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     }
     }
     let mut f = b.finish();
-    if vs_policy {
+    // the scheduler tokens also on the causal Gemm-profile build (+2 % at 8192², +1 % at 2048²)
+    if !split {
         f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
     }
     f
