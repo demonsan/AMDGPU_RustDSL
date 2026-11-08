@@ -170,6 +170,9 @@ impl FromIr for Op {
             "LoadLdsD16" => { v.expect_struct("LoadLdsD16")?; Ok(Op::LoadLdsD16 { addr: FromIr::from_ir(v.field("addr")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
             "LoadLds2" => { v.expect_struct("LoadLds2")?; Ok(Op::LoadLds2 { addr: FromIr::from_ir(v.field("addr")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
             "LoadLdsTrB16" => { v.expect_struct("LoadLdsTrB16")?; Ok(Op::LoadLdsTrB16 { addr: FromIr::from_ir(v.field("addr")?)? }) }
+            "AnyLane" => { v.expect_tuple("AnyLane", 1)?; Ok(Op::AnyLane(FromIr::from_ir(v.item(0)?)?)) }
+            "FragSlice" => { v.expect_struct("FragSlice")?; Ok(Op::FragSlice { frag: FromIr::from_ir(v.field("frag")?)?, start: FromIr::from_ir(v.field("start")?)?, n: FromIr::from_ir(v.field("n")?)? }) }
+            "FragCat" => { v.expect_struct("FragCat")?; Ok(Op::FragCat { parts: FromIr::from_ir(v.field("parts")?)?, dwords: FromIr::from_ir(v.field("dwords")?)? }) }
             "AtomicLds" => { v.expect_struct("AtomicLds")?; Ok(Op::AtomicLds { op: FromIr::from_ir(v.field("op")?)?, addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
             "AtomicGlobal" => { v.expect_struct("AtomicGlobal")?; Ok(Op::AtomicGlobal { op: FromIr::from_ir(v.field("op")?)?, base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
             "ReadLane" => { v.expect_struct("ReadLane")?; Ok(Op::ReadLane { x: FromIr::from_ir(v.field("x")?)?, lane: FromIr::from_ir(v.field("lane")?)? }) }
@@ -284,6 +287,9 @@ impl IrIds for Op {
             Op::LoadLdsD16 { addr, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
             Op::LoadLds2 { addr, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
             Op::LoadLdsTrB16 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
+            Op::AnyLane(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
+            Op::FragSlice { frag, start, n } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*start), fv, fr); IrIds::ids(&mut (*n), fv, fr); }
+            Op::FragCat { parts, dwords } => { IrIds::ids(&mut (*parts), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
             Op::AtomicLds { op, addr, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
             Op::AtomicGlobal { op, base, byte_off, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
             Op::ReadLane { x, lane } => { IrIds::ids(&mut (*x), fv, fr); IrIds::ids(&mut (*lane), fv, fr); }

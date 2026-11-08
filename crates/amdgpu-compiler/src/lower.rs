@@ -90,6 +90,15 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
             amdgpu_dsl::print::print_dsl(f)
         ));
     }
+    // `any_lane` markers carry no code (the wave-level branch is the semantics): lower the function with them substituted away, so marking a
+    // condition never changes the generated code
+    let stripped;
+    let f = if f.stmts().iter().any(|s| matches!(s, Stmt::Let { op: Op::AnyLane(_), .. })) {
+        stripped = strip_any_lane(f);
+        &stripped
+    } else {
+        f
+    };
     let mut lw = Lowerer::new(f);
     if opt_on("scalarize") {
         let (u, v) = uniform_analysis(f);
@@ -199,6 +208,8 @@ struct Lowerer {
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
     /// root register views of loop variables that must be copied at their definition (a use would otherwise see a later write of the variable: `facts::stale_view_roots`)
     view_copy: std::collections::HashSet<ValueId>,
+    /// every value some statement reads (precise: through the generated id visitor)
+    read_values: std::collections::HashSet<ValueId>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
     /// AGPR requests from the IR (resolved to vregs in inish).
@@ -326,6 +337,7 @@ impl Lowerer {
             },
             alias_cache: HashMap::new(),
             view_copy: amdgpu_dsl::facts::stale_view_roots(f),
+            read_values: f.stmts().iter().flat_map(amdgpu_dsl::facts::stmt_value_uses).collect(),
             else_started: HashSet::new(),
             agpr_marks: f.agpr.clone(),
             reg_plan: f.reg_plan.clone(),
@@ -1398,9 +1410,10 @@ impl Lowerer {
         if self.mir.vreg_class(dst) != class {
             return Err(format!("copy_reg: class mismatch {:?} -> {:?}", class, self.mir.vreg_class(dst)));
         }
+        // `sub_alias`: correct also when `dst` / `src` are themselves sub-tuple aliases (their offset is kept)
         for i in 0..width {
-            let s = self.alias_vreg(src, i as u8, RClass::V1);
-            let d = self.alias_vreg(dst, i as u8, RClass::V1);
+            let s = self.sub_alias(src, i as u8, RClass::V1);
+            let d = self.sub_alias(dst, i as u8, RClass::V1);
             self.push(MInst::new(MOp::VMovB32).def(d).srcreg(s));
         }
         Ok(())
@@ -1948,13 +1961,19 @@ impl Lowerer {
                 }
                 Stmt::VarMfma { var, kind, a, b, scale: _, zero } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
-                    let (mop, zmop) = mfma_mop(*kind)?;
-                    let ra = self.as_v4(*a)?;
-                    let rb = self.as_v4(*b)?;
+                    let (mop, zmop, imm) = match plain_f8f6f4_mop(*kind) {
+                        Some(x) => x,
+                        None => {
+                            let (m, z) = mfma_mop(*kind)?;
+                            (m, z, 0)
+                        }
+                    };
+                    let ra = self.mma_operand(*kind, kind.a, *a)?;
+                    let rb = self.mma_operand(*kind, kind.b, *b)?;
                     if *zero {
-                        self.push(MInst::new(zmop).def(v).srcreg(ra).srcreg(rb));
+                        self.push(MInst::new(zmop).def(v).srcreg(ra).srcreg(rb).imm(imm));
                     } else {
-                        self.push(MInst::new(mop).def(v).srcreg(ra).srcreg(rb).srcreg(v));
+                        self.push(MInst::new(mop).def(v).srcreg(ra).srcreg(rb).srcreg(v).imm(imm));
                     }
                 }
                 Stmt::AtomicLdsNoRet { op, addr, value } => {
@@ -2209,6 +2228,18 @@ impl Lowerer {
     }
 
     fn lower_op(&mut self, dst: ValueId, op: &Op) -> Result<(), String> {
+        // A load whose result is never used is not emitted: its destination register would be handed to another value while the load is still
+        // in flight, and the load's late write would clobber that value (a physical WAW the in-order wait accounting cannot see).
+        let pure_load = matches!(
+            op,
+            Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::BufferLoad { .. } | Op::BufferLoadB128x2 { .. }
+                | Op::LoadLdsB32 { .. } | Op::LoadLdsB64 { .. } | Op::LoadLdsB128 { .. } | Op::LoadLdsB128x2 { .. } | Op::LoadLdsTrB8 { .. }
+                | Op::LoadLdsTr4B8 { .. } | Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } | Op::LoadLdsN { .. }
+                | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. }
+        );
+        if pure_load && !self.read_values.contains(&dst) {
+            return Ok(());
+        }
         match op {
             Op::ConstI32(v) => {
                 let r = self.const_vreg(*v as i64);
@@ -2292,6 +2323,20 @@ impl Lowerer {
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
+            // a returning atomic whose result is unused: the no-return form (a dead destination would be reused by the allocator while the
+            // atomic is still in flight, and its late write would clobber the new value)
+            Op::AtomicLds { op, addr, value } if !self.read_values.contains(&dst) => {
+                let (a, off) = self.lds_addr(*addr)?;
+                let v = self.as_v1(*value)?;
+                self.touch(&[Src::Reg(v)]);
+                self.push(MInst::new(lds_atomic_mop(*op, false)).srcreg(a).srcreg(v).imm(off));
+            }
+            Op::AtomicGlobal { op, base, byte_off, value } if !self.read_values.contains(&dst) => {
+                let rb = self.as_v2(*base)?;
+                let v = self.as_v1(*value)?;
+                self.touch(&[Src::Reg(v)]);
+                self.push(MInst::new(global_atomic_mop(*op, false)).srcreg(rb).srcreg(v).imm(*byte_off as i64));
+            }
             Op::AtomicLds { op, addr, value } => {
                 let (a, off) = self.lds_addr(*addr)?;
                 let v = self.as_v1(*value)?;
@@ -2308,6 +2353,69 @@ impl Lowerer {
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(global_atomic_mop(*op, true)).def(d).srcreg(rb).srcreg(v).imm(*byte_off as i64));
                 self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::AnyLane(c) => {
+                let r = self.as_v1(*c)?;
+                self.val.insert(dst, r);
+            }
+            Op::FragSlice { frag, start, n } => {
+                let f = match frag {
+                    Opnd::Val(v) => {
+                        let r = *self.val.get(v).ok_or_else(|| format!("value v{v} not lowered"))?;
+                        self.touch(&[Src::Reg(r)]);
+                        r
+                    }
+                    Opnd::Var(v) => {
+                        let r = *self.vars.get(v.0 as usize).ok_or("var not lowered")?;
+                        self.touch(&[Src::Reg(r)]);
+                        r
+                    }
+                    _ => return Err("frag_slice of a constant".into()),
+                };
+                let cls = match n {
+                    1 => RClass::V1,
+                    2 => RClass::V2,
+                    4 => RClass::V4,
+                    _ => RClass::V8,
+                };
+                let d = self.sub_alias(f, *start, cls);
+                self.val.insert(dst, d);
+            }
+            Op::FragCat { parts, .. } => {
+                let mut regs = Vec::new();
+                let mut total = 0u8;
+                for p in parts {
+                    let r = match p {
+                        Opnd::Val(v) if self.val.get(v).map_or(false, |r| self.mir.vreg_class(*r).dwords() > 1) => self.val[v],
+                        Opnd::Var(v) if self.vars.get(v.0 as usize).map_or(false, |r| self.mir.vreg_class(*r).dwords() > 1) => self.vars[v.0 as usize],
+                        o => self.as_v1(*o)?,
+                    };
+                    self.touch(&[Src::Reg(r)]);
+                    let w = self.mir.vreg_class(r).dwords() as u8;
+                    regs.push((r, total, w));
+                    total += w;
+                }
+                let cls = match total {
+                    2 => RClass::V2,
+                    4 => RClass::V4,
+                    8 => RClass::V8,
+                    16 => RClass::V16,
+                    n => return Err(format!("frag_cat of {n} dwords")),
+                };
+                let d = self.new_vreg(cls);
+                // per dword through `sub_alias` (aliases of aliases keep their offsets; `copy_reg` into an alias tuple would not)
+                for (r, off, w) in regs {
+                    for j in 0..w {
+                        let s = if w == 1 { r } else { self.sub_alias(r, j, RClass::V1) };
+                        let dd = self.sub_alias(d, off + j, RClass::V1);
+                        if self.mir.vreg_class(s) == RClass::S1 {
+                            self.push(MInst::new(MOp::VMovFromS).def(dd).srcreg(s));
+                        } else {
+                            self.push(MInst::new(MOp::VMovB32).def(dd).srcreg(s));
+                        }
+                    }
+                }
                 self.val.insert(dst, d);
             }
             Op::ReadLane { x, lane } => {
@@ -2511,9 +2619,15 @@ impl Lowerer {
                 }
             }
             Op::Mfma { kind, a, b, c, scale: _ } => {
-                let (mop, zmop) = mfma_mop(*kind)?;
-                let ra = self.as_v4(*a)?;
-                let rb = self.as_v4(*b)?;
+                let (mop, zmop, imm) = match plain_f8f6f4_mop(*kind) {
+                    Some(x) => x,
+                    None => {
+                        let (m, z) = mfma_mop(*kind)?;
+                        (m, z, 0)
+                    }
+                };
+                let ra = self.mma_operand(*kind, kind.a, *a)?;
+                let rb = self.mma_operand(*kind, kind.b, *b)?;
                 let n = kind.acc_dwords();
                 let cls = if n == 4 { RClass::V4 } else { RClass::V16 };
                 match c {
@@ -2527,12 +2641,12 @@ impl Lowerer {
                             self.copy_reg(d, rc)?;
                             d
                         };
-                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(d));
+                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(d).imm(imm));
                         self.val.insert(dst, d);
                     }
                     _ => {
                         let d = self.new_vreg(cls);
-                        self.push(MInst::new(zmop).def(d).srcreg(ra).srcreg(rb));
+                        self.push(MInst::new(zmop).def(d).srcreg(ra).srcreg(rb).imm(imm));
                         self.val.insert(dst, d);
                     }
                 }
@@ -4474,5 +4588,87 @@ fn global_atomic_mop(o: amdgpu_dsl::AtomicOp, rtn: bool) -> MOp {
         (A::IncU32, true) => MOp::GlobalAtomicIncU32Rtn,
         (A::AddF32, false) => MOp::GlobalAtomicAddF32,
         (A::AddF32, true) => MOp::GlobalAtomicAddF32Rtn,
+    }
+}
+
+/// (C form, zero-C form, imm = cbsz << 8 | blgp << 12) of an UNSCALED f8f6f4 MFMA kind (None for the other kinds).
+fn plain_f8f6f4_mop(k: amdgpu_dsl::MmaKind) -> Option<(MOp, MOp, i64)> {
+    use amdgpu_dsl::{MmaKind, MmaShape as S};
+    if k.scaled || !matches!(k.shape, S::M16N16K128 | S::M32N32K64) {
+        return None;
+    }
+    let (ca, cb) = (MmaKind::f8f6f4_code(k.a)?, MmaKind::f8f6f4_code(k.b)?);
+    let imm = ((ca as i64) << 8) | ((cb as i64) << 12);
+    let m = |c: MOp, z: MOp| Some((c, z, imm));
+    match (k.shape, k.operand_dwords(k.a), k.operand_dwords(k.b)) {
+        (S::M16N16K128, 4, 4) => m(MOp::VMfmaPlain16x16x128A4B4, MOp::VMfmaPlain16x16x128A4B4Z),
+        (S::M16N16K128, 4, 6) => m(MOp::VMfmaPlain16x16x128A4B6, MOp::VMfmaPlain16x16x128A4B6Z),
+        (S::M16N16K128, 4, 8) => m(MOp::VMfmaPlain16x16x128A4B8, MOp::VMfmaPlain16x16x128A4B8Z),
+        (S::M16N16K128, 6, 4) => m(MOp::VMfmaPlain16x16x128A6B4, MOp::VMfmaPlain16x16x128A6B4Z),
+        (S::M16N16K128, 6, 6) => m(MOp::VMfmaPlain16x16x128A6B6, MOp::VMfmaPlain16x16x128A6B6Z),
+        (S::M16N16K128, 6, 8) => m(MOp::VMfmaPlain16x16x128A6B8, MOp::VMfmaPlain16x16x128A6B8Z),
+        (S::M16N16K128, 8, 4) => m(MOp::VMfmaPlain16x16x128A8B4, MOp::VMfmaPlain16x16x128A8B4Z),
+        (S::M16N16K128, 8, 6) => m(MOp::VMfmaPlain16x16x128A8B6, MOp::VMfmaPlain16x16x128A8B6Z),
+        (S::M16N16K128, 8, 8) => m(MOp::VMfmaPlain16x16x128A8B8, MOp::VMfmaPlain16x16x128A8B8Z),
+        (S::M32N32K64, 4, 4) => m(MOp::VMfmaPlain32x32x64A4B4, MOp::VMfmaPlain32x32x64A4B4Z),
+        (S::M32N32K64, 4, 6) => m(MOp::VMfmaPlain32x32x64A4B6, MOp::VMfmaPlain32x32x64A4B6Z),
+        (S::M32N32K64, 4, 8) => m(MOp::VMfmaPlain32x32x64A4B8, MOp::VMfmaPlain32x32x64A4B8Z),
+        (S::M32N32K64, 6, 4) => m(MOp::VMfmaPlain32x32x64A6B4, MOp::VMfmaPlain32x32x64A6B4Z),
+        (S::M32N32K64, 6, 6) => m(MOp::VMfmaPlain32x32x64A6B6, MOp::VMfmaPlain32x32x64A6B6Z),
+        (S::M32N32K64, 6, 8) => m(MOp::VMfmaPlain32x32x64A6B8, MOp::VMfmaPlain32x32x64A6B8Z),
+        (S::M32N32K64, 8, 4) => m(MOp::VMfmaPlain32x32x64A8B4, MOp::VMfmaPlain32x32x64A8B4Z),
+        (S::M32N32K64, 8, 6) => m(MOp::VMfmaPlain32x32x64A8B6, MOp::VMfmaPlain32x32x64A8B6Z),
+        (S::M32N32K64, 8, 8) => m(MOp::VMfmaPlain32x32x64A8B8, MOp::VMfmaPlain32x32x64A8B8Z),
+        _ => None,
+    }
+}
+
+/// `f` with every branch / select / not operand that is an `AnyLane(c)` value replaced by `c`.
+fn strip_any_lane(f: &Function) -> Function {
+    use amdgpu_dsl::ir_text::IrIds;
+    let mut map: HashMap<ValueId, Opnd> = HashMap::new();
+    for s in f.stmts() {
+        if let Stmt::Let { dst, op: Op::AnyLane(c) } = s {
+            let c = match c {
+                Opnd::Val(v) => map.get(v).copied().unwrap_or(*c),
+                o => *o,
+            };
+            map.insert(*dst, c);
+        }
+    }
+    let mut g = f.clone();
+    g.edit_stmts(|stmts| {
+        // the marker statements stay (lowered as an alias of their condition, no code) for any other use
+        for s in stmts.iter_mut() {
+            // substitute operands: only Val ids that are markers (their replacement may itself be a Val)
+            let mut todo: Vec<(ValueId, Opnd)> = Vec::new();
+            s.ids(&mut |v| {
+                if let Some(r) = map.get(v) {
+                    todo.push((*v, *r));
+                }
+            }, &mut |_| {});
+            if todo.is_empty() {
+                continue;
+            }
+            *s = subst_stmt(s, &map);
+        }
+    });
+    g
+}
+
+/// Replace `Opnd::Val(v)` operands of a statement by `map[v]` (markers only).
+fn subst_stmt(s: &Stmt, map: &HashMap<ValueId, Opnd>) -> Stmt {
+    let sub = |o: &Opnd| -> Opnd {
+        match o {
+            Opnd::Val(v) => map.get(v).copied().unwrap_or(*o),
+            _ => *o,
+        }
+    };
+    match s {
+        Stmt::BeginIf { cond } => Stmt::BeginIf { cond: sub(cond) },
+        Stmt::BreakIf { cond } => Stmt::BreakIf { cond: sub(cond) },
+        Stmt::Let { dst, op: Op::Select { ty, cond, a, b } } => Stmt::Let { dst: *dst, op: Op::Select { ty: *ty, cond: sub(cond), a: sub(a), b: sub(b) } },
+        Stmt::Let { dst, op: Op::NotI1(a) } => Stmt::Let { dst: *dst, op: Op::NotI1(sub(a)) },
+        other => other.clone(),
     }
 }

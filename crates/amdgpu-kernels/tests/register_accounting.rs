@@ -195,7 +195,7 @@ fn read_write(m: &str, ops: &[String]) -> (Vec<Reg>, Vec<Reg>) {
     }
     if m.starts_with("v_mfma") || m.starts_with("v_smfmac") {
         // D is in place with C; if C is the literal 0 (zero-accumulator form) D is not read.
-        let zero_acc = ops.iter().any(|o| o.trim() == "0");
+        let zero_acc = ops.iter().any(|o| o.split_whitespace().next() == Some("0")); // "0" possibly followed by modifiers (cbsz:..)
         let defs = ops.first().map(|o| scan_regs(o)).unwrap_or_default();
         let mut uses: Vec<Reg> = Vec::new();
         for (i, o) in ops.iter().enumerate() {

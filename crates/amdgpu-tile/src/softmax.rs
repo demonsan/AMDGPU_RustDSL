@@ -146,7 +146,11 @@ impl OnlineSoftmax {
         if write_bias {
             b.set_var(bias2, nb);
         }
-        b.begin_if(Opnd::Val(grow));
+        {
+            // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+            let any = b.any_lane(grow);
+            b.begin_if(Opnd::Val(any));
+        }
         {
             let dupd = b.frag2_dup(delta);
             for a in &s.accs {
@@ -175,7 +179,11 @@ impl OnlineSoftmax {
         }
         let mt = row_max(b, &flat);
         let grow = b.cmp_lt_f32(self.thr, mt);
-        b.begin_if(Opnd::Val(grow));
+        {
+            // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
+            let any = b.any_lane(grow);
+            b.begin_if(Opnd::Val(any));
+        }
         {
             let w_old_u = b.frag2_lane(Opnd::Var(bias2), 0);
             let w_old = b.bitcast_i32(w_old_u);

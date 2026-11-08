@@ -211,7 +211,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::Un(o, _) if o.trans() => ResClass::Trans,
         Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
         Op::Mfma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
-        Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } | Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } => ResClass::Valu,
+        Op::AnyLane(_) | Op::FragSlice { .. } | Op::FragCat { .. } | Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } | Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } => ResClass::Valu,
         // lane permutes through the LDS crossbar: lgkm-counted, no LDS memory
         Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => ResClass::LdsRead,
         Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => {
@@ -550,6 +550,7 @@ impl Captured {
 pub fn view_source(op: &Op) -> Option<Opnd> {
     match op {
         Op::VarSlice8 { var, .. } | Op::VarSlice4 { var, .. } => Some(Opnd::Var(*var)),
+        Op::FragSlice { frag, .. } => Some(*frag),
         Op::Frag2Lane { frag, .. } | Op::Frag4Lane { frag, .. } | Op::Frag16Lane { frag, .. } => Some(*frag),
         Op::BitcastF32(a) | Op::BitcastI32(a) => Some(*a),
         _ => None,
