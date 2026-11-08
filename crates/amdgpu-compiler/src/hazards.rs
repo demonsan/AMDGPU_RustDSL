@@ -50,6 +50,16 @@ fn valu_writer_delay(op: MOp) -> Option<usize> {
     crate::op_attrs::attrs(op).valu_writer_delay
 }
 
+/// A conversion writing a selected part of its destination (op_sel dst select: the high half / a byte) - the next consumer of the
+/// register needs one wait state (gfx950 cvt-scale forwarding; LLVM inserts `s_nop 0`, measured with probe_fp4_chain).
+fn cvt_dst_sel_write(inst: &MInst) -> bool {
+    match inst.op {
+        MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi => true,
+        MOp::VCvtScalePkFp8F32 | MOp::VCvtScalePkBf8F32 | MOp::VCvtScalePkFp4F32 | MOp::VCvtPkBf8F32 => inst.imm != 0,
+        _ => false,
+    }
+}
+
 fn reads_valu_hazard_operands(op: MOp) -> bool {
     crate::op_attrs::attrs(op).reads_valu_hazard
 }
@@ -236,7 +246,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                         if let Some(d) = x.dst {
                             aw.remove(&canon(d));
                             hiw.remove(&canon(d));
-                            if matches!(x.op, MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi) {
+                            if cvt_dst_sel_write(x) {
                                 hiw.insert(canon(d), cycle + 2);
                             }
                             if x.op == MOp::VAccvgprRead {
@@ -279,7 +289,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 vw.remove(&canon(d));
                 aw.remove(&canon(d));
                 hiw.remove(&canon(d));
-                if matches!(inst.op, MOp::VCvtPkFp8Hi | MOp::VCvtPkFp8F32Hi) {
+                if cvt_dst_sel_write(inst) {
                     hiw.insert(canon(d), cycle + 2);
                 }
                 if inst.op == MOp::VAccvgprRead {
