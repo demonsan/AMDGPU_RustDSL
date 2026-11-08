@@ -354,23 +354,31 @@ int main(int argc, char** argv) {
         hipModule_t vm; hipFunction_t vf;
         HC(hipModuleLoad(&vm, vco));
         HC(hipModuleGetFunction(&vf, vm, getenv("VENDOR1_KN")));
+        // blockscale: fp8 output [M, topk, I] followed by its fp32 scales (the vendor layout); X scale transposed [D / 128, M]
         void* dV;
-        HC(hipMalloc(&dV, (size_t)M * TK * I * 2));
-        HC(hipMemset(dV, 0, (size_t)M * TK * I * 2));
+        size_t vbytes = bs ? (size_t)(M + (4 * M + 127) / 128) * TK * I : (size_t)M * TK * I * 2;
+        HC(hipMalloc(&dV, vbytes));
+        HC(hipMemset(dV, 0, vbytes));
+        void* dxsv = dxs;
+        if (bs) {
+            std::vector<float> xt(xs.size());
+            for (int t = 0; t < M; t++) for (int g = 0; g < D / 128; g++) xt[(size_t)g * M + t] = xs[(size_t)t * (D / 128) + g];
+            dxsv = dev(xt);
+        }
         std::vector<uint8_t> va(368, 0);
         auto P = [&](int o, const void* p) { memcpy(&va[o], &p, 8); };
         auto U = [&](int o, int v) { memcpy(&va[o], &v, 4); };
-        P(0, dV); P(16, dX); P(32, dW1v); P(48, dnv); P(64, dxs); P(80, dw1sv); P(96, nullptr); P(112, dsid); P(128, dseid);
-        U(144, D); U(160, I); U(176, M); U(192, E); U(208, D); U(224, D); U(240, TK * I * 2); U(256, D * 2 * I); U(272, 2 * I * 4); U(288, I * 4);
+        P(0, dV); P(16, dX); P(32, dW1v); P(48, dnv); P(64, dxsv); P(80, dw1sv); P(96, nullptr); P(112, dsid); P(128, dseid);
+        U(144, D); U(160, I); U(176, M); U(192, E); U(208, D); U(224, D); U(240, TK * I * (bs ? 1 : 2)); U(256, D * 2 * I); U(272, bs ? 2 * I / 128 * (D / 128) * 4 : 2 * I * 4); U(288, I * 4);
         U(304, TK); U(320, 0); U(336, gelu ? 1 : 0); P(352, nullptr);
         int tn = envi("VENDOR1_TN", 128);
         launch(vf, va, I / tn, nblk);
         HC(hipDeviceSynchronize());
         std::vector<uint16_t> vy((size_t)M * TK * I);
-        HC(hipMemcpy(vy.data(), dV, vy.size() * 2, hipMemcpyDeviceToHost));
+        HC(hipMemcpy(vy.data(), dV, bs ? 0 : vy.size() * 2, hipMemcpyDeviceToHost));
         double md = 0;
         long vbad = 0;
-        for (size_t i = 0; i < vy.size(); i++) {
+        for (size_t i = 0; i < (bs ? 0 : vy.size()); i++) {
             double a = bf(vy[i]), b = bf(y1[i]);
             md = std::max(md, std::fabs(a - b));
             if (std::fabs(a - b) > 2e-2 * std::fabs(b) + 2e-2) vbad++;
