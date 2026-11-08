@@ -378,6 +378,8 @@ pub enum Op {
     /// Dwords 8 half .. 8 half + 7 of the Frag16 variable `var` as a Frag8 value WITHOUT a copy (a view of the variable's registers): valid only while
     /// the variable is not written (checked by `verify`: no in-place write of `var` between the slice and any use of it).
     VarSlice8 { var: VarId, half: u8 },
+    /// Dwords 4 idx .. 4 idx + 3 of a Frag8 (idx 0..1) or Frag16 (idx 0..3) variable as a Frag4 value WITHOUT a copy (a register view, as `VarSlice8`).
+    VarSlice4 { var: VarId, idx: u8 },
     /// `v_permlane32_swap`: exchanges lanes 32..63 of `a` with lanes 0..31 of `b`. Result: a Frag2 whose dword 0 is the new `a` and dword 1
     /// the new `b` (use `permlane32_swap`, which returns the two values).
     Permlane32Swap { a: Opnd, b: Opnd },
@@ -504,6 +506,7 @@ impl Op {
             Op::Frag2(..) => DType::Frag2,
             Op::Frag2Lane { .. } | Op::Frag4Lane { .. } => DType::U32,
             Op::VarSlice8 { .. } => DType::Frag8,
+            Op::VarSlice4 { .. } => DType::Frag4,
             Op::Permlane32Swap { .. } => DType::Frag2,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::MfmaF16Wide { .. } => DType::Frag16,
@@ -583,7 +586,7 @@ impl Op {
             Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } => vec![*base],
             Op::Frag2(a, b) => vec![*a, *b],
             Op::Frag2Lane { frag, .. } => vec![*frag],
-            Op::VarSlice8 { var, .. } => vec![Opnd::Var(*var)],
+            Op::VarSlice8 { var, .. } | Op::VarSlice4 { var, .. } => vec![Opnd::Var(*var)],
             Op::Permlane32Swap { a, b } => vec![*a, *b],
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
@@ -1575,7 +1578,7 @@ impl FnBuilder {
         let vv = match &op {
             Op::Frag2Lane { frag, .. } | Op::Frag4Lane { frag, .. } | Op::Frag16Lane { frag, .. } => of(frag, &self.views),
             Op::BitcastF32(a) | Op::BitcastI32(a) => of(a, &self.views),
-            Op::VarSlice8 { var, .. } => vec![*var],
+            Op::VarSlice8 { var, .. } | Op::VarSlice4 { var, .. } => vec![*var],
             _ => Vec::new(),
         };
         if !vv.is_empty() {
@@ -2304,6 +2307,10 @@ impl FnBuilder {
     pub fn var_slice8(&mut self, var: VarId, half: u8) -> ValueId {
         assert!(half < 2, "var_slice8: half is 0 or 1");
         self.let_(Op::VarSlice8 { var, half })
+    }
+    /// Dwords 4 idx .. 4 idx + 3 of a Frag8 / Frag16 variable as a Frag4 operand without a copy (see `Op::VarSlice4`).
+    pub fn var_slice4(&mut self, var: VarId, idx: u8) -> ValueId {
+        self.let_(Op::VarSlice4 { var, idx })
     }
     pub fn perm_b32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, sel: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PermB32(a.into(), b.into(), sel.into()))
@@ -3633,6 +3640,7 @@ pub fn stmt_var_writes(st: &Stmt) -> Vec<VarId> {
         | Stmt::VarMfmaFp8Z { var, .. }
         | Stmt::VarMfmaFp8C { var, .. }
         | Stmt::VarSmfmac { var, .. }
+        | Stmt::VarMfma { var, .. }
         | Stmt::VarAsm { var, .. } => vec![*var],
         Stmt::VarAsmN { vars, .. } | Stmt::BeginLoop { vars, .. } => vars.clone(),
         _ => Vec::new(),
@@ -3656,6 +3664,17 @@ fn check_var_slices(f: &Function, errs: &mut Vec<String>) {
         if let Stmt::Let { dst, op: Op::VarSlice8 { var, half } } = st {
             if f.var_ty(*var) != Some(DType::Frag16) || *half > 1 {
                 errs.push(format!("stmt {idx}: var_slice8 needs a frag16 variable and half 0 / 1"));
+            }
+            live.insert(*dst, (*var, false));
+        }
+        if let Stmt::Let { dst, op: Op::VarSlice4 { var, idx: q } } = st {
+            let ok = match f.var_ty(*var) {
+                Some(DType::Frag8) => *q < 2,
+                Some(DType::Frag16) => *q < 4,
+                _ => false,
+            };
+            if !ok {
+                errs.push(format!("stmt {idx}: var_slice4 needs a frag8 (idx 0..1) or frag16 (idx 0..3) variable"));
             }
             live.insert(*dst, (*var, false));
         }

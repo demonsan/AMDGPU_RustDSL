@@ -398,13 +398,21 @@ def check_mfma_p1(planes, out):
                 print(f"FAIL {name} {form}: {bad} values, e.g. lane {first[0]} value {first[1]} want {first[2]} got {first[3]}")
             else:
                 print(f"ok   {name} {form}")
+        if name == "bf16_16x16x32":
+            slice_ref = [[at(l, r) for r in range(4)] for l in range(LANES)]
         obase += 3 * LANES * n
+    got = [[out[obase + 4 * l + r] for r in range(4)] for l in range(LANES)]
+    if all(f32(got[l][r]) == slice_ref[l][r] for l in range(LANES) for r in range(4)):
+        print("ok   var_slice4 views (bf16_16x16x32 from a Frag8 loop variable)")
+    else:
+        ok = False
+        print("FAIL var_slice4 views")
     return ok
 
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
-    "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS)),
+    "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
 
 def main():

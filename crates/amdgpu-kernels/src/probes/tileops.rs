@@ -304,7 +304,7 @@ pub fn probe_mfma_p1() -> Function {
     let mut b = FnBuilder::new("probe_mfma_p1", 64);
     b.arg("in", DType::Ptr, 0, 8);
     b.arg("out", DType::Ptr, 8, 8);
-    let out_bytes: u32 = kinds.iter().map(|k| 3 * 64 * 4 * k.acc_dwords()).sum();
+    let out_bytes: u32 = kinds.iter().map(|k| 3 * 64 * 4 * k.acc_dwords()).sum::<u32>() + 64 * 16;
     b.arg_tensor("in", amdgpu_dsl::Ext::Const((kinds.len() * 2048) as i64));
     b.arg_tensor("out", amdgpu_dsl::Ext::Const(out_bytes as i64));
     let inp = b.let_(Op::KernargPtr { offset: 0 });
@@ -338,6 +338,20 @@ pub fn probe_mfma_p1() -> Function {
             }
         }
         obase += 3 * 64 * 4 * n;
+        if i == 0 {
+            // `var_slice4` views of a Frag8 loop variable holding A ++ B: the same product without copies (extra block at the end of `out`)
+            let ab = b.cat_frag8(fa, fb);
+            let vs = b.begin_loop(&[(DType::Frag8, Opnd::Val(ab))]);
+            let s0 = b.var_slice4(vs[0], 0);
+            let s1 = b.var_slice4(vs[0], 1);
+            let d4 = b.mfma(*k, s0, s1, None);
+            let always = b.cmp(CmpPred::Ge, CmpTy::I32, tid, 0);
+            b.break_if(always);
+            b.end_loop();
+            let p = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::I32(out_bytes as i32 - 64 * 16) });
+            let p = b.let_(Op::PtrAdd { base: Opnd::Val(p), byte_off: Opnd::Val(off16) });
+            b.store_global(p, 0, d4, amdgpu_dsl::MemTy::B128, false);
+        }
     }
     b.finish()
 }

@@ -185,6 +185,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         | Op::Frag2(..)
         | Op::Frag2Lane { .. }
         | Op::VarSlice8 { .. }
+        | Op::VarSlice4 { .. }
         | Op::Permlane32Swap { .. }
         | Op::Frag4(..)
         | Op::Frag4Lane { .. }
@@ -525,7 +526,7 @@ impl Captured {
 /// The operand a register-VIEW op reinterprets (no instruction: the result is the operand's register or a sub-register of it).
 pub fn view_source(op: &Op) -> Option<Opnd> {
     match op {
-        Op::VarSlice8 { var, .. } => Some(Opnd::Var(*var)),
+        Op::VarSlice8 { var, .. } | Op::VarSlice4 { var, .. } => Some(Opnd::Var(*var)),
         Op::Frag2Lane { frag, .. } | Op::Frag4Lane { frag, .. } | Op::Frag16Lane { frag, .. } => Some(*frag),
         Op::BitcastF32(a) | Op::BitcastI32(a) => Some(*a),
         _ => None,
