@@ -56,6 +56,19 @@ VCvtF32F16  | V1 <- V1 | {d} = nofpexcept V_CVT_F32_F16_e32 {s0}, implicit $mode
 VCvtF16F32  | V1 <- V1 | {d} = nofpexcept V_CVT_F16_F32_e32 {s0}, implicit $mode, implicit $exec
 VAndB32     | V1 <- V1 V1 | {d} = V_AND_B32_e32 {s0}, {s1}, implicit $exec
 VMinI32     | V1 <- V1 V1 | {d} = V_MIN_I32_e32 {s0}, {s1}, implicit $exec
+VReadLane | S1 <- V1 | {d} = V_READLANE_B32 {s0}, {lane}, implicit $exec
+VWriteLane | V1 <- S1 V1 | {d} = V_WRITELANE_B32 {s0}, {lane}, {d}(tied-def 0), implicit $exec
+VMbcntLo | V1 <- V1 V1 | {d} = V_MBCNT_LO_U32_B32_e64 {s0}, {s1}, implicit $exec
+VMbcntHi | V1 <- V1 V1 | {d} = V_MBCNT_HI_U32_B32_e64 {s0}, {s1}, implicit $exec
+VBcntU32 | V1 <- V1 V1 | {d} = V_BCNT_U32_B32_e64 {s0}, {s1}, implicit $exec
+VFfblB32 | V1 <- V1 | {d} = V_FFBL_B32_e32 {s0}, implicit $exec
+VFfbhU32 | V1 <- V1 | {d} = V_FFBH_U32_e32 {s0}, implicit $exec
+VCmpMaskNeU32 | S2 <- V1 V1 | {d} = V_CMP_NE_U32_e64 {s0}, {s1}, implicit $exec
+SMaskLo | S1 <- S2 | {d} = S_MOV_B32 {s0.0}
+SMaskHi | S1 <- S2 | {d} = S_MOV_B32 {s0.1}
+LdsBpermute | V1 <- V1 V1 | {d} = DS_BPERMUTE_B32 {s0}, {s1}, {imm}, implicit $exec
+LdsPermute | V1 <- V1 V1 | {d} = DS_PERMUTE_B32 {s0}, {s1}, {imm}, implicit $exec
+LdsSwizzle | V1 <- V1 | {d} = DS_SWIZZLE_B32 {s0}, {imm}, 0, implicit $exec
 VCvtPkF32Fp8 | V2 <- V1 | {d} = V_CVT_PK_F32_FP8_sdwa 0, {s0}, 0, 0, {sdwaword}, implicit $mode, implicit $exec
 VCvtF32Fp8 | V1 <- V1 | {d} = V_CVT_F32_FP8_sdwa 0, {s0}, 0, 0, {byte}, implicit $mode, implicit $exec
 VCvtPkF32Bf8 | V2 <- V1 | {d} = V_CVT_PK_F32_BF8_sdwa 0, {s0}, 0, 0, {sdwaword}, implicit $mode, implicit $exec
@@ -184,6 +197,34 @@ GlobalStoreF32 | <- V2 V1 | GLOBAL_STORE_DWORD {s0}, {s1}, {imm}, {cpol}, implic
 GlobalLoadF32Sc1 | V1 <- V2 | {d} = GLOBAL_LOAD_DWORD {s0}, {imm}, 16, implicit $exec :: (load (s32), addrspace 1)
 GlobalStoreF32Sc1 | <- V2 V1 | GLOBAL_STORE_DWORD {s0}, {s1}, {imm}, 16, implicit $exec :: (store (s32), addrspace 1)
 GlobalAtomicAddRet | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_ADD_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+LdsAtomicAddU32 | <- V1 V1 | DS_ADD_U32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicAddU32Rtn | V1 <- V1 V1 | {d} = DS_ADD_RTN_U32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicMaxU32 | <- V1 V1 | DS_MAX_U32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicMaxU32Rtn | V1 <- V1 V1 | {d} = DS_MAX_RTN_U32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicMinU32 | <- V1 V1 | DS_MIN_U32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicMinU32Rtn | V1 <- V1 V1 | {d} = DS_MIN_RTN_U32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicMaxI32 | <- V1 V1 | DS_MAX_I32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicMaxI32Rtn | V1 <- V1 V1 | {d} = DS_MAX_RTN_I32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicMinI32 | <- V1 V1 | DS_MIN_I32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicMinI32Rtn | V1 <- V1 V1 | {d} = DS_MIN_RTN_I32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicIncU32 | <- V1 V1 | DS_INC_U32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicIncU32Rtn | V1 <- V1 V1 | {d} = DS_INC_RTN_U32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicAddF32 | <- V1 V1 | DS_ADD_F32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+LdsAtomicAddF32Rtn | V1 <- V1 V1 | {d} = DS_ADD_RTN_F32_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store monotonic (s32), addrspace 3)
+GlobalAtomicAddU32 | <- V2 V1 | GLOBAL_ATOMIC_ADD {s0}, {s1}, {imm}, 0, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicAddU32Rtn | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_ADD_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicMaxU32 | <- V2 V1 | GLOBAL_ATOMIC_UMAX {s0}, {s1}, {imm}, 0, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicMaxU32Rtn | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_UMAX_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicMinU32 | <- V2 V1 | GLOBAL_ATOMIC_UMIN {s0}, {s1}, {imm}, 0, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicMinU32Rtn | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_UMIN_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicMaxI32 | <- V2 V1 | GLOBAL_ATOMIC_SMAX {s0}, {s1}, {imm}, 0, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicMaxI32Rtn | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_SMAX_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicMinI32 | <- V2 V1 | GLOBAL_ATOMIC_SMIN {s0}, {s1}, {imm}, 0, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicMinI32Rtn | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_SMIN_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicIncU32 | <- V2 V1 | GLOBAL_ATOMIC_INC {s0}, {s1}, {imm}, 0, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicIncU32Rtn | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_INC_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicAddF32 | <- V2 V1 | GLOBAL_ATOMIC_ADD_F32 {s0}, {s1}, {imm}, 0, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
+GlobalAtomicAddF32Rtn | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_ADD_F32_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
 BufferWbl2 | <- | BUFFER_WBL2 16, implicit $exec
 BufferInv | <- | BUFFER_INV 16, implicit $exec
 GlobalStoreF32x4 | <- V2 V4 | GLOBAL_STORE_DWORDX4 {s0}, {s1}, {imm}, {cpol}, implicit $exec :: (store (s128), addrspace 1)

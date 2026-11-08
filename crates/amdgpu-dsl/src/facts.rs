@@ -211,9 +211,21 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::Un(o, _) if o.trans() => ResClass::Trans,
         Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
         Op::Mfma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
-        Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } => ResClass::Valu,
+        Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } | Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } => ResClass::Valu,
+        // lane permutes through the LDS crossbar: lgkm-counted, no LDS memory
+        Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => ResClass::LdsRead,
         Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => {
             e.global_read = true;
+            ResClass::VmemLoad
+        }
+        Op::AtomicLds { .. } => {
+            e.lds_read = true;
+            e.lds_write = true;
+            ResClass::LdsRead
+        }
+        Op::AtomicGlobal { .. } => {
+            e.global_read = true;
+            e.global_write = true;
             ResClass::VmemLoad
         }
         Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } => {
@@ -280,6 +292,16 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             (ResClass::VmemStore, vec![], false)
         }
         Stmt::VarMfma { var, kind, zero, .. } => (ResClass::Mfma { passes: kind.passes() }, vec![*var], !*zero),
+        Stmt::AtomicLdsNoRet { .. } => {
+            e.lds_read = true;
+            e.lds_write = true;
+            (ResClass::LdsWrite, vec![], false)
+        }
+        Stmt::AtomicGlobalNoRet { .. } => {
+            e.global_read = true;
+            e.global_write = true;
+            (ResClass::VmemStore, vec![], false)
+        }
         Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => {
             e.lds_write = true;
             (ResClass::LdsWrite, vec![], false)
