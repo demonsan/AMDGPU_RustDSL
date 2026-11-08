@@ -178,6 +178,26 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> out((size_t)M * D), y1((size_t)M * TK * I);
     HC(hipMemcpy(out.data(), dO, out.size() * 2, hipMemcpyDeviceToHost));
     HC(hipMemcpy(y1.data(), dY1, y1.size() * 2, hipMemcpyDeviceToHost));
+    if (envi("GEMMONLY", 0) && !fp8 && TK == 1) {
+        // the Down kernel on the stage-1 operands: T[t][r] = X[t] . W1i[e][r] (all 2I interleaved rows), unit weights
+        std::vector<float> ones(maxp, 1.0f);
+        HC(hipMemcpy(dsw, ones.data(), maxp * 4, hipMemcpyHostToDevice));
+        auto ag = gemm_args(dX, dW1, dT, M, 2 * I, D, dxs, dw1s, 2 * I);
+        launch(f2, ag, 2 * I / 128, nblk);
+        HC(hipDeviceSynchronize());
+        std::vector<float> T((size_t)M * 2 * I);
+        HC(hipMemcpy(T.data(), dT, T.size() * 4, hipMemcpyDeviceToHost));
+        long gb = 0;
+        for (int t = 0; t < M; t++)
+            for (int r = 0; r < 2 * I; r++) {
+                int q = r / 32, rr = r % 32, src = rr < 16 ? 16 * q + rr : I + 16 * q + rr - 16, e = ids[t];
+                double s = 0;
+                for (int d = 0; d < D; d++) s += (double)xf[(size_t)t * D + d] * w1f[((size_t)e * 2 * I + src) * D + d];
+                if (std::fabs(T[(size_t)t * 2 * I + r] - s) > 1e-2 * std::fabs(s) + 1e-2) { if (gb < 5) printf("  gemm bad t=%d r=%d got %g ref %g\n", t, r, T[(size_t)t * 2 * I + r], s); gb++; }
+            }
+        printf("GEMMONLY bad=%ld of %d\n", gb, M * 2 * I);
+        HC(hipMemcpy(dsw, sw.data(), maxp * 4, hipMemcpyHostToDevice));
+    }
     if (envi("MAPDBG", 0)) {
         // full stage-1 reference for every (token, slot), then: for wrong entries, where does the GPU value occur in the reference?
         std::vector<double> ref((size_t)M * TK * I);
