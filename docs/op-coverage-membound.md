@@ -339,7 +339,7 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | topk_plain（无行范围的版本） | 缺 | 同一 kernel 的 `start = 0, end = stride` 特例；按需再加名字 |
 | MoE 辅助 | moe_sorting（单 block / 多 block / 稳定序）、**moe_reduce / moe_combine** | 有 | `moe_sorting_*`、`moe_{count,scan,scatter,scatter_ord}_*`、`moe_reduce_bf16_k<K>_d<D>`、`moe_combine_bf16_k<K>_d<D>` |
 | 其他 | **causal_conv1d_update**（decode，W = 2 – 4，状态窗口移位，可选 silu 与连续批处理的 state_indices，pad = 负） | 有（新） | `causal_conv1d_update_bf16_w<W>_s<SL>[_idx][_silu]`：输出与新状态均与 CPU 参考逐位一致；B = 2048 dim = 8192 3.1 TB/s（2 字节访问，没有向量化） |
-| | causal_conv1d fwd（prefill / split_qkv） | 缺 | 沿 L 的滑动窗口卷积：每个 lane 一个 channel、沿序列滑动，权重常驻寄存器；split_qkv 只是不同的输出切分；待做 |
+| | **causal_conv1d fwd**（prefill，变长序列，`split_qkv`） | 有（新） | `causal_conv1d_fwd_bf16_w<W>[_silu]`（输出 `[T][dim]`）与 `causal_conv1d_fwd_split_bf16_w<W>[_silu]`（特征 `[0,k)` → q、`[k,2k)` → k、其余 → v，对应 aiter `causal_conv1d_fwd_split_qkv`）：channel-last x、`cu_seqlens`、`cache_indices`（负 = 跳过）、`has_initial`、初始 / 最终状态；W = 2 – 4；长度一致的序列 2.6 – 2.9 TB/s |
 | | gated delta rule（`chunk_gated_delta_rule_fwd_h`、`gdr_decode_packed`、`fused_split_gdr_update`） | 缺 | 带小矩阵递推的状态更新（不是纯带宽），属于 GEMM 类；不在内存受限计划内 |
 | | custom_all_reduce / quick_all_reduce / reduce_scatter | 缺 | 多卡通信，本机单卡无法验证 |
 | | mhc / mega_mhc / mha_v4_quant / dsv4_*（DeepSeek-V4 专用融合） | 缺 | 模型专用的大融合，使用面窄 |
@@ -353,3 +353,10 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 `topk_per_row_{decode,prefill}_f32_k<K>`（K = 1 … 2048）：对 f32 logits 的每一行取最大的 K 个，输出列下标。decode 版的行 `b · next_n + j` 有 `L = seq_lens[b] − next_n + j + 1` 个有效列（grid = (B, next_n)）；prefill 版逐行 `[row_starts, row_ends)`，输出绝对列下标。选择方法与"采样"一节的 top-k 相同，只是键是 f32 的 32 位保序键，所以是四遍 8 位的基数选择（每遍一次 LDS 直方图 + 256 桶的降序扫描）求出第 K 大的键 `T` 与还需要的与 `T` 相等的元素个数 `rem`，最后一遍发射所有 `> T` 的元素（LDS 计数器分配位置）和前 `rem` 个 `== T` 的元素；不参与计数的元素写到每个 lane 各自的垃圾槽。每行读 5 遍（第 1 遍来自 HBM，其余多半来自 L2）。
 
 验证（`tests/gpu/topk_per_row_host.cpp`）：列必须互不相同、在行内、且所选值的多重集合恰好是该行最大的 K 个值（并列任取）；行长 ≤ K 的行必须按列序返回整行再补 −1。覆盖 decode（next_n = 1 / 2 / 3，长度不一，含短于 K 的行）、prefill（行首非零、行长 < K / = K / > K），K = 1、64、100、128、2048，带大量并列值的数据；`bad_rows = 0`，`gpu_verify --strict` 0 错误，48 VGPR。性能（一行一个块，不拆到多个 CU）：256 行 × 64K：94 µs；256 行 × 32K：46 µs；4096 行（1/4 短行）× 32K：0.54 ms。长行拆到多个 CU（aiter 的 multi-block 路径）是后续工作，只对行数少于 CU 数时有意义。
+
+
+## causal_conv1d 前向（prefill / 变长）
+
+`causal_conv1d_fwd_bf16_w<W>[_silu]` 与 `causal_conv1d_fwd_split_bf16_w<W>[_silu]`：`out[t][f] = bias[f] + Σ_{i < W} weight[f][i] · x[t − (W − 1) + i][f]`，序列起点之前的输入取该序列的初始状态（`has_initial` 为真）或 0，可选 silu；序列结束后 `conv_states[cache_idx][f][0 .. W−1)` 写成该序列最后 W − 1 个输入（序列短于 W − 1 时保留更早的初始状态值）。x 是 channel-last 的 `[T][dim]`（SGLang prefill 的布局），`cu_seqlens [B + 1]` 给出序列边界，`cache_indices [B]` 给出状态槽（负 = 跳过整个序列）；状态布局 `[slots][dim][W − 1]`，与 decode 的 `causal_conv1d_update_*_s<W−1>` 完全一致，所以 prefill 写的状态 decode 可以直接接着用。split 版本把特征 `[0, k)`、`[k, 2k)`、`[2k, dim)` 分别写进 q、k、v 三个张量（行距 k、k、dim − 2k；k % 8 = 0）。
+
+布局：一个 lane 负责 8 个连续特征（b128 访问），一个块 256 lane = 2048 个特征，grid = (⌈dim / 2048⌉, B, ⌈max_len / 8⌉)：每个块顺序处理 8 个 token，前 W − 1 个输入留在寄存器里（块内第一个块从初始状态读，其余块从 x 读前几个 token）；8 次加载在第一个输出前全部发出；超出序列末尾的块不碰内存。限制：`T · dim · 2 < 2 GiB`（32 位偏移；更大要逐序列的 `ptr_mad` 描述符）、dim % 8 = 0。验证（`tests/gpu/conv1d_fwd_host.cpp`）：长度 1、2、W、随机的混合序列，一部分有初始状态、一部分没有、一部分状态槽为负（输出与状态都必须不被写），dim = 776 / 1000 / 1536 / 2048 / 4104 / 8192，W = 2 / 3 / 4，silu 开 / 关，split；输出（≤ 1 bf16 ulp）与最终状态（逐位）都与 CPU 参考一致，`gpu_verify --strict` 0 错误。性能：B = 128、每序列 512 token、dim = 8192：2.8 TB/s（计 x 读 + out 写）；序列长度很不均匀时（最长是平均的 4 倍，网格按最长序列铺）约 1 TB/s，因为 74 % 的块在序列末尾之外空转——要避免就需要 aiter 那样的（序列, 块）调度表，留作后续。VGPR 120 – 176。
