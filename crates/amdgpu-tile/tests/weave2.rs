@@ -82,3 +82,25 @@ fn rotate_keeps_parts_by_iteration_offset() {
         assert_eq!(built, want, "{stage:?}");
     }
 }
+
+#[test]
+fn users_of_a_register_view_stay_before_the_next_write_of_the_variable() {
+    // a lane of a loop variable and a bitcast of it are register views (no instruction): their users read the variable at their own
+    // position, so they must stay before the next write of the variable (the `_t128` window bug of the automatic statement order)
+    let mut b = FnBuilder::new("views", 64);
+    let z = b.frag_zero(amdgpu_dsl::DType::Frag4);
+    b.loop_(&[(amdgpu_dsl::DType::Frag4, amdgpu_dsl::Opnd::Val(z))], |b, vars| {
+        let v = vars[0];
+        let mut u = Units::new();
+        let (_, x) = u.capture(b, "lane", |b| b.frag4_lane(amdgpu_dsl::Opnd::Var(v), 1));
+        let (_, y) = u.capture(b, "bitcast", |b| b.bitcast_f32(x));
+        let (iu, _) = u.capture(b, "use", |b| b.add_f32(y, y));
+        let (iw, ()) = u.capture(b, "write", |b| {
+            let z2 = b.frag_zero(amdgpu_dsl::DType::Frag4);
+            b.set_var(v, z2);
+        });
+        assert!(u.unit(iw).deps.contains(&iu), "the user of the view must stay before the write: {:?}", u.unit(iw).deps);
+        assert_eq!(b.view_vars(y), &[v]);
+        Weaver::new(u).seq().emit(b);
+    });
+}
