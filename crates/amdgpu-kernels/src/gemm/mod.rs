@@ -135,7 +135,7 @@ impl GemmConfig {
     /// The fused-MoE stage `st` (128-row tiles = block_m 128; stage 1: 256 interleaved gate / up B rows = 128 output columns per CTA).
     pub fn moe(elem: Elem, scales: Scales, st: MoeStage) -> GemmConfig {
         let cta_n = if matches!(st, MoeStage::Up { .. }) { 256 } else { 128 };
-        GemmConfig { cta_m: 128, cta_n, lds_epilogue: false, scales, elem, moe: Some(st), ..GemmConfig::v4() }
+        GemmConfig { cta_m: 128, cta_n, acc_agpr: 0, lds_epilogue: false, scales, elem, moe: Some(st), ..GemmConfig::v4() }
     }
     /// Split-K form of a 128 x 128 configuration (fp32 partials + `reduce::gemm_splitk_reduce`).
     pub fn splitk(self) -> GemmConfig {
