@@ -7,7 +7,7 @@
 ## 5.0 摘要
 
 1. **可达带宽**：2 GiB 工作集，HBM 标称 ≈ 8 TB/s，实测拷贝（读 + 写合计）**5.7–6.2 TB/s**（每 lane 16 B × 1 次、按 tile 一块一份），只读 **6.2–6.4 TB/s**，只写 **5.9–6.0 TB/s**；256 MiB 工作集（部分落在 256 MB Infinity Cache）读 / 写到 **6.5–6.7 TB/s**。roofline 目标 = 同读写比下实测流式带宽的 90 %（见 5.1）。
-2. **决定带宽的是在途字节数，不是向量宽度**：每 CU 在途读 ≥ 64 KB 才到 90 % 的可达值（16 KB → 2.4 TB/s，32 KB → 3.7，64 KB → 5.3，128 KB → 5.5）；4 B / 8 B / 16 B 每 lane 的访问只要在途量够，带宽相同（6.2–6.4 TB/s 只读）。`nontemporal` 对流式 kernel 没有可测差别（±1 %）。
+2. **决定带宽的是在途字节数，不是向量宽度**：每 CU 在途读 ≥ 64 KB 才到 90 % 的可达值（16 KB → 2.4 TB/s，32 KB → 3.7，64 KB → 5.3，128 KB → 5.5）；4 B / 8 B / 16 B 每 lane 的访问只要在途量够，带宽相同（6.2–6.4 TB/s 只读）。**`nontemporal`（`nt` 缓存策略位）的效果要看访问形态：在 HIP 内建 `__builtin_nontemporal_*` 的展开拷贝基准上没有可测差别，但在我们每 lane 一个 b128、一块一份的 kernel 上，加 `nt` 让带宽提高 3–14 %（5.12 的实测；aiter 的 `GROUP_NT` 正是这个）——所以流式 kernel 默认带 `nt`，表 / 查表数据（γ、cos / sin）不带。**
 3. **按 tile 一块一份（每 lane 16 B × 1）优于大展开**：U = 1 最好（6.06 TB/s），U = 8 反而 5.3；grid-stride 持久化至少要 4 块 / CU（grid ≥ 1024）才追平，且不更好。**默认模板 = 按 tile、每 lane 一次 b128、占用率优先**，不做 grid-stride。
 4. **归约的延迟对带宽基本无影响**（占用高时）：一个 wave 一行的 norm 在稳态下每个 wave 每行有 ≥ 20 k 周期预算，LDS 版 `wave_reduce`（≈ 300 周期）可以接受；DPP / permlane 全程归约只在占用低（GEMM 尾部、小 M、单 wave 内多行 ILP 不足）时才值得。
 5. **缺口（按优先级）**：① 缓存策略位（`glc` / `slc` / `nt`）与 sub-dword 访问；② `ds_bpermute` / `readlane` / `ballot` / `mbcnt` / `s_bcnt1`（扫描、top-k、MoE 对齐都需要）；③ 完整 DPP 行操作与 `permlane16`；④ LDS 与全局原子（add / inc / CAS / min / max）；⑤ 64 位地址乘加、整数除 / 取模；⑥ 带索引的 `M`（gather / scatter）与跨 wave 的 `R`（block 归约）、分段 `R`（group amax）、`S`、`P` 的 stage 实现（库里目前只有 `M` 的行 / DMA / 块拷贝、wave 内 `R`、fp8 `Q`）。详见 5.10。
@@ -33,7 +33,7 @@
 
 读法：
 - **在途字节数是第一变量**。grid-stride 的 grid = 256 / 512 / 1024（= 1 / 2 / 4 块 × 256 线程 / CU，U = 4，b128 → 每 CU 在途读 16 / 32 / 64 KB）给出 2.4 / 3.7 / 5.3 TB/s，之后饱和在 5.5。负载下的有效 HBM 延迟约为 `64 KB × 256 / 5.3 TB/s ≈ 3 µs`。设计值：**每 CU ≥ 64 KB 在途读 → 90 %，≥ 96–128 KB → 95 %**。
-- 在途量够时，向量宽度（4 / 8 / 16 B）、`nt`、持久化与否都不改变结果；大展开（U = 8）因为占用下降、每块工作量变大而略差。所以**模板的默认选择是占用率**：每 lane 一次 b128（每 wave 1 KB），每块 256 线程，让 CU 容纳尽可能多的块。
+- 在途量够时，向量宽度（4 / 8 / 16 B）、持久化与否都不改变结果（`nt` 在本基准上也没有差别，但见 5.0 的更正：在一块一份的 kernel 上它有 3–14 %）；大展开（U = 8）因为占用下降、每块工作量变大而略差。所以**模板的默认选择是占用率**：每 lane 一次 b128（每 wave 1 KB），每块 256 线程，让 CU 容纳尽可能多的块。
 - 工作集小于 Infinity Cache（256 MB）时读 / 写能到 6.5–6.7 TB/s，roofline 目标要按实际工作集取（激活张量常常 < 256 MB）。
 
 **roofline 目标**：`t ≥ 字节数 / BW_target`，`BW_target` 取同读写比的实测值：读 : 写 = 1 : 1 的逐元素 5.7–6.0 TB/s，读 > 写（量化 2 : 1、行归约 N : 1）6.0–6.4 TB/s；**验收 = 达到 `BW_target` 的 90 %**。已有数据点：`rmsnorm_quant_fp8_n4096`，M = 16384（x bf16 读 134 MB + q fp8 写 67 MB，读写比 2 : 1）5.3–5.5 TB/s ≈ 88–92 % —— 已在目标线上。
@@ -181,7 +181,7 @@
 2. **加载次序**：同一线程的 U 个加载按"先发的先用"排列，消费者按同序，使 `vmcnt(U−1), (U−2), …, 0` 逐个放行；不要把最后发的加载放在第一个消费者里。
 3. **LDS vs DPP / permlane 归约**：LDS 版 ≈ 300 周期（私有 64 B / wave，无 barrier）、DPP 版 ≈ 60 周期；带宽受限且占用 ≥ 8 wave / CU 时不换（5.4）。**DSL 要补**：DPP 的 `row_shr` / `row_bcast` / `wave_shr` / `row_mirror` 控制，`permlane16_swap`（gfx950 的 `v_permlane16_swap_b32`，现有 `permlane32_swap`）。
 4. **XCD 序**：workgroup id 轮转到 8 个 XCD（`blockIdx % 8`）；带宽受限 kernel 的块之间无复用 → 不需要；有跨块复用的（γ / β 向量、cos / sin 表、列归约相邻列块、页表）→ 让复用同一数据的块落在同一 XCD（块号重排，`GRID_MODE=xcd`），γ / β 只有 `N × 2 B`（≤ 16 KB）本身驻 L2，不需要。
-5. **`nontemporal` / 缓存策略位**：流式 kernel 实测无差别（5.1）；唯一可能有意义的场景是"每块用同一个小表（γ、cos / sin）+ 大流（x）"，用 `nt` 保住表在 L2。**批次 2 先不做**；DSL 加 `cache: CachePolicy { default, nt, slc, glc }` 到 `BufferLoad` / `BufferStore` 即可（汇编里是 `nt` / `sc0 sc1` 位，gfx950 的语法为 `sc0` / `sc1` / `nt`）。
+5. **`nontemporal` / 缓存策略位**：实测（`docs/op-coverage-membound.md`「非临时访问」）流式 kernel 的 x / residual 加载与输出存储带 `nt` 后带宽 +3 … +14 %（silu_mul D = 4096：5.98 → 6.56 TB/s，quant_group128：5.63 → 6.39），因此**批次 2 的流式 kernel 默认全部带 `nt`**，γ / β / cos / sin 这类被很多块复用的小表不带。`CachePolicy { sc0, sc1, nt }` 已在 DSL 中（backend 的 tileops）。此前基于展开拷贝基准"nt 无差别"的结论是错的形态外推。
 6. **持久化 vs 按 tile**：按 tile（每 lane b128 × 1，一块 4 KB 输入，grid = ⌈N / tile⌉）等于或优于 grid-stride（需 ≥ 4 块 / CU 才追平）；持久化只在**块启动开销显著**（极小 tile、极大 grid > 100 万块）或需要**跨 tile 状态**（扫描的回看、在线 softmax 的行跨块）时用。
 7. **越界尾部**：用 `buffer` 描述符 `num_records`（硬件守卫：读 0、写丢弃），**不生成 tail 分支**；`gpu_verify` 已按"buffer(hw-guarded)"证明（RMSNorm 的证书里有 25 个）。变长行（`cu_seqlens` / ragged）用动态 `num_records`（`buffer_desc_dyn` 已有）。
 8. **占用与寄存器**：带宽受限 kernel **以占用为目标**：先定 VGPR ≤ 128（≥ 16 wave / CU）再选 U；`s_setprio` 无益；`sched` 的 `max_vgprs` 压力限制要能按"占用目标"设置（`limit=N`，`Function::sched_opts`），而不是 256。
