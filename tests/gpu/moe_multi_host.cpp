@@ -20,7 +20,7 @@ int main(int argc, char** argv) {
     void *did, *dw, *dsid, *dsw, *deid, *dnv, *dts; CK(hipMalloc(&did, N * 4)); CK(hipMalloc(&dw, N * 4)); CK(hipMalloc(&dsid, maxp * 4 + 64)); CK(hipMalloc(&dsw, maxp * 4 + 64)); CK(hipMalloc(&deid, ntile * 4 + 64)); CK(hipMalloc(&dnv, 64)); CK(hipMalloc(&dts, (E + 1) * 4 + 64));
     CK(hipMemcpy(did, ids.data(), N * 4, hipMemcpyHostToDevice)); CK(hipMemcpy(dw, w.data(), N * 4, hipMemcpyHostToDevice));
     CK(hipMemset(dsid, 0x55, maxp * 4 + 64)); CK(hipMemset(dsw, 0x55, maxp * 4 + 64)); CK(hipMemset(deid, 0x55, ntile * 4 + 64)); CK(hipMemset(dnv, 0x55, 64)); CK(hipMemset(dts, 0x55, (E + 1) * 4 + 64));
-    char kc[64], ks[64], kt[64]; std::snprintf(kc, 64, "moe_count_e%ld_k%ld", E, K); std::snprintf(ks, 64, "moe_scan_e%ld_k%ld_b%ld", E, K, BM); std::snprintf(kt, 64, "moe_scatter_e%ld_k%ld", E, K);
+    char kc[64], ks[64], kt[64]; std::snprintf(kc, 64, "moe_count_e%ld_k%ld", E, K); std::snprintf(ks, 64, "moe_scan_e%ld_k%ld_b%ld", E, K, BM); std::snprintf(kt, 64, "moe_scatter_e%ld_k%ld_b%ld", E, K, BM);
     hipModule_t m1, m2, m3; hipFunction_t f1, f2, f3; CK(hipModuleLoad(&m1, argv[1])); CK(hipModuleGetFunction(&f1, m1, kc)); CK(hipModuleLoad(&m2, argv[2])); CK(hipModuleGetFunction(&f2, m2, ks)); CK(hipModuleLoad(&m3, argv[3])); CK(hipModuleGetFunction(&f3, m3, kt));
     long G = std::min<long>(64, (N + 4095) / 4096); if (G < 1) G = 1; long P = (N + G - 1) / G;
     void* dws; CK(hipMalloc(&dws, E * 256 + 64));

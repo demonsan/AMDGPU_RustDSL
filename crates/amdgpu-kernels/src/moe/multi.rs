@@ -6,7 +6,7 @@
 //! 2. `moe_scan_e<E>_k<K>_b<BM>`   grid 1, 1024 threads: per expert the sum over the blocks, the padded prefix scan over experts, then `ws[e][g] = first position of expert e's pairs of block g`
 //!    (padded offset of e + the pairs of the earlier blocks), plus `tile_start`, `num_valid_ids`, `sorted_expert_ids` and the padding / tail sentinels of `sorted_token_ids` / `sorted_weights`.
 //!    ABI: ws @0, sorted_token_ids @8, sorted_weights @16, sorted_expert_ids @24, num_valid_ids @32, tile_start @40, M @48 (i32), G @52 (i32).
-//! 3. `moe_scatter_e<E>_k<K>`      grid G, 1024 threads: block g places its pairs: position = `ws[e][g]` advanced by an LDS cursor (`ds_add_rtn_u32`), so the layout is deterministic across blocks;
+//! 3. `moe_scatter_e<E>_k<K>_b<BM>` grid G, 1024 threads: block g places its pairs: position = `ws[e][g]` advanced by an LDS cursor (`ds_add_rtn_u32`), so the layout is deterministic across blocks;
 //!    inside a block the order of one expert's pairs is the arrival order. ABI: topk_ids @0, topk_weights @8, sorted_token_ids @16, sorted_weights @24, ws @32, M @40 (i32), P @44 (i32).
 
 use amdgpu_dsl::{AtomicOp, BinOp, CachePolicy, CmpPred, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
@@ -36,7 +36,10 @@ pub fn by_name(name: &str) -> Option<Function> {
     }
     match kind {
         1 if bm.is_none() => Some(moe_count(name, e, k)),
-        3 if bm.is_none() => Some(moe_scatter(name, e, k)),
+        3 => {
+            let bm: i64 = bm?.parse().ok()?;
+            [16, 32, 64, 128].contains(&bm).then(|| moe_scatter(name, e, k, bm))
+        }
         2 => {
             let bm: i64 = bm?.parse().ok()?;
             [16, 32, 64, 128].contains(&bm).then(|| moe_scan(name, e, k, bm))
@@ -334,7 +337,7 @@ pub fn moe_scan(name: &str, e: i64, k: i64, bm: i64) -> Function {
     fb.finish()
 }
 
-pub fn moe_scatter(name: &str, e: i64, k: i64) -> Function {
+pub fn moe_scatter(name: &str, e: i64, k: i64, bm: i64) -> Function {
     let mut fb = FnBuilder::new(name, T as u32);
     fb.compile_profile(CompileProfile::Default);
     let b = &mut fb;
@@ -346,7 +349,7 @@ pub fn moe_scatter(name: &str, e: i64, k: i64) -> Function {
     let mm = Ext::sym("M");
     b.sym_range("M", 1, 1 << 22);
     b.ka_is(40, mm.clone());
-    let maxp = mm.clone() * Ext::c(k) + Ext::c(e * 128 - k);   // the largest BM
+    let maxp = mm.clone() * Ext::c(k) + Ext::c(e * bm - k);
     b.arg_tensor("topk_ids", mm.clone() * Ext::c(4 * k));
     b.arg_tensor("topk_weights", mm.clone() * Ext::c(4 * k));
     b.arg_tensor("sorted_token_ids", maxp.clone() * Ext::c(4));
@@ -362,9 +365,10 @@ pub fn moe_scatter(name: &str, e: i64, k: i64) -> Function {
     let sz_ids = b.bind_i32(ev(n_el) << 2);
     let r_ids = { let v = b.read_first_lane(sz_ids); b.buffer_desc_dyn(ptr[0], v) };
     let r_w = { let v = b.read_first_lane(sz_ids); b.buffer_desc_dyn(ptr[1], v) };
-    // sorted_* have no known extent here (the scan kernel's max_padded depends on BM): the descriptors cover 4 GiB - 1 and the positions come from the scan
-    let r_sid = b.buffer_desc(ptr[2], 0xffff_ffff);
-    let r_sw = b.buffer_desc(ptr[3], 0xffff_ffff);
+    let maxp_v = b.bind_i32(ev(n_el) + (e * bm - k) as i32);
+    let sz_maxp = b.bind_i32(ev(maxp_v) << 2);
+    let r_sid = { let v = b.read_first_lane(sz_maxp); b.buffer_desc_dyn(ptr[2], v) };
+    let r_sw = { let v = b.read_first_lane(sz_maxp); b.buffer_desc_dyn(ptr[3], v) };
     let r_ws = b.buffer_desc(ptr[4], (e * WS_ROW as i64) as u32);
     let oob = b.c_i32(0x7fff_ff00);
     let tid4 = b.bind_i32(ev(tid) << 2);
