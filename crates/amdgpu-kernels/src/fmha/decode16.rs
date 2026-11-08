@@ -133,10 +133,14 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
 
     // ---- private LDS: per wave K (16 KB) + V (16 KB), as decode.rs ----
     let mut lds = LdsPlan::new();
-    let kv = lds.private("KV", 2 * (KT * ROW) as i64, 4, &[]);
+    // K and V in separate private regions (their DMAs complete separately: QK waits for K only)
+    let kreg = lds.private("K", (KT * ROW) as i64, 4, &[]);
+    let vreg = lds.private("V", (KT * ROW) as i64, 4, &[]);
     lds.commit(&mut b);
-    let me = kv.mine(wv);
+    let me = kreg.mine(wv);
+    let mev = vreg.mine(wv);
     let mbase = me.base();
+    let vbase0 = mev.base();
     let l16 = b.bind_i32(lane.lane() & 15);
     let kk_of = |i: i32| (lane.lane().lshr(4)) + 4 * i;
     // K reads (A: lane row = key l % 16 of a 16-key block, k = d 32 c + 8 g): chunk (4 c + g) ^ (key % 16)
@@ -172,23 +176,25 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
         .collect();
     // all K DMAs, then all V DMAs: QK and the softmax wait only for K (counted vmcnt), the V rows land meanwhile
     let nv = lookups.len() as u8;
+    let rows: Vec<(ValueId, ValueId)> = lookups
+        .iter()
+        .map(|&(kc, pv)| {
+            let pg = b.bitcast_i32(pv);
+            let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
+            (kc, b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW))
+        })
+        .collect();
     me.write(&mut b, Opnd::Var(it), |b| {
-        let rows: Vec<(ValueId, ValueId)> = lookups
-            .iter()
-            .map(|&(kc, pv)| {
-                let pg = b.bitcast_i32(pv);
-                let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
-                (kc, b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW))
-            })
-            .collect();
         for (i, &(kc, rowoff)) in rows.iter().enumerate() {
             let kvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4));
             let m0k = b.bind_i32(mbase.clone() + ((i as i32) << 10));
             b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
         }
+    });
+    mev.write(&mut b, Opnd::Var(it), |b| {
         for (i, &(_, rowoff)) in rows.iter().enumerate() {
             let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
-            let m0v = b.bind_i32(mbase.clone() + (KT * ROW + ((i as i32) << 10)));
+            let m0v = b.bind_i32(vbase0.clone() + ((i as i32) << 10));
             b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
         }
     });
@@ -260,8 +266,8 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
     b.set_var(l_v, l_new);
     b.wait_vm(0);
     // ---- O^T += V^T P^T: 2 steps of 32 keys x 8 blocks of 16 d ----
-    let vb = b.bind_i32(mbase.clone() + KT * ROW + ev(vr));
-    me.read_back(&mut b, Opnd::Var(it), |b| {
+    let vb = b.bind_i32(vbase0.clone() + ev(vr));
+    mev.read_back(&mut b, Opnd::Var(it), |b| {
         for t in 0..NKB / 2 {
             let w: Vec<ValueId> = [(2 * t, 0usize), (2 * t, 2), (2 * t + 1, 0), (2 * t + 1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
             let pf = b.pack4(w[0], w[1], w[2], w[3]);
