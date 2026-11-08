@@ -1156,14 +1156,17 @@ pub fn by_name(name: &str) -> Option<Function> {
         n if n.starts_with("gemm_moe") => {
             // gemm_moe<1|2>_<bf16|fp8>[_silu|_gelu][_dw]
             let (elem, scales) = if n.contains("_fp8bs") { (Elem::Fp8Bs, Scales::Block128) } else if n.contains("_fp8") { (Elem::Fp8, Scales::RowCol) } else { (Elem::Bf16, Scales::None) };
-            let st = if n.starts_with("gemm_moe1") {
-                MoeStage::Up { gelu: n.contains("_gelu"), doweight: n.ends_with("_dw") }
-            } else if n.ends_with("_h") {
+            // `_bm64` suffix: block_m 64 (64-row tiles, sparse experts)
+            let (n0, bm64) = match n.strip_suffix("_bm64") { Some(x) => (x, true), None => (n, false) };
+            let st = if n0.starts_with("gemm_moe1") {
+                MoeStage::Up { gelu: n0.contains("_gelu"), doweight: n0.ends_with("_dw") }
+            } else if n0.ends_with("_h") {
                 MoeStage::DownH
             } else {
                 MoeStage::Down
             };
-            Some(gemm_mxfp8_bs(n, GemmConfig::moe(elem, scales, st)))
+            let cfg = GemmConfig::moe(elem, scales, st);
+            Some(gemm_mxfp8_bs(n, if bm64 { GemmConfig { cta_m: 64, ..cfg } } else { cfg }))
         }
         n if n.starts_with("gemm_splitk_reduce_s") => {
             // gemm_splitk_reduce_s<S>[_rc]
