@@ -64,7 +64,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("topk_per_row_decode_f32_k") || n.starts_with("topk_per_row_prefill_f32_k") => crate::topk::perrow::by_name(n),
         n if n.starts_with("moe_fused_gate_bf16_e") => crate::topk::gate::by_name(n),
         // batch 2: causal conv1d update,
-        n if n.starts_with("causal_conv1d_update_bf16_w") => crate::conv::by_name(n),
+        n if n.starts_with("causal_conv1d_update_bf16_w") || n.starts_with("causal_conv1d_fwd_") => crate::conv::by_name(n),
         // (batch 2 cont.) sampling,
         n if n.starts_with("argmax_bf16_v") || n.starts_with("sample_bf16_v") || n.starts_with("sample_topkp_bf16_v") => crate::sampling::by_name(n),
         // (batch 2 cont.) MoE sorting, dequantization, expert routing, RoPE, KV-cache write
