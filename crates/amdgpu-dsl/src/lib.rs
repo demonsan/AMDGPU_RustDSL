@@ -1691,6 +1691,7 @@ impl FnBuilder {
                 var_tys: Vec::new(),
                 value_tys: Vec::new(),
             agpr: Vec::new(),
+                src_locs: SrcLocs::default(),
                 compile_profile: None,
             lower_opts: Vec::new(),
             sched_opts: None,
