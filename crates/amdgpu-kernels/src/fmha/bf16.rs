@@ -225,12 +225,8 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
         .map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & swz)) << 4)))
         .collect();
     // V^T (A of O^T, lane: d = 32 e + l % 32, k slot kk -> key 4 h + kk (kk < 4) or 8 + 4 h + kk - 4): bf16 at key row, column d
-    let vr: Vec<ValueId> = (0..8)
-        .map(|kk| {
-            let krow = if kk < 4 { kk } else { 8 + kk - 4 };
-            b.bind_i32((ev(half) * 4 + krow) * ROW + (lane.j() << 1))
-        })
-        .collect();
+    // V^T tr_b16 reads: lane s = l % 16 at key row 4 h + s / 4, dims 16 ((l % 32) / 16) + 4 (s % 4) (bytes x 2)
+    let vr: Vec<ValueId> = vec![b.bind_i32((ev(half) * 4 + (lane.lane() & 15).lshr(2)) * ROW + ((((lane.lane() & 31).lshr(4) << 4) + ((lane.lane() & 3) << 2)) << 1))];
 
     // ---- the key range: causal keys k <= q + SK - SQ; tiles rounded up to an even count ----
     // the visible keys of query q: [q' - left, q' + right] (q' = q + SK - SQ), right = 0 for causal, unbounded without a window
@@ -457,18 +453,16 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, keep
             let w: Vec<ValueId> = (0..4).map(|j| b.cvt_pk_bf16_f32(p[i0 + 2 * j], p[i0 + 2 * j + 1])).collect();
             let pf = b.frag4(w[0], w[1], w[2], w[3]);
             for e in 0..nblk as i32 {
-                let words: Vec<ValueId> = (0..4)
-                    .map(|j| {
-                        let ld = |b: &mut FnBuilder, kk: usize| {
-                            let a = b.bind_i32(ev(tm.vr[kk]) + vbase.clone() + (32 * sb as i32 + 16 * tt as i32) * ROW + 64 * e);
-                            let v = b.load_lds_d16(a, D16Ty::B16, false);
-                            b.bind_i32(ev(v) & 0xffff)
-                        };
-                        let lo = ld(b, 2 * j);
-                        let hi = ld(b, 2 * j + 1);
-                        b.bind_i32(ev(lo) | (ev(hi) << 16))
-                    })
-                    .collect();
+                // V^T (A operand) by two ds_read_b64_tr_b16 (amdgpu_isa::tr_b16): read r covers keys 8 r + 4 h + 0..3 of the step (the P
+                // slot order), lane s = l % 16 of its 16-lane group at key row (base + s / 4), dims 32 e + 16 ((l % 32) / 16) + 4 (s % 4)
+                let mut words: Vec<ValueId> = Vec::with_capacity(4);
+                for r in 0..2i32 {
+                    let a = b.bind_i32(ev(tm.vr[0]) + vbase.clone() + (32 * sb as i32 + 16 * tt as i32 + 8 * r) * ROW + 64 * e);
+                    let x = b.load_lds_tr_b16(a);
+                    words.push(b.frag2_lane(x, 0));
+                    words.push(b.frag2_lane(x, 1));
+                }
+                let words: Vec<ValueId> = words.into_iter().map(|w| b.bitcast_i32(w)).collect();
                 let vf = b.frag4(words[0], words[1], words[2], words[3]);
                 b.var_mfma(ov[e as usize], kind, vf, pf, false);
             }

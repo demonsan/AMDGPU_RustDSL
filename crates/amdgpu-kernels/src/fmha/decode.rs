@@ -132,12 +132,7 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     let kk_of = |i: i32| (lane.lane().lshr(4)) + 4 * i;
     // per-lane LDS read offsets (as the prefill kernel, relative to the region)
     let kr: Vec<ValueId> = (0..D / 16).map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & 15)) << 4))).collect();
-    let vr: Vec<ValueId> = (0..8)
-        .map(|kk| {
-            let krow = if kk < 4 { kk } else { 8 + kk - 4 };
-            b.bind_i32((ev(half) * 4 + krow) * ROW + (lane.j() << 1))
-        })
-        .collect();
+    let vr: Vec<ValueId> = vec![b.bind_i32((ev(half) * 4 + (lane.lane() & 15).lshr(2)) * ROW + ((((lane.lane() & 31).lshr(4) << 4) + ((lane.lane() & 3) << 2)) << 1))];
     let c_l2e = b.c_f32(std::f32::consts::LOG2_E);
     let csc = b.mul_f32(scale, c_l2e);
     let neg_inf = b.c_f32(f32::NEG_INFINITY);
