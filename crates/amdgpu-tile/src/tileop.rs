@@ -197,3 +197,40 @@ pub fn group_allreduce(b: &mut FnBuilder, op: DppAluOp, x: ValueId, l: i64) -> V
     }
     v
 }
+
+/// A register tile held in a loop-carried fragment VARIABLE (an MFMA accumulator): elements are read through `frag16_lane` / `frag4_lane` views
+/// (no copy) and, for `F32`, bitcast to f32.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VarTile {
+    pub var: amdgpu_dsl::VarId,
+    pub dwords: u8,
+    pub elem: DType,
+}
+
+impl VarTile {
+    pub fn f32(var: amdgpu_dsl::VarId, dwords: u8) -> VarTile {
+        assert!(matches!(dwords, 4 | 16));
+        VarTile { var, dwords, elem: DType::F32 }
+    }
+    /// Element `i` (a view, plus the f32 bitcast).
+    pub fn elem(&self, b: &mut FnBuilder, i: u8) -> ValueId {
+        let raw = if self.dwords == 16 { b.frag16_lane(Opnd::Var(self.var), i) } else { b.frag4_lane(Opnd::Var(self.var), i) };
+        if self.elem == DType::F32 { b.bitcast_f32(raw) } else { raw }
+    }
+}
+
+/// `ewise` over selected elements of a variable tile, element by element (read, then `f`): the per-element values (no fragment is built).
+pub fn ewise_elems(b: &mut FnBuilder, t: &VarTile, idx: impl IntoIterator<Item = u8>, f: impl Fn(&mut FnBuilder, ValueId) -> ValueId) -> Vec<ValueId> {
+    idx.into_iter()
+        .map(|i| {
+            let x = t.elem(b, i);
+            f(b, x)
+        })
+        .collect()
+}
+
+/// f32 values -> packed bf16 dwords (`v_cvt_pk_bf16_f32` per pair, RNE).
+pub fn pack_bf16(b: &mut FnBuilder, vals: &[ValueId]) -> Vec<ValueId> {
+    assert!(vals.len() % 2 == 0);
+    vals.chunks(2).map(|p| b.cvt_pk_bf16_f32(p[0], p[1])).collect()
+}
