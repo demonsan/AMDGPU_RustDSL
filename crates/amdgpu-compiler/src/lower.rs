@@ -1398,9 +1398,10 @@ impl Lowerer {
         if self.mir.vreg_class(dst) != class {
             return Err(format!("copy_reg: class mismatch {:?} -> {:?}", class, self.mir.vreg_class(dst)));
         }
+        // `sub_alias`: correct also when `dst` / `src` are themselves sub-tuple aliases (their offset is kept)
         for i in 0..width {
-            let s = self.alias_vreg(src, i as u8, RClass::V1);
-            let d = self.alias_vreg(dst, i as u8, RClass::V1);
+            let s = self.sub_alias(src, i as u8, RClass::V1);
+            let d = self.sub_alias(dst, i as u8, RClass::V1);
             self.push(MInst::new(MOp::VMovB32).def(d).srcreg(s));
         }
         Ok(())
