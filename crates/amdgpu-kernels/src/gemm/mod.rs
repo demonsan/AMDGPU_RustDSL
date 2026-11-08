@@ -83,13 +83,13 @@ struct ConvRt {
 
 /// q = n / d (both >= 0, n < 2^22) by a float reciprocal and one integer correction step.
 fn div_rt(b: &mut FnBuilder, n: ValueId, d: ValueId) -> ValueId {
-    let nf = b.un(amdgpu_dsl::UnOp::CvtI32F32, n);
-    let df = b.un(amdgpu_dsl::UnOp::CvtI32F32, d);
+    // (v_cvt_f32_i32 = CvtF32I32: int -> float; v_cvt_i32_f32 = CvtI32F32: float -> int)
+    let nf = b.un(amdgpu_dsl::UnOp::CvtF32I32, n);
+    let df = b.un(amdgpu_dsl::UnOp::CvtF32I32, d);
     let r = b.rcp_f32(df);
     let qf = b.mul_f32(nf, r);
     let qf = b.un(amdgpu_dsl::UnOp::FloorF32, qf);
-    let q = b.un(amdgpu_dsl::UnOp::CvtF32I32, qf);
-    let q = b.bitcast_i32(q);
+    let q = b.un(amdgpu_dsl::UnOp::CvtI32F32, qf);
     let rem = b.bind_i32(ev(n) - ev(q) * ev(d));
     b.bind_i32(ev(q) + ev(rem).ge(ev(d)).select_i32(1, 0) - ev(rem).lt(0).select_i32(1, 0))
 }
@@ -949,20 +949,20 @@ impl Body {
                 let cc = cv.cfg;
                 let trs = cc.t * cc.r * cc.s;
                 let rs = cc.r * cc.s;
-                // t / trs, rs / s by multiply-shift (exact for t < 2^16, checked)
-                let magic = |d: i32| -> i64 { ((1i64 << 20) + d as i64 - 1) / d as i64 };
+                // t / trs, rs / s by multiply-shift (exact for t < 2^12 = 4096 K tiles, checked)
+                let magic = |d: i32| -> i64 { ((1i64 << 24) + d as i64 - 1) / d as i64 };
                 for d in [trs, rs, cc.s] {
                     let m = magic(d);
-                    for x in 0..(1i64 << 16) {
-                        assert_eq!((x * m) >> 20, x / d as i64, "conv: multiply-shift by {d}");
+                    for x in 0..(1i64 << 12) {
+                        assert_eq!((x * m) >> 24, x / d as i64, "conv: multiply-shift by {d}");
                     }
                 }
                 let t = b.bind_i32(key0.clone().lshr(7));
-                let cb = b.bind_i32((ev(t) * magic(trs) as i32).lshr(20));
+                let cb = b.bind_i32((ev(t) * magic(trs) as i32).lshr(24));
                 let tap = b.bind_i32(ev(t) - ev(cb) * trs);
-                let dz = b.bind_i32((ev(tap) * magic(rs) as i32).lshr(20));
+                let dz = b.bind_i32((ev(tap) * magic(rs) as i32).lshr(24));
                 let tr = b.bind_i32(ev(tap) - ev(dz) * rs);
-                let rr = b.bind_i32((ev(tr) * magic(cc.s) as i32).lshr(20));
+                let rr = b.bind_i32((ev(tr) * magic(cc.s) as i32).lshr(24));
                 let ss = b.bind_i32(ev(tr) - ev(rr) * cc.s);
                 let toff = b.bind_i32((((ev(dz) * cc.dil) * ev(cv.h) + ev(rr) * cc.dil) * ev(cv.w) + ev(ss) * cc.dil) * ev(cv.c) * 2 + (ev(cb) << 7));
                 let big = b.c_i32(0x7fff_fff0);
