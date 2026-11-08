@@ -891,28 +891,38 @@ impl Body {
         });
         // MMAs of the register tile with the in-place reloads of t+1 (into `u`)
         let body = |b: &mut FnBuilder, u: &mut Units| {
+            // bf16 (two dependent K-half MFMAs per block): the blocks of a PAIR of rows form one unit (first halves of all, then second
+            // halves), so a block's second MFMA issues 8 MFMAs after its first (4 per row left 120 s_nops of MFMA dependency stalls)
+            let rows_per_unit = if self.cfg.elem == Elem::Bf16 && nm % 2 == 0 { 2 } else { 1 };
             for (lo, hi) in [(0, half), (half, nn)] {
-                for i in 0..nm {
-                    let todo: Vec<usize> = (lo..hi).filter(|&j| !(lo == 0 && i * half + j < self.npre_done)).collect(); // the rest were issued before the barrier
-                    let (w, by) = self.sa_sel(i);
-                    if self.cfg.elem == Elem::Fp8 {  // one unit per block
-                        for &j in &todo {
-                            u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by));
+                for i0 in (0..nm).step_by(rows_per_unit) {
+                    let rows = i0..i0 + rows_per_unit;
+                    let mut blocks = Vec::new();
+                    for i in rows.clone() {
+                        let todo: Vec<usize> = (lo..hi).filter(|&j| !(lo == 0 && i * half + j < self.npre_done)).collect(); // the rest were issued before the barrier
+                        let (w, by) = self.sa_sel(i);
+                        if self.cfg.elem == Elem::Fp8 {  // one unit per block
+                            for &j in &todo {
+                                u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by));
+                            }
+                        } else {
+                            blocks.extend(todo.iter().map(|&j| (self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by)));
                         }
-                    } else if !todo.is_empty() {
-                        // bf16: the row's blocks in one unit, first halves then second halves
-                        let blocks: Vec<_> = todo.iter().map(|&j| (self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by)).collect();
-                        u.capture(b, format!("mma.i{i}j{}-{}", todo[0], todo[todo.len() - 1]), |b| {
+                    }
+                    if !blocks.is_empty() {
+                        u.capture(b, format!("mma.i{i0}+{}h{lo}", rows_per_unit), |b| {
                             let p = mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks);
                             self.pending.borrow_mut().extend(p);
                         });
                     }
-                    if let (true, Some((ar, _))) = (lo == half, &next) {
-                        // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
-                        u.capture(b, format!("reload.a{i}"), |b| {
-                            let v = ar.read(b, i);
-                            b.set_var(av[i], v);
-                        });
+                    for i in rows {
+                        if let (true, Some((ar, _))) = (lo == half, &next) {
+                            // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
+                            u.capture(b, format!("reload.a{i}"), |b| {
+                                let v = ar.read(b, i);
+                                b.set_var(av[i], v);
+                            });
+                        }
                     }
                 }
                 if let Some((_, br)) = &next {
