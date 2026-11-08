@@ -24,7 +24,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     const size_t big_bytes = (size_t)9 << 30;
-    const uint64_t win[4] = {0xffffffull * 256 + 0x80, 0x1000000ull * 256 + 0x80, 0x1ffffffull * 256 + 0x80, 0x2000000ull * 256 + 0x80};
+    // must match BIG_ADDR_WINDOWS (crates/amdgpu-kernels/src/probes/tileops.rs): B of windows 0 / 2 crosses the 4 GiB / 8 GiB line
+    const uint64_t win[4] = {0xfffffeull * 256 + 0x80, 0x1000001ull * 256, 0x1fffffeull * 256 + 0x80, 0x2000001ull * 256};
     void *dbig = nullptr, *dres = nullptr;
     CK(hipMalloc(&dbig, big_bytes));
     CK(hipMalloc(&dres, 8 * 256));
@@ -63,6 +64,6 @@ int main(int argc, char** argv) {
         host_ok += a + bb;
         std::printf("  host window %d: A %d / 64, B %d / 64 (first words %08x %08x)\n", k, a, bb, w[0], w[64]);
     }
-    std::printf("probe_big_addr: on-GPU read-back passes %d / 512, host window check %d / 512 (windows at 4 GiB - 128, 4 GiB + 128, 8 GiB - 128, 8 GiB + 128)\n", pass, host_ok);
+    std::printf("probe_big_addr: on-GPU read-back passes %d / 512, host window check %d / 512 (B of window 0 / 2 crosses 4 GiB / 8 GiB; windows 1 / 3 just above)\n", pass, host_ok);
     return pass == 512 && host_ok == 512 ? 0 : 1;
 }

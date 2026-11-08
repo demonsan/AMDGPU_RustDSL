@@ -973,7 +973,8 @@ pub fn probe_ptr64_p1() -> Function {
 }
 
 /// The byte offsets of `probe_big_addr`'s windows (just below / above 4 GiB and 8 GiB) as (offset >> 8, offset & 255).
-pub const BIG_ADDR_WINDOWS: [(u32, u32); 4] = [(0x00ff_ffff, 0x80), (0x0100_0000, 0x80), (0x01ff_ffff, 0x80), (0x0200_0000, 0x80)];
+/// Window k covers A = [w, w + 256) and B = [w + 256, w + 512): windows 0 / 2 put B across the 4 GiB / 8 GiB line, windows 1 / 3 sit just above it.
+pub const BIG_ADDR_WINDOWS: [(u32, u32); 4] = [(0x00ff_fffe, 0x80), (0x0100_0001, 0x00), (0x01ff_fffe, 0x80), (0x0200_0001, 0x00)];
 
 /// `probe_big_addr(big, res)` (host tests/gpu/big_addr_host.cpp, a 9 GiB `big` buffer): for every window k, lane l writes pattern A
 /// (0xA000_0000 | k << 16 | l) at `window + 4 l` through a descriptor whose base was moved with a SCALAR `ptr_mad`, and pattern B
