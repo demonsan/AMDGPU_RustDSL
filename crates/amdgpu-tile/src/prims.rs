@@ -77,6 +77,20 @@ pub fn bf16x8_to_f32(b: &mut FnBuilder, frag4: ValueId) -> [ValueId; 8] {
     out
 }
 
+/// As [`bf16x8_to_f32`], but the eight f32 values come as four even-aligned PAIRS (Frag2: elements 2 d, 2 d + 1 of dword d) for the packed
+/// f32 ops: each pair's two unpack instructions (`lo << 16`, `w & 0xffff0000`) write the two registers of one pair directly (no moves).
+pub fn bf16x8_to_f32_pairs(b: &mut FnBuilder, frag4: ValueId) -> [ValueId; 4] {
+    let mut out = [0; 4];
+    for d in 0..4u8 {
+        let l = b.frag4_lane(Opnd::Val(frag4), d);
+        let w = b.bitcast_i32(l);
+        let lo = b.bind_i32(ev(w) << 16);
+        let hi = b.bind_i32(ev(w) & (0xffff_0000u32 as i32));
+        out[d as usize] = b.pack2(lo, hi);
+    }
+    out
+}
+
 /// Reduction operator of a row reduction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RedOp {

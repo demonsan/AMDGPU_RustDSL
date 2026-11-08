@@ -2146,6 +2146,13 @@ impl FnBuilder {
         let v = v.into();
         self.frag_cat(&[v])
     }
+    /// Two dwords as an (even-aligned) Frag2 with fresh single-use parts written IN PLACE - the operand form of the packed f32 ops
+    /// (`v_pk_add_f32` / `v_pk_mul_f32` / `v_pk_fma_f32`): the two defining instructions target the halves of one register pair, no moves
+    /// (`frag2` copies).
+    pub fn pack2(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        let p = [a.into(), b.into()];
+        self.frag_cat(&p)
+    }
     /// Four dwords as a Frag4 with fresh single-use parts written in place (`frag4` copies; this does not).
     pub fn pack4(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>) -> ValueId {
         let p = [a.into(), b.into(), c.into(), d.into()];
