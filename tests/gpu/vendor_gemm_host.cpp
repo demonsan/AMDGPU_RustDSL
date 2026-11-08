@@ -154,13 +154,13 @@ int main(int argc, char** argv) {
         if (dbg) for (auto& s : sb8) s = 127;
         if (dbg == 1) for (size_t i = 0; i < (size_t)M * K; i++) { uint16_t bb = f_to_bf16(1.0f); memcpy(&ha[2 * i], &bb, 2); af[i] = 1.0f; }
         if (dbg == 2) for (size_t i = 0; i < hb.size(); i++) { hb[i] = 0x22; bf[2 * i] = 1.0f; bf[2 * i + 1] = 1.0f; }
-        // permute: phys[p] = logical K 256 T + L(p), L(p) = 64 ((p % 64) / 16) + 16 (p / 64) + p % 16 (lane g's fp4 fragment = physical
-        // positions 64 g .. 64 g + 63, dword d = 2 k + h <-> A image k half h: logical 64 k + 16 g + 8 h + 0..7)
+        // permute: phys[p] = logical K 256 T + L(p), L(p) = 128 (p / 128) + 16 ((p / 64) % 2) + 8 ((p / 32) % 2) + 32 ((p / 8) % 4) + p % 8
+        // (measured with W4DBG=3: the A K index the MFMA pairs with physical fp4 position p of the tile)
         std::vector<uint8_t> hp(hb.size(), 0);
         for (int n = 0; n < N; n++)
             for (int k = 0; k < K; k++) {
                 int T = k / 256, p = k % 256;
-                int L = 64 * ((p % 64) / 16) + 16 * (p / 64) + p % 16;
+                int L = 128 * (p / 128) + 16 * ((p / 64) % 2) + 8 * ((p / 32) % 2) + 32 * ((p / 8) % 4) + p % 8;
                 size_t src = (size_t)n * K + 256 * T + L;
                 uint8_t code = (hb[src / 2] >> (4 * (src & 1))) & 15;
                 size_t dst = (size_t)n * K + k;
