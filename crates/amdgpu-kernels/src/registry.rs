@@ -37,7 +37,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("mlp_fp8_") => crate::mlp::by_name(n),
         // P2 (stage library): RMSNorm + per-token fp8 quantization from the generic E / R / Q stages; N in the name (multiple of 512)
         n if n.starts_with("rmsnorm_quant_fp8_n") => crate::norm::by_name(n),
-        // batch 2: RoPE, KV-cache write
+        // batch 2: expert routing, RoPE, KV-cache write
+        n if n.starts_with("topk_softmax_bf16_e") || n.starts_with("topk_softmax_renorm_bf16_e") => crate::topk::by_name(n),
         n if n.starts_with("rope_neox_bf16_h") || n.starts_with("rope_gptj_bf16_h") => crate::rope::by_name(n),
         n if n.starts_with("reshape_cache_flash_bf16_h") => crate::cache::by_name(n),
         // batch 2 (docs/op-coverage-memtemplates.md): row kernels, streaming elementwise

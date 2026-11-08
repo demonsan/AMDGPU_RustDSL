@@ -13,6 +13,7 @@
 #include "activation.h"
 #include "quant.h"
 #include "rmsnorm_quant.h"
+#include "moe_topk_op.h"
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s failed: %s\n", #x, hipGetErrorString(e_)); std::exit(1); } } while (0)
 static uint16_t f32_to_bf16(float f) { uint32_t u; std::memcpy(&u, &f, 4); u += 0x7fff + ((u >> 16) & 1); return (uint16_t)(u >> 16); }
 static AiterTensor bf16_rand(std::initializer_list<int64_t> dims, size_t n, float sd, uint32_t seed) {
@@ -58,6 +59,10 @@ int main(int argc, char** argv) {
     } else if (c == "silu_mul_quant") {
         AiterTensor in = bf16_rand({M, 2 * N}, MN * 2, 2.f, 1), out = AiterTensor::empty({M, N}, AITER_DTYPE_fp8, 0), sc = AiterTensor::empty({M, 1}, AITER_DTYPE_fp32, 0);
         ms = bench([&] { aiter::silu_and_mul_quant(out, in, sc, (int)N); }, iters); bytes = (double)MN * 5 + M * 4;
+    } else if (c == "topk_softmax") {   // M tokens, N experts, topk from env TOPK (default 8): gating bf16 [M][N]
+        int K = std::getenv("TOPK") ? std::atoi(std::getenv("TOPK")) : 8;
+        AiterTensor g = bf16_rand({M, N}, MN, 2.f, 1), w = AiterTensor::empty({M, (int64_t)K}, AITER_DTYPE_fp32, 0), id = AiterTensor::empty({M, (int64_t)K}, AITER_DTYPE_i32, 0), tid = AiterTensor::empty({M, (int64_t)K}, AITER_DTYPE_i32, 0), ws = AiterTensor::empty({M * N}, AITER_DTYPE_fp32, 0);
+        ms = bench([&] { aiter::topk_softmax(w, id, tid, g, ws, false, 0, "", std::nullopt); }, iters); bytes = (double)MN * 2 + (double)M * K * 8;
     } else { std::fprintf(stderr, "unknown case %s\n", c.c_str()); return 2; }
     std::printf("vendor %-15s M=%ld N=%ld: %.4f ms/iter, %.1f GB/s\n", c.c_str(), (long)M, (long)N, ms, bytes / ms / 1e6);
     return 0;
