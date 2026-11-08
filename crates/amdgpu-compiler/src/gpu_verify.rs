@@ -1025,6 +1025,8 @@ impl<'a> An<'a> {
             Opnd::I32(c) => vec![*c as i128],
             Opnd::Val(v) if depth > 0 => match self.defs.get(v) {
                 Some(Op::ConstI32(c)) => vec![*c as i128],
+                // a sentinel shifted by a constant (sentinel + k) is still a sentinel
+                Some(Op::AddI32(x, Opnd::I32(k))) | Some(Op::AddI32(Opnd::I32(k), x)) => self.select_consts(x, depth - 1).into_iter().map(|c| c + *k as i128).collect(),
                 Some(Op::Select { a, b, .. }) => {
                     let mut r = self.select_consts(a, depth - 1);
                     r.extend(self.select_consts(b, depth - 1));
