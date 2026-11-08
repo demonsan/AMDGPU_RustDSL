@@ -144,8 +144,9 @@ pub fn mla16_decode_bf16(name: &str, page: i32) -> Function {
     let l_init = b.c_f32(0.0);
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(m_init)), (DType::F32, Opnd::Val(l_init))];
     inits.extend((0..DB + 2).map(|_| (DType::Frag4, Opnd::Val(zero4))));
-    let any = b.bind_cond(ev(ntile).gt(0));
-    b.begin_if(Opnd::Val(any));
+    // no branch around the loop: an empty part runs one fully masked tile (P = 0, l = 0) and the epilogue writes O = 0, LSE = -inf (the
+    // previous if / else form hit a backend bug: a constant register materialised only on the then path was read on the else path)
+    let nloop = { let v = b.bind_i32(ev(ntile).max(1)); b.read_first_lane(v) };
     let vars = b.begin_loop(&inits);
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..3 + DB].to_vec();
@@ -264,7 +265,7 @@ pub fn mla16_decode_bf16(name: &str, page: i32) -> Function {
     });
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
-    let done = b.bind_cond(ev(it1).ge(ev(ntile)));
+    let done = b.bind_cond(ev(it1).ge(ev(nloop)));
     b.break_if(done);
     b.end_loop();
     // ---- the part's partial: O / l (fp32, 4 consecutive d per lane and block) and LSE ----
@@ -300,24 +301,5 @@ pub fn mla16_decode_bf16(name: &str, page: i32) -> Function {
     let l_vo_r = b.bind_i32(((ev(bat) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
     let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
     b.buffer_store_f32(r_l, l_vo, c0, 0, lse);
-    b.else_();
-    {
-        // an empty part: O = 0, LSE = -inf
-        let r_l = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
-        let l_vo_r = b.bind_i32(((ev(bat) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
-        let big = b.c_i32(0x7fff_fff0);
-        let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
-        b.buffer_store_f32(r_l, l_vo, c0, 0, neg_inf);
-        let r_po = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsplit) * (4 * DV)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
-        let row_po = b.bind_i32(((ev(bat) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) * (4 * DV));
-        let po_vo_r = b.bind_i32(ev(row_po) + (ev(grp) << 4));
-        let po_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(po_vo_r), b: Opnd::Val(big) });
-        let zz = b.c_i32(0);
-        let f4 = b.frag4(zz, zz, zz, zz);
-        for db in 0..DB {
-            b.buffer_store_b128(r_po, po_vo, c0, (16 * db as u32) * 4, f4);
-        }
-    }
-    b.end_if();
     b.finish()
 }
