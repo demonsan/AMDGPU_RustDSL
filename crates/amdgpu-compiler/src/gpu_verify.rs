@@ -1416,6 +1416,10 @@ impl<'a> An<'a> {
             }
             Stmt::StoreLdsN { addr, ty, .. } => self.check_lds_at("ds_write", addr, ty.bytes() as i128),
             Stmt::AtomicLdsNoRet { addr, .. } => self.check_lds_at("ds atomic", addr, 4),
+            Stmt::BufferAtomicNoRet { rsrc, voff, soff, imm, .. } => {
+                let r = self.av_of(rsrc);
+                self.check_buffer("buffer atomic", &r, voff, soff, *imm as i128, 4, true);
+            }
             Stmt::AtomicGlobalNoRet { base, byte_off, .. } => {
                 let b = self.av_of(base);
                 self.check_global("global atomic", &b, *byte_off as i128, 4, true)
@@ -1995,7 +1999,7 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
         Stmt::StoreLdsB32 { .. } | Stmt::StoreLdsB128 { .. } | Stmt::StoreLdsB64 { .. } => (0, 1),
         Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } => (1, 0),
         Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::AtomicLdsNoRet { .. } => (0, 1),
-        Stmt::AtomicGlobalNoRet { .. } => (1, 0),
+        Stmt::AtomicGlobalNoRet { .. } | Stmt::BufferAtomicNoRet { .. } => (1, 0),
         Stmt::Let { op, .. } => match op {
             Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::LoadF32Coherent { .. } | Op::BufferLoad { .. } => (1, 0),
             Op::BufferLoadB128x2 { .. } => (2, 0),
