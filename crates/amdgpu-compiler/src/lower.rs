@@ -105,7 +105,10 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         lw.uniform = u;
         lw.uvars = v;
     }
-    lw.run(f)?;
+    let res = lw.run(f);
+    // diagnostics: which value each virtual register was lowered from (read by `diag::from_compile_error` for allocation failures)
+    LAST_ORIGINS.with(|o| *o.borrow_mut() = lw.val.iter().map(|(v, r)| (*r, *v)).collect());
+    res?;
     let mut m = lw.finish()?;
     if opt_on("kabatch") {
         batch_kernarg_loads(&mut m);
@@ -2790,12 +2793,28 @@ impl Lowerer {
                 let (n, ty, _) = op.sig();
                 let (mop, partial) = cvt_mop(*op);
                 let mut rs = Vec::with_capacity(n);
-                for s in &srcs[..n] {
-                    rs.push(self.as_v1(*s)?);
+                for (k, s) in srcs[..n].iter().enumerate() {
+                    use amdgpu_dsl::CvtOp as C6;
+                    let wide = match op {
+                        C6::Scale2xPk16Fp6F32 | C6::Scale2xPk16Bf6F32 if k < 2 => Some(RClass::V16),
+                        C6::ScalePk32Fp6F16 | C6::ScalePk32Fp6Bf16 | C6::ScalePk32Bf6F16 | C6::ScalePk32Bf6Bf16 if k == 0 => Some(RClass::V16),
+                        C6::ScalePk32F16Fp6 | C6::ScalePk32Bf16Fp6 | C6::ScalePk32F16Bf6 | C6::ScalePk32Bf16Bf6 if k == 0 => Some(RClass::V8),
+                        _ => None,
+                    };
+                    rs.push(match wide {
+                        Some(RClass::V16) => self.as_v16(*s)?,
+                        Some(_) => self.as_v8(*s)?,
+                        None => self.as_v1(*s)?,
+                    });
                 }
                 let touched: Vec<Src> = rs.iter().map(|r| Src::Reg(*r)).collect();
                 self.touch(&touched);
-                let d = self.new_vreg(if ty == DType::Frag2 { RClass::V2 } else { RClass::V1 });
+                let d = self.new_vreg(match ty {
+                    DType::Frag2 => RClass::V2,
+                    DType::Frag8 => RClass::V8,
+                    DType::Frag16 => RClass::V16,
+                    _ => RClass::V1,
+                });
                 let mut inst = MInst::new(mop).def(d).imm(*sel as i64);
                 if partial {
                     // the instruction keeps the destination's other bits: start from the old value, tie it as the last source
@@ -4800,6 +4819,16 @@ fn cvt_mop(o: amdgpu_dsl::CvtOp) -> (MOp, bool) {
         C::ScalePkF32Fp8 => (MOp::VCvtScalePkF32Fp8, false),
         C::ScalePkF32Bf8 => (MOp::VCvtScalePkF32Bf8, false),
         C::ScalePkF32Fp4 => (MOp::VCvtScalePkF32Fp4, false),
+        C::Scale2xPk16Fp6F32 => (MOp::VCvtScale2xPk16Fp6F32, false),
+        C::Scale2xPk16Bf6F32 => (MOp::VCvtScale2xPk16Bf6F32, false),
+        C::ScalePk32Fp6F16 => (MOp::VCvtScalePk32Fp6F16, false),
+        C::ScalePk32Fp6Bf16 => (MOp::VCvtScalePk32Fp6Bf16, false),
+        C::ScalePk32Bf6F16 => (MOp::VCvtScalePk32Bf6F16, false),
+        C::ScalePk32Bf6Bf16 => (MOp::VCvtScalePk32Bf6Bf16, false),
+        C::ScalePk32F16Fp6 => (MOp::VCvtScalePk32F16Fp6, false),
+        C::ScalePk32Bf16Fp6 => (MOp::VCvtScalePk32Bf16Fp6, false),
+        C::ScalePk32F16Bf6 => (MOp::VCvtScalePk32F16Bf6, false),
+        C::ScalePk32Bf16Bf6 => (MOp::VCvtScalePk32Bf16Bf6, false),
         C::ScalePkBf16Fp4 => (MOp::VCvtScalePkBf16Fp4, false),
         C::ScalePkF16Fp4 => (MOp::VCvtScalePkF16Fp4, false),
         C::ScalePkFp8F32 => (MOp::VCvtScalePkFp8F32, true),
@@ -4954,4 +4983,13 @@ fn subst_stmt(s: &Stmt, map: &HashMap<ValueId, Opnd>) -> Stmt {
         Stmt::Let { dst, op: Op::Select { ty, cond, a, b } } => Stmt::Let { dst: *dst, op: Op::Select { ty: *ty, cond: sub(cond), a: sub(a), b: sub(b) } },
         other => other.clone(),
     }
+}
+
+thread_local! {
+    static LAST_ORIGINS: std::cell::RefCell<Vec<(VReg, ValueId)>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// (virtual register, value) pairs of the most recent `lower` on this thread (diagnostics).
+pub fn last_vreg_origins() -> Vec<(VReg, ValueId)> {
+    LAST_ORIGINS.with(|o| o.borrow().clone())
 }

@@ -1240,6 +1240,16 @@ impl FromIr for CvtOp {
             "PkU8F32" => { v.expect_unit("PkU8F32")?; Ok(CvtOp::PkU8F32) }
             "PkI16I32" => { v.expect_unit("PkI16I32")?; Ok(CvtOp::PkI16I32) }
             "PkU16U32" => { v.expect_unit("PkU16U32")?; Ok(CvtOp::PkU16U32) }
+            "Scale2xPk16Fp6F32" => { v.expect_unit("Scale2xPk16Fp6F32")?; Ok(CvtOp::Scale2xPk16Fp6F32) }
+            "Scale2xPk16Bf6F32" => { v.expect_unit("Scale2xPk16Bf6F32")?; Ok(CvtOp::Scale2xPk16Bf6F32) }
+            "ScalePk32Fp6F16" => { v.expect_unit("ScalePk32Fp6F16")?; Ok(CvtOp::ScalePk32Fp6F16) }
+            "ScalePk32Fp6Bf16" => { v.expect_unit("ScalePk32Fp6Bf16")?; Ok(CvtOp::ScalePk32Fp6Bf16) }
+            "ScalePk32Bf6F16" => { v.expect_unit("ScalePk32Bf6F16")?; Ok(CvtOp::ScalePk32Bf6F16) }
+            "ScalePk32Bf6Bf16" => { v.expect_unit("ScalePk32Bf6Bf16")?; Ok(CvtOp::ScalePk32Bf6Bf16) }
+            "ScalePk32F16Fp6" => { v.expect_unit("ScalePk32F16Fp6")?; Ok(CvtOp::ScalePk32F16Fp6) }
+            "ScalePk32Bf16Fp6" => { v.expect_unit("ScalePk32Bf16Fp6")?; Ok(CvtOp::ScalePk32Bf16Fp6) }
+            "ScalePk32F16Bf6" => { v.expect_unit("ScalePk32F16Bf6")?; Ok(CvtOp::ScalePk32F16Bf6) }
+            "ScalePk32Bf16Bf6" => { v.expect_unit("ScalePk32Bf16Bf6")?; Ok(CvtOp::ScalePk32Bf16Bf6) }
             other => Err(v.err(format!("unknown CvtOp variant `{other}`"))),
         }
     }
@@ -1267,6 +1277,16 @@ impl IrIds for CvtOp {
             CvtOp::PkU8F32 => {}
             CvtOp::PkI16I32 => {}
             CvtOp::PkU16U32 => {}
+            CvtOp::Scale2xPk16Fp6F32 => {}
+            CvtOp::Scale2xPk16Bf6F32 => {}
+            CvtOp::ScalePk32Fp6F16 => {}
+            CvtOp::ScalePk32Fp6Bf16 => {}
+            CvtOp::ScalePk32Bf6F16 => {}
+            CvtOp::ScalePk32Bf6Bf16 => {}
+            CvtOp::ScalePk32F16Fp6 => {}
+            CvtOp::ScalePk32Bf16Fp6 => {}
+            CvtOp::ScalePk32F16Bf6 => {}
+            CvtOp::ScalePk32Bf16Bf6 => {}
         }
     }
 }

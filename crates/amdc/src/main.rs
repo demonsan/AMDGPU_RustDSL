@@ -357,6 +357,29 @@ fn main() -> ExitCode {
             };
             let mut bad = false;
             let (mut tot_trusted, mut tot_contracts, mut tot_unproven) = (0usize, 0usize, 0usize);
+            if args.iter().any(|a| a == "--json") {
+                // structured findings (docs/diagnostics.md): one JSON object per kernel
+                let mut objs = Vec::new();
+                for name in names {
+                    let (f, _) = match kernel_spec(&name, &args) {
+                        Ok(x) => x,
+                        Err(c) => return c,
+                    };
+                    let ds = match amdgpu_compiler::gpu_verify::analyse(&f) {
+                        Ok(r) => {
+                            bad |= !r.errors().is_empty();
+                            amdgpu_compiler::diag::from_report(&f, &r)
+                        }
+                        Err(e) => {
+                            bad = true;
+                            amdgpu_compiler::diag::from_compile_error(&f, &e)
+                        }
+                    };
+                    objs.push(format!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&ds)));
+                }
+                println!("[{}]", objs.join(","));
+                return if strict && bad { ExitCode::from(1) } else { ExitCode::SUCCESS };
+            }
             for name in names {
                 let (f, _) = match kernel_spec(&name, &args) {
                     Ok(x) => x,
@@ -392,6 +415,27 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             } else {
                 ExitCode::SUCCESS
+            }
+        }
+        "summary" => {
+            // amdc summary <kernel> [--json]: resources, per-region instruction mix, waits / nops, certificate counts (docs/diagnostics.md)
+            let Some(name) = args.get(1) else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let (f, _) = match kernel_spec(name, &args) {
+                Ok(x) => x,
+                Err(c) => return c,
+            };
+            match amdgpu_compiler::diag::summary_json(&f) {
+                Ok(j) => {
+                    println!("{j}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    println!("{{\"kernel\":\"{}\",\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&amdgpu_compiler::diag::from_compile_error(&f, &e)));
+                    ExitCode::from(1)
+                }
             }
         }
         "mops" => {
@@ -500,13 +544,35 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            let json = args.iter().any(|a| a == "--json");
             let f = match amdgpu_dsl::ir_text::parse(&text) {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("{path}: {e}");
+                    if json {
+                        let d = amdgpu_compiler::diag::Diag { code: "IR-PARSE".into(), severity: "error".into(), message: format!("{path}: {e}"), ..Default::default() };
+                        println!("{{\"file\":\"{path}\",\"ok\":false,\"diagnostics\":{}}}", amdgpu_compiler::diag::to_json(&[d]));
+                    } else {
+                        eprintln!("{path}: {e}");
+                    }
                     return ExitCode::from(2);
                 }
             };
+            if json {
+                // structured: the IR verifier's findings (statement-localized) and the strict certificate's when --verify
+                let mut ds: Vec<amdgpu_compiler::diag::Diag> = amdgpu_dsl::verify(&f)
+                    .into_iter()
+                    .map(|m| amdgpu_compiler::diag::localize(&f, amdgpu_compiler::diag::Diag { code: if m.contains("not provably wave-uniform") { "IR-UNIFORM-BRANCH".into() } else { "IR-VERIFY".into() }, severity: "error".into(), message: m, ..Default::default() }))
+                    .collect();
+                if args.iter().any(|a| a == "--verify") {
+                    match amdgpu_compiler::gpu_verify::analyse(&f) {
+                        Ok(r) => ds.extend(amdgpu_compiler::diag::from_report(&f, &r)),
+                        Err(e) => ds.extend(amdgpu_compiler::diag::from_compile_error(&f, &e)),
+                    }
+                }
+                let ok = !ds.iter().any(|d| d.severity == "error");
+                println!("{{\"file\":\"{path}\",\"kernel\":\"{}\",\"ok\":{ok},\"statements\":{},\"values\":{},\"diagnostics\":{}}}", f.name, f.stmts().len(), f.value_tys.len(), amdgpu_compiler::diag::to_json(&ds));
+                return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+            }
             let again = amdgpu_dsl::ir_text::print(&f);
             let fix = amdgpu_dsl::ir_text::parse(&again).map(|g| format!("{g:?}") == format!("{f:?}")).unwrap_or(false);
             println!(
@@ -540,7 +606,32 @@ fn main() -> ExitCode {
                 Ok(x) => x,
                 Err(c) => return c,
             };
+            let json = args.iter().any(|a| a == "--json");
             match amdgpu_compiler::compile_mir_alloc(&f) {
+                Ok((m, a)) if json => {
+                    let regs: Vec<String> = amdgpu_compiler::regplan::region_report(&m, &a)
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "{{\"name\":\"{}\",\"insts\":{},\"vgpr_footprint_peak\":{},\"vgpr_live_peak\":{},\"agpr_footprint_peak\":{},\"peak_at\":[{},{}],\"live_at_peak\":[{}]}}",
+                                p.name,
+                                p.insts,
+                                p.vgpr_footprint_peak,
+                                p.vgpr_live_peak,
+                                p.agpr_footprint_peak,
+                                p.at.0,
+                                p.at.1,
+                                p.live_at_peak.iter().take(32).map(|s| format!("\"{}\"", s.replace('"', "'"))).collect::<Vec<_>>().join(",")
+                            )
+                        })
+                        .collect();
+                    println!("{{\"kernel\":\"{}\",\"vgpr\":{},\"agpr\":{},\"regions\":[{}]}}", f.name, a.max_v, amdgpu_compiler::regalloc::agpr_count(&m, &a), regs.join(","));
+                    ExitCode::SUCCESS
+                }
+                Err(e) if json => {
+                    println!("{{\"kernel\":\"{}\",\"ok\":false,\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&amdgpu_compiler::diag::from_compile_error(&f, &e)));
+                    ExitCode::from(1)
+                }
                 Ok((m, a)) => {
                     println!("{}: arch VGPRs {} AGPRs {}", f.name, a.max_v, amdgpu_compiler::regalloc::agpr_count(&m, &a));
                     for p in amdgpu_compiler::regplan::region_report(&m, &a) {
@@ -673,7 +764,22 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             let tail: &dyn TailBackend = tail.as_ref();
+            let json = args.iter().any(|a| a == "--json");
             match amdgpu_compiler::compile_with(&f, tail) {
+                Ok(c) if json => {
+                    if let Some(p) = &out_path {
+                        if let Err(e) = fs::write(p, &c.asm) {
+                            eprintln!("cannot write {p}: {e}");
+                            return ExitCode::from(1);
+                        }
+                    }
+                    println!("{{\"kernel\":\"{}\",\"ok\":true,\"backend\":\"{}\",\"vgpr\":{},\"sgpr\":{},\"out\":{},\"diagnostics\":[]}}", f.name, tail.name(), c.vgpr, c.sgpr, out_path.as_ref().map(|p| format!("\"{p}\"")).unwrap_or_else(|| "null".into()));
+                    ExitCode::SUCCESS
+                }
+                Err(e) if json => {
+                    println!("{{\"kernel\":\"{}\",\"ok\":false,\"diagnostics\":{}}}", f.name, amdgpu_compiler::diag::to_json(&amdgpu_compiler::diag::from_compile_error(&f, &e)));
+                    ExitCode::from(1)
+                }
                 Ok(c) => {
                     match out_path {
                         Some(p) => {
