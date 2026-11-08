@@ -628,11 +628,145 @@ def check_cvt_p1(planes, out):
         k += n
     return ok
 
+# ---------------------------------------------------------------- probe_dpp_p1
+DPP_CASES = [(("qp", (3, 2, 1, 0)), 15, 15, False, None), (("shl", 1), 15, 15, False, None), (("shr", 3), 15, 15, False, None), (("ror", 5), 15, 15, False, None),
+             (("wshl",), 15, 15, False, None), (("wrol",), 15, 15, False, None), (("wshr",), 15, 15, False, None), (("wror",), 15, 15, False, None),
+             (("mirror",), 15, 15, False, None), (("hmirror",), 15, 15, False, None), (("bc15",), 15, 15, False, None), (("bc31",), 15, 15, False, None),
+             (("shr", 1), 15, 15, True, None), (("bc15",), 0xA, 15, False, None), (("shr", 2), 15, 0x5, False, None),
+             (("shr", 1), 15, 15, False, "AddU32"), (("bc31",), 0xC, 15, False, "MaxI32"), (("shr", 4), 15, 15, True, "AddF32"),
+             (("qp", (1, 0, 3, 2)), 15, 15, False, "MinU32"), (("hmirror",), 15, 15, False, "XorB32")]
+
+def gen_dpp_p1():
+    rnd = random.Random(11)
+    return [[rnd.getrandbits(32) for _ in range(LANES)], [rnd.getrandbits(32) for _ in range(LANES)],
+            [u32(float(rnd.randint(-50, 50))) for _ in range(LANES)], [u32(float(rnd.randint(-50, 50))) for _ in range(LANES)]]
+
+def dpp_src(ctrl, i):
+    """source lane of lane i, or None (invalid)"""
+    r, j = i // 16 * 16, i % 16
+    k = ctrl[0]
+    if k == "qp": return (i & ~3) + ctrl[1][i & 3]
+    if k == "shl": return i + ctrl[1] if j + ctrl[1] < 16 else None
+    if k == "shr": return i - ctrl[1] if j >= ctrl[1] else None
+    if k == "ror": return r + (j - ctrl[1]) % 16
+    if k == "wshl": return i + 1 if i < 63 else None
+    if k == "wshr": return i - 1 if i > 0 else None
+    if k == "wrol": return (i + 1) % 64
+    if k == "wror": return (i - 1) % 64
+    if k == "mirror": return r + 15 - j
+    if k == "hmirror": return i // 8 * 8 + 7 - i % 8
+    # broadcasts: the rows they do not target read their own lane (measured), not an invalid source
+    if k == "bc15": return r - 1 if r >= 16 else i
+    if k == "bc31": return 31 if i >= 32 else i
+    raise ValueError(k)
+
+def check_dpp_p1(planes, out):
+    x, y, fx, fy = planes
+    ok = True
+    for k, (ctrl, row, bank, bz, op) in enumerate(DPP_CASES):
+        bad = []
+        for i in range(LANES):
+            old = (0xDEAD0000 + i) & 0xFFFFFFFF
+            written = (row >> (i // 16)) & 1 and (bank >> ((i % 16) // 4)) & 1
+            s = dpp_src(ctrl, i)
+            if s is None and not bz:
+                written = False
+            if not written:
+                want = old
+            else:
+                if op == "AddF32":
+                    a = f32(fx[s]) if s is not None else 0.0
+                    want = u32(a + f32(fy[i]))
+                else:
+                    a = x[s] if s is not None else 0
+                    b = y[i]
+                    if op is None: want = a
+                    elif op == "AddU32": want = (a + b) & 0xFFFFFFFF
+                    elif op == "MaxI32": want = max(s32(a), s32(b)) & 0xFFFFFFFF
+                    elif op == "MinU32": want = min(a, b)
+                    elif op == "XorB32": want = a ^ b
+            got = out[k * LANES + i]
+            if got != want:
+                bad.append((i, hex(want), hex(got)))
+        name = f"{op or 'mov'} {ctrl} row_mask {row:#x} bank_mask {bank:#x}{' bound_ctrl' if bz else ''}"
+        if bad:
+            ok = False
+            print(f"FAIL {name}: {len(bad)} lanes, e.g. {bad[:3]}")
+        else:
+            print(f"ok   {name}")
+    k = len(DPP_CASES)
+    na = [x[i] if (i // 16) % 2 == 0 else y[i - 16] for i in range(LANES)]
+    nb = [x[i + 16] if (i // 16) % 2 == 0 else y[i] for i in range(LANES)]
+    for j, want in enumerate((na, nb)):
+        got = out[(k + j) * LANES:(k + j + 1) * LANES]
+        if got != want:
+            ok = False
+            print(f"FAIL permlane16_swap {'ab'[j]}: lane 0..3 got {[hex(v) for v in got[:20:4]]} want {[hex(v) for v in want[:20:4]]}")
+        else:
+            print(f"ok   permlane16_swap {'ab'[j]}")
+    return ok
+
+# ---------------------------------------------------------------- probe_tr_b16_p1 (layout discovery: prints the map; checked against TR_B16_MAP)
+def gen_tr_b16_p1():
+    return [[(2 * i) | ((2 * i + 1) << 16) for i in range(1024)]]
+
+def tr_b16_formula(l, e, extra):
+    """(source lane whose address is used, element) of value e of lane l: see check output; None until established"""
+    return None
+
+def check_tr_b16_p1(planes, out):
+    ok = True
+    for j in range(2):
+        for l in range(LANES):
+            w = out[j * 128 + 2 * l: j * 128 + 2 * l + 2]
+            vals = [(w[0] & 0xFFFF), w[0] >> 16, w[1] & 0xFFFF, w[1] >> 16]
+            want = [256 * j + 4 * (16 * (l // 16) + (l % 16) // 4 + 4 * e) + l % 4 for e in range(4)]
+            if vals != want:
+                ok = False
+    print("tr_b16 map " + ("matches lane d <- element d % 4 of lanes 16 (d / 16) + (d % 16) / 4 + 4 e" if ok else "MISMATCH"))
+    if ok and "-v" not in sys.argv:
+        return True
+    for j in range(2):
+        print(f"read {j}: lane: [values / 4 (source lane), values % 4 (element)]")
+        for l in range(LANES):
+            w = out[j * 128 + 2 * l: j * 128 + 2 * l + 2]
+            vals = [(w[0] & 0xFFFF), w[0] >> 16, w[1] & 0xFFFF, w[1] >> 16]
+            base = 256 * j
+            print(f"  {l:2d}: {[(v - base) // 4 for v in vals]} {[(v - base) % 4 for v in vals]}")
+    return ok
+
+# ---------------------------------------------------------------- probe_tr_b16_mfma: D = T^T x B with A from ds_read_b64_tr_b16
+def tr_mfma_data():
+    rnd = random.Random(21)
+    T = [[rnd.randint(-4, 4) for m in range(16)] for k in range(32)]
+    B = [[rnd.randint(-4, 4) for n in range(16)] for k in range(32)]
+    return T, B
+
+def gen_tr_b16_mfma():
+    T, B = tr_mfma_data()
+    words = []
+    flat = [enc("bf16", T[k][m]) for k in range(32) for m in range(16)]
+    words += [flat[2 * i] | (flat[2 * i + 1] << 16) for i in range(256)]
+    for l in range(LANES):
+        vals = [enc("bf16", B[8 * (l // 16) + v][l % 16]) for v in range(8)]
+        words += [vals[2 * i] | (vals[2 * i + 1] << 16) for i in range(4)]
+    return [words]
+
+def check_tr_b16_mfma(planes, out):
+    T, B = tr_mfma_data()
+    D = [[sum(T[k][m] * B[k][n] for k in range(32)) for n in range(16)] for m in range(16)]
+    bad = sum(1 for l in range(LANES) for r in range(4) if f32(out[4 * l + r]) != D[4 * (l // 16) + r][l % 16])
+    print("tr_b16 -> v_mfma_f32_16x16x32_bf16 A operand (T^T): " + ("exact" if not bad else f"{bad} wrong values"))
+    return bad == 0
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
     "probe_f8f6f4_p1": (gen_f8f6f4_p1, check_f8f6f4_p1, sum(2 * LANES * 4 * (4 if k[0] == 16 else 16) for k in F8F6F4_KINDS)),
     "probe_cvt_p1": (gen_cvt_p1, check_cvt_p1, sum(2 if c[0] in TWO else 1 for c in CVT_CASES) * LANES * 4),
+    "probe_dpp_p1": (gen_dpp_p1, check_dpp_p1, (len(DPP_CASES) + 2) * LANES * 4),
+    "probe_tr_b16_p1": (gen_tr_b16_p1, check_tr_b16_p1, 1024),
+    "probe_tr_b16_mfma": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }

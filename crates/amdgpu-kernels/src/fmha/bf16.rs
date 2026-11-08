@@ -225,12 +225,8 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
         .map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & swz)) << 4)))
         .collect();
     // V^T (A of O^T, lane: d = 32 e + l % 32, k slot kk -> key 4 h + kk (kk < 4) or 8 + 4 h + kk - 4): bf16 at key row, column d
-    let vr: Vec<ValueId> = (0..8)
-        .map(|kk| {
-            let krow = if kk < 4 { kk } else { 8 + kk - 4 };
-            b.bind_i32((ev(half) * 4 + krow) * ROW + (lane.j() << 1))
-        })
-        .collect();
+    // V^T tr_b16 reads: lane s = l % 16 at key row 4 h + s / 4, dims 16 ((l % 32) / 16) + 4 (s % 4) (bytes x 2)
+    let vr: Vec<ValueId> = vec![b.bind_i32((ev(half) * 4 + (lane.lane() & 15).lshr(2)) * ROW + ((((lane.lane() & 31).lshr(4) << 4) + ((lane.lane() & 3) << 2)) << 1))];
 
     // ---- the key range: causal keys k <= q + SK - SQ; tiles rounded up to an even count ----
     // the visible keys of query q: [q' - left, q' + right] (q' = q + SK - SQ), right = 0 for causal, unbounded without a window
@@ -266,6 +262,7 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
     let neg_inf = b.c_f32(f32::NEG_INFINITY);
     let kind = MmaKind::new(MmaShape::M32N32K16, MmaTy::Bf16);
     let zero16 = b.frag_zero(DType::Frag16);
+    let tm = Tm { d: D, kind, csc, neg_inf, kr: kr.clone(), vr: vr.clone(), qf: qf.clone() };
     let m_init = b.c_f32(-1.0e30);
     let l_init = b.c_f32(0.0);
 
@@ -297,101 +294,16 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
         let nxt = b.bind_i32(ev(nxt).min(ev(last)));
         let gen_n = if slot == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
         stage(&mut b, nxt, 1 - slot, gen_n);
-        // ---- S^T = K Q^T: 2 blocks of 32 keys, 8 MFMAs each ----
-        let kbase = ks.base as i32 + slot * KT * ROW;
-        let s: Vec<ValueId> = ks.at(&SlotIdx::new(slot, Opnd::Var(it))).read(&mut b, |b| {
-            (0..2)
-                .map(|sb| {
-                    let mut acc: Option<ValueId> = None;
-                    for c in 0..(D / 16) as usize {
-                        let a = b.bind_i32(ev(kr[c]) + kbase + sb * 32 * ROW);
-                        let kf = b.load_lds_b128(a);
-                        acc = Some(b.mfma(kind, kf, qf[c], acc.map(Opnd::Val)));
-                    }
-                    acc.expect("8 MFMAs")
-                })
-                .collect()
-        });
-        // ---- online softmax over the 64 keys of the tile (lane: one query, values = keys 32 sb + 8 (r / 4) + 4 h + r % 4) ----
+        let kbase = I32::c(ks.base as i32 + slot * KT * ROW);
+        let vbase = I32::c(vs.base as i32 + slot * KT * ROW);
         let key0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
-        let mut sv: Vec<ValueId> = Vec::with_capacity(32);
-        for sb in 0..2usize {
-            for r in 0..16u8 {
-                let x = b.frag16_lane(s[sb], r);
-                let x = b.bitcast_f32(x);
-                let off = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
-                let keep = match low {
-                    Some(lo) => b.bind_cond(((ev(key0) + off).le(ev(lim)).select_i32(1, 0) & (ev(key0) + off).ge(ev(lo)).select_i32(1, 0)).eq(1)),
-                    None => b.bind_cond((ev(key0) + off).le(ev(lim))),
-                };
-                sv.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
-            }
-        }
-        let mut mx = sv[0];
-        for x in &sv[1..] {
-            mx = b.max_f32(mx, *x);
-        }
-        let (pa, pb) = b.permlane32_swap(mx, mx);
-        let (pa, pb) = (b.bitcast_f32(pa), b.bitcast_f32(pb));
-        let mt = b.max_f32(pa, pb);
-        let mt = b.mul_f32(mt, csc);
-        let m_new = b.max_f32(Opnd::Var(m_v), mt);
-        let dm = b.sub_f32(Opnd::Var(m_v), m_new);
-        let alpha = b.exp2_f32(dm);
-        let zf = b.c_f32(0.0);
-        let nm = b.sub_f32(zf, m_new);
-        let p: Vec<ValueId> = sv
-            .iter()
-            .map(|x| {
-                let t = b.let_(Op::FmaF32(Opnd::Val(*x), Opnd::Val(csc), Opnd::Val(nm)));
-                b.exp2_f32(t)
-            })
-            .collect();
-        let mut ps = p[0];
-        for x in &p[1..] {
-            ps = b.add_f32(ps, *x);
-        }
-        let l_new = b.let_(Op::FmaF32(Opnd::Var(l_v), Opnd::Val(alpha), Opnd::Val(ps)));
-        b.set_var(m_v, m_new);
-        b.set_var(l_v, l_new);
-        // O^T *= alpha (one query per lane: a scalar)
-        for e in 0..nblk {
-            for r in 0..16u8 {
-                let x = b.frag16_lane(Opnd::Var(ov[e]), r);
-                let x = b.bitcast_f32(x);
-                let y = b.mul_f32(x, alpha);
-                b.var_set_lane(ov[e], r, y);
-            }
-        }
-        // ---- O^T += V^T P^T: 4 steps of 16 keys x 4 blocks of 32 d ----
-        let vbase = vs.base as i32 + slot * KT * ROW;
-        vs.at(&SlotIdx::new(slot, Opnd::Var(it))).read(&mut b, |b| {
-            for t in 0..4usize {
-                let (sb, tt) = (t / 2, t % 2);
-                // P^T (B operand): k slots = values 8 tt + 0..7 of block sb
-                let i0 = 16 * sb + 8 * tt;
-                let w: Vec<ValueId> = (0..4).map(|j| b.cvt_pk_bf16_f32(p[i0 + 2 * j], p[i0 + 2 * j + 1])).collect();
-                let pf = b.frag4(w[0], w[1], w[2], w[3]);
-                for e in 0..nblk as i32 {
-                    let words: Vec<ValueId> = (0..4)
-                        .map(|j| {
-                            let ld = |b: &mut FnBuilder, kk: usize| {
-                                let a = b.bind_i32(ev(vr[kk]) + vbase + (32 * sb as i32 + 16 * tt as i32) * ROW + 64 * e);
-                                let v = b.load_lds_d16(a, D16Ty::B16, false);
-                                b.bind_i32(ev(v) & 0xffff)
-                            };
-                            let lo = ld(b, 2 * j);
-                            let hi = ld(b, 2 * j + 1);
-                            b.bind_i32(ev(lo) | (ev(hi) << 16))
-                        })
-                        .collect();
-                    let vf = b.frag4(words[0], words[1], words[2], words[3]);
-                    b.var_mfma(ov[e as usize], kind, vf, pf, false);
-                }
-            }
-        });
-    }
-    let it1 = b.bind_i32(itx.clone() + 1);
+        let keep = |b: &mut FnBuilder, off: i32| match low {
+            Some(lo) => b.bind_cond(((ev(key0) + off).le(ev(lim)).select_i32(1, 0) & (ev(key0) + off).ge(ev(lo)).select_i32(1, 0)).eq(1)),
+            None => b.bind_cond((ev(key0) + off).le(ev(lim))),
+        };
+        let (kslot, vslot) = (ks.at(&SlotIdx::new(slot, Opnd::Var(it))), vs.at(&SlotIdx::new(slot, Opnd::Var(it))));
+        tile_math(&mut b, &tm, kbase, vbase, &keep, m_v, l_v, &ov, &|b, f| kslot.read(b, |b| f(b)), &|b, f| vslot.read(b, |b| f(b)));
+    }    let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
     let done = b.bind_cond(ev(it1).ge(ev(npair)));
     b.break_if(done);
@@ -447,4 +359,113 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
         b.end_if();
     }
     b.finish()
+}
+/// What the per-tile math of the bf16 attention kernels shares (`tile_math`).
+pub(crate) struct Tm {
+    pub d: i32,
+    pub kind: MmaKind,
+    /// scale log2(e)
+    pub csc: ValueId,
+    pub neg_inf: ValueId,
+    /// per-lane LDS offsets of the K A-operand reads (one per 16-dim chunk) and of the V^T 16-bit reads (one per k slot)
+    pub kr: Vec<ValueId>,
+    pub vr: Vec<ValueId>,
+    /// Q^T fragments (B operand), one per 16-dim chunk
+    pub qf: Vec<ValueId>,
+}
+
+/// LDS read scope (the verifier's slot / private read wrapper) around a group of reads.
+pub(crate) type ReadScope<'a> = &'a dyn Fn(&mut FnBuilder, &mut dyn FnMut(&mut FnBuilder));
+
+/// One 64-key tile: S^T = K Q^T from the K tile at `kbase`, the online softmax update (`keep(off)`: key key0 + off of this lane is visible;
+/// m / l / O^T loop variables), O^T += V^T P^T from the V tile at `vbase` (V^T by 16-bit reads in the key order of the P packing).
+#[allow(non_snake_case, clippy::too_many_arguments)]
+pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, keep: &dyn Fn(&mut FnBuilder, i32) -> ValueId, m_v: VarId, l_v: VarId, ov: &[VarId], kscope: ReadScope, vscope: ReadScope) {
+    let (D, kind, csc, neg_inf) = (tm.d, tm.kind, tm.csc, tm.neg_inf);
+    let ROW = 2 * D;
+    let nblk = ov.len();
+    // ---- S^T = K Q^T: 2 blocks of 32 keys, D / 16 MFMAs each ----
+    let mut s: Vec<ValueId> = Vec::new();
+    kscope(b, &mut |b| {
+        for sb in 0..2 {
+            let mut acc: Option<ValueId> = None;
+            for c in 0..(D / 16) as usize {
+                let a = b.bind_i32(ev(tm.kr[c]) + kbase.clone() + sb * 32 * ROW);
+                let kf = b.load_lds_b128(a);
+                acc = Some(b.mfma(kind, kf, tm.qf[c], acc.map(Opnd::Val)));
+            }
+            s.push(acc.expect("MFMAs"));
+        }
+    });
+    // ---- online softmax over the 64 keys (lane: one query, values = keys 32 sb + 8 (r / 4) + 4 h + r % 4) ----
+    let mut sv: Vec<ValueId> = Vec::with_capacity(32);
+    for sb in 0..2usize {
+        for r in 0..16u8 {
+            let x = b.frag16_lane(s[sb], r);
+            let x = b.bitcast_f32(x);
+            let off = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
+            let k = keep(b, off);
+            sv.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(k), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
+        }
+    }
+    let mut mx = sv[0];
+    for x in &sv[1..] {
+        mx = b.max_f32(mx, *x);
+    }
+    let (pa, pb) = b.permlane32_swap(mx, mx);
+    let (pa, pb) = (b.bitcast_f32(pa), b.bitcast_f32(pb));
+    let mt = b.max_f32(pa, pb);
+    let mt = b.mul_f32(mt, csc);
+    let m_new = b.max_f32(Opnd::Var(m_v), mt);
+    let dm = b.sub_f32(Opnd::Var(m_v), m_new);
+    let alpha = b.exp2_f32(dm);
+    let zf = b.c_f32(0.0);
+    let nm = b.sub_f32(zf, m_new);
+    let p: Vec<ValueId> = sv
+        .iter()
+        .map(|x| {
+            let t = b.let_(Op::FmaF32(Opnd::Val(*x), Opnd::Val(csc), Opnd::Val(nm)));
+            b.exp2_f32(t)
+        })
+        .collect();
+    let mut ps = p[0];
+    for x in &p[1..] {
+        ps = b.add_f32(ps, *x);
+    }
+    let l_new = b.let_(Op::FmaF32(Opnd::Var(l_v), Opnd::Val(alpha), Opnd::Val(ps)));
+    b.set_var(m_v, m_new);
+    b.set_var(l_v, l_new);
+    // O^T *= alpha (one query per lane: a scalar)
+    for e in 0..nblk {
+        for r in 0..16u8 {
+            let x = b.frag16_lane(Opnd::Var(ov[e]), r);
+            let x = b.bitcast_f32(x);
+            let y = b.mul_f32(x, alpha);
+            b.var_set_lane(ov[e], r, y);
+        }
+    }
+    // ---- O^T += V^T P^T: 4 steps of 16 keys x D / 32 blocks of 32 d ----
+    vscope(b, &mut |b| {
+        for t in 0..4usize {
+            let (sb, tt) = (t / 2, t % 2);
+            // P^T (B operand): k slots = values 8 tt + 0..7 of block sb
+            let i0 = 16 * sb + 8 * tt;
+            let w: Vec<ValueId> = (0..4).map(|j| b.cvt_pk_bf16_f32(p[i0 + 2 * j], p[i0 + 2 * j + 1])).collect();
+            let pf = b.frag4(w[0], w[1], w[2], w[3]);
+            for e in 0..nblk as i32 {
+                // V^T (A operand) by two ds_read_b64_tr_b16 (amdgpu_isa::tr_b16): read r covers keys 8 r + 4 h + 0..3 of the step (the P
+                // slot order), lane s = l % 16 of its 16-lane group at key row (base + s / 4), dims 32 e + 16 ((l % 32) / 16) + 4 (s % 4)
+                let mut words: Vec<ValueId> = Vec::with_capacity(4);
+                for r in 0..2i32 {
+                    let a = b.bind_i32(ev(tm.vr[0]) + vbase.clone() + (32 * sb as i32 + 16 * tt as i32 + 8 * r) * ROW + 64 * e);
+                    let x = b.load_lds_tr_b16(a);
+                    words.push(b.frag2_lane(x, 0));
+                    words.push(b.frag2_lane(x, 1));
+                }
+                let words: Vec<ValueId> = words.into_iter().map(|w| b.bitcast_i32(w)).collect();
+                let vf = b.frag4(words[0], words[1], words[2], words[3]);
+                b.var_mfma(ov[e as usize], kind, vf, pf, false);
+            }
+        }
+    });
 }
