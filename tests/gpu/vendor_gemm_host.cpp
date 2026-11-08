@@ -151,7 +151,8 @@ int main(int argc, char** argv) {
         for (auto& s : sb8) s = 124 + rng() % 6;
         // W4DBG=1: unit B scales + A = 1 (tests the B path); W4DBG=2: unit B scales + B = 1 (code 2) (tests the A path)
         const int dbg = envi("W4DBG", 0);
-        if (dbg) for (auto& s : sb8) s = 127;
+        if (dbg && dbg != 5) for (auto& s : sb8) s = 127;  // (W4DBG=4: unit scales only; W4DBG=5: A = 1, scales random)
+        if (dbg == 5) for (size_t i = 0; i < (size_t)M * K; i++) { uint16_t bb = f_to_bf16(1.0f); memcpy(&ha[2 * i], &bb, 2); af[i] = 1.0f; }
         if (dbg == 1) for (size_t i = 0; i < (size_t)M * K; i++) { uint16_t bb = f_to_bf16(1.0f); memcpy(&ha[2 * i], &bb, 2); af[i] = 1.0f; }
         if (dbg == 2) for (size_t i = 0; i < hb.size(); i++) { hb[i] = 0x22; bf[2 * i] = 1.0f; bf[2 * i + 1] = 1.0f; }
         // permute: phys[p] = logical K 256 T + L(p), L(p) = 128 (p / 128) + 16 ((p / 64) % 2) + 8 ((p / 32) % 2) + 32 ((p / 8) % 4) + p % 8
