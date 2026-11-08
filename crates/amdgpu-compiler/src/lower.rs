@@ -2280,6 +2280,33 @@ impl Lowerer {
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
+            Op::Cvt { op, srcs, sel } => {
+                let (n, ty, _) = op.sig();
+                let (mop, partial) = cvt_mop(*op);
+                let mut rs = Vec::with_capacity(n);
+                for s in &srcs[..n] {
+                    rs.push(self.as_v1(*s)?);
+                }
+                let touched: Vec<Src> = rs.iter().map(|r| Src::Reg(*r)).collect();
+                self.touch(&touched);
+                let d = self.new_vreg(if ty == DType::Frag2 { RClass::V2 } else { RClass::V1 });
+                let mut inst = MInst::new(mop).def(d).imm(*sel as i64);
+                if partial {
+                    // the instruction keeps the destination's other bits: start from the old value, tie it as the last source
+                    let old = rs.pop().expect("partial-write conversion has an old operand");
+                    self.copy_reg(d, old)?;
+                    for r in rs {
+                        inst = inst.srcreg(r);
+                    }
+                    inst = inst.srcreg(d);
+                } else {
+                    for r in rs {
+                        inst = inst.srcreg(r);
+                    }
+                }
+                self.push(inst);
+                self.val.insert(dst, d);
+            }
             Op::LoadGlobalN { base, byte_off, ty, cache } => {
                 let (cls, mop) = global_load_mop(*ty);
                 let d = self.new_vreg(cls);
@@ -4237,5 +4264,32 @@ fn scaled_mfma_mop(k: amdgpu_dsl::MmaKind, opsel: u8) -> Result<(MOp, MOp, i64),
         (S::M32N32K64, 8, 6) => m(MOp::VMfmaScale32x32x64A8B6, MOp::VMfmaScale32x32x64A8B6Z),
         (S::M32N32K64, 8, 8) => m(MOp::VMfmaScale32x32x64A8B8, MOp::VMfmaScale32x32x64A8B8Z),
         _ => Err(format!("mfma {k:?}: not a scaled f8f6f4 shape")),
+    }
+}
+
+/// (MOp, partial write with the old value as the last operand) of a conversion.
+fn cvt_mop(o: amdgpu_dsl::CvtOp) -> (MOp, bool) {
+    use amdgpu_dsl::CvtOp as C;
+    match o {
+        C::PkF32Fp8 => (MOp::VCvtPkF32Fp8, false),
+        C::PkF32Bf8 => (MOp::VCvtPkF32Bf8, false),
+        C::F32Fp8 => (MOp::VCvtF32Fp8, false),
+        C::F32Bf8 => (MOp::VCvtF32Bf8, false),
+        C::PkBf8F32 => (MOp::VCvtPkBf8F32, true),
+        C::ScalePkBf16Fp8 => (MOp::VCvtScalePkBf16Fp8, false),
+        C::ScalePkF16Fp8 => (MOp::VCvtScalePkF16Fp8, false),
+        C::ScalePkBf16Bf8 => (MOp::VCvtScalePkBf16Bf8, false),
+        C::ScalePkF16Bf8 => (MOp::VCvtScalePkF16Bf8, false),
+        C::ScalePkF32Fp8 => (MOp::VCvtScalePkF32Fp8, false),
+        C::ScalePkF32Bf8 => (MOp::VCvtScalePkF32Bf8, false),
+        C::ScalePkF32Fp4 => (MOp::VCvtScalePkF32Fp4, false),
+        C::ScalePkBf16Fp4 => (MOp::VCvtScalePkBf16Fp4, false),
+        C::ScalePkF16Fp4 => (MOp::VCvtScalePkF16Fp4, false),
+        C::ScalePkFp8F32 => (MOp::VCvtScalePkFp8F32, true),
+        C::ScalePkBf8F32 => (MOp::VCvtScalePkBf8F32, true),
+        C::ScalePkFp4F32 => (MOp::VCvtScalePkFp4F32, true),
+        C::PkU8F32 => (MOp::VCvtPkU8F32, false),
+        C::PkI16I32 => (MOp::VCvtPkI16I32, false),
+        C::PkU16U32 => (MOp::VCvtPkU16U32, false),
     }
 }
