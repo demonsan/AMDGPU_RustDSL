@@ -4,7 +4,7 @@
 //! * `reshape_cache_flash_bf16_h<Hk>_d<D>`: ABI k @0, v @8, key_cache @16, value_cache @24, slot_mapping @32, T @40 (i32), S @44 (i32, slots of the cache). Caches of any size
 //!   (up to 2^31 slots): the cache descriptors are moved to the token's slot row with a 64-bit `ptr_mad` (num_records = one row).
 
-use amdgpu_dsl::{BinOp, CachePolicy, CmpPred, CmpTy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd};
+use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd};
 use amdgpu_tile::ev;
 
 pub fn by_name(name: &str) -> Option<Function> {
@@ -85,10 +85,9 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     let slot = b.read_first_lane(slot);
     // a valid slot is in [0, S); the cache descriptors cover just this slot's row, their bases moved by a 64-bit ptr_mad (caches > 4 GiB).
     // Invalid slots (padding < 0, or >= S) write nothing: their stores are masked, the descriptor uses the clamped slot.
-    // one unsigned compare covers both bounds (a negative slot is a huge u32); the clamped slot is the smaller of the two as unsigned
-    let ok = b.cmp(CmpPred::Lt, CmpTy::U32, slot, s_v);
-    let smax = b.bind_i32(ev(s_v) - 1);
-    let sl = b.bin(BinOp::MinU32, slot, smax);
+    let slot = b.let_(Op::AddI32(Opnd::Val(slot), Opnd::I32(0))); // signed (read_first_lane yields u32)
+    let ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
+    let sl = { let v = b.bind_i32(ev(slot).max(0).min(ev(s_v) - 1)); b.read_first_lane(v) };
     let rowc = b.c_i32(row as i32);
     let pkc = b.ptr_mad(ptrs[2], sl, rowc);
     let pvc = b.ptr_mad(ptrs[3], sl, rowc);
