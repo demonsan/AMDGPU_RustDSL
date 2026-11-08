@@ -178,6 +178,28 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> out((size_t)M * D), y1((size_t)M * TK * I);
     HC(hipMemcpy(out.data(), dO, out.size() * 2, hipMemcpyDeviceToHost));
     HC(hipMemcpy(y1.data(), dY1, y1.size() * 2, hipMemcpyDeviceToHost));
+    if (envi("MAPDBG", 0)) {
+        // full stage-1 reference for every (token, slot), then: for wrong entries, where does the GPU value occur in the reference?
+        std::vector<double> ref((size_t)M * TK * I);
+        for (int t = 0; t < M; t++)
+            for (int k = 0; k < TK; k++) {
+                int e = ids[t * TK + k];
+                for (int i = 0; i < I; i++) {
+                    double g = 0, u = 0;
+                    for (int d = 0; d < D; d++) { g += (double)xf[(size_t)t * D + d] * w1f[((size_t)e * 2 * I + i) * D + d]; u += (double)xf[(size_t)t * D + d] * w1f[((size_t)e * 2 * I + I + i) * D + d]; }
+                    ref[((size_t)t * TK + k) * I + i] = g / (1 + std::exp(-g)) * u;
+                }
+            }
+        int shown = 0;
+        for (size_t x = 0; x < ref.size() && shown < 12; x++) {
+            double got = bf(y1[x]);
+            if (std::fabs(got - ref[x]) <= 2e-2 * std::fabs(ref[x]) + 2e-2) continue;
+            long best = -1;
+            for (size_t y = 0; y < ref.size(); y++) if (std::fabs(bf(y1[x]) - ref[y]) < 1e-2 * std::fabs(ref[y]) + 1e-3 && got != 0) { best = y; break; }
+            printf("  wrong row %zu col %zu got %g ref %g; matches ref at row %ld col %ld\n", x / I, x % I, got, ref[x], best < 0 ? -1 : best / I, best < 0 ? -1 : best % I);
+            shown++;
+        }
+    }
     // ---- CPU reference (stage 1 exact, stage 2 from the GPU's y1 so the bf16 rounding of y1 matches) ----
     long bad1 = 0, bad2 = 0;
     double me1 = 0, me2 = 0;
