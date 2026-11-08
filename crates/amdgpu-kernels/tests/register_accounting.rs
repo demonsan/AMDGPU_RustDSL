@@ -604,7 +604,7 @@ fn llvm_tail_register_accounting() {
         let f = kernel_by_name(name).unwrap();
         // own-backend-only DMA kernels (e.g. probe_dma) cannot go through the LLVM tail
         if let Ok(m) = amdgpu_compiler::compile_mir(&f) {
-            if m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, amdgpu_compiler::mir::MOp::GlobalLoadLdsB128 | amdgpu_compiler::mir::MOp::GlobalLoadLdsB32 | amdgpu_compiler::mir::MOp::BufferLoadDwordX4Lds | amdgpu_compiler::mir::MOp::BufferLoadDwordX1Lds))) {
+            if m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, amdgpu_compiler::mir::MOp::GlobalLoadLdsB128 | amdgpu_compiler::mir::MOp::GlobalLoadLdsB32 | amdgpu_compiler::mir::MOp::BufferLoadDwordX4Lds | amdgpu_compiler::mir::MOp::BufferLoadDwordX1Lds | amdgpu_compiler::mir::MOp::VMovDpp | amdgpu_compiler::mir::MOp::VMovDppX | amdgpu_compiler::mir::MOp::VAddF32Dpp | amdgpu_compiler::mir::MOp::VSubF32Dpp | amdgpu_compiler::mir::MOp::VMulF32Dpp | amdgpu_compiler::mir::MOp::VMaxF32Dpp | amdgpu_compiler::mir::MOp::VMinF32Dpp | amdgpu_compiler::mir::MOp::VAddU32Dpp | amdgpu_compiler::mir::MOp::VMaxI32Dpp | amdgpu_compiler::mir::MOp::VMinI32Dpp | amdgpu_compiler::mir::MOp::VMaxU32Dpp | amdgpu_compiler::mir::MOp::VMinU32Dpp | amdgpu_compiler::mir::MOp::VAndB32Dpp | amdgpu_compiler::mir::MOp::VOrB32Dpp | amdgpu_compiler::mir::MOp::VXorB32Dpp))) {
                 continue;
             }
         }
