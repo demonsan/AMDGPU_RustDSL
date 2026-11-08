@@ -1139,7 +1139,8 @@ pub fn probe_lds_high() -> Function {
     for (k, m0) in LDS_HIGH_M0.iter().enumerate() {
         let m0v = b.c_i32(*m0 as i32);
         let m0s = b.read_first_lane(m0v);
-        b.load_buffer_lds(r_in, off16, 0i32, m0s, (1024 * k) as u32, 4);
+        let vo = b.add_i32(off16, (1024 * k) as i32);
+        b.load_buffer_lds(r_in, vo, 0i32, m0s, 0, 4);
     }
     b.wait_vm(0);
     b.barrier();
