@@ -6,7 +6,7 @@
 //!
 //! D in {64, 128, 256} (full rotary dimension), H in 1..=256. ABI: x @0, out @8, positions @16, cos_sin @24, T @32 (i32), P @36 (i32).
 
-use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
+use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
 use amdgpu_tile::prims::bf16x8_to_f32;
 use amdgpu_tile::ev;
 
@@ -113,10 +113,10 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle) -> Function {
         let head_ok = b.let_(Op::CmpLtI32(Opnd::Val(head), Opnd::I32(h as i32)));
         let row_off = b.bind_i32(ev(tok) * (2 * h * d) as i32 + ev(head) * (2 * d) as i32);
         let off = b.bind_i32(ev(row_off) + if style == RopeStyle::Neox { ev(lr) << 4 } else { ev(lr) << 4 });
-        let lo = b.buffer_load_b128(r_x, off, 0i32, 0);
+        let lo = b.buffer_load_c(r_x, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
         let hi = if style == RopeStyle::Neox {
             let offh = b.bind_i32(ev(off) + d as i32);
-            Some(b.buffer_load_b128(r_x, offh, 0i32, 0))
+            Some(b.buffer_load_c(r_x, Some(Opnd::Val(offh)), 0i32, 0, MemTy::B128, CachePolicy::NT))
         } else {
             None
         };
@@ -156,12 +156,12 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle) -> Function {
         let masked = |b: &mut FnBuilder, o: ValueId| b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(p.head_ok), a: Opnd::Val(o), b: Opnd::I32(-16) });
         let o_lo = masked(b, p.off);
         let f = pack8(b, &yl);
-        b.buffer_store_b128(r_o, o_lo, 0i32, 0, f);
+        b.buffer_store_c(r_o, Some(Opnd::Val(o_lo)), 0i32, 0, f, MemTy::B128, false, CachePolicy::NT);
         if let Some(yh) = yh {
             let offh = b.bind_i32(ev(p.off) + d as i32);
             let o_hi = masked(b, offh);
             let f = pack8(b, &yh);
-            b.buffer_store_b128(r_o, o_hi, 0i32, 0, f);
+            b.buffer_store_c(r_o, Some(Opnd::Val(o_hi)), 0i32, 0, f, MemTy::B128, false, CachePolicy::NT);
         }
     }
     fb.finish()

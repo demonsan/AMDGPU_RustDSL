@@ -7,7 +7,7 @@
 //!
 //! N (D) a multiple of 8, 8..=8192; chunks past the row end are masked in the statistics and their stores dropped by the buffer descriptor.
 
-use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
+use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
 use amdgpu_tile::prims::{act, abs_f32, bf16x8_to_f32, fp8_pack, fp8_scale, lane_reduce, wave_reduce, Act, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
@@ -97,11 +97,11 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
     let ngrp = nld.div_ceil(4);
     let vx = b.bind_i32(ev(row) * in_row as i32 + (lane.lane() << 4));
     let gx: Vec<ValueId> = (0..ngrp).map(|g| if g == 0 { vx } else { b.bind_i32(ev(vx) + 4096 * g as i32) }).collect();
-    let xs: Vec<ValueId> = (0..nld).map(|i| b.buffer_load_b128(r_x, gx[i / 4], 0i32, (1024 * (i % 4)) as u32)).collect();
+    let xs: Vec<ValueId> = (0..nld).map(|i| b.buffer_load_c(r_x, Some(Opnd::Val(gx[i / 4])), 0i32, (1024 * (i % 4)) as u32, MemTy::B128, CachePolicy::NT)).collect();
     let x2s: Option<Vec<ValueId>> = (kind == QuantKind::SiluMulToken).then(|| {
         let v2 = b.bind_i32(ev(vx) + (2 * n) as i32);
         let g2: Vec<ValueId> = (0..ngrp).map(|g| if g == 0 { v2 } else { b.bind_i32(ev(v2) + 4096 * g as i32) }).collect();
-        (0..nld).map(|i| b.buffer_load_b128(r_x, g2[i / 4], 0i32, (1024 * (i % 4)) as u32)).collect()
+        (0..nld).map(|i| b.buffer_load_c(r_x, Some(Opnd::Val(g2[i / 4])), 0i32, (1024 * (i % 4)) as u32, MemTy::B128, CachePolicy::NT)).collect()
     });
     b.wait_vm(0);
     let valid: Vec<Option<ValueId>> = (0..nld)
@@ -143,7 +143,7 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
             None => base,
             Some(c) => b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(base), b: Opnd::I32(-16) }),
         };
-        b.buffer_store_b64(r_q, voff, 0i32, 0, f2);
+        b.buffer_store_c(r_q, Some(Opnd::Val(voff)), 0i32, 0, f2, MemTy::B64, false, CachePolicy::NT);
     };
     match kind {
         QuantKind::Token | QuantKind::SiluMulToken => {

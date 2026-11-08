@@ -49,7 +49,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // batch 2 (docs/op-coverage-memtemplates.md): row kernels, streaming elementwise
         n if n.starts_with("quant_token_bf16_fp8_n") || n.starts_with("quant_group128_bf16_fp8_n") || n.starts_with("silu_mul_quant_fp8_d") => crate::rows::quant::by_name(n),
         n if n.starts_with("rmsnorm_bf16_n") || n.starts_with("add_rmsnorm_bf16_n") || n.starts_with("layernorm_bf16_n") || n.starts_with("softmax_bf16_n") => crate::rows::by_name(n),
-        n if n.starts_with("silu_mul_bf16_d") || n.starts_with("gelu_tanh_mul_bf16_d") || n == "add_bf16" || n == "cvt_f32_bf16" || n == "cvt_bf16_f32" || n == "quant_bf16_fp8_static" => crate::eltwise::by_name(n),
+        n if n.starts_with("silu_mul_bf16_d") || n.starts_with("gelu_tanh_mul_bf16_d") || n == "add_bf16" || n == "cvt_f32_bf16" || n == "cvt_bf16_f32" || n == "quant_bf16_fp8_static" || n == "quant_bf16_fp8_static_rt" => crate::eltwise::by_name(n),
         // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
