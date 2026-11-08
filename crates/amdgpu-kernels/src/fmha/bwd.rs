@@ -18,6 +18,11 @@ const ROW: i32 = 2 * D;
 const KT: i32 = 64;
 
 fn abi(b: &mut FnBuilder) {
+    abi_x(b, false)
+}
+
+/// `fused`: slot 6 is the fp32 dQ accumulator [B, H, SQ, 128] (zeroed by the host; `fmha_bwd_dkdvq` adds into it, `fmha_bwd_dq_convert` reads it).
+fn abi_x(b: &mut FnBuilder, fused: bool) {
     for (n, i) in [("q", 0u32), ("k", 1), ("v", 2), ("do", 3), ("lse", 4), ("dot", 5), ("dq", 6), ("dk", 7), ("dv", 8), ("o", 14)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
     }
@@ -32,9 +37,10 @@ fn abi(b: &mut FnBuilder) {
     b.ka_range(208, 1, 64);
     b.ka_is(192, Ext::ka(208) * Ext::sym("G"));
     let (bb, sq, sk, hh, hk) = (Ext::sym("B"), Ext::ka(160), Ext::ka(176), Ext::ka(192), Ext::ka(208));
-    for n in ["q", "do", "dq", "o"] {
+    for n in ["q", "do", "o"] {
         b.arg_tensor(n, bb.clone() * sq.clone() * hh.clone() * Ext::c(ROW as i64));
     }
+    b.arg_tensor("dq", bb.clone() * sq.clone() * hh.clone() * Ext::c(if fused { 4 * D as i64 } else { ROW as i64 }));
     for n in ["k", "v"] {
         b.arg_tensor(n, bb.clone() * sk.clone() * hk.clone() * Ext::c(ROW as i64));
     }
@@ -312,9 +318,16 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
 /// dK / dV per 128-key tile and query head (dK, dV written per Q head [B, SK, H, 128] like the vendor: the host / a reduce sums a GQA group).
 /// Grid (ceil(SK / 128), H, B), 4 waves x 32 keys; loop over 64-query tiles (Q and dO through a 2-slot LDS ring).
 pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
+    fmha_bwd_dkdv_x(name, causal, false)
+}
+
+/// `fused` (`fmha_bwd_dkdvq`): also dQ - the tile's dS^T goes through LDS ([128 keys][64 q] bf16), every wave multiplies a 32 x 64 block of
+/// dS (tr_b16 reads) by K^T (the CTA's K tile, staged once into LDS, tr_b16 reads) over the 128 keys and adds scale dQ into the fp32
+/// accumulator (`buffer_atomic_add_f32`): no separate dQ kernel (it recomputes S / P / dP).
+pub fn fmha_bwd_dkdv_x(name: &str, causal: bool, fused: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
-    abi(&mut b);
+    abi_x(&mut b, fused);
     b.grid_is(0, Ext::ka(176).ceil_div(128));
     b.grid_is(1, Ext::ka(192));
     b.grid_is(2, Ext::sym("B"));
@@ -345,6 +358,43 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     let k_vo = b.bind_i32(((ev(bat) * ev(a.sk) + ev(key_c)) * ev(a.hkn) + ev(hkv)) * ROW + (ev(half) << 4));
     let kf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_k, k_vo, c0, (32 * c) as u32)).collect();
     let vf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_v, k_vo, c0, (32 * c) as u32)).collect();
+    // fused: the K tile into LDS (wave w: blocks w + 4 i of 1 KB = keys 4 block + lane / 16, chunk lane % 16, source chunk ^ key % 16)
+    let fz = ktile.as_ref().map(|kt_sh| {
+        let l16 = b.bind_i32(lane.lane() & 15);
+        let kso = { let v = b.bind_i32((ev(bat) * ev(a.sk) * ev(a.hkn) + ev(hkv)) * ROW); b.read_first_lane(v) };
+        let kseq = { let v = b.bind_i32(ev(a.hkn) * ROW); b.read_first_lane(v) };
+        kt_sh.at(&SlotIdx::new(0, 0)).write(&mut b, |b| {
+            for i in 0..8i32 {
+                let kk = b.bind_i32(((lane.wave() + 4 * i) << 2) + lane.lane().lshr(4));
+                let kg = b.bind_i32(((ev(kt) << 7) + ev(kk)).min(ev(a.sk) - 1));
+                let vo = b.bind_i32(ev(kg) * ev(kseq) + ((ev(l16) ^ (ev(kk) & 15)) << 4));
+                let m0 = { let x = b.bind_i32(((lane.wave() + 4 * i) << 10) + kt_sh.base as i32); b.read_first_lane(x) };
+                b.buffer_load_lds_b128(r_k, vo, kso, m0, 0);
+            }
+        });
+        // read offsets of the dQ MMAs: wave w computes q block qb = w / 2 (32 queries) x d blocks 2 (w % 2) + {0, 1}; per 16-key step st,
+        // A = dS (tr_b16 from dS^T: key rows 16 st + 8 h + 4 r + s / 4, query columns 32 qb + 16 ((l % 32) / 16) + 4 (s % 4)),
+        // B = K^T (tr_b16 from the K tile: the same key rows, d columns 32 db + 16 ((l % 32) / 16) + 4 (s % 4), swizzled chunks)
+        let s = b.bind_i32(lane.lane() & 15);
+        let qb = b.bind_i32(lane.wave().lshr(1));
+        let a_off = b.bind_i32((ev(half) * 8 + ev(s).lshr(2)) * 128 + ((ev(qb) << 5) + ((lane.lane() & 31).lshr(4) << 4) + ((ev(s) & 3) << 2)) * 2);
+        let b_off: Vec<Vec<ValueId>> = (0..2)
+            .map(|dd| {
+                (0..2)
+                    .map(|r| {
+                        let krow = b.bind_i32(ev(half) * 8 + 4 * r + ev(s).lshr(2));
+                        let db = b.bind_i32(((lane.wave() & 1) << 1) + dd);
+                        let ch = b.bind_i32((ev(db) << 2) + ((lane.lane() & 31).lshr(4) << 1) + (ev(s) & 3).lshr(1));
+                        b.bind_i32(ev(krow) * ROW + (((ev(ch) ^ ev(krow)) & 15) << 4) + ((ev(s) & 1) << 3))
+                    })
+                    .collect()
+            })
+            .collect();
+        let nacc = { let v = b.bind_i32((ev(bat) + 1) * ev(a.hq) * ev(a.sq) * (4 * D)); b.read_first_lane(v) };
+        let r_acc = b.buffer_desc_dyn(a.p[6], nacc);
+        let acc_so = { let v = b.bind_i32((ev(bat) * ev(a.hq) + ev(h)) * ev(a.sq) * (4 * D)); b.read_first_lane(v) };
+        (a_off, b_off, r_acc, acc_so, qb)
+    });
     let nl = { let v = b.bind_i32((ev(bat) + 1) * ev(a.hq) * ev(a.sq) << 2); b.read_first_lane(v) };
     let (r_l, r_d) = (b.buffer_desc_dyn(a.p[4], nl), b.buffer_desc_dyn(a.p[5], nl));
     let l_so = { let v = b.bind_i32((ev(bat) * ev(a.hq) + ev(h)) * ev(a.sq) << 2); b.read_first_lane(v) };
@@ -355,6 +405,9 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     let mut lds = LdsPlan::new();
     let qs = lds.ring("Q", (KT * ROW) as i64, 2, TLayout::Linear);
     let ds_ = lds.ring("dO", (KT * ROW) as i64, 2, TLayout::Linear);
+    // fused: the CTA's K tile (128 keys, swizzled like the rings) and the tile's dS^T [128 keys][64 q] bf16
+    let ktile = fused.then(|| lds.tile("KT", (128 * ROW) as i64, TLayout::Linear));
+    let dst = fused.then(|| lds.ring("DS", 128 * 128, 1, TLayout::Linear));
     lds.commit(&mut b);
     let q_so0 = { let v = b.bind_i32((ev(bat) * ev(a.sq) * ev(a.hq) + ev(h)) * ROW); b.read_first_lane(v) };
     let qseq = { let v = b.bind_i32(ev(a.hq) * ROW); b.read_first_lane(v) };
@@ -489,6 +542,57 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
                 }
             }
         }
+        if let (Some((a_off, b_off, r_acc, acc_so, qb)), Some(dsh), Some(ksh)) = (&fz, &dst, &ktile) {
+            // dS^T into LDS: lane (key 32 w + j) writes 4 consecutive queries (8 bytes) per (sb, g)
+            let gen = b.bind_i32((itx.clone() << 1) + slot);
+            let wrow = b.bind_i32(((lane.wave() << 5) + lane.j()) * 128 + dsh.base as i32 + (ev(half) << 3));
+            dsh.at(&SlotIdx::new(0, Opnd::Val(gen))).write(&mut b, |b| {
+                for sb in 0..2usize {
+                    for g in 0..4usize {
+                        let i0 = 16 * sb + 4 * g;
+                        let w0 = b.cvt_pk_bf16_f32(dsv[i0], dsv[i0 + 1]);
+                        let w1 = b.cvt_pk_bf16_f32(dsv[i0 + 2], dsv[i0 + 3]);
+                        let f2 = b.frag2(w0, w1);
+                        let ad = b.bind_i32(ev(wrow) + ((32 * sb + 8 * g) as i32) * 2);
+                        b.store_lds_b64(ad, f2);
+                    }
+                }
+            });
+            b.wait_lds(0);
+            b.barrier();
+            // dQ block (32 queries x 2 x 32 d) over the 128 keys: 8 steps x 2 MFMAs
+            let mut acc: Vec<Option<ValueId>> = vec![None, None];
+            dsh.at(&SlotIdx::new(0, Opnd::Val(gen))).read(&mut b, |b| {
+                ksh.at(&SlotIdx::new(0, 0)).read(b, |b| {
+                    for st in 0..8i32 {
+                        let a0 = b.bind_i32(ev(*a_off) + (16 * st) * 128);
+                        let a1 = b.bind_i32(ev(*a_off) + (16 * st + 4) * 128);
+                        let af = b.load_lds_tr_b16x2(a0, a1);
+                        for dd in 0..2usize {
+                            let b0 = b.bind_i32(ev(b_off[dd][0]) + ksh.base as i32 + 16 * st * ROW);
+                            let b1 = b.bind_i32(ev(b_off[dd][1]) + ksh.base as i32 + 16 * st * ROW);
+                            let bfr = b.load_lds_tr_b16x2(b0, b1);
+                            acc[dd] = Some(b.mfma(kind, af, bfr, acc[dd].map(Opnd::Val)));
+                        }
+                    }
+                })
+            });
+            // scale dQ added into the fp32 accumulator: C lane = d column 32 db + l % 32, values = queries 32 qb + 8 (r / 4) + 4 h + r % 4
+            let qrow0 = b.bind_i32(ev(tile) * KT + (ev(*qb) << 5) + (ev(half) << 2));
+            for dd in 0..2usize {
+                let col = b.bind_i32((((lane.wave() & 1) << 1) + dd as i32) * 32 + lane.j());
+                for r in 0..16u8 {
+                    let q = b.bind_i32(ev(qrow0) + 8 * (r as i32 / 4) + (r as i32 % 4));
+                    let x = b.frag16_lane(acc[dd].unwrap(), r);
+                    let x = b.bitcast_f32(x);
+                    let y = b.mul_f32(x, a.scale);
+                    let vo = b.bind_i32((ev(q) * D + ev(col)) << 2);
+                    let ok = b.bind_cond(ev(q).lt(ev(a.sq)));
+                    let vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(vo), b: Opnd::Val(big) });
+                    b.buffer_atomic(amdgpu_dsl::AtomicOp::AddF32, *r_acc, Some(Opnd::Val(vo)), *acc_so, 0, y);
+                }
+            }
+        }
         // dV^T += dO^T P, dK^T += Q^T dS: 4 steps of 16 queries x 4 blocks of 32 d (A by tr_b16 from the dO / Q tiles)
         for (sl, base, src, acc) in [(&dsl, dbase, &p, &dvv), (&qsl, qbase, &dsv, &dkv)] {
             sl.read(&mut b, |b| {
@@ -544,5 +648,40 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
         }
     }
     b.end_if();
+    b.finish()
+}
+/// dQ (bf16 [B, SQ, H, 128]) from the fp32 accumulator [B, H, SQ, 128] of `fmha_bwd_dkdvq` (already scaled). Grid (ceil(SQ / 64), H, B),
+/// 256 threads: thread = (row tid / 4, 32 d of quarter tid % 4).
+pub fn fmha_bwd_dq_convert(name: &str) -> Function {
+    let mut b = FnBuilder::new(name, 256);
+    b.compile_profile(CompileProfile::Gemm);
+    abi_x(&mut b, true);
+    b.grid_is(0, Ext::ka(160).ceil_div(64));
+    b.grid_is(1, Ext::ka(192));
+    b.grid_is(2, Ext::sym("B"));
+    let a = args(&mut b);
+    let (qt, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
+    let tid = b.let_(Op::WorkitemId);
+    let row = b.bind_i32((ev(qt) << 6) + ev(tid).lshr(2));
+    let qtr = b.bind_i32(ev(tid) & 3);
+    let live = b.bind_cond(ev(row).lt(ev(a.sq)));
+    let c0 = b.c_i32(0);
+    let big = b.c_i32(0x7fff_fff0);
+    let nacc = { let v = b.bind_i32((ev(bat) + 1) * ev(a.hq) * ev(a.sq) * (4 * D)); b.read_first_lane(v) };
+    let r_acc = b.buffer_desc_dyn(a.p[6], nacc);
+    let nq = { let v = b.bind_i32((ev(bat) + 1) * ev(a.sq) * ev(a.hq) * ROW); b.read_first_lane(v) };
+    let r_o = b.buffer_desc_dyn(a.p[0], nq);
+    let ia = b.bind_i32((((ev(bat) * ev(a.hq) + ev(h)) * ev(a.sq) + ev(row)) * D + (ev(qtr) << 5)) << 2);
+    let ia = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(ia), b: Opnd::Val(big) });
+    let io = b.bind_i32(((ev(bat) * ev(a.sq) + ev(row)) * ev(a.hq) + ev(h)) * ROW + (ev(qtr) << 6));
+    let io = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(io), b: Opnd::Val(big) });
+    for c in 0..8u32 {
+        let v = b.buffer_load_b128(r_acc, ia, c0, 16 * c);
+        let f: Vec<ValueId> = (0..4u8).map(|k| { let x = b.frag4_lane(v, k); b.bitcast_f32(x) }).collect();
+        let w0 = b.cvt_pk_bf16_f32(f[0], f[1]);
+        let w1 = b.cvt_pk_bf16_f32(f[2], f[3]);
+        let f2 = b.frag2(w0, w1);
+        b.buffer_store_b64(r_o, io, c0, 8 * c, f2);
+    }
     b.finish()
 }
