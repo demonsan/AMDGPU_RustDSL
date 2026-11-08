@@ -64,6 +64,10 @@ impl GemmConfig {
     pub fn a8w8_rowcol() -> GemmConfig {
         GemmConfig { scales: Scales::RowCol, ..GemmConfig::v4() }
     }
+    /// The same with a 128 x 128 CTA (4 waves of 64 x 64): 4x the CTAs for narrow M / N.
+    pub fn a8w8_rowcol_128() -> GemmConfig {
+        GemmConfig { cta_m: 128, cta_n: 128, ..GemmConfig::a8w8_rowcol() }
+    }
 }
 
 type Cfg = GemmConfig;
@@ -304,7 +308,8 @@ struct Body {
     cfg: Cfg,
     /// K / 128 (kernarg)
     kb_v: ValueId,
-    panel: Panel,
+    /// the E8M0 scale panel (Scales::Mx128)
+    panel: Option<Panel>,
     mma: TiledMma,
     a_s: Shared,
     b_s: Shared,
@@ -366,7 +371,7 @@ impl Body {
         // K group of a real tile (t + 1 is read only when it exists): the clamp is a no-op that bounds it for the verifier's loop-exit-blind intervals
         let kb = b.bind_i32(kb.lt(ev(self.kb_v)).select_i32(kb.clone(), ev(self.kb_v) - 1));
         let kb = ev(kb);
-        let p = &self.panel;
+        let p = self.panel.as_ref().expect("scale panel");
         let (base, pr) = (p.sh.base, p.sh.at(&SlotIdx::new(0, 0)));
         let sab = b.bind_i32((kb.clone() << 8) + (base as i32) + ev(p.tr));
         let sbb = b.bind_i32((kb << 2) + ev(p.b_dw) + (base + p.b_base) as i32);
@@ -533,7 +538,8 @@ impl PipeBody for Body {
     }
     fn prologue_stores(&mut self, b: &mut FnBuilder, _role: Role) {
         if self.cfg.scales == Scales::Mx128 {
-            let (p, sj) = (&self.panel, &self.panel.sfa);
+            let p = self.panel.as_ref().expect("scale panel");
+            let sj = &p.sfa;
             let pr = p.sh.at(&SlotIdx::new(0, 0));
             // loads (A: 4 x 16 bytes, B: one dword), then the transposes and the panel writes; published by the pipeline's prologue barrier
             let fr: Vec<ValueId> = sj.pso.iter().map(|so| b.buffer_load_b128(self.rsrc_sfa, sj.voff, *so, 0)).collect();
@@ -622,6 +628,7 @@ pub fn by_name(name: &str) -> Option<Function> {
     match name {
         "gemm_mxfp8_bs_v4" => Some(gemm_mxfp8_bs_v4()),
         "gemm_a8w8_rowcol_fp8" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8", GemmConfig::a8w8_rowcol())),
+        "gemm_a8w8_rowcol_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128", GemmConfig::a8w8_rowcol_128())),
         _ => None,
     }
 }
@@ -752,10 +759,11 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let b_s = lds.ring("B", cta_n * 128, slots, amdgpu_tile::Layout::Linear);
     let sc_s = lds.ring("SC", 4 * 512, slots, amdgpu_tile::Layout::Linear);
     // scale panel: A [PANEL_KB][256 rows] + B [2 blocks][PANEL_KB] (+ 4 bytes of source alignment slack, padded to 256 for the dword DMA)
-    let panel_sh = lds.tile("SCP", PANEL_KB * 256 + 512, amdgpu_tile::Layout::Linear);
+    let panel_sh = (cfg.scales == Scales::Mx128).then(|| lds.tile("SCP", PANEL_KB * 256 + 512, amdgpu_tile::Layout::Linear));
     // epilogue staging (wave-private, reusing the dead ring / panel storage): the wave's C block, bf16 rows of EPI_PITCH bytes
     let epi = if cfg.lds_epilogue {
-        let ov: Vec<&Shared> = vec![&a_s, &b_s, &sc_s, &panel_sh];
+        let mut ov: Vec<&Shared> = vec![&a_s, &b_s, &sc_s];
+        ov.extend(panel_sh.as_ref());
         let per_wave = wave_m * EPI_PITCH;
         assert!(4 * per_wave <= 160 * 1024 - 16, "epilogue staging does not fit the LDS");
         Some(lds.private("EPI", per_wave, 4, &ov))
@@ -793,6 +801,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
     let b_org = b.bind_i32((ev(bx) << lg_n) * ev(k_v));
 
+    let panel = panel_sh.map(|panel_sh| {
     // ---- the scale panel (written in the pipeline prologue, `prologue_stores`) ----
     assert!(cta_m == 256 && cta_n == 256, "scale panel: 256 x 256 CTA");
     let sh = panel_sh;
@@ -819,7 +828,8 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let bdst = b.bind_i32(((ev(tid) & 127) << 2) + (sh.base + PANEL_KB * 256) as i32);
     let pso: Vec<ValueId> = (0..4).map(|p| { let v = b.bind_i32(ev(m_v) * (16 * p)); b.read_first_lane(v) }).collect();
     let b_dw = b.bind_i32(ev(wn) * (4 * PANEL_KB as i32));
-    let panel = Panel { sh, b_base: PANEL_KB * 256, tr, b_dw, sfa: SfaJob { voff, pso, sel1, sel2, dst, bvo, bsh, bdst } };
+    Panel { sh, b_base: PANEL_KB * 256, tr, b_dw, sfa: SfaJob { voff, pso, sel1, sel2, dst, bvo, bsh, bdst } }
+    });
 
     let mut pipe = Pipeline::new(Cadence::RegStaged, kb_v, k_v, 128, Ext::ka(84));
     // two tiles per pass, static slots; tile 1 staged after the scale-panel stores with its DMAs in flight at the prologue barrier
@@ -943,7 +953,7 @@ fn lds_epilogue(
 ) {
     let d = &ctx.dyns;
     let (nm, nn) = ((wave_m / 16) as usize, (wave_n / 16) as usize);
-    assert_eq!(wave_n * 2, 256, "lds_epilogue: 128-column wave blocks (256-byte rows)");
+    assert!(wave_n % 8 == 0 && 64 % (wave_n / 8) == 0 && wave_n * 2 <= EPI_PITCH, "lds_epilogue: wave rows of 8-column chunks that tile a wave");
     // per-token x per-channel scales: the lane's row of every m block (one f32) and its 4 consecutive columns of every n block (one 16-byte
     // load), from the C TV layout of the atom over a (row 1024 + col) index; loaded before the staging barrier
     let scl: Option<(Vec<ValueId>, Vec<ValueId>)> = rowcol.map(|(rs_a, rs_b)| {
@@ -995,9 +1005,14 @@ fn lds_epilogue(
     let c_org = { let v = b.bind_i32((((ev(by) << lg_m) * ev(n_v)) + (ev(bx) << lg_n)) << 1); b.read_first_lane(v) };
     // phases of wave_m / phases rows: the conversion + LDS writes of phase p+1 are issued before the stores of phase p (which only wait for
     // phase p's reads), so conversion, LDS traffic and global stores overlap (the vendor stages quadrant by quadrant)
-    let phases = phases.max(1);
+    // a phase writes whole 16-row blocks (all nn column blocks) and reads back exactly those rows: at most nm phases, dividing nm
+    let mut phases = phases.clamp(1, nm);
+    while nm % phases != 0 {
+        phases -= 1;
+    }
     let accs_per = acc.len() / phases;
     let iss_per = issues as usize / phases;
+    assert_eq!(accs_per % nn, 0, "lds_epilogue: a phase covers whole row blocks");
     let write_phase = |b: &mut FnBuilder, p: usize| {
         me.write(b, p as i32, |b| {
             for n in p * accs_per..(p + 1) * accs_per {
