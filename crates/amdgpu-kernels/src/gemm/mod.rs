@@ -1224,7 +1224,13 @@ impl skeleton_v4::V4Slots for GemmSlots {
         ),
         Scales::RowCol => (
             { let n = b.bind_i32(ev(m_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
-            { let n = b.bind_i32(ev(n_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
+            // MoE: the weight scales of every expert [E, n]
+            if cfg.moe.is_some() {
+                let ne = b.let_(Op::KernargI32 { offset: 132 });
+                let n = b.bind_i32(ev(ne) * ev(n_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            } else {
+                let n = b.bind_i32(ev(n_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            },
         ),
         // unused (no scales)
         Scales::None => (rsrc_a, rsrc_b),
