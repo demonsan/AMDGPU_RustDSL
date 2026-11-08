@@ -23,10 +23,14 @@ pub enum RowOp {
     GatedRmsNorm,
     /// the same, then per-row dynamic fp8 of the result: `scale[row] = max|y| / 448` (a row = one head when N = head_dim = 128: aiter `gated_rmsnorm_fp8_group_quant`)
     GatedRmsNormQuant,
+    /// `res_out = bf16(x + res)`, then rmsnorm of it and per-row dynamic fp8 (aiter `add_rmsnorm_quant`): out fp8, scale f32 [M], res_out bf16
+    AddRmsNormQuant,
 }
 
 pub fn by_name(name: &str) -> Option<Function> {
-    let (rest, op) = if let Some(r) = name.strip_prefix("gated_rmsnorm_fp8_n") {
+    let (rest, op) = if let Some(r) = name.strip_prefix("add_rmsnorm_fp8_n") {
+        (r, RowOp::AddRmsNormQuant)
+    } else if let Some(r) = name.strip_prefix("gated_rmsnorm_fp8_n") {
         (r, RowOp::GatedRmsNormQuant)
     } else if let Some(r) = name.strip_prefix("gated_rmsnorm_bf16_n") {
         (r, RowOp::GatedRmsNorm)
@@ -96,8 +100,10 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
         RowOp::Softmax => &["x", "out"],
         RowOp::GatedRmsNorm => &["x", "z", "gamma", "out"],
         RowOp::GatedRmsNormQuant => &["x", "z", "gamma", "out", "scale"],
+        RowOp::AddRmsNormQuant => &["x", "res", "gamma", "out", "res_out", "scale"],
     };
-    let quant = op == RowOp::GatedRmsNormQuant;
+    let quant = matches!(op, RowOp::GatedRmsNormQuant | RowOp::AddRmsNormQuant);
+    let add = matches!(op, RowOp::AddRmsNorm | RowOp::AddRmsNormQuant);
     let gated = matches!(op, RowOp::GatedRmsNorm | RowOp::GatedRmsNormQuant);
     let has_eps = op != RowOp::Softmax;
     for (i, p) in ptrs.iter().enumerate() {
@@ -136,12 +142,12 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
         b.buffer_desc_dyn(pv[idx(nm)], v)
     };
     let r_x = dyn_desc(b, "x");
-    let r_res = if op == RowOp::AddRmsNorm { Some(dyn_desc(b, "res")) } else { None };
+    let r_res = if add { Some(dyn_desc(b, "res")) } else { None };
     let r_out = dyn_desc(b, "out");
-    let r_rout = if op == RowOp::AddRmsNorm { Some(dyn_desc(b, "res_out")) } else { None };
+    let r_rout = if add { Some(dyn_desc(b, "res_out")) } else { None };
     let r_z = if gated { Some(dyn_desc(b, "z")) } else { None };
     let r_scale = if quant { Some(dyn_desc(b, "scale")) } else { None };
-    let r_g = if matches!(op, RowOp::RmsNorm | RowOp::AddRmsNorm | RowOp::LayerNorm | RowOp::GatedRmsNorm | RowOp::GatedRmsNormQuant) { Some(b.buffer_desc(pv[idx("gamma")], (2 * n) as u32)) } else { None };
+    let r_g = if matches!(op, RowOp::RmsNorm | RowOp::AddRmsNorm | RowOp::AddRmsNormQuant | RowOp::LayerNorm | RowOp::GatedRmsNorm | RowOp::GatedRmsNormQuant) { Some(b.buffer_desc(pv[idx("gamma")], (2 * n) as u32)) } else { None };
     let r_be = if op == RowOp::LayerNorm { Some(b.buffer_desc(pv[idx("beta")], (2 * n) as u32)) } else { None };
     let rpw = rows_per_wave(n) as usize;                // rows per wave in total
     let steps = rpw / par as usize;                      // sequential steps of `par` rows
@@ -240,7 +246,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
         let rout_words: Vec<ValueId> = if rs.is_some() { packed.clone() } else { Vec::new() };
         let mut out: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
         match op {
-            RowOp::RmsNorm | RowOp::AddRmsNorm | RowOp::GatedRmsNorm | RowOp::GatedRmsNormQuant => {
+            RowOp::RmsNorm | RowOp::AddRmsNorm | RowOp::AddRmsNormQuant | RowOp::GatedRmsNorm | RowOp::GatedRmsNormQuant => {
                 let mut part: Option<ValueId> = None;
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
@@ -373,6 +379,15 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     Some(c) => b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(base), b: Opnd::I32(-16) }),
                 };
                 b.buffer_store_c(r_out, Some(Opnd::Val(voff)), 0i32, 0, f2, MemTy::B64, false, CachePolicy::NT);
+                if let Some(ro) = r_rout {
+                    // res_out (bf16 x + res) in the input layout
+                    let bb = b.bind_i32(ev(gxs[r][i / 4]) + (cstride as usize * (i % 4)) as i32);
+                    let rv = match valid[i] {
+                        None => bb,
+                        Some(c) => b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(bb), b: Opnd::I32(-16) }),
+                    };
+                    b.buffer_store_c(ro, Some(Opnd::Val(rv)), 0i32, 0, rout_words[i], MemTy::B128, false, CachePolicy::NT);
+                }
             }
             let lead = b.let_(Op::CmpLtI32(Opnd::Val(lr), Opnd::I32(1)));
             let so = b.bind_i32(ev(row_idx) << 2);
