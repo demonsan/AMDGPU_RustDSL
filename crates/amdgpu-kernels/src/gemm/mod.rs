@@ -1005,9 +1005,14 @@ fn lds_epilogue(
     let c_org = { let v = b.bind_i32((((ev(by) << lg_m) * ev(n_v)) + (ev(bx) << lg_n)) << 1); b.read_first_lane(v) };
     // phases of wave_m / phases rows: the conversion + LDS writes of phase p+1 are issued before the stores of phase p (which only wait for
     // phase p's reads), so conversion, LDS traffic and global stores overlap (the vendor stages quadrant by quadrant)
-    let phases = phases.max(1);
+    // a phase writes whole 16-row blocks (all nn column blocks) and reads back exactly those rows: at most nm phases, dividing nm
+    let mut phases = phases.clamp(1, nm);
+    while nm % phases != 0 {
+        phases -= 1;
+    }
     let accs_per = acc.len() / phases;
     let iss_per = issues as usize / phases;
+    assert_eq!(accs_per % nn, 0, "lds_epilogue: a phase covers whole row blocks");
     let write_phase = |b: &mut FnBuilder, p: usize| {
         me.write(b, p as i32, |b| {
             for n in p * accs_per..(p + 1) * accs_per {
