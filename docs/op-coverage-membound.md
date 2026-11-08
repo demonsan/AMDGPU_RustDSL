@@ -285,3 +285,9 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 仓库约定 kernel 里不留非默认的环境变量开关，所以每个 kernel 的选择已固定：
 - **DPP 全规约 vs LDS 交换**（`AMDC_DPP_REDUCE`，归档 tag `archive/dpp-reduce-env`）：`topk_softmax` 用 DPP（+19 % E = 128 / +9 % E = 256，延迟受限）；行内族（rmsnorm / add_rmsnorm / layernorm / softmax）、量化族、`argmax` / `sample` 的块归约用 LDS 交换（带宽受限，DPP 与 LDS 持平 ±2 %）；N < 512 的短行布局本来就必须用组内 DPP。
 - **softmax 重算 exp**（`AMDC_SOFTMAX_RECOMPUTE_EXP`，归档 tag `archive/softmax-recompute-exp`）：N = 4096 5836 vs 6007 GB/s（更慢），N = 8192 只快 0.7 %，VGPR 156 → 144；不采用。
+
+## KV-cache 写：超过 4 GiB 的 cache（B1 的 64 位描述符基址）
+
+`reshape_cache_flash_bf16_h<Hk>_d<D>` 和 `reshape_cache_blocked_bf16_h<Hk>_d<D>_b<BS>` 现在支持任意大小的 cache（slot 到 2³¹ 个，每个 slot 行至多 64 KiB，即单个张量到 ≈ 128 GiB）：缓存描述符被一个 64 位 `ptr_mad` 移到当前 token 的 slot 行 / 块上（`num_records` = 一行 / 一块，所以 32 位偏移不再限制 cache 大小），非法 slot（< 0 或 ≥ S）的存储被屏蔽（backend 补丁，`origin/batch2-ptr64`）。新增主机测试 `tests/gpu/cache_big_host.cpp`：整个 cache 上散布的 slot（含 4 GiB / 8 GiB 之后的，以及首尾 slot、负的和 ≥ S 的非法 slot），每个被写的 slot / 块与 CPU 参考逐字节对比，抽样的未触碰行保持哨兵值；flash 12.2 / 30.5 GiB（h8, d128）和 14.3 GiB（h5, d64）、blocked 12.2 GiB，`bad = 0`。`moe_reduce` / `moe_combine` 同样改成每 token 一个描述符（`T · K · D · 2` 不再有 2 GiB 的限制）：T = 65535, K = 8, D = 7168（x = 7.5 GB）的抽样检查 `bad = 0`，5.73 TB/s；<4 GiB 的带宽与之前持平（6.0 / 5.9 / 5.9 TB/s，在噪声内）。
+
+带宽：< 4 GiB 时没有可测的退步——同一次运行里，新的 64 位版本与旧的 32 位实现（commit 297c4c53 的代码）在 flash h8, d128 上是 4988 vs 4926 GB/s（噪声内），blocked 随机 slot 870 / 连续 1433 GB/s 与之前持平。（此前几轮测得的 5.8 TB/s 是另一个时间点的机器状态：同一份旧代码现在也只有 4.9 TB/s；backend 交替运行新旧时看到的 5 % 差别也在这个噪声之内。）让数据加载紧跟在 slot 加载之后发出（已采用，无害）和把边界检查换成一次无符号比较（通不过 provenance 校验，已撤销）都没有带来可测的变化，所以不需要单独的 < 4 GiB 变体。

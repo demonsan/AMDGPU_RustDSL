@@ -1,7 +1,8 @@
 //! KV-cache write (docs/op-coverage-memtemplates.md T7), the "flash" layout: `k, v [T][Hk][D]` bf16 are scattered to `key_cache, value_cache [S][Hk][D]` (S = num_blocks * block_size slots) at the slot given by
 //! `slot_mapping [T]` (i32; a negative slot = padding token, nothing is written). One token per 64 / 128 / 192 / 256 lanes (a block holds 4 / 2 / 1 / 1 tokens) copy the row (`Hk * D * 2` bytes) with one b128 per lane per 16 bytes of the row.
 //!
-//! * `reshape_cache_flash_bf16_h<Hk>_d<D>`: ABI k @0, v @8, key_cache @16, value_cache @24, slot_mapping @32, T @40 (i32), S @44 (i32, slots of the cache). Caches < 4 GiB (32-bit buffer offsets).
+//! * `reshape_cache_flash_bf16_h<Hk>_d<D>`: ABI k @0, v @8, key_cache @16, value_cache @24, slot_mapping @32, T @40 (i32), S @44 (i32, slots of the cache). Caches of any size
+//!   (up to 2^31 slots): the cache descriptors are moved to the token's slot row with a 64-bit `ptr_mad` (num_records = one row).
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd};
 use amdgpu_tile::ev;
@@ -41,7 +42,7 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     let tt = Ext::sym("T");
     let ss = Ext::sym("S");
     b.sym_range("T", 1, 1 << 24);
-    b.sym_range("S", 1, 1 << 24);
+    b.sym_range("S", 1, i32::MAX as i64); // > 4 GiB caches: the descriptors are moved per slot row / block (64-bit ptr_mad)
     b.ka_is(40, tt.clone());
     b.ka_is(44, ss.clone());
     b.grid_is(0, tt.clone().ceil_div(tpb));
@@ -67,17 +68,11 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     let tok_ok = b.let_(Op::CmpLtI32(Opnd::Val(tok), Opnd::Val(t_v)));
     let r_k = { let v = b.bind_i32(ev(t_v) * row as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[0], v) };
     let r_v = { let v = b.bind_i32(ev(t_v) * row as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[1], v) };
-    let r_kc = { let v = b.bind_i32(ev(s_v) * row as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[2], v) };
-    let r_vc = { let v = b.bind_i32(ev(s_v) * row as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[3], v) };
     let r_sl = { let v = b.bind_i32(ev(t_v) << 2); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[4], v) };
     let vslot = b.bind_i32(ev(tok) << 2);
     let slotf = b.buffer_load_f32(r_sl, vslot, 0i32, 0);
-    let slot = b.bitcast_i32(slotf);
-    let slot = b.read_first_lane(slot);
-    let ok = b.let_(Op::CmpGeI32(Opnd::Val(slot), Opnd::I32(0)));
     let src = b.bind_i32(ev(tok) * row as i32 + (ev(lane) << 4));
-    let dst = b.bind_i32(ev(slot) * row as i32 + (ev(lane) << 4));
-    // loads first (K and V of every iteration), then the stores; lanes past the row (and padding tokens) store out of range
+    // the data loads do not depend on the slot: they are issued right behind the slot load (their latency overlaps the slot's), the stores come after the descriptor setup; lanes past the row (and padding tokens) store out of range
     let mut loaded = Vec::new();
     for it in 0..iters {
         let so = b.bind_i32(ev(src) + (it * lt as i64 * 16) as i32);
@@ -86,6 +81,19 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
         let lane_ok = b.let_(Op::CmpLtI32(Opnd::Val(lane), Opnd::I32((nv - it * lt as i64) as i32)));
         loaded.push((it, kv, vv, lane_ok));
     }
+    let slot = b.bitcast_i32(slotf);
+    let slot = b.read_first_lane(slot);
+    // a valid slot is in [0, S); the cache descriptors cover just this slot's row, their bases moved by a 64-bit ptr_mad (caches > 4 GiB).
+    // Invalid slots (padding < 0, or >= S) write nothing: their stores are masked, the descriptor uses the clamped slot.
+    let slot = b.let_(Op::AddI32(Opnd::Val(slot), Opnd::I32(0))); // signed (read_first_lane yields u32)
+    let ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
+    let sl = { let v = b.bind_i32(ev(slot).max(0).min(ev(s_v) - 1)); b.read_first_lane(v) };
+    let rowc = b.c_i32(row as i32);
+    let pkc = b.ptr_mad(ptrs[2], sl, rowc);
+    let pvc = b.ptr_mad(ptrs[3], sl, rowc);
+    let r_kc = b.buffer_desc(pkc, row as u32);
+    let r_vc = b.buffer_desc(pvc, row as u32);
+    let dst = b.let_(Op::MulI32(Opnd::Val(lane), Opnd::I32(16))); // the lane's chunk inside the slot row (I32)
     for (it, kv, vv, lane_ok) in loaded {
         let dof = b.bind_i32(ev(dst) + (it * lt as i64 * 16) as i32);
         let o1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(dof), b: Opnd::I32(-16) });
@@ -99,7 +107,7 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
 
 /// KV-cache write into the vLLM / aiter blocked layout: `k, v [T][Hk][D]` bf16 go to `key_cache [NB][Hk][D/8][BS][8]` and `value_cache [NB][Hk][D][BS]` (bf16) at the slot of `slot_mapping[t]`
 /// (`block = slot / BS`, `off = slot % BS`; a negative slot = padding token). The key side moves one 16-byte chunk (8 elements) per lane; the value side is transposed (the token index is the fastest dimension), so
-/// each element is a 16-bit store. D in {64, 128, 256}, BS in {8 .. 128} (powers of two), caches < 4 GiB.
+/// each element is a 16-bit store. D in {64, 128, 256}, BS in {8 .. 128} (powers of two), caches of any size (per-block descriptors, 64-bit bases).
 ///
 /// * `reshape_cache_blocked_bf16_h<Hk>_d<D>_b<BS>`: ABI k @0, v @8, key_cache @16, value_cache @24, slot_mapping @32, T @40 (i32), S @44 (i32: slots = NB * BS).
 pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
@@ -123,9 +131,10 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
     b.arg("t", DType::I32, 40, 4);
     b.arg("s", DType::I32, 44, 4);
     let tt = Ext::sym("T");
-    let ss = Ext::sym("S");
+    // S = NB BS slots (the ABI: whole blocks); > 4 GiB caches: the descriptors are moved per block (64-bit ptr_mad)
+    let ss = Ext::sym("NB") * Ext::c(bs);
     b.sym_range("T", 1, 1 << 24);
-    b.sym_range("S", 1, 1 << 24);
+    b.sym_range("NB", 1, i32::MAX as i64 / bs);
     b.ka_is(40, tt.clone());
     b.ka_is(44, ss.clone());
     b.grid_is(0, tt.clone().ceil_div(tpb));
@@ -150,17 +159,10 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
     let tok_ok = b.let_(Op::CmpLtI32(Opnd::Val(tok), Opnd::Val(t_v)));
     let r_k = { let v = b.bind_i32(ev(t_v) * row as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[0], v) };
     let r_v = { let v = b.bind_i32(ev(t_v) * row as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[1], v) };
-    let r_kc = { let v = b.bind_i32(ev(s_v) * row as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[2], v) };
-    let r_vc = { let v = b.bind_i32(ev(s_v) * row as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[3], v) };
     let r_sl = { let v = b.bind_i32(ev(t_v) << 2); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[4], v) };
     let vslot = b.bind_i32(ev(tok) << 2);
     let slotf = b.buffer_load_f32(r_sl, vslot, 0i32, 0);
-    let slot = b.bitcast_i32(slotf);
-    let slot = b.read_first_lane(slot);
-    let ok = b.let_(Op::CmpGeI32(Opnd::Val(slot), Opnd::I32(0)));
-    let blk = b.bind_i32(ev(slot).lshr(bsh));
-    let off = b.bind_i32(ev(slot) & (bs as i32 - 1));
-    let oob = b.c_i32(0x7fff_ff00);
+    // the data loads do not depend on the slot: issued right behind the slot load
     let mut loaded = Vec::new();
     for it in 0..iters {
         let c = b.bind_i32(ev(lane) + (it * lt as i64) as i32);      // chunk index within the token row
@@ -170,17 +172,34 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
         let c_ok = b.let_(Op::CmpLtI32(Opnd::Val(c), Opnd::I32(nv as i32)));
         loaded.push((c, kv, vv, c_ok));
     }
+    let slot = b.bitcast_i32(slotf);
+    let slot = b.read_first_lane(slot);
+    // a valid slot is in [0, S); the cache descriptors cover just the slot's block (BS rows), their bases moved by a 64-bit ptr_mad (caches
+    // > 4 GiB). Invalid slots write nothing (masked stores); the descriptor uses the clamped slot.
+    let slot = b.let_(Op::AddI32(Opnd::Val(slot), Opnd::I32(0))); // signed (read_first_lane yields u32)
+    let ok = b.bind_cond((ev(slot).ge(0).select_i32(1, 0) & ev(slot).lt(ev(s_v)).select_i32(1, 0)).eq(1));
+    let sl = { let v = b.bind_i32(ev(slot).max(0).min(ev(s_v) - 1)); b.read_first_lane(v) };
+    // the block, clamped to the last whole block (S = NB BS by the ABI: a no-op for valid slots; it lets the verifier prove the block descriptor in bounds)
+    let blk = { let v = b.bind_i32(ev(sl).lshr(bsh).min(ev(s_v).lshr(bsh) - 1).max(0)); b.read_first_lane(v) };
+    let off = b.bind_i32(ev(sl) & (bs as i32 - 1));
+    let blk_bytes = (bs * row) as u32;
+    let bb = b.c_i32(blk_bytes as i32);
+    let pkc = b.ptr_mad(ptrs[2], blk, bb);
+    let pvc = b.ptr_mad(ptrs[3], blk, bb);
+    let r_kc = b.buffer_desc(pkc, blk_bytes);
+    let r_vc = b.buffer_desc(pvc, blk_bytes);
+    let oob = b.c_i32(0x7fff_ff00);
     for (c, kv, vv, c_ok) in loaded {
         let head = b.bind_i32(ev(c).lshr(jsh));
         let j = b.bind_i32(ev(c) & (jd as i32 - 1));
-        // key: chunk (head, j) of block blk, row `off`: ((blk * Hk + head) * (D/8) + j) * BS * 16 + off * 16
-        let kd = b.bind_i32((((ev(blk) * h as i32 + ev(head)) * jd as i32 + ev(j)) * (bs as i32 * 16)) + (ev(off) << 4));
+        // key: chunk (head, j) of the slot's block (the descriptor base), row `off`: (head * (D/8) + j) * BS * 16 + off * 16
+        let kd = b.bind_i32(((ev(head) * jd as i32 + ev(j)) * (bs as i32 * 16)) + (ev(off) << 4));
         let kd = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(kd), b: Opnd::Val(oob) });
         let kd = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c_ok), a: Opnd::Val(kd), b: Opnd::Val(oob) });
         let kd = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(tok_ok), a: Opnd::Val(kd), b: Opnd::Val(oob) });
         b.buffer_store_c(r_kc, Some(Opnd::Val(kd)), 0i32, 0, kv, MemTy::B128, false, CachePolicy::NT);
-        // value: element (head, 8 j + i): ((blk * Hk + head) * D + 8 j + i) * BS * 2 + off * 2
-        let vbase = b.bind_i32((((ev(blk) * h as i32 + ev(head)) * d as i32 + (ev(j) << 3)) * (bs as i32 * 2)) + (ev(off) << 1));
+        // value: element (head, 8 j + i) of the slot's block: (head * D + 8 j + i) * BS * 2 + off * 2
+        let vbase = b.bind_i32(((ev(head) * d as i32 + (ev(j) << 3)) * (bs as i32 * 2)) + (ev(off) << 1));
         let vbase = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(vbase), b: Opnd::Val(oob) });
         let vbase = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c_ok), a: Opnd::Val(vbase), b: Opnd::Val(oob) });
         let vbase = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(tok_ok), a: Opnd::Val(vbase), b: Opnd::Val(oob) });
