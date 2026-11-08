@@ -172,6 +172,29 @@ int main(int argc, char** argv) {
         launch(f2, a2, D / 128, nblk);
         launch(fs, as, D / 1024, M);
     };
+    if (envi("DOWNFIRST", 0) && TK == 1) {
+        // the Down kernel FIRST (cold) on the stage-1 operands, then again (warm): compare both with the reference
+        std::vector<float> ones(maxp, 1.0f);
+        HC(hipMemcpy(dsw, ones.data(), maxp * 4, hipMemcpyHostToDevice));
+        for (int rep = 0; rep < 2; rep++) {
+            HC(hipMemset(dT, 0, (size_t)M * 2 * I * 4));
+            auto ag = gemm_args(dX, dW1, dT, M, 2 * I, D, dxs, dw1s, 2 * I);
+            launch(f2, ag, 2 * I / 128, nblk);
+            HC(hipDeviceSynchronize());
+            std::vector<float> T((size_t)M * 2 * I);
+            HC(hipMemcpy(T.data(), dT, T.size() * 4, hipMemcpyDeviceToHost));
+            long gb = 0;
+            for (int tt = 0; tt < M; tt++)
+                for (int r = 0; r < 2 * I; r++) {
+                    int q = r / 32, rr = r % 32, src = rr < 16 ? 16 * q + rr : I + 16 * q + rr - 16, e = ids[tt];
+                    double s = 0;
+                    for (int d = 0; d < D; d++) s += (double)xf[(size_t)tt * D + d] * w1f[((size_t)e * 2 * I + src) * D + d];
+                    gb += std::fabs(T[(size_t)tt * 2 * I + r] - s) > 1e-2 * std::fabs(s) + 1e-2;
+                }
+            printf("DOWNFIRST rep %d bad=%ld of %d\n", rep, gb, M * 2 * I);
+        }
+        HC(hipMemcpy(dsw, sw.data(), maxp * 4, hipMemcpyHostToDevice));
+    }
     HC(hipMemset(dY1, 0, (size_t)M * TK * I * 2));
     run(true);
     HC(hipDeviceSynchronize());
