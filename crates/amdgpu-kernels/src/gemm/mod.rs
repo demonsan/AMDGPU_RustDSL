@@ -16,6 +16,7 @@ use amdgpu_layout::{composition, layout_to_offsets, make_layout, right_inverse, 
 use amdgpu_tile::{make_tiled_copy_a, make_tiled_copy_b, make_tiled_mma, Ctx, LdsPart, TiledMma};
 
 pub mod graph;
+pub mod reduce;
 mod skeleton_v4;
 
 /// Slots per wave record of the optional timing stamps (`GEMM_STAMP`): 0 kernel start, 1 setup done, 2 prologue done, 3 loop done, 4 epilogue stores issued, 16 + tile = the tile matrix phase.
@@ -44,6 +45,9 @@ pub struct GemmConfig {
     pub scales: Scales,
     /// operand element type (the LDS / register tile is 128 bytes of K either way)
     pub elem: Elem,
+    /// split-K: grid z = split index over `S` (kernarg 36) splits of KS (kernarg 88) tiles each; the fp32 partial C goes to `ptr_c` as
+    /// [S][M][N] (row / column scales are left to the reduce, `gemm_splitk_reduce`)
+    pub split_k: bool,
 }
 
 /// Operand element type of the GEMM.
@@ -93,7 +97,7 @@ pub enum Scales {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8 }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -110,6 +114,10 @@ impl GemmConfig {
     /// fp8 A8W8 with fp32 1 x 128 / 128 x 128 block scales (`gemm_a8w8_blockscale`): 128 x 128 CTA, VGPR accumulators (acc += t s).
     pub fn a8w8_blockscale() -> GemmConfig {
         GemmConfig { cta_m: 128, cta_n: 128, acc_agpr: 0, scales: Scales::Block128, elem: Elem::Fp8Bs, ..GemmConfig::v4() }
+    }
+    /// Split-K form of a 128 x 128 configuration (fp32 partials + `reduce::gemm_splitk_reduce`).
+    pub fn splitk(self) -> GemmConfig {
+        GemmConfig { split_k: true, ..self }
     }
     /// MXFP4 A4W4 (`gemm_a4w4_mxfp4`): fp4 operands, 1 x 32 E8M0 scales in the scaled MFMAs.
     pub fn a4w4() -> GemmConfig {
@@ -247,13 +255,20 @@ fn declare_abi(b: &mut FnBuilder) {
 /// The host contract of the ABI for a `cta_m x cta_n` CTA (what `gpu-verify` proves the accesses against): M = MT cta_m, N = NT cta_n, K = KT 128
 /// (the kernel has no partial tiles), the grid (NT, MT), dense strides (stride_a = stride_b = K, stride_c = N, stride_sfa = M, stride_sfb = K / 128),
 /// batch 1, and the tensor extents A M K, B N K (preshuffled, same size), C 2 M N, sa (K / 128) M, sb (N / 128) (K / 128) bytes.
-fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64) {
-    let (mt, nt, kt) = (Ext::sym("MT"), Ext::sym("NT"), Ext::sym("KT"));
+fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool) {
+    let (mt, nt) = (Ext::sym("MT"), Ext::sym("NT"));
     // int32 offsets: M K, N K and 2 M N stay below 2^31 (16384 x 65536 tiles of bytes at most)
     b.sym_range("MT", 1, (1 << 14) / cta_m);
     b.sym_range("NT", 1, (1 << 14) / cta_n);
-    // K <= 128 PANEL_KB: the scale panel holds every K group of the CTA (the vendor sp64 limit)
-    b.sym_range("KT", 1, PANEL_KB);
+    // K <= 128 PANEL_KB: the scale panel holds every K group of the CTA (the vendor sp64 limit); split-K: KT = S KS
+    let kt = if split {
+        b.sym_range("S", 1, 16);
+        b.sym_range("KS", 1, PANEL_KB);
+        Ext::sym("S") * Ext::sym("KS")
+    } else {
+        b.sym_range("KT", 1, PANEL_KB);
+        Ext::sym("KT")
+    };
     let m = mt.clone() * Ext::c(cta_m);
     let n = nt.clone() * Ext::c(cta_n);
     // K in elements (kernarg) and in bytes (extents): KT tiles of 128 bytes
@@ -262,7 +277,11 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, p
     b.ka_is(24, m.clone());
     b.ka_is(28, n.clone());
     b.ka_is(32, k_el.clone());
-    b.ka_is(36, Ext::c(1));
+    b.ka_is(36, if split { Ext::sym("S") } else { Ext::c(1) });
+    if split {
+        b.ka_is(88, Ext::sym("KS"));
+        b.grid_is(2, Ext::sym("S"));
+    }
     b.ka_is(40, k_el.clone());
     b.ka_is(44, k_el);
     b.ka_is(48, n.clone());
@@ -272,7 +291,11 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, p
     b.grid_is(1, mt.clone());
     b.arg_tensor("ptr_a", m.clone() * k.clone());
     b.arg_tensor("ptr_b", n.clone() * k.clone());
-    b.arg_tensor("ptr_c", Ext::c(2) * m.clone() * n.clone());
+    if split {
+        b.arg_tensor("ptr_c", Ext::c(4) * Ext::sym("S") * m.clone() * n.clone());
+    } else {
+        b.arg_tensor("ptr_c", Ext::c(2) * m.clone() * n.clone());
+    }
     match scales {
         Scales::Mx128 => {
             b.arg_tensor("ptr_sfa", kt.clone() * m);
@@ -443,7 +466,7 @@ fn sfa_transpose_proof() {
 
 struct Body {
     cfg: Cfg,
-    /// K / 128 (kernarg)
+    /// K tiles of this CTA's loop (K / 128, or KS with split-K)
     kb_v: ValueId,
     /// the E8M0 scale panel (Scales::Mx128)
     panel: Option<Panel>,
@@ -475,6 +498,8 @@ struct Body {
     mx32: Option<Mx32>,
     /// `Scales::Block128`: the per-tile fp32 scale loads (voffsets; `shift` unused)
     bs128: Option<Mx32>,
+    /// split-K: this split's first K tile
+    zb: Option<ValueId>,
     /// `Elem::Fp8Bs`: the block products of the tile waiting for their scaled accumulation (`bs_fma`)
     pending: std::cell::RefCell<Vec<(VarId, ValueId, VarId, VarId)>>,
     /// register-staged tile: initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
@@ -525,7 +550,12 @@ impl Body {
         // K group of a real tile (t + 1 is read only when it exists): the clamp is a no-op that bounds it for the verifier's loop-exit-blind intervals
         let kb = b.bind_i32(kb.lt(ev(self.kb_v)).select_i32(kb.clone(), ev(self.kb_v) - 1));
         if let Some(bs) = &self.bs128 {
-            // fp32 [rows][KT]: tile kb at byte 4 kb (SGPR soffset), per m block one float; the B block float (raw: installed as words)
+            // fp32 [rows][KT]: tile kb (+ the split's first tile) at byte 4 kb (SGPR soffset), per m block one float; the B block float (raw:
+            // installed as words)
+            let kb = match self.zb {
+                Some(zb) => b.bind_i32(ev(kb) + ev(zb)),
+                None => kb,
+            };
             let so = { let v = b.bind_i32(ev(kb) << 2); b.read_first_lane(v) };
             let sa = bs.voff_a.iter().map(|v| b.buffer_load_f32(self.rsrc_sfa, *v, so, 0)).collect();
             let sb = bs.voff_b.iter().map(|v| b.buffer_load_f32(self.rsrc_sfb, *v, so, 0)).collect();
@@ -847,6 +877,15 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a16w16_bf16" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16", GemmConfig::a16w16())),
         "gemm_a16w16_bf16_128" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128", GemmConfig::a16w16_128())),
         "gemm_a8w8_blockscale" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale", GemmConfig::a8w8_blockscale())),
+        "gemm_a8w8_blockscale_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_splitk", GemmConfig::a8w8_blockscale().splitk())),
+        "gemm_a8w8_rowcol_fp8_128_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128_splitk", GemmConfig::a8w8_rowcol_128().splitk())),
+        "gemm_a16w16_bf16_128_splitk" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128_splitk", GemmConfig::a16w16_128().splitk())),
+        n if n.starts_with("gemm_splitk_reduce_s") => {
+            // gemm_splitk_reduce_s<S>[_rc]
+            let rest = &n["gemm_splitk_reduce_s".len()..];
+            let (s, rc) = match rest.strip_suffix("_rc") { Some(s) => (s, true), None => (rest, false) };
+            s.parse::<i64>().ok().filter(|s| (1..=16).contains(s)).map(|s| reduce::gemm_splitk_reduce(n, s, rc))
+        }
         "gemm_a4w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4", GemmConfig::a4w4())),
         "gemm_a4w4_mxfp4_128" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_128", GemmConfig::a4w4_128())),
         _ => None,
@@ -905,7 +944,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         b.sched_opts(cfg.sched);
     }
     declare_abi(b);
-    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile());
+    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k);
     // timing stamps (opt-in debug build, GEMM_STAMP=ends|tiles): one extra pointer argument after the ABI (offset 96); see docs/stamps.md
     let stamp_mode = std::env::var("GEMM_STAMP").ok().filter(|v| v == "ends" || v == "tiles");
     if stamp_mode.is_some() {
@@ -1035,8 +1074,20 @@ impl skeleton_v4::V4Slots for GemmSlots {
             { let n = b.bind_i32(ev(n_v) * ev(kb_v) << 3); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
         ),
     };
-    let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
-    let b_org = b.bind_i32((ev(bx) << lg_n) * ev(k_v));
+    // split-K: this split's first tile zb = z KS (A advances 128 bytes per tile, the preshuffled B 16 x 128)
+    let (ks_v, zb) = if cfg.split_k {
+        assert!(matches!(cfg.scales, Scales::RowCol | Scales::None | Scales::Block128), "split-K: scales applied per tile or in the reduce");
+        let ks = b.let_(Op::KernargI32 { offset: 88 });
+        let z = b.let_(Op::WorkgroupIdZ);
+        let zb = { let v = b.bind_i32(ev(z) * ev(ks)); b.read_first_lane(v) };
+        (ks, Some(zb))
+    } else {
+        (kb_v, None)
+    };
+    let (a_org, b_org) = match zb {
+        None => (b.bind_i32((ev(by) << lg_m) * ev(k_v)), b.bind_i32((ev(bx) << lg_n) * ev(k_v))),
+        Some(zb) => (b.bind_i32((ev(by) << lg_m) * ev(k_v) + (ev(zb) << 7)), b.bind_i32((ev(bx) << lg_n) * ev(k_v) + (ev(zb) << 11))),
+    };
 
     let panel = panel_sh.map(|panel_sh| {
     // ---- the scale panel (written in the pipeline prologue, `prologue_stores`) ----
@@ -1068,7 +1119,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     Panel { sh, b_base: PANEL_KB * 256, tr, b_dw, sfa: SfaJob { voff, pso, sel1, sel2, dst, bvo, bsh, bdst } }
     });
 
-    let mut pipe = Pipeline::new(Cadence::RegStaged, kb_v, k_v, 128, Ext::ka(84));
+    let mut pipe = Pipeline::new(Cadence::RegStaged, ks_v, k_v, 128, if cfg.split_k { Ext::ka(88) } else { Ext::ka(84) });
     // two tiles per pass, static slots; tile 1 staged after the scale-panel stores with its DMAs in flight at the prologue barrier
     pipe.late_tile1_vm = (a_dma.issues.len() + b_dma.issues.len()) as u8;
     pipe.scalar_exit = true;
@@ -1105,8 +1156,8 @@ impl skeleton_v4::V4Slots for GemmSlots {
         Mx32 { voff_a, voff_b, shift }
     });
     let body = Body {
-        cfg, kb_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, pending: Default::default(),
+        cfg, kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, pending: Default::default(), zb,
     };
         GemmCx { cfg, body, pipe: Some(pipe), ctx, mma, epi, lane, s_lane, s_n, s_wm, s_wn, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx }
     }
@@ -1156,6 +1207,32 @@ impl skeleton_v4::V4Slots for GemmSlots {
         for v in bv.iter().chain(av.iter()) {
             b.pin_agpr(*v);
         }
+    }
+    if cfg.split_k {
+        // split-K: the fp32 partial C straight from the accumulator layout (lane = row m, 4 consecutive n: one 16-byte store) into
+        // ptr_c[z][m][n]
+        let z = b.let_(Op::WorkgroupIdZ);
+        let c_blk = make_layout(tup![16, 16], tup![s_n.mul_c(4), 4]);
+        let c_plan = IssuePlan::new(mma.c_tv(), 4);
+        let c_org = b.bind_i32(((((ev(by) << lg_m) * ev(n_v)) + (ev(bx) << lg_n)) << 2) + ((ev(z) * ev(m_v) * ev(n_v)) << 2));
+        let cb = b.ptr_add(ptr_c, c_org);
+        let mut exprs = Vec::new();
+        for i in 0..wave_m / 16 {
+            for j in 0..wave_n / 16 {
+                let org = s_wm.mul_c(wave_m).add_c(16 * i).mul(s_n).mul_c(4).add(&s_wn.mul_c(wave_n).add_c(16 * j).mul_c(4));
+                exprs.extend(c_plan.offsets(&c_blk, s_lane, &org, &ctx.dyns));
+            }
+        }
+        let plan = layout_to_offsets(&exprs, &Swizzle::none(), ImmRange::GLOBAL, &ctx.dyns);
+        let bases: Vec<ValueId> = plan.bases.iter().map(|e| {
+            let o = b.bind_i32(ctx.lower(e));
+            b.ptr_add(cb, o)
+        }).collect();
+        for (n, acc) in body.acc.iter().enumerate() {
+            let (bi, imm) = plan.issues[n];
+            b.store_f32x4(bases[bi], imm as u32, Opnd::Var(*acc));
+        }
+        return;
     }
     if let Some(epi) = &epi {
         let rowcol = (cfg.scales == Scales::RowCol).then_some((body.rsrc_sfa, body.rsrc_sfb));

@@ -209,9 +209,29 @@ int main(int argc, char** argv) {
         a.u32(o, M); a.u32(o + 4, N); a.u32(o + 8, K); a.b.resize(o + 12);
     }
 
+    // ours with split-K (SPLITK > 1): fp32 partials [S][M][N] into a workspace, then REDUCE_CO / REDUCE_KN (gemm_splitk_reduce_s<S>[_rc]) into C
+    void* dWS = nullptr;
+    Arg ra;
+    hipFunction_t rfn = nullptr;
+    if (fam.rfind("ours_v4_", 0) == 0 && splitk > 1) {
+        HC(hipMalloc(&dWS, (size_t)splitk * M * N * 4 + 256));
+        a.ptr(16, dWS);
+        a.u32(36, splitk);
+        a.u32(88, (kind == "f4" ? K / 256 : kind == "bf16" ? K / 64 : K / 128) / splitk);
+        gz = splitk;
+        hipModule_t rmod;
+        HC(hipModuleLoad(&rmod, getenv("REDUCE_CO")));
+        HC(hipModuleGetFunction(&rfn, rmod, getenv("REDUCE_KN")));
+        ra.ptr(0, dWS); ra.ptr(8, dC); ra.ptr(16, dSA); ra.ptr(24, dSB); ra.u32(32, M); ra.u32(36, N); ra.u32(40, splitk); ra.b.resize(48);
+    }
+    size_t rsz = ra.b.size();
+    void* rcfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ra.b.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &rsz, HIP_LAUNCH_PARAM_END};
     size_t asz = a.b.size();
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, a.b.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};
-    auto launch = [&]() { HC(hipModuleLaunchKernel(fn, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, cfg)); };
+    auto launch = [&]() {
+        HC(hipModuleLaunchKernel(fn, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, cfg));
+        if (rfn) HC(hipModuleLaunchKernel(rfn, N / 1024, M, 1, 256, 1, 1, 0, nullptr, nullptr, rcfg));
+    };
     launch();
     HC(hipDeviceSynchronize());
 
