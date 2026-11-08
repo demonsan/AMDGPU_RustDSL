@@ -213,6 +213,24 @@ int main(int argc, char** argv) {
     }
     HC(hipMemset(dY1, 0, (size_t)M * TK * I * 2));
     run(true);
+    if (envi("QDBG", 0) && fp8) {
+        // the GPU re-quantization vs the host one
+        HC(hipDeviceSynchronize());
+        const int NG = bs ? I / 128 : 1;
+        std::vector<uint8_t> gq((size_t)M * TK * I);
+        std::vector<float> gs((size_t)M * TK * NG);
+        HC(hipMemcpy(gq.data(), dY1q, gq.size(), hipMemcpyDeviceToHost));
+        HC(hipMemcpy(gs.data(), dy1s, gs.size() * 4, hipMemcpyDeviceToHost));
+        requant();
+        std::vector<uint8_t> hq(gq.size());
+        std::vector<float> hs(gs.size());
+        HC(hipMemcpy(hq.data(), dY1q, hq.size(), hipMemcpyDeviceToHost));
+        HC(hipMemcpy(hs.data(), dy1s, hs.size() * 4, hipMemcpyDeviceToHost));
+        long dq = 0, ds = 0, shown = 0;
+        for (size_t i = 0; i < gq.size(); i++) if (gq[i] != hq[i]) { if (shown++ < 6) printf("  q[%zu] gpu %02x (%g) host %02x (%g)\n", i, gq[i], e4m3_to_f(gq[i]), hq[i], e4m3_to_f(hq[i])); dq++; }
+        for (size_t i = 0; i < gs.size(); i++) if (std::fabs(gs[i] - hs[i]) > 1e-6 * std::fabs(hs[i])) { if (ds < 4) printf("  s[%zu] gpu %g host %g\n", i, gs[i], hs[i]); ds++; }
+        printf("QDBG: %ld of %zu codes differ, %ld of %zu scales differ\n", dq, gq.size(), ds, gs.size());
+    }
     HC(hipDeviceSynchronize());
     std::vector<uint16_t> out((size_t)M * D), y1((size_t)M * TK * I);
     HC(hipMemcpy(out.data(), dO, out.size() * 2, hipMemcpyDeviceToHost));
