@@ -71,6 +71,16 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     let r_sl = { let v = b.bind_i32(ev(t_v) << 2); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[4], v) };
     let vslot = b.bind_i32(ev(tok) << 2);
     let slotf = b.buffer_load_f32(r_sl, vslot, 0i32, 0);
+    let src = b.bind_i32(ev(tok) * row as i32 + (ev(lane) << 4));
+    // the data loads do not depend on the slot: they are issued right behind the slot load (their latency overlaps the slot's), the stores come after the descriptor setup; lanes past the row (and padding tokens) store out of range
+    let mut loaded = Vec::new();
+    for it in 0..iters {
+        let so = b.bind_i32(ev(src) + (it * lt as i64 * 16) as i32);
+        let kv = b.buffer_load_c(r_k, Some(Opnd::Val(so)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+        let vv = b.buffer_load_c(r_v, Some(Opnd::Val(so)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+        let lane_ok = b.let_(Op::CmpLtI32(Opnd::Val(lane), Opnd::I32((nv - it * lt as i64) as i32)));
+        loaded.push((it, kv, vv, lane_ok));
+    }
     let slot = b.bitcast_i32(slotf);
     let slot = b.read_first_lane(slot);
     // a valid slot is in [0, S); the cache descriptors cover just this slot's row, their bases moved by a 64-bit ptr_mad (caches > 4 GiB).
@@ -83,17 +93,7 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     let pvc = b.ptr_mad(ptrs[3], sl, rowc);
     let r_kc = b.buffer_desc(pkc, row as u32);
     let r_vc = b.buffer_desc(pvc, row as u32);
-    let src = b.bind_i32(ev(tok) * row as i32 + (ev(lane) << 4));
     let dst = b.let_(Op::MulI32(Opnd::Val(lane), Opnd::I32(16))); // the lane's chunk inside the slot row (I32)
-    // loads first (K and V of every iteration), then the stores; lanes past the row (and padding tokens) store out of range
-    let mut loaded = Vec::new();
-    for it in 0..iters {
-        let so = b.bind_i32(ev(src) + (it * lt as i64 * 16) as i32);
-        let kv = b.buffer_load_c(r_k, Some(Opnd::Val(so)), 0i32, 0, MemTy::B128, CachePolicy::NT);
-        let vv = b.buffer_load_c(r_v, Some(Opnd::Val(so)), 0i32, 0, MemTy::B128, CachePolicy::NT);
-        let lane_ok = b.let_(Op::CmpLtI32(Opnd::Val(lane), Opnd::I32((nv - it * lt as i64) as i32)));
-        loaded.push((it, kv, vv, lane_ok));
-    }
     for (it, kv, vv, lane_ok) in loaded {
         let dof = b.bind_i32(ev(dst) + (it * lt as i64 * 16) as i32);
         let o1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(dof), b: Opnd::I32(-16) });
@@ -162,6 +162,16 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
     let r_sl = { let v = b.bind_i32(ev(t_v) << 2); let v = b.read_first_lane(v); b.buffer_desc_dyn(ptrs[4], v) };
     let vslot = b.bind_i32(ev(tok) << 2);
     let slotf = b.buffer_load_f32(r_sl, vslot, 0i32, 0);
+    // the data loads do not depend on the slot: issued right behind the slot load
+    let mut loaded = Vec::new();
+    for it in 0..iters {
+        let c = b.bind_i32(ev(lane) + (it * lt as i64) as i32);      // chunk index within the token row
+        let so = b.bind_i32((ev(tok) * row as i32) + (ev(c) << 4));
+        let kv = b.buffer_load_c(r_k, Some(Opnd::Val(so)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+        let vv = b.buffer_load_c(r_v, Some(Opnd::Val(so)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+        let c_ok = b.let_(Op::CmpLtI32(Opnd::Val(c), Opnd::I32(nv as i32)));
+        loaded.push((c, kv, vv, c_ok));
+    }
     let slot = b.bitcast_i32(slotf);
     let slot = b.read_first_lane(slot);
     // a valid slot is in [0, S); the cache descriptors cover just the slot's block (BS rows), their bases moved by a 64-bit ptr_mad (caches
@@ -179,15 +189,6 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
     let r_kc = b.buffer_desc(pkc, blk_bytes);
     let r_vc = b.buffer_desc(pvc, blk_bytes);
     let oob = b.c_i32(0x7fff_ff00);
-    let mut loaded = Vec::new();
-    for it in 0..iters {
-        let c = b.bind_i32(ev(lane) + (it * lt as i64) as i32);      // chunk index within the token row
-        let so = b.bind_i32((ev(tok) * row as i32) + (ev(c) << 4));
-        let kv = b.buffer_load_c(r_k, Some(Opnd::Val(so)), 0i32, 0, MemTy::B128, CachePolicy::NT);
-        let vv = b.buffer_load_c(r_v, Some(Opnd::Val(so)), 0i32, 0, MemTy::B128, CachePolicy::NT);
-        let c_ok = b.let_(Op::CmpLtI32(Opnd::Val(c), Opnd::I32(nv as i32)));
-        loaded.push((c, kv, vv, c_ok));
-    }
     for (c, kv, vv, c_ok) in loaded {
         let head = b.bind_i32(ev(c).lshr(jsh));
         let j = b.bind_i32(ev(c) & (jd as i32 - 1));
