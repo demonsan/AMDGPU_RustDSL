@@ -189,3 +189,18 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 ## 部分 RoPE（rotary_dim < D）
 
 `rope_{neox,gptj}_bf16_h<H>_d<D>_r<R>`（R 是 16 的倍数，16 ≤ R < D；表是 `[P][R]`，前半 cos、后半 sin）：每个 head 只有前 R 个元素旋转，其余原样拷贝。实现不另加数据通路：不旋转的 lane 用同一套公式，cos = 1、sin = 0（恒等旋转）——NeoX 里 R 之后的元素成对分给 `D/16 − R/16` 个 lane（每 lane 两个相邻 chunk），GPT-J 里 `lr ≥ R/8` 的 lane 直接是恒等；lane 总数仍是 `D/16`（NeoX）/ `D/8`（GPT-J），所以占用与全旋转版相同。主机测试 `rope_host`（`ROPE_R=<R>`）：D = 128 / R = 64（neox、gptj）、D = 256 / R = 32，`bad = 0`，R 之后的元素逐位等于输入；D = 128 / R = 64 的 neox：5062 GB/s（流量按 R 宽的表计）。R = D 的名字不变，行为不变。
+
+## 采样：`argmax` 与温度采样（模板 T5 / T6，一个 block 一行）
+
+`sampling/mod.rs`：`argmax_bf16_v<V>`（贪心，并列取最小下标）和 `sample_bf16_v<V>`（`p = softmax(logits / T)`，返回累计概率首次达到 `u[b] · 总和` 的最小下标，即带调用方给的均匀随机数 `u ∈ [0, 1)` 的逆 CDF / 多项式采样）。V 为 8 的倍数、8 … 131072；一个 1024 线程的 block 处理一行（grid = B）。ABI：`argmax`：logits @0（bf16 `[B][V]`）、out @8（i32 `[B]`）、B @16；`sample`：logits @0、u @8（f32 `[B]`）、out @16、inv_temperature @24（f32）、B @28。主机测试 `tests/gpu/sampling_host.cpp`（CPU 双精度参考：argmax 逐行对拍，含峰值与每三行一个并列；sample 的下标与参考相同或在累计概率相差 < 2e-4 的边界上相邻）：V ∈ {8, 1000, 32000, 128256}，`bad = 0`。
+
+实现：每个线程拥有 `C = ⌈V / 8192⌉`（向上取 4 的倍数）个连续 16 B chunk；各遍是运行时循环（每次迭代 4 个 chunk 的加载先于计算）：第 1 遍（合并访问）每线程取最大值（严格大于才更新，所以线程内取最小下标）→ block 归约（DPP quad + wave 的 LDS 交换 + 每 wave 一个槽位 + barrier，每次归约一个新槽位，不需要再 barrier）取全局最大，再用"负下标取 Max"取最小下标；`sample` 再加第 2 遍（连续拥有，线程内 `exp` 之和）→ LDS 里的 Hillis–Steele 前缀扫描 → 第 3 遍（连续拥有）找第一个累计值 ≥ 目标的元素（每个线程取负下标的 Max，block 归约取最小下标；舍入导致没有命中时回退到 argmax）。**为什么不把一行留在寄存器里**：128 K 词表需要 160+ VGPR，而 1024 线程的 block 每线程至多 128（超出会 `HSA_STATUS_ERROR_INVALID_ISA` 启动失败）；展开的遍里调度器还会把后几遍的加载全部提到最前。
+
+| 形状 | VGPR | 耗时 | 有效读带宽 |
+|---|--:|--:|--:|
+| `argmax_bf16_v128256`，B = 4096 | 52 | 246 µs | 4278 GB/s |
+| `argmax_bf16_v32000`，B = 16384 | 52 | 275 µs | 3817 GB/s |
+| `sample_bf16_v128256`，B = 4096 | 60 | 1460 µs | 720 GB/s |
+| `sample_bf16_v32000`，B = 16384 | 60 | 834 µs | 1258 GB/s |
+
+结论：argmax 约为流式上限的 60–65 %（每行只有一个 block 的 16 个 wave，归约与 barrier 的延迟没有被其他行遮盖）；采样是三遍 + 扫描 + `exp`，VALU 与延迟受限，只有 argmax 的 1/3–1/6。没有与 aiter 的同轮对比（`sample_kernels.cu` 的入口依赖 torch 的随机数 / 张量约定）。待做：top-k / top-p 过滤（按阈值二分，不排序）、每个 block 处理多行或把行拆给多个 block 来遮盖归约延迟、DPP 行操作（A4）。
