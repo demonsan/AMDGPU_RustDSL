@@ -61,12 +61,18 @@ Anything not ordered by these rules may be interleaved; the result still goes th
 | `RotStage` / `Part` / `weave::rotate(b, parts, stage, order, build)` | Loop rotation by iteration offset: the prologue keeps offset ≥ 1, the steady body keeps everything, the epilogue keeps offset ≤ 0. Parts that are not kept are never built. |
 
 What `capture` fills in from the facts:
-- **Dependencies** on earlier captured units, via `must_order`. Every earlier closure unit is a conservative dependency.
+- **Dependencies** on earlier units, via `must_order`.
 - **Class, hint, latency and footprint.** The per-node facts are kept in `Unit.stmts` and their union in `Unit.summary`, for the cost-model strategy (`weave_auto`).
 
-The old closure API (`Units::add`) still works and can be mixed in.
+The earlier closure API (`Units::add` with `Out<T>` cells) has been removed: every unit is captured.
 
-**Rotation in `Pipeline`.** `Pipeline`'s `TwoPhaseOffset` iteration is a rotated weave of six parts: `stage` (+1) | `v_phase` | `complete` (+1, anchor) | `mid_sync` (anchor) | `m_phase` | `end_sync` (anchor). The peeled last iteration is the rotation's epilogue.
+**Rotation in `Pipeline`.** Every cadence's iteration is a rotated weave, and the peeled last iteration is the rotation's epilogue:
+
+| cadence | parts |
+|---|---|
+| `TwoPhaseOffset` | `stage` (+1) \| `v_phase` \| `complete` (+1, anchor) \| `mid_sync` (anchor) \| `m_phase` \| `end_sync` (anchor) |
+| `OneWindow` | `stage` (+2) \| `window` \| `complete_sync` (+2, anchor) |
+| `RegStaged` | `key` (+2) \| `pre_sync` \| `sync` (+2, anchor: waits, `post_wait`, barrier) \| `stage` (+2) \| `m_phase` |
 
 **Migrated stages.** The stages of FMHA, GEMM v4, MLP and RMSNorm, and `DmaPart::issue_buffer_units`, are written with `capture`. Every kernel's assembly is byte-identical to the closure form.
 
