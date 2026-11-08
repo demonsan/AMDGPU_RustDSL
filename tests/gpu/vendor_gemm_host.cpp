@@ -171,6 +171,13 @@ int main(int argc, char** argv) {
         a.ptr(0, dC); a.ptr(16, nullptr); a.ptr(32, dA); a.ptr(48, dB); a.f32(64, 1.0f); a.f32(80, 0.0f);
         a.u32(96, N); a.u32(128, N); a.u32(160, K); a.u32(192, K); a.u32(224, M); a.u32(240, N); a.u32(256, K);
         a.ptr(272, dSA); a.ptr(288, dSB); a.u32(304, sn); a.u32(336, sn2); a.u32(368, 0); a.b.resize(372);
+    } else if (fam == "ours_v4_fp8bs") {
+        // our v4 structure, fp8 blockscale: A scales fp32 [M][K/128] row-major (ours), B scales [N/128][K/128], KT = K / 128
+        dSA = dev(sa_blk); dSB = dev(sb_blk);
+        a.ptr(0, dA); a.ptr(8, dB); a.ptr(16, dC);
+        int iv[10] = {M, N, K, 1, K, K, N, 0, 0, 0};
+        for (int i = 0; i < 10; i++) a.u32(24 + 4 * i, iv[i]);
+        a.ptr(64, dSA); a.ptr(72, dSB); a.u32(80, M); a.u32(84, K / 128); a.u32(88, 0); a.u32(92, 0); a.b.resize(96);
     } else if (fam == "ours_v4_f4") {
         // our v4 structure, MXFP4: A [M][K/2] bytes, B preshuffled bytes, scales e8m0 [rows][K/32] (natural), KT = 128-byte K tiles = K / 256
         dSA = dev(sa8); dSB = dev(sb8);
