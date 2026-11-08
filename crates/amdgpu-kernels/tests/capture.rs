@@ -135,9 +135,9 @@ fn mfma_passes_match_the_isa_atoms() {
     use amdgpu_dsl::facts::op_class;
     let o = Opnd::I32(0);
     for (op, atom) in [
-        (Op::MfmaScaleFp8_32x32x64 { a: o, b: o, c: o, scale_a: o, scale_b: o }, amdgpu_isa::mfma_scale_32x32x64_f8()),
-        (Op::MfmaF16Wide { a: o, b: o, c: o }, amdgpu_isa::mfma_32x32x8_f16()),
-        (Op::SmfmacFp8_16x16x128 { a: o, b: o, idx: o, c: o }, amdgpu_isa::smfmac_16x16x128_fp8()),
+        (Op::MfmaScaleFp8_32x32x64 { a: o, b: o, c: o, scale_a: o, scale_b: o }, amdgpu_isa::MmaAtom::mfma_scale_32x32x64_f8()),
+        (Op::MfmaF16Wide { a: o, b: o, c: o }, amdgpu_isa::MmaAtom::mfma_32x32x8_f16()),
+        (Op::SmfmacFp8_16x16x128 { a: o, b: o, idx: o, c: o }, amdgpu_isa::MmaAtom::smfmac_16x16x128_fp8()),
     ] {
         assert_eq!(op_class(&op).0, ResClass::Mfma { passes: atom.passes as u8 }, "{op:?}");
     }
