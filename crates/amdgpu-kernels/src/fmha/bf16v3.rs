@@ -266,8 +266,8 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     // over the Gemm profile
     // (causal: the Gemm profile measured 4 % faster (955 vs 915 TF/s at 8192²); the key-split form keeps the Gemm profile: under Vs128 its
     // causal S = 4 build faulted on HW - reported)
-    let vs = !split && !causal;
-    b.compile_profile(if vs { CompileProfile::Vs128 } else { CompileProfile::Gemm });
+    let vs_policy = !split && !causal;
+    b.compile_profile(if vs_policy { CompileProfile::Vs128 } else { CompileProfile::Gemm });
     // ---- ABI (the vendor's v3, as bf16.rs) ----
     for (n, i) in [("ptr_o", 0u32), ("ptr_q", 1), ("ptr_k", 2), ("ptr_v", 3), ("ptr_lse", 4)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
@@ -573,7 +573,7 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     }
     }
     let mut f = b.finish();
-    if vs {
+    if vs_policy {
         f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
     }
     f
