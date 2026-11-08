@@ -603,6 +603,23 @@
     | 4096² B1H8 | 0.76 | 0.68 |
 
     4096² B1H8 的网格只有 64–128 个 CTA，所以比值最低。
+- **bf16 prefill 第二轮**（同次运行）：
+  - 非 causal 改用 `_vs128` 编译策略，加上 ldsink / wsink / ldahead32：+6.6–7.7%。
+  - causal 留在 Gemm 策略（换成 Vs128 测得 −4%），但同样加上调度选项：+1–2%。
+  - `_ks` 形式留在 Gemm 策略：它的 Vs128 版本在 causal S=4 下硬件出错，已报告后端。
+  - 对 fmha_v3 的比值：
+
+    | 形状 | 非 causal | causal |
+    |---|--:|--:|
+    | 8192² B2H32 | 0.95 | 0.90 |
+    | 2048² B4H16 | 0.91 | 0.84 |
+    | 1024² B8H16 | 0.88 | — |
+    | 4096² B1H8 | 0.94（`_ks` S2） | 0.94（`_ks` S4） |
+    | 512² B16H32 | 0.84 | — |
+
+  - 分发规则见 [`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `bf16_prefill_kernel`：
+    - 极小的 causal 网格（配对后不足 64 个 CTA）仍用 v1 causal。例如 B2H8 1000×1300：v1 123 TF/s，v3 最好 94 TF/s，厂商 115 TF/s。
+    - hd64 / hd256、滑窗和 varlen 仍走 v1。
 - **paged decode `pa_decode16_bf16_hd128_p<P>`**，见 [`fmha/decode16.rs`](../crates/amdgpu-kernels/src/fmha/decode16.rs)。
   - 用于 G ≤ 16：每个 wave 改用 16x16x32 MFMA，消除 32 行形式下 3/4 的空算。
   - 速度从 0.51× 提到 0.62×。
