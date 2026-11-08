@@ -1065,3 +1065,44 @@ pub fn probe_anylane() -> Function {
     }
     b.finish()
 }
+
+/// `probe_reload_p1(in, out)`: a loop-carried Frag4 variable reloaded IN PLACE from global memory each iteration (`set_var(v, cat_frag4(load
+/// b64, load b64))`, AGPR-resident): iteration i stores the variable (row i of `in`) and reloads row i + 1. out row i = in row i (i < 4).
+pub fn probe_reload_p1() -> Function {
+    use amdgpu_dsl::MemTy;
+    let mut b = FnBuilder::new("probe_reload_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(5 * 1024));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(4 * 1024));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(16)));
+    let r_in = b.buffer_desc(inp, 5 * 1024);
+    let lo0 = b.buffer_load_n(r_in, Some(Opnd::Val(off16)), 0, 0, MemTy::B64);
+    let hi0 = b.buffer_load_n(r_in, Some(Opnd::Val(off16)), 0, 8, MemTy::B64);
+    let f0 = b.cat_frag4(lo0, hi0);
+    let vars = b.begin_loop(&[(DType::Frag4, Opnd::Val(f0)), (DType::I32, Opnd::I32(0))]);
+    let (v, i) = (vars[0], vars[1]);
+    b.pin_agpr(v);
+    // store the current row i
+    let row = b.let_(Op::MulI32(Opnd::Var(i), Opnd::I32(1024)));
+    let oo = b.add_i32(off16, row);
+    let r_out = b.buffer_desc(out, 4 * 1024);
+    let cur = b.let_(Op::FragCat { parts: vec![Opnd::Var(v)], dwords: 4 });
+    b.buffer_store_n(r_out, Some(Opnd::Val(oo)), 0, 0, cur, MemTy::B128, false);
+    // reload row i + 1 in place
+    let nrow = b.add_i32(row, 1024);
+    let no = b.add_i32(off16, nrow);
+    let lo = b.buffer_load_n(r_in, Some(Opnd::Val(no)), 0, 0, MemTy::B64);
+    let hi = b.buffer_load_n(r_in, Some(Opnd::Val(no)), 0, 8, MemTy::B64);
+    let f = b.cat_frag4(lo, hi);
+    b.set_var(v, f);
+    let i2 = b.add_i32(Opnd::Var(i), 1);
+    b.set_var(i, i2);
+    let done = b.cmp(CmpPred::Ge, CmpTy::I32, i2, 4);
+    b.break_if(done);
+    b.end_loop();
+    b.finish()
+}
