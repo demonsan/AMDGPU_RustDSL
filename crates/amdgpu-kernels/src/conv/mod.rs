@@ -228,6 +228,7 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
     let chunk = b.let_(Op::WorkgroupIdZ);
     let feat = b.bind_i32((ev(tile) * 256 + ev(tid)) << 3);               // first feature of this lane
     let feat_ok = b.let_(Op::CmpLtI32(Opnd::Val(feat), Opnd::Val(dim_v)));
+    let fok = feat_ok_i(b, feat_ok);
     // the sequence: start, length, state slot, has-initial (uniform)
     let one_scalar = |b: &mut FnBuilder, p: ValueId, n_bytes: ValueId, off: ValueId, ty: MemTy| -> ValueId {
         let r = b.buffer_desc_dyn(p, n_bytes);
@@ -297,12 +298,12 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
         let o = b.bind_i32(ev(tok) * ev(dim_v) * 2 + (ev(feat) << 1));
         b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(o), b: Opnd::Val(oob) })
     };
-    let lane_on = b.cmp(CmpPred::Ne, CmpTy::I32, feat_ok_i(b, feat_ok), 0);
+    let lane_on = b.cmp(CmpPred::Ne, CmpTy::I32, fok, 0);
     let mut prev: Vec<[ValueId; 8]> = Vec::new();   // prev[i][f], oldest first
     for i in 0..sl {
         let p = b.bind_i32(ev(tok0) - (sl - i) as i32);
         let not_first = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(first), a: Opnd::I32(0), b: Opnd::I32(1) });
-        let on = b.bind_i32(ev(not_first) & ev(feat_ok_i(b, feat_ok)));
+        let on = b.bind_i32(ev(not_first) & ev(fok));
         let on_c = b.cmp(CmpPred::Ne, CmpTy::I32, on, 0);
         let o = xoff(b, p, on_c);
         let fr = b.buffer_load_c(r_x, Some(Opnd::Val(o)), 0i32, 0, MemTy::B128, CachePolicy::NT);
@@ -320,7 +321,8 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
         let tl = b.bind_i32(ev(c0) + t as i32);
         let valid = b.cmp(CmpPred::Lt, CmpTy::I32, tl, seqlen);
         let tk = b.bind_i32(ev(seq_start) + ev(tl));
-        let on = b.bind_i32(select_i32_of(b, valid) & ev(feat_ok_i(b, feat_ok)));
+        let sel_t1 = sel_i(b, valid);
+        let on = b.bind_i32(ev(sel_t1) & ev(fok));
         let on_c = b.cmp(CmpPred::Ne, CmpTy::I32, on, 0);
         let o = xoff(b, tk, on_c);
         let fr = b.buffer_load_c(r_x, Some(Opnd::Val(o)), 0i32, 0, MemTy::B128, CachePolicy::NT);
@@ -352,8 +354,10 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
         let packed = pack8(b, &y);
         let tl = b.bind_i32(ev(c0) + t as i32);
         let tk = b.bind_i32(ev(seq_start) + ev(tl));
-        let on = b.bind_i32(select_i32_of(b, valid) & ev(feat_ok_i(b, feat_ok)));
-        let on = b.bind_i32(ev(on) & select_i32_of(b, seq_ok));
+        let sel_t2 = sel_i(b, valid);
+        let on = b.bind_i32(ev(sel_t2) & ev(fok));
+        let sq_t = sel_i(b, seq_ok);
+        let on = b.bind_i32(ev(on) & ev(sq_t));
         let on_c = b.cmp(CmpPred::Ne, CmpTy::I32, on, 0);
         if split {
             // the feature range picks the output tensor (a group of 8 features never straddles a range: k_dim % 8 == 0)
@@ -371,10 +375,12 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
             let oq = b.bind_i32(ev(tk) * ev(pitch_q) * 2 + (ev(feat) << 1));
             let ok_ = b.bind_i32(ev(tk) * ev(pitch_q) * 2 + (ev(f_in_k) << 1));
             let ov = b.bind_i32(ev(tk) * ev(pitch_v) * 2 + (ev(f_in_v) << 1));
-            let sel_q = b.bind_i32(select_i32_of(b, in_q) & ev(on));
+            let sel_t3 = sel_i(b, in_q);
+            let sel_q = b.bind_i32(ev(sel_t3) & ev(on));
             let kq = b.cmp(CmpPred::Ne, CmpTy::I32, sel_q, 0);
             let notq = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_q), a: Opnd::I32(0), b: Opnd::I32(1) });
-            let ink = b.bind_i32(select_i32_of(b, in_k) & ev(notq) & ev(on));
+            let sel_t4 = sel_i(b, in_k);
+            let ink = b.bind_i32(ev(sel_t4) & ev(notq) & ev(on));
             let kk = b.cmp(CmpPred::Ne, CmpTy::I32, ink, 0);
             let notk = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_k), a: Opnd::I32(0), b: Opnd::I32(1) });
             let inv = b.bind_i32(ev(notk) & ev(on));
@@ -412,7 +418,8 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
                 let pos = b.bind_i32(ev(seqlen) - (sl - j) as i32);              // relative to the sequence start; < 0: from the initial state
                 let have = b.cmp(CmpPred::Ge, CmpTy::I32, pos, 0);
                 let tk = b.bind_i32(ev(seq_start) + ev(pos));
-                let on = b.bind_i32(select_i32_of(b, have) & ev(feat_ok_i(b, feat_ok)));
+                let sel_t5 = sel_i(b, have);
+                let on = b.bind_i32(ev(sel_t5) & ev(fok));
                 let on_c = b.cmp(CmpPred::Ne, CmpTy::I32, on, 0);
                 let o = xoff(b, tk, on_c);
                 let fr = b.buffer_load_c(r_x, Some(Opnd::Val(o)), 0i32, 0, MemTy::B128, CachePolicy::NT);
@@ -436,7 +443,8 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
                 }
             }
             let words: Vec<ValueId> = (0..vals.len() / 2).map(|k| b.cvt_pk_bf16_f32(vals[2 * k], vals[2 * k + 1])).collect();
-            let wr = b.bind_i32(select_i32_of(b, seq_ok) & ev(feat_ok_i(b, feat_ok)));
+            let sel_t6 = sel_i(b, seq_ok);
+            let wr = b.bind_i32(ev(sel_t6) & ev(fok));
             let wr_c = b.cmp(CmpPred::Ne, CmpTy::I32, wr, 0);
             let base = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wr_c), a: Opnd::Val(st_base), b: Opnd::Val(oob) });
             for c in 0..words.len() / 4 {
@@ -453,9 +461,8 @@ pub fn conv1d_fwd(name: &str, w: i64, split: bool, silu: bool) -> Function {
 fn feat_ok_i(b: &mut FnBuilder, c: ValueId) -> ValueId {
     b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::I32(1), b: Opnd::I32(0) })
 }
-fn select_i32_of(b: &mut FnBuilder, c: ValueId) -> amdgpu_dsl::I32 {
-    let v = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::I32(1), b: Opnd::I32(0) });
-    ev(v)
+fn sel_i(b: &mut FnBuilder, c: ValueId) -> ValueId {
+    b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::I32(1), b: Opnd::I32(0) })
 }
 
 fn pack8(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
