@@ -2310,6 +2310,65 @@ impl Lowerer {
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
+            Op::ReadLane { x, lane } => {
+                let r = self.as_v1(*x)?;
+                self.touch(&[Src::Reg(r)]);
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::VReadLane).def(d).srcreg(r).imm(*lane as i64));
+                self.val.insert(dst, d);
+            }
+            Op::WriteLane { x, lane, old } => {
+                let s = match x {
+                    Opnd::Val(v) if self.val.get(v).map_or(false, |r| self.mir.vreg_class(*r) == RClass::S1) => self.val[v],
+                    Opnd::I32(_) | Opnd::F32(_) => {
+                        let s = self.new_vreg(RClass::S1);
+                        let k = self.const_bits(*x).unwrap_or(0);
+                        self.push(MInst::new(MOp::SMovB32).def(s).src(Src::Imm(k)));
+                        s
+                    }
+                    _ => {
+                        let r = self.as_v1(*x)?;
+                        self.touch(&[Src::Reg(r)]);
+                        let s = self.new_vreg(RClass::S1);
+                        self.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(r));
+                        s
+                    }
+                };
+                let o = self.as_v1(*old)?;
+                self.touch(&[Src::Reg(s), Src::Reg(o)]);
+                let d = self.new_vreg(RClass::V1);
+                self.copy_reg(d, o)?;
+                self.push(MInst::new(MOp::VWriteLane).def(d).srcreg(s).srcreg(d).imm(*lane as i64));
+                self.val.insert(dst, d);
+            }
+            Op::Ballot { cond, hi } => {
+                let c = self.as_v1(*cond)?;
+                let z = self.const_vreg(0);
+                self.touch(&[Src::Reg(c)]);
+                let m = self.new_vreg(RClass::S2);
+                self.push(MInst::new(MOp::VCmpMaskNeU32).def(m).srcreg(c).srcreg(z));
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(if *hi { MOp::SMaskHi } else { MOp::SMaskLo }).def(d).srcreg(m));
+                self.val.insert(dst, d);
+            }
+            Op::Bpermute { addr, x, offset } | Op::Permute { addr, x, offset } => {
+                let ra = self.as_v1(*addr)?;
+                let rx = self.as_v1(*x)?;
+                self.touch(&[Src::Reg(ra), Src::Reg(rx)]);
+                let d = self.new_vreg(RClass::V1);
+                let mop = if matches!(op, Op::Bpermute { .. }) { MOp::LdsBpermute } else { MOp::LdsPermute };
+                self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rx).imm(*offset as i64));
+                self.pending_lds.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::Swizzle { x, pattern } => {
+                let rx = self.as_v1(*x)?;
+                self.touch(&[Src::Reg(rx)]);
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::LdsSwizzle).def(d).srcreg(rx).imm(*pattern as i64));
+                self.pending_lds.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
             Op::Dpp { dpp, x, old } => {
                 let r = self.as_v1(*x)?;
                 let o = self.as_v1(*old)?;
@@ -4094,6 +4153,8 @@ fn un_mop(o: amdgpu_dsl::UnOp) -> MOp {
         U::CvtF32Ubyte1 => MOp::VCvtF32Ubyte1,
         U::CvtF32Ubyte2 => MOp::VCvtF32Ubyte2,
         U::CvtF32Ubyte3 => MOp::VCvtF32Ubyte3,
+        U::Ffbl => MOp::VFfblB32,
+        U::Ffbh => MOp::VFfbhU32,
     }
 }
 
@@ -4114,6 +4175,9 @@ fn bin_mop(o: amdgpu_dsl::BinOp) -> MOp {
         B::PkMulF16 => MOp::VPkMulF16,
         B::PkMaxF16 => MOp::VPkMaxF16,
         B::PkMinF16 => MOp::VPkMinF16,
+        B::MbcntLo => MOp::VMbcntLo,
+        B::MbcntHi => MOp::VMbcntHi,
+        B::BcntAdd => MOp::VBcntU32,
     }
 }
 

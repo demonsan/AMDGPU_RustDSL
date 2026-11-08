@@ -127,12 +127,12 @@ impl From<f32> for Opnd {
 
 /// Unary VALU ops (P1, docs/op-coverage-tileops.md). `SinF32` / `CosF32` take the angle in REVOLUTIONS (sin(2 pi x)), as the hardware does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum UnOp { FloorF32, CeilF32, TruncF32, RndneF32, FractF32, RsqF32, SqrtF32, SinF32, CosF32, CvtI32F32, CvtU32F32, CvtF32I32, CvtF32U32, CvtF32Ubyte0, CvtF32Ubyte1, CvtF32Ubyte2, CvtF32Ubyte3 }
+pub enum UnOp { FloorF32, CeilF32, TruncF32, RndneF32, FractF32, RsqF32, SqrtF32, SinF32, CosF32, CvtI32F32, CvtU32F32, CvtF32I32, CvtF32U32, CvtF32Ubyte0, CvtF32Ubyte1, CvtF32Ubyte2, CvtF32Ubyte3, Ffbl, Ffbh }
 
 /// Binary VALU ops. `AshrI32(a, b)` = a >> b (arithmetic); `MulHi*` = high 32 bits of the 64-bit product; `MulU32U24` = low 24 bits x low 24 bits;
 /// `Pk*F16` operate on two f16 halves of a dword (a `U32` container).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BinOp { MinF32, MaxI32, MaxU32, MinU32, SubU32, MulU32U24, AshrI32, MulHiU32, MulHiI32, OrB32, PkAddF16, PkMulF16, PkMaxF16, PkMinF16 }
+pub enum BinOp { MinF32, MaxI32, MaxU32, MinU32, SubU32, MulU32U24, AshrI32, MulHiU32, MulHiI32, OrB32, PkAddF16, PkMulF16, PkMaxF16, PkMinF16, MbcntLo, MbcntHi, BcntAdd }
 
 /// Ternary VALU ops. `MadU32U24(a, b, c)` = a[23:0] * b[23:0] + c; `LshlAddU32(a, s, c)` = (a << s) + c; `Add3U32` = a + b + c;
 /// `BfeU32 / BfeI32(x, off, width)` = bit-field extract; `BfiB32(mask, a, b)` = (mask & a) | (!mask & b); `PkFmaF16` on f16 pairs.
@@ -406,12 +406,13 @@ impl D16Ty {
 
 impl UnOp {
     pub fn float_in(self) -> bool {
-        !matches!(self, UnOp::CvtF32I32 | UnOp::CvtF32U32 | UnOp::CvtF32Ubyte0 | UnOp::CvtF32Ubyte1 | UnOp::CvtF32Ubyte2 | UnOp::CvtF32Ubyte3)
+        !matches!(self, UnOp::CvtF32I32 | UnOp::CvtF32U32 | UnOp::CvtF32Ubyte0 | UnOp::CvtF32Ubyte1 | UnOp::CvtF32Ubyte2 | UnOp::CvtF32Ubyte3 | UnOp::Ffbl | UnOp::Ffbh)
     }
     pub fn result_ty(self) -> DType {
         match self {
             UnOp::CvtI32F32 => DType::I32,
             UnOp::CvtU32F32 => DType::U32,
+            UnOp::Ffbl | UnOp::Ffbh => DType::I32,
             _ => DType::F32,
         }
     }
@@ -626,6 +627,18 @@ pub enum Op {
     AtomicLds { op: AtomicOp, addr: Opnd, value: Opnd },
     /// global atomic returning the old value (`global_atomic_<op> ... sc0`)
     AtomicGlobal { op: AtomicOp, base: Opnd, byte_off: u32, value: Opnd },
+    /// `v_readlane_b32`: lane `lane`'s value of `x` (wave-uniform result)
+    ReadLane { x: Opnd, lane: u8 },
+    /// `v_writelane_b32`: `old` with lane `lane` replaced by the (uniform) `x` (a non-uniform `x` is read from the first active lane)
+    WriteLane { x: Opnd, lane: u8, old: Opnd },
+    /// the 32-bit half (`hi`) of the wave mask of lanes where `cond` (I1) holds (`v_cmp_ne_u32_e64` into an SGPR pair); wave-uniform
+    Ballot { cond: Opnd, hi: bool },
+    /// `ds_bpermute_b32`: lane k gets `x` of lane (addr[k] + offset) / 4 % 64 (a pull; no LDS memory is touched)
+    Bpermute { addr: Opnd, x: Opnd, offset: u16 },
+    /// `ds_permute_b32`: lane k sends its `x` to lane (addr[k] + offset) / 4 % 64 (a push; lanes nobody writes get 0)
+    Permute { addr: Opnd, x: Opnd, offset: u16 },
+    /// `ds_swizzle_b32 offset:pattern` (bit 15: quad-perm mode, else bit-mask mode and_mask / or_mask / xor_mask within 32 lanes)
+    Swizzle { x: Opnd, pattern: u16 },
     /// `v_mov_b32_dpp`: lane i gets `x` of the lane `dpp.ctrl` names (lanes not written keep `old`)
     Dpp { dpp: Dpp, x: Opnd, old: Opnd },
     /// `v_<op>_dpp`: dpp(a) op b, lanes not written keep `old`
@@ -652,6 +665,7 @@ impl Op {
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
+            Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => DType::I32,
             Op::AtomicLds { op, .. } | Op::AtomicGlobal { op, .. } => op.value_ty(),
             Op::DppAlu { op, .. } => match op {
                 DppAluOp::AddF32 | DppAluOp::SubF32 | DppAluOp::MulF32 | DppAluOp::MaxF32 | DppAluOp::MinF32 => DType::F32,
@@ -747,6 +761,10 @@ impl Op {
             Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } | Op::LoadLdsD16 { addr, .. } => vec![*addr],
             Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
             Op::Dpp { x, old, .. } => vec![*x, *old],
+            Op::ReadLane { x, .. } | Op::Swizzle { x, .. } => vec![*x],
+            Op::WriteLane { x, old, .. } => vec![*x, *old],
+            Op::Ballot { cond, .. } => vec![*cond],
+            Op::Bpermute { addr, x, .. } | Op::Permute { addr, x, .. } => vec![*addr, *x],
             Op::AtomicLds { addr, value, .. } => vec![*addr, *value],
             Op::AtomicGlobal { base, value, .. } => vec![*base, *value],
             Op::DppAlu { a, b, old, .. } => vec![*a, *b, *old],
@@ -2041,6 +2059,36 @@ impl FnBuilder {
             self.push_stmt(Stmt::AtomicGlobalNoRet { op, base, byte_off, value });
             None
         }
+    }
+    /// `v_readlane_b32`: lane `lane`'s `x` (uniform).
+    pub fn read_lane(&mut self, x: impl Into<Opnd>, lane: u8) -> ValueId {
+        self.let_(Op::ReadLane { x: x.into(), lane })
+    }
+    /// `v_writelane_b32`: `old` with lane `lane` set to `x`.
+    pub fn write_lane(&mut self, x: impl Into<Opnd>, lane: u8, old: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::WriteLane { x: x.into(), lane, old: old.into() })
+    }
+    /// (low, high) halves of the wave mask of lanes where `cond` holds.
+    pub fn ballot(&mut self, cond: impl Into<Opnd>) -> (ValueId, ValueId) {
+        let c = cond.into();
+        (self.let_(Op::Ballot { cond: c, hi: false }), self.let_(Op::Ballot { cond: c, hi: true }))
+    }
+    /// The lane's index among the lanes set in (`lo`, `hi`) below it (`v_mbcnt_lo` + `v_mbcnt_hi`); with -1 / -1: the lane id.
+    pub fn mbcnt(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
+        let l = self.let_(Op::Bin(BinOp::MbcntLo, lo.into(), Opnd::I32(0)));
+        self.let_(Op::Bin(BinOp::MbcntHi, hi.into(), Opnd::Val(l)))
+    }
+    /// `ds_bpermute_b32`: lane k gets `x` of lane addr[k] / 4.
+    pub fn bpermute(&mut self, addr: impl Into<Opnd>, x: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Bpermute { addr: addr.into(), x: x.into(), offset: 0 })
+    }
+    /// `ds_permute_b32`: lane k sends `x` to lane addr[k] / 4.
+    pub fn permute(&mut self, addr: impl Into<Opnd>, x: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Permute { addr: addr.into(), x: x.into(), offset: 0 })
+    }
+    /// `ds_swizzle_b32` with the raw 16-bit pattern.
+    pub fn swizzle(&mut self, x: impl Into<Opnd>, pattern: u16) -> ValueId {
+        self.let_(Op::Swizzle { x: x.into(), pattern })
     }
     /// `v_mov_b32_dpp` with a full DPP control; lanes not written keep `old`.
     pub fn dpp(&mut self, dpp: Dpp, x: impl Into<Opnd>, old: impl Into<Opnd>) -> ValueId {
