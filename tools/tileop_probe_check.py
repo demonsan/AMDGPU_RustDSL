@@ -930,6 +930,30 @@ def check_reload_p1(planes, out):
     print(("ok   " if ok else "FAIL ") + "in-place global reload of a loop variable: rows 0..3")
     return ok
 
+# ---------------------------------------------------------------- probe_lds_high (LDS-DMA destinations around / past 128 KiB)
+LDS_HIGH_M0 = [0x1c000, 0x1f000, 0x20000, 0x24000, 0x27000]
+
+def gen_lds_high():
+    rnd = random.Random(91)
+    return [[rnd.getrandbits(32) for _ in range(5 * 256)]]
+
+def check_lds_high(planes, out):
+    src = planes[0]
+    ok = True
+    for k, m0 in enumerate(LDS_HIGH_M0):
+        dma = all(out[k * 320 + 5 * l + i] == src[256 * k + 4 * l + i] for l in range(64) for i in range(4))
+        if m0 >= 0x20000:
+            marker = [out[k * 320 + 5 * l + 4] for l in range(64)]
+            kept = all(marker[l] == (0xC0DE0000 | k << 8 | l) for l in range(64))
+            wrapped = all(marker[l] == src[256 * k + 4 * l] for l in range(64))
+        else:
+            kept, wrapped = True, False
+        good = dma and kept
+        ok &= good
+        print(("ok   " if good else "FAIL ") + f"M0 = {m0:#x} ({m0 // 1024} KiB): DMA data read back {'exact' if dma else 'WRONG'}" +
+              ("" if m0 < 0x20000 else f"; marker at M0 - 128 KiB {'intact' if kept else ('OVERWRITTEN by the DMA (M0 wraps at 2^17)' if wrapped else 'changed')}"))
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -947,6 +971,7 @@ PROBES = {
     "probe_ptr64_p1": (gen_ptr64_p1, check_ptr64_p1, 9 * LANES * 4),
     "probe_anylane": (lambda: [[0] * LANES], check_anylane, 9 * LANES * 4),
     "probe_reload_p1": (gen_reload_p1, check_reload_p1, 4 * 1024),
+    "probe_lds_high": (gen_lds_high, check_lds_high, 5 * 64 * 20),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
