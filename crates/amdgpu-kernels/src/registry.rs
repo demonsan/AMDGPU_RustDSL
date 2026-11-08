@@ -47,7 +47,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // (batch 2 cont.)
         n if n.starts_with("topk_softmax_bf16_e") || n.starts_with("topk_softmax_renorm_bf16_e") => crate::topk::by_name(n),
         n if n.starts_with("rope_neox_bf16_h") || n.starts_with("rope_gptj_bf16_h") => crate::rope::by_name(n),
-        n if n.starts_with("reshape_cache_flash_bf16_h") => crate::cache::by_name(n),
+        n if n.starts_with("reshape_cache_flash_bf16_h") || n.starts_with("reshape_cache_blocked_bf16_h") => crate::cache::by_name(n),
         // batch 2 (docs/op-coverage-memtemplates.md): row kernels, streaming elementwise
         n if n.starts_with("quant_token_bf16_fp8_n") || n.starts_with("quant_token_bf16_int8_n") || n.starts_with("quant_group128_bf16_fp8_n") || n.starts_with("silu_mul_quant_fp8_d") => crate::rows::quant::by_name(n),
         n if n.starts_with("rmsnorm_bf16_n") || n.starts_with("add_rmsnorm_bf16_n") || n.starts_with("layernorm_bf16_n") || n.starts_with("softmax_bf16_n") => crate::rows::by_name(n),
