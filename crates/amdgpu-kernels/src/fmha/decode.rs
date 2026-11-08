@@ -242,7 +242,7 @@ pub fn attn_combine_bf16_hd128(name: &str) -> Function {
 /// `attn_combine_bf16_hd128` for head dim `dd` (dd threads, <= 1024).
 #[allow(non_snake_case)]
 pub fn attn_combine_bf16(name: &str, dd: i32) -> Function {
-    let (dv, row) = (dd, 2 * dd);
+    let (dv, rowb) = (dd, 2 * dd);
     let mut b = FnBuilder::new(name, dd as u32);
     b.compile_profile(CompileProfile::Gemm);
     for (n, i) in [("ptr_o", 0u32), ("ptr_po", 1), ("ptr_plse", 2)] {
@@ -256,7 +256,7 @@ pub fn attn_combine_bf16(name: &str, dd: i32) -> Function {
     b.ka_range(64, 1, 256);
     b.grid_is(0, hh.clone());
     b.grid_is(1, Ext::sym("B"));
-    b.arg_tensor("ptr_o", Ext::sym("B") * hh.clone() * Ext::c(row as i64));
+    b.arg_tensor("ptr_o", Ext::sym("B") * hh.clone() * Ext::c(rowb as i64));
     b.arg_tensor("ptr_po", Ext::sym("B") * hh.clone() * ns.clone() * Ext::c(4 * dv as i64));
     b.arg_tensor("ptr_plse", Ext::sym("B") * hh * ns * Ext::c(4));
     let (p_o, p_po, p_l) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 16 }), b.let_(Op::KernargPtr { offset: 32 }));
@@ -268,7 +268,7 @@ pub fn attn_combine_bf16(name: &str, dd: i32) -> Function {
     let row = { let v = b.bind_i32(ev(bat) * ev(hq) + ev(h)); b.read_first_lane(v) };
     let r_l = { let n = b.bind_i32((ev(row) + 1) * ev(nsv) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_l, n) };
     let r_po = { let n = b.bind_i32((ev(row) + 1) * ev(nsv) * (4 * dv)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
-    let r_o = { let n = b.bind_i32((ev(row) + 1) * row); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_o, n) };
+    let r_o = { let n = b.bind_i32((ev(row) + 1) * rowb); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_o, n) };
     let l_so = { let v = b.bind_i32(ev(row) * ev(nsv) << 2); b.read_first_lane(v) };
     let c0 = b.c_i32(0);
     let neg_inf = b.c_f32(f32::NEG_INFINITY);
