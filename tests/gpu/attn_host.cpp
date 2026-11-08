@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
         }
         if (want_lse && kmax >= kmin) {
             double lr = m + std::log(l), lg = group ? hl[(size_t)h * TQ + cuq[b] + q] : hl[((size_t)b * H + h) * SQ + q];
-            if (std::fabs(lg - lr) > 1e-2 + 1e-3 * std::fabs(lr)) badl++;
+            if (std::fabs(lg - lr) > 1e-2 + 1e-3 * std::fabs(lr)) { if (badl < envi("SHOW_BAD", 0)) printf("  badlse b=%d h=%d q=%d got %g ref %g\n", b, h, q, lg, lr); badl++; }
         }
     }
     hipEvent_t e0, e1;

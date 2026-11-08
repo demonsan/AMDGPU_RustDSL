@@ -656,9 +656,10 @@ pub fn attn_combine_bf16_hd128_q(name: &str) -> Function {
     let r_o = b.buffer_desc_dyn(p_o, nob);
     let o_vo = b.bind_i32(((ev(bat) * ev(s_q) + ev(q)) * ev(hq) + ev(h)) * ROW + (ev(tid) << 1));
     b.buffer_store_n(r_o, Some(Opnd::Val(o_vo)), c0, 0, yb, amdgpu_dsl::MemTy::U16, false);
-    let lc = b.bind_cond((ev(lse_on).ne(0).select_i32(1, 0) & ev(tid).eq(0).select_i32(1, 0)).eq(1));
-    let lc_any = b.any_lane(lc);
-    b.begin_if(Opnd::Val(lc_any));
+    // a uniform branch on lse_on; the store from thread 0 only (per-lane select of the offset)
+    let lc = b.bind_cond(ev(tid).eq(0));
+    let on = b.bind_cond(ev(lse_on).ne(0));
+    b.begin_if(Opnd::Val(on));
     {
         let lg2 = b.log2_f32(den);
         let ln2 = b.c_f32(std::f32::consts::LN_2);
