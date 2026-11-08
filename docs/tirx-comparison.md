@@ -12,7 +12,7 @@
 > [IKET](https://tvm.apache.org/tirx/programming_guides/iket_profiling.html)、
 > [Rust 扩展](https://tvm.apache.org/tirx/advanced/extending_ir_in_rust.html)。
 > 本仓库状态：Main v8.1（`f92dd8d9`，见 [current-status.md](current-status.md)）。一个 kernel 今天如何构建与优化、FMHA 上的具体例子见
-> `fmha-case-study.md`；早先的 IR 梳理见 [ir-review-tirx-sftensor.md](ir-review-tirx-sftensor.md)。
+> [fmha-case-study.md](fmha-case-study.md)；早先的 IR 梳理见 [ir-review-tirx-sftensor.md](ir-review-tirx-sftensor.md)。
 
 ## 1. 一句话
 
