@@ -297,7 +297,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.lds_write = true;
             (ResClass::LdsWrite, vec![], false)
         }
-        Stmt::AtomicGlobalNoRet { .. } => {
+        Stmt::AtomicGlobalNoRet { .. } | Stmt::BufferAtomicNoRet { .. } => {
             e.global_read = true;
             e.global_write = true;
             (ResClass::VmemStore, vec![], false)

@@ -3,6 +3,7 @@
 use crate::frag::{AccTile, C32x32F32};
 use crate::shared::PrivRef;
 use amdgpu_dsl::{ev};
+use crate::tileop::{ewise_elems, pack_bf16, VarTile};
 use crate::{Lane};
 use amdgpu_dsl::{DType, FnBuilder, Op, Opnd, ValueId, I32};
 
@@ -12,15 +13,11 @@ pub fn store_bf16(b: &mut FnBuilder, o: &AccTile<C32x32F32, 4>, fin: ValueId, ro
     b.begin_if(Opnd::Val(live));
     for e in 0..4usize {
         for q in 0..4usize {
-            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
-            for k in 0..4usize {
-                let l = b.frag16_lane(Opnd::Var(o.accs[e].var), (4 * q + k) as u8);
-                let lv = b.bitcast_f32(l);
-                v4.push(b.mul_f32(lv, fin));
-            }
-            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
-            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
-            let f2 = b.frag2(w0, w1);
+            // tileop: O[e] elements 4q .. 4q+4, scaled by fin, packed to bf16
+            let acc = VarTile::f32(o.accs[e].var, 16);
+            let v4 = ewise_elems(b, &acc, (4 * q as u8)..(4 * q as u8 + 4), |b, x| b.mul_f32(x, fin));
+            let w = pack_bf16(b, &v4);
+            let f2 = b.frag2(w[0], w[1]);
             b.store_f32x2(row_ptr, (64 * e + 16 * q) as u32, f2);
         }
     }
@@ -59,13 +56,12 @@ pub fn kvsplit_partial_f16(b: &mut FnBuilder, o: &AccTile<C32x32F32, 4>, fin: Va
         for ec in 0..2usize {
             let e = 2 * pr + ec;
             for q in 0..4usize {
-                let mut hv: Vec<ValueId> = Vec::with_capacity(4);
-                for k in 0..4usize {
-                    let l = b.frag16_lane(Opnd::Var(o.accs[e].var), (4 * q + k) as u8);
-                    let lv = b.bitcast_f32(l);
-                    let v0 = b.mul_f32(lv, fin);
-                    hv.push(b.let_(Op::CvtF32ToF16(Opnd::Val(v0))));
-                }
+                // tileop: O[e] elements 4q .. 4q+4, scaled by fin, to f16
+                let acc = VarTile::f32(o.accs[e].var, 16);
+                let hv = ewise_elems(b, &acc, (4 * q as u8)..(4 * q as u8 + 4), |b, x| {
+                    let v0 = b.mul_f32(x, fin);
+                    b.let_(Op::CvtF32ToF16(Opnd::Val(v0)))
+                });
                 let s0 = b.shl_i32(hv[1], c16);
                 let s1 = b.shl_i32(hv[3], c16);
                 let w0 = b.let_(Op::AddI32(Opnd::Val(hv[0]), Opnd::Val(s0)));

@@ -896,15 +896,11 @@ pub fn store_out3(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, o: &AccTile<C
     for e in 0..4usize {
         let mut vals = Vec::with_capacity(4);
         for q in 0..4usize {
-            let mut v4: Vec<ValueId> = Vec::with_capacity(4);
-            for k in 0..4usize {
-                let lv = b.frag16_lane(Opnd::Var(o.accs[e].var), (4 * q + k) as u8);
-                let f = b.bitcast_f32(lv);
-                v4.push(b.mul_f32(f, fin));
-            }
-            let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
-            let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
-            vals.push(b.frag2(w0, w1));
+            // tileop: O[e] elements 4q .. 4q+4 scaled by fin, packed to bf16
+            let acc = amdgpu_tile::tileop::VarTile::f32(o.accs[e].var, 16);
+            let v4 = amdgpu_tile::tileop::ewise_elems(b, &acc, (4 * q as u8)..(4 * q as u8 + 4), |b, x| b.mul_f32(x, fin));
+            let w = amdgpu_tile::tileop::pack_bf16(b, &v4);
+            vals.push(b.frag2(w[0], w[1]));
         }
         part.store(b, &ptrs, e, &vals);
     }
@@ -944,14 +940,11 @@ pub fn store_out3_lds(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, epi: &Sha
         for ec in 0..2usize {
             let e = 2 * pr + ec;
             for q in 0..4usize {
-                let mut v4: Vec<ValueId> = Vec::with_capacity(4);
-                for k in 0..4usize {
-                    let lv = b.frag16_lane(Opnd::Var(o.accs[e].var), (4 * q + k) as u8);
-                    let f = b.bitcast_f32(lv);
-                    v4.push(b.mul_f32(f, fin));
-                }
-                let w0 = b.cvt_pk_bf16_f32(v4[0], v4[1]);
-                let w1 = b.cvt_pk_bf16_f32(v4[2], v4[3]);
+                // tileop: O[e] elements 4q .. 4q+4 scaled by fin, packed to bf16
+                let acc = amdgpu_tile::tileop::VarTile::f32(o.accs[e].var, 16);
+                let v4 = amdgpu_tile::tileop::ewise_elems(b, &acc, (4 * q as u8)..(4 * q as u8 + 4), |b, x| b.mul_f32(x, fin));
+                let w = amdgpu_tile::tileop::pack_bf16(b, &v4);
+                let (w0, w1) = (w[0], w[1]);
                 let n = 2 * (4 * ec + q);
                 wp.write(b, n, 0, &[w0]);
                 wp.write(b, n + 1, 0, &[w1]);
@@ -1010,13 +1003,12 @@ pub fn store_partial3(io: &FmhaIo, b: &mut FnBuilder, blk: &FmhaBlock, epi: &Sha
         for ec in 0..2usize {
             let e = 2 * pr + ec;
             for q in 0..4usize {
-                let mut hv: Vec<ValueId> = Vec::with_capacity(4);
-                for k in 0..4usize {
-                    let lv = b.frag16_lane(Opnd::Var(o.accs[e].var), (4 * q + k) as u8);
-                    let f = b.bitcast_f32(lv);
-                    let v0 = b.mul_f32(f, fin);
-                    hv.push(b.let_(amdgpu_dsl::Op::CvtF32ToF16(Opnd::Val(v0))));
-                }
+                // tileop: O[e] elements 4q .. 4q+4 scaled by fin, to f16
+                let acc = amdgpu_tile::tileop::VarTile::f32(o.accs[e].var, 16);
+                let hv = amdgpu_tile::tileop::ewise_elems(b, &acc, (4 * q as u8)..(4 * q as u8 + 4), |b, x| {
+                    let v0 = b.mul_f32(x, fin);
+                    b.let_(amdgpu_dsl::Op::CvtF32ToF16(Opnd::Val(v0)))
+                });
                 let s0 = b.shl_i32(hv[1], c16);
                 let s1 = b.shl_i32(hv[3], c16);
                 let w0 = b.let_(amdgpu_dsl::Op::AddI32(Opnd::Val(hv[0]), Opnd::Val(s0)));

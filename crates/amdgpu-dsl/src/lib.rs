@@ -378,7 +378,7 @@ pub enum DppAluOp { AddF32, SubF32, MulF32, MaxF32, MinF32, AddU32, MaxI32, MinI
 
 /// Atomic read-modify-write operations (B3). `IncU32`: old >= value ? 0 : old + 1 (a wrapping counter).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AtomicOp { AddU32, MaxU32, MinU32, MaxI32, MinI32, IncU32, AddF32 }
+pub enum AtomicOp { AddU32, MaxU32, MinU32, MaxI32, MinI32, IncU32, AddF32, PkAddBf16, PkAddF16 }
 
 impl AtomicOp {
     pub fn value_ty(self) -> DType {
@@ -1125,6 +1125,8 @@ pub enum Stmt {
     StoreLdsN { addr: Opnd, value: Opnd, ty: MemTy, hi: bool },
     /// LDS atomic without return
     AtomicLdsNoRet { op: AtomicOp, addr: Opnd, value: Opnd },
+    /// MUBUF atomic without return (`buffer_atomic_<op>`; AddU32, AddF32, PkAddBf16, PkAddF16): range-checked against the descriptor like a store
+    BufferAtomicNoRet { op: AtomicOp, rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd },
     /// global atomic without return
     AtomicGlobalNoRet { op: AtomicOp, base: Opnd, byte_off: u32, value: Opnd },
     /// `ds_write2[st64]_b32 / _b64`: `v0` at `addr + off0 * s`, `v1` at `addr + off1 * s`
@@ -2155,6 +2157,11 @@ impl FnBuilder {
     pub fn swizzle(&mut self, x: impl Into<Opnd>, pattern: u16) -> ValueId {
         self.let_(Op::Swizzle { x: x.into(), pattern })
     }
+    /// MUBUF atomic without return (`AddU32`, `AddF32`, `PkAddBf16`, `PkAddF16`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn buffer_atomic(&mut self, op: AtomicOp, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
+        self.push_stmt(Stmt::BufferAtomicNoRet { op, rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into() });
+    }
     /// `v_mov_b32_dpp` with a full DPP control; lanes not written keep `old`.
     pub fn dpp(&mut self, dpp: Dpp, x: impl Into<Opnd>, old: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Dpp { dpp, x: x.into(), old: old.into() })
@@ -2902,7 +2909,19 @@ fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
             }
             data(&mut e, *value, *ty, *hi);
         }
-        Stmt::AtomicLdsNoRet { addr, value, .. } => {
+        Stmt::BufferAtomicNoRet { op, rsrc, voff, soff, imm, value } => {
+            if !matches!(op, AtomicOp::AddU32 | AtomicOp::AddF32 | AtomicOp::PkAddBf16 | AtomicOp::PkAddF16) {
+                e.push(format!("buffer atomic {op:?}: only AddU32 / AddF32 / PkAddBf16 / PkAddF16"));
+            }
+            e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1));
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
+        Stmt::AtomicLdsNoRet { addr, value, op } => {
+            if matches!(op, AtomicOp::PkAddBf16 | AtomicOp::PkAddF16) {
+                e.push(format!("lds atomic {op:?}: packed 16-bit atomics are global / buffer only"));
+            }
             if let Err(x) = expect_int(f, *addr, "lds atomic address") {
                 e.push(x);
             }
@@ -2975,7 +2994,10 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
         }
         Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
         Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
-        Op::AtomicLds { addr, value, .. } => {
+        Op::AtomicLds { addr, value, op } => {
+            if matches!(op, AtomicOp::PkAddBf16 | AtomicOp::PkAddF16) {
+                e.push(format!("lds atomic {op:?}: packed 16-bit atomics are global / buffer only"));
+            }
             if let Err(x) = expect_int(f, *addr, "lds atomic address") {
                 e.push(x);
             }
@@ -3605,7 +3627,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                 }
                 errs.extend(check_mfma(f, *kind, *a, *b, None, scale.as_ref()).into_iter().map(here));
             }
-            Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::AtomicLdsNoRet { .. } | Stmt::AtomicGlobalNoRet { .. } => {
+            Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::AtomicLdsNoRet { .. } | Stmt::AtomicGlobalNoRet { .. } | Stmt::BufferAtomicNoRet { .. } => {
                 for o in stmt_operands(st) {
                     if let Opnd::Val(v) = o {
                         if !visible(&scopes, v) {
@@ -4028,6 +4050,13 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
         Stmt::StoreLds2 { addr, v0, v1, .. } => vec![*addr, *v0, *v1],
         Stmt::AtomicLdsNoRet { addr, value, .. } => vec![*addr, *value],
         Stmt::AtomicGlobalNoRet { base, value, .. } => vec![*base, *value],
+        Stmt::BufferAtomicNoRet { rsrc, voff, soff, value, .. } => {
+            let mut v = vec![*rsrc];
+            v.extend(voff.iter().copied());
+            v.push(*soff);
+            v.push(*value);
+            v
+        }
         Stmt::VarMfma { a, b, scale, .. } => {
             let mut v = vec![*a, *b];
             if let Some(s) = scale {
