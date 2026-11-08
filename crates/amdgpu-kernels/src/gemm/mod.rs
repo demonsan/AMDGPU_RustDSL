@@ -353,6 +353,7 @@ fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scale
         b.arg(n, DType::I32, o, 4);
     }
     let (mt, nt, kt, ee) = (Ext::sym("MT"), Ext::sym("NT"), Ext::sym("KT"), Ext::sym("E"));
+    let nt_c = nt.clone();
     b.sym_range("MT", 1, 4096);
     b.sym_range("NT", 1, 256);
     b.sym_range("KT", 1, PANEL_KB);
@@ -390,6 +391,9 @@ fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scale
     if scales == Scales::RowCol {
         b.arg_tensor("ptr_sfa", Ext::c(4) * m);
         b.arg_tensor("ptr_sfb", Ext::c(4) * ee * n);
+    } else if scales == Scales::Block128 {
+        b.arg_tensor("ptr_sfa", Ext::c(4) * m * kt.clone());
+        b.arg_tensor("ptr_sfb", Ext::c(4 * cta_n / 128) * ee * nt_c * kt);
     }
 }
 
@@ -709,6 +713,9 @@ impl Body {
     fn sb_sel(&self, j: usize) -> usize {
         if self.mx32.is_some() {
             j
+        } else if self.bs128.as_ref().is_some_and(|bs| bs.voff_b.len() == 2) {
+            // MoE stage 1 blockscale: gate / up blocks alternate
+            j % 2
         } else {
             0
         }
@@ -984,7 +991,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         n if n.starts_with("moe_sum_bf16_k") => n["moe_sum_bf16_k".len()..].parse::<i64>().ok().filter(|k| (1..=16).contains(k)).map(|k| reduce::moe_sum_bf16(n, k)),
         n if n.starts_with("gemm_moe") => {
             // gemm_moe<1|2>_<bf16|fp8>[_silu|_gelu][_dw]
-            let (elem, scales) = if n.contains("_fp8") { (Elem::Fp8, Scales::RowCol) } else { (Elem::Bf16, Scales::None) };
+            let (elem, scales) = if n.contains("_fp8bs") { (Elem::Fp8Bs, Scales::Block128) } else if n.contains("_fp8") { (Elem::Fp8, Scales::RowCol) } else { (Elem::Bf16, Scales::None) };
             let st = if n.starts_with("gemm_moe1") { MoeStage::Up { gelu: n.contains("_gelu"), doweight: n.ends_with("_dw") } } else { MoeStage::Down };
             Some(gemm_mxfp8_bs(n, GemmConfig::moe(elem, scales, st)))
         }
@@ -1236,7 +1243,10 @@ impl skeleton_v4::V4Slots for GemmSlots {
         Scales::None => (rsrc_a, rsrc_b),
         Scales::Block128 => (
             { let n = b.bind_i32(ev(m_v) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
-            { let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
+            {
+                let ne = if cfg.moe.is_some() { b.let_(Op::KernargI32 { offset: 132 }) } else { b.c_i32(1) };
+                let n = b.bind_i32(ev(ne) * (ev(n_v) >> 7) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            },
         ),
         // [rows][K / 32] bytes = rows * K bytes / 64 for fp4 (K bytes = K / 2)
         Scales::Mx32 => (
@@ -1312,6 +1322,35 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let bs128 = (cfg.scales == Scales::Block128).then(|| {
         let r16 = b.bind_i32(lane.lane() & 15);
         let rowb = b.bind_i32(ev(kb_v) << 2);
+        if let Some(mc) = &moe_cx {
+            // MoE: A scale rows of the gathered rows ([A rows][KT] floats); B scales [E, n / 128, KT] of the tile's expert. Stage 1: the
+            // wave's 128 interleaved rows = 64 gate rows of gate block gb and the matching 64 up rows of block n_out / 128 + gb (two words,
+            // n block j uses word j % 2)
+            let so = { let v = b.bind_i32(ev(mc.row0) << 2); b.read_first_lane(v) };
+            let voff_a = (0..wave_m / 16)
+                .map(|i| {
+                    let vo = b.bind_i32((ev(wm) * (wave_m as i32) + (16 * i) as i32 + ev(r16)) << 2);
+                    let sid = b.buffer_load_f32(mc.rsrc_sid, vo, so, 0);
+                    let sid = b.bitcast_i32(sid);
+                    let tok = b.bind_i32(ev(sid) & 0xff_ffff);
+                    let row = match mc.st {
+                        MoeStage::Up { .. } => b.bind_i32(ev(tok).min(ev(mc.mtok) - 1)),
+                        MoeStage::Down => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
+                    };
+                    b.bind_i32(ev(row) * ev(rowb))
+                })
+                .collect();
+            b.wait_vm(0);
+            let nbe = b.bind_i32(ev(mc.e) * ev(n_v).lshr(7));
+            let voff_b = if matches!(mc.st, MoeStage::Up { .. }) {
+                let gb = b.bind_i32(((ev(bx) << 1) + ev(wn)).lshr(1));
+                vec![b.bind_i32((ev(nbe) + ev(gb)) * ev(rowb)), b.bind_i32((ev(nbe) + ev(mc.nout).lshr(7) + ev(gb)) * ev(rowb))]
+            } else {
+                let nb = b.bind_i32(((ev(bx) << lg_n) + ev(wn) * (wave_n as i32)).lshr(7));
+                vec![b.bind_i32((ev(nbe) + ev(nb)) * ev(rowb))]
+            };
+            return Mx32 { voff_a, voff_b, shift: r16 };
+        }
         let a0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * (wave_m as i32) + ev(r16));
         let voff_a = (0..wave_m / 16).map(|i| b.bind_i32((ev(a0) + (16 * i) as i32) * ev(rowb))).collect();
         let nb = b.bind_i32(((ev(bx) << lg_n) + ev(wn) * (wave_n as i32)).lshr(7));
