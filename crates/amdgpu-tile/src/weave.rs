@@ -248,11 +248,13 @@ pub struct Weaver {
     units: Units,
     order: Option<Vec<UnitId>>,
     label: String,
+    /// the kernel gave the order (`order` / `spread`): never overridden by the experiment switches (`weave_auto`)
+    explicit: bool,
 }
 
 impl Weaver {
     pub fn new(units: Units) -> Weaver {
-        Weaver { units, order: None, label: String::new() }
+        Weaver { units, order: None, label: String::new(), explicit: false }
     }
     /// A label for reports / errors (the phase name).
     pub fn phase(mut self, label: impl Into<String>) -> Weaver {
@@ -262,7 +264,7 @@ impl Weaver {
     /// Statement granularity: every unit split into its node groups (`Units::split`); an explicit order is dropped (re-order the
     /// sub-units with `order` / a strategy afterwards).
     pub fn fine(self) -> Weaver {
-        Weaver { units: self.units.split(), order: None, label: self.label }
+        Weaver { units: self.units.split(), order: None, label: self.label, explicit: false }
     }
     /// The units of the weave (strategies read their facts).
     pub fn units(&self) -> &Units {
@@ -275,6 +277,7 @@ impl Weaver {
     }
     /// The explicit order (authoritative): every unit exactly once.
     pub fn order(mut self, ids: Vec<UnitId>) -> Weaver {
+        self.explicit = true;
         self.order = Some(ids);
         self
     }
@@ -298,19 +301,31 @@ impl Weaver {
             }
         }
         ord.extend(fi);
+        self.explicit = true;
         self.order = Some(ord);
         self
     }
     /// The order that `emit` would use (after the checks).
     pub fn plan(&self) -> Vec<UnitId> {
-        let ord = self.order.clone().unwrap_or_else(|| (0..self.units.len()).collect());
+        let mut ord = self.order.clone().unwrap_or_else(|| (0..self.units.len()).collect());
+        // experiment switch (A/B without editing the kernel): `AMDC_WEAVE_AUTO=<label>` replaces a declaration-order weave by the cost-based order
+        if !self.explicit && !self.label.is_empty() && crate::weave_auto::env_enabled(&self.label) {
+            ord = crate::weave_auto::auto_order(&self.units, &crate::weave_auto::Model::gfx950());
+        }
         check_order(&self.units, &ord, &self.label);
         ord
     }
     /// Checks the order (a permutation of the units and a topological order of their dependencies) and emits.
     /// A labelled weave is wrapped in a weave region of that name (no code): the backend's register caps / reports and the scheduler's per-region
     /// strategies key on it (docs/weaver-regs.md). Units with internal control flow (class `Branch`) stay inside the region.
-    pub fn emit(self, b: &mut FnBuilder) {
+    pub fn emit(mut self, b: &mut FnBuilder) {
+        // statement-granularity experiment switch: split into statement groups (derived dependences), then the cost-based order
+        if !self.explicit && !self.label.is_empty() && crate::weave_auto::env_stmt_enabled(&self.label) {
+            self = self.fine();
+            let o = crate::weave_auto::auto_order(&self.units, &crate::weave_auto::Model::gfx950());
+            self.order = Some(o);
+            self.explicit = true;
+        }
         let ord = self.plan();
         let label = self.label.clone();
         let mut slots: Vec<Option<Unit>> = self.units.v.into_iter().map(Some).collect();
