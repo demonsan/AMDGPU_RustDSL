@@ -605,6 +605,10 @@ fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scale
     } else if scales == Scales::Block128 {
         b.arg_tensor("ptr_sfa", Ext::c(4) * m * kt.clone());
         b.arg_tensor("ptr_sfb", Ext::c(4 * cta_n / 128) * ee * nt_c * kt);
+    } else if scales == Scales::Mx32 {
+        // MXFP4 MoE: 1 x 32 E8M0 [rows][8 KT] bytes (A rows, every expert's n rows; not shuffled: gathered rows)
+        b.arg_tensor("ptr_sfa", Ext::c(8) * m * kt.clone());
+        b.arg_tensor("ptr_sfb", Ext::c(8) * ee * n * kt);
     }
 }
 
@@ -1357,7 +1361,16 @@ pub fn by_name(name: &str) -> Option<Function> {
         }
         n if n.starts_with("gemm_moe") => {
             // gemm_moe<1|2>_<bf16|fp8>[_silu|_gelu][_dw]
-            let (elem, scales) = if n.contains("_fp8bs") { (Elem::Fp8Bs, Scales::Block128) } else if n.contains("_fp8") { (Elem::Fp8, Scales::RowCol) } else { (Elem::Bf16, Scales::None) };
+            let (elem, scales) = if n.contains("_fp8bs") {
+                (Elem::Fp8Bs, Scales::Block128)
+            } else if n.contains("_fp8") {
+                (Elem::Fp8, Scales::RowCol)
+            } else if n.contains("_fp4") {
+                // MXFP4 A x MXFP4 B (1 x 32 E8M0, unshuffled [rows][K / 32])
+                (Elem::Fp4, Scales::Mx32)
+            } else {
+                (Elem::Bf16, Scales::None)
+            };
             // `_bm64` suffix: block_m 64 (64-row tiles, sparse experts)
             let (n0, bm64) = match n.strip_suffix("_bm64") { Some(x) => (x, true), None => (n, false) };
             let st = if n0.starts_with("gemm_moe1") {
@@ -1728,7 +1741,14 @@ impl skeleton_v4::V4Slots for GemmSlots {
         // [rows][K / 32] bytes = rows * K bytes / 64 for fp4 (K bytes = K / 2)
         Scales::Mx32 => (
             { let n = b.bind_i32(ev(m_v) * ev(kb_v) << 3); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
-            { let n = b.bind_i32(ev(n_v) * ev(kb_v) << 3); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
+            if let Some(mc) = &moe_cx {
+                // MoE: the tile's expert's [n][8 KT] scale bytes (base moved per expert)
+                let n = b.bind_i32(ev(n_v) * ev(kb_v) << 3); let n = b.read_first_lane(n);
+                let pe = b.ptr_mad(ptr_sfb, mc.e, n);
+                b.buffer_desc_dyn(pe, n)
+            } else {
+                let n = b.bind_i32(ev(n_v) * ev(kb_v) << 3); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            },
         ),
     };
     // split-K: this split's first tile zb = z KS (A advances 128 bytes per tile, the preshuffled B 16 x 128)
@@ -1839,6 +1859,29 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let mx32 = (cfg.scales == Scales::Mx32).then(|| {
         let r16 = b.bind_i32(lane.lane() & 15);
         let rowb = b.bind_i32(ev(kb_v) << 3);
+        if let Some(mc) = &moe_cx {
+            // MoE: A scale rows = the gathered rows (token, or token topk + slot), B rows of the tile's expert (descriptor base)
+            let so = { let v = b.bind_i32(ev(mc.row0) << 2); b.read_first_lane(v) };
+            let voff_a = (0..wave_m / 16)
+                .map(|i| {
+                    let vo = b.bind_i32((ev(wm) * (wave_m as i32) + (16 * i) as i32 + ev(r16)) << 2);
+                    let sid = b.buffer_load_f32(mc.rsrc_sid, vo, so, 0);
+                    let sid = b.bitcast_i32(sid);
+                    let tok = b.bind_i32(ev(sid) & 0xff_ffff);
+                    let row = match mc.st {
+                        MoeStage::Up { .. } => b.bind_i32(ev(tok).min(ev(mc.mtok) - 1)),
+                        MoeStage::Down | MoeStage::DownH => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
+                    };
+                    b.bind_i32(ev(row) * ev(rowb))
+                })
+                .collect();
+            b.wait_vm(0);
+            let b0 = b.bind_i32((ev(bx) << lg_n) + ev(wn) * (wave_n as i32) + ev(r16));
+            let voff_b = (0..wave_n / 16).map(|j| b.bind_i32((ev(b0) + (16 * j) as i32) * ev(rowb))).collect();
+            let gg = b.bind_i32(lane.lane().lshr(4));
+            let shift = b.bind_i32(ev(gg) + ((ev(gg) + 4) << 8) + 0x0C0C_0000);
+            return Mx32 { voff_a, voff_b, shift, shuf: None };
+        }
         let a0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * (wave_m as i32) + ev(r16));
         let b0 = b.bind_i32((ev(bx) << lg_n) + ev(wn) * (wave_n as i32) + ev(r16));
         let (voff_a, voff_b) = if cfg.scale_shuf {
