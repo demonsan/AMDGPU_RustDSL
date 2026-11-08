@@ -36,7 +36,8 @@ struct Body<'a> {
     kind: MmaKind,
     qf: &'a [ValueId],
     kr: &'a [ValueId],
-    vr: ValueId,
+    /// V^T read offsets per (e, r): index 2 e + r
+    vr: Vec<ValueId>,
     csc: ValueId,
     neg_inf: ValueId,
     zero16: ValueId,
@@ -95,8 +96,8 @@ impl Body<'_> {
     /// issued before the 4 MFMAs of step t
     fn pv(&self, b: &mut FnBuilder, slot: &SlotIdx) {
         let vb = self.vbase(b, slot);
-        let (kind, vr) = (self.kind, self.vr);
-        let base = b.bind_i32(ev(vr) + vb);
+        let kind = self.kind;
+        let bases: Vec<ValueId> = self.vr.iter().map(|v| b.bind_i32(ev(*v) + vb.clone())).collect();
         let p = self.p.clone();
         let o = self.o.clone();
         self.ring.vs.at(slot).read(b, |b| {
@@ -106,7 +107,7 @@ impl Body<'_> {
                     .map(|e| {
                         let mut words: Vec<ValueId> = Vec::with_capacity(4);
                         for r in 0..2i32 {
-                            let a = b.bind_i32(ev(base) + (32 * sb as i32 + 16 * tt as i32 + 8 * r) * ROW + 64 * e);
+                            let a = b.bind_i32(ev(bases[(2 * e + r) as usize]) + (32 * sb as i32 + 16 * tt as i32) * ROW);
                             let x = b.load_lds_tr_b16(a);
                             let w0 = b.frag2_lane(x, 0);
                             let w1 = b.frag2_lane(x, 1);
@@ -346,11 +347,21 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     let v_so0 = { let v = b.bind_i32(ev(bat) * ev(v_bs) + ev(hkv) * ev(v_hs)); b.read_first_lane(v) };
     let keys: Vec<ValueId> = (0..8).map(|i| b.bind_i32(((ev(wig) + 4 * i) << 2) + lane.lane().lshr(4))).collect();
     let k_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(k_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
-    let v_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(v_seqs) + (ev(l16) << 4))).collect();
+    // V swizzled like K (the transposed reads of 4 rows x 4 columns per 16-lane group then hit distinct banks)
+    let v_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(v_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
     let ring = Ring { ks, vs, k_vo, v_vo, r_k, r_v, k_so0, v_so0, seqs: k_seqs, wig };
     // read offsets (as bf16.rs)
     let kr: Vec<ValueId> = (0..8).map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & 15)) << 4))).collect();
-    let vr = b.bind_i32((ev(half) * 4 + (lane.lane() & 15).lshr(2)) * ROW + ((((lane.lane() & 31).lshr(4) << 4) + ((lane.lane() & 3) << 2)) << 1));
+    // V^T tr_b16 reads, swizzled: per (dim block e, read r) the lane's row 8 r + 4 h + s / 4 (s = lane % 16; the step rows are multiples of 16:
+    // the same key % 16), 16-byte chunk (4 e + 2 ((l % 32) / 16) + (s % 4) / 2) ^ (row % 16), byte 8 (s % 2)
+    let vr: Vec<ValueId> = (0..4)
+        .flat_map(|e| (0..2).map(move |r| (e, r)))
+        .map(|(e, r)| {
+            let krow = b.bind_i32(8 * r + ev(half) * 4 + (lane.lane() & 15).lshr(2));
+            let ch = b.bind_i32(4 * e + ((lane.lane() & 31).lshr(4) << 1) + (lane.lane() & 3).lshr(1));
+            b.bind_i32(ev(krow) * ROW + (((ev(ch) ^ ev(krow)) & 15) << 4) + ((lane.lane() & 1) << 3))
+        })
+        .collect();
 
     // ---- key range: causal keys k <= q + SK - SQ ----
     let qoff = b.bind_i32(ev(s_kv) - ev(s_q));
@@ -379,7 +390,7 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     b.begin_if(Opnd::Val(any));
     roles.each(&mut b, |b, role| {
         let mut body = Body {
-            ring: &ring, kind, qf: &qf, kr: &kr, vr, csc, neg_inf, zero16, half, row, lim, lim_min,
+            ring: &ring, kind, qf: &qf, kr: &kr, vr: vr.clone(), csc, neg_inf, zero16, half, row, lim, lim_min,
             s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: std::env::var("EXP_NOPRIO").is_err(),
         };
         pipe.run(b, role, &mut body);
