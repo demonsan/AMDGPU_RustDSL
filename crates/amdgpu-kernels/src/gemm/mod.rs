@@ -768,8 +768,8 @@ impl Body {
         }
         if let (Some(mx), Some(sh)) = (&self.mx32, self.mx32.as_ref().and_then(|m| m.shuf.as_ref())) {
             // shuffled: the tile pair kb / 2 (256 bytes per block), the tile's half selected by a shift at the install
-            let so = { let v = b.bind_i32(kb.clone().lshr(1) << 8); b.read_first_lane(v) };
-            let s = b.bind_i32((kb & 1) << 4);
+            let so = { let v = b.bind_i32(ev(kb).lshr(1) << 8); b.read_first_lane(v) };
+            let s = b.bind_i32((ev(kb) & 1) << 4);
             *sh.borrow_mut() = Some(s);
             let ld = |b: &mut FnBuilder, rs: ValueId, vo: &[ValueId]| -> Vec<ValueId> { vo.iter().map(|v| b.buffer_load_f32(rs, *v, so, 0)).collect() };
             return (ld(b, self.rsrc_sfa, &mx.voff_a), ld(b, self.rsrc_sfb, &mx.voff_b));
@@ -1610,13 +1610,13 @@ impl skeleton_v4::V4Slots for GemmSlots {
                 let nb = b.bind_i32(((ev(bx) << lg_n) + ev(wn) * (wave_n as i32)).lshr(7));
                 vec![b.bind_i32((ev(nbe) + ev(nb)) * ev(rowb))]
             };
-            return Mx32 { voff_a, voff_b, shift: r16 };
+            return Mx32 { voff_a, voff_b, shift: r16 , shuf: None };
         }
         let a0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * (wave_m as i32) + ev(r16));
         let voff_a = (0..wave_m / 16).map(|i| b.bind_i32((ev(a0) + (16 * i) as i32) * ev(rowb))).collect();
         let nb = b.bind_i32(((ev(bx) << lg_n) + ev(wn) * (wave_n as i32)).lshr(7));
         let voff_b = vec![b.bind_i32(ev(nb) * ev(rowb))];
-        Mx32 { voff_a, voff_b, shift: r16 }
+        Mx32 { voff_a, voff_b, shift: r16 , shuf: None }
     });
     let mx32 = (cfg.scales == Scales::Mx32).then(|| {
         let r16 = b.bind_i32(lane.lane() & 15);
