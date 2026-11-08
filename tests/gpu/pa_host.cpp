@@ -62,7 +62,8 @@ int main(int argc, char** argv) {
     // ours: the kernel names are pa_decode_bf16_hd128_p<P> / attn_combine_bf16_hd128
     hipModule_t mod;
     HC(hipModuleLoad(&mod, argv[2]));
-    std::string kname = ours ? "pa_decode_bf16_hd128_p" + std::to_string(P) : argv[3];
+    // KPREFIX: the kernel family of ours (pa_decode_bf16_hd128_p / pa_decode16_bf16_hd128_p)
+    std::string kname = ours ? (getenv("KPREFIX") ? std::string(getenv("KPREFIX")) : std::string("pa_decode_bf16_hd128_p")) + std::to_string(P) : argv[3];
     HC(hipModuleGetFunction(&fn, mod, kname.c_str()));
     void *dq = dev(q), *dbt = dev(bt), *dcl = dev(cl);
     const int NS = 4 * S;

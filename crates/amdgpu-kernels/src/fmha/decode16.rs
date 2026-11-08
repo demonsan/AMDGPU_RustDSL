@@ -265,7 +265,8 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
     b.break_if(done);
     b.end_loop();
     // ---- the split's partial: O / l (fp32, 4 consecutive d per lane and block) and LSE ----
-    let l_tot = group4(&mut b, l_v_val(&mut b, l_v), false);
+    let lv = l_v_val(&mut b, l_v);
+    let l_tot = group4(&mut b, lv, false);
     let lbits = b.bitcast_i32(l_tot);
     let pos = b.bind_cond(ev(lbits).gt(0));
     let inv0 = b.rcp_f32(l_tot);
