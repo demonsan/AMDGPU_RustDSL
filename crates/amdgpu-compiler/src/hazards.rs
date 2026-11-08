@@ -767,7 +767,8 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
                 MOp::SWaitVm => st.retain(|f| !(f.vm && !f.smem && f.after >= inst.imm as u32)),
                 MOp::SWaitLgkm => {
                     let k = inst.imm as u32;
-                    st.retain(|f| !(!f.vm && (if f.smem { k != 0 } else { f.after < k })));
+                    // lgkmcnt(k) retires the LDS entries with >= k younger operations, and every scalar load only at k = 0
+                    st.retain(|f| !(!f.vm && (if f.smem { k == 0 } else { f.after >= k })));
                 }
                 _ => {}
             }
@@ -813,7 +814,7 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
                     out.push(MInst::new(MOp::SWaitLgkm).imm(k as i64));
                 }
                 added += 1;
-                st.retain(|f| !(!f.vm && (if f.smem { k != 0 } else { f.after < k })));
+                st.retain(|f| !(!f.vm && (if f.smem { k == 0 } else { f.after >= k })));
             }
             if is_mem {
                 let vm = my_vm;
@@ -856,7 +857,11 @@ pub fn pad_inflight_waw(m: &mut MFunction, a: &crate::regalloc::Alloc) -> usize 
         }
     }
     let mut total = 0;
+    let dbg = std::env::var("AMDC_WAW_DEBUG").is_ok();
     for bi in 0..n {
+        if dbg {
+            eprintln!("inflight-waw: block {bi} ({}) enters with {} in-flight loads: {:?}", m.blocks[bi].label, entry[bi].len(), entry[bi].iter().take(6).collect::<Vec<_>>());
+        }
         let (_, out, added) = run(m, bi, entry[bi].clone(), true);
         if added > 0 {
             m.blocks[bi].insts = out;
