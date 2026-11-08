@@ -616,7 +616,18 @@
     | 64 / 64 / 8 / 2048 | 32 key，S=1 | 4182 GB/s | 5392 | 0.78× |
     | 4 / 32 / 4 / 8192 | 64 key，S=8 | 1352 GB/s | 1303 | 1.04× |
   - block-table 查表批量化：0.37× → 0.51×。
-- **MoE stage 2**：
+- **MLA decode `mla16_decode_bf16_p<P>`**，见 [`fmha/mla16.rs`](../crates/amdgpu-kernels/src/fmha/mla16.rs)：
+  - 结构：
+    - 每 CTA 负责 16 个 head，作为 16x16x32 MFMA 的 16 列；
+    - 每个 wave 处理自己的 key 段，没有跨 wave 的 S 归约和 barrier；
+    - 32 key 的 tile 放在 wave 私有的 36 KB 区域；
+    - 行基址由每 lane 一次块表读取加 `ds_bpermute` 得到；
+    - 空的 key 段跑一个全掩码 tile。
+  - 对照 aiter `mla_dec_stage1` a16w16（H16、P1、B64、ctx ≤ 4096）：旧版 178 µs，新版 80 µs，厂商 47.7 µs。比值从 0.27× 提到 0.60×。
+  - H128、P16：646 → 360 µs。
+  - 期间发现两个后端 bug：
+    - `ds_bpermute` 之后缺少 lgkm 等待，tileops f841f0a2 已修复；
+    - if / else 中，else 路径读取了只在 then 路径上物化的寄存器，已报告后端。新版通过去掉该分支绕开。- **MoE stage 2**：
   - bf16 原子累加：更慢（1528 vs 672 µs），且精度更差，未采纳。
   - bf16 中间结果（`_h`）：快 26%，误差属 bf16 量级。作为可选项，默认仍用 fp32 中间结果。
 
