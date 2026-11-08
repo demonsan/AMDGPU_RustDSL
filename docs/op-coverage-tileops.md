@@ -1,6 +1,6 @@
 # TIRx 式 tile-op 覆盖矩阵（gfx950）
 
-> `op-coverage-design.md` 的 §6（kernel-opt 主笔的总设计；本节由 backend 负责）。目标：以 aiter kernel zoo（`MI_Kernel_Agent/knowledge/aiter-kernel-zoo`：
+> [`op-coverage-design.md`](op-coverage-design.md) 的 §6（kernel-opt 主笔的总设计；本节由 backend 负责）。目标：以 aiter kernel zoo（`MI_Kernel_Agent/knowledge/aiter-kernel-zoo`：
 > attention、gemm、moe、quantization、normalization、rope、sampling-topk、cache-layout、fusion-activation …）为需求，按 **TIRx 的 tile-op 模型**
 > 列出 gfx950 指令族的覆盖情况、缺口与优先级，并给出 `tile::apply` / `tile::ewise` 在我们栈上的形态与验证方法。基线：Main `f25294dc`。
 
