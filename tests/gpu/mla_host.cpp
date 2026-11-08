@@ -47,10 +47,8 @@ int main(int argc, char** argv) {
     // ours mla_decode_bf16_p<P>: 16 heads per CTA, 4 key parts per CTA (NS = 4 S); the vendor path keeps NS = S
     // MLAHP=1: mla_decode_bf16_hp_p<P> (64 heads per CTA sharing the KV tiles, NS = S)
     const bool hp = envi("MLAHP", 0) != 0;
-    // MLAW8=1: mla_decode_bf16_w8_p<P> (8 waves per CTA, NS = 8 S)
-    const bool w8 = envi("MLAW8", 0) != 0;
     const bool m16 = getenv("VENDOR") == nullptr && !hp;
-    const int NS = w8 ? 8 * S : m16 ? 4 * S : S;
+    const int NS = m16 ? 4 * S : S;
     uint16_t* dout;
     void *dpo, *dpl;
     HC(hipMalloc(&dout, (size_t)B * H * DV * 2));
@@ -61,7 +59,7 @@ int main(int argc, char** argv) {
     hipModule_t m1, m2;
     hipFunction_t fn, cfn;
     HC(hipModuleLoad(&m1, vco ? vco : argv[1]));
-    std::string kn = vco ? "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E" : (hp ? "mla_decode_bf16_hp_p" : w8 ? "mla_decode_bf16_w8_p" : "mla_decode_bf16_p") + std::to_string(P);
+    std::string kn = vco ? "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E" : (hp ? "mla_decode_bf16_hp_p" : "mla_decode_bf16_p") + std::to_string(P);
     HC(hipModuleGetFunction(&fn, m1, kn.c_str()));
     HC(hipModuleLoad(&m2, argv[2]));
     HC(hipModuleGetFunction(&cfn, m2, vco ? "attn_combine_bf16_hd512_sm" : "attn_combine_bf16_hd512"));
@@ -93,7 +91,7 @@ int main(int argc, char** argv) {
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, a.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};
     void* ccfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ca.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &csz, HIP_LAUNCH_PARAM_END};
     auto launch = [&]() {
-        HC(hipModuleLaunchKernel(fn, gx, B, S, w8 ? 512 : 256, 1, 1, 0, nullptr, nullptr, cfg));
+        HC(hipModuleLaunchKernel(fn, gx, B, S, 256, 1, 1, 0, nullptr, nullptr, cfg));
         HC(hipModuleLaunchKernel(cfn, H, B, 1, 512, 1, 1, 0, nullptr, nullptr, ccfg));
     };
     launch();
