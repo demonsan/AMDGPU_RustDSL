@@ -42,3 +42,36 @@
 | `silu_mul_quant_fp8_d<D>` | `silu(x[:, :D])·x[:, D:]` 后 per-token fp8（融合，读 : 写 = 4 : 1） | 100 / 52 | D = 4096：5109；1000：5422 | 85 % / 90 %（读密集的 roofline 约 6.3 TB/s） |
 
 正确性：N ∈ {640, 1000, 4096}，M ∈ {15 … 37}，含离群值（±90），`bad = 0`，`max_rel_scale ≤ 3.5e-7`。限制：N（D）为 8 的倍数（group128 为 128 的倍数），≤ 8192；M 任意；张量 < 4 GiB；短行（N < 512）还没有多行 / wave。
+
+## 类型转换与静态量化（模板 T1）
+
+`eltwise/mod.rs`；主机测试 `tests/gpu/cast_host.cpp`（`cvt_*` 逐位对拍；`quant_static` 半个 e4m3 ulp，含 ±5000 离群值被钳到 ±448）。
+
+| kernel | 语义 | VGPR | 带宽（GB/s） | 占 roofline |
+|---|---|--:|--:|--:|
+| `cvt_f32_bf16` | f32 → bf16（RNE），n 为 4 的倍数；每 lane 两个 4 元素向量（b128 读、b64 写，全合并） | 16 | 5895 | 98 % |
+| `cvt_bf16_f32` | bf16 → f32 | 16 | 5974 | 99 % |
+| `quant_bf16_fp8_static` | `fp8(clamp(x / scale, ±448))`，`scale` 为 kernarg f32，n 为 8 的倍数（`med3` 钳位） | 20 | 5923（读 : 写 = 2 : 1） | 98 % |
+
+`add_bf16` 的 `ka_is` 事实改为 `n = N`（grid = ⌈N / 2048⌉），不再声称 n 是 2048 的倍数。
+
+## RoPE（模板 T7）
+
+`rope/mod.rs`：`x [T][H][D]` bf16，`positions [T]` i32，`cos_sin [P][D]` bf16（前半 cos、后半 sin），非原地 `out`；一个 grid x 一个 token，一个 block = `min(4, ⌈H·L/64⌉)` 个 wave，每个 wave `64/L` 个 head 同时处理，全部加载先于计算发射；位置 ≥ P 读到 0（cos = sin = 0）。主机测试 `tests/gpu/rope_host.cpp`（CPU 双精度参考，用同一份 bf16 表；含一个位置越界的 token）。
+
+| kernel | 语义 | L（lane / head 行） | VGPR | 带宽（GB/s） | 占 roofline |
+|---|---|--:|--:|--:|--:|
+| `rope_neox_bf16_h<H>_d<D>` | rotate-half，每 lane 两个 b128 | D / 16 | 44 | H = 32, D = 128：6118；H = 8, D = 128：6495（T = 262144，部分落在 Infinity Cache）；**H = 1, D = 64：1300** | 100 % / 100 %+ / **22 %** |
+| `rope_gptj_bf16_h<H>_d<D>` | 交错对 (2i, 2i+1)，每 lane 一个 b128 | D / 8 | 32 | H = 32, D = 128：5997 | 100 % |
+
+D ∈ {64, 128, 256}（全旋转维），H ∈ 1…256；正确性：T ∈ {9 … 37}，H ∈ {1, 8, 32, 40}（H = 40 的最后一个 pass 部分 head 越界）。**限制**：H · L < 64 的内核（如 MQA 的 H = 1）一个 wave 里只有一部分 lane 有 head，带宽低（H = 1, D = 64 只有 22 %）→ 需要"一个 wave 处理多个 token"的变体（待做）；部分旋转（rotary_dim < D）还没有。
+
+## KV-cache 写（模板 T7）
+
+`cache/mod.rs`，flash 布局：`k, v [T][Hk][D]` → `key_cache, value_cache [S][Hk][D]`，按 `slot_mapping [T]`（i32，负数 = padding token，什么都不写）；一个 token 用 64 / 128 / 192 / 256 个 lane 拷贝一行（`Hk·D·2` 字节，每 lane 每 16 B 一个 b128，K、V 同一轮加载），一个 block 含 4 / 2 / 1 / 1 个 token。主机测试 `tests/gpu/cache_host.cpp`（逐字节对拍，未被写的槽保持哨兵值）。
+
+| kernel | VGPR | 带宽（GB/s，随机槽位的置换） | 占 roofline |
+|---|--:|--:|--:|
+| `reshape_cache_flash_bf16_h<Hk>_d<D>` | 20 | Hk = 8, D = 128：4909；Hk = 8, D = 64：4716；Hk = 16, D = 128：4860 | 79–82 % |
+
+限制：cache < 4 GiB（32 位 buffer 偏移；需要后端的 64 位地址乘加 B1 才能去掉）。低于 90 % 的原因：随机槽位的 2 KB 行写（相邻 token 的目的地不连续），在途量已按行 / 块给够，剩下的差距在 DRAM 页局部性；量化写（fp8 cache + scale）、NHD 以外的分块布局（vLLM 的 `[num_blocks][Hk][D/x][block_size][x]`）待做。

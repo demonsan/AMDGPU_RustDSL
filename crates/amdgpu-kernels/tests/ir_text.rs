@@ -31,6 +31,12 @@ fn all_kernels() -> Vec<String> {
         "quant_token_bf16_fp8_n4096",
         "quant_group128_bf16_fp8_n640",
         "silu_mul_quant_fp8_d4096",
+        "cvt_f32_bf16",
+        "cvt_bf16_f32",
+        "quant_bf16_fp8_static",
+        "rope_neox_bf16_h32_d128",
+        "rope_gptj_bf16_h8_d256",
+        "reshape_cache_flash_bf16_h8_d128",
     ] {
         v.push(k.to_string());
     }
