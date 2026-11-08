@@ -139,6 +139,11 @@ int main(int argc, char** argv) {
     std::string dt = bs ? "fp8bs" : fp8 ? "fp8" : "bf16";
     auto load = [&](const std::string& name) { hipModule_t m; hipFunction_t f; HC(hipModuleLoad(&m, (dir + "/" + name + ".co").c_str())); HC(hipModuleGetFunction(&f, m, name.c_str())); return f; };
     hipFunction_t f1 = load("gemm_moe1_" + dt + "_" + act), f2 = load("gemm_moe2_" + dt), fs = load("moe_sum_bf16_k" + std::to_string(TK));
+    // fp8: the stage-1 output re-quantized on the GPU between the stages (dynamic per token / per 128-group): rows::quant (co_dir)
+    hipFunction_t fq = nullptr;
+    if (fp8) fq = load((bs ? "quant_group128_bf16_fp8_n" : "quant_token_bf16_fp8_n") + std::to_string(I));
+    std::vector<uint8_t> aq(32, 0);
+    { int rows = M * TK; memcpy(&aq[0], &dY1, 8); memcpy(&aq[8], &dY1q, 8); memcpy(&aq[16], &dy1s, 8); memcpy(&aq[24], &rows, 4); }
     // 96-byte GEMM ABI + MoE extension (144 bytes)
     auto gemm_args = [&](void* A, void* B, void* C, int m, int n, int k, void* sa, void* sb, int nout) {
         std::vector<uint8_t> a(144, 0);
@@ -178,7 +183,8 @@ int main(int argc, char** argv) {
     auto run = [&](bool host_q) {
         launch(f1, a1, I / envi("UP_N", 128), nblk);
         if (envi("S1ONLY", 0)) return;
-        if (fp8 && host_q) { HC(hipDeviceSynchronize()); requant(); }
+        if (fp8 && host_q && envi("HOSTQ", 0)) { HC(hipDeviceSynchronize()); requant(); }
+        else if (fp8) launch(fq, aq, (M * TK + 3) / 4, 1);
         launch(f2, a2, D / 128, nblk);
         launch(fs, as, D / 1024, M);
     };
@@ -340,13 +346,13 @@ int main(int argc, char** argv) {
     HC(hipEventRecord(e0));
     for (int i = 0; i < iters; i++) launch(f1, a1, I / envi("UP_N", 128), nblk);
     HC(hipEventRecord(e1));
-    for (int i = 0; i < iters; i++) { launch(f2, a2, D / 128, nblk); launch(fs, as, D / 1024, M); }
+    for (int i = 0; i < iters; i++) { if (fp8) launch(fq, aq, (M * TK + 3) / 4, 1); launch(f2, a2, D / 128, nblk); launch(fs, as, D / 1024, M); }
     HC(hipEventRecord(e2));
     HC(hipEventSynchronize(e2));
     float t1, t2;
     HC(hipEventElapsedTime(&t1, e0, e1)); HC(hipEventElapsedTime(&t2, e1, e2));
     double fl1 = 2.0 * M * TK * 2.0 * I * D, fl2 = 2.0 * M * TK * (double)I * D;
-    printf("ours %s %s M=%d D=%d I=%d E=%d topk=%d: stage1 %.2f us (%.1f TF/s) stage2+sum %.2f us (%.1f TF/s) bad1=%ld bad2=%ld maxerr1=%.3e maxerr2=%.3e %s\n", dt.c_str(),
+    printf("ours %s %s M=%d D=%d I=%d E=%d topk=%d: stage1 %.2f us (%.1f TF/s) requant+stage2+sum %.2f us (%.1f TF/s) bad1=%ld bad2=%ld maxerr1=%.3e maxerr2=%.3e %s\n", dt.c_str(),
            act.c_str(), M, D, I, E, TK, 1e3 * t1 / iters, fl1 / (1e-3 * t1 / iters) / 1e12, 1e3 * t2 / iters, fl2 / (1e-3 * t2 / iters) / 1e12, bad1, bad2, me1, me2,
            bad1 || bad2 ? "MOE_FAIL" : "MOE_OK");
     // ---- vendor stage 1 (fp8 per-token g1u1, same sorted buffers; block_m must equal its tile_m) ----
