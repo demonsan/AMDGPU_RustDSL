@@ -294,6 +294,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
             }
             RowOp::Softmax => {
                 let neg = b.c_f32(-3.0e38);
+                let recompute_exp = nld >= 8 && std::env::var("AMDC_SOFTMAX_KEEP_EXP").is_err();   // N >= 4096
                 let mut part: Option<ValueId> = None;
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
@@ -316,14 +317,27 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let e = masked(b, &e, i, zero);
                     let s = lane_reduce(b, RedOp::Sum, &e);
                     part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
-                    ex.push(e);
+                    if !recompute_exp {
+                        ex.push(e);
+                    }
                 }
                 let tot = red(b, RedOp::Sum, part2.unwrap(), 64, gen1, &lane);
                 let inv = b.rcp_f32(tot);
                 for i in 0..nld {
                     let mut y = [0; 8];
-                    for k in 0..8 {
-                        y[k] = b.mul_f32(ex[i][k], inv);
+                    if recompute_exp {
+                        // the exponentials are not kept across the second reduction (64+ VGPRs for a long row): recomputed from the packed row
+                        let xi = bf16x8_to_f32(b, packed[i]);
+                        for k in 0..8 {
+                            let t = b.sub_f32(xi[k], mx);
+                            let u = b.mul_f32(t, l2e);
+                            let e = b.exp2_f32(u);
+                            y[k] = b.mul_f32(e, inv);
+                        }
+                    } else {
+                        for k in 0..8 {
+                            y[k] = b.mul_f32(ex[i][k], inv);
+                        }
                     }
                     out.push(y);
                 }
