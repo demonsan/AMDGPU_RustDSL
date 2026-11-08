@@ -155,11 +155,12 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
         let key_t = b.bind_i32(ev(k_lo) + (ev(tile) << 5));
         let kl = b.bind_i32((ev(key_t) + (lane.lane() & 31)).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
         let bvo = b.bind_i32(ev(kl).lshr(page.trailing_zeros() as i32) << 2);
-        (kl, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
+        // 8 bytes (this entry + the next; a Frag2 so that the loop-carried load can land in place)
+        (kl, b.buffer_load_b64(r_bt, bvo, bt_so, 0))
     };
     let t0 = b.c_i32(0);
     let (_, pg0) = bt_load(&mut b, t0);
-    inits.push((DType::F32, Opnd::Val(pg0)));
+    inits.push((DType::Frag2, Opnd::Val(pg0)));
     let vars = b.begin_loop(&inits);
     let pg_v = vars[5 + DB];
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
@@ -170,7 +171,8 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     b.wait_lds(0);
     // the row base of key l % 32 of the tile (its page was loaded during the previous tile), shared by ds_bpermute
     let kl = b.bind_i32((ev(key_t) + (lane.lane() & 31)).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
-    let pg = b.bitcast_i32(Opnd::Var(pg_v));
+    let pg = b.frag2_lane(Opnd::Var(pg_v), 0);
+    let pg = b.bitcast_i32(pg);
     {
         let itn = b.bind_i32((itx.clone() + 1).min(ev(nloop) - 1));
         let (_, pn) = bt_load(&mut b, itn);
