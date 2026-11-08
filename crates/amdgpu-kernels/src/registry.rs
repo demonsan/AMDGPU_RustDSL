@@ -82,6 +82,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "attn_combine_bf16_hd512" => Some(crate::fmha::decode::attn_combine_bf16("attn_combine_bf16_hd512", 512)),
         "attn_combine_bf16_hd512_sm" => Some(crate::fmha::decode::attn_combine_bf16_x("attn_combine_bf16_hd512_sm", 512, true)),
         n if n.starts_with("mla_decode_bf16_p") => n["mla_decode_bf16_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::mla::mla_decode_bf16(n, p)),
+        n if n.starts_with("pa_decode16_bf16_hd128_p") => n["pa_decode16_bf16_hd128_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::decode16::pa_decode16_bf16_hd128(n, p)),
         n if n.starts_with("pa_decode_bf16_hd128_p") => n["pa_decode_bf16_hd128_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::decode::pa_decode_bf16_hd128(n, p)),
         n if n.starts_with("fmha_fwd_hd") && n.contains("_bf16") => {
             // fmha_fwd_hd<64|128|256>_bf16[_causal][_swa][_group]
