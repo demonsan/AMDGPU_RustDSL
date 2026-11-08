@@ -135,6 +135,9 @@ pub enum MOp {
     VCvtF16F32,
     VAndB32,
     VMinI32,
+    // B1 64-bit address arithmetic
+    SMulHiU32,
+    VMadU64U32,
     // B2 cross-lane / wave-mask ops (readlane / writelane: imm = lane; ds_* lane permutes: imm = offset / swizzle pattern)
     VReadLane,
     VWriteLane,

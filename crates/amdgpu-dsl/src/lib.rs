@@ -630,6 +630,9 @@ pub enum Op {
     LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
     LoadLdsTrB16 { addr: Opnd },
+    /// 64-bit address arithmetic: `base + (u64) a * (u64) b` with `a`, `b` read as UNSIGNED 32-bit (> 4 GiB offsets; a wave-uniform result
+    /// stays scalar, so it can be the base of a buffer descriptor)
+    PtrMadU32 { base: Opnd, a: Opnd, b: Opnd },
     /// "Any lane": the wave-level reading of a per-lane condition (true for the whole wave when any lane's `cond` holds) — the explicit marker
     /// for branching on a per-lane condition (`if` / `break_if` are wave-level). No code: the branch itself has this semantics.
     AnyLane(Opnd),
@@ -680,6 +683,7 @@ impl Op {
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
             Op::AnyLane(_) => DType::I1,
+            Op::PtrMadU32 { .. } => DType::Ptr,
             Op::FragSlice { n, .. } => match n {
                 1 => DType::I32,
                 2 => DType::Frag2,
@@ -789,6 +793,7 @@ impl Op {
             Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
             Op::Dpp { x, old, .. } => vec![*x, *old],
             Op::AnyLane(c) => vec![*c],
+            Op::PtrMadU32 { base, a, b } => vec![*base, *a, *b],
             Op::FragSlice { frag, .. } => vec![*frag],
             Op::FragCat { parts, .. } => parts.clone(),
             Op::ReadLane { x, .. } | Op::Swizzle { x, .. } => vec![*x],
@@ -2091,6 +2096,11 @@ impl FnBuilder {
             self.push_stmt(Stmt::AtomicGlobalNoRet { op, base, byte_off, value });
             None
         }
+    }
+    /// `base + (u64) a * (u64) b` (unsigned 32-bit factors, 64-bit product): addresses beyond 4 GiB (`index * stride`). Wave-uniform operands
+    /// give a scalar pointer (usable as a buffer-descriptor base: move the descriptor to the row / block, keep per-lane offsets small).
+    pub fn ptr_mad(&mut self, base: impl Into<Opnd>, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::PtrMadU32 { base: base.into(), a: a.into(), b: b.into() })
     }
     /// Mark a per-lane condition for a wave-level branch: the wave takes the branch when ANY lane's `cond` holds (`if` / `break_if` conditions must
     /// be wave-uniform; this is the explicit way to branch on a per-lane one).

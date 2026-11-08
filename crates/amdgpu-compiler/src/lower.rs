@@ -212,6 +212,9 @@ struct Lowerer {
     read_values: std::collections::HashSet<ValueId>,
     /// how many operand slots of all statements read each value
     read_counts: HashMap<ValueId, usize>,
+    /// wave-uniform values (amdgpu_dsl::uniform_values)
+    dsl_uniform: std::collections::HashSet<ValueId>,
+    dsl_uniform_vars: std::collections::HashSet<amdgpu_dsl::VarId>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
     /// AGPR requests from the IR (resolved to vregs in inish).
@@ -340,6 +343,8 @@ impl Lowerer {
             alias_cache: HashMap::new(),
             view_copy: amdgpu_dsl::facts::stale_view_roots(f),
             read_values: f.stmts().iter().flat_map(amdgpu_dsl::facts::stmt_value_uses).collect(),
+            dsl_uniform: amdgpu_dsl::uniform_values(f).0,
+            dsl_uniform_vars: amdgpu_dsl::uniform_values(f).1,
             read_counts: {
                 let mut c: HashMap<ValueId, usize> = HashMap::new();
                 for s in f.stmts() {
@@ -2291,7 +2296,11 @@ impl Lowerer {
                         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
                         return Ok((on, vec![Src::Reg(ra), Src::Reg(rb)]));
                     }
-                    Op::NotI1(inner) => return self.lower_condition(inner, !negate),
+                    // folding the negation into the branch polarity is only valid for a WAVE-UNIFORM condition: for a per-lane one (an `any_lane`
+                    // branch) "some lane has !c" is not "no lane has c" - materialise !c and branch on it instead
+                    Op::NotI1(inner) if self.opnd_uniform(inner) => return self.lower_condition(inner, !negate),
+                    // any_lane(c): the wave-level branch on c itself (negated: "no lane has c" = !any_lane(c), exact)
+                    Op::AnyLane(inner) => return self.lower_condition(inner, negate),
                     _ => {}
                 }
             }
@@ -2301,6 +2310,14 @@ impl Lowerer {
         self.push(MInst::new(MOp::VCmpNeI32).srcreg(r).srcreg(zero));
         let on = if negate { Pred::Vccz } else { Pred::Vccnz };
         Ok((on, vec![Src::Reg(r), Src::Reg(zero)]))
+    }
+
+    fn opnd_uniform(&self, o: Opnd) -> bool {
+        match o {
+            Opnd::I32(_) | Opnd::F32(_) => true,
+            Opnd::Val(v) => self.dsl_uniform.contains(&v),
+            Opnd::Var(v) => self.dsl_uniform_vars.contains(&v),
+        }
     }
 
     fn lower_op(&mut self, dst: ValueId, op: &Op) -> Result<(), String> {
@@ -2431,6 +2448,73 @@ impl Lowerer {
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
+            Op::PtrMadU32 { base, a, b } => {
+                // scalar path: a scalar base and scalar (or constant) factors -> s_mul_i32 / s_mul_hi_u32 / s_add_u32 / s_addc_u32
+                let sb = match base {
+                    Opnd::Val(v) => self.val.get(v).copied().filter(|r| self.mir.vreg_class(*r) == RClass::S2),
+                    _ => None,
+                };
+                // a wave-uniform factor that lowering keeps in a VGPR (e.g. a min of uniform values) is read back with v_readfirstlane
+                let mut sop = |me: &mut Self, o: Opnd| -> Option<Src> {
+                    if let Ok(s) = me.s_operand(o) {
+                        return Some(s);
+                    }
+                    match o {
+                        Opnd::Val(v) if sb.is_some() && me.dsl_uniform.contains(&v) => {
+                            let r = me.as_v1(o).ok()?;
+                            me.touch(&[Src::Reg(r)]);
+                            let s = me.new_vreg(RClass::S1);
+                            me.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(r));
+                            Some(Src::Reg(s))
+                        }
+                        _ => None,
+                    }
+                };
+                let (sa, sbb) = (sop(self, *a), sop(self, *b));
+                if let (Some(br), Some(sa), Some(sbb)) = (sb, sa, sbb) {
+                    let s1 = |me: &mut Self, s: Src| -> VReg {
+                        match s {
+                            Src::Reg(r) => r,
+                            Src::Imm(k) => {
+                                let r = me.new_vreg(RClass::S1);
+                                me.push(MInst::new(MOp::SMovB32).def(r).src(Src::Imm(k)));
+                                r
+                            }
+                        }
+                    };
+                    let (ra, rb) = (s1(self, sa), s1(self, sbb));
+                    self.touch(&[Src::Reg(br), Src::Reg(ra), Src::Reg(rb)]);
+                    let lo = self.new_vreg(RClass::S1);
+                    let hi = self.new_vreg(RClass::S1);
+                    self.push(MInst::new(MOp::SMulI32).def(lo).srcreg(ra).srcreg(rb));
+                    self.push(MInst::new(MOp::SMulHiU32).def(hi).srcreg(ra).srcreg(rb));
+                    let blo = self.new_vreg(RClass::S1);
+                    let bhi = self.new_vreg(RClass::S1);
+                    self.push(MInst::new(MOp::SMaskLo).def(blo).srcreg(br));
+                    self.push(MInst::new(MOp::SMaskHi).def(bhi).srcreg(br));
+                    let d = self.new_vreg(RClass::S2);
+                    let dlo = self.alias_vreg(d, 0, RClass::S1);
+                    let dhi = self.alias_vreg(d, 1, RClass::S1);
+                    self.push(MInst::new(MOp::SAddU32).def(dlo).srcreg(blo).srcreg(lo));
+                    self.push(MInst::new(MOp::SAddcU32).def(dhi).srcreg(bhi).srcreg(hi));
+                    self.val.insert(dst, d);
+                } else {
+                    // vector path: v_mad_u64_u32 d, vcc, a, b, base
+                    let rbase = self.as_v2(*base)?;
+                    let opa = match self.const_bits(*a) {
+                        Some(k) if (-16..=64).contains(&k) => Src::Imm(k),
+                        _ => Src::Reg(self.as_v1(*a)?),
+                    };
+                    let opb = match self.const_bits(*b) {
+                        Some(k) if (-16..=64).contains(&k) && !matches!(opa, Src::Imm(_)) => Src::Imm(k),
+                        _ => Src::Reg(self.as_v1(*b)?),
+                    };
+                    self.touch(&[opa, opb, Src::Reg(rbase)]);
+                    let d = self.new_vreg(RClass::V2);
+                    self.push(MInst::new(MOp::VMadU64U32).def(d).src(opa).src(opb).srcreg(rbase));
+                    self.val.insert(dst, d);
+                }
+            }
             Op::AnyLane(c) => {
                 let r = self.as_v1(*c)?;
                 self.val.insert(dst, r);
@@ -2449,10 +2533,14 @@ impl Lowerer {
                     }
                     _ => return Err("frag_slice of a constant".into()),
                 };
-                let cls = match n {
-                    1 => RClass::V1,
-                    2 => RClass::V2,
-                    4 => RClass::V4,
+                // a scalar tuple (a uniform pointer) slices into SGPRs
+                let scalar = !self.mir.vreg_class(f).is_vector();
+                let cls = match (n, scalar) {
+                    (1, true) => RClass::S1,
+                    (2, true) => RClass::S2,
+                    (1, false) => RClass::V1,
+                    (2, false) => RClass::V2,
+                    (4, _) => RClass::V4,
                     _ => RClass::V8,
                 };
                 let d = self.sub_alias(f, *start, cls);
@@ -4763,7 +4851,6 @@ fn subst_stmt(s: &Stmt, map: &HashMap<ValueId, Opnd>) -> Stmt {
         Stmt::BeginIf { cond } => Stmt::BeginIf { cond: sub(cond) },
         Stmt::BreakIf { cond } => Stmt::BreakIf { cond: sub(cond) },
         Stmt::Let { dst, op: Op::Select { ty, cond, a, b } } => Stmt::Let { dst: *dst, op: Op::Select { ty: *ty, cond: sub(cond), a: sub(a), b: sub(b) } },
-        Stmt::Let { dst, op: Op::NotI1(a) } => Stmt::Let { dst: *dst, op: Op::NotI1(sub(a)) },
         other => other.clone(),
     }
 }
