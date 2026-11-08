@@ -479,17 +479,9 @@ impl Body {
             // MFMA h (fragment bytes 64 h + 16 g ..) covers K group 4 h + g: v_perm puts byte g of the low word in byte 0 and byte g of the high
             // word in byte 1 (byte h = the scale of MFMA h)
             let so = { let v = b.bind_i32(ev(kb) << 3); b.read_first_lane(v) };
-            let ld = |b: &mut FnBuilder, rs: ValueId, vo: &[ValueId]| -> Vec<ValueId> {
-                vo.iter()
-                    .map(|v| {
-                        let w = b.buffer_load_b64(rs, *v, so, 0);
-                        let lo = b.frag2_lane(w, 0);
-                        let hi = b.frag2_lane(w, 1);
-                        let (lo, hi) = (b.bitcast_i32(lo), b.bitcast_i32(hi));
-                        b.perm_b32(hi, lo, mx.shift)
-                    })
-                    .collect()
-            };
+            // the raw 8-byte loads: the byte selection (`scale_word`) is applied where the words are installed, so the loads stay in flight
+            // behind the MMAs instead of being waited for at once
+            let ld = |b: &mut FnBuilder, rs: ValueId, vo: &[ValueId]| -> Vec<ValueId> { vo.iter().map(|v| b.buffer_load_b64(rs, *v, so, 0)).collect() };
             let sa = ld(b, self.rsrc_sfa, &mx.voff_a);
             let sb = ld(b, self.rsrc_sfb, &mx.voff_b);
             return (sa, sb);
@@ -504,6 +496,18 @@ impl Body {
             let wa = vec![b.frag2_lane(w2, 0), b.frag2_lane(w2, 1)];
             (wa, vec![b.load_lds_b32(sbb)])
         })
+    }
+    /// The scale word of a `load_scales` value: `Scales::Mx32` selects the lane's two group bytes of the 8-byte load (v_perm); identity otherwise.
+    fn scale_word(&self, b: &mut FnBuilder, v: ValueId) -> ValueId {
+        match &self.mx32 {
+            Some(mx) => {
+                let lo = b.frag2_lane(v, 0);
+                let hi = b.frag2_lane(v, 1);
+                let (lo, hi) = (b.bitcast_i32(lo), b.bitcast_i32(hi));
+                b.perm_b32(hi, lo, mx.shift)
+            }
+            None => v,
+        }
     }
     /// The (word, byte) of the A scale of m block i in the `load_scales` words.
     fn sa_sel(&self, i: usize) -> (usize, u8) {
@@ -529,6 +533,8 @@ impl Body {
     fn load_tile(&mut self, b: &mut FnBuilder, t: &TileIt) {
         let (nm, nn) = ((self.cfg.wave_m() / 16) as usize, (self.cfg.wave_n() / 16) as usize);
         let (sa, sb) = self.load_scales(b, ox(t.it));
+        let sa: Vec<ValueId> = sa.into_iter().map(|v| self.scale_word(b, v)).collect();
+        let sb: Vec<ValueId> = sb.into_iter().map(|v| self.scale_word(b, v)).collect();
         let ar = self.a_rd.at(b, &self.a_s.at(&t.cur));
         let br = self.b_rd.at(b, &self.b_s.at(&t.cur));
         let bf: Vec<ValueId> = (0..nn).map(|j| self.frag(b, &br, j)).collect();
@@ -616,10 +622,12 @@ impl Body {
         if let Some((sa, sb)) = early {
             u.capture(b, "scales.install", |b| {
                 for (i, v) in sa.iter().enumerate() {
-                    b.set_var(sav[i], *v);
+                    let w = self.scale_word(b, *v);
+                    b.set_var(sav[i], w);
                 }
                 for (j, v) in sb.iter().enumerate() {
-                    b.set_var(sbv[j], *v);
+                    let w = self.scale_word(b, *v);
+                    b.set_var(sbv[j], w);
                 }
             });
         }
