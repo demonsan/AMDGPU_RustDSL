@@ -2000,7 +2000,7 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
             Op::LoadLdsB128x2 { .. } => (0, 2),
             Op::LoadLdsTr4B8 { .. } => (0, 4),
             Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => (1, 0),
-            Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } | Op::AtomicLds { .. } => (0, 1),
+            Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } | Op::AtomicLds { .. } | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => (0, 1),
             Op::AtomicGlobal { .. } => (1, 0),
             _ => (0, 0),
         },

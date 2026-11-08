@@ -744,3 +744,52 @@ pub fn probe_atomic_p1() -> Function {
 fn b_shr1(b: &mut FnBuilder, x: ValueId) -> ValueId {
     b.let_(Op::LshrI32(Opnd::Val(x), Opnd::I32(1)))
 }
+
+/// `probe_lane_p1(in, out)`: cross-lane / wave-mask ops on x (plane 0 of `in`); out planes: 0 read_lane(x, 5), 1 read_lane(x, 63), 2 write_lane(read_lane(x, 7),
+/// 3, old = lane), 3 / 4 ballot(x & 1) lo / hi, 5 mbcnt(-1, -1), 6 mbcnt(ballot), 7 popcount(x), 8 ffbl(x), 9 ffbh(x), 10 bpermute from lane 7 l % 64,
+/// 11 permute to lane l + 5, 12 swizzle bit-mask xor 1, 13 swizzle quad_perm [3,2,1,0].
+pub fn probe_lane_p1() -> Function {
+    use amdgpu_dsl::{BinOp, MemTy, UnOp};
+    let mut b = FnBuilder::new("probe_lane_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(256));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(14 * 256));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    let x = b.load_global(pin, 0, MemTy::B32);
+    let mut vals = Vec::new();
+    vals.push(b.read_lane(x, 5));
+    vals.push(b.read_lane(x, 63));
+    let x7 = b.read_lane(x, 7);
+    vals.push(b.write_lane(x7, 3, tid));
+    let bit = b.let_(Op::AndI32(Opnd::Val(x), Opnd::I32(1)));
+    let cond = b.cmp(CmpPred::Ne, CmpTy::I32, bit, 0);
+    let (lo, hi) = b.ballot(cond);
+    vals.push(lo);
+    vals.push(hi);
+    vals.push(b.mbcnt(-1, -1));
+    vals.push(b.mbcnt(lo, hi));
+    vals.push(b.bin(BinOp::BcntAdd, x, 0));
+    vals.push(b.un(UnOp::Ffbl, x));
+    vals.push(b.un(UnOp::Ffbh, x));
+    let src = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(7)));
+    let src = b.let_(Op::AndI32(Opnd::Val(src), Opnd::I32(63)));
+    let a1 = b.let_(Op::MulI32(Opnd::Val(src), Opnd::I32(4)));
+    vals.push(b.bpermute(a1, x));
+    let dstl = b.add_i32(tid, 5);
+    let dstl = b.let_(Op::AndI32(Opnd::Val(dstl), Opnd::I32(63)));
+    let a2 = b.let_(Op::MulI32(Opnd::Val(dstl), Opnd::I32(4)));
+    vals.push(b.permute(a2, x));
+    vals.push(b.swizzle(x, 0x1f | (1 << 10)));
+    vals.push(b.swizzle(x, 0x8000 | 0x1b));
+    for (k, v) in vals.into_iter().enumerate() {
+        let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((256 * (k / 8 * 8)) as i32) });
+        b.store_global(base, 256 * (k as u32 % 8), v, MemTy::B32, false);
+    }
+    b.finish()
+}
