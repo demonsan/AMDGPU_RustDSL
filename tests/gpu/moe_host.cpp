@@ -213,6 +213,15 @@ int main(int argc, char** argv) {
     }
     HC(hipMemset(dY1, 0, (size_t)M * TK * I * 2));
     run(true);
+    // the stage-2 input as the GPU quantized it (the reference consumes the same codes / scales)
+    const int NGq = bs ? I / 128 : 1;
+    std::vector<uint8_t> y1q_dev(fp8 ? (size_t)M * TK * I : 0);
+    std::vector<float> y1s_dev(fp8 ? (size_t)M * TK * NGq : 0);
+    if (fp8) {
+        HC(hipDeviceSynchronize());
+        HC(hipMemcpy(y1q_dev.data(), dY1q, y1q_dev.size(), hipMemcpyDeviceToHost));
+        HC(hipMemcpy(y1s_dev.data(), dy1s, y1s_dev.size() * 4, hipMemcpyDeviceToHost));
+    }
     if (envi("QDBG", 0) && fp8) {
         // the GPU re-quantization vs the host one
         HC(hipDeviceSynchronize());
@@ -334,7 +343,10 @@ int main(int argc, char** argv) {
             }
             // stage 2 from the GPU y1 (quantized as the GPU consumed it for fp8)
             std::vector<double> yin(I);
-            if (fp8) {
+            if (fp8 && !envi("HOSTQ", 0)) {
+                size_t rr = (size_t)t * TK + k;
+                for (int i = 0; i < I; i++) yin[i] = e4m3_to_f(y1q_dev[rr * I + i]) * y1s_dev[rr * NGq + i / (I / NGq)];
+            } else if (fp8) {
                 const int G = bs ? 128 : I;
                 for (int g0 = 0; g0 < I; g0 += G) {
                     float amax = 1e-12f;
