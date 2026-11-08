@@ -45,7 +45,9 @@ int main(int argc, char** argv) {
     auto ki = [&](int b, int key, int d) { return ((size_t)bt[(size_t)b * maxp + key / P] * P + key % P) * DK + d; };
     const float scale = 1.0f / std::sqrt((float)DK);
     // ours mla_decode_bf16_p<P>: 16 heads per CTA, 4 key parts per CTA (NS = 4 S); the vendor path keeps NS = S
-    const bool m16 = getenv("VENDOR") == nullptr;
+    // MLAHP=1: mla_decode_bf16_hp_p<P> (64 heads per CTA sharing the KV tiles, NS = S)
+    const bool hp = envi("MLAHP", 0) != 0;
+    const bool m16 = getenv("VENDOR") == nullptr && !hp;
     const int NS = m16 ? 4 * S : S;
     uint16_t* dout;
     void *dpo, *dpl;
@@ -57,14 +59,14 @@ int main(int argc, char** argv) {
     hipModule_t m1, m2;
     hipFunction_t fn, cfn;
     HC(hipModuleLoad(&m1, vco ? vco : argv[1]));
-    std::string kn = vco ? "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E" : "mla_decode_bf16_p" + std::to_string(P);
+    std::string kn = vco ? "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E" : (hp ? "mla_decode_bf16_hp_p" : "mla_decode_bf16_p") + std::to_string(P);
     HC(hipModuleGetFunction(&fn, m1, kn.c_str()));
     HC(hipModuleLoad(&m2, argv[2]));
     HC(hipModuleGetFunction(&cfn, m2, vco ? "attn_combine_bf16_hd512_sm" : "attn_combine_bf16_hd512"));
     std::vector<uint8_t> a(vco ? 368 : 16 * 11, 0), ca(16 * 5, 0);
     auto Pp = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
     auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
-    int gx = m16 ? (H + 15) / 16 : (H + 31) / 32;
+    int gx = hp ? (H + 63) / 64 : m16 ? (H + 15) / 16 : (H + 31) / 32;
     if (!vco) {
         Pp(0, dpo); Pp(1, dq); Pp(2, dkv); Pp(3, dbt); Pp(4, dcl); memcpy(&a[80], &scale, 4); U(6, H); U(7, maxp); U(8, npages); U(9, S); Pp(10, dpl);
     } else {
