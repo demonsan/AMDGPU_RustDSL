@@ -6,8 +6,11 @@
 pub mod fmha;
 pub mod gemm;
 pub mod mlp;
+pub mod cache;
 pub mod eltwise;
 pub mod norm;
+pub mod rope;
+pub mod topk;
 pub mod rows;
 pub mod ir_proof;
 pub mod probes;
