@@ -695,7 +695,8 @@ pub fn probe_atomic_p1() -> Function {
     let x = b.load_global(pin, 0, MemTy::B32);
     let y = { let t = b.load_global(pin, 256, MemTy::B32); b.let_(Op::BitcastF32(Opnd::Val(t))) };
     // init: dwords 10, 11 = 0x7fffffff, all others 0 (LDS and the global counter block)
-    let is_min = b.cmp(CmpPred::Eq, CmpTy::I32, b_shr1(&mut b, tid), 5);
+    let half = b_shr1(&mut b, tid);
+    let is_min = b.cmp(CmpPred::Eq, CmpTy::I32, half, 5);
     let init = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is_min), a: Opnd::I32(0x7fffffff), b: Opnd::I32(0) });
     b.store_lds(off4, init, MemTy::B32, false);
     let gctr = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::I32(6 * 256) });
