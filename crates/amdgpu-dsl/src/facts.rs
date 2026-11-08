@@ -207,6 +207,8 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         | Op::CvtPknormPair(..)
         | Op::CvtP8x4FromU16(..) => ResClass::Valu,
         Op::ExpF32(..) | Op::RcpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) => ResClass::Trans,
+        Op::Un(o, _) if o.trans() => ResClass::Trans,
+        Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
         Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::LoadF32Coherent { .. } | Op::BufferLoad { .. } | Op::BufferLoadB128x2 { .. } => {
             e.global_read = true;
             ResClass::VmemLoad

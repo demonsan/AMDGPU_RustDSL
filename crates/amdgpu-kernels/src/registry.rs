@@ -2,13 +2,14 @@
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
-    &["probe_agpr_ref", "probe_agpr_acc", "probe_agpr_full", "probe_agpr_pinned", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_scale", "probe_lds_self2", "probe_roles_loop", "probe_lds_tr_b8", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg"]
+    &["probe_agpr_ref", "probe_agpr_acc", "probe_agpr_full", "probe_agpr_pinned", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_scale", "probe_lds_self2", "probe_roles_loop", "probe_lds_tr_b8", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg", "probe_valu_p1"]
 }
 
 pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
     match name {
         "probe_dma_voff_spill" => Some(crate::probes::probe_dma_voff_spill()),
         "probe_stamp" => Some(crate::probes::probe_stamp()),
+        "probe_valu_p1" => Some(crate::probes::tileops::probe_valu_p1()),
         "probe_agpr_ref" => Some(crate::probes::probe_agpr_ref()),
         "probe_agpr_acc" => Some(crate::probes::probe_agpr_acc()),
         "probe_agpr_full" => Some(crate::probes::probe_agpr_full()),
