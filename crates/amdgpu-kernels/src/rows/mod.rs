@@ -10,7 +10,7 @@
 pub mod quant;
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{bf16x8_to_f32, dpp_reduce, group_reduce_dpp, lane_reduce, rsqrt_f32, wave_reduce, wave_reduce_dpp, RedOp};
+use amdgpu_tile::prims::{bf16x8_to_f32, group_reduce_dpp, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,13 +37,9 @@ pub fn by_name(name: &str) -> Option<Function> {
     (n % 8 == 0 && (8..=8192).contains(&n)).then(|| row_kernel(name, n, op))
 }
 
-/// Wave-wide reduction: the LDS exchange (`wave_reduce`) or, with `AMDC_DPP_REDUCE=1`, the DPP + lane-swap all-reduce.
+/// Wave-wide reduction (the LDS exchange: measured equal to the DPP all-reduce on these bandwidth-bound kernels, so the simpler path stays).
 fn wr(b: &mut FnBuilder, op: RedOp, x: ValueId, scratch: &amdgpu_tile::shared::PrivRef, off: i32, gen: i32, lane: &Lane) -> ValueId {
-    if dpp_reduce() {
-        wave_reduce_dpp(b, op, x)
-    } else {
-        wave_reduce(b, op, x, scratch, off, gen, lane)
-    }
+    wave_reduce(b, op, x, scratch, off, gen, lane)
 }
 
 fn sel(b: &mut FnBuilder, cond: ValueId, x: ValueId, y: ValueId) -> ValueId {
@@ -155,12 +151,27 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     };
     let gg: Vec<ValueId> = (0..ngrp).map(|q| if q == 0 { vg } else { b.bind_i32(ev(vg) + 4 * cstride * q as i32) }).collect();
     let load = |b: &mut FnBuilder, rs: ValueId, g: &[ValueId], c: CachePolicy| -> Vec<ValueId> { (0..nld).map(|i| b.buffer_load_c(rs, Some(Opnd::Val(g[i / 4])), 0i32, (cstride as usize * (i % 4)) as u32, MemTy::B128, c)).collect() };
+    let gb_loaded = |b: &mut FnBuilder, late: bool, ge: &Option<Vec<ValueId>>, be: &Option<Vec<ValueId>>, rg: Option<ValueId>, rbe: Option<ValueId>| -> (Option<Vec<ValueId>>, Option<Vec<ValueId>>) {
+        if late {
+            let g = rg.map(|r| load(b, r, &gg, CachePolicy::NONE));
+            let bb = rbe.map(|r| load(b, r, &gg, CachePolicy::NONE));
+            if g.is_some() {
+                b.wait_vm(0);
+            }
+            (g, bb)
+        } else {
+            (ge.clone(), be.clone())
+        }
+    };
     let gxs: Vec<Vec<ValueId>> = (0..steps).map(|r| gx_of(b, r)).collect();
     // every row's loads are issued before any compute: rpw * (row bytes) in flight per wave
     let xs_all: Vec<Vec<ValueId>> = gxs.iter().map(|g| load(b, r_x, g, CachePolicy::NT)).collect();
     let rs_all: Option<Vec<Vec<ValueId>>> = r_res.map(|r| gxs.iter().map(|g| load(b, r, g, CachePolicy::NT)).collect());
-    let gs = r_g.map(|r| load(b, r, &gg, CachePolicy::NONE));
-    let bs = r_be.map(|r| load(b, r, &gg, CachePolicy::NONE));
+    // gamma / beta: with one step per wave they are loaded after the statistics (they would otherwise sit in 32 - 64 VGPRs across the reductions; the L2 hit overlaps with other waves);
+    // short rows (several steps) load them up front
+    let late_gb = steps == 1;
+    let gs_early = if late_gb { None } else { r_g.map(|r| load(b, r, &gg, CachePolicy::NONE)) };
+    let bs_early = if late_gb { None } else { r_be.map(|r| load(b, r, &gg, CachePolicy::NONE)) };
     b.wait_vm(0);
     // chunk validity: only the last chunk can reach past the row (n % 512 != 0)
     let valid: Vec<Option<ValueId>> = (0..nld)
@@ -223,6 +234,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 let mean = b.mul_f32(tot, inv_n);
                 let me_eps = b.add_f32(mean, eps.unwrap());
                 let inv = rsqrt_f32(b, me_eps);
+                let (gs, _bs) = gb_loaded(b, late_gb, &gs_early, &bs_early, r_g, r_be);
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
                     let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
@@ -260,6 +272,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 let var = b.mul_f32(tot2, inv_n);
                 let ve = b.add_f32(var, eps.unwrap());
                 let inv = rsqrt_f32(b, ve);
+                let (gs, bs) = gb_loaded(b, late_gb, &gs_early, &bs_early, r_g, r_be);
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
                     let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);

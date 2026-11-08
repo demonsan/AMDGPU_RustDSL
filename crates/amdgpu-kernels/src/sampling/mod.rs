@@ -8,7 +8,7 @@
 //! V a multiple of 8, 8..=131072. A block reduction = DPP quads + the wave's LDS exchange, then one slot per wave and a barrier (a fresh slot per reduction, so no barrier is needed to reuse them).
 
 use amdgpu_dsl::{AtomicOp, CachePolicy, CmpPred, Dpp, DppAluOp, DppCtrl, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{bf16x8_to_f32, dpp_reduce, lane_reduce, wave_reduce_dpp, RedOp};
+use amdgpu_tile::prims::{bf16x8_to_f32, lane_reduce, RedOp};
 use amdgpu_tile::ev;
 
 const T: i32 = 1024;
@@ -48,9 +48,7 @@ fn block_reduce(b: &mut FnBuilder, op: RedOp, x: ValueId, wave: ValueId, lane: V
         RedOp::Sum => b.add_f32(p, q),
         RedOp::Max => b.max_f32(p, q),
     };
-    let wr = if dpp_reduce() {
-        wave_reduce_dpp(b, op, x)
-    } else {
+    let wr = {
         let mut v = x;
         for perm in [[1u8, 0, 3, 2], [2, 3, 0, 1]] {
             let y = b.dpp_quad_perm(v, perm);

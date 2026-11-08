@@ -9,6 +9,7 @@
 //! j (E past the used tiles); `num_valid_ids = [padded_total, M]`; `tile_start[e]` = first tile of expert e, `tile_start[E]` = padded_total / BM. Order inside an expert's group = atomic arrival order (a multiset).
 
 pub mod multi;
+pub mod reduce;
 
 use amdgpu_dsl::{AtomicOp, CmpPred, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 use amdgpu_tile::ev;
