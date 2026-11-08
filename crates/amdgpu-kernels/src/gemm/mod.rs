@@ -1361,7 +1361,9 @@ impl skeleton_v4::V4Slots for GemmSlots {
                 let r2 = b.bind_i32(ev(r1) - ev(odv) * ev(p2));
                 let ohv = div_rt(b, r2, ow);
                 let owv = b.bind_i32(ev(r2) - ev(ohv) * ev(ow));
-                let id0 = b.bind_i32(ev(odv) * cc.stride - cc.pad);
+                // 2d (kernel depth 1): no depth stride / padding
+                let (sd, pd) = if cc.t == 1 { (1, 0) } else { (cc.stride, cc.pad) };
+                let id0 = b.bind_i32(ev(odv) * sd - pd);
                 let ih0 = b.bind_i32(ev(ohv) * cc.stride - cc.pad);
                 let iw0 = b.bind_i32(ev(owv) * cc.stride - cc.pad);
                 let base = b.bind_i32((((ev(nb) * ev(di) + ev(id0)) * ev(h) + ev(ih0)) * ev(w) + ev(iw0)) * ev(c) * 2 + ((lane.lane() & 7) << 4));
