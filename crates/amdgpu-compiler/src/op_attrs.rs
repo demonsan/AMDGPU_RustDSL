@@ -737,9 +737,9 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         VCmpMaskNeU32 => a("v_cmp_ne_u32_e64", valu).wdelay(2).dce(Pure),
         SMaskLo => a("s_mov_b32", salu).dce(Pure),
         SMaskHi => a("s_mov_b32", salu).dce(Pure),
-        LdsBpermute => a("ds_bpermute_b32", c(Lds, 4, 52, Experimental)).dce(Load),
-        LdsPermute => a("ds_permute_b32", c(Lds, 4, 52, Experimental)).dce(Load),
-        LdsSwizzle => a("ds_swizzle_b32", c(Lds, 4, 52, Experimental)).dce(Load),
+        LdsBpermute => a("ds_bpermute_b32", c(Lds, 4, 52, Experimental)).mem(L, false, Base::Unknown, 4).dce(Load), // returns through lgkmcnt: tracked like an LDS read by the wait pass (it touches no LDS memory; the ordering is conservative)
+        LdsPermute => a("ds_permute_b32", c(Lds, 4, 52, Experimental)).mem(L, false, Base::Unknown, 4).dce(Load), // returns through lgkmcnt: tracked like an LDS read by the wait pass (it touches no LDS memory; the ordering is conservative)
+        LdsSwizzle => a("ds_swizzle_b32", c(Lds, 4, 52, Experimental)).mem(L, false, Base::Unknown, 4).dce(Load), // returns through lgkmcnt: tracked like an LDS read by the wait pass (it touches no LDS memory; the ordering is conservative)
         VMovDppX => a("v_mov_b32_dpp", c(Valu, 4, 8, Unknown)).regfx(RegFx::PartialWrite).wdelay(2).hz_reader().backend(Backend::OwnOnly),
         VAddF32Dpp => a("v_add_f32_dpp", c(Valu, 4, 8, Unknown)).regfx(RegFx::PartialWrite).wdelay(2).hz_reader().backend(Backend::OwnOnly),
         VSubF32Dpp => a("v_sub_f32_dpp", c(Valu, 4, 8, Unknown)).regfx(RegFx::PartialWrite).wdelay(2).hz_reader().backend(Backend::OwnOnly),

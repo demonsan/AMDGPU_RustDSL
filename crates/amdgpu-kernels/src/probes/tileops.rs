@@ -1106,3 +1106,53 @@ pub fn probe_reload_p1() -> Function {
     b.end_loop();
     b.finish()
 }
+
+/// LDS byte offsets of `probe_lds_high` (DMA destinations; the last three are at / past 128 KiB).
+pub const LDS_HIGH_M0: [u32; 5] = [0x1_c000, 0x1_f000, 0x2_0000, 0x2_4000, 0x2_7000];
+
+/// `probe_lds_high(in, out)`: does the M0-based LDS-DMA (`buffer_load_dwordx4 ... lds`) reach LDS bytes >= 128 KiB on gfx950 (160 KiB per
+/// workgroup)? Lane l first ds_writes a marker (0xC0DE0000 | region << 8 | l) at `M0 - 128 KiB + 16 l` for the high regions, then the DMA of
+/// region k writes in[1 KiB k + 16 l] to `M0_k + 16 l`; after a wait + barrier every lane reads both back with ds_read_b128. out plane pair k:
+/// [the DMA'd 16 bytes as read at M0_k] then [the marker location's first dword] (64 lanes x 5 dwords per region).
+pub fn probe_lds_high() -> Function {
+    use amdgpu_dsl::MemTy;
+    let mut b = FnBuilder::new("probe_lds_high", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(5 * 1024));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(5 * 64 * 20));
+    b.lds(160 * 1024);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(16)));
+    let r_in = b.buffer_desc(inp, 5 * 1024);
+    for (k, m0) in LDS_HIGH_M0.iter().enumerate() {
+        if *m0 >= 0x2_0000 {
+            let a = b.add_i32(off16, (*m0 - 0x2_0000) as i32);
+            let mk = b.add_i32(tid, (0xC0DE_0000u32 | (k as u32) << 8) as i32);
+            b.store_lds(a, mk, MemTy::B32, false);
+        }
+    }
+    b.wait_lds(0);
+    b.barrier();
+    for (k, m0) in LDS_HIGH_M0.iter().enumerate() {
+        let m0v = b.c_i32(*m0 as i32);
+        let m0s = b.read_first_lane(m0v);
+        b.load_buffer_lds(r_in, off16, 0i32, m0s, (1024 * k) as u32, 4);
+    }
+    b.wait_vm(0);
+    b.barrier();
+    let off20 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(20)));
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off20) });
+    for (k, m0) in LDS_HIGH_M0.iter().enumerate() {
+        let a = b.add_i32(off16, *m0 as i32);
+        let v = b.load_lds(a, MemTy::B128);
+        let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((64 * 20 * k) as i32) });
+        b.store_global(base, 0, v, MemTy::B128, false);
+        let low = b.add_i32(off16, (*m0 as i32) - 0x2_0000);
+        let mk = if *m0 >= 0x2_0000 { b.load_lds(low, MemTy::B32) } else { b.c_i32(0) };
+        b.store_global(base, 16, mk, MemTy::B32, false);
+    }
+    b.finish()
+}

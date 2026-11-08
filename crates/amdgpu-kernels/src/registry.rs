@@ -19,6 +19,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_tr_b16_mfma" => Some(crate::probes::tileops::probe_tr_b16_mfma()),
         "probe_atomic_p1" => Some(crate::probes::tileops::probe_atomic_p1()),
         "probe_lane_p1" => Some(crate::probes::tileops::probe_lane_p1()),
+        "probe_lds_high" => Some(crate::probes::tileops::probe_lds_high()),
         "probe_reload_p1" => Some(crate::probes::tileops::probe_reload_p1()),
         "probe_anylane" => Some(crate::probes::tileops::probe_anylane()),
         "probe_big_addr" => Some(crate::probes::tileops::probe_big_addr()),

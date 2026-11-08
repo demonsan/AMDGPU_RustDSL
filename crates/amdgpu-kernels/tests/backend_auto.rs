@@ -5,7 +5,7 @@ use amdgpu_compiler::backend::{LlvmTail, LlvmTools};
 use amdgpu_compiler::{compile_with, resolve_backend, uses_own_only_ops};
 use amdgpu_kernels::{kernel_by_name, kernel_names};
 
-const OWN_ONLY_BY_NAME: &[&str] = &["probe_smfmac_gen", "probe_lds_tr_b8_gen", "probe_stamp", "probe_dma", "probe_dma_tile", "probe_dma_seq", "probe_dma_kread", "probe_dma_map", "probe_buffer_lds", "probe_buffer_dyn", "probe_dma_voff_spill", "probe_dpp_p1", "probe_tileop_p1", ];
+const OWN_ONLY_BY_NAME: &[&str] = &["probe_smfmac_gen", "probe_lds_tr_b8_gen", "probe_stamp", "probe_dma", "probe_dma_tile", "probe_dma_seq", "probe_dma_kread", "probe_dma_map", "probe_buffer_lds", "probe_buffer_dyn", "probe_dma_voff_spill", "probe_dpp_p1", "probe_tileop_p1", "probe_lds_high", ];
 
 #[test]
 fn dma_kernels_get_own_everything_else_llvm_tail() {
