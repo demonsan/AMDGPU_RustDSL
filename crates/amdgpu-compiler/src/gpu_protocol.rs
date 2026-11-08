@@ -186,11 +186,12 @@ fn is_global_access(st: &Stmt) -> Option<(bool, bool)> {
     match st {
         Stmt::StoreU16 { .. } | Stmt::StoreF32 { .. } | Stmt::StoreF32x2 { .. } | Stmt::StoreF32x4 { .. } => Some((true, false)),
         Stmt::StoreF32Wt { .. } => Some((true, true)),
-        Stmt::StoreGlobalN { .. } => Some((true, false)),
+        Stmt::StoreGlobalN { .. } | Stmt::AtomicGlobalNoRet { .. } => Some((true, false)),
         Stmt::Let { op, .. } => match op {
             Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } => Some((false, false)),
             Op::LoadF32Coherent { .. } => Some((false, true)),
             Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } => Some((false, false)),
+            Op::AtomicGlobal { .. } => Some((true, false)),
             _ => None,
         },
         _ => None,
@@ -201,9 +202,10 @@ fn is_lds_access(st: &Stmt) -> Option<(bool, bool)> {
     // (dma, is_write)
     match st {
         Stmt::LoadGlobalLds { .. } | Stmt::BufferLoadLds { .. } => Some((true, true)),
-        Stmt::StoreLdsB32 { .. } | Stmt::StoreLdsB128 { .. } | Stmt::StoreLdsB64 { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => Some((false, true)),
+        Stmt::StoreLdsB32 { .. } | Stmt::StoreLdsB128 { .. } | Stmt::StoreLdsB64 { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::AtomicLdsNoRet { .. } => Some((false, true)),
         Stmt::Let { op, .. } => match op {
             Op::LoadLdsB32 { .. } | Op::LoadLdsB128 { .. } | Op::LoadLdsB64 { .. } | Op::LoadLdsTrB8 { .. } | Op::LoadLdsTr4B8 { .. } | Op::LoadLdsB128x2 { .. } | Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } => Some((false, false)),
+            Op::AtomicLds { .. } => Some((false, true)),
             _ => None,
         },
         _ => None,

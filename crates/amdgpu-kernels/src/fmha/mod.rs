@@ -12,6 +12,7 @@ use amdgpu_tile::mma::{gemm, make_tiled_mma, TiledMma};
 use amdgpu_tile::{contract, Ctx};
 pub mod io;
 pub mod graph;
+pub mod bf16;
 mod skeleton_kvsplit;
 mod skeleton_t128;
 mod skeleton_vs128;

@@ -15,6 +15,7 @@ fn attacks_are_rejected_with_their_finding() {
         ("gv_attack_assume_loop", "GV-ASSUME-VIOLATED", 1),
         ("gv_attack_lds_const", "GV-LDS-OOB", 1),
         ("gv_attack_desc_over", "GV-BUF-OVER", 1),
+        ("gv_attack_buf_wrap", "GV-BUF-WRAP", 1),
         ("gv_attack_clamp_path", "GV-GLB-OOB", 1),
         ("probe_lds_oob", "GV-LDS-OOB", 4),
     ] {
@@ -41,4 +42,10 @@ fn trust_escapes_are_counted_in_the_ledger() {
     let r = analyse(&f).unwrap();
     assert!(r.errors().is_empty());
     assert!(!f.contract.extents.is_empty(), "the claimed extent must appear as a trusted contract in the certificate");
+}
+
+/// A masked buffer store whose sentinel stays out of range after the instruction offset is accepted (no GV-BUF-WRAP).
+#[test]
+fn a_large_buffer_sentinel_is_accepted() {
+    assert!(codes("gv_ok_buf_sentinel").is_empty(), "{:?}", codes("gv_ok_buf_sentinel"));
 }

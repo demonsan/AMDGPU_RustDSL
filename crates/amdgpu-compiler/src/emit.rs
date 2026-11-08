@@ -395,6 +395,21 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::VCvtF16F32 => un(a, inst, "v_cvt_f16_f32_e32"),
         MOp::VAndB32 => bin(a, inst, "v_and_b32_e32"),
         MOp::VMinI32 => bin(a, inst, "v_min_i32_e32"),
+        MOp::VMovDppX => vec![format!("v_mov_b32_dpp {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), dpp_mods(inst.imm))],
+        MOp::VAddF32Dpp => vec![format!("v_add_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VSubF32Dpp => vec![format!("v_sub_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMulF32Dpp => vec![format!("v_mul_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMaxF32Dpp => vec![format!("v_max_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMinF32Dpp => vec![format!("v_min_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VAddU32Dpp => vec![format!("v_add_u32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMaxI32Dpp => vec![format!("v_max_i32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMinI32Dpp => vec![format!("v_min_i32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMaxU32Dpp => vec![format!("v_max_u32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VMinU32Dpp => vec![format!("v_min_u32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VAndB32Dpp => vec![format!("v_and_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VOrB32Dpp => vec![format!("v_or_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VXorB32Dpp => vec![format!("v_xor_b32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
+        MOp::VPermlane16Swap => vec![format!("v_permlane16_swap_b32_e32 {}, {}", vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])))],
         MOp::VCvtPkF32Fp8 => vec![format!("v_cvt_pk_f32_fp8_sdwa {}, {} src0_sel:WORD_{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), inst.imm & 1)],
         MOp::VCvtF32Fp8 => vec![format!("v_cvt_f32_fp8_sdwa {}, {} src0_sel:BYTE_{}", d(a), src1(a, inst.srcs[0]), inst.imm & 3)],
         MOp::VCvtPkF32Bf8 => vec![format!("v_cvt_pk_f32_bf8_sdwa {}, {} src0_sel:WORD_{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), inst.imm & 1)],
@@ -845,6 +860,34 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
             vr(a, reg_of(&inst.srcs[1])),
             if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) }
         )],
+        MOp::LdsAtomicAddU32 => vec![format!("ds_add_u32 {}, {}{}", src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicAddU32Rtn => vec![format!("ds_add_rtn_u32 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicMaxU32 => vec![format!("ds_max_u32 {}, {}{}", src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicMaxU32Rtn => vec![format!("ds_max_rtn_u32 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicMinU32 => vec![format!("ds_min_u32 {}, {}{}", src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicMinU32Rtn => vec![format!("ds_min_rtn_u32 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicMaxI32 => vec![format!("ds_max_i32 {}, {}{}", src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicMaxI32Rtn => vec![format!("ds_max_rtn_i32 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicMinI32 => vec![format!("ds_min_i32 {}, {}{}", src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicMinI32Rtn => vec![format!("ds_min_rtn_i32 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicIncU32 => vec![format!("ds_inc_u32 {}, {}{}", src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicIncU32Rtn => vec![format!("ds_inc_rtn_u32 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicAddF32 => vec![format!("ds_add_f32 {}, {}{}", src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::LdsAtomicAddF32Rtn => vec![format!("ds_add_rtn_f32 {}, {}, {}{}", d(a), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), lds_off(inst.imm))],
+        MOp::GlobalAtomicAddU32 => vec![format!("global_atomic_add {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicAddU32Rtn => vec![format!("global_atomic_add {}, {}, {}, off{} sc0", d(a), pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicMaxU32 => vec![format!("global_atomic_umax {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicMaxU32Rtn => vec![format!("global_atomic_umax {}, {}, {}, off{} sc0", d(a), pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicMinU32 => vec![format!("global_atomic_umin {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicMinU32Rtn => vec![format!("global_atomic_umin {}, {}, {}, off{} sc0", d(a), pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicMaxI32 => vec![format!("global_atomic_smax {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicMaxI32Rtn => vec![format!("global_atomic_smax {}, {}, {}, off{} sc0", d(a), pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicMinI32 => vec![format!("global_atomic_smin {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicMinI32Rtn => vec![format!("global_atomic_smin {}, {}, {}, off{} sc0", d(a), pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicIncU32 => vec![format!("global_atomic_inc {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicIncU32Rtn => vec![format!("global_atomic_inc {}, {}, {}, off{} sc0", d(a), pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicAddF32 => vec![format!("global_atomic_add_f32 {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalAtomicAddF32Rtn => vec![format!("global_atomic_add_f32 {}, {}, {}, off{} sc0", d(a), pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
         MOp::GlobalAtomicAddRet => vec![format!(
             "global_atomic_add {}, {}, {}, off{} sc0",
             d(a),
@@ -1056,4 +1099,28 @@ fn f8f6f4_fmt(imm: i64) -> String {
         s += &format!(" blgp:{b}");
     }
     s
+}
+
+/// DPP modifiers of a full control word (`MInst::imm` of the `*Dpp` ops: dpp_ctrl | (row_mask ^ 0xf) << 12 | (bank_mask ^ 0xf) << 16 | bound_zero << 20).
+fn dpp_mods(imm: i64) -> String {
+    let c = (imm & 0x1ff) as u32;
+    let ctrl = match c {
+        0..=0xff => format!("quad_perm:[{},{},{},{}]", c & 3, c >> 2 & 3, c >> 4 & 3, c >> 6 & 3),
+        0x101..=0x10f => format!("row_shl:{}", c - 0x100),
+        0x111..=0x11f => format!("row_shr:{}", c - 0x110),
+        0x121..=0x12f => format!("row_ror:{}", c - 0x120),
+        0x130 => "wave_shl:1".to_string(),
+        0x134 => "wave_rol:1".to_string(),
+        0x138 => "wave_shr:1".to_string(),
+        0x13c => "wave_ror:1".to_string(),
+        0x140 => "row_mirror".to_string(),
+        0x141 => "row_half_mirror".to_string(),
+        0x142 => "row_bcast:15".to_string(),
+        0x143 => "row_bcast:31".to_string(),
+        _ => format!("quad_perm:[0,1,2,3] /* bad dpp_ctrl {c:#x} */"),
+    };
+    let row = ((imm >> 12) & 0xf) ^ 0xf;
+    let bank = ((imm >> 16) & 0xf) ^ 0xf;
+    let bz = if (imm >> 20) & 1 != 0 { " bound_ctrl:1" } else { "" };
+    format!(" {ctrl} row_mask:{row:#x} bank_mask:{bank:#x}{bz}")
 }

@@ -517,7 +517,36 @@ impl<'a> An<'a> {
             return;
         };
         if num.is_some() {
-            // hardware range check against num_records (loads read 0, stores are dropped): accepted; overstatement is checked at the descriptor
+            // hardware range check against num_records (loads read 0, stores are dropped): accepted; overstatement is checked at the descriptor.
+            // The range check sees the EFFECTIVE offset voffset + soffset + imm in 32 bits: a masking SENTINEL voffset (a negative constant chosen
+            // by a select, e.g. -16 for "this lane is out of range") plus a positive instruction offset wraps back to a small in-range offset
+            // (-16 + 16 = 0) and the access lands inside the buffer instead of being dropped. Reject (stores) / warn (loads) such sentinels.
+            // (A register offset that is merely negative with a folded immediate - a legitimate address - is not a sentinel and is not flagged.)
+            if imm > 0 {
+                let soff_k = match soff {
+                    Opnd::I32(c) => Some(*c as i128),
+                    o => self.int_of(o).point_const().filter(|q| q.d == 1).map(|q| q.n),
+                };
+                let mut wraps = Vec::new();
+                if let (Some(o), Some(sk)) = (voff, soff_k) {
+                    for c in self.select_consts(o, 6) {
+                        let e = c + sk + imm;
+                        if c + sk < 0 && e >= 0 {
+                            wraps.push((c, e));
+                        }
+                    }
+                }
+                if let Some((c, e)) = wraps.first() {
+                    let m = format!(
+                        "stmt {}: {what}: the masking sentinel voffset {c} plus the instruction offset {imm} is the 32-bit effective offset {e}: the \
+                         masked lanes access the buffer at {e} instead of being dropped by the range check (use a sentinel that stays >= num_records after \
+                         the immediate, e.g. 0x7fffff00, or fold the immediate into the register offset)",
+                        self.idx
+                    );
+                    self.rep.add("GV-BUF-WRAP", if store { Severity::Error } else { Severity::Warn }, m);
+                    return;
+                }
+            }
             self.rep.ok("buffer(hw-guarded)");
             return;
         }
@@ -974,6 +1003,11 @@ impl<'a> An<'a> {
             Op::LoadLdsN { addr, ty } => self.check_lds_at("ds_read", addr, ty.bytes() as i128),
             Op::LoadLdsD16 { addr, ty, .. } => self.check_lds_at("ds_read d16", addr, ty.bytes() as i128),
             Op::LoadLdsTrB16 { addr } => self.check_lds_at("ds_read_b64_tr_b16", addr, 8),
+            Op::AtomicLds { addr, .. } => self.check_lds_at("ds atomic (returning)", addr, 4),
+            Op::AtomicGlobal { base, byte_off, .. } => {
+                let b = self.av_of(base);
+                self.check_global("global atomic (returning)", &b, *byte_off as i128, 4, true);
+            }
             Op::LoadLds2 { addr, off0, off1, b64, st64 } => self.check_lds2("ds_read2", addr, *off0, *off1, *b64, *st64),
             _ => {}
         }
@@ -987,6 +1021,25 @@ impl<'a> An<'a> {
             self.cur_addr = Some((*addr, o as i128 * stride));
             let a = self.int_of(addr).add_const(o as i128 * stride);
             self.check_lds(what, &a, eb);
+        }
+    }
+
+    /// The constants an operand may take through selects (the arms of `Select`s, recursively, and constants): masking sentinels.
+    fn select_consts(&self, o: &Opnd, depth: usize) -> Vec<i128> {
+        match o {
+            Opnd::I32(c) => vec![*c as i128],
+            Opnd::Val(v) if depth > 0 => match self.defs.get(v) {
+                Some(Op::ConstI32(c)) => vec![*c as i128],
+                // a sentinel shifted by a constant (sentinel + k) is still a sentinel
+                Some(Op::AddI32(x, Opnd::I32(k))) | Some(Op::AddI32(Opnd::I32(k), x)) => self.select_consts(x, depth - 1).into_iter().map(|c| c + *k as i128).collect(),
+                Some(Op::Select { a, b, .. }) => {
+                    let mut r = self.select_consts(a, depth - 1);
+                    r.extend(self.select_consts(b, depth - 1));
+                    r
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
         }
     }
 
@@ -1362,6 +1415,11 @@ impl<'a> An<'a> {
                 self.check_buffer("buffer store", &r, voff, soff, *imm as i128, ty.bytes() as i128, true);
             }
             Stmt::StoreLdsN { addr, ty, .. } => self.check_lds_at("ds_write", addr, ty.bytes() as i128),
+            Stmt::AtomicLdsNoRet { addr, .. } => self.check_lds_at("ds atomic", addr, 4),
+            Stmt::AtomicGlobalNoRet { base, byte_off, .. } => {
+                let b = self.av_of(base);
+                self.check_global("global atomic", &b, *byte_off as i128, 4, true)
+            }
             Stmt::StoreLds2 { addr, off0, off1, b64, st64, .. } => self.check_lds2("ds_write2", addr, *off0, *off1, *b64, *st64),
             Stmt::BeginLoop { .. } => unreachable!("loops are walked by `walk_loop`"),
             Stmt::SetVar { var, value } => {
@@ -1933,7 +1991,8 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
         Stmt::BufferLoadLds { .. } | Stmt::LoadGlobalLds { .. } => (1, 0),
         Stmt::StoreLdsB32 { .. } | Stmt::StoreLdsB128 { .. } | Stmt::StoreLdsB64 { .. } => (0, 1),
         Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } => (1, 0),
-        Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => (0, 1),
+        Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::AtomicLdsNoRet { .. } => (0, 1),
+        Stmt::AtomicGlobalNoRet { .. } => (1, 0),
         Stmt::Let { op, .. } => match op {
             Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::LoadF32Coherent { .. } | Op::BufferLoad { .. } => (1, 0),
             Op::BufferLoadB128x2 { .. } => (2, 0),
@@ -1941,7 +2000,8 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
             Op::LoadLdsB128x2 { .. } => (0, 2),
             Op::LoadLdsTr4B8 { .. } => (0, 4),
             Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => (1, 0),
-            Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } => (0, 1),
+            Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } | Op::AtomicLds { .. } => (0, 1),
+            Op::AtomicGlobal { .. } => (1, 0),
             _ => (0, 0),
         },
         _ => (0, 0),

@@ -198,3 +198,28 @@ pub fn probe_lds_oob() -> Function {
     b.store_f32(p, 12, Opnd::Val(f_4096));
     b.finish()
 }
+
+/// ATTACK (sentinel wrap-around): lanes >= 32 mask their store with the "out-of-range" voffset -16, but the store's instruction offset 16 wraps
+/// the 32-bit effective offset back to 0, so those lanes overwrite bytes 0..16 instead of being dropped by the range check (GV-BUF-WRAP).
+pub fn gv_attack_buf_wrap() -> Function {
+    buf_sentinel_kernel("gv_attack_buf_wrap", -16)
+}
+
+/// The same masked store with a sentinel that stays out of range after the immediate (0x7fffff00 + 16 >= num_records): accepted.
+pub fn gv_ok_buf_sentinel() -> Function {
+    buf_sentinel_kernel("gv_ok_buf_sentinel", 0x7fffff00)
+}
+
+fn buf_sentinel_kernel(name: &str, sentinel: i32) -> Function {
+    let mut b = FnBuilder::new(name, 64);
+    b.arg("o", DType::Ptr, 0, 8);
+    b.arg_tensor("o", Ext::c(1024));
+    let o = b.let_(Op::KernargPtr { offset: 0 });
+    let tid = b.let_(Op::WorkitemId);
+    let r = b.buffer_desc(o, 1024);
+    let off = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(16)));
+    let ok = b.let_(Op::CmpLtI32(Opnd::Val(tid), Opnd::I32(32)));
+    let voff = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(off), b: Opnd::I32(sentinel) });
+    b.buffer_store_n(r, Some(Opnd::Val(voff)), 0, 16, tid, amdgpu_dsl::MemTy::B32, false);
+    b.finish()
+}
