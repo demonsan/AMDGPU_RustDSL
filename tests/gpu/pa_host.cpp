@@ -68,6 +68,7 @@ int main(int argc, char** argv) {
         kss.resize((size_t)HK * S_); vss.resize(kss.size());
         for (auto& s : kss) s = std::ldexp(1.0f, -(int)(rng() % 4));
         for (auto& s : vss) s = std::ldexp(1.0f, -(int)(rng() % 4));
+        if (envi("FP8UNIT", 0)) { std::fill(kss.begin(), kss.end(), 1.0f); std::fill(vss.begin(), vss.end(), 1.0f); }  // (debug: unit per-token scales)
         kq.assign(kc.size(), 0); vq.assign(vc.size(), 0);
         for (int pg = 0; pg < npages; pg++)
             for (int t = 0; t < P; t++)
