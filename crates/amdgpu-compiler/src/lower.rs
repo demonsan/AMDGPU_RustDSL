@@ -728,14 +728,20 @@ impl Lowerer {
     /// `frag_cat` whose parts were loads retargeted into it): those loads write the variable's register (its aliases at the same offsets)
     /// directly - no copy, and no wait at the definition (the use-based wait accounting follows the new register, also across the loop
     /// back-edge). Legal only when nothing reads or writes the variable after the first of those loads.
+    fn coalesce_why(&self, v: ValueId, why: &str) {
+        if std::env::var("AMDC_COALESCE_DEBUG").is_ok() {
+            eprintln!("in-place reload of v{v} refused (check {why})");
+        }
+    }
+
     fn try_coalesce_load_reload(&mut self, v: ValueId, dst: VReg) -> bool {
         let Some(&d) = self.val.get(&v) else { return false };
         let cls = self.mir.vreg_class(d);
         if cls != self.mir.vreg_class(dst) || self.mir.alias.contains_key(&d) || self.mir.alias.contains_key(&dst) {
-            return false;
+            { self.coalesce_why(v, "1"); return false; }
         }
         if self.val.values().filter(|x| **x == d).count() != 1 {
-            return false;
+            { self.coalesce_why(v, "2"); return false; }
         }
         let insts = &self.mir.blocks[self.cur].insts;
         let prod: Vec<usize> = insts
@@ -745,7 +751,7 @@ impl Lowerer {
             .map(|(k, _)| k)
             .collect();
         if prod.is_empty() {
-            return false;
+            { self.coalesce_why(v, "3"); return false; }
         }
         let mut covered = 0u32;
         for &k in &prod {
@@ -753,12 +759,12 @@ impl Lowerer {
             let a = crate::op_attrs::attrs(i.op);
             // loads only (a memory read with a full register write)
             if !a.mem.map_or(false, |m| !m.write) || matches!(a.regfx, crate::op_attrs::RegFx::PartialWrite) {
-                return false;
+                { self.coalesce_why(v, "4"); return false; }
             }
             covered += self.mir.vreg_class(i.dst.unwrap()).dwords() as u32;
         }
         if covered != cls.dwords() as u32 {
-            return false;
+            { self.coalesce_why(v, "5"); return false; }
         }
         let first = prod[0];
         for (k, i) in insts.iter().enumerate().skip(first) {
@@ -766,7 +772,7 @@ impl Lowerer {
                 continue;
             }
             if i.uses().iter().any(|u| self.mir.canon(*u) == dst || self.mir.canon(*u) == d) || i.dst.map_or(false, |x| self.mir.canon(x) == dst) {
-                return false;
+                { self.coalesce_why(v, "6"); return false; }
             }
         }
         let mut news: Vec<(usize, VReg)> = Vec::new();
@@ -1788,6 +1794,9 @@ impl Lowerer {
                         if let Opnd::Val(v) = value {
                             if self.use_counts.get(v).copied() == Some(1) && self.try_coalesce_lds_reload(*v, dst) {
                                 return Ok(());
+                            }
+                            if std::env::var("AMDC_COALESCE_DEBUG").is_ok() {
+                                eprintln!("set_var(v{v}): not in place (uses {:?}, def {:?})", self.use_counts.get(v), self.defs.get(v).map(|o| format!("{o:?}").chars().take(40).collect::<String>()));
                             }
                         }
                     }
