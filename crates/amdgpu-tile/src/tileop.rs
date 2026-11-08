@@ -108,18 +108,12 @@ pub fn row_allreduce16(b: &mut FnBuilder, op: DppAluOp, x: ValueId) -> ValueId {
     v
 }
 
-/// All-reduce of `x` over the 64-lane wave: the row all-reduce, then the four row results (read through `v_readlane`) combined. Returns a
-/// value of `x`'s type (F32 for the float ops), wave-uniform.
+/// All-reduce of `x` over the 64-lane wave: the row all-reduce, then the rows combined with two lane swaps that keep the value in a VGPR (no LDS, no SGPR round trip):
+/// `v_permlane32_swap` pairs lane `l` with `l ^ 32`, `v_permlane16_swap` pairs it with `l ^ 16` (with a = b = x the swap hands every lane its partner's value in `new b`
+/// for the low half / even rows and in `new a` for the high half / odd rows). Six instructions for the whole wave; every lane gets the result (a VGPR value of `x`'s type).
 pub fn wave_allreduce(b: &mut FnBuilder, op: DppAluOp, x: ValueId) -> ValueId {
     let r = row_allreduce16(b, op, x);
     let float = matches!(op, DppAluOp::AddF32 | DppAluOp::SubF32 | DppAluOp::MulF32 | DppAluOp::MaxF32 | DppAluOp::MinF32);
-    let rows: Vec<ValueId> = [0u8, 16, 32, 48]
-        .iter()
-        .map(|l| {
-            let v = b.read_lane(r, *l);
-            if float { b.let_(Op::BitcastF32(Opnd::Val(v))) } else { v }
-        })
-        .collect();
     let combine = |b: &mut FnBuilder, p: ValueId, q: ValueId| -> ValueId {
         let (a, c) = (Opnd::Val(p), Opnd::Val(q));
         match op {
@@ -138,7 +132,68 @@ pub fn wave_allreduce(b: &mut FnBuilder, op: DppAluOp, x: ValueId) -> ValueId {
             DppAluOp::SubF32 => panic!("wave_allreduce: subtraction is not associative"),
         }
     };
-    let s0 = combine(b, rows[0], rows[1]);
-    let s1 = combine(b, rows[2], rows[3]);
-    combine(b, s0, s1)
+    // raw 32-bit view of a value (the swaps and selects work on the bits)
+    let bits = |b: &mut FnBuilder, v: ValueId| -> ValueId { if float { b.let_(Op::BitcastI32(Opnd::Val(v))) } else { v } };
+    let back = |b: &mut FnBuilder, v: ValueId| -> ValueId { if float { b.let_(Op::BitcastF32(Opnd::Val(v))) } else { v } };
+    let tid = b.let_(Op::WorkitemId);
+    let lane = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(63)));
+    // step 1: partner lane ^ 32
+    let rb = bits(b, r);
+    let (na, nb) = b.permlane32_swap(rb, rb);
+    let (na, nb) = (b.let_(Op::BitcastI32(Opnd::Val(na))), b.let_(Op::BitcastI32(Opnd::Val(nb))));
+    let low = b.cmp(amdgpu_dsl::CmpPred::Lt, amdgpu_dsl::CmpTy::I32, lane, 32);
+    let p1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(low), a: Opnd::Val(nb), b: Opnd::Val(na) });
+    let p1 = back(b, p1);
+    let v = combine(b, r, p1);
+    // step 2: partner lane ^ 16
+    let vb = bits(b, v);
+    let f2 = b.permlane16_swap(vb, vb);
+    let (xa, xb) = (b.frag2_lane(f2, 0), b.frag2_lane(f2, 1));
+    let (xa, xb) = (b.let_(Op::BitcastI32(Opnd::Val(xa))), b.let_(Op::BitcastI32(Opnd::Val(xb))));
+    let l16 = b.let_(Op::AndI32(Opnd::Val(lane), Opnd::I32(16)));
+    let even = b.cmp(amdgpu_dsl::CmpPred::Eq, amdgpu_dsl::CmpTy::I32, l16, 0);
+    let p2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(even), a: Opnd::Val(xb), b: Opnd::Val(xa) });
+    let p2 = back(b, p2);
+    combine(b, v, p2)
+}
+
+/// All-reduce over each aligned group of `l` lanes (4, 8, 16, 32 or 64): quad_perm steps, then `row_half_mirror` (8), `row_ror:4` / `row_ror:8` (16), plus the `l ^ 16` swap (32) and the `l ^ 32` swap (64);
+/// every lane of a group gets the group's result. `l = 16` is `row_allreduce16`, `l = 64` is `wave_allreduce`.
+pub fn group_allreduce(b: &mut FnBuilder, op: DppAluOp, x: ValueId, l: i64) -> ValueId {
+    assert!([4, 8, 16, 32, 64].contains(&l), "group_allreduce: group size {l}");
+    if l == 64 {
+        return wave_allreduce(b, op, x);
+    }
+    let mut v = x;
+    let mut ctrls = vec![DppCtrl::QuadPerm([1, 0, 3, 2]), DppCtrl::QuadPerm([2, 3, 0, 1])];
+    if l == 8 {
+        ctrls.push(DppCtrl::RowHalfMirror);
+    } else if l >= 16 {
+        ctrls.push(DppCtrl::RowRor(4));
+        ctrls.push(DppCtrl::RowRor(8));
+    }
+    for c in ctrls {
+        v = b.dpp_alu(op, Dpp::new(c), v, v, v);
+    }
+    if l == 32 {
+        let float = matches!(op, DppAluOp::AddF32 | DppAluOp::SubF32 | DppAluOp::MulF32 | DppAluOp::MaxF32 | DppAluOp::MinF32);
+        let vb = if float { b.let_(Op::BitcastI32(Opnd::Val(v))) } else { v };
+        let f2 = b.permlane16_swap(vb, vb);
+        let (xa, xb) = (b.frag2_lane(f2, 0), b.frag2_lane(f2, 1));
+        let (xa, xb) = (b.let_(Op::BitcastI32(Opnd::Val(xa))), b.let_(Op::BitcastI32(Opnd::Val(xb))));
+        let tid = b.let_(Op::WorkitemId);
+        let l16 = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(16)));
+        let even = b.cmp(amdgpu_dsl::CmpPred::Eq, amdgpu_dsl::CmpTy::I32, l16, 0);
+        let p = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(even), a: Opnd::Val(xb), b: Opnd::Val(xa) });
+        let p = if float { b.let_(Op::BitcastF32(Opnd::Val(p))) } else { p };
+        let (a, c) = (Opnd::Val(v), Opnd::Val(p));
+        v = match op {
+            DppAluOp::AddF32 => b.let_(Op::AddF32(a, c)),
+            DppAluOp::MaxF32 => b.let_(Op::MaxF32(a, c)),
+            DppAluOp::MinF32 => b.let_(Op::Bin(amdgpu_dsl::BinOp::MinF32, a, c)),
+            DppAluOp::AddU32 => b.let_(Op::AddI32(a, c)),
+            _ => panic!("group_allreduce: op {op:?} with l = 32 not supported"),
+        };
+    }
+    v
 }
