@@ -452,12 +452,16 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, mask
     let mt = b.max_f32(pa, pb);
     let mt = b.mul_f32(mt, csc);
     // lazy rescale: the reference m moves only when the tile max passes it by more than 8 (log2 units: P <= 2^8, exact in fp32 / bf16);
-    // the rescale of O^T and l runs under that (divergent, usually empty) branch
+    // the rescale of O^T and l runs under a wave-level branch taken when ANY lane grows (DSL branches are wave level: every lane runs the
+    // body then); the body therefore moves each lane's reference to max(m, tile max) - a no-op (alpha = 1) for lanes that did not grow
+    // only when their tile max is below m, never an increase of more than 8 for them, and never towards -inf (masked tiles)
     let thr = b.c_f32(8.0);
     let mlim = b.add_f32(Opnd::Var(m_v), thr);
     let grow = b.cmp_lt_f32(mlim, mt);
+    let grow = b.any_lane(grow);
     b.begin_if(Opnd::Val(grow));
     {
+        let mt = b.max_f32(Opnd::Var(m_v), mt);
         let dm = b.sub_f32(Opnd::Var(m_v), mt);
         let alpha = b.exp2_f32(dm);
         let ad = b.frag2_dup(alpha);
