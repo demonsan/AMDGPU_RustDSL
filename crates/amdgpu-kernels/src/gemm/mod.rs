@@ -42,6 +42,27 @@ pub struct GemmConfig {
     pub lds_epilogue: bool,
     /// the quantization scheme of A and B
     pub scales: Scales,
+    /// operand element type (the LDS / register tile is 128 bytes of K either way)
+    pub elem: Elem,
+}
+
+/// Operand element type of the GEMM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Elem {
+    /// fp8 e4m3: one scaled `v_mfma_scale_f32_16x16x128_f8f6f4` per 16 x 16 block and 128-byte K tile
+    Fp8,
+    /// bf16: two `v_mfma_f32_16x16x32_bf16` per block and K tile (one per 16-byte half of the operand fragments; A and B halves share the K
+    /// permutation, so the sum is unchanged)
+    Bf16,
+}
+
+impl Elem {
+    fn bytes(self) -> i64 {
+        match self {
+            Elem::Fp8 => 1,
+            Elem::Bf16 => 2,
+        }
+    }
 }
 
 /// Scale scheme of the fp8 operands.
@@ -53,16 +74,26 @@ pub enum Scales {
     /// fp32 per row of A (per token, `ptr_sfa` [M]) and per row of B (per output channel, `ptr_sfb` [N]), applied to the accumulators in the
     /// epilogue; the MFMA runs with unit E8M0 scales (127)
     RowCol,
+    /// no scales (bf16 / fp16 operands)
+    None,
 }
 
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128 }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8 }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
         GemmConfig { scales: Scales::RowCol, ..GemmConfig::v4() }
+    }
+    /// bf16 A16W16 (`gemm_a16w16_bf16`): the v4 structure with bf16 MFMAs, no scales.
+    pub fn a16w16() -> GemmConfig {
+        GemmConfig { scales: Scales::None, elem: Elem::Bf16, ..GemmConfig::v4() }
+    }
+    /// bf16 A16W16 with a 128 x 128 CTA.
+    pub fn a16w16_128() -> GemmConfig {
+        GemmConfig { cta_m: 128, cta_n: 128, ..GemmConfig::a16w16() }
     }
     /// The same with a 128 x 128 CTA (4 waves of 64 x 64): 4x the CTAs for narrow M / N.
     pub fn a8w8_rowcol_128() -> GemmConfig {
@@ -97,10 +128,21 @@ fn smem_block() -> Layout {
 
 /// `gemm` on loop variables (the operands of the register-staged tile are loop-carried): same operand / scale exchange as `amdgpu_tile::gemm`.
 #[allow(clippy::too_many_arguments)]
-fn mma_var(b: &mut FnBuilder, mma: &TiledMma, acc: VarId, a: VarId, bf: VarId, sa: VarId, sb: VarId, byte_a: u8) {
+fn mma_var(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, acc: VarId, a: VarId, bf: VarId, sa: VarId, sb: VarId, byte_a: u8) {
     assert_eq!(mma.atom().name, "MfmaScale16x16x128F8");
     let (x, y, sx, sy, bx, by) = if mma.swap_ab { (bf, a, sb, sa, 0, byte_a) } else { (a, bf, sa, sb, byte_a, 0) };
-    b.var_mfma_scale16(acc, Opnd::Var(x), Opnd::Var(y), Opnd::Var(sx), Opnd::Var(sy), bx, by);
+    match elem {
+        Elem::Fp8 => b.var_mfma_scale16(acc, Opnd::Var(x), Opnd::Var(y), Opnd::Var(sx), Opnd::Var(sy), bx, by),
+        Elem::Bf16 => {
+            // the 32-byte fragment = two 16-byte bf16 operands (8 elements each), same K permutation for A and B
+            let k = amdgpu_dsl::MmaKind::new(amdgpu_dsl::MmaShape::M16N16K32, amdgpu_dsl::MmaTy::Bf16);
+            for h in 0..2u8 {
+                let xs = b.var_slice4(x, h);
+                let ys = b.var_slice4(y, h);
+                b.var_mfma(acc, k, xs, ys, false);
+            }
+        }
+    }
 }
 
 /// The 96-byte ABI (opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950), declared in offset order.
@@ -121,7 +163,7 @@ fn declare_abi(b: &mut FnBuilder) {
 /// The host contract of the ABI for a `cta_m x cta_n` CTA (what `gpu-verify` proves the accesses against): M = MT cta_m, N = NT cta_n, K = KT 128
 /// (the kernel has no partial tiles), the grid (NT, MT), dense strides (stride_a = stride_b = K, stride_c = N, stride_sfa = M, stride_sfb = K / 128),
 /// batch 1, and the tensor extents A M K, B N K (preshuffled, same size), C 2 M N, sa (K / 128) M, sb (N / 128) (K / 128) bytes.
-fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales) {
+fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, es: i64) {
     let (mt, nt, kt) = (Ext::sym("MT"), Ext::sym("NT"), Ext::sym("KT"));
     // int32 offsets: M K, N K and 2 M N stay below 2^31 (16384 x 65536 tiles of bytes at most)
     b.sym_range("MT", 1, (1 << 14) / cta_m);
@@ -130,13 +172,15 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales) {
     b.sym_range("KT", 1, PANEL_KB);
     let m = mt.clone() * Ext::c(cta_m);
     let n = nt.clone() * Ext::c(cta_n);
+    // K in elements (kernarg) and in bytes (extents): KT tiles of 128 bytes
     let k = kt.clone() * Ext::c(128);
+    let k_el = kt.clone() * Ext::c(128 / es);
     b.ka_is(24, m.clone());
     b.ka_is(28, n.clone());
-    b.ka_is(32, k.clone());
+    b.ka_is(32, k_el.clone());
     b.ka_is(36, Ext::c(1));
-    b.ka_is(40, k.clone());
-    b.ka_is(44, k.clone());
+    b.ka_is(40, k_el.clone());
+    b.ka_is(44, k_el);
     b.ka_is(48, n.clone());
     b.ka_is(80, m.clone());
     b.ka_is(84, kt.clone());
@@ -154,6 +198,7 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales) {
             b.arg_tensor("ptr_sfa", Ext::c(4) * m);
             b.arg_tensor("ptr_sfb", Ext::c(4) * n);
         }
+        Scales::None => {}
     }
 }
 
@@ -353,7 +398,7 @@ impl Body {
                 }
                 if n >= from {
                     let (w, by) = self.sa_sel(i);
-                    mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
+                    mma_var(b, &self.mma, self.cfg.elem, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
                 }
                 n += 1;
             }
@@ -363,7 +408,7 @@ impl Body {
     /// The scale words of tile `kb` from the transposed panel: the 8 A-scale bytes of this lane (one ds_read_b64; the MMA selects byte i % 4 of
     /// word i / 4: `sa_sel`) and the B scale (the dword-expanded panel: byte 0, no shift).
     fn load_scales(&self, b: &mut FnBuilder, kb: I32) -> (Vec<ValueId>, ValueId) {
-        if self.cfg.scales == Scales::RowCol {
+        if self.cfg.scales != Scales::Mx128 {
             // unit E8M0 scales (127 in every byte): the fp32 row / column scales are applied in the epilogue
             let (u, v) = self.unit.expect("unit scales");
             return (vec![u, u], v);
@@ -439,7 +484,7 @@ impl Body {
                             continue; // issued before the barrier (pre_sync / post_wait)
                         }
                         let (w, by) = self.sa_sel(i);
-                        u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by));
+                        u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.cfg.elem, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by));
                     }
                     if let (true, Some((ar, _))) = (lo == half, &next) {
                         // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
@@ -629,6 +674,8 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_mxfp8_bs_v4" => Some(gemm_mxfp8_bs_v4()),
         "gemm_a8w8_rowcol_fp8" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8", GemmConfig::a8w8_rowcol())),
         "gemm_a8w8_rowcol_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128", GemmConfig::a8w8_rowcol_128())),
+        "gemm_a16w16_bf16" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16", GemmConfig::a16w16())),
+        "gemm_a16w16_bf16_128" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128", GemmConfig::a16w16_128())),
         _ => None,
     }
 }
@@ -685,7 +732,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         b.sched_opts(cfg.sched);
     }
     declare_abi(b);
-    declare_contract(b, cta_m, cta_n, cfg.scales);
+    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.bytes());
     // timing stamps (opt-in debug build, GEMM_STAMP=ends|tiles): one extra pointer argument after the ABI (offset 96); see docs/stamps.md
     let stamp_mode = std::env::var("GEMM_STAMP").ok().filter(|v| v == "ends" || v == "tiles");
     if stamp_mode.is_some() {
@@ -699,7 +746,9 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let ptr_sfb = b.let_(Op::KernargPtr { offset: 72 });
     let m_v = b.let_(Op::KernargI32 { offset: 24 });
     let n_v = b.let_(Op::KernargI32 { offset: 28 });
-    let k_v = b.let_(Op::KernargI32 { offset: 32 });
+    let k_el = b.let_(Op::KernargI32 { offset: 32 });
+    // K in bytes (the tiles are 128 bytes of K)
+    let k_v = if cfg.elem.bytes() == 1 { k_el } else { b.bind_i32(ev(k_el) * (cfg.elem.bytes() as i32)) };
     let kb_v = b.let_(Op::KernargI32 { offset: 84 });
     let tid = b.let_(Op::WorkitemId);
     let lane = Lane::from_tid(b, tid);
@@ -793,7 +842,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
             { let n = b.bind_i32(ev(m_v) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
             { let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
         ),
-        Scales::RowCol => (
+        Scales::RowCol | Scales::None => (
             { let n = b.bind_i32(ev(m_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
             { let n = b.bind_i32(ev(n_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
         ),
@@ -843,7 +892,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32(x + &a_wo)).collect();
     b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32(x + &b_wo)).collect();
     let zero4 = b.frag_zero(DType::Frag4);
-    let unit = (cfg.scales == Scales::RowCol).then(|| (b.bind_i32(lane.lane().lshr(6) + 0x7F7F_7F7F), b.bind_i32(lane.lane().lshr(6) + 0x7F)));
+    let unit = (cfg.scales != Scales::Mx128).then(|| (b.bind_i32(lane.lane().lshr(6) + 0x7F7F_7F7F), b.bind_i32(lane.lane().lshr(6) + 0x7F)));
     let body = Body {
         cfg, kb_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
         a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit,
