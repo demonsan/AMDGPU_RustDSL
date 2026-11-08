@@ -389,3 +389,19 @@ pub fn rotate(b: &mut FnBuilder, parts: &[Part], stage: RotStage, order: Option<
         None => w.seq().emit(b),
     }
 }
+
+/// EXPERIMENT: a random topological order of the units (seeded LCG among the ready units).
+pub fn random_topo(units: &Units, seed: u64) -> Vec<UnitId> {
+    let n = units.len();
+    let mut placed = vec![false; n];
+    let mut ord = Vec::with_capacity(n);
+    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    while ord.len() < n {
+        let ready: Vec<UnitId> = (0..n).filter(|&i| !placed[i] && units.unit(i).deps.iter().all(|&d| placed[d])).collect();
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let pick = ready[((s >> 33) as usize) % ready.len()];
+        placed[pick] = true;
+        ord.push(pick);
+    }
+    ord
+}

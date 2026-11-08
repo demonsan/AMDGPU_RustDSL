@@ -1590,7 +1590,8 @@ impl FnBuilder {
     /// slice / bitcast of it, no instruction of its own) is also a READ of the variable: the user reads the registers at its own position.
     pub fn facts(&self, c: &Captured) -> Vec<facts::Facts> {
         let mut fs = c.facts(&self.f);
-        for f in fs.iter_mut() {
+        let noviews = std::env::var("AMDC_EXP_NOVIEWS").is_ok();
+        for f in fs.iter_mut().filter(|_| !noviews) {
             for u in f.uses.clone() {
                 if let Some(vs) = self.views.get(&u) {
                     for v in vs {

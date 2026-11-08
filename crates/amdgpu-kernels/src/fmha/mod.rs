@@ -509,10 +509,17 @@ impl PipeBody for AttnBody3<'_> {
         // the window = stage `online.softmax` (conversion chunks of tile t) woven with stage `mma.qk` (blocks of tile t + 1), alternating
         let c = StageContract { barrier_phase: StageContract::ANY_PHASE, roles: vec!["group".into()], scalars_in: bound, ..Default::default() };
         let (nx, staged) = (t.next.clone(), t.staged);
-        amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "window", c, u)
+        let inst = amdgpu_tile::stage::StageInst::new("online.softmax", amdgpu_tile::stage::Prim::O, "window", c, u)
             .param("with", "mma.qk blocks")
-            .handover(move |_b| (Vec::new(), if staged { nx.offset_scalars() } else { Vec::new() }))
-            .emit(b);
+            .handover(move |_b| (Vec::new(), if staged { nx.offset_scalars() } else { Vec::new() }));
+        match std::env::var("AMDC_EXP_FINE_SEED").ok().and_then(|s| s.parse::<u64>().ok()) {
+            Some(seed) => inst.emit_with(b, |w| {
+                let w = w.fine();
+                let ord = amdgpu_tile::weave::random_topo(w.units(), seed);
+                w.order(ord)
+            }),
+            None => inst.emit(b),
+        }
         if !lazy {
             if let Opnd::Val(v) = nb {
                 self.sm.commit_bias(b, v);
