@@ -315,7 +315,7 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | groupnorm（`groupnorm.cu`，视觉模型） | 缺 | 非推理热路径（LLM 推理里用不到），按需再做 |
 | 量化 | per-token / per-group128 / static fp8，int8 per-token，dequant | 有 | 见前文 |
 | | mxfp4 / mxfp8 量化（`quant_mxfp4.cu`，E8M0 缩放，32 元素块） | 有（Main，kernel-opt） | `quant_mxfp4_bf16_k<K>`、`quant_mxfp8_bf16_k<K>`（`rows/mxquant.rs`，不在本分支，合入 Main 后可用） |
-| | mxfp6 量化 | 缺 | 与 mxfp4 同构（e2m3 / e3m2 打包），使用面窄 |
+| | **mxfp6 量化**（OCP MX，e2m3 / e3m2） | 有（新，通用布局） | `quant_mxfp6_{e2m3,e3m2}_bf16_k<K>`：32 元素一组、E8M0 scale，q 为 `[M][K/32][24 字节]`（每组 32 个 6 位码，码 j 在第 `6j` 位起），scale `[M][K/32]` 行主序；2.9 TB/s。**不是** aiter `quant_mxfp6_gemm` 的分块 + Hadamard 旋转布局（那是 GEMM 专用的预处理，未做） |
 | | **融合进 norm 的 mxfp4 量化**（`fused_rms_mxfp4_quant`） | 有（新） | `rmsnorm_quant_mxfp4_bf16_k<K>`：RMSNorm（f32，不经过 bf16 中间值）后直接按 `quant_mxfp4_bf16_k<K>` 的规则（kernel-opt 的 amax 舍入、E8M0、`v_cvt_scalef32_pk_fp4_f32`）量化，输出 fp4 `[M][K/2]` 和 shuffled a4w4 scale 布局；K % 512 = 0，≤ 16384，M % 16 = 0；K = 2048 / 4096 / 7168 都是 2.7 – 2.8 TB/s（只计一次 x 读 + q + scales） |
 | 融合激活 | silu_mul / gelu_tanh_mul（`[M][2D]`） | 有 | `silu_mul_bf16_d<D>`、`gelu_tanh_mul_bf16_d<D>`（6.5 TB/s） |
 | | silu_mul + fp8 量化 | 有 | `silu_mul_quant_fp8_d<D>` |
@@ -413,3 +413,8 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 ### 变长序列的调度表（`_sched`）
 
 `causal_conv1d_fwd_bf16_w<W>[_silu]_sched` / `causal_conv1d_fwd_split_bf16_w<W>[_silu]_sched`：和 aiter 一样，由调用方给出每个非空块的 (序列, 块序号) 表，网格是 `(⌈dim / 2048⌉, NC, 1)`，没有块在序列末尾之外空转。ABI 在原有基础上加：`sched_seq` @(slots + 8)、`sched_chunk` @(slots + 16)（i32 `[NC]`）、`nc` @(slots + 24)、`nseq` @(slots + 28)（= B，用来给 per-sequence 数组的描述符定尺寸，这样范围可证明）。B = 256、长度从 1 到 1024 的随机混合（T = 67932、dim = 8192、silu）：网格版 0.99 TB/s，`_sched` 版 **2.66 TB/s**（2.7 倍）；输出与最终状态与 CPU 参考一致，`gpu_verify --strict` 0 错误。
+
+
+## MXFP6 量化
+
+`quant_mxfp6_e2m3_bf16_k<K>`（fp6 e2m3，最大 7.5，共享指数 = floor(log2 amax) − 2）与 `quant_mxfp6_e3m2_bf16_k<K>`（e3m2，最大 28，−4），K % 256 = 0。一个 lane 量化一组 32 个元素：4 次 b128 加载，`v_cvt_scalef32_2xpk16_fp6_f32`（backend 新增的 `CvtOp::Scale2xPk16{Fp6,Bf6}F32`，两个 16 dword 的源会交错：偶数元素放第一个源、奇数元素放第二个源，码的顺序才是元素顺序），192 位结果存三个 b64，scale 字节存一个 u8。转换指令饱和并按最近偶数舍入。ABI：x @0、q @8、scale @16、M @24；网格 `(⌈K / 32 / 256⌉, M)` × 256 线程。主机测试 `tests/gpu/mxfp6_host.cpp`（CPU 参考：scale 字节必须一致，每个 6 位码解码后在半步长以内，含 4 倍离群值使 amax 变化）：K = 1024 / 4096 / 4352 / 7168，两种格式 `bad = 0`；`gpu_verify --strict` 0 错误，80 VGPR；K = 4096、M = 32768 约 129 µs（2.9 TB/s）。
