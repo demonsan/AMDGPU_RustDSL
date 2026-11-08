@@ -142,3 +142,7 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 | `quant_token_bf16_int8_n<N>` | per-token int8：`scale = max|x| / 127`，`q = clamp(rne(x / scale), −127, 127)` | — | N = 4096：6305；N = 1000：5366 |
 
 **一个会踩的坑（已告知 backend）**：`v_cvt_scalef32_pk_{bf16,f16,f32}_fp8` 的 scale 操作数只用到指数（E8M0 风格的 2 的幂）：给 1.63 的效果是 1.0（我们的参考对拍直接发现：输出等于未缩放的 fp8 值）。所以任意 f32 scale 的反量化 = 普通的 fp8 → f32 转换（`PkF32Fp8`）后再乘 scale、再打包成 bf16；`ScalePk…` 转换适用于 mx 格式（E8M0 的 2 的幂 scale）。dequant 内核因此多一次乘法，仍是带宽受限。
+
+## 行内族：行保持打包（寄存器压力）
+
+行内 kernel（rmsnorm / add_rmsnorm / layernorm / softmax）的行在各遍之间保持 bf16 打包（每个 chunk 4 个 dword），在用到的地方再展开成 f32（每对元素两条移位 / 掩码），而不是把 f32 常驻寄存器。VGPR：rmsnorm N = 4096：124 → 92，add_rmsnorm：156 → 120，layernorm N = 4096：160 → 128，softmax N = 8192：160 → 156。带宽变化（`nt` 之后的前后，GB/s）：rmsnorm N = 4096：5915 → 6010，N = 1000：5716 → 5900；add_rmsnorm：5900 → 5804；layernorm N = 4096 / 776：5348 / 4760 → 5333 / 4552；softmax N = 4096 / 1000 / 8192：5893 / 5658 / 5483 → 5952 / 5647 / 5498。结论：占用不是这几个 kernel 的主要限制（变化在 ±4 % 内，有升有降）；剩下的差距来自每行 2 次分组归约的串行延迟链和 VALU，下一步是 DPP 行操作（backend 的 A4）与 packed f32 数学，而不是寄存器。
