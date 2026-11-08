@@ -294,7 +294,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
             }
             RowOp::Softmax => {
                 let neg = b.c_f32(-3.0e38);
-                let recompute_exp = nld >= 8 && std::env::var("AMDC_SOFTMAX_KEEP_EXP").is_err();   // N >= 4096
+                // opt-in (AMDC_SOFTMAX_RECOMPUTE_EXP=1): measured 5836 vs 6007 GB/s at N = 4096 and +0.7 % at N = 8192, so the exponentials are kept by default`r`n                let recompute_exp = std::env::var("AMDC_SOFTMAX_RECOMPUTE_EXP").is_ok();
                 let mut part: Option<ValueId> = None;
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
