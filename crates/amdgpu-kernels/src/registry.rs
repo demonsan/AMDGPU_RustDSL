@@ -53,6 +53,13 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),
+        "fmha_fwd_hd128_bf16" => Some(crate::fmha::bf16::fmha_fwd_hd128_bf16("fmha_fwd_hd128_bf16", false)),
+        "fmha_fwd_hd128_bf16_causal" => Some(crate::fmha::bf16::fmha_fwd_hd128_bf16("fmha_fwd_hd128_bf16_causal", true)),
+        n if n.starts_with("fmha_fwd_hd") && n.contains("_bf16") => {
+            // fmha_fwd_hd<64|128|256>_bf16[_causal][_swa][_group]
+            let d = n["fmha_fwd_hd".len()..].split('_').next().and_then(|s| s.parse::<i32>().ok())?;
+            matches!(d, 64 | 128 | 256).then(|| crate::fmha::bf16::fmha_fwd_bf16(n, crate::fmha::bf16::AttnCfg { d, causal: n.contains("_causal"), swa: n.contains("_swa"), group: n.contains("_group") }))
+        }
         "fmha_fwd_hd128_mxfp8_v3_kvsplit" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit()),
         "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h()),
         // scheduler-token A/B variants of the shipped kernels (same code + `Function::sched_opts` tokens on top of the kernel's own preset; no env knobs):
