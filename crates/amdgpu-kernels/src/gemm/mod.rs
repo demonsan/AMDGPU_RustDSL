@@ -329,7 +329,7 @@ fn declare_abi(b: &mut FnBuilder) {
 /// batch 1, and the tensor extents A M K, B N K (preshuffled, same size), C 2 M N, sa (K / 128) M, sb (N / 128) (K / 128) bytes.
 fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool, moe: Option<MoeStage>, conv: Option<ConvCfg>) {
     if let Some(cc) = conv {
-        return declare_contract_conv(b, cta_m, cta_n, cc, split);
+        return declare_contract_conv(b, cta_m, cta_n, cc);
     }
     if let Some(st) = moe {
         return declare_contract_moe(b, cta_m, cta_n, scales, per_tile, st);
@@ -398,7 +398,7 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, p
 
 /// The implicit-GEMM conv contract (bf16): M = NB OD OH OW rows (the last M tile partial), N = NT cta_n output channels, C = 64 CB input
 /// channels, K = C T R S; tensors: input NB DI H W C, weights N K, output M N (bf16).
-fn declare_contract_conv(b: &mut FnBuilder, cta_m: i64, cta_n: i64, cc: ConvCfg, split: bool) {
+fn declare_contract_conv(b: &mut FnBuilder, cta_m: i64, cta_n: i64, cc: ConvCfg) {
     for (n, o) in [("NB", 96u32), ("DI", 100), ("H", 104), ("W", 108), ("C", 112), ("OD", 116), ("OH", 120), ("OW", 124)] {
         b.arg(n, DType::I32, o, 4);
     }
@@ -417,31 +417,17 @@ fn declare_contract_conv(b: &mut FnBuilder, cta_m: i64, cta_n: i64, cc: ConvCfg,
     b.ka_is(24, m.clone());
     b.ka_is(28, n.clone());
     b.ka_is(32, k_el.clone());
+    b.ka_is(36, Ext::c(1));
     b.ka_is(40, k_el.clone());
     b.ka_is(44, k_el);
     b.ka_is(48, n.clone());
     b.ka_is(80, m.clone());
+    b.ka_is(84, kt.clone());
     b.grid_is(0, Ext::sym("NT"));
     b.grid_is(1, m.clone().ceil_div(cta_m));
-    b.arg_tensor("ptr_a", Ext::ka(96) * Ext::ka(100) * Ext::ka(104) * Ext::ka(108) * cb.clone() * Ext::c(128));
-    b.arg_tensor("ptr_b", n.clone() * kt.clone() * Ext::c(128));
-    if split {
-        // split-K: KT = S KS (the channel blocks CB = S KS / TRS), fp32 partials [S][MP][N] with MP = M rounded up to the CTA
-        b.sym_range("S", 1, 16);
-        b.sym_range("KS", 1, 4096);
-        b.ka_is(84, Ext::sym("S") * Ext::sym("KS"));
-        b.ka_is(36, Ext::sym("S"));
-        b.ka_is(88, Ext::sym("KS"));
-        let mp = m.clone().ceil_div(cta_m) * Ext::c(cta_m);
-        b.ka_is(92, mp.clone());
-        b.grid_is(2, Ext::sym("S"));
-        b.arg_tensor("ptr_c", Ext::sym("S") * mp * n * Ext::c(4));
-        let _ = kt;
-    } else {
-        b.ka_is(36, Ext::c(1));
-        b.ka_is(84, kt);
-        b.arg_tensor("ptr_c", m * n * Ext::c(2));
-    }
+    b.arg_tensor("ptr_a", Ext::ka(96) * Ext::ka(100) * Ext::ka(104) * Ext::ka(108) * cb * Ext::c(128));
+    b.arg_tensor("ptr_b", n.clone() * kt * Ext::c(128));
+    b.arg_tensor("ptr_c", m * n * Ext::c(2));
 }
 
 /// The MoE contract: MT = max M tiles (grid y), NT = output N tiles (grid x), A rows m (tokens or tokens x topk), B rows per expert n, E
@@ -991,11 +977,7 @@ impl Body {
                         assert_eq!((x * m) >> 24, x / d as i64, "conv: multiply-shift by {d}");
                     }
                 }
-                // (split-K: the split's first tile zb shifts the K tile index)
-                let t = match self.zb {
-                    Some(zb) => b.bind_i32(key0.clone().lshr(7) + ev(zb)),
-                    None => b.bind_i32(key0.clone().lshr(7)),
-                };
+                let t = b.bind_i32(key0.clone().lshr(7));
                 let cb = b.bind_i32((ev(t) * magic(trs) as i32).lshr(24));
                 let tap = b.bind_i32(ev(t) - ev(cb) * trs);
                 let dz = b.bind_i32((ev(tap) * magic(rs) as i32).lshr(24));
@@ -1169,10 +1151,7 @@ pub fn by_name(name: &str) -> Option<Function> {
             let r = body.split('r').nth(1)?.split('s').next()?.parse().ok()?;
             let s = body.split('s').nth(1)?.split('_').next()?.parse().ok()?;
             let cc = ConvCfg { t, r, s, stride: num("_st", 1)?, pad: num("_p", 0)?, dil: num("_d", 1)? };
-            // `_c128`: 128 x 128 CTAs; `_c128_sk`: + split-K (fp32 partials + gemm_splitk_reduce_s<S>)
-            let sk = n.ends_with("_c128_sk");
-            let cfg = GemmConfig::conv(cc, if n.ends_with("_c128") || sk { 128 } else { 256 });
-            Some(gemm_mxfp8_bs(n, if sk { cfg.splitk() } else { cfg }))
+            Some(gemm_mxfp8_bs(n, GemmConfig::conv(cc, if n.ends_with("_c128") { 128 } else { 256 })))
         }
         n if n.starts_with("gemm_moe") => {
             // gemm_moe<1|2>_<bf16|fp8>[_silu|_gelu][_dw]
