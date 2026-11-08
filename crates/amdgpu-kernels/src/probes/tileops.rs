@@ -521,3 +521,81 @@ pub fn probe_cvt_p1() -> Function {
     }
     b.finish()
 }
+
+/// DPP cases of `probe_dpp_p1`: (name, ctrl, row_mask, bank_mask, bound_zero, ALU op or None for v_mov_b32_dpp).
+pub fn dpp_p1_cases() -> Vec<(amdgpu_dsl::Dpp, Option<amdgpu_dsl::DppAluOp>)> {
+    use amdgpu_dsl::{Dpp, DppAluOp as A, DppCtrl as C};
+    let d = Dpp::new;
+    let mut v: Vec<(Dpp, Option<A>)> = [
+        C::QuadPerm([3, 2, 1, 0]),
+        C::RowShl(1),
+        C::RowShr(3),
+        C::RowRor(5),
+        C::WaveShl1,
+        C::WaveRol1,
+        C::WaveShr1,
+        C::WaveRor1,
+        C::RowMirror,
+        C::RowHalfMirror,
+        C::RowBcast15,
+        C::RowBcast31,
+    ]
+    .into_iter()
+    .map(|c| (d(c), None))
+    .collect();
+    v.push((Dpp { bound_zero: true, ..d(C::RowShr(1)) }, None));
+    v.push((Dpp { row_mask: 0xa, ..d(C::RowBcast15) }, None));
+    v.push((Dpp { bank_mask: 0x5, ..d(C::RowShr(2)) }, None));
+    v.push((d(C::RowShr(1)), Some(A::AddU32)));
+    v.push((Dpp { row_mask: 0xc, ..d(C::RowBcast31) }, Some(A::MaxI32)));
+    v.push((Dpp { bound_zero: true, ..d(C::RowShr(4)) }, Some(A::AddF32)));
+    v.push((d(C::QuadPerm([1, 0, 3, 2])), Some(A::MinU32)));
+    v.push((d(C::RowHalfMirror), Some(A::XorB32)));
+    v
+}
+
+/// `probe_dpp_p1(in, out)`: every case of `dpp_p1_cases` on per-lane x (plane 0), y (plane 1), floats fx (plane 2), fy (plane 3), with
+/// old = 0xDEAD0000 + lane; then permlane16_swap(x, y) (2 planes).
+pub fn probe_dpp_p1() -> Function {
+    let cases = dpp_p1_cases();
+    let mut b = FnBuilder::new("probe_dpp_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(4 * 256));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(((cases.len() + 2) * 256) as i64));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    let x = b.load_global(pin, 0, amdgpu_dsl::MemTy::B32);
+    let y = b.load_global(pin, 256, amdgpu_dsl::MemTy::B32);
+    let fx = { let t = b.load_global(pin, 512, amdgpu_dsl::MemTy::B32); b.let_(Op::BitcastF32(Opnd::Val(t))) };
+    let fy = { let t = b.load_global(pin, 768, amdgpu_dsl::MemTy::B32); b.let_(Op::BitcastF32(Opnd::Val(t))) };
+    let old = b.add_i32(tid, 0xDEAD0000u32 as i32);
+    let mut k = 0u32;
+    let mut put = |b: &mut FnBuilder, v: ValueId| {
+        let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((256 * (k / 8 * 8)) as i32) });
+        b.store_global(base, 256 * (k % 8), v, amdgpu_dsl::MemTy::B32, false);
+        k += 1;
+    };
+    for (dpp, op) in cases {
+        let r = match op {
+            None => b.dpp(dpp, x, old),
+            Some(o @ amdgpu_dsl::DppAluOp::AddF32) => {
+                let of = b.let_(Op::BitcastF32(Opnd::Val(old)));
+                let r = b.dpp_alu(o, dpp, fx, fy, of);
+                b.let_(Op::BitcastI32(Opnd::Val(r)))
+            }
+            Some(o) => b.dpp_alu(o, dpp, x, y, old),
+        };
+        put(&mut b, r);
+    }
+    let s = b.permlane16_swap(x, y);
+    for i in 0..2 {
+        let v = b.let_(Op::Frag2Lane { frag: Opnd::Val(s), index: i });
+        put(&mut b, v);
+    }
+    b.finish()
+}
