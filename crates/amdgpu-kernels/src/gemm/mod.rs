@@ -59,6 +59,9 @@ pub struct GemmConfig {
     pub batched: bool,
     /// with `Scales::RowCol`: per-TENSOR scales (`_pt`): `ptr_sfa` / `ptr_sfb` each one fp32 (A and B scale), applied in the epilogue
     pub per_tensor: bool,
+    /// MoE gpt-oss form (`_oss`): per-expert fp32 bias at kernarg 144 (stage 1 [E][2 n_out] gate then up; stage 2 [E][n_out]); stage 1's
+    /// activation is the clamped swiglu (gate = min(g + bg, 7), up = clamp(u + bu, -7, 7), y = (up + 1) gate sigmoid(1.702 gate))
+    pub moe_bias: bool,
 }
 
 /// Implicit-GEMM convolution, NDHWC input [NB, DI, H, W, C] bf16 (2d: DI = 1, kernel depth 1), weights [K][C / 64][T][R][S][64] (the 128-byte
@@ -181,7 +184,7 @@ pub enum Scales {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None, scale_shuf: false, batched: false, per_tensor: false, moe_bias: false }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -438,12 +441,12 @@ fn declare_abi(b: &mut FnBuilder) {
 /// The host contract of the ABI for a `cta_m x cta_n` CTA (what `gpu-verify` proves the accesses against): M = MT cta_m, N = NT cta_n, K = KT 128
 /// (the kernel has no partial tiles), the grid (NT, MT), dense strides (stride_a = stride_b = K, stride_c = N, stride_sfa = M, stride_sfb = K / 128),
 /// batch 1, and the tensor extents A M K, B N K (preshuffled, same size), C 2 M N, sa (K / 128) M, sb (N / 128) (K / 128) bytes.
-fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool, moe: Option<MoeStage>, conv: Option<ConvCfg>, batched: bool, per_tensor: bool, a8w4: usize) {
+fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool, moe: Option<MoeStage>, conv: Option<ConvCfg>, batched: bool, per_tensor: bool, a8w4: usize, moe_bias: bool) {
     if let Some(cc) = conv {
         return declare_contract_conv(b, cta_m, cta_n, cc);
     }
     if let Some(st) = moe {
-        return declare_contract_moe(b, cta_m, cta_n, scales, per_tile, st);
+        return declare_contract_moe(b, cta_m, cta_n, scales, per_tile, st, moe_bias);
     }
     let (mt, nt) = (Ext::sym("MT"), Ext::sym("NT"));
     // int32 offsets: M K, N K and 2 M N stay below 2^31 (16384 x 65536 tiles of bytes at most)
@@ -556,7 +559,10 @@ fn declare_contract_conv(b: &mut FnBuilder, cta_m: i64, cta_n: i64, cc: ConvCfg)
 
 /// The MoE contract: MT = max M tiles (grid y), NT = output N tiles (grid x), A rows m (tokens or tokens x topk), B rows per expert n, E
 /// experts, KT 128-byte K tiles.
-fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, st: MoeStage) {
+fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, st: MoeStage, moe_bias: bool) {
+    if moe_bias {
+        b.arg("ptr_bias", DType::Ptr, 144, 8);
+    }
     for (n, o) in [("ptr_sorted_ids", 96u32), ("ptr_sorted_expert_ids", 104), ("ptr_num_valid_ids", 112), ("ptr_sorted_weights", 120)] {
         b.arg(n, DType::Ptr, o, 8);
     }
@@ -593,6 +599,9 @@ fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scale
     b.grid_is(1, mt.clone());
     b.arg_tensor("ptr_a", m.clone() * k.clone());
     b.arg_tensor("ptr_b", ee.clone() * n.clone() * k);
+    if moe_bias {
+        b.arg_tensor("ptr_bias", ee.clone() * n.clone() * Ext::c(4));
+    }
     let out_rows = Ext::ka(140) * Ext::ka(128);
     b.arg_tensor("ptr_c", out_rows * n_out * Ext::c(if matches!(st, MoeStage::Up { .. } | MoeStage::DownH) { 2 } else { 4 }));
     b.arg_tensor("ptr_sorted_ids", mt.clone() * Ext::c(4 * cta_m));
@@ -1373,6 +1382,8 @@ pub fn by_name(name: &str) -> Option<Function> {
             };
             // `_bm64` suffix: block_m 64 (64-row tiles, sparse experts)
             let (n0, bm64) = match n.strip_suffix("_bm64") { Some(x) => (x, true), None => (n, false) };
+            // `_oss`: gpt-oss bias + clamped swiglu (stage 1) / bias (stage 2)
+            let (n0, oss) = match n0.strip_suffix("_oss") { Some(x) => (x, true), None => (n0, false) };
             let st = if n0.starts_with("gemm_moe1") {
                 MoeStage::Up { gelu: n0.contains("_gelu"), doweight: n0.ends_with("_dw") }
             } else if n0.ends_with("_h") {
@@ -1381,6 +1392,7 @@ pub fn by_name(name: &str) -> Option<Function> {
                 MoeStage::Down
             };
             let cfg = GemmConfig::moe(elem, scales, st);
+            let cfg = GemmConfig { moe_bias: oss, ..cfg };
             Some(gemm_mxfp8_bs(n, if bm64 { GemmConfig { cta_m: 64, ..cfg } } else { cfg }))
         }
         n if n.starts_with("gemm_splitk_reduce_s") => {
@@ -1472,7 +1484,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         b.sched_opts(cfg.sched);
     }
     declare_abi(b);
-    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k, cfg.moe, cfg.conv, cfg.batched, cfg.per_tensor, cfg.elem.a_images());
+    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k, cfg.moe, cfg.conv, cfg.batched, cfg.per_tensor, cfg.elem.a_images(), cfg.moe_bias);
     // timing stamps (opt-in debug build, GEMM_STAMP=ends|tiles): one extra pointer argument after the ABI (offset 96); see docs/stamps.md
     let stamp_mode = std::env::var("GEMM_STAMP").ok().filter(|v| v == "ends" || v == "tiles");
     if stamp_mode.is_some() {
@@ -2072,6 +2084,19 @@ fn moe_epilogue(
     };
     let l2e = b.c_f32(std::f32::consts::LOG2_E);
     let one = b.c_f32(1.0);
+    // gpt-oss (`moe_bias`): the expert's fp32 bias row(s) (stage 1: [2 n_out] gate then up; stage 2: [n_out]), base moved per expert
+    let rsrc_bias = cfg.moe_bias.then(|| {
+        let p = b.let_(Op::KernargPtr { offset: 144 });
+        let n = { let v = b.bind_i32(ev(mc.nout) * if up { 8 } else { 4 }); b.read_first_lane(v) };
+        let pe = b.ptr_mad(p, mc.e, n);
+        b.buffer_desc_dyn(pe, n)
+    });
+    let bias4 = |b: &mut FnBuilder, col: ValueId, plus: Option<ValueId>| -> Vec<ValueId> {
+        let rs = rsrc_bias.expect("bias");
+        let a = match plus { Some(p) => b.bind_i32((ev(col) + ev(p)) << 2), None => b.bind_i32(ev(col) << 2) };
+        let f = b.buffer_load_b128(rs, a, 0i32, 0);
+        (0..4u8).map(|k| { let x = b.frag4_lane(f, k); b.bitcast_f32(x) }).collect()
+    };
     for i in 0..nm {
         let sr = b.bind_i32(ev(wm) * (wave_m as i32) + 16 * i as i32 + ev(rl));
         let vo = b.bind_i32(ev(sr) << 2);
@@ -2118,9 +2143,36 @@ fn moe_epilogue(
                         u[k] = b.mul_f32(u[k], su);
                     }
                 }
+                if cfg.moe_bias {
+                    // gpt-oss: + bias (gate cols, up cols at + n_out)
+                    let bg = bias4(b, col, None);
+                    let bu = bias4(b, col, Some(mc.nout));
+                    for k in 0..4 {
+                        g[k] = b.add_f32(g[k], bg[k]);
+                        u[k] = b.add_f32(u[k], bu[k]);
+                    }
+                }
                 let y: Vec<ValueId> = (0..4)
                     .map(|k| {
-                        let a = if gelu {
+                        let a = if cfg.moe_bias {
+                            // gpt-oss clamped swiglu: gate = min(g, 7), up = clamp(u, -7, 7), (up + 1) gate sigmoid(1.702 gate)
+                            let lim = b.c_f32(7.0);
+                            let nlim = b.c_f32(-7.0);
+                            let gc = b.min_f32(g[k], lim);
+                            let uc = b.min_f32(u[k], lim);
+                            let uc = b.max_f32(uc, nlim);
+                            let zf = b.c_f32(0.0);
+                            let ng = b.sub_f32(zf, gc);
+                            let alpha_l2e = b.c_f32(1.702 * std::f32::consts::LOG2_E);
+                            let x = b.mul_f32(ng, alpha_l2e);
+                            let ex = b.exp2_f32(x);
+                            let den = b.add_f32(ex, one);
+                            let r = b.rcp_f32(den);
+                            let glu = b.mul_f32(gc, r);
+                            let up1 = b.add_f32(uc, one);
+                            u[k] = up1;
+                            glu
+                        } else if gelu {
                             // gelu (tanh form): g (1 - 1 / (exp(2 t) + 1)), t = 0.7978845608 (g + 0.044715 g^3)
                             let g2 = b.mul_f32(g[k], g[k]);
                             let c1 = b.c_f32(0.044715);
@@ -2163,10 +2215,15 @@ fn moe_epilogue(
                 let col = b.bind_i32(ev(col0) + 16 * j as i32);
                 let mut v = vals(b, nn * i + j);
                 let ws = xs.map(|_| wsc(b, col));
+                let bs2 = cfg.moe_bias.then(|| bias4(b, col, None));
                 for k in 0..4 {
                     if let (Some(xs), Some(ws)) = (xs, &ws) {
                         let s = b.mul_f32(xs, ws[k]);
                         v[k] = b.mul_f32(v[k], s);
+                    }
+                    if let Some(bs2) = &bs2 {
+                        // gpt-oss stage 2: + the expert's output bias (before the routing weight)
+                        v[k] = b.add_f32(v[k], bs2[k]);
                     }
                     let y = b.mul_f32(v[k], sw);
                     v[k] = if half_out { y } else { b.bitcast_i32(y) };
