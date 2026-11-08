@@ -189,6 +189,7 @@ int main(int argc, char** argv) {
             for (size_t x = 0; x < y2.size(); x++) { diff += y2[x] != y1[x]; zero += y2[x] == 0; }
             printf("repeat %d: differs from run 0 at %ld, zeros %ld of %zu\n", r, diff, zero, y2.size());
         }
+        if (envi("USE_REPEAT", 0)) y1 = y2;
     }
     if (envi("GEMMONLY", 0) && !fp8 && TK == 1) {
         // the Down kernel on the stage-1 operands: T[t][r] = X[t] . W1i[e][r] (all 2I interleaved rows), unit weights
