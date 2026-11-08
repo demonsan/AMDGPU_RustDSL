@@ -330,7 +330,9 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | mrope（3D 位置）、yarn / 缩放表 | 缺（表由调用方预计算） | 表是 `cos_sin [P][D]` 输入，yarn 只是换表，无需新 kernel；mrope 的按段选位置需要一个小的位置 gather |
 | KV cache | reshape_and_cache flash 布局 / vLLM 分块布局（任意大小 cache） | 有 | `reshape_cache_flash_bf16_h<Hk>_d<D>`、`reshape_cache_blocked_bf16_h<Hk>_d<D>_b<BS>` |
 | | **fp8 KV cache 写（静态 per-tensor scale）** | 有（新） | `reshape_cache_flash_fp8_h<Hk>_d<D>`：k_scale / v_scale kernarg；5.9 TB/s |
-| | fp8 cache 写 + per-token scale（`pertoken_quant`）、分块布局的 fp8 版本 | 缺 | per-token scale 需要先做一遍行 amax（复用 `quant_token`），分块布局的 fp8 版同理；待做 |
+| | **fp8 cache 写 + per-token（per-head）动态 scale，分块布局**（`reshape_and_cache_with_pertoken_quant`，非 asm 布局，x = 16） | 有（新） | `reshape_cache_blocked_fp8_h<Hk>_d<D>_b<BS>[_i64]`：`scale[h][slot] = max(amax, floor) / 448`，key `[NB][Hk][D/16][BS][16]`、value `[NB][Hk][D][BS]`（fp8），`k_scales / v_scales f32 [Hk][S]`；0.93 TB/s（value 是 1 字节散写，与 bf16 分块版同量级） |
+| | fp8 分块版的 per-block scale（`with_block_quant`）、asm 布局（`asm_layout=true`） | 缺 | per-block scale 要对整块做 amax（写入后二次扫描），asm 布局只是另一套偏移；使用面窄 |
+| | slot_mapping 为 int64（vLLM / SGLang 实际传的类型） | 有（新） | 所有 `reshape_cache_*` 都有 `_i64` 后缀版本：读每个条目的低 32 位（slot < 2³¹，−1 = 0xffffffff 仍是 padding） |
 | | MLA cache（`concat_and_cache_mla`） | 缺 | 两段拼接写（kv_c + k_pe）：和 flash 版同构，缺的只是名字 / 布局约定 |
 | 采样 / top-k | argmax、sample（温度）、top-k + top-p、topk_softmax | 有 | 见前文 |
 | | **moe_fused_gate**（DeepSeek-V3 分组 topk：sigmoid + bias → 组内 top-2 之和 → 丢掉 G − TG 个最低的组 → 余下专家里取 top-K → 权重 = s / Σs） | 有（新） | `moe_fused_gate_bf16_e<E>_g<G>_tg<TG>_k<K>`（G ∈ {4, 8, 16, 32, 64}，E / G ∈ {8, 16, 24, 32}，K ≤ 32）：一个 lane 持有一个 (行, 组) 的 E / G 个专家，所有规约是 G 个 lane 上的 DPP 全规约；并列取低下标（组选择同样）；NaN → 0。E = 256, G = 8, TG = 4, K = 8：M ≤ 4096 约 10 µs，M = 131072 118 µs（VALU 受限，0.9 µs / 千行）。不含 shared-expert 融合与 pad 行 |
@@ -360,3 +362,10 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 `causal_conv1d_fwd_bf16_w<W>[_silu]` 与 `causal_conv1d_fwd_split_bf16_w<W>[_silu]`：`out[t][f] = bias[f] + Σ_{i < W} weight[f][i] · x[t − (W − 1) + i][f]`，序列起点之前的输入取该序列的初始状态（`has_initial` 为真）或 0，可选 silu；序列结束后 `conv_states[cache_idx][f][0 .. W−1)` 写成该序列最后 W − 1 个输入（序列短于 W − 1 时保留更早的初始状态值）。x 是 channel-last 的 `[T][dim]`（SGLang prefill 的布局），`cu_seqlens [B + 1]` 给出序列边界，`cache_indices [B]` 给出状态槽（负 = 跳过整个序列）；状态布局 `[slots][dim][W − 1]`，与 decode 的 `causal_conv1d_update_*_s<W−1>` 完全一致，所以 prefill 写的状态 decode 可以直接接着用。split 版本把特征 `[0, k)`、`[k, 2k)`、`[2k, dim)` 分别写进 q、k、v 三个张量（行距 k、k、dim − 2k；k % 8 = 0）。
 
 布局：一个 lane 负责 8 个连续特征（b128 访问），一个块 256 lane = 2048 个特征，grid = (⌈dim / 2048⌉, B, ⌈max_len / 8⌉)：每个块顺序处理 8 个 token，前 W − 1 个输入留在寄存器里（块内第一个块从初始状态读，其余块从 x 读前几个 token）；8 次加载在第一个输出前全部发出；超出序列末尾的块不碰内存。限制：`T · dim · 2 < 2 GiB`（32 位偏移；更大要逐序列的 `ptr_mad` 描述符）、dim % 8 = 0。验证（`tests/gpu/conv1d_fwd_host.cpp`）：长度 1、2、W、随机的混合序列，一部分有初始状态、一部分没有、一部分状态槽为负（输出与状态都必须不被写），dim = 776 / 1000 / 1536 / 2048 / 4104 / 8192，W = 2 / 3 / 4，silu 开 / 关，split；输出（≤ 1 bf16 ulp）与最终状态（逐位）都与 CPU 参考一致，`gpu_verify --strict` 0 错误。性能：B = 128、每序列 512 token、dim = 8192：2.8 TB/s（计 x 读 + out 写）；序列长度很不均匀时（最长是平均的 4 倍，网格按最长序列铺）约 1 TB/s，因为 74 % 的块在序列末尾之外空转——要避免就需要 aiter 那样的（序列, 块）调度表，留作后续。VGPR 120 – 176。
+
+
+## fp8 分块 cache（per-token scale）与 int64 slot_mapping
+
+`reshape_cache_blocked_fp8_h<Hk>_d<D>_b<BS>[_i64]`（D ∈ {64, 128, 256}，BS ∈ {16, 32, 64, 128}）：每个 (token, head) 取 D 个元素的 amax（一个 head 的 D / 8 个 lane 上的 DPP 全规约），`scale = max(amax, floor) / 448`，`q = fp8(x / scale)`；key 写成 `[NB][Hk][D/16][BS][16]`（每个 lane 一次 8 字节存储），value 写成转置的 `[NB][Hk][D][BS]`（每个元素 1 字节存储），scale 写到 `k_scales / v_scales [Hk][S]`（下标 `head · S + slot`，head 的第一个 lane 存）；`S = NB · BS`，`Hk · S · 4 < 2 GiB`。缓存描述符按块移动（64 位 `ptr_mad`），所以 cache 本身可以任意大。主机测试 `tests/gpu/cache_blocked_fp8_host.cpp`：每个写入的 (token, head) 的字节按 e4m3 的半步长对 x / scale 校验、scale 对 amax / 448 校验（相对 1e-3）、未写的 slot 的 scale 与 cache 字节保持哨兵值、末尾之后 0 字节被写；Hk = 1 / 4 / 8，D = 64 / 128 / 256，BS = 16 / 32 / 64，含 padding slot；`bad = 0`；`gpu_verify --strict` 0 错误，44 VGPR。
+
+**int64 slot_mapping**：vLLM 与 SGLang 的 slot_mapping 是 int64 张量，所以 `reshape_cache_flash_{bf16,fp8}_h<Hk>_d<D>`、`reshape_cache_blocked_{bf16,fp8}_h<Hk>_d<D>_b<BS>` 都有 `_i64` 后缀的变体（名字最后加 `_i64`，其余 ABI 不变，slot_mapping 每项 8 字节）：只读每项的低 32 位，要求 slot < 2³¹（−1 = 0xffffffff 仍是 padding）。flash bf16 / fp8 和 blocked bf16 的 `_i64` 版本用 `cache_big_host` / `cache_fp8_host`（新增的 `i64` 参数）在 12 GiB 的 cache 上验证过，`bad = 0`。
