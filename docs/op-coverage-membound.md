@@ -75,3 +75,29 @@ D ∈ {64, 128, 256}（全旋转维），H ∈ 1…256；正确性：T ∈ {9 �
 | `reshape_cache_flash_bf16_h<Hk>_d<D>` | 20 | Hk = 8, D = 128：4909；Hk = 8, D = 64：4716；Hk = 16, D = 128：4860 | 79–82 % |
 
 限制：cache < 4 GiB（32 位 buffer 偏移；需要后端的 64 位地址乘加 B1 才能去掉）。低于 90 % 的原因：随机槽位的 2 KB 行写（相邻 token 的目的地不连续），在途量已按行 / 块给够，剩下的差距在 DRAM 页局部性；量化写（fp8 cache + scale）、NHD 以外的分块布局（vLLM 的 `[num_blocks][Hk][D/x][block_size][x]`）待做。
+
+## 与 aiter 的同轮对比
+
+方法：aiter 的 HIP 源（`csrc/kernels/{activation,quant,rmsnorm_quant}_kernels.cu`）在节点上无 torch、独立编译成 host + device 目标文件，由 `tests/gpu/vendor_membound_host.cpp` 经 aiter 自己的 C++ 入口（`aiter::silu_and_mul`、`aiter::rmsnorm`、`aiter::dynamic_per_token_scaled_quant` …，张量用 `AiterTensor` 包住普通 HIP 缓冲）调用；构建见 `tools/vendor_membound.sh`。我们的内核与 aiter 在同一个作业里交替运行（每个形状先我们后 aiter，整体重复 2 轮，两轮相差 < 1 %），同样的数据规模（≈ 1 GB 流量，GB/s = 同一公式的读 + 写字节 / 单次时间）、同一块 GPU（GPU 4）。aiter 的数值输出没有逐一对拍，只比时间；dtype 都是 bf16 输入。
+
+| 算子，形状 | 我们（GB/s） | aiter（GB/s） | 我们 / aiter |
+|---|--:|--:|--:|
+| silu_mul，M = 43690, D = 4096 | 5977 / 5947 | 5819 / 5901 | 1.01 – 1.03 |
+| silu_mul，M = 65535, D = 1024 | 5899 / 5903 | 6289 / 6306 | **0.94** |
+| silu_mul，M = 12483, D = 14336 | 5738 / 5692 | 5515 / 5488 | 1.04 |
+| gelu_tanh_mul，M = 43690, D = 4096 | 5939 / 5970 | 5051 / 5204 | **1.15 – 1.18** |
+| rmsnorm，M = 65536, N = 4096 | 5856 / 5837 | 5818 / 5874 | 0.99 – 1.01 |
+| rmsnorm，M = 262144, N = 1000 | 5726 / 5688 | 4870 / 4866 | **1.17** |
+| add_rmsnorm，M = 32768, N = 4096 | 5510 / 5498 | 6859 / 6849（见下） | 0.80 |
+| rmsnorm_quant（fp8 per-token；我们是已有的 `rmsnorm_quant_fp8_n4096`），M = 65536, N = 4096 | 4711 / 4728 | 5024 / 5049 | **0.94** |
+| quant_token（per-token fp8），M = 131072, N = 4096 | 5543 / 5542 | 5906 / 5896 | **0.94** |
+| quant_token，M = 524288, N = 1000 | 5615 / 5604 | 4050 / 4051 | **1.39** |
+| quant_group128（per-group fp8），M = 131072, N = 4096 | 5595 / 5630 | 5825 / 5822 | 0.96 – 0.97 |
+| quant_static（per-tensor fp8），n = 5.4 亿 | 5979 / 5963 | 6292 / 6307 | **0.95** |
+| silu_mul_quant（融合，per-row 量化），M = 65536, D = 4096 | 5113 / 5133 | 5329 / 5320 | 0.96 |
+
+读法：
+- **持平或更好**：silu_mul（D = 4096 / 14336）、rmsnorm（N = 4096 持平，N = 1000 +17 %，因为短行每 wave 多行）、gelu_tanh_mul（+15–18 %）、quant_token 的短行（+39 %）。
+- **落后 4–6 %**：大 N 的 fp8 输出族（quant_token / group128 / static / silu_mul_quant / 已有 rmsnorm_quant）和 D = 1024 的 silu_mul。共同点：fp8 输出我们每 lane 每 chunk 只写 8 B（b64），aiter 一次写更宽（每 lane 16 B）；D = 1024 的 silu_mul 我们每块只有 128 线程。待做：fp8 族每 lane 处理两个 chunk 后合并成 b128 存、D ≤ 2048 的 silu_mul 每块多行。
+- **add_rmsnorm（aiter 6.86 TB/s）高于测得的流式上限（≈ 6.0–6.4 TB/s）**：不能当作有效对比，可能是 aiter 的 `add_rmsnorm` 对 `residual_out` / 输出的语义与我们的不同导致实际流量更小（没有逐元素对拍），待查；在查清之前，这一行只保留数据，不用于结论。
+- 没有 aiter 对应的内核：layernorm（aiter 的 layernorm 是 torch 扩展）、row softmax、RoPE / KV cache（`pos_encoding_kernels.cu` 与 `cache_kernels.cu` 的入口依赖 torch 的 int64 positions 等约定，`cache_kernels.cu` 在 gfx950 上不能独立编译：`dtype_float16.cuh` 里的旧 asm 约束），这些仍只和 roofline 比。
