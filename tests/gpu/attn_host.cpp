@@ -64,7 +64,9 @@ int main(int argc, char** argv) {
     // fmha_fwd_v3_args: field i at 16 i
     // our ABI extension: sliding window (WL / WR env, >= 0) at 656 / 672
     const int WL = envi("WL", -1), WR = envi("WR", -1);
-    std::vector<uint8_t> a(WL >= 0 ? 688 : 656, 0);
+    // KS=lg (ours *_v3_ks): 2^lg key parts per q tile, partials + attn_combine_bf16_hd128_q (COMBINE_CO)
+    const int KS = envi("KS", -1);
+    std::vector<uint8_t> a(KS >= 0 ? 704 : WL >= 0 ? 688 : 656, 0);
     auto P = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
     auto U = [&](int i, uint32_t v) { memcpy(&a[16 * i], &v, 4); };
     auto F = [&](int i, float v) { memcpy(&a[16 * i], &v, 4); };
@@ -79,6 +81,20 @@ int main(int argc, char** argv) {
     U(29, (group ? TQ : SQ) * 4);
     if (group) { P(27, dcuq); P(28, dcuk); P(30, dcuq); P(31, dcuk); }
     if (WL >= 0) { U(41, WL); U(42, WR); }
+    void *dpo = nullptr, *dpl = nullptr;
+    const int S = KS >= 0 ? 1 << KS : 1;
+    hipFunction_t fcomb = nullptr;
+    std::vector<uint8_t> ca(48, 0);
+    if (KS >= 0) {
+        HC(hipMalloc(&dpo, (size_t)B * H * SQ * S * D * 4)); HC(hipMalloc(&dpl, (size_t)B * H * SQ * S * 4));
+        uint32_t lg = KS, sc = S;
+        memcpy(&a[656], &lg, 4); memcpy(&a[660], &sc, 4); memcpy(&a[672], &dpo, 8); memcpy(&a[688], &dpl, 8);
+        hipModule_t cm; HC(hipModuleLoad(&cm, getenv("COMBINE_CO"))); HC(hipModuleGetFunction(&fcomb, cm, "attn_combine_bf16_hd128_q"));
+        float* lsep = want_lse ? dlse : nullptr;
+        memcpy(&ca[0], &dout, 8); memcpy(&ca[8], &dpo, 8); memcpy(&ca[16], &dpl, 8); memcpy(&ca[24], &lsep, 8);
+        uint32_t hh = H, sqq = SQ, lo = want_lse;
+        memcpy(&ca[32], &hh, 4); memcpy(&ca[36], &sqq, 4); memcpy(&ca[40], &sc, 4); memcpy(&ca[44], &lo, 4);
+    }
     int tiles = ((group ? TQ : SQ) + rows - 1) / rows;
     // PAIR=1 (ours v3 causal): the vendor's pairing grid
     const bool pair = !ours || envi("PAIR", 0);
@@ -86,7 +102,12 @@ int main(int argc, char** argv) {
     int gx = group ? H : gt, gy = group ? B : H, gz = group ? gt : B;
     size_t asz = a.size();
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, a.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};
-    auto launch = [&]() { HC(hipModuleLaunchKernel(fn, gx, gy, gz, block, 1, 1, 0, nullptr, nullptr, cfg)); };
+    size_t csz = ca.size();
+    void* ccfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ca.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &csz, HIP_LAUNCH_PARAM_END};
+    auto launch = [&]() {
+        HC(hipModuleLaunchKernel(fn, gx, gy, gz * S, block, 1, 1, 0, nullptr, nullptr, cfg));
+        if (fcomb) HC(hipModuleLaunchKernel(fcomb, SQ, H, B, 128, 1, 1, 0, nullptr, nullptr, ccfg));
+    };
     launch();
     HC(hipDeviceSynchronize());
     std::vector<uint16_t> ho(nq);
