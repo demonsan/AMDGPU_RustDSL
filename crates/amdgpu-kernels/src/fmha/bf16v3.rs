@@ -29,6 +29,11 @@ struct Ring {
     v_so0: ValueId,
     seqs: ValueId,
     wig: ValueId,
+    /// hd192 (MLA prefill): the K rope part (dims 128..191) in its own ring, rows of 128 bytes (chunk ^ key % 8), 4 issues per wave
+    kbs: Option<Shared>,
+    kb_vo: Vec<ValueId>,
+    /// hd192: the V row stride (K and V rows differ); None = `seqs` for both
+    v_seqs: Option<ValueId>,
 }
 
 struct Body<'a> {
@@ -36,6 +41,8 @@ struct Body<'a> {
     kind: MmaKind,
     qf: &'a [ValueId],
     kr: &'a [ValueId],
+    /// hd192: the rope-part K read offsets (4 chunks of 16 dims)
+    kr2: &'a [ValueId],
     /// V^T read offsets per (e, r): index 2 e + r
     vr: Vec<ValueId>,
     csc: ValueId,
@@ -88,8 +95,32 @@ impl Body<'_> {
                     cur = n;
                 }
             }
-            acc.into_iter().flatten().collect()
-        })
+            acc
+        });
+        // hd192: the rope part (dims 128..191: 4 more k-chunks from the second ring)
+        let acc = match &self.ring.kbs {
+            Some(kbs) => {
+                let o = kbs.at(slot).off_v(b);
+                let kb2 = o + kbs.base as i32;
+                let bases2: Vec<ValueId> = self.kr2.iter().map(|r| b.bind_i32(ev(*r) + kb2.clone())).collect();
+                let mut acc = acc;
+                kbs.at(slot).read(b, |b| {
+                    for c in 0..4usize {
+                        for blk in 0..4usize {
+                            let a = b.bind_i32(ev(bases2[c]) + (blk as i32) * 32 * 128);
+                            let kf = b.load_lds_b128(a);
+                            match into {
+                                Some(v) => b.var_mfma(v[blk], kind, kf, qf[8 + c], false),
+                                None => acc[blk] = Some(b.mfma(kind, kf, qf[8 + c], acc[blk].map(Opnd::Val))),
+                            }
+                        }
+                    }
+                });
+                acc
+            }
+            None => acc,
+        };
+        acc.into_iter().flatten().collect()
     }
     /// O^T += V^T P^T over the 128 keys of the tile in `slot`: 8 steps of 16 keys x 4 blocks of 32 d; the 8 transposed reads of step t + 1 are
     /// issued before the 4 MFMAs of step t
@@ -133,7 +164,8 @@ impl PipeBody for Body<'_> {
             Role::B => (&r.vs, &r.v_vo, r.r_v, r.v_so0),
             _ => (&r.ks, &r.k_vo, r.r_k, r.k_so0),
         };
-        let so = { let v = b.bind_i32(ev(so0) + key0.clone() * ev(r.seqs)); b.read_first_lane(v) };
+        let st = match (role, r.v_seqs) { (Role::B, Some(vs)) => vs, _ => r.seqs };
+        let so = { let v = b.bind_i32(ev(so0) + key0.clone() * ev(st)); b.read_first_lane(v) };
         let base = { let o = sh.at(slot).off_v(b); b.bind_i32(o + sh.base as i32) };
         sh.at(slot).write(b, |b| {
             for (i, v) in vo.iter().enumerate() {
@@ -141,6 +173,16 @@ impl PipeBody for Body<'_> {
                 b.buffer_load_lds_b128(rs, *v, so, m0, 0);
             }
         });
+        // hd192: group A also stages the K rope part (16 KB: 4 issues per wave)
+        if let (Some(kbs), Role::A) = (&r.kbs, role) {
+            let base2 = { let o = kbs.at(slot).off_v(b); b.bind_i32(o + kbs.base as i32) };
+            kbs.at(slot).write(b, |b| {
+                for (i, v) in r.kb_vo.iter().enumerate() {
+                    let m0 = { let x = b.bind_i32(ev(base2) + ((ev(r.wig) + 4 * i as i32) << 10)); b.read_first_lane(x) };
+                    b.buffer_load_lds_b128(rs, *v, so, m0, 0);
+                }
+            });
+        }
     }
     fn prologue_compute(&mut self, b: &mut FnBuilder, _role: Role, t0: &TileIt) {
         self.s_init = self.qk(b, &t0.cur, None);
@@ -261,6 +303,16 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
 /// `split` (`..._ks`, for small grids): the key range of every q tile is cut into S = 2^lg_s parts (grid z = B S; our ABI extension: lg_s
 /// at kernarg 656, S = 2^lg_s at 660, fp32 partial O / l [B, H, SQ, S, 128] at 672, partial LSE [B, H, SQ, S] at 688); `attn_combine_bf16_hd128_q` merges them.
 pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Function {
+    fmha_fwd_bf16_v3_d(name, causal, split, 128)
+}
+
+/// MLA prefill (`fmha_fwd_hd192_hd128_bf16_v3[_causal]`, dqk = 192): Q / K head dim 192 (128 nope + 64 rope), V / O 128 (the vendor's
+/// fwd_hd192_hd128 ABI: qk_head_dim 192). K's rope part rides a second ring (rows of 128 bytes); QK runs 12 k-chunks.
+pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Function {
+    assert!(dqk == 128 || (dqk == 192 && !split), "bf16 v3: head dim 128, or 192 / 128 (non-split)");
+    let hd192 = dqk == 192;
+    #[allow(non_snake_case)]
+    let QROW = 2 * dqk;
     let mut b = FnBuilder::new(name, 512);
     // the `_vs128` policy (full reordering list scheduler) + ldsink / wsink / ldahead32: measured +6.6 % / +7.7 % / +6.7 % (8192², 2048², 1024²)
     // over the Gemm profile
@@ -288,15 +340,17 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     b.ka_is(320, Ext::sym("HK") * gq.clone());
     let hk = Ext::sym("HK");
     let rowb = Ext::c(ROW as i64);
-    b.ka_is(288, Ext::c(D as i64));
+    // Q / K rows (hd192: 384 bytes)
+    let qrowb = Ext::c(QROW as i64);
+    b.ka_is(288, Ext::c(dqk as i64));
     b.ka_is(304, Ext::c(D as i64));
-    b.ka_is(112, hh.clone() * rowb.clone());
-    b.ka_is(144, rowb.clone());
-    b.ka_is(160, sq.clone() * hh.clone() * rowb.clone());
-    for (s, hs, bs) in [(192u32, 208u32, 224u32), (336, 352, 368)] {
-        b.ka_is(s, hk.clone() * rowb.clone());
-        b.ka_is(hs, rowb.clone());
-        b.ka_is(bs, sk.clone() * hk.clone() * rowb.clone());
+    b.ka_is(112, hh.clone() * qrowb.clone());
+    b.ka_is(144, qrowb.clone());
+    b.ka_is(160, sq.clone() * hh.clone() * qrowb.clone());
+    for (s, hs, bs, rb) in [(192u32, 208u32, 224u32, qrowb.clone()), (336, 352, 368, rowb.clone())] {
+        b.ka_is(s, hk.clone() * rb.clone());
+        b.ka_is(hs, rb.clone());
+        b.ka_is(bs, sk.clone() * hk.clone() * rb);
     }
     b.ka_is(384, hh.clone() * rowb.clone());
     b.ka_is(400, rowb.clone());
@@ -319,9 +373,9 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
         b.arg_tensor("ptr_plse", Ext::sym("BB") * hh.clone() * sq.clone() * Ext::sym("SPL") * Ext::c(4));
     }
     let bb = if split { Ext::sym("BB") } else { bb };
-    b.arg_tensor("ptr_q", bb.clone() * sq.clone() * hh.clone() * rowb.clone());
+    b.arg_tensor("ptr_q", bb.clone() * sq.clone() * hh.clone() * qrowb.clone());
     b.arg_tensor("ptr_o", bb.clone() * sq.clone() * hh.clone() * rowb.clone());
-    b.arg_tensor("ptr_k", bb.clone() * sk.clone() * hk.clone() * rowb.clone());
+    b.arg_tensor("ptr_k", bb.clone() * sk.clone() * hk.clone() * qrowb);
     b.arg_tensor("ptr_v", bb.clone() * sk.clone() * hk * rowb);
     b.arg_tensor("ptr_lse", bb * hh * sq * Ext::c(4));
 
@@ -364,6 +418,8 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     let mut lds = LdsPlan::new();
     let ks = lds.ring("K", (KT * ROW) as i64, 2, TLayout::Linear);
     let vs = lds.ring("V", (KT * ROW) as i64, 2, TLayout::Linear);
+    // hd192: the K rope ring (128 keys x 128 bytes per slot)
+    let kbs = hd192.then(|| lds.ring("KR", (KT * 128) as i64, 2, TLayout::Linear));
     lds.commit(&mut b);
     // DMA (per group, 4 waves): block bi = w + 4 i (i < 8) of 1 KB = keys 4 bi + lane / 16, chunk lane % 16; K source chunk ^ (key % 16)
     let wig = roles.wave_in_group;
@@ -374,6 +430,18 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     let k_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(k_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
     // V swizzled like K (the transposed reads of 4 rows x 4 columns per 16-lane group then hit distinct banks)
     let v_vo: Vec<ValueId> = keys.iter().map(|k| b.bind_i32(ev(*k) * ev(v_seqs) + ((ev(l16) ^ (ev(*k) & 15)) << 4))).collect();
+    // hd192 rope part: 1 KB block bi = w + 4 i (i < 4) = keys 8 bi + lane / 8, chunk lane % 8 (source dims 128 + 8 chunk ..: byte 256 +), ^ key % 8
+    let kb_vo: Vec<ValueId> = if hd192 {
+        (0..4)
+            .map(|i| {
+                let k = b.bind_i32(((ev(wig) + 4 * i) << 3) + lane.lane().lshr(3));
+                b.bind_i32(ev(k) * ev(k_seqs) + 256 + (((lane.lane() & 7) ^ (ev(k) & 7)) << 4))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let kr2: Vec<ValueId> = if hd192 { (0..4).map(|c| b.bind_i32(lane.j() * 128 + (((ev(half) + 2 * c) ^ (lane.lane() & 7)) << 4))).collect() } else { Vec::new() };
     let (ks, vs) = (&ks, &vs);
     // read offsets (as bf16.rs)
     let kr: Vec<ValueId> = (0..8).map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & 15)) << 4))).collect();
@@ -415,7 +483,7 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     let row = b.bind_i32((ev(qt) << 8) + (lane.wave() << 5) + lane.j());
     let row_c = b.bind_i32(ev(row).min(ev(s_q) - 1));
     let q_vo = b.bind_i32(ev(row_c) * ev(q_seqs) + (ev(half) << 4));
-    let qf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_q, q_vo, q_so, (32 * c) as u32)).collect();
+    let qf: Vec<ValueId> = (0..if hd192 { 12 } else { 8 }).map(|c| b.buffer_load_b128(r_q, q_vo, q_so, (32 * c) as u32)).collect();
     // ---- key range: causal keys k <= q + SK - SQ ----
     let kv_end = if causal {
         let v = b.bind_i32((((ev(qt) + 1) << 8) - 1 + ev(qoff) + 1).min(ev(s_kv)).max(0));
@@ -452,7 +520,7 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
         }
         None => (lim, lim_min, k_so0, v_so0),
     };
-    let ring = Ring { ks: ks.clone(), vs: vs.clone(), k_vo: k_vo.clone(), v_vo: v_vo.clone(), r_k, r_v, k_so0: k_so, v_so0: v_so, seqs: k_seqs, wig };
+    let ring = Ring { ks: ks.clone(), vs: vs.clone(), k_vo: k_vo.clone(), v_vo: v_vo.clone(), r_k, r_v, k_so0: k_so, v_so0: v_so, seqs: k_seqs, wig, kbs: kbs.clone(), kb_vo: kb_vo.clone(), v_seqs: hd192.then_some(v_seqs) };
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, nkv, kv_len, KT, Ext::ka(272).ceil_div(KT as i64));
     pipe.key_unclamped = true;
 
@@ -460,7 +528,7 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     b.begin_if(Opnd::Val(any));
     roles.each(&mut b, |b, role| {
         let mut body = Body {
-            ring: &ring, kind, qf: &qf, kr: &kr, vr: vr.clone(), csc, neg_inf, zero16, half, lim, lim_min,
+            ring: &ring, kind, qf: &qf, kr: &kr, kr2: &kr2, vr: vr.clone(), csc, neg_inf, zero16, half, lim, lim_min,
             s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: true,
         };
         pipe.run(b, role, &mut body);
