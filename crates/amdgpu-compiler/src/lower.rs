@@ -210,6 +210,8 @@ struct Lowerer {
     view_copy: std::collections::HashSet<ValueId>,
     /// every value some statement reads (precise: through the generated id visitor)
     read_values: std::collections::HashSet<ValueId>,
+    /// how many operand slots of all statements read each value
+    read_counts: HashMap<ValueId, usize>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
     /// AGPR requests from the IR (resolved to vregs in inish).
@@ -338,6 +340,15 @@ impl Lowerer {
             alias_cache: HashMap::new(),
             view_copy: amdgpu_dsl::facts::stale_view_roots(f),
             read_values: f.stmts().iter().flat_map(amdgpu_dsl::facts::stmt_value_uses).collect(),
+            read_counts: {
+                let mut c: HashMap<ValueId, usize> = HashMap::new();
+                for s in f.stmts() {
+                    for v in amdgpu_dsl::facts::stmt_value_uses(s) {
+                        *c.entry(v).or_insert(0) += 1;
+                    }
+                }
+                c
+            },
             else_started: HashSet::new(),
             agpr_marks: f.agpr.clone(),
             reg_plan: f.reg_plan.clone(),
@@ -506,6 +517,57 @@ impl Lowerer {
         let r = self.mir.vregs.len() as VReg;
         self.mir.vregs.push(c);
         r
+    }
+
+    /// Rewrite the instruction of the current block that defines `r` to write `cls` at dword `off` of `tuple` instead, when that is safe: `r`
+    /// is a plain (non-alias) vreg of class `cls`, defined exactly once in the block by an instruction that fully writes it (not a tied partial
+    /// write) and read by no instruction so far. In-flight bookkeeping (pending loads) follows the new register.
+    fn retarget_def(&mut self, r: VReg, tuple: VReg, off: u8, cls: RClass) -> bool {
+        if self.mir.alias.contains_key(&r) || self.mir.vreg_class(r) != cls || cls.dwords() == 0 {
+            return false;
+        }
+        // the vreg must belong to exactly one value (bitcasts / views share vregs; constants and conversions are cached)
+        if self.val.values().filter(|x| **x == r).count() != 1
+            || self.converted.values().any(|x| *x == r)
+            || self.consts.values().any(|x| *x == r)
+            || self.rfl_cache.values().any(|x| *x == r)
+            || self.rfl_cache.keys().any(|x| *x == r)
+            || self.alias_cache.keys().any(|k| k.0 == r)
+            || self.lazy.values().any(|x| x.0 == r)
+            || self.vars.contains(&r)
+            || self.scope_snaps.iter().any(|(c, v)| c.values().any(|x| *x == r) || v.values().any(|x| *x == r))
+        {
+            return false;
+        }
+        let insts = &self.mir.blocks[self.cur].insts;
+        let mut def_at = None;
+        for (k, inst) in insts.iter().enumerate() {
+            let reads = inst.uses().into_iter().any(|u| self.mir.canon(u) == r);
+            if reads {
+                return false;
+            }
+            if inst.dst == Some(r) {
+                if def_at.is_some() {
+                    return false;
+                }
+                def_at = Some(k);
+            }
+        }
+        let Some(k) = def_at else { return false };
+        let op = self.mir.blocks[self.cur].insts[k].op;
+        if matches!(crate::op_attrs::attrs(op).regfx, crate::op_attrs::RegFx::PartialWrite) {
+            return false;
+        }
+        let slot = self.sub_alias(tuple, off, cls);
+        self.mir.blocks[self.cur].insts[k].dst = Some(slot);
+        let cr = self.mir.canon(r);
+        let ct = self.mir.canon(slot);
+        for p in self.pending_lds.iter_mut().chain(self.pending_vmem.iter_mut()) {
+            if *p == cr {
+                *p = ct;
+            }
+        }
+        true
     }
 
     fn push(&mut self, mut inst: MInst) {
@@ -2397,6 +2459,7 @@ impl Lowerer {
                 self.val.insert(dst, d);
             }
             Op::FragCat { parts, .. } => {
+                // widths first
                 let mut regs = Vec::new();
                 let mut total = 0u8;
                 for p in parts {
@@ -2405,9 +2468,8 @@ impl Lowerer {
                         Opnd::Var(v) if self.vars.get(v.0 as usize).map_or(false, |r| self.mir.vreg_class(*r).dwords() > 1) => self.vars[v.0 as usize],
                         o => self.as_v1(*o)?,
                     };
-                    self.touch(&[Src::Reg(r)]);
                     let w = self.mir.vreg_class(r).dwords() as u8;
-                    regs.push((r, total, w));
+                    regs.push((*p, r, total, w));
                     total += w;
                 }
                 let cls = match total {
@@ -2418,8 +2480,22 @@ impl Lowerer {
                     n => return Err(format!("frag_cat of {n} dwords")),
                 };
                 let d = self.new_vreg(cls);
-                // per dword through `sub_alias` (aliases of aliases keep their offsets; `copy_reg` into an alias tuple would not)
-                for (r, off, w) in regs {
+                for (p, r, off, w) in regs {
+                    let c = match w {
+                        1 => RClass::V1,
+                        2 => RClass::V2,
+                        4 => RClass::V4,
+                        8 => RClass::V8,
+                        _ => RClass::V16,
+                    };
+                    // IN PLACE: a part that is a fresh, single-use value defined in this block by an instruction that fully writes it gets that
+                    // instruction retargeted to its slot of the result (no copy, and no wait for an in-flight load)
+                    if let Opnd::Val(v) = p {
+                        if self.read_counts.get(&v).copied() == Some(1) && self.retarget_def(r, d, off, c) {
+                            continue;
+                        }
+                    }
+                    self.touch(&[Src::Reg(r)]);
                     for j in 0..w {
                         let s = if w == 1 { r } else { self.sub_alias(r, j, RClass::V1) };
                         let dd = self.sub_alias(d, off + j, RClass::V1);
