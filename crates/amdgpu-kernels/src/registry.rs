@@ -62,7 +62,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("mlp_fp8_") => crate::mlp::by_name(n),
         // P2 (stage library): RMSNorm + per-token fp8 quantization from the generic E / R / Q stages; N in the name (multiple of 512)
         n if n.starts_with("rmsnorm_quant_fp8_n") => crate::norm::by_name(n),
-        n if n.starts_with("topk_per_row_decode_f32_k") || n.starts_with("topk_per_row_prefill_f32_k") => crate::topk::perrow::by_name(n),
+        n if n.starts_with("topk_plain_f32_k") || n.starts_with("topk_per_row_decode_f32_k") || n.starts_with("topk_per_row_prefill_f32_k") => crate::topk::perrow::by_name(n),
         n if n.starts_with("moe_fused_gate_bf16_e") => crate::topk::gate::by_name(n),
         // batch 2: causal conv1d update,
         n if n.starts_with("causal_conv1d_update_bf16_w") || n.starts_with("causal_conv1d_fwd_") => crate::conv::by_name(n),
@@ -76,11 +76,11 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         // (batch 2 cont.)
         n if n.starts_with("topk_softmax_bf16_e") || n.starts_with("topk_softmax_renorm_bf16_e") => crate::topk::by_name(n),
         n if n.starts_with("qknorm_rope_") || n.starts_with("qknorm_rope_kvcache_") || n.starts_with("rope_neox_bf16_h") || n.starts_with("rope_gptj_bf16_h") => crate::rope::by_name(n),
-        n if n.starts_with("reshape_cache_flash_bf16_h") || n.starts_with("reshape_cache_flash_fp8_h") || n.starts_with("reshape_cache_blocked_fp8_h") || n.starts_with("reshape_cache_blocked_bf16_h") => crate::cache::by_name(n),
+        n if n.starts_with("reshape_cache_flash_bf16_h") || n.starts_with("reshape_cache_flash_fp8_h") || n.starts_with("concat_cache_mla_") || n.starts_with("reshape_cache_blocked_fp8_h") || n.starts_with("reshape_cache_blocked_bf16_h") => crate::cache::by_name(n),
         // batch 2 (docs/op-coverage-memtemplates.md): row kernels, streaming elementwise
         n if n.starts_with("quant_token_bf16_fp8_n") || n.starts_with("quant_token_bf16_int8_n") || n.starts_with("quant_group128_bf16_fp8_n") || n.starts_with("silu_mul_quant_fp8_d") => crate::rows::quant::by_name(n),
         n if n.starts_with("rmsnorm_bf16_n") || n.starts_with("add_rmsnorm_fp8_n") || n.starts_with("gated_rmsnorm_bf16_n") || n.starts_with("gated_rmsnorm_fp8_n") || n.starts_with("add_rmsnorm_bf16_n") || n.starts_with("layernorm_bf16_n") || n.starts_with("softmax_bf16_n") => crate::rows::by_name(n),
-        n if n.starts_with("silu_mul_bf16_d") || n.starts_with("silu_mul_limit_bf16_d") || n.starts_with("swiglu_oai_mul_bf16_d") || matches!(n, "silu_bf16" | "gelu_tanh_bf16" | "gelu_fast_bf16" | "relu2_bf16" | "sigmoid_bf16") || n.starts_with("gelu_tanh_mul_bf16_d") || n == "add_bf16" || n == "cvt_f32_bf16" || n == "cvt_bf16_f32" || n == "quant_bf16_fp8_static" || n == "quant_bf16_fp8_static_rt" => crate::eltwise::by_name(n),
+        n if n.starts_with("silu_mul_bf16_d") || n.starts_with("silu_mul_limit_bf16_d") || n.starts_with("swiglu_oai_mul_bf16_d") || n.contains("_mul_bias_bf16_d") && (n.starts_with("silu_") || n.starts_with("gelu_") || n.starts_with("swiglu_oai_")) || n == "gelu_bf16" || n.starts_with("gelu_mul_bf16_d") || matches!(n, "silu_bf16" | "gelu_tanh_bf16" | "gelu_fast_bf16" | "relu2_bf16" | "sigmoid_bf16") || n.starts_with("gelu_tanh_mul_bf16_d") || n == "add_bf16" || n == "cvt_f32_bf16" || n == "cvt_bf16_f32" || n == "quant_bf16_fp8_static" || n == "quant_bf16_fp8_static_rt" => crate::eltwise::by_name(n),
         // P3: the same four kernels on the layout layer (amdgpu-layout + amdgpu-isa + amdgpu-tile)
         "fmha_fwd_hd128_mxfp8_v3_vs128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_vs128()),
         "fmha_fwd_hd128_mxfp8_v3_t128" => Some(crate::fmha::fmha_fwd_hd128_mxfp8_v3_t128()),

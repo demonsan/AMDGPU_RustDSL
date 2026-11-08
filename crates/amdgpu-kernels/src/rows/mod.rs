@@ -12,7 +12,7 @@ pub mod mxnorm;
 pub mod mxquant;
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{abs_f32, act, bf16x8_to_f32, fp8_pack, fp8_scale, group_reduce_dpp, lane_reduce, rsqrt_f32, wave_reduce, Act, RedOp};
+use amdgpu_tile::prims::{abs_f32, act, bf16x8_to_f32, bf16x8_to_f32_pairs, fp8_pack, fp8_scale, group_reduce_dpp, lane_reduce, rsqrt_f32, wave_reduce, Act, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +84,12 @@ pub fn group_lanes(n: i64) -> i64 {
     } else {
         ((n / 8) as u64).next_power_of_two().max(4) as i64
     }
+}
+
+/// lane `i` of a Frag2 as an f32 (the lane accessor returns the raw u32)
+fn fl2(b: &mut FnBuilder, f: ValueId, i: u8) -> ValueId {
+    let v = b.frag2_lane(f, i);
+    b.bitcast_f32(v)
 }
 
 pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
@@ -291,15 +297,28 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 }
                 let tot = red(b, RedOp::Sum, part.unwrap(), 0, gen0, &lane);
                 let mean = b.mul_f32(tot, inv_n);
+                let zero_m = b.c_f32(0.0);
+                let neg_mean = b.sub_f32(zero_m, mean);
+                let nm2 = b.frag2_dup(neg_mean);                         // hoisted: two v_mov, once
                 let mut part2: Option<ValueId> = None;
                 for i in 0..nld {
-                    let xi = bf16x8_to_f32(b, packed[i]);
+                    // packed math on adjacent register pairs: v_pk_add_f32 (deviation), v_pk_mul_f32 (square)
+                    let xp = bf16x8_to_f32_pairs(b, packed[i]);
+                    let mut sq: Vec<ValueId> = Vec::new();
                     let mut dv = [0; 8];
-                    for k in 0..8 {
-                        dv[k] = b.sub_f32(xi[k], mean);
+                    for q in 0..4usize {
+                        let d2 = b.pk_add_f32(xp[q], nm2);
+                        let (d0, d1) = (fl2(b, d2, 0), fl2(b, d2, 1));
+                        dv[2 * q] = d0;
+                        dv[2 * q + 1] = d1;
                     }
                     let dv = masked(b, &dv, i, zero);
-                    let sq: Vec<ValueId> = dv.iter().map(|&x| b.mul_f32(x, x)).collect();
+                    for q in 0..4usize {
+                        let m2 = b.pack2(dv[2 * q], dv[2 * q + 1]);
+                        let s2 = b.pk_mul_f32(m2, m2);
+                        sq.push(fl2(b, s2, 0));
+                        sq.push(fl2(b, s2, 1));
+                    }
                     let s = lane_reduce(b, RedOp::Sum, &sq);
                     part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
                 }
@@ -308,17 +327,19 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 let ve = b.add_f32(var, eps.unwrap());
                 let inv = rsqrt_f32(b, ve);
                 let (gs, bs) = gb_loaded(b, late_gb, &gs_early, &bs_early, r_g, r_be);
+                let inv2 = b.frag2_dup(inv);
                 for i in 0..nld {
-                    let xi = bf16x8_to_f32(b, packed[i]);
-                    let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
-                    let be = bf16x8_to_f32(b, bs.as_ref().unwrap()[i]);
+                    let xp = bf16x8_to_f32_pairs(b, packed[i]);
+                    let gp = bf16x8_to_f32_pairs(b, gs.as_ref().unwrap()[i]);
+                    let bp = bf16x8_to_f32_pairs(b, bs.as_ref().unwrap()[i]);
                     let mut y = [0; 8];
-                    for k in 0..8 {
-                        // (x - mean) is recomputed here: the deviations are not kept across the second reduction (register pressure)
-                        let d = b.sub_f32(xi[k], mean);
-                        let t = b.mul_f32(d, inv);
-                        let u = b.mul_f32(t, g[k]);
-                        y[k] = b.add_f32(u, be[k]);
+                    for q in 0..4usize {
+                        // (x - mean) is recomputed here: the deviations are not kept across the second reduction (register pressure); (x - mean) * inv * gamma + beta, two elements per instruction
+                        let d2 = b.pk_add_f32(xp[q], nm2);
+                        let t2 = b.pk_mul_f32(d2, inv2);
+                        let y2 = b.pk_fma_f32(t2, gp[q], bp[q]);
+                        y[2 * q] = fl2(b, y2, 0);
+                        y[2 * q + 1] = fl2(b, y2, 1);
                     }
                     out.push(y);
                 }

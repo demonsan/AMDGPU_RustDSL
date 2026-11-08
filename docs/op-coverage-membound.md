@@ -322,7 +322,9 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | **silu_and_mul 带 limit**（`x = min(x, limit)`, `y` 夹到 ±limit） | 有（新） | `silu_mul_limit_bf16_d<D>`，limit 是 kernarg（≤ 0 = 不限）；6.55 TB/s |
 | | **swiglu_and_mul**（gpt-oss：限幅 7、alpha = 1.702、`(lin + 1)`） | 有（新） | `swiglu_oai_mul_bf16_d<D>`；6.58 TB/s |
 | | **一元激活**（gelu_fast = tanh 形式、relu2、silu、sigmoid） | 有（新） | `gelu_fast_bf16` / `gelu_tanh_bf16` / `relu2_bf16` / `silu_bf16` / `sigmoid_bf16`（6.2 – 6.4 TB/s） |
-| | gelu（erf 精确形式）、gelu_and_mul_bias、swiglu_and_mul_bias（MoE 逐专家 bias）、situv2 | 缺 | erf 需要多项式近似；带 bias 的两个需要 expert id 的 gather；使用频率低 |
+| | **gelu（erf 精确形式）**、`gelu_and_mul` | 有（新） | `gelu_bf16`、`gelu_mul_bf16_d<D>`：erfc 用 Numerical-Recipes 的 Chebyshev 拟合（相对误差 < 1.2e-7，尾部也准；`1 + erf` 按 z 的符号直接取 `erfc(|z|)` 或 `2 − erfc(|z|)`，没有相消） |
+| | **`*_and_mul_bias`（MoE 逐专家 bias）**：silu / gelu_tanh / gelu / swiglu | 有（新） | `{silu,gelu_tanh,gelu,swiglu_oai}_mul_bias_bf16_d<D>`：按 `expert_ids[m]` 取该专家的 `[2][D]` bias 行，先加并舍入到 bf16（与 aiter 一致）再激活；expert id < 0 或 ≥ E 输出整行 0；ABI x @0、bias @8、expert_ids @16、out @24、M @32、E @36；D = 4096、M = 32768 约 143 µs |
+| | situv2_and_mul_quant | 缺 | aiter 内部的 silu + 量化变体，用法窄 |
 | | scaled_silu_and_mul（输出 fp8，静态 scale） | 有（组合） | `silu_mul_quant_fp8_d<D>` 的静态 scale 变体可由 `quant_bf16_fp8_static` 接在后面；融合版缺 |
 | 位置编码 | rope neox / gptj，部分旋转（`_r<R>`），token 打包 | 有 | `rope_{neox,gptj}_bf16_h<H>_d<D>[_r<R>]` |
 | | **fused qk-norm + rope**（`fused_qk_norm_rope`，Qwen3 风格逐 head 归一化后旋转） | 有（新） | `qknorm_rope_{neox,gptj}_bf16_h<H>_d<D>`（全旋转）；q、k 各启动一次；H = 8 D = 128 5.7 TB/s |
@@ -333,7 +335,7 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | **fp8 cache 写 + per-token（per-head）动态 scale，分块布局**（`reshape_and_cache_with_pertoken_quant`，非 asm 布局，x = 16） | 有（新） | `reshape_cache_blocked_fp8_h<Hk>_d<D>_b<BS>[_i64]`：`scale[h][slot] = max(amax, floor) / 448`，key `[NB][Hk][D/16][BS][16]`、value `[NB][Hk][D][BS]`（fp8），`k_scales / v_scales f32 [Hk][S]`；0.93 TB/s（value 是 1 字节散写，与 bf16 分块版同量级） |
 | | fp8 分块版的 per-block scale（`with_block_quant`）、asm 布局（`asm_layout=true`） | 缺 | per-block scale 要对整块做 amax（写入后二次扫描），asm 布局只是另一套偏移；使用面窄 |
 | | slot_mapping 为 int64（vLLM / SGLang 实际传的类型） | 有（新） | 所有 `reshape_cache_*` 都有 `_i64` 后缀版本：读每个条目的低 32 位（slot < 2³¹，−1 = 0xffffffff 仍是 padding） |
-| | MLA cache（`concat_and_cache_mla`） | 缺 | 两段拼接写（kv_c + k_pe）：和 flash 版同构，缺的只是名字 / 布局约定 |
+| | **MLA cache 拼接写**（`concat_and_cache_mla` / `concat_and_cache_mla_seg`） | 有（新） | `concat_cache_mla_{bf16,fp8}_r<R>_p<P>[_i64]`（平铺 `[S][R+P]`：`[kv_c | k_pe]`）与 `concat_cache_mla_seg_{bf16,fp8}_r<R>_p<P>_b<BS>[_i64]`（分段块布局：每块先 BS 行 kv_c、再 BS 行 k_pe）；fp8 = `x / scale`（静态 scale kernarg）；任意大小 cache；R = 512、P = 64、T = 64K：bf16 平铺 4.3 TB/s |
 | 采样 / top-k | argmax、sample（温度）、top-k + top-p、topk_softmax | 有 | 见前文 |
 | | **moe_fused_gate**（DeepSeek-V3 分组 topk：sigmoid + bias → 组内 top-2 之和 → 丢掉 G − TG 个最低的组 → 余下专家里取 top-K → 权重 = s / Σs） | 有（新） | `moe_fused_gate_bf16_e<E>_g<G>_tg<TG>_k<K>`（G ∈ {4, 8, 16, 32, 64}，E / G ∈ {8, 16, 24, 32}，K ≤ 32）：一个 lane 持有一个 (行, 组) 的 E / G 个专家，所有规约是 G 个 lane 上的 DPP 全规约；并列取低下标（组选择同样）；NaN → 0。E = 256, G = 8, TG = 4, K = 8：M ≤ 4096 约 10 µs，M = 131072 118 µs（VALU 受限，0.9 µs / 千行）。不含 shared-expert 融合与 pad 行 |
 | | topk_gating | 缺 | 与 `topk_softmax` 的 renorm 变体等价的一个子集，未单列 |
@@ -385,10 +387,24 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 主机测试 `tests/gpu/mxnorm_host.cpp`：CPU 参考把同一规则用在 f32 的规范化行上；scale 字节必须一致（每百万个 group 里有几个边界 group 差 1，因为设备的 rsqrt 是近似指令，允许 ≤ 1‰），每个反量化值必须在设备自己的 scale 的 fp4 半步长（1 × scale）以内；K = 512 / 2048 / 4096 / 7168，`code_bad = 0`，`gpu_verify --strict` 0 错误，84 VGPR。性能（K = 4096、M = 32768）：123 µs；分开做（rmsnorm 约 90 µs + mxfp4 量化）估计 ≥ 1.6 倍。
 
 
-## layernorm 的 packed 数学（负结果）
+## layernorm 的 packed 数学
 
-把 layernorm 的"减均值 / 乘 inv / 乘 γ / 加 β"和"偏差平方"换成 `v_pk_add_f32` / `v_pk_mul_f32`（每条处理两个元素）后，VALU 指令数反而**增加**（N = 4096：1005 → 1158，N = 776：684 → 762，N = 400：1723 → 1883，N = 256：652 → 732，N = 200：793 → 873），带宽持平或更低（同一次运行里，N = 4096 5882 → 5873、776 4284 → 3798、400 3623 → 3096、256 5245 → 4916、200 3915 → 3340 GB/s）：packed 操作要求两个 f32 在相邻的 VGPR 里，而 bf16 解包产生的是分开的寄存器，所以每对元素还要一到两条 `v_mov` 来拼 / 拆，吞掉了省下的指令。要让 packed 数学有用，需要解包阶段本身就产生相邻的寄存器对（例如 `v_pk_` 系的 bf16 → f32 或者把 `v_lshlrev / v_and` 的目的寄存器按对分配），这是编译器 / 寄存器分配层面的事；kernel 层面不做。实验代码在归档 tag `archive/pk-layernorm`，不合入。
+第一次尝试（把 `bf16x8_to_f32` 的标量结果拼成 Frag2 再用 `v_pk_add_f32` / `v_pk_mul_f32`）是**负结果**：packed 操作要求两个 f32 在相邻的 VGPR，拼 / 拆要额外的 `v_mov`，VALU 反而更多（N = 4096：1005 → 1158）、带宽更低（归档 tag `archive/pk-layernorm`）。backend 随后给了"相邻对"的寄存器放置（`bf16x8_to_f32_pairs`：每对元素的两条解包指令直接写进 `v[2k]`、`v[2k+1]`，无需 `v_mov`；`pk_fma_f32`；`frag2_dup` 提到循环外），第二次尝试：layernorm 的偏差 / 平方（`v_pk_add_f32`、`v_pk_mul_f32`）和输出 `((x − mean) · inv) · γ + β`（`v_pk_add_f32`、`v_pk_mul_f32`、`v_pk_fma_f32`）都用相邻对，VALU 指令数下降（N = 4096：1005 → 850，776：684 → 598，400：1723 → 1539，256：652 → 592，200：793 → 701），同一次运行里带宽小幅上升（4096：5437 → 5459，776：4293 → 4387，400：3397 → 3492，256：5237 → 5353，200：4134 → 4298 GB/s，即 +0.4 % … +4 %，短行得益最多），正确性不变（`bad = 0`）。已合入；其它行内 kernel（rmsnorm、softmax、gated、add_rmsnorm 等）没有改动。
 
 ## mxfp4 规则只有一份
 
 `rows/mxquant.rs` 里的"一个 32 元素组"的步骤（amax 舍入、E8M0、`ScalePkFp4F32` 链、frag4）现在是 `pub(crate) fn mxfp4_group`，`quant_mxfp4_bf16_k<K>` 和融合的 `rmsnorm_quant_mxfp4_bf16_k<K>`（`rows/mxnorm.rs`）都调用它；重构前后两个 kernel 的汇编 md5 完全相同（`quant_mxfp4_bf16_k512 / 4096 / 7168`、`rmsnorm_quant_mxfp4_bf16_k512 / 4096 / 7168`、`quant_mxfp8_bf16_k4096`）。
+
+
+## MLA cache、erf-gelu 与 MoE bias 激活
+
+**MLA cache**：`concat_cache_mla_*`（见上表）。一个 token 的条目 = `kv_c [R]` 后接 `k_pe [P]`；平铺布局下 `kv_cache` 就是 `[S][R + P]`（block size 无关），分段布局 `[NB][BS · (R + P)]` 一块里先放 BS 行 kv_c（"nope"段）再放 BS 行 k_pe，与 aiter 的 `concat_and_cache_mla_seg` 一致。一个 lane 搬一个 16 字节的块（8 个元素）：块号 `c < R / 8` 来自 kv_c，其余来自 k_pe（两个加载都发出，另一个越界读 0，逐 dword 选择）；fp8 缓存先乘 `1 / scale` 再转 e4m3。缓存描述符按 token 条目（平铺）/ 块（分段）用 64 位 `ptr_mad` 移动，所以缓存可以任意大；`_i64` = slot_mapping 为 int64。主机测试 `tests/gpu/mla_cache_host.cpp`：每个写入的条目逐元素比对（bf16 逐位、fp8 e4m3 半步长）、未写的 slot 保持哨兵、末尾之后 0 字节被写，含负 slot 与 ≥ S 的 slot，R / P = 512 / 64、256 / 32、128 / 24（P 不是 16 的倍数）；`bad = 0`，`gpu_verify --strict` 0 错误，24 – 28 VGPR。
+
+**erf-gelu**：`Act::Gelu`（`amdgpu_tile::prims`）；`gelu_bf16`、`gelu_mul_bf16_d<D>`、以及 bias 形式；10 个系数的 Horner 求值，`exp` 走 `exp2`，一个元素约 30 条 VALU。第一版用了 Abramowitz-Stegun 7.1.26（绝对误差 1.5e-7）加 `1 − erf` 的相消，负尾部的相对误差太大（179M 个元素里 100 个超出 1e-6 的绝对容差），换成相对误差有界的 erfc 拟合之后消失。
+
+**MoE bias 激活**：`{silu,gelu_tanh,gelu,swiglu_oai}_mul_bias_bf16_d<D>`；主机测试 `tests/gpu/eltwise_bias_host.cpp`（CPU 双精度参考，含 expert id = −1 和 ≥ E 的 token）全部 `bad = 0`；`gpu_verify --strict` 0 错误，44 VGPR。
+
+
+## topk_per_row 的两个负结果（未采用）
+
+`topk_per_row_*` 一行一个块，R = 256 行 × 64K 约 94 µs（5 遍读 + 4 次直方图扫描）。试了两个看起来该有用的改动，都没有收益，已撤销：（1）后三遍直方图里，只有前缀相等的元素（约 1 / 256）才计数，所以让没有任何匹配元素的 wave 跳过 LDS 原子（`any_lane` + 一致的 `if`），发射遍同样跳过没有写入的 wave：94 → 105 µs（更慢，分支与 exec 保存 / 恢复的开销大于省下的原子）；（2）每次迭代在途的加载从 4 个提到 16 个（VGPR 48 → 72）：94 → 93 µs，短行反而 15 → 20 µs（迭代粒度变粗）。所以这个 kernel 不是被加载延迟或 LDS 原子的数量卡住，而是被每遍固定的"清零 → 直方图 → barrier → 扫描（DPP + 两次 barrier）"链和 1024 线程上的 VALU 卡住（8 K 的行 15 µs 里大部分是这条固定链，约 2.5 µs / 遍）。想要明显更快需要换结构：11 位的数字（3 遍，2048 个桶）或者把一行拆到多个块上（需要跨块的全局原子 + 多次启动或块间同步，只在行数少于 CU 数时有意义，上界约 1.7 倍），都没有做。

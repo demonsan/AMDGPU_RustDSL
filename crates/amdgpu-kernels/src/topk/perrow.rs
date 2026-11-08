@@ -2,6 +2,7 @@
 //!
 //! * `topk_per_row_decode_f32_k<K>`:  ABI logits @0 (f32 [R][stride]), seq_lens @8 (i32 [B]), indices @16 (i32 [R][K]), stride @24 (i32 elements), next_n @28 (i32), rows @32 (i32, R = B * next_n).
 //!   Grid x = B, y = next_n; the row `b * next_n + j` has `L = seq_lens[b] - next_n + j + 1` valid columns (0 .. L).
+//! * `topk_plain_f32_k<K>`: every row has `len` valid columns: ABI logits @0, indices @8, len @16, stride @20, rows @24 (i32); grid x = rows.
 //! * `topk_per_row_prefill_f32_k<K>`: ABI logits @0, row_starts @8 (i32 [R]), row_ends @16 (i32 [R]), indices @24, stride @32, rows @36. Grid x = R; the valid columns are [start, end), the indices are absolute columns.
 //!
 //! Output: `indices[r][0 .. min(K, L))` = the columns of the K largest values (unordered; ties at the K-th value are taken lowest-slot-first by an LDS counter, i.e. an arbitrary subset), and `-1` after
@@ -15,15 +16,21 @@ use amdgpu_dsl::{AtomicOp, CachePolicy, CmpPred, CmpTy, CompileProfile, DType, D
 use amdgpu_tile::ev;
 
 pub fn by_name(name: &str) -> Option<Function> {
-    let (rest, prefill) = if let Some(r) = name.strip_prefix("topk_per_row_decode_f32_k") {
-        (r, false)
+    let (rest, prefill, plain) = if let Some(r) = name.strip_prefix("topk_per_row_decode_f32_k") {
+        (r, false, false)
     } else if let Some(r) = name.strip_prefix("topk_per_row_prefill_f32_k") {
-        (r, true)
+        (r, true, false)
+    } else if let Some(r) = name.strip_prefix("topk_plain_f32_k") {
+        (r, false, true)
     } else {
         return None;
     };
     let k: i64 = rest.parse().ok()?;
-    (1..=2048).contains(&k).then(|| topk_per_row(name, k, prefill))
+    (1..=2048).contains(&k).then(|| topk_per_row_mode(name, k, prefill, plain))
+}
+
+pub fn topk_per_row(name: &str, k: i64, prefill: bool) -> Function {
+    topk_per_row_mode(name, k, prefill, false)
 }
 
 // LDS: histogram 320 slots (256 bins + a per-lane sink 256 + lane), wave totals, result slots, two counters, the emit sink (one slot per thread)
@@ -35,12 +42,19 @@ const CNT: i32 = 1424;
 const SINK: i32 = 1440;
 const LDS: u32 = 1440 + 4096;
 
-pub fn topk_per_row(name: &str, k: i64, prefill: bool) -> Function {
+pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Function {
     let mut fb = FnBuilder::new(name, 1024);
     fb.compile_profile(CompileProfile::Default);
     let b = &mut fb;
     b.arg("logits", DType::Ptr, 0, 8);
-    let (idx_off, st_off) = if prefill {
+    let (idx_off, st_off) = if plain {
+        // every row has `len` valid columns (a row pitch of `stride`)
+        b.arg("indices", DType::Ptr, 8, 8);
+        b.arg("len", DType::I32, 16, 4);
+        b.arg("stride", DType::I32, 20, 4);
+        b.arg("rows", DType::I32, 24, 4);
+        (8u32, 20u32)
+    } else if prefill {
         b.arg("row_starts", DType::Ptr, 8, 8);
         b.arg("row_ends", DType::Ptr, 16, 8);
         b.arg("indices", DType::Ptr, 24, 8);
@@ -55,14 +69,14 @@ pub fn topk_per_row(name: &str, k: i64, prefill: bool) -> Function {
         b.arg("rows", DType::I32, 32, 4);
         (16u32, 24u32)
     };
-    let rows_off = if prefill { 36u32 } else { 32u32 };
+    let rows_off = if plain { 24u32 } else if prefill { 36u32 } else { 32u32 };
     let rr = Ext::sym("R");
     let ss = Ext::sym("S");
     b.sym_range("R", 1, 1 << 24);
     b.sym_range("S", 1, 1 << 26);
     b.ka_is(rows_off, rr.clone());
     b.ka_is(st_off, ss.clone());
-    if prefill {
+    if prefill || plain {
         b.grid_is(0, rr.clone());
     } else {
         // rows = B * next_n, grid (B, next_n)
@@ -73,7 +87,8 @@ pub fn topk_per_row(name: &str, k: i64, prefill: bool) -> Function {
     }
     b.arg_tensor("logits", rr.clone() * ss * Ext::c(4));
     b.arg_tensor("indices", rr.clone() * Ext::c(4 * k));
-    if prefill {
+    if plain {
+    } else if prefill {
         b.arg_tensor("row_starts", rr.clone() * Ext::c(4));
         b.arg_tensor("row_ends", rr * Ext::c(4));
     } else {
@@ -91,7 +106,10 @@ pub fn topk_per_row(name: &str, k: i64, prefill: bool) -> Function {
     let r_l = { let n = b.bind_i32(ev(rows_v) * ev(stride_v) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_l, n) };
     let r_o = { let n = b.bind_i32(ev(rows_v) * (4 * k) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_i, n) };
     // the row, its first column and its length (uniform)
-    let (row, start, len) = if prefill {
+    let (row, start, len) = if plain {
+        let l0 = b.let_(Op::KernargI32 { offset: 16 });
+        (bx, zero_i, l0)
+    } else if prefill {
         let (p_s, p_e) = (b.let_(Op::KernargPtr { offset: 8 }), b.let_(Op::KernargPtr { offset: 16 }));
         let n = b.bind_i32(ev(rows_v) << 2);
         let n = b.read_first_lane(n);
