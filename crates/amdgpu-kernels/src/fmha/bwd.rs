@@ -358,43 +358,6 @@ pub fn fmha_bwd_dkdv_x(name: &str, causal: bool, fused: bool) -> Function {
     let k_vo = b.bind_i32(((ev(bat) * ev(a.sk) + ev(key_c)) * ev(a.hkn) + ev(hkv)) * ROW + (ev(half) << 4));
     let kf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_k, k_vo, c0, (32 * c) as u32)).collect();
     let vf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_v, k_vo, c0, (32 * c) as u32)).collect();
-    // fused: the K tile into LDS (wave w: blocks w + 4 i of 1 KB = keys 4 block + lane / 16, chunk lane % 16, source chunk ^ key % 16)
-    let fz = ktile.as_ref().map(|kt_sh| {
-        let l16 = b.bind_i32(lane.lane() & 15);
-        let kso = { let v = b.bind_i32((ev(bat) * ev(a.sk) * ev(a.hkn) + ev(hkv)) * ROW); b.read_first_lane(v) };
-        let kseq = { let v = b.bind_i32(ev(a.hkn) * ROW); b.read_first_lane(v) };
-        kt_sh.at(&SlotIdx::new(0, 0)).write(&mut b, |b| {
-            for i in 0..8i32 {
-                let kk = b.bind_i32(((lane.wave() + 4 * i) << 2) + lane.lane().lshr(4));
-                let kg = b.bind_i32(((ev(kt) << 7) + ev(kk)).min(ev(a.sk) - 1));
-                let vo = b.bind_i32(ev(kg) * ev(kseq) + ((ev(l16) ^ (ev(kk) & 15)) << 4));
-                let m0 = { let x = b.bind_i32(((lane.wave() + 4 * i) << 10) + kt_sh.base as i32); b.read_first_lane(x) };
-                b.buffer_load_lds_b128(r_k, vo, kso, m0, 0);
-            }
-        });
-        // read offsets of the dQ MMAs: wave w computes q block qb = w / 2 (32 queries) x d blocks 2 (w % 2) + {0, 1}; per 16-key step st,
-        // A = dS (tr_b16 from dS^T: key rows 16 st + 8 h + 4 r + s / 4, query columns 32 qb + 16 ((l % 32) / 16) + 4 (s % 4)),
-        // B = K^T (tr_b16 from the K tile: the same key rows, d columns 32 db + 16 ((l % 32) / 16) + 4 (s % 4), swizzled chunks)
-        let s = b.bind_i32(lane.lane() & 15);
-        let qb = b.bind_i32(lane.wave().lshr(1));
-        let a_off = b.bind_i32((ev(half) * 8 + ev(s).lshr(2)) * 128 + ((ev(qb) << 5) + ((lane.lane() & 31).lshr(4) << 4) + ((ev(s) & 3) << 2)) * 2);
-        let b_off: Vec<Vec<ValueId>> = (0..2)
-            .map(|dd| {
-                (0..2)
-                    .map(|r| {
-                        let krow = b.bind_i32(ev(half) * 8 + 4 * r + ev(s).lshr(2));
-                        let db = b.bind_i32(((lane.wave() & 1) << 1) + dd);
-                        let ch = b.bind_i32((ev(db) << 2) + ((lane.lane() & 31).lshr(4) << 1) + (ev(s) & 3).lshr(1));
-                        b.bind_i32(ev(krow) * ROW + (((ev(ch) ^ ev(krow)) & 15) << 4) + ((ev(s) & 1) << 3))
-                    })
-                    .collect()
-            })
-            .collect();
-        let nacc = { let v = b.bind_i32((ev(bat) + 1) * ev(a.hq) * ev(a.sq) * (4 * D)); b.read_first_lane(v) };
-        let r_acc = b.buffer_desc_dyn(a.p[6], nacc);
-        let acc_so = { let v = b.bind_i32((ev(bat) * ev(a.hq) + ev(h)) * ev(a.sq) * (4 * D)); b.read_first_lane(v) };
-        (a_off, b_off, r_acc, acc_so, qb)
-    });
     let nl = { let v = b.bind_i32((ev(bat) + 1) * ev(a.hq) * ev(a.sq) << 2); b.read_first_lane(v) };
     let (r_l, r_d) = (b.buffer_desc_dyn(a.p[4], nl), b.buffer_desc_dyn(a.p[5], nl));
     let l_so = { let v = b.bind_i32((ev(bat) * ev(a.hq) + ev(h)) * ev(a.sq) << 2); b.read_first_lane(v) };
@@ -433,6 +396,43 @@ pub fn fmha_bwd_dkdv_x(name: &str, causal: bool, fused: bool) -> Function {
     };
     // read offsets: Q / dO rows as A (row l % 32, chunk (2 c + h) ^ (l % 16)); Q^T / dO^T by tr_b16 (row 8 r + 4 h + s / 4, dims 32 e + ..)
     let rr: Vec<ValueId> = (0..8).map(|c| b.bind_i32(lane.j() * ROW + (((ev(half) + 2 * c) ^ (lane.lane() & 15)) << 4))).collect();
+    // fused: the K tile into LDS (wave w: blocks w + 4 i of 1 KB = keys 4 block + lane / 16, chunk lane % 16, source chunk ^ key % 16)
+    let fz = ktile.as_ref().map(|kt_sh| {
+        let l16 = b.bind_i32(lane.lane() & 15);
+        let kso = { let v = b.bind_i32((ev(bat) * ev(a.sk) * ev(a.hkn) + ev(hkv)) * ROW); b.read_first_lane(v) };
+        let kseq = { let v = b.bind_i32(ev(a.hkn) * ROW); b.read_first_lane(v) };
+        kt_sh.at(&SlotIdx::new(0, 0)).write(&mut b, |b| {
+            for i in 0..8i32 {
+                let kk = b.bind_i32(((lane.wave() + 4 * i) << 2) + lane.lane().lshr(4));
+                let kg = b.bind_i32(((ev(kt) << 7) + ev(kk)).min(ev(a.sk) - 1));
+                let vo = b.bind_i32(ev(kg) * ev(kseq) + ((ev(l16) ^ (ev(kk) & 15)) << 4));
+                let m0 = { let x = b.bind_i32(((lane.wave() + 4 * i) << 10) + kt_sh.base as i32); b.read_first_lane(x) };
+                b.buffer_load_lds_b128(r_k, vo, kso, m0, 0);
+            }
+        });
+        // read offsets of the dQ MMAs: wave w computes q block qb = w / 2 (32 queries) x d blocks 2 (w % 2) + {0, 1}; per 16-key step st,
+        // A = dS (tr_b16 from dS^T: key rows 16 st + 8 h + 4 r + s / 4, query columns 32 qb + 16 ((l % 32) / 16) + 4 (s % 4)),
+        // B = K^T (tr_b16 from the K tile: the same key rows, d columns 32 db + 16 ((l % 32) / 16) + 4 (s % 4), swizzled chunks)
+        let s = b.bind_i32(lane.lane() & 15);
+        let qb = b.bind_i32(lane.wave().lshr(1));
+        let a_off = b.bind_i32((ev(half) * 8 + ev(s).lshr(2)) * 128 + ((ev(qb) << 5) + ((lane.lane() & 31).lshr(4) << 4) + ((ev(s) & 3) << 2)) * 2);
+        let b_off: Vec<Vec<ValueId>> = (0..2)
+            .map(|dd| {
+                (0..2)
+                    .map(|r| {
+                        let krow = b.bind_i32(ev(half) * 8 + 4 * r + ev(s).lshr(2));
+                        let db = b.bind_i32(((lane.wave() & 1) << 1) + dd);
+                        let ch = b.bind_i32((ev(db) << 2) + ((lane.lane() & 31).lshr(4) << 1) + (ev(s) & 3).lshr(1));
+                        b.bind_i32(ev(krow) * ROW + (((ev(ch) ^ ev(krow)) & 15) << 4) + ((ev(s) & 1) << 3))
+                    })
+                    .collect()
+            })
+            .collect();
+        let nacc = { let v = b.bind_i32((ev(bat) + 1) * ev(a.hq) * ev(a.sq) * (4 * D)); b.read_first_lane(v) };
+        let r_acc = b.buffer_desc_dyn(a.p[6], nacc);
+        let acc_so = { let v = b.bind_i32((ev(bat) * ev(a.hq) + ev(h)) * ev(a.sq) * (4 * D)); b.read_first_lane(v) };
+        (a_off, b_off, r_acc, acc_so, qb)
+    });
     let tr: Vec<Vec<ValueId>> = (0..4)
         .map(|e| {
             (0..2)
