@@ -181,7 +181,8 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let q = b.bind_i32(ev(q) + ev(tid));
         let ex = b.bind_i32(ev(q).lshr(bsh));
         let sl = b.bind_i32(ev(q) & (bm as i32 - 1));
-        let exc = b.let_(Op::MinI32(Opnd::Val(ex), Opnd::I32(1023)));
+        let exc1 = b.let_(Op::MinI32(Opnd::Val(ex), Opnd::I32(1023)));
+        let exc = b.bin(amdgpu_dsl::BinOp::MaxI32, exc1, 0i32);
         let a_c = b.bind_i32((ev(exc) << 2) + offc);
         let a_n = b.bind_i32((ev(exc) << 2) + offa);
         let a_s = b.bind_i32((ev(exc) << 2) + cur);
