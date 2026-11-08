@@ -7,7 +7,7 @@
 //!
 //! V a multiple of 8, 8..=131072. A block reduction = DPP quads + the wave's LDS exchange, then one slot per wave and a barrier (a fresh slot per reduction, so no barrier is needed to reuse them).
 
-use amdgpu_dsl::{AtomicOp, CachePolicy, CmpPred, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
+use amdgpu_dsl::{AtomicOp, CachePolicy, CmpPred, Dpp, DppAluOp, DppCtrl, CmpTy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
 use amdgpu_tile::prims::{bf16x8_to_f32, dpp_reduce, lane_reduce, wave_reduce_dpp, RedOp};
 use amdgpu_tile::ev;
 
@@ -128,7 +128,7 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
     b.arg_tensor("out", bb * Ext::c(4));
     // LDS: wave exchange 1024 B, 4 reduction slots (256 B), scan ping-pong 2 x 4096 B
     let (ws, blk, sc0, sc1) = (0i32, 1024i32, 1536i32, 5632i32);
-    b.lds(12880);
+    b.lds(12944);
     let p_l = b.let_(Op::KernargPtr { offset: 0 });
     let p_out = b.let_(Op::KernargPtr { offset: out_off });
     let p_u = if sample { Some(b.let_(Op::KernargPtr { offset: 8 })) } else { None };
@@ -278,18 +278,28 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                 b.wait_lds(0);
                 b.barrier();
             };
-            // descending cumulative scan over the 256 bins; returns (bin, cumulative before the bin) of the bin where the cumulative reaches `tgt` (bin 0 / 0 when it never does); `float`: the bins hold f32 sums
+            // descending cumulative scan over the 256 bins; returns (bin, cumulative before the bin) of the bin where the cumulative reaches `tgt` (bin 0 / 0 when it never does); `float`: the bins hold f32 sums.
+            // Thread t < 256 owns bin 255 - t: a DPP inclusive scan inside each wave (row_shr 1 / 2 / 4 / 8, then row_bcast 15 / 31), the four wave totals through LDS, one barrier.
+            let wt = resl + 32;                                     // 16 dwords: the wave totals
             let scan_find = |b: &mut FnBuilder, tgt: ValueId, float: bool| -> (ValueId, ValueId) {
-                // thread t < 256 owns bin 255 - t; threads >= 256 use the dummy slot
                 let rb = b.bind_i32(255 - ev(tcl));
                 let a_h = b.bind_i32((ev(rb) << 2) + hist);
                 let v0 = b.load_lds(a_h, MemTy::B32);
                 b.wait_lds(0);
                 let in256 = b.cmp(CmpPred::Lt, CmpTy::I32, tid, 256);
                 let v0z = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in256), a: Opnd::Val(v0), b: Opnd::I32(0) });
-                let a_s0 = b.bind_i32(ev(tcl4) + scan_a);
-                b.store_lds(a_s0, v0z, MemTy::B32, false);
-                // defaults for the result slots
+                let vty = if float { b.bitcast_f32(v0z) } else { v0z };
+                let aop = if float { DppAluOp::AddF32 } else { DppAluOp::AddU32 };
+                let mut v = vty;
+                for c in [DppCtrl::RowShr(1), DppCtrl::RowShr(2), DppCtrl::RowShr(4), DppCtrl::RowShr(8)] {
+                    v = b.dpp_alu(aop, Dpp { ctrl: c, row_mask: 0xf, bank_mask: 0xf, bound_zero: true }, v, v, v);
+                }
+                v = b.dpp_alu(aop, Dpp { ctrl: DppCtrl::RowBcast15, row_mask: 0xa, bank_mask: 0xf, bound_zero: false }, v, v, v);
+                v = b.dpp_alu(aop, Dpp { ctrl: DppCtrl::RowBcast31, row_mask: 0xc, bank_mask: 0xf, bound_zero: false }, v, v, v);
+                // the wave total (lane 63) -> LDS; defaults of the result slots (thread 0)
+                let tot = b.read_lane(v, 63);
+                let a_wt = b.bind_i32((ev(wave) << 2) + wt);
+                b.store_lds(a_wt, tot, MemTy::B32, false);
                 let is0 = b.cmp(CmpPred::Eq, CmpTy::I32, tid, 0);
                 let dflt_a = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is0), a: Opnd::I32(resl), b: Opnd::I32(resl + 8) });
                 b.store_lds(dflt_a, zero_i, MemTy::B32, false);
@@ -297,44 +307,37 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                 b.store_lds(dflt_b, zero_i, MemTy::B32, false);
                 b.wait_lds(0);
                 b.barrier();
-                let mut cur = scan_a;
-                let mut st = 1i32;
-                while st < 256 {
-                    let nxt = if cur == scan_a { scan_b } else { scan_a };
-                    let a_own = b.bind_i32(ev(tcl4) + cur);
-                    let own = b.load_lds(a_own, MemTy::B32);
-                    let prev_i = b.bind_i32(ev(tcl) - st);
-                    let okp = b.cmp(CmpPred::Ge, CmpTy::I32, prev_i, 0);
-                    let pi = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(okp), a: Opnd::Val(prev_i), b: Opnd::I32(0) });
-                    let a_pv = b.bind_i32((ev(pi) << 2) + cur);
-                    let pv = b.load_lds(a_pv, MemTy::B32);
-                    b.wait_lds(0);
-                    let sum = if float {
-                        let (of, pf) = (b.bitcast_f32(own), b.bitcast_f32(pv));
-                        let z = b.c_f32(0.0);
-                        let addf = sel_f32(b, okp, pf, z);
-                        let sf = b.add_f32(of, addf);
-                        b.bitcast_i32(sf)
-                    } else {
-                        let add = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(okp), a: Opnd::Val(pv), b: Opnd::I32(0) });
-                        b.add_i32(own, add)
-                    };
-                    let a_nx = b.bind_i32(ev(tcl4) + nxt);
-                    b.store_lds(a_nx, sum, MemTy::B32, false);
-                    b.wait_lds(0);
-                    b.barrier();
-                    cur = nxt;
-                    st *= 2;
+                let mut tots = Vec::new();
+                for w in 0..3i32 {
+                    let a = b.c_i32(wt + 4 * w);
+                    tots.push(b.load_lds(a, MemTy::B32));
                 }
-                let a_inc = b.bind_i32(ev(tcl4) + cur);
-                let incl = b.load_lds(a_inc, MemTy::B32);
                 b.wait_lds(0);
+                // this wave's offset = the sum of the totals of the lower waves (waves >= 4 are idle; their value is unused)
+                let incl = if float {
+                    let mut pre = b.c_f32(0.0);
+                    for (w, t) in tots.iter().enumerate() {
+                        let tf = b.bitcast_f32(*t);
+                        let sum = b.add_f32(pre, tf);
+                        let is_hi = b.cmp(CmpPred::Gt, CmpTy::I32, wave, w as i32);
+                        pre = sel_f32(b, is_hi, sum, pre);
+                    }
+                    b.add_f32(v, pre)
+                } else {
+                    let mut pre = b.c_i32(0);
+                    for (w, t) in tots.iter().enumerate() {
+                        let sum = b.add_i32(pre, *t);
+                        let is_hi = b.cmp(CmpPred::Gt, CmpTy::I32, wave, w as i32);
+                        pre = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(is_hi), a: Opnd::Val(sum), b: Opnd::Val(pre) });
+                    }
+                    b.add_i32(v, pre)
+                };
                 // exclusive = inclusive - own value; the owner is the thread with exclusive < tgt <= inclusive
                 let (hit, before) = if float {
-                    let (inf, vf) = (b.bitcast_f32(incl), b.bitcast_f32(v0z));
-                    let exf = b.sub_f32(inf, vf);
+                    let vf = b.bitcast_f32(v0z);
+                    let exf = b.sub_f32(incl, vf);
                     let g1 = b.cmp(CmpPred::Lt, CmpTy::F32, exf, tgt);
-                    let g2 = b.cmp(CmpPred::Ge, CmpTy::F32, inf, tgt);
+                    let g2 = b.cmp(CmpPred::Ge, CmpTy::F32, incl, tgt);
                     let g12 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g1), a: Opnd::I32(1), b: Opnd::I32(0) });
                     let g12 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(g2), a: Opnd::Val(g12), b: Opnd::I32(0) });
                     (b.cmp(CmpPred::Ne, CmpTy::I32, g12, 0), b.bitcast_i32(exf))
