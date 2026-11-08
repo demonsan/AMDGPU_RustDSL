@@ -247,18 +247,11 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
     me.read_back(&mut b, Opnd::Var(it), |b| {
         for t in 0..2usize {
             let w: Vec<ValueId> = [(2 * t, 0usize), (2 * t, 2), (2 * t + 1, 0), (2 * t + 1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
-            let pf = b.frag4(w[0], w[1], w[2], w[3]);
+            let pf = b.pack4(w[0], w[1], w[2], w[3]);
             for db in 0..8i32 {
-                let mut words: Vec<ValueId> = Vec::with_capacity(4);
-                for r in 0..2i32 {
-                    let a = b.bind_i32(ev(vb) + (32 * t as i32 + 16 * r) * ROW + 32 * db);
-                    let x = b.load_lds_tr_b16(a);
-                    let w0 = b.frag2_lane(x, 0);
-                    let w1 = b.frag2_lane(x, 1);
-                    words.push(b.bitcast_i32(w0));
-                    words.push(b.bitcast_i32(w1));
-                }
-                let vf = b.frag4(words[0], words[1], words[2], words[3]);
+                let a0 = b.bind_i32(ev(vb) + (32 * t as i32) * ROW + 32 * db);
+                let a1 = b.bind_i32(ev(vb) + (32 * t as i32 + 16) * ROW + 32 * db);
+                let vf = b.load_lds_tr_b16x2(a0, a1);
                 b.var_mfma(ov[db as usize], kind, vf, pf, false);
             }
         }

@@ -105,23 +105,17 @@ impl Body<'_> {
                 let (sb, tt) = (t / 2, t % 2);
                 (0..4i32)
                     .map(|e| {
-                        let mut words: Vec<ValueId> = Vec::with_capacity(4);
-                        for r in 0..2i32 {
-                            let a = b.bind_i32(ev(bases[(2 * e + r) as usize]) + (32 * sb as i32 + 16 * tt as i32) * ROW);
-                            let x = b.load_lds_tr_b16(a);
-                            let w0 = b.frag2_lane(x, 0);
-                            let w1 = b.frag2_lane(x, 1);
-                            words.push(b.bitcast_i32(w0));
-                            words.push(b.bitcast_i32(w1));
-                        }
-                        b.frag4(words[0], words[1], words[2], words[3])
+                        // the two transposed reads written straight into the operand's halves (no copies)
+                        let a0 = b.bind_i32(ev(bases[(2 * e) as usize]) + (32 * sb as i32 + 16 * tt as i32) * ROW);
+                        let a1 = b.bind_i32(ev(bases[(2 * e + 1) as usize]) + (32 * sb as i32 + 16 * tt as i32) * ROW);
+                        b.load_lds_tr_b16x2(a0, a1)
                     })
                     .collect()
             };
             let mut cur = rd(b, 0);
             for t in 0..8usize {
                 let nxt = (t + 1 < 8).then(|| rd(b, t + 1));
-                let pf = b.frag4(p[4 * t], p[4 * t + 1], p[4 * t + 2], p[4 * t + 3]);
+                let pf = b.pack4(p[4 * t], p[4 * t + 1], p[4 * t + 2], p[4 * t + 3]);
                 for e in 0..4usize {
                     b.var_mfma(o[e], kind, cur[e], pf, false);
                 }
