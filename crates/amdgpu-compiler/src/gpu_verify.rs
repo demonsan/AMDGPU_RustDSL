@@ -517,7 +517,33 @@ impl<'a> An<'a> {
             return;
         };
         if num.is_some() {
-            // hardware range check against num_records (loads read 0, stores are dropped): accepted; overstatement is checked at the descriptor
+            // hardware range check against num_records (loads read 0, stores are dropped): accepted; overstatement is checked at the descriptor.
+            // The check sees the EFFECTIVE offset voffset + soffset + imm in 32 bits: an "out-of-range" sentinel offset (e.g. -16) plus a positive
+            // instruction immediate wraps back to a small in-range offset (-16 + 16 = 0) and the access lands inside the buffer instead of being
+            // dropped. Reject (stores) / warn (loads) whenever the register offset may lie in [-imm, -1].
+            let v = match voff {
+                Some(o) => self.int_of(o),
+                None => Itv::konst(0),
+            };
+            let reg = v.add(&self.int_of(soff));
+            if imm > 0 {
+                let lo = reg.lo.iter().filter_map(|p| p.floor_const()).max();
+                let hi = reg.hi.iter().filter_map(|p| p.floor_const()).min();
+                let may_neg = lo.map_or(true, |l| l <= -1);
+                let reaches = hi.map_or(true, |h| h >= -imm);
+                if may_neg && reaches {
+                    let m = format!(
+                        "stmt {}: {what}: the register offset (voffset + soffset, interval [{}, {}]) may be a negative sentinel in [-{imm}, -1]; with the \
+                         instruction offset {imm} the 32-bit effective offset wraps into [0, {imm}) and the access lands INSIDE the buffer instead of \
+                         being dropped by the range check (use a sentinel >= num_records, e.g. 0x7fffff00, or fold the immediate into the register offset)",
+                        self.idx,
+                        lo.map_or("-inf".to_string(), |x| x.to_string()),
+                        hi.map_or("+inf".to_string(), |x| x.to_string())
+                    );
+                    self.rep.add("GV-BUF-WRAP", if store { Severity::Error } else { Severity::Warn }, m);
+                    return;
+                }
+            }
             self.rep.ok("buffer(hw-guarded)");
             return;
         }

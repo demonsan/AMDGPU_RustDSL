@@ -33,6 +33,8 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "gv_attack_assume_trusted" => Some(crate::verifier_cases::gv_attack_assume_trusted()),
         "gv_attack_lds_const" => Some(crate::verifier_cases::gv_attack_lds_const()),
         "gv_attack_desc_over" => Some(crate::verifier_cases::gv_attack_desc_over()),
+        "gv_attack_buf_wrap" => Some(crate::verifier_cases::gv_attack_buf_wrap()),
+        "gv_ok_buf_sentinel" => Some(crate::verifier_cases::gv_ok_buf_sentinel()),
         "gv_attack_clamp_path" => Some(crate::verifier_cases::gv_attack_clamp_path()),
         "probe_expr_ids" => Some(crate::probes::probe_expr_ids()),
         "probe_expr_kernarg" => Some(crate::probes::probe_expr_kernarg()),
