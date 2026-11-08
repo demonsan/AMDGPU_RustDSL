@@ -357,6 +357,52 @@ impl MmaAtom {
             provenance: Provenance::Probe("probe_mfma_p1 (crates/amdgpu-kernels/src/probes/tileops.rs)"),
         }
     }
+    /// `v_mfma_scale_f32_16x16x128_f8f6f4` with fp4 (E2M1, `cbsz` / `blgp` 4) operands: lane l holds row l % 16 and the CONTIGUOUS k = 32 (l / 16) + 0..31
+    /// (16 bytes, low nibble first) — unlike the 8-bit formats (two 16-element halves); fp6 / bf6 use the same contiguous order. C as the 16x16 atoms.
+    /// Hardware probe `probe_f8f6f4_p1` (`tools/tileop_probe.sh`; mixed fp8 x fp4 / fp4 x bf8 cases fix the order relative to the fp8 atom).
+    pub fn mfma_scale_16x16x128_f4() -> MmaAtom {
+        let ab = make_layout(tup![tup![16, 4], 32], tup![tup![1, 512], 16]);
+        MmaAtom {
+            name: "MfmaScale16x16x128F4",
+            mnemonic: "v_mfma_scale_f32_16x16x128_f8f6f4",
+            m: 16,
+            n: 16,
+            k: 128,
+            ab_bits: 4,
+            a_tv: ab.clone(),
+            b_tv: ab,
+            c_tv: make_layout(tup![tup![16, 4], 4], tup![tup![16, 4], 1]),
+            a_dwords: 4,
+            b_dwords: 4,
+            c_dwords: 4,
+            scaled: true,
+            passes: 8,
+            provenance: Provenance::Probe("probe_f8f6f4_p1 (crates/amdgpu-kernels/src/probes/tileops.rs)"),
+        }
+    }
+    /// `v_mfma_scale_f32_32x32x64_f8f6f4` with fp4 (E2M1, `cbsz` / `blgp` 4) operands: lane l holds row l % 32 and the CONTIGUOUS k = 32 (l / 32) + 0..31
+    /// (16 bytes, low nibble first) — unlike the 8-bit formats (two 16-element halves); fp6 / bf6 use the same contiguous order. C as the 32x32 atoms.
+    /// Hardware probe `probe_f8f6f4_p1` (`tools/tileop_probe.sh`; mixed fp8 x fp4 / fp4 x bf8 cases fix the order relative to the fp8 atom).
+    pub fn mfma_scale_32x32x64_f4() -> MmaAtom {
+        let ab = make_layout(tup![tup![32, 2], 32], tup![tup![1, 1024], 32]);
+        MmaAtom {
+            name: "MfmaScale32x32x64F4",
+            mnemonic: "v_mfma_scale_f32_32x32x64_f8f6f4",
+            m: 32,
+            n: 32,
+            k: 64,
+            ab_bits: 4,
+            a_tv: ab.clone(),
+            b_tv: ab,
+            c_tv: make_layout(tup![tup![32, 2], tup![4, 4]], tup![tup![32, 4], tup![1, 8]]),
+            a_dwords: 4,
+            b_dwords: 4,
+            c_dwords: 16,
+            scaled: true,
+            passes: 16,
+            provenance: Provenance::Probe("probe_f8f6f4_p1 (crates/amdgpu-kernels/src/probes/tileops.rs)"),
+        }
+    }
     /// `v_smfmac_f32_16x16x128_fp8_fp8` (sparse A, 2:4 compressed; recovered with one-hot hardware probes, `data/smfmac_16x16x128_fp8.map`, docs/isa-probes-smfmac-tr.md).
     /// Operand tiles in the usual element convention (A `m + 16 c`, B `n + 16 k`, C `m + 16 n`):
     /// * A is the COMPRESSED tile, 16 rows x 64 stored values: lane l (row m = l % 16, lane group g = l / 16) holds stored values s = 0..15 (register s / 4, byte s % 4) =
