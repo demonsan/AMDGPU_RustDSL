@@ -169,8 +169,9 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
             let rowoff = b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW);
             let kvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4));
             let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
-            let m0k = { let x = b.bind_i32(mbase.clone() + (i << 10)); b.read_first_lane(x) };
-            let m0v = { let x = b.bind_i32(mbase.clone() + (KT * ROW + (i << 10))); b.read_first_lane(x) };
+            // M0: the wave's private slice (wave-uniform: the slice key is the readfirstlane'd wave index)
+            let m0k = b.bind_i32(mbase.clone() + (i << 10));
+            let m0v = b.bind_i32(mbase.clone() + (KT * ROW + (i << 10)));
             b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
             b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
         }
