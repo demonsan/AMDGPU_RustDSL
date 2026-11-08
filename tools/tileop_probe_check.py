@@ -893,6 +893,7 @@ PROBES = {
     "probe_tileop_p1": (gen_tileop_p1, check_tileop_p1, 64 * 60),
     "probe_f8f6f4_plain": (lambda: gen_f8f6f4_p1(PLAIN_KINDS), lambda p, o: check_f8f6f4_p1(p, o, PLAIN_KINDS), sum(2 * LANES * 4 * (4 if k[0] == 16 else 16) for k in PLAIN_KINDS)),
     "probe_atomic2_p1": (gen_atomic2_p1, check_atomic2_p1, 512),
+    "probe_tr_b16_mfma2": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
