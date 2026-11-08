@@ -407,7 +407,7 @@ fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
         MOp::SMaskHi => vec![format!("s_mov_b32 {}, s{}", d_s(a, inst), a.phys[reg_of(&inst.srcs[0]) as usize] + 1)],
         MOp::LdsBpermute => vec![format!("ds_bpermute_b32 {}, {}, {}{}", d(a), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), lds_off(inst.imm))],
         MOp::LdsPermute => vec![format!("ds_permute_b32 {}, {}, {}{}", d(a), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), lds_off(inst.imm))],
-        MOp::LdsSwizzle => vec![format!("ds_swizzle_b32 {}, {} offset:{}", d(a), vr(a, reg_of(&inst.srcs[0])), inst.imm & 0xffff)],
+        MOp::LdsSwizzle => vec![format!("ds_swizzle_b32 {}, {} offset:{}", d(a), vr(a, reg_of(&inst.srcs[0])), swizzle_text(inst.imm as u16))],
         MOp::VMovDppX => vec![format!("v_mov_b32_dpp {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), dpp_mods(inst.imm))],
         MOp::VAddF32Dpp => vec![format!("v_add_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
         MOp::VSubF32Dpp => vec![format!("v_sub_f32_dpp {}, {}, {}{}", vr(a, inst.dst.expect("dst")), vr(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), dpp_mods(inst.imm))],
@@ -1136,4 +1136,37 @@ fn dpp_mods(imm: i64) -> String {
     let bank = ((imm >> 16) & 0xf) ^ 0xf;
     let bz = if (imm >> 20) & 1 != 0 { " bound_ctrl:1" } else { "" };
     format!(" {ctrl} row_mask:{row:#x} bank_mask:{bank:#x}{bz}")
+}
+
+/// The `offset:` operand of `ds_swizzle_b32` in LLVM's printed form (`swizzle(QUAD_PERM,..)`, `SWAP`, `REVERSE`, `BROADCAST`, `BITMASK_PERM`),
+/// so the own and LLVM tails print the same text.
+fn swizzle_text(imm: u16) -> String {
+    if imm & 0x8000 != 0 {
+        let p = imm & 0xff;
+        return format!("swizzle(QUAD_PERM,{},{},{},{})", p & 3, p >> 2 & 3, p >> 4 & 3, p >> 6 & 3);
+    }
+    let (and, or, xor) = (imm & 0x1f, imm >> 5 & 0x1f, imm >> 10 & 0x1f);
+    if and == 0x1f && or == 0 && xor.count_ones() == 1 {
+        return format!("swizzle(SWAP,{xor})");
+    }
+    if and == 0x1f && or == 0 && xor > 0 && (xor + 1).is_power_of_two() {
+        return format!("swizzle(REVERSE,{})", xor + 1);
+    }
+    let group = 0x1f - and + 1;
+    if group > 1 && group.is_power_of_two() && or < group && xor == 0 {
+        return format!("swizzle(BROADCAST,{group},{or})");
+    }
+    let s: String = (0..5)
+        .rev()
+        .map(|i| {
+            let (a, o, x) = (and >> i & 1, or >> i & 1, xor >> i & 1);
+            match (a, o, x) {
+                (0, 0, _) => '0',
+                (0, 1, _) => '1',
+                (_, _, 1) => 'i',
+                _ => 'p',
+            }
+        })
+        .collect();
+    format!("swizzle(BITMASK_PERM,\"{s}\")")
 }
