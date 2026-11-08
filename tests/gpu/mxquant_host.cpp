@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
     memcpy(&a[0], &dx, 8); memcpy(&a[8], &dq, 8); memcpy(&a[16], &ds, 8); memcpy(&a[24], &M, 4);
     size_t asz = a.size();
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, a.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};
-    int gx = f4 ? K / 2048 : K / 512, gy = f4 ? M / 16 : M / 64;
+    int gx = f4 ? (K / 512 + 3) / 4 : K / 512, gy = f4 ? M / 16 : M / 64;
     auto launch = [&]() { HC(hipModuleLaunchKernel(fn, gx, gy, 1, 256, 1, 1, 0, nullptr, nullptr, cfg)); };
     launch();
     HC(hipDeviceSynchronize());

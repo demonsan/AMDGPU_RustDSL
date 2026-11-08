@@ -5,7 +5,7 @@
 //!   of tile 2 p + 1). Scale rule = aiter's `dynamic_mxfp4_quant`: amax rounded at mantissa bit 21 (+0x200000, truncate), e8m0 = exponent
 //!   of that - 2 (fp4 max 6 = 1.5 2^2), clamp [0, 254]; q = fp4(x / 2^(e8m0 - 127)) (hardware RNE, saturating).
 //!   One wave per (16-row block, tile pair): lane (r = l % 16, g = l / 16) quantizes groups {16 p + g + 4 j} of row 16 rb + r.
-//!   M % 16 == 0, K % 512 == 0. Grid (K / 2048, M / 16) x 256 threads (wave w: tile pair 4 x + w).
+//!   M % 16 == 0, K % 512 == 0. Grid (ceil(K / 2048), M / 16) x 256 threads (wave w: tile pair min(4 x + w, KT / 2 - 1)).
 //! * `quant_mxfp8_bf16_k<K>`: x bf16 [M, K] -> q fp8 e4m3 [M, K] + 1 x 128 E8M0 scales [K / 128][M] (the `gemm_mxfp8_bs_v4` A-scale
 //!   layout, K-major). e8m0 = ceil(log2(amax / 448)) + 127 (no saturation), clamp [0, 254]. Lane = row (64 rows per wave), one 128-wide
 //!   group per wave: grid (K / 512, M / 64) x 256 threads (wave w: group 4 x + w). M % 64 == 0, K % 512 == 0.
@@ -55,7 +55,7 @@ fn mxfp4(name: &str, k: i64) -> Function {
     b.compile_profile(CompileProfile::Gemm);
     let kt = k / 256;
     abi(&mut b, 16, k, k / 2, k / 32);
-    b.grid_is(0, Ext::c(k / 2048));
+    b.grid_is(0, Ext::c((k / 512 + 3) / 4));
     b.grid_is(1, Ext::sym("MB"));
     let kp = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargPtr { offset: o });
     let (p_x, p_q, p_s) = (kp(&mut b, 0), kp(&mut b, 8), kp(&mut b, 16));
@@ -65,7 +65,8 @@ fn mxfp4(name: &str, k: i64) -> Function {
     let lane = Lane::new(&mut b);
     let r = b.bind_i32(lane.lane() & 15);
     let g = b.bind_i32(lane.lane().lshr(4));
-    let p = { let v = b.bind_i32((ev(x0) << 2) + lane.wave()); b.read_first_lane(v) };
+    // tile pair of this wave (waves past the last pair of K % 2048 != 0 redo the last pair: same values)
+    let p = { let v = b.bind_i32(((ev(x0) << 2) + lane.wave()).min(kt as i32 / 2 - 1)); b.read_first_lane(v) };
     let row = b.bind_i32((ev(rb) << 4) + ev(r));
     let nx = { let v = b.bind_i32(ev(m_v) * (2 * k as i32)); b.read_first_lane(v) };
     let nq = { let v = b.bind_i32(ev(m_v) * (k as i32 / 2)); b.read_first_lane(v) };
@@ -95,10 +96,13 @@ fn mxfp4(name: &str, k: i64) -> Function {
         // 32 values -> 16 bytes: v_cvt_scalef32_pk_fp4_f32 packs two values per byte (sel = byte)
         let mut words: Vec<ValueId> = Vec::with_capacity(4);
         for w in 0..4usize {
+            // each pair converted into byte 0 of a fresh word, then shifted into place
+            let z = b.c_i32(0);
             let mut acc = b.c_i32(0);
             for byte in 0..4usize {
                 let i = 8 * w + 2 * byte;
-                acc = b.cvt(CvtOp::ScalePkFp4F32, &[Opnd::Val(xs[i]), Opnd::Val(xs[i + 1]), Opnd::Val(sf), Opnd::Val(acc)], byte as u8);
+                let pk = b.cvt(CvtOp::ScalePkFp4F32, &[Opnd::Val(xs[i]), Opnd::Val(xs[i + 1]), Opnd::Val(sf), Opnd::Val(z)], 0);
+                acc = b.bind_i32(ev(acc) | ((ev(pk) & 0xff) << (8 * byte as i32)));
             }
             words.push(acc);
         }
