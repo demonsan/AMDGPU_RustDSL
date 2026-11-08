@@ -1128,3 +1128,27 @@ impl Plan {
         Ok(find_slot(&mask, c, from_top))
     }
 }
+
+/// The launch-time register budget of a workgroup: its waves are spread over the 4 SIMDs of a CU, so ceil(waves / 4) of them share one
+/// SIMD's 512-entry (unified VGPR + AGPR) file; each wave allocates its register count in granules of 8. A kernel over that budget assembles
+/// and verifies but fails to launch (`HSA_STATUS_ERROR_INVALID_ISA`). Err with an explanation when `m` does not fit.
+pub fn check_workgroup_budget(m: &crate::mir::MFunction, a: &Alloc) -> Result<(), String> {
+    let n_agpr = agpr_count(m, a);
+    let (_, total, _) = unified_budget(a.max_v, n_agpr);
+    let per_wave = (total + 7) / 8 * 8;
+    let waves = (m.workgroup_size + 63) / 64;
+    let per_simd = ((waves + 3) / 4).max(1);
+    let limit = UNIFIED_FILE / per_simd / 8 * 8;
+    if per_wave > limit {
+        return Err(format!(
+            "register budget: workgroup_size {} = {waves} waves -> {per_simd} per SIMD, so each wave may use at most {limit} registers (VGPR + AGPR, \
+             granule 8), but `{}` needs {per_wave} ({} VGPRs{}); the kernel would fail to launch (HSA_STATUS_ERROR_INVALID_ISA). Use fewer threads \
+             per workgroup or fewer live registers",
+            m.workgroup_size,
+            m.name,
+            a.max_v,
+            if n_agpr > 0 { format!(" + {n_agpr} AGPRs") } else { String::new() }
+        ));
+    }
+    Ok(())
+}
