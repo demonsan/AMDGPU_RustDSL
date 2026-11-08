@@ -51,6 +51,8 @@ struct Body<'a> {
     o: Vec<VarId>,
     s: Vec<VarId>,
     p: Vec<ValueId>,
+    /// the vendor's priority ping-pong: s_setprio 1 in the matrix phase, 0 in the softmax phase
+    prio: bool,
 }
 
 impl Body<'_> {
@@ -164,6 +166,9 @@ impl PipeBody for Body<'_> {
         self.s = vars[6..10].to_vec();
     }
     fn v_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+        if self.prio {
+            b.set_prio(0);
+        }
         let (m_v, l_v) = (self.m.expect("m"), self.l.expect("l"));
         let s = self.s.clone();
         // the key mask on tiles past the smallest limit of the CTA (uniform branch, VALU only): masked lanes' S = -inf in place
@@ -243,6 +248,9 @@ impl PipeBody for Body<'_> {
             .collect();
     }
     fn m_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+        if self.prio {
+            b.set_prio(1);
+        }
         self.pv(b, &t.cur);
         if t.staged {
             let s = self.s.clone();
@@ -369,7 +377,7 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     roles.each(&mut b, |b, role| {
         let mut body = Body {
             ring: &ring, kind, qf: &qf, kr: &kr, vr, csc, neg_inf, zero16, half, row, lim, lim_min,
-            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(),
+            s_init: Vec::new(), m: None, l: None, o: Vec::new(), s: Vec::new(), p: Vec::new(), prio: std::env::var("EXP_NOPRIO").is_err(),
         };
         pipe.run(b, role, &mut body);
         // ---- epilogue: O = O^T / l (bf16, 8-byte stores), LSE ----
