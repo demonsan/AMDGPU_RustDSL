@@ -1157,3 +1157,66 @@ pub fn probe_lds_high() -> Function {
     }
     b.finish()
 }
+
+/// `probe_ifelse(in, out)`: the MLA-decode pattern (kernel-opt): values defined BEFORE a wave-uniform if / else (a zero, the per-lane
+/// `live` select, an out-of-range sentinel) used only in the ELSE arm, while the THEN arm runs a register-hungry loop. in[0] = n (uniform):
+/// n > 0 runs the then arm, else the else arm stores -inf to out[l] for live lanes (l < 40) through a buffer descriptor (dead lanes: the
+/// sentinel offset, dropped) and 0 to out[64 + l] for all lanes. The host runs it with n = 0 (else arm) and n = 3 (then arm: out[l] = sum).
+pub fn probe_ifelse() -> Function {
+    use amdgpu_dsl::MemTy;
+    let mut b = FnBuilder::new("probe_ifelse", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(256 * 4));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(128 * 4));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let r_in = b.buffer_desc(inp, 1024);
+    let r_out = b.buffer_desc(out, 512);
+    let c0 = b.c_i32(0);
+    let n = { let v = b.buffer_load_n(r_in, Some(Opnd::Val(c0)), 0, 0, MemTy::B32); b.read_first_lane(v) };
+    let zero = b.c_i32(0);
+    let big = b.c_i32(0x7fff_fff0);
+    let live = b.cmp(CmpPred::Lt, CmpTy::I32, tid, 40);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(off4), b: Opnd::Val(big) });
+    let ninf = b.c_f32(f32::NEG_INFINITY);
+    let go = b.cmp(CmpPred::Gt, CmpTy::I32, n, 0);
+    b.begin_if(Opnd::Val(go));
+    {
+        // register-hungry loop: 48 loaded values accumulated per iteration
+        let init: Vec<(DType, Opnd)> = (0..48).map(|_| (DType::I32, Opnd::I32(0))).chain([(DType::I32, Opnd::I32(0))]).collect();
+        let vars = b.begin_loop(&init);
+        let it = vars[48];
+        let mut s = b.c_i32(0);
+        for j in 0..48usize {
+            let o = b.add_i32(off4, (4 * (j % 8) as i32) + 256);
+            let x = b.buffer_load_n(r_in, Some(Opnd::Val(o)), 0, 0, MemTy::B32);
+            let y = b.add_i32(Opnd::Var(vars[j]), x);
+            b.set_var(vars[j], y);
+        }
+        for j in 0..48usize {
+            s = b.add_i32(s, Opnd::Var(vars[j]));
+        }
+        let _ = s;
+        let i2 = b.add_i32(Opnd::Var(it), 1);
+        b.set_var(it, i2);
+        let done = b.cmp(CmpPred::Ge, CmpTy::I32, i2, n);
+        b.break_if(done);
+        b.end_loop();
+        let mut s = b.c_i32(0);
+        for j in 0..48usize {
+            s = b.add_i32(s, Opnd::Var(vars[j]));
+        }
+        b.buffer_store_n(r_out, Some(Opnd::Val(off4)), 0, 0, s, MemTy::B32, false);
+    }
+    b.else_();
+    {
+        let nb = b.let_(Op::BitcastI32(Opnd::Val(ninf)));
+        b.buffer_store_n(r_out, Some(Opnd::Val(vo)), 0, 0, nb, MemTy::B32, false);
+        b.buffer_store_n(r_out, Some(Opnd::Val(off4)), 0, 256, zero, MemTy::B32, false);
+    }
+    b.end_if();
+    b.finish()
+}

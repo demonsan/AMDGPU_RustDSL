@@ -954,6 +954,15 @@ def check_lds_high(planes, out):
               ("" if m0 < 0x20000 else f"; marker at M0 - 128 KiB {'intact' if kept else ('OVERWRITTEN by the DMA (M0 wraps at 2^17)' if wrapped else 'changed')}"))
     return ok
 
+# ---------------------------------------------------------------- probe_ifelse (n = 0: the else arm)
+def check_ifelse(planes, out):
+    ninf = 0xFF800000
+    a = all(out[l] == (ninf if l < 40 else 0xA5A5A5A5) for l in range(64))
+    z = all(out[64 + l] == 0 for l in range(64))
+    print(("ok   " if a else "FAIL ") + "else arm: -inf at live lanes (l < 40), dead lanes dropped" + ("" if a else f": got {[hex(v) for v in out[:4]]} .. {[hex(v) for v in out[38:42]]}"))
+    print(("ok   " if z else "FAIL ") + "else arm: zero stores")
+    return a and z
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -972,6 +981,7 @@ PROBES = {
     "probe_anylane": (lambda: [[0] * LANES], check_anylane, 9 * LANES * 4),
     "probe_reload_p1": (gen_reload_p1, check_reload_p1, 4 * 1024),
     "probe_lds_high": (gen_lds_high, check_lds_high, 5 * 64 * 20),
+    "probe_ifelse": (lambda: [[0] * 256], check_ifelse, 128 * 4),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
