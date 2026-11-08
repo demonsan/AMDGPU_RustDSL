@@ -472,6 +472,18 @@ fn add_cost(a: &mut UnitCost, b: &UnitCost) {
     a.xdl_busy = a.xdl_busy.max(b.xdl_busy);
 }
 
+fn is_view_extract(n: &Node) -> bool {
+    matches!(n, Node::S(amdgpu_dsl::Stmt::Let { op: amdgpu_dsl::Op::Frag16Lane { frag: amdgpu_dsl::Opnd::Var(_), .. }, .. }))
+}
+
+/// `b` is a bitcast of exactly the value `a` defines.
+fn uses_only_value_of(b: &Node, a: &Node) -> bool {
+    match (a, b) {
+        (Node::S(amdgpu_dsl::Stmt::Let { dst, .. }), Node::S(amdgpu_dsl::Stmt::Let { op: amdgpu_dsl::Op::BitcastF32(amdgpu_dsl::Opnd::Val(v)), .. })) => v == dst,
+        _ => false,
+    }
+}
+
 fn data_dep(a: &Facts, b: &Facts) -> bool {
     let hits = |x: &[amdgpu_dsl::VarId], y: &[amdgpu_dsl::VarId]| x.iter().any(|v| y.contains(v));
     b.uses.iter().any(|u| a.defs.contains(u)) || hits(&a.var_writes, &b.var_reads) || hits(&a.var_reads, &b.var_writes) || hits(&a.var_writes, &b.var_writes)
@@ -480,7 +492,17 @@ fn data_dep(a: &Facts, b: &Facts) -> bool {
 /// Items of a capture: the top-level nodes (weave-region mark pairs stay together as one item), their dependences from `facts::must_order`, their costs from the resource classes, the register model at value
 /// level. Returns the items and, per item, the node range it stands for.
 pub fn items_from_nodes(f: &Function, cap: &Captured) -> (Vec<Item>, Vec<std::ops::Range<usize>>) {
-    let groups = cap.groups();
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    for r in cap.groups() {
+        // a lane extracted from a loop variable is a register view (lowering: `alias_vreg`): keep it adjacent to the bitcast that consumes it
+        if let (Some(last), 1) = (groups.last_mut(), r.len()) {
+            if last.len() == 1 && is_view_extract(&cap.nodes[last.start]) && uses_only_value_of(&cap.nodes[r.start], &cap.nodes[last.start]) {
+                last.end = r.end;
+                continue;
+            }
+        }
+        groups.push(r);
+    }
     let node_facts: Vec<Facts> = cap.facts(f);
     let facts_of = |r: &std::ops::Range<usize>| -> Facts {
         if r.len() == 1 {
