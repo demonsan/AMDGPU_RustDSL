@@ -2,7 +2,7 @@
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
-    &["probe_agpr_ref", "probe_agpr_acc", "probe_agpr_full", "probe_agpr_pinned", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_scale", "probe_lds_self2", "probe_roles_loop", "probe_lds_tr_b8", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg", "probe_valu_p1", "probe_mem_p1", "probe_mfma_p1"]
+    &["probe_agpr_ref", "probe_agpr_acc", "probe_agpr_full", "probe_agpr_pinned", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_scale", "probe_lds_self2", "probe_roles_loop", "probe_lds_tr_b8", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg", "probe_valu_p1", "probe_mem_p1", "probe_mfma_p1", "probe_f8f6f4_p1"]
 }
 
 pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
@@ -12,6 +12,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_valu_p1" => Some(crate::probes::tileops::probe_valu_p1()),
         "probe_mem_p1" => Some(crate::probes::tileops::probe_mem_p1()),
         "probe_mfma_p1" => Some(crate::probes::tileops::probe_mfma_p1()),
+        "probe_f8f6f4_p1" => Some(crate::probes::tileops::probe_f8f6f4_p1()),
         "probe_agpr_ref" => Some(crate::probes::probe_agpr_ref()),
         "probe_agpr_acc" => Some(crate::probes::probe_agpr_acc()),
         "probe_agpr_full" => Some(crate::probes::probe_agpr_full()),
@@ -34,7 +35,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_lds_self2" => Some(crate::probes::probe_lds_self2()),
         "probe_roles_loop" => Some(crate::probes::probe_roles_loop()),
         "probe_lds_tr_b8" => Some(crate::probes::probe_lds_tr_b8()),
-        n if (n.starts_with("gemm_mxfp8_bs_v") || n.starts_with("gemm_a8w8_")) && crate::gemm::by_name(n).is_some() => crate::gemm::by_name(n),
+        n if (n.starts_with("gemm_mxfp8_bs_v") || n.starts_with("gemm_a8w8_") || n.starts_with("gemm_a16w16_") || n.starts_with("gemm_a4w4_")) && crate::gemm::by_name(n).is_some() => crate::gemm::by_name(n),
         n if n.starts_with("handoff_probe_") => crate::probes::handoff::by_name(n),
         n if n.starts_with("mlp_fp8_") => crate::mlp::by_name(n),
         // P2 (stage library): RMSNorm + per-token fp8 quantization from the generic E / R / Q stages; N in the name (multiple of 512)

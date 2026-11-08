@@ -30,3 +30,18 @@ fn p1_mfma_atoms_match_the_probed_layout() {
         assert_eq!(atom.a_dwords * 32 / atom.ab_bits, per as u32);
     }
 }
+
+#[test]
+fn fp4_atoms_are_contiguous_in_k_and_the_fp8_atom_is_split() {
+    for (atom, fp8) in [(MmaAtom::mfma_scale_16x16x128_f4(), MmaAtom::mfma_scale_16x16x128_f8()), (MmaAtom::mfma_scale_32x32x64_f4(), MmaAtom::mfma_scale_32x32x64_f8())] {
+        let m = atom.m;
+        let g = 64 / m;
+        for lane in 0..64i64 {
+            for v in 0..32i64 {
+                assert_eq!(atom.a_tv.at(lane + 64 * v), lane % m + m * (32 * (lane / m) + v), "{}", atom.name);
+                // the measured 8-bit order: k = 16 (l / M) + v % 16 + 16 G (v / 16)
+                assert_eq!(fp8.a_tv.at(lane + 64 * v), lane % m + m * (16 * (lane / m) + v % 16 + 16 * g * (v / 16)), "{}", fp8.name);
+            }
+        }
+    }
+}

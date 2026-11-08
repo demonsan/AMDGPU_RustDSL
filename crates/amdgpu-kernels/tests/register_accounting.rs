@@ -385,7 +385,8 @@ fn audit_asm(kernel: &str, asm: &str) -> Vec<String> {
                         ));
                     }
                     if m.starts_with("v_mfma") && r.width > 1 && !r.scalar {
-                        if r.base % r.width != 0 || r.base % 2 != 0 {
+                        // tuples are aligned to their width rounded up to a power of two (a 6-dword fp6 operand sits in an 8-aligned slot)
+                        if r.base % r.width.next_power_of_two() != 0 || r.base % 2 != 0 {
                             bad.push(format!(
                                 "{kernel}: {m} tuple v[{}:{}] (width {}) is not aligned to its width",
                                 r.base,

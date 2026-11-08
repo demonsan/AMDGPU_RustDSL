@@ -200,12 +200,14 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
         }
         "imm" => format!("{}", inst.imm),
         // two-address DS offsets (imm = offset0 | offset1 << 8)
+        "cbsz" => format!("{}", (inst.imm >> 8) & 7),
+        "blgp" => format!("{}", (inst.imm >> 12) & 7),
         "off0" => format!("{}", inst.imm & 0xff),
         "off1" => format!("{}", (inst.imm >> 8) & 0xff),
         // the first three dwords of a 4-dword tuple (96-bit accesses use V4 registers)
         "d3" => {
             let d = dst()?;
-            (0..3).map(|k| dword_name(cx.class(d), cx.phys(d), k)).collect::<Vec<_>>().join("_").replacen("_$", "_", 2)
+            (0..3).map(|k| dword_name(cx.class(d), cx.phys(d), k)).collect::<Vec<_>>().join("_").replace("_$", "_")
         }
         "imm32" => format!("{}", inst.imm as i32),
         "i0" => match inst.srcs.first() {
@@ -229,10 +231,12 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
         "vmcnt" => format!("{}", waitcnt_imm(Some(inst.imm as u32), None)),
         "lgkmcnt" => format!("{}", waitcnt_imm(None, Some(inst.imm as u32))),
         "t" => cx.target.clone().ok_or("{t} outside a terminator")?,
-        s if s.starts_with('s') && s.ends_with("t3") && s[1..s.len() - 2].chars().all(|c| c.is_ascii_digit()) && s.len() > 3 => {
-            let n: usize = s[1..s.len() - 2].parse().unwrap();
+        // `sNtK`: the first K dwords of source N (96-bit accesses, fp6 MFMA operands held in wider tuples)
+        s if s.starts_with('s') && s[1..].contains('t') && s[1..].split('t').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) => {
+            let (n, k) = s[1..].split_once('t').unwrap();
+            let (n, k): (usize, u32) = (n.parse().unwrap(), k.parse().unwrap());
             let r = src_reg(inst, n)?;
-            (0..3).map(|k| dword_name(cx.class(r), cx.phys(r), k)).collect::<Vec<_>>().join("_").replacen("_$", "_", 2)
+            (0..k).map(|j| dword_name(cx.class(r), cx.phys(r), j)).collect::<Vec<_>>().join("_").replace("_$", "_")
         }
         s if s.starts_with('s') && s[1..].chars().all(|c| c.is_ascii_digit()) && s.len() > 1 => {
             let n: usize = s[1..].parse().unwrap();

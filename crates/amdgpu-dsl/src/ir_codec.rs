@@ -129,6 +129,7 @@ impl FromIr for Op {
             "Frag2" => { v.expect_tuple("Frag2", 2)?; Ok(Op::Frag2(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?)) }
             "Frag2Lane" => { v.expect_struct("Frag2Lane")?; Ok(Op::Frag2Lane { frag: FromIr::from_ir(v.field("frag")?)?, index: FromIr::from_ir(v.field("index")?)? }) }
             "VarSlice8" => { v.expect_struct("VarSlice8")?; Ok(Op::VarSlice8 { var: FromIr::from_ir(v.field("var")?)?, half: FromIr::from_ir(v.field("half")?)? }) }
+            "VarSlice4" => { v.expect_struct("VarSlice4")?; Ok(Op::VarSlice4 { var: FromIr::from_ir(v.field("var")?)?, idx: FromIr::from_ir(v.field("idx")?)? }) }
             "Permlane32Swap" => { v.expect_struct("Permlane32Swap")?; Ok(Op::Permlane32Swap { a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
             "Frag4" => { v.expect_tuple("Frag4", 4)?; Ok(Op::Frag4(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?, FromIr::from_ir(v.item(3)?)?)) }
             "Frag4Lane" => { v.expect_struct("Frag4Lane")?; Ok(Op::Frag4Lane { frag: FromIr::from_ir(v.field("frag")?)?, index: FromIr::from_ir(v.field("index")?)? }) }
@@ -230,6 +231,7 @@ impl IrIds for Op {
             Op::Frag2(x0, x1) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); }
             Op::Frag2Lane { frag, index } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*index), fv, fr); }
             Op::VarSlice8 { var, half } => { fr(&mut (*var)); IrIds::ids(&mut (*half), fv, fr); }
+            Op::VarSlice4 { var, idx } => { fr(&mut (*var)); IrIds::ids(&mut (*idx), fv, fr); }
             Op::Permlane32Swap { a, b } => { IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
             Op::Frag4(x0, x1, x2, x3) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); }
             Op::Frag4Lane { frag, index } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*index), fv, fr); }
