@@ -13,6 +13,7 @@ use amdgpu_tile::{contract, Ctx};
 pub mod io;
 pub mod graph;
 pub mod bf16;
+pub mod bwd;
 pub mod decode;
 pub mod mla;
 mod skeleton_kvsplit;
