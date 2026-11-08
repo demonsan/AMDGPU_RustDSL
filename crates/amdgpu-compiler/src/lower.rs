@@ -1949,13 +1949,19 @@ impl Lowerer {
                 }
                 Stmt::VarMfma { var, kind, a, b, scale: _, zero } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
-                    let (mop, zmop) = mfma_mop(*kind)?;
-                    let ra = self.as_v4(*a)?;
-                    let rb = self.as_v4(*b)?;
+                    let (mop, zmop, imm) = match plain_f8f6f4_mop(*kind) {
+                        Some(x) => x,
+                        None => {
+                            let (m, z) = mfma_mop(*kind)?;
+                            (m, z, 0)
+                        }
+                    };
+                    let ra = self.mma_operand(*kind, kind.a, *a)?;
+                    let rb = self.mma_operand(*kind, kind.b, *b)?;
                     if *zero {
-                        self.push(MInst::new(zmop).def(v).srcreg(ra).srcreg(rb));
+                        self.push(MInst::new(zmop).def(v).srcreg(ra).srcreg(rb).imm(imm));
                     } else {
-                        self.push(MInst::new(mop).def(v).srcreg(ra).srcreg(rb).srcreg(v));
+                        self.push(MInst::new(mop).def(v).srcreg(ra).srcreg(rb).srcreg(v).imm(imm));
                     }
                 }
                 Stmt::AtomicLdsNoRet { op, addr, value } => {
@@ -2571,9 +2577,15 @@ impl Lowerer {
                 }
             }
             Op::Mfma { kind, a, b, c, scale: _ } => {
-                let (mop, zmop) = mfma_mop(*kind)?;
-                let ra = self.as_v4(*a)?;
-                let rb = self.as_v4(*b)?;
+                let (mop, zmop, imm) = match plain_f8f6f4_mop(*kind) {
+                    Some(x) => x,
+                    None => {
+                        let (m, z) = mfma_mop(*kind)?;
+                        (m, z, 0)
+                    }
+                };
+                let ra = self.mma_operand(*kind, kind.a, *a)?;
+                let rb = self.mma_operand(*kind, kind.b, *b)?;
                 let n = kind.acc_dwords();
                 let cls = if n == 4 { RClass::V4 } else { RClass::V16 };
                 match c {
@@ -2587,12 +2599,12 @@ impl Lowerer {
                             self.copy_reg(d, rc)?;
                             d
                         };
-                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(d));
+                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(d).imm(imm));
                         self.val.insert(dst, d);
                     }
                     _ => {
                         let d = self.new_vreg(cls);
-                        self.push(MInst::new(zmop).def(d).srcreg(ra).srcreg(rb));
+                        self.push(MInst::new(zmop).def(d).srcreg(ra).srcreg(rb).imm(imm));
                         self.val.insert(dst, d);
                     }
                 }
@@ -4534,5 +4546,37 @@ fn global_atomic_mop(o: amdgpu_dsl::AtomicOp, rtn: bool) -> MOp {
         (A::IncU32, true) => MOp::GlobalAtomicIncU32Rtn,
         (A::AddF32, false) => MOp::GlobalAtomicAddF32,
         (A::AddF32, true) => MOp::GlobalAtomicAddF32Rtn,
+    }
+}
+
+/// (C form, zero-C form, imm = cbsz << 8 | blgp << 12) of an UNSCALED f8f6f4 MFMA kind (None for the other kinds).
+fn plain_f8f6f4_mop(k: amdgpu_dsl::MmaKind) -> Option<(MOp, MOp, i64)> {
+    use amdgpu_dsl::{MmaKind, MmaShape as S};
+    if k.scaled || !matches!(k.shape, S::M16N16K128 | S::M32N32K64) {
+        return None;
+    }
+    let (ca, cb) = (MmaKind::f8f6f4_code(k.a)?, MmaKind::f8f6f4_code(k.b)?);
+    let imm = ((ca as i64) << 8) | ((cb as i64) << 12);
+    let m = |c: MOp, z: MOp| Some((c, z, imm));
+    match (k.shape, k.operand_dwords(k.a), k.operand_dwords(k.b)) {
+        (S::M16N16K128, 4, 4) => m(MOp::VMfmaPlain16x16x128A4B4, MOp::VMfmaPlain16x16x128A4B4Z),
+        (S::M16N16K128, 4, 6) => m(MOp::VMfmaPlain16x16x128A4B6, MOp::VMfmaPlain16x16x128A4B6Z),
+        (S::M16N16K128, 4, 8) => m(MOp::VMfmaPlain16x16x128A4B8, MOp::VMfmaPlain16x16x128A4B8Z),
+        (S::M16N16K128, 6, 4) => m(MOp::VMfmaPlain16x16x128A6B4, MOp::VMfmaPlain16x16x128A6B4Z),
+        (S::M16N16K128, 6, 6) => m(MOp::VMfmaPlain16x16x128A6B6, MOp::VMfmaPlain16x16x128A6B6Z),
+        (S::M16N16K128, 6, 8) => m(MOp::VMfmaPlain16x16x128A6B8, MOp::VMfmaPlain16x16x128A6B8Z),
+        (S::M16N16K128, 8, 4) => m(MOp::VMfmaPlain16x16x128A8B4, MOp::VMfmaPlain16x16x128A8B4Z),
+        (S::M16N16K128, 8, 6) => m(MOp::VMfmaPlain16x16x128A8B6, MOp::VMfmaPlain16x16x128A8B6Z),
+        (S::M16N16K128, 8, 8) => m(MOp::VMfmaPlain16x16x128A8B8, MOp::VMfmaPlain16x16x128A8B8Z),
+        (S::M32N32K64, 4, 4) => m(MOp::VMfmaPlain32x32x64A4B4, MOp::VMfmaPlain32x32x64A4B4Z),
+        (S::M32N32K64, 4, 6) => m(MOp::VMfmaPlain32x32x64A4B6, MOp::VMfmaPlain32x32x64A4B6Z),
+        (S::M32N32K64, 4, 8) => m(MOp::VMfmaPlain32x32x64A4B8, MOp::VMfmaPlain32x32x64A4B8Z),
+        (S::M32N32K64, 6, 4) => m(MOp::VMfmaPlain32x32x64A6B4, MOp::VMfmaPlain32x32x64A6B4Z),
+        (S::M32N32K64, 6, 6) => m(MOp::VMfmaPlain32x32x64A6B6, MOp::VMfmaPlain32x32x64A6B6Z),
+        (S::M32N32K64, 6, 8) => m(MOp::VMfmaPlain32x32x64A6B8, MOp::VMfmaPlain32x32x64A6B8Z),
+        (S::M32N32K64, 8, 4) => m(MOp::VMfmaPlain32x32x64A8B4, MOp::VMfmaPlain32x32x64A8B4Z),
+        (S::M32N32K64, 8, 6) => m(MOp::VMfmaPlain32x32x64A8B6, MOp::VMfmaPlain32x32x64A8B6Z),
+        (S::M32N32K64, 8, 8) => m(MOp::VMfmaPlain32x32x64A8B8, MOp::VMfmaPlain32x32x64A8B8Z),
+        _ => None,
     }
 }

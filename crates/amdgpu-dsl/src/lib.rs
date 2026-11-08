@@ -191,6 +191,10 @@ impl MmaKind {
     pub const fn scaled_f8f6f4(shape: MmaShape, a: MmaTy, b: MmaTy) -> MmaKind {
         MmaKind { shape, a, b, scaled: true }
     }
+    /// An unscaled f8f6f4 kind (`v_mfma_f32_{16x16x128,32x32x64}_f8f6f4`): no scale operands.
+    pub const fn f8f6f4(shape: MmaShape, a: MmaTy, b: MmaTy) -> MmaKind {
+        MmaKind { shape, a, b, scaled: false }
+    }
     /// Accumulator / result dwords per lane (16x16: 4, 32x32: 16).
     pub fn acc_dwords(self) -> u32 {
         match self.shape {
@@ -220,9 +224,12 @@ impl MmaKind {
         use MmaShape as S;
         use MmaTy as T;
         let f8f6f4 = |t: MmaTy| matches!(t, T::Fp8 | T::Bf8 | T::Fp6 | T::Bf6 | T::Fp4);
+        if matches!(self.shape, S::M16N16K128 | S::M32N32K64) {
+            // f8f6f4 with A / B format select (mixed formats allowed), block-scaled or not (unscaled: no scale operands, no unit-scale constants)
+            return f8f6f4(self.a) && f8f6f4(self.b);
+        }
         if self.scaled {
-            // block-scaled f8f6f4 with A / B format select (mixed formats allowed)
-            return matches!(self.shape, S::M16N16K128 | S::M32N32K64) && f8f6f4(self.a) && f8f6f4(self.b);
+            return false;
         }
         self.a == self.b && matches!((self.shape, self.a), (S::M16N16K32 | S::M32N32K16, T::Bf16 | T::F16) | (S::M16N16K64 | S::M32N32K32, T::I8))
     }
