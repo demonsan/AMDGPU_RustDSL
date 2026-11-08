@@ -606,6 +606,56 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
                 tuple(a, c_reg, 4)
             )]
         }
+        MOp::GlobalLoadU8 => vec![format!("global_load_ubyte {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadI8 => vec![format!("global_load_sbyte {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadI16 => vec![format!("global_load_sshort {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadB64 => vec![format!("global_load_dwordx2 {}, {}", tuple(a, inst.dst.expect("dst"), 2), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadB96 => vec![format!("global_load_dwordx3 {}, {}", tuple(a, inst.dst.expect("dst"), 3), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16U8 => vec![format!("global_load_ubyte_d16 {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16U8Hi => vec![format!("global_load_ubyte_d16_hi {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16I8 => vec![format!("global_load_sbyte_d16 {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16I8Hi => vec![format!("global_load_sbyte_d16_hi {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16B16 => vec![format!("global_load_short_d16 {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16B16Hi => vec![format!("global_load_short_d16_hi {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalStoreB8 => vec![format!("global_store_byte {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalStoreB8Hi => vec![format!("global_store_byte_d16_hi {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalStoreB16Hi => vec![format!("global_store_short_d16_hi {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalStoreB96 => vec![format!("global_store_dwordx3 {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), tuple(a, reg_of(&inst.srcs[1]), 3), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::BufferLoadU8 => vec![format!("buffer_load_ubyte {}, {}", d(a), mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))],
+        MOp::BufferLoadI8 => vec![format!("buffer_load_sbyte {}, {}", d(a), mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))],
+        MOp::BufferLoadU16 => vec![format!("buffer_load_ushort {}, {}", d(a), mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))],
+        MOp::BufferLoadI16 => vec![format!("buffer_load_sshort {}, {}", d(a), mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))],
+        MOp::BufferLoadB96 => vec![format!("buffer_load_dwordx3 {}, {}", tuple(a, inst.dst.expect("dst"), 3), mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))],
+        MOp::BufferStoreB8 => vec![format!("buffer_store_byte {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
+        MOp::BufferStoreB16 => vec![format!("buffer_store_short {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
+        MOp::BufferStoreB8Hi => vec![format!("buffer_store_byte_d16_hi {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
+        MOp::BufferStoreB16Hi => vec![format!("buffer_store_short_d16_hi {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
+        MOp::BufferStoreB96 => vec![format!("buffer_store_dwordx3 {}, {}", tuple(a, reg_of(&inst.srcs[0]), 3), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
+        MOp::LdsReadU8 => vec![format!("ds_read_u8 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadI8 => vec![format!("ds_read_i8 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadU16 => vec![format!("ds_read_u16 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadI16 => vec![format!("ds_read_i16 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadB96 => vec![format!("ds_read_b96 {}, {}{}", tuple(a, inst.dst.expect("dst"), 3), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadB64TrB16 => vec![format!("ds_read_b64_tr_b16 {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16U8 => vec![format!("ds_read_u8_d16 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16U8Hi => vec![format!("ds_read_u8_d16_hi {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16I8 => vec![format!("ds_read_i8_d16 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16I8Hi => vec![format!("ds_read_i8_d16_hi {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16B16 => vec![format!("ds_read_u16_d16 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16B16Hi => vec![format!("ds_read_u16_d16_hi {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsWriteB8 => vec![format!("ds_write_b8 {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), lds_off(inst.imm))],
+        MOp::LdsWriteB16 => vec![format!("ds_write_b16 {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), lds_off(inst.imm))],
+        MOp::LdsWriteB8Hi => vec![format!("ds_write_b8_d16_hi {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), lds_off(inst.imm))],
+        MOp::LdsWriteB16Hi => vec![format!("ds_write_b16_d16_hi {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), lds_off(inst.imm))],
+        MOp::LdsWriteB96 => vec![format!("ds_write_b96 {}, {}{}", src1(a, inst.srcs[0]), tuple(a, reg_of(&inst.srcs[1]), 3), lds_off(inst.imm))],
+        MOp::LdsRead2B32 => vec![format!("ds_read2_b32 {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), lds_off2(inst.imm))],
+        MOp::LdsRead2B64 => vec![format!("ds_read2_b64 {}, {}{}", tuple(a, inst.dst.expect("dst"), 4), src1(a, inst.srcs[0]), lds_off2(inst.imm))],
+        MOp::LdsRead2St64B32 => vec![format!("ds_read2st64_b32 {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), lds_off2(inst.imm))],
+        MOp::LdsRead2St64B64 => vec![format!("ds_read2st64_b64 {}, {}{}", tuple(a, inst.dst.expect("dst"), 4), src1(a, inst.srcs[0]), lds_off2(inst.imm))],
+        MOp::LdsWrite2B32 => vec![format!("ds_write2_b32 {}, {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), vr(a, reg_of(&inst.srcs[2])), lds_off2(inst.imm))],
+        MOp::LdsWrite2B64 => vec![format!("ds_write2_b64 {}, {}, {}{}", src1(a, inst.srcs[0]), tuple(a, reg_of(&inst.srcs[1]), 2), tuple(a, reg_of(&inst.srcs[2]), 2), lds_off2(inst.imm))],
+        MOp::LdsWrite2St64B32 => vec![format!("ds_write2st64_b32 {}, {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), vr(a, reg_of(&inst.srcs[2])), lds_off2(inst.imm))],
+        MOp::LdsWrite2St64B64 => vec![format!("ds_write2st64_b64 {}, {}, {}{}", src1(a, inst.srcs[0]), tuple(a, reg_of(&inst.srcs[1]), 2), tuple(a, reg_of(&inst.srcs[2]), 2), lds_off2(inst.imm))],
         MOp::GlobalLoadU16 => vec![format!(
             "global_load_ushort {}, {}",
             d(a),
@@ -886,4 +936,17 @@ fn scale_opsel(imm: i64) -> String {
 
 fn tri(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
     vec![format!("{} {}, {}, {}, {}", mnemonic, vr(a, inst.dst.unwrap()), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), src1(a, inst.srcs[2]))]
+}
+
+/// ` offset0:A offset1:B` of a two-address DS instruction (imm = offset0 | offset1 << 8, element units).
+fn lds_off2(imm: i64) -> String {
+    let (o0, o1) = (imm & 0xff, (imm >> 8) & 0xff);
+    let mut s = String::new();
+    if o0 != 0 {
+        s += &format!(" offset0:{o0}");
+    }
+    if o1 != 0 {
+        s += &format!(" offset1:{o1}");
+    }
+    s
 }

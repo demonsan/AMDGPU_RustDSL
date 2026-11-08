@@ -147,6 +147,41 @@ pub enum CmpPred { Lt, Le, Gt, Ge, Eq, Ne, Lg, Uno, Ord }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CmpTy { F32, I32, U32 }
 
+/// Width / type of a memory access (P1 A3). Loads: `U8` / `I8` / `U16` / `I16` zero- / sign-extend into an `I32`; `B32` -> `I32`; `B64` -> `Frag2`;
+/// `B96` -> `Frag4` (lane 3 unspecified); `B128` -> `Frag4`. Stores write the low 8 / 16 bits (`U8` / `U16`; `I8` / `I16` are the same store).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemTy { U8, I8, U16, I16, B32, B64, B96, B128 }
+
+/// The data of a `d16` load: one byte (zero- or sign-extended to 16 bits) or a 16-bit half, written into the low (`hi: false`) or high half
+/// of the destination dword; the other half keeps the `merge` operand's bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum D16Ty { U8, I8, B16 }
+
+impl MemTy {
+    pub fn bytes(self) -> u32 {
+        match self {
+            MemTy::U8 | MemTy::I8 => 1,
+            MemTy::U16 | MemTy::I16 => 2,
+            MemTy::B32 => 4,
+            MemTy::B64 => 8,
+            MemTy::B96 => 12,
+            MemTy::B128 => 16,
+        }
+    }
+    pub fn value_ty(self) -> DType {
+        match self {
+            MemTy::B64 => DType::Frag2,
+            MemTy::B96 | MemTy::B128 => DType::Frag4,
+            _ => DType::I32,
+        }
+    }
+}
+impl D16Ty {
+    pub fn bytes(self) -> u32 {
+        if self == D16Ty::B16 { 2 } else { 1 }
+    }
+}
+
 impl UnOp {
     pub fn float_in(self) -> bool {
         !matches!(self, UnOp::CvtF32I32 | UnOp::CvtF32U32 | UnOp::CvtF32Ubyte0 | UnOp::CvtF32Ubyte1 | UnOp::CvtF32Ubyte2 | UnOp::CvtF32Ubyte3)
@@ -349,6 +384,20 @@ pub enum Op {
     Tri(TriOp, Opnd, Opnd, Opnd),
     /// comparison -> I1
     Cmp { pred: CmpPred, ty: CmpTy, a: Opnd, b: Opnd },
+    /// global load of any width (`MemTy`); result type `ty.value_ty()`
+    LoadGlobalN { base: Opnd, byte_off: u32, ty: MemTy },
+    /// `global_load_*_d16[_hi]`: the loaded 8 / 16 bits into one half of a dword, the other half from `merge`
+    LoadGlobalD16 { base: Opnd, byte_off: u32, ty: D16Ty, hi: bool, merge: Opnd },
+    /// MUBUF load of any width
+    BufferLoadN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, ty: MemTy },
+    /// LDS load of any width
+    LoadLdsN { addr: Opnd, ty: MemTy },
+    /// `ds_read_*_d16[_hi]`
+    LoadLdsD16 { addr: Opnd, ty: D16Ty, hi: bool, merge: Opnd },
+    /// `ds_read2[st64]_b32 / _b64`: two elements at `addr + off0 * s` and `addr + off1 * s` (s = element size, x 64 for `st64`) -> `Frag2` / `Frag4`
+    LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
+    /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
+    LoadLdsTrB16 { addr: Opnd },
 }
 
 impl Op {
@@ -358,6 +407,10 @@ impl Op {
             Op::Bin(o, ..) => o.result_ty(),
             Op::Tri(o, ..) => o.result_ty(),
             Op::Cmp { .. } => DType::I1,
+            Op::LoadGlobalN { ty, .. } | Op::BufferLoadN { ty, .. } | Op::LoadLdsN { ty, .. } => ty.value_ty(),
+            Op::LoadGlobalD16 { .. } | Op::LoadLdsD16 { .. } => DType::I32,
+            Op::LoadLds2 { b64, .. } => if *b64 { DType::Frag4 } else { DType::Frag2 },
+            Op::LoadLdsTrB16 { .. } => DType::Frag2,
             Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::AddI32(..) | Op::MulI32(..) => DType::I32,
             Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::MinI32(..) | Op::XorI32(..) | Op::LoadU16 { .. } => DType::I32,
             Op::ConstF32(_) | Op::KernargF32 { .. } => DType::F32,
@@ -435,6 +488,16 @@ impl Op {
             Op::Un(_, a) => vec![*a],
             Op::Bin(_, a, b) | Op::Cmp { a, b, .. } => vec![*a, *b],
             Op::Tri(_, a, b, c) => vec![*a, *b, *c],
+            Op::LoadGlobalN { base, .. } => vec![*base],
+            Op::LoadGlobalD16 { base, merge, .. } => vec![*base, *merge],
+            Op::BufferLoadN { rsrc, voff, soff, .. } => {
+                let mut v = vec![*rsrc];
+                v.extend(voff.iter().copied());
+                v.push(*soff);
+                v
+            }
+            Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } => vec![*addr],
+            Op::LoadLdsD16 { addr, merge, .. } => vec![*addr, *merge],
             Op::Max3F32(a, b, c) => vec![*a, *b, *c],
             Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
                 vec![*a]
@@ -744,6 +807,14 @@ pub enum Stmt {
     StageBegin { name: String, contract: Box<StageContract> },
     /// Closes the innermost stage.
     StageEnd,
+    /// global store of any width (`U8` / `U16` store the low bits; `hi` with `U8` / `U16`: the `_d16_hi` forms store bits 16..)
+    StoreGlobalN { base: Opnd, byte_off: u32, value: Opnd, ty: MemTy, hi: bool },
+    /// MUBUF store of any width (same `hi` rule)
+    BufferStoreN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd, ty: MemTy, hi: bool },
+    /// LDS store of any width (same `hi` rule)
+    StoreLdsN { addr: Opnd, value: Opnd, ty: MemTy, hi: bool },
+    /// `ds_write2[st64]_b32 / _b64`: `v0` at `addr + off0 * s`, `v1` at `addr + off1 * s`
+    StoreLds2 { addr: Opnd, v0: Opnd, v1: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// Register-planning region marker (`FnBuilder::weave_region_begin/end`): the instructions lowered between a begin and its end belong to the
     /// named region (per-region pressure caps and reports, `RegMark::Cap`). Regions nest; a begin and its end sit in the same structural block.
     /// Emits no code.
@@ -1627,6 +1698,43 @@ impl FnBuilder {
     }
     pub fn cmp(&mut self, pred: CmpPred, ty: CmpTy, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Cmp { pred, ty, a: a.into(), b: b.into() })
+    }
+
+    // ---- P1 A3 memory ----
+    pub fn load_global(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: MemTy) -> ValueId {
+        self.let_(Op::LoadGlobalN { base: base.into(), byte_off, ty })
+    }
+    pub fn load_global_d16(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: D16Ty, hi: bool, merge: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::LoadGlobalD16 { base: base.into(), byte_off, ty, hi, merge: merge.into() })
+    }
+    pub fn store_global(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
+        self.push_stmt(Stmt::StoreGlobalN { base: base.into(), byte_off, value: value.into(), ty, hi });
+    }
+    pub fn buffer_load_n(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, ty: MemTy) -> ValueId {
+        self.let_(Op::BufferLoadN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, ty })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn buffer_store_n(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
+        self.push_stmt(Stmt::BufferStoreN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into(), ty, hi });
+    }
+    pub fn load_lds(&mut self, addr: impl Into<Opnd>, ty: MemTy) -> ValueId {
+        self.let_(Op::LoadLdsN { addr: addr.into(), ty })
+    }
+    pub fn load_lds_d16(&mut self, addr: impl Into<Opnd>, ty: D16Ty, hi: bool, merge: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::LoadLdsD16 { addr: addr.into(), ty, hi, merge: merge.into() })
+    }
+    pub fn store_lds(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
+        self.push_stmt(Stmt::StoreLdsN { addr: addr.into(), value: value.into(), ty, hi });
+    }
+    pub fn load_lds2(&mut self, addr: impl Into<Opnd>, off0: u8, off1: u8, b64: bool, st64: bool) -> ValueId {
+        self.let_(Op::LoadLds2 { addr: addr.into(), off0, off1, b64, st64 })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_lds2(&mut self, addr: impl Into<Opnd>, v0: impl Into<Opnd>, v1: impl Into<Opnd>, off0: u8, off1: u8, b64: bool, st64: bool) {
+        self.push_stmt(Stmt::StoreLds2 { addr: addr.into(), v0: v0.into(), v1: v1.into(), off0, off1, b64, st64 });
+    }
+    pub fn load_lds_tr_b16(&mut self, addr: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::LoadLdsTrB16 { addr: addr.into() })
     }
 
     // ---- capture mode (docs/weave-capture.md) ----
@@ -3224,6 +3332,16 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
             v
         }
         Stmt::SetVar { value, .. } => vec![*value],
+        Stmt::StoreGlobalN { base, value, .. } => vec![*base, *value],
+        Stmt::BufferStoreN { rsrc, voff, soff, value, .. } => {
+            let mut v = vec![*rsrc];
+            v.extend(voff.iter().copied());
+            v.push(*soff);
+            v.push(*value);
+            v
+        }
+        Stmt::StoreLdsN { addr, value, .. } => vec![*addr, *value],
+        Stmt::StoreLds2 { addr, v0, v1, .. } => vec![*addr, *v0, *v1],
         Stmt::VarScaleF32 { scalar, .. } | Stmt::VarScaleLane { scalar, .. } => vec![*scalar],
         Stmt::VarSetLane { var, value, .. } => vec![Opnd::Var(*var), *value],
         Stmt::VarScalePk { pair, .. } | Stmt::VarAddPk { pair, .. } => vec![*pair],
