@@ -7,6 +7,8 @@
 //! * `layernorm_bf16_n<N>`    `out = (x - mean) * rsqrt(var + eps) * gamma + beta`.        ABI x @0, gamma @8, beta @16, out @24, M @32, eps @36
 //! * `softmax_bf16_n<N>`      `out = softmax(x)` along the row.                            ABI x @0, out @8, M @16
 
+pub mod quant;
+
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
 use amdgpu_tile::prims::{bf16x8_to_f32, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
