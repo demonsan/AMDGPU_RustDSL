@@ -564,6 +564,15 @@
 - `gemm_a16w16_bf16` 的 md5 因此变为 8ab7cd9e。
 - 调整 pre/mid sync 的 MMA 数量：差别在噪声内，未改。
 
+**fp8 KV 的 paged decode（per-tensor）**：`pa_decode16_fp8_hd128_p<P>`，即 `pa_decode16_x(.., fp8 = true)`。
+- cache 为 fp8 e4m3 [pages, P, HK, 128]，即 `reshape_cache_flash_fp8` 的布局；k_scale 在 @208，v_scale 在 @224。
+- K tile 为 fp8 行（chunk 按 key % 8 做 XOR）。QK 的每个操作数读 8 字节，用 `ScalePkBf16Fp8` 转成 8 个 bf16（精确）。
+- V 先把 fp8 行暂存，再转换进 bf16 V tile，供转置读使用。
+- k_scale 并入 softmax scale，v_scale 并入输出。
+- 测试用 [`pa_host`](../tests/gpu/pa_host.cpp) 的 `FP8KV=1`：B4、B16、B64、P256 全部 bad=0。
+- 性能：B64 ctx2048 S1 为 71.6 µs（bf16 为 96 µs，快 1.34×）；B16 ctx4096 最佳 S4 为 49 µs（bf16 46 µs）。小 batch 时转换和延迟是瓶颈。
+- 待办：per-token scale（`reshape_cache_blocked_fp8` 的分块布局），以及与 aiter `pa_bf16_pertokenFp8_*` 的对照。
+
 **A16W4（覆盖补齐，忠实语义）**：`gemm_a16w4_mxfp4`，即 `Elem::Bf16W4`，64×128 CTA。
 - A 为 bf16，精确保留；B 为 MXFP4，在主循环中反量化为 bf16，再走 bf16 MFMA。
 - 一个 K tile = 256 元素：每个 slot 放 4 份 128 字节的 A 镜像（K 64）。
