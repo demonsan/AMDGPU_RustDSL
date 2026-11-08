@@ -321,6 +321,7 @@ pub fn probe_mfma_p1() -> Function {
         let d1 = b.mfma(*k, fa, fb, None);
         let d2 = b.mfma(*k, fa, fb, Some(Opnd::Val(d1)));
         let vars = b.begin_loop(&[(k.acc_ty(), Opnd::Val(d1))]);
+        b.pin_agpr(vars[0]); // the var form accumulates in AGPRs (acc_cd)
         b.var_mfma(vars[0], *k, fa, fb, true);
         b.var_mfma(vars[0], *k, fa, fb, false);
         let always = b.cmp(CmpPred::Ge, CmpTy::I32, tid, 0);
