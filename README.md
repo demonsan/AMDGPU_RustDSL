@@ -8,6 +8,9 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 
 > **权威当前状态见 [`docs/current-status.md`](docs/current-status.md)**。本 README 只做入口与快速上手；
 > 厂商事实与认证表在 [`docs/vendor-spec.md`](docs/vendor-spec.md)；历史设计研究与逐轮记录归档在 [`docs/archive/`](docs/archive/README.md)。
+>
+> **新 kernel 作者 / agent 推荐从这里开始：[`docs/fmha-case-study.md`](docs/fmha-case-study.md)**——以 FMHA 为例讲今天的 kernel 怎样构建（算子图 → 骨架 → slot → stage → weaver → 编译器 → 证书 → 主机）、
+> 怎样优化（真实数据、归因、消融上界、同轮 A/B、门禁，以及 FMHA 的完整路程），以及从 TIRx 借鉴了什么。
 
 ---
 
