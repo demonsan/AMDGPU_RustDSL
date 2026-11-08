@@ -98,8 +98,8 @@ int main(int argc, char** argv) {
             float v = N(rng) * sc;
             if (fp8) {
                 // values quantized as code * scale (per row, or per rgrp x 128 block)
-                size_t r = i / rowlen, c = i % rowlen;
-                float s = bs ? (*rs)[(r / rgrp) * (rowlen / 128) + c / 128] : (*rs)[r];
+                size_t r = i / rowlen, col = i % rowlen;
+                float s = bs ? (*rs)[(r / rgrp) * (rowlen / 128) + col / 128] : (*rs)[r];
                 uint8_t c = f_to_e4m3(v / s);
                 raw[i] = c;
                 f[i] = e4m3_to_f(c) * s;
