@@ -147,7 +147,13 @@ pub fn concat_cache_mla(name: &str, r: i64, p: i64, bs: i64, seg: bool, fp8: boo
         let o2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c_ok), a: Opnd::Val(o1), b: Opnd::Val(oob) });
         let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(tok_ok), a: Opnd::Val(o2), b: Opnd::Val(oob) });
         // the chunk (the other load read zeros: both are combined by the same select as the offsets)
-        let frag = b.let_(Op::Select { ty: DType::Frag4, cond: Opnd::Val(from_c), a: Opnd::Val(fc), b: Opnd::Val(fp) });
+        let mut ws = Vec::new();
+        for m in 0..4u8 {
+            let (wc, wp) = (b.frag4_lane(Opnd::Val(fc), m), b.frag4_lane(Opnd::Val(fp), m));
+            let (wc, wp) = (b.bitcast_i32(wc), b.bitcast_i32(wp));
+            ws.push(b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(from_c), a: Opnd::Val(wc), b: Opnd::Val(wp) }));
+        }
+        let frag = b.frag4(ws[0], ws[1], ws[2], ws[3]);
         if fp8 {
             let x = bf16x8_to_f32(b, frag);
             let words = fp8_pack(b, &x, inv.unwrap());
