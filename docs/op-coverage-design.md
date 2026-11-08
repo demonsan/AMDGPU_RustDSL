@@ -600,6 +600,33 @@ blockscale 128×128（`fp8bs`）的规则：
 - **stage 2**：现在走 fp32 中间结果再求和，例如 4096×7168×topk8 要写 940 MB，所以只有 362 TF/s。改为 bf16 原子累加或在 CTA 内按 token 归并。aiter 没有 ASM stage 2（它用 CK），需要另找对照。
 - **blockscale stage 1**：0.8–0.87×。需要与批次 1 的 blockscale 中等 M 问题一起处理，方向是块乘积延后一个 tile。
 - **小 block_m（32 / 64）**：稀疏专家时需要。
-- **stage 1 → stage 2 的 per-token 量化**：现在由 host 完成，需要换成 kernel。
+- **stage 1 → stage 2 的再量化**：已在 GPU 上完成，fp8 用 `quant_token_bf16_fp8_n<I>`，blockscale 用 `quant_group128_bf16_fp8_n<I>`（均为 sched 的 rows::quant）。host 测试计入这一步的时间，参考实现读回 GPU 量化后的码值和 scale。
 
 **后端问题（已报告）**：一个结果未被使用的 load，其目标 VGPR 在 load 仍在途时被重新分配，load 晚到后覆盖新值（WAW）。表现为冷启动时错、热运行时对。已用"不发出死 load"绕开。
+
+### 7.7 批次 5a（attention 反向）状态：覆盖完成，性能约为厂商的 0.37×
+
+**实现**：[`fmha/bwd.rs`](../crates/amdgpu-kernels/src/fmha/bwd.rs)，按 FA2 拆成三个 kernel，全程不用原子操作。
+- `fmha_bwd_dot_hd128_bf16`：计算 Dot = Σ dO∘O。
+- `fmha_bwd_dq_hd128_bf16[_causal]`：前向方向，每 lane 一个 query。
+  - 依次算 S^T、P^T（用前向给出的 LSE）、dP^T = V·dO^T、dS^T、dQ^T += K^T·dS^T。
+  - K^T 用 `ds_read_b64_tr_b16` 从带 swizzle 的 K tile 读出。
+- `fmha_bwd_dkdv_hd128_bf16[_causal]`：每 lane 一个 key。
+  - 依次算 S = Q·K^T、dP = dO·V^T、dV^T += dO^T·P、dK^T += Q^T·dS。
+  - dO^T / Q^T 用 tr_b16 读；dK / dV 的累加器放在 AGPR。
+  - dK / dV 按 Q head 输出，与厂商约定相同，GQA 组需要再求和。
+- causal 为右下对齐。
+
+**对照**：[`attn_bwd_host.cpp`](../tests/gpu/attn_bwd_host.cpp) 同时运行 ours 与 aiter fmha_v3_bwd 的 odo、dqdkdv a32、dq_convert 三个 kernel。O 与 LSE 由 CPU 前向算出；CPU 参考对采样行检查 dQ / dK / dV。
+
+**数据**：2026-11-08，GPU 5。ours 与厂商都通过（`bad=0`），ours strict 0 错误。
+
+| 形状 | ours | aiter | 比 |
+|---|--:|--:|--:|
+| B1 H8 2048²，非 causal | 387.9 µs | 141.0 µs | 0.36 |
+| B1 H8 HK2 2048²，causal | 416.0 µs | 162.9 µs | 0.39 |
+
+**原因与方向**：
+- 两个 kernel 各自重算 S / P，dP 也算了两遍。厂商是单 kernel，dQ 走 fp32 原子累加。
+- causal 时 dkdv 只裁掉了前部的 q tile。
+- 方向：合并为一个 kernel，dQ 用原子累加（需要后端提供 `buffer_atomic_add_f32`）；加入延迟 rescale 一类的 VALU 优化。
