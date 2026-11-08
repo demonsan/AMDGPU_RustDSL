@@ -1473,7 +1473,13 @@ fn moe_epilogue(
     let (nm, nn) = ((wave_m / 16) as usize, (wave_n / 16) as usize);
     let idx = IssuePlan::new(mma.c_tv(), 4).offsets(&make_layout(tup![16, 16], tup![1024, 1]), s_lane, &Ix::C(0), d);
     let o = b.bind_i32(ctx.lower(&idx[0]));
-    let (rl, cl) = (b.bind_i32(ev(o).lshr(10)), b.bind_i32(ev(o) & 1023));
+    let (mut rl, mut cl) = (b.bind_i32(ev(o).lshr(10)), b.bind_i32(ev(o) & 1023));
+    if std::env::var("EXP_LANE").is_ok() {
+        // DEBUG: the same from a fresh lane id (swapped 16x16 C: row l % 16, columns 4 (l / 16) + 0..3)
+        let tid = b.let_(Op::WorkitemId);
+        rl = b.bind_i32(ev(tid) & 15);
+        cl = b.bind_i32(((ev(tid) & 63).lshr(4)) << 2);
+    }
     let up = matches!(mc.st, MoeStage::Up { .. }) && std::env::var("EXP_UPRAW").is_err();
     let esz = if up { 2 } else { 4 };
     let rsrc_c = { let n = b.bind_i32(ev(mc.mtok) * ev(mc.topk) * ev(mc.nout) * esz); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_c, n) };
