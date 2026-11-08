@@ -44,7 +44,9 @@ int main(int argc, char** argv) {
     for (auto& x : q) x = tobf(N(rng));
     auto ki = [&](int b, int key, int d) { return ((size_t)bt[(size_t)b * maxp + key / P] * P + key % P) * DK + d; };
     const float scale = 1.0f / std::sqrt((float)DK);
-    const int NS = S;
+    // ours mla_decode_bf16_p<P>: 16 heads per CTA, 4 key parts per CTA (NS = 4 S); the vendor path keeps NS = S
+    const bool m16 = getenv("VENDOR") == nullptr;
+    const int NS = m16 ? 4 * S : S;
     uint16_t* dout;
     void *dpo, *dpl;
     HC(hipMalloc(&dout, (size_t)B * H * DV * 2));
@@ -62,7 +64,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> a(vco ? 368 : 16 * 11, 0), ca(16 * 5, 0);
     auto Pp = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
     auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
-    int gx = (H + 31) / 32;
+    int gx = m16 ? (H + 15) / 16 : (H + 31) / 32;
     if (!vco) {
         Pp(0, dpo); Pp(1, dq); Pp(2, dkv); Pp(3, dbt); Pp(4, dcl); memcpy(&a[80], &scale, 4); U(6, H); U(7, maxp); U(8, npages); U(9, S); Pp(10, dpl);
     } else {
@@ -91,6 +93,33 @@ int main(int argc, char** argv) {
         HC(hipModuleLaunchKernel(cfn, H, B, 1, 512, 1, 1, 0, nullptr, nullptr, ccfg));
     };
     launch();
+    if (envi("DUMP", 0)) {
+        HC(hipDeviceSynchronize());
+        std::vector<float> pl((size_t)B * H * NS), po((size_t)B * H * NS * DV);
+        HC(hipMemcpy(pl.data(), dpl, pl.size() * 4, hipMemcpyDeviceToHost));
+        HC(hipMemcpy(po.data(), dpo, po.size() * 4, hipMemcpyDeviceToHost));
+        const int db = envi("DB", 0), dh = envi("DH", 0);
+        printf("DUMP ctx[%d]=%d\n", db, cl[db]);
+        {
+            // per-part reference LSE of (db, dh): parts of ceil(ceil(ctx / 32) / NS) 32-key tiles
+            int ntt = (cl[db] + 31) / 32, per = (ntt + NS - 1) / NS * 32;
+            for (int s = 0; s < NS; s++) {
+                int lo = s * per, hi = std::min(lo + per, cl[db]);
+                double m = -1e300, l = 0;
+                std::vector<double> sc;
+                for (int k = lo; k < hi; k++) {
+                    double acc = 0;
+                    for (int d = 0; d < DK; d++) acc += (double)bf(q[((size_t)db * H + dh) * DK + d]) * bf(kv[ki(db, k, d)]);
+                    sc.push_back(acc * scale);
+                    m = std::max(m, acc * scale);
+                }
+                for (double x : sc) l += std::exp(x - m);
+                printf("  part %2d keys [%d,%d) ref lse %g got %g\n", s, lo, hi, hi > lo ? m + std::log(l) : -INFINITY, pl[((size_t)db * H + dh) * NS + s]);
+            }
+        }
+        for (int h = 0; h < 0; h++)
+            for (int s = 0; s < NS; s++) printf("  h%d part %d lse %g o[0..3] %g %g %g %g o[511] %g\n", h, s, pl[(size_t)h * NS + s], po[((size_t)h * NS + s) * DV], po[((size_t)h * NS + s) * DV + 1], po[((size_t)h * NS + s) * DV + 2], po[((size_t)h * NS + s) * DV + 3], po[((size_t)h * NS + s) * DV + 511]);
+    }
     HC(hipDeviceSynchronize());
     std::vector<uint16_t> out((size_t)B * H * DV);
     HC(hipMemcpy(out.data(), dout, out.size() * 2, hipMemcpyDeviceToHost));
