@@ -270,7 +270,7 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
 /// at kernarg 656, S = 2^lg_s at 660, fp32 partial O / l [B, H, SQ, S, 128] at 672, partial LSE [B, H, SQ, S] at 688); `attn_combine_bf16_hd128_q` merges them.
 pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Function {
     let mut b = FnBuilder::new(name, 512);
-    b.compile_profile(CompileProfile::Gemm);
+    b.compile_profile(match std::env::var("EXP_PROF").as_deref() { Ok("vs128") => CompileProfile::Vs128, Ok("t128") => CompileProfile::T128, _ => CompileProfile::Gemm });
     // ---- ABI (the vendor's v3, as bf16.rs) ----
     for (n, i) in [("ptr_o", 0u32), ("ptr_q", 1), ("ptr_k", 2), ("ptr_v", 3), ("ptr_lse", 4)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
@@ -575,7 +575,11 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
         b.end_if();
     }
     }
-    b.finish()
+    let mut f = b.finish();
+    if let Ok(o) = std::env::var("EXP_SCHED") {
+        f.sched_opts = Some(o);
+    }
+    f
 }
 
 /// Merges the S = 2^lg_s key parts of `fmha_fwd_hd128_bf16_v3_ks`: O[b, q, h, :] (bf16, BSHD) = sum_s w_s po_s / sum_s w_s with w_s =
