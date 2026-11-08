@@ -178,6 +178,18 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> out((size_t)M * D), y1((size_t)M * TK * I);
     HC(hipMemcpy(out.data(), dO, out.size() * 2, hipMemcpyDeviceToHost));
     HC(hipMemcpy(y1.data(), dY1, y1.size() * 2, hipMemcpyDeviceToHost));
+    if (envi("REPEAT", 0)) {
+        std::vector<uint16_t> y2((size_t)M * TK * I);
+        for (int r = 0; r < envi("REPEAT", 0); r++) {
+            HC(hipMemset(dY1, 0, y2.size() * 2));
+            launch(f1, a1, I / envi("UP_N", 128), nblk);
+            HC(hipDeviceSynchronize());
+            HC(hipMemcpy(y2.data(), dY1, y2.size() * 2, hipMemcpyDeviceToHost));
+            long diff = 0, zero = 0;
+            for (size_t x = 0; x < y2.size(); x++) { diff += y2[x] != y1[x]; zero += y2[x] == 0; }
+            printf("repeat %d: differs from run 0 at %ld, zeros %ld of %zu\n", r, diff, zero, y2.size());
+        }
+    }
     if (envi("GEMMONLY", 0) && !fp8 && TK == 1) {
         // the Down kernel on the stage-1 operands: T[t][r] = X[t] . W1i[e][r] (all 2I interleaved rows), unit weights
         std::vector<float> ones(maxp, 1.0f);
