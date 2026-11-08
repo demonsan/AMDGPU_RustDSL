@@ -278,59 +278,65 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
 
     // prologue: tile 0 into slot 0
     stage(&mut b, kt0, 0, Opnd::I32(0));
-    // loop vars: pair index, m, l, O^T x 4
-    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(m_init)), (DType::F32, Opnd::Val(l_init))];
+    // two sequential loops over tile pairs: [0, npf) = pairs entirely inside every row's visible range (no mask), then [npf, npair) with the
+    // mask (the tail / the causal diagonal; everything for a window). Both break at the top (zero-trip); the second continues the ring and
+    // the m / l / O^T state of the first; the pair index is absolute (the ring versions continue).
+    let npf = if cfg.swa {
+        b.c_i32(0)
+    } else {
+        let v = b.bind_i32(((ev(lim_min) + 1).max(0).lshr(6)).lshr(1).min(ev(npair)));
+        b.read_first_lane(v)
+    };
     let nblk = (D / 32) as usize;
+    let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(m_init)), (DType::F32, Opnd::Val(l_init))];
     inits.extend((0..nblk).map(|_| (DType::Frag16, Opnd::Val(zero16))));
-    let vars = b.begin_loop(&inits);
-    let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
-    let ov: Vec<VarId> = vars[3..3 + nblk].to_vec();
-    if D == 256 {
-        // 128 accumulator dwords: in AGPRs (the register file holds Q^T, S and P in VGPRs)
-        for v in &ov {
-            b.pin_agpr(*v);
+    let mut fin: Vec<VarId> = Vec::new();
+    for masked in [false, true] {
+        let end = if masked { npair } else { npf };
+        let vars = b.begin_loop(&inits);
+        let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
+        let ov: Vec<VarId> = vars[3..3 + nblk].to_vec();
+        if D == 256 {
+            // 128 accumulator dwords: in AGPRs (the register file holds Q^T, S and P in VGPRs)
+            for v in &ov {
+                b.pin_agpr(*v);
+            }
         }
+        let itx = amdgpu_dsl::varx(it);
+        let out = b.bind_cond(itx.clone().ge(ev(end)));
+        b.break_if(out);
+        for slot in 0..2i32 {
+            let tile = b.bind_i32((itx.clone() << 1) + slot + ev(kt0));
+            // top of tile: this tile's DMA done and visible; the other slot free (every wave is past tile - 1)
+            b.wait_vm(0);
+            b.wait_lds(0);
+            b.barrier();
+            // the next tile into the other slot (the last pass stages a tile past the end: rows past the sequence, masked; clamped)
+            let nxt = b.bind_i32(ev(tile) + 1);
+            let last = b.bind_i32((ev(npair) << 1) - 1 + ev(kt0));
+            let nxt = b.bind_i32(ev(nxt).min(ev(last)));
+            let gen_n = if slot == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
+            stage(&mut b, nxt, 1 - slot, gen_n);
+            let kbase = I32::c(ks.base as i32 + slot * KT * ROW);
+            let vbase = I32::c(vs.base as i32 + slot * KT * ROW);
+            let key0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
+            let keep = |b: &mut FnBuilder, off: i32| match low {
+                Some(lo) => b.bind_cond(((ev(key0) + off).le(ev(lim)).select_i32(1, 0) & (ev(key0) + off).ge(ev(lo)).select_i32(1, 0)).eq(1)),
+                None => b.bind_cond((ev(key0) + off).le(ev(lim))),
+            };
+            let (kslot, vslot) = (ks.at(&SlotIdx::new(slot, Opnd::Var(it))), vs.at(&SlotIdx::new(slot, Opnd::Var(it))));
+            let kp: Option<&dyn Fn(&mut FnBuilder, i32) -> ValueId> = if masked { Some(&keep) } else { None };
+            tile_math(&mut b, &tm, kbase, vbase, kp, m_v, l_v, &ov, &|b, f| kslot.read(b, |b| f(b)), &|b, f| vslot.read(b, |b| f(b)));
+        }
+        let it1 = b.bind_i32(itx.clone() + 1);
+        b.set_var(it, it1);
+        b.end_loop();
+        // the second loop starts from this one's state
+        inits = vars.iter().zip(inits.iter()).map(|(v, (ty, _))| (*ty, Opnd::Var(*v))).collect();
+        fin = vars;
     }
-    let itx = amdgpu_dsl::varx(it);
-    for slot in 0..2i32 {
-        let tile = b.bind_i32((itx.clone() << 1) + slot + ev(kt0));
-        // top of tile: this tile's DMA done and visible; the other slot free (every wave is past tile - 1)
-        b.wait_vm(0);
-        b.wait_lds(0);
-        b.barrier();
-        // the next tile into the other slot (the last pass stages a tile past the end: rows past the sequence, masked; clamped to the pair count)
-        let nxt = b.bind_i32(ev(tile) + 1);
-        let last = b.bind_i32((ev(npair) << 1) - 1 + ev(kt0));
-        let nxt = b.bind_i32(ev(nxt).min(ev(last)));
-        let gen_n = if slot == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
-        stage(&mut b, nxt, 1 - slot, gen_n);
-        let kbase = I32::c(ks.base as i32 + slot * KT * ROW);
-        let vbase = I32::c(vs.base as i32 + slot * KT * ROW);
-        let key0 = b.bind_i32(ev(tile) * KT + (ev(half) << 2));
-        let keep = |b: &mut FnBuilder, off: i32| match low {
-            Some(lo) => b.bind_cond(((ev(key0) + off).le(ev(lim)).select_i32(1, 0) & (ev(key0) + off).ge(ev(lo)).select_i32(1, 0)).eq(1)),
-            None => b.bind_cond((ev(key0) + off).le(ev(lim))),
-        };
-        let (kslot, vslot) = (ks.at(&SlotIdx::new(slot, Opnd::Var(it))), vs.at(&SlotIdx::new(slot, Opnd::Var(it))));
-        // tiles entirely inside every row's visible range skip the mask (uniform branch): last key <= the smallest row limit and first key >=
-        // the largest row low bound
-        let t_lo = b.bind_i32(ev(tile) * KT);
-        let full_c = match low_max {
-            Some(lm) => (ev(t_lo) + (KT - 1)).le(ev(lim_min)).select_i32(1, 0) & ev(t_lo).ge(ev(lm)).select_i32(1, 0),
-            None => (ev(t_lo) + (KT - 1)).le(ev(lim_min)).select_i32(1, 0),
-        };
-        let full = b.bind_cond(full_c.eq(1));
-        b.begin_if(Opnd::Val(full));
-        tile_math(&mut b, &tm, kbase.clone(), vbase.clone(), None, m_v, l_v, &ov, &|b, f| kslot.read(b, |b| f(b)), &|b, f| vslot.read(b, |b| f(b)));
-        b.else_();
-        tile_math(&mut b, &tm, kbase, vbase, Some(&keep), m_v, l_v, &ov, &|b, f| kslot.read(b, |b| f(b)), &|b, f| vslot.read(b, |b| f(b)));
-        b.end_if();
-    }    let it1 = b.bind_i32(itx.clone() + 1);
-    b.set_var(it, it1);
-    let done = b.bind_cond(ev(it1).ge(ev(npair)));
-    b.break_if(done);
-    b.end_loop();
-
+    let (m_v, l_v) = (fin[1], fin[2]);
+    let ov: Vec<VarId> = fin[3..3 + nblk].to_vec();
     // ---- epilogue: O = O^T / l (both lane halves' row sums), bf16, 4 consecutive d per 8-byte store; LSE = (m + log2 l) ln 2 ----
     let (la, lb) = b.permlane32_swap(Opnd::Var(l_v), Opnd::Var(l_v));
     let (la, lb) = (b.bitcast_f32(la), b.bitcast_f32(lb));
