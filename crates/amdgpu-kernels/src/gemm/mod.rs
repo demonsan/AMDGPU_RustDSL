@@ -278,6 +278,7 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
         if mma.swap_ab { (acc, bf, a, sb, sa, 0, byte_a) } else { (acc, a, bf, sa, sb, byte_a, 0) }
     };
     match elem {
+        Elem::Fp8W4 => unreachable!("a8w4 handled above"),
         Elem::Fp8 => {
             for blk in blocks {
                 let (acc, x, y, sx, sy, bx, by) = ops(blk);
