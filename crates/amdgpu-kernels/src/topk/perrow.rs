@@ -200,26 +200,17 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
                 for (ok, x) in loaded {
                     let key = key_of(b, x);
                     let bin = b.bind_i32(ev(key).lshr(s) & 255);
-                    if s == 24 {
-                        let bsel = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(bin), b: Opnd::Val(sink_bin) });
-                        let addr = b.bind_i32((ev(bsel) << 2) + HIST);
-                        b.atomic_lds(AtomicOp::AddU32, addr, 1i32, false);
+                    let bsel = if s == 24 {
+                        b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(bin), b: Opnd::Val(sink_bin) })
                     } else {
-                        // only the elements whose higher bits equal the prefix count (about 1 / 256 of the row per pass): a wave without any skips the LDS atomic altogether
                         let hi_k = b.bind_i32(ev(key).lshr(s + 8));
                         let hi_t = b.bind_i32(ev(thr).lshr(s + 8));
                         let same = b.cmp(CmpPred::Eq, CmpTy::I32, hi_k, hi_t);
-                        let same_i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(same), a: Opnd::I32(1), b: Opnd::I32(0) });
-                        let ok_i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::I32(1), b: Opnd::I32(0) });
-                        let cnt_i = b.bind_i32(ev(same_i) & ev(ok_i));
-                        let cnt = b.cmp(CmpPred::Ne, CmpTy::I32, cnt_i, 0);
-                        let any = b.any_lane(cnt);
-                        b.if_(any, |b| {
-                            let bsel = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(cnt), a: Opnd::Val(bin), b: Opnd::Val(sink_bin) });
-                            let addr = b.bind_i32((ev(bsel) << 2) + HIST);
-                            b.atomic_lds(AtomicOp::AddU32, addr, 1i32, false);
-                        });
-                    }
+                        let b1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(same), a: Opnd::Val(bin), b: Opnd::Val(sink_bin) });
+                        b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(b1), b: Opnd::Val(sink_bin) })
+                    };
+                    let addr = b.bind_i32((ev(bsel) << 2) + HIST);
+                    b.atomic_lds(AtomicOp::AddU32, addr, 1i32, false);
                 }
                 let nx = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(1)));
                 b.set_var(vit, nx);
@@ -336,30 +327,23 @@ pub fn topk_per_row_mode(name: &str, k: i64, prefill: bool, plain: bool) -> Func
                 let eq_ok = b.bind_i32(ev(eq_i) & ev(ok_i));
                 let gt_c = b.cmp(CmpPred::Ne, CmpTy::I32, gt_ok, 0);
                 let eq_c = b.cmp(CmpPred::Ne, CmpTy::I32, eq_ok, 0);
-                // only the elements > T and the first `rem` equal to T are written (about K of the row): a wave without any skips the counters and the store
-                let wr_any_i = b.bind_i32(ev(gt_ok) | ev(eq_ok));
-                let wr_any_c = b.cmp(CmpPred::Ne, CmpTy::I32, wr_any_i, 0);
-                let any_w = b.any_lane(wr_any_c);
-                b.if_(any_w, |b| {
-                    let ag = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt_c), a: Opnd::Val(cgt), b: Opnd::Val(sink_e) });
-                    let ae = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq_c), a: Opnd::Val(ceq), b: Opnd::Val(sink_e) });
-                    let sg = b.atomic_lds(AtomicOp::AddU32, ag, 1i32, true).unwrap();
-                    let se = b.atomic_lds(AtomicOp::AddU32, ae, 1i32, true).unwrap();
-                    let (sg, se) = (b.bitcast_i32(sg), b.bitcast_i32(se));
-                    let eq_take = b.cmp(CmpPred::Lt, CmpTy::I32, se, rem);
-                    let eq_take_i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq_take), a: Opnd::I32(1), b: Opnd::I32(0) });
-                    let eq_w = b.bind_i32(ev(eq_ok) & ev(eq_take_i));
-                    let pos_e = b.bind_i32(ev(kmr) + ev(se));
-                    let pos = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt_c), a: Opnd::Val(sg), b: Opnd::Val(pos_e) });
-                    let wr_i = b.bind_i32(ev(gt_ok) | ev(eq_w));
-                    let wr = b.cmp(CmpPred::Ne, CmpTy::I32, wr_i, 0);
-                    let o = b.bind_i32(ev(orow) + (ev(pos) << 2));
-                    let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wr), a: Opnd::Val(o), b: Opnd::Val(oob) });
-                    let col = b.bind_i32(ev(start) + ev(idx));
-                    let cf = b.bitcast_f32(col);
-                    b.buffer_store_f32(r_o, o, 0i32, 0, cf);
-
-                });
+                let ag = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt_c), a: Opnd::Val(cgt), b: Opnd::Val(sink_e) });
+                let ae = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq_c), a: Opnd::Val(ceq), b: Opnd::Val(sink_e) });
+                let sg = b.atomic_lds(AtomicOp::AddU32, ag, 1i32, true).unwrap();
+                let se = b.atomic_lds(AtomicOp::AddU32, ae, 1i32, true).unwrap();
+                let (sg, se) = (b.bitcast_i32(sg), b.bitcast_i32(se));
+                let eq_take = b.cmp(CmpPred::Lt, CmpTy::I32, se, rem);
+                let eq_take_i = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(eq_take), a: Opnd::I32(1), b: Opnd::I32(0) });
+                let eq_w = b.bind_i32(ev(eq_ok) & ev(eq_take_i));
+                let pos_e = b.bind_i32(ev(kmr) + ev(se));
+                let pos = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt_c), a: Opnd::Val(sg), b: Opnd::Val(pos_e) });
+                let wr_i = b.bind_i32(ev(gt_ok) | ev(eq_w));
+                let wr = b.cmp(CmpPred::Ne, CmpTy::I32, wr_i, 0);
+                let o = b.bind_i32(ev(orow) + (ev(pos) << 2));
+                let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(wr), a: Opnd::Val(o), b: Opnd::Val(oob) });
+                let col = b.bind_i32(ev(start) + ev(idx));
+                let cf = b.bitcast_f32(col);
+                b.buffer_store_f32(r_o, o, 0i32, 0, cf);
             }
             let nx = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(1)));
             b.set_var(vit, nx);
