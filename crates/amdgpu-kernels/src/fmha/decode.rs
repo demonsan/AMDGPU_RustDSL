@@ -206,7 +206,8 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
                 .map(|k| {
                     let x = b.frag16_lane(Opnd::Var(ov[e]), 4 * u + k);
                     let x = b.bitcast_f32(x);
-                    b.mul_f32(x, inv)
+                    let y = b.mul_f32(x, inv);
+                    b.bitcast_i32(y)
                 })
                 .collect();
             let f4 = b.frag4(v[0], v[1], v[2], v[3]);
