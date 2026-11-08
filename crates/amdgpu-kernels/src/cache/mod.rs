@@ -178,7 +178,7 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
         let kd = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(kd), b: Opnd::Val(oob) });
         let kd = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c_ok), a: Opnd::Val(kd), b: Opnd::Val(oob) });
         let kd = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(tok_ok), a: Opnd::Val(kd), b: Opnd::Val(oob) });
-        b.buffer_store_c(r_kc, Some(Opnd::Val(kd)), 0i32, 0, kv, MemTy::B128, false, CachePolicy::NONE);
+        b.buffer_store_c(r_kc, Some(Opnd::Val(kd)), 0i32, 0, kv, MemTy::B128, false, CachePolicy::NT);
         // value: element (head, 8 j + i): ((blk * Hk + head) * D + 8 j + i) * BS * 2 + off * 2
         let vbase = b.bind_i32((((ev(blk) * h as i32 + ev(head)) * d as i32 + (ev(j) << 3)) * (bs as i32 * 2)) + (ev(off) << 1));
         let vbase = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(vbase), b: Opnd::Val(oob) });
@@ -189,7 +189,7 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
             for hi in [false, true] {
                 // the sentinel is past every descriptor; the element offsets (imm <= 7 * BS * 2 < 4096) are added to it
                 let imm = (2 * m as i64 + hi as i64) * bs * 2;
-                b.buffer_store_c(r_vc, Some(Opnd::Val(vbase)), 0i32, imm as u32, w, MemTy::U16, hi, CachePolicy::NONE);
+                b.buffer_store_c(r_vc, Some(Opnd::Val(vbase)), 0i32, imm as u32, w, MemTy::U16, hi, CachePolicy::NONE); // 2-byte partial stores must NOT be non-temporal (measured 8x slower: no write combining)
             }
         }
     }

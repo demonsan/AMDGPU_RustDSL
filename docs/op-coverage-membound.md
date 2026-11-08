@@ -146,3 +146,14 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 ## 行内族：行保持打包（寄存器压力）
 
 行内 kernel（rmsnorm / add_rmsnorm / layernorm / softmax）的行在各遍之间保持 bf16 打包（每个 chunk 4 个 dword），在用到的地方再展开成 f32（每对元素两条移位 / 掩码），而不是把 f32 常驻寄存器。VGPR：rmsnorm N = 4096：124 → 92，add_rmsnorm：156 → 120，layernorm N = 4096：160 → 128，softmax N = 8192：160 → 156。带宽变化（`nt` 之后的前后，GB/s）：rmsnorm N = 4096：5915 → 6010，N = 1000：5716 → 5900；add_rmsnorm：5900 → 5804；layernorm N = 4096 / 776：5348 / 4760 → 5333 / 4552；softmax N = 4096 / 1000 / 8192：5893 / 5658 / 5483 → 5952 / 5647 / 5498。结论：占用不是这几个 kernel 的主要限制（变化在 ±4 % 内，有升有降）；剩下的差距来自每行 2 次分组归约的串行延迟链和 VALU，下一步是 DPP 行操作（backend 的 A4）与 packed f32 数学，而不是寄存器。
+
+## KV-cache 写：vLLM / aiter 分块布局
+
+`cache/mod.rs`：`reshape_cache_blocked_bf16_h<Hk>_d<D>_b<BS>`：`k, v [T][Hk][D]` 写入 `key_cache [NB][Hk][D/8][BS][8]` 和 `value_cache [NB][Hk][D][BS]`（`block = slot / BS`，`off = slot % BS`；负 slot = padding token）。key 一侧每 lane 搬一个 16 B chunk（8 个元素，b128 存）；value 一侧是转置的（token 下标是最快维），每个元素一次 16 位存。D ∈ {64, 128, 256}，BS ∈ {8 … 128}（2 的幂），cache < 4 GiB。主机测试 `tests/gpu/cache_blocked_host.cpp`（逐字节对拍，未写字节保持哨兵值；`CONTIG=1` 为 prefill 型的连续槽位）。
+
+| 形状 | 槽位 | 带宽（GB/s，有效读写字节） |
+|---|---|--:|
+| Hk = 8, D = 128, BS = 16，T = 131072 | 连续（prefill） | 1456 |
+| 同上 | 随机置换 | 927 |
+
+这个布局的 value 写本身就是 2 字节散写，不可能接近流式带宽；已有的 aiter `reshape_and_cache` 同布局，同样的问题（不能在节点上独立编译做同轮对比）。**关键一点：这种部分行的 2 字节存不能带 `nt`**——全部带 `nt` 时是 186 GB/s（连续槽位），改成 regular 策略后 1456 GB/s（8 倍；`nt` 绕开了 L2 的写合并）；key 一侧的完整 16 B 存仍然用 `nt`（随机槽位下 `nt` 927 → regular 640）。更好的写法（待做）：同一个 block 的 BS 个连续 token 在 LDS 里转置后整行写。
