@@ -442,13 +442,14 @@ fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
     let p: Vec<ValueId> = match &kvsc { Some((_, vs)) => p.iter().zip(vs).map(|(x, s)| b.mul_f32(*x, *s)).collect(), None => p };
     let vb = b.bind_i32(vbase0.clone() + ev(vr));
     // blocked: the V^T row (d 16 db + l % 16) bytes of keys 4 g .. 4 g + 3 and 16 + 4 g ..
-    let vtb = b.bind_i32(vbase0.clone() + ev(l16) * 64 + (ev(grp) << 3));
+    let vtb = blocked.then(|| b.bind_i32(vbase0.clone() + ev(l16) * 64 + (ev(grp) << 3)));
     mev.read_back(&mut b, Opnd::Var(it), |b| {
         for t in 0..NKB / 2 {
             let w: Vec<ValueId> = [(2 * t, 0usize), (2 * t, 2), (2 * t + 1, 0), (2 * t + 1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
             let pf = b.pack4(w[0], w[1], w[2], w[3]);
             for db in 0..8i32 {
                 let vf = if blocked {
+                    let vtb = vtb.unwrap();
                     let a0 = b.bind_i32(ev(vtb) + 16 * 64 * db);
                     let a1 = b.bind_i32(ev(vtb) + 16 * 64 * db + 32);
                     let lo = b.load_lds_b64(a0);
