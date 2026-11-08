@@ -10,7 +10,7 @@
 pub mod quant;
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{bf16x8_to_f32, dpp_reduce, lane_reduce, rsqrt_f32, wave_reduce, wave_reduce_dpp, RedOp};
+use amdgpu_tile::prims::{bf16x8_to_f32, group_reduce_dpp, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,13 +37,9 @@ pub fn by_name(name: &str) -> Option<Function> {
     (n % 8 == 0 && (8..=8192).contains(&n)).then(|| row_kernel(name, n, op))
 }
 
-/// Wave-wide reduction: the LDS exchange (`wave_reduce`) or, with `AMDC_DPP_REDUCE=1`, the DPP + lane-swap all-reduce.
+/// Wave-wide reduction (the LDS exchange: measured equal to the DPP all-reduce on these bandwidth-bound kernels, so the simpler path stays).
 fn wr(b: &mut FnBuilder, op: RedOp, x: ValueId, scratch: &amdgpu_tile::shared::PrivRef, off: i32, gen: i32, lane: &Lane) -> ValueId {
-    if dpp_reduce() {
-        wave_reduce_dpp(b, op, x)
-    } else {
-        wave_reduce(b, op, x, scratch, off, gen, lane)
-    }
+    wave_reduce(b, op, x, scratch, off, gen, lane)
 }
 
 fn sel(b: &mut FnBuilder, cond: ValueId, x: ValueId, y: ValueId) -> ValueId {
@@ -58,7 +54,7 @@ fn pack(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
 /// Rows one wave processes at once: short rows (< 2 KB) need several in flight per wave for the 64 KB / CU of loads that saturate HBM (docs/op-coverage-memtemplates.md 5.1); the rows of a wave are consecutive.
 pub fn rows_per_wave(n: i64) -> i64 {
     if n < 512 {
-        4
+        8.max(64 / group_lanes(n))
     } else if n < 1024 {
         2
     } else {
@@ -66,8 +62,21 @@ pub fn rows_per_wave(n: i64) -> i64 {
     }
 }
 
+/// Lanes per row: 64 (a whole wave) for rows of 512 or more elements; a shorter row takes the smallest power of two >= its 16-byte chunks (>= 4), so a wave holds `64 / g` rows side by side
+/// (reductions over each group of `g` lanes, DPP) instead of leaving most lanes idle.
+pub fn group_lanes(n: i64) -> i64 {
+    if n >= 512 {
+        64
+    } else {
+        ((n / 8) as u64).next_power_of_two().max(4) as i64
+    }
+}
+
 pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
-    let nld = ((n + 511) / 512) as usize;
+    let g = group_lanes(n);
+    let par = 64 / g;                                   // rows side by side in a wave
+    let nld = ((n / 8 + g - 1) / g) as usize;           // chunks per lane
+    let cstride = (16 * g) as i32;                      // bytes between a lane's consecutive chunks
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::Default);
     let b = &mut fb;
@@ -117,34 +126,60 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     let r_rout = if op == RowOp::AddRmsNorm { Some(dyn_desc(b, "res_out")) } else { None };
     let r_g = if matches!(op, RowOp::RmsNorm | RowOp::AddRmsNorm | RowOp::LayerNorm) { Some(b.buffer_desc(pv[idx("gamma")], (2 * n) as u32)) } else { None };
     let r_be = if op == RowOp::LayerNorm { Some(b.buffer_desc(pv[idx("beta")], (2 * n) as u32)) } else { None };
-    let rpw = rows_per_wave(n) as usize;
+    let rpw = rows_per_wave(n) as usize;                // rows per wave in total
+    let steps = rpw / par as usize;                      // sequential steps of `par` rows
+    let lr = b.bind_i32(lane.lane() & (g as i32 - 1));
+    let grp = b.bind_i32(lane.lane().lshr(g.trailing_zeros() as i32));
     let wid = b.bind_i32(lane.wave());
     let me = red.mine(wid);
+    // reduction over a row's lanes: the whole wave (LDS exchange / DPP) or a group of g < 64 lanes (DPP all-reduce)
+    let red = |b: &mut FnBuilder, op: RedOp, x: ValueId, off: i32, gen: i32, lane: &Lane| -> ValueId {
+        if g == 64 {
+            wr(b, op, x, &me, off, gen, lane)
+        } else {
+            group_reduce_dpp(b, op, x, g)
+        }
+    };
     let ngrp = nld.div_ceil(4);
     let row0 = b.bind_i32(((ev(bx) << 2) + lane.wave()) * rpw as i32);
-    let vx0 = b.bind_i32(ev(row0) * (2 * n) as i32 + (lane.lane() << 4));
-    let vg = b.bind_i32(lane.lane() << 4);
+    let vx0 = b.bind_i32((ev(row0) + ev(grp)) * (2 * n) as i32 + (ev(lr) << 4));
+    let vg = b.bind_i32(ev(lr) << 4);
     // per row r: the group base offsets (one voffset per 4 loads, imm 1024 (i % 4))
     let gx_of = |b: &mut FnBuilder, r: usize| -> Vec<ValueId> {
-        let vr = if r == 0 { vx0 } else { b.bind_i32(ev(vx0) + (r as i64 * 2 * n) as i32) };
-        (0..ngrp).map(|q| if q == 0 { vr } else { b.bind_i32(ev(vr) + 4096 * q as i32) }).collect()
+        let vr = if r == 0 { vx0 } else { b.bind_i32(ev(vx0) + (r as i64 * par * 2 * n) as i32) };
+        (0..ngrp).map(|q| if q == 0 { vr } else { b.bind_i32(ev(vr) + 4 * cstride * q as i32) }).collect()
     };
-    let gg: Vec<ValueId> = (0..ngrp).map(|q| if q == 0 { vg } else { b.bind_i32(ev(vg) + 4096 * q as i32) }).collect();
-    let load = |b: &mut FnBuilder, rs: ValueId, g: &[ValueId], c: CachePolicy| -> Vec<ValueId> { (0..nld).map(|i| b.buffer_load_c(rs, Some(Opnd::Val(g[i / 4])), 0i32, (1024 * (i % 4)) as u32, MemTy::B128, c)).collect() };
-    let gxs: Vec<Vec<ValueId>> = (0..rpw).map(|r| gx_of(b, r)).collect();
+    let gg: Vec<ValueId> = (0..ngrp).map(|q| if q == 0 { vg } else { b.bind_i32(ev(vg) + 4 * cstride * q as i32) }).collect();
+    let load = |b: &mut FnBuilder, rs: ValueId, g: &[ValueId], c: CachePolicy| -> Vec<ValueId> { (0..nld).map(|i| b.buffer_load_c(rs, Some(Opnd::Val(g[i / 4])), 0i32, (cstride as usize * (i % 4)) as u32, MemTy::B128, c)).collect() };
+    let gb_loaded = |b: &mut FnBuilder, late: bool, ge: &Option<Vec<ValueId>>, be: &Option<Vec<ValueId>>, rg: Option<ValueId>, rbe: Option<ValueId>| -> (Option<Vec<ValueId>>, Option<Vec<ValueId>>) {
+        if late {
+            let g = rg.map(|r| load(b, r, &gg, CachePolicy::NONE));
+            let bb = rbe.map(|r| load(b, r, &gg, CachePolicy::NONE));
+            if g.is_some() {
+                b.wait_vm(0);
+            }
+            (g, bb)
+        } else {
+            (ge.clone(), be.clone())
+        }
+    };
+    let gxs: Vec<Vec<ValueId>> = (0..steps).map(|r| gx_of(b, r)).collect();
     // every row's loads are issued before any compute: rpw * (row bytes) in flight per wave
     let xs_all: Vec<Vec<ValueId>> = gxs.iter().map(|g| load(b, r_x, g, CachePolicy::NT)).collect();
     let rs_all: Option<Vec<Vec<ValueId>>> = r_res.map(|r| gxs.iter().map(|g| load(b, r, g, CachePolicy::NT)).collect());
-    let gs = r_g.map(|r| load(b, r, &gg, CachePolicy::NONE));
-    let bs = r_be.map(|r| load(b, r, &gg, CachePolicy::NONE));
+    // gamma / beta: with one step per wave they are loaded after the statistics (they would otherwise sit in 32 - 64 VGPRs across the reductions; the L2 hit overlaps with other waves);
+    // short rows (several steps) load them up front
+    let late_gb = steps == 1;
+    let gs_early = if late_gb { None } else { r_g.map(|r| load(b, r, &gg, CachePolicy::NONE)) };
+    let bs_early = if late_gb { None } else { r_be.map(|r| load(b, r, &gg, CachePolicy::NONE)) };
     b.wait_vm(0);
     // chunk validity: only the last chunk can reach past the row (n % 512 != 0)
     let valid: Vec<Option<ValueId>> = (0..nld)
         .map(|i| {
-            if (i as i64 + 1) * 512 <= n {
+            if (i as i64 + 1) * 8 * g <= n {
                 None
             } else {
-                let e = b.bind_i32((lane.lane() << 3) + 512 * i as i32);
+                let e = b.bind_i32((ev(lr) << 3) + (8 * g) as i32 * i as i32);
                 Some(b.let_(Op::CmpLtI32(Opnd::Val(e), Opnd::I32(n as i32))))
             }
         })
@@ -163,7 +198,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
             }
         }
     };
-    for r in 0..rpw {
+    for r in 0..steps {
         let (xs, rs) = (&xs_all[r], rs_all.as_ref().map(|a| &a[r]));
         let (gen0, gen1) = (2 * r as i32, 2 * r as i32 + 1);
         // the row stays PACKED (bf16, 4 dwords per chunk) between the passes and is unpacked where it is used: fewer live VGPRs (occupancy) for a few extra shifts
@@ -195,10 +230,11 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let s = lane_reduce(b, RedOp::Sum, &sq);
                     part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
                 }
-                let tot = wr(b, RedOp::Sum, part.unwrap(), &me, 0, gen0, &lane);
+                let tot = red(b, RedOp::Sum, part.unwrap(), 0, gen0, &lane);
                 let mean = b.mul_f32(tot, inv_n);
                 let me_eps = b.add_f32(mean, eps.unwrap());
                 let inv = rsqrt_f32(b, me_eps);
+                let (gs, _bs) = gb_loaded(b, late_gb, &gs_early, &bs_early, r_g, r_be);
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
                     let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
@@ -218,7 +254,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let s = lane_reduce(b, RedOp::Sum, &v);
                     part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
                 }
-                let tot = wr(b, RedOp::Sum, part.unwrap(), &me, 0, gen0, &lane);
+                let tot = red(b, RedOp::Sum, part.unwrap(), 0, gen0, &lane);
                 let mean = b.mul_f32(tot, inv_n);
                 let mut part2: Option<ValueId> = None;
                 for i in 0..nld {
@@ -232,10 +268,11 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let s = lane_reduce(b, RedOp::Sum, &sq);
                     part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
                 }
-                let tot2 = wr(b, RedOp::Sum, part2.unwrap(), &me, 64, gen1, &lane);
+                let tot2 = red(b, RedOp::Sum, part2.unwrap(), 64, gen1, &lane);
                 let var = b.mul_f32(tot2, inv_n);
                 let ve = b.add_f32(var, eps.unwrap());
                 let inv = rsqrt_f32(b, ve);
+                let (gs, bs) = gb_loaded(b, late_gb, &gs_early, &bs_early, r_g, r_be);
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
                     let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
@@ -260,7 +297,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let s = lane_reduce(b, RedOp::Max, &v);
                     part = Some(match part { None => s, Some(p) => b.max_f32(p, s) });
                 }
-                let mx = wr(b, RedOp::Max, part.unwrap(), &me, 0, gen0, &lane);
+                let mx = red(b, RedOp::Max, part.unwrap(), 0, gen0, &lane);
                 let l2e = b.c_f32(std::f32::consts::LOG2_E);
                 let mut ex: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
                 let mut part2: Option<ValueId> = None;
@@ -277,7 +314,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
                     ex.push(e);
                 }
-                let tot = wr(b, RedOp::Sum, part2.unwrap(), &me, 64, gen1, &lane);
+                let tot = red(b, RedOp::Sum, part2.unwrap(), 64, gen1, &lane);
                 let inv = b.rcp_f32(tot);
                 for i in 0..nld {
                     let mut y = [0; 8];
@@ -291,7 +328,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
         // stores: lanes past the row end store to an offset outside every descriptor (dropped by the hardware)
         for i in 0..nld {
             let f4 = pack(b, &out[i]);
-            let base = b.bind_i32(ev(gxs[r][i / 4]) + (1024 * (i % 4)) as i32);
+            let base = b.bind_i32(ev(gxs[r][i / 4]) + (cstride as usize * (i % 4)) as i32);
             let voff = match valid[i] {
                 None => base,
                 Some(c) => b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(base), b: Opnd::I32(-16) }),

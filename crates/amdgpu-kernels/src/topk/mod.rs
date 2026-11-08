@@ -37,59 +37,9 @@ fn sel_i32(b: &mut FnBuilder, cond: ValueId, x: ValueId, y: ValueId) -> ValueId 
 }
 
 /// Reduction over the `l` lanes of each aligned group of a wave (l a power of two in 4..=64); every lane of a group gets the group's result.
-fn group_reduce(b: &mut FnBuilder, op: RedOp, x: ValueId, scratch: &PrivRef, off: i32, gen: i32, lane: &Lane, l: i64) -> ValueId {
-    // the DPP all-reduce is the default here (+9..19 % measured); AMDC_DPP_REDUCE=0 selects the LDS exchange
-    if std::env::var("AMDC_DPP_REDUCE").map(|v| v != "0").unwrap_or(true) {
-        return group_reduce_dpp(b, op, x, l);
-    }
-    let comb = |b: &mut FnBuilder, p: ValueId, q: ValueId| match op {
-        RedOp::Sum => b.add_f32(p, q),
-        RedOp::Max => b.max_f32(p, q),
-    };
-    let mut v = x;
-    for perm in [[1u8, 0, 3, 2], [2, 3, 0, 1]] {
-        let y = b.dpp_quad_perm(v, perm);
-        let y = b.bitcast_f32(y);
-        v = comb(b, v, y);
-    }
-    if l == 4 {
-        return v;
-    }
-    let quads = l / 4;                                  // quad values per group
-    let base = scratch.base() + off;
-    let wa = b.bind_i32(base.clone() + (lane.lane().lshr(2) << 2));
-    let vi = b.bitcast_i32(v);
-    scratch.write(b, gen, |b| b.store_lds_b32(wa, vi));
-    b.wait_lds(0);
-    let gshift = (l as u32).trailing_zeros() as i32;
-    let parts: Vec<ValueId> = scratch.read_back(b, gen, |b| {
-        let a0 = b.bind_i32(base.clone() + (lane.lane().lshr(gshift) * (4 * quads) as i32));
-        if quads == 2 {
-            vec![b.load_lds_b64(a0)]
-        } else {
-            (0..quads / 4)
-                .map(|q| {
-                    let a = b.bind_i32(ev(a0) + 16 * q as i32);
-                    b.load_lds_b128(a)
-                })
-                .collect()
-        }
-    });
-    let mut vals = Vec::new();
-    for p in parts {
-        if quads == 2 {
-            for d in 0..2u8 {
-                let w = b.frag2_lane(Opnd::Val(p), d);
-                vals.push(b.bitcast_f32(w));
-            }
-        } else {
-            for d in 0..4u8 {
-                let w = b.frag4_lane(Opnd::Val(p), d);
-                vals.push(b.bitcast_f32(w));
-            }
-        }
-    }
-    lane_reduce(b, op, &vals)
+fn group_reduce(b: &mut FnBuilder, op: RedOp, x: ValueId, _scratch: &PrivRef, _off: i32, _gen: i32, _lane: &Lane, l: i64) -> ValueId {
+    // the DPP all-reduce (+9..19 % measured against the former LDS exchange for this latency-bound kernel)
+    group_reduce_dpp(b, op, x, l)
 }
 
 pub fn topk_softmax(name: &str, e: i64, k: i64, renorm: bool) -> Function {

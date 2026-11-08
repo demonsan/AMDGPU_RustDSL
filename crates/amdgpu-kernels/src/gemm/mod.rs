@@ -1435,7 +1435,13 @@ impl skeleton_v4::V4Slots for GemmSlots {
     };
     let rsrc_b = match &moe_cx {
         None => { let n = b.bind_i32(ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) }
-        Some(_) => { let ne = b.let_(Op::KernargI32 { offset: 132 }); let n = b.bind_i32(ev(ne) * ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) }
+        // MoE: one descriptor over the tile's EXPERT, its base moved by a 64-bit `ptr_mad` (E n K bytes passes 4 GiB at production sizes,
+        // e.g. E 256, n 4096, K 7168 fp8 = 7.5 GB); num_records = n K of one expert
+        Some(mc) => {
+            let nk = { let v = b.bind_i32(ev(n_v) * ev(k_v)); b.read_first_lane(v) };
+            let pe = b.ptr_mad(ptr_b, mc.e, nk);
+            b.buffer_desc_dyn(pe, nk)
+        }
     };
     let (rsrc_sfa, rsrc_sfb) = match cfg.scales {
         Scales::Mx128 => (
@@ -1445,9 +1451,11 @@ impl skeleton_v4::V4Slots for GemmSlots {
         Scales::RowCol => (
             { let n = b.bind_i32(ev(m_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
             // MoE: the weight scales of every expert [E, n]
-            if cfg.moe.is_some() {
-                let ne = b.let_(Op::KernargI32 { offset: 132 });
-                let n = b.bind_i32(ev(ne) * ev(n_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            if let Some(mc) = &moe_cx {
+                // MoE: the tile's expert's n weight scales (base moved per expert)
+                let n = b.bind_i32(ev(n_v) << 2); let n = b.read_first_lane(n);
+                let pe = b.ptr_mad(ptr_sfb, mc.e, n);
+                b.buffer_desc_dyn(pe, n)
             } else {
                 let n = b.bind_i32(ev(n_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
             },
@@ -1456,9 +1464,11 @@ impl skeleton_v4::V4Slots for GemmSlots {
         Scales::None => (rsrc_a, rsrc_b),
         Scales::Block128 => (
             { let n = b.bind_i32(ev(m_v) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
-            if cfg.moe.is_some() {
-                let ne = b.let_(Op::KernargI32 { offset: 132 });
-                let n = b.bind_i32(ev(ne) * (ev(n_v) >> 7) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            if let Some(mc) = &moe_cx {
+                // MoE: the tile's expert's [n / 128, KT] block scales (base moved per expert)
+                let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v) << 2); let n = b.read_first_lane(n);
+                let pe = b.ptr_mad(ptr_sfb, mc.e, n);
+                b.buffer_desc_dyn(pe, n)
             } else {
                 let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
             },
@@ -1483,7 +1493,8 @@ impl skeleton_v4::V4Slots for GemmSlots {
         // MoE: rows are gathered (A origin 0); B = the tile's expert (stage 1: the CTA's gate rows bx 128, up rows + n_out)
         None if moe_cx.is_some() => {
             let mc = moe_cx.as_ref().unwrap();
-            (b.c_i32(0), b.bind_i32((ev(mc.e) * ev(n_v) + (ev(bx) << lg_n)) * ev(k_v)))
+            let _ = mc; // the expert is in the descriptor base (rsrc_b)
+            (b.c_i32(0), b.bind_i32((ev(bx) << lg_n) * ev(k_v)))
         }
         None if cfg.conv.is_some() => (b.c_i32(0), b.bind_i32((ev(bx) << lg_n) * ev(k_v))),
         None => (b.bind_i32((ev(by) << lg_m) * ev(k_v)), b.bind_i32((ev(bx) << lg_n) * ev(k_v))),
@@ -1557,7 +1568,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
                 })
                 .collect();
             b.wait_vm(0);
-            let nbe = b.bind_i32(ev(mc.e) * ev(n_v).lshr(7));
+            let nbe = b.c_i32(0); // the expert is in the descriptor base (rsrc_sfb)
             let voff_b = if matches!(mc.st, MoeStage::Up { .. }) {
                 let gb = b.bind_i32(((ev(bx) << 1) + ev(wn)).lshr(1));
                 vec![b.bind_i32((ev(nbe) + ev(gb)) * ev(rowb)), b.bind_i32((ev(nbe) + ev(mc.nout).lshr(7) + ev(gb)) * ev(rowb))]
@@ -1781,7 +1792,7 @@ fn moe_epilogue(
             b.buffer_load_f32(rsa, ar, 0i32, 0)
         });
         let wsc = |b: &mut FnBuilder, brow: ValueId| -> Vec<ValueId> {
-            let a = b.bind_i32((ev(mc.e) * ev(n_v) + ev(brow)) << 2);
+            let a = b.bind_i32(ev(brow) << 2); // the expert is in the descriptor base (rsrc_sfb)
             let f = b.buffer_load_b128(rsb, a, 0i32, 0);
             (0..4u8).map(|k| { let x = b.frag4_lane(f, k); b.bitcast_f32(x) }).collect()
         };

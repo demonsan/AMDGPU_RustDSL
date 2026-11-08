@@ -4,6 +4,24 @@
 
 验证方法：`tests/gpu/<op>_host.cpp`（`hipModuleLoad` 加载 `amdc emit --backend=own` 汇编出的 co，CPU 双精度参考，bf16 判据 = 误差 ≤ 1 bf16 ulp + 1e-6 的绝对下限，并检查输出末尾之外的字节没有被写），带宽 = 读 + 写字节 / 单次 kernel 时间（50 次连续发射的平均，工作集约 1 GB 以避开 Infinity Cache）。
 
+## 当前状态总表（以此为准；下面各节的第一版表格用的是 regular 缓存策略，数值已被「非临时访问」一节取代）
+
+流式 kernel 默认带 `nt`（`_rt` 后缀选回 regular）；流式读写的实测上限 ≈ 6.5 TB/s，下表的百分比按它算。`tools/b2_matrix.sh` 重跑全部正确性与带宽（每个 kernel 一行）。
+
+| 族 | kernel | 当前带宽 / 延迟 | 说明 |
+|---|---|---|---|
+| 逐元素 | silu_mul / gelu_tanh_mul / add_bf16 / cvt | 6.3–6.7 TB/s（97–103 %） | 与 aiter 同轮：silu_mul 1.07–1.18×，gelu_tanh_mul 1.23–1.27× |
+| 行内 | rmsnorm N = 4096 / 1000 / 200 | 6.30 / 5.91 / 5.22–5.28 TB/s | N < 512 用 wave 内分组（N = 64 / 128 / 256：6.3–6.4）；aiter N = 1000 的 1.17× |
+| 行内 | add_rmsnorm / layernorm / softmax（N = 4096） | 6.47 / 5.60 / 6.01 TB/s | layernorm 约 1000 条 VALU / 行（rmsnorm 约 590），softmax N = 8192 5.5；短行更低（N = 200：3.9 / 4.3） |
+| 量化 | per-token / group128 fp8、int8、静态 fp8、silu_mul_quant | 5.7–6.4 TB/s | 与 aiter 同轮：fp8 per-token 1.08×（N = 1000 为 1.45×）、group128 1.10×、silu_mul_quant 1.11×、int8 1.04–1.26×；静态 fp8 0.97× |
+| 反量化 | dequant fp8 → bf16（static / token / group128） | 6.0–6.4 TB/s（N = 1000：5.3） | scalef32 转换只吃 2 的幂 scale，一般 scale 用显式乘法 |
+| RoPE / cache | RoPE neox / gptj（含部分旋转） | 6.3–6.8 TB/s；H = 1, D = 64 / 128：7.1 / 9.2（按含 cos / sin 表的流量） | 小 H 一个 wave 装多个 token（见下） |
+| RoPE / cache | KV-cache 写（flash / vLLM 分块） | 5.8 / 0.9–1.5 TB/s | 分块布局的 value 是 2 字节散写，regular 策略，不是流式 |
+| MoE | topk_softmax（含 renorm） | E = 128, K = 8：T = 65536 为 21 µs（DPP 归约后 +9–19 %） | 小 T 比 aiter 快 1.6–1.8×，大 T 0.87–0.92× |
+| MoE | moe_sorting（单 block / 多 block 原子 / 多 block 稳定顺序） | 10–18 µs（≤ 几千对）/ 31 µs（26 万对）/ 105 µs（稳定，26 万对） | 格式与 aiter `moe_sorting` 一致，附 `tile_start` |
+| 采样 | argmax / 温度采样 / top-k + top-p | 4.3 TB/s / 0.7–1.3 TB/s 等效 / 36–124 µs 每行（V = 32000） | top-k / top-p 用 bf16 序键的两遍基数选择，不排序 |
+
+未做 / 已知差距：layernorm / softmax 的短行与 N = 400–511 的行布局；采样的性能版本（直方图 top-k / top-p，一行多 block）；> 4 GiB 的 cache / 张量（要 64 位寻址，B1）；vLLM 分块 cache 的整行转置写；aiter 同轮对比没有覆盖 layernorm、row softmax、RoPE、cache、moe_sorting、采样（无法脱离 torch 独立编译）。
 ## 流式逐元素（模板 T1）
 
 | kernel | 语义 | 配置 | VGPR | 带宽（GB/s，≈1 GB 流量） | 占 roofline（6.0 TB/s） |
@@ -228,6 +246,42 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 
 ## 采样：top-k / top-p 过滤（`sample_topkp_bf16_v<V>`）
 
-在 `sample_bf16_v<V>` 的基础上加 top-k 与 top-p（nucleus）：ABI 在 inv_temperature @24 之后多 `top_p`（f32 @28，1.0 = 关）和 `top_k`（i32 @32，0 = 关），B 移到 @36。语义：先取 top-k（并列在第 k 大值上的都保留），再在保留集合上按 top-p 取最小的前缀（累计概率 ≥ p，并列同样保留），然后在保留集合内重新归一化做逆 CDF 采样（下标升序）。**不排序**：在 logit 空间（缩放后的 `x`）对阈值做二分，每次探测是对整行的一遍（保留元素的个数和 `exp(x − m)` 之和，两次 block 归约）；top-k 找"保留个数 ≥ k 的最大阈值"，top-p 找"保留质量 ≥ p · S_k 的最大阈值"（S_k 是 top-k 之后的质量），各 26 次迭代（范围 [m − 80, m + 1]，分辨率约 1.6e-6，远小于缩放后 bf16 logit 的最小间隔，所以集合与精确集合一致）；用 kernarg 控制迭代数，关掉的那一项不做任何探测。最终阈值 = max(thr_k, thr_p)，第 2、3 遍把不满足 `x ≥ thr` 的元素的分子置 0。
+在 `sample_bf16_v<V>` 的基础上加 top-k 与 top-p（nucleus）：ABI 在 inv_temperature @24 之后多 `top_p`（f32 @28，1.0 = 关）和 `top_k`（i32 @32，0 = 关），B 移到 @36。语义：先取 top-k（并列在第 k 大值上的都保留），再在保留集合上按 top-p 取最小的前缀（累计概率 ≥ p，并列同样保留），然后在保留集合内重新归一化做逆 CDF 采样（下标升序）。
 
-主机测试（`sampling_host` 的 top_k / top_p 参数；CPU 参考按上面的集合语义用排序实现）：V = 32000：关闭过滤（20.4 µs / 行）、k = 50、p = 0.9、k = 40 且 p = 0.8、k = 1，V = 1000（k = 20, p = 0.95）和 V = 128256（k = 100, p = 0.9），全部 `bad = 0`；`gpu_verify --strict` 0 错误，72 VGPR。耗时（每行一个 block，单行延迟）：V = 32000：仅 k 或仅 p 132 µs，k 与 p 同时 243 µs；V = 128256 两者同时 819 µs；B = 4096 行、V = 32000、k = 50 且 p = 0.9：4.33 ms 总计。这是"覆盖"版本，不是性能版本：延迟被 26 + 26 遍整行扫描主导（每遍 2 次 block 归约 + barrier）。待做：用阈值的直方图（一遍分 256 个桶）把迭代数降到 3–4 遍，或把每行拆给多个 block。
+**不排序，用 bf16 的 16 位序键做两遍基数选择**：logit 是 bf16，原始位翻转后（负数全翻、正数翻符号位）整数序 = 数值序（温度缩放是单调的，不改变序）。阈值 `T` = 满足"权重(key ≥ T) ≥ 目标"的最大键：第 1 遍对高 8 位建 256 个桶的直方图（LDS 原子，`ds_add_u32` 计数 / `ds_add_f32` 求 `exp(x − m)` 之和），下降方向的累计扫描找到累计值首次达到目标的桶 B（wave 内 DPP 包含式扫描：`row_shr` 1 / 2 / 4 / 8 + `row_bcast` 15 / 31，4 个 wave 的总数经 LDS，3 次 barrier），第 2 遍只对高字节 = B 的元素按低 8 位建直方图再扫一次；`T = B · 256 + L`。top-k 用计数（目标 k）；top-p 用质量（目标 `p · S_k`，S_k = top-k 之后的质量，多一遍求和），两者各 2 遍直方图，关掉的那一项（kernarg 控制的一致 `if`）不运行任何东西。最终阈值键 = top-p 的键（它从 top-k 的键起算，所以 ≥ top-k 的键）；第 2、3 遍把键 < T 的元素的分子置 0。**踩到的坑**：不参与计数的元素必须写到每个 lane 各自的"垃圾桶"（`256 + lane`），而不是同一个地址——64 个 lane 打同一个 LDS 原子地址会被串行化，开销最大的就是这个（k-only 62 → 36 µs，p-only 125 → 109 µs）。
+
+主机测试（`sampling_host` 的 top_k / top_p 参数；CPU 参考按上面的集合语义用排序实现）：V = 32000：过滤全关、k = 50、p = 0.9、k = 40 且 p = 0.8、k = 1，V = 1000（k = 20, p = 0.95）和 V = 128256（k = 100, p = 0.9），全部 `bad = 0`；`gpu_verify --strict` 0 错误，72 VGPR。单行延迟（一个 block）：V = 32000：全关 18 µs、仅 k 36 µs、仅 p 109 µs、k 与 p 同时 124 µs；V = 128256 两者同时 465 µs；B = 4096、V = 32000、k = 50 且 p = 0.9：2.02 ms（此前的 26 步二分版本：133 / 133 / 243 µs、4.33 ms）。top-p 仍慢的原因是 `ds_add_f32` 的直方图比整数计数慢得多（约 5 倍）；下一步可以把质量改成定点整数累加，或让每个 wave 先在寄存器里做桶内部分和。
+
+## 行内族：短行的 wave 内分组布局（N < 512）
+
+此前每行占一个 wave 的 64 个 lane，N = 200 只有 25 个 chunk，大半 lane 空闲（rmsnorm N = 200：3.4–3.7 TB/s）。现在 N < 512 的行用 `g` 个 lane（`g` = 不小于 chunk 数的最小 2 的幂，至少 4），一个 wave 并排放 `64 / g` 行，每行的规约在 `g` 个 lane 的组内用 DPP 全规约（`tileop::group_allreduce`：quad_perm、`row_half_mirror` / `row_ror`、`permlane16_swap`），不再经过 LDS；每个 wave 总共处理 `max(8, 64 / g)` 行（先发出全部加载再计算）。N ≥ 512 的布局不变（`g = 64`）。主机测试 `rows_host`（行数 M 较大时 `rows_per_wave` 要与 kernel 一致）：N ∈ {8, 24, 64, 128, 200, 256, 400, 504} 的 rmsnorm、N ∈ {24, 200} 的 layernorm / softmax / add_rmsnorm，`bad = 0`（含奇数的 M = 53）。带宽（M = 10⁶ 行；GB/s）：
+
+| kernel | 之前 | 现在 |
+|---|--:|--:|
+| rmsnorm N = 200 | 3412–3769 | **5284** |
+| rmsnorm N = 64 / 128 / 256 | — | 6284 / 6441 / 6289 |
+| rmsnorm N = 400 / 504（g = 64，只是行数更多） | — | 5455 / 5488 |
+| add_rmsnorm N = 200 | — | 5628 |
+| softmax N = 200 | — | 4326 |
+| layernorm N = 200 | — | 3854 |
+
+softmax 与 layernorm 的短行仍然只有 rmsnorm 的 60–80 %（两遍规约 + 更多 VALU，加载的字节更少）；N = 400 – 511 的行仍是一个 wave 的 64 lane 里用 50 个，下一步是为它们加一个"两行占三个 wave"的布局或把 chunk 数不是 2 的幂的行放进 `g = 64` 组里并排两行。
+
+## RoPE：小 H 时一个 wave 装多个 token
+
+一个 token 只用 `H · L` 个 lane（L = 每个 head 的 lane 数：NeoX 为 D / 16、GPT-J 为 D / 8），`H · L < 64` 时大半个 wave 空闲（H = 1, D = 64 只有 4 个 lane：此前 1300 GB/s，22 %）。当 `H · L ≤ 32` 且是 2 的幂时，一个 wave 装 `64 / (H · L)` 个 token（H = 1, D = 64：16 个），一个 block 4 个 wave，grid = ⌈T / (4 · tpw)⌉；位置和 cos / sin 表行因此是向量值（每个 lane 组自己的 token），越界 token 的 store 被屏蔽。名字与 ABI 不变。主机测试 `rope_host`（T = 29 … 41 的奇数 token 数，H ∈ {1, 2, 4, 8}，D ∈ {64, 128}，neox / gptj）`bad = 0`。带宽（GB/s，流量把每个 token 的 cos / sin 行也算上，它们在 L2 里，所以高于真实 HBM 流量）：H = 1, D = 64（neox）7062；H = 1, D = 128：9250；H = 2, D = 64：6193；H = 4, D = 128：7174；H = 1, D = 64（gptj）7419。
+
+## MoE 合并：`moe_reduce` / `moe_combine`（模板 T3）
+
+kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel 合并：`moe_reduce_bf16_k<K>_d<D>`：`out[t][d] = bf16(Σ_k w[t][k] · x[t][k][d])`（x bf16 `[T][K][D]`，w f32 `[T][K]`，out bf16 `[T][D]`）；`moe_combine_bf16_k<K>_d<D>` 是不带权重的和（`moe_buf` / 共享专家的合并；名字区别于 kernel-opt 的 `moe_sum_bf16_k<K>`：那个的输入是 fp32 的每路由中间结果、D 在 kernarg 里）。K ∈ 1 … 16，D 是 8 的倍数（8 … 65536）；grid = (列 tile, T)，每个 lane 一个 b128 / 路由，所有 K 次加载先发出，f32 累加，一次 RNE 到 bf16，流式（`nt`）访问；块的线程数在 64 / 128 / 192 / 256 里选最后一个列 tile 空闲 lane 最少的（D = 7168 → 128）。限制：T ≤ 65535 且 T · K · D · 2 < 2 GiB（32 位偏移；更大要 B1）。主机测试 `tests/gpu/moe_reduce_host.cpp`（CPU 双精度参考；误差判据 = 1 个 bf16 ulp + 1e-6 · Σ|项| 的累加误差）：K ∈ {1, 2, 6, 8, 16}，D ∈ {24, 512, 1000, 2048, 4096, 7168}，T ∈ {17 … 41}（奇数），`bad = 0`，输出末尾之外 0 字节被写，`gpu_verify --strict` 0 错误，VGPR 20 … 100。带宽：见 `tools/b2_matrix.sh` 的 moe_reduce 行（T = 16384 … 65535、K = 6 … 8、D = 2048 … 7168：5.4–6.4 TB/s，D = 7168 的块大小修正前是 5.44）。
+
+
+## 行内族：γ / β 延后加载；softmax 重算 exp 的实验
+
+单步（N ≥ 512）的行在统计量算完之后才加载 γ / β（此前和 x 一起在最前面加载，在两次归约期间白占 32–64 个 VGPR；它们命中 L2，延迟被其他 wave 遮住）；短行（多步）仍在最前面加载。带宽（GB/s，N = 4096）：add_rmsnorm 5803 → **6468**，layernorm 5349 → 5602，rmsnorm 6304 → 6375；VGPR 只少了几个（layernorm 128 → 120，add_rmsnorm 120 → 116），收益主要来自 γ / β 的加载不再卡在每个 wave 的关键路径之前。softmax 在输出遍里重算 exp、不保存 64 个 f32：N = 4096 反而慢（5836 vs 6007），N = 8192 只快 0.7 %（VGPR 156 → 144），所以只是 opt-in（`AMDC_SOFTMAX_RECOMPUTE_EXP=1`）。周期模型：layernorm N = 4096 约 1005 条 VALU / 行（每条 wave64 指令 2 个周期，4 个 SIMD）≈ 500 个 CU 周期，而一行的 HBM 时间 ≈ 1550 个 CU 周期，所以 VALU 约占三分之一，不是瓶颈；剩下的差距在加载 / 存储与计算的重叠。
+
+## 去掉的实验开关（结果留在这里，代码在归档 tag）
+
+仓库约定 kernel 里不留非默认的环境变量开关，所以每个 kernel 的选择已固定：
+- **DPP 全规约 vs LDS 交换**（`AMDC_DPP_REDUCE`，归档 tag `archive/dpp-reduce-env`）：`topk_softmax` 用 DPP（+19 % E = 128 / +9 % E = 256，延迟受限）；行内族（rmsnorm / add_rmsnorm / layernorm / softmax）、量化族、`argmax` / `sample` 的块归约用 LDS 交换（带宽受限，DPP 与 LDS 持平 ±2 %）；N < 512 的短行布局本来就必须用组内 DPP。
+- **softmax 重算 exp**（`AMDC_SOFTMAX_RECOMPUTE_EXP`，归档 tag `archive/softmax-recompute-exp`）：N = 4096 5836 vs 6007 GB/s（更慢），N = 8192 只快 0.7 %，VGPR 156 → 144；不采用。
