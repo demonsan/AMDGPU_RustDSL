@@ -514,14 +514,15 @@ CVT_CASES = [("PkF32Fp8", [0], 0), ("PkF32Fp8", [0], 1), ("PkF32Bf8", [0], 1), (
              ("PkBf8F32", [2, 3, 8], 1), ("ScalePkBf16Fp8", [0, 7], 1), ("ScalePkF16Fp8", [0, 7], 0), ("ScalePkBf16Bf8", [0, 7], 1),
              ("ScalePkF16Bf8", [0, 7], 0), ("ScalePkF32Fp8", [0, 7], 1), ("ScalePkF32Bf8", [0, 7], 0), ("ScalePkF32Fp4", [1, 7], 2),
              ("ScalePkBf16Fp4", [1, 7], 3), ("ScalePkF16Fp4", [1, 7], 1), ("ScalePkFp8F32", [2, 3, 7, 8], 1), ("ScalePkBf8F32", [2, 3, 7, 8], 0),
-             ("ScalePkFp4F32", [2, 3, 7, 8], 2), ("PkU8F32", [4, 8], 2), ("PkI16I32", [5, 6], 0), ("PkU16U32", [5, 6], 0)]
+             ("ScalePkFp4F32", [2, 3, 7, 8], 2), ("ScalePkF32Fp8", [0, 9], 0), ("ScalePkBf16Fp4", [1, 10], 1), ("ScalePkFp8F32", [2, 3, 10, 8], 0),
+             ("PkU8F32", [4, 8], 2), ("PkI16I32", [5, 6], 0), ("PkU16U32", [5, 6], 0)]
 TWO = {"PkF32Fp8", "PkF32Bf8", "ScalePkF32Fp8", "ScalePkF32Bf8", "ScalePkF32Fp4"}
 
 def gen_cvt_p1():
     rnd = random.Random(5)
     ok_byte = [b for b in range(256) if (b & 0x7F) != 0x7F and ((b >> 2) & 31) <= 25]
     S2 = [2 * v for v in VALS]
-    planes = [[], [], [], [], [], [], [], [], []]
+    planes = [[], [], [], [], [], [], [], [], [], [], []]
     for l in range(LANES):
         planes[0].append(sum(rnd.choice(ok_byte) << (8 * i) for i in range(4)))
         planes[1].append(rnd.getrandbits(32))
@@ -533,6 +534,8 @@ def gen_cvt_p1():
         planes[6].append(rnd.getrandbits(32) >> rnd.randrange(32))
         planes[7].append(u32(2.0))
         planes[8].append(0x5A5A5A5A)
+        planes[9].append(u32(1.63))
+        planes[10].append(u32(3.0))
     return planes
 
 def enc_rne(fmt, v):
@@ -556,6 +559,10 @@ def bf16(v):
 def h16(v):
     return f2h(v)
 
+def e8m0(s):
+    """the hardware uses only the exponent of an f32 scale (measured)"""
+    return 2.0 ** math.floor(math.log2(abs(s)))
+
 def cvt_ref(op, sel, x, hyp):
     """expected dword(s); hyp: 'div' (quant: value / scale, dequant: value * scale) or 'mul' (quant: value * scale)"""
     if op in ("PkF32Fp8", "PkF32Bf8", "F32Fp8", "F32Bf8"):
@@ -570,7 +577,7 @@ def cvt_ref(op, sel, x, hyp):
     if op.startswith("ScalePk") and op.endswith(("Fp8", "Bf8", "Fp4")) and not op.endswith("F32"):
         src_fmt = op[-3:].lower()
         out = op[7:-3]
-        s = f32(x[1])
+        s = e8m0(f32(x[1]))
         if src_fmt == "fp4":
             vals = [mf_decode("fp4", (x[0] >> (8 * sel + 4 * i)) & 15) * s for i in range(2)]
         else:
@@ -580,7 +587,7 @@ def cvt_ref(op, sel, x, hyp):
         f = bf16 if out == "Bf16" else h16
         return [f(vals[0]) | (f(vals[1]) << 16)]
     if op in ("ScalePkFp8F32", "ScalePkBf8F32", "ScalePkFp4F32"):
-        s = f32(x[2])
+        s = e8m0(f32(x[2]))
         q = (lambda v: v / s) if hyp == "div" else (lambda v: v * s)
         a, b = q(f32(x[0])), q(f32(x[1]))
         if op == "ScalePkFp4F32":

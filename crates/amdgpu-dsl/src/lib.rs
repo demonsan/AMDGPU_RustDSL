@@ -261,14 +261,18 @@ impl CachePolicy {
     }
 }
 
-/// Conversions (P1 A2; `Op::Cvt { op, srcs, sel }`). Operands per op (unused slots: anything, conventionally `Opnd::I32(0)`):
+/// Conversions (P1 A2; `Op::Cvt { op, srcs, sel }`). Operands per op (unused slots: anything, conventionally `Opnd::I32(0)`).
+///
+/// SCALE operands (`ScalePk*`) are f32 values of which the hardware uses ONLY THE EXPONENT (E8M0 semantics, measured: a scale of 1.63 acts as
+/// 1.0, 3.0 as 2.0): the effective scale is 2^floor(log2 |scale|). Pass powers of two (e.g. an E8M0 byte shifted into an f32 exponent); a
+/// constant scale that is not a power of two is rejected by the IR verifier.
 /// * `PkF32Fp8` / `PkF32Bf8`: srcs[0] packed bytes, `sel` = word (0 / 1) -> the two values as a Frag2 of f32.
 /// * `F32Fp8` / `F32Bf8`: srcs[0], `sel` = byte (0..3) -> F32.
 /// * `PkBf8F32`: srcs[0], srcs[1] f32, srcs[2] old dword; the two bf8 bytes replace word `sel` of the old dword -> I32.
-/// * `ScalePk{Bf16,F16}{Fp8,Bf8}`: srcs[0] packed bytes, srcs[1] f32 scale; word `sel` -> two 16-bit values in a U32.
+/// * `ScalePk{Bf16,F16}{Fp8,Bf8}`: srcs[0] packed bytes, srcs[1] f32 scale (exponent only); word `sel` -> two 16-bit values in a U32 (value · 2^e).
 /// * `ScalePkF32{Fp8,Bf8}`: as above -> Frag2 of f32.
 /// * `ScalePk{F32,Bf16,F16}Fp4`: srcs[0] packed fp4, srcs[1] scale; byte `sel` (two fp4 values) -> Frag2 f32 / U32.
-/// * `ScalePk{Fp8,Bf8}F32`: srcs[0], srcs[1] f32, srcs[2] scale, srcs[3] old; word `sel` replaced -> I32 (value / scale, saturated).
+/// * `ScalePk{Fp8,Bf8}F32`: srcs[0], srcs[1] f32, srcs[2] scale (exponent only), srcs[3] old; word `sel` replaced -> I32 (value / 2^e).
 /// * `ScalePkFp4F32`: srcs[0], srcs[1] f32, srcs[2] scale, srcs[3] old; byte `sel` replaced by the two fp4 values -> I32.
 /// * `PkU8F32`: srcs[0] f32, srcs[1] old; byte `sel` replaced by the value rounded and clamped to u8 -> I32.
 /// * `PkI16I32` / `PkU16U32`: srcs[0], srcs[1] -> two saturated 16-bit values -> U32.
@@ -2821,6 +2825,32 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
             for s in &srcs[..n] {
                 if let Err(x) = expect_dword(f, *s, "cvt operand") {
                     e.push(x);
+                }
+            }
+            // the scale operand: only its exponent is used (E8M0) - a constant that is not a power of two is certainly a mistake
+            let scale_slot = match op {
+                CvtOp::ScalePkBf16Fp8 | CvtOp::ScalePkF16Fp8 | CvtOp::ScalePkBf16Bf8 | CvtOp::ScalePkF16Bf8 | CvtOp::ScalePkF32Fp8 | CvtOp::ScalePkF32Bf8
+                | CvtOp::ScalePkF32Fp4 | CvtOp::ScalePkBf16Fp4 | CvtOp::ScalePkF16Fp4 => Some(1),
+                CvtOp::ScalePkFp8F32 | CvtOp::ScalePkBf8F32 | CvtOp::ScalePkFp4F32 => Some(2),
+                _ => None,
+            };
+            if let Some(k) = scale_slot {
+                let c = match srcs[k] {
+                    Opnd::F32(x) => Some(x),
+                    Opnd::Val(v) => match f.stmts().iter().find_map(|s| match s {
+                        Stmt::Let { dst, op: Op::ConstF32(x) } if *dst == v => Some(*x),
+                        _ => None,
+                    }) {
+                        Some(x) => Some(x),
+                        None => None,
+                    },
+                    _ => None,
+                };
+                if let Some(x) = c {
+                    let m = x.abs().to_bits() & 0x7f_ffff;
+                    if m != 0 || x == 0.0 || !x.is_finite() {
+                        e.push(format!("cvt {op:?}: scale {x} is not a power of two; the hardware uses only its exponent (E8M0): it would act as {}", if x.is_finite() && x != 0.0 { f32::from_bits(x.abs().to_bits() & 0x7f80_0000).to_string() } else { "garbage".to_string() }));
+                    }
                 }
             }
         }
