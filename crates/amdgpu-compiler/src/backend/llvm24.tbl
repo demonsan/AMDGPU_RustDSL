@@ -56,6 +56,7 @@ VCvtF32F16  | V1 <- V1 | {d} = nofpexcept V_CVT_F32_F16_e32 {s0}, implicit $mode
 VCvtF16F32  | V1 <- V1 | {d} = nofpexcept V_CVT_F16_F32_e32 {s0}, implicit $mode, implicit $exec
 VAndB32     | V1 <- V1 V1 | {d} = V_AND_B32_e32 {s0}, {s1}, implicit $exec
 VMinI32     | V1 <- V1 V1 | {d} = V_MIN_I32_e32 {s0}, {s1}, implicit $exec
+VPkFmaF32 | V2 <- V2 V2 V2 | {d} = nofpexcept V_PK_FMA_F32 8, {s0}, 8, {s1}, 8, {s2}, 0, 0, -1, 0, 0, implicit $mode, implicit $exec
 SMulHiU32 | S1 <- S1 S1 | {d} = S_MUL_HI_U32 {s0}, {s1}
 VMadU64U32:rrr | V2 <- V1 V1 V2 | {d}, $vcc = V_MAD_U64_U32_e64 {s0}, {s1}, {s2}, 0, implicit $exec
 VMadU64U32:rir | V2 <- V1 I V2 | {d}, $vcc = V_MAD_U64_U32_e64 {s0}, {s1}, {s2}, 0, implicit $exec
