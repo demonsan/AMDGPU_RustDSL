@@ -2431,6 +2431,57 @@ impl Lowerer {
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
+            Op::PtrMadU32 { base, a, b } => {
+                // scalar path: a scalar base and scalar (or constant) factors -> s_mul_i32 / s_mul_hi_u32 / s_add_u32 / s_addc_u32
+                let sb = match base {
+                    Opnd::Val(v) => self.val.get(v).copied().filter(|r| self.mir.vreg_class(*r) == RClass::S2),
+                    _ => None,
+                };
+                let (sa, sbb) = (self.s_operand(*a).ok(), self.s_operand(*b).ok());
+                if let (Some(br), Some(sa), Some(sbb)) = (sb, sa, sbb) {
+                    let s1 = |me: &mut Self, s: Src| -> VReg {
+                        match s {
+                            Src::Reg(r) => r,
+                            Src::Imm(k) => {
+                                let r = me.new_vreg(RClass::S1);
+                                me.push(MInst::new(MOp::SMovB32).def(r).src(Src::Imm(k)));
+                                r
+                            }
+                        }
+                    };
+                    let (ra, rb) = (s1(self, sa), s1(self, sbb));
+                    self.touch(&[Src::Reg(br), Src::Reg(ra), Src::Reg(rb)]);
+                    let lo = self.new_vreg(RClass::S1);
+                    let hi = self.new_vreg(RClass::S1);
+                    self.push(MInst::new(MOp::SMulI32).def(lo).srcreg(ra).srcreg(rb));
+                    self.push(MInst::new(MOp::SMulHiU32).def(hi).srcreg(ra).srcreg(rb));
+                    let blo = self.new_vreg(RClass::S1);
+                    let bhi = self.new_vreg(RClass::S1);
+                    self.push(MInst::new(MOp::SMaskLo).def(blo).srcreg(br));
+                    self.push(MInst::new(MOp::SMaskHi).def(bhi).srcreg(br));
+                    let d = self.new_vreg(RClass::S2);
+                    let dlo = self.alias_vreg(d, 0, RClass::S1);
+                    let dhi = self.alias_vreg(d, 1, RClass::S1);
+                    self.push(MInst::new(MOp::SAddU32).def(dlo).srcreg(blo).srcreg(lo));
+                    self.push(MInst::new(MOp::SAddcU32).def(dhi).srcreg(bhi).srcreg(hi));
+                    self.val.insert(dst, d);
+                } else {
+                    // vector path: v_mad_u64_u32 d, vcc, a, b, base
+                    let rbase = self.as_v2(*base)?;
+                    let opa = match self.const_bits(*a) {
+                        Some(k) if (-16..=64).contains(&k) => Src::Imm(k),
+                        _ => Src::Reg(self.as_v1(*a)?),
+                    };
+                    let opb = match self.const_bits(*b) {
+                        Some(k) if (-16..=64).contains(&k) && !matches!(opa, Src::Imm(_)) => Src::Imm(k),
+                        _ => Src::Reg(self.as_v1(*b)?),
+                    };
+                    self.touch(&[opa, opb, Src::Reg(rbase)]);
+                    let d = self.new_vreg(RClass::V2);
+                    self.push(MInst::new(MOp::VMadU64U32).def(d).src(opa).src(opb).srcreg(rbase));
+                    self.val.insert(dst, d);
+                }
+            }
             Op::AnyLane(c) => {
                 let r = self.as_v1(*c)?;
                 self.val.insert(dst, r);

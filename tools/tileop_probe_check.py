@@ -880,6 +880,32 @@ def check_atomic2_p1(planes, out):
         rep(f"global pk_add_f16 (returning) c{c}", (h2f(out[20 + c]), h2f(out[20 + c] >> 16)) == (t0, t1))
     return ok
 
+# ---------------------------------------------------------------- probe_ptr64_p1
+def gen_ptr64_p1():
+    rnd = random.Random(71)
+    x = [rnd.getrandbits(32) for _ in range(LANES)]
+    y = [rnd.getrandbits(32) for _ in range(LANES)]
+    x[0], y[0] = 0xFFFFFFFF, 0xFFFFFFFF
+    return [x, y]
+
+def check_ptr64_p1(planes, out):
+    x, y = planes
+    P = lambda k: out[k * LANES:(k + 1) * LANES]
+    ptr = lambda k, l: P(k)[l] | (P(k + 1)[l] << 32)
+    M = (1 << 64) - 1
+    ok = True
+    def rep(name, cond):
+        nonlocal ok
+        ok &= cond
+        print(("ok   " if cond else "FAIL ") + name)
+    base = ptr(0, 0)
+    rep("out pointer uniform", all(ptr(0, l) == base for l in range(64)))
+    rep("scalar ptr_mad(out, 0x12345678, 0x9abc)", all(ptr(2, l) == (base + 0x12345678 * 0x9abc) & M for l in range(64)))
+    rep("vector ptr_mad(out, x, y) (u32 x u32 -> u64)", all(ptr(4, l) == (base + x[l] * y[l]) & M for l in range(64)))
+    rep("scalar ptr_mad(out, rfl(x), rfl(y)) (0xffffffff^2)", all(ptr(6, l) == (base + x[0] * y[0]) & M for l in range(64)))
+    rep("store through a moved descriptor base (out + 2048)", list(P(8)) == [l + 1 for l in range(64)])
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -894,6 +920,7 @@ PROBES = {
     "probe_f8f6f4_plain": (lambda: gen_f8f6f4_p1(PLAIN_KINDS), lambda p, o: check_f8f6f4_p1(p, o, PLAIN_KINDS), sum(2 * LANES * 4 * (4 if k[0] == 16 else 16) for k in PLAIN_KINDS)),
     "probe_atomic2_p1": (gen_atomic2_p1, check_atomic2_p1, 512),
     "probe_tr_b16_mfma2": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
+    "probe_ptr64_p1": (gen_ptr64_p1, check_ptr64_p1, 9 * LANES * 4),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }

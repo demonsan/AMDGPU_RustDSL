@@ -933,3 +933,41 @@ pub fn probe_tr_b16_mfma2() -> Function {
     b.store_global(pout, 0, d, MemTy::B128, false);
     b.finish()
 }
+
+/// `probe_ptr64_p1(in, out)`: 64-bit address arithmetic. in: plane 0 x, plane 1 y (u32). out planes (64 dwords each): 0 / 1 the out pointer
+/// (lo / hi), 2 / 3 `ptr_mad(out, 0x12345678, 0x9abc)` (scalar path, constants), 4 / 5 `ptr_mad(out, x, y)` (vector path), 6 / 7
+/// `ptr_mad(out, rfl(x), rfl(y))` (scalar path, SGPR factors), 8 lane + 1 stored through a descriptor whose base was moved by `ptr_mad(out, 64, 32)`.
+pub fn probe_ptr64_p1() -> Function {
+    use amdgpu_dsl::MemTy;
+    let mut b = FnBuilder::new("probe_ptr64_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(512));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(9 * 256));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    let x = b.load_global(pin, 0, MemTy::B32);
+    let y = b.load_global(pin, 256, MemTy::B32);
+    let s = b.ptr_mad(out, 0x12345678, 0x9abc);
+    let v = b.ptr_mad(out, x, y);
+    let xr = b.let_(Op::ReadFirstLane(Opnd::Val(x)));
+    let yr = b.let_(Op::ReadFirstLane(Opnd::Val(y)));
+    let r = b.ptr_mad(out, xr, yr);
+    let mut k = 0u32;
+    for p in [out, s, v, r] {
+        for h in 0..2u8 {
+            let w = b.frag_slice(p, h, 1);
+            b.store_global(pout, 256 * k, w, MemTy::B32, false);
+            k += 1;
+        }
+    }
+    let moved = b.ptr_mad(out, 64, 32);
+    let rs = b.buffer_desc(moved, 256);
+    let one = b.add_i32(tid, 1);
+    b.buffer_store_n(rs, Some(Opnd::Val(off4)), 0, 0, one, MemTy::B32, false);
+    b.finish()
+}

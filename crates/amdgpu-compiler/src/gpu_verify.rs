@@ -183,7 +183,8 @@ enum AV {
     /// A global pointer: the kernarg it derives from (index into `f.args`) and the byte offset interval from its base.
     Ptr { arg: Option<usize>, off: Itv },
     /// A buffer descriptor: the kernarg it was built from and its `num_records` (None = the 0xFFFFFFFF "no bounds" sentinel).
-    Rsrc { arg: Option<usize>, num: Option<Itv> },
+    /// a buffer descriptor: allocation, num_records, and the byte offset of its base inside the allocation (moved bases for > 4 GiB tensors)
+    Rsrc { arg: Option<usize>, num: Option<Itv>, base: Itv },
     /// A wave-uniform select of pointers / descriptors with different provenance: every access through it is checked against EACH arm.
     Either(Vec<AV>),
     Other,
@@ -511,7 +512,7 @@ impl<'a> An<'a> {
             }
             return;
         }
-        let AV::Rsrc { arg, num } = rsrc else {
+        let AV::Rsrc { arg, num, base: boff } = rsrc else {
             let m = format!("stmt {}: {what}: descriptor operand is not a known buffer descriptor", self.idx);
             self.rep.add("GV-GLB-PROV", Severity::Error, m);
             return;
@@ -554,7 +555,7 @@ impl<'a> An<'a> {
             Some(o) => self.int_of(o),
             None => Itv::konst(0),
         };
-        let off = v.add(&self.int_of(soff));
+        let off = boff.add(&v.add(&self.int_of(soff)));
         let base = AV::Ptr { arg: *arg, off };
         self.check_global(what, &base, imm, size, store);
     }
@@ -899,6 +900,16 @@ impl<'a> An<'a> {
                 }
                 _ => AV::Ptr { arg: None, off: Itv::top() },
             },
+            // base + (u64) a * b: exact when both factors are provably non-negative (then u32 = the value); otherwise the offset is unknown
+            Op::PtrMadU32 { base, a, b } => {
+                let (ia, ib) = (self.int_of(a), self.int_of(b));
+                let ok = ia.nonneg(&self.cx) && ib.nonneg(&self.cx);
+                let prod = if ok { Some(ia.mul(&ib, &self.cx)) } else { None };
+                match (self.av_of(base), prod) {
+                    (AV::Ptr { arg, off }, Some(p)) => AV::Ptr { arg, off: off.add(&p) },
+                    _ => AV::Ptr { arg: None, off: Itv::top() },
+                }
+            }
             Op::LoadU16 { .. } => AV::Int(Itv::range(Poly::int(0), Poly::int(65535))),
             // P1 narrow loads: their value ranges (indices / scale bytes read from memory are still bounded by the width)
             Op::LoadGlobalN { ty, .. } | Op::BufferLoadN { ty, .. } | Op::LoadLdsN { ty, .. } => match ty {
@@ -910,19 +921,19 @@ impl<'a> An<'a> {
                 _ => AV::Other,
             },
             Op::BufferRsrc { base, num_records } => {
-                let arg = match self.av_of(base) {
-                    AV::Ptr { arg, off } if off.point_const().map_or(false, |q| q.is_zero()) => arg,
-                    _ => None,
+                let (arg, boff) = match self.av_of(base) {
+                    AV::Ptr { arg, off } => (arg, off),
+                    _ => (None, Itv::konst(0)),
                 };
                 let num = if *num_records == 0xFFFF_FFFF { None } else { Some(Itv::konst(*num_records as i128)) };
-                AV::Rsrc { arg, num }
+                AV::Rsrc { arg, num, base: boff }
             }
             Op::BufferRsrcDyn { base, num_records } => {
-                let arg = match self.av_of(base) {
-                    AV::Ptr { arg, off } if off.point_const().map_or(false, |q| q.is_zero()) => arg,
-                    _ => None,
+                let (arg, boff) = match self.av_of(base) {
+                    AV::Ptr { arg, off } => (arg, off),
+                    _ => (None, Itv::konst(0)),
                 };
-                AV::Rsrc { arg, num: Some(self.int_of(num_records)) }
+                AV::Rsrc { arg, num: Some(self.int_of(num_records)), base: boff }
             }
             Op::Asm { .. } => {
                 self.has_asm = true;
@@ -1045,14 +1056,16 @@ impl<'a> An<'a> {
 
     /// A descriptor must not overstate the allocation it was built from.
     fn check_descriptor(&mut self, dst: &AV) {
-        if let AV::Rsrc { arg: Some(a), num: Some(n) } = dst {
+        if let AV::Rsrc { arg: Some(a), num: Some(n), base } = dst {
             let Some(ext) = self.arg_extent(*a).cloned() else {
                 let m = format!("stmt {}: buffer descriptor over `{}` has no declared extent to check num_records against", self.idx, self.arg_name(*a));
                 self.rep.add("GV-GLB-NOEXT", Severity::Error, m);
                 return;
             };
             let limit = ext_itv(&self.cx, &ext.alloc);
-            let ok = n.hi.iter().any(|h| limit.lo.iter().any(|l| self.cx.le(h, l)));
+            // a moved base (`ptr_mad`, > 4 GiB tensors): base >= 0 and base + num_records <= the allocation
+            let end = base.add(n);
+            let ok = base.nonneg(&self.cx) && end.hi.iter().any(|h| limit.lo.iter().any(|l| self.cx.le(h, l)));
             if ok {
                 self.rep.ok("descriptor");
             } else {
