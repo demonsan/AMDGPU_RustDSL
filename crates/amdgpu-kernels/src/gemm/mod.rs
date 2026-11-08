@@ -189,7 +189,7 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                 for r in 0..4u8 {
                     let tl = b.frag4_lane(t, r);
                     let tl = b.bitcast_f32(tl);
-                    let al = b.frag16_lane(Opnd::Var(acc), r);
+                    let al = b.frag4_lane(Opnd::Var(acc), r);
                     let al = b.bitcast_f32(al);
                     let f = b.let_(Op::FmaF32(Opnd::Val(tl), Opnd::Val(s), Opnd::Val(al)));
                     b.var_set_lane(acc, r, f);
