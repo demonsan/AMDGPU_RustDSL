@@ -219,7 +219,13 @@ pub fn summary_json(f: &Function) -> Result<String, String> {
     let (m, a) = crate::compile_mir_alloc(f)?;
     let agpr = crate::regalloc::agpr_count(&m, &a);
     let mut per_region: std::collections::BTreeMap<String, [usize; 7]> = Default::default();
-    let name_of = |id: u16| -> String { m.reg_hints.regions.iter().find(|(_, i)| *i == id).map(|(n, _)| n.clone()).unwrap_or_else(|| if id == 0 { "(kernel)".into() } else { format!("region{id}") }) };
+    // region ids are 1-based indices into reg_hints.regions ((name, parent) in order of appearance); 0 = outside every region
+    let name_of = |id: u16| -> String {
+        if id == 0 {
+            return "(kernel)".into();
+        }
+        m.reg_hints.regions.get(id as usize - 1).map(|(n, _)| n.clone()).unwrap_or_else(|| format!("region{id}"))
+    };
     let (mut waits, mut nops, mut nop_states) = (0usize, 0usize, 0usize);
     for b in &m.blocks {
         for i in &b.insts {
@@ -286,4 +292,60 @@ pub fn summary_json(f: &Function) -> Result<String, String> {
         regions.join(","),
         cert
     ))
+}
+
+/// One line of the own-backend assembly mapped back to the IR: (1-based asm line, block, instruction index, region name, origin value).
+#[derive(Clone, Debug)]
+pub struct AsmLine {
+    pub line: usize,
+    pub block: usize,
+    pub inst: usize,
+    pub region: String,
+    pub value: Option<ValueId>,
+}
+
+/// The source map of a kernel's own-backend assembly: every instruction line with the IR value whose lowering emitted it (and so, through
+/// `Function::src_locs`, the Rust builder call). Instructions added after lowering (waits, nops, copies) map to no value.
+pub fn asm_map(f: &Function) -> Result<(String, Vec<AsmLine>), String> {
+    let (m, a) = crate::compile_mir_alloc(f)?;
+    let asm = crate::emit::emit(&m, &a);
+    let lines: Vec<&str> = asm.lines().collect();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            for text in crate::emit::inst_lines(&a, inst) {
+                // find the next asm line with this text (the emitted order)
+                if let Some(k) = (pos..lines.len()).find(|&k| lines[k].trim() == text.trim()) {
+                    pos = k + 1;
+                    let region = if inst.region == 0 { "(kernel)".to_string() } else { m.reg_hints.regions.get(inst.region as usize - 1).map(|r| r.0.clone()).unwrap_or_default() };
+                    out.push(AsmLine { line: k + 1, block: bi, inst: ii, region, value: if inst.origin == u32::MAX { None } else { Some(inst.origin) } });
+                }
+            }
+        }
+    }
+    Ok((asm, out))
+}
+
+/// `amdc srcmap <kernel> [--line N]` as JSON: [{"line","block","inst","region","value","src","asm"}].
+pub fn asm_map_json(f: &Function, only: Option<usize>) -> Result<String, String> {
+    let (asm, map) = asm_map(f)?;
+    let lines: Vec<&str> = asm.lines().collect();
+    let items: Vec<String> = map
+        .iter()
+        .filter(|e| only.map_or(true, |n| e.line == n))
+        .map(|e| {
+            format!(
+                "{{\"line\":{},\"block\":{},\"inst\":{},\"region\":{},\"value\":{},\"src\":{},\"asm\":{}}}",
+                e.line,
+                e.block,
+                e.inst,
+                esc(&e.region),
+                e.value.map(|v| esc(&format!("v{v}"))).unwrap_or_else(|| "null".into()),
+                opt(&e.value.and_then(|v| f.value_loc(v))),
+                esc(lines.get(e.line - 1).map(|s| s.trim()).unwrap_or(""))
+            )
+        })
+        .collect();
+    Ok(format!("[{}]", items.join(",")))
 }

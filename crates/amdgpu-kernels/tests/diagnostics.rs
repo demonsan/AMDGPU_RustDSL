@@ -91,3 +91,20 @@ fn source_locations_do_not_change_the_code() {
     let b = amdgpu_compiler::compile(&f).unwrap().asm;
     assert_eq!(a, b);
 }
+
+#[test]
+fn the_asm_source_map_points_instructions_at_their_builder_calls() {
+    let f = amdgpu_kernels::kernel_by_name("probe_pkpair").unwrap();
+    let (asm, map) = diag::asm_map(&f).unwrap();
+    // the map is built on the same code the compiler ships
+    assert_eq!(asm, amdgpu_compiler::compile(&f).unwrap().asm);
+    let lines: Vec<&str> = asm.lines().collect();
+    let pk: Vec<_> = map.iter().filter(|e| lines[e.line - 1].contains("v_pk_mul_f32")).collect();
+    assert_eq!(pk.len(), 4);
+    for e in pk {
+        let src = f.value_loc(e.value.expect("lowered from a value")).unwrap();
+        assert!(src.contains("probes/tileops.rs"), "{src}");
+    }
+    let j = diag::asm_map_json(&f, Some(map[0].line)).unwrap();
+    assert!(j.contains("\"src\":\"crates/amdgpu-kernels/src/probes/tileops.rs"), "{j}");
+}

@@ -214,6 +214,11 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
         "blgp" => format!("{}", (inst.imm >> 12) & 7),
         "off0" => format!("{}", inst.imm & 0xff),
         "off1" => format!("{}", (inst.imm >> 8) & 0xff),
+        // the first six dwords of the destination tuple (fp6 / bf6 packs: 192-bit results held in 8-dword tuples)
+        "dt6" => {
+            let d = dst()?;
+            (0..6).map(|k| dword_name(cx.class(d), cx.phys(d), k)).collect::<Vec<_>>().join("_").replace("_$", "_")
+        }
         // the first three dwords of a 4-dword tuple (96-bit accesses use V4 registers)
         "d3" => {
             let d = dst()?;

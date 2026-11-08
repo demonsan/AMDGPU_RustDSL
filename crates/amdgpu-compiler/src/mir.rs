@@ -183,6 +183,16 @@ pub enum MOp {
     VCvtScalePkF32Fp8,
     VCvtScalePkF32Bf8,
     VCvtScalePkF32Fp4,
+    VCvtScale2xPk16Fp6F32,
+    VCvtScale2xPk16Bf6F32,
+    VCvtScalePk32Fp6F16,
+    VCvtScalePk32Fp6Bf16,
+    VCvtScalePk32Bf6F16,
+    VCvtScalePk32Bf6Bf16,
+    VCvtScalePk32F16Fp6,
+    VCvtScalePk32Bf16Fp6,
+    VCvtScalePk32F16Bf6,
+    VCvtScalePk32Bf16Bf6,
     VCvtScalePkBf16Fp4,
     VCvtScalePkF16Fp4,
     VCvtScalePkFp8F32,
@@ -592,11 +602,14 @@ pub struct MInst {
     pub region: u16,
     /// Cache policy of a global / buffer access, LLVM CPol bits on gfx950: 1 = sc0, 2 = nt, 16 = sc1 (0 = default).
     pub cpol: u8,
+    /// Diagnostics: the IR value (`ValueId`) whose lowering emitted this instruction (the last value-defining statement for the others);
+    /// `u32::MAX` for instructions added by later passes (waits, nops, copies). Not used by any pass.
+    pub origin: u32,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, cpol: 0 }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, cpol: 0, origin: u32::MAX }
     }
 
     pub fn def(mut self, r: VReg) -> Self {
