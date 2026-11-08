@@ -92,7 +92,7 @@ pub fn topk_softmax(name: &str, e: i64, k: i64, renorm: bool) -> Function {
     // the negated expert index of each element (as f32), lane-local
     let nidx: Vec<ValueId> = (0..8)
         .map(|i| {
-            let ni = b.bind_i32(ev(lane.lane()) * (-8) - i as i32);
+            let ni = b.bind_i32(lane.lane() * (-8) - i as i32);
             b.un(UnOp::CvtF32I32, ni)
         })
         .collect();
