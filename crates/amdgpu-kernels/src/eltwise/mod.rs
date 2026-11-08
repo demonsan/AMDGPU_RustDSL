@@ -2,7 +2,7 @@
 //! (out-of-range loads read zeros, out-of-range stores are dropped), occupancy first. Row-structured ones (`act_mul`: `out[m][d] = act(x[m][d]) * x[m][D + d]`) run a row per block row and
 //! column tiles of `threads * 8` elements on grid y; the flat ones (`add_bf16`) run `n / 8` lanes over the whole array.
 //!
-//! Names: `silu_mul_bf16_d<D>`, `gelu_tanh_mul_bf16_d<D>` (D a multiple of 8, 8..=65536; M and the input / output tensors < 4 GiB), `add_bf16` (flat, n a multiple of 8).
+//! Names: `silu_mul_bf16_d<D>`, `gelu_tanh_mul_bf16_d<D>` (D a multiple of 8, 8..=65536; M <= 65535 and the input / output tensors < 4 GiB), `add_bf16` (flat, n a multiple of 8).
 //! ABI: `act_mul`: x @0 (`[M][2D]` bf16), out @8 (`[M][D]` bf16), M @16 (i32). `add_bf16`: a @0, b @8, out @16, n @24 (i32, elements).
 
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
@@ -30,7 +30,7 @@ fn pack_bf16x8(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
     b.frag4(w[0], w[1], w[2], w[3])
 }
 
-/// `out[m][d] = act(x[m][d]) * x[m][D + d]` for bf16 `x [M][2D]`, `out [M][D]`; one row of the grid per block row, `threads * 8` columns per block tile.
+/// `out[m][d] = act(x[m][d]) * x[m][D + d]` for bf16 `x [M][2D]`, `out [M][D]`; grid x = the column tiles of `threads * 8` elements (fastest: consecutive blocks read consecutive memory), grid y = the rows (M <= 65535).
 pub fn act_mul_bf16(name: &str, d: i64, a: Act) -> Function {
     let d8 = d / 8;
     let threads = (((d8 + 63) / 64).min(4) * 64) as u32;
@@ -42,17 +42,17 @@ pub fn act_mul_bf16(name: &str, d: i64, a: Act) -> Function {
     b.arg("out", DType::Ptr, 8, 8);
     b.arg("m", DType::I32, 16, 4);
     let mt = Ext::sym("MT");
-    b.sym_range("MT", 1, 1 << 20);
+    b.sym_range("MT", 1, 65535);
     b.ka_is(16, mt.clone());
-    b.grid_is(0, mt.clone());
-    b.grid_is(1, Ext::c(tiles));
+    b.grid_is(0, Ext::c(tiles));
+    b.grid_is(1, mt.clone());
     b.arg_tensor("x", mt.clone() * Ext::c(4 * d));
     b.arg_tensor("out", mt * Ext::c(2 * d));
     let (p_x, p_o) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 8 }));
     let m_v = b.let_(Op::KernargI32 { offset: 16 });
     let tid = b.let_(Op::WorkitemId);
-    let row = b.let_(Op::WorkgroupIdX);
-    let tile = b.let_(Op::WorkgroupIdY);
+    let tile = b.let_(Op::WorkgroupIdX);
+    let row = b.let_(Op::WorkgroupIdY);
     // descriptors: num_records = the tensor bytes (loads past the end read zeros, stores past the end are dropped)
     let r_x = { let v = b.bind_i32(ev(m_v) * (4 * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_x, v) };
     let r_o = { let v = b.bind_i32(ev(m_v) * (2 * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_o, v) };

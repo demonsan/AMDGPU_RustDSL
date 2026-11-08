@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
     struct __attribute__((packed)) A2 { void* x; void* o; int32_t m; } a2{dx, dout, (int32_t)M};
     struct __attribute__((packed)) A3 { void* a; void* b; void* o; int32_t n; } a3{dx, dy, dout, (int32_t)((size_t)M * D)};
     if (flat) { blockx = 256; gx = (int)(((size_t)M * D + 2047) / 2048); cfg_args = &a3; sz = sizeof(a3); }
-    else { long d8 = D / 8; blockx = (int)(std::min<long>(4, (d8 + 63) / 64) * 64); gx = (int)M; gy = (int)((d8 + blockx - 1) / blockx); cfg_args = &a2; sz = sizeof(a2); }
+    else { long d8 = D / 8; blockx = (int)(std::min<long>(4, (d8 + 63) / 64) * 64); gy = (int)M; gx = (int)((d8 + blockx - 1) / blockx); cfg_args = &a2; sz = sizeof(a2); }
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, cfg_args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     CK(hipModuleLaunchKernel(fn, gx, gy, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize());
     std::vector<uint16_t> ho(nout + 32);
