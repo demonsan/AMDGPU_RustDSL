@@ -288,7 +288,7 @@ pub fn fix_value_hazards_opts(m: &mut MFunction, strict: bool) {
                 if let Some(dly) = valu_writer_delay(inst.op) {
                     vw.insert(canon(d), cycle + 1 + dly);
                 }
-                if inst.op == MOp::VPermlane32Swap {
+                if matches!(inst.op, MOp::VPermlane32Swap | MOp::VPermlane16Swap) {
                     // the swap rewrites its second operand too
                     if let Some(Src::Reg(r2)) = inst.srcs.get(1) {
                         vw.insert(canon(*r2), cycle + 1 + 2);
@@ -588,7 +588,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                         wr.push((base, base + 1));
                     }
                 }
-                MOp::VPermlane32Swap => {
+                MOp::VPermlane32Swap | MOp::VPermlane16Swap => {
                     for s in inst.srcs.iter().take(2) {
                         if let Src::Reg(r) = s {
                             wr.push(rng(m, *r));
@@ -627,7 +627,7 @@ pub fn pad_physical_war(m: &mut MFunction, a: &crate::regalloc::Alloc) {
                     if let Some(d) = inst.dst {
                         touched.push(d);
                     }
-                    if inst.op == MOp::VPermlane32Swap {
+                    if matches!(inst.op, MOp::VPermlane32Swap | MOp::VPermlane16Swap) {
                         for s in inst.srcs.iter().take(2) {
                             if let Src::Reg(r) = s {
                                 touched.push(*r);

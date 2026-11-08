@@ -301,6 +301,70 @@ impl CvtOp {
     }
 }
 
+/// DPP lane control (gfx9). Rows are 16 lanes. `QuadPerm(p)`: lane i reads lane 4 (i / 4) + p[i % 4]; `RowShl(n)` / `RowShr(n)` / `RowRor(n)`
+/// (1..=15): within the row, read lane + n / lane - n / (lane - n) mod 16; `WaveShl1` / `WaveShr1` / `WaveRol1` / `WaveRor1`: whole-wave shift /
+/// rotate by one; `RowMirror` (15 - i), `RowHalfMirror` (7 - i within 8); `RowBcast15` (lane 15 of the previous row), `RowBcast31` (lane 31, for
+/// lanes 32..63). Out-of-range sources are INVALID: with `bound_zero` they read 0, else the lane keeps `old`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DppCtrl {
+    QuadPerm([u8; 4]),
+    RowShl(u8),
+    RowShr(u8),
+    RowRor(u8),
+    WaveShl1,
+    WaveRol1,
+    WaveShr1,
+    WaveRor1,
+    RowMirror,
+    RowHalfMirror,
+    RowBcast15,
+    RowBcast31,
+}
+
+impl DppCtrl {
+    /// The 9-bit dpp_ctrl encoding.
+    pub fn bits(self) -> u32 {
+        match self {
+            DppCtrl::QuadPerm(p) => p[0] as u32 & 3 | (p[1] as u32 & 3) << 2 | (p[2] as u32 & 3) << 4 | (p[3] as u32 & 3) << 6,
+            DppCtrl::RowShl(n) => 0x100 + n as u32,
+            DppCtrl::RowShr(n) => 0x110 + n as u32,
+            DppCtrl::RowRor(n) => 0x120 + n as u32,
+            DppCtrl::WaveShl1 => 0x130,
+            DppCtrl::WaveRol1 => 0x134,
+            DppCtrl::WaveShr1 => 0x138,
+            DppCtrl::WaveRor1 => 0x13c,
+            DppCtrl::RowMirror => 0x140,
+            DppCtrl::RowHalfMirror => 0x141,
+            DppCtrl::RowBcast15 => 0x142,
+            DppCtrl::RowBcast31 => 0x143,
+        }
+    }
+}
+
+/// The DPP part of a `Op::Dpp` / `Op::DppAlu`: control, row / bank write masks (bit r: row r; bit b: lanes 4 b .. 4 b + 3 of every row),
+/// and bound_ctrl (invalid sources read 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Dpp {
+    pub ctrl: DppCtrl,
+    pub row_mask: u8,
+    pub bank_mask: u8,
+    pub bound_zero: bool,
+}
+
+impl Dpp {
+    /// All rows / banks enabled, invalid sources keep `old`.
+    pub const fn new(ctrl: DppCtrl) -> Dpp {
+        Dpp { ctrl, row_mask: 0xf, bank_mask: 0xf, bound_zero: false }
+    }
+    pub fn imm(self) -> i64 {
+        self.ctrl.bits() as i64 | (((self.row_mask & 0xf) ^ 0xf) as i64) << 12 | (((self.bank_mask & 0xf) ^ 0xf) as i64) << 16 | (self.bound_zero as i64) << 20
+    }
+}
+
+/// VALU ops with a DPP-modified first operand: `D = dpp(a) op b` (lanes not written keep `old`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DppAluOp { AddF32, SubF32, MulF32, MaxF32, MinF32, AddU32, MaxI32, MinI32, MaxU32, MinU32, AndB32, OrB32, XorB32 }
+
 impl MemTy {
     pub fn bytes(self) -> u32 {
         match self {
@@ -544,6 +608,12 @@ pub enum Op {
     LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
     LoadLdsTrB16 { addr: Opnd },
+    /// `v_mov_b32_dpp`: lane i gets `x` of the lane `dpp.ctrl` names (lanes not written keep `old`)
+    Dpp { dpp: Dpp, x: Opnd, old: Opnd },
+    /// `v_<op>_dpp`: dpp(a) op b, lanes not written keep `old`
+    DppAlu { op: DppAluOp, dpp: Dpp, a: Opnd, b: Opnd, old: Opnd },
+    /// `v_permlane16_swap`: exchanges the odd 16-lane rows of `a` with the even rows of `b`; Frag2 (new a, new b)
+    Permlane16Swap { a: Opnd, b: Opnd },
     /// conversion (`CvtOp`; operands and `sel` per op)
     Cvt { op: CvtOp, srcs: [Opnd; 4], sel: u8 },
     /// D = A x B + C (`c: None`: zero accumulator) of the MFMA `kind`; result `kind.acc_ty()`
@@ -563,6 +633,12 @@ impl Op {
             Op::LoadLdsTrB16 { .. } => DType::Frag2,
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Cvt { op, .. } => op.sig().1,
+            Op::Dpp { .. } => DType::U32,
+            Op::DppAlu { op, .. } => match op {
+                DppAluOp::AddF32 | DppAluOp::SubF32 | DppAluOp::MulF32 | DppAluOp::MaxF32 | DppAluOp::MinF32 => DType::F32,
+                _ => DType::I32,
+            },
+            Op::Permlane16Swap { .. } => DType::Frag2,
             Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::AddI32(..) | Op::MulI32(..) => DType::I32,
             Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::MinI32(..) | Op::XorI32(..) | Op::LoadU16 { .. } => DType::I32,
             Op::ConstF32(_) | Op::KernargF32 { .. } => DType::F32,
@@ -651,6 +727,9 @@ impl Op {
             }
             Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } | Op::LoadLdsD16 { addr, .. } => vec![*addr],
             Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
+            Op::Dpp { x, old, .. } => vec![*x, *old],
+            Op::DppAlu { a, b, old, .. } => vec![*a, *b, *old],
+            Op::Permlane16Swap { a, b } => vec![*a, *b],
             Op::Mfma { a, b, c, scale, .. } => {
                 let mut v = vec![*a, *b];
                 v.extend(c.iter().copied());
@@ -1918,6 +1997,18 @@ impl FnBuilder {
         self.let_(Op::LoadLdsTrB16 { addr: addr.into() })
     }
 
+    /// `v_mov_b32_dpp` with a full DPP control; lanes not written keep `old`.
+    pub fn dpp(&mut self, dpp: Dpp, x: impl Into<Opnd>, old: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Dpp { dpp, x: x.into(), old: old.into() })
+    }
+    /// `dpp(a) op b` in one instruction (`v_<op>_dpp`); lanes not written keep `old`.
+    pub fn dpp_alu(&mut self, op: DppAluOp, dpp: Dpp, a: impl Into<Opnd>, b: impl Into<Opnd>, old: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::DppAlu { op, dpp, a: a.into(), b: b.into(), old: old.into() })
+    }
+    /// `v_permlane16_swap_b32`: (new a, new b) as a Frag2.
+    pub fn permlane16_swap(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Permlane16Swap { a: a.into(), b: b.into() })
+    }
     /// A conversion (`CvtOp`); pass the used operands in order.
     pub fn cvt(&mut self, op: CvtOp, srcs: &[Opnd], sel: u8) -> ValueId {
         let mut s = [Opnd::I32(0); 4];
@@ -2707,6 +2798,21 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
         }
         Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
         Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
+        Op::Dpp { x, old, dpp } | Op::DppAlu { a: x, old, dpp, .. } => {
+            for s in [*x, *old] {
+                if let Err(e2) = expect_dword(f, s, "dpp operand") {
+                    e.push(e2);
+                }
+            }
+            let ok = match dpp.ctrl {
+                DppCtrl::RowShl(n) | DppCtrl::RowShr(n) | DppCtrl::RowRor(n) => (1..=15).contains(&n),
+                DppCtrl::QuadPerm(p) => p.iter().all(|x| *x < 4),
+                _ => true,
+            };
+            if !ok {
+                e.push(format!("dpp {:?}: shift / permutation out of range", dpp.ctrl));
+            }
+        }
         Op::Cvt { op, srcs, sel } => {
             let (n, _, max_sel) = op.sig();
             if *sel > max_sel {

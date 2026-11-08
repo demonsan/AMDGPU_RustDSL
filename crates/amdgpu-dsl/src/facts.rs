@@ -211,7 +211,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::Un(o, _) if o.trans() => ResClass::Trans,
         Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
         Op::Mfma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
-        Op::Cvt { .. } => ResClass::Valu,
+        Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } => ResClass::Valu,
         Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => {
             e.global_read = true;
             ResClass::VmemLoad
