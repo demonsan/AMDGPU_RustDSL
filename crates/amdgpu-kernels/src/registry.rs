@@ -35,7 +35,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_lds_self2" => Some(crate::probes::probe_lds_self2()),
         "probe_roles_loop" => Some(crate::probes::probe_roles_loop()),
         "probe_lds_tr_b8" => Some(crate::probes::probe_lds_tr_b8()),
-        n if (n.starts_with("gemm_mxfp8_bs_v") || n.starts_with("gemm_a8w8_") || n.starts_with("gemm_a16w16_")) && crate::gemm::by_name(n).is_some() => crate::gemm::by_name(n),
+        n if (n.starts_with("gemm_mxfp8_bs_v") || n.starts_with("gemm_a8w8_") || n.starts_with("gemm_a16w16_") || n.starts_with("gemm_a4w4_")) && crate::gemm::by_name(n).is_some() => crate::gemm::by_name(n),
         n if n.starts_with("handoff_probe_") => crate::probes::handoff::by_name(n),
         n if n.starts_with("mlp_fp8_") => crate::mlp::by_name(n),
         // P2 (stage library): RMSNorm + per-token fp8 quantization from the generic E / R / Q stages; N in the name (multiple of 512)
