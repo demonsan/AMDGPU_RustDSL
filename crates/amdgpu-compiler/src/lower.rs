@@ -2225,6 +2225,18 @@ impl Lowerer {
     }
 
     fn lower_op(&mut self, dst: ValueId, op: &Op) -> Result<(), String> {
+        // A load whose result is never used is not emitted: its destination register would be handed to another value while the load is still
+        // in flight, and the load's late write would clobber that value (a physical WAW the in-order wait accounting cannot see).
+        let pure_load = matches!(
+            op,
+            Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::BufferLoad { .. } | Op::BufferLoadB128x2 { .. }
+                | Op::LoadLdsB32 { .. } | Op::LoadLdsB64 { .. } | Op::LoadLdsB128 { .. } | Op::LoadLdsB128x2 { .. } | Op::LoadLdsTrB8 { .. }
+                | Op::LoadLdsTr4B8 { .. } | Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } | Op::LoadLdsN { .. }
+                | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. }
+        );
+        if pure_load && self.use_counts.get(&dst).copied().unwrap_or(0) == 0 {
+            return Ok(());
+        }
         match op {
             Op::ConstI32(v) => {
                 let r = self.const_vreg(*v as i64);
