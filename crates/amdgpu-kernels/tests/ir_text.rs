@@ -24,6 +24,13 @@ fn all_kernels() -> Vec<String> {
         "silu_mul_bf16_d24",
         "gelu_tanh_mul_bf16_d4096",
         "add_bf16",
+        "rmsnorm_bf16_n4096",
+        "layernorm_bf16_n776",
+        "softmax_bf16_n1000",
+        "add_rmsnorm_bf16_n4096",
+        "quant_token_bf16_fp8_n4096",
+        "quant_group128_bf16_fp8_n640",
+        "silu_mul_quant_fp8_d4096",
     ] {
         v.push(k.to_string());
     }
