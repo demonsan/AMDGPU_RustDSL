@@ -485,8 +485,8 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
                         let a2 = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(s2), a: Opnd::Val(w[2]), b: Opnd::Val(a1) });
                         b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(s3), a: Opnd::Val(w[3]), b: Opnd::Val(a2) })
                     };
-                    let lse = pick(b, lv);
-                    let dot = pick(b, dv);
+                    let lse = pick(&mut b, lv);
+                    let dot = pick(&mut b, dv);
                     let s = b.frag16_lane(Opnd::Var(s_vars[sb]), r);
                     let s = b.bitcast_f32(s);
                     let x = b.mul_f32(s, csc);
