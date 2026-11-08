@@ -171,6 +171,7 @@ impl FromIr for Op {
             "LoadLds2" => { v.expect_struct("LoadLds2")?; Ok(Op::LoadLds2 { addr: FromIr::from_ir(v.field("addr")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
             "LoadLdsTrB16" => { v.expect_struct("LoadLdsTrB16")?; Ok(Op::LoadLdsTrB16 { addr: FromIr::from_ir(v.field("addr")?)? }) }
             "PtrMadU32" => { v.expect_struct("PtrMadU32")?; Ok(Op::PtrMadU32 { base: FromIr::from_ir(v.field("base")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
+            "PkFmaF32" => { v.expect_tuple("PkFmaF32", 3)?; Ok(Op::PkFmaF32(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?)) }
             "AnyLane" => { v.expect_tuple("AnyLane", 1)?; Ok(Op::AnyLane(FromIr::from_ir(v.item(0)?)?)) }
             "FragSlice" => { v.expect_struct("FragSlice")?; Ok(Op::FragSlice { frag: FromIr::from_ir(v.field("frag")?)?, start: FromIr::from_ir(v.field("start")?)?, n: FromIr::from_ir(v.field("n")?)? }) }
             "FragCat" => { v.expect_struct("FragCat")?; Ok(Op::FragCat { parts: FromIr::from_ir(v.field("parts")?)?, dwords: FromIr::from_ir(v.field("dwords")?)? }) }
@@ -289,6 +290,7 @@ impl IrIds for Op {
             Op::LoadLds2 { addr, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
             Op::LoadLdsTrB16 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
             Op::PtrMadU32 { base, a, b } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Op::PkFmaF32(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
             Op::AnyLane(x0) => { IrIds::ids(&mut (*x0), fv, fr); }
             Op::FragSlice { frag, start, n } => { IrIds::ids(&mut (*frag), fv, fr); IrIds::ids(&mut (*start), fv, fr); IrIds::ids(&mut (*n), fv, fr); }
             Op::FragCat { parts, dwords } => { IrIds::ids(&mut (*parts), fv, fr); IrIds::ids(&mut (*dwords), fv, fr); }
@@ -579,6 +581,7 @@ impl FromIr for Stmt {
             "StoreGlobalN" => { v.expect_struct("StoreGlobalN")?; Ok(Stmt::StoreGlobalN { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)?, cache: FromIr::from_ir(v.field("cache")?)? }) }
             "BufferStoreN" => { v.expect_struct("BufferStoreN")?; Ok(Stmt::BufferStoreN { rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)?, cache: FromIr::from_ir(v.field("cache")?)? }) }
             "StoreLdsN" => { v.expect_struct("StoreLdsN")?; Ok(Stmt::StoreLdsN { addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
+            "VarPkFma" => { v.expect_struct("VarPkFma")?; Ok(Stmt::VarPkFma { var: FromIr::from_ir(v.field("var")?)?, start: FromIr::from_ir(v.field("start")?)?, t: FromIr::from_ir(v.field("t")?)?, s: FromIr::from_ir(v.field("s")?)? }) }
             "AtomicLdsNoRet" => { v.expect_struct("AtomicLdsNoRet")?; Ok(Stmt::AtomicLdsNoRet { op: FromIr::from_ir(v.field("op")?)?, addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
             "BufferAtomicNoRet" => { v.expect_struct("BufferAtomicNoRet")?; Ok(Stmt::BufferAtomicNoRet { op: FromIr::from_ir(v.field("op")?)?, rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
             "AtomicGlobalNoRet" => { v.expect_struct("AtomicGlobalNoRet")?; Ok(Stmt::AtomicGlobalNoRet { op: FromIr::from_ir(v.field("op")?)?, base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)? }) }
@@ -642,6 +645,7 @@ impl IrIds for Stmt {
             Stmt::StoreGlobalN { base, byte_off, value, ty, hi, cache } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); IrIds::ids(&mut (*cache), fv, fr); }
             Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi, cache } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); IrIds::ids(&mut (*cache), fv, fr); }
             Stmt::StoreLdsN { addr, value, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Stmt::VarPkFma { var, start, t, s } => { fr(&mut (*var)); IrIds::ids(&mut (*start), fv, fr); IrIds::ids(&mut (*t), fv, fr); IrIds::ids(&mut (*s), fv, fr); }
             Stmt::AtomicLdsNoRet { op, addr, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
             Stmt::BufferAtomicNoRet { op, rsrc, voff, soff, imm, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*value), fv, fr); }
             Stmt::AtomicGlobalNoRet { op, base, byte_off, value } => { IrIds::ids(&mut (*op), fv, fr); IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); }

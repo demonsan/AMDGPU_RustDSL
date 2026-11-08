@@ -135,6 +135,7 @@ pub enum MOp {
     VCvtF16F32,
     VAndB32,
     VMinI32,
+    VPkFmaF32,
     // B1 64-bit address arithmetic
     SMulHiU32,
     VMadU64U32,

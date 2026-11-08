@@ -1881,6 +1881,22 @@ impl Lowerer {
                     let rb = self.as_v2(*b)?;
                     self.push(MInst::new(MOp::VMfma32x32x8F16Z).def(v).srcreg(ra).srcreg(rb));
                 }
+                Stmt::VarPkFma { var, start, t, s } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let rt = match t {
+                        Opnd::Val(x) => *self.val.get(x).ok_or("value not lowered")?,
+                        Opnd::Var(x) => *self.vars.get(x.0 as usize).ok_or("var not lowered")?,
+                        _ => return Err("var_pk_fma: t must be a fragment".into()),
+                    };
+                    let rs = self.as_v2(*s)?;
+                    self.touch(&[Src::Reg(v), Src::Reg(rt), Src::Reg(rs)]);
+                    let w = self.mir.vreg_class(rt).dwords() as u8;
+                    for i in 0..w / 2 {
+                        let acc = self.sub_alias(v, start + 2 * i, RClass::V2);
+                        let tp = if w == 2 { rt } else { self.sub_alias(rt, 2 * i, RClass::V2) };
+                        self.push(MInst::new(MOp::VPkFmaF32).def(acc).srcreg(tp).srcreg(rs).srcreg(acc));
+                    }
+                }
                 Stmt::VarScalePk { var, pair } => {
                     let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
                     let p = self.as_v2(*pair)?;
@@ -2592,6 +2608,13 @@ impl Lowerer {
                     self.push(MInst::new(MOp::VMadU64U32).def(d).src(opa).src(opb).srcreg(rbase));
                     self.val.insert(dst, d);
                 }
+            }
+            Op::PkFmaF32(a, b, c) => {
+                let (ra, rb, rc) = (self.as_v2(*a)?, self.as_v2(*b)?, self.as_v2(*c)?);
+                self.touch(&[Src::Reg(ra), Src::Reg(rb), Src::Reg(rc)]);
+                let d = self.new_vreg(RClass::V2);
+                self.push(MInst::new(MOp::VPkFmaF32).def(d).srcreg(ra).srcreg(rb).srcreg(rc));
+                self.val.insert(dst, d);
             }
             Op::AnyLane(c) => {
                 let r = self.as_v1(*c)?;
@@ -4127,7 +4150,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                     }
                 }
                 // any other statement that writes a variable in place makes it non-scalar
-                Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
+                Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarPkFma { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
                 | Stmt::VarScaleLane { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScale16 { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8 { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarMfma { var, .. } | Stmt::VarAsm { var, .. } => {
                     if uvars.remove(var) {
                         changed = true;

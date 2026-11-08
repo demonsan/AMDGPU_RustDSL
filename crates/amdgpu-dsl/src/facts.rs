@@ -211,7 +211,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::Un(o, _) if o.trans() => ResClass::Trans,
         Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
         Op::Mfma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
-        Op::PtrMadU32 { .. } | Op::AnyLane(_) | Op::FragSlice { .. } | Op::FragCat { .. } | Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } | Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } => ResClass::Valu,
+        Op::PkFmaF32(..) | Op::PtrMadU32 { .. } | Op::AnyLane(_) | Op::FragSlice { .. } | Op::FragCat { .. } | Op::Cvt { .. } | Op::Dpp { .. } | Op::DppAlu { .. } | Op::Permlane16Swap { .. } | Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } => ResClass::Valu,
         // lane permutes through the LDS crossbar: lgkm-counted, no LDS memory
         Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => ResClass::LdsRead,
         Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => {
@@ -327,7 +327,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             (ResClass::Sync, vec![], false)
         }
         Stmt::SetVar { var, .. } => (ResClass::Valu, vec![*var], false),
-        Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarScaleLane { var, .. } | Stmt::VarSetLane { var, .. } => {
+        Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarPkFma { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarScaleLane { var, .. } | Stmt::VarSetLane { var, .. } => {
             (ResClass::Valu, vec![*var], true)
         }
         Stmt::VarMfmaF16Z { var, .. } => (ResClass::Mfma { passes: 8 }, vec![*var], false),
