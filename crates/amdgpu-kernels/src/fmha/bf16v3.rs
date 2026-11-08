@@ -357,7 +357,9 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     b.ka_is(400, rowb.clone());
     b.ka_is(416, sq.clone() * hh.clone() * rowb.clone());
     b.ka_is(464, sq.clone() * Ext::c(4));
-    b.grid_is(0, if causal { sq.clone().ceil_div(QR as i64).ceil_div(2) } else { sq.clone().ceil_div(QR as i64) });
+    // causal: the vendor's pairing (two q tiles per CTA); hd192 causal runs one q tile per CTA (the second pass's registers do not fit)
+    let pair = causal && !hd192;
+    b.grid_is(0, if pair { sq.clone().ceil_div(QR as i64).ceil_div(2) } else { sq.clone().ceil_div(QR as i64) });
     b.grid_is(1, hh.clone());
     if split {
         b.arg("lg_s", DType::I32, 656, 4);
@@ -467,7 +469,7 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     let qoff = b.bind_i32(ev(s_kv) - ev(s_q));
     // causal: the vendor's pairing - CTA x takes q tiles x and nt - 1 - x (equal work per CTA; the grid is halved)
     let nt = { let v = b.bind_i32((ev(s_q) + (QR - 1)).lshr(8)); b.read_first_lane(v) };
-    let passes: Vec<(ValueId, Option<ValueId>)> = if causal {
+    let passes: Vec<(ValueId, Option<ValueId>)> = if pair {
         let qb = { let v = b.bind_i32(ev(nt) - 1 - ev(qt)); b.read_first_lane(v) };
         let second = b.bind_cond(ev(qb).gt(ev(qt)));
         vec![(qt, None), (qb, Some(second))]
