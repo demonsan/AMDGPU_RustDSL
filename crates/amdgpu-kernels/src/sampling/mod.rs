@@ -282,8 +282,6 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
             let scan_find = |b: &mut FnBuilder, tgt: ValueId, float: bool| -> (ValueId, ValueId) {
                 // thread t < 256 owns bin 255 - t; threads >= 256 use the dummy slot
                 let rb = b.bind_i32(255 - ev(tcl));
-                let rbc = b.let_(Op::MaxI32(Opnd::Val(rb), Opnd::I32(0)));
-                let _ = rbc;
                 let a_h = b.bind_i32((ev(rb) << 2) + hist);
                 let v0 = b.load_lds(a_h, MemTy::B32);
                 b.wait_lds(0);
@@ -389,11 +387,11 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                 let (low, _b2) = scan_find(b, tgt2, float);
                 let hi8 = b.bind_i32(ev(bin) << 8);
                 let t = b.bind_i32(ev(hi8) + ev(low));
-                b.let_(Op::MaxI32(Opnd::Val(t), Opnd::Val(kmin)))
+                b.bin(amdgpu_dsl::BinOp::MaxI32, t, kmin)
             };
             let k_on = b.let_(Op::CmpLtI32(Opnd::I32(0), Opnd::Val(top_k)));
             // top-k (counts): the largest key whose count(key >= T) >= k; off: key 0 keeps everything
-            let k_tgt = b.let_(Op::MaxI32(Opnd::Val(top_k), Opnd::I32(1)));
+            let k_tgt = b.bin(amdgpu_dsl::BinOp::MaxI32, top_k, 1i32);
             let tk_sel = select(b, k_tgt, false, zero_i);
             let thr_k = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(k_on), a: Opnd::Val(tk_sel), b: Opnd::I32(0) });
             // top-p (mass): over what top-k kept
