@@ -2,6 +2,7 @@
 // usage: rope_host <co> <kernel> <neox|gptj> <T> <H> <D> [iters]
 #include <hip/hip_runtime.h>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,20 +27,24 @@ int main(int argc, char** argv) {
     CK(hipMalloc(&dx, hx.size() * 2)); CK(hipMalloc(&dout, hx.size() * 2 + 64)); CK(hipMalloc(&dpos, T * 4)); CK(hipMalloc(&dcs, hcs.size() * 2));
     CK(hipMemcpy(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice)); CK(hipMemcpy(dpos, hpos.data(), T * 4, hipMemcpyHostToDevice)); CK(hipMemcpy(dcs, hcs.data(), hcs.size() * 2, hipMemcpyHostToDevice)); CK(hipMemset(dout, 0x55, hx.size() * 2 + 64));
     hipModule_t mod; hipFunction_t fn; CK(hipModuleLoad(&mod, co)); CK(hipModuleGetFunction(&fn, mod, kn));
-    struct __attribute__((packed)) { void* x; void* o; void* pos; void* cs; int32_t t; int32_t p; } args{dx, dout, dpos, dcs, (int32_t)T, (int32_t)P};
-    size_t sz = sizeof(args); void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
+    const bool norm = std::string(kn).rfind("qknorm_", 0) == 0;   // qknorm_rope_*: per-head RMSNorm (gamma [D], eps) before the rotation
+    std::vector<uint16_t> hg(D); { std::uniform_real_distribution<float> gd(0.5f, 1.5f); for (auto& v : hg) v = f32_to_bf16(gd(rng)); } void* dg; CK(hipMalloc(&dg, D * 2)); CK(hipMemcpy(dg, hg.data(), D * 2, hipMemcpyHostToDevice)); const float eps = 1e-6f;
+    struct __attribute__((packed)) { void* x; void* o; void* pos; void* cs; int32_t t; int32_t p; void* g; float eps; } args{dx, dout, dpos, dcs, (int32_t)T, (int32_t)P, dg, eps};
+    size_t sz = norm ? sizeof(args) : offsetof(decltype(args), g); void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     long Lr = neox ? D / 16 : D / 8, rpw = 64 / Lr, nw = std::min<long>(4, (H + rpw - 1) / rpw); long hl = H * Lr; bool packed = hl <= 32 && (hl & (hl - 1)) == 0; long tpw = packed ? 64 / hl : 1; if (packed) nw = 4; int blockx = (int)(64 * nw); int grid = packed ? (int)((T + 4 * tpw - 1) / (4 * tpw)) : (int)T;   // packed: tpw tokens per wave (rope_kernel)
     CK(hipModuleLaunchKernel(fn, grid, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize());
     std::vector<uint16_t> ho(hx.size() + 32); CK(hipMemcpy(ho.data(), dout, ho.size() * 2, hipMemcpyDeviceToHost));
-    long bad = 0, cnt = 0;
+    long bad = 0, cnt = 0; std::vector<double> xn(D);
     for (long t = 0; t < T; ++t) for (long h = 0; h < H; ++h) for (long i = 0; i < D; ++i) {
         size_t base = ((size_t)t * H + h) * D; int p = hpos[t]; bool oob = p >= P;
+        if (i == 0 && norm) { double ss = 0; for (long k = 0; k < D; ++k) { double v = bf16_to_f32(hx[base + k]); ss += v * v; } double inv = 1.0 / std::sqrt(ss / D + eps); for (long k = 0; k < D; ++k) xn[k] = bf16_to_f32(hx[base + k]) * inv * bf16_to_f32(hg[k]); }
+        auto X = [&](long j) { return norm ? xn[j] : (double)bf16_to_f32(hx[base + j]); };
         auto C = [&](long j) { return oob ? 0.0 : (double)bf16_to_f32(hcs[(size_t)p * R + j]); };
         auto S = [&](long j) { return oob ? 0.0 : (double)bf16_to_f32(hcs[(size_t)p * R + R / 2 + j]); };
         double ref;
         if (i >= R) ref = bf16_to_f32(hx[base + i]);   // past the rotary part: copied (the out-of-table check applies to the rotary part only)
-        else if (neox) { long j = i % (R / 2); double a = bf16_to_f32(hx[base + j]), c = bf16_to_f32(hx[base + R / 2 + j]); ref = i < R / 2 ? a * C(j) - c * S(j) : c * C(j) + a * S(j); }
-        else { long j = i / 2; double a = bf16_to_f32(hx[base + 2 * j]), c = bf16_to_f32(hx[base + 2 * j + 1]); ref = (i % 2 == 0) ? a * C(j) - c * S(j) : c * C(j) + a * S(j); }
+        else if (neox) { long j = i % (R / 2); double a = X(j), c = X(R / 2 + j); ref = i < R / 2 ? a * C(j) - c * S(j) : c * C(j) + a * S(j); }
+        else { long j = i / 2; double a = X(2 * j), c = X(2 * j + 1); ref = (i % 2 == 0) ? a * C(j) - c * S(j) : c * C(j) + a * S(j); }
         double got = bf16_to_f32(ho[base + i]), err = std::fabs(got - ref), tol = std::fabs(ref) * (1.0 / 128.0) * 1.05 + 2e-3;   // the products and the bf16 output: <= 1 ulp of the larger term
         if (!(err <= tol)) { if (bad < 5) std::fprintf(stderr, "bad (t%ld,h%ld,i%ld): got %g ref %g\n", t, h, i, got, ref); ++bad; }
         ++cnt;
