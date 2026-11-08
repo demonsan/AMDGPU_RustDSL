@@ -230,7 +230,7 @@ impl PipeBody for Body<'_> {
             .iter()
             .map(|x| {
                 let t = b.let_(Op::FmaF32(Opnd::Val(*x), Opnd::Val(self.csc), Opnd::Val(nm)));
-                b.exp2_f32(t)
+                if std::env::var("EXP_NOEXP").is_ok() { t } else { b.exp2_f32(t) }
             })
             .collect();
         let mut ps = p[0];
@@ -252,7 +252,9 @@ impl PipeBody for Body<'_> {
         if self.prio {
             b.set_prio(1);
         }
-        self.pv(b, &t.cur);
+        if std::env::var("EXP_NOPV").is_err() {
+            self.pv(b, &t.cur);
+        }
         if t.staged {
             let s = self.s.clone();
             self.qk(b, &t.next, Some(&s));
