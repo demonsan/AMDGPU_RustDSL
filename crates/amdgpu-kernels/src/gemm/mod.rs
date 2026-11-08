@@ -422,6 +422,7 @@ fn declare_contract_conv(b: &mut FnBuilder, cta_m: i64, cta_n: i64, cc: ConvCfg,
     b.ka_is(48, n.clone());
     b.ka_is(80, m.clone());
     b.grid_is(0, Ext::sym("NT"));
+    b.grid_is(1, m.clone().ceil_div(cta_m));
     b.arg_tensor("ptr_a", Ext::ka(96) * Ext::ka(100) * Ext::ka(104) * Ext::ka(108) * cb.clone() * Ext::c(128));
     b.arg_tensor("ptr_b", n.clone() * kt.clone() * Ext::c(128));
     if split {
@@ -431,10 +432,7 @@ fn declare_contract_conv(b: &mut FnBuilder, cta_m: i64, cta_n: i64, cc: ConvCfg,
         b.ka_is(84, Ext::sym("S") * Ext::sym("KS"));
         b.ka_is(36, Ext::sym("S"));
         b.ka_is(88, Ext::sym("KS"));
-        // MT = ceil(M / cta) row tiles (a free symbol: the partial rows are bounded by MT cta, the padded M)
-        b.sym_range("MT", 1, (1 << 20) / cta_m);
-        b.grid_is(1, Ext::sym("MT"));
-        let mp = Ext::sym("MT") * Ext::c(cta_m);
+        let mp = m.clone().ceil_div(cta_m) * Ext::c(cta_m);
         b.ka_is(92, mp.clone());
         b.grid_is(2, Ext::sym("S"));
         b.arg_tensor("ptr_c", Ext::sym("S") * mp * n * Ext::c(4));
@@ -442,7 +440,6 @@ fn declare_contract_conv(b: &mut FnBuilder, cta_m: i64, cta_n: i64, cc: ConvCfg,
     } else {
         b.ka_is(36, Ext::c(1));
         b.ka_is(84, kt);
-        b.grid_is(1, m.clone().ceil_div(cta_m));
         b.arg_tensor("ptr_c", m * n * Ext::c(2));
     }
 }
@@ -1190,11 +1187,8 @@ pub fn by_name(name: &str) -> Option<Function> {
             Some(gemm_mxfp8_bs(n, GemmConfig::moe(elem, scales, st)))
         }
         n if n.starts_with("gemm_splitk_reduce_s") => {
-            // gemm_splitk_reduce_s<S>[_rc] | gemm_splitk_reduce_s<S>_n256
+            // gemm_splitk_reduce_s<S>[_rc]
             let rest = &n["gemm_splitk_reduce_s".len()..];
-            if let Some(s) = rest.strip_suffix("_n256") {
-                return s.parse::<i64>().ok().filter(|s| (1..=16).contains(s)).map(|s| reduce::gemm_splitk_reduce_x(n, s, false, true));
-            }
             let (s, rc) = match rest.strip_suffix("_rc") { Some(s) => (s, true), None => (rest, false) };
             s.parse::<i64>().ok().filter(|s| (1..=16).contains(s)).map(|s| reduce::gemm_splitk_reduce(n, s, rc))
         }

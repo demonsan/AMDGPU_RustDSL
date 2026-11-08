@@ -8,14 +8,7 @@ use amdgpu_tile::ev;
 
 /// `splits` partial slices (compile time), with (`rowcol`) or without the per-token x per-channel scales.
 pub fn gemm_splitk_reduce(name: &str, splits: i64, rowcol: bool) -> Function {
-    gemm_splitk_reduce_x(name, splits, rowcol, false)
-}
-
-/// `n256` (`_n256`): one 64-thread wave per 256 columns (N a multiple of 256: grid (N / 256, M)) and a padded partial row count MP >= M
-/// (the implicit-GEMM conv: M = NB OD OH OW, MP = M rounded up to the CTA).
-pub fn gemm_splitk_reduce_x(name: &str, splits: i64, rowcol: bool, n256: bool) -> Function {
-    let (threads, lg_cols) = if n256 { (64u32, 8) } else { (256u32, 10) };
-    let mut b = FnBuilder::new(name, threads);
+    let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
     for (n, o) in [("ptr_ws", 0u32), ("ptr_c", 8), ("ptr_sa", 16), ("ptr_sb", 24)] {
         b.arg(n, DType::Ptr, o, 8);
@@ -26,15 +19,14 @@ pub fn gemm_splitk_reduce_x(name: &str, splits: i64, rowcol: bool, n256: bool) -
     let (mm, nb) = (Ext::sym("M"), Ext::sym("NB"));
     b.sym_range("M", 1, 1 << 14);
     b.sym_range("NB", 1, 16);
-    let n_ext = nb.clone() * Ext::c(1 << lg_cols);
+    let n_ext = nb.clone() * Ext::c(1024);
     b.ka_is(32, mm.clone());
     b.ka_is(36, n_ext.clone());
     b.ka_is(40, Ext::c(splits));
-    let mp_ext = if n256 { b.sym_range("PAD", 0, 255); mm.clone() + Ext::sym("PAD") } else { mm.clone() };
-    b.ka_is(44, mp_ext.clone());
+    b.ka_is(44, mm.clone());
     b.grid_is(0, nb);
     b.grid_is(1, mm.clone());
-    b.arg_tensor("ptr_ws", Ext::c(4 * splits) * mp_ext * n_ext.clone());
+    b.arg_tensor("ptr_ws", Ext::c(4 * splits) * mm.clone() * n_ext.clone());
     b.arg_tensor("ptr_c", Ext::c(2) * mm.clone() * n_ext.clone());
     if rowcol {
         b.arg_tensor("ptr_sa", Ext::c(4) * mm.clone());
@@ -52,7 +44,7 @@ pub fn gemm_splitk_reduce_x(name: &str, splits: i64, rowcol: bool, n256: bool) -
     let r_ws = { let v = b.bind_i32(ev(mpn) * (4 * splits as i32)); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_ws, v) };
     let r_c = { let v = b.bind_i32(ev(mn) << 1); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_c, v) };
     // the lane's 4 columns: n = 1024 bx + 4 tid of row `row`
-    let col = b.bind_i32((ev(bx) << lg_cols) + (ev(tid) << 2));
+    let col = b.bind_i32((ev(bx) << 10) + (ev(tid) << 2));
     let e0 = b.bind_i32(ev(row) * ev(n_v) + ev(col));
     let v_ws = b.bind_i32(ev(e0) << 2);
     let mn4 = { let v = b.bind_i32(ev(mpn) << 2); b.read_first_lane(v) };
