@@ -63,8 +63,7 @@ fn rmsnorm_mxfp4(name: &str, k: i64) -> Function {
     let eps = b.let_(Op::KernargF32 { offset: 36 });
     let rb = b.let_(Op::WorkgroupIdX);
     let lane = Lane::new(&mut b);
-    let l = lane.lane();
-    let lane_v = b.bind_i32(ev(l));
+    let lane_v = b.bind_i32(lane.lane());
     let r = b.bind_i32(ev(lane_v) & 15);
     let g = b.bind_i32(ev(lane_v).lshr(4));
     let wave = b.bind_i32(lane.wave());
