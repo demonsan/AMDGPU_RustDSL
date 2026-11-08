@@ -72,6 +72,7 @@ fn every_registered_kernel_survives_a_node_splice() {
 #[test]
 fn facts_classify_and_order() {
     let (mut b, out, tid) = base();
+    b.lds_ring("T", 0, 1024, 2);
     let vars = b.begin_loop(&[(DType::I32, Opnd::I32(0))]);
     let (c, _) = b.capture(|b| {
         let a = b.c_i32(8); //                                           0 pure (salu)
