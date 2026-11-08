@@ -8,11 +8,6 @@ use amdgpu_tile::{ev, LdsPlan, Lane};
 
 const D: i32 = 128;
 const ROW: i32 = 2 * D;
-/// keys per tile (32: a 16 KB private K / V region per wave, two CTAs of 4 waves per CU)
-const KT: i32 = 32;
-const LKT: i32 = KT.trailing_zeros() as i32;
-/// 16-key blocks per tile
-const NKB: usize = (KT / 16) as usize;
 
 /// max / sum over the 4 lane groups (lanes l, l ^ 16, l ^ 32, l ^ 48)
 fn group4(b: &mut FnBuilder, x: ValueId, max: bool) -> ValueId {
@@ -26,7 +21,16 @@ fn group4(b: &mut FnBuilder, x: ValueId, max: bool) -> ValueId {
     f(b, a, c)
 }
 
-pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b = FnBuilder::new(name, 256);
+/// `kt` keys per tile and wave: 32 (a 16 KB private K / V region: two CTAs of 4 waves per CU; large batches) or 64 (32 KB, one CTA per CU;
+/// small grids: more keys per wave). `crate::dispatch::decode16_config` picks it with the split count.
+pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
+    assert!(kt == 32 || kt == 64, "decode16: 32- or 64-key tiles");
+    #[allow(non_snake_case)]
+    let KT = kt;
+    #[allow(non_snake_case)]
+    let LKT = kt.trailing_zeros() as i32;
+    #[allow(non_snake_case)]
+    let NKB = (kt / 16) as usize;    let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
     for (n, i) in [("ptr_po", 0u32), ("ptr_q", 1), ("ptr_k", 2), ("ptr_v", 3), ("ptr_bt", 4), ("ptr_cl", 5), ("ptr_plse", 12)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
@@ -166,10 +170,8 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
             (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
         })
         .collect();
-    let nodma = std::env::var("EXP_NODMA").is_ok();
     me.write(&mut b, Opnd::Var(it), |b| {
         for (i, &(kc, pv)) in lookups.iter().enumerate() {
-            if nodma && i > 0 { break; }
             let i = i as i32;
             let pg = b.bitcast_i32(pv);
             let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
@@ -250,8 +252,7 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
     b.set_var(l_v, l_new);
     // ---- O^T += V^T P^T: 2 steps of 32 keys x 8 blocks of 16 d ----
     let vb = b.bind_i32(mbase.clone() + KT * ROW + ev(vr));
-    let nopv = std::env::var("EXP_NOPV").is_ok();
-    if !nopv { me.read_back(&mut b, Opnd::Var(it), |b| {
+    me.read_back(&mut b, Opnd::Var(it), |b| {
         for t in 0..NKB / 2 {
             let w: Vec<ValueId> = [(2 * t, 0usize), (2 * t, 2), (2 * t + 1, 0), (2 * t + 1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
             let pf = b.pack4(w[0], w[1], w[2], w[3]);
@@ -262,7 +263,7 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
                 b.var_mfma(ov[db as usize], kind, vf, pf, false);
             }
         }
-    }); }
+    });
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
     let done = b.bind_cond(ev(it1).ge(ev(ntile)));
