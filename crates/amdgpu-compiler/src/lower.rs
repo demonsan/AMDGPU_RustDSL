@@ -2355,16 +2355,17 @@ impl Lowerer {
                     n => return Err(format!("frag_cat of {n} dwords")),
                 };
                 let d = self.new_vreg(cls);
+                // per dword through `sub_alias` (aliases of aliases keep their offsets; `copy_reg` into an alias tuple would not)
                 for (r, off, w) in regs {
-                    let c = match w {
-                        1 => RClass::V1,
-                        2 => RClass::V2,
-                        4 => RClass::V4,
-                        8 => RClass::V8,
-                        _ => RClass::V16,
-                    };
-                    let part = self.alias_vreg(d, off, c);
-                    self.copy_reg(part, r)?;
+                    for j in 0..w {
+                        let s = if w == 1 { r } else { self.sub_alias(r, j, RClass::V1) };
+                        let dd = self.sub_alias(d, off + j, RClass::V1);
+                        if self.mir.vreg_class(s) == RClass::S1 {
+                            self.push(MInst::new(MOp::VMovFromS).def(dd).srcreg(s));
+                        } else {
+                            self.push(MInst::new(MOp::VMovB32).def(dd).srcreg(s));
+                        }
+                    }
                 }
                 self.val.insert(dst, d);
             }
