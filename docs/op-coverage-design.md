@@ -560,9 +560,9 @@
 - decode：每 wave 更大的块、私有环双缓冲、页表查找提到循环外、一 tile 多页时按页 DMA；
 - MLA：S 归约改为 DPP / permlane，或换成按 head 切分。
 
-### 7.6 批次 4（fused MoE）状态：bf16 / fp8 per-token 完成，blockscale 进行中
+### 7.6 批次 4（fused MoE）状态：bf16、fp8 per-token、fp8 blockscale 均已覆盖
 
-**实现**：`gemm_moe1_<bf16|fp8>_<silu|gelu>[_dw]`、`gemm_moe2_<bf16|fp8>`、`moe_sum_bf16_k<K>`，都在 [`gemm/mod.rs`](../crates/amdgpu-kernels/src/gemm/mod.rs) 的 `MoeStage` 下。它们复用 v4 GEMM 结构，消费 aiter `moe_sorting` 的输出：
+**实现**：`gemm_moe1_<bf16|fp8|fp8bs>_<silu|gelu>[_dw]`、`gemm_moe2_<bf16|fp8|fp8bs>`、`moe_sum_bf16_k<K>`，都在 [`gemm/mod.rs`](../crates/amdgpu-kernels/src/gemm/mod.rs) 的 `MoeStage` 下。它们复用 v4 GEMM 结构，消费 aiter `moe_sorting` 的输出：
 - `sorted_token_ids` 编码为 `(slot << 24) | token`，padding 为 `(topk << 24) | M`；
 - `sorted_expert_ids` 按 M tile 给出；
 - `num_valid_ids` 之后的 tile 直接退出。
@@ -583,9 +583,22 @@
 | M4096 D7168 I512 E32 topk8 | 345.7 µs | 395.4 µs | 1.14 |
 | M256 D7168 I2048 E64 topk8 | 423.3 µs | 391.8 µs | 0.93 |
 
+blockscale 128×128（`fp8bs`）的规则：
+- A 的 scale 行随 gather 取；
+- B 的 scale 按 expert 取块；
+- stage 1 的 gate 与 up 各有一个 scale 字，按 n 块交替使用。
+
+对照的是 aiter `…blockscale_g1u1_128x128_pf2`。它多做一步：输出时量化成 fp8。所以下表只比时间。
+
+| 形状（fp8 blockscale，silu） | ours stage 1 | aiter | 比 |
+|---|--:|--:|--:|
+| M1024 D4096 I1024 E8 topk2 | 60.6 µs | 52.5 µs | 0.87 |
+| M4096 D7168 I512 E32 topk8 | 516.3 µs | 447.4 µs | 0.87 |
+| M256 D7168 I2048 E64 topk8 | 527.9 µs | 418.4 µs | 0.79 |
+
 **待办**：
 - **stage 2**：现在走 fp32 中间结果再求和，例如 4096×7168×topk8 要写 940 MB，所以只有 362 TF/s。改为 bf16 原子累加或在 CTA 内按 token 归并。aiter 没有 ASM stage 2（它用 CK），需要另找对照。
-- **fp8 blockscale 变体**：进行中。
+- **blockscale stage 1**：0.8–0.87×。需要与批次 1 的 blockscale 中等 M 问题一起处理，方向是块乘积延后一个 tile。
 - **小 block_m（32 / 64）**：稀疏专家时需要。
 - **stage 1 → stage 2 的 per-token 量化**：现在由 host 完成，需要换成 kernel。
 
