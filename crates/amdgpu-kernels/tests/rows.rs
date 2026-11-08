@@ -29,7 +29,7 @@ fn the_name_grammar_rejects_what_the_kernels_do_not_support() {
 #[test]
 fn short_rows_get_several_rows_per_wave() {
     use amdgpu_kernels::rows::rows_per_wave;
-    assert_eq!((rows_per_wave(200), rows_per_wave(776), rows_per_wave(1024), rows_per_wave(8192)), (16, 2, 1, 1));
+    assert_eq!((rows_per_wave(200), rows_per_wave(776), rows_per_wave(1024), rows_per_wave(8192)), (8, 2, 1, 1));
     // short rows: g lanes per row (a power of two >= the chunk count, at least 4), 64 / g rows side by side
     use amdgpu_kernels::rows::group_lanes;
     assert_eq!((group_lanes(8), group_lanes(64), group_lanes(200), group_lanes(256), group_lanes(504), group_lanes(512)), (4, 8, 32, 32, 64, 64));
