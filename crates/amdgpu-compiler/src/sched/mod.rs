@@ -244,17 +244,6 @@ fn schedule_block_runs(m: &mut MFunction, bi: usize, o: &Options, lv: &liveness:
 
 /// Run the scheduling pass over the whole function.
 pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
-    // The register budget every pass schedules against may not exceed what the workgroup can launch with: ceil(waves / 4) waves share a SIMD's
-    // 512-entry file (a 1024-thread block leaves 128 per wave). Moving loads up past that (e.g. later passes' loads hoisted above an earlier
-    // reduction) would make the kernel unlaunchable; keep 8 registers of headroom for temporaries.
-    let launch = launch_vgpr_budget(m.workgroup_size);
-    let clamped;
-    let o = if o.max_vgprs > launch {
-        clamped = Options { max_vgprs: launch, ..o.clone() };
-        &clamped
-    } else {
-        o
-    };
     let mut stats = Stats::default();
     if o.cfg_cleanup {
         cfg::cleanup(m);

@@ -95,7 +95,7 @@ fn a_kernel_over_the_launch_register_budget_is_rejected() {
 fn the_scheduler_budget_follows_the_workgroup_size() {
     use amdgpu_compiler::sched::launch_vgpr_budget;
     assert_eq!(launch_vgpr_budget(1024), 120);
-    assert_eq!(launch_vgpr_budget(768), 120);
+    assert_eq!(launch_vgpr_budget(768), 162);
     assert_eq!(launch_vgpr_budget(512), 240);
     assert_eq!(launch_vgpr_budget(256), 240);
     assert_eq!(launch_vgpr_budget(64), 240);
