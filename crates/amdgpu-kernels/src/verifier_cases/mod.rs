@@ -94,6 +94,7 @@ pub fn gv_attack_clamp_path() -> Function {
     let clamped = b.min_i32(off, c127);
     let c32 = b.c_i32(32);
     let pick = b.cmp_lt_i32(tid, c32);
+    let pick = b.any_lane(pick); // a wave-level branch on a per-lane condition
     b.begin_if(Opnd::Val(pick));
     let p1 = b.ptr_add(q, clamped);
     let v1 = b.load_f32(p1, 0);

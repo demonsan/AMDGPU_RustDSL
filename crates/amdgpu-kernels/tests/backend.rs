@@ -161,6 +161,7 @@ fn loads_are_drained_on_every_path_of_a_branch() {
     let c32 = b.c_i32(32);
     let loaded = b.load_f32(o, 64);
     let cond = b.cmp_lt_i32(tid, c32);
+    let cond = b.any_lane(cond); // a wave-level branch on a per-lane condition
     b.begin_if(Opnd::Val(cond));
     b.store_f32(o, 0, loaded);
     b.else_();
@@ -199,6 +200,7 @@ fn untouched_loads_are_not_over_drained_across_a_branch() {
     let c2 = b.c_f32(2.0);
     let loaded = b.load_f32(o, 64);
     let cond = b.cmp_lt_i32(tid, c32);
+    let cond = b.any_lane(cond); // a wave-level branch on a per-lane condition
     b.begin_if(Opnd::Val(cond));
     b.store_f32(o, 0, c1);
     b.else_();
@@ -230,6 +232,7 @@ fn constants_are_materialised_on_every_path() {
     let tid = b.let_(Op::WorkitemId);
     let c32 = b.c_i32(32);
     let cond = b.cmp_lt_i32(tid, c32);
+    let cond = b.any_lane(cond); // a wave-level branch on a per-lane condition
     b.begin_if(Opnd::Val(cond));
     let x = b.c_f32(3.0);
     b.store_f32(o, 0, x);
