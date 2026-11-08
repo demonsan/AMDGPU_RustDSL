@@ -105,7 +105,10 @@ pub fn lower(f: &Function) -> Result<MFunction, String> {
         lw.uniform = u;
         lw.uvars = v;
     }
-    lw.run(f)?;
+    let res = lw.run(f);
+    // diagnostics: which value each virtual register was lowered from (read by `diag::from_compile_error` for allocation failures)
+    LAST_ORIGINS.with(|o| *o.borrow_mut() = lw.val.iter().map(|(v, r)| (*r, *v)).collect());
+    res?;
     let mut m = lw.finish()?;
     if opt_on("kabatch") {
         batch_kernarg_loads(&mut m);
@@ -4954,4 +4957,13 @@ fn subst_stmt(s: &Stmt, map: &HashMap<ValueId, Opnd>) -> Stmt {
         Stmt::Let { dst, op: Op::Select { ty, cond, a, b } } => Stmt::Let { dst: *dst, op: Op::Select { ty: *ty, cond: sub(cond), a: sub(a), b: sub(b) } },
         other => other.clone(),
     }
+}
+
+thread_local! {
+    static LAST_ORIGINS: std::cell::RefCell<Vec<(VReg, ValueId)>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// (virtual register, value) pairs of the most recent `lower` on this thread (diagnostics).
+pub fn last_vreg_origins() -> Vec<(VReg, ValueId)> {
+    LAST_ORIGINS.with(|o| o.borrow().clone())
 }

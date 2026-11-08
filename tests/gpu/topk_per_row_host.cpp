@@ -1,6 +1,7 @@
 // per-row top-K of f32 logits (batch 2): topk_per_row_{decode,prefill}_f32_k<K>: the selected columns must be distinct, inside the row, and carry exactly the K largest values (a multiset check: ties may pick any
 // of the equal elements); rows shorter than K are returned whole in column order followed by -1.
-// usage: topk_per_row_host <co> <kernel> <decode|prefill> <B or R> <next_n (decode; 1 for prefill)> <width = stride> <len (decode: the longest seq len; prefill: the longest row)> <K> [iters] [ties 0|1]
+// usage: topk_per_row_host <co> <kernel> <decode|prefill|plain>   (plain: every row has `len` valid columns)
+// usage (args): <decode|prefill|plain> <B or R> <next_n (decode; 1 for prefill)> <width = stride> <len (decode: the longest seq len; prefill: the longest row)> <K> [iters] [ties 0|1]
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -15,12 +16,13 @@
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s failed: %s\n", #x, hipGetErrorString(e_)); std::exit(1); } } while (0)
 int main(int argc, char** argv) {
     if (argc < 9) { std::fprintf(stderr, "usage: %s <co> <kernel> <decode|prefill> <B|R> <next_n> <width> <len> <K> [iters] [ties]\n", argv[0]); return 2; }
-    const char* co = argv[1]; const char* kn = argv[2]; bool prefill = std::string(argv[3]) == "prefill"; long B = std::atol(argv[4]), NN = std::atol(argv[5]), W = std::atol(argv[6]), LEN = std::atol(argv[7]), K = std::atol(argv[8]); int iters = argc > 9 ? std::atoi(argv[9]) : 10; bool ties = argc > 10 && std::atoi(argv[10]);
+    const char* co = argv[1]; const char* kn = argv[2]; const std::string mode = argv[3]; bool plain = mode == "plain"; bool prefill = mode == "prefill" || plain; long B = std::atol(argv[4]), NN = std::atol(argv[5]), W = std::atol(argv[6]), LEN = std::atol(argv[7]), K = std::atol(argv[8]); int iters = argc > 9 ? std::atoi(argv[9]) : 10; bool ties = argc > 10 && std::atoi(argv[10]);
     const long R = prefill ? B : B * NN;
     std::mt19937 rng(17); std::normal_distribution<float> nd(0.f, 3.f);
     std::vector<float> hl((size_t)R * W); for (auto& v : hl) v = nd(rng);
     std::vector<int32_t> starts(R, 0), ends(R, 0), seq(prefill ? 0 : B), rs(R), re(R);
     if (!prefill) { const long lens[4] = {LEN, std::max(NN, LEN / 8), std::max(NN, LEN / 64), std::max(NN, LEN / 2)}; for (long b = 0; b < B; ++b) seq[b] = (int32_t)std::min<long>(W + NN - 1, lens[b % 4] + (b % 7 == 3 ? 5 : 0)); for (long r = 0; r < R; ++r) { rs[r] = 0; re[r] = seq[r / NN] - (int32_t)NN + (int32_t)(r % NN) + 1; } }
+    else if (plain) { for (long r = 0; r < R; ++r) { rs[r] = 0; re[r] = (int32_t)std::min<long>(LEN, W); } }
     else { for (long r = 0; r < R; ++r) { long len = (r % 5 == 1) ? std::max<long>(1, K / 3) : (r % 5 == 3 ? K : (LEN - (r % 11) * 7)); len = std::min<long>(len, W); long st = (r % 3 == 0) ? 0 : (r * 13) % std::max<long>(1, W - len + 1); rs[r] = (int32_t)st; re[r] = (int32_t)(st + len); } }
     if (ties) for (auto& v : hl) v = std::round(v * 2.f) / 2.f;      // many equal values
     void *dl, *ds, *de, *dsq, *dout; CK(hipMalloc(&dl, hl.size() * 4)); CK(hipMalloc(&dout, (size_t)R * K * 4 + 64)); CK(hipMemset(dout, 0x55, (size_t)R * K * 4 + 64)); CK(hipMemcpy(dl, hl.data(), hl.size() * 4, hipMemcpyHostToDevice));
@@ -28,7 +30,9 @@ int main(int argc, char** argv) {
     hipModule_t mod; hipFunction_t fn; CK(hipModuleLoad(&mod, co)); CK(hipModuleGetFunction(&fn, mod, kn));
     char args[64]; size_t sz = 0; auto put = [&](const void* p, size_t k) { std::memcpy(args + sz, p, k); sz += k; };
     int32_t w32 = (int32_t)W, nn32 = (int32_t)NN, r32 = (int32_t)R;
-    if (prefill) { put(&dl, 8); put(&ds, 8); put(&de, 8); put(&dout, 8); put(&w32, 4); put(&r32, 4); } else { put(&dl, 8); put(&dsq, 8); put(&dout, 8); put(&w32, 4); put(&nn32, 4); put(&r32, 4); }
+    int32_t len32 = (int32_t)std::min<long>(LEN, W);
+    if (plain) { put(&dl, 8); put(&dout, 8); put(&len32, 4); put(&w32, 4); put(&r32, 4); }
+    else if (prefill) { put(&dl, 8); put(&ds, 8); put(&de, 8); put(&dout, 8); put(&w32, 4); put(&r32, 4); } else { put(&dl, 8); put(&dsq, 8); put(&dout, 8); put(&w32, 4); put(&nn32, 4); put(&r32, 4); }
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     auto launch = [&]() { CK(hipModuleLaunchKernel(fn, (unsigned)(prefill ? R : B), (unsigned)(prefill ? 1 : NN), 1, 1024, 1, 1, 0, nullptr, nullptr, cfg)); };
     launch(); CK(hipDeviceSynchronize());

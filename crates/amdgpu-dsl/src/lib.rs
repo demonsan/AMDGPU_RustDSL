@@ -1492,6 +1492,9 @@ pub struct Function {
     pub value_tys: Vec<DType>,
     /// AGPR placement requests (empty for every existing kernel).
     pub agpr: Vec<AgprMark>,
+    /// Where each value was created: the Rust source location of the builder call (`#[track_caller]`), indexed by `ValueId`. A side table
+    /// for diagnostics only - not part of the IR (no equality, codec or printing; `Debug` prints nothing).
+    pub src_locs: SrcLocs,
     /// Explicit compile policy (lowering options + scheduler preset). `None` = the compiler derives it from the kernel name (the historical behaviour,
     /// which every existing kernel keeps); kernels written on the tile library set it so their policy does not depend on their name.
     pub compile_profile: Option<CompileProfile>,
@@ -1504,6 +1507,54 @@ pub struct Function {
     /// Scheduler strategies of weave regions, keyed by region NAME (the labels of `weave_region_begin` / the Weaver / stage names): `declare_region(name, authored, tokens)`. A region without a
     /// declaration inherits its enclosing region's strategy (the kernel default at the top). Empty for every kernel that does not ask for per-region strategies (nothing changes then).
     pub regions: Vec<RegionDecl>,
+}
+
+/// Builder call sites of the values of a function (see `Function::src_locs`).
+#[derive(Clone, Default)]
+pub struct SrcLocs(pub Vec<Option<&'static std::panic::Location<'static>>>);
+
+impl std::fmt::Debug for SrcLocs {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
+
+impl Function {
+    /// `file:line:col` of the builder call that created value `v`.
+    pub fn value_loc(&self, v: ValueId) -> Option<String> {
+        self.src_locs.0.get(v as usize).copied().flatten().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+    }
+    /// The source location of statement `idx` of `stmts()`: its own value's creation site for a `Let` (exact), else the nearest preceding
+    /// `Let`'s (approximate). Returns (location, exact).
+    pub fn stmt_loc(&self, idx: usize) -> Option<(String, bool)> {
+        let st = self.stmts();
+        if let Some(Stmt::Let { dst, .. }) = st.get(idx) {
+            if let Some(l) = self.value_loc(*dst) {
+                return Some((l, true));
+            }
+        }
+        (0..idx.min(st.len())).rev().find_map(|k| match &st[k] {
+            Stmt::Let { dst, .. } => self.value_loc(*dst).map(|l| (l, false)),
+            _ => None,
+        })
+    }
+    /// The innermost weave region (`RegionMark`) enclosing statement `idx`.
+    pub fn region_of(&self, idx: usize) -> Option<String> {
+        let mut stack: Vec<String> = Vec::new();
+        for (k, s) in self.stmts().iter().enumerate() {
+            if k >= idx {
+                break;
+            }
+            if let Stmt::RegionMark { name, begin } = s {
+                if *begin {
+                    stack.push(name.clone());
+                } else {
+                    stack.pop();
+                }
+            }
+        }
+        stack.pop()
+    }
 }
 
 /// A weave region's scheduler strategy (declared on the function by region name; see `Function::regions`).
@@ -1563,7 +1614,7 @@ impl Function {
         reg_plan: Vec<RegMark>,
         regions: Vec<RegionDecl>,
     ) -> Function {
-        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, compile_profile, lower_opts, sched_opts, reg_plan, regions };
+        let mut f = Function { name, args, kernarg_size, workgroup_size, lds_bytes, contract, body: Vec::new(), flat: Vec::new(), var_tys, value_tys, agpr, src_locs: SrcLocs::default(), compile_profile, lower_opts, sched_opts, reg_plan, regions };
         f.set_body(body);
         f
     }
@@ -1625,6 +1676,7 @@ pub struct FnBuilder {
 pub struct CaptureId(usize);
 
 impl FnBuilder {
+    #[track_caller]
     pub fn new(name: &str, workgroup_size: u32) -> Self {
         FnBuilder {
             f: Function {
@@ -1639,6 +1691,7 @@ impl FnBuilder {
                 var_tys: Vec::new(),
                 value_tys: Vec::new(),
             agpr: Vec::new(),
+                src_locs: SrcLocs::default(),
                 compile_profile: None,
             lower_opts: Vec::new(),
             sched_opts: None,
@@ -1653,11 +1706,13 @@ impl FnBuilder {
     }
 
     /// Sets the explicit compile policy (see [`CompileProfile`]); without it the compiler keeps deriving the policy from the kernel name.
+    #[track_caller]
     pub fn compile_profile(&mut self, p: CompileProfile) {
         self.f.compile_profile = Some(p);
     }
 
     /// Extra lowering option tokens for this kernel (see Function::lower_opts).
+    #[track_caller]
     pub fn lower_opts(&mut self, opts: &[&str]) {
         self.f.lower_opts.extend(opts.iter().map(|s| s.to_string()));
     }
@@ -1665,116 +1720,142 @@ impl FnBuilder {
     /// Declares the scheduler strategy of the weave region named `name` (the label of `weave_region_begin` / `Weaver::phase`; a stage name works too): `authored` = the emitted order is
     /// authoritative (no list scheduling / slotfill / ldshoist inside; waits are recomputed and the order-preserving post-passes still apply), `tokens` = scheduler option tokens (the
     /// `AMDC_SCHED_OPTS` vocabulary) applied to the region's instructions only. Undeclared regions inherit the strategy of the region they are nested in.
+    #[track_caller]
     pub fn declare_region(&mut self, name: &str, authored: bool, tokens: &str) {
         self.f.regions.retain(|r| r.name != name);
         self.f.regions.push(RegionDecl { name: name.to_string(), authored, tokens: tokens.to_string() });
     }
 
     /// Scheduler option tokens for this kernel (see Function::sched_opts).
+    #[track_caller]
     pub fn sched_opts(&mut self, opts: &str) {
         self.f.sched_opts = Some(opts.to_string());
     }
 
     /// Declares how many bytes of workgroup LDS the kernel uses.
+    #[track_caller]
     pub fn lds(&mut self, bytes: u32) {
         self.f.lds_bytes = bytes;
     }
 
     /// GPU-semantics contract: the pointer kernarg `name` points to an allocation of `alloc_bytes` bytes (an expression over kernarg scalars and the grid).
+    #[track_caller]
     pub fn arg_tensor(&mut self, name: &str, alloc_bytes: Ext) {
         self.f.contract.extents.push(ArgExtent { arg: name.to_string(), alloc: alloc_bytes, logical: None });
     }
     /// Like `arg_tensor` with a zeroed slack at the end: reads may use `alloc_bytes`, writes must stay within `logical_bytes`.
+    #[track_caller]
     pub fn arg_tensor_slack(&mut self, name: &str, logical_bytes: Ext, alloc_bytes: Ext) {
         self.f.contract.extents.push(ArgExtent { arg: name.to_string(), alloc: alloc_bytes, logical: Some(logical_bytes) });
     }
     /// Host contract: the 32-bit kernarg scalar at `offset` lies in [lo, hi] (use `i64::MAX` for no upper bound).
+    #[track_caller]
     pub fn ka_range(&mut self, offset: u32, lo: i64, hi: i64) {
         self.f.contract.ka_ranges.push((offset, lo, hi));
     }
     /// Host contract: launch grid axis (0 = x, 1 = y, 2 = z) equals `expr`, e.g. `b.grid_is(2, Ext::sym("B") * Ext::ka(0x280))` for B batches x splits.
+    #[track_caller]
     pub fn grid_is(&mut self, axis: u8, expr: Ext) {
         self.f.contract.grid_defs.push((axis, expr));
     }
     /// Host contract: the u32 kernarg scalar at `offset` is one of `values` (e.g. the number of KV splits in {2, 4, 8}); the min/max become its range.
+    #[track_caller]
     pub fn ka_one_of(&mut self, offset: u32, values: &[i64]) {
         self.f.contract.ka_sets.push((offset, values.to_vec()));
     }
     /// Host contract: the u32 kernarg scalar at `offset` equals `expr` (e.g. strides derived from the shape: `b.ka_is(0x70, Ext::grid_y() * Ext::ka(0x90))`).
+    #[track_caller]
     pub fn ka_is(&mut self, offset: u32, expr: Ext) {
         self.f.contract.ka_defs.push((offset, expr));
     }
     /// Bounds of a free `Ext::sym` (default [1, +inf)).
+    #[track_caller]
     pub fn sym_range(&mut self, name: &str, lo: i64, hi: i64) {
         self.f.contract.sym_ranges.push((name.to_string(), lo, hi));
     }
     /// Declares an LDS tile `[base, base+size)` (one slot). Tiles must not overlap each other unless aliased with `lds_alias`.
+    #[track_caller]
     pub fn lds_tile(&mut self, name: &str, base: i64, size: i64) {
         self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size, slots: 1, private: false, global: false });
     }
     /// Declares a ring of `slots` equal slots starting at `base`.
+    #[track_caller]
     pub fn lds_ring(&mut self, name: &str, base: i64, slot_size: i64, slots: u32) {
         self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size, slots, private: false, global: false });
     }
     /// Declares a per-WAVE private LDS region: `waves` slices of `size_per_wave` bytes at `base + wave * size_per_wave`. Mark accesses with `tile_produce/tile_consume(name,
     /// wave_key, version)` where `wave_key` is THE value the address is computed from (e.g. `base + wave_key * size + lane * 16`): the verifier proves the access lies in the
     /// slice of that very key (own wave) and that the wave reads only versions it produced and completed itself (no cross-wave publish is needed or assumed).
+    #[track_caller]
     pub fn lds_private(&mut self, name: &str, base: i64, size_per_wave: i64, waves: u32) {
         self.f.contract.tiles.push(TileDecl { name: name.to_string(), base, slot_size: size_per_wave, slots: waves, private: true, global: false });
     }
     /// The two tiles are allowed to overlap (time-multiplexed storage): the lifetime check then requires their events to be ordered like versions of one tile.
+    #[track_caller]
     pub fn lds_alias(&mut self, a: &str, b: &str) {
         self.f.contract.tile_aliases.push((a.to_string(), b.to_string()));
     }
     /// Trust entry for the tile simulator: the slot / version expressions are NOT plain affine counters (xor/add/and/mul by constants) but the protocol is periodic in
     /// the loop iteration by construction, so the simulated iterations (>= 10 and >= 2 x ring slots + 4) cover every launch. Listed as TRUSTED in the report.
+    #[track_caller]
     pub fn tile_trust_periodic(&mut self, reason: &str) {
         self.f.contract.tile_trust = Some(reason.to_string());
     }
     /// Declares a GLOBAL-memory region: bytes `[base, base + size)` of the pointer kernarg `arg`. Mark the writes with `buf_produce(name, gen)` and the reads with
     /// `buf_consume(name, gen)`: the verifier then checks the four protocol obligations (complete before publish: `wait_vm(0)` / `fence_release`; publish before read:
     /// release -> barrier -> acquire inside the workgroup; read before overwrite; generation consistency). `gen` follows the same affine/periodic rules as tile versions.
+    #[track_caller]
     pub fn buf_region(&mut self, name: &str, arg: &str, base: Ext, size: Ext) {
         self.f.contract.tiles.push(TileDecl { name: name.to_string(), base: 0, slot_size: 1, slots: 1, private: false, global: true });
         self.f.contract.buf_regions.push(BufRegion { name: name.to_string(), arg: arg.to_string(), base, size });
     }
     /// The global writes issued from here (until `tile_end` / the next marker / barrier / control boundary) produce generation `gen` of the region.
+    #[track_caller]
     pub fn buf_produce(&mut self, name: &str, generation: impl Into<Opnd>) {
         self.push_stmt(Stmt::TileProduce { tile: name.to_string(), slot: Opnd::I32(0), version: generation.into() });
     }
     /// The global reads issued from here expect generation `gen` of the region.
+    #[track_caller]
     pub fn buf_consume(&mut self, name: &str, generation: impl Into<Opnd>) {
         self.push_stmt(Stmt::TileConsume { tile: name.to_string(), slot: Opnd::I32(0), version: generation.into() });
     }
     /// Declares the fused-combine (last-arriver) pattern over `region`: the stores marked `buf_produce` (generation = the block's split id, derived from the workgroup id)
     /// must be followed by `fence_release`, then an atomic ticket on the pointer kernarg `counter_arg`; the reads marked `buf_consume` must sit in the branch guarded by the
     /// ticket result, after `fence_acquire` (or with `sc1` loads for the lite variant), and cover more than one slice.
+    #[track_caller]
     pub fn buf_last_arriver(&mut self, region: &str, counter_arg: &str, splits: Ext) {
         self.f.contract.last_arrivers.push(LastArriver { region: region.to_string(), counter_arg: counter_arg.to_string(), splits });
     }
     /// Counted trust escape for one region: the verifier does not check it (e.g. a visibility argument it cannot make); listed in the certificate.
+    #[track_caller]
     pub fn buf_trust(&mut self, region: &str, reason: &str) {
         self.f.contract.buf_trusts.push((region.to_string(), reason.to_string()));
     }
     /// See `Stmt::TileProduce`.
+    #[track_caller]
     pub fn tile_produce(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>) {
         self.push_stmt(Stmt::TileProduce { tile: tile.to_string(), slot: slot.into(), version: version.into() });
     }
     /// See `Stmt::TileConsume`.
+    #[track_caller]
     pub fn tile_consume(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>) {
         self.push_stmt(Stmt::TileConsume { tile: tile.to_string(), slot: slot.into(), version: version.into() });
     }
+    #[track_caller]
     pub fn tile_end(&mut self) {
         self.push_stmt(Stmt::TileEnd);
     }
     /// Opens a pipeline stage with its boundary contract (see `Stmt::StageBegin`).
+    #[track_caller]
     pub fn stage_begin(&mut self, name: &str, contract: StageContract) {
         self.push_stmt(Stmt::StageBegin { name: name.to_string(), contract: Box::new(contract) });
     }
+    #[track_caller]
     pub fn stage_end(&mut self) {
         self.push_stmt(Stmt::StageEnd);
     }
     /// Adds a hand-over set to the innermost open stage's contract (its values are usually computed inside the stage).
+    #[track_caller]
     pub fn stage_live_out(&mut self, v: StageVal) {
         match self.tree.open.iter_mut().rev().find(|f| matches!(f, Frame::Stage { .. })) {
             Some(Frame::Stage { contract, .. }) => contract.live_out.push(v),
@@ -1782,6 +1863,7 @@ impl FnBuilder {
         }
     }
     /// Adds a scalar hand-over to the innermost open stage's contract (see `StageContract::scalars_out`).
+    #[track_caller]
     pub fn stage_scalar_out(&mut self, s: StageScalar) {
         match self.tree.open.iter_mut().rev().find(|f| matches!(f, Frame::Stage { .. })) {
             Some(Frame::Stage { contract, .. }) => contract.scalars_out.push(s),
@@ -1789,6 +1871,7 @@ impl FnBuilder {
         }
     }
     /// Closure form of `stage_begin` / `stage_end`.
+    #[track_caller]
     pub fn stage<R>(&mut self, name: &str, contract: StageContract, f: impl FnOnce(&mut Self) -> R) -> R {
         self.stage_begin(name, contract);
         let r = f(self);
@@ -1796,25 +1879,30 @@ impl FnBuilder {
         r
     }
     /// Contract fact `lo <= target <= hi` from this point on (see `Stmt::Assume`). Emits no code.
+    #[track_caller]
     pub fn assume(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext) {
         self.push_stmt(Stmt::Assume { target: target.into(), lo, hi, trusted: None });
     }
     /// Like `assume`, but for a loop variable whose range holds by a guard the analyzer cannot see (e.g. a counter bounded by the loop exit test): the induction
     /// check failing is NOT an error, the assumption is listed as TRUSTED with `reason`.
+    #[track_caller]
     pub fn assume_trusted(&mut self, target: impl Into<Opnd>, lo: Ext, hi: Ext, reason: &str) {
         self.push_stmt(Stmt::Assume { target: target.into(), lo, hi, trusted: Some(reason.to_string()) });
     }
 
+    #[track_caller]
     pub fn arg(&mut self, name: &str, ty: DType, offset: u32, size: u32) {
         self.f.args.push(Arg { name: name.to_string(), ty, kernarg_offset: offset, size });
         self.f.kernarg_size = self.f.kernarg_size.max(offset + size);
     }
 
     /// Embed a safe-asm sequence. `inputs` bind to the block's input ports in order (types are checked against the port classes by `verify`).
+    #[track_caller]
     pub fn asm(&mut self, block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) -> ValueId {
         self.let_(Op::Asm { block: std::sync::Arc::new(block), inputs: inputs.to_vec() })
     }
 
+    #[track_caller]
     pub fn let_(&mut self, op: Op) -> ValueId {
         let ty = op.result_ty();
         let dst = self.f.value_tys.len() as ValueId;
@@ -1833,86 +1921,113 @@ impl FnBuilder {
             self.views.insert(dst, vv);
         }
         self.f.value_tys.push(ty);
+        // diagnostics side table: where this value was built (the caller through the #[track_caller] builder chain)
+        let loc = std::panic::Location::caller();
+        let n = self.f.value_tys.len();
+        if self.f.src_locs.0.len() < n {
+            self.f.src_locs.0.resize(n, None);
+        }
+        self.f.src_locs.0[dst as usize] = Some(loc);
         self.push_stmt(Stmt::Let { dst, op });
         dst
     }
 
+    #[track_caller]
     pub fn store_u16(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::StoreU16 { base: base.into(), byte_off, value: value.into() });
     }
 
+    #[track_caller]
     pub fn store_f32(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::StoreF32 { base: base.into(), byte_off, value: value.into() });
     }
 
     // ---- MUBUF (buffer_load/buffer_store): SGPR resource descriptor + per-lane 32-bit byte offset + SGPR soffset + 12-bit immediate ----
     /// Resource descriptor over the kernarg pointer `base` (bounds checking off: num_records = 0xFFFFFFFF). The descriptor lives in 4 SGPRs.
+    #[track_caller]
     pub fn buffer_rsrc(&mut self, base: impl Into<Opnd>) -> ValueId {
         self.let_(Op::BufferRsrc { base: base.into(), num_records: 0xFFFF_FFFF })
     }
     /// Descriptor with an explicit `num_records` (byte range; out-of-range accesses read 0 / are dropped).
+    #[track_caller]
     pub fn buffer_rsrc_sized(&mut self, base: impl Into<Opnd>, num_records: u32) -> ValueId {
         self.let_(Op::BufferRsrc { base: base.into(), num_records })
     }
+    #[track_caller]
     pub fn buffer_load_f32(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32) -> ValueId {
         self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 1 })
     }
+    #[track_caller]
     pub fn buffer_load_b64(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32) -> ValueId {
         self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 2 })
     }
+    #[track_caller]
     pub fn buffer_load_b128(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32) -> ValueId {
         self.let_(Op::BufferLoad { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 4 })
     }
     /// `off` forms (no per-lane vaddr): every lane reads the same address (resource base + soff + imm).
     /// Two `buffer_load_dwordx4` (offsets `imm_lo` / `imm_hi`) into the two halves of one Frag8 (an MFMA operand), without the copy of `cat_frag8`.
+    #[track_caller]
     pub fn buffer_load_b128x2(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm_lo: u32, imm_hi: u32) -> ValueId {
         self.let_(Op::BufferLoadB128x2 { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm_lo, imm_hi })
     }
 
+    #[track_caller]
     pub fn buffer_store_f32(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 1, value: value.into() });
     }
+    #[track_caller]
     pub fn buffer_store_b64(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 2, value: value.into() });
     }
+    #[track_caller]
     pub fn buffer_store_b128(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::BufferStore { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), imm, dwords: 4, value: value.into() });
     }
     /// MUBUF -> LDS DMA of 16 bytes per lane (`buffer_load_dwordx4 ... lds`): LDS destination = M0 (`lds_addr`) + imm + 16 * lane.
+    #[track_caller]
     pub fn buffer_load_lds_b128(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, lds_addr: impl Into<Opnd>, imm: u32) {
         self.push_stmt(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords: 4 });
     }
     /// Descriptor with a RUNTIME byte range: `num_records` is a wave-uniform integer (kernarg value, scalar arithmetic or loop variable). Rebuild it where the
     /// value changes (the descriptor is an ordinary SGPR-quad value). Reads at offset >= num_records return 0, writes are dropped.
+    #[track_caller]
     pub fn buffer_desc_dyn(&mut self, ptr: impl Into<Opnd>, num_records_bytes: impl Into<Opnd>) -> ValueId {
         self.let_(Op::BufferRsrcDyn { base: ptr.into(), num_records: num_records_bytes.into() })
     }
     /// Alias names used by the kernels: descriptor over a kernarg pointer with `num_records` bytes (reads at offset >= num_records return 0, writes are dropped).
+    #[track_caller]
     pub fn buffer_desc(&mut self, ptr: impl Into<Opnd>, num_records_bytes: u32) -> ValueId {
         self.buffer_rsrc_sized(ptr, num_records_bytes)
     }
     /// `buffer_load_dword[x4] ... lds` with the LDS slot base `lds_addr` (M0) and `dwords` = 1 or 4.
+    #[track_caller]
     pub fn load_buffer_lds(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, lds_addr: impl Into<Opnd>, imm: u32, dwords: u8) {
         self.push_stmt(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords });
     }
     /// 4 bytes per lane (`buffer_load_dword ... lds`).
+    #[track_caller]
     pub fn buffer_load_lds_b32(&mut self, rsrc: ValueId, voff: impl Into<Opnd>, soff: impl Into<Opnd>, lds_addr: impl Into<Opnd>, imm: u32) {
         self.push_stmt(Stmt::BufferLoadLds { rsrc: Opnd::Val(rsrc), voff: Some(voff.into()), soff: soff.into(), lds_addr: lds_addr.into(), imm, dwords: 1 });
     }
 
+    #[track_caller]
     pub fn store_f32x2(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::StoreF32x2 { base: base.into(), byte_off, value: value.into() });
     }
 
+    #[track_caller]
     pub fn store_f32x4(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::StoreF32x4 { base: base.into(), byte_off, value: value.into() });
     }
 
+    #[track_caller]
     pub fn set_var(&mut self, var: VarId, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::SetVar { var, value: value.into() });
     }
 
     /// Declares `vars` initialised from `init`, then opens the loop body.
+    #[track_caller]
     pub fn begin_loop(&mut self, inits: &[(DType, Opnd)]) -> Vec<VarId> {
         let mut vars = Vec::with_capacity(inits.len());
         let mut init = Vec::with_capacity(inits.len());
@@ -1926,24 +2041,29 @@ impl FnBuilder {
         vars
     }
 
+    #[track_caller]
     pub fn break_if(&mut self, cond: impl Into<Opnd>) {
         self.push_stmt(Stmt::BreakIf { cond: cond.into() });
     }
 
+    #[track_caller]
     pub fn end_loop(&mut self) {
         self.expr_consts.clear();
         self.push_stmt(Stmt::EndLoop);
     }
 
+    #[track_caller]
     pub fn begin_if(&mut self, cond: impl Into<Opnd>) {
         self.push_stmt(Stmt::BeginIf { cond: cond.into() });
     }
 
+    #[track_caller]
     pub fn else_(&mut self) {
         self.expr_consts.clear();
         self.push_stmt(Stmt::Else);
     }
 
+    #[track_caller]
     pub fn end_if(&mut self) {
         self.expr_consts.clear();
         self.push_stmt(Stmt::EndIf);
@@ -1951,16 +2071,19 @@ impl FnBuilder {
 
     /// Keep the loop variable `var` in the AGPR file (any placement). MFMAs that accumulate into it use the `acc_cd` form; VALU access is
     /// done through `v_accvgpr_read/write` inserted by the compiler (docs/agpr.md).
+    #[track_caller]
     pub fn pin_agpr(&mut self, var: VarId) {
         self.f.agpr.push(AgprMark { target: AgprTarget::Var(var), pin: None });
     }
 
     /// As `pin_agpr`, at the exact AGPR index `base` (aligned to the register width).
+    #[track_caller]
     pub fn pin_agpr_at(&mut self, var: VarId, base: u32) {
         self.f.agpr.push(AgprMark { target: AgprTarget::Var(var), pin: Some(base) });
     }
 
     /// Mark the register tuple that holds `v` (an LDS/global load result, an MFMA result, a fragment) as AGPR-resident; returns `v`.
+    #[track_caller]
     pub fn agpr(&mut self, v: ValueId) -> ValueId {
         self.f.agpr.push(AgprMark { target: AgprTarget::Val(v), pin: None });
         v
@@ -1969,38 +2092,47 @@ impl FnBuilder {
     // ---- register planning (RegMark; docs/weaver-regs.md) ----
 
     /// HARD: keep `r` (its whole tuple) at arch VGPR `base`.
+    #[track_caller]
     pub fn pin_vgpr_at(&mut self, r: RegRef, base: u32) {
         self.f.reg_plan.push(RegMark::PinV { r, base });
     }
     /// HINT: let the members share registers when their lifetimes are disjoint.
+    #[track_caller]
     pub fn reg_share(&mut self, rs: &[RegRef]) {
         self.f.reg_plan.push(RegMark::Share(rs.to_vec()));
     }
     /// HARD: the members never share physical registers.
+    #[track_caller]
     pub fn reg_separate(&mut self, rs: &[RegRef]) {
         self.f.reg_plan.push(RegMark::Separate(rs.to_vec()));
     }
     /// HARD: arch-VGPR footprint cap of region `region` (a weave region or a stage name).
+    #[track_caller]
     pub fn reg_cap(&mut self, region: &str, vgprs: u32) {
         self.f.reg_plan.push(RegMark::Cap { region: region.to_string(), vgprs: Some(vgprs), agprs: None });
     }
     /// HARD: AGPR footprint cap of region `region`.
+    #[track_caller]
     pub fn reg_cap_agpr(&mut self, region: &str, agprs: u32) {
         self.f.reg_plan.push(RegMark::Cap { region: region.to_string(), vgprs: None, agprs: Some(agprs) });
     }
     /// The register buffers of one fragment (pairwise separate, placement reported).
+    #[track_caller]
     pub fn reg_ring(&mut self, name: &str, bufs: &[RegRef]) {
         self.f.reg_plan.push(RegMark::Ring { name: name.to_string(), bufs: bufs.to_vec() });
     }
     /// Opens a register-planning region (no code). Must be closed by `weave_region_end` in the same structural block.
+    #[track_caller]
     pub fn weave_region_begin(&mut self, name: &str) {
         self.push_stmt(Stmt::RegionMark { name: name.to_string(), begin: true });
     }
     /// Closes the innermost register-planning region.
+    #[track_caller]
     pub fn weave_region_end(&mut self) {
         self.push_stmt(Stmt::RegionMark { name: String::new(), begin: false });
     }
     /// `weave_region_begin(name)`, `f`, `weave_region_end()`.
+    #[track_caller]
     pub fn weave_region<R>(&mut self, name: &str, f: impl FnOnce(&mut Self) -> R) -> R {
         self.weave_region_begin(name);
         let r = f(self);
@@ -2008,6 +2140,7 @@ impl FnBuilder {
         r
     }
 
+    #[track_caller]
     pub fn finish(mut self) -> Function {
         assert!(self.captures.is_empty(), "kernel `{}`: {} capture(s) still open at finish()", self.f.name, self.captures.len());
         let tree = std::mem::take(&mut self.tree);
@@ -2017,74 +2150,94 @@ impl FnBuilder {
     }
 
     // ---- P1 VALU ops (docs/op-coverage-tileops.md) ----
+    #[track_caller]
     pub fn un(&mut self, op: UnOp, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Un(op, a.into()))
     }
+    #[track_caller]
     pub fn bin(&mut self, op: BinOp, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Bin(op, a.into(), b.into()))
     }
+    #[track_caller]
     pub fn tri(&mut self, op: TriOp, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Tri(op, a.into(), b.into(), c.into()))
     }
+    #[track_caller]
     pub fn cmp(&mut self, pred: CmpPred, ty: CmpTy, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Cmp { pred, ty, a: a.into(), b: b.into() })
     }
 
     // ---- P1 A3 memory ----
+    #[track_caller]
     pub fn load_global(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: MemTy) -> ValueId {
         self.load_global_c(base, byte_off, ty, CachePolicy::NONE)
     }
     /// `load_global` with a cache policy (`sc0` / `sc1` / `nt`).
+    #[track_caller]
     pub fn load_global_c(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: MemTy, cache: CachePolicy) -> ValueId {
         self.let_(Op::LoadGlobalN { base: base.into(), byte_off, ty, cache })
     }
+    #[track_caller]
     pub fn load_global_d16(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: D16Ty, hi: bool) -> ValueId {
         self.let_(Op::LoadGlobalD16 { base: base.into(), byte_off, ty, hi, cache: CachePolicy::NONE })
     }
+    #[track_caller]
     pub fn store_global(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
         self.store_global_c(base, byte_off, value, ty, hi, CachePolicy::NONE)
     }
     /// `store_global` with a cache policy.
+    #[track_caller]
     pub fn store_global_c(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool, cache: CachePolicy) {
         self.push_stmt(Stmt::StoreGlobalN { base: base.into(), byte_off, value: value.into(), ty, hi, cache });
     }
+    #[track_caller]
     pub fn buffer_load_n(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, ty: MemTy) -> ValueId {
         self.buffer_load_c(rsrc, voff, soff, imm, ty, CachePolicy::NONE)
     }
     /// `buffer_load_n` with a cache policy.
+    #[track_caller]
     pub fn buffer_load_c(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, ty: MemTy, cache: CachePolicy) -> ValueId {
         self.let_(Op::BufferLoadN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, ty, cache })
     }
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn buffer_store_n(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
         self.buffer_store_c(rsrc, voff, soff, imm, value, ty, hi, CachePolicy::NONE)
     }
     /// `buffer_store_n` with a cache policy.
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn buffer_store_c(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool, cache: CachePolicy) {
         self.push_stmt(Stmt::BufferStoreN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into(), ty, hi, cache });
     }
+    #[track_caller]
     pub fn load_lds(&mut self, addr: impl Into<Opnd>, ty: MemTy) -> ValueId {
         self.let_(Op::LoadLdsN { addr: addr.into(), ty })
     }
+    #[track_caller]
     pub fn load_lds_d16(&mut self, addr: impl Into<Opnd>, ty: D16Ty, hi: bool) -> ValueId {
         self.let_(Op::LoadLdsD16 { addr: addr.into(), ty, hi })
     }
+    #[track_caller]
     pub fn store_lds(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
         self.push_stmt(Stmt::StoreLdsN { addr: addr.into(), value: value.into(), ty, hi });
     }
+    #[track_caller]
     pub fn load_lds2(&mut self, addr: impl Into<Opnd>, off0: u8, off1: u8, b64: bool, st64: bool) -> ValueId {
         self.let_(Op::LoadLds2 { addr: addr.into(), off0, off1, b64, st64 })
     }
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn store_lds2(&mut self, addr: impl Into<Opnd>, v0: impl Into<Opnd>, v1: impl Into<Opnd>, off0: u8, off1: u8, b64: bool, st64: bool) {
         self.push_stmt(Stmt::StoreLds2 { addr: addr.into(), v0: v0.into(), v1: v1.into(), off0, off1, b64, st64 });
     }
+    #[track_caller]
     pub fn load_lds_tr_b16(&mut self, addr: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsTrB16 { addr: addr.into() })
     }
 
     /// LDS atomic: returns the old value (`ret`) or `None` (no-return form, cheaper).
+    #[track_caller]
     pub fn atomic_lds(&mut self, op: AtomicOp, addr: impl Into<Opnd>, value: impl Into<Opnd>, ret: bool) -> Option<ValueId> {
         let (addr, value) = (addr.into(), value.into());
         if ret {
@@ -2095,6 +2248,7 @@ impl FnBuilder {
         }
     }
     /// Global atomic: returns the old value (`ret`) or `None`.
+    #[track_caller]
     pub fn atomic_global(&mut self, op: AtomicOp, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ret: bool) -> Option<ValueId> {
         let (base, value) = (base.into(), value.into());
         if ret {
@@ -2106,35 +2260,42 @@ impl FnBuilder {
     }
     /// `base + (u64) a * (u64) b` (unsigned 32-bit factors, 64-bit product): addresses beyond 4 GiB (`index * stride`). Wave-uniform operands
     /// give a scalar pointer (usable as a buffer-descriptor base: move the descriptor to the row / block, keep per-lane offsets small).
+    #[track_caller]
     pub fn ptr_mad(&mut self, base: impl Into<Opnd>, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PtrMadU32 { base: base.into(), a: a.into(), b: b.into() })
     }
     /// `v_pk_fma_f32`: a * b + c, two f32 lanes per instruction (Frag2 operands).
+    #[track_caller]
     pub fn pk_fma_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PkFmaF32(a.into(), b.into(), c.into()))
     }
     /// In-place block update `var[start + k] += t[k] * s` (k over the dwords of `t`, two per `v_pk_fma_f32`; `s` a Frag2 such as
     /// `frag2_dup(scale)`), e.g. the per-tile block-scale accumulation `acc += t * (sa sb)` of the blockscale GEMMs.
+    #[track_caller]
     pub fn var_pk_fma(&mut self, var: VarId, start: u8, t: impl Into<Opnd>, s: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarPkFma { var, start, t: t.into(), s: s.into() });
     }
     /// Mark a per-lane condition for a wave-level branch: the wave takes the branch when ANY lane's `cond` holds (`if` / `break_if` conditions must
     /// be wave-uniform; this is the explicit way to branch on a per-lane one).
+    #[track_caller]
     pub fn any_lane(&mut self, cond: impl Into<Opnd>) -> ValueId {
         self.let_(Op::AnyLane(cond.into()))
     }
     /// Dwords `start .. start + n` of fragment `frag` as a view (no instruction).
+    #[track_caller]
     pub fn frag_slice(&mut self, frag: impl Into<Opnd>, start: u8, n: u8) -> ValueId {
         assert!(matches!(n, 1 | 2 | 4 | 8), "frag_slice: n is 1, 2, 4 or 8");
         self.let_(Op::FragSlice { frag: frag.into(), start, n })
     }
     /// `lo ++ hi` as one Frag4 (e.g. two `ds_read_b64_tr_b16` results = a bf16 MFMA operand). Fresh single-use parts are written IN PLACE (the
     /// defining instruction targets its half of the result: no copies, no early wait).
+    #[track_caller]
     pub fn cat_frag4(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
         let (lo, hi) = (lo.into(), hi.into());
         self.frag_cat(&[lo, hi])
     }
     /// Two `ds_read_b64_tr_b16` (at `addr0`, `addr1`) as one Frag4, each read writing its half directly.
+    #[track_caller]
     pub fn load_lds_tr_b16x2(&mut self, addr0: impl Into<Opnd>, addr1: impl Into<Opnd>) -> ValueId {
         let r0 = self.load_lds_tr_b16(addr0);
         let r1 = self.load_lds_tr_b16(addr1);
@@ -2142,6 +2303,7 @@ impl FnBuilder {
     }
     /// Mark a fresh load result (`buffer_load_b128`, ...) for IN-PLACE use: `set_var(var, b.inplace(load))` makes the load write the loop
     /// variable's own registers (no copy, no wait at the definition). Plain `set_var(var, load)` keeps the copy (the shipped behaviour).
+    #[track_caller]
     pub fn inplace(&mut self, v: impl Into<Opnd>) -> ValueId {
         let v = v.into();
         self.frag_cat(&[v])
@@ -2149,21 +2311,25 @@ impl FnBuilder {
     /// Two dwords as an (even-aligned) Frag2 with fresh single-use parts written IN PLACE - the operand form of the packed f32 ops
     /// (`v_pk_add_f32` / `v_pk_mul_f32` / `v_pk_fma_f32`): the two defining instructions target the halves of one register pair, no moves
     /// (`frag2` copies).
+    #[track_caller]
     pub fn pack2(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         let p = [a.into(), b.into()];
         self.frag_cat(&p)
     }
     /// Four dwords as a Frag4 with fresh single-use parts written in place (`frag4` copies; this does not).
+    #[track_caller]
     pub fn pack4(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>) -> ValueId {
         let p = [a.into(), b.into(), c.into(), d.into()];
         self.frag_cat(&p)
     }
     /// Concatenate one-dword values / fragments into a fragment (total 2, 4, 8 or 16 dwords).
+    #[track_caller]
     pub fn frag_cat(&mut self, parts: &[Opnd]) -> ValueId {
         let total: u32 = parts.iter().map(|p| self.opnd_dwords(*p)).sum();
         assert!(matches!(total, 2 | 4 | 8 | 16), "frag_cat: {total} dwords (2, 4, 8 or 16)");
         self.let_(Op::FragCat { parts: parts.to_vec(), dwords: total as u8 })
     }
+    #[track_caller]
     fn opnd_dwords(&self, o: Opnd) -> u32 {
         match o {
             Opnd::Val(v) => match self.f.value_tys[v as usize] {
@@ -2184,53 +2350,65 @@ impl FnBuilder {
         }
     }
     /// `v_readlane_b32`: lane `lane`'s `x` (uniform).
+    #[track_caller]
     pub fn read_lane(&mut self, x: impl Into<Opnd>, lane: u8) -> ValueId {
         self.let_(Op::ReadLane { x: x.into(), lane })
     }
     /// `v_writelane_b32`: `old` with lane `lane` set to `x`.
+    #[track_caller]
     pub fn write_lane(&mut self, x: impl Into<Opnd>, lane: u8, old: impl Into<Opnd>) -> ValueId {
         self.let_(Op::WriteLane { x: x.into(), lane, old: old.into() })
     }
     /// (low, high) halves of the wave mask of lanes where `cond` holds.
+    #[track_caller]
     pub fn ballot(&mut self, cond: impl Into<Opnd>) -> (ValueId, ValueId) {
         let c = cond.into();
         (self.let_(Op::Ballot { cond: c, hi: false }), self.let_(Op::Ballot { cond: c, hi: true }))
     }
     /// The lane's index among the lanes set in (`lo`, `hi`) below it (`v_mbcnt_lo` + `v_mbcnt_hi`); with -1 / -1: the lane id.
+    #[track_caller]
     pub fn mbcnt(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
         let l = self.let_(Op::Bin(BinOp::MbcntLo, lo.into(), Opnd::I32(0)));
         self.let_(Op::Bin(BinOp::MbcntHi, hi.into(), Opnd::Val(l)))
     }
     /// `ds_bpermute_b32`: lane k gets `x` of lane addr[k] / 4.
+    #[track_caller]
     pub fn bpermute(&mut self, addr: impl Into<Opnd>, x: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Bpermute { addr: addr.into(), x: x.into(), offset: 0 })
     }
     /// `ds_permute_b32`: lane k sends `x` to lane addr[k] / 4.
+    #[track_caller]
     pub fn permute(&mut self, addr: impl Into<Opnd>, x: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Permute { addr: addr.into(), x: x.into(), offset: 0 })
     }
     /// `ds_swizzle_b32` with the raw 16-bit pattern.
+    #[track_caller]
     pub fn swizzle(&mut self, x: impl Into<Opnd>, pattern: u16) -> ValueId {
         self.let_(Op::Swizzle { x: x.into(), pattern })
     }
     /// MUBUF atomic without return (`AddU32`, `AddF32`, `PkAddBf16`, `PkAddF16`).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn buffer_atomic(&mut self, op: AtomicOp, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::BufferAtomicNoRet { op, rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into() });
     }
     /// `v_mov_b32_dpp` with a full DPP control; lanes not written keep `old`.
+    #[track_caller]
     pub fn dpp(&mut self, dpp: Dpp, x: impl Into<Opnd>, old: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Dpp { dpp, x: x.into(), old: old.into() })
     }
     /// `dpp(a) op b` in one instruction (`v_<op>_dpp`); lanes not written keep `old`.
+    #[track_caller]
     pub fn dpp_alu(&mut self, op: DppAluOp, dpp: Dpp, a: impl Into<Opnd>, b: impl Into<Opnd>, old: impl Into<Opnd>) -> ValueId {
         self.let_(Op::DppAlu { op, dpp, a: a.into(), b: b.into(), old: old.into() })
     }
     /// `v_permlane16_swap_b32`: (new a, new b) as a Frag2.
+    #[track_caller]
     pub fn permlane16_swap(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Permlane16Swap { a: a.into(), b: b.into() })
     }
     /// A conversion (`CvtOp`); pass the used operands in order.
+    #[track_caller]
     pub fn cvt(&mut self, op: CvtOp, srcs: &[Opnd], sel: u8) -> ValueId {
         let mut s = [Opnd::I32(0); 4];
         assert_eq!(srcs.len(), op.sig().0, "cvt {op:?}: operand count");
@@ -2240,18 +2418,22 @@ impl FnBuilder {
 
     // ---- P1-d MFMA ----
     /// D = A x B + C (`c: None`: zero accumulator).
+    #[track_caller]
     pub fn mfma(&mut self, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>) -> ValueId {
         self.let_(Op::Mfma { kind, a: a.into(), b: b.into(), c, scale: None })
     }
     /// Block-scaled D = A x B + C of a scaled f8f6f4 kind (`MmaKind::scaled_f8f6f4`), E8M0 scales `s`.
+    #[track_caller]
     pub fn mfma_scaled(&mut self, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>, s: MmaScale) -> ValueId {
         self.let_(Op::Mfma { kind, a: a.into(), b: b.into(), c, scale: Some(s) })
     }
     /// Block-scaled var = A x B + var (`zero`: var = A x B).
+    #[track_caller]
     pub fn var_mfma_scaled(&mut self, var: VarId, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, s: MmaScale, zero: bool) {
         self.push_stmt(Stmt::VarMfma { var, kind, a: a.into(), b: b.into(), scale: Some(s), zero });
     }
     /// var = A x B + var (`zero`: var = A x B).
+    #[track_caller]
     pub fn var_mfma(&mut self, var: VarId, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, zero: bool) {
         self.push_stmt(Stmt::VarMfma { var, kind, a: a.into(), b: b.into(), scale: None, zero });
     }
@@ -2261,6 +2443,7 @@ impl FnBuilder {
     /// Starts capturing: the statements emitted from now on (and the regions opened AND closed meanwhile) go into a detached buffer instead
     /// of the current block. Ids are allocated as usual, so values defined inside are usable by later code once the capture is spliced
     /// before it (the weaver orders by the dependency facts, `facts::must_order`). Captures nest (LIFO).
+    #[track_caller]
     pub fn capture_begin(&mut self) -> CaptureId {
         let inner = TreeBuilder { count: self.tree.count, barriers: self.tree.barriers, ..Default::default() };
         let outer = std::mem::replace(&mut self.tree, inner);
@@ -2269,6 +2452,7 @@ impl FnBuilder {
     }
 
     /// Ends the capture `id` (the innermost open one) and returns its statements; the regions opened inside must be closed.
+    #[track_caller]
     pub fn capture_end(&mut self, id: CaptureId) -> Captured {
         assert_eq!(id.0, self.captures.len(), "kernel `{}`: capture_end out of order (captures nest LIFO)", self.f.name);
         let outer = self.captures.pop().expect("capture_end without capture_begin");
@@ -2280,6 +2464,7 @@ impl FnBuilder {
     }
 
     /// Closure form: `(captured statements, closure result)`.
+    #[track_caller]
     pub fn capture<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> (Captured, R) {
         let id = self.capture_begin();
         let r = f(self);
@@ -2288,11 +2473,13 @@ impl FnBuilder {
 
     /// Appends captured statements to the current block (in their captured order). Splicing every capture once, in capture order, gives
     /// exactly the function a direct build gives.
+    #[track_caller]
     pub fn splice(&mut self, c: Captured) {
         self.splice_nodes(c.nodes);
     }
 
     /// Appends nodes (of one or more captures, in a chosen order) to the current block. A tile region may not be spliced into an open tile region.
+    #[track_caller]
     pub fn splice_nodes(&mut self, nodes: impl IntoIterator<Item = Node>) {
         let in_region = self.tree.open.iter().any(|f| matches!(f, Frame::Region { .. }));
         for n in nodes {
@@ -2305,6 +2492,7 @@ impl FnBuilder {
 
     /// Dependency facts of captured statements in this function (value types known). A use of a register view of a loop variable (a lane /
     /// slice / bitcast of it, no instruction of its own) is also a READ of the variable: the user reads the registers at its own position.
+    #[track_caller]
     pub fn facts(&self, c: &Captured) -> Vec<facts::Facts> {
         let mut fs = c.facts(&self.f);
         for f in fs.iter_mut() {
@@ -2321,6 +2509,7 @@ impl FnBuilder {
         fs
     }
     /// The loop variables a value is a register view of (empty when it is a value of its own).
+    #[track_caller]
     pub fn view_vars(&self, v: ValueId) -> &[VarId] {
         self.views.get(&v).map_or(&[], |x| x.as_slice())
     }
@@ -2331,6 +2520,7 @@ impl FnBuilder {
     }
 
     /// Appends a statement to the innermost open region (markers open / close regions); an unbalanced end panics here, at build time.
+    #[track_caller]
     fn push_stmt(&mut self, st: Stmt) {
         if let Err(e) = self.tree.push(st) {
             panic!("kernel `{}`: {e}", self.f.name);
@@ -2338,6 +2528,7 @@ impl FnBuilder {
     }
 
     /// Closure form of `begin_loop` / `end_loop`: `body` receives the loop variables.
+    #[track_caller]
     pub fn loop_<R>(&mut self, inits: &[(DType, Opnd)], body: impl FnOnce(&mut Self, &[VarId]) -> R) -> R {
         let vars = self.begin_loop(inits);
         let r = body(self, &vars);
@@ -2345,6 +2536,7 @@ impl FnBuilder {
         r
     }
     /// Closure form of `begin_if` / `end_if`.
+    #[track_caller]
     pub fn if_<R>(&mut self, cond: impl Into<Opnd>, then: impl FnOnce(&mut Self) -> R) -> R {
         self.begin_if(cond);
         let r = then(self);
@@ -2352,6 +2544,7 @@ impl FnBuilder {
         r
     }
     /// Closure form of `begin_if` / `else_` / `end_if`.
+    #[track_caller]
     pub fn if_else(&mut self, cond: impl Into<Opnd>, then: impl FnOnce(&mut Self), els: impl FnOnce(&mut Self)) {
         self.begin_if(cond);
         then(self);
@@ -2360,6 +2553,7 @@ impl FnBuilder {
         self.end_if();
     }
     /// Closure form of `tile_produce` / `tile_end`.
+    #[track_caller]
     pub fn produce_region<R>(&mut self, tile: &str, slot: impl Into<Opnd>, version: impl Into<Opnd>, body: impl FnOnce(&mut Self) -> R) -> R {
         self.tile_produce(tile, slot, version);
         let r = body(self);
@@ -2369,50 +2563,62 @@ impl FnBuilder {
 
     // ---- convenience constructors -------------------------------------
 
+    #[track_caller]
     pub fn c_i32(&mut self, v: i32) -> ValueId {
         self.let_(Op::ConstI32(v))
     }
 
+    #[track_caller]
     pub fn c_f32(&mut self, v: f32) -> ValueId {
         self.let_(Op::ConstF32(v))
     }
 
+    #[track_caller]
     pub fn add_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::AddI32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn min_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::MinI32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn mul_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::MulI32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn shl_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::ShlI32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn add_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::AddF32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn sub_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::SubF32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn mul_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::MulF32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn max_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::MaxF32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn xor_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::XorI32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn max3_f32(
         &mut self,
         a: impl Into<Opnd>,
@@ -2422,87 +2628,106 @@ impl FnBuilder {
         self.let_(Op::Max3F32(a.into(), b.into(), c.into()))
     }
 
+    #[track_caller]
     pub fn exp_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::ExpF32(a.into()))
     }
 
+    #[track_caller]
     pub fn rcp_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::RcpF32(a.into()))
     }
 
+    #[track_caller]
     pub fn cvt_f32_to_f16(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtF32ToF16(a.into()))
     }
 
+    #[track_caller]
     pub fn cmp_lt_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CmpLtF32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn cmp_lt_i32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CmpLtI32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn load_u16(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
         self.let_(Op::LoadU16 { base: base.into(), byte_off })
     }
 
     /// Coherent (`sc1`) f32 load: reads through to the device-coherent level.
+    #[track_caller]
     pub fn load_f32_coherent(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
         self.let_(Op::LoadF32Coherent { base: base.into(), byte_off })
     }
 
     /// `global_atomic_add` returning the OLD value, device scope. Per-lane semantics: every active lane adds ITS `value`; pass `1` in lane 0 and `0`
     /// elsewhere for a one-ticket-per-wave counter, then `read_first_lane` the result.
+    #[track_caller]
     pub fn atomic_add_u32(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) -> ValueId {
         self.let_(Op::AtomicAddU32 { base: base.into(), byte_off, value: value.into() })
     }
 
+    #[track_caller]
     pub fn store_f32_wt(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::StoreF32Wt { base: base.into(), byte_off, value: value.into() });
     }
 
     /// Device-scope release: wait for all earlier loads/stores, write back L2 (`buffer_wbl2 sc1`), wait again.
+    #[track_caller]
     pub fn fence_release(&mut self) {
         self.push_stmt(Stmt::FenceRelease { wb: true });
     }
 
     /// Release without the L2 write-back (valid when every shared store used `store_*_wt`).
+    #[track_caller]
     pub fn fence_release_lite(&mut self) {
         self.push_stmt(Stmt::FenceRelease { wb: false });
     }
 
     /// Device-scope acquire: wait for the ticket, invalidate (`buffer_inv sc1`).
+    #[track_caller]
     pub fn fence_acquire(&mut self) {
         self.push_stmt(Stmt::FenceAcquire { inv: true });
     }
 
+    #[track_caller]
     pub fn fence_acquire_lite(&mut self) {
         self.push_stmt(Stmt::FenceAcquire { inv: false });
     }
 
+    #[track_caller]
     pub fn load_f32(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
         self.let_(Op::LoadF32 { base: base.into(), byte_off })
     }
 
+    #[track_caller]
     pub fn ptr_add(&mut self, base: impl Into<Opnd>, byte_off: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PtrAdd { base: base.into(), byte_off: byte_off.into() })
     }
 
+    #[track_caller]
     pub fn frag2(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Frag2(a.into(), b.into()))
     }
 
     /// `v_permlane32_swap`: `(a', b')` with a' = [a lanes 0..31, b lanes 0..31] and b' = [a lanes 32..63, b lanes 32..63] (lanes 32..63 of `a`
     /// exchanged with lanes 0..31 of `b`). 32-bit values.
+    #[track_caller]
     pub fn permlane32_swap(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> (ValueId, ValueId) {
         let p = self.let_(Op::Permlane32Swap { a: a.into(), b: b.into() });
         (self.frag2_lane(p, 0), self.frag2_lane(p, 1))
     }
 
+    #[track_caller]
     pub fn frag2_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
         self.let_(Op::Frag2Lane { frag: frag.into(), index })
     }
 
+    #[track_caller]
     pub fn frag4(
         &mut self,
         a: impl Into<Opnd>,
@@ -2513,10 +2738,12 @@ impl FnBuilder {
         self.let_(Op::Frag4(a.into(), b.into(), c.into(), d.into()))
     }
 
+    #[track_caller]
     pub fn frag4_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
         self.let_(Op::Frag4Lane { frag: frag.into(), index })
     }
 
+    #[track_caller]
     pub fn mfma_f16(
         &mut self,
         a: impl Into<Opnd>,
@@ -2526,14 +2753,17 @@ impl FnBuilder {
         self.let_(Op::MfmaF16 { a: a.into(), b: b.into(), c: c.into() })
     }
 
+    #[track_caller]
     pub fn bitcast_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::BitcastF32(a.into()))
     }
 
+    #[track_caller]
     pub fn bitcast_i32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::BitcastI32(a.into()))
     }
 
+    #[track_caller]
     pub fn mfma_f16_wide(
         &mut self,
         a: impl Into<Opnd>,
@@ -2546,27 +2776,33 @@ impl FnBuilder {
     #[allow(clippy::too_many_arguments)]
     /// Concatenate two Frag4 values into a Frag8 (low half first).
     /// Pack two f32 into two unsigned-normalized 16-bit values.
+    #[track_caller]
     pub fn cvt_pknorm_u16_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPknormU16(a.into(), b.into()))
     }
 
     /// Pack two f32 into two E4M3 fp8 bytes (upper 16 bits are zero).
+    #[track_caller]
     pub fn exp2_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Exp2F32(a.into()))
     }
 
+    #[track_caller]
     pub fn log2_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Log2F32(a.into()))
     }
 
+    #[track_caller]
     pub fn cvt_pk_bf16_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPkBf16F32(a.into(), b.into()))
     }
 
+    #[track_caller]
     pub fn cat_frag8(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CatFrag8(lo.into(), hi.into()))
     }
 
+    #[track_caller]
     pub fn frag8(
         &mut self,
         a: impl Into<Opnd>,
@@ -2590,6 +2826,7 @@ impl FnBuilder {
         ))
     }
 
+    #[track_caller]
     pub fn mfma_scale_fp8(
         &mut self,
         a: impl Into<Opnd>,
@@ -2607,11 +2844,13 @@ impl FnBuilder {
         })
     }
 
+    #[track_caller]
     pub fn frag16_lane(&mut self, frag: impl Into<Opnd>, index: u8) -> ValueId {
         self.let_(Op::Frag16Lane { frag: frag.into(), index })
     }
 
     /// Sparse fp8 MFMA (`v_smfmac_f32_16x16x128_fp8_fp8`): D = compressed A x dense B + C.
+    #[track_caller]
     pub fn smfmac_fp8_16x16x128(
         &mut self,
         a: impl Into<Opnd>,
@@ -2628,21 +2867,25 @@ impl FnBuilder {
     }
 
     /// A zero-initialised fragment of the given type.
+    #[track_caller]
     pub fn frag_zero(&mut self, ty: DType) -> ValueId {
         self.let_(Op::FragZero { ty })
     }
 
     /// One dword read from workgroup LDS.
+    #[track_caller]
     pub fn load_lds_b32(&mut self, addr: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsB32 { addr: addr.into() })
     }
 
     /// One dword write into workgroup LDS.
+    #[track_caller]
     pub fn store_lds_b32(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::StoreLdsB32 { addr: addr.into(), value: value.into() });
     }
 
     /// Four dwords (16 B) read from workgroup LDS.
+    #[track_caller]
     pub fn load_lds_b128(&mut self, addr: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsB128 { addr: addr.into() })
     }
@@ -2650,15 +2893,18 @@ impl FnBuilder {
     /// `ds_read_b64`: two dwords from LDS (8-byte aligned) as a `Frag2`.
     /// Wave-uniform select of two buffer descriptors (`s_cmp` + 2 x `s_cselect_b64`, no branch): `cond` must be a (possibly negated) signed compare
     /// of wave-uniform integers. The GPU-semantics verifier proves every access through the result against BOTH descriptors.
+    #[track_caller]
     pub fn select_uniform_rsrc(&mut self, cond: impl Into<Opnd>, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Select { ty: DType::Rsrc, cond: cond.into(), a: a.into(), b: b.into() })
     }
     /// Wave-uniform select of two SGPR pointers (kernarg pointers or uniform pointer arithmetic; `s_cmp` + `s_cselect_b64`). Accesses through the
     /// result are proven against BOTH pointers' extents.
+    #[track_caller]
     pub fn select_uniform_ptr(&mut self, cond: impl Into<Opnd>, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Select { ty: DType::Ptr, cond: cond.into(), a: a.into(), b: b.into() })
     }
 
+    #[track_caller]
     pub fn load_lds_b64(&mut self, addr: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsB64 { addr: addr.into() })
     }
@@ -2666,11 +2912,13 @@ impl FnBuilder {
     /// Four dwords (16 B) write into workgroup LDS.
     /// Transposing 8-bit LDS read into two dwords per lane.
     /// 16-byte global load into a `Frag4`.
+    #[track_caller]
     pub fn load_b128(&mut self, base: impl Into<Opnd>, byte_off: u32) -> ValueId {
         self.let_(Op::LoadGlobalB128 { base: base.into(), byte_off })
     }
 
     /// Four transposing reads into one `Frag8` (bytes 8r..8r+7 from the r-th address).
+    #[track_caller]
     pub fn load_lds_tr_b8x4(
         &mut self,
         a0: impl Into<Opnd>,
@@ -2682,89 +2930,113 @@ impl FnBuilder {
     }
 
     /// Two 16-byte LDS reads into the low and high half of one `Frag8`.
+    #[track_caller]
     pub fn load_lds_b128x2(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsB128x2 { lo: lo.into(), hi: hi.into() })
     }
 
+    #[track_caller]
     pub fn partner_max_f32(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PartnerMaxF32(a.into()))
     }
+    #[track_caller]
     pub fn frag2_dup(&mut self, a: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Frag2Dup(a.into()))
     }
+    #[track_caller]
     pub fn pk_add_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PkAddF32(a.into(), b.into()))
     }
+    #[track_caller]
     pub fn pk_mul_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PkMulF32(a.into(), b.into()))
     }
+    #[track_caller]
     pub fn cvt_pk_fp8x4_f32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPkFp8x4F32(a.into(), b.into(), c.into(), d.into()))
     }
+    #[track_caller]
     pub fn var_mfma_scale_c(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarMfmaScaleC { var, a: a.into(), b: b.into(), c: c.into(), scale_a: scale_a.into(), scale_b: scale_b.into() });
     }
 
     /// Unscaled fp8 MFMA `a x b + c` (value form; c = frag_zero gives the zero-accumulator instruction).
+    #[track_caller]
     pub fn mfma_fp8_32x32x64(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
         self.let_(Op::MfmaFp8_32x32x64 { a: a.into(), b: b.into(), c: c.into() })
     }
     /// `var += a x b` (unscaled fp8, in place).
+    #[track_caller]
     pub fn var_mfma_fp8_32x32x64(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarMfmaFp8 { var, a: a.into(), b: b.into() });
     }
     /// `var = a x b` (unscaled fp8, zero accumulator).
+    #[track_caller]
     pub fn var_mfma_fp8_32x32x64_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarMfmaFp8Z { var, a: a.into(), b: b.into() });
     }
     /// `var = a x b + c` (unscaled fp8; c a separate Frag16 value).
+    #[track_caller]
     pub fn var_mfma_fp8_32x32x64_c(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarMfmaFp8C { var, a: a.into(), b: b.into(), c: c.into() });
     }
+    #[track_caller]
     pub fn var_scale_lane(&mut self, var: VarId, index: u8, scalar: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarScaleLane { var, index, scalar: scalar.into() });
     }
 
     /// `var.lane[index] = value` (32-bit value into one dword of a fragment variable).
+    #[track_caller]
     pub fn var_set_lane(&mut self, var: VarId, index: u8, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarSetLane { var, index, value: value.into() });
     }
 
     /// Dwords 8 half .. 8 half + 7 of the Frag16 variable `var` as a Frag8 operand without a copy (see `Op::VarSlice8`).
+    #[track_caller]
     pub fn var_slice8(&mut self, var: VarId, half: u8) -> ValueId {
         assert!(half < 2, "var_slice8: half is 0 or 1");
         self.let_(Op::VarSlice8 { var, half })
     }
     /// Dwords 4 idx .. 4 idx + 3 of a Frag8 / Frag16 variable as a Frag4 operand without a copy (see `Op::VarSlice4`).
+    #[track_caller]
     pub fn var_slice4(&mut self, var: VarId, idx: u8) -> ValueId {
         self.let_(Op::VarSlice4 { var, idx })
     }
+    #[track_caller]
     pub fn perm_b32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, sel: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PermB32(a.into(), b.into(), sel.into()))
     }
+    #[track_caller]
     pub fn pk_sub_u16(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PkSubU16(a.into(), b.into()))
     }
+    #[track_caller]
     pub fn cvt_pknorm_pair(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPknormPair(a.into(), b.into()))
     }
+    #[track_caller]
     pub fn cvt_p8x4_from_u16(&mut self, u0: impl Into<Opnd>, u1: impl Into<Opnd>, scale: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtP8x4FromU16(u0.into(), u1.into(), scale.into()))
     }
+    #[track_caller]
     pub fn cvt_pknorm_p8x4(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>, scale: impl Into<Opnd>) -> ValueId {
         self.let_(Op::CvtPknormP8x4(a.into(), b.into(), c.into(), d.into(), scale.into()))
     }
+    #[track_caller]
     pub fn var_add_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarAddPk { var, pair: pair.into() });
     }
+    #[track_caller]
     pub fn var_mfma_f16_z(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarMfmaF16Z { var, a: a.into(), b: b.into() });
     }
+    #[track_caller]
     pub fn var_scale_pk(&mut self, var: VarId, pair: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarScalePk { var, pair: pair.into() });
     }
 
     /// `var = scaled_mfma(a, b, var)` in place.
+    #[track_caller]
     pub fn var_mfma_scale(
         &mut self,
         var: VarId,
@@ -2786,59 +3058,70 @@ impl FnBuilder {
     /// `var += v_mfma_scale_f32_32x32x64_f8f6f4(a, b; scale_a.byte[byte_a], scale_b.byte[byte_b])` in place: the scale operands are whole dwords and
     /// the instruction's op_sel / op_sel_hi pick the E8M0 byte (no VALU byte extraction; the vendor's form).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn var_mfma_scale_sel(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>, byte_a: u8, byte_b: u8) {
         assert!(byte_a < 4 && byte_b < 4, "scale byte select is 0..3");
         self.push_stmt(Stmt::VarMfmaScale { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into(), opsel: byte_a | (byte_b << 4) });
     }
 
     /// `var += smfmac_16x16x128_fp8_fp8(a, b, idx)`: accumulate into a `Frag4` loop variable in place.
+    #[track_caller]
     pub fn var_smfmac_fp8(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, idx: impl Into<Opnd>) {
         self.push_stmt(Stmt::VarSmfmac { var, a: a.into(), b: b.into(), idx: idx.into() });
     }
 
     /// `var += v_mfma_scale_f32_16x16x128_f8f6f4(a, b; scale_a.byte[byte_a], scale_b.byte[byte_b])` on a `Frag4` loop variable.
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn var_mfma_scale16(&mut self, var: VarId, a: impl Into<Opnd>, b: impl Into<Opnd>, scale_a: impl Into<Opnd>, scale_b: impl Into<Opnd>, byte_a: u8, byte_b: u8) {
         assert!(byte_a < 4 && byte_b < 4, "scale byte select is 0..3");
         self.push_stmt(Stmt::VarMfmaScale16 { var, a: a.into(), b: b.into(), scale_a: scale_a.into(), scale_b: scale_b.into(), opsel: byte_a | (byte_b << 4) });
     }
 
     /// Update several loop variables in place: the i-th `Seq::inout` port is bound to `vars[i]`.
+    #[track_caller]
     pub fn var_asm_n(&mut self, vars: &[VarId], block: amdgpu_safeasm::AsmBlock, inputs: &[Opnd]) {
         self.push_stmt(Stmt::VarAsmN { vars: vars.to_vec(), block: std::sync::Arc::new(block), inputs: inputs.to_vec() });
     }
 
+    #[track_caller]
     pub fn load_lds_tr_b8(&mut self, addr: impl Into<Opnd>) -> ValueId {
         self.let_(Op::LoadLdsTrB8 { addr: addr.into() })
     }
 
+    #[track_caller]
     pub fn store_lds_b128(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::StoreLdsB128 { addr: addr.into(), value: value.into() });
     }
 
     /// `ds_write_b64`: a `Frag2` into LDS (8-byte aligned).
+    #[track_caller]
     pub fn store_lds_b64(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>) {
         self.push_stmt(Stmt::StoreLdsB64 { addr: addr.into(), value: value.into() });
     }
 
     /// Broadcast lane 0 of a vector value into a scalar register.
+    #[track_caller]
     pub fn read_first_lane(&mut self, v: impl Into<Opnd>) -> ValueId {
         self.let_(Op::ReadFirstLane(v.into()))
     }
 
     /// `v_mov_b32_dpp quad_perm:[p0,p1,p2,p3]`: lane `l` gets lane `4 (l / 4) + perm[l % 4]` of `x` (a 32-bit value; e.g. `[1,0,3,2]` swaps
     /// neighbours, `[2,3,0,1]` swaps pairs). The result is a U32 bit pattern.
+    #[track_caller]
     pub fn dpp_quad_perm(&mut self, x: impl Into<Opnd>, perm: [u8; 4]) -> ValueId {
         assert!(perm.iter().all(|p| *p < 4), "dpp_quad_perm: lane selectors are 0..3");
         self.let_(Op::DppQuadPerm { x: x.into(), perm })
     }
 
     /// `s_waitcnt lgkmcnt(count)`.
+    #[track_caller]
     pub fn wait_lds(&mut self, count: u8) {
         self.push_stmt(Stmt::WaitLds { count });
     }
 
     /// `s_barrier`.
+    #[track_caller]
     pub fn wait_vm(&mut self, count: u8) {
         self.push_stmt(Stmt::WaitVm { count });
     }
@@ -2848,12 +3131,14 @@ impl FnBuilder {
     /// no group selects follow in program order. Honoured by the scheduler of ``CompileProfile::Gemm`` (or explicit ``sched_opts``); otherwise ignored.
     /// Mask bits as in LLVM: ``SCHED_ALU`` 0x1 (any ALU incl. MFMA), ``SCHED_VALU`` 0x2, ``SCHED_SALU`` 0x4, ``SCHED_MFMA`` 0x8, ``SCHED_VMEM`` 0x10,
     /// ``SCHED_VMEM_READ`` 0x20 (buffer/global loads, LDS-DMA included), ``SCHED_VMEM_WRITE`` 0x40, ``SCHED_DS`` 0x80, ``SCHED_DS_READ`` 0x100, ``SCHED_DS_WRITE`` 0x200.
+    #[track_caller]
     pub fn sched_group_barrier(&mut self, mask: u32, size: u32, sync: u32) {
         self.push_stmt(Stmt::SchedGroup { mask, size, sync });
     }
 
     /// ``repeat`` times the group sequence ``groups`` (``(mask, size)`` pairs) as ``sched_group_barrier`` directives, e.g. one MFMA then two ``ds_read``s then one DMA:
     /// ``b.sched_pattern(&[(SCHED_MFMA, 1), (SCHED_DS_READ, 2), (SCHED_VMEM_READ, 1)], 64)``.
+    #[track_caller]
     pub fn sched_pattern(&mut self, groups: &[(u32, u32)], repeat: u32) {
         for _ in 0..repeat {
             for &(mask, size) in groups {
@@ -2862,12 +3147,15 @@ impl FnBuilder {
         }
     }
     /// 16-byte (dwords = 4) or 4-byte (dwords = 1) global -> LDS DMA load; see `Stmt::LoadGlobalLds`.
+    #[track_caller]
     pub fn load_global_lds(&mut self, base: impl Into<Opnd>, lds_addr: impl Into<Opnd>, byte_off: i32, dwords: u8) {
         self.push_stmt(Stmt::LoadGlobalLds { base: base.into(), lds_addr: lds_addr.into(), byte_off, dwords });
     }
+    #[track_caller]
     pub fn set_prio(&mut self, prio: u8) {
         self.push_stmt(Stmt::SetPrio { prio });
     }
+    #[track_caller]
     pub fn barrier(&mut self) {
         self.push_stmt(Stmt::Barrier);
     }
@@ -2877,6 +3165,7 @@ impl FnBuilder {
     /// stamps at points where the kernel already drains (e.g. right after a tile's `vmcnt(0) lgkmcnt(0)` + barrier). Pinned in program order against other memory ops.
     /// Byte offset of this wave's stamp record in a debug buffer laid out `[workgroup][wave][slot]` of u32: `((wg * waves_per_wg + tid / 64) * slots) * 4`.
     /// `wg` is the linear workgroup index (for a 2-D grid pass `bx + by * grid_x`).
+    #[track_caller]
     pub fn stamp_rec_off(&mut self, wg: impl Into<Opnd>, slots: u32, waves_per_wg: u32) -> ValueId {
         let tid = self.let_(Op::WorkitemId);
         let c6 = self.c_i32(6);
@@ -2889,11 +3178,13 @@ impl FnBuilder {
     }
     /// Store a stamp (or any i32) into slot `slot` of the record at `rec_off` (from `stamp_rec_off`) of the debug buffer `buf` (a pointer argument). All 64 lanes
     /// store the same dword to the same address (one coalesced write).
+    #[track_caller]
     pub fn stamp_store(&mut self, buf: impl Into<Opnd>, rec_off: impl Into<Opnd>, slot: u32, stamp: ValueId) {
         let p = self.ptr_add(buf, rec_off);
         let f = self.bitcast_f32(stamp);
         self.store_f32(p, slot * 4, f);
     }
+    #[track_caller]
     pub fn memtime_lo(&mut self) -> ValueId {
         let id = self.f.value_tys.len() as u32;
         self.let_(Op::MemTimeLo { id })

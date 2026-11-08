@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
     if (argc < 6) { std::fprintf(stderr, "usage: %s <co> <kernel> <silu_mul|gelu_tanh_mul|add> <M> <D> [iters]\n", argv[0]); return 2; }
     const char* co = argv[1]; const char* kn = argv[2]; std::string mode = argv[3];
     long M = std::atol(argv[4]); long D = std::atol(argv[5]); int iters = argc > 6 ? std::atoi(argv[6]) : 50;
-    const bool unary = mode == "silu" || mode == "gelu_tanh" || mode == "relu2" || mode == "sigmoid"; const bool flat = mode == "add" || unary; float limit = argc > 7 ? (float)std::atof(argv[7]) : 7.0f;
+    const bool unary = mode == "silu" || mode == "gelu_tanh" || mode == "gelu" || mode == "relu2" || mode == "sigmoid"; const bool flat = mode == "add" || unary; float limit = argc > 7 ? (float)std::atof(argv[7]) : 7.0f;
     const size_t nin = flat ? (size_t)M * D : (size_t)M * 2 * D, nout = (size_t)M * D;
     std::mt19937 rng(77); std::normal_distribution<float> nd(0.f, 2.f);
     std::vector<uint16_t> hx(nin), hy((flat && !unary) ? nin : 0);
@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
     long bad = 0, cnt = 0; double max_rel = 0;
     for (size_t i = 0; i < nout; ++i) {
         double ref;
-        if (unary) { double a = bf16_to_f32(hx[i]); if (mode == "silu") ref = a / (1.0 + std::exp(-a)); else if (mode == "gelu_tanh") ref = 0.5 * a * (1.0 + std::tanh(0.7978845608028654 * (a + 0.044715 * a * a * a))); else if (mode == "relu2") ref = a > 0 ? a * a : 0.0; else ref = 1.0 / (1.0 + std::exp(-a)); }
+        if (unary) { double a = bf16_to_f32(hx[i]); if (mode == "silu") ref = a / (1.0 + std::exp(-a)); else if (mode == "gelu_tanh") ref = 0.5 * a * (1.0 + std::tanh(0.7978845608028654 * (a + 0.044715 * a * a * a))); else if (mode == "gelu") ref = 0.5 * a * (1.0 + std::erf(a / std::sqrt(2.0))); else if (mode == "relu2") ref = a > 0 ? a * a : 0.0; else ref = 1.0 / (1.0 + std::exp(-a)); }
         else if (flat) ref = (double)bf16_to_f32(hx[i]) + bf16_to_f32(hy[i]);
         else {
             size_t m = i / D, d = i % D;
@@ -53,6 +53,7 @@ int main(int argc, char** argv) {
             if (mode == "silu_mul_limit") { double lim = limit > 0 ? limit : 1e300; a = std::min(a, lim); g = std::max(-lim, std::min(g, lim)); y = a / (1.0 + std::exp(-a)); }
             else if (mode == "swiglu_oai") { double gt = std::min(a, 7.0), lin = std::max(-7.0, std::min(g, 7.0)); y = gt / (1.0 + std::exp(-1.702 * gt)); g = lin + 1.0; }
             else if (mode == "silu_mul") y = a / (1.0 + std::exp(-a));
+            else if (mode == "gelu_mul") y = 0.5 * a * (1.0 + std::erf(a / std::sqrt(2.0)));
             else y = 0.5 * a * (1.0 + std::tanh(0.7978845608028654 * (a + 0.044715 * a * a * a)));
             ref = y * g;
         }

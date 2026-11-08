@@ -8,7 +8,12 @@ use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Func
 use amdgpu_tile::prims::{abs_f32, bf16x8_to_f32, fp8_pack, fp8_scale, group_reduce_dpp, lane_reduce, RedOp};
 use amdgpu_tile::ev;
 
+pub mod mla;
+
 pub fn by_name(full: &str) -> Option<Function> {
+    if full.starts_with("concat_cache_mla_") {
+        return mla::by_name(full);
+    }
     // `_i64`: slot_mapping is an int64 tensor (vLLM / SGLang) instead of int32: the low dword of every entry is read (slots < 2^31; -1 is 0xffffffff)
     let (name, slot64) = match full.strip_suffix("_i64") {
         Some(n) => (n, true),
