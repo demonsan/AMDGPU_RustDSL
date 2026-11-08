@@ -630,6 +630,9 @@ pub enum Op {
     LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
     LoadLdsTrB16 { addr: Opnd },
+    /// "Any lane": the wave-level reading of a per-lane condition (true for the whole wave when any lane's `cond` holds) — the explicit marker
+    /// for branching on a per-lane condition (`if` / `break_if` are wave-level). No code: the branch itself has this semantics.
+    AnyLane(Opnd),
     /// Dwords `start .. start + n` of a fragment value as a value of its own WITHOUT a copy (a register view; n = 1 -> I32, 2 / 4 / 8 -> FragN)
     FragSlice { frag: Opnd, start: u8, n: u8 },
     /// The concatenation of one-dword values and fragments into one fragment of the total width (2, 4, 8 or 16 dwords; copies)
@@ -676,6 +679,7 @@ impl Op {
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
+            Op::AnyLane(_) => DType::I1,
             Op::FragSlice { n, .. } => match n {
                 1 => DType::I32,
                 2 => DType::Frag2,
@@ -784,6 +788,7 @@ impl Op {
             Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } | Op::LoadLdsD16 { addr, .. } => vec![*addr],
             Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
             Op::Dpp { x, old, .. } => vec![*x, *old],
+            Op::AnyLane(c) => vec![*c],
             Op::FragSlice { frag, .. } => vec![*frag],
             Op::FragCat { parts, .. } => parts.clone(),
             Op::ReadLane { x, .. } | Op::Swizzle { x, .. } => vec![*x],
@@ -2084,6 +2089,11 @@ impl FnBuilder {
             self.push_stmt(Stmt::AtomicGlobalNoRet { op, base, byte_off, value });
             None
         }
+    }
+    /// Mark a per-lane condition for a wave-level branch: the wave takes the branch when ANY lane's `cond` holds (`if` / `break_if` conditions must
+    /// be wave-uniform; this is the explicit way to branch on a per-lane one).
+    pub fn any_lane(&mut self, cond: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::AnyLane(cond.into()))
     }
     /// Dwords `start .. start + n` of fragment `frag` as a view (no instruction).
     pub fn frag_slice(&mut self, frag: impl Into<Opnd>, start: u8, n: u8) -> ValueId {
@@ -4168,7 +4178,7 @@ pub fn uniform_values(f: &Function) -> (std::collections::HashSet<ValueId>, std:
                             Opnd::Val(v) => consts.get(v).map_or(false, |k| *k >= 6),
                             _ => false,
                         },
-                        Op::ReadFirstLane(_) | Op::ReadLane { .. } | Op::Ballot { .. } => true,
+                        Op::ReadFirstLane(_) | Op::ReadLane { .. } | Op::Ballot { .. } | Op::AnyLane(_) => true,
                         // per-lane by construction (lane permutes, matrix results, atomics' per-lane old values, asm)
                         Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::Permlane16Swap { .. }
                         | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } | Op::WriteLane { .. } | Op::PartnerMaxF32(..)
@@ -4227,7 +4237,7 @@ fn check_uniform_branches(f: &Function, errs: &mut Vec<String>) {
         };
         if !ok {
             errs.push(format!(
-                "stmt {idx}: {what} condition {cond:?} is not provably wave-uniform: DSL branches are wave-level (the whole wave branches when ANY \
+                "stmt {idx}: {what} condition {cond:?} is not provably wave-uniform (wrap it in `any_lane(..)` if the wave-level 'any lane' reading is intended): DSL branches are wave-level (the whole wave branches when ANY \
                  lane's condition holds), so a per-lane condition silently runs the wrong trip count / skips lanes that should run. Use wave-uniform \
                  bounds (kernel arguments, workgroup ids, readfirstlane / readlane / ballot results) and predicate the per-lane work instead (select, \
                  masked buffer offsets)"
