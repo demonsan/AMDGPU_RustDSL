@@ -347,6 +347,7 @@ pub fn pa_decode16_x(name: &str, page: i32, kt: i32, fp8: bool) -> Function {
                 }
             }
         });
+        b.wait_lds(0);
     }
     // ---- O^T += V^T P^T: 2 steps of 32 keys x 8 blocks of 16 d ----
     let vb = b.bind_i32(vbase0.clone() + ev(vr));
