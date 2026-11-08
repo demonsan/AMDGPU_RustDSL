@@ -555,6 +555,36 @@
 - 厂商 bf16 fmha_v3 没有 hd64、滑窗；hd256 只有 group 模式。
 - 厂商 MLA stage-1 在页大小 16 下与参考不符，只在页大小 1 下对拍通过。可能需要它的 metadata 约定 `[待核]`。
 
+**性能进展**（2026-11-08，同次运行，逐项 A/B，只采纳实测收益）：
+- **prefill `fmha_fwd_hd128_bf16_v3[_causal]`**，见 [`fmha/bf16v3.rs`](../crates/amdgpu-kernels/src/fmha/bf16v3.rs)。
+  - 结构：v3 栈，即 `tile::Pipeline` 的 `TwoPhaseOffset`、两组各 4 wave、每 CTA 256 行、128 key 的 tile。
+  - 采纳的改动及收益：
+    - QK 改为互相独立的累加链：+21%；
+    - 片段读取提前一组、地址基址外提：+43%；
+    - setprio ping-pong：+3.8%；
+    - v_max3：+0.8%；
+    - V 做 XOR swizzle：+2%；
+    - 后端的 `load_lds_tr_b16x2` / `pack4`（v_mov 从 1396 降到 478）：+6–7%；
+    - causal 采用厂商的 q tile 配对：8192² 从 619 提到 955 TF/s。
+  - 试过但未采纳：XCD 顺序（无增益）；调度选项 ldsink / wsink（无增益）。
+  - 对 fmha_v3 的比值：
+
+    | 形状 | 非 causal | causal |
+    |---|--:|--:|
+    | 8192² B2H32 | 0.90 | 0.89 |
+    | 2048² B4H16 | 0.84 | 0.82 |
+    | 1024² B8H16 | 0.83 | — |
+    | 4096² B1H8 | 0.76 | 0.68 |
+
+    4096² B1H8 的网格只有 64–128 个 CTA，所以比值最低。
+- **paged decode `pa_decode16_bf16_hd128_p<P>`**，见 [`fmha/decode16.rs`](../crates/amdgpu-kernels/src/fmha/decode16.rs)。
+  - 用于 G ≤ 16：每个 wave 改用 16x16x32 MFMA，消除 32 行形式下 3/4 的空算。
+  - 速度从 0.51× 提到 0.62×。
+  - block-table 查表批量化：0.37× → 0.51×。
+- **MoE stage 2**：
+  - bf16 原子累加：更慢（1528 vs 672 µs），且精度更差，未采纳。
+  - bf16 中间结果（`_h`）：快 26%，误差属 bf16 量级。作为可选项，默认仍用 fp32 中间结果。
+
 **性能待办**：
 - prefill：8 wave 两组 ping-pong（v3 骨架）、延迟 rescale、QK / softmax / PV 交叠；
 - decode：每 wave 更大的块、私有环双缓冲、页表查找提到循环外、一 tile 多页时按页 DMA；
