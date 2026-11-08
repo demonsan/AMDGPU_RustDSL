@@ -4,6 +4,24 @@
 
 验证方法：`tests/gpu/<op>_host.cpp`（`hipModuleLoad` 加载 `amdc emit --backend=own` 汇编出的 co，CPU 双精度参考，bf16 判据 = 误差 ≤ 1 bf16 ulp + 1e-6 的绝对下限，并检查输出末尾之外的字节没有被写），带宽 = 读 + 写字节 / 单次 kernel 时间（50 次连续发射的平均，工作集约 1 GB 以避开 Infinity Cache）。
 
+## 当前状态总表（以此为准；下面各节的第一版表格用的是 regular 缓存策略，数值已被「非临时访问」一节取代）
+
+流式 kernel 默认带 `nt`（`_rt` 后缀选回 regular）；流式读写的实测上限 ≈ 6.5 TB/s，下表的百分比按它算。`tools/b2_matrix.sh` 重跑全部正确性与带宽（每个 kernel 一行）。
+
+| 族 | kernel | 当前带宽 / 延迟 | 说明 |
+|---|---|---|---|
+| 逐元素 | silu_mul / gelu_tanh_mul / add_bf16 / cvt | 6.3–6.7 TB/s（97–103 %） | 与 aiter 同轮：silu_mul 1.07–1.18×，gelu_tanh_mul 1.23–1.27× |
+| 行内 | rmsnorm N = 4096 / 1000 / 200 | 6.30 / 5.91 / 5.22–5.28 TB/s | N < 512 用 wave 内分组（N = 64 / 128 / 256：6.3–6.4）；aiter N = 1000 的 1.17× |
+| 行内 | add_rmsnorm / layernorm / softmax | 5.8 / 5.35 / 5.5–6.0 TB/s | layernorm、softmax 受两遍规约 + VALU 限制（短行更低：N = 200 为 3.9 / 4.3） |
+| 量化 | per-token / group128 fp8、int8、静态 fp8、silu_mul_quant | 5.7–6.4 TB/s | 与 aiter 同轮：fp8 per-token 1.08×（N = 1000 为 1.45×）、group128 1.10×、silu_mul_quant 1.11×、int8 1.04–1.26×；静态 fp8 0.97× |
+| 反量化 | dequant fp8 → bf16（static / token / group128） | 6.0–6.4 TB/s（N = 1000：5.3） | scalef32 转换只吃 2 的幂 scale，一般 scale 用显式乘法 |
+| RoPE / cache | RoPE neox / gptj（含部分旋转） | 6.3–6.8 TB/s | H = 1 的情形仍只有 22 % |
+| RoPE / cache | KV-cache 写（flash / vLLM 分块） | 5.8 / 0.9–1.5 TB/s | 分块布局的 value 是 2 字节散写，regular 策略，不是流式 |
+| MoE | topk_softmax（含 renorm） | E = 128, K = 8：T = 65536 为 21 µs（DPP 归约后 +9–19 %） | 小 T 比 aiter 快 1.6–1.8×，大 T 0.87–0.92× |
+| MoE | moe_sorting（单 block / 多 block 原子 / 多 block 稳定顺序） | 10–18 µs（≤ 几千对）/ 31 µs（26 万对）/ 105 µs（稳定，26 万对） | 格式与 aiter `moe_sorting` 一致，附 `tile_start` |
+| 采样 | argmax / 温度采样 / top-k + top-p | 4.3 TB/s / 0.7–1.3 TB/s 等效 / 130–240 µs 每行 | 覆盖版本；top-k / top-p 用阈值二分，不排序 |
+
+未做 / 已知差距：H = 1 RoPE（一个 wave 多个 token）；layernorm / softmax 的短行与 N = 400–511 的行布局；采样的性能版本（直方图 top-k / top-p，一行多 block）；> 4 GiB 的 cache / 张量（要 64 位寻址，B1）；vLLM 分块 cache 的整行转置写；aiter 同轮对比没有覆盖 layernorm、row softmax、RoPE、cache、moe_sorting、采样（无法脱离 torch 独立编译）。
 ## 流式逐元素（模板 T1）
 
 | kernel | 语义 | 配置 | VGPR | 带宽（GB/s，≈1 GB 流量） | 占 roofline（6.0 TB/s） |
