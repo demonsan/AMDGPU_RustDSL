@@ -50,6 +50,18 @@ int main(int argc, char** argv) {
     for (auto& x : kc) x = tobf(N(rng));
     for (auto& x : vc) x = tobf(N(rng));
     for (auto& x : q) x = tobf(N(rng));
+    // FP8KV=1 (pa_decode16_fp8_hd128_p<P>): fp8 e4m3 KV with per-tensor scales k 0.25 / v 0.5; the reference sees code * scale (exact in bf16)
+    const bool fp8kv = envi("FP8KV", 0) != 0;
+    const float ksc = 0.25f, vsc = 0.5f;
+    std::vector<uint8_t> kq, vq;
+    if (fp8kv) {
+        auto e4 = [](uint8_t c) { int s = c >> 7, e = (c >> 3) & 15, m = c & 7; float v = e == 0 ? std::ldexp((float)m, -9) : std::ldexp(1.0f + m / 8.0f, e - 7); return s ? -v : v; };
+        kq.resize(kc.size()); vq.resize(vc.size());
+        for (size_t i = 0; i < kc.size(); i++) {
+            uint8_t ck = (uint8_t)(((rng() % 2) << 7) | ((4 + rng() % 7) << 3) | (rng() % 8)), cv = (uint8_t)(((rng() % 2) << 7) | ((4 + rng() % 7) << 3) | (rng() % 8));
+            kq[i] = ck; vq[i] = cv; kc[i] = tobf(e4(ck) * ksc); vc[i] = tobf(e4(cv) * vsc);
+        }
+    }
     auto kidx = [&](int b, int key, int hk, int d) { return (((size_t)bt[(size_t)b * maxp + key / P] * P + key % P) * HK + hk) * D + d; };
     const float scale = 1.0f / std::sqrt((float)D);
     std::vector<uint16_t> out((size_t)B * H * D);
@@ -71,9 +83,10 @@ int main(int argc, char** argv) {
         hipModule_t cm;
         HC(hipModuleLoad(&cm, argv[3]));
         HC(hipModuleGetFunction(&cfn, cm, "attn_combine_bf16_hd128"));
-        void *dk = dev(kc), *dv = dev(vc), *dpo, *dpl;
+        void *dk = fp8kv ? (void*)dev(kq) : (void*)dev(kc), *dv = fp8kv ? (void*)dev(vq) : (void*)dev(vc), *dpo, *dpl;
         HC(hipMalloc(&dpo, (size_t)B * H * NS * D * 4)); HC(hipMalloc(&dpl, (size_t)B * H * NS * 4));
-        a.assign(16 * 13, 0);
+        a.assign(16 * (fp8kv ? 15 : 13), 0);
+        if (fp8kv) { memcpy(&a[208], &ksc, 4); memcpy(&a[224], &vsc, 4); }
         auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
         auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
         P_(0, dpo); P_(1, dq); P_(2, dk); P_(3, dv); P_(4, dbt); P_(5, dcl); memcpy(&a[96], &scale, 4); U(7, H); U(8, HK); U(9, maxp); U(10, npages); U(11, S); P_(12, dpl);
