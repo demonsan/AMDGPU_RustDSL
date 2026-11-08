@@ -160,6 +160,12 @@ impl PipeBody for Body<'_> {
         self.s = vars[6..10].to_vec();
     }
     fn v_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
+        if std::env::var("EXP_NOSM").is_ok() {
+            // (sensitivity) P = raw S bits packed, no softmax
+            let s = self.s.clone();
+            self.p = (0..32usize).map(|i| { let x = b.frag16_lane(Opnd::Var(s[i / 8]), (2 * (i % 8)) as u8); b.bitcast_i32(x) }).collect();
+            return;
+        }
         if self.prio {
             b.set_prio(0);
         }
@@ -246,8 +252,10 @@ impl PipeBody for Body<'_> {
         if self.prio {
             b.set_prio(1);
         }
-        self.pv(b, &t.cur);
-        if t.staged {
+        if std::env::var("EXP_NOPV").is_err() {
+            self.pv(b, &t.cur);
+        }
+        if t.staged && std::env::var("EXP_NOQK").is_err() {
             let s = self.s.clone();
             self.qk(b, &t.next, Some(&s));
         }
