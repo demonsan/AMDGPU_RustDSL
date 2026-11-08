@@ -204,3 +204,30 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 | `sample_bf16_v32000`，B = 16384 | 60 | 834 µs | 1258 GB/s |
 
 结论：argmax 约为流式上限的 60–65 %（每行只有一个 block 的 16 个 wave，归约与 barrier 的延迟没有被其他行遮盖）；采样是三遍 + 扫描 + `exp`，VALU 与延迟受限，只有 argmax 的 1/3–1/6。没有与 aiter 的同轮对比（`sample_kernels.cu` 的入口依赖 torch 的随机数 / 张量约定）。待做：top-k / top-p 过滤（按阈值二分，不排序）、每个 block 处理多行或把行拆给多个 block 来遮盖归约延迟、DPP 行操作（A4）。
+
+## MoE 排序：多 block 版本与确定性（稳定）顺序
+
+`moe/multi.rs`：输出格式与单 block 的 `moe_sorting_e<E>_k<K>_b<BM>` 完全相同，用于路由对很多的情形，三个 kernel 共用一块 workspace `ws`（u32 `[E][64]`，第 e 行 = 专家 e 在至多 G ≤ 64 个 block 里的计数 / 起点）：
+
+1. `moe_count_e<E>_k<K>`（grid G，1024 线程）：block g 数自己那一段路由对（LDS 原子直方图），写 `ws[e][g]`。
+2. `moe_scan_e<E>_k<K>_b<BM>`（grid 1）：每个专家对 G 个 block 求和；padded 前缀扫描；然后 `ws[e][g] = 专家 e 的补齐起点 + 之前各 block 的对数`；同时写 `tile_start`、`num_valid_ids`、`sorted_expert_ids` 和补齐 / 尾部哨兵。
+3. `moe_scatter_e<E>_k<K>_b<BM>`（grid G）：block g 放自己的对：位置 = `ws[e][g]` + LDS 游标（`ds_add_rtn_u32`）；block 之间的布局是确定的，block 内同一专家的顺序是原子到达顺序。
+3b. `moe_scatter_ord_e<E>_k<K>_b<BM>`：**确定性（稳定）版本**：每个专家的对按 (token, slot) 升序排列，与 token 顺序的计数排序一致。每 1024 个相邻的对为一块，块按顺序处理；块内每个 wave 用 `ballot` / `mbcnt`（B2）匹配相同专家：在 wave 内取 rank（比自己早且同专家的 lane 数）和每个专家的计数，16 个 wave 的计数在 LDS 里按专家做前缀（一个线程一个专家），再推进该专家的游标。
+
+主机测试 `tests/gpu/moe_multi_host.cpp`（`ORDERED=1` 同时逐项检查稳定顺序；其余检查同单 block 版：每个专家组的 (packed id, 权重) 多重集、补齐、尾部哨兵、`tile_start`、`num_valid_ids`、每个 tile 的专家号、输出末尾之外不被写，含倾斜分布与无效专家号），E ∈ {64, 128, 256}，M 4097 … 262144，`bad = 0`。三个 kernel 的 `gpu_verify --strict` 均为 0 错误。耗时（三次启动之和，G = min(64, ⌈对数 / 4096⌉)）：
+
+| 形状 | 路由对数 | 单 block（上一节） | 多 block（原子） | 多 block（稳定，ORDERED） |
+|---|--:|--:|--:|--:|
+| E = 128, K = 8, BM = 32，M = 4097 | 32776 | ≈ 52 µs（E = 256 同量级） | 20.6 µs | 81.9 µs |
+| E = 128, K = 8, BM = 32，M = 20000（倾斜） | 160000 | — | 23.7 µs | 67.8 µs |
+| E = 256, K = 8, BM = 128，M = 32768 | 262144 | ≈ 400 µs（外推） | 31.4 µs | 104.9 µs |
+| E = 256, K = 8, BM = 128，M = 262144 | 2097152 | — | 98.0 µs | 666.9 µs |
+| E = 64, K = 2, BM = 16，M = 100000（倾斜） | 200000 | — | 26.7 µs | 66.0 µs |
+
+三次启动的固定开销约 20 µs（所以小 M 仍应用单 block 版）。稳定版慢 3–7 倍（每个 1024 对的块有 4 次 barrier，wave 内按不同专家逐个匹配）；原子版的 block 内顺序不确定但布局整体确定。限制：G ≤ 64（`ws` 一行 64 个槽）、E ≤ 512。**踩到的坑**：`read_lane` 只接受常量 lane，动态广播要用 `bpermute`；LDS 存储不能像 buffer 存储那样用越界偏移丢弃，非活跃 lane 要写到一个哑单元；`gpu_verify` 对 buffer 存储要求描述符大小是真实的分配大小（`0xffffffff` 的描述符被拒绝），所以 scatter 也要带 `BM`。
+
+## 采样：top-k / top-p 过滤（`sample_topkp_bf16_v<V>`）
+
+在 `sample_bf16_v<V>` 的基础上加 top-k 与 top-p（nucleus）：ABI 在 inv_temperature @24 之后多 `top_p`（f32 @28，1.0 = 关）和 `top_k`（i32 @32，0 = 关），B 移到 @36。语义：先取 top-k（并列在第 k 大值上的都保留），再在保留集合上按 top-p 取最小的前缀（累计概率 ≥ p，并列同样保留），然后在保留集合内重新归一化做逆 CDF 采样（下标升序）。**不排序**：在 logit 空间（缩放后的 `x`）对阈值做二分，每次探测是对整行的一遍（保留元素的个数和 `exp(x − m)` 之和，两次 block 归约）；top-k 找"保留个数 ≥ k 的最大阈值"，top-p 找"保留质量 ≥ p · S_k 的最大阈值"（S_k 是 top-k 之后的质量），各 26 次迭代（范围 [m − 80, m + 1]，分辨率约 1.6e-6，远小于缩放后 bf16 logit 的最小间隔，所以集合与精确集合一致）；用 kernarg 控制迭代数，关掉的那一项不做任何探测。最终阈值 = max(thr_k, thr_p)，第 2、3 遍把不满足 `x ≥ thr` 的元素的分子置 0。
+
+主机测试（`sampling_host` 的 top_k / top_p 参数；CPU 参考按上面的集合语义用排序实现）：V = 32000：关闭过滤（20.4 µs / 行）、k = 50、p = 0.9、k = 40 且 p = 0.8、k = 1，V = 1000（k = 20, p = 0.95）和 V = 128256（k = 100, p = 0.9），全部 `bad = 0`；`gpu_verify --strict` 0 错误，72 VGPR。耗时（每行一个 block，单行延迟）：V = 32000：仅 k 或仅 p 132 µs，k 与 p 同时 243 µs；V = 128256 两者同时 819 µs；B = 4096 行、V = 32000、k = 50 且 p = 0.9：4.33 ms 总计。这是"覆盖"版本，不是性能版本：延迟被 26 + 26 遍整行扫描主导（每遍 2 次 block 归约 + barrier）。待做：用阈值的直方图（一遍分 256 个桶）把迭代数降到 3–4 遍，或把每行拆给多个 block。

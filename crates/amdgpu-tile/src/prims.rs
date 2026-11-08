@@ -171,3 +171,25 @@ pub fn rsqrt_f32(b: &mut FnBuilder, x: ValueId) -> ValueId {
     let e = b.mul_f32(l, h);
     b.exp2_f32(e)
 }
+
+/// Opt-in (`AMDC_DPP_REDUCE=1`): the batch-2 row / quant / topk / sampling kernels use the DPP + lane-swap all-reduces of `tileop` instead of the LDS exchange of `wave_reduce`.
+pub fn dpp_reduce() -> bool {
+    std::env::var("AMDC_DPP_REDUCE").map(|v| v == "1").unwrap_or(false)
+}
+
+fn dpp_op(op: RedOp) -> amdgpu_dsl::DppAluOp {
+    match op {
+        RedOp::Sum => amdgpu_dsl::DppAluOp::AddF32,
+        RedOp::Max => amdgpu_dsl::DppAluOp::MaxF32,
+    }
+}
+
+/// `wave_reduce` without the LDS: six DPP / lane-swap instructions (`tileop::wave_allreduce`).
+pub fn wave_reduce_dpp(b: &mut FnBuilder, op: RedOp, x: ValueId) -> ValueId {
+    crate::tileop::wave_allreduce(b, dpp_op(op), x)
+}
+
+/// All-reduce over aligned groups of `l` lanes with DPP (`tileop::group_allreduce`).
+pub fn group_reduce_dpp(b: &mut FnBuilder, op: RedOp, x: ValueId, l: i64) -> ValueId {
+    crate::tileop::group_allreduce(b, dpp_op(op), x, l)
+}

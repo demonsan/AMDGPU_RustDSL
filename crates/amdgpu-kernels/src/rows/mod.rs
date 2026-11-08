@@ -10,7 +10,7 @@
 pub mod quant;
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{bf16x8_to_f32, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
+use amdgpu_tile::prims::{bf16x8_to_f32, dpp_reduce, lane_reduce, rsqrt_f32, wave_reduce, wave_reduce_dpp, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +35,15 @@ pub fn by_name(name: &str) -> Option<Function> {
     };
     let n: i64 = rest.parse().ok()?;
     (n % 8 == 0 && (8..=8192).contains(&n)).then(|| row_kernel(name, n, op))
+}
+
+/// Wave-wide reduction: the LDS exchange (`wave_reduce`) or, with `AMDC_DPP_REDUCE=1`, the DPP + lane-swap all-reduce.
+fn wr(b: &mut FnBuilder, op: RedOp, x: ValueId, scratch: &amdgpu_tile::shared::PrivRef, off: i32, gen: i32, lane: &Lane) -> ValueId {
+    if dpp_reduce() {
+        wave_reduce_dpp(b, op, x)
+    } else {
+        wave_reduce(b, op, x, scratch, off, gen, lane)
+    }
 }
 
 fn sel(b: &mut FnBuilder, cond: ValueId, x: ValueId, y: ValueId) -> ValueId {
@@ -186,7 +195,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let s = lane_reduce(b, RedOp::Sum, &sq);
                     part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
                 }
-                let tot = wave_reduce(b, RedOp::Sum, part.unwrap(), &me, 0, gen0, &lane);
+                let tot = wr(b, RedOp::Sum, part.unwrap(), &me, 0, gen0, &lane);
                 let mean = b.mul_f32(tot, inv_n);
                 let me_eps = b.add_f32(mean, eps.unwrap());
                 let inv = rsqrt_f32(b, me_eps);
@@ -209,7 +218,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let s = lane_reduce(b, RedOp::Sum, &v);
                     part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
                 }
-                let tot = wave_reduce(b, RedOp::Sum, part.unwrap(), &me, 0, gen0, &lane);
+                let tot = wr(b, RedOp::Sum, part.unwrap(), &me, 0, gen0, &lane);
                 let mean = b.mul_f32(tot, inv_n);
                 let mut part2: Option<ValueId> = None;
                 for i in 0..nld {
@@ -223,7 +232,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let s = lane_reduce(b, RedOp::Sum, &sq);
                     part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
                 }
-                let tot2 = wave_reduce(b, RedOp::Sum, part2.unwrap(), &me, 64, gen1, &lane);
+                let tot2 = wr(b, RedOp::Sum, part2.unwrap(), &me, 64, gen1, &lane);
                 let var = b.mul_f32(tot2, inv_n);
                 let ve = b.add_f32(var, eps.unwrap());
                 let inv = rsqrt_f32(b, ve);
@@ -251,7 +260,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let s = lane_reduce(b, RedOp::Max, &v);
                     part = Some(match part { None => s, Some(p) => b.max_f32(p, s) });
                 }
-                let mx = wave_reduce(b, RedOp::Max, part.unwrap(), &me, 0, gen0, &lane);
+                let mx = wr(b, RedOp::Max, part.unwrap(), &me, 0, gen0, &lane);
                 let l2e = b.c_f32(std::f32::consts::LOG2_E);
                 let mut ex: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
                 let mut part2: Option<ValueId> = None;
@@ -268,7 +277,7 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
                     ex.push(e);
                 }
-                let tot = wave_reduce(b, RedOp::Sum, part2.unwrap(), &me, 64, gen1, &lane);
+                let tot = wr(b, RedOp::Sum, part2.unwrap(), &me, 64, gen1, &lane);
                 let inv = b.rcp_f32(tot);
                 for i in 0..nld {
                     let mut y = [0; 8];
