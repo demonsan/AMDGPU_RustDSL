@@ -80,7 +80,7 @@ fn block_reduce(b: &mut FnBuilder, op: RedOp, x: ValueId, wave: ValueId, lane: V
 
 pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
     let nchunk = v / 8;
-    let c = ((nchunk + (T as i64) - 1) / T as i64) as i32;   // chunks per thread
+    let c = ((((nchunk + (T as i64) - 1) / T as i64) as i32 + 3) / 4) * 4;   // chunks per thread (a multiple of 4: the passes take 4 chunks per iteration)
     let mut fb = FnBuilder::new(name, T as u32);
     fb.compile_profile(CompileProfile::Default);
     let b = &mut fb;
@@ -124,13 +124,11 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
     let big = b.c_f32(-1.0e9);
     // the passes are runtime loops of 4 chunks per iteration: the row is read once per pass (2nd / 3rd read from L2); a 1024-thread block can hold <= 128 VGPRs per thread, so
     // the row cannot stay in registers for a 128 K vocabulary, and unrolled passes would have all their loads hoisted to the top
-    let c4 = ((c + 3) / 4) as i32;                                         // loop iterations
+    let c4 = c / 4;                                                        // loop iterations
     // chunk of this thread: `coalesced` (pass 1: chunk = 1024 * ci + tid) or contiguous (passes 2 / 3: chunk = tid * C + ci, so a thread's elements ascend in index order)
     let chunk_of = |b: &mut FnBuilder, ci: ValueId, coalesced: bool| -> (ValueId, ValueId) {
         let ch = if coalesced { b.bind_i32((ev(ci) << 10) + ev(tid)) } else { b.bind_i32(ev(tid) * c + ev(ci)) };
-        let in_c = b.let_(Op::CmpLtI32(Opnd::Val(ci), Opnd::I32(c)));
-        let in_v = b.let_(Op::CmpLtI32(Opnd::Val(ch), Opnd::I32(nchunk as i32)));
-        let ok = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_c), a: Opnd::Val(in_v), b: Opnd::I32(0) });
+        let ok = b.let_(Op::CmpLtI32(Opnd::Val(ch), Opnd::I32(nchunk as i32)));
         (ch, ok)
     };
     // ---- pass 1 (coalesced): the lowest-index maximum
@@ -294,10 +292,10 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
                     let pm = sel_f32(b, ok, p, zero);
                     acc = b.add_f32(acc, pm);
                     let ge = b.cmp(CmpPred::Ge, CmpTy::F32, acc, target);
-                    let hit = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ge), a: Opnd::Val(ok), b: Opnd::I32(0) });
                     let idx_i = b.bind_i32(ev(ch) * (-8) - k as i32);
                     let nf = b.un(amdgpu_dsl::UnOp::CvtF32I32, idx_i);
-                    let cand_k = sel_f32(b, hit, nf, big);
+                    let c1 = sel_f32(b, ge, nf, big);
+                    let cand_k = sel_f32(b, ok, c1, big);
                     found = b.max_f32(found, cand_k);
                 }
             }
