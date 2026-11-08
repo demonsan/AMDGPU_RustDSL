@@ -78,7 +78,8 @@ fn defs_uses(line: &str) -> (Vec<Slot>, Vec<Slot>) {
         let before = &rest[..i];
         let end = rest[i..].find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')).map(|e| e + i).unwrap_or(rest.len());
         let slots = slots_of(&rest[i..end]);
-        if before.ends_with("implicit-def ") {
+        // `implicit-def dead $scc` is a def too (reading it as a use made SCC live into loops that build buffer descriptors)
+        if before.ends_with("implicit-def ") || before.ends_with("implicit-def dead ") {
             defs.extend(slots);
         } else {
             uses.extend(slots);
