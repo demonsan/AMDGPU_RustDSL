@@ -8,6 +8,7 @@ pub mod gemm;
 pub mod mlp;
 pub mod moe;
 pub mod cache;
+pub mod conv;
 pub mod dequant;
 pub mod eltwise;
 pub mod norm;
