@@ -80,7 +80,7 @@ fn block_reduce(b: &mut FnBuilder, op: RedOp, x: ValueId, wave: ValueId, lane: V
 
 pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
     let nchunk = v / 8;
-    let c = ((nchunk + (T as i64) - 1) / T as i64) as i32;   // chunks per thread
+    let c = ((((nchunk + (T as i64) - 1) / T as i64) as i32 + 3) / 4) * 4;   // chunks per thread (a multiple of 4: the passes take 4 chunks per iteration)
     let mut fb = FnBuilder::new(name, T as u32);
     fb.compile_profile(CompileProfile::Default);
     let b = &mut fb;
@@ -118,56 +118,60 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
     let lane = b.bind_i32(ev(tid) & 63);
     let r_l = { let n = b.bind_i32(ev(b_v) * (2 * v) as i32); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_l, n) };
     let r_o = { let n = b.bind_i32(ev(b_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_out, n) };
-    // this thread's chunks: consecutive, ascending
-    let first = b.bind_i32(ev(tid) * c);                         // first chunk index
     let rowb = b.bind_i32(ev(row) * (2 * v) as i32);
     let neg = b.c_f32(NEG);
     let zero = b.c_f32(0.0);
-    // the row is read once per pass (the 2nd / 3rd read come from L2): holding it in registers would need 160+ VGPRs for a 128 K vocabulary, which a 1024-thread block cannot have (<= 128)
-    let oks: Vec<ValueId> = (0..c)
-        .map(|ci| {
-            let ch = b.bind_i32(ev(first) + ci);
-            b.let_(Op::CmpLtI32(Opnd::Val(ch), Opnd::I32(nchunk as i32)))
-        })
-        .collect();
-    let load_all = |b: &mut FnBuilder| -> Vec<ValueId> {
-        (0..c)
-            .map(|ci| {
-                let ch = b.bind_i32(ev(first) + ci);
-                let off = b.bind_i32(ev(rowb) + (ev(ch) << 4));
-                b.buffer_load_c(r_l, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT)
-            })
-            .collect()
+    let big = b.c_f32(-1.0e9);
+    // the passes are runtime loops of 4 chunks per iteration: the row is read once per pass (2nd / 3rd read from L2); a 1024-thread block can hold <= 128 VGPRs per thread, so
+    // the row cannot stay in registers for a 128 K vocabulary, and unrolled passes would have all their loads hoisted to the top
+    let c4 = c / 4;                                                        // loop iterations
+    // chunk of this thread: `coalesced` (pass 1: chunk = 1024 * ci + tid) or contiguous (passes 2 / 3: chunk = tid * C + ci, so a thread's elements ascend in index order)
+    let chunk_of = |b: &mut FnBuilder, ci: ValueId, coalesced: bool| -> (ValueId, ValueId) {
+        let ch = if coalesced { b.bind_i32((ev(ci) << 10) + ev(tid)) } else { b.bind_i32(ev(tid) * c + ev(ci)) };
+        let ok = b.let_(Op::CmpLtI32(Opnd::Val(ch), Opnd::I32(nchunk as i32)));
+        (ch, ok)
     };
-    // the scaled values of chunk ci (invalid chunks: `fill`)
-    let vals = |b: &mut FnBuilder, frag: ValueId, ci: usize, fill: ValueId| -> [ValueId; 8] {
-        let mut x = bf16x8_to_f32(b, frag);
-        if let Some(it) = inv_t {
-            for k in 0..8 {
-                x[k] = b.mul_f32(x[k], it);
+    // ---- pass 1 (coalesced): the lowest-index maximum
+    let res1 = b.loop_(&[(DType::F32, Opnd::F32(NEG)), (DType::I32, Opnd::I32(0)), (DType::I32, Opnd::I32(0))], |b, vars| {
+        let (vb, vi, vit) = (vars[0], vars[1], vars[2]);
+        let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::I32(c4)));
+        b.break_if(done);
+        let mut best = b.let_(Op::AddF32(Opnd::Var(vb), Opnd::F32(0.0)));
+        let mut bidx = b.let_(Op::AddI32(Opnd::Var(vi), Opnd::I32(0)));
+        let mut loaded = Vec::new();
+        for u in 0..4i32 {
+            let ci = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
+            let ci = b.bind_i32(ev(ci) * 4 + u);
+            let (ch, ok) = chunk_of(b, ci, true);
+            let off = b.bind_i32(ev(rowb) + (ev(ch) << 4));
+            let frag = b.buffer_load_c(r_l, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+            loaded.push((ch, ok, frag));
+        }
+        for (ch, ok, frag) in loaded {
+            let mut x = bf16x8_to_f32(b, frag);
+            if let Some(it) = inv_t {
+                for k in 0..8 {
+                    x[k] = b.mul_f32(x[k], it);
+                }
+            }
+            for k in 0..8usize {
+                let xk = sel_f32(b, ok, x[k], neg);
+                let gt = b.cmp(CmpPred::Gt, CmpTy::F32, xk, best);
+                let idx = b.bind_i32((ev(ch) << 3) + k as i32);
+                best = sel_f32(b, gt, xk, best);
+                bidx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt), a: Opnd::Val(idx), b: Opnd::Val(bidx) });
             }
         }
-        for k in 0..8 {
-            x[k] = sel_f32(b, oks[ci], x[k], fill);
-        }
-        x
-    };
-    let frags = load_all(b);
-    // the first (lowest-index) maximum of this thread
-    let mut best = neg;
-    let mut bidx = b.bind_i32(ev(first) << 3);
-    for ci in 0..c as usize {
-        let x = vals(b, frags[ci], ci, neg);
-        for k in 0..8usize {
-            let gt = b.cmp(CmpPred::Gt, CmpTy::F32, x[k], best);
-            let idx = b.bind_i32((ev(first) << 3) + (ci * 8 + k) as i32);
-            best = sel_f32(b, gt, x[k], best);
-            bidx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt), a: Opnd::Val(idx), b: Opnd::Val(bidx) });
-        }
-    }
+        b.set_var(vb, best);
+        b.set_var(vi, bidx);
+        let nx = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(1)));
+        b.set_var(vit, nx);
+        (vb, vi)
+    });
+    let best = b.let_(Op::AddF32(Opnd::Var(res1.0), Opnd::F32(0.0)));
+    let bidx = b.let_(Op::AddI32(Opnd::Var(res1.1), Opnd::I32(0)));
     let m = block_reduce(b, RedOp::Max, best, wave, lane, 0, ws, blk, 0);
     // the lowest index among the threads holding the maximum: the maximum of the negated indices
-    let big = b.c_f32(-1.0e9);
     let at_max = b.cmp(CmpPred::Eq, CmpTy::F32, best, m);
     let nidx_i = b.bind_i32(ev(bidx) * (-1));
     let nidx = b.un(amdgpu_dsl::UnOp::CvtF32I32, nidx_i);
@@ -178,27 +182,41 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
     let result = if !sample {
         argmax
     } else {
-        // softmax numerators (masked -> 0), the thread sums, the block prefix scan, the first element whose cumulative value reaches u * total
         let l2e = b.c_f32(std::f32::consts::LOG2_E);
-        let frags2 = load_all(b);
-        let numer = |b: &mut FnBuilder, frag: ValueId, ci: usize| -> [ValueId; 8] {
-            let x = vals(b, frag, ci, neg);
-            let mut e = [0; 8];
-            for k in 0..8 {
-                let t = b.sub_f32(x[k], m);
-                let u = b.mul_f32(t, l2e);
-                let p = b.exp2_f32(u);
-                e[k] = sel_f32(b, oks[ci], p, zero);
+        // ---- pass 2 (contiguous): the thread sum of exp(x - m)
+        let st_v = b.loop_(&[(DType::F32, Opnd::F32(0.0)), (DType::I32, Opnd::I32(0))], |b, vars| {
+            let (vs, vit) = (vars[0], vars[1]);
+            let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::I32(c4)));
+            b.break_if(done);
+            let mut acc = b.let_(Op::AddF32(Opnd::Var(vs), Opnd::F32(0.0)));
+            let mut loaded = Vec::new();
+            for u in 0..4i32 {
+                let ci = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
+                let ci = b.bind_i32(ev(ci) * 4 + u);
+                let (ch, ok) = chunk_of(b, ci, false);
+                let off = b.bind_i32(ev(rowb) + (ev(ch) << 4));
+                let frag = b.buffer_load_c(r_l, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+                loaded.push((ok, frag));
             }
-            e
-        };
-        let mut st = zero;
-        for ci in 0..c as usize {
-            let e = numer(b, frags2[ci], ci);
-            for k in 0..8 {
-                st = b.add_f32(st, e[k]);
+            for (ok, frag) in loaded {
+                let mut x = bf16x8_to_f32(b, frag);
+                for k in 0..8usize {
+                    if let Some(it) = inv_t {
+                        x[k] = b.mul_f32(x[k], it);
+                    }
+                    let t = b.sub_f32(x[k], m);
+                    let u = b.mul_f32(t, l2e);
+                    let p = b.exp2_f32(u);
+                    let pm = sel_f32(b, ok, p, zero);
+                    acc = b.add_f32(acc, pm);
+                }
             }
-        }
+            b.set_var(vs, acc);
+            let nx = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(1)));
+            b.set_var(vit, nx);
+            vs
+        });
+        let st = b.let_(Op::AddF32(Opnd::Var(st_v), Opnd::F32(0.0)));
         // inclusive scan of the thread sums (Hillis-Steele in LDS)
         let tid4 = b.bind_i32(ev(tid) << 2);
         let a0 = b.bind_i32(ev(tid4) + sc0);
@@ -245,23 +263,50 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
         let one_m = b.c_f32(0.99999994);
         let uc = b.bin(amdgpu_dsl::BinOp::MinF32, uf, one_m);
         let target = b.mul_f32(uc, total);
-        // first element (in this thread's order) whose cumulative value reaches the target; -(index) so that a Max picks the lowest index
-        let mut acc = excl;
-        let mut found_neg = big;   // -1e9 = not found
-        let frags3 = load_all(b);
-        for ci in 0..c as usize {
-            let e = numer(b, frags3[ci], ci);
-            for k in 0..8usize {
-                acc = b.add_f32(acc, e[k]);
-                let ge = b.cmp(CmpPred::Ge, CmpTy::F32, acc, target);
-                let idx_i = b.bind_i32((ev(first) << 3) + (ci * 8 + k) as i32);
-                let nf_i = b.bind_i32(ev(idx_i) * (-1));
-                let nf = b.un(amdgpu_dsl::UnOp::CvtF32I32, nf_i);
-                // every element from the first hit on satisfies `acc >= target`; the first hit has the largest negated index of the thread
-                let cand_k = sel_f32(b, ge, nf, big);
-                found_neg = b.max_f32(found_neg, cand_k);
+        // ---- pass 3 (contiguous): the first element whose cumulative value reaches the target; -(index), so that a Max picks the lowest index
+        let fnd = b.loop_(&[(DType::F32, Opnd::F32(-1.0e9)), (DType::F32, Opnd::F32(0.0)), (DType::I32, Opnd::I32(0))], |b, vars| {
+            let (vf, va, vit) = (vars[0], vars[1], vars[2]);
+            let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::I32(c4)));
+            b.break_if(done);
+            let mut found = b.let_(Op::AddF32(Opnd::Var(vf), Opnd::F32(0.0)));
+            let ca = b.let_(Op::AddF32(Opnd::Var(va), Opnd::F32(0.0)));
+            let mut acc = b.add_f32(ca, excl);
+            let mut loaded = Vec::new();
+            for u in 0..4i32 {
+                let ci = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
+                let ci = b.bind_i32(ev(ci) * 4 + u);
+                let (ch, ok) = chunk_of(b, ci, false);
+                let off = b.bind_i32(ev(rowb) + (ev(ch) << 4));
+                let frag = b.buffer_load_c(r_l, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+                loaded.push((ch, ok, frag));
             }
-        }
+            for (ch, ok, frag) in loaded {
+                let mut x = bf16x8_to_f32(b, frag);
+                for k in 0..8usize {
+                    if let Some(it) = inv_t {
+                        x[k] = b.mul_f32(x[k], it);
+                    }
+                    let t = b.sub_f32(x[k], m);
+                    let u = b.mul_f32(t, l2e);
+                    let p = b.exp2_f32(u);
+                    let pm = sel_f32(b, ok, p, zero);
+                    acc = b.add_f32(acc, pm);
+                    let ge = b.cmp(CmpPred::Ge, CmpTy::F32, acc, target);
+                    let idx_i = b.bind_i32(ev(ch) * (-8) - k as i32);
+                    let nf = b.un(amdgpu_dsl::UnOp::CvtF32I32, idx_i);
+                    let c1 = sel_f32(b, ge, nf, big);
+                    let cand_k = sel_f32(b, ok, c1, big);
+                    found = b.max_f32(found, cand_k);
+                }
+            }
+            let ncum = b.sub_f32(acc, excl);
+            b.set_var(vf, found);
+            b.set_var(va, ncum);
+            let nx = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(1)));
+            b.set_var(vit, nx);
+            vf
+        });
+        let found_neg = b.let_(Op::AddF32(Opnd::Var(fnd), Opnd::F32(0.0)));
         let mn = block_reduce(b, RedOp::Max, found_neg, wave, lane, 0, ws, blk, 2);
         // fallback (rounding: nothing reached the target): the argmax
         let half = b.c_f32(-0.5e9);
