@@ -225,6 +225,12 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
     let vars = b.begin_loop(&inits);
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..3 + nblk].to_vec();
+    if D == 256 {
+        // 128 accumulator dwords: in AGPRs (the register file holds Q^T, S and P in VGPRs)
+        for v in &ov {
+            b.pin_agpr(*v);
+        }
+    }
     let itx = amdgpu_dsl::varx(it);
     for slot in 0..2i32 {
         let tile = b.bind_i32((itx.clone() << 1) + slot + ev(kt0));
