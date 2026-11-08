@@ -797,6 +797,37 @@ def check_atomic_p1(planes, out):
     report("lds min_i32 returns: old values (<= 0x7fffffff, final the min)", all(s32(v) >= s32(ctr[10 + l % 2]) for l, v in enumerate(mins)))
     return ok
 
+# ---------------------------------------------------------------- probe_lane_p1
+def gen_lane_p1():
+    rnd = random.Random(41)
+    v = [rnd.getrandbits(32) for _ in range(LANES)]
+    v[9] = 0
+    return [v]
+
+def check_lane_p1(planes, out):
+    x = planes[0]
+    lo = sum(1 << l for l in range(32) if x[l] & 1)
+    hi = sum(1 << (l - 32) for l in range(32, 64) if x[l] & 1)
+    full = lo | (hi << 32)
+    ffbl = lambda v: (v & -v).bit_length() - 1 if v else 0xFFFFFFFF
+    ffbh = lambda v: 32 - v.bit_length() if v else 0xFFFFFFFF
+    perm = [None] * 64
+    for l in range(64):
+        perm[(l + 5) % 64] = x[l]
+    want = [
+        [x[5]] * 64, [x[63]] * 64, [x[7] if l == 3 else l for l in range(64)], [lo] * 64, [hi] * 64, list(range(64)),
+        [bin(full & ((1 << l) - 1)).count("1") for l in range(64)], [bin(v).count("1") for v in x], [ffbl(v) for v in x], [ffbh(v) for v in x],
+        [x[(7 * l) % 64] for l in range(64)], perm, [x[l ^ 1] for l in range(64)], [x[(l & ~3) + (3 - l % 4)] for l in range(64)]]
+    names = ["read_lane 5", "read_lane 63", "write_lane 3", "ballot lo", "ballot hi", "mbcnt(-1,-1)", "mbcnt(ballot)", "bcnt", "ffbl", "ffbh",
+             "bpermute", "permute", "swizzle xor 1", "swizzle quad_perm"]
+    ok = True
+    for k, (n, w) in enumerate(zip(names, want)):
+        got = out[k * LANES:(k + 1) * LANES]
+        good = list(got) == [v & 0xFFFFFFFF for v in w]
+        ok &= good
+        print(("ok   " if good else "FAIL ") + n + ("" if good else f": lanes 0..3 got {[hex(v) for v in got[:4]]} want {[hex(v & 0xFFFFFFFF) for v in w[:4]]}"))
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -806,6 +837,7 @@ PROBES = {
     "probe_tr_b16_p1": (gen_tr_b16_p1, check_tr_b16_p1, 1024),
     "probe_tr_b16_mfma": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
     "probe_atomic_p1": (gen_atomic_p1, check_atomic_p1, 7 * LANES * 4),
+    "probe_lane_p1": (gen_lane_p1, check_lane_p1, 14 * LANES * 4),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
