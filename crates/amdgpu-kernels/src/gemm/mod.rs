@@ -499,7 +499,7 @@ impl Body {
                 n += 1;
             }
         }
-        mma_blocks(b, &self.mma, self.cfg.elem, self.unit, &blocks);
+        mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks);
         self.npre_done = n;
     }
     /// The scale words of tile `kb` from the transposed panel: the 8 A-scale bytes of this lane (one ds_read_b64; the MMA selects byte i % 4 of
@@ -625,12 +625,12 @@ impl Body {
                     let (w, by) = self.sa_sel(i);
                     if self.cfg.elem == Elem::Fp8 {  // one unit per block
                         for &j in &todo {
-                            u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.cfg.elem, self.unit, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by));
+                            u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by));
                         }
                     } else if !todo.is_empty() {
                         // bf16: the row's blocks in one unit, first halves then second halves
                         let blocks: Vec<_> = todo.iter().map(|&j| (self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by)).collect();
-                        u.capture(b, format!("mma.i{i}j{}-{}", todo[0], todo[todo.len() - 1]), |b| mma_blocks(b, &self.mma, self.cfg.elem, self.unit, &blocks));
+                        u.capture(b, format!("mma.i{i}j{}-{}", todo[0], todo[todo.len() - 1]), |b| mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks));
                     }
                     if let (true, Some((ar, _))) = (lo == half, &next) {
                         // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
