@@ -50,6 +50,7 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
     let n_el = b.bind_i32(ev(m_v) * k as i32);                              // routed pairs
     let maxp_v = b.bind_i32(ev(n_el) + (e * bm - k) as i32);
     let ntiles_max = b.bind_i32(ev(maxp_v).lshr(bm.trailing_zeros() as i32));
+    let ntiles_max_el = maxp_v;   // (positions are < max_padded)
     let dsc = |b: &mut FnBuilder, p: ValueId, bytes: ValueId| { let v = b.read_first_lane(bytes); b.buffer_desc_dyn(p, v) };
     let sz_ids = b.bind_i32(ev(n_el) << 2);
     let r_ids = dsc(b, ptr[0], sz_ids);
@@ -166,60 +167,81 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
     let m_f = b.bitcast_f32(m_v);
     b.buffer_store_f32(r_nv, nv_o, 0i32, 0, total_f);
     b.buffer_store_f32(r_nv, nv_o, 0i32, 4, m_f);
-    // padding entries of this expert's group: positions off_e + cnt .. off_e + padded (< BM of them), and the tail past the used part
+    // padding entries (positions off_e + cnt .. off_e + padded of every expert, < BM each): slot q = e * BM + s over all the threads, the loop bound is uniform
     let sent = b.bind_i32(((k as i32) << 24) + ev(m_v));
     let fzero = b.c_f32(0.0);
     let sent_f = b.bitcast_f32(sent);
-    let pad_n = b.bind_i32(ev(padded) - ev(cnt));                                      // padded - cnt (0 for experts >= E since padded = 0 and cnt = dummy count: clamp)
-    let pad_n = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_e), a: Opnd::Val(pad_n), b: Opnd::I32(0) });
-    let start = b.bind_i32(ev(off_e) + ev(cnt));
+    let bsh = bm.trailing_zeros() as i32;
+    let pad_iters = ((e * bm) as i32 + T - 1) / T;
     b.loop_(&[(DType::I32, Opnd::I32(0))], |b, vars| {
-        let r = vars[0];
-        let done = b.let_(Op::CmpGeI32(Opnd::Var(r), Opnd::Val(pad_n)));
+        let it = vars[0];
+        let done = b.let_(Op::CmpGeI32(Opnd::Var(it), Opnd::I32(pad_iters)));
         b.break_if(done);
-        let p = b.let_(Op::AddI32(Opnd::Val(start), Opnd::Var(r)));
-        let o = b.bind_i32(ev(p) << 2);
+        let q = b.let_(Op::MulI32(Opnd::Var(it), Opnd::I32(T)));
+        let q = b.bind_i32(ev(q) + ev(tid));
+        let ex = b.bind_i32(ev(q).lshr(bsh));
+        let sl = b.bind_i32(ev(q) & (bm as i32 - 1));
+        let exc = b.let_(Op::MinI32(Opnd::Val(ex), Opnd::I32(1023)));
+        let a_c = b.bind_i32((ev(exc) << 2) + offc);
+        let a_n = b.bind_i32((ev(exc) << 2) + offa);
+        let a_s = b.bind_i32((ev(exc) << 2) + cur);
+        let oe = b.load_lds(a_c, MemTy::B32);
+        let ce = b.load_lds(a_n, MemTy::B32);
+        let ie = b.load_lds(a_s, MemTy::B32);
+        b.wait_lds(0);
+        // the expert's padded size = incl - off; pad slot s is real iff cnt + s < padded
+        let pe = b.bind_i32(ev(ie) - ev(oe));
+        let pos = b.bind_i32(ev(oe) + ev(ce) + ev(sl));
+        let lim = b.bind_i32(ev(oe) + ev(pe));
+        let in_e = b.cmp(CmpPred::Lt, CmpTy::I32, ex, e as i32);
+        let in_p = b.cmp(CmpPred::Lt, CmpTy::I32, pos, lim);
+        let o0 = b.bind_i32(ev(pos) << 2);
+        let o1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_e), a: Opnd::Val(o0), b: Opnd::Val(oob) });
+        let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(in_p), a: Opnd::Val(o1), b: Opnd::Val(oob) });
         b.buffer_store_f32(r_sid, o, 0i32, 0, sent_f);
         b.buffer_store_f32(r_sw, o, 0i32, 0, fzero);
-        let nx = b.let_(Op::AddI32(Opnd::Var(r), Opnd::I32(1)));
-        b.set_var(r, nx);
+        let nx = b.let_(Op::AddI32(Opnd::Var(it), Opnd::I32(1)));
+        b.set_var(it, nx);
     });
-    // tail: positions total .. max_padded, strided over the threads
+    // tail: positions total .. max_padded, strided over the threads (the bound is uniform: total is the same in every thread)
+    let span = b.bind_i32(ev(maxp_v) - ev(total));
     b.loop_(&[(DType::I32, Opnd::I32(0))], |b, vars| {
         let r = vars[0];
+        let done = b.let_(Op::CmpGeI32(Opnd::Var(r), Opnd::Val(span)));
+        b.break_if(done);
         let r0 = b.let_(Op::AddI32(Opnd::Var(r), Opnd::Val(tid)));
         let p = b.bind_i32(ev(total) + ev(r0));
-        let done = b.let_(Op::CmpGeI32(Opnd::Val(p), Opnd::Val(maxp_v)));
-        b.break_if(done);
-        let o = b.bind_i32(ev(p) << 2);
+        let ok = b.cmp(CmpPred::Lt, CmpTy::I32, p, ntiles_max_el);
+        let o0 = b.bind_i32(ev(p) << 2);
+        let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(o0), b: Opnd::Val(oob) });
         b.buffer_store_f32(r_sid, o, 0i32, 0, sent_f);
         b.buffer_store_f32(r_sw, o, 0i32, 0, fzero);
         let nx = b.let_(Op::AddI32(Opnd::Var(r), Opnd::I32(T)));
         b.set_var(r, nx);
     });
-    // sorted_expert_ids: the tiles of this expert, and E for the tiles past the used part
-    let tiles_e = b.bind_i32(ev(padded).lshr(bm.trailing_zeros() as i32));
-    let eid_f = b.bitcast_f32(tid);
+    // sorted_expert_ids: tile j belongs to the number of experts whose inclusive padded end is <= j * BM (binary search in the scan), E past the used part
     b.loop_(&[(DType::I32, Opnd::I32(0))], |b, vars| {
         let r = vars[0];
-        let done = b.let_(Op::CmpGeI32(Opnd::Var(r), Opnd::Val(tiles_e)));
+        let done = b.let_(Op::CmpGeI32(Opnd::Var(r), Opnd::Val(ntiles_max)));
         b.break_if(done);
-        let j = b.let_(Op::AddI32(Opnd::Val(tile0), Opnd::Var(r)));
-        let o = b.bind_i32(ev(j) << 2);
-        b.buffer_store_f32(r_eid, o, 0i32, 0, eid_f);
-        let nx = b.let_(Op::AddI32(Opnd::Var(r), Opnd::I32(1)));
-        b.set_var(r, nx);
-    });
-    let e_const = b.c_i32(e as i32);
-    let e_f = b.bitcast_f32(e_const);
-    b.loop_(&[(DType::I32, Opnd::I32(0))], |b, vars| {
-        let r = vars[0];
         let r0 = b.let_(Op::AddI32(Opnd::Var(r), Opnd::Val(tid)));
-        let j = b.bind_i32(ev(tot_tiles) + ev(r0));
-        let done = b.let_(Op::CmpGeI32(Opnd::Val(j), Opnd::Val(ntiles_max)));
-        b.break_if(done);
-        let o = b.bind_i32(ev(j) << 2);
-        b.buffer_store_f32(r_eid, o, 0i32, 0, e_f);
+        let j = b.bind_i32(ev(r0));
+        let x = b.bind_i32(ev(j) << bsh);
+        let mut pos = b.c_i32(0);
+        for step in [512, 256, 128, 64, 32, 16, 8, 4, 2, 1] {
+            let cand = b.bind_i32(ev(pos) + step);
+            let ca = b.bind_i32(((ev(cand) - 1) << 2) + cur);
+            let v = b.load_lds(ca, MemTy::B32);
+            b.wait_lds(0);
+            let le = b.cmp(CmpPred::Le, CmpTy::I32, v, x);
+            pos = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(le), a: Opnd::Val(cand), b: Opnd::Val(pos) });
+        }
+        let ex = b.let_(Op::MinI32(Opnd::Val(pos), Opnd::I32(e as i32)));
+        let ex_f = b.bitcast_f32(ex);
+        let ok = b.cmp(CmpPred::Lt, CmpTy::I32, j, ntiles_max);
+        let o0 = b.bind_i32(ev(j) << 2);
+        let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(o0), b: Opnd::Val(oob) });
+        b.buffer_store_f32(r_eid, o, 0i32, 0, ex_f);
         let nx = b.let_(Op::AddI32(Opnd::Var(r), Opnd::I32(T)));
         b.set_var(r, nx);
     });
