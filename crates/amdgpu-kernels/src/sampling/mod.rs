@@ -123,39 +123,45 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
     let rowb = b.bind_i32(ev(row) * (2 * v) as i32);
     let neg = b.c_f32(NEG);
     let zero = b.c_f32(0.0);
-    let mut xs: Vec<[ValueId; 8]> = Vec::new();
-    let mut oks: Vec<ValueId> = Vec::new();
-    let mut frags = Vec::new();
-    for ci in 0..c {
-        let ch = b.bind_i32(ev(first) + ci);
-        let ok = b.let_(Op::CmpLtI32(Opnd::Val(ch), Opnd::I32(nchunk as i32)));
-        let off = b.bind_i32(ev(rowb) + (ev(ch) << 4));
-        frags.push(b.buffer_load_c(r_l, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT));
-        oks.push(ok);
-    }
-    for ci in 0..c as usize {
-        let mut x = bf16x8_to_f32(b, frags[ci]);
+    // the row is read once per pass (the 2nd / 3rd read come from L2): holding it in registers would need 160+ VGPRs for a 128 K vocabulary, which a 1024-thread block cannot have (<= 128)
+    let oks: Vec<ValueId> = (0..c)
+        .map(|ci| {
+            let ch = b.bind_i32(ev(first) + ci);
+            b.let_(Op::CmpLtI32(Opnd::Val(ch), Opnd::I32(nchunk as i32)))
+        })
+        .collect();
+    let load_all = |b: &mut FnBuilder| -> Vec<ValueId> {
+        (0..c)
+            .map(|ci| {
+                let ch = b.bind_i32(ev(first) + ci);
+                let off = b.bind_i32(ev(rowb) + (ev(ch) << 4));
+                b.buffer_load_c(r_l, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT)
+            })
+            .collect()
+    };
+    // the scaled values of chunk ci (invalid chunks: `fill`)
+    let vals = |b: &mut FnBuilder, frag: ValueId, ci: usize, fill: ValueId| -> [ValueId; 8] {
+        let mut x = bf16x8_to_f32(b, frag);
         if let Some(it) = inv_t {
             for k in 0..8 {
                 x[k] = b.mul_f32(x[k], it);
             }
         }
         for k in 0..8 {
-            x[k] = sel_f32(b, oks[ci], x[k], neg);
+            x[k] = sel_f32(b, oks[ci], x[k], fill);
         }
-        xs.push(x);
-    }
+        x
+    };
+    let frags = load_all(b);
     // the first (lowest-index) maximum of this thread
-    let mut best = xs[0][0];
+    let mut best = neg;
     let mut bidx = b.bind_i32(ev(first) << 3);
     for ci in 0..c as usize {
+        let x = vals(b, frags[ci], ci, neg);
         for k in 0..8usize {
-            if ci == 0 && k == 0 {
-                continue;
-            }
-            let gt = b.cmp(CmpPred::Gt, CmpTy::F32, xs[ci][k], best);
+            let gt = b.cmp(CmpPred::Gt, CmpTy::F32, x[k], best);
             let idx = b.bind_i32((ev(first) << 3) + (ci * 8 + k) as i32);
-            best = sel_f32(b, gt, xs[ci][k], best);
+            best = sel_f32(b, gt, x[k], best);
             bidx = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(gt), a: Opnd::Val(idx), b: Opnd::Val(bidx) });
         }
     }
@@ -174,18 +180,24 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
     } else {
         // softmax numerators (masked -> 0), the thread sums, the block prefix scan, the first element whose cumulative value reaches u * total
         let l2e = b.c_f32(std::f32::consts::LOG2_E);
-        let mut es: Vec<[ValueId; 8]> = Vec::new();
-        let mut st = zero;
-        for ci in 0..c as usize {
+        let frags2 = load_all(b);
+        let numer = |b: &mut FnBuilder, frag: ValueId, ci: usize| -> [ValueId; 8] {
+            let x = vals(b, frag, ci, neg);
             let mut e = [0; 8];
             for k in 0..8 {
-                let t = b.sub_f32(xs[ci][k], m);
+                let t = b.sub_f32(x[k], m);
                 let u = b.mul_f32(t, l2e);
                 let p = b.exp2_f32(u);
                 e[k] = sel_f32(b, oks[ci], p, zero);
+            }
+            e
+        };
+        let mut st = zero;
+        for ci in 0..c as usize {
+            let e = numer(b, frags2[ci], ci);
+            for k in 0..8 {
                 st = b.add_f32(st, e[k]);
             }
-            es.push(e);
         }
         // inclusive scan of the thread sums (Hillis-Steele in LDS)
         let tid4 = b.bind_i32(ev(tid) << 2);
@@ -236,9 +248,11 @@ pub fn sampling(name: &str, v: i64, sample: bool) -> Function {
         // first element (in this thread's order) whose cumulative value reaches the target; -(index) so that a Max picks the lowest index
         let mut acc = excl;
         let mut found_neg = big;   // -1e9 = not found
+        let frags3 = load_all(b);
         for ci in 0..c as usize {
+            let e = numer(b, frags3[ci], ci);
             for k in 0..8usize {
-                acc = b.add_f32(acc, es[ci][k]);
+                acc = b.add_f32(acc, e[k]);
                 let ge = b.cmp(CmpPred::Ge, CmpTy::F32, acc, target);
                 let idx_i = b.bind_i32((ev(first) << 3) + (ci * 8 + k) as i32);
                 let nf_i = b.bind_i32(ev(idx_i) * (-1));
