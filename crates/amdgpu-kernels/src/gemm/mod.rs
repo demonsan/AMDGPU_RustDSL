@@ -296,7 +296,13 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                         let d = 2 * k as u8 + h;
                         let sl = b.var_slice4(bf, d / 4);
                         let dw = b.frag4_lane(sl, d % 4);
-                        let w: Vec<ValueId> = (0..4u8).map(|byte| b.cvt(amdgpu_dsl::CvtOp::ScalePkBf16Fp4, &[Opnd::Val(dw), Opnd::Val(sf)], byte)).collect();
+                        let dwi = b.bitcast_i32(dw);
+                        let w: Vec<ValueId> = (0..4i32)
+                            .map(|byte| {
+                                let x = if byte == 0 { dwi } else { b.bind_i32(ev(dwi).lshr(8 * byte)) };
+                                b.cvt(amdgpu_dsl::CvtOp::ScalePkBf16Fp4, &[Opnd::Val(x), Opnd::Val(sf)], 0)
+                            })
+                            .collect();
                         (bf, b.pack4(w[0], w[1], w[2], w[3]))
                     })
                     .collect();
