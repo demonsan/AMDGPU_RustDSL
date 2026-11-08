@@ -196,7 +196,13 @@ int main(int argc, char** argv) {
             if (std::fabs(got - ref[x]) <= 2e-2 * std::fabs(ref[x]) + 2e-2) continue;
             long best = -1;
             for (size_t y = 0; y < ref.size(); y++) if (std::fabs(bf(y1[x]) - ref[y]) < 1e-2 * std::fabs(ref[y]) + 1e-3 && got != 0) { best = y; break; }
-            printf("  wrong row %zu col %zu got %g ref %g; matches ref at row %ld col %ld\n", x / I, x % I, got, ref[x], best < 0 ? -1 : best / I, best < 0 ? -1 : best % I);
+            // candidates: gate / up of every row i' of this token (which pair would produce got?)
+            int t = (int)(x / I / TK), e = ids[(x / I)], ii = (int)(x % I);
+            std::vector<double> G(2 * I);
+            for (int r = 0; r < 2 * I; r++) { double s = 0; for (int d = 0; d < D; d++) s += (double)xf[(size_t)t * D + d] * w1f[((size_t)e * 2 * I + r) * D + d]; G[r] = s; }
+            int bg = -1, bu = -1;
+            for (int a = 0; a < 2 * I && bg < 0; a++) for (int c = 0; c < 2 * I; c++) { double v = G[a] / (1 + std::exp(-G[a])) * G[c]; if (std::fabs(v - got) < 3e-3 * std::fabs(got) + 1e-3) { bg = a; bu = c; break; } }
+            printf("  wrong row %zu col %d got %g ref %g; = silu(row %d) * row %d (stacked rows: gate < %d)\n", x / I, ii, got, ref[x], bg, bu, I);
             shown++;
         }
     }
