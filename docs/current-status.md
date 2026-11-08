@@ -1,7 +1,7 @@
 # 当前状态总览（authoritative snapshot）
 
-本文件是仓库的**唯一权威当前状态快照**（2026-11-07 整理之后，Main `1626084b` + cleanup：stage 库 / weaver / 算子图 / IR 文本往返已合入，
-实验分支归档为 `archive/*` tag，实验变体与开关已删除）。数字来自 MI355X / gfx950（`mi355-gpu-53`，GPU 6）上的同轮硬件测量，复现命令见 §8。
+本文件是仓库的**唯一权威当前状态快照**（v8.1，Main `f92dd8d9`：2026-11-07 整理之后——stage 库 / weaver / 算子图 / IR 文本往返已合入，实验分支归档为
+`archive/*` tag——再加 FMHA 的 XCD 感知 block 顺序）。数字来自 MI355X / gfx950（`mi355-gpu-53`，GPU 6）上的同轮硬件测量，复现命令见 §8。
 厂商事实在 [`vendor-spec.md`](vendor-spec.md)，设计规格在 [`design.md`](design.md)；历史逐轮记录与各代设计研究在
 [`archive/`](archive/README.md)（其中的数字、kernel 名与开关只代表当时的状态）。
 
@@ -312,6 +312,9 @@ HIP_VISIBLE_DEVICES=6 bash tools/gemm_gate.sh
 | [`weaver-regs.md`](weaver-regs.md) / [`weaver-sched.md`](weaver-sched.md) | 编织区域的寄存器规划 / 按区域调度策略 |
 | [`jit.md`](jit.md) / [`python-jit.md`](python-jit.md) | 形状特化与 `jit-info` / Python JIT 入口 |
 | [`fmha-perf-patterns.md`](fmha-perf-patterns.md) / [`fmha-vs-vendor-asm-diff.md`](fmha-vs-vendor-asm-diff.md) | FMHA 性能承重模式 / 与厂商汇编的逐项对照 |
+| [`fmha-wave-org.md`](fmha-wave-org.md) / [`fmha-vendor-stream-design.md`](fmha-vendor-stream-design.md) / [`lgkm-lookahead.md`](lgkm-lookahead.md) / [`fmha-4wave-design.md`](fmha-4wave-design.md) / [`fmha-weaver-parity.md`](fmha-weaver-parity.md) | FMHA 设计记录：wave 组织与 XCD 顺序 / 厂商 copy 流 / lgkm 等待策略 / 4-wave 原型（搁置）/ weaver 铺满场景实验（均为负） |
+| [`functional-proofs.md`](functional-proofs.md) / [`stamps.md`](stamps.md) / [`mfma-ceiling.md`](mfma-ceiling.md) / [`mfma-dep-probe.md`](mfma-dep-probe.md) / [`isa-probes-smfmac-tr.md`](isa-probes-smfmac-tr.md) | 功能证明 / kernel 内时间戳 / MFMA 发射上限 / MFMA 依赖探针 / ISA one-hot 探针 |
+| [`tirx-comparison.md`](tirx-comparison.md) / [`ir-review-tirx-sftensor.md`](ir-review-tirx-sftensor.md) / [`ir-text-roundtrip-design.md`](ir-text-roundtrip-design.md) | 与 TVM TIRx 的对照（当前状态）/ IR 梳理（TIRx + SF Tensor）/ IR 文本往返设计 |
 | [`gpu-semantics-verifier.md`](gpu-semantics-verifier.md) / [`gpu-semantic-protocol.md`](gpu-semantic-protocol.md) | GPU 语义验证器 / 四轴协议模型 |
 | [`last-arriver-memory-model.md`](last-arriver-memory-model.md) | last-arriver 原语与内存序契约 |
 | [`agpr.md`](agpr.md) | AGPR 支持 |

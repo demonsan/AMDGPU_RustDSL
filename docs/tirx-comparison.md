@@ -1,4 +1,4 @@
-# 本仓库 vs Apache TVM TIRx：异同对照
+# 本仓库 vs Apache TVM TIRx：异同对照（当前状态）
 
 > 资料来源（2026-11-05 查阅）：[apache/tvm-tirx README](https://github.com/apache/tvm-tirx)、
 > [设计博文](https://tvm.apache.org/2026/11/03/rethinking-abstractions-in-the-agentic-era)、
@@ -11,52 +11,93 @@
 > [Compiling](https://tvm.apache.org/tirx/programming_guides/compiling.html)、
 > [IKET](https://tvm.apache.org/tirx/programming_guides/iket_profiling.html)、
 > [Rust 扩展](https://tvm.apache.org/tirx/advanced/extending_ir_in_rust.html)。
-> 本仓库状态：Main `v7.1`（见 [current-status.md](current-status.md)）。早先的 IR 梳理见 [ir-review-tirx-sftensor.md](ir-review-tirx-sftensor.md)。
+> 本仓库状态：Main v8.1（`f92dd8d9`，见 [current-status.md](current-status.md)）。一个 kernel 今天如何构建与优化、FMHA 上的具体例子见
+> `fmha-case-study.md`；早先的 IR 梳理见 [ir-review-tirx-sftensor.md](ir-review-tirx-sftensor.md)。
 
 ## 1. 一句话
 
-两者都在回答同一个问题："agent 写 kernel 的时代，编译器层还应提供什么"，而且都选择了**低而显式的抽象边界 + 可选的 tile 便利层 + 结构化 IR 供分析与验证**。
+两者都在回答"agent 写 kernel 的时代，编译器层还应提供什么"，都选择了**低而显式的抽象边界 + 可选的 tile 便利层 + 结构化 IR 供分析与验证**。
+TIRx 是通用、可插件扩展、多语言的 IR 基础设施（面向 CUDA，代码生成交给 NVRTC/LLVM）；本仓库是单目标（gfx950）、后端全自研、内建验证器的
+kernel 编译器，出货 FMHA / GEMM / MLP / RMSNorm 并与厂商同轮对比。过去两周里，TIRx 的结构化 IR 思想我们大多已经落地（§3），后端与验证上则有意走了另一条路（§5）。
 
-不同之处在于：
-- TIRx 是**通用、可插件扩展、多语言的 IR 与编译基础设施**，目前面向 CUDA，代码生成交给 NVRTC/LLVM；
-- 本仓库是**单目标（gfx950）、端到端自研后端、内建验证器的 kernel 编译器**，有调度、寄存器分配、hazard 与 wait 插入，直接产出生产级 kernel 并与厂商同轮对比。
+## 2. 逐项对照（当前状态）
 
-## 2. 逐项对照
-
-| 维度 | TIRx | 本仓库 | 异同 |
+| 维度 | TIRx | 本仓库（v8.1） | 状态 |
 |---|---|---|---|
-| 定位 | 最小、稳定、可扩展的 DSL 与编译基础；"分析 + 验证需要结构化 IR" | 面向 MI355X 的 kernel DSL + 自研编译器；FMHA、GEMM、MLP 出货并对标厂商 | 理念相同（为 agent 提供可分析可验证的 IR）；TIRx 做平台，我们做"平台 + 产品" |
-| 目标硬件 | CUDA（sm_75 起；Hopper TMA、Blackwell tcgen05 有专章） | AMD gfx950（CDNA4）；gfx1250 仅有调研文档 | 不重叠 |
-| 前端语言 | Python TVMScript（`@T.function`），核心 C++，Rust 扩展（cdylib + TVM-FFI） | 纯 Rust 嵌入式 builder（`FnBuilder` + `expr` 层），元编程即 Rust | TIRx 多语言跨 FFI；我们单语言、零三方依赖、`forbid(unsafe)` |
-| IR 形态 | 不可变 AST 树；`RegionStmt(op, args, body)`；所有节点注册结构化 hook | 区域树：`Loop/If/Region/Stage` + `Op`(89)/`Stmt`(50) 封闭枚举 | 都是"带 body 的区域"（我们的 region IR 正是借鉴它的结果）；TIRx 节点不可变、开放，我们的是封闭枚举 |
-| 扩展机制 | "一切皆插件"：新类型、算子、pass 由独立包动态加载，算子靠属性（类型推断、效果、各目标 lowering）驱动 | 新 op 要改 crate；MIR 层有算子属性表（`op_attrs.rs`，穷尽匹配），DSL 层尚无 | 最大差异。我们是单仓单体，换来可控性与零依赖 |
-| 抽象边界 | 低而显式：流水结构、同步、角色、内存放置、后端 intrinsic 都写在源码里；可选 tile 层（执行 scope、tensor layout、tile 分派） | 同样低而显式：角色分支、流水 cadence、tile 协议标记都由作者写；tile 库提供 TiledCopy/TiledMma/pipeline/softmax 等 | 高度相似。TIRx 的 tile op 是可分派的 IR 算子（按 scope、layout、target 选实现）；我们的 tile 层是 Rust 函数，展开后才进 IR |
-| 数据布局 | `TileLayout`：`S[shape : stride@axis]`，命名物理轴（`laneid`/`warpid`/内存 `m`）、副本 `R[...]`、偏移、swizzle 组合、指令专用布局 | CuTe 式 `Layout`/`IntTuple`/`Swizzle`/TV 布局、`IssuePlan`、`BitForm`、`convert_layout` 分档，以及构建期证明（单射、bank、tr_b8 源） | 同源（都继承 CuTe 思想）。TIRx 记法更直观（命名轴、显式副本）；我们多了构建期证明和布局转换代价分档 |
-| 符号分析 | `sym.Analyzer`：化简、`can_prove`；`ConstraintContext` 在遍历时自动带入循环范围和分支事实 | `amdgpu-sym`：多项式、约束上下文、区间、位集；验证器按区域树遍历并带入均匀分支事实 | 同构（我们的统一 sym 也是按它的思路做的）；TIRx 还有整除、迭代映射、区域分析 |
-| 打印 / 解析 / 结构工具 | TVMScript 打印与解析往返；`structural_walk/map/equal/hash` 由编译 hook 驱动；`format_tree` | `amdc print-ir --stage dsl\|mir\|mir-ra`；α-等价结构相等与哈希；**无解析器** | 我们缺解析器和通用 walk/map 框架（各 pass 自行递归） |
-| 代码生成 | 交给成熟工具链：CUDA C → NVRTC（寄存器分配、调度、PTX→SASS 由 NVIDIA 完成），host 走 LLVM | **全自研后端**：lowering → MIR → list/slotfill 调度 → 线性扫描 RA（含 AGPR）→ hazard/wait → asm；LLVM 只作可选的 post-RA 尾段或汇编器 | 根本差异。AMD 上要拿到厂商汇编级性能，必须自己控制 AGPR、`s_waitcnt`、MFMA/VALU 编排、M0/SCC；TIRx 在 CUDA 上可以依赖 nvcc |
-| 同步与异步协议 | "同步由调用方负责"：tile op 不插 barrier；`cp.async`/TMA/`tcgen05` 的完成协议由作者照文档写 | 作者写 barrier 与 tile 协议标记，**编译器自动插 `s_waitcnt`**，验证器证明协议（到达/完成/可见/代际四轴） | 都让作者显式写同步结构；我们额外有编译器插等待 + 静态证明 |
-| 正确性 | 博文目标：结构化 IR + 高效 checker（独立项目）+ 远期形式化（如 Lean）；文档里 lowering 会检查 tile 操作数视图是否满足指令约束 | 内建 `gpu_verify`（越界、寄存器类与对齐、路径敏感等待、协议、stage 契约）+ 严格证书（可计数的信任账本）+ 功能证明（GEMM 索引级与 IR 符号执行、FMHA 递推）+ 门禁（精度、确定性、压力、性能） | 我们在"验证"上已落地得更深；TIRx 把它作为方向和外部 checker |
-| 性能剖析 | IKET：kernel 内 `range_push/pop`、`mark` → Perfetto 时间线 | `s_memtime` stamps（按阶段、按 tile）+ ATT 分析脚本 + rocprof-report 工作流 | 思路相同（kernel 内打点）；IKET 产出时间线 UI，我们产出周期拆分表 |
-| 主机互操作 | TVM-FFI 自动生成绑定，直接接 PyTorch tensor | `amdc gen-host`：C++ ABI 头（`Args`/`validate()`）+ JSON schema | TIRx 面向 Python 生态；我们面向 C++ 启动与厂商 ABI 兼容 |
-| 面向 agent | 多语言、动态扩展，agent 可在独立包里做 pass 和 analysis | 证据驱动：同轮门禁、md5 不变式、证书、`ab_*.sh` / `perf_matrix.sh`，agent 改动必须过门禁 | 侧重点不同：TIRx 重"可扩展"，我们重"可证伪、可回归" |
+| 定位 | 最小、稳定、可扩展的 DSL 与编译基础 | gfx950 kernel DSL + 自研编译器 + 验证器；产品 kernel 对标厂商 | 理念相同，我们是"平台 + 产品" |
+| 前端 | Python TVMScript，核心 C++，Rust 扩展经 TVM-FFI | 纯 Rust builder（`FnBuilder` + `expr` 层），零三方依赖、`forbid(unsafe)` | 有意不同（§5） |
+| IR 形态 | 不可变 AST；`RegionStmt(op, args, body)` | 区域树 `Loop / If / Region / Stage` + 编织区域标记；封闭枚举 `Op`(82) / `Stmt`(48) | 已继承（§3.3） |
+| 扩展机制 | 一切皆插件；算子属性驱动类型推断、效果、lowering | MIR 层算子属性表（`op_attrs.rs`，穷尽匹配）；DSL 层仍是封闭枚举，编解码与 id 访问由生成器产出 | 部分（§4.1） |
+| 抽象边界 | 低而显式：流水、同步、角色、内存放置写在源码里；可选 tile 层 | 同样低而显式；编排写在**生成的骨架源码**里（算子图 → 骨架 → slot + stage 实例） | 已继承（§3.7） |
+| 数据布局 | `TileLayout`（命名物理轴、副本、swizzle） | CuTe 式 `Layout` / `IntTuple` / `Swizzle` / TV 布局 / `IssuePlan` + 构建期证明 | 已继承；命名轴未做（§4.3） |
+| 符号分析 | `sym.Analyzer`、`ConstraintContext` 带入循环与分支事实 | `amdgpu-sym`（`Q` / `Poly` / `Ctx` / `Itv` / 位支撑）；验证器按区域树带入分支事实 | 已继承；整除/迭代映射未做（§4.4） |
+| 打印 / 解析 / 结构工具 | TVMScript 往返；`structural_equal/hash`、`structural_walk/map` | irv1 文本打印与解析往返；α 规范化的结构相等/哈希；生成的 id 访问器 | 已继承；通用 map 部分（§3.4–3.5、§4.2） |
+| tile op | 可分派的 IR 算子（按 scope / layout / target 选实现） | tile 层与 stage 库是 Rust 函数，展开后进 IR；stage 边界以 `Node::Stage` + `StageContract` 进 IR | 部分（§4.5） |
+| 代码生成 | CUDA C → NVRTC；寄存器分配与调度由 NVIDIA 完成 | 全自研：lowering → MIR → 调度（list / slotfill / 按区域策略）→ RA（AGPR、寄存器规划）→ hazard / wait → asm；LLVM 仅可选 post-RA 尾段 | 有意不同（§5） |
+| 同步 | 同步由调用方写；完成协议照文档 | 作者写 barrier 与 tile 协议标记；编译器插 `s_waitcnt`；验证器证明四轴协议 | 有意不同（§5） |
+| 正确性 | 结构化 IR + 外部 checker + 远期形式化 | 内建 `gpu_verify` + 严格证书（`--shipped` 26 / 100 / 0）+ 功能证明 + 门禁 | 有意不同（§5） |
+| 剖析 | IKET → Perfetto 时间线 | `s_memtime` stamps + ATT 脚本 + rocprof 工作流 | 推迟（§6） |
+| 主机互操作 | TVM-FFI 绑定，直接接 PyTorch | `amdc gen-host`（C++ 头 + JSON）；Python JIT 以子进程调 `amdc` + ROCm clang | 有意不同（§5） |
 
-## 3. 我们可以继续借鉴的
+## 3. 继承并已实现
 
-1. **DSL 层算子属性化**：把 `Op`/`Stmt` 的类型规则、效果、lowering、验证器传递函数挂成属性。MIR 层已经这样做了，DSL 层仍是封闭枚举，这样可降低加 op 的成本。
-2. **tile op 进 IR**：把 `TiledCopy`/`TiledMma` 这类调用做成可分派的 IR 算子（按 scope、layout、atom 选实现），而不是在 Rust 里展开成指令序列。这样 IR 层能看到 tile 粒度，便于分析、证明和融合（例如 `convert_layout` 可以在 IR 层自动插入）。
-3. **命名物理轴的布局记法**：给 `Layout` 加 `lane`/`wave`/`m` 轴标注和显式副本，让打印输出与证明报告更可读。
-4. **IR 解析器与通用 walk/map**：打印→解析往返，让 agent 能直接编辑 IR 文本做实验；通用遍历框架可以减少各 pass 的重复递归代码。
-5. **IKET 式时间线输出**：把 stamps 的结果导出成 Perfetto 时间线。**暂缓**（2026-11-05 决定）：当前用 rocprofiler 看 trace 即可；做 mono kernel（多 stage 融合）时需要按 stage 打点、出时间线，届时再支持。
+| TIRx 思想 | 我们的落地 | 代码 / 文档 |
+|---|---|---|
+| **3.1 布局代数与 TV 布局** | `Layout` / `IntTuple` / GF(2) `Swizzle` / TV 布局 / `IssuePlan` / `BitForm`，`convert_layout` 按代数分档；构建期证明（单射、覆盖、bank、tr_b8 源、操作数匹配）；gfx950 copy 与 MMA atom 表 | `crates/amdgpu-layout`、`crates/amdgpu-isa`；[layout-tour.md](layout-tour.md) |
+| **3.2 算子属性表** | 每个 MOp 的效果、hazard 类、调度代价、AGPR 合法性、后端可表达性在一张穷尽 `match` 表里，各 pass 查表而非枚举算子 | `crates/amdgpu-compiler/src/op_attrs.rs`；[op-attributes.md](op-attributes.md) |
+| **3.3 区域 IR ≈ `RegionStmt`** | kernel 体是 `Loop / If / Region / Stage` 树，线性视图由树派生（配对错误无法表示）；`Node::Stage` 带 `StageContract`（融合边界契约，GV-STAGE）；编织区域 `Stmt::RegionMark` 给寄存器规划与按区域调度用 | `crates/amdgpu-dsl/src/lib.rs`；[region-ir.md](region-ir.md)、[weaver-regs.md](weaver-regs.md)、[weaver-sched.md](weaver-sched.md) |
+| **3.4 结构相等 / 哈希 + α 规范化** | `dsl_structural_eq/hash`：ValueId / VarId 按首次出现结构化重编号（语句、op 操作数、注解），函数名不参与 | `crates/amdgpu-dsl/src/print.rs`、`ir_text::alpha_canonical`；[ir-printing.md](ir-printing.md) |
+| **3.5 IR 文本往返 ≈ TVMScript** | `irv1`：`print-ir --stage dsl` 完整可解析，`ir-check` / `--from-ir`（emit、gpu-verify、jit-info、regplan）、A/B 脚本与 Python JIT 接受 `.ir`；全部 kernel 往返后 `Function` 逐字段相等、双后端 asm 与证书逐字节相同 | `crates/amdgpu-dsl/src/ir_text.rs`；[ir-text.md](ir-text.md) |
+| **3.6 符号分析 + 事实上下文 ≈ `Analyzer` / `ConstraintContext`** | 合同、布局与验证器共用一套多项式 + 约束上下文 + 区间 + 位集；按区域树遍历时带入一致分支事实与循环不动点 | `crates/amdgpu-sym`；[sym.md](sym.md) |
+| **3.7 显式编排在源码里** | 算子图（`*.graph.json`）→ 生成的 Rust 骨架（`skeleton_*.rs`，编排槽位可读可改）→ slot 实现 + stage 实例；weaver 把发射单元按显式顺序编织；出货 kernel 经此构建且 md5 不变 | `crates/amdgpu-tile/src/{opgraph/,stage.rs,weave.rs}`；[opgraph.md](opgraph.md)、[fusion-stage-library-design.md](fusion-stage-library-design.md) |
+| **3.8 tile 便利层建在显式 IR 之上** | `TiledCopy` / `TiledMma` / `partition_*`、pipeline、softmax、epilogue、stage 库通用原语（E / R / Q）——全部展开成普通 IR，作者随时可以下到 IR 级 | `crates/amdgpu-tile`；[dsl-tile-abstractions.md](dsl-tile-abstractions.md) |
+| **3.9 pass 工具** | 生成的 id 访问器（`IrIds`：所有 ValueId / VarId 的 walk）、`edit_stmts` / `parse_flat`（线性视图编辑后重建树）、`specialize`（标量 kernarg 常量化）、`regplan::region_report`（按区域的分配器真值） | `ir_codec.rs`（`tools/gen_ir_codec.py`）、`specialize.rs`、`regplan.rs`；[jit.md](jit.md) |
 
-## 4. TIRx 目前没有、我们有的
+## 4. 部分采纳
 
-- 自研的寄存器分配、调度与 wait 插入：AMD 上性能的关键，也是 slotfill、AGPR、`edgepad` 这些优化能做的前提。
-- 内建的静态协议验证与严格证书，以及功能等价证明（含"跳 tile"反例）。
-- 同轮对比厂商的门禁体系，以及出货 kernel 的 md5 不变式。
+1. **DSL 层算子属性化**：MIR 层已是属性表；DSL 的 `Op` / `Stmt` 仍是封闭枚举，类型规则（`result_ty`）、验证、lowering 各自 `match`。
+   已有的一步：IR 文本的解码器与 id 访问器由生成器从枚举定义产出，加 op 时打印 / 解析 / α 规范化不需要手写分支（漏了重新生成会编译失败）。
+2. **通用 walk / map**：有生成的 id 访问器，但没有 TIRx 那样的通用 `structural_map`；各 pass 仍自行递归区域树。
+3. **命名物理轴的布局记法**（`lane` / `wave` / `m` 轴、显式副本）：未做；布局打印仍是 CuTe 式 shape : stride。
+4. **符号分析的整除与迭代映射**：`amdgpu-sym` 有多项式、区间、位支撑与约束上下文，没有 TIRx 的整除推理与 iter-map 归一化；验证器靠区间 + 位集 + 契约事实足以证明出货 kernel。
+5. **tile op 作为 IR 一等公民**：tile 操作在 Rust 里展开；IR 层能看到的 tile 粒度是 `Stage` 节点（带契约）和 tile 协议区域（`Region`），不是可分派的 tile 算子。`convert_layout` 的分档在 Rust 层由布局代数决定。
 
-## 5. 结论
+## 5. 有意不同
 
-方向一致：结构化 IR、低而显式的边界、可选 tile 层、符号分析、为 agent 的分析与验证服务。我们早先的区域 IR、统一 sym、打印与结构相等，都是对 TIRx 的直接借鉴。
+| 方面 | 我们的选择 | 原因 |
+|---|---|---|
+| 后端 | 自研调度（list / slotfill / 按区域 authored-free）、线性扫描 RA（AGPR、寄存器规划）、hazard 与 wait 插入、`hzfill`；LLVM 只作可选 post-RA 尾段 | AMD 上拿到厂商汇编级性能要直接控制 AGPR、`s_waitcnt`、MFMA/VALU 编排、M0/SCC；没有等价于 nvcc 的工具链可依赖 |
+| 正确性 | 内建静态验证（越界、寄存器类、路径敏感等待、四轴协议、stage 契约）+ **严格证书**（信任账本逐项计数，`--strict` 有未证明项即失败）+ 功能证明 + 攻击用例回归（`verifier_cases.rs`） | 验证是编译的一部分而非外部工具；agent 的每个改动都必须拿到同样的证书 |
+| 语言与安全 | 单语言 Rust，九个 crate 全部 `#![forbid(unsafe_code)]`、零三方依赖、无 FFI | 可审计、可复现；ISA 规则可编码进类型（safe-asm） |
+| JIT | Python 包以**子进程**调 `amdc emit` / `jit-info` + ROCm clang，ctypes 加载 `.co`，磁盘缓存；不做 FFI 绑定 | 保持编译器零 FFI；编译期开销被缓存吸收 |
+| 证据体系 | 同轮厂商对照的门禁（`port_gate` / `gemm_gate`）、出货 md5 不变式、8 布局中位数 A/B | 优化必须可证伪、可回归 |
 
-差异来自目标不同：TIRx 是跨硬件的通用基础设施，把后端交给成熟工具链；本仓库是针对一个 AMD 目标的全栈编译器，后端和验证器都自研。如果要进一步靠拢，最有价值的是 §3 的第 1、2 项：DSL 层算子属性化，以及 tile op 作为 IR 一等公民。
+## 6. 推迟
+
+- **IKET 式 Perfetto 时间线**：stamps 已能按阶段 / 按 tile 拆周期，ATT 给逐指令视图；时间线 UI 推迟到做 **mono kernel**（多 stage 融合的单 kernel）时，按 stage 打点再接。
+- **mono kernel**：stage 库与算子图已能表达多 stage 融合（融合 MLP、RMSNorm 量化、g1q epilogue 链）；整模型级的单 kernel 编排未开始。
+
+## 7. 早期建议的落实情况
+
+上一版本文（v7.1 时）§3 的五条建议：
+
+| # | 建议 | 状态 |
+|---|---|---|
+| 1 | DSL 层算子属性化 | **未做**（MIR 层已有；DSL 层只把编解码与 id 访问生成化，见 §4.1） |
+| 2 | tile op 进 IR（可分派） | **未做**；改走"算子图 → 骨架 → stage 实例"，IR 层以 `Stage` + `StageContract` 表达边界（§3.7、§4.5） |
+| 3 | 命名物理轴的布局记法 | **未做** |
+| 4 | IR 解析器与通用 walk / map | **解析器已做**（irv1 往返，§3.5）；walk 部分（生成的 id 访问器），通用 map 未做 |
+| 5 | IKET 式时间线 | **推迟**（§6） |
+
+## 8. TIRx 没有、我们有的
+
+- 自研寄存器分配、调度与 wait 插入，以及在其上的寄存器规划（pin / separate / share / ring / 区域上限，按分配器真值报告）与按区域调度策略。
+- 内建的静态协议验证、严格证书与攻击用例回归，功能等价证明（含"跳 tile"反例）。
+- 出货 kernel 的 md5 不变式：IR 文本往返、重构、编排生成化都以"asm 逐字节不变"为验收。
+- 同轮对比厂商的门禁与 8 布局中位数 A/B 协议。
+
+## 9. 结论
+
+结构化 IR 一侧，TIRx 的主要思想已经落地：区域 IR、算子属性表（MIR）、统一符号分析、结构相等与 α 规范化、IR 文本往返、显式编排与可选 tile 层。
+仍未做的是 DSL 层属性化、通用 map、命名轴布局记法和 tile op 一等化——它们降低扩展成本，但不阻塞当前 kernel。
+后端、验证、语言与 JIT 方式是有意不同的选择，由 AMD 目标与"可证伪、可回归"的工作方式决定。

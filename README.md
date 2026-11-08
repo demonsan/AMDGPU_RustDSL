@@ -11,7 +11,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 
 ---
 
-## 当前状态（MI355X / gfx950 实测；Main `1626084b` + 2026-11-07 整理）
+## 当前状态（MI355X / gfx950 实测；Main v8.1 `f92dd8d9`：XCD 感知 block 顺序之后）
 
 | 项 | 结果 |
 |---|---|
@@ -25,7 +25,7 @@ IR / MIR，自己完成**寄存器分配**与**跨基本块指令调度**，插�
 | **组件化与编织** | 出厂 kernel 由"算子图 → 生成的骨架 → slot 实现 + stage 实例"构建（[`docs/opgraph.md`](docs/opgraph.md)、[`docs/fusion-stage-library-design.md`](docs/fusion-stage-library-design.md)）；编织区域可声明寄存器规划（pin / separate / share / ring / 区域上限，[`docs/weaver-regs.md`](docs/weaver-regs.md)）与按区域调度策略（[`docs/weaver-sched.md`](docs/weaver-sched.md)）；出厂 asm 不变 |
 | **DSL IR 文本** | `amdc print-ir --stage dsl` 输出完整可解析的 `irv1`；手改后 `amdc ir-check` / `emit --from-ir` / `gpu-verify --from-ir`（默认严格验证），A/B 脚本与 Python JIT 接受 `.ir`；全部 kernel 往返后双后端 asm 与证书逐字节相同（[`docs/ir-text.md`](docs/ir-text.md)） |
 | 测试 | `cargo test` **104 个目标 / 431 项全绿**；safe-asm 另有 ui 用例（编译失败对照） |
-| GPU 语义验证 | 编译器感知指令语义：LDS/global/buffer 越界、VGPR/SGPR/AGPR 类别与对齐、路径敏感等待、LDS tile 生命周期与同步协议、融合 stage 边界契约均被证明。严格证书：出厂 4 kernel `--shipped` **24 trusted assumes / 100 host contracts / 0 unproven**；GEMM v4 **3 / 19 / 0**；融合 MLP **0 / 9 / 0**；见 [`docs/gpu-semantics-verifier.md`](docs/gpu-semantics-verifier.md) |
+| GPU 语义验证 | 编译器感知指令语义：LDS/global/buffer 越界、VGPR/SGPR/AGPR 类别与对齐、路径敏感等待、LDS tile 生命周期与同步协议、融合 stage 边界契约均被证明。严格证书：出厂 4 kernel `--shipped` **26 trusted assumes / 100 host contracts / 0 unproven**（+2：XCD 顺序重映射后的 tile / head 范围事实）；GEMM v4 **3 / 19 / 0**；融合 MLP **0 / 9 / 0**；见 [`docs/gpu-semantics-verifier.md`](docs/gpu-semantics-verifier.md) |
 | Rust 安全 | **九个 crate 全部 `#![forbid(unsafe_code)]`、零第三方依赖、无 FFI/裸指针**；ISA 规则编码进类型系统；见 [`docs/rust-safety.md`](docs/rust-safety.md) |
 
 功能（FMHA）：head dim 128，fp8(e4m3) Q/K/V，E8M0 1×32 Q/K 缩放，标量 V 缩放，BF16 输出，在线 softmax，
@@ -126,7 +126,7 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 | [`docs/fmha-weaver-parity.md`](docs/fmha-weaver-parity.md) | 用 weaver 冲铺满场景的全部实验与结论（均未超过出货编排） |
 | [`docs/ir-text.md`](docs/ir-text.md) / [`docs/ir-text-roundtrip-design.md`](docs/ir-text-roundtrip-design.md) | **DSL IR 文本（irv1）**：打印-编辑-解析-编译工作流、格式与校验 / 设计（已实现） |
 | [`docs/jit.md`](docs/jit.md) | 形状特化（`--specialize`）与 `amdc jit-info`（Python JIT 的编译接口） |
-| [`docs/tirx-comparison.md`](docs/tirx-comparison.md) | **与 Apache TVM TIRx 的异同对照**：定位、IR、扩展机制、布局、符号分析、代码生成、同步与验证、剖析、可借鉴项 |
+| [`docs/tirx-comparison.md`](docs/tirx-comparison.md) | **与 Apache TVM TIRx 的异同对照（当前状态）**：继承并已实现 / 部分采纳 / 有意不同 / 推迟，早期建议的落实情况 |
 | [`docs/ir-review-tirx-sftensor.md`](docs/ir-review-tirx-sftensor.md) | **IR 梳理**：对照 TIRx（算子属性表、区域语句、统一符号分析、打印/结构相等、命名轴 layout）与 SF Tensor 形式化正确性，提出属性表 / 区域化 IR / 统一 sym / 功能证明层的改造顺序 |
 | [`docs/layout-tour.md`](docs/layout-tour.md) | **布局层入门**：`Layout` / `Swizzle` / TV 布局 / `IssuePlan` / 证明，用出厂 FMHA 与 GEMM 的真实代码讲 |
 | [`docs/fmha-dsl-tour.md`](docs/fmha-dsl-tour.md) | **FMHA 逐段教程**：每一段的 DSL 特性与 Rust safe 怎么保证 |
@@ -134,6 +134,9 @@ docs/                   当前状态、设计、教程、验证器、厂商 spec
 | [`docs/dsl-tile-abstractions.md`](docs/dsl-tile-abstractions.md) | tile 库（L1–L6）设计；哪些层已被布局层替代 |
 | [`docs/dsl-expression-layer.md`](docs/dsl-expression-layer.md) | 运算符表达式层 |
 | [`docs/fmha-perf-patterns.md`](docs/fmha-perf-patterns.md) | FMHA 性能承重模式清单（移植 parity checklist） |
+| [`docs/fmha-wave-org.md`](docs/fmha-wave-org.md) / [`docs/fmha-vendor-stream-design.md`](docs/fmha-vendor-stream-design.md) / [`docs/lgkm-lookahead.md`](docs/lgkm-lookahead.md) | FMHA 设计记录：铺满形状的 wave 组织与 XCD 感知 block 顺序（v8.1）/ 厂商 copy 流对照（真实数据）/ LDS 读与 lgkm 等待的调度策略 |
+| [`docs/fmha-vs-vendor-asm-diff.md`](docs/fmha-vs-vendor-asm-diff.md) / [`docs/fmha-4wave-design.md`](docs/fmha-4wave-design.md) | 与厂商汇编的逐项对照（寄存器 + 编排）/ 4-wave 原型（已搁置） |
+| [`docs/isa-probes-smfmac-tr.md`](docs/isa-probes-smfmac-tr.md) / [`docs/mfma-dep-probe.md`](docs/mfma-dep-probe.md) | ISA 探针：`v_smfmac` 与 `ds_read_b64_tr_b8` 的 one-hot 映射 / MFMA 依赖与操作数复用对发射间隔、时钟、功耗的影响 |
 | [`docs/gpu-semantics-verifier.md`](docs/gpu-semantics-verifier.md) | **GPU 语义验证器**：地址模型、LDS tile 协议、寄存器规则、路径敏感等待、trust 预算、诚实边界 |
 | [`docs/gpu-semantic-protocol.md`](docs/gpu-semantic-protocol.md) | 四轴协议模型（到达 / 完成 / 可见 / 代际） |
 | [`docs/last-arriver-memory-model.md`](docs/last-arriver-memory-model.md) | last-arriver 融合 combine 的内存序原语 |
