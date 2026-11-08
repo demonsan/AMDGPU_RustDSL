@@ -403,3 +403,8 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 **erf-gelu**：`Act::Gelu`（`amdgpu_tile::prims`）；`gelu_bf16`、`gelu_mul_bf16_d<D>`、以及 bias 形式；10 个系数的 Horner 求值，`exp` 走 `exp2`，一个元素约 30 条 VALU。第一版用了 Abramowitz-Stegun 7.1.26（绝对误差 1.5e-7）加 `1 − erf` 的相消，负尾部的相对误差太大（179M 个元素里 100 个超出 1e-6 的绝对容差），换成相对误差有界的 erfc 拟合之后消失。
 
 **MoE bias 激活**：`{silu,gelu_tanh,gelu,swiglu_oai}_mul_bias_bf16_d<D>`；主机测试 `tests/gpu/eltwise_bias_host.cpp`（CPU 双精度参考，含 expert id = −1 和 ≥ E 的 token）全部 `bad = 0`；`gpu_verify --strict` 0 错误，44 VGPR。
+
+
+## topk_per_row 的两个负结果（未采用）
+
+`topk_per_row_*` 一行一个块，R = 256 行 × 64K 约 94 µs（5 遍读 + 4 次直方图扫描）。试了两个看起来该有用的改动，都没有收益，已撤销：（1）后三遍直方图里，只有前缀相等的元素（约 1 / 256）才计数，所以让没有任何匹配元素的 wave 跳过 LDS 原子（`any_lane` + 一致的 `if`），发射遍同样跳过没有写入的 wave：94 → 105 µs（更慢，分支与 exec 保存 / 恢复的开销大于省下的原子）；（2）每次迭代在途的加载从 4 个提到 16 个（VGPR 48 → 72）：94 → 93 µs，短行反而 15 → 20 µs（迭代粒度变粗）。所以这个 kernel 不是被加载延迟或 LDS 原子的数量卡住，而是被每遍固定的"清零 → 直方图 → barrier → 扫描（DPP + 两次 barrier）"链和 1024 线程上的 VALU 卡住（8 K 的行 15 µs 里大部分是这条固定链，约 2.5 µs / 遍）。想要明显更快需要换结构：11 位的数字（3 遍，2048 个桶）或者把一行拆到多个块上（需要跨块的全局原子 + 多次启动或块间同步，只在行数少于 CU 数时有意义，上界约 1.7 倍），都没有做。
