@@ -6,7 +6,8 @@
 //!   P = exp(scale S - LSE), dV += P^T dO, dP = dO V^T, dS = P (dP - Dot), dK += dS^T Q; dK = scale dK.
 //!
 //! ABI (16-byte slots): 0 q, 1 k, 2 v, 3 do, 4 lse (fp32 [B, H, SQ], natural log, the forward's), 5 dot (fp32 [B, H, SQ]), 6 dq, 7 dk, 8 dv,
-//! 9 scale (f32), 10 SQ, 11 SK, 12 H, 13 HK, 14 o (the dot kernel). Q / dO / O / dQ [B, SQ, H, 128], K / V / dK / dV [B, SK, HK, 128] (dense),
+//! 9 scale (f32), 10 SQ, 11 SK, 12 H, 13 HK, 14 o (the dot kernel). Q / dO / O / dQ [B, SQ, H, 128], K / V [B, SK, HK, 128], dK / dV per Q head
+//! [B, SK, H, 128] (dense),
 //! causal = bottom-right (key k visible to query q iff k <= q + SK - SQ).
 use amdgpu_tile::components::gqa_kv_head;
 use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, MmaKind, MmaShape, MmaTy, Op, Opnd, ValueId, VarId};
@@ -34,8 +35,12 @@ fn abi(b: &mut FnBuilder) {
     for n in ["q", "do", "dq", "o"] {
         b.arg_tensor(n, bb.clone() * sq.clone() * hh.clone() * Ext::c(ROW as i64));
     }
-    for n in ["k", "v", "dk", "dv"] {
+    for n in ["k", "v"] {
         b.arg_tensor(n, bb.clone() * sk.clone() * hk.clone() * Ext::c(ROW as i64));
+    }
+    // dK / dV per Q head (the vendor convention; a GQA group is summed afterwards)
+    for n in ["dk", "dv"] {
+        b.arg_tensor(n, bb.clone() * sk.clone() * hh.clone() * Ext::c(ROW as i64));
     }
     for n in ["lse", "dot"] {
         b.arg_tensor(n, bb.clone() * hh.clone() * sq.clone() * Ext::c(4));
@@ -322,8 +327,6 @@ pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     b.grid_is(0, Ext::ka(176).ceil_div(128));
     b.grid_is(1, Ext::ka(192));
     b.grid_is(2, Ext::sym("B"));
-    b.arg_tensor("dk", Ext::sym("B") * Ext::ka(176) * Ext::ka(192) * Ext::c(ROW as i64));
-    b.arg_tensor("dv", Ext::sym("B") * Ext::ka(176) * Ext::ka(192) * Ext::c(ROW as i64));
     let a = args(&mut b);
     let (kt, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
     let lane = Lane::new(&mut b);
