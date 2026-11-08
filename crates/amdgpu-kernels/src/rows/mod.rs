@@ -8,6 +8,7 @@
 //! * `softmax_bf16_n<N>`      `out = softmax(x)` along the row.                            ABI x @0, out @8, M @16
 
 pub mod quant;
+pub mod mxquant;
 
 use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
 use amdgpu_tile::prims::{bf16x8_to_f32, group_reduce_dpp, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
