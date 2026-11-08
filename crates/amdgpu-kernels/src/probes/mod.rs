@@ -761,12 +761,10 @@ fn probe_last_arriver_mode(name: &str, mode: u8) -> Function {
     let i2 = b.add_i32(i, c1);
     b.set_var(i, Opnd::Val(i2));
     let more = b.cmp_lt_i32(i2, total);
-    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
-    {
-        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
-        let any = b.any_lane(stop);
-        b.break_if(Opnd::Val(any));
-    }
+    // the wave keeps iterating while ANY lane has more to do: exit when no lane does (`!any_lane(more)`, wave-uniform)
+    let any_more = b.any_lane(more);
+    let stop = b.let_(Op::NotI1(Opnd::Val(any_more)));
+    b.break_if(Opnd::Val(stop));
     b.end_loop();
     let sf = b.bitcast_f32(Opnd::Var(s));
     b.store_f32_wt(result, 0, Opnd::Val(sf));
@@ -833,12 +831,10 @@ fn probe_la8_mode(name: &str, mode: u8) -> Function {
     let dn = b.add_i32(dv[0], c1);
     b.set_var(dv[0], Opnd::Val(dn));
     let dmore = b.cmp_lt_i32(dn, iters);
-    let dstop = b.let_(Op::NotI1(Opnd::Val(dmore)));
-    {
-        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
-        let any = b.any_lane(dstop);
-        b.break_if(Opnd::Val(any));
-    }
+    // the wave keeps iterating while ANY lane has more to do: exit when no lane does (`!any_lane(more)`, wave-uniform)
+    let any_more = b.any_lane(dmore);
+    let dstop = b.let_(Op::NotI1(Opnd::Val(any_more)));
+    b.break_if(Opnd::Val(dstop));
     b.end_loop();
     // partial store: element idx = bid*512 + tid
     let row = b.mul_i32(bid, c512);
@@ -896,12 +892,10 @@ fn probe_la8_mode(name: &str, mode: u8) -> Function {
     let i2 = b.add_i32(i, c512);
     b.set_var(i, Opnd::Val(i2));
     let more = b.cmp_lt_i32(i2, total);
-    let stop = b.let_(Op::NotI1(Opnd::Val(more)));
-    {
-        // a wave-level branch on a per-lane condition, intended ('any lane'): see `FnBuilder::any_lane`
-        let any = b.any_lane(stop);
-        b.break_if(Opnd::Val(any));
-    }
+    // the wave keeps iterating while ANY lane has more to do: exit when no lane does (`!any_lane(more)`, wave-uniform)
+    let any_more = b.any_lane(more);
+    let stop = b.let_(Op::NotI1(Opnd::Val(any_more)));
+    b.break_if(Opnd::Val(stop));
     b.end_loop();
     b.end_if();
     b.finish()
