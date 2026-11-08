@@ -291,8 +291,10 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                 let ops: Vec<(VarId, ValueId)> = bsets
                     .iter()
                     .map(|&(bf, sb)| {
-                        let sw = b.bitcast_i32(Opnd::Var(VarId(sb.0 + k / 2)));
-                        let e = b.bind_i32((ev(sw).lshr(16 * (k % 2) as i32)) & 0xff);
+                        // the lane's scale word holds groups 4 (g / 2) + 0..3 (bytes 0..3); dword d of the fragment is in group 4 (g / 2) + d % 4
+                        let d0 = 2 * k + h as u32;
+                        let sw = b.bitcast_i32(Opnd::Var(sb));
+                        let e = b.bind_i32((ev(sw).lshr(8 * (d0 % 4) as i32)) & 0xff);
                         let sbits = b.bind_i32(ev(e) << 23);
                         let sf = b.bitcast_f32(sbits);
                         let d = 2 * k as u8 + h;
@@ -399,6 +401,12 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
         }
     }
     Vec::new()
+}
+
+/// The lane's g / 2 (g = lane / 16): 0 for lanes 0..31, 1 for 32..63.
+fn lane_g2(b: &mut FnBuilder) -> ValueId {
+    let l = Lane::new(b);
+    b.bind_i32(l.lane().lshr(5))
 }
 
 /// The deferred block-scale updates: acc += t (sa sb) lane by lane.
@@ -897,11 +905,17 @@ impl Body {
             // A16W4: no A scales (zeros, unused); B [N][K / 32]: the 8 group bytes of the tile per n block, as two dwords (words 2 j, 2 j + 1)
             let so = { let v = b.bind_i32(ev(kb) << 3); b.read_first_lane(v) };
             let sa = (0..mx.voff_a.len()).map(|_| b.c_i32(0)).collect();
+            // the lane's word: groups 4 (g / 2) .. 4 (g / 2) + 3 = dword g / 2 of the 8 bytes (two entries per block, the second unused)
+            let hi_half = b.bind_cond(lane_g2(b).gt(0));
             let mut sb = Vec::new();
             for v in &mx.voff_b {
                 let f = b.buffer_load_b64(self.rsrc_sfb, *v, so, 0);
-                sb.push(b.frag2_lane(f, 0));
-                sb.push(b.frag2_lane(f, 1));
+                let lo = b.frag2_lane(f, 0);
+                let hi = b.frag2_lane(f, 1);
+                let (lo, hi) = (b.bitcast_i32(lo), b.bitcast_i32(hi));
+                let w = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(hi_half), a: Opnd::Val(hi), b: Opnd::Val(lo) });
+                sb.push(w);
+                sb.push(w);
             }
             return (sa, sb);
         }
@@ -930,10 +944,9 @@ impl Body {
     }
     /// The scale word of a `load_scales` value: `Scales::Mx32` selects the lane's two group bytes of the 8-byte load (v_perm); identity otherwise.
     fn scale_word(&self, b: &mut FnBuilder, v: ValueId) -> ValueId {
-        if let Some(sh) = self.w4_shift {
-            // A16W4 B words: the lane's group bytes (2 k + g / 2) moved to bytes 0 / 2; the zero A words pass unchanged
-            let w = b.bitcast_i32(v);
-            return b.bind_i32(ev(w).lshr(ev(sh)));
+        if self.w4_shift.is_some() {
+            // A16W4: the words are selected at the load
+            return b.bitcast_i32(v);
         }
         match &self.mx32 {
             Some(mx) if mx.shuf.is_some() => {
