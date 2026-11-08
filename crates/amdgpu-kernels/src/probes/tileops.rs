@@ -371,9 +371,30 @@ pub fn f8f6f4_p1_kinds() -> Vec<amdgpu_dsl::MmaKind> {
 
 /// `probe_f8f6f4_p1(in, out)`: per kind, A and B (32 bytes per lane each, lane-major; fp4 uses the first 16, fp6 the first 24) with unit
 /// E8M0 scales (0x7F); `out` gets D = A x B (zero-C) and D2 = A x B + D, lane-major.
+/// The unscaled kinds of `probe_f8f6f4_plain` (`MmaKind::f8f6f4`, no scale operands).
+pub fn f8f6f4_plain_kinds() -> Vec<amdgpu_dsl::MmaKind> {
+    use amdgpu_dsl::{MmaKind, MmaShape as S, MmaTy as T};
+    vec![
+        MmaKind::f8f6f4(S::M16N16K128, T::Fp4, T::Fp4),
+        MmaKind::f8f6f4(S::M16N16K128, T::Fp8, T::Fp4),
+        MmaKind::f8f6f4(S::M16N16K128, T::Fp8, T::Fp8),
+        MmaKind::f8f6f4(S::M16N16K128, T::Fp6, T::Bf8),
+        MmaKind::f8f6f4(S::M32N32K64, T::Fp4, T::Fp4),
+        MmaKind::f8f6f4(S::M32N32K64, T::Bf8, T::Fp8),
+    ]
+}
+
+/// `probe_f8f6f4_plain(in, out)`: as `probe_f8f6f4_p1` for the unscaled kinds (D = A x B, D2 = A x B + D).
+pub fn probe_f8f6f4_plain() -> Function {
+    f8f6f4_probe("probe_f8f6f4_plain", f8f6f4_plain_kinds())
+}
+
 pub fn probe_f8f6f4_p1() -> Function {
-    let kinds = f8f6f4_p1_kinds();
-    let mut b = FnBuilder::new("probe_f8f6f4_p1", 64);
+    f8f6f4_probe("probe_f8f6f4_p1", f8f6f4_p1_kinds())
+}
+
+fn f8f6f4_probe(name: &str, kinds: Vec<amdgpu_dsl::MmaKind>) -> Function {
+    let mut b = FnBuilder::new(name, 64);
     b.arg("in", DType::Ptr, 0, 8);
     b.arg("out", DType::Ptr, 8, 8);
     let out_bytes: u32 = kinds.iter().map(|k| 2 * 64 * 4 * k.acc_dwords()).sum();
@@ -400,8 +421,13 @@ pub fn probe_f8f6f4_p1() -> Function {
         };
         let fa = opnd(&mut b, 0, k.a);
         let fb = opnd(&mut b, 2048, k.b);
-        let d1 = b.mfma_scaled(*k, fa, fb, None, s);
-        let d2 = b.mfma_scaled(*k, fa, fb, Some(Opnd::Val(d1)), s);
+        let (d1, d2) = if k.scaled {
+            let d1 = b.mfma_scaled(*k, fa, fb, None, s);
+            (d1, b.mfma_scaled(*k, fa, fb, Some(Opnd::Val(d1)), s))
+        } else {
+            let d1 = b.mfma(*k, fa, fb, None);
+            (d1, b.mfma(*k, fa, fb, Some(Opnd::Val(d1))))
+        };
         let n = k.acc_dwords();
         let lane_off = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32((4 * n) as i32)));
         for (j, v) in [d1, d2].into_iter().enumerate() {
