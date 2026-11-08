@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <random>
 #include <vector>
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s failed: %s\n", #x, hipGetErrorString(e_)); std::exit(1); } } while (0)
