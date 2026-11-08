@@ -170,21 +170,29 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
             (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
         })
         .collect();
+    // all K DMAs, then all V DMAs: QK and the softmax wait only for K (counted vmcnt), the V rows land meanwhile
+    let nv = lookups.len() as u8;
     me.write(&mut b, Opnd::Var(it), |b| {
-        for (i, &(kc, pv)) in lookups.iter().enumerate() {
-            let i = i as i32;
-            let pg = b.bitcast_i32(pv);
-            let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
-            let rowoff = b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW);
+        let rows: Vec<(ValueId, ValueId)> = lookups
+            .iter()
+            .map(|&(kc, pv)| {
+                let pg = b.bitcast_i32(pv);
+                let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
+                (kc, b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW))
+            })
+            .collect();
+        for (i, &(kc, rowoff)) in rows.iter().enumerate() {
             let kvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ (ev(kc) & 15)) << 4));
-            let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
-            let m0k = b.bind_i32(mbase.clone() + (i << 10));
-            let m0v = b.bind_i32(mbase.clone() + (KT * ROW + (i << 10)));
+            let m0k = b.bind_i32(mbase.clone() + ((i as i32) << 10));
             b.buffer_load_lds_b128(r_k, kvo, c0, m0k, 0);
+        }
+        for (i, &(_, rowoff)) in rows.iter().enumerate() {
+            let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
+            let m0v = b.bind_i32(mbase.clone() + (KT * ROW + ((i as i32) << 10)));
             b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
         }
     });
-    b.wait_vm(0);
+    b.wait_vm(nv);
     // ---- S^T: 4 blocks of 16 keys x 4 d chunks (block inner: independent chains) ----
     let kb = b.bind_i32(mbase.clone());
     me.read_back(&mut b, Opnd::Var(it), |b| {
@@ -250,6 +258,7 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32, kt: i32) -> Function {
     }
     let l_new = b.add_f32(Opnd::Var(l_v), ps);
     b.set_var(l_v, l_new);
+    b.wait_vm(0);
     // ---- O^T += V^T P^T: 2 steps of 32 keys x 8 blocks of 16 d ----
     let vb = b.bind_i32(mbase.clone() + KT * ROW + ev(vr));
     me.read_back(&mut b, Opnd::Var(it), |b| {
