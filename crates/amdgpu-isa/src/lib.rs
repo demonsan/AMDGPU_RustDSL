@@ -94,6 +94,18 @@ pub const DS_READ_TR_B8X4: CopyAtom = CopyAtom {
     provenance: Provenance::Probe("probe_lds_tr_b8 + fmha _vs128 V^T reads"),
     ..copy("DsReadTrB8x4", "ds_read_b64_tr_b8 x4", Space::Lds, Space::Reg, 8, 4, ImmRange::DS, Counter::Lgkm)
 };
+/// `ds_read_b64_tr_b16` (bf16 / f16 transpose read; map [`tr_b16::source`], probe `probe_tr_b16_p1`).
+pub const DS_READ_TR_B16: CopyAtom = CopyAtom {
+    transpose: true,
+    provenance: Provenance::Probe("probe_tr_b16_p1 (crates/amdgpu-kernels/src/probes/tileops.rs)"),
+    ..copy("DsReadTrB16", "ds_read_b64_tr_b16", Space::Lds, Space::Reg, 8, 1, ImmRange::DS, Counter::Lgkm)
+};
+/// Two `ds_read_b64_tr_b16`: the 8 x 16-bit (4-dword) A / B operand of `v_mfma_f32_{16x16x32,32x32x16}_{bf16,f16}` (see [`tr_b16`]).
+pub const DS_READ_TR_B16X2: CopyAtom = CopyAtom {
+    transpose: true,
+    provenance: Provenance::Probe("probe_tr_b16_p1 + probe_mfma_p1 layouts"),
+    ..copy("DsReadTrB16x2", "ds_read_b64_tr_b16 x2", Space::Lds, Space::Reg, 8, 2, ImmRange::DS, Counter::Lgkm)
+};
 pub const DS_WRITE_B128: CopyAtom = copy("DsWrite128", "ds_write_b128", Space::Reg, Space::Lds, 16, 1, ImmRange::DS, Counter::Lgkm);
 pub const DS_WRITE_B64: CopyAtom = copy("DsWrite64", "ds_write_b64", Space::Reg, Space::Lds, 8, 1, ImmRange::DS, Counter::Lgkm);
 pub const DS_WRITE_B32: CopyAtom = copy("DsWrite32", "ds_write_b32", Space::Reg, Space::Lds, 4, 1, ImmRange::DS, Counter::Lgkm);
@@ -465,6 +477,27 @@ pub mod smfmac {
     /// every B dword, i.e. two accumulated smfmacs with these words contract all 128 k).
     pub const fn uniform(p0: u32, p1: u32) -> u32 {
         nibble(p0, p1) * 0x1111_1111
+    }
+}
+
+/// `ds_read_b64_tr_b16`, measured on gfx950 (`probe_tr_b16_p1`, `tools/tileop_probe.sh`).
+///
+/// Inside each 16-lane group every lane supplies the address of an 8-byte word = 4 x 16-bit elements. Destination lane `d` (q = (d % 16) / 4,
+/// c = d % 4), element `e` (dword e / 2, half e % 2) receives element `c` of the word read by lane `16 (d / 16) + q + 4 e` — a 4 x 4 transpose of
+/// 16-bit elements per quad of source lanes {q, q + 4, q + 8, q + 12}.
+///
+/// MFMA use (bf16 / f16 16x16x32 and 32x32x16, A operand lane l: row m = l % M, k = 8 (l / M) + v): to feed A[m][k] = T[k][m] from a row-major
+/// LDS tile T[k][m], lane l = 16 G + s (s = l % 16) issues read r (r = 0, 1) at `&T[k0 + 4 r + s / 4][m0 + 4 (s % 4)]` with k0 = 8 (l / M) and
+/// m0 = 16 ((l % M) / 16); the two reads give v = 4 r + e, i.e. the operand's k order exactly (k = k0 + 4 r + e).
+pub mod tr_b16 {
+    use super::*;
+    /// (source lane, element inside its 8-byte word) of destination lane `d`, element `e`.
+    pub const fn source(d: i64, e: i64) -> (i64, i64) {
+        (16 * (d / 16) + (d % 16) / 4 + 4 * e, d % 4)
+    }
+    /// The same map as a TV layout: (dest lane, element e) -> element `4 s' + h` of the source tile "64 lanes x 4 elements".
+    pub fn dest_tv() -> Layout {
+        make_layout(tup![tup![4, 4, 4], 4], tup![tup![1, 4, 64], 16])
     }
 }
 
