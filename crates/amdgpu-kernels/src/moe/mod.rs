@@ -78,9 +78,12 @@ pub fn moe_sorting(name: &str, e: i64, k: i64, bm: i64) -> Function {
         let inb = b.let_(Op::CmpLtI32(Opnd::Val(i), Opnd::Val(n_el)));
         let off = b.bind_i32(ev(i) << 2);
         let f = b.buffer_load_f32(r_ids, off, 0i32, 0);
-        let id = b.bitcast_i32(f);
-        let ge = b.cmp(CmpPred::Ge, CmpTy::I32, id, 0);
-        let lt = b.cmp(CmpPred::Lt, CmpTy::I32, id, e as i32);
+        let id0 = b.bitcast_i32(f);
+        // clamp to 0..=1023 (the verifier needs the bound; ids outside 0..E are masked to the dummy slot below anyway)
+        let id1 = b.let_(Op::MinI32(Opnd::Val(id0), Opnd::I32(1023)));
+        let id = b.bin(amdgpu_dsl::BinOp::MaxI32, id1, 0i32);
+        let ge = b.cmp(CmpPred::Ge, CmpTy::I32, id0, 0);
+        let lt = b.cmp(CmpPred::Lt, CmpTy::I32, id0, e as i32);
         let v1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(inb), a: Opnd::Val(id), b: Opnd::I32(1023) });
         let v2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ge), a: Opnd::Val(v1), b: Opnd::I32(1023) });
         let v3 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lt), a: Opnd::Val(v2), b: Opnd::I32(1023) });
