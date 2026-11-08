@@ -296,8 +296,8 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                         let sbits = b.bind_i32(ev(e) << 23);
                         let sf = b.bitcast_f32(sbits);
                         let d = 2 * k as u8 + h;
-                        let sl = b.var_slice4(bf, d / 4);
-                        let dw = b.frag4_lane(sl, d % 4);
+                        // dword d of the B fragment (a one-dword view of the variable)
+                        let dw = b.frag_slice(Opnd::Var(bf), d, 1);
                         let dwi = b.bitcast_i32(dw);
                         let w: Vec<ValueId> = (0..4i32)
                             .map(|byte| {
