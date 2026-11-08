@@ -681,6 +681,10 @@ impl Lowerer {
         let want = match self.defs.get(&v) {
             Some(Op::LoadLdsB128 { .. }) => (RClass::V4, 1usize),
             Some(Op::LoadLdsB128x2 { .. }) => (RClass::V8, 2usize),
+            // global / buffer loads, and in-place concatenations of loads (`frag_cat` / `cat_frag4`: the loads already write the halves)
+            Some(Op::FragCat { .. }) | Some(Op::LoadGlobalB128 { .. }) | Some(Op::BufferLoadN { .. }) | Some(Op::LoadGlobalN { .. }) => {
+                return self.try_coalesce_load_reload(v, dst);
+            }
             _ => return false,
         };
         let Some(&d) = self.val.get(&v) else { return false };
@@ -720,6 +724,71 @@ impl Lowerer {
         self.val.insert(v, dst);
         true
     }
+    /// `set_var(var, v)` where every dword of `v`'s register is written in this block by LOAD instructions (a global / buffer load, or a
+    /// `frag_cat` whose parts were loads retargeted into it): those loads write the variable's register (its aliases at the same offsets)
+    /// directly - no copy, and no wait at the definition (the use-based wait accounting follows the new register, also across the loop
+    /// back-edge). Legal only when nothing reads or writes the variable after the first of those loads.
+    fn try_coalesce_load_reload(&mut self, v: ValueId, dst: VReg) -> bool {
+        let Some(&d) = self.val.get(&v) else { return false };
+        let cls = self.mir.vreg_class(d);
+        if cls != self.mir.vreg_class(dst) || self.mir.alias.contains_key(&d) || self.mir.alias.contains_key(&dst) {
+            return false;
+        }
+        if self.val.values().filter(|x| **x == d).count() != 1 {
+            return false;
+        }
+        let insts = &self.mir.blocks[self.cur].insts;
+        let prod: Vec<usize> = insts
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.dst.map_or(false, |x| self.mir.canon(x) == d))
+            .map(|(k, _)| k)
+            .collect();
+        if prod.is_empty() {
+            return false;
+        }
+        let mut covered = 0u32;
+        for &k in &prod {
+            let i = &insts[k];
+            let a = crate::op_attrs::attrs(i.op);
+            // loads only (a memory read with a full register write)
+            if !a.mem.map_or(false, |m| !m.write) || matches!(a.regfx, crate::op_attrs::RegFx::PartialWrite) {
+                return false;
+            }
+            covered += self.mir.vreg_class(i.dst.unwrap()).dwords() as u32;
+        }
+        if covered != cls.dwords() as u32 {
+            return false;
+        }
+        let first = prod[0];
+        for (k, i) in insts.iter().enumerate().skip(first) {
+            if prod.contains(&k) {
+                continue;
+            }
+            if i.uses().iter().any(|u| self.mir.canon(*u) == dst || self.mir.canon(*u) == d) || i.dst.map_or(false, |x| self.mir.canon(x) == dst) {
+                return false;
+            }
+        }
+        let mut news: Vec<(usize, VReg)> = Vec::new();
+        for &k in &prod {
+            let old = self.mir.blocks[self.cur].insts[k].dst.unwrap();
+            let off = self.mir.alias.get(&old).map(|a| a.1).unwrap_or(0);
+            let c = self.mir.vreg_class(old);
+            let nd = if off == 0 && c == cls { dst } else { self.alias_vreg(dst, off, c) };
+            news.push((k, nd));
+        }
+        for (k, nd) in news {
+            self.mir.blocks[self.cur].insts[k].dst = Some(nd);
+        }
+        for e in self.pending_lds.iter_mut().chain(self.pending_vmem.iter_mut()) {
+            if *e == d {
+                *e = dst;
+            }
+        }
+        self.val.insert(v, dst);
+        true
+    }
+
     /// Make the instruction that produced value `v` write `new_dst` directly (instead of a fresh
     /// register that would then be moved into a fragment). Only for single-use results of plain
     /// ALU ops defined earlier in the current block.
