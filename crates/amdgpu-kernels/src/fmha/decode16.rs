@@ -8,7 +8,11 @@ use amdgpu_tile::{ev, LdsPlan, Lane};
 
 const D: i32 = 128;
 const ROW: i32 = 2 * D;
-const KT: i32 = 64;
+/// keys per tile (32: a 16 KB private K / V region per wave, two CTAs of 4 waves per CU)
+const KT: i32 = 32;
+const LKT: i32 = KT.trailing_zeros() as i32;
+/// 16-key blocks per tile
+const NKB: usize = (KT / 16) as usize;
 
 /// max / sum over the 4 lane groups (lanes l, l ^ 16, l ^ 32, l ^ 48)
 fn group4(b: &mut FnBuilder, x: ValueId, max: bool) -> ValueId {
@@ -102,11 +106,11 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
         let v = b.bind_i32(sv.gt(8).select_i32(4, s3) + 2);
         b.read_first_lane(v)
     };
-    let ntt = b.bind_i32((ev(ctx) + (KT - 1)).lshr(6));
-    let per = b.bind_i32(((ev(ntt) + ev(nsplit) - 1).lshr(ev(lg))) << 6);
+    let ntt = b.bind_i32((ev(ctx) + (KT - 1)).lshr(LKT));
+    let per = b.bind_i32(((ev(ntt) + ev(nsplit) - 1).lshr(ev(lg))) << LKT);
     let k_lo = { let v = b.bind_i32(ev(ns) * ev(per)); b.read_first_lane(v) };
     let k_hi = { let v = b.bind_i32((ev(k_lo) + ev(per)).min(ev(ctx))); b.read_first_lane(v) };
-    let ntile = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(6)); b.read_first_lane(v) };
+    let ntile = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(LKT)); b.read_first_lane(v) };
 
     // ---- descriptors ----
     let r_q = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_q, n) };
@@ -144,17 +148,17 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
     let l_init = b.c_f32(0.0);
     // loop state: it, m, l, O^T (8 blocks of 16 d), S^T (4 blocks of 16 keys)
     let mut inits: Vec<(DType, Opnd)> = vec![(DType::I32, Opnd::I32(0)), (DType::F32, Opnd::Val(m_init)), (DType::F32, Opnd::Val(l_init))];
-    inits.extend((0..12).map(|_| (DType::Frag4, Opnd::Val(zero4))));
+    inits.extend((0..8 + NKB).map(|_| (DType::Frag4, Opnd::Val(zero4))));
     let any = b.bind_cond(ev(ntile).gt(0));
     b.begin_if(Opnd::Val(any));
     let vars = b.begin_loop(&inits);
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..11].to_vec();
-    let sv_: Vec<VarId> = vars[11..15].to_vec();
+    let sv_: Vec<VarId> = vars[11..11 + NKB].to_vec();
     let itx = amdgpu_dsl::varx(it);
-    let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << 6)); b.read_first_lane(v) };
+    let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << LKT)); b.read_first_lane(v) };
     b.wait_lds(0);
-    let lookups: Vec<(ValueId, ValueId)> = (0..16)
+    let lookups: Vec<(ValueId, ValueId)> = (0..KT / 4)
         .map(|i| {
             let key = b.bind_i32(ev(key_t) + kk_of(i));
             let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
@@ -183,7 +187,7 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
     let kb = b.bind_i32(mbase.clone());
     me.read_back(&mut b, Opnd::Var(it), |b| {
         for c in 0..4usize {
-            for blk in 0..4i32 {
+            for blk in 0..NKB as i32 {
                 let a = b.bind_i32(ev(kr[c]) + ev(kb) + blk * 16 * ROW);
                 let kf = b.load_lds_b128(a);
                 b.var_mfma(sv_[blk as usize], kind, kf, qf[c], c == 0);
@@ -193,7 +197,7 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
     // ---- softmax: values key_t + 16 blk + 4 g + r ----
     let key0 = b.bind_i32(ev(key_t) + (ev(grp) << 2));
     let mut s: Vec<ValueId> = Vec::with_capacity(16);
-    for blk in 0..4usize {
+    for blk in 0..NKB {
         for r in 0..4u8 {
             let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
             let x = b.bitcast_f32(x);
@@ -248,7 +252,7 @@ pub fn pa_decode16_bf16_hd128(name: &str, page: i32) -> Function {    let mut b 
     let vb = b.bind_i32(mbase.clone() + KT * ROW + ev(vr));
     let nopv = std::env::var("EXP_NOPV").is_ok();
     if !nopv { me.read_back(&mut b, Opnd::Var(it), |b| {
-        for t in 0..2usize {
+        for t in 0..NKB / 2 {
             let w: Vec<ValueId> = [(2 * t, 0usize), (2 * t, 2), (2 * t + 1, 0), (2 * t + 1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
             let pf = b.pack4(w[0], w[1], w[2], w[3]);
             for db in 0..8i32 {
