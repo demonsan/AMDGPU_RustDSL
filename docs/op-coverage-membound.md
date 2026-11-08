@@ -291,3 +291,8 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 `reshape_cache_flash_bf16_h<Hk>_d<D>` 和 `reshape_cache_blocked_bf16_h<Hk>_d<D>_b<BS>` 现在支持任意大小的 cache（slot 到 2³¹ 个，每个 slot 行至多 64 KiB，即单个张量到 ≈ 128 GiB）：缓存描述符被一个 64 位 `ptr_mad` 移到当前 token 的 slot 行 / 块上（`num_records` = 一行 / 一块，所以 32 位偏移不再限制 cache 大小），非法 slot（< 0 或 ≥ S）的存储被屏蔽（backend 补丁，`origin/batch2-ptr64`）。新增主机测试 `tests/gpu/cache_big_host.cpp`：整个 cache 上散布的 slot（含 4 GiB / 8 GiB 之后的，以及首尾 slot、负的和 ≥ S 的非法 slot），每个被写的 slot / 块与 CPU 参考逐字节对比，抽样的未触碰行保持哨兵值；flash 12.2 / 30.5 GiB（h8, d128）和 14.3 GiB（h5, d64）、blocked 12.2 GiB，`bad = 0`。`moe_reduce` / `moe_combine` 同样改成每 token 一个描述符（`T · K · D · 2` 不再有 2 GiB 的限制）：T = 65535, K = 8, D = 7168（x = 7.5 GB）的抽样检查 `bad = 0`，5.73 TB/s；<4 GiB 的带宽与之前持平（6.0 / 5.9 / 5.9 TB/s，在噪声内）。
 
 带宽：< 4 GiB 时没有可测的退步——同一次运行里，新的 64 位版本与旧的 32 位实现（commit 297c4c53 的代码）在 flash h8, d128 上是 4988 vs 4926 GB/s（噪声内），blocked 随机 slot 870 / 连续 1433 GB/s 与之前持平。（此前几轮测得的 5.8 TB/s 是另一个时间点的机器状态：同一份旧代码现在也只有 4.9 TB/s；backend 交替运行新旧时看到的 5 % 差别也在这个噪声之内。）让数据加载紧跟在 slot 加载之后发出（已采用，无害）和把边界检查换成一次无符号比较（通不过 provenance 校验，已撤销）都没有带来可测的变化，所以不需要单独的 < 4 GiB 变体。
+
+
+## 短行的 layernorm / softmax：VALU 受限（结论）
+
+把短行每个 wave 同时在途的行数从 8 加到 16 没有可测的变化（rmsnorm N = 200：5284 → 5384，layernorm N = 200 3846、softmax N = 200 4363 都不动），所以短行不是延迟 / 在途字节受限，已撤销；它们是 VALU 受限：layernorm N = 200 每 wave 步约 150 条 VALU 处理 2 行（g = 32），softmax 还有每元素一次 `v_exp`（四分之一速率）。N = 400 / 256 的 layernorm（4224 / 4937）和 N = 400 的 softmax（4572）同理；N = 400 – 511 的行用 `g = 64`，一个 wave 里 50 – 63 个 lane 有数据，不是瓶颈。继续优化需要减少每元素的 VALU：用 `v_pk_add_f32` / `v_pk_mul_f32`（DSL 里有 `PkAddF32` / `PkMulF32`，tileop 的 `apply2` 会自动打包）重写 layernorm 的减均值 / 平方 / 缩放，理论上可去掉约三分之一的 VALU；暂未做。
