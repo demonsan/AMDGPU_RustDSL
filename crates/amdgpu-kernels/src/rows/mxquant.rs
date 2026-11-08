@@ -7,12 +7,13 @@
 //!   One wave per (16-row block, tile pair): lane (r = l % 16, g = l / 16) quantizes groups {16 p + g + 4 j} of row 16 rb + r.
 //!   M % 16 == 0, K % 512 == 0. Grid (ceil(K / 2048), M / 16) x 256 threads (wave w: tile pair min(4 x + w, KT / 2 - 1)).
 //! * `quant_mxfp8_bf16_k<K>`: x bf16 [M, K] -> q fp8 e4m3 [M, K] + 1 x 128 E8M0 scales [K / 128][M] (the `gemm_mxfp8_bs_v4` A-scale
-//!   layout, K-major). e8m0 = ceil(log2(amax / 448)) + 127 (no saturation), clamp [0, 254]. Lane = row (64 rows per wave), one 128-wide
-//!   group per wave: grid (K / 512, M / 64) x 256 threads (wave w: group 4 x + w). M % 64 == 0, K % 512 == 0.
+//!   layout, K-major). e8m0 = ceil(log2(amax / 448)) + 127 (no saturation), clamp [0, 254]. A 16-lane group per (row, 128-wide group): lane
+//!   j reads 8 values (16 bytes; the 16 lanes read the group's 256 contiguous bytes), amax by a 16-lane DPP all-reduce; a wave = 4 rows, a
+//!   CTA = 16 rows: grid (K / 128, M / 16) x 256 threads. M % 16 == 0, K % 128 == 0.
 //!
 //! ABI (both): x @0, q @8, scale @16, M @24 (i32).
 use amdgpu_dsl::{CompileProfile, CvtOp, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, ValueId};
-use amdgpu_tile::prims::{abs_f32, bf16x8_to_f32};
+use amdgpu_tile::prims::{abs_f32, bf16x8_to_f32, group_reduce_dpp, RedOp};
 use amdgpu_tile::{ev, Lane};
 
 pub fn by_name(name: &str) -> Option<Function> {
@@ -121,29 +122,28 @@ fn mxfp4(name: &str, k: i64) -> Function {
 fn mxfp8(name: &str, k: i64) -> Function {
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
-    abi(&mut b, 64, k, k, k / 128);
-    b.grid_is(0, Ext::c(k / 512));
+    abi(&mut b, 16, k, k, k / 128);
+    b.grid_is(0, Ext::c(k / 128));
     b.grid_is(1, Ext::sym("MB"));
     let kp = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargPtr { offset: o });
     let (p_x, p_q, p_s) = (kp(&mut b, 0), kp(&mut b, 8), kp(&mut b, 16));
     let m_v = b.let_(Op::KernargI32 { offset: 24 });
-    let x0 = b.let_(Op::WorkgroupIdX);
+    let kb = b.let_(Op::WorkgroupIdX);
     let mb = b.let_(Op::WorkgroupIdY);
     let lane = Lane::new(&mut b);
-    let kb = { let v = b.bind_i32((ev(x0) << 2) + lane.wave()); b.read_first_lane(v) };
-    let row = b.bind_i32((ev(mb) << 6) + lane.lane());
+    let j = b.bind_i32(lane.lane() & 15);
+    let row = b.bind_i32((ev(mb) << 4) + (lane.wave() << 2) + lane.lane().lshr(4));
     let nx = { let v = b.bind_i32(ev(m_v) * (2 * k as i32)); b.read_first_lane(v) };
     let nq = { let v = b.bind_i32(ev(m_v) * (k as i32)); b.read_first_lane(v) };
     let ns = { let v = b.bind_i32(ev(m_v) * (k as i32 / 128)); b.read_first_lane(v) };
     let (r_x, r_q, r_s) = (b.buffer_desc_dyn(p_x, nx), b.buffer_desc_dyn(p_q, nq), b.buffer_desc_dyn(p_s, ns));
     let c0 = b.c_i32(0);
-    let xo = b.bind_i32((ev(row) * (k as i32) + (ev(kb) << 7)) << 1);
-    let mut xs: Vec<ValueId> = Vec::with_capacity(128);
-    for c in 0..16u32 {
-        let f = b.buffer_load_b128(r_x, xo, c0, 16 * c);
-        xs.extend(bf16x8_to_f32(&mut b, f));
-    }
-    let amax = amax_of(&mut b, &xs);
+    let col = b.bind_i32((ev(kb) << 7) + (ev(j) << 3));
+    let xo = b.bind_i32((ev(row) * (k as i32) + ev(col)) << 1);
+    let f = b.buffer_load_b128(r_x, xo, c0, 0);
+    let xs = bf16x8_to_f32(&mut b, f);
+    let am = amax_of(&mut b, &xs);
+    let amax = group_reduce_dpp(&mut b, RedOp::Max, am, 16);
     // e8m0 = ceil(log2(amax / 448)) + 127: the exponent of amax / 448, + 1 when its mantissa is not zero
     let c448 = b.c_f32(1.0 / 448.0);
     let t = b.mul_f32(amax, c448);
@@ -153,22 +153,22 @@ fn mxfp8(name: &str, k: i64) -> Function {
     let e = b.bind_i32((ev(ex) + ev(up)).max(0).min(254));
     let sbits = b.bind_i32(ev(e).max(1) << 23);
     let sf = b.bitcast_f32(sbits);
-    let qo = b.bind_i32(ev(row) * (k as i32) + (ev(kb) << 7));
-    for c in 0..8usize {
-        // 16 values -> 16 bytes: v_cvt_scalef32_pk_fp8_f32 packs two values into word `sel`
-        let mut words: Vec<ValueId> = Vec::with_capacity(4);
-        for w in 0..4usize {
-            let i = 16 * c + 4 * w;
-            let lo = b.c_i32(0);
-            let a = b.cvt(CvtOp::ScalePkFp8F32, &[Opnd::Val(xs[i]), Opnd::Val(xs[i + 1]), Opnd::Val(sf), Opnd::Val(lo)], 0);
-            let a = b.cvt(CvtOp::ScalePkFp8F32, &[Opnd::Val(xs[i + 2]), Opnd::Val(xs[i + 3]), Opnd::Val(sf), Opnd::Val(a)], 1);
-            words.push(a);
-        }
-        let f4 = b.frag4(words[0], words[1], words[2], words[3]);
-        b.buffer_store_b128(r_q, qo, c0, 16 * c as u32, f4);
+    let mut words: Vec<ValueId> = Vec::with_capacity(2);
+    for w in 0..2usize {
+        let i = 4 * w;
+        let lo = b.c_i32(0);
+        let a = b.cvt(CvtOp::ScalePkFp8F32, &[Opnd::Val(xs[i]), Opnd::Val(xs[i + 1]), Opnd::Val(sf), Opnd::Val(lo)], 0);
+        let a = b.cvt(CvtOp::ScalePkFp8F32, &[Opnd::Val(xs[i + 2]), Opnd::Val(xs[i + 3]), Opnd::Val(sf), Opnd::Val(a)], 1);
+        words.push(a);
     }
-    // scale [K / 128][M]: byte (kb M + row)
+    let f2 = b.frag2(words[0], words[1]);
+    let qo = b.bind_i32(ev(row) * (k as i32) + ev(col));
+    b.buffer_store_b64(r_q, qo, c0, 0, f2);
+    // scale [K / 128][M]: byte (kb M + row), written by lane j = 0 of the group
+    let big = b.c_i32(0x7fff_fff0);
     let so = b.bind_i32(ev(kb) * ev(m_v) + ev(row));
+    let first = b.bind_cond(ev(j).eq(0));
+    let so = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(first), a: Opnd::Val(so), b: Opnd::Val(big) });
     b.buffer_store_n(r_s, Some(Opnd::Val(so)), c0, 0, e, MemTy::U8, false);
     b.finish()
 }
