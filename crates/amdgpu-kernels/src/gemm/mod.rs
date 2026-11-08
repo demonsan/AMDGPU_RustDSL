@@ -1517,6 +1517,9 @@ fn moe_epilogue(
         };
         if up {
             let MoeStage::Up { gelu, doweight } = mc.st else { unreachable!() };
+            // the row / first column part of the store offset (padding rows: past the descriptor); the 16-column block p in the instruction offset
+            let vr0 = b.bind_i32((ev(orow) * ev(mc.nout) + ev(col0)) << 1);
+            let vrow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(vr0), b: Opnd::Val(big) });
             for p in 0..nn / 2 {
                 let col = b.bind_i32(ev(col0) + 16 * p as i32);
                 let mut g = vals(b, nn * i + 2 * p);
@@ -1563,11 +1566,11 @@ fn moe_epilogue(
                 let w0 = b.cvt_pk_bf16_f32(y[0], y[1]);
                 let w1 = b.cvt_pk_bf16_f32(y[2], y[3]);
                 let f2 = b.frag2(w0, w1);
-                let vr = b.bind_i32((ev(orow) * ev(mc.nout) + ev(col)) << 1);
-                let vv = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(vr), b: Opnd::Val(big) });
-                b.buffer_store_b64(rsrc_c, vv, c0, 0, f2);
+                b.buffer_store_b64(rsrc_c, vrow, c0, (32 * p) as u32, f2);
             }
         } else {
+            let vr0 = b.bind_i32((ev(orow) * ev(mc.nout) + ev(col0)) << 2);
+            let vrow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(vr0), b: Opnd::Val(big) });
             for j in 0..nn {
                 let col = b.bind_i32(ev(col0) + 16 * j as i32);
                 let mut v = vals(b, nn * i + j);
@@ -1581,9 +1584,7 @@ fn moe_epilogue(
                     v[k] = b.bitcast_i32(y);
                 }
                 let f4 = b.frag4(v[0], v[1], v[2], v[3]);
-                let vr = b.bind_i32((ev(orow) * ev(mc.nout) + ev(col)) << 2);
-                let vv = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(vr), b: Opnd::Val(big) });
-                b.buffer_store_b128(rsrc_c, vv, c0, 0, f4);
+                b.buffer_store_b128(rsrc_c, vrow, c0, (64 * j) as u32, f4);
             }
         }
     }
