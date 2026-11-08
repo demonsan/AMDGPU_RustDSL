@@ -115,7 +115,18 @@ pub fn localize(f: &Function, mut d: Diag) -> Diag {
             d.src_exact = exact;
         }
     }
+    // the statement's operand values (where the inputs of the failing node were built)
+    if let Some(s) = d.stmt {
+        if let Some(st) = f.stmts().get(s) {
+            for v in amdgpu_dsl::facts::stmt_value_uses(st).into_iter().take(6) {
+                d.values.push((format!("v{v}"), f.value_loc(v)));
+            }
+        }
+    }
     for v in values_of(&d.message) {
+        if d.values.iter().any(|(n, _)| *n == format!("v{v}")) {
+            continue;
+        }
         if (v as usize) < f.value_tys.len() {
             d.values.push((format!("v{v}"), f.value_loc(v)));
         }
