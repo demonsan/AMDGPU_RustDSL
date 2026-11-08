@@ -244,6 +244,17 @@ fn schedule_block_runs(m: &mut MFunction, bi: usize, o: &Options, lv: &liveness:
 
 /// Run the scheduling pass over the whole function.
 pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
+    // The register budget every pass schedules against may not exceed what the workgroup can launch with: ceil(waves / 4) waves share a SIMD's
+    // 512-entry file (a 1024-thread block leaves 128 per wave). Moving loads up past that (e.g. later passes' loads hoisted above an earlier
+    // reduction) would make the kernel unlaunchable; keep 8 registers of headroom for temporaries.
+    let launch = launch_vgpr_budget(m.workgroup_size);
+    let clamped;
+    let o = if o.max_vgprs > launch {
+        clamped = Options { max_vgprs: launch, ..o.clone() };
+        &clamped
+    } else {
+        o
+    };
     let mut stats = Stats::default();
     if o.cfg_cleanup {
         cfg::cleanup(m);
@@ -292,3 +303,11 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
 
 #[cfg(test)]
 mod tests;
+
+/// The per-wave register budget a scheduler may plan for: 512 / ceil(waves / 4) registers per wave, minus 8 of headroom, capped at 240 (the
+/// default arch-VGPR budget).
+pub fn launch_vgpr_budget(workgroup_size: u32) -> u32 {
+    let waves = (workgroup_size + 63) / 64;
+    let per_simd = ((waves + 3) / 4).max(1);
+    (512 / per_simd).saturating_sub(8).min(240)
+}

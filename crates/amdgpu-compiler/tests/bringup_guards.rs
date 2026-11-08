@@ -89,3 +89,14 @@ fn a_kernel_over_the_launch_register_budget_is_rejected() {
         }
     }
 }
+
+/// The scheduler plans against the launch budget: a 1024-thread block (4 waves per SIMD) leaves 128 registers per wave (minus 8 headroom).
+#[test]
+fn the_scheduler_budget_follows_the_workgroup_size() {
+    use amdgpu_compiler::sched::launch_vgpr_budget;
+    assert_eq!(launch_vgpr_budget(1024), 120);
+    assert_eq!(launch_vgpr_budget(768), 120);
+    assert_eq!(launch_vgpr_budget(512), 240);
+    assert_eq!(launch_vgpr_budget(256), 240);
+    assert_eq!(launch_vgpr_budget(64), 240);
+}
