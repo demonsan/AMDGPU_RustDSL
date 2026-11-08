@@ -715,6 +715,9 @@ struct Mx32 {
     voff_a: Vec<ValueId>,
     voff_b: Vec<ValueId>,
     shift: ValueId,
+    /// `reg_b` (shuffled scales): [rows / 16][KT / 2][lane][4 bytes] with lane 16 g + r holding the bytes of K groups g, 4 + g of the even
+    /// tile, then of the odd tile (one coalesced dword per lane, block and tile pair); the bit shift of the last `load_scales` (0 / 16)
+    shuf: Option<std::cell::RefCell<Option<ValueId>>>,
 }
 
 impl Body {
@@ -763,6 +766,14 @@ impl Body {
             let sb = bs.voff_b.iter().map(|v| b.buffer_load_f32(self.rsrc_sfb, *v, so, 0)).collect();
             return (sa, sb);
         }
+        if let (Some(mx), Some(sh)) = (&self.mx32, self.mx32.as_ref().and_then(|m| m.shuf.as_ref())) {
+            // shuffled: the tile pair kb / 2 (256 bytes per block), the tile's half selected by a shift at the install
+            let so = { let v = b.bind_i32(kb.clone().lshr(1) << 8); b.read_first_lane(v) };
+            let s = b.bind_i32((kb & 1) << 4);
+            *sh.borrow_mut() = Some(s);
+            let ld = |b: &mut FnBuilder, rs: ValueId, vo: &[ValueId]| -> Vec<ValueId> { vo.iter().map(|v| b.buffer_load_f32(rs, *v, so, 0)).collect() };
+            return (ld(b, self.rsrc_sfa, &mx.voff_a), ld(b, self.rsrc_sfb, &mx.voff_b));
+        }
         if let Some(mx) = &self.mx32 {
             // 1 x 32 E8M0 [rows][K / 32] bytes: the 8 groups of the tile (one 8-byte load per m / n block); the lane group g = lane / 16 of
             // MFMA h (fragment bytes 64 h + 16 g ..) covers K group 4 h + g: v_perm puts byte g of the low word in byte 0 and byte g of the high
@@ -789,6 +800,11 @@ impl Body {
     /// The scale word of a `load_scales` value: `Scales::Mx32` selects the lane's two group bytes of the 8-byte load (v_perm); identity otherwise.
     fn scale_word(&self, b: &mut FnBuilder, v: ValueId) -> ValueId {
         match &self.mx32 {
+            Some(mx) if mx.shuf.is_some() => {
+                let s = mx.shuf.as_ref().unwrap().borrow().expect("shift of the last scale load");
+                let w = b.bitcast_i32(v);
+                b.bind_i32(ev(w).lshr(ev(s)))
+            }
             Some(mx) => {
                 let lo = b.frag2_lane(v, 0);
                 let hi = b.frag2_lane(v, 1);
@@ -1607,12 +1623,26 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let rowb = b.bind_i32(ev(kb_v) << 3);
         let a0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * (wave_m as i32) + ev(r16));
         let b0 = b.bind_i32((ev(bx) << lg_n) + ev(wn) * (wave_n as i32) + ev(r16));
-        let voff_a = (0..wave_m / 16).map(|i| b.bind_i32((ev(a0) + (16 * i) as i32) * ev(rowb))).collect();
-        let voff_b = (0..wave_n / 16).map(|j| b.bind_i32((ev(b0) + (16 * j) as i32) * ev(rowb))).collect();
+        let (voff_a, voff_b) = if cfg.reg_b {
+            // shuffled: block (row / 16) of [rows / 16][KT / 2][64][4]: (row / 16) KT 128 + 4 lane (KT even)
+            let blk = b.bind_i32(ev(kb_v) << 7);
+            let l4 = b.bind_i32(lane.lane() << 2);
+            let ra = b.bind_i32(((ev(by) << lg_m) + ev(wm) * (wave_m as i32)).lshr(4));
+            let rb = b.bind_i32(((ev(bx) << lg_n) + ev(wn) * (wave_n as i32)).lshr(4));
+            (
+                (0..wave_m / 16).map(|i| b.bind_i32((ev(ra) + i as i32) * ev(blk) + ev(l4))).collect::<Vec<_>>(),
+                (0..wave_n / 16).map(|j| b.bind_i32((ev(rb) + j as i32) * ev(blk) + ev(l4))).collect::<Vec<_>>(),
+            )
+        } else {
+            (
+                (0..wave_m / 16).map(|i| b.bind_i32((ev(a0) + (16 * i) as i32) * ev(rowb))).collect(),
+                (0..wave_n / 16).map(|j| b.bind_i32((ev(b0) + (16 * j) as i32) * ev(rowb))).collect(),
+            )
+        };
         // v_perm selector: byte 0 = byte g of the low word (S1 bytes 0..3), byte 1 = byte g of the high word (S0 bytes 4..7), bytes 2, 3 = 0
         let gg = b.bind_i32(lane.lane().lshr(4));
         let shift = b.bind_i32(ev(gg) + ((ev(gg) + 4) << 8) + 0x0C0C_0000);
-        Mx32 { voff_a, voff_b, shift }
+        Mx32 { voff_a, voff_b, shift, shuf: cfg.reg_b.then(|| std::cell::RefCell::new(None)) }
     });
     let body = Body {
         cfg, kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
