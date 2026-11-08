@@ -405,3 +405,22 @@ pub fn random_topo(units: &Units, seed: u64) -> Vec<UnitId> {
     }
     ord
 }
+/// EXPERIMENT: declaration order perturbed by `swaps` random legal adjacent swaps (two neighbours without a dependency between them; deps are
+/// transitive through the order, so an adjacent swap keeps the order topological iff the later unit does not depend on the earlier one).
+pub fn perturb_topo(units: &Units, seed: u64, swaps: usize) -> Vec<UnitId> {
+    let n = units.len();
+    let mut ord: Vec<UnitId> = (0..n).collect();
+    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    for _ in 0..swaps {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        if n < 2 {
+            break;
+        }
+        let i = ((s >> 33) as usize) % (n - 1);
+        let (a, b) = (ord[i], ord[i + 1]);
+        if !units.unit(b).deps.contains(&a) {
+            ord.swap(i, i + 1);
+        }
+    }
+    ord
+}

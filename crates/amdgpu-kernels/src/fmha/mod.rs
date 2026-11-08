@@ -515,7 +515,8 @@ impl PipeBody for AttnBody3<'_> {
         match std::env::var("AMDC_EXP_FINE_SEED").ok().and_then(|s| s.parse::<u64>().ok()) {
             Some(seed) => inst.emit_with(b, |w| {
                 let w = w.fine();
-                let ord = amdgpu_tile::weave::random_topo(w.units(), seed);
+                let n = w.units().len();
+                let ord = amdgpu_tile::weave::perturb_topo(w.units(), seed, 4 * n);
                 w.order(ord)
             }),
             None => inst.emit(b),
