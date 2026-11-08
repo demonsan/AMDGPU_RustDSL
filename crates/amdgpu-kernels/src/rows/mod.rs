@@ -9,7 +9,7 @@
 
 pub mod quant;
 
-use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
+use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
 use amdgpu_tile::prims::{bf16x8_to_f32, lane_reduce, rsqrt_f32, wave_reduce, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
@@ -121,13 +121,13 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
         (0..ngrp).map(|q| if q == 0 { vr } else { b.bind_i32(ev(vr) + 4096 * q as i32) }).collect()
     };
     let gg: Vec<ValueId> = (0..ngrp).map(|q| if q == 0 { vg } else { b.bind_i32(ev(vg) + 4096 * q as i32) }).collect();
-    let load = |b: &mut FnBuilder, rs: ValueId, g: &[ValueId]| -> Vec<ValueId> { (0..nld).map(|i| b.buffer_load_b128(rs, g[i / 4], 0i32, (1024 * (i % 4)) as u32)).collect() };
+    let load = |b: &mut FnBuilder, rs: ValueId, g: &[ValueId], c: CachePolicy| -> Vec<ValueId> { (0..nld).map(|i| b.buffer_load_c(rs, Some(Opnd::Val(g[i / 4])), 0i32, (1024 * (i % 4)) as u32, MemTy::B128, c)).collect() };
     let gxs: Vec<Vec<ValueId>> = (0..rpw).map(|r| gx_of(b, r)).collect();
     // every row's loads are issued before any compute: rpw * (row bytes) in flight per wave
-    let xs_all: Vec<Vec<ValueId>> = gxs.iter().map(|g| load(b, r_x, g)).collect();
-    let rs_all: Option<Vec<Vec<ValueId>>> = r_res.map(|r| gxs.iter().map(|g| load(b, r, g)).collect());
-    let gs = r_g.map(|r| load(b, r, &gg));
-    let bs = r_be.map(|r| load(b, r, &gg));
+    let xs_all: Vec<Vec<ValueId>> = gxs.iter().map(|g| load(b, r_x, g, CachePolicy::NT)).collect();
+    let rs_all: Option<Vec<Vec<ValueId>>> = r_res.map(|r| gxs.iter().map(|g| load(b, r, g, CachePolicy::NT)).collect());
+    let gs = r_g.map(|r| load(b, r, &gg, CachePolicy::NONE));
+    let bs = r_be.map(|r| load(b, r, &gg, CachePolicy::NONE));
     b.wait_vm(0);
     // chunk validity: only the last chunk can reach past the row (n % 512 != 0)
     let valid: Vec<Option<ValueId>> = (0..nld)
@@ -282,9 +282,9 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 None => base,
                 Some(c) => b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c), a: Opnd::Val(base), b: Opnd::I32(-16) }),
             };
-            b.buffer_store_b128(r_out, voff, 0i32, 0, f4);
+            b.buffer_store_c(r_out, Some(Opnd::Val(voff)), 0i32, 0, f4, MemTy::B128, false, CachePolicy::NT);
             if let Some(ro) = r_rout {
-                b.buffer_store_b128(ro, voff, 0i32, 0, rout_words[i]);
+                b.buffer_store_c(ro, Some(Opnd::Val(voff)), 0i32, 0, rout_words[i], MemTy::B128, false, CachePolicy::NT);
             }
         }
     }

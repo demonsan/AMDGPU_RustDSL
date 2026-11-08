@@ -3,7 +3,7 @@
 //!
 //! * `reshape_cache_flash_bf16_h<Hk>_d<D>`: ABI k @0, v @8, key_cache @16, value_cache @24, slot_mapping @32, T @40 (i32), S @44 (i32, slots of the cache). Caches < 4 GiB (32-bit buffer offsets).
 
-use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd};
+use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd};
 use amdgpu_tile::ev;
 
 pub fn by_name(name: &str) -> Option<Function> {
@@ -74,8 +74,8 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
     let mut loaded = Vec::new();
     for it in 0..iters {
         let so = b.bind_i32(ev(src) + (it * lt as i64 * 16) as i32);
-        let kv = b.buffer_load_b128(r_k, so, 0i32, 0);
-        let vv = b.buffer_load_b128(r_v, so, 0i32, 0);
+        let kv = b.buffer_load_c(r_k, Some(Opnd::Val(so)), 0i32, 0, MemTy::B128, CachePolicy::NT);
+        let vv = b.buffer_load_c(r_v, Some(Opnd::Val(so)), 0i32, 0, MemTy::B128, CachePolicy::NT);
         let lane_ok = b.let_(Op::CmpLtI32(Opnd::Val(lane), Opnd::I32((nv - it * lt as i64) as i32)));
         loaded.push((it, kv, vv, lane_ok));
     }
@@ -84,8 +84,8 @@ pub fn reshape_cache_flash(name: &str, h: i64, d: i64) -> Function {
         let o1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(dof), b: Opnd::I32(-16) });
         let o2 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(lane_ok), a: Opnd::Val(o1), b: Opnd::I32(-16) });
         let o = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(tok_ok), a: Opnd::Val(o2), b: Opnd::I32(-16) });
-        b.buffer_store_b128(r_kc, o, 0i32, 0, kv);
-        b.buffer_store_b128(r_vc, o, 0i32, 0, vv);
+        b.buffer_store_c(r_kc, Some(Opnd::Val(o)), 0i32, 0, kv, MemTy::B128, false, CachePolicy::NT);
+        b.buffer_store_c(r_vc, Some(Opnd::Val(o)), 0i32, 0, vv, MemTy::B128, false, CachePolicy::NT);
     }
     fb.finish()
 }

@@ -24,7 +24,8 @@ int main(int argc, char** argv) {
     hipModule_t mod; hipFunction_t fn; CK(hipModuleLoad(&mod, co)); CK(hipModuleGetFunction(&fn, mod, kn));
     struct __attribute__((packed)) { void *g, *w, *i; int32_t t; } args{dg, dw, di, (int32_t)T};
     size_t sz = sizeof(args); void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
-    int grid = (int)((T + 3) / 4);
+    long Lg = 1; while (Lg < (E + 7) / 8) Lg <<= 1; long rpw = 64 / Lg;   // lanes per row, rows per wave (topk/mod.rs)
+    int grid = (int)((T + 4 * rpw - 1) / (4 * rpw));
     CK(hipModuleLaunchKernel(fn, grid, 1, 1, 256, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize());
     std::vector<float> hw((size_t)T * K + 16); std::vector<int32_t> hi((size_t)T * K + 16);
     CK(hipMemcpy(hw.data(), dw, hw.size() * 4, hipMemcpyDeviceToHost)); CK(hipMemcpy(hi.data(), di, hi.size() * 4, hipMemcpyDeviceToHost));

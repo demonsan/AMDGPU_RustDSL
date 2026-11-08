@@ -13,7 +13,7 @@
 #include "activation.h"
 #include "quant.h"
 #include "rmsnorm_quant.h"
-#include "moe_topk_op.h"
+#include "moe_op.h"
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s failed: %s\n", #x, hipGetErrorString(e_)); std::exit(1); } } while (0)
 static uint16_t f32_to_bf16(float f) { uint32_t u; std::memcpy(&u, &f, 4); u += 0x7fff + ((u >> 16) & 1); return (uint16_t)(u >> 16); }
 static AiterTensor bf16_rand(std::initializer_list<int64_t> dims, size_t n, float sd, uint32_t seed) {
