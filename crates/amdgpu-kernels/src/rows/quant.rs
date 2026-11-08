@@ -7,7 +7,7 @@
 //!
 //! N (D) a multiple of 8, 8..=8192; chunks past the row end are masked in the statistics and their stores dropped by the buffer descriptor.
 
-use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, ValueId};
+use amdgpu_dsl::{CachePolicy, MemTy, CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, TriOp, UnOp, ValueId};
 use amdgpu_tile::prims::{act, abs_f32, bf16x8_to_f32, fp8_pack, fp8_scale, lane_reduce, wave_reduce, Act, RedOp};
 use amdgpu_tile::{ev, Lane, LdsPlan};
 
@@ -16,10 +16,14 @@ pub enum QuantKind {
     Token,
     Group128,
     SiluMulToken,
+    /// per-token int8: `scale = max|x| / 127`, `q = clamp(rne(x / scale), -127, 127)`
+    TokenInt8,
 }
 
 pub fn by_name(name: &str) -> Option<Function> {
-    let (rest, k, mult) = if let Some(r) = name.strip_prefix("quant_group128_bf16_fp8_n") {
+    let (rest, k, mult) = if let Some(r) = name.strip_prefix("quant_token_bf16_int8_n") {
+        (r, QuantKind::TokenInt8, 8)
+    } else if let Some(r) = name.strip_prefix("quant_group128_bf16_fp8_n") {
         (r, QuantKind::Group128, 128)
     } else if let Some(r) = name.strip_prefix("quant_token_bf16_fp8_n") {
         (r, QuantKind::Token, 8)
@@ -30,6 +34,32 @@ pub fn by_name(name: &str) -> Option<Function> {
     };
     let n: i64 = rest.parse().ok()?;
     (n % mult == 0 && (8..=8192).contains(&n)).then(|| quant_kernel(name, n, k))
+}
+
+/// The int8 row scale (`max(amax, 1e-12) / 127`) and its reciprocal.
+fn int8_scale(b: &mut FnBuilder, amax: ValueId) -> (ValueId, ValueId) {
+    let tiny = b.c_f32(1e-12);
+    let a = b.max_f32(amax, tiny);
+    let k = b.c_f32(1.0 / 127.0);
+    let scale = b.mul_f32(a, k);
+    let inv = b.rcp_f32(scale);
+    (scale, inv)
+}
+
+/// `clamp(rne(y * inv), -127, 127)` as int8, four per dword in value order.
+fn int8_pack(b: &mut FnBuilder, ys: &[ValueId; 8], inv: ValueId) -> Vec<ValueId> {
+    let lo = b.c_i32(-127);
+    let hi = b.c_i32(127);
+    let q: Vec<ValueId> = ys
+        .iter()
+        .map(|&y| {
+            let t = b.mul_f32(y, inv);
+            let r = b.un(UnOp::RndneF32, t);
+            let i = b.un(UnOp::CvtI32F32, r);
+            b.tri(TriOp::Med3I32, i, lo, hi)
+        })
+        .collect();
+    q.chunks(4).map(|c| b.bind_i32((ev(c[0]) & 255) + ((ev(c[1]) & 255) << 8) + ((ev(c[2]) & 255) << 16) + (ev(c[3]) << 24))).collect()
 }
 
 fn sel_f32(b: &mut FnBuilder, cond: ValueId, x: ValueId, y: ValueId) -> ValueId {
@@ -136,7 +166,7 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
     }
     let abs8 = |b: &mut FnBuilder, y: &[ValueId; 8]| -> Vec<ValueId> { y.iter().map(|&v| abs_f32(b, v)).collect() };
     let store_q = |b: &mut FnBuilder, i: usize, inv: ValueId, y: &[ValueId; 8]| {
-        let words = fp8_pack(b, y, inv);
+        let words = if kind == QuantKind::TokenInt8 { int8_pack(b, y, inv) } else { fp8_pack(b, y, inv) };
         let f2 = b.frag2(words[0], words[1]);
         let base = b.bind_i32(ev(row) * n as i32 + (lane.lane() << 3) + 512 * i as i32);
         let voff = match valid[i] {
@@ -146,7 +176,7 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
         b.buffer_store_c(r_q, Some(Opnd::Val(voff)), 0i32, 0, f2, MemTy::B64, false, CachePolicy::NT);
     };
     match kind {
-        QuantKind::Token | QuantKind::SiluMulToken => {
+        QuantKind::Token | QuantKind::SiluMulToken | QuantKind::TokenInt8 => {
             let mut part: Option<ValueId> = None;
             for i in 0..nld {
                 let a = abs8(b, &ys[i]);
@@ -154,7 +184,7 @@ pub fn quant_kernel(name: &str, n: i64, kind: QuantKind) -> Function {
                 part = Some(match part { None => m, Some(p) => b.max_f32(p, m) });
             }
             let amax = wave_reduce(b, RedOp::Max, part.unwrap(), &me, 0, 0, &lane);
-            let (s, inv) = fp8_scale(b, amax);
+            let (s, inv) = if kind == QuantKind::TokenInt8 { int8_scale(b, amax) } else { fp8_scale(b, amax) };
             for i in 0..nld {
                 store_q(b, i, inv, &ys[i]);
             }

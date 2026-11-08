@@ -4,11 +4,11 @@
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-4}
 A=${AMDC:-/tmp/target-b2/debug/amdc}; R=${ROCM:-/shared/apps/ubuntu/opt/rocm-7.0.2}; CL=${CLANG:-/shared/apps/ubuntu/opt/rocm-10.1.0/llvm/bin/clang}; O=${1:-build/b2}
 mkdir -p $O
-for h in eltwise rows quant cast rope cache topk; do [ -x $O/${h}_host ] || $R/bin/amdclang++ -x hip -O2 --offload-arch=gfx950 --rocm-path=$R -std=c++17 tests/gpu/${h}_host.cpp -o $O/${h}_host -L$R/lib -lamdhip64 -Wl,-rpath,$R/lib 2>&1 | grep error; done
+for h in eltwise rows quant cast rope cache topk dequant; do [ -x $O/${h}_host ] || $R/bin/amdclang++ -x hip -O2 --offload-arch=gfx950 --rocm-path=$R -std=c++17 tests/gpu/${h}_host.cpp -o $O/${h}_host -L$R/lib -lamdhip64 -Wl,-rpath,$R/lib 2>&1 | grep error; done
 mk() { [ -f $O/$1.co ] && [ $O/$1.co -nt $A ] && return 0; $A emit $1 --backend=own --out $O/$1.s > $O/$1.log 2>&1 || { echo "EMIT FAIL $1"; head -4 $O/$1.log; return 1; }; $CL -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -mcode-object-version=6 -o $O/$1.co $O/$1.s; }
 one() { lab=$1; shift; out=$("$@" 2>&1); echo "$lab | $(echo "$out" | grep -E '^check' | sed -E 's/.*(bad[a-z_]*=[0-9]+).*(OK|FAIL)$/\1 \2/' | head -1) | $(echo "$out" | grep -E '^timing' | sed -E 's/.*ms\/iter[^,]*, ([0-9.]+) GB\/s.*/\1 GB\/s/; s/^timing: ([0-9.]+) ms\/iter \(([0-9.]+) us\).*/\2 us/' | head -1)"; }
-E=$O/eltwise_host; RW=$O/rows_host; Q=$O/quant_host; C=$O/cast_host; RP=$O/rope_host; CA=$O/cache_host; TK=$O/topk_host
-for k in silu_mul_bf16_d4096 silu_mul_bf16_d1024 silu_mul_bf16_d14336 silu_mul_bf16_d24 gelu_tanh_mul_bf16_d4096 add_bf16 cvt_f32_bf16 cvt_bf16_f32 quant_bf16_fp8_static rmsnorm_bf16_n4096 rmsnorm_bf16_n1000 rmsnorm_bf16_n200 add_rmsnorm_bf16_n4096 layernorm_bf16_n4096 layernorm_bf16_n776 softmax_bf16_n4096 softmax_bf16_n1000 softmax_bf16_n8192 quant_token_bf16_fp8_n4096 quant_token_bf16_fp8_n1000 quant_group128_bf16_fp8_n4096 quant_group128_bf16_fp8_n640 silu_mul_quant_fp8_d4096 silu_mul_quant_fp8_d1000 rope_neox_bf16_h32_d128 rope_gptj_bf16_h32_d128 rope_neox_bf16_h8_d128 rope_neox_bf16_h40_d64 reshape_cache_flash_bf16_h8_d128 reshape_cache_flash_bf16_h5_d64 topk_softmax_bf16_e128_k8 topk_softmax_renorm_bf16_e256_k8; do mk $k; done
+DQ=$O/dequant_host; E=$O/eltwise_host; RW=$O/rows_host; Q=$O/quant_host; C=$O/cast_host; RP=$O/rope_host; CA=$O/cache_host; TK=$O/topk_host
+for k in silu_mul_bf16_d4096 silu_mul_bf16_d1024 silu_mul_bf16_d14336 silu_mul_bf16_d24 gelu_tanh_mul_bf16_d4096 add_bf16 cvt_f32_bf16 cvt_bf16_f32 quant_bf16_fp8_static rmsnorm_bf16_n4096 rmsnorm_bf16_n1000 rmsnorm_bf16_n200 add_rmsnorm_bf16_n4096 layernorm_bf16_n4096 layernorm_bf16_n776 softmax_bf16_n4096 softmax_bf16_n1000 softmax_bf16_n8192 quant_token_bf16_fp8_n4096 quant_token_bf16_fp8_n1000 quant_group128_bf16_fp8_n4096 quant_group128_bf16_fp8_n640 quant_token_bf16_int8_n4096 quant_token_bf16_int8_n1000 dequant_fp8_bf16_static dequant_fp8_bf16_token_n4096 dequant_fp8_bf16_group128_n4096 dequant_fp8_bf16_token_n1000 silu_mul_quant_fp8_d4096 silu_mul_quant_fp8_d1000 rope_neox_bf16_h32_d128 rope_gptj_bf16_h32_d128 rope_neox_bf16_h8_d128 rope_neox_bf16_h40_d64 reshape_cache_flash_bf16_h8_d128 reshape_cache_flash_bf16_h5_d64 topk_softmax_bf16_e128_k8 topk_softmax_renorm_bf16_e256_k8; do mk $k; done
 one "silu_mul d4096 corr+perf" $E $O/silu_mul_bf16_d4096.co silu_mul_bf16_d4096 silu_mul 43690 4096 50
 one "silu_mul d1024" $E $O/silu_mul_bf16_d1024.co silu_mul_bf16_d1024 silu_mul 65535 1024 50
 one "silu_mul d14336" $E $O/silu_mul_bf16_d14336.co silu_mul_bf16_d14336 silu_mul 12483 14336 50
@@ -31,6 +31,12 @@ one "quant_token n4096" $Q $O/quant_token_bf16_fp8_n4096.co quant_token_bf16_fp8
 one "quant_token n1000" $Q $O/quant_token_bf16_fp8_n1000.co quant_token_bf16_fp8_n1000 token 524288 1000 50
 one "quant_group128 n4096" $Q $O/quant_group128_bf16_fp8_n4096.co quant_group128_bf16_fp8_n4096 group128 131072 4096 50
 one "quant_group128 n640 corr" $Q $O/quant_group128_bf16_fp8_n640.co quant_group128_bf16_fp8_n640 group128 19 640 5
+one "quant_token_int8 n4096" $Q $O/quant_token_bf16_int8_n4096.co quant_token_bf16_int8_n4096 token_int8 131072 4096 50
+one "quant_token_int8 n1000" $Q $O/quant_token_bf16_int8_n1000.co quant_token_bf16_int8_n1000 token_int8 524288 1000 50
+one "dequant static" $DQ $O/dequant_fp8_bf16_static.co dequant_fp8_bf16_static static 524288 1024 50
+one "dequant token n4096" $DQ $O/dequant_fp8_bf16_token_n4096.co dequant_fp8_bf16_token_n4096 token 65535 4096 50
+one "dequant group128 n4096" $DQ $O/dequant_fp8_bf16_group128_n4096.co dequant_fp8_bf16_group128_n4096 group128 65535 4096 50
+one "dequant token n1000 (odd tail)" $DQ $O/dequant_fp8_bf16_token_n1000.co dequant_fp8_bf16_token_n1000 token 65535 1000 50
 one "silu_mul_quant d4096" $Q $O/silu_mul_quant_fp8_d4096.co silu_mul_quant_fp8_d4096 silu_token 65536 4096 50
 one "silu_mul_quant d1000" $Q $O/silu_mul_quant_fp8_d1000.co silu_mul_quant_fp8_d1000 silu_token 262144 1000 50
 one "rope_neox h32 d128" $RP $O/rope_neox_bf16_h32_d128.co rope_neox_bf16_h32_d128 neox 65536 32 128 50

@@ -49,6 +49,9 @@ int main(int argc, char** argv) {
     } else if (c == "quant_token") {
         AiterTensor in = bf16_rand({M, N}, MN, 2.f, 2), out = AiterTensor::empty({M, N}, AITER_DTYPE_fp8, 0), sc = AiterTensor::empty({M, 1}, AITER_DTYPE_fp32, 0);
         ms = bench([&] { aiter::dynamic_per_token_scaled_quant(out, in, sc); }, iters); bytes = (double)MN * 3 + M * 4;
+    } else if (c == "quant_token_int8") {
+        AiterTensor in = bf16_rand({M, N}, MN, 2.f, 2), out = AiterTensor::empty({M, N}, AITER_DTYPE_i8, 0), sc = AiterTensor::empty({M, 1}, AITER_DTYPE_fp32, 0);
+        ms = bench([&] { aiter::dynamic_per_token_scaled_quant(out, in, sc); }, iters); bytes = (double)MN * 3 + M * 4;
     } else if (c == "quant_group128") {
         AiterTensor in = bf16_rand({M, N}, MN, 2.f, 2), out = AiterTensor::empty({M, N}, AITER_DTYPE_fp8, 0), sc = AiterTensor::empty({M, N / 128}, AITER_DTYPE_fp32, 0);
         ms = bench([&] { aiter::dynamic_per_group_scaled_quant(out, in, sc, 128, false); }, iters); bytes = (double)MN * 3 + (double)M * (N / 128) * 4;
