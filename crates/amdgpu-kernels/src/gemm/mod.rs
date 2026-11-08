@@ -280,6 +280,7 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, p
     b.ka_is(36, if split { Ext::sym("S") } else { Ext::c(1) });
     if split {
         b.ka_is(88, Ext::sym("KS"));
+        b.ka_is(92, m.clone());
         b.grid_is(2, Ext::sym("S"));
     }
     b.ka_is(40, k_el.clone());
@@ -1214,8 +1215,9 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let z = b.let_(Op::WorkgroupIdZ);
         let c_blk = make_layout(tup![16, 16], tup![s_n.mul_c(4), 4]);
         let c_plan = IssuePlan::new(mma.c_tv(), 4);
-        // slices of ceil(M / cta_m) cta_m rows (a partial last row tile writes its padding rows inside its own slice)
-        let mp = b.bind_i32(((ev(m_v) + ((1 << lg_m) - 1)).lshr(lg_m)) << lg_m);
+        // slices of MP = ceil(M / cta_m) cta_m rows (kernarg 92, from the host; a partial last row tile writes its padding rows inside its own
+        // slice)
+        let mp = b.let_(Op::KernargI32 { offset: 92 });
         let c_org = b.bind_i32(((((ev(by) << lg_m) * ev(n_v)) + (ev(bx) << lg_n)) << 2) + ((ev(z) * ev(mp) * ev(n_v)) << 2));
         let cb = b.ptr_add(ptr_c, c_org);
         let mut exprs = Vec::new();

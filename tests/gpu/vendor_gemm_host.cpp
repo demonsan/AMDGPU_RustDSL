@@ -218,6 +218,7 @@ int main(int argc, char** argv) {
         HC(hipMalloc(&dWS, (size_t)splitk * MP * N * 4 + 256));
         a.ptr(16, dWS);
         a.u32(36, splitk);
+        a.u32(92, MP);
         a.u32(88, (kind == "f4" ? K / 256 : kind == "bf16" ? K / 64 : K / 128) / splitk);
         gz = splitk;
         hipModule_t rmod;
