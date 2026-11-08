@@ -187,6 +187,13 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
         }
         if opts.reorder {
             attempts.extend([(16, Some(0)), (32, Some(0)), (48, Some(0))]); // the pressure limit only matters for the reordering scheduler
+            // a big workgroup: the schedule must also fit the launch budget (ceil(waves / 4) waves per SIMD share 512 registers); a schedule that
+            // hoists later loads above earlier work can blow it. Retry against that budget before giving up the scheduler.
+            let launch = sched::launch_vgpr_budget(base.workgroup_size);
+            if launch < opts.max_vgprs {
+                let c = opts.max_vgprs - launch;
+                attempts.extend([(c, Some(0)), (c + 16, Some(0)), (c + 32, Some(0))]);
+            }
         }
         for (cut, hoist) in attempts {
             let mut o = opts.clone();
@@ -211,6 +218,8 @@ fn lower_and_allocate_with(f: &amdgpu_dsl::Function, extra: &[&str]) -> Result<(
                     return Err(format!("MIR verification failed:\n  {}", errs.join("\n  ")));
                 }
                 let a = regalloc::allocate(&m)?;
+                // over the workgroup's launch budget: like running out of VGPRs (try the next, tighter attempt)
+                regalloc::check_workgroup_budget(&m, &a).map_err(|e| format!("out of VGPRs for the launch: {e}"))?;
                 hazards::pad_physical_war(&mut m, &a);
                 hz(&mut m, &a, true);
                 Ok(a)

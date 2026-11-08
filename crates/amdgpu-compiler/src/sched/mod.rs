@@ -292,3 +292,11 @@ pub fn run(m: &mut MFunction, o: &Options) -> Result<Stats, String> {
 
 #[cfg(test)]
 mod tests;
+
+/// The per-wave register budget a scheduler may plan for: 512 / ceil(waves / 4) registers per wave, minus 8 of headroom, capped at 240 (the
+/// default arch-VGPR budget).
+pub fn launch_vgpr_budget(workgroup_size: u32) -> u32 {
+    let waves = (workgroup_size + 63) / 64;
+    let per_simd = ((waves + 3) / 4).max(1);
+    (512 / per_simd).saturating_sub(8).min(240)
+}
