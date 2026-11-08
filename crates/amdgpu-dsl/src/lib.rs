@@ -147,6 +147,107 @@ pub enum CmpPred { Lt, Le, Gt, Ge, Eq, Ne, Lg, Uno, Ord }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CmpTy { F32, I32, U32 }
 
+/// Width / type of a memory access (P1 A3). Loads: `U8` / `I8` / `U16` / `I16` zero- / sign-extend into an `I32`; `B32` -> `I32`; `B64` -> `Frag2`;
+/// `B96` -> `Frag4` (lane 3 unspecified); `B128` -> `Frag4`. Stores write the low 8 / 16 bits (`U8` / `U16`; `I8` / `I16` are the same store).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemTy { U8, I8, U16, I16, B32, B64, B96, B128 }
+
+/// The data of a `d16` load: one byte (zero- or sign-extended to 16 bits) or a 16-bit half, placed in the low (`hi: false`) or high half of
+/// the result dword. The other half is ZERO: on gfx950 (SRAM-ECC enabled) the d16 loads do not preserve the unused half (hardware probe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum D16Ty { U8, I8, B16 }
+
+/// MFMA block shape M x N x K (gfx950).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MmaShape { M16N16K32, M32N32K16, M16N16K64, M32N32K32, M16N16K128, M32N32K64 }
+
+/// MFMA operand element type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MmaTy { F16, Bf16, I8, Fp8, Bf8, Fp6, Bf6, Fp4 }
+
+/// One MFMA instruction family member: shape, A / B element types (f8f6f4 families may mix them), block-scaled or not
+/// (docs/op-coverage-tileops.md). Supported combinations: `MmaKind::lowerable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MmaKind {
+    pub shape: MmaShape,
+    pub a: MmaTy,
+    pub b: MmaTy,
+    pub scaled: bool,
+}
+
+/// E8M0 scales of a block-scaled MFMA: one dword per lane each; `opsel` bits 0..1 = byte of `sa`, bits 4..5 = byte of `sb`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MmaScale {
+    pub sa: Opnd,
+    pub sb: Opnd,
+    pub opsel: u8,
+}
+
+impl MmaKind {
+    pub const fn new(shape: MmaShape, ty: MmaTy) -> MmaKind {
+        MmaKind { shape, a: ty, b: ty, scaled: false }
+    }
+    /// Accumulator / result dwords per lane (16x16: 4, 32x32: 16).
+    pub fn acc_dwords(self) -> u32 {
+        match self.shape {
+            MmaShape::M16N16K32 | MmaShape::M16N16K64 | MmaShape::M16N16K128 => 4,
+            _ => 16,
+        }
+    }
+    /// A (or B) operand dwords per lane.
+    pub fn operand_dwords(self, t: MmaTy) -> u32 {
+        match t {
+            MmaTy::F16 | MmaTy::Bf16 | MmaTy::I8 | MmaTy::Fp4 => 4,
+            MmaTy::Fp6 | MmaTy::Bf6 => 6,
+            MmaTy::Fp8 | MmaTy::Bf8 => 8,
+        }
+    }
+    pub fn acc_ty(self) -> DType {
+        if self.acc_dwords() == 4 { DType::Frag4 } else { DType::Frag16 }
+    }
+    pub fn operand_ty(self, t: MmaTy) -> DType {
+        match self.operand_dwords(t) {
+            4 => DType::Frag4,
+            _ => DType::Frag8,
+        }
+    }
+    /// The combinations lowering supports today (others are rejected by the IR verifier).
+    pub fn lowerable(self) -> bool {
+        use MmaShape as S;
+        use MmaTy as T;
+        !self.scaled && self.a == self.b && matches!((self.shape, self.a), (S::M16N16K32 | S::M32N32K16, T::Bf16 | T::F16) | (S::M16N16K64 | S::M32N32K32, T::I8))
+    }
+    /// XDL passes (cost model; issue cycles = 4 x passes).
+    pub fn passes(self) -> u8 {
+        if self.acc_dwords() == 4 { 8 } else { 16 }
+    }
+}
+
+impl MemTy {
+    pub fn bytes(self) -> u32 {
+        match self {
+            MemTy::U8 | MemTy::I8 => 1,
+            MemTy::U16 | MemTy::I16 => 2,
+            MemTy::B32 => 4,
+            MemTy::B64 => 8,
+            MemTy::B96 => 12,
+            MemTy::B128 => 16,
+        }
+    }
+    pub fn value_ty(self) -> DType {
+        match self {
+            MemTy::B64 => DType::Frag2,
+            MemTy::B96 | MemTy::B128 => DType::Frag4,
+            _ => DType::I32,
+        }
+    }
+}
+impl D16Ty {
+    pub fn bytes(self) -> u32 {
+        if self == D16Ty::B16 { 2 } else { 1 }
+    }
+}
+
 impl UnOp {
     pub fn float_in(self) -> bool {
         !matches!(self, UnOp::CvtF32I32 | UnOp::CvtF32U32 | UnOp::CvtF32Ubyte0 | UnOp::CvtF32Ubyte1 | UnOp::CvtF32Ubyte2 | UnOp::CvtF32Ubyte3)
@@ -277,6 +378,8 @@ pub enum Op {
     /// Dwords 8 half .. 8 half + 7 of the Frag16 variable `var` as a Frag8 value WITHOUT a copy (a view of the variable's registers): valid only while
     /// the variable is not written (checked by `verify`: no in-place write of `var` between the slice and any use of it).
     VarSlice8 { var: VarId, half: u8 },
+    /// Dwords 4 idx .. 4 idx + 3 of a Frag8 (idx 0..1) or Frag16 (idx 0..3) variable as a Frag4 value WITHOUT a copy (a register view, as `VarSlice8`).
+    VarSlice4 { var: VarId, idx: u8 },
     /// `v_permlane32_swap`: exchanges lanes 32..63 of `a` with lanes 0..31 of `b`. Result: a Frag2 whose dword 0 is the new `a` and dword 1
     /// the new `b` (use `permlane32_swap`, which returns the two values).
     Permlane32Swap { a: Opnd, b: Opnd },
@@ -349,6 +452,22 @@ pub enum Op {
     Tri(TriOp, Opnd, Opnd, Opnd),
     /// comparison -> I1
     Cmp { pred: CmpPred, ty: CmpTy, a: Opnd, b: Opnd },
+    /// global load of any width (`MemTy`); result type `ty.value_ty()`
+    LoadGlobalN { base: Opnd, byte_off: u32, ty: MemTy },
+    /// `global_load_*_d16[_hi]`: the loaded 8 / 16 bits in one half of a dword, the other half zero
+    LoadGlobalD16 { base: Opnd, byte_off: u32, ty: D16Ty, hi: bool },
+    /// MUBUF load of any width
+    BufferLoadN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, ty: MemTy },
+    /// LDS load of any width
+    LoadLdsN { addr: Opnd, ty: MemTy },
+    /// `ds_read_*_d16[_hi]`
+    LoadLdsD16 { addr: Opnd, ty: D16Ty, hi: bool },
+    /// `ds_read2[st64]_b32 / _b64`: two elements at `addr + off0 * s` and `addr + off1 * s` (s = element size, x 64 for `st64`) -> `Frag2` / `Frag4`
+    LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
+    /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
+    LoadLdsTrB16 { addr: Opnd },
+    /// D = A x B + C (`c: None`: zero accumulator) of the MFMA `kind`; result `kind.acc_ty()`
+    Mfma { kind: MmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<MmaScale> },
 }
 
 impl Op {
@@ -358,6 +477,11 @@ impl Op {
             Op::Bin(o, ..) => o.result_ty(),
             Op::Tri(o, ..) => o.result_ty(),
             Op::Cmp { .. } => DType::I1,
+            Op::LoadGlobalN { ty, .. } | Op::BufferLoadN { ty, .. } | Op::LoadLdsN { ty, .. } => ty.value_ty(),
+            Op::LoadGlobalD16 { .. } | Op::LoadLdsD16 { .. } => DType::I32,
+            Op::LoadLds2 { b64, .. } => if *b64 { DType::Frag4 } else { DType::Frag2 },
+            Op::LoadLdsTrB16 { .. } => DType::Frag2,
+            Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::AddI32(..) | Op::MulI32(..) => DType::I32,
             Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::MinI32(..) | Op::XorI32(..) | Op::LoadU16 { .. } => DType::I32,
             Op::ConstF32(_) | Op::KernargF32 { .. } => DType::F32,
@@ -382,6 +506,7 @@ impl Op {
             Op::Frag2(..) => DType::Frag2,
             Op::Frag2Lane { .. } | Op::Frag4Lane { .. } => DType::U32,
             Op::VarSlice8 { .. } => DType::Frag8,
+            Op::VarSlice4 { .. } => DType::Frag4,
             Op::Permlane32Swap { .. } => DType::Frag2,
             Op::Frag4(..) | Op::MfmaF16 { .. } => DType::Frag4,
             Op::MfmaF16Wide { .. } => DType::Frag16,
@@ -435,6 +560,24 @@ impl Op {
             Op::Un(_, a) => vec![*a],
             Op::Bin(_, a, b) | Op::Cmp { a, b, .. } => vec![*a, *b],
             Op::Tri(_, a, b, c) => vec![*a, *b, *c],
+            Op::LoadGlobalN { base, .. } => vec![*base],
+            Op::LoadGlobalD16 { base, .. } => vec![*base],
+            Op::BufferLoadN { rsrc, voff, soff, .. } => {
+                let mut v = vec![*rsrc];
+                v.extend(voff.iter().copied());
+                v.push(*soff);
+                v
+            }
+            Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } | Op::LoadLdsD16 { addr, .. } => vec![*addr],
+            Op::Mfma { a, b, c, scale, .. } => {
+                let mut v = vec![*a, *b];
+                v.extend(c.iter().copied());
+                if let Some(s) = scale {
+                    v.push(s.sa);
+                    v.push(s.sb);
+                }
+                v
+            }
             Op::Max3F32(a, b, c) => vec![*a, *b, *c],
             Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
                 vec![*a]
@@ -443,7 +586,7 @@ impl Op {
             Op::LoadU16 { base, .. } | Op::LoadF32 { base, .. } => vec![*base],
             Op::Frag2(a, b) => vec![*a, *b],
             Op::Frag2Lane { frag, .. } => vec![*frag],
-            Op::VarSlice8 { var, .. } => vec![Opnd::Var(*var)],
+            Op::VarSlice8 { var, .. } | Op::VarSlice4 { var, .. } => vec![Opnd::Var(*var)],
             Op::Permlane32Swap { a, b } => vec![*a, *b],
             Op::Frag4(a, b, c, d) => vec![*a, *b, *c, *d],
             Op::Frag4Lane { frag, .. } => vec![*frag],
@@ -744,6 +887,16 @@ pub enum Stmt {
     StageBegin { name: String, contract: Box<StageContract> },
     /// Closes the innermost stage.
     StageEnd,
+    /// global store of any width (`U8` / `U16` store the low bits; `hi` with `U8` / `U16`: the `_d16_hi` forms store bits 16..)
+    StoreGlobalN { base: Opnd, byte_off: u32, value: Opnd, ty: MemTy, hi: bool },
+    /// MUBUF store of any width (same `hi` rule)
+    BufferStoreN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd, ty: MemTy, hi: bool },
+    /// LDS store of any width (same `hi` rule)
+    StoreLdsN { addr: Opnd, value: Opnd, ty: MemTy, hi: bool },
+    /// `ds_write2[st64]_b32 / _b64`: `v0` at `addr + off0 * s`, `v1` at `addr + off1 * s`
+    StoreLds2 { addr: Opnd, v0: Opnd, v1: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
+    /// In-place MFMA accumulate into a loop variable: var = A x B + var (`zero`: var = A x B)
+    VarMfma { var: VarId, kind: MmaKind, a: Opnd, b: Opnd, scale: Option<MmaScale>, zero: bool },
     /// Register-planning region marker (`FnBuilder::weave_region_begin/end`): the instructions lowered between a begin and its end belong to the
     /// named region (per-region pressure caps and reports, `RegMark::Cap`). Regions nest; a begin and its end sit in the same structural block.
     /// Emits no code.
@@ -1425,7 +1578,7 @@ impl FnBuilder {
         let vv = match &op {
             Op::Frag2Lane { frag, .. } | Op::Frag4Lane { frag, .. } | Op::Frag16Lane { frag, .. } => of(frag, &self.views),
             Op::BitcastF32(a) | Op::BitcastI32(a) => of(a, &self.views),
-            Op::VarSlice8 { var, .. } => vec![*var],
+            Op::VarSlice8 { var, .. } | Op::VarSlice4 { var, .. } => vec![*var],
             _ => Vec::new(),
         };
         if !vv.is_empty() {
@@ -1627,6 +1780,53 @@ impl FnBuilder {
     }
     pub fn cmp(&mut self, pred: CmpPred, ty: CmpTy, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
         self.let_(Op::Cmp { pred, ty, a: a.into(), b: b.into() })
+    }
+
+    // ---- P1 A3 memory ----
+    pub fn load_global(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: MemTy) -> ValueId {
+        self.let_(Op::LoadGlobalN { base: base.into(), byte_off, ty })
+    }
+    pub fn load_global_d16(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: D16Ty, hi: bool) -> ValueId {
+        self.let_(Op::LoadGlobalD16 { base: base.into(), byte_off, ty, hi })
+    }
+    pub fn store_global(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
+        self.push_stmt(Stmt::StoreGlobalN { base: base.into(), byte_off, value: value.into(), ty, hi });
+    }
+    pub fn buffer_load_n(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, ty: MemTy) -> ValueId {
+        self.let_(Op::BufferLoadN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, ty })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn buffer_store_n(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
+        self.push_stmt(Stmt::BufferStoreN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into(), ty, hi });
+    }
+    pub fn load_lds(&mut self, addr: impl Into<Opnd>, ty: MemTy) -> ValueId {
+        self.let_(Op::LoadLdsN { addr: addr.into(), ty })
+    }
+    pub fn load_lds_d16(&mut self, addr: impl Into<Opnd>, ty: D16Ty, hi: bool) -> ValueId {
+        self.let_(Op::LoadLdsD16 { addr: addr.into(), ty, hi })
+    }
+    pub fn store_lds(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
+        self.push_stmt(Stmt::StoreLdsN { addr: addr.into(), value: value.into(), ty, hi });
+    }
+    pub fn load_lds2(&mut self, addr: impl Into<Opnd>, off0: u8, off1: u8, b64: bool, st64: bool) -> ValueId {
+        self.let_(Op::LoadLds2 { addr: addr.into(), off0, off1, b64, st64 })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_lds2(&mut self, addr: impl Into<Opnd>, v0: impl Into<Opnd>, v1: impl Into<Opnd>, off0: u8, off1: u8, b64: bool, st64: bool) {
+        self.push_stmt(Stmt::StoreLds2 { addr: addr.into(), v0: v0.into(), v1: v1.into(), off0, off1, b64, st64 });
+    }
+    pub fn load_lds_tr_b16(&mut self, addr: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::LoadLdsTrB16 { addr: addr.into() })
+    }
+
+    // ---- P1-d MFMA ----
+    /// D = A x B + C (`c: None`: zero accumulator).
+    pub fn mfma(&mut self, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, c: Option<Opnd>) -> ValueId {
+        self.let_(Op::Mfma { kind, a: a.into(), b: b.into(), c, scale: None })
+    }
+    /// var = A x B + var (`zero`: var = A x B).
+    pub fn var_mfma(&mut self, var: VarId, kind: MmaKind, a: impl Into<Opnd>, b: impl Into<Opnd>, zero: bool) {
+        self.push_stmt(Stmt::VarMfma { var, kind, a: a.into(), b: b.into(), scale: None, zero });
     }
 
     // ---- capture mode (docs/weave-capture.md) ----
@@ -2108,6 +2308,10 @@ impl FnBuilder {
         assert!(half < 2, "var_slice8: half is 0 or 1");
         self.let_(Op::VarSlice8 { var, half })
     }
+    /// Dwords 4 idx .. 4 idx + 3 of a Frag8 / Frag16 variable as a Frag4 operand without a copy (see `Op::VarSlice4`).
+    pub fn var_slice4(&mut self, var: VarId, idx: u8) -> ValueId {
+        self.let_(Op::VarSlice4 { var, idx })
+    }
     pub fn perm_b32(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, sel: impl Into<Opnd>) -> ValueId {
         self.let_(Op::PermB32(a.into(), b.into(), sel.into()))
     }
@@ -2291,6 +2495,113 @@ fn expect_int(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
     }
 }
 
+/// Type / range checks of the P1 memory statements (any-width stores, two-address LDS stores).
+fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
+    let mut e = Vec::new();
+    let data = |e: &mut Vec<String>, value: Opnd, ty: MemTy, hi: bool| {
+        let want = match ty {
+            MemTy::B64 => Some(DType::Frag2),
+            MemTy::B96 | MemTy::B128 => Some(DType::Frag4),
+            _ => None,
+        };
+        match (want, opnd_ty(f, value)) {
+            (Some(w), Ok(t)) if t != w => e.push(format!("{ty:?} store: expected {}, found {}", w.name(), t.name())),
+            (None, Ok(_)) => {
+                if let Err(x) = expect_dword(f, value, "store value") {
+                    e.push(x);
+                }
+            }
+            (_, Err(x)) => e.push(x),
+            _ => {}
+        }
+        if hi && ty.bytes() > 2 {
+            e.push(format!("{ty:?} store: only 8 / 16-bit stores have a d16_hi form"));
+        }
+    };
+    match st {
+        Stmt::StoreGlobalN { base, byte_off, value, ty, hi } => {
+            if !matches!(opnd_ty(f, *base), Ok(DType::Ptr)) {
+                e.push("global store: base must be a pointer".into());
+            }
+            if *byte_off > 4095 {
+                e.push(format!("global store: byte offset {byte_off} exceeds the 13-bit signed immediate (4095)"));
+            }
+            data(&mut e, *value, *ty, *hi);
+        }
+        Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi } => {
+            e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1));
+            data(&mut e, *value, *ty, *hi);
+        }
+        Stmt::StoreLdsN { addr, value, ty, hi } => {
+            if let Err(x) = expect_int(f, *addr, "lds store address") {
+                e.push(x);
+            }
+            data(&mut e, *value, *ty, *hi);
+        }
+        Stmt::StoreLds2 { addr, v0, v1, b64, .. } => {
+            if let Err(x) = expect_int(f, *addr, "lds store address") {
+                e.push(x);
+            }
+            for v in [*v0, *v1] {
+                data(&mut e, v, if *b64 { MemTy::B64 } else { MemTy::B32 }, false);
+            }
+        }
+        _ => {}
+    }
+    e
+}
+
+/// Operand types of an MFMA of `kind` (and that lowering supports the combination).
+fn check_mfma(f: &Function, kind: MmaKind, a: Opnd, b: Opnd, c: Option<Opnd>, scale: Option<&MmaScale>) -> Vec<String> {
+    let mut e = Vec::new();
+    if !kind.lowerable() {
+        e.push(format!("mfma {kind:?}: combination not supported yet"));
+        return e;
+    }
+    if scale.is_some() != kind.scaled {
+        e.push(format!("mfma {kind:?}: scale operands {} for a {}scaled kind", if scale.is_some() { "given" } else { "missing" }, if kind.scaled { "" } else { "non-" }));
+    }
+    for (what, o, want) in [("A", a, kind.operand_ty(kind.a)), ("B", b, kind.operand_ty(kind.b))] {
+        match opnd_ty(f, o) {
+            Ok(t) if t == want => {}
+            Ok(t) => e.push(format!("mfma {what}: expected {}, found {}", want.name(), t.name())),
+            Err(x) => e.push(x),
+        }
+    }
+    if let Some(c) = c {
+        match opnd_ty(f, c) {
+            Ok(t) if t == kind.acc_ty() => {}
+            Ok(t) => e.push(format!("mfma C: expected {}, found {}", kind.acc_ty().name(), t.name())),
+            Err(x) => e.push(x),
+        }
+    }
+    e
+}
+
+/// Type / range checks of the P1 memory loads.
+fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
+    let mut e = Vec::new();
+    match op {
+        Op::LoadGlobalN { base, byte_off, .. } | Op::LoadGlobalD16 { base, byte_off, .. } => {
+            if !matches!(opnd_ty(f, *base), Ok(DType::Ptr)) {
+                e.push("global load: base must be a pointer".into());
+            }
+            if *byte_off > 4095 {
+                e.push(format!("global load: byte offset {byte_off} exceeds the 13-bit signed immediate (4095)"));
+            }
+        }
+        Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
+        Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
+        Op::LoadLdsN { addr, .. } | Op::LoadLdsD16 { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } => {
+            if let Err(x) = expect_int(f, *addr, "lds load address") {
+                e.push(x);
+            }
+        }
+        _ => {}
+    }
+    e
+}
+
 /// A one-dword scalar value of any type (packed containers).
 fn expect_dword(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
     let t = opnd_ty(f, o)?;
@@ -2401,6 +2712,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                         }
                     }
                 }
+                errs.extend(check_mem_op(f, op).into_iter().map(|e| here(e)));
                 match op {
                     Op::Asm { block, inputs } => {
                         if inputs.len() != block.inputs().len() {
@@ -2823,6 +3135,31 @@ pub fn verify(f: &Function) -> Vec<String> {
                     }
                 }
             }
+            Stmt::VarMfma { var, kind, a, b, scale, .. } => {
+                for o in stmt_operands(st) {
+                    if let Opnd::Val(v) = o {
+                        if !visible(&scopes, v) {
+                            errs.push(here(format!("operand v{v} is not visible here")));
+                        }
+                    }
+                }
+                if !vars_defined.contains(var) {
+                    errs.push(here(format!("var{var} used before its loop")));
+                } else if f.var_tys.get(var.0 as usize) != Some(&kind.acc_ty()) {
+                    errs.push(here(format!("var_mfma: var{var} must be {}", kind.acc_ty().name())));
+                }
+                errs.extend(check_mfma(f, *kind, *a, *b, None, scale.as_ref()).into_iter().map(here));
+            }
+            Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => {
+                for o in stmt_operands(st) {
+                    if let Opnd::Val(v) = o {
+                        if !visible(&scopes, v) {
+                            errs.push(here(format!("operand v{v} is not visible here")));
+                        }
+                    }
+                }
+                errs.extend(check_mem_stmt(f, st).into_iter().map(here));
+            }
             Stmt::StoreLdsB32 { addr, value } => {
                 if let Err(e) = expect_int(f, *addr, "lds store address") {
                     errs.push(here(e));
@@ -3224,6 +3561,24 @@ pub fn stmt_operands(st: &Stmt) -> Vec<Opnd> {
             v
         }
         Stmt::SetVar { value, .. } => vec![*value],
+        Stmt::StoreGlobalN { base, value, .. } => vec![*base, *value],
+        Stmt::BufferStoreN { rsrc, voff, soff, value, .. } => {
+            let mut v = vec![*rsrc];
+            v.extend(voff.iter().copied());
+            v.push(*soff);
+            v.push(*value);
+            v
+        }
+        Stmt::StoreLdsN { addr, value, .. } => vec![*addr, *value],
+        Stmt::StoreLds2 { addr, v0, v1, .. } => vec![*addr, *v0, *v1],
+        Stmt::VarMfma { a, b, scale, .. } => {
+            let mut v = vec![*a, *b];
+            if let Some(s) = scale {
+                v.push(s.sa);
+                v.push(s.sb);
+            }
+            v
+        }
         Stmt::VarScaleF32 { scalar, .. } | Stmt::VarScaleLane { scalar, .. } => vec![*scalar],
         Stmt::VarSetLane { var, value, .. } => vec![Opnd::Var(*var), *value],
         Stmt::VarScalePk { pair, .. } | Stmt::VarAddPk { pair, .. } => vec![*pair],
@@ -3285,6 +3640,7 @@ pub fn stmt_var_writes(st: &Stmt) -> Vec<VarId> {
         | Stmt::VarMfmaFp8Z { var, .. }
         | Stmt::VarMfmaFp8C { var, .. }
         | Stmt::VarSmfmac { var, .. }
+        | Stmt::VarMfma { var, .. }
         | Stmt::VarAsm { var, .. } => vec![*var],
         Stmt::VarAsmN { vars, .. } | Stmt::BeginLoop { vars, .. } => vars.clone(),
         _ => Vec::new(),
@@ -3308,6 +3664,17 @@ fn check_var_slices(f: &Function, errs: &mut Vec<String>) {
         if let Stmt::Let { dst, op: Op::VarSlice8 { var, half } } = st {
             if f.var_ty(*var) != Some(DType::Frag16) || *half > 1 {
                 errs.push(format!("stmt {idx}: var_slice8 needs a frag16 variable and half 0 / 1"));
+            }
+            live.insert(*dst, (*var, false));
+        }
+        if let Stmt::Let { dst, op: Op::VarSlice4 { var, idx: q } } = st {
+            let ok = match f.var_ty(*var) {
+                Some(DType::Frag8) => *q < 2,
+                Some(DType::Frag16) => *q < 4,
+                _ => false,
+            };
+            if !ok {
+                errs.push(format!("stmt {idx}: var_slice4 needs a frag8 (idx 0..1) or frag16 (idx 0..3) variable"));
             }
             live.insert(*dst, (*var, false));
         }

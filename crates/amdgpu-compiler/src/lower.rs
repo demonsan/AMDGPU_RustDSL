@@ -280,6 +280,11 @@ impl Lowerer {
                     count(lds_addr);
                 }
                 Stmt::SetVar { value, .. } => count(value),
+                Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::VarMfma { .. } => {
+                    for o in amdgpu_dsl::stmt_operands(st) {
+                        count(&o);
+                    }
+                }
                 Stmt::BeginLoop { init, .. } => {
                     for o in init {
                         count(o);
@@ -1927,6 +1932,47 @@ impl Lowerer {
                     let v = self.as_v4(*value)?;
                     self.push(MInst::new(MOp::LdsWriteB128).srcreg(a).srcreg(v).imm(off));
                 }
+                Stmt::VarMfma { var, kind, a, b, scale: _, zero } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let (mop, zmop) = mfma_mop(*kind)?;
+                    let ra = self.as_v4(*a)?;
+                    let rb = self.as_v4(*b)?;
+                    if *zero {
+                        self.push(MInst::new(zmop).def(v).srcreg(ra).srcreg(rb));
+                    } else {
+                        self.push(MInst::new(mop).def(v).srcreg(ra).srcreg(rb).srcreg(v));
+                    }
+                }
+                Stmt::StoreGlobalN { base, byte_off, value, ty, hi } => {
+                    let b = self.as_v2(*base)?;
+                    let (v, mop) = self.store_value(*value, *ty, *hi, global_store_mop)?;
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(MInst::new(mop).srcreg(b).srcreg(v).imm(*byte_off as i64));
+                }
+                Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi } => {
+                    let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
+                    let (v, mop) = self.store_value(*value, *ty, *hi, buffer_store_mop)?;
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(MInst::new(mop).srcreg(v).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
+                }
+                Stmt::StoreLdsN { addr, value, ty, hi } => {
+                    let (a, off) = self.lds_addr(*addr)?;
+                    let (v, mop) = self.store_value(*value, *ty, *hi, lds_store_mop)?;
+                    self.touch(&[Src::Reg(v)]);
+                    self.push(MInst::new(mop).srcreg(a).srcreg(v).imm(off));
+                }
+                Stmt::StoreLds2 { addr, v0, v1, off0, off1, b64, st64 } => {
+                    let (a, imm) = self.lds2_addr(*addr, *off0, *off1, *b64, *st64)?;
+                    let (r0, r1) = if *b64 { (self.as_v2(*v0)?, self.as_v2(*v1)?) } else { (self.as_v1(*v0)?, self.as_v1(*v1)?) };
+                    self.touch(&[Src::Reg(r0), Src::Reg(r1)]);
+                    let mop = match (b64, st64) {
+                        (false, false) => MOp::LdsWrite2B32,
+                        (true, false) => MOp::LdsWrite2B64,
+                        (false, true) => MOp::LdsWrite2St64B32,
+                        (true, true) => MOp::LdsWrite2St64B64,
+                    };
+                    self.push(MInst::new(mop).srcreg(a).srcreg(r0).srcreg(r1).imm(imm));
+                }
                 Stmt::StoreLdsB64 { addr, value } => {
                     let (a, off) = self.lds_addr(*addr)?;
                     let v = self.as_v2(*value)?;
@@ -2220,6 +2266,94 @@ impl Lowerer {
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
+            Op::LoadGlobalN { base, byte_off, ty } => {
+                let (cls, mop) = global_load_mop(*ty);
+                let d = self.new_vreg(cls);
+                let rb = self.as_v2(*base)?;
+                self.push(MInst::new(mop).def(d).srcreg(rb).imm(*byte_off as i64));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::LoadGlobalD16 { base, byte_off, ty, hi } => {
+                // the d16 forms are partial writes in the ISA; gfx950 zeroes the other half anyway: start from 0 so both readings agree
+                let rb = self.as_v2(*base)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VMovB32).def(d).src(Src::Imm(0)));
+                self.push(MInst::new(global_d16_mop(*ty, *hi)).def(d).srcreg(rb).srcreg(d).imm(*byte_off as i64));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::BufferLoadN { rsrc, voff, soff, imm, ty } => {
+                let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
+                let (cls, mop) = buffer_load_mop(*ty);
+                let d = self.new_vreg(cls);
+                self.push(MInst::new(mop).def(d).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
+                self.pending_vmem.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::LoadLdsN { addr, ty } => {
+                let (a, off) = self.lds_addr(*addr)?;
+                let (cls, mop) = lds_load_mop(*ty);
+                let d = self.new_vreg(cls);
+                self.push(MInst::new(mop).def(d).srcreg(a).imm(off));
+                self.pending_lds.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::LoadLdsD16 { addr, ty, hi } => {
+                let (a, off) = self.lds_addr(*addr)?;
+                let d = self.new_vreg(RClass::V1);
+                self.push(MInst::new(MOp::VMovB32).def(d).src(Src::Imm(0)));
+                self.push(MInst::new(lds_d16_mop(*ty, *hi)).def(d).srcreg(a).srcreg(d).imm(off));
+                self.pending_lds.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::LoadLds2 { addr, off0, off1, b64, st64 } => {
+                let (a, imm) = self.lds2_addr(*addr, *off0, *off1, *b64, *st64)?;
+                let (cls, mop) = match (b64, st64) {
+                    (false, false) => (RClass::V2, MOp::LdsRead2B32),
+                    (true, false) => (RClass::V4, MOp::LdsRead2B64),
+                    (false, true) => (RClass::V2, MOp::LdsRead2St64B32),
+                    (true, true) => (RClass::V4, MOp::LdsRead2St64B64),
+                };
+                let d = self.new_vreg(cls);
+                self.push(MInst::new(mop).def(d).srcreg(a).imm(imm));
+                self.pending_lds.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
+            Op::Mfma { kind, a, b, c, scale: _ } => {
+                let (mop, zmop) = mfma_mop(*kind)?;
+                let ra = self.as_v4(*a)?;
+                let rb = self.as_v4(*b)?;
+                let n = kind.acc_dwords();
+                let cls = if n == 4 { RClass::V4 } else { RClass::V16 };
+                match c {
+                    Some(c) if !self.is_zero_frag(c) => {
+                        let rc = if n == 4 { self.as_v4(*c)? } else { self.as_v16(*c)? };
+                        let reusable = matches!(c, Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1) && matches!(self.defs.get(cv), Some(Op::Mfma { .. })));
+                        let d = if reusable {
+                            rc
+                        } else {
+                            let d = self.new_vreg(cls);
+                            self.copy_reg(d, rc)?;
+                            d
+                        };
+                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(d));
+                        self.val.insert(dst, d);
+                    }
+                    _ => {
+                        let d = self.new_vreg(cls);
+                        self.push(MInst::new(zmop).def(d).srcreg(ra).srcreg(rb));
+                        self.val.insert(dst, d);
+                    }
+                }
+            }
+            Op::LoadLdsTrB16 { addr } => {
+                let (a, off) = self.lds_addr(*addr)?;
+                let d = self.new_vreg(RClass::V2);
+                self.push(MInst::new(MOp::LdsReadB64TrB16).def(d).srcreg(a).imm(off));
+                self.pending_lds.push(self.mir.canon(d));
+                self.val.insert(dst, d);
+            }
             Op::XorI32(a, b) => self.bin_v1(dst, MOp::VXorB32, *a, *b)?,
             Op::MulI32(a, b) => self.bin_v1(dst, MOp::VMulLoU32, *a, *b)?,
             Op::ShlI32(a, b) => {
@@ -2473,6 +2607,12 @@ impl Lowerer {
                 self.push(MInst::new(MOp::VMovB32).def(hi).srcreg(rb));
                 // both operands are written: lo = [a 0..31, b 0..31], hi = [a 32..63, b 32..63]
                 self.push(MInst::new(MOp::VPermlane32Swap).def(lo).srcreg(lo).srcreg(hi));
+                self.val.insert(dst, d);
+            }
+            Op::VarSlice4 { var, idx } => {
+                let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                self.touch(&[Src::Reg(v)]);
+                let d = self.sub_alias(v, 4 * *idx, RClass::V4);
                 self.val.insert(dst, d);
             }
             Op::VarSlice8 { var, half } => {
@@ -2968,6 +3108,37 @@ impl Lowerer {
         Ok(())
     }
 
+    /// The data register of a store of `ty` (`hi`: the `_d16_hi` forms of 8 / 16-bit stores) and its MOp.
+    fn store_value(&mut self, value: Opnd, ty: amdgpu_dsl::MemTy, hi: bool, pick: fn(amdgpu_dsl::MemTy, bool) -> Result<MOp, String>) -> Result<(VReg, MOp), String> {
+        use amdgpu_dsl::MemTy as M;
+        let mop = pick(ty, hi)?;
+        let v = match ty {
+            M::B64 => self.as_v2(value)?,
+            M::B96 | M::B128 => self.as_v4(value)?,
+            _ => self.as_v1(value)?,
+        };
+        Ok((v, mop))
+    }
+
+    /// Address register and `offset0 | offset1 << 8` of a two-address DS access: a constant part of the address is folded into the offsets
+    /// when it is a multiple of the stride and both offsets stay within 8 bits, else it is added to the address.
+    fn lds2_addr(&mut self, addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool) -> Result<(VReg, i64), String> {
+        let (a, off) = self.lds_addr(addr)?;
+        let unit = (if b64 { 8 } else { 4 }) * (if st64 { 64 } else { 1 });
+        let (o0, o1) = (off0 as i64, off1 as i64);
+        if off == 0 {
+            return Ok((a, o0 | (o1 << 8)));
+        }
+        if off % unit == 0 && o0 + off / unit <= 255 && o1 + off / unit <= 255 && off > 0 {
+            let k = off / unit;
+            return Ok((a, (o0 + k) | ((o1 + k) << 8)));
+        }
+        let d = self.new_vreg(RClass::V1);
+        self.touch(&[Src::Reg(a)]);
+        self.push(MInst::new(MOp::VAddU32).def(d).src(Src::Imm(off)).srcreg(a));
+        Ok((d, o0 | (o1 << 8)))
+    }
+
     /// A VALU op with plain V1 operands (constants materialised; e32 / VOP3 forms both accept them).
     fn v_plain(&mut self, dst: ValueId, op: MOp, srcs: &[Opnd]) -> Result<(), String> {
         let mut rs = Vec::with_capacity(srcs.len());
@@ -3392,7 +3563,7 @@ fn uniform_analysis(f: &Function) -> (HashSet<ValueId>, HashSet<amdgpu_dsl::VarI
                 }
                 // any other statement that writes a variable in place makes it non-scalar
                 Stmt::VarScaleF32 { var, .. } | Stmt::VarScalePk { var, .. } | Stmt::VarAddPk { var, .. } | Stmt::VarMfmaF16Z { var, .. }
-                | Stmt::VarScaleLane { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScale16 { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8 { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarAsm { var, .. } => {
+                | Stmt::VarScaleLane { var, .. } | Stmt::VarMfmaScale { var, .. } | Stmt::VarMfmaScale16 { var, .. } | Stmt::VarMfmaScaleC { var, .. } | Stmt::VarMfmaFp8 { var, .. } | Stmt::VarMfmaFp8Z { var, .. } | Stmt::VarMfmaFp8C { var, .. } | Stmt::VarSmfmac { var, .. } | Stmt::VarMfma { var, .. } | Stmt::VarAsm { var, .. } => {
                     if uvars.remove(var) {
                         changed = true;
                     }
@@ -3858,4 +4029,132 @@ fn cmp_mop(p: amdgpu_dsl::CmpPred, t: amdgpu_dsl::CmpTy) -> MOp {
         // float-only predicates on integers are rejected by the IR verifier
         (_, P::Lg | P::Uno | P::Ord) => MOp::VCmpNeI32,
     }
+}
+
+fn global_load_mop(t: amdgpu_dsl::MemTy) -> (RClass, MOp) {
+    use amdgpu_dsl::MemTy as M;
+    match t {
+        M::U8 => (RClass::V1, MOp::GlobalLoadU8),
+        M::I8 => (RClass::V1, MOp::GlobalLoadI8),
+        M::U16 => (RClass::V1, MOp::GlobalLoadU16),
+        M::I16 => (RClass::V1, MOp::GlobalLoadI16),
+        M::B32 => (RClass::V1, MOp::GlobalLoadF32),
+        M::B64 => (RClass::V2, MOp::GlobalLoadB64),
+        M::B96 => (RClass::V4, MOp::GlobalLoadB96),
+        M::B128 => (RClass::V4, MOp::GlobalLoadB128),
+    }
+}
+
+fn global_d16_mop(t: amdgpu_dsl::D16Ty, hi: bool) -> MOp {
+    use amdgpu_dsl::D16Ty as D;
+    match (t, hi) {
+        (D::U8, false) => MOp::GlobalLoadD16U8,
+        (D::U8, true) => MOp::GlobalLoadD16U8Hi,
+        (D::I8, false) => MOp::GlobalLoadD16I8,
+        (D::I8, true) => MOp::GlobalLoadD16I8Hi,
+        (D::B16, false) => MOp::GlobalLoadD16B16,
+        (D::B16, true) => MOp::GlobalLoadD16B16Hi,
+    }
+}
+
+fn buffer_load_mop(t: amdgpu_dsl::MemTy) -> (RClass, MOp) {
+    use amdgpu_dsl::MemTy as M;
+    match t {
+        M::U8 => (RClass::V1, MOp::BufferLoadU8),
+        M::I8 => (RClass::V1, MOp::BufferLoadI8),
+        M::U16 => (RClass::V1, MOp::BufferLoadU16),
+        M::I16 => (RClass::V1, MOp::BufferLoadI16),
+        M::B32 => (RClass::V1, MOp::BufferLoadDwordX1),
+        M::B64 => (RClass::V2, MOp::BufferLoadDwordX2),
+        M::B96 => (RClass::V4, MOp::BufferLoadB96),
+        M::B128 => (RClass::V4, MOp::BufferLoadDwordX4),
+    }
+}
+
+fn lds_load_mop(t: amdgpu_dsl::MemTy) -> (RClass, MOp) {
+    use amdgpu_dsl::MemTy as M;
+    match t {
+        M::U8 => (RClass::V1, MOp::LdsReadU8),
+        M::I8 => (RClass::V1, MOp::LdsReadI8),
+        M::U16 => (RClass::V1, MOp::LdsReadU16),
+        M::I16 => (RClass::V1, MOp::LdsReadI16),
+        M::B32 => (RClass::V1, MOp::LdsReadB32),
+        M::B64 => (RClass::V2, MOp::LdsReadB64),
+        M::B96 => (RClass::V4, MOp::LdsReadB96),
+        M::B128 => (RClass::V4, MOp::LdsReadB128),
+    }
+}
+
+fn lds_d16_mop(t: amdgpu_dsl::D16Ty, hi: bool) -> MOp {
+    use amdgpu_dsl::D16Ty as D;
+    match (t, hi) {
+        (D::U8, false) => MOp::LdsReadD16U8,
+        (D::U8, true) => MOp::LdsReadD16U8Hi,
+        (D::I8, false) => MOp::LdsReadD16I8,
+        (D::I8, true) => MOp::LdsReadD16I8Hi,
+        (D::B16, false) => MOp::LdsReadD16B16,
+        (D::B16, true) => MOp::LdsReadD16B16Hi,
+    }
+}
+
+fn global_store_mop(t: amdgpu_dsl::MemTy, hi: bool) -> Result<MOp, String> {
+    use amdgpu_dsl::MemTy as M;
+    Ok(match (t, hi) {
+        (M::U8 | M::I8, false) => MOp::GlobalStoreB8,
+        (M::U8 | M::I8, true) => MOp::GlobalStoreB8Hi,
+        (M::U16 | M::I16, false) => MOp::GlobalStoreU16,
+        (M::U16 | M::I16, true) => MOp::GlobalStoreB16Hi,
+        (M::B32, false) => MOp::GlobalStoreF32,
+        (M::B64, false) => MOp::GlobalStoreF32x2,
+        (M::B96, false) => MOp::GlobalStoreB96,
+        (M::B128, false) => MOp::GlobalStoreF32x4,
+        (t, true) => return Err(format!("a d16_hi store of {t:?}: only 8 / 16-bit stores have a hi form")),
+    })
+}
+
+fn buffer_store_mop(t: amdgpu_dsl::MemTy, hi: bool) -> Result<MOp, String> {
+    use amdgpu_dsl::MemTy as M;
+    Ok(match (t, hi) {
+        (M::U8 | M::I8, false) => MOp::BufferStoreB8,
+        (M::U8 | M::I8, true) => MOp::BufferStoreB8Hi,
+        (M::U16 | M::I16, false) => MOp::BufferStoreB16,
+        (M::U16 | M::I16, true) => MOp::BufferStoreB16Hi,
+        (M::B32, false) => MOp::BufferStoreDwordX1,
+        (M::B64, false) => MOp::BufferStoreDwordX2,
+        (M::B96, false) => MOp::BufferStoreB96,
+        (M::B128, false) => MOp::BufferStoreDwordX4,
+        (t, true) => return Err(format!("a d16_hi store of {t:?}: only 8 / 16-bit stores have a hi form")),
+    })
+}
+
+fn lds_store_mop(t: amdgpu_dsl::MemTy, hi: bool) -> Result<MOp, String> {
+    use amdgpu_dsl::MemTy as M;
+    Ok(match (t, hi) {
+        (M::U8 | M::I8, false) => MOp::LdsWriteB8,
+        (M::U8 | M::I8, true) => MOp::LdsWriteB8Hi,
+        (M::U16 | M::I16, false) => MOp::LdsWriteB16,
+        (M::U16 | M::I16, true) => MOp::LdsWriteB16Hi,
+        (M::B32, false) => MOp::LdsWriteB32,
+        (M::B64, false) => MOp::LdsWriteB64,
+        (M::B96, false) => MOp::LdsWriteB96,
+        (M::B128, false) => MOp::LdsWriteB128,
+        (t, true) => return Err(format!("a d16_hi store of {t:?}: only 8 / 16-bit stores have a hi form")),
+    })
+}
+
+/// (C form, zero-C form) MOps of an MFMA kind.
+fn mfma_mop(k: amdgpu_dsl::MmaKind) -> Result<(MOp, MOp), String> {
+    use amdgpu_dsl::{MmaShape as S, MmaTy as T};
+    if k.scaled || k.a != k.b {
+        return Err(format!("mfma {k:?}: not supported yet"));
+    }
+    Ok(match (k.shape, k.a) {
+        (S::M16N16K32, T::Bf16) => (MOp::VMfma16x16x32Bf16, MOp::VMfma16x16x32Bf16Z),
+        (S::M32N32K16, T::Bf16) => (MOp::VMfma32x32x16Bf16, MOp::VMfma32x32x16Bf16Z),
+        (S::M16N16K32, T::F16) => (MOp::VMfma16x16x32F16, MOp::VMfma16x16x32F16Z),
+        (S::M32N32K16, T::F16) => (MOp::VMfma32x32x16F16, MOp::VMfma32x32x16F16Z),
+        (S::M16N16K64, T::I8) => (MOp::VMfma16x16x64I8, MOp::VMfma16x16x64I8Z),
+        (S::M32N32K32, T::I8) => (MOp::VMfma32x32x32I8, MOp::VMfma32x32x32I8Z),
+        _ => return Err(format!("mfma {k:?}: not supported yet")),
+    })
 }
