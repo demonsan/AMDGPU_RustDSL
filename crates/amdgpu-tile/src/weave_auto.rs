@@ -263,6 +263,20 @@ pub fn auto_order(units: &Units<'_>, m: &Model) -> Vec<UnitId> {
         return (0..n).collect();
     }
     let decl: Vec<UnitId> = (0..n).collect();
+    // effective dependences: the real ones plus the fences' - a fence unit follows every unit declared before it and precedes every unit declared after it
+    let is_fence = |i: usize| estimate(units.unit(i)).fence;
+    let ed: Vec<Vec<usize>> = (0..n)
+        .map(|i| {
+            let mut d = units.unit(i).deps.clone();
+            if is_fence(i) {
+                d.extend(0..i);
+            }
+            d.extend((0..i).filter(|&f| is_fence(f)));
+            d.sort_unstable();
+            d.dedup();
+            d
+        })
+        .collect();
     let (_, decl_peak) = simulate(units, &decl, m);
     let cap = decl_peak + m.reg_slack;
     // greedy list schedule
@@ -272,7 +286,7 @@ pub fn auto_order(units: &Units<'_>, m: &Model) -> Vec<UnitId> {
     while order.len() < n {
         let mut best: Option<(i64, usize)> = None;
         for i in 0..n {
-            if done[i] || units.unit(i).deps.iter().any(|&d| !done[d]) {
+            if done[i] || ed[i].iter().any(|&d| !done[d]) {
                 continue;
             }
             // anchors keep their declaration position relative to other anchors: only pick an anchor when it is the first unfinished anchor
@@ -300,7 +314,6 @@ pub fn auto_order(units: &Units<'_>, m: &Model) -> Vec<UnitId> {
         order = decl;
         best_cost = decl_cost;
     }
-    let fence = |i: usize| estimate(units.unit(i)).fence;
     for _ in 0..m.passes {
         let mut improved = false;
         for i in 0..n {
@@ -309,20 +322,9 @@ pub fn auto_order(units: &Units<'_>, m: &Model) -> Vec<UnitId> {
             }
             let p = order.iter().position(|&x| x == i).unwrap();
             // legal window: after the last dependency, before the first consumer, not across a fence unit
-            let lo = units.unit(i).deps.iter().map(|&d| order.iter().position(|&x| x == d).unwrap() + 1).max().unwrap_or(0);
-            let hi = (0..n).filter(|&j| units.unit(j).deps.contains(&i)).map(|j| order.iter().position(|&x| x == j).unwrap()).min().unwrap_or(n);
-            let mut lo = lo;
-            let mut hi_cap = hi;
-            for (q, &x) in order.iter().enumerate() {
-                if x != i && fence(x) {
-                    if q < p {
-                        lo = lo.max(q + 1);
-                    } else {
-                        hi_cap = hi_cap.min(q);
-                    }
-                }
-            }
-            for q in lo..hi_cap {
+            let lo = ed[i].iter().map(|&d| order.iter().position(|&x| x == d).unwrap() + 1).max().unwrap_or(0);
+            let hi = (0..n).filter(|&j| ed[j].contains(&i)).map(|j| order.iter().position(|&x| x == j).unwrap()).min().unwrap_or(n);
+            for q in lo..hi {
                 if q == p {
                     continue;
                 }
