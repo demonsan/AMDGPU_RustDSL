@@ -543,6 +543,16 @@
   - 16384³：3188 → 2006 µs。
   - 对 aiter f4gemm 从 0.60 / 0.63× 提到 0.83 / 0.82×。
 - **试过但未采纳**：寄存器 B，即 B 从 global 原地重载进 AGPR，依赖后端的 in-place reload。它只带来 +1% / 0，已从树中移除，保留为 tag `archive/mxfp4-regb`。将来若做 256 字节的 A tile，可从这个 tag 起步，因为它腾出了 B 的 ring。
+**MX 量化（覆盖补齐）**：见 [`rows/mxquant.rs`](../crates/amdgpu-kernels/src/rows/mxquant.rs)，CPU 校验用 [`mxquant_host.cpp`](../tests/gpu/mxquant_host.cpp)。
+- `quant_mxfp4_bf16_k<K>`：bf16 → fp4（e2m1）加 1×32 的 E8M0 scale，scale 直接写成 `gemm_a4w4_mxfp4` 的重排布局。
+  - scale 规则与 aiter `dynamic_mxfp4_quant` 相同：amax 加 0x200000 后截断，取指数再减 2。
+  - 4096×7168：17.9 µs，4140 GB/s，码值与 scale 全部一致。
+- `quant_mxfp8_bf16_k<K>`：bf16 → fp8 e4m3 加 1×128 的 E8M0 scale，布局为 [K/128][M]（`gemm_mxfp8_bs_v4` 的 A scale）。
+  - scale 规则：ceil(log2(amax / 448))，不饱和。
+  - 每 16 个 lane 沿 K 处理一组，用 DPP 求 amax。
+  - 4096×7168：15.7 µs，5643 GB/s，全部一致。
+- fp4 的 `v_cvt_scalef32_pk_fp4_f32` 按字节选择写入的功能不可用，已报告后端；目前改为先写 byte 0 再移位。
+
 ### 7.5 批次 3（attention）状态：覆盖完成，性能待优化
 
 **prefill**：`fmha_fwd_hd<64|128|256>_bf16[_causal][_swa][_group]`，见 [`fmha/bf16.rs`](../crates/amdgpu-kernels/src/fmha/bf16.rs)。
