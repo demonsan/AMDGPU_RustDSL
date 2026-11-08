@@ -197,6 +197,8 @@ struct Lowerer {
     exact_uses: HashMap<ValueId, usize>,
     /// Cache of sub-register views: (tuple, dword offset, class) -> alias vreg.
     alias_cache: HashMap<(VReg, u8, RClass), VReg>,
+    /// root register views of loop variables that must be copied at their definition (a use would otherwise see a later write of the variable: `facts::stale_view_roots`)
+    view_copy: std::collections::HashSet<ValueId>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
     /// AGPR requests from the IR (resolved to vregs in inish).
@@ -318,6 +320,7 @@ impl Lowerer {
                 m
             },
             alias_cache: HashMap::new(),
+            view_copy: amdgpu_dsl::facts::stale_view_roots(f),
             else_started: HashSet::new(),
             agpr_marks: f.agpr.clone(),
             reg_plan: f.reg_plan.clone(),
@@ -1503,7 +1506,21 @@ impl Lowerer {
     fn lower_stmt(&mut self, f: &Function, st: &Stmt) -> Result<(), String> {
         {
             match st {
-                Stmt::Let { dst, op } => self.lower_op(*dst, op)?,
+                Stmt::Let { dst, op } => {
+                    self.lower_op(*dst, op)?;
+                    if self.view_copy.contains(dst) {
+                        // SSA semantics for a view of a loop variable used after the variable is written: snapshot it now
+                        let r = *self.val.get(dst).ok_or("view not lowered")?;
+                        let c = self.new_vreg(self.mir.vreg_class(r));
+                        self.touch(&[Src::Reg(r)]);
+                        if self.mir.vreg_class(r) == RClass::S1 {
+                            self.push(MInst::new(MOp::SMovB32).def(c).srcreg(r));
+                        } else {
+                            self.copy_reg(c, r)?;
+                        }
+                        self.val.insert(*dst, c);
+                    }
+                }
                 Stmt::StoreU16 { base, byte_off, value } => {
                     let b = self.as_v2(*base)?;
                     let v = self.as_v1(*value)?;

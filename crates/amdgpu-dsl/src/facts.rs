@@ -432,9 +432,34 @@ impl Captured {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
-    /// Facts of every top-level node.
+    /// Facts of every top-level node. A node that uses a register VIEW of a loop variable (`view_source`: lane extracts, `var_slice8`,
+    /// bitcasts of a variable or of a view) also READS that variable: the view has no register of its own, so its value is the variable's
+    /// register at each use (lowering copies the view at its definition only when a use would otherwise see a later write: `stale_view_roots`).
+    /// Ordering such uses before the variable's next write keeps the zero-copy alias.
     pub fn facts(&self, f: &Function) -> Vec<Facts> {
-        self.nodes.iter().map(|n| node_facts(n, &f.value_tys)).collect()
+        let mut all: Vec<Stmt> = f.stmts().to_vec();
+        flatten_into(&self.nodes, &mut all);
+        let views = var_views(all.iter());
+        self.nodes
+            .iter()
+            .map(|n| {
+                let mut x = node_facts(n, &f.value_tys);
+                let mut inner = Vec::new();
+                flatten_into(std::slice::from_ref(n), &mut inner);
+                for st in &inner {
+                    for u in stmt_value_uses(st) {
+                        if let Some((v, _)) = views.get(&u) {
+                            // a view-producing Let only forwards the view: its own uses are counted where the derived value is used
+                            let forwards = matches!(st, Stmt::Let { op, .. } if view_source(op).is_some());
+                            if !forwards {
+                                push_unique(&mut x.var_reads, *v);
+                            }
+                        }
+                    }
+                }
+                x
+            })
+            .collect()
     }
     /// Facts of the whole capture as one unit (defs / uses / variables / effects / footprint of all its nodes).
     pub fn summary(&self, f: &Function) -> Facts {
@@ -499,4 +524,109 @@ impl Captured {
         }
         out
     }
+}
+
+/// The operand a register-VIEW op reinterprets (no instruction: the result is the operand's register or a sub-register of it).
+pub fn view_source(op: &Op) -> Option<Opnd> {
+    match op {
+        Op::VarSlice8 { var, .. } => Some(Opnd::Var(*var)),
+        Op::Frag2Lane { frag, .. } | Op::Frag4Lane { frag, .. } | Op::Frag16Lane { frag, .. } => Some(*frag),
+        Op::BitcastF32(a) | Op::BitcastI32(a) => Some(*a),
+        _ => None,
+    }
+}
+
+/// The values a statement reads (every ValueId it mentions except a `Let`'s destination).
+pub fn stmt_value_uses(st: &Stmt) -> Vec<ValueId> {
+    let mut out = Vec::new();
+    let dst = if let Stmt::Let { dst, .. } = st { Some(*dst) } else { None };
+    let mut s = st.clone();
+    s.ids(
+        &mut |v| {
+            if Some(*v) != dst {
+                push_unique(&mut out, *v);
+            }
+        },
+        &mut |_| {},
+    );
+    out
+}
+
+/// value -> (loop variable, root view value) for every value that is a register view of a loop variable (directly, or a view of a view).
+pub fn var_views<'a>(stmts: impl IntoIterator<Item = &'a Stmt>) -> std::collections::HashMap<ValueId, (VarId, ValueId)> {
+    let mut m: std::collections::HashMap<ValueId, (VarId, ValueId)> = std::collections::HashMap::new();
+    for st in stmts {
+        if let Stmt::Let { dst, op } = st {
+            match view_source(op) {
+                Some(Opnd::Var(v)) => {
+                    m.insert(*dst, (v, *dst));
+                }
+                Some(Opnd::Val(x)) => {
+                    if let Some(&(v, root)) = m.get(&x) {
+                        m.insert(*dst, (v, root));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    m
+}
+
+/// The root views (`var_views`) that must be COPIED at their definition for SSA semantics: some use of the view (or of a view derived from it)
+/// executes after a write of its loop variable that follows the view's definition — later in program order, or anywhere in a loop that
+/// contains the use but not the definition (the next iteration). Program order is the flat order (a write in one `if` arm and a use in the
+/// other is counted conservatively). Every other view stays a zero-cost alias.
+pub fn stale_view_roots(f: &Function) -> std::collections::HashSet<ValueId> {
+    let stmts = f.stmts();
+    let views = var_views(stmts.iter());
+    let mut out = std::collections::HashSet::new();
+    if views.is_empty() {
+        return out;
+    }
+    // loop nesting of every statement (ids of the enclosing loops)
+    let mut loops: Vec<Vec<usize>> = Vec::with_capacity(stmts.len());
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next = 0usize;
+    for st in stmts {
+        if let Stmt::EndLoop = st {
+            stack.pop();
+        }
+        loops.push(stack.clone());
+        if let Stmt::BeginLoop { .. } = st {
+            stack.push(next);
+            next += 1;
+        }
+    }
+    let mut def_pos: std::collections::HashMap<ValueId, usize> = std::collections::HashMap::new();
+    let mut writes: std::collections::HashMap<VarId, Vec<usize>> = std::collections::HashMap::new();
+    for (i, st) in stmts.iter().enumerate() {
+        if let Stmt::Let { dst, .. } = st {
+            def_pos.insert(*dst, i);
+        }
+        for w in stmt_class(st).2 {
+            if !matches!(st, Stmt::BeginLoop { .. }) {
+                writes.entry(w).or_default().push(i);
+            }
+        }
+    }
+    for (r, st) in stmts.iter().enumerate() {
+        if matches!(st, Stmt::Let { op, .. } if view_source(op).is_some()) {
+            continue; // forwarding a view is not a read
+        }
+        for u in stmt_value_uses(st) {
+            let Some(&(var, root)) = views.get(&u) else { continue };
+            if out.contains(&root) {
+                continue;
+            }
+            let Some(&p) = def_pos.get(&root) else { continue };
+            let stale = writes.get(&var).map_or(false, |ws| {
+                ws.iter().any(|&q| q > p && (q < r || loops[q].iter().any(|l| loops[r].contains(l) && !loops[p].contains(l))))
+            });
+            if stale {
+                out.insert(root);
+            }
+        }
+    }
+    out
 }
