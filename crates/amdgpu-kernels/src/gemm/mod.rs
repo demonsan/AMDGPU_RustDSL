@@ -135,7 +135,7 @@ pub enum Elem {
     /// is 128 bytes, the A tile two 128-byte halves (lo / hi images of the ring slot, two A register fragments per m block); per block two
     /// scaled `16x16x128` fp8 x fp4 MFMAs (A half h with the 16-byte B half h, scale byte h)
     Fp8W4,
-    /// A16W4 (`gemm_a16w4_mxfp4_128`): A bf16 (exact), B fp4 e2m1 with 1 x 32 E8M0 scales, dequantized to bf16 in the mainloop. K tile 256: the
+    /// A16W4 (`gemm_a16w4_mxfp4`): A bf16 (exact), B fp4 e2m1 with 1 x 32 E8M0 scales, dequantized to bf16 in the mainloop. K tile 256: the
     /// A tile is four 128-byte images (K 64 each); the host lays B with a K permutation inside each 256-K tile so that the lane's standard
     /// fp4 fragment dword 2 i + h holds the 8 K values of A image i half h (`bf16w4_k_perm`); B scales [N][K / 32] (not shuffled)
     Bf16W4,
@@ -1364,7 +1364,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_rowcol_fp8_bmm" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_bmm", GemmConfig { batched: true, ..GemmConfig::a8w8_rowcol() })),
         "gemm_a4w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4", GemmConfig::a4w4())),
         "gemm_a8w4_mxfp_128" => Some(gemm_mxfp8_bs("gemm_a8w4_mxfp_128", GemmConfig::a8w4_128())),
-        "gemm_a16w4_mxfp4_128" => Some(gemm_mxfp8_bs("gemm_a16w4_mxfp4_128", GemmConfig::a16w4_128())),
+        "gemm_a16w4_mxfp4" => Some(gemm_mxfp8_bs("gemm_a16w4_mxfp4", GemmConfig::a16w4_128())),
         "gemm_a4w4_mxfp4_128" => Some(gemm_mxfp8_bs("gemm_a4w4_mxfp4_128", GemmConfig::a4w4_128())),
         _ => None,
     }

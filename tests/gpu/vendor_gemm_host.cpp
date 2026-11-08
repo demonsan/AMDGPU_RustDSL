@@ -85,6 +85,7 @@ int main(int argc, char** argv) {
     // ---- operands (host values kept as float for the reference) ----
     std::vector<float> af((size_t)M * K), bf((size_t)N * K), sa_row, sb_col, sa_blk, sb_blk;
     std::vector<uint8_t> ha, hb;  // raw device bytes (A row-major [M, K], B [N, K] before any shuffle)
+    std::vector<uint8_t> hb_w4perm;  // bf16w4: the K-permuted B
     std::vector<uint8_t> sa8, sb8;  // e8m0 scales (f4)
     int es = 2;
     std::string kind = fam.rfind("ours_v4_", 0) == 0 ? fam.substr(8) : fam.substr(fam.find('_') + 1);
@@ -138,10 +139,33 @@ int main(int argc, char** argv) {
         sa8.resize((size_t)M * (K / 32)); sb8.resize((size_t)N * (K / 32));
         for (auto& s : sa8) s = 124 + rng() % 6;
         for (auto& s : sb8) s = 124 + rng() % 6;
+    } else if (kind == "bf16w4") {
+        // A16W4: A bf16 [M][K] (exact), B fp4 [N][K/2] bytes with e8m0 1 x 32 scales [N][K/32] (unshuffled); A "scales" all 1 (127, unused by
+        // the kernel). The device B gets the K permutation of gemm_a16w4 inside every 256-K tile (physical fp4 position p -> logical K),
+        // applied below before the standard preshuffle.
+        es = 2;
+        ha.resize((size_t)M * K * 2); hb.resize((size_t)N * K / 2);
+        for (size_t i = 0; i < (size_t)M * K; i++) { float v = (float)((int)(rng() % 17) - 8) / 8.0f; uint16_t bb = f_to_bf16(v); memcpy(&ha[2 * i], &bb, 2); af[i] = bf16_to_f(bb); }
+        for (size_t i = 0; i < hb.size(); i++) { hb[i] = rng() & 0xff; bf[2 * i] = e2m1_to_f(hb[i] & 15); bf[2 * i + 1] = e2m1_to_f(hb[i] >> 4); }
+        sa8.assign((size_t)M * (K / 32), 127); sb8.resize((size_t)N * (K / 32));
+        for (auto& s : sb8) s = 124 + rng() % 6;
+        // permute: phys[p] = logical K 256 T + L(p), L(p) = 128 (p / 128) + 64 ((p % 32) / 16) + 16 ((p % 128) / 32) + p % 16
+        std::vector<uint8_t> hp(hb.size(), 0);
+        for (int n = 0; n < N; n++)
+            for (int k = 0; k < K; k++) {
+                int T = k / 256, p = k % 256;
+                int L = 128 * (p / 128) + 64 * ((p % 32) / 16) + 16 * ((p % 128) / 32) + p % 16;
+                size_t src = (size_t)n * K + 256 * T + L;
+                uint8_t code = (hb[src / 2] >> (4 * (src & 1))) & 15;
+                size_t dst = (size_t)n * K + k;
+                hp[dst / 2] |= code << (4 * (dst & 1));
+            }
+        hb_w4perm = hp;
     } else { fprintf(stderr, "unknown family %s\n", fam.c_str()); return 1; }
 
     // ---- device buffers ----
-    const bool b4 = kind == "f4" || kind == "f8f4";
+    const bool b4 = kind == "f4" || kind == "f8f4" || kind == "bf16w4";
+    if (kind == "bf16w4") hb.swap(hb_w4perm);  // the device gets the permuted B (the reference uses bf)
     const int Kb = b4 ? K / 2 : K;  // B row length in device elements
     std::vector<uint8_t> hb_dev = pre && kind != "a16w16" && fam != "asm_bf16" ? shuffle_b(hb, N, b4 ? Kb : K, b4 ? 1 : es) : hb;
     void* dA = dev(ha);
@@ -191,7 +215,7 @@ int main(int argc, char** argv) {
         int iv[10] = {M, N, K, 1, K, K, N, 0, 0, 0};
         for (int i = 0; i < 10; i++) a.u32(24 + 4 * i, iv[i]);
         a.ptr(64, dSA); a.ptr(72, dSB); a.u32(80, M); a.u32(84, K / 128); a.u32(88, 0); a.u32(92, 0); a.b.resize(96);
-    } else if (fam == "ours_v4_f4" || fam == "ours_v4_f8f4") {
+    } else if (fam == "ours_v4_f4" || fam == "ours_v4_f8f4" || fam == "ours_v4_bf16w4") {
         // our v4 structure, MXFP4: A [M][K/2] bytes, B preshuffled bytes, KT = 128-byte K tiles = K / 256; e8m0 scales SHUFFLED
         // (gemm_a4w4_mxfp4 scale_shuf): [rows/16][KT/2][64 lanes][4] - lane 16 g + r: groups g, 4+g of tile 2p, then of tile 2p+1 (K % 512 == 0)
         {
@@ -211,7 +235,8 @@ int main(int argc, char** argv) {
                         }
                 return o;
             };
-            dSA = dev(shuf(sa8, M)); dSB = dev(shuf(sb8, N));
+            if (kind == "bf16w4") { dSA = dev(sa8); dSB = dev(sb8); }  // A16W4: B scales [N][K/32] unshuffled (A ones unused)
+            else { dSA = dev(shuf(sa8, M)); dSB = dev(shuf(sb8, N)); }
         }
         a.ptr(0, dA); a.ptr(8, dB); a.ptr(16, dC);
         int iv[10] = {M, N, K, 1, K, K, N, 0, 0, 0};
@@ -304,7 +329,7 @@ int main(int argc, char** argv) {
                     ref += p * s;
                     mag += std::fabs(p * s);
                 }
-            } else if (kind == "f4" || kind == "f8f4") {
+            } else if (kind == "f4" || kind == "f8f4" || kind == "bf16w4") {
                 for (int g = 0; g < K / 32; g++) {
                     double p = 0;
                     for (int k = g * 32; k < g * 32 + 32; k++) p += (double)af[(size_t)m * K + k] * bf[(size_t)n * K + k];
