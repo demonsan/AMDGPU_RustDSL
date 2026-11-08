@@ -146,7 +146,7 @@ pub fn mla16_decode_bf16(name: &str, page: i32) -> Function {
     inits.extend((0..DB + 2).map(|_| (DType::Frag4, Opnd::Val(zero4))));
     // no branch around the loop: an empty part runs one fully masked tile (P = 0, l = 0) and the epilogue writes O = 0, LSE = -inf (the
     // previous if / else form hit a backend bug: a constant register materialised only on the then path was read on the else path)
-    let nloop = { let v = b.bind_i32(ev(ntile).max(1)); b.read_first_lane(v) };
+    let nloop = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(5).max(1)); b.read_first_lane(v) };
     let vars = b.begin_loop(&inits);
     let (it, m_v, l_v) = (vars[0], vars[1], vars[2]);
     let ov: Vec<VarId> = vars[3..3 + DB].to_vec();
