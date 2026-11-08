@@ -556,6 +556,18 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
                 vr(a, reg_of(&inst.srcs[4]))
             )]
         }
+        MOp::VMfma16x16x32Bf16 => vec![format!("v_mfma_f32_16x16x32_bf16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 4))],
+        MOp::VMfma16x16x32Bf16Z => vec![format!("v_mfma_f32_16x16x32_bf16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfma32x32x16Bf16 => vec![format!("v_mfma_f32_32x32x16_bf16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 16))],
+        MOp::VMfma32x32x16Bf16Z => vec![format!("v_mfma_f32_32x32x16_bf16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfma16x16x32F16 => vec![format!("v_mfma_f32_16x16x32_f16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 4))],
+        MOp::VMfma16x16x32F16Z => vec![format!("v_mfma_f32_16x16x32_f16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfma32x32x16F16 => vec![format!("v_mfma_f32_32x32x16_f16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 16))],
+        MOp::VMfma32x32x16F16Z => vec![format!("v_mfma_f32_32x32x16_f16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfma16x16x64I8 => vec![format!("v_mfma_i32_16x16x64_i8 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 4))],
+        MOp::VMfma16x16x64I8Z => vec![format!("v_mfma_i32_16x16x64_i8 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfma32x32x32I8 => vec![format!("v_mfma_i32_32x32x32_i8 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 16))],
+        MOp::VMfma32x32x32I8Z => vec![format!("v_mfma_i32_32x32x32_i8 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
         MOp::VSmfmac16x16x128Fp8 => {
             // D (4) += sparse A (4) x dense B (8); SRC2 is the sparse-index dword.
             let a_reg = reg_of(&inst.srcs[0]);

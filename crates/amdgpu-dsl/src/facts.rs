@@ -209,6 +209,7 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::ExpF32(..) | Op::RcpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) => ResClass::Trans,
         Op::Un(o, _) if o.trans() => ResClass::Trans,
         Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
+        Op::Mfma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
         Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => {
             e.global_read = true;
             ResClass::VmemLoad
@@ -276,6 +277,7 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
             e.global_write = true;
             (ResClass::VmemStore, vec![], false)
         }
+        Stmt::VarMfma { var, kind, zero, .. } => (ResClass::Mfma { passes: kind.passes() }, vec![*var], !*zero),
         Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => {
             e.lds_write = true;
             (ResClass::LdsWrite, vec![], false)

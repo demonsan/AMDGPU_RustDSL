@@ -280,7 +280,7 @@ impl Lowerer {
                     count(lds_addr);
                 }
                 Stmt::SetVar { value, .. } => count(value),
-                Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => {
+                Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } | Stmt::VarMfma { .. } => {
                     for o in amdgpu_dsl::stmt_operands(st) {
                         count(&o);
                     }
@@ -1932,6 +1932,17 @@ impl Lowerer {
                     let v = self.as_v4(*value)?;
                     self.push(MInst::new(MOp::LdsWriteB128).srcreg(a).srcreg(v).imm(off));
                 }
+                Stmt::VarMfma { var, kind, a, b, scale: _, zero } => {
+                    let v = *self.vars.get(var.0 as usize).ok_or("var not lowered")?;
+                    let (mop, zmop) = mfma_mop(*kind)?;
+                    let ra = self.as_v4(*a)?;
+                    let rb = self.as_v4(*b)?;
+                    if *zero {
+                        self.push(MInst::new(zmop).def(v).srcreg(ra).srcreg(rb));
+                    } else {
+                        self.push(MInst::new(mop).def(v).srcreg(ra).srcreg(rb).srcreg(v));
+                    }
+                }
                 Stmt::StoreGlobalN { base, byte_off, value, ty, hi } => {
                     let b = self.as_v2(*base)?;
                     let (v, mop) = self.store_value(*value, *ty, *hi, global_store_mop)?;
@@ -2308,6 +2319,33 @@ impl Lowerer {
                 self.push(MInst::new(mop).def(d).srcreg(a).imm(imm));
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
+            }
+            Op::Mfma { kind, a, b, c, scale: _ } => {
+                let (mop, zmop) = mfma_mop(*kind)?;
+                let ra = self.as_v4(*a)?;
+                let rb = self.as_v4(*b)?;
+                let n = kind.acc_dwords();
+                let cls = if n == 4 { RClass::V4 } else { RClass::V16 };
+                match c {
+                    Some(c) if !self.is_zero_frag(c) => {
+                        let rc = if n == 4 { self.as_v4(*c)? } else { self.as_v16(*c)? };
+                        let reusable = matches!(c, Opnd::Val(cv) if self.use_counts.get(cv).copied() == Some(1) && matches!(self.defs.get(cv), Some(Op::Mfma { .. })));
+                        let d = if reusable {
+                            rc
+                        } else {
+                            let d = self.new_vreg(cls);
+                            self.copy_reg(d, rc)?;
+                            d
+                        };
+                        self.push(MInst::new(mop).def(d).srcreg(ra).srcreg(rb).srcreg(d));
+                        self.val.insert(dst, d);
+                    }
+                    _ => {
+                        let d = self.new_vreg(cls);
+                        self.push(MInst::new(zmop).def(d).srcreg(ra).srcreg(rb));
+                        self.val.insert(dst, d);
+                    }
+                }
             }
             Op::LoadLdsTrB16 { addr } => {
                 let (a, off) = self.lds_addr(*addr)?;
@@ -4095,5 +4133,22 @@ fn lds_store_mop(t: amdgpu_dsl::MemTy, hi: bool) -> Result<MOp, String> {
         (M::B96, false) => MOp::LdsWriteB96,
         (M::B128, false) => MOp::LdsWriteB128,
         (t, true) => return Err(format!("a d16_hi store of {t:?}: only 8 / 16-bit stores have a hi form")),
+    })
+}
+
+/// (C form, zero-C form) MOps of an MFMA kind.
+fn mfma_mop(k: amdgpu_dsl::MmaKind) -> Result<(MOp, MOp), String> {
+    use amdgpu_dsl::{MmaShape as S, MmaTy as T};
+    if k.scaled || k.a != k.b {
+        return Err(format!("mfma {k:?}: not supported yet"));
+    }
+    Ok(match (k.shape, k.a) {
+        (S::M16N16K32, T::Bf16) => (MOp::VMfma16x16x32Bf16, MOp::VMfma16x16x32Bf16Z),
+        (S::M32N32K16, T::Bf16) => (MOp::VMfma32x32x16Bf16, MOp::VMfma32x32x16Bf16Z),
+        (S::M16N16K32, T::F16) => (MOp::VMfma16x16x32F16, MOp::VMfma16x16x32F16Z),
+        (S::M32N32K16, T::F16) => (MOp::VMfma32x32x16F16, MOp::VMfma32x32x16F16Z),
+        (S::M16N16K64, T::I8) => (MOp::VMfma16x16x64I8, MOp::VMfma16x16x64I8Z),
+        (S::M32N32K32, T::I8) => (MOp::VMfma32x32x32I8, MOp::VMfma32x32x32I8Z),
+        _ => return Err(format!("mfma {k:?}: not supported yet")),
     })
 }

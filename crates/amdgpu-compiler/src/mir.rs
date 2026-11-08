@@ -236,6 +236,19 @@ pub enum MOp {
     /// ISA, explicit here so every pass sees the read). Semantics:
     /// D += A_sparse(16x128, 64 nonzeros/row) x B(128x16).
     VSmfmac16x16x128Fp8,
+    // P1-d gfx950 double-rate bf16 / f16 and i8 MFMA (docs/op-coverage-tileops.md); `Z`: zero accumulator
+    VMfma16x16x32Bf16,
+    VMfma16x16x32Bf16Z,
+    VMfma32x32x16Bf16,
+    VMfma32x32x16Bf16Z,
+    VMfma16x16x32F16,
+    VMfma16x16x32F16Z,
+    VMfma32x32x16F16,
+    VMfma32x32x16F16Z,
+    VMfma16x16x64I8,
+    VMfma16x16x64I8Z,
+    VMfma32x32x32I8,
+    VMfma32x32x32I8Z,
     /// _accvgpr_read_b32 vD, aS: dst V1 <- src A1.
     VAccvgprRead,
     /// _accvgpr_write_b32 aD, src: dst A1 <- V1 / S1 / inline constant (Imm).
