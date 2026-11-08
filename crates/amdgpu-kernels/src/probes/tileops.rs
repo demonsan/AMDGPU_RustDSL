@@ -371,9 +371,30 @@ pub fn f8f6f4_p1_kinds() -> Vec<amdgpu_dsl::MmaKind> {
 
 /// `probe_f8f6f4_p1(in, out)`: per kind, A and B (32 bytes per lane each, lane-major; fp4 uses the first 16, fp6 the first 24) with unit
 /// E8M0 scales (0x7F); `out` gets D = A x B (zero-C) and D2 = A x B + D, lane-major.
+/// The unscaled kinds of `probe_f8f6f4_plain` (`MmaKind::f8f6f4`, no scale operands).
+pub fn f8f6f4_plain_kinds() -> Vec<amdgpu_dsl::MmaKind> {
+    use amdgpu_dsl::{MmaKind, MmaShape as S, MmaTy as T};
+    vec![
+        MmaKind::f8f6f4(S::M16N16K128, T::Fp4, T::Fp4),
+        MmaKind::f8f6f4(S::M16N16K128, T::Fp8, T::Fp4),
+        MmaKind::f8f6f4(S::M16N16K128, T::Fp8, T::Fp8),
+        MmaKind::f8f6f4(S::M16N16K128, T::Fp6, T::Bf8),
+        MmaKind::f8f6f4(S::M32N32K64, T::Fp4, T::Fp4),
+        MmaKind::f8f6f4(S::M32N32K64, T::Bf8, T::Fp8),
+    ]
+}
+
+/// `probe_f8f6f4_plain(in, out)`: as `probe_f8f6f4_p1` for the unscaled kinds (D = A x B, D2 = A x B + D).
+pub fn probe_f8f6f4_plain() -> Function {
+    f8f6f4_probe("probe_f8f6f4_plain", f8f6f4_plain_kinds())
+}
+
 pub fn probe_f8f6f4_p1() -> Function {
-    let kinds = f8f6f4_p1_kinds();
-    let mut b = FnBuilder::new("probe_f8f6f4_p1", 64);
+    f8f6f4_probe("probe_f8f6f4_p1", f8f6f4_p1_kinds())
+}
+
+fn f8f6f4_probe(name: &str, kinds: Vec<amdgpu_dsl::MmaKind>) -> Function {
+    let mut b = FnBuilder::new(name, 64);
     b.arg("in", DType::Ptr, 0, 8);
     b.arg("out", DType::Ptr, 8, 8);
     let out_bytes: u32 = kinds.iter().map(|k| 2 * 64 * 4 * k.acc_dwords()).sum();
@@ -400,8 +421,13 @@ pub fn probe_f8f6f4_p1() -> Function {
         };
         let fa = opnd(&mut b, 0, k.a);
         let fb = opnd(&mut b, 2048, k.b);
-        let d1 = b.mfma_scaled(*k, fa, fb, None, s);
-        let d2 = b.mfma_scaled(*k, fa, fb, Some(Opnd::Val(d1)), s);
+        let (d1, d2) = if k.scaled {
+            let d1 = b.mfma_scaled(*k, fa, fb, None, s);
+            (d1, b.mfma_scaled(*k, fa, fb, Some(Opnd::Val(d1)), s))
+        } else {
+            let d1 = b.mfma(*k, fa, fb, None);
+            (d1, b.mfma(*k, fa, fb, Some(Opnd::Val(d1))))
+        };
         let n = k.acc_dwords();
         let lane_off = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32((4 * n) as i32)));
         for (j, v) in [d1, d2].into_iter().enumerate() {
@@ -790,6 +816,46 @@ pub fn probe_lane_p1() -> Function {
     for (k, v) in vals.into_iter().enumerate() {
         let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((256 * (k / 8 * 8)) as i32) });
         b.store_global(base, 256 * (k as u32 % 8), v, MemTy::B32, false);
+    }
+    b.finish()
+}
+
+/// `probe_tileop_p1(in, out)` (own backend: DPP): the tileop builders on x, y = 4 f32 per lane (planes 0..3 / 4..7 of `in`). out per lane (15
+/// dwords, lane-major): ewise(x, y: 2 x + y) [4], apply2 AddF32 (packed) [4], apply2 MaxF32 [4], row_allreduce16 AddF32 (x0) [1],
+/// wave_allreduce MaxF32 (x1) [1], wave_allreduce AddU32 (lane id) [1].
+pub fn probe_tileop_p1() -> Function {
+    use amdgpu_dsl::{DppAluOp, MemTy};
+    use amdgpu_tile::tileop::{apply2, ewise, row_allreduce16, wave_allreduce, Ew2, RegTile};
+    let mut b = FnBuilder::new("probe_tileop_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(2048));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(64 * 60));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(16)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off16) });
+    let fx = b.load_global(pin, 0, MemTy::B128);
+    let fy = b.load_global(pin, 1024, MemTy::B128);
+    let x = RegTile::new(fx, 4, DType::F32);
+    let y = RegTile::new(fy, 4, DType::F32);
+    let e = ewise(&mut b, &[&x, &y], DType::F32, |b, v| b.let_(Op::FmaF32(Opnd::F32(2.0), Opnd::Val(v[0]), Opnd::Val(v[1]))));
+    let s = apply2(&mut b, Ew2::AddF32, &x, &y);
+    let m = apply2(&mut b, Ew2::MaxF32, &x, &y);
+    let x0 = x.elem(&mut b, 0);
+    let x1 = x.elem(&mut b, 1);
+    let r = row_allreduce16(&mut b, DppAluOp::AddF32, x0);
+    let w = wave_allreduce(&mut b, DppAluOp::MaxF32, x1);
+    let c = wave_allreduce(&mut b, DppAluOp::AddU32, tid);
+    let off60 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(60)));
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off60) });
+    for (k, t) in [e, s, m].iter().enumerate() {
+        b.store_global(pout, 16 * k as u32, t.frag, MemTy::B128, false);
+    }
+    for (k, v) in [r, w, c].into_iter().enumerate() {
+        let v = if b.f.value_tys[v as usize] == DType::F32 { b.let_(Op::BitcastI32(Opnd::Val(v))) } else { v };
+        b.store_global(pout, 48 + 4 * k as u32, v, MemTy::B32, false);
     }
     b.finish()
 }

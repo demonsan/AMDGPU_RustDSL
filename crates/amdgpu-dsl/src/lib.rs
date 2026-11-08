@@ -191,6 +191,10 @@ impl MmaKind {
     pub const fn scaled_f8f6f4(shape: MmaShape, a: MmaTy, b: MmaTy) -> MmaKind {
         MmaKind { shape, a, b, scaled: true }
     }
+    /// An unscaled f8f6f4 kind (`v_mfma_f32_{16x16x128,32x32x64}_f8f6f4`): no scale operands.
+    pub const fn f8f6f4(shape: MmaShape, a: MmaTy, b: MmaTy) -> MmaKind {
+        MmaKind { shape, a, b, scaled: false }
+    }
     /// Accumulator / result dwords per lane (16x16: 4, 32x32: 16).
     pub fn acc_dwords(self) -> u32 {
         match self.shape {
@@ -220,9 +224,12 @@ impl MmaKind {
         use MmaShape as S;
         use MmaTy as T;
         let f8f6f4 = |t: MmaTy| matches!(t, T::Fp8 | T::Bf8 | T::Fp6 | T::Bf6 | T::Fp4);
+        if matches!(self.shape, S::M16N16K128 | S::M32N32K64) {
+            // f8f6f4 with A / B format select (mixed formats allowed), block-scaled or not (unscaled: no scale operands, no unit-scale constants)
+            return f8f6f4(self.a) && f8f6f4(self.b);
+        }
         if self.scaled {
-            // block-scaled f8f6f4 with A / B format select (mixed formats allowed)
-            return matches!(self.shape, S::M16N16K128 | S::M32N32K64) && f8f6f4(self.a) && f8f6f4(self.b);
+            return false;
         }
         self.a == self.b && matches!((self.shape, self.a), (S::M16N16K32 | S::M32N32K16, T::Bf16 | T::F16) | (S::M16N16K64 | S::M32N32K32, T::I8))
     }
@@ -623,6 +630,10 @@ pub enum Op {
     LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
     LoadLdsTrB16 { addr: Opnd },
+    /// Dwords `start .. start + n` of a fragment value as a value of its own WITHOUT a copy (a register view; n = 1 -> I32, 2 / 4 / 8 -> FragN)
+    FragSlice { frag: Opnd, start: u8, n: u8 },
+    /// The concatenation of one-dword values and fragments into one fragment of the total width (2, 4, 8 or 16 dwords; copies)
+    FragCat { parts: Vec<Opnd>, dwords: u8 },
     /// LDS atomic returning the old value (`ds_<op>_rtn_*`)
     AtomicLds { op: AtomicOp, addr: Opnd, value: Opnd },
     /// global atomic returning the old value (`global_atomic_<op> ... sc0`)
@@ -665,6 +676,18 @@ impl Op {
             Op::Mfma { kind, .. } => kind.acc_ty(),
             Op::Cvt { op, .. } => op.sig().1,
             Op::Dpp { .. } => DType::U32,
+            Op::FragSlice { n, .. } => match n {
+                1 => DType::I32,
+                2 => DType::Frag2,
+                4 => DType::Frag4,
+                _ => DType::Frag8,
+            },
+            Op::FragCat { dwords, .. } => match dwords {
+                2 => DType::Frag2,
+                4 => DType::Frag4,
+                8 => DType::Frag8,
+                _ => DType::Frag16,
+            },
             Op::ReadLane { .. } | Op::WriteLane { .. } | Op::Ballot { .. } | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => DType::I32,
             Op::AtomicLds { op, .. } | Op::AtomicGlobal { op, .. } => op.value_ty(),
             Op::DppAlu { op, .. } => match op {
@@ -761,6 +784,8 @@ impl Op {
             Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } | Op::LoadLdsD16 { addr, .. } => vec![*addr],
             Op::Cvt { op, srcs, .. } => srcs[..op.sig().0].to_vec(),
             Op::Dpp { x, old, .. } => vec![*x, *old],
+            Op::FragSlice { frag, .. } => vec![*frag],
+            Op::FragCat { parts, .. } => parts.clone(),
             Op::ReadLane { x, .. } | Op::Swizzle { x, .. } => vec![*x],
             Op::WriteLane { x, old, .. } => vec![*x, *old],
             Op::Ballot { cond, .. } => vec![*cond],
@@ -2058,6 +2083,36 @@ impl FnBuilder {
         } else {
             self.push_stmt(Stmt::AtomicGlobalNoRet { op, base, byte_off, value });
             None
+        }
+    }
+    /// Dwords `start .. start + n` of fragment `frag` as a view (no instruction).
+    pub fn frag_slice(&mut self, frag: impl Into<Opnd>, start: u8, n: u8) -> ValueId {
+        assert!(matches!(n, 1 | 2 | 4 | 8), "frag_slice: n is 1, 2, 4 or 8");
+        self.let_(Op::FragSlice { frag: frag.into(), start, n })
+    }
+    /// Concatenate one-dword values / fragments into a fragment (total 2, 4, 8 or 16 dwords).
+    pub fn frag_cat(&mut self, parts: &[Opnd]) -> ValueId {
+        let total: u32 = parts.iter().map(|p| self.opnd_dwords(*p)).sum();
+        assert!(matches!(total, 2 | 4 | 8 | 16), "frag_cat: {total} dwords (2, 4, 8 or 16)");
+        self.let_(Op::FragCat { parts: parts.to_vec(), dwords: total as u8 })
+    }
+    fn opnd_dwords(&self, o: Opnd) -> u32 {
+        match o {
+            Opnd::Val(v) => match self.f.value_tys[v as usize] {
+                DType::Frag2 | DType::Ptr => 2,
+                DType::Frag4 => 4,
+                DType::Frag8 => 8,
+                DType::Frag16 => 16,
+                _ => 1,
+            },
+            Opnd::Var(v) => match self.f.var_tys[v.0 as usize] {
+                DType::Frag2 => 2,
+                DType::Frag4 => 4,
+                DType::Frag8 => 8,
+                DType::Frag16 => 16,
+                _ => 1,
+            },
+            _ => 1,
         }
     }
     /// `v_readlane_b32`: lane `lane`'s `x` (uniform).
