@@ -5,16 +5,21 @@
 //! Names: `silu_mul_bf16_d<D>`, `gelu_tanh_mul_bf16_d<D>` (D a multiple of 8, 8..=65536; M <= 65535 and the input / output tensors < 4 GiB), `add_bf16` (flat, n a multiple of 8).
 //! ABI: `act_mul`: x @0 (`[M][2D]` bf16), out @8 (`[M][D]` bf16), M @16 (i32). `add_bf16`: a @0, b @8, out @16, n @24 (i32, elements).
 
-use amdgpu_dsl::{CompileProfile, DType, Ext, FnBuilder, Function, Op, Opnd, TriOp, ValueId};
+use amdgpu_dsl::{CachePolicy, CompileProfile, DType, Ext, FnBuilder, Function, MemTy, Op, Opnd, TriOp, ValueId};
 use amdgpu_tile::prims::{act, bf16x8_to_f32, Act};
 use amdgpu_tile::ev;
 
-pub fn by_name(name: &str) -> Option<Function> {
+pub fn by_name(full: &str) -> Option<Function> {
+    // a `_nt` suffix selects the non-temporal cache policy on the streaming loads / stores (experiment: aiter uses GROUP_NT)
+    let (name, cache) = match full.strip_suffix("_nt") {
+        Some(n) => (n, CachePolicy::NT),
+        None => (full, CachePolicy::NONE),
+    };
     match name {
         "add_bf16" => return Some(add_bf16(name)),
         "cvt_f32_bf16" => return Some(cvt_f32_bf16(name)),
         "cvt_bf16_f32" => return Some(cvt_bf16_f32(name)),
-        "quant_bf16_fp8_static" => return Some(quant_bf16_fp8_static(name)),
+        "quant_bf16_fp8_static" => return Some(quant_bf16_fp8_static(full, cache)),
         _ => {}
     }
     let (rest, a) = if let Some(r) = name.strip_prefix("silu_mul_bf16_d") {
@@ -25,7 +30,7 @@ pub fn by_name(name: &str) -> Option<Function> {
         return None;
     };
     let d: i64 = rest.parse().ok()?;
-    (d % 8 == 0 && (8..=65536).contains(&d)).then(|| act_mul_bf16(name, d, a))
+    (d % 8 == 0 && (8..=65536).contains(&d)).then(|| act_mul_bf16(full, d, a, cache))
 }
 
 /// Eight f32 values -> 4 packed-bf16 dwords as one Frag4.
@@ -35,7 +40,7 @@ fn pack_bf16x8(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
 }
 
 /// `out[m][d] = act(x[m][d]) * x[m][D + d]` for bf16 `x [M][2D]`, `out [M][D]`; grid x = the column tiles of `threads * 8` elements (fastest: consecutive blocks read consecutive memory), grid y = the rows (M <= 65535).
-pub fn act_mul_bf16(name: &str, d: i64, a: Act) -> Function {
+pub fn act_mul_bf16(name: &str, d: i64, a: Act, cache: CachePolicy) -> Function {
     let d8 = d / 8;
     let threads = (((d8 + 63) / 64).min(4) * 64) as u32;
     let tiles = (d8 + threads as i64 - 1) / threads as i64;
@@ -67,8 +72,8 @@ pub fn act_mul_bf16(name: &str, d: i64, a: Act) -> Function {
     let offo = b.bind_i32(ev(row) * (2 * d) as i32 + (ev(col8) << 4));
     // lanes past the row end store to an offset outside every descriptor (dropped by the hardware)
     let offo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(valid), a: Opnd::Val(offo), b: Opnd::I32(-16) });
-    let x1 = b.buffer_load_b128(r_x, off1, 0i32, 0);
-    let x2 = b.buffer_load_b128(r_x, off2, 0i32, 0);
+    let x1 = b.buffer_load_c(r_x, Some(Opnd::Val(off1)), 0i32, 0, MemTy::B128, cache);
+    let x2 = b.buffer_load_c(r_x, Some(Opnd::Val(off2)), 0i32, 0, MemTy::B128, cache);
     let (f1, f2) = (bf16x8_to_f32(b, x1), bf16x8_to_f32(b, x2));
     let mut r = [0; 8];
     for i in 0..8 {
@@ -76,7 +81,7 @@ pub fn act_mul_bf16(name: &str, d: i64, a: Act) -> Function {
         r[i] = b.mul_f32(y, f2[i]);
     }
     let o = pack_bf16x8(b, &r);
-    b.buffer_store_b128(r_o, offo, 0i32, 0, o);
+    b.buffer_store_c(r_o, Some(Opnd::Val(offo)), 0i32, 0, o, MemTy::B128, false, cache);
     fb.finish()
 }
 
@@ -196,7 +201,7 @@ pub fn cvt_bf16_f32(name: &str) -> Function {
 }
 
 /// Static per-tensor fp8 (e4m3) quantization: `out[i] = fp8(clamp(x[i] / scale, -448, 448))` for bf16 `x` (n a multiple of 8); a lane converts 8 elements (b128 load, b64 store). ABI x @0, out @8, scale @16 (f32), n @20 (i32).
-pub fn quant_bf16_fp8_static(name: &str) -> Function {
+pub fn quant_bf16_fp8_static(name: &str, cache: CachePolicy) -> Function {
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::Default);
     let b = &mut fb;
@@ -221,7 +226,7 @@ pub fn quant_bf16_fp8_static(name: &str) -> Function {
     let lo = b.c_f32(-448.0);
     let hi = b.c_f32(448.0);
     let off = b.bind_i32((ev(bx) << 12) + (ev(tid) << 4));
-    let x = b.buffer_load_b128(r_x, off, 0i32, 0);
+    let x = b.buffer_load_c(r_x, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, cache);
     let f = bf16x8_to_f32(b, x);
     let mut q = [0; 8];
     for k in 0..8 {
@@ -231,6 +236,6 @@ pub fn quant_bf16_fp8_static(name: &str) -> Function {
     let words = [b.cvt_pk_fp8x4_f32(q[0], q[1], q[2], q[3]), b.cvt_pk_fp8x4_f32(q[4], q[5], q[6], q[7])];
     let f2 = b.frag2(words[0], words[1]);
     let oo = b.bind_i32((ev(bx) << 11) + (ev(tid) << 3));
-    b.buffer_store_b64(r_o, oo, 0i32, 0, f2);
+    b.buffer_store_c(r_o, Some(Opnd::Val(oo)), 0i32, 0, f2, MemTy::B64, false, cache);
     fb.finish()
 }
