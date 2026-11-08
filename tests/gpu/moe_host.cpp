@@ -213,6 +213,16 @@ int main(int argc, char** argv) {
             for (size_t x = 0; x < y2.size(); x++) { diff += y2[x] != y1[x]; zero += y2[x] == 0; }
             printf("repeat %d: differs from run 0 at %ld, zeros %ld of %zu\n", r, diff, zero, y2.size());
         }
+        if (envi("DIFFMAP", 0)) {
+            // first run vs a warm run: per row (token) the count of differing columns; per 16-column block the count
+            std::vector<int> pr(M * TK, 0), pc(I / 16, 0);
+            for (size_t x = 0; x < y2.size(); x++) if (y2[x] != y1[x]) { pr[x / I]++; pc[(x % I) / 16]++; }
+            printf("rows with diffs:");
+            for (int r = 0; r < M * TK; r++) if (pr[r]) printf(" %d:%d", r, pr[r]);
+            printf("\ncol blocks:");
+            for (int c = 0; c < I / 16; c++) printf(" %d", pc[c]);
+            printf("\n");
+        }
         if (envi("USE_REPEAT", 0)) y1 = y2;
     }
     if (envi("GEMMONLY", 0) && !fp8 && TK == 1) {
