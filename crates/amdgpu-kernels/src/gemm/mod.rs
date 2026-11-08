@@ -284,6 +284,8 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                 bsets.push((bf, sb));
             }
         }
+        // every (k, h) operand of the unit's B fragments first, then the MFMAs (the dequant results are well ahead of their MFMA reads)
+        let mut all: Vec<Vec<(VarId, ValueId)>> = Vec::new();
         for k in 0..4u32 {
             for h in 0..2u8 {
                 let ops: Vec<(VarId, ValueId)> = bsets
@@ -306,6 +308,12 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                         (bf, b.pack4(w[0], w[1], w[2], w[3]))
                     })
                     .collect();
+                all.push(ops);
+            }
+        }
+        for k in 0..4u32 {
+            for h in 0..2u8 {
+                let ops = &all[(2 * k + h as u32) as usize];
                 for &(acc, a, bf, _, _, _) in blocks {
                     let bop = ops.iter().find(|x| x.0 == bf).unwrap().1;
                     let ak = b.var_slice4(VarId(a.0 + k * a_hi_off), h);
