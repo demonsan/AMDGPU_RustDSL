@@ -630,3 +630,34 @@ blockscale 128×128（`fp8bs`）的规则：
 - 两个 kernel 各自重算 S / P，dP 也算了两遍。厂商是单 kernel，dQ 走 fp32 原子累加。
 - causal 时 dkdv 只裁掉了前部的 q tile。
 - 方向：合并为一个 kernel，dQ 用原子累加（需要后端提供 `buffer_atomic_add_f32`）；加入延迟 rescale 一类的 VALU 优化。
+
+### 7.8 批次 5b（implicit-GEMM 卷积）状态：2d / 3d bf16 覆盖完成
+
+**实现**：`conv{2,3}d_bf16_[t<T>]r<R>s<S>_st<st>_p<pad>_d<dil>[_c128]`，见 [`gemm/mod.rs`](../crates/amdgpu-kernels/src/gemm/mod.rs) 的 `ConvCfg`。它复用 v4 bf16 GEMM 结构。
+- **GEMM 视图**：
+  - M = NB·OD·OH·OW。分解 m → (nb, od, oh, ow) 用浮点倒数加一步整数校正，只在循环外算一次。
+  - K = C·T·R·S，按"通道块 / 抽头"排序：每个 128 字节 K tile 是一个抽头上的 64 个通道。
+- **每 tile 的计算**：先用编译期常数的乘移位分解出抽头 (dz, r, s) 和通道块，再给出 tile 偏移。每个 A issue 判断输入坐标是否越界；越界时 voffset 取越界值，硬件读回 0，padding 由此实现。
+- **权重**：由 host 重排为 `[K][C/64][T][R][S][64]`，再做 `shuffle_weight(16,16)`。
+- **输出**：NDHWK，即 C [M, K]；最后一个 M tile 的多余行被描述符丢弃。
+
+**对照**：[`conv_host.cpp`](../tests/gpu/conv_host.cpp) 用 CPU 参考检查采样输出。FlyDSL 不可运行，所以性能按等效 GEMM 的 TF/s 报。
+
+**数据**：2026-11-08，GPU 5。全部 `bad=0`，strict 0 错误。
+
+| 形状 | TF/s |
+|---|--:|
+| 3×3 st1 p1，NB32 56² C64 K256 | 494 |
+| 3×3，NB32 28² C256 K512 | 636 |
+| 1×1，NB2 56² C256 K256 | 49 |
+| 3×3 st2，NB4 57² C128 K256 | 44 |
+| 3×3 d2 p2，NB2 30² C64 K256 | 20 |
+| 3d 3×3×3，NB2 8×16² C64 K128（CTA 128） | 59 |
+
+小形状 tile 数少，所以 TF/s 低。
+
+**待办**：
+- 小 M 时用 split-K / 128 CTA；
+- 抽头判断目前每 tile 每 issue 一次 VALU，可以裁掉无越界的 tile；
+- C 非 64 倍数时的通道 padding；
+- fp8 卷积。
