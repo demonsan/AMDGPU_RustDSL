@@ -178,7 +178,7 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
         let kd = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(kd), b: Opnd::Val(oob) });
         let kd = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(c_ok), a: Opnd::Val(kd), b: Opnd::Val(oob) });
         let kd = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(tok_ok), a: Opnd::Val(kd), b: Opnd::Val(oob) });
-        b.buffer_store_c(r_kc, Some(Opnd::Val(kd)), 0i32, 0, kv, MemTy::B128, false, CachePolicy::NT);
+        b.buffer_store_c(r_kc, Some(Opnd::Val(kd)), 0i32, 0, kv, MemTy::B128, false, CachePolicy::NONE);
         // value: element (head, 8 j + i): ((blk * Hk + head) * D + 8 j + i) * BS * 2 + off * 2
         let vbase = b.bind_i32((((ev(blk) * h as i32 + ev(head)) * d as i32 + (ev(j) << 3)) * (bs as i32 * 2)) + (ev(off) << 1));
         let vbase = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(vbase), b: Opnd::Val(oob) });
