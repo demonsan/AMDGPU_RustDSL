@@ -2299,6 +2299,20 @@ impl Lowerer {
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
+            // a returning atomic whose result is unused: the no-return form (a dead destination would be reused by the allocator while the
+            // atomic is still in flight, and its late write would clobber the new value)
+            Op::AtomicLds { op, addr, value } if self.use_counts.get(&dst).copied().unwrap_or(0) == 0 => {
+                let (a, off) = self.lds_addr(*addr)?;
+                let v = self.as_v1(*value)?;
+                self.touch(&[Src::Reg(v)]);
+                self.push(MInst::new(lds_atomic_mop(*op, false)).srcreg(a).srcreg(v).imm(off));
+            }
+            Op::AtomicGlobal { op, base, byte_off, value } if self.use_counts.get(&dst).copied().unwrap_or(0) == 0 => {
+                let rb = self.as_v2(*base)?;
+                let v = self.as_v1(*value)?;
+                self.touch(&[Src::Reg(v)]);
+                self.push(MInst::new(global_atomic_mop(*op, false)).srcreg(rb).srcreg(v).imm(*byte_off as i64));
+            }
             Op::AtomicLds { op, addr, value } => {
                 let (a, off) = self.lds_addr(*addr)?;
                 let v = self.as_v1(*value)?;
