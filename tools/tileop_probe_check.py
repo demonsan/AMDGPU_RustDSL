@@ -515,6 +515,7 @@ CVT_CASES = [("PkF32Fp8", [0], 0), ("PkF32Fp8", [0], 1), ("PkF32Bf8", [0], 1), (
              ("ScalePkF16Bf8", [0, 7], 0), ("ScalePkF32Fp8", [0, 7], 1), ("ScalePkF32Bf8", [0, 7], 0), ("ScalePkF32Fp4", [1, 7], 2),
              ("ScalePkBf16Fp4", [1, 7], 3), ("ScalePkF16Fp4", [1, 7], 1), ("ScalePkFp8F32", [2, 3, 7, 8], 1), ("ScalePkBf8F32", [2, 3, 7, 8], 0),
              ("ScalePkFp4F32", [2, 3, 7, 8], 2), ("ScalePkF32Fp8", [0, 9], 0), ("ScalePkBf16Fp4", [1, 10], 1), ("ScalePkFp8F32", [2, 3, 10, 8], 0),
+             ("ScalePkFp4F32", [2, 3, 7, 8], 0), ("ScalePkFp4F32", [2, 3, 7, 8], 1), ("ScalePkFp4F32", [2, 3, 7, 8], 3),
              ("PkU8F32", [4, 8], 2), ("PkI16I32", [5, 6], 0), ("PkU16U32", [5, 6], 0)]
 TWO = {"PkF32Fp8", "PkF32Bf8", "ScalePkF32Fp8", "ScalePkF32Bf8", "ScalePkF32Fp4"}
 
@@ -954,6 +955,34 @@ def check_lds_high(planes, out):
               ("" if m0 < 0x20000 else f"; marker at M0 - 128 KiB {'intact' if kept else ('OVERWRITTEN by the DMA (M0 wraps at 2^17)' if wrapped else 'changed')}"))
     return ok
 
+# ---------------------------------------------------------------- probe_ifelse (n = 0: the else arm)
+def check_ifelse(planes, out):
+    ninf = 0xFF800000
+    a = all(out[l] == (ninf if l < 40 else 0xA5A5A5A5) for l in range(64))
+    z = all(out[64 + l] == 0 for l in range(64))
+    print(("ok   " if a else "FAIL ") + "else arm: -inf at live lanes (l < 40), dead lanes dropped" + ("" if a else f": got {[hex(v) for v in out[:4]]} .. {[hex(v) for v in out[38:42]]}"))
+    print(("ok   " if z else "FAIL ") + "else arm: zero stores")
+    return a and z
+
+# ---------------------------------------------------------------- probe_fp4_chain
+def gen_fp4_chain():
+    rnd = random.Random(101)
+    S2 = [2 * v for v in VALS]
+    return [[u32(rnd.choice(S2)) for _ in range(LANES)] for _ in range(8)] + [[u32(2.0)] * LANES]
+
+def check_fp4_chain(planes, out):
+    bad = 0
+    for l in range(LANES):
+        w = 0
+        for s in range(4):
+            byte = enc_rne("fp4", f32(planes[2 * s][l]) / 2) | (enc_rne("fp4", f32(planes[2 * s + 1][l]) / 2) << 4)
+            w |= byte << (8 * s)
+        bad += out[l] != w
+        if out[l] != w and bad == 1:
+            print(f"  lane {l}: got {out[l]:08x} want {w:08x}")
+    print(("ok   " if bad == 0 else "FAIL ") + f"four chained fp4 packs (sel 0..3) into one word: {64 - bad}/64 lanes")
+    return bad == 0
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -972,6 +1001,8 @@ PROBES = {
     "probe_anylane": (lambda: [[0] * LANES], check_anylane, 9 * LANES * 4),
     "probe_reload_p1": (gen_reload_p1, check_reload_p1, 4 * 1024),
     "probe_lds_high": (gen_lds_high, check_lds_high, 5 * 64 * 20),
+    "probe_ifelse": (lambda: [[0] * 256], check_ifelse, 128 * 4),
+    "probe_fp4_chain": (gen_fp4_chain, check_fp4_chain, 256),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
