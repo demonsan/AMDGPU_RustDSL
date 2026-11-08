@@ -188,7 +188,10 @@ int main(int argc, char** argv) {
                 double got = bf(y1[((size_t)t * TK + k) * I + i]);
                 double err = std::fabs(got - ycpu[i]);
                 me1 = std::max(me1, err);
-                if (err > 2e-2 * std::fabs(ycpu[i]) + 2e-2) bad1++;
+                if (err > 2e-2 * std::fabs(ycpu[i]) + 2e-2) {
+                    if (bad1 < envi("SHOW_BAD", 0)) printf("  bad1 t=%d k=%d e=%d i=%d got=%g ref=%g\n", t, k, e, i, got, ycpu[i]);
+                    bad1++;
+                }
             }
             // stage 2 from the GPU y1 (quantized as the GPU consumed it for fp8)
             std::vector<double> yin(I);
