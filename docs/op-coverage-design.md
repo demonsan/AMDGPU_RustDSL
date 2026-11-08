@@ -552,6 +552,11 @@
 - 厂商 `opus bmm_a8w8_mxscale` 只有源码（csrc/opus_gemm），没有预编译 .co，所以没有做同次对比。
 - mxfp8 v4 的 bmm 只做了 strict 校验，因为 host 里还没有 v4 mxfp8 的 family。
 
+**per-tensor fp8 GEMM（覆盖补齐）**：`gemm_a8w8_pertensor_fp8[_128]`，即 `GemmConfig.per_tensor` 配合 RowCol。
+- `ptr_sfa` / `ptr_sfb` 各指向一个 fp32，在 epilogue 中广播。
+- 速度与 rowcol 相同：4096³ 为 2218 TF/s（rowcol 2225），8192³ 为 2806 TF/s；bad=0。
+- aiter 没有 per-tensor fp8 的 ASM GEMM，所以没有厂商对照。
+
 **MX 量化（覆盖补齐）**：见 [`rows/mxquant.rs`](../crates/amdgpu-kernels/src/rows/mxquant.rs)，CPU 校验用 [`mxquant_host.cpp`](../tests/gpu/mxquant_host.cpp)。
 - `quant_mxfp4_bf16_k<K>`：bf16 → fp4（e2m1）加 1×32 的 E8M0 scale，scale 直接写成 `gemm_a4w4_mxfp4` 的重排布局。
   - scale 规则与 aiter `dynamic_mxfp4_quant` 相同：amax 加 0x200000 后截断，取指数再减 2。
