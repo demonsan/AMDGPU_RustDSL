@@ -745,6 +745,12 @@ blockscale 128×128（`fp8bs`）的规则：
 **待办**：
 - **stage 2**：现在走 fp32 中间结果再求和，例如 4096×7168×topk8 要写 940 MB，所以只有 362 TF/s。改为 bf16 原子累加或在 CTA 内按 token 归并。aiter 没有 ASM stage 2（它用 CK），需要另找对照。
 - **blockscale stage 1**：0.8–0.87×。需要与批次 1 的 blockscale 中等 M 问题一起处理，方向是块乘积延后一个 tile。
+- **MXFP4 MoE（a4w4，已完成）**：`gemm_moe1_fp4_<act>[_bm64]` / `gemm_moe2_fp4[_bm64|_h]`。
+  - A 和 B 都是 fp4，配 1×32 E8M0 scale，scale 不重排：A 的 scale 行随 gather 取，B 的 scale 按 expert 用 ptr_mad 定位。
+  - 测试用 [`moe_fp4_host.cpp`](../tests/gpu/moe_fp4_host.cpp)：stage 1 的输出在 host 端按 aiter 规则重新量化成 MXFP4 后供 stage 2。结果全部 bad=0，maxrel 3.9e-3。
+  - 例如 M2048 D2048 I1024 E8 topk2：stage 1 39 µs，874 TF/s。
+  - gpt-oss 形式 `_oss`：每个 expert 带 fp32 bias（stage 1 为 [E][2I]，先 gate 后 up；stage 2 为 [E][D]）。stage 1 的激活为截断的 swiglu：gate = min(g+bg, 7)，up = clamp(u+bu, −7, 7)，y = (up+1)·gate·σ(1.702·gate)。用 host 的 `OSS=1` 测试，全部 bad=0。
+  - aiter 没有 fp4 MoE 的 ASM，因此没有厂商对照。
 - **block_m 64（已完成）**：`gemm_moe{1,2}_*_bm64` 是 64 行 tile。[`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `moe_block_m` 在每专家平均行数 M·topk/E < 128 时选用它。
   - M256 D7168 I2048 E64 topk8，stage 1：fp8 从 420 µs 降到 381 µs（aiter 392，1.03×）；fp8bs 从 530 µs 降到 417 µs（aiter 418，1.0×）。
   - 同一形状的 stage 2 + sum：fp8 251 → 222 µs，fp8bs 262 → 213 µs。
