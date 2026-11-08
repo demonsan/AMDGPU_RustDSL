@@ -404,6 +404,10 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, keep
             let x = b.frag16_lane(s[sb], r);
             let x = b.bitcast_f32(x);
             let off = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
+            if std::env::var("EXP_NOMASK").is_ok() {
+                sv.push(x);
+                continue;
+            }
             let k = keep(b, off);
             sv.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(k), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
         }
@@ -436,7 +440,7 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, keep
     b.set_var(m_v, m_new);
     b.set_var(l_v, l_new);
     // O^T *= alpha (one query per lane: a scalar)
-    for e in 0..nblk {
+    for e in 0..if std::env::var("EXP_NORESCALE").is_ok() { 0 } else { nblk } {
         for r in 0..16u8 {
             let x = b.frag16_lane(Opnd::Var(ov[e]), r);
             let x = b.bitcast_f32(x);
