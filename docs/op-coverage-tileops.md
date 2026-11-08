@@ -164,3 +164,16 @@ pub fn ewise(b: &mut FnBuilder, dst: &RegTile, srcs: &[&RegTile], f: impl Fn(&mu
 4. **硬件探针**：每个族一个探针 kernel（`probes/`），one-hot 输入对照 CPU 参考，验证 TV 布局 / 字节选择 / 舍入 / 越界语义（先例：[`isa-probes-smfmac-tr.md`](isa-probes-smfmac-tr.md)、MUBUF 越界探针）；结果写进 atom 的 provenance。
 5. **验证器覆盖**：新的地址形式进 `gpu_verify` 的区间模型（越界、对齐），新的原子 / 跨 lane 指令进效果模型；攻击用例进 `verifier_cases`。
 6. **DSL 层**：`Op` / `Stmt` 新变体 → 运行 `tools/gen_ir_codec.py`（IR 文本往返）、`facts.rs` 分类（capture / weave 依赖）。
+
+## 6.6 实施状态
+
+按 sched（batch 2）的顺序实施：A1 → A3 → A2 → A4，然后 B1–B4；GEMM 族（bf16 MFMA、f8f6f4 格式选择、fp4）并行推进。
+
+| 批次 | 内容 | 状态 |
+|---|---|---|
+| **A1 VALU / math** | DSL 通用算子 `Op::Un(UnOp, x)` / `Op::Bin(BinOp, a, b)` / `Op::Tri(TriOp, a, b, c)` / `Op::Cmp { pred, ty, a, b }`（构建器 `un` / `bin` / `tri` / `cmp`）；60 个新 MOp：`floor/ceil/trunc/rndne/fract`、`rsq/sqrt/sin/cos`（`sin/cos` 以"圈"为单位）、`cvt_{i32,u32}_f32` / `cvt_f32_{i32,u32}` / `cvt_f32_ubyte0..3`、`min_f32`、`max/min_{i32,u32}`、`sub_u32`、`mul_u32_u24`、`ashrrev_i32`、`mul_hi_{u32,i32}`、`or_b32`、`min3/med3_f32`、`min3/max3/med3_{i32,u32}`、`mad_u32_u24`、`lshl_add_u32`、`add3_u32`、`bfe_{u32,i32}`、`bfi_b32`、`pk_{add,mul,max,min,fma}_f16`、比较（f32：Lt/Le/Gt/Ge/Eq/Ne(neq)/Lg/Uno/Ord；i32/u32：Lt/Le/Gt/Ge/Eq/Ne）。验证：两张 LLVM 表行（`tail_invariance`、`llvm_tail`）、汇编（`asm_assembles`）、`gpu_verify` 对整数地址算子的区间规则（Add3、LshlAdd、MadU24、Min3、Max、Bfe…）、硬件探针 `probe_valu_p1`（`tools/tileop_probe.sh`：68 个算子 × 64 lane 含 NaN / ±0 / Inf / 边界整数，own 与 llvm-tail 两个后端 **4352 / 4352** 全部与 CPU 参考一致） | **完成** |
+| A3 访存（8/16 位、d16、b96、byte / short / d16_hi 存储；DS 对应形式、read2 / write2） | — | 进行中 |
+| A2 转换（fp8 / bf8 双向、int8 打包） | — | 待做 |
+| A4 跨 lane（DPP 行模式与 DPP 修饰算术、permlane16_swap） | — | 待做 |
+
+探针工具：`tests/gpu/tileop_probe_host.cpp`（通用 `kernel(in, out)` 一块 harness，输出预填 0xA5）、`tools/tileop_probe_check.py`（输入生成与 CPU 参考）、`tools/tileop_probe.sh <probe> [own|llvm-tail]`。
