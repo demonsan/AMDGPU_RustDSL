@@ -2399,6 +2399,90 @@ fn expect_int(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
     }
 }
 
+/// Type / range checks of the P1 memory statements (any-width stores, two-address LDS stores).
+fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
+    let mut e = Vec::new();
+    let data = |e: &mut Vec<String>, value: Opnd, ty: MemTy, hi: bool| {
+        let want = match ty {
+            MemTy::B64 => Some(DType::Frag2),
+            MemTy::B96 | MemTy::B128 => Some(DType::Frag4),
+            _ => None,
+        };
+        match (want, opnd_ty(f, value)) {
+            (Some(w), Ok(t)) if t != w => e.push(format!("{ty:?} store: expected {}, found {}", w.name(), t.name())),
+            (None, Ok(_)) => {
+                if let Err(x) = expect_dword(f, value, "store value") {
+                    e.push(x);
+                }
+            }
+            (_, Err(x)) => e.push(x),
+            _ => {}
+        }
+        if hi && ty.bytes() > 2 {
+            e.push(format!("{ty:?} store: only 8 / 16-bit stores have a d16_hi form"));
+        }
+    };
+    match st {
+        Stmt::StoreGlobalN { base, byte_off, value, ty, hi } => {
+            if !matches!(opnd_ty(f, *base), Ok(DType::Ptr)) {
+                e.push("global store: base must be a pointer".into());
+            }
+            if *byte_off > 4095 {
+                e.push(format!("global store: byte offset {byte_off} exceeds the 13-bit signed immediate (4095)"));
+            }
+            data(&mut e, *value, *ty, *hi);
+        }
+        Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi } => {
+            e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1));
+            data(&mut e, *value, *ty, *hi);
+        }
+        Stmt::StoreLdsN { addr, value, ty, hi } => {
+            if let Err(x) = expect_int(f, *addr, "lds store address") {
+                e.push(x);
+            }
+            data(&mut e, *value, *ty, *hi);
+        }
+        Stmt::StoreLds2 { addr, v0, v1, b64, .. } => {
+            if let Err(x) = expect_int(f, *addr, "lds store address") {
+                e.push(x);
+            }
+            for v in [*v0, *v1] {
+                data(&mut e, v, if *b64 { MemTy::B64 } else { MemTy::B32 }, false);
+            }
+        }
+        _ => {}
+    }
+    e
+}
+
+/// Type / range checks of the P1 memory loads.
+fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
+    let mut e = Vec::new();
+    match op {
+        Op::LoadGlobalN { base, byte_off, .. } | Op::LoadGlobalD16 { base, byte_off, .. } => {
+            if !matches!(opnd_ty(f, *base), Ok(DType::Ptr)) {
+                e.push("global load: base must be a pointer".into());
+            }
+            if *byte_off > 4095 {
+                e.push(format!("global load: byte offset {byte_off} exceeds the 13-bit signed immediate (4095)"));
+            }
+        }
+        Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
+        Op::LoadLdsN { addr, .. } | Op::LoadLdsD16 { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } => {
+            if let Err(x) = expect_int(f, *addr, "lds load address") {
+                e.push(x);
+            }
+        }
+        _ => {}
+    }
+    if let Op::LoadGlobalD16 { merge, .. } | Op::LoadLdsD16 { merge, .. } = op {
+        if let Err(x) = expect_dword(f, *merge, "d16 merge value") {
+            e.push(x);
+        }
+    }
+    e
+}
+
 /// A one-dword scalar value of any type (packed containers).
 fn expect_dword(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
     let t = opnd_ty(f, o)?;
@@ -2509,6 +2593,7 @@ pub fn verify(f: &Function) -> Vec<String> {
                         }
                     }
                 }
+                errs.extend(check_mem_op(f, op).into_iter().map(|e| here(e)));
                 match op {
                     Op::Asm { block, inputs } => {
                         if inputs.len() != block.inputs().len() {
@@ -2930,6 +3015,16 @@ pub fn verify(f: &Function) -> Vec<String> {
                         errs.push(here(format!("var{v} used before its loop")));
                     }
                 }
+            }
+            Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } | Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => {
+                for o in stmt_operands(st) {
+                    if let Opnd::Val(v) = o {
+                        if !visible(&scopes, v) {
+                            errs.push(here(format!("operand v{v} is not visible here")));
+                        }
+                    }
+                }
+                errs.extend(check_mem_stmt(f, st).into_iter().map(here));
             }
             Stmt::StoreLdsB32 { addr, value } => {
                 if let Err(e) = expect_int(f, *addr, "lds store address") {
