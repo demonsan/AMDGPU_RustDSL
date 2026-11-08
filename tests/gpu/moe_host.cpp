@@ -168,6 +168,7 @@ int main(int argc, char** argv) {
     };
     auto run = [&](bool host_q) {
         launch(f1, a1, I / envi("UP_N", 128), nblk);
+        if (envi("S1ONLY", 0)) return;
         if (fp8 && host_q) { HC(hipDeviceSynchronize()); requant(); }
         launch(f2, a2, D / 128, nblk);
         launch(fs, as, D / 1024, M);
