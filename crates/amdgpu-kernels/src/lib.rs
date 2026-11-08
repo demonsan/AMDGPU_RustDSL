@@ -6,6 +6,7 @@
 pub mod fmha;
 pub mod gemm;
 pub mod mlp;
+pub mod eltwise;
 pub mod norm;
 pub mod ir_proof;
 pub mod probes;

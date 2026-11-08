@@ -12,6 +12,8 @@ pub enum Act {
     Relu,
     /// x * sigmoid(x) = x / (1 + 2^(-x log2 e))
     Silu,
+    /// 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))), tanh(u) = 1 - 2 / (1 + 2^(2 u log2 e))
+    GeluTanh,
 }
 
 /// `act(x)` for one f32 value.
@@ -28,6 +30,21 @@ pub fn act(b: &mut FnBuilder, x: ValueId, a: Act) -> ValueId {
             let e = b.mul_f32(x, k);
             let p = b.exp2_f32(e);
             let d = b.add_f32(p, one);
+            let r = b.rcp_f32(d);
+            b.mul_f32(x, r)
+        }
+        Act::GeluTanh => {
+            // y = x * sigmoid(2 u), u = sqrt(2/pi) x (1 + 0.044715 x^2): x / (1 + 2^(-2 u log2 e)) (no cancellation for large negative x)
+            let x2 = b.mul_f32(x, x);
+            let c1 = b.c_f32(0.044715);
+            let one = b.c_f32(1.0);
+            let t = b.mul_f32(x2, c1);
+            let p = b.add_f32(t, one);
+            let k = b.c_f32(-2.0 * 0.797_884_56 * std::f32::consts::LOG2_E);
+            let xp = b.mul_f32(x, p);
+            let e = b.mul_f32(xp, k);
+            let e2 = b.exp2_f32(e);
+            let d = b.add_f32(e2, one);
             let r = b.rcp_f32(d);
             b.mul_f32(x, r)
         }

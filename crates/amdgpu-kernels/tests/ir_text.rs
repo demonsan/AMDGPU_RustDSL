@@ -19,6 +19,11 @@ fn all_kernels() -> Vec<String> {
         "rmsnorm_quant_fp8_n1024",
         "rmsnorm_quant_fp8_n4096",
         "rmsnorm_quant_fp8_n8192",
+        // batch 2: streaming elementwise
+        "silu_mul_bf16_d4096",
+        "silu_mul_bf16_d24",
+        "gelu_tanh_mul_bf16_d4096",
+        "add_bf16",
     ] {
         v.push(k.to_string());
     }

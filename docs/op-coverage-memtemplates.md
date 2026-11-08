@@ -214,7 +214,7 @@
 4. **T7**：`reshape_and_cache`（fp16 / bf16 / fp8 + per-token scale）、RoPE（NeoX / GPT-J，cached / positions，Q + K 融合 + cache 写）、MoE gather / scatter copy、`dequant_gather`。
 5. **T6 + T5 的最小集**：wave 内 `topk_softmax`（experts ≤ 256，k ≤ 8）、MoE 对齐（计数 + 块内扫描 + scatter）；之后 block bitonic top-k / sampling。
 
-每一步在 `docs/op-coverage-design.md` 的算子清单里登记：stage 组合、模板、`BW_target`、实测、证书；基准程序沿用 `tests/gpu/membw_survey.cpp` 的测法（同进程交替、hipEvent、中位数）并补每个算子的主机驱动。
+每一步在 op-coverage-design（kernel-opt） 的算子清单里登记：stage 组合、模板、`BW_target`、实测、证书；基准程序沿用 `tests/gpu/membw_survey.cpp` 的测法（同进程交替、hipEvent、中位数）并补每个算子的主机驱动。
 
 ## 5.13 基准与复现
 
