@@ -157,32 +157,31 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     for r in 0..rpw {
         let (xs, rs) = (&xs_all[r], rs_all.as_ref().map(|a| &a[r]));
         let (gen0, gen1) = (2 * r as i32, 2 * r as i32 + 1);
-        // the values per lane (f32), 8 per chunk
-        let mut xf: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
-        let mut rout_words: Vec<ValueId> = Vec::new();
+        // the row stays PACKED (bf16, 4 dwords per chunk) between the passes and is unpacked where it is used: fewer live VGPRs (occupancy) for a few extra shifts
+        let mut packed: Vec<ValueId> = Vec::with_capacity(nld);
         for i in 0..nld {
-            let a = bf16x8_to_f32(b, xs[i]);
             let v = if let Some(rv) = rs {
+                let a = bf16x8_to_f32(b, xs[i]);
                 let c = bf16x8_to_f32(b, rv[i]);
-                let mut s = [0; 8];
+                let mut sm = [0; 8];
                 for k in 0..8 {
-                    s[k] = b.add_f32(a[k], c[k]);
+                    sm[k] = b.add_f32(a[k], c[k]);
                 }
                 // res_out = bf16(x + res); the normalised value is that rounded sum
-                let f4 = pack(b, &s);
-                rout_words.push(f4);
-                bf16x8_to_f32(b, f4)
+                pack(b, &sm)
             } else {
-                a
+                xs[i]
             };
-            xf.push(v);
+            packed.push(v);
         }
+        let rout_words: Vec<ValueId> = if rs.is_some() { packed.clone() } else { Vec::new() };
         let mut out: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
         match op {
             RowOp::RmsNorm | RowOp::AddRmsNorm => {
                 let mut part: Option<ValueId> = None;
                 for i in 0..nld {
-                    let v = masked(b, &xf[i], i, zero);
+                    let xi = bf16x8_to_f32(b, packed[i]);
+                    let v = masked(b, &xi, i, zero);
                     let sq: Vec<ValueId> = v.iter().map(|&x| b.mul_f32(x, x)).collect();
                     let s = lane_reduce(b, RedOp::Sum, &sq);
                     part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
@@ -192,10 +191,11 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 let me_eps = b.add_f32(mean, eps.unwrap());
                 let inv = rsqrt_f32(b, me_eps);
                 for i in 0..nld {
+                    let xi = bf16x8_to_f32(b, packed[i]);
                     let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
                     let mut y = [0; 8];
                     for k in 0..8 {
-                        let t = b.mul_f32(xf[i][k], inv);
+                        let t = b.mul_f32(xi[k], inv);
                         y[k] = b.mul_f32(t, g[k]);
                     }
                     out.push(y);
@@ -204,7 +204,8 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
             RowOp::LayerNorm => {
                 let mut part: Option<ValueId> = None;
                 for i in 0..nld {
-                    let v = masked(b, &xf[i], i, zero);
+                    let xi = bf16x8_to_f32(b, packed[i]);
+                    let v = masked(b, &xi, i, zero);
                     let s = lane_reduce(b, RedOp::Sum, &v);
                     part = Some(match part { None => s, Some(p) => b.add_f32(p, s) });
                 }
@@ -212,9 +213,10 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 let mean = b.mul_f32(tot, inv_n);
                 let mut part2: Option<ValueId> = None;
                 for i in 0..nld {
+                    let xi = bf16x8_to_f32(b, packed[i]);
                     let mut dv = [0; 8];
                     for k in 0..8 {
-                        dv[k] = b.sub_f32(xf[i][k], mean);
+                        dv[k] = b.sub_f32(xi[k], mean);
                     }
                     let dv = masked(b, &dv, i, zero);
                     let sq: Vec<ValueId> = dv.iter().map(|&x| b.mul_f32(x, x)).collect();
@@ -226,12 +228,13 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 let ve = b.add_f32(var, eps.unwrap());
                 let inv = rsqrt_f32(b, ve);
                 for i in 0..nld {
+                    let xi = bf16x8_to_f32(b, packed[i]);
                     let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
                     let be = bf16x8_to_f32(b, bs.as_ref().unwrap()[i]);
                     let mut y = [0; 8];
                     for k in 0..8 {
                         // (x - mean) is recomputed here: the deviations are not kept across the second reduction (register pressure)
-                        let d = b.sub_f32(xf[i][k], mean);
+                        let d = b.sub_f32(xi[k], mean);
                         let t = b.mul_f32(d, inv);
                         let u = b.mul_f32(t, g[k]);
                         y[k] = b.add_f32(u, be[k]);
@@ -243,7 +246,8 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 let neg = b.c_f32(-3.0e38);
                 let mut part: Option<ValueId> = None;
                 for i in 0..nld {
-                    let v = masked(b, &xf[i], i, neg);
+                    let xi = bf16x8_to_f32(b, packed[i]);
+                    let v = masked(b, &xi, i, neg);
                     let s = lane_reduce(b, RedOp::Max, &v);
                     part = Some(match part { None => s, Some(p) => b.max_f32(p, s) });
                 }
@@ -252,9 +256,10 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 let mut ex: Vec<[ValueId; 8]> = Vec::with_capacity(nld);
                 let mut part2: Option<ValueId> = None;
                 for i in 0..nld {
+                    let xi = bf16x8_to_f32(b, packed[i]);
                     let mut e = [0; 8];
                     for k in 0..8 {
-                        let t = b.sub_f32(xf[i][k], mx);
+                        let t = b.sub_f32(xi[k], mx);
                         let u = b.mul_f32(t, l2e);
                         e[k] = b.exp2_f32(u);
                     }

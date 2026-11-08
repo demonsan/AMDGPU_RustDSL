@@ -7,6 +7,7 @@ pub mod fmha;
 pub mod gemm;
 pub mod mlp;
 pub mod cache;
+pub mod dequant;
 pub mod eltwise;
 pub mod norm;
 pub mod rope;

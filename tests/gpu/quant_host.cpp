@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
     if (argc < 6) { std::fprintf(stderr, "usage: %s <co> <kernel> <token|group128|silu_token> <M> <N> [iters]\n", argv[0]); return 2; }
     const char* co = argv[1]; const char* kn = argv[2]; std::string mode = argv[3];
     long M = std::atol(argv[4]); long N = std::atol(argv[5]); int iters = argc > 6 ? std::atoi(argv[6]) : 50;
-    const bool silu = mode == "silu_token", grp = mode == "group128";
+    const bool silu = mode == "silu_token", grp = mode == "group128", i8 = mode == "token_int8";
     const long in_cols = silu ? 2 * N : N, ns = grp ? N / 128 : 1;
     std::mt19937 rng(99); std::normal_distribution<float> nd(0.f, 2.f);
     std::vector<uint16_t> hx((size_t)M * in_cols);
@@ -48,11 +48,11 @@ int main(int argc, char** argv) {
         long gsz = grp ? 128 : N;
         for (long g0 = 0; g0 < N; g0 += gsz) {
             float amax = 0; for (long k = g0; k < g0 + gsz; ++k) amax = std::fmax(amax, std::fabs(y[k]));
-            float sref = std::fmax(amax, 1e-12f) / 448.0f, sdev = hs[(size_t)m * ns + g0 / gsz];
+            float sref = std::fmax(amax, 1e-12f) / (i8 ? 127.0f : 448.0f), sdev = hs[(size_t)m * ns + g0 / gsz];
             max_rel_scale = std::fmax(max_rel_scale, std::fabs(sdev - sref) / sref);
             for (long k = g0; k < g0 + gsz; ++k) {
-                float d = fp8_to_f32(hq[(size_t)m * N + k]) * sdev, e = std::fabs(d - y[k]);
-                float tol = std::fabs(y[k]) / 16.0f * 1.02f + sref * std::ldexp(1.0f, -9);
+                float d = (i8 ? (float)(int8_t)hq[(size_t)m * N + k] : fp8_to_f32(hq[(size_t)m * N + k])) * sdev, e = std::fabs(d - y[k]);
+                float tol = i8 ? sref * 0.5f * 1.01f + 1e-6f : std::fabs(y[k]) / 16.0f * 1.02f + sref * std::ldexp(1.0f, -9);
                 if (!(e <= tol)) { if (bad < 5) std::fprintf(stderr, "bad at (%ld,%ld): got %g ref %g\n", m, k, d, y[k]); ++bad; }
                 ++cnt;
             }
