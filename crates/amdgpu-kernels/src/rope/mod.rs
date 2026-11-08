@@ -60,8 +60,12 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Func
     let l = if style == RopeStyle::Neox { d / 16 } else { d / 8 }; // lanes per head row
     let rows_per_wave = 64 / l;
     // waves per block: only as many as the heads need (a block of idle waves would waste occupancy), at most 4
-    let nwaves = ((h + rows_per_wave - 1) / rows_per_wave).min(4);
-    let heads_per_pass = nwaves * rows_per_wave;
+    // a token with few lanes (H * L < 64, a power of two) leaves most of a wave idle: pack `tpw` tokens into every wave (H = 1, D = 64: 16 tokens per wave)
+    let hl = h * l;
+    let packed = hl <= 32 && (hl & (hl - 1)) == 0;
+    let tpw = if packed { 64 / hl } else { 1 };
+    let nwaves = if packed { 4 } else { ((h + rows_per_wave - 1) / rows_per_wave).min(4) };
+    let heads_per_pass = if packed { h } else { nwaves * rows_per_wave };
     let passes = (h + heads_per_pass - 1) / heads_per_pass;
     let mut fb = FnBuilder::new(name, (64 * nwaves) as u32);
     fb.compile_profile(CompileProfile::Default);
@@ -78,7 +82,7 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Func
     b.sym_range("P", 1, 1 << 24);
     b.ka_is(32, tt.clone());
     b.ka_is(36, pp.clone());
-    b.grid_is(0, tt.clone());
+    b.grid_is(0, if packed { tt.clone().ceil_div(4 * tpw) } else { tt.clone() });
     b.arg_tensor("x", tt.clone() * Ext::c(2 * h * d));
     b.arg_tensor("out", tt.clone() * Ext::c(2 * h * d));
     b.arg_tensor("pos", tt * Ext::c(4));
@@ -87,7 +91,11 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Func
     let t_v = b.let_(Op::KernargI32 { offset: 32 });
     let p_v = b.let_(Op::KernargI32 { offset: 36 });
     let tid = b.let_(Op::WorkitemId);
-    let tok = b.let_(Op::WorkgroupIdX);
+    let bx = b.let_(Op::WorkgroupIdX);
+    let wave = b.bind_i32(ev(tid).lshr(6));
+    let lane = b.bind_i32(ev(tid) & 63);
+    // the token of this lane: the block id (uniform), or, packed, `tpw` tokens per wave, 4 waves per block (a vector value: every lane group has its own position / table row)
+    let tok = if packed { b.bind_i32(ev(bx) * (4 * tpw) as i32 + ev(wave) * tpw as i32 + ev(lane).lshr(hl.trailing_zeros() as i32)) } else { bx };
     let r_x = { let v = b.bind_i32(ev(t_v) * (2 * h * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_x, v) };
     let r_o = { let v = b.bind_i32(ev(t_v) * (2 * h * d) as i32); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_o, v) };
     let r_pos = { let v = b.bind_i32(ev(t_v) << 2); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_pos, v) };
@@ -96,10 +104,8 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Func
     let voff_pos = b.bind_i32(ev(tok) << 2);
     let posf = b.buffer_load_f32(r_pos, voff_pos, 0i32, 0);
     let posi = b.bitcast_i32(posf);
-    let pos = b.read_first_lane(posi);
+    let pos = if packed { posi } else { b.read_first_lane(posi) };
     let cs_row = b.bind_i32(ev(pos) * (2 * r) as i32);
-    let wave = b.bind_i32(ev(tid).lshr(6));
-    let lane = b.bind_i32(ev(tid) & 63);
     let lr = b.bind_i32(ev(lane) & (l - 1) as i32);       // lane within the head row (l is a power of two)
     let row_in_wave = b.bind_i32(ev(lane).lshr(l.trailing_zeros() as i32));
     // cos / sin: lane `lr`'s part of the row, shared by every head
@@ -135,8 +141,13 @@ pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle, r: i64) -> Func
     struct Pass { head_ok: ValueId, off: ValueId, offh: Option<ValueId>, lo: ValueId, hi: Option<ValueId> }
     let mut ps: Vec<Pass> = Vec::new();
     for ps_i in 0..passes {
-        let head = b.bind_i32(ev(wave) * rows_per_wave as i32 + ev(row_in_wave) + (ps_i * heads_per_pass) as i32);
-        let head_ok = b.let_(Op::CmpLtI32(Opnd::Val(head), Opnd::I32(h as i32)));
+        let head = if packed {
+            b.bind_i32(ev(row_in_wave) & (h as i32 - 1))
+        } else {
+            b.bind_i32(ev(wave) * rows_per_wave as i32 + ev(row_in_wave) + (ps_i * heads_per_pass) as i32)
+        };
+        // (packed: a lane group whose token is past the last one stores nothing)
+        let head_ok = if packed { b.let_(Op::CmpLtI32(Opnd::Val(tok), Opnd::Val(t_v))) } else { b.let_(Op::CmpLtI32(Opnd::Val(head), Opnd::I32(h as i32))) };
         let row_off = b.bind_i32(ev(tok) * (2 * h * d) as i32 + ev(head) * (2 * d) as i32);
         // the lane's chunk: lanes that rotate take elements 8 lr.. (and, NeoX, the partner R / 2 further); the pass-through lanes of a partial rotation take a pair of adjacent chunks past R (identity cos / sin)
         let off = if let (true, Some(rotc), true) = (partial, rot, style == RopeStyle::Neox) {
