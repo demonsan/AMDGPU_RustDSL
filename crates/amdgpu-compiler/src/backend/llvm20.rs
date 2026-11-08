@@ -199,6 +199,14 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
             }
         }
         "imm" => format!("{}", inst.imm),
+        // two-address DS offsets (imm = offset0 | offset1 << 8)
+        "off0" => format!("{}", inst.imm & 0xff),
+        "off1" => format!("{}", (inst.imm >> 8) & 0xff),
+        // the first three dwords of a 4-dword tuple (96-bit accesses use V4 registers)
+        "d3" => {
+            let d = dst()?;
+            (0..3).map(|k| dword_name(cx.class(d), cx.phys(d), k)).collect::<Vec<_>>().join("_").replacen("_$", "_", 2)
+        }
         "imm32" => format!("{}", inst.imm as i32),
         "i0" => match inst.srcs.first() {
             Some(Src::Imm(i)) => format!("{}", *i as i32),
@@ -221,6 +229,11 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
         "vmcnt" => format!("{}", waitcnt_imm(Some(inst.imm as u32), None)),
         "lgkmcnt" => format!("{}", waitcnt_imm(None, Some(inst.imm as u32))),
         "t" => cx.target.clone().ok_or("{t} outside a terminator")?,
+        s if s.starts_with('s') && s.ends_with("t3") && s[1..s.len() - 2].chars().all(|c| c.is_ascii_digit()) && s.len() > 3 => {
+            let n: usize = s[1..s.len() - 2].parse().unwrap();
+            let r = src_reg(inst, n)?;
+            (0..3).map(|k| dword_name(cx.class(r), cx.phys(r), k)).collect::<Vec<_>>().join("_").replacen("_$", "_", 2)
+        }
         s if s.starts_with('s') && s[1..].chars().all(|c| c.is_ascii_digit()) && s.len() > 1 => {
             let n: usize = s[1..].parse().unwrap();
             match inst.srcs.get(n) {

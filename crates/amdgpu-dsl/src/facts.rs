@@ -209,6 +209,15 @@ pub fn op_class(op: &Op) -> (ResClass, Effects) {
         Op::ExpF32(..) | Op::RcpF32(..) | Op::Exp2F32(..) | Op::Log2F32(..) => ResClass::Trans,
         Op::Un(o, _) if o.trans() => ResClass::Trans,
         Op::Un(..) | Op::Bin(..) | Op::Tri(..) | Op::Cmp { .. } => ResClass::Valu,
+        Op::Mfma { kind, .. } => ResClass::Mfma { passes: kind.passes() },
+        Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => {
+            e.global_read = true;
+            ResClass::VmemLoad
+        }
+        Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } => {
+            e.lds_read = true;
+            ResClass::LdsRead
+        }
         Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::LoadF32Coherent { .. } | Op::BufferLoad { .. } | Op::BufferLoadB128x2 { .. } => {
             e.global_read = true;
             ResClass::VmemLoad
@@ -263,6 +272,15 @@ fn stmt_class(st: &Stmt) -> (ResClass, Effects, Vec<VarId>, bool) {
         Stmt::FenceRelease { .. } | Stmt::FenceAcquire { .. } => {
             e.fence = true;
             (ResClass::Sync, vec![], false)
+        }
+        Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } => {
+            e.global_write = true;
+            (ResClass::VmemStore, vec![], false)
+        }
+        Stmt::VarMfma { var, kind, zero, .. } => (ResClass::Mfma { passes: kind.passes() }, vec![*var], !*zero),
+        Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => {
+            e.lds_write = true;
+            (ResClass::LdsWrite, vec![], false)
         }
         Stmt::StoreLdsB32 { .. } | Stmt::StoreLdsB128 { .. } | Stmt::StoreLdsB64 { .. } => {
             e.lds_write = true;

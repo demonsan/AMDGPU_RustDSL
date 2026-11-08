@@ -162,6 +162,14 @@ impl FromIr for Op {
             "Bin" => { v.expect_tuple("Bin", 3)?; Ok(Op::Bin(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?)) }
             "Tri" => { v.expect_tuple("Tri", 4)?; Ok(Op::Tri(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?, FromIr::from_ir(v.item(3)?)?)) }
             "Cmp" => { v.expect_struct("Cmp")?; Ok(Op::Cmp { pred: FromIr::from_ir(v.field("pred")?)?, ty: FromIr::from_ir(v.field("ty")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
+            "LoadGlobalN" => { v.expect_struct("LoadGlobalN")?; Ok(Op::LoadGlobalN { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, ty: FromIr::from_ir(v.field("ty")?)? }) }
+            "LoadGlobalD16" => { v.expect_struct("LoadGlobalD16")?; Ok(Op::LoadGlobalD16 { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
+            "BufferLoadN" => { v.expect_struct("BufferLoadN")?; Ok(Op::BufferLoadN { rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, ty: FromIr::from_ir(v.field("ty")?)? }) }
+            "LoadLdsN" => { v.expect_struct("LoadLdsN")?; Ok(Op::LoadLdsN { addr: FromIr::from_ir(v.field("addr")?)?, ty: FromIr::from_ir(v.field("ty")?)? }) }
+            "LoadLdsD16" => { v.expect_struct("LoadLdsD16")?; Ok(Op::LoadLdsD16 { addr: FromIr::from_ir(v.field("addr")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
+            "LoadLds2" => { v.expect_struct("LoadLds2")?; Ok(Op::LoadLds2 { addr: FromIr::from_ir(v.field("addr")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
+            "LoadLdsTrB16" => { v.expect_struct("LoadLdsTrB16")?; Ok(Op::LoadLdsTrB16 { addr: FromIr::from_ir(v.field("addr")?)? }) }
+            "Mfma" => { v.expect_struct("Mfma")?; Ok(Op::Mfma { kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, c: FromIr::from_ir(v.field("c")?)?, scale: FromIr::from_ir(v.field("scale")?)? }) }
             other => Err(v.err(format!("unknown Op variant `{other}`"))),
         }
     }
@@ -255,6 +263,14 @@ impl IrIds for Op {
             Op::Bin(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
             Op::Tri(x0, x1, x2, x3) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); }
             Op::Cmp { pred, ty, a, b } => { IrIds::ids(&mut (*pred), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
+            Op::LoadGlobalN { base, byte_off, ty } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*ty), fv, fr); }
+            Op::LoadGlobalD16 { base, byte_off, ty, hi } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Op::BufferLoadN { rsrc, voff, soff, imm, ty } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*ty), fv, fr); }
+            Op::LoadLdsN { addr, ty } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*ty), fv, fr); }
+            Op::LoadLdsD16 { addr, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Op::LoadLds2 { addr, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
+            Op::LoadLdsTrB16 { addr } => { IrIds::ids(&mut (*addr), fv, fr); }
+            Op::Mfma { kind, a, b, c, scale } => { IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*c), fv, fr); IrIds::ids(&mut (*scale), fv, fr); }
         }
     }
 }
@@ -526,6 +542,11 @@ impl FromIr for Stmt {
         match v.name()? {
             "StageBegin" => { v.expect_struct("StageBegin")?; Ok(Stmt::StageBegin { name: FromIr::from_ir(v.field("name")?)?, contract: FromIr::from_ir(v.field("contract")?)? }) }
             "StageEnd" => { v.expect_unit("StageEnd")?; Ok(Stmt::StageEnd) }
+            "StoreGlobalN" => { v.expect_struct("StoreGlobalN")?; Ok(Stmt::StoreGlobalN { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
+            "BufferStoreN" => { v.expect_struct("BufferStoreN")?; Ok(Stmt::BufferStoreN { rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
+            "StoreLdsN" => { v.expect_struct("StoreLdsN")?; Ok(Stmt::StoreLdsN { addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
+            "StoreLds2" => { v.expect_struct("StoreLds2")?; Ok(Stmt::StoreLds2 { addr: FromIr::from_ir(v.field("addr")?)?, v0: FromIr::from_ir(v.field("v0")?)?, v1: FromIr::from_ir(v.field("v1")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
+            "VarMfma" => { v.expect_struct("VarMfma")?; Ok(Stmt::VarMfma { var: FromIr::from_ir(v.field("var")?)?, kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, scale: FromIr::from_ir(v.field("scale")?)?, zero: FromIr::from_ir(v.field("zero")?)? }) }
             "RegionMark" => { v.expect_struct("RegionMark")?; Ok(Stmt::RegionMark { name: FromIr::from_ir(v.field("name")?)?, begin: FromIr::from_ir(v.field("begin")?)? }) }
             "TileProduce" => { v.expect_struct("TileProduce")?; Ok(Stmt::TileProduce { tile: FromIr::from_ir(v.field("tile")?)?, slot: FromIr::from_ir(v.field("slot")?)?, version: FromIr::from_ir(v.field("version")?)? }) }
             "TileConsume" => { v.expect_struct("TileConsume")?; Ok(Stmt::TileConsume { tile: FromIr::from_ir(v.field("tile")?)?, slot: FromIr::from_ir(v.field("slot")?)?, version: FromIr::from_ir(v.field("version")?)? }) }
@@ -581,6 +602,11 @@ impl IrIds for Stmt {
         match self {
             Stmt::StageBegin { name, contract } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*contract), fv, fr); }
             Stmt::StageEnd => {}
+            Stmt::StoreGlobalN { base, byte_off, value, ty, hi } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Stmt::StoreLdsN { addr, value, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Stmt::StoreLds2 { addr, v0, v1, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*v0), fv, fr); IrIds::ids(&mut (*v1), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
+            Stmt::VarMfma { var, kind, a, b, scale, zero } => { fr(&mut (*var)); IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*scale), fv, fr); IrIds::ids(&mut (*zero), fv, fr); }
             Stmt::RegionMark { name, begin } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*begin), fv, fr); }
             Stmt::TileProduce { tile, slot, version } => { IrIds::ids(&mut (*tile), fv, fr); IrIds::ids(&mut (*slot), fv, fr); IrIds::ids(&mut (*version), fv, fr); }
             Stmt::TileConsume { tile, slot, version } => { IrIds::ids(&mut (*tile), fv, fr); IrIds::ids(&mut (*slot), fv, fr); IrIds::ids(&mut (*version), fv, fr); }
@@ -972,6 +998,150 @@ impl IrIds for CmpTy {
             CmpTy::I32 => {}
             CmpTy::U32 => {}
         }
+    }
+}
+
+impl FromIr for MemTy {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "U8" => { v.expect_unit("U8")?; Ok(MemTy::U8) }
+            "I8" => { v.expect_unit("I8")?; Ok(MemTy::I8) }
+            "U16" => { v.expect_unit("U16")?; Ok(MemTy::U16) }
+            "I16" => { v.expect_unit("I16")?; Ok(MemTy::I16) }
+            "B32" => { v.expect_unit("B32")?; Ok(MemTy::B32) }
+            "B64" => { v.expect_unit("B64")?; Ok(MemTy::B64) }
+            "B96" => { v.expect_unit("B96")?; Ok(MemTy::B96) }
+            "B128" => { v.expect_unit("B128")?; Ok(MemTy::B128) }
+            other => Err(v.err(format!("unknown MemTy variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for MemTy {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            MemTy::U8 => {}
+            MemTy::I8 => {}
+            MemTy::U16 => {}
+            MemTy::I16 => {}
+            MemTy::B32 => {}
+            MemTy::B64 => {}
+            MemTy::B96 => {}
+            MemTy::B128 => {}
+        }
+    }
+}
+
+impl FromIr for D16Ty {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "U8" => { v.expect_unit("U8")?; Ok(D16Ty::U8) }
+            "I8" => { v.expect_unit("I8")?; Ok(D16Ty::I8) }
+            "B16" => { v.expect_unit("B16")?; Ok(D16Ty::B16) }
+            other => Err(v.err(format!("unknown D16Ty variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for D16Ty {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            D16Ty::U8 => {}
+            D16Ty::I8 => {}
+            D16Ty::B16 => {}
+        }
+    }
+}
+
+impl FromIr for MmaShape {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "M16N16K32" => { v.expect_unit("M16N16K32")?; Ok(MmaShape::M16N16K32) }
+            "M32N32K16" => { v.expect_unit("M32N32K16")?; Ok(MmaShape::M32N32K16) }
+            "M16N16K64" => { v.expect_unit("M16N16K64")?; Ok(MmaShape::M16N16K64) }
+            "M32N32K32" => { v.expect_unit("M32N32K32")?; Ok(MmaShape::M32N32K32) }
+            "M16N16K128" => { v.expect_unit("M16N16K128")?; Ok(MmaShape::M16N16K128) }
+            "M32N32K64" => { v.expect_unit("M32N32K64")?; Ok(MmaShape::M32N32K64) }
+            other => Err(v.err(format!("unknown MmaShape variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for MmaShape {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            MmaShape::M16N16K32 => {}
+            MmaShape::M32N32K16 => {}
+            MmaShape::M16N16K64 => {}
+            MmaShape::M32N32K32 => {}
+            MmaShape::M16N16K128 => {}
+            MmaShape::M32N32K64 => {}
+        }
+    }
+}
+
+impl FromIr for MmaTy {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        match v.name()? {
+            "F16" => { v.expect_unit("F16")?; Ok(MmaTy::F16) }
+            "Bf16" => { v.expect_unit("Bf16")?; Ok(MmaTy::Bf16) }
+            "I8" => { v.expect_unit("I8")?; Ok(MmaTy::I8) }
+            "Fp8" => { v.expect_unit("Fp8")?; Ok(MmaTy::Fp8) }
+            "Bf8" => { v.expect_unit("Bf8")?; Ok(MmaTy::Bf8) }
+            "Fp6" => { v.expect_unit("Fp6")?; Ok(MmaTy::Fp6) }
+            "Bf6" => { v.expect_unit("Bf6")?; Ok(MmaTy::Bf6) }
+            "Fp4" => { v.expect_unit("Fp4")?; Ok(MmaTy::Fp4) }
+            other => Err(v.err(format!("unknown MmaTy variant `{other}`"))),
+        }
+    }
+}
+impl IrIds for MmaTy {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        match self {
+            MmaTy::F16 => {}
+            MmaTy::Bf16 => {}
+            MmaTy::I8 => {}
+            MmaTy::Fp8 => {}
+            MmaTy::Bf8 => {}
+            MmaTy::Fp6 => {}
+            MmaTy::Bf6 => {}
+            MmaTy::Fp4 => {}
+        }
+    }
+}
+
+impl FromIr for MmaKind {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("MmaKind")?;
+        Ok(MmaKind {
+            shape: FromIr::from_ir(v.field("shape")?)?,
+            a: FromIr::from_ir(v.field("a")?)?,
+            b: FromIr::from_ir(v.field("b")?)?,
+            scaled: FromIr::from_ir(v.field("scaled")?)?,
+        })
+    }
+}
+impl IrIds for MmaKind {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.shape, fv, fr);
+        IrIds::ids(&mut self.a, fv, fr);
+        IrIds::ids(&mut self.b, fv, fr);
+        IrIds::ids(&mut self.scaled, fv, fr);
+    }
+}
+
+impl FromIr for MmaScale {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("MmaScale")?;
+        Ok(MmaScale {
+            sa: FromIr::from_ir(v.field("sa")?)?,
+            sb: FromIr::from_ir(v.field("sb")?)?,
+            opsel: FromIr::from_ir(v.field("opsel")?)?,
+        })
+    }
+}
+impl IrIds for MmaScale {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.sa, fv, fr);
+        IrIds::ids(&mut self.sb, fv, fr);
+        IrIds::ids(&mut self.opsel, fv, fr);
     }
 }
 
