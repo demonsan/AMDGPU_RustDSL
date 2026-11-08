@@ -212,6 +212,8 @@ struct Lowerer {
     read_values: std::collections::HashSet<ValueId>,
     /// how many operand slots of all statements read each value
     read_counts: HashMap<ValueId, usize>,
+    /// wave-uniform values (amdgpu_dsl::uniform_values)
+    dsl_uniform: std::collections::HashSet<ValueId>,
     /// Labels of else-blocks that were actually started (the others are synthesised at `endif`).
     else_started: HashSet<u32>,
     /// AGPR requests from the IR (resolved to vregs in inish).
@@ -340,6 +342,7 @@ impl Lowerer {
             alias_cache: HashMap::new(),
             view_copy: amdgpu_dsl::facts::stale_view_roots(f),
             read_values: f.stmts().iter().flat_map(amdgpu_dsl::facts::stmt_value_uses).collect(),
+            dsl_uniform: amdgpu_dsl::uniform_values(f).0,
             read_counts: {
                 let mut c: HashMap<ValueId, usize> = HashMap::new();
                 for s in f.stmts() {
@@ -2437,7 +2440,23 @@ impl Lowerer {
                     Opnd::Val(v) => self.val.get(v).copied().filter(|r| self.mir.vreg_class(*r) == RClass::S2),
                     _ => None,
                 };
-                let (sa, sbb) = (self.s_operand(*a).ok(), self.s_operand(*b).ok());
+                // a wave-uniform factor that lowering keeps in a VGPR (e.g. a min of uniform values) is read back with v_readfirstlane
+                let mut sop = |me: &mut Self, o: Opnd| -> Option<Src> {
+                    if let Ok(s) = me.s_operand(o) {
+                        return Some(s);
+                    }
+                    match o {
+                        Opnd::Val(v) if sb.is_some() && me.dsl_uniform.contains(&v) => {
+                            let r = me.as_v1(o).ok()?;
+                            me.touch(&[Src::Reg(r)]);
+                            let s = me.new_vreg(RClass::S1);
+                            me.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(r));
+                            Some(Src::Reg(s))
+                        }
+                        _ => None,
+                    }
+                };
+                let (sa, sbb) = (sop(self, *a), sop(self, *b));
                 if let (Some(br), Some(sa), Some(sbb)) = (sb, sa, sbb) {
                     let s1 = |me: &mut Self, s: Src| -> VReg {
                         match s {
