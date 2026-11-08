@@ -318,7 +318,8 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     // over the Gemm profile
     // (causal, also the causal key-split form: the Gemm profile measured faster (955 vs 915 TF/s at 8192², 350 vs 328 _ks S=2 at 4096²);
     // the non-causal _ks form gains on Vs128: 660 vs 618 TF/s at 4096² S=1 - its earlier HW fault was the in-flight WAW backend bug, fixed)
-    let vs_policy = !causal;
+    // (hd192 causal: the Gemm profile runs out of VGPRs - Vs128 for every hd192 form)
+    let vs_policy = !causal || dqk == 192;
     b.compile_profile(if vs_policy { CompileProfile::Vs128 } else { CompileProfile::Gemm });
     // ---- ABI (the vendor's v3, as bf16.rs) ----
     for (n, i) in [("ptr_o", 0u32), ("ptr_q", 1), ("ptr_k", 2), ("ptr_v", 3), ("ptr_lse", 4)] {
