@@ -27,6 +27,6 @@ fn the_name_grammar_rejects_what_the_kernels_do_not_support() {
 fn the_block_shape_follows_d() {
     // threads = min(4, ceil(D / 8 / 64)) * 64: a short row gets a single wave, a long row 256 threads and several column tiles
     for (k, threads) in [("silu_mul_bf16_d24", 64), ("silu_mul_bf16_d1024", 128), ("silu_mul_bf16_d4096", 256), ("silu_mul_bf16_d14336", 256)] {
-        assert_eq!(kernel_by_name(k).unwrap().threads, threads, "{k}");
+        assert_eq!(kernel_by_name(k).unwrap().workgroup_size, threads, "{k}");
     }
 }
