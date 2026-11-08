@@ -302,7 +302,11 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                         let w: Vec<ValueId> = (0..4i32)
                             .map(|byte| {
                                 let x = if byte == 0 { dwi } else { b.bind_i32(ev(dwi).lshr(8 * byte)) };
-                                b.cvt(amdgpu_dsl::CvtOp::ScalePkBf16Fp4, &[Opnd::Val(x), Opnd::Val(sf)], 0)
+                                // (fp4 pair -> two f32 -> bf16 pair: exact for these values)
+                                let f2 = b.cvt(amdgpu_dsl::CvtOp::ScalePkF32Fp4, &[Opnd::Val(x), Opnd::Val(sf)], 0);
+                                let (lo, hi) = (b.frag2_lane(f2, 0), b.frag2_lane(f2, 1));
+                                let (lo, hi) = (b.bitcast_f32(lo), b.bitcast_f32(hi));
+                                b.cvt_pk_bf16_f32(lo, hi)
                             })
                             .collect();
                         (bf, b.pack4(w[0], w[1], w[2], w[3]))
