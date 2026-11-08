@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     const long S = NB * BS; const size_t row = (size_t)Hk * D * 2;
     std::mt19937 rng(77); std::vector<uint16_t> hk(T * Hk * D), hv(T * Hk * D); for (auto& v : hk) v = rng() & 0xffff; for (auto& v : hv) v = rng() & 0xffff;
     std::vector<int32_t> perm(S); std::iota(perm.begin(), perm.end(), 0); std::shuffle(perm.begin(), perm.end(), rng);
-    std::vector<int32_t> slots(T); for (long t = 0; t < T; ++t) slots[t] = (t % 7 == 3) ? -1 : perm[t];
+    std::vector<int32_t> slots(T); for (long t = 0; t < T; ++t) slots[t] = (t % 7 == 3) ? -1 : (std::getenv("CONTIG") ? (int32_t)(t % S) : perm[t]);   // CONTIG=1: consecutive tokens get consecutive slots (prefill)
     void *dk, *dv, *dkc, *dvc, *dsl; CK(hipMalloc(&dk, T * row)); CK(hipMalloc(&dv, T * row)); CK(hipMalloc(&dkc, S * row + 64)); CK(hipMalloc(&dvc, S * row + 64)); CK(hipMalloc(&dsl, T * 4));
     CK(hipMemcpy(dk, hk.data(), T * row, hipMemcpyHostToDevice)); CK(hipMemcpy(dv, hv.data(), T * row, hipMemcpyHostToDevice)); CK(hipMemcpy(dsl, slots.data(), T * 4, hipMemcpyHostToDevice));
     CK(hipMemset(dkc, 0xAB, S * row + 64)); CK(hipMemset(dvc, 0xCD, S * row + 64));
