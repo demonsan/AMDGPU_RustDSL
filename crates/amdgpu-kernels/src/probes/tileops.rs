@@ -360,7 +360,7 @@ pub fn probe_mfma_p1() -> Function {
 pub fn f8f6f4_p1_kinds() -> Vec<amdgpu_dsl::MmaKind> {
     use amdgpu_dsl::{MmaKind, MmaShape as S, MmaTy as T};
     let mut v = Vec::new();
-    for (a, b) in [(T::Fp4, T::Fp4), (T::Fp8, T::Fp4), (T::Fp4, T::Fp8), (T::Fp8, T::Fp8), (T::Bf8, T::Bf8), (T::Fp6, T::Fp6), (T::Bf6, T::Bf6), (T::Bf8, T::Fp6)] {
+    for (a, b) in [(T::Fp4, T::Fp4), (T::Fp8, T::Fp4), (T::Fp4, T::Fp8), (T::Fp8, T::Fp8), (T::Bf8, T::Bf8), (T::Fp6, T::Fp6), (T::Bf6, T::Bf6), (T::Bf8, T::Fp6), (T::Bf6, T::Fp8), (T::Fp4, T::Bf8)] {
         v.push(MmaKind::scaled_f8f6f4(S::M16N16K128, a, b));
     }
     for (a, b) in [(T::Fp4, T::Fp4), (T::Fp8, T::Fp4), (T::Fp6, T::Bf8)] {

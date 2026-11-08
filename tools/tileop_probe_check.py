@@ -412,7 +412,7 @@ def check_mfma_p1(planes, out):
 # ---------------------------------------------------------------- probe_f8f6f4_p1
 # formats: (bits, exponent bits, mantissa bits, bias); 32 elements per lane packed contiguously (element v at bit v * bits).
 FMT = {"fp8": (8, 4, 3, 7), "bf8": (8, 5, 2, 15), "fp6": (6, 2, 3, 1), "bf6": (6, 3, 2, 3), "fp4": (4, 2, 1, 1)}
-F8F6F4_KINDS = [(16, a, b) for a, b in [("fp4", "fp4"), ("fp8", "fp4"), ("fp4", "fp8"), ("fp8", "fp8"), ("bf8", "bf8"), ("fp6", "fp6"), ("bf6", "bf6"), ("bf8", "fp6")]] + \
+F8F6F4_KINDS = [(16, a, b) for a, b in [("fp4", "fp4"), ("fp8", "fp4"), ("fp4", "fp8"), ("fp8", "fp8"), ("bf8", "bf8"), ("fp6", "fp6"), ("bf6", "bf6"), ("bf8", "fp6"), ("bf6", "fp8"), ("fp4", "bf8")]] + \
                [(32, a, b) for a, b in [("fp4", "fp4"), ("fp8", "fp4"), ("fp6", "bf8")]]
 VALS = [0.0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 6.0, -6.0]
 
