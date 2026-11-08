@@ -294,7 +294,7 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     b.ka_is(400, rowb.clone());
     b.ka_is(416, sq.clone() * hh.clone() * rowb.clone());
     b.ka_is(464, sq.clone() * Ext::c(4));
-    b.grid_is(0, sq.clone().ceil_div(QR as i64));
+    b.grid_is(0, if causal { sq.clone().ceil_div(QR as i64).ceil_div(2) } else { sq.clone().ceil_div(QR as i64) });
     b.grid_is(1, hh.clone());
     b.arg_tensor("ptr_q", bb.clone() * sq.clone() * hh.clone() * rowb.clone());
     b.arg_tensor("ptr_o", bb.clone() * sq.clone() * hh.clone() * rowb.clone());
@@ -337,8 +337,6 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     let hkv = gqa_kv_head(&mut b, h, gqa, "HK");
     let hkv = b.read_first_lane(hkv);
     let half = b.bind_i32(lane.half());
-    let row = b.bind_i32((ev(qt) << 8) + (lane.wave() << 5) + lane.j());
-    let row_c = b.bind_i32(ev(row).min(ev(s_q) - 1));
     let desc = |b: &mut FnBuilder, p: ValueId, bs: ValueId| {
         let n = b.bind_i32((ev(bat) + 1) * ev(bs));
         let n = b.read_first_lane(n);
@@ -346,8 +344,6 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
     };
     let (r_q, r_k, r_v, r_o) = (desc(&mut b, p_q, q_bs), desc(&mut b, p_k, k_bs), desc(&mut b, p_v, v_bs), desc(&mut b, p_o, o_bs));
     let q_so = { let v = b.bind_i32(ev(bat) * ev(q_bs) + ev(h) * ev(q_hs)); b.read_first_lane(v) };
-    let q_vo = b.bind_i32(ev(row_c) * ev(q_seqs) + (ev(half) << 4));
-    let qf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_q, q_vo, q_so, (32 * c) as u32)).collect();
 
     // ---- LDS: the K / V rings (2 slots x 32 KB each) ----
     let mut lds = LdsPlan::new();
@@ -377,8 +373,34 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
         })
         .collect();
 
-    // ---- key range: causal keys k <= q + SK - SQ ----
+    let c_l2e = b.c_f32(std::f32::consts::LOG2_E);
+    let csc = b.mul_f32(scale, c_l2e);
+    let neg_inf = b.c_f32(f32::NEG_INFINITY);
+    let zero16 = b.frag_zero(DType::Frag16);
+    let kind = MmaKind::new(MmaShape::M32N32K16, MmaTy::Bf16);
+    let big = b.c_i32(0x7fff_fff0);
     let qoff = b.bind_i32(ev(s_kv) - ev(s_q));
+    // causal: the vendor's pairing - CTA x takes q tiles x and nt - 1 - x (equal work per CTA; the grid is halved)
+    let nt = { let v = b.bind_i32((ev(s_q) + (QR - 1)).lshr(8)); b.read_first_lane(v) };
+    let passes: Vec<(ValueId, Option<ValueId>)> = if causal {
+        let qb = { let v = b.bind_i32(ev(nt) - 1 - ev(qt)); b.read_first_lane(v) };
+        let second = b.bind_cond(ev(qb).gt(ev(qt)));
+        vec![(qt, None), (qb, Some(second))]
+    } else {
+        vec![(qt, None)]
+    };
+    for (qt, guard) in passes {
+    if let Some(g) = guard {
+        // the LDS rings are reused by the second pass: every wave is done with the first
+        b.wait_lds(0);
+        b.barrier();
+        b.begin_if(Opnd::Val(g));
+    }
+    let row = b.bind_i32((ev(qt) << 8) + (lane.wave() << 5) + lane.j());
+    let row_c = b.bind_i32(ev(row).min(ev(s_q) - 1));
+    let q_vo = b.bind_i32(ev(row_c) * ev(q_seqs) + (ev(half) << 4));
+    let qf: Vec<ValueId> = (0..8).map(|c| b.buffer_load_b128(r_q, q_vo, q_so, (32 * c) as u32)).collect();
+    // ---- key range: causal keys k <= q + SK - SQ ----
     let kv_end = if causal {
         let v = b.bind_i32((((ev(qt) + 1) << 8) - 1 + ev(qoff) + 1).min(ev(s_kv)).max(0));
         b.read_first_lane(v)
@@ -391,15 +413,9 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
         let v = b.bind_i32(if causal { ((ev(qt) << 8) + ev(qoff)).min(ev(s_kv) - 1) } else { ev(s_kv) - 1 });
         b.read_first_lane(v)
     };
-    let c_l2e = b.c_f32(std::f32::consts::LOG2_E);
-    let csc = b.mul_f32(scale, c_l2e);
-    let neg_inf = b.c_f32(f32::NEG_INFINITY);
-    let zero16 = b.frag_zero(DType::Frag16);
-    let kind = MmaKind::new(MmaShape::M32N32K16, MmaTy::Bf16);
     let mut pipe = Pipeline::new(Cadence::TwoPhaseOffset, nkv, kv_end, KT, Ext::ka(272).ceil_div(KT as i64));
     pipe.key_unclamped = true;
 
-    let big = b.c_i32(0x7fff_fff0);
     let any = b.bind_cond(ev(nkv).gt(0));
     b.begin_if(Opnd::Val(any));
     roles.each(&mut b, |b, role| {
@@ -452,6 +468,10 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
         b.end_if();
     });
     b.end_if();
+    if guard.is_some() {
+        b.end_if();
+    }
+    }
     let mut f = b.finish();
     if let Ok(o) = std::env::var("EXP_SCHED") {
         f.sched_opts = Some(o);
