@@ -80,7 +80,9 @@ int main(int argc, char** argv) {
     if (group) { P(27, dcuq); P(28, dcuk); P(30, dcuq); P(31, dcuk); }
     if (WL >= 0) { U(41, WL); U(42, WR); }
     int tiles = ((group ? TQ : SQ) + rows - 1) / rows;
-    int gt = ours ? tiles : (tiles + (causal ? 1 : 0)) / (causal ? 2 : 1);
+    // PAIR=1 (ours v3 causal): the vendor's pairing grid
+    const bool pair = !ours || envi("PAIR", 0);
+    int gt = pair ? (tiles + (causal ? 1 : 0)) / (causal ? 2 : 1) : tiles;
     int gx = group ? H : gt, gy = group ? B : H, gz = group ? gt : B;
     size_t asz = a.size();
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, a.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};

@@ -897,3 +897,39 @@ pub fn probe_atomic2_p1() -> Function {
     b.store_global(pout, 256, ret, MemTy::B32, false);
     b.finish()
 }
+
+/// `probe_tr_b16_mfma2`: `probe_tr_b16_mfma` with the A operand from `load_lds_tr_b16x2` (both reads write their half of the Frag4 in place) and
+/// the B operand from four single-dword loads packed with `pack4` (each load writes its dword in place): no operand copies.
+pub fn probe_tr_b16_mfma2() -> Function {
+    use amdgpu_dsl::{MemTy, MmaKind, MmaShape, MmaTy};
+    let mut b = FnBuilder::new("probe_tr_b16_mfma2", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(2048));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(1024));
+    b.lds(1024);
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(16)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off16) });
+    let t = b.load_global(pin, 0, MemTy::B128);
+    b.store_lds_b128(off16, t);
+    let w: Vec<ValueId> = (0..4u32).map(|i| b.load_global(pin, 1024 + 4 * i, MemTy::B32)).collect();
+    let fb = b.pack4(w[0], w[1], w[2], w[3]);
+    b.wait_lds(0);
+    b.barrier();
+    let s = b.let_(Op::AndI32(Opnd::Val(tid), Opnd::I32(15)));
+    let g = b.let_(Op::LshrI32(Opnd::Val(tid), Opnd::I32(4)));
+    let q = b.let_(Op::LshrI32(Opnd::Val(s), Opnd::I32(2)));
+    let c = b.let_(Op::AndI32(Opnd::Val(s), Opnd::I32(3)));
+    let row = b.tri(amdgpu_dsl::TriOp::LshlAddU32, g, 3, q);
+    let rb = b.let_(Op::MulI32(Opnd::Val(row), Opnd::I32(32)));
+    let addr = b.tri(amdgpu_dsl::TriOp::LshlAddU32, c, 3, rb);
+    let a1 = b.add_i32(addr, 128);
+    let fa = b.load_lds_tr_b16x2(addr, a1);
+    let d = b.mfma(MmaKind::new(MmaShape::M16N16K32, MmaTy::Bf16), fa, fb, None);
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off16) });
+    b.store_global(pout, 0, d, MemTy::B128, false);
+    b.finish()
+}

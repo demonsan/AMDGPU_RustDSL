@@ -2,7 +2,7 @@
 
 /// All kernel definitions currently shipped with the DSL.
 pub fn kernel_names() -> &'static [&'static str] {
-    &["probe_agpr_ref", "probe_agpr_acc", "probe_agpr_full", "probe_agpr_pinned", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_scale", "probe_lds_self2", "probe_roles_loop", "probe_lds_tr_b8", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg", "probe_valu_p1", "probe_mem_p1", "probe_mfma_p1", "probe_f8f6f4_p1", "probe_cpol_p1", "probe_cvt_p1", "probe_tr_b16_p1", "probe_tr_b16_mfma", "probe_atomic_p1", "probe_lane_p1", "probe_f8f6f4_plain", "probe_atomic2_p1"]
+    &["probe_agpr_ref", "probe_agpr_acc", "probe_agpr_full", "probe_agpr_pinned", "probe_store", "probe_math", "probe_mfma", "probe_lds", "gv_audit_region_trust", "probe_mfma_scale", "probe_lds_self2", "probe_roles_loop", "probe_lds_tr_b8", "probe_log_store4", "probe_llvm_kernarg", "probe_llvm_ids", "probe_llvm_roles", "probe_llvm_lds", "probe_llvm_branch", "probe_llvm_loop", "probe_llvm_atomic", "probe_llvm_maskge", "probe_llvm_k1", "probe_llvm_k2", "probe_buffer_rw", "probe_mfma_cform", "probe_store_x2", "probe_last_arriver", "probe_last_arriver_lite", "probe_last_arriver_nofence", "probe_last_arriver_plain", "probe_last_arriver_plain_fenced", "probe_la8", "probe_la8_lite", "probe_la8_plain_fenced", "probe_la8_plain", "probe_la8_nodrain", "probe_la_verify", "probe_mfma_unscaled", "probe_expr_ids", "probe_expr_kernarg", "probe_valu_p1", "probe_mem_p1", "probe_mfma_p1", "probe_f8f6f4_p1", "probe_cpol_p1", "probe_cvt_p1", "probe_tr_b16_p1", "probe_tr_b16_mfma", "probe_atomic_p1", "probe_lane_p1", "probe_f8f6f4_plain", "probe_atomic2_p1", "probe_tr_b16_mfma2"]
 }
 
 pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
@@ -19,6 +19,7 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "probe_tr_b16_mfma" => Some(crate::probes::tileops::probe_tr_b16_mfma()),
         "probe_atomic_p1" => Some(crate::probes::tileops::probe_atomic_p1()),
         "probe_lane_p1" => Some(crate::probes::tileops::probe_lane_p1()),
+        "probe_tr_b16_mfma2" => Some(crate::probes::tileops::probe_tr_b16_mfma2()),
         "probe_atomic2_p1" => Some(crate::probes::tileops::probe_atomic2_p1()),
         "probe_f8f6f4_plain" => Some(crate::probes::tileops::probe_f8f6f4_plain()),
         "probe_tileop_p1" => Some(crate::probes::tileops::probe_tileop_p1()),
@@ -76,10 +77,13 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         "fmha_bwd_dq_hd128_bf16_causal" => Some(crate::fmha::bwd::fmha_bwd_dq("fmha_bwd_dq_hd128_bf16_causal", true)),
         "fmha_bwd_dkdv_hd128_bf16" => Some(crate::fmha::bwd::fmha_bwd_dkdv("fmha_bwd_dkdv_hd128_bf16", false)),
         "fmha_bwd_dkdv_hd128_bf16_causal" => Some(crate::fmha::bwd::fmha_bwd_dkdv("fmha_bwd_dkdv_hd128_bf16_causal", true)),
+        "fmha_fwd_hd128_bf16_v3" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3("fmha_fwd_hd128_bf16_v3", false)),
+        "fmha_fwd_hd128_bf16_v3_causal" => Some(crate::fmha::bf16v3::fmha_fwd_hd128_bf16_v3("fmha_fwd_hd128_bf16_v3_causal", true)),
         "attn_combine_bf16_hd128" => Some(crate::fmha::decode::attn_combine_bf16_hd128("attn_combine_bf16_hd128")),
         "attn_combine_bf16_hd512" => Some(crate::fmha::decode::attn_combine_bf16("attn_combine_bf16_hd512", 512)),
         "attn_combine_bf16_hd512_sm" => Some(crate::fmha::decode::attn_combine_bf16_x("attn_combine_bf16_hd512_sm", 512, true)),
         n if n.starts_with("mla_decode_bf16_p") => n["mla_decode_bf16_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::mla::mla_decode_bf16(n, p)),
+        n if n.starts_with("pa_decode16_bf16_hd128_p") => n["pa_decode16_bf16_hd128_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::decode16::pa_decode16_bf16_hd128(n, p)),
         n if n.starts_with("pa_decode_bf16_hd128_p") => n["pa_decode_bf16_hd128_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::decode::pa_decode_bf16_hd128(n, p)),
         n if n.starts_with("fmha_fwd_hd") && n.contains("_bf16") => {
             // fmha_fwd_hd<64|128|256>_bf16[_causal][_swa][_group]

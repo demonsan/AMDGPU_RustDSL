@@ -2102,6 +2102,23 @@ impl FnBuilder {
         assert!(matches!(n, 1 | 2 | 4 | 8), "frag_slice: n is 1, 2, 4 or 8");
         self.let_(Op::FragSlice { frag: frag.into(), start, n })
     }
+    /// `lo ++ hi` as one Frag4 (e.g. two `ds_read_b64_tr_b16` results = a bf16 MFMA operand). Fresh single-use parts are written IN PLACE (the
+    /// defining instruction targets its half of the result: no copies, no early wait).
+    pub fn cat_frag4(&mut self, lo: impl Into<Opnd>, hi: impl Into<Opnd>) -> ValueId {
+        let (lo, hi) = (lo.into(), hi.into());
+        self.frag_cat(&[lo, hi])
+    }
+    /// Two `ds_read_b64_tr_b16` (at `addr0`, `addr1`) as one Frag4, each read writing its half directly.
+    pub fn load_lds_tr_b16x2(&mut self, addr0: impl Into<Opnd>, addr1: impl Into<Opnd>) -> ValueId {
+        let r0 = self.load_lds_tr_b16(addr0);
+        let r1 = self.load_lds_tr_b16(addr1);
+        self.cat_frag4(r0, r1)
+    }
+    /// Four dwords as a Frag4 with fresh single-use parts written in place (`frag4` copies; this does not).
+    pub fn pack4(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>) -> ValueId {
+        let p = [a.into(), b.into(), c.into(), d.into()];
+        self.frag_cat(&p)
+    }
     /// Concatenate one-dword values / fragments into a fragment (total 2, 4, 8 or 16 dwords).
     pub fn frag_cat(&mut self, parts: &[Opnd]) -> ValueId {
         let total: u32 = parts.iter().map(|p| self.opnd_dwords(*p)).sum();

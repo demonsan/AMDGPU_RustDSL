@@ -90,6 +90,12 @@ pub fn gemm_splitk_reduce(name: &str, splits: i64, rowcol: bool) -> Function {
 /// MoE stage-2 sum over the routes: out[t][n] (bf16) = sum_k W[t][k][n] (fp32 [M, topk, N]). Grid (N / 1024, M), 256 threads x 4 columns.
 /// ABI: 0 ptr_ws, 8 ptr_out, 16 M, 20 N.
 pub fn moe_sum_bf16(name: &str, topk: i64) -> Function {
+    moe_sum_bf16_x(name, topk, false)
+}
+
+/// `moe_sum_bf16` with `half_in`: the per-route intermediate in bf16 (summed in fp32).
+pub fn moe_sum_bf16_x(name: &str, topk: i64, half_in: bool) -> Function {
+    let es: i32 = if half_in { 2 } else { 4 };
     let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
     b.arg("ptr_ws", DType::Ptr, 0, 8);
@@ -104,7 +110,7 @@ pub fn moe_sum_bf16(name: &str, topk: i64) -> Function {
     b.ka_is(20, n_ext.clone());
     b.grid_is(0, nb);
     b.grid_is(1, mm.clone());
-    b.arg_tensor("ptr_ws", Ext::c(4 * topk) * mm.clone() * n_ext.clone());
+    b.arg_tensor("ptr_ws", Ext::c(es as i64 * topk) * mm.clone() * n_ext.clone());
     b.arg_tensor("ptr_out", Ext::c(2) * mm * n_ext);
     let (p_ws, p_o) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 8 }));
     let m_v = b.let_(Op::KernargI32 { offset: 16 });
@@ -113,23 +119,31 @@ pub fn moe_sum_bf16(name: &str, topk: i64) -> Function {
     let bx = b.let_(Op::WorkgroupIdX);
     let row = b.let_(Op::WorkgroupIdY);
     let mn = { let v = b.bind_i32(ev(m_v) * ev(n_v)); b.read_first_lane(v) };
-    let r_ws = { let v = b.bind_i32(ev(mn) * (4 * topk as i32)); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_ws, v) };
+    let r_ws = { let v = b.bind_i32(ev(mn) * (es * topk as i32)); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_ws, v) };
     let r_o = { let v = b.bind_i32(ev(mn) << 1); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_o, v) };
     let col = b.bind_i32((ev(bx) << 10) + (ev(tid) << 2));
-    let base = b.bind_i32((ev(row) * (topk as i32) * ev(n_v) + ev(col)) << 2);
-    let n4 = { let v = b.bind_i32(ev(n_v) << 2); b.read_first_lane(v) };
+    let base = b.bind_i32((ev(row) * (topk as i32) * ev(n_v) + ev(col)) * es);
+    let n4 = { let v = b.bind_i32(ev(n_v) * es); b.read_first_lane(v) };
     let parts: Vec<ValueId> = (0..topk)
         .map(|s| {
             let so = if s == 0 { Opnd::I32(0) } else { Opnd::Val({ let v = b.bind_i32(ev(n4) * (s as i32)); b.read_first_lane(v) }) };
-            b.buffer_load_b128(r_ws, base, so, 0)
+            if half_in { b.buffer_load_b64(r_ws, base, so, 0) } else { b.buffer_load_b128(r_ws, base, so, 0) }
         })
         .collect();
     let y: Vec<ValueId> = (0..4u8)
         .map(|r| {
             let mut acc: Option<ValueId> = None;
             for p in &parts {
-                let l = b.frag4_lane(Opnd::Val(*p), r);
-                let f = b.bitcast_f32(l);
+                let f = if half_in {
+                    // bf16 element r of the 8-byte load: dword r / 2, half r % 2 -> f32
+                    let w = b.frag2_lane(Opnd::Val(*p), r / 2);
+                    let w = b.bitcast_i32(w);
+                    let u = if r % 2 == 0 { b.bind_i32(ev(w) << 16) } else { b.bind_i32(ev(w) & (0xffff_0000u32 as i32)) };
+                    b.bitcast_f32(u)
+                } else {
+                    let l = b.frag4_lane(Opnd::Val(*p), r);
+                    b.bitcast_f32(l)
+                };
                 acc = Some(match acc { None => f, Some(a) => b.add_f32(a, f) });
             }
             acc.expect("topk >= 1")
