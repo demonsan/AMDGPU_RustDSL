@@ -196,9 +196,10 @@ impl PipeBody for Body<'_> {
                 sv.push(b.bitcast_f32(x));
             }
         }
+        // row max by v_max3_f32 (two values per instruction)
         let mut mx = sv[0];
-        for x in &sv[1..] {
-            mx = b.max_f32(mx, *x);
+        for pair in sv[1..].chunks(2) {
+            mx = if pair.len() == 2 { b.max3_f32(mx, pair[0], pair[1]) } else { b.max_f32(mx, pair[0]) };
         }
         let (pa, pb) = b.permlane32_swap(mx, mx);
         let (pa, pb) = (b.bitcast_f32(pa), b.bitcast_f32(pb));
