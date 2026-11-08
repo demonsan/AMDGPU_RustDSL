@@ -113,7 +113,7 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
             let key = b.bind_i32((ev(c) * 1821).lshr(17));
             let pos = b.bind_i32(ev(c) - ev(key) * CHUNKS);
             // pos ^ (key % 8) as (pos & !7) + ((pos ^ key) & 7): the same value, an interval the verifier keeps inside the row
-            let src = b.bind_i32((ev(pos) & !7) + ((ev(pos) ^ ev(key)) & 7));
+            let src = b.bind_i32((ev(pos).lshr(3) << 3) + ((ev(pos) ^ ev(key)) & 7));
             (key, src)
         })
         .collect();
@@ -139,7 +139,7 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     let kr: Vec<ValueId> = (0..9)
         .map(|c| {
             let ch = b.bind_i32((ev(wv) * 9 + c) * 2 + ev(half));
-            b.bind_i32(lane.j() * ROW + ((ev(ch) & !7) + ((ev(ch) ^ lane.lane()) & 7)) * 16)
+            b.bind_i32(lane.j() * ROW + ((ev(ch).lshr(3) << 3) + ((ev(ch) ^ lane.lane()) & 7)) * 16)
         })
         .collect();
     let vkey = b.bind_i32(ev(half) * 4 + (lane.lane() & 15).lshr(2));
@@ -147,7 +147,7 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
         .map(|e| {
             let dim = b.bind_i32(ev(wv) * 128 + 32 * e + ((lane.lane() & 31).lshr(4) << 4) + ((lane.lane() & 3) << 2));
             let ch = b.bind_i32(ev(dim).lshr(3));
-            b.bind_i32(ev(vkey) * ROW + (((ev(ch) & !7) + ((ev(ch) ^ ev(vkey)) & 7)) << 4) + ((ev(dim) & 7) << 1))
+            b.bind_i32(ev(vkey) * ROW + (((ev(ch).lshr(3) << 3) + ((ev(ch) ^ ev(vkey)) & 7)) << 4) + ((ev(dim) & 7) << 1))
         })
         .collect();
     let c_l2e = b.c_f32(std::f32::consts::LOG2_E);
