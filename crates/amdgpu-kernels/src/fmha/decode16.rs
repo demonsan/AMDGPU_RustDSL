@@ -36,6 +36,13 @@ pub fn pa_decode16_fp8tok(name: &str, page: i32) -> Function {
     pa_decode16_kv(name, page, 32, 2)
 }
 
+/// MTP / speculative decode (`pa_decode16_bf16_hd128_p<P>_mtp`): qlen (@240, 1..16, G qlen <= 16) new query tokens per sequence, Q
+/// [B][qlen][H][D]; the 16 MFMA columns are (query position, head) pairs j = qpos G + head, query position qpos sees keys
+/// < ctx - qlen + 1 + qpos (causal among the new tokens); partials / outputs per row (b qlen + qpos, h) (combine grid (H, B qlen)).
+pub fn pa_decode16_mtp(name: &str, page: i32, kt: i32) -> Function {
+    pa_decode16_kvm(name, page, kt, 0, true)
+}
+
 pub fn pa_decode16_x(name: &str, page: i32, kt: i32, fp8: bool) -> Function {
     pa_decode16_kv(name, page, kt, if fp8 { 1 } else { 0 })
 }
@@ -46,6 +53,10 @@ pub fn pa_decode16_x(name: &str, page: i32, kt: i32, fp8: bool) -> Function {
 /// v_scale into the output.
 /// `kvm`: 0 bf16 KV, 1 fp8 flash layout (per-tensor scales), 2 fp8 blocked layout (per-token scales).
 fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
+    pa_decode16_kvm(name, page, kt, kvm, false)
+}
+
+fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Function {
     let fp8 = kvm >= 1;
     let blocked = kvm == 2;
     assert!(!fp8 || kt == 32, "decode16 fp8: 32-key tiles");
@@ -72,6 +83,9 @@ fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
         b.arg("k_scale", DType::F32, 208, 4);
         b.arg("v_scale", DType::F32, 224, 4);
     }
+    if mtp {
+        b.arg("qlen", DType::I32, 240, 4);
+    }
     // KV cache bytes per (token, head) row
     let krow: i32 = if fp8 { D } else { ROW };
     // ---- contract ----
@@ -87,6 +101,13 @@ fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
     b.grid_is(1, Ext::sym("B"));
     b.grid_is(2, ss.clone());
     let bb = Ext::sym("B");
+    // (MTP: qlen rows per sequence: the "batch" of the Q / partial tensors is B qlen)
+    let bb = if mtp {
+        b.ka_range(240, 1, 16);
+        bb * Ext::ka(240)
+    } else {
+        bb
+    };
     b.arg_tensor("ptr_q", bb.clone() * hh.clone() * Ext::c(ROW as i64));
     let cache = np * Ext::c(page as i64) * hk * Ext::c(krow as i64);
     b.arg_tensor("ptr_k", cache.clone());
@@ -130,8 +151,25 @@ fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
         q
     };
     let j = b.bind_i32(lane.lane() & 15);
-    let row_live = b.bind_cond(ev(j).lt(ev(gsz)));
-    let head = b.bind_i32(ev(hk) * ev(gsz) + ev(j).min(ev(gsz) - 1));
+    // MTP: column j = qpos G + head index; qlen query rows per sequence (row index bat qlen + qpos)
+    let (row_live, head, qrow, qpos, qlen) = if mtp {
+        let ql = { let v = b.let_(Op::KernargI32 { offset: 240 }); b.read_first_lane(v) };
+        b.assume_trusted(ql, Ext::c(1), Ext::c(16), "MTP: qlen in [1, 16], G qlen <= 16 (host contract)");
+        let mut qp = b.c_i32(0);
+        for t in 1..16i32 {
+            qp = b.bind_i32(ev(qp) + ev(j).ge(ev(gsz) * t).select_i32(1, 0));
+        }
+        let qp = b.bind_i32(ev(qp).min(ev(ql) - 1));
+        let hi = b.bind_i32(ev(j) - ev(qp) * ev(gsz));
+        let live = b.bind_cond(ev(j).lt(ev(gsz) * ev(ql)));
+        let hd = b.bind_i32(ev(hk) * ev(gsz) + ev(hi).min(ev(gsz) - 1));
+        let qr = b.bind_i32(ev(bat) * ev(ql) + ev(qp));
+        (live, hd, qr, Some(qp), Some(ql))
+    } else {
+        let live = b.bind_cond(ev(j).lt(ev(gsz)));
+        let hd = b.bind_i32(ev(hk) * ev(gsz) + ev(j).min(ev(gsz) - 1));
+        (live, hd, bat, None, None)
+    };
     // ---- the wave's key split ----
     let nsplit = b.bind_i32(ev(s_n) << 2);
     let ns = { let v = b.bind_i32((ev(z) << 2) + ev(wv)); b.read_first_lane(v) };
@@ -155,9 +193,17 @@ fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
     let k_lo = { let v = b.bind_i32(ev(ns) * ev(per)); b.read_first_lane(v) };
     let k_hi = { let v = b.bind_i32((ev(k_lo) + ev(per)).min(ev(ctx))); b.read_first_lane(v) };
     let ntile = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(LKT)); b.read_first_lane(v) };
+    // the lane's key limit (MTP: query position qpos sees keys < ctx - qlen + 1 + qpos)
+    let kmax = match (qpos, qlen) {
+        (Some(qp), Some(ql)) => b.bind_i32(ev(k_hi).min(ev(ctx) - ev(ql) + 1 + ev(qp))),
+        _ => k_hi,
+    };
 
     // ---- descriptors ----
-    let r_q = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_q, n) };
+    // the rows end of this sequence (MTP: qlen rows per sequence)
+    let rend = qlen.map(|ql| { let v = b.bind_i32((ev(bat) + 1) * ev(ql)); b.read_first_lane(v) });
+    let re = move || -> amdgpu_dsl::I32 { match rend { Some(r) => ev(r), None => ev(bat) + 1 } };
+    let r_q = { let n = b.bind_i32(re() * ev(hq) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_q, n) };
     let page_bytes = page * krow;
     let r_k = { let n = b.bind_i32(ev(npages) * ev(hkv_n) * page_bytes); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_k, n) };
     let r_v = { let n = b.bind_i32(ev(npages) * ev(hkv_n) * page_bytes); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_v, n) };
@@ -167,7 +213,7 @@ fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
 
 
     // ---- Q^T fragments (B operand of 16x16x32: lane = head column, k = d 32 c + 8 g + 0..7) ----
-    let q_vo = b.bind_i32((ev(bat) * ev(hq) + ev(head)) * ROW + (ev(grp) << 4));
+    let q_vo = b.bind_i32((ev(qrow) * ev(hq) + ev(head)) * ROW + (ev(grp) << 4));
     let c0 = b.c_i32(0);
     let qf: Vec<ValueId> = (0..4).map(|c| b.buffer_load_b128(r_q, q_vo, c0, (64 * c) as u32)).collect();
 
@@ -360,7 +406,7 @@ fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
             let x = b.frag4_lane(Opnd::Var(sv_[blk]), r);
             let x = b.bitcast_f32(x);
             let x = match &kvsc { Some((ks, _)) => b.mul_f32(x, ks[4 * blk + r as usize]), None => x };
-            let keep = b.bind_cond((ev(key0) + (16 * blk as i32 + r as i32)).lt(ev(k_hi)));
+            let keep = b.bind_cond((ev(key0) + (16 * blk as i32 + r as i32)).lt(ev(kmax)));
             s.push(b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(keep), a: Opnd::Val(x), b: Opnd::Val(neg_inf) }));
         }
     }
@@ -477,11 +523,11 @@ fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
     let inv0 = b.rcp_f32(l_tot);
     let inv = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(pos), a: Opnd::Val(inv0), b: Opnd::Val(zf) });
     let inv = match vsc { Some(vs) => b.mul_f32(inv, vs), None => inv };
-    let row_po = b.bind_i32(((ev(bat) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) * (4 * D));
+    let row_po = b.bind_i32(((ev(qrow) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) * (4 * D));
     let big = b.c_i32(0x7fff_fff0);
     let po_vo_r = b.bind_i32(ev(row_po) + (ev(grp) << 4));
     let po_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(po_vo_r), b: Opnd::Val(big) });
-    let r_po = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsplit) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
+    let r_po = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
     for db in 0..8usize {
         let v: Vec<ValueId> = (0..4u8)
             .map(|k| {
@@ -499,14 +545,14 @@ fn pa_decode16_kv(name: &str, page: i32, kt: i32, kvm: u8) -> Function {
     let ln2 = b.c_f32(std::f32::consts::LN_2);
     let lse0 = b.mul_f32(x, ln2);
     let lse = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(pos), a: Opnd::Val(lse0), b: Opnd::Val(neg_inf) });
-    let r_l = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
-    let l_vo_r = b.bind_i32(((ev(bat) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
+    let r_l = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
+    let l_vo_r = b.bind_i32(((ev(qrow) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
     let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
     b.buffer_store_f32(r_l, l_vo, c0, 0, lse);
     b.else_();
     {
-        let r_l = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
-        let l_vo_r = b.bind_i32(((ev(bat) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
+        let r_l = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
+        let l_vo_r = b.bind_i32(((ev(qrow) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
         let big = b.c_i32(0x7fff_fff0);
         let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
         b.buffer_store_f32(r_l, l_vo, c0, 0, neg_inf);

@@ -99,10 +99,13 @@ pub fn kernel_by_name(name: &str) -> Option<amdgpu_dsl::Function> {
         n if n.starts_with("quant_mxfp4_bf16_k") || n.starts_with("quant_mxfp8_bf16_k") => crate::rows::mxquant::by_name(n),
         "attn_combine_bf16_hd128_q" => Some(crate::fmha::bf16v3::attn_combine_bf16_hd128_q("attn_combine_bf16_hd128_q")),
         "attn_combine_bf16_hd128" => Some(crate::fmha::decode::attn_combine_bf16_hd128("attn_combine_bf16_hd128")),
+        "attn_combine_bf16_sink_hd128" => Some(crate::fmha::decode::attn_combine_bf16_xs("attn_combine_bf16_sink_hd128", 128, false, true)),
+        "attn_combine_bf16_sink_hd64" => Some(crate::fmha::decode::attn_combine_bf16_xs("attn_combine_bf16_sink_hd64", 64, false, true)),
         "attn_combine_bf16_hd512" => Some(crate::fmha::decode::attn_combine_bf16("attn_combine_bf16_hd512", 512)),
         "attn_combine_bf16_hd512_sm" => Some(crate::fmha::decode::attn_combine_bf16_x("attn_combine_bf16_hd512_sm", 512, true)),
         n if n.starts_with("mla_decode_bf16_hp_p") => n["mla_decode_bf16_hp_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::mla::mla_decode_bf16_hp(n, p)),
         n if n.starts_with("mla_decode_bf16_p") => n["mla_decode_bf16_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::mla::mla_decode_bf16(n, p)),
+        n if n.starts_with("pa_decode16_bf16_hd128_p") && n.ends_with("_mtp") => n["pa_decode16_bf16_hd128_p".len()..n.len() - 4].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::decode16::pa_decode16_mtp(n, p, 32)),
         n if n.starts_with("pa_decode16_fp8tok_hd128_b") => n["pa_decode16_fp8tok_hd128_b".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (16..=1024).contains(p)).map(|p| crate::fmha::decode16::pa_decode16_fp8tok(n, p)),
         n if n.starts_with("pa_decode16_fp8_hd128_p") => n["pa_decode16_fp8_hd128_p".len()..].parse::<i32>().ok().filter(|p| p.count_ones() == 1 && (1..=1024).contains(p)).map(|p| crate::fmha::decode16::pa_decode16_x(n, p, 32, true)),
         n if n.starts_with("pa_decode16_bf16_hd128_p") => {
