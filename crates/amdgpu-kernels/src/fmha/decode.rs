@@ -254,6 +254,12 @@ pub fn attn_combine_bf16(name: &str, dd: i32) -> Function {
 
 /// `split_major`: partials indexed [B][NS][H] (aiter's MLA stage-1 splitData / splitLse) instead of [B][H][NS].
 pub fn attn_combine_bf16_x(name: &str, dd: i32, split_major: bool) -> Function {
+    attn_combine_bf16_xs(name, dd, split_major, false)
+}
+
+/// `sink` (`attn_combine_bf16_sink_hd128`, gpt-oss attention sinks): a per-head logit sink[h] (f32 [H], ptr @80) joins the softmax
+/// denominator only: O = sum_s e^(lse_s - M) po_s / (sum_s e^(lse_s - M) + e^(sink_h - M)), M = max(max_s lse_s, sink_h).
+pub fn attn_combine_bf16_xs(name: &str, dd: i32, split_major: bool, sink: bool) -> Function {
     let (dv, rowb) = (dd, 2 * dd);
     let mut b = FnBuilder::new(name, dd as u32);
     b.compile_profile(CompileProfile::Gemm);
@@ -262,6 +268,9 @@ pub fn attn_combine_bf16_x(name: &str, dd: i32, split_major: bool) -> Function {
     }
     b.arg("H", DType::I32, 48, 4);
     b.arg("NS", DType::I32, 64, 4);
+    if sink {
+        b.arg("ptr_sink", DType::Ptr, 80, 8);
+    }
     let (hh, ns) = (Ext::ka(48), Ext::ka(64));
     b.sym_range("B", 1, 1 << 16);
     b.ka_range(48, 1, 1 << 12);
@@ -270,6 +279,9 @@ pub fn attn_combine_bf16_x(name: &str, dd: i32, split_major: bool) -> Function {
     b.grid_is(1, Ext::sym("B"));
     b.arg_tensor("ptr_o", Ext::sym("B") * hh.clone() * Ext::c(rowb as i64));
     b.arg_tensor("ptr_po", Ext::sym("B") * hh.clone() * ns.clone() * Ext::c(4 * dv as i64));
+    if sink {
+        b.arg_tensor("ptr_sink", hh.clone() * Ext::c(4));
+    }
     b.arg_tensor("ptr_plse", Ext::sym("B") * hh * ns * Ext::c(4));
     let (p_o, p_po, p_l) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 16 }), b.let_(Op::KernargPtr { offset: 32 }));
     let hq = b.let_(Op::KernargI32 { offset: 48 });
@@ -303,7 +315,15 @@ pub fn attn_combine_bf16_x(name: &str, dd: i32, split_major: bool) -> Function {
     let d1 = b.bind_cond(ev(n1).ge(ev(nsv)));
     b.break_if(d1);
     b.end_loop();
-    let m = Opnd::Var(v1[1]);
+    // sinks: the head's sink logit joins the max (and the denominator below)
+    let snk = sink.then(|| {
+        let p = b.let_(Op::KernargPtr { offset: 80 });
+        let n = { let v = b.bind_i32(ev(hq) << 2); b.read_first_lane(v) };
+        let r = b.buffer_desc_dyn(p, n);
+        let so = { let v = b.bind_i32(ev(h) << 2); b.read_first_lane(v) };
+        b.buffer_load_f32(r, c0, so, 0)
+    });
+    let m = match snk { Some(s) => Opnd::Val(b.max_f32(Opnd::Var(v1[1]), s)), None => Opnd::Var(v1[1]) };
     // all empty -> M = -inf: use 0 (the weights exp(-inf - 0) = 0, O = 0 / max(sum, tiny))
     let mbits = b.bitcast_i32(m);
     let fin = b.bind_cond(ev(mbits).ne(0xff80_0000u32 as i32));
@@ -330,7 +350,17 @@ pub fn attn_combine_bf16_x(name: &str, dd: i32, split_major: bool) -> Function {
     b.break_if(d2);
     b.end_loop();
     let tiny = b.c_f32(1e-30);
-    let den = b.max_f32(Opnd::Var(v2[2]), tiny);
+    let den = match snk {
+        Some(s) => {
+            let ds = b.sub_f32(s, mm);
+            let l2e = b.c_f32(std::f32::consts::LOG2_E);
+            let ts = b.mul_f32(ds, l2e);
+            let ws = b.exp2_f32(ts);
+            Opnd::Val(b.add_f32(Opnd::Var(v2[2]), ws))
+        }
+        None => Opnd::Var(v2[2]),
+    };
+    let den = b.max_f32(den, tiny);
     let inv = b.rcp_f32(den);
     let y = b.mul_f32(Opnd::Var(v2[1]), inv);
     let yb = b.cvt_pk_bf16_f32(y, y);
