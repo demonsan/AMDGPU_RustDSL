@@ -1288,3 +1288,34 @@ pub fn probe_pkfma() -> Function {
     }
     b.finish()
 }
+
+/// `probe_pkpair(in, out)`: bf16x8 -> four f32 pairs written straight into register pairs (`bf16x8_to_f32_pairs`), then `v_pk_mul_f32` by
+/// (s, s) and `v_pk_add_f32` of pairs 0 + 1 and 2 + 3. in: plane 0..3 the 4 dwords of bf16x8 per lane, plane 4 f32 s. out planes 0..3:
+/// p0 * s + p1 * s (2 dwords), p2 * s + p3 * s (2 dwords).
+pub fn probe_pkpair() -> Function {
+    use amdgpu_dsl::MemTy;
+    let mut b = FnBuilder::new("probe_pkpair", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(5 * 256));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(4 * 256));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off4 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(4)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off4) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off4) });
+    let w: Vec<ValueId> = (0..4u32).map(|k| b.load_global(pin, 256 * k, MemTy::B32)).collect();
+    let s = b.load_global(pin, 1024, MemTy::B32);
+    let f = b.frag4(w[0], w[1], w[2], w[3]);
+    let p = amdgpu_tile::prims::bf16x8_to_f32_pairs(&mut b, f);
+    let ss = b.frag2_dup(s);
+    let m: Vec<ValueId> = p.iter().map(|x| b.pk_mul_f32(*x, ss)).collect();
+    let r0 = b.pk_add_f32(m[0], m[1]);
+    let r1 = b.pk_add_f32(m[2], m[3]);
+    for (k, (r, i)) in [(r0, 0u8), (r0, 1), (r1, 0), (r1, 1)].into_iter().enumerate() {
+        let v = b.frag2_lane(r, i);
+        b.store_global(pout, 256 * k as u32, v, MemTy::B32, false);
+    }
+    b.finish()
+}

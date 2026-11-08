@@ -20,3 +20,21 @@ fn a_constant_non_power_of_two_cvt_scale_is_rejected() {
         let _ = DType::F32;
     }
 }
+
+/// Pair-adjacent unpack (sched's packed-math layernorm): `bf16x8_to_f32_pairs` feeds `v_pk_mul_f32` / `v_pk_add_f32` without a single
+/// register-to-register move.
+#[test]
+fn bf16_pairs_feed_packed_f32_ops_without_moves() {
+    let f = amdgpu_kernels::kernel_by_name("probe_pkpair").unwrap();
+    let m = amdgpu_compiler::compile_mir(&f).unwrap();
+    let moves = m
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| i.op == amdgpu_compiler::mir::MOp::VMovB32 && matches!(i.srcs.first(), Some(amdgpu_compiler::mir::Src::Reg(_))))
+        .count();
+    let pk = m.blocks.iter().flat_map(|b| &b.insts).filter(|i| matches!(i.op, amdgpu_compiler::mir::MOp::VPkMulF32 | amdgpu_compiler::mir::MOp::VPkAddF32)).count();
+    assert_eq!(pk, 6);
+    // the frag4 of the four loaded words and frag2_dup copy; the unpack -> pair path itself adds none
+    assert!(moves <= 6, "{moves} register moves");
+}
