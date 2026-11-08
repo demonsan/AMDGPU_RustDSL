@@ -1474,7 +1474,7 @@ fn moe_epilogue(
     let idx = IssuePlan::new(mma.c_tv(), 4).offsets(&make_layout(tup![16, 16], tup![1024, 1]), s_lane, &Ix::C(0), d);
     let o = b.bind_i32(ctx.lower(&idx[0]));
     let (rl, cl) = (b.bind_i32(ev(o).lshr(10)), b.bind_i32(ev(o) & 1023));
-    let up = matches!(mc.st, MoeStage::Up { .. });
+    let up = matches!(mc.st, MoeStage::Up { .. }) && std::env::var("EXP_UPRAW").is_err();
     let esz = if up { 2 } else { 4 };
     let rsrc_c = { let n = b.bind_i32(ev(mc.mtok) * ev(mc.topk) * ev(mc.nout) * esz); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_c, n) };
     let so = { let v = b.bind_i32(ev(mc.row0) << 2); b.read_first_lane(v) };

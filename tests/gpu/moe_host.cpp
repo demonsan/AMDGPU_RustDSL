@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
         for (int rep = 0; rep < 2; rep++) {
             HC(hipMemset(dT, 0, (size_t)M * 2 * I * 4));
             auto ag = gemm_args(dX, dW1, dT, M, 2 * I, D, dxs, dw1s, 2 * I);
-            launch(f2, ag, 2 * I / 128, nblk);
+            launch(envi("DOWNFIRST", 0) == 2 ? f1 : f2, ag, 2 * I / (envi("DOWNFIRST", 0) == 2 ? 256 : 128), nblk);
             HC(hipDeviceSynchronize());
             std::vector<float> T((size_t)M * 2 * I);
             HC(hipMemcpy(T.data(), dT, T.size() * 4, hipMemcpyDeviceToHost));
