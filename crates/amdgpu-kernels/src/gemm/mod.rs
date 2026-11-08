@@ -1243,9 +1243,11 @@ impl skeleton_v4::V4Slots for GemmSlots {
         Scales::None => (rsrc_a, rsrc_b),
         Scales::Block128 => (
             { let n = b.bind_i32(ev(m_v) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
-            {
-                let ne = if cfg.moe.is_some() { b.let_(Op::KernargI32 { offset: 132 }) } else { b.c_i32(1) };
+            if cfg.moe.is_some() {
+                let ne = b.let_(Op::KernargI32 { offset: 132 });
                 let n = b.bind_i32(ev(ne) * (ev(n_v) >> 7) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            } else {
+                let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
             },
         ),
         // [rows][K / 32] bytes = rows * K bytes / 64 for fp4 (K bytes = K / 2)
