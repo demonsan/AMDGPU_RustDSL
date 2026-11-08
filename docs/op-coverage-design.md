@@ -564,6 +564,25 @@
 - `gemm_a16w16_bf16` 的 md5 因此变为 8ab7cd9e。
 - 调整 pre/mid sync 的 MMA 数量：差别在噪声内，未改。
 
+**MLA prefill（hd192/hd128）**：`fmha_fwd_hd192_hd128_bf16_v3[_causal]`，即 `fmha_fwd_bf16_v3_d(.., 192)`，使用厂商 fwd_hd192_hd128 的 ABI（qk_head_dim 192）。
+- Q/K 的 head dim 为 192（128 nope + 64 rope），V/O 为 128。
+- K 的 rope 部分放在第二个 ring（KR，行宽 128 字节，chunk 按 key % 8 做 XOR），由 group A 负责 staging（每个 wave 多 4 次 DMA）；QK 共 12 个 k-chunk。
+- LDS 正好 160 KB（K 64 + KR 32 + V 64）。
+- causal 形式不做 q tile 配对：第二个 pass 的寄存器放不下；两种形式都用 Vs128。
+- 测试用 `attn_host` 的 `DV=128`，第 10 个参数为 192。全部 bad=0。
+- 与 aiter `fwd_hd192_hd128_bf16[_causal]` 的同次对比（厂商用 128 行、256 线程）：
+
+| 形式 | 形状 | ours | 厂商 | 比值 |
+|---|---|---|---|---|
+| 非 causal | 8192² H16 | 650 µs | 617 µs | 0.95× |
+| 非 causal | 4096² H128 | 1311 µs | 1244 µs | 0.95× |
+| 非 causal | 2048² B2 | 112 µs | 96 µs | 0.86× |
+| 非 causal | 1024²（64 CTA） | 39.7 µs | 20.3 µs | 0.51× |
+| causal | 8192² | 512 µs | 375 µs | 0.73× |
+| causal | 4096² H128 | 1058 µs | 777 µs | 0.73× |
+
+- 待办：causal 的负载均衡（配对 / 128 行 tile）以及小网格。
+
 **attention sinks 与 MTP decode**：
 - **sinks**：`attn_combine_bf16_sink_hd{128,64}`，ptr_sink 在 @80，为每个 head 一个 f32。
   - sink logit 只进入 softmax 的分母：M = max(maxₛ lseₛ, sink)，den += e^(sink−M)。
