@@ -2789,6 +2789,25 @@ fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
             }
             data(&mut e, *value, *ty, *hi);
         }
+        Stmt::AtomicLdsNoRet { addr, value, .. } => {
+            if let Err(x) = expect_int(f, *addr, "lds atomic address") {
+                e.push(x);
+            }
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
+        Stmt::AtomicGlobalNoRet { base, value, byte_off, .. } => {
+            if !matches!(opnd_ty(f, *base), Ok(DType::Ptr)) {
+                e.push("global atomic: base must be a pointer".into());
+            }
+            if *byte_off > 4095 {
+                e.push(format!("global atomic: byte offset {byte_off} exceeds 4095"));
+            }
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
         Stmt::StoreLds2 { addr, v0, v1, b64, .. } => {
             if let Err(x) = expect_int(f, *addr, "lds store address") {
                 e.push(x);
@@ -2843,6 +2862,25 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
         }
         Op::BufferLoadN { rsrc, voff, soff, imm, .. } => e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1)),
         Op::Mfma { kind, a, b, c, scale } => e.extend(check_mfma(f, *kind, *a, *b, *c, scale.as_ref())),
+        Op::AtomicLds { addr, value, .. } => {
+            if let Err(x) = expect_int(f, *addr, "lds atomic address") {
+                e.push(x);
+            }
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
+        Op::AtomicGlobal { base, value, byte_off, .. } => {
+            if !matches!(opnd_ty(f, *base), Ok(DType::Ptr)) {
+                e.push("global atomic: base must be a pointer".into());
+            }
+            if *byte_off > 4095 {
+                e.push(format!("global atomic: byte offset {byte_off} exceeds 4095"));
+            }
+            if let Err(x) = expect_dword(f, *value, "atomic value") {
+                e.push(x);
+            }
+        }
         Op::Dpp { x, old, dpp } | Op::DppAlu { a: x, old, dpp, .. } => {
             for s in [*x, *old] {
                 if let Err(e2) = expect_dword(f, s, "dpp operand") {
