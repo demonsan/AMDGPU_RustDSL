@@ -157,3 +157,31 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 | 同上 | 随机置换 | 927 |
 
 这个布局的 value 写本身就是 2 字节散写，不可能接近流式带宽；已有的 aiter `reshape_and_cache` 同布局，同样的问题（不能在节点上独立编译做同轮对比）。**关键一点：这种部分行的 2 字节存不能带 `nt`**——全部带 `nt` 时是 186 GB/s（连续槽位），改成 regular 策略后 1456 GB/s（8 倍；`nt` 绕开了 L2 的写合并）；key 一侧的完整 16 B 存仍然用 `nt`（随机槽位下 `nt` 927 → regular 640）。更好的写法（待做）：同一个 block 的 BS 个连续 token 在 LDS 里转置后整行写。
+
+## MoE 对齐 / 排序：`moe_sorting`（模板 T5 + T7，单 block）
+
+`moe/mod.rs`：`moe_sorting_e<E>_k<K>_b<BM>`（E = 8 … 512 个专家，K = 1 … 16，BM ∈ {16, 32, 64, 128}；M 运行时给，M · K ≤ 2²²）。格式与 kernel-opt 商定，沿用 aiter `moe_sorting` 约定（FlyDSL `moe_sorting_kernel.py` 的头注释）：
+
+| 输出 | 内容 |
+|---|---|
+| `sorted_token_ids` u32 `[max_padded]` | `(topk_slot << 24) \| token_id`，按专家升序分组，每组补齐到 BM 的倍数，补齐值为哨兵 `(K << 24) \| M`；`max_padded = M·K + E·BM − K` |
+| `sorted_weights` f32 `[max_padded]` | 对应的 top-k 权重，补齐处为 0 |
+| `sorted_expert_ids` i32 `[max_padded / BM]` | 每个 M tile 的专家号，已用部分之后为 E |
+| `num_valid_ids` i32 `[2]` | `[padded_total, M]` |
+| `tile_start` i32 `[E + 1]` | 每个专家的第一个 tile（`tile_start[E]` = padded_total / BM），持久化 grouped GEMM 不必再扫 `sorted_expert_ids` |
+
+范围 0 … E 之外的专家号（EP 里的 −1、E）被忽略。专家组内顺序 = 原子到达顺序（多重集，GEMM 行相互独立，结果不变）；确定性的 token 顺序版要等 ballot / mbcnt（已在 B2 里）。
+
+实现（一个 1024 线程的 block，LDS 16 KB）：`ds_add_u32` 做直方图 → 每个线程一个专家的 padded 数 → LDS 里的 Hillis–Steele 前缀扫描（9 步，每步一个 barrier）→ 补齐位置 / `tile_start` / `num_valid_ids` / `sorted_expert_ids`（二分查找扫描结果，每个 tile 一次，`E` 填充）→ 散写：位置 = 该专家游标的 `ds_add_rtn_u32`，`token = i / K` 用 `mul_hi` 魔数（K = 1 用恒等）。**踩到的坑**：DSL 的循环必须是 wave 一致的（分支条件是 VCC 的"任一 lane"），所以每个线程不同的 trip count（补齐项、专家的 tile 数）要改写成统一的上界 + 谓词存储（越界偏移 `0x7fffff00`）。`gpu_verify --strict` 0 错误（LDS 原子地址靠 `min` / `max` 钳位证明）。
+
+主机测试 `tests/gpu/moe_sorting_host.cpp`：与 CPU 参考逐项比较（`num_valid_ids`、`tile_start`、每个 tile 的专家号、每个专家组的 (packed id, 权重) 多重集、补齐值和尾部哨兵、输出末尾之外不被写），含倾斜分布（一半的对去专家 0）与无效专家号（−1、E），`bad = 0`。延迟（单次启动，含启动开销）：
+
+| 形状 | 路由对数 | 延迟 |
+|---|--:|--:|
+| E = 128, K = 8, BM = 32，M = 37 | 296 | 12.2 µs |
+| E = 128, K = 8, BM = 32，M = 1001（倾斜 + 无效号） | 8008 | 14.8 µs |
+| E = 64, K = 2, BM = 16，M = 513 | 1026 | 10.5 µs |
+| E = 385, K = 6, BM = 32，M = 777 | 4662 | 17.9 µs |
+| E = 256, K = 8, BM = 128，M = 4096 | 32768 | 52.2 µs |
+
+限制：只有一个 block，路由对越多越慢（每 1 K 对约 +1.3 µs）；大 M（≳ 16 K 对）需要多 block 版本（全局原子直方图 + 分阶段，aiter 的 multiphase 同样如此）——待做。没有与 aiter 的同轮对比：aiter 的 `moe_sorting` 在本机树里是 CK / FlyDSL 路径，不能脱离 torch 单独编译。
