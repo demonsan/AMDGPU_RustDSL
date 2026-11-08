@@ -433,8 +433,8 @@ struct Body {
     rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, Vec<VarId>)>,
 }
 
-/// The 1 x 32 E8M0 scale loads of `Scales::Mx32`: per m block (n block) the lane's loop-invariant voffset of the dword holding its K groups,
-/// and the per-lane shift 16 (g % 2), g = lane / 16.
+/// The 1 x 32 E8M0 scale loads of `Scales::Mx32`: per m block (n block) the lane's loop-invariant voffset of its row's 8 groups of the tile,
+/// and the per-lane v_perm selector (`shift`) that picks the bytes of K groups g and 4 + g (g = lane / 16).
 struct Mx32 {
     voff_a: Vec<ValueId>,
     voff_b: Vec<ValueId>,
@@ -475,15 +475,18 @@ impl Body {
         // K group of a real tile (t + 1 is read only when it exists): the clamp is a no-op that bounds it for the verifier's loop-exit-blind intervals
         let kb = b.bind_i32(kb.lt(ev(self.kb_v)).select_i32(kb.clone(), ev(self.kb_v) - 1));
         if let Some(mx) = &self.mx32 {
-            // 1 x 32 E8M0 [rows][K / 32] bytes: per m block i (n block j) the dword holding this lane's two K groups 8 kb + 2 g + {0, 1}
-            // (g = lane / 16), shifted down by 16 (g % 2): byte h = the scale of MFMA h
+            // 1 x 32 E8M0 [rows][K / 32] bytes: the 8 groups of the tile (one 8-byte load per m / n block); the lane group g = lane / 16 of
+            // MFMA h (fragment bytes 64 h + 16 g ..) covers K group 4 h + g: v_perm puts byte g of the low word in byte 0 and byte g of the high
+            // word in byte 1 (byte h = the scale of MFMA h)
             let so = { let v = b.bind_i32(ev(kb) << 3); b.read_first_lane(v) };
             let ld = |b: &mut FnBuilder, rs: ValueId, vo: &[ValueId]| -> Vec<ValueId> {
                 vo.iter()
                     .map(|v| {
-                        let w = b.buffer_load_f32(rs, *v, so, 0);
-                        let wi = b.bitcast_i32(w);
-                        b.bind_i32(ev(wi).lshr(ev(mx.shift)))
+                        let w = b.buffer_load_b64(rs, *v, so, 0);
+                        let lo = b.frag2_lane(w, 0);
+                        let hi = b.frag2_lane(w, 1);
+                        let (lo, hi) = (b.bitcast_i32(lo), b.bitcast_i32(hi));
+                        b.perm_b32(hi, lo, mx.shift)
                     })
                     .collect()
             };
@@ -1001,14 +1004,15 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let unit = matches!(cfg.scales, Scales::RowCol | Scales::None).then(|| (b.bind_i32(lane.lane().lshr(6) + 0x7F7F_7F7F), b.bind_i32(lane.lane().lshr(6) + 0x7F)));
     // 1 x 32 scales: per m block i the row (CTA + wave + 16 i + lane % 16) of [rows][8 KT] bytes, the dword of K groups 4 (g / 2).. (g = lane / 16)
     let mx32 = (cfg.scales == Scales::Mx32).then(|| {
-        let g4 = b.bind_i32((lane.lane().lshr(5)) << 2);
         let r16 = b.bind_i32(lane.lane() & 15);
         let rowb = b.bind_i32(ev(kb_v) << 3);
         let a0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * (wave_m as i32) + ev(r16));
         let b0 = b.bind_i32((ev(bx) << lg_n) + ev(wn) * (wave_n as i32) + ev(r16));
-        let voff_a = (0..wave_m / 16).map(|i| b.bind_i32((ev(a0) + (16 * i) as i32) * ev(rowb) + ev(g4))).collect();
-        let voff_b = (0..wave_n / 16).map(|j| b.bind_i32((ev(b0) + (16 * j) as i32) * ev(rowb) + ev(g4))).collect();
-        let shift = b.bind_i32((lane.lane().lshr(4) & 1) << 4);
+        let voff_a = (0..wave_m / 16).map(|i| b.bind_i32((ev(a0) + (16 * i) as i32) * ev(rowb))).collect();
+        let voff_b = (0..wave_n / 16).map(|j| b.bind_i32((ev(b0) + (16 * j) as i32) * ev(rowb))).collect();
+        // v_perm selector: byte 0 = byte g of the low word (S1 bytes 0..3), byte 1 = byte g of the high word (S0 bytes 4..7), bytes 2, 3 = 0
+        let gg = b.bind_i32(lane.lane().lshr(4));
+        let shift = b.bind_i32(ev(gg) + ((ev(gg) + 4) << 8) + 0x0C0C_0000);
         Mx32 { voff_a, voff_b, shift }
     });
     let body = Body {
