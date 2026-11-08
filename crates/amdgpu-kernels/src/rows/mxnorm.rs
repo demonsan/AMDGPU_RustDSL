@@ -75,23 +75,26 @@ fn rmsnorm_mxfp4(name: &str, k: i64) -> Function {
     let r_g = b.buffer_desc(p_g, (2 * k) as u32);
     let c0 = b.c_i32(0);
     let tpc = b.c_i32(tp as i32);
-    // ---- pass A: this lane's partial sum of squares (runtime loop over its groups: i * 4 + j) ----
+    // ---- pass A: this lane's partial sum of squares (a runtime loop over its tile pairs, the 4 groups of a pair unrolled: 16 loads in flight) ----
     let ss = b.loop_(&[(DType::F32, Opnd::F32(0.0)), (DType::I32, Opnd::I32(0))], |b, vv| {
         let (vs, vit) = (vv[0], vv[1]);
-        let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::I32((ni * 4) as i32)));
+        let done = b.let_(Op::CmpGeI32(Opnd::Var(vit), Opnd::I32(ni as i32)));
         b.break_if(done);
-        let it = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
+        let i = b.let_(Op::AddI32(Opnd::Var(vit), Opnd::I32(0)));
         let acc0 = b.let_(Op::AddF32(Opnd::Var(vs), Opnd::F32(0.0)));
-        let i = b.bind_i32(ev(it).lshr(2));
-        let j = b.bind_i32(ev(it) & 3);
         let p = b.bind_i32(ev(wave) + 4 * ev(i));
         let valid = b.cmp(CmpPred::Lt, CmpTy::I32, p, tp as i32);
         let pc = b.bind_i32(ev(p).min(tp as i32 - 1));
-        let grp = b.bind_i32((ev(pc) << 4) + ev(g) + 4 * ev(j));
-        let xo = b.bind_i32((ev(row) * (k as i32) + (ev(grp) << 5)) << 1);
+        let mut loaded: Vec<ValueId> = Vec::new();
+        for j in 0..4i32 {
+            let grp = b.bind_i32((ev(pc) << 4) + ev(g) + 4 * j);
+            let xo = b.bind_i32((ev(row) * (k as i32) + (ev(grp) << 5)) << 1);
+            for c in 0..4u32 {
+                loaded.push(b.buffer_load_b128(r_x, xo, c0, 16 * c));
+            }
+        }
         let mut sq: Option<ValueId> = None;
-        for c in 0..4u32 {
-            let f = b.buffer_load_b128(r_x, xo, c0, 16 * c);
+        for f in loaded {
             for x in bf16x8_to_f32(b, f) {
                 let t = b.mul_f32(x, x);
                 sq = Some(match sq { None => t, Some(a) => b.add_f32(a, t) });
