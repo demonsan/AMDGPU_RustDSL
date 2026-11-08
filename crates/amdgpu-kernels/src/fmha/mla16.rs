@@ -96,7 +96,6 @@ pub fn mla16_decode_bf16(name: &str, page: i32) -> Function {
     let per = b.bind_i32(((ev(ntt) + ev(nsplit) - 1).lshr(ev(lg))) << 5);
     let k_lo = { let v = b.bind_i32(ev(ns) * ev(per)); b.read_first_lane(v) };
     let k_hi = { let v = b.bind_i32((ev(k_lo) + ev(per)).min(ev(ctx))); b.read_first_lane(v) };
-    let ntile = { let v = b.bind_i32((ev(k_hi) - ev(k_lo) + (KT - 1)).max(0).lshr(5)); b.read_first_lane(v) };
 
     // ---- descriptors ----
     let r_q = { let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_q, n) };
