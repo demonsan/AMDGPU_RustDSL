@@ -124,6 +124,67 @@ impl From<f32> for Opnd {
 }
 
 /// Pure operations. All operands are consumed by value.
+
+/// Unary VALU ops (P1, docs/op-coverage-tileops.md). `SinF32` / `CosF32` take the angle in REVOLUTIONS (sin(2 pi x)), as the hardware does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnOp { FloorF32, CeilF32, TruncF32, RndneF32, FractF32, RsqF32, SqrtF32, SinF32, CosF32, CvtI32F32, CvtU32F32, CvtF32I32, CvtF32U32, CvtF32Ubyte0, CvtF32Ubyte1, CvtF32Ubyte2, CvtF32Ubyte3 }
+
+/// Binary VALU ops. `AshrI32(a, b)` = a >> b (arithmetic); `MulHi*` = high 32 bits of the 64-bit product; `MulU32U24` = low 24 bits x low 24 bits;
+/// `Pk*F16` operate on two f16 halves of a dword (a `U32` container).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BinOp { MinF32, MaxI32, MaxU32, MinU32, SubU32, MulU32U24, AshrI32, MulHiU32, MulHiI32, OrB32, PkAddF16, PkMulF16, PkMaxF16, PkMinF16 }
+
+/// Ternary VALU ops. `MadU32U24(a, b, c)` = a[23:0] * b[23:0] + c; `LshlAddU32(a, s, c)` = (a << s) + c; `Add3U32` = a + b + c;
+/// `BfeU32 / BfeI32(x, off, width)` = bit-field extract; `BfiB32(mask, a, b)` = (mask & a) | (!mask & b); `PkFmaF16` on f16 pairs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TriOp { Min3F32, Med3F32, Min3I32, Max3I32, Med3I32, Min3U32, Max3U32, Med3U32, MadU32U24, LshlAddU32, Add3U32, BfeU32, BfeI32, BfiB32, PkFmaF16 }
+
+/// Comparison predicates. Float: `Lt/Le/Gt/Ge/Eq/Lg` are ORDERED (false when either is NaN), `Ne` is unordered-or-not-equal (IEEE `!=`, true for NaN),
+/// `Uno` = either is NaN, `Ord` = neither is NaN. `Lg`, `Uno`, `Ord` are float-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CmpPred { Lt, Le, Gt, Ge, Eq, Ne, Lg, Uno, Ord }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CmpTy { F32, I32, U32 }
+
+impl UnOp {
+    pub fn float_in(self) -> bool {
+        !matches!(self, UnOp::CvtF32I32 | UnOp::CvtF32U32 | UnOp::CvtF32Ubyte0 | UnOp::CvtF32Ubyte1 | UnOp::CvtF32Ubyte2 | UnOp::CvtF32Ubyte3)
+    }
+    pub fn result_ty(self) -> DType {
+        match self {
+            UnOp::CvtI32F32 => DType::I32,
+            UnOp::CvtU32F32 => DType::U32,
+            _ => DType::F32,
+        }
+    }
+    /// transcendental unit (longer latency, trans hazards)
+    pub fn trans(self) -> bool {
+        matches!(self, UnOp::RsqF32 | UnOp::SqrtF32 | UnOp::SinF32 | UnOp::CosF32)
+    }
+}
+impl BinOp {
+    pub fn packed(self) -> bool {
+        matches!(self, BinOp::PkAddF16 | BinOp::PkMulF16 | BinOp::PkMaxF16 | BinOp::PkMinF16)
+    }
+    pub fn result_ty(self) -> DType {
+        match self {
+            BinOp::MinF32 => DType::F32,
+            b if b.packed() => DType::U32,
+            _ => DType::I32,
+        }
+    }
+}
+impl TriOp {
+    pub fn result_ty(self) -> DType {
+        match self {
+            TriOp::Min3F32 | TriOp::Med3F32 => DType::F32,
+            TriOp::PkFmaF16 => DType::U32,
+            _ => DType::I32,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     ConstI32(i32),
@@ -280,11 +341,23 @@ pub enum Op {
     CvtPknormPair(Opnd, Opnd),
     /// Second half of `CvtPknormP8x4`: two u16-pair dwords (bf16 reinterpretation) -> four fp8 with a scale.
     CvtP8x4FromU16(Opnd, Opnd, Opnd),
+    /// unary VALU op (`UnOp`)
+    Un(UnOp, Opnd),
+    /// binary VALU op (`BinOp`)
+    Bin(BinOp, Opnd, Opnd),
+    /// ternary VALU op (`TriOp`)
+    Tri(TriOp, Opnd, Opnd, Opnd),
+    /// comparison -> I1
+    Cmp { pred: CmpPred, ty: CmpTy, a: Opnd, b: Opnd },
 }
 
 impl Op {
     pub fn result_ty(&self) -> DType {
         match self {
+            Op::Un(o, _) => o.result_ty(),
+            Op::Bin(o, ..) => o.result_ty(),
+            Op::Tri(o, ..) => o.result_ty(),
+            Op::Cmp { .. } => DType::I1,
             Op::ConstI32(_) | Op::KernargI32 { .. } | Op::MemTimeLo { .. } | Op::AddI32(..) | Op::MulI32(..) => DType::I32,
             Op::ShlI32(..) | Op::LshrI32(..) | Op::AndI32(..) | Op::MinI32(..) | Op::XorI32(..) | Op::LoadU16 { .. } => DType::I32,
             Op::ConstF32(_) | Op::KernargF32 { .. } => DType::F32,
@@ -359,6 +432,9 @@ impl Op {
             | Op::CmpLtF32(a, b)
             | Op::PtrAdd { base: a, byte_off: b } => vec![*a, *b],
             Op::FmaF32(a, b, c) => vec![*a, *b, *c],
+            Op::Un(_, a) => vec![*a],
+            Op::Bin(_, a, b) | Op::Cmp { a, b, .. } => vec![*a, *b],
+            Op::Tri(_, a, b, c) => vec![*a, *b, *c],
             Op::Max3F32(a, b, c) => vec![*a, *b, *c],
             Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
                 vec![*a]
@@ -1539,6 +1615,20 @@ impl FnBuilder {
         self.f
     }
 
+    // ---- P1 VALU ops (docs/op-coverage-tileops.md) ----
+    pub fn un(&mut self, op: UnOp, a: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Un(op, a.into()))
+    }
+    pub fn bin(&mut self, op: BinOp, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Bin(op, a.into(), b.into()))
+    }
+    pub fn tri(&mut self, op: TriOp, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Tri(op, a.into(), b.into(), c.into()))
+    }
+    pub fn cmp(&mut self, pred: CmpPred, ty: CmpTy, a: impl Into<Opnd>, b: impl Into<Opnd>) -> ValueId {
+        self.let_(Op::Cmp { pred, ty, a: a.into(), b: b.into() })
+    }
+
     // ---- capture mode (docs/weave-capture.md) ----
 
     /// Starts capturing: the statements emitted from now on (and the regions opened AND closed meanwhile) go into a detached buffer instead
@@ -2201,6 +2291,16 @@ fn expect_int(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
     }
 }
 
+/// A one-dword scalar value of any type (packed containers).
+fn expect_dword(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
+    let t = opnd_ty(f, o)?;
+    if t.is_int() || t.is_float() || t == DType::U32 {
+        Ok(())
+    } else {
+        Err(format!("{what}: expected a one-dword operand, found {}", t.name()))
+    }
+}
+
 fn expect_float(f: &Function, o: Opnd, what: &str) -> Result<(), String> {
     let t = opnd_ty(f, o)?;
     if t.is_float() {
@@ -2337,6 +2437,47 @@ pub fn verify(f: &Function) -> Vec<String> {
                         }
                         if let Err(e) = expect_int(f, *b, "int op") {
                             errs.push(here(e));
+                        }
+                    }
+                    Op::Un(o, a) => {
+                        let r = if o.float_in() { expect_float(f, *a, "unary op") } else { expect_int(f, *a, "unary op") };
+                        if let Err(e) = r {
+                            errs.push(here(e));
+                        }
+                    }
+                    Op::Bin(o, a, b) => {
+                        for x in [*a, *b] {
+                            let r = match o {
+                                BinOp::MinF32 => expect_float(f, x, "binary op"),
+                                o if o.packed() => expect_dword(f, x, "packed op"),
+                                _ => expect_int(f, x, "binary op"),
+                            };
+                            if let Err(e) = r {
+                                errs.push(here(e));
+                            }
+                        }
+                    }
+                    Op::Tri(o, a, b, c) => {
+                        for x in [*a, *b, *c] {
+                            let r = match o {
+                                TriOp::Min3F32 | TriOp::Med3F32 => expect_float(f, x, "ternary op"),
+                                TriOp::PkFmaF16 => expect_dword(f, x, "packed op"),
+                                _ => expect_int(f, x, "ternary op"),
+                            };
+                            if let Err(e) = r {
+                                errs.push(here(e));
+                            }
+                        }
+                    }
+                    Op::Cmp { pred, ty, a, b } => {
+                        if matches!(pred, CmpPred::Lg | CmpPred::Uno | CmpPred::Ord) && *ty != CmpTy::F32 {
+                            errs.push(here(format!("{pred:?} is a float-only predicate")));
+                        }
+                        for x in [*a, *b] {
+                            let r = if *ty == CmpTy::F32 { expect_float(f, x, "compare") } else { expect_int(f, x, "compare") };
+                            if let Err(e) = r {
+                                errs.push(here(e));
+                            }
                         }
                     }
                     Op::AddF32(a, b) | Op::SubF32(a, b) | Op::MulF32(a, b) | Op::MaxF32(a, b) | Op::CmpLtF32(a, b) => {

@@ -56,6 +56,66 @@ VCvtF32F16  | V1 <- V1 | {d} = nofpexcept V_CVT_F32_F16_e32 {s0}, implicit $mode
 VCvtF16F32  | V1 <- V1 | {d} = nofpexcept V_CVT_F16_F32_e32 {s0}, implicit $mode, implicit $exec
 VAndB32     | V1 <- V1 V1 | {d} = V_AND_B32_e32 {s0}, {s1}, implicit $exec
 VMinI32     | V1 <- V1 V1 | {d} = V_MIN_I32_e32 {s0}, {s1}, implicit $exec
+VFloorF32   | V1 <- V1 | {d} = nofpexcept V_FLOOR_F32_e32 {s0}, implicit $mode, implicit $exec
+VCeilF32    | V1 <- V1 | {d} = nofpexcept V_CEIL_F32_e32 {s0}, implicit $mode, implicit $exec
+VTruncF32   | V1 <- V1 | {d} = nofpexcept V_TRUNC_F32_e32 {s0}, implicit $mode, implicit $exec
+VRndneF32   | V1 <- V1 | {d} = nofpexcept V_RNDNE_F32_e32 {s0}, implicit $mode, implicit $exec
+VFractF32   | V1 <- V1 | {d} = nofpexcept V_FRACT_F32_e32 {s0}, implicit $mode, implicit $exec
+VRsqF32     | V1 <- V1 | {d} = nofpexcept V_RSQ_F32_e32 {s0}, implicit $mode, implicit $exec
+VSqrtF32    | V1 <- V1 | {d} = nofpexcept V_SQRT_F32_e32 {s0}, implicit $mode, implicit $exec
+VSinF32     | V1 <- V1 | {d} = nofpexcept V_SIN_F32_e32 {s0}, implicit $mode, implicit $exec
+VCosF32     | V1 <- V1 | {d} = nofpexcept V_COS_F32_e32 {s0}, implicit $mode, implicit $exec
+VCvtI32F32  | V1 <- V1 | {d} = nofpexcept V_CVT_I32_F32_e32 {s0}, implicit $mode, implicit $exec
+VCvtU32F32  | V1 <- V1 | {d} = nofpexcept V_CVT_U32_F32_e32 {s0}, implicit $mode, implicit $exec
+VCvtF32I32  | V1 <- V1 | {d} = nofpexcept V_CVT_F32_I32_e32 {s0}, implicit $mode, implicit $exec
+VCvtF32U32  | V1 <- V1 | {d} = nofpexcept V_CVT_F32_U32_e32 {s0}, implicit $mode, implicit $exec
+VCvtF32Ubyte0 | V1 <- V1 | {d} = nofpexcept V_CVT_F32_UBYTE0_e32 {s0}, implicit $mode, implicit $exec
+VCvtF32Ubyte1 | V1 <- V1 | {d} = nofpexcept V_CVT_F32_UBYTE1_e32 {s0}, implicit $mode, implicit $exec
+VCvtF32Ubyte2 | V1 <- V1 | {d} = nofpexcept V_CVT_F32_UBYTE2_e32 {s0}, implicit $mode, implicit $exec
+VCvtF32Ubyte3 | V1 <- V1 | {d} = nofpexcept V_CVT_F32_UBYTE3_e32 {s0}, implicit $mode, implicit $exec
+VMinF32     | V1 <- V1 V1 | {d} = nofpexcept V_MIN_F32_e32 {s0}, {s1}, implicit $mode, implicit $exec
+VMaxI32     | V1 <- V1 V1 | {d} = V_MAX_I32_e32 {s0}, {s1}, implicit $exec
+VMaxU32     | V1 <- V1 V1 | {d} = V_MAX_U32_e32 {s0}, {s1}, implicit $exec
+VMinU32     | V1 <- V1 V1 | {d} = V_MIN_U32_e32 {s0}, {s1}, implicit $exec
+VSubU32     | V1 <- V1 V1 | {d} = V_SUB_U32_e32 {s0}, {s1}, implicit $exec
+VMulU32U24  | V1 <- V1 V1 | {d} = V_MUL_U32_U24_e32 {s0}, {s1}, implicit $exec
+VAshrI32    | V1 <- V1 V1 | {d} = V_ASHRREV_I32_e32 {s0}, {s1}, implicit $exec
+VMulHiU32   | V1 <- V1 V1 | {d} = V_MUL_HI_U32_e64 {s0}, {s1}, implicit $exec
+VMulHiI32   | V1 <- V1 V1 | {d} = V_MUL_HI_I32_e64 {s0}, {s1}, implicit $exec
+VMin3F32    | V1 <- V1 V1 V1 | {d} = nofpexcept V_MIN3_F32_e64 0, {s0}, 0, {s1}, 0, {s2}, 0, 0, implicit $mode, implicit $exec
+VMed3F32    | V1 <- V1 V1 V1 | {d} = nofpexcept V_MED3_F32_e64 0, {s0}, 0, {s1}, 0, {s2}, 0, 0, implicit $mode, implicit $exec
+VMin3I32    | V1 <- V1 V1 V1 | {d} = V_MIN3_I32_e64 {s0}, {s1}, {s2}, implicit $exec
+VMin3U32    | V1 <- V1 V1 V1 | {d} = V_MIN3_U32_e64 {s0}, {s1}, {s2}, implicit $exec
+VMax3I32    | V1 <- V1 V1 V1 | {d} = V_MAX3_I32_e64 {s0}, {s1}, {s2}, implicit $exec
+VMax3U32    | V1 <- V1 V1 V1 | {d} = V_MAX3_U32_e64 {s0}, {s1}, {s2}, implicit $exec
+VMed3I32    | V1 <- V1 V1 V1 | {d} = V_MED3_I32_e64 {s0}, {s1}, {s2}, implicit $exec
+VMed3U32    | V1 <- V1 V1 V1 | {d} = V_MED3_U32_e64 {s0}, {s1}, {s2}, implicit $exec
+VMadU32U24  | V1 <- V1 V1 V1 | {d} = V_MAD_U32_U24_e64 {s0}, {s1}, {s2}, 0, implicit $exec
+VLshlAddU32 | V1 <- V1 V1 V1 | {d} = V_LSHL_ADD_U32_e64 {s0}, {s1}, {s2}, implicit $exec
+VAdd3U32    | V1 <- V1 V1 V1 | {d} = V_ADD3_U32_e64 {s0}, {s1}, {s2}, implicit $exec
+VBfeU32     | V1 <- V1 V1 V1 | {d} = V_BFE_U32_e64 {s0}, {s1}, {s2}, implicit $exec
+VBfeI32     | V1 <- V1 V1 V1 | {d} = V_BFE_I32_e64 {s0}, {s1}, {s2}, implicit $exec
+VBfiB32     | V1 <- V1 V1 V1 | {d} = V_BFI_B32_e64 {s0}, {s1}, {s2}, implicit $exec
+VPkAddF16   | V1 <- V1 V1 | {d} = nofpexcept V_PK_ADD_F16 8, {s0}, 8, {s1}, 0, 0, -1, 0, 0, implicit $mode, implicit $exec
+VPkMulF16   | V1 <- V1 V1 | {d} = nofpexcept V_PK_MUL_F16 8, {s0}, 8, {s1}, 0, 0, -1, 0, 0, implicit $mode, implicit $exec
+VPkMaxF16   | V1 <- V1 V1 | {d} = nofpexcept V_PK_MAX_F16 8, {s0}, 8, {s1}, 0, 0, -1, 0, 0, implicit $mode, implicit $exec
+VPkMinF16   | V1 <- V1 V1 | {d} = nofpexcept V_PK_MIN_F16 8, {s0}, 8, {s1}, 0, 0, -1, 0, 0, implicit $mode, implicit $exec
+VPkFmaF16   | V1 <- V1 V1 V1 | {d} = nofpexcept V_PK_FMA_F16 8, {s0}, 8, {s1}, 8, {s2}, 0, 0, -1, 0, 0, implicit $mode, implicit $exec
+VCmpLeF32   | <- V1 V1 | nofpexcept V_CMP_LE_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
+VCmpGtF32   | <- V1 V1 | nofpexcept V_CMP_GT_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
+VCmpGeF32   | <- V1 V1 | nofpexcept V_CMP_GE_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
+VCmpEqF32   | <- V1 V1 | nofpexcept V_CMP_EQ_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
+VCmpNeF32   | <- V1 V1 | nofpexcept V_CMP_NEQ_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
+VCmpLgF32   | <- V1 V1 | nofpexcept V_CMP_LG_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
+VCmpUF32    | <- V1 V1 | nofpexcept V_CMP_U_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
+VCmpOF32    | <- V1 V1 | nofpexcept V_CMP_O_F32_e32 {s0}, {s1}, implicit-def $vcc, implicit $mode, implicit $exec
+VCmpLeI32   | <- V1 V1 | V_CMP_LE_I32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VCmpEqI32   | <- V1 V1 | V_CMP_EQ_I32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VCmpLtU32   | <- V1 V1 | V_CMP_LT_U32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VCmpLeU32   | <- V1 V1 | V_CMP_LE_U32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VCmpGtU32   | <- V1 V1 | V_CMP_GT_U32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VCmpGeU32   | <- V1 V1 | V_CMP_GE_U32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
+VCmpEqU32   | <- V1 V1 | V_CMP_EQ_U32_e32 {s0}, {s1}, implicit-def $vcc, implicit $exec
 VOrB32      | V1 <- V1 V1 | {d} = V_OR_B32_e32 {s0}, {s1}, implicit $exec
 VXorB32     | V1 <- V1 V1 | {d} = V_XOR_B32_e32 {s0}, {s1}, implicit $exec
 VLshrB32    | V1 <- I V1  | {d} = V_LSHRREV_B32_e32 {s0}, {s1}, implicit $exec

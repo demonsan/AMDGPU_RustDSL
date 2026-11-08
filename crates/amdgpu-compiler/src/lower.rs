@@ -2215,6 +2215,11 @@ impl Lowerer {
             Op::MaxF32(a, b) => self.bin_v1(dst, MOp::VMaxF32, *a, *b)?,
             Op::AndI32(a, b) => self.bin_v1(dst, MOp::VAndB32, *a, *b)?,
             Op::MinI32(a, b) => self.bin_v1(dst, MOp::VMinI32, *a, *b)?,
+            Op::Un(o, a) => self.un_v1(dst, un_mop(*o), *a)?,
+            Op::Bin(amdgpu_dsl::BinOp::AshrI32, a, b) => self.v_plain(dst, MOp::VAshrI32, &[*b, *a])?,
+            Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
+            Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
+            Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
             Op::XorI32(a, b) => self.bin_v1(dst, MOp::VXorB32, *a, *b)?,
             Op::MulI32(a, b) => self.bin_v1(dst, MOp::VMulLoU32, *a, *b)?,
             Op::ShlI32(a, b) => {
@@ -2959,6 +2964,24 @@ impl Lowerer {
         self.touch(&[Src::Reg(ra), Src::Reg(rb)]);
         let d = self.new_vreg(RClass::V1);
         self.push(MInst::new(op).def(d).srcreg(ra).srcreg(rb));
+        self.val.insert(dst, d);
+        Ok(())
+    }
+
+    /// A VALU op with plain V1 operands (constants materialised; e32 / VOP3 forms both accept them).
+    fn v_plain(&mut self, dst: ValueId, op: MOp, srcs: &[Opnd]) -> Result<(), String> {
+        let mut rs = Vec::with_capacity(srcs.len());
+        for s in srcs {
+            rs.push(self.as_v1(*s)?);
+        }
+        let touched: Vec<Src> = rs.iter().map(|r| Src::Reg(*r)).collect();
+        self.touch(&touched);
+        let d = self.new_vreg(RClass::V1);
+        let mut inst = MInst::new(op).def(d);
+        for r in rs {
+            inst = inst.srcreg(r);
+        }
+        self.push(inst);
         self.val.insert(dst, d);
         Ok(())
     }
@@ -3743,3 +3766,96 @@ fn lds_spill(m: &mut MFunction, count: usize) -> (usize, u32) {
     (spilled, total)
 }
 use crate::asm::mop_by_name;
+
+fn un_mop(o: amdgpu_dsl::UnOp) -> MOp {
+    use amdgpu_dsl::UnOp as U;
+    match o {
+        U::FloorF32 => MOp::VFloorF32,
+        U::CeilF32 => MOp::VCeilF32,
+        U::TruncF32 => MOp::VTruncF32,
+        U::RndneF32 => MOp::VRndneF32,
+        U::FractF32 => MOp::VFractF32,
+        U::RsqF32 => MOp::VRsqF32,
+        U::SqrtF32 => MOp::VSqrtF32,
+        U::SinF32 => MOp::VSinF32,
+        U::CosF32 => MOp::VCosF32,
+        U::CvtI32F32 => MOp::VCvtI32F32,
+        U::CvtU32F32 => MOp::VCvtU32F32,
+        U::CvtF32I32 => MOp::VCvtF32I32,
+        U::CvtF32U32 => MOp::VCvtF32U32,
+        U::CvtF32Ubyte0 => MOp::VCvtF32Ubyte0,
+        U::CvtF32Ubyte1 => MOp::VCvtF32Ubyte1,
+        U::CvtF32Ubyte2 => MOp::VCvtF32Ubyte2,
+        U::CvtF32Ubyte3 => MOp::VCvtF32Ubyte3,
+    }
+}
+
+fn bin_mop(o: amdgpu_dsl::BinOp) -> MOp {
+    use amdgpu_dsl::BinOp as B;
+    match o {
+        B::MinF32 => MOp::VMinF32,
+        B::MaxI32 => MOp::VMaxI32,
+        B::MaxU32 => MOp::VMaxU32,
+        B::MinU32 => MOp::VMinU32,
+        B::SubU32 => MOp::VSubU32,
+        B::MulU32U24 => MOp::VMulU32U24,
+        B::AshrI32 => MOp::VAshrI32,
+        B::MulHiU32 => MOp::VMulHiU32,
+        B::MulHiI32 => MOp::VMulHiI32,
+        B::OrB32 => MOp::VOrB32,
+        B::PkAddF16 => MOp::VPkAddF16,
+        B::PkMulF16 => MOp::VPkMulF16,
+        B::PkMaxF16 => MOp::VPkMaxF16,
+        B::PkMinF16 => MOp::VPkMinF16,
+    }
+}
+
+fn tri_mop(o: amdgpu_dsl::TriOp) -> MOp {
+    use amdgpu_dsl::TriOp as T;
+    match o {
+        T::Min3F32 => MOp::VMin3F32,
+        T::Med3F32 => MOp::VMed3F32,
+        T::Min3I32 => MOp::VMin3I32,
+        T::Max3I32 => MOp::VMax3I32,
+        T::Med3I32 => MOp::VMed3I32,
+        T::Min3U32 => MOp::VMin3U32,
+        T::Max3U32 => MOp::VMax3U32,
+        T::Med3U32 => MOp::VMed3U32,
+        T::MadU32U24 => MOp::VMadU32U24,
+        T::LshlAddU32 => MOp::VLshlAddU32,
+        T::Add3U32 => MOp::VAdd3U32,
+        T::BfeU32 => MOp::VBfeU32,
+        T::BfeI32 => MOp::VBfeI32,
+        T::BfiB32 => MOp::VBfiB32,
+        T::PkFmaF16 => MOp::VPkFmaF16,
+    }
+}
+
+/// vcc-writing compare of `pred` on `ty` (`Ne` on integers is `v_cmp_ne_u32` for both signednesses).
+fn cmp_mop(p: amdgpu_dsl::CmpPred, t: amdgpu_dsl::CmpTy) -> MOp {
+    use amdgpu_dsl::{CmpPred as P, CmpTy as T};
+    match (t, p) {
+        (T::F32, P::Lt) => MOp::VCmpLtF32,
+        (T::F32, P::Le) => MOp::VCmpLeF32,
+        (T::F32, P::Gt) => MOp::VCmpGtF32,
+        (T::F32, P::Ge) => MOp::VCmpGeF32,
+        (T::F32, P::Eq) => MOp::VCmpEqF32,
+        (T::F32, P::Ne) => MOp::VCmpNeF32,
+        (T::F32, P::Lg) => MOp::VCmpLgF32,
+        (T::F32, P::Uno) => MOp::VCmpUF32,
+        (T::F32, P::Ord) => MOp::VCmpOF32,
+        (T::I32, P::Lt) => MOp::VCmpLtI32,
+        (T::I32, P::Le) => MOp::VCmpLeI32,
+        (T::I32, P::Gt) => MOp::VCmpGtI32,
+        (T::I32, P::Ge) => MOp::VCmpGeI32,
+        (T::I32, P::Eq) => MOp::VCmpEqI32,
+        (T::U32, P::Lt) => MOp::VCmpLtU32,
+        (T::U32, P::Le) => MOp::VCmpLeU32,
+        (T::U32, P::Gt) => MOp::VCmpGtU32,
+        (T::U32, P::Ge) => MOp::VCmpGeU32,
+        (T::U32, P::Eq) => MOp::VCmpEqU32,
+        (_, P::Ne) => MOp::VCmpNeI32,
+        // float-only predicates on integers are rejected by the IR verifier
+        (_, P::Lg | P::Uno | P::Ord) => MOp::VCmpNeI32,
+    }
+}
