@@ -187,7 +187,6 @@ pub fn probe_mem_p1() -> Function {
             _ => b.let_(Op::Frag4Lane { frag: Opnd::Val(v), index: i }),
         }).collect()
     };
-    let merge = b.c_i32(0xAAAA5555u32 as i32);
     // ---- global loads (planes 0..19)
     for (ty, off) in [(MemTy::U8, 1), (MemTy::I8, 3), (MemTy::U16, 2), (MemTy::I16, 6), (MemTy::B32, 4)] {
         let v = b.load_global(pin, off, ty);
@@ -200,7 +199,7 @@ pub fn probe_mem_p1() -> Function {
     let v128 = b.load_global(pin, 0, MemTy::B128);
     for x in lanes(&mut b, v128, 4) { put(&mut b, x); }
     for (ty, hi, off) in [(D16Ty::U8, false, 1), (D16Ty::U8, true, 1), (D16Ty::I8, false, 3), (D16Ty::I8, true, 3), (D16Ty::B16, false, 2), (D16Ty::B16, true, 2)] {
-        let v = b.load_global_d16(pin, off, ty, hi, merge);
+        let v = b.load_global_d16(pin, off, ty, hi);
         put(&mut b, v);
     }
     // ---- buffer loads (planes 20..26)
@@ -231,7 +230,7 @@ pub fn probe_mem_p1() -> Function {
     for x in lanes(&mut b, v, 4).into_iter().take(3) { put(&mut b, x); }
     for (ty, hi, off) in [(D16Ty::U8, false, 1), (D16Ty::U8, true, 1), (D16Ty::I8, false, 3), (D16Ty::I8, true, 3), (D16Ty::B16, false, 2), (D16Ty::B16, true, 2)] {
         let a = b.add_i32(off16, off);
-        let v = b.load_lds_d16(a, ty, hi, merge);
+        let v = b.load_lds_d16(a, ty, hi);
         put(&mut b, v);
     }
     let v = b.load_lds2(off16, 1, 3, false, false);

@@ -2263,12 +2263,11 @@ impl Lowerer {
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
-            Op::LoadGlobalD16 { base, byte_off, ty, hi, merge } => {
-                let m = self.as_v1(*merge)?;
+            Op::LoadGlobalD16 { base, byte_off, ty, hi } => {
+                // the d16 forms are partial writes in the ISA; gfx950 zeroes the other half anyway: start from 0 so both readings agree
                 let rb = self.as_v2(*base)?;
-                self.touch(&[Src::Reg(m)]);
                 let d = self.new_vreg(RClass::V1);
-                self.copy_reg(d, m)?;
+                self.push(MInst::new(MOp::VMovB32).def(d).src(Src::Imm(0)));
                 self.push(MInst::new(global_d16_mop(*ty, *hi)).def(d).srcreg(rb).srcreg(d).imm(*byte_off as i64));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
@@ -2289,12 +2288,10 @@ impl Lowerer {
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
-            Op::LoadLdsD16 { addr, ty, hi, merge } => {
-                let m = self.as_v1(*merge)?;
+            Op::LoadLdsD16 { addr, ty, hi } => {
                 let (a, off) = self.lds_addr(*addr)?;
-                self.touch(&[Src::Reg(m)]);
                 let d = self.new_vreg(RClass::V1);
-                self.copy_reg(d, m)?;
+                self.push(MInst::new(MOp::VMovB32).def(d).src(Src::Imm(0)));
                 self.push(MInst::new(lds_d16_mop(*ty, *hi)).def(d).srcreg(a).srcreg(d).imm(off));
                 self.pending_lds.push(self.mir.canon(d));
                 self.val.insert(dst, d);

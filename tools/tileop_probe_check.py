@@ -247,7 +247,7 @@ def mem_ref(inb):
         return int.from_bytes(inb[addr:addr + n], "little")
     def sx(v, bits):
         return (v - (1 << bits)) & 0xFFFFFFFF if v & (1 << (bits - 1)) else v
-    merge = 0xAAAA5555
+    merge = 0  # gfx950 zeroes the unused half of a d16 load
     def d16(v, bits, signed, hi):
         h = (sx(v, bits) if signed else v) & 0xFFFF
         return ((merge & 0xFFFF) | (h << 16)) if hi else ((merge & 0xFFFF0000) | h)

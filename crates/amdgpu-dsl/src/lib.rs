@@ -152,8 +152,8 @@ pub enum CmpTy { F32, I32, U32 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemTy { U8, I8, U16, I16, B32, B64, B96, B128 }
 
-/// The data of a `d16` load: one byte (zero- or sign-extended to 16 bits) or a 16-bit half, written into the low (`hi: false`) or high half
-/// of the destination dword; the other half keeps the `merge` operand's bits.
+/// The data of a `d16` load: one byte (zero- or sign-extended to 16 bits) or a 16-bit half, placed in the low (`hi: false`) or high half of
+/// the result dword. The other half is ZERO: on gfx950 (SRAM-ECC enabled) the d16 loads do not preserve the unused half (hardware probe).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum D16Ty { U8, I8, B16 }
 
@@ -386,14 +386,14 @@ pub enum Op {
     Cmp { pred: CmpPred, ty: CmpTy, a: Opnd, b: Opnd },
     /// global load of any width (`MemTy`); result type `ty.value_ty()`
     LoadGlobalN { base: Opnd, byte_off: u32, ty: MemTy },
-    /// `global_load_*_d16[_hi]`: the loaded 8 / 16 bits into one half of a dword, the other half from `merge`
-    LoadGlobalD16 { base: Opnd, byte_off: u32, ty: D16Ty, hi: bool, merge: Opnd },
+    /// `global_load_*_d16[_hi]`: the loaded 8 / 16 bits in one half of a dword, the other half zero
+    LoadGlobalD16 { base: Opnd, byte_off: u32, ty: D16Ty, hi: bool },
     /// MUBUF load of any width
     BufferLoadN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, ty: MemTy },
     /// LDS load of any width
     LoadLdsN { addr: Opnd, ty: MemTy },
     /// `ds_read_*_d16[_hi]`
-    LoadLdsD16 { addr: Opnd, ty: D16Ty, hi: bool, merge: Opnd },
+    LoadLdsD16 { addr: Opnd, ty: D16Ty, hi: bool },
     /// `ds_read2[st64]_b32 / _b64`: two elements at `addr + off0 * s` and `addr + off1 * s` (s = element size, x 64 for `st64`) -> `Frag2` / `Frag4`
     LoadLds2 { addr: Opnd, off0: u8, off1: u8, b64: bool, st64: bool },
     /// `ds_read_b64_tr_b16`: 16-bit transpose read across the 16-lane groups (as `tr_b8` for bytes) -> `Frag2`
@@ -489,15 +489,14 @@ impl Op {
             Op::Bin(_, a, b) | Op::Cmp { a, b, .. } => vec![*a, *b],
             Op::Tri(_, a, b, c) => vec![*a, *b, *c],
             Op::LoadGlobalN { base, .. } => vec![*base],
-            Op::LoadGlobalD16 { base, merge, .. } => vec![*base, *merge],
+            Op::LoadGlobalD16 { base, .. } => vec![*base],
             Op::BufferLoadN { rsrc, voff, soff, .. } => {
                 let mut v = vec![*rsrc];
                 v.extend(voff.iter().copied());
                 v.push(*soff);
                 v
             }
-            Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } => vec![*addr],
-            Op::LoadLdsD16 { addr, merge, .. } => vec![*addr, *merge],
+            Op::LoadLdsN { addr, .. } | Op::LoadLds2 { addr, .. } | Op::LoadLdsTrB16 { addr } | Op::LoadLdsD16 { addr, .. } => vec![*addr],
             Op::Max3F32(a, b, c) => vec![*a, *b, *c],
             Op::ExpF32(a) | Op::Exp2F32(a) | Op::Log2F32(a) | Op::RcpF32(a) | Op::CvtF16ToF32(a) | Op::CvtF32ToF16(a) | Op::NotI1(a) => {
                 vec![*a]
@@ -1704,8 +1703,8 @@ impl FnBuilder {
     pub fn load_global(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: MemTy) -> ValueId {
         self.let_(Op::LoadGlobalN { base: base.into(), byte_off, ty })
     }
-    pub fn load_global_d16(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: D16Ty, hi: bool, merge: impl Into<Opnd>) -> ValueId {
-        self.let_(Op::LoadGlobalD16 { base: base.into(), byte_off, ty, hi, merge: merge.into() })
+    pub fn load_global_d16(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: D16Ty, hi: bool) -> ValueId {
+        self.let_(Op::LoadGlobalD16 { base: base.into(), byte_off, ty, hi })
     }
     pub fn store_global(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
         self.push_stmt(Stmt::StoreGlobalN { base: base.into(), byte_off, value: value.into(), ty, hi });
@@ -1720,8 +1719,8 @@ impl FnBuilder {
     pub fn load_lds(&mut self, addr: impl Into<Opnd>, ty: MemTy) -> ValueId {
         self.let_(Op::LoadLdsN { addr: addr.into(), ty })
     }
-    pub fn load_lds_d16(&mut self, addr: impl Into<Opnd>, ty: D16Ty, hi: bool, merge: impl Into<Opnd>) -> ValueId {
-        self.let_(Op::LoadLdsD16 { addr: addr.into(), ty, hi, merge: merge.into() })
+    pub fn load_lds_d16(&mut self, addr: impl Into<Opnd>, ty: D16Ty, hi: bool) -> ValueId {
+        self.let_(Op::LoadLdsD16 { addr: addr.into(), ty, hi })
     }
     pub fn store_lds(&mut self, addr: impl Into<Opnd>, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
         self.push_stmt(Stmt::StoreLdsN { addr: addr.into(), value: value.into(), ty, hi });
@@ -2474,11 +2473,6 @@ fn check_mem_op(f: &Function, op: &Op) -> Vec<String> {
             }
         }
         _ => {}
-    }
-    if let Op::LoadGlobalD16 { merge, .. } | Op::LoadLdsD16 { merge, .. } = op {
-        if let Err(x) = expect_dword(f, *merge, "d16 merge value") {
-            e.push(x);
-        }
     }
     e
 }
