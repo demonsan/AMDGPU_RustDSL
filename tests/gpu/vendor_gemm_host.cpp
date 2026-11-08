@@ -174,6 +174,12 @@ int main(int argc, char** argv) {
             const int P = envi("KK", 0);
             for (int n = 0; n < N; n++) { size_t dst = (size_t)n * K + P; hp[dst / 2] |= 2 << (4 * (dst & 1)); }
         }
+        // W4DBG=6: probe the scale bytes - A[m][k] = k, B = 1.0 everywhere, scale byte GRP of every row = 2 (others 1)
+        if (dbg == 6) {
+            for (size_t i = 0; i < (size_t)M * K; i++) { uint16_t bb = f_to_bf16((float)(i % K)); memcpy(&ha[2 * i], &bb, 2); }
+            std::fill(hp.begin(), hp.end(), 0x22);
+            for (int n = 0; n < N; n++) for (int g2 = 0; g2 < K / 32; g2++) sb8[(size_t)n * (K / 32) + g2] = g2 == envi("GRP", 0) ? 128 : 127;
+        }
         hb_w4perm = hp;
     } else { fprintf(stderr, "unknown family %s\n", fam.c_str()); return 1; }
 
@@ -330,6 +336,7 @@ int main(int argc, char** argv) {
     // ---- check against the CPU reference on CHECK_ROWS rows ----
     std::vector<uint16_t> out((size_t)M * N);
     HC(hipMemcpy(out.data(), dCcheck, out.size() * 2, hipMemcpyDeviceToHost));
+    if (kind == "bf16w4" && envi("W4DBG", 0) == 6) { printf("SPROBE G=%d extra=%g row17=%g\n", envi("GRP", 0), bf16_to_f(out[0]) - 32640.0, bf16_to_f(out[17 * N + 5]) - 32640.0); return 0; }
     if (kind == "bf16w4" && envi("W4DBG", 0) == 3) { printf("PROBE P=%d got=%g %g\n", envi("KK", 0), bf16_to_f(out[0]), bf16_to_f(out[17 * N + 5])); return 0; }
     double max_rel = 0; long bad = 0, checked = 0;
     for (int ri = 0; ri < crow && ri < M; ri++) {
