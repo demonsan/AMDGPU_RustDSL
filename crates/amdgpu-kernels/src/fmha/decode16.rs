@@ -201,8 +201,9 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
 
     // ---- descriptors ----
     // the rows end of this sequence (MTP: qlen rows per sequence)
-    let rend = match qlen { Some(ql) => { let v = b.bind_i32((ev(bat) + 1) * ev(ql)); b.read_first_lane(v) }, None => b.bind_i32(ev(bat) + 1) };
-    let r_q = { let n = b.bind_i32(ev(rend) * ev(hq) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_q, n) };
+    let rend = qlen.map(|ql| { let v = b.bind_i32((ev(bat) + 1) * ev(ql)); b.read_first_lane(v) });
+    let re = move || -> amdgpu_dsl::I32 { match rend { Some(r) => ev(r), None => ev(bat) + 1 } };
+    let r_q = { let n = b.bind_i32(re() * ev(hq) * ROW); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_q, n) };
     let page_bytes = page * krow;
     let r_k = { let n = b.bind_i32(ev(npages) * ev(hkv_n) * page_bytes); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_k, n) };
     let r_v = { let n = b.bind_i32(ev(npages) * ev(hkv_n) * page_bytes); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_v, n) };
@@ -526,7 +527,7 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
     let big = b.c_i32(0x7fff_fff0);
     let po_vo_r = b.bind_i32(ev(row_po) + (ev(grp) << 4));
     let po_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(po_vo_r), b: Opnd::Val(big) });
-    let r_po = { let n = b.bind_i32(ev(rend) * ev(hq) * ev(nsplit) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
+    let r_po = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
     for db in 0..8usize {
         let v: Vec<ValueId> = (0..4u8)
             .map(|k| {
@@ -544,13 +545,13 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
     let ln2 = b.c_f32(std::f32::consts::LN_2);
     let lse0 = b.mul_f32(x, ln2);
     let lse = b.let_(Op::Select { ty: DType::F32, cond: Opnd::Val(pos), a: Opnd::Val(lse0), b: Opnd::Val(neg_inf) });
-    let r_l = { let n = b.bind_i32(ev(rend) * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
+    let r_l = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
     let l_vo_r = b.bind_i32(((ev(qrow) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
     let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
     b.buffer_store_f32(r_l, l_vo, c0, 0, lse);
     b.else_();
     {
-        let r_l = { let n = b.bind_i32(ev(rend) * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
+        let r_l = { let n = b.bind_i32(re() * ev(hq) * ev(nsplit) * 4); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_lse, n) };
         let l_vo_r = b.bind_i32(((ev(qrow) * ev(hq) + ev(head)) * ev(nsplit) + ev(ns)) << 2);
         let big = b.c_i32(0x7fff_fff0);
         let l_vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(row_live), a: Opnd::Val(l_vo_r), b: Opnd::Val(big) });
