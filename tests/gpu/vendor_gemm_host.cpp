@@ -245,6 +245,25 @@ int main(int argc, char** argv) {
         HC(hipModuleGetFunction(&rfn, rmod, getenv("REDUCE_KN")));
         ra.ptr(0, dWS); ra.ptr(8, dC); ra.ptr(16, dSA); ra.ptr(24, dSB); ra.u32(32, M); ra.u32(36, N); ra.u32(40, splitk); ra.u32(44, MP); ra.b.resize(48);
     }
+    // BATCH=n (ours_v4_bf16 / ours_v4_rowcol_fp8 with a `_bmm` kernel): n dense batches; the LAST batch holds the reference data (the others
+    // are filled with 0x3c bytes), grid z = n; the check reads the last batch's C
+    const int nbat = envi("BATCH", 1);
+    void* dCcheck = dC;
+    if (nbat > 1) {
+        auto rep = [&](void* src, size_t bytes) {
+            uint8_t* d;
+            HC(hipMalloc(&d, bytes * nbat + 256));
+            HC(hipMemset(d, 0x3c, bytes * nbat));
+            HC(hipMemcpy(d + bytes * (nbat - 1), src, bytes, hipMemcpyDeviceToDevice));
+            return (void*)d;
+        };
+        a.ptr(0, rep(dA, ha.size())); a.ptr(8, rep(dB, hb_dev.size()));
+        uint8_t* dCb; HC(hipMalloc(&dCb, (size_t)M * N * 2 * nbat + 256)); HC(hipMemset(dCb, 0, (size_t)M * N * 2 * nbat));
+        a.ptr(16, dCb); dCcheck = dCb + (size_t)M * N * 2 * (nbat - 1);
+        if (fam == "ours_v4_rowcol_fp8") { a.ptr(64, rep(dSA, (size_t)M * 4)); a.ptr(72, rep(dSB, (size_t)N * 4)); }
+        a.u32(36, nbat);
+        gz = nbat;
+    }
     size_t rsz = ra.b.size();
     void* rcfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, ra.b.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &rsz, HIP_LAUNCH_PARAM_END};
     size_t asz = a.b.size();
@@ -258,7 +277,7 @@ int main(int argc, char** argv) {
 
     // ---- check against the CPU reference on CHECK_ROWS rows ----
     std::vector<uint16_t> out((size_t)M * N);
-    HC(hipMemcpy(out.data(), dC, out.size() * 2, hipMemcpyDeviceToHost));
+    HC(hipMemcpy(out.data(), dCcheck, out.size() * 2, hipMemcpyDeviceToHost));
     double max_rel = 0; long bad = 0, checked = 0;
     for (int ri = 0; ri < crow && ri < M; ri++) {
         int m = crow >= M ? ri : (int)((long)ri * (M - 1) / (crow - 1 > 0 ? crow - 1 : 1));
@@ -305,7 +324,7 @@ int main(int argc, char** argv) {
     HC(hipEventRecord(e1));
     HC(hipEventSynchronize(e1));
     float ms; HC(hipEventElapsedTime(&ms, e0, e1));
-    double us = 1e3 * ms / iters, tf = 2.0 * M * N * K / (us * 1e-6) / 1e12;
+    double us = 1e3 * ms / iters, tf = 2.0 * nbat * M * N * K / (us * 1e-6) / 1e12;
     printf("%s %s M=%d N=%d K=%d: %.2f us %.1f TF/s check rows=%d checked=%ld bad=%ld max_rel=%.3e %s\n", fam.c_str(), kn, M, N, K, us, tf,
            crow < M ? crow : M, checked, bad, max_rel, bad ? "GEMM_FAIL" : "GEMM_OK");
     return bad ? 3 : 0;
