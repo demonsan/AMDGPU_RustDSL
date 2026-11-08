@@ -925,7 +925,7 @@ impl Body {
         }
         // the deferred block-scale updates of this tile, before the scales of t + 1 replace the scale variables
         let pend: Vec<_> = self.pending.borrow_mut().drain(..).collect();
-        if !pend.is_empty() {
+        if !pend.is_empty() && std::env::var("EXP_NOBS").is_err() {
             u.capture(b, "bs.fma", |b| bs_fma(b, &pend));
         }
         if let Some((sa, sb)) = early {
