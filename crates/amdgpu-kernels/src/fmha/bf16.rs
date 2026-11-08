@@ -29,11 +29,14 @@ pub struct AttnCfg {
     /// sliding window: keys in [q' - left, q' + right] with q' = q + SK - SQ (our ABI extension: left / right at kernarg 656 / 672, int32);
     /// combined with `causal` the right edge is min(right, 0)
     pub swa: bool,
+    /// group (varlen) mode: THD tensors over total_q / total_k rows, cu_seqlens_q / _k int32 [B + 1] at kernarg 432 / 448, grid (H, B,
+    /// ceil(total_q / 128)) (the vendor's group-mode ABI); LSE [H, total_q]
+    pub group: bool,
 }
 
 /// `fmha_fwd_hd128_bf16[_causal]` (the shipped coverage names).
 pub fn fmha_fwd_hd128_bf16(name: &str, causal: bool) -> Function {
-    fmha_fwd_bf16(name, AttnCfg { d: 128, causal, swa: false })
+    fmha_fwd_bf16(name, AttnCfg { d: 128, causal, swa: false, group: false })
 }
 
 /// The kernel for `cfg`.
@@ -66,8 +69,12 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
     for (n, i) in i32_names {
         b.arg(n, if n == "scalar" { DType::F32 } else { DType::I32 }, 16 * i, 4);
     }
-    // ---- contract: dense BSHD, D = 128 ----
-    let (bb, sq, sk, hh, gq) = (Ext::grid_z(), Ext::ka(96), Ext::ka(272), Ext::ka(320), Ext::ka(176));
+    if cfg.group {
+        b.arg("ptr_qseq", DType::Ptr, 432, 8);
+        b.arg("ptr_kseq", DType::Ptr, 448, 8);
+    }
+    // ---- contract: dense BSHD (THD in group mode) ----
+    let (bb, sq, sk, hh, gq) = (if cfg.group { Ext::c(1) } else { Ext::grid_z() }, Ext::ka(96), Ext::ka(272), Ext::ka(320), Ext::ka(176));
     b.ka_range(96, 1, 1 << 20);
     b.ka_range(272, 1, 1 << 20);
     b.ka_range(176, 1, 16);
@@ -78,18 +85,28 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
     b.ka_is(304, Ext::c(D as i64));
     b.ka_is(112, hh.clone() * Ext::c(ROW as i64));
     b.ka_is(144, Ext::c(ROW as i64));
-    b.ka_is(160, sq.clone() * hh.clone() * Ext::c(ROW as i64));
+    let zb = |e: Ext| if cfg.group { Ext::c(0) } else { e };
+    b.ka_is(160, zb(sq.clone() * hh.clone() * Ext::c(ROW as i64)));
     for (s, hs, bs) in [(192u32, 208u32, 224u32), (336, 352, 368)] {
         b.ka_is(s, hk.clone() * Ext::c(ROW as i64));
         b.ka_is(hs, Ext::c(ROW as i64));
-        b.ka_is(bs, sk.clone() * hk.clone() * Ext::c(ROW as i64));
+        b.ka_is(bs, zb(sk.clone() * hk.clone() * Ext::c(ROW as i64)));
     }
     b.ka_is(384, hh.clone() * Ext::c(ROW as i64));
     b.ka_is(400, Ext::c(ROW as i64));
-    b.ka_is(416, sq.clone() * hh.clone() * Ext::c(ROW as i64));
+    b.ka_is(416, zb(sq.clone() * hh.clone() * Ext::c(ROW as i64)));
     b.ka_is(464, sq.clone() * Ext::c(4));
-    b.grid_is(0, sq.clone().ceil_div(128));
-    b.grid_is(1, hh.clone());
+    if cfg.group {
+        b.sym_range("B", 1, 1 << 16);
+        b.grid_is(0, hh.clone());
+        b.grid_is(1, Ext::sym("B"));
+        b.grid_is(2, sq.clone().ceil_div(128));
+        b.arg_tensor("ptr_qseq", (Ext::sym("B") + Ext::c(1)) * Ext::c(4));
+        b.arg_tensor("ptr_kseq", (Ext::sym("B") + Ext::c(1)) * Ext::c(4));
+    } else {
+        b.grid_is(0, sq.clone().ceil_div(128));
+        b.grid_is(1, hh.clone());
+    }
     b.arg_tensor("ptr_q", bb.clone() * sq.clone() * hh.clone() * Ext::c(ROW as i64));
     b.arg_tensor("ptr_o", bb.clone() * sq.clone() * hh.clone() * Ext::c(ROW as i64));
     b.arg_tensor("ptr_k", bb.clone() * sk.clone() * hk.clone() * Ext::c(ROW as i64));
@@ -104,28 +121,64 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
     let (k_seqs, k_hs, k_bs, lse_on, s_kv) = (ki(&mut b, 12), ki(&mut b, 13), ki(&mut b, 14), ki(&mut b, 16), ki(&mut b, 17));
     let (v_seqs, v_hs, v_bs, o_seqs, o_hs, o_bs, lse_hs) = (ki(&mut b, 21), ki(&mut b, 22), ki(&mut b, 23), ki(&mut b, 24), ki(&mut b, 25), ki(&mut b, 26), ki(&mut b, 29));
 
-    let qt = b.let_(Op::WorkgroupIdX);
-    let h = b.let_(Op::WorkgroupIdY);
-    let bat = b.let_(Op::WorkgroupIdZ);
+    let (qt, h, bat) = if cfg.group {
+        (b.let_(Op::WorkgroupIdZ), b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY))
+    } else {
+        (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ))
+    };
+    let (s_q_tot, s_kv_tot) = (s_q, s_kv);
     let lane = Lane::new(&mut b);
     // GQA ratio a power of two <= 16 (the vendor's condition)
     let hkv = gqa_kv_head(&mut b, h, gqa, "HK");
     let hkv = b.read_first_lane(hkv);
+    // group mode: this sequence's row ranges [q0, q0 + SQ_b), [k0, k0 + SK_b) from the cu_seqlens; batch mode: rows from 0
+    let (q0, k0, s_q, s_kv) = if cfg.group {
+        let ld = |b: &mut FnBuilder, off: u32, plus: i32| {
+            let p = b.let_(Op::KernargPtr { offset: off });
+            let o = b.bind_i32((ev(bat) + plus) << 2);
+            let a = b.ptr_add(p, o);
+            let v = b.load_f32(a, 0);
+            let v = b.bitcast_i32(v);
+            b.read_first_lane(v)
+        };
+        let (qa, qb, ka, kb) = (ld(&mut b, 432, 0), ld(&mut b, 432, 1), ld(&mut b, 448, 0), ld(&mut b, 448, 1));
+        for (v, tot, what) in [(qa, Ext::ka(96), "q0"), (ka, Ext::ka(272), "k0")] {
+            b.assume_trusted(v, Ext::c(0), tot, &format!("varlen: cu_seqlens {what} lies in [0, total] (host contract)"));
+        }
+        let sqb = b.bind_i32(ev(qb) - ev(qa));
+        let skb = b.bind_i32(ev(kb) - ev(ka));
+        b.assume_trusted(sqb, Ext::c(0), Ext::ka(96), "varlen: a sequence's query count lies in [0, total_q] (host contract)");
+        b.assume_trusted(skb, Ext::c(0), Ext::ka(272), "varlen: a sequence's key count lies in [0, total_k] (host contract)");
+        (Some(qa), Some(ka), sqb, skb)
+    } else {
+        (None, None, s_q, s_kv)
+    };
+    let rows_add = |b: &mut FnBuilder, base: I32, r0: Option<ValueId>, seqs: ValueId| -> ValueId {
+        match r0 {
+            Some(r) => { let v = b.bind_i32(base + ev(r) * ev(seqs)); b.read_first_lane(v) }
+            None => { let v = b.bind_i32(base); b.read_first_lane(v) }
+        }
+    };
+    // group mode: CTAs past this sequence's queries do nothing
+    let cta_live = cfg.group.then(|| b.bind_cond((ev(qt) << 7).lt(ev(s_q))));
+    if let Some(c) = cta_live {
+        b.begin_if(Opnd::Val(c));
+    }
     // the lane's query row (column of S^T / O^T) and lane half
     let row = b.bind_i32((ev(qt) << 7) + (lane.wave() << 5) + lane.j());
     let half = b.bind_i32(lane.half());
     let row_c = b.bind_i32(ev(row).min(ev(s_q) - 1));
 
     // ---- buffer descriptors (over the batches up to this one: rows past the end of a batch read the next one, masked) ----
-    let desc = |b: &mut FnBuilder, p: ValueId, bs: ValueId| {
-        let n = b.bind_i32((ev(bat) + 1) * ev(bs));
+    let desc = |b: &mut FnBuilder, p: ValueId, bs: ValueId, tot_rows: ValueId, seqs: ValueId| {
+        let n = if cfg.group { b.bind_i32(ev(tot_rows) * ev(seqs)) } else { b.bind_i32((ev(bat) + 1) * ev(bs)) };
         let n = b.read_first_lane(n);
         b.buffer_desc_dyn(p, n)
     };
-    let (r_q, r_k, r_v, r_o) = (desc(&mut b, p_q, q_bs), desc(&mut b, p_k, k_bs), desc(&mut b, p_v, v_bs), desc(&mut b, p_o, o_bs));
+    let (r_q, r_k, r_v, r_o) = (desc(&mut b, p_q, q_bs, s_q_tot, q_seqs), desc(&mut b, p_k, k_bs, s_kv_tot, k_seqs), desc(&mut b, p_v, v_bs, s_kv_tot, v_seqs), desc(&mut b, p_o, o_bs, s_q_tot, o_seqs));
 
     // ---- Q^T fragments: B operand of 32x32x16 bf16, lane (column = query row, k = d 16 c + 8 half + 0..7): 16 bytes at d 16 c + 8 h ----
-    let q_so = { let v = b.bind_i32(ev(bat) * ev(q_bs) + ev(h) * ev(q_hs)); b.read_first_lane(v) };
+    let q_so = rows_add(&mut b, ev(bat) * ev(q_bs) + ev(h) * ev(q_hs), q0, q_seqs);
     let q_vo = b.bind_i32(ev(row_c) * ev(q_seqs) + (ev(half) << 4));
     let qf: Vec<ValueId> = (0..D / 16).map(|c| b.buffer_load_b128(r_q, q_vo, q_so, (32 * c) as u32)).collect();
 
@@ -137,8 +190,8 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
     // DMA: per tile 128 D bytes = D / 8 blocks of 1 KB; wave w issues blocks 4 i + w (i < D / 32): keys kpb (4 i + w) + lane / cpr (kpb = 1 KB / row
     // bytes), 16-byte chunk lane % cpr. K: the source chunk is the LDS position XOR (key & swz) (the reader's swizzle); V: plain.
     let (kpb, n_iss) = (512 / D, D / 32);
-    let kv_so0 = |b: &mut FnBuilder, bs: ValueId, hs: ValueId| { let v = b.bind_i32(ev(bat) * ev(bs) + ev(hkv) * ev(hs)); b.read_first_lane(v) };
-    let (k_so0, v_so0) = (kv_so0(&mut b, k_bs, k_hs), kv_so0(&mut b, v_bs, v_hs));
+    let k_so0 = rows_add(&mut b, ev(bat) * ev(k_bs) + ev(hkv) * ev(k_hs), k0, k_seqs);
+    let v_so0 = rows_add(&mut b, ev(bat) * ev(v_bs) + ev(hkv) * ev(v_hs), k0, v_seqs);
     let lc = b.bind_i32(lane.lane() & (cpr - 1));
     let key_of = |b: &mut FnBuilder, i: i32| b.bind_i32((lane.wave() + 4 * i) * kpb + lane.lane().lshr(cpr.trailing_zeros() as i32));
     let k_vo: Vec<ValueId> = (0..n_iss)
@@ -349,7 +402,7 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
     let (la, lb) = (b.bitcast_f32(la), b.bitcast_f32(lb));
     let l_tot = b.add_f32(la, lb);
     let inv = b.rcp_f32(l_tot);
-    let o_so = { let v = b.bind_i32(ev(bat) * ev(o_bs) + ev(h) * ev(o_hs)); b.read_first_lane(v) };
+    let o_so = rows_add(&mut b, ev(bat) * ev(o_bs) + ev(h) * ev(o_hs), q0, o_seqs);
     // rows past the sequence: an offset past the descriptor (the store is dropped)
     let live = b.bind_cond(ev(row).lt(ev(s_q)));
     let o_vo_r = b.bind_i32(ev(row) * ev(o_seqs) + (ev(half) << 3));
@@ -378,14 +431,20 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
         let ln2 = b.c_f32(std::f32::consts::LN_2);
         let lse = b.mul_f32(x, ln2);
         let hq = b.let_(Op::KernargI32 { offset: 320 });
-        let n = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(lse_hs));
+        let n = if cfg.group { b.bind_i32(ev(hq) * ev(lse_hs)) } else { b.bind_i32((ev(bat) + 1) * ev(hq) * ev(lse_hs)) };
         let n = b.read_first_lane(n);
         let r_l = b.buffer_desc_dyn(p_lse, n);
-        let so = { let v = b.bind_i32((ev(bat) * ev(hq) + ev(h)) * ev(lse_hs)); b.read_first_lane(v) };
+        let so = match q0 {
+            Some(r) => { let v = b.bind_i32(ev(h) * ev(lse_hs) + (ev(r) << 2)); b.read_first_lane(v) }
+            None => { let v = b.bind_i32((ev(bat) * ev(hq) + ev(h)) * ev(lse_hs)); b.read_first_lane(v) }
+        };
         let vo_r = b.bind_i32(ev(row) << 2);
         let vo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(vo_r), b: Opnd::Val(big) });
         b.buffer_store_f32(r_l, vo, so, 0, lse);
     }
     b.end_if();
+    if cta_live.is_some() {
+        b.end_if();
+    }
     b.finish()
 }
