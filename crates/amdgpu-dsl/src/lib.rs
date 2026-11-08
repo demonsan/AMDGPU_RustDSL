@@ -3123,6 +3123,7 @@ fn check_region_marks(f: &Function, errs: &mut Vec<String>) {
 pub fn verify(f: &Function) -> Vec<String> {
     let mut errs = Vec::new();
     check_var_slices(f, &mut errs);
+    check_uniform_branches(f, &mut errs);
     check_region_marks(f, &mut errs);
 
     // Region stack: values visible in the current scope.
@@ -4130,6 +4131,107 @@ fn check_var_slices(f: &Function, errs: &mut Vec<String>) {
                     *stale = true;
                 }
             }
+        }
+    }
+}
+
+/// Wave-uniform values (a conservative forward analysis): constants, kernel arguments, workgroup ids, `workitem_id >> k` (k >= 6: one value
+/// per 64-lane wave of a 1-D workgroup), `readfirstlane` / `readlane` / `ballot`, and pure ops / loads whose operands are all uniform (a load
+/// from a uniform address returns the same value in every lane); loop variables whose initial value and every write are uniform.
+pub fn uniform_values(f: &Function) -> (std::collections::HashSet<ValueId>, std::collections::HashSet<VarId>) {
+    use std::collections::HashSet;
+    let stmts = f.stmts();
+    let mut uvars: HashSet<VarId> = (0..f.var_tys.len() as u32).map(VarId).collect();
+    loop {
+        let mut u: HashSet<ValueId> = HashSet::new();
+        let mut wid: HashSet<ValueId> = HashSet::new();
+        let mut consts: std::collections::HashMap<ValueId, i32> = std::collections::HashMap::new();
+        let is_u = |o: &Opnd, u: &HashSet<ValueId>, uv: &HashSet<VarId>| match o {
+            Opnd::I32(_) | Opnd::F32(_) => true,
+            Opnd::Val(v) => u.contains(v),
+            Opnd::Var(v) => uv.contains(v),
+        };
+        let mut changed = false;
+        for st in stmts {
+            match st {
+                Stmt::Let { dst, op } => {
+                    if let Op::ConstI32(k) = op {
+                        consts.insert(*dst, *k);
+                    }
+                    let uni = match op {
+                        Op::WorkitemId => {
+                            wid.insert(*dst);
+                            false
+                        }
+                        Op::LshrI32(Opnd::Val(a), b) if wid.contains(a) => match b {
+                            Opnd::I32(k) => *k >= 6,
+                            Opnd::Val(v) => consts.get(v).map_or(false, |k| *k >= 6),
+                            _ => false,
+                        },
+                        Op::ReadFirstLane(_) | Op::ReadLane { .. } | Op::Ballot { .. } => true,
+                        // per-lane by construction (lane permutes, matrix results, atomics' per-lane old values, asm)
+                        Op::Dpp { .. } | Op::DppAlu { .. } | Op::DppQuadPerm { .. } | Op::Permlane32Swap { .. } | Op::Permlane16Swap { .. }
+                        | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } | Op::WriteLane { .. } | Op::PartnerMaxF32(..)
+                        | Op::MfmaF16 { .. } | Op::MfmaF16Wide { .. } | Op::MfmaScaleFp8_32x32x64 { .. } | Op::MfmaFp8_32x32x64 { .. }
+                        | Op::SmfmacFp8_16x16x128 { .. } | Op::Mfma { .. } | Op::AtomicLds { .. } | Op::AtomicGlobal { .. } | Op::AtomicAddU32 { .. }
+                        | Op::Asm { .. } | Op::LoadLdsTrB8 { .. } | Op::LoadLdsTr4B8 { .. } | Op::LoadLdsTrB16 { .. } => false,
+                        _ => op.operands().iter().all(|o| is_u(o, &u, &uvars)),
+                    };
+                    if uni {
+                        u.insert(*dst);
+                    }
+                }
+                Stmt::BeginLoop { vars, init } => {
+                    for (v, i) in vars.iter().zip(init.iter()) {
+                        if uvars.contains(v) && !is_u(i, &u, &uvars) {
+                            uvars.remove(v);
+                            changed = true;
+                        }
+                    }
+                }
+                Stmt::SetVar { var, value } => {
+                    if uvars.contains(var) && !is_u(value, &u, &uvars) {
+                        uvars.remove(var);
+                        changed = true;
+                    }
+                }
+                _ => {
+                    for w in stmt_var_writes(st) {
+                        if uvars.remove(&w) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            return (u, uvars);
+        }
+    }
+}
+
+/// `break_if` and `begin_if` branch on the WAVE (`s_cbranch_vccnz` / scalar compare): a per-lane condition would exit / skip for the whole wave
+/// when ANY lane's condition holds, silently running the wrong trip count. Every branch condition must be wave-uniform.
+fn check_uniform_branches(f: &Function, errs: &mut Vec<String>) {
+    let (u, uv) = uniform_values(f);
+    for (idx, st) in f.stmts().iter().enumerate() {
+        let (cond, what) = match st {
+            Stmt::BreakIf { cond } => (cond, "break_if"),
+            Stmt::BeginIf { cond } => (cond, "if"),
+            _ => continue,
+        };
+        let ok = match cond {
+            Opnd::I32(_) | Opnd::F32(_) => true,
+            Opnd::Val(v) => u.contains(v),
+            Opnd::Var(v) => uv.contains(v),
+        };
+        if !ok {
+            errs.push(format!(
+                "stmt {idx}: {what} condition {cond:?} is not provably wave-uniform: DSL branches are wave-level (the whole wave branches when ANY \
+                 lane's condition holds), so a per-lane condition silently runs the wrong trip count / skips lanes that should run. Use wave-uniform \
+                 bounds (kernel arguments, workgroup ids, readfirstlane / readlane / ballot results) and predicate the per-lane work instead (select, \
+                 masked buffer offsets)"
+            ));
         }
     }
 }
