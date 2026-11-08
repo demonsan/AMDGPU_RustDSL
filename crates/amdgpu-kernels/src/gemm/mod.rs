@@ -326,6 +326,9 @@ struct Body {
     npre_done: usize,
     /// timing stamps (GEMM_STAMP=ends|tiles): debug buffer, this wave's record offset, per-tile stamps
     stamp: Option<(ValueId, ValueId, bool)>,
+    /// `Scales::RowCol`: the unit E8M0 scale words as VGPR values (lane / 64 = 0 keeps them vector: a wave-uniform constant would be held in an
+    /// SGPR and copied to a VGPR before every scaled MFMA, with a VALU -> MFMA wait)
+    unit: Option<(ValueId, ValueId)>,
     /// register-staged tile: initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
     staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, ValueId)>,
     rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, VarId)>,
@@ -357,8 +360,8 @@ impl Body {
     fn load_scales(&self, b: &mut FnBuilder, kb: I32) -> (Vec<ValueId>, ValueId) {
         if self.cfg.scales == Scales::RowCol {
             // unit E8M0 scales (127 in every byte): the fp32 row / column scales are applied in the epilogue
-            let u = b.c_i32(0x7F7F_7F7F);
-            return (vec![u, u], b.c_i32(0x7F));
+            let (u, v) = self.unit.expect("unit scales");
+            return (vec![u, u], v);
         }
         // K group of a real tile (t + 1 is read only when it exists): the clamp is a no-op that bounds it for the verifier's loop-exit-blind intervals
         let kb = b.bind_i32(kb.lt(ev(self.kb_v)).select_i32(kb.clone(), ev(self.kb_v) - 1));
@@ -830,9 +833,10 @@ impl skeleton_v4::V4Slots for GemmSlots {
     a_rd.bases = a_rd.bases.iter().map(|x| b.let_i32(x + &a_wo)).collect();
     b_rd.bases = b_rd.bases.iter().map(|x| b.let_i32(x + &b_wo)).collect();
     let zero4 = b.frag_zero(DType::Frag4);
+    let unit = (cfg.scales == Scales::RowCol).then(|| (b.bind_i32(lane.lane().lshr(6) + 0x7F7F_7F7F), b.bind_i32(lane.lane().lshr(6) + 0x7F)));
     let body = Body {
         cfg, kb_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit,
     };
         GemmCx { cfg, body, pipe: Some(pipe), ctx, mma, epi, lane, s_lane, s_n, s_wm, s_wn, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx }
     }
