@@ -137,7 +137,7 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     let csc = b.mul_f32(scale, c_l2e);
     let neg_inf = b.c_f32(f32::NEG_INFINITY);
     let kind = MmaKind::new(MmaShape::M32N32K16, MmaTy::Bf16);
-    let tm = Tm { d: D, kind, csc, neg_inf, kr, vr, qf };
+    let tm = Tm { d: D, kind, csc, neg_inf, kr, vr, qf, nsb: 2 };
     let zero16 = b.frag_zero(DType::Frag16);
     let m_init = b.c_f32(-1.0e30);
     let l_init = b.c_f32(0.0);
@@ -153,13 +153,19 @@ pub fn pa_decode_bf16_hd128(name: &str, page: i32) -> Function {
     let key_t = { let v = b.bind_i32(ev(k_lo) + (itx.clone() << 6)); b.read_first_lane(v) };
     // ---- DMA the tile's K and V rows through the block table ----
     b.wait_lds(0);
-    me.write(&mut b, Opnd::Var(it), |b| {
-        for i in 0..16 {
+    // the 16 block-table lookups first (one round trip), then the 32 DMAs
+    let lookups: Vec<(ValueId, ValueId)> = (0..16)
+        .map(|i| {
             let key = b.bind_i32(ev(key_t) + kk_of(i));
             // the page of the (clamped) key: rows past the context read a valid page, masked
             let kc = b.bind_i32(ev(key).min(ev(k_hi) - 1).max(0).min(ev(maxk)));
             let bvo = b.bind_i32(ev(kc).lshr(page.trailing_zeros() as i32) << 2);
-            let pv = b.buffer_load_f32(r_bt, bvo, bt_so, 0);
+            (kc, b.buffer_load_f32(r_bt, bvo, bt_so, 0))
+        })
+        .collect();
+    me.write(&mut b, Opnd::Var(it), |b| {
+        for (i, &(kc, pv)) in lookups.iter().enumerate() {
+            let i = i as i32;
             let pg = b.bitcast_i32(pv);
             let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
             let rowoff = b.bind_i32(((ev(pg) * page + (ev(kc) & (page - 1))) * ev(hkv_n) + ev(hk)) * ROW);

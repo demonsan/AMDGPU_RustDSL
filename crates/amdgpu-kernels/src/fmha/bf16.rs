@@ -272,7 +272,7 @@ pub fn fmha_fwd_bf16(name: &str, cfg: AttnCfg) -> Function {
     let neg_inf = b.c_f32(f32::NEG_INFINITY);
     let kind = MmaKind::new(MmaShape::M32N32K16, MmaTy::Bf16);
     let zero16 = b.frag_zero(DType::Frag16);
-    let tm = Tm { d: D, kind, csc, neg_inf, kr: kr.clone(), vr: vr.clone(), qf: qf.clone() };
+    let tm = Tm { d: D, kind, csc, neg_inf, kr: kr.clone(), vr: vr.clone(), qf: qf.clone(), nsb: 2 };
     let m_init = b.c_f32(-1.0e30);
     let l_init = b.c_f32(0.0);
 
@@ -387,6 +387,8 @@ pub(crate) struct Tm {
     pub csc: ValueId,
     pub neg_inf: ValueId,
     /// per-lane LDS offsets of the K A-operand reads (one per 16-dim chunk) and of the V^T 16-bit reads (one per k slot)
+    /// 32-key blocks per tile (2: 64-key tiles; 1: 32-key tiles)
+    pub nsb: usize,
     pub kr: Vec<ValueId>,
     pub vr: Vec<ValueId>,
     /// Q^T fragments (B operand), one per 16-dim chunk
@@ -409,7 +411,7 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, mask
     // ---- S^T = K Q^T: 2 blocks of 32 keys, D / 16 MFMAs each ----
     // (into the S^T variables: the mask below updates them in place under a branch that holds no LDS access)
     kscope(b, &mut |b| {
-        for sb in 0..2usize {
+        for sb in 0..tm.nsb {
             for c in 0..(D / 16) as usize {
                 let a = b.bind_i32(ev(tm.kr[c]) + kbase.clone() + sb as i32 * 32 * ROW);
                 let kf = b.load_lds_b128(a);
@@ -421,7 +423,7 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, mask
         if let Some(c) = when {
             b.begin_if(Opnd::Val(c));
         }
-        for sb in 0..2usize {
+        for sb in 0..tm.nsb {
             for r in 0..16u8 {
                 let off = 32 * sb as i32 + 8 * (r as i32 / 4) + (r as i32 % 4);
                 let x = b.frag16_lane(Opnd::Var(sv_vars[sb]), r);
@@ -437,7 +439,7 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, mask
     }
     // ---- online softmax over the 64 keys (lane: one query, values = keys 32 sb + 8 (r / 4) + 4 h + r % 4) ----
     let mut sv: Vec<ValueId> = Vec::with_capacity(32);
-    for sb in 0..2usize {
+    for sb in 0..tm.nsb {
         for r in 0..16u8 {
             let x = b.frag16_lane(Opnd::Var(sv_vars[sb]), r);
             sv.push(b.bitcast_f32(x));
@@ -490,7 +492,7 @@ pub(crate) fn tile_math(b: &mut FnBuilder, tm: &Tm, kbase: I32, vbase: I32, mask
     b.set_var(l_v, l_new);
     // ---- O^T += V^T P^T: 4 steps of 16 keys x D / 32 blocks of 32 d ----
     vscope(b, &mut |b| {
-        for t in 0..4usize {
+        for t in 0..2 * tm.nsb {
             let (sb, tt) = (t / 2, t % 2);
             // P^T (B operand): k slots = values 8 tt + 0..7 of block sb
             let i0 = 16 * sb + 8 * tt;
