@@ -933,7 +933,7 @@ impl Body {
         if !pend.is_empty() {
             u.capture(b, "bs.fma", |b| bs_fma(b, &pend));
         }
-        if let Some((sa, sb)) = early {
+        if let (Some((sa, sb)), false) = (early, self.regb.is_some() && std::env::var("EXP_NOINST").is_ok()) {
             u.capture(b, "scales.install", |b| {
                 for (i, v) in sa.iter().enumerate() {
                     let w = self.scale_word(b, *v);
