@@ -1,7 +1,7 @@
 // MXFP4 fused-MoE host: ours gemm_moe1_fp4_<act>[_bm64] + gemm_moe2_fp4[_bm64] + moe_sum_bf16_k<TOPK> on aiter-style sorted routes.
 // X [M][D] and W1 [E][2I][D], W2 [E][D][I] are fp4 e2m1 codes with 1 x 32 E8M0 scales (random, exact data); the stage-1 output is
 // re-quantized to MXFP4 on the host (aiter rule) for stage 2. CPU references: stage 1 on the exact data, stage 2 on the uploaded bytes.
-//   moe_fp4_host <co_dir> M D I E TOPK      env: BLOCK_M (128 | 64), ITERS (20), SEED (1), CHECK (tokens checked, 16)
+//   moe_fp4_host <co_dir> M D I E TOPK   (D % 1024 == 0, I % 256 == 0)   env: BLOCK_M (128 | 64), ITERS (20), SEED (1), CHECK (tokens checked, 16)
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
     Mx YQ{yq, ys, M * TK, I};
     // ---- stage 2 + sum + check ----
     launch(f2, a2, D / 128, nblk);
-    launch(fs, as, M, 1);
+    launch(fs, as, D / 1024, M);
     HC(hipDeviceSynchronize());
     std::vector<uint16_t> out((size_t)M * D);
     HC(hipMemcpy(out.data(), dO, out.size() * 2, hipMemcpyDeviceToHost));
@@ -172,11 +172,11 @@ int main(int argc, char** argv) {
     // ---- timing (stage 1; stage 2 + sum) ----
     hipEvent_t e0, e1, e2;
     HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1)); HC(hipEventCreate(&e2));
-    for (int i = 0; i < 3; i++) { launch(f1, a1, 2 * I / 256, nblk); launch(f2, a2, D / 128, nblk); launch(fs, as, M, 1); }
+    for (int i = 0; i < 3; i++) { launch(f1, a1, 2 * I / 256, nblk); launch(f2, a2, D / 128, nblk); launch(fs, as, D / 1024, M); }
     HC(hipEventRecord(e0));
     for (int i = 0; i < iters; i++) launch(f1, a1, 2 * I / 256, nblk);
     HC(hipEventRecord(e1));
-    for (int i = 0; i < iters; i++) { launch(f2, a2, D / 128, nblk); launch(fs, as, M, 1); }
+    for (int i = 0; i < iters; i++) { launch(f2, a2, D / 128, nblk); launch(fs, as, D / 1024, M); }
     HC(hipEventRecord(e2)); HC(hipEventSynchronize(e2));
     float ms1, ms2; HC(hipEventElapsedTime(&ms1, e0, e1)); HC(hipEventElapsedTime(&ms2, e1, e2));
     double us1 = 1e3 * ms1 / iters, us2 = 1e3 * ms2 / iters, fl1 = 2.0 * M * TK * 2 * I * D, fl2 = 2.0 * M * TK * D * I;
