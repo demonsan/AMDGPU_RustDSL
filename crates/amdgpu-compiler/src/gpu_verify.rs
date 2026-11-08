@@ -871,6 +871,15 @@ impl<'a> An<'a> {
                 _ => AV::Ptr { arg: None, off: Itv::top() },
             },
             Op::LoadU16 { .. } => AV::Int(Itv::range(Poly::int(0), Poly::int(65535))),
+            // P1 narrow loads: their value ranges (indices / scale bytes read from memory are still bounded by the width)
+            Op::LoadGlobalN { ty, .. } | Op::BufferLoadN { ty, .. } | Op::LoadLdsN { ty, .. } => match ty {
+                amdgpu_dsl::MemTy::U8 => AV::Int(Itv::range(Poly::int(0), Poly::int(255))),
+                amdgpu_dsl::MemTy::I8 => AV::Int(Itv::range(Poly::int(-128), Poly::int(127))),
+                amdgpu_dsl::MemTy::U16 => AV::Int(Itv::range(Poly::int(0), Poly::int(65535))),
+                amdgpu_dsl::MemTy::I16 => AV::Int(Itv::range(Poly::int(-32768), Poly::int(32767))),
+                amdgpu_dsl::MemTy::B32 => AV::Int(Itv::top()),
+                _ => AV::Other,
+            },
             Op::BufferRsrc { base, num_records } => {
                 let arg = match self.av_of(base) {
                     AV::Ptr { arg, off } if off.point_const().map_or(false, |q| q.is_zero()) => arg,
@@ -949,7 +958,35 @@ impl<'a> An<'a> {
                 }
             }
             Op::BufferRsrc { .. } | Op::BufferRsrcDyn { .. } => {}
+            // P1 memory loads
+            Op::LoadGlobalN { base, byte_off, ty, .. } => {
+                let b = self.av_of(base);
+                self.check_global("global load", &b, *byte_off as i128, ty.bytes() as i128, false);
+            }
+            Op::LoadGlobalD16 { base, byte_off, ty, .. } => {
+                let b = self.av_of(base);
+                self.check_global("global load d16", &b, *byte_off as i128, ty.bytes() as i128, false);
+            }
+            Op::BufferLoadN { rsrc, voff, soff, imm, ty, .. } => {
+                let r = self.av_of(rsrc);
+                self.check_buffer("buffer load", &r, voff, soff, *imm as i128, ty.bytes() as i128, false);
+            }
+            Op::LoadLdsN { addr, ty } => self.check_lds_at("ds_read", addr, ty.bytes() as i128),
+            Op::LoadLdsD16 { addr, ty, .. } => self.check_lds_at("ds_read d16", addr, ty.bytes() as i128),
+            Op::LoadLdsTrB16 { addr } => self.check_lds_at("ds_read_b64_tr_b16", addr, 8),
+            Op::LoadLds2 { addr, off0, off1, b64, st64 } => self.check_lds2("ds_read2", addr, *off0, *off1, *b64, *st64),
             _ => {}
+        }
+    }
+
+    /// Both elements of a two-address DS access (`addr + off * stride`, stride = element size, x 64 for st64).
+    fn check_lds2(&mut self, what: &str, addr: &Opnd, off0: u8, off1: u8, b64: bool, st64: bool) {
+        let eb: i128 = if b64 { 8 } else { 4 };
+        let stride = eb * if st64 { 64 } else { 1 };
+        for o in [off0, off1] {
+            self.cur_addr = Some((*addr, o as i128 * stride));
+            let a = self.int_of(addr).add_const(o as i128 * stride);
+            self.check_lds(what, &a, eb);
         }
     }
 
@@ -1316,6 +1353,16 @@ impl<'a> An<'a> {
             Stmt::StoreLdsB32 { addr, .. } => self.check_lds_at("ds_write_b32", addr, 4),
             Stmt::StoreLdsB128 { addr, .. } => self.check_lds_at("ds_write_b128", addr, 16),
         Stmt::StoreLdsB64 { addr, .. } => self.check_lds_at("ds_write_b64", addr, 8),
+            Stmt::StoreGlobalN { base, byte_off, ty, .. } => {
+                let b = self.av_of(base);
+                self.check_global("global store", &b, *byte_off as i128, ty.bytes() as i128, true)
+            }
+            Stmt::BufferStoreN { rsrc, voff, soff, imm, ty, .. } => {
+                let r = self.av_of(rsrc);
+                self.check_buffer("buffer store", &r, voff, soff, *imm as i128, ty.bytes() as i128, true);
+            }
+            Stmt::StoreLdsN { addr, ty, .. } => self.check_lds_at("ds_write", addr, ty.bytes() as i128),
+            Stmt::StoreLds2 { addr, off0, off1, b64, st64, .. } => self.check_lds2("ds_write2", addr, *off0, *off1, *b64, *st64),
             Stmt::BeginLoop { .. } => unreachable!("loops are walked by `walk_loop`"),
             Stmt::SetVar { var, value } => {
                 let nv = self.int_of(value);
@@ -1885,12 +1932,16 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
         Stmt::StoreU16 { .. } | Stmt::StoreF32 { .. } | Stmt::StoreF32x4 { .. } | Stmt::StoreF32x2 { .. } | Stmt::BufferStore { .. } | Stmt::StoreF32Wt { .. } => (1, 0),
         Stmt::BufferLoadLds { .. } | Stmt::LoadGlobalLds { .. } => (1, 0),
         Stmt::StoreLdsB32 { .. } | Stmt::StoreLdsB128 { .. } | Stmt::StoreLdsB64 { .. } => (0, 1),
+        Stmt::StoreGlobalN { .. } | Stmt::BufferStoreN { .. } => (1, 0),
+        Stmt::StoreLdsN { .. } | Stmt::StoreLds2 { .. } => (0, 1),
         Stmt::Let { op, .. } => match op {
             Op::LoadU16 { .. } | Op::LoadF32 { .. } | Op::LoadGlobalB128 { .. } | Op::LoadF32Coherent { .. } | Op::BufferLoad { .. } => (1, 0),
             Op::BufferLoadB128x2 { .. } => (2, 0),
             Op::LoadLdsB32 { .. } | Op::LoadLdsB128 { .. } | Op::LoadLdsB64 { .. } | Op::LoadLdsTrB8 { .. } => (0, 1),
             Op::LoadLdsB128x2 { .. } => (0, 2),
             Op::LoadLdsTr4B8 { .. } => (0, 4),
+            Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => (1, 0),
+            Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } => (0, 1),
             _ => (0, 0),
         },
         _ => (0, 0),

@@ -229,7 +229,33 @@ fn mem_op(a: &Alloc, base: Src, off: i64) -> String {
     }
 }
 
+/// ` sc0 sc1 nt` cache-policy modifiers of a global / buffer access (`MInst::cpol`, LLVM CPol bits).
+fn cpol_suffix(c: u8) -> String {
+    let mut s = String::new();
+    if c & 1 != 0 {
+        s += " sc0";
+    }
+    // LLVM's order: sc0 nt sc1
+    if c & 2 != 0 {
+        s += " nt";
+    }
+    if c & 16 != 0 {
+        s += " sc1";
+    }
+    s
+}
+
 fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
+    let mut v = inst_lines_core(a, inst);
+    if inst.cpol != 0 {
+        if let Some(last) = v.last_mut() {
+            last.push_str(&cpol_suffix(inst.cpol));
+        }
+    }
+    v
+}
+
+fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
     let d = |a: &Alloc| vr(a, inst.dst.expect("dst"));
     match inst.op {
         MOp::VAccvgprRead => vec![format!("v_accvgpr_read_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],
@@ -556,6 +582,54 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
                 vr(a, reg_of(&inst.srcs[4]))
             )]
         }
+        MOp::VMfma16x16x32Bf16 => vec![format!("v_mfma_f32_16x16x32_bf16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 4))],
+        MOp::VMfma16x16x32Bf16Z => vec![format!("v_mfma_f32_16x16x32_bf16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfma32x32x16Bf16 => vec![format!("v_mfma_f32_32x32x16_bf16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 16))],
+        MOp::VMfma32x32x16Bf16Z => vec![format!("v_mfma_f32_32x32x16_bf16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfma16x16x32F16 => vec![format!("v_mfma_f32_16x16x32_f16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 4))],
+        MOp::VMfma16x16x32F16Z => vec![format!("v_mfma_f32_16x16x32_f16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfma32x32x16F16 => vec![format!("v_mfma_f32_32x32x16_f16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 16))],
+        MOp::VMfma32x32x16F16Z => vec![format!("v_mfma_f32_32x32x16_f16 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfma16x16x64I8 => vec![format!("v_mfma_i32_16x16x64_i8 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 4))],
+        MOp::VMfma16x16x64I8Z => vec![format!("v_mfma_i32_16x16x64_i8 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfma32x32x32I8 => vec![format!("v_mfma_i32_32x32x32_i8 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 16))],
+        MOp::VMfma32x32x32I8Z => vec![format!("v_mfma_i32_32x32x32_i8 {}, {}, {}, {}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string())],
+        MOp::VMfmaScale16x16x128A4B4 => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 4), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A4B4Z => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A4B6 => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 6), tuple(a, reg_of(&inst.srcs[2]), 4), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A4B6Z => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 6), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A4B8 => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 8), tuple(a, reg_of(&inst.srcs[2]), 4), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A4B8Z => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 8), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A6B4 => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 4), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A6B4Z => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A6B6 => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 6), tuple(a, reg_of(&inst.srcs[2]), 4), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A6B6Z => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 6), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A6B8 => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 8), tuple(a, reg_of(&inst.srcs[2]), 4), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A6B8Z => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 8), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A8B4 => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 4), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A8B4Z => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A8B6 => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 6), tuple(a, reg_of(&inst.srcs[2]), 4), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A8B6Z => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 6), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A8B8 => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 8), tuple(a, reg_of(&inst.srcs[2]), 4), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale16x16x128A8B8Z => vec![format!("v_mfma_scale_f32_16x16x128_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 4), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 8), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A4B4 => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 16), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A4B4Z => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A4B6 => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 6), tuple(a, reg_of(&inst.srcs[2]), 16), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A4B6Z => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 6), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A4B8 => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 8), tuple(a, reg_of(&inst.srcs[2]), 16), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A4B8Z => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 4), tuple(a, reg_of(&inst.srcs[1]), 8), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A6B4 => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 16), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A6B4Z => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A6B6 => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 6), tuple(a, reg_of(&inst.srcs[2]), 16), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A6B6Z => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 6), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A6B8 => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 8), tuple(a, reg_of(&inst.srcs[2]), 16), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A6B8Z => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 6), tuple(a, reg_of(&inst.srcs[1]), 8), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A8B4 => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 4), tuple(a, reg_of(&inst.srcs[2]), 16), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A8B4Z => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 4), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A8B6 => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 6), tuple(a, reg_of(&inst.srcs[2]), 16), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A8B6Z => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 6), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A8B8 => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 8), tuple(a, reg_of(&inst.srcs[2]), 16), vr(a, reg_of(&inst.srcs[3])), vr(a, reg_of(&inst.srcs[4])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
+        MOp::VMfmaScale32x32x64A8B8Z => vec![format!("v_mfma_scale_f32_32x32x64_f8f6f4 {}, {}, {}, {}, {}, {}{}{}", tuple(a, inst.dst.expect("dst"), 16), tuple(a, reg_of(&inst.srcs[0]), 8), tuple(a, reg_of(&inst.srcs[1]), 8), "0".to_string(), vr(a, reg_of(&inst.srcs[2])), vr(a, reg_of(&inst.srcs[3])), scale_opsel(inst.imm), f8f6f4_fmt(inst.imm))],
         MOp::VSmfmac16x16x128Fp8 => {
             // D (4) += sparse A (4) x dense B (8); SRC2 is the sparse-index dword.
             let a_reg = reg_of(&inst.srcs[0]);
@@ -606,6 +680,56 @@ fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
                 tuple(a, c_reg, 4)
             )]
         }
+        MOp::GlobalLoadU8 => vec![format!("global_load_ubyte {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadI8 => vec![format!("global_load_sbyte {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadI16 => vec![format!("global_load_sshort {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadB64 => vec![format!("global_load_dwordx2 {}, {}", tuple(a, inst.dst.expect("dst"), 2), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadB96 => vec![format!("global_load_dwordx3 {}, {}", tuple(a, inst.dst.expect("dst"), 3), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16U8 => vec![format!("global_load_ubyte_d16 {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16U8Hi => vec![format!("global_load_ubyte_d16_hi {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16I8 => vec![format!("global_load_sbyte_d16 {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16I8Hi => vec![format!("global_load_sbyte_d16_hi {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16B16 => vec![format!("global_load_short_d16 {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalLoadD16B16Hi => vec![format!("global_load_short_d16_hi {}, {}", d(a), mem_op(a, inst.srcs[0], inst.imm))],
+        MOp::GlobalStoreB8 => vec![format!("global_store_byte {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalStoreB8Hi => vec![format!("global_store_byte_d16_hi {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalStoreB16Hi => vec![format!("global_store_short_d16_hi {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), vr(a, reg_of(&inst.srcs[1])), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::GlobalStoreB96 => vec![format!("global_store_dwordx3 {}, {}, off{}", pair(a, reg_of(&inst.srcs[0])), tuple(a, reg_of(&inst.srcs[1]), 3), if inst.imm == 0 { String::new() } else { format!(" offset:{}", inst.imm) })],
+        MOp::BufferLoadU8 => vec![format!("buffer_load_ubyte {}, {}", d(a), mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))],
+        MOp::BufferLoadI8 => vec![format!("buffer_load_sbyte {}, {}", d(a), mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))],
+        MOp::BufferLoadU16 => vec![format!("buffer_load_ushort {}, {}", d(a), mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))],
+        MOp::BufferLoadI16 => vec![format!("buffer_load_sshort {}, {}", d(a), mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))],
+        MOp::BufferLoadB96 => vec![format!("buffer_load_dwordx3 {}, {}", tuple(a, inst.dst.expect("dst"), 3), mubuf_tail(a, &inst.srcs[0], &inst.srcs[1], &inst.srcs[2], inst.imm, false))],
+        MOp::BufferStoreB8 => vec![format!("buffer_store_byte {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
+        MOp::BufferStoreB16 => vec![format!("buffer_store_short {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
+        MOp::BufferStoreB8Hi => vec![format!("buffer_store_byte_d16_hi {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
+        MOp::BufferStoreB16Hi => vec![format!("buffer_store_short_d16_hi {}, {}", vr(a, reg_of(&inst.srcs[0])), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
+        MOp::BufferStoreB96 => vec![format!("buffer_store_dwordx3 {}, {}", tuple(a, reg_of(&inst.srcs[0]), 3), mubuf_tail(a, &inst.srcs[1], &inst.srcs[2], &inst.srcs[3], inst.imm, false))],
+        MOp::LdsReadU8 => vec![format!("ds_read_u8 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadI8 => vec![format!("ds_read_i8 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadU16 => vec![format!("ds_read_u16 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadI16 => vec![format!("ds_read_i16 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadB96 => vec![format!("ds_read_b96 {}, {}{}", tuple(a, inst.dst.expect("dst"), 3), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadB64TrB16 => vec![format!("ds_read_b64_tr_b16 {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16U8 => vec![format!("ds_read_u8_d16 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16U8Hi => vec![format!("ds_read_u8_d16_hi {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16I8 => vec![format!("ds_read_i8_d16 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16I8Hi => vec![format!("ds_read_i8_d16_hi {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16B16 => vec![format!("ds_read_u16_d16 {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsReadD16B16Hi => vec![format!("ds_read_u16_d16_hi {}, {}{}", d(a), src1(a, inst.srcs[0]), lds_off(inst.imm))],
+        MOp::LdsWriteB8 => vec![format!("ds_write_b8 {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), lds_off(inst.imm))],
+        MOp::LdsWriteB16 => vec![format!("ds_write_b16 {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), lds_off(inst.imm))],
+        MOp::LdsWriteB8Hi => vec![format!("ds_write_b8_d16_hi {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), lds_off(inst.imm))],
+        MOp::LdsWriteB16Hi => vec![format!("ds_write_b16_d16_hi {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), lds_off(inst.imm))],
+        MOp::LdsWriteB96 => vec![format!("ds_write_b96 {}, {}{}", src1(a, inst.srcs[0]), tuple(a, reg_of(&inst.srcs[1]), 3), lds_off(inst.imm))],
+        MOp::LdsRead2B32 => vec![format!("ds_read2_b32 {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), lds_off2(inst.imm))],
+        MOp::LdsRead2B64 => vec![format!("ds_read2_b64 {}, {}{}", tuple(a, inst.dst.expect("dst"), 4), src1(a, inst.srcs[0]), lds_off2(inst.imm))],
+        MOp::LdsRead2St64B32 => vec![format!("ds_read2st64_b32 {}, {}{}", tuple(a, inst.dst.expect("dst"), 2), src1(a, inst.srcs[0]), lds_off2(inst.imm))],
+        MOp::LdsRead2St64B64 => vec![format!("ds_read2st64_b64 {}, {}{}", tuple(a, inst.dst.expect("dst"), 4), src1(a, inst.srcs[0]), lds_off2(inst.imm))],
+        MOp::LdsWrite2B32 => vec![format!("ds_write2_b32 {}, {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), vr(a, reg_of(&inst.srcs[2])), lds_off2(inst.imm))],
+        MOp::LdsWrite2B64 => vec![format!("ds_write2_b64 {}, {}, {}{}", src1(a, inst.srcs[0]), tuple(a, reg_of(&inst.srcs[1]), 2), tuple(a, reg_of(&inst.srcs[2]), 2), lds_off2(inst.imm))],
+        MOp::LdsWrite2St64B32 => vec![format!("ds_write2st64_b32 {}, {}, {}{}", src1(a, inst.srcs[0]), vr(a, reg_of(&inst.srcs[1])), vr(a, reg_of(&inst.srcs[2])), lds_off2(inst.imm))],
+        MOp::LdsWrite2St64B64 => vec![format!("ds_write2st64_b64 {}, {}, {}{}", src1(a, inst.srcs[0]), tuple(a, reg_of(&inst.srcs[1]), 2), tuple(a, reg_of(&inst.srcs[2]), 2), lds_off2(inst.imm))],
         MOp::GlobalLoadU16 => vec![format!(
             "global_load_ushort {}, {}",
             d(a),
@@ -886,4 +1010,30 @@ fn scale_opsel(imm: i64) -> String {
 
 fn tri(a: &Alloc, inst: &MInst, mnemonic: &str) -> Vec<String> {
     vec![format!("{} {}, {}, {}, {}", mnemonic, vr(a, inst.dst.unwrap()), src1(a, inst.srcs[0]), src1(a, inst.srcs[1]), src1(a, inst.srcs[2]))]
+}
+
+/// ` offset0:A offset1:B` of a two-address DS instruction (imm = offset0 | offset1 << 8, element units).
+fn lds_off2(imm: i64) -> String {
+    let (o0, o1) = (imm & 0xff, (imm >> 8) & 0xff);
+    let mut s = String::new();
+    if o0 != 0 {
+        s += &format!(" offset0:{o0}");
+    }
+    if o1 != 0 {
+        s += &format!(" offset1:{o1}");
+    }
+    s
+}
+
+/// ` cbsz:A blgp:B` of a scaled f8f6f4 MFMA with format select (imm bits 8..10 / 12..14; 0 = fp8, 1 = bf8, 2 = fp6, 3 = bf6, 4 = fp4).
+fn f8f6f4_fmt(imm: i64) -> String {
+    let (c, b) = ((imm >> 8) & 7, (imm >> 12) & 7);
+    let mut s = String::new();
+    if c != 0 {
+        s += &format!(" cbsz:{c}");
+    }
+    if b != 0 {
+        s += &format!(" blgp:{b}");
+    }
+    s
 }

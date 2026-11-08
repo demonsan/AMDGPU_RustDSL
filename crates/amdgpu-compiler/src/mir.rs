@@ -236,6 +236,56 @@ pub enum MOp {
     /// ISA, explicit here so every pass sees the read). Semantics:
     /// D += A_sparse(16x128, 64 nonzeros/row) x B(128x16).
     VSmfmac16x16x128Fp8,
+    // P1-d scaled f8f6f4 with format select: A / B register sizes 4 (fp4), 6 (fp6 / bf6), 8 (fp8 / bf8); imm = opsel | cbsz << 8 | blgp << 12
+    VMfmaScale16x16x128A4B4,
+    VMfmaScale16x16x128A4B4Z,
+    VMfmaScale16x16x128A4B6,
+    VMfmaScale16x16x128A4B6Z,
+    VMfmaScale16x16x128A4B8,
+    VMfmaScale16x16x128A4B8Z,
+    VMfmaScale16x16x128A6B4,
+    VMfmaScale16x16x128A6B4Z,
+    VMfmaScale16x16x128A6B6,
+    VMfmaScale16x16x128A6B6Z,
+    VMfmaScale16x16x128A6B8,
+    VMfmaScale16x16x128A6B8Z,
+    VMfmaScale16x16x128A8B4,
+    VMfmaScale16x16x128A8B4Z,
+    VMfmaScale16x16x128A8B6,
+    VMfmaScale16x16x128A8B6Z,
+    VMfmaScale16x16x128A8B8,
+    VMfmaScale16x16x128A8B8Z,
+    VMfmaScale32x32x64A4B4,
+    VMfmaScale32x32x64A4B4Z,
+    VMfmaScale32x32x64A4B6,
+    VMfmaScale32x32x64A4B6Z,
+    VMfmaScale32x32x64A4B8,
+    VMfmaScale32x32x64A4B8Z,
+    VMfmaScale32x32x64A6B4,
+    VMfmaScale32x32x64A6B4Z,
+    VMfmaScale32x32x64A6B6,
+    VMfmaScale32x32x64A6B6Z,
+    VMfmaScale32x32x64A6B8,
+    VMfmaScale32x32x64A6B8Z,
+    VMfmaScale32x32x64A8B4,
+    VMfmaScale32x32x64A8B4Z,
+    VMfmaScale32x32x64A8B6,
+    VMfmaScale32x32x64A8B6Z,
+    VMfmaScale32x32x64A8B8,
+    VMfmaScale32x32x64A8B8Z,
+    // P1-d gfx950 double-rate bf16 / f16 and i8 MFMA (docs/op-coverage-tileops.md); `Z`: zero accumulator
+    VMfma16x16x32Bf16,
+    VMfma16x16x32Bf16Z,
+    VMfma32x32x16Bf16,
+    VMfma32x32x16Bf16Z,
+    VMfma16x16x32F16,
+    VMfma16x16x32F16Z,
+    VMfma32x32x16F16,
+    VMfma32x32x16F16Z,
+    VMfma16x16x64I8,
+    VMfma16x16x64I8Z,
+    VMfma32x32x32I8,
+    VMfma32x32x32I8Z,
     /// _accvgpr_read_b32 vD, aS: dst V1 <- src A1.
     VAccvgprRead,
     /// _accvgpr_write_b32 aD, src: dst A1 <- V1 / S1 / inline constant (Imm).
@@ -286,6 +336,57 @@ pub enum MOp {
     GlobalStoreF32,
     GlobalStoreF32x4,
     GlobalStoreF32x2,
+    // P1 A3 memory (docs/op-coverage-tileops.md)
+    GlobalLoadU8,
+    GlobalLoadI8,
+    GlobalLoadI16,
+    GlobalLoadB64,
+    GlobalLoadB96,
+    GlobalLoadD16U8,
+    GlobalLoadD16U8Hi,
+    GlobalLoadD16I8,
+    GlobalLoadD16I8Hi,
+    GlobalLoadD16B16,
+    GlobalLoadD16B16Hi,
+    GlobalStoreB8,
+    GlobalStoreB8Hi,
+    GlobalStoreB16Hi,
+    GlobalStoreB96,
+    BufferLoadU8,
+    BufferLoadI8,
+    BufferLoadU16,
+    BufferLoadI16,
+    BufferLoadB96,
+    BufferStoreB8,
+    BufferStoreB16,
+    BufferStoreB8Hi,
+    BufferStoreB16Hi,
+    BufferStoreB96,
+    LdsReadU8,
+    LdsReadI8,
+    LdsReadU16,
+    LdsReadI16,
+    LdsReadB96,
+    LdsReadB64TrB16,
+    LdsReadD16U8,
+    LdsReadD16U8Hi,
+    LdsReadD16I8,
+    LdsReadD16I8Hi,
+    LdsReadD16B16,
+    LdsReadD16B16Hi,
+    LdsWriteB8,
+    LdsWriteB16,
+    LdsWriteB8Hi,
+    LdsWriteB16Hi,
+    LdsWriteB96,
+    LdsRead2B32,
+    LdsRead2B64,
+    LdsRead2St64B32,
+    LdsRead2St64B64,
+    LdsWrite2B32,
+    LdsWrite2B64,
+    LdsWrite2St64B32,
+    LdsWrite2St64B64,
     /// Device-scope (`sc1`) coherent loads / write-through stores, the returning device-scope atomic add (`sc0` = return) and the L2 fences
     /// of the last-arriver pattern (`buffer_wbl2 sc1` / `buffer_inv sc1`).
     GlobalLoadF32Sc1,
@@ -358,11 +459,13 @@ pub struct MInst {
     pub skip_m0: bool,
     /// The weave / stage region the instruction was lowered in (`MFunction::reg_hints.regions`, 1-based; 0 = none). No codegen effect.
     pub region: u16,
+    /// Cache policy of a global / buffer access, LLVM CPol bits on gfx950: 1 = sc0, 2 = nt, 16 = sc1 (0 = default).
+    pub cpol: u8,
 }
 
 impl MInst {
     pub fn new(op: MOp) -> Self {
-        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0 }
+        MInst { op, dst: None, srcs: Vec::new(), imm: 0, auto: false, pin: false, skip_m0: false, region: 0, cpol: 0 }
     }
 
     pub fn def(mut self, r: VReg) -> Self {
@@ -385,6 +488,10 @@ impl MInst {
         self
     }
 
+    pub fn cpol(mut self, c: u8) -> Self {
+        self.cpol = c;
+        self
+    }
     pub fn imm(mut self, v: i64) -> Self {
         self.imm = v;
         self

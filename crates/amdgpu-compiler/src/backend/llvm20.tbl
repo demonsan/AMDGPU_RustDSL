@@ -129,6 +129,18 @@ VMfma16x16x16F16 | V4 <- V2 V2 V4 | {d} = V_MFMA_F32_16X16X16F16_vgprcd_e64 {s0}
 VMfma32x32x8F16 | V16 <- V2 V2 V16 | {d} = V_MFMA_F32_32X32X8F16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x8F16Z | V16 <- V2 V2 | {d} = V_MFMA_F32_32X32X8F16_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
 VMfma16x16x32Fp8 | V4 <- V2 V2 V4 | {d} = V_MFMA_F32_16X16X32_FP8_FP8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x32Bf16 | V4 <- V4 V4 V4 | {d} = V_MFMA_F32_16X16X32_BF16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x32Bf16Z | V4 <- V4 V4 | {d} = V_MFMA_F32_16X16X32_BF16_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x16Bf16 | V16 <- V4 V4 V16 | {d} = V_MFMA_F32_32X32X16_BF16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x16Bf16Z | V16 <- V4 V4 | {d} = V_MFMA_F32_32X32X16_BF16_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x32F16 | V4 <- V4 V4 V4 | {d} = V_MFMA_F32_16X16X32_F16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x32F16Z | V4 <- V4 V4 | {d} = V_MFMA_F32_16X16X32_F16_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x16F16 | V16 <- V4 V4 V16 | {d} = V_MFMA_F32_32X32X16_F16_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x16F16Z | V16 <- V4 V4 | {d} = V_MFMA_F32_32X32X16_F16_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x64I8 | V4 <- V4 V4 V4 | {d} = V_MFMA_I32_16X16X64_I8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x64I8Z | V4 <- V4 V4 | {d} = V_MFMA_I32_16X16X64_I8_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x32I8 | V16 <- V4 V4 V16 | {d} = V_MFMA_I32_32X32X32_I8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x32I8Z | V16 <- V4 V4 | {d} = V_MFMA_I32_32X32X32_I8_vgprcd_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x16Fp8 | V16 <- V2 V2 V16 | {d} = V_MFMA_F32_32X32X16_FP8_FP8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfmaScale32x32x64Fp8 | V16 <- V8 V8 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
 VMfma32x32x64Fp8 | V16 <- V8 V8 V16 | {d} = V_MFMA_F32_32X32X64_F8F6F4_f8_f8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, implicit $mode, implicit $exec
@@ -144,18 +156,98 @@ LdsWriteB128 | <- V1 V4 | DS_WRITE_B128_gfx9 {s0}, {s1}, {imm}, 0, implicit $exe
 LdsReadB128 | V4 <- V1 | {d} = DS_READ_B128_gfx9 {s0}, {imm}, 0, implicit $exec :: (load (s128), addrspace 3)
 LdsReadB64TrB8 | V2 <- V1 | {d} = DS_READ_B64_TR_B8_vi {s0}, {imm}, 0, implicit $exec :: (load (s64), addrspace 3)
 SBarrier    | <- | S_BARRIER
-GlobalLoadU16 | V1 <- V2 | {d} = GLOBAL_LOAD_USHORT {s0}, {imm}, 0, implicit $exec :: (load (s16), addrspace 1)
-GlobalLoadF32 | V1 <- V2 | {d} = GLOBAL_LOAD_DWORD {s0}, {imm}, 0, implicit $exec :: (load (s32), addrspace 1)
-GlobalLoadB128 | V4 <- V2 | {d} = GLOBAL_LOAD_DWORDX4 {s0}, {imm}, 0, implicit $exec :: (load (s128), addrspace 1)
-GlobalStoreU16 | <- V2 V1 | GLOBAL_STORE_SHORT {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s16), addrspace 1)
-GlobalStoreF32 | <- V2 V1 | GLOBAL_STORE_DWORD {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s32), addrspace 1)
+GlobalLoadU16 | V1 <- V2 | {d} = GLOBAL_LOAD_USHORT {s0}, {imm}, {cpol}, implicit $exec :: (load (s16), addrspace 1)
+GlobalLoadF32 | V1 <- V2 | {d} = GLOBAL_LOAD_DWORD {s0}, {imm}, {cpol}, implicit $exec :: (load (s32), addrspace 1)
+GlobalLoadB128 | V4 <- V2 | {d} = GLOBAL_LOAD_DWORDX4 {s0}, {imm}, {cpol}, implicit $exec :: (load (s128), addrspace 1)
+GlobalStoreU16 | <- V2 V1 | GLOBAL_STORE_SHORT {s0}, {s1}, {imm}, {cpol}, implicit $exec :: (store (s16), addrspace 1)
+GlobalStoreF32 | <- V2 V1 | GLOBAL_STORE_DWORD {s0}, {s1}, {imm}, {cpol}, implicit $exec :: (store (s32), addrspace 1)
 GlobalLoadF32Sc1 | V1 <- V2 | {d} = GLOBAL_LOAD_DWORD {s0}, {imm}, 16, implicit $exec :: (load (s32), addrspace 1)
 GlobalStoreF32Sc1 | <- V2 V1 | GLOBAL_STORE_DWORD {s0}, {s1}, {imm}, 16, implicit $exec :: (store (s32), addrspace 1)
 GlobalAtomicAddRet | V1 <- V2 V1 | {d} = GLOBAL_ATOMIC_ADD_RTN {s0}, {s1}, {imm}, 1, implicit $exec :: (load store syncscope("agent") monotonic (s32), addrspace 1)
 BufferWbl2 | <- | BUFFER_WBL2 16, implicit $exec
 BufferInv | <- | BUFFER_INV 16, implicit $exec
-GlobalStoreF32x4 | <- V2 V4 | GLOBAL_STORE_DWORDX4 {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s128), addrspace 1)
-GlobalStoreF32x2 | <- V2 V2 | GLOBAL_STORE_DWORDX2 {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s64), addrspace 1)
+GlobalStoreF32x4 | <- V2 V4 | GLOBAL_STORE_DWORDX4 {s0}, {s1}, {imm}, {cpol}, implicit $exec :: (store (s128), addrspace 1)
+GlobalStoreF32x2 | <- V2 V2 | GLOBAL_STORE_DWORDX2 {s0}, {s1}, {imm}, {cpol}, implicit $exec :: (store (s64), addrspace 1)
+GlobalLoadU8 | V1 <- V2 | {d} = GLOBAL_LOAD_UBYTE {s0}, {imm}, {cpol}, implicit $exec :: (load (s8), addrspace 1)
+GlobalLoadI8 | V1 <- V2 | {d} = GLOBAL_LOAD_SBYTE {s0}, {imm}, {cpol}, implicit $exec :: (load (s8), addrspace 1)
+GlobalLoadI16 | V1 <- V2 | {d} = GLOBAL_LOAD_SSHORT {s0}, {imm}, {cpol}, implicit $exec :: (load (s16), addrspace 1)
+GlobalLoadB64 | V2 <- V2 | {d} = GLOBAL_LOAD_DWORDX2 {s0}, {imm}, {cpol}, implicit $exec :: (load (s64), addrspace 1)
+GlobalLoadB96 | V4 <- V2 | {d3} = GLOBAL_LOAD_DWORDX3 {s0}, {imm}, {cpol}, implicit $exec :: (load (s96), addrspace 1)
+GlobalLoadD16U8 | V1 <- V2 V1 | {d} = GLOBAL_LOAD_UBYTE_D16 {s0}, {imm}, {cpol}, {d}(tied-def 0), implicit $exec :: (load (s8), addrspace 1)
+GlobalLoadD16U8Hi | V1 <- V2 V1 | {d} = GLOBAL_LOAD_UBYTE_D16_HI {s0}, {imm}, {cpol}, {d}(tied-def 0), implicit $exec :: (load (s8), addrspace 1)
+GlobalLoadD16I8 | V1 <- V2 V1 | {d} = GLOBAL_LOAD_SBYTE_D16 {s0}, {imm}, {cpol}, {d}(tied-def 0), implicit $exec :: (load (s8), addrspace 1)
+GlobalLoadD16I8Hi | V1 <- V2 V1 | {d} = GLOBAL_LOAD_SBYTE_D16_HI {s0}, {imm}, {cpol}, {d}(tied-def 0), implicit $exec :: (load (s8), addrspace 1)
+GlobalLoadD16B16 | V1 <- V2 V1 | {d} = GLOBAL_LOAD_SHORT_D16 {s0}, {imm}, {cpol}, {d}(tied-def 0), implicit $exec :: (load (s16), addrspace 1)
+GlobalLoadD16B16Hi | V1 <- V2 V1 | {d} = GLOBAL_LOAD_SHORT_D16_HI {s0}, {imm}, {cpol}, {d}(tied-def 0), implicit $exec :: (load (s16), addrspace 1)
+GlobalStoreB8 | <- V2 V1 | GLOBAL_STORE_BYTE {s0}, {s1}, {imm}, {cpol}, implicit $exec :: (store (s8), addrspace 1)
+GlobalStoreB8Hi | <- V2 V1 | GLOBAL_STORE_BYTE_D16_HI {s0}, {s1}, {imm}, {cpol}, implicit $exec :: (store (s8), addrspace 1)
+GlobalStoreB16Hi | <- V2 V1 | GLOBAL_STORE_SHORT_D16_HI {s0}, {s1}, {imm}, {cpol}, implicit $exec :: (store (s16), addrspace 1)
+GlobalStoreB96 | <- V2 V4 | GLOBAL_STORE_DWORDX3 {s0}, {s1t3}, {imm}, {cpol}, implicit $exec :: (store (s96), addrspace 1)
+BufferLoadU8:rrr | V1 <- S4 V1 S1 | {d} = BUFFER_LOAD_UBYTE_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s8), addrspace 8)
+BufferLoadU8:rri | V1 <- S4 V1 I | {d} = BUFFER_LOAD_UBYTE_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s8), addrspace 8)
+BufferLoadU8:rir | V1 <- S4 I S1 | {d} = BUFFER_LOAD_UBYTE_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s8), addrspace 8)
+BufferLoadU8:rii | V1 <- S4 I I | {d} = BUFFER_LOAD_UBYTE_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s8), addrspace 8)
+BufferLoadI8:rrr | V1 <- S4 V1 S1 | {d} = BUFFER_LOAD_SBYTE_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s8), addrspace 8)
+BufferLoadI8:rri | V1 <- S4 V1 I | {d} = BUFFER_LOAD_SBYTE_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s8), addrspace 8)
+BufferLoadI8:rir | V1 <- S4 I S1 | {d} = BUFFER_LOAD_SBYTE_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s8), addrspace 8)
+BufferLoadI8:rii | V1 <- S4 I I | {d} = BUFFER_LOAD_SBYTE_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s8), addrspace 8)
+BufferLoadU16:rrr | V1 <- S4 V1 S1 | {d} = BUFFER_LOAD_USHORT_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s16), addrspace 8)
+BufferLoadU16:rri | V1 <- S4 V1 I | {d} = BUFFER_LOAD_USHORT_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s16), addrspace 8)
+BufferLoadU16:rir | V1 <- S4 I S1 | {d} = BUFFER_LOAD_USHORT_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s16), addrspace 8)
+BufferLoadU16:rii | V1 <- S4 I I | {d} = BUFFER_LOAD_USHORT_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s16), addrspace 8)
+BufferLoadI16:rrr | V1 <- S4 V1 S1 | {d} = BUFFER_LOAD_SSHORT_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s16), addrspace 8)
+BufferLoadI16:rri | V1 <- S4 V1 I | {d} = BUFFER_LOAD_SSHORT_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s16), addrspace 8)
+BufferLoadI16:rir | V1 <- S4 I S1 | {d} = BUFFER_LOAD_SSHORT_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s16), addrspace 8)
+BufferLoadI16:rii | V1 <- S4 I I | {d} = BUFFER_LOAD_SSHORT_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s16), addrspace 8)
+BufferLoadB96:rrr | V4 <- S4 V1 S1 | {d3} = BUFFER_LOAD_DWORDX3_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s96), addrspace 8)
+BufferLoadB96:rri | V4 <- S4 V1 I | {d3} = BUFFER_LOAD_DWORDX3_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s96), addrspace 8)
+BufferLoadB96:rir | V4 <- S4 I S1 | {d3} = BUFFER_LOAD_DWORDX3_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s96), addrspace 8)
+BufferLoadB96:rii | V4 <- S4 I I | {d3} = BUFFER_LOAD_DWORDX3_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s96), addrspace 8)
+BufferStoreB8:rrrr | <- V1 S4 V1 S1 | BUFFER_STORE_BYTE_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s8), addrspace 8)
+BufferStoreB8:rrri | <- V1 S4 V1 I | BUFFER_STORE_BYTE_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s8), addrspace 8)
+BufferStoreB8:rrir | <- V1 S4 I S1 | BUFFER_STORE_BYTE_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s8), addrspace 8)
+BufferStoreB8:rrii | <- V1 S4 I I | BUFFER_STORE_BYTE_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s8), addrspace 8)
+BufferStoreB16:rrrr | <- V1 S4 V1 S1 | BUFFER_STORE_SHORT_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s16), addrspace 8)
+BufferStoreB16:rrri | <- V1 S4 V1 I | BUFFER_STORE_SHORT_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s16), addrspace 8)
+BufferStoreB16:rrir | <- V1 S4 I S1 | BUFFER_STORE_SHORT_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s16), addrspace 8)
+BufferStoreB16:rrii | <- V1 S4 I I | BUFFER_STORE_SHORT_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s16), addrspace 8)
+BufferStoreB8Hi:rrrr | <- V1 S4 V1 S1 | BUFFER_STORE_BYTE_D16_HI_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s8), addrspace 8)
+BufferStoreB8Hi:rrri | <- V1 S4 V1 I | BUFFER_STORE_BYTE_D16_HI_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s8), addrspace 8)
+BufferStoreB8Hi:rrir | <- V1 S4 I S1 | BUFFER_STORE_BYTE_D16_HI_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s8), addrspace 8)
+BufferStoreB8Hi:rrii | <- V1 S4 I I | BUFFER_STORE_BYTE_D16_HI_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s8), addrspace 8)
+BufferStoreB16Hi:rrrr | <- V1 S4 V1 S1 | BUFFER_STORE_SHORT_D16_HI_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s16), addrspace 8)
+BufferStoreB16Hi:rrri | <- V1 S4 V1 I | BUFFER_STORE_SHORT_D16_HI_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s16), addrspace 8)
+BufferStoreB16Hi:rrir | <- V1 S4 I S1 | BUFFER_STORE_SHORT_D16_HI_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s16), addrspace 8)
+BufferStoreB16Hi:rrii | <- V1 S4 I I | BUFFER_STORE_SHORT_D16_HI_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s16), addrspace 8)
+BufferStoreB96:rrrr | <- V4 S4 V1 S1 | BUFFER_STORE_DWORDX3_OFFEN {s0t3}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s96), addrspace 8)
+BufferStoreB96:rrri | <- V4 S4 V1 I | BUFFER_STORE_DWORDX3_OFFEN {s0t3}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s96), addrspace 8)
+BufferStoreB96:rrir | <- V4 S4 I S1 | BUFFER_STORE_DWORDX3_OFFSET {s0t3}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s96), addrspace 8)
+BufferStoreB96:rrii | <- V4 S4 I I | BUFFER_STORE_DWORDX3_OFFSET {s0t3}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s96), addrspace 8)
+LdsReadU8 | V1 <- V1 | {d} = DS_READ_U8_gfx9 {s0}, {imm}, 0, implicit $exec :: (load (s8), addrspace 3)
+LdsReadI8 | V1 <- V1 | {d} = DS_READ_I8_gfx9 {s0}, {imm}, 0, implicit $exec :: (load (s8), addrspace 3)
+LdsReadU16 | V1 <- V1 | {d} = DS_READ_U16_gfx9 {s0}, {imm}, 0, implicit $exec :: (load (s16), addrspace 3)
+LdsReadI16 | V1 <- V1 | {d} = DS_READ_I16_gfx9 {s0}, {imm}, 0, implicit $exec :: (load (s16), addrspace 3)
+LdsReadB96 | V4 <- V1 | {d3} = DS_READ_B96_gfx9 {s0}, {imm}, 0, implicit $exec :: (load (s96), addrspace 3)
+LdsReadB64TrB16 | V2 <- V1 | {d} = DS_READ_B64_TR_B16_vi {s0}, {imm}, 0, implicit $exec :: (load (s64), addrspace 3)
+LdsReadD16U8 | V1 <- V1 V1 | {d} = DS_READ_U8_D16 {s0}, {imm}, 0, {d}(tied-def 0), implicit $exec :: (load (s8), addrspace 3)
+LdsReadD16U8Hi | V1 <- V1 V1 | {d} = DS_READ_U8_D16_HI {s0}, {imm}, 0, {d}(tied-def 0), implicit $exec :: (load (s8), addrspace 3)
+LdsReadD16I8 | V1 <- V1 V1 | {d} = DS_READ_I8_D16 {s0}, {imm}, 0, {d}(tied-def 0), implicit $exec :: (load (s8), addrspace 3)
+LdsReadD16I8Hi | V1 <- V1 V1 | {d} = DS_READ_I8_D16_HI {s0}, {imm}, 0, {d}(tied-def 0), implicit $exec :: (load (s8), addrspace 3)
+LdsReadD16B16 | V1 <- V1 V1 | {d} = DS_READ_U16_D16 {s0}, {imm}, 0, {d}(tied-def 0), implicit $exec :: (load (s16), addrspace 3)
+LdsReadD16B16Hi | V1 <- V1 V1 | {d} = DS_READ_U16_D16_HI {s0}, {imm}, 0, {d}(tied-def 0), implicit $exec :: (load (s16), addrspace 3)
+LdsWriteB8 | <- V1 V1 | DS_WRITE_B8_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s8), addrspace 3)
+LdsWriteB16 | <- V1 V1 | DS_WRITE_B16_gfx9 {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s16), addrspace 3)
+LdsWriteB8Hi | <- V1 V1 | DS_WRITE_B8_D16_HI {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s8), addrspace 3)
+LdsWriteB16Hi | <- V1 V1 | DS_WRITE_B16_D16_HI {s0}, {s1}, {imm}, 0, implicit $exec :: (store (s16), addrspace 3)
+LdsWriteB96 | <- V1 V4 | DS_WRITE_B96_gfx9 {s0}, {s1t3}, {imm}, 0, implicit $exec :: (store (s96), addrspace 3)
+LdsRead2B32 | V2 <- V1 | {d} = DS_READ2_B32_gfx9 {s0}, {off0}, {off1}, 0, implicit $exec :: (load (s64), addrspace 3)
+LdsRead2B64 | V4 <- V1 | {d} = DS_READ2_B64_gfx9 {s0}, {off0}, {off1}, 0, implicit $exec :: (load (s128), addrspace 3)
+LdsRead2St64B32 | V2 <- V1 | {d} = DS_READ2ST64_B32_gfx9 {s0}, {off0}, {off1}, 0, implicit $exec :: (load (s64), addrspace 3)
+LdsRead2St64B64 | V4 <- V1 | {d} = DS_READ2ST64_B64_gfx9 {s0}, {off0}, {off1}, 0, implicit $exec :: (load (s128), addrspace 3)
+LdsWrite2B32 | <- V1 V1 V1 | DS_WRITE2_B32_gfx9 {s0}, {s1}, {s2}, {off0}, {off1}, 0, implicit $exec :: (store (s64), addrspace 3)
+LdsWrite2B64 | <- V1 V2 V2 | DS_WRITE2_B64_gfx9 {s0}, {s1}, {s2}, {off0}, {off1}, 0, implicit $exec :: (store (s128), addrspace 3)
+LdsWrite2St64B32 | <- V1 V1 V1 | DS_WRITE2ST64_B32_gfx9 {s0}, {s1}, {s2}, {off0}, {off1}, 0, implicit $exec :: (store (s64), addrspace 3)
+LdsWrite2St64B64 | <- V1 V2 V2 | DS_WRITE2ST64_B64_gfx9 {s0}, {s1}, {s2}, {off0}, {off1}, 0, implicit $exec :: (store (s128), addrspace 3)
 SLoadDword  | S1 <-    | {d} = S_LOAD_DWORD_IMM $sgpr0_sgpr1, {imm}, 0 :: (dereferenceable invariant load (s32), addrspace 4)
 SLoadDwordx2 | S2 <-   | {d} = S_LOAD_DWORDX2_IMM $sgpr0_sgpr1, {imm}, 0 :: (dereferenceable invariant load (s64), addrspace 4)
 SReadPhys   | S1 <-    | {d} = S_MOV_B32 {ps}
@@ -167,17 +259,101 @@ SAddcU32    | S1 <- S1 S1 | {d} = S_ADDC_U32 {s0}, {s1}, implicit-def $scc, impl
 SMulI32     | S1 <- S1 S1 | {d} = S_MUL_I32 {s0}, {s1}
 SShlB32     | S1 <- S1 I  | {d} = S_LSHL_B32 {s0}, {s1}, implicit-def $scc
 VMfmaScale16x16x128Fp8 | V4 <- V8 V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_vgprcd_e64 {s0}, {s1}, {s2}, 0, 0, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B4 | V4 <- V4 V4 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_vgprcd_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B4Z | V4 <- V4 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_vgprcd_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B6 | V4 <- V4 V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f6_vgprcd_e64 {s0}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B6Z | V4 <- V4 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f6_vgprcd_e64 {s0}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B8 | V4 <- V4 V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f8_vgprcd_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B8Z | V4 <- V4 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f8_vgprcd_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B4 | V4 <- V8 V4 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f4_vgprcd_e64 {s0t6}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B4Z | V4 <- V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f4_vgprcd_e64 {s0t6}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B6 | V4 <- V8 V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f6_vgprcd_e64 {s0t6}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B6Z | V4 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f6_vgprcd_e64 {s0t6}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B8 | V4 <- V8 V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f8_vgprcd_e64 {s0t6}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B8Z | V4 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f8_vgprcd_e64 {s0t6}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B4 | V4 <- V8 V4 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f4_vgprcd_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B4Z | V4 <- V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f4_vgprcd_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B6 | V4 <- V8 V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f6_vgprcd_e64 {s0}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B6Z | V4 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f6_vgprcd_e64 {s0}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B8 | V4 <- V8 V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_vgprcd_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B8Z | V4 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_vgprcd_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B4 | V16 <- V4 V4 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f4_vgprcd_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B4Z | V16 <- V4 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f4_vgprcd_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B6 | V16 <- V4 V8 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f6_vgprcd_e64 {s0}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B6Z | V16 <- V4 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f6_vgprcd_e64 {s0}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B8 | V16 <- V4 V8 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f8_vgprcd_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B8Z | V16 <- V4 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f8_vgprcd_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B4 | V16 <- V8 V4 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f4_vgprcd_e64 {s0t6}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B4Z | V16 <- V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f4_vgprcd_e64 {s0t6}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B6 | V16 <- V8 V8 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f6_vgprcd_e64 {s0t6}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B6Z | V16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f6_vgprcd_e64 {s0t6}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B8 | V16 <- V8 V8 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f8_vgprcd_e64 {s0t6}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B8Z | V16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f8_vgprcd_e64 {s0t6}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B4 | V16 <- V8 V4 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f4_vgprcd_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B4Z | V16 <- V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f4_vgprcd_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B6 | V16 <- V8 V8 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f6_vgprcd_e64 {s0}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B6Z | V16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f6_vgprcd_e64 {s0}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B8 | V16 <- V8 V8 V16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_vgprcd_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B8Z | V16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_vgprcd_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
 # ---- accumulator-register (acc_cd) forms: `Op@a` rows, used when the destination is an AGPR (srcC is then an AGPR too; srcA/srcB may be V or A)
 VMfma16x16x16F16@a | A4 <- V2 V2 A4 | {d} = V_MFMA_F32_16X16X16F16_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x8F16@a | A16 <- V2 V2 A16 | {d} = V_MFMA_F32_32X32X8F16_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x8F16Z@a | A16 <- V2 V2 | {d} = V_MFMA_F32_32X32X8F16_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
 VMfma16x16x32Fp8@a | A4 <- V2 V2 A4 | {d} = V_MFMA_F32_16X16X32_FP8_FP8_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x32Bf16@a | A4 <- V4 V4 A4 | {d} = V_MFMA_F32_16X16X32_BF16_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x32Bf16Z@a | A4 <- V4 V4 | {d} = V_MFMA_F32_16X16X32_BF16_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x16Bf16@a | A16 <- V4 V4 A16 | {d} = V_MFMA_F32_32X32X16_BF16_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x16Bf16Z@a | A16 <- V4 V4 | {d} = V_MFMA_F32_32X32X16_BF16_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x32F16@a | A4 <- V4 V4 A4 | {d} = V_MFMA_F32_16X16X32_F16_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x32F16Z@a | A4 <- V4 V4 | {d} = V_MFMA_F32_16X16X32_F16_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x16F16@a | A16 <- V4 V4 A16 | {d} = V_MFMA_F32_32X32X16_F16_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x16F16Z@a | A16 <- V4 V4 | {d} = V_MFMA_F32_32X32X16_F16_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x64I8@a | A4 <- V4 V4 A4 | {d} = V_MFMA_I32_16X16X64_I8_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma16x16x64I8Z@a | A4 <- V4 V4 | {d} = V_MFMA_I32_16X16X64_I8_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x32I8@a | A16 <- V4 V4 A16 | {d} = V_MFMA_I32_32X32X32_I8_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
+VMfma32x32x32I8Z@a | A16 <- V4 V4 | {d} = V_MFMA_I32_32X32X32_I8_e64 {s0}, {s1}, 0, 0, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x16Fp8@a | A16 <- V2 V2 A16 | {d} = V_MFMA_F32_32X32X16_FP8_FP8_e64 {s0}, {s1}, {s2}, 0, 0, 0, implicit $mode, implicit $exec
 VMfmaScale32x32x64Fp8@a | A16 <- V8 V8 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_e64 {s0}, {s1}, {s2}, 0, 0, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
 VMfma32x32x64Fp8@a | A16 <- V8 V8 A16 | {d} = V_MFMA_F32_32X32X64_F8F6F4_f8_f8_e64 {s0}, {s1}, {s2}, 0, 0, implicit $mode, implicit $exec
 VMfma32x32x64Fp8Z@a | A16 <- V8 V8 | {d} = V_MFMA_F32_32X32X64_F8F6F4_f8_f8_e64 {s0}, {s1}, 0, 0, 0, implicit $mode, implicit $exec
 VMfmaScale32x32x64Fp8Z@a | A16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_e64 {s0}, {s1}, 0, 0, 0, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
 VMfmaScale16x16x128Fp8@a | A4 <- V8 V8 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_e64 {s0}, {s1}, {s2}, 0, 0, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B4@a | A4 <- V4 V4 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B4Z@a | A4 <- V4 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B6@a | A4 <- V4 V8 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f6_e64 {s0}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B6Z@a | A4 <- V4 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f6_e64 {s0}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B8@a | A4 <- V4 V8 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f8_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A4B8Z@a | A4 <- V4 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f8_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B4@a | A4 <- V8 V4 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f4_e64 {s0t6}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B4Z@a | A4 <- V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f4_e64 {s0t6}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B6@a | A4 <- V8 V8 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f6_e64 {s0t6}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B6Z@a | A4 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f6_e64 {s0t6}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B8@a | A4 <- V8 V8 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f8_e64 {s0t6}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A6B8Z@a | A4 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f6_f8_e64 {s0t6}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B4@a | A4 <- V8 V4 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f4_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B4Z@a | A4 <- V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f4_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B6@a | A4 <- V8 V8 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f6_e64 {s0}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B6Z@a | A4 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f6_e64 {s0}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B8@a | A4 <- V8 V8 A4 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale16x16x128A8B8Z@a | A4 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B4@a | A16 <- V4 V4 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f4_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B4Z@a | A16 <- V4 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f4_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B6@a | A16 <- V4 V8 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f6_e64 {s0}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B6Z@a | A16 <- V4 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f6_e64 {s0}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B8@a | A16 <- V4 V8 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f8_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A4B8Z@a | A16 <- V4 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f4_f8_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B4@a | A16 <- V8 V4 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f4_e64 {s0t6}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B4Z@a | A16 <- V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f4_e64 {s0t6}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B6@a | A16 <- V8 V8 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f6_e64 {s0t6}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B6Z@a | A16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f6_e64 {s0t6}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B8@a | A16 <- V8 V8 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f8_e64 {s0t6}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A6B8Z@a | A16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f6_f8_e64 {s0t6}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B4@a | A16 <- V8 V4 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f4_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B4Z@a | A16 <- V8 V4 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f4_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B6@a | A16 <- V8 V8 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f6_e64 {s0}, {s1t6}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B6Z@a | A16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f6_e64 {s0}, {s1t6}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B8@a | A16 <- V8 V8 A16 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_e64 {s0}, {s1}, {s2}, {cbsz}, {blgp}, {s3}, {s4}, {opselA}, {opselB}, implicit $mode, implicit $exec
+VMfmaScale32x32x64A8B8Z@a | A16 <- V8 V8 V1 V1 | {d} = V_MFMA_SCALE_F32_32X32X64_F8F6F4_f8_f8_e64 {s0}, {s1}, 0, {cbsz}, {blgp}, {s2}, {s3}, {opselA}, {opselB}, implicit $mode, implicit $exec
 VSmfmac16x16x128Fp8 | V4 <- V4 V8 V1 | {d} = V_SMFMAC_F32_16X16X128_FP8_FP8_e64 {s0}, {s1}, {s2}, 0, 0, {d}, implicit $mode, implicit $exec
 SLshrB32    | S1 <- S1 I  | {d} = S_LSHR_B32 {s0}, {s1}, implicit-def $scc
 SAndB32     | S1 <- S1 S1 | {d} = S_AND_B32 {s0}, {s1}, implicit-def $scc
@@ -209,27 +385,27 @@ X_Drain     | <- | S_WAITCNT 0
 # ---- MUBUF (buffer) memory ops: srcs [rsrc S4, voffset (V1 = OFFEN, I = the OFFSET form), soffset (S1 or I)]; stores [data, rsrc, voffset, soffset]. The LDS-DMA forms are own-only (like global_load_lds).
 SBufferRsrcDyn | S4 <- S2 S1 | {d.0} = S_MOV_B32 {s0.0} ;; {d.1} = S_AND_B32 {s0.1}, 65535, implicit-def dead $scc ;; {d.2} = S_MOV_B32 {s1} ;; {d.3} = S_MOV_B32 131072
 SBufferRsrc | S4 <- S2 | {d.0} = S_MOV_B32 {s0.0} ;; {d.1} = S_AND_B32 {s0.1}, 65535, implicit-def dead $scc ;; {d.2} = S_MOV_B32 {imm32} ;; {d.3} = S_MOV_B32 131072
-BufferLoadDwordX1:rrr | V1 <- S4 V1 S1 | {d} = BUFFER_LOAD_DWORD_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s32), addrspace 8)
-BufferLoadDwordX1:rri | V1 <- S4 V1 I | {d} = BUFFER_LOAD_DWORD_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s32), addrspace 8)
-BufferLoadDwordX1:rir | V1 <- S4 I S1 | {d} = BUFFER_LOAD_DWORD_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s32), addrspace 8)
-BufferLoadDwordX1:rii | V1 <- S4 I I | {d} = BUFFER_LOAD_DWORD_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s32), addrspace 8)
-BufferLoadDwordX2:rrr | V2 <- S4 V1 S1 | {d} = BUFFER_LOAD_DWORDX2_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s64), addrspace 8)
-BufferLoadDwordX2:rri | V2 <- S4 V1 I | {d} = BUFFER_LOAD_DWORDX2_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s64), addrspace 8)
-BufferLoadDwordX2:rir | V2 <- S4 I S1 | {d} = BUFFER_LOAD_DWORDX2_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s64), addrspace 8)
-BufferLoadDwordX2:rii | V2 <- S4 I I | {d} = BUFFER_LOAD_DWORDX2_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s64), addrspace 8)
-BufferLoadDwordX4:rrr | V4 <- S4 V1 S1 | {d} = BUFFER_LOAD_DWORDX4_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s128), addrspace 8)
-BufferLoadDwordX4:rri | V4 <- S4 V1 I | {d} = BUFFER_LOAD_DWORDX4_OFFEN {s1}, {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s128), addrspace 8)
-BufferLoadDwordX4:rir | V4 <- S4 I S1 | {d} = BUFFER_LOAD_DWORDX4_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s128), addrspace 8)
-BufferLoadDwordX4:rii | V4 <- S4 I I | {d} = BUFFER_LOAD_DWORDX4_OFFSET {s0}, {s2}, {imm}, 0, 0, implicit $exec :: (load (s128), addrspace 8)
-BufferStoreDwordX1:rrrr | <- V1 S4 V1 S1 | BUFFER_STORE_DWORD_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s32), addrspace 8)
-BufferStoreDwordX1:rrri | <- V1 S4 V1 I | BUFFER_STORE_DWORD_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s32), addrspace 8)
-BufferStoreDwordX1:rrir | <- V1 S4 I S1 | BUFFER_STORE_DWORD_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s32), addrspace 8)
-BufferStoreDwordX1:rrii | <- V1 S4 I I | BUFFER_STORE_DWORD_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s32), addrspace 8)
-BufferStoreDwordX2:rrrr | <- V2 S4 V1 S1 | BUFFER_STORE_DWORDX2_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s64), addrspace 8)
-BufferStoreDwordX2:rrri | <- V2 S4 V1 I | BUFFER_STORE_DWORDX2_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s64), addrspace 8)
-BufferStoreDwordX2:rrir | <- V2 S4 I S1 | BUFFER_STORE_DWORDX2_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s64), addrspace 8)
-BufferStoreDwordX2:rrii | <- V2 S4 I I | BUFFER_STORE_DWORDX2_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s64), addrspace 8)
-BufferStoreDwordX4:rrrr | <- V4 S4 V1 S1 | BUFFER_STORE_DWORDX4_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s128), addrspace 8)
-BufferStoreDwordX4:rrri | <- V4 S4 V1 I | BUFFER_STORE_DWORDX4_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s128), addrspace 8)
-BufferStoreDwordX4:rrir | <- V4 S4 I S1 | BUFFER_STORE_DWORDX4_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s128), addrspace 8)
-BufferStoreDwordX4:rrii | <- V4 S4 I I | BUFFER_STORE_DWORDX4_OFFSET {s0}, {s1}, {s3}, {imm}, 0, 0, implicit $exec :: (store (s128), addrspace 8)
+BufferLoadDwordX1:rrr | V1 <- S4 V1 S1 | {d} = BUFFER_LOAD_DWORD_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s32), addrspace 8)
+BufferLoadDwordX1:rri | V1 <- S4 V1 I | {d} = BUFFER_LOAD_DWORD_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s32), addrspace 8)
+BufferLoadDwordX1:rir | V1 <- S4 I S1 | {d} = BUFFER_LOAD_DWORD_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s32), addrspace 8)
+BufferLoadDwordX1:rii | V1 <- S4 I I | {d} = BUFFER_LOAD_DWORD_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s32), addrspace 8)
+BufferLoadDwordX2:rrr | V2 <- S4 V1 S1 | {d} = BUFFER_LOAD_DWORDX2_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s64), addrspace 8)
+BufferLoadDwordX2:rri | V2 <- S4 V1 I | {d} = BUFFER_LOAD_DWORDX2_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s64), addrspace 8)
+BufferLoadDwordX2:rir | V2 <- S4 I S1 | {d} = BUFFER_LOAD_DWORDX2_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s64), addrspace 8)
+BufferLoadDwordX2:rii | V2 <- S4 I I | {d} = BUFFER_LOAD_DWORDX2_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s64), addrspace 8)
+BufferLoadDwordX4:rrr | V4 <- S4 V1 S1 | {d} = BUFFER_LOAD_DWORDX4_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s128), addrspace 8)
+BufferLoadDwordX4:rri | V4 <- S4 V1 I | {d} = BUFFER_LOAD_DWORDX4_OFFEN {s1}, {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s128), addrspace 8)
+BufferLoadDwordX4:rir | V4 <- S4 I S1 | {d} = BUFFER_LOAD_DWORDX4_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s128), addrspace 8)
+BufferLoadDwordX4:rii | V4 <- S4 I I | {d} = BUFFER_LOAD_DWORDX4_OFFSET {s0}, {s2}, {imm}, {cpol}, 0, implicit $exec :: (load (s128), addrspace 8)
+BufferStoreDwordX1:rrrr | <- V1 S4 V1 S1 | BUFFER_STORE_DWORD_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s32), addrspace 8)
+BufferStoreDwordX1:rrri | <- V1 S4 V1 I | BUFFER_STORE_DWORD_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s32), addrspace 8)
+BufferStoreDwordX1:rrir | <- V1 S4 I S1 | BUFFER_STORE_DWORD_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s32), addrspace 8)
+BufferStoreDwordX1:rrii | <- V1 S4 I I | BUFFER_STORE_DWORD_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s32), addrspace 8)
+BufferStoreDwordX2:rrrr | <- V2 S4 V1 S1 | BUFFER_STORE_DWORDX2_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s64), addrspace 8)
+BufferStoreDwordX2:rrri | <- V2 S4 V1 I | BUFFER_STORE_DWORDX2_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s64), addrspace 8)
+BufferStoreDwordX2:rrir | <- V2 S4 I S1 | BUFFER_STORE_DWORDX2_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s64), addrspace 8)
+BufferStoreDwordX2:rrii | <- V2 S4 I I | BUFFER_STORE_DWORDX2_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s64), addrspace 8)
+BufferStoreDwordX4:rrrr | <- V4 S4 V1 S1 | BUFFER_STORE_DWORDX4_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s128), addrspace 8)
+BufferStoreDwordX4:rrri | <- V4 S4 V1 I | BUFFER_STORE_DWORDX4_OFFEN {s0}, {s2}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s128), addrspace 8)
+BufferStoreDwordX4:rrir | <- V4 S4 I S1 | BUFFER_STORE_DWORDX4_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s128), addrspace 8)
+BufferStoreDwordX4:rrii | <- V4 S4 I I | BUFFER_STORE_DWORDX4_OFFSET {s0}, {s1}, {s3}, {imm}, {cpol}, 0, implicit $exec :: (store (s128), addrspace 8)
