@@ -291,15 +291,28 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 }
                 let tot = red(b, RedOp::Sum, part.unwrap(), 0, gen0, &lane);
                 let mean = b.mul_f32(tot, inv_n);
+                let neg_mean = b.neg_f32(mean);
                 let mut part2: Option<ValueId> = None;
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
-                    let mut dv = [0; 8];
-                    for k in 0..8 {
-                        dv[k] = b.sub_f32(xi[k], mean);
+                    // packed math: two elements per v_pk_add_f32 / v_pk_mul_f32 (deviation, square), pair sums with v_pk_add_f32
+                    let nm2 = b.frag2(neg_mean, neg_mean);
+                    let mut sqp: Vec<ValueId> = Vec::new();
+                    for q in 0..4usize {
+                        let x2 = b.frag2(xi[2 * q], xi[2 * q + 1]);
+                        let d2 = b.pk_add_f32(x2, nm2);
+                        // masked lanes: the deviation of a masked-out chunk must not count
+                        let d0 = b.frag2_lane(d2, 0);
+                        let d1 = b.frag2_lane(d2, 1);
+                        let dm = masked(b, &[d0, d1, zero, zero, zero, zero, zero, zero], i, zero);
+                        let dm2 = b.frag2(dm[0], dm[1]);
+                        sqp.push(b.pk_mul_f32(dm2, dm2));
                     }
-                    let dv = masked(b, &dv, i, zero);
-                    let sq: Vec<ValueId> = dv.iter().map(|&x| b.mul_f32(x, x)).collect();
+                    let a01 = b.pk_add_f32(sqp[0], sqp[1]);
+                    let a23 = b.pk_add_f32(sqp[2], sqp[3]);
+                    let a = b.pk_add_f32(a01, a23);
+                    let (l0, l1) = (b.frag2_lane(a, 0), b.frag2_lane(a, 1));
+                    let sq = vec![l0, l1];
                     let s = lane_reduce(b, RedOp::Sum, &sq);
                     part2 = Some(match part2 { None => s, Some(p) => b.add_f32(p, s) });
                 }
@@ -313,12 +326,19 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
                     let be = bf16x8_to_f32(b, bs.as_ref().unwrap()[i]);
                     let mut y = [0; 8];
-                    for k in 0..8 {
-                        // (x - mean) is recomputed here: the deviations are not kept across the second reduction (register pressure)
-                        let d = b.sub_f32(xi[k], mean);
-                        let t = b.mul_f32(d, inv);
-                        let u = b.mul_f32(t, g[k]);
-                        y[k] = b.add_f32(u, be[k]);
+                    let nm2 = b.frag2(neg_mean, neg_mean);
+                    let inv2 = b.frag2(inv, inv);
+                    for q in 0..4usize {
+                        // packed: (x - mean) * inv * gamma + beta, two elements per instruction ((x - mean) is recomputed: the deviations are not kept across the second reduction)
+                        let x2 = b.frag2(xi[2 * q], xi[2 * q + 1]);
+                        let g2 = b.frag2(g[2 * q], g[2 * q + 1]);
+                        let b2 = b.frag2(be[2 * q], be[2 * q + 1]);
+                        let d2 = b.pk_add_f32(x2, nm2);
+                        let t2 = b.pk_mul_f32(d2, inv2);
+                        let u2 = b.pk_mul_f32(t2, g2);
+                        let y2 = b.pk_add_f32(u2, b2);
+                        y[2 * q] = b.frag2_lane(y2, 0);
+                        y[2 * q + 1] = b.frag2_lane(y2, 1);
                     }
                     out.push(y);
                 }
