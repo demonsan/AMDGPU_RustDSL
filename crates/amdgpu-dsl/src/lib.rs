@@ -176,7 +176,7 @@ pub struct MmaKind {
 }
 
 /// E8M0 scales of a block-scaled MFMA: one dword per lane each; `opsel` bits 0..1 = byte of `sa`, bits 4..5 = byte of `sb`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MmaScale {
     pub sa: Opnd,
     pub sb: Opnd,
