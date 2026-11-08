@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
                 double err = std::fabs(got - ycpu[i]);
                 me1 = std::max(me1, err);
                 if (err > 2e-2 * std::fabs(ycpu[i]) + 2e-2) {
-                    if (bad1 < envi("SHOW_BAD", 0)) printf("  bad1 t=%d k=%d e=%d i=%d got=%g ref=%g\n", t, k, e, i, got, ycpu[i]);
+                    if (bad1 < envi("SHOW_BAD", 0)) { int p = 0; while (p < maxp && sid[p] != (t | (k << 24))) p++; printf("  bad1 t=%d k=%d e=%d i=%d tile=%d row=%d got=%g ref=%g\n", t, k, e, i, p / BM, p % BM, got, ycpu[i]); }
                     bad1++;
                 }
             }
