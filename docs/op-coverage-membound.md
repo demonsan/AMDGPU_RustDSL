@@ -383,3 +383,12 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 `rmsnorm_quant_mxfp4_bf16_k<K>`：把 `rmsnorm_bf16_n<K>` 与 kernel-opt 的 `quant_mxfp4_bf16_k<K>`（`rows/mxquant.rs`）合成一个 kernel，省掉规范化后的行在 HBM 里的 bf16 往返（写 2 B + 读 2 B / 元素）。量化规则、E8M0 scale、fp4 转换指令和 shuffled a4w4 scale 布局完全沿用 mxquant（输出可以直接喂 `gemm_a4w4_mxfp4`）。映射也沿用 mxquant：一个块 = 16 行 × 整行 K，4 个 wave，wave `w` 处理 tile pair `w + 4 i`，lane `16 g + r` 负责行 `16 rb + r` 的第 `16 p + g + 4 j` 组；pass A 求每个 lane 的平方和（一个 tile pair 的 4 组展开，16 次 b128 加载在飞），行内 4 个 lane（`l ^ 16`、`l ^ 32`）用两次 lane swap 合并，4 个 wave 用 256 字节 LDS 合并；pass B 重新读行（L2）、乘 `inv_rms · gamma` 后量化。ABI：x @0、gamma @8、q @16、scale @24、M @32、eps @36。
 
 主机测试 `tests/gpu/mxnorm_host.cpp`：CPU 参考把同一规则用在 f32 的规范化行上；scale 字节必须一致（每百万个 group 里有几个边界 group 差 1，因为设备的 rsqrt 是近似指令，允许 ≤ 1‰），每个反量化值必须在设备自己的 scale 的 fp4 半步长（1 × scale）以内；K = 512 / 2048 / 4096 / 7168，`code_bad = 0`，`gpu_verify --strict` 0 错误，84 VGPR。性能（K = 4096、M = 32768）：123 µs；分开做（rmsnorm 约 90 µs + mxfp4 量化）估计 ≥ 1.6 倍。
+
+
+## layernorm 的 packed 数学（负结果）
+
+把 layernorm 的"减均值 / 乘 inv / 乘 γ / 加 β"和"偏差平方"换成 `v_pk_add_f32` / `v_pk_mul_f32`（每条处理两个元素）后，VALU 指令数反而**增加**（N = 4096：1005 → 1158，N = 776：684 → 762，N = 400：1723 → 1883，N = 256：652 → 732，N = 200：793 → 873），带宽持平或更低（同一次运行里，N = 4096 5882 → 5873、776 4284 → 3798、400 3623 → 3096、256 5245 → 4916、200 3915 → 3340 GB/s）：packed 操作要求两个 f32 在相邻的 VGPR 里，而 bf16 解包产生的是分开的寄存器，所以每对元素还要一到两条 `v_mov` 来拼 / 拆，吞掉了省下的指令。要让 packed 数学有用，需要解包阶段本身就产生相邻的寄存器对（例如 `v_pk_` 系的 bf16 → f32 或者把 `v_lshlrev / v_and` 的目的寄存器按对分配），这是编译器 / 寄存器分配层面的事；kernel 层面不做。实验代码在归档 tag `archive/pk-layernorm`，不合入。
+
+## mxfp4 规则只有一份
+
+`rows/mxquant.rs` 里的"一个 32 元素组"的步骤（amax 舍入、E8M0、`ScalePkFp4F32` 链、frag4）现在是 `pub(crate) fn mxfp4_group`，`quant_mxfp4_bf16_k<K>` 和融合的 `rmsnorm_quant_mxfp4_bf16_k<K>`（`rows/mxnorm.rs`）都调用它；重构前后两个 kernel 的汇编 md5 完全相同（`quant_mxfp4_bf16_k512 / 4096 / 7168`、`rmsnorm_quant_mxfp4_bf16_k512 / 4096 / 7168`、`quant_mxfp8_bf16_k4096`）。
