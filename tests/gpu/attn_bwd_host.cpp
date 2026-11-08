@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
         auto run = [&]() {
             launch(fd, a, (SQ + 255) / 256, H, B);
             launch(fq, a, (SQ + 127) / 128, H, B);
-            launch(fk, a, causal ? ((SK + 127) / 128 + 1) / 2 : (SK + 127) / 128, H, B);
+            launch(fk, a, (SK + 127) / 128, H, B);
         };
         run();
         HC(hipDeviceSynchronize());
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
         printf("ours bwd B=%d H=%d HK=%d SQ=%d SK=%d causal=%d: %.1f us %.1f TF/s\n", B, H, HK, SQ, SK, causal, us, flops / (us * 1e-6) / 1e12);
         // per-kernel split
         hipFunction_t fs[3] = {fd, fq, fk};
-        int gxs[3] = {(SQ + 255) / 256, (SQ + 127) / 128, causal ? ((SK + 127) / 128 + 1) / 2 : (SK + 127) / 128};
+        int gxs[3] = {(SQ + 255) / 256, (SQ + 127) / 128, (SK + 127) / 128};
         const char* nm[3] = {"dot", "dq", "dkdv"};
         for (int kk = 0; kk < 3; kk++) {
             HC(hipEventRecord(e0));
