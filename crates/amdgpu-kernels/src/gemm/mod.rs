@@ -1549,7 +1549,8 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let k16 = { let v = b.bind_i32(ev(k_v) << 4); b.read_first_lane(v) };
         let vo: Vec<ValueId> = (0..2)
             .map(|k| {
-                let o = b.let_i32(&b_rd.bases[ops[0][k].0] + ops[0][k].1 as i32);
+                // (the partition bases include the ring's LDS base)
+                let o = b.let_i32(&b_rd.bases[ops[0][k].0] + (ops[0][k].1 - b_s.base) as i32);
                 b.bind_i32((o.clone().lshr(11)) * ev(k16) + (o & 2047))
             })
             .collect();
