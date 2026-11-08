@@ -509,6 +509,10 @@ pub fn cvt_p1_cases() -> Vec<(amdgpu_dsl::CvtOp, Vec<usize>, u8)> {
         (C::ScalePkF32Fp8, vec![0, 9], 0),
         (C::ScalePkBf16Fp4, vec![1, 10], 1),
         (C::ScalePkFp8F32, vec![2, 3, 10, 8], 0),
+        // every destination byte of the fp4 pack (kernel-opt: sel 1..3)
+        (C::ScalePkFp4F32, vec![2, 3, 7, 8], 0),
+        (C::ScalePkFp4F32, vec![2, 3, 7, 8], 1),
+        (C::ScalePkFp4F32, vec![2, 3, 7, 8], 3),
         (C::PkU8F32, vec![4, 8], 2),
         (C::PkI16I32, vec![5, 6], 0),
         (C::PkU16U32, vec![5, 6], 0),

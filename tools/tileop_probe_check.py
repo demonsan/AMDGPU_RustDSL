@@ -515,6 +515,7 @@ CVT_CASES = [("PkF32Fp8", [0], 0), ("PkF32Fp8", [0], 1), ("PkF32Bf8", [0], 1), (
              ("ScalePkF16Bf8", [0, 7], 0), ("ScalePkF32Fp8", [0, 7], 1), ("ScalePkF32Bf8", [0, 7], 0), ("ScalePkF32Fp4", [1, 7], 2),
              ("ScalePkBf16Fp4", [1, 7], 3), ("ScalePkF16Fp4", [1, 7], 1), ("ScalePkFp8F32", [2, 3, 7, 8], 1), ("ScalePkBf8F32", [2, 3, 7, 8], 0),
              ("ScalePkFp4F32", [2, 3, 7, 8], 2), ("ScalePkF32Fp8", [0, 9], 0), ("ScalePkBf16Fp4", [1, 10], 1), ("ScalePkFp8F32", [2, 3, 10, 8], 0),
+             ("ScalePkFp4F32", [2, 3, 7, 8], 0), ("ScalePkFp4F32", [2, 3, 7, 8], 1), ("ScalePkFp4F32", [2, 3, 7, 8], 3),
              ("PkU8F32", [4, 8], 2), ("PkI16I32", [5, 6], 0), ("PkU16U32", [5, 6], 0)]
 TWO = {"PkF32Fp8", "PkF32Bf8", "ScalePkF32Fp8", "ScalePkF32Bf8", "ScalePkF32Fp4"}
 
