@@ -115,15 +115,17 @@ pub fn probe_valu_p1() -> Function {
     let off = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::Val(c4)));
     let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off) });
     let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off) });
-    let ld = |b: &mut FnBuilder, k: u32| b.let_(Op::LoadF32 { base: Opnd::Val(pin), byte_off: 256 * k });
+    let ld = |b: &mut FnBuilder, k: u32| b.let_(Op::LoadF32 { base: Opnd::Val(pin), byte_off: 256 * k });  // 256 * 5 < 4096
     let (fa, fb, fc) = (ld(&mut b, 0), ld(&mut b, 1), ld(&mut b, 2));
     let ia = { let x = ld(&mut b, 3); b.let_(Op::BitcastI32(Opnd::Val(x))) };
     let ib = { let x = ld(&mut b, 4); b.let_(Op::BitcastI32(Opnd::Val(x))) };
     let ic = { let x = ld(&mut b, 5); b.let_(Op::BitcastI32(Opnd::Val(x))) };
     let mut k = 0u32;
+    // one pointer per 16 ops: global offsets are 13-bit signed (at most 4095)
     let mut store = |b: &mut FnBuilder, v: ValueId, float: bool| {
         let v = if float { v } else { b.let_(Op::BitcastF32(Opnd::Val(v))) };
-        b.store_f32(pout, 256 * k, v);
+        let base = b.let_(Op::PtrAdd { base: Opnd::Val(pout), byte_off: Opnd::I32((256 * (k / 8 * 8)) as i32) });
+        b.store_f32(base, 256 * (k % 8), v);
         k += 1;
     };
     for u in UN {
