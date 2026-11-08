@@ -239,6 +239,8 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                         let frag = b.buffer_load_c(r_l, Some(Opnd::Val(off)), 0i32, 0, MemTy::B128, CachePolicy::NT);
                         loaded.push((ok, frag));
                     }
+                    // the elements that do not count go to a per-lane sink bin (256 + lane): 64 lanes on one address would serialise the LDS atomic
+                    let dm = b.bind_i32(256 + (ev(tid) & 63));
                     for (ok, frag) in loaded {
                         let x = bf16x8_to_f32(b, frag);
                         for k in 0..8usize {
@@ -247,14 +249,14 @@ pub fn sampling(name: &str, v: i64, sample: bool, filtered: bool) -> Function {
                             let hi = b.bind_i32(ev(key).lshr(8));
                             let bin = if second { b.bind_i32(ev(key) & 255) } else { hi };
                             // the dummy bin (256) takes everything that does not count
-                            let b1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ge), a: Opnd::Val(bin), b: Opnd::I32(256) });
+                            let b1 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ge), a: Opnd::Val(bin), b: Opnd::Val(dm) });
                             let b2 = if second {
                                 let same = b.cmp(CmpPred::Eq, CmpTy::I32, hi, bsel);
-                                b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(same), a: Opnd::Val(b1), b: Opnd::I32(256) })
+                                b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(same), a: Opnd::Val(b1), b: Opnd::Val(dm) })
                             } else {
                                 b1
                             };
-                            let b3 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(b2), b: Opnd::I32(256) });
+                            let b3 = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(b2), b: Opnd::Val(dm) });
                             let addr = b.bind_i32((ev(b3) << 2) + hist);
                             if weighted {
                                 let xs = match inv_t { Some(it) => b.mul_f32(x[k], it), None => x[k] };
