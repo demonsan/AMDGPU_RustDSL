@@ -510,3 +510,52 @@
 - **blockscale 的中等 M 差距**：1024 / 256 行 0.78 / 0.89。原因是每 CU 一个 CTA 时，块乘积的 FMA 与下一 tile 的 MMA 不能重叠。方向：块乘积延后一个 tile。
 - **MXFP4**：0.6× 的结构性原因是 fp4 下 128 字节 K tile 的 MFMA 工作量只有 fp8 的一半，而每 tile 的开销不变。方向：256 字节 K tile。达到 ≥ 0.9× 之前保持"实验"标注。
 - **i8**：等待 i32 → f32 转换（§6.4 P1-c）。
+
+**批次 1 性能待办**（覆盖完成后回来做）：
+- blockscale 中等 M：块乘积延后一个 tile；
+- MXFP4：256 字节 K tile；
+- i8；
+- 与厂商同条件的 split-K 对比。
+
+### 7.5 批次 3（attention）状态：覆盖完成，性能待优化
+
+**prefill**：`fmha_fwd_hd<64|128|256>_bf16[_causal][_swa][_group]`，见 [`fmha/bf16.rs`](../crates/amdgpu-kernels/src/fmha/bf16.rs)。
+- **ABI**：aiter fmha_v3 的 656 字节 ABI；滑窗参数为我们的扩展，放在 656 / 672。
+- **方向**：S^T = K·Q^T，O^T = V^T·P^T，用 bf16 32x32x16。每 lane 一个 query，所以在线 softmax 是逐 lane 标量，两半 lane 用 `v_permlane32_swap` 合并。
+- **数据流**：
+  - Q^T 常驻寄存器；
+  - 64 key 的 K / V tile 用 2 槽 LDS 环，K 做 XOR swizzle；
+  - V^T 用两条 `ds_read_b64_tr_b16` 读出：源 4 行块放在 key 8r + 4h，使转置后的 k 序等于 P 的打包序。
+- **覆盖**：GQA、causal（右下对齐）、滑窗、varlen（group ABI）、LSE；hd256 的 O^T 放 AGPR。
+
+**paged decode**：`pa_decode_bf16_hd128_p<P>` 加 `attn_combine_bf16_hd128`，见 [`fmha/decode.rs`](../crates/amdgpu-kernels/src/fmha/decode.rs)。
+- **布局**：NHD 页，加 block table 和上下文长度。
+- **分工**：一个 KV head 的 GQA 头是一个 wave 的 32 行；每个 wave 是一个 key split，经私有 32 KB LDS 流式处理，每行 key 都经 block table 翻译。
+- **输出**：部分 O / l 与 LSE，再由 combine 合并。
+
+**MLA decode**：`mla_decode_bf16_p<P>` 加 `attn_combine_bf16_hd512[_sm]`，见 [`fmha/mla.rs`](../crates/amdgpu-kernels/src/fmha/mla.rs)。
+- **形状**：576 / 512，单个 latent 头，每 CTA 32 头。
+- **QK**：维度按 wave 四分，S 经 LDS 归约。
+- **PV**：v 维按 wave 四分。
+- **其他**：key split 加 combine；`_sm` 变体读 aiter stage-1 的 [B][S][H] 布局。
+
+**对照工具**：[`attn_host.cpp`](../tests/gpu/attn_host.cpp)、[`pa_host.cpp`](../tests/gpu/pa_host.cpp)、[`mla_host.cpp`](../tests/gpu/mla_host.cpp)。三者都在同进程、同逻辑数据上运行；PA 的 host 同时构造 aiter 的 PA 布局。
+
+**数据**：2026-11-08，GPU 5。全部 `bad=0`（CPU 参考，含 LSE），strict 0 错误。
+
+| 算子 | 形状 | ours | 厂商 | 比 |
+|---|---|--:|--:|--:|
+| prefill hd128 | B1 H8 4096² | 440 TF/s | fwd_hd128_bf16：688 | 0.64 |
+| prefill hd128 causal varlen | B4 H8 ≤2000 | 87 TF/s（tr_b16 之前） | 276 | 0.32 |
+| paged decode P16 | B16 H64 HK8 ctx ≤4096 | 2246 GB/s | pa_bf16_noquant_gqa8：5997 | 0.37 |
+| MLA decode P1 | B32 H16 ctx ≤2048 | 1019 GB/s | mla_dec_stage1 gqa16（+我们的 combine）：2227 | 0.46 |
+| MLA decode P1 | B128 H16 ctx ≤4096 | 994 GB/s | 4094 | 0.24 |
+
+**限制与观察**：
+- 厂商 bf16 fmha_v3 没有 hd64、滑窗；hd256 只有 group 模式。
+- 厂商 MLA stage-1 在页大小 16 下与参考不符，只在页大小 1 下对拍通过。可能需要它的 metadata 约定 `[待核]`。
+
+**性能待办**：
+- prefill：8 wave 两组 ping-pong（v3 骨架）、延迟 rescale、QK / softmax / PV 交叠；
+- decode：每 wave 更大的块、私有环双缓冲、页表查找提到循环外、一 tile 多页时按页 DMA；
+- MLA：S 归约改为 DPP / permlane，或换成按 head 切分。
