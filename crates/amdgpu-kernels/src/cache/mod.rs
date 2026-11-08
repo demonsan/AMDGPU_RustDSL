@@ -220,7 +220,8 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
     fb.finish()
 }
 
-/// The < 4 GiB variant (`_s32` suffix): 32-bit descriptor extents and offsets, no 64-bit pointer setup (about 14 % faster than the any-size kernel on h8 / d128).\npub fn reshape_cache_flash_s32(name: &str, h: i64, d: i64) -> Function {
+/// The < 4 GiB variant (_s32 suffix): 32-bit descriptor extents and offsets, no 64-bit pointer setup (about 14 % faster than the any-size kernel on h8 / d128).
+pub fn reshape_cache_flash_s32(name: &str, h: i64, d: i64) -> Function {
     let row = 2 * h * d;                    // bytes per token row
     let nv = row / 16;                      // b128 vectors per row
     let lt = (((nv + 63) / 64).min(4) * 64) as u32;      // lanes per token
