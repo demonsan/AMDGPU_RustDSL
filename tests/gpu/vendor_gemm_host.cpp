@@ -210,7 +210,10 @@ int main(int argc, char** argv) {
             }
             double got = bf16_to_f(out[(size_t)m * N + n]);
             double err = std::fabs(got - ref), tol = 1e-2 * std::fabs(ref) + 2e-3 * mag / std::sqrt((double)K) + 1e-6;
-            if (err > tol) bad++;
+            if (err > tol) {
+                if (bad < envi("SHOW_BAD", 0)) printf("  bad m=%d n=%d got=%.6g ref=%.6g mag=%.6g\n", m, n, got, ref, mag);
+                bad++;
+            }
             max_rel = std::max(max_rel, err / (std::fabs(ref) + mag / K + 1e-12));
             checked++;
         }
