@@ -535,7 +535,9 @@ pub fn auto_order_nodes(f: &Function, cap: &Captured, m: &Model) -> Vec<usize> {
             let k = groups[g].start;
             let e = &fs[k].eff;
             let flags = format!("{}{}{}{}{}{}", if e.lds_read { "Lr " } else { "" }, if e.lds_write { "Lw " } else { "" }, if e.global_read || e.global_write { "G " } else { "" }, if e.anchor() { "ANCHOR " } else { "" }, if e.branch { "BRANCH " } else { "" }, if !fs[k].defs.is_empty() { "def" } else { "" });
-            eprintln!("  {pos:3} <- {g:3} {:?} {flags}", fs[k].class);
+            let mut det = format!("{:?}", cap.nodes[k]);
+            det.truncate(170);
+            eprintln!("  {pos:3} <- {g:3} {:?} {flags} defs={:?} uses={:?} vr={:?} vw={:?} | {det}", fs[k].class, fs[k].defs, fs[k].uses, fs[k].var_reads, fs[k].var_writes);
         }
     }
     order.into_iter().flat_map(|g| groups[g].clone()).collect()
