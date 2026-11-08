@@ -259,7 +259,7 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
 }
 
 /// `split` (`..._ks`, for small grids): the key range of every q tile is cut into S = 2^lg_s parts (grid z = B S; our ABI extension: lg_s
-/// at kernarg 656, fp32 partial O / l [B, H, SQ, S, 128] at 672, partial LSE [B, H, SQ, S] at 688); `attn_combine_bf16_hd128_q` merges them.
+/// at kernarg 656, S = 2^lg_s at 660, fp32 partial O / l [B, H, SQ, S, 128] at 672, partial LSE [B, H, SQ, S] at 688); `attn_combine_bf16_hd128_q` merges them.
 pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Function {
     let mut b = FnBuilder::new(name, 512);
     b.compile_profile(CompileProfile::Gemm);
@@ -301,6 +301,8 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     b.grid_is(1, hh.clone());
     if split {
         b.arg("lg_s", DType::I32, 656, 4);
+        b.arg("S", DType::I32, 660, 4);
+        b.ka_is(660, Ext::sym("SPL"));
         b.arg("ptr_po", DType::Ptr, 672, 8);
         b.arg("ptr_plse", DType::Ptr, 688, 8);
         b.sym_range("LS", 0, 4);
@@ -464,15 +466,16 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
         let l_tot = b.add_f32(la, lb);
         let inv = b.rcp_f32(l_tot);
         let live = b.bind_cond(ev(row).lt(ev(s_q)));
-        if let (Some(l), Some(pt)) = (lg_s, part) {
+        if let (Some(_), Some(pt)) = (lg_s, part) {
             // partial O / l (fp32) and LSE (ln) of this part: row (b, h, q) x S + part
             let hq = b.let_(Op::KernargI32 { offset: 320 });
             let (p_po, p_pl) = (b.let_(Op::KernargPtr { offset: 672 }), b.let_(Op::KernargPtr { offset: 688 }));
-            let nrow = { let v = b.bind_i32(((ev(bat) + 1) * ev(hq) * ev(s_q)) << ev(l)); b.read_first_lane(v) };
+            let s_cnt = b.let_(Op::KernargI32 { offset: 660 });
+            let nrow = { let v = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(s_q) * ev(s_cnt)); b.read_first_lane(v) };
             let npo = { let v = b.bind_i32(ev(nrow) * (4 * D)); b.read_first_lane(v) };
             let npl = { let v = b.bind_i32(ev(nrow) << 2); b.read_first_lane(v) };
             let (r_po, r_pl) = (b.buffer_desc_dyn(p_po, npo), b.buffer_desc_dyn(p_pl, npl));
-            let prow = b.bind_i32(((((ev(bat) * ev(hq) + ev(h)) * ev(s_q) + ev(row)) << ev(l)) + ev(pt)));
+            let prow = b.bind_i32((((ev(bat) * ev(hq) + ev(h)) * ev(s_q) + ev(row)) * ev(s_cnt)) + ev(pt));
             let pvo = b.bind_i32(ev(prow) * (4 * D) + (ev(half) << 4));
             let pvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(pvo), b: Opnd::Val(big) });
             for e in 0..4usize {
@@ -534,17 +537,18 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
         }
         b.end_if();
     });
-    if let (Some(l), Some(pt)) = (lg_s, part) {
+    if let (Some(_), Some(pt)) = (lg_s, part) {
         // an empty part (no tile): O = 0, LSE = -inf (the combine weights it 0)
         b.else_();
         let hq = b.let_(Op::KernargI32 { offset: 320 });
         let (p_po, p_pl) = (b.let_(Op::KernargPtr { offset: 672 }), b.let_(Op::KernargPtr { offset: 688 }));
-        let nrow = { let v = b.bind_i32(((ev(bat) + 1) * ev(hq) * ev(s_q)) << ev(l)); b.read_first_lane(v) };
+        let s_cnt = b.let_(Op::KernargI32 { offset: 660 });
+        let nrow = { let v = b.bind_i32((ev(bat) + 1) * ev(hq) * ev(s_q) * ev(s_cnt)); b.read_first_lane(v) };
         let npo = { let v = b.bind_i32(ev(nrow) * (4 * D)); b.read_first_lane(v) };
         let npl = { let v = b.bind_i32(ev(nrow) << 2); b.read_first_lane(v) };
         let (r_po, r_pl) = (b.buffer_desc_dyn(p_po, npo), b.buffer_desc_dyn(p_pl, npl));
         let live = b.bind_cond(ev(row).lt(ev(s_q)));
-        let prow = b.bind_i32(((((ev(bat) * ev(hq) + ev(h)) * ev(s_q) + ev(row)) << ev(l)) + ev(pt)));
+        let prow = b.bind_i32((((ev(bat) * ev(hq) + ev(h)) * ev(s_q) + ev(row)) * ev(s_cnt)) + ev(pt));
         let pvo = b.bind_i32(ev(prow) * (4 * D) + (ev(half) << 4));
         let pvo = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(pvo), b: Opnd::Val(big) });
         let z = b.c_i32(0);
@@ -568,22 +572,21 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
 
 /// Merges the S = 2^lg_s key parts of `fmha_fwd_hd128_bf16_v3_ks`: O[b, q, h, :] (bf16, BSHD) = sum_s w_s po_s / sum_s w_s with w_s =
 /// exp(lse_s - M); optional LSE [B, H, SQ] = M + ln(sum w). Grid (SQ, H, B), 128 threads (one per d). ABI: 0 ptr_o, 8 ptr_po, 16 ptr_plse,
-/// 24 ptr_lse, 32 H, 36 SQ, 40 lg_s, 44 lse_on.
+/// 24 ptr_lse, 32 H, 36 SQ, 40 S, 44 lse_on.
 pub fn attn_combine_bf16_hd128_q(name: &str) -> Function {
     let mut b = FnBuilder::new(name, 128);
     b.compile_profile(CompileProfile::Gemm);
     for (n, o) in [("ptr_o", 0u32), ("ptr_po", 8), ("ptr_plse", 16), ("ptr_lse", 24)] {
         b.arg(n, DType::Ptr, o, 8);
     }
-    for (n, o) in [("H", 32u32), ("SQ", 36), ("lg_s", 40), ("lse_on", 44)] {
+    for (n, o) in [("H", 32u32), ("SQ", 36), ("S", 40), ("lse_on", 44)] {
         b.arg(n, DType::I32, o, 4);
     }
     let (hh, sq) = (Ext::ka(32), Ext::ka(36));
     b.ka_range(32, 1, 256);
     b.ka_range(36, 1, 1 << 20);
-    b.sym_range("LS", 0, 4);
-    b.ka_is(40, Ext::sym("LS"));
     b.sym_range("SPL", 1, 16);
+    b.ka_is(40, Ext::sym("SPL"));
     b.sym_range("B", 1, 1 << 12);
     b.grid_is(0, sq.clone());
     b.grid_is(1, hh.clone());
@@ -600,11 +603,11 @@ pub fn attn_combine_bf16_hd128_q(name: &str) -> Function {
     let (q, h, bat) = (b.let_(Op::WorkgroupIdX), b.let_(Op::WorkgroupIdY), b.let_(Op::WorkgroupIdZ));
     let tid = b.let_(Op::WorkitemId);
     let row = { let v = b.bind_i32((ev(bat) * ev(hq) + ev(h)) * ev(s_q) + ev(q)); b.read_first_lane(v) };
-    let ns = { let v = b.bind_i32(I32::c(1) << ev(lg)); b.read_first_lane(v) };
-    let nrow = { let v = b.bind_i32((ev(row) + 1) << ev(lg)); b.read_first_lane(v) };
+    let ns = lg;
+    let nrow = { let v = b.bind_i32((ev(row) + 1) * ev(ns)); b.read_first_lane(v) };
     let r_pl = { let n = b.bind_i32(ev(nrow) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_pl, n) };
     let r_po = { let n = b.bind_i32(ev(nrow) * (4 * D)); let n = b.read_first_lane(n); b.buffer_desc_dyn(p_po, n) };
-    let base = { let v = b.bind_i32(ev(row) << ev(lg)); b.read_first_lane(v) };
+    let base = { let v = b.bind_i32(ev(row) * ev(ns)); b.read_first_lane(v) };
     let lso = { let v = b.bind_i32(ev(base) << 2); b.read_first_lane(v) };
     let c0 = b.c_i32(0);
     let neg_inf = b.c_f32(f32::NEG_INFINITY);
