@@ -111,10 +111,12 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
 
     // ---- private LDS: per wave one 32-key tile (36 KB) ----
     let mut lds = LdsPlan::new();
-    let kv = lds.private("KV", (KT * ROW) as i64, 4, &[]);
+    // the tile as two 16-key halves in separate private regions: QK of half 0 runs while half 1 lands
+    let kv0 = lds.private("KV0", (16 * ROW) as i64, 4, &[]);
+    let kv1 = lds.private("KV1", (16 * ROW) as i64, 4, &[]);
     lds.commit(&mut b);
-    let me = kv.mine(wv);
-    let mbase = me.base();
+    let mes = [kv0.mine(wv), kv1.mine(wv)];
+    let mbases = [mes[0].base(), mes[1].base()];
     for c in 0..2304i64 {
         assert_eq!((c * 1821) >> 17, c / 72, "c / 72 multiply-shift");
     }
@@ -161,40 +163,43 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     let pg = b.bitcast_i32(pv);
     let pg = b.bind_i32(ev(pg).max(0).min(ev(npages) - 1));
     let rowb = b.bind_i32((ev(pg) * page + (ev(kl) & (page - 1))) * ROW);
-    me.write(&mut b, Opnd::Var(it), |b| {
-        // groups of 12 issues: the row bases by ds_bpermute (lgkm-tracked), then the DMAs
-        for g0 in (0..36i32).step_by(12) {
-            let parts: Vec<(ValueId, ValueId)> = (g0..g0 + 12)
-                .map(|i| {
-                    let c = b.bind_i32((i << 6) + lane.lane());
-                    let key = b.bind_i32((ev(c) * 1821).lshr(17));
-                    let pos = b.bind_i32(ev(c) - ev(key) * CHUNKS);
-                    let src = b.bind_i32((ev(pos).lshr(3) << 3) + ((ev(pos) ^ ev(key)) & 7));
-                    let addr = b.bind_i32(ev(key) << 2);
-                    (b.bpermute(addr, rowb), src)
-                })
-                .collect();
-            for (k, (rb, src)) in parts.into_iter().enumerate() {
-                let i = g0 + k as i32;
-                let rb = b.bitcast_i32(rb);
-                let vo = b.bind_i32(ev(rb) + (ev(src) << 4));
-                let m0 = b.bind_i32(mbase.clone() + (i << 10));
-                b.buffer_load_lds_b128(r_kv, vo, c0, m0, 0);
+    // per half: 18 issues of 1 KB (chunk c = 72 key + position, key < 16), row bases by ds_bpermute from lane 16 h + key
+    for (h, me) in mes.iter().enumerate() {
+        let mb = mbases[h].clone();
+        me.write(&mut b, Opnd::Var(it), |b| {
+            for g0 in (0..18i32).step_by(9) {
+                let parts: Vec<(ValueId, ValueId)> = (g0..g0 + 9)
+                    .map(|i| {
+                        let c = b.bind_i32((i << 6) + lane.lane());
+                        let key = b.bind_i32((ev(c) * 1821).lshr(17));
+                        let pos = b.bind_i32(ev(c) - ev(key) * CHUNKS);
+                        let src = b.bind_i32((ev(pos).lshr(3) << 3) + ((ev(pos) ^ ev(key)) & 7));
+                        let addr = b.bind_i32((ev(key) + 16 * h as i32) << 2);
+                        (b.bpermute(addr, rowb), src)
+                    })
+                    .collect();
+                for (k, (rb, src)) in parts.into_iter().enumerate() {
+                    let i = g0 + k as i32;
+                    let rb = b.bitcast_i32(rb);
+                    let vo = b.bind_i32(ev(rb) + (ev(src) << 4));
+                    let m0 = b.bind_i32(mb.clone() + (i << 10));
+                    b.buffer_load_lds_b128(r_kv, vo, c0, m0, 0);
+                }
             }
-        }
-    });
-    b.wait_vm(0);
-    // ---- S^T: 2 blocks of 16 keys x 18 d chunks (independent chains interleaved) ----
-    let kb = b.bind_i32(mbase.clone());
-    me.read_back(&mut b, Opnd::Var(it), |b| {
-        for c in 0..QC {
-            for blk in 0..2i32 {
-                let a = b.bind_i32(ev(kr[c]) + ev(kb) + blk * 16 * ROW);
+        });
+    }
+    // ---- S^T: block (half) 0 after its 18 DMAs complete (half 1 in flight), then block 1 ----
+    for blk in 0..2usize {
+        b.wait_vm(if blk == 0 { 18 } else { 0 });
+        let kb = b.bind_i32(mbases[blk].clone());
+        mes[blk].read_back(&mut b, Opnd::Var(it), |b| {
+            for c in 0..QC {
+                let a = b.bind_i32(ev(kr[c]) + ev(kb));
                 let kf = b.load_lds_b128(a);
-                b.var_mfma(sv_[blk as usize], kind, kf, qf[c], c == 0);
+                b.var_mfma(sv_[blk], kind, kf, qf[c], c == 0);
             }
-        }
-    });
+        });
+    }
     // ---- softmax: values key_t + 16 blk + 4 g + r ----
     let key0 = b.bind_i32(ev(key_t) + (ev(grp) << 2));
     let mut s: Vec<ValueId> = Vec::with_capacity(8);
@@ -252,17 +257,17 @@ pub fn mla_decode_bf16(name: &str, page: i32) -> Function {
     // ---- O^T += V^T P^T: one 32-key step x 32 blocks of 16 d ----
     let w: Vec<ValueId> = [(0usize, 0usize), (0, 2), (1, 0), (1, 2)].iter().map(|&(blk, r)| b.cvt_pk_bf16_f32(p[4 * blk + r], p[4 * blk + r + 1])).collect();
     let pf = b.pack4(w[0], w[1], w[2], w[3]);
-    let vbase: Vec<ValueId> = vr.iter().map(|v| b.bind_i32(mbase.clone() + ev(*v))).collect();
-    me.read_back(&mut b, Opnd::Var(it), |b| {
-        for db in 0..DB as i32 {
-            let q = (db % 4) as usize;
-            let hi = ((2 * db) & !7) << 4;
-            let a0 = b.bind_i32(ev(vbase[q]) + hi);
-            let a1 = b.bind_i32(ev(vbase[q]) + hi + 16 * ROW);
-            let vf = b.load_lds_tr_b16x2(a0, a1);
-            b.var_mfma(ov[db as usize], kind, vf, pf, false);
-        }
-    });
+    let vb0: Vec<ValueId> = vr.iter().map(|v| b.bind_i32(mbases[0].clone() + ev(*v))).collect();
+    let vb1: Vec<ValueId> = vr.iter().map(|v| b.bind_i32(mbases[1].clone() + ev(*v))).collect();
+    // the two halves are read inside one region each: the 32 MFMAs need both, so the reads are split per half (A halves cat'ed)
+    for db in 0..DB as i32 {
+        let q = (db % 4) as usize;
+        let hi = ((2 * db) & !7) << 4;
+        let x0 = mes[0].read_back(&mut b, Opnd::Var(it), |b| { let a = b.bind_i32(ev(vb0[q]) + hi); b.load_lds_tr_b16(a) });
+        let x1 = mes[1].read_back(&mut b, Opnd::Var(it), |b| { let a = b.bind_i32(ev(vb1[q]) + hi); b.load_lds_tr_b16(a) });
+        let vf = b.cat_frag4(x0, x1);
+        b.var_mfma(ov[db as usize], kind, vf, pf, false);
+    }
     let it1 = b.bind_i32(itx.clone() + 1);
     b.set_var(it, it1);
     let done = b.bind_cond(ev(it1).ge(ev(nloop)));
