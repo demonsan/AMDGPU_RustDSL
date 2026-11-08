@@ -573,7 +573,7 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     }
     }
     let mut f = b.finish();
-    if vs_policy {
+    if vs_policy || (causal && !split && std::env::var("EXP_CS").is_ok()) {
         f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
     }
     f
