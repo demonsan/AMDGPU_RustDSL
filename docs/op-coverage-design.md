@@ -559,3 +559,47 @@
 - prefill：8 wave 两组 ping-pong（v3 骨架）、延迟 rescale、QK / softmax / PV 交叠；
 - decode：每 wave 更大的块、私有环双缓冲、页表查找提到循环外、一 tile 多页时按页 DMA；
 - MLA：S 归约改为 DPP / permlane，或换成按 head 切分。
+
+### 7.6 批次 4（fused MoE）状态：bf16、fp8 per-token、fp8 blockscale 均已覆盖
+
+**实现**：`gemm_moe1_<bf16|fp8|fp8bs>_<silu|gelu>[_dw]`、`gemm_moe2_<bf16|fp8|fp8bs>`、`moe_sum_bf16_k<K>`，都在 [`gemm/mod.rs`](../crates/amdgpu-kernels/src/gemm/mod.rs) 的 `MoeStage` 下。它们复用 v4 GEMM 结构，消费 aiter `moe_sorting` 的输出：
+- `sorted_token_ids` 编码为 `(slot << 24) | token`，padding 为 `(topk << 24) | M`；
+- `sorted_expert_ids` 按 M tile 给出；
+- `num_valid_ids` 之后的 tile 直接退出。
+
+**数据流**：
+- **A 行 gather**：每 lane 的 voffset 在循环外一次算好。stage 1 按 token 取行，stage 2 按 `token·topk + slot` 取行。每个 DMA issue 有自己的 M0，不用指令偏移。
+- **B**：按 expert 取基址。stage 1 的 W1 由 host 把 gate / up 以 16 行块交错后再做 `shuffle_weight(16,16)`，使同一 lane 同时持有同一输出列的 gate 和 up。
+- **stage 1 epilogue**：寄存器内算 `act(gate)·up`（silu 或 tanh 形式的 gelu），可选乘路由权重，输出 bf16 `[M, topk, I]`，与 aiter stage 1 布局相同。
+- **stage 2**：fp32 `[M, topk, D]` 乘路由权重，再由 `moe_sum` 沿 topk 求和。
+
+**对照**：[`moe_host.cpp`](../tests/gpu/moe_host.cpp) 在同一进程、同一数据上运行 ours 与 aiter stage 1 ASM（W1 为 aiter 的堆叠布局）。
+
+**数据**：2026-11-08，GPU 5。全部 `bad=0`，strict 0 错误。aiter stage 1 的输出与我们的 y1 在容差内完全一致（diffs=0）。
+
+| 形状（fp8 per-token，silu，block_m 128） | ours stage 1 | aiter `fmoe_stage1 …128x128_pf2` | 比 |
+|---|--:|--:|--:|
+| M1024 D4096 I1024 E8 topk2 | 38.3 µs | 40.8 µs | 1.07 |
+| M4096 D7168 I512 E32 topk8 | 345.7 µs | 395.4 µs | 1.14 |
+| M256 D7168 I2048 E64 topk8 | 423.3 µs | 391.8 µs | 0.93 |
+
+blockscale 128×128（`fp8bs`）的规则：
+- A 的 scale 行随 gather 取；
+- B 的 scale 按 expert 取块；
+- stage 1 的 gate 与 up 各有一个 scale 字，按 n 块交替使用。
+
+对照的是 aiter `…blockscale_g1u1_128x128_pf2`。它多做一步：输出时量化成 fp8。所以下表只比时间。
+
+| 形状（fp8 blockscale，silu） | ours stage 1 | aiter | 比 |
+|---|--:|--:|--:|
+| M1024 D4096 I1024 E8 topk2 | 60.6 µs | 52.5 µs | 0.87 |
+| M4096 D7168 I512 E32 topk8 | 516.3 µs | 447.4 µs | 0.87 |
+| M256 D7168 I2048 E64 topk8 | 527.9 µs | 418.4 µs | 0.79 |
+
+**待办**：
+- **stage 2**：现在走 fp32 中间结果再求和，例如 4096×7168×topk8 要写 940 MB，所以只有 362 TF/s。改为 bf16 原子累加或在 CTA 内按 token 归并。aiter 没有 ASM stage 2（它用 CK），需要另找对照。
+- **blockscale stage 1**：0.8–0.87×。需要与批次 1 的 blockscale 中等 M 问题一起处理，方向是块乘积延后一个 tile。
+- **小 block_m（32 / 64）**：稀疏专家时需要。
+- **stage 1 → stage 2 的 per-token 量化**：现在由 host 完成，需要换成 kernel。
+
+**后端问题（已报告）**：一个结果未被使用的 load，其目标 VGPR 在 load 仍在途时被重新分配，load 晚到后覆盖新值（WAW）。表现为冷启动时错、热运行时对。已用"不发出死 load"绕开。

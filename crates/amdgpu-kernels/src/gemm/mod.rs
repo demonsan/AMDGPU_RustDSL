@@ -48,6 +48,23 @@ pub struct GemmConfig {
     /// split-K: grid z = split index over `S` (kernarg 36) splits of KS (kernarg 88) tiles each; the fp32 partial C goes to `ptr_c` as
     /// [S][M][N] (row / column scales are left to the reduce, `gemm_splitk_reduce`)
     pub split_k: bool,
+    /// fused-MoE grouped GEMM over aiter-style sorted routes (`MoeStage`)
+    pub moe: Option<MoeStage>,
+}
+
+/// The two grouped GEMMs of a fused MoE over the moe_sorting outputs (sorted_token_ids `(slot << 24) | token`, padding `(topk << 24) | M`;
+/// sorted_expert_ids per M tile; num_valid_ids [padded rows, M]; sorted_weights). M tile = cta_m sorted rows of ONE expert; tiles past
+/// num_valid_ids[0] exit. ABI = the 96-byte GEMM ABI (A, B = all experts, C, m = A rows, n = B rows per expert, k) + 96 ptr_sorted_ids,
+/// 104 ptr_sorted_expert_ids, 112 ptr_num_valid_ids, 120 ptr_sorted_weights, 128 topk, 132 E, 136 n_out, 140 M (tokens).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeStage {
+    /// gate / up: A = X [M, k] gathered by token, B = W1 [E, 2 n_out, k] with the gate and up rows INTERLEAVED in 16-row blocks (block 2 p =
+    /// gate rows 16 p.., block 2 p + 1 = up rows 16 p..; then aiter shuffle_weight(16, 16)) so a lane holds both for the same output columns;
+    /// C = act(gate) up (x the routing weight with `doweight`) bf16 [M, topk, n_out] at row token topk + slot
+    Up { gelu: bool, doweight: bool },
+    /// down: A = the stage-1 output [M topk, k] gathered by (token, slot), B = W2 [E, n_out, k]; C = fp32 [M, topk, n_out] x the routing
+    /// weight (summed over topk by `reduce::moe_sum_bf16`)
+    Down,
 }
 
 /// Operand element type of the GEMM.
@@ -97,7 +114,7 @@ pub enum Scales {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -114,6 +131,11 @@ impl GemmConfig {
     /// fp8 A8W8 with fp32 1 x 128 / 128 x 128 block scales (`gemm_a8w8_blockscale`): 128 x 128 CTA, VGPR accumulators (acc += t s).
     pub fn a8w8_blockscale() -> GemmConfig {
         GemmConfig { cta_m: 128, cta_n: 128, acc_agpr: 0, scales: Scales::Block128, elem: Elem::Fp8Bs, ..GemmConfig::v4() }
+    }
+    /// The fused-MoE stage `st` (128-row tiles = block_m 128; stage 1: 256 interleaved gate / up B rows = 128 output columns per CTA).
+    pub fn moe(elem: Elem, scales: Scales, st: MoeStage) -> GemmConfig {
+        let cta_n = if matches!(st, MoeStage::Up { .. }) { 256 } else { 128 };
+        GemmConfig { cta_m: 128, cta_n, lds_epilogue: false, scales, elem, moe: Some(st), ..GemmConfig::v4() }
     }
     /// Split-K form of a 128 x 128 configuration (fp32 partials + `reduce::gemm_splitk_reduce`).
     pub fn splitk(self) -> GemmConfig {
@@ -255,7 +277,10 @@ fn declare_abi(b: &mut FnBuilder) {
 /// The host contract of the ABI for a `cta_m x cta_n` CTA (what `gpu-verify` proves the accesses against): M = MT cta_m, N = NT cta_n, K = KT 128
 /// (the kernel has no partial tiles), the grid (NT, MT), dense strides (stride_a = stride_b = K, stride_c = N, stride_sfa = M, stride_sfb = K / 128),
 /// batch 1, and the tensor extents A M K, B N K (preshuffled, same size), C 2 M N, sa (K / 128) M, sb (N / 128) (K / 128) bytes.
-fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool) {
+fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool, moe: Option<MoeStage>) {
+    if let Some(st) = moe {
+        return declare_contract_moe(b, cta_m, cta_n, scales, per_tile, st);
+    }
     let (mt, nt) = (Ext::sym("MT"), Ext::sym("NT"));
     // int32 offsets: M K, N K and 2 M N stay below 2^31 (16384 x 65536 tiles of bytes at most)
     b.sym_range("MT", 1, (1 << 14) / cta_m);
@@ -318,9 +343,65 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, p
     }
 }
 
+/// The MoE contract: MT = max M tiles (grid y), NT = output N tiles (grid x), A rows m (tokens or tokens x topk), B rows per expert n, E
+/// experts, KT 128-byte K tiles.
+fn declare_contract_moe(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, st: MoeStage) {
+    for (n, o) in [("ptr_sorted_ids", 96u32), ("ptr_sorted_expert_ids", 104), ("ptr_num_valid_ids", 112), ("ptr_sorted_weights", 120)] {
+        b.arg(n, DType::Ptr, o, 8);
+    }
+    for (n, o) in [("topk", 128u32), ("E", 132), ("n_out", 136), ("M_tokens", 140)] {
+        b.arg(n, DType::I32, o, 4);
+    }
+    let (mt, nt, kt, ee) = (Ext::sym("MT"), Ext::sym("NT"), Ext::sym("KT"), Ext::sym("E"));
+    let nt_c = nt.clone();
+    b.sym_range("MT", 1, 4096);
+    b.sym_range("NT", 1, 256);
+    b.sym_range("KT", 1, PANEL_KB);
+    b.sym_range("E", 1, 512);
+    b.sym_range("AR", 1, 1 << 20);
+    b.ka_range(128, 1, 16);
+    b.ka_range(140, 1, 1 << 20);
+    let k = kt.clone() * Ext::c(128);
+    let k_el = kt.clone() * Ext::c(per_tile);
+    // output columns per CTA: stage 1 half the B rows (gate / up interleaved)
+    let ncta = if matches!(st, MoeStage::Up { .. }) { cta_n / 2 } else { cta_n };
+    let n_out = nt.clone() * Ext::c(ncta);
+    let n = if matches!(st, MoeStage::Up { .. }) { n_out.clone() * Ext::c(2) } else { n_out.clone() };
+    let m = Ext::sym("AR");
+    b.ka_is(24, m.clone());
+    b.ka_is(28, n.clone());
+    b.ka_is(32, k_el.clone());
+    b.ka_is(36, Ext::c(1));
+    b.ka_is(40, k_el.clone());
+    b.ka_is(44, k_el);
+    b.ka_is(48, n_out.clone());
+    b.ka_is(84, kt.clone());
+    b.ka_is(132, ee.clone());
+    b.ka_is(136, n_out.clone());
+    b.grid_is(0, nt);
+    b.grid_is(1, mt.clone());
+    b.arg_tensor("ptr_a", m.clone() * k.clone());
+    b.arg_tensor("ptr_b", ee.clone() * n.clone() * k);
+    let out_rows = Ext::ka(140) * Ext::ka(128);
+    b.arg_tensor("ptr_c", out_rows * n_out * Ext::c(if matches!(st, MoeStage::Up { .. }) { 2 } else { 4 }));
+    b.arg_tensor("ptr_sorted_ids", mt.clone() * Ext::c(4 * cta_m));
+    b.arg_tensor("ptr_sorted_weights", mt.clone() * Ext::c(4 * cta_m));
+    b.arg_tensor("ptr_sorted_expert_ids", mt * Ext::c(4));
+    b.arg_tensor("ptr_num_valid_ids", Ext::c(8));
+    if scales == Scales::RowCol {
+        b.arg_tensor("ptr_sfa", Ext::c(4) * m);
+        b.arg_tensor("ptr_sfb", Ext::c(4) * ee * n);
+    } else if scales == Scales::Block128 {
+        b.arg_tensor("ptr_sfa", Ext::c(4) * m * kt.clone());
+        b.arg_tensor("ptr_sfb", Ext::c(4 * cta_n / 128) * ee * nt_c * kt);
+    }
+}
+
 /// One DMA stage of a [rows x 128 B] tile: per issue the lane's voffset (bound once, loop invariant) and the LDS offset of its 1 KB block.
 struct Dma {
     issues: Vec<(ValueId, i32)>,
+    /// per-lane gathered rows (MoE): every issue its own M0, no instruction offset (the voffset is the exact source offset)
+    gather: bool,
     /// LDS bytes per 1 KB issue block (1024, or 1056 for the padded A image); the issue LDS offsets above are in 1 KB units (`act`)
     pitch: i32,
 }
@@ -328,7 +409,14 @@ struct Dma {
 impl Dma {
     /// (M0 offset of the issue's group of 4, instruction offset) for the virtual 1 KB offset `lds`
     fn act(&self, lds: i32) -> (i32, u32) {
+        if self.gather {
+            return (lds / 1024 * self.pitch, 0);
+        }
         ((lds - lds % 4096) / 1024 * self.pitch, ((lds % 4096) / 1024 * self.pitch) as u32)
+    }
+    /// the M0 group of an issue
+    fn group(&self, lds: i32) -> i32 {
+        if self.gather { lds } else { lds - lds % 4096 }
     }
 }
 
@@ -339,7 +427,7 @@ fn finish_dma_p(b: &mut FnBuilder, ctx: &Ctx, gofs: Vec<Ix>, pitch: i32) -> Dma 
     ctx.set_bitfield(true);
     let issues = adj.iter().enumerate().map(|(q, g)| { let e = ctx.bind(b, g); (b.bind_i32(e), 1024 * q as i32) }).collect();
     ctx.set_bitfield(false);
-    Dma { issues, pitch }
+    Dma { issues, pitch, gather: false }
 }
 /// LDS byte `d = 1024 (issues (tid / 64) + q) + 16 (tid % 64)` holds tile element `smem^-1(d)`, so the source offset is `glob o right_inverse(smem)`;
 /// proved here for sampled threads against a direct search of the LDS layout.
@@ -364,6 +452,22 @@ fn dma_plan(b: &mut FnBuilder, ctx: &Ctx, s_tid: &Ix, rows: i64, glob: &Layout, 
     }
     // MUBUF form: voffset (loop invariant) + soffset + the instruction offset 1024 (q % 4) = the global offset; M0 = the group's first 1 KB block
     finish_dma_p(b, ctx, gofs, 1024)
+}
+
+/// The A DMA of the padded image with GATHERED rows (MoE): the same lane -> (tile row lane / 8 + 8 block, bytes 16 (lane % 8)) map as
+/// `dma_plan_rows_pad`; the source row of tile row r is `row_src(r)` (per lane, loop invariant); exact voffsets, no instruction offset.
+fn dma_plan_gather(b: &mut FnBuilder, lane: &Lane, rows: i64, waves: i64, k_v: ValueId, row_src: &dyn Fn(&mut FnBuilder, I32) -> ValueId) -> Dma {
+    let issues = rows * 128 / 1024 / waves;
+    let mut out = Vec::new();
+    for q in 0..issues {
+        let r = (lane.wave() * issues as i32 + q as i32) * 8 + lane.lane().lshr(3);
+        let src = row_src(b, r);
+        let v = b.bind_i32(ev(src) * ev(k_v) + ((lane.lane() & 7) << 4));
+        out.push((v, 1024 * q as i32));
+    }
+    // the row-index loads complete here: the pipeline's counted vmcnt waits count only its DMAs
+    b.wait_vm(0);
+    Dma { issues: out, pitch: 1056, gather: true }
 }
 
 /// A-tile DMA for the PADDED row-major LDS image (the vendor form): 1 KB blocks of 8 whole 128-byte rows at a pitch of 1056 bytes (32 bytes of
@@ -609,6 +713,9 @@ impl Body {
     fn sb_sel(&self, j: usize) -> usize {
         if self.mx32.is_some() {
             j
+        } else if self.bs128.as_ref().is_some_and(|bs| bs.voff_b.len() == 2) {
+            // MoE stage 1 blockscale: gate / up blocks alternate
+            j % 2
         } else {
             0
         }
@@ -758,7 +865,7 @@ impl Body {
                 let mut m0s: Vec<(i32, ValueId)> = Vec::new();
                 let mut mine: Vec<(ValueId, i32, ValueId)> = Vec::new();
                 for (g, lds) in dma.issues.iter() {
-                    let grp = *lds - *lds % 4096;
+                    let grp = dma.group(*lds);
                     if !m0s.iter().any(|x| x.0 == grp) {
                         let v = b.bind_i32(ev(sbase) + dma.act(*lds).0);
                         let v = b.read_first_lane(v);
@@ -881,6 +988,13 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_blockscale_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_splitk", GemmConfig::a8w8_blockscale().splitk())),
         "gemm_a8w8_rowcol_fp8_128_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128_splitk", GemmConfig::a8w8_rowcol_128().splitk())),
         "gemm_a16w16_bf16_128_splitk" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128_splitk", GemmConfig::a16w16_128().splitk())),
+        n if n.starts_with("moe_sum_bf16_k") => n["moe_sum_bf16_k".len()..].parse::<i64>().ok().filter(|k| (1..=16).contains(k)).map(|k| reduce::moe_sum_bf16(n, k)),
+        n if n.starts_with("gemm_moe") => {
+            // gemm_moe<1|2>_<bf16|fp8>[_silu|_gelu][_dw]
+            let (elem, scales) = if n.contains("_fp8bs") { (Elem::Fp8Bs, Scales::Block128) } else if n.contains("_fp8") { (Elem::Fp8, Scales::RowCol) } else { (Elem::Bf16, Scales::None) };
+            let st = if n.starts_with("gemm_moe1") { MoeStage::Up { gelu: n.contains("_gelu"), doweight: n.ends_with("_dw") } } else { MoeStage::Down };
+            Some(gemm_mxfp8_bs(n, GemmConfig::moe(elem, scales, st)))
+        }
         n if n.starts_with("gemm_splitk_reduce_s") => {
             // gemm_splitk_reduce_s<S>[_rc]
             let rest = &n["gemm_splitk_reduce_s".len()..];
@@ -903,8 +1017,24 @@ fn build(name: &str, cfg: Cfg) -> Function {
 }
 
 /// Everything the slots of the GEMM share (the locals of the former monolithic builder).
+/// MoE per-CTA values.
+#[derive(Clone)]
+struct MoeCx {
+    st: MoeStage,
+    rsrc_sid: ValueId,
+    rsrc_sw: ValueId,
+    topk: ValueId,
+    mtok: ValueId,
+    nout: ValueId,
+    e: ValueId,
+    live: ValueId,
+    row0: ValueId,
+}
+
 pub(crate) struct GemmCx {
     cfg: Cfg,
+    moe: Option<MoeCx>,
+    rsrc_sfa_e: Option<(ValueId, ValueId)>,
     body: Body,
     pipe: Option<Pipeline>,
     ctx: Ctx,
@@ -945,7 +1075,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         b.sched_opts(cfg.sched);
     }
     declare_abi(b);
-    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k);
+    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k, cfg.moe);
     // timing stamps (opt-in debug build, GEMM_STAMP=ends|tiles): one extra pointer argument after the ABI (offset 96); see docs/stamps.md
     let stamp_mode = std::env::var("GEMM_STAMP").ok().filter(|v| v == "ends" || v == "tiles");
     if stamp_mode.is_some() {
@@ -983,7 +1113,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     });
     // XCD-aware raster: workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
     // give every XCD whole 4 x 4 blocks of tiles (4 A + 4 B panels instead of all A panels). Only for a 16 x 16 tile grid here; identity otherwise.
-    let (bx, by) = {
+    let (bx, by) = if cfg.moe.is_some() { (bx0, by0) } else {
         let okv = b.bind_i32((ev(n_v) ^ (16 * cfg.cta_n) as i32) | (ev(m_v) ^ (16 * cfg.cta_m) as i32));
         let id = b.bind_i32(ev(bx0) + (ev(by0) << 4));
         let loc = b.bind_i32(ev(id).lshr(3));
@@ -1047,13 +1177,53 @@ impl skeleton_v4::V4Slots for GemmSlots {
     // ---- DMA (A row-major into the padded image, B preshuffled), wave parts of M0, CTA origins ----
     let a_glob = make_layout(tup![cta_m, 128], tup![s_k.clone(), 1]);
     let b_glob = make_layout(tup![tup![16, cta_n / 16], tup![16, 8]], tup![tup![16, s_k.mul_c(16)], tup![1, 256]]);
-    let a_dma = dma_plan_rows_pad(b, &ctx, &s_tid, cta_m, &a_glob, 8192, 4);
+    // MoE: the tile's rows, its expert, the live test (tiles past num_valid_ids[0] do nothing)
+    let moe_cx = cfg.moe.map(|st| {
+        let kp = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargPtr { offset: o });
+        let ki = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargI32 { offset: o });
+        let (p_sid, p_eid, p_nv, p_sw) = (kp(b, 96), kp(b, 104), kp(b, 112), kp(b, 120));
+        let (topk, ne, nout, mtok) = (ki(b, 128), ki(b, 132), ki(b, 136), ki(b, 140));
+        let nrows = { let v = b.bind_i32(((ev(by) + 1) << lg_m) << 2); b.read_first_lane(v) };
+        let rsrc_sid = b.buffer_desc_dyn(p_sid, nrows);
+        let rsrc_sw = b.buffer_desc_dyn(p_sw, nrows);
+        let rsrc_nv = b.buffer_desc(p_nv, 8);
+        let neid = { let v = b.bind_i32((ev(by) + 1) << 2); b.read_first_lane(v) };
+        let rsrc_e = b.buffer_desc_dyn(p_eid, neid);
+        let c0 = b.c_i32(0);
+        let nv = { let v = b.buffer_load_f32(rsrc_nv, c0, 0i32, 0); let v = b.bitcast_i32(v); b.read_first_lane(v) };
+        let eo = { let v = b.bind_i32(ev(by) << 2); b.read_first_lane(v) };
+        let e = { let v = b.buffer_load_f32(rsrc_e, c0, eo, 0); let v = b.bitcast_i32(v); let v = b.bind_i32(ev(v).max(0).min(ev(ne) - 1)); b.read_first_lane(v) };
+        let row0 = { let v = b.bind_i32(ev(by) << lg_m); b.read_first_lane(v) };
+        let live = b.bind_cond(ev(row0).lt(ev(nv)));
+        MoeCx { st, rsrc_sid, rsrc_sw, topk, mtok, nout, e, live, row0 }
+    });
+    let a_dma = match &moe_cx {
+        None => dma_plan_rows_pad(b, &ctx, &s_tid, cta_m, &a_glob, 8192, 4),
+        Some(mc) => {
+            let mc = mc.clone();
+            dma_plan_gather(b, &lane, cta_m, 4, k_v, &|b, r| {
+                // source row of sorted row row0 + r: the token (stage 1) or token topk + slot (stage 2), clamped inside A
+                let vo = b.bind_i32(r << 2);
+                let so = { let v = b.bind_i32(ev(mc.row0) << 2); b.read_first_lane(v) };
+                let sid = b.buffer_load_f32(mc.rsrc_sid, vo, so, 0);
+                let sid = b.bitcast_i32(sid);
+                let tok = b.bind_i32(ev(sid) & 0xff_ffff);
+                match mc.st {
+                    MoeStage::Up { .. } => b.bind_i32(ev(tok).min(ev(mc.mtok) - 1)),
+                    MoeStage::Down => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
+                }
+            })
+        }
+    };
     let b_dma = dma_plan(b, &ctx, &s_tid, cta_n, &b_glob, 8192, 4);
     let a_wave = b.bind_i32(lane.wave() * (a_bytes / 4) as i32);
     let b_wave = b.bind_i32(lane.wave() * (cta_n * 128 / 4) as i32);
     // buffer descriptors over A (M K bytes) and the preshuffled B (N K bytes)
     let rsrc_a = { let n = b.bind_i32(ev(m_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_a, n) };
-    let rsrc_b = { let n = b.bind_i32(ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) };
+    let rsrc_b = match &moe_cx {
+        None => { let n = b.bind_i32(ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) }
+        Some(_) => { let ne = b.let_(Op::KernargI32 { offset: 132 }); let n = b.bind_i32(ev(ne) * ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) }
+    };
     let (rsrc_sfa, rsrc_sfb) = match cfg.scales {
         Scales::Mx128 => (
             { let n = b.bind_i32(ev(m_v) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
@@ -1061,13 +1231,24 @@ impl skeleton_v4::V4Slots for GemmSlots {
         ),
         Scales::RowCol => (
             { let n = b.bind_i32(ev(m_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
-            { let n = b.bind_i32(ev(n_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
+            // MoE: the weight scales of every expert [E, n]
+            if cfg.moe.is_some() {
+                let ne = b.let_(Op::KernargI32 { offset: 132 });
+                let n = b.bind_i32(ev(ne) * ev(n_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            } else {
+                let n = b.bind_i32(ev(n_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            },
         ),
         // unused (no scales)
         Scales::None => (rsrc_a, rsrc_b),
         Scales::Block128 => (
             { let n = b.bind_i32(ev(m_v) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
-            { let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
+            if cfg.moe.is_some() {
+                let ne = b.let_(Op::KernargI32 { offset: 132 });
+                let n = b.bind_i32(ev(ne) * (ev(n_v) >> 7) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            } else {
+                let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n)
+            },
         ),
         // [rows][K / 32] bytes = rows * K bytes / 64 for fp4 (K bytes = K / 2)
         Scales::Mx32 => (
@@ -1086,6 +1267,11 @@ impl skeleton_v4::V4Slots for GemmSlots {
         (kb_v, None)
     };
     let (a_org, b_org) = match zb {
+        // MoE: rows are gathered (A origin 0); B = the tile's expert (stage 1: the CTA's gate rows bx 128, up rows + n_out)
+        None if moe_cx.is_some() => {
+            let mc = moe_cx.as_ref().unwrap();
+            (b.c_i32(0), b.bind_i32((ev(mc.e) * ev(n_v) + (ev(bx) << lg_n)) * ev(k_v)))
+        }
         None => (b.bind_i32((ev(by) << lg_m) * ev(k_v)), b.bind_i32((ev(bx) << lg_n) * ev(k_v))),
         Some(zb) => (b.bind_i32((ev(by) << lg_m) * ev(k_v) + (ev(zb) << 7)), b.bind_i32((ev(bx) << lg_n) * ev(k_v) + (ev(zb) << 11))),
     };
@@ -1138,6 +1324,35 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let bs128 = (cfg.scales == Scales::Block128).then(|| {
         let r16 = b.bind_i32(lane.lane() & 15);
         let rowb = b.bind_i32(ev(kb_v) << 2);
+        if let Some(mc) = &moe_cx {
+            // MoE: A scale rows of the gathered rows ([A rows][KT] floats); B scales [E, n / 128, KT] of the tile's expert. Stage 1: the
+            // wave's 128 interleaved rows = 64 gate rows of gate block gb and the matching 64 up rows of block n_out / 128 + gb (two words,
+            // n block j uses word j % 2)
+            let so = { let v = b.bind_i32(ev(mc.row0) << 2); b.read_first_lane(v) };
+            let voff_a = (0..wave_m / 16)
+                .map(|i| {
+                    let vo = b.bind_i32((ev(wm) * (wave_m as i32) + (16 * i) as i32 + ev(r16)) << 2);
+                    let sid = b.buffer_load_f32(mc.rsrc_sid, vo, so, 0);
+                    let sid = b.bitcast_i32(sid);
+                    let tok = b.bind_i32(ev(sid) & 0xff_ffff);
+                    let row = match mc.st {
+                        MoeStage::Up { .. } => b.bind_i32(ev(tok).min(ev(mc.mtok) - 1)),
+                        MoeStage::Down => b.bind_i32((ev(tok) * ev(mc.topk) + ev(sid).lshr(24)).min(ev(m_v) - 1).max(0)),
+                    };
+                    b.bind_i32(ev(row) * ev(rowb))
+                })
+                .collect();
+            b.wait_vm(0);
+            let nbe = b.bind_i32(ev(mc.e) * ev(n_v).lshr(7));
+            let voff_b = if matches!(mc.st, MoeStage::Up { .. }) {
+                let gb = b.bind_i32(((ev(bx) << 1) + ev(wn)).lshr(1));
+                vec![b.bind_i32((ev(nbe) + ev(gb)) * ev(rowb)), b.bind_i32((ev(nbe) + ev(mc.nout).lshr(7) + ev(gb)) * ev(rowb))]
+            } else {
+                let nb = b.bind_i32(((ev(bx) << lg_n) + ev(wn) * (wave_n as i32)).lshr(7));
+                vec![b.bind_i32((ev(nbe) + ev(nb)) * ev(rowb))]
+            };
+            return Mx32 { voff_a, voff_b, shift: r16 };
+        }
         let a0 = b.bind_i32((ev(by) << lg_m) + ev(wm) * (wave_m as i32) + ev(r16));
         let voff_a = (0..wave_m / 16).map(|i| b.bind_i32((ev(a0) + (16 * i) as i32) * ev(rowb))).collect();
         let nb = b.bind_i32(((ev(bx) << lg_n) + ev(wn) * (wave_n as i32)).lshr(7));
@@ -1160,7 +1375,11 @@ impl skeleton_v4::V4Slots for GemmSlots {
         cfg, kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
         a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, pending: Default::default(), zb,
     };
-        GemmCx { cfg, body, pipe: Some(pipe), ctx, mma, epi, lane, s_lane, s_n, s_wm, s_wn, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx }
+        // MoE: everything after this runs only for tiles below num_valid_ids[0] (closed at the end of the epilogue)
+    if let Some(mc) = &moe_cx {
+        b.begin_if(Opnd::Val(mc.live));
+    }
+    GemmCx { cfg, moe: moe_cx, rsrc_sfa_e: Some((rsrc_sfa, rsrc_sfb)), body, pipe: Some(pipe), ctx, mma, epi, lane, s_lane, s_n, s_wm, s_wn, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx }
     }
     fn pipeline(&mut self, b: &mut FnBuilder, cx: &mut GemmCx) -> Pipeline {
         if let Some((buf, rec, _)) = cx.stamp_ctx {
@@ -1208,6 +1427,12 @@ impl skeleton_v4::V4Slots for GemmSlots {
         for v in bv.iter().chain(av.iter()) {
             b.pin_agpr(*v);
         }
+    }
+    if let Some(mc) = cx.moe.clone() {
+        let (rsa, rsb) = cx.rsrc_sfa_e.expect("descriptors");
+        moe_epilogue(b, &ctx, &mma, &body.acc, s_lane, &mc, cfg, rsa, rsb, ptr_c, m_v, n_v, bx, wm, wn, wave_m, wave_n);
+        b.end_if();
+        return;
     }
     if cfg.split_k {
         // split-K: the fp32 partial C straight from the accumulator layout (lane = row m, 4 consecutive n: one 16-byte store) into
@@ -1279,6 +1504,135 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let st = b.memtime_lo();
         b.stamp_store(buf, rec, 4, st);
     }
+    }
+}
+
+/// The MoE epilogue straight from the accumulators (lane: row = the c_tv row, 4 consecutive columns): per m block the sorted row's
+/// (token, slot) and routing weight; stage 1: act(gate) up of the interleaved block pairs -> bf16 [M topk, n_out] at row token topk + slot;
+/// stage 2: fp32 [M topk, n_out] x the weight. Padding rows (token >= M) store past the descriptor (dropped).
+#[allow(clippy::too_many_arguments)]
+fn moe_epilogue(
+    b: &mut FnBuilder, ctx: &Ctx, mma: &TiledMma, acc: &[VarId], s_lane: &Ix, mc: &MoeCx, cfg: Cfg, rsa: ValueId, rsb: ValueId, ptr_c: ValueId, m_v: ValueId,
+    n_v: ValueId, bx: ValueId, wm: ValueId, wn: ValueId, wave_m: i64, wave_n: i64,
+) {
+    let d = &ctx.dyns;
+    let (nm, nn) = ((wave_m / 16) as usize, (wave_n / 16) as usize);
+    let idx = IssuePlan::new(mma.c_tv(), 4).offsets(&make_layout(tup![16, 16], tup![1024, 1]), s_lane, &Ix::C(0), d);
+    let o = b.bind_i32(ctx.lower(&idx[0]));
+    let (rl, cl) = (b.bind_i32(ev(o).lshr(10)), b.bind_i32(ev(o) & 1023));
+    let up = matches!(mc.st, MoeStage::Up { .. });
+    let esz = if up { 2 } else { 4 };
+    let rsrc_c = { let n = b.bind_i32(ev(mc.mtok) * ev(mc.topk) * ev(mc.nout) * esz); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_c, n) };
+    let so = { let v = b.bind_i32(ev(mc.row0) << 2); b.read_first_lane(v) };
+    let big = b.c_i32(0x7fff_fff0);
+    let c0 = b.c_i32(0);
+    // the first output column of this lane in the wave
+    let col0 = if up {
+        b.bind_i32((ev(bx) << (cfg.cta_n.trailing_zeros() as i32 - 1)) + ev(wn) * (wave_n as i32 / 2) + ev(cl))
+    } else {
+        b.bind_i32((ev(bx) << cfg.cta_n.trailing_zeros() as i32) + ev(wn) * (wave_n as i32) + ev(cl))
+    };
+    let l2e = b.c_f32(std::f32::consts::LOG2_E);
+    let one = b.c_f32(1.0);
+    for i in 0..nm {
+        let sr = b.bind_i32(ev(wm) * (wave_m as i32) + 16 * i as i32 + ev(rl));
+        let vo = b.bind_i32(ev(sr) << 2);
+        let sid = b.buffer_load_f32(mc.rsrc_sid, vo, so, 0);
+        let sid = b.bitcast_i32(sid);
+        // the routing weight only where it is used (a dead load's destination must not be reused while it is in flight: backend issue)
+        let use_w = !matches!(mc.st, MoeStage::Up { doweight: false, .. });
+        let sw = if use_w { b.buffer_load_f32(mc.rsrc_sw, vo, so, 0) } else { b.c_f32(1.0) };
+        let tok = b.bind_i32(ev(sid) & 0xff_ffff);
+        let orow = b.bind_i32(ev(tok) * ev(mc.topk) + ev(sid).lshr(24));
+        let live = b.bind_cond(ev(tok).lt(ev(mc.mtok)));
+        // per-token (A row) scale
+        let xs = (cfg.scales == Scales::RowCol).then(|| {
+            let arow = if up { tok } else { orow };
+            let ar = b.bind_i32(ev(arow).min(ev(m_v) - 1) << 2);
+            b.buffer_load_f32(rsa, ar, 0i32, 0)
+        });
+        let wsc = |b: &mut FnBuilder, brow: ValueId| -> Vec<ValueId> {
+            let a = b.bind_i32((ev(mc.e) * ev(n_v) + ev(brow)) << 2);
+            let f = b.buffer_load_b128(rsb, a, 0i32, 0);
+            (0..4u8).map(|k| { let x = b.frag4_lane(f, k); b.bitcast_f32(x) }).collect()
+        };
+        let vals = |b: &mut FnBuilder, n: usize| -> Vec<ValueId> {
+            (0..4u8).map(|r| { let l = b.frag4_lane(Opnd::Var(acc[n]), r); b.bitcast_f32(l) }).collect()
+        };
+        if up {
+            let MoeStage::Up { gelu, doweight } = mc.st else { unreachable!() };
+            // the row / first column part of the store offset (padding rows: past the descriptor); the 16-column block p in the instruction offset
+            let vr0 = b.bind_i32((ev(orow) * ev(mc.nout) + ev(col0)) << 1);
+            let vrow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(vr0), b: Opnd::Val(big) });
+            for p in 0..nn / 2 {
+                let col = b.bind_i32(ev(col0) + 16 * p as i32);
+                let mut g = vals(b, nn * i + 2 * p);
+                let mut u = vals(b, nn * i + 2 * p + 1);
+                if let Some(xs) = xs {
+                    // the weight scales follow the interleaved row order: output column c = 16 q + r -> gate row 32 q + r, up row 32 q + 16 + r
+                    let grow = b.bind_i32(((ev(col).lshr(4)) << 5) + (ev(col) & 15));
+                    let urow = b.bind_i32(ev(grow) + 16);
+                    let (wg, wu) = (wsc(b, grow), wsc(b, urow));
+                    for k in 0..4 {
+                        let sg = b.mul_f32(xs, wg[k]);
+                        g[k] = b.mul_f32(g[k], sg);
+                        let su = b.mul_f32(xs, wu[k]);
+                        u[k] = b.mul_f32(u[k], su);
+                    }
+                }
+                let y: Vec<ValueId> = (0..4)
+                    .map(|k| {
+                        let a = if gelu {
+                            // gelu (tanh form): g (1 - 1 / (exp(2 t) + 1)), t = 0.7978845608 (g + 0.044715 g^3)
+                            let g2 = b.mul_f32(g[k], g[k]);
+                            let c1 = b.c_f32(0.044715);
+                            let inner = b.let_(Op::FmaF32(Opnd::Val(g2), Opnd::Val(c1), Opnd::Val(one)));
+                            let t0 = b.mul_f32(g[k], inner);
+                            let c2 = b.c_f32(2.0 * 0.797_884_56 * std::f32::consts::LOG2_E);
+                            let x2 = b.mul_f32(t0, c2);
+                            let ex = b.exp2_f32(x2);
+                            let den = b.add_f32(ex, one);
+                            let r = b.rcp_f32(den);
+                            let om = b.sub_f32(one, r);
+                            b.mul_f32(g[k], om)
+                        } else {
+                            // silu: g / (1 + exp(-g))
+                            let zf = b.c_f32(0.0);
+                            let ng = b.sub_f32(zf, g[k]);
+                            let x = b.mul_f32(ng, l2e);
+                            let ex = b.exp2_f32(x);
+                            let den = b.add_f32(ex, one);
+                            let r = b.rcp_f32(den);
+                            b.mul_f32(g[k], r)
+                        };
+                        let yy = b.mul_f32(a, u[k]);
+                        if doweight { b.mul_f32(yy, sw) } else { yy }
+                    })
+                    .collect();
+                let w0 = b.cvt_pk_bf16_f32(y[0], y[1]);
+                let w1 = b.cvt_pk_bf16_f32(y[2], y[3]);
+                let f2 = b.frag2(w0, w1);
+                b.buffer_store_b64(rsrc_c, vrow, c0, (32 * p) as u32, f2);
+            }
+        } else {
+            let vr0 = b.bind_i32((ev(orow) * ev(mc.nout) + ev(col0)) << 2);
+            let vrow = b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(live), a: Opnd::Val(vr0), b: Opnd::Val(big) });
+            for j in 0..nn {
+                let col = b.bind_i32(ev(col0) + 16 * j as i32);
+                let mut v = vals(b, nn * i + j);
+                let ws = xs.map(|_| wsc(b, col));
+                for k in 0..4 {
+                    if let (Some(xs), Some(ws)) = (xs, &ws) {
+                        let s = b.mul_f32(xs, ws[k]);
+                        v[k] = b.mul_f32(v[k], s);
+                    }
+                    let y = b.mul_f32(v[k], sw);
+                    v[k] = b.bitcast_i32(y);
+                }
+                let f4 = b.frag4(v[0], v[1], v[2], v[3]);
+                b.buffer_store_b128(rsrc_c, vrow, c0, (64 * j) as u32, f4);
+            }
+        }
     }
 }
 
