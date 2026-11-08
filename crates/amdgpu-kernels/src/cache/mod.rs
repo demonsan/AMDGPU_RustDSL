@@ -131,9 +131,10 @@ pub fn reshape_cache_blocked(name: &str, h: i64, d: i64, bs: i64) -> Function {
     b.arg("t", DType::I32, 40, 4);
     b.arg("s", DType::I32, 44, 4);
     let tt = Ext::sym("T");
-    let ss = Ext::sym("S");
+    // S = NB BS slots (the ABI: whole blocks); > 4 GiB caches: the descriptors are moved per block (64-bit ptr_mad)
+    let ss = Ext::sym("NB") * Ext::c(bs);
     b.sym_range("T", 1, 1 << 24);
-    b.sym_range("S", 1, i32::MAX as i64); // > 4 GiB caches: the descriptors are moved per slot row / block (64-bit ptr_mad)
+    b.sym_range("NB", 1, i32::MAX as i64 / bs);
     b.ka_is(40, tt.clone());
     b.ka_is(44, ss.clone());
     b.grid_is(0, tt.clone().ceil_div(tpb));
