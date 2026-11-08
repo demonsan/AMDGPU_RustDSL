@@ -322,7 +322,7 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | | **silu_and_mul 带 limit**（`x = min(x, limit)`, `y` 夹到 ±limit） | 有（新） | `silu_mul_limit_bf16_d<D>`，limit 是 kernarg（≤ 0 = 不限）；6.55 TB/s |
 | | **swiglu_and_mul**（gpt-oss：限幅 7、alpha = 1.702、`(lin + 1)`） | 有（新） | `swiglu_oai_mul_bf16_d<D>`；6.58 TB/s |
 | | **一元激活**（gelu_fast = tanh 形式、relu2、silu、sigmoid） | 有（新） | `gelu_fast_bf16` / `gelu_tanh_bf16` / `relu2_bf16` / `silu_bf16` / `sigmoid_bf16`（6.2 – 6.4 TB/s） |
-| | **gelu（erf 精确形式）**、`gelu_and_mul` | 有（新） | `gelu_bf16`、`gelu_mul_bf16_d<D>`：erf 用 Abramowitz-Stegun 7.1.26 多项式（|误差| < 1.5e-7，远小于 bf16 的舍入） |
+| | **gelu（erf 精确形式）**、`gelu_and_mul` | 有（新） | `gelu_bf16`、`gelu_mul_bf16_d<D>`：erfc 用 Numerical-Recipes 的 Chebyshev 拟合（相对误差 < 1.2e-7，尾部也准；`1 + erf` 按 z 的符号直接取 `erfc(|z|)` 或 `2 − erfc(|z|)`，没有相消） |
 | | **`*_and_mul_bias`（MoE 逐专家 bias）**：silu / gelu_tanh / gelu / swiglu | 有（新） | `{silu,gelu_tanh,gelu,swiglu_oai}_mul_bias_bf16_d<D>`：按 `expert_ids[m]` 取该专家的 `[2][D]` bias 行，先加并舍入到 bf16（与 aiter 一致）再激活；expert id < 0 或 ≥ E 输出整行 0；ABI x @0、bias @8、expert_ids @16、out @24、M @32、E @36；D = 4096、M = 32768 约 143 µs |
 | | situv2_and_mul_quant | 缺 | aiter 内部的 silu + 量化变体，用法窄 |
 | | scaled_silu_and_mul（输出 fp8，静态 scale） | 有（组合） | `silu_mul_quant_fp8_d<D>` 的静态 scale 变体可由 `quant_bf16_fp8_static` 接在后面；融合版缺 |
@@ -400,6 +400,6 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 
 **MLA cache**：`concat_cache_mla_*`（见上表）。一个 token 的条目 = `kv_c [R]` 后接 `k_pe [P]`；平铺布局下 `kv_cache` 就是 `[S][R + P]`（block size 无关），分段布局 `[NB][BS · (R + P)]` 一块里先放 BS 行 kv_c（"nope"段）再放 BS 行 k_pe，与 aiter 的 `concat_and_cache_mla_seg` 一致。一个 lane 搬一个 16 字节的块（8 个元素）：块号 `c < R / 8` 来自 kv_c，其余来自 k_pe（两个加载都发出，另一个越界读 0，逐 dword 选择）；fp8 缓存先乘 `1 / scale` 再转 e4m3。缓存描述符按 token 条目（平铺）/ 块（分段）用 64 位 `ptr_mad` 移动，所以缓存可以任意大；`_i64` = slot_mapping 为 int64。主机测试 `tests/gpu/mla_cache_host.cpp`：每个写入的条目逐元素比对（bf16 逐位、fp8 e4m3 半步长）、未写的 slot 保持哨兵、末尾之后 0 字节被写，含负 slot 与 ≥ S 的 slot，R / P = 512 / 64、256 / 32、128 / 24（P 不是 16 的倍数）；`bad = 0`，`gpu_verify --strict` 0 错误，24 – 28 VGPR。
 
-**erf-gelu**：`Act::Gelu`（`amdgpu_tile::prims`）；`gelu_bf16`、`gelu_mul_bf16_d<D>`、以及 bias 形式；多项式的 5 个系数用 Horner 求值，`exp(-z²)` 走 `exp2`，所以一个元素约 20 条 VALU，D = 2048 的 bias 形式仍是 6 TB/s 量级。
+**erf-gelu**：`Act::Gelu`（`amdgpu_tile::prims`）；`gelu_bf16`、`gelu_mul_bf16_d<D>`、以及 bias 形式；10 个系数的 Horner 求值，`exp` 走 `exp2`，一个元素约 30 条 VALU。第一版用了 Abramowitz-Stegun 7.1.26（绝对误差 1.5e-7）加 `1 − erf` 的相消，负尾部的相对误差太大（179M 个元素里 100 个超出 1e-6 的绝对容差），换成相对误差有界的 erfc 拟合之后消失。
 
 **MoE bias 激活**：`{silu,gelu_tanh,gelu,swiglu_oai}_mul_bias_bf16_d<D>`；主机测试 `tests/gpu/eltwise_bias_host.cpp`（CPU 双精度参考，含 expert id = −1 和 ≥ E 的 token）全部 `bad = 0`；`gpu_verify --strict` 0 错误，44 VGPR。
