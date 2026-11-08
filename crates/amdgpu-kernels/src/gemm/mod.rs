@@ -153,13 +153,14 @@ fn smem_block() -> Layout {
 /// `gemm` on loop variables (the operands of the register-staged tile are loop-carried): same operand / scale exchange as `amdgpu_tile::gemm`.
 #[allow(clippy::too_many_arguments)]
 fn mma_var(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueId>, acc: VarId, a: VarId, bf: VarId, sa: VarId, sb: VarId, byte_a: u8) {
-    mma_blocks(b, mma, elem, unit, &[(acc, a, bf, sa, sb, byte_a)]);
+    let p = mma_blocks(b, mma, elem, unit, &[(acc, a, bf, sa, sb, byte_a)]);
+    assert!(p.is_empty(), "mma_var: block-scaled MMAs go through mma_blocks");
 }
 
 /// The MMAs of several 16 x 16 blocks of the K tile (acc, A frag, B frag, A scale, B scale, A scale byte). fp8: one scaled MFMA per block.
 /// bf16: the 32-byte fragments are two 16-byte bf16 operands (8 elements each, the same K permutation for A and B); the first halves of every
 /// block, then the second halves, so the two MFMAs into one accumulator are not back to back.
-fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueId>, blocks: &[(VarId, VarId, VarId, VarId, VarId, u8)]) {
+fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueId>, blocks: &[(VarId, VarId, VarId, VarId, VarId, u8)]) -> Vec<(VarId, ValueId, VarId, VarId)> {
     assert_eq!(mma.atom().name, "MfmaScale16x16x128F8");
     let ops = |&(acc, a, bf, sa, sb, byte_a): &(VarId, VarId, VarId, VarId, VarId, u8)| {
         if mma.swap_ab { (acc, bf, a, sb, sa, 0, byte_a) } else { (acc, a, bf, sa, sb, byte_a, 0) }
@@ -172,29 +173,18 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
             }
         }
         Elem::Fp8Bs => {
-            // fp32 block scales (1 x 128 A, 128 x 128 B): per block the K tile's product into a fresh accumulator (unit E8M0 scales, zero C),
-            // then acc += t (sa sb) lane by lane; the MFMAs of the group first, then the FMAs
+            // fp32 block scales (1 x 128 A, 128 x 128 B): per block the K tile's product into a fresh accumulator (unit E8M0 scales, zero C);
+            // the acc += t (sa sb) updates are returned and emitted by `bs_fma` at the end of the tile (MFMA latency off the critical path)
             let k = amdgpu_dsl::MmaKind::scaled_f8f6f4(amdgpu_dsl::MmaShape::M16N16K128, amdgpu_dsl::MmaTy::Fp8, amdgpu_dsl::MmaTy::Fp8);
             let u = Opnd::Val(unit.expect("unit scales"));
-            let ts: Vec<ValueId> = blocks
+            return blocks
                 .iter()
                 .map(|blk| {
                     let (_, x, y, ..) = ops(blk);
-                    b.mfma_scaled(k, Opnd::Var(x), Opnd::Var(y), None, amdgpu_dsl::MmaScale { sa: u, sb: u, opsel: 0 })
+                    let t = b.mfma_scaled(k, Opnd::Var(x), Opnd::Var(y), None, amdgpu_dsl::MmaScale { sa: u, sb: u, opsel: 0 });
+                    (blk.0, t, blk.3, blk.4)
                 })
                 .collect();
-            for (&(acc, _, _, sa, sb, _), t) in blocks.iter().zip(ts) {
-                let (fa, fb) = (b.bitcast_f32(Opnd::Var(sa)), b.bitcast_f32(Opnd::Var(sb)));
-                let s = b.mul_f32(fa, fb);
-                for r in 0..4u8 {
-                    let tl = b.frag4_lane(t, r);
-                    let tl = b.bitcast_f32(tl);
-                    let al = b.frag4_lane(Opnd::Var(acc), r);
-                    let al = b.bitcast_f32(al);
-                    let f = b.let_(Op::FmaF32(Opnd::Val(tl), Opnd::Val(s), Opnd::Val(al)));
-                    b.var_set_lane(acc, r, f);
-                }
-            }
         }
         Elem::Fp4 => {
             // two fp4 x fp4 scaled MFMAs per block: 16-byte half h of each fragment, the scale byte h of the (shifted) scale words
@@ -218,6 +208,23 @@ fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, unit: Option<ValueI
                     b.var_mfma(acc, k, xs, ys, false);
                 }
             }
+        }
+    }
+    Vec::new()
+}
+
+/// The deferred block-scale updates: acc += t (sa sb) lane by lane.
+fn bs_fma(b: &mut FnBuilder, pending: &[(VarId, ValueId, VarId, VarId)]) {
+    for &(acc, t, sa, sb) in pending {
+        let (fa, fb) = (b.bitcast_f32(Opnd::Var(sa)), b.bitcast_f32(Opnd::Var(sb)));
+        let s = b.mul_f32(fa, fb);
+        for r in 0..4u8 {
+            let tl = b.frag4_lane(t, r);
+            let tl = b.bitcast_f32(tl);
+            let al = b.frag4_lane(Opnd::Var(acc), r);
+            let al = b.bitcast_f32(al);
+            let f = b.let_(Op::FmaF32(Opnd::Val(tl), Opnd::Val(s), Opnd::Val(al)));
+            b.var_set_lane(acc, r, f);
         }
     }
 }
@@ -468,6 +475,8 @@ struct Body {
     mx32: Option<Mx32>,
     /// `Scales::Block128`: the per-tile fp32 scale loads (voffsets; `shift` unused)
     bs128: Option<Mx32>,
+    /// `Elem::Fp8Bs`: the block products of the tile waiting for their scaled accumulation (`bs_fma`)
+    pending: std::cell::RefCell<Vec<(VarId, ValueId, VarId, VarId)>>,
     /// register-staged tile: initial values (tile 0) and the loop variables: B fragments, A fragments, A scales, B scale
     staged: Option<(Vec<ValueId>, Vec<ValueId>, Vec<ValueId>, Vec<ValueId>)>,
     rv: Option<(Vec<VarId>, Vec<VarId>, Vec<VarId>, Vec<VarId>)>,
@@ -501,7 +510,8 @@ impl Body {
                 n += 1;
             }
         }
-        mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks);
+        let p = mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks);
+        self.pending.borrow_mut().extend(p);
         self.npre_done = n;
     }
     /// The scale words of tile `kb` from the transposed panel: the 8 A-scale bytes of this lane (one ds_read_b64; the MMA selects byte i % 4 of
@@ -632,7 +642,10 @@ impl Body {
                     } else if !todo.is_empty() {
                         // bf16: the row's blocks in one unit, first halves then second halves
                         let blocks: Vec<_> = todo.iter().map(|&j| (self.acc[nn * i + j], av[i], bv[j], sav[w], sbv[self.sb_sel(j)], by)).collect();
-                        u.capture(b, format!("mma.i{i}j{}-{}", todo[0], todo[todo.len() - 1]), |b| mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks));
+                        u.capture(b, format!("mma.i{i}j{}-{}", todo[0], todo[todo.len() - 1]), |b| {
+                            let p = mma_blocks(b, &self.mma, self.cfg.elem, self.unit.map(|u| u.0), &blocks);
+                            self.pending.borrow_mut().extend(p);
+                        });
                     }
                     if let (true, Some((ar, _))) = (lo == half, &next) {
                         // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
@@ -666,6 +679,11 @@ impl Body {
                 });
             }
             None => body(b, &mut u),
+        }
+        // the deferred block-scale updates of this tile, before the scales of t + 1 replace the scale variables
+        let pend: Vec<_> = self.pending.borrow_mut().drain(..).collect();
+        if !pend.is_empty() {
+            u.capture(b, "bs.fma", |b| bs_fma(b, &pend));
         }
         if let Some((sa, sb)) = early {
             u.capture(b, "scales.install", |b| {
@@ -1088,7 +1106,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     });
     let body = Body {
         cfg, kb_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, pending: Default::default(),
     };
         GemmCx { cfg, body, pipe: Some(pipe), ctx, mma, epi, lane, s_lane, s_n, s_wm, s_wn, ptr_c, m_v, n_v, bx, by, wm, wn, lg_m, lg_n, wave_m, wave_n, stamp_ctx }
     }
