@@ -664,7 +664,14 @@ blockscale 128×128（`fp8bs`）的规则：
   - dkdv 的 causal key tile 配对：128 个 CTA 在 256 个 CU 上被减半后反而更慢。
 
 **原因与方向**：
-- 余下的差距在 dkdv 的单 tile 效率（单独 139 µs，约等于厂商的总时间）。下一步给 dkdv 做 v3 式处理：读取提前、8 wave ping-pong。
+- 余下的差距在 dkdv 的单 tile 效率：单独 139 µs，约等于厂商的总时间。
+- **寄存器是瓶颈（暂停）**：
+  - 现状：dkdv 用 VGPR 200 + AGPR 128 = 328，每 SIMD 只能跑 1 个 wave，ping-pong 无从重叠。P / dS 已提前打包成 bf16（性能持平，已采纳）。
+  - 要降到 ≤256，需要两处重构：
+    - K / V 的 B 操作数（64 VGPR）放进 LDS，会使 S / dP 的 LDS 流量加倍；
+    - LSE / Dot（被提前发出的 16 条 b128 load，占 64 VGPR）要随 Q / dO 的 DMA 按 q tile 暂存进 LDS。
+  - 厂商的 dqdkdv 用 512 个寄存器、每 SIMD 1 个 wave，同样做到 141 µs。所以下一步改为做单 wave 内的软件流水调度（厂商式），不再追求占用率。
+- 之前计划的 v3 式处理（读取提前、8 wave ping-pong）因此搁置。
 - 两个 kernel 各自重算 S / P，dP 也算了两遍。厂商是单 kernel，dQ 走 fp32 原子累加。
 - causal 时 dkdv 只裁掉了前部的 q tile。
 - 方向：合并为一个 kernel，dQ 用原子累加（需要后端提供 `buffer_atomic_add_f32`）；加入延迟 rescale 一类的 VALU 优化。
