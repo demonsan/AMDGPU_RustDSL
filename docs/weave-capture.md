@@ -87,3 +87,21 @@ The earlier closure API (`Units::add` with `Out<T>` cells) has been removed: eve
 No `Out<T>` is left in the kernels.
 
 **Rule when moving a stage to `capture`.** Take the stage's scalar inputs, such as `SlotIdx::offset_scalars()`, **before** capturing its units. Capturing binds the offsets that the stage itself creates, and those would otherwise be declared as inputs. GV-STAGE reports this as "not handed over by an earlier stage".
+
+## Register views of loop variables
+
+`var_slice8`, the lane extracts (`Frag2Lane` / `Frag4Lane` / `Frag16Lane`) and the bitcasts emit **no instruction**: their result is the
+operand's register (or a sub-register of it). When the operand is a loop variable (or a view of one), the value therefore lives in the
+variable's register, and a use placed after a write of the variable would read the NEW value — not SSA semantics. Reordering captured
+statements hit exactly this (`_t128` `window`: bitcasts of `Frag16Lane(var)` moved after the variable's update; wrong results with a clean
+certificate). Since 2026-11-08:
+
+- **Lowering is SSA-correct**: `facts::stale_view_roots(f)` finds every root view some use of which (directly or through derived views)
+  executes after a write of its variable that follows the view's definition — later in program order, or anywhere in a loop containing the
+  use but not the definition. Exactly those views are copied at their definition (one `v_mov` per dword); all other views stay zero-cost
+  aliases. No shipped kernel has a stale view (asm md5 unchanged for all kernels).
+- **Facts model the alias**: `Captured::facts` adds the variable to `var_reads` of every node that uses a view of it (a view-forwarding
+  `Let` itself is not a read), so `must_order` keeps view uses before the variable's next write and a weaver does not create copies.
+- Tests: `crates/amdgpu-compiler/tests/var_views.rs` (alias kept when used before the write; snapshot when used after it, also through a
+  nested loop; facts). GPU repro (sched's `AMDC_WEAVE_AUTO_STMT=window AMDC_WEAVE_AUTO_PREFIX=52` on `_t128`, B2H8S2048, 128 rows per
+  block): bad 24 before, 0 after.
