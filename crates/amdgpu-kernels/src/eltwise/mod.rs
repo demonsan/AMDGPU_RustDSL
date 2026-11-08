@@ -15,7 +15,6 @@ pub fn by_name(name: &str) -> Option<Function> {
         "cvt_f32_bf16" => return Some(cvt_f32_bf16(name)),
         "cvt_bf16_f32" => return Some(cvt_bf16_f32(name)),
         "quant_bf16_fp8_static" => return Some(quant_bf16_fp8_static(name)),
-        "quant_bf16_fp8_static_x16" => return Some(quant_bf16_fp8_static_x16(name)),
         _ => {}
     }
     let (rest, a) = if let Some(r) = name.strip_prefix("silu_mul_bf16_d") {
@@ -233,50 +232,5 @@ pub fn quant_bf16_fp8_static(name: &str) -> Function {
     let f2 = b.frag2(words[0], words[1]);
     let oo = b.bind_i32((ev(bx) << 11) + (ev(tid) << 3));
     b.buffer_store_b64(r_o, oo, 0i32, 0, f2);
-    fb.finish()
-}
-
-/// `quant_bf16_fp8_static` with 16 elements per lane: two contiguous b128 loads (32 bytes per lane), one b128 store (16 fp8 bytes per lane); 256 threads = 4096 elements per block (n a multiple of 16). Same ABI.
-pub fn quant_bf16_fp8_static_x16(name: &str) -> Function {
-    let mut fb = FnBuilder::new(name, 256);
-    fb.compile_profile(CompileProfile::Default);
-    let b = &mut fb;
-    b.arg("x", DType::Ptr, 0, 8);
-    b.arg("out", DType::Ptr, 8, 8);
-    b.arg("scale", DType::F32, 16, 4);
-    b.arg("n", DType::I32, 20, 4);
-    let n = Ext::sym("N");
-    b.sym_range("N", 16, 1 << 30);
-    b.ka_is(20, n.clone());
-    b.grid_is(0, n.clone().ceil_div(4096));
-    b.arg_tensor("x", n.clone() * Ext::c(2));
-    b.arg_tensor("out", n);
-    let (p_x, p_o) = (b.let_(Op::KernargPtr { offset: 0 }), b.let_(Op::KernargPtr { offset: 8 }));
-    let scale = b.let_(Op::KernargF32 { offset: 16 });
-    let n_v = b.let_(Op::KernargI32 { offset: 20 });
-    let tid = b.let_(Op::WorkitemId);
-    let bx = b.let_(Op::WorkgroupIdX);
-    let r_x = { let v = b.bind_i32(ev(n_v) << 1); let v = b.read_first_lane(v); b.buffer_desc_dyn(p_x, v) };
-    let r_o = { let v = b.read_first_lane(n_v); b.buffer_desc_dyn(p_o, v) };
-    let inv = b.rcp_f32(scale);
-    let lo = b.c_f32(-448.0);
-    let hi = b.c_f32(448.0);
-    let off = b.bind_i32((ev(bx) << 13) + (ev(tid) << 5));
-    let x0 = b.buffer_load_b128(r_x, off, 0i32, 0);
-    let x1 = b.buffer_load_b128(r_x, off, 0i32, 16);
-    let mut words = Vec::new();
-    for x in [x0, x1] {
-        let f = bf16x8_to_f32(b, x);
-        let mut q = [0; 8];
-        for k in 0..8 {
-            let y = b.mul_f32(f[k], inv);
-            q[k] = b.tri(TriOp::Med3F32, y, lo, hi);
-        }
-        words.push(b.cvt_pk_fp8x4_f32(q[0], q[1], q[2], q[3]));
-        words.push(b.cvt_pk_fp8x4_f32(q[4], q[5], q[6], q[7]));
-    }
-    let f4 = b.frag4(words[0], words[1], words[2], words[3]);
-    let oo = b.bind_i32((ev(bx) << 12) + (ev(tid) << 4));
-    b.buffer_store_b128(r_o, oo, 0i32, 0, f4);
     fb.finish()
 }
