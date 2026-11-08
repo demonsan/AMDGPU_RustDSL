@@ -134,9 +134,8 @@ impl GemmConfig {
     }
     /// The fused-MoE stage `st` (128-row tiles = block_m 128; stage 1: 256 interleaved gate / up B rows = 128 output columns per CTA).
     pub fn moe(elem: Elem, scales: Scales, st: MoeStage) -> GemmConfig {
-        let cta_n = if matches!(st, MoeStage::Up { .. }) && std::env::var("EXP_UP128").is_err() { 256 } else { 128 };
-        let sched = if std::env::var("EXP_NOSCHED").is_ok() { "" } else { GemmConfig::v4().sched };
-        GemmConfig { cta_m: 128, cta_n, acc_agpr: 0, lds_epilogue: false, scales, elem, moe: Some(st), sched, ..GemmConfig::v4() }
+        let cta_n = if matches!(st, MoeStage::Up { .. }) { 256 } else { 128 };
+        GemmConfig { cta_m: 128, cta_n, lds_epilogue: false, scales, elem, moe: Some(st), ..GemmConfig::v4() }
     }
     /// Split-K form of a 128 x 128 configuration (fp32 partials + `reduce::gemm_splitk_reduce`).
     pub fn splitk(self) -> GemmConfig {
@@ -977,7 +976,6 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_rowcol_fp8" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8", GemmConfig::a8w8_rowcol())),
         "gemm_a8w8_rowcol_fp8_128" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128", GemmConfig::a8w8_rowcol_128())),
         "gemm_a16w16_bf16" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16", GemmConfig::a16w16())),
-        "gemm_a16w16_bf16_128x256" => Some(gemm_mxfp8_bs(name, GemmConfig { cta_m: 128, cta_n: 256, ..GemmConfig::a16w16() })),
         "gemm_a16w16_bf16_128" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128", GemmConfig::a16w16_128())),
         "gemm_a8w8_blockscale" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale", GemmConfig::a8w8_blockscale())),
         "gemm_a8w8_blockscale_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_blockscale_splitk", GemmConfig::a8w8_blockscale().splitk())),
@@ -1474,14 +1472,8 @@ fn moe_epilogue(
     let (nm, nn) = ((wave_m / 16) as usize, (wave_n / 16) as usize);
     let idx = IssuePlan::new(mma.c_tv(), 4).offsets(&make_layout(tup![16, 16], tup![1024, 1]), s_lane, &Ix::C(0), d);
     let o = b.bind_i32(ctx.lower(&idx[0]));
-    let (mut rl, mut cl) = (b.bind_i32(ev(o).lshr(10)), b.bind_i32(ev(o) & 1023));
-    if std::env::var("EXP_LANE").is_ok() {
-        // DEBUG: the same from a fresh lane id (swapped 16x16 C: row l % 16, columns 4 (l / 16) + 0..3)
-        let tid = b.let_(Op::WorkitemId);
-        rl = b.bind_i32(ev(tid) & 15);
-        cl = b.bind_i32(((ev(tid) & 63).lshr(4)) << 2);
-    }
-    let up = matches!(mc.st, MoeStage::Up { .. }) && std::env::var("EXP_UPRAW").is_err();
+    let (rl, cl) = (b.bind_i32(ev(o).lshr(10)), b.bind_i32(ev(o) & 1023));
+    let up = matches!(mc.st, MoeStage::Up { .. });
     let esz = if up { 2 } else { 4 };
     let rsrc_c = { let n = b.bind_i32(ev(mc.mtok) * ev(mc.topk) * ev(mc.nout) * esz); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_c, n) };
     let so = { let v = b.bind_i32(ev(mc.row0) << 2); b.read_first_lane(v) };
@@ -1500,7 +1492,9 @@ fn moe_epilogue(
         let vo = b.bind_i32(ev(sr) << 2);
         let sid = b.buffer_load_f32(mc.rsrc_sid, vo, so, 0);
         let sid = b.bitcast_i32(sid);
-        let sw = b.buffer_load_f32(mc.rsrc_sw, vo, so, 0);
+        // the routing weight only where it is used (a dead load's destination must not be reused while it is in flight: backend issue)
+        let use_w = !matches!(mc.st, MoeStage::Up { doweight: false, .. });
+        let sw = if use_w { b.buffer_load_f32(mc.rsrc_sw, vo, so, 0) } else { b.c_f32(1.0) };
         let tok = b.bind_i32(ev(sid) & 0xff_ffff);
         let orow = b.bind_i32(ev(tok) * ev(mc.topk) + ev(sid).lshr(24));
         let live = b.bind_cond(ev(tok).lt(ev(mc.mtok)));
@@ -1541,7 +1535,7 @@ fn moe_epilogue(
                 }
                 let y: Vec<ValueId> = (0..4)
                     .map(|k| {
-                        let a = if std::env::var("EXP_NOACT").is_ok() { g[k] } else if gelu {
+                        let a = if gelu {
                             // gelu (tanh form): g (1 - 1 / (exp(2 t) + 1)), t = 0.7978845608 (g + 0.044715 g^3)
                             let g2 = b.mul_f32(g[k], g[k]);
                             let c1 = b.c_f32(0.044715);
