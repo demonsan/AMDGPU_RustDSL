@@ -1,6 +1,6 @@
 // KV-cache write into caches larger than 4 GiB (batch 2, B1 64-bit descriptor bases): reshape_cache_flash_bf16_h<Hk>_d<D> and reshape_cache_blocked_bf16_h<Hk>_d<D>_b<BS>.
 // Scattered slots over the WHOLE cache (including past 4 GiB and 8 GiB), a few invalid slots (negative, >= S); every touched slot / block is compared byte-exactly with a CPU reference, and a sample of untouched
-// rows keeps its sentinel.   usage: cache_big_host <co> <kernel> <flash|blocked> <T> <Hk> <D> <BS> <NB>      (flash: S = NB * BS slots; caches are S * Hk * D * 2 bytes each)
+// rows keeps its sentinel.   usage: cache_big_host <co> <kernel> <flash|blocked> <T> <Hk> <D> <BS> <NB> [i64 0|1]      (flash: S = NB * BS slots; caches are S * Hk * D * 2 bytes each)
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cstdint>
@@ -14,15 +14,15 @@
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s failed: %s\n", #x, hipGetErrorString(e_)); std::exit(1); } } while (0)
 int main(int argc, char** argv) {
     if (argc < 9) { std::fprintf(stderr, "usage: %s <co> <kernel> <flash|blocked> <T> <Hk> <D> <BS> <NB>\n", argv[0]); return 2; }
-    const char* co = argv[1]; const char* kn = argv[2]; bool blocked = std::string(argv[3]) == "blocked"; long T = std::atol(argv[4]), Hk = std::atol(argv[5]), D = std::atol(argv[6]), BS = std::atol(argv[7]), NB = std::atol(argv[8]);
+    const char* co = argv[1]; const char* kn = argv[2]; bool blocked = std::string(argv[3]) == "blocked"; long T = std::atol(argv[4]), Hk = std::atol(argv[5]), D = std::atol(argv[6]), BS = std::atol(argv[7]), NB = std::atol(argv[8]); const bool s64 = argc > 9 && std::atoi(argv[9]);
     const long S = NB * BS; const size_t row = (size_t)Hk * D * 2; const size_t cbytes = (size_t)S * row;
     std::printf("cache bytes per tensor: %.2f GiB\n", cbytes / 1073741824.0);
     std::mt19937_64 rng(123); std::vector<uint8_t> hk(T * row), hv(T * row); for (auto& v : hk) v = rng() & 255; for (auto& v : hv) v = rng() & 255;
     std::vector<int32_t> slots(T); std::set<int32_t> used;
     for (long t = 0; t < T; ++t) { int32_t s; do { s = (int32_t)(rng() % (uint64_t)S); } while (used.count(s)); if (t % 11 == 5) s = -1 - (int32_t)(t % 7); else if (t % 13 == 4) s = (int32_t)std::min<long>(S + t, INT32_MAX); else used.insert(s); slots[t] = s; }
     if (!used.empty()) { slots[0] = 0; used.insert(0); slots[1] = (int32_t)(S - 1); used.insert((int32_t)(S - 1)); }   // the first and the last slot of the cache (0 may collide with a random one: harmless, the later token wins in the reference below)
-    void *dk, *dv, *dkc, *dvc, *dsl; CK(hipMalloc(&dk, T * row)); CK(hipMalloc(&dv, T * row)); CK(hipMalloc(&dkc, cbytes)); CK(hipMalloc(&dvc, cbytes)); CK(hipMalloc(&dsl, T * 4));
-    CK(hipMemcpy(dk, hk.data(), T * row, hipMemcpyHostToDevice)); CK(hipMemcpy(dv, hv.data(), T * row, hipMemcpyHostToDevice)); CK(hipMemcpy(dsl, slots.data(), T * 4, hipMemcpyHostToDevice));
+    void *dk, *dv, *dkc, *dvc, *dsl; CK(hipMalloc(&dk, T * row)); CK(hipMalloc(&dv, T * row)); CK(hipMalloc(&dkc, cbytes)); CK(hipMalloc(&dvc, cbytes)); CK(hipMalloc(&dsl, T * 8));
+    CK(hipMemcpy(dk, hk.data(), T * row, hipMemcpyHostToDevice)); CK(hipMemcpy(dv, hv.data(), T * row, hipMemcpyHostToDevice)); { std::vector<int64_t> s8(slots.begin(), slots.end()); if (s64) CK(hipMemcpy(dsl, s8.data(), T * 8, hipMemcpyHostToDevice)); else CK(hipMemcpy(dsl, slots.data(), T * 4, hipMemcpyHostToDevice)); }
     CK(hipMemset(dkc, 0xAB, cbytes)); CK(hipMemset(dvc, 0xCD, cbytes));
     hipModule_t mod; hipFunction_t fn; CK(hipModuleLoad(&mod, co)); CK(hipModuleGetFunction(&fn, mod, kn));
     struct __attribute__((packed)) { void *k, *v, *kc, *vc, *sl; int32_t t, s; } args{dk, dv, dkc, dvc, dsl, (int32_t)T, (int32_t)S};
