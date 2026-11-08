@@ -543,6 +543,15 @@
   - 16384³：3188 → 2006 µs。
   - 对 aiter f4gemm 从 0.60 / 0.63× 提到 0.83 / 0.82×。
 - **试过但未采纳**：寄存器 B，即 B 从 global 原地重载进 AGPR，依赖后端的 in-place reload。它只带来 +1% / 0，已从树中移除，保留为 tag `archive/mxfp4-regb`。将来若做 256 字节的 A tile，可从这个 tag 起步，因为它腾出了 B 的 ring。
+**批量 GEMM（覆盖补齐）**：`gemm_a16w16_bf16_bmm`、`gemm_a8w8_rowcol_fp8_bmm`、`gemm_mxfp8_bs_v4_bmm`（`GemmConfig.batched`）。
+- 网格 z = batch（kernarg 36）。各 batch 的 A、B、C 与 scale 都是稠密块，基址用 64 位 `ptr_mad` 移动；契约中每个张量乘以 BT。
+- 测试用 [`vendor_gemm_host.cpp`](../tests/gpu/vendor_gemm_host.cpp) 的 `BATCH=n`：最后一个 batch 放参考数据，其余填充垃圾，检查最后一个 batch 的输出。
+- 结果全部 bad=0，例如：
+  - bf16 1024³ ×32：942 TF/s；
+  - fp8 rowcol 256×4096×4096 ×32：1850 TF/s。
+- 厂商 `opus bmm_a8w8_mxscale` 只有源码（csrc/opus_gemm），没有预编译 .co，所以没有做同次对比。
+- mxfp8 v4 的 bmm 只做了 strict 校验，因为 host 里还没有 v4 mxfp8 的 family。
+
 **MX 量化（覆盖补齐）**：见 [`rows/mxquant.rs`](../crates/amdgpu-kernels/src/rows/mxquant.rs)，CPU 校验用 [`mxquant_host.cpp`](../tests/gpu/mxquant_host.cpp)。
 - `quant_mxfp4_bf16_k<K>`：bf16 → fp4（e2m1）加 1×32 的 E8M0 scale，scale 直接写成 `gemm_a4w4_mxfp4` 的重排布局。
   - scale 规则与 aiter `dynamic_mxfp4_quant` 相同：amax 加 0x200000 后截断，取指数再减 2。
