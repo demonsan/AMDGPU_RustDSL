@@ -54,7 +54,7 @@ fn pack(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
 /// Rows one wave processes at once: short rows (< 2 KB) need several in flight per wave for the 64 KB / CU of loads that saturate HBM (docs/op-coverage-memtemplates.md 5.1); the rows of a wave are consecutive.
 pub fn rows_per_wave(n: i64) -> i64 {
     if n < 512 {
-        8.max(64 / group_lanes(n))
+        16.max(64 / group_lanes(n))
     } else if n < 1024 {
         2
     } else {

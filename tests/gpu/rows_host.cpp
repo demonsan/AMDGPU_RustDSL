@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
     else { putp(dx); putp(dout); put(&m32, 4); }
     void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
     long g = 64; if (N < 512) { g = 4; while (g < N / 8) g *= 2; }   // lanes per row (group_lanes in rows/mod.rs)
-long rpw = N < 512 ? std::max(8L, 64 / g) : (N < 1024 ? 2 : 1);   // rows per wave (rows_per_wave in rows/mod.rs)
+long rpw = N < 512 ? std::max(16L, 64 / g) : (N < 1024 ? 2 : 1);   // rows per wave (rows_per_wave in rows/mod.rs)
     int grid = (int)((M + 4 * rpw - 1) / (4 * rpw));
     CK(hipModuleLaunchKernel(fn, grid, 1, 1, 256, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize());
     std::vector<uint16_t> ho((size_t)M * N + 32), hro(drout ? (size_t)M * N + 32 : 0);
