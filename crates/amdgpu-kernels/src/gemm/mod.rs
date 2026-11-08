@@ -461,6 +461,8 @@ fn dma_plan_gather(b: &mut FnBuilder, lane: &Lane, rows: i64, waves: i64, k_v: V
         let v = b.bind_i32(ev(src) * ev(k_v) + ((lane.lane() & 7) << 4));
         out.push((v, 1024 * q as i32));
     }
+    // the row-index loads complete here: the pipeline's counted vmcnt waits count only its DMAs
+    b.wait_vm(0);
     Dma { issues: out, pitch: 1056, gather: true }
 }
 
