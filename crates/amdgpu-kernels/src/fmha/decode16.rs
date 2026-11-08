@@ -225,8 +225,6 @@ pub fn pa_decode16_bf16_hd128_x(name: &str, page: i32, kt: i32, kreg: bool) -> F
             let rn = rows_of(&mut b, nxt);
             let kn = k_loads(&mut b, rn);
             for (v, x) in ksets[1 - h].iter().zip(kn) {
-                // in place: the loads write the loop variable's registers (no copy, no wait at the definition)
-                let x = b.inplace(x);
                 b.set_var(*v, x);
             }
             let gen_n = if h == 0 { Opnd::Var(it) } else { Opnd::Val(b.bind_i32(itx.clone() + 1)) };
