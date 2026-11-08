@@ -163,9 +163,9 @@ impl FromIr for Op {
             "Bin" => { v.expect_tuple("Bin", 3)?; Ok(Op::Bin(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?)) }
             "Tri" => { v.expect_tuple("Tri", 4)?; Ok(Op::Tri(FromIr::from_ir(v.item(0)?)?, FromIr::from_ir(v.item(1)?)?, FromIr::from_ir(v.item(2)?)?, FromIr::from_ir(v.item(3)?)?)) }
             "Cmp" => { v.expect_struct("Cmp")?; Ok(Op::Cmp { pred: FromIr::from_ir(v.field("pred")?)?, ty: FromIr::from_ir(v.field("ty")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)? }) }
-            "LoadGlobalN" => { v.expect_struct("LoadGlobalN")?; Ok(Op::LoadGlobalN { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, ty: FromIr::from_ir(v.field("ty")?)? }) }
-            "LoadGlobalD16" => { v.expect_struct("LoadGlobalD16")?; Ok(Op::LoadGlobalD16 { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
-            "BufferLoadN" => { v.expect_struct("BufferLoadN")?; Ok(Op::BufferLoadN { rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, ty: FromIr::from_ir(v.field("ty")?)? }) }
+            "LoadGlobalN" => { v.expect_struct("LoadGlobalN")?; Ok(Op::LoadGlobalN { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, ty: FromIr::from_ir(v.field("ty")?)?, cache: FromIr::from_ir(v.field("cache")?)? }) }
+            "LoadGlobalD16" => { v.expect_struct("LoadGlobalD16")?; Ok(Op::LoadGlobalD16 { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)?, cache: FromIr::from_ir(v.field("cache")?)? }) }
+            "BufferLoadN" => { v.expect_struct("BufferLoadN")?; Ok(Op::BufferLoadN { rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, ty: FromIr::from_ir(v.field("ty")?)?, cache: FromIr::from_ir(v.field("cache")?)? }) }
             "LoadLdsN" => { v.expect_struct("LoadLdsN")?; Ok(Op::LoadLdsN { addr: FromIr::from_ir(v.field("addr")?)?, ty: FromIr::from_ir(v.field("ty")?)? }) }
             "LoadLdsD16" => { v.expect_struct("LoadLdsD16")?; Ok(Op::LoadLdsD16 { addr: FromIr::from_ir(v.field("addr")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
             "LoadLds2" => { v.expect_struct("LoadLds2")?; Ok(Op::LoadLds2 { addr: FromIr::from_ir(v.field("addr")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
@@ -265,9 +265,9 @@ impl IrIds for Op {
             Op::Bin(x0, x1, x2) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); }
             Op::Tri(x0, x1, x2, x3) => { IrIds::ids(&mut (*x0), fv, fr); IrIds::ids(&mut (*x1), fv, fr); IrIds::ids(&mut (*x2), fv, fr); IrIds::ids(&mut (*x3), fv, fr); }
             Op::Cmp { pred, ty, a, b } => { IrIds::ids(&mut (*pred), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); }
-            Op::LoadGlobalN { base, byte_off, ty } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*ty), fv, fr); }
-            Op::LoadGlobalD16 { base, byte_off, ty, hi } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
-            Op::BufferLoadN { rsrc, voff, soff, imm, ty } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*ty), fv, fr); }
+            Op::LoadGlobalN { base, byte_off, ty, cache } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*cache), fv, fr); }
+            Op::LoadGlobalD16 { base, byte_off, ty, hi, cache } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); IrIds::ids(&mut (*cache), fv, fr); }
+            Op::BufferLoadN { rsrc, voff, soff, imm, ty, cache } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*cache), fv, fr); }
             Op::LoadLdsN { addr, ty } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*ty), fv, fr); }
             Op::LoadLdsD16 { addr, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
             Op::LoadLds2 { addr, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
@@ -544,8 +544,8 @@ impl FromIr for Stmt {
         match v.name()? {
             "StageBegin" => { v.expect_struct("StageBegin")?; Ok(Stmt::StageBegin { name: FromIr::from_ir(v.field("name")?)?, contract: FromIr::from_ir(v.field("contract")?)? }) }
             "StageEnd" => { v.expect_unit("StageEnd")?; Ok(Stmt::StageEnd) }
-            "StoreGlobalN" => { v.expect_struct("StoreGlobalN")?; Ok(Stmt::StoreGlobalN { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
-            "BufferStoreN" => { v.expect_struct("BufferStoreN")?; Ok(Stmt::BufferStoreN { rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
+            "StoreGlobalN" => { v.expect_struct("StoreGlobalN")?; Ok(Stmt::StoreGlobalN { base: FromIr::from_ir(v.field("base")?)?, byte_off: FromIr::from_ir(v.field("byte_off")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)?, cache: FromIr::from_ir(v.field("cache")?)? }) }
+            "BufferStoreN" => { v.expect_struct("BufferStoreN")?; Ok(Stmt::BufferStoreN { rsrc: FromIr::from_ir(v.field("rsrc")?)?, voff: FromIr::from_ir(v.field("voff")?)?, soff: FromIr::from_ir(v.field("soff")?)?, imm: FromIr::from_ir(v.field("imm")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)?, cache: FromIr::from_ir(v.field("cache")?)? }) }
             "StoreLdsN" => { v.expect_struct("StoreLdsN")?; Ok(Stmt::StoreLdsN { addr: FromIr::from_ir(v.field("addr")?)?, value: FromIr::from_ir(v.field("value")?)?, ty: FromIr::from_ir(v.field("ty")?)?, hi: FromIr::from_ir(v.field("hi")?)? }) }
             "StoreLds2" => { v.expect_struct("StoreLds2")?; Ok(Stmt::StoreLds2 { addr: FromIr::from_ir(v.field("addr")?)?, v0: FromIr::from_ir(v.field("v0")?)?, v1: FromIr::from_ir(v.field("v1")?)?, off0: FromIr::from_ir(v.field("off0")?)?, off1: FromIr::from_ir(v.field("off1")?)?, b64: FromIr::from_ir(v.field("b64")?)?, st64: FromIr::from_ir(v.field("st64")?)? }) }
             "VarMfma" => { v.expect_struct("VarMfma")?; Ok(Stmt::VarMfma { var: FromIr::from_ir(v.field("var")?)?, kind: FromIr::from_ir(v.field("kind")?)?, a: FromIr::from_ir(v.field("a")?)?, b: FromIr::from_ir(v.field("b")?)?, scale: FromIr::from_ir(v.field("scale")?)?, zero: FromIr::from_ir(v.field("zero")?)? }) }
@@ -604,8 +604,8 @@ impl IrIds for Stmt {
         match self {
             Stmt::StageBegin { name, contract } => { IrIds::ids(&mut (*name), fv, fr); IrIds::ids(&mut (*contract), fv, fr); }
             Stmt::StageEnd => {}
-            Stmt::StoreGlobalN { base, byte_off, value, ty, hi } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
-            Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
+            Stmt::StoreGlobalN { base, byte_off, value, ty, hi, cache } => { IrIds::ids(&mut (*base), fv, fr); IrIds::ids(&mut (*byte_off), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); IrIds::ids(&mut (*cache), fv, fr); }
+            Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi, cache } => { IrIds::ids(&mut (*rsrc), fv, fr); IrIds::ids(&mut (*voff), fv, fr); IrIds::ids(&mut (*soff), fv, fr); IrIds::ids(&mut (*imm), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); IrIds::ids(&mut (*cache), fv, fr); }
             Stmt::StoreLdsN { addr, value, ty, hi } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*value), fv, fr); IrIds::ids(&mut (*ty), fv, fr); IrIds::ids(&mut (*hi), fv, fr); }
             Stmt::StoreLds2 { addr, v0, v1, off0, off1, b64, st64 } => { IrIds::ids(&mut (*addr), fv, fr); IrIds::ids(&mut (*v0), fv, fr); IrIds::ids(&mut (*v1), fv, fr); IrIds::ids(&mut (*off0), fv, fr); IrIds::ids(&mut (*off1), fv, fr); IrIds::ids(&mut (*b64), fv, fr); IrIds::ids(&mut (*st64), fv, fr); }
             Stmt::VarMfma { var, kind, a, b, scale, zero } => { fr(&mut (*var)); IrIds::ids(&mut (*kind), fv, fr); IrIds::ids(&mut (*a), fv, fr); IrIds::ids(&mut (*b), fv, fr); IrIds::ids(&mut (*scale), fv, fr); IrIds::ids(&mut (*zero), fv, fr); }
@@ -1144,6 +1144,24 @@ impl IrIds for MmaScale {
         IrIds::ids(&mut self.sa, fv, fr);
         IrIds::ids(&mut self.sb, fv, fr);
         IrIds::ids(&mut self.opsel, fv, fr);
+    }
+}
+
+impl FromIr for CachePolicy {
+    fn from_ir(v: &IrVal) -> Result<Self, IrErr> {
+        v.expect_struct("CachePolicy")?;
+        Ok(CachePolicy {
+            sc0: FromIr::from_ir(v.field("sc0")?)?,
+            sc1: FromIr::from_ir(v.field("sc1")?)?,
+            nt: FromIr::from_ir(v.field("nt")?)?,
+        })
+    }
+}
+impl IrIds for CachePolicy {
+    fn ids(&mut self, fv: &mut dyn FnMut(&mut ValueId), fr: &mut dyn FnMut(&mut VarId)) {
+        IrIds::ids(&mut self.sc0, fv, fr);
+        IrIds::ids(&mut self.sc1, fv, fr);
+        IrIds::ids(&mut self.nt, fv, fr);
     }
 }
 

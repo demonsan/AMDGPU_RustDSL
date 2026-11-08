@@ -229,7 +229,32 @@ fn mem_op(a: &Alloc, base: Src, off: i64) -> String {
     }
 }
 
+/// ` sc0 sc1 nt` cache-policy modifiers of a global / buffer access (`MInst::cpol`, LLVM CPol bits).
+fn cpol_suffix(c: u8) -> String {
+    let mut s = String::new();
+    if c & 1 != 0 {
+        s += " sc0";
+    }
+    if c & 16 != 0 {
+        s += " sc1";
+    }
+    if c & 2 != 0 {
+        s += " nt";
+    }
+    s
+}
+
 fn inst_lines(a: &Alloc, inst: &MInst) -> Vec<String> {
+    let mut v = inst_lines_core(a, inst);
+    if inst.cpol != 0 {
+        if let Some(last) = v.last_mut() {
+            last.push_str(&cpol_suffix(inst.cpol));
+        }
+    }
+    v
+}
+
+fn inst_lines_core(a: &Alloc, inst: &MInst) -> Vec<String> {
     let d = |a: &Alloc| vr(a, inst.dst.expect("dst"));
     match inst.op {
         MOp::VAccvgprRead => vec![format!("v_accvgpr_read_b32 {}, {}", d(a), src1(a, inst.srcs[0]))],

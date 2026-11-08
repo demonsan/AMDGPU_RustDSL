@@ -416,3 +416,41 @@ pub fn probe_f8f6f4_p1() -> Function {
     }
     b.finish()
 }
+
+/// `probe_cpol_p1(in, out)`: cache-policy modifiers on global / buffer loads and stores (sc0, sc1, nt): out = in through four
+/// differently-flagged copy paths, lane l copying 16 bytes per path.
+pub fn probe_cpol_p1() -> Function {
+    use amdgpu_dsl::{CachePolicy as C, MemTy};
+    let mut b = FnBuilder::new("probe_cpol_p1", 64);
+    b.arg("in", DType::Ptr, 0, 8);
+    b.arg("out", DType::Ptr, 8, 8);
+    b.arg_tensor("in", amdgpu_dsl::Ext::Const(4096));
+    b.arg_tensor("out", amdgpu_dsl::Ext::Const(4096));
+    let inp = b.let_(Op::KernargPtr { offset: 0 });
+    let out = b.let_(Op::KernargPtr { offset: 8 });
+    let tid = b.let_(Op::WorkitemId);
+    let off16 = b.let_(Op::MulI32(Opnd::Val(tid), Opnd::I32(16)));
+    let pin = b.let_(Op::PtrAdd { base: Opnd::Val(inp), byte_off: Opnd::Val(off16) });
+    let pout = b.let_(Op::PtrAdd { base: Opnd::Val(out), byte_off: Opnd::Val(off16) });
+    let all = C { sc0: true, sc1: true, nt: true };
+    let sc0 = C { sc0: true, ..C::NONE };
+    let sc1 = C { sc1: true, ..C::NONE };
+    // path 0: global nt load -> global sc0 sc1 nt store
+    let v = b.load_global_c(pin, 0, MemTy::B128, C::NT);
+    b.store_global_c(pout, 0, v, MemTy::B128, false, all);
+    // path 1: global sc1 dword loads -> global sc0 stores (bytes 1024..)
+    for k in 0..4u32 {
+        let x = b.load_global_c(pin, 1024 + 4 * k, MemTy::B32, sc1);
+        b.store_global_c(pout, 1024 + 4 * k, x, MemTy::B32, false, sc0);
+    }
+    // paths 2, 3: buffer loads / stores with policies (bytes 2048.., 3072..)
+    let rin = b.buffer_desc(inp, 4096);
+    let rout = b.buffer_desc(out, 4096);
+    let v = b.buffer_load_c(rin, Some(Opnd::Val(off16)), 0, 2048, MemTy::B128, sc0);
+    b.buffer_store_c(rout, Some(Opnd::Val(off16)), 0, 2048, v, MemTy::B128, false, C::NT);
+    let v = b.buffer_load_c(rin, Some(Opnd::Val(off16)), 0, 3072, MemTy::B96, all);
+    b.buffer_store_c(rout, Some(Opnd::Val(off16)), 0, 3072, v, MemTy::B96, false, sc1);
+    let w = b.buffer_load_c(rin, Some(Opnd::Val(off16)), 0, 3084, MemTy::B32, C::NT);
+    b.buffer_store_c(rout, Some(Opnd::Val(off16)), 0, 3084, w, MemTy::B32, false, all);
+    b.finish()
+}

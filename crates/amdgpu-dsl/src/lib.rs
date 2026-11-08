@@ -243,6 +243,24 @@ impl MmaKind {
     }
 }
 
+/// Cache policy of a global / buffer access (gfx950 `sc0`, `sc1`, `nt` modifiers). Default: none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct CachePolicy {
+    pub sc0: bool,
+    pub sc1: bool,
+    pub nt: bool,
+}
+
+impl CachePolicy {
+    pub const NONE: CachePolicy = CachePolicy { sc0: false, sc1: false, nt: false };
+    /// Non-temporal (streaming) access.
+    pub const NT: CachePolicy = CachePolicy { sc0: false, sc1: false, nt: true };
+    /// LLVM CPol bits (1 = sc0, 2 = nt, 16 = sc1).
+    pub fn bits(self) -> u8 {
+        (self.sc0 as u8) | ((self.nt as u8) << 1) | ((self.sc1 as u8) << 4)
+    }
+}
+
 impl MemTy {
     pub fn bytes(self) -> u32 {
         match self {
@@ -473,11 +491,11 @@ pub enum Op {
     /// comparison -> I1
     Cmp { pred: CmpPred, ty: CmpTy, a: Opnd, b: Opnd },
     /// global load of any width (`MemTy`); result type `ty.value_ty()`
-    LoadGlobalN { base: Opnd, byte_off: u32, ty: MemTy },
+    LoadGlobalN { base: Opnd, byte_off: u32, ty: MemTy, cache: CachePolicy },
     /// `global_load_*_d16[_hi]`: the loaded 8 / 16 bits in one half of a dword, the other half zero
-    LoadGlobalD16 { base: Opnd, byte_off: u32, ty: D16Ty, hi: bool },
+    LoadGlobalD16 { base: Opnd, byte_off: u32, ty: D16Ty, hi: bool, cache: CachePolicy },
     /// MUBUF load of any width
-    BufferLoadN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, ty: MemTy },
+    BufferLoadN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, ty: MemTy, cache: CachePolicy },
     /// LDS load of any width
     LoadLdsN { addr: Opnd, ty: MemTy },
     /// `ds_read_*_d16[_hi]`
@@ -908,9 +926,9 @@ pub enum Stmt {
     /// Closes the innermost stage.
     StageEnd,
     /// global store of any width (`U8` / `U16` store the low bits; `hi` with `U8` / `U16`: the `_d16_hi` forms store bits 16..)
-    StoreGlobalN { base: Opnd, byte_off: u32, value: Opnd, ty: MemTy, hi: bool },
+    StoreGlobalN { base: Opnd, byte_off: u32, value: Opnd, ty: MemTy, hi: bool, cache: CachePolicy },
     /// MUBUF store of any width (same `hi` rule)
-    BufferStoreN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd, ty: MemTy, hi: bool },
+    BufferStoreN { rsrc: Opnd, voff: Option<Opnd>, soff: Opnd, imm: u32, value: Opnd, ty: MemTy, hi: bool, cache: CachePolicy },
     /// LDS store of any width (same `hi` rule)
     StoreLdsN { addr: Opnd, value: Opnd, ty: MemTy, hi: bool },
     /// `ds_write2[st64]_b32 / _b64`: `v0` at `addr + off0 * s`, `v1` at `addr + off1 * s`
@@ -1804,20 +1822,37 @@ impl FnBuilder {
 
     // ---- P1 A3 memory ----
     pub fn load_global(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: MemTy) -> ValueId {
-        self.let_(Op::LoadGlobalN { base: base.into(), byte_off, ty })
+        self.load_global_c(base, byte_off, ty, CachePolicy::NONE)
+    }
+    /// `load_global` with a cache policy (`sc0` / `sc1` / `nt`).
+    pub fn load_global_c(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: MemTy, cache: CachePolicy) -> ValueId {
+        self.let_(Op::LoadGlobalN { base: base.into(), byte_off, ty, cache })
     }
     pub fn load_global_d16(&mut self, base: impl Into<Opnd>, byte_off: u32, ty: D16Ty, hi: bool) -> ValueId {
-        self.let_(Op::LoadGlobalD16 { base: base.into(), byte_off, ty, hi })
+        self.let_(Op::LoadGlobalD16 { base: base.into(), byte_off, ty, hi, cache: CachePolicy::NONE })
     }
     pub fn store_global(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
-        self.push_stmt(Stmt::StoreGlobalN { base: base.into(), byte_off, value: value.into(), ty, hi });
+        self.store_global_c(base, byte_off, value, ty, hi, CachePolicy::NONE)
+    }
+    /// `store_global` with a cache policy.
+    pub fn store_global_c(&mut self, base: impl Into<Opnd>, byte_off: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool, cache: CachePolicy) {
+        self.push_stmt(Stmt::StoreGlobalN { base: base.into(), byte_off, value: value.into(), ty, hi, cache });
     }
     pub fn buffer_load_n(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, ty: MemTy) -> ValueId {
-        self.let_(Op::BufferLoadN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, ty })
+        self.buffer_load_c(rsrc, voff, soff, imm, ty, CachePolicy::NONE)
+    }
+    /// `buffer_load_n` with a cache policy.
+    pub fn buffer_load_c(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, ty: MemTy, cache: CachePolicy) -> ValueId {
+        self.let_(Op::BufferLoadN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, ty, cache })
     }
     #[allow(clippy::too_many_arguments)]
     pub fn buffer_store_n(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool) {
-        self.push_stmt(Stmt::BufferStoreN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into(), ty, hi });
+        self.buffer_store_c(rsrc, voff, soff, imm, value, ty, hi, CachePolicy::NONE)
+    }
+    /// `buffer_store_n` with a cache policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn buffer_store_c(&mut self, rsrc: impl Into<Opnd>, voff: Option<Opnd>, soff: impl Into<Opnd>, imm: u32, value: impl Into<Opnd>, ty: MemTy, hi: bool, cache: CachePolicy) {
+        self.push_stmt(Stmt::BufferStoreN { rsrc: rsrc.into(), voff, soff: soff.into(), imm, value: value.into(), ty, hi, cache });
     }
     pub fn load_lds(&mut self, addr: impl Into<Opnd>, ty: MemTy) -> ValueId {
         self.let_(Op::LoadLdsN { addr: addr.into(), ty })
@@ -2547,7 +2582,7 @@ fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
         }
     };
     match st {
-        Stmt::StoreGlobalN { base, byte_off, value, ty, hi } => {
+        Stmt::StoreGlobalN { base, byte_off, value, ty, hi, .. } => {
             if !matches!(opnd_ty(f, *base), Ok(DType::Ptr)) {
                 e.push("global store: base must be a pointer".into());
             }
@@ -2556,7 +2591,7 @@ fn check_mem_stmt(f: &Function, st: &Stmt) -> Vec<String> {
             }
             data(&mut e, *value, *ty, *hi);
         }
-        Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi } => {
+        Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi, .. } => {
             e.extend(check_buffer_access(f, *rsrc, *voff, *soff, *imm, 1));
             data(&mut e, *value, *ty, *hi);
         }

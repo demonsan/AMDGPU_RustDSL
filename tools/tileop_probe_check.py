@@ -498,10 +498,22 @@ def check_f8f6f4_p1(planes, out):
         obase += 2 * LANES * n
     return ok
 
+# ---------------------------------------------------------------- probe_cpol_p1: out == in (4 copy paths with cache-policy modifiers)
+def gen_cpol_p1():
+    return [[(i * 2654435761 + 12345) & 0xFFFFFFFF for i in range(1024)]]
+
+def check_cpol_p1(planes, out):
+    bad = [i for i in range(1024) if out[i] != planes[0][i]]
+    for path in range(4):
+        n = len([i for i in bad if path * 256 <= i < (path + 1) * 256])
+        print(("FAIL" if n else "ok  ") + f" copy path {path}: {256 - n} / 256 dwords")
+    return not bad
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
     "probe_f8f6f4_p1": (gen_f8f6f4_p1, check_f8f6f4_p1, sum(2 * LANES * 4 * (4 if k[0] == 16 else 16) for k in F8F6F4_KINDS)),
+    "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
 

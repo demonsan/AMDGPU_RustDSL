@@ -201,6 +201,7 @@ fn eval_token(tok: &str, inst: &MInst, cx: &RenderCtx) -> Result<String, String>
         "imm" => format!("{}", inst.imm),
         // two-address DS offsets (imm = offset0 | offset1 << 8)
         "cbsz" => format!("{}", (inst.imm >> 8) & 7),
+        "cpol" => format!("{}", inst.cpol),
         "blgp" => format!("{}", (inst.imm >> 12) & 7),
         "off0" => format!("{}", inst.imm & 0xff),
         "off1" => format!("{}", (inst.imm >> 8) & 0xff),

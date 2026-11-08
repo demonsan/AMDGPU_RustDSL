@@ -1957,17 +1957,17 @@ impl Lowerer {
                         self.push(MInst::new(mop).def(v).srcreg(ra).srcreg(rb).srcreg(v));
                     }
                 }
-                Stmt::StoreGlobalN { base, byte_off, value, ty, hi } => {
+                Stmt::StoreGlobalN { base, byte_off, value, ty, hi, cache } => {
                     let b = self.as_v2(*base)?;
                     let (v, mop) = self.store_value(*value, *ty, *hi, global_store_mop)?;
                     self.touch(&[Src::Reg(v)]);
-                    self.push(MInst::new(mop).srcreg(b).srcreg(v).imm(*byte_off as i64));
+                    self.push(MInst::new(mop).srcreg(b).srcreg(v).imm(*byte_off as i64).cpol(cache.bits()));
                 }
-                Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi } => {
+                Stmt::BufferStoreN { rsrc, voff, soff, imm, value, ty, hi, cache } => {
                     let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
                     let (v, mop) = self.store_value(*value, *ty, *hi, buffer_store_mop)?;
                     self.touch(&[Src::Reg(v)]);
-                    self.push(MInst::new(mop).srcreg(v).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
+                    self.push(MInst::new(mop).srcreg(v).srcreg(rr).src(vs).src(ss).imm(*imm as i64).cpol(cache.bits()));
                 }
                 Stmt::StoreLdsN { addr, value, ty, hi } => {
                     let (a, off) = self.lds_addr(*addr)?;
@@ -2280,28 +2280,28 @@ impl Lowerer {
             Op::Bin(o, a, b) => self.v_plain(dst, bin_mop(*o), &[*a, *b])?,
             Op::Tri(o, a, b, c) => self.v_plain(dst, tri_mop(*o), &[*a, *b, *c])?,
             Op::Cmp { pred, ty, a, b } => self.cmp_i1(dst, cmp_mop(*pred, *ty), *a, *b)?,
-            Op::LoadGlobalN { base, byte_off, ty } => {
+            Op::LoadGlobalN { base, byte_off, ty, cache } => {
                 let (cls, mop) = global_load_mop(*ty);
                 let d = self.new_vreg(cls);
                 let rb = self.as_v2(*base)?;
-                self.push(MInst::new(mop).def(d).srcreg(rb).imm(*byte_off as i64));
+                self.push(MInst::new(mop).def(d).srcreg(rb).imm(*byte_off as i64).cpol(cache.bits()));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
-            Op::LoadGlobalD16 { base, byte_off, ty, hi } => {
+            Op::LoadGlobalD16 { base, byte_off, ty, hi, cache } => {
                 // the d16 forms are partial writes in the ISA; gfx950 zeroes the other half anyway: start from 0 so both readings agree
                 let rb = self.as_v2(*base)?;
                 let d = self.new_vreg(RClass::V1);
                 self.push(MInst::new(MOp::VMovB32).def(d).src(Src::Imm(0)));
-                self.push(MInst::new(global_d16_mop(*ty, *hi)).def(d).srcreg(rb).srcreg(d).imm(*byte_off as i64));
+                self.push(MInst::new(global_d16_mop(*ty, *hi)).def(d).srcreg(rb).srcreg(d).imm(*byte_off as i64).cpol(cache.bits()));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
-            Op::BufferLoadN { rsrc, voff, soff, imm, ty } => {
+            Op::BufferLoadN { rsrc, voff, soff, imm, ty, cache } => {
                 let (rr, vs, ss) = self.buffer_operands(*rsrc, *voff, *soff)?;
                 let (cls, mop) = buffer_load_mop(*ty);
                 let d = self.new_vreg(cls);
-                self.push(MInst::new(mop).def(d).srcreg(rr).src(vs).src(ss).imm(*imm as i64));
+                self.push(MInst::new(mop).def(d).srcreg(rr).src(vs).src(ss).imm(*imm as i64).cpol(cache.bits()));
                 self.pending_vmem.push(self.mir.canon(d));
                 self.val.insert(dst, d);
             }
