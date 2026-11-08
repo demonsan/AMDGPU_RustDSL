@@ -139,7 +139,7 @@ impl KvRing3 {
 
     /// The copies of the tile at `key0` into `slot` that `role` produces, as emission units (buffer form: one unit per DMA instruction). `None` for
     /// the VGPR K-scale staging (`_t128`), which keeps the direct form.
-    pub fn stage_units(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<Units<'static>> {
+    pub fn stage_units(&self, b: &mut FnBuilder, role: Role, key0: &I32, slot: &SlotIdx) -> Option<Units> {
         match (role, &self.kdc, &self.buf, &self.kd_buf) {
             (Role::A, KdCopy3::Dma(kd), Some((kb, _)), Some(kdb)) => {
                 let mut u = kd.issue_buffer_units(b, kdb, key0, &self.kd.at(slot));
@@ -305,7 +305,7 @@ impl<'a> AttnBody3<'a> {
     }
     /// QK into the S variables as captured units: the setup (slot-bound K / K-scale partitions; the one bias MFMA of the `biasonce` form) and per
     /// 32-key block a read unit (K fragments, K-scale word) and an MMA unit (the shift and the two scaled MFMAs).
-    fn qk_units<'s>(&self, b: &mut FnBuilder, slot: &SlotIdx, s: AccTile<C32x32F32, 4>, bias: Opnd) -> Units<'s> {
+    fn qk_units(&self, b: &mut FnBuilder, slot: &SlotIdx, s: AccTile<C32x32F32, 4>, bias: Opnd) -> Units {
         let r = self.ring;
         let mut u = Units::new();
         let once = self.biasonce && self.kscale_sel;
@@ -333,7 +333,7 @@ impl<'a> AttnBody3<'a> {
     }
     /// PV as captured units: the setup (slot-bound V partition, the two P fragments), the row sums, per (half hh, dim group e) a read unit and an
     /// MMA unit.
-    fn pv_units<'s>(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) -> Units<'s> {
+    fn pv_units(&self, b: &mut FnBuilder, slot: &SlotIdx, w: &[ValueId]) -> Units {
         let r = self.ring;
         let mut u = Units::new();
         let (_, (v, p)) = u.capture(b, "pv.setup", |b| {

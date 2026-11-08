@@ -44,7 +44,7 @@ pub struct StageInst<'a> {
     /// instantiation parameters (for reports and the op graph)
     pub params: Vec<(String, String)>,
     pub contract: StageContract,
-    pub units: Units<'a>,
+    pub units: Units,
     /// live-out / scalar-out sets, evaluated after the units were emitted
     pub handover: Option<Handover<'a>>,
     /// open a `Node::Stage` region (false: units only, e.g. the unfused forms of a kernel keep their plain program)
@@ -55,7 +55,7 @@ pub struct StageInst<'a> {
 }
 
 impl<'a> StageInst<'a> {
-    pub fn new(key: &'static str, prim: Prim, name: impl Into<String>, contract: StageContract, units: Units<'a>) -> StageInst<'a> {
+    pub fn new(key: &'static str, prim: Prim, name: impl Into<String>, contract: StageContract, units: Units) -> StageInst<'a> {
         StageInst { key, prim, name: name.into(), params: Vec::new(), contract, units, handover: None, region: true, prebind: None }
     }
     pub fn param(mut self, k: &str, v: impl ToString) -> StageInst<'a> {
@@ -80,7 +80,7 @@ impl<'a> StageInst<'a> {
     }
     /// Emits the stage with the kernel's orchestration: `weave` receives the stage's weaver (labelled with the stage name) and returns it with an
     /// order / strategy.
-    pub fn emit_with(self, b: &mut FnBuilder, weave: impl FnOnce(Weaver<'a>) -> Weaver<'a>) {
+    pub fn emit_with(self, b: &mut FnBuilder, weave: impl FnOnce(Weaver) -> Weaver) {
         let StageInst { name, contract, units, handover, region, prebind, .. } = self;
         if let Some(p) = prebind {
             p(b);
@@ -109,7 +109,7 @@ impl<'a> StageInst<'a> {
 /// Several stage instances woven together into ONE phase (their units interleave under the kernel's order): the instances are emitted plain (a
 /// `Node::Stage` region cannot interleave with another); returns the phase's weaver (label `phase`) and the instances' (key, name, params) for
 /// reports. Unit ids are the instances' ids shifted by the units of the instances before them (declaration order = instance order).
-pub fn compose<'a>(phase: &str, insts: Vec<StageInst<'a>>) -> (Weaver<'a>, Vec<(&'static str, String, Vec<(String, String)>)>) {
+pub fn compose<'a>(phase: &str, insts: Vec<StageInst<'a>>) -> (Weaver, Vec<(&'static str, String, Vec<(String, String)>)>) {
     let mut u = Units::new();
     let mut info = Vec::new();
     for inst in insts {

@@ -1,8 +1,9 @@
 //! Emission units and the weaver (docs/fusion-stage-library-design.md, "Stage / Weaver / backend").
 //!
-//! A stage instantiated for one shape returns [`Unit`]s instead of emitting: each unit is a closure that emits a small, self-contained piece of IR
-//! (one QK block, one PV block, one DMA instruction, ...) plus the facts a weaver needs to place it - dependencies on earlier units, a resource
-//! class, a nominal latency, a register profile and an interleave hint. The [`Weaver`] takes the units of one or more stages and emits them in an
+//! A stage instantiated for one shape returns [`Unit`]s instead of emitting: each unit holds a small, self-contained piece of IR captured from
+//! the builder (one QK block, one PV block, one DMA instruction, ...; `Units::capture`, docs/weave-capture.md) plus the facts a weaver needs to
+//! place it - dependencies on earlier units (derived from the statement facts), a resource class, a nominal latency, a register profile and an
+//! interleave hint. The [`Weaver`] takes the units of one or more stages and emits them in an
 //! order: the kernel author's explicit order is authoritative ([`Weaver::order`] / [`Weaver::seq`]); [`Weaver::spread`] is an optional automatic
 //! strategy (skeleton units with filler units spread between them). The weave is checked to be a topological order of the dependencies before
 //! anything is emitted. The output is ordinary region IR - verified (gpu_verify, GV-STAGE) and compiled as before. Per-shape decisions (which
@@ -10,8 +11,6 @@
 
 use amdgpu_dsl::facts::{must_order, Facts, ResClass};
 use amdgpu_dsl::{Captured, FnBuilder};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 pub type UnitId = usize;
 
@@ -54,43 +53,8 @@ pub struct RegProfile {
     pub agpr_ok: bool,
 }
 
-/// A value produced by one unit and consumed by later ones (set when the producer is emitted).
-pub struct Out<T>(Rc<RefCell<Option<T>>>);
-
-impl<T> Clone for Out<T> {
-    fn clone(&self) -> Self {
-        Out(self.0.clone())
-    }
-}
-
-impl<T> Default for Out<T> {
-    fn default() -> Self {
-        Out(Rc::new(RefCell::new(None)))
-    }
-}
-
-impl<T> Out<T> {
-    pub fn new() -> Out<T> {
-        Out::default()
-    }
-    pub fn set(&self, v: T) {
-        *self.0.borrow_mut() = Some(v);
-    }
-    /// Borrow the produced value (panics when the producer has not been emitted: the weave is not a topological order).
-    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        let g = self.0.borrow();
-        f(g.as_ref().expect("weave: a unit consumed a value before its producer was emitted"))
-    }
-}
-
-impl<T: Clone> Out<T> {
-    pub fn get(&self) -> T {
-        self.with(|v| v.clone())
-    }
-}
-
 /// One emission unit.
-pub struct Unit<'a> {
+pub struct Unit {
     pub name: String,
     pub class: UnitClass,
     pub hint: Hint,
@@ -101,19 +65,13 @@ pub struct Unit<'a> {
     pub regs: RegProfile,
     /// iteration offset of the unit's work relative to the loop iteration it is emitted in (0 = this tile, +1 = the next one): `rotate`
     pub iter: i32,
-    /// statement facts of a captured unit (one per top-level node, in order); empty for a closure unit
+    /// statement facts (one per top-level node, in order)
     pub stmts: Vec<Facts>,
-    /// the facts of the whole unit (captured units)
-    pub summary: Option<Facts>,
-    /// unsplittable node ranges of a captured unit (`Captured::groups`)
+    /// the facts of the whole unit
+    pub summary: Facts,
+    /// unsplittable node ranges (`Captured::groups`)
     groups: Vec<std::ops::Range<usize>>,
-    body: Body<'a>,
-}
-
-/// What a unit emits: a deferred closure (the original API) or statements already captured (`Units::capture`), spliced when woven.
-enum Body<'a> {
-    Emit(Box<dyn FnOnce(&mut FnBuilder) + 'a>),
-    Cap(Captured),
+    cap: Captured,
 }
 
 /// The union of the facts of several nodes (a unit's summary): defs, uses not defined inside, variable reads / writes, effects, footprint.
@@ -197,12 +155,12 @@ fn classify(fs: &[Facts], sum: &Facts) -> (UnitClass, Hint, u32) {
 
 /// The units of one or more stage instances.
 #[derive(Default)]
-pub struct Units<'a> {
-    v: Vec<Unit<'a>>,
+pub struct Units {
+    v: Vec<Unit>,
 }
 
-impl<'a> Units<'a> {
-    pub fn new() -> Units<'a> {
+impl Units {
+    pub fn new() -> Units {
         Units { v: Vec::new() }
     }
     pub fn len(&self) -> usize {
@@ -211,17 +169,9 @@ impl<'a> Units<'a> {
     pub fn is_empty(&self) -> bool {
         self.v.is_empty()
     }
-    /// Adds a unit; returns its id.
-    pub fn add(&mut self, name: impl Into<String>, class: UnitClass, hint: Hint, deps: &[UnitId], emit: impl FnOnce(&mut FnBuilder) + 'a) -> UnitId {
-        for &d in deps {
-            assert!(d < self.v.len(), "Units::add: dependency {d} of `{}` is not an earlier unit", self.v.len());
-        }
-        self.v.push(Unit { name: name.into(), class, hint, latency: 0, deps: deps.to_vec(), regs: RegProfile::default(), iter: 0, stmts: Vec::new(), summary: None, groups: Vec::new(), body: Body::Emit(Box::new(emit)) });
-        self.v.len() - 1
-    }
-    /// Adds a CAPTURED unit: `f` runs NOW into a capture buffer (its values are usable by the code that follows, e.g. later units), and the
-    /// statements are spliced where the weave places the unit. Dependencies on the earlier captured units are derived from the statement
-    /// facts (values, loop variables, effects: `amdgpu_dsl::facts::must_order`); every earlier closure unit is a conservative dependency.
+    /// Adds a unit: `f` runs NOW into a capture buffer (its values are usable by the code that follows, e.g. later units), and the statements
+    /// are spliced where the weave places the unit. Dependencies on the earlier units are derived from the statement facts (values, loop
+    /// variables, effects: `amdgpu_dsl::facts::must_order`).
     /// Class, hint, latency and register footprint are filled from the facts. Captured in order and woven in declaration order, the program
     /// is identical to building it directly.
     pub fn capture<R>(&mut self, b: &mut FnBuilder, name: impl Into<String>, f: impl FnOnce(&mut FnBuilder) -> R) -> (UnitId, R) {
@@ -230,14 +180,11 @@ impl<'a> Units<'a> {
         let groups = cap.groups();
         let sum = merge_facts(&stmts);
         let deps: Vec<UnitId> = (0..self.v.len())
-            .filter(|&j| match &self.v[j].summary {
-                Some(sj) => must_order(sj, &sum),
-                None => true,
-            })
+            .filter(|&j| must_order(&self.v[j].summary, &sum))
             .collect();
         let (class, hint, latency) = classify(&stmts, &sum);
         let regs = RegProfile { live_in: 0, live_out: sum.footprint, temps: sum.footprint, agpr_ok: false };
-        self.v.push(Unit { name: name.into(), class, hint, latency, deps, regs, iter: 0, stmts, summary: Some(sum), groups, body: Body::Cap(cap) });
+        self.v.push(Unit { name: name.into(), class, hint, latency, deps, regs, iter: 0, stmts, summary: sum, groups, cap });
         (self.v.len() - 1, r)
     }
     /// `capture` for an ordering anchor (waits, barriers, markers): hint `Anchor` regardless of the facts.
@@ -250,53 +197,29 @@ impl<'a> Units<'a> {
     pub fn set_iter(&mut self, id: UnitId, iter: i32) {
         self.v[id].iter = iter;
     }
-    /// Splits every captured unit into its unsplittable node groups (statement granularity; a region / tile region / stage / weave-region
-    /// mark pair stays whole). Dependencies between all the groups are re-derived from the statement facts; closure units stay whole and keep
-    /// their explicit dependencies (re-pointed to the last group of a split unit, and conservatively ordered after every earlier group).
-    /// Sub-unit names are `<unit>#<k>`; declaration order = the original statement order.
-    pub fn split(self) -> Units<'a> {
-        let mut out: Units<'a> = Units::new();
-        let mut last_of: Vec<UnitId> = Vec::with_capacity(self.v.len());
+    /// Splits every unit into its unsplittable node groups (statement granularity; a region / tile region / stage / weave-region mark pair
+    /// stays whole). Dependencies between all the groups are re-derived from the statement facts. Sub-unit names are `<unit>#<k>`; declaration
+    /// order = the original statement order.
+    pub fn split(self) -> Units {
+        let mut out = Units::new();
         for u in self.v {
-            match u.body {
-                Body::Emit(e) => {
-                    let mut deps: Vec<UnitId> = u.deps.iter().map(|&d| last_of[d]).collect();
-                    deps.extend(0..out.v.len());
-                    deps.sort_unstable();
-                    deps.dedup();
-                    out.v.push(Unit { name: u.name, class: u.class, hint: u.hint, latency: u.latency, deps, regs: u.regs, iter: u.iter, stmts: Vec::new(), summary: None, groups: Vec::new(), body: Body::Emit(e) });
-                }
-                Body::Cap(cap) => {
-                    let mut nodes = cap.nodes.into_iter();
-                    for (k, g) in u.groups.iter().enumerate() {
-                        let part: Vec<amdgpu_dsl::Node> = nodes.by_ref().take(g.len()).collect();
-                        let fs: Vec<Facts> = u.stmts[g.clone()].to_vec();
-                        let sum = merge_facts(&fs);
-                        let deps: Vec<UnitId> = (0..out.v.len())
-                            .filter(|&j| match &out.v[j].summary {
-                                Some(sj) => must_order(sj, &sum),
-                                None => true,
-                            })
-                            .collect();
-                        let (class, hint, latency) = classify(&fs, &sum);
-                        let regs = RegProfile { live_in: 0, live_out: sum.footprint, temps: sum.footprint, agpr_ok: false };
-                        let groups = vec![0..part.len()];
-                        out.v.push(Unit { name: format!("{}#{k}", u.name), class, hint, latency, deps, regs, iter: u.iter, stmts: fs, summary: Some(sum), groups, body: Body::Cap(Captured { nodes: part }) });
-                    }
-                }
+            let mut nodes = u.cap.nodes.into_iter();
+            for (k, g) in u.groups.iter().enumerate() {
+                let part: Vec<amdgpu_dsl::Node> = nodes.by_ref().take(g.len()).collect();
+                let fs: Vec<Facts> = u.stmts[g.clone()].to_vec();
+                let sum = merge_facts(&fs);
+                let deps: Vec<UnitId> = (0..out.v.len()).filter(|&j| must_order(&out.v[j].summary, &sum)).collect();
+                let (class, hint, latency) = classify(&fs, &sum);
+                let regs = RegProfile { live_in: 0, live_out: sum.footprint, temps: sum.footprint, agpr_ok: false };
+                let groups = vec![0..part.len()];
+                out.v.push(Unit { name: format!("{}#{k}", u.name), class, hint, latency, deps, regs, iter: u.iter, stmts: fs, summary: sum, groups, cap: Captured { nodes: part } });
             }
-            last_of.push(out.v.len() - 1);
         }
         out
     }
-    /// Sets the nominal latency and register profile of unit `id`.
-    pub fn facts(&mut self, id: UnitId, latency: u32, regs: RegProfile) {
-        self.v[id].latency = latency;
-        self.v[id].regs = regs;
-    }
     /// Appends another unit list (its ids are shifted by the current length); returns the shift. `after`: extra dependencies of every appended
     /// unit (e.g. the last unit of a phase that must come first).
-    pub fn append(&mut self, other: Units<'a>, after: &[UnitId]) -> usize {
+    pub fn append(&mut self, other: Units, after: &[UnitId]) -> usize {
         let base = self.v.len();
         for mut u in other.v {
             for d in u.deps.iter_mut() {
@@ -307,7 +230,7 @@ impl<'a> Units<'a> {
         }
         base
     }
-    pub fn unit(&self, id: UnitId) -> &Unit<'a> {
+    pub fn unit(&self, id: UnitId) -> &Unit {
         &self.v[id]
     }
     /// Ids of the units with iteration offset `iter`.
@@ -321,43 +244,43 @@ impl<'a> Units<'a> {
 }
 
 /// Places the units of a phase and emits them.
-pub struct Weaver<'a> {
-    units: Units<'a>,
+pub struct Weaver {
+    units: Units,
     order: Option<Vec<UnitId>>,
     label: String,
 }
 
-impl<'a> Weaver<'a> {
-    pub fn new(units: Units<'a>) -> Weaver<'a> {
+impl Weaver {
+    pub fn new(units: Units) -> Weaver {
         Weaver { units, order: None, label: String::new() }
     }
     /// A label for reports / errors (the phase name).
-    pub fn phase(mut self, label: impl Into<String>) -> Weaver<'a> {
+    pub fn phase(mut self, label: impl Into<String>) -> Weaver {
         self.label = label.into();
         self
     }
-    /// Statement granularity: every captured unit split into its node groups (`Units::split`); an explicit order is dropped (re-order the
+    /// Statement granularity: every unit split into its node groups (`Units::split`); an explicit order is dropped (re-order the
     /// sub-units with `order` / a strategy afterwards).
-    pub fn fine(self) -> Weaver<'a> {
+    pub fn fine(self) -> Weaver {
         Weaver { units: self.units.split(), order: None, label: self.label }
     }
     /// The units of the weave (strategies read their facts).
-    pub fn units(&self) -> &Units<'a> {
+    pub fn units(&self) -> &Units {
         &self.units
     }
     /// Declaration order.
-    pub fn seq(mut self) -> Weaver<'a> {
+    pub fn seq(mut self) -> Weaver {
         self.order = Some((0..self.units.len()).collect());
         self
     }
     /// The explicit order (authoritative): every unit exactly once.
-    pub fn order(mut self, ids: Vec<UnitId>) -> Weaver<'a> {
+    pub fn order(mut self, ids: Vec<UnitId>) -> Weaver {
         self.order = Some(ids);
         self
     }
     /// Strategy: `skeleton` in its given order, `fillers` distributed round-robin after the skeleton units, at most `per` after each (the rest
     /// after the last skeleton unit); every other unit keeps its declaration position before the first skeleton unit.
-    pub fn spread(mut self, skeleton: &[UnitId], fillers: &[UnitId], per: usize) -> Weaver<'a> {
+    pub fn spread(mut self, skeleton: &[UnitId], fillers: &[UnitId], per: usize) -> Weaver {
         let n = self.units.len();
         let mut placed = vec![false; n];
         for &i in skeleton.iter().chain(fillers) {
@@ -390,16 +313,13 @@ impl<'a> Weaver<'a> {
     pub fn emit(self, b: &mut FnBuilder) {
         let ord = self.plan();
         let label = self.label.clone();
-        let mut slots: Vec<Option<Unit<'a>>> = self.units.v.into_iter().map(Some).collect();
+        let mut slots: Vec<Option<Unit>> = self.units.v.into_iter().map(Some).collect();
         if !label.is_empty() {
             b.weave_region_begin(&label);
         }
         for i in ord {
             let u = slots[i].take().expect("weave: unit emitted twice");
-            match u.body {
-                Body::Emit(e) => e(b),
-                Body::Cap(c) => b.splice(c),
-            }
+            b.splice(u.cap);
         }
         if !label.is_empty() {
             b.weave_region_end();
