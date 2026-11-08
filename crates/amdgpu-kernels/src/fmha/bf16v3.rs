@@ -160,12 +160,6 @@ impl PipeBody for Body<'_> {
         self.s = vars[6..10].to_vec();
     }
     fn v_phase(&mut self, b: &mut FnBuilder, _role: Role, t: &TileIt) {
-        if std::env::var("EXP_NOSM").is_ok() {
-            // (sensitivity) P = raw S bits packed, no softmax
-            let s = self.s.clone();
-            self.p = (0..32usize).map(|i| { let x = b.frag16_lane(Opnd::Var(s[i / 8]), (2 * (i % 8)) as u8); b.bitcast_i32(x) }).collect();
-            return;
-        }
         if self.prio {
             b.set_prio(0);
         }
@@ -252,10 +246,8 @@ impl PipeBody for Body<'_> {
         if self.prio {
             b.set_prio(1);
         }
-        if std::env::var("EXP_NOPV").is_err() {
-            self.pv(b, &t.cur);
-        }
-        if t.staged && std::env::var("EXP_NOQK").is_err() {
+        self.pv(b, &t.cur);
+        if t.staged {
             let s = self.s.clone();
             self.qk(b, &t.next, Some(&s));
         }
@@ -270,7 +262,9 @@ pub fn fmha_fwd_hd128_bf16_v3(name: &str, causal: bool) -> Function {
 /// at kernarg 656, S = 2^lg_s at 660, fp32 partial O / l [B, H, SQ, S, 128] at 672, partial LSE [B, H, SQ, S] at 688); `attn_combine_bf16_hd128_q` merges them.
 pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Function {
     let mut b = FnBuilder::new(name, 512);
-    b.compile_profile(match std::env::var("EXP_PROF").as_deref() { Ok("vs128") => CompileProfile::Vs128, Ok("t128") => CompileProfile::T128, _ => CompileProfile::Gemm });
+    // the `_vs128` policy (full reordering list scheduler) + ldsink / wsink / ldahead32: measured +6.6 % / +7.7 % / +6.7 % (8192², 2048², 1024²)
+    // over the Gemm profile
+    b.compile_profile(CompileProfile::Vs128);
     // ---- ABI (the vendor's v3, as bf16.rs) ----
     for (n, i) in [("ptr_o", 0u32), ("ptr_q", 1), ("ptr_k", 2), ("ptr_v", 3), ("ptr_lse", 4)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
@@ -576,9 +570,7 @@ pub fn fmha_fwd_hd128_bf16_v3_x(name: &str, causal: bool, split: bool) -> Functi
     }
     }
     let mut f = b.finish();
-    if let Ok(o) = std::env::var("EXP_SCHED") {
-        f.sched_opts = Some(o);
-    }
+    f.sched_opts = Some("ldsink=1,wsink,ldahead32=1".to_string());
     f
 }
 
