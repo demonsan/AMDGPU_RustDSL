@@ -129,17 +129,33 @@ fn smem_block() -> Layout {
 /// `gemm` on loop variables (the operands of the register-staged tile are loop-carried): same operand / scale exchange as `amdgpu_tile::gemm`.
 #[allow(clippy::too_many_arguments)]
 fn mma_var(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, acc: VarId, a: VarId, bf: VarId, sa: VarId, sb: VarId, byte_a: u8) {
+    mma_blocks(b, mma, elem, &[(acc, a, bf, sa, sb, byte_a)]);
+}
+
+/// The MMAs of several 16 x 16 blocks of the K tile (acc, A frag, B frag, A scale, B scale, A scale byte). fp8: one scaled MFMA per block.
+/// bf16: the 32-byte fragments are two 16-byte bf16 operands (8 elements each, the same K permutation for A and B); the first halves of every
+/// block, then the second halves, so the two MFMAs into one accumulator are not back to back.
+fn mma_blocks(b: &mut FnBuilder, mma: &TiledMma, elem: Elem, blocks: &[(VarId, VarId, VarId, VarId, VarId, u8)]) {
     assert_eq!(mma.atom().name, "MfmaScale16x16x128F8");
-    let (x, y, sx, sy, bx, by) = if mma.swap_ab { (bf, a, sb, sa, 0, byte_a) } else { (a, bf, sa, sb, byte_a, 0) };
+    let ops = |&(acc, a, bf, sa, sb, byte_a): &(VarId, VarId, VarId, VarId, VarId, u8)| {
+        if mma.swap_ab { (acc, bf, a, sb, sa, 0, byte_a) } else { (acc, a, bf, sa, sb, byte_a, 0) }
+    };
     match elem {
-        Elem::Fp8 => b.var_mfma_scale16(acc, Opnd::Var(x), Opnd::Var(y), Opnd::Var(sx), Opnd::Var(sy), bx, by),
+        Elem::Fp8 => {
+            for blk in blocks {
+                let (acc, x, y, sx, sy, bx, by) = ops(blk);
+                b.var_mfma_scale16(acc, Opnd::Var(x), Opnd::Var(y), Opnd::Var(sx), Opnd::Var(sy), bx, by);
+            }
+        }
         Elem::Bf16 => {
-            // the 32-byte fragment = two 16-byte bf16 operands (8 elements each), same K permutation for A and B
             let k = amdgpu_dsl::MmaKind::new(amdgpu_dsl::MmaShape::M16N16K32, amdgpu_dsl::MmaTy::Bf16);
             for h in 0..2u8 {
-                let xs = b.var_slice4(x, h);
-                let ys = b.var_slice4(y, h);
-                b.var_mfma(acc, k, xs, ys, false);
+                for blk in blocks {
+                    let (acc, x, y, ..) = ops(blk);
+                    let xs = b.var_slice4(x, h);
+                    let ys = b.var_slice4(y, h);
+                    b.var_mfma(acc, k, xs, ys, false);
+                }
             }
         }
     }
@@ -391,6 +407,7 @@ impl Body {
         let nn = bv.len();
         let half = nn / 2;
         let mut n = 0;
+        let mut blocks = Vec::new();
         'o: for i in 0..av.len() {
             for j in 0..half {
                 if n >= to {
@@ -398,11 +415,12 @@ impl Body {
                 }
                 if n >= from {
                     let (w, by) = self.sa_sel(i);
-                    mma_var(b, &self.mma, self.cfg.elem, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by);
+                    blocks.push((self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by));
                 }
                 n += 1;
             }
         }
+        mma_blocks(b, &self.mma, self.cfg.elem, &blocks);
         self.npre_done = n;
     }
     /// The scale words of tile `kb` from the transposed panel: the 8 A-scale bytes of this lane (one ds_read_b64; the MMA selects byte i % 4 of
@@ -479,12 +497,16 @@ impl Body {
         let body = |b: &mut FnBuilder, u: &mut Units| {
             for (lo, hi) in [(0, half), (half, nn)] {
                 for i in 0..nm {
-                    for j in lo..hi {
-                        if lo == 0 && i * half + j < self.npre_done {
-                            continue; // issued before the barrier (pre_sync / post_wait)
+                    let todo: Vec<usize> = (lo..hi).filter(|&j| !(lo == 0 && i * half + j < self.npre_done)).collect(); // the rest were issued before the barrier
+                    let (w, by) = self.sa_sel(i);
+                    if self.cfg.elem == Elem::Fp8 {
+                        for &j in &todo {
+                            u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.cfg.elem, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by));
                         }
-                        let (w, by) = self.sa_sel(i);
-                        u.capture(b, format!("mma.i{i}j{j}"), |b| mma_var(b, &self.mma, self.cfg.elem, self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by));
+                    } else if !todo.is_empty() {
+                        // bf16: the row's blocks in one unit, first halves then second halves
+                        let blocks: Vec<_> = todo.iter().map(|&j| (self.acc[nn * i + j], av[i], bv[j], sav[w], sbv, by)).collect();
+                        u.capture(b, format!("mma.i{i}j{}-{}", todo[0], todo[todo.len() - 1]), |b| mma_blocks(b, &self.mma, self.cfg.elem, &blocks));
                     }
                     if let (true, Some((ar, _))) = (lo == half, &next) {
                         // in-place reload: the ds_reads write the variable's own AGPRs (coalesced set_var)
@@ -842,10 +864,12 @@ impl skeleton_v4::V4Slots for GemmSlots {
             { let n = b.bind_i32(ev(m_v) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
             { let n = b.bind_i32((ev(n_v) >> 7) * ev(kb_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
         ),
-        Scales::RowCol | Scales::None => (
+        Scales::RowCol => (
             { let n = b.bind_i32(ev(m_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfa, n) },
             { let n = b.bind_i32(ev(n_v) << 2); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_sfb, n) },
         ),
+        // unused (no scales)
+        Scales::None => (rsrc_a, rsrc_b),
     };
     let a_org = b.bind_i32((ev(by) << lg_m) * ev(k_v));
     let b_org = b.bind_i32((ev(bx) << lg_n) * ev(k_v));
