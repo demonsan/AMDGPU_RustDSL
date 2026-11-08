@@ -347,7 +347,7 @@ fn metadata_args_match_the_dsl_args_without_padding() {
 fn llvm_tail_supported(name: &str) -> bool {
     let Some(f) = amdgpu_kernels::kernel_by_name(name) else { return true };
     match amdgpu_compiler::compile_mir(&f) {
-        Ok(m) => !m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 | MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds))),
+        Ok(m) => !m.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, MOp::GlobalLoadLdsB128 | MOp::GlobalLoadLdsB32 | MOp::BufferLoadDwordX4Lds | MOp::BufferLoadDwordX1Lds | MOp::VMovDpp | MOp::VMovDppX | MOp::VAddF32Dpp | MOp::VSubF32Dpp | MOp::VMulF32Dpp | MOp::VMaxF32Dpp | MOp::VMinF32Dpp | MOp::VAddU32Dpp | MOp::VMaxI32Dpp | MOp::VMinI32Dpp | MOp::VMaxU32Dpp | MOp::VMinU32Dpp | MOp::VAndB32Dpp | MOp::VOrB32Dpp | MOp::VXorB32Dpp))),
         Err(_) => true,
     }
 }
