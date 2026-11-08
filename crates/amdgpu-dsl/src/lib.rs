@@ -2124,6 +2124,12 @@ impl FnBuilder {
         let r1 = self.load_lds_tr_b16(addr1);
         self.cat_frag4(r0, r1)
     }
+    /// Mark a fresh load result (`buffer_load_b128`, ...) for IN-PLACE use: `set_var(var, b.inplace(load))` makes the load write the loop
+    /// variable's own registers (no copy, no wait at the definition). Plain `set_var(var, load)` keeps the copy (the shipped behaviour).
+    pub fn inplace(&mut self, v: impl Into<Opnd>) -> ValueId {
+        let v = v.into();
+        self.frag_cat(&[v])
+    }
     /// Four dwords as a Frag4 with fresh single-use parts written in place (`frag4` copies; this does not).
     pub fn pack4(&mut self, a: impl Into<Opnd>, b: impl Into<Opnd>, c: impl Into<Opnd>, d: impl Into<Opnd>) -> ValueId {
         let p = [a.into(), b.into(), c.into(), d.into()];
