@@ -316,7 +316,7 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 | 量化 | per-token / per-group128 / static fp8，int8 per-token，dequant | 有 | 见前文 |
 | | mxfp4 / mxfp8 量化（`quant_mxfp4.cu`，E8M0 缩放，32 元素块） | 有（Main，kernel-opt） | `quant_mxfp4_bf16_k<K>`、`quant_mxfp8_bf16_k<K>`（`rows/mxquant.rs`，不在本分支，合入 Main 后可用） |
 | | mxfp6 量化 | 缺 | 与 mxfp4 同构（e2m3 / e3m2 打包），使用面窄 |
-| | 融合进 norm 的 mxfp4 量化 | 缺 | 复用 kernel-opt 的 `mxquant` 打包 / E8M0 scale 逻辑，在行内族的输出阶段接上，不另写实现；待 Main 合并后做 |
+| | **融合进 norm 的 mxfp4 量化**（`fused_rms_mxfp4_quant`） | 有（新） | `rmsnorm_quant_mxfp4_bf16_k<K>`：RMSNorm（f32，不经过 bf16 中间值）后直接按 `quant_mxfp4_bf16_k<K>` 的规则（kernel-opt 的 amax 舍入、E8M0、`v_cvt_scalef32_pk_fp4_f32`）量化，输出 fp4 `[M][K/2]` 和 shuffled a4w4 scale 布局；K % 512 = 0，≤ 16384，M % 16 = 0；K = 2048 / 4096 / 7168 都是 2.7 – 2.8 TB/s（只计一次 x 读 + q + scales） |
 | 融合激活 | silu_mul / gelu_tanh_mul（`[M][2D]`） | 有 | `silu_mul_bf16_d<D>`、`gelu_tanh_mul_bf16_d<D>`（6.5 TB/s） |
 | | silu_mul + fp8 量化 | 有 | `silu_mul_quant_fp8_d<D>` |
 | | **silu_and_mul 带 limit**（`x = min(x, limit)`, `y` 夹到 ±limit） | 有（新） | `silu_mul_limit_bf16_d<D>`，limit 是 kernarg（≤ 0 = 不限）；6.55 TB/s |
@@ -376,3 +376,10 @@ kernel-opt 的 stage 2 先写"每条路由一行"的输出，再由这个 kernel
 `qknorm_rope_kvcache_{neox,gptj}_{bf16,fp8}_h<Hk>_d<D>[_i64]`：把 `qknorm_rope_*` 的输出阶段换成 KV cache 写。输入 K、V 为 `[T][Hk][D]` bf16；K 逐 head 做 RMSNorm（gamma、eps）后旋转，结果写到 `key_cache[slot_mapping[t]]`；V 写到 `value_cache[slot]`，bf16 cache 原样拷贝、fp8 cache 用静态 `v_scale` 量化（K 用 `k_scale`，e4m3，写入的是 `x / scale`）；flash 布局 `[S][Hk][D]`；`slot_mapping` 负数或 ≥ S 的 token 什么都不写。ABI 在 `qknorm_rope_*` 的基础上加 v @56、key_cache @64、value_cache @72、slot_mapping @80、S @88（i32）、k_scale @92 / v_scale @96（仅 fp8）；`out` 参数保留但不使用。Q 的 norm + rope 仍然是 `qknorm_rope_*` 的一次启动，所以完整的 aiter 融合 = 两次启动（Q、KV）。限制：cache < 2 GiB（逐 lane 的 slot 地址是 32 位偏移）、全旋转（无 `_r<R>`）。
 
 主机测试 `tests/gpu/qknorm_rope_kv_host.cpp`：CPU 参考（范数 → 旋转 → 写 / 量化）逐元素比较 K（bf16 ≤ 1 ulp、fp8 按 e4m3 半步长）和 V（bf16 逐位、fp8 同上），未写的 cache 行保持哨兵、末尾之后 0 字节被写；覆盖 neox / gptj，H = 1（打包 token 模式）/ 2 / 4 / 8，D = 64 / 128 / 256，bf16 与 fp8 cache，int32 与 int64 slot，含负 slot、≥ S 的 slot 和超出 cos / sin 表的位置；`bad = 0`；`gpu_verify --strict` 0 错误，52 – 92 VGPR。
+
+
+## RMSNorm + MXFP4 融合
+
+`rmsnorm_quant_mxfp4_bf16_k<K>`：把 `rmsnorm_bf16_n<K>` 与 kernel-opt 的 `quant_mxfp4_bf16_k<K>`（`rows/mxquant.rs`）合成一个 kernel，省掉规范化后的行在 HBM 里的 bf16 往返（写 2 B + 读 2 B / 元素）。量化规则、E8M0 scale、fp4 转换指令和 shuffled a4w4 scale 布局完全沿用 mxquant（输出可以直接喂 `gemm_a4w4_mxfp4`）。映射也沿用 mxquant：一个块 = 16 行 × 整行 K，4 个 wave，wave `w` 处理 tile pair `w + 4 i`，lane `16 g + r` 负责行 `16 rb + r` 的第 `16 p + g + 4 j` 组；pass A 求每个 lane 的平方和（一个 tile pair 的 4 组展开，16 次 b128 加载在飞），行内 4 个 lane（`l ^ 16`、`l ^ 32`）用两次 lane swap 合并，4 个 wave 用 256 字节 LDS 合并；pass B 重新读行（L2）、乘 `inv_rms · gamma` 后量化。ABI：x @0、gamma @8、q @16、scale @24、M @32、eps @36。
+
+主机测试 `tests/gpu/mxnorm_host.cpp`：CPU 参考把同一规则用在 f32 的规范化行上；scale 字节必须一致（每百万个 group 里有几个边界 group 差 1，因为设备的 rsqrt 是近似指令，允许 ≤ 1‰），每个反量化值必须在设备自己的 scale 的 fp4 半步长（1 × scale）以内；K = 512 / 2048 / 4096 / 7168，`code_bad = 0`，`gpu_verify --strict` 0 错误，84 VGPR。性能（K = 4096、M = 32768）：123 µs；分开做（rmsnorm 约 90 µs + mxfp4 量化）估计 ≥ 1.6 倍。
