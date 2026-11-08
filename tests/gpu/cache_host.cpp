@@ -23,8 +23,8 @@ int main(int argc, char** argv) {
     hipModule_t mod; hipFunction_t fn; CK(hipModuleLoad(&mod, co)); CK(hipModuleGetFunction(&fn, mod, kn));
     struct __attribute__((packed)) { void *k, *v, *kc, *vc, *sl; int32_t t, s; } args{dk, dv, dkc, dvc, dsl, (int32_t)T, (int32_t)S};
     size_t sz = sizeof(args); void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
-    long nv = (long)(row / 16); int blockx = (int)(std::min<long>(4, (nv + 63) / 64) * 64);
-    CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize());
+    long nv = (long)(row / 16); long lt = std::min<long>(4, (nv + 63) / 64) * 64, tpb = lt <= 128 ? 256 / lt : 1; int blockx = (int)(lt * tpb); int grid = (int)((T + tpb - 1) / tpb);
+    CK(hipModuleLaunchKernel(fn, grid, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize());
     std::vector<uint8_t> hkc(S * row + 64), hvc(S * row + 64); CK(hipMemcpy(hkc.data(), dkc, hkc.size(), hipMemcpyDeviceToHost)); CK(hipMemcpy(hvc.data(), dvc, hvc.size(), hipMemcpyDeviceToHost));
     std::vector<int32_t> owner(S, -1); for (long t = 0; t < T; ++t) if (slots[t] >= 0) owner[slots[t]] = (int32_t)t;
     long bad = 0;
@@ -35,8 +35,8 @@ int main(int argc, char** argv) {
     long guard = 0; for (size_t i = S * row; i < S * row + 64; ++i) if (hkc[i] != 0xAB || hvc[i] != 0xCD) ++guard;
     std::printf("check: T=%ld Hk=%ld D=%ld S=%ld bad_bytes=%ld past_end_bad=%ld %s\n", T, Hk, D, S, bad, guard, (bad == 0 && guard == 0) ? "CACHE_OK" : "CACHE_FAIL");
     hipEvent_t a, b; CK(hipEventCreate(&a)); CK(hipEventCreate(&b));
-    for (int i = 0; i < 20; ++i) CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg));
-    CK(hipEventRecord(a)); for (int i = 0; i < iters; ++i) CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg));
+    for (int i = 0; i < 20; ++i) CK(hipModuleLaunchKernel(fn, grid, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg));
+    CK(hipEventRecord(a)); for (int i = 0; i < iters; ++i) CK(hipModuleLaunchKernel(fn, grid, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg));
     CK(hipEventRecord(b)); CK(hipEventSynchronize(b)); float ms; CK(hipEventElapsedTime(&ms, a, b)); ms /= iters;
     double bytes = 2.0 * 2.0 * (double)T * row * ((double)(T - (T + 6) / 7) / T);   // k and v read + written for the non-padding tokens
     std::printf("timing: %.4f ms/iter, %.1f GB/s (traffic %.1f MB)\n", ms, bytes / ms / 1e6, bytes / 1e6);

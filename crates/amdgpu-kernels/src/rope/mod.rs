@@ -1,5 +1,5 @@
 //! RoPE (docs/op-coverage-memtemplates.md T7): `x [T][H][D]` bf16, `positions [T]` i32, `cos_sin [P][D]` bf16 (per position: cos in the first D/2 elements, sin in the last D/2), out-of-place `out [T][H][D]`.
-//! One grid x per token; a block's 4 waves rotate `4 * 64 / L` heads at a time (L lanes per head row); all loads are issued before any compute. Positions >= P read zeros (cos = sin = 0).
+//! One grid x per token; a block of `min(4, ceil(H * L / 64))` waves rotates `waves * 64 / L` heads at a time (L lanes per head row); all loads are issued before any compute. Positions >= P read zeros (cos = sin = 0).
 //!
 //! * `rope_neox_bf16_h<H>_d<D>`: rotate half (partner of element i is i + D/2), L = D/16 lanes per row, two b128 chunks per lane.
 //! * `rope_gptj_bf16_h<H>_d<D>`: interleaved pairs (2i, 2i+1), L = D/8 lanes per row, one b128 chunk per lane.
@@ -50,9 +50,11 @@ fn pack8(b: &mut FnBuilder, r: &[ValueId; 8]) -> ValueId {
 pub fn rope_kernel(name: &str, h: i64, d: i64, style: RopeStyle) -> Function {
     let l = if style == RopeStyle::Neox { d / 16 } else { d / 8 }; // lanes per head row
     let rows_per_wave = 64 / l;
-    let heads_per_pass = 4 * rows_per_wave;
+    // waves per block: only as many as the heads need (a block of idle waves would waste occupancy), at most 4
+    let nwaves = ((h + rows_per_wave - 1) / rows_per_wave).min(4);
+    let heads_per_pass = nwaves * rows_per_wave;
     let passes = (h + heads_per_pass - 1) / heads_per_pass;
-    let mut fb = FnBuilder::new(name, 256);
+    let mut fb = FnBuilder::new(name, (64 * nwaves) as u32);
     fb.compile_profile(CompileProfile::Default);
     let b = &mut fb;
     b.arg("x", DType::Ptr, 0, 8);

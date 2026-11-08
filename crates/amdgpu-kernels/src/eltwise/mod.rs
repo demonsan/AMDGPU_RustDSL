@@ -143,7 +143,9 @@ pub fn cvt_f32_bf16(name: &str) -> Function {
     for (k, x) in [(0i32, x0), (1, x1)] {
         let w: Vec<ValueId> = (0..2u8).map(|j| {
             let a = b.frag4_lane(Opnd::Val(x), 2 * j);
+            let a = b.bitcast_f32(a);
             let c = b.frag4_lane(Opnd::Val(x), 2 * j + 1);
+            let c = b.bitcast_f32(c);
             b.cvt_pk_bf16_f32(a, c)
         }).collect();
         let f = b.frag2(w[0], w[1]);
@@ -182,10 +184,9 @@ pub fn cvt_bf16_f32(name: &str) -> Function {
         for d in 0..2u8 {
             let l = b.frag2_lane(Opnd::Val(x), d);
             let w = b.bitcast_i32(l);
-            let lo = b.bind_i32(ev(w) << 16);
-            let hi = b.bind_i32(ev(w) & (0xffff_0000u32 as i32));
-            f[2 * d as usize] = b.bitcast_f32(lo);
-            f[2 * d as usize + 1] = b.bitcast_f32(hi);
+            // the f32 bit patterns: bf16 << 16 (low half) and the high half in place
+            f[2 * d as usize] = b.bind_i32(ev(w) << 16);
+            f[2 * d as usize + 1] = b.bind_i32(ev(w) & (0xffff_0000u32 as i32));
         }
         let out = b.frag4(f[0], f[1], f[2], f[3]);
         let off = b.bind_i32((ev(v0) << 4) + 4096 * k);

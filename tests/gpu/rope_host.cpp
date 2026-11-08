@@ -28,7 +28,8 @@ int main(int argc, char** argv) {
     hipModule_t mod; hipFunction_t fn; CK(hipModuleLoad(&mod, co)); CK(hipModuleGetFunction(&fn, mod, kn));
     struct __attribute__((packed)) { void* x; void* o; void* pos; void* cs; int32_t t; int32_t p; } args{dx, dout, dpos, dcs, (int32_t)T, (int32_t)P};
     size_t sz = sizeof(args); void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
-    CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, 256, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize());
+    long Lr = neox ? D / 16 : D / 8, rpw = 64 / Lr, nw = std::min<long>(4, (H + rpw - 1) / rpw); int blockx = (int)(64 * nw);
+    CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg)); CK(hipDeviceSynchronize());
     std::vector<uint16_t> ho(hx.size() + 32); CK(hipMemcpy(ho.data(), dout, ho.size() * 2, hipMemcpyDeviceToHost));
     long bad = 0, cnt = 0;
     for (long t = 0; t < T; ++t) for (long h = 0; h < H; ++h) for (long i = 0; i < D; ++i) {
@@ -45,8 +46,8 @@ int main(int argc, char** argv) {
     long guard = 0; for (size_t i = hx.size(); i < hx.size() + 32; ++i) if (ho[i] != 0x5555) ++guard;
     std::printf("check: rope_%s T=%ld H=%ld D=%ld bad=%ld (of %ld) past_end_bad=%ld %s\n", mode.c_str(), T, H, D, bad, cnt, guard, (bad == 0 && guard == 0) ? "ROPE_OK" : "ROPE_FAIL");
     hipEvent_t a, b; CK(hipEventCreate(&a)); CK(hipEventCreate(&b));
-    for (int i = 0; i < 20; ++i) CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, 256, 1, 1, 0, nullptr, nullptr, cfg));
-    CK(hipEventRecord(a)); for (int i = 0; i < iters; ++i) CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, 256, 1, 1, 0, nullptr, nullptr, cfg));
+    for (int i = 0; i < 20; ++i) CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg));
+    CK(hipEventRecord(a)); for (int i = 0; i < iters; ++i) CK(hipModuleLaunchKernel(fn, (int)T, 1, 1, blockx, 1, 1, 0, nullptr, nullptr, cfg));
     CK(hipEventRecord(b)); CK(hipEventSynchronize(b)); float ms; CK(hipEventElapsedTime(&ms, a, b)); ms /= iters;
     double bytes = (double)T * H * D * 2 * 2 + (double)T * (4 + D * 2);
     std::printf("timing: %.4f ms/iter, %.1f GB/s (traffic %.1f MB)\n", ms, bytes / ms / 1e6, bytes / 1e6);
