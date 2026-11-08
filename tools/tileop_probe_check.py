@@ -1061,6 +1061,13 @@ def check_fp6(planes, out):
                 bad += 1
                 if bad == 1:
                     print(f"  {name} lane {l}: got {got:048x}\n  {' ' * len(name)}       want {want:048x}")
+        if bad:
+            # which input element lands in each 6-bit slot (consistent over all lanes)
+            perm = []
+            for j in range(32):
+                cands = [i for i in range(32) if all(((sum(O(base + k, l) << (32 * k) for k in range(6)) >> (6 * j)) & 63) == enc6(fmt, f32(planes[i][l]) / 2) for l in range(LANES))]
+                perm.append(cands)
+            print(f"  {name}: slot -> input element candidates: {perm}")
         print(("ok   " if bad == 0 else "FAIL ") + f"{name}: {64 - bad}/64 lanes")
         ok_all &= bad == 0
     for name, base, half in [("pk32 f16 <- fp6", 36, "f16"), ("pk32 bf16 <- fp6", 52, "bf16"), ("pk32 f16 <- bf6", 68, "f16"), ("pk32 bf16 <- bf6", 84, "bf16")]:
