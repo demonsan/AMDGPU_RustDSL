@@ -50,6 +50,48 @@ pub struct GemmConfig {
     pub split_k: bool,
     /// fused-MoE grouped GEMM over aiter-style sorted routes (`MoeStage`)
     pub moe: Option<MoeStage>,
+    /// implicit-GEMM convolution (`ConvCfg`)
+    pub conv: Option<ConvCfg>,
+}
+
+/// Implicit-GEMM convolution, NDHWC input [NB, DI, H, W, C] bf16 (2d: DI = 1, kernel depth 1), weights [K][C / 64][T][R][S][64] (the 128-byte
+/// K tiles = 64 channels of one tap; then aiter shuffle_weight(16, 16)), output [NB, OD, OH, OW, K] bf16 = C [M, K] with M = NB OD OH OW.
+/// GEMM M row m -> (nb, od, oh, ow); K tile t -> (channel block t / TRS, tap t % TRS -> (dz, r, s)); the A row of (m, t) is the input pixel
+/// (od st - pad + dz dil, oh st - pad + r dil, ow st - pad + s dil) of batch nb, zero when outside (an out-of-range voffset). ABI: the 96-byte
+/// GEMM ABI (A = input, B = weights, C = output, m = M, n = K, k = C T R S) + 96 NB, 100 DI, 104 H, 108 W, 112 C, 116 OD, 120 OH, 124 OW.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvCfg {
+    pub t: i32,
+    pub r: i32,
+    pub s: i32,
+    pub stride: i32,
+    pub pad: i32,
+    pub dil: i32,
+}
+
+/// Per-CTA conv values: per A issue the row's base offset and its first input coordinates; the input sizes.
+#[derive(Clone)]
+struct ConvRt {
+    cfg: ConvCfg,
+    rows: Vec<(ValueId, ValueId, ValueId, ValueId)>,
+    di: ValueId,
+    h: ValueId,
+    w: ValueId,
+    c: ValueId,
+    zero: ValueId,
+}
+
+/// q = n / d (both >= 0, n < 2^22) by a float reciprocal and one integer correction step.
+fn div_rt(b: &mut FnBuilder, n: ValueId, d: ValueId) -> ValueId {
+    let nf = b.un(amdgpu_dsl::UnOp::CvtI32F32, n);
+    let df = b.un(amdgpu_dsl::UnOp::CvtI32F32, d);
+    let r = b.rcp_f32(df);
+    let qf = b.mul_f32(nf, r);
+    let qf = b.un(amdgpu_dsl::UnOp::FloorF32, qf);
+    let q = b.un(amdgpu_dsl::UnOp::CvtF32I32, qf);
+    let q = b.bitcast_i32(q);
+    let rem = b.bind_i32(ev(n) - ev(q) * ev(d));
+    b.bind_i32(ev(q) + ev(rem).ge(ev(d)).select_i32(1, 0) - ev(rem).lt(0).select_i32(1, 0))
 }
 
 /// The two grouped GEMMs of a fused MoE over the moe_sorting outputs (sorted_token_ids `(slot << 24) | token`, padding `(topk << 24) | M`;
@@ -114,7 +156,7 @@ pub enum Scales {
 impl GemmConfig {
     /// The shipped configuration.
     pub fn v4() -> GemmConfig {
-        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None }
+        GemmConfig { cta_m: 256, cta_n: 256, acc_agpr: 24, pre_sync_mmas: 5, mid_sync_mmas: 3, epi_phases: 8, sched: "rewait,slotfill", lds_epilogue: true, scales: Scales::Mx128, elem: Elem::Fp8, split_k: false, moe: None, conv: None }
     }
     /// fp8 A8W8 with per-token x per-channel fp32 scales (`gemm_a8w8_rowcol_fp8`): the v4 structure, unit MFMA scales, scaled epilogue.
     pub fn a8w8_rowcol() -> GemmConfig {
@@ -136,6 +178,10 @@ impl GemmConfig {
     pub fn moe(elem: Elem, scales: Scales, st: MoeStage) -> GemmConfig {
         let cta_n = if matches!(st, MoeStage::Up { .. }) { 256 } else { 128 };
         GemmConfig { cta_m: 128, cta_n, lds_epilogue: false, scales, elem, moe: Some(st), ..GemmConfig::v4() }
+    }
+    /// Implicit-GEMM bf16 convolution (`ConvCfg`) on the bf16 GEMM configuration.
+    pub fn conv(cc: ConvCfg, cta: i64) -> GemmConfig {
+        GemmConfig { cta_m: cta, cta_n: cta, conv: Some(cc), ..GemmConfig::a16w16() }
     }
     /// Split-K form of a 128 x 128 configuration (fp32 partials + `reduce::gemm_splitk_reduce`).
     pub fn splitk(self) -> GemmConfig {
@@ -277,7 +323,10 @@ fn declare_abi(b: &mut FnBuilder) {
 /// The host contract of the ABI for a `cta_m x cta_n` CTA (what `gpu-verify` proves the accesses against): M = MT cta_m, N = NT cta_n, K = KT 128
 /// (the kernel has no partial tiles), the grid (NT, MT), dense strides (stride_a = stride_b = K, stride_c = N, stride_sfa = M, stride_sfb = K / 128),
 /// batch 1, and the tensor extents A M K, B N K (preshuffled, same size), C 2 M N, sa (K / 128) M, sb (N / 128) (K / 128) bytes.
-fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool, moe: Option<MoeStage>) {
+fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, per_tile: i64, split: bool, moe: Option<MoeStage>, conv: Option<ConvCfg>) {
+    if let Some(cc) = conv {
+        return declare_contract_conv(b, cta_m, cta_n, cc);
+    }
     if let Some(st) = moe {
         return declare_contract_moe(b, cta_m, cta_n, scales, per_tile, st);
     }
@@ -341,6 +390,40 @@ fn declare_contract(b: &mut FnBuilder, cta_m: i64, cta_n: i64, scales: Scales, p
             b.arg_tensor("ptr_sfb", nt * Ext::c(cta_n / 128) * kt * Ext::c(4));
         }
     }
+}
+
+/// The implicit-GEMM conv contract (bf16): M = NB OD OH OW rows (the last M tile partial), N = NT cta_n output channels, C = 64 CB input
+/// channels, K = C T R S; tensors: input NB DI H W C, weights N K, output M N (bf16).
+fn declare_contract_conv(b: &mut FnBuilder, cta_m: i64, cta_n: i64, cc: ConvCfg) {
+    for (n, o) in [("NB", 96u32), ("DI", 100), ("H", 104), ("W", 108), ("C", 112), ("OD", 116), ("OH", 120), ("OW", 124)] {
+        b.arg(n, DType::I32, o, 4);
+    }
+    for o in [96u32, 100, 104, 108, 116, 120, 124] {
+        b.ka_range(o, 1, 4096);
+    }
+    b.sym_range("CB", 1, 64);
+    b.sym_range("NT", 1, (1 << 14) / cta_n);
+    let cb = Ext::sym("CB");
+    b.ka_is(112, cb.clone() * Ext::c(64));
+    let trs = (cc.t * cc.r * cc.s) as i64;
+    let m = Ext::ka(96) * Ext::ka(116) * Ext::ka(120) * Ext::ka(124);
+    let n = Ext::sym("NT") * Ext::c(cta_n);
+    let kt = cb.clone() * Ext::c(trs);
+    let k_el = kt.clone() * Ext::c(64);
+    b.ka_is(24, m.clone());
+    b.ka_is(28, n.clone());
+    b.ka_is(32, k_el.clone());
+    b.ka_is(36, Ext::c(1));
+    b.ka_is(40, k_el.clone());
+    b.ka_is(44, k_el);
+    b.ka_is(48, n.clone());
+    b.ka_is(80, m.clone());
+    b.ka_is(84, kt.clone());
+    b.grid_is(0, Ext::sym("NT"));
+    b.grid_is(1, m.clone().ceil_div(cta_m));
+    b.arg_tensor("ptr_a", Ext::ka(96) * Ext::ka(100) * Ext::ka(104) * Ext::ka(108) * cb * Ext::c(128));
+    b.arg_tensor("ptr_b", n.clone() * kt * Ext::c(128));
+    b.arg_tensor("ptr_c", m * n * Ext::c(2));
 }
 
 /// The MoE contract: MT = max M tiles (grid y), NT = output N tiles (grid x), A rows m (tokens or tokens x topk), B rows per expert n, E
@@ -603,6 +686,8 @@ struct Body {
     mx32: Option<Mx32>,
     /// `Scales::Block128`: the per-tile fp32 scale loads (voffsets; `shift` unused)
     bs128: Option<Mx32>,
+    /// implicit-GEMM convolution: the per-tile A addressing
+    conv: Option<ConvRt>,
     /// split-K: this split's first K tile
     zb: Option<ValueId>,
     /// `Elem::Fp8Bs`: the block products of the tile waiting for their scaled accumulation (`bs_fma`)
@@ -858,6 +943,45 @@ impl Body {
             let kb = { let v = b.bind_i32((key0.clone() << 4) + ev(self.b_org)); b.read_first_lane(v) };
             [ka, kb]
         });
+        // implicit-GEMM conv: this tile's channel block and tap (wave uniform), then per A issue the input pixel's voffset (or out of range)
+        let conv_vo: Option<Vec<ValueId>> = self.conv.as_ref().map(|cv| {
+            let (_, vo) = u.capture(b, "ab.conv", |b| {
+                let cc = cv.cfg;
+                let trs = cc.t * cc.r * cc.s;
+                let rs = cc.r * cc.s;
+                // t / trs, rs / s by multiply-shift (exact for t < 2^16, checked)
+                let magic = |d: i32| -> i64 { ((1i64 << 20) + d as i64 - 1) / d as i64 };
+                for d in [trs, rs, cc.s] {
+                    let m = magic(d);
+                    for x in 0..(1i64 << 16) {
+                        assert_eq!((x * m) >> 20, x / d as i64, "conv: multiply-shift by {d}");
+                    }
+                }
+                let t = b.bind_i32(key0.clone().lshr(7));
+                let cb = b.bind_i32((ev(t) * magic(trs) as i32).lshr(20));
+                let tap = b.bind_i32(ev(t) - ev(cb) * trs);
+                let dz = b.bind_i32((ev(tap) * magic(rs) as i32).lshr(20));
+                let tr = b.bind_i32(ev(tap) - ev(dz) * rs);
+                let rr = b.bind_i32((ev(tr) * magic(cc.s) as i32).lshr(20));
+                let ss = b.bind_i32(ev(tr) - ev(rr) * cc.s);
+                let toff = b.bind_i32((((ev(dz) * cc.dil) * ev(cv.h) + ev(rr) * cc.dil) * ev(cv.w) + ev(ss) * cc.dil) * ev(cv.c) * 2 + (ev(cb) << 7));
+                let big = b.c_i32(0x7fff_fff0);
+                cv.rows
+                    .iter()
+                    .map(|&(base, id0, ih0, iw0)| {
+                        let (zi, yi, xi) = (b.bind_i32(ev(id0) + ev(dz) * cc.dil), b.bind_i32(ev(ih0) + ev(rr) * cc.dil), b.bind_i32(ev(iw0) + ev(ss) * cc.dil));
+                        let ok = b.bind_i32(
+                            ev(zi).ge(0).select_i32(1, 0) & ev(zi).lt(ev(cv.di)).select_i32(1, 0) & ev(yi).ge(0).select_i32(1, 0) & ev(yi).lt(ev(cv.h)).select_i32(1, 0)
+                                & ev(xi).ge(0).select_i32(1, 0) & ev(xi).lt(ev(cv.w)).select_i32(1, 0),
+                        );
+                        let ok = b.bind_cond(ev(ok).eq(1));
+                        let v = b.bind_i32(ev(base) + ev(toff));
+                        b.let_(Op::Select { ty: DType::I32, cond: Opnd::Val(ok), a: Opnd::Val(v), b: Opnd::Val(big) })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            vo
+        });
         for (bi, (sh, dma, rsrc, wave)) in [(&self.a_s, &self.a_dma, self.rsrc_a, self.a_wave), (&self.b_s, &self.b_dma, self.rsrc_b, self.b_wave)].into_iter().enumerate() {
             let (_, mine) = u.capture(b, format!("ab.{}.setup", sh.name), |b| {
                 let o = sh.at(slot).off_v(b);
@@ -878,7 +1002,11 @@ impl Body {
             for (q, &(g, lds, m0)) in mine.iter().enumerate() {
                 // buffer_load_dwordx4 ... lds: voffset = the lane's loop-invariant offset, soffset = the tile origin (wave uniform), M0 = the first 1 KB
                 // block of each group of 4 issues, instruction offset 1024 (q % 4) moves both the LDS and the global address
-                u.capture(b, format!("ab.{}.{q}", sh.name), |b| sh.at(slot).write(b, |b| b.load_buffer_lds(rsrc, g, orgs[bi], m0, dma.act(lds).1, 4)));
+                let (g, so) = match (&conv_vo, bi) {
+                    (Some(vo), 0) => (vo[q], self.conv.as_ref().map(|c| c.zero).unwrap()),
+                    _ => (g, orgs[bi]),
+                };
+                u.capture(b, format!("ab.{}.{q}", sh.name), |b| sh.at(slot).write(b, |b| b.load_buffer_lds(rsrc, g, so, m0, dma.act(lds).1, 4)));
             }
         }
         let contract = amdgpu_dsl::StageContract { barrier_phase: phase, roles: vec!["all".to_string()], ..Default::default() };
@@ -989,6 +1117,21 @@ pub fn by_name(name: &str) -> Option<Function> {
         "gemm_a8w8_rowcol_fp8_128_splitk" => Some(gemm_mxfp8_bs("gemm_a8w8_rowcol_fp8_128_splitk", GemmConfig::a8w8_rowcol_128().splitk())),
         "gemm_a16w16_bf16_128_splitk" => Some(gemm_mxfp8_bs("gemm_a16w16_bf16_128_splitk", GemmConfig::a16w16_128().splitk())),
         n if n.starts_with("moe_sum_bf16_k") => n["moe_sum_bf16_k".len()..].parse::<i64>().ok().filter(|k| (1..=16).contains(k)).map(|k| reduce::moe_sum_bf16(n, k)),
+        n if n.starts_with("conv2d_bf16_") || n.starts_with("conv3d_bf16_") => {
+            // conv{2,3}d_bf16_[t<T>]r<R>s<S>_st<st>_p<pad>_d<dil>[_c128]
+            let num = |key: &str, dflt: i32| -> Option<i32> {
+                match n.find(key) {
+                    None => Some(dflt),
+                    Some(i) => n[i + key.len()..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok(),
+                }
+            };
+            let body = &n[11..];
+            let t = if n.starts_with("conv3d") { num("_t", 1).or_else(|| body.strip_prefix('t').and_then(|x| x.split('r').next()?.parse().ok()))? } else { 1 };
+            let r = body.split('r').nth(1)?.split('s').next()?.parse().ok()?;
+            let s = body.split('s').nth(1)?.split('_').next()?.parse().ok()?;
+            let cc = ConvCfg { t, r, s, stride: num("_st", 1)?, pad: num("_p", 0)?, dil: num("_d", 1)? };
+            Some(gemm_mxfp8_bs(n, GemmConfig::conv(cc, if n.ends_with("_c128") { 128 } else { 256 })))
+        }
         n if n.starts_with("gemm_moe") => {
             // gemm_moe<1|2>_<bf16|fp8>[_silu|_gelu][_dw]
             let (elem, scales) = if n.contains("_fp8bs") { (Elem::Fp8Bs, Scales::Block128) } else if n.contains("_fp8") { (Elem::Fp8, Scales::RowCol) } else { (Elem::Bf16, Scales::None) };
@@ -1075,7 +1218,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
         b.sched_opts(cfg.sched);
     }
     declare_abi(b);
-    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k, cfg.moe);
+    declare_contract(b, cta_m, cta_n, cfg.scales, cfg.elem.per_tile(), cfg.split_k, cfg.moe, cfg.conv);
     // timing stamps (opt-in debug build, GEMM_STAMP=ends|tiles): one extra pointer argument after the ABI (offset 96); see docs/stamps.md
     let stamp_mode = std::env::var("GEMM_STAMP").ok().filter(|v| v == "ends" || v == "tiles");
     if stamp_mode.is_some() {
@@ -1113,7 +1256,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     });
     // XCD-aware raster: workgroups are dispatched round robin over the 8 XCDs (linear id % 8), each with its own L2;
     // give every XCD whole 4 x 4 blocks of tiles (4 A + 4 B panels instead of all A panels). Only for a 16 x 16 tile grid here; identity otherwise.
-    let (bx, by) = if cfg.moe.is_some() { (bx0, by0) } else {
+    let (bx, by) = if cfg.moe.is_some() || cfg.conv.is_some() { (bx0, by0) } else {
         let okv = b.bind_i32((ev(n_v) ^ (16 * cfg.cta_n) as i32) | (ev(m_v) ^ (16 * cfg.cta_m) as i32));
         let id = b.bind_i32(ev(bx0) + (ev(by0) << 4));
         let loc = b.bind_i32(ev(id).lshr(3));
@@ -1197,7 +1340,38 @@ impl skeleton_v4::V4Slots for GemmSlots {
         let live = b.bind_cond(ev(row0).lt(ev(nv)));
         MoeCx { st, rsrc_sid, rsrc_sw, topk, mtok, nout, e, live, row0 }
     });
+    let mut conv_rt: Option<ConvRt> = None;
     let a_dma = match &moe_cx {
+        None if cfg.conv.is_some() => {
+            // implicit-GEMM conv: per issue row m = by cta_m + r -> (nb, od, oh, ow), the first input coordinates and the row's base offset
+            let cc = cfg.conv.unwrap();
+            let ki = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargI32 { offset: o });
+            let (di, h, w, c, od, oh, ow) = (ki(b, 100), ki(b, 104), ki(b, 108), ki(b, 112), ki(b, 116), ki(b, 120), ki(b, 124));
+            let p2 = b.bind_i32(ev(oh) * ev(ow));
+            let p1 = b.bind_i32(ev(od) * ev(p2));
+            let issues = cta_m * 128 / 1024 / 4;
+            let mut rows = Vec::new();
+            let mut out = Vec::new();
+            for q in 0..issues {
+                let r = (lane.wave() * issues as i32 + q as i32) * 8 + lane.lane().lshr(3);
+                let m = b.bind_i32(((ev(by) << lg_m) + r).min(ev(m_v) - 1));
+                let nb = div_rt(b, m, p1);
+                let r1 = b.bind_i32(ev(m) - ev(nb) * ev(p1));
+                let odv = div_rt(b, r1, p2);
+                let r2 = b.bind_i32(ev(r1) - ev(odv) * ev(p2));
+                let ohv = div_rt(b, r2, ow);
+                let owv = b.bind_i32(ev(r2) - ev(ohv) * ev(ow));
+                let id0 = b.bind_i32(ev(odv) * cc.stride - cc.pad);
+                let ih0 = b.bind_i32(ev(ohv) * cc.stride - cc.pad);
+                let iw0 = b.bind_i32(ev(owv) * cc.stride - cc.pad);
+                let base = b.bind_i32((((ev(nb) * ev(di) + ev(id0)) * ev(h) + ev(ih0)) * ev(w) + ev(iw0)) * ev(c) * 2 + ((lane.lane() & 7) << 4));
+                rows.push((base, id0, ih0, iw0));
+                out.push((base, 1024 * q as i32));
+            }
+            let zero = { let z = b.c_i32(0); b.read_first_lane(z) };
+            conv_rt = Some(ConvRt { cfg: cc, rows, di, h, w, c, zero });
+            Dma { issues: out, pitch: 1056, gather: true }
+        }
         None => dma_plan_rows_pad(b, &ctx, &s_tid, cta_m, &a_glob, 8192, 4),
         Some(mc) => {
             let mc = mc.clone();
@@ -1219,7 +1393,17 @@ impl skeleton_v4::V4Slots for GemmSlots {
     let a_wave = b.bind_i32(lane.wave() * (a_bytes / 4) as i32);
     let b_wave = b.bind_i32(lane.wave() * (cta_n * 128 / 4) as i32);
     // buffer descriptors over A (M K bytes) and the preshuffled B (N K bytes)
-    let rsrc_a = { let n = b.bind_i32(ev(m_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_a, n) };
+    let rsrc_a = match cfg.conv {
+        // conv: the input tensor NB DI H W C bf16
+        Some(_) => {
+            let ki = |b: &mut FnBuilder, o: u32| b.let_(Op::KernargI32 { offset: o });
+            let (nb, di, h, w, c) = (ki(b, 96), ki(b, 100), ki(b, 104), ki(b, 108), ki(b, 112));
+            let n = b.bind_i32(ev(nb) * ev(di) * ev(h) * ev(w) * ev(c) * 2);
+            let n = b.read_first_lane(n);
+            b.buffer_desc_dyn(ptr_a, n)
+        }
+        None => { let n = b.bind_i32(ev(m_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_a, n) }
+    };
     let rsrc_b = match &moe_cx {
         None => { let n = b.bind_i32(ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) }
         Some(_) => { let ne = b.let_(Op::KernargI32 { offset: 132 }); let n = b.bind_i32(ev(ne) * ev(n_v) * ev(k_v)); let n = b.read_first_lane(n); b.buffer_desc_dyn(ptr_b, n) }
@@ -1272,6 +1456,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
             let mc = moe_cx.as_ref().unwrap();
             (b.c_i32(0), b.bind_i32((ev(mc.e) * ev(n_v) + (ev(bx) << lg_n)) * ev(k_v)))
         }
+        None if cfg.conv.is_some() => (b.c_i32(0), b.bind_i32((ev(bx) << lg_n) * ev(k_v))),
         None => (b.bind_i32((ev(by) << lg_m) * ev(k_v)), b.bind_i32((ev(bx) << lg_n) * ev(k_v))),
         Some(zb) => (b.bind_i32((ev(by) << lg_m) * ev(k_v) + (ev(zb) << 7)), b.bind_i32((ev(bx) << lg_n) * ev(k_v) + (ev(zb) << 11))),
     };
@@ -1373,7 +1558,7 @@ impl skeleton_v4::V4Slots for GemmSlots {
     });
     let body = Body {
         cfg, kb_v: ks_v, panel, mma: mma.clone(), a_s, b_s, a_dma, b_dma, a_org, b_org, a_wave, b_wave, rsrc_a, rsrc_b, rsrc_sfa, rsrc_sfb,
-        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, pending: Default::default(), zb,
+        a_rd, b_rd, zero4, acc: Vec::new(), staged: None, rv: None, npre_done: 0, stamp: stamp_ctx, unit, mx32, bs128, conv: conv_rt, pending: Default::default(), zb,
     };
         // MoE: everything after this runs only for tiles below num_valid_ids[0] (closed at the end of the epilogue)
     if let Some(mc) = &moe_cx {
