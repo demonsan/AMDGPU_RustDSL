@@ -533,7 +533,6 @@ pub fn mla_decode_bf16_w8(name: &str, page: i32) -> Function {
     let done = b.bind_cond(ev(it1).ge(ev(nloop)));
     b.break_if(done);
     b.end_loop();
-    let zf = b.c_f32(0.0);
     // ---- the part's partial: O / l (fp32, 4 consecutive d per lane and block) and LSE ----
     let lv = { let z0 = b.c_f32(0.0); b.add_f32(Opnd::Var(l_v), z0) };
     let l_tot = group4(&mut b, lv, false);
