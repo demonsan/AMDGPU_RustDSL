@@ -86,6 +86,12 @@ pub fn group_lanes(n: i64) -> i64 {
     }
 }
 
+/// a Frag2 of two f32 values (the constructor takes the raw 32-bit patterns)
+fn pf2(b: &mut FnBuilder, x: ValueId, y: ValueId) -> ValueId {
+    let (xi, yi) = (b.bitcast_i32(x), b.bitcast_i32(y));
+    b.frag2(xi, yi)
+}
+
 pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
     let g = group_lanes(n);
     let par = 64 / g;                                   // rows side by side in a wave
@@ -296,16 +302,16 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                 for i in 0..nld {
                     let xi = bf16x8_to_f32(b, packed[i]);
                     // packed math: two elements per v_pk_add_f32 / v_pk_mul_f32 (deviation, square), pair sums with v_pk_add_f32
-                    let nm2 = b.frag2(neg_mean, neg_mean);
+                    let nm2 = pf2(b, neg_mean, neg_mean);
                     let mut sqp: Vec<ValueId> = Vec::new();
                     for q in 0..4usize {
-                        let x2 = b.frag2(xi[2 * q], xi[2 * q + 1]);
+                        let x2 = pf2(b, xi[2 * q], xi[2 * q + 1]);
                         let d2 = b.pk_add_f32(x2, nm2);
                         // masked lanes: the deviation of a masked-out chunk must not count
                         let d0 = b.frag2_lane(d2, 0);
                         let d1 = b.frag2_lane(d2, 1);
                         let dm = masked(b, &[d0, d1, zero, zero, zero, zero, zero, zero], i, zero);
-                        let dm2 = b.frag2(dm[0], dm[1]);
+                        let dm2 = pf2(b, dm[0], dm[1]);
                         sqp.push(b.pk_mul_f32(dm2, dm2));
                     }
                     let a01 = b.pk_add_f32(sqp[0], sqp[1]);
@@ -326,13 +332,13 @@ pub fn row_kernel(name: &str, n: i64, op: RowOp) -> Function {
                     let g = bf16x8_to_f32(b, gs.as_ref().unwrap()[i]);
                     let be = bf16x8_to_f32(b, bs.as_ref().unwrap()[i]);
                     let mut y = [0; 8];
-                    let nm2 = b.frag2(neg_mean, neg_mean);
-                    let inv2 = b.frag2(inv, inv);
+                    let nm2 = pf2(b, neg_mean, neg_mean);
+                    let inv2 = pf2(b, inv, inv);
                     for q in 0..4usize {
                         // packed: (x - mean) * inv * gamma + beta, two elements per instruction ((x - mean) is recomputed: the deviations are not kept across the second reduction)
-                        let x2 = b.frag2(xi[2 * q], xi[2 * q + 1]);
-                        let g2 = b.frag2(g[2 * q], g[2 * q + 1]);
-                        let b2 = b.frag2(be[2 * q], be[2 * q + 1]);
+                        let x2 = pf2(b, xi[2 * q], xi[2 * q + 1]);
+                        let g2 = pf2(b, g[2 * q], g[2 * q + 1]);
+                        let b2 = pf2(b, be[2 * q], be[2 * q + 1]);
                         let d2 = b.pk_add_f32(x2, nm2);
                         let t2 = b.pk_mul_f32(d2, inv2);
                         let u2 = b.pk_mul_f32(t2, g2);
