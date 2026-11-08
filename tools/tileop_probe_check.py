@@ -920,6 +920,16 @@ def check_anylane(planes, out):
         print(("ok   " if good else "FAIL ") + names[k] + ("" if good else f": got {got[0]}"))
     return ok
 
+# ---------------------------------------------------------------- probe_reload_p1
+def gen_reload_p1():
+    rnd = random.Random(81)
+    return [[rnd.getrandbits(32) for _ in range(5 * 256)]]
+
+def check_reload_p1(planes, out):
+    ok = list(out[:4 * 256]) == planes[0][:4 * 256]
+    print(("ok   " if ok else "FAIL ") + "in-place global reload of a loop variable: rows 0..3")
+    return ok
+
 PROBES = {
     "probe_valu_p1": (gen_valu_p1, check_valu_p1, (len(UN) + len(BIN) + len(TRI) + len(CMPS)) * LANES * 4),
     "probe_mem_p1": (gen_mem_p1, check_mem_p1, MEM_PLANES * LANES * 4 + 2 * LANES * 32),
@@ -936,6 +946,7 @@ PROBES = {
     "probe_tr_b16_mfma2": (gen_tr_b16_mfma, check_tr_b16_mfma, 1024),
     "probe_ptr64_p1": (gen_ptr64_p1, check_ptr64_p1, 9 * LANES * 4),
     "probe_anylane": (lambda: [[0] * LANES], check_anylane, 9 * LANES * 4),
+    "probe_reload_p1": (gen_reload_p1, check_reload_p1, 4 * 1024),
     "probe_cpol_p1": (gen_cpol_p1, check_cpol_p1, 4096),
     "probe_mfma_p1": (gen_mfma_p1, check_mfma_p1, sum(3 * LANES * 4 * k[4] for k in MFMA_KINDS) + LANES * 16),
 }
