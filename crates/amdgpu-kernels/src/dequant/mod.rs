@@ -25,18 +25,22 @@ pub fn by_name(name: &str) -> Option<Function> {
     (n % 8 == 0 && (8..=65536).contains(&n) && (!group || n % 128 == 0)).then(|| dequant_rows(name, n, group))
 }
 
-/// 8 fp8 bytes (a Frag2 of two dwords) -> 4 dwords of bf16 pairs as one Frag4, times `scale`.
+/// 8 fp8 bytes (a Frag2 of two dwords) -> 4 dwords of bf16 pairs as one Frag4, times the f32 `scale`.
+/// (`v_cvt_scalef32_pk_bf16_fp8` is NOT used: its scale operand is an E8M0-style power of two -- measured: a scale of 1.63 acts as 1.0 -- so a general f32 scale is a multiply after the plain fp8 -> f32 conversion.)
 fn dequant8(b: &mut FnBuilder, q: ValueId, scale: ValueId) -> ValueId {
     let mut w = Vec::new();
     for d in 0..2u8 {
         let dw = b.frag2_lane(Opnd::Val(q), d);
         for sel in 0..2u8 {
-            w.push(b.cvt(CvtOp::ScalePkBf16Fp8, &[Opnd::Val(dw), Opnd::Val(scale)], sel));
+            let f2 = b.cvt(CvtOp::PkF32Fp8, &[Opnd::Val(dw)], sel);
+            let (a, c) = (b.frag2_lane(Opnd::Val(f2), 0), b.frag2_lane(Opnd::Val(f2), 1));
+            let (a, c) = (b.bitcast_f32(a), b.bitcast_f32(c));
+            let (a, c) = (b.mul_f32(a, scale), b.mul_f32(c, scale));
+            w.push(b.cvt_pk_bf16_f32(a, c));
         }
     }
     b.frag4(w[0], w[1], w[2], w[3])
 }
-
 pub fn dequant_static(name: &str) -> Function {
     let mut fb = FnBuilder::new(name, 256);
     fb.compile_profile(CompileProfile::Default);
