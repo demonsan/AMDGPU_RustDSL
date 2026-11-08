@@ -231,3 +231,18 @@ aiter 的 kernel 在每次访存上带 `AUX` / `GROUP_NT` 缓存策略，而我�
 在 `sample_bf16_v<V>` 的基础上加 top-k 与 top-p（nucleus）：ABI 在 inv_temperature @24 之后多 `top_p`（f32 @28，1.0 = 关）和 `top_k`（i32 @32，0 = 关），B 移到 @36。语义：先取 top-k（并列在第 k 大值上的都保留），再在保留集合上按 top-p 取最小的前缀（累计概率 ≥ p，并列同样保留），然后在保留集合内重新归一化做逆 CDF 采样（下标升序）。**不排序**：在 logit 空间（缩放后的 `x`）对阈值做二分，每次探测是对整行的一遍（保留元素的个数和 `exp(x − m)` 之和，两次 block 归约）；top-k 找"保留个数 ≥ k 的最大阈值"，top-p 找"保留质量 ≥ p · S_k 的最大阈值"（S_k 是 top-k 之后的质量），各 26 次迭代（范围 [m − 80, m + 1]，分辨率约 1.6e-6，远小于缩放后 bf16 logit 的最小间隔，所以集合与精确集合一致）；用 kernarg 控制迭代数，关掉的那一项不做任何探测。最终阈值 = max(thr_k, thr_p)，第 2、3 遍把不满足 `x ≥ thr` 的元素的分子置 0。
 
 主机测试（`sampling_host` 的 top_k / top_p 参数；CPU 参考按上面的集合语义用排序实现）：V = 32000：关闭过滤（20.4 µs / 行）、k = 50、p = 0.9、k = 40 且 p = 0.8、k = 1，V = 1000（k = 20, p = 0.95）和 V = 128256（k = 100, p = 0.9），全部 `bad = 0`；`gpu_verify --strict` 0 错误，72 VGPR。耗时（每行一个 block，单行延迟）：V = 32000：仅 k 或仅 p 132 µs，k 与 p 同时 243 µs；V = 128256 两者同时 819 µs；B = 4096 行、V = 32000、k = 50 且 p = 0.9：4.33 ms 总计。这是"覆盖"版本，不是性能版本：延迟被 26 + 26 遍整行扫描主导（每遍 2 次 block 归约 + barrier）。待做：用阈值的直方图（一遍分 256 个桶）把迭代数降到 3–4 遍，或把每行拆给多个 block。
+
+## 行内族：短行的 wave 内分组布局（N < 512）
+
+此前每行占一个 wave 的 64 个 lane，N = 200 只有 25 个 chunk，大半 lane 空闲（rmsnorm N = 200：3.4–3.7 TB/s）。现在 N < 512 的行用 `g` 个 lane（`g` = 不小于 chunk 数的最小 2 的幂，至少 4），一个 wave 并排放 `64 / g` 行，每行的规约在 `g` 个 lane 的组内用 DPP 全规约（`tileop::group_allreduce`：quad_perm、`row_half_mirror` / `row_ror`、`permlane16_swap`），不再经过 LDS；每个 wave 总共处理 `max(8, 64 / g)` 行（先发出全部加载再计算）。N ≥ 512 的布局不变（`g = 64`）。主机测试 `rows_host`（行数 M 较大时 `rows_per_wave` 要与 kernel 一致）：N ∈ {8, 24, 64, 128, 200, 256, 400, 504} 的 rmsnorm、N ∈ {24, 200} 的 layernorm / softmax / add_rmsnorm，`bad = 0`（含奇数的 M = 53）。带宽（M = 10⁶ 行；GB/s）：
+
+| kernel | 之前 | 现在 |
+|---|--:|--:|
+| rmsnorm N = 200 | 3412–3769 | **5284** |
+| rmsnorm N = 64 / 128 / 256 | — | 6284 / 6441 / 6289 |
+| rmsnorm N = 400 / 504（g = 64，只是行数更多） | — | 5455 / 5488 |
+| add_rmsnorm N = 200 | — | 5628 |
+| softmax N = 200 | — | 4326 |
+| layernorm N = 200 | — | 3854 |
+
+softmax 与 layernorm 的短行仍然只有 rmsnorm 的 60–80 %（两遍规约 + 更多 VALU，加载的字节更少）；N = 400 – 511 的行仍是一个 wave 的 64 lane 里用 50 个，下一步是为它们加一个"两行占三个 wave"的布局或把 chunk 数不是 2 的幂的行放进 `g = 64` 组里并排两行。
