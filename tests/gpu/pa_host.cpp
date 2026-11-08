@@ -123,6 +123,18 @@ int main(int argc, char** argv) {
         if (sinks) { void* ds = dev(sink); memcpy(&ca[80], &ds, 8); }
         memcpy(&ca[0], &dout, 8); memcpy(&ca[16], &dpo, 8); memcpy(&ca[32], &dpl, 8); memcpy(&ca[48], &H, 4); memcpy(&ca[64], &NS, 4);
         gx = HK; gy = B; gz = S; blk = 256;
+    } else if (fp8mode == 2) {
+        // vendor pertokenFp8 (pa_bf16_pertokenFp8_*, P = 16): K [blk][hk][d / 16][16][16] and V [blk][hk][d][16] fp8 = the blocked layout
+        // built above; KQ / VQ f32 [HK][NB 16] per-token scales (kernarg names O Q K V BT CL KQ VQ sclg mblk batch Qs Bs KVs mtp GQA [QTP])
+        void *dk = dev(kq), *dv = dev(vq), *dks = dev(kss), *dvs = dev(vss);
+        a.assign(envi("VARGS", 256), 0);
+        auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
+        auto U = [&](int i, int v) { memcpy(&a[16 * i], &v, 4); };
+        P_(0, dout); P_(1, dq); P_(2, dk); P_(3, dv); P_(4, dbt); P_(5, dcl); P_(6, dks); P_(7, dvs);
+        float sl = std::log2(std::exp(1.0f)) * scale;
+        memcpy(&a[128], &sl, 4);
+        U(9, maxp); U(10, HK); U(11, H * D * 2); U(12, HK * 16 * D); U(13, 16 * D); U(14, envi("VMTP", 0)); U(15, H / HK);
+        gx = HK; gy = B; gz = 1; blk = 256;
     } else {
         // vendor layouts (x = 8 bf16 per 16 bytes): K [blk][hk][d / 8][16][8], V [blk][hk][16 / 8][d][8]
         std::vector<uint16_t> kv2(kc.size()), vv2(vc.size());
