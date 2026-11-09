@@ -65,7 +65,7 @@ fn args(b: &mut FnBuilder) -> Args {
 /// Dot[b, h, q] = sum_d dO[b, q, h, d] O[b, q, h, d]. Grid (ceil(SQ / 256), H, B), one row per thread.
 pub fn fmha_bwd_dot(name: &str) -> Function {
     let mut b = FnBuilder::new(name, 256);
-    b.compile_profile(if std::env::var("TEMP_BWD_POL").map_or(false, |v| v.starts_with("vs")) { CompileProfile::Vs128 } else { CompileProfile::Gemm });
+    b.compile_profile(CompileProfile::Gemm);
     abi(&mut b);
     b.grid_is(0, Ext::ka(160).ceil_div(256));
     b.grid_is(1, Ext::ka(192));
@@ -109,7 +109,7 @@ pub fn fmha_bwd_dot(name: &str) -> Function {
 /// dQ per 128-query tile (see the module doc). Grid (ceil(SQ / 128), H, B), 4 waves x 32 queries.
 pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
-    b.compile_profile(if std::env::var("TEMP_BWD_POL").map_or(false, |v| v.starts_with("vs")) { CompileProfile::Vs128 } else { CompileProfile::Gemm });
+    b.compile_profile(CompileProfile::Gemm);
     abi(&mut b);
     b.grid_is(0, Ext::ka(160).ceil_div(128));
     b.grid_is(1, Ext::ka(192));
@@ -313,7 +313,7 @@ pub fn fmha_bwd_dq(name: &str, causal: bool) -> Function {
 /// Grid (ceil(SK / 128), H, B), 4 waves x 32 keys; loop over 64-query tiles (Q and dO through a 2-slot LDS ring).
 pub fn fmha_bwd_dkdv(name: &str, causal: bool) -> Function {
     let mut b = FnBuilder::new(name, 256);
-    b.compile_profile(if std::env::var("TEMP_BWD_POL").map_or(false, |v| v.starts_with("vs")) { CompileProfile::Vs128 } else { CompileProfile::Gemm });
+    b.compile_profile(CompileProfile::Gemm);
     abi(&mut b);
     b.grid_is(0, Ext::ka(176).ceil_div(128));
     b.grid_is(1, Ext::ka(192));
