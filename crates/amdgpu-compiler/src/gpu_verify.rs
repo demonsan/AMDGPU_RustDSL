@@ -863,6 +863,10 @@ impl<'a> An<'a> {
                         ([], _) => true,
                         _ => false,
                     };
+                    if dbg && !ok_clamp {
+                        let tops = top.map(|(k, c)| format!("{:x} c={} hi={}", k.1, c.show(), ranges[k].1.show()));
+                        eprintln!("gw:   clamp: wg atoms {:?}, top {:?}, bound {}", wgs.iter().map(|k| format!("{:x}", k.1)).collect::<Vec<_>>(), tops, bound.show());
+                    }
                     if !ok_clamp {
                         { if dbg { eprintln!("gw:   cap {ci} rejected at 5"); } continue; }
                     }
