@@ -416,7 +416,9 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         }
         None => mev.write(&mut b, Opnd::Var(it), |b| {
             for (i, &(_, rowoff)) in rows.iter().enumerate() {
-                let vvo = b.bind_i32(ev(rowoff) + (ev(l16) << 4));
+                // V tile swizzle: the 32-byte granule G of tile row r is stored at granule G ^ (r % 8) (the DMA lands lane-linear, so the swizzle is applied to the SOURCE chunk: l16 ^ 2 (r % 8))
+                let vsw = b.bind_i32((kk_of(i as i32) & 7) << 1);
+                let vvo = b.bind_i32(ev(rowoff) + ((ev(l16) ^ ev(vsw)) << 4));
                 let m0v = b.bind_i32(vbase0.clone() + ((i as i32) << 10));
                 b.buffer_load_lds_b128(r_v, vvo, c0, m0v, 0);
             }
@@ -539,6 +541,9 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
     // blocked: P times the per-key V scales (the row sum l is unscaled)
     let p: Vec<ValueId> = match &kvsc { Some((_, vs)) => p.iter().zip(vs).map(|(x, s)| b.mul_f32(*x, *s)).collect(), None => p };
     let vb = b.bind_i32(vbase0.clone() + ev(vr));
+    // the swizzled granule offsets of the 8 d blocks (hoisted): (db ^ (r0 % 8)) * 32, r0 = 4 grp + l16 / 4
+    let r0m = b.bind_i32(((ev(grp) << 2) + ev(l16).lshr(2)) & 7);
+    let vgran: Vec<ValueId> = if grp_path { (0..8i32).map(|db| b.bind_i32((ev(r0m) ^ db) << 5)).collect() } else { Vec::new() };
     // blocked: the V^T row (d 16 db + l % 16) bytes of keys 4 g .. 4 g + 3 and 16 + 4 g ..
     let vtb = blocked.then(|| b.bind_i32(vbase0.clone() + ev(l16) * 64 + (ev(grp) << 3)));
     mev.read_back(&mut b, Opnd::Var(it), |b| {
@@ -554,8 +559,12 @@ fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
                     let hi = b.load_lds_b64(a1);
                     b.cat_frag4(lo, hi)
                 } else {
-                    let a0 = b.bind_i32(ev(vb) + (32 * t as i32) * ROW + 32 * db);
-                    let a1 = b.bind_i32(ev(vb) + (32 * t as i32 + 16) * ROW + 32 * db);
+                    // (the swizzle exists on the bf16 flash path only: the fp8 forms convert their V rows into an unswizzled bf16 tile)
+                    let (a0, a1) = if grp_path {
+                        (b.bind_i32(ev(vb) + (32 * t as i32) * ROW + ev(vgran[db as usize])), b.bind_i32(ev(vb) + (32 * t as i32 + 16) * ROW + ev(vgran[db as usize])))
+                    } else {
+                        (b.bind_i32(ev(vb) + (32 * t as i32) * ROW + 32 * db), b.bind_i32(ev(vb) + (32 * t as i32 + 16) * ROW + 32 * db))
+                    };
                     b.load_lds_tr_b16x2(a0, a1)
                 };
                 b.var_mfma(ov[db as usize], kind, vf, pf, false);
