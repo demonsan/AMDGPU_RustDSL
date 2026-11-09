@@ -611,6 +611,7 @@ pub const ALL: &[MOp] = &[
     MOp::GlobalStoreF32Sc1,
     MOp::GlobalAtomicAddRet,
     MOp::BufferAtomicAddU32,
+    MOp::BufferAtomicAddU32Ret,
     MOp::BufferAtomicAddF32,
     MOp::BufferAtomicPkAddBf16,
     MOp::BufferAtomicPkAddF16,
@@ -1065,6 +1066,7 @@ const fn attrs_of(op: MOp) -> OpAttrs {
         // read-modify-write with a result: a global access (vmcnt queue entry whose destination is the old value)
         GlobalAtomicAddRet => a("global_atomic_add", c(Vmem, 8, 900, Unknown)).mem(G, true, Src(0), 4),
         BufferAtomicAddU32 => a("buffer_atomic_add", c(Vmem, 8, 4, Unknown)).mem(G, true, Base::Unknown, 4).agpr(false, 0b1),
+        BufferAtomicAddU32Ret => a("buffer_atomic_add", c(Vmem, 8, 4, Unknown)).mem(G, true, Base::Unknown, 4).regfx(RegFx::PartialWrite).backend(Backend::OwnOnly),
         BufferAtomicAddF32 => a("buffer_atomic_add_f32", c(Vmem, 8, 4, Unknown)).mem(G, true, Base::Unknown, 4).agpr(false, 0b1),
         BufferAtomicPkAddBf16 => a("buffer_atomic_pk_add_bf16", c(Vmem, 8, 4, Unknown)).mem(G, true, Base::Unknown, 4).agpr(false, 0b1),
         BufferAtomicPkAddF16 => a("buffer_atomic_pk_add_f16", c(Vmem, 8, 4, Unknown)).mem(G, true, Base::Unknown, 4).agpr(false, 0b1),

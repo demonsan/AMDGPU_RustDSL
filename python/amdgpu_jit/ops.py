@@ -140,3 +140,16 @@ def fmha_fwd_mxfp8(q, k, v, q_scale, k_scale, v_scale, out, *, path="auto", spli
     cgrid = max(1, math.ceil(rows_total * D / (256 * 8)))
     comb.launch(_present(comb, cvals), (cgrid, 1, 1), {}, {"ptr_ohat": sizes2["ptr_ohat"], "ptr_lse": sizes2["ptr_lse"], "ptr_out": ro.cap}, st, check)
     return path, splits
+
+
+def decode16_plan(b, hk, ctx, page=16):
+    """The paged-decode (bf16, hd128, GQA <= 16) launch plan - the single rule ``amdgpu_kernels::dispatch::decode16_plan``, asked from amdc
+    (``amdc dispatch decode16``): returns ``(kernel_name, form, splits)`` with form "fused" (S = 1, no combine kernel) or "lastc" (the
+    last-arriving CTA merges the S partials, no combine kernel)."""
+    import json
+    import subprocess
+    from ._compile import amdc_path
+    out = subprocess.run([amdc_path(), "dispatch", "decode16", str(int(b)), str(int(hk)), str(int(ctx)), "--page", str(int(page))],
+                         capture_output=True, text=True, check=True).stdout
+    j = json.loads(out)
+    return j["kernel"], j["form"], int(j["splits"])

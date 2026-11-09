@@ -1067,6 +1067,10 @@ impl<'a> An<'a> {
             Op::LoadLdsD16 { addr, ty, .. } => self.check_lds_at("ds_read d16", addr, ty.bytes() as i128),
             Op::LoadLdsTrB16 { addr } => self.check_lds_at("ds_read_b64_tr_b16", addr, 8),
             Op::AtomicLds { addr, .. } => self.check_lds_at("ds atomic (returning)", addr, 4),
+            Op::BufferAtomicRet { rsrc, voff, soff, imm, .. } => {
+                let r = self.av_of(rsrc);
+                self.check_buffer("buffer atomic (returning)", &r, voff, soff, *imm as i128, 4, true);
+            }
             Op::AtomicGlobal { base, byte_off, .. } => {
                 let b = self.av_of(base);
                 self.check_global("global atomic (returning)", &b, *byte_off as i128, 4, true);
@@ -2074,7 +2078,7 @@ fn mem_counts(st: &Stmt) -> (u32, u32) {
             Op::LoadLdsTr4B8 { .. } => (0, 4),
             Op::LoadGlobalN { .. } | Op::LoadGlobalD16 { .. } | Op::BufferLoadN { .. } => (1, 0),
             Op::LoadLdsN { .. } | Op::LoadLdsD16 { .. } | Op::LoadLds2 { .. } | Op::LoadLdsTrB16 { .. } | Op::AtomicLds { .. } | Op::Bpermute { .. } | Op::Permute { .. } | Op::Swizzle { .. } => (0, 1),
-            Op::AtomicGlobal { .. } => (1, 0),
+            Op::AtomicGlobal { .. } | Op::BufferAtomicRet { .. } => (1, 0),
             _ => (0, 0),
         },
         _ => (0, 0),
