@@ -132,7 +132,11 @@ int main(int argc, char** argv) {
         std::string cs = causal ? "_causal" : "";
         hipFunction_t fd = load(dir + "/fmha_bwd_dot_hd128_bf16.co", "fmha_bwd_dot_hd128_bf16");
         hipFunction_t fq = load(dir + "/fmha_bwd_dq_hd128_bf16" + cs + ".co", "fmha_bwd_dq_hd128_bf16" + cs);
-        hipFunction_t fk = load(dir + "/fmha_bwd_dkdv_hd128_bf16" + cs + ".co", "fmha_bwd_dkdv_hd128_bf16" + cs);
+        // PAIR=1 (causal): the paired dkdv form (`_causal_pair`, half the key-tile grid)
+        const bool pairk = causal && envi("PAIR", 0);
+        const std::string ks = cs + (pairk ? "_pair" : "");
+        const int gk = pairk ? ((SK + 127) / 128 + 1) / 2 : (SK + 127) / 128;
+        hipFunction_t fk = load(dir + "/fmha_bwd_dkdv_hd128_bf16" + ks + ".co", "fmha_bwd_dkdv_hd128_bf16" + ks);
         std::vector<uint8_t> a(16 * 15, 0);
         auto P_ = [&](int i, const void* p) { memcpy(&a[16 * i], &p, 8); };
         auto U = [&](int i, int x) { memcpy(&a[16 * i], &x, 4); };
@@ -141,7 +145,7 @@ int main(int argc, char** argv) {
         auto run = [&]() {
             launch(fd, a, (SQ + 255) / 256, H, B);
             launch(fq, a, (SQ + 127) / 128, H, B);
-            launch(fk, a, (SK + 127) / 128, H, B);
+            launch(fk, a, gk, H, B);
         };
         run();
         HC(hipDeviceSynchronize());
@@ -154,7 +158,7 @@ int main(int argc, char** argv) {
         printf("ours bwd B=%d H=%d HK=%d SQ=%d SK=%d causal=%d: %.1f us %.1f TF/s\n", B, H, HK, SQ, SK, causal, us, flops / (us * 1e-6) / 1e12);
         // per-kernel split
         hipFunction_t fs[3] = {fd, fq, fk};
-        int gxs[3] = {(SQ + 255) / 256, (SQ + 127) / 128, (SK + 127) / 128};
+        int gxs[3] = {(SQ + 255) / 256, (SQ + 127) / 128, gk};
         const char* nm[3] = {"dot", "dq", "dkdv"};
         for (int kk = 0; kk < 3; kk++) {
             HC(hipEventRecord(e0));
