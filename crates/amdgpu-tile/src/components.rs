@@ -29,6 +29,29 @@ pub fn kv_split_decode(b: &mut FnBuilder, z: ValueId, splits: ValueId, splits_ka
     (bi, sp, lg)
 }
 
+/// `kv_split_range` for a key range that varies per block (causal: the block's last visible key + 1 = `kv_len`): a split past the block's
+/// tiles is EMPTY (returned flag, 0 / 1); it is clamped to the last tile (a valid range, so the pipeline runs) and the caller discards its
+/// result (log-sum-exp = -inf). Returns `(key_lo, kv_eff, empty)`.
+pub fn kv_split_range_var(b: &mut FnBuilder, kv_len: ValueId, split: ValueId, lg: ValueId, skv_ka: u32) -> (ValueId, ValueId, ValueId) {
+    let ntiles = b.bind_i32((ev(kv_len) + 127).lshr(7));
+    let tps = b.bind_i32((ev(ntiles) + ((I32::c(1) << ev(lg)) - 1)).lshr(ev(lg)));
+    b.assume_trusted(tps, Ext::c(1), Ext::ka(skv_ka).ceil_div(128), "tiles per split = ceil(ntiles / splits) in [1, ntiles] (1 <= kv_len <= SK); variable shift by log2(splits)");
+    let raw = b.bind_i32(ev(split) * ev(tps));
+    let empty = b.bind_i32(ev(raw).ge(ev(ntiles)).select_i32(1, 0));
+    let tile_lo = b.bind_i32(ev(raw).min(ev(ntiles) - 1));
+    b.assume_trusted(tile_lo, Ext::c(0), Ext::ka(skv_ka).ceil_div(128) - Ext::c(1), "first tile of this split = min(split * tps, ntiles - 1) <= ntiles - 1 with ntiles <= ceil(SK / 128) (correlation through the min)");
+    let hi_r = b.let_i32(ev(tile_lo) + ev(tps));
+    let tile_hi = hi_r.lt(ev(ntiles)).select_i32(&hi_r, ev(ntiles));
+    let key_lo = b.bind_i32(ev(tile_lo) << 7);
+    b.sym_range("KL", 0, i64::MAX);
+    b.assume_trusted(key_lo, Ext::sym("KL"), Ext::sym("KL"), "KL is only a NAME for key_lo = tile_lo << 7 (free symbol >= 0) so the next assume can state the correlation with the split length");
+    let key_hi_t = b.let_i32(tile_hi << 7);
+    let key_hi = key_hi_t.lt(ev(kv_len)).select_i32(&key_hi_t, ev(kv_len));
+    let kv_eff = b.bind_i32(key_hi - ev(key_lo));
+    b.assume_trusted(kv_eff, Ext::c(1), Ext::ka(skv_ka) - Ext::sym("KL"), "split length kv_eff = min(tile_hi << 7, kv_len) - key_lo with tile_lo <= ntiles - 1 < tile_hi (>= 1) and kv_len <= SK (correlation lost by the interval engine)");
+    (key_lo, kv_eff, empty)
+}
+
 /// This split's key range: tiles `[split * tps, min(ntiles, (split + 1) * tps))` with `tps = ceil(ntiles / splits)`; returns `(key_lo, kv_eff)` (first key,
 /// number of keys of the split). `skv_ka` = kernarg offset of the full sequence length. Emits the four trusted facts of the host guard
 /// "every split is non-empty" (splits <= ceil(SK / 128)) and names `key_lo` with the symbol `KL` so `kv_eff <= SK - KL` can be stated.

@@ -38,6 +38,26 @@ pub fn dispatched_names() -> BTreeSet<String> {
             }
         }
     }
+    // per-tensor FP8 prefill (+ the KV-split combine)
+    for (b, h, sq) in [(1u64, 8u64, 2048u64), (1, 8, 4096), (2, 32, 8192)] {
+        for causal in [false, true] {
+            let (k, s) = fp8pt_prefill_kernel(b, h, sq, sq, causal, 256);
+            n.insert(k.to_string());
+            if s > 1 {
+                n.insert("fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h".into());
+            }
+        }
+    }
+    // MLA prefill hd192/hd128 (+ the key-split combine)
+    for (b, h, sq) in [(1u64, 8u64, 4096u64), (1, 16, 2048), (4, 16, 2048), (1, 128, 1024)] {
+        for causal in [false, true] {
+            let (k, s) = hd192_prefill_kernel(b, h, sq, sq, causal, 256);
+            n.insert(k.to_string());
+            if s > 1 {
+                n.insert("attn_combine_bf16_hd128_q".into());
+            }
+        }
+    }
     // MLA decode
     for b in [1u64, 64] {
         for h in [16u64, 128] {

@@ -44,6 +44,10 @@ struct Launch {
     hipFunction_t fn;
     std::vector<uint8_t> a;
     int gx, gy, gz, block;
+    // KV split (ours): the combine launch after the main kernel
+    hipFunction_t comb = nullptr;
+    std::vector<uint8_t> ca;
+    int cgrid = 0;
 };
 
 int main(int argc, char** argv) {
@@ -94,6 +98,12 @@ int main(int argc, char** argv) {
     const float scale = 1.0f / std::sqrt((float)D);
     // VSCALE_MUL: a factor on the softmax scale passed to the vendor kernel only (ABI probing)
     const float vmul = getenv("VSCALE_MUL") ? (float)atof(getenv("VSCALE_MUL")) : 1.0f;
+    // KVS=n (2 / 4 / 8): our kernel is a `_kvsplit` form (kernarg 0x290 Ohat, 0x298 lse, 0x2A0 splits, 0x2A4 rows_total; grid z = B n)
+    // merged by COMBINE_CO / COMBINE_KN (default fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h, 8 elements per thread); both are timed together
+    const int kvs = envi("KVS", 0);
+    void *dohat = nullptr, *dlsep = nullptr;
+    const long rows_total = (long)B * SQ * H;
+    if (kvs) { HC(hipMalloc(&dohat, (size_t)kvs * rows_total * D * 4)); HC(hipMalloc(&dlsep, (size_t)kvs * rows_total * 4)); }
     auto make = [&](const char* co, const char* kn, float smul) {
         Launch L;
         hipModule_t mod;
@@ -120,6 +130,21 @@ int main(int argc, char** argv) {
         // OUR_PAIR=0: our kernel without the q-tile pairing (one q tile per block)
         const bool pair = causal && (kn[0] == '_' || envi("OUR_PAIR", 1));
         L.gx = pair ? (tiles + 1) / 2 : tiles; L.gy = H; L.gz = B; L.block = 512;
+        if (kvs && kn[0] != '_') {
+            L.a.resize(688, 0);
+            memcpy(&L.a[0x290], &dohat, 8); memcpy(&L.a[0x298], &dlsep, 8);
+            const uint32_t sp = kvs, rt = (uint32_t)rows_total;
+            memcpy(&L.a[0x2A0], &sp, 4); memcpy(&L.a[0x2A4], &rt, 4);
+            L.gx = tiles; L.gz = B * kvs;
+            hipModule_t cm;
+            HC(hipModuleLoad(&cm, getenv("COMBINE_CO")));
+            HC(hipModuleGetFunction(&L.comb, cm, getenv("COMBINE_KN") ? getenv("COMBINE_KN") : "fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h"));
+            L.ca.assign(48, 0);
+            memcpy(&L.ca[0x00], &dohat, 8); memcpy(&L.ca[0x08], &dlsep, 8); memcpy(&L.ca[0x10], &dout, 8);
+            const uint32_t d128 = D;
+            memcpy(&L.ca[0x18], &rt, 4); memcpy(&L.ca[0x1C], &d128, 4); memcpy(&L.ca[0x20], &sp, 4);
+            L.cgrid = (int)((rows_total * D / 8 + 255) / 256);
+        }
         return L;
     };
     std::vector<Launch> Ls = {make(argv[1], argv[2], vmul), make(argv[3], argv[4], 1.0f)};
@@ -128,6 +153,11 @@ int main(int argc, char** argv) {
         size_t asz = L.a.size();
         void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, L.a.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &asz, HIP_LAUNCH_PARAM_END};
         HC(hipModuleLaunchKernel(L.fn, L.gx, L.gy, L.gz, L.block, 1, 1, 0, nullptr, nullptr, cfg));
+        if (L.comb) {
+            size_t csz = L.ca.size();
+            void* ccfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, L.ca.data(), HIP_LAUNCH_PARAM_BUFFER_SIZE, &csz, HIP_LAUNCH_PARAM_END};
+            HC(hipModuleLaunchKernel(L.comb, L.cgrid, 1, 1, 256, 1, 1, 0, nullptr, nullptr, ccfg));
+        }
     };
     // sampled rows (first / last query of the first / last batch and head always)
     std::vector<int> cb(ncheck), ch(ncheck), cq(ncheck);

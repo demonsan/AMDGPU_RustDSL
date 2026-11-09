@@ -705,7 +705,7 @@
 - Q/K 的 head dim 为 192（128 nope + 64 rope），V/O 为 128。
 - K 的 rope 部分放在第二个 ring（KR，行宽 128 字节，chunk 按 key % 8 做 XOR），由 group A 负责 staging（每个 wave 多 4 次 DMA）；QK 共 12 个 k-chunk。
 - LDS 正好 160 KB（K 64 + KR 32 + V 64）。
-- causal 形式不做 q tile 配对：第二个 pass 的寄存器放不下；两种形式都用 Vs128。
+- causal 形式不做 q tile 配对：第二个 pass 的寄存器放不下；两种形式都用 Vs128。（2026-11-09 起已配对，并按网格分发，见 §7.5 的“MLA prefill causal 的 q tile 配对”。）
 - 测试用 `attn_host` 的 `DV=128`，第 10 个参数为 192。全部 bad=0。
 - 与 aiter `fwd_hd192_hd128_bf16[_causal]` 的同次对比（厂商用 128 行、256 线程）：
 
@@ -935,8 +935,21 @@
 
   - 厂商这个 kernel 用标准 exp 路径（每元素 `v_pk_fma` + `v_exp_f32` + `v_cvt_pk_fp8_f32`，VALU 行和）和不带 scale 的 MFMA；我们沿用 MXFP8 的位技巧配方，VALU 少得多，但仍慢 3–12%。差距的归因（ATT）还没做。
   - 小形状（B2 H8 300×200 等，几十 µs 以内）约 0.62×，属启动与短序列 LUT 副本的开销。
+- **小网格：KV split（`fmha_fwd_hd128_fp8pt_v3[_causal]_kvsplit`）**：`skeleton_kvsplit` 上的同一个 body（MUBUF staging、优先级 ping-pong、单次 bias MFMA），每个 q tile 的 key 范围切成 S 份（grid z = B·S），fp16 部分结果加 LSE，由出厂的 `fmha_fwd_hd128_mxfp8_v3_kvsplit_combine8h` 合并。
+  - ABI 扩展放在 656 字节之后（0x290 Ohat、0x298 LSE、0x2A0 splits、0x2A4 rows_total），因为 0x270 / 0x280 已被 V descale 的步长占用。
+  - causal：切的是该 q tile 可见的 key 范围（`components::kv_split_range_var`）；超出范围的 split 夹到最后一个 tile 运行，结果以 LSE = −∞ 丢弃。split 内的 causal mask 以 split 起点为原点。
+  - 分发：[`dispatch.rs`](../crates/amdgpu-kernels/src/dispatch.rs) 的 `fp8pt_prefill_kernel`：未配对网格 U = B·H·⌈SQ/256⌉ < CU 数时用 split，S 取使 U·S ≥ CU 的最小值（≤ 4，每份至少两个 key tile）。
+  - 扫描（同次运行，µs，plain / 最佳 split / 厂商）：B1 H8 2048² 37.7 / 24.6（S4）/ 33.2；4096² 71.0 / 55.3（S2）/ 63.7；causal 2048² 50.4 / 25.2（S4）/ 41.1；causal 4096² 90.8 / 51.3（S2）/ 68.2。U = 256 时 split 更慢（B4 H16 1024²：32.3 对 S2 47.6；causal 40.0 对 45.6），所以不切。
+  - strict 0 错误；厂商对齐全部 PASS（mean_err 1.02–1.07×）。
 
-**attention 各族与厂商的当前比值汇总**（2026-11-09，GPU 5；prefill / 反向为同一次运行，脚本 [`attn_family_table.sh`](../tools/attn_family_table.sh)；全部 bad=0；比值 = 厂商时间 / ours，>1 表示 ours 更快）：
+**MLA prefill（hd192/hd128）causal 的 q tile 配对**（2026-11-09）：
+- 以前不配对的原因是第二个 pass 放不下寄存器。和 fp8pt 一样，根因是第二个 pass 复用第一个 pass 的 lane 分区值（DMA voffset、K / V 读偏移），使它们在第一个 pass 的末尾 tile 保活。改为第二个 pass 重新绑定这些值（[`bf16v3.rs`](../crates/amdgpu-kernels/src/fmha/bf16v3.rs) 的 `lane_parts`、`V3Opts::fresh2`）后可以配对（253 VGPR；不重绑的版本分配失败）。
+- 同次 A/B（µs，不配对 / 配对 / 厂商）：B4 H16 2048² 173 / 130 / 128；B1 H16 8192² 495 / 372 / 374；B1 H128 4096² 1030 / 774 / 774；B1 H128 1024² 101 / 80 / 82。小网格配对更慢：B1 H16 4096² 143 / 156，B1 H16 2048² 72 / 83。
+- 因此 `fmha_fwd_hd192_hd128_bf16_v3_causal` 改为配对形式（网格 x 减半），另加不配对的 `_causal_np`；分发规则见 `dispatch::hd192_prefill_kernel`：U = B·H·⌈SQ/256⌉ ≥ 2·CU 用配对；U ≤ CU/2 且 key tile ≥ 32 用不配对的 `_causal_ks` S=2（B1 H8 4096² 104 对 121）；其余用 `_np`。
+- 同样的重绑在 hd128 causal（本来就配对）上测得中性（8192² 1140 / 1141 µs，2048² 108 / 109），不采用，hd128 的代码与 md5 不变。
+- 期间发现 `fmha_fwd_hd128_bf16_v3_causal_ks`（hd128 causal 小网格的分发目标）汇编失败：`.amdhsa_next_free_sgpr 104` 越界，Main 上即如此（与本改动无关）。后端已定位（emit 把 SGPR 数向上取整到 8 的倍数），在 `sgpr-fix` 分支修复，并让 `dispatch_compile` 汇编每个可达 kernel。
+
+**attention 各族与厂商的当前比值汇总**（2026-11-09，GPU 5；prefill / 反向为同一次运行（fp8pt 与 hd192 两节为配对 / split 改动后重测，所用形式为分发规则所选），脚本 [`attn_family_table.sh`](../tools/attn_family_table.sh)；全部 bad=0；比值 = 厂商时间 / ours，>1 表示 ours 更快）：
 
 | 族 | 形状 | ours | 厂商 | 比 |
 |---|---|--:|--:|--:|
@@ -945,8 +958,9 @@
 | MXFP8 | B4 H8 2048² | 39.4 µs | 40.0 µs | 1.02 |
 | fp8 per-tensor | B2 H32 8192² | 1205 µs | 1107 µs（fwd_hd128_fp8） | 0.92 |
 | fp8 per-tensor causal | B2 H32 8192² | 672 µs | 615 µs | 0.91 |
-| fp8 per-tensor | B1 H8 4096² | 68.4 µs | 60.4 µs | 0.88 |
-| fp8 per-tensor causal | B1 H8 4096² | 90.0 µs | 68.9 µs | 0.77 |
+| fp8 per-tensor（分发：`_kvsplit` S2） | B1 H8 4096² | 51.7 µs | 61.5 µs | 1.19 |
+| fp8 per-tensor causal（`_causal_kvsplit` S2） | B1 H8 4096² | 51.3 µs | 67.8 µs | 1.32 |
+| fp8 per-tensor（`_kvsplit` S4） | B1 H8 2048² | 24.0 µs | 32.6 µs | 1.36 |
 | bf16 v3 hd128 | B2 H32 8192² | 2037 µs | 1950 µs（fwd_hd128_bf16） | 0.96 |
 | bf16 v3 hd128 | B4 H16 2048² | 172 µs | 154 µs | 0.89 |
 | bf16 v3 hd128 | B1 H8 4096² | 114 µs | 100 µs | 0.88 |
@@ -955,8 +969,11 @@
 | bf16 v3 hd128 causal | B1 H8 4096² | 120 µs | 90.5 µs | 0.75 |
 | bf16 hd192/hd128（MLA prefill） | B1 H16 4096² | 187 µs | 178 µs（fwd_hd192_hd128_bf16，128 行） | 0.95 |
 | bf16 hd192/hd128 | B4 H16 2048² | 206 µs | 189 µs | 0.91 |
-| bf16 hd192/hd128 causal | B1 H16 4096² | 147 µs | 114 µs | 0.77 |
-| bf16 hd192/hd128 causal | B4 H16 2048² | 171 µs | 127 µs | 0.74 |
+| bf16 hd192/hd128 | B1 H8 4096²（128 CTA） | 135 µs | 88.3 µs | 0.66 |
+| bf16 hd192/hd128 causal（配对） | B4 H16 2048² | 128 µs | 126 µs | 0.98 |
+| bf16 hd192/hd128 causal（配对） | B1 H128 1024² | 82.8 µs | 79.5 µs | 0.96 |
+| bf16 hd192/hd128 causal（`_np`） | B1 H16 4096² | 147 µs | 113 µs | 0.77 |
+| bf16 hd192/hd128 causal（`_ks` S2） | B1 H8 4096² | 103 µs | 84.6 µs | 0.82 |
 | bf16 反向 | B4 H16 2048² | 670 µs | 494 µs（fmha_v3_bwd a32 管线） | 0.74 |
 | bf16 反向 | B1 H16 4096² | 637 µs | 465 µs | 0.73 |
 | bf16 反向 GQA4 | B4 H16 HK4 2048² | 671 µs | 490 µs | 0.73 |
@@ -970,7 +987,7 @@
 - decode 两族的 host 需要分发计划（`decode16_plan`、`mla_config`），没有放进同次脚本；数字取自上文 2026-11-08/09 的记录。
 - MXFP8 一行是强制 `_vs128` 的单 kernel 比较；出厂分发（短序列 KV-split / `_t128`）的 25 形状矩阵为 0.93–1.06×，见 [`current-status.md`](current-status.md)。
 - 同一脚本里 bf16 反向非 causal 为 0.73–0.74×（交接记录的 0.83× 是不同形状与批次）；causal 4096² 0.86×。
-- 共同的短板：causal 的小网格（B1 H8 4096²：fp8pt 0.77、bf16 0.75）与 hd192 causal（不配对，0.74–0.77）。上面的 `KvRing3::rebuilt` 做法（第二 pass 重建 lane 分区）可以直接用来尝试 hd192 causal 的配对，`fmha_fwd_bf16_v3_d` 用自己的 ring，需要同样的改法。
+- 剩余短板：hd192 的小网格（非 causal B1 H8 4096² 0.66，causal 0.77–0.82）、bf16 hd128 causal 小网格（分发目标 `_causal_ks` 待后端 SGPR 修复后重测；表中 0.75 为配对的普通形式）、反向 0.72–0.86。
 
 **性能待办**：
 - prefill：8 wave 两组 ping-pong（v3 骨架）、延迟 rescale、QK / softmax / PV 交叠；
