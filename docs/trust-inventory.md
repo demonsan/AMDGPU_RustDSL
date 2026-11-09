@@ -101,10 +101,21 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 
 ## 4. 做了越界检查、没做竞争检查（本轮新增计数）
 
-**`global-write-untracked`**：
-- 范围：所有不在 `buf_region` 标记内的全局 / buffer 写；
-- 越界已证明，但不同 workgroup 写的位置互不重叠是被信任的；
-- 每个 kernel 都有，这是"输出按 CTA 划分"的通用假设。
+**跨 workgroup 的全局写不相交（本轮新增证明）**：
+- 范围：所有不在 `buf_region` 标记内的普通全局 / buffer 写（原子写不需要）；
+- 做法：把每个写地址化成符号线性式，原子是 workgroup id、lane 派生值、循环变量；结构相同的重算表达式共用一个原子。各写的常数差按单项式拆成伪数字位。
+- 判据：所有数字位按系数排序后构成混合进制，即每个系数 ≥ 更小数字位的总跨度 + 访问大小；并且每个可能多于一个 workgroup 的轴都是一个数字位。满足时两个不同 workgroup 不可能写同一字节，计入 `proven["global-write-disjoint"]`；不满足的写仍计入 `global-write-untracked`；
+- 合同里未定义、kernel 也不读的 grid 轴按 1 个 workgroup 处理（与 grid 范围同属主机契约）；
+- 掩码写的哨兵臂（≥ 2^30 或负常数，被描述符范围检查丢弃，这一点已由越界证明确立）不算写；
+- `AMDC_GW_DEBUG=1 amdc gpu-verify <k>` 逐参数打印失败原因和原子签名。
+
+已证明：rmsnorm 系列、量化、激活、rope、`topk_softmax`、`moe_sum` / `moe_reduce`、各 combine、`gemm_splitk_reduce`、argmax / sample 的输出。
+
+仍未证明（原因 → 需要什么）：
+- GEMM / MoE GEMM / mlp（XCD 光栅：tile 坐标是 workgroup id 的置换，由 `assume_trusted` 声明）→ 需要"双射"这种事实形式；
+- decode16 / MLA / reshape_cache（G = H/HK 由 kernarg 的 select 得出，区间不是一个点；slot_mapping 是数据）→ 需要把 G 作为契约符号；
+- bf16 prefill / bwd（系数含 kernarg 步长，与常数不可比）→ 需要步长的契约下界；
+- mxfp8 FMHA（XCD 块序）同 GEMM。
 
 **`lds-untracked`**：
 - 范围：不在任何 tile 标记内的 LDS 访问；
@@ -138,6 +149,6 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 
 1. 采样 / top-k / moe_sorting 的 LDS 归约改用 LdsPlan tile 并加标记，使 `lds-untracked` 归零。
 2. 增加 `amdc check-launch`，让 C++ 主机和外部启动器也能检查主机契约。
-3. 对仿射输出做全局写不相交证明，让 `global-write-untracked` 只剩真正数据相关的散写。
+3. 全局写不相交证明（已做，见 §4）：下一步补双射事实（XCD 光栅）与步长下界，覆盖 GEMM / attention。
 4. 区间引擎接入循环退出条件和 `x >> log2(g)` 这类关系，可去掉 §1(b) 的大部分 `assume_trusted`。
 5. 调试模式把 `assume` / `assume_trusted` 编成运行时断言（违反时写调试缓冲区），覆盖 §1(a)。
