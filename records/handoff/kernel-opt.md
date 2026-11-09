@@ -38,8 +38,17 @@ docs in Chinese in `docs/op-coverage-design.md` (relative links, `python tools\c
   large grids 0.93 -> 1.03 (non-causal 8192^2), causal 0.92 -> 0.97; new combine `attn_combine_bf16_hd128_q16` (replaces `_q`; 16 rows per
   workgroup) and hd192 non-causal `_ks` in the dispatch: hd192 B1H8 4096^2 0.66 -> 0.81, causal `_ks` 0.82 -> 0.95, bf16 hd128 B1H8 4096^2 1.07.
   `tools/att_fp8pt.sh` = ATT of fp8pt vs aiter. Python `prefill_bf16` switched to q16 (not run here: no torch on the node path I use).
-- Next candidates: re-measure bf16 hd128 causal small grids once sgpr-fix is in Main; hd192 small grids structurally need a 128-row / 4-wave form;
-  bwd 0.72-0.86.
+- Round 4: fp8pt m-scale moved to where S is produced (end of m_phase / prologue; sched ATT: the VALU phase was the long ping-pong side):
+  large grids 1.09-1.22x aiter, KV split 1.48-1.74x. bf16 hd128 causal small grids re-measured with the assembling `_causal_ks`; dispatch tweak.
+- Round 5: 128-row / 64-key form (`V3Opts::small`, names `_q128`), adopted only where it wins (hd128 causal paired grid 128..255 with short keys,
+  hd192 causal unpaired U <= 128); non-causal q128 loses everywhere. hd192 derived read offsets rejected (archive/bf16v3-derived-offsets).
+  sched's hd192 region policy merged (sched-hd192-regions); hd192 dispatch re-tuned after it.
+- Round 6/7: bwd masks only on the tiles that need them (dq key mask; dkdv tail / causal diagonal, S = -inf in place) + fma for the dkdv P
+  exponent; dkdv LSE / Dot staged through LDS with the Q / dO DMA. bwd 0.72-0.86 -> 0.79-0.97x aiter.
+- Final same-run family table (2026-11-10) in docs §7.5: fp8pt 1.09-1.74, bf16 hd128 0.89-1.23 (large non-causal 0.96, causal 0.90), hd192
+  0.70-1.04, bwd 0.79-0.97, MXFP8 0.96-1.02 (earlier run).
+- Next candidates (need rewrites): bwd = fused dq + dkdv with atomic dQ (vendor style; dkdv runs 1 wave per SIMD); hd192 small grids = per-CU
+  efficiency vs the vendor's 128-row kernel (integer VALU / scheduling); bf16 hd128 mid grids (B4 H16 1024^2 non-causal 0.82).
 ## Open items across my areas (current same-run ratios vs aiter; >1 = ours faster)
 
 - **MXFP4 GEMM** 0.86-0.90× (8192³ 270 vs 242 µs). sched's attribution (docs/mxfp4-gemm-profile.md on origin/sched-mxfp4-prof): DMA-issue

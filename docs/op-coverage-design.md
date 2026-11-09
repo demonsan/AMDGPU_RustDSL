@@ -987,12 +987,12 @@
 | bf16 hd192/hd128 causal（`_np_q128` + 区域策略） | B1 H16 2048² | 56.9 µs | 48.9 µs | 0.86 |
 | bf16 hd192/hd128（`_ks` S2 + 区域策略） | B1 H16 2048² | 64.4 µs | 46.7 µs | 0.73 |
 | bf16 hd192/hd128 causal（`_ks` S2 + q16 combine） | B1 H8 4096² | 89.1 µs | 84.4 µs | 0.95 |
-| bf16 反向（mask 只在需要的 tile，重测） | B4 H16 2048² | 638 µs | 494 µs（fmha_v3_bwd a32 管线） | 0.77 |
-| bf16 反向 | B1 H16 4096² | 597 µs | 467 µs | 0.78 |
-| bf16 反向 GQA4 | B4 H16 HK4 2048² | 635 µs | 493 µs | 0.78 |
-| bf16 反向 causal | B4 H16 2048² | 382 µs | 320 µs | 0.84 |
-| bf16 反向 causal | B1 H16 4096² | 354 µs | 342 µs | 0.97 |
-| bf16 反向 causal GQA4 | B4 H16 HK4 2048² | 386 µs | 305 µs | 0.79 |
+| bf16 反向（mask 只在需要的 tile + LSE / Dot 经 LDS） | B4 H16 2048² | 628 µs | 494 µs（fmha_v3_bwd a32 管线） | 0.79 |
+| bf16 反向 | B1 H16 4096² | 593 µs | 468 µs | 0.79 |
+| bf16 反向 GQA4 | B4 H16 HK4 2048² | 624 µs | 491 µs | 0.79 |
+| bf16 反向 causal | B4 H16 2048² | 377 µs | 311 µs | 0.82 |
+| bf16 反向 causal | B1 H16 4096² | 352 µs | 342 µs | 0.97 |
+| bf16 反向 causal GQA4 | B4 H16 HK4 2048² | 381 µs | 309 µs | 0.81 |
 | paged decode（不同次，上文表） | B16 H64 HK8 ctx 2048 | 24.1 µs | 18.5 µs | 0.77 |
 | paged decode（不同次） | B64 ctx 2048 | 83.8 µs | 77.4 µs | 0.92 |
 | MLA decode H16 P1（不同次，上文） | B64 ctx ≤ 4096 | 76 µs | 47.7 µs | 0.63 |
@@ -1000,7 +1000,7 @@
 - decode 两族的 host 需要分发计划（`decode16_plan`、`mla_config`），没有放进同次脚本；数字取自上文 2026-11-08/09 的记录。
 - MXFP8 一行是强制 `_vs128` 的单 kernel 比较；出厂分发（短序列 KV-split / `_t128`）的 25 形状矩阵为 0.93–1.06×，见 [`current-status.md`](current-status.md)。
 - 同一脚本里 bf16 反向非 causal 为 0.73–0.74×（交接记录的 0.83× 是不同形状与批次）；causal 4096² 0.86×。
-- fp8 per-tensor 的行在 m 缩放移位之后重测；其余 prefill 行为同日的同次运行。
+- fp8 per-tensor 的行在 m 缩放移位之后重测；其余 prefill 行为同日的同次运行；反向行为 2026-11-10 收尾时的同次运行（`attn_family_table.sh` 全量，fp8pt / bf16 / hd192 与上表一致，在 ±3% 内）。
 - 剩余短板：hd192 小网格（非 causal B1 H8 4096² 0.81、causal `_np` 0.77）、bf16 hd128 causal 中等网格（B4 H16 2048² 0.80、B4 H16 1024² 0.82：配对后 128–256 个 CTA，切分与配对都不再划算）、反向 0.72–0.86。
 - **bf16 hd128 causal 小网格**（SGPR 修复合入后，`_causal_ks` 可以汇编；同次运行，µs，厂商 / 配对 / v1 / ks2 / ks4）：B1 H8 4096² 91 / 119 / 98 / 86 / **74**；2048² 52 / 69 / 49 / 51 / **42**；B2 H8 HK2 1000×1300 47 / 63 / **36** / 50 / 43；B1 H16 4096² 108 / 133 / 150 / **122** / 157；B4 H16 1024² 42 / **51** / 51 / 59 / 86；B1 H8 8192² 192 / 239 / 280 / **203** / 226。据此 `bf16_prefill_kernel` 改为：v1 只用于配对 CTA < 64 且 key tile < 16 的情形，key tile < 16 时 causal 不切分（B1 H8 2048² 由 v1 49 改为 ks4 42 µs；B4 H16 1024² 由 ks2 59 改为配对 51 µs）。
 - **key-split 合并 kernel `attn_combine_bf16_hd128_q16`**（取代 `attn_combine_bf16_hd128_q`）：每个 workgroup 16 行、每线程 8 维（每份两次 16 字节读），一遍在线合并；旧版每行一个 workgroup、每线程每份一个 dword、两遍，受延迟限制（hd192 `_ks` B1 H8 4096² S2 的合并约 22 µs）。同次 A/B（µs，旧 / 新）：hd192 B1 H8 2048² S4 54.4 / 41.3，4096² S2 122.5 / 111.8，B4 H16 1024² S2 112 / 86，B1 H16 4096² S2 243 / 224。Python `prefill_bf16` 与 `attn_host` 默认改用它。
@@ -1196,6 +1196,9 @@ blockscale 128×128（`fp8bs`）的规则：
 | B4 H16 HK4 2048² causal | 386.0 µs | 304.7 µs | 0.79 |
 | B1 H8 2048²（A/B 运行） | 146.6 µs | 141.0 µs | 0.96 |
 | B1 H8 2048² causal（A/B 运行） | 136.6 µs | 163.1 µs | 1.19 |
+- **dkdv 的 LSE / Dot 经 LDS**（ATT：大网格 dkdv 的 MFMA 流超出 60%，其中 LSE / Dot 的 16 条全局 b128 load 的发射与 `vmcnt` 等待占 45%）：每个 q tile 的 LSE / Dot（64 个 query × 4 字节）随 Q / dO 一起用 `buffer_load_dword … lds` 预取进 LDS（每个 wave 私有 512 字节），使用处改为 LDS 的 16 字节读。VGPR 232 → 220。同次 A/B（µs，总计 / dkdv）：B4 H16 2048² 644 → 635 / 367 → 359，B1 H8 2048² 146.5 → 143.4，B4 H16 2048² causal 388 → 376；尾部形状持平；全部 bad=0，strict 0 错误。
+- **本轮收尾**（2026-11-10）：反向余下的差距是结构性的：dkdv 每 SIMD 1 个 wave、dq 与 dkdv 各自重算 S / P（厂商单 kernel，dQ 用原子累加）。下一步需要合并 kernel 一类的重写，留待下一轮。
+
 正确性：ours 全部 `bad=0`，`gpu_verify --strict` 0 错误；厂商在 SQ ≠ SK 且不是 128 的整数倍的形状（B2 H8 HK2 1000 × 1500，causal）上自己有 dk / dv 错误（`dk=196 dv=177` bad），ours 没有。
 
 ### 7.8 批次 5b（implicit-GEMM 卷积）状态：2d / 3d bf16 覆盖完成
