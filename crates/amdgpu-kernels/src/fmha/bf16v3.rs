@@ -472,7 +472,7 @@ pub fn fmha_fwd_bf16_v3_d(name: &str, causal: bool, split: bool, dqk: i32) -> Fu
     let passes: Vec<(ValueId, Option<ValueId>)> = if pair {
         let qb = { let v = b.bind_i32(ev(nt) - 1 - ev(qt)); b.read_first_lane(v) };
         let second = b.bind_cond(ev(qb).gt(ev(qt)));
-        b.wg_union(&[qt, qb], &[0], Ext::c(0), sq.clone().ceil_div(QR as i64) - Ext::c(1), "causal pairing: CTA x takes q tiles x and nt - 1 - x (the second only when nt - 1 - x > x), grid x = ceil(nt / 2): every q tile once");
+        b.wg_union(&[qt, qb], &[0], Ext::c(0), Ext::ka(96).ceil_div(QR as i64) - Ext::c(1), "causal pairing: CTA x takes q tiles x and nt - 1 - x (the second only when nt - 1 - x > x), grid x = ceil(nt / 2): every q tile once");
         vec![(qt, None), (qb, Some(second))]
     } else {
         vec![(qt, None)]
