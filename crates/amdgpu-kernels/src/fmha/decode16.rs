@@ -49,11 +49,6 @@ pub fn pa_decode16_fused(name: &str, page: i32, kt: i32) -> Function {
     pa_decode16_all(name, page, kt, 0, false, true)
 }
 
-/// `_f8`: the fused form with 8 waves per CTA (two per SIMD: one wave's latency hides behind the other's work), 8 key parts merged in LDS.
-pub fn pa_decode16_fused8(name: &str, page: i32) -> Function {
-    pa_decode16_w(name, page, 32, 0, false, true, 8)
-}
-
 pub fn pa_decode16_x(name: &str, page: i32, kt: i32, fp8: bool) -> Function {
     pa_decode16_kv(name, page, kt, if fp8 { 1 } else { 0 })
 }
@@ -72,13 +67,6 @@ fn pa_decode16_kvm(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool) -> Functi
 }
 
 fn pa_decode16_all(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool) -> Function {
-    pa_decode16_w(name, page, kt, kvm, mtp, fused, 4)
-}
-
-/// `waves` per CTA (4, or 8 for the fused form): NS = waves S key parts.
-fn pa_decode16_w(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool, waves: i32) -> Function {
-    assert!(waves == 4 || (waves == 8 && fused && kvm == 0 && !mtp && kt == 32), "decode16: 4 waves, or 8 in the bf16 fused form");
-    let lw = waves.trailing_zeros() as i32;
     assert!(!fused || (kvm == 0 && !mtp), "decode16 fused: bf16, qlen 1");
     let fp8 = kvm >= 1;
     let blocked = kvm == 2;
@@ -90,7 +78,7 @@ fn pa_decode16_w(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool
     #[allow(non_snake_case)]
     let LKT = kt.trailing_zeros() as i32;
     #[allow(non_snake_case)]
-    let NKB = (kt / 16) as usize;    let mut b = FnBuilder::new(name, 64 * waves as u32);
+    let NKB = (kt / 16) as usize;    let mut b = FnBuilder::new(name, 256);
     b.compile_profile(CompileProfile::Gemm);
     for (n, i) in [("ptr_po", 0u32), ("ptr_q", 1), ("ptr_k", 2), ("ptr_v", 3), ("ptr_bt", 4), ("ptr_cl", 5), ("ptr_plse", 12)] {
         b.arg(n, DType::Ptr, 16 * i, 8);
@@ -148,7 +136,7 @@ fn pa_decode16_w(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool
     } else {
         b.arg_tensor("ptr_po", bb.clone() * hh.clone() * ss.clone() * Ext::c(4 * 4 * D as i64));
     }
-    b.arg_tensor("ptr_plse", bb * hh * ss * Ext::c(4 * waves as i64));
+    b.arg_tensor("ptr_plse", bb * hh * ss * Ext::c(16));
 
     let kp = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargPtr { offset: 16 * i });
     let ki = |b: &mut FnBuilder, i: u32| b.let_(Op::KernargI32 { offset: 16 * i });
@@ -199,8 +187,8 @@ fn pa_decode16_w(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool
         (live, hd, bat, None, None)
     };
     // ---- the wave's key split ----
-    let nsplit = b.bind_i32(ev(s_n) << lw);
-    let ns = { let v = b.bind_i32((ev(z) << lw) + ev(wv)); b.read_first_lane(v) };
+    let nsplit = b.bind_i32(ev(s_n) << 2);
+    let ns = { let v = b.bind_i32((ev(z) << 2) + ev(wv)); b.read_first_lane(v) };
     let ncl = { let v = b.bind_i32((ev(bat) + 1) << 2); b.read_first_lane(v) };
     let r_cl = b.buffer_desc_dyn(p_cl, ncl);
     let cl_so = { let v = b.bind_i32(ev(bat) << 2); b.read_first_lane(v) };
@@ -248,16 +236,15 @@ fn pa_decode16_w(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool
     // ---- private LDS: per wave K (16 KB) + V (16 KB), as decode.rs ----
     let mut lds = LdsPlan::new();
     // K and V in separate private regions (their DMAs complete separately: QK waits for K only)
-    let kreg = lds.private("K", (KT * krow) as i64, waves as u32, &[]);
-    let vreg = lds.private("V", (KT * ROW) as i64, waves as u32, &[]);
+    let kreg = lds.private("K", (KT * krow) as i64, 4, &[]);
+    let vreg = lds.private("V", (KT * ROW) as i64, 4, &[]);
     // fp8: the staged fp8 V rows (converted into the bf16 V tile)
     let vsreg = fp8.then(|| lds.private("VS", (KT * D) as i64, 4, &[]));
     // fused: wave w's normalized partial O [16 cols][128] f32 over its own K region (8 KB w) and its LSE [16] at the start of its own V
     // region (32 KB + 8 KB w): a wave writes only its own dead storage, before the barrier
-    #[allow(non_snake_case)]
-    let EPI_L: i32 = 8192 * waves;
+    const EPI_L: i32 = 32768;
     assert!(!fused || KT == 32, "decode16 fused: 32-key tiles (8 KB K / V per wave)");
-    let epi = fused.then(|| lds.tile_over("EPI", (EPI_L + (waves - 1) * 8192 + 64) as i64, &[&kreg, &vreg]));
+    let epi = fused.then(|| lds.tile_over("EPI", (EPI_L + 3 * 8192 + 64) as i64, &[&kreg, &vreg]));
     lds.commit(&mut b);
     // fused: this wave's slice of EPI (O at 8 KB w + 512 col + 4 d, LSE at 32 KB + 64 w + 4 col)
     let epi_o = fused.then(|| b.bind_i32((ev(wv) << 13) + (ev(j) << 9) + (ev(grp) << 4)));
@@ -743,8 +730,8 @@ fn pa_decode16_w(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool
         let col = b.bind_i32(ev(tid).lshr(4));
         let d0 = b.bind_i32((ev(tid) & 15) << 3);
         let (ls, os): (Vec<ValueId>, Vec<(ValueId, ValueId)>) = e.at(&amdgpu_tile::SlotIdx::new(0, 0)).read(&mut b, |b| {
-            let ls = (0..waves).map(|w| { let a = b.bind_i32((ev(col) << 2) + (EPI_L + 8192 * w)); b.load_lds_b32(a) }).collect();
-            let os = (0..waves)
+            let ls = (0..4i32).map(|w| { let a = b.bind_i32((ev(col) << 2) + (EPI_L + 8192 * w)); b.load_lds_b32(a) }).collect();
+            let os = (0..4i32)
                 .map(|w| {
                     let a = b.bind_i32((ev(col) << 9) + (ev(d0) << 2) + (w << 13));
                     let a1 = b.bind_i32(ev(a) + 16);
@@ -773,7 +760,7 @@ fn pa_decode16_w(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bool
         let mut outv: Vec<ValueId> = Vec::with_capacity(8);
         for k in 0..8u8 {
             let mut acc = zf;
-            for w in 0..waves as usize {
+            for w in 0..4usize {
                 let f = if k < 4 { os[w].0 } else { os[w].1 };
                 let x = b.frag4_lane(f, k % 4);
                 let x = b.bitcast_f32(x);

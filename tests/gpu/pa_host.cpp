@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
         ca.assign(16 * 6, 0);
         if (sinks) { void* ds = dev(sink); memcpy(&ca[80], &ds, 8); }
         memcpy(&ca[0], &dout, 8); memcpy(&ca[16], &dpo, 8); memcpy(&ca[32], &dpl, 8); memcpy(&ca[48], &H, 4); memcpy(&ca[64], &NS, 4);
-        gx = HK; gy = B; gz = S; blk = envi("BLOCK", 256);  // (BLOCK=512: the 8-wave _f8 form)
+        gx = HK; gy = B; gz = S; blk = 256;
     } else if (fp8mode == 2) {
         // vendor pertokenFp8 (pa_bf16_pertokenFp8_*, P = 16): K [blk][hk][d / 16][16][16] and V [blk][hk][d][16] fp8 = the blocked layout
         // built above; KQ / VQ f32 [HK][NB 16] per-token scales (kernarg names O Q K V BT CL KQ VQ sclg mblk batch Qs Bs KVs mtp GQA [QTP])
