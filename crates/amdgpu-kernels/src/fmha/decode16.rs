@@ -459,7 +459,8 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
             compute(&mut b, key_t, &kset[ph], Opnd::Val(t_), &mvs3[ph], m_v, l_v, &ov, &sv_);
             let tn = b.bind_i32(ev(t_) + 1);
             if ph == 2 {
-                b.set_var(it, tn);
+                let it3 = b.bind_i32(itx.clone() + 3);
+                b.set_var(it, it3);
             }
             // (the V slot of tile t is rewritten by tile t + 3 in the next phase: its reads complete first)
             b.wait_lds(0);
