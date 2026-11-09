@@ -3306,7 +3306,7 @@ impl Lowerer {
             // then hoists) and the readfirstlane reads an older value (no VALU -> readfirstlane wait states)
             Op::ReadFirstLane(Opnd::Val(a))
                 if matches!(self.defs.get(a), Some(Op::AddI32(Opnd::Val(_), Opnd::I32(_))) | Some(Op::AddI32(Opnd::I32(_), Opnd::Val(_))))
-                    && opt_on("rflfold") =>
+                    =>
             {
                 let (x, c) = match self.defs.get(a) {
                     Some(Op::AddI32(Opnd::Val(x), Opnd::I32(c))) | Some(Op::AddI32(Opnd::I32(c), Opnd::Val(x))) => (*x, *c),
