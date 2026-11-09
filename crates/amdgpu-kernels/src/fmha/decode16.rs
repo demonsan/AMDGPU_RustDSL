@@ -778,6 +778,8 @@ fn pa_decode16_gen(name: &str, page: i32, kt: i32, kvm: u8, mtp: bool, fused: bo
         let sm1 = b.bind_i32(ev(s_n) - 1);
         let is_last = b.let_(Op::CmpGeI32(Opnd::Val(ticket), Opnd::Val(sm1)));
         let any = b.any_lane(is_last);
+        // the S CTAs of a (b, hk) share counter[b HK + hk]; exactly one sees ticket S - 1 (one atomic per CTA, the last resets the counter)
+        b.wg_winner(any, &[2], "last arriver: the S split CTAs of (b, hk) take tickets 0..S-1 on one counter; only ticket S - 1 runs the combine");
         b.begin_if(Opnd::Val(any));
         {
             b.fence_acquire_lite();

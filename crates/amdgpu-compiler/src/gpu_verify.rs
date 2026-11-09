@@ -228,9 +228,14 @@ struct An<'a> {
     gcaps: BTreeMap<usize, Vec<(SLin, Poly, bool)>>,
     /// set_vars waiting for the end of their statement list (stmt index, var, value)
     pending_sets: Vec<(usize, VarId, Opnd)>,
+    /// grid axes of the `wg_winner` branches enclosing the current statement
+    winner_axes: Vec<u8>,
+    /// store stmt -> the winner axes active there
+    gwin: BTreeMap<usize, Vec<u8>>,
     /// trusted loop-variable assumes already counted in the ledger
     trusted_counted: std::collections::HashSet<VarId>,
     group_caps: std::cell::RefCell<BTreeMap<u32, Vec<Vec<(SLin, Poly, bool)>>>>,
+    group_win: std::cell::RefCell<BTreeMap<u32, Vec<Vec<u8>>>>,
     /// the address operand (and constant offset) of the LDS access being checked: private-region checks need it symbolically
     cur_addr: Option<(Opnd, i128)>,
     acc: HashMap<VarId, Itv>,
@@ -707,6 +712,7 @@ impl<'a> An<'a> {
             Some(m)
         });
         self.gstores.insert(self.idx, (rec.0, rec.1, size, ranges));
+        self.gwin.insert(self.idx, self.winner_axes.clone());
         let caps = std::mem::take(&mut *self.caps_cur.borrow_mut());
         self.gcaps.insert(self.idx, caps);
     }
@@ -768,6 +774,11 @@ impl<'a> An<'a> {
             caps_by_arg.entry(s.0).or_default().push(self.gcaps.get(i).cloned().unwrap_or_default());
         }
         *self.group_caps.borrow_mut() = caps_by_arg;
+        let mut win_by_arg: BTreeMap<u32, Vec<Vec<u8>>> = BTreeMap::new();
+        for (i, s) in &self.gstores {
+            win_by_arg.entry(s.0).or_default().push(self.gwin.get(i).cloned().unwrap_or_default());
+        }
+        *self.group_win.borrow_mut() = win_by_arg;
         let (mut ok, mut bad) = (0, 0);
         for (arg, ss) in by_arg {
             if arg != u32::MAX && self.disjoint_group(&ss) {
@@ -1070,7 +1081,9 @@ impl<'a> An<'a> {
                         atoms.contains_key(&k) || covered.contains(&k)
                     })
             });
-            if !seen && !mapped && (defined || read) && cx.sym_poly(Sym::Grid(ax as u8)).as_const() != Some(Q::int(1)) {
+            // ... or every store of the group runs in a `wg_winner` branch over this axis (one workgroup per group)
+            let winner = self.group_win.borrow().get(&ss[0].0).map_or(false, |ws| !ws.is_empty() && ws.iter().all(|w| w.contains(&(ax as u8))));
+            if !seen && !mapped && !winner && (defined || read) && cx.sym_poly(Sym::Grid(ax as u8)).as_const() != Some(Q::int(1)) {
                 return Err("a workgroup axis that is not a digit".into());
             }
         }
@@ -1993,7 +2006,15 @@ impl<'a> An<'a> {
                     // branch facts (scoped): inside `then` the condition holds, inside `else` it does not (`if` is wave-level:
                     // every lane of a wave that runs the branch satisfies it only for wave-uniform conditions - see `branch_fact`)
                     let undo = self.branch_fact(cond, true);
+                    // a `wg_winner` branch: one workgroup per group along its axes
+                    let wn = self.winner_axes.len();
+                    for w in &self.f.contract.wg_winners {
+                        if matches!(cond, Opnd::Val(c) if *c == w.cond) {
+                            self.winner_axes.extend(w.axes.iter().copied());
+                        }
+                    }
                     self.walk(then, idx);
+                    self.winner_axes.truncate(wn);
                     self.undo_fact(undo);
                     if let Some(e) = els {
                         self.idx = *idx;
@@ -2484,7 +2505,7 @@ fn barrier_balance(f: &Function, rep: &mut Report) {
 
 /// IR-level verification: LDS budget, global / buffer bounds, role-barrier balance, contract sanity.
 pub fn verify_ir(f: &Function) -> Report {
-    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), trusted_counted: Default::default(), group_caps: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
+    let mut an = An { f, cx: contract_ctx(f), env: HashMap::new(), vars: HashMap::new(), var_init: HashMap::new(), assumed: HashMap::new(), assumed_trusted: HashMap::new(), tag: None, tag_stmt: 0, gstores: BTreeMap::new(), atom_inst: Default::default(), sig_memo: Default::default(), caps_cur: Default::default(), gcaps: BTreeMap::new(), pending_sets: Vec::new(), winner_axes: Vec::new(), gwin: BTreeMap::new(), trusted_counted: Default::default(), group_caps: Default::default(), group_win: Default::default(), cur_addr: None, acc: HashMap::new(), ovr: None, assumed_vals: Default::default(), defs: f.stmts().iter().filter_map(|s| if let Stmt::Let { dst, op } = s { Some((*dst, op.clone())) } else { None }).collect(), rep: Report::default(), idx: 0, has_asm: false };
     for e in &f.contract.extents {
         if !f.args.iter().any(|a| a.name == e.arg && a.ty == amdgpu_dsl::DType::Ptr) {
             an.rep.add("GV-CONTRACT", Severity::Error, format!("contract: extent declared for `{}` which is not a pointer kernarg of `{}`", e.arg, f.name));
@@ -2501,6 +2522,9 @@ pub fn verify_ir(f: &Function) -> Report {
         }
     }
     an.run();
+    for w in &f.contract.wg_winners {
+        an.rep.add("GV-ASSUME", Severity::Info, format!("wg_winner v{} over grid axes {:?}: TRUSTED ({})", w.cond, w.axes, w.reason));
+    }
     for m in &f.contract.wg_maps {
         an.rep.add("GV-ASSUME", Severity::Info, format!("wg_bijection {:?} over grid axes {:?}: TRUSTED ({})", m.outs, m.axes, m.reason));
     }

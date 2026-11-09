@@ -1069,6 +1069,17 @@ pub struct Contract {
     /// Trusted facts: a tuple of values is an injective function of the workgroup id over the listed grid axes (e.g. an XCD raster, a
     /// permutation of the tile grid). Used by the cross-workgroup store proof; counted in the trust ledger (`wg_bijection`).
     pub wg_maps: Vec<WgMap>,
+    /// Trusted facts: the `then` branch of an `if` on `cond` runs in exactly one workgroup of every group of workgroups that differ only along
+    /// `axes` (a last-arriver ticket). Used by the cross-workgroup store proof; counted in the trust ledger (`wg_winner`).
+    pub wg_winners: Vec<WgWinner>,
+}
+
+/// See `Contract::wg_winners`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WgWinner {
+    pub cond: ValueId,
+    pub axes: Vec<u8>,
+    pub reason: String,
 }
 
 /// See `Contract::wg_maps`.
@@ -1936,6 +1947,13 @@ impl FnBuilder {
     /// Trusted fact: `outs` are the same index (e.g. a q tile) as computed by different store classes of one workgroup (the paired causal
     /// tiles x and n - 1 - x, the second guarded by n - 1 - x > x), and the index is injective over (workgroup, class). The cross-workgroup
     /// store proof treats them as one digit covering `axes`. Counted in the trust ledger.
+    /// Trusted fact: the `then` branch of `if cond` runs in exactly ONE workgroup of each group of workgroups that differ only along grid `axes`
+    /// (the last arriver of a ticket counter shared by the group). Stores in that branch need no digit for those axes. Counted in the ledger.
+    #[track_caller]
+    pub fn wg_winner(&mut self, cond: ValueId, axes: &[u8], reason: &str) {
+        self.f.contract.wg_winners.push(WgWinner { cond, axes: axes.to_vec(), reason: reason.to_string() });
+    }
+
     #[track_caller]
     pub fn wg_union(&mut self, outs: &[ValueId], axes: &[u8], lo: Ext, hi: Ext, reason: &str) {
         self.f.contract.wg_maps.push(WgMap { outs: outs.to_vec(), axes: axes.to_vec(), reason: reason.to_string(), union: true, range: Some((lo, hi)) });
