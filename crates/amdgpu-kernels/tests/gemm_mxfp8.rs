@@ -22,8 +22,8 @@ fn gemm_v4_passes_strict_verification() {
         assert!(errs.is_empty(), "{name}:\n{}", errs.join("\n"));
         let warns = rep.findings.iter().filter(|x| x.severity == Severity::Warn).count();
         assert_eq!(warns, 0, "{name}: {}", rep.render());
-        // the trust ledger: the pipeline tile counter + the two XCD-raster permutation bounds
+        // the trust ledger: the pipeline tile counter + the two XCD-raster permutation bounds + the raster bijection (cross-workgroup store proof)
         let l = rep.ledger();
-        assert!(l.total() <= 3 && l.tile_trust == 0 && l.region_trust == 0, "{name}: ledger {l:?}");
+        assert!(l.total() <= 4 && l.tile_trust == 0 && l.region_trust == 0, "{name}: ledger {l:?}");
     }
 }

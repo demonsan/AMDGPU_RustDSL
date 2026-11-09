@@ -109,13 +109,24 @@ bounds-checked, not race-checked (docs/trust-inventory.md): {"global-write-untra
 - 掩码写的哨兵臂（≥ 2^30 或负常数，被描述符范围检查丢弃，这一点已由越界证明确立）不算写；
 - `AMDC_GW_DEBUG=1 amdc gpu-verify <k>` 逐参数打印失败原因和原子签名。
 
-已证明：rmsnorm 系列、量化、激活、rope、`topk_softmax`、`moe_sum` / `moe_reduce`、各 combine、`gemm_splitk_reduce`、argmax / sample 的输出。
+补充规则：
+- **掩码上限**：掩码写的活臂只在 `x < bound` 时执行；夹紧写 `min(x, bound - 1)` 也算，但要求 x 唯一的 workgroup 数字位在最高位，且 c_u·hi_u ≤ bound - 1。若偏移里含 k·x、x 自身对其原子是单射，就把 x 的原子合成一个数字位（系数 k，取值 [min x, bound - 1]）。各写的 x 常数可以不同，会从各自常数中扣除。
+- **`b.wg_bijection(outs, axes, reason)`**：受信事实，计入账本。声明 `outs` 这个元组是 workgroup id 在这些轴上的单射（例如 XCD 光栅、块序置换）；证明时把 `outs` 当作这些轴的数字位。只在它真正换来证明的地方使用：GEMM 光栅、mxfp8 FMHA 的 XCD 块序。
+
+已证明（出厂 / 常用）：
+- `gemm_mxfp8_bs_v4`、bf16 / blockscale GEMM；
+- mxfp8 FMHA `_vs128` / `_t128` / combine；
+- bf16 prefill v3、bwd dot / dq / dkdv；
+- rmsnorm 系列、量化、激活、rope、`topk_softmax`、`moe_sum` / `moe_reduce`、各 combine、`gemm_splitk_reduce`、argmax / sample 的输出。
+
+代价：账本上 `_vs128` / `_t128` 各 +1（XCD 块序），GEMM v4 +1（光栅），出厂合计 26 → 28。
 
 仍未证明（原因 → 需要什么）：
-- GEMM / MoE GEMM / mlp（XCD 光栅：tile 坐标是 workgroup id 的置换，由 `assume_trusted` 声明）→ 需要"双射"这种事实形式；
-- decode16 / MLA / reshape_cache（G = H/HK 由 kernarg 的 select 得出，区间不是一个点；slot_mapping 是数据）→ 需要把 G 作为契约符号；
-- bf16 prefill / bwd（系数含 kernarg 步长，与常数不可比）→ 需要步长的契约下界；
-- mxfp8 FMHA（XCD 块序）同 GEMM。
+- `mxfp8 _kvsplit`：分片偏移的行复合位没有形成，系数不可比 → 需要分片行的上限形式；
+- causal v3：两类 tile 的写对同一原子系数不同 → 需要按写分组证明；
+- decode16 / MLA：G = H/HK 由 kernarg 的 select 得出，区间不是一个点 → 需要把 G 作为契约符号；
+- MoE GEMM / reshape_cache：行号或 slot 是数据（排序后的 token id、slot_mapping）→ 需要数据事实（互不相同）；
+- 持久化 `mlp_fp8_ws_fused`：tile 由循环变量 + workgroup 决定 → 需要循环关系。
 
 **`lds-untracked`**：
 - 范围：不在任何 tile 标记内的 LDS 访问；
