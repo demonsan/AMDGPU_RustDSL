@@ -3302,6 +3302,30 @@ impl Lowerer {
                 self.push(MInst::new(MOp::VMovDpp).def(d).srcreg(r).imm(ctl));
                 self.val.insert(dst, d);
             }
+            // readfirstlane(x + c) = readfirstlane(x) + c (wrapping): the scalar add folds into its consumer (e.g. the M0 write of an LDS DMA, which
+            // then hoists) and the readfirstlane reads an older value (no VALU -> readfirstlane wait states)
+            Op::ReadFirstLane(Opnd::Val(a))
+                if matches!(self.defs.get(a), Some(Op::AddI32(Opnd::Val(_), Opnd::I32(_))) | Some(Op::AddI32(Opnd::I32(_), Opnd::Val(_))))
+                    && opt_on("rflfold") =>
+            {
+                let (x, c) = match self.defs.get(a) {
+                    Some(Op::AddI32(Opnd::Val(x), Opnd::I32(c))) | Some(Op::AddI32(Opnd::I32(c), Opnd::Val(x))) => (*x, *c),
+                    _ => unreachable!(),
+                };
+                let rx = match self.val.get(&x) {
+                    Some(r) if self.mir.vreg_class(*r) == RClass::S1 => *r,
+                    _ => {
+                        let r = self.as_v1(Opnd::Val(x))?;
+                        self.touch(&[Src::Reg(r)]);
+                        let s = self.new_vreg(RClass::S1);
+                        self.push(MInst::new(MOp::VReadFirstLane).def(s).srcreg(r));
+                        s
+                    }
+                };
+                let d = self.new_vreg(RClass::S1);
+                self.push(MInst::new(MOp::SAddU32).def(d).srcreg(rx).src(Src::Imm(c as i64)));
+                self.val.insert(dst, d);
+            }
             Op::ReadFirstLane(a) => {
                 let r = self.as_v1(*a)?;
                 self.touch(&[Src::Reg(r)]);
